@@ -1,0 +1,340 @@
+package handlers_test
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"testing"
+
+	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
+	"github.com/fivetwenty-io/bosh-pve-cpi/internal/cpi/handlers"
+	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
+	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
+	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
+	sdkclusterapi "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cluster"
+	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/qemu"
+	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/tasks"
+)
+
+// ---------------------------------------------------------------------------
+// resizeQEMUService: QEMU mock for resize_disk tests.
+// ---------------------------------------------------------------------------
+
+type resizeQEMUService struct {
+	configFn     func(ctx context.Context, node string, vmid int) (map[string]interface{}, error)
+	resizeDiskFn func(ctx context.Context, node string, vmid int, diskID string, sizeGiB int) (string, error)
+}
+
+func (m *resizeQEMUService) Config(ctx context.Context, node string, vmid int) (map[string]interface{}, error) {
+	if m.configFn != nil {
+		return m.configFn(ctx, node, vmid)
+	}
+	return map[string]interface{}{}, nil
+}
+
+func (m *resizeQEMUService) ResizeDisk(ctx context.Context, node string, vmid int, diskID string, sizeGiB int) (string, error) {
+	if m.resizeDiskFn != nil {
+		return m.resizeDiskFn(ctx, node, vmid, diskID, sizeGiB)
+	}
+	return "", nil
+}
+
+// Unimplemented methods.
+func (m *resizeQEMUService) Create(_ context.Context, _ string, _ map[string]interface{}) (string, error) {
+	panic("resizeQEMUService.Create: not expected")
+}
+func (m *resizeQEMUService) Status(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
+	panic("resizeQEMUService.Status: not expected")
+}
+func (m *resizeQEMUService) Start(_ context.Context, _ string, _ int) (string, error) {
+	panic("resizeQEMUService.Start: not expected")
+}
+func (m *resizeQEMUService) Stop(_ context.Context, _ string, _ int) (string, error) {
+	panic("resizeQEMUService.Stop: not expected")
+}
+func (m *resizeQEMUService) Reset(_ context.Context, _ string, _ int) (string, error) {
+	panic("resizeQEMUService.Reset: not expected")
+}
+func (m *resizeQEMUService) Clone(_ context.Context, _ string, _ int, _ map[string]interface{}) (string, error) {
+	panic("resizeQEMUService.Clone: not expected")
+}
+func (m *resizeQEMUService) Template(_ context.Context, _ string, _ int) (string, error) {
+	panic("resizeQEMUService.Template: not expected")
+}
+func (m *resizeQEMUService) AttachDisk(_ context.Context, _ string, _ int, _ string, _ string, _ *qemu.AttachOpts) (string, error) {
+	panic("resizeQEMUService.AttachDisk: not expected")
+}
+func (m *resizeQEMUService) DetachDisk(_ context.Context, _ string, _ int, _ string) error {
+	panic("resizeQEMUService.DetachDisk: not expected")
+}
+func (m *resizeQEMUService) Snapshot(_ context.Context, _ string, _ int, _ string, _ map[string]interface{}) (string, error) {
+	panic("resizeQEMUService.Snapshot: not expected")
+}
+func (m *resizeQEMUService) DeleteSnapshot(_ context.Context, _ string, _ int, _ string) error {
+	panic("resizeQEMUService.DeleteSnapshot: not expected")
+}
+func (m *resizeQEMUService) ListSnapshots(_ context.Context, _ string, _ int) ([]map[string]interface{}, error) {
+	panic("resizeQEMUService.ListSnapshots: not expected")
+}
+func (m *resizeQEMUService) RollbackSnapshot(_ context.Context, _ string, _ int, _ string) (string, error) {
+	panic("resizeQEMUService.RollbackSnapshot: not expected")
+}
+
+var _ qemu.Service = (*resizeQEMUService)(nil)
+
+// ---------------------------------------------------------------------------
+// resizeDeps builds Deps for resize_disk tests.
+// ---------------------------------------------------------------------------
+
+func resizeDeps(qemuSvc qemu.Service, clusterSvc sdkclusterapi.Service, tasksSvc tasks.Service) handlers.Deps {
+	return handlers.Deps{
+		Config: &config.CPIConfig{
+			Node: "pve1",
+		},
+		PVE: &mockPVEClient{
+			qemuSvc:    qemuSvc,
+			clusterSvc: clusterSvc,
+			tasksSvc:   tasksSvc,
+		},
+		Logger: log.NewNopLogger(),
+	}
+}
+
+// resizeClusterWith returns a cluster service that reports one VM (vmid on pve1).
+func resizeClusterWith(vmid int) sdkclusterapi.Service {
+	return &snapClusterService{
+		listFn: func(_ context.Context, _ *sdkclusterapi.ListResourcesParams) (*sdkclusterapi.ListResourcesResponse, error) {
+			return clusterRespWith(vmid, "pve1"), nil
+		},
+	}
+}
+
+// resizeQEMUWithDisk returns a QEMU mock that serves config with the given disk slot.
+// diskOptStr must be in the format "<bareVolid>[,options...]" (e.g. "vm-9001-disk-0,size=10G").
+// The first two Config calls (from findVMByDiskVolid and ResolveDiskID) return the bare volid
+// so FindDiskIDByVolID can match exactly. Subsequent calls return the full option string so
+// parseDiskSizeGiB can read the size field.
+func resizeQEMUWithDisk(diskSlot, diskOptStr string, resizeFn func(ctx context.Context, node string, vmid int, diskID string, sizeGiB int) (string, error)) *resizeQEMUService {
+	// Extract bare volid (part before first comma).
+	bareVolid := diskOptStr
+	if idx := strings.IndexByte(diskOptStr, ','); idx >= 0 {
+		bareVolid = diskOptStr[:idx]
+	}
+	callCount := 0
+	return &resizeQEMUService{
+		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
+			callCount++
+			// Calls 1 and 2: findVMByDiskVolid + ResolveDiskID — need exact bare volid match.
+			if callCount <= 2 {
+				return map[string]interface{}{diskSlot: bareVolid}, nil
+			}
+			// Call 3+: parseDiskSizeGiB — need full option string with size=.
+			return map[string]interface{}{diskSlot: diskOptStr}, nil
+		},
+		resizeDiskFn: resizeFn,
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+func TestHandleResizeDisk_Grow(t *testing.T) {
+	const diskCID = "local-lvm:vm-9001-disk-0"
+	const volid = "vm-9001-disk-0"
+
+	var capturedDelta int
+
+	qemuSvc := resizeQEMUWithDisk("scsi2", volid+",size=10G", func(_ context.Context, _ string, _ int, _ string, deltaGiB int) (string, error) {
+		capturedDelta = deltaGiB
+		return "", nil
+	})
+
+	h := handlers.HandleResizeDisk(resizeDeps(qemuSvc, resizeClusterWith(100), nil))
+
+	// 15360 MiB = 15 GiB; current = 10 GiB → delta = 5 GiB.
+	result, err := h.Handle(context.Background(), marshalArgs(diskCID, 15360), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result != nil {
+		t.Errorf("result: want nil (void), got %v", result)
+	}
+	if capturedDelta != 5 {
+		t.Errorf("resize delta: want 5 GiB, got %d GiB", capturedDelta)
+	}
+}
+
+func TestHandleResizeDisk_NoOp(t *testing.T) {
+	// new_size_mb == current_size → delta == 0 → no-op, no resize call.
+	const diskCID = "local-lvm:vm-9001-disk-0"
+
+	var resizeCalled bool
+
+	qemuSvc := resizeQEMUWithDisk("scsi2", "vm-9001-disk-0,size=10G", func(_ context.Context, _ string, _ int, _ string, _ int) (string, error) {
+		resizeCalled = true
+		return "", nil
+	})
+
+	h := handlers.HandleResizeDisk(resizeDeps(qemuSvc, resizeClusterWith(100), nil))
+	// 10240 MiB = 10 GiB exactly, same as current.
+	_, err := h.Handle(context.Background(), marshalArgs(diskCID, 10240), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error for no-op resize: %v", err)
+	}
+	if resizeCalled {
+		t.Error("ResizeDisk must not be called when delta is zero")
+	}
+}
+
+func TestHandleResizeDisk_ShrinkRejected(t *testing.T) {
+	// new_size_mb < current_size → NotSupported error.
+	const diskCID = "local-lvm:vm-9001-disk-0"
+
+	qemuSvc := resizeQEMUWithDisk("scsi2", "vm-9001-disk-0,size=20G", nil)
+
+	h := handlers.HandleResizeDisk(resizeDeps(qemuSvc, resizeClusterWith(100), nil))
+	// 5120 MiB = 5 GiB; current = 20 GiB → shrink.
+	_, err := h.Handle(context.Background(), marshalArgs(diskCID, 5120), jsonrpc.Context{})
+	if err == nil {
+		t.Fatal("expected error for shrink attempt")
+	}
+	if !cpierrors.IsType(err, cpierrors.TypeNotSupported) {
+		t.Errorf("error type: want NotSupported, got %T %v", err, err)
+	}
+}
+
+func TestHandleResizeDisk_WithUpid(t *testing.T) {
+	const diskCID = "local-lvm:vm-9001-disk-0"
+
+	var waitCalled bool
+	tasksSvc := &mockTasksService{
+		waitFn: func(_ context.Context, _, _ string, _ *tasks.WaitOptions) (*tasks.Status, error) {
+			waitCalled = true
+			return &tasks.Status{ExitStatus: "OK"}, nil
+		},
+	}
+
+	qemuSvc := resizeQEMUWithDisk("scsi2", "vm-9001-disk-0,size=10G", func(_ context.Context, _ string, _ int, _ string, _ int) (string, error) {
+		return "UPID:pve1:resize:abc", nil
+	})
+
+	h := handlers.HandleResizeDisk(resizeDeps(qemuSvc, resizeClusterWith(100), tasksSvc))
+	_, err := h.Handle(context.Background(), marshalArgs(diskCID, 20480), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !waitCalled {
+		t.Error("AwaitTask was not called for UPID")
+	}
+}
+
+func TestHandleResizeDisk_DiskNotAttached(t *testing.T) {
+	const diskCID = "local-lvm:vm-9001-disk-0"
+
+	// Cluster has a VM but it doesn't have the disk.
+	qemuSvc := &resizeQEMUService{
+		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
+			return map[string]interface{}{"scsi0": "local-lvm:other"}, nil
+		},
+	}
+
+	h := handlers.HandleResizeDisk(resizeDeps(qemuSvc, resizeClusterWith(100), nil))
+	_, err := h.Handle(context.Background(), marshalArgs(diskCID, 20480), jsonrpc.Context{})
+	if err == nil {
+		t.Fatal("expected error for disk not attached to any VM")
+	}
+}
+
+func TestHandleResizeDisk_SizeParseFail(t *testing.T) {
+	// Disk has no "size=" in option string → parseDiskSizeGiB returns error.
+	const diskCID = "local-lvm:vm-9001-disk-0"
+
+	qemuSvc := resizeQEMUWithDisk("scsi2", "vm-9001-disk-0,cache=writeback", nil)
+
+	h := handlers.HandleResizeDisk(resizeDeps(qemuSvc, resizeClusterWith(100), nil))
+	_, err := h.Handle(context.Background(), marshalArgs(diskCID, 20480), jsonrpc.Context{})
+	if err == nil {
+		t.Fatal("expected error when size cannot be parsed from config")
+	}
+}
+
+func TestHandleResizeDisk_ResizeSDKError(t *testing.T) {
+	const diskCID = "local-lvm:vm-9001-disk-0"
+
+	qemuSvc := resizeQEMUWithDisk("scsi2", "vm-9001-disk-0,size=10G", func(_ context.Context, _ string, _ int, _ string, _ int) (string, error) {
+		return "", errors.New("PVE refused resize")
+	})
+
+	h := handlers.HandleResizeDisk(resizeDeps(qemuSvc, resizeClusterWith(100), nil))
+	_, err := h.Handle(context.Background(), marshalArgs(diskCID, 20480), jsonrpc.Context{})
+	if err == nil {
+		t.Fatal("expected error from ResizeDisk SDK failure")
+	}
+}
+
+func TestHandleResizeDisk_MalformedDiskCID(t *testing.T) {
+	h := handlers.HandleResizeDisk(resizeDeps(&resizeQEMUService{}, &snapClusterService{}, nil))
+	_, err := h.Handle(context.Background(), marshalArgs("no-colon-cid", 10240), jsonrpc.Context{})
+	if err == nil {
+		t.Fatal("expected error for malformed disk_cid")
+	}
+}
+
+func TestHandleResizeDisk_ZeroSizeMB(t *testing.T) {
+	h := handlers.HandleResizeDisk(resizeDeps(&resizeQEMUService{}, &snapClusterService{}, nil))
+	_, err := h.Handle(context.Background(), marshalArgs("local-lvm:vol", 0), jsonrpc.Context{})
+	if err == nil {
+		t.Fatal("expected error for zero new_size_mb")
+	}
+}
+
+func TestHandleResizeDisk_TooFewArgs(t *testing.T) {
+	h := handlers.HandleResizeDisk(resizeDeps(&resizeQEMUService{}, &snapClusterService{}, nil))
+	_, err := h.Handle(context.Background(), marshalArgs("local-lvm:vol"), jsonrpc.Context{})
+	if err == nil {
+		t.Fatal("expected error for missing new_size_mb argument")
+	}
+}
+
+// With no Config.Node and an empty cluster (no VMs holding the disk), the
+// handler must fail with a "disk not attached to any VM" error rather than
+// panicking. This replaces the legacy missing-node assertion: under the
+// backend abstraction Config.Node is no longer mandatory — the cluster scan
+// drives node selection, and a successful scan with no matches is the new
+// failure surface.
+func TestHandleResizeDisk_NoConfigNodeAndEmptyCluster(t *testing.T) {
+	h := handlers.HandleResizeDisk(handlers.Deps{
+		Config: &config.CPIConfig{Node: ""},
+		PVE: &mockPVEClient{
+			qemuSvc:    &resizeQEMUService{},
+			clusterSvc: &snapClusterService{},
+		},
+		Logger: log.NewNopLogger(),
+	})
+	_, err := h.Handle(context.Background(), marshalArgs("local-lvm:vol", 10240), jsonrpc.Context{})
+	if err == nil {
+		t.Fatal("expected error when no VM hosts the disk")
+	}
+}
+
+func TestHandleResizeDisk_CeilingMath(t *testing.T) {
+	// 10241 MiB → ceil → 11 GiB; current = 10 GiB → delta = 1 GiB.
+	const diskCID = "local-lvm:vm-9001-disk-0"
+
+	var capturedDelta int
+
+	qemuSvc := resizeQEMUWithDisk("scsi2", "vm-9001-disk-0,size=10G", func(_ context.Context, _ string, _ int, _ string, deltaGiB int) (string, error) {
+		capturedDelta = deltaGiB
+		return "", nil
+	})
+
+	h := handlers.HandleResizeDisk(resizeDeps(qemuSvc, resizeClusterWith(100), nil))
+	_, err := h.Handle(context.Background(), marshalArgs(diskCID, 10241), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if capturedDelta != 1 {
+		t.Errorf("delta: want 1 GiB for 10241 MiB -> 11 GiB - 10 GiB, got %d GiB", capturedDelta)
+	}
+}

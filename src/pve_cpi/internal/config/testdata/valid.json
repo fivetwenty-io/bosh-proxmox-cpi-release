@@ -1,0 +1,10 @@
+{
+  "host": "pve.example.com",
+  "user": "root",
+  "password": "s3cr3t",
+  "vm_storage": "local-lvm",
+  "disk_storage": "local-lvm",
+  "stemcell_storage": "local",
+  "network_bridge": "vmbr0",
+  "node": "pve1"
+}

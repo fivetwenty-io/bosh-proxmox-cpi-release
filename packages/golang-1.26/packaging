@@ -1,0 +1,10 @@
+#!/bin/bash
+set -euo pipefail
+
+BLOB="golang-1.26/go1.26.3.linux-amd64.tar.gz"
+
+echo "==> Extracting Go toolchain"
+tar -xzf "${BLOB}" -C "${BOSH_INSTALL_TARGET}" --strip-components=1
+
+echo "==> Go version: $("${BOSH_INSTALL_TARGET}/bin/go" version)"
+echo "==> Go toolchain installed at: ${BOSH_INSTALL_TARGET}"

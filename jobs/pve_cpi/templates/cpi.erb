@@ -1,0 +1,10 @@
+#!/bin/bash
+set -eu
+
+# Resolve paths relative to this script so the wrapper works for both
+# director VM installs (/var/vcap/...) and `bosh create-env` host installs
+# (~/.bosh/installations/<id>/...).
+JOB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PACKAGES_DIR="$(cd "${JOB_DIR}/../../packages" && pwd)"
+
+exec "${PACKAGES_DIR}/pve_cpi/bin/cpi" --config "${JOB_DIR}/config/cpi.json"

@@ -1,0 +1,36 @@
+---
+# Copy to vars.yml and fill in. Do not commit vars.yml (contains secrets).
+
+# --- PVE target -----------------------------------------------------------
+pve_host:            pve.example.com
+pve_port:            8006
+pve_user:            root@pam
+pve_password:        REPLACE_ME
+pve_node:            pve1
+pve_vm_storage:      local-lvm
+pve_disk_storage:    local-lvm
+pve_stemcell_storage: local
+pve_network_bridge:  vmbr0
+pve_verify_ssl:      true
+
+# --- Director VM sizing ---------------------------------------------------
+director_cpu:    2
+director_memory: 4096
+director_disk:   32768
+
+# --- Director network -----------------------------------------------------
+internal_cidr: 192.168.1.0/24
+internal_gw:   192.168.1.1
+internal_ip:   192.168.1.10
+
+# --- Release + stemcell ---------------------------------------------------
+# Absolute path to the tarball from ./scripts/create-release dev
+pve_cpi_release_path: /absolute/path/to/dev_releases/bosh-pve-cpi/bosh-pve-cpi-0+dev.1.tgz
+
+# Ubuntu jammy openstack-kvm stemcell (works on PVE qemu/kvm).
+# Get latest from https://bosh.io/stemcells/bosh-openstack-kvm-ubuntu-jammy-go_agent
+stemcell_url:  https://bosh.io/d/stemcells/bosh-openstack-kvm-ubuntu-jammy-go_agent?v=1.999
+stemcell_sha1: REPLACE_WITH_PUBLISHED_SHA1
+
+# --- Director identity ----------------------------------------------------
+director_name: bosh-pve

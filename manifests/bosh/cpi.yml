@@ -1,0 +1,98 @@
+---
+# Ops file: layer the pve_cpi CPI onto cloudfoundry/bosh-deployment's bosh.yml.
+#
+# Usage:
+#   bosh create-env ~/w/cloudfoundry/bosh-deployment/bosh.yml \
+#     --state=manifests/bosh/state.json \
+#     --vars-store=manifests/bosh/creds.yml \
+#     -o  manifests/bosh/cpi.yml \
+#     -o  ~/w/cloudfoundry/bosh-deployment/uaa.yml \
+#     -o  ~/w/cloudfoundry/bosh-deployment/credhub.yml \
+#     -l  manifests/bosh/vars.yml \
+#     -v  director_name=ocfp-mgmt
+#
+# Requires a local release tarball produced by ./scripts/create-release dev
+# (path is read from var pve_cpi_release_path).
+
+- type: replace
+  path: /releases/name=bosh-pve-cpi?
+  value:
+    name: bosh-pve-cpi
+    url: file://((pve_cpi_release_path))
+
+# Stemcell: openstack-kvm jammy works on PVE (qemu/KVM).
+- type: replace
+  path: /resource_pools/name=vms/stemcell?
+  value:
+    url: ((stemcell_url))
+    sha1: ((stemcell_sha1))
+
+- type: replace
+  path: /resource_pools/name=vms/cloud_properties?
+  value:
+    cpu: ((director_cpu))
+    memory: ((director_memory))
+    disk: ((director_disk))
+
+- type: replace
+  path: /disk_pools/name=disks/cloud_properties?
+  value:
+    # ----------------------------------------------------------------------
+    # Persistent-disk cloud_properties (all keys optional).
+    #
+    # The CPI classifies the target storage as shared (cluster-visible: rbd,
+    # cephfs, nfs, cifs, glusterfs, pbs, or any storage with shared=1) or
+    # local (lvm, lvmthin, zfspool, dir, btrfs). See docs/persistent-disks.md
+    # for the full backend matrix and worked examples.
+    # ----------------------------------------------------------------------
+    #
+    # storage: ceph-rbd      # Shared backend (auto-detected by type=rbd).
+    # storage: local-zfs     # Local backend; co-locates with the owner VM.
+    # node: pve-02           # Local backend: pin disks to this node.
+    # disk_format: raw       # Required for lvm/lvmthin/zfspool block storages.
+    {}
+
+- type: replace
+  path: /networks/name=default/subnets/0/cloud_properties?
+  value:
+    bridge: ((pve_network_bridge))
+
+# Tell the director which CPI job to invoke once it's running.
+- type: replace
+  path: /instance_groups/name=bosh/properties/director/cpi_job?
+  value: pve_cpi
+
+# Insert pve_cpi job into the bosh instance group.
+- type: replace
+  path: /instance_groups/name=bosh/jobs/-
+  value:
+    name: pve_cpi
+    release: bosh-pve-cpi
+    properties:
+      pve: &pve_props
+        host: ((pve_host))
+        port: ((pve_port))
+        user: ((pve_user))
+        password: ((pve_password))
+        api_token: ((pve_api_token))
+        node: ((pve_node))
+        vm_storage: ((pve_vm_storage))
+        disk_storage: ((pve_disk_storage))
+        stemcell_storage: ((pve_stemcell_storage))
+        iso_storage: ((pve_iso_storage))
+        network_bridge: ((pve_network_bridge))
+        verify_ssl: ((pve_verify_ssl))
+        agent_mode: cloudinit
+        vm_disk_format: qcow2
+        log_level: info
+
+# cloud_provider drives create-env itself.
+- type: replace
+  path: /cloud_provider/template?
+  value:
+    name: pve_cpi
+    release: bosh-pve-cpi
+
+- type: replace
+  path: /cloud_provider/properties/pve?
+  value: *pve_props

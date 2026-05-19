@@ -1,0 +1,21 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# ///
+"""Clean build artifacts via make."""
+
+from __future__ import annotations
+
+import subprocess
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def main() -> int:
+    return subprocess.run(["make", "clean"], cwd=REPO_ROOT).returncode
+
+
+if __name__ == "__main__":
+    sys.exit(main())

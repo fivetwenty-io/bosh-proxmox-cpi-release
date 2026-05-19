@@ -1,0 +1,91 @@
+---
+name: pve_cpi
+
+description: "PVE BOSH Cloud Provider Interface"
+
+templates:
+  cpi.erb: bin/cpi
+  cpi.json.erb: config/cpi.json
+
+packages:
+  - pve_cpi
+
+properties:
+  pve.host:
+    description: "PVE host"
+  pve.port:
+    description: "PVE API port"
+    default: 8006
+  pve.user:
+    description: "PVE username"
+  pve.password:
+    description: "PVE password (mutually exclusive with api_token)"
+    default: ""
+  pve.api_token:
+    description: "PVE API token (mutually exclusive with password)"
+    default: ""
+  pve.realm:
+    description: "Authentication realm"
+    default: "pam"
+  pve.node:
+    description: "Default PVE node"
+  pve.vm_storage:
+    description: "Storage pool for VMs"
+  pve.disk_storage:
+    description: "Storage pool for persistent disks"
+  pve.stemcell_storage:
+    description: |
+      Storage pool for stemcell qcow2 images. PVE only allows uploads to
+      file-based storages (dir, nfs, cifs, glusterfs, cephfs); block-based
+      storages (lvm, lvmthin, zfspool, rbd) cannot accept qcow2 uploads and
+      are rejected at create_stemcell time. Must also be shared across all
+      cluster nodes when the cluster has more than one node. Defaults to
+      vm_storage if unset; in that case vm_storage must satisfy the same
+      constraints.
+    default: ""
+  pve.iso_storage:
+    description: |
+      Storage pool (dir/nfs/cifs with `iso` content enabled) used to hold the
+      per-VM ConfigDrive ISO. Block storages (lvm/lvmthin/zfspool) cannot
+      hold ISO files.
+    default: "local"
+  pve.network_bridge:
+    description: "Default network bridge"
+    default: "vmbr0"
+  pve.verify_ssl:
+    description: "Verify TLS certificate"
+    default: true
+  pve.agent_mode:
+    description: "Agent bootstrap mode: cloudinit, registry, noagent"
+    default: "cloudinit"
+  pve.vm_disk_format:
+    description: "Disk format: qcow2, raw, vmdk"
+    default: "qcow2"
+  pve.log_level:
+    description: "Log level"
+    default: "info"
+  pve.vmid_range_start:
+    description: |
+      Starting VMID for VM allocation. VMs are allocated in the range
+      [vmid_range_start, 5999]; default vmid_range_start is 100.
+      Persistent disks use synthetic VMIDs 9000-9999 (unchanged).
+    default: 100
+  agent.mbus:
+    description: |
+      URL the BOSH agent should bind/listen on inside the VM (the same value
+      `cloud_provider.properties.agent.mbus` carries in bosh-deployment).
+      Required for create-env: bosh-init does not pass it via the per-call
+      env argument, only via CPI config.
+    default: ""
+  agent.blobstore:
+    description: "Optional default blobstore for settings.json (agent.blobstore in bosh.yml)"
+    default: {}
+  registry.endpoint:
+    description: "BOSH registry endpoint (required if agent_mode=registry)"
+    default: ""
+  registry.user:
+    description: "Registry user"
+    default: ""
+  registry.password:
+    description: "Registry password"
+    default: ""

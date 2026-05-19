@@ -1,0 +1,112 @@
+---
+# Cloud-config for cf-deployment on the bosh-pve director.
+#
+# Single-node PVE cluster, 3 AZ aliases (z1/z2/z3) all bound to the same
+# node + bridge so cf-deployment's HA assumptions interpolate cleanly.
+#
+# Upload:
+#   bosh -e pve update-cloud-config manifests/cf/cloud-config.yml \
+#     -l manifests/bosh/vars.yml -l manifests/cf/vars.yml
+
+azs:
+- name: z1
+- name: z2
+- name: z3
+
+vm_types:
+# cf-deployment.yml references all of these by name; sizes tuned for a
+# single-node lab cluster, not production.
+- name: minimal
+  cloud_properties:
+    cores: 1
+    memory: 1024
+    disk: 8192
+    network_bridge: ((pve_network_bridge))
+
+- name: small
+  cloud_properties:
+    cores: 1
+    memory: 2048
+    disk: 16384
+    network_bridge: ((pve_network_bridge))
+
+- name: small-highmem
+  cloud_properties:
+    cores: 2
+    memory: 4096
+    disk: 16384
+    network_bridge: ((pve_network_bridge))
+
+- name: small-50GB-ephemeral-disk
+  cloud_properties:
+    cores: 1
+    memory: 2048
+    disk: 51200
+    network_bridge: ((pve_network_bridge))
+
+- name: small-highmem-100GB-ephemeral-disk
+  cloud_properties:
+    cores: 2
+    memory: 8192
+    disk: 102400
+    network_bridge: ((pve_network_bridge))
+
+- name: medium
+  cloud_properties:
+    cores: 2
+    memory: 4096
+    disk: 32768
+    network_bridge: ((pve_network_bridge))
+
+disk_types:
+- name: 5GB
+  disk_size: 5120
+  cloud_properties: {}
+- name: 10GB
+  disk_size: 10240
+  cloud_properties: {}
+- name: 100GB
+  disk_size: 102400
+  cloud_properties: {}
+
+vm_extensions:
+# cf-deployment expects these names; on PVE we have no IaaS LB / SG layer
+# so they merge an empty cloud_properties hash. Harmless.
+- name: cf-router-network-properties
+  cloud_properties: {}
+- name: diego-ssh-proxy-network-properties
+  cloud_properties: {}
+- name: cf-tcp-router-network-properties
+  cloud_properties: {}
+- name: 100GB_ephemeral_disk
+  cloud_properties:
+    disk: 102400
+- name: 50GB_ephemeral_disk
+  cloud_properties:
+    disk: 51200
+
+networks:
+- name: default
+  type: manual
+  subnets:
+  - range:   ((internal_cidr))
+    gateway: ((internal_gw))
+    dns:     [ 1.1.1.1, 8.8.8.8 ]
+    # Reserve gateway, director, and a top-of-range band for routers / infra.
+    reserved:
+    - 192.168.1.1-192.168.1.19
+    - 192.168.1.200-192.168.1.254
+    static:
+    - ((haproxy_private_ip))
+    azs:     [ z1, z2, z3 ]
+    cloud_properties:
+      bridge: ((pve_network_bridge))
+
+compilation:
+  # workers=1 until the CPI VMID allocator race is fixed; concurrent
+  # qmclone calls fight over the same VMID/PVE per-VM lock.
+  workers: 1
+  reuse_compilation_vms: true
+  az: z1
+  vm_type: medium
+  network: default

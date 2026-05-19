@@ -1,0 +1,270 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# ///
+"""BOSH CPI lifecycle harness.
+
+Exercises the bosh-pve-cpi binary end-to-end against a live PVE cluster by
+feeding JSON-RPC requests to ./bin/cpi on stdin (one process per call) and
+threading IDs between steps.
+
+Sequence (mirrors the BOSH-CPI Director call order):
+    1.  info
+    2.  create_stemcell
+    3.  create_vm
+    4.  has_vm                  (post-create assertion)
+    5.  set_vm_metadata
+    6.  create_disk
+    7.  attach_disk
+    8.  get_disks               (post-attach assertion)
+    9.  snapshot_disk
+   10.  detach_disk
+   11.  delete_snapshot
+   12.  delete_disk
+   13.  delete_vm
+   14.  delete_stemcell
+
+A failure in any step aborts the run and prints the failing JSON-RPC error.
+Cleanup is best-effort: resources created before the failure are torn down in
+reverse order.
+
+Required environment:
+    CPI_CONFIG       path to CPI JSON config (PVE credentials, node, storage)
+    STEMCELL_PATH    path to BOSH stemcell tarball (.tgz)
+
+Optional environment:
+    CPI_BIN          path to compiled cpi binary  (default: ./bin/cpi)
+    AGENT_ID         agent UUID used in create_vm (default: lifecycle-<pid>)
+    NETWORK_RANGE    CIDR for the test network    (default: 192.168.1.0/24)
+    NETWORK_GATEWAY  gateway for the test network (default: 192.168.1.1)
+    NETWORK_IP       static IP for the test VM    (default: 192.168.1.250)
+    NETWORK_BRIDGE   PVE bridge override          (default: from CPI_CONFIG)
+    VM_CORES         cores                        (default: 1)
+    VM_MEMORY_MIB    memory in MiB                (default: 1024)
+    DISK_SIZE_MIB    persistent disk size in MiB  (default: 1024)
+    TRACE            non-empty enables tracing    (default: unset)
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import random
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+
+def env(name: str, default: str | None = None, *, required: bool = False) -> str:
+    val = os.environ.get(name, default)
+    if required and not val:
+        sys.exit(f"{name} required")
+    return val or ""
+
+
+CPI_CONFIG = env("CPI_CONFIG", required=True)
+STEMCELL_PATH = env("STEMCELL_PATH", required=True)
+CPI_BIN = env("CPI_BIN", "./bin/cpi")
+AGENT_ID = env("AGENT_ID", f"lifecycle-{os.getpid()}")
+NETWORK_RANGE = env("NETWORK_RANGE", "192.168.1.0/24")
+NETWORK_GATEWAY = env("NETWORK_GATEWAY", "192.168.1.1")
+NETWORK_IP = env("NETWORK_IP", "192.168.1.250")
+NETWORK_BRIDGE = env("NETWORK_BRIDGE", "")
+VM_CORES = int(env("VM_CORES", "1"))
+VM_MEMORY_MIB = int(env("VM_MEMORY_MIB", "1024"))
+DISK_SIZE_MIB = int(env("DISK_SIZE_MIB", "1024"))
+TRACE = bool(env("TRACE", ""))
+
+if not os.access(CPI_BIN, os.X_OK):
+    sys.exit(f"CPI_BIN not executable: {CPI_BIN}")
+if not os.access(CPI_CONFIG, os.R_OK):
+    sys.exit(f"CPI_CONFIG not readable: {CPI_CONFIG}")
+if not os.access(STEMCELL_PATH, os.R_OK):
+    sys.exit(f"STEMCELL_PATH not readable: {STEMCELL_PATH}")
+
+if not NETWORK_BRIDGE:
+    with open(CPI_CONFIG) as f:
+        NETWORK_BRIDGE = json.load(f).get("network_bridge", "vmbr0")
+
+
+state: dict[str, Any] = {
+    "stemcell_cid": "",
+    "vm_cid": "",
+    "disk_cid": "",
+    "snapshot_cid": "",
+    "disk_attached": False,
+}
+
+
+def step(msg: str) -> None:
+    print()
+    print(f"==> {msg}")
+    print()
+
+
+def call(method: str, args: list[Any]) -> Any:
+    req_id = f"{time.time_ns()}-{random.randint(0, 1 << 32)}"
+    req = {
+        "method": method,
+        "arguments": args,
+        "context": {"request_id": req_id},
+        "api_version": 2,
+    }
+    if TRACE:
+        print(f"  -> {json.dumps(req)}", file=sys.stderr)
+
+    proc = subprocess.run(
+        [CPI_BIN, "--config", CPI_CONFIG],
+        input=json.dumps(req) + "\n",
+        capture_output=True,
+        text=True,
+    )
+
+    if not proc.stdout.strip():
+        raise RuntimeError(f"call {method}: empty response from cpi binary")
+
+    resp = json.loads(proc.stdout)
+    if TRACE:
+        print(f"  <- {json.dumps(resp)}", file=sys.stderr)
+
+    if resp.get("error") is not None:
+        print(f"call {method} failed:", file=sys.stderr)
+        print(json.dumps(resp["error"], indent=2), file=sys.stderr)
+        raise RuntimeError(f"{method} failed")
+
+    return resp.get("result")
+
+
+def cleanup() -> None:
+    if state["snapshot_cid"]:
+        try:
+            call("delete_snapshot", [state["snapshot_cid"]])
+        except Exception:
+            pass
+    if state["disk_attached"] and state["vm_cid"] and state["disk_cid"]:
+        try:
+            call("detach_disk", [state["vm_cid"], state["disk_cid"]])
+        except Exception:
+            pass
+    if state["disk_cid"]:
+        try:
+            call("delete_disk", [state["disk_cid"]])
+        except Exception:
+            pass
+    if state["vm_cid"]:
+        try:
+            call("delete_vm", [state["vm_cid"]])
+        except Exception:
+            pass
+    if state["stemcell_cid"]:
+        try:
+            call("delete_stemcell", [state["stemcell_cid"]])
+        except Exception:
+            pass
+
+
+def main() -> int:
+    try:
+        step("1. info")
+        info = call("info", [])
+        print(json.dumps(info, indent=2))
+
+        step(f"2. create_stemcell (image={STEMCELL_PATH})")
+        state["stemcell_cid"] = call("create_stemcell", [STEMCELL_PATH, {}])
+        print(f"stemcell_cid={state['stemcell_cid']}")
+
+        step(f"3. create_vm (agent_id={AGENT_ID}, stemcell_cid={state['stemcell_cid']})")
+        cloud_props = {"cores": VM_CORES, "memory": VM_MEMORY_MIB}
+        networks = {
+            "default": {
+                "type": "manual",
+                "ip": NETWORK_IP,
+                "netmask": "255.255.255.0",
+                "gateway": NETWORK_GATEWAY,
+                "dns": ["8.8.8.8"],
+                "default": ["dns", "gateway"],
+                "cloud_properties": {"bridge": NETWORK_BRIDGE},
+            }
+        }
+        create_vm_res = call(
+            "create_vm",
+            [AGENT_ID, state["stemcell_cid"], cloud_props, networks, [], {}],
+        )
+        state["vm_cid"] = create_vm_res[0]
+        print(f"vm_cid={state['vm_cid']}")
+
+        step("4. has_vm")
+        has_vm = call("has_vm", [state["vm_cid"]])
+        if has_vm is not True:
+            raise RuntimeError(f"has_vm returned {has_vm}, expected true")
+        print("has_vm=true")
+
+        step("5. set_vm_metadata")
+        call(
+            "set_vm_metadata",
+            [state["vm_cid"], {"deployment": "lifecycle-test", "director": "local-harness"}],
+        )
+        print("set_vm_metadata=ok")
+
+        step(f"6. create_disk (size={DISK_SIZE_MIB} MiB)")
+        state["disk_cid"] = call("create_disk", [DISK_SIZE_MIB, {}, state["vm_cid"]])
+        print(f"disk_cid={state['disk_cid']}")
+
+        step("7. attach_disk")
+        call("attach_disk", [state["vm_cid"], state["disk_cid"]])
+        state["disk_attached"] = True
+        print("attach_disk=ok")
+
+        step("8. get_disks")
+        disks = call("get_disks", [state["vm_cid"]])
+        print(f"disks={json.dumps(disks)}")
+        if state["disk_cid"] not in disks:
+            raise RuntimeError(f"get_disks did not include {state['disk_cid']}")
+
+        step("9. snapshot_disk")
+        state["snapshot_cid"] = call(
+            "snapshot_disk", [state["disk_cid"], {"deployment": "lifecycle-test"}]
+        )
+        print(f"snapshot_cid={state['snapshot_cid']}")
+
+        step("10. detach_disk")
+        call("detach_disk", [state["vm_cid"], state["disk_cid"]])
+        state["disk_attached"] = False
+        print("detach_disk=ok")
+
+        step("11. delete_snapshot")
+        call("delete_snapshot", [state["snapshot_cid"]])
+        state["snapshot_cid"] = ""
+        print("delete_snapshot=ok")
+
+        step("12. delete_disk")
+        call("delete_disk", [state["disk_cid"]])
+        state["disk_cid"] = ""
+        print("delete_disk=ok")
+
+        step("13. delete_vm")
+        call("delete_vm", [state["vm_cid"]])
+        state["vm_cid"] = ""
+        print("delete_vm=ok")
+
+        step("14. delete_stemcell")
+        call("delete_stemcell", [state["stemcell_cid"]])
+        state["stemcell_cid"] = ""
+        print("delete_stemcell=ok")
+
+        print()
+        print("==> lifecycle complete")
+        print()
+        return 0
+    except Exception as e:
+        print()
+        print(f"==> failure detected: {e} — best-effort cleanup", file=sys.stderr)
+        print()
+        cleanup()
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

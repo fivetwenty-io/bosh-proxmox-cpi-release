@@ -1,0 +1,327 @@
+package pve_test
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"strings"
+	"testing"
+
+	sdknodes "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/nodes"
+
+	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
+)
+
+// buildImportContent marshals volid strings into a ListStorageContentResponse
+// simulating PVE content-type "import" entries.
+func buildImportContent(volids ...string) *sdknodes.ListStorageContentResponse {
+	resp := make(sdknodes.ListStorageContentResponse, 0, len(volids))
+	for _, v := range volids {
+		entry := struct {
+			VolID   string `json:"volid"`
+			Content string `json:"content"`
+		}{VolID: v, Content: "import"}
+		raw, _ := json.Marshal(entry)
+		resp = append(resp, raw)
+	}
+	return &resp
+}
+
+// ---- TestBuildStemcellFilename ----
+
+func TestBuildStemcellFilename(t *testing.T) {
+	t.Parallel()
+	got := pve.BuildStemcellFilename("ubuntu-jammy", "1.234", "abc12345def67890abcdef")
+	want := "bosh-stemcell-ubuntu-jammy-1.234-abc12345.qcow2"
+	if got != want {
+		t.Errorf("BuildStemcellFilename = %q; want %q", got, want)
+	}
+}
+
+// ---- TestBuildStemcellCID ----
+
+func TestBuildStemcellCID(t *testing.T) {
+	t.Parallel()
+	got := pve.BuildStemcellCID("nfs-pool", "foo.qcow2")
+	want := "nfs-pool:import/foo.qcow2"
+	if got != want {
+		t.Errorf("BuildStemcellCID = %q; want %q", got, want)
+	}
+}
+
+// ---- TestParseStemcellCID_Valid ----
+
+func TestParseStemcellCID_Valid(t *testing.T) {
+	t.Parallel()
+	storage, path, err := pve.ParseStemcellCID("nfs-pool:import/foo.qcow2")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if storage != "nfs-pool" {
+		t.Errorf("storage = %q; want %q", storage, "nfs-pool")
+	}
+	if path != "import/foo.qcow2" {
+		t.Errorf("volumePath = %q; want %q", path, "import/foo.qcow2")
+	}
+}
+
+// ---- TestFindStemcellByFilename_Found ----
+
+func TestFindStemcellByFilename_Found(t *testing.T) {
+	t.Parallel()
+
+	// mockClient is defined in task_test.go (same pve_test package).
+	// Wire only the nodes service; all other accessors return nil.
+	client := &mockClient{
+		nodesSvc: &stubNodesService{
+			listStorageContentFn: func(_ context.Context, _, _ string, _ *sdknodes.ListStorageContentParams) (*sdknodes.ListStorageContentResponse, error) {
+				return buildImportContent("nfs-pool:import/foo.qcow2"), nil
+			},
+		},
+	}
+
+	volid, err := pve.FindStemcellByFilename(context.Background(), client, "pve", "nfs-pool", "foo.qcow2")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if volid != "nfs-pool:import/foo.qcow2" {
+		t.Errorf("volid = %q; want %q", volid, "nfs-pool:import/foo.qcow2")
+	}
+}
+
+// ---- ParseStemcellCID edge cases ----
+
+func TestParseStemcellCID_Empty(t *testing.T) {
+	t.Parallel()
+	_, _, err := pve.ParseStemcellCID("")
+	if err == nil {
+		t.Fatal("expected error for empty CID, got nil")
+	}
+}
+
+func TestParseStemcellCID_IntegerLegacyFormat(t *testing.T) {
+	t.Parallel()
+	_, _, err := pve.ParseStemcellCID("5042")
+	if err == nil {
+		t.Fatal("expected error for legacy integer CID, got nil")
+	}
+}
+
+func TestParseStemcellCID_NoColon(t *testing.T) {
+	t.Parallel()
+	_, _, err := pve.ParseStemcellCID("foopath")
+	if err == nil {
+		t.Fatal("expected error for CID missing ':', got nil")
+	}
+}
+
+func TestParseStemcellCID_MissingImportPrefix(t *testing.T) {
+	t.Parallel()
+	_, _, err := pve.ParseStemcellCID("storage:other/foo.qcow2")
+	if err == nil {
+		t.Fatal("expected error for CID without 'import/' prefix, got nil")
+	}
+}
+
+func TestParseStemcellCID_EmptyFilename(t *testing.T) {
+	t.Parallel()
+	// "storage:import/" has an empty filename segment. The format check passes
+	// (path starts with "import/") so ParseStemcellCID succeeds, returning an
+	// empty filename. Callers validate the filename separately.
+	storage, path, err := pve.ParseStemcellCID("storage:import/")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if storage != "storage" {
+		t.Errorf("storage = %q; want %q", storage, "storage")
+	}
+	if path != "import/" {
+		t.Errorf("volumePath = %q; want %q", path, "import/")
+	}
+}
+
+func TestParseStemcellCID_MultipleColons(t *testing.T) {
+	t.Parallel()
+	// Design choice: storage = first segment before ':', path = everything after.
+	// "storage:import/has:colon.qcow2" → storage="storage", path="import/has:colon.qcow2".
+	storage, path, err := pve.ParseStemcellCID("storage:import/has:colon.qcow2")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if storage != "storage" {
+		t.Errorf("storage = %q; want %q", storage, "storage")
+	}
+	if path != "import/has:colon.qcow2" {
+		t.Errorf("volumePath = %q; want %q", path, "import/has:colon.qcow2")
+	}
+}
+
+// ---- FindStemcellByFilename edge cases ----
+
+func TestFindStemcellByFilename_NotFound(t *testing.T) {
+	t.Parallel()
+	client := &mockClient{
+		nodesSvc: &stubNodesService{
+			listStorageContentFn: func(_ context.Context, _, _ string, _ *sdknodes.ListStorageContentParams) (*sdknodes.ListStorageContentResponse, error) {
+				return buildImportContent("nfs-pool:import/other.qcow2"), nil
+			},
+		},
+	}
+	volid, err := pve.FindStemcellByFilename(context.Background(), client, "pve", "nfs-pool", "foo.qcow2")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if volid != "" {
+		t.Errorf("expected empty volid for no match, got %q", volid)
+	}
+}
+
+func TestFindStemcellByFilename_APIError(t *testing.T) {
+	t.Parallel()
+	apiErr := errors.New("storage not available")
+	client := &mockClient{
+		nodesSvc: &stubNodesService{
+			listStorageContentFn: func(_ context.Context, _, _ string, _ *sdknodes.ListStorageContentParams) (*sdknodes.ListStorageContentResponse, error) {
+				return nil, apiErr
+			},
+		},
+	}
+	_, err := pve.FindStemcellByFilename(context.Background(), client, "pve", "nfs-pool", "foo.qcow2")
+	if err == nil {
+		t.Fatal("expected error propagated from API, got nil")
+	}
+	if !errors.Is(err, apiErr) {
+		t.Errorf("expected wrapped apiErr, got %v", err)
+	}
+}
+
+func TestFindStemcellByFilename_NilResponse(t *testing.T) {
+	t.Parallel()
+	// SDK returns nil response pointer with no error → function returns ("", nil).
+	client := &mockClient{
+		nodesSvc: &stubNodesService{
+			listStorageContentFn: func(_ context.Context, _, _ string, _ *sdknodes.ListStorageContentParams) (*sdknodes.ListStorageContentResponse, error) {
+				return nil, nil
+			},
+		},
+	}
+	volid, err := pve.FindStemcellByFilename(context.Background(), client, "pve", "nfs-pool", "foo.qcow2")
+	if err != nil {
+		t.Fatalf("unexpected error for nil response: %v", err)
+	}
+	if volid != "" {
+		t.Errorf("expected empty volid for nil response, got %q", volid)
+	}
+}
+
+func TestFindStemcellByFilename_EmptyList(t *testing.T) {
+	t.Parallel()
+	client := &mockClient{
+		nodesSvc: &stubNodesService{
+			listStorageContentFn: func(_ context.Context, _, _ string, _ *sdknodes.ListStorageContentParams) (*sdknodes.ListStorageContentResponse, error) {
+				return buildImportContent(), nil
+			},
+		},
+	}
+	volid, err := pve.FindStemcellByFilename(context.Background(), client, "pve", "nfs-pool", "foo.qcow2")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if volid != "" {
+		t.Errorf("expected empty volid for empty list, got %q", volid)
+	}
+}
+
+func TestFindStemcellByFilename_MalformedItem(t *testing.T) {
+	t.Parallel()
+	// Design choice: malformed JSON items (not valid storageContentItem) are
+	// skipped silently. A single well-formed match after the malformed entry
+	// is still found.
+	resp := make(sdknodes.ListStorageContentResponse, 0, 2)
+	resp = append(resp, json.RawMessage(`{not valid json`))
+	goodEntry, _ := json.Marshal(struct {
+		VolID   string `json:"volid"`
+		Content string `json:"content"`
+	}{VolID: "nfs-pool:import/foo.qcow2", Content: "import"})
+	resp = append(resp, json.RawMessage(goodEntry))
+
+	client := &mockClient{
+		nodesSvc: &stubNodesService{
+			listStorageContentFn: func(_ context.Context, _, _ string, _ *sdknodes.ListStorageContentParams) (*sdknodes.ListStorageContentResponse, error) {
+				return &resp, nil
+			},
+		},
+	}
+	volid, err := pve.FindStemcellByFilename(context.Background(), client, "pve", "nfs-pool", "foo.qcow2")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if volid != "nfs-pool:import/foo.qcow2" {
+		t.Errorf("expected match after malformed entry, got %q", volid)
+	}
+}
+
+// ---- BuildStemcellFilename sanitization edge cases ----
+
+func TestBuildStemcellFilename_UppercaseLowered(t *testing.T) {
+	t.Parallel()
+	got := pve.BuildStemcellFilename("Ubuntu", "1.0", "abcdef1234567890")
+	want := "bosh-stemcell-ubuntu-1.0-abcdef12.qcow2"
+	if got != want {
+		t.Errorf("BuildStemcellFilename = %q; want %q", got, want)
+	}
+}
+
+func TestBuildStemcellFilename_SpacesReplaced(t *testing.T) {
+	t.Parallel()
+	got := pve.BuildStemcellFilename("ubuntu jammy", "1.0", "abcdef1234567890")
+	want := "bosh-stemcell-ubuntu-jammy-1.0-abcdef12.qcow2"
+	if got != want {
+		t.Errorf("BuildStemcellFilename = %q; want %q", got, want)
+	}
+}
+
+func TestBuildStemcellFilename_SpecialChars(t *testing.T) {
+	t.Parallel()
+	// '/', '@' are not in [a-z0-9._] so each collapses to a single '-'.
+	got := pve.BuildStemcellFilename("foo/bar@baz", "1.0", "abcdef1234567890")
+	want := "bosh-stemcell-foo-bar-baz-1.0-abcdef12.qcow2"
+	if got != want {
+		t.Errorf("BuildStemcellFilename = %q; want %q", got, want)
+	}
+}
+
+func TestBuildStemcellFilename_LongInputTruncated(t *testing.T) {
+	t.Parallel()
+	// Name 300 chars + version 300 chars exceeds maxStemcellFilenameLen (200).
+	// Result must be ≤ 255 chars total (NAME_MAX).
+	longName := strings.Repeat("a", 300)
+	longVersion := strings.Repeat("b", 300)
+	got := pve.BuildStemcellFilename(longName, longVersion, "abcdef1234567890")
+	// suffix "-abcdef12.qcow2" = 15 chars; total must be ≤ 255.
+	if len(got) > 255 {
+		t.Errorf("BuildStemcellFilename length %d exceeds 255 (NAME_MAX)", len(got))
+	}
+	if !strings.HasSuffix(got, ".qcow2") {
+		t.Errorf("BuildStemcellFilename %q missing .qcow2 suffix", got)
+	}
+}
+
+func TestBuildStemcellFilename_ShortSHA(t *testing.T) {
+	t.Parallel()
+	// sha256hex < 8 chars → function uses "00000000" placeholder.
+	got := pve.BuildStemcellFilename("ubuntu", "1.0", "abc")
+	if !strings.HasSuffix(got, "-00000000.qcow2") {
+		t.Errorf("BuildStemcellFilename with short sha = %q; want suffix -00000000.qcow2", got)
+	}
+}
+
+func TestBuildStemcellFilename_EmptySHA(t *testing.T) {
+	t.Parallel()
+	// Empty sha → same "00000000" placeholder.
+	got := pve.BuildStemcellFilename("ubuntu", "1.0", "")
+	if !strings.HasSuffix(got, "-00000000.qcow2") {
+		t.Errorf("BuildStemcellFilename with empty sha = %q; want suffix -00000000.qcow2", got)
+	}
+}
+

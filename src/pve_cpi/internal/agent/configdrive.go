@@ -1,0 +1,259 @@
+package agent
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"strconv"
+
+	"github.com/fivetwenty-io/bosh-pve-cpi/internal/configdrive"
+	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
+	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
+	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
+	sdknodes "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/nodes"
+)
+
+// configDriveSlot is the SCSI bus slot used to attach the ConfigDrive ISO as
+// a CD-ROM. The stemcell finds it by volume label (CONFIG-2 / config-2), so
+// the slot index does not need to match a path the agent expects. PVE
+// exposes scsi0–scsi30 (31 slots total). Reservation map:
+//
+//	virtio0         system disk (stemcell-imported root).
+//	scsi0           unused (kept free for clarity; AttachDisk starts at scsi1).
+//	scsi1..scsi28   ephemeral + persistent disks (create_vm + attach_disk).
+//	scsi29          reserved headroom (unused; leaves space for future use).
+//	scsi30          ConfigDrive CD-ROM (this constant).
+//
+// Picking scsi30 — rather than scsi6, the historic choice — keeps the
+// CD-ROM out of NextIndexForBus's path so attach_disk never overwrites it
+// regardless of how many persistent disks the VM carries. create_vm
+// enforces the matching cap of 28 persistent disks at creation time.
+const configDriveSlot = "scsi30"
+
+// configDriveSlotIndex is the integer index of configDriveSlot (30), used
+// with nodes.UpdateQemuConfigParams.Scsi.
+const configDriveSlotIndex = 30
+
+// Compile-time assertion: ConfigDrive satisfies Agent.
+var _ Agent = (*ConfigDrive)(nil)
+
+// ConfigDrive writes BOSH agent settings via an OpenStack ConfigDrive ISO
+// attached as a CD-ROM. The ISO contains the raw settings.json bytes at
+// /ec2/latest/user-data (and /ec2/latest/meta-data.json) so the bosh-agent on
+// an OpenStack stemcell can read them via the ConfigDrive datasource —
+// without depending on a cloud-init runcmd to restart a specific systemd unit.
+//
+// This is the only cloud-init bootstrap path for the CPI.
+type ConfigDrive struct {
+	storage string
+	pveSvc  pve.Client
+	logger  *log.Logger
+}
+
+// NewConfigDrive constructs a ConfigDrive bound to the given PVE client.
+// pveClient, logger must not be nil; storage must not be empty.
+func NewConfigDrive(pveClient pve.Client, storage string, logger *log.Logger) *ConfigDrive {
+	if pveClient == nil {
+		panic("agent: NewConfigDrive: pveClient must not be nil")
+	}
+	if logger == nil {
+		panic("agent: NewConfigDrive: logger must not be nil")
+	}
+	if storage == "" {
+		panic("agent: NewConfigDrive: storage must not be empty")
+	}
+	return &ConfigDrive{
+		storage: storage,
+		pveSvc:  pveClient,
+		logger:  logger,
+	}
+}
+
+// newConfigDriveForTest builds a ConfigDrive directly from a fake pve.Client.
+// Tests only; production code always calls NewConfigDrive.
+func newConfigDriveForTest(pveSvc pve.Client, storage string, logger *log.Logger) *ConfigDrive {
+	return &ConfigDrive{pveSvc: pveSvc, storage: storage, logger: logger}
+}
+
+// Configure builds the ConfigDrive ISO, uploads it to PVE storage, and
+// attaches it to the VM as a CD-ROM on scsi30 (see configDriveSlot for
+// the SCSI-slot reservation map).
+//
+//  1. Build settings.json (with the MBus-from-blobstore fallback).
+//  2. Author the ISO via go-diskfs (ConfigDrive v2 layout, Rock Ridge,
+//     volume label "config-2").
+//  3. Upload via Storage().Upload (content=iso).
+//  4. Attach via Nodes().UpdateQemuConfig with scsi30 entry.
+//  5. Remove the local temp file unconditionally on the way out.
+func (a *ConfigDrive) Configure(ctx context.Context, node string, vmid int, cfg AgentConfig) error {
+	if ctx == nil {
+		return cpierrors.Cloud("agent configure: ctx must not be nil")
+	}
+	if node == "" {
+		return cpierrors.Cloud("agent configure: node must not be empty")
+	}
+	if vmid <= 0 {
+		return cpierrors.Cloud("agent configure: vmid must be positive, got %d", vmid)
+	}
+
+	a.logger.Debug("configdrive: configure",
+		log.String("node", node),
+		log.Int("vmid", vmid),
+		log.String("agent_id", cfg.AgentID),
+	)
+
+	settings, fallbackApplied := buildSettings(cfg, vmid)
+	if fallbackApplied {
+		a.logger.Info("configdrive: mbus empty; derived from blobstore endpoint",
+			log.String("mbus", settings.MBus),
+		)
+	}
+
+	payload, err := json.Marshal(settings)
+	if err != nil {
+		return cpierrors.Wrap(err, fmt.Sprintf("agent configure vm %d: marshal settings.json", vmid))
+	}
+
+	isoPath, cleanup, err := configdrive.Build(payload)
+	if err != nil {
+		return cpierrors.Wrap(err, fmt.Sprintf("agent configure vm %d: build configdrive iso", vmid))
+	}
+	defer func() {
+		cleanup()
+	}()
+
+	filename := configDriveISOFilename(vmid)
+
+	// Pre-delete any orphan ISO sitting under the same filename. PVE rejects
+	// `content=iso` uploads with HTTP 409 when the target name is taken, so a
+	// botched earlier create_vm (or a VMID recycled out-of-band) would wedge
+	// every subsequent attempt at the same vmid. 404 is tolerated; any other
+	// failure short-circuits before the upload.
+	if existed, rmErr := a.removeISOIfExists(ctx, node, filename); rmErr != nil {
+		return cpierrors.Wrap(rmErr, fmt.Sprintf("agent configure vm %d: pre-delete stale configdrive iso", vmid))
+	} else if existed {
+		a.logger.Warn("configdrive: removed stale orphan iso before upload",
+			log.String("node", node),
+			log.Int("vmid", vmid),
+			log.String("filename", filename),
+		)
+	}
+
+	if err := a.uploadISO(ctx, node, isoPath, filename); err != nil {
+		return cpierrors.Wrap(err, fmt.Sprintf("agent configure vm %d: upload configdrive iso", vmid))
+	}
+
+	if err := a.attachISO(ctx, node, vmid, filename); err != nil {
+		// Best-effort cleanup: if attach failed, remove the uploaded ISO so
+		// it does not linger as an orphan in the storage pool.
+		if rmErr := a.removeISOFromStorage(ctx, node, filename); rmErr != nil {
+			a.logger.Warn("configdrive: failed to remove orphan ISO after attach failure",
+				log.String("filename", filename),
+				log.Err(rmErr),
+			)
+		}
+		return cpierrors.Wrap(err, fmt.Sprintf("agent configure vm %d: attach configdrive iso", vmid))
+	}
+
+	a.logger.Info("configdrive: configured",
+		log.String("node", node),
+		log.Int("vmid", vmid),
+		log.String("slot", configDriveSlot),
+	)
+	return nil
+}
+
+// Remove deletes the ConfigDrive ISO for vmid from the PVE storage pool. A
+// 404 is treated as success (idempotent) so callers may invoke this during
+// delete_vm without checking whether the agent was ever configured.
+func (a *ConfigDrive) Remove(ctx context.Context, node string, vmid int) error {
+	if ctx == nil {
+		return cpierrors.Cloud("agent remove: ctx must not be nil")
+	}
+	if node == "" {
+		return cpierrors.Cloud("agent remove: node must not be empty")
+	}
+	if vmid <= 0 {
+		return cpierrors.Cloud("agent remove: vmid must be positive, got %d", vmid)
+	}
+
+	filename := configDriveISOFilename(vmid)
+	if err := a.removeISOFromStorage(ctx, node, filename); err != nil {
+		return cpierrors.Wrap(err, fmt.Sprintf("agent remove vm %d: delete configdrive iso", vmid))
+	}
+	a.logger.Info("configdrive: removed configdrive iso",
+		log.String("node", node),
+		log.Int("vmid", vmid),
+	)
+	return nil
+}
+
+// UpdateDiskHints is a no-op: BOSH v2 passes disk hints via attach_disk
+// return values; ConfigDrive does not maintain a registry record to patch.
+func (a *ConfigDrive) UpdateDiskHints(_ context.Context, _ int, _ []DiskHint) error {
+	return nil
+}
+
+func (a *ConfigDrive) uploadISO(ctx context.Context, node, localPath, filename string) error {
+	f, err := os.Open(localPath)
+	if err != nil {
+		return fmt.Errorf("open local iso: %w", err)
+	}
+	defer f.Close()
+
+	upid, err := a.pveSvc.Storage().Upload(ctx, node, a.storage, "iso", filename, f)
+	if err != nil {
+		return pve.WrapError(err)
+	}
+	// Upload returns a UPID (async storage task). The file is not yet
+	// visible to subsequent calls (e.g. attaching as a CD-ROM) until the
+	// task completes. Await it before returning.
+	if upid == "" {
+		return nil
+	}
+	if waitErr := pve.AwaitTaskWithLogger(ctx, a.pveSvc, node, upid, a.logger); waitErr != nil {
+		return waitErr
+	}
+	return nil
+}
+
+func (a *ConfigDrive) attachISO(ctx context.Context, node string, vmid int, filename string) error {
+	value := fmt.Sprintf("%s:iso/%s,media=cdrom", a.storage, filename)
+	params := &sdknodes.UpdateQemuConfigParams{
+		Scsi: map[int]string{configDriveSlotIndex: value},
+	}
+	if err := a.pveSvc.Nodes().UpdateQemuConfig(ctx, node, strconv.Itoa(vmid), params); err != nil {
+		return pve.WrapError(err)
+	}
+	return nil
+}
+
+// removeISOIfExists deletes the configdrive ISO at `filename` and reports
+// whether anything was actually removed. Callers (Configure's pre-delete
+// path) use the existed flag to log a warning when a stale orphan was
+// found. 404 is treated as "did not exist" (returns false, nil); other
+// errors propagate.
+func (a *ConfigDrive) removeISOIfExists(ctx context.Context, node, filename string) (bool, error) {
+	volume := fmt.Sprintf("%s:iso/%s", a.storage, filename)
+	existed, err := a.pveSvc.Storage().DeleteVolumeIfExists(ctx, node, a.storage, volume)
+	if err != nil {
+		return false, pve.WrapError(err)
+	}
+	return existed, nil
+}
+
+// removeISOFromStorage issues a DELETE for the configdrive ISO volume and
+// treats 404 as success (idempotent). The SDK's DeleteVolume already swallows
+// 404 internally.
+func (a *ConfigDrive) removeISOFromStorage(ctx context.Context, node, filename string) error {
+	volume := fmt.Sprintf("%s:iso/%s", a.storage, filename)
+	if err := a.pveSvc.Storage().DeleteVolume(ctx, node, a.storage, volume); err != nil {
+		return pve.WrapError(err)
+	}
+	return nil
+}
+
+func configDriveISOFilename(vmid int) string {
+	return fmt.Sprintf("vm-%d-config.iso", vmid)
+}

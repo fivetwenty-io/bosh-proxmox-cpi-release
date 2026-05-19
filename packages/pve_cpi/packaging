@@ -1,0 +1,36 @@
+#!/bin/bash
+set -euo pipefail
+
+GOROOT=/var/vcap/packages/golang-1.26
+if [ ! -d "${GOROOT}" ]; then
+  GOROOT="$(dirname "${BOSH_INSTALL_TARGET}")/golang-1.26"
+fi
+# Packaged Go is Linux ELF; fall back to host `go` if it can't execute here
+# (e.g. macOS operator host running `bosh create-env`).
+if ! "${GOROOT}/bin/go" version >/dev/null 2>&1; then
+  if command -v go >/dev/null 2>&1; then
+    GOROOT="$(go env GOROOT)"
+  else
+    echo "ERROR: packaged Go cannot execute on this host and no host 'go' found in PATH" >&2
+    exit 1
+  fi
+fi
+export GOROOT
+export PATH=${GOROOT}/bin:${PATH}
+export GOCACHE=${BOSH_COMPILE_TARGET}/.gocache
+export GOMODCACHE=${BOSH_COMPILE_TARGET}/.gomodcache
+
+mkdir -p "${BOSH_INSTALL_TARGET}/bin"
+
+pushd "${BOSH_COMPILE_TARGET}/pve_cpi" >/dev/null
+  go build \
+    -mod=vendor \
+    -trimpath \
+    -ldflags "-s -w \
+      -X github.com/fivetwenty-io/bosh-pve-cpi/internal/version.Version=${BOSH_PACKAGE_VERSION:-0.0.0+dev} \
+      -X github.com/fivetwenty-io/bosh-pve-cpi/internal/version.BuildDate=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    -o "${BOSH_INSTALL_TARGET}/bin/cpi" \
+    ./cmd/cpi
+popd >/dev/null
+
+echo "==> pve_cpi built at ${BOSH_INSTALL_TARGET}/bin/cpi"

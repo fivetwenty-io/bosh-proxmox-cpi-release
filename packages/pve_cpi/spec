@@ -1,0 +1,12 @@
+---
+name: pve_cpi
+
+dependencies:
+  - golang-1.26
+
+files:
+  - pve_cpi/cmd/**/*.go
+  - pve_cpi/internal/**/*.go
+  - pve_cpi/go.mod
+  - pve_cpi/go.sum
+  - pve_cpi/vendor/**/*

@@ -1,0 +1,47 @@
+---
+# Minimal cloud-config for the bosh-pve CPI. Upload to the director with:
+#   bosh -e bosh-pve update-cloud-config manifests/bosh/cloud-config.yml \
+#     -l manifests/bosh/vars.yml
+
+azs:
+- name: z1
+
+vm_types:
+- name: default
+  cloud_properties:
+    cores: 1
+    memory: 1024
+    disk: 8192
+    network_bridge: ((pve_network_bridge))
+
+- name: small
+  cloud_properties:
+    cores: 1
+    memory: 2048
+    disk: 16384
+    network_bridge: ((pve_network_bridge))
+
+disk_types:
+- name: default
+  disk_size: 1024
+  cloud_properties: {}
+
+networks:
+- name: default
+  type: manual
+  subnets:
+  - range:    ((internal_cidr))
+    gateway:  ((internal_gw))
+    dns:      [ 1.1.1.1, 8.8.8.8 ]
+    # Reserve the director plus a small infra band; rest of /24 is free.
+    reserved: [ ((internal_gw)), ((internal_ip)) ]
+    az:       z1
+    cloud_properties:
+      bridge: ((pve_network_bridge))
+
+compilation:
+  workers:     2
+  reuse_compilation_vms: true
+  az:          z1
+  vm_type:     default
+  network:     default

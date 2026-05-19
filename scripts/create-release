@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+#
+# Build a BOSH release tarball for bosh-pve-cpi.
+#
+# Usage:
+#   scripts/create-release            # dev release (timestamped)
+#   scripts/create-release dev        # dev release (timestamped)
+#   scripts/create-release X.Y.Z      # final release
+#
+# Side effects:
+#   - removes prior bin/, coverage, and *.tgz artifacts via `make release-clean`
+#   - writes ./bosh-pve-cpi-dev-<UTC-ts>.tgz (dev) or ./bosh-pve-cpi-<X.Y.Z>.tgz (final)
+#   - if manifests/bosh/vars.yml exists, rewrites its `pve_cpi_release_path:` line to
+#     point at the newly built tarball's absolute path
+#   - for a final release: git add + commit + tag v<X.Y.Z>
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "${REPO_ROOT}"
+
+RELEASE_NAME="bosh-pve-cpi"
+VERSION="${1:-dev}"
+
+GREEN='\033[1;32m'
+YELLOW='\033[1;33m'
+RESET='\033[0m'
+
+echo -e "${GREEN}==> Cleaning release artifacts${RESET}"
+make release-clean
+
+if [[ "${VERSION}" == "dev" ]]; then
+  TS="$(date -u +%Y%m%d%H%M%S)"
+  TARBALL="${REPO_ROOT}/${RELEASE_NAME}-dev-${TS}.tgz"
+  echo -e "${GREEN}==> bosh create-release (dev, ts=${TS})${RESET}"
+  bosh create-release --force --tarball="${TARBALL}"
+else
+  TARBALL="${REPO_ROOT}/${RELEASE_NAME}-${VERSION}.tgz"
+  echo -e "${GREEN}==> bosh create-release (version=${VERSION})${RESET}"
+  bosh create-release --force --version="${VERSION}" --tarball="${TARBALL}"
+fi
+
+echo -e "${GREEN}✓ ${TARBALL}${RESET}"
+
+VARS_FILE="${REPO_ROOT}/manifests/bosh/vars.yml"
+if [[ -f "${VARS_FILE}" ]]; then
+  echo -e "${GREEN}==> Updating pve_cpi_release_path in manifests/bosh/vars.yml${RESET}"
+  # Portable across BSD/GNU sed by using awk + temp file rather than sed -i.
+  tmp="$(mktemp)"
+  awk -v path="${TARBALL}" '
+    /^[[:space:]]*pve_cpi_release_path:/ {
+      sub(/:.*/, ": " path)
+    }
+    { print }
+  ' "${VARS_FILE}" > "${tmp}"
+  mv "${tmp}" "${VARS_FILE}"
+  echo "   pve_cpi_release_path: ${TARBALL}"
+else
+  echo -e "${YELLOW}note: manifests/bosh/vars.yml not present — skipping vars rewrite${RESET}"
+fi
+
+if [[ "${VERSION}" != "dev" ]]; then
+  echo -e "${GREEN}==> Committing final release ${VERSION}${RESET}"
+  git add .
+  git commit -m "Final release ${VERSION}"
+  git tag -a "v${VERSION}" -m "Version ${VERSION}"
+  echo -e "${YELLOW}Don't forget: git push --follow-tags${RESET}"
+fi
+
+echo -e "${GREEN}Done.${RESET}"

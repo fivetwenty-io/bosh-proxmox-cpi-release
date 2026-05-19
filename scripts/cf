@@ -1,0 +1,164 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["requests"]
+# ///
+"""Manage the cloudfoundry deployment on the bosh-pve director.
+
+Usage:
+    ./scripts/cf <command> [args...]
+
+Commands:
+    deploy             Run all steps: runtime-config, cloud-config, stemcell, bosh-deploy.
+    runtime-config     Upload the DNS runtime-config.
+    cloud-config       Upload the cf cloud-config.
+    stemcell           Upload the stemcell pinned by cf-deployment (skips if present).
+    bosh-deploy        Run only the bosh deploy step.
+    help               Show this message.
+
+Extra args after the command are forwarded to the underlying bosh deploy
+invocation (only meaningful for `deploy` and `bosh-deploy`).
+
+Assumes:
+    - bosh CLI is logged into the 'pve' alias (bosh -e pve env succeeds).
+    - ~/w/cloudfoundry/cf-deployment is checked out.
+    - ~/w/cloudfoundry/bosh-deployment is checked out (for the dns runtime config).
+"""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+import requests
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+CF_DEPLOYMENT = Path(os.environ.get("CF_DEPLOYMENT", Path.home() / "w/cloudfoundry/cf-deployment"))
+BOSH_DEPLOYMENT = Path(os.environ.get("BOSH_DEPLOYMENT", Path.home() / "w/cloudfoundry/bosh-deployment"))
+ENV = os.environ.get("BOSH_ENV", "pve")
+DEPLOYMENT = os.environ.get("BOSH_DEPLOYMENT_NAME", "cf")
+
+
+def banner(title: str) -> None:
+    print()
+    print(f">>> {title}")
+    print()
+
+
+def run(*cmd: str) -> None:
+    subprocess.run(cmd, check=True)
+
+
+def capture(*cmd: str) -> str:
+    return subprocess.run(cmd, check=True, capture_output=True, text=True).stdout.strip()
+
+
+def stemcell_sha1(name: str, version: str) -> str:
+    resp = requests.get(f"https://bosh.io/api/v1/stemcells/{name}", timeout=30)
+    resp.raise_for_status()
+    match = next((s for s in resp.json() if s.get("version") == version), None)
+    sha1 = (match or {}).get("regular", {}).get("sha1")
+    if not sha1:
+        sys.exit(f"sha1 not found for {version}")
+    return sha1
+
+
+def cmd_runtime_config(_extra: list[str]) -> None:
+    banner("DNS runtime-config")
+    run(
+        "bosh", "-e", ENV, "-n", "update-runtime-config",
+        str(BOSH_DEPLOYMENT / "runtime-configs/dns.yml"),
+        "--name", "dns",
+    )
+
+
+def cmd_cloud_config(_extra: list[str]) -> None:
+    banner("Cloud-config")
+    run(
+        "bosh", "-e", ENV,  "-n","update-cloud-config",
+        "manifests/cf/cloud-config.yml",
+        "-l", "manifests/bosh/vars.yml",
+        "-l", "manifests/cf/vars.yml",
+    )
+
+
+def cmd_stemcell(_extra: list[str]) -> None:
+    banner("Stemcell")
+    manifest = str(CF_DEPLOYMENT / "cf-deployment.yml")
+    os_name = capture("bosh", "int", manifest, "--path=/stemcells/alias=default/os")
+    version = capture("bosh", "int", manifest, "--path=/stemcells/alias=default/version")
+    name = f"bosh-openstack-kvm-{os_name}"
+    print(f"    stemcell: {name} v{version}")
+
+    existing = subprocess.run(
+        ["bosh", "-e", ENV, "stemcells", "--json"],
+        capture_output=True, text=True, check=False,
+    ).stdout
+    if name in existing and version in existing:
+        print("    already uploaded; skipping")
+        return
+
+    url = f"https://bosh.io/d/stemcells/{name}?v={version}"
+    sha1 = stemcell_sha1(name, version)
+    print(f"    sha1: {sha1}")
+    print()
+    run("bosh", "-e", ENV, "-n", "upload-stemcell", "--sha1", sha1, url)
+
+
+def cmd_bosh_deploy(extra: list[str]) -> None:
+    banner("Deploy")
+    run(
+        "bosh", "-e", ENV, "-n", "-d", DEPLOYMENT, "deploy",
+        str(CF_DEPLOYMENT / "cf-deployment.yml"),
+        "-o", str(CF_DEPLOYMENT / "operations/use-compiled-releases.yml"),
+        "-o", str(CF_DEPLOYMENT / "operations/use-haproxy.yml"),
+        "-o", "manifests/cf/ops-serialize-deploy.yml",
+        "-l", "manifests/bosh/vars.yml",
+        "-l", "manifests/cf/vars.yml",
+        *extra,
+    )
+
+
+def cmd_deploy(extra: list[str]) -> None:
+    cmd_runtime_config([])
+    cmd_cloud_config([])
+    cmd_stemcell([])
+    cmd_bosh_deploy(extra)
+
+
+COMMANDS = {
+    "deploy": cmd_deploy,
+    "runtime-config": cmd_runtime_config,
+    "cloud-config": cmd_cloud_config,
+    "stemcell": cmd_stemcell,
+    "bosh-deploy": cmd_bosh_deploy,
+}
+
+
+def usage(stream=sys.stdout) -> None:
+    print(__doc__, file=stream)
+
+
+def main(argv: list[str]) -> None:
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        usage()
+        return
+
+    command, extra = argv[0], argv[1:]
+    handler = COMMANDS.get(command)
+    if handler is None:
+        print(f"unknown command: {command}", file=sys.stderr)
+        usage(sys.stderr)
+        sys.exit(2)
+
+    os.chdir(REPO_ROOT)
+    handler(extra)
+
+
+if __name__ == "__main__":
+    try:
+        main(sys.argv[1:])
+    except subprocess.CalledProcessError as e:
+        sys.exit(e.returncode)

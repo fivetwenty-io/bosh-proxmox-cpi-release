@@ -1,0 +1,14 @@
+{
+  "method": "create_vm",
+  "arguments": ["agent-id-1", "stemcell-cid-1", {"instance_type": "standard"}, {"network0": {"type": "dynamic"}}, [], {"bosh": {"password": "secret"}}],
+  "context": {
+    "director_uuid": "550e8400-e29b-41d4-a716-446655440000",
+    "request_id": "cpi-abc123",
+    "vm": {
+      "stemcell": {
+        "api_version": 2
+      }
+    }
+  },
+  "api_version": 2
+}

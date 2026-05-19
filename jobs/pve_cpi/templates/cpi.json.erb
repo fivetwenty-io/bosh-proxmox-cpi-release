@@ -1,0 +1,35 @@
+<%=
+  config = {
+    "host"             => p("pve.host"),
+    "port"             => p("pve.port"),
+    "user"             => p("pve.user"),
+    "password"         => p("pve.password"),
+    "api_token"        => p("pve.api_token"),
+    "realm"            => p("pve.realm"),
+    "node"             => p("pve.node"),
+    "vm_storage"       => p("pve.vm_storage"),
+    "disk_storage"     => p("pve.disk_storage"),
+    "stemcell_storage" => p("pve.stemcell_storage"),
+    "iso_storage"      => p("pve.iso_storage"),
+    "network_bridge"   => p("pve.network_bridge"),
+    "verify_ssl"       => p("pve.verify_ssl"),
+    "agent_mode"       => p("pve.agent_mode"),
+    "vm_disk_format"   => p("pve.vm_disk_format"),
+    "log_level"        => p("pve.log_level"),
+    "vmid_range_start" => p("pve.vmid_range_start"),
+  }
+
+  # cloud_provider.properties.agent.mbus is the URL the agent listens on.
+  # bosh-init does NOT pass it via the per-call env argument; it lives only
+  # in CPI config. Forward it (and the optional agent.blobstore) so create_vm
+  # can stamp it into settings.json.
+  if_p("agent.mbus") { |v| config["agent_mbus"] = v }
+  if_p("agent.blobstore") { |v| config["agent_blobstore"] = v }
+
+  if p("pve.agent_mode") == "registry"
+    config["registry_endpoint"] = p("registry.endpoint")
+    config["registry_user"]     = p("registry.user")
+    config["registry_password"] = p("registry.password")
+  end
+  JSON.dump(config)
+%>

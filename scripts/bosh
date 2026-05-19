@@ -1,0 +1,157 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# ///
+"""Wrapper around the bosh CLI for the bosh-pve-cpi-release repo.
+
+Subcommands:
+    create-env | deploy    bosh create-env for the pve director
+    alias-env              alias the director as 'pve' using creds.yml CA
+    login                  bosh -e pve login
+    env                    bosh env (against pve)
+    ucc | upload-cloud-config
+                           upload manifests/bosh/cloud-config.yml
+    emptyvm                deploy manifests/bosh/emptyvm.yml
+    help                   show this help
+    <anything else>        passthrough → bosh -e pve <args>
+
+Env (auto-exported for non-create-env subcommands when creds.yml exists):
+    BOSH_ENVIRONMENT=pve
+    BOSH_CLIENT=admin
+    BOSH_CLIENT_SECRET=<creds.yml:/admin_password>
+    BOSH_CA_CERT=<creds.yml:/director_ssl/ca>
+"""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+BOSH_DEPLOYMENT_DIR = Path(os.environ.get("BOSH_DEPLOYMENT_DIR", Path.home() / "w/cloudfoundry/bosh-deployment"))
+MANIFESTS = REPO_ROOT / "manifests"
+BOSH_DIR = MANIFESTS / "bosh"
+VARS = BOSH_DIR / "vars.yml"
+CREDS = BOSH_DIR / "creds.yml"
+STATE = BOSH_DIR / "state.json"
+CPI_OPS = BOSH_DIR / "cpi.yml"
+CLOUD_CONFIG = BOSH_DIR / "cloud-config.yml"
+EMPTYVM = BOSH_DIR / "emptyvm.yml"
+
+USAGE = __doc__ or ""
+
+
+def bosh_int(path: Path, json_path: str) -> str:
+    return subprocess.run(
+        ["bosh", "int", str(path), "--path", json_path],
+        check=True, capture_output=True, text=True,
+    ).stdout.rstrip("\n")
+
+
+def run(*cmd: str, env: dict[str, str] | None = None) -> int:
+    return subprocess.run(list(cmd), env=env, cwd=REPO_ROOT).returncode
+
+
+def director_env() -> dict[str, str]:
+    if not CREDS.exists():
+        sys.exit(f"creds file missing: {CREDS} — run 'scripts/bosh create-env' first")
+    env = os.environ.copy()
+    env["BOSH_ENVIRONMENT"] = "pve"
+    env["BOSH_CLIENT"] = "admin"
+    env["BOSH_CLIENT_SECRET"] = bosh_int(CREDS, "/admin_password")
+    env["BOSH_CA_CERT"] = bosh_int(CREDS, "/director_ssl/ca")
+    return env
+
+
+def cmd_create_env(_: list[str]) -> int:
+    return run(
+        "bosh", "create-env",
+        str(BOSH_DEPLOYMENT_DIR / "bosh.yml"),
+        "-n",
+        "-o", str(CPI_OPS),
+        "-o", str(BOSH_DEPLOYMENT_DIR / "uaa.yml"),
+        "-o", str(BOSH_DEPLOYMENT_DIR / "credhub.yml"),
+        "-l", str(VARS),
+        "-v", "director_name=ocfp-mgmt",
+        f"--state={STATE}",
+        f"--vars-store={CREDS}",
+    )
+
+
+def cmd_alias_env(_: list[str]) -> int:
+    director_ip = bosh_int(VARS, "/internal_ip")
+    ca = bosh_int(CREDS, "/director_ssl/ca")
+    proc = subprocess.run(
+        ["bosh", "alias-env", "pve", "-e", director_ip, "--ca-cert", ca],
+        cwd=REPO_ROOT,
+    )
+    return proc.returncode
+
+
+def cmd_login(_: list[str]) -> int:
+    return run("bosh", "-e", "pve", "login", env=director_env())
+
+
+def cmd_env(_: list[str]) -> int:
+    return run("bosh", "env", env=director_env())
+
+
+def cmd_ucc(_: list[str]) -> int:
+    return run(
+        "bosh", "-e", "pve", "-n", "update-cloud-config",
+        str(CLOUD_CONFIG),
+        "-l", str(VARS),
+        env=director_env(),
+    )
+
+
+def cmd_emptyvm(_: list[str]) -> int:
+    return run(
+        "bosh", "-e", "pve", "-n", "-d", "emptyvm", "deploy",
+        str(EMPTYVM),
+        "-l", str(VARS),
+        env=director_env(),
+    )
+
+
+def cmd_help(_: list[str]) -> int:
+    print(USAGE)
+    return 0
+
+
+def cmd_passthrough(args: list[str]) -> int:
+    return run("bosh", "-e", "pve", *args, env=director_env())
+
+
+COMMANDS = {
+    "create-env": cmd_create_env,
+    "deploy": cmd_create_env,
+    "alias-env": cmd_alias_env,
+    "login": cmd_login,
+    "env": cmd_env,
+    "ucc": cmd_ucc,
+    "upload-cloud-config": cmd_ucc,
+    "emptyvm": cmd_emptyvm,
+    "help": cmd_help,
+    "-h": cmd_help,
+    "--help": cmd_help,
+}
+
+
+def main(argv: list[str]) -> int:
+    if not argv:
+        return cmd_help([])
+    sub, *rest = argv
+    handler = COMMANDS.get(sub)
+    if handler is None:
+        return cmd_passthrough(argv)
+    return handler(rest)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except subprocess.CalledProcessError as e:
+        sys.exit(e.returncode)

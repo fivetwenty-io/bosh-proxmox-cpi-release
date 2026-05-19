@@ -1,0 +1,37 @@
+# Go build artifacts
+bin/
+*.test
+*.out
+coverage.html
+coverage.xml
+src/pve_cpi/coverage.out
+src/pve_cpi/coverage.html
+
+# Editor
+.DS_Store
+*.swp
+*.bak
+*.log
+*~
+.ruby-lsp/
+
+# Local
+.envrc
+.env
+/cpi
+
+# bosh create-env workflow
+manifests/vars.yml
+manifests/state.json
+manifests/creds.yml
+
+# BOSH release artifacts
+blobs/
+dev_releases/
+.dev_builds/
+.final_builds/
+bosh-pve-cpi-*.tgz
+tmp/
+creds.yml
+vars.yml
+state.json

@@ -1,0 +1,37 @@
+---
+# Minimal smoke-test deployment: one bare stemcell VM, no jobs.
+# Verifies director ↔ pve_cpi end-to-end (create_vm, attach_disk, agent
+# handshake) without needing a real release.
+#
+# Deploy with:
+#   bosh -e bosh-pve -d emptyvm deploy manifests/bosh/emptyvm.yml \
+#     -l manifests/bosh/vars.yml
+#
+# Teardown:
+#   bosh -e bosh-pve -d emptyvm delete-deployment
+
+name: emptyvm
+
+releases: []
+
+stemcells:
+- alias:   default
+  os:      ubuntu-noble
+  version: latest
+
+instance_groups:
+- name:      emptyvm
+  instances: 1
+  jobs:      []
+  vm_type:   small
+  stemcell:  default
+  azs:       [ z1 ]
+  networks:
+  - name: default
+
+update:
+  canaries:          1
+  max_in_flight:     1
+  canary_watch_time: 5000-30000
+  update_watch_time: 5000-30000
+  serial:            true

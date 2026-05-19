@@ -1,0 +1,1 @@
+{"result":null,"error":{"type":"Bosh::Clouds::CloudError","message":"something went wrong","ok_to_retry":false},"log":"stack trace here"}
