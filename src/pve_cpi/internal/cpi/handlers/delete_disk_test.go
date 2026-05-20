@@ -44,7 +44,7 @@ func TestHandleDeleteDisk_Happy(t *testing.T) {
 			if storage != "local-lvm" {
 				t.Errorf("unexpected storage %q", storage)
 			}
-			if volume != "vm-9001-disk-0" {
+			if volume != "local-lvm:vm-9001-disk-0" {
 				t.Errorf("unexpected volume %q", volume)
 			}
 			return nil

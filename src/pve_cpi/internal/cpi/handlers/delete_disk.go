@@ -46,20 +46,22 @@ func HandleDeleteDisk(deps Deps) Handler {
 		// ----------------------------------------------------------------
 		// 2. Parse disk CID → storage + volume.
 		// ----------------------------------------------------------------
-		storage, volume, err := pve.ParseDiskCID(diskCID)
+		storage, _, err := pve.ParseDiskCID(diskCID)
 		if err != nil {
 			return nil, fmt.Errorf("delete_disk: invalid disk_cid %q: %w", diskCID, err)
 		}
 
 		// ----------------------------------------------------------------
 		// 3. Resolve node via backend (shared → defaultNode; local → cluster
-		//    scan locating the volume's owning node).
+		//    scan locating the volume's owning node). PVE's storage content
+		//    endpoint wants the canonical "<storage>:<volname>" volid, which
+		//    is the disk_cid as-is.
 		// ----------------------------------------------------------------
 		backend, err := backendResolverOrDefault(deps).Resolve(ctx, storage)
 		if err != nil {
 			return nil, fmt.Errorf("delete_disk: backend resolution failed for storage %q: %w", storage, err)
 		}
-		node, err := backend.NodeForExisting(ctx, volume)
+		node, err := backend.NodeForExisting(ctx, diskCID)
 		if err != nil {
 			if pve.IsNotFound(err) {
 				deps.Logger.Info("delete_disk: volume not found on any node, treating as already-deleted",
@@ -74,7 +76,7 @@ func HandleDeleteDisk(deps Deps) Handler {
 		// 4. Delete the volume. SDK DeleteVolume is already 404-safe;
 		//    we do NOT propagate 404 as an error.
 		// ----------------------------------------------------------------
-		if err := deps.PVE.Storage().DeleteVolume(ctx, node, storage, volume); err != nil {
+		if err := deps.PVE.Storage().DeleteVolume(ctx, node, storage, diskCID); err != nil {
 			// Check whether the error is a not-found variant. The SDK
 			// DeleteVolume already swallows 404 internally, but if a
 			// non-SDK not-found surfaces we still treat it as success.

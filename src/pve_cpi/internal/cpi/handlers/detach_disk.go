@@ -73,19 +73,21 @@ func HandleDetachDisk(deps Deps) Handler {
 			return nil, cpierrors.VMNotFound(vmCID)
 		}
 
-		storage, volid, err := pve.ParseDiskCID(diskCID)
+		storage, _, err := pve.ParseDiskCID(diskCID)
 		if err != nil {
 			return nil, cpierrors.DiskNotFound(diskCID)
 		}
 
 		// detach_disk modifies VM config, which lives on the VM's node — which
 		// is the same node that holds the volume (the disk is attached). Resolve
-		// via the storage backend to share behavior with attach_disk.
+		// via the storage backend to share behavior with attach_disk. PVE's
+		// storage content endpoint wants the canonical "<storage>:<volname>"
+		// form, which is the disk_cid as-is.
 		backend, err := backendResolverOrDefault(deps).Resolve(ctx, storage)
 		if err != nil {
 			return nil, fmt.Errorf("detach_disk: backend resolution failed for storage %q: %w", storage, err)
 		}
-		node, err := backend.NodeForExisting(ctx, volid)
+		node, err := backend.NodeForExisting(ctx, diskCID)
 		if err != nil {
 			if pve.IsNotFound(err) {
 				// Volume gone → disk already detached from its perspective; idempotent.
@@ -102,14 +104,13 @@ func HandleDetachDisk(deps Deps) Handler {
 		// 3. Resolve diskID from current VM config.
 		//    If not attached: log warning, return nil (idempotent).
 		// --------------------------------------------------------------------
-		diskID, err := pve.ResolveDiskID(ctx, deps.PVE, node, vmid, volid)
+		diskID, err := pve.ResolveDiskID(ctx, deps.PVE, node, vmid, diskCID)
 		if err != nil {
 			if cpierrors.IsType(err, cpierrors.TypeCloud) || pve.IsNotFound(err) {
 				// Disk is not attached to this VM; idempotent success.
 				deps.Logger.Warn("detach_disk: disk not attached to VM; skipping",
 					log.String("vm_cid", vmCID),
 					log.String("disk_cid", diskCID),
-					log.String("volid", volid),
 					log.Err(err),
 				)
 				return nil, nil

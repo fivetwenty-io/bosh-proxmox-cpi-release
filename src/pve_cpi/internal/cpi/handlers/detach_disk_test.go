@@ -116,7 +116,7 @@ func TestHandleDetachDisk_Happy(t *testing.T) {
 	const (
 		vmCID   = "100"
 		diskCID = "local-lvm:vm-9001-disk-0"
-		volid   = "vm-9001-disk-0"
+		volid   = "local-lvm:vm-9001-disk-0"
 	)
 
 	qemuSvc := &detachQEMUService{
@@ -175,7 +175,7 @@ func TestHandleDetachDisk_DetachFail(t *testing.T) {
 	const (
 		vmCID   = "100"
 		diskCID = "local-lvm:vm-9001-disk-0"
-		volid   = "vm-9001-disk-0"
+		volid   = "local-lvm:vm-9001-disk-0"
 	)
 
 	qemuSvc := &detachQEMUService{
@@ -195,7 +195,7 @@ func TestHandleDetachDisk_VMNotFound(t *testing.T) {
 	const (
 		vmCID   = "999"
 		diskCID = "local-lvm:vm-9001-disk-0"
-		volid   = "vm-9001-disk-0"
+		volid   = "local-lvm:vm-9001-disk-0"
 	)
 
 	qemuSvc := &detachQEMUService{

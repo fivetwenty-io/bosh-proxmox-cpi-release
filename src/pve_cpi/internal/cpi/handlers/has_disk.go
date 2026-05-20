@@ -46,7 +46,7 @@ func HandleHasDisk(deps Deps) Handler {
 		// ----------------------------------------------------------------
 		// 2. Parse disk CID → storage + volume.
 		// ----------------------------------------------------------------
-		storage, volume, err := pve.ParseDiskCID(diskCID)
+		storage, _, err := pve.ParseDiskCID(diskCID)
 		if err != nil {
 			return nil, fmt.Errorf("has_disk: invalid disk_cid %q: %w", diskCID, err)
 		}
@@ -55,13 +55,14 @@ func HandleHasDisk(deps Deps) Handler {
 		// 3. Resolve node via backend. For local backends, NodeForExisting
 		//    scans the cluster for the owning node and returns DiskNotFound
 		//    when no node holds the volume — surface that as has_disk=false
-		//    rather than an error.
+		//    rather than an error. PVE's storage content endpoint wants the
+		//    canonical "<storage>:<volname>" volid, which is the disk_cid.
 		// ----------------------------------------------------------------
 		backend, err := backendResolverOrDefault(deps).Resolve(ctx, storage)
 		if err != nil {
 			return nil, fmt.Errorf("has_disk: backend resolution failed for storage %q: %w", storage, err)
 		}
-		node, err := backend.NodeForExisting(ctx, volume)
+		node, err := backend.NodeForExisting(ctx, diskCID)
 		if err != nil {
 			if pve.IsNotFound(err) {
 				deps.Logger.Debug("has_disk: backend reports volume not present on any node",
@@ -76,7 +77,7 @@ func HandleHasDisk(deps Deps) Handler {
 		// 4. Call storage.Exists. The SDK returns (false, nil) for 404
 		//    internally; we propagate other errors to the dispatcher.
 		// ----------------------------------------------------------------
-		exists, err := deps.PVE.Storage().Exists(ctx, node, storage, volume)
+		exists, err := deps.PVE.Storage().Exists(ctx, node, storage, diskCID)
 		if err != nil {
 			// If an unexpected not-found surfaces from a non-SDK path,
 			// treat it as "not exists" rather than an error.

@@ -407,23 +407,22 @@ func createVM(
 		if diskCID == "" {
 			continue
 		}
-		// disk_cid is "<storage>:<pve-volid>"; ParseDiskCID returns the
-		// trailing PVE volid ("data:vm-9000-disk-0"), which is what PVE
-		// expects as the scsi value. Passing the raw disk_cid would
-		// double-prefix the storage and trip
-		// "lvm name 'data:vm-...' contains illegal characters".
-		_, volid, parseErr := pve.ParseDiskCID(diskCID)
-		if parseErr != nil {
+		// PVE disk config values are the canonical "<storage>:<volname>"
+		// form (e.g. "data:vm-9003-disk-0"). The disk_cid is already in
+		// that form, so pass it through verbatim. Stripping the storage
+		// prefix produces a bare volname that PVE rejects with
+		// "scsi0.file: invalid format - unable to parse volume ID ...".
+		// ParseDiskCID is still used to validate the shape.
+		if _, _, parseErr := pve.ParseDiskCID(diskCID); parseErr != nil {
 			return nil, cpierrors.Cloud("create_vm: parse disk_cid %q: %s", diskCID, parseErr.Error())
 		}
-		diskID, err := deps.PVE.QEMU().AttachDisk(ctx, node, vmid, volid, "scsi", nil)
+		diskID, err := deps.PVE.QEMU().AttachDisk(ctx, node, vmid, diskCID, "scsi", nil)
 		if err != nil {
-			return nil, cpierrors.Cloud("create_vm: attach disk %q (volid=%q) to vmid=%d: %s", diskCID, volid, vmid, err.Error())
+			return nil, cpierrors.Cloud("create_vm: attach disk %q to vmid=%d: %s", diskCID, vmid, err.Error())
 		}
 		logger.Info("create_vm: attached persistent disk",
 			log.Int("vmid", vmid),
 			log.String("disk_cid", diskCID),
-			log.String("volid", volid),
 			log.String("disk_id", diskID),
 		)
 	}

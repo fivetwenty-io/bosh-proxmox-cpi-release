@@ -57,8 +57,7 @@ func HandleSnapshotDisk(deps Deps) Handler {
 		// ----------------------------------------------------------------
 		// 2. Parse disk_cid → storage + volid components.
 		// ----------------------------------------------------------------
-		_, volid, err := pve.ParseDiskCID(diskCID)
-		if err != nil {
+		if _, _, err := pve.ParseDiskCID(diskCID); err != nil {
 			return nil, cpierrors.DiskNotFound(diskCID)
 		}
 
@@ -67,9 +66,11 @@ func HandleSnapshotDisk(deps Deps) Handler {
 		//    Returns the VMID and its current node — snapshot must target the
 		//    VM's actual node, which may differ from Config.Node in multi-node
 		//    deployments. Local-storage disks require both VM and disk on the
-		//    same node, which is implicit in the cluster scan result.
+		//    same node, which is implicit in the cluster scan result. PVE VM
+		//    config stores disk values in canonical "<storage>:<volname>"
+		//    form — the disk_cid is that form.
 		// ----------------------------------------------------------------
-		vmid, node, err := pve.FindVMByDiskVolid(ctx, deps.PVE, deps.Config.Node, volid)
+		vmid, node, err := pve.FindVMByDiskVolid(ctx, deps.PVE, deps.Config.Node, diskCID)
 		if err != nil {
 			return nil, err
 		}

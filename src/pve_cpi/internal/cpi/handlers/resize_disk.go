@@ -64,8 +64,7 @@ func HandleResizeDisk(deps Deps) Handler {
 		// ----------------------------------------------------------------
 		// 2. Parse disk_cid → volid.
 		// ----------------------------------------------------------------
-		_, volid, err := pve.ParseDiskCID(diskCID)
-		if err != nil {
+		if _, _, err := pve.ParseDiskCID(diskCID); err != nil {
 			return nil, cpierrors.DiskNotFound(diskCID)
 		}
 
@@ -73,14 +72,15 @@ func HandleResizeDisk(deps Deps) Handler {
 		// 3. Locate attached VM + its current node, then resolve diskID.
 		//    FindVMByDiskVolid scans /cluster/resources so resize works in
 		//    multi-node deployments without depending on Config.Node matching
-		//    the VM's node.
+		//    the VM's node. PVE VM config stores disk values in canonical
+		//    "<storage>:<volname>" form — the disk_cid is that form.
 		// ----------------------------------------------------------------
-		vmid, node, err := pve.FindVMByDiskVolid(ctx, deps.PVE, deps.Config.Node, volid)
+		vmid, node, err := pve.FindVMByDiskVolid(ctx, deps.PVE, deps.Config.Node, diskCID)
 		if err != nil {
 			return nil, err
 		}
 
-		diskID, err := pve.ResolveDiskID(ctx, deps.PVE, node, vmid, volid)
+		diskID, err := pve.ResolveDiskID(ctx, deps.PVE, node, vmid, diskCID)
 		if err != nil {
 			// ResolveDiskID returns CloudError when disk not attached.
 			return nil, fmt.Errorf("resize_disk: cannot resolve diskID for %s on VM %d: %w", diskCID, vmid, err)

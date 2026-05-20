@@ -138,7 +138,7 @@ func snapDeps(qemuSvc qemu.Service, clusterSvc sdkclusterapi.Service, tasksSvc t
 
 func TestHandleSnapshotDisk_Happy(t *testing.T) {
 	const diskCID = "local-lvm:vm-9001-disk-0"
-	const volid = "vm-9001-disk-0"
+	const volid = "local-lvm:vm-9001-disk-0"
 
 	var snapCalled bool
 	var snapName string
@@ -187,7 +187,7 @@ func TestHandleSnapshotDisk_Happy(t *testing.T) {
 
 func TestHandleSnapshotDisk_WithDescription(t *testing.T) {
 	const diskCID = "local-lvm:vm-9001-disk-0"
-	const volid = "vm-9001-disk-0"
+	const volid = "local-lvm:vm-9001-disk-0"
 
 	var capturedOpts map[string]interface{}
 
@@ -232,7 +232,7 @@ func TestHandleSnapshotDisk_WithUpid(t *testing.T) {
 
 	qemuSvc := &snapQEMUService{
 		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
-			return map[string]interface{}{"scsi1": "vm-9001-disk-0"}, nil
+			return map[string]interface{}{"scsi1": "local-lvm:vm-9001-disk-0"}, nil
 		},
 		snapshotFn: func(_ context.Context, _ string, _ int, _ string, _ map[string]interface{}) (string, error) {
 			return "UPID:pve1:abc:snap", nil // returns a UPID
@@ -307,7 +307,7 @@ func TestHandleSnapshotDisk_SnapshotFails(t *testing.T) {
 
 	qemuSvc := &snapQEMUService{
 		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
-			return map[string]interface{}{"scsi1": "vm-9001-disk-0"}, nil
+			return map[string]interface{}{"scsi1": "local-lvm:vm-9001-disk-0"}, nil
 		},
 		snapshotFn: func(_ context.Context, _ string, _ int, _ string, _ map[string]interface{}) (string, error) {
 			return "", errors.New("PVE snapshot quota exceeded")
@@ -362,7 +362,7 @@ func TestHandleSnapshotDisk_ClusterListError(t *testing.T) {
 func TestHandleSnapshotDisk_DiskInOptionString(t *testing.T) {
 	// Disk stored with option string: "local-lvm:vm-9001-disk-0,size=10G,cache=writeback"
 	const diskCID = "local-lvm:vm-9001-disk-0"
-	const volid = "vm-9001-disk-0"
+	const volid = "local-lvm:vm-9001-disk-0"
 
 	var snapCalled bool
 
@@ -400,7 +400,7 @@ func TestHandleSnapshotDisk_SDKError404(t *testing.T) {
 
 	qemuSvc := &snapQEMUService{
 		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
-			return map[string]interface{}{"scsi1": "vm-9001-disk-0"}, nil
+			return map[string]interface{}{"scsi1": "local-lvm:vm-9001-disk-0"}, nil
 		},
 		snapshotFn: func(_ context.Context, _ string, _ int, _ string, _ map[string]interface{}) (string, error) {
 			return "", &sdkerrors.APIError{HTTPCode: 404, Message: "VM not found"}

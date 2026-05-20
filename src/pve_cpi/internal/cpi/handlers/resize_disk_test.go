@@ -110,7 +110,7 @@ func resizeClusterWith(vmid int) sdkclusterapi.Service {
 }
 
 // resizeQEMUWithDisk returns a QEMU mock that serves config with the given disk slot.
-// diskOptStr must be in the format "<bareVolid>[,options...]" (e.g. "vm-9001-disk-0,size=10G").
+// diskOptStr must be in the format "<bareVolid>[,options...]" (e.g. "local-lvm:vm-9001-disk-0,size=10G").
 // The first two Config calls (from findVMByDiskVolid and ResolveDiskID) return the bare volid
 // so FindDiskIDByVolID can match exactly. Subsequent calls return the full option string so
 // parseDiskSizeGiB can read the size field.
@@ -141,7 +141,7 @@ func resizeQEMUWithDisk(diskSlot, diskOptStr string, resizeFn func(ctx context.C
 
 func TestHandleResizeDisk_Grow(t *testing.T) {
 	const diskCID = "local-lvm:vm-9001-disk-0"
-	const volid = "vm-9001-disk-0"
+	const volid = "local-lvm:vm-9001-disk-0"
 
 	var capturedDelta int
 
@@ -171,7 +171,7 @@ func TestHandleResizeDisk_NoOp(t *testing.T) {
 
 	var resizeCalled bool
 
-	qemuSvc := resizeQEMUWithDisk("scsi2", "vm-9001-disk-0,size=10G", func(_ context.Context, _ string, _ int, _ string, _ int) (string, error) {
+	qemuSvc := resizeQEMUWithDisk("scsi2", "local-lvm:vm-9001-disk-0,size=10G", func(_ context.Context, _ string, _ int, _ string, _ int) (string, error) {
 		resizeCalled = true
 		return "", nil
 	})
@@ -191,7 +191,7 @@ func TestHandleResizeDisk_ShrinkRejected(t *testing.T) {
 	// new_size_mb < current_size → NotSupported error.
 	const diskCID = "local-lvm:vm-9001-disk-0"
 
-	qemuSvc := resizeQEMUWithDisk("scsi2", "vm-9001-disk-0,size=20G", nil)
+	qemuSvc := resizeQEMUWithDisk("scsi2", "local-lvm:vm-9001-disk-0,size=20G", nil)
 
 	h := handlers.HandleResizeDisk(resizeDeps(qemuSvc, resizeClusterWith(100), nil))
 	// 5120 MiB = 5 GiB; current = 20 GiB → shrink.
@@ -215,7 +215,7 @@ func TestHandleResizeDisk_WithUpid(t *testing.T) {
 		},
 	}
 
-	qemuSvc := resizeQEMUWithDisk("scsi2", "vm-9001-disk-0,size=10G", func(_ context.Context, _ string, _ int, _ string, _ int) (string, error) {
+	qemuSvc := resizeQEMUWithDisk("scsi2", "local-lvm:vm-9001-disk-0,size=10G", func(_ context.Context, _ string, _ int, _ string, _ int) (string, error) {
 		return "UPID:pve1:resize:abc", nil
 	})
 
@@ -250,7 +250,7 @@ func TestHandleResizeDisk_SizeParseFail(t *testing.T) {
 	// Disk has no "size=" in option string → parseDiskSizeGiB returns error.
 	const diskCID = "local-lvm:vm-9001-disk-0"
 
-	qemuSvc := resizeQEMUWithDisk("scsi2", "vm-9001-disk-0,cache=writeback", nil)
+	qemuSvc := resizeQEMUWithDisk("scsi2", "local-lvm:vm-9001-disk-0,cache=writeback", nil)
 
 	h := handlers.HandleResizeDisk(resizeDeps(qemuSvc, resizeClusterWith(100), nil))
 	_, err := h.Handle(context.Background(), marshalArgs(diskCID, 20480), jsonrpc.Context{})
@@ -262,7 +262,7 @@ func TestHandleResizeDisk_SizeParseFail(t *testing.T) {
 func TestHandleResizeDisk_ResizeSDKError(t *testing.T) {
 	const diskCID = "local-lvm:vm-9001-disk-0"
 
-	qemuSvc := resizeQEMUWithDisk("scsi2", "vm-9001-disk-0,size=10G", func(_ context.Context, _ string, _ int, _ string, _ int) (string, error) {
+	qemuSvc := resizeQEMUWithDisk("scsi2", "local-lvm:vm-9001-disk-0,size=10G", func(_ context.Context, _ string, _ int, _ string, _ int) (string, error) {
 		return "", errors.New("PVE refused resize")
 	})
 
@@ -324,7 +324,7 @@ func TestHandleResizeDisk_CeilingMath(t *testing.T) {
 
 	var capturedDelta int
 
-	qemuSvc := resizeQEMUWithDisk("scsi2", "vm-9001-disk-0,size=10G", func(_ context.Context, _ string, _ int, _ string, deltaGiB int) (string, error) {
+	qemuSvc := resizeQEMUWithDisk("scsi2", "local-lvm:vm-9001-disk-0,size=10G", func(_ context.Context, _ string, _ int, _ string, deltaGiB int) (string, error) {
 		capturedDelta = deltaGiB
 		return "", nil
 	})

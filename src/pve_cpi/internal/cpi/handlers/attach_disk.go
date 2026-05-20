@@ -96,7 +96,7 @@ func HandleAttachDisk(deps Deps) Handler {
 			return nil, cpierrors.VMNotFound(vmCID)
 		}
 
-		storage, volid, err := pve.ParseDiskCID(diskCID)
+		storage, _, err := pve.ParseDiskCID(diskCID)
 		if err != nil {
 			return nil, cpierrors.DiskNotFound(diskCID)
 		}
@@ -104,12 +104,14 @@ func HandleAttachDisk(deps Deps) Handler {
 		// Resolve disk's owning node via the backend abstraction. For shared
 		// backends this is the configured default; for local backends a
 		// cluster scan locates the node that holds the volume. attach_disk
-		// then runs the QEMU config PUT against that node.
+		// then runs the QEMU config PUT against that node. PVE's storage
+		// content endpoint wants the canonical "<storage>:<volname>" form,
+		// which is the disk_cid as-is.
 		backend, err := backendResolverOrDefault(deps).Resolve(ctx, storage)
 		if err != nil {
 			return nil, fmt.Errorf("attach_disk: backend resolution failed for storage %q: %w", storage, err)
 		}
-		node, err := backend.NodeForExisting(ctx, volid)
+		node, err := backend.NodeForExisting(ctx, diskCID)
 		if err != nil {
 			if pve.IsNotFound(err) {
 				return nil, cpierrors.DiskNotFound(diskCID)
@@ -140,7 +142,10 @@ func HandleAttachDisk(deps Deps) Handler {
 		// --------------------------------------------------------------------
 		const bus = "scsi"
 
-		diskID, err := deps.PVE.QEMU().AttachDisk(ctx, node, vmid, volid, bus, nil)
+		// PVE config disk values are canonical "<storage>:<volname>"
+		// (e.g. "data:vm-9003-disk-0"). Pass the full disk_cid; a bare
+		// volname is rejected with "scsi0.file: invalid format ...".
+		diskID, err := deps.PVE.QEMU().AttachDisk(ctx, node, vmid, diskCID, bus, nil)
 		if err != nil {
 			wrapped := pve.WrapError(err)
 			if pve.IsNotFound(err) {
@@ -153,7 +158,7 @@ func HandleAttachDisk(deps Deps) Handler {
 		// 4. Confirm attachment by resolving diskID from current VM config.
 		//    This guards against edge cases where AttachDisk returns stale data.
 		// --------------------------------------------------------------------
-		resolvedDiskID, err := pve.ResolveDiskID(ctx, deps.PVE, node, vmid, volid)
+		resolvedDiskID, err := pve.ResolveDiskID(ctx, deps.PVE, node, vmid, diskCID)
 		if err != nil {
 			// ResolveDiskID failure after a successful AttachDisk is unexpected.
 			// Use the diskID returned by AttachDisk as fallback; log the anomaly.
