@@ -45,6 +45,13 @@ func (f *fakeStorageSvc) DeleteVolume(ctx context.Context, node, storage, volume
 	return nil
 }
 
+func (f *fakeStorageSvc) DeleteVolumeAsync(ctx context.Context, node, storage, volume string) (string, error) {
+	if err := f.DeleteVolume(ctx, node, storage, volume); err != nil {
+		return "", err
+	}
+	return "", nil
+}
+
 func (f *fakeStorageSvc) DeleteVolumeIfExists(ctx context.Context, node, storage, volume string) (bool, error) {
 	f.deleteVolumeIfExistsCalls = append(f.deleteVolumeIfExistsCalls, volume)
 	if f.deleteVolumeIfExistsFn != nil {
@@ -52,6 +59,14 @@ func (f *fakeStorageSvc) DeleteVolumeIfExists(ctx context.Context, node, storage
 	}
 	// Default: volume existed and was deleted.
 	return true, nil
+}
+
+func (f *fakeStorageSvc) DeleteVolumeIfExistsAsync(ctx context.Context, node, storage, volume string) (bool, string, error) {
+	existed, err := f.DeleteVolumeIfExists(ctx, node, storage, volume)
+	if err != nil {
+		return false, "", err
+	}
+	return existed, "", nil
 }
 
 func (f *fakeStorageSvc) Exists(_ context.Context, _, _, _ string) (bool, error) {

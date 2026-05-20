@@ -185,11 +185,24 @@ func HandleCreateDisk(deps Deps) Handler {
 					// re-runs see a clean slate.
 					rollbackCtx := contextWithoutCancel(ctx)
 					if exists, exErr := deps.PVE.Storage().Exists(rollbackCtx, node, storage, candidateCanonical); exErr == nil && exists {
-						if delErr := deps.PVE.Storage().DeleteVolume(rollbackCtx, node, storage, candidateCanonical); delErr != nil {
+						upid, delErr := deps.PVE.Storage().DeleteVolumeAsync(rollbackCtx, node, storage, candidateCanonical)
+						if delErr != nil {
 							deps.Logger.Warn("create_disk: orphan volume cleanup after CreateVolume error failed",
 								log.String("volid", candidateCanonical),
 								log.Err(delErr),
 							)
+						} else if upid != "" {
+							if werr := pve.AwaitTaskWithLogger(rollbackCtx, deps.PVE, node, upid, deps.Logger); werr != nil {
+								deps.Logger.Warn("create_disk: orphan volume cleanup await failed",
+									log.String("volid", candidateCanonical),
+									log.String("upid", upid),
+									log.Err(werr),
+								)
+							} else {
+								deps.Logger.Info("create_disk: removed orphan volume after CreateVolume error",
+									log.String("volid", candidateCanonical),
+								)
+							}
 						} else {
 							deps.Logger.Info("create_disk: removed orphan volume after CreateVolume error",
 								log.String("volid", candidateCanonical),
@@ -219,12 +232,23 @@ func HandleCreateDisk(deps Deps) Handler {
 				return
 			}
 			rollbackCtx := contextWithoutCancel(ctx)
-			if delErr := deps.PVE.Storage().DeleteVolume(rollbackCtx, node, storage, canonicalVolID); delErr != nil {
+			upid, delErr := deps.PVE.Storage().DeleteVolumeAsync(rollbackCtx, node, storage, canonicalVolID)
+			if delErr != nil {
 				deps.Logger.Warn("create_disk: rollback DeleteVolume failed",
 					log.String("volid", canonicalVolID),
 					log.Err(delErr),
 				)
 				return
+			}
+			if upid != "" {
+				if werr := pve.AwaitTaskWithLogger(rollbackCtx, deps.PVE, node, upid, deps.Logger); werr != nil {
+					deps.Logger.Warn("create_disk: rollback DeleteVolume await failed",
+						log.String("volid", canonicalVolID),
+						log.String("upid", upid),
+						log.Err(werr),
+					)
+					return
+				}
 			}
 			deps.Logger.Info("create_disk: rolled back created volume after failure",
 				log.String("volid", canonicalVolID),

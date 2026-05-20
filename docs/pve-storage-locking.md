@@ -101,6 +101,21 @@ At default settings, a worst-case all-retries run waits roughly `2 + 3 + 4.5 + 6
 
 For multipart uploads (`Storage().Upload`), the request body is a single-use `io.Reader`. A retry must reopen the source from its on-disk path so PVE sees a fresh stream each attempt. Both `uploadStemcellImage` and `agent/configdrive.uploadISO` do this — the `os.Open` lives inside the retry callback.
 
+### Queued-imgdel hazard
+
+PVE's `DELETE /nodes/{node}/storage/{storage}/content/{volume}` does not run the delete inline; it queues an `imgdel` task under the same per-storage lockfile and returns the task UPID. Under heavy contention the queued imgdel can sit waiting for the lock for several seconds — long enough for the caller to issue an `Upload` to the same filename, win the lock first, and finish. Then the queued imgdel grabs the lock and removes the freshly-uploaded volume.
+
+We observed this exact race against `vm-117-config.iso`:
+
+```
+14:44:09  imgcopy  vm-117-config.iso        (upload completes)
+14:44:11  qmstart  117                       (config references local:iso/vm-117-config.iso)
+14:44:17  imgdel   vm-117-config.iso        (queued from earlier pre-delete; finally got lock)
+14:44:17  qmstart  failed: volume 'local:iso/vm-117-config.iso' does not exist
+```
+
+The fix is in the SDK and CPI: `Storage().DeleteVolumeAsync` and `Storage().DeleteVolumeIfExistsAsync` (added in `pve-apiclient-go` v3.1.6) return the imgdel UPID. The CPI's `agent/configdrive` pre-delete now awaits that UPID before uploading, so a queued imgdel can never fire mid-create. Same wiring applies to `delete_disk` and `create_disk`'s rollback paths.
+
 ## Operator-side knobs
 
 The CPI's retry absorbs short bursts. If your deploys consistently exhaust the retry budget, the contention is structural and you have three options:

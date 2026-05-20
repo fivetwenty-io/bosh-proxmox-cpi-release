@@ -55,6 +55,13 @@ func (m *mockStorageService) DeleteVolume(ctx context.Context, node, storage, vo
 	return nil
 }
 
+func (m *mockStorageService) DeleteVolumeAsync(ctx context.Context, node, storage, volume string) (string, error) {
+	if err := m.DeleteVolume(ctx, node, storage, volume); err != nil {
+		return "", err
+	}
+	return "", nil
+}
+
 func (m *mockStorageService) Exists(ctx context.Context, node, storage, volume string) (bool, error) {
 	if m.existsFn != nil {
 		return m.existsFn(ctx, node, storage, volume)
@@ -67,6 +74,14 @@ func (m *mockStorageService) DeleteVolumeIfExists(ctx context.Context, node, sto
 		return m.deleteVolumeIfExistsFn(ctx, node, storage, volume)
 	}
 	return false, nil
+}
+
+func (m *mockStorageService) DeleteVolumeIfExistsAsync(ctx context.Context, node, storage, volume string) (bool, string, error) {
+	existed, err := m.DeleteVolumeIfExists(ctx, node, storage, volume)
+	if err != nil {
+		return false, "", err
+	}
+	return existed, "", nil
 }
 
 func (m *mockStorageService) Upload(ctx context.Context, node, storage, content, filename string, body io.Reader) (string, error) {

@@ -73,11 +73,20 @@ func HandleDeleteDisk(deps Deps) Handler {
 		}
 
 		// ----------------------------------------------------------------
-		// 4. Delete the volume. SDK DeleteVolume is already 404-safe;
-		//    we do NOT propagate 404 as an error.
+		// 4. Delete the volume. SDK DeleteVolumeAsync is already 404-safe;
+		//    we do NOT propagate 404 as an error. Await the returned
+		//    imgdel UPID so a queued imgdel under storage-lock contention
+		//    cannot fire after delete_disk has already returned success.
 		// ----------------------------------------------------------------
 		delErr := pve.RetryOnTransientOrLock(ctx, deps.Logger, "delete_disk", 0, func() error {
-			return deps.PVE.Storage().DeleteVolume(ctx, node, storage, diskCID)
+			upid, err := deps.PVE.Storage().DeleteVolumeAsync(ctx, node, storage, diskCID)
+			if err != nil {
+				return err
+			}
+			if upid == "" {
+				return nil
+			}
+			return pve.AwaitTaskWithLogger(ctx, deps.PVE, node, upid, deps.Logger)
 		})
 		if err := delErr; err != nil {
 			// Check whether the error is a not-found variant. The SDK

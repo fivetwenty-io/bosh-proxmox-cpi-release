@@ -4,7 +4,7 @@ go 1.25.3
 
 require (
 	github.com/diskfs/go-diskfs v1.9.3
-	github.com/fivetwenty-io/pve-apiclient-go/v3 v3.1.5
+	github.com/fivetwenty-io/pve-apiclient-go/v3 v3.1.6
 )
 
 require (

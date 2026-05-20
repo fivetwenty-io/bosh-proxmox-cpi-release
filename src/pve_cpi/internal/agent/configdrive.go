@@ -237,22 +237,43 @@ func (a *ConfigDrive) attachISO(ctx context.Context, node string, vmid int, file
 // path) use the existed flag to log a warning when a stale orphan was
 // found. 404 is treated as "did not exist" (returns false, nil); other
 // errors propagate.
+//
+// The delete is awaited via the returned imgdel UPID before this function
+// returns. PVE's DELETE on a storage volume queues an imgdel task under the
+// per-storage lockfile; under bursty deploys that lock is contended and the
+// imgdel can sit in the queue for seconds. Without an await, Configure would
+// proceed to upload the replacement ISO and Start the VM *before* the queued
+// imgdel ran, then PVE would fire imgdel during qmstart and remove the just-
+// uploaded ISO — causing qmstart to fail with "volume … does not exist".
 func (a *ConfigDrive) removeISOIfExists(ctx context.Context, node, filename string) (bool, error) {
 	volume := fmt.Sprintf("%s:iso/%s", a.storage, filename)
-	existed, err := a.pveSvc.Storage().DeleteVolumeIfExists(ctx, node, a.storage, volume)
+	existed, upid, err := a.pveSvc.Storage().DeleteVolumeIfExistsAsync(ctx, node, a.storage, volume)
 	if err != nil {
 		return false, pve.WrapError(err)
+	}
+	if upid != "" {
+		if werr := pve.AwaitTaskWithLogger(ctx, a.pveSvc, node, upid, a.logger); werr != nil {
+			return existed, pve.WrapError(werr)
+		}
 	}
 	return existed, nil
 }
 
 // removeISOFromStorage issues a DELETE for the configdrive ISO volume and
-// treats 404 as success (idempotent). The SDK's DeleteVolume already swallows
-// 404 internally.
+// treats 404 as success (idempotent). Awaits the queued imgdel UPID so
+// downstream operations (e.g. re-uploading to the same name on a recycled
+// VMID) cannot race a late-firing imgdel.
 func (a *ConfigDrive) removeISOFromStorage(ctx context.Context, node, filename string) error {
 	volume := fmt.Sprintf("%s:iso/%s", a.storage, filename)
 	delErr := pve.RetryOnTransientOrLock(ctx, a.logger, "configdrive_delete", 0, func() error {
-		return a.pveSvc.Storage().DeleteVolume(ctx, node, a.storage, volume)
+		upid, err := a.pveSvc.Storage().DeleteVolumeAsync(ctx, node, a.storage, volume)
+		if err != nil {
+			return err
+		}
+		if upid == "" {
+			return nil
+		}
+		return pve.AwaitTaskWithLogger(ctx, a.pveSvc, node, upid, a.logger)
 	})
 	if delErr != nil {
 		return pve.WrapError(delErr)
