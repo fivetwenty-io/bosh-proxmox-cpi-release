@@ -97,6 +97,8 @@ type diskMetaNodesMock struct {
 	vmsByNode map[string][]int64
 	// capturedDesc captures the description value written by UpdateQemuConfig.
 	capturedDesc *string
+	// capturedTags captures the tags value written by UpdateQemuConfig.
+	capturedTags *string
 	// updateErr if set, UpdateQemuConfig returns this error.
 	updateErr error
 }
@@ -127,8 +129,13 @@ func (m *diskMetaNodesMock) UpdateQemuConfig(_ context.Context, _ string, _ stri
 	if m.updateErr != nil {
 		return m.updateErr
 	}
-	if params != nil && params.Description != nil {
-		m.capturedDesc = params.Description
+	if params != nil {
+		if params.Description != nil {
+			m.capturedDesc = params.Description
+		}
+		if params.Tags != nil {
+			m.capturedTags = params.Tags
+		}
 	}
 	return nil
 }
@@ -479,6 +486,56 @@ func TestHandleSetDiskMetadata_MissingArgs(t *testing.T) {
 	}
 	if !cpierrors.IsType(err, cpierrors.TypeCloud) {
 		t.Errorf("want CloudError, got %v", err)
+	}
+}
+
+// TestHandleSetDiskMetadata_AppliesDiskTags verifies that a "tags" sub-key in
+// metadata causes the hosting VM's tags field to be updated with sanitized
+// "<key>--<value>" entries while pre-existing non-conflicting tags survive.
+func TestHandleSetDiskMetadata_AppliesDiskTags(t *testing.T) {
+	t.Parallel()
+
+	nodesSvc := &diskMetaNodesMock{
+		vmsByNode: map[string][]int64{testNode: {testVMID}},
+	}
+	qemuSvc := &diskMetaQEMUMock{
+		configs: map[string]map[string]interface{}{
+			testNode + ":0": {
+				"scsi0": testDiskCID,
+				"tags":  "env--prod;director--abc",
+			},
+		},
+	}
+	clusterSvc := &mockClusterService{statusResp: clusterWithNode(testNode)}
+	pve := &diskMetaClientMock{qemuSvc: qemuSvc, nodesSvc: nodesSvc, clusterSvc: clusterSvc}
+
+	h := handlers.HandleSetDiskMetadata(makeDiskMetaDeps(pve))
+	meta := map[string]any{
+		"deployment": "cf",
+		"tags": map[string]any{
+			"tier": "bronze",
+		},
+	}
+	_, err := h.Handle(context.Background(), makeMetaArgs(testDiskCID, meta), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if nodesSvc.capturedDesc == nil {
+		t.Fatal("UpdateQemuConfig not called")
+	}
+	desc := *nodesSvc.capturedDesc
+	if !strings.Contains(desc, "bosh_disk_tags") {
+		t.Errorf("description sentinel missing bosh_disk_tags; got: %s", desc)
+	}
+	if nodesSvc.capturedTags == nil {
+		t.Fatal("UpdateQemuConfig did not write VM tags field")
+	}
+	gotTags := *nodesSvc.capturedTags
+	for _, want := range []string{"env--prod", "director--abc", "tier--bronze"} {
+		if !strings.Contains(gotTags, want) {
+			t.Errorf("VM tags missing %q; got: %q", want, gotTags)
+		}
 	}
 }
 

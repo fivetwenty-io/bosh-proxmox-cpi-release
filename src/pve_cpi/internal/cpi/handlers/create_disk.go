@@ -160,7 +160,7 @@ func HandleCreateDisk(deps Deps) Handler {
 				candidateCanonical := fmt.Sprintf("%s:%s", storage, volName)
 
 				var v string
-				cerr := pve.RetryOnStorageLock(ctx, deps.Logger, "create_disk", lockAttempts, func() error {
+				cerr := pve.RetryOnTransientOrLock(ctx, deps.Logger, "create_disk", lockAttempts, func() error {
 					var innerErr error
 					v, innerErr = deps.PVE.Storage().CreateVolume(
 						ctx, node, storage, sizeGiB, formatArg, candidate, volName,

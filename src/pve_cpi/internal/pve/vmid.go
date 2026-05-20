@@ -10,6 +10,7 @@ import (
 	"time"
 
 	sdkcluster "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cluster"
+	sdknodes "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/nodes"
 
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 )
@@ -110,9 +111,20 @@ type vmidEntry struct {
 // listClusterVMIDs calls GET /cluster/resources?type=vm and returns the set of
 // all VMID integers currently registered in the cluster (across all nodes).
 // Returns a non-nil error wrapped as *cpierrors.Error on any failure.
+//
+// The cluster-resources call is wrapped in RetryOnTransient to absorb the
+// pvedaemon-worker-recycle window: under burst load the worker holding our
+// TCP connection may exit (request-quota or memory limit), surfacing as
+// HTTP 596 or an auth-EOF on the next call. A fresh worker spawns within
+// roughly a second, so a short retry usually wins.
 func listClusterVMIDs(ctx context.Context, c Client) (map[int]struct{}, error) {
 	typeStr := "vm"
-	resp, err := c.Cluster().ListResources(ctx, &sdkcluster.ListResourcesParams{Type: &typeStr})
+	var resp *sdkcluster.ListResourcesResponse
+	err := RetryOnTransient(ctx, nil, "vmid_list_cluster", 0, func() error {
+		var inner error
+		resp, inner = c.Cluster().ListResources(ctx, &sdkcluster.ListResourcesParams{Type: &typeStr})
+		return inner
+	})
 	if err != nil {
 		return nil, cpierrors.Wrap(err, "vmid: list cluster resources")
 	}
@@ -242,7 +254,12 @@ func listStorageVMIDs(ctx context.Context, c Client, node, storage string) (map[
 		// volumes. Production sdkClient.Nodes() is always non-nil.
 		return map[int]struct{}{}, nil
 	}
-	resp, err := nodesSvc.ListStorageContent(ctx, node, storage, nil)
+	var resp *sdknodes.ListStorageContentResponse
+	err := RetryOnTransient(ctx, nil, "vmid_list_storage", 0, func() error {
+		var inner error
+		resp, inner = nodesSvc.ListStorageContent(ctx, node, storage, nil)
+		return inner
+	})
 	if err != nil {
 		return nil, cpierrors.Wrap(err, fmt.Sprintf("vmid: list storage %q content on node %q", storage, node))
 	}

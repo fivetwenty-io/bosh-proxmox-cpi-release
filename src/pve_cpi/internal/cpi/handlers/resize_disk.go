@@ -138,7 +138,7 @@ func HandleResizeDisk(deps Deps) Handler {
 		// task can fail with "can't lock file ... got timeout". Retry the
 		// submit+await pair on that signal; non-lock errors propagate.
 		// ----------------------------------------------------------------
-		rerr := pve.RetryOnStorageLock(ctx, deps.Logger, "resize_disk", 0, func() error {
+		rerr := pve.RetryOnTransientOrLock(ctx, deps.Logger, "resize_disk", 0, func() error {
 			upid, e := deps.PVE.QEMU().ResizeDisk(ctx, node, vmid, diskID, deltaGiB)
 			if e != nil {
 				return e

@@ -66,3 +66,39 @@ properties:
 ```
 
 In the example above, `nfs-shared` is a PVE NFS storage pool with the `import` content type enabled and `shared=1`. Both `vm_storage` and `stemcell_storage` must be accessible from all cluster nodes when operating a multi-node cluster.
+
+## Custom Tags
+
+Operators may attach arbitrary tags to VMs and persistent disks via the `tags` cloud-property on `vm_types` and `disk_types`. Tags surface in the PVE UI for filtering, cost-allocation, ownership tracking, and ad-hoc grouping.
+
+The `tags` cloud-property is a map of `key: value` pairs. Each pair is sanitized and emitted as a `<key>--<value>` entry in the PVE tags field (PVE allows only `[A-Za-z0-9-]` in tag values; other bytes are replaced with `-`). Multiple entries are joined with `;`.
+
+Example cloud-config snippet:
+
+```yaml
+vm_types:
+- name: tagged
+  cloud_properties:
+    cpu: 2
+    memory: 1024
+    tags:
+      env: prod
+      owner: platform-team
+
+disk_types:
+- name: small
+  disk_size: 1024
+  cloud_properties:
+    tags:
+      tier: bronze
+```
+
+Notes:
+
+- Tags are sanitized: a key like `bad key` becomes `bad-key`, a value like `with spaces` becomes `with-spaces`.
+
+- The combined tag string is capped at 255 bytes; entries past the cap are dropped at a `;` boundary so partial entries are never emitted.
+
+- The CPI reserves three tag-key prefixes for its own use: `director--`, `deployment--`, and `job--`. These are rebuilt from BOSH-supplied metadata on every `set_vm_metadata` call. Custom tags survive those re-syncs.
+
+- PVE has no native disk-volume tag field. Tags supplied on a `disk_type` are written to the tags field of the VM the disk is attached to and recorded in the VM description sentinel under `bosh_disk_tags`. Disk tags only become visible once the disk is attached to a VM; if `create_disk` is called without a `vm_cid` hint, the tags are deferred and applied on the next `set_disk_metadata` call.

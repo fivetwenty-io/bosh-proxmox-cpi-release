@@ -70,7 +70,10 @@ func (m *mockQEMUService) Config(ctx context.Context, node string, vmid int) (ma
 	if m.configFn != nil {
 		return m.configFn(ctx, node, vmid)
 	}
-	panic("mockQEMUService.Config: not configured")
+	// Default: empty config. Handlers (e.g., set_vm_metadata) call Config()
+	// to preserve operator-supplied tags; tests that don't exercise that
+	// preservation logic should see a no-op empty config.
+	return map[string]interface{}{}, nil
 }
 
 func (m *mockQEMUService) Create(ctx context.Context, node string, params map[string]interface{}) (string, error) {
@@ -228,6 +231,12 @@ func testConfig() *config.CPIConfig {
 
 // testDeps builds a Deps struct wiring the provided mock services.
 func testDeps(qemuSvc qemu.Service, nodesSvc nodes.Service, tasksSvc tasks.Service, agentSvc agent.Agent) handlers.Deps {
+	// Default qemu service so handlers calling QEMU().Config() (e.g.,
+	// set_vm_metadata reading existing tags) don't dereference nil in
+	// tests that pass nil for qemuSvc.
+	if qemuSvc == nil {
+		qemuSvc = &mockQEMUService{}
+	}
 	return handlers.Deps{
 		Config: testConfig(),
 		PVE: &mockPVEClient{

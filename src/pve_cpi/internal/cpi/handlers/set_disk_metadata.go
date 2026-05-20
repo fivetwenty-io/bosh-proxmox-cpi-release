@@ -24,7 +24,8 @@ var boshSentinelPattern = regexp.MustCompile(`<!--BOSH:(.*?)-->`)
 
 // boshDescriptionPayload is the JSON structure stashed inside the sentinel comment.
 type boshDescriptionPayload struct {
-	BoshDiskMetadata map[string]map[string]any `json:"bosh_disk_metadata"`
+	BoshDiskMetadata map[string]map[string]any    `json:"bosh_disk_metadata"`
+	BoshDiskTags     map[string]map[string]string `json:"bosh_disk_tags,omitempty"`
 }
 
 // attachedVM records the node+vmid pair that hosts a disk.
@@ -85,6 +86,16 @@ func HandleSetDiskMetadata(deps Deps) cpi.Handler {
 			return nil, err
 		}
 
+		// Extract operator-supplied disk tags out of metadata so they don't
+		// also land in the regular sentinel "bosh_disk_metadata" payload.
+		// Accept map[string]string and map[string]any (BOSH JSON deserialises
+		// nested objects as map[string]any).
+		var diskTags map[string]string
+		if raw, ok := metadata["tags"]; ok {
+			diskTags = coerceTagMap(raw)
+			delete(metadata, "tags")
+		}
+
 		// --- scan VMs for disk ---
 		matches, err := findVMsHostingDisk(ctx, deps, diskCID)
 		if err != nil {
@@ -98,7 +109,15 @@ func HandleSetDiskMetadata(deps Deps) cpi.Handler {
 			return nil, nil
 
 		case 1:
-			return nil, persistMetadata(ctx, deps, matches[0], diskCID, metadata)
+			if err := persistMetadata(ctx, deps, matches[0], diskCID, metadata); err != nil {
+				return nil, err
+			}
+			if len(diskTags) > 0 {
+				if err := applyCustomTagsToVM(ctx, deps, matches[0].node, matches[0].vmid, diskTags, diskCID); err != nil {
+					return nil, err
+				}
+			}
+			return nil, nil
 
 		default:
 			return nil, cpierrors.Cloud(
@@ -107,6 +126,29 @@ func HandleSetDiskMetadata(deps Deps) cpi.Handler {
 			)
 		}
 	})
+}
+
+// coerceTagMap accepts an arbitrary JSON value supplied under metadata["tags"]
+// and returns it as map[string]string. Non-string values are stringified via
+// fmt.Sprint to keep the path forgiving for callers that supply numeric tag
+// values. Returns nil if the input is not a JSON object.
+func coerceTagMap(v any) map[string]string {
+	switch m := v.(type) {
+	case map[string]string:
+		out := make(map[string]string, len(m))
+		for k, val := range m {
+			out[k] = val
+		}
+		return out
+	case map[string]any:
+		out := make(map[string]string, len(m))
+		for k, val := range m {
+			out[k] = fmt.Sprint(val)
+		}
+		return out
+	default:
+		return nil
+	}
 }
 
 // findVMsHostingDisk iterates all nodes and their VMs, returning every (node, vmid)
@@ -229,5 +271,108 @@ func persistMetadata(ctx context.Context, deps Deps, vm attachedVM, diskCID stri
 		)
 	}
 
+	return nil
+}
+
+// applyCustomTagsToVM merges operator-supplied disk tags onto the hosting VM.
+//
+// PVE has no native disk-volume tag field. For tags supplied on disk_types,
+// the CPI writes them to the tags field of the VM the disk is attached to
+// and also stashes them in the description sentinel under bosh_disk_tags so
+// the per-disk attribution survives detach+attach cycles.
+//
+// Merge semantics: for each key in `tags`, any existing entry on the VM with
+// the same key prefix ("<key>--") is replaced. Entries with unrelated keys
+// are preserved. The BOSH-reserved director/deployment/job prefixes are also
+// preserved here — set_vm_metadata owns those and rebuilds them on each sync.
+func applyCustomTagsToVM(ctx context.Context, deps Deps, node string, vmid int, tags map[string]string, diskCID string) error {
+	if len(tags) == 0 {
+		return nil
+	}
+
+	cfg, err := deps.PVE.QEMU().Config(ctx, node, vmid)
+	if err != nil {
+		return cpierrors.Wrap(err,
+			fmt.Sprintf("set_disk_metadata: fetch VM config for tag apply (node=%s vmid=%d)", node, vmid),
+		)
+	}
+
+	newEntries := buildCustomTags(tags)
+	replacedPrefixes := make(map[string]struct{}, len(newEntries))
+	for _, e := range newEntries {
+		idx := strings.Index(e, "--")
+		if idx <= 0 {
+			continue
+		}
+		replacedPrefixes[e[:idx+2]] = struct{}{}
+	}
+
+	var existing []string
+	if v, ok := cfg["tags"]; ok {
+		if s, ok := v.(string); ok {
+			for _, e := range parseTagsField(s) {
+				skip := false
+				for prefix := range replacedPrefixes {
+					if strings.HasPrefix(e, prefix) {
+						skip = true
+						break
+					}
+				}
+				if !skip {
+					existing = append(existing, e)
+				}
+			}
+		}
+	}
+
+	mergedTags := mergeTagList(existing, newEntries, maxTagLength)
+
+	currentDesc := ""
+	if v, ok := cfg["description"]; ok {
+		if s, ok := v.(string); ok {
+			currentDesc = s
+		}
+	}
+
+	var payload boshDescriptionPayload
+	payload.BoshDiskMetadata = make(map[string]map[string]any)
+
+	nonBoshDesc := currentDesc
+	if m := boshSentinelPattern.FindStringSubmatchIndex(currentDesc); m != nil {
+		jsonStr := currentDesc[m[2]:m[3]]
+		if parseErr := json.Unmarshal([]byte(jsonStr), &payload); parseErr != nil {
+			payload.BoshDiskMetadata = make(map[string]map[string]any)
+			payload.BoshDiskTags = nil
+		}
+		nonBoshDesc = strings.TrimSpace(currentDesc[:m[0]])
+	}
+	if payload.BoshDiskTags == nil {
+		payload.BoshDiskTags = make(map[string]map[string]string)
+	}
+	tagCopy := make(map[string]string, len(tags))
+	for k, v := range tags {
+		tagCopy[k] = v
+	}
+	payload.BoshDiskTags[diskCID] = tagCopy
+
+	sentinelJSON, err := json.Marshal(payload)
+	if err != nil {
+		return cpierrors.Cloud("set_disk_metadata: marshal tag payload: %s", err.Error())
+	}
+	newDesc := fmt.Sprintf("<!--BOSH:%s-->", string(sentinelJSON))
+	if nonBoshDesc != "" {
+		newDesc = nonBoshDesc + "\n" + newDesc
+	}
+
+	vmidStr := fmt.Sprintf("%d", vmid)
+	updateParams := &sdknodes.UpdateQemuConfigParams{
+		Description: &newDesc,
+		Tags:        &mergedTags,
+	}
+	if updateErr := deps.PVE.Nodes().UpdateQemuConfig(ctx, node, vmidStr, updateParams); updateErr != nil {
+		return cpierrors.Wrap(updateErr,
+			fmt.Sprintf("set_disk_metadata: UpdateQemuConfig tags (node=%s vmid=%d)", node, vmid),
+		)
+	}
 	return nil
 }

@@ -85,11 +85,29 @@ func HandleSetVMMetadata(deps Deps) cpi.Handler {
 		// Sorted "key: value\n" lines matching Perl reference behavior.
 		description := buildDescription(metadata)
 
-		// --- build tags ---
-		// Extract director, deployment, job; emit "<key>--<value>" entries
-		// (PVE tags accept only [A-Za-z0-9-]); join with ";"; truncate to
-		// maxTagLength at a tag boundary.
-		tags := buildTags(metadata)
+		// --- merge tags ---
+		// Read the existing tags string so operator-supplied custom tags
+		// (env--prod, owner--cpi-test, ...) survive. The director/deployment/
+		// job triple is rebuilt from metadata each call so stale values from
+		// a prior sync cannot accumulate.
+		var existingTags []string
+		if cfg, cfgErr := deps.PVE.QEMU().Config(ctx, node, vmid); cfgErr == nil {
+			if v, ok := cfg["tags"]; ok {
+				if s, ok := v.(string); ok {
+					existingTags = parseTagsField(s)
+				}
+			}
+		} else if pve.IsNotFound(cfgErr) {
+			return nil, cpierrors.VMNotFound(vmCID)
+		} else {
+			logger.Warn("set_vm_metadata: could not read current VM config; existing tags will not be preserved",
+				log.Err(cfgErr),
+			)
+		}
+
+		preserved := stripReservedBoshTags(existingTags)
+		boshEntries := buildBoshManagedTags(metadata)
+		tags := mergeTagList(preserved, boshEntries, maxTagLength)
 
 		logger.Debug("set_vm_metadata: updating VM config",
 			log.String("description_len", fmt.Sprintf("%d", len(description))),
@@ -135,12 +153,11 @@ func buildDescription(metadata map[string]any) string {
 	return sb.String()
 }
 
-// buildTags extracts director, deployment, and job from metadata and emits
-// "<key>--<value>" entries joined with ";". PVE tag values accept only
-// [A-Za-z0-9-]; any other byte in the value is replaced with "-". The result
-// is truncated to maxTagLength bytes at a tag boundary so no partial tag is
-// emitted. Returns empty string when none of the three fields are present.
-func buildTags(metadata map[string]any) string {
+// buildBoshManagedTags extracts director, deployment, and job from metadata
+// and returns sanitized "<key>--<value>" entries. PVE tag values accept only
+// [A-Za-z0-9-]; any other byte in the value is replaced with "-". Keys whose
+// metadata value is missing, nil, or sanitizes to empty are skipped.
+func buildBoshManagedTags(metadata map[string]any) []string {
 	var parts []string
 	for _, key := range []string{"director", "deployment", "job"} {
 		v, ok := metadata[key]
@@ -153,46 +170,5 @@ func buildTags(metadata map[string]any) string {
 		}
 		parts = append(parts, key+"--"+s)
 	}
-	if len(parts) == 0 {
-		return ""
-	}
-	tags := strings.Join(parts, ";")
-	if len(tags) <= maxTagLength {
-		return tags
-	}
-	// Truncate at a tag boundary so we never emit a partial "<key>--<value>".
-	var truncated string
-	for i, p := range parts {
-		candidate := p
-		if i > 0 {
-			candidate = truncated + ";" + p
-		}
-		if len(candidate) > maxTagLength {
-			break
-		}
-		truncated = candidate
-	}
-	return truncated
-}
-
-// sanitizeTagValue replaces any byte outside [A-Za-z0-9-] with "-" so the
-// result is a valid PVE tag value. Leading/trailing "-" are trimmed.
-func sanitizeTagValue(s string) string {
-	if s == "" {
-		return ""
-	}
-	b := make([]byte, len(s))
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		switch {
-		case c >= 'a' && c <= 'z',
-			c >= 'A' && c <= 'Z',
-			c >= '0' && c <= '9',
-			c == '-':
-			b[i] = c
-		default:
-			b[i] = '-'
-		}
-	}
-	return strings.Trim(string(b), "-")
+	return parts
 }

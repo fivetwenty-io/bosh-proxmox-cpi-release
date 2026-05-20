@@ -117,7 +117,7 @@ func HandleDeleteVM(deps Deps) cpi.Handler {
 		destroyDisks := true
 		logger.Debug("delete_vm: deleting VM")
 		var deleteResp *sdknodes.DeleteQemuResponse
-		deleteErr := pve.RetryOnStorageLock(ctx, logger, "delete_vm", 0, func() error {
+		deleteErr := pve.RetryOnTransientOrLock(ctx, logger, "delete_vm", 0, func() error {
 			var innerErr error
 			deleteResp, innerErr = deps.PVE.Nodes().DeleteQemu(ctx, node, vmCID, &sdknodes.DeleteQemuParams{
 				Purge:                    &purge,

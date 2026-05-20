@@ -128,6 +128,59 @@ func IsVMIDConflict(err error) bool {
 	return strings.Contains(strings.ToLower(err.Error()), "already exists")
 }
 
+// IsTransientTransport reports whether err signals a transient transport-layer
+// fault between the CPI and the PVE API surface, distinct from a deliberate
+// HTTP 4xx response. The canonical trigger is a pvedaemon worker cycling
+// mid-request — under burst load each worker hits its built-in request quota
+// and exits, dropping every in-flight TCP connection.
+//
+// Surfaces detected:
+//   - Any 5xx APIError (errors.Is sdkerrors.ErrServer). HTTP 596 is the
+//     specific shape pveproxy emits when it cannot reach pvedaemon on
+//     localhost ("backend gone"); it is included in the 5xx class.
+//   - SDK *ConnectionError — bare TCP refusal, RST, or DNS failure.
+//   - SDK *TimeoutError — request deadline exceeded.
+//   - "failed to parse login response" — POST /access/ticket returned an
+//     empty body because the worker exited mid-response.
+//   - "auto-login failed" — generic SDK wrapper covering ticket-fetch
+//     failures, including the EOF case above.
+//
+// The condition is transient: a fresh pvedaemon worker replaces the dying
+// one within a second, so a short backoff and retry usually wins.
+//
+// nil → false.
+func IsTransientTransport(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, sdkerrors.ErrServer) {
+		return true
+	}
+	var connErr *sdkerrors.ConnectionError
+	if errors.As(err, &connErr) {
+		return true
+	}
+	var timeoutErr *sdkerrors.TimeoutError
+	if errors.As(err, &timeoutErr) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "failed to parse login response") {
+		return true
+	}
+	if strings.Contains(msg, "auto-login failed") {
+		return true
+	}
+	if strings.Contains(msg, "(code: 596)") || strings.Contains(msg, "http 596") {
+		return true
+	}
+	return false
+}
+
 // IsStorageLockTimeout reports whether err signals that a PVE per-storage
 // lockfile (e.g. /var/lock/pve-manager/pve-storage-<name>) could not be
 // acquired before its timeout. This happens when many concurrent qmcreate

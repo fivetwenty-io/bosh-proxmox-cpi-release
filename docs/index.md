@@ -24,6 +24,10 @@ This CPI enables BOSH to provision and manage resources on PVE 9.x, implementing
 
 - [PVE Storage Locking](pve-storage-locking.md): How PVE's per-storage lockfile serialises every storage mutation, why bursty BOSH deploys hit it, and how the CPI retries to absorb the contention.
 
+- [PVE Transient Transport Faults](pve-transient-transport.md): How pvedaemon worker recycling produces HTTP 596 and auth-ticket EOFs under burst load, and how the CPI absorbs them.
+
+- [PVE Host Tuning](pve-host-tuning.md): Operator-side knobs (`pvedaemon` / `pveproxy` worker counts, storage layout) for sustained concurrent CPI workloads.
+
 - [Troubleshooting](troubleshooting.md): Solutions to common issues.
 
 - [Examples](examples.md): Sample BOSH deployment manifests and usage scenarios.

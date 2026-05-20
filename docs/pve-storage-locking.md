@@ -123,6 +123,10 @@ Nonzero retry log lines on a deploy that ultimately succeeds: working as intende
 
 `attempt=10` followed by the operation failing means retries were exhausted. Look at the PVE node's `journalctl -u pvedaemon -u pveproxy` from the same window to see what was holding the lock.
 
+## Related failure mode
+
+Per-storage lock contention is the first transient PVE failure the CPI handles; pvedaemon worker recycling is the second. The two often coexist on the same call sites and are absorbed by the same helper (`RetryOnTransientOrLock`). See [PVE Transient Transport Faults](pve-transient-transport.md) for the worker-recycle side.
+
 ## References
 
 - `internal/pve/retry.go` — helper implementation and backoff curve.

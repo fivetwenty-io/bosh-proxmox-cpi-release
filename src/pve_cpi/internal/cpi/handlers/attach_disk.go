@@ -145,7 +145,12 @@ func HandleAttachDisk(deps Deps) Handler {
 		// PVE config disk values are canonical "<storage>:<volname>"
 		// (e.g. "data:vm-9003-disk-0"). Pass the full disk_cid; a bare
 		// volname is rejected with "scsi0.file: invalid format ...".
-		diskID, err := deps.PVE.QEMU().AttachDisk(ctx, node, vmid, diskCID, bus, nil)
+		var diskID string
+		err = pve.RetryOnTransient(ctx, deps.Logger, "attach_disk", 0, func() error {
+			var attachErr error
+			diskID, attachErr = deps.PVE.QEMU().AttachDisk(ctx, node, vmid, diskCID, bus, nil)
+			return attachErr
+		})
 		if err != nil {
 			wrapped := pve.WrapError(err)
 			if pve.IsNotFound(err) {

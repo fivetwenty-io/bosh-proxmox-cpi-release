@@ -132,6 +132,123 @@ func TestRetryOnStorageLock_ZeroMaxAttemptsUsesDefault(t *testing.T) {
 	}
 }
 
+func TestRetryOnTransient_SucceedsImmediately(t *testing.T) {
+	calls := 0
+	err := RetryOnTransient(context.Background(), nil, "test", 5, func() error {
+		calls++
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("expected 1 call, got %d", calls)
+	}
+}
+
+func TestRetryOnTransient_NonTransientPropagates(t *testing.T) {
+	want := errors.New("plain unrelated")
+	calls := 0
+	err := RetryOnTransient(context.Background(), nil, "test", 5, func() error {
+		calls++
+		return want
+	})
+	if !errors.Is(err, want) {
+		t.Fatalf("expected wrapped sentinel, got %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("expected 1 call (no retry), got %d", calls)
+	}
+}
+
+func TestRetryOnTransient_RetriesOnLoginEOF(t *testing.T) {
+	calls := 0
+	transient := errors.New("auto-login failed: authentication failed: failed to parse login response: EOF")
+	err := RetryOnTransient(context.Background(), nil, "test", 3, func() error {
+		calls++
+		if calls < 2 {
+			return transient
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("expected 2 calls, got %d", calls)
+	}
+}
+
+func TestRetryOnTransient_ExhaustsAndReturnsLastErr(t *testing.T) {
+	calls := 0
+	transient := errors.New("HTTP 596 (code: 596)")
+	err := RetryOnTransient(context.Background(), nil, "test", 2, func() error {
+		calls++
+		return transient
+	})
+	if !errors.Is(err, transient) {
+		t.Fatalf("expected exhausted error to wrap last transient, got %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("expected 2 calls (max), got %d", calls)
+	}
+}
+
+func TestRetryOnTransientOrLock_SwitchesBackoffByReason(t *testing.T) {
+	// Mix a transient transport fault then a lock timeout to confirm both
+	// predicates participate. Cap attempts at 3 to keep the test fast
+	// (worst-case sleep ~3-4s).
+	calls := 0
+	transient := errors.New("(code: 596)")
+	lockErr := errors.New("can't lock file '/var/lock/pve-manager/pve-storage-data' - got timeout")
+	err := RetryOnTransientOrLock(context.Background(), nil, "test", 3, func() error {
+		calls++
+		switch calls {
+		case 1:
+			return transient
+		case 2:
+			return lockErr
+		default:
+			return nil
+		}
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if calls != 3 {
+		t.Fatalf("expected 3 calls, got %d", calls)
+	}
+}
+
+func TestRetryOnTransientOrLock_NonRetryablePropagates(t *testing.T) {
+	want := errors.New("some other failure")
+	calls := 0
+	err := RetryOnTransientOrLock(context.Background(), nil, "test", 5, func() error {
+		calls++
+		return want
+	})
+	if !errors.Is(err, want) {
+		t.Fatalf("expected want, got %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("expected 1 call, got %d", calls)
+	}
+}
+
+func TestTransientBackoff_GrowsAndCaps(t *testing.T) {
+	d0 := TransientBackoff(0)
+	if d0 < 600*time.Millisecond || d0 > 1400*time.Millisecond {
+		t.Errorf("attempt 0 backoff out of expected band: %v", d0)
+	}
+	dBig := TransientBackoff(20)
+	if dBig > 15*time.Second {
+		t.Errorf("attempt 20 backoff exceeds cap: %v", dBig)
+	}
+	if dBig < 10*time.Second {
+		t.Errorf("attempt 20 backoff below floor at cap: %v", dBig)
+	}
+}
+
 func TestStorageLockBackoff_GrowsAndCaps(t *testing.T) {
 	// At attempt 0 the floor is 2s − 30% = 1.4s. Past attempt ≈ 7 the
 	// raw exponent exceeds 30s and the cap kicks in (jittered down to

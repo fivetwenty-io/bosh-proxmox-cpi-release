@@ -235,6 +235,90 @@ func TestHandleSetVMMetadata_TagTruncation(t *testing.T) {
 	}
 }
 
+// TestHandleSetVMMetadata_PreservesCustomTags verifies operator-supplied tags
+// already on the VM (env--prod, owner--alice) survive a director re-sync.
+func TestHandleSetVMMetadata_PreservesCustomTags(t *testing.T) {
+	t.Parallel()
+
+	qemuSvc := &mockQEMUService{
+		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
+			return map[string]interface{}{
+				"tags": "env--prod;owner--alice",
+			}, nil
+		},
+	}
+
+	var gotTags string
+	nodesSvc := &mockNodesService{
+		updateQemuConfigFn: func(_ context.Context, _, _ string, params *nodes.UpdateQemuConfigParams) error {
+			if params.Tags != nil {
+				gotTags = *params.Tags
+			}
+			return nil
+		},
+	}
+
+	h := handlers.HandleSetVMMetadata(testDeps(qemuSvc, nodesSvc, nil, &mockAgentService{}))
+	_, err := h.Handle(context.Background(), marshalArgs("101", map[string]any{
+		"director":   "bosh",
+		"deployment": "cf",
+		"job":        "diego_cell",
+	}), jsonrpc.Context{})
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	for _, want := range []string{"env--prod", "owner--alice", "director--bosh", "deployment--cf", "job--diego-cell"} {
+		if !strings.Contains(gotTags, want) {
+			t.Errorf("tags missing %q; got: %q", want, gotTags)
+		}
+	}
+}
+
+// TestHandleSetVMMetadata_ReplacesStaleBoshTags verifies that pre-existing
+// director--/deployment--/job-- entries are dropped and rebuilt from this
+// call's metadata, so stale values cannot accumulate.
+func TestHandleSetVMMetadata_ReplacesStaleBoshTags(t *testing.T) {
+	t.Parallel()
+
+	qemuSvc := &mockQEMUService{
+		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
+			return map[string]interface{}{
+				"tags": "director--old-uuid;deployment--old;job--old;env--prod",
+			}, nil
+		},
+	}
+
+	var gotTags string
+	nodesSvc := &mockNodesService{
+		updateQemuConfigFn: func(_ context.Context, _, _ string, params *nodes.UpdateQemuConfigParams) error {
+			if params.Tags != nil {
+				gotTags = *params.Tags
+			}
+			return nil
+		},
+	}
+
+	h := handlers.HandleSetVMMetadata(testDeps(qemuSvc, nodesSvc, nil, &mockAgentService{}))
+	_, err := h.Handle(context.Background(), marshalArgs("101", map[string]any{
+		"director":   "new-uuid",
+		"deployment": "cf",
+		"job":        "diego",
+	}), jsonrpc.Context{})
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if strings.Contains(gotTags, "director--old-uuid") || strings.Contains(gotTags, "deployment--old") || strings.Contains(gotTags, "job--old") {
+		t.Errorf("stale BOSH-managed tags survived; got: %q", gotTags)
+	}
+	for _, want := range []string{"director--new-uuid", "deployment--cf", "job--diego", "env--prod"} {
+		if !strings.Contains(gotTags, want) {
+			t.Errorf("tags missing %q; got: %q", want, gotTags)
+		}
+	}
+}
+
 // TestHandleSetVMMetadata_DescriptionSorted verifies description lines are sorted by key.
 func TestHandleSetVMMetadata_DescriptionSorted(t *testing.T) {
 	t.Parallel()

@@ -14,6 +14,34 @@ import (
 // bounded under PVE's task watchdog window.
 const DefaultStorageLockMaxAttempts = 10
 
+// DefaultTransientMaxAttempts bounds transport-layer retries (pvedaemon worker
+// cycle, pveproxy backend stalls, auth-ticket EOF). Worker restart is
+// sub-second so a higher attempt count is cheap and rarely consumed in full.
+const DefaultTransientMaxAttempts = 8
+
+// TransientBackoff returns the sleep duration after the attempt-th (0-indexed)
+// failed transport call: exponential 1s × 1.5^attempt with ±30% jitter, capped
+// at 15s. Tuned for pvedaemon worker recycling, which completes in roughly a
+// second; longer waits buy nothing.
+func TransientBackoff(attempt int) time.Duration {
+	const cap = 15 * time.Second
+	base := 1 * time.Second
+	factor := 1.0
+	for i := 0; i < attempt; i++ {
+		factor *= 1.5
+	}
+	d := time.Duration(float64(base) * factor)
+	if d > cap {
+		d = cap
+	}
+	jitter := time.Duration(mrand.Int64N(int64(d) * 6 / 10))
+	out := d - d*3/10 + jitter
+	if out > cap {
+		out = cap
+	}
+	return out
+}
+
 // StorageLockBackoff returns the sleep duration after the attempt-th
 // (0-indexed) failed lock acquisition: exponential 2s × 1.5^attempt with
 // ±30% jitter, capped at 30s. PVE serialises every per-storage operation
@@ -79,6 +107,128 @@ func RetryOnStorageLock(
 		if logger != nil {
 			logger.Info("pve: storage lock timeout, retrying",
 				log.String("op", label),
+				log.Int("attempt", attempt+1),
+				log.Int("max_attempts", maxAttempts),
+				log.Int("backoff_ms", int(d/time.Millisecond)),
+				log.String("error", err.Error()),
+			)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(d):
+		}
+	}
+	return lastErr
+}
+
+// RetryOnTransient invokes op up to maxAttempts times, retrying only when the
+// returned error is a transient transport-layer fault (IsTransientTransport).
+// Other errors (or success) return immediately. Backoff uses TransientBackoff.
+// Context cancellation short-circuits the sleep.
+//
+// Use for SDK calls that don't touch the per-storage lock (config edits,
+// listings, login) but can still die to a pvedaemon worker recycling.
+//
+// maxAttempts ≤ 0 falls back to DefaultTransientMaxAttempts.
+func RetryOnTransient(
+	ctx context.Context,
+	logger *log.Logger,
+	label string,
+	maxAttempts int,
+	op func() error,
+) error {
+	if maxAttempts <= 0 {
+		maxAttempts = DefaultTransientMaxAttempts
+	}
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		err := op()
+		if err == nil {
+			return nil
+		}
+		if !IsTransientTransport(err) {
+			return err
+		}
+		lastErr = err
+		if attempt == maxAttempts-1 {
+			break
+		}
+		d := TransientBackoff(attempt)
+		if logger != nil {
+			logger.Info("pve: transient transport fault, retrying",
+				log.String("op", label),
+				log.Int("attempt", attempt+1),
+				log.Int("max_attempts", maxAttempts),
+				log.Int("backoff_ms", int(d/time.Millisecond)),
+				log.String("error", err.Error()),
+			)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(d):
+		}
+	}
+	return lastErr
+}
+
+// RetryOnTransientOrLock invokes op up to maxAttempts times, retrying when the
+// returned error is either a per-storage lockfile timeout (IsStorageLockTimeout)
+// or a transient transport-layer fault (IsTransientTransport). The longer
+// StorageLockBackoff curve is used because storage-lock holds dominate the
+// wait when both failure modes coexist; a sub-second transport retry inside
+// a 30-second lock window is just noise.
+//
+// Use for storage-touching SDK calls that may collide on either condition.
+// Backoff continues from a single attempt counter — a deploy that hits a
+// transient fault on attempt 3 then a lock timeout on attempt 4 keeps
+// climbing the same curve rather than restarting from zero.
+//
+// maxAttempts ≤ 0 falls back to DefaultStorageLockMaxAttempts (the longer of
+// the two budgets — the helper subsumes both failure modes).
+func RetryOnTransientOrLock(
+	ctx context.Context,
+	logger *log.Logger,
+	label string,
+	maxAttempts int,
+	op func() error,
+) error {
+	if maxAttempts <= 0 {
+		maxAttempts = DefaultStorageLockMaxAttempts
+	}
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		err := op()
+		if err == nil {
+			return nil
+		}
+		isLock := IsStorageLockTimeout(err)
+		isTransient := IsTransientTransport(err)
+		if !isLock && !isTransient {
+			return err
+		}
+		lastErr = err
+		if attempt == maxAttempts-1 {
+			break
+		}
+		// Transport faults clear in sub-second, lock holds in tens of
+		// seconds; pick the shorter curve when only the transport mode
+		// fired so a fast retry doesn't waste the lock-tuned budget.
+		var d time.Duration
+		if isLock {
+			d = StorageLockBackoff(attempt)
+		} else {
+			d = TransientBackoff(attempt)
+		}
+		if logger != nil {
+			reason := "transient_transport"
+			if isLock {
+				reason = "storage_lock"
+			}
+			logger.Info("pve: retrying after retryable fault",
+				log.String("op", label),
+				log.String("reason", reason),
 				log.Int("attempt", attempt+1),
 				log.Int("max_attempts", maxAttempts),
 				log.Int("backoff_ms", int(d/time.Millisecond)),

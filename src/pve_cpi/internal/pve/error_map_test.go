@@ -368,6 +368,113 @@ func TestIsVMIDConflict_PlainAlreadyExists(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// IsTransientTransport
+// ---------------------------------------------------------------------------
+
+func TestIsTransientTransport_Nil(t *testing.T) {
+	if pve.IsTransientTransport(nil) {
+		t.Error("nil should not be transient")
+	}
+}
+
+func TestIsTransientTransport_HTTP596(t *testing.T) {
+	err := makeAPIErr(596, "backend gone")
+	if !pve.IsTransientTransport(err) {
+		t.Errorf("HTTP 596 should be transient; err=%v", err)
+	}
+}
+
+func TestIsTransientTransport_HTTP500(t *testing.T) {
+	err := makeAPIErr(500, "internal server error")
+	if !pve.IsTransientTransport(err) {
+		t.Errorf("HTTP 500 should be transient; err=%v", err)
+	}
+}
+
+func TestIsTransientTransport_HTTP503(t *testing.T) {
+	err := makeAPIErr(503, "service unavailable")
+	if !pve.IsTransientTransport(err) {
+		t.Errorf("HTTP 503 should be transient; err=%v", err)
+	}
+}
+
+func TestIsTransientTransport_HTTP404False(t *testing.T) {
+	err := makeAPIErr(404, "not found")
+	if pve.IsTransientTransport(err) {
+		t.Errorf("HTTP 404 should not be transient; err=%v", err)
+	}
+}
+
+func TestIsTransientTransport_HTTP409False(t *testing.T) {
+	err := makeAPIErr(409, "conflict")
+	if pve.IsTransientTransport(err) {
+		t.Errorf("HTTP 409 should not be transient; err=%v", err)
+	}
+}
+
+func TestIsTransientTransport_ConnectionError(t *testing.T) {
+	err := &sdkerrors.ConnectionError{
+		Host:    "pve.example.com",
+		Port:    8006,
+		Message: "connection refused",
+	}
+	if !pve.IsTransientTransport(err) {
+		t.Errorf("ConnectionError should be transient; err=%v", err)
+	}
+}
+
+func TestIsTransientTransport_TimeoutError(t *testing.T) {
+	err := &sdkerrors.TimeoutError{Operation: "get", Duration: "30s"}
+	if !pve.IsTransientTransport(err) {
+		t.Errorf("TimeoutError should be transient; err=%v", err)
+	}
+}
+
+func TestIsTransientTransport_NetTimeout(t *testing.T) {
+	err := &fakeNetError{timeout: true}
+	if !pve.IsTransientTransport(err) {
+		t.Errorf("net.Error with Timeout()=true should be transient; err=%v", err)
+	}
+}
+
+func TestIsTransientTransport_NetNonTimeoutFalse(t *testing.T) {
+	err := &fakeNetError{timeout: false}
+	if pve.IsTransientTransport(err) {
+		t.Errorf("net.Error with Timeout()=false should not be transient; err=%v", err)
+	}
+}
+
+func TestIsTransientTransport_LoginEOF(t *testing.T) {
+	err := errors.New("auto-login failed: authentication failed: failed to parse login response: EOF")
+	if !pve.IsTransientTransport(err) {
+		t.Errorf("login EOF should be transient; err=%v", err)
+	}
+}
+
+func TestIsTransientTransport_AutoLoginFailed(t *testing.T) {
+	err := errors.New("auto-login failed: some other reason")
+	if !pve.IsTransientTransport(err) {
+		t.Errorf("auto-login failed should be transient; err=%v", err)
+	}
+}
+
+func TestIsTransientTransport_596Substring(t *testing.T) {
+	// Plain errors (no APIError wrap) carrying the SDK formatted
+	// "(code: 596)" suffix should still be detected.
+	err := errors.New("API request failed: HTTP 596 (code: 596)")
+	if !pve.IsTransientTransport(err) {
+		t.Errorf("plain 596 message should be transient; err=%v", err)
+	}
+}
+
+func TestIsTransientTransport_Unrelated(t *testing.T) {
+	err := errors.New("some other error")
+	if pve.IsTransientTransport(err) {
+		t.Errorf("unrelated error should not be transient; err=%v", err)
+	}
+}
+
 func TestIsStorageLockTimeout_Nil(t *testing.T) {
 	if pve.IsStorageLockTimeout(nil) {
 		t.Error("nil error should not be storage lock timeout")

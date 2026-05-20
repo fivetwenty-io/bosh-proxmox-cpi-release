@@ -520,7 +520,7 @@ func uploadStemcellImage(
 	// whole open+upload+await tuple on that signal; the body stream is
 	// reopened from imagePath each attempt so PVE always sees a fresh
 	// reader.
-	rerr := pve.RetryOnStorageLock(ctx, deps.Logger, "create_stemcell_upload", 0, func() error {
+	rerr := pve.RetryOnTransientOrLock(ctx, deps.Logger, "create_stemcell_upload", 0, func() error {
 		f, openErr := os.Open(imagePath)
 		if openErr != nil {
 			return cpierrors.Cloud("uploadStemcellImage: open %s: %s", imagePath, openErr.Error())

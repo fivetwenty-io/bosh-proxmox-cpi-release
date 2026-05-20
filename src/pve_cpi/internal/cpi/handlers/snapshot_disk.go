@@ -96,7 +96,7 @@ func HandleSnapshotDisk(deps Deps) Handler {
 		// operations on zfs/lvm/btrfs storages take the per-storage lock,
 		// so retry the submit+await pair on IsStorageLockTimeout.
 		// ----------------------------------------------------------------
-		serr := pve.RetryOnStorageLock(ctx, deps.Logger, "snapshot_disk", 0, func() error {
+		serr := pve.RetryOnTransientOrLock(ctx, deps.Logger, "snapshot_disk", 0, func() error {
 			upid, e := deps.PVE.QEMU().Snapshot(ctx, node, vmid, snapName, snapOpts)
 			if e != nil {
 				return e

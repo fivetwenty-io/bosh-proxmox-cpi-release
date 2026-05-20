@@ -203,7 +203,7 @@ func (a *ConfigDrive) uploadISO(ctx context.Context, node, localPath, filename s
 	// "can't lock file ... got timeout" on either side. Retry the whole
 	// open+upload+await tuple on that signal; the body stream is reopened
 	// each attempt so PVE always sees a fresh reader.
-	return pve.RetryOnStorageLock(ctx, a.logger, "configdrive_upload", 0, func() error {
+	return pve.RetryOnTransientOrLock(ctx, a.logger, "configdrive_upload", 0, func() error {
 		f, openErr := os.Open(localPath)
 		if openErr != nil {
 			return fmt.Errorf("open local iso: %w", openErr)
@@ -251,7 +251,7 @@ func (a *ConfigDrive) removeISOIfExists(ctx context.Context, node, filename stri
 // 404 internally.
 func (a *ConfigDrive) removeISOFromStorage(ctx context.Context, node, filename string) error {
 	volume := fmt.Sprintf("%s:iso/%s", a.storage, filename)
-	delErr := pve.RetryOnStorageLock(ctx, a.logger, "configdrive_delete", 0, func() error {
+	delErr := pve.RetryOnTransientOrLock(ctx, a.logger, "configdrive_delete", 0, func() error {
 		return a.pveSvc.Storage().DeleteVolume(ctx, node, a.storage, volume)
 	})
 	if delErr != nil {

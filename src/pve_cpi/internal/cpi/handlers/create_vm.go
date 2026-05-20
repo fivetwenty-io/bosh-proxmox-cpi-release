@@ -271,7 +271,7 @@ func createVM(
 	// -----------------------------------------------------------------------
 	var createUPID string
 	isRetryable := func(e error) bool {
-		return pve.IsVMIDConflict(e) || pve.IsStorageLockTimeout(e)
+		return pve.IsVMIDConflict(e) || pve.IsStorageLockTimeout(e) || pve.IsTransientTransport(e)
 	}
 	vmid, err := pve.AllocateWithRetry(ctx, deps.PVE,
 		func(candidate int) error {
@@ -311,6 +311,17 @@ func createVM(
 						log.Int("vmid_attempted", candidate),
 					)
 				}
+				if pve.IsTransientTransport(cerr) {
+					// HTTP 596 or auth-EOF: pvedaemon worker cycled
+					// mid-request. POST may or may not have committed
+					// the VM. Sweep this VMID before the next attempt
+					// so the cluster list is clean.
+					logger.Info("create_vm: transient transport fault on create, retrying",
+						log.Int("vmid_attempted", candidate),
+						log.String("error", cerr.Error()),
+					)
+					cleanupVM(contextWithoutCancel(ctx), deps, node, candidate, logger)
+				}
 				return cerr
 			}
 
@@ -329,6 +340,17 @@ func createVM(
 					// PVE rolled back its own qmcreate task — but the
 					// VMID may still be registered with the partial
 					// state. Clean up before the next attempt.
+					cleanupVM(contextWithoutCancel(ctx), deps, node, candidate, logger)
+					return werr
+				}
+				if pve.IsTransientTransport(werr) {
+					logger.Info("create_vm: transient transport fault on await, retrying",
+						log.Int("vmid_attempted", candidate),
+						log.String("error", werr.Error()),
+					)
+					// The qmcreate task itself may still be running on
+					// PVE — we only lost the await connection. Clean
+					// up the VMID so a fresh attempt has a clean slate.
 					cleanupVM(contextWithoutCancel(ctx), deps, node, candidate, logger)
 					return werr
 				}
@@ -390,7 +412,7 @@ func createVM(
 		// and other resizes and surfaces as "can't lock file ... got timeout"
 		// in the task log. Retry the whole submit+await with seconds-scale
 		// backoff against the lock holder finishing.
-		rerr := pve.RetryOnStorageLock(ctx, logger, "resize_virtio0", maxAttempts, func() error {
+		rerr := pve.RetryOnTransientOrLock(ctx, logger, "resize_virtio0", maxAttempts, func() error {
 			upid, e := deps.PVE.QEMU().ResizeDisk(ctx, node, vmid, "virtio0", growGiB)
 			if e != nil {
 				return e

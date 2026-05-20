@@ -113,6 +113,8 @@ The `stemcell_cid` must be in `<storage>:import/<filename>` format. Integer CIDs
 
 A VMID is allocated from the range `[vmid_range_start, 5999]` (default: `[100, 5999]`). After the import task completes, the CPI configures NICs, attaches any pre-existing persistent disks, writes agent settings, and starts the VM. The returned `networks_with_mac` hash augments the input networks map with MAC addresses assigned by PVE.
 
+`cloud_properties.tags` (map of `key: value`) is applied to the PVE tags field on the new VM as sanitized `<key>--<value>` entries. The BOSH-managed `director--`, `deployment--`, and `job--` triple is not known at create time and is added later by `set_vm_metadata`. See [Custom Tags](configuration.md#custom-tags).
+
 ---
 
 ### `delete_vm`
@@ -178,6 +180,8 @@ A VMID is allocated from the range `[vmid_range_start, 5999]` (default: `[100, 5
 
 **Notes:** Stores metadata as PVE VM tags and/or description. The Director passes standard keys such as `director`, `deployment`, `instance_group`, `job`, `id`, `name`, `index`, and `created_at`. Do not override or filter these.
 
+The handler reads the VM's existing PVE tags, strips entries with the reserved prefixes `director--`, `deployment--`, and `job--`, rebuilds the triple from the incoming metadata, and merges the result with any operator-supplied custom tags already on the VM. Custom tags from `create_vm` therefore survive director re-syncs without manual reconciliation.
+
 ---
 
 ### `calculate_vm_cloud_properties`
@@ -216,6 +220,8 @@ A VMID is allocated from the range `[vmid_range_start, 5999]` (default: `[100, 5
 **Errors:** `Bosh::Clouds::CloudError` on storage or PVE API failure
 
 **Notes:** Allocates a disk on `disk_storage`. The disk CID encodes the storage pool and disk identifier. Disks use VMIDs in the 9000–9999 range by convention.
+
+`cloud_properties.tags` (map of `key: value`) is applied to the PVE tags field on the VM identified by `vm_cid`. PVE has no native disk-volume tag field — tags ride on the hosting VM. When `vm_cid` is empty (Director is creating an unattached disk), the tags are deferred and applied on the next `set_disk_metadata` call. See [Custom Tags](configuration.md#custom-tags).
 
 ---
 
@@ -368,6 +374,8 @@ A VMID is allocated from the range `[vmid_range_start, 5999]` (default: `[100, 5
 **Errors:** `Bosh::Clouds::CloudError` on PVE API failure
 
 **Notes:** PVE has no native disk metadata. This CPI stashes metadata as a JSON block in the description of the VM that currently has the disk attached. If the disk is detached at call time, the CPI logs a warning and returns success without storing the metadata.
+
+If `metadata` contains a `tags` sub-object (map of `key: value`), the entries are extracted from the regular `bosh_disk_metadata` payload, written to the hosting VM's PVE tags field as sanitized `<key>--<value>` entries, and recorded separately in the description sentinel under `bosh_disk_tags[<disk_cid>]`. Existing tag entries whose key prefix collides with a new tag are replaced; other entries are preserved. See [Custom Tags](configuration.md#custom-tags).
 
 ---
 

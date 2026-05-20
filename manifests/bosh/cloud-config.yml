@@ -20,11 +20,23 @@ vm_types:
     memory: 2048
     disk: 16384
     network_bridge: ((pve_network_bridge))
+    # Operator-supplied tags surface in the PVE UI as "<key>--<value>"
+    # entries. Allowed characters: [A-Za-z0-9-]; others are replaced with
+    # "-". The BOSH-managed director--/deployment--/job-- triple is added
+    # later by set_vm_metadata and merges with these entries.
+    # tags:
+    #   env: prod
+    #   owner: platform-team
 
 disk_types:
 - name: default
   disk_size: 1024
   cloud_properties: {}
+  # Disk tags are applied to the PVE tags field of the VM the disk is
+  # attached to (PVE has no native disk-volume tag field).
+  # cloud_properties:
+  #   tags:
+  #     tier: bronze
 
 networks:
 - name: default
