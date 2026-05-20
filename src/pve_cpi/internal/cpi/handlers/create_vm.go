@@ -20,6 +20,53 @@ import (
 	sdknodes "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/nodes"
 )
 
+// retryOnStorageLock invokes op up to maxAttempts times, retrying only when
+// the returned error is a PVE per-storage lockfile timeout
+// (pve.IsStorageLockTimeout). Other errors (or success) return immediately.
+//
+// Used to absorb contention against /var/lock/pve-manager/pve-storage-<name>
+// from parallel qmcreate / qm resize / qm set operations during bursts of
+// concurrent create_vm calls. Backoff uses createVMRetryBackoff (seconds-scale
+// exponential with jitter, capped at 30 s). The VM/VMID does not change
+// across retries — same operation, same target, just wait for the lock holder
+// to finish.
+func retryOnStorageLock(
+	ctx context.Context,
+	logger *log.Logger,
+	label string,
+	maxAttempts int,
+	op func() error,
+) error {
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		err := op()
+		if err == nil {
+			return nil
+		}
+		if !pve.IsStorageLockTimeout(err) {
+			return err
+		}
+		lastErr = err
+		if attempt == maxAttempts-1 {
+			break
+		}
+		d := createVMRetryBackoff(err, attempt)
+		logger.Info("create_vm: storage lock timeout, retrying",
+			log.String("op", label),
+			log.Int("attempt", attempt+1),
+			log.Int("max_attempts", maxAttempts),
+			log.Int("backoff_ms", int(d/time.Millisecond)),
+			log.String("error", err.Error()),
+		)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(d):
+		}
+	}
+	return lastErr
+}
+
 // createVMRetryBackoff selects the sleep duration between AllocateWithRetry
 // attempts in create_vm. VMID conflicts only need a brief jitter to
 // decorrelate herds across concurrent CPI processes; storage lock-file
@@ -368,14 +415,24 @@ func createVM(
 	// -----------------------------------------------------------------------
 	growGiB := rootDiskGiB - defaultStemcellDiskGiB
 	if growGiB > 0 {
-		resizeUPID, rerr := deps.PVE.QEMU().ResizeDisk(ctx, node, vmid, "virtio0", growGiB)
-		if rerr != nil {
-			return nil, cpierrors.Cloud("create_vm: resize virtio0 vmid=%d +%dG: %s", vmid, growGiB, rerr.Error())
-		}
-		if resizeUPID != "" {
-			if werr := pve.AwaitTaskWithLogger(ctx, deps.PVE, node, resizeUPID, logger); werr != nil {
-				return nil, cpierrors.Wrap(werr, fmt.Sprintf("create_vm: await resize vmid=%d", vmid))
+		// PVE's `qm resize` runs `qemu-img resize` under the per-storage
+		// lockfile (/var/lock/pve-manager/pve-storage-<name>). Under a
+		// concurrent CF deploy this contends with parallel stemcell imports
+		// and other resizes and surfaces as "can't lock file ... got timeout"
+		// in the task log. Retry the whole submit+await with seconds-scale
+		// backoff against the lock holder finishing.
+		rerr := retryOnStorageLock(ctx, logger, "resize_virtio0", maxAttempts, func() error {
+			upid, e := deps.PVE.QEMU().ResizeDisk(ctx, node, vmid, "virtio0", growGiB)
+			if e != nil {
+				return e
 			}
+			if upid == "" {
+				return nil
+			}
+			return pve.AwaitTaskWithLogger(ctx, deps.PVE, node, upid, logger)
+		})
+		if rerr != nil {
+			return nil, cpierrors.Wrap(rerr, fmt.Sprintf("create_vm: resize virtio0 vmid=%d +%dG", vmid, growGiB))
 		}
 		logger.Info("create_vm: grew virtio0",
 			log.Int("vmid", vmid),
