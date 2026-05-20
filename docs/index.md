@@ -22,6 +22,8 @@ This CPI enables BOSH to provision and manage resources on PVE 9.x, implementing
 
 - [Smoke-testing with `emptyvm`](emptyvm.md): Minimal post-deploy deployment that exercises the full CPI surface (create_stemcell, create_vm, create_disk, attach_disk, agent handshake).
 
+- [PVE Storage Locking](pve-storage-locking.md): How PVE's per-storage lockfile serialises every storage mutation, why bursty BOSH deploys hit it, and how the CPI retries to absorb the contention.
+
 - [Troubleshooting](troubleshooting.md): Solutions to common issues.
 
 - [Examples](examples.md): Sample BOSH deployment manifests and usage scenarios.
