@@ -367,3 +367,44 @@ func TestIsVMIDConflict_PlainAlreadyExists(t *testing.T) {
 		t.Error("plain error with 'already exists' should be VMID conflict")
 	}
 }
+
+func TestIsStorageLockTimeout_Nil(t *testing.T) {
+	if pve.IsStorageLockTimeout(nil) {
+		t.Error("nil error should not be storage lock timeout")
+	}
+}
+
+func TestIsStorageLockTimeout_RealPVEMessage(t *testing.T) {
+	err := errors.New("task failed: unable to create VM 131 - cannot import from 'local:import/foo.qcow2' - can't lock file '/var/lock/pve-manager/pve-storage-data' - got timeout")
+	if !pve.IsStorageLockTimeout(err) {
+		t.Error("real PVE storage lock timeout message should match")
+	}
+}
+
+func TestIsStorageLockTimeout_MixedCase(t *testing.T) {
+	err := errors.New("Can't Lock File '/var/lock/pve-manager/pve-storage-data' - Got Timeout")
+	if !pve.IsStorageLockTimeout(err) {
+		t.Error("mixed-case message should match")
+	}
+}
+
+func TestIsStorageLockTimeout_OnlyLockNoTimeout(t *testing.T) {
+	err := errors.New("can't lock file '/var/lock/foo'")
+	if pve.IsStorageLockTimeout(err) {
+		t.Error("lock-only message without timeout should not match")
+	}
+}
+
+func TestIsStorageLockTimeout_OnlyTimeoutNoLock(t *testing.T) {
+	err := errors.New("got timeout")
+	if pve.IsStorageLockTimeout(err) {
+		t.Error("timeout-only message without lock should not match")
+	}
+}
+
+func TestIsStorageLockTimeout_Unrelated(t *testing.T) {
+	err := errors.New("VM 131 already exists")
+	if pve.IsStorageLockTimeout(err) {
+		t.Error("unrelated message should not match")
+	}
+}

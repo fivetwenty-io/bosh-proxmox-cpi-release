@@ -5,8 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	mrand "math/rand/v2"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
 
@@ -17,6 +19,32 @@ import (
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
 	sdknodes "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/nodes"
 )
+
+// createVMRetryBackoff selects the sleep duration between AllocateWithRetry
+// attempts in create_vm. VMID conflicts only need a brief jitter to
+// decorrelate herds across concurrent CPI processes; storage lock-file
+// timeouts mean PVE is serialising imports against a busy storage and
+// retrying immediately wins us nothing — back off seconds, exponentially,
+// up to 30s.
+func createVMRetryBackoff(err error, attempt int) time.Duration {
+	if pve.IsStorageLockTimeout(err) {
+		// Exponential base 2s × 1.5^attempt with ±30% jitter, capped at 30s.
+		base := 2 * time.Second
+		factor := 1.0
+		for i := 0; i < attempt; i++ {
+			factor *= 1.5
+		}
+		d := time.Duration(float64(base) * factor)
+		if d > 30*time.Second {
+			d = 30 * time.Second
+		}
+		// Jitter ±30%.
+		jitter := time.Duration(mrand.Int64N(int64(d) * 6 / 10))
+		return d - d*3/10 + jitter
+	}
+	// VMID conflict (or anything else flagged retryable): uniform 50-250 ms.
+	return 50*time.Millisecond + time.Duration(mrand.Int64N(int64(200*time.Millisecond)))
+}
 
 // defaultStemcellDiskGiB is the minimum root-disk size assumed when
 // cloud_properties.disk is absent or zero. Stemcells are always at least
@@ -166,7 +194,12 @@ func createVM(
 	}
 	maxAttempts := deps.Config.VMIDAllocAttempts
 	if maxAttempts <= 0 {
-		maxAttempts = 5
+		// Default raised to 10 so a parallel CF deploy (many simultaneous
+		// stemcell imports against the same PVE storage) can survive
+		// transient per-storage lockfile timeouts in addition to VMID
+		// races. Each lock-timeout retry waits seconds, not ms, so 10 is
+		// still bounded.
+		maxAttempts = 10
 	}
 
 	// Resolve disk format: prefer cloud_properties.vm_disk_format; fall back to "qcow2".
@@ -224,6 +257,9 @@ func createVM(
 	//    non-conflict error (PVE accepted the POST but the task itself failed).
 	// -----------------------------------------------------------------------
 	var createUPID string
+	isRetryable := func(e error) bool {
+		return pve.IsVMIDConflict(e) || pve.IsStorageLockTimeout(e)
+	}
 	vmid, err := pve.AllocateWithRetry(ctx, deps.PVE,
 		func(candidate int) error {
 			virtio0Val := fmt.Sprintf("%s:0,import-from=%s,format=%s,size=%dG",
@@ -254,6 +290,11 @@ func createVM(
 						log.Int("vmid_attempted", candidate),
 					)
 				}
+				if pve.IsStorageLockTimeout(cerr) {
+					logger.Info("create_vm: storage lock timeout on create, retrying",
+						log.Int("vmid_attempted", candidate),
+					)
+				}
 				return cerr
 			}
 
@@ -263,6 +304,16 @@ func createVM(
 					logger.Info("create_vm: vmid conflict on await, retrying",
 						log.Int("vmid_attempted", candidate),
 					)
+					return werr
+				}
+				if pve.IsStorageLockTimeout(werr) {
+					logger.Info("create_vm: storage lock timeout on import, retrying",
+						log.Int("vmid_attempted", candidate),
+					)
+					// PVE rolled back its own qmcreate task — but the
+					// VMID may still be registered with the partial
+					// state. Clean up before the next attempt.
+					cleanupVM(contextWithoutCancel(ctx), deps, node, candidate, logger)
 					return werr
 				}
 				// Non-conflict failure after Create succeeded: the VM may
@@ -276,9 +327,10 @@ func createVM(
 			createUPID = upid
 			return nil
 		},
-		pve.IsVMIDConflict,
+		isRetryable,
 		maxAttempts,
 		pve.WithRange(rangeStart, pve.VMIDRangeVMEnd),
+		pve.WithBackoffFunc(createVMRetryBackoff),
 	)
 	if err != nil {
 		return nil, cpierrors.Wrap(err, "create_vm: allocate+create VM")

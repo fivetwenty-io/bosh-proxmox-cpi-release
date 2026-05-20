@@ -31,6 +31,13 @@ type allocOpts struct {
 	rangeStart int
 	rangeEnd   int
 	noBackoff  bool
+	// backoffFn, when set, is consulted by the retry helpers to compute
+	// the sleep duration between attempts. attempt is 0-indexed (so the
+	// pause that follows the first failure has attempt=0). The error
+	// argument is the retryable error returned by the create callback so
+	// the caller can apply a longer backoff for, e.g., storage lock
+	// timeouts vs. VMID conflicts.
+	backoffFn func(err error, attempt int) time.Duration
 }
 
 // AllocOption is a functional option for NextVMID and the retry helpers.
@@ -57,16 +64,33 @@ func WithNoBackoff() AllocOption {
 	}
 }
 
-// retryBackoff sleeps a small jittered duration to decorrelate retry herds
-// across concurrent CPI processes. Returns the chosen duration so callers
-// can log it before sleeping. Returns 0 when the sleep is skipped.
-func retryBackoff(noBackoff bool) time.Duration {
-	if noBackoff {
+// WithBackoffFunc installs a custom backoff function that is consulted
+// between retry attempts. attempt is 0-indexed. The returned duration is
+// slept verbatim (return 0 to skip). WithNoBackoff takes precedence over
+// any installed function.
+func WithBackoffFunc(fn func(err error, attempt int) time.Duration) AllocOption {
+	return func(o *allocOpts) {
+		o.backoffFn = fn
+	}
+}
+
+// retryBackoff sleeps for a duration chosen by ao's backoff configuration
+// and returns the slept duration so callers can log it. The order of
+// precedence is: noBackoff (returns 0) > backoffFn > default jitter.
+func retryBackoff(ao *allocOpts, err error, attempt int) time.Duration {
+	if ao != nil && ao.noBackoff {
 		return 0
 	}
-	// Uniform 50–250 ms.
-	d := 50*time.Millisecond + time.Duration(mrand.Int64N(int64(200*time.Millisecond)))
-	time.Sleep(d)
+	var d time.Duration
+	if ao != nil && ao.backoffFn != nil {
+		d = ao.backoffFn(err, attempt)
+	} else {
+		// Default: uniform 50–250 ms.
+		d = 50*time.Millisecond + time.Duration(mrand.Int64N(int64(200*time.Millisecond)))
+	}
+	if d > 0 {
+		time.Sleep(d)
+	}
 	return d
 }
 
@@ -308,7 +332,7 @@ func AllocateWithRetry(
 		if createErr := create(vmid); createErr != nil {
 			if isConflict != nil && isConflict(createErr) {
 				if attempt < maxAttempts-1 {
-					retryBackoff(ao.noBackoff)
+					retryBackoff(ao, createErr, attempt)
 				}
 				continue
 			}
@@ -365,7 +389,7 @@ func AllocateDiskWithRetry(
 		if createErr := create(vmid); createErr != nil {
 			if isConflict != nil && isConflict(createErr) {
 				if attempt < maxAttempts-1 {
-					retryBackoff(ao.noBackoff)
+					retryBackoff(ao, createErr, attempt)
 				}
 				continue
 			}

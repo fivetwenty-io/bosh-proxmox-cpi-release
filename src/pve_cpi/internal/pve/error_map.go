@@ -127,3 +127,24 @@ func IsVMIDConflict(err error) bool {
 	}
 	return strings.Contains(strings.ToLower(err.Error()), "already exists")
 }
+
+// IsStorageLockTimeout reports whether err signals that a PVE per-storage
+// lockfile (e.g. /var/lock/pve-manager/pve-storage-<name>) could not be
+// acquired before its timeout. This happens when many concurrent qmcreate
+// tasks import from the same storage and the import operation serialises
+// behind the storage lock; the loser surfaces a task error like:
+//
+//	cannot import from 'local:import/...' - can't lock file
+//	'/var/lock/pve-manager/pve-storage-data' - got timeout
+//
+// The condition is transient: retrying with a fresh VMID after a longer
+// backoff succeeds once the lock holder finishes its import.
+//
+// nil → false.
+func IsStorageLockTimeout(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "can't lock file") && strings.Contains(msg, "got timeout")
+}
