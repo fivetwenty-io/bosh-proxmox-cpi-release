@@ -65,7 +65,7 @@ def director_env() -> dict[str, str]:
     return env
 
 
-def cmd_create_env(_: list[str]) -> int:
+def cmd_create_env(args: list[str]) -> int:
     return run(
         "bosh", "create-env",
         str(BOSH_DEPLOYMENT_DIR / "bosh.yml"),
@@ -77,46 +77,49 @@ def cmd_create_env(_: list[str]) -> int:
         "-v", "director_name=ocfp-mgmt",
         f"--state={STATE}",
         f"--vars-store={CREDS}",
+        *args,
     )
 
 
-def cmd_alias_env(_: list[str]) -> int:
+def cmd_alias_env(args: list[str]) -> int:
     director_ip = bosh_int(VARS, "/internal_ip")
     ca = bosh_int(CREDS, "/director_ssl/ca")
     proc = subprocess.run(
-        ["bosh", "alias-env", "pve", "-e", director_ip, "--ca-cert", ca],
+        ["bosh", "alias-env", "pve", "-e", director_ip, "--ca-cert", ca, *args],
         cwd=REPO_ROOT,
     )
     return proc.returncode
 
 
-def cmd_login(_: list[str]) -> int:
-    return run("bosh", "-e", "pve", "login", env=director_env())
+def cmd_login(args: list[str]) -> int:
+    return run("bosh", "-e", "pve", "login", *args, env=director_env())
 
 
-def cmd_env(_: list[str]) -> int:
-    return run("bosh", "env", env=director_env())
+def cmd_env(args: list[str]) -> int:
+    return run("bosh", "env", *args, env=director_env())
 
 
-def cmd_ucc(_: list[str]) -> int:
+def cmd_ucc(args: list[str]) -> int:
     return run(
         "bosh", "-e", "pve", "-n", "update-cloud-config",
         str(CLOUD_CONFIG),
         "-l", str(VARS),
+        *args,
         env=director_env(),
     )
 
 
-def cmd_emptyvm(_: list[str]) -> int:
+def cmd_emptyvm(args: list[str]) -> int:
     return run(
         "bosh", "-e", "pve", "-n", "-d", "emptyvm", "deploy",
         str(EMPTYVM),
         "-l", str(VARS),
+        *args,
         env=director_env(),
     )
 
 
-def cmd_help(_: list[str]) -> int:
+def cmd_help(args: list[str]) -> int:
     print(USAGE)
     return 0
 

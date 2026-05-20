@@ -54,6 +54,11 @@ type CPIConfig struct {
 
 	// VMID allocation
 	VMIDRangeStart int `json:"vmid_range_start,omitempty"`
+	// VMIDAllocAttempts is the maximum number of retries for VMID-conflict
+	// recovery in create_vm / create_disk. ≤0 → use the handler default (5).
+	// Cross-process VMID collisions surface as PVE 500 "already exists"
+	// errors; the retry loop allocates a fresh VMID and re-attempts.
+	VMIDAllocAttempts int `json:"vmid_alloc_attempts,omitempty"`
 
 	// Registry (required only when agent_mode == "registry")
 	RegistryEndpoint string `json:"registry_endpoint,omitempty"`

@@ -315,3 +315,55 @@ func TestIsNotFound_GenericFalse(t *testing.T) {
 		t.Error("generic error should not be not-found")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// IsVMIDConflict
+// ---------------------------------------------------------------------------
+
+func TestIsVMIDConflict_Nil(t *testing.T) {
+	if pve.IsVMIDConflict(nil) {
+		t.Error("nil should not be a VMID conflict")
+	}
+}
+
+func TestIsVMIDConflict_HTTP409(t *testing.T) {
+	err := makeAPIErr(409, "vmid is in use")
+	if !pve.IsVMIDConflict(err) {
+		t.Errorf("HTTP 409 APIError should be VMID conflict, got false; err=%v", err)
+	}
+}
+
+func TestIsVMIDConflict_HTTP500AlreadyExists(t *testing.T) {
+	err := makeAPIErr(500, "unable to create VM 113 - VM 113 already exists on node 'pve'")
+	if !pve.IsVMIDConflict(err) {
+		t.Errorf("500 with 'already exists' should be VMID conflict, got false; err=%v", err)
+	}
+}
+
+func TestIsVMIDConflict_MixedCase(t *testing.T) {
+	err := makeAPIErr(500, "Volume Already Exists")
+	if !pve.IsVMIDConflict(err) {
+		t.Errorf("mixed-case 'Already Exists' should be VMID conflict; err=%v", err)
+	}
+}
+
+func TestIsVMIDConflict_HTTP500Unrelated(t *testing.T) {
+	err := makeAPIErr(500, "lvm thin pool out of space")
+	if pve.IsVMIDConflict(err) {
+		t.Errorf("unrelated 500 should not be VMID conflict; err=%v", err)
+	}
+}
+
+func TestIsVMIDConflict_HTTP404(t *testing.T) {
+	err := makeAPIErr(404, "vm not found")
+	if pve.IsVMIDConflict(err) {
+		t.Errorf("404 should not be VMID conflict; err=%v", err)
+	}
+}
+
+func TestIsVMIDConflict_PlainAlreadyExists(t *testing.T) {
+	err := errors.New("already exists")
+	if !pve.IsVMIDConflict(err) {
+		t.Error("plain error with 'already exists' should be VMID conflict")
+	}
+}

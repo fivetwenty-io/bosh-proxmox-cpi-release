@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	mrand "math/rand/v2"
 	"regexp"
 	"sync"
+	"time"
 
 	sdkcluster "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cluster"
 
@@ -22,13 +24,16 @@ const (
 	VMIDRangeDiskEnd   = 9999
 )
 
-// allocOpts holds resolved configuration for a single NextVMID call.
+// allocOpts holds resolved configuration for a single NextVMID call or
+// AllocateWithRetry invocation. Backoff fields are consumed only by the retry
+// helpers; NextVMID ignores them.
 type allocOpts struct {
 	rangeStart int
 	rangeEnd   int
+	noBackoff  bool
 }
 
-// AllocOption is a functional option for NextVMID.
+// AllocOption is a functional option for NextVMID and the retry helpers.
 type AllocOption func(*allocOpts)
 
 // WithRange sets a custom inclusive VMID range [start, end].
@@ -41,6 +46,28 @@ func WithRange(start, end int) AllocOption {
 			o.rangeEnd = end
 		}
 	}
+}
+
+// WithNoBackoff disables the jittered sleep between retry attempts in
+// AllocateWithRetry / AllocateDiskWithRetry. Tests use this so the retry
+// loop stays deterministic.
+func WithNoBackoff() AllocOption {
+	return func(o *allocOpts) {
+		o.noBackoff = true
+	}
+}
+
+// retryBackoff sleeps a small jittered duration to decorrelate retry herds
+// across concurrent CPI processes. Returns the chosen duration so callers
+// can log it before sleeping. Returns 0 when the sleep is skipped.
+func retryBackoff(noBackoff bool) time.Duration {
+	if noBackoff {
+		return 0
+	}
+	// Uniform 50–250 ms.
+	d := 50*time.Millisecond + time.Duration(mrand.Int64N(int64(200*time.Millisecond)))
+	time.Sleep(d)
+	return d
 }
 
 // globalVMIDMu is the process-level mutex that serialises VMID allocation.
@@ -234,7 +261,12 @@ func listStorageVMIDs(ctx context.Context, c Client, node, storage string) (map[
 // maxAttempts retries on VMID conflict. On each attempt it calls NextVMID
 // (which re-fetches the cluster list under the mutex) then calls create.
 // If create returns an error for which isConflict returns true, the allocation
-// is retried with a fresh cluster list. Any other error is returned immediately.
+// is retried with a fresh cluster list after a short jittered sleep that
+// decorrelates retry herds across concurrent CPI processes. Any other error
+// is returned immediately.
+//
+// On final exhaustion the error message includes the last VMID attempted so
+// operator logs surface the contended range.
 //
 // Returns 0 and a *cpierrors.Error if:
 //   - all maxAttempts are exhausted.
@@ -261,13 +293,23 @@ func AllocateWithRetry(
 		maxAttempts = 3
 	}
 
+	ao := &allocOpts{}
+	for _, opt := range opts {
+		opt(ao)
+	}
+
+	var lastVMID int
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		vmid, err := NextVMID(ctx, c, opts...)
 		if err != nil {
 			return 0, err
 		}
+		lastVMID = vmid
 		if createErr := create(vmid); createErr != nil {
 			if isConflict != nil && isConflict(createErr) {
+				if attempt < maxAttempts-1 {
+					retryBackoff(ao.noBackoff)
+				}
 				continue
 			}
 			return 0, cpierrors.Wrap(createErr, fmt.Sprintf("create VMID %d", vmid))
@@ -275,5 +317,65 @@ func AllocateWithRetry(
 		return vmid, nil
 	}
 
-	return 0, cpierrors.Cloud("AllocateWithRetry: failed to allocate VMID after %d attempts", maxAttempts)
+	return 0, cpierrors.Cloud(
+		"AllocateWithRetry: failed to allocate VMID after %d attempts (last attempted VMID %d)",
+		maxAttempts, lastVMID,
+	)
+}
+
+// AllocateDiskWithRetry mirrors AllocateWithRetry for disk-range VMIDs. On
+// each attempt it calls NextDiskVMID(ctx, c, node, storage) so the
+// storage-volume scan re-runs every iteration and orphan volumes from prior
+// failed attempts remain visible. Same backoff/jitter treatment as
+// AllocateWithRetry.
+func AllocateDiskWithRetry(
+	ctx context.Context,
+	c Client,
+	node, storage string,
+	create func(vmid int) error,
+	isConflict func(err error) bool,
+	maxAttempts int,
+	opts ...AllocOption,
+) (int, error) {
+	if ctx == nil {
+		return 0, cpierrors.Cloud("AllocateDiskWithRetry: ctx must not be nil")
+	}
+	if c == nil {
+		return 0, cpierrors.Cloud("AllocateDiskWithRetry: client must not be nil")
+	}
+	if create == nil {
+		return 0, cpierrors.Cloud("AllocateDiskWithRetry: create func must not be nil")
+	}
+	if maxAttempts <= 0 {
+		maxAttempts = 3
+	}
+
+	ao := &allocOpts{}
+	for _, opt := range opts {
+		opt(ao)
+	}
+
+	var lastVMID int
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		vmid, err := NextDiskVMID(ctx, c, node, storage)
+		if err != nil {
+			return 0, err
+		}
+		lastVMID = vmid
+		if createErr := create(vmid); createErr != nil {
+			if isConflict != nil && isConflict(createErr) {
+				if attempt < maxAttempts-1 {
+					retryBackoff(ao.noBackoff)
+				}
+				continue
+			}
+			return 0, cpierrors.Wrap(createErr, fmt.Sprintf("create disk VMID %d", vmid))
+		}
+		return vmid, nil
+	}
+
+	return 0, cpierrors.Cloud(
+		"AllocateDiskWithRetry: failed to allocate disk VMID after %d attempts (last attempted VMID %d)",
+		maxAttempts, lastVMID,
+	)
 }

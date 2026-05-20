@@ -583,6 +583,115 @@ func TestNextVMID_NilListResourcesResponse(t *testing.T) {
 	}
 }
 
+// WithNoBackoff exercises the deterministic, no-sleep retry path.
+func TestAllocateWithRetry_NoBackoff(t *testing.T) {
+	c := newVMIDClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+		return buildResources(), nil
+	})
+
+	conflictErr := errors.New("already exists")
+	attempts := 0
+	id, err := pve.AllocateWithRetry(context.Background(), c,
+		func(_ int) error {
+			attempts++
+			if attempts < 2 {
+				return conflictErr
+			}
+			return nil
+		},
+		func(e error) bool { return errors.Is(e, conflictErr) },
+		3,
+		pve.WithNoBackoff(),
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if attempts != 2 {
+		t.Errorf("expected 2 attempts, got %d", attempts)
+	}
+	if id != pve.VMIDRangeVMStart {
+		t.Errorf("expected %d, got %d", pve.VMIDRangeVMStart, id)
+	}
+}
+
+func TestAllocateDiskWithRetry_Success(t *testing.T) {
+	c := newVMIDClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+		return buildResources(), nil
+	})
+
+	var created int
+	id, err := pve.AllocateDiskWithRetry(context.Background(), c, "", "",
+		func(vmid int) error { created = vmid; return nil },
+		func(_ error) bool { return false },
+		3,
+		pve.WithNoBackoff(),
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if id != created {
+		t.Errorf("returned VMID %d != created VMID %d", id, created)
+	}
+	if id < pve.VMIDRangeDiskStart || id > pve.VMIDRangeDiskEnd {
+		t.Errorf("disk VMID %d outside [%d,%d]", id, pve.VMIDRangeDiskStart, pve.VMIDRangeDiskEnd)
+	}
+}
+
+func TestAllocateDiskWithRetry_ConflictThenSuccess(t *testing.T) {
+	c := newVMIDClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+		return buildResources(), nil
+	})
+
+	conflictErr := errors.New("already exists")
+	attempts := 0
+	id, err := pve.AllocateDiskWithRetry(context.Background(), c, "", "",
+		func(_ int) error {
+			attempts++
+			if attempts < 3 {
+				return conflictErr
+			}
+			return nil
+		},
+		func(e error) bool { return errors.Is(e, conflictErr) },
+		5,
+		pve.WithNoBackoff(),
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if attempts != 3 {
+		t.Errorf("expected 3 attempts, got %d", attempts)
+	}
+	if id < pve.VMIDRangeDiskStart {
+		t.Errorf("expected disk-range VMID, got %d", id)
+	}
+}
+
+func TestAllocateDiskWithRetry_Exhausted(t *testing.T) {
+	c := newVMIDClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+		return buildResources(), nil
+	})
+
+	conflictErr := errors.New("already exists")
+	_, err := pve.AllocateDiskWithRetry(context.Background(), c, "", "",
+		func(_ int) error { return conflictErr },
+		func(e error) bool { return errors.Is(e, conflictErr) },
+		3,
+		pve.WithNoBackoff(),
+	)
+	if err == nil {
+		t.Fatal("expected exhausted error, got nil")
+	}
+}
+
+func TestAllocateDiskWithRetry_NilCreateFunc(t *testing.T) {
+	c := newVMIDClient(nil)
+	_, err := pve.AllocateDiskWithRetry(context.Background(), c, "", "", nil, nil, 3)
+	if err == nil {
+		t.Fatal("expected error for nil create func, got nil")
+	}
+}
+
 func TestNextVMID_VmidNullField(t *testing.T) {
 	// JSON entry where vmid is null — should be skipped (pointer nil).
 	entry := sdkcluster.ListResourcesResponse{

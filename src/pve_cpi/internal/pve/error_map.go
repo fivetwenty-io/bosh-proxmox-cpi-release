@@ -4,6 +4,7 @@ package pve
 import (
 	"errors"
 	"net"
+	"strings"
 
 	sdkerrors "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/errors"
 
@@ -101,4 +102,28 @@ func IsNotFound(err error) bool {
 	}
 	// Check BOSH not-found types.
 	return cpierrors.IsNotFound(err)
+}
+
+// IsVMIDConflict reports whether err signals that a VMID (or block-storage
+// volume name) was already taken when the create request reached PVE.
+//
+// PVE returns this condition in two shapes depending on the endpoint:
+//   - REST API spec: HTTP 409 from /cluster/nextid validators.
+//   - Observed in the wild for /nodes/{node}/qemu and storage allocators:
+//     HTTP 500 wrapping the perl die() text "VM N already exists on node …"
+//     or "unable to create VM N - VM N already exists".
+//
+// Substring matching on "already exists" (case-insensitive) is the canonical
+// detector; the 409 check is kept as a forward-compatible hint.
+//
+// nil → false.
+func IsVMIDConflict(err error) bool {
+	if err == nil {
+		return false
+	}
+	var apiErr *sdkerrors.APIError
+	if errors.As(err, &apiErr) && apiErr.HTTPCode == 409 {
+		return true
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "already exists")
 }

@@ -103,42 +103,13 @@ func HandleCreateDisk(deps Deps) Handler {
 		}
 
 		// ----------------------------------------------------------------
-		// 3. Allocate a synthetic disk VMID from [9000, 9999].
-		//
-		// vmCID is intentionally NOT used for naming: the owning VM already
-		// has its system disk named "vm-{vmcid}-disk-0", and lvmthin/zfspool
-		// volume names must be unique per storage. Allocating a fresh
-		// synthetic VMID keeps every BOSH persistent disk in its own
-		// namespace ("vm-9xxx-disk-0").
+		// 3. Compute size in GiB (ceiling division).
 		// ----------------------------------------------------------------
 		_ = vmCID
-		// Pass node+storage so NextDiskVMID also unions volume names from
-		// the disk_storage. Without this, orphan volumes from prior failed
-		// runs ("vm-9000-disk-0" with no matching VM) are invisible and
-		// the same VMID gets handed out again, colliding on lvcreate.
-		namingVMID, err := pve.NextDiskVMID(ctx, deps.PVE, node, storage)
-		if err != nil {
-			return nil, fmt.Errorf("create_disk: failed to allocate disk VMID: %w", err)
-		}
-
-		// ----------------------------------------------------------------
-		// 4. Compute size in GiB (ceiling division).
-		// ----------------------------------------------------------------
 		sizeGiB := (sizeMB + 1023) / 1024
 		if sizeGiB <= 0 {
 			sizeGiB = 1
 		}
-
-		// ----------------------------------------------------------------
-		// 5. Compose volume name and call CreateVolume.
-		//
-		// Volume name must follow PVE's vm-{vmid}-disk-{N} convention.
-		// lvmthin/zfspool storages enforce this strictly — names like
-		// "bosh-disk-X" are rejected. For BOSH persistent disks each volume
-		// owns its own synthetic VMID (allocated by NextDiskVMID), so disk
-		// index is always 0.
-		// ----------------------------------------------------------------
-		volName := fmt.Sprintf("vm-%d-disk-0", namingVMID)
 
 		// Block storages (lvm/lvmthin/zfspool) reject qcow2 and only accept
 		// raw. The CPI's default disk_format is qcow2 which works for file
@@ -150,30 +121,73 @@ func HandleCreateDisk(deps Deps) Handler {
 			formatArg = format
 		}
 
-		// The canonical PVE volid form for a block-storage VM disk volume.
-		// Used both as the delete target on rollback and as the source for
-		// the BOSH disk_cid when PVE returns an empty volid on create.
-		canonicalVolID := fmt.Sprintf("%s:%s", storage, volName)
+		maxAttempts := deps.Config.VMIDAllocAttempts
+		if maxAttempts <= 0 {
+			maxAttempts = 5
+		}
 
-		volid, err := deps.PVE.Storage().CreateVolume(ctx, node, storage, sizeGiB, formatArg, namingVMID, volName)
-		if err != nil {
-			// CreateVolume may fail after PVE has partially committed the
-			// volume (network drop mid-task, storage daemon timeout, etc.).
-			// Best-effort: check if the volume now exists and delete it so
-			// the next retry sees a clean slate.
-			rollbackCtx := contextWithoutCancel(ctx)
-			if exists, exErr := deps.PVE.Storage().Exists(rollbackCtx, node, storage, canonicalVolID); exErr == nil && exists {
-				if delErr := deps.PVE.Storage().DeleteVolume(rollbackCtx, node, storage, canonicalVolID); delErr != nil {
-					deps.Logger.Warn("create_disk: orphan volume cleanup after CreateVolume error failed",
-						log.String("volid", canonicalVolID),
-						log.Err(delErr),
-					)
-				} else {
-					deps.Logger.Info("create_disk: removed orphan volume after CreateVolume error",
-						log.String("volid", canonicalVolID),
-					)
+		// ----------------------------------------------------------------
+		// 4. Allocate a synthetic disk VMID + create the volume.
+		//
+		// AllocateDiskWithRetry re-runs NextDiskVMID(node, storage) every
+		// attempt so the storage scan picks up orphan volumes from prior
+		// failed iterations. On non-conflict CreateVolume failures the
+		// callback removes any partially-committed volume before propagating.
+		// ----------------------------------------------------------------
+		var (
+			namingVMID     int
+			volid          string
+			canonicalVolID string
+		)
+
+		namingVMID, err = pve.AllocateDiskWithRetry(ctx, deps.PVE, node, storage,
+			func(candidate int) error {
+				volName := fmt.Sprintf("vm-%d-disk-0", candidate)
+				candidateCanonical := fmt.Sprintf("%s:%s", storage, volName)
+
+				v, cerr := deps.PVE.Storage().CreateVolume(
+					ctx, node, storage, sizeGiB, formatArg, candidate, volName,
+				)
+				if cerr != nil {
+					if pve.IsVMIDConflict(cerr) {
+						// Pure conflict (volume name already taken at storage
+						// level). No partial commit possible; let the helper
+						// pick a new VMID.
+						deps.Logger.Info("create_disk: vmid conflict, retrying",
+							log.Int("vmid_attempted", candidate),
+							log.String("storage", storage),
+						)
+						return cerr
+					}
+					// Non-conflict CreateVolume failure: PVE may have
+					// partially committed the volume (network drop mid-task,
+					// storage daemon timeout). Best-effort: remove it before
+					// propagating so retries (which won't run) and operator
+					// re-runs see a clean slate.
+					rollbackCtx := contextWithoutCancel(ctx)
+					if exists, exErr := deps.PVE.Storage().Exists(rollbackCtx, node, storage, candidateCanonical); exErr == nil && exists {
+						if delErr := deps.PVE.Storage().DeleteVolume(rollbackCtx, node, storage, candidateCanonical); delErr != nil {
+							deps.Logger.Warn("create_disk: orphan volume cleanup after CreateVolume error failed",
+								log.String("volid", candidateCanonical),
+								log.Err(delErr),
+							)
+						} else {
+							deps.Logger.Info("create_disk: removed orphan volume after CreateVolume error",
+								log.String("volid", candidateCanonical),
+							)
+						}
+					}
+					return cerr
 				}
-			}
+
+				volid = v
+				canonicalVolID = candidateCanonical
+				return nil
+			},
+			pve.IsVMIDConflict,
+			maxAttempts,
+		)
+		if err != nil {
 			return nil, fmt.Errorf("create_disk: CreateVolume failed on node %q storage %q: %w", node, storage, err)
 		}
 

@@ -19,6 +19,7 @@ import (
 	sdknodes "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/nodes"
 	sdkqemu "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/qemu"
 	sdktasks "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/tasks"
+	sdkerrors "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/errors"
 )
 
 // testStemcellCID is the canonical volid-format stemcell CID used across create_vm tests.
@@ -778,6 +779,82 @@ func TestCreateVM_RollbackRemovesConfigDriveISO(t *testing.T) {
 	if removed.vmid != configured.vmid || removed.node != configured.node {
 		t.Errorf("agent.Remove(node=%q,vmid=%d) does not match Configure(node=%q,vmid=%d)",
 			removed.node, removed.vmid, configured.node, configured.vmid)
+	}
+}
+
+// TestHandleCreateVM_VMIDConflictRetry verifies that create_vm retries on
+// PVE "already exists" 500 errors (cross-process VMID collisions) and
+// eventually succeeds without rolling back the (non-existent) VM.
+func TestHandleCreateVM_VMIDConflictRetry(t *testing.T) {
+	attempt := 0
+	q := &vmMockQEMU{
+		createFn: func(_ context.Context, _ string, _ map[string]interface{}) (string, error) {
+			attempt++
+			if attempt < 3 {
+				body := []byte(`{"message":"unable to create VM 113 - VM 113 already exists on node 'pve'","code":500}`)
+				return "", sdkerrors.ParseAPIError(500, body)
+			}
+			return "UPID:pve:create:ok", nil
+		},
+	}
+	n := &vmMockNodes{}
+	a := &vmMockAgent{}
+	deps := buildVMDeps(q, n, &vmMockCluster{}, a)
+	deps.Config.VMIDAllocAttempts = 5
+	h := handlers.HandleCreateVM(deps)
+
+	args := mkArgs("agent-1", testStemcellCID, map[string]any{},
+		map[string]any{"default": map[string]any{"type": "dynamic", "cloud_properties": map[string]any{}}},
+		[]string{}, map[string]any{})
+
+	_, err := h.Handle(context.Background(), args, mkCtx("vmid-conflict-retry"))
+	if err != nil {
+		t.Fatalf("expected success after retries, got: %v", err)
+	}
+	if attempt != 3 {
+		t.Errorf("expected 3 Create attempts (2 conflicts + 1 success), got %d", attempt)
+	}
+	if len(n.deleteQemuCalls) != 0 {
+		t.Errorf("expected 0 rollback calls on conflict path, got %d", len(n.deleteQemuCalls))
+	}
+}
+
+// TestHandleCreateVM_AwaitTaskNonConflictRollsBack verifies that when
+// QEMU.Create succeeds (UPID returned) but the task-await surfaces a
+// non-conflict failure, the partial VM for that attempt is destroyed via
+// cleanupVM before propagating the error (so PVE state stays clean).
+func TestHandleCreateVM_AwaitTaskNonConflictRollsBack(t *testing.T) {
+	q := &vmMockQEMU{
+		createFn: func(_ context.Context, _ string, _ map[string]interface{}) (string, error) {
+			return "UPID:pve:create:partial", nil
+		},
+	}
+	n := &vmMockNodes{}
+	deps := buildVMDeps(q, n, &vmMockCluster{}, &vmMockAgent{})
+	deps.Config.VMIDAllocAttempts = 3
+	// Wire the tasks service to surface a non-conflict failure on await.
+	deps.PVE = &mockPVEClient{
+		qemuSvc:    q,
+		nodesSvc:   n,
+		clusterSvc: &vmMockCluster{},
+		tasksSvc: &mockTasksService{
+			waitFn: func(_ context.Context, _, _ string, _ *sdktasks.WaitOptions) (*sdktasks.Status, error) {
+				return &sdktasks.Status{ExitStatus: "qemu boot disk format unknown"}, nil
+			},
+		},
+	}
+
+	h := handlers.HandleCreateVM(deps)
+	args := mkArgs("agent-1", testStemcellCID, map[string]any{},
+		map[string]any{"default": map[string]any{"type": "dynamic", "cloud_properties": map[string]any{}}},
+		[]string{}, map[string]any{})
+
+	_, err := h.Handle(context.Background(), args, mkCtx("await-nonconflict"))
+	if err == nil {
+		t.Fatal("expected error from non-conflict await failure")
+	}
+	if len(n.deleteQemuCalls) != 1 {
+		t.Errorf("expected exactly 1 per-attempt cleanupVM rollback, got %d", len(n.deleteQemuCalls))
 	}
 }
 

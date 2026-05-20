@@ -23,6 +23,7 @@ import (
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/cpi/handlers"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
+	sdkerrors "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/errors"
 )
 
 // ---------------------------------------------------------------------------
@@ -503,6 +504,55 @@ func TestHandleCreateDisk_EmptyVolidFallback(t *testing.T) {
 	diskCID, ok := result.(string)
 	if !ok || diskCID == "" {
 		t.Fatalf("expected non-empty string result, got %T %v", result, result)
+	}
+}
+
+// TestHandleCreateDisk_VMIDConflictRetry verifies that CreateVolume returning
+// an "already exists" error causes AllocateDiskWithRetry to pick a fresh VMID
+// and re-attempt without firing the orphan-cleanup branch (a pure conflict
+// means PVE rejected the volume; no partial commit can exist).
+func TestHandleCreateDisk_VMIDConflictRetry(t *testing.T) {
+	attempt := 0
+	existsCalls := 0
+	deleteCalls := 0
+	storageSvc := &mockStorageService{
+		createVolumeFn: func(_ context.Context, _, storage string, _ int, _ string, vmid int, _ string) (string, error) {
+			attempt++
+			if attempt < 3 {
+				body := []byte(`{"message":"volume vm-9000-disk-0 already exists","code":500}`)
+				return "", sdkerrors.ParseAPIError(500, body)
+			}
+			return fmt.Sprintf("%s:vm-%d-disk-0", storage, vmid), nil
+		},
+		existsFn: func(_ context.Context, _, _, _ string) (bool, error) {
+			existsCalls++
+			return false, nil
+		},
+		deleteVolumeFn: func(_ context.Context, _, _, _ string) error {
+			deleteCalls++
+			return nil
+		},
+	}
+	deps := baseDepsForCreate(t, storageSvc, nil)
+	deps.Config.VMIDAllocAttempts = 5
+
+	h := handlers.HandleCreateDisk(deps)
+	_, err := h.Handle(context.Background(), []json.RawMessage{
+		marshal(1024),
+		marshal(map[string]string{}),
+	}, jsonrpc.Context{})
+
+	if err != nil {
+		t.Fatalf("expected success after retries, got: %v", err)
+	}
+	if attempt != 3 {
+		t.Errorf("expected 3 CreateVolume attempts (2 conflicts + 1 success), got %d", attempt)
+	}
+	if existsCalls != 0 {
+		t.Errorf("expected 0 Exists calls on pure conflict path, got %d", existsCalls)
+	}
+	if deleteCalls != 0 {
+		t.Errorf("expected 0 DeleteVolume calls on pure conflict path, got %d", deleteCalls)
 	}
 }
 
