@@ -62,7 +62,10 @@ func HandleDeleteSnapshot(deps Deps) Handler {
 		// ----------------------------------------------------------------
 		// 3. Delete snapshot via SDK. 404 → idempotent success.
 		// ----------------------------------------------------------------
-		if err := deps.PVE.QEMU().DeleteSnapshot(ctx, node, vmid, snapName); err != nil {
+		delErr := pve.RetryOnStorageLock(ctx, deps.Logger, "delete_snapshot", 0, func() error {
+			return deps.PVE.QEMU().DeleteSnapshot(ctx, node, vmid, snapName)
+		})
+		if err := delErr; err != nil {
 			if pve.IsNotFound(err) {
 				deps.Logger.Info("delete_snapshot: snapshot already absent, skipping",
 					log.String("snapshot_cid", snapshotCID),

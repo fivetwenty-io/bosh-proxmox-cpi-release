@@ -90,7 +90,12 @@ func HandleDeleteStemcell(deps Deps) cpi.Handler {
 		// Delete qcow2 volume. Absent = warning only (idempotent).
 		// Volume notes (set by create_stemcell) are removed transitively.
 		// ----------------------------------------------------------------
-		qcow2Existed, qcow2Err := deps.PVE.Storage().DeleteVolumeIfExists(ctx, node, storage, volumePath)
+		var qcow2Existed bool
+		qcow2Err := pve.RetryOnStorageLock(ctx, deps.Logger, "delete_stemcell", 0, func() error {
+			var innerErr error
+			qcow2Existed, innerErr = deps.PVE.Storage().DeleteVolumeIfExists(ctx, node, storage, volumePath)
+			return innerErr
+		})
 		if qcow2Err != nil {
 			return nil, cpierrors.Cloud(
 				"delete_stemcell: delete qcow2 volume %q on storage %q node %q: %s",

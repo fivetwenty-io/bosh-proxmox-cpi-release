@@ -196,26 +196,29 @@ func (a *ConfigDrive) UpdateDiskHints(_ context.Context, _ int, _ []DiskHint) er
 }
 
 func (a *ConfigDrive) uploadISO(ctx context.Context, node, localPath, filename string) error {
-	f, err := os.Open(localPath)
-	if err != nil {
-		return fmt.Errorf("open local iso: %w", err)
-	}
-	defer f.Close()
-
-	upid, err := a.pveSvc.Storage().Upload(ctx, node, a.storage, "iso", filename, f)
-	if err != nil {
-		return pve.WrapError(err)
-	}
 	// Upload returns a UPID (async storage task). The file is not yet
 	// visible to subsequent calls (e.g. attaching as a CD-ROM) until the
-	// task completes. Await it before returning.
-	if upid == "" {
-		return nil
-	}
-	if waitErr := pve.AwaitTaskWithLogger(ctx, a.pveSvc, node, upid, a.logger); waitErr != nil {
-		return waitErr
-	}
-	return nil
+	// task completes. Both the multipart POST and the task run under the
+	// per-storage lockfile, so on bursty deploys this can surface
+	// "can't lock file ... got timeout" on either side. Retry the whole
+	// open+upload+await tuple on that signal; the body stream is reopened
+	// each attempt so PVE always sees a fresh reader.
+	return pve.RetryOnStorageLock(ctx, a.logger, "configdrive_upload", 0, func() error {
+		f, openErr := os.Open(localPath)
+		if openErr != nil {
+			return fmt.Errorf("open local iso: %w", openErr)
+		}
+		defer f.Close()
+
+		upid, err := a.pveSvc.Storage().Upload(ctx, node, a.storage, "iso", filename, f)
+		if err != nil {
+			return pve.WrapError(err)
+		}
+		if upid == "" {
+			return nil
+		}
+		return pve.AwaitTaskWithLogger(ctx, a.pveSvc, node, upid, a.logger)
+	})
 }
 
 func (a *ConfigDrive) attachISO(ctx context.Context, node string, vmid int, filename string) error {
@@ -248,8 +251,11 @@ func (a *ConfigDrive) removeISOIfExists(ctx context.Context, node, filename stri
 // 404 internally.
 func (a *ConfigDrive) removeISOFromStorage(ctx context.Context, node, filename string) error {
 	volume := fmt.Sprintf("%s:iso/%s", a.storage, filename)
-	if err := a.pveSvc.Storage().DeleteVolume(ctx, node, a.storage, volume); err != nil {
-		return pve.WrapError(err)
+	delErr := pve.RetryOnStorageLock(ctx, a.logger, "configdrive_delete", 0, func() error {
+		return a.pveSvc.Storage().DeleteVolume(ctx, node, a.storage, volume)
+	})
+	if delErr != nil {
+		return pve.WrapError(delErr)
 	}
 	return nil
 }

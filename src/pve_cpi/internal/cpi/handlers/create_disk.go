@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
@@ -23,6 +24,12 @@ type createDiskCloudProperties struct {
 	// only when no vm_cid hint can resolve the owner node; for shared backends
 	// this is just a placement preference.
 	Node string `json:"node"`
+	// Tags is an operator-supplied map applied to the tags field of the VM
+	// the disk is attached to. PVE has no native disk-volume tag field, so
+	// tags ride on the hosting VM plus a sentinel record in its description
+	// (see applyCustomTagsToVM). Tags are deferred when create_disk has no
+	// vm_cid hint; set_disk_metadata applies them on the next sync.
+	Tags map[string]string `json:"tags"`
 }
 
 // HandleCreateDisk returns a Handler for the BOSH CPI create_disk method.
@@ -125,6 +132,13 @@ func HandleCreateDisk(deps Deps) Handler {
 		if maxAttempts <= 0 {
 			maxAttempts = 5
 		}
+		// Lock retries scale with how busy the storage is, not with how many
+		// VMID collisions we can tolerate. Use the package default unless an
+		// operator overrides it explicitly.
+		lockAttempts := deps.Config.VMIDAllocAttempts
+		if lockAttempts <= 0 {
+			lockAttempts = pve.DefaultStorageLockMaxAttempts
+		}
 
 		// ----------------------------------------------------------------
 		// 4. Allocate a synthetic disk VMID + create the volume.
@@ -145,9 +159,14 @@ func HandleCreateDisk(deps Deps) Handler {
 				volName := fmt.Sprintf("vm-%d-disk-0", candidate)
 				candidateCanonical := fmt.Sprintf("%s:%s", storage, volName)
 
-				v, cerr := deps.PVE.Storage().CreateVolume(
-					ctx, node, storage, sizeGiB, formatArg, candidate, volName,
-				)
+				var v string
+				cerr := pve.RetryOnStorageLock(ctx, deps.Logger, "create_disk", lockAttempts, func() error {
+					var innerErr error
+					v, innerErr = deps.PVE.Storage().CreateVolume(
+						ctx, node, storage, sizeGiB, formatArg, candidate, volName,
+					)
+					return innerErr
+				})
 				if cerr != nil {
 					if pve.IsVMIDConflict(cerr) {
 						// Pure conflict (volume name already taken at storage
@@ -230,6 +249,36 @@ func HandleCreateDisk(deps Deps) Handler {
 			log.String("format", format),
 			log.Int("naming_vmid", namingVMID),
 		)
+
+		// Apply operator-supplied tags to the attached VM, if any. PVE has
+		// no native disk-volume tag field, so disk tags can only ride on the
+		// hosting VM. When create_disk is called without a vm_cid hint we
+		// can't attribute them yet — set_disk_metadata picks them up later.
+		if len(cloudProps.Tags) > 0 {
+			if vmCID == "" {
+				deps.Logger.Warn(
+					"create_disk: tags supplied but disk has no attached VM; tags deferred until set_disk_metadata is called",
+					log.String("disk_cid", diskCID),
+				)
+			} else if vmid, parseErr := strconv.Atoi(vmCID); parseErr == nil && vmid > 0 {
+				if applyErr := applyCustomTagsToVM(ctx, deps, node, vmid, cloudProps.Tags, diskCID); applyErr != nil {
+					// Tagging is best-effort metadata; do not fail volume
+					// creation when only the tag write fails. The next
+					// set_disk_metadata call will re-apply.
+					deps.Logger.Warn("create_disk: failed to apply tags to attached VM",
+						log.String("disk_cid", diskCID),
+						log.String("vm_cid", vmCID),
+						log.Err(applyErr),
+					)
+				}
+			} else {
+				deps.Logger.Warn(
+					"create_disk: tags supplied but vm_cid is not a valid integer; tags deferred",
+					log.String("disk_cid", diskCID),
+					log.String("vm_cid", vmCID),
+				)
+			}
+		}
 
 		success = true
 		return diskCID, nil

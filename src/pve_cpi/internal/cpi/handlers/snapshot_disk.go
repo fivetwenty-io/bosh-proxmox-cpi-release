@@ -92,27 +92,28 @@ func HandleSnapshotDisk(deps Deps) Handler {
 		}
 
 		// ----------------------------------------------------------------
-		// 6. Take VM snapshot via SDK.
+		// 6-7. Take VM snapshot via SDK and await its task. PVE snapshot
+		// operations on zfs/lvm/btrfs storages take the per-storage lock,
+		// so retry the submit+await pair on IsStorageLockTimeout.
 		// ----------------------------------------------------------------
-		upid, err := deps.PVE.QEMU().Snapshot(ctx, node, vmid, snapName, snapOpts)
-		if err != nil {
-			wrapped := pve.WrapError(err)
+		serr := pve.RetryOnStorageLock(ctx, deps.Logger, "snapshot_disk", 0, func() error {
+			upid, e := deps.PVE.QEMU().Snapshot(ctx, node, vmid, snapName, snapOpts)
+			if e != nil {
+				return e
+			}
+			if upid == "" {
+				return nil
+			}
+			return pve.AwaitTaskWithLogger(ctx, deps.PVE, node, upid, deps.Logger)
+		})
+		if serr != nil {
 			deps.Logger.Error("snapshot_disk: Snapshot failed",
 				log.String("disk_cid", diskCID),
 				log.Int("vmid", vmid),
 				log.String("snap_name", snapName),
-				log.Err(err),
+				log.Err(serr),
 			)
-			return nil, fmt.Errorf("snapshot_disk: Snapshot failed for VM %d disk %s: %w", vmid, diskCID, wrapped)
-		}
-
-		// ----------------------------------------------------------------
-		// 7. Await task completion when a UPID is returned.
-		// ----------------------------------------------------------------
-		if upid != "" {
-			if err := pve.AwaitTaskWithLogger(ctx, deps.PVE, node, upid, deps.Logger); err != nil {
-				return nil, fmt.Errorf("snapshot_disk: snapshot task failed for VM %d disk %s: %w", vmid, diskCID, err)
-			}
+			return nil, fmt.Errorf("snapshot_disk: Snapshot failed for VM %d disk %s: %w", vmid, diskCID, pve.WrapError(serr))
 		}
 
 		// ----------------------------------------------------------------

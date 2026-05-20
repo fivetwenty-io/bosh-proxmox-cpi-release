@@ -20,53 +20,6 @@ import (
 	sdknodes "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/nodes"
 )
 
-// retryOnStorageLock invokes op up to maxAttempts times, retrying only when
-// the returned error is a PVE per-storage lockfile timeout
-// (pve.IsStorageLockTimeout). Other errors (or success) return immediately.
-//
-// Used to absorb contention against /var/lock/pve-manager/pve-storage-<name>
-// from parallel qmcreate / qm resize / qm set operations during bursts of
-// concurrent create_vm calls. Backoff uses createVMRetryBackoff (seconds-scale
-// exponential with jitter, capped at 30 s). The VM/VMID does not change
-// across retries — same operation, same target, just wait for the lock holder
-// to finish.
-func retryOnStorageLock(
-	ctx context.Context,
-	logger *log.Logger,
-	label string,
-	maxAttempts int,
-	op func() error,
-) error {
-	var lastErr error
-	for attempt := 0; attempt < maxAttempts; attempt++ {
-		err := op()
-		if err == nil {
-			return nil
-		}
-		if !pve.IsStorageLockTimeout(err) {
-			return err
-		}
-		lastErr = err
-		if attempt == maxAttempts-1 {
-			break
-		}
-		d := createVMRetryBackoff(err, attempt)
-		logger.Info("create_vm: storage lock timeout, retrying",
-			log.String("op", label),
-			log.Int("attempt", attempt+1),
-			log.Int("max_attempts", maxAttempts),
-			log.Int("backoff_ms", int(d/time.Millisecond)),
-			log.String("error", err.Error()),
-		)
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(d):
-		}
-	}
-	return lastErr
-}
-
 // createVMRetryBackoff selects the sleep duration between AllocateWithRetry
 // attempts in create_vm. VMID conflicts only need a brief jitter to
 // decorrelate herds across concurrent CPI processes; storage lock-file
@@ -118,6 +71,13 @@ type createVMCloudProps struct {
 	Disk          int    `json:"disk"`
 	NetworkBridge string `json:"network_bridge"` // per-VM bridge override
 	NetworkModel  string `json:"network_model"`  // virtio|e1000 etc.
+	// Tags is an operator-supplied map applied to the new VM's PVE tags
+	// field as sanitized "<key>--<value>" entries. The BOSH-reserved
+	// director/deployment/job triple is not known at create_vm time
+	// (BOSH supplies it via set_vm_metadata after the agent settles), so
+	// these entries are purely custom. set_vm_metadata preserves them
+	// across re-syncs.
+	Tags map[string]string `json:"tags"`
 }
 
 // createVMNetworkSpec mirrors the BOSH v2 network spec shape.
@@ -295,6 +255,12 @@ func createVM(
 		memMiB = 512
 	}
 
+	// Pre-compute the operator-supplied tag string. The BOSH-managed
+	// director/deployment/job triple is added later by set_vm_metadata; here
+	// we set only the custom tags so the VM has them visible in the PVE UI
+	// immediately after creation.
+	initialTags := mergeTagList(nil, buildCustomTags(cloudProps.Tags), maxTagLength)
+
 	// -----------------------------------------------------------------------
 	// 4. Allocate VMID + create VM via retry-on-conflict.
 	//    PVE may reject POST /qemu with HTTP 500 "VM N already exists" when a
@@ -328,6 +294,9 @@ func createVM(
 			}
 			if sockets > 1 {
 				createParams["sockets"] = sockets
+			}
+			if initialTags != "" {
+				createParams["tags"] = initialTags
 			}
 
 			upid, cerr := deps.PVE.QEMU().Create(ctx, node, createParams)
@@ -421,7 +390,7 @@ func createVM(
 		// and other resizes and surfaces as "can't lock file ... got timeout"
 		// in the task log. Retry the whole submit+await with seconds-scale
 		// backoff against the lock holder finishing.
-		rerr := retryOnStorageLock(ctx, logger, "resize_virtio0", maxAttempts, func() error {
+		rerr := pve.RetryOnStorageLock(ctx, logger, "resize_virtio0", maxAttempts, func() error {
 			upid, e := deps.PVE.QEMU().ResizeDisk(ctx, node, vmid, "virtio0", growGiB)
 			if e != nil {
 				return e

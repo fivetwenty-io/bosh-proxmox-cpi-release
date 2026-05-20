@@ -133,22 +133,24 @@ func HandleResizeDisk(deps Deps) Handler {
 		}
 
 		// ----------------------------------------------------------------
-		// 6. Resize disk via SDK (additive "+NG" format via deltaGiB).
+		// 6-7. Submit ResizeDisk and await its task. PVE's qemu-img resize
+		// runs under the per-storage lockfile, so on bursty deploys the
+		// task can fail with "can't lock file ... got timeout". Retry the
+		// submit+await pair on that signal; non-lock errors propagate.
 		// ----------------------------------------------------------------
-		upid, err := deps.PVE.QEMU().ResizeDisk(ctx, node, vmid, diskID, deltaGiB)
-		if err != nil {
-			wrapped := pve.WrapError(err)
-			return nil, fmt.Errorf("resize_disk: ResizeDisk failed for VM %d disk %s (+%dG): %w",
-				vmid, diskCID, deltaGiB, wrapped)
-		}
-
-		// ----------------------------------------------------------------
-		// 7. Await task completion when a UPID is returned.
-		// ----------------------------------------------------------------
-		if upid != "" {
-			if err := pve.AwaitTaskWithLogger(ctx, deps.PVE, node, upid, deps.Logger); err != nil {
-				return nil, fmt.Errorf("resize_disk: resize task failed for VM %d disk %s: %w", vmid, diskCID, err)
+		rerr := pve.RetryOnStorageLock(ctx, deps.Logger, "resize_disk", 0, func() error {
+			upid, e := deps.PVE.QEMU().ResizeDisk(ctx, node, vmid, diskID, deltaGiB)
+			if e != nil {
+				return e
 			}
+			if upid == "" {
+				return nil
+			}
+			return pve.AwaitTaskWithLogger(ctx, deps.PVE, node, upid, deps.Logger)
+		})
+		if rerr != nil {
+			return nil, fmt.Errorf("resize_disk: ResizeDisk failed for VM %d disk %s (+%dG): %w",
+				vmid, diskCID, deltaGiB, pve.WrapError(rerr))
 		}
 
 		deps.Logger.Info("resize_disk",

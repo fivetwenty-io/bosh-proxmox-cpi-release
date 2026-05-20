@@ -76,7 +76,10 @@ func HandleDeleteDisk(deps Deps) Handler {
 		// 4. Delete the volume. SDK DeleteVolume is already 404-safe;
 		//    we do NOT propagate 404 as an error.
 		// ----------------------------------------------------------------
-		if err := deps.PVE.Storage().DeleteVolume(ctx, node, storage, diskCID); err != nil {
+		delErr := pve.RetryOnStorageLock(ctx, deps.Logger, "delete_disk", 0, func() error {
+			return deps.PVE.Storage().DeleteVolume(ctx, node, storage, diskCID)
+		})
+		if err := delErr; err != nil {
 			// Check whether the error is a not-found variant. The SDK
 			// DeleteVolume already swallows 404 internally, but if a
 			// non-SDK not-found surfaces we still treat it as success.

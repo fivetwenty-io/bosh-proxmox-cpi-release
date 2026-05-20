@@ -108,12 +108,22 @@ func HandleDeleteVM(deps Deps) cpi.Handler {
 		// --- delete VM ---
 		// Purge removes VMID from backup/HA/replication configs.
 		// DestroyUnreferencedDisks removes orphaned volumes from storage.
+		//
+		// DestroyUnreferencedDisks=true triggers pvesm free under the
+		// per-storage lockfile for every attached volume, so on bursty
+		// deploys this can surface "can't lock file ... got timeout".
+		// Retry on that signal; everything else propagates immediately.
 		purge := true
 		destroyDisks := true
 		logger.Debug("delete_vm: deleting VM")
-		deleteResp, deleteErr := deps.PVE.Nodes().DeleteQemu(ctx, node, vmCID, &sdknodes.DeleteQemuParams{
-			Purge:                    &purge,
-			DestroyUnreferencedDisks: &destroyDisks,
+		var deleteResp *sdknodes.DeleteQemuResponse
+		deleteErr := pve.RetryOnStorageLock(ctx, logger, "delete_vm", 0, func() error {
+			var innerErr error
+			deleteResp, innerErr = deps.PVE.Nodes().DeleteQemu(ctx, node, vmCID, &sdknodes.DeleteQemuParams{
+				Purge:                    &purge,
+				DestroyUnreferencedDisks: &destroyDisks,
+			})
+			return innerErr
 		})
 		if deleteErr != nil {
 			if pve.IsNotFound(deleteErr) {

@@ -512,24 +512,33 @@ func uploadStemcellImage(
 		return cpierrors.Cloud("uploadStemcellImage: storage service unavailable")
 	}
 
-	f, err := os.Open(imagePath)
-	if err != nil {
-		return cpierrors.Cloud("uploadStemcellImage: open %s: %s", imagePath, err.Error())
-	}
-	defer func() { _ = f.Close() }()
-
-	upid, err := deps.PVE.Storage().Upload(ctx, node, storageName, "import", filename, f)
-	if err != nil {
-		return cpierrors.Cloud("uploadStemcellImage: upload to %s/%s: %s", node, storageName, err.Error())
-	}
 	// Upload returns a UPID task identifier; wait for completion using
-	// StemcellMaxWait (600s) to accommodate format conversion (D-06).
-	if upid == "" {
-		return nil
-	}
-	if waitErr := pve.AwaitTaskWithLogger(ctx, deps.PVE, node, upid, deps.Logger,
-		pve.WithMaxWait(pve.StemcellMaxWait)); waitErr != nil {
-		return cpierrors.Wrap(waitErr, fmt.Sprintf("uploadStemcellImage: await %s", upid))
+	// StemcellMaxWait (600s) to accommodate format conversion (D-06). Both
+	// the multipart POST and the resulting task run under the per-storage
+	// lockfile, so concurrent stemcell uploads against the same storage can
+	// surface "can't lock file ... got timeout" on either side. Retry the
+	// whole open+upload+await tuple on that signal; the body stream is
+	// reopened from imagePath each attempt so PVE always sees a fresh
+	// reader.
+	rerr := pve.RetryOnStorageLock(ctx, deps.Logger, "create_stemcell_upload", 0, func() error {
+		f, openErr := os.Open(imagePath)
+		if openErr != nil {
+			return cpierrors.Cloud("uploadStemcellImage: open %s: %s", imagePath, openErr.Error())
+		}
+		defer func() { _ = f.Close() }()
+
+		upid, uerr := deps.PVE.Storage().Upload(ctx, node, storageName, "import", filename, f)
+		if uerr != nil {
+			return uerr
+		}
+		if upid == "" {
+			return nil
+		}
+		return pve.AwaitTaskWithLogger(ctx, deps.PVE, node, upid, deps.Logger,
+			pve.WithMaxWait(pve.StemcellMaxWait))
+	})
+	if rerr != nil {
+		return cpierrors.Cloud("uploadStemcellImage: upload to %s/%s: %s", node, storageName, rerr.Error())
 	}
 	return nil
 }
