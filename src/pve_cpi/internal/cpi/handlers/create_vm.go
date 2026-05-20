@@ -25,6 +25,10 @@ const defaultStemcellDiskGiB = 5
 
 // createVMCloudProps holds the fields we care about from Args[2].
 type createVMCloudProps struct {
+	// CPU is the total vCPU count using the vSphere CPI convention. When
+	// set and Cores is unset, the VM is created with Cores=CPU, Sockets=1
+	// (PVE's cores-per-socket sums to total vCPUs at runtime).
+	CPU                 int    `json:"cpu"`
 	Cores               int    `json:"cores"`
 	Sockets             int    `json:"sockets"`
 	Memory              int    `json:"memory"`         // MiB
@@ -190,7 +194,15 @@ func createVM(
 		}
 	}
 
+	// cloud_properties supports two conventions:
+	//   - vSphere CPI style: cpu = total vCPU count (cores × sockets).
+	//   - PVE-native: cores/sockets explicit.
+	// Explicit cores/sockets win when present; otherwise fall back to cpu
+	// as cores with a single socket. Default is 1 vCPU.
 	cores := cloudProps.Cores
+	if cores <= 0 && cloudProps.CPU > 0 {
+		cores = cloudProps.CPU
+	}
 	if cores <= 0 {
 		cores = 1
 	}
