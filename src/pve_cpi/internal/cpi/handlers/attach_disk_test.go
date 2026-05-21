@@ -173,7 +173,7 @@ func extractPath(t *testing.T, result any) string {
 // TestHandleAttachDisk_Happy verifies the full happy path:
 //   - AttachDisk returns diskID "scsi2"
 //   - Config returns config confirming scsi2 → volid
-//   - disk_hints {"path": "/dev/sdc"} returned (scsi index 2 → 'a'+2 = 'c' → /dev/sdc)
+//   - disk_hints {"path": "/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_drive-scsi2"} returned
 //   - UpdateDiskHints called with correct vmid and device_path
 func TestHandleAttachDisk_Happy(t *testing.T) {
 	const (
@@ -201,9 +201,10 @@ func TestHandleAttachDisk_Happy(t *testing.T) {
 		t.Fatal("result is nil; want disk_hints object")
 	}
 
+	const wantPath = "/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_drive-scsi2"
 	path := extractPath(t, result)
-	if path != "/dev/sdc" {
-		t.Errorf("disk_hints.path: want /dev/sdc, got %q", path)
+	if path != wantPath {
+		t.Errorf("disk_hints.path: want %q, got %q", wantPath, path)
 	}
 
 	if !ag.updateCalled {
@@ -215,8 +216,8 @@ func TestHandleAttachDisk_Happy(t *testing.T) {
 	if len(ag.updateHints) != 1 {
 		t.Fatalf("UpdateDiskHints hints len: want 1, got %d", len(ag.updateHints))
 	}
-	if ag.updateHints[0].DevicePath != "/dev/sdc" {
-		t.Errorf("UpdateDiskHints device_path: want /dev/sdc, got %q", ag.updateHints[0].DevicePath)
+	if ag.updateHints[0].DevicePath != wantPath {
+		t.Errorf("UpdateDiskHints device_path: want %q, got %q", wantPath, ag.updateHints[0].DevicePath)
 	}
 	if ag.updateHints[0].DiskCID != diskCID {
 		t.Errorf("UpdateDiskHints disk_cid: want %q, got %q", diskCID, ag.updateHints[0].DiskCID)
@@ -247,10 +248,10 @@ func TestHandleAttachDisk_AlreadyAttached(t *testing.T) {
 		t.Fatalf("unexpected error on already-attached: %v", err)
 	}
 
-	// scsi1 → index 1 → 'a'+1 = 'b' → /dev/sdb
+	const wantPath = "/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_drive-scsi1"
 	path := extractPath(t, result)
-	if path != "/dev/sdb" {
-		t.Errorf("disk_hints.path: want /dev/sdb, got %q", path)
+	if path != wantPath {
+		t.Errorf("disk_hints.path: want %q, got %q", wantPath, path)
 	}
 }
 
@@ -373,13 +374,14 @@ func TestHandleAttachDisk_ResolveFallback(t *testing.T) {
 		t.Fatalf("unexpected error in fallback path: %v", err)
 	}
 
-	// Both the Resolve and the path-derivation Config calls fail, so we end
-	// up on the GuessDevicePath fallback: scsi3 → /dev/sdd (slot-based).
-	// In real usage this is the correct value only when scsi0 is also
-	// attached, but it is the safest degraded-mode output we can produce.
+	// Resolve's Config call fails; the handler falls back to the diskID
+	// returned by AttachDisk ("scsi3"). devicePathByID is a pure function
+	// of the diskID so the final by-id path is still valid even though
+	// the resolve step degraded.
+	const wantPath = "/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_drive-scsi3"
 	path := extractPath(t, result)
-	if path != "/dev/sdd" {
-		t.Errorf("disk_hints.path: want /dev/sdd (GuessDevicePath fallback for scsi3), got %q", path)
+	if path != wantPath {
+		t.Errorf("disk_hints.path: want %q, got %q", wantPath, path)
 	}
 }
 
@@ -440,9 +442,10 @@ func TestHandleAttachDisk_FreshVMSkipsSCSI0(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
+	const wantPath = "/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_drive-scsi1"
 	path := extractPath(t, result)
-	if path != "/dev/sda" {
-		t.Errorf("disk_hints.path: want /dev/sda (scsi1, sole scsi disk, rank 0), got %q", path)
+	if path != wantPath {
+		t.Errorf("disk_hints.path: want %q, got %q", wantPath, path)
 	}
 }
 
@@ -476,9 +479,10 @@ func TestHandleAttachDisk_LegacySCSI0Migration(t *testing.T) {
 		t.Errorf("expected DetachDisk(\"scsi0\") to be called exactly once, got %v", qemuSvc.detachCalls)
 	}
 
+	const wantPath = "/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_drive-scsi1"
 	path := extractPath(t, result)
-	if path != "/dev/sda" {
-		t.Errorf("disk_hints.path: want /dev/sda (post-migration, sole scsi disk), got %q", path)
+	if path != wantPath {
+		t.Errorf("disk_hints.path: want %q (post-migration), got %q", wantPath, path)
 	}
 }
 
@@ -508,10 +512,10 @@ func TestHandleAttachDisk_PreservesExistingNonZeroSlot(t *testing.T) {
 		t.Errorf("expected no DetachDisk calls when existing slot is non-zero; got %v", qemuSvc.detachCalls)
 	}
 
+	const wantPath = "/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_drive-scsi3"
 	path := extractPath(t, result)
-	// Config has two scsi disks (scsi1, scsi3); diskCID at scsi3 → rank 1 → /dev/sdb.
-	if path != "/dev/sdb" {
-		t.Errorf("disk_hints.path: want /dev/sdb (scsi3 preserved, rank 1 of [scsi1, scsi3]), got %q", path)
+	if path != wantPath {
+		t.Errorf("disk_hints.path: want %q (scsi3 preserved), got %q", wantPath, path)
 	}
 }
 
@@ -536,9 +540,9 @@ func TestHandleAttachDisk_PicksLowestFreeAtOrAboveOne(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
+	const wantPath = "/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_drive-scsi2"
 	path := extractPath(t, result)
-	// Config has three scsi disks (scsi1, scsi2, scsi3); diskCID at scsi2 → rank 1 → /dev/sdb.
-	if path != "/dev/sdb" {
-		t.Errorf("disk_hints.path: want /dev/sdb (scsi2 — rank 1 of [scsi1, scsi2, scsi3]), got %q", path)
+	if path != wantPath {
+		t.Errorf("disk_hints.path: want %q (lowest free >= 1), got %q", wantPath, path)
 	}
 }

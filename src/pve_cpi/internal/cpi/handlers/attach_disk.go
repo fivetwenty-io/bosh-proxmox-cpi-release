@@ -5,9 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"sort"
 	"strconv"
-	"strings"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/agent"
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
@@ -35,7 +33,7 @@ type diskHints struct {
 //	[0] vm_cid   string — VMID of the target VM (integer as string, e.g. "100")
 //	[1] disk_cid string — persistent disk CID in "<storage>:<volid>" form
 //
-// Returns (v2): disk_hints object {"path": "/dev/sdX"} per the BOSH CPI v2 spec.
+// Returns (v2): disk_hints object {"path": "/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_drive-scsi<N>"} per the BOSH CPI v2 spec.
 //
 // Logic:
 //  1. Parse vm_cid to VMID int; parse disk_cid to storage+volid components.
@@ -48,7 +46,8 @@ type diskHints struct {
 //     async task), so no AwaitTask is needed.
 //  4. Resolve the final diskID from the current VM config via pve.ResolveDiskID to
 //     confirm the attachment and get the canonical slot name.
-//  5. Derive device path from diskID using qemu.GuessDevicePath.
+//  5. Derive device path from diskID as a PVE-stable by-id symlink:
+//     "/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_drive-scsi<N>".
 //  6. Call agent.UpdateDiskHints so registry-mode agents receive the updated
 //     persistent disk mapping. No-op for cloudinit and noagent modes.
 //  7. Return disk_hints{"path": devicePath}.
@@ -56,14 +55,17 @@ type diskHints struct {
 // Device path convention:
 //
 //	virtio0 → /dev/vda  (system disk imported from the stemcell — not a persistent disk)
-//	scsi1   → /dev/sda  (sole persistent disk; scsi0 is reserved & unused)
-//	scsi1+scsi2 → /dev/sda + /dev/sdb (rank-based, not slot-based)
+//	scsi<N> → /dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_drive-scsi<N>
 //
-// Letters track rank among disk-type scsi entries in the post-attach
-// config, not the PVE slot index. Linux's virtio-scsi controller scans
-// targets in id order and assigns /dev/sd<a + rank>, so a sole persistent
-// disk at scsi1 enumerates as /dev/sda regardless of slot. See
-// devicePathForSCSIRank for the computation.
+// We DO NOT return a "/dev/sd<X>" hint. BOSH agent's
+// mappedDevicePathResolver probes prefixes in the order
+// [/dev/xvd, /dev/vd, /dev/sd] when the hint starts with "/dev/sd", and
+// would resolve "/dev/sd<X>" to the virtio root disk "/dev/vd<X>" because
+// /dev/vda exists. By returning a path that does not start with "/dev/sd",
+// the resolver falls into its else-branch, finds the by-id symlink,
+// follows it to whatever /dev/sd<X> the kernel actually assigned, and
+// returns that. PVE virtio-scsi-pci sets the QEMU disk serial to
+// "drive-scsi<N>", and udev creates the corresponding by-id symlink.
 //
 // Bus selection: "scsi" is always used for persistent disks regardless of
 // VMDiskFormat. The scsi bus matches the virtio-scsi-single controller that
@@ -213,40 +215,27 @@ func HandleAttachDisk(deps Deps) Handler {
 		// --------------------------------------------------------------------
 		// 5. Derive device path from diskID.
 		//
-		// We cannot use qemu.GuessDevicePath's naive scsi<N> → /dev/sd<a+N>
-		// formula here: with scsi0 reserved (see step 3) and a persistent
-		// disk at scsi1, the guest kernel scans the virtio-scsi controller,
-		// finds one disk, and assigns it /dev/sda — NOT /dev/sdb. Hinting
-		// "/dev/sdb" makes the agent's mappedDevicePathResolver time out
-		// probing /dev/xvdb, /dev/vdb, /dev/sdb (none exist).
+		// We use a PVE-stable by-id symlink rather than a "/dev/sd<X>" hint
+		// because BOSH agent's mappedDevicePathResolver substitutes /dev/sd
+		// prefixes with /dev/vd before falling back to /dev/sd (see
+		// infrastructure/devicepathresolver/mapped_device_path_resolver.go).
+		// A virtio root disk (/dev/vda) on this VM makes "/dev/sda" resolve
+		// to the root disk; the agent then runs persistent-disk partitioning
+		// against /dev/vda and fails with
+		//     "Persistent disks with many partitions are not supported.
+		//      Expected 1, got 4."
 		//
-		// Instead, compute the path by rank: enumerate non-cdrom scsi
-		// entries in the post-attach config, sort by slot index, and pick
-		// /dev/sd<a + rank-of-this-attachment>. This matches Linux's
-		// scsi-host scan order on cold boot and is also what the kernel
-		// reports for hot-attached devices when the lower letters are free.
+		// PVE configures virtio-scsi-pci disks with QEMU disk serial
+		// "drive-scsi<N>" (where N is the slot index), and udev creates the
+		// symlink "/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_drive-scsi<N>"
+		// pointing to whatever /dev/sd<X> letter the guest kernel assigned.
+		// Because this path does not start with "/dev/sd", the agent's
+		// resolver skips its substitution table, follows the symlink, and
+		// returns the correct device.
 		// --------------------------------------------------------------------
-		var devicePath string
-		if postCfg, cfgErr := deps.PVE.QEMU().Config(ctx, node, vmid); cfgErr == nil {
-			if dp, dpErr := devicePathForSCSIRank(postCfg, resolvedDiskID); dpErr == nil {
-				devicePath = dp
-			}
-		} else {
-			deps.Logger.Warn("attach_disk: re-read VM config failed; falling back to slot-based device path",
-				log.String("vm_cid", vmCID),
-				log.String("disk_cid", diskCID),
-				log.Err(cfgErr),
-			)
-		}
-		// Fallback: the slot-based formula. Wrong when scsi0 is reserved (the
-		// typical case), but better than failing outright. This path only
-		// fires when the rank-based computation failed because we could not
-		// re-read the config or could not locate diskID in it — both rare.
-		if devicePath == "" {
-			devicePath = qemu.GuessDevicePath(resolvedDiskID)
-		}
-		if devicePath == "" {
-			return nil, fmt.Errorf("attach_disk: cannot compute device path for diskID %q", resolvedDiskID)
+		devicePath, devErr := devicePathByID(resolvedDiskID)
+		if devErr != nil {
+			return nil, fmt.Errorf("attach_disk: cannot compute device path for diskID %q: %w", resolvedDiskID, devErr)
 		}
 
 		// --------------------------------------------------------------------
@@ -324,55 +313,25 @@ func chooseSCSISlotSkippingZero(
 	return fmt.Sprintf("scsi%d", idx), nil
 }
 
-// devicePathForSCSIRank computes the Linux /dev/sd<letter> path the guest
-// kernel will assign to the disk at diskID, given the VM config that
-// includes the attachment.
+// devicePathByID returns the PVE-stable udev by-id symlink path for the
+// disk attached at diskID. PVE configures virtio-scsi-pci disks with the
+// QEMU disk serial "drive-scsi<N>" (where N is the slot index from the
+// "scsiN" key), and udev's 60-persistent-storage.rules creates a symlink
 //
-// The naive formula /dev/sd<a+N> for "scsiN" is wrong whenever the slot
-// numbers are not contiguous from 0. With scsi0 reserved (see
-// chooseSCSISlotSkippingZero), the disk at scsi1 enumerates as /dev/sda
-// because Linux's scsi-host scan walks the bus in target-ID order and
-// assigns the next free letter starting at 'a'. Letters track the rank
-// among disk-type entries, not the raw target ID.
+//	/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_drive-scsi<N>
 //
-// Cdrom entries (media=cdrom) become /dev/sr* and are excluded from the
-// rank. Non-scsi entries (virtio, ide, sata) are ignored.
+// pointing to whatever /dev/sd<X> the guest kernel assigned. Returning
+// this path (instead of a guessed /dev/sd<X>) bypasses BOSH agent's
+// mappedDevicePathResolver substitution that would otherwise collide with
+// the virtio root disk.
 //
-// Returns "" only for non-scsi diskIDs; callers should already have
-// asserted the bus before invoking. An error is returned when diskID is
-// not actually present in cfg (would indicate a race between AttachDisk
-// and this lookup).
-func devicePathForSCSIRank(cfg map[string]interface{}, diskID string) (string, error) {
+// Returns an error if diskID is not a scsi slot.
+func devicePathByID(diskID string) (string, error) {
 	var idx int
 	if _, err := fmt.Sscanf(diskID, "scsi%d", &idx); err != nil {
 		return "", fmt.Errorf("diskID %q is not a scsi slot", diskID)
 	}
-
-	var ranks []int
-	for k, v := range cfg {
-		var slot int
-		if _, err := fmt.Sscanf(k, "scsi%d", &slot); err != nil {
-			continue
-		}
-		s, ok := v.(string)
-		if !ok {
-			continue
-		}
-		// Skip cdrom-class entries — they become /dev/sr*, not /dev/sd*,
-		// and so do not consume an sd-letter in the guest's enumeration.
-		if strings.Contains(s, "media=cdrom") {
-			continue
-		}
-		ranks = append(ranks, slot)
-	}
-	sort.Ints(ranks)
-
-	for i, r := range ranks {
-		if r == idx {
-			return fmt.Sprintf("/dev/sd%c", 'a'+i), nil
-		}
-	}
-	return "", fmt.Errorf("diskID %q not found in config (or is a cdrom)", diskID)
+	return fmt.Sprintf("/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_drive-scsi%d", idx), nil
 }
 
 // nextFreeSCSIIndexAtLeast returns the lowest scsi slot index >= floor that is
