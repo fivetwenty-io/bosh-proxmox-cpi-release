@@ -26,9 +26,21 @@ type attachQEMUService struct {
 	attachReturnDiskID string
 	attachErr          error
 
-	// Config control (used by ResolveDiskID after attach).
-	configCfg map[string]interface{}
-	configErr error
+	// Config control. Two modes:
+	//   - configCfgs (when non-nil): staged responses; call N returns
+	//     configCfgs[N-1], or the last entry if call N exceeds the slice.
+	//   - configCfg + configErr: legacy single-shape mode used by older
+	//     tests. configErrAfter, when > 0, returns configCfg/nil for the
+	//     first N calls and configErr starting with call N+1.
+	configCfgs     []map[string]interface{}
+	configCfg      map[string]interface{}
+	configErr      error
+	configErrAfter int
+	configCalls    int
+
+	// DetachDisk control — records calls and may inject error.
+	detachCalls []string
+	detachErr   error
 }
 
 func (m *attachQEMUService) AttachDisk(_ context.Context, _ string, _ int, _ string, _ string, _ *qemu.AttachOpts) (string, error) {
@@ -36,6 +48,17 @@ func (m *attachQEMUService) AttachDisk(_ context.Context, _ string, _ int, _ str
 }
 
 func (m *attachQEMUService) Config(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
+	m.configCalls++
+	if len(m.configCfgs) > 0 {
+		idx := m.configCalls - 1
+		if idx >= len(m.configCfgs) {
+			idx = len(m.configCfgs) - 1
+		}
+		return m.configCfgs[idx], nil
+	}
+	if m.configErrAfter > 0 && m.configCalls <= m.configErrAfter {
+		return m.configCfg, nil
+	}
 	return m.configCfg, m.configErr
 }
 
@@ -61,8 +84,9 @@ func (m *attachQEMUService) Clone(_ context.Context, _ string, _ int, _ map[stri
 func (m *attachQEMUService) Template(_ context.Context, _ string, _ int) (string, error) {
 	panic("attachQEMUService.Template: not expected")
 }
-func (m *attachQEMUService) DetachDisk(_ context.Context, _ string, _ int, _ string) error {
-	panic("attachQEMUService.DetachDisk: not expected")
+func (m *attachQEMUService) DetachDisk(_ context.Context, _ string, _ int, diskID string) error {
+	m.detachCalls = append(m.detachCalls, diskID)
+	return m.detachErr
 }
 func (m *attachQEMUService) ResizeDisk(_ context.Context, _ string, _ int, _ string, _ int) (string, error) {
 	panic("attachQEMUService.ResizeDisk: not expected")
@@ -327,14 +351,19 @@ func TestHandleAttachDisk_EmptyDiskCID(t *testing.T) {
 	}
 }
 
-// TestHandleAttachDisk_ResolveFallback verifies that when ResolveDiskID fails after
-// a successful AttachDisk, the handler falls back to the diskID returned by
-// AttachDisk and still returns valid disk_hints (logs a warning).
+// TestHandleAttachDisk_ResolveFallback verifies that when ResolveDiskID's
+// Config call fails after a successful AttachDisk, the handler falls back to
+// the diskID returned by AttachDisk and still returns valid disk_hints
+// (logs a warning).
+//
+// The first Config call (slot selection) must succeed; the second (resolve)
+// must fail. configErrAfter=1 implements that two-phase behavior.
 func TestHandleAttachDisk_ResolveFallback(t *testing.T) {
-	// Config returns error on the ResolveDiskID call, but AttachDisk succeeds.
 	qemuSvc := &attachQEMUService{
 		attachReturnDiskID: "scsi3",
+		configCfg:          map[string]interface{}{}, // empty config → slot-selection picks scsi1
 		configErr:          errors.New("transient config error"),
+		configErrAfter:     1,
 	}
 	ag := &captureAgent{}
 	h := handlers.HandleAttachDisk(attachDeps(qemuSvc, ag))
@@ -383,4 +412,128 @@ func keysOf(m map[string]json.RawMessage) []string {
 		ks = append(ks, k)
 	}
 	return ks
+}
+
+// TestHandleAttachDisk_FreshVMSkipsSCSI0 verifies that a fresh attach on a VM
+// with no scsi disks lands at scsi1 (not scsi0). scsi0 is reserved because the
+// BOSH agent's mappedDevicePathResolver resolves /dev/sda hints to the virtio
+// root disk /dev/vda when one exists, shadowing the persistent disk.
+func TestHandleAttachDisk_FreshVMSkipsSCSI0(t *testing.T) {
+	const volid = "vm-9001-disk-0"
+	qemuSvc := &attachQEMUService{
+		attachReturnDiskID: "scsi1",
+		// First Config call (slot selection): config has virtio0 root, no scsi.
+		// Second Config call (resolve): config has the new scsi1 attachment.
+		configCfg: map[string]interface{}{
+			"virtio0": "data:vm-100-disk-0",
+			"scsi1":   "data:" + volid,
+		},
+	}
+	ag := &captureAgent{}
+	h := handlers.HandleAttachDisk(attachDeps(qemuSvc, ag))
+
+	result, err := h.Handle(context.Background(), attachArgs("100", "data:"+volid), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	path := extractPath(t, result)
+	if path != "/dev/sdb" {
+		t.Errorf("disk_hints.path: want /dev/sdb (scsi1, never sda/scsi0), got %q", path)
+	}
+}
+
+// TestHandleAttachDisk_LegacySCSI0Migration verifies the migration path:
+// when a disk is already attached at scsi0 (from a prior CPI version that
+// allowed it), attach_disk detaches scsi0 and reattaches at scsi1+.
+func TestHandleAttachDisk_LegacySCSI0Migration(t *testing.T) {
+	const volid = "vm-9001-disk-0"
+	const diskCID = "data:" + volid
+
+	qemuSvc := &attachQEMUService{
+		attachReturnDiskID: "scsi1",
+		configCfgs: []map[string]interface{}{
+			// Call 1 — slot selection: legacy scsi0 attachment present.
+			{"virtio0": "data:vm-100-disk-0", "scsi0": diskCID},
+			// Call 2 — re-read after Detach: scsi0 gone.
+			{"virtio0": "data:vm-100-disk-0"},
+			// Call 3 — Resolve after AttachDisk: scsi1 present with volid.
+			{"virtio0": "data:vm-100-disk-0", "scsi1": diskCID},
+		},
+	}
+	ag := &captureAgent{}
+	h := handlers.HandleAttachDisk(attachDeps(qemuSvc, ag))
+
+	result, err := h.Handle(context.Background(), attachArgs("100", diskCID), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(qemuSvc.detachCalls) != 1 || qemuSvc.detachCalls[0] != "scsi0" {
+		t.Errorf("expected DetachDisk(\"scsi0\") to be called exactly once, got %v", qemuSvc.detachCalls)
+	}
+
+	path := extractPath(t, result)
+	if path != "/dev/sdb" {
+		t.Errorf("disk_hints.path: want /dev/sdb (post-migration), got %q", path)
+	}
+}
+
+// TestHandleAttachDisk_PreservesExistingNonZeroSlot verifies that an existing
+// attachment at scsi >= 1 is preserved (idempotent reattach with no migration).
+func TestHandleAttachDisk_PreservesExistingNonZeroSlot(t *testing.T) {
+	const volid = "vm-9001-disk-0"
+	const diskCID = "data:" + volid
+
+	qemuSvc := &attachQEMUService{
+		attachReturnDiskID: "scsi3",
+		configCfg: map[string]interface{}{
+			"virtio0": "data:vm-100-disk-0",
+			"scsi1":   "data:other",
+			"scsi3":   diskCID,
+		},
+	}
+	ag := &captureAgent{}
+	h := handlers.HandleAttachDisk(attachDeps(qemuSvc, ag))
+
+	result, err := h.Handle(context.Background(), attachArgs("100", diskCID), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(qemuSvc.detachCalls) != 0 {
+		t.Errorf("expected no DetachDisk calls when existing slot is non-zero; got %v", qemuSvc.detachCalls)
+	}
+
+	path := extractPath(t, result)
+	if path != "/dev/sdd" {
+		t.Errorf("disk_hints.path: want /dev/sdd (scsi3 preserved), got %q", path)
+	}
+}
+
+// TestHandleAttachDisk_PicksLowestFreeAtOrAboveOne verifies the slot allocator
+// picks the lowest free index >= 1, skipping occupied slots.
+func TestHandleAttachDisk_PicksLowestFreeAtOrAboveOne(t *testing.T) {
+	const volid = "vm-9001-disk-0"
+	qemuSvc := &attachQEMUService{
+		attachReturnDiskID: "scsi2",
+		configCfg: map[string]interface{}{
+			"virtio0": "data:vm-100-disk-0",
+			"scsi1":   "data:other-a",
+			"scsi3":   "data:other-c",
+			"scsi2":   "data:" + volid, // post-attach resolve view
+		},
+	}
+	ag := &captureAgent{}
+	h := handlers.HandleAttachDisk(attachDeps(qemuSvc, ag))
+
+	result, err := h.Handle(context.Background(), attachArgs("100", "data:"+volid), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	path := extractPath(t, result)
+	if path != "/dev/sdc" {
+		t.Errorf("disk_hints.path: want /dev/sdc (scsi2 — lowest free >= 1), got %q", path)
+	}
 }

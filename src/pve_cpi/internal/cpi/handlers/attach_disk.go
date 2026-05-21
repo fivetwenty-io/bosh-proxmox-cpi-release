@@ -37,10 +37,11 @@ type diskHints struct {
 //
 // Logic:
 //  1. Parse vm_cid to VMID int; parse disk_cid to storage+volid components.
-//  2. Call qemu.AttachDisk — SDK resolves the next free scsi/virtio slot, sets
-//     the disk in VM config via PUT /nodes/{node}/qemu/{vmid}/config, and returns
-//     the assigned diskID (e.g., "scsi1"). If the volume is already attached the
-//     SDK detects it and returns the existing diskID (idempotent by SDK design).
+//  2. Choose a scsi slot >= 1 (never scsi0 — see chooseSCSISlotSkippingZero
+//     for rationale: BOSH agent's resolver resolves /dev/sda to /dev/vda when
+//     a virtio root disk exists, so scsi0 attachments are silently shadowed
+//     by the root disk). Call qemu.AttachDisk with the chosen DiskID; if the
+//     volume is already attached at the chosen slot, the SDK is idempotent.
 //  3. AttachDisk does not return a UPID (it is a synchronous config PUT, not an
 //     async task), so no AwaitTask is needed.
 //  4. Resolve the final diskID from the current VM config via pve.ResolveDiskID to
@@ -135,20 +136,47 @@ func HandleAttachDisk(deps Deps) Handler {
 		}
 
 		// --------------------------------------------------------------------
-		// 3. Attach disk via SDK. Bus is always "scsi" for persistent disks.
-		//    The SDK auto-selects the next free slot index when opts.DiskID is
-		//    empty. If the volid is already attached, the SDK returns the
-		//    existing diskID without modifying the config (idempotent).
+		// 3. Attach disk via SDK at scsi1 or higher (NEVER scsi0).
+		//
+		// The SDK's default slot selection picks the lowest free index — 0 for
+		// a VM with no other scsi disks. That would yield /dev/sda inside the
+		// guest, which collides with the BOSH agent's mappedDevicePathResolver:
+		//
+		//   The resolver strips the "/dev/sd" prefix and probes "/dev/xvd",
+		//   "/dev/vd", "/dev/sd" in turn (see create_vm.go agent-Disks.System
+		//   note). With a virtio0 root disk, /dev/vda exists, so the resolver
+		//   returns /dev/vda for any "/dev/sda" hint — including the persistent
+		//   disk hint. The agent then runs persistent-disk partitioning against
+		//   the root disk and fails with:
+		//
+		//     "Persistent disks with many partitions are not supported.
+		//      Expected 1, got 4."
+		//
+		// Reserving scsi0 forces persistent disks to scsi1+ (/dev/sdb+); the
+		// resolver finds no /dev/vdb, falls through to /dev/sdb, and operates
+		// on the correct disk.
+		//
+		// Bus is always "scsi" for persistent disks. PVE config disk values are
+		// canonical "<storage>:<volname>" (e.g. "data:vm-9003-disk-0"); pass the
+		// full disk_cid — a bare volname is rejected with
+		// "scsi0.file: invalid format ...".
 		// --------------------------------------------------------------------
 		const bus = "scsi"
 
-		// PVE config disk values are canonical "<storage>:<volname>"
-		// (e.g. "data:vm-9003-disk-0"). Pass the full disk_cid; a bare
-		// volname is rejected with "scsi0.file: invalid format ...".
+		desiredDiskID, prepErr := chooseSCSISlotSkippingZero(ctx, deps, node, vmid, diskCID)
+		if prepErr != nil {
+			if pve.IsNotFound(prepErr) {
+				return nil, cpierrors.VMNotFound(vmCID)
+			}
+			return nil, fmt.Errorf("attach_disk: slot selection for VM %s disk %s: %w", vmCID, diskCID, pve.WrapError(prepErr))
+		}
+
 		var diskID string
 		err = pve.RetryOnTransient(ctx, deps.Logger, "attach_disk", 0, func() error {
 			var attachErr error
-			diskID, attachErr = deps.PVE.QEMU().AttachDisk(ctx, node, vmid, diskCID, bus, nil)
+			diskID, attachErr = deps.PVE.QEMU().AttachDisk(ctx, node, vmid, diskCID, bus, &qemu.AttachOpts{
+				DiskID: desiredDiskID,
+			})
 			return attachErr
 		})
 		if err != nil {
@@ -206,4 +234,74 @@ func HandleAttachDisk(deps Deps) Handler {
 		// --------------------------------------------------------------------
 		return diskHints{Path: devicePath}, nil
 	})
+}
+
+// chooseSCSISlotSkippingZero returns the diskID the persistent disk should be
+// attached at. It guarantees scsi0 is never used so the BOSH agent's
+// mappedDevicePathResolver does not silently resolve a "/dev/sda" hint to the
+// virtio root disk (/dev/vda).
+//
+// Behavior:
+//
+//   - If volid is already present in the VM config at scsiN with N >= 1, that
+//     diskID is reused (idempotent reattach).
+//   - If volid is present at scsi0 (legacy from prior CPI versions), the
+//     attachment is removed and a fresh scsi index >= 1 is chosen. Persistent
+//     disks orphaned at scsi0 have, by construction, never been successfully
+//     partitioned by the agent (the resolver always picked /dev/vda instead),
+//     so detaching them loses no data.
+//   - Otherwise the lowest free scsi index >= 1 is returned.
+func chooseSCSISlotSkippingZero(
+	ctx context.Context,
+	deps Deps,
+	node string,
+	vmid int,
+	volid string,
+) (string, error) {
+	cfg, err := deps.PVE.QEMU().Config(ctx, node, vmid)
+	if err != nil {
+		return "", err
+	}
+
+	if existing, ok := qemu.FindDiskIDByVolID(cfg, volid); ok {
+		if existing != "scsi0" {
+			return existing, nil
+		}
+		// Legacy scsi0 attachment from a prior CPI version. Detach so the
+		// reattach below lands on scsi1+. DetachDisk also sweeps the
+		// resulting unusedN entry, leaving the config clean.
+		deps.Logger.Warn("attach_disk: migrating legacy scsi0 attachment to scsi1+",
+			log.Int("vmid", vmid),
+			log.String("volid", volid),
+		)
+		if detachErr := deps.PVE.QEMU().DetachDisk(ctx, node, vmid, "scsi0"); detachErr != nil {
+			return "", fmt.Errorf("detach legacy scsi0: %w", detachErr)
+		}
+		// Re-read config so NextFreeSCSIIndexAtLeast sees scsi0 as free.
+		cfg, err = deps.PVE.QEMU().Config(ctx, node, vmid)
+		if err != nil {
+			return "", fmt.Errorf("re-read config after scsi0 detach: %w", err)
+		}
+	}
+
+	idx := nextFreeSCSIIndexAtLeast(cfg, 1)
+	return fmt.Sprintf("scsi%d", idx), nil
+}
+
+// nextFreeSCSIIndexAtLeast returns the lowest scsi slot index >= floor that is
+// not present in cfg. Mirrors qemu.NextIndexForBus semantics but with a
+// configurable floor so the caller can reserve low-numbered slots.
+func nextFreeSCSIIndexAtLeast(cfg map[string]interface{}, floor int) int {
+	used := map[int]bool{}
+	for k := range cfg {
+		var idx int
+		if _, scanErr := fmt.Sscanf(k, "scsi%d", &idx); scanErr == nil {
+			used[idx] = true
+		}
+	}
+	for i := floor; ; i++ {
+		if !used[i] {
+			return i
+		}
+	}
 }
