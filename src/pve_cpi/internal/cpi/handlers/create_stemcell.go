@@ -19,6 +19,8 @@ import (
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
+
+	sdkclient "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/client"
 )
 
 // normalizeOSType maps common BOSH/stemcell os_type values to PVE's enumerated
@@ -520,6 +522,14 @@ func uploadStemcellImage(
 	// whole open+upload+await tuple on that signal; the body stream is
 	// reopened from imagePath each attempt so PVE always sees a fresh
 	// reader.
+	//
+	// Disable the SDK's inner HTTP retry: it replays multipart uploads by
+	// re-reading req.Body, but the body has already been drained by attempt
+	// 0. The replay sends an empty body with the original Content-Length,
+	// which Go's transport rejects ("http: ContentLength=N with Body length
+	// 0"). Our outer RetryOnTransientOrLock reopens the file each iteration
+	// so transient failures retry with a fresh stream.
+	uploadCtx := sdkclient.WithRetries(ctx, 0)
 	rerr := pve.RetryOnTransientOrLock(ctx, deps.Logger, "create_stemcell_upload", 0, func() error {
 		f, openErr := os.Open(imagePath)
 		if openErr != nil {
@@ -527,7 +537,7 @@ func uploadStemcellImage(
 		}
 		defer func() { _ = f.Close() }()
 
-		upid, uerr := deps.PVE.Storage().Upload(ctx, node, storageName, "import", filename, f)
+		upid, uerr := deps.PVE.Storage().Upload(uploadCtx, node, storageName, "import", filename, f)
 		if uerr != nil {
 			return uerr
 		}

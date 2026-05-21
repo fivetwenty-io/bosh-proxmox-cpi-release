@@ -12,6 +12,7 @@ import (
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
 	sdknodes "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/nodes"
+	sdkclient "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/client"
 )
 
 // configDriveSlot is the SCSI bus slot used to attach the ConfigDrive ISO as
@@ -203,6 +204,15 @@ func (a *ConfigDrive) uploadISO(ctx context.Context, node, localPath, filename s
 	// "can't lock file ... got timeout" on either side. Retry the whole
 	// open+upload+await tuple on that signal; the body stream is reopened
 	// each attempt so PVE always sees a fresh reader.
+	//
+	// Disable the SDK's inner HTTP retry for this request: it tries to
+	// replay a multipart upload by re-reading req.Body, but the body has
+	// already been drained by attempt 0. The replay sends an empty body
+	// while Content-Length still advertises the original size, and Go's
+	// transport rejects with "http: ContentLength=N with Body length 0".
+	// Our outer RetryOnTransientOrLock reopens the file each iteration,
+	// so transient failures are still retried with a fresh stream.
+	uploadCtx := sdkclient.WithRetries(ctx, 0)
 	return pve.RetryOnTransientOrLock(ctx, a.logger, "configdrive_upload", 0, func() error {
 		f, openErr := os.Open(localPath)
 		if openErr != nil {
@@ -210,7 +220,7 @@ func (a *ConfigDrive) uploadISO(ctx context.Context, node, localPath, filename s
 		}
 		defer f.Close()
 
-		upid, err := a.pveSvc.Storage().Upload(ctx, node, a.storage, "iso", filename, f)
+		upid, err := a.pveSvc.Storage().Upload(uploadCtx, node, a.storage, "iso", filename, f)
 		if err != nil {
 			return pve.WrapError(err)
 		}
