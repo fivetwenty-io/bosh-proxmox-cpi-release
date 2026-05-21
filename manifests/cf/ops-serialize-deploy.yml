@@ -1,18 +1,16 @@
 ---
-# Bound concurrent VM creates to a single PVE node's lock-throughput.
+# Run instance groups in parallel and let each scale to ((cf_max_in_flight))
+# concurrent create_vm calls. Sized for a PVE node configured with 12 worker
+# threads — operations complete as quickly as the storage layer allows.
 #
-# cf-deployment ships `update.serial: false` so 25+ instance groups
-# create VMs in parallel. PVE's per-storage lock serialises clones at
-# ~60s timeout each, so concurrent fan-out > a handful → cascade
-# lock-timeout failures.
-#
-# This ops file forces serial deployment across instance groups, then
-# uses ((cf_max_in_flight)) (default 4) as the within-IG parallelism cap.
-# Effective ceiling: ((cf_max_in_flight)) concurrent create_vm calls
-# globally, since serial=true means only one IG runs at a time.
+# History: this ops file previously pinned `update.serial: true` to throttle
+# concurrent VM creates against PVE's per-storage lock. With worker count
+# raised to 12 that bottleneck no longer dominates, so we revert to the
+# cf-deployment default (serial: false) and only override max_in_flight.
+
 - type: replace
   path: /update/serial
-  value: true
+  value: false
 
 - type: replace
   path: /update/max_in_flight

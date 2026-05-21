@@ -14,6 +14,9 @@ Commands:
     cloud-config       Upload the cf cloud-config.
     stemcell           Upload the stemcell pinned by cf-deployment (skips if present).
     bosh-deploy        Run only the bosh deploy step.
+    api                Point the cf CLI at https://api.<system_domain>.
+    login              cf api + cf login -u admin (password from credhub).
+    admin-password     Print /ocfp-mgmt/cf/cf_admin_password from credhub.
     help               Show this message.
 
 Extra args after the command are forwarded to the underlying bosh deploy
@@ -39,6 +42,8 @@ CF_DEPLOYMENT = Path(os.environ.get("CF_DEPLOYMENT", Path.home() / "w/cloudfound
 BOSH_DEPLOYMENT = Path(os.environ.get("BOSH_DEPLOYMENT", Path.home() / "w/cloudfoundry/bosh-deployment"))
 ENV = os.environ.get("BOSH_ENV", "pve")
 DEPLOYMENT = os.environ.get("BOSH_DEPLOYMENT_NAME", "cf")
+BOSH_VARS = REPO_ROOT / "manifests" / "bosh" / "vars.yml"
+BOSH_CREDS = REPO_ROOT / "manifests" / "bosh" / "creds.yml"
 
 
 def banner(title: str) -> None:
@@ -129,6 +134,54 @@ def cmd_bosh_deploy(extra: list[str]) -> None:
     )
 
 
+def system_domain() -> str:
+    return capture("bosh", "int", "manifests/cf/vars.yml", "--path=/system_domain")
+
+
+def credhub_env() -> dict[str, str]:
+    if not BOSH_CREDS.exists():
+        sys.exit(f"creds file missing: {BOSH_CREDS} — run 'scripts/bosh create-env' first")
+    director_ip = capture("bosh", "int", str(BOSH_VARS), "--path=/internal_ip")
+    credhub_ca = capture("bosh", "int", str(BOSH_CREDS), "--path=/credhub_tls/ca")
+    uaa_ca = capture("bosh", "int", str(BOSH_CREDS), "--path=/uaa_ssl/ca")
+    env = os.environ.copy()
+    env["CREDHUB_SERVER"] = f"https://{director_ip}:8844"
+    env["CREDHUB_CLIENT"] = "credhub-admin"
+    env["CREDHUB_SECRET"] = capture("bosh", "int", str(BOSH_CREDS), "--path=/credhub_admin_client_secret")
+    env["CREDHUB_CA_CERT"] = credhub_ca + "\n" + uaa_ca
+    return env
+
+
+def admin_password() -> str:
+    return subprocess.run(
+        ["credhub", "get", "-n", "/ocfp-mgmt/cf/cf_admin_password", "-q"],
+        check=True, capture_output=True, text=True, env=credhub_env(),
+    ).stdout.strip()
+
+
+def cmd_admin_password(_extra: list[str]) -> None:
+    print(admin_password())
+
+
+def cmd_api(_extra: list[str]) -> None:
+    banner("cf api")
+    run("cf", "api", f"https://api.{system_domain()}", "--skip-ssl-validation")
+
+
+def cmd_login(_extra: list[str]) -> None:
+    banner("cf login")
+    domain = system_domain()
+    pw = admin_password()
+    run("cf", "api", f"https://api.{domain}", "--skip-ssl-validation")
+    run(
+        "cf", "login",
+        "-a", f"https://api.{domain}",
+        "-u", "admin",
+        "-p", pw,
+        "--skip-ssl-validation",
+    )
+
+
 def cmd_deploy(extra: list[str]) -> None:
     cmd_runtime_config([])
     cmd_cloud_config([])
@@ -142,6 +195,9 @@ COMMANDS = {
     "cloud-config": cmd_cloud_config,
     "stemcell": cmd_stemcell,
     "bosh-deploy": cmd_bosh_deploy,
+    "api": cmd_api,
+    "login": cmd_login,
+    "admin-password": cmd_admin_password,
 }
 
 

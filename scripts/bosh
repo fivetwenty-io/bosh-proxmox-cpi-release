@@ -16,7 +16,6 @@ Subcommands:
     emptyvm                deploy manifests/bosh/emptyvm.yml
     credhub <args>         passthrough → credhub <args> with the director's
                            credhub URL, admin client, and CA pre-exported
-    cf-admin-password      print /ocfp-mgmt/cf/cf_admin_password
     help                   show this help
     <anything else>        passthrough → bosh -e pve <args>
 
@@ -26,7 +25,7 @@ Env (auto-exported for non-create-env subcommands when creds.yml exists):
     BOSH_CLIENT_SECRET=<creds.yml:/admin_password>
     BOSH_CA_CERT=<creds.yml:/director_ssl/ca>
 
-Credhub env (for credhub / cf-admin-password):
+Credhub env (for credhub):
     CREDHUB_SERVER=https://<internal_ip>:8844
     CREDHUB_CLIENT=credhub-admin
     CREDHUB_SECRET=<creds.yml:/credhub_admin_client_secret>
@@ -161,10 +160,6 @@ def cmd_credhub(args: list[str]) -> int:
     return run("credhub", *args, env=credhub_env())
 
 
-def cmd_cf_admin_password(args: list[str]) -> int:
-    return run("credhub", "get", "-n", "/ocfp-mgmt/cf/cf_admin_password", "-q", *args, env=credhub_env())
-
-
 def cmd_help(args: list[str]) -> int:
     print(USAGE)
     return 0
@@ -185,7 +180,6 @@ COMMANDS = {
     "runtime-config": cmd_runtime_config,
     "emptyvm": cmd_emptyvm,
     "credhub": cmd_credhub,
-    "cf-admin-password": cmd_cf_admin_password,
     "help": cmd_help,
     "-h": cmd_help,
     "--help": cmd_help,
