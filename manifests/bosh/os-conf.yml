@@ -1,0 +1,37 @@
+---
+# Ops file: install qemu-guest-agent on the BOSH director itself.
+#
+# Runtime-configs do not apply to `bosh create-env`, so the same logic from
+# manifests/runtime-configs/pve-guest-agent.yml is replicated here as an
+# inline job on the `bosh` instance group via os-conf-release's
+# pre-start-script.
+#
+# Layered by ./scripts/bosh create-env after manifests/bosh/cpi.yml.
+
+- type: replace
+  path: /releases/name=os-conf?
+  value:
+    name:    os-conf
+    version: 23.0.0
+    url:     https://bosh.io/d/github.com/cloudfoundry/os-conf-release?v=23.0.0
+    sha1:    d20772d8ce6e781ceb13cac7df5950bfa4330ba1
+
+- type: replace
+  path: /instance_groups/name=bosh/jobs/name=pre-start-script?
+  value:
+    name:    pre-start-script
+    release: os-conf
+    properties:
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+
+        if command -v qemu-ga >/dev/null 2>&1; then
+          systemctl enable --now qemu-guest-agent || true
+          exit 0
+        fi
+
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update -y
+        apt-get install -y --no-install-recommends qemu-guest-agent
+        systemctl enable --now qemu-guest-agent

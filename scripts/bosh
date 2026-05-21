@@ -48,6 +48,7 @@ VARS = BOSH_DIR / "vars.yml"
 CREDS = BOSH_DIR / "creds.yml"
 STATE = BOSH_DIR / "state.json"
 CPI_OPS = BOSH_DIR / "cpi.yml"
+OS_CONF_OPS = BOSH_DIR / "os-conf.yml"
 CLOUD_CONFIG = BOSH_DIR / "cloud-config.yml"
 EMPTYVM = BOSH_DIR / "emptyvm.yml"
 PVE_GUEST_AGENT_RC = MANIFESTS / "runtime-configs" / "pve-guest-agent.yml"
@@ -99,6 +100,7 @@ def cmd_create_env(args: list[str]) -> int:
         "-o", str(CPI_OPS),
         "-o", str(BOSH_DEPLOYMENT_DIR / "uaa.yml"),
         "-o", str(BOSH_DEPLOYMENT_DIR / "credhub.yml"),
+        "-o", str(OS_CONF_OPS),
         "-l", str(VARS),
         "-v", "director_name=ocfp-mgmt",
         f"--state={STATE}",
