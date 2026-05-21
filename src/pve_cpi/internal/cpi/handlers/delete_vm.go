@@ -75,7 +75,8 @@ func HandleDeleteVM(deps Deps) cpi.Handler {
 		}
 		if stopUPID != "" {
 			if awaitErr := pve.AwaitTaskWithLogger(ctx, deps.PVE, node, stopUPID, logger); awaitErr != nil {
-				return nil, cpierrors.Wrap(awaitErr, fmt.Sprintf("delete_vm: await stop task for VM %s", vmCID))
+				return nil, cpierrors.Wrap(pve.WrapError(awaitErr),
+					fmt.Sprintf("delete_vm: await stop task for VM %s", vmCID))
 			}
 		}
 

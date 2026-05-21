@@ -15,6 +15,17 @@ import (
 // helpers
 // ---------------------------------------------------------------------------
 
+// cpiErrIsRetriable reports whether err's chain carries a *cpierrors.Error with
+// OkToRetry()==true. Used to assert WrapError-driven retriability mapping.
+func cpiErrIsRetriable(t *testing.T, err error) bool {
+	t.Helper()
+	var e *cpierrors.Error
+	if !errors.As(err, &e) {
+		return false
+	}
+	return e.OkToRetry()
+}
+
 // makeAPIErr builds an SDK error via ParseAPIError (which sets the sentinel and
 // HTTPCode correctly) so errors.Is(err, sdkerrors.ErrNotFound) etc. work.
 func makeAPIErr(httpCode int, msg string) error {
@@ -513,5 +524,97 @@ func TestIsStorageLockTimeout_Unrelated(t *testing.T) {
 	err := errors.New("VM 131 already exists")
 	if pve.IsStorageLockTimeout(err) {
 		t.Error("unrelated message should not match")
+	}
+}
+
+func TestIsLVMCommandTimeout_RealPVEMessage(t *testing.T) {
+	err := errors.New("AwaitTask UPID:pve:00157ECF:00B4B70C:6A0E4D24:resize:112:root@pam:: poll failed: task failed: command '/sbin/lvs --separator : --noheadings --units b --unbuffered --nosuffix --options lv_size /dev/data/vm-112-disk-0' failed: got timeout")
+	if !pve.IsLVMCommandTimeout(err) {
+		t.Error("real lvs command-timeout message should match")
+	}
+	// And the broader storage-backend predicate should subsume it.
+	if !pve.IsStorageLockTimeout(err) {
+		t.Error("IsStorageLockTimeout should subsume LVM command timeouts")
+	}
+}
+
+func TestIsLVMCommandTimeout_LVCreate(t *testing.T) {
+	err := errors.New("task failed: command '/sbin/lvcreate -aly -Wy --yes --addtag pve-vm-114 --size 5G --name vm-114-disk-0 data' failed: got timeout")
+	if !pve.IsLVMCommandTimeout(err) {
+		t.Error("lvcreate command-timeout should match")
+	}
+}
+
+func TestIsLVMCommandTimeout_VGSTimeout(t *testing.T) {
+	err := errors.New("command '/sbin/vgs --separator : data' failed: got timeout")
+	if !pve.IsLVMCommandTimeout(err) {
+		t.Error("vgs command-timeout should match")
+	}
+}
+
+func TestIsLVMCommandTimeout_UnrelatedTimeout(t *testing.T) {
+	// "command X failed: got timeout" but X isn't an LVM tool — must not match.
+	err := errors.New("command '/usr/bin/curl --foo' failed: got timeout")
+	if pve.IsLVMCommandTimeout(err) {
+		t.Error("non-LVM command timeout should not match")
+	}
+}
+
+func TestIsLVMCommandTimeout_Nil(t *testing.T) {
+	if pve.IsLVMCommandTimeout(nil) {
+		t.Error("nil should not match")
+	}
+}
+
+func TestIsPmxcfsConfigMissing_RealPVEMessage(t *testing.T) {
+	err := errors.New("AwaitTask UPID:pve:001581E7:00B4C1C0:6A0E4D3F:resize:114:root@pam:: poll failed: task failed: Configuration file 'nodes/pve/qemu-server/114.conf' does not exist")
+	if !pve.IsPmxcfsConfigMissing(err) {
+		t.Error("real pmxcfs config-missing message should match")
+	}
+}
+
+func TestIsPmxcfsConfigMissing_Unrelated(t *testing.T) {
+	err := errors.New("VM 131 already exists")
+	if pve.IsPmxcfsConfigMissing(err) {
+		t.Error("unrelated message should not match")
+	}
+}
+
+func TestIsPmxcfsConfigMissing_Nil(t *testing.T) {
+	if pve.IsPmxcfsConfigMissing(nil) {
+		t.Error("nil should not match")
+	}
+}
+
+func TestWrapError_LVMCommandTimeout_IsRetriable(t *testing.T) {
+	err := errors.New("AwaitTask UPID:pve:00157ECF:00B4B70C:6A0E4D24:resize:112:root@pam:: poll failed: task failed: command '/sbin/lvs ...' failed: got timeout")
+	wrapped := pve.WrapError(err)
+	if wrapped == nil {
+		t.Fatal("WrapError returned nil")
+	}
+	if !cpiErrIsRetriable(t, wrapped) {
+		t.Errorf("LVM command timeout should map to RetriableCloudError; got %T %v", wrapped, wrapped)
+	}
+}
+
+func TestWrapError_PmxcfsConfigMissing_IsRetriable(t *testing.T) {
+	err := errors.New("AwaitTask UPID:...:resize:114:root@pam:: poll failed: task failed: Configuration file 'nodes/pve/qemu-server/114.conf' does not exist")
+	wrapped := pve.WrapError(err)
+	if wrapped == nil {
+		t.Fatal("WrapError returned nil")
+	}
+	if !cpiErrIsRetriable(t, wrapped) {
+		t.Errorf("pmxcfs config-missing should map to RetriableCloudError; got %T %v", wrapped, wrapped)
+	}
+}
+
+func TestWrapError_StorageLockTimeout_IsRetriable(t *testing.T) {
+	err := errors.New("task failed: unable to create VM 131 - can't lock file '/var/lock/pve-manager/pve-storage-data' - got timeout")
+	wrapped := pve.WrapError(err)
+	if wrapped == nil {
+		t.Fatal("WrapError returned nil")
+	}
+	if !cpiErrIsRetriable(t, wrapped) {
+		t.Errorf("storage-lock timeout should map to RetriableCloudError; got %T %v", wrapped, wrapped)
 	}
 }

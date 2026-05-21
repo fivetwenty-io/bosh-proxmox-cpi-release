@@ -56,6 +56,17 @@ func WrapError(err error) error {
 		return cpierrors.Cloud("PVE API error: %s", apiErr.Error())
 	}
 
+	// Task-level transient signals carried as plain errors (no APIError /
+	// ConnectionError shape because they originate inside a UPID task body
+	// surfaced by AwaitTask). Mark these retriable so the director re-runs
+	// the action with a fresh VMID / on a recovered storage layer.
+	if IsStorageLockTimeout(err) {
+		return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, "PVE storage backend transient: "+err.Error())
+	}
+	if IsPmxcfsConfigMissing(err) {
+		return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, "PVE pmxcfs race (config gone mid-flight): "+err.Error())
+	}
+
 	// Fallback: generic wrap as non-retriable CloudError.
 	return cpierrors.Wrap(err, "PVE error: "+err.Error())
 }
@@ -181,17 +192,24 @@ func IsTransientTransport(err error) bool {
 	return false
 }
 
-// IsStorageLockTimeout reports whether err signals that a PVE per-storage
-// lockfile (e.g. /var/lock/pve-manager/pve-storage-<name>) could not be
-// acquired before its timeout. This happens when many concurrent qmcreate
-// tasks import from the same storage and the import operation serialises
-// behind the storage lock; the loser surfaces a task error like:
+// IsStorageLockTimeout reports whether err signals a transient PVE storage-
+// backend stall. Two shapes are covered, both surfaced inside qmtask output:
 //
-//	cannot import from 'local:import/...' - can't lock file
-//	'/var/lock/pve-manager/pve-storage-data' - got timeout
+//  1. per-storage lockfile timeout — many concurrent qmcreate / qm resize
+//     tasks serialise behind /var/lock/pve-manager/pve-storage-<name>; the
+//     loser dies with
+//     "can't lock file '/var/lock/pve-manager/pve-storage-data' - got timeout".
 //
-// The condition is transient: retrying with a fresh VMID after a longer
-// backoff succeeds once the lock holder finishes its import.
+//  2. LVM tooling command timeout — `qm resize` shells out to /sbin/lvs to
+//     read the LV's current size before extending. Under heavy concurrent
+//     activity on the same VG, lvs blocks on the LVM metadata daemon and
+//     the wrapper kills it after its internal deadline, surfacing as
+//     "command '/sbin/lvs --separator ... /dev/data/vm-N-disk-0' failed:
+//     got timeout".
+//
+// Both are transient storage-backend contention and clear once the in-flight
+// holder releases — the same seconds-scale backoff is appropriate for both,
+// so they share the predicate and the retry curve.
 //
 // nil → false.
 func IsStorageLockTimeout(err error) bool {
@@ -199,5 +217,57 @@ func IsStorageLockTimeout(err error) bool {
 		return false
 	}
 	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "can't lock file") && strings.Contains(msg, "got timeout")
+	if strings.Contains(msg, "can't lock file") && strings.Contains(msg, "got timeout") {
+		return true
+	}
+	return IsLVMCommandTimeout(err)
+}
+
+// IsLVMCommandTimeout reports whether err is a task-level failure caused by
+// an LVM userspace tool (lvs, lvcreate, lvremove, lvextend, vgs) timing out
+// against the LVM metadata daemon. PVE invokes these directly during qm
+// resize / qmcreate / qmdestroy on LVM-thin storage; under concurrent VG
+// activity any one of them can stall and PVE's command wrapper kills it.
+//
+// The canonical surface is
+//
+//	task failed: command '/sbin/lvs ...' failed: got timeout
+//
+// nil → false.
+func IsLVMCommandTimeout(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	if !strings.Contains(msg, "failed: got timeout") {
+		return false
+	}
+	// Anchor on the LVM tool path to avoid colliding with unrelated
+	// "command X failed: got timeout" surfaces. /sbin/lv* and /sbin/vg*
+	// cover the LVM2 user-space binaries PVE shells out to.
+	return strings.Contains(msg, "/sbin/lv") || strings.Contains(msg, "/sbin/vg")
+}
+
+// IsPmxcfsConfigMissing reports whether err is a task-level failure caused by
+// PVE failing to read a VM's config file from /etc/pve (the pmxcfs cluster
+// filesystem). Surface text:
+//
+//	task failed: Configuration file 'nodes/<node>/qemu-server/<vmid>.conf' does not exist
+//
+// This is observed mid-deploy when a concurrent operation (rollback of a
+// sibling create, an orphan sweep, or a pmxcfs sync delay across nodes)
+// removes the conf between an earlier successful qmcreate and the very next
+// qm config / qm resize call against the same VMID. The VM may genuinely be
+// gone — retrying the same call in-process is fruitless — but classifying
+// this as retriable lets the BOSH director re-issue create_vm with a fresh
+// VMID rather than failing the entire deploy.
+//
+// nil → false.
+func IsPmxcfsConfigMissing(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "Configuration file ") &&
+		strings.Contains(msg, "does not exist")
 }

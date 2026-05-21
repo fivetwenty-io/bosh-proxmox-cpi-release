@@ -427,7 +427,13 @@ func createVM(
 			return pve.AwaitTaskWithLogger(ctx, deps.PVE, node, upid, logger)
 		})
 		if rerr != nil {
-			return nil, cpierrors.Wrap(rerr, fmt.Sprintf("create_vm: resize virtio0 vmid=%d +%dG", vmid, growGiB))
+			// Route through WrapError so task-level transients (LVM command
+			// timeouts under VG contention, pmxcfs sync races where the just-
+			// created conf is briefly absent) surface as RetriableCloudError
+			// — director re-issues create_vm with a fresh VMID instead of
+			// failing the deploy.
+			return nil, cpierrors.Wrap(pve.WrapError(rerr),
+				fmt.Sprintf("create_vm: resize virtio0 vmid=%d +%dG", vmid, growGiB))
 		}
 		logger.Info("create_vm: grew virtio0",
 			log.Int("vmid", vmid),
@@ -615,7 +621,8 @@ func createVM(
 	}
 
 	if err := pve.AwaitTaskWithLogger(ctx, deps.PVE, node, startUPID, logger); err != nil {
-		return nil, cpierrors.Wrap(err, fmt.Sprintf("create_vm: await start task vmid=%d", vmid))
+		return nil, cpierrors.Wrap(pve.WrapError(err),
+			fmt.Sprintf("create_vm: await start task vmid=%d", vmid))
 	}
 
 	logger.Info("create_vm: VM started", log.Int("vmid", vmid))
