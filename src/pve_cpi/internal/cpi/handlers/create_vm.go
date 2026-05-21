@@ -71,6 +71,16 @@ type createVMCloudProps struct {
 	Disk          int    `json:"disk"`
 	NetworkBridge string `json:"network_bridge"` // per-VM bridge override
 	NetworkModel  string `json:"network_model"`  // virtio|e1000 etc.
+	// Hotplug overrides the CPI default for this VM (config.Hotplug).
+	// Pointer-typed so the caller can distinguish "not set" (use config
+	// default) from "set to empty string" (currently treated the same:
+	// fall back to default). Use "0" to explicitly disable hotplug.
+	Hotplug *string `json:"hotplug,omitempty"`
+	// NUMA overrides the CPI default (config.NUMA). PVE requires numa=1
+	// at create time for memory hotplug to allocate DIMM slots; setting
+	// false here disables NUMA for the new VM regardless of the global
+	// default. Pointer-typed so explicit false survives JSON omission.
+	NUMA *bool `json:"numa,omitempty"`
 	// Tags is an operator-supplied map applied to the new VM's PVE tags
 	// field as sanitized "<key>--<value>" entries. The BOSH-reserved
 	// director/deployment/job triple is not known at create_vm time
@@ -262,6 +272,19 @@ func createVM(
 		memMiB = 512
 	}
 
+	// Resolve hotplug + numa with cloud_properties → config → built-in default.
+	// Memory hotplug needs both numa=1 and "memory" in hotplug at create time;
+	// operators can override per-vm_type for stemcells that misbehave on
+	// memory hot-add.
+	hotplug := deps.Config.HotplugValue()
+	if cloudProps.Hotplug != nil {
+		hotplug = *cloudProps.Hotplug
+	}
+	numaEnabled := deps.Config.NUMAValue()
+	if cloudProps.NUMA != nil {
+		numaEnabled = *cloudProps.NUMA
+	}
+
 	// Pre-compute the operator-supplied tag string. The BOSH-managed
 	// director/deployment/job triple is added later by set_vm_metadata; here
 	// we set only the custom tags so the VM has them visible in the PVE UI
@@ -299,8 +322,11 @@ func createVM(
 				"virtio0": virtio0Val,
 				"boot":    "order=virtio0",
 				"agent":   "enabled=1",
-				"hotplug": "network,disk,cpu",
+				"hotplug": hotplug,
 				"onboot":  0,
+			}
+			if numaEnabled {
+				createParams["numa"] = 1
 			}
 			if sockets > 1 {
 				createParams["sockets"] = sockets

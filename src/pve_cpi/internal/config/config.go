@@ -52,6 +52,22 @@ type CPIConfig struct {
 	VMDiskFormat string `json:"vm_disk_format,omitempty"`
 	LogLevel     string `json:"log_level,omitempty"`
 
+	// Hotplug is the PVE `hotplug` flag baked into every new VM. Comma-list of
+	// "network,disk,cpu,memory,usb,cloudinit"; "0" disables hotplug entirely.
+	// Defaults to "network,disk,cpu,memory" so memory + CPU can be resized
+	// live via qm set without rebooting the guest. Per-VM cloud_properties
+	// can override (cloud_properties.hotplug) for stemcells that misbehave
+	// on memory hot-add. Pointer-typed so an explicit empty / "0" value is
+	// preserved through ApplyDefaults.
+	Hotplug *string `json:"hotplug,omitempty"`
+
+	// NUMA controls whether new VMs are created with NUMA enabled (numa=1).
+	// PVE requires numa=1 at create time for memory hotplug to allocate DIMM
+	// slots; without it, memory hot-add silently no-ops. Defaults to true.
+	// Per-VM override via cloud_properties.numa. Pointer-typed so an explicit
+	// false survives ApplyDefaults.
+	NUMA *bool `json:"numa,omitempty"`
+
 	// VMID allocation
 	VMIDRangeStart int `json:"vmid_range_start,omitempty"`
 	// VMIDAllocAttempts is the maximum number of retries for VMID-conflict
@@ -150,6 +166,32 @@ func (c *CPIConfig) ApplyDefaults() {
 	if c.ISOStorage == "" {
 		c.ISOStorage = "local"
 	}
+	if c.Hotplug == nil {
+		s := "network,disk,cpu,memory"
+		c.Hotplug = &s
+	}
+	if c.NUMA == nil {
+		t := true
+		c.NUMA = &t
+	}
+}
+
+// HotplugValue returns the effective hotplug flag, falling back to the
+// CPI default ("network,disk,cpu,memory") when the pointer is nil.
+func (c *CPIConfig) HotplugValue() string {
+	if c.Hotplug == nil {
+		return "network,disk,cpu,memory"
+	}
+	return *c.Hotplug
+}
+
+// NUMAValue returns the effective NUMA toggle, defaulting to true (memory
+// hotplug requires numa=1 at create time) when the pointer is nil.
+func (c *CPIConfig) NUMAValue() bool {
+	if c.NUMA == nil {
+		return true
+	}
+	return *c.NUMA
 }
 
 // Validate checks all required fields and enum constraints.

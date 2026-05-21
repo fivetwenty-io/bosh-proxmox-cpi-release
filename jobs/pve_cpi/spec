@@ -64,6 +64,21 @@ properties:
   pve.log_level:
     description: "Log level"
     default: "info"
+  pve.hotplug:
+    description: |
+      PVE hotplug flags applied to every new VM. Comma-separated list of
+      "network,disk,cpu,memory,usb,cloudinit"; "0" disables hotplug entirely.
+      Defaults to "network,disk,cpu,memory" so CPU + RAM can be resized live
+      via `qm set` without rebooting. Per-VM override via
+      cloud_properties.hotplug for stemcells that misbehave on memory hot-add.
+    default: "network,disk,cpu,memory"
+  pve.numa:
+    description: |
+      Enable NUMA (numa=1) on every new VM. PVE requires this at create time
+      for memory hotplug to allocate DIMM slots; without it, memory hot-add
+      silently no-ops. Set false to disable globally; per-VM override via
+      cloud_properties.numa.
+    default: true
   pve.vmid_range_start:
     description: |
       Starting VMID for VM allocation. VMs are allocated in the range
