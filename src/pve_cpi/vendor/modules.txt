@@ -30,7 +30,7 @@ github.com/djherbis/times
 # github.com/elliotwutingfeng/asciiset v0.0.0-20260129054604-cfde2086bc57
 ## explicit; go 1.11
 github.com/elliotwutingfeng/asciiset
-# github.com/fivetwenty-io/pve-apiclient-go/v3 v3.1.6
+# github.com/fivetwenty-io/pve-apiclient-go/v3 v3.1.7
 ## explicit; go 1.25.0
 github.com/fivetwenty-io/pve-apiclient-go/v3/internal/constants
 github.com/fivetwenty-io/pve-apiclient-go/v3/internal/http

@@ -5,6 +5,7 @@ import (
 	"regexp"
 	"sort"
 	"strconv"
+	"strings"
 
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/internal/constants"
 )
@@ -28,9 +29,17 @@ func ParseDisks(cfg map[string]interface{}) map[string]string {
 }
 
 // FindDiskIDByVolID returns the diskID for a given volid if present.
+//
+// PVE stores disk values in option-string format: the volid (e.g.
+// "data:vm-9003-disk-0") is followed by comma-separated options
+// (e.g. ",size=64G,iothread=1"). A plain string equality test misses
+// these entries and leads callers to treat the disk as not attached,
+// causing duplicate attachments. Comparison here matches both the bare
+// volid and the option-string form by checking equality first, then
+// the "<volid>," prefix.
 func FindDiskIDByVolID(cfg map[string]interface{}, volid string) (string, bool) {
 	for id, v := range ParseDisks(cfg) {
-		if v == volid {
+		if v == volid || strings.HasPrefix(v, volid+",") {
 			return id, true
 		}
 	}

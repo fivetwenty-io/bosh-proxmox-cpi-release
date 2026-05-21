@@ -98,8 +98,8 @@ func FormatSnapshotCID(vmCID, snapName string) string {
 
 // ResolveDiskID finds the PVE disk slot (e.g., "scsi1", "ide0") that holds volid
 // on the specified VM. It calls QEMU().Config to retrieve the current VM config,
-// then uses the SDK's FindDiskIDByVolID to locate the slot. The volid must match
-// the raw config value exactly (e.g., "local-lvm:vm-100-disk-1").
+// then uses option-string-tolerant lookup to locate the slot: a config entry
+// "data:vm-9003-disk-0,size=64G" matches volid "data:vm-9003-disk-0".
 //
 // Returns ("", cpierrors.Cloud) when volid is not attached to the VM.
 // Returns ("", err) when the Config call fails.
@@ -119,7 +119,7 @@ func ResolveDiskID(ctx context.Context, c Client, node string, vmid int, volid s
 		return "", fmt.Errorf("ResolveDiskID: config fetch failed for VM %d on node %q: %w", vmid, node, err)
 	}
 
-	diskID, ok := qemu.FindDiskIDByVolID(cfg, volid)
+	diskID, ok := FindDiskIDByVolID(qemu.ParseDisks(cfg), volid)
 	if !ok {
 		return "", cpierrors.Cloud("disk %q not attached to VM %d on node %q", volid, vmid, node)
 	}
@@ -206,6 +206,22 @@ func DiskOptStrContainsVolid(disks map[string]string, volid string) bool {
 		}
 	}
 	return false
+}
+
+// FindDiskIDByVolID returns the diskID (e.g. "scsi1") for the given volid by
+// scanning a parsed disks map. Comparison tolerates PVE's option-string format:
+// a config value of "data:vm-9003-disk-0,size=64G" matches volid
+// "data:vm-9003-disk-0". The SDK's qemu.FindDiskIDByVolID does exact string
+// match and silently misses these entries, causing the caller to treat the
+// disk as not attached and re-attach it at a fresh slot — a duplicate that
+// surfaces as "disk found on N VMs" at the next set_disk_metadata.
+func FindDiskIDByVolID(disks map[string]string, volid string) (string, bool) {
+	for id, v := range disks {
+		if v == volid || strings.HasPrefix(v, volid+",") {
+			return id, true
+		}
+	}
+	return "", false
 }
 
 // FindVMNodeViaCluster returns the PVE node hosting vmid by querying

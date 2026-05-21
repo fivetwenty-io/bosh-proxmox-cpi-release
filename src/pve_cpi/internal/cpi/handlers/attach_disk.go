@@ -288,7 +288,7 @@ func chooseSCSISlotSkippingZero(
 		return "", err
 	}
 
-	if existing, ok := qemu.FindDiskIDByVolID(cfg, volid); ok {
+	if existing, ok := pve.FindDiskIDByVolID(qemu.ParseDisks(cfg), volid); ok {
 		if existing != "scsi0" {
 			return existing, nil
 		}
