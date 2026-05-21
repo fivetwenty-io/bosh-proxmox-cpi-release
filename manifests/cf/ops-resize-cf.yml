@@ -1,0 +1,54 @@
+---
+# Lab-tuned vm_type overrides for cf-deployment instance groups whose
+# default `small` / `minimal` allocations OOM or run hot under modest
+# load on this single-node PVE cluster.
+#
+# All target vm_types are declared in cloud-config.yml.
+#
+#   api          2c / 4 GiB     medium
+#   cc-worker    2c / 4 GiB     small-highmem
+#   database     2c / 4 GiB     medium                          (CC+UAA+diego SQL)
+#   diego-cell   4c / 16 GiB    large-100GB-ephemeral-disk      (incl. 100 GB ephemeral)
+#   doppler      1c / 2 GiB     small
+#   haproxy      1c / 2 GiB     small
+#   router       1c / 2 GiB     small
+#   scheduler    1c / 2 GiB     small
+#   uaa          2c / 4 GiB     small-highmem
+#
+# Apply alongside ops-serialize-deploy.yml on every deploy.
+
+- type: replace
+  path: /instance_groups/name=api/vm_type
+  value: medium
+
+- type: replace
+  path: /instance_groups/name=cc-worker/vm_type
+  value: small-highmem
+
+- type: replace
+  path: /instance_groups/name=database/vm_type
+  value: medium
+
+- type: replace
+  path: /instance_groups/name=diego-cell/vm_type
+  value: large-100GB-ephemeral-disk
+
+- type: replace
+  path: /instance_groups/name=doppler/vm_type
+  value: small
+
+- type: replace
+  path: /instance_groups/name=haproxy/vm_type
+  value: small
+
+- type: replace
+  path: /instance_groups/name=router/vm_type
+  value: small
+
+- type: replace
+  path: /instance_groups/name=scheduler/vm_type
+  value: small
+
+- type: replace
+  path: /instance_groups/name=uaa/vm_type
+  value: small-highmem

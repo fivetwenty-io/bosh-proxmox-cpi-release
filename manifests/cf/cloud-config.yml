@@ -58,6 +58,13 @@ vm_types:
     disk: 32768
     network_bridge: ((pve_network_bridge))
 
+- name: large-100GB-ephemeral-disk
+  cloud_properties:
+    cores: 4
+    memory: 16384
+    disk: 102400
+    network_bridge: ((pve_network_bridge))
+
 disk_types:
 - name: 5GB
   disk_size: 5120

@@ -73,6 +73,13 @@ def cmd_runtime_config(_extra: list[str]) -> None:
         "--name", "dns",
     )
 
+    banner("PVE guest-agent runtime-config")
+    run(
+        "bosh", "-e", ENV, "-n", "update-runtime-config",
+        "manifests/runtime-configs/pve-guest-agent.yml",
+        "--name", "pve-guest-agent",
+    )
+
 
 def cmd_cloud_config(_extra: list[str]) -> None:
     banner("Cloud-config")
@@ -115,6 +122,7 @@ def cmd_bosh_deploy(extra: list[str]) -> None:
         "-o", str(CF_DEPLOYMENT / "operations/use-compiled-releases.yml"),
         "-o", str(CF_DEPLOYMENT / "operations/use-haproxy.yml"),
         "-o", "manifests/cf/ops-serialize-deploy.yml",
+        "-o", "manifests/cf/ops-resize-cf.yml",
         "-l", "manifests/bosh/vars.yml",
         "-l", "manifests/cf/vars.yml",
         *extra,

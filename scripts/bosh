@@ -11,7 +11,12 @@ Subcommands:
     env                    bosh env (against pve)
     ucc | upload-cloud-config
                            upload manifests/bosh/cloud-config.yml
+    runtime-config         upload manifests/runtime-configs/pve-guest-agent.yml
+                           (named runtime-config "pve-guest-agent")
     emptyvm                deploy manifests/bosh/emptyvm.yml
+    credhub <args>         passthrough → credhub <args> with the director's
+                           credhub URL, admin client, and CA pre-exported
+    cf-admin-password      print /ocfp-mgmt/cf/cf_admin_password
     help                   show this help
     <anything else>        passthrough → bosh -e pve <args>
 
@@ -20,6 +25,12 @@ Env (auto-exported for non-create-env subcommands when creds.yml exists):
     BOSH_CLIENT=admin
     BOSH_CLIENT_SECRET=<creds.yml:/admin_password>
     BOSH_CA_CERT=<creds.yml:/director_ssl/ca>
+
+Credhub env (for credhub / cf-admin-password):
+    CREDHUB_SERVER=https://<internal_ip>:8844
+    CREDHUB_CLIENT=credhub-admin
+    CREDHUB_SECRET=<creds.yml:/credhub_admin_client_secret>
+    CREDHUB_CA_CERT=<creds.yml:/credhub_tls/ca + /uaa_ssl/ca>
 """
 
 from __future__ import annotations
@@ -39,6 +50,7 @@ STATE = BOSH_DIR / "state.json"
 CPI_OPS = BOSH_DIR / "cpi.yml"
 CLOUD_CONFIG = BOSH_DIR / "cloud-config.yml"
 EMPTYVM = BOSH_DIR / "emptyvm.yml"
+PVE_GUEST_AGENT_RC = MANIFESTS / "runtime-configs" / "pve-guest-agent.yml"
 
 USAGE = __doc__ or ""
 
@@ -62,6 +74,20 @@ def director_env() -> dict[str, str]:
     env["BOSH_CLIENT"] = "admin"
     env["BOSH_CLIENT_SECRET"] = bosh_int(CREDS, "/admin_password")
     env["BOSH_CA_CERT"] = bosh_int(CREDS, "/director_ssl/ca")
+    return env
+
+
+def credhub_env() -> dict[str, str]:
+    if not CREDS.exists():
+        sys.exit(f"creds file missing: {CREDS} — run 'scripts/bosh create-env' first")
+    director_ip = bosh_int(VARS, "/internal_ip")
+    credhub_ca = bosh_int(CREDS, "/credhub_tls/ca")
+    uaa_ca = bosh_int(CREDS, "/uaa_ssl/ca")
+    env = os.environ.copy()
+    env["CREDHUB_SERVER"] = f"https://{director_ip}:8844"
+    env["CREDHUB_CLIENT"] = "credhub-admin"
+    env["CREDHUB_SECRET"] = bosh_int(CREDS, "/credhub_admin_client_secret")
+    env["CREDHUB_CA_CERT"] = credhub_ca + "\n" + uaa_ca
     return env
 
 
@@ -109,6 +135,16 @@ def cmd_ucc(args: list[str]) -> int:
     )
 
 
+def cmd_runtime_config(args: list[str]) -> int:
+    return run(
+        "bosh", "-e", "pve", "-n", "update-runtime-config",
+        str(PVE_GUEST_AGENT_RC),
+        "--name", "pve-guest-agent",
+        *args,
+        env=director_env(),
+    )
+
+
 def cmd_emptyvm(args: list[str]) -> int:
     return run(
         "bosh", "-e", "pve", "-n", "-d", "emptyvm", "deploy",
@@ -117,6 +153,14 @@ def cmd_emptyvm(args: list[str]) -> int:
         *args,
         env=director_env(),
     )
+
+
+def cmd_credhub(args: list[str]) -> int:
+    return run("credhub", *args, env=credhub_env())
+
+
+def cmd_cf_admin_password(args: list[str]) -> int:
+    return run("credhub", "get", "-n", "/ocfp-mgmt/cf/cf_admin_password", "-q", *args, env=credhub_env())
 
 
 def cmd_help(args: list[str]) -> int:
@@ -136,7 +180,10 @@ COMMANDS = {
     "env": cmd_env,
     "ucc": cmd_ucc,
     "upload-cloud-config": cmd_ucc,
+    "runtime-config": cmd_runtime_config,
     "emptyvm": cmd_emptyvm,
+    "credhub": cmd_credhub,
+    "cf-admin-password": cmd_cf_admin_password,
     "help": cmd_help,
     "-h": cmd_help,
     "--help": cmd_help,

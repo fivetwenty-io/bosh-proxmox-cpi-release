@@ -1,0 +1,44 @@
+---
+# Runtime-config addon: install + enable the QEMU guest agent on every BOSH
+# VM the director deploys. PVE polls the QGA socket (`agent: enabled=1` is
+# set by the CPI at VM create time in create_vm.go) so IP discovery, freeze-
+# fs snapshots, and `qm guest cmd` only work once the in-guest daemon is
+# running.
+#
+# Upload with:
+#   ./scripts/bosh runtime-config
+#
+# Stemcell (bosh-openstack-kvm-ubuntu-noble) does NOT ship qemu-guest-agent;
+# the pre-start script installs it on first boot and is a no-op thereafter.
+# Air-gapped sites must pre-bake the package or mirror it on a reachable
+# apt repo.
+
+releases:
+- name:    os-conf
+  version: 23.0.0
+  url:     https://bosh.io/d/github.com/cloudfoundry/os-conf-release?v=23.0.0
+  sha1:    d20772d8ce6e781ceb13cac7df5950bfa4330ba1
+
+addons:
+- name: pve-guest-agent
+  jobs:
+  - name:    pre-start-script
+    release: os-conf
+    properties:
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+
+        if command -v qemu-ga >/dev/null 2>&1; then
+          systemctl enable --now qemu-guest-agent || true
+          exit 0
+        fi
+
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update -y
+        apt-get install -y --no-install-recommends qemu-guest-agent
+        systemctl enable --now qemu-guest-agent
+  include:
+    stemcell:
+    - os: ubuntu-jammy
+    - os: ubuntu-noble
