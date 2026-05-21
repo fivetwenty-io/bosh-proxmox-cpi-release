@@ -181,6 +181,13 @@ func createVM(
 		return nil, cpierrors.Cloud("create_vm: parse env: %s", err.Error())
 	}
 
+	// Initial VM name derived from env.bosh.{group,groups} so the PVE UI shows
+	// the BOSH instance-group name immediately on come-online, instead of the
+	// placeholder "vm-<vmid>". set_vm_metadata later refines this to
+	// "<job>-<index>" once BOSH knows the instance index (the index is not
+	// part of the create_vm env per the v2 CPI spec).
+	initialJobName := sanitizeVMName(extractJobNameFromEnv(env))
+
 	// -----------------------------------------------------------------------
 	// 2. Resolve node from cloud_properties or config default
 	// -----------------------------------------------------------------------
@@ -277,7 +284,10 @@ func createVM(
 		func(candidate int) error {
 			virtio0Val := fmt.Sprintf("%s:0,import-from=%s,format=%s,size=%dG",
 				vmStorage, stemcellCID, vmDiskFormat, rootDiskGiB)
-			candidateName := fmt.Sprintf("vm-%d", candidate)
+			candidateName := initialJobName
+			if candidateName == "" {
+				candidateName = fmt.Sprintf("vm-%d", candidate)
+			}
 
 			createParams := map[string]interface{}{
 				"vmid":    candidate,
@@ -379,7 +389,10 @@ func createVM(
 	}
 	_ = createUPID
 
-	vmName := fmt.Sprintf("vm-%d", vmid)
+	vmName := initialJobName
+	if vmName == "" {
+		vmName = fmt.Sprintf("vm-%d", vmid)
+	}
 
 	// Arm rollback for stages 4b–8: any failure after this point destroys
 	// the winning VM.
@@ -776,6 +789,46 @@ func buildAgentNetworks(networks map[string]createVMNetworkSpec) map[string]agen
 		}
 	}
 	return out
+}
+
+// --------------------------------------------------------------------------
+// extractJobNameFromEnv returns the BOSH instance-group (job) name from the
+// create_vm env, or "" if it cannot be derived.
+//
+// env["bosh"]["group"] is "<director>-<deployment>-<job>" and
+// env["bosh"]["groups"] is an array containing all combinations of those
+// three (including each one standalone). The bare job name is the shortest
+// element G for which group has suffix "-G" (or group == G). Using the
+// shortest such suffix avoids confusing "<deployment>-<job>" with "<job>"
+// when the job name itself contains hyphens (e.g. "diego-api").
+//
+// Returns the raw job name; the caller must run sanitizeVMName before
+// handing it to PVE.
+// --------------------------------------------------------------------------
+func extractJobNameFromEnv(env map[string]any) string {
+	boshRaw, ok := env["bosh"].(map[string]any)
+	if !ok {
+		return ""
+	}
+	group, _ := boshRaw["group"].(string)
+	groupsRaw, _ := boshRaw["groups"].([]any)
+	if group == "" || len(groupsRaw) == 0 {
+		return ""
+	}
+	var best string
+	for _, g := range groupsRaw {
+		s, ok := g.(string)
+		if !ok || s == "" || s == group {
+			continue
+		}
+		if !strings.HasSuffix(group, "-"+s) {
+			continue
+		}
+		if best == "" || len(s) < len(best) {
+			best = s
+		}
+	}
+	return best
 }
 
 // --------------------------------------------------------------------------
