@@ -319,6 +319,125 @@ func TestHandleSetVMMetadata_ReplacesStaleBoshTags(t *testing.T) {
 	}
 }
 
+// TestHandleSetVMMetadata_EmitsNameTag verifies the BOSH instance name
+// "<job>/<id>" is emitted as a "<job>--<id>" tag (PVE tags reject "/", so
+// the slash is rewritten to the "--" separator used elsewhere in tags).
+func TestHandleSetVMMetadata_EmitsNameTag(t *testing.T) {
+	t.Parallel()
+
+	metadata := map[string]any{
+		"director":   "bosh",
+		"deployment": "cf",
+		"job":        "diego-cell",
+		"id":         "2844c990-aef3-4de7-8bf3-d936fc2201be",
+		"name":       "diego-cell/2844c990-aef3-4de7-8bf3-d936fc2201be",
+	}
+
+	var gotTags string
+	nodesSvc := &mockNodesService{
+		updateQemuConfigFn: func(_ context.Context, _, _ string, params *nodes.UpdateQemuConfigParams) error {
+			if params.Tags != nil {
+				gotTags = *params.Tags
+			}
+			return nil
+		},
+	}
+
+	h := handlers.HandleSetVMMetadata(testDeps(nil, nodesSvc, nil, &mockAgentService{}))
+	_, err := h.Handle(context.Background(), marshalArgs("101", metadata), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	want := "diego-cell--2844c990-aef3-4de7-8bf3-d936fc2201be"
+	if !strings.Contains(gotTags, want) {
+		t.Errorf("expected name tag %q in tags; got: %q", want, gotTags)
+	}
+
+	// Exact entry match — splitting on ";" should yield the literal string.
+	found := false
+	for _, p := range strings.Split(gotTags, ";") {
+		if p == want {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("name tag %q not present as a standalone entry; got: %q", want, gotTags)
+	}
+}
+
+// TestHandleSetVMMetadata_NameTagSanitizesInvalidBytes verifies that any
+// non-[A-Za-z0-9-] byte in the BOSH name (other than the "/" between job
+// and id, which is rewritten to "--") is replaced with "-".
+func TestHandleSetVMMetadata_NameTagSanitizesInvalidBytes(t *testing.T) {
+	t.Parallel()
+
+	// Underscore is invalid in PVE tag values → must become "-".
+	metadata := map[string]any{
+		"name": "diego_cell/abc_123",
+	}
+
+	var gotTags string
+	nodesSvc := &mockNodesService{
+		updateQemuConfigFn: func(_ context.Context, _, _ string, params *nodes.UpdateQemuConfigParams) error {
+			if params.Tags != nil {
+				gotTags = *params.Tags
+			}
+			return nil
+		},
+	}
+
+	h := handlers.HandleSetVMMetadata(testDeps(nil, nodesSvc, nil, &mockAgentService{}))
+	_, err := h.Handle(context.Background(), marshalArgs("101", metadata), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	want := "diego-cell--abc-123"
+	if !strings.Contains(gotTags, want) {
+		t.Errorf("expected sanitized name tag %q; got: %q", want, gotTags)
+	}
+	if strings.ContainsRune(gotTags, '/') {
+		t.Errorf("tags must not contain '/'; got: %q", gotTags)
+	}
+}
+
+// TestHandleSetVMMetadata_NameTagMissingOmitted verifies that omitting the
+// "name" key from metadata simply skips the name tag (no empty entry, no error).
+func TestHandleSetVMMetadata_NameTagMissingOmitted(t *testing.T) {
+	t.Parallel()
+
+	metadata := map[string]any{
+		"director":   "bosh",
+		"deployment": "cf",
+		"job":        "diego-cell",
+		// no "name" key
+	}
+
+	var gotTags string
+	nodesSvc := &mockNodesService{
+		updateQemuConfigFn: func(_ context.Context, _, _ string, params *nodes.UpdateQemuConfigParams) error {
+			if params.Tags != nil {
+				gotTags = *params.Tags
+			}
+			return nil
+		},
+	}
+
+	h := handlers.HandleSetVMMetadata(testDeps(nil, nodesSvc, nil, &mockAgentService{}))
+	_, err := h.Handle(context.Background(), marshalArgs("101", metadata), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	for _, p := range strings.Split(gotTags, ";") {
+		if p == "" {
+			t.Errorf("empty tag entry in: %q", gotTags)
+		}
+	}
+}
+
 // TestHandleSetVMMetadata_DescriptionSorted verifies description lines are sorted by key.
 func TestHandleSetVMMetadata_DescriptionSorted(t *testing.T) {
 	t.Parallel()

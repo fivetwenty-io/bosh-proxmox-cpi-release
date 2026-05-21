@@ -37,8 +37,9 @@ const maxTagLength = 255
 //  2. Decode metadata map.
 //  3. Build description string: sorted "key: value\n" lines (matches Perl reference).
 //  4. Build tags string: extract director, deployment, job; emit as "<key>--<value>"
-//     entries (PVE tags allow only alphanumerics and "-"); join with ";"; truncate
-//     to 50 chars at a tag boundary.
+//     entries (PVE tags allow only alphanumerics and "-"). Also extract the BOSH
+//     instance name ("<job>/<id>") and emit "<job>--<id>" (PVE tags reject "/").
+//     Join with ";"; truncate to maxTagLength bytes at a tag boundary.
 //  5. Call nodes.UpdateQemuConfig with description + tags. Overwrites existing values.
 //  6. 404 → return VMNotFound.
 //
@@ -153,10 +154,19 @@ func buildDescription(metadata map[string]any) string {
 	return sb.String()
 }
 
-// buildBoshManagedTags extracts director, deployment, and job from metadata
-// and returns sanitized "<key>--<value>" entries. PVE tag values accept only
-// [A-Za-z0-9-]; any other byte in the value is replaced with "-". Keys whose
-// metadata value is missing, nil, or sanitizes to empty are skipped.
+// buildBoshManagedTags extracts director, deployment, job, and name from
+// metadata and returns sanitized tag entries.
+//
+// For director/deployment/job the form is "<key>--<value>". PVE tag values
+// accept only [A-Za-z0-9-]; any other byte in the value is replaced with "-".
+//
+// For the BOSH instance name (e.g. "diego-cell/2844c990-aef3-4de7-8bf3-..."),
+// the "/" between job and id is rewritten to "--" so the tag round-trips as
+// "<job>--<id>" (PVE tags reject "/"). The job/id pair is stable per VM CID,
+// so re-running set_vm_metadata produces the same tag and mergeTagList dedups
+// rather than accumulating.
+//
+// Keys whose metadata value is missing, nil, or sanitizes to empty are skipped.
 func buildBoshManagedTags(metadata map[string]any) []string {
 	var parts []string
 	for _, key := range []string{"director", "deployment", "job"} {
@@ -169,6 +179,12 @@ func buildBoshManagedTags(metadata map[string]any) []string {
 			continue
 		}
 		parts = append(parts, key+"--"+s)
+	}
+	if v, ok := metadata["name"]; ok && v != nil {
+		raw := strings.ReplaceAll(fmt.Sprintf("%v", v), "/", "--")
+		if s := sanitizeTagValue(raw); s != "" {
+			parts = append(parts, s)
+		}
 	}
 	return parts
 }
