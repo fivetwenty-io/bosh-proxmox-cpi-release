@@ -373,10 +373,13 @@ func TestHandleAttachDisk_ResolveFallback(t *testing.T) {
 		t.Fatalf("unexpected error in fallback path: %v", err)
 	}
 
-	// scsi3 → index 3 → 'a'+3 = 'd' → /dev/sdd
+	// Both the Resolve and the path-derivation Config calls fail, so we end
+	// up on the GuessDevicePath fallback: scsi3 → /dev/sdd (slot-based).
+	// In real usage this is the correct value only when scsi0 is also
+	// attached, but it is the safest degraded-mode output we can produce.
 	path := extractPath(t, result)
 	if path != "/dev/sdd" {
-		t.Errorf("disk_hints.path: want /dev/sdd (fallback from scsi3), got %q", path)
+		t.Errorf("disk_hints.path: want /dev/sdd (GuessDevicePath fallback for scsi3), got %q", path)
 	}
 }
 
@@ -438,8 +441,8 @@ func TestHandleAttachDisk_FreshVMSkipsSCSI0(t *testing.T) {
 	}
 
 	path := extractPath(t, result)
-	if path != "/dev/sdb" {
-		t.Errorf("disk_hints.path: want /dev/sdb (scsi1, never sda/scsi0), got %q", path)
+	if path != "/dev/sda" {
+		t.Errorf("disk_hints.path: want /dev/sda (scsi1, sole scsi disk, rank 0), got %q", path)
 	}
 }
 
@@ -474,8 +477,8 @@ func TestHandleAttachDisk_LegacySCSI0Migration(t *testing.T) {
 	}
 
 	path := extractPath(t, result)
-	if path != "/dev/sdb" {
-		t.Errorf("disk_hints.path: want /dev/sdb (post-migration), got %q", path)
+	if path != "/dev/sda" {
+		t.Errorf("disk_hints.path: want /dev/sda (post-migration, sole scsi disk), got %q", path)
 	}
 }
 
@@ -506,8 +509,9 @@ func TestHandleAttachDisk_PreservesExistingNonZeroSlot(t *testing.T) {
 	}
 
 	path := extractPath(t, result)
-	if path != "/dev/sdd" {
-		t.Errorf("disk_hints.path: want /dev/sdd (scsi3 preserved), got %q", path)
+	// Config has two scsi disks (scsi1, scsi3); diskCID at scsi3 → rank 1 → /dev/sdb.
+	if path != "/dev/sdb" {
+		t.Errorf("disk_hints.path: want /dev/sdb (scsi3 preserved, rank 1 of [scsi1, scsi3]), got %q", path)
 	}
 }
 
@@ -533,7 +537,8 @@ func TestHandleAttachDisk_PicksLowestFreeAtOrAboveOne(t *testing.T) {
 	}
 
 	path := extractPath(t, result)
-	if path != "/dev/sdc" {
-		t.Errorf("disk_hints.path: want /dev/sdc (scsi2 — lowest free >= 1), got %q", path)
+	// Config has three scsi disks (scsi1, scsi2, scsi3); diskCID at scsi2 → rank 1 → /dev/sdb.
+	if path != "/dev/sdb" {
+		t.Errorf("disk_hints.path: want /dev/sdb (scsi2 — rank 1 of [scsi1, scsi2, scsi3]), got %q", path)
 	}
 }
