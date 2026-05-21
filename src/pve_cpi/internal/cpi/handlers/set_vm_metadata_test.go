@@ -469,6 +469,104 @@ func TestHandleSetVMMetadata_SetsVMName(t *testing.T) {
 	}
 }
 
+// TestHandleSetVMMetadata_VMNameFromJobIndex verifies the primary VM name
+// derivation: "<job>-<index>" so the PVE UI shows "diego-cell-0" rather
+// than the UUID-bearing "<job>-<id>" form. The UUID name metadata is only
+// a fallback.
+func TestHandleSetVMMetadata_VMNameFromJobIndex(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		desc string
+		md   map[string]any
+		want string
+	}{
+		{
+			desc: "diego-cell job with numeric index",
+			md: map[string]any{
+				"job":   "diego-cell",
+				"index": 0,
+				"name":  "diego-cell/2844c990-aef3-4de7-8bf3-d936fc2201be",
+			},
+			want: "diego-cell-0",
+		},
+		{
+			desc: "bosh job with string index",
+			md: map[string]any{
+				"job":   "bosh",
+				"index": "0",
+				"name":  "bosh/abcd1234",
+			},
+			want: "bosh-0",
+		},
+		{
+			desc: "job with underscores sanitized",
+			md: map[string]any{
+				"job":   "diego_cell",
+				"index": 2,
+			},
+			want: "diego-cell-2",
+		},
+	}
+
+	for _, c := range cases {
+		c := c
+		t.Run(c.desc, func(t *testing.T) {
+			t.Parallel()
+			var gotName *string
+			nodesSvc := &mockNodesService{
+				updateQemuConfigFn: func(_ context.Context, _, _ string, params *nodes.UpdateQemuConfigParams) error {
+					gotName = params.Name
+					return nil
+				},
+			}
+			h := handlers.HandleSetVMMetadata(testDeps(nil, nodesSvc, nil, &mockAgentService{}))
+			_, err := h.Handle(context.Background(), marshalArgs("101", c.md), jsonrpc.Context{})
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if gotName == nil {
+				t.Fatalf("expected Name=%q, got nil", c.want)
+			}
+			if *gotName != c.want {
+				t.Errorf("Name = %q, want %q", *gotName, c.want)
+			}
+		})
+	}
+}
+
+// TestHandleSetVMMetadata_VMNameFallsBackToName verifies that when job or
+// index is missing, the handler falls back to sanitizing metadata["name"]
+// ("<job>/<id>") so existing deployments don't regress.
+func TestHandleSetVMMetadata_VMNameFallsBackToName(t *testing.T) {
+	t.Parallel()
+
+	var gotName *string
+	nodesSvc := &mockNodesService{
+		updateQemuConfigFn: func(_ context.Context, _, _ string, params *nodes.UpdateQemuConfigParams) error {
+			gotName = params.Name
+			return nil
+		},
+	}
+
+	h := handlers.HandleSetVMMetadata(testDeps(nil, nodesSvc, nil, &mockAgentService{}))
+	// job present, index absent → fall back to name.
+	_, err := h.Handle(context.Background(), marshalArgs("101", map[string]any{
+		"job":  "diego-cell",
+		"name": "diego-cell/2844c990-aef3-4de7-8bf3-d936fc2201be",
+	}), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if gotName == nil {
+		t.Fatal("expected fallback Name, got nil")
+	}
+	want := "diego-cell-2844c990-aef3-4de7-8bf3-d936fc2201be"
+	if *gotName != want {
+		t.Errorf("Name = %q, want %q", *gotName, want)
+	}
+}
+
 // TestHandleSetVMMetadata_LeavesVMNameUnchangedWhenAbsent verifies that
 // when metadata has no "name" key the Name pointer is nil — preserving the
 // existing PVE name instead of clobbering it with an empty string.

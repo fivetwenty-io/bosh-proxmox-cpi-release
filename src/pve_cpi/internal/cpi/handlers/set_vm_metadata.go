@@ -40,9 +40,11 @@ const maxTagLength = 255
 //     entries (PVE tags allow only alphanumerics and "-"). Also extract the BOSH
 //     instance name ("<job>/<id>") and emit "<job>--<id>" (PVE tags reject "/").
 //     Join with ";"; truncate to maxTagLength bytes at a tag boundary.
-//  4a. Derive a DNS-label VM name from metadata["name"] ("<job>/<id>" →
-//     "<job>-<id>") so the PVE UI shows the BOSH instance identifier instead
-//     of the placeholder "vm-<vmid>" written at create_vm time.
+//  4a. Derive a DNS-label VM name as "<job>-<index>" (e.g. "diego-cell-0",
+//     "bosh-0") so the PVE UI shows the human-readable BOSH instance
+//     identifier instead of the placeholder "vm-<vmid>" written at create_vm
+//     time. The UUID-bearing metadata["name"] ("<job>/<id>") is used only as
+//     a fallback when job or index is missing.
 //  5. Call nodes.UpdateQemuConfig with description + tags. Overwrites existing values.
 //  6. 404 → return VMNotFound.
 //
@@ -113,16 +115,17 @@ func HandleSetVMMetadata(deps Deps) cpi.Handler {
 		boshEntries := buildBoshManagedTags(metadata)
 		tags := mergeTagList(preserved, boshEntries, maxTagLength)
 
-		// --- derive PVE VM name from BOSH instance name ---
-		// BOSH supplies metadata["name"] = "<job>/<id>" (e.g. "diego-cell/2844c990-...").
-		// PVE's name field is a DNS label (alnum + "-", ≤ 63 bytes), so the
-		// "/" and any other invalid bytes are rewritten to "-". When the BOSH
-		// name is absent the existing PVE name is left untouched.
+		// --- derive PVE VM name from job + index ---
+		// PVE's name field is a DNS label (alnum + "-", ≤ 63 bytes), so we
+		// build it from BOSH's job and index metadata ("diego-cell" + 0 →
+		// "diego-cell-0", "bosh" + 0 → "bosh-0"). This matches what BOSH and
+		// operators see in `bosh vms` output rather than the UUID-bearing
+		// instance name. When job or index is absent we fall back to the
+		// full BOSH instance name ("<job>/<id>"); when both are absent the
+		// existing PVE name is left untouched.
 		var vmName *string
-		if v, ok := metadata["name"]; ok && v != nil {
-			if s := sanitizeVMName(fmt.Sprintf("%v", v)); s != "" {
-				vmName = &s
-			}
+		if s := buildVMName(metadata); s != "" {
+			vmName = &s
 		}
 
 		logger.Debug("set_vm_metadata: updating VM config",
@@ -147,6 +150,30 @@ func HandleSetVMMetadata(deps Deps) cpi.Handler {
 		logger.Info("set_vm_metadata: VM metadata updated")
 		return nil, nil
 	})
+}
+
+// buildVMName derives the PVE VM name from BOSH metadata. Prefers
+// "<job>-<index>" so the PVE UI shows the human-readable instance
+// identifier ("diego-cell-0", "bosh-0"). Falls back to the full BOSH
+// instance name (metadata["name"], "<job>/<id>") sanitized as a DNS label
+// when job or index is absent. Returns "" when neither source yields a
+// non-empty label, signalling the caller to leave the existing PVE name
+// untouched.
+func buildVMName(metadata map[string]any) string {
+	job, jobOK := metadata["job"]
+	idx, idxOK := metadata["index"]
+	if jobOK && job != nil && idxOK && idx != nil {
+		raw := fmt.Sprintf("%v-%v", job, idx)
+		if s := sanitizeVMName(raw); s != "" {
+			return s
+		}
+	}
+	if v, ok := metadata["name"]; ok && v != nil {
+		if s := sanitizeVMName(fmt.Sprintf("%v", v)); s != "" {
+			return s
+		}
+	}
+	return ""
 }
 
 // derefStr returns the pointed-to string, or "" if the pointer is nil. Used
