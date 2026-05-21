@@ -151,3 +151,49 @@ func hasReservedBoshPrefix(entry string) bool {
 	}
 	return false
 }
+
+// maxPVEVMNameLength is the maximum byte length accepted by PVE for a VM's
+// "name" config field. The PVE schema documents the field as a DNS name
+// (RFC 1035 single label), which caps total length at 63 octets.
+const maxPVEVMNameLength = 63
+
+// sanitizeVMName converts a BOSH instance name (e.g. "diego-cell/2844c990-...")
+// into a PVE-compatible VM name. PVE's name field is a DNS label
+// ([A-Za-z0-9-], must start/end with alphanumeric, ≤ 63 bytes). Every byte
+// outside [A-Za-z0-9] is rewritten to "-", consecutive dashes are collapsed,
+// and leading/trailing dashes are trimmed. If the result would exceed 63
+// bytes it is truncated to 63 and re-trimmed. Returns "" if the input
+// collapses to an empty/invalid label.
+func sanitizeVMName(s string) string {
+	if s == "" {
+		return ""
+	}
+	b := make([]byte, 0, len(s))
+	prevDash := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		isAlnum := (c >= 'a' && c <= 'z') ||
+			(c >= 'A' && c <= 'Z') ||
+			(c >= '0' && c <= '9')
+		switch {
+		case isAlnum:
+			b = append(b, c)
+			prevDash = false
+		case c == '-':
+			if !prevDash {
+				b = append(b, '-')
+				prevDash = true
+			}
+		default:
+			if !prevDash {
+				b = append(b, '-')
+				prevDash = true
+			}
+		}
+	}
+	out := strings.Trim(string(b), "-")
+	if len(out) > maxPVEVMNameLength {
+		out = strings.TrimRight(out[:maxPVEVMNameLength], "-")
+	}
+	return out
+}

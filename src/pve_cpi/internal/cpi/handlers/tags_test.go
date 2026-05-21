@@ -167,6 +167,42 @@ func TestStripReservedBoshTags_Empty(t *testing.T) {
 	}
 }
 
+func TestSanitizeVMName(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		in, want string
+	}{
+		{"", ""},
+		{"diego-cell/2844c990-aef3-4de7-8bf3-d936fc2201be", "diego-cell-2844c990-aef3-4de7-8bf3-d936fc2201be"},
+		{"bosh/0", "bosh-0"},
+		{"job_with_underscores/abc", "job-with-underscores-abc"},
+		{"a/b/c", "a-b-c"},
+		{"---leading-and-trailing---", "leading-and-trailing"},
+		{"a..b", "a-b"},          // consecutive invalids collapse
+		{"a/_/b", "a-b"},         // mixed invalids collapse
+		{"MixedCase/123", "MixedCase-123"},
+		{"////", ""}, // all invalids collapse to empty after trim
+	}
+	for _, c := range cases {
+		got := sanitizeVMName(c.in)
+		if got != c.want {
+			t.Errorf("sanitizeVMName(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestSanitizeVMName_TruncatesTo63(t *testing.T) {
+	t.Parallel()
+	long := "diego-cell/" + strings.Repeat("a", 80)
+	got := sanitizeVMName(long)
+	if len(got) > 63 {
+		t.Errorf("sanitizeVMName length = %d, want <= 63; got %q", len(got), got)
+	}
+	if strings.HasSuffix(got, "-") {
+		t.Errorf("sanitizeVMName must not end in '-'; got %q", got)
+	}
+}
+
 func equalStrings(a, b []string) bool {
 	if len(a) != len(b) {
 		return false

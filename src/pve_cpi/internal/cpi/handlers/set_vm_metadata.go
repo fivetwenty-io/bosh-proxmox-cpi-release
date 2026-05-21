@@ -40,6 +40,9 @@ const maxTagLength = 255
 //     entries (PVE tags allow only alphanumerics and "-"). Also extract the BOSH
 //     instance name ("<job>/<id>") and emit "<job>--<id>" (PVE tags reject "/").
 //     Join with ";"; truncate to maxTagLength bytes at a tag boundary.
+//  4a. Derive a DNS-label VM name from metadata["name"] ("<job>/<id>" →
+//     "<job>-<id>") so the PVE UI shows the BOSH instance identifier instead
+//     of the placeholder "vm-<vmid>" written at create_vm time.
 //  5. Call nodes.UpdateQemuConfig with description + tags. Overwrites existing values.
 //  6. 404 → return VMNotFound.
 //
@@ -110,15 +113,29 @@ func HandleSetVMMetadata(deps Deps) cpi.Handler {
 		boshEntries := buildBoshManagedTags(metadata)
 		tags := mergeTagList(preserved, boshEntries, maxTagLength)
 
+		// --- derive PVE VM name from BOSH instance name ---
+		// BOSH supplies metadata["name"] = "<job>/<id>" (e.g. "diego-cell/2844c990-...").
+		// PVE's name field is a DNS label (alnum + "-", ≤ 63 bytes), so the
+		// "/" and any other invalid bytes are rewritten to "-". When the BOSH
+		// name is absent the existing PVE name is left untouched.
+		var vmName *string
+		if v, ok := metadata["name"]; ok && v != nil {
+			if s := sanitizeVMName(fmt.Sprintf("%v", v)); s != "" {
+				vmName = &s
+			}
+		}
+
 		logger.Debug("set_vm_metadata: updating VM config",
 			log.String("description_len", fmt.Sprintf("%d", len(description))),
 			log.String("tags", tags),
+			log.String("name", derefStr(vmName)),
 		)
 
 		// --- update VM config ---
 		updateErr := deps.PVE.Nodes().UpdateQemuConfig(ctx, node, vmCID, &sdknodes.UpdateQemuConfigParams{
 			Description: &description,
 			Tags:        &tags,
+			Name:        vmName,
 		})
 		if updateErr != nil {
 			if pve.IsNotFound(updateErr) {
@@ -130,6 +147,15 @@ func HandleSetVMMetadata(deps Deps) cpi.Handler {
 		logger.Info("set_vm_metadata: VM metadata updated")
 		return nil, nil
 	})
+}
+
+// derefStr returns the pointed-to string, or "" if the pointer is nil. Used
+// only for logging.
+func derefStr(p *string) string {
+	if p == nil {
+		return ""
+	}
+	return *p
 }
 
 // buildDescription renders metadata as sorted "key: value\n" lines.

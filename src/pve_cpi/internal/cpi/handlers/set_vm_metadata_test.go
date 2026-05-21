@@ -438,6 +438,69 @@ func TestHandleSetVMMetadata_NameTagMissingOmitted(t *testing.T) {
 	}
 }
 
+// TestHandleSetVMMetadata_SetsVMName verifies that metadata["name"] is
+// rewritten to a DNS label and passed as UpdateQemuConfigParams.Name so
+// the PVE UI shows the BOSH instance identifier instead of "vm-<vmid>".
+func TestHandleSetVMMetadata_SetsVMName(t *testing.T) {
+	t.Parallel()
+
+	var gotName *string
+	nodesSvc := &mockNodesService{
+		updateQemuConfigFn: func(_ context.Context, _, _ string, params *nodes.UpdateQemuConfigParams) error {
+			gotName = params.Name
+			return nil
+		},
+	}
+
+	h := handlers.HandleSetVMMetadata(testDeps(nil, nodesSvc, nil, &mockAgentService{}))
+	_, err := h.Handle(context.Background(), marshalArgs("101", map[string]any{
+		"name": "diego-cell/2844c990-aef3-4de7-8bf3-d936fc2201be",
+	}), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if gotName == nil {
+		t.Fatal("expected Name to be set, got nil")
+	}
+	want := "diego-cell-2844c990-aef3-4de7-8bf3-d936fc2201be"
+	if *gotName != want {
+		t.Errorf("Name = %q, want %q", *gotName, want)
+	}
+}
+
+// TestHandleSetVMMetadata_LeavesVMNameUnchangedWhenAbsent verifies that
+// when metadata has no "name" key the Name pointer is nil — preserving the
+// existing PVE name instead of clobbering it with an empty string.
+func TestHandleSetVMMetadata_LeavesVMNameUnchangedWhenAbsent(t *testing.T) {
+	t.Parallel()
+
+	var gotName *string
+	called := false
+	nodesSvc := &mockNodesService{
+		updateQemuConfigFn: func(_ context.Context, _, _ string, params *nodes.UpdateQemuConfigParams) error {
+			called = true
+			gotName = params.Name
+			return nil
+		},
+	}
+
+	h := handlers.HandleSetVMMetadata(testDeps(nil, nodesSvc, nil, &mockAgentService{}))
+	_, err := h.Handle(context.Background(), marshalArgs("101", map[string]any{
+		"director":   "bosh",
+		"deployment": "cf",
+	}), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !called {
+		t.Fatal("UpdateQemuConfig was not called")
+	}
+	if gotName != nil {
+		t.Errorf("Name should be nil when metadata lacks 'name'; got %q", *gotName)
+	}
+}
+
 // TestHandleSetVMMetadata_DescriptionSorted verifies description lines are sorted by key.
 func TestHandleSetVMMetadata_DescriptionSorted(t *testing.T) {
 	t.Parallel()
