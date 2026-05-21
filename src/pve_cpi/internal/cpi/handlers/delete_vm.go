@@ -55,8 +55,17 @@ func HandleDeleteVM(deps Deps) cpi.Handler {
 
 		// --- stop VM ---
 		// Stop returns a UPID; if VM is not found (already deleted), treat as success.
+		// Wrap in RetryOnTransient so a pvedaemon worker-recycle (HTTP 5xx /
+		// "got no worker upid - start worker failed") under burst load is
+		// absorbed in-process rather than surfacing as RetriableCloudError to
+		// the director.
 		logger.Debug("delete_vm: stopping VM")
-		stopUPID, stopErr := deps.PVE.QEMU().Stop(ctx, node, vmid)
+		var stopUPID string
+		stopErr := pve.RetryOnTransient(ctx, logger, "delete_vm.stop", 0, func() error {
+			var innerErr error
+			stopUPID, innerErr = deps.PVE.QEMU().Stop(ctx, node, vmid)
+			return innerErr
+		})
 		if stopErr != nil {
 			if pve.IsNotFound(stopErr) {
 				logger.Info("delete_vm: VM not found during stop — already deleted, returning success")

@@ -301,17 +301,21 @@ func createVM(
 
 			upid, cerr := deps.PVE.QEMU().Create(ctx, node, createParams)
 			if cerr != nil {
-				if pve.IsVMIDConflict(cerr) {
+				// Classify mutually exclusively so VMID conflicts don't
+				// trigger the transient-transport cleanup path: a "VM N
+				// already exists" 500 satisfies both predicates, but
+				// destroying the conflicting VMID would wipe another
+				// process's in-flight VM.
+				switch {
+				case pve.IsVMIDConflict(cerr):
 					logger.Info("create_vm: vmid conflict, retrying",
 						log.Int("vmid_attempted", candidate),
 					)
-				}
-				if pve.IsStorageLockTimeout(cerr) {
+				case pve.IsStorageLockTimeout(cerr):
 					logger.Info("create_vm: storage lock timeout on create, retrying",
 						log.Int("vmid_attempted", candidate),
 					)
-				}
-				if pve.IsTransientTransport(cerr) {
+				case pve.IsTransientTransport(cerr):
 					// HTTP 596 or auth-EOF: pvedaemon worker cycled
 					// mid-request. POST may or may not have committed
 					// the VM. Sweep this VMID before the next attempt
@@ -598,8 +602,15 @@ func createVM(
 	// -----------------------------------------------------------------------
 	// 8. Start VM
 	// -----------------------------------------------------------------------
-	startUPID, err := deps.PVE.QEMU().Start(ctx, node, vmid)
-	if err != nil {
+	// Wrap in RetryOnTransient so a pvedaemon worker-recycle (HTTP 5xx /
+	// "got no worker upid - start worker failed") under burst load is absorbed
+	// in-process rather than surfacing as RetriableCloudError to the director.
+	var startUPID string
+	if err := pve.RetryOnTransient(ctx, logger, "create_vm.start", 0, func() error {
+		var innerErr error
+		startUPID, innerErr = deps.PVE.QEMU().Start(ctx, node, vmid)
+		return innerErr
+	}); err != nil {
 		return nil, cpierrors.Cloud("create_vm: start vmid=%d: %s", vmid, err.Error())
 	}
 
@@ -635,8 +646,16 @@ func createVM(
 func cleanupVM(ctx context.Context, deps Deps, node string, vmid int, logger *log.Logger) {
 	logger.Warn("create_vm: rolling back, destroying created VM", log.Int("vmid", vmid))
 
-	// Stop (best-effort; VM may not have started yet)
-	stopUPID, stopErr := deps.PVE.QEMU().Stop(ctx, node, vmid)
+	// Stop (best-effort; VM may not have started yet). Wrap in RetryOnTransient
+	// so a pvedaemon worker-recycle during rollback doesn't bubble out — this
+	// path is best-effort already and absorbing the transient keeps the
+	// rollback graceful.
+	var stopUPID string
+	stopErr := pve.RetryOnTransient(ctx, logger, "create_vm.cleanup.stop", 0, func() error {
+		var innerErr error
+		stopUPID, innerErr = deps.PVE.QEMU().Stop(ctx, node, vmid)
+		return innerErr
+	})
 	if stopErr == nil && stopUPID != "" {
 		if awaitErr := pve.AwaitTask(ctx, deps.PVE, node, stopUPID); awaitErr != nil {
 			logger.Warn("create_vm: rollback stop task failed", log.Int("vmid", vmid), log.Err(awaitErr))
