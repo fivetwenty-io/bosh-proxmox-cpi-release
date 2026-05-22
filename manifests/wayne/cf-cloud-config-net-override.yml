@@ -1,0 +1,40 @@
+---
+# Wayne lab CF cloud-config network override — lvnet001 (10.64.64.0/18)
+#
+# Fixes the hardcoded 192.168.1.x reserved-range in manifests/cf/cloud-config.yml
+# and wires the subnet to lvnet001 with correct Wayne IPAM allocations.
+#
+# CF IPAM layout (within 10.64.64.0/18):
+#   10.64.64.1-10.64.64.19   reserved (gateway, infra, BOSH directors, artifacts VM)
+#   10.64.64.20-10.64.64.49  dynamic (CF VMs, BOSH-managed)
+#   10.64.64.50               haproxy (static — must match haproxy_private_ip in vars.yml)
+#   10.64.64.51-10.64.127.254 reserved (upper band; prevents BOSH over-allocating
+#                              into addresses reserved for future blocs)
+#
+# Usage:
+#   bosh update-cloud-config manifests/cf/cloud-config.yml \
+#     -o manifests/wayne/cf-cloud-config-net-override.yml \
+#     -l manifests/bosh/vars.yml -l manifests/cf/vars.yml
+
+- type: replace
+  path: /networks/name=default/subnets/0/range
+  value: 10.64.64.0/18
+
+- type: replace
+  path: /networks/name=default/subnets/0/gateway
+  value: 10.64.64.1
+
+- type: replace
+  path: /networks/name=default/subnets/0/reserved
+  value:
+  - 10.64.64.1-10.64.64.19
+  - 10.64.64.51-10.64.127.254
+
+- type: replace
+  path: /networks/name=default/subnets/0/static
+  value:
+  - 10.64.64.50
+
+- type: replace
+  path: /networks/name=default/subnets/0/cloud_properties/bridge
+  value: lvnet001

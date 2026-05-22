@@ -1,0 +1,68 @@
+---
+# Wayne lab storage pool override
+#
+# Maps PVE storage pools to their roles in this lab:
+#   data    lvmthin  — root (ephemeral) VM disks
+#   zfs-1   zfspool  — persistent BOSH disks (requires disk_format: raw;
+#                      zfspool block devices do not support qcow2)
+#   local   dir      — stemcell uploads and ISO images
+#
+# Apply after manifests/bosh/cpi.yml so the pve_cpi job properties are
+# already present.
+#
+# Usage:
+#   bosh create-env ~/w/cloudfoundry/bosh-deployment/bosh.yml \
+#     --state=manifests/bosh/state.json \
+#     --vars-store=manifests/bosh/creds.yml \
+#     -o manifests/bosh/cpi.yml \
+#     -o manifests/wayne/storage-pools.yml \
+#     -l manifests/bosh/vars.yml
+
+# Root (ephemeral) VM disks: lvmthin pool named "data"
+- type: replace
+  path: /instance_groups/name=bosh/jobs/name=pve_cpi/properties/pve/vm_storage
+  value: data
+
+# Persistent BOSH disks: zfspool named "zfs-1"
+# zfspool requires disk_format: raw — qcow2 is not supported for block devices.
+- type: replace
+  path: /instance_groups/name=bosh/jobs/name=pve_cpi/properties/pve/disk_storage
+  value: zfs-1
+
+- type: replace
+  path: /instance_groups/name=bosh/jobs/name=pve_cpi/properties/pve/vm_disk_format
+  value: raw
+
+# Stemcell uploads and ISO images: local dir storage
+- type: replace
+  path: /instance_groups/name=bosh/jobs/name=pve_cpi/properties/pve/stemcell_storage
+  value: local
+
+- type: replace
+  path: /instance_groups/name=bosh/jobs/name=pve_cpi/properties/pve/iso_storage
+  value: local
+
+# Propagate persistent-disk pool and format to the disk_pools block used
+# during create-env bootstrap (before the director is running).
+- type: replace
+  path: /disk_pools/name=disks/cloud_properties
+  value:
+    storage: zfs-1
+    disk_format: raw
+
+# Mirror storage settings in cloud_provider for create-env bootstrap CPI.
+- type: replace
+  path: /cloud_provider/properties/pve/vm_storage
+  value: data
+
+- type: replace
+  path: /cloud_provider/properties/pve/disk_storage
+  value: zfs-1
+
+- type: replace
+  path: /cloud_provider/properties/pve/stemcell_storage
+  value: local
+
+- type: replace
+  path: /cloud_provider/properties/pve/iso_storage
+  value: local
