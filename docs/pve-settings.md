@@ -84,6 +84,8 @@ The `content` line must include `import`.
 
 ## 3. Disable Privilege Separation on the API Token
 
+This section covers the `root@pam` quick-start token. For the recommended non-root setup — a dedicated `bosh@pve` user with a custom `BoshOperator` role — see [pve-api-permissions.md](pve-api-permissions.md). The `privsep=0` requirement applies to both paths; the trust boundary is what differs.
+
 PVE API tokens default to **Privilege Separation = on**. That gives the token its own (empty) ACL, distinct from the parent user — even when the parent is `root@pam`. The CPI then fails any call that needs full root authority, most visibly `--import-from=<path>` (filesystem-path arguments are user-bound, not ACL-bound).
 
 ### Fix A — Disable Privilege Separation (recommended)
