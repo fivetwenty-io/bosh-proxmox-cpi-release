@@ -6,10 +6,18 @@ pve_host:            pve.example.com
 pve_port:            8006
 pve_user:            root@pam
 pve_password:        REPLACE_ME
+# Optional: API token alternative to password auth. Provide exactly one of
+# pve_password or pve_api_token; leave the other empty string.
+# Format: <user>!<token-id>=<uuid>  e.g. root@pam!bosh-cpi=8b452463-0990-409a-9b24-3920cb778ef3
+pve_api_token:       ""
 pve_node:            pve1
 pve_vm_storage:      local-lvm
 pve_disk_storage:    local-lvm
 pve_stemcell_storage: local
+# Storage pool (dir/nfs/cifs with iso content enabled) for per-VM cloud-init ISOs.
+# Block storages (lvm/lvmthin/zfspool) cannot hold ISO files; use "local" or a
+# dedicated NFS/CIFS ISO store. Must match a storage visible on all cluster nodes.
+pve_iso_storage:     local
 pve_network_bridge:  vmbr0
 pve_verify_ssl:      true
 
