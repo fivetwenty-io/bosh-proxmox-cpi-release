@@ -28,6 +28,13 @@ vm_types:
     #   env: prod
     #   owner: platform-team
 
+- name: compilation
+  cloud_properties:
+    cores: 4
+    memory: 4096
+    disk: 16384
+    network_bridge: ((pve_network_bridge))
+
 disk_types:
 - name: default
   disk_size: 1024
@@ -55,5 +62,5 @@ compilation:
   workers:     2
   reuse_compilation_vms: true
   az:          z1
-  vm_type:     default
+  vm_type:     compilation
   network:     default

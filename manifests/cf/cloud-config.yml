@@ -65,6 +65,13 @@ vm_types:
     disk: 102400
     network_bridge: ((pve_network_bridge))
 
+- name: compilation
+  cloud_properties:
+    cores: 4
+    memory: 4096
+    disk: 32768
+    network_bridge: ((pve_network_bridge))
+
 disk_types:
 - name: 5GB
   disk_size: 5120
@@ -115,5 +122,5 @@ compilation:
   workers: 1
   reuse_compilation_vms: true
   az: z1
-  vm_type: medium
+  vm_type: compilation
   network: default
