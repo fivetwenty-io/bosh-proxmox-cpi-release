@@ -21,6 +21,15 @@ pve_iso_storage:     local
 pve_network_bridge:  vmbr0
 pve_verify_ssl:      true
 
+# --- VM naming ------------------------------------------------------------
+# Prefix prepended to every CPI-provisioned VM's PVE name. With prefix "cpi"
+# names take the form "cpi-<deployment>-<job>-<index>" (e.g. "cpi-cf-api-0").
+# Leave empty to omit the prefix; deployment + job + index are always included.
+pve_vm_prefix:       cpi
+# Synthetic deployment name used in VM names for `bosh create-env` directors
+# (bosh-init does not pass a deployment in env). Defaults to "create-env".
+pve_create_env_deployment: create-env
+
 # --- Director VM sizing ---------------------------------------------------
 director_cpu:    2
 director_memory: 4096

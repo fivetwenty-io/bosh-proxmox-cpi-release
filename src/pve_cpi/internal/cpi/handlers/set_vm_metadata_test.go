@@ -599,6 +599,115 @@ func TestHandleSetVMMetadata_LeavesVMNameUnchangedWhenAbsent(t *testing.T) {
 	}
 }
 
+// TestHandleSetVMMetadata_VMNameIncludesDeployment verifies that when the
+// director provides a "deployment" key the VM name includes it as the
+// segment between any prefix and the job, so VMs from different deployments
+// are distinguishable in the PVE UI.
+func TestHandleSetVMMetadata_VMNameIncludesDeployment(t *testing.T) {
+	t.Parallel()
+
+	var gotName *string
+	nodesSvc := &mockNodesService{
+		updateQemuConfigFn: func(_ context.Context, _, _ string, params *nodes.UpdateQemuConfigParams) error {
+			gotName = params.Name
+			return nil
+		},
+	}
+
+	h := handlers.HandleSetVMMetadata(testDeps(nil, nodesSvc, nil, &mockAgentService{}))
+	_, err := h.Handle(context.Background(), marshalArgs("101", map[string]any{
+		"deployment": "cf",
+		"job":        "api",
+		"index":      0,
+	}), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if gotName == nil {
+		t.Fatal("expected Name to be set")
+	}
+	if *gotName != "cf-api-0" {
+		t.Errorf("Name = %q, want %q", *gotName, "cf-api-0")
+	}
+}
+
+// TestHandleSetVMMetadata_VMNameWithPrefix verifies that Config.VMPrefix is
+// prepended to the assembled name, yielding "<prefix>-<deployment>-<job>-<index>".
+func TestHandleSetVMMetadata_VMNameWithPrefix(t *testing.T) {
+	t.Parallel()
+
+	var gotName *string
+	nodesSvc := &mockNodesService{
+		updateQemuConfigFn: func(_ context.Context, _, _ string, params *nodes.UpdateQemuConfigParams) error {
+			gotName = params.Name
+			return nil
+		},
+	}
+
+	deps := testDeps(nil, nodesSvc, nil, &mockAgentService{})
+	deps.Config.VMPrefix = "cpi"
+
+	h := handlers.HandleSetVMMetadata(deps)
+	_, err := h.Handle(context.Background(), marshalArgs("101", map[string]any{
+		"deployment": "cf",
+		"job":        "diego-cell",
+		"index":      2,
+	}), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if gotName == nil {
+		t.Fatal("expected Name to be set")
+	}
+	if *gotName != "cpi-cf-diego-cell-2" {
+		t.Errorf("Name = %q, want %q", *gotName, "cpi-cf-diego-cell-2")
+	}
+}
+
+// TestHandleSetVMMetadata_EmitsIndexTag verifies that metadata["index"] is
+// emitted as an "index--<n>" PVE tag alongside the director/deployment/job
+// triple, and that stale "index--" tags from a prior sync are replaced.
+func TestHandleSetVMMetadata_EmitsIndexTag(t *testing.T) {
+	t.Parallel()
+
+	qemuSvc := &mockQEMUService{
+		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
+			return map[string]interface{}{
+				"tags": "index--7;env--prod",
+			}, nil
+		},
+	}
+
+	var gotTags string
+	nodesSvc := &mockNodesService{
+		updateQemuConfigFn: func(_ context.Context, _, _ string, params *nodes.UpdateQemuConfigParams) error {
+			if params.Tags != nil {
+				gotTags = *params.Tags
+			}
+			return nil
+		},
+	}
+
+	h := handlers.HandleSetVMMetadata(testDeps(qemuSvc, nodesSvc, nil, &mockAgentService{}))
+	_, err := h.Handle(context.Background(), marshalArgs("101", map[string]any{
+		"director":   "bosh",
+		"deployment": "cf",
+		"job":        "api",
+		"index":      0,
+	}), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if strings.Contains(gotTags, "index--7") {
+		t.Errorf("stale index tag survived; got: %q", gotTags)
+	}
+	for _, want := range []string{"index--0", "director--bosh", "deployment--cf", "job--api", "env--prod"} {
+		if !strings.Contains(gotTags, want) {
+			t.Errorf("tags missing %q; got: %q", want, gotTags)
+		}
+	}
+}
+
 // TestHandleSetVMMetadata_DescriptionSorted verifies description lines are sorted by key.
 func TestHandleSetVMMetadata_DescriptionSorted(t *testing.T) {
 	t.Parallel()

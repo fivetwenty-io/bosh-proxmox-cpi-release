@@ -85,6 +85,8 @@
         agent_mode: cloudinit
         vm_disk_format: qcow2
         log_level: info
+        vm_prefix: ((pve_vm_prefix))
+        create_env_deployment: ((pve_create_env_deployment))
 
 # cloud_provider drives create-env itself.
 - type: replace

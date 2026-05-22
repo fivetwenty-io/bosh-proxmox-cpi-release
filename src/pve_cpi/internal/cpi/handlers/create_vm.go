@@ -191,12 +191,28 @@ func createVM(
 		return nil, cpierrors.Cloud("create_vm: parse env: %s", err.Error())
 	}
 
-	// Initial VM name derived from env.bosh.{group,groups} so the PVE UI shows
-	// the BOSH instance-group name immediately on come-online, instead of the
-	// placeholder "vm-<vmid>". set_vm_metadata later refines this to
-	// "<job>-<index>" once BOSH knows the instance index (the index is not
-	// part of the create_vm env per the v2 CPI spec).
-	initialJobName := sanitizeVMName(extractJobNameFromEnv(env))
+	// Initial VM name derived from env.bosh.{group,groups} + Config so the
+	// PVE UI shows the deployment + instance-group immediately on come-online
+	// instead of the placeholder "vm-<vmid>". For director-mode deploys env
+	// carries director + deployment + job in env.bosh.group; for `bosh
+	// create-env` env has no deployment, so Config.CreateEnvDeployment
+	// (default "create-env") fills that segment. set_vm_metadata later
+	// refines this to "<prefix>-<deployment>-<job>-<index>" once the index
+	// is known (the index is not part of the create_vm env per the v2 CPI
+	// spec).
+	initialJobName := extractJobNameFromEnv(env)
+	initialDeployment := extractDeploymentFromEnv(env, initialJobName)
+	if initialDeployment == "" {
+		initialDeployment = deps.Config.CreateEnvDeployment
+	}
+	if initialJobName == "" {
+		// create-env path: env has no group/groups. Fall back to the BOSH
+		// instance-group baked into cloud_provider.template.name when it is
+		// detectable from env.bosh.instance.name; otherwise leave blank and
+		// let the "vm-<vmid>" placeholder stand.
+		initialJobName = extractInstanceNameFromEnv(env)
+	}
+	initialVMName := composeVMName(deps.Config.VMPrefix, initialDeployment, initialJobName, "")
 
 	// -----------------------------------------------------------------------
 	// 2. Resolve node from cloud_properties or config default
@@ -307,7 +323,7 @@ func createVM(
 		func(candidate int) error {
 			virtio0Val := fmt.Sprintf("%s:0,import-from=%s,format=%s,size=%dG",
 				vmStorage, stemcellCID, vmDiskFormat, rootDiskGiB)
-			candidateName := initialJobName
+			candidateName := initialVMName
 			if candidateName == "" {
 				candidateName = fmt.Sprintf("vm-%d", candidate)
 			}
@@ -415,7 +431,7 @@ func createVM(
 	}
 	_ = createUPID
 
-	vmName := initialJobName
+	vmName := initialVMName
 	if vmName == "" {
 		vmName = fmt.Sprintf("vm-%d", vmid)
 	}
@@ -855,6 +871,91 @@ func extractJobNameFromEnv(env map[string]any) string {
 		}
 	}
 	return best
+}
+
+// extractDeploymentFromEnv returns the BOSH deployment name from the
+// create_vm env, or "" if it cannot be derived. Given env.bosh.group =
+// "<director>-<deployment>-<job>" and the already-resolved job, the
+// remainder ("<director>-<deployment>") has the deployment as the shortest
+// suffix in env.bosh.groups that is neither the remainder itself nor the
+// bare director. This mirrors extractJobNameFromEnv's "shortest matching
+// suffix" rule so a deployment name containing hyphens still resolves
+// correctly. Returns "" when env.bosh is absent, when group is empty, or
+// when job is empty (the deployment cannot be located without first
+// stripping the job suffix from group).
+func extractDeploymentFromEnv(env map[string]any, job string) string {
+	if job == "" {
+		return ""
+	}
+	boshRaw, ok := env["bosh"].(map[string]any)
+	if !ok {
+		return ""
+	}
+	group, _ := boshRaw["group"].(string)
+	groupsRaw, _ := boshRaw["groups"].([]any)
+	if group == "" || len(groupsRaw) == 0 {
+		return ""
+	}
+	remainder := strings.TrimSuffix(group, "-"+job)
+	if remainder == group || remainder == "" {
+		return ""
+	}
+	var best string
+	for _, g := range groupsRaw {
+		s, ok := g.(string)
+		if !ok || s == "" || s == remainder || s == group || s == job {
+			continue
+		}
+		if !strings.HasSuffix(remainder, "-"+s) {
+			continue
+		}
+		if best == "" || len(s) < len(best) {
+			best = s
+		}
+	}
+	return best
+}
+
+// extractInstanceNameFromEnv returns the BOSH instance-group name embedded
+// in env.bosh.instance.name (the bosh-init / create-env env shape includes
+// this even when env.bosh.group is absent). Returns "" when neither key is
+// present.
+func extractInstanceNameFromEnv(env map[string]any) string {
+	boshRaw, ok := env["bosh"].(map[string]any)
+	if !ok {
+		return ""
+	}
+	if inst, ok := boshRaw["instance"].(map[string]any); ok {
+		if s, _ := inst["name"].(string); s != "" {
+			return s
+		}
+	}
+	return ""
+}
+
+// composeVMName builds the PVE VM name from prefix + deployment + job +
+// optional index. Empty segments are dropped, so a metadata payload missing
+// the deployment still yields "<prefix>-<job>-<index>" rather than a
+// double-dash. Returns "" when no segment is populated; the caller then
+// falls back to the "vm-<vmid>" placeholder.
+func composeVMName(prefix, deployment, job, index string) string {
+	parts := make([]string, 0, 4)
+	if prefix != "" {
+		parts = append(parts, prefix)
+	}
+	if deployment != "" {
+		parts = append(parts, deployment)
+	}
+	if job != "" {
+		parts = append(parts, job)
+	}
+	if index != "" {
+		parts = append(parts, index)
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return sanitizeVMName(strings.Join(parts, "-"))
 }
 
 // --------------------------------------------------------------------------

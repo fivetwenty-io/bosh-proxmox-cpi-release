@@ -85,6 +85,22 @@ properties:
       [vmid_range_start, 5999]; default vmid_range_start is 100.
       Persistent disks use synthetic VMIDs 9000-9999 (unchanged).
     default: 100
+  pve.vm_prefix:
+    description: |
+      Optional prefix prepended to every CPI-provisioned VM's PVE name.
+      When set (e.g. "cpi") VM names take the form
+      "<prefix>-<deployment>-<job>-<index>", so deployments sharing a PVE
+      cluster can be filtered by prefix in the PVE UI. When empty the
+      prefix is omitted and the name is "<deployment>-<job>-<index>".
+    default: ""
+  pve.create_env_deployment:
+    description: |
+      Synthetic deployment name used for VMs created by `bosh create-env`.
+      bosh-init does not pass a deployment in env, so a stable placeholder
+      is required for the "<deployment>" segment of the VM name. Defaults
+      to "create-env" so the director comes online as
+      "<prefix>-create-env-<job>-0".
+    default: "create-env"
   agent.mbus:
     description: |
       URL the BOSH agent should bind/listen on inside the VM (the same value

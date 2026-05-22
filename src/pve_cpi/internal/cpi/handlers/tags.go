@@ -10,7 +10,7 @@ import (
 // on every set_vm_metadata call. Entries with these prefixes are stripped
 // from a stored PVE tag list before BOSH-managed values are re-applied, so a
 // stale director/deployment/job triple cannot accumulate.
-var reservedBoshTagPrefixes = []string{"director--", "deployment--", "job--"}
+var reservedBoshTagPrefixes = []string{"director--", "deployment--", "job--", "index--"}
 
 // sanitizeTagValue replaces any byte outside [A-Za-z0-9-] with "-" so the
 // result is a valid PVE tag value. Leading/trailing "-" are trimmed.

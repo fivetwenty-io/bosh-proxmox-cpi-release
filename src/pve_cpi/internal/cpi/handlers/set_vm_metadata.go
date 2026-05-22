@@ -115,16 +115,16 @@ func HandleSetVMMetadata(deps Deps) cpi.Handler {
 		boshEntries := buildBoshManagedTags(metadata)
 		tags := mergeTagList(preserved, boshEntries, maxTagLength)
 
-		// --- derive PVE VM name from job + index ---
-		// PVE's name field is a DNS label (alnum + "-", ≤ 63 bytes), so we
-		// build it from BOSH's job and index metadata ("diego-cell" + 0 →
-		// "diego-cell-0", "bosh" + 0 → "bosh-0"). This matches what BOSH and
-		// operators see in `bosh vms` output rather than the UUID-bearing
-		// instance name. When job or index is absent we fall back to the
-		// full BOSH instance name ("<job>/<id>"); when both are absent the
-		// existing PVE name is left untouched.
+		// --- derive PVE VM name from prefix + deployment + job + index ---
+		// PVE's name field is a DNS label (alnum + "-", ≤ 63 bytes). The CPI
+		// stamps the name in "<prefix>-<deployment>-<job>-<index>" form
+		// ("cpi-cf-api-0", "cf-api-0" when prefix is empty), so deployments
+		// sharing a PVE cluster are filterable in the UI. When job, index, or
+		// deployment is absent we fall back to the full BOSH instance name
+		// ("<job>/<id>"); when no source yields a usable label the existing
+		// PVE name is left untouched.
 		var vmName *string
-		if s := buildVMName(metadata); s != "" {
+		if s := buildVMName(metadata, deps.Config.VMPrefix); s != "" {
 			vmName = &s
 		}
 
@@ -152,24 +152,41 @@ func HandleSetVMMetadata(deps Deps) cpi.Handler {
 	})
 }
 
-// buildVMName derives the PVE VM name from BOSH metadata. Prefers
-// "<job>-<index>" so the PVE UI shows the human-readable instance
-// identifier ("diego-cell-0", "bosh-0"). Falls back to the full BOSH
-// instance name (metadata["name"], "<job>/<id>") sanitized as a DNS label
-// when job or index is absent. Returns "" when neither source yields a
-// non-empty label, signalling the caller to leave the existing PVE name
-// untouched.
-func buildVMName(metadata map[string]any) string {
+// buildVMName derives the PVE VM name from BOSH metadata + the operator's
+// configured VM prefix. The preferred form is
+// "<prefix>-<deployment>-<job>-<index>" ("cpi-cf-api-0", "cf-api-0" when
+// prefix is empty) so deployments sharing a PVE cluster are filterable in
+// the UI. The prefix and deployment segments are dropped from the joined
+// label when the corresponding input is empty, so a metadata payload with
+// only job + index still yields "<job>-<index>" — keeping legacy single-
+// deployment installs visible. When job or index is absent the BOSH
+// instance name ("<job>/<id>" in metadata["name"]) is sanitized as a DNS
+// label. Returns "" when no source yields a usable label, signalling the
+// caller to leave the existing PVE name untouched.
+func buildVMName(metadata map[string]any, prefix string) string {
 	job, jobOK := metadata["job"]
 	idx, idxOK := metadata["index"]
 	if jobOK && job != nil && idxOK && idx != nil {
-		raw := fmt.Sprintf("%v-%v", job, idx)
-		if s := sanitizeVMName(raw); s != "" {
+		parts := make([]string, 0, 4)
+		if prefix != "" {
+			parts = append(parts, prefix)
+		}
+		if v, ok := metadata["deployment"]; ok && v != nil {
+			if s := fmt.Sprintf("%v", v); s != "" {
+				parts = append(parts, s)
+			}
+		}
+		parts = append(parts, fmt.Sprintf("%v", job), fmt.Sprintf("%v", idx))
+		if s := sanitizeVMName(strings.Join(parts, "-")); s != "" {
 			return s
 		}
 	}
 	if v, ok := metadata["name"]; ok && v != nil {
-		if s := sanitizeVMName(fmt.Sprintf("%v", v)); s != "" {
+		raw := fmt.Sprintf("%v", v)
+		if prefix != "" {
+			raw = prefix + "-" + raw
+		}
+		if s := sanitizeVMName(raw); s != "" {
 			return s
 		}
 	}
@@ -222,7 +239,7 @@ func buildDescription(metadata map[string]any) string {
 // Keys whose metadata value is missing, nil, or sanitizes to empty are skipped.
 func buildBoshManagedTags(metadata map[string]any) []string {
 	var parts []string
-	for _, key := range []string{"director", "deployment", "job"} {
+	for _, key := range []string{"director", "deployment", "job", "index"} {
 		v, ok := metadata[key]
 		if !ok || v == nil {
 			continue

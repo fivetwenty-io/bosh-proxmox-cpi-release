@@ -92,6 +92,20 @@ type CPIConfig struct {
 	// AgentBlobstore mirrors AgentMBus: the blobstore agent settings.json
 	// should advertise. Populated from cloud_provider.properties.agent.blobstore.
 	AgentBlobstore map[string]any `json:"agent_blobstore,omitempty"`
+
+	// VMPrefix is prepended to every CPI-provisioned VM's PVE name. When set
+	// (e.g. "cpi") VM names are formed as "<prefix>-<deployment>-<job>-<index>"
+	// so deployments sharing a PVE cluster are easy to filter in the UI. When
+	// empty, the prefix is omitted and the name format is
+	// "<deployment>-<job>-<index>".
+	VMPrefix string `json:"vm_prefix,omitempty"`
+
+	// CreateEnvDeployment is the synthetic deployment name used in VM names
+	// for VMs created via `bosh create-env`. bosh-init does not pass a
+	// deployment in env, so a stable placeholder is required for the
+	// "<deployment>" segment. Defaults to "create-env" so a director booted
+	// via create-env shows up as "<prefix>-create-env-bosh-0".
+	CreateEnvDeployment string `json:"create_env_deployment,omitempty"`
 }
 
 // Load decodes CPIConfig from r, applies defaults, then validates.
@@ -173,6 +187,9 @@ func (c *CPIConfig) ApplyDefaults() {
 	if c.NUMA == nil {
 		t := true
 		c.NUMA = &t
+	}
+	if c.CreateEnvDeployment == "" {
+		c.CreateEnvDeployment = "create-env"
 	}
 }
 

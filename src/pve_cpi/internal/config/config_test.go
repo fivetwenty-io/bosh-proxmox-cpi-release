@@ -220,6 +220,12 @@ func TestApplyDefaults_AllFields(t *testing.T) {
 	if cfg.VMIDRangeStart != 100 {
 		t.Errorf("VMIDRangeStart = %d, want 100", cfg.VMIDRangeStart)
 	}
+	if cfg.CreateEnvDeployment != "create-env" {
+		t.Errorf("CreateEnvDeployment = %q, want %q", cfg.CreateEnvDeployment, "create-env")
+	}
+	if cfg.VMPrefix != "" {
+		t.Errorf("VMPrefix = %q, want empty (no default prefix)", cfg.VMPrefix)
+	}
 }
 
 // --------------------------------------------------------------------------
