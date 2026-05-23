@@ -466,14 +466,21 @@ func resolveStemcellImage(imagePath, defaultFormat string, logger *log.Logger) (
 			return "", noop, "", cpierrors.Cloud("resolveStemcellImage: no disk image inside tarball %s", imagePath)
 		}
 
-		// Detect format of extracted file via magic bytes.
+		// Detect format of extracted file via magic bytes. Read only the
+		// first 4 bytes — qcow2 magic is QFI\xFB — instead of slurping the
+		// entire (multi-GB) disk image into memory, which previously OOM'd
+		// resource-constrained directors (D-07).
 		format := defaultFormat
-		if magic, merr := os.ReadFile(imgPath); merr == nil && len(magic) >= 4 {
-			if magic[0] == 'Q' && magic[1] == 'F' && magic[2] == 'I' && magic[3] == 0xFB {
-				format = "qcow2"
-			} else {
-				format = "raw"
+		if mf, merr := os.Open(imgPath); merr == nil {
+			var magic [4]byte
+			if _, rerr := io.ReadFull(mf, magic[:]); rerr == nil {
+				if magic[0] == 'Q' && magic[1] == 'F' && magic[2] == 'I' && magic[3] == 0xFB {
+					format = "qcow2"
+				} else {
+					format = "raw"
+				}
 			}
+			_ = mf.Close()
 		}
 		logger.Info("resolveStemcellImage: extracted",
 			log.String("source", imagePath),
