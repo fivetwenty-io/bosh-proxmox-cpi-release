@@ -29,15 +29,25 @@ addons:
         #!/usr/bin/env bash
         set -euo pipefail
 
+        # qemu-guest-agent.service on Ubuntu Noble is a STATIC unit (no
+        # [Install] section, no WantedBy). It is activated by udev via the
+        # virtio-serial device. `systemctl enable` errors on static units, so
+        # use `start` only (idempotent — no-op if already running).
+        start_qga() {
+          systemctl start qemu-guest-agent.service 2>/dev/null || true
+        }
+
         if command -v qemu-ga >/dev/null 2>&1; then
-          systemctl enable --now qemu-guest-agent || true
+          start_qga
           exit 0
         fi
 
         export DEBIAN_FRONTEND=noninteractive
-        apt-get update -y
+        if ! apt-get update -y; then
+          echo "pve-guest-agent: apt-get update had errors, continuing" >&2
+        fi
         apt-get install -y --no-install-recommends qemu-guest-agent
-        systemctl enable --now qemu-guest-agent
+        start_qga
   include:
     stemcell:
     - os: ubuntu-jammy
