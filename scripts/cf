@@ -14,6 +14,7 @@ Commands:
     cloud-config       Upload the cf cloud-config.
     stemcell           Upload the stemcell pinned by cf-deployment (skips if present).
     check-uaa-db       Fail fast if uaa schema is in the Flyway-rename trap.
+    unstick-agent      Restart bosh-agent on an instance via PVE qga (bypasses NATS).
     bosh-deploy        Run only the bosh deploy step.
     api                Point the cf CLI at https://api.<system_domain>.
     login              cf api + cf login -u admin (password from credhub).
@@ -33,6 +34,7 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -186,6 +188,82 @@ def cmd_check_uaa_db(_extra: list[str]) -> None:
     print("    OK")
 
 
+def cmd_unstick_agent(extra: list[str]) -> None:
+    """Force-restart the BOSH agent on an instance via PVE qemu-guest-agent.
+
+    The director's RPC channel (NATS mbus) into a long-lived agent can
+    wedge after a sustained crashloop on the VM — the agent keeps
+    sending heartbeats but stops replying to `get_state` / `run_script`
+    inside the 45s budget, and every subsequent deploy fails with
+    `Timed out sending '<action>' to instance: <inst>` even after the
+    underlying workload is healthy.
+
+    `bosh ssh` itself goes through the same wedged channel so it is
+    not a recovery tool here. We bypass BOSH entirely: look up the PVE
+    VMID from `bosh vms`, ssh into the PVE host, and use
+    `qm guest exec <vmid>` to issue `systemctl restart bosh-agent`
+    directly inside the VM.
+
+    Usage: ./scripts/cf unstick-agent <instance>
+        instance: bosh-style identifier ("uaa/0", "diego-cell/<uuid>")
+    """
+    if not extra:
+        sys.exit("usage: scripts/cf unstick-agent <instance>")
+    target = extra[0]
+    banner(f"unstick-agent {target}")
+
+    raw = capture(
+        "bosh", "-e", ENV, "-d", DEPLOYMENT, "vms",
+        "--column=instance", "--column=vm_cid",
+    )
+    cid = None
+    for line in raw.splitlines():
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        inst, vm_cid = parts[0], parts[1]
+        if inst == target:
+            cid = vm_cid
+            break
+        job, sep, ref = inst.partition("/")
+        if sep and (target == job or target == f"{job}/{ref}"):
+            cid = vm_cid
+            break
+        try:
+            idx = int(target.split("/", 1)[1])
+        except (ValueError, IndexError):
+            idx = None
+        if idx is not None and target.split("/", 1)[0] == job:
+            cid = vm_cid
+            break
+    if not cid:
+        sys.exit(f"no VM cid found for instance {target!r} in deployment {DEPLOYMENT}")
+    print(f"    instance {target} -> PVE vmid {cid}")
+
+    pve_host = capture("bosh", "int", str(BOSH_VARS), "--path=/pve_host")
+    print(f"    pve host: {pve_host}")
+
+    probe = (
+        "set -e; "
+        "systemctl restart bosh-agent && "
+        "sleep 3 && "
+        "systemctl is-active bosh-agent"
+    )
+    print("    restarting bosh-agent via qemu-guest-agent...")
+    result = subprocess.run(
+        ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
+         f"root@{pve_host}",
+         f"qm guest exec {cid} --timeout 20 -- /bin/sh -c {shlex.quote(probe)}"],
+        capture_output=True, text=True, check=False,
+    )
+    out = (result.stdout or "") + (result.stderr or "")
+    if result.returncode != 0 or '"exitcode" : 0' not in out:
+        sys.exit(f"qm guest exec failed (rc={result.returncode}):\n{out}")
+    if "active" not in out:
+        sys.exit(f"agent did not report active:\n{out}")
+    print("    bosh-agent active")
+
+
 def cmd_bosh_deploy(extra: list[str]) -> None:
     banner("Deploy")
     run(
@@ -263,6 +341,7 @@ COMMANDS = {
     "cloud-config": cmd_cloud_config,
     "stemcell": cmd_stemcell,
     "check-uaa-db": cmd_check_uaa_db,
+    "unstick-agent": cmd_unstick_agent,
     "bosh-deploy": cmd_bosh_deploy,
     "api": cmd_api,
     "login": cmd_login,
