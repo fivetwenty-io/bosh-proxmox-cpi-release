@@ -104,9 +104,54 @@ The per-storage lock is held for the duration of the underlying I/O. A 4 GB stem
 
 - **Watch `iostat -xz 2` during a deploy.** A storage backend pinned at 100 % `%util` is the bottleneck regardless of API worker count.
 
-## 6. Verify Together After Tuning
+## 6. TCP Keepalives for Long-Lived BOSH Agent → Director Connections
 
-After applying sections 1–2:
+Every BOSH-managed VM holds a long-lived TLS+TCP connection from its
+bosh-agent to the director's NATS server on port 4222. Idle stretches
+between deploy phases can exceed the host's default TCP keepalive
+window (Linux defaults: `tcp_keepalive_time=7200` s before the first
+keepalive probe is sent), at which point a stateful bridge,
+conntrack entry, or upstream router may silently drop the half-open
+flow. The next packet from either side gets RST'd, the agent reconnects,
+and any RPC the director published during the gap is lost — surfacing
+as `Timed out sending '<verb>' to instance: <inst>'`.
+
+This is a *path-level* failure, distinct from the NATS-server
+`ping_interval` (handled at the director itself via
+`manifests/bosh/nats-tuning.yml`). Tighter host-level keepalives
+ensure the TCP flow keeps reannouncing itself to anything tracking
+it, well before any reasonable idle-drop timer fires.
+
+Apply on every PVE node:
+
+```sh
+cat >/etc/sysctl.d/60-bosh-nats-keepalive.conf <<'EOF'
+# Send the first TCP keepalive after 60 s idle (default 7200).
+net.ipv4.tcp_keepalive_time = 60
+
+# Then a probe every 15 s (default 75).
+net.ipv4.tcp_keepalive_intvl = 15
+
+# Drop the connection after 4 unanswered probes (default 9).
+net.ipv4.tcp_keepalive_probes = 4
+EOF
+sysctl --system
+```
+
+If a Linux bridge or `iptables`/`nftables` rule on the host is doing
+conntrack on the agent → director flow, also confirm
+`net.netfilter.nf_conntrack_tcp_timeout_established` is well above
+the cumulative keepalive window (default 432000 s — no action needed
+unless an operator lowered it).
+
+These knobs do not affect the agent's own NATS Go client (which has
+its own application-level PING/PONG). They only keep network
+elements between the VM and the director from concluding the flow
+is dead during quiet periods.
+
+## 7. Verify Together After Tuning
+
+After applying sections 1–3:
 
 ```sh
 grep -E '^(MAX_WORKERS|TIMEOUT)' /etc/default/pvedaemon /etc/default/pveproxy
@@ -115,6 +160,14 @@ systemctl status pvedaemon pveproxy --no-pager | grep -E '(Active|Main PID)'
 ```
 
 Then run a BOSH deploy that previously showed contention and watch the CPI log for `pve: storage lock timeout, retrying` lines. If retry counts drop and `attempt` values stay below 3, the tuning landed. If retries are still climbing past 5, contention is structural — work on sections 4 and 5.
+
+After applying section 6:
+
+```sh
+sysctl net.ipv4.tcp_keepalive_time net.ipv4.tcp_keepalive_intvl net.ipv4.tcp_keepalive_probes
+```
+
+Then run a deploy long enough to traverse a quiet phase (cf-deployment package compile, for instance) and confirm `bosh vms` does not surface `unresponsive agent` for instances that have been idle.
 
 ## What Not to Tune
 

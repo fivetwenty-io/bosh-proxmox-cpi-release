@@ -1,0 +1,34 @@
+---
+# Ops file: relax the director NATS server's ping window so BOSH agents
+# under sustained CPU/IO load are not RST'd mid-deploy.
+#
+# Background
+# ----------
+# The bosh release's `nats` job templates `ping_interval: 5s` and
+# `ping_max_outstanding: 2` into nats.cfg. That gives any connected
+# agent ~15 seconds to PONG before the server resets its TCP
+# connection. The agent's NATS Go client reconnects, but core NATS
+# does not buffer messages for offline subscribers, so any
+# get_state / run_script the director published during the gap is
+# lost — and the next attempt surfaces as
+#   `Timed out sending '<verb>' to instance: <inst>'`
+# in the deploy log, with `bosh vms` showing `unresponsive agent`.
+#
+# In practice 15 s is too tight: UAA Java boot (Flyway + Spring
+# init), monit reloads after configure-jobs, large package installs
+# on diego-cells all easily block the agent's NATS handler past that
+# window. Bumping ping_interval to 30 s (with ping_max_outstanding=2
+# kept at default) widens the grace period to ~90 s. Heartbeat-based
+# liveness detection (hm.agent.heartbeat.*) is unaffected — that
+# channel is independent of the mbus PING/PONG.
+#
+# Usage: applied automatically by `scripts/bosh create-env`.
+# Takes effect on the next director redeploy.
+
+- type: replace
+  path: /instance_groups/name=bosh/properties/nats/ping_interval?
+  value: 30s
+
+- type: replace
+  path: /instance_groups/name=bosh/properties/nats/ping_max_outstanding?
+  value: 2
