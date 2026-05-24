@@ -233,14 +233,18 @@ func (c *CPIConfig) Validate() error {
 		errs = append(errs, "network_bridge is required")
 	}
 
-	// Authentication: exactly one of password or api_token must be set.
+	// Authentication: at least one of password or api_token must be set.
+	// When both are present (e.g. kit renders a placeholder password alongside
+	// a real api_token because credhub entombment rejects empty values), the
+	// api_token wins — clear the password so downstream code uses tokens.
 	hasPassword := c.Password != ""
 	hasToken := c.APIToken != ""
-	switch {
-	case !hasPassword && !hasToken:
+	if hasPassword && hasToken {
+		c.Password = ""
+		hasPassword = false
+	}
+	if !hasPassword && !hasToken {
 		errs = append(errs, "one of password or api_token is required")
-	case hasPassword && hasToken:
-		errs = append(errs, "password and api_token are mutually exclusive; provide only one")
 	}
 
 	// Port range.
