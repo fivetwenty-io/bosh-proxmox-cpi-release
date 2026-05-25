@@ -268,6 +268,10 @@ func IsPmxcfsConfigMissing(err error) bool {
 		return false
 	}
 	msg := err.Error()
-	return strings.Contains(msg, "Configuration file ") &&
-		strings.Contains(msg, "does not exist")
+	// Two surfaces for the same condition:
+	//   qm config / qm resize: "Configuration file '...' does not exist"
+	//   qm stop / qm destroy:  "unable to find configuration file for VM <id> on node '<node>'"
+	return (strings.Contains(msg, "Configuration file ") &&
+		strings.Contains(msg, "does not exist")) ||
+		strings.Contains(msg, "unable to find configuration file")
 }

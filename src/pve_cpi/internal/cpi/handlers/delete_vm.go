@@ -75,6 +75,17 @@ func HandleDeleteVM(deps Deps) cpi.Handler {
 		}
 		if stopUPID != "" {
 			if awaitErr := pve.AwaitTaskWithLogger(ctx, deps.PVE, node, stopUPID, logger); awaitErr != nil {
+				// A qmstop task can be accepted (Stop returns a UPID) yet fail
+				// when the VM's config has already been removed — surfaced as
+				// "unable to find configuration file for VM ...". For delete_vm
+				// that means the target is already gone, so treat it as success.
+				if pve.IsNotFound(awaitErr) || pve.IsPmxcfsConfigMissing(awaitErr) {
+					logger.Info("delete_vm: VM config missing during stop await — already deleted, returning success")
+					if agentErr := deps.Agent.Remove(ctx, node, vmid); agentErr != nil {
+						logger.Warn("delete_vm: agent.Remove failed after idempotent stop-await", log.Err(agentErr))
+					}
+					return nil, nil
+				}
 				return nil, cpierrors.Wrap(pve.WrapError(awaitErr),
 					fmt.Sprintf("delete_vm: await stop task for VM %s", vmCID))
 			}
