@@ -131,12 +131,22 @@ func TestValidate_AuthMissing(t *testing.T) {
 // --------------------------------------------------------------------------
 
 func TestValidate_AuthBoth(t *testing.T) {
-	_, err := mustLoad(t, `{
+	cfg, err := mustLoad(t, `{
 		"host": "h", "user": "u",
 		"password": "pw", "api_token": "tok",
 		"vm_storage": "s", "disk_storage": "s", "network_bridge": "br"
 	}`)
-	assertCloudError(t, err, "mutually exclusive")
+	// When both password and api_token are supplied, the api_token wins and
+	// the password is cleared so downstream code authenticates with the token.
+	if err != nil {
+		t.Fatalf("expected no error when both credentials set, got %v", err)
+	}
+	if cfg.APIToken != "tok" {
+		t.Errorf("expected api_token preserved, got %q", cfg.APIToken)
+	}
+	if cfg.Password != "" {
+		t.Errorf("expected password cleared when api_token present, got %q", cfg.Password)
+	}
 }
 
 // --------------------------------------------------------------------------
