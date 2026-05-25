@@ -60,6 +60,7 @@ type createVMCloudProps struct {
 	Cores               int    `json:"cores"`
 	Sockets             int    `json:"sockets"`
 	Memory              int    `json:"memory"`         // MiB
+	RAM                 int    `json:"ram"`            // MiB (alias for memory)
 	VMDiskFormat        string `json:"vm_disk_format"` // qcow2|raw|vmdk
 	TargetNode          string `json:"target_node"`
 	EphemeralDiskSizeMB int    `json:"ephemeral_disk_size_mb"`
@@ -284,6 +285,9 @@ func createVM(
 		sockets = 1
 	}
 	memMiB := cloudProps.Memory
+	if memMiB <= 0 {
+		memMiB = cloudProps.RAM
+	}
 	if memMiB <= 0 {
 		memMiB = 512
 	}
