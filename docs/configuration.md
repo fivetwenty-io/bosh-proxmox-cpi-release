@@ -18,6 +18,8 @@ The CPI is configured via properties in a BOSH deployment manifest. The job temp
 | `pve.verify_ssl` | Verify TLS certificates | `true` | no |
 | `pve.agent_mode` | Agent bootstrap mode (`cloudinit`, `registry`, `noagent`) | `cloudinit` | no |
 | `pve.vm_disk_format` | Disk image format (`qcow2`, `raw`, `vmdk`) | `qcow2` | no |
+| `pve.reboot_mode` | `reboot_vm` strategy: `soft` (graceful ACPI reboot, hard-reset fallback) or `hard` (immediate reset) | `soft` | no |
+| `pve.reboot_timeout` | Seconds to wait for graceful shutdown before hard-reset fallback (soft mode only) | `60` | no |
 | `pve.log_level` | Log level (`debug`, `info`, `warn`, `error`) | `info` | no |
 | `pve.vmid_range_start` | First VMID used for VM allocation. VMs use `[vmid_range_start, 5999]`. Persistent disks use `[9000, 9999]`. | `100` | no |
 | `registry.endpoint` | BOSH registry URL | - | yes when `agent_mode = registry` |

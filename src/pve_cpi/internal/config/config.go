@@ -106,6 +106,17 @@ type CPIConfig struct {
 	// "<deployment>" segment. Defaults to "create-env" so a director booted
 	// via create-env shows up as "<prefix>-create-env-bosh-0".
 	CreateEnvDeployment string `json:"create_env_deployment,omitempty"`
+
+	// RebootMode selects the reboot_vm strategy. "soft" (default) issues a
+	// graceful ACPI shutdown/reboot and falls back to a hard reset after
+	// RebootTimeout seconds if the guest has not powered off. "hard" issues an
+	// immediate /status/reset without a graceful-wait phase.
+	RebootMode string `json:"reboot_mode,omitempty"`
+
+	// RebootTimeout is the number of seconds the soft reboot path waits for a
+	// graceful ACPI shutdown before falling back to a hard reset. Ignored when
+	// RebootMode is "hard". Valid range 1–3600; defaults to 60.
+	RebootTimeout int `json:"reboot_timeout,omitempty"`
 }
 
 // Load decodes CPIConfig from r, applies defaults, then validates.
@@ -191,6 +202,31 @@ func (c *CPIConfig) ApplyDefaults() {
 	if c.CreateEnvDeployment == "" {
 		c.CreateEnvDeployment = "create-env"
 	}
+	if c.RebootMode == "" {
+		c.RebootMode = "soft"
+	}
+	if c.RebootTimeout <= 0 {
+		c.RebootTimeout = 60
+	}
+}
+
+// RebootModeValue returns the effective reboot mode, defaulting to "soft" when
+// the field is empty (e.g. config constructed manually without ApplyDefaults).
+func (c *CPIConfig) RebootModeValue() string {
+	if c.RebootMode == "" {
+		return "soft"
+	}
+	return c.RebootMode
+}
+
+// RebootTimeoutValue returns the effective reboot timeout in seconds, defaulting
+// to 60 when the field is zero or negative (e.g. config constructed manually
+// without ApplyDefaults).
+func (c *CPIConfig) RebootTimeoutValue() int {
+	if c.RebootTimeout <= 0 {
+		return 60
+	}
+	return c.RebootTimeout
 }
 
 // HotplugValue returns the effective hotplug flag, falling back to the
@@ -286,6 +322,23 @@ func (c *CPIConfig) Validate() error {
 	if c.VMIDRangeStart < 100 {
 		errs = append(errs, fmt.Sprintf(
 			"vmid_range_start must be ≥100 (PVE reserved range), got %d", c.VMIDRangeStart,
+		))
+	}
+
+	// RebootMode enum.
+	switch c.RebootMode {
+	case "soft", "hard":
+		// valid
+	default:
+		errs = append(errs, fmt.Sprintf(
+			`reboot_mode must be one of soft|hard, got %q`, c.RebootMode,
+		))
+	}
+
+	// RebootTimeout range: 1–3600 seconds.
+	if c.RebootTimeout < 1 || c.RebootTimeout > 3600 {
+		errs = append(errs, fmt.Sprintf(
+			"reboot_timeout must be 1-3600 seconds, got %d", c.RebootTimeout,
 		))
 	}
 

@@ -49,6 +49,8 @@ type mockQEMUService struct {
 	createFn func(ctx context.Context, node string, params map[string]interface{}) (string, error)
 	stopFn   func(ctx context.Context, node string, vmid int) (string, error)
 	resetFn  func(ctx context.Context, node string, vmid int) (string, error)
+	startFn  func(ctx context.Context, node string, vmid int) (string, error)
+	statusFn func(ctx context.Context, node string, vmid int) (map[string]interface{}, error)
 	configFn func(ctx context.Context, node string, vmid int) (map[string]interface{}, error)
 }
 
@@ -84,13 +86,21 @@ func (m *mockQEMUService) Create(ctx context.Context, node string, params map[st
 	return "upid-mock-create", nil
 }
 
+func (m *mockQEMUService) Status(ctx context.Context, node string, vmid int) (map[string]interface{}, error) {
+	if m.statusFn != nil {
+		return m.statusFn(ctx, node, vmid)
+	}
+	panic("mockQEMUService.Status: not configured")
+}
+
+func (m *mockQEMUService) Start(ctx context.Context, node string, vmid int) (string, error) {
+	if m.startFn != nil {
+		return m.startFn(ctx, node, vmid)
+	}
+	panic("mockQEMUService.Start: not configured")
+}
+
 // Unimplemented qemu.Service methods — panic on accidental call.
-func (m *mockQEMUService) Status(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
-	panic("mockQEMUService.Status: not expected")
-}
-func (m *mockQEMUService) Start(_ context.Context, _ string, _ int) (string, error) {
-	panic("mockQEMUService.Start: not expected")
-}
 func (m *mockQEMUService) Clone(_ context.Context, _ string, _ int, _ map[string]interface{}) (string, error) {
 	panic("mockQEMUService.Clone: not expected")
 }
@@ -124,13 +134,14 @@ func (m *mockQEMUService) RollbackSnapshot(_ context.Context, _ string, _ int, _
 // --------------------------------------------------------------------------
 
 // mockNodesService embeds panicNodesStub and overrides the methods
-// used by delete_vm, set_vm_metadata, and direct-qcow handlers.
+// used by delete_vm, reboot_vm, set_vm_metadata, and direct-qcow handlers.
 // ListStorageContentFn defaults to returning an empty response when nil.
 type mockNodesService struct {
 	panicNodesStub
-	deleteQemuFn         func(ctx context.Context, node string, vmid string, params *nodes.DeleteQemuParams) (*nodes.DeleteQemuResponse, error)
-	updateQemuConfigFn   func(ctx context.Context, node string, vmid string, params *nodes.UpdateQemuConfigParams) error
-	listStorageContentFn func(ctx context.Context, node string, storage string, params *nodes.ListStorageContentParams) (*nodes.ListStorageContentResponse, error)
+	deleteQemuFn             func(ctx context.Context, node string, vmid string, params *nodes.DeleteQemuParams) (*nodes.DeleteQemuResponse, error)
+	updateQemuConfigFn       func(ctx context.Context, node string, vmid string, params *nodes.UpdateQemuConfigParams) error
+	listStorageContentFn     func(ctx context.Context, node string, storage string, params *nodes.ListStorageContentParams) (*nodes.ListStorageContentResponse, error)
+	createQemuStatusRebootFn func(ctx context.Context, node string, vmid string, params *nodes.CreateQemuStatusRebootParams) (*nodes.CreateQemuStatusRebootResponse, error)
 }
 
 func (m *mockNodesService) DeleteQemu(ctx context.Context, node string, vmid string, params *nodes.DeleteQemuParams) (*nodes.DeleteQemuResponse, error) {
@@ -154,6 +165,13 @@ func (m *mockNodesService) ListStorageContent(ctx context.Context, node string, 
 	// Default: empty storage content — no volumes present.
 	empty := nodes.ListStorageContentResponse{}
 	return &empty, nil
+}
+
+func (m *mockNodesService) CreateQemuStatusReboot(ctx context.Context, node string, vmid string, params *nodes.CreateQemuStatusRebootParams) (*nodes.CreateQemuStatusRebootResponse, error) {
+	if m.createQemuStatusRebootFn != nil {
+		return m.createQemuStatusRebootFn(ctx, node, vmid, params)
+	}
+	panic("mockNodesService.CreateQemuStatusReboot: not configured")
 }
 
 // --------------------------------------------------------------------------

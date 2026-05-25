@@ -161,7 +161,12 @@ A VMID is allocated from the range `[vmid_range_start, 5999]` (default: `[100, 5
 
 **Errors:** `Bosh::Clouds::CloudError` on PVE API failure
 
-**Notes:** Issues a PVE reboot command. The VM may be running or stopped. The Director waits for agent heartbeat after reboot, not for the CPI to confirm boot completion.
+**Notes:** Reboots the VM using the strategy set by `pve.reboot_mode` (default `soft`).
+
+- **soft** (default): sends a graceful ACPI reboot via the PVE API and waits up to `pve.reboot_timeout` seconds (default 60) for the guest to respond. If the guest does not shut down in time, or the reboot call fails for any reason other than a 404, the CPI falls back to a hard reset automatically. A 404 response means the VM was not found and raises `Bosh::Clouds::CloudError`.
+- **hard**: issues an immediate hard reset (power cycle) with no grace period. This was the only behavior before the `reboot_mode` option was introduced.
+
+If the VM is stopped when `reboot_vm` is called, the CPI starts it so the VM ends up running, matching the BOSH expectation. The BOSH wire contract is unchanged: `reboot_vm` accepts only `vm_cid`.
 
 ---
 

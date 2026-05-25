@@ -79,6 +79,19 @@ properties:
       silently no-ops. Set false to disable globally; per-VM override via
       cloud_properties.numa.
     default: true
+  pve.reboot_mode:
+    description: |
+      reboot_vm behavior. "soft" (default) performs a graceful ACPI reboot
+      (shutdown + auto-start) and falls back to a hard reset if the guest
+      does not shut down within reboot_timeout seconds. "hard" performs an
+      immediate hard reset (power cycle). One of soft|hard.
+    default: "soft"
+  pve.reboot_timeout:
+    description: |
+      Seconds the soft reboot waits for graceful ACPI shutdown before
+      falling back to a hard reset. Range 1-3600. Ignored when
+      reboot_mode is "hard".
+    default: 60
   pve.vmid_range_start:
     description: |
       Starting VMID for VM allocation. VMs are allocated in the range

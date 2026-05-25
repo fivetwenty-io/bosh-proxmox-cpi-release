@@ -415,6 +415,104 @@ func TestValidate_MultipleErrors(t *testing.T) {
 }
 
 // --------------------------------------------------------------------------
+// TestApplyDefaults_RebootFields
+// --------------------------------------------------------------------------
+
+// TestApplyDefaults_RebootFields verifies that ApplyDefaults fills in the
+// reboot_mode and reboot_timeout defaults when both fields are absent.
+func TestApplyDefaults_RebootFields(t *testing.T) {
+	var cfg config.CPIConfig
+	cfg.VMStorage = "vm-store"
+	cfg.ApplyDefaults()
+
+	if cfg.RebootModeValue() != "soft" {
+		t.Errorf("RebootModeValue() = %q, want %q", cfg.RebootModeValue(), "soft")
+	}
+	if cfg.RebootTimeoutValue() != 60 {
+		t.Errorf("RebootTimeoutValue() = %d, want 60", cfg.RebootTimeoutValue())
+	}
+}
+
+// --------------------------------------------------------------------------
+// TestApplyDefaults_RebootFieldsExplicit
+// --------------------------------------------------------------------------
+
+// TestApplyDefaults_RebootFieldsExplicit ensures explicit values survive ApplyDefaults.
+func TestApplyDefaults_RebootFieldsExplicit(t *testing.T) {
+	var cfg config.CPIConfig
+	cfg.VMStorage = "vm-store"
+	cfg.RebootMode = "hard"
+	cfg.RebootTimeout = 120
+	cfg.ApplyDefaults()
+
+	if cfg.RebootModeValue() != "hard" {
+		t.Errorf("RebootModeValue() = %q, want %q (must not overwrite explicit hard)", cfg.RebootModeValue(), "hard")
+	}
+	if cfg.RebootTimeoutValue() != 120 {
+		t.Errorf("RebootTimeoutValue() = %d, want 120 (must not overwrite explicit 120)", cfg.RebootTimeoutValue())
+	}
+}
+
+// --------------------------------------------------------------------------
+// TestValidate_RebootModeInvalid
+// --------------------------------------------------------------------------
+
+func TestValidate_RebootModeInvalid(t *testing.T) {
+	_, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+		"reboot_mode":"graceful"
+	}`)
+	assertCloudError(t, err, "reboot_mode must be one of soft|hard")
+}
+
+// --------------------------------------------------------------------------
+// TestValidate_RebootTimeoutZeroDefaulted
+// --------------------------------------------------------------------------
+
+// TestValidate_RebootTimeoutZeroDefaulted confirms reboot_timeout=0 (absent from JSON)
+// is defaulted to 60 before Validate runs, so no validation error fires.
+func TestValidate_RebootTimeoutZeroDefaulted(t *testing.T) {
+	cfg, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br"
+	}`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.RebootTimeoutValue() != 60 {
+		t.Errorf("RebootTimeoutValue() = %d, want 60 after default", cfg.RebootTimeoutValue())
+	}
+}
+
+// --------------------------------------------------------------------------
+// TestValidate_RebootTimeoutTooLarge
+// --------------------------------------------------------------------------
+
+func TestValidate_RebootTimeoutTooLarge(t *testing.T) {
+	// Must construct manually and call Validate after ApplyDefaults to force
+	// an out-of-range value through without JSON decode clamping it.
+	cfg := &config.CPIConfig{
+		Host:           "h",
+		User:           "u",
+		Password:       "p",
+		VMStorage:      "s",
+		DiskStorage:    "s",
+		NetworkBridge:  "br",
+		AgentMode:      "cloudinit",
+		VMDiskFormat:   "qcow2",
+		LogLevel:       "info",
+		VMIDRangeStart: 100,
+		Port:           8006,
+		VerifySSL:      boolPtr(true),
+		RebootMode:     "soft",
+		RebootTimeout:  3601,
+	}
+	err := cfg.Validate()
+	assertCloudError(t, err, "reboot_timeout must be 1-3600 seconds")
+}
+
+// --------------------------------------------------------------------------
 // TestLoad_RegistryMode_Valid
 // --------------------------------------------------------------------------
 
