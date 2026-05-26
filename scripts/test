@@ -309,9 +309,13 @@ def tier_bosh(cfg: dict, cpi_config_path: str, keep: bool) -> int:
     tier2 = cfg.get("tier2", {})
     alias = str(tier2.get("bosh_env_alias", "pve"))
     deployment = str(tier2.get("deployment_name", "emptyvm"))
-    smoke_timeout = tier2.get("smoke_timeout_s") or None
-    if smoke_timeout is not None:
-        smoke_timeout = int(smoke_timeout)
+    # The emptyvm deploy creates a VM, bootstraps its agent, compiles packages,
+    # and runs the instance update — minutes of work, not a quick smoke check.
+    # Give it its own generous timeout (default 30m); smoke_timeout_s is reserved
+    # for fast probes (e.g. the cf push/curl in tier 3).
+    deploy_timeout = tier2.get("deploy_timeout_s", 1800) or None
+    if deploy_timeout is not None:
+        deploy_timeout = int(deploy_timeout)
 
     # emptyvm deploys a bare stemcell VM, so the director needs an uploaded
     # stemcell first (create-env only stages the director's own VM). Resolve the
@@ -325,7 +329,7 @@ def tier_bosh(cfg: dict, cpi_config_path: str, keep: bool) -> int:
         ("ucc",             ["./scripts/bosh", "ucc"],             None,          None),
         ("runtime-config",  ["./scripts/bosh", "runtime-config"],  None,          None),
         ("upload-stemcell", ["./scripts/bosh", "upload-stemcell"], None,          {"STEMCELL_PATH": sc_path}),
-        ("emptyvm",         ["./scripts/bosh", "emptyvm"],         smoke_timeout, None),
+        ("emptyvm",         ["./scripts/bosh", "emptyvm"],         deploy_timeout, None),
         ("env",             ["./scripts/bosh", "env"],             None,          None),
     ]
 

@@ -804,7 +804,7 @@ def _print_summary(cfg: dict, dry_run: bool) -> None:
     print(f"  bosh_env_alias:   {tier2.get('bosh_env_alias')}")
     print(f"  director_name:    {tier2.get('director_name')}")
     print(f"  deployment_name:  {tier2.get('deployment_name')}")
-    print(f"  smoke_timeout_s:  {tier2.get('smoke_timeout_s')}")
+    print(f"  deploy_timeout_s: {tier2.get('deploy_timeout_s', 1800)}")
     print()
     print("Tier 3 (cf):")
     print(f"  deployment_name:  {tier3.get('deployment_name')}")
