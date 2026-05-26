@@ -3,6 +3,7 @@ package handlers_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/cpi/handlers"
@@ -302,6 +303,48 @@ func TestHandleDeleteNetwork_Bridge_HappyPath(t *testing.T) {
 	}
 	if !updateNetworkCalled {
 		t.Error("UpdateNetwork must be called after bridge delete")
+	}
+}
+
+// -- DN-07b: Bridge fallback when SDN probe returns the "does not exist"
+// message rather than an HTTP 404. PVE's GET /cluster/sdn/vnets/<x> on a
+// missing vnet returns a generic error (code 0) with this text, not a 404, so
+// isSDNNotFound must detect it for the bridge fallback to trigger. --
+
+func TestHandleDeleteNetwork_Bridge_SDNDoesNotExistMessage(t *testing.T) {
+	var bridgeDeleteCalled bool
+
+	nodesSvc := &mockBridgeNodes{
+		deleteNetwork2Fn: func(_ context.Context, _ string, iface string) error {
+			bridgeDeleteCalled = true
+			if iface != "vmbr9" {
+				t.Errorf("iface: got %q, want vmbr9", iface)
+			}
+			return nil
+		},
+		updateNetworkFn: func(_ context.Context, _ string, _ *sdknodes.UpdateNetworkParams) (*sdknodes.UpdateNetworkResponse, error) {
+			return nil, nil
+		},
+	}
+	clusterSvc := &mockSDNCluster{
+		getSdnVnetsFn: func(_ context.Context, _ string, _ *sdkcluster.GetSdnVnetsParams) (*sdkcluster.GetSdnVnetsResponse, error) {
+			return nil, errors.New(
+				`cluster.GetSdnVnets: GET "/cluster/sdn/vnets/vmbr9" failed: ` +
+					`API request failed: sdn vnet 'vmbr9' does not exist (code: 0)`)
+		},
+	}
+	cfg := testConfig()
+	cfg.Node = "pvenode"
+	deps := handlers.Deps{
+		Config: cfg,
+		PVE:    &mockPVEClient{clusterSvc: clusterSvc, nodesSvc: nodesSvc},
+		Logger: log.NewNopLogger(),
+	}
+	if err := invokeDeleteNetwork(t, deps, "vmbr9"); err != nil {
+		t.Fatalf("unexpected error — bridge fallback should have run: %v", err)
+	}
+	if !bridgeDeleteCalled {
+		t.Error("DeleteNetwork2 must be called via bridge fallback on SDN 'does not exist'")
 	}
 }
 

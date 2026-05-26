@@ -9,8 +9,8 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
+	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
 	sdkcluster "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cluster"
 	pveerr "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/errors"
@@ -68,8 +68,13 @@ func validateVnetName(name string) error {
 	return nil
 }
 
-// isSDNNotFound returns true when err is a PVE API 404 error.
-// Handles the pveerr.APIError chain from cluster_gen error wrapping.
+// isSDNNotFound returns true when err indicates an absent SDN resource.
+// Handles the pveerr.APIError chain from cluster_gen error wrapping, plus PVE's
+// SDN-specific absence message: a GET/DELETE on a missing vnet/zone/subnet does
+// not return HTTP 404 — it returns a generic error (code 0) whose message reads
+// "sdn vnet 'X' does not exist" (likewise for zones/subnets). Without matching
+// that text, delete_network would surface the probe error instead of falling
+// back to the bridge path (or treating the SDN resource as already gone).
 func isSDNNotFound(err error) bool {
 	if err == nil {
 		return false
@@ -81,9 +86,12 @@ func isSDNNotFound(err error) bool {
 	// Unwrap APIError and check IsNotFound().
 	var apiErr *pveerr.APIError
 	if errors.As(err, &apiErr) {
-		return apiErr.IsNotFound()
+		if apiErr.IsNotFound() {
+			return true
+		}
 	}
-	return false
+	// PVE SDN absence message (not surfaced as HTTP 404).
+	return strings.Contains(strings.ToLower(err.Error()), "does not exist")
 }
 
 // isSDNConflict returns true when err indicates a 409 Conflict (already exists).
