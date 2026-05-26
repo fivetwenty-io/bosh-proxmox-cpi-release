@@ -437,6 +437,9 @@ def tier_cf(cfg: dict, cpi_config_path: str, keep: bool) -> int:
         ("cf create-org",    ["cf", "create-org", smoke_org],                         None,          6),
         ("cf create-space",  ["cf", "create-space", smoke_space, "-o", smoke_org],    None,          3),
         ("cf target",        ["cf", "target", "-o", smoke_org, "-s", smoke_space],    None,          2),
+        # The smoke app is a docker image, so diego_docker must be enabled
+        # (admin-scoped, off by default in cf-deployment). Idempotent.
+        ("enable docker",    ["cf", "enable-feature-flag", "diego_docker"],           None,          2),
         ("cf push",          ["cf", "push", smoke_app,
                               "-o", "ghcr.io/mccutchen/go-httpbin"],                  smoke_timeout, 1),
         ("cf map-route",     ["cf", "map-route", smoke_app,
