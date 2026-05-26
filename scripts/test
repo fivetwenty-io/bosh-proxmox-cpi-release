@@ -1,20 +1,461 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
+# dependencies = ["pyyaml"]
 # ///
-"""Run the project test/check suite via make."""
+"""Run project tests or the integration test harness.
+
+Usage:
+    ./scripts/test                      Run unit/check suite (make check).
+    ./scripts/test integration [action] Run integration tier(s).
+
+Integration actions:
+    all        Teardown existing env, then run lifecycle → bosh → cf (default).
+    lifecycle  Run only Tier 1: CPI 16-step lifecycle test.
+    bosh       Run only Tier 2: bosh create-env + emptyvm smoke.
+    cf         Run only Tier 3: CF deploy + smoke app.
+    teardown   Tear down CF deployment and BOSH director.
+
+Integration flags:
+    --config FILE   Path to integration config YAML (default: ci/integration.yml).
+    --dry-run       Print each command without executing; exit 0.
+    --keep          Skip cleanup steps after each tier (leave resources running).
+"""
 
 from __future__ import annotations
 
+import atexit
+import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
+# Populated once from parsed args; run() reads this module-level flag.
+_dry_run: bool = False
+
+
+# ---------------------------------------------------------------------------
+# subprocess helper
+# ---------------------------------------------------------------------------
+
+
+def run(
+    cmd: list[str],
+    env: dict[str, str] | None = None,
+    check: bool = True,
+    cwd: Path | None = None,
+    timeout: int | None = None,
+) -> int:
+    """Run a command, respecting dry_run mode.
+
+    In dry_run mode, prints the command prefixed with 'DRY-RUN:' and returns 0
+    without executing.  In live mode, inherits the current process env merged
+    with any extra vars in *env*, injects NO_COLOR=1 when stdout is not a TTY,
+    and returns the subprocess returncode.
+
+    Args:
+        cmd:     Command and arguments as a list.
+        env:     Optional dict of additional env vars to merge into the child env.
+        check:   When True, raise CalledProcessError on non-zero exit.
+        cwd:     Working directory for the child process (default: REPO_ROOT).
+        timeout: Optional timeout in seconds; on expiry prints the step label
+                 and returns 1.  None means no timeout.
+
+    Returns:
+        Process returncode (always 0 in dry_run mode).
+
+    Raises:
+        subprocess.CalledProcessError: Non-zero exit when check=True.
+    """
+    if _dry_run:
+        print(f"DRY-RUN: {shlex.join(cmd)}")
+        return 0
+
+    child_env = os.environ.copy()
+    if not sys.stdout.isatty():
+        child_env["NO_COLOR"] = "1"
+    if env:
+        child_env.update(env)
+
+    try:
+        result = subprocess.run(
+            cmd,
+            env=child_env,
+            cwd=cwd or REPO_ROOT,
+            check=check,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        print(f"{shlex.join(cmd)} timed out after {timeout}s", file=sys.stderr)
+        return 1
+    return result.returncode
+
+
+# ---------------------------------------------------------------------------
+# Loader import
+# ---------------------------------------------------------------------------
+
+sys.path.insert(0, str(REPO_ROOT / "scripts"))
+import _integration  # noqa: E402
+
+
+# ---------------------------------------------------------------------------
+# Tier helpers
+# ---------------------------------------------------------------------------
+
+
+def tier_lifecycle(cfg: dict, cpi_config_path: str, keep: bool) -> int:
+    """Build bin/cpi then run scripts/lifecycle with the Tier 1 env.
+
+    Args:
+        cfg:             Validated config dict.
+        cpi_config_path: Path to the synthesized CPI JSON config.
+        keep:            Unused for lifecycle (lifecycle self-cleans).
+
+    Returns:
+        0 on success, 1 on failure.
+    """
+    print("==> tier 1: lifecycle")
+
+    rc = run(["make", "bin/cpi"], cwd=REPO_ROOT)
+    if rc != 0:
+        print("tier 1 failed: make bin/cpi", file=sys.stderr)
+        return 1
+
+    # Build tier1 env; in dry_run the stemcell_path may be empty.
+    if _dry_run:
+        try:
+            t1_env = _integration.tier1_env(cfg, cpi_config_path, dry_run=True)
+        except SystemExit:
+            # stemcell_path empty and STEMCELL_PATH not set — use a placeholder.
+            t1_env = _integration.tier1_env(
+                _cfg_with_stemcell(cfg, "<dry-run:stemcell>"),
+                cpi_config_path,
+                dry_run=True,
+            )
+    else:
+        t1_env = _integration.tier1_env(cfg, cpi_config_path, dry_run=False)
+
+    rc = run(["./scripts/lifecycle"], env=t1_env, cwd=REPO_ROOT)
+    if rc != 0:
+        print("tier 1 failed: scripts/lifecycle", file=sys.stderr)
+        return 1
+
+    print("==> tier 1: lifecycle passed")
+    return 0
+
+
+def _cfg_with_stemcell(cfg: dict, path: str) -> dict:
+    """Return a shallow copy of cfg with tier1.stemcell_path set to path."""
+    import copy
+    cfg2 = copy.deepcopy(cfg)
+    cfg2["tier1"]["stemcell_path"] = path
+    return cfg2
+
+
+def tier_bosh(cfg: dict, cpi_config_path: str, keep: bool) -> int:
+    """Run the Tier 2 BOSH director smoke sequence.
+
+    Steps: create-env → alias-env → ucc → runtime-config → emptyvm → env assert.
+    Unless keep, deletes the emptyvm deployment afterwards.
+
+    Args:
+        cfg:             Validated config dict.
+        cpi_config_path: Not used directly; director reads its own manifests.
+        keep:            When True, skip delete-deployment cleanup.
+
+    Returns:
+        0 on success, non-zero on first failure.
+    """
+    print("==> tier 2: bosh")
+    tier2 = cfg.get("tier2", {})
+    alias = str(tier2.get("bosh_env_alias", "pve"))
+    deployment = str(tier2.get("deployment_name", "emptyvm"))
+    smoke_timeout = tier2.get("smoke_timeout_s") or None
+    if smoke_timeout is not None:
+        smoke_timeout = int(smoke_timeout)
+
+    steps = [
+        ("create-env",      ["./scripts/bosh", "create-env"],     None),
+        ("alias-env",       ["./scripts/bosh", "alias-env"],      None),
+        ("ucc",             ["./scripts/bosh", "ucc"],             None),
+        ("runtime-config",  ["./scripts/bosh", "runtime-config"], None),
+        ("emptyvm",         ["./scripts/bosh", "emptyvm"],         smoke_timeout),
+        ("env",             ["./scripts/bosh", "env"],             None),
+    ]
+
+    for step_name, cmd, step_timeout in steps:
+        rc = run(cmd, cwd=REPO_ROOT, timeout=step_timeout)
+        if rc != 0:
+            print(f"tier 2 failed: {step_name}", file=sys.stderr)
+            return rc
+
+    if not keep:
+        d_env = _integration.director_env(cfg, dry_run=_dry_run)
+        rc = run(
+            ["bosh", "-e", alias, "-d", deployment, "delete-deployment", "-n"],
+            env=d_env,
+            cwd=REPO_ROOT,
+        )
+        if rc != 0:
+            print(f"tier 2 failed: delete-deployment {deployment}", file=sys.stderr)
+            return rc
+
+    print("==> tier 2: bosh passed")
+    return 0
+
+
+def tier_cf(cfg: dict, cpi_config_path: str, keep: bool) -> int:
+    """Run the Tier 3 CF deploy and smoke app sequence.
+
+    Steps: cf deploy → cf login → create org/space → cf push smoke app →
+    map-route → curl HTTP 200 assert. Unless keep, deletes app/space/org.
+
+    Args:
+        cfg:             Validated config dict.
+        cpi_config_path: Not used directly; scripts/cf reads its own manifests.
+        keep:            When True, skip delete cleanup.
+
+    Returns:
+        0 on success, non-zero on first failure.
+    """
+    print("==> tier 3: cf")
+    tier3 = cfg.get("tier3", {})
+    smoke_org   = str(tier3.get("smoke_org", "integration-smoke"))
+    smoke_space = str(tier3.get("smoke_space", "test"))
+    smoke_app   = str(tier3.get("smoke_app", "httpbin-smoke"))
+    smoke_timeout = tier3.get("smoke_timeout_s") or None
+    if smoke_timeout is not None:
+        smoke_timeout = int(smoke_timeout)
+
+    sys_domain = _integration.system_domain(cfg, dry_run=_dry_run)
+
+    # (step_name, cmd, timeout) — smoke_timeout applied to cf push and curl.
+    steps_before_push: list[tuple[str, list[str], int | None]] = [
+        ("cf deploy",        ["./scripts/cf", "deploy"],                              None),
+        ("cf login",         ["./scripts/cf", "login"],                               None),
+        ("cf create-org",    ["cf", "create-org", smoke_org],                         None),
+        ("cf create-space",  ["cf", "create-space", smoke_space, "-o", smoke_org],    None),
+        ("cf target",        ["cf", "target", "-o", smoke_org, "-s", smoke_space],    None),
+        ("cf push",          ["cf", "push", smoke_app,
+                              "-o", "ghcr.io/mccutchen/go-httpbin", "--wait"],        smoke_timeout),
+        ("cf map-route",     ["cf", "map-route", smoke_app,
+                              sys_domain, "--hostname", "smoke"],                     None),
+    ]
+
+    for step_name, cmd, step_timeout in steps_before_push:
+        rc = run(cmd, cwd=REPO_ROOT, timeout=step_timeout)
+        if rc != 0:
+            print(f"tier 3 failed: {step_name}", file=sys.stderr)
+            return rc
+
+    smoke_url = f"https://smoke.{sys_domain}/get"
+    rc = run(["curl", "-sf", smoke_url, "--insecure"], cwd=REPO_ROOT, timeout=smoke_timeout)
+    if rc != 0:
+        print(f"tier 3 failed: curl {smoke_url} (expected HTTP 200)", file=sys.stderr)
+        return rc
+
+    if not keep:
+        cleanup_steps: list[tuple[str, list[str]]] = [
+            ("cf delete app",   ["cf", "delete", "-f", smoke_app]),
+            ("cf delete-space", ["cf", "delete-space", "-f", smoke_space, "-o", smoke_org]),
+            ("cf delete-org",   ["cf", "delete-org", "-f", smoke_org]),
+        ]
+        for step_name, cmd in cleanup_steps:
+            rc = run(cmd, cwd=REPO_ROOT)
+            if rc != 0:
+                print(f"tier 3 cleanup failed: {step_name}", file=sys.stderr)
+                return rc
+
+    print("==> tier 3: cf passed")
+    return 0
+
+
+def teardown(cfg: dict) -> int:
+    """Tear down CF deployment then BOSH director (both idempotent).
+
+    Args:
+        cfg: Validated config dict (unused by teardown scripts directly;
+             passed for interface consistency and future use).
+
+    Returns:
+        0 on success, non-zero on first failure.
+    """
+    print("==> teardown")
+    for step_name, cmd in [
+        ("cf teardown",   ["./scripts/cf", "teardown"]),
+        ("bosh teardown", ["./scripts/bosh", "teardown"]),
+    ]:
+        rc = run(cmd, cwd=REPO_ROOT)
+        if rc != 0:
+            print(f"teardown failed: {step_name}", file=sys.stderr)
+            return rc
+    print("==> teardown complete")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Integration entry point
+# ---------------------------------------------------------------------------
+
+
+def cmd_integration(argv: list[str]) -> int:
+    """Parse integration subcommand args and dispatch to tier helpers.
+
+    Args:
+        argv: Arguments after 'integration' (sys.argv[2:]).
+
+    Returns:
+        0 pass, 1 tier failure, 2 usage/config error.
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="scripts/test integration",
+        description=(
+            "Run integration tier(s) against a live PVE environment.\n"
+            "Actions: all, lifecycle, bosh, cf, teardown."
+        ),
+    )
+    parser.add_argument(
+        "action",
+        nargs="?",
+        default="all",
+        choices=["all", "lifecycle", "bosh", "cf", "teardown"],
+        help="Tier to run (default: all).",
+    )
+    parser.add_argument(
+        "--config",
+        default="ci/integration.yml",
+        metavar="FILE",
+        help="Integration config YAML (default: ci/integration.yml).",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print commands without executing; exit 0.",
+    )
+    parser.add_argument(
+        "--keep",
+        action="store_true",
+        help="Skip cleanup after each tier (leave resources running).",
+    )
+
+    args = parser.parse_args(argv)
+
+    # Set module-level flag so run() respects it everywhere.
+    global _dry_run
+    _dry_run = args.dry_run
+
+    # Load config — config/parse errors exit 2; tier runtime failures exit 1.
+    try:
+        cfg = _integration.load_config(args.config, dry_run=args.dry_run)
+    except SystemExit as exc:
+        # loader called sys.exit(message) — map to exit code 2.
+        msg = str(exc) if str(exc) not in ("None", "") else "config error"
+        print(f"config error: {msg}", file=sys.stderr)
+        sys.exit(2)
+    except Exception as exc:  # noqa: BLE001
+        print(f"config error: {exc}", file=sys.stderr)
+        sys.exit(2)
+
+    # Synthesize CPI config into a temp file; register cleanup.
+    cpi_config_path = f"/tmp/integration-cpi-config-{os.getpid()}.json"
+
+    def _cleanup_cpi_config() -> None:
+        if not args.keep:
+            try:
+                Path(cpi_config_path).unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    atexit.register(_cleanup_cpi_config)
+
+    try:
+        _integration.write_cpi_config(cfg, cpi_config_path, dry_run=args.dry_run)
+    except SystemExit as exc:
+        msg = str(exc) if str(exc) not in ("None", "") else "config error"
+        print(f"config error: {msg}", file=sys.stderr)
+        sys.exit(2)
+    except Exception as exc:  # noqa: BLE001
+        print(f"config error: {exc}", file=sys.stderr)
+        sys.exit(2)
+
+    tiers = cfg.get("tiers", {})
+    keep = args.keep
+
+    try:
+        if args.action == "teardown":
+            return teardown(cfg)
+
+        if args.action == "lifecycle":
+            if not tiers.get("lifecycle", True):
+                print("tier lifecycle disabled in config; skipping")
+                return 0
+            return tier_lifecycle(cfg, cpi_config_path, keep)
+
+        if args.action == "bosh":
+            if not tiers.get("bosh", True):
+                print("tier bosh disabled in config; skipping")
+                return 0
+            return tier_bosh(cfg, cpi_config_path, keep)
+
+        if args.action == "cf":
+            if not tiers.get("cf", True):
+                print("tier cf disabled in config; skipping")
+                return 0
+            return tier_cf(cfg, cpi_config_path, keep)
+
+        # action == "all"
+        rc = teardown(cfg)
+        if rc != 0:
+            return rc
+
+        if tiers.get("lifecycle", True):
+            rc = tier_lifecycle(cfg, cpi_config_path, keep)
+            if rc != 0:
+                return rc
+
+        if tiers.get("bosh", True):
+            rc = tier_bosh(cfg, cpi_config_path, keep)
+            if rc != 0:
+                return rc
+
+        if tiers.get("cf", True):
+            rc = tier_cf(cfg, cpi_config_path, keep)
+            if rc != 0:
+                return rc
+
+        return 0
+
+    except subprocess.CalledProcessError as exc:
+        print(f"step failed with exit code {exc.returncode}: {shlex.join(exc.cmd)}", file=sys.stderr)
+        return 1
+
+
+# ---------------------------------------------------------------------------
+# Top-level dispatch
+# ---------------------------------------------------------------------------
+
 
 def main() -> int:
-    return subprocess.run(["make", "check"], cwd=REPO_ROOT).returncode
+    """Dispatch to make check (no args) or integration subcommand."""
+    argv = sys.argv[1:]
+
+    if not argv:
+        return subprocess.run(["make", "check"], cwd=REPO_ROOT).returncode
+
+    if argv[0] == "integration":
+        return cmd_integration(argv[1:])
+
+    # Unknown subcommand — fall through to make check for backward compat,
+    # or print an error.  Treat as usage error.
+    print(f"unknown subcommand: {argv[0]}", file=sys.stderr)
+    print("usage: scripts/test [integration [action] [--config FILE] [--dry-run] [--keep]]", file=sys.stderr)
+    return 2
 
 
 if __name__ == "__main__":

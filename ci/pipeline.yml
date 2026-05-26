@@ -1,0 +1,41 @@
+# ci/pipeline.yml
+#
+# Set via: fly -t lab sp -p bosh-pve-cpi -c ci/pipeline.yml -l ci/params.yml
+# Secrets supplied by Vault/CredHub or a local fly -l params file (gitignored).
+#
+# WORKER REQUIREMENT: the `integration` job must run on a Concourse worker that
+# can reach 192.168.1.0/24 (lab subnet — PVE API, BOSH director, CF ingress).
+# The `unit` job has no network requirements and runs on any worker.
+
+resources:
+  - name: repo
+    type: git
+    source:
+      uri: ((repo_uri))
+      branch: main
+
+jobs:
+
+  # Always-on: no infra required, no secrets, triggers on every push.
+  - name: unit
+    plan:
+      - get: repo
+        trigger: true
+      - task: run-unit-tests
+        file: repo/ci/tasks/unit.yml
+
+  # Gated: manual trigger only, requires lab worker and credential vars.
+  - name: integration
+    serial: true
+    plan:
+      - get: repo
+        passed: [unit]
+        trigger: false
+      - task: run-integration
+        file: repo/ci/tasks/integration.yml
+        params:
+          STEMCELL_PATH:       ((stemcell_path))
+          BOSH_DEPLOYMENT_DIR: ((bosh_deployment_dir))
+          CF_DEPLOYMENT:       ((cf_deployment_dir))
+          BOSH_VARS_YAML:      ((bosh_vars_yaml))
+          CF_VARS_YAML:        ((cf_vars_yaml))

@@ -21,8 +21,10 @@ Sequence (mirrors the BOSH-CPI Director call order):
    10.  detach_disk
    11.  delete_snapshot
    12.  delete_disk
-   13.  delete_vm
-   14.  delete_stemcell
+   13.  reboot_vm               (soft graceful reboot, default config)
+   14.  reboot_vm               (hard reset, reboot_mode=hard)
+   15.  delete_vm
+   16.  delete_stemcell
 
 A failure in any step aborts the run and prints the failing JSON-RPC error.
 Cleanup is best-effort: resources created before the failure are torn down in
@@ -39,6 +41,7 @@ Optional environment:
     NETWORK_GATEWAY  gateway for the test network (default: 192.168.1.1)
     NETWORK_IP       static IP for the test VM    (default: 192.168.1.250)
     NETWORK_BRIDGE   PVE bridge override          (default: from CPI_CONFIG)
+    NETWORK_DNS      JSON array of DNS servers    (default: ["8.8.8.8"])
     VM_CORES         cores                        (default: 1)
     VM_MEMORY_MIB    memory in MiB                (default: 1024)
     DISK_SIZE_MIB    persistent disk size in MiB  (default: 1024)
@@ -52,6 +55,7 @@ import os
 import random
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -71,6 +75,7 @@ AGENT_ID = env("AGENT_ID", f"lifecycle-{os.getpid()}")
 NETWORK_RANGE = env("NETWORK_RANGE", "192.168.1.0/24")
 NETWORK_GATEWAY = env("NETWORK_GATEWAY", "192.168.1.1")
 NETWORK_IP = env("NETWORK_IP", "192.168.1.250")
+NETWORK_DNS: list[str] = json.loads(env("NETWORK_DNS", '["8.8.8.8"]'))
 NETWORK_BRIDGE = env("NETWORK_BRIDGE", "")
 VM_CORES = int(env("VM_CORES", "1"))
 VM_MEMORY_MIB = int(env("VM_MEMORY_MIB", "1024"))
@@ -104,7 +109,7 @@ def step(msg: str) -> None:
     print()
 
 
-def call(method: str, args: list[Any]) -> Any:
+def call(method: str, args: list[Any], config_path: str = "") -> Any:
     req_id = f"{time.time_ns()}-{random.randint(0, 1 << 32)}"
     req = {
         "method": method,
@@ -116,7 +121,7 @@ def call(method: str, args: list[Any]) -> Any:
         print(f"  -> {json.dumps(req)}", file=sys.stderr)
 
     proc = subprocess.run(
-        [CPI_BIN, "--config", CPI_CONFIG],
+        [CPI_BIN, "--config", config_path or CPI_CONFIG],
         input=json.dumps(req) + "\n",
         capture_output=True,
         text=True,
@@ -135,6 +140,21 @@ def call(method: str, args: list[Any]) -> Any:
         raise RuntimeError(f"{method} failed")
 
     return resp.get("result")
+
+
+def write_reboot_config(mode: str) -> str:
+    """Derive a temp CPI config from CPI_CONFIG with reboot_mode overridden.
+
+    Lets the harness exercise the hard-reset path without mutating the primary
+    config. The caller must unlink the returned path.
+    """
+    with open(CPI_CONFIG) as f:
+        cfg = json.load(f)
+    cfg["reboot_mode"] = mode
+    fd, path = tempfile.mkstemp(prefix="cpi-reboot-", suffix=".json")
+    with os.fdopen(fd, "w") as f:
+        json.dump(cfg, f)
+    return path
 
 
 def cleanup() -> None:
@@ -183,7 +203,7 @@ def main() -> int:
                 "ip": NETWORK_IP,
                 "netmask": "255.255.255.0",
                 "gateway": NETWORK_GATEWAY,
-                "dns": ["8.8.8.8"],
+                "dns": NETWORK_DNS,
                 "default": ["dns", "gateway"],
                 "cloud_properties": {"bridge": NETWORK_BRIDGE},
             }
@@ -244,12 +264,34 @@ def main() -> int:
         state["disk_cid"] = ""
         print("delete_disk=ok")
 
-        step("13. delete_vm")
+        # reboot_vm is exercised here, while the VM is still running, before
+        # it is torn down. Both config-selectable modes are checked against
+        # live PVE: soft issues a graceful ACPI reboot (POST /status/reboot)
+        # with a hard-reset fallback; hard issues an immediate reset
+        # (POST /status/reset). has_vm must stay true after each — the VM is
+        # expected to be running again once reboot_vm returns.
+        step("13. reboot_vm (soft graceful reboot, default config)")
+        call("reboot_vm", [state["vm_cid"]])
+        if call("has_vm", [state["vm_cid"]]) is not True:
+            raise RuntimeError("has_vm returned false after soft reboot_vm")
+        print("reboot_vm(soft)=ok")
+
+        hard_cfg = write_reboot_config("hard")
+        try:
+            step("14. reboot_vm (hard reset, reboot_mode=hard)")
+            call("reboot_vm", [state["vm_cid"]], config_path=hard_cfg)
+            if call("has_vm", [state["vm_cid"]]) is not True:
+                raise RuntimeError("has_vm returned false after hard reboot_vm")
+            print("reboot_vm(hard)=ok")
+        finally:
+            os.unlink(hard_cfg)
+
+        step("15. delete_vm")
         call("delete_vm", [state["vm_cid"]])
         state["vm_cid"] = ""
         print("delete_vm=ok")
 
-        step("14. delete_stemcell")
+        step("16. delete_stemcell")
         call("delete_stemcell", [state["stemcell_cid"]])
         state["stemcell_cid"] = ""
         print("delete_stemcell=ok")

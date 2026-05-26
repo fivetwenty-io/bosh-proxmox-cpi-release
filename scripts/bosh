@@ -6,6 +6,8 @@
 
 Subcommands:
     create-env | deploy    bosh create-env for the pve director
+    teardown | delete-env  bosh delete-env for the pve director (idempotent:
+                           no-op when state.json is absent or empty)
     alias-env              alias the director as 'pve' using creds.yml CA
     login                  bosh -e pve login
     env                    bosh env (against pve)
@@ -110,6 +112,40 @@ def cmd_create_env(args: list[str]) -> int:
     )
 
 
+def _state_is_empty() -> bool:
+    """Return True when state.json is absent, <= 10 bytes, or contains only '{}'."""
+    if not STATE.exists():
+        return True
+    content = STATE.read_text(encoding="utf-8").strip()
+    if len(content) <= 10 or content == "{}":
+        return True
+    return False
+
+
+def cmd_teardown(args: list[str]) -> int:
+    if _state_is_empty():
+        print(f"teardown: state file absent or empty ({STATE}), nothing to delete")
+        return 0
+    rc = run(
+        "bosh", "delete-env",
+        str(BOSH_DEPLOYMENT_DIR / "bosh.yml"),
+        "-n",
+        "-o", str(CPI_OPS),
+        "-o", str(BOSH_DEPLOYMENT_DIR / "uaa.yml"),
+        "-o", str(BOSH_DEPLOYMENT_DIR / "credhub.yml"),
+        "-o", str(OS_CONF_OPS),
+        "-o", str(NATS_TUNING_OPS),
+        "-l", str(VARS),
+        "-v", "director_name=ocfp-mgmt",
+        f"--state={STATE}",
+        f"--vars-store={CREDS}",
+        *args,
+    )
+    if rc != 0:
+        print(f"teardown: bosh delete-env exited {rc}", file=sys.stderr)
+    return rc
+
+
 def cmd_alias_env(args: list[str]) -> int:
     director_ip = bosh_int(VARS, "/internal_ip")
     ca = bosh_int(CREDS, "/director_ssl/ca")
@@ -174,6 +210,8 @@ def cmd_passthrough(args: list[str]) -> int:
 COMMANDS = {
     "create-env": cmd_create_env,
     "deploy": cmd_create_env,
+    "teardown": cmd_teardown,
+    "delete-env": cmd_teardown,
     "alias-env": cmd_alias_env,
     "login": cmd_login,
     "env": cmd_env,

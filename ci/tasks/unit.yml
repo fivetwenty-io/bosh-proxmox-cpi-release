@@ -1,0 +1,26 @@
+# ci/tasks/unit.yml
+#
+# Runs `make check` from the repository root. The root Makefile delegates
+# Go linting, vetting, and tests to src/pve_cpi.
+#
+# No secrets required. Runs on any Concourse worker.
+
+platform: linux
+
+image_resource:
+  type: docker-image
+  source:
+    repository: golang
+    tag: "1.25"
+
+inputs:
+  - name: repo
+
+run:
+  path: /bin/bash
+  args:
+    - -euc
+    - |
+      export NO_COLOR=1
+      cd repo
+      make check

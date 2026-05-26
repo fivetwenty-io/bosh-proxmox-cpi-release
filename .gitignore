@@ -35,3 +35,8 @@ tmp/
 creds.yml
 vars.yml
 state.json
+
+# Integration test generated config (secrets resolved at runtime)
+ci/integration.yml
+ci/params.yml
+ci/cpi-config.json

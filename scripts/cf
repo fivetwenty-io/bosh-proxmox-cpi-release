@@ -16,6 +16,9 @@ Commands:
     check-uaa-db       Fail fast if uaa schema is in the Flyway-rename trap.
     unstick-agent      Restart bosh-agent on an instance via PVE qga (bypasses NATS).
     bosh-deploy        Run only the bosh deploy step.
+    teardown           Delete the CF deployment (--force). Skips if director unreachable
+                       or deployment not found. Alias: delete-deployment.
+    delete-deployment  Alias for teardown.
     api                Point the cf CLI at https://api.<system_domain>.
     login              cf api + cf login -u admin (password from credhub).
     admin-password     Print /ocfp-mgmt/cf/cf_admin_password from credhub.
@@ -32,6 +35,7 @@ Assumes:
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shlex
@@ -327,6 +331,43 @@ def cmd_login(_extra: list[str]) -> None:
     )
 
 
+def cmd_teardown(_extra: list[str]) -> None:
+    """Delete the CF deployment from the director.
+
+    Checks for the deployment's presence first so the command is safe to
+    run when the director is unreachable or the deployment does not exist.
+    Both conditions are treated as already-done and exit 0.
+
+    The bosh delete-deployment --force flag handles partially deleted or
+    inconsistent deployment state.
+    """
+    banner(f"Teardown deployment '{DEPLOYMENT}'")
+
+    result = subprocess.run(
+        ["bosh", "-e", ENV, "deployments", "--json"],
+        capture_output=True, text=True, check=False,
+    )
+    if result.returncode != 0:
+        print(f"    director unreachable (bosh deployments rc={result.returncode}); skipping teardown")
+        return
+
+    try:
+        data = json.loads(result.stdout)
+        rows = data["Tables"][0]["Rows"]
+        names = [row.get("name", "") for row in rows]
+    except (json.JSONDecodeError, KeyError, IndexError, TypeError):
+        print("    could not parse deployments list; skipping teardown")
+        return
+
+    if DEPLOYMENT not in names:
+        print(f"    deployment '{DEPLOYMENT}' not found; skipping teardown")
+        return
+
+    print(f"    deleting deployment '{DEPLOYMENT}' with --force ...")
+    run("bosh", "-e", ENV, "-n", "-d", DEPLOYMENT, "delete-deployment", "--force")
+    print(f"    deployment '{DEPLOYMENT}' deleted")
+
+
 def cmd_deploy(extra: list[str]) -> None:
     cmd_runtime_config([])
     cmd_cloud_config([])
@@ -343,6 +384,8 @@ COMMANDS = {
     "check-uaa-db": cmd_check_uaa_db,
     "unstick-agent": cmd_unstick_agent,
     "bosh-deploy": cmd_bosh_deploy,
+    "teardown": cmd_teardown,
+    "delete-deployment": cmd_teardown,
     "api": cmd_api,
     "login": cmd_login,
     "admin-password": cmd_admin_password,

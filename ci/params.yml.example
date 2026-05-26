@@ -1,0 +1,47 @@
+# ci/params.yml.example
+#
+# Template for the fly -l params file used when setting the pipeline locally.
+# Copy to ci/params.yml (gitignored), fill in real values, then run:
+#
+#   fly -t lab sp -p bosh-pve-cpi -c ci/pipeline.yml -l ci/params.yml
+#
+# In a shared CI environment, store these values in Vault/CredHub instead and
+# reference them as ((var_name)) — Concourse resolves them at runtime without
+# a local params file.
+#
+# NEVER commit ci/params.yml to version control.
+
+# Git repository URI for the repo resource.
+repo_uri: https://github.com/your-org/bosh-pve-cpi-release
+
+# Proxmox VE API endpoint (with port if non-standard).
+pve_endpoint: https://192.168.1.10:8006
+
+# Proxmox VE API token — format: USER@REALM!TOKENID=SECRET
+pve_api_token: root@pam!ci=00000000-0000-0000-0000-000000000000
+
+# Absolute path to the stemcell tarball on the Concourse worker.
+stemcell_path: /var/lib/concourse/stemcells/bosh-stemcell-621.74-warden-boshlite-ubuntu-jammy-go_agent.tgz
+
+# Directory on the worker containing the BOSH deployment manifest + operators.
+bosh_deployment_dir: /var/lib/concourse/bosh-deployment
+
+# Path or directory for CF deployment manifests on the worker.
+cf_deployment_dir: /var/lib/concourse/cf-deployment
+
+# BOSH UAA client secret for the `admin` client.
+bosh_client_secret: changeme
+
+# PEM-encoded BOSH director CA certificate.
+bosh_ca_cert: |
+  -----BEGIN CERTIFICATE-----
+  <replace with actual CA cert>
+  -----END CERTIFICATE-----
+
+# base64-encoded content of manifests/bosh/vars.yml (never commit the raw file).
+# Generate: base64 < manifests/bosh/vars.yml | tr -d '\n'
+bosh_vars_yaml: ""
+
+# base64-encoded content of manifests/cf/vars.yml (never commit the raw file).
+# Generate: base64 < manifests/cf/vars.yml | tr -d '\n'
+cf_vars_yaml: ""
