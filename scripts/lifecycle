@@ -15,12 +15,17 @@ Sequence (mirrors the BOSH-CPI Director call order):
     4.  has_vm                  (post-create assertion)
     5.  set_vm_metadata
     6.  create_disk
+    6a. has_disk                (post-create assertion, expect true)
     7.  attach_disk
+    7a. set_disk_metadata
+    7b. resize_disk             (doubles disk size; disk must be attached)
+    7c. update_disk             (sets cache=writeback, iothread=true)
     8.  get_disks               (post-attach assertion)
     9.  snapshot_disk
    10.  detach_disk
    11.  delete_snapshot
    12.  delete_disk
+   12a. has_disk                (post-delete assertion, expect false)
    13.  reboot_vm               (soft graceful reboot, default config)
    14.  reboot_vm               (hard reset, reboot_mode=hard)
    15.  delete_vm
@@ -45,6 +50,8 @@ Optional environment:
     VM_CORES         cores                        (default: 1)
     VM_MEMORY_MIB    memory in MiB                (default: 1024)
     DISK_SIZE_MIB    persistent disk size in MiB  (default: 1024)
+    STEMCELL_NAME    override stemcell name       (default: from stemcell.MF)
+    STEMCELL_VERSION override stemcell version    (default: from stemcell.MF)
     TRACE            non-empty enables tracing    (default: unset)
 """
 
@@ -53,8 +60,11 @@ from __future__ import annotations
 import json
 import os
 import random
+import re
+import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 from pathlib import Path
@@ -80,6 +90,8 @@ NETWORK_BRIDGE = env("NETWORK_BRIDGE", "")
 VM_CORES = int(env("VM_CORES", "1"))
 VM_MEMORY_MIB = int(env("VM_MEMORY_MIB", "1024"))
 DISK_SIZE_MIB = int(env("DISK_SIZE_MIB", "1024"))
+STEMCELL_NAME = env("STEMCELL_NAME", "")
+STEMCELL_VERSION = env("STEMCELL_VERSION", "")
 TRACE = bool(env("TRACE", ""))
 
 if not os.access(CPI_BIN, os.X_OK):
@@ -101,6 +113,67 @@ state: dict[str, Any] = {
     "snapshot_cid": "",
     "disk_attached": False,
 }
+
+
+def stemcell_cloud_props() -> dict[str, Any]:
+    """Build create_stemcell cloud_properties.
+
+    Mirrors a real BOSH director: the director downloads/extracts the
+    stemcell tarball and passes the CPI a local image path plus the
+    cloud_properties from stemcell.MF. Here there is no director, so read
+    name and version from the tarball's stemcell.MF (the CPI requires both
+    for direct-qcow upload). STEMCELL_NAME / STEMCELL_VERSION override.
+    """
+    name, version = STEMCELL_NAME, STEMCELL_VERSION
+    if not name or not version:
+        try:
+            with tarfile.open(STEMCELL_PATH, "r:*") as tar:
+                member = tar.extractfile("stemcell.MF")
+                text = member.read().decode() if member else ""
+        except (KeyError, OSError, tarfile.TarError) as exc:
+            sys.exit(f"cannot read stemcell.MF from {STEMCELL_PATH}: {exc}")
+        for line in text.splitlines():
+            m = re.match(r"(name|version)\s*:\s*'?\"?([^'\"]+?)'?\"?\s*$", line)
+            if not m:
+                continue
+            if m.group(1) == "name" and not name:
+                name = m.group(2).strip()
+            elif m.group(1) == "version" and not version:
+                version = m.group(2).strip()
+    if not name or not version:
+        sys.exit(
+            "stemcell.MF missing name/version; set STEMCELL_NAME and "
+            "STEMCELL_VERSION env vars"
+        )
+    return {"name": name, "version": version}
+
+
+def extract_stemcell_image() -> tuple[str, "Callable[[], None]"]:
+    """Extract the stemcell tarball and return (image_path, cleanup).
+
+    A real BOSH director unpacks the stemcell .tgz and hands the CPI the inner
+    `image` file (itself a gzipped tar of root.img), not the outer tarball. The
+    CPI's resolveStemcellImage expects that inner file; given the outer .tgz it
+    would upload the gzip `image` blob verbatim ("not in qcow2 format"). Mirror
+    the director: extract `image` to a temp dir and pass its path.
+    """
+    tmpdir = tempfile.mkdtemp(prefix="lifecycle-stemcell-")
+
+    def cleanup() -> None:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    image_path = os.path.join(tmpdir, "image")
+    try:
+        with tarfile.open(STEMCELL_PATH, "r:*") as tar:
+            member = tar.extractfile("image")
+            if member is None:
+                raise KeyError("image")
+            with open(image_path, "wb") as out:
+                shutil.copyfileobj(member, out)
+    except (KeyError, OSError, tarfile.TarError) as exc:
+        cleanup()
+        sys.exit(f"cannot extract 'image' from {STEMCELL_PATH}: {exc}")
+    return image_path, cleanup
 
 
 def step(msg: str) -> None:
@@ -192,7 +265,13 @@ def main() -> int:
         print(json.dumps(info, indent=2))
 
         step(f"2. create_stemcell (image={STEMCELL_PATH})")
-        state["stemcell_cid"] = call("create_stemcell", [STEMCELL_PATH, {}])
+        image_path, stemcell_cleanup = extract_stemcell_image()
+        try:
+            state["stemcell_cid"] = call(
+                "create_stemcell", [image_path, stemcell_cloud_props()]
+            )
+        finally:
+            stemcell_cleanup()
         print(f"stemcell_cid={state['stemcell_cid']}")
 
         step(f"3. create_vm (agent_id={AGENT_ID}, stemcell_cid={state['stemcell_cid']})")
@@ -232,10 +311,32 @@ def main() -> int:
         state["disk_cid"] = call("create_disk", [DISK_SIZE_MIB, {}, state["vm_cid"]])
         print(f"disk_cid={state['disk_cid']}")
 
+        step("6a. has_disk (post-create)")
+        hd = call("has_disk", [state["disk_cid"]])
+        if hd is not True:
+            raise RuntimeError(f"has_disk returned {hd}, expected true")
+        print("has_disk=true")
+
         step("7. attach_disk")
         call("attach_disk", [state["vm_cid"], state["disk_cid"]])
         state["disk_attached"] = True
         print("attach_disk=ok")
+
+        step("7a. set_disk_metadata")
+        call("set_disk_metadata", [state["disk_cid"], {
+            "deployment": "lifecycle-test",
+            "director": "local-harness",
+            "instance_id": AGENT_ID,
+        }])
+        print("set_disk_metadata=ok")
+
+        step(f"7b. resize_disk ({DISK_SIZE_MIB} MiB -> {DISK_SIZE_MIB * 2} MiB)")
+        call("resize_disk", [state["disk_cid"], DISK_SIZE_MIB * 2])
+        print("resize_disk=ok")
+
+        step("7c. update_disk")
+        call("update_disk", [state["disk_cid"], {"cache": "writeback", "iothread": True}])
+        print("update_disk=ok")
 
         step("8. get_disks")
         disks = call("get_disks", [state["vm_cid"]])
@@ -261,6 +362,11 @@ def main() -> int:
 
         step("12. delete_disk")
         call("delete_disk", [state["disk_cid"]])
+        step("12a. has_disk (post-delete)")
+        hd = call("has_disk", [state["disk_cid"]])
+        if hd is not False:
+            raise RuntimeError(f"has_disk post-delete returned {hd}, expected false")
+        print("has_disk=false")
         state["disk_cid"] = ""
         print("delete_disk=ok")
 
