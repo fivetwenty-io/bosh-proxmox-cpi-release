@@ -19,7 +19,7 @@ flowchart LR
 | Tier | Name | What it does | Infrastructure required |
 |------|------|-------------|------------------------|
 | 0 | Unit | `make check` — go vet, staticcheck, go test | None |
-| 1 | Lifecycle | 16-step CPI binary roundtrip: create stemcell, create VM, attach disk, snapshot, detach, reboot VM (soft + hard), delete all resources | Live PVE cluster, lab network (192.168.1.x) |
+| 1 | Lifecycle | CPI binary roundtrip: create stemcell, (optionally) create network, create VM, attach/resize/update/snapshot disk, reboot VM (soft + hard), delete all resources. Each major step is additionally verified out-of-band against the PVE REST API (real cluster state, not just CPI return values) | Live PVE cluster, lab network (192.168.1.x) |
 | 2 | BOSH | `bosh create-env` full director deploy, cloud/runtime-config upload, `emptyvm` smoke deployment, director health assertion | Live PVE cluster, lab network |
 | 3 | CF | CF deployment via `scripts/cf deploy`, smoke app push (go-httpbin), map-route, HTTP 200 assertion | Live PVE cluster, lab network, routable system domain |
 
@@ -178,6 +178,26 @@ cp ci/integration.yml.example ci/integration.yml
 | `vm_memory_mib` | RAM for the test VM in MiB | `1024` |
 | `disk_size_mib` | Persistent disk size in MiB | `1024` |
 | `stemcell_path` | Absolute path to stemcell tarball; leave empty to use `STEMCELL_PATH` env | `""` |
+| `disk_storage_pools` | Optional. Empty list = single run on `pve_disk_storage`. A list of pool names runs Tier 1 once per pool. The string `auto` autodetects local image-capable pools (lvm/lvmthin/zfspool/dir) via the PVE API | `[]` |
+| `network_test` | Optional. Exercises `create_network`/`delete_network` against live PVE (see below) | *(see below)* |
+
+#### `tier1.network_test` — managed-network handler coverage
+
+When `network_test.modes` is non-empty, Tier 1 runs one **extra** `scripts/lifecycle` pass per mode (independent of `disk_storage_pools` — no cross product), exercising the BOSH CPI `create_network`/`delete_network` methods. The created network is attached to that pass's test VM, and the result is verified out-of-band against the PVE REST API. An empty/absent `modes` list skips network testing entirely (default).
+
+| Key | Description | Example |
+|-----|-------------|---------|
+| `network_test.modes` | List of paths to exercise: `sdn`, `bridge`, or both. `[]` = skip | `[sdn, bridge]` |
+| `network_test.sdn.zone` | SDN zone name. Must pre-exist unless the CPI config sets `sdn_auto_manage_zone` (then it is auto-created) | `it` |
+| `network_test.sdn.zone_type` | Zone type used when the zone is auto-created | `simple` |
+| `network_test.sdn.vnet` | vnet name, 1–8 chars `[a-z0-9]` | `itvnet` |
+| `network_test.sdn.range` | Isolated subnet CIDR (must not collide with the LAN) | `10.250.0.0/24` |
+| `network_test.sdn.gateway` | Gateway for the SDN subnet | `10.250.0.1` |
+| `network_test.sdn.ip` | Test VM IP within `range` | `10.250.0.10` |
+| `network_test.bridge.iface` | **Unused** bridge iface to create then delete. Bridge mode mutates node networking — pick a name not in use | `vmbr9` |
+
+- **`sdn` mode** requires an SDN-capable cluster. It creates a zone (if `sdn_auto_manage_zone`), vnet, and — when `range` is set — a subnet, applies the SDN config, and attaches the VM to the realized vnet bridge.
+- **`bridge` mode** creates a Linux bridge via the nodes API and attaches the VM to it. This changes the node's network configuration; always use an unused iface name.
 
 **`tier2` — BOSH director smoke**
 
@@ -198,6 +218,12 @@ cp ci/integration.yml.example ci/integration.yml
 | `smoke_app` | CF app name pushed as the smoke app | `httpbin-smoke` |
 | `smoke_timeout_s` | Seconds to wait for CF deploy and app push | `900` |
 
+### Out-of-band PVE verification
+
+Beyond asserting on the CPI binary's JSON-RPC return values, Tier 1 independently confirms real cluster state by querying the PVE REST API directly (`scripts/_pve_verify.py`). The verifier reuses the **same host and authentication as the CPI config** — `api_token` becomes an `Authorization: PVEAPIToken=` header; a `password` config performs a `/access/ticket` login and uses the `PVEAuthCookie`. It queries list endpoints (`/cluster/sdn/vnets`, `/cluster/sdn/zones`, `/nodes/{node}/qemu`, `/nodes/{node}/network`, storage content) and tests membership, which sidesteps PVE's inconsistent 404/500 behavior on per-id GETs.
+
+Verified steps: `create_network` → vnet+subnet (SDN) or bridge present; `create_vm` → VM present; `create_disk` → volume present; `delete_vm` → VM gone; `delete_network` → vnet/bridge gone. A failed verification aborts the run exactly like a CPI error. `scripts/_pve_verify.py` is stdlib-only and can be run standalone for a connectivity smoke, e.g. `./scripts/_pve_verify.py --config cpi.json vnet itvnet`.
+
 ### `scripts/lifecycle` environment variables
 
 `scripts/lifecycle` is called by the Tier 1 runner. When invoked via `./scripts/test integration lifecycle`, the harness sets all variables from `ci/integration.yml`. When invoked directly, set these yourself.
@@ -217,6 +243,16 @@ cp ci/integration.yml.example ci/integration.yml
 | `VM_MEMORY_MIB` | `1024` | RAM in MiB |
 | `DISK_SIZE_MIB` | `1024` | Persistent disk size in MiB |
 | `TRACE` | *(unset)* | Set to any non-empty value to print raw JSON-RPC request/response to stderr |
+| `NETWORK_TEST_MODE` | `off` | `off` \| `sdn` \| `bridge` — exercise `create_network`/`delete_network` for that path |
+| `SDN_ZONE` | *(empty)* | SDN zone name (mode=sdn) |
+| `SDN_ZONE_TYPE` | `simple` | Zone type used when auto-creating the zone |
+| `SDN_VNET` | *(empty)* | vnet name, 1–8 chars `[a-z0-9]` (mode=sdn) |
+| `SDN_RANGE` | *(empty)* | CIDR for the SDN subnet (mode=sdn) |
+| `SDN_GATEWAY` | *(empty)* | Gateway for the SDN subnet (mode=sdn) |
+| `SDN_IP` | *(empty)* | Test VM IP within `SDN_RANGE` (mode=sdn) |
+| `BRIDGE_TEST_IFACE` | *(empty)* | Bridge iface to create then delete (mode=bridge) |
+
+When invoked via `./scripts/test integration lifecycle`, `NETWORK_TEST_MODE` is set per pass from `tier1.network_test.modes`; the `SDN_*`/`BRIDGE_TEST_IFACE` values come from `tier1.network_test`.
 
 ---
 
