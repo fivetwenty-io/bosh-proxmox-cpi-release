@@ -427,7 +427,7 @@ func createVM(
 		},
 		isRetryable,
 		maxAttempts,
-		pve.WithRange(rangeStart, pve.VMIDRangeVMEnd),
+		pve.WithRange(rangeStart, deps.Config.VMIDRangeEnd),
 		pve.WithBackoffFunc(createVMRetryBackoff),
 	)
 	if err != nil {

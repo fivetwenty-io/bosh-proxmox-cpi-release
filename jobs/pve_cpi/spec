@@ -52,6 +52,35 @@ properties:
   pve.network_bridge:
     description: "Default network bridge"
     default: "vmbr0"
+  pve.network_mode:
+    description: |
+      Selects create_network/delete_network behavior.
+      "sdn" — PVE SDN vnet lifecycle (cluster SDN must be enabled).
+      "bridge" — Linux bridge lifecycle via the nodes API.
+      "auto" — use SDN when cloud_properties.zone or pve.sdn_zone is set;
+               fall back to bridge otherwise.
+    default: "auto"
+  pve.sdn_zone:
+    description: |
+      Default PVE SDN zone name for vnet creation. Used when
+      cloud_properties.zone is absent. When empty and network_mode requires
+      SDN, the zone must be supplied per-call in cloud_properties.
+    default: ""
+  pve.sdn_zone_type:
+    description: |
+      PVE zone type the CPI uses when it creates a zone (requires
+      sdn_auto_manage_zone: true). One of: simple, vlan, qinq, vxlan, evpn.
+      "simple" is appropriate for single-node labs; multi-node overlays
+      require vxlan or evpn.
+    default: "simple"
+  pve.sdn_auto_manage_zone:
+    description: |
+      When true, create_network creates the SDN zone (type sdn_zone_type)
+      if it does not already exist, and delete_network deletes the zone if
+      all conditions hold: CPI created it, it is not operator-pinned via
+      sdn_zone or cloud_properties.zone, and the zone has zero remaining
+      vnets. Default false — operator manages zones; CPI manages only vnets.
+    default: false
   pve.verify_ssl:
     description: "Verify TLS certificate"
     default: true
@@ -95,9 +124,27 @@ properties:
   pve.vmid_range_start:
     description: |
       Starting VMID for VM allocation. VMs are allocated in the range
-      [vmid_range_start, 5999]; default vmid_range_start is 100.
+      [vmid_range_start, vmid_range_end]; default vmid_range_start is 100.
       Persistent disks use synthetic VMIDs 9000-9999 (unchanged).
     default: 100
+  pve.vmid_range_end:
+    description: |
+      Inclusive upper bound of the VMID range for VM allocation. VMs allocated in
+      [vmid_range_start, vmid_range_end]. Default 5999. Must be > vmid_range_start
+      and <= 9999. Persistent disks use synthetic VMIDs 9000-9999 (unaffected).
+    default: 5999
+  pve.allow_disk_ops_with_snapshots:
+    description: |
+      When true, bypasses the snapshot pre-flight guard in attach_disk, detach_disk,
+      and resize_disk. Use only for emergency disk recovery; snapshot state will be
+      inconsistent after the operation. Default false (guard active).
+    default: false
+  pve.require_snapshot_check_pass:
+    description: |
+      When true, a disk operation aborts if the snapshot pre-flight check itself
+      fails (cannot reach PVE to list snapshots). Default false: on check failure
+      the CPI logs a warning and proceeds (fail-open).
+    default: false
   pve.vm_prefix:
     description: |
       Optional prefix prepended to every CPI-provisioned VM's PVE name.

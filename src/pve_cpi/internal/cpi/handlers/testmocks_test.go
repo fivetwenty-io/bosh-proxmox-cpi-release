@@ -134,14 +134,17 @@ func (m *mockQEMUService) RollbackSnapshot(_ context.Context, _ string, _ int, _
 // --------------------------------------------------------------------------
 
 // mockNodesService embeds panicNodesStub and overrides the methods
-// used by delete_vm, reboot_vm, set_vm_metadata, and direct-qcow handlers.
-// ListStorageContentFn defaults to returning an empty response when nil.
+// used by delete_vm, reboot_vm, set_vm_metadata, direct-qcow handlers,
+// and calculate_vm_cloud_properties (listStorageFn).
+// All Fn fields default to nil; nil means use the safe default behaviour
+// documented on each method below.
 type mockNodesService struct {
 	panicNodesStub
 	deleteQemuFn             func(ctx context.Context, node string, vmid string, params *nodes.DeleteQemuParams) (*nodes.DeleteQemuResponse, error)
 	updateQemuConfigFn       func(ctx context.Context, node string, vmid string, params *nodes.UpdateQemuConfigParams) error
 	listStorageContentFn     func(ctx context.Context, node string, storage string, params *nodes.ListStorageContentParams) (*nodes.ListStorageContentResponse, error)
 	createQemuStatusRebootFn func(ctx context.Context, node string, vmid string, params *nodes.CreateQemuStatusRebootParams) (*nodes.CreateQemuStatusRebootResponse, error)
+	listStorageFn            func(ctx context.Context, node string, params *nodes.ListStorageParams) (*nodes.ListStorageResponse, error)
 }
 
 func (m *mockNodesService) DeleteQemu(ctx context.Context, node string, vmid string, params *nodes.DeleteQemuParams) (*nodes.DeleteQemuResponse, error) {
@@ -172,6 +175,29 @@ func (m *mockNodesService) CreateQemuStatusReboot(ctx context.Context, node stri
 		return m.createQemuStatusRebootFn(ctx, node, vmid, params)
 	}
 	panic("mockNodesService.CreateQemuStatusReboot: not configured")
+}
+
+func (m *mockNodesService) ListStorage(ctx context.Context, node string, params *nodes.ListStorageParams) (*nodes.ListStorageResponse, error) {
+	if m.listStorageFn != nil {
+		return m.listStorageFn(ctx, node, params)
+	}
+	// Default: return active+images for whatever storage name was requested.
+	// The handler passes &ListStorageParams{Storage: &effectiveStorage}; when
+	// params.Storage is set, echo that name back as active+images so tests
+	// that do not exercise storage filtering pass without extra configuration.
+	storageName := "local-lvm" // safe fallback matching testConfig()
+	if params != nil && params.Storage != nil && *params.Storage != "" {
+		storageName = *params.Storage
+	}
+	raw, _ := json.Marshal(map[string]interface{}{
+		"storage": storageName,
+		"type":    "dir",
+		"active":  1,
+		"enabled": 1,
+		"content": "images,rootdir",
+	})
+	resp := nodes.ListStorageResponse{json.RawMessage(raw)}
+	return &resp, nil
 }
 
 // --------------------------------------------------------------------------
@@ -283,4 +309,158 @@ func marshalArgs(vals ...any) []json.RawMessage {
 		out[i] = b
 	}
 	return out
+}
+
+// --------------------------------------------------------------------------
+// mockSDNCluster
+// --------------------------------------------------------------------------
+
+// mockSDNCluster embeds cluster.Service (nil — panics on any non-overridden
+// method). Override only the SDN methods handlers call; set the corresponding
+// Fn field to supply behaviour; leave nil for a zero-value safe default.
+type mockSDNCluster struct {
+	cluster.Service // nil — non-overridden methods panic
+
+	createSdnVnetsFn        func(ctx context.Context, params *cluster.CreateSdnVnetsParams) error
+	deleteSdnVnetsFn        func(ctx context.Context, vnet string, params *cluster.DeleteSdnVnetsParams) error
+	getSdnVnetsFn           func(ctx context.Context, vnet string, params *cluster.GetSdnVnetsParams) (*cluster.GetSdnVnetsResponse, error)
+	listSdnVnetsFn          func(ctx context.Context, params *cluster.ListSdnVnetsParams) (*cluster.ListSdnVnetsResponse, error)
+	createSdnZonesFn        func(ctx context.Context, params *cluster.CreateSdnZonesParams) error
+	deleteSdnZonesFn        func(ctx context.Context, zone string, params *cluster.DeleteSdnZonesParams) error
+	getSdnZonesFn           func(ctx context.Context, zone string, params *cluster.GetSdnZonesParams) (*cluster.GetSdnZonesResponse, error)
+	listSdnZonesFn          func(ctx context.Context, params *cluster.ListSdnZonesParams) (*cluster.ListSdnZonesResponse, error)
+	createSdnVnetsSubnetsFn func(ctx context.Context, vnet string, params *cluster.CreateSdnVnetsSubnetsParams) error
+	deleteSdnVnetsSubnetsFn func(ctx context.Context, vnet string, subnet string, params *cluster.DeleteSdnVnetsSubnetsParams) error
+	listSdnVnetsSubnetsFn   func(ctx context.Context, vnet string, params *cluster.ListSdnVnetsSubnetsParams) (*cluster.ListSdnVnetsSubnetsResponse, error)
+	updateSdnFn             func(ctx context.Context, params *cluster.UpdateSdnParams) (*cluster.UpdateSdnResponse, error)
+}
+
+// compile-time interface check.
+var _ cluster.Service = (*mockSDNCluster)(nil)
+
+func (m *mockSDNCluster) CreateSdnVnets(ctx context.Context, params *cluster.CreateSdnVnetsParams) error {
+	if m.createSdnVnetsFn != nil {
+		return m.createSdnVnetsFn(ctx, params)
+	}
+	return nil
+}
+
+func (m *mockSDNCluster) DeleteSdnVnets(ctx context.Context, vnet string, params *cluster.DeleteSdnVnetsParams) error {
+	if m.deleteSdnVnetsFn != nil {
+		return m.deleteSdnVnetsFn(ctx, vnet, params)
+	}
+	return nil
+}
+
+func (m *mockSDNCluster) GetSdnVnets(ctx context.Context, vnet string, params *cluster.GetSdnVnetsParams) (*cluster.GetSdnVnetsResponse, error) {
+	if m.getSdnVnetsFn != nil {
+		return m.getSdnVnetsFn(ctx, vnet, params)
+	}
+	return nil, nil
+}
+
+func (m *mockSDNCluster) ListSdnVnets(ctx context.Context, params *cluster.ListSdnVnetsParams) (*cluster.ListSdnVnetsResponse, error) {
+	if m.listSdnVnetsFn != nil {
+		return m.listSdnVnetsFn(ctx, params)
+	}
+	empty := cluster.ListSdnVnetsResponse{}
+	return &empty, nil
+}
+
+func (m *mockSDNCluster) CreateSdnZones(ctx context.Context, params *cluster.CreateSdnZonesParams) error {
+	if m.createSdnZonesFn != nil {
+		return m.createSdnZonesFn(ctx, params)
+	}
+	return nil
+}
+
+func (m *mockSDNCluster) DeleteSdnZones(ctx context.Context, zone string, params *cluster.DeleteSdnZonesParams) error {
+	if m.deleteSdnZonesFn != nil {
+		return m.deleteSdnZonesFn(ctx, zone, params)
+	}
+	return nil
+}
+
+func (m *mockSDNCluster) GetSdnZones(ctx context.Context, zone string, params *cluster.GetSdnZonesParams) (*cluster.GetSdnZonesResponse, error) {
+	if m.getSdnZonesFn != nil {
+		return m.getSdnZonesFn(ctx, zone, params)
+	}
+	return nil, nil
+}
+
+func (m *mockSDNCluster) ListSdnZones(ctx context.Context, params *cluster.ListSdnZonesParams) (*cluster.ListSdnZonesResponse, error) {
+	if m.listSdnZonesFn != nil {
+		return m.listSdnZonesFn(ctx, params)
+	}
+	empty := cluster.ListSdnZonesResponse{}
+	return &empty, nil
+}
+
+func (m *mockSDNCluster) CreateSdnVnetsSubnets(ctx context.Context, vnet string, params *cluster.CreateSdnVnetsSubnetsParams) error {
+	if m.createSdnVnetsSubnetsFn != nil {
+		return m.createSdnVnetsSubnetsFn(ctx, vnet, params)
+	}
+	return nil
+}
+
+func (m *mockSDNCluster) DeleteSdnVnetsSubnets(ctx context.Context, vnet string, subnet string, params *cluster.DeleteSdnVnetsSubnetsParams) error {
+	if m.deleteSdnVnetsSubnetsFn != nil {
+		return m.deleteSdnVnetsSubnetsFn(ctx, vnet, subnet, params)
+	}
+	return nil
+}
+
+func (m *mockSDNCluster) ListSdnVnetsSubnets(ctx context.Context, vnet string, params *cluster.ListSdnVnetsSubnetsParams) (*cluster.ListSdnVnetsSubnetsResponse, error) {
+	if m.listSdnVnetsSubnetsFn != nil {
+		return m.listSdnVnetsSubnetsFn(ctx, vnet, params)
+	}
+	empty := cluster.ListSdnVnetsSubnetsResponse{}
+	return &empty, nil
+}
+
+func (m *mockSDNCluster) UpdateSdn(ctx context.Context, params *cluster.UpdateSdnParams) (*cluster.UpdateSdnResponse, error) {
+	if m.updateSdnFn != nil {
+		return m.updateSdnFn(ctx, params)
+	}
+	return nil, nil
+}
+
+// --------------------------------------------------------------------------
+// mockBridgeNodes
+// --------------------------------------------------------------------------
+
+// mockBridgeNodes embeds panicNodesStub (nil — panics on non-overridden methods)
+// and overrides the three node-bridge methods the bridge fallback path calls.
+// Set the corresponding Fn field to supply behaviour; nil gives a safe default.
+// Additive: does not replace the existing mockNodesService used by other tests.
+type mockBridgeNodes struct {
+	panicNodesStub
+
+	createNetworkFn  func(ctx context.Context, node string, params *nodes.CreateNetworkParams) error
+	deleteNetwork2Fn func(ctx context.Context, node string, iface string) error
+	updateNetworkFn  func(ctx context.Context, node string, params *nodes.UpdateNetworkParams) (*nodes.UpdateNetworkResponse, error)
+}
+
+// compile-time interface check.
+var _ nodes.Service = (*mockBridgeNodes)(nil)
+
+func (m *mockBridgeNodes) CreateNetwork(ctx context.Context, node string, params *nodes.CreateNetworkParams) error {
+	if m.createNetworkFn != nil {
+		return m.createNetworkFn(ctx, node, params)
+	}
+	return nil
+}
+
+func (m *mockBridgeNodes) DeleteNetwork2(ctx context.Context, node string, iface string) error {
+	if m.deleteNetwork2Fn != nil {
+		return m.deleteNetwork2Fn(ctx, node, iface)
+	}
+	return nil
+}
+
+func (m *mockBridgeNodes) UpdateNetwork(ctx context.Context, node string, params *nodes.UpdateNetworkParams) (*nodes.UpdateNetworkResponse, error) {
+	if m.updateNetworkFn != nil {
+		return m.updateNetworkFn(ctx, node, params)
+	}
+	return nil, nil
 }

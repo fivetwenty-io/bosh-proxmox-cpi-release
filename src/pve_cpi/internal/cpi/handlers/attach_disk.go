@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"strings"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/agent"
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
@@ -144,7 +145,51 @@ func HandleAttachDisk(deps Deps) Handler {
 		}
 
 		// --------------------------------------------------------------------
-		// 3. Attach disk via SDK at scsi1 or higher (NEVER scsi0).
+		// 3. Snapshot pre-flight guard.
+		//
+		// PVE permits attaching a disk to a VM that has existing snapshots, but the
+		// newly attached disk is absent from all prior snapshots — on rollback the
+		// disk disappears, causing silent data loss. Guard before any mutating PVE
+		// call to surface the risk early with an actionable message.
+		//
+		// Policy (D2-C, D3-C):
+		//   HasSnapshots error + RequireSnapshotCheckPass=true  → fail-closed (abort)
+		//   HasSnapshots error + RequireSnapshotCheckPass=false → WARN + proceed
+		//   Snapshots present + AllowDiskOpsWithSnapshots=false → Cloud error (hard fail)
+		//   Snapshots present + AllowDiskOpsWithSnapshots=true  → WARN + proceed
+		//   No snapshots                                        → proceed normally
+		// --------------------------------------------------------------------
+		if snapNames, snapErr := pve.HasSnapshots(ctx, deps.PVE, node, vmid); snapErr != nil {
+			if deps.Config.RequireSnapshotCheckPass {
+				return nil, cpierrors.Wrap(snapErr,
+					"attach_disk: snapshot pre-flight check failed and require_snapshot_check_pass is set",
+				)
+			}
+			deps.Logger.Warn("attach_disk: snapshot pre-flight check failed — proceeding (fail-open)",
+				log.String("node", node),
+				log.Int("vmid", vmid),
+				log.Err(snapErr),
+			)
+		} else if len(snapNames) > 0 {
+			if deps.Config.AllowDiskOpsWithSnapshots {
+				deps.Logger.Warn("attach_disk: proceeding despite snapshots (allow_disk_ops_with_snapshots=true)",
+					log.String("vm_cid", vmCID),
+					log.String("node", node),
+					log.String("snapshots", strings.Join(snapNames, ", ")),
+				)
+			} else {
+				return nil, cpierrors.Cloud(
+					"attach_disk: VM %s (node %s) has %d snapshot(s) [%s]: attaching a persistent disk while"+
+						" snapshots exist makes the disk invisible in all prior snapshot rollbacks."+
+						" Delete all snapshots before attaching persistent disks, or set"+
+						" pve.allow_disk_ops_with_snapshots=true in CPI config to bypass this guard.",
+					vmCID, node, len(snapNames), strings.Join(snapNames, ", "),
+				)
+			}
+		}
+
+		// --------------------------------------------------------------------
+		// 5. Attach disk via SDK at scsi1 or higher (NEVER scsi0).
 		//
 		// The SDK's default slot selection picks the lowest free index — 0 for
 		// a VM with no other scsi disks. That would yield /dev/sda inside the
@@ -196,7 +241,7 @@ func HandleAttachDisk(deps Deps) Handler {
 		}
 
 		// --------------------------------------------------------------------
-		// 4. Confirm attachment by resolving diskID from current VM config.
+		// 6. Confirm attachment by resolving diskID from current VM config.
 		//    This guards against edge cases where AttachDisk returns stale data.
 		// --------------------------------------------------------------------
 		resolvedDiskID, err := pve.ResolveDiskID(ctx, deps.PVE, node, vmid, diskCID)
@@ -213,7 +258,7 @@ func HandleAttachDisk(deps Deps) Handler {
 		}
 
 		// --------------------------------------------------------------------
-		// 5. Derive device path from diskID.
+		// 7. Derive device path from diskID.
 		//
 		// We use a PVE-stable by-id symlink rather than a "/dev/sd<X>" hint
 		// because BOSH agent's mappedDevicePathResolver substitutes /dev/sd
@@ -239,7 +284,7 @@ func HandleAttachDisk(deps Deps) Handler {
 		}
 
 		// --------------------------------------------------------------------
-		// 6. Update agent disk hints (no-op for cloudinit/noagent modes).
+		// 8. Update agent disk hints (no-op for cloudinit/noagent modes).
 		// --------------------------------------------------------------------
 		if err := deps.Agent.UpdateDiskHints(ctx, vmid, []agent.DiskHint{
 			{DiskCID: diskCID, DevicePath: devicePath},
@@ -255,7 +300,7 @@ func HandleAttachDisk(deps Deps) Handler {
 		)
 
 		// --------------------------------------------------------------------
-		// 7. Return disk_hints (v2 spec: object with "path" key).
+		// 9. Return disk_hints (v2 spec: object with "path" key).
 		// --------------------------------------------------------------------
 		return diskHints{Path: devicePath}, nil
 	})

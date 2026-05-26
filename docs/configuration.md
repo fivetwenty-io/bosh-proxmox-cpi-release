@@ -21,7 +21,10 @@ The CPI is configured via properties in a BOSH deployment manifest. The job temp
 | `pve.reboot_mode` | `reboot_vm` strategy: `soft` (graceful ACPI reboot, hard-reset fallback) or `hard` (immediate reset) | `soft` | no |
 | `pve.reboot_timeout` | Seconds to wait for graceful shutdown before hard-reset fallback (soft mode only) | `60` | no |
 | `pve.log_level` | Log level (`debug`, `info`, `warn`, `error`) | `info` | no |
-| `pve.vmid_range_start` | First VMID used for VM allocation. VMs use `[vmid_range_start, 5999]`. Persistent disks use `[9000, 9999]`. | `100` | no |
+| `pve.vmid_range_start` | First VMID used for VM allocation. VMs use `[vmid_range_start, vmid_range_end]`. Persistent disks use `[9000, 9999]`. | `100` | no |
+| `pve.vmid_range_end` | Inclusive upper bound of the VM VMID range. Must be greater than `vmid_range_start` and at most `9999`. The allocator scans this range from a randomized start so concurrent CPI invocations rarely pick the same VMID; a retry-on-conflict loop backstops the rare collision. | `5999` | no |
+| `pve.allow_disk_ops_with_snapshots` | When `true`, bypasses the snapshot pre-flight guard in `attach_disk`, `detach_disk`, and `resize_disk`. Use only for emergency disk recovery — snapshot state becomes inconsistent after the operation. | `false` | no |
+| `pve.require_snapshot_check_pass` | Controls behavior when the snapshot pre-flight check itself cannot reach PVE. `false` (default) logs a warning and proceeds (fail-open); `true` aborts the disk operation if the snapshot list cannot be fetched (fail-closed). | `false` | no |
 | `registry.endpoint` | BOSH registry URL | - | yes when `agent_mode = registry` |
 | `registry.user` | Registry username | - | yes when `agent_mode = registry` |
 | `registry.password` | Registry password | - | yes when `agent_mode = registry` |

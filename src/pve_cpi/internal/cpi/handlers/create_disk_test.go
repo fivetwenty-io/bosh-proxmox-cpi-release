@@ -493,8 +493,16 @@ func TestHandleCreateDisk_DiskCIDNotDoublePrefixed(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected string result, got %T", result)
 	}
-	if got, want := diskCID, "data:vm-9000-disk-0"; got != want {
-		t.Errorf("disk_cid = %q, want %q (double-prefix bug)", got, want)
+	// The disk VMID is allocated from the synthetic disk range [9000,9999]
+	// with a randomized scan start, so the exact ID is non-deterministic.
+	// The regression invariant is structural: a single "data:" prefix and
+	// the canonical "vm-<vmid>-disk-0" volid shape. A double-prefixed CID
+	// ("data:data:vm-...") fails the Sscanf literal-prefix match.
+	var vmid int
+	if n, serr := fmt.Sscanf(diskCID, "data:vm-%d-disk-0", &vmid); serr != nil || n != 1 {
+		t.Errorf("disk_cid = %q, want form data:vm-<vmid>-disk-0 (single prefix, no double-prefix bug)", diskCID)
+	} else if vmid < 9000 || vmid > 9999 {
+		t.Errorf("disk_cid = %q, vmid %d outside disk range [9000,9999]", diskCID, vmid)
 	}
 }
 

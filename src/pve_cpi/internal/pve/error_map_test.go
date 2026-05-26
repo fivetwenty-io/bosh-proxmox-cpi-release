@@ -618,3 +618,60 @@ func TestWrapError_StorageLockTimeout_IsRetriable(t *testing.T) {
 		t.Errorf("storage-lock timeout should map to RetriableCloudError; got %T %v", wrapped, wrapped)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// IsSnapshotBlocked
+// ---------------------------------------------------------------------------
+
+func TestIsSnapshotBlocked_Nil(t *testing.T) {
+	if pve.IsSnapshotBlocked(nil) {
+		t.Error("nil should not be snapshot-blocked")
+	}
+}
+
+func TestIsSnapshotBlocked_DetachMessage(t *testing.T) {
+	// Canonical PVE detach surface: PUT /config delete:scsiN rejected because
+	// a snapshot references the disk.
+	err := errors.New("cannot delete disk 'scsi1', disk is used in snapshot 'snap1'")
+	if !pve.IsSnapshotBlocked(err) {
+		t.Errorf("detach snapshot-blocked message should match; err=%v", err)
+	}
+}
+
+func TestIsSnapshotBlocked_ResizeMessage(t *testing.T) {
+	// Canonical PVE resize surface (LVM-thin/ZFS): task body contains this text.
+	err := errors.New("can't resize volume, volume is referenced in snapshot 'bosh-1'")
+	if !pve.IsSnapshotBlocked(err) {
+		t.Errorf("resize snapshot-blocked message should match; err=%v", err)
+	}
+}
+
+func TestIsSnapshotBlocked_StorageLockTimeout(t *testing.T) {
+	// Unrelated transient error must not match.
+	err := errors.New("task failed: can't lock file '/var/lock/pve-manager/pve-storage-data' - got timeout")
+	if pve.IsSnapshotBlocked(err) {
+		t.Errorf("storage lock timeout should not be snapshot-blocked; err=%v", err)
+	}
+}
+
+func TestIsSnapshotBlocked_CaseInsensitive_UsedIn(t *testing.T) {
+	// PVE error text may arrive in mixed case depending on Perl die() formatting.
+	err := errors.New("Cannot Delete Disk 'scsi0', Disk Is Used In Snapshot 'auto-backup'")
+	if !pve.IsSnapshotBlocked(err) {
+		t.Errorf("mixed-case 'Is Used In Snapshot' should match; err=%v", err)
+	}
+}
+
+func TestIsSnapshotBlocked_CaseInsensitive_ReferencedIn(t *testing.T) {
+	err := errors.New("Task Failed: Volume Is Referenced In Snapshot 'daily-2024'")
+	if !pve.IsSnapshotBlocked(err) {
+		t.Errorf("mixed-case 'Referenced In Snapshot' should match; err=%v", err)
+	}
+}
+
+func TestIsSnapshotBlocked_Unrelated(t *testing.T) {
+	err := errors.New("VM 131 already exists on node 'pve'")
+	if pve.IsSnapshotBlocked(err) {
+		t.Errorf("unrelated error should not be snapshot-blocked; err=%v", err)
+	}
+}

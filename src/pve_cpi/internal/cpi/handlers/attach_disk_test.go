@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/agent"
@@ -41,6 +42,11 @@ type attachQEMUService struct {
 	// DetachDisk control — records calls and may inject error.
 	detachCalls []string
 	detachErr   error
+
+	// listSnapshotsFn controls ListSnapshots behavior for snapshot guard tests.
+	// nil → return only the synthetic "current" entry (no real snapshots),
+	// so existing tests are not affected by the guard.
+	listSnapshotsFn func(ctx context.Context, node string, vmid int) ([]map[string]interface{}, error)
 }
 
 func (m *attachQEMUService) AttachDisk(_ context.Context, _ string, _ int, _ string, _ string, _ *qemu.AttachOpts) (string, error) {
@@ -97,8 +103,16 @@ func (m *attachQEMUService) Snapshot(_ context.Context, _ string, _ int, _ strin
 func (m *attachQEMUService) DeleteSnapshot(_ context.Context, _ string, _ int, _ string) error {
 	panic("attachQEMUService.DeleteSnapshot: not expected")
 }
-func (m *attachQEMUService) ListSnapshots(_ context.Context, _ string, _ int) ([]map[string]interface{}, error) {
-	panic("attachQEMUService.ListSnapshots: not expected")
+func (m *attachQEMUService) ListSnapshots(
+	ctx context.Context, node string, vmid int,
+) ([]map[string]interface{}, error) {
+	if m.listSnapshotsFn != nil {
+		return m.listSnapshotsFn(ctx, node, vmid)
+	}
+	// Default: only the synthetic "current" entry — no real snapshots.
+	// Existing tests do not set listSnapshotsFn; this keeps them unaffected by
+	// the snapshot guard (guard sees len(names)==0 and proceeds normally).
+	return []map[string]interface{}{{"name": "current"}}, nil
 }
 func (m *attachQEMUService) RollbackSnapshot(_ context.Context, _ string, _ int, _ string) (string, error) {
 	panic("attachQEMUService.RollbackSnapshot: not expected")
@@ -141,6 +155,17 @@ func attachDeps(qemuSvc qemu.Service, ag agent.Agent) handlers.Deps {
 			Node:         "pve1",
 			VMDiskFormat: "qcow2",
 		},
+		PVE:    &mockPVEClient{qemuSvc: qemuSvc},
+		Agent:  ag,
+		Logger: log.NewNopLogger(),
+	}
+}
+
+// attachDepsWithConfig builds a Deps with a caller-supplied config. Used by
+// snapshot guard tests that need AllowDiskOpsWithSnapshots / RequireSnapshotCheckPass.
+func attachDepsWithConfig(qemuSvc qemu.Service, ag agent.Agent, cfg *config.CPIConfig) handlers.Deps {
+	return handlers.Deps{
+		Config: cfg,
 		PVE:    &mockPVEClient{qemuSvc: qemuSvc},
 		Agent:  ag,
 		Logger: log.NewNopLogger(),
@@ -544,5 +569,198 @@ func TestHandleAttachDisk_PicksLowestFreeAtOrAboveOne(t *testing.T) {
 	path := extractPath(t, result)
 	if path != wantPath {
 		t.Errorf("disk_hints.path: want %q (lowest free >= 1), got %q", wantPath, path)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot guard tests
+//
+// Each test uses a fresh attachQEMUService that wires listSnapshotsFn to
+// control the guard outcome, and verifies:
+//   a) whether AttachDisk was called (attachCalled tracks this via attachErr sentinel)
+//   b) the error type / message content
+//
+// The "attachCalled" pattern: if attachErr is set to errAttachSentinel, the
+// test can detect a call vs. no-call by checking whether the error returned by
+// the handler contains "sentinel". When no error is expected the attach
+// succeeds normally via attachReturnDiskID.
+// ---------------------------------------------------------------------------
+
+// snapshots builds a ListSnapshots response with the given real snapshot names
+// plus the mandatory synthetic "current" entry.
+func snapshots(names ...string) func(_ context.Context, _ string, _ int) ([]map[string]interface{}, error) {
+	return func(_ context.Context, _ string, _ int) ([]map[string]interface{}, error) {
+		out := []map[string]interface{}{{"name": "current"}}
+		for _, n := range names {
+			out = append(out, map[string]interface{}{"name": n})
+		}
+		return out, nil
+	}
+}
+
+// snapshotErr returns a listSnapshotsFn that fails with the given error.
+func snapshotErr(err error) func(_ context.Context, _ string, _ int) ([]map[string]interface{}, error) {
+	return func(_ context.Context, _ string, _ int) ([]map[string]interface{}, error) {
+		return nil, err
+	}
+}
+
+// guardCfg returns a CPIConfig with the given guard flags and the minimal
+// fields the handler's local-backend path requires. Node is set to match
+// the mock's resolved node ("pve1" matches attachDeps default; disk_cid
+// storage "local-lvm" is shared; we use "data" storage which maps to shared
+// backend so no vmNode lookup is triggered).
+func guardCfg(allowDiskOps, requireCheckPass bool) *config.CPIConfig {
+	return &config.CPIConfig{
+		Node:                      "pve1",
+		VMDiskFormat:              "qcow2",
+		AllowDiskOpsWithSnapshots: allowDiskOps,
+		RequireSnapshotCheckPass:  requireCheckPass,
+	}
+}
+
+// snapQEMUSvc builds an attachQEMUService with listSnapshotsFn set and a
+// working attach+config path. diskCID must match the "storage:volid" form
+// used in the test.
+func snapQEMUSvc(
+	listFn func(context.Context, string, int) ([]map[string]interface{}, error),
+	volid string,
+) *attachQEMUService {
+	return &attachQEMUService{
+		attachReturnDiskID: "scsi1",
+		configCfg: map[string]interface{}{
+			"scsi1": "data:" + volid,
+		},
+		listSnapshotsFn: listFn,
+	}
+}
+
+// TestHandleAttachDisk_GuardBlocksWhenSnapshotsPresent verifies that the
+// handler returns a Cloud error and does NOT call AttachDisk when the VM has
+// real snapshots and AllowDiskOpsWithSnapshots is false.
+func TestHandleAttachDisk_GuardBlocksWhenSnapshotsPresent(t *testing.T) {
+	const volid = "vm-9001-disk-0"
+	const diskCID = "data:" + volid
+	snapName1, snapName2 := "bosh-snap-a", "bosh-snap-b"
+
+	qemuSvc := snapQEMUSvc(snapshots(snapName1, snapName2), volid)
+	// Sentinel: if AttachDisk is called unexpectedly it will return this error,
+	// and the test will catch it via the error message.
+	qemuSvc.attachErr = errors.New("AttachDisk must not be called")
+
+	ag := &captureAgent{}
+	h := handlers.HandleAttachDisk(attachDepsWithConfig(qemuSvc, ag, guardCfg(false, false)))
+
+	_, err := h.Handle(context.Background(), attachArgs("100", diskCID), jsonrpc.Context{})
+	if err == nil {
+		t.Fatal("expected error when snapshots present; got nil")
+	}
+	if !cpierrors.IsType(err, cpierrors.TypeCloud) {
+		t.Errorf("error type: want TypeCloud, got %T: %v", err, err)
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, snapName1) || !strings.Contains(msg, snapName2) {
+		t.Errorf("error message must contain snapshot names %q and %q; got: %s", snapName1, snapName2, msg)
+	}
+	if !strings.Contains(msg, "allow_disk_ops_with_snapshots") {
+		t.Errorf("error message must contain remediation hint 'allow_disk_ops_with_snapshots'; got: %s", msg)
+	}
+	if ag.updateCalled {
+		t.Error("UpdateDiskHints must not be called when guard blocks")
+	}
+}
+
+// TestHandleAttachDisk_GuardProceedsWhenNoSnapshots verifies the happy path
+// when the VM has no real snapshots: AttachDisk is called and disk_hints returned.
+func TestHandleAttachDisk_GuardProceedsWhenNoSnapshots(t *testing.T) {
+	const volid = "vm-9001-disk-0"
+	const diskCID = "data:" + volid
+
+	qemuSvc := snapQEMUSvc(snapshots( /* none */ ), volid)
+	ag := &captureAgent{}
+	h := handlers.HandleAttachDisk(attachDepsWithConfig(qemuSvc, ag, guardCfg(false, false)))
+
+	result, err := h.Handle(context.Background(), attachArgs("100", diskCID), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error when no snapshots: %v", err)
+	}
+	if result == nil {
+		t.Fatal("expected disk_hints result; got nil")
+	}
+	if !ag.updateCalled {
+		t.Error("UpdateDiskHints should be called on success")
+	}
+}
+
+// TestHandleAttachDisk_GuardCheckErrorFailOpen verifies that when ListSnapshots
+// returns an error and RequireSnapshotCheckPass is false, the handler WARNs and
+// proceeds: AttachDisk is called and disk_hints are returned.
+func TestHandleAttachDisk_GuardCheckErrorFailOpen(t *testing.T) {
+	const volid = "vm-9001-disk-0"
+	const diskCID = "data:" + volid
+
+	listErr := errors.New("PVE transient: connection reset")
+	qemuSvc := snapQEMUSvc(snapshotErr(listErr), volid)
+	ag := &captureAgent{}
+	h := handlers.HandleAttachDisk(attachDepsWithConfig(qemuSvc, ag, guardCfg(false, false)))
+
+	result, err := h.Handle(context.Background(), attachArgs("100", diskCID), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("expected fail-open (proceed with warn) when RequireSnapshotCheckPass=false; got error: %v", err)
+	}
+	if result == nil {
+		t.Fatal("expected disk_hints result on fail-open; got nil")
+	}
+	if !ag.updateCalled {
+		t.Error("UpdateDiskHints should be called on fail-open proceed")
+	}
+}
+
+// TestHandleAttachDisk_GuardCheckErrorFailClosed verifies that when ListSnapshots
+// returns an error and RequireSnapshotCheckPass is true, the handler returns an
+// error and does NOT call AttachDisk.
+func TestHandleAttachDisk_GuardCheckErrorFailClosed(t *testing.T) {
+	const volid = "vm-9001-disk-0"
+	const diskCID = "data:" + volid
+
+	listErr := errors.New("PVE transient: connection reset")
+	qemuSvc := snapQEMUSvc(snapshotErr(listErr), volid)
+	qemuSvc.attachErr = errors.New("AttachDisk must not be called")
+
+	ag := &captureAgent{}
+	h := handlers.HandleAttachDisk(attachDepsWithConfig(qemuSvc, ag, guardCfg(false, true)))
+
+	_, err := h.Handle(context.Background(), attachArgs("100", diskCID), jsonrpc.Context{})
+	if err == nil {
+		t.Fatal("expected error when RequireSnapshotCheckPass=true and check fails; got nil")
+	}
+	if !strings.Contains(err.Error(), "require_snapshot_check_pass") {
+		t.Errorf("error must mention require_snapshot_check_pass; got: %v", err)
+	}
+	if ag.updateCalled {
+		t.Error("UpdateDiskHints must not be called when guard fails closed")
+	}
+}
+
+// TestHandleAttachDisk_GuardAllowOverrideProceeds verifies that when snapshots
+// are present but AllowDiskOpsWithSnapshots is true, the handler WARNs and
+// proceeds: AttachDisk is called and disk_hints are returned.
+func TestHandleAttachDisk_GuardAllowOverrideProceeds(t *testing.T) {
+	const volid = "vm-9001-disk-0"
+	const diskCID = "data:" + volid
+
+	qemuSvc := snapQEMUSvc(snapshots("snap-override-test"), volid)
+	ag := &captureAgent{}
+	h := handlers.HandleAttachDisk(attachDepsWithConfig(qemuSvc, ag, guardCfg(true, false)))
+
+	result, err := h.Handle(context.Background(), attachArgs("100", diskCID), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("expected proceed when AllowDiskOpsWithSnapshots=true; got error: %v", err)
+	}
+	if result == nil {
+		t.Fatal("expected disk_hints result with allow override; got nil")
+	}
+	if !ag.updateCalled {
+		t.Error("UpdateDiskHints should be called when override allows proceed")
 	}
 }

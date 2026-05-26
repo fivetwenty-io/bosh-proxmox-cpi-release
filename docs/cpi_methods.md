@@ -199,12 +199,13 @@ The handler reads the VM's existing PVE tags, strips entries with the reserved p
   - `cpu` (Integer): virtual core count
   - `ram` (Integer): RAM in MiB
   - `ephemeral_disk_size` (Integer): ephemeral disk size in MB
+  - `storage` (String, optional): overrides `pve.vm_storage` for this call only; the returned `target_storage` reflects it
 
 **Returns:** `Hash` — `cloud_properties` suitable for use in a BOSH VM type
 
-**Errors:** `Bosh::Clouds::CloudError` if requested resources exceed cluster capacity
+**Errors:** `Bosh::Clouds::NotSupported` when no node satisfies the request. The message names the requested cpu/ram and storage, and lists CPU/RAM-qualifying nodes that failed the storage check.
 
-**Notes:** Queries PVE cluster node capabilities and returns the minimum PVE cloud_properties (cores, sockets, memory, target node) that satisfy the requested size. May oversize. Used by the BOSH CLI `interpolate` and `env` commands.
+**Notes:** Selects a node storage-first: only nodes where the effective storage is active and `images`-capable are considered, then the node with the most free RAM among them wins. This prevents placing a VM on a node where the storage is unavailable (which previously failed later in `create_vm` with an opaque PVE error). Returns the minimum PVE cloud_properties (cores, sockets, memory, target node, target storage) that satisfy the requested size. May oversize. Used by the BOSH CLI `interpolate` and `env` commands.
 
 ---
 
@@ -275,7 +276,7 @@ The handler reads the VM's existing PVE tags, strips entries with the reserved p
 
 **Errors:** `Bosh::Clouds::CloudError` on PVE API failure
 
-**Notes:** Attaches the disk to the VM's PVE config and awaits the PVE task. Returns the kernel device path assigned to the disk. This is a v2 change: v1 returned void and updated the registry instead.
+**Notes:** Attaches the disk to the VM's PVE config and awaits the PVE task. Returns the kernel device path assigned to the disk. This is a v2 change: v1 returned void and updated the registry instead. A snapshot pre-flight guard runs first: if the VM has snapshots, attach is rejected with an actionable error, because a disk attached after a snapshot is invisible to that snapshot on rollback. Set `pve.allow_disk_ops_with_snapshots` to bypass. See [Snapshot guard on disk operations](#snapshot-guard-on-disk-operations).
 
 ---
 
@@ -292,7 +293,7 @@ The handler reads the VM's existing PVE tags, strips entries with the reserved p
 
 **Errors:** `Bosh::Clouds::CloudError` on PVE API failure
 
-**Notes:** Removes the disk from the VM's PVE config and awaits the PVE task. In v2 with `api_version: 2` stemcells, the Director sends disk-detach notification to the agent directly; the CPI does not touch the registry.
+**Notes:** Removes the disk from the VM's PVE config and awaits the PVE task. In v2 with `api_version: 2` stemcells, the Director sends disk-detach notification to the agent directly; the CPI does not touch the registry. A snapshot pre-flight guard runs first: if the VM has snapshots that reference the disk, detach is rejected with an actionable error naming the blocking snapshots (PVE would otherwise reject it with a raw message). Set `pve.allow_disk_ops_with_snapshots` to bypass. See [Snapshot guard on disk operations](#snapshot-guard-on-disk-operations).
 
 ---
 
@@ -361,7 +362,19 @@ The handler reads the VM's existing PVE tags, strips entries with the reserved p
 - `Bosh::Clouds::NotSupported` when `new_size` is less than the current disk size (shrink rejected; Director falls back to create-new + copy-data)
 - `Bosh::Clouds::CloudError` on PVE API failure
 
-**Notes:** The Director calls this only when `director.enable_cpi_resize_disk: true`. The disk must be detached before resize.
+**Notes:** The Director calls this only when `director.enable_cpi_resize_disk: true`. The disk must be detached before resize. A snapshot pre-flight guard runs first: if the VM has snapshots, resize is rejected with an actionable error. PVE cannot resize disks on LVM-thin or ZFS storage while snapshots exist; on qcow2/raw the resize would succeed but leave snapshot data inconsistent. Set `pve.allow_disk_ops_with_snapshots` to bypass. See [Snapshot guard on disk operations](#snapshot-guard-on-disk-operations).
+
+---
+
+### Snapshot guard on disk operations
+
+`attach_disk`, `detach_disk`, and `resize_disk` run a snapshot pre-flight check before mutating the VM. If the VM has one or more snapshots, the operation is rejected with an error that names the VM, node, and snapshot names, and states the remediation: delete the snapshots first, or set `pve.allow_disk_ops_with_snapshots`. This converts opaque PVE rejections (detach, resize) and silent data-integrity hazards (attach) into clear, actionable failures.
+
+Two settings tune the behavior:
+
+- `pve.allow_disk_ops_with_snapshots` (default `false`) — when `true`, the guard is bypassed and the operation proceeds despite snapshots. For emergency recovery only; snapshot state becomes inconsistent afterward.
+
+- `pve.require_snapshot_check_pass` (default `false`) — controls what happens when the snapshot check itself cannot reach PVE. Default is fail-open: log a warning and proceed. Set `true` to fail-closed: abort the operation if the snapshot list cannot be fetched.
 
 ---
 

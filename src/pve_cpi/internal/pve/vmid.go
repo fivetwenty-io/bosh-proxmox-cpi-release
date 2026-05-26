@@ -146,10 +146,29 @@ func listClusterVMIDs(ctx context.Context, c Client) (map[int]struct{}, error) {
 	return used, nil
 }
 
-// nextVMIDInRange scans [start, end] and returns the lowest VMID not present
-// in used. Returns a *cpierrors.Error if the entire range is exhausted.
+// nextVMIDInRange picks a random start offset within [start, end] and scans
+// the full range exactly once (wrapping at end back to start), returning the
+// first VMID not present in used. Randomising the entry point scatters
+// concurrent CPI processes across the VMID space, reducing cross-process
+// collision probability to roughly 1/(end-start+1) per process pair while
+// keeping AllocateWithRetry as the backstop for the rare collision that still
+// occurs.
+//
+// Inputs and failure modes:
+//   - used nil is treated as an empty set (all IDs free).
+//   - end < start → returns *cpierrors.Error immediately (defensive guard;
+//     callers are expected to pass a valid range, but we never panic).
+//   - range fully exhausted → returns *cpierrors.Error with same message as
+//     before so callers / tests that match the string remain unaffected.
 func nextVMIDInRange(used map[int]struct{}, start, end int) (int, error) {
-	for candidate := start; candidate <= end; candidate++ {
+	if end < start {
+		return 0, cpierrors.Cloud("no free VMID in range [%d, %d]: all %d IDs exhausted",
+			start, end, 0)
+	}
+	width := end - start + 1
+	randomOffset := mrand.IntN(width) // goroutine-safe; no manual seed required
+	for i := 0; i < width; i++ {
+		candidate := start + (randomOffset+i)%width
 		if _, taken := used[candidate]; !taken {
 			return candidate, nil
 		}

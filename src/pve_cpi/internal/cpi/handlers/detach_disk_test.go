@@ -28,6 +28,9 @@ type detachQEMUService struct {
 	detachErr      error
 	detachCalled   bool
 	detachedDiskID string
+
+	// listSnapshotsFn drives the snapshot guard. nil → returns (nil, nil) (no snapshots).
+	listSnapshotsFn func(ctx context.Context, node string, vmid int) ([]map[string]interface{}, error)
 }
 
 func (m *detachQEMUService) Config(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
@@ -73,8 +76,13 @@ func (m *detachQEMUService) Snapshot(_ context.Context, _ string, _ int, _ strin
 func (m *detachQEMUService) DeleteSnapshot(_ context.Context, _ string, _ int, _ string) error {
 	panic("detachQEMUService.DeleteSnapshot: not expected")
 }
-func (m *detachQEMUService) ListSnapshots(_ context.Context, _ string, _ int) ([]map[string]interface{}, error) {
-	panic("detachQEMUService.ListSnapshots: not expected")
+func (m *detachQEMUService) ListSnapshots(
+	ctx context.Context, node string, vmid int,
+) ([]map[string]interface{}, error) {
+	if m.listSnapshotsFn != nil {
+		return m.listSnapshotsFn(ctx, node, vmid)
+	}
+	return nil, nil // default: no snapshots → guard passes
 }
 func (m *detachQEMUService) RollbackSnapshot(_ context.Context, _ string, _ int, _ string) (string, error) {
 	panic("detachQEMUService.RollbackSnapshot: not expected")
@@ -294,5 +302,178 @@ func TestHandleDetachDisk_EmptyConfigIdempotent(t *testing.T) {
 	}
 	if qemuSvc.detachCalled {
 		t.Error("DetachDisk must not be called when disk is not attached")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot guard tests
+// ---------------------------------------------------------------------------
+
+// snapshotRows returns a ListSnapshots response containing the given snapshot
+// names plus the synthetic "current" entry (which HasSnapshots filters out).
+func snapshotRows(names ...string) []map[string]interface{} {
+	rows := []map[string]interface{}{{"name": "current"}} // synthetic — always present
+	for _, n := range names {
+		rows = append(rows, map[string]interface{}{"name": n})
+	}
+	return rows
+}
+
+// detachDepsWithCfg builds Deps with overridden config fields for guard tests.
+func detachDepsWithCfg(qemuSvc qemu.Service, allow, require bool) handlers.Deps {
+	return handlers.Deps{
+		Config: &config.CPIConfig{
+			Node:                      "pve1",
+			VMDiskFormat:              "qcow2",
+			AllowDiskOpsWithSnapshots: allow,
+			RequireSnapshotCheckPass:  require,
+		},
+		PVE:    &mockPVEClient{qemuSvc: qemuSvc},
+		Agent:  &mockAgentService{},
+		Logger: log.NewNopLogger(),
+	}
+}
+
+// TestHandleDetachDisk_SnapshotPresent_HardFail verifies that when real
+// snapshots exist and AllowDiskOpsWithSnapshots=false, the handler returns a
+// Cloud error and DetachDisk is NOT called. The error message must contain the
+// snapshot names, the disk CID, and the remediation hint.
+func TestHandleDetachDisk_SnapshotPresent_HardFail(t *testing.T) {
+	const (
+		vmCID   = "100"
+		diskCID = "local-lvm:vm-9001-disk-0"
+		volid   = "local-lvm:vm-9001-disk-0"
+	)
+
+	qemuSvc := &detachQEMUService{
+		configCfg: map[string]interface{}{"scsi2": volid},
+		listSnapshotsFn: func(_ context.Context, _ string, _ int) ([]map[string]interface{}, error) {
+			return snapshotRows("snap-before-patch", "snap-qa"), nil
+		},
+	}
+	h := handlers.HandleDetachDisk(detachDepsWithCfg(qemuSvc, false, false))
+
+	_, err := h.Handle(context.Background(), detachArgs(vmCID, diskCID), jsonrpc.Context{})
+	if err == nil {
+		t.Fatal("expected Cloud error when snapshots present and AllowDiskOpsWithSnapshots=false")
+	}
+	if !cpierrors.IsType(err, cpierrors.TypeCloud) {
+		t.Errorf("error type: want Cloud, got %T %v", err, err)
+	}
+	msg := err.Error()
+	for _, want := range []string{"snap-before-patch", "snap-qa", diskCID, "allow_disk_ops_with_snapshots"} {
+		if !containsSubstr(msg, want) {
+			t.Errorf("error message missing %q; full msg: %s", want, msg)
+		}
+	}
+	if qemuSvc.detachCalled {
+		t.Error("DetachDisk must NOT be called when snapshot guard hard-fails")
+	}
+}
+
+// TestHandleDetachDisk_NoSnapshots_Proceeds verifies the happy path when the
+// snapshot check returns no real snapshots — DetachDisk is called normally.
+func TestHandleDetachDisk_NoSnapshots_Proceeds(t *testing.T) {
+	const (
+		vmCID   = "100"
+		diskCID = "local-lvm:vm-9001-disk-0"
+		volid   = "local-lvm:vm-9001-disk-0"
+	)
+
+	qemuSvc := &detachQEMUService{
+		configCfg: map[string]interface{}{"scsi2": volid},
+		listSnapshotsFn: func(_ context.Context, _ string, _ int) ([]map[string]interface{}, error) {
+			return snapshotRows(), nil // only "current" synthetic — HasSnapshots returns []
+		},
+	}
+	h := handlers.HandleDetachDisk(detachDepsWithCfg(qemuSvc, false, false))
+
+	_, err := h.Handle(context.Background(), detachArgs(vmCID, diskCID), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error when no real snapshots: %v", err)
+	}
+	if !qemuSvc.detachCalled {
+		t.Error("DetachDisk must be called when no real snapshots exist")
+	}
+}
+
+// TestHandleDetachDisk_SnapshotCheckError_FailOpen verifies that when
+// ListSnapshots returns an error and RequireSnapshotCheckPass=false, the
+// handler logs a warning and proceeds to call DetachDisk (fail-open, D3-C).
+func TestHandleDetachDisk_SnapshotCheckError_FailOpen(t *testing.T) {
+	const (
+		vmCID   = "100"
+		diskCID = "local-lvm:vm-9001-disk-0"
+		volid   = "local-lvm:vm-9001-disk-0"
+	)
+
+	qemuSvc := &detachQEMUService{
+		configCfg: map[string]interface{}{"scsi2": volid},
+		listSnapshotsFn: func(_ context.Context, _ string, _ int) ([]map[string]interface{}, error) {
+			return nil, errors.New("PVE snapshot API unavailable")
+		},
+	}
+	h := handlers.HandleDetachDisk(detachDepsWithCfg(qemuSvc, false, false))
+
+	_, err := h.Handle(context.Background(), detachArgs(vmCID, diskCID), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("expected fail-open (no error) when snapshot check errors and require=false: %v", err)
+	}
+	if !qemuSvc.detachCalled {
+		t.Error("DetachDisk must be called in fail-open mode")
+	}
+}
+
+// TestHandleDetachDisk_SnapshotCheckError_FailClosed verifies that when
+// ListSnapshots returns an error and RequireSnapshotCheckPass=true, the
+// handler aborts with an error and DetachDisk is NOT called (fail-closed, D3-C).
+func TestHandleDetachDisk_SnapshotCheckError_FailClosed(t *testing.T) {
+	const (
+		vmCID   = "100"
+		diskCID = "local-lvm:vm-9001-disk-0"
+		volid   = "local-lvm:vm-9001-disk-0"
+	)
+
+	qemuSvc := &detachQEMUService{
+		configCfg: map[string]interface{}{"scsi2": volid},
+		listSnapshotsFn: func(_ context.Context, _ string, _ int) ([]map[string]interface{}, error) {
+			return nil, errors.New("PVE snapshot API unavailable")
+		},
+	}
+	h := handlers.HandleDetachDisk(detachDepsWithCfg(qemuSvc, false, true))
+
+	_, err := h.Handle(context.Background(), detachArgs(vmCID, diskCID), jsonrpc.Context{})
+	if err == nil {
+		t.Fatal("expected error when snapshot check errors and require_snapshot_check_pass=true")
+	}
+	if qemuSvc.detachCalled {
+		t.Error("DetachDisk must NOT be called when fail-closed aborts")
+	}
+}
+
+// TestHandleDetachDisk_SnapshotPresent_AllowOverride verifies that when real
+// snapshots exist and AllowDiskOpsWithSnapshots=true, the handler logs a
+// warning but proceeds to call DetachDisk (operator-override, D2-C).
+func TestHandleDetachDisk_SnapshotPresent_AllowOverride(t *testing.T) {
+	const (
+		vmCID   = "100"
+		diskCID = "local-lvm:vm-9001-disk-0"
+		volid   = "local-lvm:vm-9001-disk-0"
+	)
+
+	qemuSvc := &detachQEMUService{
+		configCfg: map[string]interface{}{"scsi2": volid},
+		listSnapshotsFn: func(_ context.Context, _ string, _ int) ([]map[string]interface{}, error) {
+			return snapshotRows("snap-emergency"), nil
+		},
+	}
+	h := handlers.HandleDetachDisk(detachDepsWithCfg(qemuSvc, true, false))
+
+	_, err := h.Handle(context.Background(), detachArgs(vmCID, diskCID), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error with AllowDiskOpsWithSnapshots=true: %v", err)
+	}
+	if !qemuSvc.detachCalled {
+		t.Error("DetachDisk must be called when allow_disk_ops_with_snapshots=true overrides the guard")
 	}
 }

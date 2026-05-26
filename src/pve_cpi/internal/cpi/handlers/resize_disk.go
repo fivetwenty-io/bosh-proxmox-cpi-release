@@ -25,10 +25,13 @@ import (
 //
 // Logic:
 //  1. Parse disk_cid and locate the attached VM + diskID.
-//  2. Read current disk size from VM config (parsed from the disk option string).
-//  3. Compute delta GiB. Shrink (delta < 0) is not supported. No-op (delta == 0) returns nil.
-//  4. Call ResizeDisk with the positive delta in GiB (PVE additive "+NG" format).
-//  5. Await the returned task UPID.
+//  2. Run snapshot pre-flight guard (D2-C/D3-C): fail if snapshots exist and
+//     allow_disk_ops_with_snapshots is false; fail-open or fail-closed on check
+//     error per require_snapshot_check_pass.
+//  3. Read current disk size from VM config (parsed from the disk option string).
+//  4. Compute delta GiB. Shrink (delta < 0) is not supported. No-op (delta == 0) returns nil.
+//  5. Call ResizeDisk with the positive delta in GiB (PVE additive "+NG" format).
+//  6. Await the returned task UPID.
 //
 // Size conversion: BOSH provides MiB; PVE ResizeDisk accepts GiB deltas. The delta
 // is computed as ceiling(new_size_mb / 1024) - current_size_gib. If current_size_gib
@@ -87,7 +90,53 @@ func HandleResizeDisk(deps Deps) Handler {
 		}
 
 		// ----------------------------------------------------------------
-		// 4. Read current size from VM config disk option string.
+		// 4. Snapshot pre-flight guard.
+		//
+		// PVE cannot resize disks on LVM-thin or ZFS storage when snapshots
+		// exist (the API returns an error). On qcow2/raw the resize succeeds
+		// but the snapshot data becomes inconsistent. Guard before any
+		// mutating PVE call to surface the risk early with an actionable
+		// message.
+		//
+		// Policy (D2-C, D3-C):
+		//   HasSnapshots error + RequireSnapshotCheckPass=true  → fail-closed
+		//   HasSnapshots error + RequireSnapshotCheckPass=false → WARN + proceed
+		//   Snapshots present + AllowDiskOpsWithSnapshots=false → Cloud error
+		//   Snapshots present + AllowDiskOpsWithSnapshots=true  → WARN + proceed
+		//   No snapshots                                        → proceed normally
+		// ----------------------------------------------------------------
+		if snapNames, snapErr := pve.HasSnapshots(ctx, deps.PVE, node, vmid); snapErr != nil {
+			if deps.Config.RequireSnapshotCheckPass {
+				return nil, cpierrors.Wrap(snapErr,
+					"resize_disk: snapshot pre-flight check failed and require_snapshot_check_pass is set",
+				)
+			}
+			deps.Logger.Warn("resize_disk: snapshot pre-flight check failed — proceeding (fail-open)",
+				log.String("node", node),
+				log.Int("vmid", vmid),
+				log.Err(snapErr),
+			)
+		} else if len(snapNames) > 0 {
+			if deps.Config.AllowDiskOpsWithSnapshots {
+				deps.Logger.Warn("resize_disk: proceeding despite snapshots (allow_disk_ops_with_snapshots=true)",
+					log.Int("vmid", vmid),
+					log.String("node", node),
+					log.String("snapshots", strings.Join(snapNames, ", ")),
+				)
+			} else {
+				return nil, cpierrors.Cloud(
+					"resize_disk: VM %d (node %s) has %d snapshot(s) [%s]."+
+						" PVE cannot resize disks on LVM-thin or ZFS storage when snapshots exist;"+
+						" on qcow2/raw the resize succeeds but snapshot data becomes inconsistent."+
+						" Delete all snapshots before resizing, or set"+
+						" pve.allow_disk_ops_with_snapshots=true to bypass this guard.",
+					vmid, node, len(snapNames), strings.Join(snapNames, ", "),
+				)
+			}
+		}
+
+		// ----------------------------------------------------------------
+		// 6. Read current size from VM config disk option string.
 		//    PVE stores disk config as: "<volid>[,size=<N>G][,<other-opts>]"
 		//    The size field may be absent on very old disks; if absent, we
 		//    cannot determine the delta safely and return an error.
@@ -108,7 +157,7 @@ func HandleResizeDisk(deps Deps) Handler {
 		}
 
 		// ----------------------------------------------------------------
-		// 5. Compute delta in GiB (ceiling of new_size_mb / 1024).
+		// 7. Compute delta in GiB (ceiling of new_size_mb / 1024).
 		// ----------------------------------------------------------------
 		newGiB := (newSizeMB + 1023) / 1024
 		deltaGiB := newGiB - currentGiB
@@ -133,7 +182,7 @@ func HandleResizeDisk(deps Deps) Handler {
 		}
 
 		// ----------------------------------------------------------------
-		// 6-7. Submit ResizeDisk and await its task. PVE's qemu-img resize
+		// 8-9. Submit ResizeDisk and await its task. PVE's qemu-img resize
 		// runs under the per-storage lockfile, so on bursty deploys the
 		// task can fail with "can't lock file ... got timeout". Retry the
 		// submit+await pair on that signal; non-lock errors propagate.

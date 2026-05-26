@@ -248,6 +248,34 @@ func IsLVMCommandTimeout(err error) bool {
 	return strings.Contains(msg, "/sbin/lv") || strings.Contains(msg, "/sbin/vg")
 }
 
+// IsSnapshotBlocked reports whether err signals that a PVE disk operation was
+// rejected because a VM snapshot holds a reference to the affected disk. PVE
+// refuses detach and resize on LVM-thin/ZFS storage when a snapshot captures
+// the disk state; the error surfaces as a task-body failure (for resize, via
+// AwaitTask) or as a synchronous HTTP error (for detach via PUT /config).
+//
+// Two PVE message shapes are detected (case-insensitive):
+//
+//   - "is used in snapshot" — detach path:
+//     "cannot delete disk 'scsiN', disk is used in snapshot '<name>'"
+//   - "referenced in snapshot" — resize path (LVM-thin/ZFS):
+//     "can't resize volume, volume is referenced in snapshot '<name>'"
+//
+// This is a defense-in-depth classifier. The primary guard is the pre-flight
+// HasSnapshots check in each handler. IsSnapshotBlocked lets callers add
+// remediation context when a guard is bypassed (race, config override, or
+// storage backends that allow the op but later fail at the task level).
+//
+// nil → false.
+func IsSnapshotBlocked(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "is used in snapshot") ||
+		strings.Contains(msg, "referenced in snapshot")
+}
+
 // IsPmxcfsConfigMissing reports whether err is a task-level failure caused by
 // PVE failing to read a VM's config file from /etc/pve (the pmxcfs cluster
 // filesystem). Surface text:

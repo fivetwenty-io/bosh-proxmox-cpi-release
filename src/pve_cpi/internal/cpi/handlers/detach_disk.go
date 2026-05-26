@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"strings"
 
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
@@ -120,7 +121,51 @@ func HandleDetachDisk(deps Deps) Handler {
 		}
 
 		// --------------------------------------------------------------------
-		// 4. Detach disk via SDK. Synchronous config PUT; no UPID returned.
+		// 4. Snapshot pre-flight guard.
+		//
+		// PVE rejects DetachDisk while a snapshot references the disk slot.
+		// Guard before any mutating call to surface the issue with an
+		// actionable message instead of an opaque PVE API error.
+		//
+		// Policy (D2-C, D3-C):
+		//   HasSnapshots error + RequireSnapshotCheckPass=true  → fail-closed (abort)
+		//   HasSnapshots error + RequireSnapshotCheckPass=false → WARN + proceed
+		//   Snapshots present + AllowDiskOpsWithSnapshots=false → Cloud error (hard fail)
+		//   Snapshots present + AllowDiskOpsWithSnapshots=true  → WARN + proceed
+		//   No snapshots                                        → proceed normally
+		// --------------------------------------------------------------------
+		if snapNames, snapErr := pve.HasSnapshots(ctx, deps.PVE, node, vmid); snapErr != nil {
+			if deps.Config.RequireSnapshotCheckPass {
+				return nil, cpierrors.Wrap(snapErr,
+					"detach_disk: snapshot pre-flight check failed and require_snapshot_check_pass is set",
+				)
+			}
+			deps.Logger.Warn("detach_disk: snapshot pre-flight check failed — proceeding (fail-open)",
+				log.String("node", node),
+				log.Int("vmid", vmid),
+				log.Err(snapErr),
+			)
+		} else if len(snapNames) > 0 {
+			if deps.Config.AllowDiskOpsWithSnapshots {
+				deps.Logger.Warn("detach_disk: proceeding despite snapshots (allow_disk_ops_with_snapshots=true)",
+					log.String("vm_cid", vmCID),
+					log.String("node", node),
+					log.String("snapshots", strings.Join(snapNames, ", ")),
+				)
+			} else {
+				return nil, cpierrors.Cloud(
+					"detach_disk: VM %s (node %s) has %d snapshot(s) [%s] that reference disk %s."+
+						" PVE will reject detach while snapshots reference this disk."+
+						" Delete snapshot(s) [%s] first, then retry detach_disk;"+
+						" or set pve.allow_disk_ops_with_snapshots=true to bypass this guard.",
+					vmCID, node, len(snapNames), strings.Join(snapNames, ", "),
+					diskCID, strings.Join(snapNames, ", "),
+				)
+			}
+		}
+
+		// --------------------------------------------------------------------
+		// 5. Detach disk via SDK. Synchronous config PUT; no UPID returned.
 		// --------------------------------------------------------------------
 		// SDK ≥ v3.1.2 sweeps any unusedN slot PVE auto-creates on detach,
 		// so the disk is fully removed from the VM config and survives a
@@ -143,7 +188,7 @@ func HandleDetachDisk(deps Deps) Handler {
 		)
 
 		// --------------------------------------------------------------------
-		// 5. Return nil (void success).
+		// 6. Return nil (void success).
 		// --------------------------------------------------------------------
 		return nil, nil
 	})

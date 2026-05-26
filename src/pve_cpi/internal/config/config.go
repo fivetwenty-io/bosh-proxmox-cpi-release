@@ -27,8 +27,8 @@ type CPIConfig struct {
 	Node     string `json:"node,omitempty"`
 
 	// Storage
-	VMStorage       string `json:"vm_storage"`
-	DiskStorage     string `json:"disk_storage"`
+	VMStorage   string `json:"vm_storage"`
+	DiskStorage string `json:"disk_storage"`
 	// StemcellStorage receives qcow2 uploads and is referenced via
 	// "<storage>:import/<filename>" in scsi0's `import-from=`. PVE only
 	// allows uploads to file-based storages (dir/nfs/cifs/glusterfs/cephfs);
@@ -42,6 +42,31 @@ type CPIConfig struct {
 
 	// Network
 	NetworkBridge string `json:"network_bridge"`
+
+	// NetworkMode selects create_network/delete_network behavior.
+	// "sdn" — PVE SDN vnet lifecycle (requires SDN enabled on the cluster).
+	// "bridge" — Linux bridge lifecycle via nodes API.
+	// "auto" — use SDN if cloud_properties.zone or config SDNZone is set;
+	//           fall back to bridge otherwise.
+	// Defaults to "auto".
+	NetworkMode string `json:"network_mode,omitempty"`
+
+	// SDNZone is the default PVE SDN zone name for vnet creation. Operators may
+	// override per-call via cloud_properties.zone. When empty and NetworkMode
+	// requires SDN, the zone must be supplied in cloud_properties.
+	SDNZone string `json:"sdn_zone,omitempty"`
+
+	// SDNZoneType is the PVE zone type used when the CPI creates the zone itself
+	// (auto-manage enabled and zone absent). Valid values: simple, vlan, qinq,
+	// vxlan, evpn. Defaults to "simple".
+	SDNZoneType string `json:"sdn_zone_type,omitempty"`
+
+	// SDNAutoManageZone controls whether the CPI may create and delete the zone.
+	// When true, create_network creates the zone (type SDNZoneType) if absent,
+	// and delete_network deletes the zone if: it is not pinned by SDNZone, and
+	// it has no remaining vnets. Default false (operator manages zones; CPI
+	// manages only vnets).
+	SDNAutoManageZone bool `json:"sdn_auto_manage_zone,omitempty"`
 
 	// TLS — pointer so JSON omission (nil) is distinguishable from explicit false.
 	// Use VerifySSLValue() to obtain the effective bool.
@@ -70,11 +95,28 @@ type CPIConfig struct {
 
 	// VMID allocation
 	VMIDRangeStart int `json:"vmid_range_start,omitempty"`
+	// VMIDRangeEnd is the inclusive upper bound of the VMID range for VM
+	// allocation. VMs are allocated in [VMIDRangeStart, VMIDRangeEnd].
+	// Defaults to 5999. Must be > VMIDRangeStart and <= 9999.
+	// Persistent disks use synthetic VMIDs 9000-9999 (unaffected by this field).
+	VMIDRangeEnd int `json:"vmid_range_end,omitempty"`
 	// VMIDAllocAttempts is the maximum number of retries for VMID-conflict
 	// recovery in create_vm / create_disk. ≤0 → use the handler default (5).
 	// Cross-process VMID collisions surface as PVE 500 "already exists"
 	// errors; the retry loop allocates a fresh VMID and re-attempts.
 	VMIDAllocAttempts int `json:"vmid_alloc_attempts,omitempty"`
+
+	// AllowDiskOpsWithSnapshots bypasses the snapshot pre-flight guard in
+	// attach_disk, detach_disk, and resize_disk when true. Use only for
+	// emergency disk recovery; snapshot state will be inconsistent after
+	// the operation. Default false (guard active).
+	AllowDiskOpsWithSnapshots bool `json:"allow_disk_ops_with_snapshots,omitempty"`
+
+	// RequireSnapshotCheckPass controls behavior when the snapshot pre-flight
+	// check itself fails (cannot reach PVE to list snapshots). When true, the
+	// disk operation aborts. Default false: on check failure the CPI logs a
+	// warning and proceeds (fail-open).
+	RequireSnapshotCheckPass bool `json:"require_snapshot_check_pass,omitempty"`
 
 	// Registry (required only when agent_mode == "registry")
 	RegistryEndpoint string `json:"registry_endpoint,omitempty"`
@@ -184,6 +226,9 @@ func (c *CPIConfig) ApplyDefaults() {
 	if c.VMIDRangeStart == 0 {
 		c.VMIDRangeStart = 100
 	}
+	if c.VMIDRangeEnd == 0 {
+		c.VMIDRangeEnd = 5999
+	}
 	// StemcellStorage defaults to VMStorage when not specified.
 	if c.StemcellStorage == "" {
 		c.StemcellStorage = c.VMStorage
@@ -207,6 +252,12 @@ func (c *CPIConfig) ApplyDefaults() {
 	}
 	if c.RebootTimeout <= 0 {
 		c.RebootTimeout = 60
+	}
+	if c.NetworkMode == "" {
+		c.NetworkMode = "auto"
+	}
+	if c.SDNZoneType == "" {
+		c.SDNZoneType = "simple"
 	}
 }
 
@@ -325,6 +376,18 @@ func (c *CPIConfig) Validate() error {
 		))
 	}
 
+	// VMIDRangeEnd: must be strictly greater than VMIDRangeStart and within PVE
+	// VM VMID space (max 9999; disk range 9000-9999 is separate).
+	if c.VMIDRangeEnd <= c.VMIDRangeStart {
+		errs = append(errs, fmt.Sprintf(
+			"vmid_range_end must be > vmid_range_start (%d), got %d", c.VMIDRangeStart, c.VMIDRangeEnd,
+		))
+	} else if c.VMIDRangeEnd > 9999 {
+		errs = append(errs, fmt.Sprintf(
+			"vmid_range_end must be ≤9999, got %d", c.VMIDRangeEnd,
+		))
+	}
+
 	// RebootMode enum.
 	switch c.RebootMode {
 	case "soft", "hard":
@@ -340,6 +403,28 @@ func (c *CPIConfig) Validate() error {
 		errs = append(errs, fmt.Sprintf(
 			"reboot_timeout must be 1-3600 seconds, got %d", c.RebootTimeout,
 		))
+	}
+
+	// NetworkMode enum.
+	switch c.NetworkMode {
+	case "sdn", "bridge", "auto":
+		// valid
+	default:
+		errs = append(errs, fmt.Sprintf(
+			"network_mode must be one of sdn|bridge|auto, got %q", c.NetworkMode,
+		))
+	}
+
+	// SDNZoneType enum — only validated when the SDN path is reachable.
+	if c.NetworkMode == "sdn" || c.NetworkMode == "auto" {
+		switch c.SDNZoneType {
+		case "simple", "vlan", "qinq", "vxlan", "evpn":
+			// valid
+		default:
+			errs = append(errs, fmt.Sprintf(
+				"sdn_zone_type must be one of simple|vlan|qinq|vxlan|evpn, got %q", c.SDNZoneType,
+			))
+		}
 	}
 
 	// Registry mode requires endpoint + credentials.

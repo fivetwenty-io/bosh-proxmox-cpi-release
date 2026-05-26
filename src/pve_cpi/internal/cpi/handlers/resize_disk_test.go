@@ -23,6 +23,10 @@ import (
 type resizeQEMUService struct {
 	configFn     func(ctx context.Context, node string, vmid int) (map[string]interface{}, error)
 	resizeDiskFn func(ctx context.Context, node string, vmid int, diskID string, sizeGiB int) (string, error)
+	// listSnapshotsFn controls ListSnapshots for snapshot guard tests.
+	// nil → return only the synthetic "current" entry (no real snapshots),
+	// so existing tests are unaffected by the guard.
+	listSnapshotsFn func(ctx context.Context, node string, vmid int) ([]map[string]interface{}, error)
 }
 
 func (m *resizeQEMUService) Config(ctx context.Context, node string, vmid int) (map[string]interface{}, error) {
@@ -73,8 +77,15 @@ func (m *resizeQEMUService) Snapshot(_ context.Context, _ string, _ int, _ strin
 func (m *resizeQEMUService) DeleteSnapshot(_ context.Context, _ string, _ int, _ string) error {
 	panic("resizeQEMUService.DeleteSnapshot: not expected")
 }
-func (m *resizeQEMUService) ListSnapshots(_ context.Context, _ string, _ int) ([]map[string]interface{}, error) {
-	panic("resizeQEMUService.ListSnapshots: not expected")
+func (m *resizeQEMUService) ListSnapshots(
+	ctx context.Context, node string, vmid int,
+) ([]map[string]interface{}, error) {
+	if m.listSnapshotsFn != nil {
+		return m.listSnapshotsFn(ctx, node, vmid)
+	}
+	// Safe default: return only the synthetic "current" entry so the guard
+	// proceeds normally in tests that do not exercise snapshot behaviour.
+	return []map[string]interface{}{{"name": "current"}}, nil
 }
 func (m *resizeQEMUService) RollbackSnapshot(_ context.Context, _ string, _ int, _ string) (string, error) {
 	panic("resizeQEMUService.RollbackSnapshot: not expected")
@@ -336,5 +347,198 @@ func TestHandleResizeDisk_CeilingMath(t *testing.T) {
 	}
 	if capturedDelta != 1 {
 		t.Errorf("delta: want 1 GiB for 10241 MiB -> 11 GiB - 10 GiB, got %d GiB", capturedDelta)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot guard tests (IMP-08).
+// ---------------------------------------------------------------------------
+
+// resizeDepsWithConfig builds Deps using a caller-supplied *config.CPIConfig.
+func resizeDepsWithConfig(
+	cfg *config.CPIConfig, qemuSvc qemu.Service, clusterSvc sdkclusterapi.Service, tasksSvc tasks.Service,
+) handlers.Deps {
+	return handlers.Deps{
+		Config: cfg,
+		PVE: &mockPVEClient{
+			qemuSvc:    qemuSvc,
+			clusterSvc: clusterSvc,
+			tasksSvc:   tasksSvc,
+		},
+		Logger: log.NewNopLogger(),
+	}
+}
+
+// resizeQEMUWithDiskAndSnapshots returns a mock with snapshot control.
+func resizeQEMUWithDiskAndSnapshots(
+	diskSlot, diskOptStr string,
+	resizeFn func(ctx context.Context, node string, vmid int, diskID string, sizeGiB int) (string, error),
+	snapshotFn func(ctx context.Context, node string, vmid int) ([]map[string]interface{}, error),
+) *resizeQEMUService {
+	svc := resizeQEMUWithDisk(diskSlot, diskOptStr, resizeFn)
+	svc.listSnapshotsFn = snapshotFn
+	return svc
+}
+
+func TestHandleResizeDisk_SnapshotsPresent_HardFail(t *testing.T) {
+	// Snapshots exist, AllowDiskOpsWithSnapshots=false → Cloud error; ResizeDisk NOT called.
+	const diskCID = "local-lvm:vm-9001-disk-0"
+
+	var resizeCalled bool
+	qemuSvc := resizeQEMUWithDiskAndSnapshots(
+		"scsi2", "local-lvm:vm-9001-disk-0,size=10G",
+		func(_ context.Context, _ string, _ int, _ string, _ int) (string, error) {
+			resizeCalled = true
+			return "", nil
+		},
+		func(_ context.Context, _ string, _ int) ([]map[string]interface{}, error) {
+			return []map[string]interface{}{
+				{"name": "snap1"},
+				{"name": "snap2"},
+			}, nil
+		},
+	)
+
+	cfg := &config.CPIConfig{
+		Node:                      "pve1",
+		AllowDiskOpsWithSnapshots: false,
+	}
+	h := handlers.HandleResizeDisk(resizeDepsWithConfig(cfg, qemuSvc, resizeClusterWith(100), nil))
+	_, err := h.Handle(context.Background(), marshalArgs(diskCID, 20480), jsonrpc.Context{})
+	if err == nil {
+		t.Fatal("expected error when snapshots exist and allow_disk_ops_with_snapshots=false")
+	}
+	if !cpierrors.IsType(err, cpierrors.TypeCloud) {
+		t.Errorf("error type: want Cloud, got %T: %v", err, err)
+	}
+	if !strings.Contains(err.Error(), "snap1") || !strings.Contains(err.Error(), "snap2") {
+		t.Errorf("error message should contain snapshot names; got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "allow_disk_ops_with_snapshots") {
+		t.Errorf("error message should contain remediation hint; got: %v", err)
+	}
+	if resizeCalled {
+		t.Error("ResizeDisk must not be called when guard blocks")
+	}
+}
+
+func TestHandleResizeDisk_NoSnapshots_Proceeds(t *testing.T) {
+	// No real snapshots → guard passes → ResizeDisk called.
+	const diskCID = "local-lvm:vm-9001-disk-0"
+
+	var resizeCalled bool
+	qemuSvc := resizeQEMUWithDiskAndSnapshots(
+		"scsi2", "local-lvm:vm-9001-disk-0,size=10G",
+		func(_ context.Context, _ string, _ int, _ string, _ int) (string, error) {
+			resizeCalled = true
+			return "", nil
+		},
+		func(_ context.Context, _ string, _ int) ([]map[string]interface{}, error) {
+			// Only the synthetic "current" entry — no real snapshots.
+			return []map[string]interface{}{{"name": "current"}}, nil
+		},
+	)
+
+	cfg := &config.CPIConfig{Node: "pve1"}
+	h := handlers.HandleResizeDisk(resizeDepsWithConfig(cfg, qemuSvc, resizeClusterWith(100), nil))
+	_, err := h.Handle(context.Background(), marshalArgs(diskCID, 20480), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error when no snapshots: %v", err)
+	}
+	if !resizeCalled {
+		t.Error("ResizeDisk should be called when no real snapshots exist")
+	}
+}
+
+func TestHandleResizeDisk_SnapshotCheckError_FailOpen(t *testing.T) {
+	// ListSnapshots returns error, RequireSnapshotCheckPass=false → WARN + proceed (ResizeDisk called).
+	const diskCID = "local-lvm:vm-9001-disk-0"
+
+	var resizeCalled bool
+	qemuSvc := resizeQEMUWithDiskAndSnapshots(
+		"scsi2", "local-lvm:vm-9001-disk-0,size=10G",
+		func(_ context.Context, _ string, _ int, _ string, _ int) (string, error) {
+			resizeCalled = true
+			return "", nil
+		},
+		func(_ context.Context, _ string, _ int) ([]map[string]interface{}, error) {
+			return nil, errors.New("PVE API timeout")
+		},
+	)
+
+	cfg := &config.CPIConfig{
+		Node:                     "pve1",
+		RequireSnapshotCheckPass: false,
+	}
+	h := handlers.HandleResizeDisk(resizeDepsWithConfig(cfg, qemuSvc, resizeClusterWith(100), nil))
+	_, err := h.Handle(context.Background(), marshalArgs(diskCID, 20480), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("expected fail-open: no error when RequireSnapshotCheckPass=false; got: %v", err)
+	}
+	if !resizeCalled {
+		t.Error("ResizeDisk should be called in fail-open mode")
+	}
+}
+
+func TestHandleResizeDisk_SnapshotCheckError_FailClosed(t *testing.T) {
+	// ListSnapshots returns error, RequireSnapshotCheckPass=true → error returned; ResizeDisk NOT called.
+	const diskCID = "local-lvm:vm-9001-disk-0"
+
+	var resizeCalled bool
+	qemuSvc := resizeQEMUWithDiskAndSnapshots(
+		"scsi2", "local-lvm:vm-9001-disk-0,size=10G",
+		func(_ context.Context, _ string, _ int, _ string, _ int) (string, error) {
+			resizeCalled = true
+			return "", nil
+		},
+		func(_ context.Context, _ string, _ int) ([]map[string]interface{}, error) {
+			return nil, errors.New("PVE API timeout")
+		},
+	)
+
+	cfg := &config.CPIConfig{
+		Node:                     "pve1",
+		RequireSnapshotCheckPass: true,
+	}
+	h := handlers.HandleResizeDisk(resizeDepsWithConfig(cfg, qemuSvc, resizeClusterWith(100), nil))
+	_, err := h.Handle(context.Background(), marshalArgs(diskCID, 20480), jsonrpc.Context{})
+	if err == nil {
+		t.Fatal("expected error when RequireSnapshotCheckPass=true and ListSnapshots fails")
+	}
+	if !strings.Contains(err.Error(), "require_snapshot_check_pass") {
+		t.Errorf("error message should mention require_snapshot_check_pass; got: %v", err)
+	}
+	if resizeCalled {
+		t.Error("ResizeDisk must not be called when fail-closed guard blocks")
+	}
+}
+
+func TestHandleResizeDisk_SnapshotsPresent_AllowOverride(t *testing.T) {
+	// Snapshots exist, AllowDiskOpsWithSnapshots=true → WARN + ResizeDisk called.
+	const diskCID = "local-lvm:vm-9001-disk-0"
+
+	var resizeCalled bool
+	qemuSvc := resizeQEMUWithDiskAndSnapshots(
+		"scsi2", "local-lvm:vm-9001-disk-0,size=10G",
+		func(_ context.Context, _ string, _ int, _ string, _ int) (string, error) {
+			resizeCalled = true
+			return "", nil
+		},
+		func(_ context.Context, _ string, _ int) ([]map[string]interface{}, error) {
+			return []map[string]interface{}{{"name": "snap1"}}, nil
+		},
+	)
+
+	cfg := &config.CPIConfig{
+		Node:                      "pve1",
+		AllowDiskOpsWithSnapshots: true,
+	}
+	h := handlers.HandleResizeDisk(resizeDepsWithConfig(cfg, qemuSvc, resizeClusterWith(100), nil))
+	_, err := h.Handle(context.Background(), marshalArgs(diskCID, 20480), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("expected no error with allow_disk_ops_with_snapshots=true; got: %v", err)
+	}
+	if !resizeCalled {
+		t.Error("ResizeDisk should be called when allow override is set")
 	}
 }

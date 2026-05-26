@@ -84,8 +84,9 @@ func buildResources(vmids ...int) *sdkcluster.ListResourcesResponse {
 
 // ---- tests ----
 
-func TestNextVMID_LowestAvailable(t *testing.T) {
-	// used: 100, 101, 103 → first free is 102
+func TestNextVMID_FreeInRange(t *testing.T) {
+	// used: 100, 101, 103; free slots include 102, 104..5999.
+	// With randomised start the returned ID is any free slot in [100,5999].
 	c := newVMIDClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
 		return buildResources(100, 101, 103), nil
 	})
@@ -94,13 +95,17 @@ func TestNextVMID_LowestAvailable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if id != 102 {
-		t.Errorf("expected VMID 102, got %d", id)
+	if id < pve.VMIDRangeVMStart || id > pve.VMIDRangeVMEnd {
+		t.Errorf("VMID %d outside VM range [%d,%d]", id, pve.VMIDRangeVMStart, pve.VMIDRangeVMEnd)
+	}
+	if id == 100 || id == 101 || id == 103 {
+		t.Errorf("returned a used VMID: %d", id)
 	}
 }
 
 func TestNextVMID_EmptyCluster(t *testing.T) {
-	// No VMs → lowest is rangeStart (100).
+	// No VMs → returned VMID is somewhere in the VM range.
+	// Randomised start means it is not necessarily VMIDRangeVMStart.
 	c := newVMIDClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
 		return buildResources(), nil
 	})
@@ -109,8 +114,8 @@ func TestNextVMID_EmptyCluster(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if id != pve.VMIDRangeVMStart {
-		t.Errorf("expected %d, got %d", pve.VMIDRangeVMStart, id)
+	if id < pve.VMIDRangeVMStart || id > pve.VMIDRangeVMEnd {
+		t.Errorf("VMID %d outside VM range [%d,%d]", id, pve.VMIDRangeVMStart, pve.VMIDRangeVMEnd)
 	}
 }
 
@@ -131,7 +136,8 @@ func TestNextVMID_AllUsed(t *testing.T) {
 }
 
 func TestNextVMID_CustomRange(t *testing.T) {
-	// Range [200,250], used [200,201,202] → expect 203.
+	// Range [200,250], used [200,201,202]. Free slots: 203..250.
+	// Randomised start means any free slot may be returned; verify in-range and not used.
 	c := newVMIDClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
 		return buildResources(200, 201, 202), nil
 	})
@@ -140,8 +146,11 @@ func TestNextVMID_CustomRange(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if id != 203 {
-		t.Errorf("expected 203, got %d", id)
+	if id < 200 || id > 250 {
+		t.Errorf("VMID %d outside custom range [200,250]", id)
+	}
+	if id == 200 || id == 201 || id == 202 {
+		t.Errorf("returned a used VMID: %d", id)
 	}
 }
 
@@ -158,6 +167,7 @@ func TestNextVMID_CustomRange_AllUsed(t *testing.T) {
 }
 
 func TestNextDiskVMID_InRange(t *testing.T) {
+	// 9000 used; any ID in [9001,9999] is valid with randomised start.
 	c := newVMIDClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
 		return buildResources(9000), nil
 	})
@@ -169,21 +179,21 @@ func TestNextDiskVMID_InRange(t *testing.T) {
 	if id < pve.VMIDRangeDiskStart || id > pve.VMIDRangeDiskEnd {
 		t.Errorf("disk VMID %d out of range [%d,%d]", id, pve.VMIDRangeDiskStart, pve.VMIDRangeDiskEnd)
 	}
-	if id != 9001 {
-		t.Errorf("expected 9001, got %d", id)
+	if id == 9000 {
+		t.Errorf("returned used disk VMID 9000")
 	}
 }
 
 func TestNextVMID_Concurrency(t *testing.T) {
-	// 100 goroutines call NextVMID with a shared cluster list that starts empty.
-	// The globalVMIDMu means each goroutine serialises; with an empty list and range
-	// [100,4999] all 100 goroutines will return 100 unless the list changes between calls.
-	// We track call count and verify no data race (run with -race).
-	//
-	// Because we use a process-global mutex, all goroutines will call ListResources
-	// serially. The mock always returns an empty set; every goroutine gets 100.
-	// That is correct per the documented contract: cross-process races are handled by
-	// PVE conflict → caller retry; within-process the mutex prevents data races.
+	// 100 goroutines call NextVMID against an empty cluster. The process-level
+	// globalVMIDMu serialises them, so there is no data race (verified by -race).
+	// With randomised start each goroutine picks a different offset, so results
+	// are scattered across [VMIDRangeVMStart, VMIDRangeVMEnd]. We verify:
+	//   1. No errors.
+	//   2. Every returned VMID is within the valid range.
+	//   3. ListResources is called exactly once per goroutine.
+	//   4. At least two distinct VMIDs are returned (scatter check; astronomically
+	//      unlikely to fail on a 5900-wide range with 100 goroutines).
 
 	var callCount int64
 	c := newVMIDClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
@@ -215,15 +225,20 @@ func TestNextVMID_Concurrency(t *testing.T) {
 	for err := range errs {
 		t.Errorf("unexpected error: %v", err)
 	}
+
+	seen := make(map[int]struct{})
 	for id := range results {
-		// All should be 100 (empty cluster, lowest start).
-		if id != pve.VMIDRangeVMStart {
-			t.Errorf("expected %d, got %d", pve.VMIDRangeVMStart, id)
+		if id < pve.VMIDRangeVMStart || id > pve.VMIDRangeVMEnd {
+			t.Errorf("VMID %d outside range [%d,%d]", id, pve.VMIDRangeVMStart, pve.VMIDRangeVMEnd)
 		}
+		seen[id] = struct{}{}
+	}
+	if len(seen) < 2 {
+		t.Errorf("expected scattered VMIDs (>1 distinct value), got %d distinct: %v", len(seen), seen)
 	}
 
 	if atomic.LoadInt64(&callCount) != goroutines {
-		t.Errorf("expected %d ListResources calls (one per goroutine), got %d", goroutines, callCount)
+		t.Errorf("expected %d ListResources calls, got %d", goroutines, callCount)
 	}
 }
 
@@ -310,8 +325,8 @@ func TestNextDiskVMID_UnionsStorageVolumes(t *testing.T) {
 	if id == 9000 {
 		t.Fatal("returned 9000 despite orphan vm-9000-disk-0 on storage; orphan was not counted as used")
 	}
-	if id != 9001 {
-		t.Errorf("expected 9001, got %d", id)
+	if id < pve.VMIDRangeDiskStart || id > pve.VMIDRangeDiskEnd {
+		t.Errorf("disk VMID %d outside [%d,%d]", id, pve.VMIDRangeDiskStart, pve.VMIDRangeDiskEnd)
 	}
 }
 
@@ -358,8 +373,12 @@ func TestNextDiskVMID_IgnoresNonDiskVolumes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if id != 9001 {
-		t.Errorf("expected 9001 (9000 used by disk volume), got %d", id)
+	// 9000 is used (vm-9000-disk-0 matched); any other disk-range ID is valid.
+	if id == 9000 {
+		t.Error("returned 9000 but vm-9000-disk-0 volume marks it as used")
+	}
+	if id < pve.VMIDRangeDiskStart || id > pve.VMIDRangeDiskEnd {
+		t.Errorf("disk VMID %d outside [%d,%d]", id, pve.VMIDRangeDiskStart, pve.VMIDRangeDiskEnd)
 	}
 }
 
@@ -404,8 +423,8 @@ func TestAllocateWithRetry_ConflictRetry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if id != pve.VMIDRangeVMStart {
-		t.Errorf("expected %d, got %d", pve.VMIDRangeVMStart, id)
+	if id < pve.VMIDRangeVMStart || id > pve.VMIDRangeVMEnd {
+		t.Errorf("VMID %d outside VM range [%d,%d]", id, pve.VMIDRangeVMStart, pve.VMIDRangeVMEnd)
 	}
 	if attempt != 3 {
 		t.Errorf("expected 3 create attempts, got %d", attempt)
@@ -454,6 +473,7 @@ func TestAllocateWithRetry_NilCreateFunc(t *testing.T) {
 
 func TestNextVMID_WithRange_InvalidIgnored(t *testing.T) {
 	// Invalid range (start > end) is ignored; default VM range applies.
+	// With randomised start and empty cluster, result is anywhere in default VM range.
 	c := newVMIDClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
 		return buildResources(), nil
 	})
@@ -462,14 +482,14 @@ func TestNextVMID_WithRange_InvalidIgnored(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	// With invalid range ignored, default VMIDRangeVMStart applies.
-	if id != pve.VMIDRangeVMStart {
-		t.Errorf("expected default %d, got %d", pve.VMIDRangeVMStart, id)
+	if id < pve.VMIDRangeVMStart || id > pve.VMIDRangeVMEnd {
+		t.Errorf("VMID %d outside default VM range [%d,%d]", id, pve.VMIDRangeVMStart, pve.VMIDRangeVMEnd)
 	}
 }
 
 func TestNextVMID_MalformedJSONSkipped(t *testing.T) {
-	// One malformed JSON entry in ListResources; should be skipped, not error.
+	// One malformed JSON entry must be skipped; allocation proceeds over remaining.
+	// used: {101}; free: all of [100,5999] except 101.
 	malformed := sdkcluster.ListResourcesResponse{
 		json.RawMessage(`{bad json`),
 		json.RawMessage(`{"vmid":101}`),
@@ -482,14 +502,17 @@ func TestNextVMID_MalformedJSONSkipped(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	// 101 used, 100 is free.
-	if id != 100 {
-		t.Errorf("expected 100, got %d", id)
+	if id < pve.VMIDRangeVMStart || id > pve.VMIDRangeVMEnd {
+		t.Errorf("VMID %d outside VM range", id)
+	}
+	if id == 101 {
+		t.Errorf("returned used VMID 101")
 	}
 }
 
 func TestNextVMID_GapAtStart(t *testing.T) {
-	// used: 101 only; first free is 100 (rangeStart).
+	// used: 101 only; free: 100, 102..5999.
+	// Randomised start; any free slot in the VM range is valid.
 	c := newVMIDClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
 		return buildResources(101), nil
 	})
@@ -498,13 +521,17 @@ func TestNextVMID_GapAtStart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if id != 100 {
-		t.Errorf("expected 100, got %d", id)
+	if id < pve.VMIDRangeVMStart || id > pve.VMIDRangeVMEnd {
+		t.Errorf("VMID %d outside VM range", id)
+	}
+	if id == 101 {
+		t.Errorf("returned used VMID 101")
 	}
 }
 
 func TestNextVMID_VmidsOutsideRangeIgnored(t *testing.T) {
 	// VMIDs in the disk range (9000+) must not block the VM range.
+	// All of [VMIDRangeVMStart,VMIDRangeVMEnd] is free; returned ID is anywhere in that range.
 	c := newVMIDClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
 		return buildResources(9000, 9001), nil
 	})
@@ -513,8 +540,8 @@ func TestNextVMID_VmidsOutsideRangeIgnored(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if id != pve.VMIDRangeVMStart {
-		t.Errorf("expected %d, got %d", pve.VMIDRangeVMStart, id)
+	if id < pve.VMIDRangeVMStart || id > pve.VMIDRangeVMEnd {
+		t.Errorf("VMID %d outside VM range [%d,%d]", id, pve.VMIDRangeVMStart, pve.VMIDRangeVMEnd)
 	}
 }
 
@@ -524,10 +551,10 @@ func TestVMIDRange_VMEndIs5999(t *testing.T) {
 	}
 }
 
-// TestNextVMID_5500Allocatable verifies that VMID 5500, which was formerly in the
-// stemcell sub-range [5000,5999], is now allocatable as a regular VM VMID.
+// TestNextVMID_5500Allocatable verifies that VMIDs in [5500,5999], formerly in the
+// stemcell sub-range, are now allocatable as regular VM VMIDs.
 func TestNextVMID_5500Allocatable(t *testing.T) {
-	// Fill 100..5499; 5500 must be the first free VMID.
+	// Fill 100..5499; only 5500..5999 remain free.
 	all := make([]int, 0, 5500-100)
 	for i := 100; i < 5500; i++ {
 		all = append(all, i)
@@ -540,11 +567,9 @@ func TestNextVMID_5500Allocatable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if id != 5500 {
-		t.Errorf("expected 5500 (first free after filling 100-5499), got %d", id)
-	}
-	if id < pve.VMIDRangeVMStart || id > pve.VMIDRangeVMEnd {
-		t.Errorf("VMID %d outside VM range [%d,%d]", id, pve.VMIDRangeVMStart, pve.VMIDRangeVMEnd)
+	// Randomised start: result is somewhere in [5500,5999].
+	if id < 5500 || id > pve.VMIDRangeVMEnd {
+		t.Errorf("expected free VMID in [5500,%d], got %d", pve.VMIDRangeVMEnd, id)
 	}
 }
 
@@ -609,8 +634,8 @@ func TestAllocateWithRetry_NoBackoff(t *testing.T) {
 	if attempts != 2 {
 		t.Errorf("expected 2 attempts, got %d", attempts)
 	}
-	if id != pve.VMIDRangeVMStart {
-		t.Errorf("expected %d, got %d", pve.VMIDRangeVMStart, id)
+	if id < pve.VMIDRangeVMStart || id > pve.VMIDRangeVMEnd {
+		t.Errorf("VMID %d outside VM range [%d,%d]", id, pve.VMIDRangeVMStart, pve.VMIDRangeVMEnd)
 	}
 }
 
@@ -693,7 +718,8 @@ func TestAllocateDiskWithRetry_NilCreateFunc(t *testing.T) {
 }
 
 func TestNextVMID_VmidNullField(t *testing.T) {
-	// JSON entry where vmid is null — should be skipped (pointer nil).
+	// JSON entry where vmid is null must be skipped (pointer nil).
+	// used: {100}; free: 101..5999 plus any others in the VM range.
 	entry := sdkcluster.ListResourcesResponse{
 		json.RawMessage(`{"vmid":null,"type":"node"}`),
 		json.RawMessage(fmt.Sprintf(`{"vmid":%d}`, 100)),
@@ -706,8 +732,119 @@ func TestNextVMID_VmidNullField(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	// 100 is used; next is 101.
-	if id != 101 {
-		t.Errorf("expected 101, got %d", id)
+	if id < pve.VMIDRangeVMStart || id > pve.VMIDRangeVMEnd {
+		t.Errorf("VMID %d outside VM range", id)
+	}
+	if id == 100 {
+		t.Errorf("returned used VMID 100")
+	}
+}
+
+// ---- IMP-01: randomised-start scatter tests ----
+
+// TestNextVMIDInRange_AllFreeInRange verifies that with all slots free in a
+// small range the returned VMID lands within that range.
+func TestNextVMIDInRange_AllFreeInRange(t *testing.T) {
+	const rangeStart, rangeEnd = 100, 199
+	c := newVMIDClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+		return buildResources(), nil
+	})
+
+	id, err := pve.NextVMID(context.Background(), c, pve.WithRange(rangeStart, rangeEnd))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if id < rangeStart || id > rangeEnd {
+		t.Errorf("VMID %d outside [%d,%d]", id, rangeStart, rangeEnd)
+	}
+}
+
+// TestNextVMIDInRange_OnlyOneSlotFree verifies that when all IDs in a range
+// are used except one, that one ID is always returned regardless of where
+// the random scan starts. Runs multiple iterations to defeat luck.
+func TestNextVMIDInRange_OnlyOneSlotFree(t *testing.T) {
+	const rangeStart, rangeEnd, freeID = 100, 199, 150
+	all := make([]int, 0, rangeEnd-rangeStart)
+	for i := rangeStart; i <= rangeEnd; i++ {
+		if i != freeID {
+			all = append(all, i)
+		}
+	}
+
+	c := newVMIDClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+		return buildResources(all...), nil
+	})
+
+	const iterations = 50
+	for iter := 0; iter < iterations; iter++ {
+		id, err := pve.NextVMID(context.Background(), c, pve.WithRange(rangeStart, rangeEnd))
+		if err != nil {
+			t.Fatalf("iter %d: unexpected error: %v", iter, err)
+		}
+		if id != freeID {
+			t.Fatalf("iter %d: expected %d (only free slot), got %d", iter, freeID, id)
+		}
+	}
+}
+
+// TestNextVMIDInRange_ExhaustedRange verifies that a fully-used range returns
+// an error. Uses multi-element ranges so WithRange accepts them (requires end > start).
+func TestNextVMIDInRange_ExhaustedRange(t *testing.T) {
+	tests := []struct {
+		name  string
+		used  []int
+		start int
+		end   int
+	}{
+		{
+			name:  "two-element range all used",
+			used:  []int{300, 301},
+			start: 300,
+			end:   301,
+		},
+		{
+			name:  "three-element range all used",
+			used:  []int{400, 401, 402},
+			start: 400,
+			end:   402,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newVMIDClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+				return buildResources(tc.used...), nil
+			})
+			_, err := pve.NextVMID(context.Background(), c, pve.WithRange(tc.start, tc.end))
+			if err == nil {
+				t.Fatal("expected error for exhausted range, got nil")
+			}
+		})
+	}
+}
+
+// TestNextVMIDInRange_SpreadCheck runs NextVMID 200 times on a fully-free
+// [100,1099] range and asserts that more than one distinct VMID is returned,
+// confirming the randomised start scatters allocations rather than always
+// returning the same ID.
+func TestNextVMIDInRange_SpreadCheck(t *testing.T) {
+	const rangeStart, rangeEnd = 100, 1099
+	c := newVMIDClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+		return buildResources(), nil
+	})
+
+	seen := make(map[int]struct{})
+	const iterations = 200
+	for i := 0; i < iterations; i++ {
+		id, err := pve.NextVMID(context.Background(), c, pve.WithRange(rangeStart, rangeEnd))
+		if err != nil {
+			t.Fatalf("iter %d: unexpected error: %v", i, err)
+		}
+		if id < rangeStart || id > rangeEnd {
+			t.Errorf("iter %d: VMID %d outside [%d,%d]", i, id, rangeStart, rangeEnd)
+		}
+		seen[id] = struct{}{}
+	}
+	if len(seen) <= 1 {
+		t.Errorf("spread check failed: all %d iterations returned the same VMID (scatter not working)", iterations)
 	}
 }

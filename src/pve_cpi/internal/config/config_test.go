@@ -542,3 +542,374 @@ func TestLoad_RegistryMode_Valid(t *testing.T) {
 		t.Errorf("RegistryEndpoint = %q", cfg.RegistryEndpoint)
 	}
 }
+
+// --------------------------------------------------------------------------
+// TestApplyDefaults_VMIDRangeEnd
+// --------------------------------------------------------------------------
+
+// TestApplyDefaults_VMIDRangeEnd verifies VMIDRangeEnd defaults to 5999 when absent.
+func TestApplyDefaults_VMIDRangeEnd(t *testing.T) {
+	var cfg config.CPIConfig
+	cfg.VMStorage = "vm-store"
+	cfg.ApplyDefaults()
+
+	if cfg.VMIDRangeEnd != 5999 {
+		t.Errorf("VMIDRangeEnd = %d, want 5999 (default)", cfg.VMIDRangeEnd)
+	}
+}
+
+// TestApplyDefaults_VMIDRangeEndNotOverwritten ensures an explicit VMIDRangeEnd
+// is preserved by ApplyDefaults.
+func TestApplyDefaults_VMIDRangeEndNotOverwritten(t *testing.T) {
+	var cfg config.CPIConfig
+	cfg.VMStorage = "vm-store"
+	cfg.VMIDRangeEnd = 3000
+	cfg.ApplyDefaults()
+
+	if cfg.VMIDRangeEnd != 3000 {
+		t.Errorf("VMIDRangeEnd = %d, want 3000 (must not overwrite explicit value)", cfg.VMIDRangeEnd)
+	}
+}
+
+// --------------------------------------------------------------------------
+// TestLoad_VMIDRangeEndOverride
+// --------------------------------------------------------------------------
+
+// TestLoad_VMIDRangeEndOverride confirms that vmid_range_end from JSON is honored.
+func TestLoad_VMIDRangeEndOverride(t *testing.T) {
+	cfg, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+		"vmid_range_end":2500
+	}`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.VMIDRangeEnd != 2500 {
+		t.Errorf("VMIDRangeEnd = %d, want 2500", cfg.VMIDRangeEnd)
+	}
+}
+
+// --------------------------------------------------------------------------
+// TestValidate_VMIDRangeEnd
+// --------------------------------------------------------------------------
+
+// TestValidate_VMIDRangeEndEqualToStart confirms end == start is rejected.
+func TestValidate_VMIDRangeEndEqualToStart(t *testing.T) {
+	cfg := &config.CPIConfig{
+		Host:           "h",
+		User:           "u",
+		Password:       "p",
+		VMStorage:      "s",
+		DiskStorage:    "s",
+		NetworkBridge:  "br",
+		AgentMode:      "cloudinit",
+		VMDiskFormat:   "qcow2",
+		LogLevel:       "info",
+		Port:           8006,
+		VerifySSL:      boolPtr(true),
+		VMIDRangeStart: 100,
+		VMIDRangeEnd:   100, // equal to start — invalid
+		RebootMode:     "soft",
+		RebootTimeout:  60,
+	}
+	assertCloudError(t, cfg.Validate(), "vmid_range_end must be > vmid_range_start")
+}
+
+// TestValidate_VMIDRangeEndBelowStart confirms end < start is rejected.
+func TestValidate_VMIDRangeEndBelowStart(t *testing.T) {
+	cfg := &config.CPIConfig{
+		Host:           "h",
+		User:           "u",
+		Password:       "p",
+		VMStorage:      "s",
+		DiskStorage:    "s",
+		NetworkBridge:  "br",
+		AgentMode:      "cloudinit",
+		VMDiskFormat:   "qcow2",
+		LogLevel:       "info",
+		Port:           8006,
+		VerifySSL:      boolPtr(true),
+		VMIDRangeStart: 500,
+		VMIDRangeEnd:   200, // below start — invalid
+		RebootMode:     "soft",
+		RebootTimeout:  60,
+	}
+	assertCloudError(t, cfg.Validate(), "vmid_range_end must be > vmid_range_start")
+}
+
+// TestValidate_VMIDRangeEndTooHigh confirms end > 9999 is rejected.
+func TestValidate_VMIDRangeEndTooHigh(t *testing.T) {
+	cfg := &config.CPIConfig{
+		Host:           "h",
+		User:           "u",
+		Password:       "p",
+		VMStorage:      "s",
+		DiskStorage:    "s",
+		NetworkBridge:  "br",
+		AgentMode:      "cloudinit",
+		VMDiskFormat:   "qcow2",
+		LogLevel:       "info",
+		Port:           8006,
+		VerifySSL:      boolPtr(true),
+		VMIDRangeStart: 100,
+		VMIDRangeEnd:   10000, // above max — invalid
+		RebootMode:     "soft",
+		RebootTimeout:  60,
+	}
+	assertCloudError(t, cfg.Validate(), "vmid_range_end must be ≤9999")
+}
+
+// TestValidate_VMIDRangeEndAt9999 confirms end == 9999 is valid.
+func TestValidate_VMIDRangeEndAt9999(t *testing.T) {
+	cfg, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+		"vmid_range_end":9999
+	}`)
+	if err != nil {
+		t.Fatalf("unexpected error for vmid_range_end=9999: %v", err)
+	}
+	if cfg.VMIDRangeEnd != 9999 {
+		t.Errorf("VMIDRangeEnd = %d, want 9999", cfg.VMIDRangeEnd)
+	}
+}
+
+// --------------------------------------------------------------------------
+// TestApplyDefaults_SnapshotGuardBools
+// --------------------------------------------------------------------------
+
+// TestApplyDefaults_SnapshotGuardBools confirms both bool fields default to false
+// (Go zero-value; ApplyDefaults has no explicit step for them — this test verifies
+// that no accidental default-to-true was introduced).
+func TestApplyDefaults_SnapshotGuardBools(t *testing.T) {
+	var cfg config.CPIConfig
+	cfg.VMStorage = "vm-store"
+	cfg.ApplyDefaults()
+
+	if cfg.AllowDiskOpsWithSnapshots {
+		t.Error("AllowDiskOpsWithSnapshots = true after ApplyDefaults, want false")
+	}
+	if cfg.RequireSnapshotCheckPass {
+		t.Error("RequireSnapshotCheckPass = true after ApplyDefaults, want false")
+	}
+}
+
+// --------------------------------------------------------------------------
+// TestLoad_SnapshotGuardBools
+// --------------------------------------------------------------------------
+
+// --------------------------------------------------------------------------
+// TestApplyDefaults_NetworkMode_DefaultsToAuto
+// --------------------------------------------------------------------------
+
+// TestApplyDefaults_NetworkMode_DefaultsToAuto verifies that a zero-value
+// CPIConfig gets NetworkMode="auto" after ApplyDefaults.
+func TestApplyDefaults_NetworkMode_DefaultsToAuto(t *testing.T) {
+	var cfg config.CPIConfig
+	cfg.VMStorage = "vm-store"
+	cfg.ApplyDefaults()
+
+	if cfg.NetworkMode != "auto" {
+		t.Errorf("NetworkMode = %q, want %q", cfg.NetworkMode, "auto")
+	}
+}
+
+// --------------------------------------------------------------------------
+// TestApplyDefaults_SDNZoneType_DefaultsToSimple
+// --------------------------------------------------------------------------
+
+// TestApplyDefaults_SDNZoneType_DefaultsToSimple verifies that a zero-value
+// CPIConfig gets SDNZoneType="simple" after ApplyDefaults.
+func TestApplyDefaults_SDNZoneType_DefaultsToSimple(t *testing.T) {
+	var cfg config.CPIConfig
+	cfg.VMStorage = "vm-store"
+	cfg.ApplyDefaults()
+
+	if cfg.SDNZoneType != "simple" {
+		t.Errorf("SDNZoneType = %q, want %q", cfg.SDNZoneType, "simple")
+	}
+}
+
+// --------------------------------------------------------------------------
+// TestValidate_NetworkMode_InvalidEnum
+// --------------------------------------------------------------------------
+
+func TestValidate_NetworkMode_InvalidEnum(t *testing.T) {
+	_, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+		"network_mode":"invalid"
+	}`)
+	assertCloudError(t, err, "network_mode must be one of sdn|bridge|auto")
+}
+
+// --------------------------------------------------------------------------
+// TestValidate_NetworkMode_ValidValues
+// --------------------------------------------------------------------------
+
+func TestValidate_NetworkMode_ValidValues(t *testing.T) {
+	for _, mode := range []string{"sdn", "bridge", "auto"} {
+		t.Run(mode, func(t *testing.T) {
+			_, err := mustLoad(t, `{
+				"host":"h","user":"u","password":"p",
+				"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+				"network_mode":"`+mode+`"
+			}`)
+			if err != nil {
+				t.Errorf("network_mode=%q: unexpected error: %v", mode, err)
+			}
+		})
+	}
+}
+
+// --------------------------------------------------------------------------
+// TestValidate_SDNZoneType_InvalidEnum_WhenSDNMode
+// --------------------------------------------------------------------------
+
+func TestValidate_SDNZoneType_InvalidEnum_WhenSDNMode(t *testing.T) {
+	_, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+		"network_mode":"sdn","sdn_zone_type":"bogus"
+	}`)
+	assertCloudError(t, err, "sdn_zone_type must be one of simple|vlan|qinq|vxlan|evpn")
+}
+
+// --------------------------------------------------------------------------
+// TestValidate_SDNZoneType_NotValidated_WhenBridgeMode
+// --------------------------------------------------------------------------
+
+// TestValidate_SDNZoneType_NotValidated_WhenBridgeMode confirms that an invalid
+// sdn_zone_type is not rejected when network_mode="bridge" (SDN path unreachable).
+func TestValidate_SDNZoneType_NotValidated_WhenBridgeMode(t *testing.T) {
+	_, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+		"network_mode":"bridge","sdn_zone_type":"bogus"
+	}`)
+	if err != nil {
+		t.Errorf("expected no error for sdn_zone_type with network_mode=bridge, got: %v", err)
+	}
+}
+
+// --------------------------------------------------------------------------
+// TestLoad_NetworkFields_RoundTrip
+// --------------------------------------------------------------------------
+
+// TestLoad_NetworkFields_RoundTrip verifies all four SDN config fields parse
+// correctly from JSON.
+func TestLoad_NetworkFields_RoundTrip(t *testing.T) {
+	cfg, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+		"network_mode":"sdn",
+		"sdn_zone":"boshzone",
+		"sdn_zone_type":"vxlan",
+		"sdn_auto_manage_zone":true
+	}`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.NetworkMode != "sdn" {
+		t.Errorf("NetworkMode = %q, want %q", cfg.NetworkMode, "sdn")
+	}
+	if cfg.SDNZone != "boshzone" {
+		t.Errorf("SDNZone = %q, want %q", cfg.SDNZone, "boshzone")
+	}
+	if cfg.SDNZoneType != "vxlan" {
+		t.Errorf("SDNZoneType = %q, want %q", cfg.SDNZoneType, "vxlan")
+	}
+	if !cfg.SDNAutoManageZone {
+		t.Error("SDNAutoManageZone = false, want true")
+	}
+}
+
+// --------------------------------------------------------------------------
+// TestLoad_NetworkMode_Omitted_GetsAuto
+// --------------------------------------------------------------------------
+
+// TestLoad_NetworkMode_Omitted_GetsAuto confirms that omitting network_mode
+// from JSON results in NetworkMode="auto" after Load applies defaults.
+func TestLoad_NetworkMode_Omitted_GetsAuto(t *testing.T) {
+	cfg, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br"
+	}`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.NetworkMode != "auto" {
+		t.Errorf("NetworkMode = %q, want %q (default when omitted)", cfg.NetworkMode, "auto")
+	}
+}
+
+// --------------------------------------------------------------------------
+// TestLoad_SnapshotGuardBools
+// --------------------------------------------------------------------------
+
+// TestLoad_SnapshotGuardBools confirms that explicit true values are honored
+// through JSON decode and that absent fields remain false.
+func TestLoad_SnapshotGuardBools(t *testing.T) {
+	cases := []struct {
+		name        string
+		json        string
+		wantAllow   bool
+		wantRequire bool
+	}{
+		{
+			name: "both absent — both false",
+			json: `{
+				"host":"h","user":"u","password":"p",
+				"vm_storage":"s","disk_storage":"s","network_bridge":"br"
+			}`,
+			wantAllow:   false,
+			wantRequire: false,
+		},
+		{
+			name: "allow_disk_ops_with_snapshots true",
+			json: `{
+				"host":"h","user":"u","password":"p",
+				"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+				"allow_disk_ops_with_snapshots":true
+			}`,
+			wantAllow:   true,
+			wantRequire: false,
+		},
+		{
+			name: "require_snapshot_check_pass true",
+			json: `{
+				"host":"h","user":"u","password":"p",
+				"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+				"require_snapshot_check_pass":true
+			}`,
+			wantAllow:   false,
+			wantRequire: true,
+		},
+		{
+			name: "both true",
+			json: `{
+				"host":"h","user":"u","password":"p",
+				"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+				"allow_disk_ops_with_snapshots":true,
+				"require_snapshot_check_pass":true
+			}`,
+			wantAllow:   true,
+			wantRequire: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := mustLoad(t, tc.json)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if cfg.AllowDiskOpsWithSnapshots != tc.wantAllow {
+				t.Errorf("AllowDiskOpsWithSnapshots = %v, want %v", cfg.AllowDiskOpsWithSnapshots, tc.wantAllow)
+			}
+			if cfg.RequireSnapshotCheckPass != tc.wantRequire {
+				t.Errorf("RequireSnapshotCheckPass = %v, want %v", cfg.RequireSnapshotCheckPass, tc.wantRequire)
+			}
+		})
+	}
+}
