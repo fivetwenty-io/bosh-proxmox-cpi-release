@@ -362,7 +362,7 @@ The handler reads the VM's existing PVE tags, strips entries with the reserved p
 - `Bosh::Clouds::NotSupported` when `new_size` is less than the current disk size (shrink rejected; Director falls back to create-new + copy-data)
 - `Bosh::Clouds::CloudError` on PVE API failure
 
-**Notes:** The Director calls this only when `director.enable_cpi_resize_disk: true`. The disk must be detached before resize. A snapshot pre-flight guard runs first: if the VM has snapshots, resize is rejected with an actionable error. PVE cannot resize disks on LVM-thin or ZFS storage while snapshots exist; on qcow2/raw the resize would succeed but leave snapshot data inconsistent. Set `pve.allow_disk_ops_with_snapshots` to bypass. See [Snapshot guard on disk operations](#snapshot-guard-on-disk-operations).
+**Notes:** The Director calls this only when `director.enable_cpi_resize_disk: true`. The disk must be attached to a VM at call time; the handler uses `FindVMByDiskVolid` to locate the hosting VM and determine the current disk size before issuing the resize. If the disk is not attached, the call will error. A snapshot pre-flight guard runs first: if the VM has snapshots, resize is rejected with an actionable error. PVE cannot resize disks on LVM-thin or ZFS storage while snapshots exist; on qcow2/raw the resize would succeed but leave snapshot data inconsistent. Set `pve.allow_disk_ops_with_snapshots` to bypass. See [Snapshot guard on disk operations](#snapshot-guard-on-disk-operations).
 
 ---
 
