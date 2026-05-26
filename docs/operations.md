@@ -397,12 +397,11 @@ pvesm free <storage>:images/vm-9NNN-disk-0.qcow2
 
 **Danger: `pvesm free` permanently deletes the volume. Confirm the stemcell is absent from the Director's state and that no running VM still uses the ISO before freeing it.**
 
-Stemcell import files come in pairs: the qcow2 image and a JSON sidecar. List them and confirm the Director no longer references the stemcell (`bosh stemcells`) before freeing:
+A stemcell import is a single qcow2 image. List it and confirm the Director no longer references the stemcell (`bosh stemcells`) before freeing:
 
 ```bash
 pvesm list <stemcell_storage> --content import | grep bosh-stemcell
 pvesm free <stemcell_storage>:import/<filename>.qcow2
-pvesm free <stemcell_storage>:import/<filename>.json
 ```
 
 ConfigDrive ISOs belong to a specific VM. Confirm that VM is gone (or no longer references the ISO via `qm config <vmid>`) before freeing:

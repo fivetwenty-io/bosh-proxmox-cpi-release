@@ -104,8 +104,6 @@ bosh-stemcell-<sanitized-name>-<sanitized-version>-<sha8>.qcow2
 
 where `sha8` is the first 8 hex characters of the SHA-256 hash of the disk image. This makes the filename a content-addressed key, enabling deduplication: if a volume with the same filename already exists, `create_stemcell` returns the existing CID without re-uploading.
 
-A companion sidecar file (`*.json`) is uploaded alongside the qcow2 for operator audit. The CPI never reads the sidecar; if the sidecar upload fails, `create_stemcell` returns an error and attempts to delete the already-uploaded qcow2.
-
 The returned **stemcell CID** is the full PVE volume identifier:
 
 ```
@@ -128,7 +126,7 @@ VMID allocation uses the range `[vmid_range_start, 5999]`. Stemcells no longer o
 
 ### delete_stemcell
 
-The handler parses the CID to extract the storage name and volume path, then calls `DeleteVolumeIfExists` for both the qcow2 and the sidecar. Missing volumes are logged at WARN and treated as success (idempotent).
+The handler parses the CID to extract the storage name and volume path, then calls `DeleteVolumeIfExists` for the qcow2. Missing volumes are logged at WARN and treated as success (idempotent).
 
 ### Shared-storage requirement
 

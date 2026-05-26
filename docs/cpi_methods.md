@@ -59,7 +59,7 @@ The CPI advertises `openstack-qcow2` and `openstack-raw` because OpenStack qcow2
 bosh-stemcell-<name>-<version>-<sha8>.qcow2
 ```
 
-A companion sidecar JSON file is uploaded alongside the qcow2 for operator audit. If a volume with the same filename already exists on the storage pool, the upload is skipped and the existing CID is returned.
+If a volume with the same filename already exists on the storage pool, the upload is skipped and the existing CID is returned.
 
 The returned `stemcell_cid` is the PVE volume identifier: `<storage>:import/<filename>` (e.g. `nfs-pool:import/bosh-stemcell-ubuntu-jammy-1.438-a1b2c3d4.qcow2`).
 
@@ -79,7 +79,7 @@ The returned `stemcell_cid` is the PVE volume identifier: `<storage>:import/<fil
 
 **Errors:** `Bosh::Clouds::CloudError` on PVE API failure
 
-**Notes:** Parses the stemcell CID as `<storage>:import/<filename>` and deletes both the qcow2 volume and its companion sidecar JSON. If either volume is absent the call still succeeds (idempotent). Legacy integer-only CIDs (from template-based deployments) are rejected with an error.
+**Notes:** Parses the stemcell CID as `<storage>:import/<filename>` and deletes the qcow2 volume. If the volume is absent the call still succeeds (idempotent). Legacy integer-only CIDs (from template-based deployments) are rejected with an error.
 
 Because PVE copies qcow2 data into each VM's root disk at create time (block-copy semantics), running VMs have no dependency on the stemcell volume after creation. The stemcell can be deleted at any time without affecting running VMs.
 
