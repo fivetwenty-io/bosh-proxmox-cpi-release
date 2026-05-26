@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/agent"
@@ -1031,3 +1032,122 @@ func TestHandleAttachDisk_LVMThin_CID(t *testing.T) {
 // integration-test harness provides a cifs pool via env.
 //
 // func TestHandleAttachDisk_CIFS_CID(t *testing.T) { ... }
+
+// ---------------------------------------------------------------------------
+// Auth-failure test
+// ---------------------------------------------------------------------------
+
+// TestHandleAttachDisk_AuthFailure verifies that a 401 Unauthorized from
+// AttachDisk is classified as a non-retriable Cloud error. Auth failures
+// (wrong API token, expired ticket) are operator configuration issues; BOSH
+// must surface them immediately rather than retrying indefinitely.
+func TestHandleAttachDisk_AuthFailure(t *testing.T) {
+	authErr := &sdkerrors.APIError{HTTPCode: 401, Message: "authentication failure"}
+
+	qemuSvc := &attachQEMUService{
+		attachErr: authErr,
+	}
+	h := handlers.HandleAttachDisk(attachDeps(qemuSvc, &captureAgent{}))
+
+	_, err := h.Handle(context.Background(), attachArgs("100", "local-lvm:vm-9001-disk-0"), jsonrpc.Context{})
+	if err == nil {
+		t.Fatal("expected error from 401 auth failure")
+	}
+
+	// 401 is a 4xx non-404 → WrapError returns a non-retriable Cloud error.
+	cpiErr, ok := err.(*cpierrors.Error)
+	if !ok {
+		t.Fatalf("expected *cpierrors.Error, got %T: %v", err, err)
+	}
+	if cpiErr.OkToRetry() {
+		t.Errorf("auth failure must not be retriable; OkToRetry()=true; type=%s", cpiErr.Type())
+	}
+	if cpiErr.Type() == cpierrors.TypeRetriableCloud {
+		t.Errorf("auth failure classified as RetriableCloud; want non-retriable TypeCloud; type=%s", cpiErr.Type())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Concurrent attach_disk test
+// ---------------------------------------------------------------------------
+
+// TestAttachDisk_ConcurrentSameVM spawns two goroutines each calling
+// HandleAttachDisk against the same VMID with the same disk CID. The test
+// asserts the invariant required by the BOSH CPI spec for attach_disk:
+//
+//   - Both calls succeed (idempotent: second call sees disk already attached).
+//   - OR one call fails with a storage-lock retriable error (transient contention).
+//
+// The test does NOT assert that BOTH succeed simultaneously; PVE serialises
+// QEMU config updates behind a per-VM lock, so one call may lose the race.
+// What must NOT happen: a non-retriable Cloud error (which would cause BOSH
+// to treat the attach as permanently failed and orphan the disk).
+//
+// Each goroutine gets its own independent mock service to avoid data races on
+// the configCalls counter inside attachQEMUService; the VMID and disk CID are
+// shared via immutable constants.
+func TestAttachDisk_ConcurrentSameVM(t *testing.T) {
+	t.Parallel()
+
+	const (
+		vmCID   = "100"
+		diskCID = "local-lvm:vm-9001-disk-0"
+	)
+
+	// newQEMU returns a fresh, unshared attachQEMUService for each goroutine.
+	// Sharing a single instance would cause a data race on configCalls.
+	newQEMU := func() *attachQEMUService {
+		return &attachQEMUService{
+			attachReturnDiskID: "scsi1",
+			configCfg: map[string]interface{}{
+				"scsi1": diskCID,
+			},
+		}
+	}
+
+	type callResult struct {
+		err error
+	}
+
+	const workers = 2
+	results := make(chan callResult, workers)
+
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for i := 0; i < workers; i++ {
+		go func() {
+			defer wg.Done()
+			// Independent QEMU service + captureAgent per goroutine — no shared mutable state.
+			ag := &captureAgent{}
+			h := handlers.HandleAttachDisk(attachDeps(newQEMU(), ag))
+			_, err := h.Handle(context.Background(), attachArgs(vmCID, diskCID), jsonrpc.Context{})
+			results <- callResult{err: err}
+		}()
+	}
+
+	wg.Wait()
+	close(results)
+
+	var nonRetriableFailures []error
+	for r := range results {
+		if r.err == nil {
+			continue // success: idempotent attach
+		}
+		cpiErr, ok := r.err.(*cpierrors.Error)
+		if !ok {
+			// Non-CPI error — unexpected; surface it.
+			nonRetriableFailures = append(nonRetriableFailures, r.err)
+			continue
+		}
+		if !cpiErr.OkToRetry() {
+			// Non-retriable error from concurrent attach is not acceptable.
+			nonRetriableFailures = append(nonRetriableFailures, r.err)
+		}
+		// Retriable error (storage lock contention) is acceptable per BOSH spec.
+	}
+
+	if len(nonRetriableFailures) > 0 {
+		t.Errorf("concurrent attach_disk produced %d non-retriable failure(s): %v",
+			len(nonRetriableFailures), nonRetriableFailures)
+	}
+}

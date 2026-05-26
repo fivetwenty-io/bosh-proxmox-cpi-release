@@ -741,7 +741,7 @@ func TestNextVMID_VmidNullField(t *testing.T) {
 	}
 }
 
-// ---- IMP-01: randomised-start scatter tests ----
+// ---- Randomised-start scatter tests ----
 
 // TestNextVMIDInRange_AllFreeInRange verifies that with all slots free in a
 // small range the returned VMID lands within that range.
@@ -946,10 +946,20 @@ func TestRetryBackoff_RespectsContextCancel(t *testing.T) {
 	conflictErr := errors.New("conflict: already exists")
 	attempts := 0
 
-	// Cancel the context after the first attempt fails.
+	// inBackoff signals exactly once when the backoff func is invoked for
+	// the first time. The cancel goroutine waits on it instead of sleeping
+	// a fixed wall-clock interval, eliminating timing flakes on slow CI.
+	// Buffered (cap 1) so the send never blocks even if the cancel
+	// goroutine has not yet reached the receive (e.g. fast schedulers).
+	inBackoff := make(chan struct{}, 1)
+	var signalOnce sync.Once
+
+	// Cancel the context the moment AllocateWithRetry enters its first
+	// backoff sleep. The backoff func itself returns 10s, so if the cancel
+	// path were broken the test would block for the full 10s and the
+	// elapsed check below would fail.
 	go func() {
-		// Give the first attempt time to complete and the backoff to begin.
-		time.Sleep(50 * time.Millisecond)
+		<-inBackoff
 		cancel()
 	}()
 
@@ -964,6 +974,7 @@ func TestRetryBackoff_RespectsContextCancel(t *testing.T) {
 		// Backoff of 10s: if context cancellation is not respected the test
 		// would run for 10s; with the fix it returns within ~100ms.
 		pve.WithBackoffFunc(func(_ error, _ int) time.Duration {
+			signalOnce.Do(func() { inBackoff <- struct{}{} })
 			return 10 * time.Second
 		}),
 	)

@@ -18,12 +18,17 @@ src/pve_cpi/coverage.html
 # Local
 .envrc
 .env
-/cpi
 
 # bosh create-env workflow
 manifests/vars.yml
 manifests/state.json
 manifests/creds.yml
+
+# BOSH CPI deployment secrets — explicit paths for defense-in-depth
+# Bare-filename patterns above already catch these; explicit entries prevent
+# rename/move from accidentally unmasking them.
+manifests/bosh/vars.yml
+manifests/bosh/creds.yml
 
 # BOSH release artifacts
 blobs/

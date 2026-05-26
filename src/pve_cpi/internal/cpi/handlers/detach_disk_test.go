@@ -634,6 +634,69 @@ func TestHandleDetachDisk_LVMThin_CID(t *testing.T) {
 	}
 }
 
+// TestDetachDisk_SentinelIdempotent verifies that when ResolveDiskID returns
+// the new ErrDiskNotAttached sentinel (via the production code path: a Config
+// fetch that succeeds but the volid is absent), the handler reports success
+// and does not call DetachDisk. The sweep over unusedN entries also runs and
+// finds nothing for this volid, so DetachDisk stays untouched.
+func TestDetachDisk_SentinelIdempotent(t *testing.T) {
+	const (
+		vmCID   = "100"
+		diskCID = "local-lvm:vm-9001-disk-0"
+	)
+
+	qemuSvc := &detachQEMUService{
+		// Config returns a populated map that does NOT contain diskCID on any
+		// bus slot or unused slot — ResolveDiskID wraps ErrDiskNotAttached.
+		configCfg: map[string]interface{}{
+			"scsi0": "local-lvm:vm-100-disk-0",
+		},
+	}
+	h := handlers.HandleDetachDisk(detachDeps(qemuSvc))
+
+	result, err := h.Handle(context.Background(), detachArgs(vmCID, diskCID), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("expected nil error for sentinel-idempotent path, got: %v", err)
+	}
+	if result != nil {
+		t.Errorf("result: want nil (void), got %v", result)
+	}
+	if qemuSvc.detachCalled {
+		t.Error("DetachDisk must NOT be called when ResolveDiskID returns ErrDiskNotAttached")
+	}
+}
+
+// TestDetachDisk_OtherCloudErrorPropagates verifies that the previously broad
+// TypeCloud swallow has been narrowed to the ErrDiskNotAttached sentinel.
+// A non-sentinel Cloud error surfaced from the Config-fetch path (here a
+// QEMU().Config() that returns cpierrors.Cloud directly, not the sentinel)
+// must propagate to the caller as a real error and must not call DetachDisk.
+func TestDetachDisk_OtherCloudErrorPropagates(t *testing.T) {
+	const (
+		vmCID   = "100"
+		diskCID = "local-lvm:vm-9001-disk-0"
+	)
+
+	// Inject a Cloud error from Config — ResolveDiskID wraps it with %w but
+	// the underlying type is TypeCloud, not the sentinel. The new sentinel
+	// check (errors.Is) returns false, so the handler must propagate.
+	qemuSvc := &detachQEMUService{
+		configErr: cpierrors.Cloud("simulated non-sentinel cloud failure from config"),
+	}
+	h := handlers.HandleDetachDisk(detachDeps(qemuSvc))
+
+	_, err := h.Handle(context.Background(), detachArgs(vmCID, diskCID), jsonrpc.Context{})
+	if err == nil {
+		t.Fatal("expected error from non-sentinel Cloud failure; got nil")
+	}
+	if errors.Is(err, nil) {
+		t.Fatal("error must be non-nil (compile-time guard)")
+	}
+	if qemuSvc.detachCalled {
+		t.Error("DetachDisk must NOT be called when ResolveDiskID returns a non-sentinel error")
+	}
+}
+
 // TODO(storage-network): nfs — wired to PVE network-call boundary, stubbed pending
 // live shared-storage test infrastructure. Storage: nfs-store:9001/vm-9001-disk-0.qcow2. Re-enable when
 // integration-test harness provides a nfs pool via env.

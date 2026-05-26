@@ -81,12 +81,27 @@
         stemcell_storage: ((pve_stemcell_storage))
         iso_storage: ((pve_iso_storage))
         network_bridge: ((pve_network_bridge))
+        network_mode: ((pve_network_mode))
+        sdn_zone: ((pve_sdn_zone))
+        sdn_zone_type: ((pve_sdn_zone_type))
+        sdn_auto_manage_zone: ((pve_sdn_auto_manage_zone))
         verify_ssl: ((pve_verify_ssl))
         agent_mode: cloudinit
         vm_disk_format: qcow2
         log_level: info
         vm_prefix: ((pve_vm_prefix))
         create_env_deployment: ((pve_create_env_deployment))
+        vmid_range_start: ((pve_vmid_range_start))
+        vmid_range_end: ((pve_vmid_range_end))
+        allow_disk_ops_with_snapshots: ((pve_allow_disk_ops_with_snapshots))
+        require_snapshot_check_pass: ((pve_require_snapshot_check_pass))
+        hotplug: ((pve_hotplug))
+        numa: ((pve_numa))
+        reboot_mode: ((pve_reboot_mode))
+        reboot_timeout: ((pve_reboot_timeout))
+      agent: &pve_agent_props
+        mbus: ((pve_agent_mbus))
+        blobstore: ((pve_agent_blobstore))
 
 # cloud_provider drives create-env itself.
 - type: replace
@@ -98,3 +113,7 @@
 - type: replace
   path: /cloud_provider/properties/pve?
   value: *pve_props
+
+- type: replace
+  path: /cloud_provider/properties/agent?
+  value: *pve_agent_props

@@ -35,6 +35,8 @@ Assumes:
 
 from __future__ import annotations
 
+import importlib.machinery as _ilm
+import importlib.util as _ilu
 import json
 import os
 import re
@@ -173,17 +175,28 @@ def cmd_check_uaa_db(_extra: list[str]) -> None:
         ["bosh", "-e", ENV, "-d", DEPLOYMENT, "ssh", "database/0", "-c", probe, "-r"],
         capture_output=True, text=True, check=False,
     )
+    if result.returncode != 0:
+        stderr_snippet = (result.stderr or "").strip()[-500:]
+        raise RuntimeError(
+            f"bosh ssh to database/0 failed (rc={result.returncode}).\n"
+            f"stderr: {stderr_snippet}"
+        )
     out = (result.stdout or "") + (result.stderr or "")
     if any(tok in out for tok in ("OK_DB_MISSING", "OK_FRESH", "SKIP_NO_PXC", "SKIP_NO_MYSQL_BIN")):
         print("    skipped (uaa schema or pxc not yet provisioned)")
         return
     if "PROBE_ERROR" in out:
-        print(f"    warn: probe inconclusive — {out.strip().splitlines()[-1][:200]}")
-        return
+        raise RuntimeError(
+            f"uaa DB probe returned PROBE_ERROR — bosh ssh succeeded but the remote "
+            f"script reported a non-recoverable error.\n"
+            f"Output: {out.strip().splitlines()[-1][:500]}"
+        )
     match = re.search(r"FAILED_ROWS=(\d+)", out)
     if not match:
-        print(f"    warn: unable to parse probe output: {out[-200:]}")
-        return
+        raise RuntimeError(
+            f"uaa DB probe output could not be parsed; cannot confirm schema health.\n"
+            f"Raw output (last 500 chars): {out[-500:]}"
+        )
     failed = int(match.group(1))
     if failed > 0:
         sys.exit(
@@ -201,6 +214,27 @@ def cmd_check_uaa_db(_extra: list[str]) -> None:
             f"    bosh -e {ENV} -d {DEPLOYMENT} recreate uaa\n"
         )
     print("    OK")
+
+
+def _coerce_vmid(raw_cid: str) -> int:
+    """Parse a PVE VMID string to a positive integer.
+
+    Raises ValueError with a specific message when the value is not a
+    valid integer, preventing injection of arbitrary strings into
+    downstream subprocess arguments.
+    """
+    try:
+        vmid = int(raw_cid)
+    except (ValueError, TypeError):
+        raise ValueError(
+            f"PVE VMID must be an integer; got {raw_cid!r}. "
+            "Check that 'bosh vms --column=vm_cid' returned a numeric VMID."
+        )
+    if vmid <= 0:
+        raise ValueError(
+            f"PVE VMID must be a positive integer; got {vmid!r}."
+        )
+    return vmid
 
 
 def cmd_unstick_agent(extra: list[str]) -> None:
@@ -221,6 +255,13 @@ def cmd_unstick_agent(extra: list[str]) -> None:
 
     Usage: ./scripts/cf unstick-agent <instance>
         instance: bosh-style identifier ("uaa/0", "diego-cell/<uuid>")
+
+    SSH host-key checking:
+        By default, SSH validates the PVE host key against ~/.ssh/known_hosts.
+        Set SCRIPTS_CF_SSH_UNSAFE=1 to disable host-key checking (for
+        first-boot or test environments where the host key is not yet trusted).
+        WARNING: SCRIPTS_CF_SSH_UNSAFE=1 exposes the connection to MITM attacks.
+        Never use in production.
     """
     if not extra:
         sys.exit("usage: scripts/cf unstick-agent <instance>")
@@ -231,32 +272,52 @@ def cmd_unstick_agent(extra: list[str]) -> None:
         "bosh", "-e", ENV, "-d", DEPLOYMENT, "vms",
         "--column=instance", "--column=vm_cid",
     )
-    cid = None
+    raw_cid = None
     for line in raw.splitlines():
         parts = line.split()
         if len(parts) < 2:
             continue
         inst, vm_cid = parts[0], parts[1]
         if inst == target:
-            cid = vm_cid
+            raw_cid = vm_cid
             break
         job, sep, ref = inst.partition("/")
         if sep and (target == job or target == f"{job}/{ref}"):
-            cid = vm_cid
+            raw_cid = vm_cid
             break
         try:
             idx = int(target.split("/", 1)[1])
         except (ValueError, IndexError):
             idx = None
         if idx is not None and target.split("/", 1)[0] == job:
-            cid = vm_cid
+            raw_cid = vm_cid
             break
-    if not cid:
+    if not raw_cid:
         sys.exit(f"no VM cid found for instance {target!r} in deployment {DEPLOYMENT}")
-    print(f"    instance {target} -> PVE vmid {cid}")
+
+    # Coerce to int before any use — rejects injection strings like "123; rm -rf /"
+    # and ensures the VMID is safe to pass as a discrete argv element.
+    try:
+        vmid = _coerce_vmid(raw_cid)
+    except ValueError as exc:
+        sys.exit(f"invalid VM cid for instance {target!r}: {exc}")
+
+    print(f"    instance {target} -> PVE vmid {vmid}")
 
     pve_host = capture("bosh", "int", str(BOSH_VARS), "--path=/pve_host")
     print(f"    pve host: {pve_host}")
+
+    # Build SSH options. StrictHostKeyChecking is enabled by default so the
+    # user's known_hosts is consulted and a bogus host key is rejected.
+    # Operators who need to bypass the check for first-time host-key acceptance
+    # must set SCRIPTS_CF_SSH_UNSAFE=1 explicitly.
+    ssh_opts: list[str] = ["-o", "BatchMode=yes"]
+    if os.environ.get("SCRIPTS_CF_SSH_UNSAFE") == "1":
+        print(
+            "    WARNING: SCRIPTS_CF_SSH_UNSAFE=1 — SSH host-key checking is disabled. "
+            "Do not use in production."
+        )
+        ssh_opts += ["-o", "StrictHostKeyChecking=no"]
 
     probe = (
         "set -e; "
@@ -265,10 +326,17 @@ def cmd_unstick_agent(extra: list[str]) -> None:
         "systemctl is-active bosh-agent"
     )
     print("    restarting bosh-agent via qemu-guest-agent...")
+    # argv list prevents shell injection — vmid is an int, pve_host is a plain
+    # hostname string (no shell expansion). shlex.quote wraps the probe so the
+    # remote shell receives it as a single argument.
     result = subprocess.run(
-        ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
-         f"root@{pve_host}",
-         f"qm guest exec {cid} --timeout 20 -- /bin/sh -c {shlex.quote(probe)}"],
+        [
+            "ssh",
+            *ssh_opts,
+            f"root@{pve_host}",
+            "qm", "guest", "exec", str(vmid), "--timeout", "20",
+            "--", "/bin/sh", "-c", probe,
+        ],
         capture_output=True, text=True, check=False,
     )
     out = (result.stdout or "") + (result.stderr or "")
@@ -382,6 +450,45 @@ def cmd_teardown(_extra: list[str]) -> None:
     print(f"    deployment '{DEPLOYMENT}' deleted")
 
 
+def _load_bosh_module():
+    """Load scripts/bosh as a Python module for COMMANDS-map dispatch.
+
+    scripts/bosh has no .py extension, so we use SourceFileLoader.
+    The loaded module exposes its COMMANDS dict and main() function,
+    allowing scripts/cf to delegate operations through the same dispatch
+    path rather than embedding raw bosh CLI subprocess calls.
+    """
+    bosh_path = str(Path(__file__).resolve().parent / "bosh")
+    loader = _ilm.SourceFileLoader("bosh_script", bosh_path)
+    spec = _ilu.spec_from_loader("bosh_script", loader, origin=bosh_path)
+    mod = _ilu.module_from_spec(spec)
+    mod.__file__ = bosh_path
+    loader.exec_module(mod)
+    return mod
+
+
+def cmd_update_resurrection(extra: list[str]) -> None:
+    """Enable or disable BOSH resurrection for the director.
+
+    Routes through the scripts/bosh COMMANDS map so that all director
+    environment setup (BOSH_ENVIRONMENT, BOSH_CLIENT, BOSH_CA_CERT) is
+    handled consistently by scripts/bosh rather than duplicated here.
+
+    Usage:
+        ./scripts/cf update-resurrection on   # enable resurrection
+        ./scripts/cf update-resurrection off  # disable resurrection
+        ./scripts/cf update-resurrection      # passthrough with no args
+
+    Args in extra are forwarded verbatim to `bosh update-resurrection`.
+    The command exits non-zero when the bosh CLI returns a non-zero
+    exit code, propagating the failure to the caller.
+    """
+    bosh_mod = _load_bosh_module()
+    rc = bosh_mod.main(["update-resurrection", *extra])
+    if rc != 0:
+        sys.exit(rc)
+
+
 def cmd_deploy(extra: list[str]) -> None:
     cmd_runtime_config([])
     cmd_cloud_config([])
@@ -403,6 +510,7 @@ COMMANDS = {
     "api": cmd_api,
     "login": cmd_login,
     "admin-password": cmd_admin_password,
+    "update-resurrection": cmd_update_resurrection,
 }
 
 

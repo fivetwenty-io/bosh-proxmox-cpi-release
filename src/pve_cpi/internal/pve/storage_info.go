@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/clusterstorage"
+
+	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 )
 
 // StorageInfo is the CPI-facing view of a PVE storage entry.
@@ -54,6 +56,12 @@ type StorageLister interface {
 // the refresh, then closes the channel. All subsequent goroutines that arrive
 // while the refresh is in flight wait on that channel and re-read the cache
 // once it closes. This eliminates the TOCTOU double-refresh race (B5).
+//
+// A short-lived negative cache mirrors the positive cache: when a refresh
+// returns an error the failure is cached for negativeCacheTTL before the
+// next attempt is allowed. This stops a degraded PVE cluster from being
+// hammered by every concurrent CPI request on the same lookup key while
+// the underlying fault clears (thundering-herd guard).
 type StorageInfoCache struct {
 	lister StorageLister
 	ttl    time.Duration
@@ -61,12 +69,28 @@ type StorageInfoCache struct {
 	mu       sync.Mutex
 	entries  map[string]storageInfoEntry
 	inflight map[string]chan struct{}
+	negCache negativeCacheEntry
 }
 
 type storageInfoEntry struct {
 	info StorageInfo
 	exp  time.Time
 }
+
+// negativeCacheEntry holds the most-recent refresh failure with an expiry.
+// One entry covers the entire cache because refresh fetches the full index
+// in a single call: a failure to fetch the index applies to every key.
+type negativeCacheEntry struct {
+	err error
+	exp time.Time
+}
+
+// negativeCacheTTL is the window during which a failed refresh is replayed
+// from the negative cache instead of being re-attempted. 5 seconds is short
+// enough that a transient PVE blip clears before any human-noticeable
+// extra latency, long enough that a thundering herd of CPI requests on
+// the same cold cache only triggers one upstream call per window.
+const negativeCacheTTL = 5 * time.Second
 
 // NewStorageInfoCache constructs a cache backed by lister. ttl <= 0 disables
 // caching (every Get triggers a fetch).
@@ -110,6 +134,16 @@ func (c *StorageInfoCache) Get(ctx context.Context, name string) (StorageInfo, e
 		if entry, ok := c.entries[name]; ok && (c.ttl <= 0 || time.Now().Before(entry.exp)) {
 			c.mu.Unlock()
 			return entry.info, nil
+		}
+
+		// Negative-cache hit: a recent refresh failed and the TTL has not
+		// expired. Replay the cached error rather than hammering the upstream
+		// while the failure mode is still in effect. Preserves the wrapped
+		// retriable classification produced by refresh.
+		if c.negCache.err != nil && time.Now().Before(c.negCache.exp) {
+			cachedErr := c.negCache.err
+			c.mu.Unlock()
+			return StorageInfo{}, cachedErr
 		}
 
 		// Cache miss: check whether another goroutine is already refreshing.
@@ -158,26 +192,44 @@ func (c *StorageInfoCache) Get(ctx context.Context, name string) (StorageInfo, e
 	}
 }
 
-// Invalidate drops the cached entry for name. The next Get refetches the index.
+// Invalidate drops the cached entry for name and clears any negative-cache
+// failure so the next Get refetches the index. Operators that have remedied
+// a PVE outage can call this to force re-discovery without waiting out the
+// negative-cache TTL.
 func (c *StorageInfoCache) Invalidate(name string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	delete(c.entries, name)
+	c.negCache = negativeCacheEntry{}
 }
 
 // refresh fetches /storage and replaces the cache wholesale. PVE returns the
 // full index even when only one entry is needed, so populating all entries from
 // a single request is strictly cheaper than per-name lookups.
+//
+// On error the returned value is classified through pve.WrapError so callers
+// preserve the retriable/non-retriable distinction (transient transport
+// faults remain retriable; 404 stays non-retriable). The same wrapped error
+// is recorded in the negative cache so concurrent callers within
+// negativeCacheTTL replay it instead of triggering parallel refreshes.
 func (c *StorageInfoCache) refresh(ctx context.Context) error {
 	if c.lister == nil {
 		return fmt.Errorf("storage_info: cache has no lister configured")
 	}
 	resp, err := c.lister.ListStorage(ctx, &clusterstorage.ListStorageParams{})
 	if err != nil {
-		return fmt.Errorf("storage_info: list cluster storage: %w", err)
+		wrapped := cpierrors.Wrap(WrapError(err), "storage_info: list cluster storage")
+		c.mu.Lock()
+		c.negCache = negativeCacheEntry{err: wrapped, exp: time.Now().Add(negativeCacheTTL)}
+		c.mu.Unlock()
+		return wrapped
 	}
 	if resp == nil {
-		return fmt.Errorf("storage_info: nil response from cluster storage list")
+		wrapped := cpierrors.Cloud("storage_info: nil response from cluster storage list")
+		c.mu.Lock()
+		c.negCache = negativeCacheEntry{err: wrapped, exp: time.Now().Add(negativeCacheTTL)}
+		c.mu.Unlock()
+		return wrapped
 	}
 
 	now := time.Now()
@@ -193,6 +245,8 @@ func (c *StorageInfoCache) refresh(ctx context.Context) error {
 		}
 		c.entries[info.Name] = storageInfoEntry{info: info, exp: deadline}
 	}
+	// Successful refresh clears the negative cache.
+	c.negCache = negativeCacheEntry{}
 	return nil
 }
 

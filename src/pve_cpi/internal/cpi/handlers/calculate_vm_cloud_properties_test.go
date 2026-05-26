@@ -380,7 +380,7 @@ func TestHandleCalculateVMCloudProperties_ClusterAPIError(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Storage-first tests (IMP-11 / IMP-12 / VAL-03)
+// Storage-first tests
 // ---------------------------------------------------------------------------
 
 // TestHandleCalculateVMCloudProperties_StorageFirst_AllHaveStorage verifies that

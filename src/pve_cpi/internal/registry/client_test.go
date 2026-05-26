@@ -457,3 +457,113 @@ func TestPut_InstanceIDInPath(t *testing.T) {
 		t.Errorf("path: got %q, want %q", gotPath, wantPath)
 	}
 }
+
+// --------------------------------------------------------------------------
+// Body drain on terminal err + LimitReader cap.
+// --------------------------------------------------------------------------
+
+// --------------------------------------------------------------------------
+// Retry-exhaustion timing — backoff slept at least the jitter lower
+// bound between attempts.
+// --------------------------------------------------------------------------
+
+// TestPut_RetryExhaustion_BackoffWallClock verifies that when the retry budget
+// is exhausted, the wall-clock elapsed time is bounded below by the sum of
+// minimum jitter delays the backoff schedule guarantees between attempts.
+//
+// The schedule (see backoffDelay): base=200ms, attempt i delay = 200ms*2^i*j
+// where j ∈ [0.75, 1.25). With retryMaxAttempts=3 the loop sleeps once
+// before attempt 1 (i=0, min 150ms) and once before attempt 2 (i=1, min 300ms),
+// for a guaranteed lower bound of 450ms across all retries.
+//
+// We tolerate scheduler jitter on busy CI runners by asserting against 90% of
+// the deterministic floor (405ms), which still proves the sleeps actually ran
+// rather than being silently skipped.
+func TestPut_RetryExhaustion_BackoffWallClock(t *testing.T) {
+	var callCount int
+	client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+	})
+
+	start := time.Now()
+	err := client.Put(context.Background(), "100", map[string]string{"k": "v"})
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected error after retry budget exhausted, got nil")
+	}
+	if callCount != 3 {
+		t.Fatalf("expected 3 HTTP calls (1 initial + 2 retries), got %d", callCount)
+	}
+
+	// Floor: 150ms + 300ms = 450ms; allow 10% slack so a slow runner does
+	// not flap. If the sleeps were skipped entirely, elapsed would be ~0ms
+	// and the assertion would fire cleanly.
+	const floorMillis = 405
+	if elapsed < floorMillis*time.Millisecond {
+		t.Errorf("elapsed = %v, want ≥ %dms (90%% of summed jitter lower bounds)",
+			elapsed, floorMillis)
+	}
+
+	// Sanity upper bound: the maximum delay sum is 250ms + 500ms = 750ms;
+	// add 2s slack for HTTP round-trip overhead and scheduler noise.
+	const ceilingMillis = 2750
+	if elapsed > ceilingMillis*time.Millisecond {
+		t.Errorf("elapsed = %v, exceeds %dms ceiling (jitter upper bound + slack)",
+			elapsed, ceilingMillis)
+	}
+}
+
+// TestReadAll_CappedAt1MiB confirms the client reads at most maxRegistryRespBody
+// (1 MiB) bytes from any single response body, even when the server returns
+// a much larger payload. We exercise the error-path Get reader by responding
+// with 2 MiB and a 200 status (so the success-path ReadAll fires) — the
+// unmarshal will fail, but the captured length tells us the cap held.
+func TestReadAll_CappedAt1MiB(t *testing.T) {
+	const (
+		oneMiB = 1 << 20
+		twoMiB = 2 * oneMiB
+	)
+	body := make([]byte, twoMiB)
+	for i := range body {
+		body[i] = 'A'
+	}
+
+	client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(body)
+	})
+
+	// Get unmarshals as JSON envelope; 2 MiB of 'A' is not valid JSON, so
+	// we expect an unmarshal error rather than success. The point is that
+	// the read did not OOM and the response body length surfaced in the
+	// error is bounded by the cap (assert by reaching the unmarshal path).
+	_, err := client.Get(context.Background(), "100")
+	if err == nil {
+		t.Fatal("expected unmarshal error on 2 MiB junk body, got nil")
+	}
+	// The unmarshal error originates from json.Unmarshal of at most 1 MiB
+	// of input. If the cap were missing, a 2 MiB allocation would still
+	// produce an unmarshal error — so we cannot prove the cap from the
+	// error alone. Instead, exercise the err-status path where the body
+	// flows through ReadAll directly into the message, then bound the
+	// returned message length.
+	client2, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write(body)
+	})
+	err = client2.Put(context.Background(), "100", map[string]string{"k": "v"})
+	if err == nil {
+		t.Fatal("expected 400 error, got nil")
+	}
+	// Error string contains the (trimmed) body; cap-bounded length must
+	// not exceed maxRegistryRespBody plus the static framing prefix.
+	const framingSlack = 256
+	if len(err.Error()) > oneMiB+framingSlack {
+		t.Errorf("error message length %d exceeds 1 MiB cap + slack (%d)", len(err.Error()), oneMiB+framingSlack)
+	}
+}

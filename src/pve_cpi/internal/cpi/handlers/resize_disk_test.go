@@ -351,7 +351,7 @@ func TestHandleResizeDisk_CeilingMath(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Snapshot guard tests (IMP-08).
+// Snapshot guard tests.
 // ---------------------------------------------------------------------------
 
 // resizeDepsWithConfig builds Deps using a caller-supplied *config.CPIConfig.
@@ -578,34 +578,17 @@ func TestHandleResizeDisk_ConfigFetchError(t *testing.T) {
 	}
 }
 
-func TestHandleResizeDisk_NonGSizeUnit(t *testing.T) {
-	// Gap #2: parseDiskSizeGiB rejects non-G size units (e.g. "10M", "1T").
-	// resize_disk.go parseDiskSizeGiB returns an error for any unit that is
-	// not "G"; the handler wraps and propagates it.
-	cases := []struct {
-		name   string
-		optStr string
-	}{
-		{"megabytes", "local-lvm:vm-9001-disk-0,size=10240M"},
-		{"terabytes", "local-lvm:vm-9001-disk-0,size=1T"},
-	}
+func TestHandleResizeDisk_UnknownSizeUnit(t *testing.T) {
+	// parseDiskSizeGiB accepts K/M/G/T/P case-insensitive; any other unit
+	// suffix is rejected. Confirm "xyz" trailing characters trigger the
+	// handler's error path.
+	const diskCID = "local-lvm:vm-9001-disk-0"
+	qemuSvc := resizeQEMUWithDisk("scsi2", "local-lvm:vm-9001-disk-0,size=100xyz", nil)
 
-	for _, tc := range cases {
-		tc := tc
-		t.Run(tc.name, func(t *testing.T) {
-			const diskCID = "local-lvm:vm-9001-disk-0"
-			// resizeQEMUWithDisk sets bareVolid from the first comma-separated
-			// segment, which is the volid itself when no comma exists in the
-			// first segment. Supply the full optStr so the 3rd config call
-			// returns the non-G size unit.
-			qemuSvc := resizeQEMUWithDisk("scsi2", tc.optStr, nil)
-
-			h := handlers.HandleResizeDisk(resizeDeps(qemuSvc, resizeClusterWith(100), nil))
-			_, err := h.Handle(context.Background(), marshalArgs(diskCID, 20480), jsonrpc.Context{})
-			if err == nil {
-				t.Fatalf("expected error for non-G size unit %q", tc.optStr)
-			}
-		})
+	h := handlers.HandleResizeDisk(resizeDeps(qemuSvc, resizeClusterWith(100), nil))
+	_, err := h.Handle(context.Background(), marshalArgs(diskCID, 20480), jsonrpc.Context{})
+	if err == nil {
+		t.Fatal("expected error for unsupported size unit")
 	}
 }
 

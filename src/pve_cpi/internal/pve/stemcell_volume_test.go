@@ -342,7 +342,7 @@ func TestSanitizeStemcellPart_MultibyteUTF8_ProducesAsciiOnly(t *testing.T) {
 		{
 			name:       "CJK middle of name",
 			input:      "ubuntu-中文-jammy", // "ubuntu-中文-jammy"
-			wantOutput: "ubuntu-jammy",               // CJK collapses to single "-"
+			wantOutput: "ubuntu-jammy",    // CJK collapses to single "-"
 		},
 		{
 			name:       "emoji single rune",
@@ -360,8 +360,8 @@ func TestSanitizeStemcellPart_MultibyteUTF8_ProducesAsciiOnly(t *testing.T) {
 			wantOutput: "caf-test",  // 'é' → single '-', collapses with following '-'
 		},
 		{
-			name:       "all non-ascii",
-			input:      "中文", // two CJK runes, 6 bytes total
+			name:  "all non-ascii",
+			input: "中文", // two CJK runes, 6 bytes total
 			// Each rune → '-', consecutive → collapsed, then trimmed → empty.
 			wantOutput: "",
 		},
@@ -407,3 +407,43 @@ func TestSanitizeStemcellPart_MultibyteUTF8_ProducesAsciiOnly(t *testing.T) {
 	}
 }
 
+// ---- TestIsLegacyIntegerStemcellCID ----
+
+// TestIsLegacyIntegerStemcellCID covers the predicate that delete_stemcell
+// uses to treat obsolete integer-only CIDs (e.g. "5042" from the
+// template-clone era) as no-op deletes. Every CID shape the function might
+// encounter at runtime gets a row.
+func TestIsLegacyIntegerStemcellCID(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		cid  string
+		want bool
+	}{
+		{name: "empty string is not legacy", cid: "", want: false},
+		{name: "single digit", cid: "5", want: true},
+		{name: "small integer", cid: "100", want: true},
+		{name: "typical legacy VMID", cid: "5042", want: true},
+		{name: "large integer fits PVE VMID space", cid: "9999", want: true},
+		{name: "very large integer string still all-digits", cid: "1234567890123456", want: true},
+		{name: "prefixed colon CID (current format)", cid: "local-lvm:import/foo.qcow2", want: false},
+		{name: "prefixed colon CID with only digits before colon", cid: "5042:import/foo.qcow2", want: false},
+		{name: "trailing whitespace breaks all-digit", cid: "5042 ", want: false},
+		{name: "leading whitespace breaks all-digit", cid: " 5042", want: false},
+		{name: "leading plus sign", cid: "+5042", want: false},
+		{name: "leading minus sign", cid: "-5042", want: false},
+		{name: "hex prefix", cid: "0x5042", want: false},
+		{name: "non-ASCII digit", cid: "５０４２", want: false}, // fullwidth digits — not [0-9]
+		{name: "alpha-only", cid: "abc", want: false},
+		{name: "alphanumeric mix", cid: "5042a", want: false},
+		{name: "alphanumeric mix leading alpha", cid: "a5042", want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := pve.IsLegacyIntegerStemcellCID(tc.cid)
+			if got != tc.want {
+				t.Errorf("IsLegacyIntegerStemcellCID(%q) = %v; want %v", tc.cid, got, tc.want)
+			}
+		})
+	}
+}

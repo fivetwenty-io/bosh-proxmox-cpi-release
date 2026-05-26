@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"sync"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/configdrive"
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
@@ -14,6 +15,11 @@ import (
 	sdknodes "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/nodes"
 	sdkclient "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/client"
 )
+
+// localISOStorageWarnOnce guards the single-shot warning emitted when the
+// effective iso_storage resolves to "local". One warning per CPI process is
+// sufficient; re-firing on every create_vm would flood operator logs.
+var localISOStorageWarnOnce sync.Once
 
 // configDriveSlot is the SCSI bus slot used to attach the ConfigDrive ISO as
 // a CD-ROM. The stemcell finds it by volume label (CONFIG-2 / config-2), so
@@ -100,6 +106,15 @@ func (a *ConfigDrive) Configure(ctx context.Context, node string, vmid int, cfg 
 		return cpierrors.Cloud("agent configure: vmid must be positive, got %d", vmid)
 	}
 
+	// Warn once per process when iso_storage resolves to "local". Local storage
+	// ISOs are readable by anyone with access to the PVE node-local storage pool,
+	// which is not appropriate for multi-tenant environments.
+	if a.storage == "local" {
+		localISOStorageWarnOnce.Do(func() {
+			a.logger.Warn("iso_storage=local; ConfigDrive ISOs are readable by anyone with access to the PVE node-local storage. Recommend dedicated pool. See docs/operations.md ISO storage section.")
+		})
+	}
+
 	a.logger.Debug("configdrive: configure",
 		log.String("node", node),
 		log.Int("vmid", vmid),
@@ -145,16 +160,18 @@ func (a *ConfigDrive) Configure(ctx context.Context, node string, vmid int, cfg 
 		return cpierrors.Wrap(err, fmt.Sprintf("agent configure vm %d: upload configdrive iso", vmid))
 	}
 
-	if err := a.attachISO(ctx, node, vmid, filename); err != nil {
-		// Best-effort cleanup: if attach failed, remove the uploaded ISO so
-		// it does not linger as an orphan in the storage pool.
+	if attachErr := a.attachISO(ctx, node, vmid, filename); attachErr != nil {
+		// Best-effort cleanup: remove the uploaded ISO so it does not linger as
+		// an orphan in the storage pool. When cleanup also fails the combined
+		// error supersedes the attach-only error so operators see both failure
+		// surfaces in the single returned message. The attach error is wrapped
+		// (via %w) to preserve its BOSH error type classification for retry logic;
+		// the cleanup error is appended as context via %v.
 		if rmErr := a.removeISOFromStorage(ctx, node, filename); rmErr != nil {
-			a.logger.Warn("configdrive: failed to remove orphan ISO after attach failure",
-				log.String("filename", filename),
-				log.Err(rmErr),
-			)
+			return fmt.Errorf("agent configure vm %d: attach configdrive iso failed (%w); cleanup also failed: %v",
+				vmid, attachErr, rmErr)
 		}
-		return cpierrors.Wrap(err, fmt.Sprintf("agent configure vm %d: attach configdrive iso", vmid))
+		return cpierrors.Wrap(attachErr, fmt.Sprintf("agent configure vm %d: attach configdrive iso", vmid))
 	}
 
 	a.logger.Info("configdrive: configured",

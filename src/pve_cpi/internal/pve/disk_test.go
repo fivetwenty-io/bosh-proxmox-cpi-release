@@ -437,3 +437,114 @@ func TestFindVMByDiskVolid_TransientThenSuccess(t *testing.T) {
 		t.Errorf("expected at least 2 ListResources calls (1 transient + 1 success), got %d", listCalls)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// FindUnusedDiskEntries
+// ---------------------------------------------------------------------------
+
+func TestFindUnusedDiskEntries(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name     string
+		cfg      map[string]interface{}
+		wantKeys []string          // expected slot keys in result
+		wantVals map[string]string // expected slot→bare-volid mapping
+		wantLen  int               // expected result length
+	}{
+		{
+			name:    "empty config map returns empty result",
+			cfg:     map[string]interface{}{},
+			wantLen: 0,
+		},
+		{
+			name: "one unused0 entry parsed correctly",
+			cfg: map[string]interface{}{
+				"unused0": "local-lvm:vm-100-disk-0,size=10G",
+			},
+			wantLen:  1,
+			wantKeys: []string{"unused0"},
+			wantVals: map[string]string{"unused0": "local-lvm:vm-100-disk-0"},
+		},
+		{
+			name: "multiple unusedN entries all returned in slot-keyed map",
+			cfg: map[string]interface{}{
+				"unused0": "local-lvm:vm-100-disk-0",
+				"unused1": "local-lvm:vm-100-disk-1",
+				"unused2": "data:vm-200-disk-0",
+			},
+			wantLen: 3,
+			wantVals: map[string]string{
+				"unused0": "local-lvm:vm-100-disk-0",
+				"unused1": "local-lvm:vm-100-disk-1",
+				"unused2": "data:vm-200-disk-0",
+			},
+		},
+		{
+			name: "mixed unused and non-unused keys returns only unused entries",
+			cfg: map[string]interface{}{
+				"scsi0":   "local-lvm:vm-100-disk-0",
+				"net0":    "virtio=aa:bb:cc:dd:ee:ff,bridge=vmbr0",
+				"unused0": "local-lvm:vm-100-disk-1",
+				"name":    "my-vm",
+				"ide2":    "local:cloudinit",
+			},
+			wantLen:  1,
+			wantVals: map[string]string{"unused0": "local-lvm:vm-100-disk-1"},
+		},
+		{
+			name: "unused0 with extra comma-separated options strips options suffix",
+			cfg: map[string]interface{}{
+				"unused0": "local-lvm:vm-100-disk-0,iothread=1,cache=writeback",
+			},
+			wantLen:  1,
+			wantVals: map[string]string{"unused0": "local-lvm:vm-100-disk-0"},
+		},
+		{
+			name: "malformed unused entry without storage colon is skipped (bare value kept)",
+			cfg: map[string]interface{}{
+				// PVE normally always emits "storage:volid"; a value with no colon
+				// is unexpected but FindUnusedDiskEntries must not panic. The bare
+				// string (no comma suffix) is stored as-is under the slot key.
+				"unused0": "garbage_no_colon",
+			},
+			// The function stores the bare value; no error is possible since
+			// FindUnusedDiskEntries has no error return. Callers that need the
+			// storage prefix (ParseDiskCID) will error on their own.
+			wantLen:  1,
+			wantVals: map[string]string{"unused0": "garbage_no_colon"},
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := pve.FindUnusedDiskEntries(tc.cfg)
+
+			if len(got) != tc.wantLen {
+				t.Errorf("len: want %d, got %d; result=%v", tc.wantLen, len(got), got)
+			}
+			for slot, wantVolid := range tc.wantVals {
+				gotVolid, ok := got[slot]
+				if !ok {
+					t.Errorf("slot %q missing from result; result=%v", slot, got)
+					continue
+				}
+				if gotVolid != wantVolid {
+					t.Errorf("slot %q: want volid %q, got %q", slot, wantVolid, gotVolid)
+				}
+			}
+			// No extra keys beyond expected.
+			for slot := range got {
+				if _, expected := tc.wantVals[slot]; !expected && tc.wantLen > 0 {
+					// wantVals might be nil (wantLen==0 case) — only fail when
+					// wantVals is populated and the slot is truly unexpected.
+					if tc.wantVals != nil {
+						t.Errorf("unexpected slot %q in result", slot)
+					}
+				}
+			}
+		})
+	}
+}

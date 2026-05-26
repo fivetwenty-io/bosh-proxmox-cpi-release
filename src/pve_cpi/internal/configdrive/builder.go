@@ -144,13 +144,18 @@ func writeFiles(fs filesystem.FileSystem, payload []byte) error {
 	return nil
 }
 
-func writeISOFile(fs filesystem.FileSystem, name string, data []byte) error {
-	f, err := fs.OpenFile(name, os.O_CREATE|os.O_RDWR)
-	if err != nil {
-		return fmt.Errorf("configdrive: open %s: %w", name, err)
+func writeISOFile(fs filesystem.FileSystem, name string, data []byte) (err error) {
+	f, openErr := fs.OpenFile(name, os.O_CREATE|os.O_RDWR)
+	if openErr != nil {
+		return fmt.Errorf("configdrive: open %s: %w", name, openErr)
 	}
-	if _, err := f.Write(data); err != nil {
-		return fmt.Errorf("configdrive: write %s: %w", name, err)
+	defer func() {
+		if cErr := f.Close(); cErr != nil && err == nil {
+			err = fmt.Errorf("configdrive: close %s: %w", name, cErr)
+		}
+	}()
+	if _, wErr := f.Write(data); wErr != nil {
+		return fmt.Errorf("configdrive: write %s: %w", name, wErr)
 	}
 	return nil
 }

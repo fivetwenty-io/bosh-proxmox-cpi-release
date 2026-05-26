@@ -107,6 +107,14 @@ func TestHandleDeleteNetwork_SDN_WithSubnets(t *testing.T) {
 			deleteSubnetCalls = append(deleteSubnetCalls, subnet)
 			return nil
 		},
+		// Opt in to vnet delete + apply mutations the SDN delete
+		// path runs after subnet teardown.
+		deleteSdnVnetsFn: func(_ context.Context, _ string, _ *sdkcluster.DeleteSdnVnetsParams) error {
+			return nil
+		},
+		updateSdnFn: func(_ context.Context, _ *sdkcluster.UpdateSdnParams) (*sdkcluster.UpdateSdnResponse, error) {
+			return nil, nil
+		},
 	}
 
 	err := invokeDeleteNetwork(t, testDeleteDeps(clusterSvc, false, ""), "net01")
@@ -172,6 +180,13 @@ func TestHandleDeleteNetwork_SDN_ZoneKeptWhenPinned(t *testing.T) {
 			deleteZoneCalled = true
 			return nil
 		},
+		// Opt in to vnet delete + apply mutations.
+		deleteSdnVnetsFn: func(_ context.Context, _ string, _ *sdkcluster.DeleteSdnVnetsParams) error {
+			return nil
+		},
+		updateSdnFn: func(_ context.Context, _ *sdkcluster.UpdateSdnParams) (*sdkcluster.UpdateSdnResponse, error) {
+			return nil, nil
+		},
 	}
 	// auto-manage true, but zone is pinned (== SDNZone)
 	err := invokeDeleteNetwork(t, testDeleteDeps(clusterSvc, true, "pinnedzone"), "net01")
@@ -213,6 +228,11 @@ func TestHandleDeleteNetwork_SDN_ZoneDeletedWhenOwnedAndEmpty(t *testing.T) {
 			applyAfterZoneCalled++
 			return nil, nil
 		},
+		// Opt in to vnet delete — the delete path must call this
+		// before the zone teardown branch is reached.
+		deleteSdnVnetsFn: func(_ context.Context, _ string, _ *sdkcluster.DeleteSdnVnetsParams) error {
+			return nil
+		},
 	}
 	// SDNZone="" so zone is not pinned; auto-manage=true
 	err := invokeDeleteNetwork(t, testDeleteDeps(clusterSvc, true, ""), "net01")
@@ -250,6 +270,13 @@ func TestHandleDeleteNetwork_SDN_ZoneKeptWhenRemainingVnets(t *testing.T) {
 		deleteSdnZonesFn: func(_ context.Context, _ string, _ *sdkcluster.DeleteSdnZonesParams) error {
 			deleteZoneCalled = true
 			return nil
+		},
+		// Opt in to vnet delete + apply mutations.
+		deleteSdnVnetsFn: func(_ context.Context, _ string, _ *sdkcluster.DeleteSdnVnetsParams) error {
+			return nil
+		},
+		updateSdnFn: func(_ context.Context, _ *sdkcluster.UpdateSdnParams) (*sdkcluster.UpdateSdnResponse, error) {
+			return nil, nil
 		},
 	}
 	err := invokeDeleteNetwork(t, testDeleteDeps(clusterSvc, true, ""), "net01")
@@ -488,6 +515,13 @@ func TestHandleDeleteNetwork_SDN_ZoneNotDeletedWhenAutoManageFalse(t *testing.T)
 			deleteZoneCalled = true
 			return nil
 		},
+		// Opt in to vnet delete + apply mutations.
+		deleteSdnVnetsFn: func(_ context.Context, _ string, _ *sdkcluster.DeleteSdnVnetsParams) error {
+			return nil
+		},
+		updateSdnFn: func(_ context.Context, _ *sdkcluster.UpdateSdnParams) (*sdkcluster.UpdateSdnResponse, error) {
+			return nil, nil
+		},
 	}
 	// auto-manage=false
 	err := invokeDeleteNetwork(t, testDeleteDeps(clusterSvc, false, ""), "net01")
@@ -513,9 +547,154 @@ func TestHandleDeleteNetwork_SDN_VnetAlreadyGone(t *testing.T) {
 		deleteSdnVnetsFn: func(_ context.Context, _ string, _ *sdkcluster.DeleteSdnVnetsParams) error {
 			return pveerr.ErrNotFound // already gone
 		},
+		// Opt in to apply mutation — delete path always calls
+		// UpdateSdn after the (idempotent) vnet delete.
+		updateSdnFn: func(_ context.Context, _ *sdkcluster.UpdateSdnParams) (*sdkcluster.UpdateSdnResponse, error) {
+			return nil, nil
+		},
 	}
 	err := invokeDeleteNetwork(t, testDeleteDeps(clusterSvc, false, ""), "net01")
 	if err != nil {
 		t.Fatalf("expected nil on idempotent vnet-already-gone, got: %v", err)
+	}
+}
+
+// -- TestDeleteNetwork_NotFound_Idempotent --
+//
+// Verifies the end-to-end idempotency contract: when the SDN probe reports
+// the vnet is absent AND the bridge fallback also returns 404, the handler
+// must report success. This is the canonical "already deleted by a prior
+// run" shape that BOSH retries can hit.
+
+func TestDeleteNetwork_NotFound_Idempotent(t *testing.T) {
+	clusterSvc := &mockSDNCluster{
+		getSdnVnetsFn: func(_ context.Context, _ string, _ *sdkcluster.GetSdnVnetsParams) (*sdkcluster.GetSdnVnetsResponse, error) {
+			return nil, sdnNotFound()
+		},
+	}
+	nodesSvc := &mockBridgeNodes{
+		deleteNetwork2Fn: func(_ context.Context, _ string, _ string) error {
+			return pveerr.ErrNotFound
+		},
+	}
+	cfg := testConfig()
+	cfg.NetworkMode = "auto"
+	cfg.Node = "pve1"
+	deps := handlers.Deps{
+		Config: cfg,
+		PVE:    &mockPVEClient{clusterSvc: clusterSvc, nodesSvc: nodesSvc},
+		Logger: log.NewNopLogger(),
+	}
+	if err := invokeDeleteNetwork(t, deps, "anything"); err != nil {
+		t.Fatalf("idempotent NotFound must return nil; got: %v", err)
+	}
+}
+
+// -- TestDeleteNetwork_ZoneAutoDelete_OnlyWhenAllConditionsHold --
+//
+// Table-driven test for the zone auto-delete guards in
+// maybeDeleteOrphanedZone. The zone must only be deleted when ALL of the
+// following hold:
+//  1. config.SDNAutoManageZone == true
+//  2. zone observed on vnet != config.SDNZone (the pinned zone is preserved)
+//  3. no remaining vnets reference the zone
+//
+// Each row asserts whether DeleteSdnZones was called.
+
+func TestDeleteNetwork_ZoneAutoDelete_OnlyWhenAllConditionsHold(t *testing.T) {
+	type row struct {
+		name              string
+		autoManage        bool
+		configSDNZone     string
+		observedZone      string
+		remainingVnets    sdkcluster.ListSdnVnetsResponse
+		wantDeleteZone    bool
+		wantApplyAfterMin int // minimum UpdateSdn calls (1 for vnet delete; 2 if zone delete too)
+	}
+
+	rows := []row{
+		{
+			name:              "auto_manage_off_never_deletes_zone",
+			autoManage:        false,
+			configSDNZone:     "",
+			observedZone:      "anyzone",
+			remainingVnets:    sdkcluster.ListSdnVnetsResponse{},
+			wantDeleteZone:    false,
+			wantApplyAfterMin: 1,
+		},
+		{
+			name:              "auto_manage_on_but_zone_is_pinned_config_zone",
+			autoManage:        true,
+			configSDNZone:     "pinned",
+			observedZone:      "pinned",
+			remainingVnets:    sdkcluster.ListSdnVnetsResponse{},
+			wantDeleteZone:    false,
+			wantApplyAfterMin: 1,
+		},
+		{
+			name:          "auto_manage_on_zone_unpinned_but_other_vnets_remain",
+			autoManage:    true,
+			configSDNZone: "",
+			observedZone:  "shared",
+			remainingVnets: sdkcluster.ListSdnVnetsResponse{
+				json.RawMessage(`{"vnet":"other","zone":"shared"}`),
+			},
+			wantDeleteZone:    false,
+			wantApplyAfterMin: 1,
+		},
+		{
+			name:              "auto_manage_on_zone_unpinned_zone_empty_deletes",
+			autoManage:        true,
+			configSDNZone:     "",
+			observedZone:      "orphan",
+			remainingVnets:    sdkcluster.ListSdnVnetsResponse{},
+			wantDeleteZone:    true,
+			wantApplyAfterMin: 2,
+		},
+	}
+
+	for _, r := range rows {
+		t.Run(r.name, func(t *testing.T) {
+			var deleteZoneCalled bool
+			var updateSdnCalls int
+			remainingCopy := r.remainingVnets
+
+			clusterSvc := &mockSDNCluster{
+				getSdnVnetsFn: func(_ context.Context, _ string, _ *sdkcluster.GetSdnVnetsParams) (*sdkcluster.GetSdnVnetsResponse, error) {
+					raw, _ := json.Marshal(map[string]any{"vnet": "net01", "zone": r.observedZone})
+					out := sdkcluster.GetSdnVnetsResponse(raw)
+					return &out, nil
+				},
+				listSdnVnetsSubnetsFn: func(_ context.Context, _ string, _ *sdkcluster.ListSdnVnetsSubnetsParams) (*sdkcluster.ListSdnVnetsSubnetsResponse, error) {
+					empty := sdkcluster.ListSdnVnetsSubnetsResponse{}
+					return &empty, nil
+				},
+				listSdnVnetsFn: func(_ context.Context, _ *sdkcluster.ListSdnVnetsParams) (*sdkcluster.ListSdnVnetsResponse, error) {
+					return &remainingCopy, nil
+				},
+				deleteSdnVnetsFn: func(_ context.Context, _ string, _ *sdkcluster.DeleteSdnVnetsParams) error {
+					return nil
+				},
+				deleteSdnZonesFn: func(_ context.Context, _ string, _ *sdkcluster.DeleteSdnZonesParams) error {
+					deleteZoneCalled = true
+					return nil
+				},
+				updateSdnFn: func(_ context.Context, _ *sdkcluster.UpdateSdnParams) (*sdkcluster.UpdateSdnResponse, error) {
+					updateSdnCalls++
+					return nil, nil
+				},
+			}
+
+			err := invokeDeleteNetwork(t, testDeleteDeps(clusterSvc, r.autoManage, r.configSDNZone), "net01")
+			if err != nil {
+				t.Fatalf("unexpected: %v", err)
+			}
+			if deleteZoneCalled != r.wantDeleteZone {
+				t.Errorf("DeleteSdnZones called=%v, want=%v", deleteZoneCalled, r.wantDeleteZone)
+			}
+			if updateSdnCalls < r.wantApplyAfterMin {
+				t.Errorf("UpdateSdn calls=%d, want >= %d", updateSdnCalls, r.wantApplyAfterMin)
+			}
+		})
 	}
 }

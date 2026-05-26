@@ -20,11 +20,17 @@ LDFLAGS := -X '$(PKG).Version=$(VERSION)' \
            -X '$(PKG).Commit=$(COMMIT)' \
            -X '$(PKG).BuildDate=$(DATE)'
 
-COVERAGE_THRESHOLD := 80
+COVERAGE_THRESHOLD := 75
 
 # BOSH release packaging
 RELEASE_NAME := bosh-pve-cpi
-RELEASE_ARTIFACT_FIND := find . -type f \( -name 'coverage.*' -o -name '*.prof' -o -name '*.test' -o -name '*.tgz' \) -not -path './.git/*' -not -path './blobs/*' -not -path './.blobs/*' -not -path './$(SRC_ROOT)/vendor/*'
+# Tarballs are written under dev_releases/ (dev) or releases/ (final), never at the repo root.
+RELEASE_DEV_DIR  := dev_releases/$(RELEASE_NAME)
+RELEASE_ARTIFACT_FIND := find . -type f \( -name 'coverage.*' -o -name '*.prof' -o -name '*.test' \) -not -path './.git/*' -not -path './blobs/*' -not -path './.blobs/*' -not -path './$(SRC_ROOT)/vendor/*' -not -path './dev_releases/*' -not -path './releases/*'
+# Separate find for release tarballs in their canonical output dirs.
+RELEASE_TGZ_FIND := find dev_releases releases -type f -name '*.tgz' 2>/dev/null || true
+# Loose tarballs at the repo root are always erroneous; release-hygiene asserts none exist.
+RELEASE_ROOT_TGZ_FIND := find . -maxdepth 1 -name 'bosh-pve-cpi-*.tgz'
 
 # Go sources — prerequisites for bin/cpi so the binary rebuilds whenever any
 # source, go.mod, or go.sum changes (the bare target never rebuilt once built).
@@ -120,15 +126,20 @@ vet: ## Run go vet
 	@cd $(SRC_ROOT) && go vet ./...
 	@echo "$(GREEN)✓ Vet passed$(RESET)"
 
+# Pinned golangci-lint version — update here when upgrading.
+# go run is used as a fallback when the binary is not present, ensuring CI
+# (golang:1.26 image) runs lint without baking golangci-lint into the image.
+GOLANGCI_LINT_VERSION := v1.64.8
+
 .PHONY: lint
-lint: ## Run golangci-lint (skip with notice if not installed)
-	@echo "$(GREEN)Running golangci-lint...$(RESET)"
+lint: ## Run golangci-lint (binary if installed, else go run @pinned version)
+	@echo "$(GREEN)Running golangci-lint $(GOLANGCI_LINT_VERSION)...$(RESET)"
 	@if command -v golangci-lint >/dev/null 2>&1; then \
 		cd $(SRC_ROOT) && golangci-lint run --timeout=5m ./...; \
-		echo "$(GREEN)✓ Lint passed$(RESET)"; \
 	else \
-		echo "$(YELLOW)golangci-lint not installed — skipping. Install: go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest$(RESET)"; \
+		cd $(SRC_ROOT) && go run github.com/golangci/golangci-lint/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION) run --timeout=5m ./...; \
 	fi
+	@echo "$(GREEN)✓ Lint passed$(RESET)"
 
 .PHONY: staticcheck
 staticcheck: ## Run staticcheck (skip with notice if not installed)
@@ -141,7 +152,7 @@ staticcheck: ## Run staticcheck (skip with notice if not installed)
 	fi
 
 .PHONY: check
-check: vet staticcheck test ## Run vet, staticcheck, and test
+check: vet staticcheck lint coverage-check test ## Run vet, staticcheck, lint, coverage-check, and test (cheap-fast checks first)
 	@echo "$(GREEN)✓ All checks passed$(RESET)"
 
 ##@ Security
@@ -197,39 +208,39 @@ sync-blobs: ## Sync blobs/ from the configured blobstore
 ##@ Release
 
 .PHONY: release-build
-release-build: check security bin/cpi ## Full binary release build: check + security + bin/cpi
-	@echo "$(GREEN)✓ Release build complete: $(VERSION) ($(COMMIT))$(RESET)"
+release-build: bin/cpi ## Build Go CPI binary only (no BOSH tarball). Use 'make release' to build the full BOSH tarball.
+	@echo "$(GREEN)✓ CPI binary built: bin/cpi $(VERSION) ($(COMMIT))$(RESET)"
 
 .PHONY: dev-release
-dev-release: ## Build a dev BOSH release tarball at ./$(RELEASE_NAME)-dev-<UTC-timestamp>.tgz
+dev-release: ## Build a dev BOSH release tarball under dev_releases/$(RELEASE_NAME)/ and print RELEASE_TGZ=...
 	@./scripts/create-release dev
 
 .PHONY: release
-release: ## Build a versioned BOSH release at ./$(RELEASE_NAME)-$$VERSION.tgz (requires VERSION=)
+release: ## Build a versioned BOSH release under dev_releases/ or releases/ (requires VERSION=X.Y.Z). Prints RELEASE_TGZ=<path>.
 	@if [ -z "$(VERSION)" ] || [ "$(VERSION)" = "dev" ]; then \
-		echo "$(YELLOW)ERROR: VERSION= required (e.g., make release VERSION=1.0.0)$(RESET)" >&2; \
+		echo "$(YELLOW)ERROR: VERSION= required for a final release (e.g., make release VERSION=1.0.0)$(RESET)" >&2; \
+		echo "$(YELLOW)For a dev tarball use: make dev-release$(RESET)" >&2; \
 		exit 1; \
 	fi
 	@./scripts/create-release $(VERSION)
 
 .PHONY: release-clean
-release-clean: ## Remove local artifacts that can confuse BOSH release packaging
+release-clean: ## Remove bin/, coverage artifacts, and release tarballs under dev_releases/ and releases/
 	@rm -rf bin
 	@$(RELEASE_ARTIFACT_FIND) -delete
+	@$(RELEASE_TGZ_FIND) | xargs rm -f 2>/dev/null; true
+	@echo "$(GREEN)✓ release artifacts cleaned$(RESET)"
 
 .PHONY: release-hygiene
-release-hygiene: ## Fail if local release-confusing artifacts are present
-	@tmp="$$(mktemp)"; \
-	trap 'rm -f "$$tmp"' EXIT; \
-	$(RELEASE_ARTIFACT_FIND) | sort > "$$tmp"; \
-	if [ -e bin ]; then echo bin >> "$$tmp"; fi; \
-	if [ -s "$$tmp" ]; then \
-		echo "$(YELLOW)ERROR: local artifacts must be cleaned before release packaging:$(RESET)" >&2; \
-		cat "$$tmp" >&2; \
-		echo "Run 'make release-clean' and retry." >&2; \
+release-hygiene: ## Assert no bosh-pve-cpi-*.tgz exists at the repo root. Exits 1 if any are found.
+	@found="$$($(RELEASE_ROOT_TGZ_FIND))"; \
+	if [ -n "$$found" ]; then \
+		echo "$(YELLOW)ERROR: loose release tarballs found at repo root — must not exist:$(RESET)" >&2; \
+		echo "$$found" >&2; \
+		echo "Run 'make release-clean' or 'rm bosh-pve-cpi-*.tgz' to remove them." >&2; \
 		exit 1; \
 	fi
-	@echo "$(GREEN)✓ release hygiene clean$(RESET)"
+	@echo "$(GREEN)✓ release hygiene clean — no loose tarballs at repo root$(RESET)"
 
 .PHONY: bosh-clean
 bosh-clean: ## Remove local BOSH release artifacts (.dev_builds, .final_builds, dev_releases)

@@ -53,7 +53,13 @@ func NewAgent(cfg *config.CPIConfig, pveClient pve.Client, logger *log.Logger) (
 		if cfg.RegistryEndpoint == "" {
 			return nil, cpierrors.Cloud("agent.NewAgent: registry_endpoint is required when agent_mode=registry")
 		}
-		regClient := registry.NewClient(cfg.RegistryEndpoint, cfg.RegistryUser, cfg.RegistryPassword)
+		regClient, err := registry.NewClientWithOptions(
+			cfg.RegistryEndpoint, cfg.RegistryUser, cfg.RegistryPassword,
+			registry.Options{CACertPEM: cfg.RegistryCACertPEM},
+		)
+		if err != nil {
+			return nil, cpierrors.Cloud("agent.NewAgent: build registry client: %s", err.Error())
+		}
 		return NewRegistryAgent(regClient, logger), nil
 
 	case "noagent":

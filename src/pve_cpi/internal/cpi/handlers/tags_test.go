@@ -60,11 +60,11 @@ func TestBuildCustomTags_DeterministicSort(t *testing.T) {
 func TestBuildCustomTags_SkipEmptyAndSanitize(t *testing.T) {
 	t.Parallel()
 	in := map[string]string{
-		"bad key":   "with spaces",
-		"empty":     "",
-		"":          "ignored",
-		"env":       "prod",
-		"--only--":  "x",
+		"bad key":  "with spaces",
+		"empty":    "",
+		"":         "ignored",
+		"env":      "prod",
+		"--only--": "x",
 	}
 	got := buildCustomTags(in)
 	joined := strings.Join(got, ",")
@@ -178,8 +178,8 @@ func TestSanitizeVMName(t *testing.T) {
 		{"job_with_underscores/abc", "job-with-underscores-abc"},
 		{"a/b/c", "a-b-c"},
 		{"---leading-and-trailing---", "leading-and-trailing"},
-		{"a..b", "a-b"},          // consecutive invalids collapse
-		{"a/_/b", "a-b"},         // mixed invalids collapse
+		{"a..b", "a-b"},  // consecutive invalids collapse
+		{"a/_/b", "a-b"}, // mixed invalids collapse
 		{"MixedCase/123", "MixedCase-123"},
 		{"////", ""}, // all invalids collapse to empty after trim
 	}

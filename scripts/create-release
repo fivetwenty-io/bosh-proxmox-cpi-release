@@ -7,12 +7,18 @@
 #   scripts/create-release dev        # dev release (timestamped)
 #   scripts/create-release X.Y.Z      # final release
 #
+# Output contract:
+#   - Tarball is written to dev_releases/bosh-pve-cpi/<name>.tgz (dev) or
+#     releases/bosh-pve-cpi/<name>.tgz (final), matching BOSH directory conventions.
+#   - The absolute path to the tarball is printed to stdout as the last line:
+#       RELEASE_TGZ=/abs/path/to/bosh-pve-cpi-X.tgz
+#   - No writes to manifests/bosh/vars.yml occur. The operator must pass the path
+#     explicitly via bosh int/deploy, e.g.:
+#       bosh int bosh.yml --var release_artifact_path=$RELEASE_TGZ [...]
+#   - For a final release: git add + commit + tag v<X.Y.Z>
+#
 # Side effects:
 #   - removes prior bin/, coverage, and *.tgz artifacts via `make release-clean`
-#   - writes ./bosh-pve-cpi-dev-<UTC-ts>.tgz (dev) or ./bosh-pve-cpi-<X.Y.Z>.tgz (final)
-#   - if manifests/bosh/vars.yml exists, rewrites its `pve_cpi_release_path:` line to
-#     point at the newly built tarball's absolute path
-#   - for a final release: git add + commit + tag v<X.Y.Z>
 
 set -euo pipefail
 
@@ -31,37 +37,62 @@ make release-clean
 
 if [[ "${VERSION}" == "dev" ]]; then
   TS="$(date -u +%Y%m%d%H%M%S)"
-  TARBALL="${REPO_ROOT}/${RELEASE_NAME}-dev-${TS}.tgz"
+  TARBALL_DIR="${REPO_ROOT}/dev_releases/${RELEASE_NAME}"
+  mkdir -p "${TARBALL_DIR}"
+  TARBALL="${TARBALL_DIR}/${RELEASE_NAME}-dev-${TS}.tgz"
   echo -e "${GREEN}==> bosh create-release (dev, ts=${TS})${RESET}"
   bosh create-release --force --tarball="${TARBALL}"
 else
-  TARBALL="${REPO_ROOT}/${RELEASE_NAME}-${VERSION}.tgz"
+  TARBALL_DIR="${REPO_ROOT}/releases/${RELEASE_NAME}"
+  mkdir -p "${TARBALL_DIR}"
+  TARBALL="${TARBALL_DIR}/${RELEASE_NAME}-${VERSION}.tgz"
   echo -e "${GREEN}==> bosh create-release (version=${VERSION})${RESET}"
   bosh create-release --force --version="${VERSION}" --tarball="${TARBALL}"
 fi
 
 echo -e "${GREEN}✓ ${TARBALL}${RESET}"
-
-VARS_FILE="${REPO_ROOT}/manifests/bosh/vars.yml"
-if [[ -f "${VARS_FILE}" ]]; then
-  echo -e "${GREEN}==> Updating pve_cpi_release_path in manifests/bosh/vars.yml${RESET}"
-  # Portable across BSD/GNU sed by using awk + temp file rather than sed -i.
-  tmp="$(mktemp)"
-  awk -v path="${TARBALL}" '
-    /^[[:space:]]*pve_cpi_release_path:/ {
-      sub(/:.*/, ": " path)
-    }
-    { print }
-  ' "${VARS_FILE}" > "${tmp}"
-  mv "${tmp}" "${VARS_FILE}"
-  echo "   pve_cpi_release_path: ${TARBALL}"
-else
-  echo -e "${YELLOW}note: manifests/bosh/vars.yml not present — skipping vars rewrite${RESET}"
-fi
+echo ""
+echo -e "${YELLOW}Set BOSH var: --var release_artifact_path=${TARBALL}${RESET}"
+echo "RELEASE_TGZ=${TARBALL}"
 
 if [[ "${VERSION}" != "dev" ]]; then
   echo -e "${GREEN}==> Committing final release ${VERSION}${RESET}"
+
+  # --- secret guard -----------------------------------------------------------
+  # Stage all tracked changes so the check inspects what would actually land in
+  # the commit.  We run the check BEFORE git commit so any bail is non-destructive.
   git add .
+
+  # Scan the index for files whose names look like credentials.
+  STAGED_SECRETS="$(git diff --cached --name-only | grep -E '(creds|vars|secret)\.yml$' || true)"
+
+  if [[ -n "${STAGED_SECRETS}" ]]; then
+    if [[ "${ALLOW_SECRET_COMMIT:-0}" == "1" ]]; then
+      echo -e "${YELLOW}"
+      echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+      echo "WARNING: ALLOW_SECRET_COMMIT=1 — bypassing secret guard."
+      echo "The following files will be committed and may contain credentials:"
+      while IFS= read -r f; do echo "  $f"; done <<< "${STAGED_SECRETS}"
+      echo "Ensure these files contain only template/example values."
+      echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+      echo -e "${RESET}"
+    else
+      echo -e "${YELLOW}"
+      echo "ERROR: Secret guard blocked the commit." >&2
+      echo "The following staged files match the credential name pattern" >&2
+      echo "  (creds|vars|secret).yml:" >&2
+      while IFS= read -r f; do echo "  $f" >&2; done <<< "${STAGED_SECRETS}"
+      echo "" >&2
+      echo "These files are in .gitignore and must not be committed." >&2
+      echo "If this file contains only non-secret example values and you" >&2
+      echo "intentionally want to commit it, re-run with:" >&2
+      echo "  ALLOW_SECRET_COMMIT=1 scripts/create-release ${VERSION}" >&2
+      echo -e "${RESET}" >&2
+      exit 1
+    fi
+  fi
+  # --- end secret guard -------------------------------------------------------
+
   git commit -m "Final release ${VERSION}"
   git tag -a "v${VERSION}" -m "Version ${VERSION}"
   echo -e "${YELLOW}Don't forget: git push --follow-tags${RESET}"

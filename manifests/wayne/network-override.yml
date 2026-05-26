@@ -1,4 +1,10 @@
 ---
+# ============================================================================
+# PAIRED OVERRIDE: When applying this network-override to BOSH deploys, also
+# apply ./cf-cloud-config-override.yml so cf/cloud-config subnets match.
+# Mismatch re-triggers the tailscale LAN route hazard (see memory + docs).
+# ============================================================================
+#
 # Wayne lab network override — lvnet001 (10.64.64.0/18)
 #
 # Apply after manifests/bosh/cpi.yml. Overrides the default network

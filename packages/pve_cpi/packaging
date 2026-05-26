@@ -1,36 +1,108 @@
 #!/bin/bash
+# BOSH packaging script for the pve_cpi binary.
+# Runs inside a BOSH compilation VM (Linux/amd64).  All compilation
+# happens vendor-only (no network) and produces a linux/amd64 ELF binary.
 set -euo pipefail
 
+# ---------------------------------------------------------------------------
+# 1. Locate Go toolchain
+# ---------------------------------------------------------------------------
 GOROOT=/var/vcap/packages/golang-1.26
 if [ ! -d "${GOROOT}" ]; then
+  # Relative path used by `bosh create-env` local compilation.
   GOROOT="$(dirname "${BOSH_INSTALL_TARGET}")/golang-1.26"
 fi
-# Packaged Go is Linux ELF; fall back to host `go` if it can't execute here
-# (e.g. macOS operator host running `bosh create-env`).
+
+# Packaged Go is a Linux ELF; on a macOS operator host running `bosh
+# create-env` it cannot execute.  Fall back to the host `go` binary in
+# that case, but WARN loudly when the host and target platforms differ.
 if ! "${GOROOT}/bin/go" version >/dev/null 2>&1; then
   if command -v go >/dev/null 2>&1; then
     GOROOT="$(go env GOROOT)"
+    HOST_GOOS="$(go env GOOS)"
+    HOST_GOARCH="$(go env GOARCH)"
+    if [ "${HOST_GOOS}" != "linux" ] || [ "${HOST_GOARCH}" != "amd64" ]; then
+      echo "WARNING: packaged Go (linux/amd64 ELF) cannot execute on this host" >&2
+      echo "WARNING: falling back to host go (${HOST_GOOS}/${HOST_GOARCH})" >&2
+      echo "WARNING: cross-compilation is required — ensure the host toolchain" >&2
+      echo "WARNING: supports GOOS=linux GOARCH=amd64 or this binary will not" >&2
+      echo "WARNING: run on the target Linux VM." >&2
+    fi
   else
     echo "ERROR: packaged Go cannot execute on this host and no host 'go' found in PATH" >&2
     exit 1
   fi
 fi
-export GOROOT
-export PATH=${GOROOT}/bin:${PATH}
-export GOCACHE=${BOSH_COMPILE_TARGET}/.gocache
-export GOMODCACHE=${BOSH_COMPILE_TARGET}/.gomodcache
 
+export GOROOT
+export PATH="${GOROOT}/bin:${PATH}"
+
+# ---------------------------------------------------------------------------
+# 2. Compilation environment
+# ---------------------------------------------------------------------------
+export GOCACHE="${BOSH_COMPILE_TARGET}/.gocache"
+export GOMODCACHE="${BOSH_COMPILE_TARGET}/.gomodcache"
+
+# Force vendor mode globally so no stray `go` sub-invocation hits the network.
+export GOFLAGS="-mod=vendor"
+
+# Assert target platform — BOSH compilation VMs are always linux/amd64.
+# Set explicitly so cross-compilation from macOS produces the right binary.
+export GOOS=linux
+export GOARCH=amd64
+
+# Verify the toolchain can cross-compile for the target before attempting build.
+if ! go version >/dev/null 2>&1; then
+  echo "ERROR: go binary at ${GOROOT}/bin/go is not executable" >&2
+  exit 1
+fi
+ACTUAL_GOOS="$(go env GOOS)"
+ACTUAL_GOARCH="$(go env GOARCH)"
+if [ "${ACTUAL_GOOS}" != "linux" ] || [ "${ACTUAL_GOARCH}" != "amd64" ]; then
+  echo "ERROR: go env reports GOOS=${ACTUAL_GOOS} GOARCH=${ACTUAL_GOARCH}" >&2
+  echo "ERROR: expected linux/amd64; the compiled binary would be unusable." >&2
+  exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# 3. Sanitize BOSH_PACKAGE_VERSION for use in ldflags.
+# The raw value may contain characters that are not safe inside Go -ldflags
+# (e.g. embedded spaces from dirty git tags).  Strip everything except
+# alphanumerics, dots, dashes, and plus signs.
+# ---------------------------------------------------------------------------
+BOSH_PACKAGE_VERSION_SANITIZED="$(printf '%s' "${BOSH_PACKAGE_VERSION:-0.0.0+dev}" | tr -cd '[:alnum:].-+')"
+if [ -z "${BOSH_PACKAGE_VERSION_SANITIZED}" ]; then
+  BOSH_PACKAGE_VERSION_SANITIZED="0.0.0+dev"
+fi
+
+# ---------------------------------------------------------------------------
+# 4. Build
+# ---------------------------------------------------------------------------
 mkdir -p "${BOSH_INSTALL_TARGET}/bin"
 
+echo "==> Building pve_cpi (${GOOS}/${GOARCH}) version=${BOSH_PACKAGE_VERSION_SANITIZED}"
 pushd "${BOSH_COMPILE_TARGET}/pve_cpi" >/dev/null
+
   go build \
-    -mod=vendor \
     -trimpath \
     -ldflags "-s -w \
-      -X github.com/fivetwenty-io/bosh-pve-cpi/internal/version.Version=${BOSH_PACKAGE_VERSION:-0.0.0+dev} \
+      -X github.com/fivetwenty-io/bosh-pve-cpi/internal/version.Version=${BOSH_PACKAGE_VERSION_SANITIZED} \
       -X github.com/fivetwenty-io/bosh-pve-cpi/internal/version.BuildDate=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     -o "${BOSH_INSTALL_TARGET}/bin/cpi" \
     ./cmd/cpi
+
 popd >/dev/null
+
+# Confirm the binary is a Linux ELF (sanity check on the host-fallback path).
+if command -v file >/dev/null 2>&1; then
+  BIN_TYPE="$(file -b "${BOSH_INSTALL_TARGET}/bin/cpi")"
+  case "${BIN_TYPE}" in
+    ELF*) ;;
+    *)
+      echo "WARNING: produced binary does not appear to be an ELF: ${BIN_TYPE}" >&2
+      echo "WARNING: the binary may not execute on the Linux target VM." >&2
+      ;;
+  esac
+fi
 
 echo "==> pve_cpi built at ${BOSH_INSTALL_TARGET}/bin/cpi"

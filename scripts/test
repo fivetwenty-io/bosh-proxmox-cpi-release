@@ -77,10 +77,12 @@ def run(
         return 0
 
     child_env = os.environ.copy()
-    if not sys.stdout.isatty():
-        child_env["NO_COLOR"] = "1"
     if env:
         child_env.update(env)
+    # Inject NO_COLOR when stdout is not a TTY and the caller has not supplied
+    # an explicit NO_COLOR override in env — caller-supplied value wins.
+    if not sys.stdout.isatty() and "NO_COLOR" not in child_env:
+        child_env["NO_COLOR"] = "1"
 
     try:
         result = subprocess.run(

@@ -1,0 +1,19 @@
+---
+# CredHub variable declarations for the PVE CPI deployment.
+#
+# Apply with:
+#   credhub set -n /<director>/<deployment>/pve_password  -t password -v <secret>
+#   credhub set -n /<director>/<deployment>/pve_api_token -t password -v <secret>
+#
+# Or generate via the BOSH director's CredHub integration: add this file to the
+# manifest's `variables:` block (or merge with `bosh int -o`) and let the director
+# auto-generate / fetch the credentials on `bosh deploy`.
+#
+# Both credentials are typed `password` (opaque secret string). Provide exactly
+# one of pve_password or pve_api_token; the CPI's config validator rejects a
+# config with both set or neither set.
+variables:
+  - name: pve_password
+    type: password
+  - name: pve_api_token
+    type: password

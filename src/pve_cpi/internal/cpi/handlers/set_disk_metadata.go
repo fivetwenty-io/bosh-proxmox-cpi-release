@@ -224,7 +224,7 @@ func findVMsHostingDisk(ctx context.Context, deps Deps, diskCID string) ([]attac
 func persistMetadata(ctx context.Context, deps Deps, vm attachedVM, diskCID string, metadata map[string]any) error {
 	cfg, err := deps.PVE.QEMU().Config(ctx, vm.node, vm.vmid)
 	if err != nil {
-		return cpierrors.Wrap(err, fmt.Sprintf("set_disk_metadata: fetch VM config (node=%s vmid=%d)", vm.node, vm.vmid))
+		return cpierrors.Wrap(pve.WrapError(err), fmt.Sprintf("set_disk_metadata: fetch VM config (node=%s vmid=%d)", vm.node, vm.vmid))
 	}
 
 	// Extract current description.
@@ -270,7 +270,7 @@ func persistMetadata(ctx context.Context, deps Deps, vm attachedVM, diskCID stri
 		Description: &newDesc,
 	}
 	if updateErr := deps.PVE.Nodes().UpdateQemuConfig(ctx, vm.node, vmidStr, updateParams); updateErr != nil {
-		return cpierrors.Wrap(updateErr,
+		return cpierrors.Wrap(pve.WrapError(updateErr),
 			fmt.Sprintf("set_disk_metadata: UpdateQemuConfig (node=%s vmid=%d)", vm.node, vm.vmid),
 		)
 	}
@@ -296,7 +296,7 @@ func applyCustomTagsToVM(ctx context.Context, deps Deps, node string, vmid int, 
 
 	cfg, err := deps.PVE.QEMU().Config(ctx, node, vmid)
 	if err != nil {
-		return cpierrors.Wrap(err,
+		return cpierrors.Wrap(pve.WrapError(err),
 			fmt.Sprintf("set_disk_metadata: fetch VM config for tag apply (node=%s vmid=%d)", node, vmid),
 		)
 	}
@@ -374,7 +374,7 @@ func applyCustomTagsToVM(ctx context.Context, deps Deps, node string, vmid int, 
 		Tags:        &mergedTags,
 	}
 	if updateErr := deps.PVE.Nodes().UpdateQemuConfig(ctx, node, vmidStr, updateParams); updateErr != nil {
-		return cpierrors.Wrap(updateErr,
+		return cpierrors.Wrap(pve.WrapError(updateErr),
 			fmt.Sprintf("set_disk_metadata: UpdateQemuConfig tags (node=%s vmid=%d)", node, vmid),
 		)
 	}

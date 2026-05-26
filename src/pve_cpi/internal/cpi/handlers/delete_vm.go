@@ -227,7 +227,30 @@ func HandleDeleteVM(deps Deps) cpi.Handler {
 			}
 			return nil, cpierrors.Wrap(pve.WrapError(deleteErr), fmt.Sprintf("delete_vm: delete VM %s", vmCID))
 		}
-		_ = deleteResp // response is a raw JSON blob; no fields needed
+
+		// Await the destroy task so the VM is fully purged from PVE before we
+		// return. DeleteQemu returns a UPID as a json.RawMessage; an empty or
+		// null response means PVE completed synchronously and no await is needed.
+		if deleteResp != nil {
+			deleteUPID, upidErr := pve.UPIDFromRaw(*deleteResp)
+			if upidErr != nil {
+				// Malformed UPID is unexpected but non-fatal: the delete call
+				// already succeeded; log and continue rather than fail the operation.
+				logger.Warn("delete_vm: cannot parse UPID from delete response -- skipping await",
+					log.Err(upidErr))
+			} else if deleteUPID != "" {
+				if awaitErr := pve.AwaitTaskWithLogger(ctx, deps.PVE, node, deleteUPID, logger); awaitErr != nil {
+					// NotFound or PmxcfsConfigMissing during destroy-await means
+					// the VM was already gone by the time we polled -- idempotent.
+					if pve.IsNotFound(awaitErr) || pve.IsPmxcfsConfigMissing(awaitErr) {
+						logger.Info("delete_vm: VM config missing during destroy await -- treating as already deleted")
+					} else {
+						return nil, cpierrors.Wrap(pve.WrapError(awaitErr),
+							fmt.Sprintf("delete_vm: await destroy task for VM %s", vmCID))
+					}
+				}
+			}
+		}
 
 		// --- agent cleanup ---
 		logger.Debug("delete_vm: calling agent.Remove")

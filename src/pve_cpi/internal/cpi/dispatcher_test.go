@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/cpi"
@@ -11,6 +12,15 @@ import (
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
 )
+
+// mustRegister calls d.Register and fails the test on error. All names in tests
+// are canonical; an error here indicates a test-authoring mistake.
+func mustRegister(t *testing.T, d *cpi.Dispatcher, method string, h cpi.Handler) {
+	t.Helper()
+	if err := d.Register(method, h); err != nil {
+		t.Fatalf("Register(%q): unexpected error: %v", method, err)
+	}
+}
 
 // nopLogger returns a no-op log.Logger suitable for tests that do not assert log output.
 func nopLogger() *log.Logger { return log.NewNopLogger() }
@@ -60,7 +70,7 @@ func TestRegister_Overrides(t *testing.T) {
 	d := cpi.NewDispatcher(nopLogger())
 
 	called := false
-	d.Register("info", cpi.HandlerFunc(func(_ context.Context, _ []json.RawMessage, _ jsonrpc.Context) (any, error) {
+	mustRegister(t, d, "info", cpi.HandlerFunc(func(_ context.Context, _ []json.RawMessage, _ jsonrpc.Context) (any, error) {
 		called = true
 		return map[string]string{"api_version": "2"}, nil
 	}))
@@ -107,7 +117,7 @@ func TestHandle_HandlerReturnsResult(t *testing.T) {
 	d := cpi.NewDispatcher(nopLogger())
 
 	want := map[string]string{"stemcell_id": "sc-abc123"}
-	d.Register("create_stemcell", cpi.HandlerFunc(func(_ context.Context, _ []json.RawMessage, _ jsonrpc.Context) (any, error) {
+	mustRegister(t, d, "create_stemcell", cpi.HandlerFunc(func(_ context.Context, _ []json.RawMessage, _ jsonrpc.Context) (any, error) {
 		return want, nil
 	}))
 
@@ -141,7 +151,7 @@ func TestHandle_HandlerReturnsError(t *testing.T) {
 	d := cpi.NewDispatcher(nopLogger())
 
 	vmCID := "vm-missing-001"
-	d.Register("delete_vm", cpi.HandlerFunc(func(_ context.Context, _ []json.RawMessage, _ jsonrpc.Context) (any, error) {
+	mustRegister(t, d, "delete_vm", cpi.HandlerFunc(func(_ context.Context, _ []json.RawMessage, _ jsonrpc.Context) (any, error) {
 		return nil, cpierrors.VMNotFound(vmCID)
 	}))
 
@@ -167,7 +177,7 @@ func TestHandle_HandlerReturnsError(t *testing.T) {
 func TestHandle_HandlerReturnsPlainError(t *testing.T) {
 	d := cpi.NewDispatcher(nopLogger())
 
-	d.Register("has_vm", cpi.HandlerFunc(func(_ context.Context, _ []json.RawMessage, _ jsonrpc.Context) (any, error) {
+	mustRegister(t, d, "has_vm", cpi.HandlerFunc(func(_ context.Context, _ []json.RawMessage, _ jsonrpc.Context) (any, error) {
 		return nil, errors.New("pve api timeout")
 	}))
 
@@ -284,9 +294,11 @@ func TestDispatcher_ConcurrentRegisterHandle_NoDataRace(t *testing.T) {
 				if n%2 == 0 {
 					method = "create_stemcell"
 				}
-				d.Register(method, cpi.HandlerFunc(func(_ context.Context, _ []json.RawMessage, _ jsonrpc.Context) (any, error) {
+				if err := d.Register(method, cpi.HandlerFunc(func(_ context.Context, _ []json.RawMessage, _ jsonrpc.Context) (any, error) {
 					return map[string]int{"n": n}, nil
-				}))
+				})); err != nil {
+					t.Errorf("goroutine %d: Register(%q): unexpected error: %v", n, method, err)
+				}
 			}(i)
 		}
 		// Reader goroutines: concurrently call Handle.
@@ -314,6 +326,63 @@ func TestDispatcher_ConcurrentRegisterHandle_NoDataRace(t *testing.T) {
 	<-done
 }
 
+// --------------------------------------------------------------------------
+// TestRegister_RejectsUnknownMethod
+// --------------------------------------------------------------------------
+
+func TestRegister_RejectsUnknownMethod(t *testing.T) {
+	d := cpi.NewDispatcher(nopLogger())
+	err := d.Register("not_a_real_method", cpi.HandlerFunc(func(_ context.Context, _ []json.RawMessage, _ jsonrpc.Context) (any, error) {
+		return nil, nil
+	}))
+	if err == nil {
+		t.Fatal("Register: expected error for unknown method; got nil")
+	}
+	if !strings.Contains(err.Error(), "unknown CPI method") {
+		t.Errorf("Register: error message = %q; want to contain \"unknown CPI method\"", err.Error())
+	}
+}
+
+// --------------------------------------------------------------------------
+// TestRegister_AcceptsCanonicalMethod
+// --------------------------------------------------------------------------
+
+func TestRegister_AcceptsCanonicalMethod(t *testing.T) {
+	d := cpi.NewDispatcher(nopLogger())
+	err := d.Register("create_vm", cpi.HandlerFunc(func(_ context.Context, _ []json.RawMessage, _ jsonrpc.Context) (any, error) {
+		return nil, nil
+	}))
+	if err != nil {
+		t.Fatalf("Register(\"create_vm\"): unexpected error: %v", err)
+	}
+}
+
+// --------------------------------------------------------------------------
+// TestHandle_UnknownMethodReturnsMethodNotFound
+// --------------------------------------------------------------------------
+
+func TestHandle_UnknownMethodReturnsMethodNotFound(t *testing.T) {
+	d := cpi.NewDispatcher(nopLogger())
+	resp := d.Handle(context.Background(), makeReq("bogus"))
+
+	if resp == nil {
+		t.Fatal("Handle returned nil")
+	}
+	if resp.Error == nil {
+		t.Fatal("expected error response for unknown method; got nil error")
+	}
+	// BOSH CPI uses CloudError for method-not-found (JSON-RPC -32601 equivalent).
+	if resp.Error.Type != string(cpierrors.TypeCloud) {
+		t.Errorf("error type = %q; want CloudError (method-not-found)", resp.Error.Type)
+	}
+	if resp.Error.OkToRetry {
+		t.Error("method-not-found error must not be retriable")
+	}
+	if !strings.Contains(resp.Error.Message, "method not found") {
+		t.Errorf("error message = %q; want to contain \"method not found\"", resp.Error.Message)
+	}
+}
+
 // TestHandle_ResultMarshalError
 // --------------------------------------------------------------------------
 
@@ -321,7 +390,7 @@ func TestHandle_ResultMarshalError(t *testing.T) {
 	d := cpi.NewDispatcher(nopLogger())
 
 	// Channels are not JSON-serialisable; json.Marshal returns an error.
-	d.Register("info", cpi.HandlerFunc(func(_ context.Context, _ []json.RawMessage, _ jsonrpc.Context) (any, error) {
+	mustRegister(t, d, "info", cpi.HandlerFunc(func(_ context.Context, _ []json.RawMessage, _ jsonrpc.Context) (any, error) {
 		return make(chan int), nil // non-marshalable
 	}))
 

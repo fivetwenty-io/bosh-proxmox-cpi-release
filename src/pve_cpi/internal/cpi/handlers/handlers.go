@@ -47,29 +47,39 @@ func backendResolverOrDefault(d Deps) pve.BackendResolver {
 	return pve.NewStaticBackendResolver(d.PVE, defaultNode)
 }
 
+// mustRegister calls d.Register and panics on error. All names passed here are
+// compile-time constants matching the canonical Methods() set; an error indicates
+// a programming mistake (e.g. a typo in a method name) that must be caught at
+// startup rather than silently producing a broken dispatcher.
+func mustRegister(d *cpi.Dispatcher, method string, h Handler) {
+	if err := d.Register(method, h); err != nil {
+		panic("cpi: RegisterAll: " + err.Error())
+	}
+}
+
 // RegisterAll installs every CPI handler onto d. main.go calls this
 // once after building deps.
 func RegisterAll(d *cpi.Dispatcher, deps Deps) {
-	d.Register("info", HandleInfo(deps))
-	d.Register("create_stemcell", HandleCreateStemcell(deps))
-	d.Register("delete_stemcell", HandleDeleteStemcell(deps))
-	d.Register("create_vm", HandleCreateVM(deps))
-	d.Register("delete_vm", HandleDeleteVM(deps))
-	d.Register("has_vm", HandleHasVM(deps))
-	d.Register("reboot_vm", HandleRebootVM(deps))
-	d.Register("set_vm_metadata", HandleSetVMMetadata(deps))
-	d.Register("calculate_vm_cloud_properties", HandleCalculateVMCloudProperties(deps))
-	d.Register("create_disk", HandleCreateDisk(deps))
-	d.Register("delete_disk", HandleDeleteDisk(deps))
-	d.Register("has_disk", HandleHasDisk(deps))
-	d.Register("attach_disk", HandleAttachDisk(deps))
-	d.Register("detach_disk", HandleDetachDisk(deps))
-	d.Register("snapshot_disk", HandleSnapshotDisk(deps))
-	d.Register("delete_snapshot", HandleDeleteSnapshot(deps))
-	d.Register("get_disks", HandleGetDisks(deps))
-	d.Register("resize_disk", HandleResizeDisk(deps))
-	d.Register("set_disk_metadata", HandleSetDiskMetadata(deps))
-	d.Register("update_disk", HandleUpdateDisk(deps))
-	d.Register("create_network", HandleCreateNetwork(deps))
-	d.Register("delete_network", HandleDeleteNetwork(deps))
+	mustRegister(d, "info", HandleInfo(deps))
+	mustRegister(d, "create_stemcell", HandleCreateStemcell(deps))
+	mustRegister(d, "delete_stemcell", HandleDeleteStemcell(deps))
+	mustRegister(d, "create_vm", HandleCreateVM(deps))
+	mustRegister(d, "delete_vm", HandleDeleteVM(deps))
+	mustRegister(d, "has_vm", HandleHasVM(deps))
+	mustRegister(d, "reboot_vm", HandleRebootVM(deps))
+	mustRegister(d, "set_vm_metadata", HandleSetVMMetadata(deps))
+	mustRegister(d, "calculate_vm_cloud_properties", HandleCalculateVMCloudProperties(deps))
+	mustRegister(d, "create_disk", HandleCreateDisk(deps))
+	mustRegister(d, "delete_disk", HandleDeleteDisk(deps))
+	mustRegister(d, "has_disk", HandleHasDisk(deps))
+	mustRegister(d, "attach_disk", HandleAttachDisk(deps))
+	mustRegister(d, "detach_disk", HandleDetachDisk(deps))
+	mustRegister(d, "snapshot_disk", HandleSnapshotDisk(deps))
+	mustRegister(d, "delete_snapshot", HandleDeleteSnapshot(deps))
+	mustRegister(d, "get_disks", HandleGetDisks(deps))
+	mustRegister(d, "resize_disk", HandleResizeDisk(deps))
+	mustRegister(d, "set_disk_metadata", HandleSetDiskMetadata(deps))
+	mustRegister(d, "update_disk", HandleUpdateDisk(deps))
+	mustRegister(d, "create_network", HandleCreateNetwork(deps))
+	mustRegister(d, "delete_network", HandleDeleteNetwork(deps))
 }

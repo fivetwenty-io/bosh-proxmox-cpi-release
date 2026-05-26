@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"reflect"
 	"strings"
@@ -124,6 +125,19 @@ type CPIConfig struct {
 	RegistryEndpoint string `json:"registry_endpoint,omitempty"`
 	RegistryUser     string `json:"registry_user,omitempty"`
 	RegistryPassword string `json:"registry_password,omitempty"`
+
+	// RegistryAllowInsecure relaxes the default https:// requirement on the
+	// registry endpoint. When false (default), Validate rejects any non-https
+	// scheme so credentials are never transmitted in cleartext. When true and
+	// the endpoint is http://, Validate emits a single warning log and proceeds.
+	RegistryAllowInsecure bool `json:"registry_allow_insecure,omitempty"`
+
+	// RegistryCACertPEM is an optional PEM-encoded CA certificate (or chain)
+	// appended to the host's system trust pool when building the registry
+	// HTTP client. Use when the registry presents a certificate signed by a
+	// private CA the host trust store does not already include. Ignored when
+	// empty (system trust pool used unmodified).
+	RegistryCACertPEM string `json:"registry_ca_cert,omitempty"`
 
 	// AgentMBus is the URL the BOSH agent should bind/listen on inside the VM
 	// (e.g. https://mbus:pw@0.0.0.0:6868). Sourced from
@@ -327,6 +341,19 @@ func (c *CPIConfig) ApplyDefaults() {
 	if c.SDNZoneType == "" {
 		c.SDNZoneType = "simple"
 	}
+	// Authentication precedence: when both password and api_token are present
+	// (e.g. a kit renders a placeholder password alongside a real api_token
+	// because credhub entombment rejects empty values), the api_token wins —
+	// clear the password so downstream code uses tokens.
+	//
+	// This mutation lives in ApplyDefaults rather than Validate because
+	// Validate's contract is read-only: callers may invoke Validate repeatedly
+	// for diagnostics without side effects. Load() runs ApplyDefaults before
+	// Validate, so the merged-credential path is normalized before the
+	// validation pass observes it.
+	if c.Password != "" && c.APIToken != "" {
+		c.Password = ""
+	}
 }
 
 // RebootModeValue returns the effective reboot mode, defaulting to "soft" when
@@ -368,7 +395,18 @@ func (c *CPIConfig) NUMAValue() bool {
 
 // Validate checks all required fields and enum constraints.
 // Returns a CloudError whose message lists every violation, separated by "; ".
+//
+// Validate may emit a warning log entry (registry_allow_insecure opt-in path).
+// The warning is written to a stderr-backed slog logger; callers who need to
+// capture it for assertions should use ValidateWithLogger instead.
 func (c *CPIConfig) Validate() error {
+	return c.ValidateWithLogger(nil)
+}
+
+// ValidateWithLogger is identical to Validate, but routes any warning entries
+// to logger instead of the default stderr fallback. A nil logger uses the
+// default fallback (matching the legacy Validate behavior).
+func (c *CPIConfig) ValidateWithLogger(logger *log.Logger) error {
 	var errs []string
 
 	// Required scalar fields.
@@ -389,15 +427,10 @@ func (c *CPIConfig) Validate() error {
 	}
 
 	// Authentication: at least one of password or api_token must be set.
-	// When both are present (e.g. kit renders a placeholder password alongside
-	// a real api_token because credhub entombment rejects empty values), the
-	// api_token wins — clear the password so downstream code uses tokens.
+	// ApplyDefaults normalizes the "both supplied" case (token wins, password
+	// cleared) so Validate sees the merged result here without mutating c.
 	hasPassword := c.Password != ""
 	hasToken := c.APIToken != ""
-	if hasPassword && hasToken {
-		c.Password = ""
-		hasPassword = false
-	}
 	if !hasPassword && !hasToken {
 		errs = append(errs, "one of password or api_token is required")
 	}
@@ -506,10 +539,90 @@ func (c *CPIConfig) Validate() error {
 		if c.RegistryPassword == "" {
 			errs = append(errs, "registry_password is required when agent_mode=registry")
 		}
+		// Scheme guard: refuse plaintext http:// (or any non-https scheme) unless
+		// the operator has explicitly set registry_allow_insecure=true. Credentials
+		// flow over this connection on every settings PUT/GET; default-deny matches
+		// the verify_ssl=true default for the PVE connection.
+		if c.RegistryEndpoint != "" {
+			if err := c.validateRegistryScheme(logger); err != "" {
+				errs = append(errs, err)
+			}
+		}
 	}
 
 	if len(errs) > 0 {
 		return cpierrors.Cloud("config validation failed: %s", strings.Join(errs, "; "))
 	}
 	return nil
+}
+
+// validateRegistryScheme parses RegistryEndpoint and applies the scheme guard.
+// Returns an empty string on success, or a violation message suitable for
+// appending to the validation error list. When the opt-in flag is set and the
+// scheme is http://, a single warning is emitted to logger (or to a stderr
+// fallback when logger is nil).
+func (c *CPIConfig) validateRegistryScheme(logger *log.Logger) string {
+	u, err := url.Parse(c.RegistryEndpoint)
+	if err != nil {
+		return fmt.Sprintf("registry_endpoint %q is not a valid URL: %s", c.RegistryEndpoint, err.Error())
+	}
+	scheme := strings.ToLower(u.Scheme)
+	if scheme == "" {
+		return fmt.Sprintf(
+			"registry_endpoint %q is missing a scheme; expected https:// (or http:// with registry_allow_insecure=true)",
+			c.RegistryEndpoint,
+		)
+	}
+	if scheme == "https" {
+		return ""
+	}
+	if !c.RegistryAllowInsecure {
+		return fmt.Sprintf(
+			"registry_endpoint scheme must be https (got %q); set registry_allow_insecure=true to permit plaintext",
+			scheme,
+		)
+	}
+	// Opt-in to insecure transport: only http:// is supported as the cleartext
+	// alternative. Anything else (e.g. ftp, gopher) is rejected outright.
+	if scheme != "http" {
+		return fmt.Sprintf(
+			"registry_endpoint scheme %q is not supported even with registry_allow_insecure=true (use https:// or http://)",
+			scheme,
+		)
+	}
+	emitRegistryInsecureWarning(logger, c.RegistryEndpoint)
+	return ""
+}
+
+// emitRegistryInsecureWarning logs the opt-in plaintext warning to logger.
+// When logger is nil it builds a stderr-backed warn-level logger (matching the
+// pattern used by warnUnknownFields) so the warning surfaces even when Validate
+// is invoked before the application logger is constructed.
+func emitRegistryInsecureWarning(logger *log.Logger, endpoint string) {
+	target := logger
+	if target == nil {
+		fallback, err := log.NewLogger("warn", os.Stderr)
+		if err != nil {
+			return
+		}
+		target = fallback
+	}
+	target.Warn(
+		"registry_allow_insecure=true; transmitting credentials over cleartext http",
+		log.String("endpoint", redactEndpoint(endpoint)),
+	)
+}
+
+// redactEndpoint strips userinfo from a URL so the endpoint can be logged
+// without leaking embedded credentials. A parse failure returns the original
+// string unchanged so the operator still sees something useful in logs.
+func redactEndpoint(endpoint string) string {
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return endpoint
+	}
+	if u.User != nil {
+		u.User = url.UserPassword("REDACTED", "REDACTED")
+	}
+	return u.String()
 }

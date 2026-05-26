@@ -123,6 +123,82 @@ func parseStemcellCloudProps(cp map[string]any) stemcellCloudProps {
 	return p
 }
 
+// stemcellStagingRoots returns the absolute, cleaned set of directories under
+// which an incoming image_path is permitted to resolve. The BOSH director stages
+// stemcell tarballs in its scratch area (os.TempDir() on the CPI host), so that
+// root is always permitted. Additional roots may be added here in the future
+// (e.g. an explicit `stemcell_staging_dir` config field) without changing
+// callers.
+func stemcellStagingRoots() []string {
+	roots := []string{os.TempDir()}
+	// Resolve and clean each root once. Best-effort EvalSymlinks: if the root
+	// itself is a symlink (e.g. /tmp -> /private/tmp on macOS), comparison must
+	// use the realpath so a resolved image_path under the realpath matches.
+	out := make([]string, 0, len(roots))
+	for _, r := range roots {
+		if r == "" {
+			continue
+		}
+		abs, err := filepath.Abs(r)
+		if err != nil {
+			abs = r
+		}
+		clean := filepath.Clean(abs)
+		if resolved, err := filepath.EvalSymlinks(clean); err == nil {
+			clean = resolved
+		}
+		out = append(out, clean)
+	}
+	return out
+}
+
+// validateStemcellImagePath rejects an image_path that does not resolve under
+// any element of stemcellStagingRoots. Containment is verified via filepath.Rel
+// against the absolute, symlink-resolved form of both sides; a relative result
+// that does not start with ".." (and is not the OS-specific volume-traversal
+// form) means the path is inside the root. A "../" prefix or an error from Rel
+// means the path escapes the root and is rejected.
+//
+// The check tolerates a non-existent image_path: filepath.EvalSymlinks fails
+// for missing files, in which case the cleaned absolute form is compared as-is.
+// The subsequent os.Stat call surfaces the missing-file error with a more
+// specific message; this function's job is only to reject containment breaches.
+func validateStemcellImagePath(imagePath string) error {
+	abs, err := filepath.Abs(imagePath)
+	if err != nil {
+		return cpierrors.Cloud(
+			"create_stemcell: imagePath %q could not be resolved: %s", imagePath, err.Error())
+	}
+	clean := filepath.Clean(abs)
+	if resolved, err := filepath.EvalSymlinks(clean); err == nil {
+		clean = resolved
+	}
+
+	roots := stemcellStagingRoots()
+	for _, root := range roots {
+		rel, err := filepath.Rel(root, clean)
+		if err != nil {
+			// Rel fails when root and clean are on different volumes (Windows);
+			// on a unix CPI host this is effectively unreachable, but treat it
+			// as a non-match rather than an error so the next root is tried.
+			continue
+		}
+		// rel == "." means clean IS root; reject (must be a file under root).
+		// A "../" prefix means clean escapes root via traversal — reject.
+		// Anything else (e.g. "subdir/file.tgz") is contained — accept.
+		if rel == "." {
+			continue
+		}
+		if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			continue
+		}
+		return nil
+	}
+
+	return cpierrors.Cloud(
+		"create_stemcell: imagePath %q outside permitted staging root", imagePath)
+}
+
 // HandleCreateStemcell returns a Handler for the BOSH CPI create_stemcell method.
 //
 // Arguments (positional JSON array):
@@ -172,6 +248,19 @@ func HandleCreateStemcell(deps Deps) cpi.Handler {
 		var imagePath string
 		if err := json.Unmarshal(args[0], &imagePath); err != nil || imagePath == "" {
 			return nil, cpierrors.Cloud("create_stemcell: image_path must be a non-empty string")
+		}
+
+		// Path containment: image_path must resolve under a permitted staging root.
+		// The BOSH director writes stemcell tarballs to its own scratch area before
+		// invoking the CPI; that area is os.TempDir() on the CPI host (the director
+		// stages via /tmp by default). Any path that resolves outside this root —
+		// e.g. /etc/passwd, /var/vcap/jobs/uaa/config/uaa.yml — is rejected so a
+		// malicious or compromised director cannot use create_stemcell as a path
+		// probe against arbitrary host files. The check uses filepath.Rel against
+		// the resolved-absolute form of both sides so symlinks or "../" sequences
+		// that escape the root are caught.
+		if pathErr := validateStemcellImagePath(imagePath); pathErr != nil {
+			return nil, pathErr
 		}
 
 		fi, statErr := os.Stat(imagePath)
@@ -469,6 +558,17 @@ func resolveStemcellImage(imagePath, defaultFormat string, logger *log.Logger) (
 			}
 			name := filepath.Base(hdr.Name)
 			isImg := strings.HasSuffix(strings.ToLower(name), ".img")
+			// Reject malformed tar headers up front. archive/tar permits a
+			// negative Size on synthetic entry types, but for TypeReg a
+			// negative value indicates a crafted or corrupt archive and must
+			// not be tolerated: it would skew the totalExtracted guard and
+			// invalidate the io.CopyN bound below.
+			if hdr.Size < 0 {
+				cleanup()
+				return "", noop, "", "", cpierrors.Cloud(
+					"create_stemcell: malformed tar header (negative size %d for %s)",
+					hdr.Size, hdr.Name)
+			}
 			// Skip obviously-not-disk small files that are neither .img nor large.
 			if !isImg && hdr.Size < 1024*1024 {
 				continue
@@ -476,7 +576,8 @@ func resolveStemcellImage(imagePath, defaultFormat string, logger *log.Logger) (
 			// Tar-bomb guard: reject archives whose candidate entries sum to
 			// more than MaxStemcellTotalExtract before any extraction begins.
 			// hdr.Size is the declared size from the tar header; a malicious
-			// archive could lie, so we also track actual written bytes below.
+			// archive could lie, so io.CopyN below also caps each file at
+			// its declared size to detect bodies longer than the header.
 			totalExtracted += hdr.Size
 			if totalExtracted > MaxStemcellTotalExtract {
 				cleanup()
@@ -492,10 +593,19 @@ func resolveStemcellImage(imagePath, defaultFormat string, logger *log.Logger) (
 			}
 			h := sha256.New()
 			tee := io.TeeReader(tr, h)
-			if _, cerr := io.Copy(out, tee); cerr != nil {
+			// Bound the per-file write at hdr.Size. archive/tar's reader is
+			// already capped at the header-declared size, so a well-formed
+			// entry copies exactly hdr.Size bytes and CopyN returns (n, nil).
+			// If the tar stream is truncated, CopyN returns io.ErrUnexpectedEOF
+			// after copying fewer than hdr.Size bytes; that is treated as an
+			// error here so callers cannot upload a half-written disk image.
+			written, cerr := io.CopyN(out, tee, hdr.Size)
+			if cerr != nil && cerr != io.EOF {
 				_ = out.Close()
 				cleanup()
-				return "", noop, "", "", cpierrors.Cloud("resolveStemcellImage: copy %s: %s", dst, cerr.Error())
+				return "", noop, "", "", cpierrors.Cloud(
+					"resolveStemcellImage: copy %s (wrote %d of %d declared bytes): %s",
+					dst, written, hdr.Size, cerr.Error())
 			}
 			_ = out.Close()
 			candidates = append(candidates, tarCandidate{
@@ -539,6 +649,16 @@ func resolveStemcellImage(imagePath, defaultFormat string, logger *log.Logger) (
 			// No .img found; use largest non-.img candidate.
 			imgPath = fallbackPath
 			imgSHA = fallbackSHA
+		}
+		if imgPath == "" {
+			// Neither an .img nor a non-trivial fallback file was extracted.
+			// Returning here prevents the rest of the function from running
+			// magic-byte detection against an empty path and uploading a
+			// zero-byte file to PVE.
+			cleanup()
+			return "", noop, "", "", cpierrors.Cloud(
+				"create_stemcell: no usable disk image candidate in tarball %s",
+				imagePath)
 		}
 
 		// Detect format and validate magic bytes. Read only the first 4 bytes
@@ -624,7 +744,7 @@ func uploadStemcellImage(
 	}
 
 	// Upload returns a UPID task identifier; wait for completion using
-	// StemcellMaxWait (600s) to accommodate format conversion (D-06). Both
+	// StemcellMaxWait (600s) to accommodate format conversion. Both
 	// the multipart POST and the resulting task run under the per-storage
 	// lockfile, so concurrent stemcell uploads against the same storage can
 	// surface "can't lock file ... got timeout" on either side. Retry the

@@ -1,8 +1,37 @@
 #!/bin/bash
+# BOSH packaging script for the Go 1.26 toolchain blob.
+# Verifies the tarball SHA256 before extraction to detect blob tampering or
+# corruption in the blobstore.  The canonical SHA is pinned from the same
+# source as Makefile GO_BLOB_SHA.
 set -euo pipefail
 
 BLOB="golang-1.26/go1.26.3.linux-amd64.tar.gz"
 
+# ---------------------------------------------------------------------------
+# SHA256 verification
+# Canonical digest: Makefile GO_BLOB_SHA (go1.26.3.linux-amd64.tar.gz from
+# https://dl.google.com/go/).  Pinned here so the packaging script is
+# self-contained and verifiable without the Makefile.
+# ---------------------------------------------------------------------------
+EXPECTED_SHA256="2b2cfc7148493da5e73981bffbf3353af381d5f93e789c82c79aff64962eb556"
+
+echo "==> Verifying Go toolchain tarball SHA256"
+ACTUAL_SHA256="$(sha256sum "${BLOB}" | awk '{print $1}')"
+
+if [ "${ACTUAL_SHA256}" != "${EXPECTED_SHA256}" ]; then
+  echo "ERROR: SHA256 mismatch for ${BLOB}" >&2
+  echo "  expected: ${EXPECTED_SHA256}" >&2
+  echo "  actual:   ${ACTUAL_SHA256}" >&2
+  echo "The blob in the blobstore may be corrupt or tampered with." >&2
+  echo "Re-download the blob via 'make download-blobs' and re-register it." >&2
+  exit 1
+fi
+echo "==> SHA256 verified: ${ACTUAL_SHA256}"
+
+# ---------------------------------------------------------------------------
+# Extract — strip the top-level 'go/' directory so the toolchain root lands
+# directly at BOSH_INSTALL_TARGET (i.e. BOSH_INSTALL_TARGET/bin/go).
+# ---------------------------------------------------------------------------
 echo "==> Extracting Go toolchain"
 tar -xzf "${BLOB}" -C "${BOSH_INSTALL_TARGET}" --strip-components=1
 

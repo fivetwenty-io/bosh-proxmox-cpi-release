@@ -520,3 +520,180 @@ func TestHandleDeleteVM_AgentRemoveError(t *testing.T) {
 		t.Errorf("expected nil result, got %v", result)
 	}
 }
+
+// TestDeleteVM_AwaitsDestroyTask verifies that delete_vm decodes the UPID from
+// the DeleteQemu response and awaits the destroy task before returning success.
+// The mock task service starts in state "running" and transitions to "stopped/OK"
+// on the first Wait call.
+func TestDeleteVM_AwaitsDestroyTask(t *testing.T) {
+	t.Parallel()
+
+	const destroyUPID = "UPID:pve-node1:00AABBCC:00112233:6789ABCD:qmdestroy:101:root@pam:"
+
+	awaitCalled := false
+
+	qemuSvc := &mockQEMUService{
+		stopFn: func(_ context.Context, _ string, _ int) (string, error) {
+			return "", nil // no stop UPID — synchronous stop
+		},
+		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
+			return map[string]interface{}{}, nil
+		},
+	}
+
+	// DeleteQemu returns a UPID string encoded as a JSON RawMessage.
+	deleteResp := nodes.DeleteQemuResponse(`"` + destroyUPID + `"`)
+	nodesSvc := &mockNodesService{
+		deleteQemuFn: func(_ context.Context, _ string, _ string, _ *nodes.DeleteQemuParams) (*nodes.DeleteQemuResponse, error) {
+			return &deleteResp, nil
+		},
+	}
+
+	tasksSvc := &mockTasksService{
+		waitFn: func(_ context.Context, _, upid string, _ *tasks.WaitOptions) (*tasks.Status, error) {
+			if upid == destroyUPID {
+				awaitCalled = true
+				return &tasks.Status{ExitStatus: "OK"}, nil
+			}
+			return &tasks.Status{ExitStatus: "OK"}, nil
+		},
+	}
+	agentSvc := &mockAgentService{}
+
+	h := handlers.HandleDeleteVM(testDepsFoundVM(101, qemuSvc, nodesSvc, tasksSvc, agentSvc))
+	result, err := h.Handle(context.Background(), marshalArgs("101"), jsonrpc.Context{})
+
+	if err != nil {
+		t.Fatalf("expected success, got error: %v", err)
+	}
+	if result != nil {
+		t.Errorf("expected nil result, got %v", result)
+	}
+	if !awaitCalled {
+		t.Error("destroy task was not awaited — UPID must be extracted and polled")
+	}
+}
+
+// TestDeleteVM_AwaitDestroyNotFoundIdempotent verifies that when the destroy-task
+// await returns a NotFound error (VM already gone by the time we polled), the
+// handler treats this as idempotent success.
+func TestDeleteVM_AwaitDestroyNotFoundIdempotent(t *testing.T) {
+	t.Parallel()
+
+	const destroyUPID = "UPID:pve-node1:00AABBCC:00112233:6789ABCD:qmdestroy:102:root@pam:"
+
+	qemuSvc := &mockQEMUService{
+		stopFn: func(_ context.Context, _ string, _ int) (string, error) {
+			return "", nil
+		},
+		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
+			return map[string]interface{}{}, nil
+		},
+	}
+
+	deleteResp := nodes.DeleteQemuResponse(`"` + destroyUPID + `"`)
+	nodesSvc := &mockNodesService{
+		deleteQemuFn: func(_ context.Context, _ string, _ string, _ *nodes.DeleteQemuParams) (*nodes.DeleteQemuResponse, error) {
+			return &deleteResp, nil
+		},
+	}
+
+	// Await returns a NotFound-class error: VM config gone before poll completed.
+	tasksSvc := &mockTasksService{
+		waitFn: func(_ context.Context, _, _ string, _ *tasks.WaitOptions) (*tasks.Status, error) {
+			return nil, &sdkerrors.APIError{HTTPCode: 404}
+		},
+	}
+	agentSvc := &mockAgentService{}
+
+	h := handlers.HandleDeleteVM(testDepsFoundVM(102, qemuSvc, nodesSvc, tasksSvc, agentSvc))
+	result, err := h.Handle(context.Background(), marshalArgs("102"), jsonrpc.Context{})
+
+	if err != nil {
+		t.Fatalf("NotFound on destroy await must be idempotent success, got: %v", err)
+	}
+	if result != nil {
+		t.Errorf("expected nil result, got %v", result)
+	}
+}
+
+// TestDeleteVM_AwaitDestroyTransientRetriable verifies that when the destroy-task
+// await returns a transient task-exit failure (non-OK exit status), the handler
+// propagates a CPI error so the BOSH director can decide whether to retry.
+// The error must not be silently swallowed.
+func TestDeleteVM_AwaitDestroyTransientRetriable(t *testing.T) {
+	t.Parallel()
+
+	const destroyUPID = "UPID:pve-node1:00AABBCC:00112233:6789ABCD:qmdestroy:103:root@pam:"
+
+	qemuSvc := &mockQEMUService{
+		stopFn: func(_ context.Context, _ string, _ int) (string, error) {
+			return "", nil
+		},
+		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
+			return map[string]interface{}{}, nil
+		},
+	}
+
+	deleteResp := nodes.DeleteQemuResponse(`"` + destroyUPID + `"`)
+	nodesSvc := &mockNodesService{
+		deleteQemuFn: func(_ context.Context, _ string, _ string, _ *nodes.DeleteQemuParams) (*nodes.DeleteQemuResponse, error) {
+			return &deleteResp, nil
+		},
+	}
+
+	// Await returns a non-OK task exit status — the task itself failed.
+	tasksSvc := &mockTasksService{
+		waitFn: func(_ context.Context, _, _ string, _ *tasks.WaitOptions) (*tasks.Status, error) {
+			// Non-OK exit status causes AwaitTask to return a CloudError.
+			return &tasks.Status{ExitStatus: "ERROR"}, nil
+		},
+	}
+	agentSvc := &mockAgentService{}
+
+	h := handlers.HandleDeleteVM(testDepsFoundVM(103, qemuSvc, nodesSvc, tasksSvc, agentSvc))
+	_, err := h.Handle(context.Background(), marshalArgs("103"), jsonrpc.Context{})
+
+	if err == nil {
+		t.Fatal("expected error from failed destroy task exit status, got nil")
+	}
+	var cpiErr *cpierrors.Error
+	if !errors.As(err, &cpiErr) {
+		t.Fatalf("expected *cpierrors.Error, got %T: %v", err, err)
+	}
+}
+
+// TestHandleDeleteVM_AuthFailure verifies that a 401 Unauthorized from QEMU.Stop
+// is classified as a non-retriable Cloud error. Auth failures indicate operator
+// misconfiguration (wrong token) and must surface immediately without retry.
+func TestHandleDeleteVM_AuthFailure(t *testing.T) {
+	t.Parallel()
+
+	authErr := &sdkerrors.APIError{HTTPCode: 401, Message: "authentication failure"}
+
+	qemuSvc := &mockQEMUService{
+		stopFn: func(_ context.Context, _ string, _ int) (string, error) {
+			return "", authErr
+		},
+	}
+	agentSvc := &mockAgentService{}
+
+	h := handlers.HandleDeleteVM(testDepsFoundVM(999, qemuSvc, nil, nil, agentSvc))
+	_, err := h.Handle(context.Background(), marshalArgs("999"), jsonrpc.Context{})
+
+	if err == nil {
+		t.Fatal("expected error from 401 auth failure on Stop")
+	}
+
+	// 401 is a 4xx non-404 → WrapError returns a non-retriable Cloud error.
+	cpiErr, ok := err.(*cpierrors.Error)
+	if !ok {
+		t.Fatalf("expected *cpierrors.Error, got %T: %v", err, err)
+	}
+	if cpiErr.OkToRetry() {
+		t.Errorf("auth failure must not be retriable; OkToRetry()=true; type=%s", cpiErr.Type())
+	}
+	if cpiErr.Type() == cpierrors.TypeRetriableCloud {
+		t.Errorf("auth failure classified as RetriableCloud; want non-retriable TypeCloud; type=%s", cpiErr.Type())
+	}
+}

@@ -835,7 +835,7 @@ func TestHandleUpdateDisk_ZFSPool_CID(t *testing.T) {
 // func TestHandleUpdateDisk_CIFS_CID(t *testing.T) { ... }
 
 // ---------------------------------------------------------------------------
-// Storage-lock retry tests (IMP-09 wiring verification).
+// Storage-lock retry tests (wiring verification).
 //
 // resizeDiskInternal wraps ResizeDisk+AwaitTask in pve.RetryOnTransientOrLock.
 // These tests exercise that path via the full HandleUpdateDisk call stack,

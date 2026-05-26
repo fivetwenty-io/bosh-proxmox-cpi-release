@@ -231,7 +231,9 @@ func TestMain_VersionFlag(t *testing.T) {
 	buildCmd := exec.Command("go", "build", "-o", binPath, "./cmd/cpi")
 	buildCmd.Dir = repoRoot
 	if out, err := buildCmd.CombinedOutput(); err != nil {
-		t.Skipf("go build failed (skip --version test): %v\n%s", err, out)
+		// Build failure must fail the test, not skip it — the binary is the
+		// product under test and a broken build is a regression to surface.
+		t.Fatalf("go build failed: %v\n%s", err, out)
 	}
 
 	versionCmd := exec.Command(binPath, "--version")
@@ -242,5 +244,107 @@ func TestMain_VersionFlag(t *testing.T) {
 	output := strings.TrimSpace(string(out))
 	if !strings.Contains(output, "bosh-pve-cpi") {
 		t.Errorf("--version output does not contain 'bosh-pve-cpi': %q", output)
+	}
+}
+
+// --------------------------------------------------------------------------
+// Explicit dispatch / EOF / malformed-JSON envelope coverage.
+// --------------------------------------------------------------------------
+
+// TestRunCPI_DispatchesRequest verifies that runCPI parses a valid JSON-RPC
+// request from r, hands it to the dispatcher, and writes a well-formed
+// response envelope to w. Uses a pre-registered method ("info") that the
+// dispatcher returns as NotImplemented; the test asserts the round-trip
+// produced exactly one response carrying that error type. Complements
+// TestRunCPI_SingleRequest by also confirming the request_id flows through.
+func TestRunCPI_DispatchesRequest(t *testing.T) {
+	_, logger := makeTestDeps(t)
+	req := `{"method":"info","arguments":[],"context":{"request_id":"dispatch-id-1"},"api_version":2}` + "\n"
+	r := strings.NewReader(req)
+	var w bytes.Buffer
+
+	d := cpi.NewDispatcher(logger)
+	if err := runCPI(context.Background(), r, &w, d, logger); err != nil {
+		t.Fatalf("runCPI returned unexpected error: %v", err)
+	}
+
+	out := strings.TrimSpace(w.String())
+	if out == "" {
+		t.Fatal("expected response on stdout, got empty buffer")
+	}
+	// Exactly one response line — no extra writes from a clean dispatch.
+	if lines := strings.Split(out, "\n"); len(lines) != 1 {
+		t.Fatalf("expected 1 response line, got %d:\n%s", len(lines), out)
+	}
+
+	resp := parseResponse(t, out)
+	if resp.Error == nil {
+		t.Fatalf("expected NotImplemented error envelope, got result: %v", resp.Result)
+	}
+	if !strings.Contains(resp.Error.Type, "NotImplemented") {
+		t.Errorf("error type: got %q, want substring NotImplemented", resp.Error.Type)
+	}
+	// Result field must be null when Error is set (BOSH JSON-RPC contract).
+	if resp.Result != nil {
+		t.Errorf("expected nil Result on error response, got %v", resp.Result)
+	}
+}
+
+// TestRunCPI_HandlesEOF verifies that an immediately-closed input stream
+// returns nil (clean exit) and writes no output. Distinct from
+// TestRunCPI_EOF in that it explicitly uses an io.Pipe-style reader that
+// has already returned EOF to exercise the empty-Scan path.
+func TestRunCPI_HandlesEOF(t *testing.T) {
+	_, logger := makeTestDeps(t)
+	// strings.NewReader("") returns (0, io.EOF) on the first Read, mirroring
+	// what stdin behaves like when the BOSH director closes its end without
+	// sending a request line.
+	r := strings.NewReader("")
+	var w bytes.Buffer
+
+	d := cpi.NewDispatcher(logger)
+	err := runCPI(context.Background(), r, &w, d, logger)
+	if err != nil {
+		t.Fatalf("runCPI on EOF returned %v, want nil (clean exit)", err)
+	}
+	if w.Len() != 0 {
+		t.Fatalf("expected no output on EOF, got %d bytes: %q", w.Len(), w.String())
+	}
+}
+
+// TestRunCPI_MalformedJSONReturnsError feeds a single malformed JSON line
+// and asserts a CloudError envelope is returned. Distinct from
+// TestRunCPI_MalformedJSON (which also covers loop continuation after the
+// error) by isolating the envelope contract.
+func TestRunCPI_MalformedJSONReturnsError(t *testing.T) {
+	_, logger := makeTestDeps(t)
+	r := strings.NewReader("{garbage\n")
+	var w bytes.Buffer
+
+	d := cpi.NewDispatcher(logger)
+	if err := runCPI(context.Background(), r, &w, d, logger); err != nil {
+		t.Fatalf("runCPI returned unexpected error: %v", err)
+	}
+
+	out := strings.TrimSpace(w.String())
+	if out == "" {
+		t.Fatal("expected CloudError envelope on stdout, got empty buffer")
+	}
+	lines := strings.Split(out, "\n")
+	if len(lines) != 1 {
+		t.Fatalf("expected exactly 1 response line for the malformed input, got %d:\n%s", len(lines), out)
+	}
+
+	resp := parseResponse(t, lines[0])
+	if resp.Error == nil {
+		t.Fatalf("expected error envelope for malformed JSON, got result: %v", resp.Result)
+	}
+	if !strings.Contains(resp.Error.Type, "CloudError") {
+		t.Errorf("error type: got %q, want substring CloudError", resp.Error.Type)
+	}
+	if !strings.Contains(strings.ToLower(resp.Error.Message), "decode") &&
+		!strings.Contains(strings.ToLower(resp.Error.Message), "parse") &&
+		!strings.Contains(strings.ToLower(resp.Error.Message), "json") {
+		t.Errorf("error message should describe the decode failure: %q", resp.Error.Message)
 	}
 }

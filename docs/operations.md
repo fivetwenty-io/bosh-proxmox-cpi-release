@@ -466,6 +466,84 @@ bosh env | grep -E 'Version|CPI'
 bosh --version
 ```
 
+---
+
+## Release artifact workflow
+
+This section describes how to build a CPI release tarball and pass its path to BOSH at deploy time. The tarball path is never written back to `manifests/bosh/vars.yml` automatically — operators must supply it explicitly.
+
+### Build a dev tarball
+
+```bash
+# Build a timestamped dev tarball under dev_releases/bosh-pve-cpi/
+make dev-release
+
+# Capture the path from the RELEASE_TGZ= line printed at the end
+RELEASE_TGZ=$(scripts/create-release dev 2>&1 | grep '^RELEASE_TGZ=' | cut -d= -f2-)
+```
+
+Or equivalently:
+
+```bash
+scripts/create-release dev
+# Output ends with:
+#   Set BOSH var: --var release_artifact_path=/abs/path/to/bosh-pve-cpi-dev-YYYYMMDDHHMMSS.tgz
+#   RELEASE_TGZ=/abs/path/to/bosh-pve-cpi-dev-YYYYMMDDHHMMSS.tgz
+RELEASE_TGZ=/abs/path/to/bosh-pve-cpi-dev-YYYYMMDDHHMMSS.tgz
+```
+
+### Build a versioned (final) tarball
+
+```bash
+make release VERSION=1.2.3
+# Tarball written to releases/bosh-pve-cpi/bosh-pve-cpi-1.2.3.tgz
+RELEASE_TGZ="$(pwd)/releases/bosh-pve-cpi/bosh-pve-cpi-1.2.3.tgz"
+```
+
+### Pass the path to BOSH
+
+For `bosh create-env`:
+
+```bash
+bosh create-env manifests/bosh/bosh.yml \
+  --state manifests/bosh/state.json \
+  --vars-file manifests/bosh/vars.yml \
+  --var release_artifact_path="$RELEASE_TGZ" \
+  ...
+```
+
+For `bosh int` (manifest interpolation only):
+
+```bash
+bosh int manifests/bosh/bosh.yml \
+  --vars-file manifests/bosh/vars.yml \
+  --var release_artifact_path="$RELEASE_TGZ"
+```
+
+`manifests/bosh/vars.yml.example` shows the corresponding variable declaration:
+
+```yaml
+pve_cpi_release_path: ((release_artifact_path))
+```
+
+Copy `vars.yml.example` to `vars.yml` and leave `pve_cpi_release_path` as the `((release_artifact_path))` placeholder. Supply the actual path via `--var release_artifact_path=...` at runtime. Never commit `vars.yml` — it is listed in `.gitignore`.
+
+### Hygiene check
+
+`make release-hygiene` asserts that no `bosh-pve-cpi-*.tgz` file exists at the repository root. This gate catches accidental tarball dumps in the working tree before they enter a commit.
+
+```bash
+make release-hygiene
+# Exits 0 when clean; exits 1 and prints offending paths when any loose tarball is found.
+```
+
+Run this check in CI before any commit that touches BOSH release structure, or wire it into a pre-commit hook:
+
+```bash
+# .git/hooks/pre-commit (excerpt)
+make release-hygiene || exit 1
+```
+
 ### Logs to attach
 
 1. Full CPI debug log for the failed task:
@@ -509,3 +587,153 @@ sudo cat /var/vcap/jobs/pve_cpi/config/cpi.json \
 cat /etc/pve/storage.cfg
 pvesm status
 ```
+
+---
+
+## ConfigDrive ISO storage
+
+In `cloudinit` agent mode (the default), the CPI builds an ISO 9660 image containing the BOSH agent settings for each VM. These settings include the NATS mbus URL — which embeds credentials when the Director is deployed with a `nats://user:password@host:port` mbus string — and the blobstore credentials map. The ISO is uploaded to the storage pool named by `pve.iso_storage` and attached to the VM as a CD-ROM on `scsi30`. It remains on storage for the lifetime of the VM.
+
+### Default (`local`) and its trust boundary
+
+The default `iso_storage` value is `local`, which maps to the node-local directory storage at `/var/lib/vz/`. Anyone with read access to that storage pool — including any PVE user with `Datastore.AllocateSpace` or `Datastore.AllocateTemplate` privilege, or any root-level process on the PVE node — can mount the ISO and extract the credentials it contains.
+
+When the CPI configures a VM against the `local` pool, it emits a warning in the CPI log:
+
+```
+iso_storage=local; ConfigDrive ISOs are readable by anyone with access to the PVE node-local storage. Recommend dedicated pool. See docs/operations.md ISO storage section.
+```
+
+Treat this warning as a deploy-time signal to move to a dedicated pool. The warning fires once per CPI process, not once per VM.
+
+### Recommended configuration
+
+Dedicate a separate PVE storage pool for ConfigDrive ISOs and grant access only to the PVE user account the CPI authenticates as. Suitable pool types are `dir`, `nfs`, and `cifs` — ISO uploads require a file-based pool.
+
+Example pool options:
+
+| Pool type | Notes |
+|---|---|
+| `dir` | Node-local directory at a non-default path; reduces exposure vs `/var/lib/vz/` but remains node-local |
+| `nfs` | Shared; restrict NFS exports to the PVE node IP range |
+| `cephfs` | Shared; ACL enforcement via Ceph caps; preferred for multi-node clusters |
+
+Set the pool in the CPI manifest properties:
+
+```yaml
+properties:
+  pve:
+    iso_storage: bosh-isos
+```
+
+Verify the pool type is file-based:
+
+```bash
+pvesh get /storage/bosh-isos | jq '.data.type'
+# Must be "dir", "nfs", or "cifs"
+```
+
+After moving to a dedicated pool, confirm the warning no longer appears in subsequent deploy logs.
+
+### Orphan ISO cleanup
+
+ConfigDrive ISOs are named `vm-<vmid>-config.iso`. The CPI removes the ISO during `delete_vm`. If a VM is destroyed outside BOSH (for example, by `qm destroy` directly), the ISO may linger as an orphan:
+
+```bash
+pvesm list <iso_storage> --content iso | grep config.iso
+pvesm free <iso_storage>:iso/vm-<vmid>-config.iso
+```
+
+Confirm the corresponding VM is absent before freeing:
+
+```bash
+qm status <vmid>   # should return "no such guest"
+```
+
+---
+
+## Error message hygiene
+
+### Policy
+
+Error messages returned to the BOSH Director in the JSON-RPC response envelope must not contain secrets. Secrets include passwords, API tokens, NATS mbus URLs that embed credentials (`nats://user:pass@host:port`), and blobstore credential maps. Filesystem paths and PVE storage names may appear in error messages — they are operational identifiers, not credentials — but full absolute paths should be trimmed to the basename or replaced with a logical identifier when they add no diagnostic value.
+
+### Mechanism
+
+The `cpierrors` package distinguishes two error surfaces:
+
+| Constructor | Director sees | Use when |
+|---|---|---|
+| `cpierrors.Cloud(format, args...)` | The formatted message string | The message is safe to surface: it contains no secrets and is written for an operator |
+| `cpierrors.Retriable(format, args...)` | The formatted message string | Same as Cloud but signals the Director to retry the CPI call |
+| `cpierrors.Wrap(err, msg)` | `msg` only (the cause is not serialized into the RPC payload) | Wrapping an inner error that may carry secret-bearing context; `msg` is operator-safe, the full chain is preserved for the Go logger |
+
+`Wrap` preserves the error type and `ok_to_retry` flag from the innermost `*cpierrors.Error` in the chain, so retriable classification is not lost when adding context. The `error.Error()` string (used by the logger) includes the full chain; `RPCPayload()` serializes only `msg`.
+
+### Developer rule
+
+When wrapping an error that may carry secret-bearing context — for example, an SDK `APIError` that includes raw HTTP response bodies or credential fields — write a generic, operator-safe message for the `Wrap` call and log the full chain at debug level separately:
+
+```go
+if err := pveClient.Nodes().Something(ctx, node, params); err != nil {
+    logger.Debug("pve api error detail", log.Error(err))
+    return cpierrors.Wrap(pve.WrapError(err),
+        fmt.Sprintf("operation failed for node %s", node))
+}
+```
+
+The message passed to `Wrap` is what the Director persists in its task log. It must identify the failing operation and the resource (node name, VMID, disk CID) but must not include credential values.
+
+### Example: PVE authentication failure
+
+A PVE API 401 response returns a generic operator-safe message in the BOSH error:
+
+```
+PVE authentication failed for node <node-name>
+```
+
+The full `APIError` — including HTTP response body, request URL, and any credential hint in the body — is logged at debug level only and does not appear in the Director's task log or error envelope.
+
+To inspect the full error during a failed deploy:
+
+```bash
+bosh task <id> --debug 2>&1 | grep 'pve api error detail'
+```
+
+---
+
+## Persistent disks: cloud_properties
+
+The CPI creates persistent disks as PVE storage volumes. The disk format and the storage pool type must be compatible. LVM and ZFS pools require raw volumes; directory-backed and network-backed pools default to `qcow2`.
+
+### `disk_format` property
+
+Set `disk_format` in the `cloud_properties` of a `persistent_disk_type` when the target pool requires a specific format:
+
+| Pool type | Required `disk_format` | Notes |
+|---|---|---|
+| `lvm`, `lvmthin` | `raw` | LVM does not support qcow2 layers |
+| `zfspool` | `raw` | ZFS zvols are raw block devices |
+| `dir`, `nfs`, `cifs` | omit (defaults to `qcow2`) | qcow2 is the pool default; raw is also valid |
+| `rbd` (Ceph) | omit (defaults to `raw`) | RBD volumes are always raw; the field is ignored |
+
+### Example manifest snippet
+
+```yaml
+disk_types:
+  - name: 50GB
+    disk_size: 51200
+    cloud_properties:
+      disk_format: raw   # required for lvm, lvmthin, and zfspool pools
+```
+
+For pools that do not require `raw`, omit `disk_format` entirely:
+
+```yaml
+disk_types:
+  - name: 50GB
+    disk_size: 51200
+    cloud_properties: {}
+```
+
+See [Configuration — Storage properties](configuration.md) for the full set of `cloud_properties` fields and their defaults.

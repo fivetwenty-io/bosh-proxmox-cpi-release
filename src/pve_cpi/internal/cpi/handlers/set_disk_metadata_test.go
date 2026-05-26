@@ -14,14 +14,16 @@ import (
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
+	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
 
-	sdkclusterapi "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cluster"
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cloudinit"
+	sdkclusterapi "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cluster"
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/clusterstorage"
 	sdknodes "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/nodes"
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/qemu"
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/storage"
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/tasks"
+	sdkerrors "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/errors"
 )
 
 // ---------------------------------------------------------------------------
@@ -164,7 +166,10 @@ func clusterResourcesWithVM(vmid int64, node string) *sdkclusterapi.ListResource
 }
 
 // clusterResourcesWithVMs builds a ListResourcesResponse with multiple VM entries.
-func clusterResourcesWithVMs(pairs ...struct{ vmid int64; node string }) *sdkclusterapi.ListResourcesResponse {
+func clusterResourcesWithVMs(pairs ...struct {
+	vmid int64
+	node string
+}) *sdkclusterapi.ListResourcesResponse {
 	type entry struct {
 		VMID int64  `json:"vmid"`
 		Node string `json:"node"`
@@ -212,10 +217,20 @@ func vmConfigWithDisk(diskCID, desc string) map[string]interface{} {
 	return m
 }
 
-func makeDiskMetaDeps(pve *diskMetaClientMock) handlers.Deps {
+func makeDiskMetaDeps(client pve.Client) handlers.Deps {
 	return handlers.Deps{
 		Config: &config.CPIConfig{VMDiskFormat: "qcow2"},
-		PVE:    pve,
+		PVE:    client,
+		Logger: log.NewNopLogger(),
+	}
+}
+
+// makeDiskMetaDepsClient builds Deps from a generic pve.Client. Used by tests
+// that wire custom mock implementations (e.g., diskMetaFullMock).
+func makeDiskMetaDepsClient(client pve.Client) handlers.Deps {
+	return handlers.Deps{
+		Config: &config.CPIConfig{VMDiskFormat: "qcow2"},
+		PVE:    client,
 		Logger: log.NewNopLogger(),
 	}
 }
@@ -316,8 +331,14 @@ func TestHandleSetDiskMetadata_Ambiguous(t *testing.T) {
 	// ambiguous-match error path in the handler.
 	clusterSvc := &diskMetaClusterSvc{
 		resp: clusterResourcesWithVMs(
-			struct{ vmid int64; node string }{testVMID, testNode},
-			struct{ vmid int64; node string }{vm2, testNode},
+			struct {
+				vmid int64
+				node string
+			}{testVMID, testNode},
+			struct {
+				vmid int64
+				node string
+			}{vm2, testNode},
 		),
 	}
 	nodesSvc := &diskMetaNodesMock{}
@@ -801,26 +822,203 @@ func TestHandleSetDiskMetadata_TransportErrorPropagates(t *testing.T) {
 	}
 }
 
-// TODO(storage-network): nfs — wired to PVE network-call boundary, stubbed pending
-// live shared-storage test infrastructure. Storage: nfs-store:9001/vm-9001-disk-0.qcow2.
-// Re-enable when integration-test harness provides a nfs pool via env.
+// TestSetDiskMetadata_UpdateTransient_Retriable verifies that when SDK calls in
+// persistMetadata and applyCustomTagsToVM return a transient 5xx error, the
+// WrapError wrapping inside those functions preserves the Retriable classification
+// so the BOSH director re-issues the request rather than treating it as permanent.
 //
-// func TestHandleSetDiskMetadata_NFS_CID(t *testing.T) { ... }
+// Three subtests, one per write site:
+//   - "persist_metadata_update": UpdateQemuConfig in persistMetadata (disk metadata write).
+//   - "apply_tags_config_fetch": Config() in applyCustomTagsToVM (tag-merge read).
+//   - "apply_tags_update": UpdateQemuConfig in applyCustomTagsToVM (tag write).
+func TestSetDiskMetadata_UpdateTransient_Retriable(t *testing.T) {
+	t.Parallel()
 
-// TODO(storage-network): rbd — wired to PVE network-call boundary, stubbed pending
-// live shared-storage test infrastructure. Storage: ceph-pool:vm-9001-disk-0.
-// Re-enable when integration-test harness provides a rbd pool via env.
-//
-// func TestHandleSetDiskMetadata_RBD_CID(t *testing.T) { ... }
+	// ConnectionError is always classified as transient by WrapError → RetriableCloud.
+	transientErr := &sdkerrors.ConnectionError{Host: "pve.test.local", Port: 8006, Message: "connection reset by peer"}
 
-// TODO(storage-network): cephfs — wired to PVE network-call boundary, stubbed pending
-// live shared-storage test infrastructure. Storage: cephfs-pool:vm-9001-disk-0.
-// Re-enable when integration-test harness provides a cephfs pool via env.
-//
-// func TestHandleSetDiskMetadata_CephFS_CID(t *testing.T) { ... }
+	const cid = testDiskCID
+	configKey := diskKey(testNode, int(testVMID))
+	baseConfigs := map[string]map[string]interface{}{
+		configKey: vmConfigWithDisk(cid, ""),
+	}
 
-// TODO(storage-network): cifs — wired to PVE network-call boundary, stubbed pending
-// live shared-storage test infrastructure. Storage: cifs-store:9001/vm-9001-disk-0.qcow2.
-// Re-enable when integration-test harness provides a cifs pool via env.
-//
-// func TestHandleSetDiskMetadata_CIFS_CID(t *testing.T) { ... }
+	// subtest helper: builds and invokes the handler, then asserts Retriable error.
+	runCase := func(t *testing.T, name string, qemuSvc qemu.Service, nodesSvc sdknodes.Service, meta map[string]any) {
+		t.Helper()
+		clusterSvc := &diskMetaClusterSvc{resp: clusterResourcesWithVM(testVMID, testNode)}
+		client := &diskMetaFullMock{
+			qemuSvc:    qemuSvc,
+			nodesSvc:   nodesSvc,
+			clusterSvc: clusterSvc,
+		}
+		h := handlers.HandleSetDiskMetadata(makeDiskMetaDepsClient(client))
+		_, err := h.Handle(context.Background(), makeMetaArgs(cid, meta), jsonrpc.Context{})
+		if err == nil {
+			t.Fatalf("%s: expected error from transient SDK failure, got nil", name)
+		}
+		var cpiErr *cpierrors.Error
+		if !errors.As(err, &cpiErr) {
+			t.Fatalf("%s: expected *cpierrors.Error, got %T: %v", name, err, err)
+		}
+		if cpiErr.Type() != cpierrors.TypeRetriableCloud {
+			t.Errorf("%s: error type = %q; want %q (Retriable)", name, cpiErr.Type(), cpierrors.TypeRetriableCloud)
+		}
+	}
+
+	// Site 1: UpdateQemuConfig in persistMetadata fails with transient error.
+	// No tags in metadata so applyCustomTagsToVM is not called.
+	t.Run("persist_metadata_update", func(t *testing.T) {
+		t.Parallel()
+		qemuSvc := &diskMetaQEMUMock{configs: baseConfigs}
+		nodesSvc := &diskMetaNodesMock{updateErr: transientErr}
+		runCase(t, "persist_metadata_update", qemuSvc, nodesSvc, map[string]any{"deployment": "cf"})
+	})
+
+	// Site 2: Config() in applyCustomTagsToVM fails with transient error.
+	// persistMetadata (first UpdateQemuConfig) succeeds; the second Config()
+	// call — inside applyCustomTagsToVM — returns the transient error.
+	// findVMsHostingDisk calls Config once; persistMetadata calls Config once;
+	// applyCustomTagsToVM calls Config a third time — inject error on call ≥ 3.
+	t.Run("apply_tags_config_fetch", func(t *testing.T) {
+		t.Parallel()
+		configCallCount := 0
+		qemuSvc := &configFnQEMU{
+			base: &diskMetaQEMUMock{configs: baseConfigs},
+			fn: func(_ context.Context, node string, vmid int) (map[string]interface{}, error) {
+				configCallCount++
+				// findVMsHostingDisk = call 1 (scan); persistMetadata = call 2; applyCustomTagsToVM = call 3.
+				if configCallCount >= 3 {
+					return nil, transientErr
+				}
+				key := diskKey(node, vmid)
+				if cfg, ok := baseConfigs[key]; ok {
+					return cfg, nil
+				}
+				return map[string]interface{}{}, nil
+			},
+		}
+		// UpdateQemuConfig succeeds for persistMetadata (call 1).
+		nodesSvc := &diskMetaNodesMock{}
+		meta := map[string]any{"deployment": "cf", "tags": map[string]any{"tier": "gold"}}
+		runCase(t, "apply_tags_config_fetch", qemuSvc, nodesSvc, meta)
+	})
+
+	// Site 3: UpdateQemuConfig in applyCustomTagsToVM fails with transient error.
+	// persistMetadata's UpdateQemuConfig (first call) succeeds; the second call
+	// (tags write in applyCustomTagsToVM) returns the transient error.
+	t.Run("apply_tags_update", func(t *testing.T) {
+		t.Parallel()
+		updateCallCount := 0
+		captured := &diskMetaNodesMock{}
+		nodesSvc := &updateCaptureMock{
+			updateFn: func(_ context.Context, _ string, _ string, params *sdknodes.UpdateQemuConfigParams) error {
+				updateCallCount++
+				if updateCallCount >= 2 {
+					return transientErr
+				}
+				// Capture first write (persistMetadata) so the test helper sees it.
+				if params != nil && params.Description != nil {
+					captured.capturedDesc = params.Description
+				}
+				return nil
+			},
+		}
+		qemuSvc := &diskMetaQEMUMock{configs: baseConfigs}
+		meta := map[string]any{"deployment": "cf", "tags": map[string]any{"tier": "gold"}}
+		runCase(t, "apply_tags_update", qemuSvc, nodesSvc, meta)
+	})
+}
+
+// configFnQEMU wraps diskMetaQEMUMock, overriding Config with a custom function.
+// Used by tests that need per-call error injection on Config.
+type configFnQEMU struct {
+	base *diskMetaQEMUMock
+	fn   func(context.Context, string, int) (map[string]interface{}, error)
+}
+
+func (c *configFnQEMU) Config(ctx context.Context, node string, vmid int) (map[string]interface{}, error) {
+	if c.fn != nil {
+		return c.fn(ctx, node, vmid)
+	}
+	return c.base.Config(ctx, node, vmid)
+}
+
+func (c *configFnQEMU) Create(ctx context.Context, node string, params map[string]interface{}) (string, error) {
+	return c.base.Create(ctx, node, params)
+}
+func (c *configFnQEMU) Status(ctx context.Context, node string, vmid int) (map[string]interface{}, error) {
+	return c.base.Status(ctx, node, vmid)
+}
+func (c *configFnQEMU) Start(ctx context.Context, node string, vmid int) (string, error) {
+	return c.base.Start(ctx, node, vmid)
+}
+func (c *configFnQEMU) Stop(ctx context.Context, node string, vmid int) (string, error) {
+	return c.base.Stop(ctx, node, vmid)
+}
+func (c *configFnQEMU) Reset(ctx context.Context, node string, vmid int) (string, error) {
+	return c.base.Reset(ctx, node, vmid)
+}
+func (c *configFnQEMU) Clone(ctx context.Context, node string, vmid int, params map[string]interface{}) (string, error) {
+	return c.base.Clone(ctx, node, vmid, params)
+}
+func (c *configFnQEMU) Template(ctx context.Context, node string, vmid int) (string, error) {
+	return c.base.Template(ctx, node, vmid)
+}
+func (c *configFnQEMU) AttachDisk(ctx context.Context, node string, vmid int, slot, volid string, opts *qemu.AttachOpts) (string, error) {
+	return c.base.AttachDisk(ctx, node, vmid, slot, volid, opts)
+}
+func (c *configFnQEMU) DetachDisk(ctx context.Context, node string, vmid int, slot string) error {
+	return c.base.DetachDisk(ctx, node, vmid, slot)
+}
+func (c *configFnQEMU) ResizeDisk(ctx context.Context, node string, vmid int, slot string, sizeGB int) (string, error) {
+	return c.base.ResizeDisk(ctx, node, vmid, slot, sizeGB)
+}
+func (c *configFnQEMU) Snapshot(ctx context.Context, node string, vmid int, name string, params map[string]interface{}) (string, error) {
+	return c.base.Snapshot(ctx, node, vmid, name, params)
+}
+func (c *configFnQEMU) DeleteSnapshot(ctx context.Context, node string, vmid int, name string) error {
+	return c.base.DeleteSnapshot(ctx, node, vmid, name)
+}
+func (c *configFnQEMU) ListSnapshots(ctx context.Context, node string, vmid int) ([]map[string]interface{}, error) {
+	return c.base.ListSnapshots(ctx, node, vmid)
+}
+func (c *configFnQEMU) RollbackSnapshot(ctx context.Context, node string, vmid int, name string) (string, error) {
+	return c.base.RollbackSnapshot(ctx, node, vmid, name)
+}
+
+var _ qemu.Service = (*configFnQEMU)(nil)
+
+// updateCaptureMock implements nodes.Service with only UpdateQemuConfig wired.
+// All other methods delegate to the embedded panicNodesStub (panic on call).
+type updateCaptureMock struct {
+	panicNodesStub
+	updateFn func(context.Context, string, string, *sdknodes.UpdateQemuConfigParams) error
+}
+
+func (m *updateCaptureMock) UpdateQemuConfig(ctx context.Context, node, vmid string, params *sdknodes.UpdateQemuConfigParams) error {
+	if m.updateFn != nil {
+		return m.updateFn(ctx, node, vmid, params)
+	}
+	return nil
+}
+
+var _ sdknodes.Service = (*updateCaptureMock)(nil)
+
+// diskMetaFullMock wires a qemu.Service and nodes.Service for transient tests.
+// Both fields accept the interface to allow configFnQEMU / updateCaptureMock.
+type diskMetaFullMock struct {
+	qemuSvc    qemu.Service
+	nodesSvc   sdknodes.Service
+	clusterSvc sdkclusterapi.Service
+}
+
+func (c *diskMetaFullMock) QEMU() qemu.Service             { return c.qemuSvc }
+func (c *diskMetaFullMock) Storage() storage.Service       { return nil }
+func (c *diskMetaFullMock) CloudInit() cloudinit.Service   { return nil }
+func (c *diskMetaFullMock) Tasks() tasks.Service           { return nil }
+func (c *diskMetaFullMock) Nodes() sdknodes.Service        { return c.nodesSvc }
+func (c *diskMetaFullMock) Cluster() sdkclusterapi.Service { return c.clusterSvc }
+func (c *diskMetaFullMock) ClusterStorage() clusterstorage.Service {
+	return nil
+}

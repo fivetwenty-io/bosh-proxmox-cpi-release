@@ -395,9 +395,9 @@ func TestCreateStemcell_Dedup_SameFilename(t *testing.T) {
 	}
 }
 
-// TestCreateStemcell_RejectLocalStemcellStorage verifies D-03: a local-only
+// TestCreateStemcell_RejectLocalStemcellStorage verifies that a local-only
 // stemcell storage on a multi-node cluster causes the handler to return an error
-// containing "shared" (the canonical D-03 message fragment).
+// containing "shared" (the canonical rejection message fragment).
 func TestCreateStemcell_RejectLocalStemcellStorage(t *testing.T) {
 	t.Parallel()
 
@@ -428,7 +428,7 @@ func TestCreateStemcell_RejectLocalStemcellStorage(t *testing.T) {
 
 	_, err := h.Handle(context.Background(), args, jsonrpc.Context{})
 	if err == nil {
-		t.Fatal("expected error for local storage on multi-node cluster (D-03), got nil")
+		t.Fatal("expected error for local storage on multi-node cluster, got nil")
 	}
 	if !containsSubstr(err.Error(), "shared") {
 		t.Errorf("error %q does not contain expected fragment %q", err.Error(), "shared")
@@ -974,6 +974,247 @@ func TestResolveStemcell_TarballExceedsMaxSize_Errors(t *testing.T) {
 	}
 	if !containsSubstr(err.Error(), "exceed") {
 		t.Errorf("error %q does not mention 'exceed'; expected the MaxStemcellTotalExtract message", err.Error())
+	}
+}
+
+// makeNegativeSizeTar builds a gzip+tar archive containing a single
+// regular-file entry whose Size field is overwritten with the GNU base-256
+// encoding of -1 after archive/tar.Writer has produced an otherwise valid
+// header. The Writer is used first so the checksum and other ustar fields
+// satisfy archive/tar.Reader's parser; the size field is then patched
+// in-place and the checksum is recomputed before the gzip stream is closed.
+//
+// archive/tar.Reader.Next() decodes the patched size as -1 (high bit of the
+// leading byte signals binary mode; remaining 0xFF bytes complete the
+// two's-complement -1). The production code's hdr.Size < 0 guard then fires
+// in resolveStemcellImage before any data is read.
+func makeNegativeSizeTar(t *testing.T, name string) string {
+	t.Helper()
+	// Step 1: build a valid 1-block ustar archive (no body) with the Writer.
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	hdr := &tar.Header{
+		Typeflag: tar.TypeReg,
+		Name:     name,
+		Size:     0,
+		Mode:     0o644,
+		Format:   tar.FormatUSTAR,
+	}
+	if werr := tw.WriteHeader(hdr); werr != nil {
+		t.Fatalf("makeNegativeSizeTar: write header: %v", werr)
+	}
+	if cerr := tw.Close(); cerr != nil {
+		t.Fatalf("makeNegativeSizeTar: close writer: %v", cerr)
+	}
+
+	raw := buf.Bytes()
+	if len(raw) < 512 {
+		t.Fatalf("makeNegativeSizeTar: writer produced %d bytes; expected >= 512", len(raw))
+	}
+
+	// Step 2: overwrite the Size field (bytes 124..135 of the first header)
+	// with GNU base-256 -1 (0xFF repeated; high bit signals binary).
+	for i := 124; i < 136; i++ {
+		raw[i] = 0xFF
+	}
+
+	// Step 3: blank the checksum field (148..155) to spaces, recompute the
+	// 6-octal-digit checksum, then write it back as "NNNNNN\x00 ".
+	for i := 148; i < 156; i++ {
+		raw[i] = ' '
+	}
+	var sum uint32
+	for i := 0; i < 512; i++ {
+		sum += uint32(raw[i])
+	}
+	copy(raw[148:154], fmtOctal(sum, 6))
+	raw[154] = 0x00
+	raw[155] = ' '
+
+	// Step 4: wrap in gzip and write to a temp file.
+	f, err := os.CreateTemp(t.TempDir(), "stemcell-negsize-*.tgz")
+	if err != nil {
+		t.Fatalf("makeNegativeSizeTar: create: %v", err)
+	}
+	gw, err := gzip.NewWriterLevel(f, gzip.BestSpeed)
+	if err != nil {
+		t.Fatalf("makeNegativeSizeTar: gzip: %v", err)
+	}
+	if _, werr := gw.Write(raw); werr != nil {
+		t.Fatalf("makeNegativeSizeTar: gzip write: %v", werr)
+	}
+	if cerr := gw.Close(); cerr != nil {
+		t.Fatalf("makeNegativeSizeTar: gzip close: %v", cerr)
+	}
+	if cerr := f.Close(); cerr != nil {
+		t.Fatalf("makeNegativeSizeTar: file close: %v", cerr)
+	}
+	return f.Name()
+}
+
+// fmtOctal renders v as an n-digit zero-padded octal string.
+func fmtOctal(v uint32, n int) string {
+	buf := make([]byte, n)
+	for i := n - 1; i >= 0; i-- {
+		buf[i] = byte('0' + (v & 0o7))
+		v >>= 3
+	}
+	return string(buf)
+}
+
+// TestCreateStemcell_RejectsNegativeHdrSize verifies that a tarball whose
+// regular-file entry declares a negative Size (via the GNU base-256 sign
+// extension) is rejected with a Cloud error before any disk I/O.
+//
+// Two-layered defense: archive/tar.Reader's handleRegularFile rejects
+// negative Size with ErrHeader at parse time, and our resolveStemcellImage
+// wraps that as a Cloud error before returning. The production code also
+// carries an explicit hdr.Size < 0 guard as belt-and-suspenders for the
+// case where a future archive/tar release loosens its check, or where a
+// caller bypasses archive/tar entirely; that guard returns a more specific
+// "malformed tar header (negative size N for NAME)" message.
+//
+// This test asserts the outer behavior: a negative-size tar is rejected
+// with a Cloud error and DetachDisk-equivalent side effects do not occur.
+// It accepts either the archive/tar reader's message ("invalid tar header")
+// or the explicit guard message ("negative size") so the test stays valid
+// across Go stdlib revisions.
+func TestCreateStemcell_RejectsNegativeHdrSize(t *testing.T) {
+	t.Parallel()
+
+	tgzPath := makeNegativeSizeTar(t, "root.img")
+
+	deps := makeDeps(defaultStemcellClient())
+	h := handlers.HandleCreateStemcell(deps)
+
+	cp := map[string]any{"name": "ubuntu-jammy", "version": "1.0", "disk_format": "qcow2"}
+	args := []json.RawMessage{marshalArg(t, tgzPath), marshalArg(t, cp)}
+
+	_, err := h.Handle(context.Background(), args, jsonrpc.Context{})
+	if err == nil {
+		t.Fatal("expected error for negative tar header size; got nil")
+	}
+	msg := err.Error()
+	if !containsSubstr(msg, "negative size") && !containsSubstr(msg, "invalid tar header") {
+		t.Errorf("error %q does not mention 'negative size' or 'invalid tar header'", msg)
+	}
+}
+
+// TestCreateStemcell_NoImgCandidateError verifies that a tarball whose
+// only candidate is a zero-byte .img file lands in the imgPath=="" branch
+// of the candidate-selection logic and is rejected with a Cloud error that
+// names the source tarball. Without this guard the upload path would
+// receive an empty source path and attempt to read zero bytes — a silent
+// failure mode that produces an unusable stemcell volume in PVE.
+//
+// Selection arithmetic: a 0-byte .img file bypasses the small-skip filter
+// (which only drops non-.img files below 1 MiB), so it survives as a
+// tarCandidate with size=0. The selection loop compares c.size > imgSize
+// (imgSize starts at 0), so the comparison is false and imgPath stays "".
+// The non-.img fallback branch also stays empty because the only candidate
+// is an .img. After the fallback step imgPath is still "" — the new guard
+// then surfaces a specific error rather than letting the empty path leak
+// into the magic-byte stat and upload steps.
+func TestCreateStemcell_NoImgCandidateError(t *testing.T) {
+	t.Parallel()
+
+	// Single zero-byte non-root .img file: isImg=true (so it survives the
+	// small-file skip filter), size=0 (so c.size > imgSize == 0 is false),
+	// and name != "root.img" (so the equal-size tiebreaker does not fire
+	// either). The fallback non-.img branch is also empty because the only
+	// candidate IS an .img. The result is imgPath == "" after selection —
+	// exactly the branch the new guard protects.
+	tgzPath := makeStemcellTar(t, map[string][]byte{
+		"empty.img": nil, // zero-byte declared and written; not "root.img"
+	})
+
+	deps := makeDeps(defaultStemcellClient())
+	h := handlers.HandleCreateStemcell(deps)
+
+	cp := map[string]any{"name": "ubuntu-jammy", "version": "1.0", "disk_format": "qcow2"}
+	args := []json.RawMessage{marshalArg(t, tgzPath), marshalArg(t, cp)}
+
+	_, err := h.Handle(context.Background(), args, jsonrpc.Context{})
+	if err == nil {
+		t.Fatal("expected error when tarball has no usable disk image candidate; got nil")
+	}
+	if !containsSubstr(err.Error(), "no usable disk image candidate") {
+		t.Errorf("error %q does not mention 'no usable disk image candidate'", err.Error())
+	}
+}
+
+// TestCreateStemcell_RejectsPathOutsideStagingRoot verifies the path-containment
+// guard. The handler must refuse to open an image_path that
+// resolves outside the permitted staging root (os.TempDir()). The error message
+// names the path and the "outside permitted staging root" phrase so operators
+// see immediately that the request was rejected by policy, not by I/O failure.
+//
+// Two paths are exercised:
+//   - /etc/passwd — a classic probe target that exists on every Linux host.
+//   - A constructed path under /var that does not exist; the containment guard
+//     must fire BEFORE the stat call so a non-existent escape still surfaces
+//     the policy error (not a "file not found" leak).
+func TestCreateStemcell_RejectsPathOutsideStagingRoot(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name      string
+		imagePath string
+	}{
+		{name: "etc-passwd", imagePath: "/etc/passwd"},
+		{name: "var-nonexistent", imagePath: "/var/no-such-stemcell-staging/img.tgz"},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			deps := makeDeps(defaultStemcellClient())
+			h := handlers.HandleCreateStemcell(deps)
+
+			cp := map[string]any{"name": "ubuntu-jammy", "version": "1.0", "disk_format": "qcow2"}
+			args := []json.RawMessage{marshalArg(t, tc.imagePath), marshalArg(t, cp)}
+
+			_, err := h.Handle(context.Background(), args, jsonrpc.Context{})
+			if err == nil {
+				t.Fatalf("expected containment rejection for %q; got nil", tc.imagePath)
+			}
+			msg := err.Error()
+			if !containsSubstr(msg, "outside permitted staging root") {
+				t.Errorf("error %q does not mention 'outside permitted staging root'", msg)
+			}
+			if !containsSubstr(msg, tc.imagePath) {
+				t.Errorf("error %q does not echo the rejected path %q", msg, tc.imagePath)
+			}
+		})
+	}
+}
+
+// TestCreateStemcell_AcceptsPathUnderTempDir is the positive companion to
+// TestCreateStemcell_RejectsPathOutsideStagingRoot: a path under os.TempDir()
+// (via t.TempDir()) must pass the containment check and proceed to the next
+// validation stage. The test asserts the handler does NOT short-circuit with
+// the staging-root rejection error for a well-located path; it may still fail
+// at later stages (magic-byte detection, missing cluster mocks, etc.), which
+// is fine — the assertion is specifically that the policy guard is not the
+// failure mode.
+func TestCreateStemcell_AcceptsPathUnderTempDir(t *testing.T) {
+	t.Parallel()
+
+	imgPath := tempImageFile(t) // lives under os.TempDir() via t.TempDir()
+
+	deps := makeDeps(defaultStemcellClient())
+	h := handlers.HandleCreateStemcell(deps)
+
+	cp := map[string]any{"name": "ubuntu-jammy", "version": "1.0", "disk_format": "qcow2"}
+	args := []json.RawMessage{marshalArg(t, imgPath), marshalArg(t, cp)}
+
+	_, err := h.Handle(context.Background(), args, jsonrpc.Context{})
+	// Any later-stage error is acceptable; this test only guards against the
+	// staging-root rejection misfiring on a legitimate path.
+	if err != nil && containsSubstr(err.Error(), "outside permitted staging root") {
+		t.Errorf("staging-root guard rejected a legitimate temp path %q: %v", imgPath, err)
 	}
 }
 

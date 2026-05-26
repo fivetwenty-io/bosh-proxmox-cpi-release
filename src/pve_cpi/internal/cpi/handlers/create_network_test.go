@@ -121,7 +121,7 @@ func TestHandleCreateNetwork_SDN_HappyPath(t *testing.T) {
 		t.Fatalf("cloud_properties_out is not map: %T", arr[2])
 	}
 	if cp["bridge"] != "boshvnet" {
-		t.Errorf("bridge must equal vnet name (D-06); got %v", cp["bridge"])
+		t.Errorf("bridge must equal vnet name; got %v", cp["bridge"])
 	}
 }
 
@@ -146,6 +146,15 @@ func TestHandleCreateNetwork_SDN_WithSubnet(t *testing.T) {
 				t.Errorf("gateway: got %v, want 10.0.0.1", params.Gateway)
 			}
 			return nil
+		},
+		// SDN mock defaults panic on unconfigured calls. Opt in
+		// to the create-vnet + apply mutations the SDN path performs after a
+		// 404 from GetSdnVnets.
+		createSdnVnetsFn: func(_ context.Context, _ *sdkcluster.CreateSdnVnetsParams) error {
+			return nil
+		},
+		updateSdnFn: func(_ context.Context, _ *sdkcluster.UpdateSdnParams) (*sdkcluster.UpdateSdnResponse, error) {
+			return nil, nil
 		},
 	}
 
@@ -191,6 +200,11 @@ func TestHandleCreateNetwork_SDN_IdempotentVnetExists(t *testing.T) {
 		createSdnVnetsFn: func(_ context.Context, _ *sdkcluster.CreateSdnVnetsParams) error {
 			createVnetCalled = true
 			return nil
+		},
+		// Opt in to UpdateSdn — the SDN path always commits after a
+		// successful vnet probe, even on the idempotent re-create branch.
+		updateSdnFn: func(_ context.Context, _ *sdkcluster.UpdateSdnParams) (*sdkcluster.UpdateSdnResponse, error) {
+			return nil, nil
 		},
 	}
 
@@ -282,6 +296,14 @@ func TestHandleCreateNetwork_SDN_ZoneMissingAutoManageTrue(t *testing.T) {
 		},
 		getSdnVnetsFn: func(_ context.Context, _ string, _ *sdkcluster.GetSdnVnetsParams) (*sdkcluster.GetSdnVnetsResponse, error) {
 			return nil, sdnNotFound()
+		},
+		// Opt in to vnet create + apply mutations the SDN path runs
+		// after auto-managed zone creation.
+		createSdnVnetsFn: func(_ context.Context, _ *sdkcluster.CreateSdnVnetsParams) error {
+			return nil
+		},
+		updateSdnFn: func(_ context.Context, _ *sdkcluster.UpdateSdnParams) (*sdkcluster.UpdateSdnResponse, error) {
+			return nil, nil
 		},
 	}
 
@@ -429,6 +451,13 @@ func TestHandleCreateNetwork_SDN_ConfigZoneFallback(t *testing.T) {
 		getSdnVnetsFn: func(_ context.Context, _ string, _ *sdkcluster.GetSdnVnetsParams) (*sdkcluster.GetSdnVnetsResponse, error) {
 			return nil, sdnNotFound()
 		},
+		// Opt in to vnet create + apply mutations the SDN path runs.
+		createSdnVnetsFn: func(_ context.Context, _ *sdkcluster.CreateSdnVnetsParams) error {
+			return nil
+		},
+		updateSdnFn: func(_ context.Context, _ *sdkcluster.UpdateSdnParams) (*sdkcluster.UpdateSdnResponse, error) {
+			return nil, nil
+		},
 	}
 
 	// zone comes from config, not cloud_properties
@@ -472,7 +501,7 @@ func TestHandleCreateNetwork_SDN_VnetNameInvalidChars(t *testing.T) {
 	}
 }
 
-// -- ensure bridge returned in cloud_properties_out uses vnet name not "vmbr"+vnet (D-06) --
+// -- ensure bridge returned in cloud_properties_out uses vnet name not "vmbr"+vnet --
 
 func TestHandleCreateNetwork_SDN_BridgeEqualsVnet(t *testing.T) {
 	clusterSvc := &mockSDNCluster{
@@ -482,6 +511,13 @@ func TestHandleCreateNetwork_SDN_BridgeEqualsVnet(t *testing.T) {
 		},
 		getSdnVnetsFn: func(_ context.Context, _ string, _ *sdkcluster.GetSdnVnetsParams) (*sdkcluster.GetSdnVnetsResponse, error) {
 			return nil, sdnNotFound()
+		},
+		// Opt in to vnet create + apply mutations.
+		createSdnVnetsFn: func(_ context.Context, _ *sdkcluster.CreateSdnVnetsParams) error {
+			return nil
+		},
+		updateSdnFn: func(_ context.Context, _ *sdkcluster.UpdateSdnParams) (*sdkcluster.UpdateSdnResponse, error) {
+			return nil, nil
 		},
 	}
 	spec := map[string]any{
@@ -497,10 +533,10 @@ func TestHandleCreateNetwork_SDN_BridgeEqualsVnet(t *testing.T) {
 	}
 	cp := result.([]any)[2].(map[string]any)
 	if cp["bridge"] != "net01" {
-		t.Errorf("D-06 violation: bridge=%v, want net01 (the vnet name)", cp["bridge"])
+		t.Errorf("invariant: bridge=%v, want net01 (the vnet name)", cp["bridge"])
 	}
 	if strings.HasPrefix(cp["bridge"].(string), "vmbr") {
-		t.Errorf("D-06 violation: bridge must not be vmbr-prefixed: %v", cp["bridge"])
+		t.Errorf("invariant: bridge must not be vmbr-prefixed: %v", cp["bridge"])
 	}
 }
 
@@ -630,6 +666,13 @@ func TestHandleCreateNetwork_SDN_ReservedIsEmptySlice(t *testing.T) {
 		getSdnVnetsFn: func(_ context.Context, _ string, _ *sdkcluster.GetSdnVnetsParams) (*sdkcluster.GetSdnVnetsResponse, error) {
 			return nil, sdnNotFound()
 		},
+		// Opt in to vnet create + apply mutations.
+		createSdnVnetsFn: func(_ context.Context, _ *sdkcluster.CreateSdnVnetsParams) error {
+			return nil
+		},
+		updateSdnFn: func(_ context.Context, _ *sdkcluster.UpdateSdnParams) (*sdkcluster.UpdateSdnResponse, error) {
+			return nil, nil
+		},
 	}
 	spec := map[string]any{"type": "manual", "cloud_properties": map[string]any{"zone": "z", "vnet": "net01"}}
 	result, err := invokeCreateNetwork(t, testSDNDeps(clusterSvc, "sdn", "", false), spec)
@@ -675,7 +718,7 @@ func TestHandleCreateNetwork_Bridge_CreateError(t *testing.T) {
 
 // -- CN-RB-01: subnet-create failure → vnet rollback + applySDN(rollback) called; original error returned --
 //
-// Verifies F-1 (rollback apply) and F-7 (vnetCreated gates rollback, not spec.Range).
+// Verifies the rollback apply contract: vnetCreated gates rollback, not spec.Range.
 
 func TestHandleCreateNetwork_SDN_Rollback_SubnetFails(t *testing.T) {
 	var deleteVnetCalled bool
@@ -729,7 +772,7 @@ func TestHandleCreateNetwork_SDN_Rollback_SubnetFails(t *testing.T) {
 
 // -- CN-RB-02: apply failure after vnet+subnet created → rollback deletes both; applySDN(rollback) called --
 //
-// Verifies F-1 (rollback apply) and F-7 (subnetCreated=true gates subnet delete).
+// Verifies the rollback apply contract: subnetCreated=true gates subnet delete.
 
 func TestHandleCreateNetwork_SDN_Rollback_ApplyFails(t *testing.T) {
 	var deleteVnetCalled bool
@@ -795,7 +838,7 @@ func TestHandleCreateNetwork_SDN_Rollback_ApplyFails(t *testing.T) {
 
 // -- CN-RB-03: vnet pre-exists (GetSdnVnets ok → vnetCreated=false); later failure must NOT delete vnet/subnet --
 //
-// Verifies F-7: rollback is gated on *Created bools, not on spec.Range/vnet values.
+// Verifies rollback is gated on *Created bools, not on spec.Range/vnet values.
 // When a concurrent apply failure occurs and the vnet was pre-existing, rollback must
 // leave the operator's vnet and any pre-existing subnet untouched.
 
@@ -945,3 +988,215 @@ func TestHandleCreateNetwork_SubnetCreateFails_RollsBackZoneAndVnet(t *testing.T
 
 // ensure testConfig() satisfies compile-time check that *config.CPIConfig is used
 var _ *config.CPIConfig = testConfig()
+
+// -- TestCreateNetwork_RollbackSurvivesParentCancel --
+//
+// Verifies that when the caller's context is cancelled mid-flow, the
+// best-effort rollback path still executes its cleanup I/O — i.e. the
+// rollback uses a detached context that survives parent cancellation.
+//
+// Sequence under test:
+//  1. GetSdnZones returns the zone.
+//  2. GetSdnVnets returns 404.
+//  3. CreateSdnVnets succeeds (vnetCreated=true). At this point the test
+//     cancels the parent context, simulating an upstream abort.
+//  4. CreateSdnVnetsSubnets returns a non-409 error, triggering rollback.
+//  5. The rollback must call DeleteSdnVnets and UpdateSdn (apply) even
+//     though the parent context is already cancelled.
+
+func TestCreateNetwork_RollbackSurvivesParentCancel(t *testing.T) {
+	parentCtx, cancel := context.WithCancel(context.Background())
+
+	var deleteVnetCtxErr error
+	var applyCtxErr error
+	var rollbackDeleteCalled, rollbackApplyCalled bool
+
+	clusterSvc := &mockSDNCluster{
+		getSdnZonesFn: func(_ context.Context, _ string, _ *sdkcluster.GetSdnZonesParams) (*sdkcluster.GetSdnZonesResponse, error) {
+			raw := sdkcluster.GetSdnZonesResponse(`{"zone":"z"}`)
+			return &raw, nil
+		},
+		getSdnVnetsFn: func(_ context.Context, _ string, _ *sdkcluster.GetSdnVnetsParams) (*sdkcluster.GetSdnVnetsResponse, error) {
+			return nil, sdnNotFound()
+		},
+		createSdnVnetsFn: func(_ context.Context, _ *sdkcluster.CreateSdnVnetsParams) error {
+			// Vnet created — now cancel the parent ctx, simulating an abort
+			// from the upstream caller right before subnet create runs.
+			cancel()
+			return nil
+		},
+		createSdnVnetsSubnetsFn: func(_ context.Context, _ string, _ *sdkcluster.CreateSdnVnetsSubnetsParams) error {
+			return &pveerr.APIError{} // triggers rollback path
+		},
+		deleteSdnVnetsFn: func(ctx context.Context, _ string, _ *sdkcluster.DeleteSdnVnetsParams) error {
+			rollbackDeleteCalled = true
+			deleteVnetCtxErr = ctx.Err()
+			return nil
+		},
+		updateSdnFn: func(ctx context.Context, _ *sdkcluster.UpdateSdnParams) (*sdkcluster.UpdateSdnResponse, error) {
+			rollbackApplyCalled = true
+			applyCtxErr = ctx.Err()
+			return nil, nil
+		},
+	}
+
+	spec := map[string]any{
+		"type":  "manual",
+		"range": "10.0.0.0/24",
+		"cloud_properties": map[string]any{
+			"zone": "z",
+			"vnet": "myvnet",
+		},
+	}
+	deps := testSDNDeps(clusterSvc, "sdn", "", false)
+	h := handlers.HandleCreateNetwork(deps)
+	raw := marshalArgs(spec)
+	_, err := h.Handle(parentCtx, raw, jsonrpc.Context{})
+	if err == nil {
+		t.Fatal("expected subnet-create error to bubble up")
+	}
+	if !rollbackDeleteCalled {
+		t.Fatal("rollback DeleteSdnVnets must run despite parent cancel")
+	}
+	if !rollbackApplyCalled {
+		t.Fatal("rollback UpdateSdn (apply) must run despite parent cancel")
+	}
+	if deleteVnetCtxErr != nil {
+		t.Errorf("rollback DeleteSdnVnets ctx must NOT carry cancel; got %v", deleteVnetCtxErr)
+	}
+	if applyCtxErr != nil {
+		t.Errorf("rollback UpdateSdn ctx must NOT carry cancel; got %v", applyCtxErr)
+	}
+}
+
+// -- TestCreateNetwork_Concurrent_IdempotentOnExisting --
+//
+// Verifies that when GetSdnVnets reports the vnet already exists (e.g. a
+// concurrent caller created it first), the handler does NOT call
+// CreateSdnVnets again and returns the same vnet identity. The handler must
+// still commit via UpdateSdn so any pending zone-config state for the
+// observed vnet is applied for the new caller's session.
+
+func TestCreateNetwork_Concurrent_IdempotentOnExisting(t *testing.T) {
+	var createVnetCalled bool
+	var applyCalled bool
+
+	clusterSvc := &mockSDNCluster{
+		getSdnZonesFn: func(_ context.Context, _ string, _ *sdkcluster.GetSdnZonesParams) (*sdkcluster.GetSdnZonesResponse, error) {
+			raw := sdkcluster.GetSdnZonesResponse(`{"zone":"z"}`)
+			return &raw, nil
+		},
+		getSdnVnetsFn: func(_ context.Context, vnet string, _ *sdkcluster.GetSdnVnetsParams) (*sdkcluster.GetSdnVnetsResponse, error) {
+			if vnet != "shared" {
+				t.Errorf("get vnet name: got %q, want shared", vnet)
+			}
+			raw := sdkcluster.GetSdnVnetsResponse(`{"vnet":"shared","zone":"z"}`)
+			return &raw, nil
+		},
+		createSdnVnetsFn: func(_ context.Context, _ *sdkcluster.CreateSdnVnetsParams) error {
+			createVnetCalled = true
+			return nil
+		},
+		updateSdnFn: func(_ context.Context, _ *sdkcluster.UpdateSdnParams) (*sdkcluster.UpdateSdnResponse, error) {
+			applyCalled = true
+			return nil, nil
+		},
+	}
+
+	spec := map[string]any{
+		"type": "manual",
+		"cloud_properties": map[string]any{
+			"zone": "z",
+			"vnet": "shared",
+		},
+	}
+	result, err := invokeCreateNetwork(t, testSDNDeps(clusterSvc, "sdn", "", false), spec)
+	if err != nil {
+		t.Fatalf("idempotent observe must succeed; got: %v", err)
+	}
+	if createVnetCalled {
+		t.Error("CreateSdnVnets must NOT be called when vnet already exists")
+	}
+	if !applyCalled {
+		t.Error("UpdateSdn must still be called to commit any pending state")
+	}
+	arr, ok := result.([]any)
+	if !ok || len(arr) != 3 {
+		t.Fatalf("expected 3-element response, got %T %v", result, result)
+	}
+	if arr[0] != "shared" {
+		t.Errorf("network_cid: got %v, want shared", arr[0])
+	}
+	cp := arr[2].(map[string]any)
+	if cp["vnet"] != "shared" || cp["bridge"] != "shared" {
+		t.Errorf("idempotent response must echo vnet/bridge=shared; got %v", cp)
+	}
+}
+
+// -- TestCreateNetwork_ZoneAlreadyExists_NoError --
+//
+// Verifies that when sdn_auto_manage_zone is true but the requested zone is
+// already present in PVE, the handler treats the GetSdnZones success as
+// "do not create" and does NOT mark createdZone. A subsequent rollback must
+// therefore NOT delete the operator-owned zone, even if a later step fails.
+
+func TestCreateNetwork_ZoneAlreadyExists_NoError(t *testing.T) {
+	var createZoneCalled bool
+	var deleteZoneCalled bool
+	var deleteVnetCalled bool
+
+	clusterSvc := &mockSDNCluster{
+		getSdnZonesFn: func(_ context.Context, _ string, _ *sdkcluster.GetSdnZonesParams) (*sdkcluster.GetSdnZonesResponse, error) {
+			// Zone is present — no 404.
+			raw := sdkcluster.GetSdnZonesResponse(`{"zone":"existingzone","type":"simple"}`)
+			return &raw, nil
+		},
+		createSdnZonesFn: func(_ context.Context, _ *sdkcluster.CreateSdnZonesParams) error {
+			createZoneCalled = true
+			return nil
+		},
+		getSdnVnetsFn: func(_ context.Context, _ string, _ *sdkcluster.GetSdnVnetsParams) (*sdkcluster.GetSdnVnetsResponse, error) {
+			return nil, sdnNotFound()
+		},
+		createSdnVnetsFn: func(_ context.Context, _ *sdkcluster.CreateSdnVnetsParams) error {
+			return nil
+		},
+		createSdnVnetsSubnetsFn: func(_ context.Context, _ string, _ *sdkcluster.CreateSdnVnetsSubnetsParams) error {
+			// Force rollback so we can confirm zone is NOT deleted.
+			return &pveerr.APIError{}
+		},
+		deleteSdnZonesFn: func(_ context.Context, _ string, _ *sdkcluster.DeleteSdnZonesParams) error {
+			deleteZoneCalled = true
+			return nil
+		},
+		deleteSdnVnetsFn: func(_ context.Context, _ string, _ *sdkcluster.DeleteSdnVnetsParams) error {
+			deleteVnetCalled = true
+			return nil
+		},
+		updateSdnFn: func(_ context.Context, _ *sdkcluster.UpdateSdnParams) (*sdkcluster.UpdateSdnResponse, error) {
+			return nil, nil
+		},
+	}
+
+	spec := map[string]any{
+		"type":  "manual",
+		"range": "10.0.0.0/24",
+		"cloud_properties": map[string]any{
+			"zone": "existingzone",
+			"vnet": "myvnet",
+		},
+	}
+	_, err := invokeCreateNetwork(t, testSDNDeps(clusterSvc, "sdn", "", true), spec)
+	if err == nil {
+		t.Fatal("expected subnet-create failure to bubble up")
+	}
+	if createZoneCalled {
+		t.Error("CreateSdnZones must NOT be called when zone already exists")
+	}
+	if !deleteVnetCalled {
+		t.Error("rollback DeleteSdnVnets must run because vnetCreated=true")
+	}
+	if deleteZoneCalled {
+		t.Error("rollback must NOT delete a pre-existing zone (createdZone=false)")
+	}
+}

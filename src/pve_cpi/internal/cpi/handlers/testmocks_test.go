@@ -251,9 +251,48 @@ func boolPtr(b bool) *bool { return &b }
 // testConfig
 // --------------------------------------------------------------------------
 
+// testConfigOption is a functional option that modifies a CPIConfig returned
+// by testConfig or testConfigWith.
+type testConfigOption func(*config.CPIConfig)
+
+// WithStorageType returns a testConfigOption that sets VMStorage and DiskStorage
+// to a pool name that reflects the given PVE storage type.
+// Accepted values: "zfspool", "lvmthin", "dir".
+// Default (when not applied): "local-lvm" (lvm block storage).
+//
+// This option also updates VMDiskFormat to "raw" for block storages (zfspool,
+// lvmthin) because qcow2 is rejected by those storage types. For "dir" the
+// format stays "qcow2" since dir-type storage supports image formats.
+func WithStorageType(storageType string) testConfigOption {
+	return func(c *config.CPIConfig) {
+		switch storageType {
+		case "zfspool":
+			c.VMStorage = "local-zfs"
+			c.DiskStorage = "local-zfs"
+			c.VMDiskFormat = "raw"
+		case "lvmthin":
+			c.VMStorage = "local-lvm-thin"
+			c.DiskStorage = "local-lvm-thin"
+			c.VMDiskFormat = "raw"
+		case "dir":
+			c.VMStorage = "local"
+			c.DiskStorage = "local"
+			// dir-type storage accepts qcow2; keep the default format.
+		default:
+			panic("WithStorageType: unsupported storage type " + storageType + "; accepted: zfspool, lvmthin, dir")
+		}
+	}
+}
+
 // testConfig returns a minimal CPIConfig for handler tests.
 func testConfig() *config.CPIConfig {
-	return &config.CPIConfig{
+	return testConfigWith()
+}
+
+// testConfigWith returns a minimal CPIConfig with the given options applied.
+// Without options it is equivalent to testConfig().
+func testConfigWith(opts ...testConfigOption) *config.CPIConfig {
+	c := &config.CPIConfig{
 		Host:           "pve.test.local",
 		Port:           8006,
 		User:           "root",
@@ -267,6 +306,10 @@ func testConfig() *config.CPIConfig {
 		VerifySSL:      boolPtr(false),
 		VMIDRangeStart: 100,
 	}
+	for _, o := range opts {
+		o(c)
+	}
+	return c
 }
 
 // --------------------------------------------------------------------------
@@ -371,91 +414,93 @@ type mockSDNCluster struct {
 // compile-time interface check.
 var _ cluster.Service = (*mockSDNCluster)(nil)
 
+// SDN mock defaults panic on unconfigured methods. Tests that exercise the
+// SDN code path MUST explicitly opt into each method by setting the
+// corresponding Fn field. Panic-on-unconfigured surfaces missing mock
+// configuration immediately rather than silently succeeding.
+
 func (m *mockSDNCluster) CreateSdnVnets(ctx context.Context, params *cluster.CreateSdnVnetsParams) error {
 	if m.createSdnVnetsFn != nil {
 		return m.createSdnVnetsFn(ctx, params)
 	}
-	return nil
+	panic("mockSDNCluster.CreateSdnVnets called without configuration; opt in by setting createSdnVnetsFn")
 }
 
 func (m *mockSDNCluster) DeleteSdnVnets(ctx context.Context, vnet string, params *cluster.DeleteSdnVnetsParams) error {
 	if m.deleteSdnVnetsFn != nil {
 		return m.deleteSdnVnetsFn(ctx, vnet, params)
 	}
-	return nil
+	panic("mockSDNCluster.DeleteSdnVnets called without configuration; opt in by setting deleteSdnVnetsFn")
 }
 
 func (m *mockSDNCluster) GetSdnVnets(ctx context.Context, vnet string, params *cluster.GetSdnVnetsParams) (*cluster.GetSdnVnetsResponse, error) {
 	if m.getSdnVnetsFn != nil {
 		return m.getSdnVnetsFn(ctx, vnet, params)
 	}
-	return nil, nil
+	panic("mockSDNCluster.GetSdnVnets called without configuration; opt in by setting getSdnVnetsFn")
 }
 
 func (m *mockSDNCluster) ListSdnVnets(ctx context.Context, params *cluster.ListSdnVnetsParams) (*cluster.ListSdnVnetsResponse, error) {
 	if m.listSdnVnetsFn != nil {
 		return m.listSdnVnetsFn(ctx, params)
 	}
-	empty := cluster.ListSdnVnetsResponse{}
-	return &empty, nil
+	panic("mockSDNCluster.ListSdnVnets called without configuration; opt in by setting listSdnVnetsFn")
 }
 
 func (m *mockSDNCluster) CreateSdnZones(ctx context.Context, params *cluster.CreateSdnZonesParams) error {
 	if m.createSdnZonesFn != nil {
 		return m.createSdnZonesFn(ctx, params)
 	}
-	return nil
+	panic("mockSDNCluster.CreateSdnZones called without configuration; opt in by setting createSdnZonesFn")
 }
 
 func (m *mockSDNCluster) DeleteSdnZones(ctx context.Context, zone string, params *cluster.DeleteSdnZonesParams) error {
 	if m.deleteSdnZonesFn != nil {
 		return m.deleteSdnZonesFn(ctx, zone, params)
 	}
-	return nil
+	panic("mockSDNCluster.DeleteSdnZones called without configuration; opt in by setting deleteSdnZonesFn")
 }
 
 func (m *mockSDNCluster) GetSdnZones(ctx context.Context, zone string, params *cluster.GetSdnZonesParams) (*cluster.GetSdnZonesResponse, error) {
 	if m.getSdnZonesFn != nil {
 		return m.getSdnZonesFn(ctx, zone, params)
 	}
-	return nil, nil
+	panic("mockSDNCluster.GetSdnZones called without configuration; opt in by setting getSdnZonesFn")
 }
 
 func (m *mockSDNCluster) ListSdnZones(ctx context.Context, params *cluster.ListSdnZonesParams) (*cluster.ListSdnZonesResponse, error) {
 	if m.listSdnZonesFn != nil {
 		return m.listSdnZonesFn(ctx, params)
 	}
-	empty := cluster.ListSdnZonesResponse{}
-	return &empty, nil
+	panic("mockSDNCluster.ListSdnZones called without configuration; opt in by setting listSdnZonesFn")
 }
 
 func (m *mockSDNCluster) CreateSdnVnetsSubnets(ctx context.Context, vnet string, params *cluster.CreateSdnVnetsSubnetsParams) error {
 	if m.createSdnVnetsSubnetsFn != nil {
 		return m.createSdnVnetsSubnetsFn(ctx, vnet, params)
 	}
-	return nil
+	panic("mockSDNCluster.CreateSdnVnetsSubnets called without configuration; opt in by setting createSdnVnetsSubnetsFn")
 }
 
 func (m *mockSDNCluster) DeleteSdnVnetsSubnets(ctx context.Context, vnet string, subnet string, params *cluster.DeleteSdnVnetsSubnetsParams) error {
 	if m.deleteSdnVnetsSubnetsFn != nil {
 		return m.deleteSdnVnetsSubnetsFn(ctx, vnet, subnet, params)
 	}
-	return nil
+	panic("mockSDNCluster.DeleteSdnVnetsSubnets called without configuration; opt in by setting deleteSdnVnetsSubnetsFn")
 }
 
 func (m *mockSDNCluster) ListSdnVnetsSubnets(ctx context.Context, vnet string, params *cluster.ListSdnVnetsSubnetsParams) (*cluster.ListSdnVnetsSubnetsResponse, error) {
 	if m.listSdnVnetsSubnetsFn != nil {
 		return m.listSdnVnetsSubnetsFn(ctx, vnet, params)
 	}
-	empty := cluster.ListSdnVnetsSubnetsResponse{}
-	return &empty, nil
+	panic("mockSDNCluster.ListSdnVnetsSubnets called without configuration; opt in by setting listSdnVnetsSubnetsFn")
 }
 
 func (m *mockSDNCluster) UpdateSdn(ctx context.Context, params *cluster.UpdateSdnParams) (*cluster.UpdateSdnResponse, error) {
 	if m.updateSdnFn != nil {
 		return m.updateSdnFn(ctx, params)
 	}
-	return nil, nil
+	panic("mockSDNCluster.UpdateSdn called without configuration; opt in by setting updateSdnFn")
 }
 
 // --------------------------------------------------------------------------

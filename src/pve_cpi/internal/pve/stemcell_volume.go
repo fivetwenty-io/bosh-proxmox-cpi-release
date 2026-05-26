@@ -57,7 +57,8 @@ func sanitizeStemcellPart(s string) string {
 	prevDash := false
 	for _, r := range s {
 		if isAllowedStemcellRune(r) {
-			buf = append(buf, byte(r)) // r is ASCII at this point (a-z, 0-9, '.', '_')
+			// #nosec G115 -- isAllowedStemcellRune restricts r to ASCII [a-z0-9._]; rune-to-byte truncation is safe.
+			buf = append(buf, byte(r))
 			prevDash = false
 		} else {
 			if !prevDash {

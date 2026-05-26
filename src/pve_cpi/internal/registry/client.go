@@ -6,6 +6,8 @@ package registry
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -35,18 +37,73 @@ type Client struct {
 	http     *http.Client
 }
 
-// NewClient constructs a Client for the registry at endpoint.
-// Trailing slashes on endpoint are trimmed. The underlying http.Client
-// uses a 30-second per-attempt timeout with no connection keep-alive limit.
+// defaultClientTimeout is the per-attempt timeout applied by NewClient when
+// the caller does not override it via Options.Timeout.
+const defaultClientTimeout = 30 * time.Second
+
+// Options carries optional knobs for NewClientWithOptions. The zero value is
+// valid and selects safe defaults: TLS 1.2 floor, system trust pool, 30s
+// per-attempt timeout.
+type Options struct {
+	// CACertPEM is an optional PEM-encoded CA certificate (or chain) appended
+	// to the system trust pool when verifying the registry's TLS certificate.
+	// Empty means use the system pool unmodified.
+	CACertPEM string
+
+	// Timeout overrides the per-attempt http.Client.Timeout. Zero or negative
+	// values fall back to defaultClientTimeout.
+	Timeout time.Duration
+}
+
+// NewClient constructs a Client for the registry at endpoint with default
+// transport options (TLS 1.2 floor, system trust pool, 30-second per-attempt
+// timeout). Trailing slashes on endpoint are trimmed.
+//
+// This is a thin wrapper over NewClientWithOptions retained for backward
+// compatibility with existing call sites.
 func NewClient(endpoint, user, pass string) *Client {
+	c, _ := NewClientWithOptions(endpoint, user, pass, Options{})
+	return c
+}
+
+// NewClientWithOptions constructs a Client with explicit transport options.
+// The HTTP client is configured with an http.Transport carrying a tls.Config
+// pinned to TLS 1.2 minimum; when opts.CACertPEM is non-empty the PEM is
+// appended to a copy of the system trust pool and assigned to RootCAs.
+//
+// Returns an error only when opts.CACertPEM is non-empty and cannot be parsed
+// (either x509.SystemCertPool fails or no certificates are decoded from PEM).
+// Callers may safely ignore the error when they pass an empty CACertPEM.
+func NewClientWithOptions(endpoint, user, pass string, opts Options) (*Client, error) {
+	tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12}
+	if opts.CACertPEM != "" {
+		pool, err := x509.SystemCertPool()
+		if err != nil {
+			// On platforms without a system pool (or when retrieval fails) start
+			// from an empty pool so the caller-supplied CA is still honored.
+			pool = x509.NewCertPool()
+		}
+		if !pool.AppendCertsFromPEM([]byte(opts.CACertPEM)) {
+			return nil, cpierrors.Cloud("registry: NewClientWithOptions: no PEM certificates parsed from CACertPEM")
+		}
+		tlsCfg.RootCAs = pool
+	}
+	timeout := opts.Timeout
+	if timeout <= 0 {
+		timeout = defaultClientTimeout
+	}
+	// Documented: TLS 1.2 floor pinned for every registry request; CACertPEM (when
+	// provided) augments the system trust pool, never replaces it.
+	transport := &http.Transport{TLSClientConfig: tlsCfg}
 	return &Client{
 		endpoint: strings.TrimRight(endpoint, "/"),
 		user:     user,
 		pass:     pass,
 		http: &http.Client{
-			Timeout: 30 * time.Second,
+			Timeout:   timeout,
+			Transport: transport,
 		},
-	}
+	}, nil
 }
 
 // retryMaxAttempts is the total number of attempts (1 initial + 2 retries).
@@ -54,6 +111,14 @@ const retryMaxAttempts = 3
 
 // retryBaseDelay is the base backoff interval before the first retry.
 const retryBaseDelay = 200 * time.Millisecond
+
+// maxRegistryRespBody caps the bytes read from any registry response body.
+// The BOSH registry settings document is well under 64 KiB in production; a
+// 1 MiB ceiling absorbs reasonable growth while preventing a malicious or
+// runaway endpoint from forcing the CPI to allocate unbounded memory while
+// reading a response. Applied uniformly to error-message bodies and to
+// the settings envelope itself.
+const maxRegistryRespBody = 1 << 20
 
 // isRetriable reports whether the HTTP response or transport error warrants a retry.
 //
@@ -122,24 +187,42 @@ func backoffDelay(i int) time.Duration {
 // ensure req.GetBody is set when the method has a body (Put sets it automatically
 // using bytes.NewReader; Get and Delete have no body).
 func (c *Client) doWithRetry(req *http.Request) (*http.Response, error) {
+	// drainAndClose discards then closes the prior response body so the
+	// connection is returned to the keep-alive pool and no fd is leaked.
+	// Bounded by maxRegistryRespBody to cap the discard cost in case a
+	// server hands back a large error page.
+	drainAndClose := func(r *http.Response) {
+		if r == nil || r.Body == nil {
+			return
+		}
+		_, _ = io.Copy(io.Discard, io.LimitReader(r.Body, maxRegistryRespBody))
+		r.Body.Close()
+	}
+
 	var (
 		resp *http.Response
 		err  error
 	)
 	for attempt := 0; attempt < retryMaxAttempts; attempt++ {
 		if attempt > 0 {
-			// Re-wind the request body for the retry attempt.
+			// Re-wind the request body for the retry attempt. If GetBody
+			// fails the previous response body (if any) must still be
+			// drained+closed before returning so the connection is released.
 			if req.GetBody != nil {
 				body, gberr := req.GetBody()
 				if gberr != nil {
+					drainAndClose(resp)
 					return nil, gberr
 				}
 				req.Body = body
 			}
-			// Wait for backoff interval or context cancellation.
+			// Wait for backoff interval or context cancellation. Drain+close
+			// the prior response before returning on context cancellation so
+			// the body is not abandoned mid-stream.
 			delay := backoffDelay(attempt - 1)
 			select {
 			case <-req.Context().Done():
+				drainAndClose(resp)
 				return nil, req.Context().Err()
 			case <-time.After(delay):
 			}
@@ -147,15 +230,27 @@ func (c *Client) doWithRetry(req *http.Request) (*http.Response, error) {
 
 		// Drain and close the previous failed response body before retrying.
 		if resp != nil {
-			_, _ = io.Copy(io.Discard, resp.Body)
-			resp.Body.Close()
+			drainAndClose(resp)
 			resp = nil
 		}
 
 		resp, err = c.http.Do(req)
 		if !isRetriable(resp, err) {
+			// Terminal: when both resp and err are non-nil (rare but possible
+			// with some net.http edge cases) close the body now since the
+			// caller receives the err and will not see resp.
+			if err != nil && resp != nil {
+				drainAndClose(resp)
+				return nil, err
+			}
 			return resp, err
 		}
+	}
+	// Loop exhausted. As above, if both resp and err are non-nil, drain+close
+	// since callers treating err as terminal will not consume resp.
+	if err != nil && resp != nil {
+		drainAndClose(resp)
+		return nil, err
 	}
 	return resp, err
 }
@@ -204,7 +299,7 @@ func (c *Client) Put(ctx context.Context, instanceID string, settings any) error
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		respBody, _ := io.ReadAll(resp.Body)
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxRegistryRespBody))
 		return cpierrors.Cloud(
 			"registry: Put %s: unexpected status %d: %s",
 			instanceID, resp.StatusCode, strings.TrimSpace(string(respBody)),
@@ -240,14 +335,14 @@ func (c *Client) Get(ctx context.Context, instanceID string) (json.RawMessage, e
 		return nil, cpierrors.Cloud("registry: Get %s: not found (404)", instanceID)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		respBody, _ := io.ReadAll(resp.Body)
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxRegistryRespBody))
 		return nil, cpierrors.Cloud(
 			"registry: Get %s: unexpected status %d: %s",
 			instanceID, resp.StatusCode, strings.TrimSpace(string(respBody)),
 		)
 	}
 
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxRegistryRespBody))
 	if err != nil {
 		return nil, cpierrors.Cloud("registry: Get %s: read body: %s", instanceID, err.Error())
 	}
@@ -288,7 +383,7 @@ func (c *Client) Delete(ctx context.Context, instanceID string) error {
 		return nil
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		respBody, _ := io.ReadAll(resp.Body)
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxRegistryRespBody))
 		return cpierrors.Cloud(
 			"registry: Delete %s: unexpected status %d: %s",
 			instanceID, resp.StatusCode, strings.TrimSpace(string(respBody)),

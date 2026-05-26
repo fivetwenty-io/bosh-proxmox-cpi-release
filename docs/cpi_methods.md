@@ -129,7 +129,7 @@ A VMID is allocated from the range `[vmid_range_start, 5999]` (default: `[100, 5
 
 **Errors:** `Bosh::Clouds::CloudError` if deletion is not certain (to prevent orphaned VMs)
 
-**Notes:** Stops the VM if running, then destroys it. If persistent disks are attached, the CPI detaches them before destroying the VM. If the VM does not exist, the call succeeds without error.
+**Notes:** Stops the VM if running, then destroys it. The CPI decodes the destroy task UPID and awaits its completion before returning success, so the Director never observes a still-pending volume on the storage backend. If persistent disks are attached, the CPI detaches them before destroying the VM. If the VM does not exist, the call succeeds without error.
 
 ---
 
@@ -432,6 +432,9 @@ network spec. Most deployments that pre-configure networks in PVE do not use
 managed networks and these methods are never called; they are only invoked when
 the BOSH cloud-config marks a network as `managed: true`.
 
+For the full `cloud_properties` schema, zone/vnet/subnet semantics, naming
+rules, and worked manifest examples, see [Network configuration](networks.md).
+
 ---
 
 ### `create_network`
@@ -606,6 +609,6 @@ emptied. Operators who share a zone across deployments must either set
 | 18 | `resize_disk` | Disk | null | No change |
 | 19 | `set_disk_metadata` | Disk | null | No change |
 | 20 | `update_disk` | Disk | null | Extension (PVE-specific) |
-| 21 | `create_network` | Network | [id, addrs, props] | New in v2 (optional) |
-| 22 | `delete_network` | Network | null | New in v2 (optional) |
+| 21 | `create_network` | Network | [id, addrs, props] | New in v2 (optional). Implemented — see [Network configuration](networks.md). |
+| 22 | `delete_network` | Network | null | New in v2 (optional). Implemented — see [Network configuration](networks.md). |
 | — | `configure_networks` | REMOVED | — | Removed in v2 |

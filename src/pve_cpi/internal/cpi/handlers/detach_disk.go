@@ -4,6 +4,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -107,7 +108,7 @@ func HandleDetachDisk(deps Deps) Handler {
 		// --------------------------------------------------------------------
 		diskID, err := pve.ResolveDiskID(ctx, deps.PVE, node, vmid, diskCID)
 		if err != nil {
-			if cpierrors.IsType(err, cpierrors.TypeCloud) || pve.IsNotFound(err) {
+			if errors.Is(err, pve.ErrDiskNotAttached) || pve.IsNotFound(err) {
 				// Disk is not on an active bus. It may still linger as an unusedN
 				// slot: a prior detach with allow_disk_ops_with_snapshots=true
 				// parked it there, but PVE's unusedN sweep was blocked by a
@@ -115,6 +116,11 @@ func HandleDetachDisk(deps Deps) Handler {
 				// here — completing that sweep is what makes the documented "delete
 				// snapshots, then retry detach_disk" recovery actually free the
 				// volume (delete_disk) and unblock delete_vm.
+				//
+				// The sentinel check (errors.Is) narrows the previously broad
+				// TypeCloud catch: any other Cloud error from ResolveDiskID
+				// (validation failures on node/vmid/volid) now propagates as a
+				// real error instead of being silently swallowed as idempotent.
 				swept, sweepErr := sweepUnusedDiskSlot(ctx, deps, node, vmid, vmCID, diskCID)
 				if sweepErr != nil {
 					return nil, sweepErr

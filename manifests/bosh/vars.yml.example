@@ -41,8 +41,13 @@ internal_gw:   192.168.1.1
 internal_ip:   192.168.1.10
 
 # --- Release + stemcell ---------------------------------------------------
-# Absolute path to the tarball from ./scripts/create-release dev
-pve_cpi_release_path: /absolute/path/to/dev_releases/bosh-pve-cpi/bosh-pve-cpi-0+dev.1.tgz
+# Path to the CPI release tarball produced by `make release` or `scripts/create-release`.
+# Override with: bosh int --var release_artifact_path=/abs/path/to/bosh-pve-cpi-VERSION.tgz
+# Capture the path from the RELEASE_TGZ= line printed by scripts/create-release, then
+# pass it at deploy time:
+#   RELEASE_TGZ=$(scripts/create-release dev | grep '^RELEASE_TGZ=' | cut -d= -f2)
+#   bosh int bosh.yml --var release_artifact_path="$RELEASE_TGZ" ...
+pve_cpi_release_path: ((release_artifact_path))
 
 # Ubuntu jammy openstack-kvm stemcell (works on PVE qemu/kvm).
 # Get latest from https://bosh.io/stemcells/bosh-openstack-kvm-ubuntu-jammy-go_agent
@@ -51,3 +56,55 @@ stemcell_sha1: REPLACE_WITH_PUBLISHED_SHA1
 
 # --- Director identity ----------------------------------------------------
 director_name: bosh-pve
+
+# --- Newly wired properties ----------------------------------------------
+# These keys map 1:1 to job spec defaults; override only when you need to
+# deviate from the spec-declared default. Each comment lists the spec default.
+
+# Network mode for create_network / delete_network handlers.
+# One of: auto | sdn | bridge. Spec default: auto.
+pve_network_mode:               auto
+
+# Default PVE SDN zone for vnet creation when cloud_properties.zone is absent.
+# Spec default: "" (per-call zone required when network_mode resolves to sdn).
+pve_sdn_zone:                   ""
+
+# SDN zone type used when the CPI auto-creates a zone.
+# One of: simple | vlan | qinq | vxlan | evpn. Spec default: simple.
+pve_sdn_zone_type:              simple
+
+# When true the CPI manages zone create/delete lifecycle in addition to vnets.
+# Spec default: false (operator owns zones; CPI owns only vnets).
+pve_sdn_auto_manage_zone:       false
+
+# VMID allocation window for create_vm. Persistent disks always use 9000-9999.
+# Spec defaults: 100 / 5999.
+pve_vmid_range_start:           100
+pve_vmid_range_end:             5999
+
+# Snapshot pre-flight guards on attach_disk / detach_disk / resize_disk.
+# Spec defaults: both false (guard active, fail-open on probe failure).
+pve_allow_disk_ops_with_snapshots: false
+pve_require_snapshot_check_pass:   false
+
+# Hotplug flags applied to every new VM. Comma-separated subset of
+# network,disk,cpu,memory,usb,cloudinit (or "0" to disable). Spec default:
+# "network,disk,cpu,memory".
+pve_hotplug:                    "network,disk,cpu,memory"
+
+# Enable NUMA at VM create time. Required for live memory hot-add.
+# Spec default: true.
+pve_numa:                       true
+
+# reboot_vm behavior. One of: soft | hard. Spec default: soft.
+pve_reboot_mode:                soft
+
+# Seconds soft reboot waits for graceful ACPI shutdown before hard reset.
+# Range 1-3600. Spec default: 60.
+pve_reboot_timeout:             60
+
+# Agent settings passed via cloud_provider.properties.agent for `bosh create-env`.
+# pve_agent_mbus MUST be set when running create-env (bosh-init has no per-call
+# env). Spec defaults: "" and {}.
+pve_agent_mbus:                 ""
+pve_agent_blobstore:            {}

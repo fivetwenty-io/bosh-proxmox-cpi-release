@@ -147,9 +147,18 @@ func (l *localBackend) candidateNodes(ctx context.Context) ([]string, error) {
 	}
 
 	typ := "node"
-	resp, err := l.client.Cluster().ListResources(ctx, &sdkcluster.ListResourcesParams{Type: &typ})
-	if err != nil {
-		return nil, cpierrors.Wrap(err, "backend(local): list cluster nodes")
+	// Wrap the cluster-resources listing in RetryOnTransient so a transient
+	// pvedaemon worker recycling during candidate-node discovery does not
+	// abort the entire backend resolve and cascade into a DiskNotFound. The
+	// SDK error is classified through pve.WrapError so retriable transport
+	// faults propagate up as RetriableCloud once retries are exhausted.
+	var resp *sdkcluster.ListResourcesResponse
+	if rerr := RetryOnTransient(ctx, nil, "backend(local).candidateNodes", 0, func() error {
+		var listErr error
+		resp, listErr = l.client.Cluster().ListResources(ctx, &sdkcluster.ListResourcesParams{Type: &typ})
+		return listErr
+	}); rerr != nil {
+		return nil, cpierrors.Wrap(WrapError(rerr), "backend(local): list cluster nodes")
 	}
 	if resp == nil {
 		return out, nil

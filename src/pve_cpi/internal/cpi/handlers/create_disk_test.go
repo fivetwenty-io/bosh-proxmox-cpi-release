@@ -21,6 +21,7 @@ import (
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/cpi/handlers"
+	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
 	sdkerrors "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/errors"
@@ -771,3 +772,46 @@ func TestHandleCreateDisk_Dir_ExplicitFormat_Forwarded(t *testing.T) {
 // integration-test harness provides a cifs pool via env.
 //
 // func TestHandleCreateDisk_CIFS_NoFormatArg(t *testing.T) { ... }
+
+// ---------------------------------------------------------------------------
+// Auth-failure test
+// ---------------------------------------------------------------------------
+
+// TestHandleCreateDisk_AuthFailure verifies that a 401 Unauthorized error from
+// the storage CreateVolume call is classified as a non-retriable Cloud error.
+// Auth failures are operator configuration issues (wrong API token or expired
+// ticket) and must surface immediately — BOSH must not retry indefinitely.
+func TestHandleCreateDisk_AuthFailure(t *testing.T) {
+	authErr := &sdkerrors.APIError{HTTPCode: 401, Message: "authentication failure"}
+
+	storageSvc := &mockStorageService{
+		createVolumeFn: func(_ context.Context, _, _ string, _ int, _ string, _ int, _ string) (string, error) {
+			return "", authErr
+		},
+	}
+	deps := baseDepsForCreate(t, storageSvc, nil)
+
+	h := handlers.HandleCreateDisk(deps)
+	_, err := h.Handle(context.Background(), []json.RawMessage{
+		marshal(1024),
+		marshal(map[string]string{}),
+	}, jsonrpc.Context{})
+
+	if err == nil {
+		t.Fatal("expected error from 401 auth failure")
+	}
+
+	// 401 is a 4xx non-404 → WrapError returns a non-retriable Cloud error.
+	cpiErr, ok := err.(*cpierrors.Error)
+	if !ok {
+		// The error may not be wrapped as a CPI error if the handler does not
+		// call WrapError on storage errors; surface the raw error for diagnosis.
+		t.Fatalf("expected *cpierrors.Error, got %T: %v", err, err)
+	}
+	if cpiErr.OkToRetry() {
+		t.Errorf("auth failure must not be retriable; OkToRetry()=true; type=%s", cpiErr.Type())
+	}
+	if cpiErr.Type() == cpierrors.TypeRetriableCloud {
+		t.Errorf("auth failure classified as RetriableCloud; want non-retriable TypeCloud; type=%s", cpiErr.Type())
+	}
+}

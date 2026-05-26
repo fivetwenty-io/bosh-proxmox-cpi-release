@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 
@@ -34,19 +35,29 @@ func (f HandlerFunc) Handle(ctx context.Context, args []json.RawMessage, reqCtx 
 // a read lock. BOSH dispatches sequentially over stdin so locking is not
 // required in production, but concurrent tests and future extensions are safe.
 type Dispatcher struct {
-	mu       sync.RWMutex
-	handlers map[string]Handler
-	logger   *log.Logger
+	mu           sync.RWMutex
+	handlers     map[string]Handler
+	allowedNames map[string]struct{}
+	logger       *log.Logger
 }
 
 // NewDispatcher returns a Dispatcher with all 22 CPI methods pre-registered as
 // NotImplemented placeholders. Call Register to override with a concrete handler.
+// The canonical allow-list is built once from Methods() at construction time for
+// O(1) lookup on every Register and Handle call.
 func NewDispatcher(logger *log.Logger) *Dispatcher {
-	d := &Dispatcher{
-		handlers: make(map[string]Handler, len(Methods())),
-		logger:   logger,
+	methods := Methods()
+	allowed := make(map[string]struct{}, len(methods))
+	for _, m := range methods {
+		allowed[m] = struct{}{}
 	}
-	for _, m := range Methods() {
+
+	d := &Dispatcher{
+		handlers:     make(map[string]Handler, len(methods)),
+		allowedNames: allowed,
+		logger:       logger,
+	}
+	for _, m := range methods {
 		method := m // capture for closure
 		d.handlers[method] = HandlerFunc(func(_ context.Context, _ []json.RawMessage, _ jsonrpc.Context) (any, error) {
 			return nil, cpierrors.NotImplemented(method)
@@ -57,14 +68,18 @@ func NewDispatcher(logger *log.Logger) *Dispatcher {
 
 // Register installs h as the handler for the given method name.
 // If a handler already exists for method it is replaced.
-// method need not be one of the 22 canonical names; arbitrary methods may be
-// registered (useful for extensions or testing), but only pre-registered slots
-// accept calls through Handle — unknown methods return a CloudError.
+// Register returns an error when method is not a canonical CPI method name.
+// Canonical names are the 22 methods returned by Methods().
 // Register is safe to call concurrently with other Register or Handle calls.
-func (d *Dispatcher) Register(method string, h Handler) {
+func (d *Dispatcher) Register(method string, h Handler) error {
+	if _, ok := d.allowedNames[method]; !ok {
+		methods := Methods()
+		return fmt.Errorf("register: unknown CPI method %q; canonical set: %v", method, methods)
+	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.handlers[method] = h
+	return nil
 }
 
 // Handle dispatches one JSON-RPC request. It always returns a non-nil *jsonrpc.Response.
@@ -81,6 +96,20 @@ func (d *Dispatcher) Register(method string, h Handler) {
 // Every dispatch is logged at Info level with method, request_id, and duration_ms.
 func (d *Dispatcher) Handle(ctx context.Context, req *jsonrpc.Request) *jsonrpc.Response {
 	start := time.Now()
+
+	// Reject non-canonical method names before consulting the handlers map.
+	// This is the allow-list guard: even if a handler were somehow installed
+	// for a non-canonical name (impossible via Register but defensive), the
+	// Director never receives a response for it.
+	if _, allowed := d.allowedNames[req.Method]; !allowed {
+		d.logger.Info("dispatch",
+			log.String("method", req.Method),
+			log.String("request_id", req.Context.RequestID),
+			log.Float64("duration_ms", float64(time.Since(start).Microseconds())/1000.0),
+			log.String("outcome", "method_not_found"),
+		)
+		return errorResponse(cpierrors.Cloud("method not found: %s", req.Method))
+	}
 
 	d.mu.RLock()
 	h, ok := d.handlers[req.Method]

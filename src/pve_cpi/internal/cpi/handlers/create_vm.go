@@ -152,13 +152,13 @@ func createVM(
 	if err := json.Unmarshal(args[1], &stemcellCID); err != nil {
 		return nil, cpierrors.Cloud("create_vm: parse stemcell_cid: %s", err.Error())
 	}
+	// stemcellStorage is used as a fallback VMStorage when deps.Config.VMStorage
+	// is empty (see VMStorage resolution below). ParseStemcellCID guarantees a
+	// non-empty storage component when err == nil.
 	stemcellStorage, _, err := pve.ParseStemcellCID(stemcellCID)
 	if err != nil {
 		return nil, cpierrors.Cloud("create_vm: invalid stemcell_cid %q: %s", stemcellCID, err.Error())
 	}
-	// stemcellStorage is used as a fallback VMStorage when deps.Config.VMStorage is empty;
-	// it must be non-empty (guaranteed by ParseStemcellCID returning a non-empty storage).
-	_ = stemcellStorage
 
 	var cloudProps createVMCloudProps
 	if err := json.Unmarshal(args[2], &cloudProps); err != nil {
@@ -580,7 +580,7 @@ func createVM(
 	}
 
 	if err := deps.PVE.Nodes().UpdateQemuConfig(ctx, node, strconv.Itoa(vmid), nicParams); err != nil {
-		return nil, cpierrors.Cloud("create_vm: configure NICs vmid=%d: %s", vmid, err.Error())
+		return nil, cpierrors.Wrap(pve.WrapError(err), fmt.Sprintf("create_vm: configure NICs vmid=%d: %s", vmid, err.Error()))
 	}
 
 	// -----------------------------------------------------------------------
@@ -601,7 +601,7 @@ func createVM(
 		}
 		diskID, err := deps.PVE.QEMU().AttachDisk(ctx, node, vmid, diskCID, "scsi", nil)
 		if err != nil {
-			return nil, cpierrors.Cloud("create_vm: attach disk %q to vmid=%d: %s", diskCID, vmid, err.Error())
+			return nil, cpierrors.Wrap(pve.WrapError(err), fmt.Sprintf("create_vm: attach disk %q to vmid=%d: %s", diskCID, vmid, err.Error()))
 		}
 		logger.Info("create_vm: attached persistent disk",
 			log.Int("vmid", vmid),
@@ -733,13 +733,36 @@ func cleanupVM(ctx context.Context, deps Deps, node string, vmid int, logger *lo
 	// Purge the VM
 	purge := true
 	destroyUnref := true
-	_, delErr := deps.PVE.Nodes().DeleteQemu(ctx, node, strconv.Itoa(vmid), &sdknodes.DeleteQemuParams{
+	delResp, delErr := deps.PVE.Nodes().DeleteQemu(ctx, node, strconv.Itoa(vmid), &sdknodes.DeleteQemuParams{
 		Purge:                    &purge,
 		DestroyUnreferencedDisks: &destroyUnref,
 	})
 	if delErr != nil {
-		logger.Error("create_vm: rollback delete failed", log.Int("vmid", vmid), log.Err(delErr))
+		if pve.IsNotFound(delErr) || pve.IsPmxcfsConfigMissing(delErr) {
+			logger.Info("create_vm: rollback delete -- VM already gone (idempotent)", log.Int("vmid", vmid))
+		} else {
+			logger.Error("create_vm: rollback delete failed", log.Int("vmid", vmid), log.Err(delErr))
+		}
 	} else {
+		// Await the destroy task so PVE fully releases the VMID before we return.
+		// An empty UPID means synchronous completion; skip await in that case.
+		if delResp != nil {
+			delUPID, upidErr := pve.UPIDFromRaw(*delResp)
+			if upidErr != nil {
+				logger.Warn("create_vm: cannot parse UPID from rollback delete response -- skipping await",
+					log.Int("vmid", vmid), log.Err(upidErr))
+			} else if delUPID != "" {
+				if awaitErr := pve.AwaitTaskWithLogger(ctx, deps.PVE, node, delUPID, logger); awaitErr != nil {
+					if pve.IsNotFound(awaitErr) || pve.IsPmxcfsConfigMissing(awaitErr) {
+						logger.Info("create_vm: rollback destroy await -- VM already gone (idempotent)",
+							log.Int("vmid", vmid))
+					} else {
+						logger.Error("create_vm: rollback destroy await failed",
+							log.Int("vmid", vmid), log.Err(awaitErr))
+					}
+				}
+			}
+		}
 		logger.Info("create_vm: rollback complete", log.Int("vmid", vmid))
 	}
 

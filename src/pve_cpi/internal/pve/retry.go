@@ -30,20 +30,29 @@ const DefaultTransientMaxAttempts = 8
 // at 15s. Tuned for pvedaemon worker recycling, which completes in roughly a
 // second; longer waits buy nothing.
 func TransientBackoff(attempt int) time.Duration {
-	const cap = 15 * time.Second
+	// maxBackoff renamed from the builtin-shadowing `cap` so go vet stops
+	// flagging this scope and the symbol is unambiguous when reading the
+	// jitter math below.
+	const maxBackoff = 15 * time.Second
 	base := 1 * time.Second
 	factor := 1.0
 	for i := 0; i < attempt; i++ {
 		factor *= 1.5
 	}
 	d := time.Duration(float64(base) * factor)
-	if d > cap {
-		d = cap
+	if d > maxBackoff {
+		d = maxBackoff
 	}
-	jitter := time.Duration(mrand.Int64N(int64(d) * 6 / 10))
+	// Guard against Int64N(0) which panics. With a zero/negative jitter
+	// window fall back to the deterministic base delay.
+	jitterWindow := int64(d) * 6 / 10
+	var jitter time.Duration
+	if jitterWindow > 0 {
+		jitter = time.Duration(mrand.Int64N(jitterWindow))
+	}
 	out := d - d*3/10 + jitter
-	if out > cap {
-		out = cap
+	if out > maxBackoff {
+		out = maxBackoff
 	}
 	return out
 }
@@ -54,20 +63,28 @@ func TransientBackoff(attempt int) time.Duration {
 // (import, resize, alloc, free, snapshot) through the same lockfile so
 // retrying immediately wins nothing — pause seconds, let the holder finish.
 func StorageLockBackoff(attempt int) time.Duration {
-	const cap = 30 * time.Second
+	// maxBackoff renamed from the builtin-shadowing `cap` so go vet stops
+	// flagging this scope; jitter math reads cleaner with the explicit name.
+	const maxBackoff = 30 * time.Second
 	base := 2 * time.Second
 	factor := 1.0
 	for i := 0; i < attempt; i++ {
 		factor *= 1.5
 	}
 	d := time.Duration(float64(base) * factor)
-	if d > cap {
-		d = cap
+	if d > maxBackoff {
+		d = maxBackoff
 	}
-	jitter := time.Duration(mrand.Int64N(int64(d) * 6 / 10))
+	// Guard against Int64N(0) which panics. With a zero/negative jitter
+	// window fall back to the deterministic base delay.
+	jitterWindow := int64(d) * 6 / 10
+	var jitter time.Duration
+	if jitterWindow > 0 {
+		jitter = time.Duration(mrand.Int64N(jitterWindow))
+	}
 	out := d - d*3/10 + jitter
-	if out > cap {
-		out = cap
+	if out > maxBackoff {
+		out = maxBackoff
 	}
 	return out
 }

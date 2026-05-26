@@ -108,7 +108,7 @@ func HandleRebootVM(deps Deps) cpi.Handler {
 			}
 			if upid != "" {
 				if awaitErr := pve.AwaitTaskWithLogger(ctx, deps.PVE, node, upid, logger); awaitErr != nil {
-					return nil, cpierrors.Wrap(awaitErr, fmt.Sprintf("reboot_vm: await reset task for VM %s", vmCID))
+					return nil, cpierrors.Wrap(pve.WrapError(awaitErr), fmt.Sprintf("reboot_vm: await reset task for VM %s", vmCID))
 				}
 			}
 			logger.Info("reboot_vm: VM hard-reset completed")
@@ -118,10 +118,16 @@ func HandleRebootVM(deps Deps) cpi.Handler {
 		// --- pre-check: get current VM state ---
 		// Inputs: ctx, node, vmid (all validated).
 		// Failure modes:
-		//   - 404 → VMNotFound.
-		//   - other → CloudError via WrapError.
+		//   - 404 → VMNotFound (non-retriable; VM is gone).
+		//   - transient → retried by RetryOnTransient; on exhaustion returns Retriable.
+		//   - other → non-retriable CloudError via WrapError.
 		//   - status map missing "status" key → state is "" → treated as running.
-		st, statusErr := deps.PVE.QEMU().Status(ctx, node, vmid)
+		var st map[string]interface{}
+		statusErr := pve.RetryOnTransient(ctx, logger, "reboot_vm.status", 0, func() error {
+			var inner error
+			st, inner = deps.PVE.QEMU().Status(ctx, node, vmid)
+			return inner
+		})
 		if statusErr != nil {
 			if pve.IsNotFound(statusErr) {
 				return nil, cpierrors.VMNotFound(vmCID)
@@ -139,7 +145,12 @@ func HandleRebootVM(deps Deps) cpi.Handler {
 		//   - empty UPID → synchronous start, no await needed.
 		if state == "stopped" {
 			logger.Info("reboot_vm: VM stopped, starting")
-			startUPID, startErr := deps.PVE.QEMU().Start(ctx, node, vmid)
+			var startUPID string
+			startErr := pve.RetryOnTransient(ctx, logger, "reboot_vm.start", 0, func() error {
+				var inner error
+				startUPID, inner = deps.PVE.QEMU().Start(ctx, node, vmid)
+				return inner
+			})
 			if startErr != nil {
 				if pve.IsNotFound(startErr) {
 					return nil, cpierrors.VMNotFound(vmCID)
@@ -148,7 +159,7 @@ func HandleRebootVM(deps Deps) cpi.Handler {
 			}
 			if startUPID != "" {
 				if awaitErr := pve.AwaitTaskWithLogger(ctx, deps.PVE, node, startUPID, logger); awaitErr != nil {
-					return nil, cpierrors.Wrap(awaitErr, fmt.Sprintf("reboot_vm: await start task for VM %s", vmCID))
+					return nil, cpierrors.Wrap(pve.WrapError(awaitErr), fmt.Sprintf("reboot_vm: await start task for VM %s", vmCID))
 				}
 			}
 			logger.Info("reboot_vm: stopped VM started")

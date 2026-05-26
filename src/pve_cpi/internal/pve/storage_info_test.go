@@ -131,6 +131,91 @@ func TestStorageInfoCache_PropagatesListerError(t *testing.T) {
 	}
 }
 
+// TestRefresh_NegativeCacheTTL confirms that a failed refresh is cached for
+// negativeCacheTTL (5s): within the window the second Get returns the same
+// error WITHOUT re-invoking the lister, preventing a thundering herd on a
+// degraded PVE pool. After Invalidate the negative cache is cleared so the
+// next Get retries the upstream.
+func TestRefresh_NegativeCacheTTL(t *testing.T) {
+	lister := &fakeLister{err: errors.New("pve unreachable")}
+	cache := NewStorageInfoCache(lister, time.Minute)
+
+	// First Get triggers a refresh that fails; lister called once.
+	_, err1 := cache.Get(context.Background(), "ceph")
+	if err1 == nil {
+		t.Fatal("expected error from first Get, got nil")
+	}
+	if lister.calls != 1 {
+		t.Fatalf("lister.calls after first Get = %d, want 1", lister.calls)
+	}
+
+	// Second Get within the TTL replays the negative cache; lister NOT
+	// called again. Issue several rapid Gets to confirm the herd-cap.
+	for i := 0; i < 10; i++ {
+		_, err := cache.Get(context.Background(), "ceph")
+		if err == nil {
+			t.Fatalf("Get #%d: expected cached error, got nil", i+2)
+		}
+	}
+	if lister.calls != 1 {
+		t.Errorf("lister.calls after 10 cached Gets = %d, want 1 (negative cache should suppress re-invocation)", lister.calls)
+	}
+
+	// Gets on a different name also share the negative cache because the
+	// underlying /storage index failure applies to every key.
+	_, err := cache.Get(context.Background(), "different-name")
+	if err == nil {
+		t.Fatal("expected cached error for different name, got nil")
+	}
+	if lister.calls != 1 {
+		t.Errorf("lister.calls after different-name Get = %d, want 1 (shared neg cache)", lister.calls)
+	}
+
+	// Invalidate clears the negative cache; next Get re-invokes lister
+	// (which still fails, but the call count rises).
+	cache.Invalidate("ceph")
+	_, err = cache.Get(context.Background(), "ceph")
+	if err == nil {
+		t.Fatal("expected lister-propagated error after Invalidate, got nil")
+	}
+	if lister.calls != 2 {
+		t.Errorf("lister.calls after Invalidate+Get = %d, want 2 (Invalidate should clear neg cache)", lister.calls)
+	}
+}
+
+// TestNegativeCacheTTL_Expires confirms that after the negative-cache window
+// elapses, a new Get re-invokes the lister rather than indefinitely caching
+// the failure. Uses a tiny TTL override by manipulating the cache directly
+// since negativeCacheTTL is a package-level constant; this test runs in the
+// same package and can read it for the wait duration.
+func TestNegativeCacheTTL_Expires(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping TTL expiry wait under -short")
+	}
+	lister := &fakeLister{err: errors.New("pve unreachable")}
+	cache := NewStorageInfoCache(lister, time.Minute)
+
+	_, err := cache.Get(context.Background(), "ceph")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if lister.calls != 1 {
+		t.Fatalf("calls=%d want 1", lister.calls)
+	}
+
+	// Wait out the negative-cache TTL plus a small slack. Suppressed
+	// under -short since 5s + slack exceeds typical short budget.
+	time.Sleep(negativeCacheTTL + 200*time.Millisecond)
+
+	_, err = cache.Get(context.Background(), "ceph")
+	if err == nil {
+		t.Fatal("expected error on retry after TTL expiry, got nil")
+	}
+	if lister.calls != 2 {
+		t.Errorf("lister.calls after TTL expiry = %d, want 2", lister.calls)
+	}
+}
+
 func TestBackendResolver_FallsBackToLocalOnLookupMiss(t *testing.T) {
 	lister := &fakeLister{entries: []map[string]any{}}
 	cache := NewStorageInfoCache(lister, time.Minute)

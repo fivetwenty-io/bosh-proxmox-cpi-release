@@ -120,7 +120,16 @@ AGENT_ID = env("AGENT_ID", f"lifecycle-{os.getpid()}")
 NETWORK_RANGE = env("NETWORK_RANGE", "192.168.1.0/24")
 NETWORK_GATEWAY = env("NETWORK_GATEWAY", "192.168.1.1")
 NETWORK_IP = env("NETWORK_IP", "192.168.1.250")
-NETWORK_DNS: list[str] = json.loads(env("NETWORK_DNS", '["8.8.8.8"]'))
+_network_dns_raw = env("NETWORK_DNS", '["8.8.8.8"]')
+try:
+    NETWORK_DNS: list[str] = json.loads(_network_dns_raw)
+    if not isinstance(NETWORK_DNS, list):
+        raise ValueError("expected a JSON array")
+except (json.JSONDecodeError, ValueError) as _dns_exc:
+    sys.exit(
+        f"NETWORK_DNS is malformed (got {_network_dns_raw!r}): {_dns_exc}\n"
+        'NETWORK_DNS must be a JSON array, e.g. \'["8.8.8.8"]\''
+    )
 NETWORK_BRIDGE = env("NETWORK_BRIDGE", "")
 VM_CORES = int(env("VM_CORES", "1"))
 VM_MEMORY_MIB = int(env("VM_MEMORY_MIB", "1024"))
@@ -288,6 +297,13 @@ def call(method: str, args: list[Any], config_path: str = "") -> Any:
         capture_output=True,
         text=True,
     )
+
+    if proc.returncode != 0:
+        stderr_snippet = (proc.stderr or "").strip()[-1000:]
+        raise RuntimeError(
+            f"call {method}: cpi binary exited {proc.returncode}"
+            + (f"\nstderr: {stderr_snippet}" if stderr_snippet else "")
+        )
 
     if not proc.stdout.strip():
         raise RuntimeError(f"call {method}: empty response from cpi binary")

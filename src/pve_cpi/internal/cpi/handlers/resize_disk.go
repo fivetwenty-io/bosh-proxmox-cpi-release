@@ -214,29 +214,102 @@ func HandleResizeDisk(deps Deps) Handler {
 	})
 }
 
-// parseDiskSizeGiB extracts the numeric GiB value from a PVE disk option string.
-// The option string format is: "<volid>[,key=value,...]" where one key may be
-// "size=<N>G". For example:
+// parseDiskSizeGiB extracts the size from a PVE disk option string and
+// converts it to whole GiB. The option string format is
+// "<volid>[,key=value,...]" where one key may be "size=<N><unit>". The
+// unit is case-insensitive and one of K, M, G, T, P (KiB, MiB, GiB, TiB,
+// PiB respectively). A unit-less value is treated as bytes.
 //
-//	"local-lvm:vm-100-disk-1,size=10G,cache=writeback" → 10
-//	"local-lvm:vm-100-disk-1"                          → error (size not present)
+// Examples:
 //
-// Only the "G" suffix (GiB) is handled. PVE stores disk sizes in GiB for
-// QEMU VMs. Sizes in other units (M, T, P) are rejected with an error.
+//	"local-lvm:vm-100-disk-1,size=10G"          → 10
+//	"local-lvm:vm-100-disk-1,size=1024M"        → 1
+//	"local-lvm:vm-100-disk-1,size=1T"           → 1024
+//	"local-lvm:vm-100-disk-1,size=1048576K"     → 1
+//	"local-lvm:vm-100-disk-1,size=10737418240"  → 10  (bytes, no unit)
+//	"local-lvm:vm-100-disk-1"                   → error (size missing)
+//	"local-lvm:vm-100-disk-1,size=100xyz"       → error (unknown unit)
+//
+// Conversion uses integer ceiling so a value that is not a whole number
+// of GiB rounds UP to the next GiB. PVE never shrinks an existing disk
+// at the storage layer, so rounding up matches the on-disk semantics
+// reported by qemu-img (the disk is allocated to the next GiB boundary).
+//
+// Inputs and failure modes:
+//   - optStr empty or no "size=" segment → CloudError "size option not found".
+//   - size value empty → CloudError "size value empty".
+//   - size value not a positive integer → wrapped strconv error.
+//   - size unit unrecognised → CloudError "unsupported size unit".
+//   - size in K/M/G/T/P with case-insensitive suffix → rounded-up GiB.
 func parseDiskSizeGiB(optStr string) (int, error) {
 	for _, part := range strings.Split(optStr, ",") {
 		if !strings.HasPrefix(part, "size=") {
 			continue
 		}
 		sizeVal := strings.TrimPrefix(part, "size=")
-		if strings.HasSuffix(sizeVal, "G") {
-			n, err := strconv.Atoi(strings.TrimSuffix(sizeVal, "G"))
-			if err != nil {
-				return 0, cpierrors.Wrap(err, "cannot parse size value "+sizeVal)
-			}
-			return n, nil
+		if sizeVal == "" {
+			return 0, cpierrors.Cloud("size value empty in %q", part)
 		}
-		return 0, cpierrors.Cloud("unsupported size unit in %q (only GiB supported)", sizeVal)
+
+		// Detect unit suffix (last byte). PVE accepts the same set as
+		// qemu-img: K, M, G, T, P. Anything else is treated as either
+		// no-unit (digit) or unknown (other letter).
+		last := sizeVal[len(sizeVal)-1]
+		var unit byte
+		var numStr string
+		switch last {
+		case 'K', 'k', 'M', 'm', 'G', 'g', 'T', 't', 'P', 'p':
+			unit = last
+			numStr = sizeVal[:len(sizeVal)-1]
+		default:
+			if last >= '0' && last <= '9' {
+				// No unit — treat as bytes.
+				unit = 'B'
+				numStr = sizeVal
+			} else {
+				return 0, cpierrors.Cloud("unsupported size unit in %q (expected one of K/M/G/T/P or bytes)", sizeVal)
+			}
+		}
+
+		if numStr == "" {
+			return 0, cpierrors.Cloud("size value missing numeric part in %q", sizeVal)
+		}
+
+		n, err := strconv.ParseInt(numStr, 10, 64)
+		if err != nil {
+			return 0, cpierrors.Wrap(err, "cannot parse size value "+sizeVal)
+		}
+		if n < 0 {
+			return 0, cpierrors.Cloud("size value must be non-negative in %q", sizeVal)
+		}
+
+		// Convert each unit to bytes, then bytes → GiB rounded up.
+		const (
+			kib int64 = 1 << 10
+			mib int64 = 1 << 20
+			gib int64 = 1 << 30
+			tib int64 = 1 << 40
+			pib int64 = 1 << 50
+		)
+		var bytesVal int64
+		switch unit {
+		case 'K', 'k':
+			bytesVal = n * kib
+		case 'M', 'm':
+			bytesVal = n * mib
+		case 'G', 'g':
+			bytesVal = n * gib
+		case 'T', 't':
+			bytesVal = n * tib
+		case 'P', 'p':
+			bytesVal = n * pib
+		case 'B':
+			bytesVal = n
+		}
+
+		// Ceiling division to GiB.
+		out := (bytesVal + gib - 1) / gib
+		return int(out), nil
 	}
 	return 0, cpierrors.Cloud("size option not found in disk option string %q", optStr)
 }

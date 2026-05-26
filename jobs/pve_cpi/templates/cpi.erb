@@ -1,5 +1,5 @@
 #!/bin/bash
-set -eu
+set -euo pipefail
 
 # Resolve paths relative to this script so the wrapper works for both
 # director VM installs (/var/vcap/...) and `bosh create-env` host installs
@@ -7,4 +7,13 @@ set -eu
 JOB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PACKAGES_DIR="$(cd "${JOB_DIR}/../../packages" && pwd)"
 
-exec "${PACKAGES_DIR}/pve_cpi/bin/cpi" --config "${JOB_DIR}/config/cpi.json"
+BIN="${PACKAGES_DIR}/pve_cpi/bin/cpi"
+
+if [ ! -x "${BIN}" ]; then
+  printf '{"result":null,"error":{"type":"Bosh::Clouds::CloudError","message":"pve_cpi binary not found or not executable: %s — verify package compilation succeeded","ok_to_retry":false},"log":""}\n' "${BIN}" >&1
+  exit 1
+fi
+
+cd "${JOB_DIR}" || exit 1
+
+exec "${BIN}" --config "${JOB_DIR}/config/cpi.json"

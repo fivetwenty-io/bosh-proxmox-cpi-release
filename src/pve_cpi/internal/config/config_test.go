@@ -6,6 +6,7 @@ import (
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
+	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
 )
 
 // --------------------------------------------------------------------------
@@ -531,14 +532,14 @@ func TestLoad_RegistryMode_Valid(t *testing.T) {
 		"host":"h","user":"u","password":"p",
 		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
 		"agent_mode":"registry",
-		"registry_endpoint":"http://registry:25777",
+		"registry_endpoint":"https://registry:25777",
 		"registry_user":"admin",
 		"registry_password":"secret"
 	}`)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if cfg.RegistryEndpoint != "http://registry:25777" {
+	if cfg.RegistryEndpoint != "https://registry:25777" {
 		t.Errorf("RegistryEndpoint = %q", cfg.RegistryEndpoint)
 	}
 }
@@ -937,4 +938,398 @@ func TestLoad_SnapshotGuardBools(t *testing.T) {
 			}
 		})
 	}
+}
+
+// --------------------------------------------------------------------------
+// Registry scheme guard
+// --------------------------------------------------------------------------
+
+// registryBaseCfg returns a CPIConfig with all required non-registry fields
+// populated and AgentMode=registry. Caller sets RegistryEndpoint per test.
+func registryBaseCfg() *config.CPIConfig {
+	return &config.CPIConfig{
+		Host:             "h",
+		User:             "u",
+		Password:         "p",
+		VMStorage:        "s",
+		DiskStorage:      "s",
+		NetworkBridge:    "br",
+		Port:             8006,
+		VerifySSL:        boolPtr(true),
+		AgentMode:        "registry",
+		VMDiskFormat:     "qcow2",
+		LogLevel:         "info",
+		VMIDRangeStart:   100,
+		VMIDRangeEnd:     5999,
+		RebootMode:       "soft",
+		RebootTimeout:    60,
+		NetworkMode:      "auto",
+		SDNZoneType:      "simple",
+		RegistryUser:     "ru",
+		RegistryPassword: "rp",
+	}
+}
+
+// TestValidate_DoesNotMutatePassword guards the read-only contract of Validate.
+// The "both password and api_token supplied" normalization moved into
+// ApplyDefaults; Validate must observe whatever the caller passed in without
+// rewriting fields. A regression that re-introduces the in-Validate mutation
+// would cause repeated Validate calls in diagnostic code to silently clear a
+// caller-provided password, which is surprising and hides bugs.
+func TestValidate_DoesNotMutatePassword(t *testing.T) {
+	cfg := &config.CPIConfig{
+		Host:           "h",
+		User:           "u",
+		Password:       "foo",
+		VMStorage:      "s",
+		DiskStorage:    "s",
+		NetworkBridge:  "br",
+		Port:           8006,
+		VerifySSL:      boolPtr(true),
+		AgentMode:      "cloudinit",
+		VMDiskFormat:   "qcow2",
+		LogLevel:       "info",
+		VMIDRangeStart: 100,
+		VMIDRangeEnd:   5999,
+		RebootMode:     "soft",
+		RebootTimeout:  60,
+		NetworkMode:    "auto",
+		SDNZoneType:    "simple",
+	}
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate returned unexpected error: %v", err)
+	}
+	if cfg.Password != "foo" {
+		t.Errorf("Validate mutated Password: got %q, want %q", cfg.Password, "foo")
+	}
+
+	// Also assert the both-credentials path: Validate must not clear Password
+	// when APIToken is also set. ApplyDefaults owns that normalization now.
+	cfg2 := &config.CPIConfig{
+		Host:           "h",
+		User:           "u",
+		Password:       "foo",
+		APIToken:       "tok",
+		VMStorage:      "s",
+		DiskStorage:    "s",
+		NetworkBridge:  "br",
+		Port:           8006,
+		VerifySSL:      boolPtr(true),
+		AgentMode:      "cloudinit",
+		VMDiskFormat:   "qcow2",
+		LogLevel:       "info",
+		VMIDRangeStart: 100,
+		VMIDRangeEnd:   5999,
+		RebootMode:     "soft",
+		RebootTimeout:  60,
+		NetworkMode:    "auto",
+		SDNZoneType:    "simple",
+	}
+	if err := cfg2.Validate(); err != nil {
+		t.Fatalf("Validate (both creds) returned unexpected error: %v", err)
+	}
+	if cfg2.Password != "foo" {
+		t.Errorf("Validate cleared Password despite read-only contract: got %q, want %q",
+			cfg2.Password, "foo")
+	}
+	if cfg2.APIToken != "tok" {
+		t.Errorf("Validate mutated APIToken: got %q, want %q", cfg2.APIToken, "tok")
+	}
+}
+
+// TestApplyDefaults_BothCredentialsTokenWins covers the mutation moved from
+// Validate to ApplyDefaults: when both password and api_token are supplied,
+// the token wins and the password is cleared so downstream code never sends
+// stale Basic Auth credentials alongside a token.
+func TestApplyDefaults_BothCredentialsTokenWins(t *testing.T) {
+	var cfg config.CPIConfig
+	cfg.VMStorage = "vm-store"
+	cfg.Password = "foo"
+	cfg.APIToken = "tok"
+	cfg.ApplyDefaults()
+
+	if cfg.APIToken != "tok" {
+		t.Errorf("APIToken = %q, want %q (api_token must survive)", cfg.APIToken, "tok")
+	}
+	if cfg.Password != "" {
+		t.Errorf("Password = %q, want empty (cleared when api_token also present)", cfg.Password)
+	}
+}
+
+func TestValidate_RegistryHTTPRejected(t *testing.T) {
+	cfg := registryBaseCfg()
+	cfg.RegistryEndpoint = "http://registry.example.com:25777"
+	// RegistryAllowInsecure left false (default).
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected validation error, got nil")
+	}
+	if !strings.Contains(err.Error(), "registry_allow_insecure") {
+		t.Errorf("error %q must mention registry_allow_insecure for operator clarity", err.Error())
+	}
+	if !strings.Contains(err.Error(), "https") {
+		t.Errorf("error %q should name the required scheme (https)", err.Error())
+	}
+}
+
+func TestValidate_RegistryHTTPAllowedWithOptIn(t *testing.T) {
+	cfg := registryBaseCfg()
+	cfg.RegistryEndpoint = "http://registry.example.com:25777"
+	cfg.RegistryAllowInsecure = true
+
+	logger, obs := log.NewObservedLogger(log.LevelWarn)
+	if err := cfg.ValidateWithLogger(logger); err != nil {
+		t.Fatalf("expected nil error with opt-in true, got %v", err)
+	}
+
+	// Exactly one warn entry mentioning the opt-in flag must be emitted.
+	entries := obs.All()
+	if len(entries) == 0 {
+		t.Fatal("expected at least one warn log entry, got none")
+	}
+	found := false
+	for _, e := range entries {
+		if strings.Contains(e.Message, "registry_allow_insecure=true") &&
+			strings.Contains(e.Message, "cleartext") {
+			found = true
+			// Endpoint attribute must be present and must not leak userinfo.
+			ep, ok := e.Attrs["endpoint"]
+			if !ok {
+				t.Errorf("warn entry missing 'endpoint' attribute: %+v", e)
+			}
+			if epStr, _ := ep.(string); strings.Contains(epStr, "REDACTED") {
+				// expected when endpoint had userinfo; for this test the URL has none
+				// so just confirm it carries the supplied host.
+			}
+			if epStr, _ := ep.(string); !strings.Contains(epStr, "registry.example.com") {
+				t.Errorf("endpoint attr %q lost host", epStr)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("no warn entry matched the expected message; entries=%+v", entries)
+	}
+}
+
+func TestValidate_RegistryHTTPSAccepted(t *testing.T) {
+	cfg := registryBaseCfg()
+	cfg.RegistryEndpoint = "https://registry.example.com:25777"
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected nil error for https endpoint, got %v", err)
+	}
+}
+
+func TestValidate_NonRegistryModeIgnoresInsecureFlag(t *testing.T) {
+	cfg := registryBaseCfg()
+	cfg.AgentMode = "cloudinit"
+	// Registry endpoint left set with http:// — must be ignored entirely because
+	// the scheme guard only fires in registry mode.
+	cfg.RegistryEndpoint = "http://registry.example.com:25777"
+	cfg.RegistryAllowInsecure = false
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected nil error in cloudinit mode despite http registry endpoint, got %v", err)
+	}
+}
+
+func TestValidate_RegistryRejectsUnknownSchemeEvenWithOptIn(t *testing.T) {
+	cfg := registryBaseCfg()
+	cfg.RegistryEndpoint = "ftp://registry.example.com"
+	cfg.RegistryAllowInsecure = true
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected rejection for ftp scheme even with opt-in, got nil")
+	}
+	if !strings.Contains(err.Error(), "not supported") {
+		t.Errorf("error %q should explain unsupported scheme", err.Error())
+	}
+}
+
+func TestValidate_RegistryRejectsMissingScheme(t *testing.T) {
+	cfg := registryBaseCfg()
+	cfg.RegistryEndpoint = "registry.example.com:25777"
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected rejection for scheme-less endpoint, got nil")
+	}
+	if !strings.Contains(err.Error(), "scheme") {
+		t.Errorf("error %q should mention missing scheme", err.Error())
+	}
+}
+
+func TestValidateWithLogger_NilLoggerStillSucceedsOnHTTPSPath(t *testing.T) {
+	// Regression: ValidateWithLogger(nil) must behave identically to Validate()
+	// for the https success path (no warning to emit, so no logger needed).
+	cfg := registryBaseCfg()
+	cfg.RegistryEndpoint = "https://registry.example.com:25777"
+	if err := cfg.ValidateWithLogger(nil); err != nil {
+		t.Fatalf("expected nil error, got %v", err)
+	}
+}
+
+// --------------------------------------------------------------------------
+// Hotplug / NUMA accessors
+// --------------------------------------------------------------------------
+
+// TestHotplugValue_DefaultsAndOverrides covers all three states for the
+// Hotplug *string field: nil pointer (returns canonical default), explicit
+// override survives ApplyDefaults, and the empty-string "disabled" override
+// is honored verbatim.
+func TestHotplugValue_DefaultsAndOverrides(t *testing.T) {
+	t.Run("nil pointer returns canonical default", func(t *testing.T) {
+		var cfg config.CPIConfig
+		if got := cfg.HotplugValue(); got != "network,disk,cpu,memory" {
+			t.Errorf("HotplugValue() = %q, want %q", got, "network,disk,cpu,memory")
+		}
+	})
+
+	t.Run("ApplyDefaults populates pointer when nil", func(t *testing.T) {
+		var cfg config.CPIConfig
+		cfg.VMStorage = "vm-store"
+		cfg.ApplyDefaults()
+		if cfg.Hotplug == nil {
+			t.Fatal("Hotplug pointer remained nil after ApplyDefaults")
+		}
+		if got := cfg.HotplugValue(); got != "network,disk,cpu,memory" {
+			t.Errorf("HotplugValue() after ApplyDefaults = %q, want %q", got, "network,disk,cpu,memory")
+		}
+	})
+
+	t.Run("explicit override survives ApplyDefaults", func(t *testing.T) {
+		var cfg config.CPIConfig
+		cfg.VMStorage = "vm-store"
+		custom := "network,disk"
+		cfg.Hotplug = &custom
+		cfg.ApplyDefaults()
+		if got := cfg.HotplugValue(); got != "network,disk" {
+			t.Errorf("HotplugValue() = %q, want %q (explicit override must survive)", got, "network,disk")
+		}
+	})
+
+	t.Run("explicit disabled (\"0\") survives ApplyDefaults", func(t *testing.T) {
+		var cfg config.CPIConfig
+		cfg.VMStorage = "vm-store"
+		disabled := "0"
+		cfg.Hotplug = &disabled
+		cfg.ApplyDefaults()
+		if got := cfg.HotplugValue(); got != "0" {
+			t.Errorf("HotplugValue() = %q, want %q (\"0\" must survive)", got, "0")
+		}
+	})
+
+	t.Run("explicit empty string survives ApplyDefaults", func(t *testing.T) {
+		// Empty string is a legitimate caller-supplied value distinct from
+		// nil — the pointer is non-nil but its target is empty. ApplyDefaults
+		// must not overwrite it.
+		var cfg config.CPIConfig
+		cfg.VMStorage = "vm-store"
+		empty := ""
+		cfg.Hotplug = &empty
+		cfg.ApplyDefaults()
+		if got := cfg.HotplugValue(); got != "" {
+			t.Errorf("HotplugValue() = %q, want empty (caller-supplied empty must survive)", got)
+		}
+	})
+
+	t.Run("JSON omission produces default via Load", func(t *testing.T) {
+		cfg, err := mustLoad(t, `{
+			"host":"h","user":"u","password":"p",
+			"vm_storage":"s","disk_storage":"s","network_bridge":"br"
+		}`)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got := cfg.HotplugValue(); got != "network,disk,cpu,memory" {
+			t.Errorf("HotplugValue() from Load = %q, want default", got)
+		}
+	})
+
+	t.Run("JSON explicit override survives Load", func(t *testing.T) {
+		cfg, err := mustLoad(t, `{
+			"host":"h","user":"u","password":"p",
+			"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+			"hotplug":"cpu,memory"
+		}`)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got := cfg.HotplugValue(); got != "cpu,memory" {
+			t.Errorf("HotplugValue() from Load = %q, want %q", got, "cpu,memory")
+		}
+	})
+}
+
+// TestNUMAValue_DefaultTrue verifies NUMAValue defaults to true (memory hotplug
+// requires numa=1 at create time) and that an explicit false override is
+// preserved through ApplyDefaults.
+func TestNUMAValue_DefaultTrue(t *testing.T) {
+	t.Run("nil pointer returns true", func(t *testing.T) {
+		var cfg config.CPIConfig
+		if !cfg.NUMAValue() {
+			t.Error("NUMAValue() = false on nil pointer, want true")
+		}
+	})
+
+	t.Run("ApplyDefaults sets pointer to *true when nil", func(t *testing.T) {
+		var cfg config.CPIConfig
+		cfg.VMStorage = "vm-store"
+		cfg.ApplyDefaults()
+		if cfg.NUMA == nil {
+			t.Fatal("NUMA pointer remained nil after ApplyDefaults")
+		}
+		if !cfg.NUMAValue() {
+			t.Error("NUMAValue() = false after ApplyDefaults, want true")
+		}
+	})
+
+	t.Run("explicit false survives ApplyDefaults", func(t *testing.T) {
+		var cfg config.CPIConfig
+		cfg.VMStorage = "vm-store"
+		cfg.NUMA = boolPtr(false)
+		cfg.ApplyDefaults()
+		if cfg.NUMAValue() {
+			t.Error("NUMAValue() = true after ApplyDefaults overrode explicit *false")
+		}
+	})
+
+	t.Run("explicit true survives ApplyDefaults", func(t *testing.T) {
+		var cfg config.CPIConfig
+		cfg.VMStorage = "vm-store"
+		cfg.NUMA = boolPtr(true)
+		cfg.ApplyDefaults()
+		if !cfg.NUMAValue() {
+			t.Error("NUMAValue() = false after ApplyDefaults overrode explicit *true")
+		}
+	})
+
+	t.Run("JSON explicit false survives Load", func(t *testing.T) {
+		cfg, err := mustLoad(t, `{
+			"host":"h","user":"u","password":"p",
+			"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+			"numa":false
+		}`)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.NUMAValue() {
+			t.Error("NUMAValue() = true after Load decoded explicit false")
+		}
+	})
+
+	t.Run("JSON omission defaults to true via Load", func(t *testing.T) {
+		cfg, err := mustLoad(t, `{
+			"host":"h","user":"u","password":"p",
+			"vm_storage":"s","disk_storage":"s","network_bridge":"br"
+		}`)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !cfg.NUMAValue() {
+			t.Error("NUMAValue() = false after Load with numa absent, want true")
+		}
+	})
 }

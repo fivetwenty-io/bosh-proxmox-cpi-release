@@ -19,10 +19,17 @@ properties:
   pve.user:
     description: "PVE username"
   pve.password:
-    description: "PVE password (mutually exclusive with api_token)"
+    description: |
+      PVE password (mutually exclusive with api_token). Must be credhub-managed
+      in production: reference via `((pve_password))` against a credhub variable
+      typed `password`. Empty string when api_token is used instead.
     default: ""
   pve.api_token:
-    description: "PVE API token (mutually exclusive with password)"
+    description: |
+      PVE API token (mutually exclusive with password). Format:
+      <user>!<token-id>=<uuid>. Must be credhub-managed in production: reference
+      via `((pve_api_token))` against a credhub variable typed `password`. Empty
+      string when password is used instead.
     default: ""
   pve.realm:
     description: "Authentication realm"
@@ -180,4 +187,18 @@ properties:
     default: ""
   registry.password:
     description: "Registry password"
+    default: ""
+  registry.allow_insecure:
+    description: |
+      When true, permits a plaintext http:// registry endpoint. Default false:
+      Validate rejects any non-https scheme so registry credentials never travel
+      in cleartext. Set to true only for lab/test deployments; production
+      deployments must use https with verified certificates.
+    default: false
+  registry.ca_cert:
+    description: |
+      Optional PEM-encoded CA certificate (or chain) appended to the host's
+      system trust pool when verifying the registry's TLS certificate. Use when
+      the registry presents a certificate signed by a private CA the host trust
+      store does not already include. Empty means use the system pool unmodified.
     default: ""

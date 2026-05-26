@@ -113,7 +113,6 @@ func HandleCreateDisk(deps Deps) Handler {
 		// ----------------------------------------------------------------
 		// 3. Compute size in GiB (ceiling division).
 		// ----------------------------------------------------------------
-		_ = vmCID
 		sizeGiB := (sizeMB + 1023) / 1024
 		if sizeGiB <= 0 {
 			sizeGiB = 1

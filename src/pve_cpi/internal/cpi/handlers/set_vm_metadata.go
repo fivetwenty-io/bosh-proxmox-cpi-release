@@ -42,7 +42,7 @@ const maxTagLength = 255
 //     entries (PVE tags allow only alphanumerics and "-"). Also extract the BOSH
 //     instance name ("<job>/<id>") and emit "<job>--<id>" (PVE tags reject "/").
 //     Join with ";"; truncate to maxTagLength bytes at a tag boundary.
-//  5a. Derive a DNS-label VM name as "<job>-<index>" (e.g. "diego-cell-0",
+//     5a. Derive a DNS-label VM name as "<job>-<index>" (e.g. "diego-cell-0",
 //     "bosh-0") so the PVE UI shows the human-readable BOSH instance
 //     identifier instead of the placeholder "vm-<vmid>" written at create_vm
 //     time. The UUID-bearing metadata["name"] ("<job>/<id>") is used only as

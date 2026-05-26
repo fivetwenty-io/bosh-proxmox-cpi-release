@@ -9,14 +9,47 @@ Uses only stdlib; no PVE network connection required.
 
 from __future__ import annotations
 
+import importlib.machinery as _ilm
+import importlib.util as _ilu
 import sys
+import tempfile
+import types as _types
 import unittest
+import unittest.mock
 from pathlib import Path
 
 # Mirror the import pattern used by scripts/test so the module resolves
 # regardless of the working directory the test is invoked from.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _integration
+
+# Import the scripts/cf module under test.  The file has no .py extension so
+# we load it via importlib with an explicit SourceFileLoader.  The scripts/cf
+# file declares `requests` as a uv inline dependency; we stub it at import
+# time so unit tests run without the package installed.
+import importlib.util as _ilu
+import importlib.machinery as _ilm
+import types as _types
+
+def _load_cf_module():
+    _cf_path = str(Path(__file__).resolve().parent / "cf")
+    # Stub `requests` if not installed (uv provides it at runtime).
+    _requests_stub = _types.ModuleType("requests")
+    _requests_stub.get = lambda *a, **kw: None  # type: ignore[attr-defined]
+    import sys as _sys
+    _had_requests = "requests" in _sys.modules
+    if not _had_requests:
+        _sys.modules["requests"] = _requests_stub
+    try:
+        loader = _ilm.SourceFileLoader("cf_script", _cf_path)
+        spec = _ilu.spec_from_loader("cf_script", loader, origin=_cf_path)
+        mod = _ilu.module_from_spec(spec)
+        mod.__file__ = _cf_path  # required for Path(__file__) at module level
+        loader.exec_module(mod)
+    finally:
+        if not _had_requests:
+            _sys.modules.pop("requests", None)
+    return mod
 
 
 class TestSelectLocalDiskPools(unittest.TestCase):
@@ -250,6 +283,310 @@ class TestSelectNetworkModes(unittest.TestCase):
             bridge_exists=False,
         )
         self.assertEqual(sorted(self._modes(passes)), ["bridge", "sdn"])
+
+
+class TestCfScripts_UnstickAgent_RejectsNonIntCID(unittest.TestCase):
+    """_coerce_vmid must reject non-integer CIDs before any subprocess call."""
+
+    def setUp(self):
+        self._cf = _load_cf_module()
+
+    # -- parametrized rejection cases ----------------------------------------
+
+    def test_invalid_cid_values_raise_value_error(self) -> None:
+        """All invalid VMID strings raise ValueError; subprocess is never called."""
+        cases = [
+            # (label, cid, required_fragment_in_message)
+            ("pure alpha", "abc", "integer"),
+            ("shell injection", "abc; rm -rf /", "integer"),
+            ("empty string", "", None),
+            ("float string", "1.5", None),
+            ("zero", "0", "positive"),
+            ("negative", "-1", "positive"),
+        ]
+        for label, cid, required_fragment in cases:
+            with self.subTest(cid=repr(cid)):
+                with self.assertRaises(ValueError) as ctx:
+                    self._cf._coerce_vmid(cid)
+                if required_fragment:
+                    self.assertIn(
+                        required_fragment,
+                        str(ctx.exception).lower(),
+                        msg=f"{label!r}: expected {required_fragment!r} in exception message",
+                    )
+
+    def test_invalid_cid_subprocess_never_called(self) -> None:
+        """subprocess.run is never invoked for any invalid VMID."""
+        invalid_cids = ["abc; rm -rf /", "", "1.5", "0", "-1", "abc"]
+        for cid in invalid_cids:
+            with self.subTest(cid=repr(cid)):
+                with unittest.mock.patch("subprocess.run") as mock_run:
+                    with self.assertRaises(ValueError):
+                        self._cf._coerce_vmid(cid)
+                    mock_run.assert_not_called()
+
+    # -- valid VMID ----------------------------------------------------------
+
+    def test_valid_integer_returns_int(self) -> None:
+        """A valid positive integer string should pass through as int."""
+        result = self._cf._coerce_vmid("101")
+        self.assertEqual(result, 101)
+        self.assertIsInstance(result, int)
+
+    def test_cmd_unstick_agent_non_int_cid_exits_without_subprocess(self) -> None:
+        """cmd_unstick_agent exits cleanly when bosh vms returns a non-integer CID.
+
+        subprocess.run must never be called with the malformed CID value.
+        """
+        cf = self._cf
+
+        def _fake_capture(*cmd):
+            # Simulate 'bosh vms' returning a line with a non-integer CID.
+            if "vms" in cmd:
+                return "uaa/0  abc; rm -rf /"
+            # 'bosh int' for pve_host — should not be reached.
+            return "pve.example.com"  # pragma: no cover
+
+        with unittest.mock.patch.object(cf, "capture", side_effect=_fake_capture):
+            with unittest.mock.patch("subprocess.run") as mock_run:
+                with self.assertRaises(SystemExit) as ctx:
+                    cf.cmd_unstick_agent(["uaa/0"])
+                # Exit must be non-zero (string message triggers sys.exit(msg)).
+                self.assertNotEqual(ctx.exception.code, 0)
+                # subprocess.run must never have been called with the raw CID.
+                for call in mock_run.call_args_list:
+                    args = call.args[0] if call.args else []
+                    joined = " ".join(str(a) for a in args)
+                    self.assertNotIn("rm -rf", joined)
+
+
+class TestCfScripts_CheckUaaDb_RaisesOnSSHFailure(unittest.TestCase):
+    """cmd_check_uaa_db must raise RuntimeError when bosh ssh returns rc != 0."""
+
+    def setUp(self):
+        self._cf = _load_cf_module()
+
+    def _make_completed_process(self, returncode: int, stdout: str = "", stderr: str = ""):
+        import subprocess as _sp
+        result = _sp.CompletedProcess(args=[], returncode=returncode)
+        result.stdout = stdout
+        result.stderr = stderr
+        return result
+
+    def test_nonzero_rc_raises_runtime_error(self) -> None:
+        """Any non-zero returncode from bosh ssh raises RuntimeError."""
+        cases = [
+            # (label, returncode, stderr, expected_in_msg)
+            (
+                "rc=255 ssh unreachable",
+                255,
+                "ssh: connect to host database.example.com port 22: Connection refused",
+                ["255", "bosh ssh"],
+            ),
+            (
+                "rc=1 deployment not found",
+                1,
+                "Error: deployment 'cf' not found",
+                ["1"],
+            ),
+            (
+                "rc=2 general failure",
+                2,
+                "general error",
+                ["2"],
+            ),
+        ]
+        for label, rc, stderr_text, expected_fragments in cases:
+            with self.subTest(label=label):
+                fake = self._make_completed_process(returncode=rc, stderr=stderr_text)
+                with unittest.mock.patch("subprocess.run", return_value=fake):
+                    with self.assertRaises(RuntimeError) as ctx:
+                        self._cf.cmd_check_uaa_db([])
+                    msg = str(ctx.exception).lower()
+                    for frag in expected_fragments:
+                        self.assertIn(frag.lower(), msg, msg=f"{label}: expected {frag!r} in error message")
+
+    def test_zero_rc_recognized_tokens_return_normally(self) -> None:
+        """rc=0 with recognized output tokens must not raise."""
+        cases = [
+            ("SKIP_NO_PXC token", "SKIP_NO_PXC\n"),
+            ("OK_FRESH token", "OK_FRESH\n"),
+        ]
+        for label, stdout_text in cases:
+            with self.subTest(label=label):
+                fake = self._make_completed_process(returncode=0, stdout=stdout_text)
+                with unittest.mock.patch("subprocess.run", return_value=fake):
+                    # Must return without raising.
+                    self._cf.cmd_check_uaa_db([])
+
+    def test_zero_rc_error_conditions_raise_runtime_error(self) -> None:
+        """rc=0 with error indicators in output must raise RuntimeError."""
+        cases = [
+            ("PROBE_ERROR token", "PROBE_ERROR: Access denied\n", "PROBE_ERROR"),
+            ("unparseable output", "completely unexpected output\n", "parsed"),
+        ]
+        for label, stdout_text, expected_fragment in cases:
+            with self.subTest(label=label):
+                fake = self._make_completed_process(returncode=0, stdout=stdout_text)
+                with unittest.mock.patch("subprocess.run", return_value=fake):
+                    with self.assertRaises(RuntimeError) as ctx:
+                        self._cf.cmd_check_uaa_db([])
+                    self.assertIn(
+                        expected_fragment.lower(),
+                        str(ctx.exception).lower(),
+                        msg=f"{label}: expected {expected_fragment!r} in error message",
+                    )
+
+
+def _load_module_no_ext(name: str, filepath: str):
+    """Load a Python script that has no .py extension via SourceFileLoader."""
+    loader = _ilm.SourceFileLoader(name, filepath)
+    spec = _ilu.spec_from_loader(name, loader, origin=filepath)
+    mod = _ilu.module_from_spec(spec)
+    mod.__file__ = filepath
+    loader.exec_module(mod)
+    return mod
+
+
+def _load_bosh_module():
+    bosh_path = str(Path(__file__).resolve().parent / "bosh")
+    return _load_module_no_ext("bosh_script", bosh_path)
+
+
+def _load_test_module():
+    test_path = str(Path(__file__).resolve().parent / "test")
+    return _load_module_no_ext("test_script", test_path)
+
+
+class TestBoshStateIsEmpty(unittest.TestCase):
+    """Unit tests for scripts/bosh _state_is_empty.
+
+    Covers:
+      - absent file             -> True
+      - empty / whitespace-only -> True
+      - bare '{}'               -> True
+      - JSON without bosh/deployments keys -> True
+      - populated with 'bosh' key          -> False
+      - populated with 'deployments' key   -> False
+      - invalid JSON                       -> False (conservative: don't skip teardown)
+      - JSON array                         -> False
+    """
+
+    def setUp(self):
+        self._bosh = _load_bosh_module()
+
+    def _write_state(self, content: str, tmpdir: Path) -> None:
+        state_file = tmpdir / "state.json"
+        state_file.write_text(content, encoding="utf-8")
+        self._bosh.STATE = state_file
+
+    def test_absent_file_returns_true(self) -> None:
+        """Non-existent state file is empty."""
+        with tempfile.TemporaryDirectory() as d:
+            self._bosh.STATE = Path(d) / "state.json"
+            self.assertTrue(self._bosh._state_is_empty())
+
+    def test_file_contents_classified_as_empty(self) -> None:
+        """File contents that represent an absent/empty BOSH state return True."""
+        cases = [
+            ("empty string", ""),
+            ("whitespace only", "   \n  "),
+            ("bare empty object", "{}"),
+            ("json with unrelated key", '{"other": "data"}'),
+        ]
+        for label, content in cases:
+            with self.subTest(label=label):
+                with tempfile.TemporaryDirectory() as d:
+                    self._write_state(content, Path(d))
+                    self.assertTrue(
+                        self._bosh._state_is_empty(),
+                        msg=f"{label!r}: expected _state_is_empty()=True",
+                    )
+
+    def test_file_contents_classified_as_non_empty(self) -> None:
+        """File contents that indicate real BOSH state return False."""
+        cases = [
+            (
+                "populated bosh key",
+                '{"bosh": {"type": "create-env"}, "current_manifest_sha1": "abc"}',
+            ),
+            (
+                "populated deployments key",
+                '{"deployments": [{"name": "bosh"}]}',
+            ),
+            (
+                "invalid json",
+                "{not valid json",
+            ),
+            (
+                "json array not dict",
+                "[]",
+            ),
+        ]
+        for label, content in cases:
+            with self.subTest(label=label):
+                with tempfile.TemporaryDirectory() as d:
+                    self._write_state(content, Path(d))
+                    self.assertFalse(
+                        self._bosh._state_is_empty(),
+                        msg=f"{label!r}: expected _state_is_empty()=False",
+                    )
+
+
+class TestRunWithRetries(unittest.TestCase):
+    """Unit tests for scripts/test run_with_retries.
+
+    run_with_retries wraps run() which in turn calls subprocess.run.
+    We patch run() directly on the loaded module to control return codes
+    without spawning real subprocesses.
+    """
+
+    def setUp(self):
+        self._test_mod = _load_test_module()
+
+    def test_retry_count_and_return_code_matrix(self) -> None:
+        """Parametrized: verify call count and final rc for various retry/rc combinations."""
+        cases = [
+            # (label, run_returns_sequence, retries, expected_rc, expected_call_count)
+            ("success on first attempt", [0], 2, 0, 1),
+            ("success after one failure", [1, 0], 1, 0, 2),
+            ("all attempts fail rc=42", [42, 42, 42], 2, 42, 3),
+            ("no retries returns immediately", [7], 0, 7, 1),
+        ]
+        for label, run_returns, retries, expected_rc, expected_calls in cases:
+            with self.subTest(label=label):
+                mod = _load_test_module()
+                with unittest.mock.patch.object(mod, "run", side_effect=run_returns) as mock_run:
+                    with unittest.mock.patch.object(mod, "_dry_run", False):
+                        with unittest.mock.patch("time.sleep"):
+                            rc = mod.run_with_retries(["cmd"], retries=retries, delay=0)
+                self.assertEqual(rc, expected_rc, msg=f"{label}: rc mismatch")
+                self.assertEqual(mock_run.call_count, expected_calls, msg=f"{label}: call_count mismatch")
+
+    def test_dry_run_mode_returns_zero_without_calling_run(self) -> None:
+        """When _dry_run is True, run() prints and returns 0 without executing."""
+        test_mod = _load_test_module()
+        test_mod._dry_run = True
+        with unittest.mock.patch.object(test_mod, "run", wraps=test_mod.run) as mock_run:
+            rc = test_mod.run_with_retries(["echo", "dry"], retries=1, delay=0)
+        # run() is still called (it handles dry_run internally), but returns 0
+        # without spawning a subprocess; rc must be 0.
+        self.assertEqual(rc, 0)
+
+    def test_label_used_in_retry_message(self) -> None:
+        """label= kwarg appears in the stderr retry message instead of the raw cmd."""
+        import io
+        buf = io.StringIO()
+        with unittest.mock.patch.object(
+            self._test_mod, "run", side_effect=[1, 0]
+        ):
+            with unittest.mock.patch.object(self._test_mod, "_dry_run", False):
+                with unittest.mock.patch("time.sleep"):
+                    with unittest.mock.patch("sys.stderr", buf):
+                        self._test_mod.run_with_retries(
+                            ["my-cmd", "arg"], retries=1, delay=0, label="my-label"
+                        )
+        self.assertIn("my-label", buf.getvalue())
 
 
 if __name__ == "__main__":

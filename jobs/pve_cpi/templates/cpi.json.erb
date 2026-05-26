@@ -3,8 +3,6 @@
     "host"             => p("pve.host"),
     "port"             => p("pve.port"),
     "user"             => p("pve.user"),
-    "password"         => p("pve.password"),
-    "api_token"        => p("pve.api_token"),
     "realm"            => p("pve.realm"),
     "node"             => p("pve.node"),
     "vm_storage"       => p("pve.vm_storage"),
@@ -32,6 +30,16 @@
     "create_env_deployment" => p("pve.create_env_deployment"),
   }
 
+  # Emit password / api_token only when non-empty. The Go config validator
+  # rejects "both set" or "neither set" — this template never strips a value
+  # the operator supplied. If both p() calls return non-empty, both keys
+  # land in the JSON and Validate() will reject the result with a clear
+  # error at CPI start-up rather than silently picking one.
+  pve_password  = p("pve.password",  "")
+  pve_api_token = p("pve.api_token", "")
+  config["password"]  = pve_password  unless pve_password.to_s.empty?
+  config["api_token"] = pve_api_token unless pve_api_token.to_s.empty?
+
   # cloud_provider.properties.agent.mbus is the URL the agent listens on.
   # bosh-init does NOT pass it via the per-call env argument; it lives only
   # in CPI config. Forward it (and the optional agent.blobstore) so create_vm
@@ -40,9 +48,11 @@
   if_p("agent.blobstore") { |v| config["agent_blobstore"] = v }
 
   if p("pve.agent_mode") == "registry"
-    config["registry_endpoint"] = p("registry.endpoint")
-    config["registry_user"]     = p("registry.user")
-    config["registry_password"] = p("registry.password")
+    config["registry_endpoint"]        = p("registry.endpoint")
+    config["registry_user"]            = p("registry.user")
+    config["registry_password"]        = p("registry.password")
+    config["registry_allow_insecure"]  = p("registry.allow_insecure", false)
+    config["registry_ca_cert"]         = p("registry.ca_cert", "")
   end
   JSON.dump(config)
 %>

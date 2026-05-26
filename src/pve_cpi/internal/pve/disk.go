@@ -5,6 +5,7 @@ package pve
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -14,6 +15,15 @@ import (
 
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 )
+
+// ErrDiskNotAttached is returned (wrapped via fmt.Errorf with %w) by
+// ResolveDiskID when the requested volid is not present on any active bus
+// slot of the target VM. Callers should detect this condition via
+// errors.Is(err, pve.ErrDiskNotAttached) rather than relying on the error
+// type or message text: handlers such as detach_disk treat it as
+// idempotent success, while resize_disk and update_disk treat it as a
+// hard cloud error.
+var ErrDiskNotAttached = errors.New("disk not attached to vm")
 
 // unusedDiskKeyPattern matches PVE "unusedN" config keys. PVE moves a disk
 // to such a slot when it is removed from its bus slot (e.g., scsi1) via
@@ -101,8 +111,12 @@ func FormatSnapshotCID(vmCID, snapName string) string {
 // then uses option-string-tolerant lookup to locate the slot: a config entry
 // "data:vm-9003-disk-0,size=64G" matches volid "data:vm-9003-disk-0".
 //
-// Returns ("", cpierrors.Cloud) when volid is not attached to the VM.
-// Returns ("", err) when the Config call fails.
+// Returns ("", err) wrapping ErrDiskNotAttached when volid is not present on
+// any active bus slot of the VM. Callers may detect this case via
+// errors.Is(err, ErrDiskNotAttached) to decide between idempotent success
+// (detach_disk) and a hard cloud error (resize_disk, update_disk).
+// Returns ("", err) when the Config call fails (the underlying error is
+// wrapped via %w so callers may inspect it).
 func ResolveDiskID(ctx context.Context, c Client, node string, vmid int, volid string) (string, error) {
 	if node == "" {
 		return "", cpierrors.Cloud("ResolveDiskID: node must not be empty")
@@ -121,7 +135,12 @@ func ResolveDiskID(ctx context.Context, c Client, node string, vmid int, volid s
 
 	diskID, ok := FindDiskIDByVolID(qemu.ParseDisks(cfg), volid)
 	if !ok {
-		return "", cpierrors.Cloud("disk %q not attached to VM %d on node %q", volid, vmid, node)
+		// Wrap the sentinel so callers can use errors.Is to distinguish a
+		// not-attached disk from any other ResolveDiskID failure (config
+		// fetch error, validation error). The human-readable prefix
+		// preserves the original message shape for log readability.
+		return "", fmt.Errorf("resolve disk %q on VM %d (node %q): %w",
+			volid, vmid, node, ErrDiskNotAttached)
 	}
 
 	return diskID, nil

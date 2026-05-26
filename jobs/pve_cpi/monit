@@ -1,1 +1,6 @@
-<%# no-op: pve_cpi is invoked on demand by the BOSH director, not run as a service %>
+# The pve_cpi binary is invoked on demand by the BOSH director via stdin/stdout
+# JSON-RPC — it is not a long-running process. A `check process` declaration
+# would cause monit to restart it continuously. This no-op check program keeps
+# monit satisfied while leaving the invocation model intact.
+check program pve_cpi with path /bin/true
+  if status != 0 then unmonitor

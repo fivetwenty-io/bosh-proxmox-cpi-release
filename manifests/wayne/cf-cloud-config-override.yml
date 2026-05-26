@@ -1,0 +1,49 @@
+---
+# ============================================================================
+# PAIRED OVERRIDE: Apply together with manifests/wayne/network-override.yml.
+#
+#   bosh -e pve update-cloud-config manifests/cf/cloud-config.yml \
+#     -o manifests/wayne/cf-cloud-config-override.yml \
+#     -l manifests/bosh/vars.yml -l manifests/cf/vars.yml
+#
+# Replaces the cf/cloud-config.yml subnet CIDR (192.168.1.0/24) with the
+# Wayne lab bloc 10.64.64.0/18 (lvnet001 bridge, 10.64.64.0-10.64.127.255).
+# Mismatch between bosh network and cf cloud-config re-triggers the
+# tailscale LAN route hazard (memory: tailscale-lan-route-hazard): traffic
+# destined for 192.168.1.x is hijacked by the pve Tailscale peer's
+# advertised subnet route, causing "no route to host" for userland clients.
+#
+# CIDR layout (mirrors manifests/wayne/network-override.yml IPAM):
+#   10.64.64.1        gateway (lvnet001)
+#   10.64.64.2-9      reserved infrastructure
+#   10.64.64.10       mgmt-BOSH director
+#   10.64.64.11       reserved (artifacts VM)
+#   10.64.64.12       env-BOSH director
+#   10.64.64.13-19    reserved infrastructure band
+#   10.64.64.20-49    dynamic (CF VMs, BOSH-managed)
+#   10.64.64.50       haproxy (static — matches ((haproxy_private_ip)))
+#   10.64.64.51-254   dynamic continuation
+#   10.64.64.255      reserved (broadcast / infrastructure)
+#   10.64.65.0-10.64.127.255  available for future expansion
+# ============================================================================
+
+# Replace the subnet range with the Wayne lab CIDR.
+- type: replace
+  path: /networks/name=default/subnets/0/range
+  value: 10.64.64.0/18
+
+# Replace the gateway.
+- type: replace
+  path: /networks/name=default/subnets/0/gateway
+  value: 10.64.64.1
+
+# Replace reserved bands.
+# Mirrors the reserved list in manifests/wayne/network-override.yml plus
+# a top-of-range band analogous to 192.168.1.200-254 in the base config.
+- type: replace
+  path: /networks/name=default/subnets/0/reserved
+  value:
+  - 10.64.64.1-10.64.64.9
+  - 10.64.64.11
+  - 10.64.64.13-10.64.64.19
+  - 10.64.127.200-10.64.127.255

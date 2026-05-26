@@ -566,3 +566,104 @@ func TestConfigDrive_Remove_TypedServiceErrorPropagates(t *testing.T) {
 		t.Errorf("expected upstream message in error chain, got %v", err)
 	}
 }
+
+// TestConfigure_PromotesCleanupError verifies that when both attachISO and
+// removeISOFromStorage fail, the returned error contains both the attach and
+// cleanup error messages. The attach error is the wrapped cause (preserving
+// its BOSH type classification via errors.Is traversal); the cleanup error is
+// appended as context.
+func TestConfigure_PromotesCleanupError(t *testing.T) {
+	t.Parallel()
+
+	storageSvc := &fakeStorageSvc{
+		deleteFn: func(_ context.Context, _, _, _ string) error {
+			return errors.New("cleanup boom")
+		},
+	}
+	nodesSvc := &fakeNodesSvc{
+		updateConfigFn: func(_ context.Context, _, _ string, _ *sdknodes.UpdateQemuConfigParams) error {
+			return errors.New("attach boom")
+		},
+	}
+	a := newISOAgent(storageSvc, nodesSvc)
+	err := a.Configure(context.Background(), "pve1", 200, baseISOConfig())
+	if err == nil {
+		t.Fatal("expected error when both attach and cleanup fail")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "attach boom") {
+		t.Errorf("error should contain attach error text; got: %v", err)
+	}
+	if !strings.Contains(msg, "cleanup boom") {
+		t.Errorf("error should contain cleanup error text; got: %v", err)
+	}
+	// The attach error must remain unwrappable from the combined error.
+	if !errors.Is(err, errors.Unwrap(err)) {
+		// Just verify the chain is intact — errors.Is works on plain errors.
+	}
+	// Confirm the attach cause is reachable via Unwrap.
+	cause := errors.Unwrap(err)
+	if cause == nil {
+		t.Error("expected non-nil Unwrap on combined error (attach error should be wrapped cause)")
+	}
+}
+
+// TestConfigure_LocalISOStorageEmitsWarning verifies that Configure emits
+// exactly one warning log containing "iso_storage=local" when storage is
+// "local", regardless of how many times Configure is called.
+func TestConfigure_LocalISOStorageEmitsWarning(t *testing.T) {
+	// Not parallel — manipulates the package-level sync.Once.
+	resetLocalISOStorageWarnOnce()
+	t.Cleanup(resetLocalISOStorageWarnOnce)
+
+	obsLogger, obs := log.NewObservedLogger(log.LevelWarn)
+	client := &fakePVEClient{
+		storageSvc: &fakeStorageSvc{},
+		nodesSvc:   &fakeNodesSvc{},
+	}
+	a := newConfigDriveForTest(client, "local", obsLogger)
+
+	// First call.
+	if err := a.Configure(context.Background(), "pve1", 201, baseISOConfig()); err != nil {
+		t.Fatalf("Configure (1st): %v", err)
+	}
+	// Second call — warning must NOT fire again.
+	if err := a.Configure(context.Background(), "pve1", 202, baseISOConfig()); err != nil {
+		t.Fatalf("Configure (2nd): %v", err)
+	}
+
+	var warnCount int
+	for _, e := range obs.All() {
+		if e.Level == log.LevelWarn && strings.Contains(e.Message, "iso_storage=local") {
+			warnCount++
+		}
+	}
+	if warnCount != 1 {
+		t.Errorf("expected exactly 1 iso_storage=local warning across 2 Configure calls, got %d", warnCount)
+	}
+}
+
+// TestConfigure_NonLocalISOStorageNoWarning verifies that no "iso_storage=local"
+// warning is emitted when the effective storage pool is not "local".
+func TestConfigure_NonLocalISOStorageNoWarning(t *testing.T) {
+	// Not parallel — manipulates the package-level sync.Once.
+	resetLocalISOStorageWarnOnce()
+	t.Cleanup(resetLocalISOStorageWarnOnce)
+
+	obsLogger, obs := log.NewObservedLogger(log.LevelWarn)
+	client := &fakePVEClient{
+		storageSvc: &fakeStorageSvc{},
+		nodesSvc:   &fakeNodesSvc{},
+	}
+	a := newConfigDriveForTest(client, "ceph", obsLogger)
+
+	if err := a.Configure(context.Background(), "pve1", 203, baseISOConfig()); err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+
+	for _, e := range obs.All() {
+		if e.Level == log.LevelWarn && strings.Contains(e.Message, "iso_storage=local") {
+			t.Errorf("unexpected iso_storage=local warning for storage=ceph: %q", e.Message)
+		}
+	}
+}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"sync/atomic"
 	"testing"
 
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cloudinit"
@@ -13,6 +14,7 @@ import (
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/qemu"
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/storage"
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/tasks"
+	sdkerrors "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/errors"
 )
 
 // ---------------------------------------------------------------------------
@@ -258,7 +260,9 @@ func TestNodeForExisting_AllNodesError_ReturnsRetriable(t *testing.T) {
 
 	// Must NOT be DiskNotFound — that would silently hide the cluster outage.
 	if isDNF := func() bool {
-		type diskNotFoundChecker interface{ Type() interface{ String() string } }
+		type diskNotFoundChecker interface {
+			Type() interface{ String() string }
+		}
 		// Check via string: DiskNotFound message contains "disk not found:".
 		return len(err.Error()) > 0 && containsStr(err.Error(), "disk not found:")
 	}(); isDNF {
@@ -288,6 +292,52 @@ func containsStr(s, sub string) bool {
 		}
 		return false
 	}()
+}
+
+// TestCandidateNodes_RetriesOnTransient confirms candidateNodes wraps the
+// /cluster/resources call in RetryOnTransient so a transient SDK error (e.g.
+// pvedaemon worker recycle) does not cascade into a backend resolve failure.
+// The fake cluster service returns a transient ConnectionError on the first
+// call and a healthy response on the second; the test asserts the eventual
+// success path runs (NodeForExisting returns the expected node) and that
+// ListResources was invoked at least twice.
+func TestCandidateNodes_RetriesOnTransient(t *testing.T) {
+	var calls atomic.Int32
+	c := &backendTestClient{
+		storageSvc: &fakeStorage{
+			existsFn: func(_ context.Context, node, _, _ string) (bool, error) {
+				return node == "pve-02", nil
+			},
+		},
+		clusterSvc: &fakeCluster{
+			listFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+				n := calls.Add(1)
+				if n == 1 {
+					// Transient ConnectionError: IsTransientTransport returns true.
+					return nil, &sdkerrors.ConnectionError{
+						Host:    "pve.example",
+						Port:    8006,
+						Message: "transient blip",
+					}
+				}
+				return clusterResp(
+					map[string]any{"node": "pve-01"},
+					map[string]any{"node": "pve-02"},
+				), nil
+			},
+		},
+	}
+	b := newLocalBackend(c, StorageInfo{Name: "local-zfs", Type: "zfspool"}, "")
+	got, err := b.NodeForExisting(context.Background(), "vm-100-disk-0")
+	if err != nil {
+		t.Fatalf("NodeForExisting after transient retry: %v", err)
+	}
+	if got != "pve-02" {
+		t.Errorf("got %q, want pve-02", got)
+	}
+	if n := calls.Load(); n < 2 {
+		t.Errorf("ListResources call count = %d, want ≥2 (retry should have re-invoked)", n)
+	}
 }
 
 func TestLocalBackend_NodeForExisting_RestrictedNodes_SkipsClusterScan(t *testing.T) {

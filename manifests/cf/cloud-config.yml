@@ -1,4 +1,15 @@
 ---
+# ============================================================================
+# WAYNE LAB OVERRIDE PAIR: When the network uses 10.64.64.0/18 (lvnet001),
+# apply both override files together with `bosh update-cloud-config`:
+#   -o manifests/wayne/cf-cloud-config-override.yml
+# The BOSH director network must also be overridden:
+#   -o manifests/wayne/network-override.yml  (applied at bosh create-env)
+# Omitting cf-cloud-config-override.yml while network-override.yml is active
+# leaves this file's reserved bands in 192.168.1.x, re-triggering the
+# tailscale LAN route hazard (see memory: tailscale-lan-route-hazard).
+# ============================================================================
+#
 # Cloud-config for cf-deployment on the bosh-pve director.
 #
 # Single-node PVE cluster, 3 AZ aliases (z1/z2/z3) all bound to the same

@@ -6,32 +6,41 @@ The CPI is configured via properties in a BOSH deployment manifest. The job temp
 |---|---|---|---|
 | `pve.host` | PVE host (IP or FQDN) | - | yes |
 | `pve.port` | PVE API port | `8006` | no |
-| `pve.user` | PVE username | - | yes |
-| `pve.password` | PVE password | - | one of password or api_token |
-| `pve.api_token` | PVE API token | - | one of password or api_token |
+| `pve.user` | PVE username (e.g. `root@pam` or `bosh@pve`) | - | yes |
+| `pve.password` | PVE password. Mutually exclusive with `api_token`. Must be credhub-managed in production via `((pve_password))`. | `""` | one of password or api_token |
+| `pve.api_token` | PVE API token (`<user>!<token-id>=<uuid>`). Mutually exclusive with `password`. Must be credhub-managed in production via `((pve_api_token))`. | `""` | one of password or api_token |
 | `pve.realm` | Authentication realm | `pam` | no |
-| `pve.node` | Default node | - | yes |
+| `pve.node` | Default node for placement and bridge operations | - | yes |
 | `pve.vm_storage` | Storage pool for VM root disks | - | yes |
 | `pve.disk_storage` | Storage pool for persistent disks | - | yes |
-| `pve.stemcell_storage` | Storage pool for stemcell qcow2 images. Must be a file-based PVE storage (dir, nfs, cifs, glusterfs, cephfs) — block-based storages (lvm, lvmthin, zfspool, rbd) cannot accept qcow2 uploads. Must also be shared across cluster nodes when the cluster has more than one node. Defaults to `vm_storage`; in that case `vm_storage` must satisfy the same constraints. | `vm_storage` | no |
-| `pve.network_bridge` | Default network bridge | `vmbr0` | no |
-| `pve.network_mode` | Network creation mode for managed networks: `sdn`, `bridge`, or `auto` | `auto` | no |
-| `pve.sdn_zone` | Default PVE SDN zone for vnet placement. When empty, the zone must be supplied per-call in `cloud_properties.zone`. | `""` | no |
+| `pve.stemcell_storage` | Storage pool for stemcell qcow2 images. Must be a file-based PVE storage (`dir`, `nfs`, `cifs`, `glusterfs`, `cephfs`) — block-based storages (`lvm`, `lvmthin`, `zfspool`, `rbd`) cannot accept qcow2 uploads. Must also be shared across cluster nodes when the cluster has more than one node. Defaults to `vm_storage`; in that case `vm_storage` must satisfy the same constraints. | `""` (falls back to `vm_storage`) | no |
+| `pve.iso_storage` | Storage pool (`dir`, `nfs`, or `cifs` with `iso` content enabled) used for per-VM ConfigDrive ISOs in `cloudinit` agent mode. Block storages (`lvm`, `lvmthin`, `zfspool`) cannot hold ISO files. The default `local` value places ISOs on node-local storage and is readable by any user with PVE node access — see [ConfigDrive ISO storage](operations.md#configdrive-iso-storage) for the dedicated-pool recommendation. | `local` | no |
+| `pve.network_bridge` | Default Linux bridge for `create_vm` NIC attachment. Required regardless of `network_mode`. | `vmbr0` | no |
+| `pve.network_mode` | Network creation mode for managed networks. `sdn` — PVE SDN vnet lifecycle. `bridge` — Linux bridge lifecycle. `auto` — SDN when `cloud_properties.zone` or `pve.sdn_zone` is set; bridge otherwise. See [Network configuration](networks.md). | `auto` | no |
+| `pve.sdn_zone` | Default PVE SDN zone for vnet placement. When empty, the zone must be supplied per-call in `cloud_properties.zone`. See [Network configuration](networks.md). | `""` | no |
 | `pve.sdn_zone_type` | Zone type the CPI uses when creating a zone (`simple`, `vlan`, `qinq`, `vxlan`, `evpn`). Only relevant when `sdn_auto_manage_zone` is `true`. | `simple` | no |
-| `pve.sdn_auto_manage_zone` | When `true`, the CPI may create SDN zones on `create_network` and delete them on `delete_network` when all safety conditions are met. | `false` | no |
-| `pve.verify_ssl` | Verify TLS certificates | `true` | no |
+| `pve.sdn_auto_manage_zone` | When `true`, the CPI may create SDN zones on `create_network` and delete them on `delete_network` when all safety conditions are met. See [Network configuration](networks.md). | `false` | no |
+| `pve.verify_ssl` | Verify the PVE API TLS certificate | `true` | no |
 | `pve.agent_mode` | Agent bootstrap mode (`cloudinit`, `registry`, `noagent`) | `cloudinit` | no |
 | `pve.vm_disk_format` | Disk image format (`qcow2`, `raw`, `vmdk`) | `qcow2` | no |
-| `pve.reboot_mode` | `reboot_vm` strategy: `soft` (graceful ACPI reboot, hard-reset fallback) or `hard` (immediate reset) | `soft` | no |
-| `pve.reboot_timeout` | Seconds to wait for graceful shutdown before hard-reset fallback (soft mode only) | `60` | no |
-| `pve.log_level` | Log level (`debug`, `info`, `warn`, `error`) | `info` | no |
+| `pve.hotplug` | PVE hotplug flags applied to every new VM. Comma-separated subset of `network,disk,cpu,memory,usb,cloudinit`, or `0` to disable hotplug entirely. Per-VM override via `cloud_properties.hotplug`. | `network,disk,cpu,memory` | no |
+| `pve.numa` | Enable NUMA (`numa=1`) on every new VM. Required at create time for live memory hotplug to allocate DIMM slots; without it, memory hot-add silently no-ops. Per-VM override via `cloud_properties.numa`. | `true` | no |
+| `pve.reboot_mode` | `reboot_vm` strategy: `soft` (graceful ACPI reboot, hard-reset fallback) or `hard` (immediate reset). | `soft` | no |
+| `pve.reboot_timeout` | Seconds to wait for graceful shutdown before hard-reset fallback (soft mode only). Range 1–3600. | `60` | no |
+| `pve.log_level` | Structured log level (`debug`, `info`, `warn`, `error`) | `info` | no |
 | `pve.vmid_range_start` | First VMID used for VM allocation. VMs use `[vmid_range_start, vmid_range_end]`. Persistent disks use `[9000, 9999]`. | `100` | no |
 | `pve.vmid_range_end` | Inclusive upper bound of the VM VMID range. Must be greater than `vmid_range_start` and at most `9999`. The allocator scans this range from a randomized start so concurrent CPI invocations rarely pick the same VMID; a retry-on-conflict loop backstops the rare collision. | `5999` | no |
+| `pve.vm_prefix` | Optional prefix prepended to every CPI-provisioned VM's PVE name. With `cpi`, names take the form `cpi-<deployment>-<job>-<index>`. Empty means the prefix is omitted. The prefix is cluster-wide — every VM created by this CPI deployment carries it. | `""` | no |
+| `pve.create_env_deployment` | Synthetic deployment name used for VMs created by `bosh create-env`. bosh-init does not pass a deployment in env, so a stable placeholder is required for the `<deployment>` segment of the VM name. | `create-env` | no |
 | `pve.allow_disk_ops_with_snapshots` | When `true`, bypasses the snapshot pre-flight guard in `attach_disk`, `detach_disk`, and `resize_disk`. Use only for emergency disk recovery — snapshot state becomes inconsistent after the operation. | `false` | no |
 | `pve.require_snapshot_check_pass` | Controls behavior when the snapshot pre-flight check itself cannot reach PVE. `false` (default) logs a warning and proceeds (fail-open); `true` aborts the disk operation if the snapshot list cannot be fetched (fail-closed). | `false` | no |
-| `registry.endpoint` | BOSH registry URL | - | yes when `agent_mode = registry` |
-| `registry.user` | Registry username | - | yes when `agent_mode = registry` |
-| `registry.password` | Registry password | - | yes when `agent_mode = registry` |
+| `agent.mbus` | URL the BOSH agent should bind/listen on inside the VM. Required for `bosh create-env`: bosh-init does not pass it via the per-call env argument, only via CPI config. When empty, the CPI derives `nats://<blobstore-host>:4222` from the blobstore endpoint if one is configured (loopback hosts rejected). | `""` | yes for `create-env` |
+| `agent.blobstore` | Optional default blobstore settings for the agent's `settings.json` (mirrors `agent.blobstore` in `bosh.yml`). | `{}` | no |
+| `registry.endpoint` | BOSH registry URL. Must use `https://` unless `registry.allow_insecure` is `true`. | `""` | yes when `agent_mode = registry` |
+| `registry.user` | Registry HTTP basic-auth username | `""` | yes when `agent_mode = registry` |
+| `registry.password` | Registry HTTP basic-auth password | `""` | yes when `agent_mode = registry` |
+| `registry.allow_insecure` | When `true`, permits a plaintext `http://` registry endpoint. Default `false` rejects any non-`https` scheme so registry credentials never travel in cleartext. Set `true` only for lab and test deployments. | `false` | no |
+| `registry.ca_cert` | Optional PEM-encoded CA certificate (or chain) appended to the host system trust pool when verifying the registry's TLS certificate. Use when the registry presents a certificate signed by a private CA. Empty means use the system pool unmodified. | `""` | no |
 
 ## Stemcell Storage
 
