@@ -39,6 +39,16 @@ tier1:
   disk_size_mib:    1024           # Persistent disk size (MiB)
   stemcell_path:    ""             # Absolute path to stemcell; or set STEMCELL_PATH env var
 
+  # Snapshot/detach ordering (optional). The base lifecycle pass runs the clean
+  # order: delete_snapshot before detach_disk (PVE refuses to detach a disk a
+  # snapshot still references, so detach_disk's guard never fires). When true,
+  # Tier 1 runs one extra pass (orthogonal to disk_storage_pools / network modes)
+  # that detaches while the snapshot is present, using a CPI config with
+  # allow_disk_ops_with_snapshots=true to exercise detach_disk's documented
+  # guard-bypass path and the resulting unused-slot cleanup through delete_vm.
+  # Default (absent/false) runs only the clean order.
+  snapshot_detach_bypass: false
+
   # Multi-storage matrix (optional). When disk_storage_pools is non-empty, Tier 1
   # runs scripts/lifecycle once per pool, exercising all disk CPI methods against
   # each storage type. Each run is independently gated — a pool failure halts the

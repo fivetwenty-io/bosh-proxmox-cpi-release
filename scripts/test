@@ -247,6 +247,38 @@ def tier_lifecycle(cfg: dict, cpi_config_path: str, keep: bool) -> int:
             print(f"tier 1 failed: scripts/lifecycle (mode={mode})", file=sys.stderr)
             return 1
 
+    # Snapshot-detach bypass pass (optional, orthogonal to pools/network). The
+    # base pass(es) above run SNAPSHOT_DETACH_MODE=clean (delete_snapshot before
+    # detach). When tier1.snapshot_detach_bypass is set, run one extra pass that
+    # detaches while the snapshot is still present, using a CPI config with
+    # allow_disk_ops_with_snapshots=true so detach_disk's guard is bypassed.
+    if cfg.get("tier1", {}).get("snapshot_detach_bypass"):
+        print("==> tier 1: lifecycle pass (SNAPSHOT_DETACH_MODE=bypass)")
+        if _dry_run:
+            print("==> tier 1: would write CPI config with allow_disk_ops_with_snapshots=true")
+            rc = run(
+                ["./scripts/lifecycle"],
+                env={**t1_env, "SNAPSHOT_DETACH_MODE": "bypass"},
+                cwd=REPO_ROOT,
+            )
+        else:
+            fd, bypass_cfg = tempfile.mkstemp(prefix="cpi-snap-bypass-", suffix=".json")
+            os.close(fd)
+            try:
+                _integration.write_cpi_config(
+                    cfg, bypass_cfg, dry_run=False, allow_disk_ops_with_snapshots=True
+                )
+                rc = run(
+                    ["./scripts/lifecycle"],
+                    env={**t1_env, "CPI_CONFIG": bypass_cfg, "SNAPSHOT_DETACH_MODE": "bypass"},
+                    cwd=REPO_ROOT,
+                )
+            finally:
+                Path(bypass_cfg).unlink(missing_ok=True)
+        if rc != 0:
+            print("tier 1 failed: scripts/lifecycle (SNAPSHOT_DETACH_MODE=bypass)", file=sys.stderr)
+            return 1
+
     print("==> tier 1: lifecycle passed")
     return 0
 

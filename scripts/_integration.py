@@ -140,6 +140,7 @@ def build_cpi_config(
     disk_storage_override: "str | None" = None,
     sdn_zone: "str | None" = None,
     sdn_auto_manage_zone: "bool | None" = None,
+    allow_disk_ops_with_snapshots: "bool | None" = None,
 ) -> dict:
     """Build and return the CPI config dict from cfg without writing any file.
 
@@ -236,6 +237,11 @@ def build_cpi_config(
     if sdn_auto_manage_zone is not None:
         cpi_cfg["sdn_auto_manage_zone"] = sdn_auto_manage_zone
 
+    # Optional snapshot-guard bypass (set by the snapshot-detach bypass pass).
+    # Omitted by default so non-bypass runs keep the existing config shape.
+    if allow_disk_ops_with_snapshots is not None:
+        cpi_cfg["allow_disk_ops_with_snapshots"] = allow_disk_ops_with_snapshots
+
     return cpi_cfg
 
 
@@ -247,6 +253,7 @@ def write_cpi_config(
     disk_storage_override: "str | None" = None,
     sdn_zone: "str | None" = None,
     sdn_auto_manage_zone: "bool | None" = None,
+    allow_disk_ops_with_snapshots: "bool | None" = None,
 ) -> str:
     """Synthesize the CPI JSON config and write it to out_path.
 
@@ -276,6 +283,7 @@ def write_cpi_config(
         disk_storage_override=disk_storage_override,
         sdn_zone=sdn_zone,
         sdn_auto_manage_zone=sdn_auto_manage_zone,
+        allow_disk_ops_with_snapshots=allow_disk_ops_with_snapshots,
     )
 
     if dry_run:

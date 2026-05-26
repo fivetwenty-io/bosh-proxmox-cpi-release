@@ -23,8 +23,8 @@ Sequence (mirrors the BOSH-CPI Director call order):
     7c. update_disk             (sets cache=writeback, iothread=true)
     8.  get_disks               (post-attach assertion)
     9.  snapshot_disk
-   10.  detach_disk
-   11.  delete_snapshot
+   10.  delete_snapshot          (clean mode; detach_disk in bypass mode)
+   11.  detach_disk              (clean mode; delete_snapshot in bypass mode)
    12.  delete_disk
    12a. has_disk                (post-delete assertion, expect false)
    13.  reboot_vm               (soft graceful reboot, default config)
@@ -73,6 +73,17 @@ Network-test environment (exercises create_network / delete_network):
     SDN_GATEWAY        gateway for the SDN subnet   (mode=sdn)
     SDN_IP             test VM IP within SDN_RANGE  (mode=sdn)
     BRIDGE_TEST_IFACE  bridge iface to create       (mode=bridge, e.g. vmbr9)
+
+Snapshot/detach ordering (exercises detach_disk's snapshot guard):
+    SNAPSHOT_DETACH_MODE  clean | bypass             (default: clean)
+                       clean  — delete the snapshot before detaching (PVE rejects
+                                detaching a disk a snapshot references; this is
+                                the safe order, so detach_disk's guard never fires)
+                       bypass — detach while the snapshot is still present; relies
+                                on the CPI config setting
+                                allow_disk_ops_with_snapshots=true to skip the
+                                guard (the test harness writes that config for the
+                                bypass pass)
 """
 
 from __future__ import annotations
@@ -128,6 +139,10 @@ SDN_RANGE = env("SDN_RANGE", "")
 SDN_GATEWAY = env("SDN_GATEWAY", "")
 SDN_IP = env("SDN_IP", "")
 BRIDGE_TEST_IFACE = env("BRIDGE_TEST_IFACE", "")
+
+SNAPSHOT_DETACH_MODE = env("SNAPSHOT_DETACH_MODE", "clean").strip().lower()
+if SNAPSHOT_DETACH_MODE not in ("clean", "bypass"):
+    sys.exit(f"SNAPSHOT_DETACH_MODE must be clean|bypass, got {SNAPSHOT_DETACH_MODE!r}")
 
 if not os.access(CPI_BIN, os.X_OK):
     sys.exit(f"CPI_BIN not executable: {CPI_BIN}")
@@ -486,15 +501,37 @@ def main() -> int:
         )
         print(f"snapshot_cid={state['snapshot_cid']}")
 
-        step("10. detach_disk")
-        call("detach_disk", [state["vm_cid"], state["disk_cid"]])
-        state["disk_attached"] = False
-        print("detach_disk=ok")
+        # Steps 10-11 ordering depends on SNAPSHOT_DETACH_MODE.
+        #   clean  — delete the snapshot first, then detach. PVE refuses to detach
+        #            a disk a snapshot still references, so the safe teardown order
+        #            removes the snapshot before detach; detach_disk's guard never
+        #            fires.
+        #   bypass — detach while the snapshot is still present, relying on the
+        #            CPI's allow_disk_ops_with_snapshots=true (set in this pass's
+        #            config) to skip the guard. PVE leaves the volume in an unused
+        #            slot; delete_disk (step 12) then frees it once the snapshot is
+        #            gone, and the dangling slot is tolerated by delete_vm's
+        #            stale-slot guard. Exercises the full documented bypass path.
+        if SNAPSHOT_DETACH_MODE == "bypass":
+            step("10. detach_disk (bypass: snapshot present, allow_disk_ops_with_snapshots=true)")
+            call("detach_disk", [state["vm_cid"], state["disk_cid"]])
+            state["disk_attached"] = False
+            print("detach_disk(bypass)=ok")
 
-        step("11. delete_snapshot")
-        call("delete_snapshot", [state["snapshot_cid"]])
-        state["snapshot_cid"] = ""
-        print("delete_snapshot=ok")
+            step("11. delete_snapshot")
+            call("delete_snapshot", [state["snapshot_cid"]])
+            state["snapshot_cid"] = ""
+            print("delete_snapshot=ok")
+        else:
+            step("10. delete_snapshot (clean: before detach)")
+            call("delete_snapshot", [state["snapshot_cid"]])
+            state["snapshot_cid"] = ""
+            print("delete_snapshot=ok")
+
+            step("11. detach_disk")
+            call("detach_disk", [state["vm_cid"], state["disk_cid"]])
+            state["disk_attached"] = False
+            print("detach_disk=ok")
 
         step("12. delete_disk")
         call("delete_disk", [state["disk_cid"]])
