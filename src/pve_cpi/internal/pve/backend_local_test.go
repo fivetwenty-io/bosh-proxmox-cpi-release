@@ -232,6 +232,64 @@ func TestLocalBackend_NodeForExisting_ClusterListErrorPropagates(t *testing.T) {
 	}
 }
 
+func TestNodeForExisting_AllNodesError_ReturnsRetriable(t *testing.T) {
+	// All candidate Exists() probes fail → must return retriable error, NOT DiskNotFound.
+	probeErr := errors.New("connection refused")
+	c := &backendTestClient{
+		storageSvc: &fakeStorage{
+			existsFn: func(_ context.Context, _, _, _ string) (bool, error) {
+				return false, probeErr
+			},
+		},
+		clusterSvc: &fakeCluster{
+			listFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+				return clusterResp(
+					map[string]any{"node": "pve-01"},
+					map[string]any{"node": "pve-02"},
+				), nil
+			},
+		},
+	}
+	b := newLocalBackend(c, StorageInfo{Name: "local-zfs", Type: "zfspool"}, "")
+	_, err := b.NodeForExisting(context.Background(), "vm-100-disk-0")
+	if err == nil {
+		t.Fatalf("expected error when all probes fail")
+	}
+
+	// Must NOT be DiskNotFound — that would silently hide the cluster outage.
+	if isDNF := func() bool {
+		type diskNotFoundChecker interface{ Type() interface{ String() string } }
+		// Check via string: DiskNotFound message contains "disk not found:".
+		return len(err.Error()) > 0 && containsStr(err.Error(), "disk not found:")
+	}(); isDNF {
+		t.Fatalf("got DiskNotFound but expected retriable error; err=%v", err)
+	}
+
+	// Must be retriable (ok_to_retry=true).
+	type retriableChecker interface {
+		OkToRetry() bool
+	}
+	rc, ok := err.(retriableChecker)
+	if !ok {
+		t.Fatalf("error does not implement OkToRetry(); type=%T err=%v", err, err)
+	}
+	if !rc.OkToRetry() {
+		t.Fatalf("expected OkToRetry()=true, got false; err=%v", err)
+	}
+}
+
+// containsStr is a package-private substring helper for test assertions.
+func containsStr(s, sub string) bool {
+	return len(sub) > 0 && len(s) >= len(sub) && func() bool {
+		for i := 0; i <= len(s)-len(sub); i++ {
+			if s[i:i+len(sub)] == sub {
+				return true
+			}
+		}
+		return false
+	}()
+}
+
 func TestLocalBackend_NodeForExisting_RestrictedNodes_SkipsClusterScan(t *testing.T) {
 	c := &backendTestClient{
 		storageSvc: &fakeStorage{

@@ -856,5 +856,92 @@ func TestHandleCreateNetwork_SDN_Rollback_PreexistingVnet_NoRollbackDelete(t *te
 	}
 }
 
+// -- CN-RB-04: auto-create zone + vnet; subnet-create fails → rollback deletes both vnet and zone, applies --
+//
+// Verifies the createdZone=true rollback branch in createNetworkSDN:
+//   - Zone absent, sdn_auto_manage_zone=true → CreateSdnZones called → createdZone=true.
+//   - Vnet absent → CreateSdnVnets called → vnetCreated=true.
+//   - CreateSdnVnetsSubnets returns a non-conflict error → rollback path.
+//   - Rollback: DeleteSdnVnets called (vnetCreated=true).
+//   - Rollback: DeleteSdnZones called (createdZone=true).
+//   - Rollback: UpdateSdn (applySDN) called at least once.
+//   - Handler returns the original subnet-create error.
+
+func TestHandleCreateNetwork_SubnetCreateFails_RollsBackZoneAndVnet(t *testing.T) {
+	var deleteVnetCalled bool
+	var deleteZoneCalled bool
+	var updateSdnCalls int
+	subnetErr := &pveerr.APIError{} // non-409, non-404 — triggers rollback
+
+	clusterSvc := &mockSDNCluster{
+		getSdnZonesFn: func(_ context.Context, _ string, _ *sdkcluster.GetSdnZonesParams) (*sdkcluster.GetSdnZonesResponse, error) {
+			// Zone absent → triggers auto-create (sdn_auto_manage_zone=true).
+			return nil, sdnNotFound()
+		},
+		createSdnZonesFn: func(_ context.Context, params *sdkcluster.CreateSdnZonesParams) error {
+			if params.Zone != "autozone" {
+				t.Errorf("createSdnZones: expected zone=autozone, got %q", params.Zone)
+			}
+			return nil // zone created → createdZone=true
+		},
+		getSdnVnetsFn: func(_ context.Context, _ string, _ *sdkcluster.GetSdnVnetsParams) (*sdkcluster.GetSdnVnetsResponse, error) {
+			return nil, sdnNotFound() // vnet absent → will be created
+		},
+		createSdnVnetsFn: func(_ context.Context, params *sdkcluster.CreateSdnVnetsParams) error {
+			if params.Zone != "autozone" {
+				t.Errorf("createSdnVnets: expected zone=autozone, got %q", params.Zone)
+			}
+			return nil // vnet created → vnetCreated=true
+		},
+		createSdnVnetsSubnetsFn: func(_ context.Context, _ string, _ *sdkcluster.CreateSdnVnetsSubnetsParams) error {
+			return subnetErr // non-conflict error → rollback
+		},
+		deleteSdnVnetsFn: func(_ context.Context, vnet string, _ *sdkcluster.DeleteSdnVnetsParams) error {
+			deleteVnetCalled = true
+			if vnet != "myvnet" {
+				t.Errorf("deleteSdnVnets: expected vnet=myvnet, got %q", vnet)
+			}
+			return nil
+		},
+		deleteSdnZonesFn: func(_ context.Context, zone string, _ *sdkcluster.DeleteSdnZonesParams) error {
+			deleteZoneCalled = true
+			if zone != "autozone" {
+				t.Errorf("deleteSdnZones: expected zone=autozone, got %q", zone)
+			}
+			return nil
+		},
+		updateSdnFn: func(_ context.Context, _ *sdkcluster.UpdateSdnParams) (*sdkcluster.UpdateSdnResponse, error) {
+			updateSdnCalls++
+			return nil, nil
+		},
+	}
+
+	spec := map[string]any{
+		"type":    "manual",
+		"range":   "10.0.0.0/24",
+		"gateway": "10.0.0.1",
+		"cloud_properties": map[string]any{
+			"zone": "autozone",
+			"vnet": "myvnet",
+		},
+	}
+	_, err := invokeCreateNetwork(t, testSDNDeps(clusterSvc, "sdn", "", true), spec)
+	if err == nil {
+		t.Fatal("expected error from subnet-create failure")
+	}
+	if !deleteVnetCalled {
+		t.Error("rollback: DeleteSdnVnets must be called when vnetCreated=true and subnet-create fails")
+	}
+	if !deleteZoneCalled {
+		t.Error("rollback: DeleteSdnZones must be called when createdZone=true and subnet-create fails")
+	}
+	if updateSdnCalls < 1 {
+		t.Errorf("rollback: UpdateSdn (applySDN) must be called at least once after rollback deletes; called %d times", updateSdnCalls)
+	}
+	// UpdateSdn must NOT be called before rollback (apply only runs for cleanup).
+	// The subnet-create failure occurs before the main happy-path apply, so
+	// every UpdateSdn call in this test belongs to the rollback path.
+}
+
 // ensure testConfig() satisfies compile-time check that *config.CPIConfig is used
 var _ *config.CPIConfig = testConfig()

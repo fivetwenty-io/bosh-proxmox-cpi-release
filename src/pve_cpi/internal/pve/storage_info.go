@@ -48,12 +48,19 @@ type StorageLister interface {
 // StorageInfoCache holds short-lived StorageInfo lookups so the backend
 // abstraction does not flood the PVE Director with /storage requests during
 // bursts of disk activity.
+//
+// The inflight map coalesces concurrent misses on the same key: the first
+// goroutine to observe a miss creates a channel, releases the mutex, performs
+// the refresh, then closes the channel. All subsequent goroutines that arrive
+// while the refresh is in flight wait on that channel and re-read the cache
+// once it closes. This eliminates the TOCTOU double-refresh race (B5).
 type StorageInfoCache struct {
 	lister StorageLister
 	ttl    time.Duration
 
-	mu      sync.Mutex
-	entries map[string]storageInfoEntry
+	mu       sync.Mutex
+	entries  map[string]storageInfoEntry
+	inflight map[string]chan struct{}
 }
 
 type storageInfoEntry struct {
@@ -65,41 +72,90 @@ type storageInfoEntry struct {
 // caching (every Get triggers a fetch).
 func NewStorageInfoCache(lister StorageLister, ttl time.Duration) *StorageInfoCache {
 	return &StorageInfoCache{
-		lister:  lister,
-		ttl:     ttl,
-		entries: make(map[string]storageInfoEntry),
+		lister:   lister,
+		ttl:      ttl,
+		entries:  make(map[string]storageInfoEntry),
+		inflight: make(map[string]chan struct{}),
 	}
 }
 
 // Get returns the StorageInfo for the named storage. The first call (or a call
 // after expiry) fetches the full /storage index and populates the cache.
 //
-// A storage not present in the index is reported as
-// ("", os.ErrNotExist-wrapped CloudError). Callers that want "treat-as-local"
-// behavior on lookup miss should handle the error explicitly.
+// Concurrent misses on the same key are coalesced: only one goroutine performs
+// the refresh; all others wait on an inflight channel and re-read the cache
+// once the refresh completes. This prevents the TOCTOU double-refresh race
+// where two goroutines both observe a miss and both call refresh concurrently.
+//
+// A storage not present in the index is reported as a non-nil error. Callers
+// that want "treat-as-local" behavior on lookup miss should handle explicitly.
+//
+// Inputs and failure modes:
+//   - name "" → error before any lock or fetch.
+//   - ctx cancelled while waiting on inflight → returns ctx.Err() wrapped.
+//   - lister error → refresh goroutine returns the error; waiters receive it
+//     because the cache is not populated and they attempt their own refresh
+//     via the same coalescing path (the inflight channel is deleted after
+//     refresh returns regardless of success).
+//   - storage absent from index → non-nil error after successful refresh.
 func (c *StorageInfoCache) Get(ctx context.Context, name string) (StorageInfo, error) {
 	if name == "" {
 		return StorageInfo{}, fmt.Errorf("storage_info: name must not be empty")
 	}
 
-	c.mu.Lock()
-	if entry, ok := c.entries[name]; ok && (c.ttl <= 0 || time.Now().Before(entry.exp)) {
+	for {
+		c.mu.Lock()
+
+		// Cache hit: valid entry exists and TTL not expired (or TTL disabled).
+		if entry, ok := c.entries[name]; ok && (c.ttl <= 0 || time.Now().Before(entry.exp)) {
+			c.mu.Unlock()
+			return entry.info, nil
+		}
+
+		// Cache miss: check whether another goroutine is already refreshing.
+		if ch, inflight := c.inflight[name]; inflight {
+			// Another goroutine owns the refresh; wait for it to complete.
+			c.mu.Unlock()
+			select {
+			case <-ch:
+				// Refresh done; loop back to re-read the cache. The entry may
+				// or may not be present (refresh could have failed), so we
+				// re-enter the loop rather than reading unconditionally.
+				continue
+			case <-ctx.Done():
+				return StorageInfo{}, fmt.Errorf("storage_info: context done while waiting for cache refresh of %q: %w", name, ctx.Err())
+			}
+		}
+
+		// This goroutine is the refresh owner: publish the inflight channel
+		// before releasing the lock so latecomers see it immediately.
+		ch := make(chan struct{})
+		c.inflight[name] = ch
 		c.mu.Unlock()
+
+		// Perform the refresh outside all locks. Other goroutines for this key
+		// are parked on ch; goroutines for different keys proceed unobstructed.
+		refreshErr := c.refresh(ctx)
+
+		// Close the channel to unblock all waiters, then remove the sentinel.
+		close(ch)
+		c.mu.Lock()
+		delete(c.inflight, name)
+		c.mu.Unlock()
+
+		if refreshErr != nil {
+			return StorageInfo{}, refreshErr
+		}
+
+		// Read the result under lock; absent entry is a not-found error.
+		c.mu.Lock()
+		entry, ok := c.entries[name]
+		c.mu.Unlock()
+		if !ok {
+			return StorageInfo{}, fmt.Errorf("storage_info: storage %q not present in PVE /storage index", name)
+		}
 		return entry.info, nil
 	}
-	c.mu.Unlock()
-
-	if err := c.refresh(ctx); err != nil {
-		return StorageInfo{}, err
-	}
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	entry, ok := c.entries[name]
-	if !ok {
-		return StorageInfo{}, fmt.Errorf("storage_info: storage %q not present in PVE /storage index", name)
-	}
-	return entry.info, nil
 }
 
 // Invalidate drops the cached entry for name. The next Get refetches the index.

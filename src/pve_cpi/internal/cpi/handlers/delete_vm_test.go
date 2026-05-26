@@ -18,7 +18,7 @@ func notFoundAPIErr() error {
 	return &sdkerrors.APIError{HTTPCode: 404}
 }
 
-// TestHandleDeleteVM_Happy verifies the stop→await→delete→agent.Remove path.
+// TestHandleDeleteVM_Happy verifies the stop->await->delete->agent.Remove path.
 func TestHandleDeleteVM_Happy(t *testing.T) {
 	t.Parallel()
 
@@ -73,7 +73,7 @@ func TestHandleDeleteVM_Happy(t *testing.T) {
 		},
 	}
 
-	h := handlers.HandleDeleteVM(testDeps(qemuSvc, nodesSvc, tasksSvc, agentSvc))
+	h := handlers.HandleDeleteVM(testDepsFoundVM(101, qemuSvc, nodesSvc, tasksSvc, agentSvc))
 	result, err := h.Handle(context.Background(), marshalArgs("101"), jsonrpc.Context{})
 
 	if err != nil {
@@ -93,6 +93,24 @@ func TestHandleDeleteVM_Happy(t *testing.T) {
 	}
 }
 
+// TestHandleDeleteVM_NotFound_InCluster verifies that when the cluster scan does
+// not find the VM, delete_vm returns nil (idempotent: already gone).
+func TestHandleDeleteVM_NotFound_InCluster(t *testing.T) {
+	t.Parallel()
+
+	// testDeps wires empty cluster: VM not found.
+	agentSvc := &mockAgentService{}
+	h := handlers.HandleDeleteVM(testDeps(nil, nil, nil, agentSvc))
+	result, err := h.Handle(context.Background(), marshalArgs("202"), jsonrpc.Context{})
+
+	if err != nil {
+		t.Fatalf("expected nil error for cluster-not-found, got: %v", err)
+	}
+	if result != nil {
+		t.Errorf("expected nil result, got %v", result)
+	}
+}
+
 // TestHandleDeleteVM_NotFound_AtStop verifies 404 during stop returns nil (idempotent).
 func TestHandleDeleteVM_NotFound_AtStop(t *testing.T) {
 	t.Parallel()
@@ -104,7 +122,7 @@ func TestHandleDeleteVM_NotFound_AtStop(t *testing.T) {
 	}
 	agentSvc := &mockAgentService{}
 
-	h := handlers.HandleDeleteVM(testDeps(qemuSvc, nil, nil, agentSvc))
+	h := handlers.HandleDeleteVM(testDepsFoundVM(202, qemuSvc, nil, nil, agentSvc))
 	result, err := h.Handle(context.Background(), marshalArgs("202"), jsonrpc.Context{})
 
 	if err != nil {
@@ -135,7 +153,7 @@ func TestHandleDeleteVM_NotFound_AtDelete(t *testing.T) {
 	tasksSvc := &mockTasksService{}
 	agentSvc := &mockAgentService{}
 
-	h := handlers.HandleDeleteVM(testDeps(qemuSvc, nodesSvc, tasksSvc, agentSvc))
+	h := handlers.HandleDeleteVM(testDepsFoundVM(303, qemuSvc, nodesSvc, tasksSvc, agentSvc))
 	result, err := h.Handle(context.Background(), marshalArgs("303"), jsonrpc.Context{})
 
 	if err != nil {
@@ -158,7 +176,7 @@ func TestHandleDeleteVM_StopFail(t *testing.T) {
 	}
 	agentSvc := &mockAgentService{}
 
-	h := handlers.HandleDeleteVM(testDeps(qemuSvc, nil, nil, agentSvc))
+	h := handlers.HandleDeleteVM(testDepsFoundVM(404, qemuSvc, nil, nil, agentSvc))
 	_, err := h.Handle(context.Background(), marshalArgs("404"), jsonrpc.Context{})
 
 	if err == nil {
@@ -226,12 +244,12 @@ func TestHandleDeleteVM_RefusesWhenPersistentDiskUnused(t *testing.T) {
 	}
 	tasksSvc := &mockTasksService{}
 	agentSvc := &mockAgentService{}
-	// Volume still exists in storage → a real persistent disk → guard refuses.
+	// Volume still exists in storage -> a real persistent disk -> guard refuses.
 	storageSvc := &mockStorageService{
 		existsFn: func(_ context.Context, _, _, _ string) (bool, error) { return true, nil },
 	}
 
-	h := handlers.HandleDeleteVM(testDepsWithStorage(qemuSvc, nodesSvc, tasksSvc, agentSvc, storageSvc))
+	h := handlers.HandleDeleteVM(testDepsFoundVMWithStorage(101, qemuSvc, nodesSvc, tasksSvc, agentSvc, storageSvc))
 	_, err := h.Handle(context.Background(), marshalArgs("101"), jsonrpc.Context{})
 
 	if err == nil {
@@ -248,10 +266,7 @@ func TestHandleDeleteVM_RefusesWhenPersistentDiskUnused(t *testing.T) {
 
 // TestHandleDeleteVM_AllowsWhenUnusedVolumeAlreadyDeleted verifies the guard
 // does NOT block destroy when an unusedN slot references a volume that has
-// already been deleted from storage (e.g. detach_disk's sweep was blocked by a
-// snapshot, then delete_disk removed the volume before delete_vm). The slot is
-// then a dangling reference pointing at nothing, so destroying the VM cannot
-// lose data and DeleteQemu MUST be called.
+// already been deleted from storage.
 func TestHandleDeleteVM_AllowsWhenUnusedVolumeAlreadyDeleted(t *testing.T) {
 	t.Parallel()
 
@@ -276,12 +291,12 @@ func TestHandleDeleteVM_AllowsWhenUnusedVolumeAlreadyDeleted(t *testing.T) {
 	}
 	tasksSvc := &mockTasksService{}
 	agentSvc := &mockAgentService{}
-	// Volume gone from storage → stale dangling slot → guard must not block.
+	// Volume gone from storage -> stale dangling slot -> guard must not block.
 	storageSvc := &mockStorageService{
 		existsFn: func(_ context.Context, _, _, _ string) (bool, error) { return false, nil },
 	}
 
-	h := handlers.HandleDeleteVM(testDepsWithStorage(qemuSvc, nodesSvc, tasksSvc, agentSvc, storageSvc))
+	h := handlers.HandleDeleteVM(testDepsFoundVMWithStorage(101, qemuSvc, nodesSvc, tasksSvc, agentSvc, storageSvc))
 	_, err := h.Handle(context.Background(), marshalArgs("101"), jsonrpc.Context{})
 
 	if err != nil {
@@ -293,8 +308,8 @@ func TestHandleDeleteVM_AllowsWhenUnusedVolumeAlreadyDeleted(t *testing.T) {
 }
 
 // TestHandleDeleteVM_AllowsWhenUnusedOnDifferentStorage verifies the guard
-// only protects volumes on pve_disk_storage; unused entries on other
-// storages (e.g., a leftover ISO mount) do not block destroy.
+// fails CLOSED when an unusedN slot references a storage that does not match
+// pve_disk_storage.
 func TestHandleDeleteVM_AllowsWhenUnusedOnDifferentStorage(t *testing.T) {
 	t.Parallel()
 
@@ -304,6 +319,8 @@ func TestHandleDeleteVM_AllowsWhenUnusedOnDifferentStorage(t *testing.T) {
 			return "", nil
 		},
 		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
+			// unused0 on "local" storage; testConfig sets DiskStorage="local-lvm".
+			// Mismatch -> guard fails closed; delete must NOT proceed.
 			return map[string]interface{}{
 				"unused0": "local:iso/vm-101-config.iso",
 			}, nil
@@ -319,12 +336,151 @@ func TestHandleDeleteVM_AllowsWhenUnusedOnDifferentStorage(t *testing.T) {
 	tasksSvc := &mockTasksService{}
 	agentSvc := &mockAgentService{}
 
-	h := handlers.HandleDeleteVM(testDeps(qemuSvc, nodesSvc, tasksSvc, agentSvc))
-	if _, err := h.Handle(context.Background(), marshalArgs("101"), jsonrpc.Context{}); err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	h := handlers.HandleDeleteVM(testDepsFoundVM(101, qemuSvc, nodesSvc, tasksSvc, agentSvc))
+	_, err := h.Handle(context.Background(), marshalArgs("101"), jsonrpc.Context{})
+	if err == nil {
+		t.Fatal("expected guard to fail closed for storage-mismatch unused slot, got nil error")
+	}
+	if deleteCalled {
+		t.Error("DeleteQemu must not be called when guard fails closed on storage mismatch")
+	}
+	var cpiErr *cpierrors.Error
+	if !errors.As(err, &cpiErr) {
+		t.Errorf("expected *cpierrors.Error, got %T: %v", err, cpiErr)
+	}
+}
+
+// TestDeleteVM_UnusedSlotPresent_DiskStorageEmpty_FailsClosed verifies that
+// when the VM config has an unusedN entry but DiskStorage is not configured,
+// the guard fails closed.
+func TestDeleteVM_UnusedSlotPresent_DiskStorageEmpty_FailsClosed(t *testing.T) {
+	t.Parallel()
+
+	deleteCalled := false
+	qemuSvc := &mockQEMUService{
+		stopFn: func(_ context.Context, _ string, _ int) (string, error) {
+			return "", nil
+		},
+		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
+			return map[string]interface{}{
+				"unused0": "local-lvm:vm-500-disk-0",
+			}, nil
+		},
+	}
+	nodesSvc := &mockNodesService{
+		deleteQemuFn: func(_ context.Context, _ string, _ string, _ *nodes.DeleteQemuParams) (*nodes.DeleteQemuResponse, error) {
+			deleteCalled = true
+			raw := nodes.DeleteQemuResponse{}
+			return &raw, nil
+		},
+	}
+	tasksSvc := &mockTasksService{}
+	agentSvc := &mockAgentService{}
+
+	// Build deps with DiskStorage explicitly cleared.
+	deps := testDepsFoundVMWithStorage(500, qemuSvc, nodesSvc, tasksSvc, agentSvc, &mockStorageService{})
+	deps.Config.DiskStorage = ""
+
+	h := handlers.HandleDeleteVM(deps)
+	_, err := h.Handle(context.Background(), marshalArgs("500"), jsonrpc.Context{})
+
+	if err == nil {
+		t.Fatal("expected guard to fail closed when DiskStorage is empty and unusedN slot present, got nil error")
+	}
+	if deleteCalled {
+		t.Error("DeleteQemu must not be called when guard fails closed (empty DiskStorage)")
+	}
+	var cpiErr *cpierrors.Error
+	if !errors.As(err, &cpiErr) {
+		t.Errorf("expected *cpierrors.Error, got %T: %v", err, cpiErr)
+	}
+}
+
+// TestDeleteVM_UnusedSlotPresent_DiskStorageMismatch_FailsClosed verifies that
+// when the unusedN slot's storage does not match the configured DiskStorage,
+// the guard fails closed regardless of whether the volume actually exists.
+func TestDeleteVM_UnusedSlotPresent_DiskStorageMismatch_FailsClosed(t *testing.T) {
+	t.Parallel()
+
+	deleteCalled := false
+	qemuSvc := &mockQEMUService{
+		stopFn: func(_ context.Context, _ string, _ int) (string, error) {
+			return "", nil
+		},
+		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
+			// "ceph-pool" does not match testConfig DiskStorage="local-lvm".
+			return map[string]interface{}{
+				"unused0": "ceph-pool:vm-501-disk-0",
+			}, nil
+		},
+	}
+	nodesSvc := &mockNodesService{
+		deleteQemuFn: func(_ context.Context, _ string, _ string, _ *nodes.DeleteQemuParams) (*nodes.DeleteQemuResponse, error) {
+			deleteCalled = true
+			raw := nodes.DeleteQemuResponse{}
+			return &raw, nil
+		},
+	}
+	tasksSvc := &mockTasksService{}
+	agentSvc := &mockAgentService{}
+	// existsFn should NOT be called -- guard fires before reaching the probe.
+	storageSvc := &mockStorageService{
+		existsFn: func(_ context.Context, _, _, _ string) (bool, error) {
+			t.Error("Exists probe must not be called for storage-mismatch slot")
+			return false, nil
+		},
+	}
+
+	h := handlers.HandleDeleteVM(testDepsFoundVMWithStorage(501, qemuSvc, nodesSvc, tasksSvc, agentSvc, storageSvc))
+	_, err := h.Handle(context.Background(), marshalArgs("501"), jsonrpc.Context{})
+
+	if err == nil {
+		t.Fatal("expected guard to fail closed for storage-mismatch unused slot, got nil error")
+	}
+	if deleteCalled {
+		t.Error("DeleteQemu must not be called when guard fails closed on storage mismatch")
+	}
+	var cpiErr *cpierrors.Error
+	if !errors.As(err, &cpiErr) {
+		t.Errorf("expected *cpierrors.Error, got %T: %v", err, cpiErr)
+	}
+}
+
+// TestDeleteVM_NoUnusedSlots_Succeeds verifies that when the VM config has no
+// unusedN entries the guard does not block destroy.
+func TestDeleteVM_NoUnusedSlots_Succeeds(t *testing.T) {
+	t.Parallel()
+
+	deleteCalled := false
+	qemuSvc := &mockQEMUService{
+		stopFn: func(_ context.Context, _ string, _ int) (string, error) {
+			return "", nil
+		},
+		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
+			// Only a live scsi0 attachment -- no unused slots.
+			return map[string]interface{}{
+				"scsi0": "local-lvm:vm-502-disk-0",
+			}, nil
+		},
+	}
+	nodesSvc := &mockNodesService{
+		deleteQemuFn: func(_ context.Context, _ string, _ string, _ *nodes.DeleteQemuParams) (*nodes.DeleteQemuResponse, error) {
+			deleteCalled = true
+			raw := nodes.DeleteQemuResponse{}
+			return &raw, nil
+		},
+	}
+	tasksSvc := &mockTasksService{}
+	agentSvc := &mockAgentService{}
+
+	h := handlers.HandleDeleteVM(testDepsFoundVM(502, qemuSvc, nodesSvc, tasksSvc, agentSvc))
+	_, err := h.Handle(context.Background(), marshalArgs("502"), jsonrpc.Context{})
+
+	if err != nil {
+		t.Fatalf("expected success when no unused slots present, got: %v", err)
 	}
 	if !deleteCalled {
-		t.Error("DeleteQemu should run when unused refs are not on disk storage")
+		t.Error("DeleteQemu must be called when VM has no unused disk slots")
 	}
 }
 
@@ -334,7 +490,7 @@ func TestHandleDeleteVM_AgentRemoveError(t *testing.T) {
 
 	qemuSvc := &mockQEMUService{
 		stopFn: func(_ context.Context, _ string, _ int) (string, error) {
-			return "", nil // no UPID → skip await
+			return "", nil // no UPID -> skip await
 		},
 		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
 			return map[string]interface{}{}, nil
@@ -353,7 +509,7 @@ func TestHandleDeleteVM_AgentRemoveError(t *testing.T) {
 		},
 	}
 
-	h := handlers.HandleDeleteVM(testDeps(qemuSvc, nodesSvc, tasksSvc, agentSvc))
+	h := handlers.HandleDeleteVM(testDepsFoundVM(505, qemuSvc, nodesSvc, tasksSvc, agentSvc))
 	result, err := h.Handle(context.Background(), marshalArgs("505"), jsonrpc.Context{})
 
 	// Agent.Remove failure should NOT cause delete_vm to return an error.

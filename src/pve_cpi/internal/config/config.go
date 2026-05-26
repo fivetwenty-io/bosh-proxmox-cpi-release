@@ -8,9 +8,11 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"reflect"
 	"strings"
 
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
+	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
 )
 
 // CPIConfig holds all configuration loaded from the JSON config file.
@@ -161,13 +163,79 @@ type CPIConfig struct {
 	RebootTimeout int `json:"reboot_timeout,omitempty"`
 }
 
+// knownConfigFields is the set of JSON field names declared on CPIConfig.
+// Built once at init time via reflection so it stays in sync with struct changes.
+var knownConfigFields = func() map[string]struct{} {
+	t := reflect.TypeOf(CPIConfig{})
+	m := make(map[string]struct{}, t.NumField())
+	for i := 0; i < t.NumField(); i++ {
+		tag := t.Field(i).Tag.Get("json")
+		if tag == "" || tag == "-" {
+			continue
+		}
+		// Strip options like ",omitempty".
+		name, _, _ := strings.Cut(tag, ",")
+		if name != "" && name != "-" {
+			m[name] = struct{}{}
+		}
+	}
+	return m
+}()
+
+// insertionSort sorts a string slice in place.
+func insertionSort(s []string) {
+	for i := 1; i < len(s); i++ {
+		for j := i; j > 0 && s[j] < s[j-1]; j-- {
+			s[j], s[j-1] = s[j-1], s[j]
+		}
+	}
+}
+
+// warnUnknownFields decodes raw into a flat map, finds keys absent from
+// knownConfigFields, and emits a single Warn entry listing them.
+// Uses a stderr logger so the warning surfaces even before the application
+// logger is fully initialized. Unknown fields are ignored, not rejected, to
+// preserve forward-compatibility when the director sends fields added by
+// future CPI versions.
+func warnUnknownFields(raw []byte) {
+	var flat map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &flat); err != nil {
+		return // malformed JSON is handled by the main decode path
+	}
+	var unknown []string
+	for k := range flat {
+		if _, known := knownConfigFields[k]; !known {
+			unknown = append(unknown, k)
+		}
+	}
+	if len(unknown) == 0 {
+		return
+	}
+	insertionSort(unknown)
+	logger, err := log.NewLogger("warn", os.Stderr)
+	if err != nil {
+		return
+	}
+	logger.Warn("config: unknown fields ignored (forward-compat)",
+		log.String("fields", strings.Join(unknown, ", ")),
+	)
+}
+
 // Load decodes CPIConfig from r, applies defaults, then validates.
-// Returns a CloudError on decode failure or validation failure.
+// Unknown JSON fields are logged at Warn level and ignored to preserve
+// forward-compatibility with future BOSH director versions.
+// Returns a CloudError on read failure, decode failure, or validation failure.
 func Load(r io.Reader) (*CPIConfig, error) {
+	// Buffer the input so we can decode twice: once into a raw map for unknown-
+	// field detection, then into CPIConfig for the actual value population.
+	raw, err := io.ReadAll(r)
+	if err != nil {
+		return nil, cpierrors.Cloud("config: read: %s", err.Error())
+	}
+	warnUnknownFields(raw)
+
 	var cfg CPIConfig
-	dec := json.NewDecoder(r)
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&cfg); err != nil {
+	if err := json.Unmarshal(raw, &cfg); err != nil {
 		return nil, cpierrors.Cloud("config: decode failed: %s", err.Error())
 	}
 	cfg.ApplyDefaults()

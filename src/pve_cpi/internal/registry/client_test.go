@@ -327,6 +327,120 @@ func TestPut_ContentTypeJSON(t *testing.T) {
 }
 
 // --------------------------------------------------------------------------
+// Retry on transient failures
+// --------------------------------------------------------------------------
+
+// TestPut_RetriesOnTransient verifies that Put retries on a 503 and succeeds
+// on the subsequent 200, issuing exactly 2 HTTP requests total.
+func TestPut_RetriesOnTransient(t *testing.T) {
+	var callCount int
+	client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		if callCount == 1 {
+			http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+
+	err := client.Put(context.Background(), "100", map[string]string{"k": "v"})
+	if err != nil {
+		t.Fatalf("Put returned unexpected error after retry: %v", err)
+	}
+	if callCount != 2 {
+		t.Errorf("expected 2 HTTP calls (1 failure + 1 success), got %d", callCount)
+	}
+}
+
+// TestPut_AllRetriesExhausted_5xx verifies Put returns an error after the
+// retry budget is exhausted by persistent 5xx responses, and that exactly
+// 3 HTTP requests are issued (1 initial + 2 retries).
+func TestPut_AllRetriesExhausted_5xx(t *testing.T) {
+	var callCount int
+	client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+	})
+
+	err := client.Put(context.Background(), "100", map[string]string{"k": "v"})
+	if err == nil {
+		t.Fatal("expected error after retry budget exhausted, got nil")
+	}
+	if callCount != 3 {
+		t.Errorf("expected 3 HTTP calls (1 + 2 retries), got %d", callCount)
+	}
+}
+
+// TestPut_NoRetryOn4xx verifies that Put does not retry on a 400 Bad Request.
+func TestPut_NoRetryOn4xx(t *testing.T) {
+	var callCount int
+	client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		http.Error(w, "bad request", http.StatusBadRequest)
+	})
+
+	err := client.Put(context.Background(), "100", map[string]string{"k": "v"})
+	if err == nil {
+		t.Fatal("expected error on 400, got nil")
+	}
+	if callCount != 1 {
+		t.Errorf("expected exactly 1 HTTP call for non-retryable 400, got %d", callCount)
+	}
+}
+
+// TestGet_RetriesOnTransient verifies that Get retries on a 503 response.
+func TestGet_RetriesOnTransient(t *testing.T) {
+	inner := map[string]any{"agent_id": "xyz"}
+	innerJSON, _ := json.Marshal(inner)
+	envelope := map[string]string{"settings": string(innerJSON)}
+	envBody, _ := json.Marshal(envelope)
+
+	var callCount int
+	client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		if callCount == 1 {
+			http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write(envBody) //nolint:errcheck
+	})
+
+	raw, err := client.Get(context.Background(), "100")
+	if err != nil {
+		t.Fatalf("Get returned unexpected error after retry: %v", err)
+	}
+	if raw == nil {
+		t.Fatal("expected non-nil RawMessage after retry")
+	}
+	if callCount != 2 {
+		t.Errorf("expected 2 HTTP calls, got %d", callCount)
+	}
+}
+
+// TestDelete_RetriesOnTransient verifies that Delete retries on a 503 response.
+func TestDelete_RetriesOnTransient(t *testing.T) {
+	var callCount int
+	client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		if callCount == 1 {
+			http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+
+	err := client.Delete(context.Background(), "100")
+	if err != nil {
+		t.Fatalf("Delete returned unexpected error after retry: %v", err)
+	}
+	if callCount != 2 {
+		t.Errorf("expected 2 HTTP calls, got %d", callCount)
+	}
+}
+
+// --------------------------------------------------------------------------
 // Large instance ID (path injection guard)
 // --------------------------------------------------------------------------
 

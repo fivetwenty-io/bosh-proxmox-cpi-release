@@ -2,6 +2,7 @@ package pve_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 
@@ -339,5 +340,100 @@ func TestResolveDiskID_EmptyConfig(t *testing.T) {
 	_, err := pve.ResolveDiskID(context.Background(), c, "pve1", 100, "local:vm-100-disk-0")
 	if err == nil {
 		t.Fatal("expected error when config is empty and volid not found")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// FindVMByDiskVolid — transient retry test infrastructure
+// ---------------------------------------------------------------------------
+
+// diskClusterClient is a pve.Client variant that exposes both a QEMU service
+// (for Config calls) and a Cluster service (for ListResources calls).
+type diskClusterClient struct {
+	qemuSvc    qemu.Service
+	clusterSvc cluster.Service
+}
+
+func (c *diskClusterClient) QEMU() qemu.Service                     { return c.qemuSvc }
+func (c *diskClusterClient) Storage() storage.Service               { return nil }
+func (c *diskClusterClient) CloudInit() cloudinit.Service           { return nil }
+func (c *diskClusterClient) Tasks() tasks.Service                   { return nil }
+func (c *diskClusterClient) Nodes() nodes.Service                   { return nil }
+func (c *diskClusterClient) Cluster() cluster.Service               { return c.clusterSvc }
+func (c *diskClusterClient) ClusterStorage() clusterstorage.Service { return nil }
+
+// diskFakeCluster is a minimal cluster.Service that delegates ListResources
+// to an injected function.
+type diskFakeCluster struct {
+	cluster.Service
+	listFn func(ctx context.Context, params *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error)
+}
+
+func (f *diskFakeCluster) ListResources(ctx context.Context, params *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+	return f.listFn(ctx, params)
+}
+
+// diskFakeQEMU is a minimal qemu.Service that returns a canned config for any VM.
+type diskFakeQEMU struct {
+	qemu.Service
+	cfg map[string]interface{}
+}
+
+func (q *diskFakeQEMU) Config(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
+	return q.cfg, nil
+}
+
+// diskClusterResp builds a cluster.ListResourcesResponse from typed rows.
+func diskClusterResp(rows ...map[string]any) *cluster.ListResourcesResponse {
+	out := make(cluster.ListResourcesResponse, 0, len(rows))
+	for _, r := range rows {
+		b, _ := json.Marshal(r)
+		out = append(out, b)
+	}
+	return &out
+}
+
+// ---------------------------------------------------------------------------
+// TestFindVMByDiskVolid_TransientThenSuccess
+// ---------------------------------------------------------------------------
+
+func TestFindVMByDiskVolid_TransientThenSuccess(t *testing.T) {
+	// ListResources errors once with a transient signal, then succeeds.
+	// FindVMByDiskVolid must retry and return the correct (vmid, node).
+	var listCalls int
+	volid := "local-lvm:vm-200-disk-0"
+
+	c := &diskClusterClient{
+		clusterSvc: &diskFakeCluster{
+			listFn: func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+				listCalls++
+				if listCalls == 1 {
+					// Transient shape: "(code: 596)" is detected by IsTransientTransport.
+					return nil, errors.New("pveproxy backend gone (code: 596)")
+				}
+				return diskClusterResp(
+					map[string]any{"vmid": int64(200), "node": "pve-01"},
+				), nil
+			},
+		},
+		qemuSvc: &diskFakeQEMU{
+			cfg: map[string]interface{}{
+				"scsi0": volid,
+			},
+		},
+	}
+
+	vmid, node, err := pve.FindVMByDiskVolid(context.Background(), c, "pve-default", volid)
+	if err != nil {
+		t.Fatalf("expected success after transient retry, got: %v", err)
+	}
+	if vmid != 200 {
+		t.Errorf("vmid: want 200, got %d", vmid)
+	}
+	if node != "pve-01" {
+		t.Errorf("node: want pve-01, got %s", node)
+	}
+	if listCalls < 2 {
+		t.Errorf("expected at least 2 ListResources calls (1 transient + 1 success), got %d", listCalls)
 	}
 }

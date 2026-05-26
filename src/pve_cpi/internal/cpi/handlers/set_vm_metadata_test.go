@@ -42,7 +42,7 @@ func TestHandleSetVMMetadata_Happy(t *testing.T) {
 		},
 	}
 
-	h := handlers.HandleSetVMMetadata(testDeps(nil, nodesSvc, nil, &mockAgentService{}))
+	h := handlers.HandleSetVMMetadata(testDepsFoundVM(101, nil, nodesSvc, nil, &mockAgentService{}))
 	result, err := h.Handle(context.Background(), marshalArgs("101", metadata), jsonrpc.Context{})
 
 	if err != nil {
@@ -93,7 +93,7 @@ func TestHandleSetVMMetadata_EmptyMetadata(t *testing.T) {
 		},
 	}
 
-	h := handlers.HandleSetVMMetadata(testDeps(nil, nodesSvc, nil, &mockAgentService{}))
+	h := handlers.HandleSetVMMetadata(testDepsFoundVM(101, nil, nodesSvc, nil, &mockAgentService{}))
 	result, err := h.Handle(context.Background(), marshalArgs("101", map[string]any{}), jsonrpc.Context{})
 
 	if err != nil {
@@ -120,7 +120,7 @@ func TestHandleSetVMMetadata_NotFound(t *testing.T) {
 		},
 	}
 
-	h := handlers.HandleSetVMMetadata(testDeps(nil, nodesSvc, nil, &mockAgentService{}))
+	h := handlers.HandleSetVMMetadata(testDepsFoundVM(101, nil, nodesSvc, nil, &mockAgentService{}))
 	_, err := h.Handle(context.Background(), marshalArgs("999", map[string]any{"director": "bosh"}), jsonrpc.Context{})
 
 	if err == nil {
@@ -145,7 +145,7 @@ func TestHandleSetVMMetadata_SDKError(t *testing.T) {
 		},
 	}
 
-	h := handlers.HandleSetVMMetadata(testDeps(nil, nodesSvc, nil, &mockAgentService{}))
+	h := handlers.HandleSetVMMetadata(testDepsFoundVM(101, nil, nodesSvc, nil, &mockAgentService{}))
 	_, err := h.Handle(context.Background(), marshalArgs("101", map[string]any{"index": "0"}), jsonrpc.Context{})
 
 	if err == nil {
@@ -182,7 +182,7 @@ func TestHandleSetVMMetadata_NullMetadata(t *testing.T) {
 		},
 	}
 
-	h := handlers.HandleSetVMMetadata(testDeps(nil, nodesSvc, nil, &mockAgentService{}))
+	h := handlers.HandleSetVMMetadata(testDepsFoundVM(101, nil, nodesSvc, nil, &mockAgentService{}))
 	// args[1] = JSON null
 	result, err := h.Handle(context.Background(), marshalArgs("101", nil), jsonrpc.Context{})
 
@@ -218,7 +218,7 @@ func TestHandleSetVMMetadata_TagTruncation(t *testing.T) {
 		},
 	}
 
-	h := handlers.HandleSetVMMetadata(testDeps(nil, nodesSvc, nil, &mockAgentService{}))
+	h := handlers.HandleSetVMMetadata(testDepsFoundVM(101, nil, nodesSvc, nil, &mockAgentService{}))
 	_, err := h.Handle(context.Background(), marshalArgs("101", metadata), jsonrpc.Context{})
 
 	if err != nil {
@@ -258,7 +258,7 @@ func TestHandleSetVMMetadata_PreservesCustomTags(t *testing.T) {
 		},
 	}
 
-	h := handlers.HandleSetVMMetadata(testDeps(qemuSvc, nodesSvc, nil, &mockAgentService{}))
+	h := handlers.HandleSetVMMetadata(testDepsFoundVM(101, qemuSvc, nodesSvc, nil, &mockAgentService{}))
 	_, err := h.Handle(context.Background(), marshalArgs("101", map[string]any{
 		"director":   "bosh",
 		"deployment": "cf",
@@ -299,7 +299,7 @@ func TestHandleSetVMMetadata_ReplacesStaleBoshTags(t *testing.T) {
 		},
 	}
 
-	h := handlers.HandleSetVMMetadata(testDeps(qemuSvc, nodesSvc, nil, &mockAgentService{}))
+	h := handlers.HandleSetVMMetadata(testDepsFoundVM(101, qemuSvc, nodesSvc, nil, &mockAgentService{}))
 	_, err := h.Handle(context.Background(), marshalArgs("101", map[string]any{
 		"director":   "new-uuid",
 		"deployment": "cf",
@@ -343,7 +343,7 @@ func TestHandleSetVMMetadata_EmitsNameTag(t *testing.T) {
 		},
 	}
 
-	h := handlers.HandleSetVMMetadata(testDeps(nil, nodesSvc, nil, &mockAgentService{}))
+	h := handlers.HandleSetVMMetadata(testDepsFoundVM(101, nil, nodesSvc, nil, &mockAgentService{}))
 	_, err := h.Handle(context.Background(), marshalArgs("101", metadata), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -388,7 +388,7 @@ func TestHandleSetVMMetadata_NameTagSanitizesInvalidBytes(t *testing.T) {
 		},
 	}
 
-	h := handlers.HandleSetVMMetadata(testDeps(nil, nodesSvc, nil, &mockAgentService{}))
+	h := handlers.HandleSetVMMetadata(testDepsFoundVM(101, nil, nodesSvc, nil, &mockAgentService{}))
 	_, err := h.Handle(context.Background(), marshalArgs("101", metadata), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -425,7 +425,7 @@ func TestHandleSetVMMetadata_NameTagMissingOmitted(t *testing.T) {
 		},
 	}
 
-	h := handlers.HandleSetVMMetadata(testDeps(nil, nodesSvc, nil, &mockAgentService{}))
+	h := handlers.HandleSetVMMetadata(testDepsFoundVM(101, nil, nodesSvc, nil, &mockAgentService{}))
 	_, err := h.Handle(context.Background(), marshalArgs("101", metadata), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -452,7 +452,7 @@ func TestHandleSetVMMetadata_SetsVMName(t *testing.T) {
 		},
 	}
 
-	h := handlers.HandleSetVMMetadata(testDeps(nil, nodesSvc, nil, &mockAgentService{}))
+	h := handlers.HandleSetVMMetadata(testDepsFoundVM(101, nil, nodesSvc, nil, &mockAgentService{}))
 	_, err := h.Handle(context.Background(), marshalArgs("101", map[string]any{
 		"name": "diego-cell/2844c990-aef3-4de7-8bf3-d936fc2201be",
 	}), jsonrpc.Context{})
@@ -520,7 +520,7 @@ func TestHandleSetVMMetadata_VMNameFromJobIndex(t *testing.T) {
 					return nil
 				},
 			}
-			h := handlers.HandleSetVMMetadata(testDeps(nil, nodesSvc, nil, &mockAgentService{}))
+			h := handlers.HandleSetVMMetadata(testDepsFoundVM(101, nil, nodesSvc, nil, &mockAgentService{}))
 			_, err := h.Handle(context.Background(), marshalArgs("101", c.md), jsonrpc.Context{})
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
@@ -549,7 +549,7 @@ func TestHandleSetVMMetadata_VMNameFallsBackToName(t *testing.T) {
 		},
 	}
 
-	h := handlers.HandleSetVMMetadata(testDeps(nil, nodesSvc, nil, &mockAgentService{}))
+	h := handlers.HandleSetVMMetadata(testDepsFoundVM(101, nil, nodesSvc, nil, &mockAgentService{}))
 	// job present, index absent → fall back to name.
 	_, err := h.Handle(context.Background(), marshalArgs("101", map[string]any{
 		"job":  "diego-cell",
@@ -583,7 +583,7 @@ func TestHandleSetVMMetadata_LeavesVMNameUnchangedWhenAbsent(t *testing.T) {
 		},
 	}
 
-	h := handlers.HandleSetVMMetadata(testDeps(nil, nodesSvc, nil, &mockAgentService{}))
+	h := handlers.HandleSetVMMetadata(testDepsFoundVM(101, nil, nodesSvc, nil, &mockAgentService{}))
 	_, err := h.Handle(context.Background(), marshalArgs("101", map[string]any{
 		"director":   "bosh",
 		"deployment": "cf",
@@ -614,7 +614,7 @@ func TestHandleSetVMMetadata_VMNameIncludesDeployment(t *testing.T) {
 		},
 	}
 
-	h := handlers.HandleSetVMMetadata(testDeps(nil, nodesSvc, nil, &mockAgentService{}))
+	h := handlers.HandleSetVMMetadata(testDepsFoundVM(101, nil, nodesSvc, nil, &mockAgentService{}))
 	_, err := h.Handle(context.Background(), marshalArgs("101", map[string]any{
 		"deployment": "cf",
 		"job":        "api",
@@ -644,7 +644,7 @@ func TestHandleSetVMMetadata_VMNameWithPrefix(t *testing.T) {
 		},
 	}
 
-	deps := testDeps(nil, nodesSvc, nil, &mockAgentService{})
+	deps := testDepsFoundVM(101, nil, nodesSvc, nil, &mockAgentService{})
 	deps.Config.VMPrefix = "cpi"
 
 	h := handlers.HandleSetVMMetadata(deps)
@@ -688,7 +688,7 @@ func TestHandleSetVMMetadata_EmitsIndexTag(t *testing.T) {
 		},
 	}
 
-	h := handlers.HandleSetVMMetadata(testDeps(qemuSvc, nodesSvc, nil, &mockAgentService{}))
+	h := handlers.HandleSetVMMetadata(testDepsFoundVM(101, qemuSvc, nodesSvc, nil, &mockAgentService{}))
 	_, err := h.Handle(context.Background(), marshalArgs("101", map[string]any{
 		"director":   "bosh",
 		"deployment": "cf",
@@ -728,7 +728,7 @@ func TestHandleSetVMMetadata_DescriptionSorted(t *testing.T) {
 		},
 	}
 
-	h := handlers.HandleSetVMMetadata(testDeps(nil, nodesSvc, nil, &mockAgentService{}))
+	h := handlers.HandleSetVMMetadata(testDepsFoundVM(101, nil, nodesSvc, nil, &mockAgentService{}))
 	_, err := h.Handle(context.Background(), marshalArgs("101", metadata), jsonrpc.Context{})
 
 	if err != nil {

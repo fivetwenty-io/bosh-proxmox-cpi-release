@@ -278,12 +278,11 @@ func testDeps(qemuSvc qemu.Service, nodesSvc nodes.Service, tasksSvc tasks.Servi
 	return testDepsWithStorage(qemuSvc, nodesSvc, tasksSvc, agentSvc, &mockStorageService{})
 }
 
-// testDepsWithStorage is testDeps with an explicit storage service, for
-// handlers (e.g. delete_vm's unused-slot existence probe) that call Storage().
+// testDepsWithStorage is testDeps with an explicit storage service.
+// The default cluster mock returns an empty resource list, so
+// FindVMNodeViaCluster reports VM-not-found. Tests that need the cluster scan
+// to resolve a specific node must use testDepsFoundVM or testDepsFoundVMWithStorage.
 func testDepsWithStorage(qemuSvc qemu.Service, nodesSvc nodes.Service, tasksSvc tasks.Service, agentSvc agent.Agent, storageSvc storage.Service) handlers.Deps {
-	// Default qemu service so handlers calling QEMU().Config() (e.g.,
-	// set_vm_metadata reading existing tags) don't dereference nil in
-	// tests that pass nil for qemuSvc.
 	if qemuSvc == nil {
 		qemuSvc = &mockQEMUService{}
 	}
@@ -294,6 +293,33 @@ func testDepsWithStorage(qemuSvc qemu.Service, nodesSvc nodes.Service, tasksSvc 
 			nodesSvc:   nodesSvc,
 			tasksSvc:   tasksSvc,
 			storageSvc: storageSvc,
+			clusterSvc: &mockClusterSvc{}, // empty list: VM not found
+		},
+		Agent:  agentSvc,
+		Logger: log.NewNopLogger(),
+	}
+}
+
+// testDepsFoundVM builds Deps where the cluster scan resolves vmid to "pve-node1".
+// Use for tests that must reach handler logic past the cluster-scan step (e.g.
+// Stop, Config, UpdateQemuConfig, DeleteSnapshot). Storage defaults to a no-op mock.
+func testDepsFoundVM(vmid int, qemuSvc qemu.Service, nodesSvc nodes.Service, tasksSvc tasks.Service, agentSvc agent.Agent) handlers.Deps {
+	return testDepsFoundVMWithStorage(vmid, qemuSvc, nodesSvc, tasksSvc, agentSvc, &mockStorageService{})
+}
+
+// testDepsFoundVMWithStorage is testDepsFoundVM with an explicit storage service.
+func testDepsFoundVMWithStorage(vmid int, qemuSvc qemu.Service, nodesSvc nodes.Service, tasksSvc tasks.Service, agentSvc agent.Agent, storageSvc storage.Service) handlers.Deps {
+	if qemuSvc == nil {
+		qemuSvc = &mockQEMUService{}
+	}
+	return handlers.Deps{
+		Config: testConfig(),
+		PVE: &mockPVEClient{
+			qemuSvc:    qemuSvc,
+			nodesSvc:   nodesSvc,
+			tasksSvc:   tasksSvc,
+			storageSvc: storageSvc,
+			clusterSvc: defaultClusterSvc(vmid, "pve-node1"),
 		},
 		Agent:  agentSvc,
 		Logger: log.NewNopLogger(),
@@ -470,4 +496,85 @@ func (m *mockBridgeNodes) UpdateNetwork(ctx context.Context, node string, params
 		return m.updateNetworkFn(ctx, node, params)
 	}
 	return nil, nil
+}
+
+// --------------------------------------------------------------------------
+// mockClusterSvc
+// --------------------------------------------------------------------------
+
+// mockClusterSvc implements cluster.Service with a configurable ListResources.
+// All other methods are provided by the embedded mockSDNCluster (which panics
+// on accidental calls to SDN methods). The default ListResources places any
+// queried VM on "pve-node1" (matching testConfig().Node) so existing tests that
+// do not exercise HA-failover node resolution pass without modification.
+//
+// Set listResourcesFn to override behavior for specific tests.
+type mockClusterSvc struct {
+	mockSDNCluster
+	listResourcesFn func(ctx context.Context, params *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error)
+}
+
+var _ cluster.Service = (*mockClusterSvc)(nil)
+
+func (m *mockClusterSvc) ListResources(ctx context.Context, params *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+	if m.listResourcesFn != nil {
+		return m.listResourcesFn(ctx, params)
+	}
+	// Default: return an empty resource list. Handlers treat empty-list as
+	// "VM not found". Tests that need a VM to be found must supply listResourcesFn
+	// or use clusterVMOnNode to build a response.
+	empty := cluster.ListResourcesResponse{}
+	return &empty, nil
+}
+
+// clusterVMOnNode builds a ListResourcesResponse placing vmid on node.
+// Used to feed FindVMNodeViaCluster in tests that need the cluster scan to
+// resolve a specific node for a VM.
+func clusterVMOnNode(vmid int, node string) *cluster.ListResourcesResponse {
+	raw, _ := json.Marshal(map[string]interface{}{
+		"vmid": vmid,
+		"node": node,
+		"type": "qemu",
+	})
+	resp := cluster.ListResourcesResponse{raw}
+	return &resp
+}
+
+// defaultClusterSvc returns a mockClusterSvc whose ListResources places vmid
+// on the given node. Used in testDepsWithCluster to make cluster-scan-using
+// handlers find the VM on the expected node.
+func defaultClusterSvc(vmid int, node string) *mockClusterSvc {
+	return &mockClusterSvc{
+		listResourcesFn: func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+			return clusterVMOnNode(vmid, node), nil
+		},
+	}
+}
+
+// testDepsWithCluster is testDepsWithStorage plus an explicit cluster service.
+// Use this for handlers that call FindVMNodeViaCluster when you need to control
+// which node is returned.
+func testDepsWithCluster(
+	qemuSvc qemu.Service,
+	nodesSvc nodes.Service,
+	tasksSvc tasks.Service,
+	agentSvc agent.Agent,
+	storageSvc storage.Service,
+	clusterSvc cluster.Service,
+) handlers.Deps {
+	if qemuSvc == nil {
+		qemuSvc = &mockQEMUService{}
+	}
+	return handlers.Deps{
+		Config: testConfig(),
+		PVE: &mockPVEClient{
+			qemuSvc:    qemuSvc,
+			nodesSvc:   nodesSvc,
+			tasksSvc:   tasksSvc,
+			storageSvc: storageSvc,
+			clusterSvc: clusterSvc,
+		},
+		Agent:  agentSvc,
+		Logger: log.NewNopLogger(),
+	}
 }

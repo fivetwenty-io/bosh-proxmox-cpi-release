@@ -3,6 +3,7 @@ package configdrive_test
 import (
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -39,11 +40,10 @@ func TestBuild_RoundTrip(t *testing.T) {
 		t.Errorf("volume label = %q, want config-2", label)
 	}
 
-	// Files that mirror the settings.json payload.
+	// Files that carry the raw settings.json payload.
 	for _, name := range []string{
 		"/openstack/latest/user_data",
 		"/ec2/latest/user-data",
-		"/ec2/latest/meta-data.json",
 	} {
 		f, err := iso.OpenFile(name, os.O_RDONLY)
 		if err != nil {
@@ -58,17 +58,27 @@ func TestBuild_RoundTrip(t *testing.T) {
 		}
 	}
 
-	// /openstack/latest/meta_data.json carries a minimal stub (not the payload).
-	mf, err := iso.OpenFile("/openstack/latest/meta_data.json", os.O_RDONLY)
-	if err != nil {
-		t.Fatalf("OpenFile /openstack/latest/meta_data.json: %v", err)
-	}
-	mb, err := io.ReadAll(mf)
-	if err != nil {
-		t.Fatalf("read meta_data.json: %v", err)
-	}
-	if len(mb) == 0 {
-		t.Error("/openstack/latest/meta_data.json is empty; want minimal JSON stub")
+	// Both meta_data files must carry the minimal stub, not the payload.
+	// /openstack/latest/meta_data.json — OpenStack datasource stub.
+	// /ec2/latest/meta-data.json       — EC2 datasource stub (fixed: was payload).
+	for _, name := range []string{
+		"/openstack/latest/meta_data.json",
+		"/ec2/latest/meta-data.json",
+	} {
+		mf, err := iso.OpenFile(name, os.O_RDONLY)
+		if err != nil {
+			t.Fatalf("OpenFile %s: %v", name, err)
+		}
+		mb, err := io.ReadAll(mf)
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		if len(mb) == 0 {
+			t.Errorf("%s is empty; want minimal JSON stub", name)
+		}
+		if string(mb) == string(payload) {
+			t.Errorf("%s contains full settings payload; want metadata stub only", name)
+		}
 	}
 }
 
@@ -84,5 +94,46 @@ func TestBuild_CleanupRemovesFile(t *testing.T) {
 	cleanup()
 	if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
 		t.Errorf("expected iso removed after cleanup, stat err: %v", statErr)
+	}
+}
+
+// TestBuild_UsesTempDir verifies that Build places the ISO inside a
+// process-owned temp directory (not directly in /tmp with a predictable name),
+// and that the temp directory is fully removed by the cleanup function.
+func TestBuild_UsesTempDir(t *testing.T) {
+	t.Parallel()
+
+	path, cleanup, err := configdrive.Build([]byte(`{"agent_id":"test"}`))
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	// The ISO must be named "configdrive.iso" and live inside a temp directory,
+	// not directly in /tmp as a bare *.iso file.
+	base := filepath.Base(path)
+	if base != "configdrive.iso" {
+		t.Errorf("ISO filename = %q, want %q", base, "configdrive.iso")
+	}
+
+	dir := filepath.Dir(path)
+	// The parent directory must not be /tmp itself — it must be a unique subdir.
+	tmpRoot := os.TempDir()
+	if dir == tmpRoot {
+		t.Errorf("ISO placed directly in %s; expected a unique subdirectory", tmpRoot)
+	}
+
+	// The temp directory must exist before cleanup.
+	if _, statErr := os.Stat(dir); statErr != nil {
+		t.Fatalf("expected temp dir to exist before cleanup, stat err: %v", statErr)
+	}
+
+	cleanup()
+
+	// Both the ISO and its parent temp directory must be gone after cleanup.
+	if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
+		t.Errorf("ISO still exists after cleanup: stat err: %v", statErr)
+	}
+	if _, statErr := os.Stat(dir); !os.IsNotExist(statErr) {
+		t.Errorf("temp dir still exists after cleanup: stat err: %v", statErr)
 	}
 }

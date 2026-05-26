@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strconv"
 
+	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
@@ -54,21 +55,21 @@ func HandleCreateDisk(deps Deps) Handler {
 		// 1. Unmarshal and validate arguments.
 		// ----------------------------------------------------------------
 		if len(args) < 2 {
-			return nil, fmt.Errorf("create_disk: expected at least 2 arguments (size_mb, cloud_properties), got %d", len(args))
+			return nil, cpierrors.Cloud("create_disk: expected at least 2 arguments (size_mb, cloud_properties), got %d", len(args))
 		}
 
 		var sizeMB int
 		if err := json.Unmarshal(args[0], &sizeMB); err != nil {
-			return nil, fmt.Errorf("create_disk: args[0] size_mb must be an integer: %w", err)
+			return nil, cpierrors.Wrap(err, "create_disk: args[0] size_mb must be an integer")
 		}
 		if sizeMB <= 0 {
-			return nil, fmt.Errorf("create_disk: size_mb must be > 0, got %d", sizeMB)
+			return nil, cpierrors.Cloud("create_disk: size_mb must be > 0, got %d", sizeMB)
 		}
 
 		var cloudProps createDiskCloudProperties
 		// args[1] may be null, {}, or a populated object.
 		if err := json.Unmarshal(args[1], &cloudProps); err != nil {
-			return nil, fmt.Errorf("create_disk: args[1] cloud_properties must be an object: %w", err)
+			return nil, cpierrors.Wrap(err, "create_disk: args[1] cloud_properties must be an object")
 		}
 
 		// args[2] (vm_cid) is optional; an absent or null third argument is fine.
@@ -87,7 +88,7 @@ func HandleCreateDisk(deps Deps) Handler {
 			storage = cloudProps.Storage
 		}
 		if storage == "" {
-			return nil, fmt.Errorf(
+			return nil, cpierrors.Cloud(
 				"create_disk: no storage configured (disk_storage empty and cloud_properties.storage not set)",
 			)
 		}
@@ -102,11 +103,11 @@ func HandleCreateDisk(deps Deps) Handler {
 
 		backend, err := backendResolverOrDefault(deps).Resolve(ctx, storage)
 		if err != nil {
-			return nil, fmt.Errorf("create_disk: backend resolution failed for storage %q: %w", storage, err)
+			return nil, cpierrors.Wrap(err, "create_disk: backend resolution failed for storage "+storage)
 		}
 		node, err := backend.NodeForCreate(ctx, vmCID, cloudProps.Node)
 		if err != nil {
-			return nil, fmt.Errorf("create_disk: %w", err)
+			return nil, cpierrors.Wrap(err, "create_disk")
 		}
 
 		// ----------------------------------------------------------------
@@ -220,7 +221,7 @@ func HandleCreateDisk(deps Deps) Handler {
 			maxAttempts,
 		)
 		if err != nil {
-			return nil, fmt.Errorf("create_disk: CreateVolume failed on node %q storage %q: %w", node, storage, err)
+			return nil, cpierrors.Wrap(err, "create_disk: CreateVolume failed on node "+node+" storage "+storage)
 		}
 
 		// From here on, any failure path must roll back the just-created

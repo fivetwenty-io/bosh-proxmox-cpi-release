@@ -109,7 +109,13 @@ func AwaitTask(ctx context.Context, c Client, node, upid string, opts ...AwaitOp
 	}
 
 	exit := status.ExitStatus
-	if exit != "OK" && exit != "ok" && exit != "" {
+	if exit == "" {
+		// Empty exit status means the task poller returned before PVE wrote
+		// the terminal ExitStatus field. Treating this as success silently
+		// masks tasks that stalled or were killed without a recorded outcome.
+		return cpierrors.Cloud("task %s: empty exit status (polling did not surface completion state)", upid)
+	}
+	if exit != "OK" && exit != "ok" {
 		return cpierrors.Cloud("task %s failed: exit status %q", upid, exit)
 	}
 

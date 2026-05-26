@@ -21,10 +21,14 @@ import (
 //
 // Logic:
 //  1. Parse vm_cid → vmid int.
-//  2. Call qemu.Config(ctx, node, vmid).
-//  3. 404 response → return false.
-//  4. Any other SDK error → propagate as CPI error.
-//  5. Success → return true.
+//  2. Locate VM via cluster scan (FindVMNodeViaCluster → /cluster/resources).
+//  3. Not found in cluster → return false.
+//  4. Transport error → propagate as CPI error (caller may retry).
+//  5. Found → return true.
+//
+// Using the cluster scan rather than Config(node, vmid) means the result is
+// correct after an HA failover: the VM may have migrated to a different node
+// since the CPI was configured.
 //
 // Returns bool.
 func HandleHasVM(deps Deps) cpi.Handler {
@@ -49,22 +53,23 @@ func HandleHasVM(deps Deps) cpi.Handler {
 			return nil, cpierrors.Cloud("has_vm: vm_cid %q must be a positive integer", vmCID)
 		}
 
-		node := deps.Config.Node
 		logger := deps.Logger.With(log.String("method", "has_vm"), log.String("vm_cid", vmCID), log.Int("vmid", vmid))
 
-		// --- existence check via Config ---
-		logger.Debug("has_vm: fetching VM config")
-		_, configErr := deps.PVE.QEMU().Config(ctx, node, vmid)
-		if configErr != nil {
-			if pve.IsNotFound(configErr) {
-				logger.Debug("has_vm: VM not found — returning false")
-				return false, nil
-			}
-			// Non-404 error: propagate to caller.
-			return nil, cpierrors.Wrap(pve.WrapError(configErr), "has_vm: config fetch failed")
+		// --- locate VM via cluster scan ---
+		// Queries /cluster/resources so the node returned is authoritative even
+		// after an HA failover. Scan-not-found → VM absent → return false.
+		// Transport error → propagate; caller may retry.
+		logger.Debug("has_vm: locating VM via cluster scan")
+		node, found, lookupErr := pve.FindVMNodeViaCluster(ctx, deps.PVE, vmid)
+		if lookupErr != nil {
+			return nil, cpierrors.Wrap(pve.WrapError(lookupErr), "has_vm: locate VM")
+		}
+		if !found || node == "" {
+			logger.Debug("has_vm: VM not found in cluster — returning false")
+			return false, nil
 		}
 
-		logger.Debug("has_vm: VM found — returning true")
+		logger.Debug("has_vm: VM found via cluster scan — returning true", log.String("node", node))
 		return true, nil
 	})
 }

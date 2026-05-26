@@ -79,16 +79,31 @@ func (l *localBackend) NodeForExisting(ctx context.Context, volume string) (stri
 		return "", err
 	}
 
+	var lastProbeErr error
+	anyProbeSucceeded := false
+
 	for _, node := range candidates {
 		exists, err := l.client.Storage().Exists(ctx, node, storage, volume)
 		if err != nil {
 			// Probe failure on one node should not abort the cluster scan —
-			// the volume may live on a different healthy node. Continue.
+			// the volume may live on a different healthy node. Record the
+			// error and continue so a healthy node can still return a hit.
+			lastProbeErr = err
 			continue
 		}
+		anyProbeSucceeded = true
 		if exists {
 			return node, nil
 		}
+	}
+
+	// If every candidate errored (none returned a clean false), we cannot
+	// distinguish "disk genuinely absent" from "all nodes unreachable". Treat
+	// the latter as retriable so the director re-drives the action once PVE
+	// recovers, rather than permanently losing track of the disk.
+	if !anyProbeSucceeded && lastProbeErr != nil {
+		return "", cpierrors.WrapAs(lastProbeErr, cpierrors.TypeRetriableCloud,
+			"NodeForExisting: all-node probe failed")
 	}
 
 	return "", cpierrors.DiskNotFound(FormatDiskCID(storage, volume))

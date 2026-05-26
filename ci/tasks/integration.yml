@@ -5,7 +5,8 @@
 #
 # Image requirements: the task image must contain bosh, cf, credhub, uv, go,
 # and make.  bosh/bosh-cli does NOT include cf or uv — replace with a custom
-# lab image that bundles all required CLIs.
+# lab image that bundles all required CLIs.  See docs/ci-image.md for the full
+# CLI list, an example Dockerfile, and how to wire the image_resource stanza.
 #
 # Prerequisite inputs: bosh-deployment and cf-deployment Git checkouts must
 # be present at the paths named by BOSH_DEPLOYMENT_DIR and CF_DEPLOYMENT.
@@ -48,7 +49,9 @@ run:
       export BOSH_DEPLOYMENT_DIR="${BOSH_DEPLOYMENT_DIR}"
       export CF_DEPLOYMENT="${CF_DEPLOYMENT}"
 
-      # Decode secret vars files from environment; scripts expect them at these paths.
+      # Validate and decode secret vars files from environment; scripts expect them at these paths.
+      if [ -z "${BOSH_VARS_YAML}" ]; then echo "BOSH_VARS_YAML param is empty" >&2; exit 1; fi
+      if [ -z "${CF_VARS_YAML}" ];   then echo "CF_VARS_YAML param is empty"   >&2; exit 1; fi
       mkdir -p repo/manifests/bosh repo/manifests/cf
       printf '%s' "${BOSH_VARS_YAML}" | base64 -d > repo/manifests/bosh/vars.yml
       printf '%s' "${CF_VARS_YAML}"   | base64 -d > repo/manifests/cf/vars.yml

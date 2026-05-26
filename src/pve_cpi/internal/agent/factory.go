@@ -57,6 +57,17 @@ func NewAgent(cfg *config.CPIConfig, pveClient pve.Client, logger *log.Logger) (
 		return NewRegistryAgent(regClient, logger), nil
 
 	case "noagent":
+		// Warn on misconfiguration: noagent ignores registry + ISO storage
+		// settings. Catching this here makes the operator-error visible
+		// before VM creation rather than after silent ignore.
+		if cfg.RegistryEndpoint != "" {
+			logger.Warn("agent.NewAgent: agent_mode=noagent ignores registry_endpoint",
+				log.String("registry_endpoint", cfg.RegistryEndpoint))
+		}
+		if cfg.ISOStorage != "" {
+			logger.Warn("agent.NewAgent: agent_mode=noagent ignores iso_storage",
+				log.String("iso_storage", cfg.ISOStorage))
+		}
 		return NewNoAgent(logger), nil
 
 	default:

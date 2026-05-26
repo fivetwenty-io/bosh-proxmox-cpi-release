@@ -829,6 +829,31 @@ func TestLoad_NetworkFields_RoundTrip(t *testing.T) {
 // TestLoad_NetworkMode_Omitted_GetsAuto
 // --------------------------------------------------------------------------
 
+// --------------------------------------------------------------------------
+// TestLoad_UnknownFields_LogsWarn_StillLoads
+// --------------------------------------------------------------------------
+
+// TestLoad_UnknownFields_LogsWarn_StillLoads verifies that a JSON payload
+// containing an unrecognized field ("future_field") decodes successfully
+// and returns a valid config. The unknown field is ignored (forward-compat).
+func TestLoad_UnknownFields_LogsWarn_StillLoads(t *testing.T) {
+	cfg, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+		"future_field":"x"
+	}`)
+	if err != nil {
+		t.Fatalf("expected no error for unknown field, got: %v", err)
+	}
+	// Verify that the rest of the config decoded correctly.
+	if cfg.Host != "h" {
+		t.Errorf("Host = %q, want %q", cfg.Host, "h")
+	}
+	if cfg.VMStorage != "s" {
+		t.Errorf("VMStorage = %q, want %q", cfg.VMStorage, "s")
+	}
+}
+
 // TestLoad_NetworkMode_Omitted_GetsAuto confirms that omitting network_mode
 // from JSON results in NetworkMode="auto" after Load applies defaults.
 func TestLoad_NetworkMode_Omitted_GetsAuto(t *testing.T) {

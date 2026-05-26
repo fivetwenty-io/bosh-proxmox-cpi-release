@@ -15,6 +15,7 @@ package configdrive
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 
 	diskfs "github.com/diskfs/go-diskfs"
 	"github.com/diskfs/go-diskfs/disk"
@@ -39,27 +40,31 @@ const isoSize int64 = 10 * 1024 * 1024
 // A minimal /openstack/latest/meta_data.json stub is generated alongside.
 //
 // Returns the path to the finalized ISO file on disk and a cleanup func that
-// removes it. The caller must invoke cleanup once the ISO has been uploaded.
-// On any error the partially-written file is removed before returning.
+// removes the temp directory containing it. The caller must invoke cleanup once
+// the ISO has been uploaded. On any error the temp directory is removed before
+// returning.
+//
+// The ISO path is placed inside a process-owned temp directory created with
+// os.MkdirTemp (random suffix) to eliminate the TOCTOU race that existed when
+// os.CreateTemp created a named placeholder that was then removed and re-opened.
 func Build(payload []byte) (path string, cleanup func(), err error) {
-	tmp, err := os.CreateTemp("", "bosh-cpi-configdrive-*.iso")
+	// Create a process-owned temp directory. The directory name carries a random
+	// suffix chosen by the OS, so no other process can predict or race the ISO path.
+	dir, err := os.MkdirTemp("", "bosh-cpi-configdrive-*")
 	if err != nil {
-		return "", nil, fmt.Errorf("configdrive: create temp file: %w", err)
-	}
-	tmpPath := tmp.Name()
-	_ = tmp.Close()
-	// diskfs.Create opens the file with O_EXCL via the underlying backend, so
-	// remove the empty placeholder created by os.CreateTemp first. The unique
-	// name from CreateTemp guarantees no collision with other goroutines.
-	_ = os.Remove(tmpPath)
-
-	removeOnError := func() {
-		_ = os.Remove(tmpPath)
+		return "", nil, fmt.Errorf("configdrive: create temp dir: %w", err)
 	}
 
-	d, err := diskfs.Create(tmpPath, isoSize, diskfs.SectorSizeDefault)
+	// cleanupDir removes the entire temp directory, including the ISO inside it.
+	cleanupDir := func() {
+		_ = os.RemoveAll(dir)
+	}
+
+	isoPath := filepath.Join(dir, "configdrive.iso")
+
+	d, err := diskfs.Create(isoPath, isoSize, diskfs.SectorSizeDefault)
 	if err != nil {
-		removeOnError()
+		cleanupDir()
 		return "", nil, fmt.Errorf("configdrive: diskfs.Create: %w", err)
 	}
 	// ISO 9660 mandates 2 KiB logical blocks.
@@ -72,18 +77,18 @@ func Build(payload []byte) (path string, cleanup func(), err error) {
 	}
 	fs, err := d.CreateFilesystem(spec)
 	if err != nil {
-		removeOnError()
+		cleanupDir()
 		return "", nil, fmt.Errorf("configdrive: CreateFilesystem: %w", err)
 	}
 
 	if err := writeFiles(fs, payload); err != nil {
-		removeOnError()
+		cleanupDir()
 		return "", nil, err
 	}
 
 	iso, ok := fs.(*iso9660.FileSystem)
 	if !ok {
-		removeOnError()
+		cleanupDir()
 		return "", nil, fmt.Errorf("configdrive: unexpected filesystem type %T", fs)
 	}
 	finalizeOpts := iso9660.FinalizeOptions{
@@ -91,12 +96,11 @@ func Build(payload []byte) (path string, cleanup func(), err error) {
 		VolumeIdentifier: volumeLabel,
 	}
 	if err := iso.Finalize(finalizeOpts); err != nil {
-		removeOnError()
+		cleanupDir()
 		return "", nil, fmt.Errorf("configdrive: Finalize: %w", err)
 	}
 
-	cleanup = func() { _ = os.Remove(tmpPath) }
-	return tmpPath, cleanup, nil
+	return isoPath, cleanupDir, nil
 }
 
 // minimalOpenStackMetaData is the smallest /openstack/latest/meta_data.json
@@ -129,7 +133,12 @@ func writeFiles(fs filesystem.FileSystem, payload []byte) error {
 	if err := writeISOFile(fs, "/ec2/latest/user-data", payload); err != nil {
 		return err
 	}
-	if err := writeISOFile(fs, "/ec2/latest/meta-data.json", payload); err != nil {
+	// EC2 meta-data.json must carry the same minimal stub as
+	// /openstack/latest/meta_data.json. Writing the full settings payload
+	// here was a bug: the EC2 datasource reads user-data for agent settings,
+	// not meta-data. Stemcells that parse meta-data.json as JSON would fail
+	// if they received a settings blob instead of a metadata object.
+	if err := writeISOFile(fs, "/ec2/latest/meta-data.json", []byte(minimalOpenStackMetaData)); err != nil {
 		return err
 	}
 	return nil

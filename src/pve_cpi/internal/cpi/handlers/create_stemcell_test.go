@@ -1,7 +1,9 @@
 package handlers_test
 
 import (
+	"archive/tar"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -764,6 +766,214 @@ func TestCreateStemcell_QCow2FileBarePassthrough(t *testing.T) {
 	}
 	if !containsSubstr(cid, "local:import/bosh-stemcell-ubuntu-focal-99.1-") {
 		t.Errorf("CID %q does not match expected prefix", cid)
+	}
+}
+
+// ============================================================
+// Tests: tar extraction — B10 selection and magic-byte checks
+// ============================================================
+
+// makeStemcellTar builds an in-memory gzip+tar archive containing the given
+// files and writes it to a temp file. Each entry in files maps filename to
+// content bytes.
+func makeStemcellTar(t *testing.T, files map[string][]byte) string {
+	t.Helper()
+	f, err := os.CreateTemp(t.TempDir(), "stemcell-*.tgz")
+	if err != nil {
+		t.Fatalf("makeStemcellTar: create: %v", err)
+	}
+
+	gw, err := gzip.NewWriterLevel(f, gzip.BestSpeed)
+	if err != nil {
+		t.Fatalf("makeStemcellTar: gzip writer: %v", err)
+	}
+	tw := tar.NewWriter(gw)
+
+	for name, data := range files {
+		hdr := &tar.Header{
+			Typeflag: tar.TypeReg,
+			Name:     name,
+			Size:     int64(len(data)),
+			Mode:     0o644,
+		}
+		if err := tw.WriteHeader(hdr); err != nil {
+			t.Fatalf("makeStemcellTar: write header %s: %v", name, err)
+		}
+		if _, err := tw.Write(data); err != nil {
+			t.Fatalf("makeStemcellTar: write data %s: %v", name, err)
+		}
+	}
+
+	if err := tw.Close(); err != nil {
+		t.Fatalf("makeStemcellTar: close tar: %v", err)
+	}
+	if err := gw.Close(); err != nil {
+		t.Fatalf("makeStemcellTar: close gzip: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("makeStemcellTar: close file: %v", err)
+	}
+	return f.Name()
+}
+
+// qcow2Bytes returns a minimal valid-magic qcow2 header padded to size bytes.
+func qcow2Bytes(size int) []byte {
+	b := make([]byte, size)
+	b[0] = 'Q'
+	b[1] = 'F'
+	b[2] = 'I'
+	b[3] = 0xFB
+	return b
+}
+
+// TestResolveStemcell_PrefersImgOverLargerNonImg verifies that when a tarball
+// contains a smaller root.img and a larger binary blob, the .img file wins.
+// This is the B10 regression test: the old code picked the largest file by
+// byte count regardless of suffix, causing a non-image blob to be uploaded.
+func TestResolveStemcell_PrefersImgOverLargerNonImg(t *testing.T) {
+	t.Parallel()
+
+	// root.img: 2 MiB with qcow2 magic — correct disk image.
+	// extras.bin: 5 MiB with arbitrary bytes — should be ignored.
+	imgData := qcow2Bytes(2 * 1024 * 1024)
+	binData := bytes.Repeat([]byte{0xDE, 0xAD, 0xBE, 0xEF}, (5*1024*1024)/4)
+
+	tgzPath := makeStemcellTar(t, map[string][]byte{
+		"root.img":   imgData,
+		"extras.bin": binData,
+	})
+
+	var uploadedBytes []byte
+	storageSvc := &stemcellMockStorage{
+		uploadFn: func(_ context.Context, _, _, _, _ string, body io.Reader) (string, error) {
+			data, err := io.ReadAll(body)
+			if err != nil {
+				return "", err
+			}
+			uploadedBytes = data
+			return "", nil
+		},
+	}
+	client := buildStemcellClient(&stemcellMockQEMU{}, &stemcellMockNodes{}, &stemcellMockTasks{}, &stemcellMockCluster{})
+	client.storageSvc = storageSvc
+
+	deps := makeDeps(client)
+	h := handlers.HandleCreateStemcell(deps)
+
+	cp := map[string]any{"name": "ubuntu-jammy", "version": "1.0", "disk_format": "qcow2"}
+	args := []json.RawMessage{marshalArg(t, tgzPath), marshalArg(t, cp)}
+
+	if _, err := h.Handle(context.Background(), args, jsonrpc.Context{}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(uploadedBytes) < 4 {
+		t.Fatalf("upload too short (%d bytes); expected qcow2 content", len(uploadedBytes))
+	}
+	// Verify the uploaded bytes are from root.img (qcow2 magic), not extras.bin.
+	if uploadedBytes[0] != 'Q' || uploadedBytes[1] != 'F' || uploadedBytes[2] != 'I' || uploadedBytes[3] != 0xFB {
+		t.Errorf("upload does not start with qcow2 magic; first 4 bytes: %#x %#x %#x %#x",
+			uploadedBytes[0], uploadedBytes[1], uploadedBytes[2], uploadedBytes[3])
+	}
+}
+
+// TestResolveStemcell_RejectsUnknownMagic verifies that a tarball containing
+// only a root.img with unrecognised magic bytes (no qcow2/gzip/lz4 header and
+// below the raw-size threshold) returns an error that names the file and the
+// magic bytes. This ensures accidental upload of manifest or config files is
+// blocked at extraction time.
+func TestResolveStemcell_RejectsUnknownMagic(t *testing.T) {
+	t.Parallel()
+
+	// root.img with arbitrary non-disk header bytes and size below 1 MiB.
+	// The four bytes 0xCA 0xFE 0xBA 0xBE are the Java class magic — clearly
+	// not a disk image.
+	smallJunk := make([]byte, 512*1024) // 512 KiB — below the raw-size floor
+	smallJunk[0] = 0xCA
+	smallJunk[1] = 0xFE
+	smallJunk[2] = 0xBA
+	smallJunk[3] = 0xBE
+
+	tgzPath := makeStemcellTar(t, map[string][]byte{
+		"root.img": smallJunk,
+	})
+
+	deps := makeDeps(defaultStemcellClient())
+	h := handlers.HandleCreateStemcell(deps)
+
+	cp := map[string]any{"name": "ubuntu-jammy", "version": "1.0", "disk_format": "raw"}
+	args := []json.RawMessage{marshalArg(t, tgzPath), marshalArg(t, cp)}
+
+	_, err := h.Handle(context.Background(), args, jsonrpc.Context{})
+	if err == nil {
+		t.Fatal("expected error for unknown magic bytes; got nil")
+	}
+	if !containsSubstr(err.Error(), "unknown magic bytes") {
+		t.Errorf("error %q does not mention 'unknown magic bytes'", err.Error())
+	}
+}
+
+// TestResolveStemcell_TarballExceedsMaxSize_Errors verifies that a tarball
+// whose candidate entries declare a cumulative size above MaxStemcellTotalExtract
+// is rejected before any disk I/O, returning an error that mentions the limit.
+//
+// The test constructs a minimal gzip+tar where a single .img entry declares a
+// 33 GiB header size but provides only a 2 MiB payload. The extraction guard
+// fires on the declared size, so the test completes instantly without allocating
+// 33 GiB on disk.
+func TestResolveStemcell_TarballExceedsMaxSize_Errors(t *testing.T) {
+	t.Parallel()
+
+	// Build a gzip+tar with one .img entry whose declared size exceeds 32 GiB.
+	// The actual body written is only 2 MiB (qcow2 magic + padding) so the test
+	// is fast; the guard triggers on hdr.Size, not on bytes written to disk.
+	const declaredSize = 33 * 1024 * 1024 * 1024 // 33 GiB — above the 32 GiB cap
+
+	f, err := os.CreateTemp(t.TempDir(), "stemcell-tarbomb-*.tgz")
+	if err != nil {
+		t.Fatalf("create temp file: %v", err)
+	}
+
+	gw, err := gzip.NewWriterLevel(f, gzip.BestSpeed)
+	if err != nil {
+		_ = f.Close()
+		t.Fatalf("gzip writer: %v", err)
+	}
+	tw := tar.NewWriter(gw)
+
+	body := qcow2Bytes(2 * 1024 * 1024) // 2 MiB with qcow2 magic
+	hdr := &tar.Header{
+		Typeflag: tar.TypeReg,
+		Name:     "root.img",
+		Size:     declaredSize, // declares 33 GiB — triggers the guard
+		Mode:     0o644,
+	}
+	if werr := tw.WriteHeader(hdr); werr != nil {
+		t.Fatalf("write tar header: %v", werr)
+	}
+	if _, werr := tw.Write(body); werr != nil {
+		t.Fatalf("write tar body: %v", werr)
+	}
+	// Do NOT close tw/gw normally — the declared size exceeds the body, which
+	// makes a well-formed tar impossible. We flush what we have and close
+	// the underlying gzip writer so the file is readable up to the guard check.
+	_ = gw.Flush()
+	_ = gw.Close()
+	_ = f.Close()
+	tgzPath := f.Name()
+
+	deps := makeDeps(defaultStemcellClient())
+	h := handlers.HandleCreateStemcell(deps)
+
+	cp := map[string]any{"name": "ubuntu-jammy", "version": "1.0", "disk_format": "qcow2"}
+	args := []json.RawMessage{marshalArg(t, tgzPath), marshalArg(t, cp)}
+
+	_, err = h.Handle(context.Background(), args, jsonrpc.Context{})
+	if err == nil {
+		t.Fatal("expected error for tar-bomb (declared size > 32GB); got nil")
+	}
+	if !containsSubstr(err.Error(), "exceed") {
+		t.Errorf("error %q does not mention 'exceed'; expected the MaxStemcellTotalExtract message", err.Error())
 	}
 }
 

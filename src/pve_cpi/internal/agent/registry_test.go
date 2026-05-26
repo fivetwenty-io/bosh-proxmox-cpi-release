@@ -412,7 +412,16 @@ func captureSettings(t *testing.T, cfg agent.AgentConfig) map[string]json.RawMes
 	return inner
 }
 
-func TestRegistryAgent_Configure_MBusFallbackFromBlobstore(t *testing.T) {
+// TestRegistryAgent_Configure_MBusFallbackReturnsError verifies that Configure
+// returns an error when MBus is empty and the blobstore endpoint would produce
+// a credential-less NATS URL. Operators must supply mbus explicitly.
+func TestRegistryAgent_Configure_MBusFallbackReturnsError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	ra := newRegistryAgent(t, srv)
 	cfg := agent.AgentConfig{
 		AgentID: "x",
 		MBus:    "",
@@ -421,11 +430,12 @@ func TestRegistryAgent_Configure_MBusFallbackFromBlobstore(t *testing.T) {
 			Options:  map[string]any{"endpoint": "https://10.0.0.1:25250"},
 		},
 	}
-	settings := captureSettings(t, cfg)
-	var mbus string
-	_ = json.Unmarshal(settings["mbus"], &mbus)
-	if mbus != "nats://10.0.0.1:4222" {
-		t.Errorf("mbus = %q, want nats://10.0.0.1:4222", mbus)
+	err := ra.Configure(context.Background(), "node1", 100, cfg)
+	if err == nil {
+		t.Fatal("expected error when mbus is empty and blobstore host is derivable; got nil")
+	}
+	if !strings.Contains(err.Error(), "mbus is empty") {
+		t.Errorf("error should mention 'mbus is empty', got: %v", err)
 	}
 }
 

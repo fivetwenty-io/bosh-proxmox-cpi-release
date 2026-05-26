@@ -78,9 +78,24 @@ func WithBackoffFunc(fn func(err error, attempt int) time.Duration) AllocOption 
 // retryBackoff sleeps for a duration chosen by ao's backoff configuration
 // and returns the slept duration so callers can log it. The order of
 // precedence is: noBackoff (returns 0) > backoffFn > default jitter.
-func retryBackoff(ao *allocOpts, err error, attempt int) time.Duration {
+//
+// The sleep is context-aware: if ctx is cancelled or its deadline expires
+// before the sleep completes, retryBackoff returns ctx.Err() immediately
+// so callers stop retrying without waiting for the full sleep duration.
+//
+// Inputs:
+//   - ctx: must not be nil; passed through from the outer VMID allocation call.
+//   - ao: may be nil (treated as no override — default jitter applies).
+//   - err: the error from the last failed attempt; forwarded to backoffFn.
+//   - attempt: 0-indexed retry count.
+//
+// Failure modes:
+//   - ctx cancelled/deadline exceeded before sleep completes → returns ctx.Err().
+//   - noBackoff set → returns nil immediately (d == 0).
+//   - normal completion → returns nil.
+func retryBackoff(ctx context.Context, ao *allocOpts, err error, attempt int) error {
 	if ao != nil && ao.noBackoff {
-		return 0
+		return nil
 	}
 	var d time.Duration
 	if ao != nil && ao.backoffFn != nil {
@@ -89,10 +104,15 @@ func retryBackoff(ao *allocOpts, err error, attempt int) time.Duration {
 		// Default: uniform 50–250 ms.
 		d = 50*time.Millisecond + time.Duration(mrand.Int64N(int64(200*time.Millisecond)))
 	}
-	if d > 0 {
-		time.Sleep(d)
+	if d <= 0 {
+		return nil
 	}
-	return d
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(d):
+		return nil
+	}
 }
 
 // globalVMIDMu is the process-level mutex that serialises VMID allocation.
@@ -178,9 +198,11 @@ func nextVMIDInRange(used map[int]struct{}, start, end int) (int, error) {
 }
 
 // NextVMID returns the lowest free VMID in the range specified by opts (default
-// [VMIDRangeVMStart, VMIDRangeVMEnd]). The cluster VM list is fetched under a
-// process-level mutex to prevent within-process races. Cross-process races are
-// handled at the caller layer via retry-on-conflict.
+// [VMIDRangeVMStart, VMIDRangeVMEnd]). The cluster VM list is fetched outside
+// the process-level mutex so a slow PVE API call does not block other goroutines
+// for its full round-trip duration. The mutex is held only around the in-memory
+// scan+select, which is microsecond-range work. Cross-process races are handled
+// at the caller layer via retry-on-conflict.
 //
 // Inputs and failure modes:
 //   - ctx nil → returns *cpierrors.Error before any SDK call.
@@ -203,13 +225,18 @@ func NextVMID(ctx context.Context, c Client, opts ...AllocOption) (int, error) {
 		opt(ao)
 	}
 
-	globalVMIDMu.Lock()
-	defer globalVMIDMu.Unlock()
-
+	// Fetch outside the mutex: the PVE API call can take seconds; holding the
+	// lock here would serialize all goroutines behind a single 30-second timeout.
 	used, err := listClusterVMIDs(ctx, c)
 	if err != nil {
 		return 0, err
 	}
+
+	// Lock only for the pure in-memory scan so two goroutines with identical
+	// "used" snapshots cannot return the same VMID. The randomised start in
+	// nextVMIDInRange further scatters concurrent allocations.
+	globalVMIDMu.Lock()
+	defer globalVMIDMu.Unlock()
 
 	return nextVMIDInRange(used, ao.rangeStart, ao.rangeEnd)
 }
@@ -225,6 +252,10 @@ func NextVMID(ctx context.Context, c Client, opts ...AllocOption) (int, error) {
 // scan, a stale "vm-9000-disk-0" left behind on storage would be invisible
 // to NextDiskVMID and the next call would happily return 9000 again,
 // colliding on lvcreate.
+//
+// Both API calls (cluster list + storage content list) run outside the mutex
+// for the same reason as NextVMID: they can block for seconds and must not
+// head-of-line-block other goroutines.
 func NextDiskVMID(ctx context.Context, c Client, node, storage string) (int, error) {
 	if ctx == nil {
 		return 0, cpierrors.Cloud("NextDiskVMID: ctx must not be nil")
@@ -233,9 +264,7 @@ func NextDiskVMID(ctx context.Context, c Client, node, storage string) (int, err
 		return 0, cpierrors.Cloud("NextDiskVMID: client must not be nil")
 	}
 
-	globalVMIDMu.Lock()
-	defer globalVMIDMu.Unlock()
-
+	// Fetch both data sources outside the mutex.
 	used, err := listClusterVMIDs(ctx, c)
 	if err != nil {
 		return 0, err
@@ -250,6 +279,9 @@ func NextDiskVMID(ctx context.Context, c Client, node, storage string) (int, err
 			used[id] = struct{}{}
 		}
 	}
+
+	globalVMIDMu.Lock()
+	defer globalVMIDMu.Unlock()
 
 	return nextVMIDInRange(used, VMIDRangeDiskStart, VMIDRangeDiskEnd)
 }
@@ -368,7 +400,9 @@ func AllocateWithRetry(
 		if createErr := create(vmid); createErr != nil {
 			if isConflict != nil && isConflict(createErr) {
 				if attempt < maxAttempts-1 {
-					retryBackoff(ao, createErr, attempt)
+					if sleepErr := retryBackoff(ctx, ao, createErr, attempt); sleepErr != nil {
+						return 0, cpierrors.Wrap(sleepErr, "AllocateWithRetry: context cancelled during backoff")
+					}
 				}
 				continue
 			}
@@ -425,7 +459,9 @@ func AllocateDiskWithRetry(
 		if createErr := create(vmid); createErr != nil {
 			if isConflict != nil && isConflict(createErr) {
 				if attempt < maxAttempts-1 {
-					retryBackoff(ao, createErr, attempt)
+					if sleepErr := retryBackoff(ctx, ao, createErr, attempt); sleepErr != nil {
+						return 0, cpierrors.Wrap(sleepErr, "AllocateDiskWithRetry: context cancelled during backoff")
+					}
 				}
 				continue
 			}

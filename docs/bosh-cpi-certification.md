@@ -107,6 +107,17 @@ TRACE=1 ./scripts/lifecycle 2>&1 | tee lifecycle.log
 
 Each step prints `==> <method>` before invocation; the failing step is the last one printed before the trap output.
 
+### Cluster Topology Behavior
+
+Read-path handlers — `has_vm`, `reboot_vm`, `set_vm_metadata`, `get_disks`, `delete_vm`, and `delete_snapshot` — locate VMs via a `/cluster/resources` scan rather than a single-node query. This means they find the correct node after a PVE HA failover without any operator intervention or CPI reconfiguration.
+
+`delete_network` has a per-path difference:
+
+- **SDN path** — resolves the vnet by name from the SDN database, which is cluster-global. No node constraint applies.
+- **Bridge path** — issues the bridge deletion against `Config.Node`. If HA moves the broker VM to a different node between `create_network` and `delete_network`, the bridge delete targets the original node and may fail.
+
+**Operator requirement for bridge networks:** do not change `Config.Node` in `cpi.json` between creating and deleting the same network CID. See [CPI configuration reference](pve-settings.md) for the `node` field.
+
 ### Running a Single Step
 
 The harness is a flat script; comment out steps you don't want to run. For ad-hoc invocation of one method, use `jq` + `bin/cpi` directly:

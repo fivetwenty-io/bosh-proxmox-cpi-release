@@ -329,6 +329,61 @@ def _cfg_with_stemcell(cfg: dict, path: str) -> dict:
     return cfg2
 
 
+# Tracks whether an atexit resurrection-re-enable callback has been registered
+# so that multiple tier runs in a single `all` invocation do not stack duplicate
+# callbacks.
+_resurrection_atexit_registered: bool = False
+
+
+def disable_resurrection(cfg: dict) -> int:
+    """Disable BOSH resurrection and register an atexit handler to re-enable it.
+
+    The Health Monitor's resurrector races integration deploys: a transient
+    missed get_state heartbeat causes HM to declare a healthy VM dead and
+    launch 'scan and fix', which grabs the deployment lock and fails the
+    in-flight deploy.  Disabling resurrection for the duration of the run
+    prevents this.
+
+    An atexit callback unconditionally re-enables resurrection on process
+    exit (success, failure, or keyboard interrupt) so the lab is never left
+    with resurrection permanently disabled.  The callback is registered at
+    most once per process, regardless of how many tiers call this function.
+
+    Args:
+        cfg: Validated config dict (unused directly; reserved for future
+             per-environment targeting).
+
+    Returns:
+        0 on success, non-zero if the disable command fails.
+    """
+    global _resurrection_atexit_registered
+
+    if not _resurrection_atexit_registered:
+        def _reenable_resurrection() -> None:
+            # Run unconditionally — ignore errors so a broken director does
+            # not suppress the atexit machinery for other handlers.
+            try:
+                subprocess.run(
+                    ["./scripts/bosh", "update-resurrection", "on"],
+                    cwd=REPO_ROOT,
+                    check=False,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+
+        atexit.register(_reenable_resurrection)
+        _resurrection_atexit_registered = True
+
+    rc = run_with_retries(
+        ["./scripts/bosh", "update-resurrection", "off"],
+        cwd=REPO_ROOT,
+        retries=1,
+        delay=20,
+        label="resurrection-off",
+    )
+    return rc
+
+
 def tier_bosh(cfg: dict, cpi_config_path: str, keep: bool) -> int:
     """Run the Tier 2 BOSH director smoke sequence.
 
@@ -360,23 +415,26 @@ def tier_bosh(cfg: dict, cpi_config_path: str, keep: bool) -> int:
     # same stemcell Tier 1 uses; a placeholder suffices under --dry-run.
     sc_path = "<dry-run:stemcell>" if _dry_run else _integration.stemcell_path(cfg)
 
+    # Disable resurrection before any deploy steps so the Health Monitor's
+    # resurrector cannot race deploys.  disable_resurrection() registers an
+    # atexit callback to re-enable it, guaranteeing re-enable on any exit path
+    # including KeyboardInterrupt.  See disable_resurrection() for full rationale.
+    rc = disable_resurrection(cfg)
+    if rc != 0:
+        print("tier 2 failed: resurrection-off", file=sys.stderr)
+        return rc
+
     # (step_name, cmd, timeout, env, retries)
-    # resurrection-off: keep the Health Monitor's resurrector from racing the
-    # deploys. On a lab with intermittent NATS request/reply hiccups a single
-    # missed get_state makes HM declare a (healthy) VM unresponsive and launch
-    # 'scan and fix', which grabs the deployment lock and fails the in-flight
-    # deploy. Tests own the lifecycle, so disable resurrection up front.
-    # emptyvm gets retries: the same intermittent get_state/get_task 45s
-    # timeout can fail an otherwise-healthy deploy; re-running it resumes.
+    # emptyvm gets retries: intermittent get_state/get_task 45s timeouts can
+    # fail an otherwise-healthy deploy; re-running it resumes.
     steps = [
-        ("create-env",       ["./scripts/bosh", "create-env"],                 None,           None,                          0),
-        ("alias-env",        ["./scripts/bosh", "alias-env"],                  None,           None,                          0),
-        ("resurrection-off", ["./scripts/bosh", "update-resurrection", "off"], None,           None,                          1),
-        ("ucc",              ["./scripts/bosh", "ucc"],                        None,           None,                          1),
-        ("runtime-config",   ["./scripts/bosh", "runtime-config"],             None,           None,                          1),
-        ("upload-stemcell",  ["./scripts/bosh", "upload-stemcell"],            None,           {"STEMCELL_PATH": sc_path},    1),
-        ("emptyvm",          ["./scripts/bosh", "emptyvm"],                    deploy_timeout, None,                          2),
-        ("env",              ["./scripts/bosh", "env"],                        None,           None,                          1),
+        ("create-env",      ["./scripts/bosh", "create-env"],    None,           None,                          0),
+        ("alias-env",       ["./scripts/bosh", "alias-env"],     None,           None,                          0),
+        ("ucc",             ["./scripts/bosh", "ucc"],           None,           None,                          1),
+        ("runtime-config",  ["./scripts/bosh", "runtime-config"], None,          None,                          1),
+        ("upload-stemcell", ["./scripts/bosh", "upload-stemcell"], None,         {"STEMCELL_PATH": sc_path},    1),
+        ("emptyvm",         ["./scripts/bosh", "emptyvm"],       deploy_timeout, None,                          2),
+        ("env",             ["./scripts/bosh", "env"],           None,           None,                          1),
     ]
 
     for step_name, cmd, step_timeout, step_env, step_retries in steps:
@@ -428,24 +486,29 @@ def tier_cf(cfg: dict, cpi_config_path: str, keep: bool) -> int:
 
     sys_domain = _integration.system_domain(cfg, dry_run=_dry_run)
 
+    # Disable resurrection before any deploy steps.  disable_resurrection()
+    # registers an atexit callback to re-enable it unconditionally on exit.
+    # Idempotent when tier_bosh ran first in the same process (atexit registered
+    # at most once).  Covers a standalone `integration cf` run too.
+    rc = disable_resurrection(cfg)
+    if rc != 0:
+        print("tier 3 failed: resurrection-off", file=sys.stderr)
+        return rc
+
     # (step_name, cmd, timeout, retries) — smoke_timeout applies to cf push.
     # The cf CLI steps that touch the Cloud Controller get retries: the first
     # writes after a fresh deploy can transiently fail with "MySQL client is
     # not connected" until CC's DB connection pool warms up.
+    # cf deploy is NOT auto-retried: re-running an interrupted multi-VM CF
+    # deploy resumes in-place, and if the first attempt died early (before
+    # router/tcp-router/scheduler were updated) the haproxy canary then
+    # crash-loops on unresolvable backend bosh-dns names and wedges the
+    # deploy. A clean single pass is the reliable path; an interrupted
+    # deploy is better re-run from a fresh `integration cf` (or `all`).
+    # The real cause of those interruptions is the single-node lab's 45s
+    # director->agent timeout under the 16-VM creation burst — see
+    # docs/pve-host-tuning.md; not a CPI defect.
     steps_before_push: list[tuple[str, list[str], int | None, int]] = [
-        # See tier_bosh: disable resurrection so HM does not grab the cf
-        # deployment lock on a transient missed heartbeat. (Idempotent; also
-        # covers a standalone `integration cf` run.)
-        ("resurrection-off", ["./scripts/bosh", "update-resurrection", "off"],        None,          1),
-        # cf deploy is NOT auto-retried: re-running an interrupted multi-VM CF
-        # deploy resumes in-place, and if the first attempt died early (before
-        # router/tcp-router/scheduler were updated) the haproxy canary then
-        # crash-loops on unresolvable backend bosh-dns names and wedges the
-        # deploy. A clean single pass is the reliable path; an interrupted
-        # deploy is better re-run from a fresh `integration cf` (or `all`).
-        # The real cause of those interruptions is the single-node lab's 45s
-        # director->agent timeout under the 16-VM creation burst — see
-        # docs/pve-host-tuning.md; not a CPI defect.
         ("cf deploy",        ["./scripts/cf", "deploy"],                              None,          0),
         ("cf login",         ["./scripts/cf", "login"],                               None,          3),
         ("cf create-org",    ["cf", "create-org", smoke_org],                         None,          6),
@@ -583,15 +646,29 @@ def cmd_integration(argv: list[str]) -> int:
         print(f"config error: {exc}", file=sys.stderr)
         sys.exit(2)
 
-    # Synthesize CPI config into a temp file; register cleanup.
-    cpi_config_path = f"/tmp/integration-cpi-config-{os.getpid()}.json"
+    # Synthesize CPI config into a temp file.
+    # mkstemp creates the file with mode 0600 (owner-read/write only), preventing
+    # other users on the host from reading PVE credentials while the run is live.
+    # The atexit handler is registered unconditionally so the file is always
+    # removed on exit — even when --keep is specified.  Under --keep a warning is
+    # printed so the operator knows the credentials file remains on disk and must
+    # be deleted manually after inspection.
+    _cpi_fd, cpi_config_path = tempfile.mkstemp(
+        prefix="integration-cpi-config-", suffix=".json"
+    )
+    os.close(_cpi_fd)
 
     def _cleanup_cpi_config() -> None:
-        if not args.keep:
-            try:
-                Path(cpi_config_path).unlink(missing_ok=True)
-            except OSError:
-                pass
+        if args.keep:
+            print(
+                f"warn: --keep specified; credentials file remains at {cpi_config_path} "
+                "— delete it manually after inspection.",
+                file=sys.stderr,
+            )
+        try:
+            Path(cpi_config_path).unlink(missing_ok=True)
+        except OSError:
+            pass
 
     atexit.register(_cleanup_cpi_config)
 

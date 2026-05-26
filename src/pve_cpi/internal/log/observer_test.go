@@ -1,6 +1,7 @@
 package log
 
 import (
+	"context"
 	"errors"
 	"log/slog"
 	"sync"
@@ -104,10 +105,10 @@ func TestObserver_ConcurrentSafe(t *testing.T) {
 
 func TestEnabledThreshold(t *testing.T) {
 	h := &observerHandler{minLevel: slog.LevelWarn, obs: &Observer{}}
-	if h.Enabled(nil, slog.LevelInfo) {
+	if h.Enabled(context.TODO(), slog.LevelInfo) {
 		t.Fatal("info should be disabled when min is warn")
 	}
-	if !h.Enabled(nil, slog.LevelError) {
+	if !h.Enabled(context.TODO(), slog.LevelError) {
 		t.Fatal("error should be enabled when min is warn")
 	}
 }

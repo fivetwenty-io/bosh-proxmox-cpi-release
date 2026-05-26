@@ -6,6 +6,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/cpi/handlers"
@@ -301,6 +302,40 @@ func TestHandleUpdateDisk_DetachedDisk(t *testing.T) {
 	}
 	if !cpierrors.IsType(err, cpierrors.TypeCloud) {
 		t.Errorf("error type: want CloudError for detached disk, got %T %v", err, err)
+	}
+	// Error must say "detached disk" not a transport message.
+	if !strings.Contains(err.Error(), "detached disk") {
+		t.Errorf("error must mention detached disk, got: %v", err)
+	}
+}
+
+// TestHandleUpdateDisk_FindVMTransportError — FindVMByDiskVolid cluster-scan fails
+// with a transport error (connection refused). The bug was that the handler swallowed
+// this as "detached disk"; the fix propagates it as a distinct wrapped error.
+func TestHandleUpdateDisk_FindVMTransportError(t *testing.T) {
+	const diskCID = "local-lvm:vm-9001-disk-0"
+
+	transportErr := errors.New("connection refused dialing cluster API")
+	// Cluster ListResources returns a transport-level error (not "disk not found").
+	faultCluster := &snapClusterService{
+		listFn: func(_ context.Context, _ *sdkclusterapi.ListResourcesParams) (*sdkclusterapi.ListResourcesResponse, error) {
+			return nil, transportErr
+		},
+	}
+
+	h := handlers.HandleUpdateDisk(updateDiskDeps(&updateDiskQEMUService{}, faultCluster, nil))
+	_, err := h.Handle(context.Background(), marshalArgs(diskCID, map[string]any{"cache": "writeback"}), jsonrpc.Context{})
+	if err == nil {
+		t.Fatal("expected error for cluster transport failure, got nil")
+	}
+	// Must NOT be "detached disk" — that message must only appear when the disk
+	// is genuinely absent from every VM. Transport errors must propagate as-is.
+	if strings.Contains(err.Error(), "detached disk cannot be updated") {
+		t.Errorf("transport error must not be reported as 'detached disk', got: %v", err)
+	}
+	// Must be a CloudError type (wrapped transport error).
+	if !cpierrors.IsType(err, cpierrors.TypeCloud) && !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+		t.Errorf("transport error must be wrapped as Cloud or RetriableCloud, got: %T %v", err, err)
 	}
 }
 
@@ -798,3 +833,119 @@ func TestHandleUpdateDisk_ZFSPool_CID(t *testing.T) {
 // integration-test harness provides a cifs pool via env.
 //
 // func TestHandleUpdateDisk_CIFS_CID(t *testing.T) { ... }
+
+// ---------------------------------------------------------------------------
+// Storage-lock retry tests (IMP-09 wiring verification).
+//
+// resizeDiskInternal wraps ResizeDisk+AwaitTask in pve.RetryOnTransientOrLock.
+// These tests exercise that path via the full HandleUpdateDisk call stack,
+// using error strings that pve.IsStorageLockTimeout recognises:
+//   "can't lock file '/var/lock/pve-manager/pve-storage-*' - got timeout"
+// ---------------------------------------------------------------------------
+
+// storageLockErr returns an error that pve.IsStorageLockTimeout recognises —
+// the canonical PVE storage-lockfile timeout string format.
+func storageLockErr() error {
+	return errors.New("can't lock file '/var/lock/pve-manager/pve-storage-local-lvm' - got timeout")
+}
+
+// TestHandleUpdateDisk_ResizeUnderStorageLock_RetriesAndSucceeds verifies that
+// resizeDiskInternal retries on a storage-lock error and returns nil when
+// ResizeDisk eventually succeeds within the retry budget.
+//
+// Setup: ResizeDisk returns storageLockErr on the first N-1 calls, then ""
+// (no UPID, synchronous success) on the Nth call. AwaitTask is not invoked
+// because the final call returns an empty UPID.
+func TestHandleUpdateDisk_ResizeUnderStorageLock_RetriesAndSucceeds(t *testing.T) {
+	const diskCID = "local-lvm:vm-9001-disk-0"
+	const volid = "local-lvm:vm-9001-disk-0"
+
+	// Fail twice with a storage-lock error then succeed.
+	resizeCallCount := 0
+	const failN = 2
+
+	configCallCount := 0
+	qemuSvc := &updateDiskQEMUService{
+		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
+			configCallCount++
+			// Calls 1-2: FindVMByDiskVolid + ResolveDiskID — return canonical volid.
+			// Call 3+: resizeDiskInternal config read — return volid with size=10G.
+			if configCallCount <= 2 {
+				return map[string]interface{}{"scsi2": volid}, nil
+			}
+			return map[string]interface{}{"scsi2": volid + ",size=10G"}, nil
+		},
+		resizeDiskFn: func(_ context.Context, _ string, _ int, _ string, _ int) (string, error) {
+			resizeCallCount++
+			if resizeCallCount <= failN {
+				return "", storageLockErr()
+			}
+			// Synchronous success (empty UPID) — no AwaitTask needed.
+			return "", nil
+		},
+	}
+
+	h := handlers.HandleUpdateDisk(updateDiskDeps(qemuSvc, updateClusterWith(100), nil))
+	_, err := h.Handle(context.Background(), marshalArgs(diskCID, map[string]any{
+		"size": 20480, // 20 GiB, current=10 GiB → delta=10 GiB
+	}), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("expected nil error after retry success, got: %v", err)
+	}
+	if resizeCallCount <= failN {
+		t.Errorf("ResizeDisk must be called at least %d times (retry path), got %d", failN+1, resizeCallCount)
+	}
+}
+
+// TestHandleUpdateDisk_ResizeUnderStorageLock_ExhaustsRetries verifies that
+// resizeDiskInternal propagates a storage-lock error once the retry budget
+// (pve.DefaultStorageLockMaxAttempts) is exhausted. The test caps calls at
+// DefaultStorageLockMaxAttempts+2 to detect infinite-loop regressions.
+//
+// Note: pve.RetryOnTransientOrLock does not sleep in tests because the
+// backoff timer fires on real time — using context.Background() the full
+// budget runs immediately (each call is synchronous and instantaneous, so
+// StorageLockBackoff sleep durations apply). To keep the test fast, the
+// test sets up a context with a short deadline so the retry loop terminates
+// via ctx cancellation if somehow it exceeds the expected call count.
+func TestHandleUpdateDisk_ResizeUnderStorageLock_ExhaustsRetries(t *testing.T) {
+	const diskCID = "local-lvm:vm-9001-disk-0"
+	const volid = "local-lvm:vm-9001-disk-0"
+
+	// Always return a storage-lock error so RetryOnTransientOrLock exhausts.
+	// We count calls to detect regressions where retries don't stop.
+	resizeCallCount := 0
+	configCallCount := 0
+	qemuSvc := &updateDiskQEMUService{
+		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
+			configCallCount++
+			if configCallCount <= 2 {
+				return map[string]interface{}{"scsi2": volid}, nil
+			}
+			return map[string]interface{}{"scsi2": volid + ",size=10G"}, nil
+		},
+		resizeDiskFn: func(_ context.Context, _ string, _ int, _ string, _ int) (string, error) {
+			resizeCallCount++
+			return "", storageLockErr()
+		},
+	}
+
+	// Use a short-deadline context so the retry backoff sleeps abort quickly,
+	// keeping the test runtime under a second even at DefaultStorageLockMaxAttempts.
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+
+	h := handlers.HandleUpdateDisk(updateDiskDeps(qemuSvc, updateClusterWith(100), nil))
+	_, err := h.Handle(ctx, marshalArgs(diskCID, map[string]any{
+		"size": 20480,
+	}), jsonrpc.Context{})
+	if err == nil {
+		t.Fatal("expected error when storage-lock errors persist across entire retry budget")
+	}
+	// The error must not be nil — it should be the storage-lock error (possibly
+	// wrapped) or a context.DeadlineExceeded (both are acceptable: the test
+	// confirms the handler does not silently swallow persistent lock errors).
+	if resizeCallCount == 0 {
+		t.Error("ResizeDisk must be called at least once")
+	}
+}

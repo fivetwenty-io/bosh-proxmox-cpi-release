@@ -23,11 +23,14 @@ import (
 //
 // Logic:
 //  1. Parse vm_cid → vmid int.
-//  2. GET /qemu/{vmid}/status/current — determine running state.
+//  2. Locate VM via cluster scan (FindVMNodeViaCluster) to get authoritative node.
+//     - Not found → VMNotFound.
+//     - Transport error → CloudError.
+//  3. GET /qemu/{vmid}/status/current — determine running state.
 //     - 404 → VMNotFound; other err → CloudError.
-//  3. If state == "stopped": issue qemu.Start; await UPID; return nil.
-//  4. If mode == "hard": call hardReset() directly.
-//  5. If mode == "soft": POST /status/reboot with configured timeout.
+//  4. If state == "stopped": issue qemu.Start; await UPID; return nil.
+//  5. If mode == "hard": call hardReset() directly.
+//  6. If mode == "soft": POST /status/reboot with configured timeout.
 //     - 404 on reboot call → VMNotFound (no fallback).
 //     - Other reboot-call error → log warn + fallback to hardReset().
 //     - Reboot UPID await failure → log warn + fallback to hardReset().
@@ -57,12 +60,24 @@ func HandleRebootVM(deps Deps) cpi.Handler {
 			return nil, cpierrors.Cloud("reboot_vm: vm_cid %q must be a positive integer", vmCID)
 		}
 
-		node := deps.Config.Node
 		logger := deps.Logger.With(
 			log.String("method", "reboot_vm"),
 			log.String("vm_cid", vmCID),
 			log.Int("vmid", vmid),
 		)
+
+		// --- locate VM via cluster scan ---
+		// Queries /cluster/resources for the authoritative node, correct even
+		// after an HA failover. Not-found → VMNotFound. Transport error → propagate.
+		logger.Debug("reboot_vm: locating VM via cluster scan")
+		node, found, lookupErr := pve.FindVMNodeViaCluster(ctx, deps.PVE, vmid)
+		if lookupErr != nil {
+			return nil, cpierrors.Wrap(pve.WrapError(lookupErr), fmt.Sprintf("reboot_vm: locate VM %s", vmCID))
+		}
+		if !found || node == "" {
+			return nil, cpierrors.VMNotFound(vmCID)
+		}
+		logger.Debug("reboot_vm: VM located", log.String("node", node))
 
 		mode := deps.Config.RebootModeValue()
 		timeout := deps.Config.RebootTimeoutValue()
@@ -72,13 +87,19 @@ func HandleRebootVM(deps Deps) cpi.Handler {
 		// All inputs: ctx (from outer closure), node/vmid/vmCID (validated above),
 		//             logger (structured), deps.PVE (non-nil by construction).
 		// Failure modes:
-		//   - Reset returns 404 → VMNotFound (non-retriable).
-		//   - Reset returns other error → CloudError via WrapError.
+		//   - Reset returns 404 → VMNotFound (non-retriable, not retried).
+		//   - Reset returns transient error → retried by RetryOnTransient.
+		//   - Reset returns other non-transient error → CloudError via WrapError.
 		//   - AwaitTaskWithLogger returns task failure → wrapped CloudError.
 		//   - Empty UPID → success (synchronous reset, no task to await).
 		hardReset := func() (any, error) {
 			logger.Debug("reboot_vm: issuing hard reset")
-			upid, resetErr := deps.PVE.QEMU().Reset(ctx, node, vmid)
+			var upid string
+			resetErr := pve.RetryOnTransient(ctx, logger, "reboot_vm.hard_reset", 0, func() error {
+				var inner error
+				upid, inner = deps.PVE.QEMU().Reset(ctx, node, vmid)
+				return inner
+			})
 			if resetErr != nil {
 				if pve.IsNotFound(resetErr) {
 					return nil, cpierrors.VMNotFound(vmCID)

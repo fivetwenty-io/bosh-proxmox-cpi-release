@@ -155,6 +155,23 @@ if not NETWORK_BRIDGE:
     with open(CPI_CONFIG) as f:
         NETWORK_BRIDGE = json.load(f).get("network_bridge", "vmbr0")
 
+_SDN_VNET_RE = re.compile(r'^[a-z0-9]{1,8}$')
+
+
+def validate_sdn_vnet(name: str) -> None:
+    """Validate SDN_VNET against PVE vnet naming rules: 1-8 lowercase alphanumeric chars.
+
+    Raises SystemExit with a clear message if invalid — called before any cluster mutation.
+    """
+    if not name:
+        sys.exit("SDN_VNET is empty; provide a 1-8 character lowercase alphanumeric vnet name")
+    if not _SDN_VNET_RE.match(name):
+        sys.exit(
+            f"SDN_VNET {name!r} is invalid — must be 1-8 characters, [a-z0-9] only "
+            f"(PVE vnet naming constraint)"
+        )
+
+
 # Validate mode-specific inputs up front so a misconfigured run fails before
 # touching the cluster.
 if NETWORK_TEST_MODE == "sdn":
@@ -171,6 +188,7 @@ if NETWORK_TEST_MODE == "sdn":
     ]
     if _missing:
         sys.exit(f"NETWORK_TEST_MODE=sdn requires: {', '.join(_missing)}")
+    validate_sdn_vnet(SDN_VNET)
 elif NETWORK_TEST_MODE == "bridge":
     if not BRIDGE_TEST_IFACE:
         sys.exit("NETWORK_TEST_MODE=bridge requires BRIDGE_TEST_IFACE")

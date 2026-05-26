@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	mrand "math/rand/v2"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -319,7 +320,6 @@ func createVM(
 	//    rolls back per-attempt failures whose UPID-await surfaces a
 	//    non-conflict error (PVE accepted the POST but the task itself failed).
 	// -----------------------------------------------------------------------
-	var createUPID string
 	isRetryable := func(e error) bool {
 		return pve.IsVMIDConflict(e) || pve.IsStorageLockTimeout(e) || pve.IsTransientTransport(e)
 	}
@@ -422,7 +422,10 @@ func createVM(
 				return werr
 			}
 
-			createUPID = upid
+			logger.Info("create_vm: vm disk imported",
+				log.Int("vmid_attempted", candidate),
+				log.String("upid", upid),
+			)
 			return nil
 		},
 		isRetryable,
@@ -433,7 +436,6 @@ func createVM(
 	if err != nil {
 		return nil, cpierrors.Wrap(err, "create_vm: allocate+create VM")
 	}
-	_ = createUPID
 
 	vmName := initialVMName
 	if vmName == "" {
@@ -757,33 +759,30 @@ func cleanupVM(ctx context.Context, deps Deps, node string, vmid int, logger *lo
 // --------------------------------------------------------------------------
 // sortedNetworkNames returns network names in a deterministic order.
 // "default" network (if present) is first; remaining names are alphabetical.
+//
+// The previous implementation iterated the tail of a pre-built slice that
+// already had "default" at index 0, which meant the bubble-sort only ran
+// over non-default names when "default" was present. When "default" was
+// absent the slice had no guaranteed ordering because Go map iteration is
+// randomised — bug B8. This implementation collects non-default names into
+// a fresh slice, sorts them with sort.Strings (correct O(n log n)), then
+// prepends "default" only if it exists.
 // --------------------------------------------------------------------------
 func sortedNetworkNames(networks map[string]createVMNetworkSpec) []string {
 	names := make([]string, 0, len(networks))
+	hasDefault := false
 	for n := range networks {
+		if n == "default" {
+			hasDefault = true
+			continue
+		}
 		names = append(names, n)
 	}
-	// Stable sort: "default" first, then alphabetical.
-	sorted := make([]string, 0, len(names))
-	for _, n := range names {
-		if n == "default" {
-			sorted = append([]string{n}, sorted...)
-		} else {
-			sorted = append(sorted, n)
-		}
+	sort.Strings(names)
+	if hasDefault {
+		return append([]string{"default"}, names...)
 	}
-	// Sort the non-default portion alphabetically for full determinism.
-	if len(sorted) > 1 {
-		tail := sorted[1:]
-		for i := 0; i < len(tail)-1; i++ {
-			for j := i + 1; j < len(tail); j++ {
-				if tail[i] > tail[j] {
-					tail[i], tail[j] = tail[j], tail[i]
-				}
-			}
-		}
-	}
-	return sorted
+	return names
 }
 
 // --------------------------------------------------------------------------

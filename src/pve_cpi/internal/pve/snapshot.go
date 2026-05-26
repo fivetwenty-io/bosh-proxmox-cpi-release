@@ -86,9 +86,14 @@ func WaitForSnapshotAbsent(
 	deadline := time.Now().Add(time.Duration(ao.maxWaitSeconds) * time.Second)
 
 	for {
-		names, err := HasSnapshots(ctx, client, node, vmid)
-		if err != nil {
-			return cpierrors.Wrap(err,
+		var names []string
+		retryErr := RetryOnTransient(ctx, nil, "wait_snapshot_absent_poll", 0, func() error {
+			var inner error
+			names, inner = HasSnapshots(ctx, client, node, vmid)
+			return inner
+		})
+		if retryErr != nil {
+			return cpierrors.Wrap(retryErr,
 				fmt.Sprintf("WaitForSnapshotAbsent: vm %d on node %s", vmid, node))
 		}
 		present := false

@@ -78,16 +78,18 @@ var _ qemu.Service = (*getDisksQEMUService)(nil)
 
 // ---------------------------------------------------------------------------
 // getDisksDeps builds Deps for get_disks tests.
+// The cluster mock places VMID 100 on "pve-node1" so FindVMNodeViaCluster
+// resolves and the handler proceeds to QEMU.Config. Tests exercising
+// not-found behavior (VMNotFound) use the zero-vmid variant directly.
 // ---------------------------------------------------------------------------
 
 func getDisksDeps(qemuSvc qemu.Service) handlers.Deps {
-	return handlers.Deps{
-		Config: &config.CPIConfig{
-			Node: "pve1",
-		},
-		PVE:    &mockPVEClient{qemuSvc: qemuSvc},
-		Logger: log.NewNopLogger(),
-	}
+	return testDepsFoundVM(100, qemuSvc, nil, nil, &mockAgentService{})
+}
+
+// getDisksDepsNotFound builds Deps where the cluster scan returns empty (VM absent).
+func getDisksDepsNotFound(qemuSvc qemu.Service) handlers.Deps {
+	return testDepsWithStorage(qemuSvc, nil, nil, &mockAgentService{}, &mockStorageService{})
 }
 
 // ---------------------------------------------------------------------------
@@ -214,14 +216,25 @@ func TestHandleGetDisks_TooFewArgs(t *testing.T) {
 }
 
 func TestHandleGetDisks_MissingNode(t *testing.T) {
+	// With cluster-scan-based node resolution, a missing Config.Node is no longer
+	// an error: the node is resolved from the cluster scan. When the cluster scan
+	// returns not-found (empty list), the handler returns VMNotFound. This test
+	// verifies that a missing Config.Node with a VM absent from the cluster returns
+	// a VMNotFound error rather than panicking.
 	h := handlers.HandleGetDisks(handlers.Deps{
 		Config: &config.CPIConfig{Node: ""},
-		PVE:    &mockPVEClient{qemuSvc: &getDisksQEMUService{}},
+		PVE: &mockPVEClient{
+			qemuSvc:    &getDisksQEMUService{},
+			clusterSvc: &mockClusterSvc{}, // empty: VM 100 not found
+		},
 		Logger: log.NewNopLogger(),
 	})
 	_, err := h.Handle(context.Background(), marshalArgs("100"), jsonrpc.Context{})
 	if err == nil {
-		t.Fatal("expected error for missing node")
+		t.Fatal("expected VMNotFound when Config.Node is empty and cluster scan finds nothing")
+	}
+	if !cpierrors.IsType(err, cpierrors.TypeVMNotFound) {
+		t.Errorf("error type: want VMNotFound, got %T %v", err, err)
 	}
 }
 

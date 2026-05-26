@@ -259,6 +259,61 @@ func TestMethods_Count22(t *testing.T) {
 }
 
 // --------------------------------------------------------------------------
+// --------------------------------------------------------------------------
+// TestDispatcher_ConcurrentRegisterHandle_NoDataRace
+//
+// Runs Register and Handle concurrently across multiple goroutines to verify
+// no data race occurs under the -race detector. This test is meaningful only
+// with `go test -race`; without the race detector it simply confirms correct
+// results are returned without panics.
+// --------------------------------------------------------------------------
+
+func TestDispatcher_ConcurrentRegisterHandle_NoDataRace(t *testing.T) {
+	d := cpi.NewDispatcher(nopLogger())
+
+	const goroutines = 20
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		// Writer goroutines: concurrently register handlers.
+		writers := make(chan struct{}, goroutines)
+		for i := 0; i < goroutines; i++ {
+			go func(n int) {
+				defer func() { writers <- struct{}{} }()
+				method := "info"
+				if n%2 == 0 {
+					method = "create_stemcell"
+				}
+				d.Register(method, cpi.HandlerFunc(func(_ context.Context, _ []json.RawMessage, _ jsonrpc.Context) (any, error) {
+					return map[string]int{"n": n}, nil
+				}))
+			}(i)
+		}
+		// Reader goroutines: concurrently call Handle.
+		readers := make(chan struct{}, goroutines)
+		for i := 0; i < goroutines; i++ {
+			go func(n int) {
+				defer func() { readers <- struct{}{} }()
+				method := "has_vm"
+				if n%3 == 0 {
+					method = "info"
+				}
+				resp := d.Handle(context.Background(), makeReq(method))
+				if resp == nil {
+					t.Errorf("goroutine %d: Handle returned nil", n)
+				}
+			}(i)
+		}
+		for i := 0; i < goroutines; i++ {
+			<-writers
+		}
+		for i := 0; i < goroutines; i++ {
+			<-readers
+		}
+	}()
+	<-done
+}
+
 // TestHandle_ResultMarshalError
 // --------------------------------------------------------------------------
 

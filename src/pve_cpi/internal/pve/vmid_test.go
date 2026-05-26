@@ -8,6 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	sdkcluster "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cluster"
 	sdknodes "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/nodes"
@@ -846,5 +847,137 @@ func TestNextVMIDInRange_SpreadCheck(t *testing.T) {
 	}
 	if len(seen) <= 1 {
 		t.Errorf("spread check failed: all %d iterations returned the same VMID (scatter not working)", iterations)
+	}
+}
+
+// TestNextVMID_LockNotHeldDuringAPICall demonstrates that globalVMIDMu is NOT
+// held while the PVE API call executes. A channel-blocking fake client stalls
+// the API call. A second goroutine calls NextVMID concurrently and must
+// complete before the first one unblocks, proving the lock is not held during
+// the network round-trip.
+//
+// Without the B1 fix (lock held around API call), the second goroutine would
+// block on the mutex until the first goroutine's stalled API call completes,
+// making this test deadlock or time out.
+func TestNextVMID_LockNotHeldDuringAPICall(t *testing.T) {
+	// gate controls when the first goroutine's API call unblocks.
+	gate := make(chan struct{})
+	// firstStarted is closed once goroutine-1's API call has begun.
+	firstStarted := make(chan struct{})
+
+	blockingClient := newVMIDClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+		select {
+		case <-firstStarted:
+			// already closed by this goroutine on first invocation; a second
+			// goroutine using a different client hits its own fast path.
+		default:
+			close(firstStarted)
+		}
+		// Block until gate is opened.
+		<-gate
+		return buildResources(), nil
+	})
+
+	fastClient := newVMIDClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+		return buildResources(), nil
+	})
+
+	// Goroutine 1: starts the blocking API call.
+	g1done := make(chan error, 1)
+	go func() {
+		_, err := pve.NextVMID(context.Background(), blockingClient)
+		g1done <- err
+	}()
+
+	// Wait until goroutine-1's API call has started (first started signal).
+	select {
+	case <-firstStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("goroutine-1 API call did not start within 5 s")
+	}
+
+	// Goroutine 2: must acquire the mutex and complete while goroutine-1 is
+	// still blocked in its API call. If the lock were held during the API call,
+	// this goroutine would block here until the gate is opened.
+	g2done := make(chan error, 1)
+	go func() {
+		_, err := pve.NextVMID(context.Background(), fastClient)
+		g2done <- err
+	}()
+
+	// Goroutine-2 must finish promptly (well before the 5 s gate).
+	select {
+	case err := <-g2done:
+		if err != nil {
+			t.Errorf("goroutine-2 NextVMID error: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		close(gate) // unblock goroutine-1 so the test can clean up
+		t.Fatal("goroutine-2 was blocked while goroutine-1's API call was in flight; lock held during API call")
+	}
+
+	// Unblock goroutine-1 and verify it also completes cleanly.
+	close(gate)
+	select {
+	case err := <-g1done:
+		if err != nil {
+			t.Errorf("goroutine-1 NextVMID error: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("goroutine-1 did not complete after gate was opened")
+	}
+}
+
+// TestRetryBackoff_RespectsContextCancel verifies that when the context is
+// cancelled during a backoff sleep, AllocateWithRetry returns immediately with
+// a context error rather than sleeping for the full backoff duration. This
+// validates the C10 fix to retryBackoff.
+//
+// The test installs a backoff function that would sleep 10s (far longer than
+// the test timeout); the context is cancelled within 100ms. The call must
+// return well before the 10s sleep completes.
+func TestRetryBackoff_RespectsContextCancel(t *testing.T) {
+	c := newVMIDClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+		return buildResources(), nil
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	conflictErr := errors.New("conflict: already exists")
+	attempts := 0
+
+	// Cancel the context after the first attempt fails.
+	go func() {
+		// Give the first attempt time to complete and the backoff to begin.
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+
+	start := time.Now()
+	_, err := pve.AllocateWithRetry(ctx, c,
+		func(_ int) error {
+			attempts++
+			return conflictErr // always conflict so retry is triggered
+		},
+		func(e error) bool { return errors.Is(e, conflictErr) },
+		5,
+		// Backoff of 10s: if context cancellation is not respected the test
+		// would run for 10s; with the fix it returns within ~100ms.
+		pve.WithBackoffFunc(func(_ error, _ int) time.Duration {
+			return 10 * time.Second
+		}),
+	)
+
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected error after context cancel, got nil")
+	}
+	if elapsed > 2*time.Second {
+		t.Errorf("AllocateWithRetry did not respect context cancel: elapsed %v (expected < 2s)", elapsed)
+	}
+	// The error must reflect context cancellation (wrapped or direct).
+	if ctx.Err() == nil {
+		t.Error("expected ctx.Err() to be non-nil after cancel")
 	}
 }

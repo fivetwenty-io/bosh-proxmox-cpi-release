@@ -10,18 +10,40 @@ import (
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
+	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cluster"
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/nodes"
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/tasks"
 )
 
 // testDepsReboot builds Deps with the given qemu/nodes/tasks mocks and
 // reboot_mode/reboot_timeout from the provided config overrides.
+//
+// The cluster service is wired with a default that places vmid 101 on
+// "pve-node1" so that FindVMNodeViaCluster (called by the reboot handler)
+// resolves correctly for the standard test VMID. Tests that need to control
+// the cluster-scan result (e.g., VM-not-found from the cluster scan itself)
+// must call testDepsRebootCluster instead.
 func testDepsReboot(
 	qemuSvc *mockQEMUService,
 	nodesSvc *mockNodesService,
 	tasksSvc *mockTasksService,
 	mode string,
 	timeout int,
+) handlers.Deps {
+	return testDepsRebootCluster(qemuSvc, nodesSvc, tasksSvc, mode, timeout,
+		defaultClusterSvc(101, "pve-node1"))
+}
+
+// testDepsRebootCluster is testDepsReboot with an explicit cluster service.
+// Use when a test needs to control FindVMNodeViaCluster behaviour (e.g.,
+// returning not-found or a transport error from the cluster scan).
+func testDepsRebootCluster(
+	qemuSvc *mockQEMUService,
+	nodesSvc *mockNodesService,
+	tasksSvc *mockTasksService,
+	mode string,
+	timeout int,
+	clusterSvc cluster.Service,
 ) handlers.Deps {
 	cfg := testConfig()
 	if mode != "" {
@@ -44,9 +66,10 @@ func testDepsReboot(
 	return handlers.Deps{
 		Config: cfg,
 		PVE: &mockPVEClient{
-			qemuSvc:  qemuSvc,
-			nodesSvc: ns,
-			tasksSvc: ts,
+			qemuSvc:    qemuSvc,
+			nodesSvc:   ns,
+			tasksSvc:   ts,
+			clusterSvc: clusterSvc,
 		},
 		Agent:  &mockAgentService{},
 		Logger: log.NewNopLogger(),
@@ -531,5 +554,52 @@ func TestHandleRebootVM_SoftEmptyUPID(t *testing.T) {
 	}
 	if resetCalled {
 		t.Error("Reset was unexpectedly called for empty UPID synchronous reboot")
+	}
+}
+
+// --------------------------------------------------------------------------
+// m. Hard reset retries on transient error: Reset fails once with HTTP 596
+//    (transient), then succeeds; overall result is success after retry.
+// --------------------------------------------------------------------------
+
+func TestHandleRebootVM_HardReset_RetriesOnTransient(t *testing.T) {
+	t.Parallel()
+
+	resetAttempts := 0
+
+	qemuSvc := &mockQEMUService{
+		statusFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
+			return map[string]interface{}{"status": "running"}, nil
+		},
+		resetFn: func(_ context.Context, _ string, _ int) (string, error) {
+			resetAttempts++
+			if resetAttempts == 1 {
+				// First attempt: transient error (pvedaemon worker recycle).
+				return "", errors.New("reset failed (code: 596)")
+			}
+			// Second attempt: success.
+			return "UPID:node:reset-ok", nil
+		},
+	}
+	tasksSvc := &mockTasksService{
+		waitFn: func(_ context.Context, _, upid string, _ *tasks.WaitOptions) (*tasks.Status, error) {
+			if upid != "UPID:node:reset-ok" {
+				t.Errorf("Wait: unexpected upid %q", upid)
+			}
+			return &tasks.Status{ExitStatus: "OK"}, nil
+		},
+	}
+
+	h := handlers.HandleRebootVM(testDepsReboot(qemuSvc, nil, tasksSvc, "hard", 60))
+	result, err := h.Handle(context.Background(), marshalArgs("101"), jsonrpc.Context{})
+
+	if err != nil {
+		t.Fatalf("unexpected error after transient retry: %v", err)
+	}
+	if result != nil {
+		t.Errorf("expected nil result, got %v", result)
+	}
+	if resetAttempts < 2 {
+		t.Errorf("expected at least 2 reset attempts (1 transient + 1 success), got %d", resetAttempts)
 	}
 }

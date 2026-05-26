@@ -8,7 +8,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -22,6 +21,13 @@ import (
 
 	sdkclient "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/client"
 )
+
+// MaxStemcellTotalExtract caps cumulative extracted bytes from a stemcell
+// tarball. A stemcell tarball contains one disk image (typically 3-10 GiB
+// compressed to ~700 MiB) plus small metadata files. 32 GiB is a hard upper
+// bound above any real stemcell; exceeding it indicates a tar-bomb or
+// corrupted archive.
+const MaxStemcellTotalExtract = 32 * 1024 * 1024 * 1024 // 32 GiB
 
 // normalizeOSType maps common BOSH/stemcell os_type values to PVE's enumerated
 // ostype set (other, wxp, w2k, w2k3, w2k8, wvista, win7-11, l24, l26, solaris).
@@ -126,7 +132,7 @@ func parseStemcellCloudProps(cp map[string]any) stemcellCloudProps {
 //
 // Returns: stemcell_cid string — "<storage>:import/<filename>" (e.g. "stemcell-store:import/bosh-stemcell-ubuntu-jammy-1.438-a1b2c3d4.qcow2").
 //
-// Thirteen-step direct-upload flow:
+// Eleven-step direct-upload flow:
 //
 //  1. Validate args[0] image_path.
 //  2. Parse cloud_properties → stemcellCloudProps.
@@ -233,7 +239,7 @@ func HandleCreateStemcell(deps Deps) cpi.Handler {
 		// ----------------------------------------------------------------
 		// Step 6: Resolve disk image (extract from tarball if needed)
 		// ----------------------------------------------------------------
-		uploadSourcePath, cleanupExtract, detectedFormat, detectErr := resolveStemcellImage(
+		uploadSourcePath, cleanupExtract, detectedFormat, extractedSHA, detectErr := resolveStemcellImage(
 			imagePath, cp.DiskFormat, deps.Logger)
 		if detectErr != nil {
 			return nil, cpierrors.Wrap(detectErr, "create_stemcell: resolve image")
@@ -249,11 +255,18 @@ func HandleCreateStemcell(deps Deps) cpi.Handler {
 		}
 
 		// ----------------------------------------------------------------
-		// Step 7: Compute SHA-256 of resolved disk image
+		// Step 7: Obtain SHA-256 of resolved disk image
 		// ----------------------------------------------------------------
-		sha256hex, hashErr := sha256FilePath(uploadSourcePath)
-		if hashErr != nil {
-			return nil, cpierrors.Wrap(hashErr, "create_stemcell: compute sha256")
+		// For tarball inputs resolveStemcellImage computed the SHA via TeeReader
+		// during the single extraction pass. For bare images (qcow2 magic, raw
+		// passthrough) extractedSHA is empty and a second-pass file read is used.
+		sha256hex := extractedSHA
+		if sha256hex == "" {
+			var hashErr error
+			sha256hex, hashErr = sha256FilePath(uploadSourcePath)
+			if hashErr != nil {
+				return nil, cpierrors.Wrap(hashErr, "create_stemcell: compute sha256")
+			}
 		}
 
 		// ----------------------------------------------------------------
@@ -269,7 +282,7 @@ func HandleCreateStemcell(deps Deps) cpi.Handler {
 		)
 
 		// ----------------------------------------------------------------
-		// Step 11: Dedup — skip upload if volume already present
+		// Step 10: Dedup — skip upload if volume already present
 		// ----------------------------------------------------------------
 		existing, findErr := pve.FindStemcellByFilename(ctx, deps.PVE, node, storage, qcow2Filename)
 		if findErr != nil {
@@ -285,7 +298,7 @@ func HandleCreateStemcell(deps Deps) cpi.Handler {
 		}
 
 		// ----------------------------------------------------------------
-		// Step 12: Upload qcow2 image
+		// Step 11: Upload qcow2 image
 		// ----------------------------------------------------------------
 		if uploadErr := uploadStemcellImage(ctx, deps, node, storage, qcow2Filename, uploadSourcePath); uploadErr != nil {
 			return nil, cpierrors.Wrap(uploadErr, "create_stemcell: upload qcow2")
@@ -367,7 +380,7 @@ func clusterNodeCount(ctx context.Context, deps Deps) (int, error) {
 	}
 	resp, err := deps.PVE.Cluster().ListConfigNodes(ctx)
 	if err != nil {
-		return 0, fmt.Errorf("clusterNodeCount: list cluster config nodes: %w", err)
+		return 0, cpierrors.Wrap(err, "clusterNodeCount: list cluster config nodes")
 	}
 	if resp == nil {
 		return 0, nil
@@ -384,12 +397,17 @@ func clusterNodeCount(ctx context.Context, deps Deps) (int, error) {
 // bytes ("qcow2" or "raw"). When the input is already a bare disk image
 // (not a tarball), detectedFormat is also inferred from its magic.
 // An empty detectedFormat means "could not infer; caller should fall back".
-func resolveStemcellImage(imagePath, defaultFormat string, logger *log.Logger) (string, func(), string, error) {
+//
+// extractedSHA256hex is the hex-encoded SHA-256 of the selected disk image
+// computed during tarball extraction via TeeReader (single pass). The caller
+// uses this value directly and skips a second file-read pass. An empty string
+// is returned for the non-tarball path; the caller must call sha256FilePath.
+func resolveStemcellImage(imagePath, defaultFormat string, logger *log.Logger) (path string, cleanup func(), detectedFormat string, extractedSHA256hex string, err error) {
 	noop := func() {}
 
-	f, err := os.Open(imagePath)
-	if err != nil {
-		return "", noop, "", cpierrors.Cloud("resolveStemcellImage: open %s: %s", imagePath, err.Error())
+	f, openErr := os.Open(imagePath)
+	if openErr != nil {
+		return "", noop, "", "", cpierrors.Cloud("resolveStemcellImage: open %s: %s", imagePath, openErr.Error())
 	}
 	defer func() { _ = f.Close() }()
 
@@ -398,19 +416,19 @@ func resolveStemcellImage(imagePath, defaultFormat string, logger *log.Logger) (
 	n, _ := io.ReadFull(f, head)
 	head = head[:n]
 
-	// Bare QCOW2 magic: 'Q','F','I',0xFB
+	// Bare QCOW2 magic: 'Q','F','I',0xFB. SHA computed by caller (direct pass).
 	if n >= 4 && head[0] == 'Q' && head[1] == 'F' && head[2] == 'I' && head[3] == 0xFB {
-		return imagePath, noop, "qcow2", nil
+		return imagePath, noop, "qcow2", "", nil
 	}
 
 	// Gzip magic: 0x1F 0x8B
 	if n >= 2 && head[0] == 0x1F && head[1] == 0x8B {
-		if _, err := f.Seek(0, io.SeekStart); err != nil {
-			return "", noop, "", cpierrors.Cloud("resolveStemcellImage: seek: %s", err.Error())
+		if _, seekErr := f.Seek(0, io.SeekStart); seekErr != nil {
+			return "", noop, "", "", cpierrors.Cloud("resolveStemcellImage: seek: %s", seekErr.Error())
 		}
-		gz, err := gzip.NewReader(f)
-		if err != nil {
-			return "", noop, "", cpierrors.Cloud("resolveStemcellImage: gzip: %s", err.Error())
+		gz, gzErr := gzip.NewReader(f)
+		if gzErr != nil {
+			return "", noop, "", "", cpierrors.Cloud("resolveStemcellImage: gzip: %s", gzErr.Error())
 		}
 		defer func() { _ = gz.Close() }()
 
@@ -418,14 +436,25 @@ func resolveStemcellImage(imagePath, defaultFormat string, logger *log.Logger) (
 		// Find the largest regular file ending in .img (or just the first
 		// regular file if no .img is present). Stemcells contain root.img
 		// alongside small manifest files.
-		tmpDir, err := os.MkdirTemp("", "bosh-stemcell-extract-")
-		if err != nil {
-			return "", noop, "", cpierrors.Cloud("resolveStemcellImage: mktemp: %s", err.Error())
+		tmpDir, mkErr := os.MkdirTemp("", "bosh-stemcell-extract-")
+		if mkErr != nil {
+			return "", noop, "", "", cpierrors.Cloud("resolveStemcellImage: mktemp: %s", mkErr.Error())
 		}
 		cleanup := func() { _ = os.RemoveAll(tmpDir) }
 
-		var imgPath string
-		var imgSize int64
+		// tarCandidate records a file extracted from the tarball that may be
+		// the disk image. Two-pass selection: pass 1 extracts all candidates
+		// and computes each one's SHA-256 via TeeReader during the single copy;
+		// pass 2 selects by preference order and returns the winner's pre-computed
+		// SHA so the caller skips a second file-read pass.
+		type tarCandidate struct {
+			path      string
+			size      int64
+			isImg     bool   // true when name ends in .img
+			sha256hex string // hex-encoded SHA-256 computed during extraction
+		}
+		var candidates []tarCandidate
+		var totalExtracted int64
 		for {
 			hdr, terr := tr.Next()
 			if terr == io.EOF {
@@ -433,66 +462,139 @@ func resolveStemcellImage(imagePath, defaultFormat string, logger *log.Logger) (
 			}
 			if terr != nil {
 				cleanup()
-				return "", noop, "", cpierrors.Cloud("resolveStemcellImage: tar: %s", terr.Error())
+				return "", noop, "", "", cpierrors.Cloud("resolveStemcellImage: tar: %s", terr.Error())
 			}
 			if hdr.Typeflag != tar.TypeReg {
 				continue
 			}
 			name := filepath.Base(hdr.Name)
-			isImg := strings.HasSuffix(strings.ToLower(name), ".img") || name == "root.img"
-			// Skip obviously-not-disk small files.
+			isImg := strings.HasSuffix(strings.ToLower(name), ".img")
+			// Skip obviously-not-disk small files that are neither .img nor large.
 			if !isImg && hdr.Size < 1024*1024 {
 				continue
+			}
+			// Tar-bomb guard: reject archives whose candidate entries sum to
+			// more than MaxStemcellTotalExtract before any extraction begins.
+			// hdr.Size is the declared size from the tar header; a malicious
+			// archive could lie, so we also track actual written bytes below.
+			totalExtracted += hdr.Size
+			if totalExtracted > MaxStemcellTotalExtract {
+				cleanup()
+				return "", noop, "", "", cpierrors.Cloud(
+					"create_stemcell: tarball entries exceed maximum %dGB; refusing to extract",
+					MaxStemcellTotalExtract/(1024*1024*1024))
 			}
 			dst := filepath.Join(tmpDir, name)
 			out, oerr := os.Create(dst)
 			if oerr != nil {
 				cleanup()
-				return "", noop, "", cpierrors.Cloud("resolveStemcellImage: create %s: %s", dst, oerr.Error())
+				return "", noop, "", "", cpierrors.Cloud("resolveStemcellImage: create %s: %s", dst, oerr.Error())
 			}
-			if _, cerr := io.Copy(out, tr); cerr != nil {
+			h := sha256.New()
+			tee := io.TeeReader(tr, h)
+			if _, cerr := io.Copy(out, tee); cerr != nil {
 				_ = out.Close()
 				cleanup()
-				return "", noop, "", cpierrors.Cloud("resolveStemcellImage: copy %s: %s", dst, cerr.Error())
+				return "", noop, "", "", cpierrors.Cloud("resolveStemcellImage: copy %s: %s", dst, cerr.Error())
 			}
 			_ = out.Close()
-			if hdr.Size > imgSize {
-				imgPath = dst
-				imgSize = hdr.Size
+			candidates = append(candidates, tarCandidate{
+				path:      dst,
+				size:      hdr.Size,
+				isImg:     isImg,
+				sha256hex: hex.EncodeToString(h.Sum(nil)),
+			})
+		}
+		if len(candidates) == 0 {
+			cleanup()
+			return "", noop, "", "", cpierrors.Cloud("resolveStemcellImage: no disk image inside tarball %s", imagePath)
+		}
+
+		// Pass 2: prefer largest .img file; fall back to largest non-.img.
+		// "root.img" is a standard BOSH stemcell name and is preferred if
+		// multiple .img files share the same size.
+		var imgPath string
+		var imgSHA string
+		var imgSize int64
+		var fallbackPath string
+		var fallbackSHA string
+		var fallbackSize int64
+		for _, c := range candidates {
+			if c.isImg {
+				if c.size > imgSize ||
+					(c.size == imgSize && filepath.Base(c.path) == "root.img") {
+					imgPath = c.path
+					imgSHA = c.sha256hex
+					imgSize = c.size
+				}
+			} else {
+				if c.size > fallbackSize {
+					fallbackPath = c.path
+					fallbackSHA = c.sha256hex
+					fallbackSize = c.size
+				}
 			}
 		}
 		if imgPath == "" {
-			cleanup()
-			return "", noop, "", cpierrors.Cloud("resolveStemcellImage: no disk image inside tarball %s", imagePath)
+			// No .img found; use largest non-.img candidate.
+			imgPath = fallbackPath
+			imgSHA = fallbackSHA
 		}
 
-		// Detect format of extracted file via magic bytes. Read only the
-		// first 4 bytes — qcow2 magic is QFI\xFB — instead of slurping the
-		// entire (multi-GB) disk image into memory, which previously OOM'd
-		// resource-constrained directors (D-07).
+		// Detect format and validate magic bytes. Read only the first 4 bytes
+		// to avoid OOM on multi-GB images. Accepted signatures:
+		//   qcow2  — 'Q','F','I',0xFB
+		//   gzip   — 0x1F,0x8B (compressed raw; treat as raw)
+		//   lz4    — 0x04,0x22,0x4D,0x18
+		//   raw    — any other non-zero content of sufficient size (>= 1 MiB)
+		//
+		// Files that do not match any known signature are rejected to prevent
+		// accidentally uploading a manifest or other metadata file as the disk.
 		format := defaultFormat
 		if mf, merr := os.Open(imgPath); merr == nil {
 			var magic [4]byte
-			if _, rerr := io.ReadFull(mf, magic[:]); rerr == nil {
-				if magic[0] == 'Q' && magic[1] == 'F' && magic[2] == 'I' && magic[3] == 0xFB {
-					format = "qcow2"
-				} else {
-					format = "raw"
-				}
-			}
+			n, rerr := io.ReadFull(mf, magic[:])
 			_ = mf.Close()
+			if rerr != nil && n < 2 {
+				cleanup()
+				return "", noop, "", "", cpierrors.Cloud(
+					"create_stemcell: extracted image at %s is too small to identify (read %d bytes)",
+					imgPath, n)
+			}
+			switch {
+			case magic[0] == 'Q' && magic[1] == 'F' && magic[2] == 'I' && magic[3] == 0xFB:
+				format = "qcow2"
+			case magic[0] == 0x1F && magic[1] == 0x8B:
+				// Nested gzip inside a tar — treat as raw; PVE handles decompression.
+				format = "raw"
+			case n >= 4 && magic[0] == 0x04 && magic[1] == 0x22 && magic[2] == 0x4D && magic[3] == 0x18:
+				// LZ4 frame magic.
+				format = "raw"
+			default:
+				// Require the file to be a known .img or large enough to plausibly
+				// be a raw disk. If neither, it likely is not a disk image.
+				fi, sterr := os.Stat(imgPath)
+				if sterr != nil || fi.Size() < 1024*1024 {
+					cleanup()
+					return "", noop, "", "", cpierrors.Cloud(
+						"create_stemcell: extracted image at %s has unknown magic bytes %x; expected qcow2/gzip/lz4/raw",
+						imgPath, magic[:n])
+				}
+				format = "raw"
+			}
 		}
 		logger.Info("resolveStemcellImage: extracted",
 			log.String("source", imagePath),
 			log.String("disk", imgPath),
 			log.String("format", format),
+			log.String("sha256", imgSHA),
 		)
-		return imgPath, cleanup, format, nil
+		return imgPath, cleanup, format, imgSHA, nil
 	}
 
-	// Not gzip, not qcow2 magic — treat as raw disk image.
+	// Not gzip, not qcow2 magic — treat as raw disk image. SHA computed by caller.
 	logger.Info("resolveStemcellImage: passthrough as raw", log.String("source", imagePath))
-	return imagePath, noop, "raw", nil
+	return imagePath, noop, "raw", "", nil
 }
 
 // sha256FilePath returns the hex-encoded SHA-256 of the file at path.

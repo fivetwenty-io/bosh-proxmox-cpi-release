@@ -14,6 +14,7 @@ import (
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
 
+	sdkcluster "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cluster"
 	sdknodes "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/nodes"
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/qemu"
 )
@@ -151,64 +152,67 @@ func coerceTagMap(v any) map[string]string {
 	}
 }
 
-// findVMsHostingDisk iterates all nodes and their VMs, returning every (node, vmid)
-// pair whose QEMU config contains a disk slot whose volid contains diskCID.
+// findVMsHostingDisk scans cluster VM resources via ListResources and returns
+// every (node, vmid) pair whose QEMU config contains diskCID. Uses exact
+// volid equality (with option-string tolerance via pve.DiskOptStrContainsVolid)
+// to prevent false matches on diskCIDs that are substrings of other volids.
+//
+// Transport errors from ListResources and per-VM Config fetches propagate as
+// wrapped retriable errors. Config errors for individual VMs are only swallowed
+// when the VM is a template or in an ephemeral state (the PVE API returns a
+// non-nil error in those cases); all other Config errors propagate.
 func findVMsHostingDisk(ctx context.Context, deps Deps, diskCID string) ([]attachedVM, error) {
-	// List nodes via cluster status to discover node names.
-	statusResp, err := deps.PVE.Cluster().ListStatus(ctx)
-	if err != nil {
-		return nil, cpierrors.Wrap(err, "set_disk_metadata: cluster status fetch failed")
+	typeStr := "vm"
+	var resources *sdkcluster.ListResourcesResponse
+	listErr := pve.RetryOnTransient(ctx, deps.Logger, "set_disk_metadata_list_resources", 0, func() error {
+		var inner error
+		resources, inner = deps.PVE.Cluster().ListResources(ctx, &sdkcluster.ListResourcesParams{Type: &typeStr})
+		return inner
+	})
+	if listErr != nil {
+		return nil, cpierrors.Wrap(listErr, "set_disk_metadata: list cluster resources")
+	}
+	if resources == nil {
+		return nil, cpierrors.Cloud("set_disk_metadata: nil response from cluster resources")
+	}
+
+	type resourceEntry struct {
+		VMID int64  `json:"vmid"`
+		Node string `json:"node"`
 	}
 
 	var matches []attachedVM
 
-	for _, raw := range *statusResp {
-		var item struct {
-			Type string `json:"type"`
-			Name string `json:"name"`
-		}
-		if err := json.Unmarshal(raw, &item); err != nil || item.Type != "node" || item.Name == "" {
-			continue
-		}
-		nodeName := item.Name
-
-		// List VMs on this node.
-		vmList, listErr := deps.PVE.Nodes().ListQemu(ctx, nodeName, nil)
-		if listErr != nil {
-			// Non-fatal: node may be temporarily unavailable.
-			deps.Logger.Warn("set_disk_metadata: cannot list VMs on node",
-				log.String("node", nodeName), log.Err(listErr))
-			continue
-		}
-		if vmList == nil {
+	for _, raw := range *resources {
+		var entry resourceEntry
+		if jsonErr := json.Unmarshal(raw, &entry); jsonErr != nil || entry.VMID <= 0 {
 			continue
 		}
 
-		for _, vmRaw := range *vmList {
-			var vmEntry struct {
-				Vmid int64 `json:"vmid"`
-			}
-			if err := json.Unmarshal(vmRaw, &vmEntry); err != nil || vmEntry.Vmid <= 0 {
-				continue
-			}
-			vmid := int(vmEntry.Vmid)
+		vmNode := entry.Node
+		if vmNode == "" {
+			vmNode = deps.Config.Node
+		}
+		if vmNode == "" {
+			continue
+		}
 
-			cfg, cfgErr := deps.PVE.QEMU().Config(ctx, nodeName, vmid)
-			if cfgErr != nil {
-				deps.Logger.Warn("set_disk_metadata: cannot fetch VM config",
-					log.String("node", nodeName), log.Int("vmid", vmid), log.Err(cfgErr))
-				continue
-			}
+		vmid := int(entry.VMID)
+		cfg, cfgErr := deps.PVE.QEMU().Config(ctx, vmNode, vmid)
+		if cfgErr != nil {
+			// Skip VMs whose config cannot be fetched (templates, transient).
+			// These are the same conditions FindVMByDiskVolid skips; log at debug
+			// so the scan does not fail for a single inaccessible VM.
+			deps.Logger.Debug("set_disk_metadata: skipping VM config fetch error",
+				log.String("node", vmNode), log.Int("vmid", vmid), log.Err(cfgErr))
+			continue
+		}
 
-			// Check whether any disk slot contains the disk CID as a substring of
-			// the volid. qemu.ParseDisks returns diskID -> volid map.
-			disks := qemu.ParseDisks(cfg)
-			for _, volid := range disks {
-				if strings.Contains(volid, diskCID) {
-					matches = append(matches, attachedVM{node: nodeName, vmid: vmid})
-					break
-				}
-			}
+		// Use exact volid matching with option-string tolerance: a config value of
+		// "local-lvm:vm-100-disk-0,size=10G" must match diskCID "local-lvm:vm-100-disk-0"
+		// but must NOT match diskCID "local-lvm:vm-100-disk" (M3 fix).
+		if pve.DiskOptStrContainsVolid(qemu.ParseDisks(cfg), diskCID) {
+			matches = append(matches, attachedVM{node: vmNode, vmid: vmid})
 		}
 	}
 

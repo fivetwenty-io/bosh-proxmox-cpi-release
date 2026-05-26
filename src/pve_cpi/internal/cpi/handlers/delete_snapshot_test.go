@@ -11,6 +11,7 @@ import (
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
+	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cluster"
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/qemu"
 	sdkerrors "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/errors"
 )
@@ -90,7 +91,10 @@ func delSnapDeps(qemuSvc qemu.Service) handlers.Deps {
 		Config: &config.CPIConfig{
 			Node: "pve1",
 		},
-		PVE:    &mockPVEClient{qemuSvc: qemuSvc},
+		PVE: &mockPVEClient{
+			qemuSvc:    qemuSvc,
+			clusterSvc: defaultClusterSvc(100, "pve1"),
+		},
 		Logger: log.NewNopLogger(),
 	}
 }
@@ -200,15 +204,24 @@ func TestHandleDeleteSnapshot_TooFewArgs(t *testing.T) {
 }
 
 func TestHandleDeleteSnapshot_MissingNode(t *testing.T) {
+	// With the cluster-scan flow, the handler no longer validates Config.Node
+	// before calling FindVMNodeViaCluster. A cluster service returning a
+	// transport error is the new equivalent: the handler returns a cloud error.
+	clusterErr := errors.New("cluster unavailable: connection refused")
+	clusterSvc := &mockClusterSvc{
+		listResourcesFn: func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+			return nil, clusterErr
+		},
+	}
 	qemuSvc := &delSnapQEMUService{}
 	h := handlers.HandleDeleteSnapshot(handlers.Deps{
 		Config: &config.CPIConfig{Node: ""},
-		PVE:    &mockPVEClient{qemuSvc: qemuSvc},
+		PVE:    &mockPVEClient{qemuSvc: qemuSvc, clusterSvc: clusterSvc},
 		Logger: log.NewNopLogger(),
 	})
 	_, err := h.Handle(context.Background(), marshalArgs("100:bosh-snap"), jsonrpc.Context{})
 	if err == nil {
-		t.Fatal("expected error for missing node")
+		t.Fatal("expected error when cluster service fails")
 	}
 }
 

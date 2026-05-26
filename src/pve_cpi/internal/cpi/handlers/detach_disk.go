@@ -47,23 +47,23 @@ func HandleDetachDisk(deps Deps) Handler {
 		// 1. Unmarshal and validate arguments.
 		// --------------------------------------------------------------------
 		if len(args) < 2 {
-			return nil, fmt.Errorf("detach_disk: expected 2 arguments (vm_cid, disk_cid), got %d", len(args))
+			return nil, cpierrors.Cloud("detach_disk: expected 2 arguments (vm_cid, disk_cid), got %d", len(args))
 		}
 
 		var vmCID string
 		if err := json.Unmarshal(args[0], &vmCID); err != nil {
-			return nil, fmt.Errorf("detach_disk: args[0] vm_cid must be a string: %w", err)
+			return nil, cpierrors.Wrap(err, "detach_disk: args[0] vm_cid must be a string")
 		}
 		if vmCID == "" {
-			return nil, fmt.Errorf("detach_disk: args[0] vm_cid must not be empty")
+			return nil, cpierrors.Cloud("detach_disk: args[0] vm_cid must not be empty")
 		}
 
 		var diskCID string
 		if err := json.Unmarshal(args[1], &diskCID); err != nil {
-			return nil, fmt.Errorf("detach_disk: args[1] disk_cid must be a string: %w", err)
+			return nil, cpierrors.Wrap(err, "detach_disk: args[1] disk_cid must be a string")
 		}
 		if diskCID == "" {
-			return nil, fmt.Errorf("detach_disk: args[1] disk_cid must not be empty")
+			return nil, cpierrors.Cloud("detach_disk: args[1] disk_cid must not be empty")
 		}
 
 		// --------------------------------------------------------------------
@@ -86,7 +86,7 @@ func HandleDetachDisk(deps Deps) Handler {
 		// form, which is the disk_cid as-is.
 		backend, err := backendResolverOrDefault(deps).Resolve(ctx, storage)
 		if err != nil {
-			return nil, fmt.Errorf("detach_disk: backend resolution failed for storage %q: %w", storage, err)
+			return nil, cpierrors.Wrap(err, fmt.Sprintf("detach_disk: backend resolution failed for storage %q", storage))
 		}
 		node, err := backend.NodeForExisting(ctx, diskCID)
 		if err != nil {
@@ -98,7 +98,7 @@ func HandleDetachDisk(deps Deps) Handler {
 				)
 				return nil, nil
 			}
-			return nil, fmt.Errorf("detach_disk: %w", err)
+			return nil, cpierrors.Wrap(err, "detach_disk: node lookup failed")
 		}
 
 		// --------------------------------------------------------------------
@@ -130,7 +130,7 @@ func HandleDetachDisk(deps Deps) Handler {
 				return nil, nil
 			}
 			// Config fetch error (network, 404 on VM itself, etc.).
-			return nil, pve.WrapError(err)
+			return nil, cpierrors.Wrap(pve.WrapError(err), fmt.Sprintf("detach_disk: config fetch failed for VM %s", vmCID))
 		}
 
 		// --------------------------------------------------------------------
@@ -190,8 +190,7 @@ func HandleDetachDisk(deps Deps) Handler {
 			if pve.IsNotFound(err) {
 				return nil, cpierrors.VMNotFound(vmCID)
 			}
-			return nil, fmt.Errorf("detach_disk: DetachDisk failed for VM %s disk %s (diskID=%s): %w",
-				vmCID, diskCID, diskID, wrapped)
+			return nil, cpierrors.Wrap(wrapped, fmt.Sprintf("detach_disk: DetachDisk failed for VM %s disk %s (diskID=%s)", vmCID, diskCID, diskID))
 		}
 
 		deps.Logger.Info("detach_disk",
@@ -225,8 +224,7 @@ func sweepUnusedDiskSlot(
 		if pve.IsNotFound(err) {
 			return false, nil // VM gone — nothing to sweep.
 		}
-		return false, fmt.Errorf("detach_disk: read config for VM %s to sweep unused slot: %w",
-			vmCID, pve.WrapError(err))
+		return false, cpierrors.Wrap(pve.WrapError(err), fmt.Sprintf("detach_disk: read config for VM %s to sweep unused slot", vmCID))
 	}
 
 	for slot, volid := range pve.FindUnusedDiskEntries(cfg) {
@@ -239,8 +237,7 @@ func sweepUnusedDiskSlot(
 			if pve.IsNotFound(sweepErr) {
 				return true, nil // slot already gone
 			}
-			return false, fmt.Errorf("detach_disk: remove lingering unused slot %s for disk %s on VM %s: %w",
-				slot, diskCID, vmCID, pve.WrapError(sweepErr))
+			return false, cpierrors.Wrap(pve.WrapError(sweepErr), fmt.Sprintf("detach_disk: remove lingering unused slot %s for disk %s on VM %s", slot, diskCID, vmCID))
 		}
 		deps.Logger.Info("detach_disk: removed lingering unused disk slot",
 			log.String("vm_cid", vmCID),

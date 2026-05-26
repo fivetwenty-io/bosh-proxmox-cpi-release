@@ -37,15 +37,15 @@ func HandleSnapshotDisk(deps Deps) Handler {
 		// 1. Unmarshal and validate arguments.
 		// ----------------------------------------------------------------
 		if len(args) < 1 {
-			return nil, fmt.Errorf("snapshot_disk: expected at least 1 argument (disk_cid), got 0")
+			return nil, cpierrors.Cloud("snapshot_disk: expected at least 1 argument (disk_cid), got 0")
 		}
 
 		var diskCID string
 		if err := json.Unmarshal(args[0], &diskCID); err != nil {
-			return nil, fmt.Errorf("snapshot_disk: args[0] disk_cid must be a string: %w", err)
+			return nil, cpierrors.Wrap(err, "snapshot_disk: args[0] disk_cid must be a string")
 		}
 		if diskCID == "" {
-			return nil, fmt.Errorf("snapshot_disk: args[0] disk_cid must not be empty")
+			return nil, cpierrors.Cloud("snapshot_disk: args[0] disk_cid must not be empty")
 		}
 
 		// metadata arg is optional and may be null or absent.
@@ -80,7 +80,7 @@ func HandleSnapshotDisk(deps Deps) Handler {
 		// ----------------------------------------------------------------
 		snapName, err := generateSnapName()
 		if err != nil {
-			return nil, fmt.Errorf("snapshot_disk: failed to generate snapshot name: %w", err)
+			return nil, cpierrors.Wrap(err, "snapshot_disk: failed to generate snapshot name")
 		}
 
 		// ----------------------------------------------------------------
@@ -113,7 +113,7 @@ func HandleSnapshotDisk(deps Deps) Handler {
 				log.String("snap_name", snapName),
 				log.Err(serr),
 			)
-			return nil, fmt.Errorf("snapshot_disk: Snapshot failed for VM %d disk %s: %w", vmid, diskCID, pve.WrapError(serr))
+			return nil, cpierrors.Wrap(pve.WrapError(serr), fmt.Sprintf("snapshot_disk: Snapshot failed for VM %d disk %s", vmid, diskCID))
 		}
 
 		// ----------------------------------------------------------------
@@ -135,6 +135,21 @@ func HandleSnapshotDisk(deps Deps) Handler {
 // generateSnapName returns a snapshot name of the form "bosh-<timestamp>-<hex4>".
 // The timestamp is seconds since Unix epoch. The 4-byte random suffix reduces
 // collision probability for concurrent snapshot calls on the same VM.
+//
+// PVE snapshot name constraints (PVE 8.x API schema):
+//
+//	Pattern: [a-zA-Z][a-zA-Z0-9_-]{0,39}  (max 40 chars, must start with a letter)
+//
+// The generated format "bosh-<unix_ts>-<8hex>" is at most 25 chars, starts
+// with 'b' (a letter), and uses only alphanumeric characters plus hyphens —
+// all within the allowed set.
+//
+// Hyphen compatibility note: PVE 8.x permits hyphens in snapshot names.
+// PVE 7.x and earlier have inconsistent hyphen support depending on the
+// storage backend; underscore separators are universally safe across all
+// PVE versions. This implementation keeps hyphens for human readability,
+// accepting that PVE <8.x deployments may need to switch to underscores
+// (change the fmt.Sprintf format string; no logic change required).
 func generateSnapName() (string, error) {
 	buf := make([]byte, 4)
 	if _, err := rand.Read(buf); err != nil {

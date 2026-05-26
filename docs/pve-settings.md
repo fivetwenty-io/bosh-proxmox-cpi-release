@@ -172,3 +172,40 @@ Expect:
 - `privsep`: `0`
 
 If the calls return `401`, the token secret is wrong. If any field is off, re-run the matching section above.
+
+## Cluster topology limitations
+
+### Single-node vs. multi-node PVE
+
+The CPI reads `config.node` for node-scoped operations (bridge create/delete, VM placement when no cloud-property override is supplied). On a single-node cluster this works transparently because there is only one node to target. On multi-node clusters, ensure `config.node` names a node that is reachable and that hosts (or will host) the resources the CPI manages.
+
+VM-scan operations (e.g., `has_vm`, `get_disks`) search across all cluster nodes and do not depend on `config.node`.
+
+### Bridge network node affinity
+
+Linux bridges are per-node configuration objects. The CPI creates a bridge on the node resolved at `create_network` time (`cloud_properties.node` if supplied, otherwise `config.node`) and deletes it from `config.node` at `delete_network` time.
+
+**Operator requirement:** do not change `config.node` between `create_network` and `delete_network` for the same network CID. If `config.node` is changed in between, `delete_network` will target the wrong node and the bridge on the original node will be left behind. Clean it up manually:
+
+```bash
+# On the original node
+pvesh set /nodes/<original-node>/network --iface <bridge-name>
+# or via API
+curl -sk -X DELETE -H "Authorization: $PVE_TOKEN" \
+  https://$PVE_HOST/api2/json/nodes/<original-node>/network/<bridge-name>
+curl -sk -X PUT -H "Authorization: $PVE_TOKEN" \
+  https://$PVE_HOST/api2/json/nodes/<original-node>/network
+```
+
+This limitation does not affect the SDN path; SDN vnets are cluster-global and are not tied to a specific node.
+
+### SDN `sdn_auto_manage_zone` scope
+
+The `sdn_auto_manage_zone` CPI config flag controls whether the CPI creates or deletes SDN zones on your behalf. It does **not** invent zone names.
+
+| Flag value | Zone absent from PVE | Zone name not supplied by operator |
+|---|---|---|
+| `false` (default) | `create_network` returns an error | `create_network` returns an error |
+| `true` | CPI creates the zone in PVE | `create_network` returns an error — a name is still required |
+
+The operator must always supply the zone name via `cloud_properties.zone` or `config.sdn_zone`. Setting `sdn_auto_manage_zone: true` only allows the CPI to create a zone that does not yet exist in PVE, and to delete a zone that becomes empty after `delete_network`. It does not relax the requirement that the zone name be provided.

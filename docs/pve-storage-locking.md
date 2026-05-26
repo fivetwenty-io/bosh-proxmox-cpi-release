@@ -93,6 +93,7 @@ At default settings, a worst-case all-retries run waits roughly `2 + 3 + 4.5 + 6
 | `delete_stemcell` | `DeleteVolumeIfExists` |
 | `snapshot_disk` | `Snapshot` + await |
 | `delete_snapshot` | `DeleteSnapshot` |
+| `update_disk` | `ResizeDisk` on the resize path (cache/iothread-only changes skip storage I/O) |
 | `agent/configdrive` | `Upload` + await (file reopened per attempt), `DeleteVolume` |
 
 `attach_disk` and `detach_disk` are not wrapped — they only mutate VM config and never touch the storage lock.

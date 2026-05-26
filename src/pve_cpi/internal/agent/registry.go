@@ -37,10 +37,11 @@ func NewRegistryAgent(reg *registry.Client, logger *log.Logger) *RegistryAgent {
 // result to /instances/{vmid}/settings. Called by create_vm after VM
 // creation.
 //
-// buildSettings supplies the same defaults the cloud-init agents apply:
-// non-nil networks/disks/env/ntp (so JSON renders {}/[] rather than
-// null), VM.Name fallback "vm-{vmid}", VM.ID fallback to the vmid string,
-// and the MBus-from-blobstore fallback when cfg.MBus is empty.
+// buildSettings applies non-nil networks/disks/env/ntp defaults (so JSON
+// renders {}/[] rather than null), VM.Name fallback "vm-{vmid}", and VM.ID
+// fallback to the vmid string. cfg.MBus must be set explicitly — an empty
+// MBus with a derivable blobstore host returns an error rather than silently
+// producing a credential-less NATS URL.
 func (a *RegistryAgent) Configure(ctx context.Context, node string, vmid int, cfg AgentConfig) error {
 	id := strconv.Itoa(vmid)
 
@@ -50,11 +51,9 @@ func (a *RegistryAgent) Configure(ctx context.Context, node string, vmid int, cf
 		log.String("agent_id", cfg.AgentID),
 	)
 
-	settings, fallbackApplied := buildSettings(cfg, vmid)
-	if fallbackApplied {
-		a.logger.Info("registry: mbus empty; derived from blobstore endpoint",
-			log.String("mbus", settings.MBus),
-		)
+	settings, err := buildSettings(cfg, vmid)
+	if err != nil {
+		return err
 	}
 
 	if err := a.reg.Put(ctx, id, settings); err != nil {

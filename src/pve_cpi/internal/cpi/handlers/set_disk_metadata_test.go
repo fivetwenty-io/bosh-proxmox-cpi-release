@@ -3,6 +3,7 @@ package handlers_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -14,8 +15,8 @@ import (
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
 
+	sdkclusterapi "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cluster"
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cloudinit"
-	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cluster"
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/clusterstorage"
 	sdknodes "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/nodes"
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/qemu"
@@ -30,8 +31,6 @@ import (
 type diskMetaQEMUMock struct {
 	// configs maps "node:vmid" → config map.
 	configs map[string]map[string]interface{}
-	// updateDesc captures the description written via UpdateQemuConfig on
-	// the main QEMU config path (used in nodes mock).
 }
 
 func (m *diskMetaQEMUMock) Config(_ context.Context, node string, vmid int) (map[string]interface{}, error) {
@@ -88,15 +87,14 @@ func (m *diskMetaQEMUMock) RollbackSnapshot(_ context.Context, _ string, _ int, 
 var _ qemu.Service = (*diskMetaQEMUMock)(nil)
 
 // ---------------------------------------------------------------------------
-// Minimal nodes.Service mock — only ListQemu and UpdateQemuConfig used.
+// Minimal nodes.Service mock — only UpdateQemuConfig used by set_disk_metadata.
+// ListQemu is no longer called; findVMsHostingDisk uses ListResources directly.
 // ---------------------------------------------------------------------------
 
-// diskMetaNodesMock implements the nodes.Service interface. Only ListQemu and
-// UpdateQemuConfig are implemented; all other methods panic.
+// diskMetaNodesMock implements the nodes.Service interface. Only UpdateQemuConfig
+// is implemented; all other methods panic.
 type diskMetaNodesMock struct {
 	sdknodes.Service // nil embed — panics on uncovered methods
-	// vmsByNode maps node name → list of vmid int64.
-	vmsByNode map[string][]int64
 	// capturedDesc captures the description value written by UpdateQemuConfig.
 	capturedDesc *string
 	// capturedTags captures the tags value written by UpdateQemuConfig.
@@ -107,24 +105,6 @@ type diskMetaNodesMock struct {
 
 func diskKey(node string, vmid int) string {
 	return node + ":" + strconv.Itoa(vmid)
-}
-
-func vmidRaw(id int64) json.RawMessage {
-	b, _ := json.Marshal(map[string]interface{}{"vmid": id})
-	return json.RawMessage(b)
-}
-
-func (m *diskMetaNodesMock) ListQemu(_ context.Context, node string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
-	ids, ok := m.vmsByNode[node]
-	if !ok {
-		resp := sdknodes.ListQemuResponse{}
-		return &resp, nil
-	}
-	resp := make(sdknodes.ListQemuResponse, 0, len(ids))
-	for _, id := range ids {
-		resp = append(resp, vmidRaw(id))
-	}
-	return &resp, nil
 }
 
 func (m *diskMetaNodesMock) UpdateQemuConfig(_ context.Context, _ string, _ string, params *sdknodes.UpdateQemuConfigParams) error {
@@ -142,14 +122,6 @@ func (m *diskMetaNodesMock) UpdateQemuConfig(_ context.Context, _ string, _ stri
 	return nil
 }
 
-// All remaining nodes.Service methods panic — they are never called by set_disk_metadata.
-func (m *diskMetaNodesMock) ListNodes(_ context.Context) (*sdknodes.ListNodesResponse, error) {
-	panic("ListNodes not expected")
-}
-func (m *diskMetaNodesMock) GetNodes(_ context.Context, _ string) (*sdknodes.GetNodesResponse, error) {
-	panic("GetNodes not expected")
-}
-
 // compile-time interface check.
 var _ sdknodes.Service = (*diskMetaNodesMock)(nil)
 
@@ -160,7 +132,7 @@ var _ sdknodes.Service = (*diskMetaNodesMock)(nil)
 type diskMetaClientMock struct {
 	qemuSvc    *diskMetaQEMUMock
 	nodesSvc   *diskMetaNodesMock
-	clusterSvc *mockClusterService
+	clusterSvc sdkclusterapi.Service
 }
 
 func (c *diskMetaClientMock) QEMU() qemu.Service                     { return c.qemuSvc }
@@ -168,7 +140,7 @@ func (c *diskMetaClientMock) Storage() storage.Service               { return ni
 func (c *diskMetaClientMock) CloudInit() cloudinit.Service           { return nil }
 func (c *diskMetaClientMock) Tasks() tasks.Service                   { return nil }
 func (c *diskMetaClientMock) Nodes() sdknodes.Service                { return c.nodesSvc }
-func (c *diskMetaClientMock) Cluster() cluster.Service               { return c.clusterSvc }
+func (c *diskMetaClientMock) Cluster() sdkclusterapi.Service         { return c.clusterSvc }
 func (c *diskMetaClientMock) ClusterStorage() clusterstorage.Service { return nil }
 
 // ---------------------------------------------------------------------------
@@ -179,18 +151,57 @@ const testDiskCID = "local-lvm:vm-100-disk-0"
 const testNode = "pve1"
 const testVMID = int64(100)
 
-// clusterWithNode builds a ListStatusResponse with a single online node entry.
-func clusterWithNode(name string) *cluster.ListStatusResponse {
-	raw, _ := json.Marshal(map[string]interface{}{
-		"type":   "node",
-		"name":   name,
-		"online": 1,
-	})
-	resp := cluster.ListStatusResponse{json.RawMessage(raw)}
+// clusterResourcesWithVM builds a ListResourcesResponse with a single VM entry.
+// This is used by findVMsHostingDisk (via Cluster().ListResources) after the B9 fix.
+func clusterResourcesWithVM(vmid int64, node string) *sdkclusterapi.ListResourcesResponse {
+	type entry struct {
+		VMID int64  `json:"vmid"`
+		Node string `json:"node"`
+	}
+	raw, _ := json.Marshal(entry{VMID: vmid, Node: node})
+	resp := sdkclusterapi.ListResourcesResponse{raw}
 	return &resp
 }
 
-// vmConfigWithDisk builds a QEMU config map that includes testDiskCID at scsi0.
+// clusterResourcesWithVMs builds a ListResourcesResponse with multiple VM entries.
+func clusterResourcesWithVMs(pairs ...struct{ vmid int64; node string }) *sdkclusterapi.ListResourcesResponse {
+	type entry struct {
+		VMID int64  `json:"vmid"`
+		Node string `json:"node"`
+	}
+	resp := make(sdkclusterapi.ListResourcesResponse, 0, len(pairs))
+	for _, p := range pairs {
+		raw, _ := json.Marshal(entry{VMID: p.vmid, Node: p.node})
+		resp = append(resp, raw)
+	}
+	return &resp
+}
+
+// diskMetaClusterSvc is a minimal cluster.Service that only implements ListResources.
+type diskMetaClusterSvc struct {
+	sdkclusterapi.Service // nil embed
+	listFn                func(ctx context.Context, params *sdkclusterapi.ListResourcesParams) (*sdkclusterapi.ListResourcesResponse, error)
+	listErr               error
+	resp                  *sdkclusterapi.ListResourcesResponse
+}
+
+func (m *diskMetaClusterSvc) ListResources(ctx context.Context, params *sdkclusterapi.ListResourcesParams) (*sdkclusterapi.ListResourcesResponse, error) {
+	if m.listFn != nil {
+		return m.listFn(ctx, params)
+	}
+	if m.listErr != nil {
+		return nil, m.listErr
+	}
+	if m.resp != nil {
+		return m.resp, nil
+	}
+	empty := sdkclusterapi.ListResourcesResponse{}
+	return &empty, nil
+}
+
+var _ sdkclusterapi.Service = (*diskMetaClusterSvc)(nil)
+
+// vmConfigWithDisk builds a QEMU config map that includes diskCID at scsi0.
 func vmConfigWithDisk(diskCID, desc string) map[string]interface{} {
 	m := map[string]interface{}{
 		"scsi0": diskCID,
@@ -215,6 +226,17 @@ func makeMetaArgs(diskCID string, meta map[string]any) []json.RawMessage {
 	return []json.RawMessage{json.RawMessage(r0), json.RawMessage(r1)}
 }
 
+// buildDiskMetaPVE constructs a diskMetaClientMock with a cluster service that
+// returns the given VM in its resource list and a QEMU mock that returns the
+// given configs. The nodes mock is provided directly for UpdateQemuConfig capture.
+func buildDiskMetaPVE(clusterSvc sdkclusterapi.Service, qemuCfgs map[string]map[string]interface{}, nodesSvc *diskMetaNodesMock) *diskMetaClientMock {
+	return &diskMetaClientMock{
+		qemuSvc:    &diskMetaQEMUMock{configs: qemuCfgs},
+		nodesSvc:   nodesSvc,
+		clusterSvc: clusterSvc,
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -222,16 +244,11 @@ func makeMetaArgs(diskCID string, meta map[string]any) []json.RawMessage {
 func TestHandleSetDiskMetadata_AttachedSingleVM(t *testing.T) {
 	t.Parallel()
 
-	nodesSvc := &diskMetaNodesMock{
-		vmsByNode: map[string][]int64{testNode: {testVMID}},
-	}
-	qemuSvc := &diskMetaQEMUMock{
-		configs: map[string]map[string]interface{}{
-			testNode + ":100": vmConfigWithDisk(testDiskCID, ""),
-		},
-	}
-	clusterSvc := &mockClusterService{statusResp: clusterWithNode(testNode)}
-	pve := &diskMetaClientMock{qemuSvc: qemuSvc, nodesSvc: nodesSvc, clusterSvc: clusterSvc}
+	nodesSvc := &diskMetaNodesMock{}
+	clusterSvc := &diskMetaClusterSvc{resp: clusterResourcesWithVM(testVMID, testNode)}
+	pve := buildDiskMetaPVE(clusterSvc, map[string]map[string]interface{}{
+		diskKey(testNode, int(testVMID)): vmConfigWithDisk(testDiskCID, ""),
+	}, nodesSvc)
 
 	h := handlers.HandleSetDiskMetadata(makeDiskMetaDeps(pve))
 
@@ -262,17 +279,12 @@ func TestHandleSetDiskMetadata_Detached(t *testing.T) {
 
 	logger, logs := log.NewObservedLogger(log.LevelWarn)
 
-	nodesSvc := &diskMetaNodesMock{
-		vmsByNode: map[string][]int64{testNode: {testVMID}},
-	}
-	// VM config has NO matching disk.
-	qemuSvc := &diskMetaQEMUMock{
-		configs: map[string]map[string]interface{}{
-			testNode + ":100": {"scsi0": "local-lvm:vm-100-disk-99"},
-		},
-	}
-	clusterSvc := &mockClusterService{statusResp: clusterWithNode(testNode)}
-	pve := &diskMetaClientMock{qemuSvc: qemuSvc, nodesSvc: nodesSvc, clusterSvc: clusterSvc}
+	nodesSvc := &diskMetaNodesMock{}
+	// VM config has NO matching disk — disk is detached.
+	clusterSvc := &diskMetaClusterSvc{resp: clusterResourcesWithVM(testVMID, testNode)}
+	pve := buildDiskMetaPVE(clusterSvc, map[string]map[string]interface{}{
+		diskKey(testNode, int(testVMID)): {"scsi0": "local-lvm:vm-100-disk-99"},
+	}, nodesSvc)
 
 	deps := handlers.Deps{
 		Config: &config.CPIConfig{VMDiskFormat: "qcow2"},
@@ -300,21 +312,21 @@ func TestHandleSetDiskMetadata_Ambiguous(t *testing.T) {
 	t.Parallel()
 
 	const vm2 = int64(200)
-	ambigNodesSvc := &diskMetaNodesMock{
-		vmsByNode: map[string][]int64{testNode: {testVMID, vm2}},
-	}
 	// Both vmids (100 and 200) have configs containing testDiskCID, triggering the
 	// ambiguous-match error path in the handler.
-	pveAmbig := &diskMetaClientMock{
-		qemuSvc: &diskMetaQEMUMock{configs: map[string]map[string]interface{}{
-			"pve1:100": vmConfigWithDisk(testDiskCID, ""),
-			"pve1:200": vmConfigWithDisk(testDiskCID, ""),
-		}},
-		nodesSvc:   ambigNodesSvc,
-		clusterSvc: &mockClusterService{statusResp: clusterWithNode(testNode)},
+	clusterSvc := &diskMetaClusterSvc{
+		resp: clusterResourcesWithVMs(
+			struct{ vmid int64; node string }{testVMID, testNode},
+			struct{ vmid int64; node string }{vm2, testNode},
+		),
 	}
+	nodesSvc := &diskMetaNodesMock{}
+	pve := buildDiskMetaPVE(clusterSvc, map[string]map[string]interface{}{
+		diskKey(testNode, int(testVMID)): vmConfigWithDisk(testDiskCID, ""),
+		diskKey(testNode, int(vm2)):      vmConfigWithDisk(testDiskCID, ""),
+	}, nodesSvc)
 
-	hAmbig := handlers.HandleSetDiskMetadata(makeDiskMetaDeps(pveAmbig))
+	hAmbig := handlers.HandleSetDiskMetadata(makeDiskMetaDeps(pve))
 	ambigResult, ambigErr := hAmbig.Handle(context.Background(), makeMetaArgs(testDiskCID, map[string]any{}), jsonrpc.Context{})
 	if ambigErr == nil {
 		t.Fatalf("ambiguous: expected error, got nil result=%v", ambigResult)
@@ -331,16 +343,11 @@ func TestHandleSetDiskMetadata_DescriptionPreserved(t *testing.T) {
 	t.Parallel()
 
 	existingDesc := "VM managed by BOSH"
-	nodesSvc := &diskMetaNodesMock{
-		vmsByNode: map[string][]int64{testNode: {testVMID}},
-	}
-	qemuSvc := &diskMetaQEMUMock{
-		configs: map[string]map[string]interface{}{
-			testNode + ":100": vmConfigWithDisk(testDiskCID, existingDesc),
-		},
-	}
-	clusterSvc := &mockClusterService{statusResp: clusterWithNode(testNode)}
-	pve := &diskMetaClientMock{qemuSvc: qemuSvc, nodesSvc: nodesSvc, clusterSvc: clusterSvc}
+	nodesSvc := &diskMetaNodesMock{}
+	clusterSvc := &diskMetaClusterSvc{resp: clusterResourcesWithVM(testVMID, testNode)}
+	pve := buildDiskMetaPVE(clusterSvc, map[string]map[string]interface{}{
+		diskKey(testNode, int(testVMID)): vmConfigWithDisk(testDiskCID, existingDesc),
+	}, nodesSvc)
 
 	h := handlers.HandleSetDiskMetadata(makeDiskMetaDeps(pve))
 	_, err := h.Handle(context.Background(), makeMetaArgs(testDiskCID, map[string]any{"k": "v"}), jsonrpc.Context{})
@@ -363,11 +370,11 @@ func TestHandleSetDiskMetadata_DescriptionPreserved(t *testing.T) {
 func TestHandleSetDiskMetadata_MissingArgs(t *testing.T) {
 	t.Parallel()
 
-	pve := &diskMetaClientMock{
-		clusterSvc: &mockClusterService{},
-		nodesSvc:   &diskMetaNodesMock{},
-		qemuSvc:    &diskMetaQEMUMock{},
-	}
+	pve := buildDiskMetaPVE(
+		&diskMetaClusterSvc{},
+		map[string]map[string]interface{}{},
+		&diskMetaNodesMock{},
+	)
 	h := handlers.HandleSetDiskMetadata(makeDiskMetaDeps(pve))
 
 	_, err := h.Handle(context.Background(), []json.RawMessage{}, jsonrpc.Context{})
@@ -385,19 +392,14 @@ func TestHandleSetDiskMetadata_MissingArgs(t *testing.T) {
 func TestHandleSetDiskMetadata_AppliesDiskTags(t *testing.T) {
 	t.Parallel()
 
-	nodesSvc := &diskMetaNodesMock{
-		vmsByNode: map[string][]int64{testNode: {testVMID}},
-	}
-	qemuSvc := &diskMetaQEMUMock{
-		configs: map[string]map[string]interface{}{
-			testNode + ":100": {
-				"scsi0": testDiskCID,
-				"tags":  "env--prod;director--abc",
-			},
+	nodesSvc := &diskMetaNodesMock{}
+	clusterSvc := &diskMetaClusterSvc{resp: clusterResourcesWithVM(testVMID, testNode)}
+	pve := buildDiskMetaPVE(clusterSvc, map[string]map[string]interface{}{
+		diskKey(testNode, int(testVMID)): {
+			"scsi0": testDiskCID,
+			"tags":  "env--prod;director--abc",
 		},
-	}
-	clusterSvc := &mockClusterService{statusResp: clusterWithNode(testNode)}
-	pve := &diskMetaClientMock{qemuSvc: qemuSvc, nodesSvc: nodesSvc, clusterSvc: clusterSvc}
+	}, nodesSvc)
 
 	h := handlers.HandleSetDiskMetadata(makeDiskMetaDeps(pve))
 	meta := map[string]any{
@@ -432,11 +434,11 @@ func TestHandleSetDiskMetadata_AppliesDiskTags(t *testing.T) {
 func TestHandleSetDiskMetadata_InvalidDiskCID(t *testing.T) {
 	t.Parallel()
 
-	pve := &diskMetaClientMock{
-		clusterSvc: &mockClusterService{},
-		nodesSvc:   &diskMetaNodesMock{},
-		qemuSvc:    &diskMetaQEMUMock{},
-	}
+	pve := buildDiskMetaPVE(
+		&diskMetaClusterSvc{},
+		map[string]map[string]interface{}{},
+		&diskMetaNodesMock{},
+	)
 	h := handlers.HandleSetDiskMetadata(makeDiskMetaDeps(pve))
 
 	r0, _ := json.Marshal("nodisk") // no colon → invalid
@@ -452,11 +454,11 @@ func TestHandleSetDiskMetadata_InvalidDiskCID(t *testing.T) {
 func TestHandleSetDiskMetadata_MetadataNotObject(t *testing.T) {
 	t.Parallel()
 
-	pve := &diskMetaClientMock{
-		clusterSvc: &mockClusterService{},
-		nodesSvc:   &diskMetaNodesMock{},
-		qemuSvc:    &diskMetaQEMUMock{},
-	}
+	pve := buildDiskMetaPVE(
+		&diskMetaClusterSvc{},
+		map[string]map[string]interface{}{},
+		&diskMetaNodesMock{},
+	)
 	h := handlers.HandleSetDiskMetadata(makeDiskMetaDeps(pve))
 
 	r0, _ := json.Marshal(testDiskCID)
@@ -473,22 +475,22 @@ func TestHandleSetDiskMetadata_MetadataNotObject(t *testing.T) {
 	}
 }
 
-// TestHandleSetDiskMetadata_ClusterStatusError verifies that a Cluster().ListStatus()
-// failure propagates as an error from the handler.
-func TestHandleSetDiskMetadata_ClusterStatusError(t *testing.T) {
+// TestHandleSetDiskMetadata_ListResourcesError — B9 fix: ListResources transport
+// failure propagates as an error from the handler instead of silently succeeding.
+func TestHandleSetDiskMetadata_ListResourcesError(t *testing.T) {
 	t.Parallel()
 
 	clusterErr := fmt.Errorf("cluster unreachable")
-	pve := &diskMetaClientMock{
-		clusterSvc: &mockClusterService{statusErr: clusterErr},
-		nodesSvc:   &diskMetaNodesMock{},
-		qemuSvc:    &diskMetaQEMUMock{},
-	}
+	pve := buildDiskMetaPVE(
+		&diskMetaClusterSvc{listErr: clusterErr},
+		map[string]map[string]interface{}{},
+		&diskMetaNodesMock{},
+	)
 	h := handlers.HandleSetDiskMetadata(makeDiskMetaDeps(pve))
 
 	_, err := h.Handle(context.Background(), makeMetaArgs(testDiskCID, map[string]any{"k": "v"}), jsonrpc.Context{})
 	if err == nil {
-		t.Fatal("expected error from cluster status failure, got nil")
+		t.Fatal("expected error from ListResources failure, got nil")
 	}
 	if !strings.Contains(err.Error(), "cluster") {
 		t.Errorf("error should mention 'cluster'; got %q", err.Error())
@@ -501,17 +503,11 @@ func TestHandleSetDiskMetadata_UpdateConfigError(t *testing.T) {
 	t.Parallel()
 
 	updateErr := fmt.Errorf("write conflict: locked")
-	nodesSvc := &diskMetaNodesMock{
-		vmsByNode: map[string][]int64{testNode: {testVMID}},
-		updateErr: updateErr,
-	}
-	qemuSvc := &diskMetaQEMUMock{
-		configs: map[string]map[string]interface{}{
-			diskKey(testNode, int(testVMID)): vmConfigWithDisk(testDiskCID, ""),
-		},
-	}
-	clusterSvc := &mockClusterService{statusResp: clusterWithNode(testNode)}
-	pve := &diskMetaClientMock{qemuSvc: qemuSvc, nodesSvc: nodesSvc, clusterSvc: clusterSvc}
+	nodesSvc := &diskMetaNodesMock{updateErr: updateErr}
+	clusterSvc := &diskMetaClusterSvc{resp: clusterResourcesWithVM(testVMID, testNode)}
+	pve := buildDiskMetaPVE(clusterSvc, map[string]map[string]interface{}{
+		diskKey(testNode, int(testVMID)): vmConfigWithDisk(testDiskCID, ""),
+	}, nodesSvc)
 
 	h := handlers.HandleSetDiskMetadata(makeDiskMetaDeps(pve))
 	_, err := h.Handle(context.Background(), makeMetaArgs(testDiskCID, map[string]any{"k": "v"}), jsonrpc.Context{})
@@ -525,9 +521,8 @@ func TestHandleSetDiskMetadata_UpdateConfigError(t *testing.T) {
 
 // setDiskMetadataCallHandler is a helper that invokes HandleSetDiskMetadata and
 // returns the captured description from the nodes mock after the call.
-func setDiskMetadataCallHandler(t *testing.T, nodesSvc *diskMetaNodesMock, qemuSvc *diskMetaQEMUMock, diskCID string, meta map[string]any) string {
+func setDiskMetadataCallHandler(t *testing.T, nodesSvc *diskMetaNodesMock, qemuSvc *diskMetaQEMUMock, clusterSvc sdkclusterapi.Service, diskCID string, meta map[string]any) string {
 	t.Helper()
-	clusterSvc := &mockClusterService{statusResp: clusterWithNode(testNode)}
 	pve := &diskMetaClientMock{qemuSvc: qemuSvc, nodesSvc: nodesSvc, clusterSvc: clusterSvc}
 	h := handlers.HandleSetDiskMetadata(makeDiskMetaDeps(pve))
 	_, err := h.Handle(context.Background(), makeMetaArgs(diskCID, meta), jsonrpc.Context{})
@@ -553,12 +548,11 @@ func TestHandleSetDiskMetadata_SameCIDReplaces(t *testing.T) {
 			configKey: vmConfigWithDisk(testDiskCID, ""),
 		},
 	}
-	nodesSvc := &diskMetaNodesMock{
-		vmsByNode: map[string][]int64{testNode: {testVMID}},
-	}
+	nodesSvc := &diskMetaNodesMock{}
+	clusterSvc := &diskMetaClusterSvc{resp: clusterResourcesWithVM(testVMID, testNode)}
 
 	// First call: write deployment=cf.
-	desc1 := setDiskMetadataCallHandler(t, nodesSvc, qemuSvc, testDiskCID, map[string]any{"deployment": "cf"})
+	desc1 := setDiskMetadataCallHandler(t, nodesSvc, qemuSvc, clusterSvc, testDiskCID, map[string]any{"deployment": "cf"})
 	if !strings.Contains(desc1, "cf") {
 		t.Fatalf("first call: sentinel missing 'cf'; got: %s", desc1)
 	}
@@ -567,7 +561,7 @@ func TestHandleSetDiskMetadata_SameCIDReplaces(t *testing.T) {
 	qemuSvc.configs[configKey]["description"] = desc1
 	nodesSvc.capturedDesc = nil
 
-	clusterSvc2 := &mockClusterService{statusResp: clusterWithNode(testNode)}
+	clusterSvc2 := &diskMetaClusterSvc{resp: clusterResourcesWithVM(testVMID, testNode)}
 	pve2 := &diskMetaClientMock{qemuSvc: qemuSvc, nodesSvc: nodesSvc, clusterSvc: clusterSvc2}
 	h2 := handlers.HandleSetDiskMetadata(makeDiskMetaDeps(pve2))
 	_, err := h2.Handle(context.Background(), makeMetaArgs(testDiskCID, map[string]any{"instance_id": "vm-xyz"}), jsonrpc.Context{})
@@ -584,7 +578,6 @@ func TestHandleSetDiskMetadata_SameCIDReplaces(t *testing.T) {
 		t.Errorf("second call: sentinel missing 'vm-xyz'; got: %s", desc2)
 	}
 	// First call's value replaced — "cf" must NOT appear as the deployment value.
-	// The sentinel encodes the full metadata object, so "cf" should be absent.
 	if strings.Contains(desc2, `"cf"`) {
 		t.Errorf("second call: 'cf' should have been replaced, still present; got: %s", desc2)
 	}
@@ -596,8 +589,6 @@ func TestHandleSetDiskMetadata_SameCIDReplaces(t *testing.T) {
 
 // TestHandleSetDiskMetadata_CrossDiskMergePreserved verifies that calling the handler
 // for two different disk CIDs on the same VM preserves both CID entries in the sentinel.
-// Call 1 writes diskCID A; call 2 (seeing call 1's description in config) writes diskCID B.
-// The final sentinel must contain entries for both A and B.
 func TestHandleSetDiskMetadata_CrossDiskMergePreserved(t *testing.T) {
 	t.Parallel()
 
@@ -613,12 +604,11 @@ func TestHandleSetDiskMetadata_CrossDiskMergePreserved(t *testing.T) {
 			},
 		},
 	}
-	nodesSvc := &diskMetaNodesMock{
-		vmsByNode: map[string][]int64{testNode: {testVMID}},
-	}
+	nodesSvc := &diskMetaNodesMock{}
+	clusterSvc := &diskMetaClusterSvc{resp: clusterResourcesWithVM(testVMID, testNode)}
 
 	// Call 1: set metadata for disk A.
-	desc1 := setDiskMetadataCallHandler(t, nodesSvc, qemuSvc, diskA, map[string]any{"deployment": "cf"})
+	desc1 := setDiskMetadataCallHandler(t, nodesSvc, qemuSvc, clusterSvc, diskA, map[string]any{"deployment": "cf"})
 	if !strings.Contains(desc1, diskA) {
 		t.Fatalf("call 1: sentinel missing diskA CID; got: %s", desc1)
 	}
@@ -628,7 +618,7 @@ func TestHandleSetDiskMetadata_CrossDiskMergePreserved(t *testing.T) {
 	nodesSvc.capturedDesc = nil
 
 	// Call 2: set metadata for disk B (different CID, same VM).
-	clusterSvc2 := &mockClusterService{statusResp: clusterWithNode(testNode)}
+	clusterSvc2 := &diskMetaClusterSvc{resp: clusterResourcesWithVM(testVMID, testNode)}
 	pve2 := &diskMetaClientMock{qemuSvc: qemuSvc, nodesSvc: nodesSvc, clusterSvc: clusterSvc2}
 	h2 := handlers.HandleSetDiskMetadata(makeDiskMetaDeps(pve2))
 	_, err := h2.Handle(context.Background(), makeMetaArgs(diskB, map[string]any{"instance_id": "vm-xyz"}), jsonrpc.Context{})
@@ -667,11 +657,9 @@ func TestHandleSetDiskMetadata_CorruptedSentinel(t *testing.T) {
 			configKey: vmConfigWithDisk(testDiskCID, corruptDesc),
 		},
 	}
-	nodesSvc := &diskMetaNodesMock{
-		vmsByNode: map[string][]int64{testNode: {testVMID}},
-	}
-	clusterSvc := &mockClusterService{statusResp: clusterWithNode(testNode)}
-	pve := &diskMetaClientMock{qemuSvc: qemuSvc, nodesSvc: nodesSvc, clusterSvc: clusterSvc}
+	nodesSvc := &diskMetaNodesMock{}
+	clusterSvc := &diskMetaClusterSvc{resp: clusterResourcesWithVM(testVMID, testNode)}
+	pve := buildDiskMetaPVE(clusterSvc, qemuSvc.configs, nodesSvc)
 
 	h := handlers.HandleSetDiskMetadata(makeDiskMetaDeps(pve))
 	_, err := h.Handle(context.Background(), makeMetaArgs(testDiskCID, map[string]any{"deployment": "reset-test"}), jsonrpc.Context{})
@@ -692,8 +680,7 @@ func TestHandleSetDiskMetadata_CorruptedSentinel(t *testing.T) {
 
 // TestHandleSetDiskMetadata_Dir_CID verifies that a dir-storage disk CID in the
 // form "local:9001/vm-9001-disk-0.raw" is correctly parsed by ParseDiskCID
-// (storage="local") and matched against the VM config. The handler treats CID
-// formats as opaque after the initial colon-split; this test exercises that path.
+// (storage="local") and matched against the VM config.
 func TestHandleSetDiskMetadata_Dir_CID(t *testing.T) {
 	t.Parallel()
 
@@ -701,18 +688,13 @@ func TestHandleSetDiskMetadata_Dir_CID(t *testing.T) {
 	const dirVMID = int64(9001)
 
 	configKey := diskKey(testNode, int(dirVMID))
-	qemuSvc := &diskMetaQEMUMock{
-		configs: map[string]map[string]interface{}{
-			configKey: {
-				"scsi0": dirCID,
-			},
+	nodesSvc := &diskMetaNodesMock{}
+	clusterSvc := &diskMetaClusterSvc{resp: clusterResourcesWithVM(dirVMID, testNode)}
+	pve := buildDiskMetaPVE(clusterSvc, map[string]map[string]interface{}{
+		configKey: {
+			"scsi0": dirCID,
 		},
-	}
-	nodesSvc := &diskMetaNodesMock{
-		vmsByNode: map[string][]int64{testNode: {dirVMID}},
-	}
-	clusterSvc := &mockClusterService{statusResp: clusterWithNode(testNode)}
-	pve := &diskMetaClientMock{qemuSvc: qemuSvc, nodesSvc: nodesSvc, clusterSvc: clusterSvc}
+	}, nodesSvc)
 
 	h := handlers.HandleSetDiskMetadata(makeDiskMetaDeps(pve))
 	_, err := h.Handle(context.Background(), makeMetaArgs(dirCID, map[string]any{"deployment": "cf"}), jsonrpc.Context{})
@@ -728,6 +710,94 @@ func TestHandleSetDiskMetadata_Dir_CID(t *testing.T) {
 	}
 	if !strings.Contains(desc, dirCID) {
 		t.Errorf("dir CID: sentinel missing disk CID %q; got: %s", dirCID, desc)
+	}
+}
+
+// TestHandleSetDiskMetadata_ExactVolidMatch — M3 fix: a diskCID "local-lvm:vm-100-disk-0"
+// must NOT match a VM that holds "local-lvm:vm-100-disk-0-clone" (substring match
+// would produce a false positive). Only exact volid equality or option-prefixed
+// match "local-lvm:vm-100-disk-0,..." must match.
+func TestHandleSetDiskMetadata_ExactVolidMatch(t *testing.T) {
+	t.Parallel()
+
+	const wantCID = "local-lvm:vm-100-disk-0"
+	// VM config holds a different volid that contains wantCID as a substring.
+	const similarButDifferentVolid = "local-lvm:vm-100-disk-0-clone"
+
+	configKey := diskKey(testNode, int(testVMID))
+	nodesSvc := &diskMetaNodesMock{}
+	logger, _ := log.NewObservedLogger(log.LevelWarn)
+	clusterSvc := &diskMetaClusterSvc{resp: clusterResourcesWithVM(testVMID, testNode)}
+	pve := buildDiskMetaPVE(clusterSvc, map[string]map[string]interface{}{
+		configKey: {"scsi0": similarButDifferentVolid},
+	}, nodesSvc)
+
+	deps := handlers.Deps{
+		Config: &config.CPIConfig{VMDiskFormat: "qcow2"},
+		PVE:    pve,
+		Logger: logger,
+	}
+	h := handlers.HandleSetDiskMetadata(deps)
+	result, err := h.Handle(context.Background(), makeMetaArgs(wantCID, map[string]any{"k": "v"}), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("exact volid match: unexpected error: %v", err)
+	}
+	if result != nil {
+		t.Errorf("exact volid match: expected nil result (no-op), got %v", result)
+	}
+	// UpdateQemuConfig must NOT be called — the disk is not attached to any VM.
+	if nodesSvc.capturedDesc != nil {
+		t.Errorf("exact volid match: UpdateQemuConfig must not be called for a substring-only match; got desc: %s", *nodesSvc.capturedDesc)
+	}
+}
+
+// TestHandleSetDiskMetadata_OptionStringVolidMatch — volid with option suffix
+// "local-lvm:vm-100-disk-0,size=10G" must still match diskCID "local-lvm:vm-100-disk-0".
+func TestHandleSetDiskMetadata_OptionStringVolidMatch(t *testing.T) {
+	t.Parallel()
+
+	const wantCID = "local-lvm:vm-100-disk-0"
+	const volidWithOptions = "local-lvm:vm-100-disk-0,size=10G"
+
+	configKey := diskKey(testNode, int(testVMID))
+	nodesSvc := &diskMetaNodesMock{}
+	clusterSvc := &diskMetaClusterSvc{resp: clusterResourcesWithVM(testVMID, testNode)}
+	pve := buildDiskMetaPVE(clusterSvc, map[string]map[string]interface{}{
+		configKey: {"scsi0": volidWithOptions},
+	}, nodesSvc)
+
+	h := handlers.HandleSetDiskMetadata(makeDiskMetaDeps(pve))
+	_, err := h.Handle(context.Background(), makeMetaArgs(wantCID, map[string]any{"deployment": "cf"}), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("option string volid match: unexpected error: %v", err)
+	}
+	if nodesSvc.capturedDesc == nil {
+		t.Fatal("option string volid match: UpdateQemuConfig not called — disk should have been found")
+	}
+}
+
+// TestHandleSetDiskMetadata_TransportErrorPropagates — B9 fix: when ListResources
+// returns a transport error, the handler must propagate it rather than treating it
+// as "disk not attached" and returning nil.
+func TestHandleSetDiskMetadata_TransportErrorPropagates(t *testing.T) {
+	t.Parallel()
+
+	transportErr := errors.New("dial tcp: connection refused")
+	pve := buildDiskMetaPVE(
+		&diskMetaClusterSvc{listErr: transportErr},
+		map[string]map[string]interface{}{},
+		&diskMetaNodesMock{},
+	)
+	h := handlers.HandleSetDiskMetadata(makeDiskMetaDeps(pve))
+
+	_, err := h.Handle(context.Background(), makeMetaArgs(testDiskCID, map[string]any{"deployment": "cf"}), jsonrpc.Context{})
+	if err == nil {
+		t.Fatal("transport error: expected error, got nil")
+	}
+	// Must NOT be "disk not attached" — that must only happen when the cluster scan
+	// completes successfully and finds no match.
+	if strings.Contains(err.Error(), "not attached") {
+		t.Errorf("transport error must not be reported as 'not attached'; got: %v", err)
 	}
 }
 

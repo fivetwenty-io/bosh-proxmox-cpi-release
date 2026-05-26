@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -187,5 +189,91 @@ func TestStaticResolver_AlwaysShared(t *testing.T) {
 	}
 	if got != "pve-x" {
 		t.Fatalf("NodeForExisting=%q, want pve-x", got)
+	}
+}
+
+// atomicLister is a StorageLister that counts calls with an atomic counter so
+// the count is race-detector-safe when used from concurrent goroutines.
+type atomicLister struct {
+	calls   atomic.Int64
+	entries []map[string]any
+	// delay, when non-nil, is called before returning so tests can inject
+	// artificial latency that forces all concurrent goroutines to observe a
+	// cache miss before any one of them completes the refresh.
+	delay func()
+}
+
+func (a *atomicLister) ListStorage(_ context.Context, _ *clusterstorage.ListStorageParams) (*clusterstorage.ListStorageResponse, error) {
+	a.calls.Add(1)
+	if a.delay != nil {
+		a.delay()
+	}
+	out := make(clusterstorage.ListStorageResponse, 0, len(a.entries))
+	for _, e := range a.entries {
+		raw, err := json.Marshal(e)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, raw)
+	}
+	return &out, nil
+}
+
+// TestStorageInfoCache_ConcurrentGetCoalesces verifies the B5 fix: 100
+// goroutines that all observe a cold-cache miss for the same key must trigger
+// exactly 1 refresh call, not 100. The atomicLister injects a brief pause
+// inside ListStorage so that all 100 goroutines reach the miss path before
+// any refresh completes, maximising the probability of observing the bug if
+// the fix is absent.
+func TestStorageInfoCache_ConcurrentGetCoalesces(t *testing.T) {
+	const goroutines = 100
+
+	// allStarted is closed after all Get goroutines have been launched.
+	// The delay function blocks inside ListStorage until allStarted is closed,
+	// ensuring the maximum number of goroutines observe a cold-cache miss
+	// before the refresh completes.
+	allStarted := make(chan struct{})
+
+	lister := &atomicLister{
+		entries: []map[string]any{
+			{"storage": "ceph", "type": "rbd"},
+		},
+		delay: func() {
+			select {
+			case <-allStarted:
+				// All goroutines have been launched; proceed with refresh.
+			case <-time.After(10 * time.Second):
+				// Safety valve: do not hang indefinitely if the test is broken.
+			}
+		},
+	}
+
+	cache := NewStorageInfoCache(lister, time.Minute)
+
+	errs := make(chan error, goroutines)
+	var wg sync.WaitGroup
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := cache.Get(context.Background(), "ceph")
+			if err != nil {
+				errs <- err
+			}
+		}()
+	}
+	// Signal that all goroutines have been spawned; the delay in ListStorage
+	// unblocks once this channel is closed.
+	close(allStarted)
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		t.Errorf("Get error: %v", err)
+	}
+
+	got := lister.calls.Load()
+	if got != 1 {
+		t.Errorf("expected exactly 1 ListStorage call for %d concurrent misses, got %d (TOCTOU double-refresh race)", goroutines, got)
 	}
 }

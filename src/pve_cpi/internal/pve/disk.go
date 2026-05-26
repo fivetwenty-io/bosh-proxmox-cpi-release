@@ -151,9 +151,14 @@ func FindVMByDiskVolid(ctx context.Context, c Client, fallbackNode, volid string
 	}
 
 	typeStr := "vm"
-	resources, err := c.Cluster().ListResources(ctx, &sdkcluster.ListResourcesParams{Type: &typeStr})
-	if err != nil {
-		return 0, "", cpierrors.Wrap(err, "FindVMByDiskVolid: list cluster resources")
+	var resources *sdkcluster.ListResourcesResponse
+	listErr := RetryOnTransient(ctx, nil, "find_vm_by_disk_volid_list", 0, func() error {
+		var inner error
+		resources, inner = c.Cluster().ListResources(ctx, &sdkcluster.ListResourcesParams{Type: &typeStr})
+		return inner
+	})
+	if listErr != nil {
+		return 0, "", cpierrors.Wrap(listErr, "FindVMByDiskVolid: list cluster resources")
 	}
 	if resources == nil {
 		return 0, "", cpierrors.Cloud("FindVMByDiskVolid: nil response from cluster resources")
@@ -236,9 +241,14 @@ func FindVMNodeViaCluster(ctx context.Context, c Client, vmid int) (string, bool
 		return "", false, nil
 	}
 	typ := "vm"
-	resp, err := c.Cluster().ListResources(ctx, &sdkcluster.ListResourcesParams{Type: &typ})
-	if err != nil {
-		return "", false, cpierrors.Wrap(err, "findVMNodeViaCluster: list cluster vms")
+	var resp *sdkcluster.ListResourcesResponse
+	listErr := RetryOnTransient(ctx, nil, "find_vm_node_via_cluster_list", 0, func() error {
+		var inner error
+		resp, inner = c.Cluster().ListResources(ctx, &sdkcluster.ListResourcesParams{Type: &typ})
+		return inner
+	})
+	if listErr != nil {
+		return "", false, cpierrors.Wrap(listErr, "findVMNodeViaCluster: list cluster vms")
 	}
 	if resp == nil {
 		return "", false, nil

@@ -116,7 +116,15 @@ func createNetworkSDN(
 		return nil, err
 	}
 
-	// Resolve zone — create when SDNAutoManageZone and zone is absent.
+	// Resolve zone.
+	//
+	// What sdn_auto_manage_zone does and does NOT do:
+	//   - false (default): zone must exist in PVE before create_network is called.
+	//     The CPI returns an error if the zone is absent or unspecified.
+	//   - true: the CPI will CREATE the zone in PVE when it does not already exist.
+	//     It does NOT derive or invent a zone name — the operator must still supply
+	//     cloud_properties.zone or config.sdn_zone. The flag only relaxes the
+	//     "zone not found" error into an auto-create action.
 	createdZone := false
 	if zone == "" {
 		if !cfg.SDNAutoManageZone {
@@ -125,21 +133,22 @@ func createNetworkSDN(
 					"or enable sdn_auto_manage_zone",
 			)
 		}
-		// Auto-manage: derive zone name from vnet (operator must supply a zone name
-		// via cloud_properties.zone when SDN is enabled but no global zone is configured).
+		// sdn_auto_manage_zone is true but no zone name was provided (neither
+		// cloud_properties.zone nor config.sdn_zone). The flag cannot auto-create a
+		// zone without a name; the operator must supply one.
 		return nil, cpierrors.Cloud(
 			"create_network: cloud_properties.zone is required when sdn_auto_manage_zone is true " +
 				"and no sdn_zone is configured in the CPI config",
 		)
 	}
 
-	// Verify zone exists; create it when auto-manage is enabled and zone is absent.
+	// Verify zone exists in PVE; create it when sdn_auto_manage_zone is enabled.
 	_, zoneGetErr := clusterSvc.GetSdnZones(ctx, zone, nil)
 	if zoneGetErr != nil {
 		if !isSDNNotFound(zoneGetErr) {
 			return nil, cpierrors.Wrap(zoneGetErr, fmt.Sprintf("create_network: get SDN zone %q", zone))
 		}
-		// Zone does not exist.
+		// Zone does not exist in PVE.
 		if !cfg.SDNAutoManageZone {
 			return nil, cpierrors.Cloud(
 				"create_network: SDN zone %q not found and sdn_auto_manage_zone is false — "+

@@ -149,6 +149,8 @@ def cmd_teardown(args: list[str]) -> int:
 
 
 def cmd_alias_env(args: list[str]) -> int:
+    if not CREDS.exists():
+        sys.exit(f"creds.yml missing at {CREDS} — run 'scripts/bosh create-env' first")
     director_ip = bosh_int(VARS, "/internal_ip")
     ca = bosh_int(CREDS, "/director_ssl/ca")
     proc = subprocess.run(

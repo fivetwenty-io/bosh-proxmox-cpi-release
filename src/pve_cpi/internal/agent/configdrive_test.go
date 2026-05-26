@@ -303,31 +303,15 @@ func TestConfigDrive_Configure_DeletesLocalTempOnUploadFailure(t *testing.T) {
 	}
 }
 
-func TestConfigDrive_Configure_MBusFallback(t *testing.T) {
+// TestConfigDrive_Configure_MBusFallbackReturnsError verifies that Configure
+// returns an error when cfg.MBus is empty and the blobstore endpoint would
+// yield a credential-less NATS URL. The previous behaviour silently synthesised
+// nats://<host>:4222 without credentials, causing authentication failures
+// against production NATS servers. Operators must set mbus explicitly.
+func TestConfigDrive_Configure_MBusFallbackReturnsError(t *testing.T) {
 	t.Parallel()
 
-	var uploadedPath string
-	storageSvc := &fakeStorageSvc{
-		uploadFn: func(_ context.Context, _, _, _, _ string, body io.Reader) (string, error) {
-			tmp, err := os.CreateTemp("", "uploaded-*.iso")
-			if err != nil {
-				return "", err
-			}
-			defer tmp.Close()
-			if _, err := io.Copy(tmp, body); err != nil {
-				return "", err
-			}
-			uploadedPath = tmp.Name()
-			return "", nil
-		},
-	}
-
-	a := newISOAgent(storageSvc, nil)
-	defer func() {
-		if uploadedPath != "" {
-			_ = os.Remove(uploadedPath)
-		}
-	}()
+	a := newISOAgent(nil, nil)
 
 	cfg := baseISOConfig()
 	cfg.MBus = ""
@@ -336,13 +320,12 @@ func TestConfigDrive_Configure_MBusFallback(t *testing.T) {
 		Options:  map[string]any{"endpoint": "https://10.0.0.42:25250"},
 	}
 
-	if err := a.Configure(context.Background(), "pve1", 200, cfg); err != nil {
-		t.Fatalf("Configure: %v", err)
+	err := a.Configure(context.Background(), "pve1", 200, cfg)
+	if err == nil {
+		t.Fatal("expected error when mbus is empty and blobstore host is derivable; got nil")
 	}
-
-	s, _ := readSettingsFromISO(t, uploadedPath)
-	if s.MBus != "nats://10.0.0.42:4222" {
-		t.Errorf("settings.mbus = %q, want fallback nats://10.0.0.42:4222", s.MBus)
+	if !strings.Contains(err.Error(), "mbus is empty") {
+		t.Errorf("error should mention 'mbus is empty', got: %v", err)
 	}
 }
 

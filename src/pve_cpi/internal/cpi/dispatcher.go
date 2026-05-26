@@ -7,7 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
+	"sync"
 	"time"
 
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
@@ -30,9 +30,11 @@ func (f HandlerFunc) Handle(ctx context.Context, args []json.RawMessage, reqCtx 
 }
 
 // Dispatcher routes JSON-RPC requests to registered handlers.
-// It is not safe for concurrent use — the BOSH CPI executes requests in a
-// single-threaded stdin loop, so no locking is required.
+// It is safe for concurrent use: Register holds a write lock and Handle holds
+// a read lock. BOSH dispatches sequentially over stdin so locking is not
+// required in production, but concurrent tests and future extensions are safe.
 type Dispatcher struct {
+	mu       sync.RWMutex
 	handlers map[string]Handler
 	logger   *log.Logger
 }
@@ -58,7 +60,10 @@ func NewDispatcher(logger *log.Logger) *Dispatcher {
 // method need not be one of the 22 canonical names; arbitrary methods may be
 // registered (useful for extensions or testing), but only pre-registered slots
 // accept calls through Handle — unknown methods return a CloudError.
+// Register is safe to call concurrently with other Register or Handle calls.
 func (d *Dispatcher) Register(method string, h Handler) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
 	d.handlers[method] = h
 }
 
@@ -77,7 +82,9 @@ func (d *Dispatcher) Register(method string, h Handler) {
 func (d *Dispatcher) Handle(ctx context.Context, req *jsonrpc.Request) *jsonrpc.Response {
 	start := time.Now()
 
+	d.mu.RLock()
 	h, ok := d.handlers[req.Method]
+	d.mu.RUnlock()
 	if !ok {
 		d.logger.Info("dispatch",
 			log.String("method", req.Method),
@@ -197,8 +204,3 @@ func errorResponse(e *cpierrors.Error) *jsonrpc.Response {
 
 // Ensure HandlerFunc implements Handler at compile time.
 var _ Handler = HandlerFunc(nil)
-
-// unmarshalableValue is used only in tests; kept here so the package self-documents
-// the marshal-failure code path without importing test packages in tests.
-// (Tests reference the channel type directly — no exported symbol needed.)
-var _ = fmt.Sprintf // keep fmt import live

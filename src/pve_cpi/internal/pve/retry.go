@@ -1,3 +1,9 @@
+// Note: time.After timers used in the select statements below are reaped by
+// the Go 1.23+ runtime, which tracks and collects them even when the select
+// arm is never reached. This module requires Go 1.23+ (go.mod declares go
+// 1.25). If a toolchain downgrade below 1.23 is ever proposed, convert each
+// time.After call to the NewTimer/Stop pattern explicitly to avoid goroutine
+// leaks on ctx.Done cancellations.
 package pve
 
 import (

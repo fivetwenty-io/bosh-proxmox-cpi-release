@@ -4,7 +4,6 @@ package handlers
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"strconv"
 	"strings"
 
@@ -42,32 +41,34 @@ var systemDiskSlots = map[string]bool{
 //
 // Logic:
 //  1. Parse vm_cid to VMID int.
-//  2. Fetch VM config via SDK qemu.Config.
-//  3. Parse all disk entries from config using SDK qemu.ParseDisks.
-//  4. Filter out system disks (scsi0/virtio0) and cloudinit drives (ide2 or
+//  2. Locate VM via cluster scan (FindVMNodeViaCluster) to get authoritative node.
+//     Not-found -> VMNotFound. Transport error -> propagate.
+//  3. Fetch VM config via SDK qemu.Config.
+//  4. Parse all disk entries from config using SDK qemu.ParseDisks.
+//  5. Filter out system disks (scsi0/virtio0) and cloudinit drives (ide2 or
 //     any disk whose option string contains "media=cdrom").
-//  5. For each remaining disk, extract the bare volid (the part before the first
+//  6. For each remaining disk, extract the bare volid (the part before the first
 //     comma in the option string) and format it as a disk_cid.
-//  6. Return the list. An empty list is a valid response when no persistent disks
+//  7. Return the list. An empty list is a valid response when no persistent disks
 //     are attached.
 //
-// VMNotFound: if the Config API returns a 404 for the given VMID, the handler
-// returns a VMNotFound error.
+// VMNotFound: if the cluster scan does not find the VMID, or the Config API
+// returns a 404, the handler returns a VMNotFound error.
 func HandleGetDisks(deps Deps) Handler {
 	return HandlerFunc(func(ctx context.Context, args []json.RawMessage, _ jsonrpc.Context) (any, error) {
 		// ----------------------------------------------------------------
 		// 1. Unmarshal and validate arguments.
 		// ----------------------------------------------------------------
 		if len(args) < 1 {
-			return nil, fmt.Errorf("get_disks: expected 1 argument (vm_cid), got 0")
+			return nil, cpierrors.Cloud("get_disks: expected 1 argument (vm_cid), got 0")
 		}
 
 		var vmCID string
 		if err := json.Unmarshal(args[0], &vmCID); err != nil {
-			return nil, fmt.Errorf("get_disks: args[0] vm_cid must be a string: %w", err)
+			return nil, cpierrors.Wrap(err, "get_disks: args[0] vm_cid must be a string")
 		}
 		if vmCID == "" {
-			return nil, fmt.Errorf("get_disks: args[0] vm_cid must not be empty")
+			return nil, cpierrors.Cloud("get_disks: args[0] vm_cid must not be empty")
 		}
 
 		vmid, err := strconv.Atoi(vmCID)
@@ -75,24 +76,35 @@ func HandleGetDisks(deps Deps) Handler {
 			return nil, cpierrors.VMNotFound(vmCID)
 		}
 
-		node := deps.Config.Node
-		if node == "" {
-			return nil, fmt.Errorf("get_disks: node is not configured")
+		// ----------------------------------------------------------------
+		// 2. Locate VM via cluster scan to get authoritative node.
+		// ----------------------------------------------------------------
+		node, found, lookupErr := pve.FindVMNodeViaCluster(ctx, deps.PVE, vmid)
+		if lookupErr != nil {
+			return nil, cpierrors.Wrap(pve.WrapError(lookupErr), "get_disks: locate VM "+vmCID)
+		}
+		if !found || node == "" {
+			return nil, cpierrors.VMNotFound(vmCID)
 		}
 
+		deps.Logger.Debug("get_disks: VM located via cluster scan",
+			log.String("vm_cid", vmCID),
+			log.String("node", node),
+		)
+
 		// ----------------------------------------------------------------
-		// 2. Fetch VM config.
+		// 3. Fetch VM config.
 		// ----------------------------------------------------------------
 		cfg, err := deps.PVE.QEMU().Config(ctx, node, vmid)
 		if err != nil {
 			if pve.IsNotFound(err) {
 				return nil, cpierrors.VMNotFound(vmCID)
 			}
-			return nil, fmt.Errorf("get_disks: failed to fetch config for VM %s: %w", vmCID, pve.WrapError(err))
+			return nil, cpierrors.Wrap(pve.WrapError(err), "get_disks: failed to fetch config for VM "+vmCID)
 		}
 
 		// ----------------------------------------------------------------
-		// 3. Parse disk entries from config and filter to persistent disks.
+		// 4. Parse disk entries from config and filter to persistent disks.
 		// ----------------------------------------------------------------
 		allDisks := qemu.ParseDisks(cfg)
 		diskCIDs := make([]string, 0, len(allDisks))

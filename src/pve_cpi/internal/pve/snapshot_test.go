@@ -253,6 +253,32 @@ func TestWaitForSnapshotAbsent_ListError(t *testing.T) {
 	}
 }
 
+func TestWaitForSnapshotAbsent_TransientInPollLoop_Retries(t *testing.T) {
+	// HasSnapshots returns a transient error twice, then succeeds with snapshot
+	// absent. WaitForSnapshotAbsent must survive the transient retries and
+	// ultimately return nil once the snapshot is gone.
+	t.Parallel()
+	var calls int32
+	client := snapClient(func(_ context.Context, _ string, _ int) ([]map[string]interface{}, error) {
+		n := atomic.AddInt32(&calls, 1)
+		if n <= 2 {
+			// Return a transient-transport-shaped error so RetryOnTransient
+			// retries it. The "(code: 596)" suffix matches IsTransientTransport.
+			return nil, errors.New("pveproxy backend gone (code: 596)")
+		}
+		// Third call: snapshot absent → success.
+		return snapEntries("current"), nil
+	})
+	err := pve.WaitForSnapshotAbsent(context.Background(), client, "pve1", 9001, "snap1",
+		pve.WithPollInterval(1*time.Millisecond), pve.WithMaxWait(30*time.Second))
+	if err != nil {
+		t.Fatalf("expected success after transient retries, got: %v", err)
+	}
+	if atomic.LoadInt32(&calls) < 3 {
+		t.Errorf("expected at least 3 ListSnapshots calls (2 transient + 1 success), got %d", calls)
+	}
+}
+
 func TestWaitForSnapshotAbsent_ContextCancelled(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())

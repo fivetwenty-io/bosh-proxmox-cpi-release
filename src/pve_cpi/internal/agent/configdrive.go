@@ -81,7 +81,9 @@ func newConfigDriveForTest(pveSvc pve.Client, storage string, logger *log.Logger
 // attaches it to the VM as a CD-ROM on scsi30 (see configDriveSlot for
 // the SCSI-slot reservation map).
 //
-//  1. Build settings.json (with the MBus-from-blobstore fallback).
+//  1. Build settings.json. cfg.MBus must be set explicitly; an empty MBus
+//     combined with a derivable blobstore host returns an error (credential-less
+//     NATS URLs silently fail authentication).
 //  2. Author the ISO via go-diskfs (ConfigDrive v2 layout, Rock Ridge,
 //     volume label "config-2").
 //  3. Upload via Storage().Upload (content=iso).
@@ -104,11 +106,9 @@ func (a *ConfigDrive) Configure(ctx context.Context, node string, vmid int, cfg 
 		log.String("agent_id", cfg.AgentID),
 	)
 
-	settings, fallbackApplied := buildSettings(cfg, vmid)
-	if fallbackApplied {
-		a.logger.Info("configdrive: mbus empty; derived from blobstore endpoint",
-			log.String("mbus", settings.MBus),
-		)
+	settings, err := buildSettings(cfg, vmid)
+	if err != nil {
+		return err
 	}
 
 	payload, err := json.Marshal(settings)

@@ -58,22 +58,22 @@ func HandleUpdateDisk(deps Deps) Handler {
 		// 1. Unmarshal and validate arguments.
 		// ----------------------------------------------------------------
 		if len(args) < 2 {
-			return nil, fmt.Errorf("update_disk: expected 2 arguments (disk_cid, update_spec), got %d", len(args))
+			return nil, cpierrors.Cloud("update_disk: expected 2 arguments (disk_cid, update_spec), got %d", len(args))
 		}
 
 		var diskCID string
 		if err := json.Unmarshal(args[0], &diskCID); err != nil {
-			return nil, fmt.Errorf("update_disk: args[0] disk_cid must be a string: %w", err)
+			return nil, cpierrors.Wrap(err, "update_disk: args[0] disk_cid must be a string")
 		}
 		if diskCID == "" {
-			return nil, fmt.Errorf("update_disk: args[0] disk_cid must not be empty")
+			return nil, cpierrors.Cloud("update_disk: args[0] disk_cid must not be empty")
 		}
 
 		// update_spec may be null or missing; treat as empty map.
 		var updateSpec map[string]any
 		if args[1] != nil {
 			if err := json.Unmarshal(args[1], &updateSpec); err != nil {
-				return nil, fmt.Errorf("update_disk: args[1] update_spec must be an object: %w", err)
+				return nil, cpierrors.Wrap(err, "update_disk: args[1] update_spec must be an object")
 			}
 		}
 
@@ -94,15 +94,26 @@ func HandleUpdateDisk(deps Deps) Handler {
 		// ----------------------------------------------------------------
 		vmid, node, vmErr := pve.FindVMByDiskVolid(ctx, deps.PVE, deps.Config.Node, diskCID)
 		if vmErr != nil {
-			// Distinguish "not attached to any VM" from other errors.
-			return nil, cpierrors.Cloud(
-				"update_disk: detached disk cannot be updated — disk %q not attached to any VM", diskCID,
-			)
+			// Distinguish "disk not attached to any VM" (expected detached-disk path)
+			// from transport/cluster-scan errors (which must propagate so the caller
+			// can detect transient failures and retry).
+			//
+			// FindVMByDiskVolid returns a plain CloudError (no cause, no retry flag)
+			// containing "not attached to any VM" when the scan completes and finds no
+			// match. Transport/cluster errors are wrapped with a cause and may carry
+			// TypeRetriableCloud. pve.IsNotFound handles SDK 404 shapes; the message
+			// check handles FindVMByDiskVolid's own sentinel text.
+			if pve.IsNotFound(vmErr) || strings.Contains(vmErr.Error(), "not attached to any VM") {
+				return nil, cpierrors.Cloud(
+					"update_disk: detached disk cannot be updated — disk %q not attached to any VM", diskCID,
+				)
+			}
+			return nil, cpierrors.Wrap(pve.WrapError(vmErr), fmt.Sprintf("update_disk: locate VM for disk %q", diskCID))
 		}
 
 		diskID, err := pve.ResolveDiskID(ctx, deps.PVE, node, vmid, diskCID)
 		if err != nil {
-			return nil, fmt.Errorf("update_disk: cannot resolve diskID for %s on VM %d: %w", diskCID, vmid, err)
+			return nil, cpierrors.Wrap(err, fmt.Sprintf("update_disk: cannot resolve diskID for %s on VM %d", diskCID, vmid))
 		}
 
 		// ----------------------------------------------------------------
@@ -111,7 +122,7 @@ func HandleUpdateDisk(deps Deps) Handler {
 		if sizeRaw, hasSz := updateSpec["size"]; hasSz {
 			newSizeMB, ok := toInt(sizeRaw)
 			if !ok || newSizeMB <= 0 {
-				return nil, fmt.Errorf("update_disk: update_spec.size must be a positive integer (MiB), got %v", sizeRaw)
+				return nil, cpierrors.Cloud("update_disk: update_spec.size must be a positive integer (MiB), got %v", sizeRaw)
 			}
 			if err := resizeDiskInternal(ctx, deps, node, vmid, diskID, diskCID, newSizeMB); err != nil {
 				return nil, err
@@ -135,12 +146,12 @@ func HandleUpdateDisk(deps Deps) Handler {
 		// ----------------------------------------------------------------
 		cfg, err := deps.PVE.QEMU().Config(ctx, node, vmid)
 		if err != nil {
-			return nil, fmt.Errorf("update_disk: failed to read VM %d config: %w", vmid, pve.WrapError(err))
+			return nil, cpierrors.Wrap(pve.WrapError(err), fmt.Sprintf("update_disk: failed to read VM %d config", vmid))
 		}
 
 		diskOptStr, ok := cfg[diskID].(string)
 		if !ok || diskOptStr == "" {
-			return nil, fmt.Errorf("update_disk: disk %q not found in VM %d config after locate", diskID, vmid)
+			return nil, cpierrors.Cloud("update_disk: disk %q not found in VM %d config after locate", diskID, vmid)
 		}
 
 		// Split option string into the bare volid and existing option pairs.
@@ -162,8 +173,7 @@ func HandleUpdateDisk(deps Deps) Handler {
 			DiskID: diskID,
 		})
 		if err != nil {
-			wrapped := pve.WrapError(err)
-			return nil, fmt.Errorf("update_disk: failed to update disk options for %s on VM %d: %w", diskCID, vmid, wrapped)
+			return nil, cpierrors.Wrap(pve.WrapError(err), fmt.Sprintf("update_disk: failed to update disk options for %s on VM %d", diskCID, vmid))
 		}
 
 		deps.Logger.Info("update_disk",
@@ -190,17 +200,17 @@ func resizeDiskInternal(
 ) error {
 	cfg, err := deps.PVE.QEMU().Config(ctx, node, vmid)
 	if err != nil {
-		return fmt.Errorf("update_disk: failed to read VM %d config for resize: %w", vmid, err)
+		return cpierrors.Wrap(pve.WrapError(err), fmt.Sprintf("update_disk: failed to read VM %d config for resize", vmid))
 	}
 
 	diskOptStr, ok := cfg[diskID].(string)
 	if !ok || diskOptStr == "" {
-		return fmt.Errorf("update_disk: disk %q not in VM %d config during resize", diskID, vmid)
+		return cpierrors.Cloud("update_disk: disk %q not in VM %d config during resize", diskID, vmid)
 	}
 
 	currentGiB, parseErr := parseDiskSizeGiB(diskOptStr)
 	if parseErr != nil {
-		return fmt.Errorf("update_disk: cannot determine current size for %s: %w", diskCID, parseErr)
+		return cpierrors.Wrap(parseErr, fmt.Sprintf("update_disk: cannot determine current size for %s", diskCID))
 	}
 
 	newGiB := (newSizeMB + 1023) / 1024
@@ -217,14 +227,21 @@ func resizeDiskInternal(
 		return nil // no-op
 	}
 
-	upid, err := deps.PVE.QEMU().ResizeDisk(ctx, node, vmid, diskID, deltaGiB)
-	if err != nil {
-		return fmt.Errorf("update_disk: ResizeDisk failed for %s (+%dG): %w", diskCID, deltaGiB, pve.WrapError(err))
-	}
-	if upid != "" {
-		if err := pve.AwaitTaskWithLogger(ctx, deps.PVE, node, upid, deps.Logger); err != nil {
-			return fmt.Errorf("update_disk: resize task failed for %s: %w", diskCID, err)
+	// Wrap submit+await in RetryOnTransientOrLock: PVE holds a per-storage
+	// lockfile during resize; concurrent resizes fail with "can't lock file
+	// ... got timeout". Retry the full submit+await pair on that signal.
+	rerr := pve.RetryOnTransientOrLock(ctx, deps.Logger, "update_disk_resize", 0, func() error {
+		upid, e := deps.PVE.QEMU().ResizeDisk(ctx, node, vmid, diskID, deltaGiB)
+		if e != nil {
+			return e
 		}
+		if upid == "" {
+			return nil
+		}
+		return pve.AwaitTaskWithLogger(ctx, deps.PVE, node, upid, deps.Logger)
+	})
+	if rerr != nil {
+		return cpierrors.Wrap(pve.WrapError(rerr), fmt.Sprintf("update_disk: ResizeDisk failed for %s (+%dG)", diskCID, deltaGiB))
 	}
 	return nil
 }

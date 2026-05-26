@@ -4,8 +4,8 @@ package handlers
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 
+	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
@@ -32,15 +32,15 @@ func HandleHasDisk(deps Deps) Handler {
 		// 1. Unmarshal and validate arguments.
 		// ----------------------------------------------------------------
 		if len(args) < 1 {
-			return nil, fmt.Errorf("has_disk: expected 1 argument (disk_cid), got 0")
+			return nil, cpierrors.Cloud("has_disk: expected 1 argument (disk_cid), got 0")
 		}
 
 		var diskCID string
 		if err := json.Unmarshal(args[0], &diskCID); err != nil {
-			return nil, fmt.Errorf("has_disk: args[0] disk_cid must be a string: %w", err)
+			return nil, cpierrors.Wrap(err, "has_disk: args[0] disk_cid must be a string")
 		}
 		if diskCID == "" {
-			return nil, fmt.Errorf("has_disk: disk_cid must not be empty")
+			return nil, cpierrors.Cloud("has_disk: disk_cid must not be empty")
 		}
 
 		// ----------------------------------------------------------------
@@ -48,7 +48,7 @@ func HandleHasDisk(deps Deps) Handler {
 		// ----------------------------------------------------------------
 		storage, _, err := pve.ParseDiskCID(diskCID)
 		if err != nil {
-			return nil, fmt.Errorf("has_disk: invalid disk_cid %q: %w", diskCID, err)
+			return nil, cpierrors.Wrap(err, "has_disk: invalid disk_cid "+diskCID)
 		}
 
 		// ----------------------------------------------------------------
@@ -60,7 +60,7 @@ func HandleHasDisk(deps Deps) Handler {
 		// ----------------------------------------------------------------
 		backend, err := backendResolverOrDefault(deps).Resolve(ctx, storage)
 		if err != nil {
-			return nil, fmt.Errorf("has_disk: backend resolution failed for storage %q: %w", storage, err)
+			return nil, cpierrors.Wrap(err, "has_disk: backend resolution failed for storage "+storage)
 		}
 		node, err := backend.NodeForExisting(ctx, diskCID)
 		if err != nil {
@@ -70,7 +70,7 @@ func HandleHasDisk(deps Deps) Handler {
 				)
 				return false, nil
 			}
-			return nil, fmt.Errorf("has_disk: %w", err)
+			return nil, cpierrors.Wrap(err, "has_disk")
 		}
 
 		// ----------------------------------------------------------------
@@ -87,7 +87,7 @@ func HandleHasDisk(deps Deps) Handler {
 				)
 				return false, nil
 			}
-			return nil, fmt.Errorf("has_disk: Exists check failed for %q on node %q: %w", diskCID, node, err)
+			return nil, cpierrors.Wrap(err, "has_disk: Exists check failed for "+diskCID+" on node "+node)
 		}
 
 		deps.Logger.Debug("has_disk", log.String("disk_cid", diskCID), log.Bool("exists", exists))

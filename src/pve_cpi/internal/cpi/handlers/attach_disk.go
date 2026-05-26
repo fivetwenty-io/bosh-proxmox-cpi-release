@@ -79,23 +79,23 @@ func HandleAttachDisk(deps Deps) Handler {
 		// 1. Unmarshal and validate arguments.
 		// --------------------------------------------------------------------
 		if len(args) < 2 {
-			return nil, fmt.Errorf("attach_disk: expected 2 arguments (vm_cid, disk_cid), got %d", len(args))
+			return nil, cpierrors.Cloud("attach_disk: expected 2 arguments (vm_cid, disk_cid), got %d", len(args))
 		}
 
 		var vmCID string
 		if err := json.Unmarshal(args[0], &vmCID); err != nil {
-			return nil, fmt.Errorf("attach_disk: args[0] vm_cid must be a string: %w", err)
+			return nil, cpierrors.Wrap(err, "attach_disk: args[0] vm_cid must be a string")
 		}
 		if vmCID == "" {
-			return nil, fmt.Errorf("attach_disk: args[0] vm_cid must not be empty")
+			return nil, cpierrors.Cloud("attach_disk: args[0] vm_cid must not be empty")
 		}
 
 		var diskCID string
 		if err := json.Unmarshal(args[1], &diskCID); err != nil {
-			return nil, fmt.Errorf("attach_disk: args[1] disk_cid must be a string: %w", err)
+			return nil, cpierrors.Wrap(err, "attach_disk: args[1] disk_cid must be a string")
 		}
 		if diskCID == "" {
-			return nil, fmt.Errorf("attach_disk: args[1] disk_cid must not be empty")
+			return nil, cpierrors.Cloud("attach_disk: args[1] disk_cid must not be empty")
 		}
 
 		// --------------------------------------------------------------------
@@ -119,14 +119,14 @@ func HandleAttachDisk(deps Deps) Handler {
 		// which is the disk_cid as-is.
 		backend, err := backendResolverOrDefault(deps).Resolve(ctx, storage)
 		if err != nil {
-			return nil, fmt.Errorf("attach_disk: backend resolution failed for storage %q: %w", storage, err)
+			return nil, cpierrors.Wrap(err, fmt.Sprintf("attach_disk: backend resolution failed for storage %q", storage))
 		}
 		node, err := backend.NodeForExisting(ctx, diskCID)
 		if err != nil {
 			if pve.IsNotFound(err) {
 				return nil, cpierrors.DiskNotFound(diskCID)
 			}
-			return nil, fmt.Errorf("attach_disk: %w", err)
+			return nil, cpierrors.Wrap(err, "attach_disk: node lookup failed")
 		}
 
 		// For local backends, the disk and VM MUST live on the same node — the
@@ -135,7 +135,7 @@ func HandleAttachDisk(deps Deps) Handler {
 		// co-location explicitly and surface a clear message when violated.
 		if backend.Kind() == pve.BackendLocal {
 			if vmNode, found, lookupErr := pve.FindVMNodeViaCluster(ctx, deps.PVE, vmid); lookupErr != nil {
-				return nil, fmt.Errorf("attach_disk: lookup VM %s node failed: %w", vmCID, lookupErr)
+				return nil, cpierrors.Wrap(lookupErr, fmt.Sprintf("attach_disk: lookup VM %s node failed", vmCID))
 			} else if found && vmNode != "" && vmNode != node {
 				return nil, cpierrors.Cloud(
 					"attach_disk: local-backend disk %s lives on node %s but VM %s runs on node %s — local-storage disks cannot cross nodes",
@@ -221,7 +221,7 @@ func HandleAttachDisk(deps Deps) Handler {
 			if pve.IsNotFound(prepErr) {
 				return nil, cpierrors.VMNotFound(vmCID)
 			}
-			return nil, fmt.Errorf("attach_disk: slot selection for VM %s disk %s: %w", vmCID, diskCID, pve.WrapError(prepErr))
+			return nil, cpierrors.Wrap(pve.WrapError(prepErr), fmt.Sprintf("attach_disk: slot selection for VM %s disk %s", vmCID, diskCID))
 		}
 
 		var diskID string
@@ -237,7 +237,7 @@ func HandleAttachDisk(deps Deps) Handler {
 			if pve.IsNotFound(err) {
 				return nil, cpierrors.VMNotFound(vmCID)
 			}
-			return nil, fmt.Errorf("attach_disk: AttachDisk failed for VM %s disk %s: %w", vmCID, diskCID, wrapped)
+			return nil, cpierrors.Wrap(wrapped, fmt.Sprintf("attach_disk: AttachDisk failed for VM %s disk %s", vmCID, diskCID))
 		}
 
 		// --------------------------------------------------------------------
@@ -280,7 +280,7 @@ func HandleAttachDisk(deps Deps) Handler {
 		// --------------------------------------------------------------------
 		devicePath, devErr := devicePathByID(resolvedDiskID)
 		if devErr != nil {
-			return nil, fmt.Errorf("attach_disk: cannot compute device path for diskID %q: %w", resolvedDiskID, devErr)
+			return nil, cpierrors.Wrap(devErr, fmt.Sprintf("attach_disk: cannot compute device path for diskID %q", resolvedDiskID))
 		}
 
 		// --------------------------------------------------------------------
@@ -289,7 +289,7 @@ func HandleAttachDisk(deps Deps) Handler {
 		if err := deps.Agent.UpdateDiskHints(ctx, vmid, []agent.DiskHint{
 			{DiskCID: diskCID, DevicePath: devicePath},
 		}); err != nil {
-			return nil, fmt.Errorf("attach_disk: UpdateDiskHints failed for VM %s disk %s: %w", vmCID, diskCID, err)
+			return nil, cpierrors.Wrap(err, fmt.Sprintf("attach_disk: UpdateDiskHints failed for VM %s disk %s", vmCID, diskCID))
 		}
 
 		deps.Logger.Info("attach_disk",
@@ -345,12 +345,12 @@ func chooseSCSISlotSkippingZero(
 			log.String("volid", volid),
 		)
 		if detachErr := deps.PVE.QEMU().DetachDisk(ctx, node, vmid, "scsi0"); detachErr != nil {
-			return "", fmt.Errorf("detach legacy scsi0: %w", detachErr)
+			return "", cpierrors.Wrap(detachErr, "attach_disk: detach legacy scsi0")
 		}
 		// Re-read config so NextFreeSCSIIndexAtLeast sees scsi0 as free.
 		cfg, err = deps.PVE.QEMU().Config(ctx, node, vmid)
 		if err != nil {
-			return "", fmt.Errorf("re-read config after scsi0 detach: %w", err)
+			return "", cpierrors.Wrap(err, "attach_disk: re-read config after scsi0 detach")
 		}
 	}
 
@@ -374,7 +374,7 @@ func chooseSCSISlotSkippingZero(
 func devicePathByID(diskID string) (string, error) {
 	var idx int
 	if _, err := fmt.Sscanf(diskID, "scsi%d", &idx); err != nil {
-		return "", fmt.Errorf("diskID %q is not a scsi slot", diskID)
+		return "", cpierrors.Cloud("attach_disk: diskID %q is not a scsi slot", diskID)
 	}
 	return fmt.Sprintf("/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_drive-scsi%d", idx), nil
 }

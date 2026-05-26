@@ -64,6 +64,17 @@ def run(*cmd: str) -> None:
     subprocess.run(cmd, check=True)
 
 
+def run_env(extra_env: dict[str, str], *cmd: str) -> None:
+    """Run *cmd* with the current process env merged with *extra_env*.
+
+    Used when a subprocess must receive credentials via the environment
+    rather than CLI arguments, to avoid leaking sensitive values into the
+    process table.
+    """
+    env = {**os.environ, **extra_env}
+    subprocess.run(cmd, check=True, env=env)
+
+
 def capture(*cmd: str) -> str:
     return subprocess.run(cmd, check=True, capture_output=True, text=True).stdout.strip()
 
@@ -322,11 +333,14 @@ def cmd_login(_extra: list[str]) -> None:
     domain = system_domain()
     pw = admin_password()
     run("cf", "api", f"https://api.{domain}", "--skip-ssl-validation")
-    run(
+    # Pass the admin password via CF_PASSWORD so it never appears in the
+    # process table or shell history.  The CF CLI reads CF_PASSWORD when
+    # -p is absent, so no -p flag is supplied here.
+    run_env(
+        {"CF_PASSWORD": pw},
         "cf", "login",
         "-a", f"https://api.{domain}",
         "-u", "admin",
-        "-p", pw,
         "--skip-ssl-validation",
     )
 

@@ -325,3 +325,85 @@ func TestBuildStemcellFilename_EmptySHA(t *testing.T) {
 	}
 }
 
+// TestSanitizeStemcellPart_MultibyteUTF8_ProducesAsciiOnly verifies that
+// multi-byte UTF-8 characters (e.g., CJK, emoji, combining marks) are treated
+// as a single disallowed unit and produce exactly one "-" rather than one "-"
+// per byte. This validates the rune-iteration fix (C6).
+func TestSanitizeStemcellPart_MultibyteUTF8_ProducesAsciiOnly(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name  string
+		input string // stemcell name/version containing multi-byte runes
+		// want describes only the ASCII-only guarantee and rune-vs-byte collapse.
+		// Exact output checked where deterministic.
+		wantContainsOnly func(s string) bool
+		wantOutput       string // exact expected output; empty means skip exact check
+	}{
+		{
+			name:       "CJK middle of name",
+			input:      "ubuntu-中文-jammy", // "ubuntu-中文-jammy"
+			wantOutput: "ubuntu-jammy",               // CJK collapses to single "-"
+		},
+		{
+			name:       "emoji single rune",
+			input:      "stemcell-\U0001F600-test", // snowman is 3 bytes; emoji is 4 bytes
+			wantOutput: "stemcell-test",
+		},
+		{
+			name:       "ascii only passthrough",
+			input:      "ubuntu-jammy",
+			wantOutput: "ubuntu-jammy",
+		},
+		{
+			name:       "combining mark after ascii",
+			input:      "café-test", // "café-test": é (U+00E9) is 2 bytes
+			wantOutput: "caf-test",  // 'é' → single '-', collapses with following '-'
+		},
+		{
+			name:       "all non-ascii",
+			input:      "中文", // two CJK runes, 6 bytes total
+			// Each rune → '-', consecutive → collapsed, then trimmed → empty.
+			wantOutput: "",
+		},
+		{
+			name:       "mixed ascii and multibyte",
+			input:      "v1.à.0", // "v1.à.0" — à (U+00E0) is 2 bytes
+			wantOutput: "v1.-.0", // à → '-'; dots are allowed so no collapse across them
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			// BuildStemcellFilename calls sanitizeStemcellPart internally.
+			// Drive it with version "1.0" and a known sha; check the name segment.
+			got := pve.BuildStemcellFilename(tc.input, "1.0", "abcdef1234567890")
+			// Output must be ASCII-only.
+			for _, r := range got {
+				if r > 127 {
+					t.Errorf("non-ASCII rune %U in output %q for input %q", r, got, tc.input)
+				}
+			}
+			if tc.wantOutput != "" {
+				// The name segment is between "bosh-stemcell-" prefix and
+				// the first "-1.0-" (version separator).
+				prefix := "bosh-stemcell-"
+				versionSep := "-1.0-"
+				if !strings.HasPrefix(got, prefix) {
+					t.Errorf("output %q missing expected prefix %q", got, prefix)
+					return
+				}
+				after := got[len(prefix):]
+				idx := strings.Index(after, versionSep)
+				if idx < 0 {
+					t.Errorf("output %q missing version separator %q", got, versionSep)
+					return
+				}
+				namePart := after[:idx]
+				if namePart != tc.wantOutput {
+					t.Errorf("sanitized name = %q; want %q (full output: %q)", namePart, tc.wantOutput, got)
+				}
+			}
+		})
+	}
+}
+

@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
-	"unicode"
 
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/nodes"
 )
@@ -48,14 +47,17 @@ func BuildStemcellFilename(name, version, sha256hex string) string {
 
 // sanitizeStemcellPart lowercases s, replaces characters outside [a-z0-9._]
 // with "-", and collapses consecutive "-" runs to a single "-".
+//
+// Iteration uses range over the string so multi-byte UTF-8 runes are processed
+// as a unit: a single non-ASCII rune produces exactly one "-" rather than one
+// "-" per byte, keeping output length predictable for multi-byte inputs.
 func sanitizeStemcellPart(s string) string {
 	s = strings.ToLower(s)
 	var buf []byte
 	prevDash := false
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if isAllowedStemcellByte(c) {
-			buf = append(buf, c)
+	for _, r := range s {
+		if isAllowedStemcellRune(r) {
+			buf = append(buf, byte(r)) // r is ASCII at this point (a-z, 0-9, '.', '_')
 			prevDash = false
 		} else {
 			if !prevDash {
@@ -69,10 +71,12 @@ func sanitizeStemcellPart(s string) string {
 	return result
 }
 
-// isAllowedStemcellByte reports whether b is in [a-z0-9._].
-func isAllowedStemcellByte(b byte) bool {
-	r := rune(b)
-	return unicode.IsLower(r) || unicode.IsDigit(r) || b == '.' || b == '_'
+// isAllowedStemcellRune reports whether r is in the ASCII subset [a-z0-9._].
+// Non-ASCII runes (any rune > 127) always return false so the caller replaces
+// them with a single '-'. This intentionally excludes Unicode lowercase letters
+// such as 'é' — only the 26 ASCII letters, digits 0-9, '.', and '_' are valid.
+func isAllowedStemcellRune(r rune) bool {
+	return (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '.' || r == '_'
 }
 
 // BuildStemcellCID composes the BOSH stemcell CID from the storage pool name

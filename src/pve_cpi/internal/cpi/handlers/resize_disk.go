@@ -45,23 +45,23 @@ func HandleResizeDisk(deps Deps) Handler {
 		// 1. Unmarshal and validate arguments.
 		// ----------------------------------------------------------------
 		if len(args) < 2 {
-			return nil, fmt.Errorf("resize_disk: expected 2 arguments (disk_cid, new_size_mb), got %d", len(args))
+			return nil, cpierrors.Cloud("resize_disk: expected 2 arguments (disk_cid, new_size_mb), got %d", len(args))
 		}
 
 		var diskCID string
 		if err := json.Unmarshal(args[0], &diskCID); err != nil {
-			return nil, fmt.Errorf("resize_disk: args[0] disk_cid must be a string: %w", err)
+			return nil, cpierrors.Wrap(err, "resize_disk: args[0] disk_cid must be a string")
 		}
 		if diskCID == "" {
-			return nil, fmt.Errorf("resize_disk: args[0] disk_cid must not be empty")
+			return nil, cpierrors.Cloud("resize_disk: args[0] disk_cid must not be empty")
 		}
 
 		var newSizeMB int
 		if err := json.Unmarshal(args[1], &newSizeMB); err != nil {
-			return nil, fmt.Errorf("resize_disk: args[1] new_size_mb must be an integer: %w", err)
+			return nil, cpierrors.Wrap(err, "resize_disk: args[1] new_size_mb must be an integer")
 		}
 		if newSizeMB <= 0 {
-			return nil, fmt.Errorf("resize_disk: new_size_mb must be > 0, got %d", newSizeMB)
+			return nil, cpierrors.Cloud("resize_disk: new_size_mb must be > 0, got %d", newSizeMB)
 		}
 
 		// ----------------------------------------------------------------
@@ -86,7 +86,7 @@ func HandleResizeDisk(deps Deps) Handler {
 		diskID, err := pve.ResolveDiskID(ctx, deps.PVE, node, vmid, diskCID)
 		if err != nil {
 			// ResolveDiskID returns CloudError when disk not attached.
-			return nil, fmt.Errorf("resize_disk: cannot resolve diskID for %s on VM %d: %w", diskCID, vmid, err)
+			return nil, cpierrors.Wrap(err, fmt.Sprintf("resize_disk: cannot resolve diskID for %s on VM %d", diskCID, vmid))
 		}
 
 		// ----------------------------------------------------------------
@@ -143,17 +143,17 @@ func HandleResizeDisk(deps Deps) Handler {
 		// ----------------------------------------------------------------
 		cfg, err := deps.PVE.QEMU().Config(ctx, node, vmid)
 		if err != nil {
-			return nil, fmt.Errorf("resize_disk: failed to read VM %d config: %w", vmid, err)
+			return nil, cpierrors.Wrap(err, fmt.Sprintf("resize_disk: failed to read VM %d config", vmid))
 		}
 
 		diskOptStr, ok := cfg[diskID].(string)
 		if !ok || diskOptStr == "" {
-			return nil, fmt.Errorf("resize_disk: disk %q not found in VM %d config", diskID, vmid)
+			return nil, cpierrors.Cloud("resize_disk: disk %q not found in VM %d config", diskID, vmid)
 		}
 
 		currentGiB, parseErr := parseDiskSizeGiB(diskOptStr)
 		if parseErr != nil {
-			return nil, fmt.Errorf("resize_disk: cannot determine current size of disk %s: %w", diskCID, parseErr)
+			return nil, cpierrors.Wrap(parseErr, "resize_disk: cannot determine current size of disk "+diskCID)
 		}
 
 		// ----------------------------------------------------------------
@@ -198,8 +198,7 @@ func HandleResizeDisk(deps Deps) Handler {
 			return pve.AwaitTaskWithLogger(ctx, deps.PVE, node, upid, deps.Logger)
 		})
 		if rerr != nil {
-			return nil, fmt.Errorf("resize_disk: ResizeDisk failed for VM %d disk %s (+%dG): %w",
-				vmid, diskCID, deltaGiB, pve.WrapError(rerr))
+			return nil, cpierrors.Wrap(pve.WrapError(rerr), fmt.Sprintf("resize_disk: ResizeDisk failed for VM %d disk %s (+%dG)", vmid, diskCID, deltaGiB))
 		}
 
 		deps.Logger.Info("resize_disk",
@@ -233,11 +232,11 @@ func parseDiskSizeGiB(optStr string) (int, error) {
 		if strings.HasSuffix(sizeVal, "G") {
 			n, err := strconv.Atoi(strings.TrimSuffix(sizeVal, "G"))
 			if err != nil {
-				return 0, fmt.Errorf("cannot parse size value %q: %w", sizeVal, err)
+				return 0, cpierrors.Wrap(err, "cannot parse size value "+sizeVal)
 			}
 			return n, nil
 		}
-		return 0, fmt.Errorf("unsupported size unit in %q (only GiB supported)", sizeVal)
+		return 0, cpierrors.Cloud("unsupported size unit in %q (only GiB supported)", sizeVal)
 	}
-	return 0, fmt.Errorf("size option not found in disk option string %q", optStr)
+	return 0, cpierrors.Cloud("size option not found in disk option string %q", optStr)
 }

@@ -5,25 +5,21 @@ import (
 	"errors"
 	"testing"
 
+	sdkcluster "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cluster"
+
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/cpi/handlers"
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
 )
 
-// TestHandleHasVM_Exists verifies true is returned when VM config fetch succeeds.
+// TestHandleHasVM_Exists verifies true is returned when the cluster scan finds
+// the VM. The handler no longer calls QEMU.Config; the cluster scan is the sole
+// existence check.
 func TestHandleHasVM_Exists(t *testing.T) {
 	t.Parallel()
 
-	qemuSvc := &mockQEMUService{
-		configFn: func(_ context.Context, node string, vmid int) (map[string]interface{}, error) {
-			if node != "pve-node1" || vmid != 101 {
-				t.Errorf("Config: unexpected node=%q vmid=%d", node, vmid)
-			}
-			return map[string]interface{}{"cores": 2.0, "memory": 2048.0}, nil
-		},
-	}
-
-	h := handlers.HandleHasVM(testDeps(qemuSvc, nil, nil, &mockAgentService{}))
+	// Cluster scan returns vmid 101 on "pve-node1".
+	h := handlers.HandleHasVM(testDepsFoundVM(101, nil, nil, nil, &mockAgentService{}))
 	result, err := h.Handle(context.Background(), marshalArgs("101"), jsonrpc.Context{})
 
 	if err != nil {
@@ -38,21 +34,17 @@ func TestHandleHasVM_Exists(t *testing.T) {
 	}
 }
 
-// TestHandleHasVM_NotExists verifies false is returned on 404.
+// TestHandleHasVM_NotExists verifies false is returned when the cluster scan
+// returns no match for the VM.
 func TestHandleHasVM_NotExists(t *testing.T) {
 	t.Parallel()
 
-	qemuSvc := &mockQEMUService{
-		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
-			return nil, notFoundAPIErr()
-		},
-	}
-
-	h := handlers.HandleHasVM(testDeps(qemuSvc, nil, nil, &mockAgentService{}))
+	// testDeps wires empty cluster list: vmid 999 will not be found.
+	h := handlers.HandleHasVM(testDeps(nil, nil, nil, &mockAgentService{}))
 	result, err := h.Handle(context.Background(), marshalArgs("999"), jsonrpc.Context{})
 
 	if err != nil {
-		t.Fatalf("404 should yield false result, not error: %v", err)
+		t.Fatalf("cluster-not-found should yield false result, not error: %v", err)
 	}
 	got, ok := result.(bool)
 	if !ok {
@@ -63,22 +55,23 @@ func TestHandleHasVM_NotExists(t *testing.T) {
 	}
 }
 
-// TestHandleHasVM_SDKError verifies non-404 SDK errors are propagated.
-func TestHandleHasVM_SDKError(t *testing.T) {
+// TestHandleHasVM_ClusterTransportError verifies that a cluster scan transport
+// error is propagated as a CPI error (caller may retry).
+func TestHandleHasVM_ClusterTransportError(t *testing.T) {
 	t.Parallel()
 
-	sdkErr := errors.New("network timeout")
-	qemuSvc := &mockQEMUService{
-		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
-			return nil, sdkErr
+	transportErr := errors.New("network timeout")
+	clusterSvc := &mockClusterSvc{
+		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+			return nil, transportErr
 		},
 	}
 
-	h := handlers.HandleHasVM(testDeps(qemuSvc, nil, nil, &mockAgentService{}))
+	h := handlers.HandleHasVM(testDepsWithCluster(nil, nil, nil, &mockAgentService{}, &mockStorageService{}, clusterSvc))
 	_, err := h.Handle(context.Background(), marshalArgs("101"), jsonrpc.Context{})
 
 	if err == nil {
-		t.Fatal("expected error from SDK failure, got nil")
+		t.Fatal("expected error from cluster transport failure, got nil")
 	}
 	var cpiErr *cpierrors.Error
 	if !errors.As(err, &cpiErr) {

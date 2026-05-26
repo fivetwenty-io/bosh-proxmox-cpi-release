@@ -18,36 +18,40 @@ import (
 //
 // Arguments (positional JSON array):
 //
-//	[0] snapshot_cid  string — snapshot CID of the form "<vmid>:<snap_name>"
+//	[0] snapshot_cid  string -- snapshot CID of the form "<vmid>:<snap_name>"
 //
 // Returns: null on success (BOSH void method).
 //
 // Idempotency: a 404 from PVE (snapshot not found) is treated as success.
 // This matches BOSH Director expectations for delete operations, which may be
 // retried after partial failures.
+//
+// The VM node is resolved via cluster scan (FindVMNodeViaCluster) so the call
+// works after an HA failover. When the VM is not found in the cluster the
+// handler returns nil (idempotent: if the VM is gone the snapshot is gone).
 func HandleDeleteSnapshot(deps Deps) Handler {
 	return HandlerFunc(func(ctx context.Context, args []json.RawMessage, _ jsonrpc.Context) (any, error) {
 		// ----------------------------------------------------------------
 		// 1. Unmarshal and validate arguments.
 		// ----------------------------------------------------------------
 		if len(args) < 1 {
-			return nil, fmt.Errorf("delete_snapshot: expected 1 argument (snapshot_cid), got 0")
+			return nil, cpierrors.Cloud("delete_snapshot: expected 1 argument (snapshot_cid), got 0")
 		}
 
 		var snapshotCID string
 		if err := json.Unmarshal(args[0], &snapshotCID); err != nil {
-			return nil, fmt.Errorf("delete_snapshot: args[0] snapshot_cid must be a string: %w", err)
+			return nil, cpierrors.Wrap(err, "delete_snapshot: args[0] snapshot_cid must be a string")
 		}
 		if snapshotCID == "" {
-			return nil, fmt.Errorf("delete_snapshot: args[0] snapshot_cid must not be empty")
+			return nil, cpierrors.Cloud("delete_snapshot: args[0] snapshot_cid must not be empty")
 		}
 
 		// ----------------------------------------------------------------
-		// 2. Parse snapshot_cid → vmCID + snapName.
+		// 2. Parse snapshot_cid -> vmCID + snapName.
 		// ----------------------------------------------------------------
 		vmCID, snapName, err := pve.ParseSnapshotCID(snapshotCID)
 		if err != nil {
-			return nil, fmt.Errorf("delete_snapshot: invalid snapshot_cid %q: %w", snapshotCID, err)
+			return nil, cpierrors.Wrap(err, "delete_snapshot: invalid snapshot_cid "+snapshotCID)
 		}
 
 		vmid, err := strconv.Atoi(vmCID)
@@ -55,13 +59,31 @@ func HandleDeleteSnapshot(deps Deps) Handler {
 			return nil, cpierrors.VMNotFound(vmCID)
 		}
 
-		node := deps.Config.Node
-		if node == "" {
-			return nil, fmt.Errorf("delete_snapshot: node is not configured")
+		// ----------------------------------------------------------------
+		// 3. Locate VM via cluster scan to get authoritative node.
+		// ----------------------------------------------------------------
+		node, found, lookupErr := pve.FindVMNodeViaCluster(ctx, deps.PVE, vmid)
+		if lookupErr != nil {
+			return nil, cpierrors.Wrap(pve.WrapError(lookupErr),
+				fmt.Sprintf("delete_snapshot: locate VM %s", vmCID))
+		}
+		if !found || node == "" {
+			// VM absent -> snapshot is necessarily absent. Idempotent success.
+			deps.Logger.Info("delete_snapshot: VM not found in cluster -- snapshot already absent",
+				log.String("snapshot_cid", snapshotCID),
+				log.Int("vmid", vmid),
+			)
+			return nil, nil
 		}
 
+		deps.Logger.Debug("delete_snapshot: VM located via cluster scan",
+			log.String("snapshot_cid", snapshotCID),
+			log.Int("vmid", vmid),
+			log.String("node", node),
+		)
+
 		// ----------------------------------------------------------------
-		// 3. Delete snapshot via SDK. 404 → idempotent success.
+		// 4. Delete snapshot via SDK. 404 -> idempotent success.
 		// ----------------------------------------------------------------
 		delErr := pve.RetryOnTransientOrLock(ctx, deps.Logger, "delete_snapshot", 0, func() error {
 			return deps.PVE.QEMU().DeleteSnapshot(ctx, node, vmid, snapName)
@@ -75,9 +97,7 @@ func HandleDeleteSnapshot(deps Deps) Handler {
 				)
 				return nil, nil
 			}
-			wrapped := pve.WrapError(err)
-			return nil, fmt.Errorf("delete_snapshot: DeleteSnapshot failed for VM %s snap %s: %w",
-				vmCID, snapName, wrapped)
+			return nil, cpierrors.Wrap(pve.WrapError(err), "delete_snapshot: DeleteSnapshot failed for VM "+vmCID+" snap "+snapName)
 		}
 
 		// PVE deletes snapshots via an async worker task, and the SDK discards
@@ -88,8 +108,7 @@ func HandleDeleteSnapshot(deps Deps) Handler {
 		// means the snapshot existed and a deletion task is in flight.
 		if waitErr := pve.WaitForSnapshotAbsent(ctx, deps.PVE, node, vmid, snapName,
 			pve.WithMaxWait(120*time.Second)); waitErr != nil {
-			return nil, fmt.Errorf("delete_snapshot: waiting for snapshot %s removal on VM %s: %w",
-				snapName, vmCID, waitErr)
+			return nil, cpierrors.Wrap(waitErr, "delete_snapshot: waiting for snapshot "+snapName+" removal on VM "+vmCID)
 		}
 
 		deps.Logger.Info("delete_snapshot",

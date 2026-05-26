@@ -34,19 +34,21 @@ const maxTagLength = 255
 //
 // Logic:
 //  1. Parse vm_cid → vmid int.
-//  2. Decode metadata map.
-//  3. Build description string: sorted "key: value\n" lines (matches Perl reference).
-//  4. Build tags string: extract director, deployment, job; emit as "<key>--<value>"
+//  2. Locate VM via cluster scan (FindVMNodeViaCluster) to get authoritative node.
+//     Not-found → VMNotFound. Transport error → propagate.
+//  3. Decode metadata map.
+//  4. Build description string: sorted "key: value\n" lines (matches Perl reference).
+//  5. Build tags string: extract director, deployment, job; emit as "<key>--<value>"
 //     entries (PVE tags allow only alphanumerics and "-"). Also extract the BOSH
 //     instance name ("<job>/<id>") and emit "<job>--<id>" (PVE tags reject "/").
 //     Join with ";"; truncate to maxTagLength bytes at a tag boundary.
-//  4a. Derive a DNS-label VM name as "<job>-<index>" (e.g. "diego-cell-0",
+//  5a. Derive a DNS-label VM name as "<job>-<index>" (e.g. "diego-cell-0",
 //     "bosh-0") so the PVE UI shows the human-readable BOSH instance
 //     identifier instead of the placeholder "vm-<vmid>" written at create_vm
 //     time. The UUID-bearing metadata["name"] ("<job>/<id>") is used only as
 //     a fallback when job or index is missing.
-//  5. Call nodes.UpdateQemuConfig with description + tags. Overwrites existing values.
-//  6. 404 → return VMNotFound.
+//  6. Call nodes.UpdateQemuConfig with description + tags. Overwrites existing values.
+//  7. 404 → return VMNotFound.
 //
 // Empty metadata is valid; description and tags will be empty strings.
 // Returns nil result on success.
@@ -80,12 +82,24 @@ func HandleSetVMMetadata(deps Deps) cpi.Handler {
 			}
 		}
 
-		node := deps.Config.Node
 		logger := deps.Logger.With(
 			log.String("method", "set_vm_metadata"),
 			log.String("vm_cid", vmCID),
 			log.Int("vmid", vmid),
 		)
+
+		// --- locate VM via cluster scan ---
+		// Queries /cluster/resources for the authoritative node, correct even
+		// after an HA failover. Not-found → VMNotFound. Transport error → propagate.
+		logger.Debug("set_vm_metadata: locating VM via cluster scan")
+		node, found, lookupErr := pve.FindVMNodeViaCluster(ctx, deps.PVE, vmid)
+		if lookupErr != nil {
+			return nil, cpierrors.Wrap(pve.WrapError(lookupErr), fmt.Sprintf("set_vm_metadata: locate VM %s", vmCID))
+		}
+		if !found || node == "" {
+			return nil, cpierrors.VMNotFound(vmCID)
+		}
+		logger.Debug("set_vm_metadata: VM located", log.String("node", node))
 
 		// --- build description ---
 		// Sorted "key: value\n" lines matching Perl reference behavior.

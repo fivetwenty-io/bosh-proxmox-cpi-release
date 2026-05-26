@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -66,16 +67,21 @@ func TestAwaitTask_Success(t *testing.T) {
 	}
 }
 
-func TestAwaitTask_SuccessEmptyExitStatus(t *testing.T) {
-	// SDK treats "" as success; AwaitTask must also.
+func TestAwaitTask_EmptyExitStatusReturnsError(t *testing.T) {
+	// Empty exit status means PVE never wrote a terminal ExitStatus — the task
+	// poller returned before the task completed or was killed without recording
+	// an outcome. AwaitTask must treat this as an error, not as success.
 	svc := &mockTasksService{
 		waitFn: func(_ context.Context, _, upid string, _ *sdktasks.WaitOptions) (*sdktasks.Status, error) {
 			return &sdktasks.Status{Status: "stopped", ExitStatus: "", UpID: upid}, nil
 		},
 	}
 	err := pve.AwaitTask(context.Background(), newMockClient(svc), "node1", "UPID:node1:abc")
-	if err != nil {
-		t.Fatalf("expected nil error for empty exit status, got: %v", err)
+	if err == nil {
+		t.Fatal("expected error for empty exit status, got nil")
+	}
+	if !strings.Contains(err.Error(), "empty exit status") {
+		t.Errorf("error message should mention empty exit status, got: %v", err)
 	}
 }
 
