@@ -477,3 +477,125 @@ func TestHandleDetachDisk_SnapshotPresent_AllowOverride(t *testing.T) {
 		t.Error("DetachDisk must be called when allow_disk_ops_with_snapshots=true overrides the guard")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// CID-variant success tests (static/shared backend).
+//
+// detach_disk has no storage-type branching — the CID is parsed to extract
+// storage+volid and passed opaquely to ResolveDiskID/DetachDisk. These tests
+// exercise ParseDiskCID with the four active local storage-type formats and
+// verify that DetachDisk is called in each case.
+// ---------------------------------------------------------------------------
+
+// TestHandleDetachDisk_LVM_CID verifies that a standard LVM CID
+// ("local-lvm:vm-9001-disk-0") is parsed correctly and detach proceeds.
+func TestHandleDetachDisk_LVM_CID(t *testing.T) {
+	const diskCID = "local-lvm:vm-9001-disk-0"
+
+	qemuSvc := &detachQEMUService{
+		configCfg: map[string]interface{}{"scsi1": diskCID},
+	}
+	h := handlers.HandleDetachDisk(detachDeps(qemuSvc))
+
+	result, err := h.Handle(context.Background(), detachArgs("100", diskCID), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("LVM CID: unexpected error: %v", err)
+	}
+	if result != nil {
+		t.Errorf("LVM CID: expected nil result (void), got %v", result)
+	}
+	if !qemuSvc.detachCalled {
+		t.Error("LVM CID: DetachDisk not called")
+	}
+}
+
+// TestHandleDetachDisk_ZFSPool_CID verifies that a ZFS pool bare-volname CID
+// ("local-zfs:vm-9001-disk-0") is parsed correctly and detach proceeds.
+func TestHandleDetachDisk_ZFSPool_CID(t *testing.T) {
+	const diskCID = "local-zfs:vm-9001-disk-0"
+
+	qemuSvc := &detachQEMUService{
+		configCfg: map[string]interface{}{"scsi1": diskCID},
+	}
+	h := handlers.HandleDetachDisk(detachDeps(qemuSvc))
+
+	result, err := h.Handle(context.Background(), detachArgs("100", diskCID), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("ZFSPool CID: unexpected error: %v", err)
+	}
+	if result != nil {
+		t.Errorf("ZFSPool CID: expected nil result (void), got %v", result)
+	}
+	if !qemuSvc.detachCalled {
+		t.Error("ZFSPool CID: DetachDisk not called")
+	}
+}
+
+// TestHandleDetachDisk_Dir_CID verifies that a dir-type subpath CID
+// ("local:9001/vm-9001-disk-0.raw") is parsed correctly and detach proceeds.
+// ParseDiskCID splits on the first colon; the volume segment is opaque to the handler.
+func TestHandleDetachDisk_Dir_CID(t *testing.T) {
+	const diskCID = "local:9001/vm-9001-disk-0.raw"
+
+	qemuSvc := &detachQEMUService{
+		configCfg: map[string]interface{}{"scsi1": diskCID},
+	}
+	h := handlers.HandleDetachDisk(detachDeps(qemuSvc))
+
+	result, err := h.Handle(context.Background(), detachArgs("100", diskCID), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("Dir CID: unexpected error: %v", err)
+	}
+	if result != nil {
+		t.Errorf("Dir CID: expected nil result (void), got %v", result)
+	}
+	if !qemuSvc.detachCalled {
+		t.Error("Dir CID: DetachDisk not called")
+	}
+}
+
+// TestHandleDetachDisk_LVMThin_CID verifies that an LVMThin bare-volname CID
+// ("local-lvm-thin:vm-9001-disk-0") is parsed correctly and detach proceeds.
+func TestHandleDetachDisk_LVMThin_CID(t *testing.T) {
+	const diskCID = "local-lvm-thin:vm-9001-disk-0"
+
+	qemuSvc := &detachQEMUService{
+		configCfg: map[string]interface{}{"scsi1": diskCID},
+	}
+	h := handlers.HandleDetachDisk(detachDeps(qemuSvc))
+
+	result, err := h.Handle(context.Background(), detachArgs("100", diskCID), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("LVMThin CID: unexpected error: %v", err)
+	}
+	if result != nil {
+		t.Errorf("LVMThin CID: expected nil result (void), got %v", result)
+	}
+	if !qemuSvc.detachCalled {
+		t.Error("LVMThin CID: DetachDisk not called")
+	}
+}
+
+// TODO(storage-network): nfs — wired to PVE network-call boundary, stubbed pending
+// live shared-storage test infrastructure. Storage: nfs-store:9001/vm-9001-disk-0.qcow2. Re-enable when
+// integration-test harness provides a nfs pool via env.
+//
+// func TestHandleDetachDisk_NFS_CID(t *testing.T) { ... }
+
+// TODO(storage-network): rbd — wired to PVE network-call boundary, stubbed pending
+// live shared-storage test infrastructure. Storage: ceph-pool:vm-9001-disk-0. Re-enable when
+// integration-test harness provides a rbd pool via env.
+//
+// func TestHandleDetachDisk_RBD_CID(t *testing.T) { ... }
+
+// TODO(storage-network): cephfs — wired to PVE network-call boundary, stubbed pending
+// live shared-storage test infrastructure. Storage: cephfs-pool:vm-9001-disk-0. Re-enable when
+// integration-test harness provides a cephfs pool via env.
+//
+// func TestHandleDetachDisk_CephFS_CID(t *testing.T) { ... }
+
+// TODO(storage-network): cifs — wired to PVE network-call boundary, stubbed pending
+// live shared-storage test infrastructure. Storage: cifs-store:9001/vm-9001-disk-0.qcow2. Re-enable when
+// integration-test harness provides a cifs pool via env.
+//
+// func TestHandleDetachDisk_CIFS_CID(t *testing.T) { ... }

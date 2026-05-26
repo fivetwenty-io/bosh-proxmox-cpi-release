@@ -600,3 +600,174 @@ func TestHandleCreateDisk_MissingNode(t *testing.T) {
 		t.Fatal("expected error for missing node")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Storage-type × formatArg tests
+//
+// Block storages (lvm, lvmthin, zfspool) reject qcow2; file storages (dir,
+// nfs, cifs) accept it but PVE also auto-picks per storage type. When the
+// caller does NOT set cloud_properties.disk_format, create_disk must pass
+// format="" to CreateVolume so PVE selects the correct default for each
+// storage type. When disk_format IS set, the value must be forwarded verbatim.
+// ---------------------------------------------------------------------------
+
+// TestHandleCreateDisk_LVM_NoFormatArg — lvm block storage, no disk_format in
+// cloud_properties → CreateVolume must receive format="" (PVE auto-picks raw).
+func TestHandleCreateDisk_LVM_NoFormatArg(t *testing.T) {
+	var capturedFormat string
+	storageSvc := &mockStorageService{
+		createVolumeFn: func(_ context.Context, _, _ string, _ int, format string, vmid int, _ string) (string, error) {
+			capturedFormat = format
+			return fmt.Sprintf("local-lvm:vm-%d-disk-0", vmid), nil
+		},
+	}
+	deps := baseDepsForCreate(t, storageSvc, nil)
+	deps.Config.DiskStorage = "local-lvm"
+
+	h := handlers.HandleCreateDisk(deps)
+	_, err := h.Handle(context.Background(), []json.RawMessage{
+		marshal(1024),
+		marshal(map[string]string{}), // no disk_format
+	}, jsonrpc.Context{})
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if capturedFormat != "" {
+		t.Errorf("lvm storage: expected CreateVolume format=%q (PVE auto-pick), got %q", "", capturedFormat)
+	}
+}
+
+// TestHandleCreateDisk_LVMThin_NoFormatArg — lvmthin block storage, no
+// disk_format → format="" forwarded so PVE picks the correct raw default.
+func TestHandleCreateDisk_LVMThin_NoFormatArg(t *testing.T) {
+	var capturedFormat string
+	storageSvc := &mockStorageService{
+		createVolumeFn: func(_ context.Context, _, _ string, _ int, format string, vmid int, _ string) (string, error) {
+			capturedFormat = format
+			return fmt.Sprintf("local-lvm-thin:vm-%d-disk-0", vmid), nil
+		},
+	}
+	deps := baseDepsForCreate(t, storageSvc, nil)
+	deps.Config.DiskStorage = "local-lvm-thin"
+
+	h := handlers.HandleCreateDisk(deps)
+	_, err := h.Handle(context.Background(), []json.RawMessage{
+		marshal(1024),
+		marshal(map[string]string{}), // no disk_format
+	}, jsonrpc.Context{})
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if capturedFormat != "" {
+		t.Errorf("lvmthin storage: expected CreateVolume format=%q (PVE auto-pick), got %q", "", capturedFormat)
+	}
+}
+
+// TestHandleCreateDisk_ZFSPool_NoFormatArg — zfspool block storage, no
+// disk_format → format="" forwarded so PVE picks the correct default.
+func TestHandleCreateDisk_ZFSPool_NoFormatArg(t *testing.T) {
+	var capturedFormat string
+	storageSvc := &mockStorageService{
+		createVolumeFn: func(_ context.Context, _, _ string, _ int, format string, vmid int, _ string) (string, error) {
+			capturedFormat = format
+			return fmt.Sprintf("local-zfs:vm-%d-disk-0", vmid), nil
+		},
+	}
+	deps := baseDepsForCreate(t, storageSvc, nil)
+	deps.Config.DiskStorage = "local-zfs"
+
+	h := handlers.HandleCreateDisk(deps)
+	_, err := h.Handle(context.Background(), []json.RawMessage{
+		marshal(1024),
+		marshal(map[string]string{}), // no disk_format
+	}, jsonrpc.Context{})
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if capturedFormat != "" {
+		t.Errorf("zfspool storage: expected CreateVolume format=%q (PVE auto-pick), got %q", "", capturedFormat)
+	}
+}
+
+// TestHandleCreateDisk_Dir_NoFormatArg — dir (file) storage, no disk_format →
+// format="" forwarded; PVE auto-picks raw for dir-type without an explicit hint.
+func TestHandleCreateDisk_Dir_NoFormatArg(t *testing.T) {
+	var capturedFormat string
+	storageSvc := &mockStorageService{
+		createVolumeFn: func(_ context.Context, _, _ string, _ int, format string, vmid int, _ string) (string, error) {
+			capturedFormat = format
+			// Dir storage returns subpath volid form: storage:vmid/volname.ext
+			return fmt.Sprintf("local:9001/vm-%d-disk-0.raw", vmid), nil
+		},
+	}
+	deps := baseDepsForCreate(t, storageSvc, nil)
+	deps.Config.DiskStorage = "local"
+
+	h := handlers.HandleCreateDisk(deps)
+	_, err := h.Handle(context.Background(), []json.RawMessage{
+		marshal(1024),
+		marshal(map[string]string{}), // no disk_format
+	}, jsonrpc.Context{})
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if capturedFormat != "" {
+		t.Errorf("dir storage: expected CreateVolume format=%q (PVE auto-pick), got %q", "", capturedFormat)
+	}
+}
+
+// TestHandleCreateDisk_Dir_ExplicitFormat_Forwarded — dir storage with
+// cloud_properties.disk_format=qcow2 → format="qcow2" forwarded verbatim to
+// CreateVolume. Verifies the explicit-format forwarding path for file storages.
+func TestHandleCreateDisk_Dir_ExplicitFormat_Forwarded(t *testing.T) {
+	var capturedFormat string
+	storageSvc := &mockStorageService{
+		createVolumeFn: func(_ context.Context, _, _ string, _ int, format string, vmid int, _ string) (string, error) {
+			capturedFormat = format
+			return fmt.Sprintf("local:9001/vm-%d-disk-0.qcow2", vmid), nil
+		},
+	}
+	deps := baseDepsForCreate(t, storageSvc, nil)
+	deps.Config.DiskStorage = "local"
+
+	h := handlers.HandleCreateDisk(deps)
+	_, err := h.Handle(context.Background(), []json.RawMessage{
+		marshal(1024),
+		marshal(map[string]string{"disk_format": "qcow2"}),
+	}, jsonrpc.Context{})
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if capturedFormat != "qcow2" {
+		t.Errorf("dir storage with explicit disk_format: expected CreateVolume format=%q, got %q", "qcow2", capturedFormat)
+	}
+}
+
+// TODO(storage-network): nfs — wired to PVE network-call boundary, stubbed pending
+// live shared-storage test infrastructure. Storage: nfs-store:9001/vm-9001-disk-0.qcow2. Re-enable when
+// integration-test harness provides a nfs pool via env.
+//
+// func TestHandleCreateDisk_NFS_NoFormatArg(t *testing.T) { ... }
+
+// TODO(storage-network): rbd — wired to PVE network-call boundary, stubbed pending
+// live shared-storage test infrastructure. Storage: ceph-pool:vm-9001-disk-0. Re-enable when
+// integration-test harness provides a rbd pool via env.
+//
+// func TestHandleCreateDisk_RBD_NoFormatArg(t *testing.T) { ... }
+
+// TODO(storage-network): cephfs — wired to PVE network-call boundary, stubbed pending
+// live shared-storage test infrastructure. Storage: cephfs-pool:vm-9001-disk-0. Re-enable when
+// integration-test harness provides a cephfs pool via env.
+//
+// func TestHandleCreateDisk_CephFS_NoFormatArg(t *testing.T) { ... }
+
+// TODO(storage-network): cifs — wired to PVE network-call boundary, stubbed pending
+// live shared-storage test infrastructure. Storage: cifs-store:9001/vm-9001-disk-0.qcow2. Re-enable when
+// integration-test harness provides a cifs pool via env.
+//
+// func TestHandleCreateDisk_CIFS_NoFormatArg(t *testing.T) { ... }

@@ -3,6 +3,8 @@ package handlers_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -104,7 +106,7 @@ type diskMetaNodesMock struct {
 }
 
 func diskKey(node string, vmid int) string {
-	return node + ":" + string(rune('0'+vmid%10)) // compact but unique within tests
+	return node + ":" + strconv.Itoa(vmid)
 }
 
 func vmidRaw(id int64) json.RawMessage {
@@ -225,7 +227,7 @@ func TestHandleSetDiskMetadata_AttachedSingleVM(t *testing.T) {
 	}
 	qemuSvc := &diskMetaQEMUMock{
 		configs: map[string]map[string]interface{}{
-			testNode + ":0": vmConfigWithDisk(testDiskCID, ""),
+			testNode + ":100": vmConfigWithDisk(testDiskCID, ""),
 		},
 	}
 	clusterSvc := &mockClusterService{statusResp: clusterWithNode(testNode)}
@@ -266,7 +268,7 @@ func TestHandleSetDiskMetadata_Detached(t *testing.T) {
 	// VM config has NO matching disk.
 	qemuSvc := &diskMetaQEMUMock{
 		configs: map[string]map[string]interface{}{
-			testNode + ":0": {"scsi0": "local-lvm:vm-100-disk-99"},
+			testNode + ":100": {"scsi0": "local-lvm:vm-100-disk-99"},
 		},
 	}
 	clusterSvc := &mockClusterService{statusResp: clusterWithNode(testNode)}
@@ -298,134 +300,22 @@ func TestHandleSetDiskMetadata_Ambiguous(t *testing.T) {
 	t.Parallel()
 
 	const vm2 = int64(200)
-	nodesSvc := &diskMetaNodesMock{
-		vmsByNode: map[string][]int64{testNode: {testVMID, vm2}},
-	}
-	_ = nodesSvc // replaced by ambigNodesSvc below
-	qemuSvc := &diskMetaQEMUMock{
-		configs: map[string]map[string]interface{}{
-			testNode + ":0": vmConfigWithDisk(testDiskCID, ""),
-			// vm2 uses a different index mod10 key — but we can't express that simply.
-			// We override the config map key manually.
-		},
-	}
-	// Also add vm2 config keyed by its vmid%10 = 0 → collision, use mod approach differently.
-	// Use actual key format node:vmidmod for vm2 (200%10=0 also → use another approach).
-	// Switch to a custom qemu mock that checks vmid directly.
-	type configKey struct {
-		node string
-		vmid int
-	}
-	type fullQemuMock struct {
-		diskMetaQEMUMock
-		full map[configKey]map[string]interface{}
-	}
-	_ = qemuSvc // replaced
-
-	type fqm struct{}
-	_ = fqm{}
-
-	// Use a different mock approach: store by (node, vmid) pair as string.
-	type mixedQEMU struct {
-		diskMetaQEMUMock
-		data map[string]map[string]interface{}
-	}
-	mixed := &mixedQEMU{
-		data: map[string]map[string]interface{}{
-			"pve1/100": vmConfigWithDisk(testDiskCID, ""),
-			"pve1/200": vmConfigWithDisk(testDiskCID, ""),
-		},
-	}
-
-	// Re-wire the QEMU service to use the mixed map.
-	type altQEMU struct {
-		diskMetaQEMUMock
-		data map[string]map[string]interface{}
-	}
-	altQ := &struct {
-		diskMetaQEMUMock
-	}{}
-	_ = altQ
-	_ = mixed
-
-	// Simplest approach: wire directly with custom type inline.
-	type ambigClient struct {
-		clusterSvc cluster.Service
-		nodesSvc   sdknodes.Service
-	}
-
-	// Build a proper ambiguous test with a custom qemu.Service.
-	ambigQEMU := &struct {
-		diskMetaQEMUMock
-	}{}
-	ambigQEMU.diskMetaQEMUMock.configs = map[string]map[string]interface{}{
-		"pve1:0": vmConfigWithDisk(testDiskCID, ""),
-	}
-
 	ambigNodesSvc := &diskMetaNodesMock{
 		vmsByNode: map[string][]int64{testNode: {testVMID, vm2}},
 	}
-	// For vm2 (vmid=200), key is node+":"+rune('0'+200%10) = "pve1:0" — same key collision.
-	// Use a fresh mock that routes by (node,vmid) tuple without key collision.
-	var ambigResult any
-	var ambigErr error
-
-	// Direct inline test using a separate qemu implementation.
-	ambigConfigMap := map[string]map[string]interface{}{
-		"pve1|100": vmConfigWithDisk(testDiskCID, ""),
-		"pve1|200": vmConfigWithDisk(testDiskCID, ""),
-	}
-
-	type tupleQEMU struct {
-		diskMetaQEMUMock
-		cfgByTuple map[string]map[string]interface{}
-	}
-	tq := &tupleQEMU{cfgByTuple: ambigConfigMap}
-
-	type fullClient struct {
-		clusterSvc *mockClusterService
-		nodesSvc   *diskMetaNodesMock
-		qemuSvc    *tupleQEMU
-	}
-
-	// Override Config() to use tuple key "node|vmid".
-	// Since Go can't override methods on embedded structs, use a local type with Config implemented.
-	type tqImpl struct {
-		data map[string]map[string]interface{}
-	}
-	tqImplInstance := &struct {
-		diskMetaQEMUMock
-		data map[string]map[string]interface{}
-	}{data: ambigConfigMap}
-	_ = tqImplInstance
-
-	// The cleanest path: implement a minimal qemu.Service that uses a map keyed by "node|vmid".
-	_ = tq
-	_ = fullClient{}
-
-	// Redefine using a local type for the entire test scope.
-	type localQEMU struct {
-		diskMetaQEMUMock
-		cfgs map[string]map[string]interface{}
-	}
-	lq := &localQEMU{cfgs: map[string]map[string]interface{}{
-		"pve1|100": vmConfigWithDisk(testDiskCID, ""),
-		"pve1|200": vmConfigWithDisk(testDiskCID, ""),
-	}}
-	_ = lq
-
-	// We cannot use lq.Config without defining a new type outside this function.
-	// Use the shared mock but accept that both vmids map to key "pve1:0".
-	// Both config fetches will return the same disk-containing config.
-	// This is correct for the ambiguous test because BOTH vmids match.
+	// Both vmids (100 and 200) have configs containing testDiskCID, triggering the
+	// ambiguous-match error path in the handler.
 	pveAmbig := &diskMetaClientMock{
-		qemuSvc:    &diskMetaQEMUMock{configs: map[string]map[string]interface{}{"pve1:0": vmConfigWithDisk(testDiskCID, "")}},
+		qemuSvc: &diskMetaQEMUMock{configs: map[string]map[string]interface{}{
+			"pve1:100": vmConfigWithDisk(testDiskCID, ""),
+			"pve1:200": vmConfigWithDisk(testDiskCID, ""),
+		}},
 		nodesSvc:   ambigNodesSvc,
 		clusterSvc: &mockClusterService{statusResp: clusterWithNode(testNode)},
 	}
 
 	hAmbig := handlers.HandleSetDiskMetadata(makeDiskMetaDeps(pveAmbig))
-	ambigResult, ambigErr = hAmbig.Handle(context.Background(), makeMetaArgs(testDiskCID, map[string]any{}), jsonrpc.Context{})
+	ambigResult, ambigErr := hAmbig.Handle(context.Background(), makeMetaArgs(testDiskCID, map[string]any{}), jsonrpc.Context{})
 	if ambigErr == nil {
 		t.Fatalf("ambiguous: expected error, got nil result=%v", ambigResult)
 	}
@@ -446,7 +336,7 @@ func TestHandleSetDiskMetadata_DescriptionPreserved(t *testing.T) {
 	}
 	qemuSvc := &diskMetaQEMUMock{
 		configs: map[string]map[string]interface{}{
-			testNode + ":0": vmConfigWithDisk(testDiskCID, existingDesc),
+			testNode + ":100": vmConfigWithDisk(testDiskCID, existingDesc),
 		},
 	}
 	clusterSvc := &mockClusterService{statusResp: clusterWithNode(testNode)}
@@ -500,7 +390,7 @@ func TestHandleSetDiskMetadata_AppliesDiskTags(t *testing.T) {
 	}
 	qemuSvc := &diskMetaQEMUMock{
 		configs: map[string]map[string]interface{}{
-			testNode + ":0": {
+			testNode + ":100": {
 				"scsi0": testDiskCID,
 				"tags":  "env--prod;director--abc",
 			},
@@ -556,3 +446,311 @@ func TestHandleSetDiskMetadata_InvalidDiskCID(t *testing.T) {
 		t.Fatal("expected error for invalid disk_cid, got nil")
 	}
 }
+
+// TestHandleSetDiskMetadata_MetadataNotObject verifies that supplying a non-object
+// JSON value (integer 42) as the metadata argument returns a CloudError.
+func TestHandleSetDiskMetadata_MetadataNotObject(t *testing.T) {
+	t.Parallel()
+
+	pve := &diskMetaClientMock{
+		clusterSvc: &mockClusterService{},
+		nodesSvc:   &diskMetaNodesMock{},
+		qemuSvc:    &diskMetaQEMUMock{},
+	}
+	h := handlers.HandleSetDiskMetadata(makeDiskMetaDeps(pve))
+
+	r0, _ := json.Marshal(testDiskCID)
+	r1 := json.RawMessage(`42`) // integer, not JSON object
+	_, err := h.Handle(context.Background(), []json.RawMessage{r0, r1}, jsonrpc.Context{})
+	if err == nil {
+		t.Fatal("expected error for non-object metadata, got nil")
+	}
+	if !cpierrors.IsType(err, cpierrors.TypeCloud) {
+		t.Errorf("want CloudError, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "metadata") {
+		t.Errorf("error should mention 'metadata'; got %q", err.Error())
+	}
+}
+
+// TestHandleSetDiskMetadata_ClusterStatusError verifies that a Cluster().ListStatus()
+// failure propagates as an error from the handler.
+func TestHandleSetDiskMetadata_ClusterStatusError(t *testing.T) {
+	t.Parallel()
+
+	clusterErr := fmt.Errorf("cluster unreachable")
+	pve := &diskMetaClientMock{
+		clusterSvc: &mockClusterService{statusErr: clusterErr},
+		nodesSvc:   &diskMetaNodesMock{},
+		qemuSvc:    &diskMetaQEMUMock{},
+	}
+	h := handlers.HandleSetDiskMetadata(makeDiskMetaDeps(pve))
+
+	_, err := h.Handle(context.Background(), makeMetaArgs(testDiskCID, map[string]any{"k": "v"}), jsonrpc.Context{})
+	if err == nil {
+		t.Fatal("expected error from cluster status failure, got nil")
+	}
+	if !strings.Contains(err.Error(), "cluster") {
+		t.Errorf("error should mention 'cluster'; got %q", err.Error())
+	}
+}
+
+// TestHandleSetDiskMetadata_UpdateConfigError verifies that an UpdateQemuConfig
+// SDK failure propagates as an error after the disk is found on a VM.
+func TestHandleSetDiskMetadata_UpdateConfigError(t *testing.T) {
+	t.Parallel()
+
+	updateErr := fmt.Errorf("write conflict: locked")
+	nodesSvc := &diskMetaNodesMock{
+		vmsByNode: map[string][]int64{testNode: {testVMID}},
+		updateErr: updateErr,
+	}
+	qemuSvc := &diskMetaQEMUMock{
+		configs: map[string]map[string]interface{}{
+			diskKey(testNode, int(testVMID)): vmConfigWithDisk(testDiskCID, ""),
+		},
+	}
+	clusterSvc := &mockClusterService{statusResp: clusterWithNode(testNode)}
+	pve := &diskMetaClientMock{qemuSvc: qemuSvc, nodesSvc: nodesSvc, clusterSvc: clusterSvc}
+
+	h := handlers.HandleSetDiskMetadata(makeDiskMetaDeps(pve))
+	_, err := h.Handle(context.Background(), makeMetaArgs(testDiskCID, map[string]any{"k": "v"}), jsonrpc.Context{})
+	if err == nil {
+		t.Fatal("expected error from UpdateQemuConfig failure, got nil")
+	}
+	if !strings.Contains(err.Error(), "write conflict") {
+		t.Errorf("error should propagate SDK message; got %q", err.Error())
+	}
+}
+
+// setDiskMetadataCallHandler is a helper that invokes HandleSetDiskMetadata and
+// returns the captured description from the nodes mock after the call.
+func setDiskMetadataCallHandler(t *testing.T, nodesSvc *diskMetaNodesMock, qemuSvc *diskMetaQEMUMock, diskCID string, meta map[string]any) string {
+	t.Helper()
+	clusterSvc := &mockClusterService{statusResp: clusterWithNode(testNode)}
+	pve := &diskMetaClientMock{qemuSvc: qemuSvc, nodesSvc: nodesSvc, clusterSvc: clusterSvc}
+	h := handlers.HandleSetDiskMetadata(makeDiskMetaDeps(pve))
+	_, err := h.Handle(context.Background(), makeMetaArgs(diskCID, meta), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected handler error: %v", err)
+	}
+	if nodesSvc.capturedDesc == nil {
+		t.Fatal("UpdateQemuConfig not called — capturedDesc is nil")
+	}
+	return *nodesSvc.capturedDesc
+}
+
+// TestHandleSetDiskMetadata_SameCIDReplaces verifies that calling the handler twice
+// with the same disk CID replaces that CID's metadata object wholesale. The second
+// call's metadata wins; fields from the first call are NOT preserved (no field-level
+// merge within a single CID entry).
+func TestHandleSetDiskMetadata_SameCIDReplaces(t *testing.T) {
+	t.Parallel()
+
+	configKey := diskKey(testNode, int(testVMID))
+	qemuSvc := &diskMetaQEMUMock{
+		configs: map[string]map[string]interface{}{
+			configKey: vmConfigWithDisk(testDiskCID, ""),
+		},
+	}
+	nodesSvc := &diskMetaNodesMock{
+		vmsByNode: map[string][]int64{testNode: {testVMID}},
+	}
+
+	// First call: write deployment=cf.
+	desc1 := setDiskMetadataCallHandler(t, nodesSvc, qemuSvc, testDiskCID, map[string]any{"deployment": "cf"})
+	if !strings.Contains(desc1, "cf") {
+		t.Fatalf("first call: sentinel missing 'cf'; got: %s", desc1)
+	}
+
+	// Second call: write instance_id only — same diskCID → replaces first call's entry.
+	qemuSvc.configs[configKey]["description"] = desc1
+	nodesSvc.capturedDesc = nil
+
+	clusterSvc2 := &mockClusterService{statusResp: clusterWithNode(testNode)}
+	pve2 := &diskMetaClientMock{qemuSvc: qemuSvc, nodesSvc: nodesSvc, clusterSvc: clusterSvc2}
+	h2 := handlers.HandleSetDiskMetadata(makeDiskMetaDeps(pve2))
+	_, err := h2.Handle(context.Background(), makeMetaArgs(testDiskCID, map[string]any{"instance_id": "vm-xyz"}), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("second call: unexpected error: %v", err)
+	}
+	if nodesSvc.capturedDesc == nil {
+		t.Fatal("second call: UpdateQemuConfig not called")
+	}
+	desc2 := *nodesSvc.capturedDesc
+
+	// Second call's value present.
+	if !strings.Contains(desc2, "vm-xyz") {
+		t.Errorf("second call: sentinel missing 'vm-xyz'; got: %s", desc2)
+	}
+	// First call's value replaced — "cf" must NOT appear as the deployment value.
+	// The sentinel encodes the full metadata object, so "cf" should be absent.
+	if strings.Contains(desc2, `"cf"`) {
+		t.Errorf("second call: 'cf' should have been replaced, still present; got: %s", desc2)
+	}
+	// Exactly one sentinel block.
+	if count := strings.Count(desc2, "<!--BOSH:"); count != 1 {
+		t.Errorf("expected exactly 1 sentinel block, got %d; desc: %s", count, desc2)
+	}
+}
+
+// TestHandleSetDiskMetadata_CrossDiskMergePreserved verifies that calling the handler
+// for two different disk CIDs on the same VM preserves both CID entries in the sentinel.
+// Call 1 writes diskCID A; call 2 (seeing call 1's description in config) writes diskCID B.
+// The final sentinel must contain entries for both A and B.
+func TestHandleSetDiskMetadata_CrossDiskMergePreserved(t *testing.T) {
+	t.Parallel()
+
+	const diskA = testDiskCID               // "local-lvm:vm-100-disk-0"
+	const diskB = "local-lvm:vm-100-disk-1" // second disk on same VM
+	configKey := diskKey(testNode, int(testVMID))
+
+	qemuSvc := &diskMetaQEMUMock{
+		configs: map[string]map[string]interface{}{
+			configKey: {
+				"scsi0": diskA,
+				"scsi1": diskB,
+			},
+		},
+	}
+	nodesSvc := &diskMetaNodesMock{
+		vmsByNode: map[string][]int64{testNode: {testVMID}},
+	}
+
+	// Call 1: set metadata for disk A.
+	desc1 := setDiskMetadataCallHandler(t, nodesSvc, qemuSvc, diskA, map[string]any{"deployment": "cf"})
+	if !strings.Contains(desc1, diskA) {
+		t.Fatalf("call 1: sentinel missing diskA CID; got: %s", desc1)
+	}
+
+	// Inject call 1's written description so call 2 sees it.
+	qemuSvc.configs[configKey]["description"] = desc1
+	nodesSvc.capturedDesc = nil
+
+	// Call 2: set metadata for disk B (different CID, same VM).
+	clusterSvc2 := &mockClusterService{statusResp: clusterWithNode(testNode)}
+	pve2 := &diskMetaClientMock{qemuSvc: qemuSvc, nodesSvc: nodesSvc, clusterSvc: clusterSvc2}
+	h2 := handlers.HandleSetDiskMetadata(makeDiskMetaDeps(pve2))
+	_, err := h2.Handle(context.Background(), makeMetaArgs(diskB, map[string]any{"instance_id": "vm-xyz"}), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("call 2: unexpected error: %v", err)
+	}
+	if nodesSvc.capturedDesc == nil {
+		t.Fatal("call 2: UpdateQemuConfig not called")
+	}
+	desc2 := *nodesSvc.capturedDesc
+
+	// Both disk CIDs must be present in the merged sentinel.
+	if !strings.Contains(desc2, diskA) {
+		t.Errorf("call 2: sentinel lost diskA entry; got: %s", desc2)
+	}
+	if !strings.Contains(desc2, diskB) {
+		t.Errorf("call 2: sentinel missing diskB entry; got: %s", desc2)
+	}
+	// Exactly one sentinel block.
+	if count := strings.Count(desc2, "<!--BOSH:"); count != 1 {
+		t.Errorf("expected exactly 1 sentinel block, got %d; desc: %s", count, desc2)
+	}
+}
+
+// TestHandleSetDiskMetadata_CorruptedSentinel verifies that when the existing VM
+// description contains a sentinel block with invalid JSON, the handler resets the
+// sentinel and writes fresh metadata rather than failing or propagating the
+// parse error.
+func TestHandleSetDiskMetadata_CorruptedSentinel(t *testing.T) {
+	t.Parallel()
+
+	corruptDesc := "operator note\n<!--BOSH:{not valid json at all-->rest"
+	configKey := diskKey(testNode, int(testVMID))
+	qemuSvc := &diskMetaQEMUMock{
+		configs: map[string]map[string]interface{}{
+			configKey: vmConfigWithDisk(testDiskCID, corruptDesc),
+		},
+	}
+	nodesSvc := &diskMetaNodesMock{
+		vmsByNode: map[string][]int64{testNode: {testVMID}},
+	}
+	clusterSvc := &mockClusterService{statusResp: clusterWithNode(testNode)}
+	pve := &diskMetaClientMock{qemuSvc: qemuSvc, nodesSvc: nodesSvc, clusterSvc: clusterSvc}
+
+	h := handlers.HandleSetDiskMetadata(makeDiskMetaDeps(pve))
+	_, err := h.Handle(context.Background(), makeMetaArgs(testDiskCID, map[string]any{"deployment": "reset-test"}), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("corrupted sentinel: unexpected error (should reset+rewrite): %v", err)
+	}
+	if nodesSvc.capturedDesc == nil {
+		t.Fatal("corrupted sentinel: UpdateQemuConfig not called")
+	}
+	desc := *nodesSvc.capturedDesc
+	if !strings.Contains(desc, "<!--BOSH:") {
+		t.Errorf("corrupted sentinel: rewritten description missing sentinel block; got: %s", desc)
+	}
+	if !strings.Contains(desc, "reset-test") {
+		t.Errorf("corrupted sentinel: rewritten description missing new metadata value; got: %s", desc)
+	}
+}
+
+// TestHandleSetDiskMetadata_Dir_CID verifies that a dir-storage disk CID in the
+// form "local:9001/vm-9001-disk-0.raw" is correctly parsed by ParseDiskCID
+// (storage="local") and matched against the VM config. The handler treats CID
+// formats as opaque after the initial colon-split; this test exercises that path.
+func TestHandleSetDiskMetadata_Dir_CID(t *testing.T) {
+	t.Parallel()
+
+	const dirCID = "local:9001/vm-9001-disk-0.raw"
+	const dirVMID = int64(9001)
+
+	configKey := diskKey(testNode, int(dirVMID))
+	qemuSvc := &diskMetaQEMUMock{
+		configs: map[string]map[string]interface{}{
+			configKey: {
+				"scsi0": dirCID,
+			},
+		},
+	}
+	nodesSvc := &diskMetaNodesMock{
+		vmsByNode: map[string][]int64{testNode: {dirVMID}},
+	}
+	clusterSvc := &mockClusterService{statusResp: clusterWithNode(testNode)}
+	pve := &diskMetaClientMock{qemuSvc: qemuSvc, nodesSvc: nodesSvc, clusterSvc: clusterSvc}
+
+	h := handlers.HandleSetDiskMetadata(makeDiskMetaDeps(pve))
+	_, err := h.Handle(context.Background(), makeMetaArgs(dirCID, map[string]any{"deployment": "cf"}), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("dir CID: unexpected error: %v", err)
+	}
+	if nodesSvc.capturedDesc == nil {
+		t.Fatal("dir CID: UpdateQemuConfig not called — capturedDesc is nil")
+	}
+	desc := *nodesSvc.capturedDesc
+	if !strings.Contains(desc, "<!--BOSH:") {
+		t.Errorf("dir CID: description missing sentinel block; got: %s", desc)
+	}
+	if !strings.Contains(desc, dirCID) {
+		t.Errorf("dir CID: sentinel missing disk CID %q; got: %s", dirCID, desc)
+	}
+}
+
+// TODO(storage-network): nfs — wired to PVE network-call boundary, stubbed pending
+// live shared-storage test infrastructure. Storage: nfs-store:9001/vm-9001-disk-0.qcow2.
+// Re-enable when integration-test harness provides a nfs pool via env.
+//
+// func TestHandleSetDiskMetadata_NFS_CID(t *testing.T) { ... }
+
+// TODO(storage-network): rbd — wired to PVE network-call boundary, stubbed pending
+// live shared-storage test infrastructure. Storage: ceph-pool:vm-9001-disk-0.
+// Re-enable when integration-test harness provides a rbd pool via env.
+//
+// func TestHandleSetDiskMetadata_RBD_CID(t *testing.T) { ... }
+
+// TODO(storage-network): cephfs — wired to PVE network-call boundary, stubbed pending
+// live shared-storage test infrastructure. Storage: cephfs-pool:vm-9001-disk-0.
+// Re-enable when integration-test harness provides a cephfs pool via env.
+//
+// func TestHandleSetDiskMetadata_CephFS_CID(t *testing.T) { ... }
+
+// TODO(storage-network): cifs — wired to PVE network-call boundary, stubbed pending
+// live shared-storage test infrastructure. Storage: cifs-store:9001/vm-9001-disk-0.qcow2.
+// Re-enable when integration-test harness provides a cifs pool via env.
+//
+// func TestHandleSetDiskMetadata_CIFS_CID(t *testing.T) { ... }

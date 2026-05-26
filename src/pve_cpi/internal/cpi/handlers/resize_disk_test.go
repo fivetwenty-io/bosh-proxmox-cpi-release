@@ -542,3 +542,199 @@ func TestHandleResizeDisk_SnapshotsPresent_AllowOverride(t *testing.T) {
 		t.Error("ResizeDisk should be called when allow override is set")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Error-path gap tests (gaps #1, #2, #3 from R1).
+// ---------------------------------------------------------------------------
+
+func TestHandleResizeDisk_ConfigFetchError(t *testing.T) {
+	// Gap #1: QEMU().Config() returns an error after the disk is located.
+	// The handler must propagate the error rather than proceeding with
+	// an unknown current size.
+	const diskCID = "local-lvm:vm-9001-disk-0"
+	const diskSlot = "scsi2"
+
+	configErr := errors.New("PVE config fetch timeout")
+	callCount := 0
+	qemuSvc := &resizeQEMUService{
+		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
+			callCount++
+			// Calls 1-2: FindVMByDiskVolid + ResolveDiskID need the bare volid.
+			if callCount <= 2 {
+				return map[string]interface{}{diskSlot: diskCID}, nil
+			}
+			// Call 3: the real Config() read — return error.
+			return nil, configErr
+		},
+	}
+
+	h := handlers.HandleResizeDisk(resizeDeps(qemuSvc, resizeClusterWith(100), nil))
+	_, err := h.Handle(context.Background(), marshalArgs(diskCID, 20480), jsonrpc.Context{})
+	if err == nil {
+		t.Fatal("expected error when Config() fails after disk is located")
+	}
+	if !strings.Contains(err.Error(), "config") {
+		t.Errorf("error should mention config read failure; got: %v", err)
+	}
+}
+
+func TestHandleResizeDisk_NonGSizeUnit(t *testing.T) {
+	// Gap #2: parseDiskSizeGiB rejects non-G size units (e.g. "10M", "1T").
+	// resize_disk.go parseDiskSizeGiB returns an error for any unit that is
+	// not "G"; the handler wraps and propagates it.
+	cases := []struct {
+		name   string
+		optStr string
+	}{
+		{"megabytes", "local-lvm:vm-9001-disk-0,size=10240M"},
+		{"terabytes", "local-lvm:vm-9001-disk-0,size=1T"},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			const diskCID = "local-lvm:vm-9001-disk-0"
+			// resizeQEMUWithDisk sets bareVolid from the first comma-separated
+			// segment, which is the volid itself when no comma exists in the
+			// first segment. Supply the full optStr so the 3rd config call
+			// returns the non-G size unit.
+			qemuSvc := resizeQEMUWithDisk("scsi2", tc.optStr, nil)
+
+			h := handlers.HandleResizeDisk(resizeDeps(qemuSvc, resizeClusterWith(100), nil))
+			_, err := h.Handle(context.Background(), marshalArgs(diskCID, 20480), jsonrpc.Context{})
+			if err == nil {
+				t.Fatalf("expected error for non-G size unit %q", tc.optStr)
+			}
+		})
+	}
+}
+
+func TestHandleResizeDisk_AwaitTaskFailure(t *testing.T) {
+	// Gap #3: ResizeDisk returns a UPID; AwaitTask returns a non-OK ExitStatus.
+	// AwaitTaskWithLogger (pve/task.go) wraps non-OK exit status as a Cloud
+	// error; RetryOnTransientOrLock propagates it; the handler wraps it again
+	// with context. The caller must receive a non-nil error.
+	const diskCID = "local-lvm:vm-9001-disk-0"
+
+	qemuSvc := resizeQEMUWithDisk("scsi2", "local-lvm:vm-9001-disk-0,size=10G",
+		func(_ context.Context, _ string, _ int, _ string, _ int) (string, error) {
+			return "UPID:pve1:resize:deadbeef", nil
+		},
+	)
+
+	tasksSvc := &mockTasksService{
+		waitFn: func(_ context.Context, _, _ string, _ *tasks.WaitOptions) (*tasks.Status, error) {
+			return &tasks.Status{ExitStatus: "ERROR: resize failed"}, nil
+		},
+	}
+
+	h := handlers.HandleResizeDisk(resizeDeps(qemuSvc, resizeClusterWith(100), tasksSvc))
+	_, err := h.Handle(context.Background(), marshalArgs(diskCID, 20480), jsonrpc.Context{})
+	if err == nil {
+		t.Fatal("expected error when AwaitTask returns non-OK ExitStatus")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Storage-type CID-variant tests.
+// resize_disk has no storage-type branching; these tests exercise
+// ParseDiskCID with different volume-format strings and confirm the handler
+// calls ResizeDisk when the disk is attached.
+// ---------------------------------------------------------------------------
+
+func TestHandleResizeDisk_Dir_CID(t *testing.T) {
+	// dir-style CID: storage="local", volume="9001/vm-9001-disk-0.raw".
+	// ParseDiskCID splits on the first colon only; the subpath segment is
+	// opaque to the handler. FindVMByDiskVolid matches on the full CID string.
+	const diskCID = "local:9001/vm-9001-disk-0.raw"
+	const diskSlot = "scsi0"
+
+	var resizeCalled bool
+	qemuSvc := resizeQEMUWithDisk(diskSlot, diskCID+",size=20G",
+		func(_ context.Context, _ string, _ int, _ string, _ int) (string, error) {
+			resizeCalled = true
+			return "", nil
+		},
+	)
+
+	h := handlers.HandleResizeDisk(resizeDeps(qemuSvc, resizeClusterWith(9001), nil))
+	_, err := h.Handle(context.Background(), marshalArgs(diskCID, 30720), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error for dir-style CID: %v", err)
+	}
+	if !resizeCalled {
+		t.Error("ResizeDisk must be called for dir-style CID")
+	}
+}
+
+func TestHandleResizeDisk_ZFSPool_CID(t *testing.T) {
+	// zfspool-style CID: bare volume name, no subpath or extension.
+	// ParseDiskCID splits on colon; volume segment is "vm-9001-disk-0".
+	const diskCID = "local-zfs:vm-9001-disk-0"
+	const diskSlot = "scsi1"
+
+	var resizeCalled bool
+	qemuSvc := resizeQEMUWithDisk(diskSlot, diskCID+",size=10G",
+		func(_ context.Context, _ string, _ int, _ string, _ int) (string, error) {
+			resizeCalled = true
+			return "", nil
+		},
+	)
+
+	h := handlers.HandleResizeDisk(resizeDeps(qemuSvc, resizeClusterWith(9001), nil))
+	_, err := h.Handle(context.Background(), marshalArgs(diskCID, 20480), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error for zfspool CID: %v", err)
+	}
+	if !resizeCalled {
+		t.Error("ResizeDisk must be called for zfspool CID")
+	}
+}
+
+func TestHandleResizeDisk_LVMThin_CID(t *testing.T) {
+	// lvmthin-style CID: bare volume name, same format as lvm.
+	// ParseDiskCID splits on colon; volume segment is "vm-9001-disk-0".
+	const diskCID = "local-lvm-thin:vm-9001-disk-0"
+	const diskSlot = "scsi3"
+
+	var resizeCalled bool
+	qemuSvc := resizeQEMUWithDisk(diskSlot, diskCID+",size=15G",
+		func(_ context.Context, _ string, _ int, _ string, _ int) (string, error) {
+			resizeCalled = true
+			return "", nil
+		},
+	)
+
+	h := handlers.HandleResizeDisk(resizeDeps(qemuSvc, resizeClusterWith(9001), nil))
+	_, err := h.Handle(context.Background(), marshalArgs(diskCID, 20480), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error for lvmthin CID: %v", err)
+	}
+	if !resizeCalled {
+		t.Error("ResizeDisk must be called for lvmthin CID")
+	}
+}
+
+// TODO(storage-network): nfs — wired to PVE network-call boundary, stubbed pending
+// live shared-storage test infrastructure. Storage: nfs-store:9001/vm-9001-disk-0.qcow2. Re-enable when
+// integration-test harness provides a nfs pool via env.
+//
+// func TestHandleResizeDisk_NFS_CID(t *testing.T) { ... }
+
+// TODO(storage-network): rbd — wired to PVE network-call boundary, stubbed pending
+// live shared-storage test infrastructure. Storage: ceph-pool:vm-9001-disk-0. Re-enable when
+// integration-test harness provides a rbd pool via env.
+//
+// func TestHandleResizeDisk_RBD_CID(t *testing.T) { ... }
+
+// TODO(storage-network): cephfs — wired to PVE network-call boundary, stubbed pending
+// live shared-storage test infrastructure. Storage: cephfs-pool:vm-9001-disk-0. Re-enable when
+// integration-test harness provides a cephfs pool via env.
+//
+// func TestHandleResizeDisk_CephFS_CID(t *testing.T) { ... }
+
+// TODO(storage-network): cifs — wired to PVE network-call boundary, stubbed pending
+// live shared-storage test infrastructure. Storage: cifs-store:9001/vm-9001-disk-0.qcow2. Re-enable when
+// integration-test harness provides a cifs pool via env.
+//
+// func TestHandleResizeDisk_CIFS_CID(t *testing.T) { ... }

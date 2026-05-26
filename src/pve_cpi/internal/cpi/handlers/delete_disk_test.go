@@ -235,6 +235,145 @@ func TestHandleDeleteDisk_SDKDeleteVolumeReturnsNil(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// CID-variant tests
+//
+// delete_disk is storage-type-agnostic: the handler splits on the first colon
+// to extract storage, then forwards the full disk_cid to DeleteVolumeAsync.
+// These tests exercise ParseDiskCID with each active local storage CID format,
+// confirming the correct storage and full volume strings reach the SDK call.
+// There is no divergent handler logic across storage types — the variants
+// validate CID identity through the split-on-colon parse.
+// ---------------------------------------------------------------------------
+
+func TestHandleDeleteDisk_LVM_CID(t *testing.T) {
+	const cid = "local-lvm:vm-9001-disk-0"
+	var capturedStorage, capturedVolume string
+	storageSvc := &mockStorageService{
+		deleteVolumeFn: func(_ context.Context, _, storage, volume string) error {
+			capturedStorage = storage
+			capturedVolume = volume
+			return nil
+		},
+	}
+	deps := baseDepsForDelete(t, storageSvc)
+
+	h := handlers.HandleDeleteDisk(deps)
+	_, err := h.Handle(context.Background(), []json.RawMessage{marshal(cid)}, jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if capturedStorage != "local-lvm" {
+		t.Errorf("storage: got %q, want %q", capturedStorage, "local-lvm")
+	}
+	if capturedVolume != cid {
+		t.Errorf("volume: got %q, want %q", capturedVolume, cid)
+	}
+}
+
+func TestHandleDeleteDisk_LVMThin_CID(t *testing.T) {
+	const cid = "local-lvm-thin:vm-9001-disk-0"
+	var capturedStorage, capturedVolume string
+	storageSvc := &mockStorageService{
+		deleteVolumeFn: func(_ context.Context, _, storage, volume string) error {
+			capturedStorage = storage
+			capturedVolume = volume
+			return nil
+		},
+	}
+	deps := baseDepsForDelete(t, storageSvc)
+
+	h := handlers.HandleDeleteDisk(deps)
+	_, err := h.Handle(context.Background(), []json.RawMessage{marshal(cid)}, jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if capturedStorage != "local-lvm-thin" {
+		t.Errorf("storage: got %q, want %q", capturedStorage, "local-lvm-thin")
+	}
+	if capturedVolume != cid {
+		t.Errorf("volume: got %q, want %q", capturedVolume, cid)
+	}
+}
+
+func TestHandleDeleteDisk_ZFSPool_CID(t *testing.T) {
+	const cid = "local-zfs:vm-9001-disk-0"
+	var capturedStorage, capturedVolume string
+	storageSvc := &mockStorageService{
+		deleteVolumeFn: func(_ context.Context, _, storage, volume string) error {
+			capturedStorage = storage
+			capturedVolume = volume
+			return nil
+		},
+	}
+	deps := baseDepsForDelete(t, storageSvc)
+
+	h := handlers.HandleDeleteDisk(deps)
+	_, err := h.Handle(context.Background(), []json.RawMessage{marshal(cid)}, jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if capturedStorage != "local-zfs" {
+		t.Errorf("storage: got %q, want %q", capturedStorage, "local-zfs")
+	}
+	if capturedVolume != cid {
+		t.Errorf("volume: got %q, want %q", capturedVolume, cid)
+	}
+}
+
+func TestHandleDeleteDisk_Dir_CID(t *testing.T) {
+	// dir-style CID: path-form volume — the portion after the first colon
+	// contains a subpath with vmid prefix and extension.
+	// ParseDiskCID splits on the first colon only, so storage="local" and
+	// the full volume string including the subpath is forwarded to the SDK.
+	const cid = "local:9001/vm-9001-disk-0.raw"
+	var capturedStorage, capturedVolume string
+	storageSvc := &mockStorageService{
+		deleteVolumeFn: func(_ context.Context, _, storage, volume string) error {
+			capturedStorage = storage
+			capturedVolume = volume
+			return nil
+		},
+	}
+	deps := baseDepsForDelete(t, storageSvc)
+
+	h := handlers.HandleDeleteDisk(deps)
+	_, err := h.Handle(context.Background(), []json.RawMessage{marshal(cid)}, jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if capturedStorage != "local" {
+		t.Errorf("storage: got %q, want %q", capturedStorage, "local")
+	}
+	if capturedVolume != cid {
+		t.Errorf("volume: got %q, want full cid %q", capturedVolume, cid)
+	}
+}
+
+// TODO(storage-network): nfs — wired to PVE network-call boundary, stubbed pending
+// live shared-storage test infrastructure. Storage: nfs-store:9001/vm-9001-disk-0.qcow2. Re-enable when
+// integration-test harness provides a nfs pool via env.
+//
+// func TestHandleDeleteDisk_NFS_CID(t *testing.T) { ... }
+
+// TODO(storage-network): rbd — wired to PVE network-call boundary, stubbed pending
+// live shared-storage test infrastructure. Storage: ceph-pool:vm-9001-disk-0. Re-enable when
+// integration-test harness provides a rbd pool via env.
+//
+// func TestHandleDeleteDisk_RBD_CID(t *testing.T) { ... }
+
+// TODO(storage-network): cephfs — wired to PVE network-call boundary, stubbed pending
+// live shared-storage test infrastructure. Storage: cephfs-pool:vm-9001-disk-0. Re-enable when
+// integration-test harness provides a cephfs pool via env.
+//
+// func TestHandleDeleteDisk_CephFS_CID(t *testing.T) { ... }
+
+// TODO(storage-network): cifs — wired to PVE network-call boundary, stubbed pending
+// live shared-storage test infrastructure. Storage: cifs-store:9001/vm-9001-disk-0.qcow2. Re-enable when
+// integration-test harness provides a cifs pool via env.
+//
+// func TestHandleDeleteDisk_CIFS_CID(t *testing.T) { ... }
+
 // Ensure cluster list not needed when using newHandlerMockClient.
 // This validates the delete_disk handler does NOT call NextDiskVMID.
 func TestHandleDeleteDisk_NoClusterCallExpected(t *testing.T) {

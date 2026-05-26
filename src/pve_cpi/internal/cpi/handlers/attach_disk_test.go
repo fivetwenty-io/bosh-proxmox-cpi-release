@@ -13,6 +13,8 @@ import (
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
+	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
+	sdkcluster "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cluster"
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/qemu"
 	sdkerrors "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/errors"
 )
@@ -764,3 +766,268 @@ func TestHandleAttachDisk_GuardAllowOverrideProceeds(t *testing.T) {
 		t.Error("UpdateDiskHints should be called when override allows proceed")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Local-backend co-location test types (file-local, prefixed attachDisk).
+//
+// The production localBackend (in the pve package) locates existing volumes via
+// Storage().Exists cluster scan. For handler-level unit tests, we inject a fake
+// resolver/backend that returns a configurable node directly, avoiding all PVE
+// API calls except Cluster().ListResources which FindVMNodeViaCluster needs.
+// ---------------------------------------------------------------------------
+
+// attachDiskLocalBackend is a pve.Backend that reports BackendLocal kind and
+// returns a fixed node for NodeForExisting. Used to trigger the co-location
+// check in attach_disk without wiring the production storage cluster scan.
+type attachDiskLocalBackend struct {
+	diskNode string // node that "holds" the disk
+}
+
+func (b *attachDiskLocalBackend) Kind() pve.BackendKind { return pve.BackendLocal }
+
+func (b *attachDiskLocalBackend) NodeForCreate(_ context.Context, _, _ string) (string, error) {
+	return b.diskNode, nil
+}
+
+func (b *attachDiskLocalBackend) NodeForExisting(_ context.Context, _ string) (string, error) {
+	return b.diskNode, nil
+}
+
+// attachDiskLocalResolver is a pve.BackendResolver that always returns an
+// attachDiskLocalBackend bound to diskNode.
+type attachDiskLocalResolver struct {
+	diskNode string
+}
+
+func (r *attachDiskLocalResolver) Resolve(_ context.Context, _ string) (pve.Backend, error) {
+	return &attachDiskLocalBackend{diskNode: r.diskNode}, nil
+}
+
+// attachDiskClusterSvc implements cluster.Service. Only ListResources is
+// overridden; all other methods panic on accidental call. The listFn field
+// controls what ListResources returns so tests can place a VM on a specific node.
+type attachDiskClusterSvc struct {
+	sdkcluster.Service // nil — non-overridden methods panic
+
+	listFn func(ctx context.Context, params *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error)
+}
+
+func (c *attachDiskClusterSvc) ListResources(ctx context.Context, params *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+	if c.listFn != nil {
+		return c.listFn(ctx, params)
+	}
+	empty := sdkcluster.ListResourcesResponse{}
+	return &empty, nil
+}
+
+// attachDiskVMOnNode builds a ListResourcesResponse that places vmid on node.
+// FindVMNodeViaCluster parses {"vmid": N, "node": "name"} rows.
+func attachDiskVMOnNode(vmid int, node string) *sdkcluster.ListResourcesResponse {
+	raw, _ := json.Marshal(map[string]interface{}{
+		"vmid": vmid,
+		"node": node,
+		"type": "qemu",
+	})
+	resp := sdkcluster.ListResourcesResponse{raw}
+	return &resp
+}
+
+// ---------------------------------------------------------------------------
+// Co-location enforcement test
+//
+// CID-variant tests below (LVM_CID, ZFSPool_CID, Dir_CID, LVMThin_CID) use a
+// static (shared) backend and exercise ParseDiskCID/identity through the handler.
+// The co-location test is the real branch that exercises BackendLocal logic.
+// ---------------------------------------------------------------------------
+
+// TestHandleAttachDisk_LocalBackend_CoLocationEnforced verifies that when the
+// storage backend is local, the disk lives on pve-node2, and the VM lives on
+// pve-node1, attach_disk returns an error rather than issuing a cross-node
+// config PUT that PVE would reject with an opaque storage error.
+func TestHandleAttachDisk_LocalBackend_CoLocationEnforced(t *testing.T) {
+	const (
+		vmCID    = "100"
+		diskCID  = "local-lvm:vm-9001-disk-0"
+		diskNode = "pve-node2" // where the local-storage disk lives
+		vmNode   = "pve-node1" // where the VM runs (different node → violation)
+	)
+
+	// attachQEMUService: slot selection needs Config (returns empty — picks scsi1).
+	// AttachDisk must NOT be called; set attachErr to a sentinel so an accidental
+	// call produces a recognizable test failure rather than a silent success.
+	qemuSvc := &attachQEMUService{
+		attachErr: errors.New("AttachDisk must not be called on co-location violation"),
+		configCfg: map[string]interface{}{}, // empty — chooseSCSISlotSkippingZero picks scsi1
+	}
+
+	// Cluster returns VM 100 on vmNode so FindVMNodeViaCluster resolves it.
+	clusterSvc := &attachDiskClusterSvc{
+		listFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+			return attachDiskVMOnNode(100, vmNode), nil
+		},
+	}
+
+	deps := handlers.Deps{
+		Config: &config.CPIConfig{
+			Node:         "pve1",
+			VMDiskFormat: "qcow2",
+		},
+		PVE: &mockPVEClient{
+			qemuSvc:    qemuSvc,
+			clusterSvc: clusterSvc,
+		},
+		Agent:    &captureAgent{},
+		Logger:   log.NewNopLogger(),
+		Resolver: &attachDiskLocalResolver{diskNode: diskNode},
+	}
+
+	h := handlers.HandleAttachDisk(deps)
+	_, err := h.Handle(context.Background(), attachArgs(vmCID, diskCID), jsonrpc.Context{})
+	if err == nil {
+		t.Fatal("expected co-location error; got nil")
+	}
+	// Error must be a Cloud-type error (not VMNotFound/DiskNotFound).
+	if !cpierrors.IsType(err, cpierrors.TypeCloud) {
+		t.Errorf("error type: want TypeCloud, got %T: %v", err, err)
+	}
+	msg := err.Error()
+	// Message must name both nodes so the operator can diagnose the mismatch.
+	if !strings.Contains(msg, diskNode) {
+		t.Errorf("error must mention disk node %q; got: %s", diskNode, msg)
+	}
+	if !strings.Contains(msg, vmNode) {
+		t.Errorf("error must mention VM node %q; got: %s", vmNode, msg)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// CID-variant success tests (static/shared backend).
+//
+// These tests exercise ParseDiskCID with different volid formats and verify that
+// the handler proceeds through AttachDisk for each active local storage type.
+// Storage-type branching does not exist in attach_disk — the CID is passed
+// opaquely to AttachDisk; these tests confirm CID parsing doesn't break for
+// any of the four active local formats.
+// ---------------------------------------------------------------------------
+
+// TestHandleAttachDisk_LVM_CID verifies that a standard LVM CID
+// ("local-lvm:vm-9001-disk-0") is parsed correctly and attach proceeds.
+func TestHandleAttachDisk_LVM_CID(t *testing.T) {
+	const (
+		diskCID = "local-lvm:vm-9001-disk-0"
+		volid   = "vm-9001-disk-0"
+	)
+	qemuSvc := &attachQEMUService{
+		attachReturnDiskID: "scsi1",
+		configCfg:          map[string]interface{}{"scsi1": diskCID},
+	}
+	ag := &captureAgent{}
+	h := handlers.HandleAttachDisk(attachDeps(qemuSvc, ag))
+
+	result, err := h.Handle(context.Background(), attachArgs("100", diskCID), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("LVM CID: unexpected error: %v", err)
+	}
+	if result == nil {
+		t.Fatal("LVM CID: expected disk_hints; got nil")
+	}
+	if !ag.updateCalled {
+		t.Error("LVM CID: UpdateDiskHints not called")
+	}
+	_ = volid // CID exercises ParseDiskCID; volid is the opaque volume segment
+}
+
+// TestHandleAttachDisk_ZFSPool_CID verifies that a ZFS pool bare-volname CID
+// ("local-zfs:vm-9001-disk-0") is parsed correctly and attach proceeds.
+func TestHandleAttachDisk_ZFSPool_CID(t *testing.T) {
+	const diskCID = "local-zfs:vm-9001-disk-0"
+	qemuSvc := &attachQEMUService{
+		attachReturnDiskID: "scsi1",
+		configCfg:          map[string]interface{}{"scsi1": diskCID},
+	}
+	ag := &captureAgent{}
+	h := handlers.HandleAttachDisk(attachDeps(qemuSvc, ag))
+
+	result, err := h.Handle(context.Background(), attachArgs("100", diskCID), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("ZFSPool CID: unexpected error: %v", err)
+	}
+	if result == nil {
+		t.Fatal("ZFSPool CID: expected disk_hints; got nil")
+	}
+	if !ag.updateCalled {
+		t.Error("ZFSPool CID: UpdateDiskHints not called")
+	}
+}
+
+// TestHandleAttachDisk_Dir_CID verifies that a dir-type subpath CID
+// ("local:9001/vm-9001-disk-0.raw") is parsed correctly and attach proceeds.
+// ParseDiskCID splits on the first colon; the volume segment ("9001/vm-9001-disk-0.raw")
+// is treated as opaque by the handler.
+func TestHandleAttachDisk_Dir_CID(t *testing.T) {
+	const diskCID = "local:9001/vm-9001-disk-0.raw"
+	qemuSvc := &attachQEMUService{
+		attachReturnDiskID: "scsi1",
+		configCfg:          map[string]interface{}{"scsi1": diskCID},
+	}
+	ag := &captureAgent{}
+	h := handlers.HandleAttachDisk(attachDeps(qemuSvc, ag))
+
+	result, err := h.Handle(context.Background(), attachArgs("100", diskCID), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("Dir CID: unexpected error: %v", err)
+	}
+	if result == nil {
+		t.Fatal("Dir CID: expected disk_hints; got nil")
+	}
+	if !ag.updateCalled {
+		t.Error("Dir CID: UpdateDiskHints not called")
+	}
+}
+
+// TestHandleAttachDisk_LVMThin_CID verifies that an LVMThin bare-volname CID
+// ("local-lvm-thin:vm-9001-disk-0") is parsed correctly and attach proceeds.
+func TestHandleAttachDisk_LVMThin_CID(t *testing.T) {
+	const diskCID = "local-lvm-thin:vm-9001-disk-0"
+	qemuSvc := &attachQEMUService{
+		attachReturnDiskID: "scsi1",
+		configCfg:          map[string]interface{}{"scsi1": diskCID},
+	}
+	ag := &captureAgent{}
+	h := handlers.HandleAttachDisk(attachDeps(qemuSvc, ag))
+
+	result, err := h.Handle(context.Background(), attachArgs("100", diskCID), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("LVMThin CID: unexpected error: %v", err)
+	}
+	if result == nil {
+		t.Fatal("LVMThin CID: expected disk_hints; got nil")
+	}
+	if !ag.updateCalled {
+		t.Error("LVMThin CID: UpdateDiskHints not called")
+	}
+}
+
+// TODO(storage-network): nfs — wired to PVE network-call boundary, stubbed pending
+// live shared-storage test infrastructure. Storage: nfs-store:9001/vm-9001-disk-0.qcow2. Re-enable when
+// integration-test harness provides a nfs pool via env.
+//
+// func TestHandleAttachDisk_NFS_CID(t *testing.T) { ... }
+
+// TODO(storage-network): rbd — wired to PVE network-call boundary, stubbed pending
+// live shared-storage test infrastructure. Storage: ceph-pool:vm-9001-disk-0. Re-enable when
+// integration-test harness provides a rbd pool via env.
+//
+// func TestHandleAttachDisk_RBD_CID(t *testing.T) { ... }
+
+// TODO(storage-network): cephfs — wired to PVE network-call boundary, stubbed pending
+// live shared-storage test infrastructure. Storage: cephfs-pool:vm-9001-disk-0. Re-enable when
+// integration-test harness provides a cephfs pool via env.
+//
+// func TestHandleAttachDisk_CephFS_CID(t *testing.T) { ... }
+
+// TODO(storage-network): cifs — wired to PVE network-call boundary, stubbed pending
+// live shared-storage test infrastructure. Storage: cifs-store:9001/vm-9001-disk-0.qcow2. Re-enable when
+// integration-test harness provides a cifs pool via env.
+//
+// func TestHandleAttachDisk_CIFS_CID(t *testing.T) { ... }

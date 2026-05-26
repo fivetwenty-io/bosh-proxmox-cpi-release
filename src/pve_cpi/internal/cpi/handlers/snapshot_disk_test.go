@@ -419,3 +419,147 @@ func TestHandleSnapshotDisk_SDKError404(t *testing.T) {
 		t.Fatal("expected error for 404 from Snapshot")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// CID-variant tests: dir, zfspool, lvmthin.
+//
+// snapshot_disk has no storage-type branching. These tests verify that
+// ParseDiskCID accepts each CID format and that the handler locates the VM
+// and calls Snapshot regardless of storage type. The CID is passed through
+// unchanged — identity, not transformation, is what is tested.
+// ---------------------------------------------------------------------------
+
+func TestHandleSnapshotDisk_Dir_CID(t *testing.T) {
+	// dir storage: CID has subpath form "<storage>:<vmid>/<volname>.<ext>".
+	const diskCID = "local:9001/vm-9001-disk-0.raw"
+
+	var snapCalled bool
+	qemuSvc := &snapQEMUService{
+		configFn: func(_ context.Context, _ string, vmid int) (map[string]interface{}, error) {
+			if vmid == 9001 {
+				return map[string]interface{}{"scsi1": diskCID}, nil
+			}
+			return map[string]interface{}{}, nil
+		},
+		snapshotFn: func(_ context.Context, _ string, _ int, _ string, _ map[string]interface{}) (string, error) {
+			snapCalled = true
+			return "", nil
+		},
+	}
+	clusterSvc := &snapClusterService{
+		listFn: func(_ context.Context, _ *sdkclusterapi.ListResourcesParams) (*sdkclusterapi.ListResourcesResponse, error) {
+			return clusterRespWith(9001, "pve1"), nil
+		},
+	}
+
+	h := handlers.HandleSnapshotDisk(snapDeps(qemuSvc, clusterSvc, nil))
+	result, err := h.Handle(context.Background(), marshalArgs(diskCID), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("Dir CID: unexpected error: %v", err)
+	}
+	if !snapCalled {
+		t.Error("Dir CID: Snapshot was not called")
+	}
+	sid, ok := result.(string)
+	if !ok || sid == "" {
+		t.Fatalf("Dir CID: result: want non-empty snapshot_cid string, got %T %v", result, result)
+	}
+}
+
+func TestHandleSnapshotDisk_ZFSPool_CID(t *testing.T) {
+	// zfspool storage: bare volname (no subpath), e.g. "local-zfs:vm-9001-disk-0".
+	const diskCID = "local-zfs:vm-9001-disk-0"
+
+	var snapCalled bool
+	qemuSvc := &snapQEMUService{
+		configFn: func(_ context.Context, _ string, vmid int) (map[string]interface{}, error) {
+			if vmid == 9001 {
+				return map[string]interface{}{"scsi1": diskCID}, nil
+			}
+			return map[string]interface{}{}, nil
+		},
+		snapshotFn: func(_ context.Context, _ string, _ int, _ string, _ map[string]interface{}) (string, error) {
+			snapCalled = true
+			return "", nil
+		},
+	}
+	clusterSvc := &snapClusterService{
+		listFn: func(_ context.Context, _ *sdkclusterapi.ListResourcesParams) (*sdkclusterapi.ListResourcesResponse, error) {
+			return clusterRespWith(9001, "pve1"), nil
+		},
+	}
+
+	h := handlers.HandleSnapshotDisk(snapDeps(qemuSvc, clusterSvc, nil))
+	result, err := h.Handle(context.Background(), marshalArgs(diskCID), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("ZFSPool CID: unexpected error: %v", err)
+	}
+	if !snapCalled {
+		t.Error("ZFSPool CID: Snapshot was not called")
+	}
+	sid, ok := result.(string)
+	if !ok || sid == "" {
+		t.Fatalf("ZFSPool CID: result: want non-empty snapshot_cid string, got %T %v", result, result)
+	}
+}
+
+func TestHandleSnapshotDisk_LVMThin_CID(t *testing.T) {
+	// lvmthin storage: bare volname, e.g. "local-lvm-thin:vm-9001-disk-0".
+	const diskCID = "local-lvm-thin:vm-9001-disk-0"
+
+	var snapCalled bool
+	qemuSvc := &snapQEMUService{
+		configFn: func(_ context.Context, _ string, vmid int) (map[string]interface{}, error) {
+			if vmid == 9001 {
+				return map[string]interface{}{"scsi1": diskCID}, nil
+			}
+			return map[string]interface{}{}, nil
+		},
+		snapshotFn: func(_ context.Context, _ string, _ int, _ string, _ map[string]interface{}) (string, error) {
+			snapCalled = true
+			return "", nil
+		},
+	}
+	clusterSvc := &snapClusterService{
+		listFn: func(_ context.Context, _ *sdkclusterapi.ListResourcesParams) (*sdkclusterapi.ListResourcesResponse, error) {
+			return clusterRespWith(9001, "pve1"), nil
+		},
+	}
+
+	h := handlers.HandleSnapshotDisk(snapDeps(qemuSvc, clusterSvc, nil))
+	result, err := h.Handle(context.Background(), marshalArgs(diskCID), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("LVMThin CID: unexpected error: %v", err)
+	}
+	if !snapCalled {
+		t.Error("LVMThin CID: Snapshot was not called")
+	}
+	sid, ok := result.(string)
+	if !ok || sid == "" {
+		t.Fatalf("LVMThin CID: result: want non-empty snapshot_cid string, got %T %v", result, result)
+	}
+}
+
+// TODO(storage-network): nfs — wired to PVE network-call boundary, stubbed pending
+// live shared-storage test infrastructure. Storage: nfs-store:9001/vm-9001-disk-0.qcow2. Re-enable when
+// integration-test harness provides a nfs pool via env.
+//
+// func TestHandleSnapshotDisk_NFS_CID(t *testing.T) { ... }
+
+// TODO(storage-network): rbd — wired to PVE network-call boundary, stubbed pending
+// live shared-storage test infrastructure. Storage: ceph-pool:vm-9001-disk-0. Re-enable when
+// integration-test harness provides a rbd pool via env.
+//
+// func TestHandleSnapshotDisk_RBD_CID(t *testing.T) { ... }
+
+// TODO(storage-network): cephfs — wired to PVE network-call boundary, stubbed pending
+// live shared-storage test infrastructure. Storage: cephfs-pool:vm-9001-disk-0. Re-enable when
+// integration-test harness provides a cephfs pool via env.
+//
+// func TestHandleSnapshotDisk_CephFS_CID(t *testing.T) { ... }
+
+// TODO(storage-network): cifs — wired to PVE network-call boundary, stubbed pending
+// live shared-storage test infrastructure. Storage: cifs-store:9001/vm-9001-disk-0.qcow2. Re-enable when
+// integration-test harness provides a cifs pool via env.
+//
+// func TestHandleSnapshotDisk_CIFS_CID(t *testing.T) { ... }

@@ -305,3 +305,128 @@ func TestHandleGetDisks_BareVolidNoOptions(t *testing.T) {
 		t.Errorf("disk_cid: want local-lvm:vm-9001-disk-0, got %q", diskCIDs[0])
 	}
 }
+
+// ---------------------------------------------------------------------------
+// CID-variant tests: dir, zfspool, lvmthin.
+//
+// get_disks has no storage-type branching. These tests verify that the handler
+// returns the correct bare volid (CID identity) for each storage type. The
+// volid extracted by bareVolidFromOptStr is identical to the input CID when
+// no option string is present — ParseDiskCID is exercised implicitly by the
+// caller, but the handler itself just returns the volid string unchanged.
+// ---------------------------------------------------------------------------
+
+func TestHandleGetDisks_Dir_CID(t *testing.T) {
+	// dir storage: CID has subpath form "<storage>:<vmid>/<volname>.<ext>".
+	// The colon splits at first occurrence; the full CID is the volid returned.
+	const diskCID = "local:9001/vm-9001-disk-0.raw"
+	qemuSvc := &getDisksQEMUService{
+		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
+			return map[string]interface{}{
+				"scsi0": "local:100/vm-100-disk-0.raw", // system disk
+				"scsi1": diskCID,
+			}, nil
+		},
+	}
+
+	h := handlers.HandleGetDisks(getDisksDeps(qemuSvc))
+	result, err := h.Handle(context.Background(), marshalArgs("100"), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("Dir CID: unexpected error: %v", err)
+	}
+
+	diskCIDs, ok := result.([]string)
+	if !ok {
+		t.Fatalf("Dir CID: result: want []string, got %T", result)
+	}
+	if len(diskCIDs) != 1 {
+		t.Fatalf("Dir CID: disk count: want 1, got %d: %v", len(diskCIDs), diskCIDs)
+	}
+	if diskCIDs[0] != diskCID {
+		t.Errorf("Dir CID: disk_cid: want %q, got %q", diskCID, diskCIDs[0])
+	}
+}
+
+func TestHandleGetDisks_ZFSPool_CID(t *testing.T) {
+	// zfspool storage: bare volname (no subpath), e.g. "local-zfs:vm-9001-disk-0".
+	const diskCID = "local-zfs:vm-9001-disk-0"
+	qemuSvc := &getDisksQEMUService{
+		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
+			return map[string]interface{}{
+				"scsi0": "local-zfs:vm-100-disk-0", // system disk
+				"scsi1": diskCID,
+			}, nil
+		},
+	}
+
+	h := handlers.HandleGetDisks(getDisksDeps(qemuSvc))
+	result, err := h.Handle(context.Background(), marshalArgs("100"), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("ZFSPool CID: unexpected error: %v", err)
+	}
+
+	diskCIDs, ok := result.([]string)
+	if !ok {
+		t.Fatalf("ZFSPool CID: result: want []string, got %T", result)
+	}
+	if len(diskCIDs) != 1 {
+		t.Fatalf("ZFSPool CID: disk count: want 1, got %d: %v", len(diskCIDs), diskCIDs)
+	}
+	if diskCIDs[0] != diskCID {
+		t.Errorf("ZFSPool CID: disk_cid: want %q, got %q", diskCID, diskCIDs[0])
+	}
+}
+
+func TestHandleGetDisks_LVMThin_CID(t *testing.T) {
+	// lvmthin storage: bare volname, e.g. "local-lvm-thin:vm-9001-disk-0".
+	const diskCID = "local-lvm-thin:vm-9001-disk-0"
+	qemuSvc := &getDisksQEMUService{
+		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
+			return map[string]interface{}{
+				"scsi0": "local-lvm-thin:vm-100-disk-0", // system disk
+				"scsi1": diskCID,
+			}, nil
+		},
+	}
+
+	h := handlers.HandleGetDisks(getDisksDeps(qemuSvc))
+	result, err := h.Handle(context.Background(), marshalArgs("100"), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("LVMThin CID: unexpected error: %v", err)
+	}
+
+	diskCIDs, ok := result.([]string)
+	if !ok {
+		t.Fatalf("LVMThin CID: result: want []string, got %T", result)
+	}
+	if len(diskCIDs) != 1 {
+		t.Fatalf("LVMThin CID: disk count: want 1, got %d: %v", len(diskCIDs), diskCIDs)
+	}
+	if diskCIDs[0] != diskCID {
+		t.Errorf("LVMThin CID: disk_cid: want %q, got %q", diskCID, diskCIDs[0])
+	}
+}
+
+// TODO(storage-network): nfs — wired to PVE network-call boundary, stubbed pending
+// live shared-storage test infrastructure. Storage: nfs-store:9001/vm-9001-disk-0.qcow2. Re-enable when
+// integration-test harness provides a nfs pool via env.
+//
+// func TestHandleGetDisks_NFS_CID(t *testing.T) { ... }
+
+// TODO(storage-network): rbd — wired to PVE network-call boundary, stubbed pending
+// live shared-storage test infrastructure. Storage: ceph-pool:vm-9001-disk-0. Re-enable when
+// integration-test harness provides a rbd pool via env.
+//
+// func TestHandleGetDisks_RBD_CID(t *testing.T) { ... }
+
+// TODO(storage-network): cephfs — wired to PVE network-call boundary, stubbed pending
+// live shared-storage test infrastructure. Storage: cephfs-pool:vm-9001-disk-0. Re-enable when
+// integration-test harness provides a cephfs pool via env.
+//
+// func TestHandleGetDisks_CephFS_CID(t *testing.T) { ... }
+
+// TODO(storage-network): cifs — wired to PVE network-call boundary, stubbed pending
+// live shared-storage test infrastructure. Storage: cifs-store:9001/vm-9001-disk-0.qcow2. Re-enable when
+// integration-test harness provides a cifs pool via env.
+//
+// func TestHandleGetDisks_CIFS_CID(t *testing.T) { ... }

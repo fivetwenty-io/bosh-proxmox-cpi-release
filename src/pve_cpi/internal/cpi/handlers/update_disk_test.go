@@ -581,3 +581,219 @@ func TestHandleUpdateDisk_NullSpec_NoOp(t *testing.T) {
 		t.Fatalf("unexpected error for null spec: %v", err)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Gap tests: error paths (gaps #12, #13, #15, #23 from R1).
+// ---------------------------------------------------------------------------
+
+// TestHandleUpdateDisk_ConfigReadError — Config() fails on the 3rd call (during
+// option read, after locate + ResolveDiskID succeed). Handler must propagate the
+// error (gap #12).
+func TestHandleUpdateDisk_ConfigReadError(t *testing.T) {
+	const diskCID = "local-lvm:vm-9001-disk-0"
+	const volid = "vm-9001-disk-0"
+
+	configCallCount := 0
+	qemuSvc := &updateDiskQEMUService{
+		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
+			configCallCount++
+			if configCallCount <= 2 {
+				// Calls 1-2: FindVMByDiskVolid + ResolveDiskID — return bare volid.
+				return map[string]interface{}{"scsi2": volid}, nil
+			}
+			// Call 3: option read for merge — inject failure.
+			return nil, errors.New("config read failure injected")
+		},
+	}
+
+	h := handlers.HandleUpdateDisk(updateDiskDeps(qemuSvc, updateClusterWith(100), nil))
+	_, err := h.Handle(context.Background(), marshalArgs(diskCID, map[string]any{
+		"cache": "writeback",
+	}), jsonrpc.Context{})
+	if err == nil {
+		t.Fatal("expected error when Config() fails during option read")
+	}
+	if !strings.Contains(err.Error(), "config") && !strings.Contains(err.Error(), "config read failure injected") {
+		t.Errorf("error must mention config failure, got: %v", err)
+	}
+}
+
+// TestHandleUpdateDisk_ResolveDiskIDError — Config() fails on the 2nd call
+// (used by ResolveDiskID internally), so ResolveDiskID returns error. Handler
+// must propagate it (gap #13).
+func TestHandleUpdateDisk_ResolveDiskIDError(t *testing.T) {
+	const diskCID = "local-lvm:vm-9001-disk-0"
+	const volid = "vm-9001-disk-0"
+
+	configCallCount := 0
+	qemuSvc := &updateDiskQEMUService{
+		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
+			configCallCount++
+			if configCallCount == 1 {
+				// Call 1: FindVMByDiskVolid — returns bare volid so VM is located.
+				return map[string]interface{}{"scsi2": volid}, nil
+			}
+			// Call 2: ResolveDiskID config fetch — inject failure.
+			return nil, errors.New("resolve config error injected")
+		},
+	}
+
+	h := handlers.HandleUpdateDisk(updateDiskDeps(qemuSvc, updateClusterWith(100), nil))
+	_, err := h.Handle(context.Background(), marshalArgs(diskCID, map[string]any{
+		"cache": "writeback",
+	}), jsonrpc.Context{})
+	if err == nil {
+		t.Fatal("expected error when ResolveDiskID fails")
+	}
+}
+
+// TestHandleUpdateDisk_SizeWrongType — update_spec.size is a string "big" (not a
+// number). toInt() returns false → handler returns a descriptive error (gap #15).
+func TestHandleUpdateDisk_SizeWrongType(t *testing.T) {
+	const diskCID = "local-lvm:vm-9001-disk-0"
+	const volid = "vm-9001-disk-0"
+
+	configCallCount := 0
+	qemuSvc := &updateDiskQEMUService{
+		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
+			configCallCount++
+			if configCallCount <= 2 {
+				return map[string]interface{}{"scsi2": volid}, nil
+			}
+			return map[string]interface{}{"scsi2": volid + ",size=10G"}, nil
+		},
+	}
+
+	h := handlers.HandleUpdateDisk(updateDiskDeps(qemuSvc, updateClusterWith(100), nil))
+	_, err := h.Handle(context.Background(), marshalArgs(diskCID, map[string]any{
+		"size": "big",
+	}), jsonrpc.Context{})
+	if err == nil {
+		t.Fatal("expected error for non-numeric size field")
+	}
+	if !strings.Contains(err.Error(), "size") {
+		t.Errorf("error must mention size field, got: %v", err)
+	}
+}
+
+// TestHandleUpdateDisk_EmptyDiskCID — diskCID is an empty string after unmarshal.
+// update_disk.go:68-70 returns an explicit error before ParseDiskCID is reached
+// (gap #23).
+func TestHandleUpdateDisk_EmptyDiskCID(t *testing.T) {
+	h := handlers.HandleUpdateDisk(updateDiskDeps(&updateDiskQEMUService{}, &snapClusterService{}, nil))
+	_, err := h.Handle(context.Background(), marshalArgs("", map[string]any{}), jsonrpc.Context{})
+	if err == nil {
+		t.Fatal("expected error for empty diskCID")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// CID variant tests: dir and zfspool formats (gap #16 for update_disk).
+// update_disk has no storage-type branching; these tests exercise ParseDiskCID
+// with non-lvm volume formats and confirm the full update path completes.
+// ---------------------------------------------------------------------------
+
+// TestHandleUpdateDisk_Dir_CID — diskCID uses dir-storage subpath format
+// "local:9001/vm-9001-disk-0.raw". ParseDiskCID splits on first colon:
+// storage="local", volume="9001/vm-9001-disk-0.raw". Handler locates the VM
+// and applies option updates normally.
+func TestHandleUpdateDisk_Dir_CID(t *testing.T) {
+	const diskCID = "local:9001/vm-9001-disk-0.raw"
+	const volid = "9001/vm-9001-disk-0.raw"
+
+	var capturedOptStr string
+
+	configCallCount := 0
+	qemuSvc := &updateDiskQEMUService{
+		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
+			configCallCount++
+			if configCallCount <= 2 {
+				return map[string]interface{}{"scsi2": volid}, nil
+			}
+			return map[string]interface{}{"scsi2": volid + ",size=10G"}, nil
+		},
+		attachDiskFn: func(_ context.Context, _ string, _ int, optStr string, _ string, opts *qemu.AttachOpts) (string, error) {
+			capturedOptStr = optStr
+			if opts == nil || opts.DiskID != "scsi2" {
+				t.Errorf("expected AttachDisk with DiskID=scsi2, got %v", opts)
+			}
+			return "scsi2", nil
+		},
+	}
+
+	h := handlers.HandleUpdateDisk(updateDiskDeps(qemuSvc, updateClusterWith(100), nil))
+	_, err := h.Handle(context.Background(), marshalArgs(diskCID, map[string]any{
+		"cache": "none",
+	}), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error for dir-storage CID: %v", err)
+	}
+	if !strings.Contains(capturedOptStr, "cache=none") {
+		t.Errorf("option string must contain cache=none, got %q", capturedOptStr)
+	}
+}
+
+// TestHandleUpdateDisk_ZFSPool_CID — diskCID uses zfspool bare-volname format
+// "local-zfs:vm-9001-disk-0". ParseDiskCID: storage="local-zfs",
+// volume="vm-9001-disk-0". update_disk has no storage-type branching so the
+// zfspool CID passes through the same path as lvm.
+func TestHandleUpdateDisk_ZFSPool_CID(t *testing.T) {
+	const diskCID = "local-zfs:vm-9001-disk-0"
+	const volid = "vm-9001-disk-0"
+
+	var capturedOptStr string
+
+	configCallCount := 0
+	qemuSvc := &updateDiskQEMUService{
+		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
+			configCallCount++
+			if configCallCount <= 2 {
+				return map[string]interface{}{"scsi2": volid}, nil
+			}
+			return map[string]interface{}{"scsi2": volid + ",size=10G"}, nil
+		},
+		attachDiskFn: func(_ context.Context, _ string, _ int, optStr string, _ string, opts *qemu.AttachOpts) (string, error) {
+			capturedOptStr = optStr
+			if opts == nil || opts.DiskID != "scsi2" {
+				t.Errorf("expected AttachDisk with DiskID=scsi2, got %v", opts)
+			}
+			return "scsi2", nil
+		},
+	}
+
+	h := handlers.HandleUpdateDisk(updateDiskDeps(qemuSvc, updateClusterWith(100), nil))
+	_, err := h.Handle(context.Background(), marshalArgs(diskCID, map[string]any{
+		"iothread": true,
+	}), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error for zfspool CID: %v", err)
+	}
+	if !strings.Contains(capturedOptStr, "iothread=1") {
+		t.Errorf("option string must contain iothread=1, got %q", capturedOptStr)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TODO(storage-network): nfs — wired to PVE network-call boundary, stubbed pending
+// live shared-storage test infrastructure. Storage: nfs-store:9001/vm-9001-disk-0.qcow2. Re-enable when
+// integration-test harness provides a nfs pool via env.
+//
+// func TestHandleUpdateDisk_NFS_CID(t *testing.T) { ... }
+
+// TODO(storage-network): rbd — wired to PVE network-call boundary, stubbed pending
+// live shared-storage test infrastructure. Storage: ceph-pool:vm-9001-disk-0. Re-enable when
+// integration-test harness provides a rbd pool via env.
+//
+// func TestHandleUpdateDisk_RBD_CID(t *testing.T) { ... }
+
+// TODO(storage-network): cephfs — wired to PVE network-call boundary, stubbed pending
+// live shared-storage test infrastructure. Storage: cephfs-pool:vm-9001-disk-0. Re-enable when
+// integration-test harness provides a cephfs pool via env.
+//
+// func TestHandleUpdateDisk_CephFS_CID(t *testing.T) { ... }
+
+// TODO(storage-network): cifs — wired to PVE network-call boundary, stubbed pending
+// live shared-storage test infrastructure. Storage: cifs-store:9001/vm-9001-disk-0.qcow2. Re-enable when
+// integration-test harness provides a cifs pool via env.
+//
+// func TestHandleUpdateDisk_CIFS_CID(t *testing.T) { ... }
