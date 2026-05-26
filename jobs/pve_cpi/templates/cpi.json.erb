@@ -26,8 +26,9 @@
     "numa"                  => p("pve.numa"),
     "reboot_mode"           => p("pve.reboot_mode"),
     "reboot_timeout"        => p("pve.reboot_timeout"),
-    "vm_prefix"             => p("pve.vm_prefix"),
-    "create_env_deployment" => p("pve.create_env_deployment"),
+    "vm_prefix"                 => p("pve.vm_prefix"),
+    "create_env_deployment"     => p("pve.create_env_deployment"),
+    "fetch_credential_defaults" => p("pve.fetch_credential_defaults", []),
   }
 
   # Emit password / api_token only when non-empty. The Go config validator

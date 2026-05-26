@@ -175,6 +175,26 @@ type CPIConfig struct {
 	// graceful ACPI shutdown before falling back to a hard reset. Ignored when
 	// RebootMode is "hard". Valid range 1–3600; defaults to 60.
 	RebootTimeout int `json:"reboot_timeout,omitempty"`
+
+	// FetchCredentialDefaults holds URL-prefix → auth-payload mappings used by
+	// the stemcell_fetch package when no per-stemcell auth is provided in
+	// cloud_properties. The longest URLPrefix match wins. Empty slice (default)
+	// means all stemcell fetches are unauthenticated unless
+	// cloud_properties.image_url_auth supplies per-stemcell credentials.
+	FetchCredentialDefaults []FetchCredentialDefault `json:"fetch_credential_defaults,omitempty"`
+}
+
+// FetchCredentialDefault maps a URL prefix to a JSON auth payload understood
+// by stemcell_fetch.parseAuth. URLPrefix is compared against the raw image_url
+// string; the entry with the longest matching prefix wins.
+//
+// Auth is a raw JSON object with a mandatory "type" field (basic|bearer|s3|oci).
+// Example:
+//
+//	{"url_prefix":"https://harbor.corp/stemcells/","auth":{"type":"basic","username":"robot","password":"s3cr3t"}}
+type FetchCredentialDefault struct {
+	URLPrefix string          `json:"url_prefix"`
+	Auth      json.RawMessage `json:"auth"`
 }
 
 // knownConfigFields is the set of JSON field names declared on CPIConfig.

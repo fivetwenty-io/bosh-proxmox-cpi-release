@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	sdkcloudinit "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cloudinit"
@@ -36,20 +37,64 @@ import (
 // stemcellMockClient implements pve.Client. All services default to no-ops or
 // embed the interface (panics on unknown calls).
 type stemcellMockClient struct {
-	qemuSvc    sdkqemu.Service
-	nodesSvc   sdknodes.Service
-	tasksSvc   sdktasks.Service
-	clusterSvc sdkcluster.Service
-	storageSvc sdkstorage.Service
+	qemuSvc           sdkqemu.Service
+	nodesSvc          sdknodes.Service
+	tasksSvc          sdktasks.Service
+	clusterSvc        sdkcluster.Service
+	storageSvc        sdkstorage.Service
+	clusterStorageSvc sdkclusterstorage.Service
 }
 
-func (m *stemcellMockClient) QEMU() sdkqemu.Service                     { return m.qemuSvc }
-func (m *stemcellMockClient) Storage() sdkstorage.Service               { return m.storageSvc }
-func (m *stemcellMockClient) CloudInit() sdkcloudinit.Service           { return nil }
-func (m *stemcellMockClient) Tasks() sdktasks.Service                   { return m.tasksSvc }
-func (m *stemcellMockClient) Nodes() sdknodes.Service                   { return m.nodesSvc }
-func (m *stemcellMockClient) Cluster() sdkcluster.Service               { return m.clusterSvc }
-func (m *stemcellMockClient) ClusterStorage() sdkclusterstorage.Service { return nil }
+func (m *stemcellMockClient) QEMU() sdkqemu.Service           { return m.qemuSvc }
+func (m *stemcellMockClient) Storage() sdkstorage.Service     { return m.storageSvc }
+func (m *stemcellMockClient) CloudInit() sdkcloudinit.Service { return nil }
+func (m *stemcellMockClient) Tasks() sdktasks.Service         { return m.tasksSvc }
+func (m *stemcellMockClient) Nodes() sdknodes.Service         { return m.nodesSvc }
+func (m *stemcellMockClient) Cluster() sdkcluster.Service     { return m.clusterSvc }
+func (m *stemcellMockClient) ClusterStorage() sdkclusterstorage.Service {
+	return m.clusterStorageSvc
+}
+
+// stemcellMockClusterStorage satisfies sdkclusterstorage.Service.
+// Only ListStorage is wired; other methods panic on accidental call.
+type stemcellMockClusterStorage struct {
+	sdkclusterstorage.Service // embed nil — panics on unexpected calls
+	listStorageFn             func(ctx context.Context, params *sdkclusterstorage.ListStorageParams) (*sdkclusterstorage.ListStorageResponse, error)
+}
+
+func (m *stemcellMockClusterStorage) ListStorage(ctx context.Context, params *sdkclusterstorage.ListStorageParams) (*sdkclusterstorage.ListStorageResponse, error) {
+	if m.listStorageFn != nil {
+		return m.listStorageFn(ctx, params)
+	}
+	// Default: empty list — no storages visible. Tests that exercise
+	// storage policy must supply listStorageFn.
+	empty := sdkclusterstorage.ListStorageResponse{}
+	return &empty, nil
+}
+
+// lightStemcellClusterStorage builds a stemcellMockClusterStorage whose
+// ListStorage returns a single entry with the given storage name and type.
+// shared=1 when isShared is true, 0 otherwise. nodes is comma-joined from
+// the nodeList slice (empty means no node restriction).
+func lightStemcellClusterStorage(storageName, storageType string, isShared bool, nodeList []string) *stemcellMockClusterStorage {
+	return &stemcellMockClusterStorage{
+		listStorageFn: func(_ context.Context, _ *sdkclusterstorage.ListStorageParams) (*sdkclusterstorage.ListStorageResponse, error) {
+			shared := 0
+			if isShared {
+				shared = 1
+			}
+			nodes := strings.Join(nodeList, ",")
+			raw, _ := json.Marshal(map[string]interface{}{
+				"storage": storageName,
+				"type":    storageType,
+				"shared":  shared,
+				"nodes":   nodes,
+			})
+			resp := sdkclusterstorage.ListStorageResponse{raw}
+			return &resp, nil
+		},
+	}
+}
 
 // stemcellMockQEMU satisfies sdkqemu.Service. Only Create and Config are wired.
 // templateFn removed — the new flow never calls QEMU().Template().
@@ -176,6 +221,30 @@ func buildStemcellClient(qemu *stemcellMockQEMU, nodes *stemcellMockNodes, tasks
 		tasksSvc:   tasks,
 		clusterSvc: cluster,
 		storageSvc: &stemcellMockStorage{},
+	}
+}
+
+// buildLightStemcellClient constructs a stemcellMockClient wired for light
+// stemcell tests. clusterStorage drives handlerPolicyDeps.StorageInfo;
+// clusterNodes drives clusterNodeCount via cluster.ListConfigNodes.
+func buildLightStemcellClient(
+	clusterStorage *stemcellMockClusterStorage,
+	nodes *stemcellMockNodes,
+	cluster *stemcellMockCluster,
+) *stemcellMockClient {
+	if nodes == nil {
+		nodes = &stemcellMockNodes{}
+	}
+	if cluster == nil {
+		cluster = &stemcellMockCluster{}
+	}
+	return &stemcellMockClient{
+		qemuSvc:           &stemcellMockQEMU{},
+		nodesSvc:          nodes,
+		tasksSvc:          &stemcellMockTasks{},
+		clusterSvc:        cluster,
+		storageSvc:        &stemcellMockStorage{},
+		clusterStorageSvc: clusterStorage,
 	}
 }
 
@@ -1219,11 +1288,601 @@ func TestCreateStemcell_AcceptsPathUnderTempDir(t *testing.T) {
 }
 
 // ============================================================
+// Tests: parseStemcellCloudProps — light-stemcell fields
+// ============================================================
+
+// parseStemcellCloudPropsExported is a thin shim that exercises the package-internal
+// parseStemcellCloudProps via the exported HandleCreateStemcell handler by extracting
+// the parsed result from observable side-effects. Because stemcellCloudProps is
+// package-internal, direct instantiation is not available from _test packages.
+// Instead we use a dedicated test helper that invokes the exported constructor and
+// reads back the fields via the exported helper methods IsLight and LightMode
+// (also tested here), plus a targeted validateLightMutex error case via the handler.
+//
+// For field-level assertions that require access to unexported struct fields
+// (ImageURLAuth, Node), we use a white-box test file (create_stemcell_internal_test.go)
+// in the handlers package (package handlers). The table-driven tests below cover
+// observable behaviour accessible from the _test package.
+
+// TestParseStemcellCloudProps_LightFields_BlackBox exercises the light-field
+// parsing through observable handler behaviour. IsLight and LightMode are
+// verified indirectly: for preuploaded/fetch modes the handler currently still
+// falls through to name/version validation (light path not yet routed), so we
+// inspect the error message to confirm parsing proceeded past the mutex check.
+//
+// Direct field access (ImageURLAuth, Node) is validated in the white-box test
+// file create_stemcell_wb_test.go (package handlers).
+func TestParseStemcellCloudProps_LightFields_BlackBox(t *testing.T) {
+	t.Parallel()
+
+	// light cases: image_id only, image_url only — handler reaches name validation,
+	// not a mutex error. This confirms parsing did not short-circuit on these inputs.
+	cases := []struct {
+		name          string
+		cp            map[string]any
+		wantMutexErr  bool
+		wantMutexFrag string
+	}{
+		{
+			name:         "image_id only",
+			cp:           map[string]any{"image_id": "nfs:import/x.qcow2"},
+			wantMutexErr: false,
+		},
+		{
+			name:         "image_url only",
+			cp:           map[string]any{"image_url": "https://example.com/x.qcow2"},
+			wantMutexErr: false,
+		},
+		{
+			name:          "both image_id and image_url",
+			cp:            map[string]any{"image_id": "nfs:import/x.qcow2", "image_url": "https://example.com/x.qcow2"},
+			wantMutexErr:  true,
+			wantMutexFrag: "mutually exclusive",
+		},
+		{
+			name:         "neither set",
+			cp:           map[string]any{},
+			wantMutexErr: false,
+		},
+		{
+			name:         "node only",
+			cp:           map[string]any{"node": "pve1"},
+			wantMutexErr: false,
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			imgPath := tempImageFile(t)
+			deps := makeDeps(defaultStemcellClient())
+			h := handlers.HandleCreateStemcell(deps)
+
+			args := []json.RawMessage{marshalArg(t, imgPath), marshalArg(t, tc.cp)}
+			_, err := h.Handle(context.Background(), args, jsonrpc.Context{})
+
+			if tc.wantMutexErr {
+				if err == nil {
+					t.Fatal("expected mutex error; got nil")
+				}
+				if !containsSubstr(err.Error(), tc.wantMutexFrag) {
+					t.Errorf("error %q does not contain %q", err.Error(), tc.wantMutexFrag)
+				}
+				return
+			}
+			// Non-mutex cases: error must NOT be the mutex error. Later-stage
+			// errors (missing name/version) are acceptable.
+			if err != nil && containsSubstr(err.Error(), "mutually exclusive") {
+				t.Errorf("unexpected mutex error for case %q: %v", tc.name, err)
+			}
+		})
+	}
+}
+
+// ============================================================
+// Tests: stemcellCloudProps.validateLightMutex
+// ============================================================
+
+// TestStemcellCloudProps_validateLightMutex exercises mutual-exclusion logic
+// through HandleCreateStemcell since stemcellCloudProps is package-internal.
+func TestStemcellCloudProps_validateLightMutex(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name    string
+		cp      map[string]any
+		wantErr bool
+		errFrag string
+	}{
+		{
+			name:    "both set — error",
+			cp:      map[string]any{"image_id": "local:import/a.qcow2", "image_url": "https://example.com/b.qcow2"},
+			wantErr: true,
+			errFrag: "mutually exclusive",
+		},
+		{
+			name:    "image_id only — ok",
+			cp:      map[string]any{"image_id": "local:import/a.qcow2"},
+			wantErr: false,
+		},
+		{
+			name:    "image_url only — ok",
+			cp:      map[string]any{"image_url": "https://example.com/b.qcow2"},
+			wantErr: false,
+		},
+		{
+			name:    "neither — ok",
+			cp:      map[string]any{},
+			wantErr: false,
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			imgPath := tempImageFile(t)
+			deps := makeDeps(defaultStemcellClient())
+			h := handlers.HandleCreateStemcell(deps)
+
+			args := []json.RawMessage{marshalArg(t, imgPath), marshalArg(t, tc.cp)}
+			_, err := h.Handle(context.Background(), args, jsonrpc.Context{})
+
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error containing %q; got nil", tc.errFrag)
+				}
+				if !containsSubstr(err.Error(), tc.errFrag) {
+					t.Errorf("error %q does not contain %q", err.Error(), tc.errFrag)
+				}
+				return
+			}
+			// No mutex error expected. Later-stage errors (name/version missing) are fine.
+			if err != nil && containsSubstr(err.Error(), "mutually exclusive") {
+				t.Errorf("unexpected mutual-exclusion error: %v", err)
+			}
+		})
+	}
+}
+
+// ============================================================
+// Tests: HandleCreateStemcell — light stemcell (pre-uploaded)
+// ============================================================
+
+// lightStemcellDeps builds a Deps suitable for light stemcell tests.
+// clusterStorage drives handlerPolicyDeps.StorageInfo;
+// nodeListFn drives ListStorageContent (existence check);
+// configNodeCount controls how many nodes the cluster mock reports.
+func lightStemcellDeps(
+	t *testing.T,
+	clusterStorage *stemcellMockClusterStorage,
+	nodeListFn func(_ context.Context, _, _ string, _ *sdknodes.ListStorageContentParams) (*sdknodes.ListStorageContentResponse, error),
+	configNodeCount int,
+) handlers.Deps {
+	t.Helper()
+	var clusterNodes sdkcluster.ListConfigNodesResponse
+	for i := 0; i < configNodeCount; i++ {
+		raw, _ := json.Marshal(map[string]string{"node": "pve-node1"})
+		clusterNodes = append(clusterNodes, raw)
+	}
+	cluster := &stemcellMockCluster{
+		listConfigNodesFn: func(_ context.Context) (*sdkcluster.ListConfigNodesResponse, error) {
+			return &clusterNodes, nil
+		},
+	}
+	nodes := &stemcellMockNodes{listStorageFn: nodeListFn}
+	client := buildLightStemcellClient(clusterStorage, nodes, cluster)
+	return handlers.Deps{
+		Config: &config.CPIConfig{
+			Node:            "pve-node1",
+			StemcellStorage: "nfs",
+			VMStorage:       "nfs",
+			DiskStorage:     "nfs",
+		},
+		PVE:    client,
+		Logger: log.NewNopLogger(),
+	}
+}
+
+// existingVolumeListFn returns a ListStorageContent that reports qcow2Filename as present.
+func existingVolumeListFn(storage, qcow2Filename string) func(_ context.Context, _, _ string, _ *sdknodes.ListStorageContentParams) (*sdknodes.ListStorageContentResponse, error) {
+	return func(_ context.Context, _, _ string, _ *sdknodes.ListStorageContentParams) (*sdknodes.ListStorageContentResponse, error) {
+		volid := storage + ":import/" + qcow2Filename
+		raw, _ := json.Marshal(map[string]string{"volid": volid})
+		resp := sdknodes.ListStorageContentResponse{raw}
+		return &resp, nil
+	}
+}
+
+// emptyVolumeListFn returns a ListStorageContent that reports no volumes.
+func emptyVolumeListFn() func(_ context.Context, _, _ string, _ *sdknodes.ListStorageContentParams) (*sdknodes.ListStorageContentResponse, error) {
+	return func(_ context.Context, _, _ string, _ *sdknodes.ListStorageContentParams) (*sdknodes.ListStorageContentResponse, error) {
+		empty := sdknodes.ListStorageContentResponse{}
+		return &empty, nil
+	}
+}
+
+// TestHandleCreateStemcell_LightPreUploaded_HappyPath verifies the end-to-end
+// success path: valid image_id, shared NFS storage on a single-node cluster,
+// file found on PVE — handler returns a "light:" CID, no upload occurs.
+func TestHandleCreateStemcell_LightPreUploaded_HappyPath(t *testing.T) {
+	t.Parallel()
+
+	const (
+		storageName = "nfs"
+		filename    = "ubuntu-jammy-1.438-abc12345.qcow2"
+		imageID     = storageName + ":import/" + filename
+	)
+
+	clusterStorage := lightStemcellClusterStorage(storageName, "nfs", true, nil)
+	deps := lightStemcellDeps(t, clusterStorage, existingVolumeListFn(storageName, filename), 1)
+
+	var uploadCalled bool
+	deps.PVE.(*stemcellMockClient).storageSvc = &stemcellMockStorage{
+		uploadFn: func(_ context.Context, _, _, _, _ string, _ io.Reader) (string, error) {
+			uploadCalled = true
+			return "", nil
+		},
+	}
+
+	h := handlers.HandleCreateStemcell(deps)
+	cp := map[string]any{
+		"name":     "ubuntu-jammy",
+		"version":  "1.438",
+		"image_id": imageID,
+	}
+	// BOSH passes /dev/null for light stemcells — not a real file.
+	args := []json.RawMessage{marshalArg(t, "/dev/null"), marshalArg(t, cp)}
+
+	result, err := h.Handle(context.Background(), args, jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	cid, ok := result.(string)
+	if !ok {
+		t.Fatalf("result is %T; want string", result)
+	}
+	wantCID := "light:" + imageID
+	if cid != wantCID {
+		t.Errorf("CID = %q; want %q", cid, wantCID)
+	}
+	if uploadCalled {
+		t.Error("Upload called for light stemcell; must be skipped")
+	}
+}
+
+// TestHandleCreateStemcell_LightPreUploaded_MalformedImageID verifies that a
+// cloud_properties.image_id that cannot be parsed as a volid returns a Cloud
+// error naming the bad value.
+func TestHandleCreateStemcell_LightPreUploaded_MalformedImageID(t *testing.T) {
+	t.Parallel()
+
+	clusterStorage := lightStemcellClusterStorage("nfs", "nfs", true, nil)
+	deps := lightStemcellDeps(t, clusterStorage, emptyVolumeListFn(), 1)
+
+	h := handlers.HandleCreateStemcell(deps)
+	cp := map[string]any{
+		"name":     "ubuntu-jammy",
+		"version":  "1.438",
+		"image_id": "not-a-valid-volid",
+	}
+	args := []json.RawMessage{marshalArg(t, "/dev/null"), marshalArg(t, cp)}
+
+	_, err := h.Handle(context.Background(), args, jsonrpc.Context{})
+	if err == nil {
+		t.Fatal("expected error for malformed image_id; got nil")
+	}
+	if !containsSubstr(err.Error(), "not-a-valid-volid") {
+		t.Errorf("error %q does not echo the bad image_id", err.Error())
+	}
+}
+
+// TestHandleCreateStemcell_LightPreUploaded_VolumeNotFound verifies that when
+// the existence check finds no matching volume, the error mentions "not found".
+func TestHandleCreateStemcell_LightPreUploaded_VolumeNotFound(t *testing.T) {
+	t.Parallel()
+
+	const (
+		storageName = "nfs"
+		filename    = "ubuntu-jammy-1.438-abc12345.qcow2"
+		imageID     = storageName + ":import/" + filename
+	)
+
+	clusterStorage := lightStemcellClusterStorage(storageName, "nfs", true, nil)
+	deps := lightStemcellDeps(t, clusterStorage, emptyVolumeListFn(), 1)
+
+	h := handlers.HandleCreateStemcell(deps)
+	cp := map[string]any{
+		"name":     "ubuntu-jammy",
+		"version":  "1.438",
+		"image_id": imageID,
+	}
+	args := []json.RawMessage{marshalArg(t, "/dev/null"), marshalArg(t, cp)}
+
+	_, err := h.Handle(context.Background(), args, jsonrpc.Context{})
+	if err == nil {
+		t.Fatal("expected error for volume not found; got nil")
+	}
+	if !containsSubstr(err.Error(), "not found") {
+		t.Errorf("error %q does not mention 'not found'", err.Error())
+	}
+}
+
+// TestHandleCreateStemcell_LightPreUploaded_BlockStorageRejected verifies that
+// an image_id referencing block-only storage (lvm type) is rejected by the
+// storage policy with an error mentioning the block-only constraint.
+func TestHandleCreateStemcell_LightPreUploaded_BlockStorageRejected(t *testing.T) {
+	t.Parallel()
+
+	const (
+		storageName = "local-lvm"
+		filename    = "ubuntu-jammy-1.438-abc12345.qcow2"
+		imageID     = storageName + ":import/" + filename
+	)
+
+	// lvm type → block-only → must be rejected.
+	clusterStorage := lightStemcellClusterStorage(storageName, "lvm", false, nil)
+	deps := lightStemcellDeps(t, clusterStorage, emptyVolumeListFn(), 1)
+
+	h := handlers.HandleCreateStemcell(deps)
+	cp := map[string]any{
+		"name":     "ubuntu-jammy",
+		"version":  "1.438",
+		"image_id": imageID,
+	}
+	args := []json.RawMessage{marshalArg(t, "/dev/null"), marshalArg(t, cp)}
+
+	_, err := h.Handle(context.Background(), args, jsonrpc.Context{})
+	if err == nil {
+		t.Fatal("expected error for block storage; got nil")
+	}
+	if !containsSubstr(err.Error(), "block") {
+		t.Errorf("error %q does not mention 'block'", err.Error())
+	}
+}
+
+// TestHandleCreateStemcell_LightPreUploaded_LocalMultiNodeNoPin verifies that
+// local storage on a multi-node cluster without a cloud_properties.node pin is
+// rejected with an error mentioning node pinning.
+func TestHandleCreateStemcell_LightPreUploaded_LocalMultiNodeNoPin(t *testing.T) {
+	t.Parallel()
+
+	const (
+		storageName = "local-dir"
+		filename    = "ubuntu-jammy-1.438-abc12345.qcow2"
+		imageID     = storageName + ":import/" + filename
+	)
+
+	// dir type, not shared → local storage.
+	clusterStorage := lightStemcellClusterStorage(storageName, "dir", false, nil)
+	// 2 nodes → must require pin.
+	deps := lightStemcellDeps(t, clusterStorage, emptyVolumeListFn(), 2)
+
+	h := handlers.HandleCreateStemcell(deps)
+	cp := map[string]any{
+		"name":     "ubuntu-jammy",
+		"version":  "1.438",
+		"image_id": imageID,
+		// node intentionally omitted.
+	}
+	args := []json.RawMessage{marshalArg(t, "/dev/null"), marshalArg(t, cp)}
+
+	_, err := h.Handle(context.Background(), args, jsonrpc.Context{})
+	if err == nil {
+		t.Fatal("expected error for local storage multi-node without node pin; got nil")
+	}
+	if !containsSubstr(err.Error(), "node") {
+		t.Errorf("error %q does not mention 'node'", err.Error())
+	}
+}
+
+// TestHandleCreateStemcell_LightPreUploaded_LocalSingleNodeAccepted verifies
+// that local storage on a single-node cluster is accepted without a node pin.
+func TestHandleCreateStemcell_LightPreUploaded_LocalSingleNodeAccepted(t *testing.T) {
+	t.Parallel()
+
+	const (
+		storageName = "local-dir"
+		filename    = "ubuntu-jammy-1.438-abc12345.qcow2"
+		imageID     = storageName + ":import/" + filename
+	)
+
+	clusterStorage := lightStemcellClusterStorage(storageName, "dir", false, nil)
+	deps := lightStemcellDeps(t, clusterStorage, existingVolumeListFn(storageName, filename), 1)
+
+	h := handlers.HandleCreateStemcell(deps)
+	cp := map[string]any{
+		"name":     "ubuntu-jammy",
+		"version":  "1.438",
+		"image_id": imageID,
+	}
+	args := []json.RawMessage{marshalArg(t, "/dev/null"), marshalArg(t, cp)}
+
+	result, err := h.Handle(context.Background(), args, jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error for single-node local storage: %v", err)
+	}
+	cid, ok := result.(string)
+	if !ok {
+		t.Fatalf("result is %T; want string", result)
+	}
+	if !containsSubstr(cid, "light:") {
+		t.Errorf("CID %q missing 'light:' prefix", cid)
+	}
+}
+
+// TestHandleCreateStemcell_LightPreUploaded_AnyStorageAccepted verifies that
+// when image_id references any shared-file storage, the handler accepts it
+// (there is no config-level restriction on which storage a pre-uploaded
+// light stemcell may use — policy is applied by ValidateLightStemcellStorage).
+func TestHandleCreateStemcell_LightPreUploaded_AnyStorageAccepted(t *testing.T) {
+	t.Parallel()
+
+	const (
+		storageName = "nfs-other"
+		filename    = "ubuntu-jammy-1.438-abc12345.qcow2"
+		imageID     = storageName + ":import/" + filename
+	)
+
+	clusterStorage := lightStemcellClusterStorage(storageName, "nfs", true, nil)
+	deps := lightStemcellDeps(t, clusterStorage, existingVolumeListFn(storageName, filename), 1)
+
+	h := handlers.HandleCreateStemcell(deps)
+	cp := map[string]any{
+		"name":     "ubuntu-jammy",
+		"version":  "1.438",
+		"image_id": imageID,
+	}
+	args := []json.RawMessage{marshalArg(t, "/dev/null"), marshalArg(t, cp)}
+
+	result, err := h.Handle(context.Background(), args, jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error for shared-file storage: %v", err)
+	}
+	cid, ok := result.(string)
+	if !ok {
+		t.Fatalf("result is %T; want string", result)
+	}
+	if !containsSubstr(cid, "light:") {
+		t.Errorf("CID %q missing 'light:' prefix", cid)
+	}
+}
+
+// TestHandleCreateStemcell_LightPreUploaded_StorageMatchSuccess verifies that
+// shared-file storage is accepted and produces a valid light: CID.
+func TestHandleCreateStemcell_LightPreUploaded_StorageMatchSuccess(t *testing.T) {
+	t.Parallel()
+
+	const (
+		storageName = "nfs-light"
+		filename    = "ubuntu-jammy-1.438-abc12345.qcow2"
+		imageID     = storageName + ":import/" + filename
+	)
+
+	clusterStorage := lightStemcellClusterStorage(storageName, "nfs", true, nil)
+	deps := lightStemcellDeps(t, clusterStorage, existingVolumeListFn(storageName, filename), 1)
+
+	h := handlers.HandleCreateStemcell(deps)
+	cp := map[string]any{
+		"name":     "ubuntu-jammy",
+		"version":  "1.438",
+		"image_id": imageID,
+	}
+	args := []json.RawMessage{marshalArg(t, "/dev/null"), marshalArg(t, cp)}
+
+	result, err := h.Handle(context.Background(), args, jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error when storage matches config: %v", err)
+	}
+	cid, _ := result.(string)
+	if !containsSubstr(cid, "light:") {
+		t.Errorf("CID %q missing 'light:' prefix", cid)
+	}
+}
+
+// TestHandleCreateStemcell_LightFetch_BadScheme verifies that an image_url with
+// an unsupported scheme (e.g. "ftp://") is rejected before any network I/O with
+// a Cloud error that names the URL. No mocking required: ResolveSource rejects
+// the scheme synchronously.
+func TestHandleCreateStemcell_LightFetch_BadScheme(t *testing.T) {
+	t.Parallel()
+
+	deps := makeDeps(defaultStemcellClient())
+	h := handlers.HandleCreateStemcell(deps)
+
+	cp := map[string]any{
+		"name":      "ubuntu-jammy",
+		"version":   "1.438",
+		"image_url": "ftp://example.com/ubuntu-jammy.qcow2",
+	}
+	args := []json.RawMessage{marshalArg(t, "/dev/null"), marshalArg(t, cp)}
+
+	_, err := h.Handle(context.Background(), args, jsonrpc.Context{})
+	if err == nil {
+		t.Fatal("expected error for unsupported scheme; got nil")
+	}
+	if !containsSubstr(err.Error(), "ftp") && !containsSubstr(err.Error(), "scheme") && !containsSubstr(err.Error(), "unsupported") {
+		t.Errorf("error %q does not mention unsupported scheme", err.Error())
+	}
+}
+
+// TestHandleCreateStemcell_LightFetch_BlockStorageRejected verifies that block-only
+// storage (lvm type) is rejected by the storage policy before any network I/O.
+// Uses the cluster-storage mock so handlerPolicyDeps.StorageInfo can classify the
+// storage. No source mocking required: the policy check fires before Fetch is called.
+func TestHandleCreateStemcell_LightFetch_BlockStorageRejected(t *testing.T) {
+	t.Parallel()
+
+	const storageName = "local-lvm"
+	clusterStorage := lightStemcellClusterStorage(storageName, "lvm", false, nil)
+	deps := lightStemcellDeps(t, clusterStorage, emptyVolumeListFn(), 1)
+	// Point StemcellStorage at the lvm pool so the fetch path resolves to it.
+	deps.Config.StemcellStorage = storageName
+
+	h := handlers.HandleCreateStemcell(deps)
+	cp := map[string]any{
+		"name":      "ubuntu-jammy",
+		"version":   "1.438",
+		"image_url": "https://example.com/ubuntu-jammy.qcow2",
+	}
+	args := []json.RawMessage{marshalArg(t, "/dev/null"), marshalArg(t, cp)}
+
+	_, err := h.Handle(context.Background(), args, jsonrpc.Context{})
+	if err == nil {
+		t.Fatal("expected error for block storage in fetch mode; got nil")
+	}
+	if !containsSubstr(err.Error(), "block") {
+		t.Errorf("error %q does not mention 'block'", err.Error())
+	}
+}
+
+// TestHandleCreateStemcell_LightPreUploaded_LightPrefixStripped verifies that
+// an image_id that already has the "light:" prefix is accepted (prefix is stripped
+// before parsing, so the volid parse succeeds).
+func TestHandleCreateStemcell_LightPreUploaded_LightPrefixStripped(t *testing.T) {
+	t.Parallel()
+
+	const (
+		storageName = "nfs"
+		filename    = "ubuntu-jammy-1.438-abc12345.qcow2"
+		// Operator accidentally includes the light: prefix in image_id.
+		imageID = "light:nfs:import/" + filename
+	)
+
+	clusterStorage := lightStemcellClusterStorage(storageName, "nfs", true, nil)
+	deps := lightStemcellDeps(t, clusterStorage, existingVolumeListFn(storageName, filename), 1)
+
+	h := handlers.HandleCreateStemcell(deps)
+	cp := map[string]any{
+		"name":     "ubuntu-jammy",
+		"version":  "1.438",
+		"image_id": imageID,
+	}
+	args := []json.RawMessage{marshalArg(t, "/dev/null"), marshalArg(t, cp)}
+
+	result, err := h.Handle(context.Background(), args, jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error when image_id has light: prefix: %v", err)
+	}
+	cid, _ := result.(string)
+	if !containsSubstr(cid, "light:") {
+		t.Errorf("CID %q missing 'light:' prefix", cid)
+	}
+}
+
+// ============================================================
 // Compile-time interface checks
 // ============================================================
 
 // Verify stemcellMockClient fully implements pve.Client.
 var _ pve.Client = (*stemcellMockClient)(nil)
+
+// Verify stemcellMockClusterStorage fully implements sdkclusterstorage.Service
+// at compile time.
+var _ sdkclusterstorage.Service = (*stemcellMockClusterStorage)(nil)
 
 // Verify that pve.Backend is fully implemented by localBackend.
 var _ pve.Backend = (*localBackend)(nil)

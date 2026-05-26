@@ -1,0 +1,53 @@
+---
+# Light stemcell manifest — CPI-assisted fetch mode.
+#
+# Use this stemcell record when the qcow2 disk image lives at a remote URL
+# (HTTPS, S3, OCI, or BOSH blobstore). The CPI fetches and uploads the image
+# to PVE storage automatically; subsequent uploads for the same name+version
+# are deduplicated by SHA-256 so re-uploading is safe and fast.
+#
+# cloud_properties.image_url       — remote URL of the qcow2 disk image.
+#   Supported schemes: https://, s3://, oci://, bosh+blobstore:
+#
+# cloud_properties.image_url_auth  — optional per-stemcell credentials.
+#   Supported types: basic, bearer, s3, blobstore, oci.
+#   This example uses type=bearer; see docs/light-stemcells.md for full schemas.
+#   Leave this block absent to rely on CPI-config fetch_credential_defaults
+#   or to fetch from a public URL without authentication.
+#
+# Interpolation variables (supply with -l or --vars-store):
+#   stemcell_url    — full remote URL of the qcow2 image
+#                     (e.g. "https://artifacts.example.com/stemcells/ubuntu-jammy-1.438.qcow2")
+#   stemcell_token  — Bearer token for authenticated downloads; set to ""
+#                     for public URLs and remove the image_url_auth block
+#
+# Example bosh upload-stemcell invocation (authenticated):
+#   bosh -e <env> upload-stemcell manifests/bosh/light-stemcell-fetch.yml \
+#     -v stemcell_url=https://artifacts.example.com/stemcells/ubuntu-jammy-1.438.qcow2 \
+#     -v stemcell_token=<your-token>
+#
+# Example bosh upload-stemcell invocation (public URL, no auth):
+#   bosh -e <env> upload-stemcell manifests/bosh/light-stemcell-fetch.yml \
+#     --var-errs-unused=false \
+#     -v stemcell_url=https://public.example.com/ubuntu-jammy-1.438.qcow2 \
+#     -v stemcell_token=""
+#
+# The CPI streams the image directly from the remote URL to PVE storage; the
+# full image is not staged locally on the BOSH Director before upload.
+
+name: bosh-proxmox-kvm-ubuntu-jammy-go_agent-light-fetch
+version: "1.438"
+sha1: 0000000000000000000000000000000000000000
+operating_system: ubuntu-jammy
+stemcell_formats:
+- proxmox-kvm
+cloud_properties:
+  image_url: "((stemcell_url))"
+  image_url_auth:
+    type: bearer
+    bearer_token: "((stemcell_token))"
+  name: ubuntu-jammy
+  version: "1.438"
+  disk_format: qcow2
+  os_type: l26
+  disk: 10240

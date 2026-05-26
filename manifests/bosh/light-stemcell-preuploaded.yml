@@ -1,0 +1,39 @@
+---
+# Light stemcell manifest — pre-uploaded mode.
+#
+# Use this stemcell record when the operator has already placed a qcow2 disk
+# image on PVE storage (e.g. via "pvesm upload" or the PVE web UI).
+# The CPI skips the upload step and returns a "light:<storage>:import/<file>"
+# CID that points directly to the existing volume.
+#
+# cloud_properties.image_id  — PVE volid of the pre-uploaded image.
+#   Format: "<storage>:import/<filename.qcow2>"
+#   Example: "nfs-stemcells:import/ubuntu-jammy-1.438.qcow2"
+#
+# Interpolation variables (supply with -l or --vars-store):
+#   stemcell_storage   — PVE storage pool that holds the image
+#                        (e.g. "nfs-stemcells", "ceph-fs", "local")
+#   stemcell_filename  — filename of the uploaded qcow2, without a path prefix
+#                        (e.g. "ubuntu-jammy-1.438.qcow2")
+#
+# Example bosh upload-stemcell invocation:
+#   bosh -e <env> upload-stemcell manifests/bosh/light-stemcell-preuploaded.yml \
+#     -v stemcell_storage=nfs-stemcells \
+#     -v stemcell_filename=ubuntu-jammy-1.438.qcow2
+#
+# The CPI verifies the image exists on PVE before accepting the stemcell.
+# If the file is absent, create_stemcell returns a Cloud error and the upload fails.
+
+name: bosh-proxmox-kvm-ubuntu-jammy-go_agent-light
+version: "1.438"
+sha1: 0000000000000000000000000000000000000000
+operating_system: ubuntu-jammy
+stemcell_formats:
+- proxmox-kvm
+cloud_properties:
+  image_id: "((stemcell_storage)):import/((stemcell_filename))"
+  name: ubuntu-jammy
+  version: "1.438"
+  disk_format: qcow2
+  os_type: l26
+  disk: 10240

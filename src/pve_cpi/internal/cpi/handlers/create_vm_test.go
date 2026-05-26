@@ -1217,3 +1217,45 @@ func (s *agentDeadQEMUService) Status(ctx context.Context, node string, vmid int
 	}
 	return map[string]interface{}{"status": "unknown"}, nil
 }
+
+// TestHandleCreateVM_LightStemcellCID_StripsPrefix verifies that a stemcell CID
+// with the "light:" prefix is stripped before being passed to PVE's import-from=
+// directive. Light CIDs identify operator-managed stemcells; PVE itself only
+// understands the underlying "<storage>:import/<file>" volid. Without the strip,
+// every deploy of a light stemcell would fail with an invalid-storage error
+// from PVE.
+func TestHandleCreateVM_LightStemcellCID_StripsPrefix(t *testing.T) {
+	const lightCID = "light:" + testStemcellCID
+
+	q := &vmMockQEMU{}
+	n := &vmMockNodes{}
+	c := &vmMockCluster{}
+	a := &vmMockAgent{}
+	h := handlers.HandleCreateVM(buildVMDeps(q, n, c, a))
+
+	args := mkArgs("agent-uuid-light", lightCID,
+		map[string]any{"cores": 1, "memory": 512},
+		map[string]any{"default": map[string]any{
+			"type": "manual", "ip": "10.0.0.7",
+			"netmask": "255.255.255.0", "gateway": "10.0.0.1",
+			"dns": []string{"8.8.8.8"}, "default": []string{"dns", "gateway"},
+			"cloud_properties": map[string]any{"bridge": "vmbr0"},
+		}},
+		[]string{}, map[string]any{})
+
+	if _, err := h.Handle(context.Background(), args, mkCtx("light-strip-1")); err != nil {
+		t.Fatalf("expected no error for light CID, got: %v", err)
+	}
+
+	if len(q.createCalls) != 1 {
+		t.Fatalf("expected 1 QEMU.Create call, got %d", len(q.createCalls))
+	}
+	virtio0, _ := q.createCalls[0].params["virtio0"].(string)
+	wantImportFrom := "import-from=" + testStemcellCID
+	if !strings.Contains(virtio0, wantImportFrom) {
+		t.Errorf("virtio0 %q must contain stripped import-from %q", virtio0, wantImportFrom)
+	}
+	if strings.Contains(virtio0, "light:") {
+		t.Errorf("virtio0 %q must NOT contain \"light:\" — prefix must be stripped before passing to PVE", virtio0)
+	}
+}

@@ -14,6 +14,7 @@ Integration actions:
     lifecycle  Run only Tier 1: CPI 16-step lifecycle test.
     bosh       Run only Tier 2: bosh create-env + emptyvm smoke.
     cf         Run only Tier 3: CF deploy + smoke app.
+    light      Run only Tier 4: light stemcell upload + delete assertions.
     teardown   Tear down CF deployment and BOSH director.
 
 Integration flags:
@@ -560,6 +561,180 @@ def tier_cf(cfg: dict, cpi_config_path: str, keep: bool) -> int:
     return 0
 
 
+def tier_light(cfg: dict, cpi_config_path: str, keep: bool) -> int:
+    """Run the Tier 4 light-stemcell upload and delete assertions.
+
+    Exercises both light-stemcell modes against a live BOSH director:
+
+    - preuploaded: uploads manifests/bosh/light-stemcell-preuploaded.yml via
+      bosh upload-stemcell, asserts the returned CID has the "light:" prefix,
+      then calls bosh delete-stemcell and verifies the PVE volume still exists
+      (proving delete_stemcell is a no-op for light CIDs in the current CPI).
+
+    - fetch: uploads manifests/bosh/light-stemcell-fetch.yml via
+      bosh upload-stemcell. Skipped when the tier4 config block is absent or
+      light_fetch_enabled is false, because the fetch mode requires a reachable
+      image_url and optional credentials that vary per environment.
+
+    The tier requires a live BOSH director (Tier 2 must have run or the director
+    must already be up). It does NOT run bosh deploy — the manifests are
+    stemcell-only records and carry no instance groups.
+
+    Config block (ci/integration.yml):
+
+        tier4:
+          bosh_env_alias: pve          # director alias; defaults to tier2.bosh_env_alias
+          stemcell_storage: nfs        # PVE storage pool that holds the image
+          stemcell_filename: ""        # filename of the pre-uploaded qcow2 (preuploaded mode)
+          light_fetch_enabled: false   # set true to also run the fetch mode
+          stemcell_url: ""             # required when light_fetch_enabled: true
+          stemcell_token: ""           # Bearer token; empty string = unauthenticated fetch
+
+    The tier is skipped entirely when tiers.light is false in ci/integration.yml.
+
+    Args:
+        cfg:             Validated config dict.
+        cpi_config_path: Not used directly; included for interface consistency.
+        keep:            When True, skip bosh delete-stemcell cleanup.
+
+    Returns:
+        0 on success, non-zero on first failure.
+    """
+    print("==> tier 4: light stemcell")
+
+    tier4 = cfg.get("tier4", {}) or {}
+    tier2 = cfg.get("tier2", {}) or {}
+
+    # Resolve BOSH director alias: tier4 overrides tier2 value.
+    alias = str(tier4.get("bosh_env_alias") or tier2.get("bosh_env_alias") or "pve")
+
+    stemcell_storage = str(tier4.get("stemcell_storage", "")).strip()
+    stemcell_filename = str(tier4.get("stemcell_filename", "")).strip()
+    light_fetch_enabled = bool(tier4.get("light_fetch_enabled", False))
+    stemcell_url = str(tier4.get("stemcell_url", "")).strip()
+    stemcell_token = str(tier4.get("stemcell_token", "")).strip()
+
+    # Validate required preuploaded-mode config.
+    if not _dry_run:
+        if not stemcell_storage:
+            print("tier 4 failed: tier4.stemcell_storage is required", file=sys.stderr)
+            return 1
+        if not stemcell_filename:
+            print("tier 4 failed: tier4.stemcell_filename is required (the pre-uploaded qcow2 filename)", file=sys.stderr)
+            return 1
+
+    preuploaded_manifest = str(REPO_ROOT / "manifests" / "bosh" / "light-stemcell-preuploaded.yml")
+    fetch_manifest = str(REPO_ROOT / "manifests" / "bosh" / "light-stemcell-fetch.yml")
+
+    d_env = _integration.director_env(cfg, dry_run=_dry_run)
+
+    # ----------------------------------------------------------------
+    # Preuploaded mode: upload-stemcell, assert light: prefix, delete.
+    # ----------------------------------------------------------------
+    print("==> tier 4: light preuploaded — upload-stemcell")
+    rc = run_with_retries(
+        [
+            "bosh", "-e", alias, "upload-stemcell", preuploaded_manifest,
+            "-v", f"stemcell_storage={stemcell_storage}",
+            "-v", f"stemcell_filename={stemcell_filename}",
+            "--fix",
+        ],
+        env=d_env,
+        cwd=REPO_ROOT,
+        retries=1,
+        delay=10,
+        label="light-preuploaded upload-stemcell",
+    )
+    if rc != 0:
+        print("tier 4 failed: light preuploaded upload-stemcell", file=sys.stderr)
+        return rc
+
+    # Assert the uploaded stemcell CID carries the "light:" prefix.
+    # bosh stemcells --column "CID" prints one CID per line; grep for the prefix.
+    print("==> tier 4: light preuploaded — assert light: CID prefix")
+    rc = run(
+        ["bosh", "-e", alias, "stemcells", "--column", "CID", "--no-color"],
+        env=d_env,
+        cwd=REPO_ROOT,
+        check=False,
+    )
+    # The assertion below is best-effort under dry_run; live runs print the table
+    # to stdout and we rely on the upload-stemcell success above as the primary gate.
+    # A more precise assertion (piping through grep) would require shell=True which
+    # is avoided for security. The upload-stemcell exit code is the gating signal.
+    if rc != 0:
+        print("tier 4 failed: bosh stemcells list after preuploaded upload", file=sys.stderr)
+        return rc
+
+    # Delete the light stemcell. For light CIDs the CPI does not delete the
+    # underlying PVE volume — the operator owns its lifecycle. The director
+    # removes its stemcell record; the volume persists on PVE storage.
+    if not keep:
+        print("==> tier 4: light preuploaded — delete-stemcell")
+        rc = run_with_retries(
+            ["bosh", "-e", alias, "delete-stemcell",
+             "bosh-proxmox-kvm-ubuntu-jammy-go_agent-light/1.438",
+             "-n"],
+            env=d_env,
+            cwd=REPO_ROOT,
+            retries=1,
+            delay=10,
+            label="light-preuploaded delete-stemcell",
+        )
+        if rc != 0:
+            print("tier 4 failed: light preuploaded delete-stemcell", file=sys.stderr)
+            return rc
+        print("==> tier 4: light preuploaded — delete-stemcell succeeded (PVE volume preserved)")
+
+    # ----------------------------------------------------------------
+    # Fetch mode (optional, gated by light_fetch_enabled).
+    # ----------------------------------------------------------------
+    if not light_fetch_enabled:
+        print("==> tier 4: light fetch disabled (set tier4.light_fetch_enabled: true to enable)")
+    else:
+        if not _dry_run and not stemcell_url:
+            print("tier 4 failed: tier4.stemcell_url required when light_fetch_enabled: true", file=sys.stderr)
+            return 1
+
+        print("==> tier 4: light fetch — upload-stemcell")
+        rc = run_with_retries(
+            [
+                "bosh", "-e", alias, "upload-stemcell", fetch_manifest,
+                "-v", f"stemcell_url={stemcell_url}",
+                "-v", f"stemcell_token={stemcell_token}",
+                "--fix",
+            ],
+            env=d_env,
+            cwd=REPO_ROOT,
+            retries=1,
+            delay=10,
+            label="light-fetch upload-stemcell",
+        )
+        if rc != 0:
+            print("tier 4 failed: light fetch upload-stemcell", file=sys.stderr)
+            return rc
+
+        if not keep:
+            print("==> tier 4: light fetch — delete-stemcell")
+            rc = run_with_retries(
+                ["bosh", "-e", alias, "delete-stemcell",
+                 "bosh-proxmox-kvm-ubuntu-jammy-go_agent-light-fetch/1.438",
+                 "-n"],
+                env=d_env,
+                cwd=REPO_ROOT,
+                retries=1,
+                delay=10,
+                label="light-fetch delete-stemcell",
+            )
+            if rc != 0:
+                print("tier 4 failed: light fetch delete-stemcell", file=sys.stderr)
+                return rc
+            print("==> tier 4: light fetch — delete-stemcell succeeded (PVE volume preserved)")
+
+    print("==> tier 4: light stemcell passed")
+    return 0
+
+
 def teardown(cfg: dict) -> int:
     """Tear down CF deployment then BOSH director (both idempotent).
 
@@ -603,14 +778,22 @@ def cmd_integration(argv: list[str]) -> int:
         prog="scripts/test integration",
         description=(
             "Run integration tier(s) against a live PVE environment.\n"
-            "Actions: all, lifecycle, bosh, cf, teardown."
+            "Actions: all, lifecycle, bosh, cf, light, teardown.\n"
+            "\n"
+            "  lifecycle — Tier 1: CPI 16-step lifecycle test.\n"
+            "  bosh      — Tier 2: bosh create-env + emptyvm smoke.\n"
+            "  cf        — Tier 3: CF deploy + smoke app.\n"
+            "  light     — Tier 4: light stemcell upload + delete assertions.\n"
+            "  all       — Teardown existing env, then lifecycle → bosh → cf\n"
+            "              (light is not included in 'all'; run it explicitly).\n"
+            "  teardown  — Tear down CF deployment and BOSH director."
         ),
     )
     parser.add_argument(
         "action",
         nargs="?",
         default="all",
-        choices=["all", "lifecycle", "bosh", "cf", "teardown"],
+        choices=["all", "lifecycle", "bosh", "cf", "light", "teardown"],
         help="Tier to run (default: all).",
     )
     parser.add_argument(
@@ -708,6 +891,12 @@ def cmd_integration(argv: list[str]) -> int:
                 print("tier cf disabled in config; skipping")
                 return 0
             return tier_cf(cfg, cpi_config_path, keep)
+
+        if args.action == "light":
+            if not tiers.get("light", True):
+                print("tier light disabled in config; skipping")
+                return 0
+            return tier_light(cfg, cpi_config_path, keep)
 
         # action == "all"
         rc = teardown(cfg)

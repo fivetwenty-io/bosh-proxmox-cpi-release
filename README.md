@@ -8,6 +8,7 @@ The CPI provisions VMs, persistent disks, networks, snapshots, and stemcells on 
 - PVE SDN vnet lifecycle plus Linux bridge fallback for managed networks
 - ConfigDrive ISO agent bootstrap with no external registry dependency
 - API token or password authentication; TLS verification on by default
+- [Light stemcells](docs/light-stemcells.md) — pre-uploaded or CPI-fetched qcow2 images; no director-side re-upload on redeploy
 
 ## Quickstart
 
@@ -178,6 +179,8 @@ For symptom-first triage of deployment, VM creation, disk attachment, network, a
 - [Network configuration](docs/networks.md) — SDN and bridge `cloud_properties` schema and manifest examples.
 - [Operations runbook](docs/operations.md) — day-2 operations and diagnostics.
 - [Troubleshooting](docs/troubleshooting.md) — symptom-first failure triage.
+- [Light stemcells](docs/light-stemcells.md) — pre-uploaded and CPI-fetch modes, storage requirements, and credentials.
+- [Persistent disks](docs/persistent-disks.md) — storage backend classification and disk-pool cloud-properties.
 - [ConfigDrive layout](docs/configdrive.md) — ISO 9660 volume layout and SCSI slot reservation map.
 - [PVE API permissions](docs/pve-api-permissions.md) — minimum-privilege `bosh@pve` user setup and token creation.
 - [PVE settings](docs/pve-settings.md) — cluster-level settings the CPI assumes (storage content types, SDN enablement).

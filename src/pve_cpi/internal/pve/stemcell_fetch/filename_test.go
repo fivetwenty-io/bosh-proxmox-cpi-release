@@ -1,0 +1,79 @@
+package stemcellfetch
+
+import (
+	"strings"
+	"testing"
+
+	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
+)
+
+func TestBuildFetchedFilename_Happy(t *testing.T) {
+	name, version, sha := "ubuntu-jammy", "1.438", "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
+	got := BuildFetchedFilename(name, version, sha)
+	want := pve.BuildStemcellFilename(name, version, sha)
+	if got != want {
+		t.Errorf("BuildFetchedFilename = %q; want %q", got, want)
+	}
+	if !strings.HasSuffix(got, ".qcow2") {
+		t.Errorf("expected .qcow2 suffix, got %q", got)
+	}
+}
+
+func TestBuildFetchedFilename_ShortSHA(t *testing.T) {
+	// sha shorter than 8 chars → "00000000" placeholder embedded.
+	got := BuildFetchedFilename("ubuntu-jammy", "1.438", "abc")
+	want := pve.BuildStemcellFilename("ubuntu-jammy", "1.438", "abc")
+	if got != want {
+		t.Errorf("BuildFetchedFilename short-sha = %q; want %q", got, want)
+	}
+	if !strings.Contains(got, "00000000") {
+		t.Errorf("expected 00000000 placeholder in %q", got)
+	}
+}
+
+func TestPartialFilename_Happy(t *testing.T) {
+	got := PartialFilename("bosh-stemcell-ubuntu-jammy-1.438-abcdef12.qcow2")
+	want := "bosh-stemcell-ubuntu-jammy-1.438-abcdef12.qcow2.partial"
+	if got != want {
+		t.Errorf("PartialFilename = %q; want %q", got, want)
+	}
+}
+
+func TestPartialFilename_Empty(t *testing.T) {
+	if got := PartialFilename(""); got != "" {
+		t.Errorf("PartialFilename(\"\") = %q; want empty string", got)
+	}
+}
+
+func TestFilenamePrefixForDedup_Standard(t *testing.T) {
+	got := FilenamePrefixForDedup("ubuntu-jammy", "1.438")
+	want := "bosh-stemcell-ubuntu-jammy-1.438-"
+	if got != want {
+		t.Errorf("FilenamePrefixForDedup = %q; want %q", got, want)
+	}
+	// Verify it is actually a prefix of a real filename built with any sha8.
+	full := BuildFetchedFilename("ubuntu-jammy", "1.438", "deadbeef12345678")
+	if !strings.HasPrefix(full, got) {
+		t.Errorf("full filename %q does not start with prefix %q", full, got)
+	}
+}
+
+func TestFilenamePrefixForDedup_EmptyInputs(t *testing.T) {
+	// Empty name and version must not panic; result is a non-empty string
+	// (sanitizer maps empty to empty then BuildStemcellFilename returns a
+	// degenerate but non-empty filename).
+	got := FilenamePrefixForDedup("", "")
+	if got == "" {
+		t.Error("FilenamePrefixForDedup(\"\",\"\") returned empty string; expected at least a partial prefix")
+	}
+}
+
+func TestFilenamePrefixForDedup_SpecialChars(t *testing.T) {
+	// Special chars in name/version get sanitized to dashes; prefix still
+	// matches files built from the same inputs.
+	got := FilenamePrefixForDedup("Ubuntu Jammy!", "1.438 RC1")
+	full := BuildFetchedFilename("Ubuntu Jammy!", "1.438 RC1", "cafebabe12345678")
+	if !strings.HasPrefix(full, got) {
+		t.Errorf("full filename %q does not start with prefix %q", full, got)
+	}
+}

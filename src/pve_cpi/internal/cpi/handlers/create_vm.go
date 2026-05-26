@@ -152,10 +152,16 @@ func createVM(
 	if err := json.Unmarshal(args[1], &stemcellCID); err != nil {
 		return nil, cpierrors.Cloud("create_vm: parse stemcell_cid: %s", err.Error())
 	}
+	// Strip the "light:" prefix if present. Light stemcell CIDs are
+	// "light:<storage>:import/<file>"; PVE's import-from= accepts only the
+	// underlying "<storage>:import/<file>" volid. The light: marker exists so
+	// delete_stemcell can recognize and no-op these CIDs without consulting
+	// any external state.
+	rawStemcellCID := pve.StripLightPrefix(stemcellCID)
 	// stemcellStorage is used as a fallback VMStorage when deps.Config.VMStorage
 	// is empty (see VMStorage resolution below). ParseStemcellCID guarantees a
 	// non-empty storage component when err == nil.
-	stemcellStorage, _, err := pve.ParseStemcellCID(stemcellCID)
+	stemcellStorage, _, err := pve.ParseStemcellCID(rawStemcellCID)
 	if err != nil {
 		return nil, cpierrors.Cloud("create_vm: invalid stemcell_cid %q: %s", stemcellCID, err.Error())
 	}
@@ -326,7 +332,7 @@ func createVM(
 	vmid, err := pve.AllocateWithRetry(ctx, deps.PVE,
 		func(candidate int) error {
 			virtio0Val := fmt.Sprintf("%s:0,import-from=%s,format=%s,size=%dG",
-				vmStorage, stemcellCID, vmDiskFormat, rootDiskGiB)
+				vmStorage, rawStemcellCID, vmDiskFormat, rootDiskGiB)
 			candidateName := initialVMName
 			if candidateName == "" {
 				candidateName = fmt.Sprintf("vm-%d", candidate)

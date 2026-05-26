@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -18,7 +19,10 @@ import (
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
+	stemcellfetch "github.com/fivetwenty-io/bosh-pve-cpi/internal/pve/stemcell_fetch"
 
+	sdkclusterstorage "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/clusterstorage"
+	sdknodes "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/nodes"
 	sdkclient "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/client"
 )
 
@@ -88,6 +92,52 @@ type stemcellCloudProps struct {
 	Version string
 	// DiskMiB is the disk size hint in MiB; 0 means no hint.
 	DiskMiB int
+	// ImageID identifies a pre-uploaded volume the operator placed externally.
+	// Format: "<storage>:import/<file>" — e.g. "nfs:import/ubuntu-jammy.qcow2".
+	// Mutually exclusive with ImageURL.
+	ImageID string
+	// ImageURL is a remote URL from which the CPI fetches the disk image.
+	// Supported schemes: https://, s3://, bosh+blobstore:, oci://.
+	// Mutually exclusive with ImageID.
+	ImageURL string
+	// ImageURLAuth holds per-stemcell credentials that override config defaults
+	// when non-empty. Re-marshalled from the raw cloud_properties value so
+	// callers receive canonical JSON bytes.
+	ImageURLAuth json.RawMessage
+	// Node pins light-stemcell placement to a specific cluster node.
+	// Used when stemcell storage is local-dir and multi-node placement matters.
+	Node string
+}
+
+// validateLightMutex returns an error when both ImageID and ImageURL are set.
+// The two fields are mutually exclusive: ImageID points to an already-uploaded
+// volume; ImageURL triggers a fetch. Supplying both is an operator error.
+func (p stemcellCloudProps) validateLightMutex() error {
+	if p.ImageID != "" && p.ImageURL != "" {
+		return cpierrors.Cloud(
+			"create_stemcell: cloud_properties.image_id and cloud_properties.image_url are mutually exclusive")
+	}
+	return nil
+}
+
+// IsLight reports whether the stemcell is a light stemcell (no local tarball
+// required). True when either ImageID or ImageURL is set.
+func (p stemcellCloudProps) IsLight() bool {
+	return p.ImageID != "" || p.ImageURL != ""
+}
+
+// LightMode returns the light-stemcell variant string:
+//   - "preuploaded" when ImageID is set (operator pre-placed volume)
+//   - "fetch"       when ImageURL is set (CPI fetches from remote URL)
+//   - ""            when neither is set (heavy stemcell, normal tarball upload)
+func (p stemcellCloudProps) LightMode() string {
+	if p.ImageID != "" {
+		return "preuploaded"
+	}
+	if p.ImageURL != "" {
+		return "fetch"
+	}
+	return ""
 }
 
 // parseStemcellCloudProps extracts known fields from cloud_properties.
@@ -118,6 +168,29 @@ func parseStemcellCloudProps(cp map[string]any) stemcellCloudProps {
 		p.DiskMiB = v
 	case int64:
 		p.DiskMiB = int(v)
+	}
+
+	if v, ok := cp["image_id"].(string); ok {
+		p.ImageID = v
+	}
+	if v, ok := cp["image_url"].(string); ok {
+		p.ImageURL = v
+	}
+	// image_url_auth: accept json.RawMessage directly or re-marshal from any.
+	// Re-marshal needed because encoding/json decodes JSON objects as map[string]any,
+	// and the caller needs canonical JSON bytes for downstream credential parsing.
+	if raw, ok := cp["image_url_auth"].(json.RawMessage); ok {
+		p.ImageURLAuth = raw
+	} else if v, ok := cp["image_url_auth"]; ok && v != nil {
+		if b, merr := json.Marshal(v); merr == nil {
+			p.ImageURLAuth = b
+		}
+		// marshal failure is impossible for values that came from json.Unmarshal;
+		// on the off chance it occurs, leave ImageURLAuth nil so the caller falls
+		// back to config-level credentials rather than using garbled bytes.
+	}
+	if v, ok := cp["node"].(string); ok {
+		p.Node = v
 	}
 
 	return p
@@ -240,7 +313,7 @@ func validateStemcellImagePath(imagePath string) error {
 func HandleCreateStemcell(deps Deps) cpi.Handler {
 	return cpi.HandlerFunc(func(ctx context.Context, args []json.RawMessage, _ jsonrpc.Context) (any, error) {
 		// ----------------------------------------------------------------
-		// Step 1: Validate arg 0 — image_path
+		// Step 1a: Parse arg 0 — image_path string (always required)
 		// ----------------------------------------------------------------
 		if len(args) < 1 {
 			return nil, cpierrors.Cloud("create_stemcell: missing required argument image_path")
@@ -248,30 +321,6 @@ func HandleCreateStemcell(deps Deps) cpi.Handler {
 		var imagePath string
 		if err := json.Unmarshal(args[0], &imagePath); err != nil || imagePath == "" {
 			return nil, cpierrors.Cloud("create_stemcell: image_path must be a non-empty string")
-		}
-
-		// Path containment: image_path must resolve under a permitted staging root.
-		// The BOSH director writes stemcell tarballs to its own scratch area before
-		// invoking the CPI; that area is os.TempDir() on the CPI host (the director
-		// stages via /tmp by default). Any path that resolves outside this root —
-		// e.g. /etc/passwd, /var/vcap/jobs/uaa/config/uaa.yml — is rejected so a
-		// malicious or compromised director cannot use create_stemcell as a path
-		// probe against arbitrary host files. The check uses filepath.Rel against
-		// the resolved-absolute form of both sides so symlinks or "../" sequences
-		// that escape the root are caught.
-		if pathErr := validateStemcellImagePath(imagePath); pathErr != nil {
-			return nil, pathErr
-		}
-
-		fi, statErr := os.Stat(imagePath)
-		if statErr != nil {
-			if os.IsNotExist(statErr) {
-				return nil, cpierrors.Cloud("create_stemcell: image_path %q does not exist", imagePath)
-			}
-			return nil, cpierrors.Cloud("create_stemcell: cannot stat image_path %q: %s", imagePath, statErr.Error())
-		}
-		if !fi.Mode().IsRegular() {
-			return nil, cpierrors.Cloud("create_stemcell: image_path %q is not a regular file", imagePath)
 		}
 
 		// ----------------------------------------------------------------
@@ -289,6 +338,42 @@ func HandleCreateStemcell(deps Deps) cpi.Handler {
 		}
 
 		cp := parseStemcellCloudProps(cloudProps)
+		if err := cp.validateLightMutex(); err != nil {
+			return nil, err
+		}
+
+		// ----------------------------------------------------------------
+		// Step 1b: image_path file checks — skipped for light stemcells.
+		// Light mode provides a pre-uploaded or remotely-fetched image;
+		// the BOSH director may pass /dev/null or a synthetic path here
+		// that must not be stat'd. Path-containment and regular-file
+		// checks only apply to the heavy (local tarball) upload path.
+		// ----------------------------------------------------------------
+		if !cp.IsLight() {
+			// Path containment: image_path must resolve under a permitted staging root.
+			// The BOSH director writes stemcell tarballs to its own scratch area before
+			// invoking the CPI; that area is os.TempDir() on the CPI host (the director
+			// stages via /tmp by default). Any path that resolves outside this root —
+			// e.g. /etc/passwd, /var/vcap/jobs/uaa/config/uaa.yml — is rejected so a
+			// malicious or compromised director cannot use create_stemcell as a path
+			// probe against arbitrary host files. The check uses filepath.Rel against
+			// the resolved-absolute form of both sides so symlinks or "../" sequences
+			// that escape the root are caught.
+			if pathErr := validateStemcellImagePath(imagePath); pathErr != nil {
+				return nil, pathErr
+			}
+
+			fi, statErr := os.Stat(imagePath)
+			if statErr != nil {
+				if os.IsNotExist(statErr) {
+					return nil, cpierrors.Cloud("create_stemcell: image_path %q does not exist", imagePath)
+				}
+				return nil, cpierrors.Cloud("create_stemcell: cannot stat image_path %q: %s", imagePath, statErr.Error())
+			}
+			if !fi.Mode().IsRegular() {
+				return nil, cpierrors.Cloud("create_stemcell: image_path %q is not a regular file", imagePath)
+			}
+		}
 
 		// ----------------------------------------------------------------
 		// Step 3: Validate name + version (required for deterministic CID)
@@ -300,6 +385,18 @@ func HandleCreateStemcell(deps Deps) cpi.Handler {
 		if cp.Version == "" {
 			return nil, cpierrors.Cloud(
 				"create_stemcell: cloud_properties.version is required for direct-qcow stemcell upload")
+		}
+
+		// ----------------------------------------------------------------
+		// Light-stemcell short-circuit. cp.LightMode() returns "preuploaded"
+		// or "fetch" when the operator supplied image_id or image_url; both
+		// bypass the local image_path upload pipeline entirely.
+		// ----------------------------------------------------------------
+		switch cp.LightMode() {
+		case "preuploaded":
+			return handleLightStemcellPreUploaded(ctx, deps, cp)
+		case "fetch":
+			return handleLightStemcellFetch(ctx, deps, cp)
 		}
 
 		// ----------------------------------------------------------------
@@ -411,6 +508,368 @@ func HandleCreateStemcell(deps Deps) cpi.Handler {
 		)
 		return cid, nil
 	})
+}
+
+// handleLightStemcellPreUploaded resolves a pre-uploaded light stemcell:
+// validates the operator-supplied image_id (PVE volid), applies the storage
+// policy, confirms the qcow2 is present on PVE, and returns the canonical
+// light: CID. The CPI never uploads, deletes, or rewrites the underlying
+// volume; the operator owns its lifecycle.
+func handleLightStemcellPreUploaded(
+	ctx context.Context,
+	deps Deps,
+	cp stemcellCloudProps,
+) (any, error) {
+	// 1. Parse image_id as a volid: "<storage>:import/<file>".
+	// Operator may include the "light:" prefix — strip it to be forgiving.
+	// ParseStemcellCID enforces canonical form below.
+	imageID := cp.ImageID
+	rawImageID := pve.StripLightPrefix(imageID)
+	storage, volumePath, parseErr := pve.ParseStemcellCID(rawImageID)
+	if parseErr != nil {
+		return nil, cpierrors.Cloud(
+			"create_stemcell: cloud_properties.image_id %q is not a valid storage volid (expected \"<storage>:import/<file>\"): %s",
+			imageID, parseErr.Error())
+	}
+
+	// 2. Apply storage policy via ValidateLightStemcellStorage.
+	policyDeps := newHandlerPolicyDeps(deps)
+	chosenNode, policyErr := pve.ValidateLightStemcellStorage(ctx, policyDeps, storage, cp.Node)
+	if policyErr != nil {
+		return nil, policyErr
+	}
+
+	// 4. Resolve the node to query for existence. chosenNode wins when non-empty;
+	// fall back to config.Node (existing handler invariant: non-empty for normal path).
+	node := chosenNode
+	if node == "" && deps.Config != nil {
+		node = deps.Config.Node
+	}
+	if node == "" {
+		return nil, cpierrors.Cloud("create_stemcell: config.node must not be empty")
+	}
+
+	// 5. Existence check — qcow2 filename is the trailing segment after "import/".
+	// volumePath has the form "import/<file>" per ParseStemcellCID contract.
+	qcow2Filename := strings.TrimPrefix(volumePath, "import/")
+	if qcow2Filename == volumePath || qcow2Filename == "" {
+		return nil, cpierrors.Cloud(
+			"create_stemcell: cloud_properties.image_id volume path %q is not \"import/<file>\"", volumePath)
+	}
+
+	existing, findErr := pve.FindStemcellByFilename(ctx, deps.PVE, node, storage, qcow2Filename)
+	if findErr != nil {
+		return nil, cpierrors.Wrap(findErr,
+			fmt.Sprintf("create_stemcell: light pre-uploaded existence check (storage=%q file=%q)", storage, qcow2Filename))
+	}
+	if existing == "" {
+		return nil, cpierrors.Cloud(
+			"create_stemcell: light stemcell image_id %q not found on storage %q node %q — "+
+				"operator must upload via pvesm or PVE Upload API before referencing",
+			imageID, storage, node)
+	}
+
+	// 6. Build canonical light: CID.
+	lightCID := pve.BuildLightStemcellCID(storage, qcow2Filename)
+
+	deps.Logger.Info("create_stemcell: light stemcell (pre-uploaded) accepted",
+		log.String("image_id", imageID),
+		log.String("storage", storage),
+		log.String("node", node),
+		log.String("cid", lightCID),
+	)
+	return lightCID, nil
+}
+
+// fetchResolverOverride is set by tests to inject a stub source resolver.
+// Production code leaves it nil and uses stemcellfetch.ResolveSource directly.
+// This package-level seam avoids bloating Deps for a single test concern.
+var fetchResolverOverride func(rawURL string) (stemcellfetch.Source, stemcellfetch.Reference, error)
+
+// resolveFetchSource calls the override when set (tests), otherwise the real implementation.
+func resolveFetchSource(rawURL string) (stemcellfetch.Source, stemcellfetch.Reference, error) {
+	if fetchResolverOverride != nil {
+		return fetchResolverOverride(rawURL)
+	}
+	return stemcellfetch.ResolveSource(rawURL)
+}
+
+// handleLightStemcellFetch fetches a remote stemcell qcow2, uploads it to PVE
+// storage, and returns the canonical light: CID. Entered when cloud_properties
+// sets image_url.
+//
+// Flow:
+//  1. Resolve source + credentials.
+//  2. Apply storage policy (block-storage rejection, multi-node local pin).
+//  3. Best-effort prefix dedup: scan storage for any file matching name+version
+//     prefix before fetching (avoids a redundant network round-trip when the
+//     same name+version was fetched before, regardless of sha8 match).
+//  4. Stream remote body through io.TeeReader into a local temp file while
+//     computing SHA-256 in one pass.
+//  5. Build canonical filename from sha256; exact dedup check.
+//  6. Upload temp file via existing uploadStemcellImage (retry-on-lock, UPID await).
+//  7. Return light: CID.
+//
+// Temp file is cleaned up on both success and failure.
+func handleLightStemcellFetch(
+	ctx context.Context,
+	deps Deps,
+	cp stemcellCloudProps,
+) (any, error) {
+	// 1. Resolve source + credentials.
+	src, ref, resolveErr := resolveFetchSource(cp.ImageURL)
+	if resolveErr != nil {
+		return nil, cpierrors.Cloud("create_stemcell: resolve source for %q: %s", cp.ImageURL, resolveErr.Error())
+	}
+
+	// Credentials: cloud_properties.image_url_auth overrides config defaults;
+	// longest-prefix match within FetchCredentialDefaults applies otherwise.
+	creds, credErr := stemcellfetch.ResolveCredentials(cp.ImageURLAuth, deps.Config.FetchCredentialDefaults, cp.ImageURL)
+	if credErr != nil {
+		return nil, cpierrors.Cloud("create_stemcell: resolve credentials: %s", credErr.Error())
+	}
+	if creds.Kind() == "none" {
+		deps.Logger.Warn("create_stemcell: fetching stemcell without credentials",
+			log.String("image_url", cp.ImageURL),
+		)
+	}
+
+	// 2. Resolve storage: StemcellStorage falls back to VMStorage.
+	// Config.ApplyDefaults already applies this chain; guard here for callers
+	// that bypass ApplyDefaults (e.g. minimal test configs).
+	storage := deps.Config.StemcellStorage
+	if storage == "" {
+		storage = deps.Config.VMStorage
+	}
+	if storage == "" {
+		return nil, cpierrors.Cloud("create_stemcell: no stemcell storage configured (stemcell_storage and vm_storage both empty)")
+	}
+
+	// Apply storage policy (block-type check, multi-node local-pin enforcement).
+	policyDeps := newHandlerPolicyDeps(deps)
+	chosenNode, policyErr := pve.ValidateLightStemcellStorage(ctx, policyDeps, storage, cp.Node)
+	if policyErr != nil {
+		return nil, policyErr
+	}
+	node := chosenNode
+	if node == "" && deps.Config != nil {
+		node = deps.Config.Node
+	}
+	if node == "" {
+		return nil, cpierrors.Cloud("create_stemcell: config.node must not be empty")
+	}
+
+	// 3. Pre-fetch prefix dedup: scan storage for any import volume matching the
+	// bosh-stemcell-<name>-<version>- prefix. We don't know sha8 yet, so this is
+	// best-effort — it only fires when a prior fetch for the same name+version
+	// already landed (regardless of sha8). On a hit we skip the network fetch.
+	prefix := stemcellfetch.FilenamePrefixForDedup(cp.Name, cp.Version)
+	if existingVol, prefixErr := fetchFindByPrefix(ctx, deps, node, storage, prefix); prefixErr == nil && existingVol != "" {
+		// Guard: only short-circuit when the found volid belongs to the target storage.
+		// A volid from a different storage would produce a mismatched light: CID.
+		if strings.HasPrefix(existingVol, storage+":") {
+			extractedName := fetchExtractFilename(existingVol)
+			if extractedName != "" {
+				deps.Logger.Info("create_stemcell: light fetch — existing stemcell found by prefix, skipping fetch",
+					log.String("volid", existingVol),
+				)
+				return pve.BuildLightStemcellCID(storage, extractedName), nil
+			}
+		}
+	}
+
+	// 4. Fetch source body → local temp file + SHA-256 in flight.
+	body, contentLength, fetchErr := src.Fetch(ctx, ref, creds)
+	if fetchErr != nil {
+		return nil, cpierrors.Cloud("create_stemcell: fetch %q: %s", cp.ImageURL, fetchErr.Error())
+	}
+	defer func() { _ = body.Close() }()
+
+	tmpFile, tmpErr := os.CreateTemp("", "bosh-stemcell-fetch-*.qcow2")
+	if tmpErr != nil {
+		return nil, cpierrors.Wrap(tmpErr, "create_stemcell: create temp file for fetch staging")
+	}
+	tmpPath := tmpFile.Name()
+	defer func() {
+		_ = tmpFile.Close()
+		_ = os.Remove(tmpPath)
+	}()
+
+	h := sha256.New()
+	written, copyErr := io.Copy(io.MultiWriter(tmpFile, h), body)
+	if copyErr != nil {
+		return nil, cpierrors.Cloud("create_stemcell: stream fetched body to temp file: %s", copyErr.Error())
+	}
+	sha256hex := hex.EncodeToString(h.Sum(nil))
+
+	// Sync to disk before uploadStemcellImage reopens the file for upload.
+	if syncErr := tmpFile.Sync(); syncErr != nil {
+		return nil, cpierrors.Wrap(syncErr, "create_stemcell: sync fetch temp file")
+	}
+
+	deps.Logger.Info("create_stemcell: light fetch streamed to temp file",
+		log.Int64("bytes_written", written),
+		log.Int64("content_length", contentLength),
+		log.String("sha256", sha256hex),
+	)
+
+	// 5. Build canonical filename + exact dedup check.
+	qcow2Filename := stemcellfetch.BuildFetchedFilename(cp.Name, cp.Version, sha256hex)
+	existingVol, findErr := pve.FindStemcellByFilename(ctx, deps.PVE, node, storage, qcow2Filename)
+	if findErr != nil {
+		return nil, cpierrors.Wrap(findErr, "create_stemcell: light fetch dedup lookup")
+	}
+	if existingVol != "" {
+		deps.Logger.Info("create_stemcell: light fetch — SHA-matched existing stemcell, skipping upload",
+			log.String("volid", existingVol),
+		)
+		return pve.BuildLightStemcellCID(storage, qcow2Filename), nil
+	}
+
+	// 6. Upload temp file under the final canonical filename. uploadStemcellImage
+	// handles retry-on-lock and UPID await; it reopens tmpPath each attempt so
+	// the PVE reader always sees a fresh stream from the beginning of the file.
+	if uploadErr := uploadStemcellImage(ctx, deps, node, storage, qcow2Filename, tmpPath); uploadErr != nil {
+		return nil, cpierrors.Wrap(uploadErr, "create_stemcell: light fetch upload")
+	}
+
+	lightCID := pve.BuildLightStemcellCID(storage, qcow2Filename)
+	deps.Logger.Info("create_stemcell: light stemcell (fetched) ready",
+		log.String("image_url", cp.ImageURL),
+		log.String("source_scheme", ref.Scheme),
+		log.String("creds_kind", creds.Kind()),
+		log.String("cid", lightCID),
+		log.Int64("bytes", written),
+	)
+	return lightCID, nil
+}
+
+// fetchFindByPrefix scans the named storage for any import volume whose volid
+// contains ":import/<prefix>". Used by handleLightStemcellFetch for the
+// pre-fetch dedup check before SHA-256 is known.
+//
+// Returns ("", nil) when no match is found. Returns ("", err) only on PVE API
+// failure. The caller is responsible for verifying the returned volid belongs
+// to the target storage before using it.
+func fetchFindByPrefix(ctx context.Context, deps Deps, node, storage, prefix string) (string, error) {
+	if deps.PVE == nil || deps.PVE.Nodes() == nil {
+		return "", fmt.Errorf("fetchFindByPrefix: nodes service unavailable")
+	}
+	content := "import"
+	resp, err := deps.PVE.Nodes().ListStorageContent(ctx, node, storage, &sdknodes.ListStorageContentParams{
+		Content: &content,
+	})
+	if err != nil {
+		return "", err
+	}
+	if resp == nil {
+		return "", nil
+	}
+	needle := ":import/" + prefix
+	for _, raw := range *resp {
+		var item struct {
+			VolID string `json:"volid"`
+		}
+		if jerr := json.Unmarshal(raw, &item); jerr != nil {
+			continue
+		}
+		if strings.Contains(item.VolID, needle) {
+			return item.VolID, nil
+		}
+	}
+	return "", nil
+}
+
+// fetchExtractFilename returns the filename component from a PVE volid of the
+// form "<storage>:import/<filename>". Returns empty string when the volid does
+// not match the expected pattern.
+func fetchExtractFilename(volid string) string {
+	idx := strings.IndexByte(volid, ':')
+	if idx < 0 || idx == len(volid)-1 {
+		return ""
+	}
+	path := volid[idx+1:]
+	const pfx = "import/"
+	if !strings.HasPrefix(path, pfx) {
+		return ""
+	}
+	name := path[len(pfx):]
+	if name == "" {
+		return ""
+	}
+	return name
+}
+
+// handlerPolicyDeps adapts handlers.Deps to pve.PolicyDeps for storage policy
+// validation. It exposes StorageInfo by calling ClusterStorage().ListStorage
+// directly — same underlying call as StorageInfoCache.refresh, kept here to
+// avoid changing the Deps surface for this handler only.
+// ClusterNodeCount delegates to the existing clusterNodeCount helper.
+type handlerPolicyDeps struct {
+	deps Deps
+}
+
+// newHandlerPolicyDeps constructs the adapter. Exported as a tiny function so
+// tests can substitute an alternative PolicyDeps implementation by building
+// handleLightStemcellPreUploaded with a seam (see create_stemcell_wb_test.go).
+func newHandlerPolicyDeps(deps Deps) pve.PolicyDeps {
+	return &handlerPolicyDeps{deps: deps}
+}
+
+// StorageInfo lists cluster storage and returns the named entry's classification.
+// Returns an error when ClusterStorage() is nil (mock tests that don't wire it)
+// so the policy call fails clearly rather than panicking.
+func (h *handlerPolicyDeps) StorageInfo(ctx context.Context, name string) (pve.StorageInfo, error) {
+	if h.deps.PVE == nil || h.deps.PVE.ClusterStorage() == nil {
+		return pve.StorageInfo{}, fmt.Errorf(
+			"handlerPolicyDeps: ClusterStorage unavailable — wire deps.PVE.ClusterStorage or use a custom PolicyDeps in tests")
+	}
+	resp, err := h.deps.PVE.ClusterStorage().ListStorage(ctx, &sdkclusterstorage.ListStorageParams{})
+	if err != nil {
+		return pve.StorageInfo{}, err
+	}
+	if resp == nil {
+		return pve.StorageInfo{}, fmt.Errorf("handlerPolicyDeps: nil response from cluster storage list")
+	}
+
+	// Parse raw JSON entries identical to StorageInfoCache.refresh. Each item is
+	// a json.RawMessage; we decode only the subset pve.StorageInfo needs.
+	var entry struct {
+		Storage string `json:"storage"`
+		Type    string `json:"type"`
+		Shared  *int   `json:"shared,omitempty"`
+		Nodes   string `json:"nodes,omitempty"`
+	}
+	for _, raw := range *resp {
+		if jerr := json.Unmarshal(raw, &entry); jerr != nil {
+			continue
+		}
+		if entry.Storage != name {
+			continue
+		}
+		info := pve.StorageInfo{
+			Name: entry.Storage,
+			Type: entry.Type,
+		}
+		if entry.Shared != nil && *entry.Shared != 0 {
+			info.Shared = true
+		}
+		if entry.Nodes != "" {
+			for _, part := range strings.Split(entry.Nodes, ",") {
+				part = strings.TrimSpace(part)
+				if part != "" {
+					info.Nodes = append(info.Nodes, part)
+				}
+			}
+		}
+		return info, nil
+	}
+	return pve.StorageInfo{}, fmt.Errorf("handlerPolicyDeps: storage %q not found in cluster storage list", name)
+}
+
+// ClusterNodeCount delegates to the existing clusterNodeCount helper.
+func (h *handlerPolicyDeps) ClusterNodeCount(ctx context.Context) (int, error) {
+	return clusterNodeCount(ctx, h.deps)
 }
 
 // validateStemcellStorageShared enforces that stemcell storage must be shared

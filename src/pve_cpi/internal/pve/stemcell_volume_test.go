@@ -447,3 +447,99 @@ func TestIsLegacyIntegerStemcellCID(t *testing.T) {
 		})
 	}
 }
+
+// ---- Light-stemcell CID helpers ----
+
+func TestIsLightStemcellCID(t *testing.T) {
+	cases := []struct {
+		name string
+		cid  string
+		want bool
+	}{
+		{name: "empty", cid: "", want: false},
+		{name: "prefix-only", cid: "light:", want: false},
+		{name: "happy path", cid: "light:nfs:import/foo.qcow2", want: true},
+		{name: "double prefix", cid: "light:light:nfs:import/foo.qcow2", want: true},
+		{name: "no prefix", cid: "nfs:import/foo.qcow2", want: false},
+		{name: "wrong prefix case", cid: "Light:nfs:import/foo.qcow2", want: false},
+		{name: "legacy integer", cid: "5042", want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := pve.IsLightStemcellCID(tc.cid); got != tc.want {
+				t.Errorf("IsLightStemcellCID(%q) = %v; want %v", tc.cid, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestStripLightPrefix(t *testing.T) {
+	cases := []struct {
+		name string
+		cid  string
+		want string
+	}{
+		{name: "empty unchanged", cid: "", want: ""},
+		{name: "happy path", cid: "light:nfs:import/foo.qcow2", want: "nfs:import/foo.qcow2"},
+		{name: "double prefix strips one", cid: "light:light:nfs:import/foo.qcow2", want: "light:nfs:import/foo.qcow2"},
+		{name: "no prefix unchanged", cid: "nfs:import/foo.qcow2", want: "nfs:import/foo.qcow2"},
+		{name: "legacy integer unchanged", cid: "5042", want: "5042"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := pve.StripLightPrefix(tc.cid); got != tc.want {
+				t.Errorf("StripLightPrefix(%q) = %q; want %q", tc.cid, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestBuildLightStemcellCID(t *testing.T) {
+	got := pve.BuildLightStemcellCID("nfs-stemcells", "bosh-stemcell-ubuntu-1.0-deadbeef.qcow2")
+	want := "light:nfs-stemcells:import/bosh-stemcell-ubuntu-1.0-deadbeef.qcow2"
+	if got != want {
+		t.Errorf("BuildLightStemcellCID = %q; want %q", got, want)
+	}
+	// Round-trip: built CID should parse back to original components.
+	storage, volpath, err := pve.ParseLightStemcellCID(got)
+	if err != nil {
+		t.Fatalf("ParseLightStemcellCID round-trip: %v", err)
+	}
+	if storage != "nfs-stemcells" || volpath != "import/bosh-stemcell-ubuntu-1.0-deadbeef.qcow2" {
+		t.Errorf("round-trip mismatch: storage=%q volpath=%q", storage, volpath)
+	}
+}
+
+func TestParseLightStemcellCID(t *testing.T) {
+	cases := []struct {
+		name        string
+		cid         string
+		wantStorage string
+		wantVolPath string
+		wantErr     bool
+	}{
+		{name: "happy path", cid: "light:nfs:import/foo.qcow2", wantStorage: "nfs", wantVolPath: "import/foo.qcow2"},
+		{name: "missing light prefix", cid: "nfs:import/foo.qcow2", wantErr: true},
+		{name: "empty", cid: "", wantErr: true},
+		{name: "double prefix fails inner parse", cid: "light:light:nfs:import/foo.qcow2", wantErr: true},
+		{name: "missing import/ segment", cid: "light:nfs:foo.qcow2", wantErr: true},
+		{name: "no inner colon", cid: "light:badcid", wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			storage, volpath, err := pve.ParseLightStemcellCID(tc.cid)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("ParseLightStemcellCID(%q) = (%q, %q, nil); want error", tc.cid, storage, volpath)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ParseLightStemcellCID(%q) unexpected error: %v", tc.cid, err)
+			}
+			if storage != tc.wantStorage || volpath != tc.wantVolPath {
+				t.Errorf("ParseLightStemcellCID(%q) = (%q, %q); want (%q, %q)", tc.cid, storage, volpath, tc.wantStorage, tc.wantVolPath)
+			}
+		})
+	}
+}

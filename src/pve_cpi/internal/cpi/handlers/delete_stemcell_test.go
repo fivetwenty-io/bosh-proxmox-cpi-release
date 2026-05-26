@@ -338,3 +338,42 @@ func TestDeleteStemcell_StorageExtractedFromCID(t *testing.T) {
 		t.Errorf("storage passed to DeleteVolumeIfExists = %q; want %q", capturedStorage, "nfs-pool")
 	}
 }
+
+// TestDeleteStemcell_LightCID_NoOp verifies that delete_stemcell short-circuits
+// on a "light:" prefixed CID without calling the PVE Storage API. Light
+// stemcells are operator-managed; the CPI must never delete their underlying
+// volumes.
+func TestDeleteStemcell_LightCID_NoOp(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		cid  string
+	}{
+		{name: "light shared storage", cid: "light:nfs-stemcells:import/bosh-stemcell-ubuntu-1.0-deadbeef.qcow2"},
+		{name: "light local storage", cid: "light:local:import/bosh-stemcell-other-2.0-cafebabe.qcow2"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			storageSvc := &deleteStemcellMockStorage{}
+			deps := buildDeleteStemcellDeps(storageSvc)
+			h := handlers.HandleDeleteStemcell(deps)
+
+			args := []json.RawMessage{marshalArg(t, tc.cid)}
+			result, err := h.Handle(context.Background(), args, jsonrpc.Context{RequestID: "req-del-light"})
+			if err != nil {
+				t.Fatalf("unexpected error for light CID %q: %v", tc.cid, err)
+			}
+			if result != nil {
+				t.Errorf("expected nil result for light CID %q, got %v", tc.cid, result)
+			}
+			if storageSvc.deleteVolumeIfExistsCalls != 0 {
+				t.Errorf("expected ZERO DeleteVolumeIfExists calls for light CID, got %d",
+					storageSvc.deleteVolumeIfExistsCalls)
+			}
+		})
+	}
+}

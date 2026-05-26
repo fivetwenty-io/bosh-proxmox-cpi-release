@@ -52,6 +52,20 @@ func HandleDeleteStemcell(deps Deps) cpi.Handler {
 		}
 
 		// ----------------------------------------------------------------
+		// Light stemcell CIDs ("light:<storage>:import/<file>") are
+		// operator-managed: both pre-uploaded mode and CPI-assisted-fetch
+		// mode resolve to the same lifecycle policy — the CPI never
+		// deletes the underlying volume. Operator removes via PVE-native
+		// tooling (pvesm free) when ready.
+		// ----------------------------------------------------------------
+		if pve.IsLightStemcellCID(cidStr) {
+			deps.Logger.Info("delete_stemcell: light stemcell CID, skipping delete (operator-managed)",
+				log.String("stemcell_cid", cidStr),
+			)
+			return nil, nil
+		}
+
+		// ----------------------------------------------------------------
 		// Legacy integer CIDs ("5042") were emitted by the obsolete
 		// template-clone CPI design. The matching template VM and its
 		// import qcow2 are no longer referenced by direct-qcow create_vm.

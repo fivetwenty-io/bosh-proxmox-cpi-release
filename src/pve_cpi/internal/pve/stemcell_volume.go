@@ -132,6 +132,48 @@ func IsLegacyIntegerStemcellCID(cid string) bool {
 	return cid != "" && isAllDigits(cid)
 }
 
+// IsLightStemcellCID reports whether cid is a light-stemcell CID.
+//
+// A light-stemcell CID has the form "light:<storage>:import/<filename>".
+// Returns true iff cid starts with the literal prefix "light:" and has at
+// least one character after that prefix. A bare "light:" string (no payload)
+// returns false. Double-prefixed strings such as "light:light:..." return true
+// because the outer prefix is present; StripLightPrefix removes exactly one layer.
+func IsLightStemcellCID(cid string) bool {
+	const prefix = "light:"
+	return strings.HasPrefix(cid, prefix) && len(cid) > len(prefix)
+}
+
+// StripLightPrefix removes exactly one leading "light:" segment from cid.
+// If cid does not satisfy IsLightStemcellCID, cid is returned unchanged.
+// The function intentionally strips only one layer; callers must not double-strip.
+func StripLightPrefix(cid string) string {
+	if IsLightStemcellCID(cid) {
+		return cid[len("light:"):]
+	}
+	return cid
+}
+
+// BuildLightStemcellCID returns the canonical light-stemcell CID for the given
+// storage pool and qcow2 filename.
+//
+// Format: "light:<storage>:import/<filename>"
+func BuildLightStemcellCID(storage, qcow2Filename string) string {
+	return "light:" + BuildStemcellCID(storage, qcow2Filename)
+}
+
+// ParseLightStemcellCID splits a light-stemcell CID into (storage, volumePath).
+//
+// Expected format: "light:<storage>:import/<filename>"
+// Returns an error when cid does not satisfy IsLightStemcellCID. All errors
+// from the underlying ParseStemcellCID call are propagated as-is.
+func ParseLightStemcellCID(cid string) (storage string, volumePath string, err error) {
+	if !IsLightStemcellCID(cid) {
+		return "", "", fmt.Errorf("ParseLightStemcellCID: CID %q missing \"light:\" prefix", cid)
+	}
+	return ParseStemcellCID(StripLightPrefix(cid))
+}
+
 // isAllDigits reports whether s consists entirely of ASCII decimal digits.
 func isAllDigits(s string) bool {
 	if s == "" {

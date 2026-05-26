@@ -19,6 +19,7 @@ tiers:
   lifecycle: true   # Tier 1: CPI 16-step + 4 sub-steps lifecycle via scripts/lifecycle
   bosh:      true   # Tier 2: bosh create-env + cloud/runtime-config + emptyvm smoke
   cf:        true   # Tier 3: CF deploy + smoke app push + HTTP 200 assert
+  light:     true   # Tier 4: light stemcell upload + delete assertions (run explicitly: integration light)
 
 # Paths to secret manifest files (relative to repo root, all gitignored).
 bosh_vars:  manifests/bosh/vars.yml   # PVE connection + sizing knobs
@@ -136,3 +137,22 @@ tier3:
   smoke_space:     test              # CF space created for the smoke test
   smoke_app:       httpbin-smoke     # CF app name pushed for the smoke test
   smoke_timeout_s: 900               # Seconds to wait for CF deploy + app push
+
+# Tier 4: Light stemcell upload + delete assertions.
+# Run with: ./scripts/test integration light
+#
+# Exercises both light-stemcell modes against a live BOSH director.
+# Tier 2 (bosh create-env) must have run first, or the director must already
+# be up. This tier does NOT run bosh deploy — manifests are stemcell-only.
+#
+# Preuploaded mode always runs; fetch mode requires light_fetch_enabled: true
+# plus a reachable stemcell_url.
+tier4:
+  bosh_env_alias:       ""      # Director alias; defaults to tier2.bosh_env_alias when empty
+  stemcell_storage:     ""      # PVE storage pool holding the pre-uploaded qcow2
+                                # (e.g. "nfs-stemcells", "ceph-fs", "local")
+  stemcell_filename:    ""      # Filename of the pre-uploaded qcow2, no path prefix
+                                # (e.g. "ubuntu-jammy-1.438.qcow2")
+  light_fetch_enabled:  false   # Set true to also run the CPI-assisted fetch mode
+  stemcell_url:         ""      # Remote qcow2 URL; required when light_fetch_enabled: true
+  stemcell_token:       ""      # Bearer token for authenticated fetch; empty = no auth
