@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"time"
 
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
@@ -77,6 +78,18 @@ func HandleDeleteSnapshot(deps Deps) Handler {
 			wrapped := pve.WrapError(err)
 			return nil, fmt.Errorf("delete_snapshot: DeleteSnapshot failed for VM %s snap %s: %w",
 				vmCID, snapName, wrapped)
+		}
+
+		// PVE deletes snapshots via an async worker task, and the SDK discards
+		// the task UPID, so the DELETE above returns before PVE has actually
+		// removed the snapshot. Wait until it is gone; otherwise an immediately
+		// following detach_disk (whose guard rejects live snapshots) fails
+		// spuriously. A 404/idempotent delete returned earlier, so reaching here
+		// means the snapshot existed and a deletion task is in flight.
+		if waitErr := pve.WaitForSnapshotAbsent(ctx, deps.PVE, node, vmid, snapName,
+			pve.WithMaxWait(120*time.Second)); waitErr != nil {
+			return nil, fmt.Errorf("delete_snapshot: waiting for snapshot %s removal on VM %s: %w",
+				snapName, vmCID, waitErr)
 		}
 
 		deps.Logger.Info("delete_snapshot",

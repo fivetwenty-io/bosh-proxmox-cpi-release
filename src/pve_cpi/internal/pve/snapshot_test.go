@@ -3,7 +3,9 @@ package pve_test
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cloudinit"
@@ -191,5 +193,76 @@ func TestHasSnapshots(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TestWaitForSnapshotAbsent
+// ---------------------------------------------------------------------------
+
+func TestWaitForSnapshotAbsent_AlreadyGone(t *testing.T) {
+	t.Parallel()
+	client := snapClient(func(_ context.Context, _ string, _ int) ([]map[string]interface{}, error) {
+		return snapEntries("current"), nil
+	})
+	if err := pve.WaitForSnapshotAbsent(context.Background(), client, "pve1", 9001, "snap1"); err != nil {
+		t.Fatalf("unexpected error when snapshot already absent: %v", err)
+	}
+}
+
+func TestWaitForSnapshotAbsent_LingersThenGone(t *testing.T) {
+	t.Parallel()
+	var calls int32
+	client := snapClient(func(_ context.Context, _ string, _ int) ([]map[string]interface{}, error) {
+		// Present on the first two polls, gone afterward.
+		if atomic.AddInt32(&calls, 1) <= 2 {
+			return snapEntries("current", "snap1"), nil
+		}
+		return snapEntries("current"), nil
+	})
+	err := pve.WaitForSnapshotAbsent(context.Background(), client, "pve1", 9001, "snap1",
+		pve.WithPollInterval(1*time.Millisecond), pve.WithMaxWait(10*time.Second))
+	if err != nil {
+		t.Fatalf("unexpected error waiting for snapshot to clear: %v", err)
+	}
+	if atomic.LoadInt32(&calls) < 3 {
+		t.Errorf("expected at least 3 polls before the snapshot cleared, got %d", calls)
+	}
+}
+
+func TestWaitForSnapshotAbsent_Timeout(t *testing.T) {
+	t.Parallel()
+	client := snapClient(func(_ context.Context, _ string, _ int) ([]map[string]interface{}, error) {
+		return snapEntries("current", "snap1"), nil // never clears
+	})
+	err := pve.WaitForSnapshotAbsent(context.Background(), client, "pve1", 9001, "snap1",
+		pve.WithPollInterval(1*time.Millisecond), pve.WithMaxWait(1*time.Second))
+	if err == nil {
+		t.Fatal("expected timeout error when snapshot never clears")
+	}
+}
+
+func TestWaitForSnapshotAbsent_ListError(t *testing.T) {
+	t.Parallel()
+	client := snapClient(func(_ context.Context, _ string, _ int) ([]map[string]interface{}, error) {
+		return nil, errors.New("connection refused")
+	})
+	err := pve.WaitForSnapshotAbsent(context.Background(), client, "pve1", 9001, "snap1")
+	if err == nil {
+		t.Fatal("expected error when snapshot list cannot be read")
+	}
+}
+
+func TestWaitForSnapshotAbsent_ContextCancelled(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancelled before the first poll completes its wait
+	client := snapClient(func(_ context.Context, _ string, _ int) ([]map[string]interface{}, error) {
+		return snapEntries("current", "snap1"), nil // never clears → forces the wait/select
+	})
+	err := pve.WaitForSnapshotAbsent(ctx, client, "pve1", 9001, "snap1",
+		pve.WithPollInterval(50*time.Millisecond), pve.WithMaxWait(10*time.Second))
+	if err == nil {
+		t.Fatal("expected error when context is cancelled")
 	}
 }

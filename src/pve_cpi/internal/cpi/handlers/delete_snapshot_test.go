@@ -21,6 +21,7 @@ import (
 
 type delSnapQEMUService struct {
 	deleteSnapshotFn func(ctx context.Context, node string, vmid int, name string) error
+	listSnapshotsFn  func(ctx context.Context, node string, vmid int) ([]map[string]interface{}, error)
 }
 
 func (m *delSnapQEMUService) DeleteSnapshot(ctx context.Context, node string, vmid int, name string) error {
@@ -67,8 +68,12 @@ func (m *delSnapQEMUService) ResizeDisk(_ context.Context, _ string, _ int, _ st
 func (m *delSnapQEMUService) Snapshot(_ context.Context, _ string, _ int, _ string, _ map[string]interface{}) (string, error) {
 	panic("delSnapQEMUService.Snapshot: not expected")
 }
-func (m *delSnapQEMUService) ListSnapshots(_ context.Context, _ string, _ int) ([]map[string]interface{}, error) {
-	panic("delSnapQEMUService.ListSnapshots: not expected")
+func (m *delSnapQEMUService) ListSnapshots(ctx context.Context, node string, vmid int) ([]map[string]interface{}, error) {
+	if m.listSnapshotsFn != nil {
+		return m.listSnapshotsFn(ctx, node, vmid)
+	}
+	// Default: snapshot already gone, so WaitForSnapshotAbsent returns immediately.
+	return []map[string]interface{}{{"name": "current"}}, nil
 }
 func (m *delSnapQEMUService) RollbackSnapshot(_ context.Context, _ string, _ int, _ string) (string, error) {
 	panic("delSnapQEMUService.RollbackSnapshot: not expected")

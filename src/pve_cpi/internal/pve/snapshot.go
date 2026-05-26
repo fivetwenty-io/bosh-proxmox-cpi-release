@@ -3,6 +3,9 @@ package pve
 import (
 	"context"
 	"fmt"
+	"time"
+
+	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 )
 
 // HasSnapshots returns the names of real (non-synthetic) snapshots for the given VM.
@@ -44,4 +47,70 @@ func HasSnapshots(ctx context.Context, client Client, node string, vmid int) ([]
 		names = append(names, name)
 	}
 	return names, nil
+}
+
+// WaitForSnapshotAbsent polls until snapName no longer appears in the VM's
+// snapshot list, or the configured timeout / ctx deadline elapses.
+//
+// PVE removes a snapshot via an asynchronous worker task, but the SDK's
+// DeleteSnapshot issues the DELETE and discards the task UPID, so callers
+// cannot AwaitTask the removal directly. Without waiting, delete_snapshot
+// returns while PVE is still deleting the snapshot, and an immediately
+// following operation whose PVE-side guard rejects live snapshots — notably
+// detach_disk — fails spuriously. This poll bridges that gap.
+//
+// Options reuse AwaitTask's defaults (2 s interval, 5 min max wait) and may be
+// overridden with WithPollInterval / WithMaxWait.
+//
+// Returns nil once snapName is gone. Returns a *cpierrors.Error on timeout, on
+// ctx cancellation, or when the snapshot list cannot be read.
+func WaitForSnapshotAbsent(
+	ctx context.Context, client Client, node string, vmid int, snapName string, opts ...AwaitOption,
+) error {
+	if ctx == nil {
+		return cpierrors.Cloud("WaitForSnapshotAbsent: ctx must not be nil")
+	}
+	if client == nil {
+		return cpierrors.Cloud("WaitForSnapshotAbsent: client must not be nil")
+	}
+
+	ao := &awaitOptions{
+		pollIntervalMs: defaultPollIntervalMs,
+		maxWaitSeconds: defaultMaxWaitSeconds,
+	}
+	for _, opt := range opts {
+		opt(ao)
+	}
+
+	interval := time.Duration(ao.pollIntervalMs) * time.Millisecond
+	deadline := time.Now().Add(time.Duration(ao.maxWaitSeconds) * time.Second)
+
+	for {
+		names, err := HasSnapshots(ctx, client, node, vmid)
+		if err != nil {
+			return cpierrors.Wrap(err,
+				fmt.Sprintf("WaitForSnapshotAbsent: vm %d on node %s", vmid, node))
+		}
+		present := false
+		for _, n := range names {
+			if n == snapName {
+				present = true
+				break
+			}
+		}
+		if !present {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return cpierrors.Cloud(
+				"WaitForSnapshotAbsent: snapshot %q on vm %d still present after %ds",
+				snapName, vmid, ao.maxWaitSeconds)
+		}
+		select {
+		case <-ctx.Done():
+			return cpierrors.Wrap(ctx.Err(),
+				fmt.Sprintf("WaitForSnapshotAbsent: snapshot %q on vm %d", snapName, vmid))
+		case <-time.After(interval):
+		}
+	}
 }
