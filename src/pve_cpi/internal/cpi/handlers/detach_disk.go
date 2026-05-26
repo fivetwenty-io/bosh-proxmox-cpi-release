@@ -108,12 +108,25 @@ func HandleDetachDisk(deps Deps) Handler {
 		diskID, err := pve.ResolveDiskID(ctx, deps.PVE, node, vmid, diskCID)
 		if err != nil {
 			if cpierrors.IsType(err, cpierrors.TypeCloud) || pve.IsNotFound(err) {
-				// Disk is not attached to this VM; idempotent success.
-				deps.Logger.Warn("detach_disk: disk not attached to VM; skipping",
-					log.String("vm_cid", vmCID),
-					log.String("disk_cid", diskCID),
-					log.Err(err),
-				)
+				// Disk is not on an active bus. It may still linger as an unusedN
+				// slot: a prior detach with allow_disk_ops_with_snapshots=true
+				// parked it there, but PVE's unusedN sweep was blocked by a
+				// snapshot. Once the snapshot is gone a follow-up detach_disk lands
+				// here — completing that sweep is what makes the documented "delete
+				// snapshots, then retry detach_disk" recovery actually free the
+				// volume (delete_disk) and unblock delete_vm.
+				swept, sweepErr := sweepUnusedDiskSlot(ctx, deps, node, vmid, vmCID, diskCID)
+				if sweepErr != nil {
+					return nil, sweepErr
+				}
+				if !swept {
+					// Truly detached (no active slot, no unusedN); idempotent success.
+					deps.Logger.Warn("detach_disk: disk not attached to VM; skipping",
+						log.String("vm_cid", vmCID),
+						log.String("disk_cid", diskCID),
+						log.Err(err),
+					)
+				}
 				return nil, nil
 			}
 			// Config fetch error (network, 404 on VM itself, etc.).
@@ -192,4 +205,49 @@ func HandleDetachDisk(deps Deps) Handler {
 		// --------------------------------------------------------------------
 		return nil, nil
 	})
+}
+
+// sweepUnusedDiskSlot removes a lingering unusedN config entry that still
+// references diskCID on the given VM, returning true when a slot was removed.
+//
+// PVE demotes a detached disk to unusedN and the SDK's DetachDisk normally
+// removes that slot in the same call. That sweep is rejected while a snapshot
+// references the disk (the allow_disk_ops_with_snapshots bypass path), so the
+// slot can linger. ResolveDiskID does not see unusedN slots (PVE's disk-key
+// pattern covers only active buses), so a retried detach_disk reaches here once
+// the snapshot is gone and completes the cleanup. PUT delete=unusedN frees the
+// reference so delete_disk can remove the volume and delete_vm is unblocked.
+func sweepUnusedDiskSlot(
+	ctx context.Context, deps Deps, node string, vmid int, vmCID, diskCID string,
+) (bool, error) {
+	cfg, err := deps.PVE.QEMU().Config(ctx, node, vmid)
+	if err != nil {
+		if pve.IsNotFound(err) {
+			return false, nil // VM gone — nothing to sweep.
+		}
+		return false, fmt.Errorf("detach_disk: read config for VM %s to sweep unused slot: %w",
+			vmCID, pve.WrapError(err))
+	}
+
+	for slot, volid := range pve.FindUnusedDiskEntries(cfg) {
+		if volid != diskCID {
+			continue
+		}
+		if sweepErr := pve.RetryOnTransient(ctx, deps.Logger, "detach_disk.sweep", 0, func() error {
+			return deps.PVE.QEMU().DetachDisk(ctx, node, vmid, slot)
+		}); sweepErr != nil {
+			if pve.IsNotFound(sweepErr) {
+				return true, nil // slot already gone
+			}
+			return false, fmt.Errorf("detach_disk: remove lingering unused slot %s for disk %s on VM %s: %w",
+				slot, diskCID, vmCID, pve.WrapError(sweepErr))
+		}
+		deps.Logger.Info("detach_disk: removed lingering unused disk slot",
+			log.String("vm_cid", vmCID),
+			log.String("slot", slot),
+			log.String("disk_cid", diskCID),
+		)
+		return true, nil
+	}
+	return false, nil
 }

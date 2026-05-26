@@ -178,6 +178,64 @@ func TestHandleDetachDisk_NotAttached(t *testing.T) {
 	}
 }
 
+// TestHandleDetachDisk_SweepsLingeringUnusedSlot verifies that when the disk is
+// not on an active bus but lingers as an unusedN slot (e.g. a prior bypassed
+// detach whose unusedN sweep was blocked by a snapshot), a retry detach_disk
+// removes that slot. This is the recovery path the guard message promises.
+func TestHandleDetachDisk_SweepsLingeringUnusedSlot(t *testing.T) {
+	const (
+		vmCID   = "100"
+		diskCID = "local-lvm:vm-9001-disk-0"
+	)
+
+	qemuSvc := &detachQEMUService{
+		// No active-bus slot for the volid → ResolveDiskID misses it. The disk is
+		// parked in unused0 with a size option (FindUnusedDiskEntries strips it).
+		configCfg: map[string]interface{}{
+			"scsi0":   "local-lvm:vm-100-disk-0",
+			"unused0": diskCID + ",size=2G",
+		},
+	}
+	h := handlers.HandleDetachDisk(detachDeps(qemuSvc))
+
+	result, err := h.Handle(context.Background(), detachArgs(vmCID, diskCID), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error sweeping unused slot: %v", err)
+	}
+	if result != nil {
+		t.Errorf("result: want nil (void), got %v", result)
+	}
+	if !qemuSvc.detachCalled {
+		t.Error("DetachDisk must be called to remove the lingering unused slot")
+	}
+	if qemuSvc.detachedDiskID != "unused0" {
+		t.Errorf("swept slot: want unused0, got %q", qemuSvc.detachedDiskID)
+	}
+}
+
+// TestHandleDetachDisk_UnusedSlotDifferentVolume verifies the sweep does not
+// touch an unusedN slot that references a different volume.
+func TestHandleDetachDisk_UnusedSlotDifferentVolume(t *testing.T) {
+	const (
+		vmCID   = "100"
+		diskCID = "local-lvm:vm-9001-disk-0"
+	)
+
+	qemuSvc := &detachQEMUService{
+		configCfg: map[string]interface{}{
+			"unused0": "local-lvm:some-other-disk",
+		},
+	}
+	h := handlers.HandleDetachDisk(detachDeps(qemuSvc))
+
+	if _, err := h.Handle(context.Background(), detachArgs(vmCID, diskCID), jsonrpc.Context{}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if qemuSvc.detachCalled {
+		t.Error("DetachDisk must not be called when no unused slot references this volume")
+	}
+}
+
 // TestHandleDetachDisk_DetachFail verifies SDK DetachDisk failure propagates.
 func TestHandleDetachDisk_DetachFail(t *testing.T) {
 	const (
