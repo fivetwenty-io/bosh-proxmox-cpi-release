@@ -437,10 +437,16 @@ def tier_cf(cfg: dict, cpi_config_path: str, keep: bool) -> int:
         # deployment lock on a transient missed heartbeat. (Idempotent; also
         # covers a standalone `integration cf` run.)
         ("resurrection-off", ["./scripts/bosh", "update-resurrection", "off"],        None,          1),
-        # cf deploy gets one retry: an intermittent get_state timeout to a
-        # healthy instance can fail an otherwise-fine deploy, and re-running
-        # the idempotent deploy resumes from where it left off.
-        ("cf deploy",        ["./scripts/cf", "deploy"],                              None,          1),
+        # cf deploy is NOT auto-retried: re-running an interrupted multi-VM CF
+        # deploy resumes in-place, and if the first attempt died early (before
+        # router/tcp-router/scheduler were updated) the haproxy canary then
+        # crash-loops on unresolvable backend bosh-dns names and wedges the
+        # deploy. A clean single pass is the reliable path; an interrupted
+        # deploy is better re-run from a fresh `integration cf` (or `all`).
+        # The real cause of those interruptions is the single-node lab's 45s
+        # director->agent timeout under the 16-VM creation burst — see
+        # docs/pve-host-tuning.md; not a CPI defect.
+        ("cf deploy",        ["./scripts/cf", "deploy"],                              None,          0),
         ("cf login",         ["./scripts/cf", "login"],                               None,          3),
         ("cf create-org",    ["cf", "create-org", smoke_org],                         None,          6),
         ("cf create-space",  ["cf", "create-space", smoke_space, "-o", smoke_org],    None,          3),
