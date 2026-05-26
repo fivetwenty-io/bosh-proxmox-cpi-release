@@ -45,6 +45,13 @@ tier1:
   # matrix. Default (empty list) runs lifecycle once using the pve_disk_storage pool
   # from bosh_vars, preserving the existing single-pool behavior.
   #
+  # Set to the string `auto` to detect available local disk storage pools at run
+  # time by querying the PVE host API. The harness keeps pools of type lvm,
+  # lvmthin, zfspool, or dir that advertise images content and are not disabled.
+  # Autodetect requires valid PVE credentials in bosh_vars (pve_api_token or
+  # pve_password). In --dry-run mode, autodetect is skipped and a single lifecycle
+  # run is performed.
+  #
   # Required PVE storage pools for the full local matrix:
   #   lvm pool:     pvesm add lvm <name> --vgname <vg>
   #   lvmthin pool: pvesm add lvmthin <name> --vgname <vg> --thinpool <tp>
@@ -58,7 +65,41 @@ tier1:
   #     - local-lvm-thin
   #     - local-zfs
   #     - local
+  #
+  # Example using autodetect:
+  #   disk_storage_pools: auto
   disk_storage_pools: []
+
+  # Network-handler matrix (optional). Exercises create_network / delete_network
+  # — the BOSH CPI managed-network methods — against live PVE, with out-of-band
+  # verification (scripts/_pve_verify.py confirms real cluster state, not just the
+  # CPI's return values). When modes is non-empty, Tier 1 runs scripts/lifecycle
+  # one extra pass per mode (independent of disk_storage_pools, using the default
+  # CPI config). Default (empty) skips network testing entirely.
+  #
+  #   sdn    — create an SDN vnet (+ subnet) and attach the test VM to it. Needs
+  #            an SDN-capable cluster. 'zone' must already exist unless the CPI
+  #            config sets sdn_auto_manage_zone (then the zone is auto-created).
+  #            'range' should be an isolated CIDR that does not collide with the
+  #            LAN; the test VM gets 'ip' within it (no external connectivity
+  #            required for the lifecycle assertions).
+  #   bridge — create a Linux bridge via the nodes API and attach the VM to it.
+  #            CAUTION: this mutates node networking — use an UNUSED iface name.
+  #
+  # Example:
+  #   network_test:
+  #     modes: [sdn, bridge]
+  network_test:
+    modes: []                   # [] = skip. e.g. [sdn], [bridge], or [sdn, bridge]
+    sdn:
+      zone:      ""             # pre-existing zone, or any name if sdn_auto_manage_zone
+      zone_type: simple         # used only when the zone is auto-created
+      vnet:      itvnet         # 1-8 chars [a-z0-9]
+      range:     10.250.0.0/24  # isolated test subnet (must not collide with LAN)
+      gateway:   10.250.0.1     # gateway for the SDN subnet
+      ip:        10.250.0.10    # test VM IP within range
+    bridge:
+      iface:     vmbr9          # UNUSED bridge iface to create then delete
 
 # Tier 2: BOSH director smoke test.
 tier2:

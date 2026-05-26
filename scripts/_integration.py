@@ -20,8 +20,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import ssl
 import subprocess
 import sys
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 import yaml
@@ -130,34 +133,32 @@ def bosh_int(file: "str | Path", path: str, dry_run: bool = False) -> str:
     return result.stdout.rstrip("\n")
 
 
-def write_cpi_config(
+def build_cpi_config(
     cfg: dict,
-    out_path: "str | Path",
-    dry_run: bool = False,
     *,
+    dry_run: bool = False,
     disk_storage_override: "str | None" = None,
-) -> str:
-    """Synthesize the CPI JSON config and write it to out_path.
+) -> dict:
+    """Build and return the CPI config dict from cfg without writing any file.
 
     Pulls PVE secrets from cfg['bosh_vars'] via bosh int.  Auth preference:
     pve_api_token if non-empty, otherwise pve_password.  network_bridge uses
     tier1.network_bridge when non-empty, falling back to pve_network_bridge from
-    vars.  verify_ssl is always false for test isolation.  vmid_range_start comes
+    vars.  verify_ssl is always False for test isolation.  vmid_range_start comes
     from tier1.
 
     Args:
         cfg:                   Validated config dict from load_config.
-        out_path:              Destination path for the CPI JSON file.
-        dry_run:               When True, skip the disk write and return str(out_path).
+        dry_run:               When True, bosh int returns placeholder strings.
         disk_storage_override: When not None, overrides the disk_storage value
-                               read from bosh_vars. Used by the multi-storage
-                               matrix loop in tier_lifecycle.
+                               read from bosh_vars.
 
     Returns:
-        str(out_path).
+        CPI config dict suitable for JSON serialization.
 
     Raises:
-        SystemExit: bosh int fails for any required var, or out_path not writable.
+        SystemExit: bosh int fails for any required var.
+        ValueError:  pve_port present but not an integer.
     """
     bosh_vars = cfg["bosh_vars"]
     tier1 = cfg["tier1"]
@@ -226,6 +227,40 @@ def write_cpi_config(
         cpi_cfg["api_token"] = api_token
         cpi_cfg["password"] = password
 
+    return cpi_cfg
+
+
+def write_cpi_config(
+    cfg: dict,
+    out_path: "str | Path",
+    dry_run: bool = False,
+    *,
+    disk_storage_override: "str | None" = None,
+) -> str:
+    """Synthesize the CPI JSON config and write it to out_path.
+
+    Delegates dict construction to build_cpi_config.  Auth preference:
+    pve_api_token if non-empty, otherwise pve_password.  network_bridge uses
+    tier1.network_bridge when non-empty, falling back to pve_network_bridge from
+    vars.  verify_ssl is always false for test isolation.  vmid_range_start comes
+    from tier1.
+
+    Args:
+        cfg:                   Validated config dict from load_config.
+        out_path:              Destination path for the CPI JSON file.
+        dry_run:               When True, skip the disk write and return str(out_path).
+        disk_storage_override: When not None, overrides the disk_storage value
+                               read from bosh_vars. Used by the multi-storage
+                               matrix loop in tier_lifecycle.
+
+    Returns:
+        str(out_path).
+
+    Raises:
+        SystemExit: bosh int fails for any required var, or out_path not writable.
+    """
+    cpi_cfg = build_cpi_config(cfg, dry_run=dry_run, disk_storage_override=disk_storage_override)
+
     if dry_run:
         return str(out_path)
 
@@ -236,6 +271,199 @@ def write_cpi_config(
         sys.exit(f"failed to write CPI config to {dest}: {exc}")
 
     return str(dest)
+
+
+# ---------------------------------------------------------------------------
+# Storage pool detection
+# ---------------------------------------------------------------------------
+
+_LOCAL_DISK_TYPES = ("lvm", "lvmthin", "zfspool", "dir")
+
+
+def select_local_disk_pools(
+    entries: "list[dict]",
+    types: "tuple[str, ...]" = _LOCAL_DISK_TYPES,
+) -> "list[str]":
+    """Filter PVE storage entries to local disk pools capable of holding VM images.
+
+    Args:
+        entries: List of storage entry dicts from the PVE /api2/json/storage
+                 endpoint (the ``data`` array).
+        types:   Storage types considered local disk pools.  Defaults to
+                 ``("lvm", "lvmthin", "zfspool", "dir")``.
+
+    Returns:
+        Sorted, de-duplicated list of storage names that:
+        - have a type in ``types``,
+        - advertise ``images`` in their ``content`` field (comma-separated),
+        - are not disabled (``disable`` absent, falsy, or not one of 1/"1"/True).
+
+    No network calls are made; function is pure and unit-testable.
+    """
+    seen: set[str] = set()
+    result: list[str] = []
+    for entry in entries:
+        if entry.get("type") not in types:
+            continue
+        # Disabled check: PVE sets disable=1 (int) or "1" (str) or True.
+        disabled = entry.get("disable")
+        if disabled in (1, "1", True):
+            continue
+        content = entry.get("content", "")
+        parts = [p.strip() for p in content.split(",")]
+        if "images" not in parts:
+            continue
+        name = entry["storage"]
+        if name not in seen:
+            seen.add(name)
+            result.append(name)
+    return sorted(result)
+
+
+def fetch_storage_index(cpi_cfg: dict) -> "list[dict]":
+    """Query PVE /api2/json/storage and return the data array.
+
+    Auth:
+    - If ``cpi_cfg["api_token"]`` is set and not a ``<dry-run:`` placeholder,
+      sends ``Authorization: PVEAPIToken=<token>`` header.
+    - Else if ``cpi_cfg["password"]`` is set, authenticates via
+      POST /api2/json/access/ticket and uses the resulting cookie.
+    - Otherwise raises RuntimeError (no usable credentials).
+
+    TLS verification is always disabled (verify_ssl is always False in the
+    test harness).
+
+    Args:
+        cpi_cfg: CPI config dict as returned by build_cpi_config.
+
+    Returns:
+        List of storage entry dicts from PVE (``response["data"]``).
+
+    Raises:
+        RuntimeError: HTTP error, network error, JSON parse error, or
+                      unexpected response structure.
+    """
+    host = cpi_cfg["host"]
+    port = cpi_cfg.get("port", 8006)
+    base_url = f"https://{host}:{port}/api2/json"
+    timeout = 15
+
+    # Build a TLS context that skips certificate verification.
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+
+    api_token = cpi_cfg.get("api_token", "")
+    password = cpi_cfg.get("password", "")
+
+    is_token_placeholder = bool(api_token and api_token.startswith("<dry-run:"))
+    is_password_placeholder = bool(password and password.startswith("<dry-run:"))
+
+    if api_token and not is_token_placeholder:
+        # Token auth: single GET with Authorization header.
+        headers = {"Authorization": f"PVEAPIToken={api_token}"}
+        req = urllib.request.Request(f"{base_url}/storage", headers=headers)
+        try:
+            with urllib.request.urlopen(req, context=ctx, timeout=timeout) as resp:
+                raw = resp.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            raise RuntimeError(
+                f"PVE storage index request to {host}:{port} failed: HTTP {exc.code} {exc.reason}"
+            ) from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(
+                f"PVE storage index request to {host}:{port} failed: {exc.reason}"
+            ) from exc
+
+    elif password and not is_password_placeholder:
+        # Password auth: POST to /access/ticket, then GET /storage with cookie.
+        ticket_url = f"{base_url}/access/ticket"
+        body = urllib.parse.urlencode({"username": cpi_cfg["user"], "password": password}).encode()
+        ticket_req = urllib.request.Request(
+            ticket_url,
+            data=body,
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(ticket_req, context=ctx, timeout=timeout) as resp:
+                ticket_raw = resp.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            raise RuntimeError(
+                f"PVE ticket auth to {host}:{port} failed: HTTP {exc.code} {exc.reason}"
+            ) from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(
+                f"PVE ticket auth to {host}:{port} failed: {exc.reason}"
+            ) from exc
+
+        try:
+            ticket_resp = json.loads(ticket_raw)
+            ticket = ticket_resp["data"]["ticket"]
+            csrf = ticket_resp["data"]["CSRFPreventionToken"]
+        except (KeyError, TypeError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"PVE ticket response from {host}:{port} missing expected fields: {exc}"
+            ) from exc
+
+        storage_req = urllib.request.Request(
+            f"{base_url}/storage",
+            headers={
+                "Cookie": f"PVEAuthCookie={ticket}",
+                "CSRFPreventionToken": csrf,
+            },
+        )
+        try:
+            with urllib.request.urlopen(storage_req, context=ctx, timeout=timeout) as resp:
+                raw = resp.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            raise RuntimeError(
+                f"PVE storage index request to {host}:{port} failed: HTTP {exc.code} {exc.reason}"
+            ) from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(
+                f"PVE storage index request to {host}:{port} failed: {exc.reason}"
+            ) from exc
+
+    else:
+        raise RuntimeError(
+            f"No usable credentials for PVE storage index at {host}:{port}: "
+            "set pve_api_token or pve_password in bosh_vars."
+        )
+
+    try:
+        parsed = json.loads(raw)
+        data = parsed["data"]
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise RuntimeError(
+            f"Unexpected PVE storage index response from {host}:{port}: {exc}"
+        ) from exc
+
+    if not isinstance(data, list):
+        raise RuntimeError(
+            f"PVE storage index data from {host}:{port} is not a list (got {type(data).__name__})"
+        )
+
+    return data
+
+
+def detect_disk_storage_pools(cfg: dict) -> "list[str]":
+    """Autodetect local disk storage pools on the PVE host.
+
+    Calls build_cpi_config to resolve connection details, fetches the PVE
+    storage index via the API, and filters to local image-capable pools.
+
+    Args:
+        cfg: Validated config dict from load_config.
+
+    Returns:
+        Sorted list of storage pool names suitable for disk_storage_override.
+
+    Raises:
+        RuntimeError: Network error, auth failure, or malformed response.
+    """
+    cpi_cfg = build_cpi_config(cfg, dry_run=False)
+    entries = fetch_storage_index(cpi_cfg)
+    return select_local_disk_pools(entries)
 
 
 def tier1_env(cfg: dict, cpi_config_path: "str | Path", dry_run: bool = False) -> dict:
@@ -273,7 +501,7 @@ def tier1_env(cfg: dict, cpi_config_path: "str | Path", dry_run: bool = False) -
     if not isinstance(dns_raw, list):
         dns_raw = [str(dns_raw)]
 
-    return {
+    env_out = {
         "CPI_CONFIG": str(cpi_config_path),
         "STEMCELL_PATH": stemcell,
         "NETWORK_IP": str(tier1["network_ip"]),
@@ -285,6 +513,29 @@ def tier1_env(cfg: dict, cpi_config_path: "str | Path", dry_run: bool = False) -
         "VM_MEMORY_MIB": str(tier1["vm_memory_mib"]),
         "DISK_SIZE_MIB": str(tier1["disk_size_mib"]),
     }
+
+    # Optional network-test parameters consumed by create_network/delete_network
+    # in scripts/lifecycle. NETWORK_TEST_MODE itself is injected per-pass by
+    # tier_lifecycle (scripts/test); here we only surface the SDN/bridge knobs so
+    # they are present whenever a mode is selected. Absent block -> nothing added
+    # (lifecycle defaults to mode=off).
+    network_test = tier1.get("network_test", {}) or {}
+    if network_test:
+        sdn = network_test.get("sdn", {}) or {}
+        bridge = network_test.get("bridge", {}) or {}
+        env_out.update(
+            {
+                "SDN_ZONE": str(sdn.get("zone", "")),
+                "SDN_ZONE_TYPE": str(sdn.get("zone_type", "simple")),
+                "SDN_VNET": str(sdn.get("vnet", "")),
+                "SDN_RANGE": str(sdn.get("range", "")),
+                "SDN_GATEWAY": str(sdn.get("gateway", "")),
+                "SDN_IP": str(sdn.get("ip", "")),
+                "BRIDGE_TEST_IFACE": str(bridge.get("iface", "")),
+            }
+        )
+
+    return env_out
 
 
 def director_env(cfg: dict, dry_run: bool = False) -> dict:
@@ -362,6 +613,18 @@ def _print_summary(cfg: dict, dry_run: bool) -> None:
     print(f"  disk_size_mib:    {tier1['disk_size_mib']}")
     stemcell = str(tier1.get("stemcell_path", "")).strip() or os.environ.get("STEMCELL_PATH", "(not set)")
     print(f"  stemcell_path:    {stemcell}")
+    nt = tier1.get("network_test", {}) or {}
+    modes = nt.get("modes", []) or []
+    if modes:
+        sdn = nt.get("sdn", {}) or {}
+        bridge = nt.get("bridge", {}) or {}
+        print(f"  network_test:     modes={modes}")
+        if "sdn" in modes:
+            print(f"    sdn:            zone={sdn.get('zone')} vnet={sdn.get('vnet')} range={sdn.get('range')}")
+        if "bridge" in modes:
+            print(f"    bridge:         iface={bridge.get('iface')}")
+    else:
+        print("  network_test:     (disabled)")
     print()
     print("Tier 2 (bosh):")
     print(f"  bosh_env_alias:   {tier2.get('bosh_env_alias')}")

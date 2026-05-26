@@ -140,7 +140,29 @@ def tier_lifecycle(cfg: dict, cpi_config_path: str, keep: bool) -> int:
     else:
         t1_env = _integration.tier1_env(cfg, cpi_config_path, dry_run=False)
 
-    pools: list[str] = cfg.get("tier1", {}).get("disk_storage_pools", [])
+    raw_pools = cfg.get("tier1", {}).get("disk_storage_pools", [])
+    # Normalize to AUTO sentinel or an explicit list.
+    _auto = raw_pools == "auto" or raw_pools == ["auto"]
+    if _auto:
+        if _dry_run:
+            print("==> tier 1: would autodetect local disk storage pools (lvm/lvmthin/zfspool/dir)")
+            pools = []  # fall through to single-run path below
+        else:
+            try:
+                pools = _integration.detect_disk_storage_pools(cfg)
+            except RuntimeError as exc:
+                print(f"tier 1: autodetect error: {exc}", file=sys.stderr)
+                return 1
+            print(f"==> tier 1: autodetected disk storage pools: {pools}")
+            if not pools:
+                print(
+                    "tier 1: autodetect found no local image-capable disk storage",
+                    file=sys.stderr,
+                )
+                return 1
+    else:
+        pools = list(raw_pools)
+
     if not pools:
         rc = run(["./scripts/lifecycle"], env=t1_env, cwd=REPO_ROOT)
         if rc != 0:
@@ -167,6 +189,21 @@ def tier_lifecycle(cfg: dict, cpi_config_path: str, keep: bool) -> int:
             if rc != 0:
                 print(f"tier 1 failed: scripts/lifecycle [{pool}]", file=sys.stderr)
                 return 1
+
+    # Network-test passes: when tier1.network_test.modes is set, run one extra
+    # lifecycle pass per mode (sdn/bridge), injecting NETWORK_TEST_MODE so each
+    # pass exercises create_network/delete_network and its out-of-band PVE
+    # verification for that path. Kept independent of disk_storage_pools (no
+    # cross product) — these passes use the default CPI config. Empty/absent
+    # modes -> no extra passes (backward compatible).
+    modes: list[str] = cfg.get("tier1", {}).get("network_test", {}).get("modes", []) or []
+    for mode in modes:
+        print(f"==> tier 1: lifecycle pass (NETWORK_TEST_MODE={mode})")
+        mode_env = {**t1_env, "NETWORK_TEST_MODE": str(mode)}
+        rc = run(["./scripts/lifecycle"], env=mode_env, cwd=REPO_ROOT)
+        if rc != 0:
+            print(f"tier 1 failed: scripts/lifecycle (mode={mode})", file=sys.stderr)
+            return 1
 
     print("==> tier 1: lifecycle passed")
     return 0
