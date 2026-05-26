@@ -30,7 +30,9 @@ This CPI enables BOSH to provision and manage resources on PVE 9.x, implementing
 
 - [PVE Host Tuning](pve-host-tuning.md): Operator-side knobs (`pvedaemon` / `pveproxy` worker counts, storage layout) for sustained concurrent CPI workloads.
 
-- [Troubleshooting](troubleshooting.md): Solutions to common issues.
+- [Troubleshooting](troubleshooting.md): Symptom-first runbook for authentication, storage, networking, and agent failures; cross-references the deep-detail docs for each failure class.
+
+- [Operations Runbook](operations.md): Day-2 operations and diagnostics — log access, PVE-side inspection commands, pre- and post-deploy health checks, orphan and lock recovery, and how to file a bug report.
 
 - [Examples](examples.md): Sample BOSH deployment manifests and usage scenarios.
 
