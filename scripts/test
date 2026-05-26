@@ -30,6 +30,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -93,6 +94,40 @@ def run(
         print(f"{shlex.join(cmd)} timed out after {timeout}s", file=sys.stderr)
         return 1
     return result.returncode
+
+
+def run_with_retries(
+    cmd: list[str],
+    *,
+    cwd: Path | None = None,
+    timeout: int | None = None,
+    retries: int = 0,
+    delay: int = 10,
+    label: str = "",
+) -> int:
+    """Run *cmd* via run(), retrying on non-zero exit up to *retries* times.
+
+    Sleeps *delay* seconds between attempts. Used for CF smoke steps that race
+    a freshly-deployed Cloud Controller: the first write after deploy can hit a
+    transient "MySQL client is not connected" until CC's DB connection pool
+    warms up. Returns 0 on the first success, else the last non-zero rc.
+    """
+    attempts = retries + 1
+    rc = 0
+    for attempt in range(1, attempts + 1):
+        rc = run(cmd, cwd=cwd, timeout=timeout, check=False)
+        if rc == 0:
+            return 0
+        if attempt < attempts:
+            what = label or shlex.join(cmd)
+            print(
+                f"retry: {what} exited {rc} (attempt {attempt}/{attempts}); "
+                f"retrying in {delay}s",
+                file=sys.stderr,
+            )
+            if not _dry_run:
+                time.sleep(delay)
+    return rc
 
 
 # ---------------------------------------------------------------------------
@@ -379,27 +414,37 @@ def tier_cf(cfg: dict, cpi_config_path: str, keep: bool) -> int:
 
     sys_domain = _integration.system_domain(cfg, dry_run=_dry_run)
 
-    # (step_name, cmd, timeout) — smoke_timeout applied to cf push and curl.
-    steps_before_push: list[tuple[str, list[str], int | None]] = [
-        ("cf deploy",        ["./scripts/cf", "deploy"],                              None),
-        ("cf login",         ["./scripts/cf", "login"],                               None),
-        ("cf create-org",    ["cf", "create-org", smoke_org],                         None),
-        ("cf create-space",  ["cf", "create-space", smoke_space, "-o", smoke_org],    None),
-        ("cf target",        ["cf", "target", "-o", smoke_org, "-s", smoke_space],    None),
+    # (step_name, cmd, timeout, retries) — smoke_timeout applies to cf push.
+    # The cf CLI steps that touch the Cloud Controller get retries: the first
+    # writes after a fresh deploy can transiently fail with "MySQL client is
+    # not connected" until CC's DB connection pool warms up.
+    steps_before_push: list[tuple[str, list[str], int | None, int]] = [
+        ("cf deploy",        ["./scripts/cf", "deploy"],                              None,          0),
+        ("cf login",         ["./scripts/cf", "login"],                               None,          3),
+        ("cf create-org",    ["cf", "create-org", smoke_org],                         None,          6),
+        ("cf create-space",  ["cf", "create-space", smoke_space, "-o", smoke_org],    None,          3),
+        ("cf target",        ["cf", "target", "-o", smoke_org, "-s", smoke_space],    None,          2),
         ("cf push",          ["cf", "push", smoke_app,
-                              "-o", "ghcr.io/mccutchen/go-httpbin", "--wait"],        smoke_timeout),
+                              "-o", "ghcr.io/mccutchen/go-httpbin", "--wait"],        smoke_timeout, 1),
         ("cf map-route",     ["cf", "map-route", smoke_app,
-                              sys_domain, "--hostname", "smoke"],                     None),
+                              sys_domain, "--hostname", "smoke"],                     None,          2),
     ]
 
-    for step_name, cmd, step_timeout in steps_before_push:
-        rc = run(cmd, cwd=REPO_ROOT, timeout=step_timeout)
+    for step_name, cmd, step_timeout, step_retries in steps_before_push:
+        rc = run_with_retries(
+            cmd, cwd=REPO_ROOT, timeout=step_timeout, retries=step_retries, label=step_name
+        )
         if rc != 0:
             print(f"tier 3 failed: {step_name}", file=sys.stderr)
             return rc
 
+    # Route registration propagates asynchronously to the gorouter, so retry
+    # the smoke GET until the route is live (or the budget is exhausted).
     smoke_url = f"https://smoke.{sys_domain}/get"
-    rc = run(["curl", "-sf", smoke_url, "--insecure"], cwd=REPO_ROOT, timeout=smoke_timeout)
+    rc = run_with_retries(
+        ["curl", "-sf", smoke_url, "--insecure"],
+        cwd=REPO_ROOT, timeout=smoke_timeout, retries=6, label=f"curl {smoke_url}",
+    )
     if rc != 0:
         print(f"tier 3 failed: curl {smoke_url} (expected HTTP 200)", file=sys.stderr)
         return rc
