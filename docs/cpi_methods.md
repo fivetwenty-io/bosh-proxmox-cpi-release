@@ -424,6 +424,16 @@ If `metadata` contains a `tags` sub-object (map of `key: value`), the entries ar
 
 ## Network
 
+The CPI implements `create_network` and `delete_network` for BOSH managed
+networks. Two paths are available: **SDN** (PVE SDN vnets via the cluster API)
+and **bridge** (Linux bridges via the nodes API). The active path is selected
+by `network_mode` in config and by the `cloud_properties` keys present in the
+network spec. Most deployments that pre-configure networks in PVE do not use
+managed networks and these methods are never called; they are only invoked when
+the BOSH cloud-config marks a network as `managed: true`.
+
+---
+
 ### `create_network`
 
 **Type:** Optional v2
@@ -431,17 +441,77 @@ If `metadata` contains a `tags` sub-object (map of `key: value`), the entries ar
 **Args:**
 
 - `args[0]` (Hash): `network_spec`
-  - `type` (String): network type — required
-  - `cloud_properties` (Hash): IaaS-specific config — required
-  - `range` (String): CIDR range — optional
+  - `type` (String): `"manual"` or `"dynamic"` — required
+  - `range` (String): CIDR, e.g. `"10.0.0.0/24"` — optional
   - `gateway` (String): gateway IP — optional
   - `netmask_bits` (Integer): prefix length — optional
+  - `cloud_properties` (Hash): PVE-specific keys:
+    - `zone` (String): PVE SDN zone name; overrides `pve.sdn_zone` config
+    - `zone_type` (String): zone type used when the CPI creates the zone (`simple` | `vlan` | `qinq` | `vxlan` | `evpn`); overrides `pve.sdn_zone_type` config
+    - `vnet` (String): PVE vnet name — max 8 chars, `[a-z0-9]`; required for the SDN path
+    - `bridge` (String): Linux bridge interface name, e.g. `"vmbr1"`; required for the bridge path when `pve.network_bridge` is not set
+    - `node` (String): PVE node name for bridge operations; falls back to `pve.node` config
 
-**Returns:** `Array` — `[network_id, address_properties, cloud_properties]`
+**Returns:** `[network_id, address_properties, cloud_properties_out]`
 
-**Errors:** `Bosh::Clouds::CloudError` on PVE API failure
+| Element | SDN path | Bridge path |
+|---|---|---|
+| `network_id` | vnet name | bridge interface name |
+| `address_properties` | `{range, gateway, reserved: []}` | `{range, gateway, reserved: []}` |
+| `cloud_properties_out` | `{zone, vnet, bridge: <vnet>}` | `{bridge, node}` |
 
-**Notes:** Creates a named network resource in PVE. Many deployments do not use dynamic network creation; networks are typically pre-configured on the PVE host.
+Note: on the SDN path `bridge` equals `vnet` because PVE realizes a simple-zone
+vnet as a Linux bridge with the same name. The `bridge` key in
+`cloud_properties_out` is present so `create_vm` NIC attachment works without
+additional config.
+
+**Path selection:**
+
+The handler picks a path based on `pve.network_mode` (default `"auto"`):
+
+| `network_mode` | Path taken |
+|---|---|
+| `"sdn"` | Always SDN |
+| `"bridge"` | Always bridge |
+| `"auto"` | SDN when `cloud_properties.zone` or `cloud_properties.vnet` is set, or `pve.sdn_zone` is configured; bridge otherwise |
+
+**Behavior — SDN path:**
+
+1. Resolve zone: `cloud_properties.zone` → `pve.sdn_zone` → error if neither is set.
+2. Probe `GetSdnZones` for the zone. If absent and `pve.sdn_auto_manage_zone=true`, create the zone using the resolved `zone_type`. If absent and `sdn_auto_manage_zone=false`, return a `CloudError`.
+3. Probe `GetSdnVnets` for the vnet. If absent, call `CreateSdnVnets`. A 409 conflict (concurrent create) is treated as success.
+4. If `network_spec.range` is set, call `CreateSdnVnetsSubnets` with the CIDR and gateway. A 409 conflict is treated as success.
+5. Call `UpdateSdn` to commit staged SDN changes to the data plane.
+6. Return `[vnet, {range, gateway, reserved:[]}, {zone, vnet, bridge: vnet}]`.
+
+On apply failure the handler makes best-effort rollback (delete subnet, vnet, and zone if created in this call) before returning the error.
+
+**Behavior — bridge path:**
+
+1. Resolve node: `cloud_properties.node` → `pve.node` → error if neither is set.
+2. Call `CreateNetwork(node, {iface: bridge, type: "bridge", autostart: true})`. A 409 conflict (bridge already exists) is treated as success.
+3. Call `UpdateNetwork(node)` to reload the node's network configuration.
+4. Return `[bridge, {range, gateway, reserved:[]}, {bridge, node}]`.
+
+**Idempotency:**
+
+- SDN path: `GetSdnVnets` is probed before each create. Re-calling with the same `vnet` and `zone` returns the same result without error.
+- Bridge path: a 409 response from `CreateNetwork` is treated as success. `UpdateNetwork` is always called.
+
+**Zone lifecycle (SDN path, `sdn_auto_manage_zone=true`):**
+
+When `pve.sdn_auto_manage_zone=true` the CPI creates the SDN zone if it does
+not exist. The CPI does not track zone ownership between calls; instead it
+applies a stateless safety rule on deletion (see `delete_network` below).
+`create_network` is safe to retry regardless of the zone state.
+
+**Errors:**
+
+- `CloudError`: zone not found and `sdn_auto_manage_zone=false`
+- `CloudError`: `cloud_properties.vnet` missing or invalid (>8 chars, non-`[a-z0-9]` characters) on the SDN path
+- `CloudError`: neither `cloud_properties.zone`/`pve.sdn_zone` nor `cloud_properties.bridge`/`pve.network_bridge` is set and path cannot be determined
+- `CloudError`: target node not set for bridge path
+- `CloudError`: PVE API failure (zone create, vnet create, subnet create, `UpdateSdn`, bridge create, node reload)
 
 ---
 
@@ -451,13 +521,64 @@ If `metadata` contains a `tags` sub-object (map of `key: value`), the entries ar
 
 **Args:**
 
-- `args[0]` (String): `network_id` — from `create_network`
+- `args[0]` (String): `network_id` — the value returned as `network_id` by `create_network` (vnet name for SDN, bridge name for bridge)
 
 **Returns:** `null`
 
-**Errors:** `Bosh::Clouds::CloudError` on PVE API failure
+**Path selection:**
 
-**Notes:** Removes the named PVE network resource.
+`delete_network` receives only the `network_id` string. It probes
+`GetSdnVnets(network_id)` to determine the path: if the vnet is found the SDN
+path runs; if the probe returns 404 the bridge path runs.
+
+**Behavior — SDN path:**
+
+1. Probe `GetSdnVnets(network_id)`. If 404, return `null` (idempotent).
+2. Extract zone name from the vnet response.
+3. List and delete all subnets under the vnet (PVE requires subnets removed first). 404 on a subnet is treated as already-gone.
+4. Delete the vnet. 404 is treated as already-gone.
+5. Call `UpdateSdn` to commit the change.
+6. Evaluate zone auto-delete (see rule below). If conditions hold, delete the zone and call `UpdateSdn` again.
+7. Return `null`.
+
+**Behavior — bridge path:**
+
+1. Call `DeleteNetwork2(config.node, network_id)`. If 404, return `null` (idempotent).
+2. Call `UpdateNetwork(config.node)` to reload.
+3. Return `null`.
+
+The bridge path uses `pve.node` from config. Per-bridge node assignment is not
+stored between the `create_network` and `delete_network` calls; if `pve.node`
+is unset, `delete_network` returns a `CloudError` rather than silently
+succeeding with the bridge still present.
+
+**Idempotency:**
+
+Both paths are no-ops when the resource is already absent. `delete_network`
+can be called multiple times safely.
+
+**Zone auto-delete safety rule:**
+
+The CPI deletes the parent SDN zone during `delete_network` only when **all**
+of the following conditions hold:
+
+1. `pve.sdn_auto_manage_zone=true` (explicit opt-in; default `false`).
+2. The zone name does not equal `pve.sdn_zone` (the configured default zone is never auto-deleted).
+3. After the vnet is removed, `ListSdnVnets` filtered by zone returns zero remaining vnets.
+
+If `ListSdnVnets` fails, the zone is left intact rather than risking deletion
+of a zone that may still contain vnets.
+
+Residual risk: with `sdn_auto_manage_zone=true`, any zone supplied via
+`cloud_properties.zone` that differs from `pve.sdn_zone` will be deleted when
+emptied. Operators who share a zone across deployments must either set
+`pve.sdn_zone` to pin it or leave `sdn_auto_manage_zone=false` (the default).
+
+**Errors:**
+
+- `CloudError`: `pve.node` unset on the bridge path
+- `CloudError`: unexpected PVE API failure probing, deleting, or applying SDN changes
+- `CloudError`: unexpected PVE API failure deleting bridge or reloading node network
 
 ---
 

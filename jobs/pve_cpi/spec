@@ -76,10 +76,11 @@ properties:
   pve.sdn_auto_manage_zone:
     description: |
       When true, create_network creates the SDN zone (type sdn_zone_type)
-      if it does not already exist, and delete_network deletes the zone if
-      all conditions hold: CPI created it, it is not operator-pinned via
-      sdn_zone or cloud_properties.zone, and the zone has zero remaining
-      vnets. Default false — operator manages zones; CPI manages only vnets.
+      if it does not already exist, and delete_network deletes the zone when
+      ALL three conditions hold: (1) sdn_auto_manage_zone is true, (2) the
+      zone name does not equal pve.sdn_zone (the operator-pinned zone is never
+      auto-deleted), and (3) the zone has zero remaining vnets after the vnet
+      delete. Default false — operator manages zones; CPI manages only vnets.
     default: false
   pve.verify_ssl:
     description: "Verify TLS certificate"

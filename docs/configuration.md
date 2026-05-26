@@ -15,6 +15,10 @@ The CPI is configured via properties in a BOSH deployment manifest. The job temp
 | `pve.disk_storage` | Storage pool for persistent disks | - | yes |
 | `pve.stemcell_storage` | Storage pool for stemcell qcow2 images. Must be a file-based PVE storage (dir, nfs, cifs, glusterfs, cephfs) — block-based storages (lvm, lvmthin, zfspool, rbd) cannot accept qcow2 uploads. Must also be shared across cluster nodes when the cluster has more than one node. Defaults to `vm_storage`; in that case `vm_storage` must satisfy the same constraints. | `vm_storage` | no |
 | `pve.network_bridge` | Default network bridge | `vmbr0` | no |
+| `pve.network_mode` | Network creation mode for managed networks: `sdn`, `bridge`, or `auto` | `auto` | no |
+| `pve.sdn_zone` | Default PVE SDN zone for vnet placement. When empty, the zone must be supplied per-call in `cloud_properties.zone`. | `""` | no |
+| `pve.sdn_zone_type` | Zone type the CPI uses when creating a zone (`simple`, `vlan`, `qinq`, `vxlan`, `evpn`). Only relevant when `sdn_auto_manage_zone` is `true`. | `simple` | no |
+| `pve.sdn_auto_manage_zone` | When `true`, the CPI may create SDN zones on `create_network` and delete them on `delete_network` when all safety conditions are met. | `false` | no |
 | `pve.verify_ssl` | Verify TLS certificates | `true` | no |
 | `pve.agent_mode` | Agent bootstrap mode (`cloudinit`, `registry`, `noagent`) | `cloudinit` | no |
 | `pve.vm_disk_format` | Disk image format (`qcow2`, `raw`, `vmdk`) | `qcow2` | no |
@@ -44,6 +48,93 @@ The storage pool must have the `import` content type enabled. See [Proxmox VE Se
 Exactly one of `pve.password` or `pve.api_token` must be set. API tokens are preferred for production deployments; they support per-token revocation and per-token privilege separation in PVE 9.
 
 See [pve-api-permissions.md](pve-api-permissions.md) for token creation and the minimum-privilege `bosh@pve` user setup.
+
+## SDN Network Management
+
+When the Director's cloud-config marks a network as `managed: true`, the CPI calls `create_network` and `delete_network` to provision and remove the network resource. The CPI supports two backends: PVE SDN vnets and Linux bridges on a node.
+
+### Configuration Properties
+
+| Property | Description | Default |
+|---|---|---|
+| `pve.network_mode` | `sdn` — PVE SDN vnet lifecycle. `bridge` — Linux bridge lifecycle. `auto` — SDN when a zone is resolvable, bridge otherwise. | `auto` |
+| `pve.sdn_zone` | Default SDN zone name for vnet placement. Overridable per-call via `cloud_properties.zone`. | `""` (per-call) |
+| `pve.sdn_zone_type` | Zone type used when the CPI creates a zone. One of: `simple`, `vlan`, `qinq`, `vxlan`, `evpn`. | `simple` |
+| `pve.sdn_auto_manage_zone` | When `true`, the CPI may create and delete SDN zones. See zone lifecycle notes below. | `false` |
+
+### Prerequisites — SDN Mode
+
+1. PVE SDN must be enabled at the datacenter level. The **Datacenter > SDN** menu appears in PVE 7.2+ and requires `libpve-network-perl` installed on all cluster nodes.
+
+2. At least one SDN zone must exist before `create_network` is called, unless `sdn_auto_manage_zone: true` is set to let the CPI create it. The zone name must match `cloud_properties.zone` or `pve.sdn_zone`.
+
+3. The PVE API token or user must hold the `SDN.Allocate` privilege on `/sdn`.
+
+### Manifest Example — SDN Mode
+
+```yaml
+properties:
+  pve:
+    host: pve.example.com
+    user: root@pam
+    api_token: root@pam!bosh=<token>
+    node: pve1
+    vm_storage: local-lvm
+    disk_storage: local-lvm
+    network_bridge: vmbr0
+    network_mode: sdn
+    sdn_zone: boshzone
+    sdn_zone_type: simple
+    sdn_auto_manage_zone: false
+```
+
+Cloud-config managed network:
+
+```yaml
+networks:
+- name: bosh-net
+  type: manual
+  managed: true
+  cloud_properties:
+    zone: boshzone
+    vnet: boshvn
+  subnets:
+  - range: 10.200.0.0/24
+    gateway: 10.200.0.1
+```
+
+### Manifest Example — Bridge Mode
+
+```yaml
+properties:
+  pve:
+    network_mode: bridge
+    network_bridge: vmbr0
+```
+
+Cloud-config managed network:
+
+```yaml
+networks:
+- name: bosh-bridge
+  type: manual
+  managed: true
+  cloud_properties:
+    bridge: vmbr1
+  subnets:
+  - range: 10.201.0.0/24
+    gateway: 10.201.0.1
+```
+
+### Notes
+
+- Most deployments pre-configure networks and do not set `managed: true`. The `create_network` and `delete_network` handlers run only when the Director's cloud-config marks a network as managed.
+
+- `pve.network_bridge` remains required for `create_vm` NIC attachment regardless of `network_mode`. It is the default bridge VMs attach to at boot.
+
+- SDN changes are staged by the PVE API and committed by the CPI via a `PUT /cluster/sdn` apply call after each create or delete operation. This is PVE's two-phase commit model. On error, the CPI issues a rollback to clear any staged-but-unapplied changes.
+
+- Zone auto-deletion (`sdn_auto_manage_zone: true`) is opt-in and disabled by default. When enabled, `delete_network` removes the zone only when all three conditions hold: `sdn_auto_manage_zone` is `true`, the zone name does not match `pve.sdn_zone` (the operator-pinned default zone is never auto-deleted), and the zone has zero remaining vnets after the vnet is removed. Leave `sdn_auto_manage_zone: false` unless the CPI should own the full zone lifecycle.
 
 ## MBus fallback
 
