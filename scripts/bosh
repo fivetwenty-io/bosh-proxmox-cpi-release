@@ -15,6 +15,8 @@ Subcommands:
                            upload manifests/bosh/cloud-config.yml
     runtime-config         upload manifests/runtime-configs/pve-guest-agent.yml
                            (named runtime-config "pve-guest-agent")
+    upload-stemcell        upload $STEMCELL_PATH to the director (needed before
+                           emptyvm; idempotent for an already-present version)
     emptyvm                deploy manifests/bosh/emptyvm.yml
     credhub <args>         passthrough → credhub <args> with the director's
                            credhub URL, admin client, and CA pre-exported
@@ -194,6 +196,17 @@ def cmd_emptyvm(args: list[str]) -> int:
     )
 
 
+def cmd_upload_stemcell(args: list[str]) -> int:
+    stemcell = os.environ.get("STEMCELL_PATH", "").strip()
+    if not stemcell:
+        print("upload-stemcell: STEMCELL_PATH env var not set", file=sys.stderr)
+        return 1
+    # Idempotent: re-uploading an already-present stemcell version is a no-op.
+    return run(
+        "bosh", "-e", "pve", "-n", "upload-stemcell", stemcell, *args, env=director_env()
+    )
+
+
 def cmd_credhub(args: list[str]) -> int:
     return run("credhub", *args, env=credhub_env())
 
@@ -218,6 +231,7 @@ COMMANDS = {
     "ucc": cmd_ucc,
     "upload-cloud-config": cmd_ucc,
     "runtime-config": cmd_runtime_config,
+    "upload-stemcell": cmd_upload_stemcell,
     "emptyvm": cmd_emptyvm,
     "credhub": cmd_credhub,
     "help": cmd_help,

@@ -313,17 +313,24 @@ def tier_bosh(cfg: dict, cpi_config_path: str, keep: bool) -> int:
     if smoke_timeout is not None:
         smoke_timeout = int(smoke_timeout)
 
+    # emptyvm deploys a bare stemcell VM, so the director needs an uploaded
+    # stemcell first (create-env only stages the director's own VM). Resolve the
+    # same stemcell Tier 1 uses; a placeholder suffices under --dry-run.
+    sc_path = "<dry-run:stemcell>" if _dry_run else _integration.stemcell_path(cfg)
+
+    # (step_name, cmd, timeout, env)
     steps = [
-        ("create-env",      ["./scripts/bosh", "create-env"],     None),
-        ("alias-env",       ["./scripts/bosh", "alias-env"],      None),
-        ("ucc",             ["./scripts/bosh", "ucc"],             None),
-        ("runtime-config",  ["./scripts/bosh", "runtime-config"], None),
-        ("emptyvm",         ["./scripts/bosh", "emptyvm"],         smoke_timeout),
-        ("env",             ["./scripts/bosh", "env"],             None),
+        ("create-env",      ["./scripts/bosh", "create-env"],      None,          None),
+        ("alias-env",       ["./scripts/bosh", "alias-env"],       None,          None),
+        ("ucc",             ["./scripts/bosh", "ucc"],             None,          None),
+        ("runtime-config",  ["./scripts/bosh", "runtime-config"],  None,          None),
+        ("upload-stemcell", ["./scripts/bosh", "upload-stemcell"], None,          {"STEMCELL_PATH": sc_path}),
+        ("emptyvm",         ["./scripts/bosh", "emptyvm"],         smoke_timeout, None),
+        ("env",             ["./scripts/bosh", "env"],             None,          None),
     ]
 
-    for step_name, cmd, step_timeout in steps:
-        rc = run(cmd, cwd=REPO_ROOT, timeout=step_timeout)
+    for step_name, cmd, step_timeout, step_env in steps:
+        rc = run(cmd, env=step_env, cwd=REPO_ROOT, timeout=step_timeout)
         if rc != 0:
             print(f"tier 2 failed: {step_name}", file=sys.stderr)
             return rc

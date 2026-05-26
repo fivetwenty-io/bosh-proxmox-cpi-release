@@ -625,6 +625,27 @@ def detect_network_modes(cfg: dict) -> "list[dict]":
     )
 
 
+def stemcell_path(cfg: dict) -> str:
+    """Resolve the stemcell path used by Tier 1 (lifecycle) and Tier 2 (upload).
+
+    Resolution order:
+    1. cfg['tier1']['stemcell_path'] if non-empty.
+    2. STEMCELL_PATH environment variable.
+
+    Raises:
+        SystemExit: neither source provides a path.
+    """
+    tier1 = cfg.get("tier1", {})
+    stemcell = str(tier1.get("stemcell_path", "")).strip()
+    if not stemcell:
+        stemcell = os.environ.get("STEMCELL_PATH", "").strip()
+    if not stemcell:
+        sys.exit(
+            "stemcell_path not set in tier1 config and STEMCELL_PATH env var not set"
+        )
+    return stemcell
+
+
 def tier1_env(cfg: dict, cpi_config_path: "str | Path", dry_run: bool = False) -> dict:
     """Build the env dict required by scripts/lifecycle (Tier 1).
 
@@ -648,13 +669,7 @@ def tier1_env(cfg: dict, cpi_config_path: "str | Path", dry_run: bool = False) -
     """
     tier1 = cfg["tier1"]
 
-    stemcell = str(tier1.get("stemcell_path", "")).strip()
-    if not stemcell:
-        stemcell = os.environ.get("STEMCELL_PATH", "").strip()
-    if not stemcell:
-        sys.exit(
-            "stemcell_path not set in tier1 config and STEMCELL_PATH env var not set"
-        )
+    stemcell = stemcell_path(cfg)
 
     dns_raw = tier1.get("network_dns", ["8.8.8.8"])
     if not isinstance(dns_raw, list):
