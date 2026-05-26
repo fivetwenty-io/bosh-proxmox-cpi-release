@@ -26,6 +26,10 @@ COVERAGE_THRESHOLD := 80
 RELEASE_NAME := bosh-pve-cpi
 RELEASE_ARTIFACT_FIND := find . -type f \( -name 'coverage.*' -o -name '*.prof' -o -name '*.test' -o -name '*.tgz' \) -not -path './.git/*' -not -path './blobs/*' -not -path './.blobs/*' -not -path './$(SRC_ROOT)/vendor/*'
 
+# Go sources — prerequisites for bin/cpi so the binary rebuilds whenever any
+# source, go.mod, or go.sum changes (the bare target never rebuilt once built).
+GO_SOURCES := $(shell find $(SRC_ROOT) -type f -name '*.go' -not -path '*/vendor/*' 2>/dev/null)
+
 # BOSH release blob config
 BLOBS_DIR    := blobs
 GO_BLOB_VER  := 1.26.3
@@ -47,7 +51,7 @@ help: ## Display this help message
 .PHONY: build
 build: bin/cpi ## Build CPI binary (alias for bin/cpi)
 
-bin/cpi: ## Build CPI binary to bin/cpi with version ldflags
+bin/cpi: $(GO_SOURCES) $(SRC_ROOT)/go.mod $(SRC_ROOT)/go.sum ## Build CPI binary to bin/cpi with version ldflags
 	@echo "$(GREEN)Building bin/cpi $(VERSION)...$(RESET)"
 	@mkdir -p bin
 	@cd $(SRC_ROOT) && go build -ldflags "$(LDFLAGS)" -o ../../bin/cpi ./cmd/cpi
