@@ -358,9 +358,15 @@ def tier_bosh(cfg: dict, cpi_config_path: str, keep: bool) -> int:
     sc_path = "<dry-run:stemcell>" if _dry_run else _integration.stemcell_path(cfg)
 
     # (step_name, cmd, timeout, env)
+    # resurrection-off: keep the Health Monitor's resurrector from racing the
+    # deploys. On a lab with intermittent NATS request/reply hiccups a single
+    # missed get_state makes HM declare a (healthy) VM unresponsive and launch
+    # 'scan and fix', which grabs the deployment lock and fails the in-flight
+    # deploy. Tests own the lifecycle, so disable resurrection up front.
     steps = [
-        ("create-env",      ["./scripts/bosh", "create-env"],      None,          None),
-        ("alias-env",       ["./scripts/bosh", "alias-env"],       None,          None),
+        ("create-env",       ["./scripts/bosh", "create-env"],                None, None),
+        ("alias-env",        ["./scripts/bosh", "alias-env"],                 None, None),
+        ("resurrection-off", ["./scripts/bosh", "update-resurrection", "off"], None, None),
         ("ucc",             ["./scripts/bosh", "ucc"],             None,          None),
         ("runtime-config",  ["./scripts/bosh", "runtime-config"],  None,          None),
         ("upload-stemcell", ["./scripts/bosh", "upload-stemcell"], None,          {"STEMCELL_PATH": sc_path}),
@@ -419,7 +425,14 @@ def tier_cf(cfg: dict, cpi_config_path: str, keep: bool) -> int:
     # writes after a fresh deploy can transiently fail with "MySQL client is
     # not connected" until CC's DB connection pool warms up.
     steps_before_push: list[tuple[str, list[str], int | None, int]] = [
-        ("cf deploy",        ["./scripts/cf", "deploy"],                              None,          0),
+        # See tier_bosh: disable resurrection so HM does not grab the cf
+        # deployment lock on a transient missed heartbeat. (Idempotent; also
+        # covers a standalone `integration cf` run.)
+        ("resurrection-off", ["./scripts/bosh", "update-resurrection", "off"],        None,          1),
+        # cf deploy gets one retry: an intermittent get_state timeout to a
+        # healthy instance can fail an otherwise-fine deploy, and re-running
+        # the idempotent deploy resumes from where it left off.
+        ("cf deploy",        ["./scripts/cf", "deploy"],                              None,          1),
         ("cf login",         ["./scripts/cf", "login"],                               None,          3),
         ("cf create-org",    ["cf", "create-org", smoke_org],                         None,          6),
         ("cf create-space",  ["cf", "create-space", smoke_space, "-o", smoke_org],    None,          3),
