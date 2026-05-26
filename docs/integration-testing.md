@@ -19,7 +19,7 @@ flowchart LR
 | Tier | Name | What it does | Infrastructure required |
 |------|------|-------------|------------------------|
 | 0 | Unit | `make check` — go vet, staticcheck, go test | None |
-| 1 | Lifecycle | CPI binary roundtrip: create stemcell, (optionally) create network, create VM, attach/resize/update/snapshot disk, reboot VM (soft + hard), delete all resources. Each major step is additionally verified out-of-band against the PVE REST API (real cluster state, not just CPI return values) | Live PVE cluster, lab network (192.168.1.x) |
+| 1 | Lifecycle | CPI binary roundtrip: create stemcell, (optionally) create network, create VM, attach disk, then exercise has_disk, set_disk_metadata, resize_disk, update_disk, and snapshot disk, reboot VM (soft + hard), delete all resources (has_disk re-checked false after delete). Each major step is additionally verified out-of-band against the PVE REST API (real cluster state, not just CPI return values) | Live PVE cluster, lab network (192.168.1.x) |
 | 2 | BOSH | `bosh create-env` full director deploy, cloud/runtime-config upload, `emptyvm` smoke deployment, director health assertion | Live PVE cluster, lab network |
 | 3 | CF | CF deployment via `scripts/cf deploy`, smoke app push (go-httpbin), map-route, HTTP 200 assertion | Live PVE cluster, lab network, routable system domain |
 
