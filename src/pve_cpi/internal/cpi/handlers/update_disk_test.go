@@ -121,12 +121,13 @@ func updateClusterWith(vmid int) sdkclusterapi.Service {
 
 func TestHandleUpdateDisk_OptionsOnly(t *testing.T) {
 	const diskCID = "local-lvm:vm-9001-disk-0"
-	const volid = "vm-9001-disk-0"
+	const volid = "local-lvm:vm-9001-disk-0"
 
 	var capturedOptStr string
 
-	// configFn: calls 1-2 return bare volid (for findVMByDiskVolid + ResolveDiskID).
-	// call 3+ returns full option string (for reading existing options to merge).
+	// configFn: calls 1-2 return the canonical volid (for FindVMByDiskVolid +
+	// ResolveDiskID, which match the full "<storage>:<volume>" form PVE stores).
+	// call 3+ returns the full option string (for reading existing options to merge).
 	callCount := 0
 	qemuSvc := &updateDiskQEMUService{
 		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
@@ -171,12 +172,12 @@ func TestHandleUpdateDisk_OptionsOnly(t *testing.T) {
 
 func TestHandleUpdateDisk_SizeOnly(t *testing.T) {
 	const diskCID = "local-lvm:vm-9001-disk-0"
-	const volid = "vm-9001-disk-0"
+	const volid = "local-lvm:vm-9001-disk-0"
 
 	var capturedDelta int
 	var attachCalled bool
 
-	// calls 1-2: bare volid; call 3+: option string with size (for resize).
+	// calls 1-2: canonical volid; call 3+: option string with size (for resize).
 	callCount2 := 0
 	qemuSvc := &updateDiskQEMUService{
 		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
@@ -215,7 +216,7 @@ func TestHandleUpdateDisk_SizeOnly(t *testing.T) {
 
 func TestHandleUpdateDisk_CombinedSizeAndOptions(t *testing.T) {
 	const diskCID = "local-lvm:vm-9001-disk-0"
-	const volid = "vm-9001-disk-0"
+	const volid = "local-lvm:vm-9001-disk-0"
 
 	var resizeCalled bool
 	var attachCalled bool
@@ -258,7 +259,7 @@ func TestHandleUpdateDisk_CombinedSizeAndOptions(t *testing.T) {
 func TestHandleUpdateDisk_EmptySpec_NoOp(t *testing.T) {
 	// Empty spec → no resize, no AttachDisk.
 	const diskCID = "local-lvm:vm-9001-disk-0"
-	const volid = "vm-9001-disk-0"
+	const volid = "local-lvm:vm-9001-disk-0"
 
 	var attachCalled bool
 
@@ -305,7 +306,7 @@ func TestHandleUpdateDisk_DetachedDisk(t *testing.T) {
 
 func TestHandleUpdateDisk_ShrinkRejected(t *testing.T) {
 	const diskCID = "local-lvm:vm-9001-disk-0"
-	const volid = "vm-9001-disk-0"
+	const volid = "local-lvm:vm-9001-disk-0"
 
 	callCount4 := 0
 	qemuSvc := &updateDiskQEMUService{
@@ -347,7 +348,7 @@ func TestHandleUpdateDisk_TooFewArgs(t *testing.T) {
 
 func TestHandleUpdateDisk_IOThreadFalseRemovesOption(t *testing.T) {
 	const diskCID = "local-lvm:vm-9001-disk-0"
-	const volid = "vm-9001-disk-0"
+	const volid = "local-lvm:vm-9001-disk-0"
 
 	var capturedOptStr string
 
@@ -382,7 +383,7 @@ func TestHandleUpdateDisk_IOThreadFalseRemovesOption(t *testing.T) {
 
 func TestHandleUpdateDisk_AttachSDKError(t *testing.T) {
 	const diskCID = "local-lvm:vm-9001-disk-0"
-	const volid = "vm-9001-disk-0"
+	const volid = "local-lvm:vm-9001-disk-0"
 
 	callCount8 := 0
 	qemuSvc := &updateDiskQEMUService{
@@ -409,7 +410,7 @@ func TestHandleUpdateDisk_AttachSDKError(t *testing.T) {
 
 func TestHandleUpdateDisk_ResizeWithUpid(t *testing.T) {
 	const diskCID = "local-lvm:vm-9001-disk-0"
-	const volid = "vm-9001-disk-0"
+	const volid = "local-lvm:vm-9001-disk-0"
 
 	var waitCalled bool
 	tasksSvc := &mockTasksService{
@@ -448,7 +449,7 @@ func TestHandleUpdateDisk_ResizeWithUpid(t *testing.T) {
 func TestHandleUpdateDisk_PreservesExistingOptions(t *testing.T) {
 	// Existing options not in update_spec must be preserved in the merged string.
 	const diskCID = "local-lvm:vm-9001-disk-0"
-	const volid = "vm-9001-disk-0"
+	const volid = "local-lvm:vm-9001-disk-0"
 
 	var capturedOptStr string
 
@@ -487,7 +488,7 @@ func TestHandleUpdateDisk_PreservesExistingOptions(t *testing.T) {
 func TestHandleUpdateDisk_BandwidthIOPS(t *testing.T) {
 	// Exercises mbps_rd, mbps_wr, iops_rd, iops_wr option fields.
 	const diskCID = "local-lvm:vm-9001-disk-0"
-	const volid = "vm-9001-disk-0"
+	const volid = "local-lvm:vm-9001-disk-0"
 
 	var capturedOptStr string
 
@@ -526,7 +527,7 @@ func TestHandleUpdateDisk_BandwidthIOPS(t *testing.T) {
 func TestHandleUpdateDisk_SSDAndBackup(t *testing.T) {
 	// Exercises ssd and backup bool options.
 	const diskCID = "local-lvm:vm-9001-disk-0"
-	const volid = "vm-9001-disk-0"
+	const volid = "local-lvm:vm-9001-disk-0"
 
 	var capturedOptStr string
 
@@ -564,7 +565,7 @@ func TestHandleUpdateDisk_SSDAndBackup(t *testing.T) {
 func TestHandleUpdateDisk_NullSpec_NoOp(t *testing.T) {
 	// Null update_spec (JSON null) → treated as empty map → no-op.
 	const diskCID = "local-lvm:vm-9001-disk-0"
-	const volid = "vm-9001-disk-0"
+	const volid = "local-lvm:vm-9001-disk-0"
 
 	qemuSvc := &updateDiskQEMUService{
 		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
@@ -591,14 +592,14 @@ func TestHandleUpdateDisk_NullSpec_NoOp(t *testing.T) {
 // error (gap #12).
 func TestHandleUpdateDisk_ConfigReadError(t *testing.T) {
 	const diskCID = "local-lvm:vm-9001-disk-0"
-	const volid = "vm-9001-disk-0"
+	const volid = "local-lvm:vm-9001-disk-0"
 
 	configCallCount := 0
 	qemuSvc := &updateDiskQEMUService{
 		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
 			configCallCount++
 			if configCallCount <= 2 {
-				// Calls 1-2: FindVMByDiskVolid + ResolveDiskID — return bare volid.
+				// Calls 1-2: FindVMByDiskVolid + ResolveDiskID — return canonical volid.
 				return map[string]interface{}{"scsi2": volid}, nil
 			}
 			// Call 3: option read for merge — inject failure.
@@ -623,14 +624,14 @@ func TestHandleUpdateDisk_ConfigReadError(t *testing.T) {
 // must propagate it (gap #13).
 func TestHandleUpdateDisk_ResolveDiskIDError(t *testing.T) {
 	const diskCID = "local-lvm:vm-9001-disk-0"
-	const volid = "vm-9001-disk-0"
+	const volid = "local-lvm:vm-9001-disk-0"
 
 	configCallCount := 0
 	qemuSvc := &updateDiskQEMUService{
 		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
 			configCallCount++
 			if configCallCount == 1 {
-				// Call 1: FindVMByDiskVolid — returns bare volid so VM is located.
+				// Call 1: FindVMByDiskVolid — returns canonical volid so VM is located.
 				return map[string]interface{}{"scsi2": volid}, nil
 			}
 			// Call 2: ResolveDiskID config fetch — inject failure.
@@ -651,7 +652,7 @@ func TestHandleUpdateDisk_ResolveDiskIDError(t *testing.T) {
 // number). toInt() returns false → handler returns a descriptive error (gap #15).
 func TestHandleUpdateDisk_SizeWrongType(t *testing.T) {
 	const diskCID = "local-lvm:vm-9001-disk-0"
-	const volid = "vm-9001-disk-0"
+	const volid = "local-lvm:vm-9001-disk-0"
 
 	configCallCount := 0
 	qemuSvc := &updateDiskQEMUService{
@@ -699,7 +700,7 @@ func TestHandleUpdateDisk_EmptyDiskCID(t *testing.T) {
 // and applies option updates normally.
 func TestHandleUpdateDisk_Dir_CID(t *testing.T) {
 	const diskCID = "local:9001/vm-9001-disk-0.raw"
-	const volid = "9001/vm-9001-disk-0.raw"
+	const volid = "local:9001/vm-9001-disk-0.raw"
 
 	var capturedOptStr string
 
@@ -739,7 +740,7 @@ func TestHandleUpdateDisk_Dir_CID(t *testing.T) {
 // zfspool CID passes through the same path as lvm.
 func TestHandleUpdateDisk_ZFSPool_CID(t *testing.T) {
 	const diskCID = "local-zfs:vm-9001-disk-0"
-	const volid = "vm-9001-disk-0"
+	const volid = "local-zfs:vm-9001-disk-0"
 
 	var capturedOptStr string
 

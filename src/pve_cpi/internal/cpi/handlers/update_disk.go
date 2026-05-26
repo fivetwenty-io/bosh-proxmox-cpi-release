@@ -78,10 +78,12 @@ func HandleUpdateDisk(deps Deps) Handler {
 		}
 
 		// ----------------------------------------------------------------
-		// 2. Parse disk_cid → volid.
+		// 2. Validate disk_cid format. The locator and diskID resolver match
+		//    against the full canonical "<storage>:<volume>" form that PVE
+		//    stores in the VM config (e.g. "data:vm-9559-disk-0,size=2G"), so
+		//    pass diskCID through — NOT the storage-stripped volume part.
 		// ----------------------------------------------------------------
-		_, volid, err := pve.ParseDiskCID(diskCID)
-		if err != nil {
+		if _, _, err := pve.ParseDiskCID(diskCID); err != nil {
 			return nil, cpierrors.DiskNotFound(diskCID)
 		}
 
@@ -90,7 +92,7 @@ func HandleUpdateDisk(deps Deps) Handler {
 		//    Detached disk → CloudError. FindVMByDiskVolid uses a cluster
 		//    scan, so update_disk works across nodes in a cluster deploy.
 		// ----------------------------------------------------------------
-		vmid, node, vmErr := pve.FindVMByDiskVolid(ctx, deps.PVE, deps.Config.Node, volid)
+		vmid, node, vmErr := pve.FindVMByDiskVolid(ctx, deps.PVE, deps.Config.Node, diskCID)
 		if vmErr != nil {
 			// Distinguish "not attached to any VM" from other errors.
 			return nil, cpierrors.Cloud(
@@ -98,7 +100,7 @@ func HandleUpdateDisk(deps Deps) Handler {
 			)
 		}
 
-		diskID, err := pve.ResolveDiskID(ctx, deps.PVE, node, vmid, volid)
+		diskID, err := pve.ResolveDiskID(ctx, deps.PVE, node, vmid, diskCID)
 		if err != nil {
 			return nil, fmt.Errorf("update_disk: cannot resolve diskID for %s on VM %d: %w", diskCID, vmid, err)
 		}
