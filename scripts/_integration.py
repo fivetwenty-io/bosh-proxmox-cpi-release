@@ -138,6 +138,8 @@ def build_cpi_config(
     *,
     dry_run: bool = False,
     disk_storage_override: "str | None" = None,
+    sdn_zone: "str | None" = None,
+    sdn_auto_manage_zone: "bool | None" = None,
 ) -> dict:
     """Build and return the CPI config dict from cfg without writing any file.
 
@@ -227,6 +229,13 @@ def build_cpi_config(
         cpi_cfg["api_token"] = api_token
         cpi_cfg["password"] = password
 
+    # Optional SDN knobs (set by the auto network-mode detection for sdn passes).
+    # Omitted by default so non-network runs keep the existing config shape.
+    if sdn_zone is not None:
+        cpi_cfg["sdn_zone"] = sdn_zone
+    if sdn_auto_manage_zone is not None:
+        cpi_cfg["sdn_auto_manage_zone"] = sdn_auto_manage_zone
+
     return cpi_cfg
 
 
@@ -236,6 +245,8 @@ def write_cpi_config(
     dry_run: bool = False,
     *,
     disk_storage_override: "str | None" = None,
+    sdn_zone: "str | None" = None,
+    sdn_auto_manage_zone: "bool | None" = None,
 ) -> str:
     """Synthesize the CPI JSON config and write it to out_path.
 
@@ -259,7 +270,13 @@ def write_cpi_config(
     Raises:
         SystemExit: bosh int fails for any required var, or out_path not writable.
     """
-    cpi_cfg = build_cpi_config(cfg, dry_run=dry_run, disk_storage_override=disk_storage_override)
+    cpi_cfg = build_cpi_config(
+        cfg,
+        dry_run=dry_run,
+        disk_storage_override=disk_storage_override,
+        sdn_zone=sdn_zone,
+        sdn_auto_manage_zone=sdn_auto_manage_zone,
+    )
 
     if dry_run:
         return str(out_path)
@@ -320,28 +337,33 @@ def select_local_disk_pools(
     return sorted(result)
 
 
-def fetch_storage_index(cpi_cfg: dict) -> "list[dict]":
-    """Query PVE /api2/json/storage and return the data array.
+def pve_api_get(cpi_cfg: dict, path: str, *, allow_missing: bool = False) -> "Any":
+    """GET an arbitrary PVE API path and return the parsed ``data`` field.
 
-    Auth:
-    - If ``cpi_cfg["api_token"]`` is set and not a ``<dry-run:`` placeholder,
-      sends ``Authorization: PVEAPIToken=<token>`` header.
-    - Else if ``cpi_cfg["password"]`` is set, authenticates via
-      POST /api2/json/access/ticket and uses the resulting cookie.
+    Auth (reused from cpi_cfg):
+    - ``api_token`` set and not a ``<dry-run:`` placeholder -> sends
+      ``Authorization: PVEAPIToken=<token>`` header.
+    - Else ``password`` set -> POST /access/ticket, then GET with the cookie.
     - Otherwise raises RuntimeError (no usable credentials).
 
     TLS verification is always disabled (verify_ssl is always False in the
     test harness).
 
     Args:
-        cpi_cfg: CPI config dict as returned by build_cpi_config.
+        cpi_cfg:       CPI config dict as returned by build_cpi_config.
+        path:          API path beginning with '/', e.g. '/storage' or
+                       '/cluster/sdn/zones'.
+        allow_missing: When True, a 404/501 response (endpoint absent — e.g. SDN
+                       not installed) returns None instead of raising. Other
+                       errors still raise.
 
     Returns:
-        List of storage entry dicts from PVE (``response["data"]``).
+        The parsed ``response["data"]`` value, or None when allow_missing and the
+        endpoint is absent.
 
     Raises:
-        RuntimeError: HTTP error, network error, JSON parse error, or
-                      unexpected response structure.
+        RuntimeError: HTTP error, network error, JSON parse error, or missing
+                      credentials.
     """
     host = cpi_cfg["host"]
     port = cpi_cfg.get("port", 8006)
@@ -359,31 +381,14 @@ def fetch_storage_index(cpi_cfg: dict) -> "list[dict]":
     is_token_placeholder = bool(api_token and api_token.startswith("<dry-run:"))
     is_password_placeholder = bool(password and password.startswith("<dry-run:"))
 
+    extra_headers: "dict[str, str]" = {}
     if api_token and not is_token_placeholder:
-        # Token auth: single GET with Authorization header.
-        headers = {"Authorization": f"PVEAPIToken={api_token}"}
-        req = urllib.request.Request(f"{base_url}/storage", headers=headers)
-        try:
-            with urllib.request.urlopen(req, context=ctx, timeout=timeout) as resp:
-                raw = resp.read().decode("utf-8")
-        except urllib.error.HTTPError as exc:
-            raise RuntimeError(
-                f"PVE storage index request to {host}:{port} failed: HTTP {exc.code} {exc.reason}"
-            ) from exc
-        except urllib.error.URLError as exc:
-            raise RuntimeError(
-                f"PVE storage index request to {host}:{port} failed: {exc.reason}"
-            ) from exc
-
+        extra_headers["Authorization"] = f"PVEAPIToken={api_token}"
     elif password and not is_password_placeholder:
-        # Password auth: POST to /access/ticket, then GET /storage with cookie.
+        # Password auth: POST to /access/ticket, then use the cookie.
         ticket_url = f"{base_url}/access/ticket"
         body = urllib.parse.urlencode({"username": cpi_cfg["user"], "password": password}).encode()
-        ticket_req = urllib.request.Request(
-            ticket_url,
-            data=body,
-            method="POST",
-        )
+        ticket_req = urllib.request.Request(ticket_url, data=body, method="POST")
         try:
             with urllib.request.urlopen(ticket_req, context=ctx, timeout=timeout) as resp:
                 ticket_raw = resp.read().decode("utf-8")
@@ -395,7 +400,6 @@ def fetch_storage_index(cpi_cfg: dict) -> "list[dict]":
             raise RuntimeError(
                 f"PVE ticket auth to {host}:{port} failed: {exc.reason}"
             ) from exc
-
         try:
             ticket_resp = json.loads(ticket_raw)
             ticket = ticket_resp["data"]["ticket"]
@@ -404,45 +408,60 @@ def fetch_storage_index(cpi_cfg: dict) -> "list[dict]":
             raise RuntimeError(
                 f"PVE ticket response from {host}:{port} missing expected fields: {exc}"
             ) from exc
-
-        storage_req = urllib.request.Request(
-            f"{base_url}/storage",
-            headers={
-                "Cookie": f"PVEAuthCookie={ticket}",
-                "CSRFPreventionToken": csrf,
-            },
-        )
-        try:
-            with urllib.request.urlopen(storage_req, context=ctx, timeout=timeout) as resp:
-                raw = resp.read().decode("utf-8")
-        except urllib.error.HTTPError as exc:
-            raise RuntimeError(
-                f"PVE storage index request to {host}:{port} failed: HTTP {exc.code} {exc.reason}"
-            ) from exc
-        except urllib.error.URLError as exc:
-            raise RuntimeError(
-                f"PVE storage index request to {host}:{port} failed: {exc.reason}"
-            ) from exc
-
+        extra_headers["Cookie"] = f"PVEAuthCookie={ticket}"
+        extra_headers["CSRFPreventionToken"] = csrf
     else:
         raise RuntimeError(
-            f"No usable credentials for PVE storage index at {host}:{port}: "
+            f"No usable credentials for PVE API at {host}:{port}: "
             "set pve_api_token or pve_password in bosh_vars."
         )
 
+    req = urllib.request.Request(f"{base_url}{path}", headers=extra_headers)
     try:
-        parsed = json.loads(raw)
-        data = parsed["data"]
-    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        with urllib.request.urlopen(req, context=ctx, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        if allow_missing and exc.code in (404, 501):
+            return None
         raise RuntimeError(
-            f"Unexpected PVE storage index response from {host}:{port}: {exc}"
+            f"PVE GET {path} on {host}:{port} failed: HTTP {exc.code} {exc.reason}"
+        ) from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(
+            f"PVE GET {path} on {host}:{port} failed: {exc.reason}"
         ) from exc
 
+    try:
+        parsed = json.loads(raw)
+        return parsed["data"]
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise RuntimeError(
+            f"Unexpected PVE response for {path} from {host}:{port}: {exc}"
+        ) from exc
+
+
+def fetch_storage_index(cpi_cfg: dict) -> "list[dict]":
+    """Query PVE /storage and return the data array.
+
+    Thin wrapper over pve_api_get; see it for auth details.
+
+    Args:
+        cpi_cfg: CPI config dict as returned by build_cpi_config.
+
+    Returns:
+        List of storage entry dicts from PVE (``response["data"]``).
+
+    Raises:
+        RuntimeError: HTTP error, network error, JSON parse error, or
+                      unexpected response structure.
+    """
+    host = cpi_cfg["host"]
+    port = cpi_cfg.get("port", 8006)
+    data = pve_api_get(cpi_cfg, "/storage")
     if not isinstance(data, list):
         raise RuntimeError(
             f"PVE storage index data from {host}:{port} is not a list (got {type(data).__name__})"
         )
-
     return data
 
 
@@ -464,6 +483,138 @@ def detect_disk_storage_pools(cfg: dict) -> "list[str]":
     cpi_cfg = build_cpi_config(cfg, dry_run=False)
     entries = fetch_storage_index(cpi_cfg)
     return select_local_disk_pools(entries)
+
+
+# ---------------------------------------------------------------------------
+# Network mode detection
+# ---------------------------------------------------------------------------
+
+
+def select_network_modes(
+    *,
+    sdn_installed: bool,
+    existing_zones: "list[str]",
+    sdn_cfg: dict,
+    bridge_iface: str,
+    bridge_exists: bool,
+) -> "list[dict]":
+    """Decide which network-test passes to run from detected capabilities.
+
+    Pure function (no I/O) so it is unit-testable. Returns a list of pass
+    descriptors, each a dict with:
+
+        mode  — "sdn" or "bridge" (value for NETWORK_TEST_MODE)
+        env   — extra env vars to inject for that pass (e.g. SDN_ZONE)
+        cpi   — CPI-config overrides for that pass (sdn_zone / sdn_auto_manage_zone);
+                empty dict means reuse the default synthesized CPI config
+
+    Policy ("both whenever possible"):
+      - bridge: always runnable on any node, so included whenever a target iface
+        is configured AND not already present (we never create+delete a bridge
+        we do not own).
+      - sdn: included only when SDN is installed, the lifecycle SDN parameters
+        (vnet/range/gateway/ip) are configured, and a usable zone is resolvable:
+          * configured zone that already exists -> reuse it (pin sdn_zone, leave
+            auto-manage OFF so delete_network never removes a pre-existing zone);
+          * no configured zone but zones exist -> adopt the first (same pin);
+          * configured zone that is absent -> create+teardown it (auto-manage ON,
+            sdn_zone left unset so the teardown pin-rule does not block deletion).
+        When SDN is installed but no zone is resolvable, sdn is skipped.
+    """
+    passes: "list[dict]" = []
+
+    if bridge_iface and not bridge_exists:
+        passes.append({"mode": "bridge", "env": {}, "cpi": {}})
+
+    if sdn_installed:
+        params_ok = all(str(sdn_cfg.get(k, "")).strip() for k in ("vnet", "range", "gateway", "ip"))
+        if params_ok:
+            zone_cfg = str(sdn_cfg.get("zone", "")).strip()
+            if zone_cfg and zone_cfg in existing_zones:
+                passes.append({
+                    "mode": "sdn",
+                    "env": {"SDN_ZONE": zone_cfg},
+                    "cpi": {"sdn_zone": zone_cfg, "sdn_auto_manage_zone": False},
+                })
+            elif not zone_cfg and existing_zones:
+                adopted = sorted(existing_zones)[0]
+                passes.append({
+                    "mode": "sdn",
+                    "env": {"SDN_ZONE": adopted},
+                    "cpi": {"sdn_zone": adopted, "sdn_auto_manage_zone": False},
+                })
+            elif zone_cfg:
+                # Configured zone is absent — create and tear it down ourselves.
+                passes.append({
+                    "mode": "sdn",
+                    "env": {"SDN_ZONE": zone_cfg},
+                    "cpi": {"sdn_auto_manage_zone": True},
+                })
+            # else: no zone configured and none exist -> cannot run sdn; skip.
+
+    return passes
+
+
+def detect_network_modes(cfg: dict) -> "list[dict]":
+    """Autodetect runnable network-test passes against the live PVE host.
+
+    Probes the PVE API for SDN availability + existing zones and whether the
+    configured bridge iface already exists, then delegates the decision to
+    select_network_modes.
+
+    Args:
+        cfg: Validated config dict from load_config.
+
+    Returns:
+        List of pass descriptors (see select_network_modes).
+
+    Raises:
+        RuntimeError: Network error, auth failure, or malformed response from a
+                      probe that is expected to succeed (SDN-absent is handled
+                      gracefully via allow_missing, not an error).
+    """
+    tier1 = cfg["tier1"]
+    nt = tier1.get("network_test", {}) or {}
+    sdn_cfg = nt.get("sdn", {}) or {}
+    bridge_cfg = nt.get("bridge", {}) or {}
+    bridge_iface = str(bridge_cfg.get("iface", "")).strip()
+
+    cpi_cfg = build_cpi_config(cfg, dry_run=False)
+    node = str(cpi_cfg.get("node", "")).strip()
+
+    # SDN capability: a present /cluster/sdn/zones endpoint means SDN is
+    # installed; allow_missing maps 404/501 (not installed) to None.
+    zones_data = pve_api_get(cpi_cfg, "/cluster/sdn/zones", allow_missing=True)
+    sdn_installed = zones_data is not None
+    existing_zones: "list[str]" = []
+    if isinstance(zones_data, list):
+        existing_zones = [
+            str(e["zone"]) for e in zones_data if isinstance(e, dict) and e.get("zone")
+        ]
+
+    # Bridge capability: is the configured iface already present on the node?
+    # Without a node we cannot create a bridge anyway — treat as blocked so the
+    # selector skips bridge rather than attempting a doomed create.
+    bridge_exists = False
+    if bridge_iface:
+        if not node:
+            bridge_exists = True
+        else:
+            net_data = pve_api_get(
+                cpi_cfg, f"/nodes/{urllib.parse.quote(node)}/network", allow_missing=True
+            )
+            if isinstance(net_data, list):
+                bridge_exists = any(
+                    isinstance(e, dict) and e.get("iface") == bridge_iface for e in net_data
+                )
+
+    return select_network_modes(
+        sdn_installed=sdn_installed,
+        existing_zones=existing_zones,
+        sdn_cfg=sdn_cfg,
+        bridge_iface=bridge_iface,
+        bridge_exists=bridge_exists,
+    )
 
 
 def tier1_env(cfg: dict, cpi_config_path: "str | Path", dry_run: bool = False) -> dict:

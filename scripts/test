@@ -190,17 +190,59 @@ def tier_lifecycle(cfg: dict, cpi_config_path: str, keep: bool) -> int:
                 print(f"tier 1 failed: scripts/lifecycle [{pool}]", file=sys.stderr)
                 return 1
 
-    # Network-test passes: when tier1.network_test.modes is set, run one extra
-    # lifecycle pass per mode (sdn/bridge), injecting NETWORK_TEST_MODE so each
-    # pass exercises create_network/delete_network and its out-of-band PVE
-    # verification for that path. Kept independent of disk_storage_pools (no
-    # cross product) — these passes use the default CPI config. Empty/absent
-    # modes -> no extra passes (backward compatible).
-    modes: list[str] = cfg.get("tier1", {}).get("network_test", {}).get("modes", []) or []
-    for mode in modes:
+    # Network-test passes. tier1.network_test.modes selects which create_network/
+    # delete_network paths to exercise, each as one extra lifecycle pass with
+    # out-of-band PVE verification. Kept independent of disk_storage_pools (no
+    # cross product). Accepts an explicit list (e.g. [sdn, bridge]) or the string
+    # `auto` to detect at run time which modes the PVE host supports (sdn when
+    # SDN is installed with a usable zone; bridge when the configured iface is
+    # free). Empty/absent -> no extra passes (backward compatible).
+    raw_modes = cfg.get("tier1", {}).get("network_test", {}).get("modes", []) or []
+    net_passes: list[dict] = []
+    if raw_modes == "auto" or raw_modes == ["auto"]:
+        if _dry_run:
+            print("==> tier 1: would autodetect network modes (sdn if available, bridge if iface free)")
+        else:
+            try:
+                net_passes = _integration.detect_network_modes(cfg)
+            except RuntimeError as exc:
+                print(f"tier 1: network autodetect error: {exc}", file=sys.stderr)
+                return 1
+            detected = [p["mode"] for p in net_passes]
+            print(f"==> tier 1: autodetected network modes: {detected or '(none)'}")
+    else:
+        net_passes = [{"mode": str(m), "env": {}, "cpi": {}} for m in raw_modes]
+
+    for p in net_passes:
+        mode = p["mode"]
         print(f"==> tier 1: lifecycle pass (NETWORK_TEST_MODE={mode})")
-        mode_env = {**t1_env, "NETWORK_TEST_MODE": str(mode)}
-        rc = run(["./scripts/lifecycle"], env=mode_env, cwd=REPO_ROOT)
+        # Some passes (auto sdn) need CPI-config overrides for zone management;
+        # write a dedicated config for those, otherwise reuse the default.
+        cpi_overrides = p.get("cpi") or {}
+        pass_cpi_path = cpi_config_path
+        tmp_cfg = None
+        if cpi_overrides and not _dry_run:
+            fd, tmp_cfg = tempfile.mkstemp(prefix=f"cpi-net-{mode}-", suffix=".json")
+            os.close(fd)
+            _integration.write_cpi_config(
+                cfg,
+                tmp_cfg,
+                dry_run=False,
+                sdn_zone=cpi_overrides.get("sdn_zone"),
+                sdn_auto_manage_zone=cpi_overrides.get("sdn_auto_manage_zone"),
+            )
+            pass_cpi_path = tmp_cfg
+        try:
+            mode_env = {
+                **t1_env,
+                "CPI_CONFIG": pass_cpi_path,
+                "NETWORK_TEST_MODE": mode,
+                **(p.get("env") or {}),
+            }
+            rc = run(["./scripts/lifecycle"], env=mode_env, cwd=REPO_ROOT)
+        finally:
+            if tmp_cfg is not None:
+                Path(tmp_cfg).unlink(missing_ok=True)
         if rc != 0:
             print(f"tier 1 failed: scripts/lifecycle (mode={mode})", file=sys.stderr)
             return 1

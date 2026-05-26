@@ -164,5 +164,93 @@ class TestSelectLocalDiskPools(unittest.TestCase):
         self.assertEqual(result, ["my-lvm"])
 
 
+class TestSelectNetworkModes(unittest.TestCase):
+    """Tests for _integration.select_network_modes (pure decision logic)."""
+
+    SDN = {"vnet": "itvnet", "range": "10.250.0.0/24", "gateway": "10.250.0.1", "ip": "10.250.0.10"}
+
+    def _call(self, **kw):
+        defaults = dict(
+            sdn_installed=False,
+            existing_zones=[],
+            sdn_cfg={},
+            bridge_iface="",
+            bridge_exists=False,
+        )
+        defaults.update(kw)
+        return _integration.select_network_modes(**defaults)
+
+    def _modes(self, passes):
+        return [p["mode"] for p in passes]
+
+    def test_nothing_capable_returns_empty(self) -> None:
+        self.assertEqual(self._call(), [])
+
+    def test_bridge_included_when_iface_free(self) -> None:
+        passes = self._call(bridge_iface="vmbr9", bridge_exists=False)
+        self.assertEqual(self._modes(passes), ["bridge"])
+        self.assertEqual(passes[0]["cpi"], {})
+
+    def test_bridge_skipped_when_iface_exists(self) -> None:
+        passes = self._call(bridge_iface="vmbr9", bridge_exists=True)
+        self.assertEqual(passes, [])
+
+    def test_bridge_skipped_when_no_iface_configured(self) -> None:
+        passes = self._call(bridge_iface="", bridge_exists=False)
+        self.assertEqual(passes, [])
+
+    def test_sdn_skipped_when_not_installed(self) -> None:
+        passes = self._call(sdn_installed=False, existing_zones=["it"], sdn_cfg={**self.SDN, "zone": "it"})
+        self.assertEqual(passes, [])
+
+    def test_sdn_skipped_when_params_missing(self) -> None:
+        # vnet/range/gateway/ip absent -> cannot run sdn even if installed + zone.
+        passes = self._call(sdn_installed=True, existing_zones=["it"], sdn_cfg={"zone": "it"})
+        self.assertEqual(passes, [])
+
+    def test_sdn_reuse_existing_configured_zone(self) -> None:
+        passes = self._call(
+            sdn_installed=True, existing_zones=["it", "other"], sdn_cfg={**self.SDN, "zone": "it"}
+        )
+        self.assertEqual(self._modes(passes), ["sdn"])
+        p = passes[0]
+        self.assertEqual(p["env"], {"SDN_ZONE": "it"})
+        # Reuse must pin the zone and keep auto-manage OFF (never delete it).
+        self.assertEqual(p["cpi"], {"sdn_zone": "it", "sdn_auto_manage_zone": False})
+
+    def test_sdn_adopts_first_existing_zone_when_unconfigured(self) -> None:
+        passes = self._call(
+            sdn_installed=True, existing_zones=["zb", "za"], sdn_cfg={**self.SDN, "zone": ""}
+        )
+        p = passes[0]
+        self.assertEqual(p["env"], {"SDN_ZONE": "za"})  # sorted-first
+        self.assertEqual(p["cpi"], {"sdn_zone": "za", "sdn_auto_manage_zone": False})
+
+    def test_sdn_creates_configured_zone_when_absent(self) -> None:
+        passes = self._call(
+            sdn_installed=True, existing_zones=["other"], sdn_cfg={**self.SDN, "zone": "it"}
+        )
+        p = passes[0]
+        self.assertEqual(p["env"], {"SDN_ZONE": "it"})
+        # Create path: auto-manage ON, sdn_zone left unset so teardown isn't pinned.
+        self.assertEqual(p["cpi"], {"sdn_auto_manage_zone": True})
+
+    def test_sdn_skipped_when_no_zone_and_none_exist(self) -> None:
+        passes = self._call(
+            sdn_installed=True, existing_zones=[], sdn_cfg={**self.SDN, "zone": ""}
+        )
+        self.assertEqual(passes, [])
+
+    def test_both_modes_when_all_capable(self) -> None:
+        passes = self._call(
+            sdn_installed=True,
+            existing_zones=["it"],
+            sdn_cfg={**self.SDN, "zone": "it"},
+            bridge_iface="vmbr9",
+            bridge_exists=False,
+        )
+        self.assertEqual(sorted(self._modes(passes)), ["bridge", "sdn"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -74,8 +74,8 @@ tier1:
   # — the BOSH CPI managed-network methods — against live PVE, with out-of-band
   # verification (scripts/_pve_verify.py confirms real cluster state, not just the
   # CPI's return values). When modes is non-empty, Tier 1 runs scripts/lifecycle
-  # one extra pass per mode (independent of disk_storage_pools, using the default
-  # CPI config). Default (empty) skips network testing entirely.
+  # one extra pass per mode (independent of disk_storage_pools). Default (empty)
+  # skips network testing entirely.
   #
   #   sdn    — create an SDN vnet (+ subnet) and attach the test VM to it. Needs
   #            an SDN-capable cluster. 'zone' must already exist unless the CPI
@@ -86,11 +86,22 @@ tier1:
   #   bridge — create a Linux bridge via the nodes API and attach the VM to it.
   #            CAUTION: this mutates node networking — use an UNUSED iface name.
   #
-  # Example:
-  #   network_test:
-  #     modes: [sdn, bridge]
+  # Set modes to the string `auto` to detect at run time which modes the PVE
+  # host supports and run those (requires valid PVE credentials in bosh_vars):
+  #   - sdn is selected when SDN is installed AND a usable zone is resolvable
+  #     (the configured 'zone' exists -> reused and pinned; no 'zone' but zones
+  #     exist -> first one adopted and pinned; configured 'zone' absent -> created
+  #     and torn down via sdn_auto_manage_zone). The sdn.vnet/range/gateway/ip
+  #     values below must still be set for sdn to be runnable.
+  #   - bridge is selected when bridge.iface is configured and not already present
+  #     on the node (so the harness can cleanly create then delete it).
+  # In --dry-run mode autodetect is skipped (no network passes are previewed).
+  #
+  # Examples:
+  #   modes: [sdn, bridge]
+  #   modes: auto
   network_test:
-    modes: []                   # [] = skip. e.g. [sdn], [bridge], or [sdn, bridge]
+    modes: []                   # [] = skip. [sdn], [bridge], [sdn, bridge], or auto
     sdn:
       zone:      ""             # pre-existing zone, or any name if sdn_auto_manage_zone
       zone_type: simple         # used only when the zone is auto-created

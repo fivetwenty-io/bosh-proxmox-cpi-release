@@ -185,9 +185,16 @@ cp ci/integration.yml.example ci/integration.yml
 
 When `network_test.modes` is non-empty, Tier 1 runs one **extra** `scripts/lifecycle` pass per mode (independent of `disk_storage_pools` — no cross product), exercising the BOSH CPI `create_network`/`delete_network` methods. The created network is attached to that pass's test VM, and the result is verified out-of-band against the PVE REST API. An empty/absent `modes` list skips network testing entirely (default).
 
+Setting `modes: auto` makes the harness **detect at run time** which modes the PVE host supports and run those, mirroring `disk_storage_pools: auto`:
+
+- **`sdn`** is selected when the `/cluster/sdn` API is present (SDN installed) **and** a usable zone is resolvable: the configured `sdn.zone` already exists (reused and pinned so it is never deleted), or no `sdn.zone` is set but zones exist (the first is adopted and pinned), or the configured `sdn.zone` is absent (created for the test and torn down via `sdn_auto_manage_zone`). The `sdn.vnet`/`range`/`gateway`/`ip` values must still be set for SDN to be runnable.
+- **`bridge`** is selected when `bridge.iface` is configured and **not already present** on the node, so the harness can cleanly create then delete it (it never touches a bridge it did not create).
+
+Autodetect requires valid PVE credentials in `bosh_vars`. In `--dry-run` mode autodetect is skipped (no network passes are previewed).
+
 | Key | Description | Example |
 |-----|-------------|---------|
-| `network_test.modes` | List of paths to exercise: `sdn`, `bridge`, or both. `[]` = skip | `[sdn, bridge]` |
+| `network_test.modes` | Paths to exercise: a list of `sdn`/`bridge`, or the string `auto` to detect supported modes. `[]` = skip | `[sdn, bridge]` or `auto` |
 | `network_test.sdn.zone` | SDN zone name. Must pre-exist unless the CPI config sets `sdn_auto_manage_zone` (then it is auto-created) | `it` |
 | `network_test.sdn.zone_type` | Zone type used when the zone is auto-created | `simple` |
 | `network_test.sdn.vnet` | vnet name, 1–8 chars `[a-z0-9]` | `itvnet` |
