@@ -109,10 +109,30 @@ func HandleDeleteVM(deps Deps) cpi.Handler {
 				// 404 here means the VM is gone — fall through to the destroy
 				// call below, which handles the NotFound case idempotently.
 			} else {
+				// Only an unusedN slot whose volume STILL EXISTS represents a real
+				// persistent disk that the DELETE below would silently destroy. PVE
+				// demotes a disk to unusedN on detach; when a snapshot still
+				// references the volume the SDK's sweep cannot remove that slot, so
+				// it can linger. Once the volume itself is deleted (e.g. delete_disk
+				// runs before delete_vm) the slot is a dangling reference pointing at
+				// nothing — destroying the VM cannot lose data, so it must not block
+				// delete_vm. Existence-probe failures fail closed (treated as
+				// present) so a transient error never green-lights destroying a live
+				// volume. Probe on the VM's node: any volume still referenced by this
+				// VM's config is reachable from there.
 				var protected []string
 				for slot, volid := range pve.FindUnusedDiskEntries(cfg) {
 					storage, _, parseErr := pve.ParseDiskCID(volid)
 					if parseErr != nil || storage != diskStorage {
+						continue
+					}
+					exists, existErr := deps.PVE.Storage().Exists(ctx, node, diskStorage, volid)
+					if existErr != nil {
+						logger.Warn("delete_vm: unused-slot volume existence probe failed — treating slot as present (fail-closed)",
+							log.String("slot", slot), log.String("volid", volid), log.Err(existErr))
+					} else if !exists {
+						logger.Info("delete_vm: ignoring stale unused slot — volume already deleted",
+							log.String("slot", slot), log.String("volid", volid))
 						continue
 					}
 					protected = append(protected, fmt.Sprintf("%s=%s", slot, volid))

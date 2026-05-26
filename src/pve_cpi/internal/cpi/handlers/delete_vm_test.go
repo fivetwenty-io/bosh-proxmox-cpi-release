@@ -226,8 +226,12 @@ func TestHandleDeleteVM_RefusesWhenPersistentDiskUnused(t *testing.T) {
 	}
 	tasksSvc := &mockTasksService{}
 	agentSvc := &mockAgentService{}
+	// Volume still exists in storage → a real persistent disk → guard refuses.
+	storageSvc := &mockStorageService{
+		existsFn: func(_ context.Context, _, _, _ string) (bool, error) { return true, nil },
+	}
 
-	h := handlers.HandleDeleteVM(testDeps(qemuSvc, nodesSvc, tasksSvc, agentSvc))
+	h := handlers.HandleDeleteVM(testDepsWithStorage(qemuSvc, nodesSvc, tasksSvc, agentSvc, storageSvc))
 	_, err := h.Handle(context.Background(), marshalArgs("101"), jsonrpc.Context{})
 
 	if err == nil {
@@ -239,6 +243,52 @@ func TestHandleDeleteVM_RefusesWhenPersistentDiskUnused(t *testing.T) {
 	var cpiErr *cpierrors.Error
 	if !errors.As(err, &cpiErr) {
 		t.Errorf("expected *cpierrors.Error, got %T: %v", err, err)
+	}
+}
+
+// TestHandleDeleteVM_AllowsWhenUnusedVolumeAlreadyDeleted verifies the guard
+// does NOT block destroy when an unusedN slot references a volume that has
+// already been deleted from storage (e.g. detach_disk's sweep was blocked by a
+// snapshot, then delete_disk removed the volume before delete_vm). The slot is
+// then a dangling reference pointing at nothing, so destroying the VM cannot
+// lose data and DeleteQemu MUST be called.
+func TestHandleDeleteVM_AllowsWhenUnusedVolumeAlreadyDeleted(t *testing.T) {
+	t.Parallel()
+
+	deleteCalled := false
+	qemuSvc := &mockQEMUService{
+		stopFn: func(_ context.Context, _ string, _ int) (string, error) {
+			return "", nil
+		},
+		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
+			// unused0 on disk_storage, but its volume no longer exists.
+			return map[string]interface{}{
+				"unused0": "local-lvm:vm-9000-disk-0",
+			}, nil
+		},
+	}
+	nodesSvc := &mockNodesService{
+		deleteQemuFn: func(_ context.Context, _ string, _ string, _ *nodes.DeleteQemuParams) (*nodes.DeleteQemuResponse, error) {
+			deleteCalled = true
+			raw := nodes.DeleteQemuResponse{}
+			return &raw, nil
+		},
+	}
+	tasksSvc := &mockTasksService{}
+	agentSvc := &mockAgentService{}
+	// Volume gone from storage → stale dangling slot → guard must not block.
+	storageSvc := &mockStorageService{
+		existsFn: func(_ context.Context, _, _, _ string) (bool, error) { return false, nil },
+	}
+
+	h := handlers.HandleDeleteVM(testDepsWithStorage(qemuSvc, nodesSvc, tasksSvc, agentSvc, storageSvc))
+	_, err := h.Handle(context.Background(), marshalArgs("101"), jsonrpc.Context{})
+
+	if err != nil {
+		t.Fatalf("expected destroy to proceed for stale unused slot, got error: %v", err)
+	}
+	if !deleteCalled {
+		t.Error("DeleteQemu must be called when the unused-slot volume is already deleted")
 	}
 }
 

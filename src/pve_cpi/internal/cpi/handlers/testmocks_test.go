@@ -275,6 +275,12 @@ func testConfig() *config.CPIConfig {
 
 // testDeps builds a Deps struct wiring the provided mock services.
 func testDeps(qemuSvc qemu.Service, nodesSvc nodes.Service, tasksSvc tasks.Service, agentSvc agent.Agent) handlers.Deps {
+	return testDepsWithStorage(qemuSvc, nodesSvc, tasksSvc, agentSvc, &mockStorageService{})
+}
+
+// testDepsWithStorage is testDeps with an explicit storage service, for
+// handlers (e.g. delete_vm's unused-slot existence probe) that call Storage().
+func testDepsWithStorage(qemuSvc qemu.Service, nodesSvc nodes.Service, tasksSvc tasks.Service, agentSvc agent.Agent, storageSvc storage.Service) handlers.Deps {
 	// Default qemu service so handlers calling QEMU().Config() (e.g.,
 	// set_vm_metadata reading existing tags) don't dereference nil in
 	// tests that pass nil for qemuSvc.
@@ -284,9 +290,10 @@ func testDeps(qemuSvc qemu.Service, nodesSvc nodes.Service, tasksSvc tasks.Servi
 	return handlers.Deps{
 		Config: testConfig(),
 		PVE: &mockPVEClient{
-			qemuSvc:  qemuSvc,
-			nodesSvc: nodesSvc,
-			tasksSvc: tasksSvc,
+			qemuSvc:    qemuSvc,
+			nodesSvc:   nodesSvc,
+			tasksSvc:   tasksSvc,
+			storageSvc: storageSvc,
 		},
 		Agent:  agentSvc,
 		Logger: log.NewNopLogger(),
