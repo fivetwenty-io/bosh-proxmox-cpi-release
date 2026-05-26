@@ -16,7 +16,7 @@
 
 # Which test tiers to run.
 tiers:
-  lifecycle: true   # Tier 1: CPI 14-step lifecycle via scripts/lifecycle
+  lifecycle: true   # Tier 1: CPI 16-step + 4 sub-steps lifecycle via scripts/lifecycle
   bosh:      true   # Tier 2: bosh create-env + cloud/runtime-config + emptyvm smoke
   cf:        true   # Tier 3: CF deploy + smoke app push + HTTP 200 assert
 
@@ -38,6 +38,27 @@ tier1:
   vm_memory_mib:    1024           # RAM for the test VM (MiB)
   disk_size_mib:    1024           # Persistent disk size (MiB)
   stemcell_path:    ""             # Absolute path to stemcell; or set STEMCELL_PATH env var
+
+  # Multi-storage matrix (optional). When disk_storage_pools is non-empty, Tier 1
+  # runs scripts/lifecycle once per pool, exercising all disk CPI methods against
+  # each storage type. Each run is independently gated — a pool failure halts the
+  # matrix. Default (empty list) runs lifecycle once using the pve_disk_storage pool
+  # from bosh_vars, preserving the existing single-pool behavior.
+  #
+  # Required PVE storage pools for the full local matrix:
+  #   lvm pool:     pvesm add lvm <name> --vgname <vg>
+  #   lvmthin pool: pvesm add lvmthin <name> --vgname <vg> --thinpool <tp>
+  #   zfspool:      pvesm add zfspool <name> --pool <zfs-dataset>
+  #   dir pool:     pvesm add dir <name> --path <path>
+  #                 (the 'local' pool is typically pre-existing)
+  #
+  # Example with all 4 local types (adjust pool names to match your PVE host):
+  #   disk_storage_pools:
+  #     - local-lvm
+  #     - local-lvm-thin
+  #     - local-zfs
+  #     - local
+  disk_storage_pools: []
 
 # Tier 2: BOSH director smoke test.
 tier2:

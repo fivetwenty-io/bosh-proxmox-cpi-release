@@ -130,7 +130,13 @@ def bosh_int(file: "str | Path", path: str, dry_run: bool = False) -> str:
     return result.stdout.rstrip("\n")
 
 
-def write_cpi_config(cfg: dict, out_path: "str | Path", dry_run: bool = False) -> str:
+def write_cpi_config(
+    cfg: dict,
+    out_path: "str | Path",
+    dry_run: bool = False,
+    *,
+    disk_storage_override: "str | None" = None,
+) -> str:
     """Synthesize the CPI JSON config and write it to out_path.
 
     Pulls PVE secrets from cfg['bosh_vars'] via bosh int.  Auth preference:
@@ -140,9 +146,12 @@ def write_cpi_config(cfg: dict, out_path: "str | Path", dry_run: bool = False) -
     from tier1.
 
     Args:
-        cfg:      Validated config dict from load_config.
-        out_path: Destination path for the CPI JSON file.
-        dry_run:  When True, skip the disk write and return str(out_path).
+        cfg:                   Validated config dict from load_config.
+        out_path:              Destination path for the CPI JSON file.
+        dry_run:               When True, skip the disk write and return str(out_path).
+        disk_storage_override: When not None, overrides the disk_storage value
+                               read from bosh_vars. Used by the multi-storage
+                               matrix loop in tier_lifecycle.
 
     Returns:
         str(out_path).
@@ -162,6 +171,8 @@ def write_cpi_config(cfg: dict, out_path: "str | Path", dry_run: bool = False) -
     node = _int("/pve_node")
     vm_storage = _int("/pve_vm_storage")
     disk_storage = _int("/pve_disk_storage")
+    if disk_storage_override is not None:
+        disk_storage = disk_storage_override
     stemcell_storage = _int("/pve_stemcell_storage")
     iso_storage = _int("/pve_iso_storage")
     network_bridge_pve = _int("/pve_network_bridge")

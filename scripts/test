@@ -29,6 +29,7 @@ import os
 import shlex
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -139,10 +140,33 @@ def tier_lifecycle(cfg: dict, cpi_config_path: str, keep: bool) -> int:
     else:
         t1_env = _integration.tier1_env(cfg, cpi_config_path, dry_run=False)
 
-    rc = run(["./scripts/lifecycle"], env=t1_env, cwd=REPO_ROOT)
-    if rc != 0:
-        print("tier 1 failed: scripts/lifecycle", file=sys.stderr)
-        return 1
+    pools: list[str] = cfg.get("tier1", {}).get("disk_storage_pools", [])
+    if not pools:
+        rc = run(["./scripts/lifecycle"], env=t1_env, cwd=REPO_ROOT)
+        if rc != 0:
+            print("tier 1 failed: scripts/lifecycle", file=sys.stderr)
+            return 1
+    else:
+        for pool in pools:
+            # In dry-run mode skip real temp file creation — run() is a no-op anyway.
+            if _dry_run:
+                pool_cfg = "/dev/null"
+            else:
+                fd, pool_cfg = tempfile.mkstemp(prefix=f"cpi-{pool}-", suffix=".json")
+                os.close(fd)
+            try:
+                _integration.write_cpi_config(
+                    cfg, pool_cfg, dry_run=_dry_run, disk_storage_override=pool
+                )
+                pool_env = {**t1_env, "CPI_CONFIG": pool_cfg}
+                print(f"==> tier 1: lifecycle [{pool}]")
+                rc = run(["./scripts/lifecycle"], env=pool_env, cwd=REPO_ROOT)
+            finally:
+                if not _dry_run:
+                    Path(pool_cfg).unlink(missing_ok=True)
+            if rc != 0:
+                print(f"tier 1 failed: scripts/lifecycle [{pool}]", file=sys.stderr)
+                return 1
 
     print("==> tier 1: lifecycle passed")
     return 0
