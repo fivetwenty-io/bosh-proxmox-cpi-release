@@ -9,9 +9,11 @@
 #   ./scripts/bosh runtime-config
 #
 # Stemcell (bosh-openstack-kvm-ubuntu-noble) does NOT ship qemu-guest-agent;
-# the pre-start script installs it on first boot and is a no-op thereafter.
-# Air-gapped sites must pre-bake the package or mirror it on a reachable
-# apt repo.
+# the pre-start script installs it on first boot (detached, best-effort) and
+# is a no-op thereafter. The install runs in the background so a slow or
+# unreachable apt mirror can never stall pre-start (a long blocking pre-start
+# can drop the director<->agent NATS link and wedge the deploy). Air-gapped
+# sites should pre-bake the package or mirror it on a reachable apt repo.
 
 releases:
 - name:    os-conf
@@ -37,17 +39,32 @@ addons:
           systemctl start qemu-guest-agent.service 2>/dev/null || true
         }
 
+        # Fast path: already installed — ensure it is running and return.
         if command -v qemu-ga >/dev/null 2>&1; then
           start_qga
           exit 0
         fi
 
-        export DEBIAN_FRONTEND=noninteractive
-        if ! apt-get update -y; then
-          echo "pve-guest-agent: apt-get update had errors, continuing" >&2
-        fi
-        apt-get install -y --no-install-recommends qemu-guest-agent
-        start_qga
+        # Install path: NEVER block pre-start. A synchronous apt run against a
+        # slow or unreachable mirror takes minutes, and while the BOSH agent
+        # waits on pre-start the director<->agent NATS link can drop and fail
+        # to recover — wedging the deploy at the pre-start canary with the VM
+        # otherwise healthy. So install fully detached and best-effort:
+        # pre-start returns immediately, the package lands moments later, and a
+        # flaky apt can neither stall nor fail the deploy. Bounded with
+        # timeouts and a single retry so it can never run unattended forever.
+        logdir=/var/vcap/sys/log/pve-guest-agent
+        mkdir -p "$logdir"
+        setsid bash -c '
+          export DEBIAN_FRONTEND=noninteractive
+          opts="-o Acquire::Retries=1 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20"
+          timeout 120 apt-get $opts update -y \
+            || echo "pve-guest-agent: apt-get update failed/timed out, continuing"
+          timeout 180 apt-get $opts install -y --no-install-recommends qemu-guest-agent \
+            || echo "pve-guest-agent: qemu-guest-agent install failed/timed out"
+          systemctl start qemu-guest-agent.service 2>/dev/null || true
+        ' </dev/null >>"$logdir/install.log" 2>&1 &
+        exit 0
   include:
     stemcell:
     - os: ubuntu-jammy
