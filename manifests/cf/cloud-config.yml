@@ -30,7 +30,12 @@ vm_types:
 - name: minimal
   cloud_properties:
     cores: 1
-    memory: 1024
+    # 1024 MB was too small for the tcp-router instance group; running
+    # tcp-router + bosh-dns + dns_health + monit + the bosh-agent at the
+    # same time starved the agent's NATS handler and the director saw
+    # "Timed out sending get_state to instance tcp-router after 45 s" on
+    # the canary. 2048 keeps headroom.
+    memory: 2048
     disk: 8192
     network_bridge: ((pve_network_bridge))
 
