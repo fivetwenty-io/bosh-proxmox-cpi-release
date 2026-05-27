@@ -8,7 +8,6 @@ import (
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/cpi/handlers"
-	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
 	sdkclusterapi "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cluster"
@@ -22,18 +21,18 @@ import (
 // ---------------------------------------------------------------------------
 
 type snapQEMUService struct {
-	configFn   func(ctx context.Context, node string, vmid int) (map[string]interface{}, error)
-	snapshotFn func(ctx context.Context, node string, vmid int, name string, opts map[string]interface{}) (string, error)
+	configFn   func(ctx context.Context, node string, vmid int) (map[string]any, error)
+	snapshotFn func(ctx context.Context, node string, vmid int, name string, opts map[string]any) (string, error)
 }
 
-func (m *snapQEMUService) Config(ctx context.Context, node string, vmid int) (map[string]interface{}, error) {
+func (m *snapQEMUService) Config(ctx context.Context, node string, vmid int) (map[string]any, error) {
 	if m.configFn != nil {
 		return m.configFn(ctx, node, vmid)
 	}
-	return map[string]interface{}{}, nil
+	return map[string]any{}, nil
 }
 
-func (m *snapQEMUService) Snapshot(ctx context.Context, node string, vmid int, name string, opts map[string]interface{}) (string, error) {
+func (m *snapQEMUService) Snapshot(ctx context.Context, node string, vmid int, name string, opts map[string]any) (string, error) {
 	if m.snapshotFn != nil {
 		return m.snapshotFn(ctx, node, vmid, name, opts)
 	}
@@ -41,10 +40,10 @@ func (m *snapQEMUService) Snapshot(ctx context.Context, node string, vmid int, n
 }
 
 // Unimplemented methods — panic on accidental call.
-func (m *snapQEMUService) Create(_ context.Context, _ string, _ map[string]interface{}) (string, error) {
+func (m *snapQEMUService) Create(_ context.Context, _ string, _ map[string]any) (string, error) {
 	panic("snapQEMUService.Create: not expected")
 }
-func (m *snapQEMUService) Status(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
+func (m *snapQEMUService) Status(_ context.Context, _ string, _ int) (map[string]any, error) {
 	panic("snapQEMUService.Status: not expected")
 }
 func (m *snapQEMUService) Start(_ context.Context, _ string, _ int) (string, error) {
@@ -56,7 +55,7 @@ func (m *snapQEMUService) Stop(_ context.Context, _ string, _ int) (string, erro
 func (m *snapQEMUService) Reset(_ context.Context, _ string, _ int) (string, error) {
 	panic("snapQEMUService.Reset: not expected")
 }
-func (m *snapQEMUService) Clone(_ context.Context, _ string, _ int, _ map[string]interface{}) (string, error) {
+func (m *snapQEMUService) Clone(_ context.Context, _ string, _ int, _ map[string]any) (string, error) {
 	panic("snapQEMUService.Clone: not expected")
 }
 func (m *snapQEMUService) Template(_ context.Context, _ string, _ int) (string, error) {
@@ -74,7 +73,7 @@ func (m *snapQEMUService) ResizeDisk(_ context.Context, _ string, _ int, _ strin
 func (m *snapQEMUService) DeleteSnapshot(_ context.Context, _ string, _ int, _ string) error {
 	panic("snapQEMUService.DeleteSnapshot: not expected")
 }
-func (m *snapQEMUService) ListSnapshots(_ context.Context, _ string, _ int) ([]map[string]interface{}, error) {
+func (m *snapQEMUService) ListSnapshots(_ context.Context, _ string, _ int) ([]map[string]any, error) {
 	panic("snapQEMUService.ListSnapshots: not expected")
 }
 func (m *snapQEMUService) RollbackSnapshot(_ context.Context, _ string, _ int, _ string) (string, error) {
@@ -144,15 +143,15 @@ func TestHandleSnapshotDisk_Happy(t *testing.T) {
 	var snapName string
 
 	qemuSvc := &snapQEMUService{
-		configFn: func(_ context.Context, _ string, vmid int) (map[string]interface{}, error) {
+		configFn: func(_ context.Context, _ string, vmid int) (map[string]any, error) {
 			if vmid == 100 {
-				return map[string]interface{}{
+				return map[string]any{
 					"scsi2": volid,
 				}, nil
 			}
-			return map[string]interface{}{}, nil
+			return map[string]any{}, nil
 		},
-		snapshotFn: func(_ context.Context, _ string, vmid int, name string, _ map[string]interface{}) (string, error) {
+		snapshotFn: func(_ context.Context, _ string, vmid int, name string, _ map[string]any) (string, error) {
 			snapCalled = true
 			snapName = name
 			return "", nil // no UPID (synchronous success)
@@ -189,13 +188,13 @@ func TestHandleSnapshotDisk_WithDescription(t *testing.T) {
 	const diskCID = "local-lvm:vm-9001-disk-0"
 	const volid = "local-lvm:vm-9001-disk-0"
 
-	var capturedOpts map[string]interface{}
+	var capturedOpts map[string]any
 
 	qemuSvc := &snapQEMUService{
-		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
-			return map[string]interface{}{"scsi1": volid}, nil
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return map[string]any{"scsi1": volid}, nil
 		},
-		snapshotFn: func(_ context.Context, _ string, _ int, _ string, opts map[string]interface{}) (string, error) {
+		snapshotFn: func(_ context.Context, _ string, _ int, _ string, opts map[string]any) (string, error) {
 			capturedOpts = opts
 			return "", nil
 		},
@@ -231,10 +230,10 @@ func TestHandleSnapshotDisk_WithUpid(t *testing.T) {
 	}
 
 	qemuSvc := &snapQEMUService{
-		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
-			return map[string]interface{}{"scsi1": "local-lvm:vm-9001-disk-0"}, nil
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return map[string]any{"scsi1": "local-lvm:vm-9001-disk-0"}, nil
 		},
-		snapshotFn: func(_ context.Context, _ string, _ int, _ string, _ map[string]interface{}) (string, error) {
+		snapshotFn: func(_ context.Context, _ string, _ int, _ string, _ map[string]any) (string, error) {
 			return "UPID:pve1:abc:snap", nil // returns a UPID
 		},
 	}
@@ -262,9 +261,9 @@ func TestHandleSnapshotDisk_DiskNotAttached(t *testing.T) {
 	const diskCID = "local-lvm:vm-9001-disk-0"
 
 	qemuSvc := &snapQEMUService{
-		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
 			// VM exists but does not have this disk.
-			return map[string]interface{}{"scsi0": "local-lvm:other"}, nil
+			return map[string]any{"scsi0": "local-lvm:other"}, nil
 		},
 	}
 
@@ -279,10 +278,7 @@ func TestHandleSnapshotDisk_DiskNotAttached(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for disk not attached to any VM")
 	}
-	if cpierrors.IsType(err, cpierrors.TypeDiskNotFound) {
-		// CloudError is acceptable; DiskNotFound is also fine.
-	}
-	// Must be an error of some kind.
+	// Any error type (DiskNotFound or CloudError) is acceptable; err != nil already verified above.
 }
 
 func TestHandleSnapshotDisk_EmptyClusterList(t *testing.T) {
@@ -306,10 +302,10 @@ func TestHandleSnapshotDisk_SnapshotFails(t *testing.T) {
 	const diskCID = "local-lvm:vm-9001-disk-0"
 
 	qemuSvc := &snapQEMUService{
-		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
-			return map[string]interface{}{"scsi1": "local-lvm:vm-9001-disk-0"}, nil
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return map[string]any{"scsi1": "local-lvm:vm-9001-disk-0"}, nil
 		},
-		snapshotFn: func(_ context.Context, _ string, _ int, _ string, _ map[string]interface{}) (string, error) {
+		snapshotFn: func(_ context.Context, _ string, _ int, _ string, _ map[string]any) (string, error) {
 			return "", errors.New("PVE snapshot quota exceeded")
 		},
 	}
@@ -367,12 +363,12 @@ func TestHandleSnapshotDisk_DiskInOptionString(t *testing.T) {
 	var snapCalled bool
 
 	qemuSvc := &snapQEMUService{
-		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
-			return map[string]interface{}{
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return map[string]any{
 				"scsi2": volid + ",size=10G,cache=writeback",
 			}, nil
 		},
-		snapshotFn: func(_ context.Context, _ string, _ int, _ string, _ map[string]interface{}) (string, error) {
+		snapshotFn: func(_ context.Context, _ string, _ int, _ string, _ map[string]any) (string, error) {
 			snapCalled = true
 			return "", nil
 		},
@@ -399,10 +395,10 @@ func TestHandleSnapshotDisk_SDKError404(t *testing.T) {
 	const diskCID = "local-lvm:vm-9001-disk-0"
 
 	qemuSvc := &snapQEMUService{
-		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
-			return map[string]interface{}{"scsi1": "local-lvm:vm-9001-disk-0"}, nil
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return map[string]any{"scsi1": "local-lvm:vm-9001-disk-0"}, nil
 		},
-		snapshotFn: func(_ context.Context, _ string, _ int, _ string, _ map[string]interface{}) (string, error) {
+		snapshotFn: func(_ context.Context, _ string, _ int, _ string, _ map[string]any) (string, error) {
 			return "", &sdkerrors.APIError{HTTPCode: 404, Message: "VM not found"}
 		},
 	}
@@ -435,13 +431,13 @@ func TestHandleSnapshotDisk_Dir_CID(t *testing.T) {
 
 	var snapCalled bool
 	qemuSvc := &snapQEMUService{
-		configFn: func(_ context.Context, _ string, vmid int) (map[string]interface{}, error) {
+		configFn: func(_ context.Context, _ string, vmid int) (map[string]any, error) {
 			if vmid == 9001 {
-				return map[string]interface{}{"scsi1": diskCID}, nil
+				return map[string]any{"scsi1": diskCID}, nil
 			}
-			return map[string]interface{}{}, nil
+			return map[string]any{}, nil
 		},
-		snapshotFn: func(_ context.Context, _ string, _ int, _ string, _ map[string]interface{}) (string, error) {
+		snapshotFn: func(_ context.Context, _ string, _ int, _ string, _ map[string]any) (string, error) {
 			snapCalled = true
 			return "", nil
 		},
@@ -472,13 +468,13 @@ func TestHandleSnapshotDisk_ZFSPool_CID(t *testing.T) {
 
 	var snapCalled bool
 	qemuSvc := &snapQEMUService{
-		configFn: func(_ context.Context, _ string, vmid int) (map[string]interface{}, error) {
+		configFn: func(_ context.Context, _ string, vmid int) (map[string]any, error) {
 			if vmid == 9001 {
-				return map[string]interface{}{"scsi1": diskCID}, nil
+				return map[string]any{"scsi1": diskCID}, nil
 			}
-			return map[string]interface{}{}, nil
+			return map[string]any{}, nil
 		},
-		snapshotFn: func(_ context.Context, _ string, _ int, _ string, _ map[string]interface{}) (string, error) {
+		snapshotFn: func(_ context.Context, _ string, _ int, _ string, _ map[string]any) (string, error) {
 			snapCalled = true
 			return "", nil
 		},
@@ -509,13 +505,13 @@ func TestHandleSnapshotDisk_LVMThin_CID(t *testing.T) {
 
 	var snapCalled bool
 	qemuSvc := &snapQEMUService{
-		configFn: func(_ context.Context, _ string, vmid int) (map[string]interface{}, error) {
+		configFn: func(_ context.Context, _ string, vmid int) (map[string]any, error) {
 			if vmid == 9001 {
-				return map[string]interface{}{"scsi1": diskCID}, nil
+				return map[string]any{"scsi1": diskCID}, nil
 			}
-			return map[string]interface{}{}, nil
+			return map[string]any{}, nil
 		},
-		snapshotFn: func(_ context.Context, _ string, _ int, _ string, _ map[string]interface{}) (string, error) {
+		snapshotFn: func(_ context.Context, _ string, _ int, _ string, _ map[string]any) (string, error) {
 			snapCalled = true
 			return "", nil
 		},

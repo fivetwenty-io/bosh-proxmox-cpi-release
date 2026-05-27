@@ -382,7 +382,7 @@ func devicePathByID(diskID string) (string, error) {
 // nextFreeSCSIIndexAtLeast returns the lowest scsi slot index >= floor that is
 // not present in cfg. Mirrors qemu.NextIndexForBus semantics but with a
 // configurable floor so the caller can reserve low-numbered slots.
-func nextFreeSCSIIndexAtLeast(cfg map[string]interface{}, floor int) int {
+func nextFreeSCSIIndexAtLeast(cfg map[string]any, floor int) int {
 	used := map[int]bool{}
 	for k := range cfg {
 		var idx int

@@ -167,22 +167,22 @@ func (l *Logger) logCtx() context.Context {
 
 // Debug logs at debug level using the stored context (set via WithContext).
 func (l *Logger) Debug(msg string, fields ...Field) {
-	l.Logger.LogAttrs(l.logCtx(), slog.LevelDebug, msg, fields...)
+	l.LogAttrs(l.logCtx(), slog.LevelDebug, msg, fields...)
 }
 
 // Info logs at info level using the stored context (set via WithContext).
 func (l *Logger) Info(msg string, fields ...Field) {
-	l.Logger.LogAttrs(l.logCtx(), slog.LevelInfo, msg, fields...)
+	l.LogAttrs(l.logCtx(), slog.LevelInfo, msg, fields...)
 }
 
 // Warn logs at warn level using the stored context (set via WithContext).
 func (l *Logger) Warn(msg string, fields ...Field) {
-	l.Logger.LogAttrs(l.logCtx(), slog.LevelWarn, msg, fields...)
+	l.LogAttrs(l.logCtx(), slog.LevelWarn, msg, fields...)
 }
 
 // Error logs at error level using the stored context (set via WithContext).
 func (l *Logger) Error(msg string, fields ...Field) {
-	l.Logger.LogAttrs(l.logCtx(), slog.LevelError, msg, fields...)
+	l.LogAttrs(l.logCtx(), slog.LevelError, msg, fields...)
 }
 
 // Sync is a no-op; slog handlers flush per write. Retained for API symmetry

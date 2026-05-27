@@ -10,7 +10,6 @@ import (
 
 	sdkcloudinit "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cloudinit"
 	sdkcluster "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cluster"
-	sdkclusterapi "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cluster"
 	sdkclusterstorage "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/clusterstorage"
 	sdknodes "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/nodes"
 	sdkqemu "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/qemu"
@@ -94,15 +93,15 @@ func (m *mockStorageService) Upload(ctx context.Context, node, storage, content,
 
 // mockClusterServiceForHandlers implements cluster.Service with a configurable ListResources.
 type mockClusterServiceForHandlers struct {
-	sdkclusterapi.Service
-	listFn func(ctx context.Context, params *sdkclusterapi.ListResourcesParams) (*sdkclusterapi.ListResourcesResponse, error)
+	sdkcluster.Service
+	listFn func(ctx context.Context, params *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error)
 }
 
-func (m *mockClusterServiceForHandlers) ListResources(ctx context.Context, params *sdkclusterapi.ListResourcesParams) (*sdkclusterapi.ListResourcesResponse, error) {
+func (m *mockClusterServiceForHandlers) ListResources(ctx context.Context, params *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
 	if m.listFn != nil {
 		return m.listFn(ctx, params)
 	}
-	resp := sdkclusterapi.ListResourcesResponse{}
+	resp := sdkcluster.ListResourcesResponse{}
 	return &resp, nil
 }
 
@@ -123,8 +122,8 @@ func (c *handlerMockClient) ClusterStorage() sdkclusterstorage.Service { return 
 // newHandlerMockClient builds a mock pve.Client with wired storage and cluster.
 // clusterVMIDs is the set of VMIDs reported by the cluster (for NextDiskVMID).
 func newHandlerMockClient(storageSvc *mockStorageService, clusterVMIDs []int) pve.Client {
-	listFn := func(_ context.Context, _ *sdkclusterapi.ListResourcesParams) (*sdkclusterapi.ListResourcesResponse, error) {
-		resp := make(sdkclusterapi.ListResourcesResponse, 0, len(clusterVMIDs))
+	listFn := func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+		resp := make(sdkcluster.ListResourcesResponse, 0, len(clusterVMIDs))
 		for _, id := range clusterVMIDs {
 			id64 := int64(id)
 			entry := struct {

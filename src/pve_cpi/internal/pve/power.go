@@ -23,7 +23,7 @@ func UPIDFromRaw(raw json.RawMessage) (string, error) {
 
 	// Some endpoints (and certain PVE versions) return an object containing
 	// the UPID at key "upid". Mirror the postUPID handling in the qemu SDK.
-	var m map[string]interface{}
+	var m map[string]any
 	if err := json.Unmarshal(raw, &m); err == nil {
 		if v, ok := m["upid"].(string); ok {
 			return v, nil

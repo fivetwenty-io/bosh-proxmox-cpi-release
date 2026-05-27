@@ -52,6 +52,7 @@ func backendResolverOrDefault(d Deps) pve.BackendResolver {
 // a programming mistake (e.g. a typo in a method name) that must be caught at
 // startup rather than silently producing a broken dispatcher.
 func mustRegister(d *cpi.Dispatcher, method string, h Handler) {
+	// invariant violation: unknown or duplicate method name passed at startup; cannot occur at runtime
 	if err := d.Register(method, h); err != nil {
 		panic("cpi: RegisterAll: " + err.Error())
 	}

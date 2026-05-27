@@ -4,6 +4,7 @@ package pve
 
 import (
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -102,7 +103,8 @@ func NewClient(cfg *config.CPIConfig, logger *log.Logger) (Client, error) {
 		}
 		opts.Password = cfg.Password
 		opts.AutoLogin = true
-		logger.Debug("pve client: using password auth", log.String("username", opts.Username))
+		// username intentionally omitted: auth-event probe surface; emit at scope of auth-failure event instead
+		logger.Debug("pve client: using password auth")
 	}
 
 	if !cfg.VerifySSLValue() {
@@ -111,6 +113,36 @@ func NewClient(cfg *config.CPIConfig, logger *log.Logger) (Client, error) {
 			VerifyHostname: false,
 		}
 		logger.Warn("pve client: TLS verification disabled")
+	} else if cfg.PVECACertPEM != "" {
+		// verify_ssl=true and a custom CA PEM is supplied. The SDK accepts a CA
+		// cert as a file path only; write the PEM to a secure temp file, pass the
+		// path during construction, then delete the file immediately. The TLS
+		// config is built synchronously inside sdkclient.NewClient — the pool is
+		// baked into *tls.Config before the call returns and the file is no longer
+		// referenced after that point.
+		f, tmpErr := os.CreateTemp("", "pve-ca-*.pem")
+		if tmpErr != nil {
+			return nil, cpierrors.Cloud("pve client init: create temp CA file: %s", tmpErr.Error())
+		}
+		tmpPath := f.Name()
+		// Ensure the temp file is removed whether the write, SDK init, or any
+		// subsequent step fails. The defer fires after sdkclient.NewClient returns.
+		defer func() { _ = os.Remove(tmpPath) }()
+
+		if _, writeErr := f.WriteString(cfg.PVECACertPEM); writeErr != nil {
+			_ = f.Close()
+			return nil, cpierrors.Cloud("pve client init: write temp CA file: %s", writeErr.Error())
+		}
+		if closeErr := f.Close(); closeErr != nil {
+			return nil, cpierrors.Cloud("pve client init: close temp CA file: %s", closeErr.Error())
+		}
+
+		opts.SSLOptions = &sdkclient.SSLOptions{
+			VerifyMode:     sdkclient.SSLVerifyPeer,
+			VerifyHostname: true,
+			CACert:         tmpPath,
+		}
+		logger.Debug("pve client: custom CA cert pool in use")
 	}
 
 	raw, err := sdkclient.NewClient(opts)

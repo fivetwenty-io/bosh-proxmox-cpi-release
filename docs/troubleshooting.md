@@ -151,6 +151,56 @@ The CPI uses `DisallowUnknownFields` when parsing `cpi.json`. A typo in a proper
 
 Compare the failing `cpi.json` against the property list in [Configuration](configuration.md). Correct the misspelled field name and redeploy.
 
+### Stemcell path outside staging directory
+
+**Symptom**
+
+```text
+create_stemcell: open <path>: path escapes staging root
+```
+
+or a similar `os.Root` path-escape error referencing the configured `stemcell_staging_dir`.
+
+**Diagnosis**
+
+`pve.stemcell_staging_dir` is set and the BOSH director supplied a stemcell image path that resolves outside the declared root. This is a configuration mismatch: either the staging directory is set too narrowly, or the director is supplying an unexpected path.
+
+**Fix**
+
+Set `pve.stemcell_staging_dir` to a directory that is a parent of all paths the director supplies (typically the BOSH blob store temp directory), or remove the property to revert to unrestricted path access. See [Configuration](configuration.md).
+
+### Registry host rejected by allow-list
+
+**Symptom**
+
+```text
+registry: host "<host>" not in allowed_hosts list
+```
+
+**Diagnosis**
+
+`registry.allowed_hosts` is set and the registry endpoint host does not match any listed pattern.
+
+**Fix**
+
+Add the registry hostname to `registry.allowed_hosts`, or remove the property to disable allow-list filtering. Each entry is either an exact hostname (e.g. `registry.example.com`) or a single-level wildcard prefix (e.g. `*.example.com`). See [Configuration](configuration.md).
+
+### PVE CA certificate parse failure
+
+**Symptom**
+
+```text
+config validation failed: pve.ca_cert: no valid PEM certificates found
+```
+
+**Diagnosis**
+
+`pve.ca_cert` is set but the value is not valid PEM-encoded certificate data. The CPI validates the PEM at startup using `crypto/x509`.
+
+**Fix**
+
+Verify the PEM block with `openssl x509 -text -noout -in <cert.pem>`. Ensure the property contains the full PEM block including `-----BEGIN CERTIFICATE-----` and `-----END CERTIFICATE-----` markers. Remove the property to fall back to the system trust pool. See [Configuration](configuration.md).
+
 ## VM creation failures
 
 ### Target node not set
@@ -590,7 +640,6 @@ These properties control how the CPI behaves when it encounters the failure clas
 
 | Property | Default | Effect |
 |---|---|---|
-| `pve.vmid_alloc_attempts` | `10` (create_vm) / `5` (create_disk VMID conflict) | Maximum retries for VMID allocation before giving up |
 | `pve.reboot_timeout` | `60s` | How long the CPI waits for a soft-reboot to complete |
 | `pve.reboot_mode` | `soft` | `soft` uses ACPI shutdown; `hard` forces power off |
 | `pve.allow_disk_ops_with_snapshots` | `false` | When `true`, bypasses the snapshot guard on attach, detach, and resize |

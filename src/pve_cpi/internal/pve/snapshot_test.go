@@ -29,10 +29,10 @@ type snapQEMUService struct {
 	// pattern used across other pve_test files.
 	sdkqemu.Service
 
-	listSnapshotsFn func(ctx context.Context, node string, vmid int) ([]map[string]interface{}, error)
+	listSnapshotsFn func(ctx context.Context, node string, vmid int) ([]map[string]any, error)
 }
 
-func (s *snapQEMUService) ListSnapshots(ctx context.Context, node string, vmid int) ([]map[string]interface{}, error) {
+func (s *snapQEMUService) ListSnapshots(ctx context.Context, node string, vmid int) ([]map[string]any, error) {
 	if s.listSnapshotsFn != nil {
 		return s.listSnapshotsFn(ctx, node, vmid)
 	}
@@ -63,16 +63,16 @@ var _ pve.Client = (*snapMockClient)(nil)
 // helpers
 // ---------------------------------------------------------------------------
 
-func snapClient(fn func(ctx context.Context, node string, vmid int) ([]map[string]interface{}, error)) pve.Client {
+func snapClient(fn func(ctx context.Context, node string, vmid int) ([]map[string]any, error)) pve.Client {
 	return &snapMockClient{
 		qemuSvc: &snapQEMUService{listSnapshotsFn: fn},
 	}
 }
 
-func snapEntries(names ...string) []map[string]interface{} {
-	out := make([]map[string]interface{}, 0, len(names))
+func snapEntries(names ...string) []map[string]any {
+	out := make([]map[string]any, 0, len(names))
 	for _, n := range names {
-		out = append(out, map[string]interface{}{"name": n})
+		out = append(out, map[string]any{"name": n})
 	}
 	return out
 }
@@ -88,7 +88,7 @@ func TestHasSnapshots(t *testing.T) {
 
 	tests := []struct {
 		name        string
-		entries     []map[string]interface{}
+		entries     []map[string]any
 		listErr     error
 		wantNames   []string
 		wantErrText string // non-empty → expect error containing this substring
@@ -115,7 +115,7 @@ func TestHasSnapshots(t *testing.T) {
 		},
 		{
 			name: "entry with missing name key is skipped safely",
-			entries: []map[string]interface{}{
+			entries: []map[string]any{
 				{"name": "current"},
 				{"description": "no name key here"},
 				{"name": "real-snap"},
@@ -124,7 +124,7 @@ func TestHasSnapshots(t *testing.T) {
 		},
 		{
 			name: "entry with non-string name is skipped safely",
-			entries: []map[string]interface{}{
+			entries: []map[string]any{
 				{"name": "current"},
 				{"name": 42},
 				{"name": "real-snap"},
@@ -133,7 +133,7 @@ func TestHasSnapshots(t *testing.T) {
 		},
 		{
 			name: "entry with empty string name is skipped",
-			entries: []map[string]interface{}{
+			entries: []map[string]any{
 				{"name": ""},
 				{"name": "current"},
 				{"name": "keep-me"},
@@ -142,7 +142,7 @@ func TestHasSnapshots(t *testing.T) {
 		},
 		{
 			name:      "empty entry list returns nil names",
-			entries:   []map[string]interface{}{},
+			entries:   []map[string]any{},
 			wantNames: nil,
 		},
 		{
@@ -160,7 +160,7 @@ func TestHasSnapshots(t *testing.T) {
 			entries := tc.entries
 			listErr := tc.listErr
 
-			client := snapClient(func(_ context.Context, _ string, _ int) ([]map[string]interface{}, error) {
+			client := snapClient(func(_ context.Context, _ string, _ int) ([]map[string]any, error) {
 				return entries, listErr
 			})
 
@@ -202,7 +202,7 @@ func TestHasSnapshots(t *testing.T) {
 
 func TestWaitForSnapshotAbsent_AlreadyGone(t *testing.T) {
 	t.Parallel()
-	client := snapClient(func(_ context.Context, _ string, _ int) ([]map[string]interface{}, error) {
+	client := snapClient(func(_ context.Context, _ string, _ int) ([]map[string]any, error) {
 		return snapEntries("current"), nil
 	})
 	if err := pve.WaitForSnapshotAbsent(context.Background(), client, "pve1", 9001, "snap1"); err != nil {
@@ -213,7 +213,7 @@ func TestWaitForSnapshotAbsent_AlreadyGone(t *testing.T) {
 func TestWaitForSnapshotAbsent_LingersThenGone(t *testing.T) {
 	t.Parallel()
 	var calls int32
-	client := snapClient(func(_ context.Context, _ string, _ int) ([]map[string]interface{}, error) {
+	client := snapClient(func(_ context.Context, _ string, _ int) ([]map[string]any, error) {
 		// Present on the first two polls, gone afterward.
 		if atomic.AddInt32(&calls, 1) <= 2 {
 			return snapEntries("current", "snap1"), nil
@@ -232,7 +232,7 @@ func TestWaitForSnapshotAbsent_LingersThenGone(t *testing.T) {
 
 func TestWaitForSnapshotAbsent_Timeout(t *testing.T) {
 	t.Parallel()
-	client := snapClient(func(_ context.Context, _ string, _ int) ([]map[string]interface{}, error) {
+	client := snapClient(func(_ context.Context, _ string, _ int) ([]map[string]any, error) {
 		return snapEntries("current", "snap1"), nil // never clears
 	})
 	err := pve.WaitForSnapshotAbsent(context.Background(), client, "pve1", 9001, "snap1",
@@ -244,7 +244,7 @@ func TestWaitForSnapshotAbsent_Timeout(t *testing.T) {
 
 func TestWaitForSnapshotAbsent_ListError(t *testing.T) {
 	t.Parallel()
-	client := snapClient(func(_ context.Context, _ string, _ int) ([]map[string]interface{}, error) {
+	client := snapClient(func(_ context.Context, _ string, _ int) ([]map[string]any, error) {
 		return nil, errors.New("connection refused")
 	})
 	err := pve.WaitForSnapshotAbsent(context.Background(), client, "pve1", 9001, "snap1")
@@ -259,7 +259,7 @@ func TestWaitForSnapshotAbsent_TransientInPollLoop_Retries(t *testing.T) {
 	// ultimately return nil once the snapshot is gone.
 	t.Parallel()
 	var calls int32
-	client := snapClient(func(_ context.Context, _ string, _ int) ([]map[string]interface{}, error) {
+	client := snapClient(func(_ context.Context, _ string, _ int) ([]map[string]any, error) {
 		n := atomic.AddInt32(&calls, 1)
 		if n <= 2 {
 			// Return a transient-transport-shaped error so RetryOnTransient
@@ -283,7 +283,7 @@ func TestWaitForSnapshotAbsent_ContextCancelled(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // cancelled before the first poll completes its wait
-	client := snapClient(func(_ context.Context, _ string, _ int) ([]map[string]interface{}, error) {
+	client := snapClient(func(_ context.Context, _ string, _ int) ([]map[string]any, error) {
 		return snapEntries("current", "snap1"), nil // never clears → forces the wait/select
 	})
 	err := pve.WaitForSnapshotAbsent(ctx, client, "pve1", 9001, "snap1",

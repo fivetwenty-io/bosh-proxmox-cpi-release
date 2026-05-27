@@ -40,11 +40,11 @@ func createVMRetryBackoff(err error, attempt int) time.Duration {
 			d = 30 * time.Second
 		}
 		// Jitter ±30%.
-		jitter := time.Duration(mrand.Int64N(int64(d) * 6 / 10))
+		jitter := time.Duration(mrand.Int64N(int64(d) * 6 / 10)) // #nosec G404 -- VMID jitter; non-cryptographic
 		return d - d*3/10 + jitter
 	}
 	// VMID conflict (or anything else flagged retryable): uniform 50-250 ms.
-	return 50*time.Millisecond + time.Duration(mrand.Int64N(int64(200*time.Millisecond)))
+	return 50*time.Millisecond + time.Duration(mrand.Int64N(int64(200*time.Millisecond))) // #nosec G404 -- retry jitter; non-cryptographic
 }
 
 // defaultStemcellDiskGiB is the minimum root-disk size assumed when
@@ -338,7 +338,7 @@ func createVM(
 				candidateName = fmt.Sprintf("vm-%d", candidate)
 			}
 
-			createParams := map[string]interface{}{
+			createParams := map[string]any{
 				"vmid":    candidate,
 				"name":    candidateName,
 				"memory":  memMiB,
@@ -621,6 +621,10 @@ func createVM(
 	// -----------------------------------------------------------------------
 	agentNetworks := buildAgentNetworks(networks)
 	mbus, blobstore := extractMBusAndBlobstore(env)
+	if bsRaw, ok := env["blobstore"].(map[string]any); ok && len(bsRaw) > 0 && blobstore.Provider == "" {
+		logger.Warn("create_vm: env.blobstore.provider type assertion failed; configuring agent without blobstore",
+			log.String("vm", vmName))
+	}
 	// In the modern (NATS-mTLS) BOSH director path the director-side
 	// agent_settings env carries env.bosh.mbus.cert but NOT env.bosh.mbus.url
 	// — the URL has to come from the CPI's job-level `properties.agent.mbus`
@@ -708,7 +712,7 @@ func createVM(
 			log.Int("vmid", vmid),
 			log.Err(err),
 		)
-		vmCfg = map[string]interface{}{}
+		vmCfg = map[string]any{}
 	}
 
 	responseNetworks := buildResponseNetworks(networks, netNames, vmCfg)
@@ -1059,7 +1063,7 @@ func extractMBusAndBlobstore(env map[string]any) (string, agent.BlobstoreSpec) {
 func buildResponseNetworks(
 	networks map[string]createVMNetworkSpec,
 	orderedNames []string,
-	vmCfg map[string]interface{},
+	vmCfg map[string]any,
 ) map[string]createVMNetworkSpec {
 	// Build index → MAC lookup from VM config
 	macByIndex := extractMACsFromConfig(vmCfg)
@@ -1087,7 +1091,7 @@ func buildResponseNetworks(
 //	"virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0,firewall=1"
 //	  or
 //	"virtio,bridge=vmbr0"   (no MAC, PVE assigns later)
-func extractMACsFromConfig(cfg map[string]interface{}) map[int]string {
+func extractMACsFromConfig(cfg map[string]any) map[int]string {
 	macs := make(map[int]string)
 	for key, val := range cfg {
 		if !strings.HasPrefix(key, "net") {

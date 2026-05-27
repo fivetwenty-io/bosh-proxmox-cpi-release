@@ -74,7 +74,7 @@ For end-to-end CPI method exercise against a live cluster, see [BOSH CPI Lifecyc
 
 ## Properties
 
-The CPI exposes 37 properties under the `pve.*`, `agent.*`, and `registry.*` namespaces. The most operator-relevant subset is summarized below; the [full property reference](docs/configuration.md) documents every field with defaults, types, and validation rules.
+The CPI exposes 41 properties under the `pve.*`, `agent.*`, and `registry.*` namespaces. The most operator-relevant subset is summarized below; the [full property reference](docs/configuration.md) documents every field with defaults, types, and validation rules.
 
 | Property | Description | Default |
 |---|---|---|
@@ -175,7 +175,7 @@ For symptom-first triage of deployment, VM creation, disk attachment, network, a
 ## Reference
 
 - [CPI methods reference](docs/cpi_methods.md) — every BOSH CPI v2 method with args, returns, errors, and notes.
-- [Configuration reference](docs/configuration.md) — all 37 properties with defaults and validation rules.
+- [Configuration reference](docs/configuration.md) — all 41 properties with defaults and validation rules.
 - [Network configuration](docs/networks.md) — SDN and bridge `cloud_properties` schema and manifest examples.
 - [Operations runbook](docs/operations.md) — day-2 operations and diagnostics.
 - [Troubleshooting](docs/troubleshooting.md) — symptom-first failure triage.

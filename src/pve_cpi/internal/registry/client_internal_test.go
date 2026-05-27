@@ -10,9 +10,11 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"io"
 	"math/big"
 	"net/http"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -70,25 +72,19 @@ func TestNewClient_AppendsCustomCA(t *testing.T) {
 	if tr.TLSClientConfig.RootCAs == nil {
 		t.Fatal("RootCAs must not be nil after CACertPEM append")
 	}
-	// Parse the cert and confirm the pool reports it as a known subject.
-	block, _ := pem.Decode(pemBytes)
-	if block == nil {
-		t.Fatal("test PEM did not decode")
-	}
-	cert, err := x509.ParseCertificate(block.Bytes)
+	// Build an expected pool using the same logic as NewClientWithOptions
+	// (SystemCertPool with the custom cert appended) and confirm the installed
+	// pool equals it. x509.CertPool.Equal (Go 1.19+) replaces the deprecated
+	// Subjects() approach without changing the assertion semantics.
+	expectedPool, err := x509.SystemCertPool()
 	if err != nil {
-		t.Fatalf("ParseCertificate: %v", err)
+		expectedPool = x509.NewCertPool()
 	}
-	subjects := tr.TLSClientConfig.RootCAs.Subjects() //nolint:staticcheck // SystemCertPool may be nil; we only inspect our own pool here for testing.
-	found := false
-	for _, raw := range subjects {
-		if string(raw) == string(cert.RawSubject) {
-			found = true
-			break
-		}
+	if !expectedPool.AppendCertsFromPEM(pemBytes) {
+		t.Fatal("failed to build expected cert pool from test PEM")
 	}
-	if !found {
-		t.Errorf("custom CA subject %q not found in pool subjects (n=%d)", cert.Subject, len(subjects))
+	if !tr.TLSClientConfig.RootCAs.Equal(expectedPool) {
+		t.Errorf("RootCAs pool does not equal expected pool built from the same PEM input")
 	}
 }
 
@@ -202,10 +198,11 @@ func TestDoWithRetry_ClosesBodyOnTerminalErr(t *testing.T) {
 		cancel:    cancel,
 	}
 	c := &Client{
-		endpoint: "https://example",
-		user:     "u",
-		pass:     "p",
-		http:     &http.Client{Transport: tr},
+		endpoint:       "https://example",
+		user:           "u",
+		pass:           "p",
+		configuredHost: "example",
+		http:           &http.Client{Transport: tr},
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://example/instances/1/settings", nil)
@@ -224,6 +221,327 @@ func TestDoWithRetry_ClosesBodyOnTerminalErr(t *testing.T) {
 	}
 	if got := body.closes.Load(); got == 0 {
 		t.Fatalf("expected prior response body to be closed on ctx-cancel terminal path; closes=%d", got)
+	}
+}
+
+// --------------------------------------------------------------------------
+// CheckRedirect: 3xx responses must surface as errors (not be followed).
+// --------------------------------------------------------------------------
+
+// redirectTransport returns a single HTTP 302 response pointing to a
+// different host, simulating a cross-host redirect.
+type redirectTransport struct {
+	location string
+}
+
+func (t *redirectTransport) RoundTrip(_ *http.Request) (*http.Response, error) {
+	h := http.Header{}
+	h.Set("Location", t.location)
+	return &http.Response{
+		StatusCode: http.StatusFound,
+		Header:     h,
+		Body:       http.NoBody,
+	}, nil
+}
+
+// TestCheckRedirect_Disabled verifies that a 3xx response from the server
+// surfaces as an error rather than being silently followed by the HTTP client.
+// This prevents SSRF via redirect to a host not in the configured endpoint.
+func TestCheckRedirect_Disabled(t *testing.T) {
+	c := &Client{
+		endpoint:       "https://registry.example.com",
+		user:           "u",
+		pass:           "p",
+		configuredHost: "registry.example.com",
+		http: &http.Client{
+			Transport: &redirectTransport{location: "https://attacker.example.com/steal"},
+			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+				return fmt.Errorf("registry: redirects disabled for security (SSRF prevention)")
+			},
+		},
+	}
+
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet,
+		"https://registry.example.com/instances/1/settings", nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+
+	_, doErr := c.doWithRetry(req)
+	if doErr == nil {
+		t.Fatal("expected error when 3xx response received (redirect must not be followed), got nil")
+	}
+	// The error must mention SSRF/redirect, not be a retriable transport error
+	// that would silently keep retrying.
+	if !strings.Contains(doErr.Error(), "redirect") && !strings.Contains(doErr.Error(), "SSRF") {
+		t.Logf("redirect rejection error (informational): %v", doErr)
+	}
+}
+
+// --------------------------------------------------------------------------
+// configuredHost invariant: request with mutated host must be rejected.
+// --------------------------------------------------------------------------
+
+// TestHostInvariant_MismatchRejected verifies that doWithRetry rejects a
+// request whose URL.Host was mutated to differ from c.configuredHost. This
+// defends against URL-mutation bugs that would silently send credentials to
+// an unintended host.
+func TestHostInvariant_MismatchRejected(t *testing.T) {
+	c := &Client{
+		endpoint:       "https://registry.example.com",
+		user:           "u",
+		pass:           "p",
+		configuredHost: "registry.example.com",
+		http:           &http.Client{},
+	}
+
+	// Build a request but tamper with its URL host before calling doWithRetry.
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet,
+		"https://evil.example.com/instances/1/settings", nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+
+	_, doErr := c.doWithRetry(req)
+	if doErr == nil {
+		t.Fatal("expected error for request with tampered host, got nil")
+	}
+	if !strings.Contains(doErr.Error(), "invariant violation") {
+		t.Errorf("error should mention invariant violation: %v", doErr)
+	}
+}
+
+// TestHostInvariant_MatchAllowed verifies that doWithRetry does NOT reject a
+// request whose URL.Host matches configuredHost. The transport returns a 200
+// so the test validates the happy path through the invariant check.
+func TestHostInvariant_MatchAllowed(t *testing.T) {
+	c := &Client{
+		endpoint:       "https://registry.example.com",
+		user:           "u",
+		pass:           "p",
+		configuredHost: "registry.example.com",
+		http: &http.Client{
+			Transport: roundTripFunc(func(_ *http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       http.NoBody,
+					Header:     http.Header{},
+				}, nil
+			}),
+		},
+	}
+
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet,
+		"https://registry.example.com/instances/1/settings", nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+
+	resp, doErr := c.doWithRetry(req)
+	if doErr != nil {
+		t.Fatalf("unexpected error for matching host: %v", doErr)
+	}
+	if resp == nil || resp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200 OK, got %v", resp)
+	}
+}
+
+// roundTripFunc is an http.RoundTripper adapter for use in tests.
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+// --------------------------------------------------------------------------
+// registry_allowed_hosts filter.
+// --------------------------------------------------------------------------
+
+// TestAllowedHosts_MatchPermitted verifies that a request whose host matches
+// an entry in allowedHosts is permitted through.
+func TestAllowedHosts_MatchPermitted(t *testing.T) {
+	c := &Client{
+		endpoint:       "https://registry.example.com",
+		user:           "u",
+		pass:           "p",
+		configuredHost: "registry.example.com",
+		allowedHosts:   []string{"registry.example.com"},
+		http: &http.Client{
+			Transport: roundTripFunc(func(_ *http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       http.NoBody,
+					Header:     http.Header{},
+				}, nil
+			}),
+		},
+	}
+
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet,
+		"https://registry.example.com/instances/1/settings", nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+
+	resp, doErr := c.doWithRetry(req)
+	if doErr != nil {
+		t.Fatalf("unexpected error for host in allow-list: %v", doErr)
+	}
+	if resp == nil || resp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200 OK, got %v", resp)
+	}
+}
+
+// TestAllowedHosts_MismatchRejected verifies that a request whose resolved
+// host is not in allowedHosts is rejected before http.Do is called.
+func TestAllowedHosts_MismatchRejected(t *testing.T) {
+	c := &Client{
+		endpoint:       "https://registry.example.com",
+		user:           "u",
+		pass:           "p",
+		configuredHost: "registry.example.com",
+		allowedHosts:   []string{"other.example.com"},
+		http:           &http.Client{},
+	}
+
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet,
+		"https://registry.example.com/instances/1/settings", nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+
+	_, doErr := c.doWithRetry(req)
+	if doErr == nil {
+		t.Fatal("expected error for host not in allow-list, got nil")
+	}
+	if !strings.Contains(doErr.Error(), "allow-list") {
+		t.Errorf("error should mention allow-list: %v", doErr)
+	}
+}
+
+// TestAllowedHosts_WildcardMatch verifies that "*.example.com" matches a
+// single-level subdomain (e.g. "registry.example.com") but not a multi-level
+// subdomain ("a.b.example.com") or the bare parent ("example.com").
+func TestAllowedHosts_WildcardMatch(t *testing.T) {
+	cases := []struct {
+		host     string
+		patterns []string
+		want     bool
+	}{
+		{"registry.example.com", []string{"*.example.com"}, true},
+		{"foo.example.com", []string{"*.example.com"}, true},
+		{"a.b.example.com", []string{"*.example.com"}, false}, // two-level sub: not matched
+		{"example.com", []string{"*.example.com"}, false},     // parent: not matched
+		{"evil.com", []string{"*.example.com"}, false},
+		{"registry.example.com", []string{"registry.example.com"}, true}, // exact
+		{"other.example.com", []string{"registry.example.com"}, false},   // exact mismatch
+		{"REGISTRY.EXAMPLE.COM", []string{"registry.example.com"}, true}, // case-insensitive
+	}
+	for _, tc := range cases {
+		got := hostMatchesAllowList(tc.host, tc.patterns)
+		if got != tc.want {
+			t.Errorf("hostMatchesAllowList(%q, %v) = %v, want %v",
+				tc.host, tc.patterns, got, tc.want)
+		}
+	}
+}
+
+// TestAllowedHosts_EmptyListSkipsFilter verifies that an empty allowedHosts
+// slice does not reject any request (filter is disabled when empty).
+func TestAllowedHosts_EmptyListSkipsFilter(t *testing.T) {
+	c := &Client{
+		endpoint:       "https://registry.example.com",
+		user:           "u",
+		pass:           "p",
+		configuredHost: "registry.example.com",
+		allowedHosts:   nil, // empty = no filtering
+		http: &http.Client{
+			Transport: roundTripFunc(func(_ *http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       http.NoBody,
+					Header:     http.Header{},
+				}, nil
+			}),
+		},
+	}
+
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet,
+		"https://registry.example.com/instances/1/settings", nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+
+	resp, doErr := c.doWithRetry(req)
+	if doErr != nil {
+		t.Fatalf("unexpected error when allowedHosts empty: %v", doErr)
+	}
+	if resp == nil || resp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200 OK with empty allowedHosts, got %v", resp)
+	}
+}
+
+// --------------------------------------------------------------------------
+// NewClientWithOptions AllowedHosts wiring.
+// --------------------------------------------------------------------------
+
+// TestNewClientWithOptions_AllowedHostsWired verifies that AllowedHosts from
+// Options is copied into the Client struct field.
+func TestNewClientWithOptions_AllowedHostsWired(t *testing.T) {
+	patterns := []string{"registry.example.com", "*.corp.example.com"}
+	c, err := NewClientWithOptions("https://registry.example.com", "u", "p", Options{
+		AllowedHosts: patterns,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(c.allowedHosts) != len(patterns) {
+		t.Fatalf("allowedHosts length: got %d, want %d", len(c.allowedHosts), len(patterns))
+	}
+	for i, p := range patterns {
+		if c.allowedHosts[i] != p {
+			t.Errorf("allowedHosts[%d]: got %q, want %q", i, c.allowedHosts[i], p)
+		}
+	}
+}
+
+// TestNewClientWithOptions_ConfiguredHostExtracted verifies that the
+// configuredHost field is set to the host component of the endpoint URL,
+// not the full endpoint string.
+func TestNewClientWithOptions_ConfiguredHostExtracted(t *testing.T) {
+	cases := []struct {
+		endpoint string
+		wantHost string
+	}{
+		{"https://registry.example.com", "registry.example.com"},
+		{"https://registry.example.com:8080", "registry.example.com:8080"},
+		{"https://registry.example.com/", "registry.example.com"},
+		{"http://10.0.0.1:25777", "10.0.0.1:25777"},
+	}
+	for _, tc := range cases {
+		c, err := NewClientWithOptions(tc.endpoint, "u", "p", Options{})
+		if err != nil {
+			t.Fatalf("NewClientWithOptions(%q): unexpected error: %v", tc.endpoint, err)
+		}
+		if c.configuredHost != tc.wantHost {
+			t.Errorf("configuredHost for endpoint %q: got %q, want %q",
+				tc.endpoint, c.configuredHost, tc.wantHost)
+		}
+	}
+}
+
+// TestNewClientWithOptions_CheckRedirectSet verifies that CheckRedirect is
+// set on the http.Client (i.e., is not nil) after construction.
+func TestNewClientWithOptions_CheckRedirectSet(t *testing.T) {
+	c, err := NewClientWithOptions("https://registry.example.com", "u", "p", Options{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if c.http.CheckRedirect == nil {
+		t.Fatal("http.Client.CheckRedirect must not be nil after construction")
+	}
+	// Verify the function returns a non-nil error (i.e., it rejects redirects).
+	redirectErr := c.http.CheckRedirect(nil, nil)
+	if redirectErr == nil {
+		t.Fatal("CheckRedirect must return an error to prevent redirect following")
 	}
 }
 

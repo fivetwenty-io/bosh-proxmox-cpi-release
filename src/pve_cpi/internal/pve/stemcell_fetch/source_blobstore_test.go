@@ -69,7 +69,7 @@ func TestBlobstoreSource_Fetch_Success(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Fetch: unexpected error: %v", err)
 	}
-	defer body.Close()
+	defer func() { _ = body.Close() }()
 
 	if contentLength != 21 {
 		t.Errorf("contentLength = %d, want 21", contentLength)
@@ -291,7 +291,7 @@ func TestBlobstoreSource_Fetch_RawAuthCreds(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Fetch via rawAuthCreds: unexpected error: %v", err)
 	}
-	defer body.Close()
+	defer func() { _ = body.Close() }()
 
 	got, err := io.ReadAll(body)
 	if err != nil {

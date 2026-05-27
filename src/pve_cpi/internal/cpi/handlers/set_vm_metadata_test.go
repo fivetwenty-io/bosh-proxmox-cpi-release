@@ -3,6 +3,7 @@ package handlers_test
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 
@@ -228,7 +229,7 @@ func TestHandleSetVMMetadata_TagTruncation(t *testing.T) {
 		t.Errorf("tags length %d exceeds 255; got: %q", len(gotTags), gotTags)
 	}
 	// Truncation must occur at a ";" boundary — no partial "<key>--<value>".
-	for _, part := range strings.Split(gotTags, ";") {
+	for part := range strings.SplitSeq(gotTags, ";") {
 		if part == "" || !strings.Contains(part, "--") {
 			t.Errorf("malformed tag %q in %q", part, gotTags)
 		}
@@ -241,8 +242,8 @@ func TestHandleSetVMMetadata_PreservesCustomTags(t *testing.T) {
 	t.Parallel()
 
 	qemuSvc := &mockQEMUService{
-		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
-			return map[string]interface{}{
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return map[string]any{
 				"tags": "env--prod;owner--alice",
 			}, nil
 		},
@@ -282,8 +283,8 @@ func TestHandleSetVMMetadata_ReplacesStaleBoshTags(t *testing.T) {
 	t.Parallel()
 
 	qemuSvc := &mockQEMUService{
-		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
-			return map[string]interface{}{
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return map[string]any{
 				"tags": "director--old-uuid;deployment--old;job--old;env--prod",
 			}, nil
 		},
@@ -355,14 +356,7 @@ func TestHandleSetVMMetadata_EmitsNameTag(t *testing.T) {
 	}
 
 	// Exact entry match — splitting on ";" should yield the literal string.
-	found := false
-	for _, p := range strings.Split(gotTags, ";") {
-		if p == want {
-			found = true
-			break
-		}
-	}
-	if !found {
+	if !slices.Contains(strings.Split(gotTags, ";"), want) {
 		t.Errorf("name tag %q not present as a standalone entry; got: %q", want, gotTags)
 	}
 }
@@ -431,7 +425,7 @@ func TestHandleSetVMMetadata_NameTagMissingOmitted(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	for _, p := range strings.Split(gotTags, ";") {
+	for p := range strings.SplitSeq(gotTags, ";") {
 		if p == "" {
 			t.Errorf("empty tag entry in: %q", gotTags)
 		}
@@ -510,7 +504,6 @@ func TestHandleSetVMMetadata_VMNameFromJobIndex(t *testing.T) {
 	}
 
 	for _, c := range cases {
-		c := c
 		t.Run(c.desc, func(t *testing.T) {
 			t.Parallel()
 			var gotName *string
@@ -671,8 +664,8 @@ func TestHandleSetVMMetadata_EmitsIndexTag(t *testing.T) {
 	t.Parallel()
 
 	qemuSvc := &mockQEMUService{
-		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
-			return map[string]interface{}{
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return map[string]any{
 				"tags": "index--7;env--prod",
 			}, nil
 		},
@@ -742,7 +735,7 @@ func TestHandleSetVMMetadata_DescriptionSorted(t *testing.T) {
 	if posA < 0 || posM < 0 || posZ < 0 {
 		t.Fatalf("description missing expected keys: %q", gotDescription)
 	}
-	if !(posA < posM && posM < posZ) {
+	if posA >= posM || posM >= posZ {
 		t.Errorf("description keys not sorted: a=%d m=%d z=%d in %q", posA, posM, posZ, gotDescription)
 	}
 }

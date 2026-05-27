@@ -195,7 +195,7 @@ func TestConfigDrive_Configure_BuildsISOWithCorrectLayout(t *testing.T) {
 			if err != nil {
 				return "", err
 			}
-			defer tmp.Close()
+			defer func() { _ = tmp.Close() }()
 			if _, err := io.Copy(tmp, body); err != nil {
 				return "", err
 			}
@@ -263,7 +263,7 @@ func TestConfigDrive_Configure_AttachesAsScsi30Cdrom(t *testing.T) {
 
 func TestConfigDrive_Configure_DeletesLocalTempOnSuccess(t *testing.T) {
 	tempDir, _ := os.MkdirTemp("", "iso-temp-*")
-	defer os.RemoveAll(tempDir)
+	defer func() { _ = os.RemoveAll(tempDir) }()
 	t.Setenv("TMPDIR", tempDir)
 
 	a := newISOAgent(nil, nil)
@@ -281,7 +281,7 @@ func TestConfigDrive_Configure_DeletesLocalTempOnSuccess(t *testing.T) {
 
 func TestConfigDrive_Configure_DeletesLocalTempOnUploadFailure(t *testing.T) {
 	tempDir, _ := os.MkdirTemp("", "iso-temp-*")
-	defer os.RemoveAll(tempDir)
+	defer func() { _ = os.RemoveAll(tempDir) }()
 	t.Setenv("TMPDIR", tempDir)
 
 	storageSvc := &fakeStorageSvc{
@@ -598,9 +598,6 @@ func TestConfigure_PromotesCleanupError(t *testing.T) {
 		t.Errorf("error should contain cleanup error text; got: %v", err)
 	}
 	// The attach error must remain unwrappable from the combined error.
-	if !errors.Is(err, errors.Unwrap(err)) {
-		// Just verify the chain is intact — errors.Is works on plain errors.
-	}
 	// Confirm the attach cause is reachable via Unwrap.
 	cause := errors.Unwrap(err)
 	if cause == nil {

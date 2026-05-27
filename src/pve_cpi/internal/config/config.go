@@ -4,6 +4,7 @@
 package config
 
 import (
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -37,6 +38,14 @@ type CPIConfig struct {
 	// allows uploads to file-based storages (dir/nfs/cifs/glusterfs/cephfs);
 	// block storages (lvm, lvmthin, zfspool, rbd) cannot accept qcow2 uploads.
 	StemcellStorage string `json:"stemcell_storage"`
+
+	// StemcellStagingDir is an optional absolute path that scopes all stemcell
+	// file reads/writes to a single directory root using Go 1.24+ os.Root.
+	// When empty (the default), os.Open/os.Create are called on paths as-is
+	// (byte-identical behavior to prior releases). When set, director-supplied
+	// image paths must reside under this directory; out-of-root paths are
+	// rejected at runtime. Defense-in-depth against unexpected stemcell paths.
+	StemcellStagingDir string `json:"stemcell_staging_dir,omitempty"`
 	// ISOStorage is the PVE storage (must support content type `iso`,
 	// i.e. dir/nfs/cifs) used to hold the per-VM ConfigDrive ISO that
 	// boots the BOSH agent. Block storages (lvm/lvmthin/zfspool) cannot
@@ -74,6 +83,15 @@ type CPIConfig struct {
 	// TLS — pointer so JSON omission (nil) is distinguishable from explicit false.
 	// Use VerifySSLValue() to obtain the effective bool.
 	VerifySSL *bool `json:"verify_ssl,omitempty"`
+
+	// PVECACertPEM is an optional PEM-encoded CA certificate (or chain) that
+	// replaces the system trust pool when verifying the PVE API TLS certificate.
+	// Use when the PVE host presents a certificate signed by a private CA that
+	// the host trust store does not already include. When empty (the default),
+	// TLS verification uses the system trust pool — behavior is byte-identical to
+	// prior releases. Ignored when VerifySSL is false. Symmetric to
+	// RegistryCACertPEM / registry.ca_cert.
+	PVECACertPEM string `json:"pve_ca_cert,omitempty"`
 
 	// Agent
 	AgentMode    string `json:"agent_mode"`
@@ -138,6 +156,16 @@ type CPIConfig struct {
 	// private CA the host trust store does not already include. Ignored when
 	// empty (system trust pool used unmodified).
 	RegistryCACertPEM string `json:"registry_ca_cert,omitempty"`
+
+	// RegistryAllowedHosts is an optional list of host patterns that restrict
+	// which hosts the registry HTTP client is permitted to contact. Each entry
+	// is either an exact host (e.g. "registry.example.com") or a wildcard
+	// prefix pattern (e.g. "*.example.com"). When non-empty, the registry
+	// client rejects any request whose resolved host does not match at least
+	// one entry. Empty (default) disables host-allow-list filtering; the
+	// configuredHost invariant and disabled redirects still apply regardless.
+	// Defense-in-depth against SSRF via host mutation.
+	RegistryAllowedHosts []string `json:"registry_allowed_hosts,omitempty" yaml:"registry_allowed_hosts,omitempty"`
 
 	// AgentMBus is the URL the BOSH agent should bind/listen on inside the VM
 	// (e.g. https://mbus:pw@0.0.0.0:6868). Sourced from
@@ -282,11 +310,11 @@ func Load(r io.Reader) (*CPIConfig, error) {
 // LoadFile opens path and delegates to Load.
 // Returns a CloudError on open failure, decode failure, or validation failure.
 func LoadFile(path string) (*CPIConfig, error) {
-	f, err := os.Open(path)
+	f, err := os.Open(path) // #nosec G304 -- path is operator-supplied CLI arg; trust boundary
 	if err != nil {
 		return nil, cpierrors.Cloud("config: open %s: %s", path, err.Error())
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	return Load(f)
 }
 
@@ -526,6 +554,28 @@ func (c *CPIConfig) ValidateWithLogger(logger *log.Logger) error {
 		))
 	}
 
+	// StemcellStagingDir: when set, must be an absolute path to an existing directory.
+	if c.StemcellStagingDir != "" {
+		if !strings.HasPrefix(c.StemcellStagingDir, "/") {
+			errs = append(errs, fmt.Sprintf(
+				"stemcell_staging_dir %q must be an absolute path", c.StemcellStagingDir))
+		} else {
+			fi, statErr := os.Stat(c.StemcellStagingDir)
+			if statErr != nil {
+				if os.IsNotExist(statErr) {
+					errs = append(errs, fmt.Sprintf(
+						"stemcell_staging_dir %q does not exist", c.StemcellStagingDir))
+				} else {
+					errs = append(errs, fmt.Sprintf(
+						"stemcell_staging_dir %q cannot be stat'd: %s", c.StemcellStagingDir, statErr.Error()))
+				}
+			} else if !fi.IsDir() {
+				errs = append(errs, fmt.Sprintf(
+					"stemcell_staging_dir %q is not a directory", c.StemcellStagingDir))
+			}
+		}
+	}
+
 	// NetworkMode enum.
 	switch c.NetworkMode {
 	case "sdn", "bridge", "auto":
@@ -548,6 +598,17 @@ func (c *CPIConfig) ValidateWithLogger(logger *log.Logger) error {
 		}
 	}
 
+	// PVECACertPEM: when non-empty AND verify_ssl=true, the PEM must parse to at
+	// least one valid certificate. Malformed PEM at startup is rejected so the
+	// operator learns immediately rather than encountering TLS errors at runtime.
+	// When verify_ssl=false the CA cert is ignored (insecure-skip-verify wins).
+	if c.PVECACertPEM != "" && c.VerifySSLValue() {
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM([]byte(c.PVECACertPEM)) {
+			errs = append(errs, "pve_ca_cert: no valid PEM certificates parsed from value")
+		}
+	}
+
 	// Registry mode requires endpoint + credentials.
 	if c.AgentMode == "registry" {
 		if c.RegistryEndpoint == "" {
@@ -566,6 +627,25 @@ func (c *CPIConfig) ValidateWithLogger(logger *log.Logger) error {
 		if c.RegistryEndpoint != "" {
 			if err := c.validateRegistryScheme(logger); err != "" {
 				errs = append(errs, err)
+			}
+		}
+		// registry_allowed_hosts: each entry must be a non-empty string with no
+		// scheme or path component (host patterns only).
+		for i, h := range c.RegistryAllowedHosts {
+			if h == "" {
+				errs = append(errs, fmt.Sprintf("registry_allowed_hosts[%d] must not be empty", i))
+				continue
+			}
+			if strings.Contains(h, "://") {
+				errs = append(errs, fmt.Sprintf(
+					"registry_allowed_hosts[%d] %q must be a host pattern (no scheme; use e.g. \"host.example.com\" or \"*.example.com\")", i, h,
+				))
+				continue
+			}
+			if strings.Contains(h, "/") {
+				errs = append(errs, fmt.Sprintf(
+					"registry_allowed_hosts[%d] %q must be a host pattern (no path component)", i, h,
+				))
 			}
 		}
 	}

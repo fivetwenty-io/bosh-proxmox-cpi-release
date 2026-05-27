@@ -105,8 +105,8 @@ func TestHandleRebootVM_SoftHappy(t *testing.T) {
 	awaitCalled := false
 
 	qemuSvc := &mockQEMUService{
-		statusFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
-			return map[string]interface{}{"status": "running"}, nil
+		statusFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return map[string]any{"status": "running"}, nil
 		},
 		resetFn: func(_ context.Context, _ string, _ int) (string, error) {
 			resetCalled = true
@@ -165,8 +165,8 @@ func TestHandleRebootVM_SoftFallbackOnTaskFail(t *testing.T) {
 	resetCalled := false
 
 	qemuSvc := &mockQEMUService{
-		statusFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
-			return map[string]interface{}{"status": "running"}, nil
+		statusFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return map[string]any{"status": "running"}, nil
 		},
 		resetFn: func(_ context.Context, _ string, _ int) (string, error) {
 			resetCalled = true
@@ -212,8 +212,8 @@ func TestHandleRebootVM_SoftFallbackOnRebootCallError(t *testing.T) {
 	resetCalled := false
 
 	qemuSvc := &mockQEMUService{
-		statusFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
-			return map[string]interface{}{"status": "running"}, nil
+		statusFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return map[string]any{"status": "running"}, nil
 		},
 		resetFn: func(_ context.Context, _ string, _ int) (string, error) {
 			resetCalled = true
@@ -252,8 +252,8 @@ func TestHandleRebootVM_HardMode(t *testing.T) {
 	rebootCalled := false
 
 	qemuSvc := &mockQEMUService{
-		statusFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
-			return map[string]interface{}{"status": "running"}, nil
+		statusFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return map[string]any{"status": "running"}, nil
 		},
 		resetFn: func(_ context.Context, _ string, _ int) (string, error) {
 			resetCalled = true
@@ -298,8 +298,8 @@ func TestHandleRebootVM_StoppedStart(t *testing.T) {
 	rebootCalled := false
 
 	qemuSvc := &mockQEMUService{
-		statusFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
-			return map[string]interface{}{"status": "stopped"}, nil
+		statusFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return map[string]any{"status": "stopped"}, nil
 		},
 		startFn: func(_ context.Context, node string, vmid int) (string, error) {
 			if node != "pve-node1" || vmid != 101 {
@@ -351,8 +351,8 @@ func TestHandleRebootVM_StoppedStartError(t *testing.T) {
 	t.Parallel()
 
 	qemuSvc := &mockQEMUService{
-		statusFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
-			return map[string]interface{}{"status": "stopped"}, nil
+		statusFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return map[string]any{"status": "stopped"}, nil
 		},
 		startFn: func(_ context.Context, _ string, _ int) (string, error) {
 			return "", errors.New("pve: start failed: disk error")
@@ -379,7 +379,7 @@ func TestHandleRebootVM_StatusNotFound(t *testing.T) {
 	t.Parallel()
 
 	qemuSvc := &mockQEMUService{
-		statusFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
+		statusFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
 			return nil, notFoundAPIErr()
 		},
 	}
@@ -407,7 +407,7 @@ func TestHandleRebootVM_StatusGenericError(t *testing.T) {
 	t.Parallel()
 
 	qemuSvc := &mockQEMUService{
-		statusFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
+		statusFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
 			return nil, errors.New("pve: connection refused")
 		},
 	}
@@ -437,8 +437,8 @@ func TestHandleRebootVM_RebootNotFound(t *testing.T) {
 	resetCalled := false
 
 	qemuSvc := &mockQEMUService{
-		statusFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
-			return map[string]interface{}{"status": "running"}, nil
+		statusFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return map[string]any{"status": "running"}, nil
 		},
 		resetFn: func(_ context.Context, _ string, _ int) (string, error) {
 			resetCalled = true
@@ -519,8 +519,8 @@ func TestHandleRebootVM_SoftEmptyUPID(t *testing.T) {
 	resetCalled := false
 
 	qemuSvc := &mockQEMUService{
-		statusFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
-			return map[string]interface{}{"status": "running"}, nil
+		statusFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return map[string]any{"status": "running"}, nil
 		},
 		resetFn: func(_ context.Context, _ string, _ int) (string, error) {
 			resetCalled = true
@@ -569,8 +569,8 @@ func TestHandleRebootVM_HardReset_RetriesOnTransient(t *testing.T) {
 	resetAttempts := 0
 
 	qemuSvc := &mockQEMUService{
-		statusFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
-			return map[string]interface{}{"status": "running"}, nil
+		statusFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return map[string]any{"status": "running"}, nil
 		},
 		resetFn: func(_ context.Context, _ string, _ int) (string, error) {
 			resetAttempts++
@@ -621,7 +621,7 @@ func TestRebootVM_StatusTransient_Retriable(t *testing.T) {
 
 	statusAttempts := 0
 	qemuSvc := &mockQEMUService{
-		statusFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
+		statusFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
 			statusAttempts++
 			return nil, transientErr
 		},
@@ -660,8 +660,8 @@ func TestRebootVM_StartTransient_Retriable(t *testing.T) {
 
 	startAttempts := 0
 	qemuSvc := &mockQEMUService{
-		statusFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
-			return map[string]interface{}{"status": "stopped"}, nil
+		statusFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return map[string]any{"status": "stopped"}, nil
 		},
 		startFn: func(_ context.Context, _ string, _ int) (string, error) {
 			startAttempts++
@@ -727,8 +727,8 @@ func TestRebootVM_AwaitTransient_Retriable(t *testing.T) {
 			t.Parallel()
 
 			qemuSvc := &mockQEMUService{
-				statusFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
-					return map[string]interface{}{"status": tc.statusSt}, nil
+				statusFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+					return map[string]any{"status": tc.statusSt}, nil
 				},
 				resetFn: func(_ context.Context, _ string, _ int) (string, error) {
 					return "UPID:node:reset-await-transient", nil

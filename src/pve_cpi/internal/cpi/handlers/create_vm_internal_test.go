@@ -1,8 +1,10 @@
 package handlers
 
 import (
+	"fmt"
 	"reflect"
 	"testing"
+	"time"
 )
 
 // TestSortedNetworkNames_NoDefault_Deterministic verifies that sortedNetworkNames
@@ -149,5 +151,169 @@ func TestExtractMBusAndBlobstore_LegacyTopLevel(t *testing.T) {
 	}
 	if bs.Provider != "local" {
 		t.Errorf("blobstore.provider = %q, want local", bs.Provider)
+	}
+}
+
+// --------------------------------------------------------------------------
+// createVMRetryBackoff
+// --------------------------------------------------------------------------
+
+// TestCreateVMRetryBackoff_StorageLockTimeout verifies that a storage-lock
+// timeout error produces a duration that grows with attempt count and stays
+// within the [d×0.7, d×1.3] window (exponential base 2s × 1.5^attempt ±30%).
+func TestCreateVMRetryBackoff_StorageLockTimeout(t *testing.T) {
+	t.Parallel()
+
+	lockErr := fmt.Errorf("can't lock file '/var/lock/pve-manager/pve-storage-data' - got timeout")
+
+	for attempt := 0; attempt <= 5; attempt++ {
+		d := createVMRetryBackoff(lockErr, attempt)
+
+		// Compute expected base: 2s × 1.5^attempt, capped at 30s.
+		base := 2 * time.Second
+		factor := 1.0
+		for i := 0; i < attempt; i++ {
+			factor *= 1.5
+		}
+		expected := time.Duration(float64(base) * factor)
+		if expected > 30*time.Second {
+			expected = 30 * time.Second
+		}
+
+		// Allowed window: [expected×0.7, expected×1.3] (±30% jitter boundary).
+		lo := time.Duration(float64(expected) * 0.7)
+		hi := time.Duration(float64(expected) * 1.3)
+
+		if d < lo || d > hi {
+			t.Errorf("attempt=%d: backoff=%v not in [%v, %v] (expected base %v)",
+				attempt, d, lo, hi, expected)
+		}
+	}
+}
+
+// TestCreateVMRetryBackoff_StorageLockTimeout_Cap verifies that the base
+// duration is capped at 30s before jitter. The jittered output may be up to
+// 30s×1.3 (capped base ±30%), but the base itself must not grow beyond 30s.
+// We check that the result stays within [30s×0.7, 30s×1.3].
+func TestCreateVMRetryBackoff_StorageLockTimeout_Cap(t *testing.T) {
+	t.Parallel()
+
+	lockErr := fmt.Errorf("can't lock file '/var/lock/pve-manager/pve-storage-data' - got timeout")
+	// attempt=20 pushes the raw exponential far above 30s; the base is capped at 30s
+	// before jitter, so the jittered output is in [30s×0.7, 30s×1.3].
+	const cappedBase = 30 * time.Second
+	lo := time.Duration(float64(cappedBase) * 0.7)
+	hi := time.Duration(float64(cappedBase) * 1.3)
+
+	for i := 0; i < 5; i++ {
+		d := createVMRetryBackoff(lockErr, 20)
+		if d < lo || d > hi {
+			t.Errorf("attempt=20 (run %d): backoff=%v not in [%v, %v]", i, d, lo, hi)
+		}
+	}
+}
+
+// TestCreateVMRetryBackoff_NonRetriable verifies that errors not matching
+// IsStorageLockTimeout (auth failures, permission errors, opaque errors) fall
+// through to the uniform 50–250 ms jitter branch. createVMRetryBackoff does
+// not gate on retryability — that is the caller's responsibility — so any
+// non-storage-lock error uses the short jitter window.
+func TestCreateVMRetryBackoff_NonRetriable(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		err  error
+	}{
+		{"auth failure", fmt.Errorf("401 authentication failure")},
+		{"permission denied", fmt.Errorf("permission denied")},
+		{"storage full", fmt.Errorf("storage full")},
+		{"vmid conflict", fmt.Errorf("VM 113 already exists on node 'pve'")},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			for attempt := 0; attempt <= 3; attempt++ {
+				d := createVMRetryBackoff(tc.err, attempt)
+				const lo = 50 * time.Millisecond
+				const hi = 250 * time.Millisecond
+				if d < lo || d > hi {
+					t.Errorf("%s attempt=%d: backoff=%v not in [%v, %v]",
+						tc.name, attempt, d, lo, hi)
+				}
+			}
+		})
+	}
+}
+
+// TestCreateVMRetryBackoff_UnknownErrorType verifies that an opaque error with
+// no pve fingerprint also falls through to the 50–250 ms uniform jitter branch.
+func TestCreateVMRetryBackoff_UnknownErrorType(t *testing.T) {
+	t.Parallel()
+
+	unknownErr := fmt.Errorf("some opaque error with no pve fingerprint whatsoever")
+	d := createVMRetryBackoff(unknownErr, 0)
+	const lo = 50 * time.Millisecond
+	const hi = 250 * time.Millisecond
+	if d < lo || d > hi {
+		t.Errorf("unknown error type: backoff=%v not in [%v, %v]", d, lo, hi)
+	}
+}
+
+// --------------------------------------------------------------------------
+// normalizeOSType
+// --------------------------------------------------------------------------
+
+// TestNormalizeOSType covers all mapped BOSH/stemcell os_type values plus
+// empty input and unknown inputs (which are returned verbatim for PVE
+// validation).
+func TestNormalizeOSType(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		input string
+		want  string
+	}{
+		// Linux 2.6+ inputs → l26.
+		{"linux", "l26"},
+		{"ubuntu", "l26"},
+		{"centos", "l26"},
+		{"rhel", "l26"},
+		{"debian", "l26"},
+		{"fedora", "l26"},
+		{"alpine", "l26"},
+		{"l26", "l26"},
+		// Linux 2.4 → l24.
+		{"linux24", "l24"},
+		{"l24", "l24"},
+		// Windows variants.
+		{"windows", "win10"},
+		{"win", "win10"},
+		{"win10", "win10"},
+		{"win11", "win11"},
+		{"win7", "win7"},
+		{"win8", "win8"},
+		// Solaris.
+		{"solaris", "solaris"},
+		// Pass-through: unknown values returned verbatim for PVE to validate.
+		{"other-linux", "other-linux"},
+		{"wvista", "wvista"},
+		{"w2k8", "w2k8"},
+		{"custom-os", "custom-os"},
+		// Empty string returns empty string (verbatim pass-through).
+		{"", ""},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(fmt.Sprintf("input=%q", tc.input), func(t *testing.T) {
+			t.Parallel()
+			got := normalizeOSType(tc.input)
+			if got != tc.want {
+				t.Errorf("normalizeOSType(%q) = %q; want %q", tc.input, got, tc.want)
+			}
+		})
 	}
 }

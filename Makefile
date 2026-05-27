@@ -177,8 +177,14 @@ gosec: ## Run gosec security scanner
 		echo "$(YELLOW)gosec not installed — skipping. Install: go install github.com/securego/gosec/v2/cmd/gosec@latest$(RESET)"; \
 	fi
 
+.PHONY: trivy
+trivy: ## Run trivy filesystem scan for HIGH/CRITICAL CVEs (skips gracefully if trivy is not installed)
+	@echo "$(GREEN)Running trivy fs scan...$(RESET)"
+	@command -v trivy >/dev/null 2>&1 && trivy fs --severity HIGH,CRITICAL --exit-code 1 . || echo "$(YELLOW)trivy not installed — skipping. Install: https://trivy.dev/latest/getting-started/installation/$(RESET)"
+	@command -v trivy >/dev/null 2>&1 && echo "$(GREEN)✓ trivy passed$(RESET)" || true
+
 .PHONY: security
-security: govulncheck gosec ## Run all security scans
+security: govulncheck gosec trivy ## Run all security scans (govulncheck, gosec, trivy)
 	@echo "$(GREEN)✓ Security scans complete$(RESET)"
 
 ##@ Blobs
@@ -254,5 +260,5 @@ clean: release-clean ## Remove coverage files, bin/, and stray release artifacts
 	@echo "$(GREEN)✓ Clean complete$(RESET)"
 
 .PHONY: help build install tidy test coverage coverage-html coverage-check fmt vet lint \
-        staticcheck check govulncheck gosec security download-blobs upload-blobs sync-blobs \
+        staticcheck check govulncheck gosec trivy security download-blobs upload-blobs sync-blobs \
         release-build dev-release release release-clean release-hygiene bosh-clean clean

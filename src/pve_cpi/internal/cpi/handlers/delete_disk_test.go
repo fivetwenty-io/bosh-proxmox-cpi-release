@@ -14,6 +14,7 @@ import (
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/cpi/handlers"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
+	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
 )
 
 // baseDepsForDelete builds Deps for delete_disk tests.
@@ -204,8 +205,7 @@ func TestHandleDeleteDisk_EmptyVolumePart(t *testing.T) {
 
 // newHandlerMockClientNoCluster builds a mock client without cluster (cluster not needed for delete/has).
 // Reuses newHandlerMockClient with empty cluster VMID list.
-func newHandlerMockClientNoCluster(storageSvc *mockStorageService) interface { /* pve.Client */
-} {
+func newHandlerMockClientNoCluster(storageSvc *mockStorageService) any /* pve.Client */ {
 	return newHandlerMockClient(storageSvc, []int{})
 }
 
@@ -409,5 +409,54 @@ func TestHandleDeleteDisk_NoClusterCallExpected(t *testing.T) {
 	}
 	if clusterCalled {
 		t.Error("delete_disk must not call the cluster service (no VMID allocation needed)")
+	}
+}
+
+// TestHandleDeleteDisk_WithoutClusterService verifies that delete_disk succeeds
+// when the client is built without a populated cluster VMID list. The handler
+// must not require the cluster service for volume deletion. newHandlerMockClientNoCluster
+// wires an empty cluster list, confirming the delete path never touches VMID allocation.
+func TestHandleDeleteDisk_WithoutClusterService(t *testing.T) {
+	var deleteCalled bool
+	storageSvc := &mockStorageService{
+		deleteVolumeFn: func(_ context.Context, _, storage, volume string) error {
+			deleteCalled = true
+			if storage != "local-lvm" {
+				t.Errorf("expected storage %q, got %q", "local-lvm", storage)
+			}
+			if volume != "local-lvm:vm-9001-disk-0" {
+				t.Errorf("expected volume %q, got %q", "local-lvm:vm-9001-disk-0", volume)
+			}
+			return nil
+		},
+	}
+
+	// newHandlerMockClientNoCluster explicitly passes an empty cluster VMID list,
+	// asserting delete_disk works without any cluster state wired. The function
+	// returns interface{} (the underlying value is a pve.Client); assert the type
+	// so Deps.PVE can accept it.
+	client := newHandlerMockClientNoCluster(storageSvc).(pve.Client)
+	deps := handlers.Deps{
+		Config: &config.CPIConfig{
+			Node:        "pve1",
+			DiskStorage: "local-lvm",
+		},
+		PVE:    client,
+		Logger: log.NewNopLogger(),
+	}
+
+	h := handlers.HandleDeleteDisk(deps)
+	result, err := h.Handle(context.Background(), []json.RawMessage{
+		marshal("local-lvm:vm-9001-disk-0"),
+	}, jsonrpc.Context{})
+
+	if err != nil {
+		t.Fatalf("unexpected error with no-cluster client: %v", err)
+	}
+	if result != nil {
+		t.Errorf("expected nil result, got %v", result)
+	}
+	if !deleteCalled {
+		t.Error("expected DeleteVolume to be called via no-cluster client")
 	}
 }

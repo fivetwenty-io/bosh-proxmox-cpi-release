@@ -61,12 +61,15 @@ type ConfigDrive struct {
 // NewConfigDrive constructs a ConfigDrive bound to the given PVE client.
 // pveClient, logger must not be nil; storage must not be empty.
 func NewConfigDrive(pveClient pve.Client, storage string, logger *log.Logger) *ConfigDrive {
+	// invariant violation: nil pve.Client at construction; cannot occur at runtime
 	if pveClient == nil {
 		panic("agent: NewConfigDrive: pveClient must not be nil")
 	}
+	// invariant violation: nil logger at construction; cannot occur at runtime
 	if logger == nil {
 		panic("agent: NewConfigDrive: logger must not be nil")
 	}
+	// invariant violation: empty iso_storage at construction; cannot occur at runtime
 	if storage == "" {
 		panic("agent: NewConfigDrive: storage must not be empty")
 	}
@@ -231,11 +234,11 @@ func (a *ConfigDrive) uploadISO(ctx context.Context, node, localPath, filename s
 	// so transient failures are still retried with a fresh stream.
 	uploadCtx := sdkclient.WithRetries(ctx, 0)
 	return pve.RetryOnTransientOrLock(ctx, a.logger, "configdrive_upload", 0, func() error {
-		f, openErr := os.Open(localPath)
+		f, openErr := os.Open(localPath) // #nosec G304 -- localPath is CPI-owned MkdirTemp output
 		if openErr != nil {
 			return fmt.Errorf("open local iso: %w", openErr)
 		}
-		defer f.Close()
+		defer func() { _ = f.Close() }()
 
 		upid, err := a.pveSvc.Storage().Upload(uploadCtx, node, a.storage, "iso", filename, f)
 		if err != nil {

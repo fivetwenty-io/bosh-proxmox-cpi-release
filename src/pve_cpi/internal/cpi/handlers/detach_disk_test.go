@@ -21,7 +21,7 @@ import (
 
 type detachQEMUService struct {
 	// Config control — used by ResolveDiskID.
-	configCfg map[string]interface{}
+	configCfg map[string]any
 	configErr error
 
 	// DetachDisk control.
@@ -30,10 +30,10 @@ type detachQEMUService struct {
 	detachedDiskID string
 
 	// listSnapshotsFn drives the snapshot guard. nil → returns (nil, nil) (no snapshots).
-	listSnapshotsFn func(ctx context.Context, node string, vmid int) ([]map[string]interface{}, error)
+	listSnapshotsFn func(ctx context.Context, node string, vmid int) ([]map[string]any, error)
 }
 
-func (m *detachQEMUService) Config(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
+func (m *detachQEMUService) Config(_ context.Context, _ string, _ int) (map[string]any, error) {
 	return m.configCfg, m.configErr
 }
 
@@ -46,10 +46,10 @@ func (m *detachQEMUService) DetachDisk(_ context.Context, _ string, _ int, diskI
 func (m *detachQEMUService) AttachDisk(_ context.Context, _ string, _ int, _ string, _ string, _ *qemu.AttachOpts) (string, error) {
 	panic("detachQEMUService.AttachDisk: not expected")
 }
-func (m *detachQEMUService) Create(_ context.Context, _ string, _ map[string]interface{}) (string, error) {
+func (m *detachQEMUService) Create(_ context.Context, _ string, _ map[string]any) (string, error) {
 	panic("detachQEMUService.Create: not expected")
 }
-func (m *detachQEMUService) Status(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
+func (m *detachQEMUService) Status(_ context.Context, _ string, _ int) (map[string]any, error) {
 	panic("detachQEMUService.Status: not expected")
 }
 func (m *detachQEMUService) Start(_ context.Context, _ string, _ int) (string, error) {
@@ -61,7 +61,7 @@ func (m *detachQEMUService) Stop(_ context.Context, _ string, _ int) (string, er
 func (m *detachQEMUService) Reset(_ context.Context, _ string, _ int) (string, error) {
 	panic("detachQEMUService.Reset: not expected")
 }
-func (m *detachQEMUService) Clone(_ context.Context, _ string, _ int, _ map[string]interface{}) (string, error) {
+func (m *detachQEMUService) Clone(_ context.Context, _ string, _ int, _ map[string]any) (string, error) {
 	panic("detachQEMUService.Clone: not expected")
 }
 func (m *detachQEMUService) Template(_ context.Context, _ string, _ int) (string, error) {
@@ -70,7 +70,7 @@ func (m *detachQEMUService) Template(_ context.Context, _ string, _ int) (string
 func (m *detachQEMUService) ResizeDisk(_ context.Context, _ string, _ int, _ string, _ int) (string, error) {
 	panic("detachQEMUService.ResizeDisk: not expected")
 }
-func (m *detachQEMUService) Snapshot(_ context.Context, _ string, _ int, _ string, _ map[string]interface{}) (string, error) {
+func (m *detachQEMUService) Snapshot(_ context.Context, _ string, _ int, _ string, _ map[string]any) (string, error) {
 	panic("detachQEMUService.Snapshot: not expected")
 }
 func (m *detachQEMUService) DeleteSnapshot(_ context.Context, _ string, _ int, _ string) error {
@@ -78,7 +78,7 @@ func (m *detachQEMUService) DeleteSnapshot(_ context.Context, _ string, _ int, _
 }
 func (m *detachQEMUService) ListSnapshots(
 	ctx context.Context, node string, vmid int,
-) ([]map[string]interface{}, error) {
+) ([]map[string]any, error) {
 	if m.listSnapshotsFn != nil {
 		return m.listSnapshotsFn(ctx, node, vmid)
 	}
@@ -128,7 +128,7 @@ func TestHandleDetachDisk_Happy(t *testing.T) {
 	)
 
 	qemuSvc := &detachQEMUService{
-		configCfg: map[string]interface{}{
+		configCfg: map[string]any{
 			"scsi0": "local-lvm:vm-100-disk-0",
 			"scsi1": "local-lvm:vm-100-disk-1",
 			"scsi2": volid,
@@ -160,7 +160,7 @@ func TestHandleDetachDisk_NotAttached(t *testing.T) {
 	)
 
 	qemuSvc := &detachQEMUService{
-		configCfg: map[string]interface{}{
+		configCfg: map[string]any{
 			"scsi0": "local-lvm:vm-100-disk-0",
 		},
 	}
@@ -191,7 +191,7 @@ func TestHandleDetachDisk_SweepsLingeringUnusedSlot(t *testing.T) {
 	qemuSvc := &detachQEMUService{
 		// No active-bus slot for the volid → ResolveDiskID misses it. The disk is
 		// parked in unused0 with a size option (FindUnusedDiskEntries strips it).
-		configCfg: map[string]interface{}{
+		configCfg: map[string]any{
 			"scsi0":   "local-lvm:vm-100-disk-0",
 			"unused0": diskCID + ",size=2G",
 		},
@@ -222,7 +222,7 @@ func TestHandleDetachDisk_UnusedSlotDifferentVolume(t *testing.T) {
 	)
 
 	qemuSvc := &detachQEMUService{
-		configCfg: map[string]interface{}{
+		configCfg: map[string]any{
 			"unused0": "local-lvm:some-other-disk",
 		},
 	}
@@ -245,7 +245,7 @@ func TestHandleDetachDisk_DetachFail(t *testing.T) {
 	)
 
 	qemuSvc := &detachQEMUService{
-		configCfg: map[string]interface{}{"scsi2": volid},
+		configCfg: map[string]any{"scsi2": volid},
 		detachErr: errors.New("PVE refused to detach"),
 	}
 	h := handlers.HandleDetachDisk(detachDeps(qemuSvc))
@@ -265,7 +265,7 @@ func TestHandleDetachDisk_VMNotFound(t *testing.T) {
 	)
 
 	qemuSvc := &detachQEMUService{
-		configCfg: map[string]interface{}{"scsi2": volid},
+		configCfg: map[string]any{"scsi2": volid},
 		detachErr: &sdkerrors.APIError{Code: 404, Message: "VM not found"},
 	}
 	h := handlers.HandleDetachDisk(detachDeps(qemuSvc))
@@ -347,7 +347,7 @@ func TestHandleDetachDisk_ConfigFetchError(t *testing.T) {
 // (no disks attached at all) is treated as "not attached" and returns nil.
 func TestHandleDetachDisk_EmptyConfigIdempotent(t *testing.T) {
 	qemuSvc := &detachQEMUService{
-		configCfg: map[string]interface{}{}, // VM exists but has no disks
+		configCfg: map[string]any{},
 	}
 	h := handlers.HandleDetachDisk(detachDeps(qemuSvc))
 
@@ -369,10 +369,10 @@ func TestHandleDetachDisk_EmptyConfigIdempotent(t *testing.T) {
 
 // snapshotRows returns a ListSnapshots response containing the given snapshot
 // names plus the synthetic "current" entry (which HasSnapshots filters out).
-func snapshotRows(names ...string) []map[string]interface{} {
-	rows := []map[string]interface{}{{"name": "current"}} // synthetic — always present
+func snapshotRows(names ...string) []map[string]any {
+	rows := []map[string]any{{"name": "current"}} // synthetic — always present
 	for _, n := range names {
-		rows = append(rows, map[string]interface{}{"name": n})
+		rows = append(rows, map[string]any{"name": n})
 	}
 	return rows
 }
@@ -404,8 +404,8 @@ func TestHandleDetachDisk_SnapshotPresent_HardFail(t *testing.T) {
 	)
 
 	qemuSvc := &detachQEMUService{
-		configCfg: map[string]interface{}{"scsi2": volid},
-		listSnapshotsFn: func(_ context.Context, _ string, _ int) ([]map[string]interface{}, error) {
+		configCfg: map[string]any{"scsi2": volid},
+		listSnapshotsFn: func(_ context.Context, _ string, _ int) ([]map[string]any, error) {
 			return snapshotRows("snap-before-patch", "snap-qa"), nil
 		},
 	}
@@ -439,8 +439,8 @@ func TestHandleDetachDisk_NoSnapshots_Proceeds(t *testing.T) {
 	)
 
 	qemuSvc := &detachQEMUService{
-		configCfg: map[string]interface{}{"scsi2": volid},
-		listSnapshotsFn: func(_ context.Context, _ string, _ int) ([]map[string]interface{}, error) {
+		configCfg: map[string]any{"scsi2": volid},
+		listSnapshotsFn: func(_ context.Context, _ string, _ int) ([]map[string]any, error) {
 			return snapshotRows(), nil // only "current" synthetic — HasSnapshots returns []
 		},
 	}
@@ -466,8 +466,8 @@ func TestHandleDetachDisk_SnapshotCheckError_FailOpen(t *testing.T) {
 	)
 
 	qemuSvc := &detachQEMUService{
-		configCfg: map[string]interface{}{"scsi2": volid},
-		listSnapshotsFn: func(_ context.Context, _ string, _ int) ([]map[string]interface{}, error) {
+		configCfg: map[string]any{"scsi2": volid},
+		listSnapshotsFn: func(_ context.Context, _ string, _ int) ([]map[string]any, error) {
 			return nil, errors.New("PVE snapshot API unavailable")
 		},
 	}
@@ -493,8 +493,8 @@ func TestHandleDetachDisk_SnapshotCheckError_FailClosed(t *testing.T) {
 	)
 
 	qemuSvc := &detachQEMUService{
-		configCfg: map[string]interface{}{"scsi2": volid},
-		listSnapshotsFn: func(_ context.Context, _ string, _ int) ([]map[string]interface{}, error) {
+		configCfg: map[string]any{"scsi2": volid},
+		listSnapshotsFn: func(_ context.Context, _ string, _ int) ([]map[string]any, error) {
 			return nil, errors.New("PVE snapshot API unavailable")
 		},
 	}
@@ -520,8 +520,8 @@ func TestHandleDetachDisk_SnapshotPresent_AllowOverride(t *testing.T) {
 	)
 
 	qemuSvc := &detachQEMUService{
-		configCfg: map[string]interface{}{"scsi2": volid},
-		listSnapshotsFn: func(_ context.Context, _ string, _ int) ([]map[string]interface{}, error) {
+		configCfg: map[string]any{"scsi2": volid},
+		listSnapshotsFn: func(_ context.Context, _ string, _ int) ([]map[string]any, error) {
 			return snapshotRows("snap-emergency"), nil
 		},
 	}
@@ -551,7 +551,7 @@ func TestHandleDetachDisk_LVM_CID(t *testing.T) {
 	const diskCID = "local-lvm:vm-9001-disk-0"
 
 	qemuSvc := &detachQEMUService{
-		configCfg: map[string]interface{}{"scsi1": diskCID},
+		configCfg: map[string]any{"scsi1": diskCID},
 	}
 	h := handlers.HandleDetachDisk(detachDeps(qemuSvc))
 
@@ -573,7 +573,7 @@ func TestHandleDetachDisk_ZFSPool_CID(t *testing.T) {
 	const diskCID = "local-zfs:vm-9001-disk-0"
 
 	qemuSvc := &detachQEMUService{
-		configCfg: map[string]interface{}{"scsi1": diskCID},
+		configCfg: map[string]any{"scsi1": diskCID},
 	}
 	h := handlers.HandleDetachDisk(detachDeps(qemuSvc))
 
@@ -596,7 +596,7 @@ func TestHandleDetachDisk_Dir_CID(t *testing.T) {
 	const diskCID = "local:9001/vm-9001-disk-0.raw"
 
 	qemuSvc := &detachQEMUService{
-		configCfg: map[string]interface{}{"scsi1": diskCID},
+		configCfg: map[string]any{"scsi1": diskCID},
 	}
 	h := handlers.HandleDetachDisk(detachDeps(qemuSvc))
 
@@ -618,7 +618,7 @@ func TestHandleDetachDisk_LVMThin_CID(t *testing.T) {
 	const diskCID = "local-lvm-thin:vm-9001-disk-0"
 
 	qemuSvc := &detachQEMUService{
-		configCfg: map[string]interface{}{"scsi1": diskCID},
+		configCfg: map[string]any{"scsi1": diskCID},
 	}
 	h := handlers.HandleDetachDisk(detachDeps(qemuSvc))
 
@@ -648,7 +648,7 @@ func TestDetachDisk_SentinelIdempotent(t *testing.T) {
 	qemuSvc := &detachQEMUService{
 		// Config returns a populated map that does NOT contain diskCID on any
 		// bus slot or unused slot — ResolveDiskID wraps ErrDiskNotAttached.
-		configCfg: map[string]interface{}{
+		configCfg: map[string]any{
 			"scsi0": "local-lvm:vm-100-disk-0",
 		},
 	}

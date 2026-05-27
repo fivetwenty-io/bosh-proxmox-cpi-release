@@ -23,9 +23,11 @@ var _ Agent = (*RegistryAgent)(nil)
 // NewRegistryAgent constructs a RegistryAgent backed by reg.
 // Both reg and logger must be non-nil.
 func NewRegistryAgent(reg *registry.Client, logger *log.Logger) *RegistryAgent {
+	// invariant violation: nil registry.Client at construction; cannot occur at runtime
 	if reg == nil {
 		panic("registry.Client must not be nil")
 	}
+	// invariant violation: nil logger at construction; cannot occur at runtime
 	if logger == nil {
 		panic("log.Logger must not be nil")
 	}

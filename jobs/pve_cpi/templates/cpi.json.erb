@@ -31,6 +31,18 @@
     "fetch_credential_defaults" => p("pve.fetch_credential_defaults", []),
   }
 
+  # Emit pve_ca_cert only when the operator supplies a non-empty value. When
+  # absent or empty (the default), the key is omitted so the Go config
+  # zero-value ("") is preserved and TLS behavior is unchanged (system trust pool).
+  pve_ca_cert = p("pve.ca_cert", "")
+  config["pve_ca_cert"] = pve_ca_cert unless pve_ca_cert.to_s.empty?
+
+  # Emit stemcell_staging_dir only when the operator supplies a non-empty value.
+  # When absent or empty (the default), the key is omitted so the Go config
+  # zero-value ("") is preserved and no behavior change occurs.
+  stemcell_staging_dir = p("pve.stemcell_staging_dir", "")
+  config["stemcell_staging_dir"] = stemcell_staging_dir unless stemcell_staging_dir.to_s.empty?
+
   # Emit password / api_token only when non-empty. The Go config validator
   # rejects "both set" or "neither set" — this template never strips a value
   # the operator supplied. If both p() calls return non-empty, both keys
@@ -54,6 +66,11 @@
     config["registry_password"]        = p("registry.password")
     config["registry_allow_insecure"]  = p("registry.allow_insecure", false)
     config["registry_ca_cert"]         = p("registry.ca_cert", "")
+    # Emit registry_allowed_hosts only when the operator supplies a non-empty list.
+    # When absent or empty (the default), the key is omitted so the Go config
+    # zero-value ([]) is preserved and no behavior change occurs.
+    registry_allowed_hosts = p("registry.allowed_hosts", [])
+    config["registry_allowed_hosts"] = registry_allowed_hosts unless registry_allowed_hosts.nil? || registry_allowed_hosts.empty?
   end
   JSON.dump(config)
 %>

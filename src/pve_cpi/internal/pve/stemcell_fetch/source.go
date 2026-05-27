@@ -15,6 +15,7 @@ package stemcellfetch
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -105,15 +106,13 @@ func ResolveSource(rawURL string) (Source, Reference, error) {
 
 	default:
 		return nil, ref, fmt.Errorf(
-			"stemcell_fetch: unsupported URL scheme in %q (supported: https://, s3://, bosh+blobstore:, oci://)",
-			rawURL,
+			"stemcell_fetch: unsupported URL scheme in %q (supported: https://, s3://, bosh+blobstore:, oci://): %w",
+			rawURL, errNotImplemented,
 		)
 	}
 }
 
-// errNotImplemented returns a typed sentinel error for a known-but-not-yet-
-// wired scheme. Callers that need to distinguish "not-yet-implemented" from
-// "unsupported scheme" may use errors.Is against ErrNotImplemented.
-func errNotImplemented(scheme string) error {
-	return fmt.Errorf("stemcell_fetch: %s source not yet implemented", scheme)
-}
+// errNotImplemented is the sentinel for a known-but-not-yet-wired scheme.
+// Callers that need to distinguish "not-yet-implemented" from "unsupported
+// scheme" may use errors.Is against this value.
+var errNotImplemented = errors.New("stemcell_fetch: source not yet implemented")

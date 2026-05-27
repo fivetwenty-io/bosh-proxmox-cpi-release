@@ -15,6 +15,7 @@ import (
 	"math/rand/v2"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"syscall"
 	"time"
@@ -31,10 +32,12 @@ type settingsEnvelope struct {
 // Client is an HTTP client for the BOSH registry service.
 // Instances are safe for concurrent use after construction.
 type Client struct {
-	endpoint string
-	user     string
-	pass     string
-	http     *http.Client
+	endpoint       string
+	user           string
+	pass           string
+	http           *http.Client
+	configuredHost string   // host extracted from endpoint at construction; invariant-checked before every request
+	allowedHosts   []string // optional host allow-list; empty disables filtering
 }
 
 // defaultClientTimeout is the per-attempt timeout applied by NewClient when
@@ -53,6 +56,13 @@ type Options struct {
 	// Timeout overrides the per-attempt http.Client.Timeout. Zero or negative
 	// values fall back to defaultClientTimeout.
 	Timeout time.Duration
+
+	// AllowedHosts is an optional list of host patterns that restrict which
+	// hosts the client may contact. Each entry is an exact host or a wildcard
+	// prefix ("*.example.com"). Empty (default) disables host-allow-list
+	// filtering; the configuredHost invariant and disabled redirects still
+	// apply regardless. Sourced from config.RegistryAllowedHosts.
+	AllowedHosts []string
 }
 
 // NewClient constructs a Client for the registry at endpoint with default
@@ -67,9 +77,18 @@ func NewClient(endpoint, user, pass string) *Client {
 }
 
 // NewClientWithOptions constructs a Client with explicit transport options.
-// The HTTP client is configured with an http.Transport carrying a tls.Config
-// pinned to TLS 1.2 minimum; when opts.CACertPEM is non-empty the PEM is
-// appended to a copy of the system trust pool and assigned to RootCAs.
+//
+// Security posture:
+//   - TLS 1.2 floor is pinned on the underlying transport for every request.
+//   - HTTP redirects are disabled: CheckRedirect returns an error so any 3xx
+//     response surfaces immediately as a CloudError instead of being silently
+//     followed to a potentially attacker-controlled host. BOSH registries do
+//     not issue redirects; disabling them is safe and prevents SSRF via redirect.
+//   - The configuredHost field records the endpoint host at construction time.
+//     doWithRetry enforces an invariant that req.URL.Host equals configuredHost
+//     before every http.Do call, catching accidental URL mutation bugs.
+//   - When opts.AllowedHosts is non-empty, doWithRetry additionally verifies
+//     req.URL.Host against the allow-list (exact match or "*.example.com" wildcard).
 //
 // Returns an error only when opts.CACertPEM is non-empty and cannot be parsed
 // (either x509.SystemCertPool fails or no certificates are decoded from PEM).
@@ -92,16 +111,45 @@ func NewClientWithOptions(endpoint, user, pass string, opts Options) (*Client, e
 	if timeout <= 0 {
 		timeout = defaultClientTimeout
 	}
+
+	// Extract the configured host from the endpoint URL so we can enforce the
+	// configuredHost invariant in doWithRetry. Parse errors here are non-fatal
+	// because the config validator has already accepted the endpoint; we fall
+	// back to the raw endpoint string as a best-effort host value.
+	trimmedEndpoint := strings.TrimRight(endpoint, "/")
+	configuredHost := trimmedEndpoint
+	if u, parseErr := url.Parse(trimmedEndpoint); parseErr == nil && u.Host != "" {
+		configuredHost = u.Host
+	}
+
 	// Documented: TLS 1.2 floor pinned for every registry request; CACertPEM (when
 	// provided) augments the system trust pool, never replaces it.
 	transport := &http.Transport{TLSClientConfig: tlsCfg}
+
+	// Copy AllowedHosts to avoid retaining a reference to the caller's slice.
+	var allowedHosts []string
+	if len(opts.AllowedHosts) > 0 {
+		allowedHosts = make([]string, len(opts.AllowedHosts))
+		copy(allowedHosts, opts.AllowedHosts)
+	}
+
 	return &Client{
-		endpoint: strings.TrimRight(endpoint, "/"),
-		user:     user,
-		pass:     pass,
+		endpoint:       trimmedEndpoint,
+		user:           user,
+		pass:           pass,
+		configuredHost: configuredHost,
+		allowedHosts:   allowedHosts,
 		http: &http.Client{
 			Timeout:   timeout,
 			Transport: transport,
+			// Disable automatic redirect following. BOSH registries do not redirect;
+			// any 3xx response is unexpected and potentially dangerous (SSRF via
+			// redirect to a non-configured host). Returning an error here causes
+			// http.Client.Do to return the error, which doWithRetry treats as a
+			// non-retriable terminal failure — the caller receives a CloudError.
+			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+				return fmt.Errorf("registry: redirects disabled for security (SSRF prevention)")
+			},
 		},
 	}, nil
 }
@@ -174,8 +222,47 @@ func backoffDelay(i int) time.Duration {
 	for j := 0; j < i; j++ {
 		base *= 2
 	}
-	jitter := 0.75 + rand.Float64()*0.5
+	jitter := 0.75 + rand.Float64()*0.5 // #nosec G404 -- jitter; non-cryptographic
 	return time.Duration(float64(base) * jitter)
+}
+
+// hostMatchesAllowList reports whether host matches at least one entry in patterns.
+// Each pattern is either an exact host ("registry.example.com") or a wildcard
+// prefix pattern ("*.example.com"). Wildcard patterns match any single-level
+// subdomain of the suffix: "*.example.com" matches "foo.example.com" but not
+// "foo.bar.example.com" or "example.com". The comparison is case-insensitive.
+//
+// The host argument may include a port (e.g. "registry.example.com:443"); the
+// port is stripped before comparison so patterns need only carry the hostname.
+func hostMatchesAllowList(host string, patterns []string) bool {
+	// Strip port if present.
+	bare := host
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		bare = h
+	}
+	bare = strings.ToLower(bare)
+	for _, p := range patterns {
+		// Strip port from pattern for a forgiving comparison.
+		pBare := p
+		if ph, _, err := net.SplitHostPort(p); err == nil {
+			pBare = ph
+		}
+		pBare = strings.ToLower(pBare)
+		if strings.HasPrefix(pBare, "*.") {
+			// Wildcard: "*.example.com" matches exactly one label prefix.
+			suffix := pBare[1:] // ".example.com"
+			if strings.HasSuffix(bare, suffix) {
+				// Ensure the matched prefix is exactly one label (no nested dot).
+				prefix := bare[:len(bare)-len(suffix)]
+				if prefix != "" && !strings.Contains(prefix, ".") {
+					return true
+				}
+			}
+		} else if bare == pBare {
+			return true
+		}
+	}
+	return false
 }
 
 // doWithRetry executes req with up to retryMaxAttempts total attempts.
@@ -196,7 +283,7 @@ func (c *Client) doWithRetry(req *http.Request) (*http.Response, error) {
 			return
 		}
 		_, _ = io.Copy(io.Discard, io.LimitReader(r.Body, maxRegistryRespBody))
-		r.Body.Close()
+		_ = r.Body.Close() // #nosec G104 -- close on drained body; nothing actionable
 	}
 
 	var (
@@ -231,10 +318,29 @@ func (c *Client) doWithRetry(req *http.Request) (*http.Response, error) {
 		// Drain and close the previous failed response body before retrying.
 		if resp != nil {
 			drainAndClose(resp)
-			resp = nil
 		}
 
-		resp, err = c.http.Do(req)
+		// configuredHost invariant: verify req.URL.Host equals the host from the
+		// endpoint supplied at construction time. The registry client only builds
+		// URLs from c.endpoint, so a mismatch here indicates a bug (URL mutation)
+		// rather than a legitimate multi-host scenario. Always-on; no config gate.
+		if req.URL.Host != c.configuredHost {
+			drainAndClose(resp)
+			return nil, cpierrors.Cloud(
+				"registry: request host %q does not match configured host %q (invariant violation)",
+				req.URL.Host, c.configuredHost,
+			)
+		}
+		// registry_allowed_hosts filter: when non-empty, verify req.URL.Host
+		// matches at least one pattern (exact or "*.example.com" wildcard).
+		if len(c.allowedHosts) > 0 && !hostMatchesAllowList(req.URL.Host, c.allowedHosts) {
+			drainAndClose(resp)
+			return nil, cpierrors.Cloud(
+				"registry: request host %q is not in registry_allowed_hosts allow-list",
+				req.URL.Host,
+			)
+		}
+		resp, err = c.http.Do(req) // #nosec G704 -- URL host enforced via configuredHost invariant + CheckRedirect rejects redirects; registry_allowed_hosts may further constrain
 		if !isRetriable(resp, err) {
 			// Terminal: when both resp and err are non-nil (rare but possible
 			// with some net.http edge cases) close the body now since the
@@ -296,7 +402,7 @@ func (c *Client) Put(ctx context.Context, instanceID string, settings any) error
 	if err != nil {
 		return cpierrors.Cloud("registry: Put: %s", err.Error())
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxRegistryRespBody))
@@ -329,7 +435,7 @@ func (c *Client) Get(ctx context.Context, instanceID string) (json.RawMessage, e
 	if err != nil {
 		return nil, cpierrors.Cloud("registry: Get: %s", err.Error())
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode == http.StatusNotFound {
 		return nil, cpierrors.Cloud("registry: Get %s: not found (404)", instanceID)
@@ -376,7 +482,7 @@ func (c *Client) Delete(ctx context.Context, instanceID string) error {
 	if err != nil {
 		return cpierrors.Cloud("registry: Delete: %s", err.Error())
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	// 404 is idempotent — the record is already gone.
 	if resp.StatusCode == http.StatusNotFound {

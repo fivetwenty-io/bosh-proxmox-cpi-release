@@ -46,12 +46,12 @@ func (m *mockPVEClient) ClusterStorage() clusterstorage.Service { return nil }
 // CreateFn defaults to ("upid-mock-create", nil) when nil so tests not
 // exercising Create pass through without configuration.
 type mockQEMUService struct {
-	createFn func(ctx context.Context, node string, params map[string]interface{}) (string, error)
+	createFn func(ctx context.Context, node string, params map[string]any) (string, error)
 	stopFn   func(ctx context.Context, node string, vmid int) (string, error)
 	resetFn  func(ctx context.Context, node string, vmid int) (string, error)
 	startFn  func(ctx context.Context, node string, vmid int) (string, error)
-	statusFn func(ctx context.Context, node string, vmid int) (map[string]interface{}, error)
-	configFn func(ctx context.Context, node string, vmid int) (map[string]interface{}, error)
+	statusFn func(ctx context.Context, node string, vmid int) (map[string]any, error)
+	configFn func(ctx context.Context, node string, vmid int) (map[string]any, error)
 }
 
 func (m *mockQEMUService) Stop(ctx context.Context, node string, vmid int) (string, error) {
@@ -68,17 +68,17 @@ func (m *mockQEMUService) Reset(ctx context.Context, node string, vmid int) (str
 	panic("mockQEMUService.Reset: not configured")
 }
 
-func (m *mockQEMUService) Config(ctx context.Context, node string, vmid int) (map[string]interface{}, error) {
+func (m *mockQEMUService) Config(ctx context.Context, node string, vmid int) (map[string]any, error) {
 	if m.configFn != nil {
 		return m.configFn(ctx, node, vmid)
 	}
 	// Default: empty config. Handlers (e.g., set_vm_metadata) call Config()
 	// to preserve operator-supplied tags; tests that don't exercise that
 	// preservation logic should see a no-op empty config.
-	return map[string]interface{}{}, nil
+	return map[string]any{}, nil
 }
 
-func (m *mockQEMUService) Create(ctx context.Context, node string, params map[string]interface{}) (string, error) {
+func (m *mockQEMUService) Create(ctx context.Context, node string, params map[string]any) (string, error) {
 	if m.createFn != nil {
 		return m.createFn(ctx, node, params)
 	}
@@ -86,7 +86,7 @@ func (m *mockQEMUService) Create(ctx context.Context, node string, params map[st
 	return "upid-mock-create", nil
 }
 
-func (m *mockQEMUService) Status(ctx context.Context, node string, vmid int) (map[string]interface{}, error) {
+func (m *mockQEMUService) Status(ctx context.Context, node string, vmid int) (map[string]any, error) {
 	if m.statusFn != nil {
 		return m.statusFn(ctx, node, vmid)
 	}
@@ -101,7 +101,7 @@ func (m *mockQEMUService) Start(ctx context.Context, node string, vmid int) (str
 }
 
 // Unimplemented qemu.Service methods — panic on accidental call.
-func (m *mockQEMUService) Clone(_ context.Context, _ string, _ int, _ map[string]interface{}) (string, error) {
+func (m *mockQEMUService) Clone(_ context.Context, _ string, _ int, _ map[string]any) (string, error) {
 	panic("mockQEMUService.Clone: not expected")
 }
 func (m *mockQEMUService) Template(_ context.Context, _ string, _ int) (string, error) {
@@ -116,13 +116,13 @@ func (m *mockQEMUService) DetachDisk(_ context.Context, _ string, _ int, _ strin
 func (m *mockQEMUService) ResizeDisk(_ context.Context, _ string, _ int, _ string, _ int) (string, error) {
 	panic("mockQEMUService.ResizeDisk: not expected")
 }
-func (m *mockQEMUService) Snapshot(_ context.Context, _ string, _ int, _ string, _ map[string]interface{}) (string, error) {
+func (m *mockQEMUService) Snapshot(_ context.Context, _ string, _ int, _ string, _ map[string]any) (string, error) {
 	panic("mockQEMUService.Snapshot: not expected")
 }
 func (m *mockQEMUService) DeleteSnapshot(_ context.Context, _ string, _ int, _ string) error {
 	panic("mockQEMUService.DeleteSnapshot: not expected")
 }
-func (m *mockQEMUService) ListSnapshots(_ context.Context, _ string, _ int) ([]map[string]interface{}, error) {
+func (m *mockQEMUService) ListSnapshots(_ context.Context, _ string, _ int) ([]map[string]any, error) {
 	panic("mockQEMUService.ListSnapshots: not expected")
 }
 func (m *mockQEMUService) RollbackSnapshot(_ context.Context, _ string, _ int, _ string) (string, error) {
@@ -189,7 +189,7 @@ func (m *mockNodesService) ListStorage(ctx context.Context, node string, params 
 	if params != nil && params.Storage != nil && *params.Storage != "" {
 		storageName = *params.Storage
 	}
-	raw, _ := json.Marshal(map[string]interface{}{
+	raw, _ := json.Marshal(map[string]any{
 		"storage": storageName,
 		"type":    "dir",
 		"active":  1,
@@ -245,6 +245,7 @@ func (m *mockAgentService) UpdateDiskHints(_ context.Context, _ int, _ []agent.D
 // helpers
 // --------------------------------------------------------------------------
 
+//nolint:modernize // helper supports non-zero bool values; new(bool) only gives false
 func boolPtr(b bool) *bool { return &b }
 
 // --------------------------------------------------------------------------
@@ -576,7 +577,7 @@ func (m *mockClusterSvc) ListResources(ctx context.Context, params *cluster.List
 // Used to feed FindVMNodeViaCluster in tests that need the cluster scan to
 // resolve a specific node for a VM.
 func clusterVMOnNode(vmid int, node string) *cluster.ListResourcesResponse {
-	raw, _ := json.Marshal(map[string]interface{}{
+	raw, _ := json.Marshal(map[string]any{
 		"vmid": vmid,
 		"node": node,
 		"type": "qemu",

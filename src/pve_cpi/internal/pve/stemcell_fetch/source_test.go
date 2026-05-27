@@ -241,7 +241,7 @@ func TestResolveCredentials(t *testing.T) {
 		},
 		{
 			name:      "s3 auth type with valid credentials returns s3Credentials",
-			propsAuth: mustRaw(map[string]interface{}{"type": "s3", "access_key_id": "AKIATEST", "secret_access_key": "secretval"}),
+			propsAuth: mustRaw(map[string]any{"type": "s3", "access_key_id": "AKIATEST", "secret_access_key": "secretval"}),
 			defaults:  nil,
 			url:       "s3://bucket/key",
 			wantKind:  "s3",

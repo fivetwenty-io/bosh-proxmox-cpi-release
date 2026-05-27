@@ -180,17 +180,17 @@ func TestFormatSnapshotCID_RoundTrip(t *testing.T) {
 // All methods except Config panic if called, enforcing that ResolveDiskID only
 // calls Config.
 type diskMockQEMUService struct {
-	configCfg map[string]interface{}
+	configCfg map[string]any
 	configErr error
 }
 
-func (m *diskMockQEMUService) Config(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
+func (m *diskMockQEMUService) Config(_ context.Context, _ string, _ int) (map[string]any, error) {
 	return m.configCfg, m.configErr
 }
-func (m *diskMockQEMUService) Create(_ context.Context, _ string, _ map[string]interface{}) (string, error) {
+func (m *diskMockQEMUService) Create(_ context.Context, _ string, _ map[string]any) (string, error) {
 	panic("Create not expected")
 }
-func (m *diskMockQEMUService) Status(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
+func (m *diskMockQEMUService) Status(_ context.Context, _ string, _ int) (map[string]any, error) {
 	panic("Status not expected")
 }
 func (m *diskMockQEMUService) Start(_ context.Context, _ string, _ int) (string, error) {
@@ -202,7 +202,7 @@ func (m *diskMockQEMUService) Stop(_ context.Context, _ string, _ int) (string, 
 func (m *diskMockQEMUService) Reset(_ context.Context, _ string, _ int) (string, error) {
 	panic("Reset not expected")
 }
-func (m *diskMockQEMUService) Clone(_ context.Context, _ string, _ int, _ map[string]interface{}) (string, error) {
+func (m *diskMockQEMUService) Clone(_ context.Context, _ string, _ int, _ map[string]any) (string, error) {
 	panic("Clone not expected")
 }
 func (m *diskMockQEMUService) Template(_ context.Context, _ string, _ int) (string, error) {
@@ -217,13 +217,13 @@ func (m *diskMockQEMUService) DetachDisk(_ context.Context, _ string, _ int, _ s
 func (m *diskMockQEMUService) ResizeDisk(_ context.Context, _ string, _ int, _ string, _ int) (string, error) {
 	panic("ResizeDisk not expected")
 }
-func (m *diskMockQEMUService) Snapshot(_ context.Context, _ string, _ int, _ string, _ map[string]interface{}) (string, error) {
+func (m *diskMockQEMUService) Snapshot(_ context.Context, _ string, _ int, _ string, _ map[string]any) (string, error) {
 	panic("Snapshot not expected")
 }
 func (m *diskMockQEMUService) DeleteSnapshot(_ context.Context, _ string, _ int, _ string) error {
 	panic("DeleteSnapshot not expected")
 }
-func (m *diskMockQEMUService) ListSnapshots(_ context.Context, _ string, _ int) ([]map[string]interface{}, error) {
+func (m *diskMockQEMUService) ListSnapshots(_ context.Context, _ string, _ int) ([]map[string]any, error) {
 	panic("ListSnapshots not expected")
 }
 func (m *diskMockQEMUService) RollbackSnapshot(_ context.Context, _ string, _ int, _ string) (string, error) {
@@ -243,7 +243,7 @@ func (c *diskMockClient) Nodes() nodes.Service                   { return nil }
 func (c *diskMockClient) Cluster() cluster.Service               { return nil }
 func (c *diskMockClient) ClusterStorage() clusterstorage.Service { return nil }
 
-func newMockClientWithConfig(cfg map[string]interface{}, err error) pve.Client {
+func newMockClientWithConfig(cfg map[string]any, err error) pve.Client {
 	return &diskMockClient{
 		qemuSvc: &diskMockQEMUService{configCfg: cfg, configErr: err},
 	}
@@ -254,7 +254,7 @@ func newMockClientWithConfig(cfg map[string]interface{}, err error) pve.Client {
 // ---------------------------------------------------------------------------
 
 func TestResolveDiskID_Found(t *testing.T) {
-	cfg := map[string]interface{}{
+	cfg := map[string]any{
 		"scsi0": "local-lvm:vm-100-disk-0",
 		"scsi1": "local:vm-100-disk-1",
 		"ide2":  "local:cloudinit",
@@ -272,7 +272,7 @@ func TestResolveDiskID_Found(t *testing.T) {
 }
 
 func TestResolveDiskID_FoundScsi0(t *testing.T) {
-	cfg := map[string]interface{}{
+	cfg := map[string]any{
 		"scsi0": "local-lvm:vm-100-disk-0",
 	}
 	c := newMockClientWithConfig(cfg, nil)
@@ -287,7 +287,7 @@ func TestResolveDiskID_FoundScsi0(t *testing.T) {
 }
 
 func TestResolveDiskID_NotFound(t *testing.T) {
-	cfg := map[string]interface{}{
+	cfg := map[string]any{
 		"scsi0": "local-lvm:vm-100-disk-0",
 	}
 	c := newMockClientWithConfig(cfg, nil)
@@ -336,7 +336,7 @@ func TestResolveDiskID_EmptyVolID(t *testing.T) {
 }
 
 func TestResolveDiskID_EmptyConfig(t *testing.T) {
-	c := newMockClientWithConfig(map[string]interface{}{}, nil)
+	c := newMockClientWithConfig(map[string]any{}, nil)
 	_, err := pve.ResolveDiskID(context.Background(), c, "pve1", 100, "local:vm-100-disk-0")
 	if err == nil {
 		t.Fatal("expected error when config is empty and volid not found")
@@ -376,10 +376,10 @@ func (f *diskFakeCluster) ListResources(ctx context.Context, params *cluster.Lis
 // diskFakeQEMU is a minimal qemu.Service that returns a canned config for any VM.
 type diskFakeQEMU struct {
 	qemu.Service
-	cfg map[string]interface{}
+	cfg map[string]any
 }
 
-func (q *diskFakeQEMU) Config(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
+func (q *diskFakeQEMU) Config(_ context.Context, _ string, _ int) (map[string]any, error) {
 	return q.cfg, nil
 }
 
@@ -417,7 +417,7 @@ func TestFindVMByDiskVolid_TransientThenSuccess(t *testing.T) {
 			},
 		},
 		qemuSvc: &diskFakeQEMU{
-			cfg: map[string]interface{}{
+			cfg: map[string]any{
 				"scsi0": volid,
 			},
 		},
@@ -447,19 +447,19 @@ func TestFindUnusedDiskEntries(t *testing.T) {
 
 	cases := []struct {
 		name     string
-		cfg      map[string]interface{}
+		cfg      map[string]any
 		wantKeys []string          // expected slot keys in result
 		wantVals map[string]string // expected slot→bare-volid mapping
 		wantLen  int               // expected result length
 	}{
 		{
 			name:    "empty config map returns empty result",
-			cfg:     map[string]interface{}{},
+			cfg:     map[string]any{},
 			wantLen: 0,
 		},
 		{
 			name: "one unused0 entry parsed correctly",
-			cfg: map[string]interface{}{
+			cfg: map[string]any{
 				"unused0": "local-lvm:vm-100-disk-0,size=10G",
 			},
 			wantLen:  1,
@@ -468,7 +468,7 @@ func TestFindUnusedDiskEntries(t *testing.T) {
 		},
 		{
 			name: "multiple unusedN entries all returned in slot-keyed map",
-			cfg: map[string]interface{}{
+			cfg: map[string]any{
 				"unused0": "local-lvm:vm-100-disk-0",
 				"unused1": "local-lvm:vm-100-disk-1",
 				"unused2": "data:vm-200-disk-0",
@@ -482,7 +482,7 @@ func TestFindUnusedDiskEntries(t *testing.T) {
 		},
 		{
 			name: "mixed unused and non-unused keys returns only unused entries",
-			cfg: map[string]interface{}{
+			cfg: map[string]any{
 				"scsi0":   "local-lvm:vm-100-disk-0",
 				"net0":    "virtio=aa:bb:cc:dd:ee:ff,bridge=vmbr0",
 				"unused0": "local-lvm:vm-100-disk-1",
@@ -494,7 +494,7 @@ func TestFindUnusedDiskEntries(t *testing.T) {
 		},
 		{
 			name: "unused0 with extra comma-separated options strips options suffix",
-			cfg: map[string]interface{}{
+			cfg: map[string]any{
 				"unused0": "local-lvm:vm-100-disk-0,iothread=1,cache=writeback",
 			},
 			wantLen:  1,
@@ -502,7 +502,7 @@ func TestFindUnusedDiskEntries(t *testing.T) {
 		},
 		{
 			name: "malformed unused entry without storage colon is skipped (bare value kept)",
-			cfg: map[string]interface{}{
+			cfg: map[string]any{
 				// PVE normally always emits "storage:volid"; a value with no colon
 				// is unexpected but FindUnusedDiskEntries must not panic. The bare
 				// string (no comma suffix) is stored as-is under the slot key.

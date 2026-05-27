@@ -95,6 +95,10 @@ type SDNZone struct {
 	Raw    json.RawMessage `json:"-"`
 }
 
+// CreateSDNZone is reserved for a future create_network refactor; it is
+// covered by unit tests in sdn_test.go. Do not remove without updating
+// the corresponding test cases.
+//
 // CreateSDNZone issues POST /cluster/sdn/zones with the typed parameters.
 //
 // Returns nil on success. Validation errors (empty Zone or Type) surface as
@@ -273,6 +277,10 @@ type SDNVnet struct {
 	Raw       json.RawMessage `json:"-"`
 }
 
+// CreateSDNVnet is reserved for a future create_network refactor; it is
+// covered by unit tests in sdn_test.go. Do not remove without updating
+// the corresponding test cases.
+//
 // CreateSDNVnet issues POST /cluster/sdn/vnets.
 func CreateSDNVnet(ctx context.Context, c Client, p SDNVnetParams) error {
 	if ctx == nil {
@@ -448,6 +456,10 @@ type SDNSubnet struct {
 	Raw     json.RawMessage `json:"-"`
 }
 
+// CreateSDNVnetSubnet is reserved for a future create_network refactor; it is
+// covered by unit tests in sdn_test.go. Do not remove without updating
+// the corresponding test cases.
+//
 // CreateSDNVnetSubnet issues POST /cluster/sdn/vnets/{vnet}/subnets.
 //
 // The SDK requires a "type" field whose only PVE-accepted value is
@@ -587,6 +599,10 @@ func ListSDNVnetSubnets(ctx context.Context, c Client, vnet string) ([]SDNSubnet
 // Apply
 // ---------------------------------------------------------------------------
 
+// ApplySDN is reserved for a future create_network refactor; it is
+// covered by unit tests in sdn_test.go. Do not remove without updating
+// the corresponding test cases.
+//
 // ApplySDN commits pending SDN configuration via PUT /cluster/sdn
 // (cluster.Service.UpdateSdn). Passes nil params (no lock-token, no
 // release-lock) so the call is suitable for unlocked apply flows.

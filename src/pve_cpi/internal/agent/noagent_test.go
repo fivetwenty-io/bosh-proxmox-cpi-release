@@ -63,9 +63,7 @@ func TestUpdateDiskHints_NoOp(t *testing.T) {
 func TestSatisfiesInterface(t *testing.T) {
 	t.Parallel()
 	var iface Agent = NewNoAgent(log.NewNopLogger())
-	if iface == nil {
-		t.Fatal("NoAgent does not satisfy Agent interface at runtime")
-	}
+	_ = iface // compile-time proof that *noAgent satisfies Agent
 }
 
 func TestLogsAtDebug_Configure(t *testing.T) {

@@ -1,8 +1,18 @@
 package config_test
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/json"
+	"encoding/pem"
+	"math/big"
+	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
@@ -20,6 +30,8 @@ func mustLoad(t *testing.T, jsonStr string) (*config.CPIConfig, error) {
 }
 
 // boolPtr returns a pointer to b, for constructing *bool fields in literals.
+//
+//nolint:modernize // helper supports non-zero bool values; new(bool) only gives false
 func boolPtr(b bool) *bool { return &b }
 
 // assertCloudError asserts err is a *cpierrors.Error with TypeCloud and that
@@ -1098,10 +1110,6 @@ func TestValidate_RegistryHTTPAllowedWithOptIn(t *testing.T) {
 			if !ok {
 				t.Errorf("warn entry missing 'endpoint' attribute: %+v", e)
 			}
-			if epStr, _ := ep.(string); strings.Contains(epStr, "REDACTED") {
-				// expected when endpoint had userinfo; for this test the URL has none
-				// so just confirm it carries the supplied host.
-			}
 			if epStr, _ := ep.(string); !strings.Contains(epStr, "registry.example.com") {
 				t.Errorf("endpoint attr %q lost host", epStr)
 			}
@@ -1332,4 +1340,175 @@ func TestNUMAValue_DefaultTrue(t *testing.T) {
 			t.Error("NUMAValue() = false after Load with numa absent, want true")
 		}
 	})
+}
+
+// --------------------------------------------------------------------------
+// TestValidate_StemcellStagingDir
+// --------------------------------------------------------------------------
+
+// TestValidate_StemcellStagingDir_EmptyDefault verifies that an omitted
+// stemcell_staging_dir leaves StemcellStagingDir empty and passes validation
+// unchanged — byte-identical behavior to prior releases when the field is absent.
+func TestValidate_StemcellStagingDir_EmptyDefault(t *testing.T) {
+	t.Parallel()
+	cfg, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br"
+	}`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.StemcellStagingDir != "" {
+		t.Errorf("StemcellStagingDir = %q; want empty string (default)", cfg.StemcellStagingDir)
+	}
+}
+
+// TestValidate_StemcellStagingDir_ValidDir verifies that an absolute path to
+// an existing directory passes validation and is stored correctly.
+func TestValidate_StemcellStagingDir_ValidDir(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	cfg, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+		"stemcell_staging_dir":"`+dir+`"
+	}`)
+	if err != nil {
+		t.Fatalf("unexpected error for valid stemcell_staging_dir: %v", err)
+	}
+	if cfg.StemcellStagingDir != dir {
+		t.Errorf("StemcellStagingDir = %q; want %q", cfg.StemcellStagingDir, dir)
+	}
+}
+
+// TestValidate_StemcellStagingDir_RelativePath verifies that a relative path
+// is rejected with a clear error message.
+func TestValidate_StemcellStagingDir_RelativePath(t *testing.T) {
+	t.Parallel()
+	_, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+		"stemcell_staging_dir":"relative/path"
+	}`)
+	assertCloudError(t, err, "stemcell_staging_dir")
+	assertCloudError(t, err, "absolute path")
+}
+
+// TestValidate_StemcellStagingDir_NonExistent verifies that a non-existent
+// absolute path is rejected with a clear error message.
+func TestValidate_StemcellStagingDir_NonExistent(t *testing.T) {
+	t.Parallel()
+	_, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+		"stemcell_staging_dir":"/nonexistent-bosh-cpi-test-dir-should-not-exist"
+	}`)
+	assertCloudError(t, err, "stemcell_staging_dir")
+	assertCloudError(t, err, "does not exist")
+}
+
+// TestValidate_StemcellStagingDir_IsFile verifies that a path that exists but
+// is a regular file (not a directory) is rejected.
+func TestValidate_StemcellStagingDir_IsFile(t *testing.T) {
+	t.Parallel()
+	tmpFile, ferr := os.CreateTemp("", "cpi-test-not-a-dir-*")
+	if ferr != nil {
+		t.Fatalf("create temp file: %v", ferr)
+	}
+	defer func() { _ = os.Remove(tmpFile.Name()) }()
+	_ = tmpFile.Close()
+
+	_, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+		"stemcell_staging_dir":"`+tmpFile.Name()+`"
+	}`)
+	assertCloudError(t, err, "stemcell_staging_dir")
+	assertCloudError(t, err, "not a directory")
+}
+
+// --------------------------------------------------------------------------
+// TestValidate_PVECACertPEM
+// --------------------------------------------------------------------------
+
+// selfSignedCAPEMForConfigTest generates a minimal self-signed CA certificate
+// and returns it as a PEM string. For use in config validation tests only.
+func selfSignedCAPEMForConfigTest(t *testing.T) string {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "test-ca"},
+		NotBefore:             time.Now().Add(-time.Minute),
+		NotAfter:              time.Now().Add(time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("create cert: %v", err)
+	}
+	return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
+}
+
+// TestValidate_PVECACertPEM_Empty verifies that an absent pve_ca_cert field
+// passes validation unchanged — behavior is byte-identical to prior releases.
+func TestValidate_PVECACertPEM_Empty(t *testing.T) {
+	t.Parallel()
+	_, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br"
+	}`)
+	if err != nil {
+		t.Fatalf("empty pve_ca_cert: expected no error, got: %v", err)
+	}
+}
+
+// TestValidate_PVECACertPEM_ValidPEM verifies that a well-formed PEM CA bundle
+// passes validation when verify_ssl is true (the default).
+func TestValidate_PVECACertPEM_ValidPEM(t *testing.T) {
+	t.Parallel()
+	caPEM := selfSignedCAPEMForConfigTest(t)
+	// JSON-encode the PEM so it is safely embedded in the JSON literal.
+	pemJSON, _ := json.Marshal(caPEM)
+	_, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+		"pve_ca_cert":`+string(pemJSON)+`
+	}`)
+	if err != nil {
+		t.Fatalf("valid pve_ca_cert: expected no error, got: %v", err)
+	}
+}
+
+// TestValidate_PVECACertPEM_Malformed verifies that a malformed PEM value is
+// rejected at validation time with a descriptive error message.
+func TestValidate_PVECACertPEM_Malformed(t *testing.T) {
+	t.Parallel()
+	_, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+		"pve_ca_cert":"not-a-valid-pem-string"
+	}`)
+	assertCloudError(t, err, "pve_ca_cert")
+	assertCloudError(t, err, "no valid PEM certificates parsed")
+}
+
+// TestValidate_PVECACertPEM_IgnoredWhenVerifySSLFalse verifies that a malformed
+// PEM is silently ignored when verify_ssl=false (insecure-skip-verify path).
+// This confirms the CA cert is not parsed at all when TLS verification is off.
+func TestValidate_PVECACertPEM_IgnoredWhenVerifySSLFalse(t *testing.T) {
+	t.Parallel()
+	_, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+		"verify_ssl":false,
+		"pve_ca_cert":"not-a-valid-pem-string"
+	}`)
+	if err != nil {
+		t.Fatalf("malformed pve_ca_cert with verify_ssl=false: expected no error, got: %v", err)
+	}
 }

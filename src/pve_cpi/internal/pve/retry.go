@@ -48,7 +48,7 @@ func TransientBackoff(attempt int) time.Duration {
 	jitterWindow := int64(d) * 6 / 10
 	var jitter time.Duration
 	if jitterWindow > 0 {
-		jitter = time.Duration(mrand.Int64N(jitterWindow))
+		jitter = time.Duration(mrand.Int64N(jitterWindow)) // #nosec G404 -- backoff jitter; non-cryptographic
 	}
 	out := d - d*3/10 + jitter
 	if out > maxBackoff {
@@ -80,7 +80,7 @@ func StorageLockBackoff(attempt int) time.Duration {
 	jitterWindow := int64(d) * 6 / 10
 	var jitter time.Duration
 	if jitterWindow > 0 {
-		jitter = time.Duration(mrand.Int64N(jitterWindow))
+		jitter = time.Duration(mrand.Int64N(jitterWindow)) // #nosec G404 -- backoff jitter; non-cryptographic
 	}
 	out := d - d*3/10 + jitter
 	if out > maxBackoff {

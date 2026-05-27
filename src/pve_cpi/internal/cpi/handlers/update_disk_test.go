@@ -23,16 +23,16 @@ import (
 // ---------------------------------------------------------------------------
 
 type updateDiskQEMUService struct {
-	configFn     func(ctx context.Context, node string, vmid int) (map[string]interface{}, error)
+	configFn     func(ctx context.Context, node string, vmid int) (map[string]any, error)
 	resizeDiskFn func(ctx context.Context, node string, vmid int, diskID string, sizeGiB int) (string, error)
 	attachDiskFn func(ctx context.Context, node string, vmid int, volid string, bus string, opts *qemu.AttachOpts) (string, error)
 }
 
-func (m *updateDiskQEMUService) Config(ctx context.Context, node string, vmid int) (map[string]interface{}, error) {
+func (m *updateDiskQEMUService) Config(ctx context.Context, node string, vmid int) (map[string]any, error) {
 	if m.configFn != nil {
 		return m.configFn(ctx, node, vmid)
 	}
-	return map[string]interface{}{}, nil
+	return map[string]any{}, nil
 }
 
 func (m *updateDiskQEMUService) ResizeDisk(ctx context.Context, node string, vmid int, diskID string, sizeGiB int) (string, error) {
@@ -50,10 +50,10 @@ func (m *updateDiskQEMUService) AttachDisk(ctx context.Context, node string, vmi
 }
 
 // Unimplemented methods.
-func (m *updateDiskQEMUService) Create(_ context.Context, _ string, _ map[string]interface{}) (string, error) {
+func (m *updateDiskQEMUService) Create(_ context.Context, _ string, _ map[string]any) (string, error) {
 	panic("updateDiskQEMUService.Create: not expected")
 }
-func (m *updateDiskQEMUService) Status(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
+func (m *updateDiskQEMUService) Status(_ context.Context, _ string, _ int) (map[string]any, error) {
 	panic("updateDiskQEMUService.Status: not expected")
 }
 func (m *updateDiskQEMUService) Start(_ context.Context, _ string, _ int) (string, error) {
@@ -65,7 +65,7 @@ func (m *updateDiskQEMUService) Stop(_ context.Context, _ string, _ int) (string
 func (m *updateDiskQEMUService) Reset(_ context.Context, _ string, _ int) (string, error) {
 	panic("updateDiskQEMUService.Reset: not expected")
 }
-func (m *updateDiskQEMUService) Clone(_ context.Context, _ string, _ int, _ map[string]interface{}) (string, error) {
+func (m *updateDiskQEMUService) Clone(_ context.Context, _ string, _ int, _ map[string]any) (string, error) {
 	panic("updateDiskQEMUService.Clone: not expected")
 }
 func (m *updateDiskQEMUService) Template(_ context.Context, _ string, _ int) (string, error) {
@@ -74,13 +74,13 @@ func (m *updateDiskQEMUService) Template(_ context.Context, _ string, _ int) (st
 func (m *updateDiskQEMUService) DetachDisk(_ context.Context, _ string, _ int, _ string) error {
 	panic("updateDiskQEMUService.DetachDisk: not expected")
 }
-func (m *updateDiskQEMUService) Snapshot(_ context.Context, _ string, _ int, _ string, _ map[string]interface{}) (string, error) {
+func (m *updateDiskQEMUService) Snapshot(_ context.Context, _ string, _ int, _ string, _ map[string]any) (string, error) {
 	panic("updateDiskQEMUService.Snapshot: not expected")
 }
 func (m *updateDiskQEMUService) DeleteSnapshot(_ context.Context, _ string, _ int, _ string) error {
 	panic("updateDiskQEMUService.DeleteSnapshot: not expected")
 }
-func (m *updateDiskQEMUService) ListSnapshots(_ context.Context, _ string, _ int) ([]map[string]interface{}, error) {
+func (m *updateDiskQEMUService) ListSnapshots(_ context.Context, _ string, _ int) ([]map[string]any, error) {
 	panic("updateDiskQEMUService.ListSnapshots: not expected")
 }
 func (m *updateDiskQEMUService) RollbackSnapshot(_ context.Context, _ string, _ int, _ string) (string, error) {
@@ -131,12 +131,12 @@ func TestHandleUpdateDisk_OptionsOnly(t *testing.T) {
 	// call 3+ returns the full option string (for reading existing options to merge).
 	callCount := 0
 	qemuSvc := &updateDiskQEMUService{
-		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
 			callCount++
 			if callCount <= 2 {
-				return map[string]interface{}{"scsi2": volid}, nil
+				return map[string]any{"scsi2": volid}, nil
 			}
-			return map[string]interface{}{"scsi2": volid + ",size=10G"}, nil
+			return map[string]any{"scsi2": volid + ",size=10G"}, nil
 		},
 		attachDiskFn: func(_ context.Context, _ string, _ int, optStr string, _ string, opts *qemu.AttachOpts) (string, error) {
 			capturedOptStr = optStr
@@ -181,12 +181,12 @@ func TestHandleUpdateDisk_SizeOnly(t *testing.T) {
 	// calls 1-2: canonical volid; call 3+: option string with size (for resize).
 	callCount2 := 0
 	qemuSvc := &updateDiskQEMUService{
-		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
 			callCount2++
 			if callCount2 <= 2 {
-				return map[string]interface{}{"scsi2": volid}, nil
+				return map[string]any{"scsi2": volid}, nil
 			}
-			return map[string]interface{}{"scsi2": volid + ",size=10G"}, nil
+			return map[string]any{"scsi2": volid + ",size=10G"}, nil
 		},
 		resizeDiskFn: func(_ context.Context, _ string, _ int, _ string, deltaGiB int) (string, error) {
 			capturedDelta = deltaGiB
@@ -224,12 +224,12 @@ func TestHandleUpdateDisk_CombinedSizeAndOptions(t *testing.T) {
 
 	callCount3 := 0
 	qemuSvc := &updateDiskQEMUService{
-		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
 			callCount3++
 			if callCount3 <= 2 {
-				return map[string]interface{}{"scsi2": volid}, nil
+				return map[string]any{"scsi2": volid}, nil
 			}
-			return map[string]interface{}{"scsi2": volid + ",size=10G"}, nil
+			return map[string]any{"scsi2": volid + ",size=10G"}, nil
 		},
 		resizeDiskFn: func(_ context.Context, _ string, _ int, _ string, _ int) (string, error) {
 			resizeCalled = true
@@ -265,8 +265,8 @@ func TestHandleUpdateDisk_EmptySpec_NoOp(t *testing.T) {
 	var attachCalled bool
 
 	qemuSvc := &updateDiskQEMUService{
-		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
-			return map[string]interface{}{"scsi2": volid}, nil
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return map[string]any{"scsi2": volid}, nil
 		},
 		attachDiskFn: func(_ context.Context, _ string, _ int, _ string, _ string, _ *qemu.AttachOpts) (string, error) {
 			attachCalled = true
@@ -345,12 +345,12 @@ func TestHandleUpdateDisk_ShrinkRejected(t *testing.T) {
 
 	callCount4 := 0
 	qemuSvc := &updateDiskQEMUService{
-		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
 			callCount4++
 			if callCount4 <= 2 {
-				return map[string]interface{}{"scsi2": volid}, nil
+				return map[string]any{"scsi2": volid}, nil
 			}
-			return map[string]interface{}{"scsi2": volid + ",size=20G"}, nil
+			return map[string]any{"scsi2": volid + ",size=20G"}, nil
 		},
 	}
 
@@ -389,12 +389,12 @@ func TestHandleUpdateDisk_IOThreadFalseRemovesOption(t *testing.T) {
 
 	callCount5 := 0
 	qemuSvc := &updateDiskQEMUService{
-		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
 			callCount5++
 			if callCount5 <= 2 {
-				return map[string]interface{}{"scsi2": volid}, nil
+				return map[string]any{"scsi2": volid}, nil
 			}
-			return map[string]interface{}{"scsi2": volid + ",iothread=1,size=10G"}, nil
+			return map[string]any{"scsi2": volid + ",iothread=1,size=10G"}, nil
 		},
 		attachDiskFn: func(_ context.Context, _ string, _ int, optStr string, _ string, _ *qemu.AttachOpts) (string, error) {
 			capturedOptStr = optStr
@@ -422,12 +422,12 @@ func TestHandleUpdateDisk_AttachSDKError(t *testing.T) {
 
 	callCount8 := 0
 	qemuSvc := &updateDiskQEMUService{
-		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
 			callCount8++
 			if callCount8 <= 2 {
-				return map[string]interface{}{"scsi2": volid}, nil
+				return map[string]any{"scsi2": volid}, nil
 			}
-			return map[string]interface{}{"scsi2": volid + ",size=10G"}, nil
+			return map[string]any{"scsi2": volid + ",size=10G"}, nil
 		},
 		attachDiskFn: func(_ context.Context, _ string, _ int, _ string, _ string, _ *qemu.AttachOpts) (string, error) {
 			return "", errors.New("PVE config update rejected")
@@ -457,12 +457,12 @@ func TestHandleUpdateDisk_ResizeWithUpid(t *testing.T) {
 
 	callCount6 := 0
 	qemuSvc := &updateDiskQEMUService{
-		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
 			callCount6++
 			if callCount6 <= 2 {
-				return map[string]interface{}{"scsi2": volid}, nil
+				return map[string]any{"scsi2": volid}, nil
 			}
-			return map[string]interface{}{"scsi2": volid + ",size=10G"}, nil
+			return map[string]any{"scsi2": volid + ",size=10G"}, nil
 		},
 		resizeDiskFn: func(_ context.Context, _ string, _ int, _ string, _ int) (string, error) {
 			return "UPID:pve1:resize:abc", nil
@@ -490,13 +490,13 @@ func TestHandleUpdateDisk_PreservesExistingOptions(t *testing.T) {
 
 	callCount7 := 0
 	qemuSvc := &updateDiskQEMUService{
-		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
 			callCount7++
 			if callCount7 <= 2 {
-				return map[string]interface{}{"scsi2": volid}, nil
+				return map[string]any{"scsi2": volid}, nil
 			}
 			// Existing options: size, backup.
-			return map[string]interface{}{"scsi2": volid + ",backup=1,size=10G"}, nil
+			return map[string]any{"scsi2": volid + ",backup=1,size=10G"}, nil
 		},
 		attachDiskFn: func(_ context.Context, _ string, _ int, optStr string, _ string, _ *qemu.AttachOpts) (string, error) {
 			capturedOptStr = optStr
@@ -529,12 +529,12 @@ func TestHandleUpdateDisk_BandwidthIOPS(t *testing.T) {
 
 	callCount9 := 0
 	qemuSvc := &updateDiskQEMUService{
-		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
 			callCount9++
 			if callCount9 <= 2 {
-				return map[string]interface{}{"scsi2": volid}, nil
+				return map[string]any{"scsi2": volid}, nil
 			}
-			return map[string]interface{}{"scsi2": volid + ",size=10G"}, nil
+			return map[string]any{"scsi2": volid + ",size=10G"}, nil
 		},
 		attachDiskFn: func(_ context.Context, _ string, _ int, optStr string, _ string, _ *qemu.AttachOpts) (string, error) {
 			capturedOptStr = optStr
@@ -568,12 +568,12 @@ func TestHandleUpdateDisk_SSDAndBackup(t *testing.T) {
 
 	callCount10 := 0
 	qemuSvc := &updateDiskQEMUService{
-		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
 			callCount10++
 			if callCount10 <= 2 {
-				return map[string]interface{}{"scsi2": volid}, nil
+				return map[string]any{"scsi2": volid}, nil
 			}
-			return map[string]interface{}{"scsi2": volid}, nil
+			return map[string]any{"scsi2": volid}, nil
 		},
 		attachDiskFn: func(_ context.Context, _ string, _ int, optStr string, _ string, _ *qemu.AttachOpts) (string, error) {
 			capturedOptStr = optStr
@@ -599,12 +599,11 @@ func TestHandleUpdateDisk_SSDAndBackup(t *testing.T) {
 
 func TestHandleUpdateDisk_NullSpec_NoOp(t *testing.T) {
 	// Null update_spec (JSON null) → treated as empty map → no-op.
-	const diskCID = "local-lvm:vm-9001-disk-0"
 	const volid = "local-lvm:vm-9001-disk-0"
 
 	qemuSvc := &updateDiskQEMUService{
-		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
-			return map[string]interface{}{"scsi2": volid}, nil
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return map[string]any{"scsi2": volid}, nil
 		},
 	}
 
@@ -631,11 +630,11 @@ func TestHandleUpdateDisk_ConfigReadError(t *testing.T) {
 
 	configCallCount := 0
 	qemuSvc := &updateDiskQEMUService{
-		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
 			configCallCount++
 			if configCallCount <= 2 {
 				// Calls 1-2: FindVMByDiskVolid + ResolveDiskID — return canonical volid.
-				return map[string]interface{}{"scsi2": volid}, nil
+				return map[string]any{"scsi2": volid}, nil
 			}
 			// Call 3: option read for merge — inject failure.
 			return nil, errors.New("config read failure injected")
@@ -663,11 +662,11 @@ func TestHandleUpdateDisk_ResolveDiskIDError(t *testing.T) {
 
 	configCallCount := 0
 	qemuSvc := &updateDiskQEMUService{
-		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
 			configCallCount++
 			if configCallCount == 1 {
 				// Call 1: FindVMByDiskVolid — returns canonical volid so VM is located.
-				return map[string]interface{}{"scsi2": volid}, nil
+				return map[string]any{"scsi2": volid}, nil
 			}
 			// Call 2: ResolveDiskID config fetch — inject failure.
 			return nil, errors.New("resolve config error injected")
@@ -691,12 +690,12 @@ func TestHandleUpdateDisk_SizeWrongType(t *testing.T) {
 
 	configCallCount := 0
 	qemuSvc := &updateDiskQEMUService{
-		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
 			configCallCount++
 			if configCallCount <= 2 {
-				return map[string]interface{}{"scsi2": volid}, nil
+				return map[string]any{"scsi2": volid}, nil
 			}
-			return map[string]interface{}{"scsi2": volid + ",size=10G"}, nil
+			return map[string]any{"scsi2": volid + ",size=10G"}, nil
 		},
 	}
 
@@ -741,12 +740,12 @@ func TestHandleUpdateDisk_Dir_CID(t *testing.T) {
 
 	configCallCount := 0
 	qemuSvc := &updateDiskQEMUService{
-		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
 			configCallCount++
 			if configCallCount <= 2 {
-				return map[string]interface{}{"scsi2": volid}, nil
+				return map[string]any{"scsi2": volid}, nil
 			}
-			return map[string]interface{}{"scsi2": volid + ",size=10G"}, nil
+			return map[string]any{"scsi2": volid + ",size=10G"}, nil
 		},
 		attachDiskFn: func(_ context.Context, _ string, _ int, optStr string, _ string, opts *qemu.AttachOpts) (string, error) {
 			capturedOptStr = optStr
@@ -781,12 +780,12 @@ func TestHandleUpdateDisk_ZFSPool_CID(t *testing.T) {
 
 	configCallCount := 0
 	qemuSvc := &updateDiskQEMUService{
-		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
 			configCallCount++
 			if configCallCount <= 2 {
-				return map[string]interface{}{"scsi2": volid}, nil
+				return map[string]any{"scsi2": volid}, nil
 			}
-			return map[string]interface{}{"scsi2": volid + ",size=10G"}, nil
+			return map[string]any{"scsi2": volid + ",size=10G"}, nil
 		},
 		attachDiskFn: func(_ context.Context, _ string, _ int, optStr string, _ string, opts *qemu.AttachOpts) (string, error) {
 			capturedOptStr = optStr
@@ -866,14 +865,14 @@ func TestHandleUpdateDisk_ResizeUnderStorageLock_RetriesAndSucceeds(t *testing.T
 
 	configCallCount := 0
 	qemuSvc := &updateDiskQEMUService{
-		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
 			configCallCount++
 			// Calls 1-2: FindVMByDiskVolid + ResolveDiskID — return canonical volid.
 			// Call 3+: resizeDiskInternal config read — return volid with size=10G.
 			if configCallCount <= 2 {
-				return map[string]interface{}{"scsi2": volid}, nil
+				return map[string]any{"scsi2": volid}, nil
 			}
-			return map[string]interface{}{"scsi2": volid + ",size=10G"}, nil
+			return map[string]any{"scsi2": volid + ",size=10G"}, nil
 		},
 		resizeDiskFn: func(_ context.Context, _ string, _ int, _ string, _ int) (string, error) {
 			resizeCallCount++
@@ -917,12 +916,12 @@ func TestHandleUpdateDisk_ResizeUnderStorageLock_ExhaustsRetries(t *testing.T) {
 	resizeCallCount := 0
 	configCallCount := 0
 	qemuSvc := &updateDiskQEMUService{
-		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
 			configCallCount++
 			if configCallCount <= 2 {
-				return map[string]interface{}{"scsi2": volid}, nil
+				return map[string]any{"scsi2": volid}, nil
 			}
-			return map[string]interface{}{"scsi2": volid + ",size=10G"}, nil
+			return map[string]any{"scsi2": volid + ",size=10G"}, nil
 		},
 		resizeDiskFn: func(_ context.Context, _ string, _ int, _ string, _ int) (string, error) {
 			resizeCallCount++

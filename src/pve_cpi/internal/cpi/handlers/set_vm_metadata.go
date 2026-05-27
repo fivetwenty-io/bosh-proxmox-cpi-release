@@ -232,7 +232,7 @@ func buildDescription(metadata map[string]any) string {
 	for _, k := range keys {
 		sb.WriteString(k)
 		sb.WriteString(": ")
-		sb.WriteString(fmt.Sprintf("%v", metadata[k]))
+		fmt.Fprintf(&sb, "%v", metadata[k])
 		sb.WriteString("\n")
 	}
 	return sb.String()

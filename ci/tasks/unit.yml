@@ -12,6 +12,7 @@ image_resource:
   source:
     repository: golang
     tag: "1.26"
+    digest: "sha256:2d6c80227255c3112a4d08e67ba98e58efd3846daf15d9d7d4c389565d881b1a"
 
 inputs:
   - name: repo
@@ -24,3 +25,4 @@ run:
       export NO_COLOR=1
       cd repo
       make check
+      make security

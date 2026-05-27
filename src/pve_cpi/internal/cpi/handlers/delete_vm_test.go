@@ -34,9 +34,9 @@ func TestHandleDeleteVM_Happy(t *testing.T) {
 			stopCalled = true
 			return "UPID:node:stop-task", nil
 		},
-		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
 			// No unused entries — guard falls through to destroy.
-			return map[string]interface{}{}, nil
+			return map[string]any{}, nil
 		},
 	}
 	nodesSvc := &mockNodesService{
@@ -141,8 +141,8 @@ func TestHandleDeleteVM_NotFound_AtDelete(t *testing.T) {
 		stopFn: func(_ context.Context, _ string, _ int) (string, error) {
 			return "UPID:node:stop-task", nil
 		},
-		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
-			return map[string]interface{}{}, nil
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return map[string]any{}, nil
 		},
 	}
 	nodesSvc := &mockNodesService{
@@ -224,12 +224,12 @@ func TestHandleDeleteVM_RefusesWhenPersistentDiskUnused(t *testing.T) {
 		stopFn: func(_ context.Context, _ string, _ int) (string, error) {
 			return "", nil
 		},
-		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
 			// Persistent disk demoted to unused0 — exactly the state that
 			// would cause data loss if delete proceeded. testDeps configures
 			// DiskStorage="local-lvm" so the unused volid must share that
 			// storage prefix to trip the guard.
-			return map[string]interface{}{
+			return map[string]any{
 				"scsi0":   "local-lvm:vm-101-disk-0",
 				"unused0": "local-lvm:vm-9000-disk-0",
 			}, nil
@@ -275,9 +275,9 @@ func TestHandleDeleteVM_AllowsWhenUnusedVolumeAlreadyDeleted(t *testing.T) {
 		stopFn: func(_ context.Context, _ string, _ int) (string, error) {
 			return "", nil
 		},
-		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
 			// unused0 on disk_storage, but its volume no longer exists.
-			return map[string]interface{}{
+			return map[string]any{
 				"unused0": "local-lvm:vm-9000-disk-0",
 			}, nil
 		},
@@ -318,10 +318,10 @@ func TestHandleDeleteVM_AllowsWhenUnusedOnDifferentStorage(t *testing.T) {
 		stopFn: func(_ context.Context, _ string, _ int) (string, error) {
 			return "", nil
 		},
-		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
 			// unused0 on "local" storage; testConfig sets DiskStorage="local-lvm".
 			// Mismatch -> guard fails closed; delete must NOT proceed.
-			return map[string]interface{}{
+			return map[string]any{
 				"unused0": "local:iso/vm-101-config.iso",
 			}, nil
 		},
@@ -361,8 +361,8 @@ func TestDeleteVM_UnusedSlotPresent_DiskStorageEmpty_FailsClosed(t *testing.T) {
 		stopFn: func(_ context.Context, _ string, _ int) (string, error) {
 			return "", nil
 		},
-		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
-			return map[string]interface{}{
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return map[string]any{
 				"unused0": "local-lvm:vm-500-disk-0",
 			}, nil
 		},
@@ -407,9 +407,9 @@ func TestDeleteVM_UnusedSlotPresent_DiskStorageMismatch_FailsClosed(t *testing.T
 		stopFn: func(_ context.Context, _ string, _ int) (string, error) {
 			return "", nil
 		},
-		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
 			// "ceph-pool" does not match testConfig DiskStorage="local-lvm".
-			return map[string]interface{}{
+			return map[string]any{
 				"unused0": "ceph-pool:vm-501-disk-0",
 			}, nil
 		},
@@ -456,9 +456,9 @@ func TestDeleteVM_NoUnusedSlots_Succeeds(t *testing.T) {
 		stopFn: func(_ context.Context, _ string, _ int) (string, error) {
 			return "", nil
 		},
-		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
 			// Only a live scsi0 attachment -- no unused slots.
-			return map[string]interface{}{
+			return map[string]any{
 				"scsi0": "local-lvm:vm-502-disk-0",
 			}, nil
 		},
@@ -492,8 +492,8 @@ func TestHandleDeleteVM_AgentRemoveError(t *testing.T) {
 		stopFn: func(_ context.Context, _ string, _ int) (string, error) {
 			return "", nil // no UPID -> skip await
 		},
-		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
-			return map[string]interface{}{}, nil
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return map[string]any{}, nil
 		},
 	}
 	nodesSvc := &mockNodesService{
@@ -536,8 +536,8 @@ func TestDeleteVM_AwaitsDestroyTask(t *testing.T) {
 		stopFn: func(_ context.Context, _ string, _ int) (string, error) {
 			return "", nil // no stop UPID — synchronous stop
 		},
-		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
-			return map[string]interface{}{}, nil
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return map[string]any{}, nil
 		},
 	}
 
@@ -586,8 +586,8 @@ func TestDeleteVM_AwaitDestroyNotFoundIdempotent(t *testing.T) {
 		stopFn: func(_ context.Context, _ string, _ int) (string, error) {
 			return "", nil
 		},
-		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
-			return map[string]interface{}{}, nil
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return map[string]any{}, nil
 		},
 	}
 
@@ -630,8 +630,8 @@ func TestDeleteVM_AwaitDestroyTransientRetriable(t *testing.T) {
 		stopFn: func(_ context.Context, _ string, _ int) (string, error) {
 			return "", nil
 		},
-		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
-			return map[string]interface{}{}, nil
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return map[string]any{}, nil
 		},
 	}
 

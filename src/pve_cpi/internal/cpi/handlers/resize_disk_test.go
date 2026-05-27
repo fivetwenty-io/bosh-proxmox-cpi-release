@@ -21,19 +21,19 @@ import (
 // ---------------------------------------------------------------------------
 
 type resizeQEMUService struct {
-	configFn     func(ctx context.Context, node string, vmid int) (map[string]interface{}, error)
+	configFn     func(ctx context.Context, node string, vmid int) (map[string]any, error)
 	resizeDiskFn func(ctx context.Context, node string, vmid int, diskID string, sizeGiB int) (string, error)
 	// listSnapshotsFn controls ListSnapshots for snapshot guard tests.
 	// nil → return only the synthetic "current" entry (no real snapshots),
 	// so existing tests are unaffected by the guard.
-	listSnapshotsFn func(ctx context.Context, node string, vmid int) ([]map[string]interface{}, error)
+	listSnapshotsFn func(ctx context.Context, node string, vmid int) ([]map[string]any, error)
 }
 
-func (m *resizeQEMUService) Config(ctx context.Context, node string, vmid int) (map[string]interface{}, error) {
+func (m *resizeQEMUService) Config(ctx context.Context, node string, vmid int) (map[string]any, error) {
 	if m.configFn != nil {
 		return m.configFn(ctx, node, vmid)
 	}
-	return map[string]interface{}{}, nil
+	return map[string]any{}, nil
 }
 
 func (m *resizeQEMUService) ResizeDisk(ctx context.Context, node string, vmid int, diskID string, sizeGiB int) (string, error) {
@@ -44,10 +44,10 @@ func (m *resizeQEMUService) ResizeDisk(ctx context.Context, node string, vmid in
 }
 
 // Unimplemented methods.
-func (m *resizeQEMUService) Create(_ context.Context, _ string, _ map[string]interface{}) (string, error) {
+func (m *resizeQEMUService) Create(_ context.Context, _ string, _ map[string]any) (string, error) {
 	panic("resizeQEMUService.Create: not expected")
 }
-func (m *resizeQEMUService) Status(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
+func (m *resizeQEMUService) Status(_ context.Context, _ string, _ int) (map[string]any, error) {
 	panic("resizeQEMUService.Status: not expected")
 }
 func (m *resizeQEMUService) Start(_ context.Context, _ string, _ int) (string, error) {
@@ -59,7 +59,7 @@ func (m *resizeQEMUService) Stop(_ context.Context, _ string, _ int) (string, er
 func (m *resizeQEMUService) Reset(_ context.Context, _ string, _ int) (string, error) {
 	panic("resizeQEMUService.Reset: not expected")
 }
-func (m *resizeQEMUService) Clone(_ context.Context, _ string, _ int, _ map[string]interface{}) (string, error) {
+func (m *resizeQEMUService) Clone(_ context.Context, _ string, _ int, _ map[string]any) (string, error) {
 	panic("resizeQEMUService.Clone: not expected")
 }
 func (m *resizeQEMUService) Template(_ context.Context, _ string, _ int) (string, error) {
@@ -71,7 +71,7 @@ func (m *resizeQEMUService) AttachDisk(_ context.Context, _ string, _ int, _ str
 func (m *resizeQEMUService) DetachDisk(_ context.Context, _ string, _ int, _ string) error {
 	panic("resizeQEMUService.DetachDisk: not expected")
 }
-func (m *resizeQEMUService) Snapshot(_ context.Context, _ string, _ int, _ string, _ map[string]interface{}) (string, error) {
+func (m *resizeQEMUService) Snapshot(_ context.Context, _ string, _ int, _ string, _ map[string]any) (string, error) {
 	panic("resizeQEMUService.Snapshot: not expected")
 }
 func (m *resizeQEMUService) DeleteSnapshot(_ context.Context, _ string, _ int, _ string) error {
@@ -79,13 +79,13 @@ func (m *resizeQEMUService) DeleteSnapshot(_ context.Context, _ string, _ int, _
 }
 func (m *resizeQEMUService) ListSnapshots(
 	ctx context.Context, node string, vmid int,
-) ([]map[string]interface{}, error) {
+) ([]map[string]any, error) {
 	if m.listSnapshotsFn != nil {
 		return m.listSnapshotsFn(ctx, node, vmid)
 	}
 	// Safe default: return only the synthetic "current" entry so the guard
 	// proceeds normally in tests that do not exercise snapshot behaviour.
-	return []map[string]interface{}{{"name": "current"}}, nil
+	return []map[string]any{{"name": "current"}}, nil
 }
 func (m *resizeQEMUService) RollbackSnapshot(_ context.Context, _ string, _ int, _ string) (string, error) {
 	panic("resizeQEMUService.RollbackSnapshot: not expected")
@@ -133,14 +133,14 @@ func resizeQEMUWithDisk(diskSlot, diskOptStr string, resizeFn func(ctx context.C
 	}
 	callCount := 0
 	return &resizeQEMUService{
-		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
 			callCount++
 			// Calls 1 and 2: findVMByDiskVolid + ResolveDiskID — need exact bare volid match.
 			if callCount <= 2 {
-				return map[string]interface{}{diskSlot: bareVolid}, nil
+				return map[string]any{diskSlot: bareVolid}, nil
 			}
 			// Call 3+: parseDiskSizeGiB — need full option string with size=.
-			return map[string]interface{}{diskSlot: diskOptStr}, nil
+			return map[string]any{diskSlot: diskOptStr}, nil
 		},
 		resizeDiskFn: resizeFn,
 	}
@@ -245,8 +245,8 @@ func TestHandleResizeDisk_DiskNotAttached(t *testing.T) {
 
 	// Cluster has a VM but it doesn't have the disk.
 	qemuSvc := &resizeQEMUService{
-		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
-			return map[string]interface{}{"scsi0": "local-lvm:other"}, nil
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return map[string]any{"scsi0": "local-lvm:other"}, nil
 		},
 	}
 
@@ -373,7 +373,7 @@ func resizeDepsWithConfig(
 func resizeQEMUWithDiskAndSnapshots(
 	diskSlot, diskOptStr string,
 	resizeFn func(ctx context.Context, node string, vmid int, diskID string, sizeGiB int) (string, error),
-	snapshotFn func(ctx context.Context, node string, vmid int) ([]map[string]interface{}, error),
+	snapshotFn func(ctx context.Context, node string, vmid int) ([]map[string]any, error),
 ) *resizeQEMUService {
 	svc := resizeQEMUWithDisk(diskSlot, diskOptStr, resizeFn)
 	svc.listSnapshotsFn = snapshotFn
@@ -391,8 +391,8 @@ func TestHandleResizeDisk_SnapshotsPresent_HardFail(t *testing.T) {
 			resizeCalled = true
 			return "", nil
 		},
-		func(_ context.Context, _ string, _ int) ([]map[string]interface{}, error) {
-			return []map[string]interface{}{
+		func(_ context.Context, _ string, _ int) ([]map[string]any, error) {
+			return []map[string]any{
 				{"name": "snap1"},
 				{"name": "snap2"},
 			}, nil
@@ -433,9 +433,9 @@ func TestHandleResizeDisk_NoSnapshots_Proceeds(t *testing.T) {
 			resizeCalled = true
 			return "", nil
 		},
-		func(_ context.Context, _ string, _ int) ([]map[string]interface{}, error) {
+		func(_ context.Context, _ string, _ int) ([]map[string]any, error) {
 			// Only the synthetic "current" entry — no real snapshots.
-			return []map[string]interface{}{{"name": "current"}}, nil
+			return []map[string]any{{"name": "current"}}, nil
 		},
 	)
 
@@ -461,7 +461,7 @@ func TestHandleResizeDisk_SnapshotCheckError_FailOpen(t *testing.T) {
 			resizeCalled = true
 			return "", nil
 		},
-		func(_ context.Context, _ string, _ int) ([]map[string]interface{}, error) {
+		func(_ context.Context, _ string, _ int) ([]map[string]any, error) {
 			return nil, errors.New("PVE API timeout")
 		},
 	)
@@ -491,7 +491,7 @@ func TestHandleResizeDisk_SnapshotCheckError_FailClosed(t *testing.T) {
 			resizeCalled = true
 			return "", nil
 		},
-		func(_ context.Context, _ string, _ int) ([]map[string]interface{}, error) {
+		func(_ context.Context, _ string, _ int) ([]map[string]any, error) {
 			return nil, errors.New("PVE API timeout")
 		},
 	)
@@ -524,8 +524,8 @@ func TestHandleResizeDisk_SnapshotsPresent_AllowOverride(t *testing.T) {
 			resizeCalled = true
 			return "", nil
 		},
-		func(_ context.Context, _ string, _ int) ([]map[string]interface{}, error) {
-			return []map[string]interface{}{{"name": "snap1"}}, nil
+		func(_ context.Context, _ string, _ int) ([]map[string]any, error) {
+			return []map[string]any{{"name": "snap1"}}, nil
 		},
 	)
 
@@ -557,11 +557,11 @@ func TestHandleResizeDisk_ConfigFetchError(t *testing.T) {
 	configErr := errors.New("PVE config fetch timeout")
 	callCount := 0
 	qemuSvc := &resizeQEMUService{
-		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
 			callCount++
 			// Calls 1-2: FindVMByDiskVolid + ResolveDiskID need the bare volid.
 			if callCount <= 2 {
-				return map[string]interface{}{diskSlot: diskCID}, nil
+				return map[string]any{diskSlot: diskCID}, nil
 			}
 			// Call 3: the real Config() read — return error.
 			return nil, configErr

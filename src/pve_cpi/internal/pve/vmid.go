@@ -102,7 +102,7 @@ func retryBackoff(ctx context.Context, ao *allocOpts, err error, attempt int) er
 		d = ao.backoffFn(err, attempt)
 	} else {
 		// Default: uniform 50–250 ms.
-		d = 50*time.Millisecond + time.Duration(mrand.Int64N(int64(200*time.Millisecond)))
+		d = 50*time.Millisecond + time.Duration(mrand.Int64N(int64(200*time.Millisecond))) // #nosec G404 -- VMID collision-avoidance jitter; non-cryptographic
 	}
 	if d <= 0 {
 		return nil
@@ -186,7 +186,7 @@ func nextVMIDInRange(used map[int]struct{}, start, end int) (int, error) {
 			start, end, 0)
 	}
 	width := end - start + 1
-	randomOffset := mrand.IntN(width) // goroutine-safe; no manual seed required
+	randomOffset := mrand.IntN(width) // #nosec G404 -- VMID collision-avoidance offset; non-cryptographic
 	for i := 0; i < width; i++ {
 		candidate := start + (randomOffset+i)%width
 		if _, taken := used[candidate]; !taken {

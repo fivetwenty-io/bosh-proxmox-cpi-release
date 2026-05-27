@@ -20,21 +20,21 @@ import (
 // ---------------------------------------------------------------------------
 
 type getDisksQEMUService struct {
-	configFn func(ctx context.Context, node string, vmid int) (map[string]interface{}, error)
+	configFn func(ctx context.Context, node string, vmid int) (map[string]any, error)
 }
 
-func (m *getDisksQEMUService) Config(ctx context.Context, node string, vmid int) (map[string]interface{}, error) {
+func (m *getDisksQEMUService) Config(ctx context.Context, node string, vmid int) (map[string]any, error) {
 	if m.configFn != nil {
 		return m.configFn(ctx, node, vmid)
 	}
-	return map[string]interface{}{}, nil
+	return map[string]any{}, nil
 }
 
 // Unimplemented methods.
-func (m *getDisksQEMUService) Create(_ context.Context, _ string, _ map[string]interface{}) (string, error) {
+func (m *getDisksQEMUService) Create(_ context.Context, _ string, _ map[string]any) (string, error) {
 	panic("getDisksQEMUService.Create: not expected")
 }
-func (m *getDisksQEMUService) Status(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
+func (m *getDisksQEMUService) Status(_ context.Context, _ string, _ int) (map[string]any, error) {
 	panic("getDisksQEMUService.Status: not expected")
 }
 func (m *getDisksQEMUService) Start(_ context.Context, _ string, _ int) (string, error) {
@@ -46,7 +46,7 @@ func (m *getDisksQEMUService) Stop(_ context.Context, _ string, _ int) (string, 
 func (m *getDisksQEMUService) Reset(_ context.Context, _ string, _ int) (string, error) {
 	panic("getDisksQEMUService.Reset: not expected")
 }
-func (m *getDisksQEMUService) Clone(_ context.Context, _ string, _ int, _ map[string]interface{}) (string, error) {
+func (m *getDisksQEMUService) Clone(_ context.Context, _ string, _ int, _ map[string]any) (string, error) {
 	panic("getDisksQEMUService.Clone: not expected")
 }
 func (m *getDisksQEMUService) Template(_ context.Context, _ string, _ int) (string, error) {
@@ -61,13 +61,13 @@ func (m *getDisksQEMUService) DetachDisk(_ context.Context, _ string, _ int, _ s
 func (m *getDisksQEMUService) ResizeDisk(_ context.Context, _ string, _ int, _ string, _ int) (string, error) {
 	panic("getDisksQEMUService.ResizeDisk: not expected")
 }
-func (m *getDisksQEMUService) Snapshot(_ context.Context, _ string, _ int, _ string, _ map[string]interface{}) (string, error) {
+func (m *getDisksQEMUService) Snapshot(_ context.Context, _ string, _ int, _ string, _ map[string]any) (string, error) {
 	panic("getDisksQEMUService.Snapshot: not expected")
 }
 func (m *getDisksQEMUService) DeleteSnapshot(_ context.Context, _ string, _ int, _ string) error {
 	panic("getDisksQEMUService.DeleteSnapshot: not expected")
 }
-func (m *getDisksQEMUService) ListSnapshots(_ context.Context, _ string, _ int) ([]map[string]interface{}, error) {
+func (m *getDisksQEMUService) ListSnapshots(_ context.Context, _ string, _ int) ([]map[string]any, error) {
 	panic("getDisksQEMUService.ListSnapshots: not expected")
 }
 func (m *getDisksQEMUService) RollbackSnapshot(_ context.Context, _ string, _ int, _ string) (string, error) {
@@ -87,19 +87,14 @@ func getDisksDeps(qemuSvc qemu.Service) handlers.Deps {
 	return testDepsFoundVM(100, qemuSvc, nil, nil, &mockAgentService{})
 }
 
-// getDisksDepsNotFound builds Deps where the cluster scan returns empty (VM absent).
-func getDisksDepsNotFound(qemuSvc qemu.Service) handlers.Deps {
-	return testDepsWithStorage(qemuSvc, nil, nil, &mockAgentService{}, &mockStorageService{})
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 func TestHandleGetDisks_MultiplePersistentDisks(t *testing.T) {
 	qemuSvc := &getDisksQEMUService{
-		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
-			return map[string]interface{}{
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return map[string]any{
 				"scsi0": "local-lvm:vm-100-disk-0",                // system disk → excluded
 				"scsi1": "local-lvm:vm-100-disk-1",                // persistent disk 1
 				"scsi2": "local-lvm:vm-9001-disk-0,size=10G",      // persistent disk 2 (option string)
@@ -134,8 +129,8 @@ func TestHandleGetDisks_MultiplePersistentDisks(t *testing.T) {
 func TestHandleGetDisks_SystemDiskOnly(t *testing.T) {
 	// VM has only a system disk → persistent disk list is empty.
 	qemuSvc := &getDisksQEMUService{
-		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
-			return map[string]interface{}{
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return map[string]any{
 				"scsi0": "local-lvm:vm-100-disk-0",
 				"ide2":  "local-lvm:vm-100-cloudinit,media=cdrom",
 			}, nil
@@ -159,7 +154,7 @@ func TestHandleGetDisks_SystemDiskOnly(t *testing.T) {
 
 func TestHandleGetDisks_VMNotFound(t *testing.T) {
 	qemuSvc := &getDisksQEMUService{
-		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
 			return nil, &sdkerrors.APIError{HTTPCode: 404, Message: "VM not found"}
 		},
 	}
@@ -176,7 +171,7 @@ func TestHandleGetDisks_VMNotFound(t *testing.T) {
 
 func TestHandleGetDisks_ConfigFetchError(t *testing.T) {
 	qemuSvc := &getDisksQEMUService{
-		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
 			return nil, errors.New("storage backend unreachable")
 		},
 	}
@@ -241,8 +236,8 @@ func TestHandleGetDisks_MissingNode(t *testing.T) {
 func TestHandleGetDisks_CloudinitExcluded(t *testing.T) {
 	// Verify cloudinit drive (media=cdrom) is not included even when not on ide2.
 	qemuSvc := &getDisksQEMUService{
-		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
-			return map[string]interface{}{
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return map[string]any{
 				"scsi0": "local-lvm:vm-100-disk-0",
 				"scsi3": "local-lvm:vm-100-ci,media=cdrom", // cloudinit on non-standard slot
 				"scsi2": "local-lvm:vm-9001-disk-0",
@@ -270,8 +265,8 @@ func TestHandleGetDisks_CloudinitExcluded(t *testing.T) {
 func TestHandleGetDisks_EmptyVM(t *testing.T) {
 	// VM with no disks at all → empty list.
 	qemuSvc := &getDisksQEMUService{
-		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
-			return map[string]interface{}{
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return map[string]any{
 				"name":   "test-vm",
 				"memory": 2048.0,
 			}, nil
@@ -296,8 +291,8 @@ func TestHandleGetDisks_EmptyVM(t *testing.T) {
 func TestHandleGetDisks_BareVolidNoOptions(t *testing.T) {
 	// Disk stored as bare volid (no option string) → returned as-is.
 	qemuSvc := &getDisksQEMUService{
-		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
-			return map[string]interface{}{
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return map[string]any{
 				"scsi0": "local-lvm:vm-100-disk-0",  // system disk
 				"scsi1": "local-lvm:vm-9001-disk-0", // bare volid, no options
 			}, nil
@@ -334,8 +329,8 @@ func TestHandleGetDisks_Dir_CID(t *testing.T) {
 	// The colon splits at first occurrence; the full CID is the volid returned.
 	const diskCID = "local:9001/vm-9001-disk-0.raw"
 	qemuSvc := &getDisksQEMUService{
-		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
-			return map[string]interface{}{
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return map[string]any{
 				"scsi0": "local:100/vm-100-disk-0.raw", // system disk
 				"scsi1": diskCID,
 			}, nil
@@ -364,8 +359,8 @@ func TestHandleGetDisks_ZFSPool_CID(t *testing.T) {
 	// zfspool storage: bare volname (no subpath), e.g. "local-zfs:vm-9001-disk-0".
 	const diskCID = "local-zfs:vm-9001-disk-0"
 	qemuSvc := &getDisksQEMUService{
-		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
-			return map[string]interface{}{
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return map[string]any{
 				"scsi0": "local-zfs:vm-100-disk-0", // system disk
 				"scsi1": diskCID,
 			}, nil
@@ -394,8 +389,8 @@ func TestHandleGetDisks_LVMThin_CID(t *testing.T) {
 	// lvmthin storage: bare volname, e.g. "local-lvm-thin:vm-9001-disk-0".
 	const diskCID = "local-lvm-thin:vm-9001-disk-0"
 	qemuSvc := &getDisksQEMUService{
-		configFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
-			return map[string]interface{}{
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return map[string]any{
 				"scsi0": "local-lvm-thin:vm-100-disk-0", // system disk
 				"scsi1": diskCID,
 			}, nil

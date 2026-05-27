@@ -122,7 +122,7 @@ func HandleRebootVM(deps Deps) cpi.Handler {
 		//   - transient → retried by RetryOnTransient; on exhaustion returns Retriable.
 		//   - other → non-retriable CloudError via WrapError.
 		//   - status map missing "status" key → state is "" → treated as running.
-		var st map[string]interface{}
+		var st map[string]any
 		statusErr := pve.RetryOnTransient(ctx, logger, "reboot_vm.status", 0, func() error {
 			var inner error
 			st, inner = deps.PVE.QEMU().Status(ctx, node, vmid)

@@ -7,6 +7,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"io"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	sdkcloudinit "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cloudinit"
@@ -238,7 +241,7 @@ func (m *wbMockClusterStorage) ListStorage(_ context.Context, _ *sdkclusterstora
 	if m.isShared {
 		shared = 1
 	}
-	raw, _ := json.Marshal(map[string]interface{}{
+	raw, _ := json.Marshal(map[string]any{
 		"storage": m.storageName,
 		"type":    m.storageType,
 		"shared":  shared,
@@ -418,6 +421,100 @@ func mustMarshal(t *testing.T, v any) json.RawMessage {
 		t.Fatalf("mustMarshal: %v", err)
 	}
 	return raw
+}
+
+// ============================================================
+// openStagedFile unit tests — empty stagingDir (byte-identical) and set stagingDir
+// ============================================================
+
+// TestOpenStagedFile_EmptyStagingDir_UsesDirectPath verifies that when stagingDir
+// is empty, openStagedFile opens the file directly via os.Open (byte-identical
+// behavior to prior releases). The test creates a real temp file so the open
+// succeeds, then confirms the file contents are readable.
+func TestOpenStagedFile_EmptyStagingDir_UsesDirectPath(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	f, werr := os.Create(filepath.Join(dir, "test.qcow2"))
+	if werr != nil {
+		t.Fatalf("create test file: %v", werr)
+	}
+	wantContent := []byte("QCOW2-MAGIC-BYTES")
+	if _, werr = f.Write(wantContent); werr != nil {
+		t.Fatalf("write test file: %v", werr)
+	}
+	_ = f.Close()
+
+	// Empty stagingDir — direct open.
+	opened, err := openStagedFile("", filepath.Join(dir, "test.qcow2"))
+	if err != nil {
+		t.Fatalf("openStagedFile with empty stagingDir: %v", err)
+	}
+	defer func() { _ = opened.Close() }()
+
+	got, rerr := io.ReadAll(opened)
+	if rerr != nil {
+		t.Fatalf("read: %v", rerr)
+	}
+	if !bytes.Equal(got, wantContent) {
+		t.Errorf("content = %q; want %q", got, wantContent)
+	}
+}
+
+// TestOpenStagedFile_StagingDir_ScopedAccess verifies that when stagingDir is set:
+//  1. A path inside the staging dir is opened successfully.
+//  2. A path outside the staging dir (escaping via "..") is rejected.
+func TestOpenStagedFile_StagingDir_ScopedAccess(t *testing.T) {
+	t.Parallel()
+
+	stagingDir := t.TempDir()
+	outsideDir := t.TempDir()
+
+	// Create file inside staging dir.
+	insidePath := filepath.Join(stagingDir, "root.img")
+	if werr := os.WriteFile(insidePath, []byte("DISK-IMAGE"), 0600); werr != nil {
+		t.Fatalf("write inside file: %v", werr)
+	}
+
+	// Create file outside staging dir.
+	outsidePath := filepath.Join(outsideDir, "escape.img")
+	if werr := os.WriteFile(outsidePath, []byte("OUTSIDE"), 0600); werr != nil {
+		t.Fatalf("write outside file: %v", werr)
+	}
+
+	// Inside path — must succeed.
+	in, err := openStagedFile(stagingDir, insidePath)
+	if err != nil {
+		t.Fatalf("openStagedFile inside stagingDir: %v", err)
+	}
+	_ = in.Close()
+
+	// Outside path — must be rejected.
+	_, outErr := openStagedFile(stagingDir, outsidePath)
+	if outErr == nil {
+		t.Fatal("openStagedFile outside stagingDir: expected error; got nil")
+	}
+	if !strings.Contains(outErr.Error(), "escapes") && !strings.Contains(outErr.Error(), "..") {
+		t.Errorf("expected path-escape error; got %q", outErr.Error())
+	}
+}
+
+// TestOpenStagedFile_StagingDir_NonExistentFile verifies that a non-existent
+// file inside a valid staging dir returns a file-not-found error (not a
+// path-escape error).
+func TestOpenStagedFile_StagingDir_NonExistentFile(t *testing.T) {
+	t.Parallel()
+
+	stagingDir := t.TempDir()
+	missingPath := filepath.Join(stagingDir, "nonexistent.qcow2")
+
+	_, err := openStagedFile(stagingDir, missingPath)
+	if err == nil {
+		t.Fatal("expected error for nonexistent file; got nil")
+	}
+	if strings.Contains(err.Error(), "escapes") {
+		t.Errorf("got path-escape error for file-not-found case: %q", err.Error())
+	}
 }
 
 // TestStemcellCloudProps_validateLightMutex_Direct exercises the method

@@ -84,7 +84,7 @@ func lightStemcellClusterStorage(storageName, storageType string, isShared bool,
 				shared = 1
 			}
 			nodes := strings.Join(nodeList, ",")
-			raw, _ := json.Marshal(map[string]interface{}{
+			raw, _ := json.Marshal(map[string]any{
 				"storage": storageName,
 				"type":    storageType,
 				"shared":  shared,
@@ -100,22 +100,22 @@ func lightStemcellClusterStorage(storageName, storageType string, isShared bool,
 // templateFn removed — the new flow never calls QEMU().Template().
 type stemcellMockQEMU struct {
 	sdkqemu.Service // embed nil — panics on unmocked methods
-	createFn        func(ctx context.Context, node string, params map[string]interface{}) (string, error)
-	configFn        func(ctx context.Context, node string, vmid int) (map[string]interface{}, error)
+	createFn        func(ctx context.Context, node string, params map[string]any) (string, error)
+	configFn        func(ctx context.Context, node string, vmid int) (map[string]any, error)
 }
 
-func (m *stemcellMockQEMU) Create(ctx context.Context, node string, params map[string]interface{}) (string, error) {
+func (m *stemcellMockQEMU) Create(ctx context.Context, node string, params map[string]any) (string, error) {
 	if m.createFn != nil {
 		return m.createFn(ctx, node, params)
 	}
 	return "UPID:node1:create:ok", nil
 }
 
-func (m *stemcellMockQEMU) Config(ctx context.Context, node string, vmid int) (map[string]interface{}, error) {
+func (m *stemcellMockQEMU) Config(ctx context.Context, node string, vmid int) (map[string]any, error) {
 	if m.configFn != nil {
 		return m.configFn(ctx, node, vmid)
 	}
-	return map[string]interface{}{}, nil
+	return map[string]any{}, nil
 }
 
 // stemcellMockNodes satisfies sdknodes.Service for create_stemcell tests.

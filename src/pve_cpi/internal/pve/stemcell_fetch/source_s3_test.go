@@ -95,7 +95,7 @@ func TestParseS3Auth(t *testing.T) {
 
 	tests := []struct {
 		name            string
-		payload         map[string]interface{}
+		payload         map[string]any
 		wantAccessKeyID string
 		wantRegion      string
 		wantEndpoint    string
@@ -104,7 +104,7 @@ func TestParseS3Auth(t *testing.T) {
 	}{
 		{
 			name: "valid minimal credentials",
-			payload: map[string]interface{}{
+			payload: map[string]any{
 				"type":              "s3",
 				"access_key_id":     "AKIATEST123",
 				"secret_access_key": "secretvalue",
@@ -113,7 +113,7 @@ func TestParseS3Auth(t *testing.T) {
 		},
 		{
 			name: "valid full credentials with endpoint and region",
-			payload: map[string]interface{}{
+			payload: map[string]any{
 				"type":              "s3",
 				"access_key_id":     "AKIATEST456",
 				"secret_access_key": "secretvalue",
@@ -128,7 +128,7 @@ func TestParseS3Auth(t *testing.T) {
 		},
 		{
 			name: "missing access_key_id",
-			payload: map[string]interface{}{
+			payload: map[string]any{
 				"type":              "s3",
 				"secret_access_key": "secretvalue",
 			},
@@ -136,7 +136,7 @@ func TestParseS3Auth(t *testing.T) {
 		},
 		{
 			name: "missing secret_access_key",
-			payload: map[string]interface{}{
+			payload: map[string]any{
 				"type":          "s3",
 				"access_key_id": "AKIATEST",
 			},
@@ -144,7 +144,7 @@ func TestParseS3Auth(t *testing.T) {
 		},
 		{
 			name:    "both keys missing",
-			payload: map[string]interface{}{"type": "s3"},
+			payload: map[string]any{"type": "s3"},
 			wantErr: "access_key_id and secret_access_key are required",
 		},
 	}
@@ -237,7 +237,7 @@ func TestS3Source_Fetch_Success(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Fetch: unexpected error: %v", err)
 	}
-	defer body.Close()
+	defer func() { _ = body.Close() }()
 
 	got, err := io.ReadAll(body)
 	if err != nil {
@@ -259,7 +259,7 @@ func TestS3Source_Fetch_ViaRawAuthCreds(t *testing.T) {
 	server := s3TestServer(t)
 	defer server.Close()
 
-	raw, err := json.Marshal(map[string]interface{}{
+	raw, err := json.Marshal(map[string]any{
 		"type":              "s3",
 		"access_key_id":     "AKIATEST",
 		"secret_access_key": "secretvalue",
@@ -277,7 +277,7 @@ func TestS3Source_Fetch_ViaRawAuthCreds(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Fetch via rawAuthCreds: unexpected error: %v", err)
 	}
-	defer body.Close()
+	defer func() { _ = body.Close() }()
 
 	got, err := io.ReadAll(body)
 	if err != nil {
@@ -406,7 +406,7 @@ func TestResolveSource_S3_InvalidURL(t *testing.T) {
 func TestParseAuth_S3(t *testing.T) {
 	t.Parallel()
 
-	raw, err := json.Marshal(map[string]interface{}{
+	raw, err := json.Marshal(map[string]any{
 		"type":              "s3",
 		"access_key_id":     "AKIATEST789",
 		"secret_access_key": "supersecret",

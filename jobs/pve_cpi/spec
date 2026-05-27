@@ -92,6 +92,15 @@ properties:
   pve.verify_ssl:
     description: "Verify TLS certificate"
     default: true
+  pve.ca_cert:
+    description: |
+      Optional. PEM-encoded CA certificate bundle for verifying the Proxmox VE
+      API TLS certificate. When empty (default), the system trust pool is used
+      unmodified — behavior is byte-identical to prior releases. When set, the
+      PEM is parsed and the resulting cert pool replaces the system pool for PVE
+      API HTTPS verification. Ignored when verify_ssl is false. Symmetric to
+      registry.ca_cert.
+    default: ""
   pve.agent_mode:
     description: "Agent bootstrap mode: cloudinit, registry, noagent"
     default: "cloudinit"
@@ -202,6 +211,23 @@ properties:
       the registry presents a certificate signed by a private CA the host trust
       store does not already include. Empty means use the system pool unmodified.
     default: ""
+  pve.stemcell_staging_dir:
+    description: |
+      Optional. When set, restricts stemcell file reads/writes to this directory
+      using Go 1.24+ os.Root scoping. Defense-in-depth; if unset, behavior is
+      unchanged from prior releases. Paths supplied by the BOSH director must
+      reside under this directory when set. Must be an absolute path to an
+      existing directory on the CPI host.
+    default: ""
+  registry.allowed_hosts:
+    description: |
+      Optional. If non-empty, restricts the registry HTTP client to only
+      contact hosts matching one of these patterns. Each entry is either an
+      exact host (e.g. "registry.example.com") or a wildcard prefix
+      (e.g. "*.example.com"). Defense-in-depth against SSRF via host mutation.
+      Empty (default) disables host-allow-list filtering; the configuredHost
+      invariant and disabled redirects still apply regardless.
+    default: []
   pve.fetch_credential_defaults:
     description: |
       Ordered list of URL-prefix to auth-payload mappings used by the CPI when

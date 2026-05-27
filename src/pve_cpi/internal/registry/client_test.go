@@ -452,7 +452,7 @@ func TestPut_InstanceIDInPath(t *testing.T) {
 	})
 
 	_ = client.Put(context.Background(), "vm-1234", map[string]string{})
-	wantPath := fmt.Sprintf("/instances/vm-1234/settings")
+	wantPath := "/instances/vm-1234/settings"
 	if gotPath != wantPath {
 		t.Errorf("path: got %q, want %q", gotPath, wantPath)
 	}

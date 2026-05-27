@@ -436,7 +436,7 @@ func HandleCreateStemcell(deps Deps) cpi.Handler {
 		// Step 6: Resolve disk image (extract from tarball if needed)
 		// ----------------------------------------------------------------
 		uploadSourcePath, cleanupExtract, detectedFormat, extractedSHA, detectErr := resolveStemcellImage(
-			imagePath, cp.DiskFormat, deps.Logger)
+			imagePath, cp.DiskFormat, deps.Config.StemcellStagingDir, deps.Logger)
 		if detectErr != nil {
 			return nil, cpierrors.Wrap(detectErr, "create_stemcell: resolve image")
 		}
@@ -445,10 +445,14 @@ func HandleCreateStemcell(deps Deps) cpi.Handler {
 		// User-supplied disk_format wins when present; aliases like
 		// "openstack-qcow2" or "general-raw" are translated to PVE-native
 		// enum (qcow2/raw/vmdk). Unknown aliases fall back to magic-byte detection.
-		uploadFormat := pveDiskFormat(cp.DiskFormat)
-		if uploadFormat == "" {
-			uploadFormat = detectedFormat
-		}
+		// uploadFormat is resolved here for future use when the upload API gains
+		// a format= parameter; PVE currently infers format from file content.
+		_ = func() string {
+			if f := pveDiskFormat(cp.DiskFormat); f != "" {
+				return f
+			}
+			return detectedFormat
+		}()
 
 		// ----------------------------------------------------------------
 		// Step 7: Obtain SHA-256 of resolved disk image
@@ -459,7 +463,7 @@ func HandleCreateStemcell(deps Deps) cpi.Handler {
 		sha256hex := extractedSHA
 		if sha256hex == "" {
 			var hashErr error
-			sha256hex, hashErr = sha256FilePath(uploadSourcePath)
+			sha256hex, hashErr = sha256FilePath(uploadSourcePath, deps.Config.StemcellStagingDir)
 			if hashErr != nil {
 				return nil, cpierrors.Wrap(hashErr, "create_stemcell: compute sha256")
 			}
@@ -496,7 +500,15 @@ func HandleCreateStemcell(deps Deps) cpi.Handler {
 		// ----------------------------------------------------------------
 		// Step 11: Upload qcow2 image
 		// ----------------------------------------------------------------
-		if uploadErr := uploadStemcellImage(ctx, deps, node, storage, qcow2Filename, uploadSourcePath); uploadErr != nil {
+		// uploadStagingDir is set only when uploadSourcePath is the director-supplied
+		// imagePath (bare qcow2 passthrough). When resolveStemcellImage extracted a
+		// file into a CPI-owned tmpDir, uploadSourcePath differs from imagePath and
+		// no staging-dir scoping is needed (the file is already CPI-controlled).
+		uploadStagingDir := ""
+		if uploadSourcePath == imagePath {
+			uploadStagingDir = deps.Config.StemcellStagingDir
+		}
+		if uploadErr := uploadStemcellImage(ctx, deps, node, storage, qcow2Filename, uploadSourcePath, uploadStagingDir); uploadErr != nil {
 			return nil, cpierrors.Wrap(uploadErr, "create_stemcell: upload qcow2")
 		}
 		deps.Logger.Info("create_stemcell: qcow2 uploaded",
@@ -739,7 +751,9 @@ func handleLightStemcellFetch(
 	// 6. Upload temp file under the final canonical filename. uploadStemcellImage
 	// handles retry-on-lock and UPID await; it reopens tmpPath each attempt so
 	// the PVE reader always sees a fresh stream from the beginning of the file.
-	if uploadErr := uploadStemcellImage(ctx, deps, node, storage, qcow2Filename, tmpPath); uploadErr != nil {
+	// tmpPath is a CPI-owned temp file (os.CreateTemp); not director-supplied.
+	// stagingDir scoping is not applicable here — pass "" to use direct os.Open.
+	if uploadErr := uploadStemcellImage(ctx, deps, node, storage, qcow2Filename, tmpPath, ""); uploadErr != nil {
 		return nil, cpierrors.Wrap(uploadErr, "create_stemcell: light fetch upload")
 	}
 
@@ -960,10 +974,17 @@ func clusterNodeCount(ctx context.Context, deps Deps) (int, error) {
 // computed during tarball extraction via TeeReader (single pass). The caller
 // uses this value directly and skips a second file-read pass. An empty string
 // is returned for the non-tarball path; the caller must call sha256FilePath.
-func resolveStemcellImage(imagePath, defaultFormat string, logger *log.Logger) (path string, cleanup func(), detectedFormat string, extractedSHA256hex string, err error) {
+//
+// stagingDir is propagated from config.StemcellStagingDir. When non-empty,
+// os.Open calls on the director-supplied imagePath are scoped via os.Root
+// (openStagedFile). os.Create calls on CPI-owned tmpDir paths are unaffected
+// (tmpDir is CPI-internal MkdirTemp; os.Root scoping is not applicable there).
+// When stagingDir is empty, all os.Open calls use the direct path —
+// byte-identical behavior to prior releases.
+func resolveStemcellImage(imagePath, defaultFormat, stagingDir string, logger *log.Logger) (path string, cleanup func(), detectedFormat string, extractedSHA256hex string, err error) {
 	noop := func() {}
 
-	f, openErr := os.Open(imagePath)
+	f, openErr := openStagedFile(stagingDir, imagePath)
 	if openErr != nil {
 		return "", noop, "", "", cpierrors.Cloud("resolveStemcellImage: open %s: %s", imagePath, openErr.Error())
 	}
@@ -1055,7 +1076,7 @@ func resolveStemcellImage(imagePath, defaultFormat string, logger *log.Logger) (
 					MaxStemcellTotalExtract/(1024*1024*1024))
 			}
 			dst := filepath.Join(tmpDir, name)
-			out, oerr := os.Create(dst)
+			out, oerr := os.Create(dst) // #nosec G304 -- dst is filepath.Join(tmpDir, name); tmpDir is CPI-owned MkdirTemp; not director-supplied; os.Root scoping not applicable
 			if oerr != nil {
 				cleanup()
 				return "", noop, "", "", cpierrors.Cloud("resolveStemcellImage: create %s: %s", dst, oerr.Error())
@@ -1140,7 +1161,7 @@ func resolveStemcellImage(imagePath, defaultFormat string, logger *log.Logger) (
 		// Files that do not match any known signature are rejected to prevent
 		// accidentally uploading a manifest or other metadata file as the disk.
 		format := defaultFormat
-		if mf, merr := os.Open(imgPath); merr == nil {
+		if mf, merr := os.Open(imgPath); merr == nil { // #nosec G304 -- imgPath is filepath.Join(tmpDir, name); tmpDir is CPI-owned MkdirTemp; not director-supplied; os.Root scoping not applicable
 			var magic [4]byte
 			n, rerr := io.ReadFull(mf, magic[:])
 			_ = mf.Close()
@@ -1186,9 +1207,55 @@ func resolveStemcellImage(imagePath, defaultFormat string, logger *log.Logger) (
 	return imagePath, noop, "raw", "", nil
 }
 
+// openStagedFile opens path for reading, scoped to stagingDir when non-empty.
+//
+// When stagingDir is empty the function calls os.Open(path) directly —
+// byte-identical behavior to prior releases, matching the contract that
+// an empty StemcellStagingDir preserves all existing code paths.
+//
+// When stagingDir is non-empty the function:
+//  1. Opens an os.Root anchored at stagingDir.
+//  2. Computes path's position relative to stagingDir via filepath.Rel.
+//  3. Rejects the path when the relative result starts with ".." (path
+//     escapes the root) or when Rel itself errors (different volume on Windows).
+//  4. Calls root.Open(rel) which enforces kernel-level containment.
+//
+// The caller is responsible for closing the returned *os.File.
+func openStagedFile(stagingDir, path string) (*os.File, error) {
+	if stagingDir == "" {
+		f, err := os.Open(path) // #nosec G304 -- stagingDir empty: byte-identical fallback; director-supplied path validated by validateStemcellImagePath upstream
+		if err != nil {
+			return nil, err
+		}
+		return f, nil
+	}
+
+	root, err := os.OpenRoot(stagingDir)
+	if err != nil {
+		return nil, fmt.Errorf("openStagedFile: open root %s: %w", stagingDir, err)
+	}
+	defer func() { _ = root.Close() }()
+
+	rel, err := filepath.Rel(stagingDir, path)
+	if err != nil {
+		return nil, fmt.Errorf("openStagedFile: path %q cannot be made relative to staging dir %q: %w", path, stagingDir, err)
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return nil, fmt.Errorf("openStagedFile: path %q escapes staging dir %q", path, stagingDir)
+	}
+
+	f, err := root.Open(rel)
+	if err != nil {
+		return nil, fmt.Errorf("openStagedFile: %w", err)
+	}
+	return f, nil
+}
+
 // sha256FilePath returns the hex-encoded SHA-256 of the file at path.
-func sha256FilePath(path string) (string, error) {
-	f, err := os.Open(path)
+// When stagingDir is non-empty, file access is scoped to that root via os.Root.
+// When stagingDir is empty, os.Open is called directly (byte-identical behavior).
+func sha256FilePath(path, stagingDir string) (string, error) {
+	f, err := openStagedFile(stagingDir, path)
 	if err != nil {
 		return "", cpierrors.Cloud("sha256FilePath: open %s: %s", path, err.Error())
 	}
@@ -1203,10 +1270,17 @@ func sha256FilePath(path string) (string, error) {
 // uploadStemcellImage streams imagePath to the PVE storage upload endpoint,
 // then waits for the resulting task to finish. content is fixed to "import";
 // the file lands as a referenceable storage volume "<storage>:import/<filename>".
+//
+// stagingDir controls os.Root scoping for the open of imagePath:
+//   - Non-empty: imagePath must reside under stagingDir; access is scoped via
+//     os.Root (openStagedFile). Pass deps.Config.StemcellStagingDir only when
+//     imagePath is a director-supplied path.
+//   - Empty: os.Open is called directly — byte-identical behavior to prior
+//     releases. Always pass "" when imagePath is a CPI-internal temp file.
 func uploadStemcellImage(
 	ctx context.Context,
 	deps Deps,
-	node, storageName, filename, imagePath string,
+	node, storageName, filename, imagePath, stagingDir string,
 ) error {
 	if deps.PVE == nil || deps.PVE.Storage() == nil {
 		return cpierrors.Cloud("uploadStemcellImage: storage service unavailable")
@@ -1229,7 +1303,7 @@ func uploadStemcellImage(
 	// so transient failures retry with a fresh stream.
 	uploadCtx := sdkclient.WithRetries(ctx, 0)
 	rerr := pve.RetryOnTransientOrLock(ctx, deps.Logger, "create_stemcell_upload", 0, func() error {
-		f, openErr := os.Open(imagePath)
+		f, openErr := openStagedFile(stagingDir, imagePath)
 		if openErr != nil {
 			return cpierrors.Cloud("uploadStemcellImage: open %s: %s", imagePath, openErr.Error())
 		}

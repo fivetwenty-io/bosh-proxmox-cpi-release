@@ -32,21 +32,21 @@ import (
 
 type diskMetaQEMUMock struct {
 	// configs maps "node:vmid" → config map.
-	configs map[string]map[string]interface{}
+	configs map[string]map[string]any
 }
 
-func (m *diskMetaQEMUMock) Config(_ context.Context, node string, vmid int) (map[string]interface{}, error) {
+func (m *diskMetaQEMUMock) Config(_ context.Context, node string, vmid int) (map[string]any, error) {
 	key := diskKey(node, vmid)
 	if cfg, ok := m.configs[key]; ok {
 		return cfg, nil
 	}
-	return map[string]interface{}{}, nil
+	return map[string]any{}, nil
 }
 
-func (m *diskMetaQEMUMock) Create(_ context.Context, _ string, _ map[string]interface{}) (string, error) {
+func (m *diskMetaQEMUMock) Create(_ context.Context, _ string, _ map[string]any) (string, error) {
 	panic("Create not expected")
 }
-func (m *diskMetaQEMUMock) Status(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
+func (m *diskMetaQEMUMock) Status(_ context.Context, _ string, _ int) (map[string]any, error) {
 	panic("Status not expected")
 }
 func (m *diskMetaQEMUMock) Start(_ context.Context, _ string, _ int) (string, error) {
@@ -58,7 +58,7 @@ func (m *diskMetaQEMUMock) Stop(_ context.Context, _ string, _ int) (string, err
 func (m *diskMetaQEMUMock) Reset(_ context.Context, _ string, _ int) (string, error) {
 	panic("Reset not expected")
 }
-func (m *diskMetaQEMUMock) Clone(_ context.Context, _ string, _ int, _ map[string]interface{}) (string, error) {
+func (m *diskMetaQEMUMock) Clone(_ context.Context, _ string, _ int, _ map[string]any) (string, error) {
 	panic("Clone not expected")
 }
 func (m *diskMetaQEMUMock) Template(_ context.Context, _ string, _ int) (string, error) {
@@ -73,13 +73,13 @@ func (m *diskMetaQEMUMock) DetachDisk(_ context.Context, _ string, _ int, _ stri
 func (m *diskMetaQEMUMock) ResizeDisk(_ context.Context, _ string, _ int, _ string, _ int) (string, error) {
 	panic("ResizeDisk not expected")
 }
-func (m *diskMetaQEMUMock) Snapshot(_ context.Context, _ string, _ int, _ string, _ map[string]interface{}) (string, error) {
+func (m *diskMetaQEMUMock) Snapshot(_ context.Context, _ string, _ int, _ string, _ map[string]any) (string, error) {
 	panic("Snapshot not expected")
 }
 func (m *diskMetaQEMUMock) DeleteSnapshot(_ context.Context, _ string, _ int, _ string) error {
 	panic("DeleteSnapshot not expected")
 }
-func (m *diskMetaQEMUMock) ListSnapshots(_ context.Context, _ string, _ int) ([]map[string]interface{}, error) {
+func (m *diskMetaQEMUMock) ListSnapshots(_ context.Context, _ string, _ int) ([]map[string]any, error) {
 	panic("ListSnapshots not expected")
 }
 func (m *diskMetaQEMUMock) RollbackSnapshot(_ context.Context, _ string, _ int, _ string) (string, error) {
@@ -207,8 +207,8 @@ func (m *diskMetaClusterSvc) ListResources(ctx context.Context, params *sdkclust
 var _ sdkclusterapi.Service = (*diskMetaClusterSvc)(nil)
 
 // vmConfigWithDisk builds a QEMU config map that includes diskCID at scsi0.
-func vmConfigWithDisk(diskCID, desc string) map[string]interface{} {
-	m := map[string]interface{}{
+func vmConfigWithDisk(diskCID, desc string) map[string]any {
+	m := map[string]any{
 		"scsi0": diskCID,
 	}
 	if desc != "" {
@@ -244,7 +244,7 @@ func makeMetaArgs(diskCID string, meta map[string]any) []json.RawMessage {
 // buildDiskMetaPVE constructs a diskMetaClientMock with a cluster service that
 // returns the given VM in its resource list and a QEMU mock that returns the
 // given configs. The nodes mock is provided directly for UpdateQemuConfig capture.
-func buildDiskMetaPVE(clusterSvc sdkclusterapi.Service, qemuCfgs map[string]map[string]interface{}, nodesSvc *diskMetaNodesMock) *diskMetaClientMock {
+func buildDiskMetaPVE(clusterSvc sdkclusterapi.Service, qemuCfgs map[string]map[string]any, nodesSvc *diskMetaNodesMock) *diskMetaClientMock {
 	return &diskMetaClientMock{
 		qemuSvc:    &diskMetaQEMUMock{configs: qemuCfgs},
 		nodesSvc:   nodesSvc,
@@ -261,7 +261,7 @@ func TestHandleSetDiskMetadata_AttachedSingleVM(t *testing.T) {
 
 	nodesSvc := &diskMetaNodesMock{}
 	clusterSvc := &diskMetaClusterSvc{resp: clusterResourcesWithVM(testVMID, testNode)}
-	pve := buildDiskMetaPVE(clusterSvc, map[string]map[string]interface{}{
+	pve := buildDiskMetaPVE(clusterSvc, map[string]map[string]any{
 		diskKey(testNode, int(testVMID)): vmConfigWithDisk(testDiskCID, ""),
 	}, nodesSvc)
 
@@ -297,7 +297,7 @@ func TestHandleSetDiskMetadata_Detached(t *testing.T) {
 	nodesSvc := &diskMetaNodesMock{}
 	// VM config has NO matching disk — disk is detached.
 	clusterSvc := &diskMetaClusterSvc{resp: clusterResourcesWithVM(testVMID, testNode)}
-	pve := buildDiskMetaPVE(clusterSvc, map[string]map[string]interface{}{
+	pve := buildDiskMetaPVE(clusterSvc, map[string]map[string]any{
 		diskKey(testNode, int(testVMID)): {"scsi0": "local-lvm:vm-100-disk-99"},
 	}, nodesSvc)
 
@@ -342,7 +342,7 @@ func TestHandleSetDiskMetadata_Ambiguous(t *testing.T) {
 		),
 	}
 	nodesSvc := &diskMetaNodesMock{}
-	pve := buildDiskMetaPVE(clusterSvc, map[string]map[string]interface{}{
+	pve := buildDiskMetaPVE(clusterSvc, map[string]map[string]any{
 		diskKey(testNode, int(testVMID)): vmConfigWithDisk(testDiskCID, ""),
 		diskKey(testNode, int(vm2)):      vmConfigWithDisk(testDiskCID, ""),
 	}, nodesSvc)
@@ -366,7 +366,7 @@ func TestHandleSetDiskMetadata_DescriptionPreserved(t *testing.T) {
 	existingDesc := "VM managed by BOSH"
 	nodesSvc := &diskMetaNodesMock{}
 	clusterSvc := &diskMetaClusterSvc{resp: clusterResourcesWithVM(testVMID, testNode)}
-	pve := buildDiskMetaPVE(clusterSvc, map[string]map[string]interface{}{
+	pve := buildDiskMetaPVE(clusterSvc, map[string]map[string]any{
 		diskKey(testNode, int(testVMID)): vmConfigWithDisk(testDiskCID, existingDesc),
 	}, nodesSvc)
 
@@ -393,7 +393,7 @@ func TestHandleSetDiskMetadata_MissingArgs(t *testing.T) {
 
 	pve := buildDiskMetaPVE(
 		&diskMetaClusterSvc{},
-		map[string]map[string]interface{}{},
+		map[string]map[string]any{},
 		&diskMetaNodesMock{},
 	)
 	h := handlers.HandleSetDiskMetadata(makeDiskMetaDeps(pve))
@@ -415,7 +415,7 @@ func TestHandleSetDiskMetadata_AppliesDiskTags(t *testing.T) {
 
 	nodesSvc := &diskMetaNodesMock{}
 	clusterSvc := &diskMetaClusterSvc{resp: clusterResourcesWithVM(testVMID, testNode)}
-	pve := buildDiskMetaPVE(clusterSvc, map[string]map[string]interface{}{
+	pve := buildDiskMetaPVE(clusterSvc, map[string]map[string]any{
 		diskKey(testNode, int(testVMID)): {
 			"scsi0": testDiskCID,
 			"tags":  "env--prod;director--abc",
@@ -457,7 +457,7 @@ func TestHandleSetDiskMetadata_InvalidDiskCID(t *testing.T) {
 
 	pve := buildDiskMetaPVE(
 		&diskMetaClusterSvc{},
-		map[string]map[string]interface{}{},
+		map[string]map[string]any{},
 		&diskMetaNodesMock{},
 	)
 	h := handlers.HandleSetDiskMetadata(makeDiskMetaDeps(pve))
@@ -477,7 +477,7 @@ func TestHandleSetDiskMetadata_MetadataNotObject(t *testing.T) {
 
 	pve := buildDiskMetaPVE(
 		&diskMetaClusterSvc{},
-		map[string]map[string]interface{}{},
+		map[string]map[string]any{},
 		&diskMetaNodesMock{},
 	)
 	h := handlers.HandleSetDiskMetadata(makeDiskMetaDeps(pve))
@@ -504,7 +504,7 @@ func TestHandleSetDiskMetadata_ListResourcesError(t *testing.T) {
 	clusterErr := fmt.Errorf("cluster unreachable")
 	pve := buildDiskMetaPVE(
 		&diskMetaClusterSvc{listErr: clusterErr},
-		map[string]map[string]interface{}{},
+		map[string]map[string]any{},
 		&diskMetaNodesMock{},
 	)
 	h := handlers.HandleSetDiskMetadata(makeDiskMetaDeps(pve))
@@ -526,7 +526,7 @@ func TestHandleSetDiskMetadata_UpdateConfigError(t *testing.T) {
 	updateErr := fmt.Errorf("write conflict: locked")
 	nodesSvc := &diskMetaNodesMock{updateErr: updateErr}
 	clusterSvc := &diskMetaClusterSvc{resp: clusterResourcesWithVM(testVMID, testNode)}
-	pve := buildDiskMetaPVE(clusterSvc, map[string]map[string]interface{}{
+	pve := buildDiskMetaPVE(clusterSvc, map[string]map[string]any{
 		diskKey(testNode, int(testVMID)): vmConfigWithDisk(testDiskCID, ""),
 	}, nodesSvc)
 
@@ -565,7 +565,7 @@ func TestHandleSetDiskMetadata_SameCIDReplaces(t *testing.T) {
 
 	configKey := diskKey(testNode, int(testVMID))
 	qemuSvc := &diskMetaQEMUMock{
-		configs: map[string]map[string]interface{}{
+		configs: map[string]map[string]any{
 			configKey: vmConfigWithDisk(testDiskCID, ""),
 		},
 	}
@@ -618,7 +618,7 @@ func TestHandleSetDiskMetadata_CrossDiskMergePreserved(t *testing.T) {
 	configKey := diskKey(testNode, int(testVMID))
 
 	qemuSvc := &diskMetaQEMUMock{
-		configs: map[string]map[string]interface{}{
+		configs: map[string]map[string]any{
 			configKey: {
 				"scsi0": diskA,
 				"scsi1": diskB,
@@ -674,7 +674,7 @@ func TestHandleSetDiskMetadata_CorruptedSentinel(t *testing.T) {
 	corruptDesc := "operator note\n<!--BOSH:{not valid json at all-->rest"
 	configKey := diskKey(testNode, int(testVMID))
 	qemuSvc := &diskMetaQEMUMock{
-		configs: map[string]map[string]interface{}{
+		configs: map[string]map[string]any{
 			configKey: vmConfigWithDisk(testDiskCID, corruptDesc),
 		},
 	}
@@ -711,7 +711,7 @@ func TestHandleSetDiskMetadata_Dir_CID(t *testing.T) {
 	configKey := diskKey(testNode, int(dirVMID))
 	nodesSvc := &diskMetaNodesMock{}
 	clusterSvc := &diskMetaClusterSvc{resp: clusterResourcesWithVM(dirVMID, testNode)}
-	pve := buildDiskMetaPVE(clusterSvc, map[string]map[string]interface{}{
+	pve := buildDiskMetaPVE(clusterSvc, map[string]map[string]any{
 		configKey: {
 			"scsi0": dirCID,
 		},
@@ -749,7 +749,7 @@ func TestHandleSetDiskMetadata_ExactVolidMatch(t *testing.T) {
 	nodesSvc := &diskMetaNodesMock{}
 	logger, _ := log.NewObservedLogger(log.LevelWarn)
 	clusterSvc := &diskMetaClusterSvc{resp: clusterResourcesWithVM(testVMID, testNode)}
-	pve := buildDiskMetaPVE(clusterSvc, map[string]map[string]interface{}{
+	pve := buildDiskMetaPVE(clusterSvc, map[string]map[string]any{
 		configKey: {"scsi0": similarButDifferentVolid},
 	}, nodesSvc)
 
@@ -783,7 +783,7 @@ func TestHandleSetDiskMetadata_OptionStringVolidMatch(t *testing.T) {
 	configKey := diskKey(testNode, int(testVMID))
 	nodesSvc := &diskMetaNodesMock{}
 	clusterSvc := &diskMetaClusterSvc{resp: clusterResourcesWithVM(testVMID, testNode)}
-	pve := buildDiskMetaPVE(clusterSvc, map[string]map[string]interface{}{
+	pve := buildDiskMetaPVE(clusterSvc, map[string]map[string]any{
 		configKey: {"scsi0": volidWithOptions},
 	}, nodesSvc)
 
@@ -806,7 +806,7 @@ func TestHandleSetDiskMetadata_TransportErrorPropagates(t *testing.T) {
 	transportErr := errors.New("dial tcp: connection refused")
 	pve := buildDiskMetaPVE(
 		&diskMetaClusterSvc{listErr: transportErr},
-		map[string]map[string]interface{}{},
+		map[string]map[string]any{},
 		&diskMetaNodesMock{},
 	)
 	h := handlers.HandleSetDiskMetadata(makeDiskMetaDeps(pve))
@@ -839,7 +839,7 @@ func TestSetDiskMetadata_UpdateTransient_Retriable(t *testing.T) {
 
 	const cid = testDiskCID
 	configKey := diskKey(testNode, int(testVMID))
-	baseConfigs := map[string]map[string]interface{}{
+	baseConfigs := map[string]map[string]any{
 		configKey: vmConfigWithDisk(cid, ""),
 	}
 
@@ -885,7 +885,7 @@ func TestSetDiskMetadata_UpdateTransient_Retriable(t *testing.T) {
 		configCallCount := 0
 		qemuSvc := &configFnQEMU{
 			base: &diskMetaQEMUMock{configs: baseConfigs},
-			fn: func(_ context.Context, node string, vmid int) (map[string]interface{}, error) {
+			fn: func(_ context.Context, node string, vmid int) (map[string]any, error) {
 				configCallCount++
 				// findVMsHostingDisk = call 1 (scan); persistMetadata = call 2; applyCustomTagsToVM = call 3.
 				if configCallCount >= 3 {
@@ -895,7 +895,7 @@ func TestSetDiskMetadata_UpdateTransient_Retriable(t *testing.T) {
 				if cfg, ok := baseConfigs[key]; ok {
 					return cfg, nil
 				}
-				return map[string]interface{}{}, nil
+				return map[string]any{}, nil
 			},
 		}
 		// UpdateQemuConfig succeeds for persistMetadata (call 1).
@@ -934,20 +934,20 @@ func TestSetDiskMetadata_UpdateTransient_Retriable(t *testing.T) {
 // Used by tests that need per-call error injection on Config.
 type configFnQEMU struct {
 	base *diskMetaQEMUMock
-	fn   func(context.Context, string, int) (map[string]interface{}, error)
+	fn   func(context.Context, string, int) (map[string]any, error)
 }
 
-func (c *configFnQEMU) Config(ctx context.Context, node string, vmid int) (map[string]interface{}, error) {
+func (c *configFnQEMU) Config(ctx context.Context, node string, vmid int) (map[string]any, error) {
 	if c.fn != nil {
 		return c.fn(ctx, node, vmid)
 	}
 	return c.base.Config(ctx, node, vmid)
 }
 
-func (c *configFnQEMU) Create(ctx context.Context, node string, params map[string]interface{}) (string, error) {
+func (c *configFnQEMU) Create(ctx context.Context, node string, params map[string]any) (string, error) {
 	return c.base.Create(ctx, node, params)
 }
-func (c *configFnQEMU) Status(ctx context.Context, node string, vmid int) (map[string]interface{}, error) {
+func (c *configFnQEMU) Status(ctx context.Context, node string, vmid int) (map[string]any, error) {
 	return c.base.Status(ctx, node, vmid)
 }
 func (c *configFnQEMU) Start(ctx context.Context, node string, vmid int) (string, error) {
@@ -959,7 +959,7 @@ func (c *configFnQEMU) Stop(ctx context.Context, node string, vmid int) (string,
 func (c *configFnQEMU) Reset(ctx context.Context, node string, vmid int) (string, error) {
 	return c.base.Reset(ctx, node, vmid)
 }
-func (c *configFnQEMU) Clone(ctx context.Context, node string, vmid int, params map[string]interface{}) (string, error) {
+func (c *configFnQEMU) Clone(ctx context.Context, node string, vmid int, params map[string]any) (string, error) {
 	return c.base.Clone(ctx, node, vmid, params)
 }
 func (c *configFnQEMU) Template(ctx context.Context, node string, vmid int) (string, error) {
@@ -974,13 +974,13 @@ func (c *configFnQEMU) DetachDisk(ctx context.Context, node string, vmid int, sl
 func (c *configFnQEMU) ResizeDisk(ctx context.Context, node string, vmid int, slot string, sizeGB int) (string, error) {
 	return c.base.ResizeDisk(ctx, node, vmid, slot, sizeGB)
 }
-func (c *configFnQEMU) Snapshot(ctx context.Context, node string, vmid int, name string, params map[string]interface{}) (string, error) {
+func (c *configFnQEMU) Snapshot(ctx context.Context, node string, vmid int, name string, params map[string]any) (string, error) {
 	return c.base.Snapshot(ctx, node, vmid, name, params)
 }
 func (c *configFnQEMU) DeleteSnapshot(ctx context.Context, node string, vmid int, name string) error {
 	return c.base.DeleteSnapshot(ctx, node, vmid, name)
 }
-func (c *configFnQEMU) ListSnapshots(ctx context.Context, node string, vmid int) ([]map[string]interface{}, error) {
+func (c *configFnQEMU) ListSnapshots(ctx context.Context, node string, vmid int) ([]map[string]any, error) {
 	return c.base.ListSnapshots(ctx, node, vmid)
 }
 func (c *configFnQEMU) RollbackSnapshot(ctx context.Context, node string, vmid int, name string) (string, error) {

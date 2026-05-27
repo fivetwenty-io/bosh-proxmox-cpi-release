@@ -31,10 +31,10 @@ const testStemcellCID = "test-storage:import/bosh-stemcell-foo-1.0-abc12345.qcow
 
 // vmMockQEMU implements qemu.Service for create_vm tests.
 type vmMockQEMU struct {
-	createFn     func(ctx context.Context, node string, params map[string]interface{}) (string, error)
+	createFn     func(ctx context.Context, node string, params map[string]any) (string, error)
 	startFn      func(ctx context.Context, node string, vmid int) (string, error)
 	stopFn       func(ctx context.Context, node string, vmid int) (string, error)
-	configFn     func(ctx context.Context, node string, vmid int) (map[string]interface{}, error)
+	configFn     func(ctx context.Context, node string, vmid int) (map[string]any, error)
 	attachDiskFn func(ctx context.Context, node string, vmid int, volid, bus string, opts *sdkqemu.AttachOpts) (string, error)
 
 	createCalls []vmCreateCall
@@ -43,10 +43,10 @@ type vmMockQEMU struct {
 
 type vmCreateCall struct {
 	node   string
-	params map[string]interface{}
+	params map[string]any
 }
 
-func (m *vmMockQEMU) Create(ctx context.Context, node string, params map[string]interface{}) (string, error) {
+func (m *vmMockQEMU) Create(ctx context.Context, node string, params map[string]any) (string, error) {
 	m.createCalls = append(m.createCalls, vmCreateCall{node, params})
 	if m.createFn != nil {
 		return m.createFn(ctx, node, params)
@@ -67,11 +67,11 @@ func (m *vmMockQEMU) Stop(ctx context.Context, node string, vmid int) (string, e
 	}
 	return "UPID:pve:stop:ok", nil
 }
-func (m *vmMockQEMU) Config(ctx context.Context, node string, vmid int) (map[string]interface{}, error) {
+func (m *vmMockQEMU) Config(ctx context.Context, node string, vmid int) (map[string]any, error) {
 	if m.configFn != nil {
 		return m.configFn(ctx, node, vmid)
 	}
-	return map[string]interface{}{"net0": "virtio=aa:bb:cc:dd:ee:ff,bridge=vmbr0"}, nil
+	return map[string]any{"net0": "virtio=aa:bb:cc:dd:ee:ff,bridge=vmbr0"}, nil
 }
 func (m *vmMockQEMU) AttachDisk(ctx context.Context, node string, vmid int, volid, bus string, opts *sdkqemu.AttachOpts) (string, error) {
 	if m.attachDiskFn != nil {
@@ -82,12 +82,12 @@ func (m *vmMockQEMU) AttachDisk(ctx context.Context, node string, vmid int, voli
 
 // Clone panics — create_vm no longer calls Clone; tests that accidentally trigger
 // it reveal a regression in the handler.
-func (m *vmMockQEMU) Clone(_ context.Context, _ string, _ int, _ map[string]interface{}) (string, error) {
+func (m *vmMockQEMU) Clone(_ context.Context, _ string, _ int, _ map[string]any) (string, error) {
 	panic("vmMockQEMU.Clone: create_vm must not call Clone (direct-import mode)")
 }
 
 // Unimplemented stubs — panic on unexpected calls.
-func (m *vmMockQEMU) Status(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
+func (m *vmMockQEMU) Status(_ context.Context, _ string, _ int) (map[string]any, error) {
 	panic("vmMockQEMU.Status: not expected")
 }
 func (m *vmMockQEMU) Reset(_ context.Context, _ string, _ int) (string, error) {
@@ -102,13 +102,13 @@ func (m *vmMockQEMU) DetachDisk(_ context.Context, _ string, _ int, _ string) er
 func (m *vmMockQEMU) ResizeDisk(_ context.Context, _ string, _ int, _ string, _ int) (string, error) {
 	panic("vmMockQEMU.ResizeDisk: not expected")
 }
-func (m *vmMockQEMU) Snapshot(_ context.Context, _ string, _ int, _ string, _ map[string]interface{}) (string, error) {
+func (m *vmMockQEMU) Snapshot(_ context.Context, _ string, _ int, _ string, _ map[string]any) (string, error) {
 	panic("vmMockQEMU.Snapshot: not expected")
 }
 func (m *vmMockQEMU) DeleteSnapshot(_ context.Context, _ string, _ int, _ string) error {
 	panic("vmMockQEMU.DeleteSnapshot: not expected")
 }
-func (m *vmMockQEMU) ListSnapshots(_ context.Context, _ string, _ int) ([]map[string]interface{}, error) {
+func (m *vmMockQEMU) ListSnapshots(_ context.Context, _ string, _ int) ([]map[string]any, error) {
 	panic("vmMockQEMU.ListSnapshots: not expected")
 }
 func (m *vmMockQEMU) RollbackSnapshot(_ context.Context, _ string, _ int, _ string) (string, error) {
@@ -376,7 +376,7 @@ func TestHandleCreateVM_VMIDAllocFail(t *testing.T) {
 // (QEMU.Create itself failed — the VM was never created).
 func TestHandleCreateVM_CreateFail(t *testing.T) {
 	q := &vmMockQEMU{
-		createFn: func(_ context.Context, _ string, _ map[string]interface{}) (string, error) {
+		createFn: func(_ context.Context, _ string, _ map[string]any) (string, error) {
 			return "", fmt.Errorf("storage full")
 		},
 	}
@@ -701,7 +701,7 @@ func TestHandleCreateVM_EnvMBusBlobstore(t *testing.T) {
 func TestHandleCreateVM_TargetNodeFromCloudProperties(t *testing.T) {
 	var createNode string
 	q := &vmMockQEMU{
-		createFn: func(_ context.Context, node string, _ map[string]interface{}) (string, error) {
+		createFn: func(_ context.Context, node string, _ map[string]any) (string, error) {
 			createNode = node
 			return "UPID:pve2:create:ok", nil
 		},
@@ -788,7 +788,7 @@ func TestCreateVM_RollbackRemovesConfigDriveISO(t *testing.T) {
 func TestHandleCreateVM_VMIDConflictRetry(t *testing.T) {
 	attempt := 0
 	q := &vmMockQEMU{
-		createFn: func(_ context.Context, _ string, _ map[string]interface{}) (string, error) {
+		createFn: func(_ context.Context, _ string, _ map[string]any) (string, error) {
 			attempt++
 			if attempt < 3 {
 				body := []byte(`{"message":"unable to create VM 113 - VM 113 already exists on node 'pve'","code":500}`)
@@ -825,7 +825,7 @@ func TestHandleCreateVM_VMIDConflictRetry(t *testing.T) {
 // cleanupVM before propagating the error (so PVE state stays clean).
 func TestHandleCreateVM_AwaitTaskNonConflictRollsBack(t *testing.T) {
 	q := &vmMockQEMU{
-		createFn: func(_ context.Context, _ string, _ map[string]interface{}) (string, error) {
+		createFn: func(_ context.Context, _ string, _ map[string]any) (string, error) {
 			return "UPID:pve:create:partial", nil
 		},
 	}
@@ -1057,7 +1057,7 @@ func TestHandleCreateVM_AuthFailure(t *testing.T) {
 	authErr := &sdkerrors.APIError{HTTPCode: 401, Message: "authentication failure"}
 
 	q := &vmMockQEMU{
-		createFn: func(_ context.Context, _ string, _ map[string]interface{}) (string, error) {
+		createFn: func(_ context.Context, _ string, _ map[string]any) (string, error) {
 			return "", authErr
 		},
 	}
@@ -1107,35 +1107,15 @@ func TestCreateVM_AgentDead_EmitsDiagnostic(t *testing.T) {
 	statusCalled := false
 	q.startFn = nil // not needed; we simulate failure at agent.Configure
 
-	// Wire a custom QEMU service that knows Status.
-	type agentDeadQEMU struct {
-		*vmMockQEMU
-		statusFn func(ctx context.Context, node string, vmid int) (map[string]interface{}, error)
-	}
-	deadQ := &struct {
-		vmMockQEMU
-		statusFn func(ctx context.Context, node string, vmid int) (map[string]interface{}, error)
-	}{
-		vmMockQEMU: *q,
-		statusFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
-			statusCalled = true
-			return map[string]interface{}{"status": vmStatus, "qmpstatus": vmStatus}, nil
-		},
-	}
-
-	// Build a custom QEMU service that delegates Status.
-	type agentDeadQEMUService struct {
-		vmMockQEMU
-		statusCallFn func(ctx context.Context, node string, vmid int) (map[string]interface{}, error)
-	}
+	// Wire the package-level agentDeadQEMUService so its Status method
+	// intercepts any diagnostic probe the handler may emit after agent.Configure fails.
 	customQ := &agentDeadQEMUService{
 		vmMockQEMU: *q,
-		statusCallFn: func(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
+		statusCallFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
 			statusCalled = true
-			return map[string]interface{}{"status": vmStatus, "qmpstatus": vmStatus}, nil
+			return map[string]any{"status": vmStatus, "qmpstatus": vmStatus}, nil
 		},
 	}
-	_ = deadQ // avoid unused-variable lint
 
 	a := &vmMockAgent{
 		configureFn: func(_ context.Context, _ string, _ int, _ agent.AgentConfig) error {
@@ -1208,14 +1188,14 @@ func TestCreateVM_AgentDead_EmitsDiagnostic(t *testing.T) {
 // agentDeadQEMUService extends vmMockQEMU to override Status without panic.
 type agentDeadQEMUService struct {
 	vmMockQEMU
-	statusCallFn func(ctx context.Context, node string, vmid int) (map[string]interface{}, error)
+	statusCallFn func(ctx context.Context, node string, vmid int) (map[string]any, error)
 }
 
-func (s *agentDeadQEMUService) Status(ctx context.Context, node string, vmid int) (map[string]interface{}, error) {
+func (s *agentDeadQEMUService) Status(ctx context.Context, node string, vmid int) (map[string]any, error) {
 	if s.statusCallFn != nil {
 		return s.statusCallFn(ctx, node, vmid)
 	}
-	return map[string]interface{}{"status": "unknown"}, nil
+	return map[string]any{"status": "unknown"}, nil
 }
 
 // TestHandleCreateVM_LightStemcellCID_StripsPrefix verifies that a stemcell CID

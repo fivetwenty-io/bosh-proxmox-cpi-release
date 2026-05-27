@@ -38,21 +38,6 @@ func testSDNDeps(clusterSvc sdkcluster.Service, networkMode, sdnZone string, aut
 	}
 }
 
-// testBridgeDeps returns Deps wired with nodesSvc for bridge fallback.
-func testBridgeDeps(nodesSvc sdknodes.Service) handlers.Deps {
-	cfg := testConfig()
-	cfg.NetworkMode = "bridge"
-	cfg.NetworkBridge = "vmbr0"
-	return handlers.Deps{
-		Config: cfg,
-		PVE: &mockPVEClient{
-			clusterSvc: &mockSDNCluster{},
-			nodesSvc:   nodesSvc,
-		},
-		Logger: log.NewNopLogger(),
-	}
-}
-
 // invokeCreateNetwork marshals args and calls the handler.
 func invokeCreateNetwork(t *testing.T, deps handlers.Deps, args ...any) (any, error) {
 	t.Helper()

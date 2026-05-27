@@ -22,6 +22,7 @@ import (
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/cpi"
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
+	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
 )
 
@@ -169,6 +170,9 @@ func maybeDeleteOrphanedZone(ctx context.Context, deps Deps, zone string) error 
 	if listErr != nil {
 		// Cannot confirm zone is empty — do not delete. This is the
 		// safe default; the operator can clean up manually if needed.
+		deps.Logger.Warn("delete_network: zone teardown skipped — could not list vnets",
+			log.String("zone", zone),
+			log.Err(listErr))
 		return nil
 	}
 	for _, v := range allVnets {

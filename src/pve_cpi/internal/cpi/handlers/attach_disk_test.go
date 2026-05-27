@@ -36,8 +36,8 @@ type attachQEMUService struct {
 	//   - configCfg + configErr: legacy single-shape mode used by older
 	//     tests. configErrAfter, when > 0, returns configCfg/nil for the
 	//     first N calls and configErr starting with call N+1.
-	configCfgs     []map[string]interface{}
-	configCfg      map[string]interface{}
+	configCfgs     []map[string]any
+	configCfg      map[string]any
 	configErr      error
 	configErrAfter int
 	configCalls    int
@@ -49,14 +49,14 @@ type attachQEMUService struct {
 	// listSnapshotsFn controls ListSnapshots behavior for snapshot guard tests.
 	// nil → return only the synthetic "current" entry (no real snapshots),
 	// so existing tests are not affected by the guard.
-	listSnapshotsFn func(ctx context.Context, node string, vmid int) ([]map[string]interface{}, error)
+	listSnapshotsFn func(ctx context.Context, node string, vmid int) ([]map[string]any, error)
 }
 
 func (m *attachQEMUService) AttachDisk(_ context.Context, _ string, _ int, _ string, _ string, _ *qemu.AttachOpts) (string, error) {
 	return m.attachReturnDiskID, m.attachErr
 }
 
-func (m *attachQEMUService) Config(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
+func (m *attachQEMUService) Config(_ context.Context, _ string, _ int) (map[string]any, error) {
 	m.configCalls++
 	if len(m.configCfgs) > 0 {
 		idx := m.configCalls - 1
@@ -72,10 +72,10 @@ func (m *attachQEMUService) Config(_ context.Context, _ string, _ int) (map[stri
 }
 
 // Remaining Service methods — panic on accidental call.
-func (m *attachQEMUService) Create(_ context.Context, _ string, _ map[string]interface{}) (string, error) {
+func (m *attachQEMUService) Create(_ context.Context, _ string, _ map[string]any) (string, error) {
 	panic("attachQEMUService.Create: not expected")
 }
-func (m *attachQEMUService) Status(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
+func (m *attachQEMUService) Status(_ context.Context, _ string, _ int) (map[string]any, error) {
 	panic("attachQEMUService.Status: not expected")
 }
 func (m *attachQEMUService) Start(_ context.Context, _ string, _ int) (string, error) {
@@ -87,7 +87,7 @@ func (m *attachQEMUService) Stop(_ context.Context, _ string, _ int) (string, er
 func (m *attachQEMUService) Reset(_ context.Context, _ string, _ int) (string, error) {
 	panic("attachQEMUService.Reset: not expected")
 }
-func (m *attachQEMUService) Clone(_ context.Context, _ string, _ int, _ map[string]interface{}) (string, error) {
+func (m *attachQEMUService) Clone(_ context.Context, _ string, _ int, _ map[string]any) (string, error) {
 	panic("attachQEMUService.Clone: not expected")
 }
 func (m *attachQEMUService) Template(_ context.Context, _ string, _ int) (string, error) {
@@ -100,7 +100,7 @@ func (m *attachQEMUService) DetachDisk(_ context.Context, _ string, _ int, diskI
 func (m *attachQEMUService) ResizeDisk(_ context.Context, _ string, _ int, _ string, _ int) (string, error) {
 	panic("attachQEMUService.ResizeDisk: not expected")
 }
-func (m *attachQEMUService) Snapshot(_ context.Context, _ string, _ int, _ string, _ map[string]interface{}) (string, error) {
+func (m *attachQEMUService) Snapshot(_ context.Context, _ string, _ int, _ string, _ map[string]any) (string, error) {
 	panic("attachQEMUService.Snapshot: not expected")
 }
 func (m *attachQEMUService) DeleteSnapshot(_ context.Context, _ string, _ int, _ string) error {
@@ -108,14 +108,14 @@ func (m *attachQEMUService) DeleteSnapshot(_ context.Context, _ string, _ int, _
 }
 func (m *attachQEMUService) ListSnapshots(
 	ctx context.Context, node string, vmid int,
-) ([]map[string]interface{}, error) {
+) ([]map[string]any, error) {
 	if m.listSnapshotsFn != nil {
 		return m.listSnapshotsFn(ctx, node, vmid)
 	}
 	// Default: only the synthetic "current" entry — no real snapshots.
 	// Existing tests do not set listSnapshotsFn; this keeps them unaffected by
 	// the snapshot guard (guard sees len(names)==0 and proceeds normally).
-	return []map[string]interface{}{{"name": "current"}}, nil
+	return []map[string]any{{"name": "current"}}, nil
 }
 func (m *attachQEMUService) RollbackSnapshot(_ context.Context, _ string, _ int, _ string) (string, error) {
 	panic("attachQEMUService.RollbackSnapshot: not expected")
@@ -212,7 +212,7 @@ func TestHandleAttachDisk_Happy(t *testing.T) {
 
 	qemuSvc := &attachQEMUService{
 		attachReturnDiskID: "scsi2",
-		configCfg: map[string]interface{}{
+		configCfg: map[string]any{
 			"scsi0": "local-lvm:vm-100-disk-0",
 			"scsi1": "local-lvm:vm-100-disk-1",
 			"scsi2": volid,
@@ -263,7 +263,7 @@ func TestHandleAttachDisk_AlreadyAttached(t *testing.T) {
 
 	qemuSvc := &attachQEMUService{
 		attachReturnDiskID: "scsi1",
-		configCfg: map[string]interface{}{
+		configCfg: map[string]any{
 			"scsi0": "local-lvm:vm-100-disk-0",
 			"scsi1": volid,
 		},
@@ -318,7 +318,7 @@ func TestHandleAttachDisk_UpdateDiskHintsFail(t *testing.T) {
 	const volid = "vm-9001-disk-0"
 	qemuSvc := &attachQEMUService{
 		attachReturnDiskID: "scsi2",
-		configCfg:          map[string]interface{}{"scsi2": volid},
+		configCfg:          map[string]any{"scsi2": volid},
 	}
 	ag := &captureAgent{updateErr: errors.New("registry unavailable")}
 	h := handlers.HandleAttachDisk(attachDeps(qemuSvc, ag))
@@ -390,7 +390,7 @@ func TestHandleAttachDisk_EmptyDiskCID(t *testing.T) {
 func TestHandleAttachDisk_ResolveFallback(t *testing.T) {
 	qemuSvc := &attachQEMUService{
 		attachReturnDiskID: "scsi3",
-		configCfg:          map[string]interface{}{}, // empty config → slot-selection picks scsi1
+		configCfg:          map[string]any{},
 		configErr:          errors.New("transient config error"),
 		configErrAfter:     1,
 	}
@@ -419,7 +419,7 @@ func TestHandleAttachDisk_DiskHintsShape(t *testing.T) {
 	const volid = "vm-9001-disk-0"
 	qemuSvc := &attachQEMUService{
 		attachReturnDiskID: "scsi2",
-		configCfg:          map[string]interface{}{"scsi2": volid},
+		configCfg:          map[string]any{"scsi2": volid},
 	}
 	h := handlers.HandleAttachDisk(attachDeps(qemuSvc, &captureAgent{}))
 
@@ -457,7 +457,7 @@ func TestHandleAttachDisk_FreshVMSkipsSCSI0(t *testing.T) {
 		attachReturnDiskID: "scsi1",
 		// First Config call (slot selection): config has virtio0 root, no scsi.
 		// Second Config call (resolve): config has the new scsi1 attachment.
-		configCfg: map[string]interface{}{
+		configCfg: map[string]any{
 			"virtio0": "data:vm-100-disk-0",
 			"scsi1":   "data:" + volid,
 		},
@@ -486,7 +486,7 @@ func TestHandleAttachDisk_LegacySCSI0Migration(t *testing.T) {
 
 	qemuSvc := &attachQEMUService{
 		attachReturnDiskID: "scsi1",
-		configCfgs: []map[string]interface{}{
+		configCfgs: []map[string]any{
 			// Call 1 — slot selection: legacy scsi0 attachment present.
 			{"virtio0": "data:vm-100-disk-0", "scsi0": diskCID},
 			// Call 2 — re-read after Detach: scsi0 gone.
@@ -522,7 +522,7 @@ func TestHandleAttachDisk_PreservesExistingNonZeroSlot(t *testing.T) {
 
 	qemuSvc := &attachQEMUService{
 		attachReturnDiskID: "scsi3",
-		configCfg: map[string]interface{}{
+		configCfg: map[string]any{
 			"virtio0": "data:vm-100-disk-0",
 			"scsi1":   "data:other",
 			"scsi3":   diskCID,
@@ -553,7 +553,7 @@ func TestHandleAttachDisk_PicksLowestFreeAtOrAboveOne(t *testing.T) {
 	const volid = "vm-9001-disk-0"
 	qemuSvc := &attachQEMUService{
 		attachReturnDiskID: "scsi2",
-		configCfg: map[string]interface{}{
+		configCfg: map[string]any{
 			"virtio0": "data:vm-100-disk-0",
 			"scsi1":   "data:other-a",
 			"scsi3":   "data:other-c",
@@ -591,19 +591,19 @@ func TestHandleAttachDisk_PicksLowestFreeAtOrAboveOne(t *testing.T) {
 
 // snapshots builds a ListSnapshots response with the given real snapshot names
 // plus the mandatory synthetic "current" entry.
-func snapshots(names ...string) func(_ context.Context, _ string, _ int) ([]map[string]interface{}, error) {
-	return func(_ context.Context, _ string, _ int) ([]map[string]interface{}, error) {
-		out := []map[string]interface{}{{"name": "current"}}
+func snapshots(names ...string) func(_ context.Context, _ string, _ int) ([]map[string]any, error) {
+	return func(_ context.Context, _ string, _ int) ([]map[string]any, error) {
+		out := []map[string]any{{"name": "current"}}
 		for _, n := range names {
-			out = append(out, map[string]interface{}{"name": n})
+			out = append(out, map[string]any{"name": n})
 		}
 		return out, nil
 	}
 }
 
 // snapshotErr returns a listSnapshotsFn that fails with the given error.
-func snapshotErr(err error) func(_ context.Context, _ string, _ int) ([]map[string]interface{}, error) {
-	return func(_ context.Context, _ string, _ int) ([]map[string]interface{}, error) {
+func snapshotErr(err error) func(_ context.Context, _ string, _ int) ([]map[string]any, error) {
+	return func(_ context.Context, _ string, _ int) ([]map[string]any, error) {
 		return nil, err
 	}
 }
@@ -626,12 +626,12 @@ func guardCfg(allowDiskOps, requireCheckPass bool) *config.CPIConfig {
 // working attach+config path. diskCID must match the "storage:volid" form
 // used in the test.
 func snapQEMUSvc(
-	listFn func(context.Context, string, int) ([]map[string]interface{}, error),
+	listFn func(context.Context, string, int) ([]map[string]any, error),
 	volid string,
 ) *attachQEMUService {
 	return &attachQEMUService{
 		attachReturnDiskID: "scsi1",
-		configCfg: map[string]interface{}{
+		configCfg: map[string]any{
 			"scsi1": "data:" + volid,
 		},
 		listSnapshotsFn: listFn,
@@ -824,7 +824,7 @@ func (c *attachDiskClusterSvc) ListResources(ctx context.Context, params *sdkclu
 // attachDiskVMOnNode builds a ListResourcesResponse that places vmid on node.
 // FindVMNodeViaCluster parses {"vmid": N, "node": "name"} rows.
 func attachDiskVMOnNode(vmid int, node string) *sdkcluster.ListResourcesResponse {
-	raw, _ := json.Marshal(map[string]interface{}{
+	raw, _ := json.Marshal(map[string]any{
 		"vmid": vmid,
 		"node": node,
 		"type": "qemu",
@@ -858,7 +858,7 @@ func TestHandleAttachDisk_LocalBackend_CoLocationEnforced(t *testing.T) {
 	// call produces a recognizable test failure rather than a silent success.
 	qemuSvc := &attachQEMUService{
 		attachErr: errors.New("AttachDisk must not be called on co-location violation"),
-		configCfg: map[string]interface{}{}, // empty — chooseSCSISlotSkippingZero picks scsi1
+		configCfg: map[string]any{},
 	}
 
 	// Cluster returns VM 100 on vmNode so FindVMNodeViaCluster resolves it.
@@ -920,7 +920,7 @@ func TestHandleAttachDisk_LVM_CID(t *testing.T) {
 	)
 	qemuSvc := &attachQEMUService{
 		attachReturnDiskID: "scsi1",
-		configCfg:          map[string]interface{}{"scsi1": diskCID},
+		configCfg:          map[string]any{"scsi1": diskCID},
 	}
 	ag := &captureAgent{}
 	h := handlers.HandleAttachDisk(attachDeps(qemuSvc, ag))
@@ -944,7 +944,7 @@ func TestHandleAttachDisk_ZFSPool_CID(t *testing.T) {
 	const diskCID = "local-zfs:vm-9001-disk-0"
 	qemuSvc := &attachQEMUService{
 		attachReturnDiskID: "scsi1",
-		configCfg:          map[string]interface{}{"scsi1": diskCID},
+		configCfg:          map[string]any{"scsi1": diskCID},
 	}
 	ag := &captureAgent{}
 	h := handlers.HandleAttachDisk(attachDeps(qemuSvc, ag))
@@ -969,7 +969,7 @@ func TestHandleAttachDisk_Dir_CID(t *testing.T) {
 	const diskCID = "local:9001/vm-9001-disk-0.raw"
 	qemuSvc := &attachQEMUService{
 		attachReturnDiskID: "scsi1",
-		configCfg:          map[string]interface{}{"scsi1": diskCID},
+		configCfg:          map[string]any{"scsi1": diskCID},
 	}
 	ag := &captureAgent{}
 	h := handlers.HandleAttachDisk(attachDeps(qemuSvc, ag))
@@ -992,7 +992,7 @@ func TestHandleAttachDisk_LVMThin_CID(t *testing.T) {
 	const diskCID = "local-lvm-thin:vm-9001-disk-0"
 	qemuSvc := &attachQEMUService{
 		attachReturnDiskID: "scsi1",
-		configCfg:          map[string]interface{}{"scsi1": diskCID},
+		configCfg:          map[string]any{"scsi1": diskCID},
 	}
 	ag := &captureAgent{}
 	h := handlers.HandleAttachDisk(attachDeps(qemuSvc, ag))
@@ -1099,7 +1099,7 @@ func TestAttachDisk_ConcurrentSameVM(t *testing.T) {
 	newQEMU := func() *attachQEMUService {
 		return &attachQEMUService{
 			attachReturnDiskID: "scsi1",
-			configCfg: map[string]interface{}{
+			configCfg: map[string]any{
 				"scsi1": diskCID,
 			},
 		}

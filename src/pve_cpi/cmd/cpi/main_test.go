@@ -25,6 +25,7 @@ import (
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
 )
 
+//nolint:modernize // helper supports non-zero bool values; new(bool) only gives false
 func boolPtr(b bool) *bool { return &b }
 
 // nilPVEClient satisfies pve.Client without making real API calls.

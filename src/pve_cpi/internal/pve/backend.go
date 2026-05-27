@@ -98,7 +98,7 @@ func (r *resolver) Resolve(ctx context.Context, storage string) (Backend, error)
 		// fabricated StorageInfo. The local backend's NodeForCreate refuses
 		// to make decisions without one of (vmHint, cloudPropNode, defaultNode),
 		// which keeps the safe-default behavior described in the plan.
-		_ = err
+		_ = err // err deliberately discarded: cache miss falls through to default backend resolution; high-frequency path, no log to avoid noise.
 	}
 
 	// No cache configured or storage not found: treat as local. Tests that

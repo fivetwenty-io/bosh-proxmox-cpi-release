@@ -386,7 +386,7 @@ func TestOCISource_Fetch_Anonymous(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Fetch: unexpected error: %v", err)
 	}
-	defer body.Close()
+	defer func() { _ = body.Close() }()
 
 	data, err := io.ReadAll(body)
 	if err != nil {
@@ -442,7 +442,7 @@ func TestOCISource_Fetch_LayerSelection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Fetch: unexpected error: %v", err)
 	}
-	defer body.Close()
+	defer func() { _ = body.Close() }()
 
 	data, err := io.ReadAll(body)
 	if err != nil {
@@ -482,7 +482,7 @@ func TestOCISource_Fetch_NoLayers(t *testing.T) {
 			}`
 			w.Header().Set("Content-Type", "application/vnd.docker.distribution.manifest.v2+json")
 			w.WriteHeader(http.StatusOK)
-			fmt.Fprint(w, manifest)
+			_, _ = fmt.Fprint(w, manifest)
 		default:
 			http.NotFound(w, r)
 		}

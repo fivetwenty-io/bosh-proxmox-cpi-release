@@ -260,9 +260,6 @@ func TestNodeForExisting_AllNodesError_ReturnsRetriable(t *testing.T) {
 
 	// Must NOT be DiskNotFound — that would silently hide the cluster outage.
 	if isDNF := func() bool {
-		type diskNotFoundChecker interface {
-			Type() interface{ String() string }
-		}
 		// Check via string: DiskNotFound message contains "disk not found:".
 		return len(err.Error()) > 0 && containsStr(err.Error(), "disk not found:")
 	}(); isDNF {

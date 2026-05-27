@@ -39,7 +39,7 @@ var unusedDiskKeyPattern = regexp.MustCompile(`^unused\d+$`)
 // matches "unusedN" and whose value is a non-empty string. The returned
 // volids are bare (any ",options" suffix is stripped) for direct equality
 // comparison with storage-prefixed volume identifiers.
-func FindUnusedDiskEntries(cfg map[string]interface{}) map[string]string {
+func FindUnusedDiskEntries(cfg map[string]any) map[string]string {
 	out := make(map[string]string)
 	for key, raw := range cfg {
 		if !unusedDiskKeyPattern.MatchString(key) {

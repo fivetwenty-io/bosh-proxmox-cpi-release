@@ -42,7 +42,7 @@ func TestDecode_Valid(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open testdata/request.json: %v", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	req, err := Decode(f)
 	if err != nil {
@@ -294,7 +294,7 @@ func TestRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open request.json: %v", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	req, err := Decode(f)
 	if err != nil {

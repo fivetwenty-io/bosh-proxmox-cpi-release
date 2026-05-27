@@ -39,7 +39,7 @@ func TestHTTPSSource_Fetch_Unauthenticated(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Fetch: unexpected error: %v", err)
 	}
-	defer body.Close()
+	defer func() { _ = body.Close() }()
 
 	got, err := io.ReadAll(body)
 	if err != nil {
@@ -85,7 +85,7 @@ func TestHTTPSSource_Fetch_Basic(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Fetch: unexpected error: %v", err)
 		}
-		defer body.Close()
+		defer func() { _ = body.Close() }()
 		got, _ := io.ReadAll(body)
 		if string(got) != wantBody {
 			t.Errorf("body = %q, want %q", got, wantBody)
@@ -138,7 +138,7 @@ func TestHTTPSSource_Fetch_Bearer(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Fetch: unexpected error: %v", err)
 		}
-		defer body.Close()
+		defer func() { _ = body.Close() }()
 		got, _ := io.ReadAll(body)
 		if string(got) != wantBody {
 			t.Errorf("body = %q, want %q", got, wantBody)
@@ -230,7 +230,7 @@ func TestHTTPSSource_Fetch_Redirect(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Fetch: unexpected error: %v", err)
 	}
-	defer body.Close()
+	defer func() { _ = body.Close() }()
 
 	got, err := io.ReadAll(body)
 	if err != nil {
@@ -263,7 +263,7 @@ func TestHTTPSSource_Fetch_ContentLength(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Fetch: unexpected error: %v", err)
 	}
-	defer body.Close()
+	defer func() { _ = body.Close() }()
 
 	if contentLength != 27 {
 		t.Errorf("contentLength = %d, want 27", contentLength)

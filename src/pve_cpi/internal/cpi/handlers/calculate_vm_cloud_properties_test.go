@@ -69,7 +69,7 @@ func (c *calcMockClient) ClusterStorage() clusterstorage.Service { return nil }
 // storageActiveImagesJSON returns a single-entry ListStorageResponse with the
 // named storage marked active=1 and content="images,rootdir".
 func storageActiveImagesJSON(storageName string) *nodes.ListStorageResponse {
-	raw, _ := json.Marshal(map[string]interface{}{
+	raw, _ := json.Marshal(map[string]any{
 		"storage": storageName,
 		"type":    "dir",
 		"active":  1,
@@ -83,7 +83,7 @@ func storageActiveImagesJSON(storageName string) *nodes.ListStorageResponse {
 // storageInactiveJSON returns a single-entry response where the storage is
 // listed but active==0 (mount failed or backend offline).
 func storageInactiveJSON(storageName string) *nodes.ListStorageResponse {
-	raw, _ := json.Marshal(map[string]interface{}{
+	raw, _ := json.Marshal(map[string]any{
 		"storage": storageName,
 		"type":    "dir",
 		"active":  0,
@@ -97,7 +97,7 @@ func storageInactiveJSON(storageName string) *nodes.ListStorageResponse {
 // storageNoImagesJSON returns a response where storage is active but does not
 // declare "images" content type (e.g., backup-only storage).
 func storageNoImagesJSON(storageName string) *nodes.ListStorageResponse {
-	raw, _ := json.Marshal(map[string]interface{}{
+	raw, _ := json.Marshal(map[string]any{
 		"storage": storageName,
 		"type":    "dir",
 		"active":  1,
@@ -120,7 +120,7 @@ func emptyStorageResponse() *nodes.ListStorageResponse {
 
 // nodeJSON builds a json.RawMessage representing a PVE cluster/status node entry.
 func nodeJSON(name string, maxcpu, maxmem, mem int64, online int) json.RawMessage {
-	raw, _ := json.Marshal(map[string]interface{}{
+	raw, _ := json.Marshal(map[string]any{
 		"type":   "node",
 		"name":   name,
 		"maxcpu": maxcpu,
@@ -165,7 +165,7 @@ func makeCalcDepsWithNodes(svc *mockClusterService, nodesSvc nodes.Service) hand
 }
 
 func makeCalcArgs(cpu, ram, disk int) []json.RawMessage {
-	raw, _ := json.Marshal(map[string]interface{}{
+	raw, _ := json.Marshal(map[string]any{
 		"cpu":                 cpu,
 		"ram":                 ram,
 		"ephemeral_disk_size": disk,
@@ -175,7 +175,7 @@ func makeCalcArgs(cpu, ram, disk int) []json.RawMessage {
 
 // makeCalcArgsWithStorage builds args that include a per-request storage override.
 func makeCalcArgsWithStorage(cpu, ram, disk int, stor string) []json.RawMessage {
-	raw, _ := json.Marshal(map[string]interface{}{
+	raw, _ := json.Marshal(map[string]any{
 		"cpu":                 cpu,
 		"ram":                 ram,
 		"ephemeral_disk_size": disk,

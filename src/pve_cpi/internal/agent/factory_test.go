@@ -9,6 +9,7 @@ import (
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 )
 
+//nolint:modernize // helper supports non-zero bool values; new(bool) only gives false
 func boolPtr(b bool) *bool { return &b }
 
 // minimalCfg returns a CPIConfig with required fields set and the given agent mode.

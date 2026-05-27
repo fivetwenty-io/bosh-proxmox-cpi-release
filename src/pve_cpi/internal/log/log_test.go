@@ -62,7 +62,7 @@ func TestNewLogger_JSONOutput(t *testing.T) {
 	l.Debug("json check", log.String("key", "val"))
 
 	line := strings.TrimSpace(buf.String())
-	var m map[string]interface{}
+	var m map[string]any
 	if err := json.Unmarshal([]byte(line), &m); err != nil {
 		t.Fatalf("output is not valid JSON: %v\noutput: %s", err, line)
 	}
@@ -166,7 +166,7 @@ func TestWithContext_EmptyCtx(t *testing.T) {
 	}
 	l2.Info("empty ctx")
 
-	var m map[string]interface{}
+	var m map[string]any
 	if err := json.Unmarshal([]byte(strings.TrimSpace(buf.String())), &m); err != nil {
 		t.Fatalf("output not valid JSON: %v", err)
 	}
