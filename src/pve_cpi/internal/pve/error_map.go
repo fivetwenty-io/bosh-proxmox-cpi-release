@@ -2,6 +2,7 @@
 package pve
 
 import (
+	"context"
 	"errors"
 	"net"
 	"strings"
@@ -113,6 +114,63 @@ func IsNotFound(err error) bool {
 	}
 	// Check BOSH not-found types.
 	return cpierrors.IsNotFound(err)
+}
+
+// IsVolumeMissing reports whether err signals that a storage volume is absent.
+// PVE's HTTP layer returns 404 for dir-type storages (covered by IsNotFound),
+// but block-backed storages return 500 with a CLI-derived error string when
+// the underlying object no longer exists. Detected shapes:
+//
+//   - lvmthin: GET /nodes/<n>/storage/<s>/content/<volid> on a deleted LV
+//     returns 500 with "can't get size of '/dev/<vg>/<lv>': Failed to find
+//     logical volume \"<vg>/<lv>\"". Either substring is sufficient.
+//   - zfspool: similar pattern with "dataset does not exist" or
+//     "no such pool or dataset".
+//
+// Callers that want existence semantics — has_disk, delete_disk idempotency,
+// the NodeForExisting cluster scan — should fold this into a clean "not
+// present" outcome rather than letting it surface as a retriable cloud error
+// (which makes the operation appear to fail forever even though the volume
+// is genuinely gone).
+//
+// nil → false.
+func IsVolumeMissing(err error) bool {
+	if err == nil {
+		return false
+	}
+	if IsNotFound(err) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(msg, "failed to find logical volume"):
+		return true
+	case strings.Contains(msg, "can't get size of"):
+		return true
+	case strings.Contains(msg, "dataset does not exist"):
+		return true
+	case strings.Contains(msg, "no such pool or dataset"):
+		return true
+	}
+	return false
+}
+
+// ExistsTolerant wraps client.Storage().Exists with extended not-found
+// detection. The SDK only folds HTTP 404 into (false, nil); block-backed
+// storages (lvmthin, zfspool) instead return 500 wrapping the perl CLI's
+// "Failed to find logical volume" / "dataset does not exist" text. This
+// helper recognizes both and reports (false, nil) so the cluster-scan and
+// idempotent delete paths see uniform existence semantics regardless of
+// storage backend.
+func ExistsTolerant(ctx context.Context, client Client, node, storage, volume string) (bool, error) {
+	exists, err := client.Storage().Exists(ctx, node, storage, volume)
+	if err == nil {
+		return exists, nil
+	}
+	if IsVolumeMissing(err) {
+		return false, nil
+	}
+	return false, err
 }
 
 // IsVMIDConflict reports whether err signals that a VMID (or block-storage

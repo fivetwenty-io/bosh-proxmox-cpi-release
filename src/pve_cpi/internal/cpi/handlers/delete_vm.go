@@ -176,7 +176,11 @@ func HandleDeleteVM(deps Deps) cpi.Handler {
 					protected = append(protected, fmt.Sprintf("%s=%s", slot, volid))
 					continue
 				}
-				exists, existErr := deps.PVE.Storage().Exists(ctx, node, diskStorage, volid)
+				// ExistsTolerant: block-backed storages return 500 with
+				// "Failed to find logical volume" for missing LVs rather
+				// than 404. Treat those as "volume gone" so a stale unused
+				// slot pointing at a deleted volume does not wedge delete_vm.
+				exists, existErr := pve.ExistsTolerant(ctx, deps.PVE, node, diskStorage, volid)
 				if existErr != nil {
 					logger.Warn("delete_vm: unused-slot volume existence probe failed -- treating slot as present (fail-closed)",
 						log.String("slot", slot), log.String("volid", volid), log.Err(existErr))

@@ -83,7 +83,12 @@ func (l *localBackend) NodeForExisting(ctx context.Context, volume string) (stri
 	anyProbeSucceeded := false
 
 	for _, node := range candidates {
-		exists, err := l.client.Storage().Exists(ctx, node, storage, volume)
+		// ExistsTolerant folds the lvmthin/zfspool "Failed to find logical
+		// volume" / "dataset does not exist" 500 errors into (false, nil)
+		// so the cluster scan reports a clean miss instead of a retriable
+		// error when the volume is genuinely gone (e.g. just-deleted disks
+		// being re-probed by has_disk / delete_disk idempotency paths).
+		exists, err := ExistsTolerant(ctx, l.client, node, storage, volume)
 		if err != nil {
 			// Probe failure on one node should not abort the cluster scan —
 			// the volume may live on a different healthy node. Record the

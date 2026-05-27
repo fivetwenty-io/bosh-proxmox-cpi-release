@@ -10,7 +10,7 @@ Usage:
     ./scripts/test integration [action] Run integration tier(s).
 
 Integration actions:
-    all        Teardown existing env, then run lifecycle → bosh → cf (default).
+    all        Teardown existing env, then run lifecycle → bosh → cf → light (default).
     lifecycle  Run only Tier 1: CPI 16-step lifecycle test.
     bosh       Run only Tier 2: bosh create-env + emptyvm smoke.
     cf         Run only Tier 3: CF deploy + smoke app.
@@ -784,8 +784,9 @@ def cmd_integration(argv: list[str]) -> int:
             "  bosh      — Tier 2: bosh create-env + emptyvm smoke.\n"
             "  cf        — Tier 3: CF deploy + smoke app.\n"
             "  light     — Tier 4: light stemcell upload + delete assertions.\n"
-            "  all       — Teardown existing env, then lifecycle → bosh → cf\n"
-            "              (light is not included in 'all'; run it explicitly).\n"
+            "  all       — Teardown existing env, then lifecycle → bosh → cf → light\n"
+            "              (light is included when tiers.light is true and tier 2\n"
+            "              has populated the director).\n"
             "  teardown  — Tear down CF deployment and BOSH director."
         ),
     )
@@ -915,6 +916,13 @@ def cmd_integration(argv: list[str]) -> int:
 
         if tiers.get("cf", True):
             rc = tier_cf(cfg, cpi_config_path, keep)
+            if rc != 0:
+                return rc
+
+        # Tier 4 light needs the director from tier 2 still up. tier_cf does not
+        # tear the director down, so running light after cf is safe.
+        if tiers.get("light", True):
+            rc = tier_light(cfg, cpi_config_path, keep)
             if rc != 0:
                 return rc
 

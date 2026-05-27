@@ -74,14 +74,18 @@ func HandleHasDisk(deps Deps) Handler {
 		}
 
 		// ----------------------------------------------------------------
-		// 4. Call storage.Exists. The SDK returns (false, nil) for 404
-		//    internally; we propagate other errors to the dispatcher.
+		// 4. Call storage.Exists via ExistsTolerant so block-backed
+		//    storages (lvmthin/zfspool) that return 500 wrapping
+		//    "Failed to find logical volume" / "dataset does not exist"
+		//    for a missing volume report a clean (false, nil) — has_disk
+		//    must answer false for a just-deleted disk regardless of
+		//    backend, not raise a retriable cloud error.
 		// ----------------------------------------------------------------
-		exists, err := deps.PVE.Storage().Exists(ctx, node, storage, diskCID)
+		exists, err := pve.ExistsTolerant(ctx, deps.PVE, node, storage, diskCID)
 		if err != nil {
-			// If an unexpected not-found surfaces from a non-SDK path,
-			// treat it as "not exists" rather than an error.
-			if pve.IsNotFound(err) {
+			// Belt-and-braces: any not-found classification surfacing through
+			// a non-Exists path still resolves to false.
+			if pve.IsVolumeMissing(err) {
 				deps.Logger.Debug("has_disk: not found via error path, returning false",
 					log.String("disk_cid", diskCID),
 				)

@@ -675,3 +675,61 @@ func TestIsSnapshotBlocked_Unrelated(t *testing.T) {
 		t.Errorf("unrelated error should not be snapshot-blocked; err=%v", err)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// IsVolumeMissing — covers the lvmthin and zfspool 500-error patterns that
+// the SDK does not classify as 404. NodeForExisting must fold these into a
+// clean miss so a just-deleted disk does not surface as a retriable error.
+// ---------------------------------------------------------------------------
+
+func TestIsVolumeMissing_LvmthinFailedToFind(t *testing.T) {
+	// Exact PVE-API error shape observed in the wild for a deleted lvmthin LV.
+	err := errors.New(
+		`failed to check if volume "data:vm-9373-disk-0" exists on storage "data" node "pve": ` +
+			`failed to execute GET request to "/nodes/pve/storage/data/content/data:vm-9373-disk-0" ` +
+			`with context: HTTP GET request failed: API request failed: can't get size of ` +
+			`'/dev/data/vm-9373-disk-0':   Failed to find logical volume "data/vm-9373-disk-0"`)
+	if !pve.IsVolumeMissing(err) {
+		t.Errorf("expected lvmthin 'Failed to find logical volume' error to classify as missing; err=%v", err)
+	}
+}
+
+func TestIsVolumeMissing_LvmthinCantGetSize(t *testing.T) {
+	// The "can't get size of '/dev/...'" prefix alone (without the trailing
+	// 'Failed to find logical volume') is sufficient — PVE has been seen
+	// emitting just the size-probe error for some lvmthin variants.
+	err := errors.New(`can't get size of '/dev/data/vm-100-disk-1'`)
+	if !pve.IsVolumeMissing(err) {
+		t.Errorf("expected lvmthin 'can't get size of' error to classify as missing; err=%v", err)
+	}
+}
+
+func TestIsVolumeMissing_ZfspoolDatasetMissing(t *testing.T) {
+	err := errors.New(`zfs error: dataset does not exist`)
+	if !pve.IsVolumeMissing(err) {
+		t.Errorf("expected zfspool 'dataset does not exist' to classify as missing; err=%v", err)
+	}
+}
+
+func TestIsVolumeMissing_HTTP404(t *testing.T) {
+	// SDK 404 path must still classify (existing IsNotFound semantics retained).
+	err := makeAPIErr(404, "no such volume")
+	if !pve.IsVolumeMissing(err) {
+		t.Errorf("expected SDK 404 to classify as missing; err=%v", err)
+	}
+}
+
+func TestIsVolumeMissing_Unrelated(t *testing.T) {
+	// A genuine transient error (timeout, 5xx without the missing-LV text)
+	// must NOT classify as missing — otherwise we would mask real failures.
+	err := errors.New("upstream gateway timed out")
+	if pve.IsVolumeMissing(err) {
+		t.Errorf("unrelated error should not classify as missing; err=%v", err)
+	}
+}
+
+func TestIsVolumeMissing_Nil(t *testing.T) {
+	if pve.IsVolumeMissing(nil) {
+		t.Error("nil should not classify as missing")
+	}
+}
