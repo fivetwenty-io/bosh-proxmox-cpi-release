@@ -621,9 +621,13 @@ func createVM(
 	// -----------------------------------------------------------------------
 	agentNetworks := buildAgentNetworks(networks)
 	mbus, blobstore := extractMBusAndBlobstore(env)
-	// create-env (bosh-init) does not put the agent mbus URL in env; it
-	// lives in CPI config as cloud_provider.properties.agent.mbus. Fall back
-	// to the configured value when env didn't carry one.
+	// In the modern (NATS-mTLS) BOSH director path the director-side
+	// agent_settings env carries env.bosh.mbus.cert but NOT env.bosh.mbus.url
+	// — the URL has to come from the CPI's job-level `properties.agent.mbus`
+	// config (matches the pattern bosh-deployment uses for other CPIs, e.g.
+	// virtualbox_cpi in misc/ipv6/bosh.yml). The same fallback handles
+	// create-env (bosh-init), where env carries no mbus at all and the URL
+	// lives in cloud_provider.properties.agent.mbus.
 	if mbus == "" {
 		mbus = deps.Config.AgentMBus
 	}

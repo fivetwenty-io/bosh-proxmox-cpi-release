@@ -64,23 +64,23 @@
 
 # Insert pve_cpi job into the bosh instance group.
 #
-# Note: we deliberately do NOT set a job-level `agent` property here. BOSH
-# manifest property resolution makes a job-level `properties.agent` shadow the
-# instance-group-level `properties.agent` from bosh-deployment's bosh.yml
-# (which supplies `agent.mbus: nats://((internal_ip)):4222`). The director
-# reads its own `agent.mbus` to populate the `mbus` field in the agent_settings
-# JSON it hands to every CPI create_vm call. If we shadow that with an empty
-# string, every deployed VM's agent boots with mbus="" and the CPI rejects
-# the call with "agent settings vm N: mbus is empty". Leaving the bosh.yml
-# default in place is the correct behaviour: the CPI receives agent_settings
-# per-invocation and forwards them into the VM, so the release does not need
-# its own agent property override.
+# Note on agent.mbus: in modern bosh-deployment (NATS mTLS era), the director
+# populates the agent_settings env.bosh.mbus object with the NATS *cert* only;
+# it does NOT inject env.bosh.mbus.url. The CPI is expected to supply the URL
+# from its own job-level `properties.agent.mbus` config (the same pattern
+# bosh-deployment uses for virtualbox_cpi in misc/ipv6/bosh.yml). Without this
+# property the agent settings the CPI emits have mbus="" and the agent cannot
+# locate NATS, which the CPI guards against with "agent settings vm N: mbus is
+# empty". Set pve_agent_mbus to the director's NATS URL (e.g. nats://10.0.0.1:4222);
+# the variable lives in vars.yml so the URL stays out of this ops file.
 - type: replace
   path: /instance_groups/name=bosh/jobs/-
   value:
     name: pve_cpi
     release: bosh-pve-cpi
     properties:
+      agent:
+        mbus: ((pve_agent_mbus))
       pve: &pve_props
         host: ((pve_host))
         port: ((pve_port))
