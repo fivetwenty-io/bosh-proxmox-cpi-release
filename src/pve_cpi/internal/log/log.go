@@ -37,13 +37,26 @@ type Logger struct {
 }
 
 // Field constructors mirror the names previously provided by zap so call-site
-// migrations are mechanical.
-func String(key, val string) Field          { return slog.String(key, val) }
-func Int(key string, val int) Field         { return slog.Int(key, val) }
-func Int64(key string, val int64) Field     { return slog.Int64(key, val) }
+// migrations are mechanical. Each wraps the corresponding slog.* helper and
+// returns a Field (alias for slog.Attr) ready to pass to Logger methods.
+
+// String returns a Field carrying a string value under the given key.
+func String(key, val string) Field { return slog.String(key, val) }
+
+// Int returns a Field carrying an int value under the given key.
+func Int(key string, val int) Field { return slog.Int(key, val) }
+
+// Int64 returns a Field carrying an int64 value under the given key.
+func Int64(key string, val int64) Field { return slog.Int64(key, val) }
+
+// Float64 returns a Field carrying a float64 value under the given key.
 func Float64(key string, val float64) Field { return slog.Float64(key, val) }
-func Bool(key string, val bool) Field       { return slog.Bool(key, val) }
-func Any(key string, val any) Field         { return slog.Any(key, val) }
+
+// Bool returns a Field carrying a bool value under the given key.
+func Bool(key string, val bool) Field { return slog.Bool(key, val) }
+
+// Any returns a Field carrying an arbitrary value under the given key.
+func Any(key string, val any) Field { return slog.Any(key, val) }
 
 // Err is a convenience for slog.Any("error", err); slog has no Error field helper.
 func Err(err error) Field { return slog.Any("error", err) }

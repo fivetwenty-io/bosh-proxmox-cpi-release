@@ -440,7 +440,7 @@ type SDNVnetSubnetParams struct {
 	Snat          bool
 	DhcpDNS       string
 	DhcpRange     []string
-	DnsZonePrefix string
+	DNSZonePrefix string
 }
 
 // SDNSubnet is the decoded shape of a subnet row. Vnet is promoted so a
@@ -499,8 +499,8 @@ func CreateSDNVnetSubnet(ctx context.Context, c Client, p SDNVnetSubnetParams) e
 	if len(p.DhcpRange) > 0 {
 		params.DhcpRange = append([]string(nil), p.DhcpRange...)
 	}
-	if p.DnsZonePrefix != "" {
-		d := p.DnsZonePrefix
+	if p.DNSZonePrefix != "" {
+		d := p.DNSZonePrefix
 		params.Dnszoneprefix = &d
 	}
 

@@ -115,7 +115,7 @@ func parseAuth(raw json.RawMessage) (Credentials, error) {
 	}
 
 	switch env.Type {
-	case "basic":
+	case credKindBasic:
 		var bc basicCreds
 		if err := json.Unmarshal(raw, &bc); err != nil {
 			return nil, fmt.Errorf("stemcell_fetch: parse basic auth: %w", err)
@@ -125,7 +125,7 @@ func parseAuth(raw json.RawMessage) (Credentials, error) {
 		}
 		return bc, nil
 
-	case "bearer":
+	case credKindBearer:
 		var br bearerCreds
 		if err := json.Unmarshal(raw, &br); err != nil {
 			return nil, fmt.Errorf("stemcell_fetch: parse bearer auth: %w", err)
@@ -138,10 +138,10 @@ func parseAuth(raw json.RawMessage) (Credentials, error) {
 	case "s3":
 		return parseS3Auth(raw)
 
-	case "blobstore":
+	case credKindBlobstore:
 		return parseBlobstoreAuth(raw)
 
-	case "oci":
+	case credKindOCI:
 		return parseOCIAuth(raw)
 
 	case "":
@@ -164,7 +164,7 @@ func (b basicCreds) Apply(req *http.Request) error {
 	return nil
 }
 
-func (basicCreds) Kind() string { return "basic" }
+func (basicCreds) Kind() string { return credKindBasic }
 
 // bearerCreds implements HTTP Bearer token auth for https:// sources.
 type bearerCreds struct {
@@ -177,7 +177,7 @@ func (b bearerCreds) Apply(req *http.Request) error {
 	return nil
 }
 
-func (bearerCreds) Kind() string { return "bearer" }
+func (bearerCreds) Kind() string { return credKindBearer }
 
 // rawAuthCreds carries a raw JSON auth payload for sources that decode
 // credentials themselves rather than via HTTP header injection. Apply is

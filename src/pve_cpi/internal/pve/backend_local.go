@@ -19,6 +19,10 @@ import (
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 )
 
+// resourceTypeNode is the PVE cluster-resource type tag for compute nodes,
+// used as the `type=` filter for ListResources calls.
+const resourceTypeNode = "node"
+
 type localBackend struct {
 	client      Client
 	info        StorageInfo
@@ -149,7 +153,7 @@ func (l *localBackend) candidateNodes(ctx context.Context) ([]string, error) {
 		return out, nil
 	}
 
-	typ := "node"
+	typ := resourceTypeNode
 	// Wrap the cluster-resources listing in RetryOnTransient so a transient
 	// pvedaemon worker recycling during candidate-node discovery does not
 	// abort the entire backend resolve and cascade into a DiskNotFound. The

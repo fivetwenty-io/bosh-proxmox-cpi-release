@@ -29,6 +29,10 @@ type Agent interface {
 
 // AgentConfig is the complete agent bootstrap payload.
 // Maps to the settings.json / registry record format defined by BOSH agent.
+//
+// nolint:revive // "AgentConfig" intentionally stutters with the package name;
+// the package is imported as `agent` and the symbol's full name (agent.AgentConfig)
+// is widely referenced across the codebase. Renaming is a breaking change.
 type AgentConfig struct {
 	AgentID   string
 	Networks  map[string]NetworkSpec

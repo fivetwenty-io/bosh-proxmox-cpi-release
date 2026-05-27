@@ -45,7 +45,7 @@ type ociCredentials struct {
 }
 
 func (ociCredentials) Apply(_ *http.Request) error { return nil }
-func (ociCredentials) Kind() string                { return "oci" }
+func (ociCredentials) Kind() string                { return credKindOCI }
 
 // parseOCIAuth deserializes raw into ociCredentials.
 //
@@ -202,7 +202,7 @@ func pickLayer(layers []ociLayer) ociLayer {
 			}
 			continue
 		}
-		if types.MediaType(mt) == types.MediaType(stemcellQcow2MediaType) {
+		if mt == stemcellQcow2MediaType {
 			return l
 		}
 		if !isStandardRootfs(mt) && fallback == nil {

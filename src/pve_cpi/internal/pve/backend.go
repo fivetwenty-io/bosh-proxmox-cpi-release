@@ -20,6 +20,7 @@ import (
 // BackendKind distinguishes shared from local storage backends.
 type BackendKind string
 
+// BackendKind values returned by Backend.Kind().
 const (
 	BackendShared BackendKind = "shared"
 	BackendLocal  BackendKind = "local"

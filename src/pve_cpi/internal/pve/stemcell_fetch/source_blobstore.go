@@ -54,7 +54,7 @@ func (b blobstoreCredentials) Apply(req *http.Request) error {
 }
 
 // Kind reports the auth scheme for logging and diagnostics.
-func (blobstoreCredentials) Kind() string { return "blobstore" }
+func (blobstoreCredentials) Kind() string { return credKindBlobstore }
 
 // parseBlobstoreAuth deserializes raw into blobstoreCredentials. Returns an
 // error when endpoint is empty; username and password are individually optional.
@@ -118,7 +118,7 @@ func (b *blobstoreSource) Fetch(ctx context.Context, ref Reference, creds Creden
 
 	fetchURL := strings.TrimRight(c.Endpoint, "/") + "/" + ref.BlobID
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fetchURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fetchURL, http.NoBody)
 	if err != nil {
 		return nil, 0, fmt.Errorf("stemcell_fetch(blobstore): build request: %w", err)
 	}

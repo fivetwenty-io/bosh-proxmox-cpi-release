@@ -375,7 +375,7 @@ func resolveVMShape(deps Deps, parsed *createVMParsedArgs) (*createVMShape, erro
 	// Resolve disk format: prefer cloud_properties.vm_disk_format; fall back to "qcow2".
 	vmDiskFormat := cp.VMDiskFormat
 	if vmDiskFormat == "" {
-		vmDiskFormat = "qcow2"
+		vmDiskFormat = diskFormatQCOW2
 	}
 
 	// Resolve target storage: prefer config VMStorage; fall back to the stemcell's
@@ -530,7 +530,7 @@ func attemptCreateVM(
 		"name":    candidateName,
 		"memory":  shape.memMiB,
 		"cores":   shape.cores,
-		"ostype":  "l26",
+		"ostype":  osTypeLinux26,
 		"scsihw":  "virtio-scsi-pci",
 		"virtio0": virtio0Val,
 		"boot":    "order=virtio0",
@@ -1092,7 +1092,8 @@ func netmaskToCIDR(netmask string) int {
 // --------------------------------------------------------------------------
 func buildAgentNetworks(networks map[string]createVMNetworkSpec) map[string]agent.NetworkSpec {
 	out := make(map[string]agent.NetworkSpec, len(networks))
-	for name, spec := range networks {
+	for name := range networks {
+		spec := networks[name]
 		out[name] = agent.NetworkSpec{
 			Type:    spec.Type,
 			IP:      spec.IP,
@@ -1309,9 +1310,9 @@ func buildResponseNetworks(
 		out[name] = spec
 	}
 	// Copy any names not in orderedNames (defensive)
-	for name, spec := range networks {
+	for name := range networks {
 		if _, exists := out[name]; !exists {
-			out[name] = spec
+			out[name] = networks[name]
 		}
 	}
 	return out

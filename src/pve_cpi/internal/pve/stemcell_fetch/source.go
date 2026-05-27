@@ -68,7 +68,7 @@ func ResolveSource(rawURL string) (Source, Reference, error) {
 
 	switch {
 	case strings.HasPrefix(rawURL, "https://"):
-		ref.Scheme = "https"
+		ref.Scheme = schemeHTTPS
 		return newHTTPSSource(), ref, nil
 
 	case strings.HasPrefix(rawURL, "s3://"):
@@ -82,7 +82,7 @@ func ResolveSource(rawURL string) (Source, Reference, error) {
 		return newS3Source(), ref, nil
 
 	case strings.HasPrefix(rawURL, "bosh+blobstore:"):
-		ref.Scheme = "bosh+blobstore"
+		ref.Scheme = schemeBOSHBlobstore
 		// BlobID is everything after the scheme prefix; no "//" authority.
 		ref.BlobID = strings.TrimPrefix(rawURL, "bosh+blobstore:")
 		if ref.BlobID == "" {
@@ -91,7 +91,7 @@ func ResolveSource(rawURL string) (Source, Reference, error) {
 		return newBlobstoreSource(), ref, nil
 
 	case strings.HasPrefix(rawURL, "oci://"):
-		ref.Scheme = "oci"
+		ref.Scheme = schemeOCI
 		rest := strings.TrimPrefix(rawURL, "oci://")
 		// image may be "host/repo" with tag separated by the last ":" that has
 		// no "/" after it (the colon is not part of a port number).

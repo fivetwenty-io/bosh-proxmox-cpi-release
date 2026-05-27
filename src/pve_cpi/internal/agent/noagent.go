@@ -19,7 +19,7 @@ func NewNoAgent(logger *log.Logger) *NoAgent {
 }
 
 // Configure is a no-op. NoAgent does not write agent settings to the VM.
-func (a *NoAgent) Configure(_ context.Context, node string, vmid int, cfg AgentConfig) error {
+func (a *NoAgent) Configure(_ context.Context, node string, vmid int, _ AgentConfig) error {
 	a.logger.Debug("noagent: Configure skipped", log.String("node", node), log.Int("vmid", vmid))
 	return nil
 }

@@ -138,9 +138,7 @@ func (a *ConfigDrive) Configure(ctx context.Context, node string, vmid int, cfg 
 	if err != nil {
 		return cpierrors.Wrap(err, fmt.Sprintf("agent configure vm %d: build configdrive iso", vmid))
 	}
-	defer func() {
-		cleanup()
-	}()
+	defer cleanup()
 
 	filename := configDriveISOFilename(vmid)
 
