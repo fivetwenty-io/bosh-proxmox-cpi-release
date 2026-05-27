@@ -1,13 +1,13 @@
 ---
 # ============================================================================
-# WAYNE LAB OVERRIDE PAIR: When the network uses 10.64.64.0/18 (lvnet001),
-# apply both override files together with `bosh update-cloud-config`:
-#   -o manifests/wayne/cf-cloud-config-override.yml
-# The BOSH director network must also be overridden:
-#   -o manifests/wayne/network-override.yml  (applied at bosh create-env)
-# Omitting cf-cloud-config-override.yml while network-override.yml is active
-# leaves this file's reserved bands in 192.168.1.x, re-triggering the
-# tailscale LAN route hazard (see memory: tailscale-lan-route-hazard).
+# Env bundle pairing: when an env's network layer changes the director CIDR
+# (e.g. BOSH_PVE_ENV=lab swaps 192.168.1.0/24 for 10.64.64.0/18), this file
+# must be paired with the env's CF cloud-config layer. scripts/cf cloud-config
+# auto-layers manifests/envs/$BOSH_PVE_ENV/cf-cloud-config.yml when the env
+# is set. Skipping the pairing leaves this file's reserved bands in the base
+# 192.168.1.x range while the director network is on the override CIDR,
+# re-triggering the tailscale LAN route hazard (memory:
+# tailscale-lan-route-hazard).
 # ============================================================================
 #
 # Cloud-config for cf-deployment on the bosh-pve director.

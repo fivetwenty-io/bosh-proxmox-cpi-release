@@ -1,5 +1,5 @@
 ---
-# Wayne lab VMID range override
+# Env bundle: lab — VMID range override
 #
 # Sets pve.vmid_range_start to 200 so the CPI allocates VMIDs from 200
 # upward (VMIDs 100-199 are reserved for manually-managed VMs: drgao-bastion=100,
@@ -15,7 +15,7 @@
 #     --state=manifests/bosh/state.json \
 #     --vars-store=manifests/bosh/creds.yml \
 #     -o manifests/bosh/cpi.yml \
-#     -o manifests/wayne/vmid-range.yml \
+#     -o manifests/envs/lab/vmid-range.yml \
 #     -l manifests/bosh/vars.yml
 
 - type: replace

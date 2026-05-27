@@ -58,6 +58,51 @@ HM_TUNING_OPS = BOSH_DIR / "hm-tuning.yml"
 CLOUD_CONFIG = BOSH_DIR / "cloud-config.yml"
 EMPTYVM = BOSH_DIR / "emptyvm.yml"
 PVE_GUEST_AGENT_RC = MANIFESTS / "runtime-configs" / "pve-guest-agent.yml"
+ENVS_DIR = MANIFESTS / "envs"
+DEV_RELEASES_DIR = REPO_ROOT / "dev_releases" / "bosh-pve-cpi"
+
+
+def cpi_release_path() -> str:
+    """Resolve the CPI release tarball path for create-env/delete-env.
+
+    PVE_CPI_RELEASE_PATH wins when set (Concourse points it at an artifact
+    input). Otherwise pick the newest *.tgz under dev_releases/bosh-pve-cpi/
+    by mtime — the location scripts/create-release writes to.
+    """
+    override = os.environ.get("PVE_CPI_RELEASE_PATH", "").strip()
+    if override:
+        return override
+    if not DEV_RELEASES_DIR.is_dir():
+        sys.exit(
+            f"cpi release tarball not found: set PVE_CPI_RELEASE_PATH or run "
+            f"`./scripts/create-release dev` to populate {DEV_RELEASES_DIR}"
+        )
+    tarballs = sorted(
+        DEV_RELEASES_DIR.glob("*.tgz"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    if not tarballs:
+        sys.exit(
+            f"no *.tgz under {DEV_RELEASES_DIR}; run `./scripts/create-release dev` "
+            f"or set PVE_CPI_RELEASE_PATH"
+        )
+    return str(tarballs[0])
+
+
+def env_network_ops() -> list[str]:
+    """Return -o flags for the active env's director network layer.
+
+    BOSH_PVE_ENV selects manifests/envs/<env>/network.yml when present;
+    unset or missing file means no layer applied.
+    """
+    env_name = os.environ.get("BOSH_PVE_ENV", "").strip()
+    if not env_name:
+        return []
+    layer = ENVS_DIR / env_name / "network.yml"
+    if not layer.exists():
+        return []
+    return ["-o", str(layer)]
 
 USAGE = __doc__ or ""
 
@@ -99,6 +144,7 @@ def credhub_env() -> dict[str, str]:
 
 
 def cmd_create_env(args: list[str]) -> int:
+    release = cpi_release_path()
     return run(
         "bosh", "create-env",
         str(BOSH_DEPLOYMENT_DIR / "bosh.yml"),
@@ -109,8 +155,10 @@ def cmd_create_env(args: list[str]) -> int:
         "-o", str(OS_CONF_OPS),
         "-o", str(NATS_TUNING_OPS),
         "-o", str(HM_TUNING_OPS),
+        *env_network_ops(),
         "-l", str(VARS),
         "-v", "director_name=ocfp-mgmt",
+        "-v", f"pve_cpi_release_path={release}",
         f"--state={STATE}",
         f"--vars-store={CREDS}",
         *args,
@@ -157,6 +205,7 @@ def cmd_teardown(args: list[str]) -> int:
     if _state_is_empty():
         print(f"teardown: state file absent or empty ({STATE}), nothing to delete")
         return 0
+    release = cpi_release_path()
     rc = run(
         "bosh", "delete-env",
         str(BOSH_DEPLOYMENT_DIR / "bosh.yml"),
@@ -167,8 +216,10 @@ def cmd_teardown(args: list[str]) -> int:
         "-o", str(OS_CONF_OPS),
         "-o", str(NATS_TUNING_OPS),
         "-o", str(HM_TUNING_OPS),
+        *env_network_ops(),
         "-l", str(VARS),
         "-v", "director_name=ocfp-mgmt",
+        "-v", f"pve_cpi_release_path={release}",
         f"--state={STATE}",
         f"--vars-store={CREDS}",
         *args,

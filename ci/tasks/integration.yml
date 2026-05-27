@@ -38,11 +38,13 @@ inputs:
   - name: repo
 
 params:
-  STEMCELL_PATH:       ""
-  BOSH_DEPLOYMENT_DIR: ""
-  CF_DEPLOYMENT:       ""
-  BOSH_VARS_YAML:      ""   # base64-encoded content of manifests/bosh/vars.yml
-  CF_VARS_YAML:        ""   # base64-encoded content of manifests/cf/vars.yml
+  STEMCELL_PATH:          ""
+  BOSH_DEPLOYMENT_DIR:    ""
+  CF_DEPLOYMENT:          ""
+  BOSH_PVE_ENV:           ""   # env bundle selector (e.g. "lab"); empty = base CIDR
+  PVE_CPI_RELEASE_PATH:   ""   # absolute path to cpi release tarball; empty = autodiscover
+  BOSH_VARS_YAML:         ""   # base64-encoded content of manifests/bosh/vars.yml
+  CF_VARS_YAML:           ""   # base64-encoded content of manifests/cf/vars.yml
 
 run:
   path: /bin/bash
@@ -53,6 +55,8 @@ run:
       export STEMCELL_PATH="${STEMCELL_PATH}"
       export BOSH_DEPLOYMENT_DIR="${BOSH_DEPLOYMENT_DIR}"
       export CF_DEPLOYMENT="${CF_DEPLOYMENT}"
+      export BOSH_PVE_ENV="${BOSH_PVE_ENV}"
+      export PVE_CPI_RELEASE_PATH="${PVE_CPI_RELEASE_PATH}"
 
       # ---------------------------------------------------------------
       # Install required CLIs.  This block is only reached when the task

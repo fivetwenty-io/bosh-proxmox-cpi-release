@@ -71,8 +71,9 @@
 # bosh-deployment uses for virtualbox_cpi in misc/ipv6/bosh.yml). Without this
 # property the agent settings the CPI emits have mbus="" and the agent cannot
 # locate NATS, which the CPI guards against with "agent settings vm N: mbus is
-# empty". Set pve_agent_mbus to the director's NATS URL (e.g. nats://10.0.0.1:4222);
-# the variable lives in vars.yml so the URL stays out of this ops file.
+# empty". The URL is computed from ((internal_ip)) here at manifest-render
+# time rather than carried as a separate var, so changing the director IP via
+# vars.yml propagates automatically.
 - type: replace
   path: /instance_groups/name=bosh/jobs/-
   value:
@@ -80,7 +81,7 @@
     release: bosh-pve-cpi
     properties:
       agent:
-        mbus: ((pve_agent_mbus))
+        mbus: nats://((internal_ip)):4222
       pve: &pve_props
         host: ((pve_host))
         port: ((pve_port))
@@ -125,11 +126,9 @@
 
 # Note: do NOT replace /cloud_provider/properties/agent here. bosh-deployment's
 # bosh.yml supplies the create-env agent bind URL
-# (https://mbus:((mbus_bootstrap_password))@0.0.0.0:6868), and bosh int only
-# resolves ((vars)) at the manifest top level — pre-baking the URL via a
-# vars.yml value with an inner ((mbus_bootstrap_password)) reference does not
-# expand recursively, so an override here either wipes the bind URL (empty
-# pve_agent_mbus) or hard-codes a stale password. Leaving the bosh.yml default
-# in place keeps bosh-init <-> agent bootstrap working. The CPI-driven agent
-# properties for deployed instance groups still flow through
-# /instance_groups/name=bosh/jobs/-/properties/agent above.
+# (https://mbus:((mbus_bootstrap_password))@0.0.0.0:6868). Overriding it with
+# a value that contains an inner ((var)) would not expand recursively, so the
+# override would either wipe the bind URL or hard-code a stale password.
+# Leaving the bosh.yml default in place keeps bosh-init <-> agent bootstrap
+# working. The CPI-driven agent properties for deployed instance groups still
+# flow through /instance_groups/name=bosh/jobs/-/properties/agent above.

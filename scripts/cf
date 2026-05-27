@@ -108,11 +108,29 @@ def cmd_runtime_config(_extra: list[str]) -> None:
     )
 
 
+def _env_cf_cloud_config_ops() -> list[str]:
+    """Return -o flags for the active env's CF cloud-config layer.
+
+    BOSH_PVE_ENV selects manifests/envs/<env>/cf-cloud-config.yml when present;
+    unset or missing file means no layer applied. Pairs with the director
+    network layer applied by scripts/bosh — skipping one re-triggers the
+    tailscale LAN route hazard (memory: tailscale-lan-route-hazard).
+    """
+    env_name = os.environ.get("BOSH_PVE_ENV", "").strip()
+    if not env_name:
+        return []
+    layer = REPO_ROOT / "manifests" / "envs" / env_name / "cf-cloud-config.yml"
+    if not layer.exists():
+        return []
+    return ["-o", str(layer)]
+
+
 def cmd_cloud_config(_extra: list[str]) -> None:
     banner("Cloud-config")
     run(
         "bosh", "-e", ENV,  "-n","update-cloud-config",
         "manifests/cf/cloud-config.yml",
+        *_env_cf_cloud_config_ops(),
         "-l", "manifests/bosh/vars.yml",
         "-l", "manifests/cf/vars.yml",
     )

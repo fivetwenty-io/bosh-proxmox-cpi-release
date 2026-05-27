@@ -1,8 +1,9 @@
 ---
-# Wayne lab CF cloud-config network override — lvnet001 (10.64.64.0/18)
+# Env bundle: lab — CF cloud-config network override (legacy variant).
 #
-# Fixes the hardcoded 192.168.1.x reserved-range in manifests/cf/cloud-config.yml
-# and wires the subnet to lvnet001 with correct Wayne IPAM allocations.
+# Note: prefer cf-cloud-config.yml in this same dir; it's the version
+# auto-layered by BOSH_PVE_ENV=lab. This file is kept for the alternative
+# IPAM layout (static haproxy slot + tighter dynamic band).
 #
 # CF IPAM layout (within 10.64.64.0/18):
 #   10.64.64.1-10.64.64.19   reserved (gateway, infra, BOSH directors, artifacts VM)
@@ -13,7 +14,7 @@
 #
 # Usage:
 #   bosh update-cloud-config manifests/cf/cloud-config.yml \
-#     -o manifests/wayne/cf-cloud-config-net-override.yml \
+#     -o manifests/envs/lab/cf-cloud-config-net-override.yml \
 #     -l manifests/bosh/vars.yml -l manifests/cf/vars.yml
 
 - type: replace

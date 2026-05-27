@@ -1,19 +1,26 @@
 ---
 # ============================================================================
-# PAIRED OVERRIDE: Apply together with manifests/wayne/network-override.yml.
+# Env bundle: lab — CF cloud-config layer.
 #
+# Auto-layered by scripts/cf cloud-config when BOSH_PVE_ENV=lab. Paired with
+# manifests/envs/lab/network.yml (director network layer). Mismatch between
+# the two re-triggers the tailscale LAN route hazard (memory:
+# tailscale-lan-route-hazard): traffic destined for 192.168.1.x is hijacked
+# by the pve Tailscale peer's advertised subnet route, causing "no route to
+# host" for userland clients.
+#
+# Replaces the cf/cloud-config.yml subnet CIDR (192.168.1.0/24) with the lab
+# bloc 10.64.64.0/18 (lvnet001 bridge, 10.64.64.0-10.64.127.255).
+#
+# Usage:
+#   BOSH_PVE_ENV=lab ./scripts/cf cloud-config
+#
+# Direct invocation:
 #   bosh -e pve update-cloud-config manifests/cf/cloud-config.yml \
-#     -o manifests/wayne/cf-cloud-config-override.yml \
+#     -o manifests/envs/lab/cf-cloud-config.yml \
 #     -l manifests/bosh/vars.yml -l manifests/cf/vars.yml
 #
-# Replaces the cf/cloud-config.yml subnet CIDR (192.168.1.0/24) with the
-# Wayne lab bloc 10.64.64.0/18 (lvnet001 bridge, 10.64.64.0-10.64.127.255).
-# Mismatch between bosh network and cf cloud-config re-triggers the
-# tailscale LAN route hazard (memory: tailscale-lan-route-hazard): traffic
-# destined for 192.168.1.x is hijacked by the pve Tailscale peer's
-# advertised subnet route, causing "no route to host" for userland clients.
-#
-# CIDR layout (mirrors manifests/wayne/network-override.yml IPAM):
+# CIDR layout (mirrors manifests/envs/lab/network.yml IPAM):
 #   10.64.64.1        gateway (lvnet001)
 #   10.64.64.2-9      reserved infrastructure
 #   10.64.64.10       mgmt-BOSH director
@@ -27,7 +34,7 @@
 #   10.64.65.0-10.64.127.255  available for future expansion
 # ============================================================================
 
-# Replace the subnet range with the Wayne lab CIDR.
+# Replace the subnet range with the lab CIDR.
 - type: replace
   path: /networks/name=default/subnets/0/range
   value: 10.64.64.0/18
@@ -37,9 +44,9 @@
   path: /networks/name=default/subnets/0/gateway
   value: 10.64.64.1
 
-# Replace reserved bands.
-# Mirrors the reserved list in manifests/wayne/network-override.yml plus
-# a top-of-range band analogous to 192.168.1.200-254 in the base config.
+# Replace reserved bands. Mirrors the reserved list in
+# manifests/envs/lab/network.yml plus a top-of-range band analogous to
+# 192.168.1.200-254 in the base config.
 - type: replace
   path: /networks/name=default/subnets/0/reserved
   value:

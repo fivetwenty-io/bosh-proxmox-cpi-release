@@ -41,13 +41,15 @@ internal_gw:   192.168.1.1
 internal_ip:   192.168.1.10
 
 # --- Release + stemcell ---------------------------------------------------
-# Path to the CPI release tarball produced by `make release` or `scripts/create-release`.
-# Override with: bosh int --var release_artifact_path=/abs/path/to/bosh-pve-cpi-VERSION.tgz
-# Capture the path from the RELEASE_TGZ= line printed by scripts/create-release, then
-# pass it at deploy time:
-#   RELEASE_TGZ=$(scripts/create-release dev | grep '^RELEASE_TGZ=' | cut -d= -f2)
-#   bosh int bosh.yml --var release_artifact_path="$RELEASE_TGZ" ...
-pve_cpi_release_path: ((release_artifact_path))
+# pve_cpi_release_path is supplied by scripts/bosh at deploy time via -v.
+# Discovery order:
+#   1. PVE_CPI_RELEASE_PATH env var (set by Concourse to the artifact input
+#      path; set locally to point at a custom build);
+#   2. else the newest tarball under dev_releases/bosh-pve-cpi/*.tgz by mtime
+#      (what `scripts/create-release dev` produces).
+# Override at deploy time when you want a specific build:
+#   PVE_CPI_RELEASE_PATH=/abs/path/to/bosh-pve-cpi-VERSION.tgz \
+#     ./scripts/bosh create-env
 
 # Ubuntu jammy openstack-kvm stemcell (works on PVE qemu/kvm).
 # Get latest from https://bosh.io/stemcells/bosh-openstack-kvm-ubuntu-jammy-go_agent
@@ -103,8 +105,7 @@ pve_reboot_mode:                soft
 # Range 1-3600. Spec default: 60.
 pve_reboot_timeout:             60
 
-# Agent settings passed via cloud_provider.properties.agent for `bosh create-env`.
-# pve_agent_mbus MUST be set when running create-env (bosh-init has no per-call
-# env). Spec defaults: "" and {}.
-pve_agent_mbus:                 ""
+# Agent transport. The NATS URL is computed from ((internal_ip)) inside
+# cpi.yml at manifest-render time, so no agent_mbus var is needed here.
+# Only the (typically empty) blobstore overrides surface as a var.
 pve_agent_blobstore:            {}

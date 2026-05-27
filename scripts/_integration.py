@@ -85,6 +85,16 @@ def load_config(path: "str | Path", dry_run: bool = False) -> dict:
         if key not in cfg:
             sys.exit(f"missing required config key: {key}  (file: {config_path})")
 
+    # Env passthrough: yaml-level env_name and cpi_release_path map to the
+    # env vars that scripts/bosh and scripts/cf already honor. Caller-supplied
+    # env wins so a Concourse param or shell override still takes precedence.
+    env_name = str(cfg.get("env_name", "")).strip()
+    if env_name and not os.environ.get("BOSH_PVE_ENV"):
+        os.environ["BOSH_PVE_ENV"] = env_name
+    release_path = str(cfg.get("cpi_release_path", "")).strip()
+    if release_path and not os.environ.get("PVE_CPI_RELEASE_PATH"):
+        os.environ["PVE_CPI_RELEASE_PATH"] = release_path
+
     tier1 = cfg.get("tier1", {})
     for key in _REQUIRED_TIER1:
         if key not in tier1:

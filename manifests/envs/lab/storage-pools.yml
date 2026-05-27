@@ -1,5 +1,5 @@
 ---
-# Wayne lab storage pool override
+# Env bundle: lab — storage pool override
 #
 # Maps PVE storage pools to their roles in this lab:
 #   data    lvmthin  — root (ephemeral) VM disks
@@ -15,7 +15,7 @@
 #     --state=manifests/bosh/state.json \
 #     --vars-store=manifests/bosh/creds.yml \
 #     -o manifests/bosh/cpi.yml \
-#     -o manifests/wayne/storage-pools.yml \
+#     -o manifests/envs/lab/storage-pools.yml \
 #     -l manifests/bosh/vars.yml
 
 # Root (ephemeral) VM disks: lvmthin pool named "data"
