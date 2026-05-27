@@ -1,6 +1,14 @@
 # The pve_cpi binary is invoked on demand by the BOSH director via stdin/stdout
-# JSON-RPC — it is not a long-running process. A `check process` declaration
-# would cause monit to restart it continuously. This no-op check program keeps
-# monit satisfied while leaving the invocation model intact.
-check program pve_cpi with path /bin/true
-  if status != 0 then unmonitor
+# JSON-RPC -- it is not a long-running process. A `check process` declaration
+# would cause monit to restart it continuously.
+#
+# A `check program ... with path ...` no-op would be the natural way to keep
+# monit happy with no live process, but that syntax was only introduced in
+# monit 5.5; BOSH stemcells ship monit 5.2.5, which rejects it with
+# "syntax error 'pve_cpi'" and wedges the agent's monit reload cycle (the
+# agent then loops polling 127.0.0.1:2822 because monit refuses to start).
+#
+# A comments-only file is valid monit syntax on every version: the include
+# glob (`include /var/vcap/monit/job/*.monitrc`) picks it up without error,
+# and the agent's monit-reload contract is satisfied. The CPI's invocation
+# model (one stdin/stdout RPC per call from the director) is unchanged.
