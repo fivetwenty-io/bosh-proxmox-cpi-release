@@ -1,11 +1,9 @@
-// Package pve — SDN backend adapter.
-//
-// Typed CRUD primitives over PVE SDN zones, vnets, and vnet subnets, plus an
-// ApplySDN entry point that commits pending SDN configuration changes
-// (PUT /cluster/sdn). Each primitive accepts a typed parameter struct and
-// returns errors classified by WrapError; 404 responses surface as
-// ErrSDNNotFound so callers can distinguish missing entities from generic
-// failures.
+// SDN backend adapter: typed CRUD primitives over PVE SDN zones, vnets, and
+// vnet subnets, plus an ApplySDN entry point that commits pending SDN
+// configuration changes (PUT /cluster/sdn). Each primitive accepts a typed
+// parameter struct and returns errors classified by WrapError; 404 responses
+// surface as ErrSDNNotFound so callers can distinguish missing entities from
+// generic failures.
 //
 // PVE quirks captured here:
 //   - SDN zone create has no description/notes/comment field; callers cannot

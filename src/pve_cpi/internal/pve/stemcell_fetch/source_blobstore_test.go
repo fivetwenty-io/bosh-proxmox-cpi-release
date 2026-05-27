@@ -439,7 +439,7 @@ func TestBlobstoreCredentials_Apply_WithAuth(t *testing.T) {
 		Password: "wonderland",
 	}
 
-	req, err := http.NewRequest(http.MethodGet, "https://blobstore.example.com/blob", nil)
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "https://blobstore.example.com/blob", nil)
 	if err != nil {
 		t.Fatalf("build request: %v", err)
 	}
@@ -466,7 +466,7 @@ func TestBlobstoreCredentials_Apply_NoAuth(t *testing.T) {
 
 	c := blobstoreCredentials{Endpoint: "https://open-blobstore.example.com"}
 
-	req, err := http.NewRequest(http.MethodGet, "https://open-blobstore.example.com/blob", nil)
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "https://open-blobstore.example.com/blob", nil)
 	if err != nil {
 		t.Fatalf("build request: %v", err)
 	}

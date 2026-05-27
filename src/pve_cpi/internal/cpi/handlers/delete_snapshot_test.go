@@ -104,6 +104,7 @@ func delSnapDeps(qemuSvc qemu.Service) handlers.Deps {
 // ---------------------------------------------------------------------------
 
 func TestHandleDeleteSnapshot_Happy(t *testing.T) {
+	t.Parallel()
 	var deleteCalled bool
 	var deletedVMID int
 	var deletedSnap string
@@ -137,6 +138,7 @@ func TestHandleDeleteSnapshot_Happy(t *testing.T) {
 }
 
 func TestHandleDeleteSnapshot_NotFound_Idempotent(t *testing.T) {
+	t.Parallel()
 	qemuSvc := &delSnapQEMUService{
 		deleteSnapshotFn: func(_ context.Context, _ string, _ int, _ string) error {
 			return &sdkerrors.APIError{HTTPCode: 404, Message: "snapshot not found"}
@@ -154,6 +156,7 @@ func TestHandleDeleteSnapshot_NotFound_Idempotent(t *testing.T) {
 }
 
 func TestHandleDeleteSnapshot_SDKError(t *testing.T) {
+	t.Parallel()
 	qemuSvc := &delSnapQEMUService{
 		deleteSnapshotFn: func(_ context.Context, _ string, _ int, _ string) error {
 			return errors.New("PVE internal error during snapshot delete")
@@ -168,6 +171,7 @@ func TestHandleDeleteSnapshot_SDKError(t *testing.T) {
 }
 
 func TestHandleDeleteSnapshot_MalformedCID_NoColon(t *testing.T) {
+	t.Parallel()
 	h := handlers.HandleDeleteSnapshot(delSnapDeps(&delSnapQEMUService{}))
 	_, err := h.Handle(context.Background(), marshalArgs("no-colon-snapshot-cid"), jsonrpc.Context{})
 	if err == nil {
@@ -176,6 +180,7 @@ func TestHandleDeleteSnapshot_MalformedCID_NoColon(t *testing.T) {
 }
 
 func TestHandleDeleteSnapshot_MalformedCID_InvalidVMID(t *testing.T) {
+	t.Parallel()
 	// Snapshot CID with non-integer vm part.
 	h := handlers.HandleDeleteSnapshot(delSnapDeps(&delSnapQEMUService{}))
 	_, err := h.Handle(context.Background(), marshalArgs("not-a-vmid:snap"), jsonrpc.Context{})
@@ -188,6 +193,7 @@ func TestHandleDeleteSnapshot_MalformedCID_InvalidVMID(t *testing.T) {
 }
 
 func TestHandleDeleteSnapshot_EmptyCID(t *testing.T) {
+	t.Parallel()
 	h := handlers.HandleDeleteSnapshot(delSnapDeps(&delSnapQEMUService{}))
 	_, err := h.Handle(context.Background(), marshalArgs(""), jsonrpc.Context{})
 	if err == nil {
@@ -196,6 +202,7 @@ func TestHandleDeleteSnapshot_EmptyCID(t *testing.T) {
 }
 
 func TestHandleDeleteSnapshot_TooFewArgs(t *testing.T) {
+	t.Parallel()
 	h := handlers.HandleDeleteSnapshot(delSnapDeps(&delSnapQEMUService{}))
 	_, err := h.Handle(context.Background(), []json.RawMessage{}, jsonrpc.Context{})
 	if err == nil {
@@ -204,6 +211,7 @@ func TestHandleDeleteSnapshot_TooFewArgs(t *testing.T) {
 }
 
 func TestHandleDeleteSnapshot_MissingNode(t *testing.T) {
+	t.Parallel()
 	// With the cluster-scan flow, the handler no longer validates Config.Node
 	// before calling FindVMNodeViaCluster. A cluster service returning a
 	// transport error is the new equivalent: the handler returns a cloud error.
@@ -226,6 +234,7 @@ func TestHandleDeleteSnapshot_MissingNode(t *testing.T) {
 }
 
 func TestHandleDeleteSnapshot_ZeroVMID(t *testing.T) {
+	t.Parallel()
 	// VMID "0" should be rejected as invalid.
 	h := handlers.HandleDeleteSnapshot(delSnapDeps(&delSnapQEMUService{}))
 	_, err := h.Handle(context.Background(), marshalArgs("0:bosh-snap"), jsonrpc.Context{})

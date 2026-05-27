@@ -121,6 +121,7 @@ func updateClusterWith(vmid int) sdkclusterapi.Service {
 // ---------------------------------------------------------------------------
 
 func TestHandleUpdateDisk_OptionsOnly(t *testing.T) {
+	t.Parallel()
 	const diskCID = "local-lvm:vm-9001-disk-0"
 	const volid = "local-lvm:vm-9001-disk-0"
 
@@ -172,6 +173,7 @@ func TestHandleUpdateDisk_OptionsOnly(t *testing.T) {
 }
 
 func TestHandleUpdateDisk_SizeOnly(t *testing.T) {
+	t.Parallel()
 	const diskCID = "local-lvm:vm-9001-disk-0"
 	const volid = "local-lvm:vm-9001-disk-0"
 
@@ -216,6 +218,7 @@ func TestHandleUpdateDisk_SizeOnly(t *testing.T) {
 }
 
 func TestHandleUpdateDisk_CombinedSizeAndOptions(t *testing.T) {
+	t.Parallel()
 	const diskCID = "local-lvm:vm-9001-disk-0"
 	const volid = "local-lvm:vm-9001-disk-0"
 
@@ -258,6 +261,7 @@ func TestHandleUpdateDisk_CombinedSizeAndOptions(t *testing.T) {
 }
 
 func TestHandleUpdateDisk_EmptySpec_NoOp(t *testing.T) {
+	t.Parallel()
 	// Empty spec → no resize, no AttachDisk.
 	const diskCID = "local-lvm:vm-9001-disk-0"
 	const volid = "local-lvm:vm-9001-disk-0"
@@ -285,6 +289,7 @@ func TestHandleUpdateDisk_EmptySpec_NoOp(t *testing.T) {
 }
 
 func TestHandleUpdateDisk_DetachedDisk(t *testing.T) {
+	t.Parallel()
 	const diskCID = "local-lvm:vm-9001-disk-0"
 
 	// Cluster has no VMs → disk is not attached.
@@ -313,6 +318,7 @@ func TestHandleUpdateDisk_DetachedDisk(t *testing.T) {
 // with a transport error (connection refused). The bug was that the handler swallowed
 // this as "detached disk"; the fix propagates it as a distinct wrapped error.
 func TestHandleUpdateDisk_FindVMTransportError(t *testing.T) {
+	t.Parallel()
 	const diskCID = "local-lvm:vm-9001-disk-0"
 
 	transportErr := errors.New("connection refused dialing cluster API")
@@ -340,6 +346,7 @@ func TestHandleUpdateDisk_FindVMTransportError(t *testing.T) {
 }
 
 func TestHandleUpdateDisk_ShrinkRejected(t *testing.T) {
+	t.Parallel()
 	const diskCID = "local-lvm:vm-9001-disk-0"
 	const volid = "local-lvm:vm-9001-disk-0"
 
@@ -366,6 +373,7 @@ func TestHandleUpdateDisk_ShrinkRejected(t *testing.T) {
 }
 
 func TestHandleUpdateDisk_MalformedDiskCID(t *testing.T) {
+	t.Parallel()
 	h := handlers.HandleUpdateDisk(updateDiskDeps(&updateDiskQEMUService{}, &snapClusterService{}, nil))
 	_, err := h.Handle(context.Background(), marshalArgs("bad-cid-no-colon", map[string]any{}), jsonrpc.Context{})
 	if err == nil {
@@ -374,6 +382,7 @@ func TestHandleUpdateDisk_MalformedDiskCID(t *testing.T) {
 }
 
 func TestHandleUpdateDisk_TooFewArgs(t *testing.T) {
+	t.Parallel()
 	h := handlers.HandleUpdateDisk(updateDiskDeps(&updateDiskQEMUService{}, &snapClusterService{}, nil))
 	_, err := h.Handle(context.Background(), marshalArgs("local-lvm:vol"), jsonrpc.Context{})
 	if err == nil {
@@ -382,6 +391,7 @@ func TestHandleUpdateDisk_TooFewArgs(t *testing.T) {
 }
 
 func TestHandleUpdateDisk_IOThreadFalseRemovesOption(t *testing.T) {
+	t.Parallel()
 	const diskCID = "local-lvm:vm-9001-disk-0"
 	const volid = "local-lvm:vm-9001-disk-0"
 
@@ -417,6 +427,7 @@ func TestHandleUpdateDisk_IOThreadFalseRemovesOption(t *testing.T) {
 }
 
 func TestHandleUpdateDisk_AttachSDKError(t *testing.T) {
+	t.Parallel()
 	const diskCID = "local-lvm:vm-9001-disk-0"
 	const volid = "local-lvm:vm-9001-disk-0"
 
@@ -444,6 +455,7 @@ func TestHandleUpdateDisk_AttachSDKError(t *testing.T) {
 }
 
 func TestHandleUpdateDisk_ResizeWithUpid(t *testing.T) {
+	t.Parallel()
 	const diskCID = "local-lvm:vm-9001-disk-0"
 	const volid = "local-lvm:vm-9001-disk-0"
 
@@ -482,6 +494,7 @@ func TestHandleUpdateDisk_ResizeWithUpid(t *testing.T) {
 }
 
 func TestHandleUpdateDisk_PreservesExistingOptions(t *testing.T) {
+	t.Parallel()
 	// Existing options not in update_spec must be preserved in the merged string.
 	const diskCID = "local-lvm:vm-9001-disk-0"
 	const volid = "local-lvm:vm-9001-disk-0"
@@ -521,6 +534,7 @@ func TestHandleUpdateDisk_PreservesExistingOptions(t *testing.T) {
 }
 
 func TestHandleUpdateDisk_BandwidthIOPS(t *testing.T) {
+	t.Parallel()
 	// Exercises mbps_rd, mbps_wr, iops_rd, iops_wr option fields.
 	const diskCID = "local-lvm:vm-9001-disk-0"
 	const volid = "local-lvm:vm-9001-disk-0"
@@ -560,6 +574,7 @@ func TestHandleUpdateDisk_BandwidthIOPS(t *testing.T) {
 }
 
 func TestHandleUpdateDisk_SSDAndBackup(t *testing.T) {
+	t.Parallel()
 	// Exercises ssd and backup bool options.
 	const diskCID = "local-lvm:vm-9001-disk-0"
 	const volid = "local-lvm:vm-9001-disk-0"
@@ -598,6 +613,7 @@ func TestHandleUpdateDisk_SSDAndBackup(t *testing.T) {
 }
 
 func TestHandleUpdateDisk_NullSpec_NoOp(t *testing.T) {
+	t.Parallel()
 	// Null update_spec (JSON null) → treated as empty map → no-op.
 	const volid = "local-lvm:vm-9001-disk-0"
 
@@ -625,6 +641,7 @@ func TestHandleUpdateDisk_NullSpec_NoOp(t *testing.T) {
 // option read, after locate + ResolveDiskID succeed). Handler must propagate the
 // error (gap #12).
 func TestHandleUpdateDisk_ConfigReadError(t *testing.T) {
+	t.Parallel()
 	const diskCID = "local-lvm:vm-9001-disk-0"
 	const volid = "local-lvm:vm-9001-disk-0"
 
@@ -657,6 +674,7 @@ func TestHandleUpdateDisk_ConfigReadError(t *testing.T) {
 // (used by ResolveDiskID internally), so ResolveDiskID returns error. Handler
 // must propagate it (gap #13).
 func TestHandleUpdateDisk_ResolveDiskIDError(t *testing.T) {
+	t.Parallel()
 	const diskCID = "local-lvm:vm-9001-disk-0"
 	const volid = "local-lvm:vm-9001-disk-0"
 
@@ -685,6 +703,7 @@ func TestHandleUpdateDisk_ResolveDiskIDError(t *testing.T) {
 // TestHandleUpdateDisk_SizeWrongType — update_spec.size is a string "big" (not a
 // number). toInt() returns false → handler returns a descriptive error (gap #15).
 func TestHandleUpdateDisk_SizeWrongType(t *testing.T) {
+	t.Parallel()
 	const diskCID = "local-lvm:vm-9001-disk-0"
 	const volid = "local-lvm:vm-9001-disk-0"
 
@@ -715,6 +734,7 @@ func TestHandleUpdateDisk_SizeWrongType(t *testing.T) {
 // update_disk.go:68-70 returns an explicit error before ParseDiskCID is reached
 // (gap #23).
 func TestHandleUpdateDisk_EmptyDiskCID(t *testing.T) {
+	t.Parallel()
 	h := handlers.HandleUpdateDisk(updateDiskDeps(&updateDiskQEMUService{}, &snapClusterService{}, nil))
 	_, err := h.Handle(context.Background(), marshalArgs("", map[string]any{}), jsonrpc.Context{})
 	if err == nil {
@@ -733,6 +753,7 @@ func TestHandleUpdateDisk_EmptyDiskCID(t *testing.T) {
 // storage="local", volume="9001/vm-9001-disk-0.raw". Handler locates the VM
 // and applies option updates normally.
 func TestHandleUpdateDisk_Dir_CID(t *testing.T) {
+	t.Parallel()
 	const diskCID = "local:9001/vm-9001-disk-0.raw"
 	const volid = "local:9001/vm-9001-disk-0.raw"
 
@@ -773,6 +794,7 @@ func TestHandleUpdateDisk_Dir_CID(t *testing.T) {
 // volume="vm-9001-disk-0". update_disk has no storage-type branching so the
 // zfspool CID passes through the same path as lvm.
 func TestHandleUpdateDisk_ZFSPool_CID(t *testing.T) {
+	t.Parallel()
 	const diskCID = "local-zfs:vm-9001-disk-0"
 	const volid = "local-zfs:vm-9001-disk-0"
 
@@ -856,6 +878,7 @@ func storageLockErr() error {
 // (no UPID, synchronous success) on the Nth call. AwaitTask is not invoked
 // because the final call returns an empty UPID.
 func TestHandleUpdateDisk_ResizeUnderStorageLock_RetriesAndSucceeds(t *testing.T) {
+	t.Parallel()
 	const diskCID = "local-lvm:vm-9001-disk-0"
 	const volid = "local-lvm:vm-9001-disk-0"
 
@@ -908,6 +931,7 @@ func TestHandleUpdateDisk_ResizeUnderStorageLock_RetriesAndSucceeds(t *testing.T
 // test sets up a context with a short deadline so the retry loop terminates
 // via ctx cancellation if somehow it exceeds the expected call count.
 func TestHandleUpdateDisk_ResizeUnderStorageLock_ExhaustsRetries(t *testing.T) {
+	t.Parallel()
 	const diskCID = "local-lvm:vm-9001-disk-0"
 	const volid = "local-lvm:vm-9001-disk-0"
 

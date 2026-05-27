@@ -1,9 +1,7 @@
-// Package handlers — create_network handler.
-//
-// Implements the BOSH CPI v2 create_network method. When cloud_properties
-// indicate an SDN zone or the config NetworkMode is "sdn", the handler creates
-// a PVE SDN vnet (and optionally a subnet and zone). Otherwise it falls back to
-// creating a Linux bridge via the nodes API.
+// create_network handler: implements the BOSH CPI v2 create_network method.
+// When cloud_properties indicate an SDN zone or the config NetworkMode is
+// "sdn", creates a PVE SDN vnet (and optionally a subnet and zone). Otherwise
+// falls back to creating a Linux bridge via the nodes API.
 package handlers
 
 import (
@@ -211,7 +209,9 @@ func createNetworkSDN(
 				// runs even after the caller aborts.
 				if createdZone {
 					rollbackCtx := contextWithoutCancel(ctx)
-					_ = clusterSvc.DeleteSdnZones(rollbackCtx, zone, nil)
+					if err := clusterSvc.DeleteSdnZones(rollbackCtx, zone, nil); err != nil {
+						deps.Logger.Warn("create_network: rollback delete zone failed", log.Err(err))
+					}
 					// Apply rollback so the staged zone deletion is committed.
 					if applyErr := applySDN(rollbackCtx, deps, clusterSvc,
 						"create_network: rollback zone after vnet-create failure"); applyErr != nil {
@@ -250,10 +250,14 @@ func createNetworkSDN(
 				// createdZone guard against deleting pre-existing resources.
 				rollbackCtx := contextWithoutCancel(ctx)
 				if vnetCreated {
-					_ = clusterSvc.DeleteSdnVnets(rollbackCtx, vnet, nil)
+					if err := clusterSvc.DeleteSdnVnets(rollbackCtx, vnet, nil); err != nil {
+						deps.Logger.Warn("create_network: rollback delete vnet failed", log.Err(err))
+					}
 				}
 				if createdZone {
-					_ = clusterSvc.DeleteSdnZones(rollbackCtx, zone, nil)
+					if err := clusterSvc.DeleteSdnZones(rollbackCtx, zone, nil); err != nil {
+						deps.Logger.Warn("create_network: rollback delete zone failed", log.Err(err))
+					}
 				}
 				if vnetCreated || createdZone {
 					// Apply to commit the staged rollback deletions.
@@ -284,13 +288,19 @@ func createNetworkSDN(
 		// completes even when the caller cancelled the request.
 		rollbackCtx := contextWithoutCancel(ctx)
 		if subnetCreated {
-			_ = clusterSvc.DeleteSdnVnetsSubnets(rollbackCtx, vnet, spec.Range, nil)
+			if err := clusterSvc.DeleteSdnVnetsSubnets(rollbackCtx, vnet, spec.Range, nil); err != nil {
+				deps.Logger.Warn("create_network: rollback delete subnet failed", log.Err(err))
+			}
 		}
 		if vnetCreated {
-			_ = clusterSvc.DeleteSdnVnets(rollbackCtx, vnet, nil)
+			if err := clusterSvc.DeleteSdnVnets(rollbackCtx, vnet, nil); err != nil {
+				deps.Logger.Warn("create_network: rollback delete vnet failed", log.Err(err))
+			}
 		}
 		if createdZone {
-			_ = clusterSvc.DeleteSdnZones(rollbackCtx, zone, nil)
+			if err := clusterSvc.DeleteSdnZones(rollbackCtx, zone, nil); err != nil {
+				deps.Logger.Warn("create_network: rollback delete zone failed", log.Err(err))
+			}
 		}
 		// Apply to commit the staged rollback deletions. Every SDN mutation
 		// must be followed by UpdateSdn or it stays pending in /etc/pve/sdn/.cfg.

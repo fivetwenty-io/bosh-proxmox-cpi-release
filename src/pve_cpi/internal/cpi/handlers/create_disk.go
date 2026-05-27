@@ -1,4 +1,3 @@
-// Package handlers contains the 22 BOSH CPI v2 method implementations.
 package handlers
 
 import (
@@ -186,12 +185,13 @@ func HandleCreateDisk(deps Deps) Handler {
 					rollbackCtx := contextWithoutCancel(ctx)
 					if exists, exErr := deps.PVE.Storage().Exists(rollbackCtx, node, storage, candidateCanonical); exErr == nil && exists {
 						upid, delErr := deps.PVE.Storage().DeleteVolumeAsync(rollbackCtx, node, storage, candidateCanonical)
-						if delErr != nil {
+						switch {
+						case delErr != nil:
 							deps.Logger.Warn("create_disk: orphan volume cleanup after CreateVolume error failed",
 								log.String("volid", candidateCanonical),
 								log.Err(delErr),
 							)
-						} else if upid != "" {
+						case upid != "":
 							if werr := pve.AwaitTaskWithLogger(rollbackCtx, deps.PVE, node, upid, deps.Logger); werr != nil {
 								deps.Logger.Warn("create_disk: orphan volume cleanup await failed",
 									log.String("volid", candidateCanonical),
@@ -203,7 +203,7 @@ func HandleCreateDisk(deps Deps) Handler {
 									log.String("volid", candidateCanonical),
 								)
 							}
-						} else {
+						default:
 							deps.Logger.Info("create_disk: removed orphan volume after CreateVolume error",
 								log.String("volid", candidateCanonical),
 							)

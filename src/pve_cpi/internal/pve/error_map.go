@@ -1,4 +1,4 @@
-// Package pve provides SDK-to-BOSH error mapping used across all CPI actions.
+// SDK-to-BOSH error mapping used across all CPI actions.
 package pve
 
 import (

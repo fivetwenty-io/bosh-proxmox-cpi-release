@@ -12,6 +12,7 @@ import (
 
 // TestNewLogger_Levels verifies each valid level constructs without error.
 func TestNewLogger_Levels(t *testing.T) {
+	t.Parallel()
 	levels := []string{"debug", "info", "warn", "error"}
 	for _, lvl := range levels {
 		t.Run(lvl, func(t *testing.T) {
@@ -28,6 +29,7 @@ func TestNewLogger_Levels(t *testing.T) {
 
 // TestNewLogger_InvalidLevel ensures unrecognized levels return an error.
 func TestNewLogger_InvalidLevel(t *testing.T) {
+	t.Parallel()
 	cases := []string{"", "trace", "WARN", "verbose", "fatal"}
 	for _, lvl := range cases {
 		t.Run(lvl, func(t *testing.T) {
@@ -41,6 +43,7 @@ func TestNewLogger_InvalidLevel(t *testing.T) {
 
 // TestNewLogger_WritesToSink confirms log output reaches the provided writer.
 func TestNewLogger_WritesToSink(t *testing.T) {
+	t.Parallel()
 	var buf bytes.Buffer
 	l, err := log.NewLogger("info", &buf)
 	if err != nil {
@@ -54,6 +57,7 @@ func TestNewLogger_WritesToSink(t *testing.T) {
 
 // TestNewLogger_JSONOutput confirms output is valid JSON.
 func TestNewLogger_JSONOutput(t *testing.T) {
+	t.Parallel()
 	var buf bytes.Buffer
 	l, err := log.NewLogger("debug", &buf)
 	if err != nil {
@@ -77,6 +81,7 @@ func TestNewLogger_JSONOutput(t *testing.T) {
 // TestNewLogger_LevelFiltering confirms that messages below the configured
 // level are suppressed.
 func TestNewLogger_LevelFiltering(t *testing.T) {
+	t.Parallel()
 	var buf bytes.Buffer
 	l, err := log.NewLogger("warn", &buf)
 	if err != nil {
@@ -91,6 +96,7 @@ func TestNewLogger_LevelFiltering(t *testing.T) {
 
 // TestNewLogger_NilSinkDefaultsToStderr ensures nil sink is accepted (uses os.Stderr).
 func TestNewLogger_NilSinkDefaultsToStderr(t *testing.T) {
+	t.Parallel()
 	l, err := log.NewLogger("info", nil)
 	if err != nil {
 		t.Fatalf("NewLogger with nil sink: %v", err)
@@ -102,6 +108,7 @@ func TestNewLogger_NilSinkDefaultsToStderr(t *testing.T) {
 
 // TestWithRequestID round-trips the request ID through context.
 func TestWithRequestID(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	ctx = log.WithRequestID(ctx, "req-abc-123")
 
@@ -121,6 +128,7 @@ func TestWithRequestID(t *testing.T) {
 
 // TestWithMethod round-trips the method name through context.
 func TestWithMethod(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	ctx = log.WithMethod(ctx, "create_vm")
 
@@ -140,6 +148,7 @@ func TestWithMethod(t *testing.T) {
 
 // TestWithContext_BothValues confirms both request_id and method appear together.
 func TestWithContext_BothValues(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	ctx = log.WithRequestID(ctx, "req-999")
 	ctx = log.WithMethod(ctx, "delete_vm")
@@ -157,6 +166,7 @@ func TestWithContext_BothValues(t *testing.T) {
 // TestWithContext_EmptyCtx confirms WithContext on empty context returns same logger
 // (no extra fields, no panic).
 func TestWithContext_EmptyCtx(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	var buf bytes.Buffer
 	l, _ := log.NewLogger("info", &buf)
@@ -181,6 +191,7 @@ func TestWithContext_EmptyCtx(t *testing.T) {
 // TestFromContext_NoLogger ensures FromContext returns a nop logger (no panic)
 // when no logger is stored in ctx.
 func TestFromContext_NoLogger(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	l := log.FromContext(ctx)
 	if l == nil {
@@ -191,6 +202,7 @@ func TestFromContext_NoLogger(t *testing.T) {
 
 // TestFromContext_Roundtrip confirms a stored logger is retrieved correctly.
 func TestFromContext_Roundtrip(t *testing.T) {
+	t.Parallel()
 	var buf bytes.Buffer
 	l, _ := log.NewLogger("info", &buf)
 
@@ -208,6 +220,7 @@ func TestFromContext_Roundtrip(t *testing.T) {
 
 // TestWithFields chains additional structured fields onto a logger.
 func TestWithFields(t *testing.T) {
+	t.Parallel()
 	var buf bytes.Buffer
 	l, _ := log.NewLogger("debug", &buf)
 	l2 := l.WithFields(log.String("component", "pve"), log.Int("vmid", 100))
@@ -221,6 +234,7 @@ func TestWithFields(t *testing.T) {
 
 // TestWithFields_Empty verifies that WithFields with no args returns a valid logger.
 func TestWithFields_Empty(t *testing.T) {
+	t.Parallel()
 	var buf bytes.Buffer
 	l, _ := log.NewLogger("info", &buf)
 	l2 := l.WithFields()
@@ -235,6 +249,7 @@ func TestWithFields_Empty(t *testing.T) {
 
 // TestNopLogger_NoOutput confirms NewNopLogger produces no output to any sink.
 func TestNopLogger_NoOutput(t *testing.T) {
+	t.Parallel()
 	var buf bytes.Buffer
 	l := log.NewNopLogger()
 	if l == nil {
@@ -251,6 +266,7 @@ func TestNopLogger_NoOutput(t *testing.T) {
 
 // TestLogger_AllLevelMethods exercises Debug/Info/Warn/Error methods without panic.
 func TestLogger_AllLevelMethods(t *testing.T) {
+	t.Parallel()
 	var buf bytes.Buffer
 	l, _ := log.NewLogger("debug", &buf)
 	l.Debug("debug msg", log.String("k", "v"))

@@ -136,6 +136,7 @@ func snapDeps(qemuSvc qemu.Service, clusterSvc sdkclusterapi.Service, tasksSvc t
 // ---------------------------------------------------------------------------
 
 func TestHandleSnapshotDisk_Happy(t *testing.T) {
+	t.Parallel()
 	const diskCID = "local-lvm:vm-9001-disk-0"
 	const volid = "local-lvm:vm-9001-disk-0"
 
@@ -185,6 +186,7 @@ func TestHandleSnapshotDisk_Happy(t *testing.T) {
 }
 
 func TestHandleSnapshotDisk_WithDescription(t *testing.T) {
+	t.Parallel()
 	const diskCID = "local-lvm:vm-9001-disk-0"
 	const volid = "local-lvm:vm-9001-disk-0"
 
@@ -219,6 +221,7 @@ func TestHandleSnapshotDisk_WithDescription(t *testing.T) {
 }
 
 func TestHandleSnapshotDisk_WithUpid(t *testing.T) {
+	t.Parallel()
 	const diskCID = "local-lvm:vm-9001-disk-0"
 
 	var waitCalled bool
@@ -258,6 +261,7 @@ func TestHandleSnapshotDisk_WithUpid(t *testing.T) {
 }
 
 func TestHandleSnapshotDisk_DiskNotAttached(t *testing.T) {
+	t.Parallel()
 	const diskCID = "local-lvm:vm-9001-disk-0"
 
 	qemuSvc := &snapQEMUService{
@@ -282,6 +286,7 @@ func TestHandleSnapshotDisk_DiskNotAttached(t *testing.T) {
 }
 
 func TestHandleSnapshotDisk_EmptyClusterList(t *testing.T) {
+	t.Parallel()
 	const diskCID = "local-lvm:vm-9001-disk-0"
 
 	clusterSvc := &snapClusterService{
@@ -299,6 +304,7 @@ func TestHandleSnapshotDisk_EmptyClusterList(t *testing.T) {
 }
 
 func TestHandleSnapshotDisk_SnapshotFails(t *testing.T) {
+	t.Parallel()
 	const diskCID = "local-lvm:vm-9001-disk-0"
 
 	qemuSvc := &snapQEMUService{
@@ -324,6 +330,7 @@ func TestHandleSnapshotDisk_SnapshotFails(t *testing.T) {
 }
 
 func TestHandleSnapshotDisk_MalformedDiskCID(t *testing.T) {
+	t.Parallel()
 	h := handlers.HandleSnapshotDisk(snapDeps(&snapQEMUService{}, &snapClusterService{}, nil))
 	_, err := h.Handle(context.Background(), marshalArgs("no-colon-disk-cid"), jsonrpc.Context{})
 	if err == nil {
@@ -332,6 +339,7 @@ func TestHandleSnapshotDisk_MalformedDiskCID(t *testing.T) {
 }
 
 func TestHandleSnapshotDisk_EmptyDiskCID(t *testing.T) {
+	t.Parallel()
 	h := handlers.HandleSnapshotDisk(snapDeps(&snapQEMUService{}, &snapClusterService{}, nil))
 	_, err := h.Handle(context.Background(), marshalArgs(""), jsonrpc.Context{})
 	if err == nil {
@@ -340,6 +348,7 @@ func TestHandleSnapshotDisk_EmptyDiskCID(t *testing.T) {
 }
 
 func TestHandleSnapshotDisk_ClusterListError(t *testing.T) {
+	t.Parallel()
 	const diskCID = "local-lvm:vm-9001-disk-0"
 
 	clusterSvc := &snapClusterService{
@@ -356,6 +365,7 @@ func TestHandleSnapshotDisk_ClusterListError(t *testing.T) {
 }
 
 func TestHandleSnapshotDisk_DiskInOptionString(t *testing.T) {
+	t.Parallel()
 	// Disk stored with option string: "local-lvm:vm-9001-disk-0,size=10G,cache=writeback"
 	const diskCID = "local-lvm:vm-9001-disk-0"
 	const volid = "local-lvm:vm-9001-disk-0"
@@ -391,6 +401,7 @@ func TestHandleSnapshotDisk_DiskInOptionString(t *testing.T) {
 }
 
 func TestHandleSnapshotDisk_SDKError404(t *testing.T) {
+	t.Parallel()
 	// A 404 API error from Snapshot should propagate as an error.
 	const diskCID = "local-lvm:vm-9001-disk-0"
 
@@ -426,6 +437,7 @@ func TestHandleSnapshotDisk_SDKError404(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestHandleSnapshotDisk_Dir_CID(t *testing.T) {
+	t.Parallel()
 	// dir storage: CID has subpath form "<storage>:<vmid>/<volname>.<ext>".
 	const diskCID = "local:9001/vm-9001-disk-0.raw"
 
@@ -463,6 +475,7 @@ func TestHandleSnapshotDisk_Dir_CID(t *testing.T) {
 }
 
 func TestHandleSnapshotDisk_ZFSPool_CID(t *testing.T) {
+	t.Parallel()
 	// zfspool storage: bare volname (no subpath), e.g. "local-zfs:vm-9001-disk-0".
 	const diskCID = "local-zfs:vm-9001-disk-0"
 
@@ -500,6 +513,7 @@ func TestHandleSnapshotDisk_ZFSPool_CID(t *testing.T) {
 }
 
 func TestHandleSnapshotDisk_LVMThin_CID(t *testing.T) {
+	t.Parallel()
 	// lvmthin storage: bare volname, e.g. "local-lvm-thin:vm-9001-disk-0".
 	const diskCID = "local-lvm-thin:vm-9001-disk-0"
 

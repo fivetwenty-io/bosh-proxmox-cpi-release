@@ -1,8 +1,7 @@
-// Package pve: light-stemcell storage policy validation.
-//
-// ValidateLightStemcellStorage enforces five placement rules that determine
-// whether a given PVE storage is acceptable for light stemcell uploads and
-// whether a specific cluster node must be pinned for that upload.
+// Light-stemcell storage policy validation. ValidateLightStemcellStorage
+// enforces five placement rules that determine whether a given PVE storage is
+// acceptable for light stemcell uploads and whether a specific cluster node
+// must be pinned for that upload.
 package pve
 
 import (
@@ -34,10 +33,10 @@ type PolicyDeps interface {
 // qcow2 files. Rule 1 (block-type rejection) is evaluated before rule 3
 // (shared acceptance) so rbd is always rejected.
 var blockStorageTypes = map[string]struct{}{
-	"lvm":     {},
-	"lvmthin": {},
-	"zfspool": {},
-	"rbd":     {},
+	StorageTypeLVM:     {},
+	StorageTypeLVMThin: {},
+	StorageTypeZFSPool: {},
+	StorageTypeRBD:     {},
 }
 
 // IsBlockStorage reports whether the given PVE storage type cannot hold

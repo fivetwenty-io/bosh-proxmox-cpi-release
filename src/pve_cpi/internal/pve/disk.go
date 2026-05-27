@@ -1,5 +1,5 @@
-// Package pve provides disk CID parsing, formatting, and disk-slot resolution
-// helpers used by detach_disk, resize_disk, and set_disk_metadata.
+// Disk CID parsing, formatting, and disk-slot resolution helpers used by
+// detach_disk, resize_disk, and set_disk_metadata.
 package pve
 
 import (

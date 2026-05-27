@@ -22,6 +22,7 @@ import (
 // ---------------------------------------------------------------------------
 
 func TestParseDiskCID_Valid(t *testing.T) {
+	t.Parallel()
 	storage, volume, err := pve.ParseDiskCID("local:vm-100-disk-1")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -35,6 +36,7 @@ func TestParseDiskCID_Valid(t *testing.T) {
 }
 
 func TestParseDiskCID_ValidLocalLVM(t *testing.T) {
+	t.Parallel()
 	s, v, err := pve.ParseDiskCID("local-lvm:vm-200-disk-0")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -45,6 +47,7 @@ func TestParseDiskCID_ValidLocalLVM(t *testing.T) {
 }
 
 func TestParseDiskCID_NoColon(t *testing.T) {
+	t.Parallel()
 	_, _, err := pve.ParseDiskCID("broken")
 	if err == nil {
 		t.Fatal("expected error for CID without colon")
@@ -52,6 +55,7 @@ func TestParseDiskCID_NoColon(t *testing.T) {
 }
 
 func TestParseDiskCID_Empty(t *testing.T) {
+	t.Parallel()
 	_, _, err := pve.ParseDiskCID("")
 	if err == nil {
 		t.Fatal("expected error for empty CID")
@@ -59,6 +63,7 @@ func TestParseDiskCID_Empty(t *testing.T) {
 }
 
 func TestParseDiskCID_EmptyStorage(t *testing.T) {
+	t.Parallel()
 	_, _, err := pve.ParseDiskCID(":volume")
 	if err == nil {
 		t.Fatal("expected error for empty storage part")
@@ -66,6 +71,7 @@ func TestParseDiskCID_EmptyStorage(t *testing.T) {
 }
 
 func TestParseDiskCID_EmptyVolume(t *testing.T) {
+	t.Parallel()
 	_, _, err := pve.ParseDiskCID("storage:")
 	if err == nil {
 		t.Fatal("expected error for empty volume part")
@@ -73,6 +79,7 @@ func TestParseDiskCID_EmptyVolume(t *testing.T) {
 }
 
 func TestParseDiskCID_MultipleColons(t *testing.T) {
+	t.Parallel()
 	// Only first colon is the split point; remainder is volume.
 	s, v, err := pve.ParseDiskCID("local:vm-100:extra")
 	if err != nil {
@@ -88,6 +95,7 @@ func TestParseDiskCID_MultipleColons(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestFormatDiskCID(t *testing.T) {
+	t.Parallel()
 	got := pve.FormatDiskCID("local", "vol")
 	if got != "local:vol" {
 		t.Errorf("want %q got %q", "local:vol", got)
@@ -95,6 +103,7 @@ func TestFormatDiskCID(t *testing.T) {
 }
 
 func TestFormatDiskCID_RoundTrip(t *testing.T) {
+	t.Parallel()
 	original := "local-lvm:vm-999-disk-3"
 	s, v, err := pve.ParseDiskCID(original)
 	if err != nil {
@@ -110,6 +119,7 @@ func TestFormatDiskCID_RoundTrip(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestParseSnapshotCID_Valid(t *testing.T) {
+	t.Parallel()
 	vmCID, snapName, err := pve.ParseSnapshotCID("vm-100:snap1")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -123,6 +133,7 @@ func TestParseSnapshotCID_Valid(t *testing.T) {
 }
 
 func TestParseSnapshotCID_NoColon(t *testing.T) {
+	t.Parallel()
 	_, _, err := pve.ParseSnapshotCID("nocobon")
 	if err == nil {
 		t.Fatal("expected error for snapshot CID without colon")
@@ -130,6 +141,7 @@ func TestParseSnapshotCID_NoColon(t *testing.T) {
 }
 
 func TestParseSnapshotCID_Empty(t *testing.T) {
+	t.Parallel()
 	_, _, err := pve.ParseSnapshotCID("")
 	if err == nil {
 		t.Fatal("expected error for empty snapshot CID")
@@ -137,6 +149,7 @@ func TestParseSnapshotCID_Empty(t *testing.T) {
 }
 
 func TestParseSnapshotCID_EmptyVMCID(t *testing.T) {
+	t.Parallel()
 	_, _, err := pve.ParseSnapshotCID(":snapname")
 	if err == nil {
 		t.Fatal("expected error for empty vm_cid part")
@@ -144,6 +157,7 @@ func TestParseSnapshotCID_EmptyVMCID(t *testing.T) {
 }
 
 func TestParseSnapshotCID_EmptySnapName(t *testing.T) {
+	t.Parallel()
 	_, _, err := pve.ParseSnapshotCID("vm-100:")
 	if err == nil {
 		t.Fatal("expected error for empty snap_name part")
@@ -155,6 +169,7 @@ func TestParseSnapshotCID_EmptySnapName(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestFormatSnapshotCID(t *testing.T) {
+	t.Parallel()
 	got := pve.FormatSnapshotCID("vm-100", "my-snap")
 	if got != "vm-100:my-snap" {
 		t.Errorf("want %q got %q", "vm-100:my-snap", got)
@@ -162,6 +177,7 @@ func TestFormatSnapshotCID(t *testing.T) {
 }
 
 func TestFormatSnapshotCID_RoundTrip(t *testing.T) {
+	t.Parallel()
 	original := "vm-42:pre-deploy"
 	v, s, err := pve.ParseSnapshotCID(original)
 	if err != nil {
@@ -254,6 +270,7 @@ func newMockClientWithConfig(cfg map[string]any, err error) pve.Client {
 // ---------------------------------------------------------------------------
 
 func TestResolveDiskID_Found(t *testing.T) {
+	t.Parallel()
 	cfg := map[string]any{
 		"scsi0": "local-lvm:vm-100-disk-0",
 		"scsi1": "local:vm-100-disk-1",
@@ -272,6 +289,7 @@ func TestResolveDiskID_Found(t *testing.T) {
 }
 
 func TestResolveDiskID_FoundScsi0(t *testing.T) {
+	t.Parallel()
 	cfg := map[string]any{
 		"scsi0": "local-lvm:vm-100-disk-0",
 	}
@@ -287,6 +305,7 @@ func TestResolveDiskID_FoundScsi0(t *testing.T) {
 }
 
 func TestResolveDiskID_NotFound(t *testing.T) {
+	t.Parallel()
 	cfg := map[string]any{
 		"scsi0": "local-lvm:vm-100-disk-0",
 	}
@@ -299,6 +318,7 @@ func TestResolveDiskID_NotFound(t *testing.T) {
 }
 
 func TestResolveDiskID_ConfigError(t *testing.T) {
+	t.Parallel()
 	configErr := errors.New("API unreachable")
 	c := newMockClientWithConfig(nil, configErr)
 
@@ -312,6 +332,7 @@ func TestResolveDiskID_ConfigError(t *testing.T) {
 }
 
 func TestResolveDiskID_EmptyNode(t *testing.T) {
+	t.Parallel()
 	c := newMockClientWithConfig(nil, nil)
 	_, err := pve.ResolveDiskID(context.Background(), c, "", 100, "local:disk")
 	if err == nil {
@@ -320,6 +341,7 @@ func TestResolveDiskID_EmptyNode(t *testing.T) {
 }
 
 func TestResolveDiskID_InvalidVMID(t *testing.T) {
+	t.Parallel()
 	c := newMockClientWithConfig(nil, nil)
 	_, err := pve.ResolveDiskID(context.Background(), c, "pve1", 0, "local:disk")
 	if err == nil {
@@ -328,6 +350,7 @@ func TestResolveDiskID_InvalidVMID(t *testing.T) {
 }
 
 func TestResolveDiskID_EmptyVolID(t *testing.T) {
+	t.Parallel()
 	c := newMockClientWithConfig(nil, nil)
 	_, err := pve.ResolveDiskID(context.Background(), c, "pve1", 100, "")
 	if err == nil {
@@ -336,6 +359,7 @@ func TestResolveDiskID_EmptyVolID(t *testing.T) {
 }
 
 func TestResolveDiskID_EmptyConfig(t *testing.T) {
+	t.Parallel()
 	c := newMockClientWithConfig(map[string]any{}, nil)
 	_, err := pve.ResolveDiskID(context.Background(), c, "pve1", 100, "local:vm-100-disk-0")
 	if err == nil {
@@ -398,6 +422,7 @@ func diskClusterResp(rows ...map[string]any) *cluster.ListResourcesResponse {
 // ---------------------------------------------------------------------------
 
 func TestFindVMByDiskVolid_TransientThenSuccess(t *testing.T) {
+	t.Parallel()
 	// ListResources errors once with a transient signal, then succeeds.
 	// FindVMByDiskVolid must retry and return the correct (vmid, node).
 	var listCalls int

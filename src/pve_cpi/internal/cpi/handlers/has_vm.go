@@ -1,4 +1,3 @@
-// Package handlers contains the 22 BOSH CPI v2 method implementations.
 package handlers
 
 import (

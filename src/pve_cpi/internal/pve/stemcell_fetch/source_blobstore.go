@@ -2,6 +2,7 @@ package stemcellfetch
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -19,11 +20,14 @@ type blobstoreSource struct {
 }
 
 // newBlobstoreSource returns a Source whose http.Client uses a 30-minute
-// timeout. Large stemcells on slow Director blobstores can saturate the
-// default 5-second timeout.
+// timeout and a TLS 1.2 floor. Large stemcells on slow Director blobstores
+// can saturate the default 5-second timeout.
 func newBlobstoreSource() *blobstoreSource {
 	return &blobstoreSource{
-		client: &http.Client{Timeout: 30 * time.Minute},
+		client: &http.Client{
+			Timeout:   30 * time.Minute,
+			Transport: &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12}},
+		},
 	}
 }
 
@@ -58,6 +62,12 @@ func (blobstoreCredentials) Kind() string { return "blobstore" }
 // Failure modes:
 //   - JSON unmarshal error → wrapped error
 //   - empty endpoint → error (endpoint is required to build the fetch URL)
+//
+// SECURITY: when endpoint scheme is http (not https), Basic-auth credentials
+// are transmitted in plaintext. A structured WARN log cannot be emitted here
+// because blobstoreSource carries no logger field. Wire a logger into
+// blobstoreSource and emit the warning (mirroring config.emitRegistryInsecureWarning)
+// before accepting the http endpoint.
 func parseBlobstoreAuth(raw json.RawMessage) (blobstoreCredentials, error) {
 	var c blobstoreCredentials
 	if err := json.Unmarshal(raw, &c); err != nil {

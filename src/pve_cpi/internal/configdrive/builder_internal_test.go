@@ -330,3 +330,260 @@ func TestBuild_WriteFilesError_WriteFails(t *testing.T) {
 		t.Errorf("file handle leaked after Write failure: %v", leaked)
 	}
 }
+
+// --------------------------------------------------------------------------
+// Additional writeFiles error-path tests to cover remaining branches.
+// --------------------------------------------------------------------------
+
+// TestBuild_WriteFilesError_MkdirOpenStackLatestFails covers the
+// /openstack/latest Mkdir error branch (the second Mkdir call).
+func TestBuild_WriteFilesError_MkdirOpenStackLatestFails(t *testing.T) {
+	t.Parallel()
+
+	sentinel := &errSentinel{msg: "injected: quota exceeded on /openstack/latest"}
+	tfs := newTrackingFS()
+	ifs := &injectFS{
+		trackingFS:  tfs,
+		mkdirFailOn: "/openstack/latest",
+		mkdirErr:    sentinel,
+	}
+
+	err := writeFiles(ifs, []byte(`{"x":1}`))
+	if err == nil {
+		t.Fatal("expected error from /openstack/latest Mkdir failure, got nil")
+	}
+	if !errors.Is(err, sentinel) {
+		t.Errorf("error %v should wrap sentinel via %%w", err)
+	}
+	if !strings.Contains(err.Error(), "/openstack/latest") {
+		t.Errorf("error %q should name /openstack/latest", err.Error())
+	}
+	// No files should have been opened before the second Mkdir.
+	if len(tfs.opened) != 0 {
+		t.Errorf("expected 0 OpenFile calls, got %d", len(tfs.opened))
+	}
+}
+
+// TestBuild_WriteFilesError_OpenMetaDataFails covers the OpenFile error for
+// /openstack/latest/meta_data.json (second OpenFile call in writeFiles).
+func TestBuild_WriteFilesError_OpenMetaDataFails(t *testing.T) {
+	t.Parallel()
+
+	sentinel := &errSentinel{msg: "injected: no space left for meta_data.json"}
+	tfs := newTrackingFS()
+	ifs := &injectFS{
+		trackingFS: tfs,
+		openFailOn: "/openstack/latest/meta_data.json",
+		openErr:    sentinel,
+	}
+
+	err := writeFiles(ifs, []byte(`{"x":1}`))
+	if err == nil {
+		t.Fatal("expected error from meta_data.json OpenFile failure, got nil")
+	}
+	if !errors.Is(err, sentinel) {
+		t.Errorf("error %v should wrap sentinel via %%w", err)
+	}
+	if !strings.Contains(err.Error(), "/openstack/latest/meta_data.json") {
+		t.Errorf("error %q should name /openstack/latest/meta_data.json", err.Error())
+	}
+	// user_data was opened successfully; it must have been closed.
+	if len(tfs.opened) != 1 {
+		t.Errorf("expected 1 successful OpenFile (user_data) before failure, got %d", len(tfs.opened))
+	}
+	if ok, leaked := tfs.allClosed(); !ok {
+		t.Errorf("handle leaked after meta_data.json OpenFile failure: %v", leaked)
+	}
+}
+
+// TestBuild_WriteFilesError_MkdirEC2Fails covers the /ec2 Mkdir error branch.
+func TestBuild_WriteFilesError_MkdirEC2Fails(t *testing.T) {
+	t.Parallel()
+
+	sentinel := &errSentinel{msg: "injected: read-only after /ec2"}
+	tfs := newTrackingFS()
+	ifs := &injectFS{
+		trackingFS:  tfs,
+		mkdirFailOn: "/ec2",
+		mkdirErr:    sentinel,
+	}
+
+	err := writeFiles(ifs, []byte(`{"x":1}`))
+	if err == nil {
+		t.Fatal("expected error from /ec2 Mkdir failure, got nil")
+	}
+	if !errors.Is(err, sentinel) {
+		t.Errorf("error %v should wrap sentinel via %%w", err)
+	}
+	if !strings.Contains(err.Error(), "/ec2") {
+		t.Errorf("error %q should name /ec2", err.Error())
+	}
+	// Two openstack files were opened before the /ec2 Mkdir; both must be closed.
+	if len(tfs.opened) != 2 {
+		t.Errorf("expected 2 OpenFile calls (openstack files) before /ec2 Mkdir, got %d", len(tfs.opened))
+	}
+	if ok, leaked := tfs.allClosed(); !ok {
+		t.Errorf("handle leaked after /ec2 Mkdir failure: %v", leaked)
+	}
+}
+
+// TestBuild_WriteFilesError_MkdirEC2LatestFails covers the /ec2/latest Mkdir error.
+func TestBuild_WriteFilesError_MkdirEC2LatestFails(t *testing.T) {
+	t.Parallel()
+
+	sentinel := &errSentinel{msg: "injected: inode exhausted at /ec2/latest"}
+	tfs := newTrackingFS()
+	ifs := &injectFS{
+		trackingFS:  tfs,
+		mkdirFailOn: "/ec2/latest",
+		mkdirErr:    sentinel,
+	}
+
+	err := writeFiles(ifs, []byte(`{"x":1}`))
+	if err == nil {
+		t.Fatal("expected error from /ec2/latest Mkdir failure, got nil")
+	}
+	if !errors.Is(err, sentinel) {
+		t.Errorf("error %v should wrap sentinel via %%w", err)
+	}
+	if !strings.Contains(err.Error(), "/ec2/latest") {
+		t.Errorf("error %q should name /ec2/latest", err.Error())
+	}
+	if ok, leaked := tfs.allClosed(); !ok {
+		t.Errorf("handle leaked after /ec2/latest Mkdir failure: %v", leaked)
+	}
+}
+
+// TestBuild_WriteFilesError_WriteEC2UserDataFails covers the Write failure on
+// /ec2/latest/user-data, verifying (a) the error propagates and (b) the handle
+// is closed.
+func TestBuild_WriteFilesError_WriteEC2UserDataFails(t *testing.T) {
+	t.Parallel()
+
+	sentinel := &errSentinel{msg: "injected: disk full at /ec2/latest/user-data"}
+	tfs := newTrackingFS()
+	ifs := &injectFS{
+		trackingFS:  tfs,
+		writeFailOn: "/ec2/latest/user-data",
+		writeErr:    sentinel,
+	}
+
+	err := writeFiles(ifs, []byte(`{"x":1}`))
+	if err == nil {
+		t.Fatal("expected error from /ec2/latest/user-data Write failure, got nil")
+	}
+	if !errors.Is(err, sentinel) {
+		t.Errorf("error %v should wrap sentinel via %%w", err)
+	}
+	if !strings.Contains(err.Error(), "/ec2/latest/user-data") {
+		t.Errorf("error %q should name /ec2/latest/user-data", err.Error())
+	}
+	// Exactly 3 files opened before the failing 4th (user-data).
+	// openstack/latest/user_data, openstack/latest/meta_data.json,
+	// ec2/latest/user-data (the failing one — opened but write fails).
+	if len(tfs.opened) != 3 {
+		t.Errorf("expected 3 OpenFile calls before EC2 user-data write failure, got %d", len(tfs.opened))
+	}
+	if ok, leaked := tfs.allClosed(); !ok {
+		t.Errorf("handle leaked after /ec2/latest/user-data Write failure: %v", leaked)
+	}
+}
+
+// TestBuild_WriteFilesError_WriteEC2MetaDataFails covers the Write failure on
+// /ec2/latest/meta-data.json (last file written by writeFiles).
+func TestBuild_WriteFilesError_WriteEC2MetaDataFails(t *testing.T) {
+	t.Parallel()
+
+	sentinel := &errSentinel{msg: "injected: disk full at /ec2/latest/meta-data.json"}
+	tfs := newTrackingFS()
+	ifs := &injectFS{
+		trackingFS:  tfs,
+		writeFailOn: "/ec2/latest/meta-data.json",
+		writeErr:    sentinel,
+	}
+
+	err := writeFiles(ifs, []byte(`{"x":1}`))
+	if err == nil {
+		t.Fatal("expected error from /ec2/latest/meta-data.json Write failure, got nil")
+	}
+	if !errors.Is(err, sentinel) {
+		t.Errorf("error %v should wrap sentinel via %%w", err)
+	}
+	if !strings.Contains(err.Error(), "/ec2/latest/meta-data.json") {
+		t.Errorf("error %q should name /ec2/latest/meta-data.json", err.Error())
+	}
+	// All 4 files opened; all must be closed (including the failing one).
+	if len(tfs.opened) != 4 {
+		t.Errorf("expected 4 OpenFile calls, got %d", len(tfs.opened))
+	}
+	if ok, leaked := tfs.allClosed(); !ok {
+		t.Errorf("handle leaked after /ec2/latest/meta-data.json Write failure: %v", leaked)
+	}
+}
+
+// --------------------------------------------------------------------------
+// writeISOFile close-error path test.
+// --------------------------------------------------------------------------
+
+// closeErrFile wraps memFile but returns a Close error, used to test the
+// deferred Close error path in writeISOFile.
+type closeErrFile struct {
+	*memFile
+	closeErr error
+}
+
+func (c *closeErrFile) Close() error {
+	_ = c.memFile.Close() // mark closed for tracking
+	return c.closeErr
+}
+
+// closeErrFS is a trackingFS variant that returns a closeErrFile for one
+// specific path, so the deferred close in writeISOFile returns an error.
+type closeErrFS struct {
+	*trackingFS
+	closeFailOn string
+	closeErr    error
+}
+
+func (c *closeErrFS) OpenFile(name string, flag int) (filesystem.File, error) {
+	f, err := c.trackingFS.OpenFile(name, flag)
+	if err != nil {
+		return nil, err
+	}
+	if name == c.closeFailOn {
+		mf := f.(*memFile)
+		return &closeErrFile{memFile: mf, closeErr: c.closeErr}, nil
+	}
+	return f, nil
+}
+
+func (c *closeErrFS) Mkdir(path string) error {
+	return c.trackingFS.Mkdir(path)
+}
+
+// TestWriteISOFile_CloseErrorPropagates verifies that when Close returns an
+// error and no Write error occurred, writeISOFile propagates the Close error.
+// This exercises the "err = fmt.Errorf(configdrive: close ...)" branch.
+func TestWriteISOFile_CloseErrorPropagates(t *testing.T) {
+	t.Parallel()
+
+	closeErr := &errSentinel{msg: "injected: close flush failed"}
+	tfs := newTrackingFS()
+	cfs := &closeErrFS{
+		trackingFS:  tfs,
+		closeFailOn: "/openstack/latest/user_data",
+		closeErr:    closeErr,
+	}
+
+	err := writeFiles(cfs, []byte(`{"x":1}`))
+	if err == nil {
+		t.Fatal("expected Close error from writeISOFile to propagate, got nil")
+	}
+	// The error must wrap closeErr via %w so errors.Is matches.
+	if !errors.Is(err, closeErr) {
+		t.Errorf("error %v should wrap closeErr via %%w", err)
+	}
+	if !strings.Contains(err.Error(), "/openstack/latest/user_data") {
+		t.Errorf("error %q should name the file whose Close failed", err.Error())
+	}
+}

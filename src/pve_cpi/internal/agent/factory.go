@@ -1,7 +1,8 @@
-// Package agent implements BOSH agent bootstrap strategies for PVE VMs.
 package agent
 
 import (
+	"net/url"
+
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
@@ -68,7 +69,7 @@ func NewAgent(cfg *config.CPIConfig, pveClient pve.Client, logger *log.Logger) (
 		// before VM creation rather than after silent ignore.
 		if cfg.RegistryEndpoint != "" {
 			logger.Warn("agent.NewAgent: agent_mode=noagent ignores registry_endpoint",
-				log.String("registry_endpoint", cfg.RegistryEndpoint))
+				log.String("registry_endpoint", redactURL(cfg.RegistryEndpoint)))
 		}
 		if cfg.ISOStorage != "" {
 			logger.Warn("agent.NewAgent: agent_mode=noagent ignores iso_storage",
@@ -82,4 +83,17 @@ func NewAgent(cfg *config.CPIConfig, pveClient pve.Client, logger *log.Logger) (
 			"must be one of: cloudinit, registry, noagent",
 		)
 	}
+}
+
+// redactURL strips userinfo from a URL before logging. A parse failure returns
+// the original string so the operator still sees something useful in logs.
+func redactURL(endpoint string) string {
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return endpoint
+	}
+	if u.User != nil {
+		u.User = url.UserPassword("REDACTED", "REDACTED")
+	}
+	return u.String()
 }

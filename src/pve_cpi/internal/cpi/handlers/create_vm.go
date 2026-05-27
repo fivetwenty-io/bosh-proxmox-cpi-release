@@ -1,4 +1,3 @@
-// Package handlers contains the 22 BOSH CPI v2 method implementations.
 package handlers
 
 import (
@@ -104,6 +103,36 @@ type createVMNetworkSpec struct {
 	MAC             string         `json:"mac,omitempty"` // filled in response
 }
 
+// createVMParsedArgs holds the validated, unmarshalled create_vm arguments.
+type createVMParsedArgs struct {
+	agentID      string
+	stemcellCID  string // original (may have "light:" prefix)
+	rawCID       string // stripped of "light:" prefix
+	stemcellStor string // storage component of rawCID
+	cloudProps   createVMCloudProps
+	networks     map[string]createVMNetworkSpec
+	diskCIDs     []string
+	env          map[string]any
+}
+
+// createVMShape holds the resolved VM-shape parameters derived from
+// createVMParsedArgs + Deps.Config.
+type createVMShape struct {
+	node         string
+	vmStorage    string
+	vmDiskFormat string
+	rootDiskGiB  int
+	cores        int
+	sockets      int
+	memMiB       int
+	hotplug      string
+	numaEnabled  bool
+	initialTags  string
+	rangeStart   int
+	maxAttempts  int
+	initialName  string
+}
+
 // HandleCreateVM returns a cpi.Handler that implements the BOSH CPI create_vm method.
 //
 // Arguments (positional, all required):
@@ -136,6 +165,105 @@ func createVM(
 	// -----------------------------------------------------------------------
 	// 1. Parse + validate arguments
 	// -----------------------------------------------------------------------
+	parsed, err := parseCreateVMArgs(args)
+	if err != nil {
+		return nil, err
+	}
+
+	// -----------------------------------------------------------------------
+	// 2–3. Resolve node and VM-shape parameters.
+	// -----------------------------------------------------------------------
+	shape, err := resolveVMShape(deps, parsed)
+	if err != nil {
+		return nil, err
+	}
+
+	// -----------------------------------------------------------------------
+	// 4. Allocate VMID + create VM via retry-on-conflict.
+	//    PVE may reject POST /qemu with HTTP 500 "VM N already exists" when a
+	//    concurrent CPI process wins the same VMID. AllocateWithRetry picks a
+	//    fresh VMID after backoff and re-attempts. The retry callback also
+	//    rolls back per-attempt failures whose UPID-await surfaces a
+	//    non-conflict error (PVE accepted the POST but the task itself failed).
+	// -----------------------------------------------------------------------
+	vmid, err := allocateVM(ctx, deps, logger, parsed, shape)
+	if err != nil {
+		return nil, cpierrors.Wrap(err, "create_vm: allocate+create VM")
+	}
+
+	vmName := shape.initialName
+	if vmName == "" {
+		vmName = fmt.Sprintf("vm-%d", vmid)
+	}
+
+	// Arm rollback for stages 4b–8: any failure after this point destroys
+	// the winning VM.
+	vmCreated := true
+	defer func() {
+		if retErr != nil && vmCreated {
+			cleanupVM(contextWithoutCancel(ctx), deps, shape.node, vmid, logger)
+		}
+	}()
+
+	logger.Info("create_vm: vm created and disk imported",
+		log.Int("vmid", vmid),
+		log.String("stemcell_cid", parsed.stemcellCID),
+		log.String("storage", shape.vmStorage),
+		log.Int("root_disk_gib", shape.rootDiskGiB),
+	)
+
+	// -----------------------------------------------------------------------
+	// 4b. Grow virtio0 to the requested root disk size.
+	//
+	// PVE silently ignores the `size=<N>G` directive on the import-from
+	// scsi/virtio param when the source image is smaller than N — the new
+	// volume keeps the source image's size (~5 GiB for BOSH stemcells).
+	// Without an explicit resize, the BOSH agent's bootstrap fails at
+	// "Setting up ephemeral disk: Insufficient remaining disk space"
+	// (CreatePartitionIfNoEphemeralDisk=true in the stemcell's agent.json
+	// requires free space at the end of the root disk).
+	// -----------------------------------------------------------------------
+	if err := resizeRootDisk(ctx, deps, logger, shape, vmid); err != nil {
+		return nil, err
+	}
+
+	// -----------------------------------------------------------------------
+	// 5. Configure NICs from networks map
+	// -----------------------------------------------------------------------
+	netNames, err := configureNICs(ctx, deps, logger, parsed, shape, vmid)
+	if err != nil {
+		return nil, err
+	}
+
+	// -----------------------------------------------------------------------
+	// 6. Attach persistent disks (disk_cids pre-attach)
+	// -----------------------------------------------------------------------
+	if err := attachPersistentDisks(ctx, deps, logger, parsed, shape, vmid); err != nil {
+		return nil, err
+	}
+
+	// -----------------------------------------------------------------------
+	// 7. Build AgentConfig and call agent.Configure
+	// -----------------------------------------------------------------------
+	if err := configureAgent(ctx, deps, logger, parsed, shape, vmid, vmName); err != nil {
+		return nil, err
+	}
+
+	// -----------------------------------------------------------------------
+	// 8. Start VM + read back VM config to extract assigned MAC addresses
+	// -----------------------------------------------------------------------
+	responseNetworks, err := startVMAndReadConfig(ctx, deps, logger, parsed, shape, vmid, netNames)
+	if err != nil {
+		return nil, err
+	}
+
+	vmCID := strconv.Itoa(vmid)
+	return []any{vmCID, responseNetworks}, nil
+}
+
+// parseCreateVMArgs validates and unmarshals the 6-element create_vm JSON args array.
+// Returns cpierrors.CloudError on any validation failure.
+func parseCreateVMArgs(args []json.RawMessage) (*createVMParsedArgs, error) {
 	if len(args) < 6 {
 		return nil, cpierrors.Cloud("create_vm: expected 6 arguments, got %d", len(args))
 	}
@@ -157,11 +285,11 @@ func createVM(
 	// underlying "<storage>:import/<file>" volid. The light: marker exists so
 	// delete_stemcell can recognize and no-op these CIDs without consulting
 	// any external state.
-	rawStemcellCID := pve.StripLightPrefix(stemcellCID)
+	rawCID := pve.StripLightPrefix(stemcellCID)
 	// stemcellStorage is used as a fallback VMStorage when deps.Config.VMStorage
 	// is empty (see VMStorage resolution below). ParseStemcellCID guarantees a
 	// non-empty storage component when err == nil.
-	stemcellStorage, _, err := pve.ParseStemcellCID(rawStemcellCID)
+	stemcellStor, _, err := pve.ParseStemcellCID(rawCID)
 	if err != nil {
 		return nil, cpierrors.Cloud("create_vm: invalid stemcell_cid %q: %s", stemcellCID, err.Error())
 	}
@@ -199,33 +327,27 @@ func createVM(
 		return nil, cpierrors.Cloud("create_vm: parse env: %s", err.Error())
 	}
 
-	// Initial VM name derived from env.bosh.{group,groups} + Config so the
-	// PVE UI shows the deployment + instance-group immediately on come-online
-	// instead of the placeholder "vm-<vmid>". For director-mode deploys env
-	// carries director + deployment + job in env.bosh.group; for `bosh
-	// create-env` env has no deployment, so Config.CreateEnvDeployment
-	// (default "create-env") fills that segment. set_vm_metadata later
-	// refines this to "<prefix>-<deployment>-<job>-<index>" once the index
-	// is known (the index is not part of the create_vm env per the v2 CPI
-	// spec).
-	initialJobName := extractJobNameFromEnv(env)
-	initialDeployment := extractDeploymentFromEnv(env, initialJobName)
-	if initialDeployment == "" {
-		initialDeployment = deps.Config.CreateEnvDeployment
-	}
-	if initialJobName == "" {
-		// create-env path: env has no group/groups. Fall back to the BOSH
-		// instance-group baked into cloud_provider.template.name when it is
-		// detectable from env.bosh.instance.name; otherwise leave blank and
-		// let the "vm-<vmid>" placeholder stand.
-		initialJobName = extractInstanceNameFromEnv(env)
-	}
-	initialVMName := composeVMName(deps.Config.VMPrefix, initialDeployment, initialJobName, "")
+	return &createVMParsedArgs{
+		agentID:      agentID,
+		stemcellCID:  stemcellCID,
+		rawCID:       rawCID,
+		stemcellStor: stemcellStor,
+		cloudProps:   cloudProps,
+		networks:     networks,
+		diskCIDs:     diskCIDs,
+		env:          env,
+	}, nil
+}
+
+// resolveVMShape derives the createVMShape from deps.Config + parsed args.
+// Returns cpierrors.CloudError if the target node cannot be determined.
+func resolveVMShape(deps Deps, parsed *createVMParsedArgs) (*createVMShape, error) {
+	cp := parsed.cloudProps
 
 	// -----------------------------------------------------------------------
 	// 2. Resolve node from cloud_properties or config default
 	// -----------------------------------------------------------------------
-	node := cloudProps.TargetNode
+	node := cp.TargetNode
 	if node == "" {
 		node = deps.Config.Node
 	}
@@ -251,7 +373,7 @@ func createVM(
 	}
 
 	// Resolve disk format: prefer cloud_properties.vm_disk_format; fall back to "qcow2".
-	vmDiskFormat := cloudProps.VMDiskFormat
+	vmDiskFormat := cp.VMDiskFormat
 	if vmDiskFormat == "" {
 		vmDiskFormat = "qcow2"
 	}
@@ -260,7 +382,7 @@ func createVM(
 	// own storage so the import stays on-node when no override is configured.
 	vmStorage := deps.Config.VMStorage
 	if vmStorage == "" {
-		vmStorage = stemcellStorage
+		vmStorage = parsed.stemcellStor
 	}
 
 	// Compute root disk size in GiB. cloud_properties.disk is in MiB; round up.
@@ -268,8 +390,8 @@ func createVM(
 	// the imported image (PVE enforces a no-shrink rule — the import itself would
 	// succeed but the explicit size= directive would be ignored or error).
 	rootDiskGiB := defaultStemcellDiskGiB
-	if cloudProps.Disk > 0 {
-		requestedGiB := (cloudProps.Disk + 1023) / 1024
+	if cp.Disk > 0 {
+		requestedGiB := (cp.Disk + 1023) / 1024
 		if requestedGiB > rootDiskGiB {
 			rootDiskGiB = requestedGiB
 		}
@@ -280,20 +402,20 @@ func createVM(
 	//   - PVE-native: cores/sockets explicit.
 	// Explicit cores/sockets win when present; otherwise fall back to cpu
 	// as cores with a single socket. Default is 1 vCPU.
-	cores := cloudProps.Cores
-	if cores <= 0 && cloudProps.CPU > 0 {
-		cores = cloudProps.CPU
+	cores := cp.Cores
+	if cores <= 0 && cp.CPU > 0 {
+		cores = cp.CPU
 	}
 	if cores <= 0 {
 		cores = 1
 	}
-	sockets := cloudProps.Sockets
+	sockets := cp.Sockets
 	if sockets <= 0 {
 		sockets = 1
 	}
-	memMiB := cloudProps.Memory
+	memMiB := cp.Memory
 	if memMiB <= 0 {
-		memMiB = cloudProps.RAM
+		memMiB = cp.RAM
 	}
 	if memMiB <= 0 {
 		memMiB = 512
@@ -304,228 +426,309 @@ func createVM(
 	// operators can override per-vm_type for stemcells that misbehave on
 	// memory hot-add.
 	hotplug := deps.Config.HotplugValue()
-	if cloudProps.Hotplug != nil {
-		hotplug = *cloudProps.Hotplug
+	if cp.Hotplug != nil {
+		hotplug = *cp.Hotplug
 	}
 	numaEnabled := deps.Config.NUMAValue()
-	if cloudProps.NUMA != nil {
-		numaEnabled = *cloudProps.NUMA
+	if cp.NUMA != nil {
+		numaEnabled = *cp.NUMA
 	}
 
 	// Pre-compute the operator-supplied tag string. The BOSH-managed
 	// director/deployment/job triple is added later by set_vm_metadata; here
 	// we set only the custom tags so the VM has them visible in the PVE UI
 	// immediately after creation.
-	initialTags := mergeTagList(nil, buildCustomTags(cloudProps.Tags), maxTagLength)
+	initialTags := mergeTagList(nil, buildCustomTags(cp.Tags), maxTagLength)
 
-	// -----------------------------------------------------------------------
-	// 4. Allocate VMID + create VM via retry-on-conflict.
-	//    PVE may reject POST /qemu with HTTP 500 "VM N already exists" when a
-	//    concurrent CPI process wins the same VMID. AllocateWithRetry picks a
-	//    fresh VMID after backoff and re-attempts. The retry callback also
-	//    rolls back per-attempt failures whose UPID-await surfaces a
-	//    non-conflict error (PVE accepted the POST but the task itself failed).
-	// -----------------------------------------------------------------------
+	// Initial VM name derived from env.bosh.{group,groups} + Config so the
+	// PVE UI shows the deployment + instance-group immediately on come-online
+	// instead of the placeholder "vm-<vmid>". For director-mode deploys env
+	// carries director + deployment + job in env.bosh.group; for `bosh
+	// create-env` env has no deployment, so Config.CreateEnvDeployment
+	// (default "create-env") fills that segment. set_vm_metadata later
+	// refines this to "<prefix>-<deployment>-<job>-<index>" once the index
+	// is known (the index is not part of the create_vm env per the v2 CPI
+	// spec).
+	initialJobName := extractJobNameFromEnv(parsed.env)
+	initialDeployment := extractDeploymentFromEnv(parsed.env, initialJobName)
+	if initialDeployment == "" {
+		initialDeployment = deps.Config.CreateEnvDeployment
+	}
+	if initialJobName == "" {
+		// create-env path: env has no group/groups. Fall back to the BOSH
+		// instance-group baked into cloud_provider.template.name when it is
+		// detectable from env.bosh.instance.name; otherwise leave blank and
+		// let the "vm-<vmid>" placeholder stand.
+		initialJobName = extractInstanceNameFromEnv(parsed.env)
+	}
+	initialName := composeVMName(deps.Config.VMPrefix, initialDeployment, initialJobName, "")
+
+	return &createVMShape{
+		node:         node,
+		vmStorage:    vmStorage,
+		vmDiskFormat: vmDiskFormat,
+		rootDiskGiB:  rootDiskGiB,
+		cores:        cores,
+		sockets:      sockets,
+		memMiB:       memMiB,
+		hotplug:      hotplug,
+		numaEnabled:  numaEnabled,
+		initialTags:  initialTags,
+		rangeStart:   rangeStart,
+		maxAttempts:  maxAttempts,
+		initialName:  initialName,
+	}, nil
+}
+
+// allocateVM runs AllocateWithRetry: picks a free VMID, calls QEMU.Create,
+// awaits the import task. On conflict or transient errors it retries up to
+// shape.maxAttempts times. Returns the winning vmid.
+func allocateVM(
+	ctx context.Context,
+	deps Deps,
+	logger *log.Logger,
+	parsed *createVMParsedArgs,
+	shape *createVMShape,
+) (int, error) {
 	isRetryable := func(e error) bool {
 		return pve.IsVMIDConflict(e) || pve.IsStorageLockTimeout(e) || pve.IsTransientTransport(e)
 	}
+
 	vmid, err := pve.AllocateWithRetry(ctx, deps.PVE,
 		func(candidate int) error {
-			virtio0Val := fmt.Sprintf("%s:0,import-from=%s,format=%s,size=%dG",
-				vmStorage, rawStemcellCID, vmDiskFormat, rootDiskGiB)
-			candidateName := initialVMName
-			if candidateName == "" {
-				candidateName = fmt.Sprintf("vm-%d", candidate)
-			}
-
-			createParams := map[string]any{
-				"vmid":    candidate,
-				"name":    candidateName,
-				"memory":  memMiB,
-				"cores":   cores,
-				"ostype":  "l26",
-				"scsihw":  "virtio-scsi-pci",
-				"virtio0": virtio0Val,
-				"boot":    "order=virtio0",
-				"agent":   "enabled=1",
-				"hotplug": hotplug,
-				"onboot":  0,
-			}
-			if numaEnabled {
-				createParams["numa"] = 1
-			}
-			if sockets > 1 {
-				createParams["sockets"] = sockets
-			}
-			if initialTags != "" {
-				createParams["tags"] = initialTags
-			}
-
-			upid, cerr := deps.PVE.QEMU().Create(ctx, node, createParams)
-			if cerr != nil {
-				// Classify mutually exclusively so VMID conflicts don't
-				// trigger the transient-transport cleanup path: a "VM N
-				// already exists" 500 satisfies both predicates, but
-				// destroying the conflicting VMID would wipe another
-				// process's in-flight VM.
-				switch {
-				case pve.IsVMIDConflict(cerr):
-					logger.Info("create_vm: vmid conflict, retrying",
-						log.Int("vmid_attempted", candidate),
-					)
-				case pve.IsStorageLockTimeout(cerr):
-					logger.Info("create_vm: storage lock timeout on create, retrying",
-						log.Int("vmid_attempted", candidate),
-					)
-				case pve.IsTransientTransport(cerr):
-					// HTTP 596 or auth-EOF: pvedaemon worker cycled
-					// mid-request. POST may or may not have committed
-					// the VM. Sweep this VMID before the next attempt
-					// so the cluster list is clean.
-					logger.Info("create_vm: transient transport fault on create, retrying",
-						log.Int("vmid_attempted", candidate),
-						log.String("error", cerr.Error()),
-					)
-					cleanupVM(contextWithoutCancel(ctx), deps, node, candidate, logger)
-				}
-				return cerr
-			}
-
-			if werr := pve.AwaitTaskWithLogger(ctx, deps.PVE, node, upid, logger,
-				pve.WithMaxWait(pve.StemcellMaxWait)); werr != nil {
-				if pve.IsVMIDConflict(werr) {
-					logger.Info("create_vm: vmid conflict on await, retrying",
-						log.Int("vmid_attempted", candidate),
-					)
-					return werr
-				}
-				if pve.IsStorageLockTimeout(werr) {
-					logger.Info("create_vm: storage lock timeout on import, retrying",
-						log.Int("vmid_attempted", candidate),
-					)
-					// PVE rolled back its own qmcreate task — but the
-					// VMID may still be registered with the partial
-					// state. Clean up before the next attempt.
-					cleanupVM(contextWithoutCancel(ctx), deps, node, candidate, logger)
-					return werr
-				}
-				if pve.IsTransientTransport(werr) {
-					logger.Info("create_vm: transient transport fault on await, retrying",
-						log.Int("vmid_attempted", candidate),
-						log.String("error", werr.Error()),
-					)
-					// The qmcreate task itself may still be running on
-					// PVE — we only lost the await connection. Clean
-					// up the VMID so a fresh attempt has a clean slate.
-					cleanupVM(contextWithoutCancel(ctx), deps, node, candidate, logger)
-					return werr
-				}
-				// Non-conflict failure after Create succeeded: the VM may
-				// have been partially registered. Roll back this attempt
-				// before propagating so the next retry (which won't run)
-				// or the caller sees a clean slate.
-				cleanupVM(contextWithoutCancel(ctx), deps, node, candidate, logger)
-				return werr
-			}
-
-			logger.Info("create_vm: vm disk imported",
-				log.Int("vmid_attempted", candidate),
-				log.String("upid", upid),
-			)
-			return nil
+			return attemptCreateVM(ctx, deps, logger, parsed, shape, candidate)
 		},
 		isRetryable,
-		maxAttempts,
-		pve.WithRange(rangeStart, deps.Config.VMIDRangeEnd),
+		shape.maxAttempts,
+		pve.WithRange(shape.rangeStart, deps.Config.VMIDRangeEnd),
 		pve.WithBackoffFunc(createVMRetryBackoff),
 	)
-	if err != nil {
-		return nil, cpierrors.Wrap(err, "create_vm: allocate+create VM")
+	return vmid, err
+}
+
+// attemptCreateVM builds the create params for one VMID candidate, calls
+// QEMU.Create, and awaits the task. On retryable failures it logs and
+// optionally cleans up the candidate VMID before returning the error so
+// AllocateWithRetry can retry with a fresh candidate.
+func attemptCreateVM(
+	ctx context.Context,
+	deps Deps,
+	logger *log.Logger,
+	parsed *createVMParsedArgs,
+	shape *createVMShape,
+	candidate int,
+) error {
+	virtio0Val := fmt.Sprintf("%s:0,import-from=%s,format=%s,size=%dG",
+		shape.vmStorage, parsed.rawCID, shape.vmDiskFormat, shape.rootDiskGiB)
+	candidateName := shape.initialName
+	if candidateName == "" {
+		candidateName = fmt.Sprintf("vm-%d", candidate)
 	}
 
-	vmName := initialVMName
-	if vmName == "" {
-		vmName = fmt.Sprintf("vm-%d", vmid)
+	createParams := map[string]any{
+		"vmid":    candidate,
+		"name":    candidateName,
+		"memory":  shape.memMiB,
+		"cores":   shape.cores,
+		"ostype":  "l26",
+		"scsihw":  "virtio-scsi-pci",
+		"virtio0": virtio0Val,
+		"boot":    "order=virtio0",
+		"agent":   "enabled=1",
+		"hotplug": shape.hotplug,
+		"onboot":  0,
+	}
+	if shape.numaEnabled {
+		createParams["numa"] = 1
+	}
+	if shape.sockets > 1 {
+		createParams["sockets"] = shape.sockets
+	}
+	if shape.initialTags != "" {
+		createParams["tags"] = shape.initialTags
 	}
 
-	// Arm rollback for stages 4b–8: any failure after this point destroys
-	// the winning VM.
-	vmCreated := true
-	defer func() {
-		if retErr != nil && vmCreated {
-			cleanupVM(contextWithoutCancel(ctx), deps, node, vmid, logger)
-		}
-	}()
+	upid, cerr := deps.PVE.QEMU().Create(ctx, shape.node, createParams)
+	if cerr != nil {
+		return handleCreateError(ctx, deps, logger, shape.node, candidate, cerr)
+	}
 
-	logger.Info("create_vm: vm created and disk imported",
-		log.Int("vmid", vmid),
-		log.String("stemcell_cid", stemcellCID),
-		log.String("storage", vmStorage),
-		log.Int("root_disk_gib", rootDiskGiB),
+	if werr := pve.AwaitTaskWithLogger(ctx, deps.PVE, shape.node, upid, logger,
+		pve.WithMaxWait(pve.StemcellMaxWait)); werr != nil {
+		return handleAwaitError(ctx, deps, logger, shape.node, candidate, werr)
+	}
+
+	logger.Info("create_vm: vm disk imported",
+		log.Int("vmid_attempted", candidate),
+		log.String("upid", upid),
 	)
+	return nil
+}
 
-	// -----------------------------------------------------------------------
-	// 4b. Grow virtio0 to the requested root disk size.
-	//
-	// PVE silently ignores the `size=<N>G` directive on the import-from
-	// scsi/virtio param when the source image is smaller than N — the new
-	// volume keeps the source image's size (~5 GiB for BOSH stemcells).
-	// Without an explicit resize, the BOSH agent's bootstrap fails at
-	// "Setting up ephemeral disk: Insufficient remaining disk space"
-	// (CreatePartitionIfNoEphemeralDisk=true in the stemcell's agent.json
-	// requires free space at the end of the root disk).
-	// -----------------------------------------------------------------------
-	growGiB := rootDiskGiB - defaultStemcellDiskGiB
-	if growGiB > 0 {
-		// PVE's `qm resize` runs `qemu-img resize` under the per-storage
-		// lockfile (/var/lock/pve-manager/pve-storage-<name>). Under a
-		// concurrent CF deploy this contends with parallel stemcell imports
-		// and other resizes and surfaces as "can't lock file ... got timeout"
-		// in the task log. Retry the whole submit+await with seconds-scale
-		// backoff against the lock holder finishing.
-		rerr := pve.RetryOnTransientOrLock(ctx, logger, "resize_virtio0", maxAttempts, func() error {
-			upid, e := deps.PVE.QEMU().ResizeDisk(ctx, node, vmid, "virtio0", growGiB)
-			if e != nil {
-				return e
-			}
-			if upid == "" {
-				return nil
-			}
-			return pve.AwaitTaskWithLogger(ctx, deps.PVE, node, upid, logger)
-		})
-		if rerr != nil {
-			// Route through WrapError so task-level transients (LVM command
-			// timeouts under VG contention, pmxcfs sync races where the just-
-			// created conf is briefly absent) surface as RetriableCloudError
-			// — director re-issues create_vm with a fresh VMID instead of
-			// failing the deploy.
-			return nil, cpierrors.Wrap(pve.WrapError(rerr),
-				fmt.Sprintf("create_vm: resize virtio0 vmid=%d +%dG", vmid, growGiB))
-		}
-		logger.Info("create_vm: grew virtio0",
-			log.Int("vmid", vmid),
-			log.Int("delta_gib", growGiB),
-			log.Int("final_gib", rootDiskGiB),
+// handleCreateError classifies a QEMU.Create error and logs the appropriate
+// message. It cleans up transient-transport failures (where the POST may have
+// committed) and returns the original error so AllocateWithRetry can retry.
+func handleCreateError(
+	ctx context.Context,
+	deps Deps,
+	logger *log.Logger,
+	node string,
+	candidate int,
+	cerr error,
+) error {
+	// Classify mutually exclusively so VMID conflicts don't
+	// trigger the transient-transport cleanup path: a "VM N
+	// already exists" 500 satisfies both predicates, but
+	// destroying the conflicting VMID would wipe another
+	// process's in-flight VM.
+	switch {
+	case pve.IsVMIDConflict(cerr):
+		logger.Info("create_vm: vmid conflict, retrying",
+			log.Int("vmid_attempted", candidate),
 		)
+	case pve.IsStorageLockTimeout(cerr):
+		logger.Info("create_vm: storage lock timeout on create, retrying",
+			log.Int("vmid_attempted", candidate),
+		)
+	case pve.IsTransientTransport(cerr):
+		// HTTP 596 or auth-EOF: pvedaemon worker cycled
+		// mid-request. POST may or may not have committed
+		// the VM. Sweep this VMID before the next attempt
+		// so the cluster list is clean.
+		logger.Info("create_vm: transient transport fault on create, retrying",
+			log.Int("vmid_attempted", candidate),
+			log.String("error", cerr.Error()),
+		)
+		cleanupVM(contextWithoutCancel(ctx), deps, node, candidate, logger)
 	}
+	return cerr
+}
 
-	// -----------------------------------------------------------------------
-	// 5. Configure NICs from networks map
-	// -----------------------------------------------------------------------
+// handleAwaitError classifies an AwaitTask error after QEMU.Create succeeded.
+// It cleans up partially registered VMIDs for retriable errors and returns the
+// original error so AllocateWithRetry can retry.
+func handleAwaitError(
+	ctx context.Context,
+	deps Deps,
+	logger *log.Logger,
+	node string,
+	candidate int,
+	werr error,
+) error {
+	if pve.IsVMIDConflict(werr) {
+		logger.Info("create_vm: vmid conflict on await, retrying",
+			log.Int("vmid_attempted", candidate),
+		)
+		return werr
+	}
+	if pve.IsStorageLockTimeout(werr) {
+		logger.Info("create_vm: storage lock timeout on import, retrying",
+			log.Int("vmid_attempted", candidate),
+		)
+		// PVE rolled back its own qmcreate task — but the
+		// VMID may still be registered with the partial
+		// state. Clean up before the next attempt.
+		cleanupVM(contextWithoutCancel(ctx), deps, node, candidate, logger)
+		return werr
+	}
+	if pve.IsTransientTransport(werr) {
+		logger.Info("create_vm: transient transport fault on await, retrying",
+			log.Int("vmid_attempted", candidate),
+			log.String("error", werr.Error()),
+		)
+		// The qmcreate task itself may still be running on
+		// PVE — we only lost the await connection. Clean
+		// up the VMID so a fresh attempt has a clean slate.
+		cleanupVM(contextWithoutCancel(ctx), deps, node, candidate, logger)
+		return werr
+	}
+	// Non-conflict failure after Create succeeded: the VM may
+	// have been partially registered. Roll back this attempt
+	// before propagating so the next retry (which won't run)
+	// or the caller sees a clean slate.
+	cleanupVM(contextWithoutCancel(ctx), deps, node, candidate, logger)
+	return werr
+}
+
+// resizeRootDisk grows virtio0 by the delta between rootDiskGiB and the
+// imported stemcell base size. It is a no-op when no growth is needed.
+//
+// PVE silently ignores the `size=<N>G` directive on the import-from
+// scsi/virtio param when the source image is smaller than N — the new
+// volume keeps the source image's size (~5 GiB for BOSH stemcells).
+// Without an explicit resize, the BOSH agent's bootstrap fails at
+// "Setting up ephemeral disk: Insufficient remaining disk space"
+// (CreatePartitionIfNoEphemeralDisk=true in the stemcell's agent.json
+// requires free space at the end of the root disk).
+func resizeRootDisk(
+	ctx context.Context,
+	deps Deps,
+	logger *log.Logger,
+	shape *createVMShape,
+	vmid int,
+) error {
+	growGiB := shape.rootDiskGiB - defaultStemcellDiskGiB
+	if growGiB <= 0 {
+		return nil
+	}
+	// PVE's `qm resize` runs `qemu-img resize` under the per-storage
+	// lockfile (/var/lock/pve-manager/pve-storage-<name>). Under a
+	// concurrent CF deploy this contends with parallel stemcell imports
+	// and other resizes and surfaces as "can't lock file ... got timeout"
+	// in the task log. Retry the whole submit+await with seconds-scale
+	// backoff against the lock holder finishing.
+	rerr := pve.RetryOnTransientOrLock(ctx, logger, "resize_virtio0", shape.maxAttempts, func() error {
+		upid, e := deps.PVE.QEMU().ResizeDisk(ctx, shape.node, vmid, "virtio0", growGiB)
+		if e != nil {
+			return e
+		}
+		if upid == "" {
+			return nil
+		}
+		return pve.AwaitTaskWithLogger(ctx, deps.PVE, shape.node, upid, logger)
+	})
+	if rerr != nil {
+		// Route through WrapError so task-level transients (LVM command
+		// timeouts under VG contention, pmxcfs sync races where the just-
+		// created conf is briefly absent) surface as RetriableCloudError
+		// — director re-issues create_vm with a fresh VMID instead of
+		// failing the deploy.
+		return cpierrors.Wrap(pve.WrapError(rerr),
+			fmt.Sprintf("create_vm: resize virtio0 vmid=%d +%dG", vmid, growGiB))
+	}
+	logger.Info("create_vm: grew virtio0",
+		log.Int("vmid", vmid),
+		log.Int("delta_gib", growGiB),
+		log.Int("final_gib", shape.rootDiskGiB),
+	)
+	return nil
+}
+
+// configureNICs builds and applies the NIC configuration for the new VM from
+// the networks map. Returns the ordered list of network names (used later for
+// MAC extraction) and any error.
+func configureNICs(
+	ctx context.Context,
+	deps Deps,
+	_ *log.Logger,
+	parsed *createVMParsedArgs,
+	shape *createVMShape,
+	vmid int,
+) ([]string, error) {
 	// Build an ordered list of network names for deterministic NIC assignment.
-	netNames := sortedNetworkNames(networks)
+	netNames := sortedNetworkNames(parsed.networks)
 
 	// bridge and model defaults
 	defaultBridge := deps.Config.NetworkBridge
 	if defaultBridge == "" {
 		defaultBridge = "vmbr0"
 	}
-	if cloudProps.NetworkBridge != "" {
-		defaultBridge = cloudProps.NetworkBridge
+	if parsed.cloudProps.NetworkBridge != "" {
+		defaultBridge = parsed.cloudProps.NetworkBridge
 	}
 	defaultModel := "virtio"
-	if cloudProps.NetworkModel != "" {
-		defaultModel = cloudProps.NetworkModel
+	if parsed.cloudProps.NetworkModel != "" {
+		defaultModel = parsed.cloudProps.NetworkModel
 	}
 
 	// Build net map[int]string and ipconfig map[int]string for UpdateQemuConfigParams
@@ -535,7 +738,7 @@ func createVM(
 	firstNS := true
 
 	for i, name := range netNames {
-		spec := networks[name]
+		spec := parsed.networks[name]
 
 		// NIC bridge from cloud_properties within the network spec
 		bridge := defaultBridge
@@ -585,14 +788,24 @@ func createVM(
 		nicParams.Nameserver = &ns
 	}
 
-	if err := deps.PVE.Nodes().UpdateQemuConfig(ctx, node, strconv.Itoa(vmid), nicParams); err != nil {
+	if err := deps.PVE.Nodes().UpdateQemuConfig(ctx, shape.node, strconv.Itoa(vmid), nicParams); err != nil {
 		return nil, cpierrors.Wrap(pve.WrapError(err), fmt.Sprintf("create_vm: configure NICs vmid=%d: %s", vmid, err.Error()))
 	}
 
-	// -----------------------------------------------------------------------
-	// 6. Attach persistent disks (disk_cids pre-attach)
-	// -----------------------------------------------------------------------
-	for _, diskCID := range diskCIDs {
+	return netNames, nil
+}
+
+// attachPersistentDisks attaches each disk CID in parsed.diskCIDs to the VM
+// on the scsi bus.
+func attachPersistentDisks(
+	ctx context.Context,
+	deps Deps,
+	logger *log.Logger,
+	parsed *createVMParsedArgs,
+	shape *createVMShape,
+	vmid int,
+) error {
+	for _, diskCID := range parsed.diskCIDs {
 		if diskCID == "" {
 			continue
 		}
@@ -603,11 +816,11 @@ func createVM(
 		// "scsi0.file: invalid format - unable to parse volume ID ...".
 		// ParseDiskCID is still used to validate the shape.
 		if _, _, parseErr := pve.ParseDiskCID(diskCID); parseErr != nil {
-			return nil, cpierrors.Cloud("create_vm: parse disk_cid %q: %s", diskCID, parseErr.Error())
+			return cpierrors.Cloud("create_vm: parse disk_cid %q: %s", diskCID, parseErr.Error())
 		}
-		diskID, err := deps.PVE.QEMU().AttachDisk(ctx, node, vmid, diskCID, "scsi", nil)
+		diskID, err := deps.PVE.QEMU().AttachDisk(ctx, shape.node, vmid, diskCID, "scsi", nil)
 		if err != nil {
-			return nil, cpierrors.Wrap(pve.WrapError(err), fmt.Sprintf("create_vm: attach disk %q to vmid=%d: %s", diskCID, vmid, err.Error()))
+			return cpierrors.Wrap(pve.WrapError(err), fmt.Sprintf("create_vm: attach disk %q to vmid=%d: %s", diskCID, vmid, err.Error()))
 		}
 		logger.Info("create_vm: attached persistent disk",
 			log.Int("vmid", vmid),
@@ -615,13 +828,22 @@ func createVM(
 			log.String("disk_id", diskID),
 		)
 	}
+	return nil
+}
 
-	// -----------------------------------------------------------------------
-	// 7. Build AgentConfig and call agent.Configure
-	// -----------------------------------------------------------------------
-	agentNetworks := buildAgentNetworks(networks)
-	mbus, blobstore := extractMBusAndBlobstore(env)
-	if bsRaw, ok := env["blobstore"].(map[string]any); ok && len(bsRaw) > 0 && blobstore.Provider == "" {
+// configureAgent builds the agent.AgentConfig and calls deps.Agent.Configure.
+func configureAgent(
+	ctx context.Context,
+	deps Deps,
+	logger *log.Logger,
+	parsed *createVMParsedArgs,
+	shape *createVMShape,
+	vmid int,
+	vmName string,
+) error {
+	agentNetworks := buildAgentNetworks(parsed.networks)
+	mbus, blobstore := extractMBusAndBlobstore(parsed.env)
+	if bsRaw, ok := parsed.env["blobstore"].(map[string]any); ok && len(bsRaw) > 0 && blobstore.Provider == "" {
 		logger.Warn("create_vm: env.blobstore.provider type assertion failed; configuring agent without blobstore",
 			log.String("vm", vmName))
 	}
@@ -648,7 +870,7 @@ func createVM(
 	}
 
 	agentCfg := agent.AgentConfig{
-		AgentID:  agentID,
+		AgentID:  parsed.agentID,
 		Networks: agentNetworks,
 		Disks: agent.DisksSpec{
 			// "/dev/sda" is the *form* the agent's mappedDevicePathResolver
@@ -667,7 +889,7 @@ func createVM(
 			// DevicePathResolver to poll forever for a second disk to appear.
 			Persistent: map[string]string{},
 		},
-		Env:       env,
+		Env:       parsed.env,
 		MBus:      mbus,
 		Blobstore: blobstore,
 		VM: agent.VMSpec{
@@ -676,10 +898,23 @@ func createVM(
 		},
 	}
 
-	if err := deps.Agent.Configure(ctx, node, vmid, agentCfg); err != nil {
-		return nil, cpierrors.Wrap(err, fmt.Sprintf("create_vm: agent configure vmid=%d", vmid))
+	if err := deps.Agent.Configure(ctx, shape.node, vmid, agentCfg); err != nil {
+		return cpierrors.Wrap(err, fmt.Sprintf("create_vm: agent configure vmid=%d", vmid))
 	}
+	return nil
+}
 
+// startVMAndReadConfig starts the VM, awaits the task, reads back PVE config
+// to extract MAC addresses, and returns the populated response networks map.
+func startVMAndReadConfig(
+	ctx context.Context,
+	deps Deps,
+	logger *log.Logger,
+	parsed *createVMParsedArgs,
+	shape *createVMShape,
+	vmid int,
+	netNames []string,
+) (map[string]createVMNetworkSpec, error) {
 	// -----------------------------------------------------------------------
 	// 8. Start VM
 	// -----------------------------------------------------------------------
@@ -689,13 +924,13 @@ func createVM(
 	var startUPID string
 	if err := pve.RetryOnTransient(ctx, logger, "create_vm.start", 0, func() error {
 		var innerErr error
-		startUPID, innerErr = deps.PVE.QEMU().Start(ctx, node, vmid)
+		startUPID, innerErr = deps.PVE.QEMU().Start(ctx, shape.node, vmid)
 		return innerErr
 	}); err != nil {
 		return nil, cpierrors.Cloud("create_vm: start vmid=%d: %s", vmid, err.Error())
 	}
 
-	if err := pve.AwaitTaskWithLogger(ctx, deps.PVE, node, startUPID, logger); err != nil {
+	if err := pve.AwaitTaskWithLogger(ctx, deps.PVE, shape.node, startUPID, logger); err != nil {
 		return nil, cpierrors.Wrap(pve.WrapError(err),
 			fmt.Sprintf("create_vm: await start task vmid=%d", vmid))
 	}
@@ -705,7 +940,7 @@ func createVM(
 	// -----------------------------------------------------------------------
 	// 9. Read back VM config to extract assigned MAC addresses
 	// -----------------------------------------------------------------------
-	vmCfg, err := deps.PVE.QEMU().Config(ctx, node, vmid)
+	vmCfg, err := deps.PVE.QEMU().Config(ctx, shape.node, vmid)
 	if err != nil {
 		// Non-fatal: return networks without MAC rather than rolling back
 		logger.Warn("create_vm: could not read VM config for MAC extraction",
@@ -715,10 +950,7 @@ func createVM(
 		vmCfg = map[string]any{}
 	}
 
-	responseNetworks := buildResponseNetworks(networks, netNames, vmCfg)
-
-	vmCID := strconv.Itoa(vmid)
-	return []any{vmCID, responseNetworks}, nil
+	return buildResponseNetworks(parsed.networks, netNames, vmCfg), nil
 }
 
 // --------------------------------------------------------------------------

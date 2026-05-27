@@ -393,7 +393,7 @@ func TestConfigDrive_Remove_InvalidInputs(t *testing.T) {
 	t.Parallel()
 	a := newISOAgent(nil, nil)
 
-	if err := a.Remove(nil, "pve1", 200); err == nil { //nolint:staticcheck
+	if err := a.Remove(nil, "pve1", 200); err == nil { //nolint:staticcheck // SA1012: intentionally passing nil ctx to exercise nil-context validation
 		t.Error("expected error for nil ctx")
 	}
 	if err := a.Remove(context.Background(), "", 200); err == nil {
@@ -500,7 +500,7 @@ func TestConfigDrive_Configure_InvalidInputs(t *testing.T) {
 	t.Parallel()
 	a := newISOAgent(nil, nil)
 
-	if err := a.Configure(nil, "pve1", 200, baseISOConfig()); err == nil { //nolint:staticcheck
+	if err := a.Configure(nil, "pve1", 200, baseISOConfig()); err == nil { //nolint:staticcheck // SA1012: intentionally passing nil ctx to exercise nil-context validation
 		t.Error("expected error for nil ctx")
 	}
 	if err := a.Configure(context.Background(), "", 200, baseISOConfig()); err == nil {
@@ -597,11 +597,19 @@ func TestConfigure_PromotesCleanupError(t *testing.T) {
 	if !strings.Contains(msg, "cleanup boom") {
 		t.Errorf("error should contain cleanup error text; got: %v", err)
 	}
-	// The attach error must remain unwrappable from the combined error.
-	// Confirm the attach cause is reachable via Unwrap.
-	cause := errors.Unwrap(err)
-	if cause == nil {
-		t.Error("expected non-nil Unwrap on combined error (attach error should be wrapped cause)")
+	// The combined error must expose both wrapped causes via the multi-error
+	// Unwrap() []error interface (produced by fmt.Errorf with two %w verbs,
+	// Go 1.20+). This confirms both the attach error and the cleanup error
+	// are inspectable with errors.Is / errors.As by callers.
+	type multiUnwrapper interface {
+		Unwrap() []error
+	}
+	mu, ok := err.(multiUnwrapper)
+	if !ok {
+		t.Fatalf("expected combined error to implement Unwrap() []error; got %T", err)
+	}
+	if len(mu.Unwrap()) < 2 {
+		t.Errorf("expected at least 2 wrapped causes; got %d", len(mu.Unwrap()))
 	}
 }
 

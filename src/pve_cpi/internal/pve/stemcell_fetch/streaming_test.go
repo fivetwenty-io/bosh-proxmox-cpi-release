@@ -39,6 +39,7 @@ func (f *fakeUploader) Upload(_ context.Context, node, storage, content, filenam
 // TestStreamingSink_HashesCorrectly writes a known string into a StreamingSink
 // and verifies Sum() matches crypto/sha256.
 func TestStreamingSink_HashesCorrectly(t *testing.T) {
+	t.Parallel()
 	payload := "hello, bosh stemcell fetch"
 	sink := NewStreamingSink(strings.NewReader(payload))
 
@@ -63,6 +64,7 @@ func TestStreamingSink_HashesCorrectly(t *testing.T) {
 // TestStreamingSink_ChunkedReads reads in small 32-byte chunks and verifies the
 // final hash is identical to a single-read result.
 func TestStreamingSink_ChunkedReads(t *testing.T) {
+	t.Parallel()
 	payload := bytes.Repeat([]byte("abcdefghijklmnopqrstuvwxyz012345"), 8) // 256 bytes
 	sink := NewStreamingSink(bytes.NewReader(payload))
 
@@ -98,6 +100,7 @@ func TestStreamingSink_ChunkedReads(t *testing.T) {
 // TestStreamToPVE_HappyPath verifies StreamToPVE returns correct sha256, upid,
 // and byte count on a successful upload.
 func TestStreamToPVE_HappyPath(t *testing.T) {
+	t.Parallel()
 	payload := []byte("this is a fake stemcell qcow2 body")
 	uploader := &fakeUploader{upid: "UPID:testnode:00001234:00000001:67890ABC:upload:local:root@pam:"}
 
@@ -146,6 +149,7 @@ func TestStreamToPVE_HappyPath(t *testing.T) {
 // TestStreamToPVE_UploaderError verifies that an uploader error is wrapped
 // with node/storage/filename context.
 func TestStreamToPVE_UploaderError(t *testing.T) {
+	t.Parallel()
 	sentinel := errors.New("PVE API 500")
 	uploader := &fakeUploader{err: sentinel}
 
@@ -175,6 +179,7 @@ func TestStreamToPVE_UploaderError(t *testing.T) {
 
 // TestStreamToPVE_NilUploader verifies the nil-uploader guard.
 func TestStreamToPVE_NilUploader(t *testing.T) {
+	t.Parallel()
 	_, _, _, err := StreamToPVE(
 		context.Background(),
 		nil,
@@ -191,6 +196,7 @@ func TestStreamToPVE_NilUploader(t *testing.T) {
 
 // TestStreamToPVE_EmptyPartialFilename verifies the empty-filename guard.
 func TestStreamToPVE_EmptyPartialFilename(t *testing.T) {
+	t.Parallel()
 	uploader := &fakeUploader{}
 	_, _, _, err := StreamToPVE(
 		context.Background(),

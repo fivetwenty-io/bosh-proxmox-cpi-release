@@ -445,7 +445,7 @@ func TestS3Credentials_Apply(t *testing.T) {
 	t.Parallel()
 
 	c := s3Credentials{AccessKeyID: "AK", SecretAccessKey: "SK"}
-	req, err := http.NewRequest(http.MethodGet, "https://example.com/", nil)
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "https://example.com/", nil)
 	if err != nil {
 		t.Fatalf("build request: %v", err)
 	}

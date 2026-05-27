@@ -86,6 +86,7 @@ func buildResources(vmids ...int) *sdkcluster.ListResourcesResponse {
 // ---- tests ----
 
 func TestNextVMID_FreeInRange(t *testing.T) {
+	t.Parallel()
 	// used: 100, 101, 103; free slots include 102, 104..5999.
 	// With randomised start the returned ID is any free slot in [100,5999].
 	c := newVMIDClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
@@ -105,6 +106,7 @@ func TestNextVMID_FreeInRange(t *testing.T) {
 }
 
 func TestNextVMID_EmptyCluster(t *testing.T) {
+	t.Parallel()
 	// No VMs → returned VMID is somewhere in the VM range.
 	// Randomised start means it is not necessarily VMIDRangeVMStart.
 	c := newVMIDClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
@@ -121,6 +123,7 @@ func TestNextVMID_EmptyCluster(t *testing.T) {
 }
 
 func TestNextVMID_AllUsed(t *testing.T) {
+	t.Parallel()
 	// Fill entire VM range [100..5999].
 	all := make([]int, 0, pve.VMIDRangeVMEnd-pve.VMIDRangeVMStart+1)
 	for i := pve.VMIDRangeVMStart; i <= pve.VMIDRangeVMEnd; i++ {
@@ -137,6 +140,7 @@ func TestNextVMID_AllUsed(t *testing.T) {
 }
 
 func TestNextVMID_CustomRange(t *testing.T) {
+	t.Parallel()
 	// Range [200,250], used [200,201,202]. Free slots: 203..250.
 	// Randomised start means any free slot may be returned; verify in-range and not used.
 	c := newVMIDClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
@@ -156,6 +160,7 @@ func TestNextVMID_CustomRange(t *testing.T) {
 }
 
 func TestNextVMID_CustomRange_AllUsed(t *testing.T) {
+	t.Parallel()
 	// Tiny range [200,202] all used → error.
 	c := newVMIDClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
 		return buildResources(200, 201, 202), nil
@@ -168,6 +173,7 @@ func TestNextVMID_CustomRange_AllUsed(t *testing.T) {
 }
 
 func TestNextDiskVMID_InRange(t *testing.T) {
+	t.Parallel()
 	// 9000 used; any ID in [9001,9999] is valid with randomised start.
 	c := newVMIDClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
 		return buildResources(9000), nil
@@ -186,6 +192,7 @@ func TestNextDiskVMID_InRange(t *testing.T) {
 }
 
 func TestNextVMID_Concurrency(t *testing.T) {
+	t.Parallel()
 	// 100 goroutines call NextVMID against an empty cluster. The process-level
 	// globalVMIDMu serialises them, so there is no data race (verified by -race).
 	// With randomised start each goroutine picks a different offset, so results
@@ -244,6 +251,7 @@ func TestNextVMID_Concurrency(t *testing.T) {
 }
 
 func TestNextVMID_SDKError(t *testing.T) {
+	t.Parallel()
 	c := newVMIDClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
 		return nil, errors.New("connection refused")
 	})
@@ -255,6 +263,7 @@ func TestNextVMID_SDKError(t *testing.T) {
 }
 
 func TestNextVMID_NilContext(t *testing.T) {
+	t.Parallel()
 	c := newVMIDClient(nil)
 	//nolint:staticcheck // intentional nil ctx for validation test
 	_, err := pve.NextVMID(nil, c)
@@ -264,6 +273,7 @@ func TestNextVMID_NilContext(t *testing.T) {
 }
 
 func TestNextVMID_NilClient(t *testing.T) {
+	t.Parallel()
 	_, err := pve.NextVMID(context.Background(), nil)
 	if err == nil {
 		t.Fatal("expected error for nil client, got nil")
@@ -271,6 +281,7 @@ func TestNextVMID_NilClient(t *testing.T) {
 }
 
 func TestNextDiskVMID_NilClient(t *testing.T) {
+	t.Parallel()
 	_, err := pve.NextDiskVMID(context.Background(), nil, "", "")
 	if err == nil {
 		t.Fatal("expected error for nil client, got nil")
@@ -278,6 +289,7 @@ func TestNextDiskVMID_NilClient(t *testing.T) {
 }
 
 func TestNextDiskVMID_NilCtx(t *testing.T) {
+	t.Parallel()
 	c := newVMIDClient(nil)
 	//nolint:staticcheck // intentional nil ctx for validation test
 	_, err := pve.NextDiskVMID(nil, c, "", "")
@@ -287,6 +299,7 @@ func TestNextDiskVMID_NilCtx(t *testing.T) {
 }
 
 func TestNextDiskVMID_AllUsed(t *testing.T) {
+	t.Parallel()
 	all := make([]int, 0, pve.VMIDRangeDiskEnd-pve.VMIDRangeDiskStart+1)
 	for i := pve.VMIDRangeDiskStart; i <= pve.VMIDRangeDiskEnd; i++ {
 		all = append(all, i)
@@ -305,6 +318,7 @@ func TestNextDiskVMID_AllUsed(t *testing.T) {
 // "data:vm-9000-disk-0" with no matching VM must still be treated as used
 // so the next call returns 9001, not 9000.
 func TestNextDiskVMID_UnionsStorageVolumes(t *testing.T) {
+	t.Parallel()
 	c := newVMIDClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
 		// No VMs in the synthetic range — cluster says 9000 is free.
 		return buildResources(), nil
@@ -334,6 +348,7 @@ func TestNextDiskVMID_UnionsStorageVolumes(t *testing.T) {
 // When node/storage are empty, NextDiskVMID falls back to cluster-only
 // scan and never calls ListStorageContent.
 func TestNextDiskVMID_EmptyStorageSkipsScan(t *testing.T) {
+	t.Parallel()
 	c := newVMIDClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
 		return buildResources(), nil
 	})
@@ -357,6 +372,7 @@ func TestNextDiskVMID_EmptyStorageSkipsScan(t *testing.T) {
 // Non-disk volumes on the storage (ISOs, backups) must NOT bleed into the
 // used set. Only names matching vm-NNN-disk-N count.
 func TestNextDiskVMID_IgnoresNonDiskVolumes(t *testing.T) {
+	t.Parallel()
 	c := newVMIDClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
 		return buildResources(), nil
 	})
@@ -384,6 +400,7 @@ func TestNextDiskVMID_IgnoresNonDiskVolumes(t *testing.T) {
 }
 
 func TestAllocateWithRetry_Success(t *testing.T) {
+	t.Parallel()
 	c := newVMIDClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
 		return buildResources(), nil
 	})
@@ -403,6 +420,7 @@ func TestAllocateWithRetry_Success(t *testing.T) {
 }
 
 func TestAllocateWithRetry_ConflictRetry(t *testing.T) {
+	t.Parallel()
 	// First two calls fail with conflict; third succeeds.
 	attempt := 0
 	c := newVMIDClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
@@ -433,6 +451,7 @@ func TestAllocateWithRetry_ConflictRetry(t *testing.T) {
 }
 
 func TestAllocateWithRetry_ExhaustedAttempts(t *testing.T) {
+	t.Parallel()
 	c := newVMIDClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
 		return buildResources(), nil
 	})
@@ -449,6 +468,7 @@ func TestAllocateWithRetry_ExhaustedAttempts(t *testing.T) {
 }
 
 func TestAllocateWithRetry_NonConflictError(t *testing.T) {
+	t.Parallel()
 	c := newVMIDClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
 		return buildResources(), nil
 	})
@@ -465,6 +485,7 @@ func TestAllocateWithRetry_NonConflictError(t *testing.T) {
 }
 
 func TestAllocateWithRetry_NilCreateFunc(t *testing.T) {
+	t.Parallel()
 	c := newVMIDClient(nil)
 	_, err := pve.AllocateWithRetry(context.Background(), c, nil, nil, 3)
 	if err == nil {
@@ -473,6 +494,7 @@ func TestAllocateWithRetry_NilCreateFunc(t *testing.T) {
 }
 
 func TestNextVMID_WithRange_InvalidIgnored(t *testing.T) {
+	t.Parallel()
 	// Invalid range (start > end) is ignored; default VM range applies.
 	// With randomised start and empty cluster, result is anywhere in default VM range.
 	c := newVMIDClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
@@ -489,6 +511,7 @@ func TestNextVMID_WithRange_InvalidIgnored(t *testing.T) {
 }
 
 func TestNextVMID_MalformedJSONSkipped(t *testing.T) {
+	t.Parallel()
 	// One malformed JSON entry must be skipped; allocation proceeds over remaining.
 	// used: {101}; free: all of [100,5999] except 101.
 	malformed := sdkcluster.ListResourcesResponse{
@@ -512,6 +535,7 @@ func TestNextVMID_MalformedJSONSkipped(t *testing.T) {
 }
 
 func TestNextVMID_GapAtStart(t *testing.T) {
+	t.Parallel()
 	// used: 101 only; free: 100, 102..5999.
 	// Randomised start; any free slot in the VM range is valid.
 	c := newVMIDClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
@@ -531,6 +555,7 @@ func TestNextVMID_GapAtStart(t *testing.T) {
 }
 
 func TestNextVMID_VmidsOutsideRangeIgnored(t *testing.T) {
+	t.Parallel()
 	// VMIDs in the disk range (9000+) must not block the VM range.
 	// All of [VMIDRangeVMStart,VMIDRangeVMEnd] is free; returned ID is anywhere in that range.
 	c := newVMIDClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
@@ -547,6 +572,7 @@ func TestNextVMID_VmidsOutsideRangeIgnored(t *testing.T) {
 }
 
 func TestVMIDRange_VMEndIs5999(t *testing.T) {
+	t.Parallel()
 	if pve.VMIDRangeVMEnd != 5999 {
 		t.Errorf("VMIDRangeVMEnd: expected 5999, got %d", pve.VMIDRangeVMEnd)
 	}
@@ -555,6 +581,7 @@ func TestVMIDRange_VMEndIs5999(t *testing.T) {
 // TestNextVMID_5500Allocatable verifies that VMIDs in [5500,5999], formerly in the
 // stemcell sub-range, are now allocatable as regular VM VMIDs.
 func TestNextVMID_5500Allocatable(t *testing.T) {
+	t.Parallel()
 	// Fill 100..5499; only 5500..5999 remain free.
 	all := make([]int, 0, 5500-100)
 	for i := 100; i < 5500; i++ {
@@ -575,6 +602,7 @@ func TestNextVMID_5500Allocatable(t *testing.T) {
 }
 
 func TestAllocateWithRetry_ZeroAttempts(t *testing.T) {
+	t.Parallel()
 	// maxAttempts ≤ 0 is normalized to 3; conflict on every call → exhausted.
 	c := newVMIDClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
 		return buildResources(), nil
@@ -599,6 +627,7 @@ func TestAllocateWithRetry_ZeroAttempts(t *testing.T) {
 }
 
 func TestNextVMID_NilListResourcesResponse(t *testing.T) {
+	t.Parallel()
 	c := newVMIDClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
 		return nil, nil
 	})
@@ -611,6 +640,7 @@ func TestNextVMID_NilListResourcesResponse(t *testing.T) {
 
 // WithNoBackoff exercises the deterministic, no-sleep retry path.
 func TestAllocateWithRetry_NoBackoff(t *testing.T) {
+	t.Parallel()
 	c := newVMIDClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
 		return buildResources(), nil
 	})
@@ -641,6 +671,7 @@ func TestAllocateWithRetry_NoBackoff(t *testing.T) {
 }
 
 func TestAllocateDiskWithRetry_Success(t *testing.T) {
+	t.Parallel()
 	c := newVMIDClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
 		return buildResources(), nil
 	})
@@ -664,6 +695,7 @@ func TestAllocateDiskWithRetry_Success(t *testing.T) {
 }
 
 func TestAllocateDiskWithRetry_ConflictThenSuccess(t *testing.T) {
+	t.Parallel()
 	c := newVMIDClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
 		return buildResources(), nil
 	})
@@ -694,6 +726,7 @@ func TestAllocateDiskWithRetry_ConflictThenSuccess(t *testing.T) {
 }
 
 func TestAllocateDiskWithRetry_Exhausted(t *testing.T) {
+	t.Parallel()
 	c := newVMIDClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
 		return buildResources(), nil
 	})
@@ -711,6 +744,7 @@ func TestAllocateDiskWithRetry_Exhausted(t *testing.T) {
 }
 
 func TestAllocateDiskWithRetry_NilCreateFunc(t *testing.T) {
+	t.Parallel()
 	c := newVMIDClient(nil)
 	_, err := pve.AllocateDiskWithRetry(context.Background(), c, "", "", nil, nil, 3)
 	if err == nil {
@@ -719,6 +753,7 @@ func TestAllocateDiskWithRetry_NilCreateFunc(t *testing.T) {
 }
 
 func TestNextVMID_VmidNullField(t *testing.T) {
+	t.Parallel()
 	// JSON entry where vmid is null must be skipped (pointer nil).
 	// used: {100}; free: 101..5999 plus any others in the VM range.
 	entry := sdkcluster.ListResourcesResponse{
@@ -746,6 +781,7 @@ func TestNextVMID_VmidNullField(t *testing.T) {
 // TestNextVMIDInRange_AllFreeInRange verifies that with all slots free in a
 // small range the returned VMID lands within that range.
 func TestNextVMIDInRange_AllFreeInRange(t *testing.T) {
+	t.Parallel()
 	const rangeStart, rangeEnd = 100, 199
 	c := newVMIDClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
 		return buildResources(), nil
@@ -764,6 +800,7 @@ func TestNextVMIDInRange_AllFreeInRange(t *testing.T) {
 // are used except one, that one ID is always returned regardless of where
 // the random scan starts. Runs multiple iterations to defeat luck.
 func TestNextVMIDInRange_OnlyOneSlotFree(t *testing.T) {
+	t.Parallel()
 	const rangeStart, rangeEnd, freeID = 100, 199, 150
 	all := make([]int, 0, rangeEnd-rangeStart)
 	for i := rangeStart; i <= rangeEnd; i++ {
@@ -791,6 +828,7 @@ func TestNextVMIDInRange_OnlyOneSlotFree(t *testing.T) {
 // TestNextVMIDInRange_ExhaustedRange verifies that a fully-used range returns
 // an error. Uses multi-element ranges so WithRange accepts them (requires end > start).
 func TestNextVMIDInRange_ExhaustedRange(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name  string
 		used  []int
@@ -828,6 +866,7 @@ func TestNextVMIDInRange_ExhaustedRange(t *testing.T) {
 // confirming the randomised start scatters allocations rather than always
 // returning the same ID.
 func TestNextVMIDInRange_SpreadCheck(t *testing.T) {
+	t.Parallel()
 	const rangeStart, rangeEnd = 100, 1099
 	c := newVMIDClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
 		return buildResources(), nil
@@ -860,6 +899,7 @@ func TestNextVMIDInRange_SpreadCheck(t *testing.T) {
 // block on the mutex until the first goroutine's stalled API call completes,
 // making this test deadlock or time out.
 func TestNextVMID_LockNotHeldDuringAPICall(t *testing.T) {
+	t.Parallel()
 	// gate controls when the first goroutine's API call unblocks.
 	gate := make(chan struct{})
 	// firstStarted is closed once goroutine-1's API call has begun.
@@ -937,6 +977,7 @@ func TestNextVMID_LockNotHeldDuringAPICall(t *testing.T) {
 // the test timeout); the context is cancelled within 100ms. The call must
 // return well before the 10s sleep completes.
 func TestRetryBackoff_RespectsContextCancel(t *testing.T) {
+	t.Parallel()
 	c := newVMIDClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
 		return buildResources(), nil
 	})

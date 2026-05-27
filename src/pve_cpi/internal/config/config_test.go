@@ -61,6 +61,7 @@ func assertCloudError(t *testing.T, err error, contains string) {
 // --------------------------------------------------------------------------
 
 func TestLoad_Valid(t *testing.T) {
+	t.Parallel()
 	cfg, err := config.LoadFile("testdata/valid.json")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -110,6 +111,7 @@ func TestLoad_Valid(t *testing.T) {
 // --------------------------------------------------------------------------
 
 func TestLoad_MissingRequired(t *testing.T) {
+	t.Parallel()
 	_, err := config.LoadFile("testdata/invalid_missing_host.json")
 	assertCloudError(t, err, "host is required")
 }
@@ -119,6 +121,7 @@ func TestLoad_MissingRequired(t *testing.T) {
 // --------------------------------------------------------------------------
 
 func TestValidate_AgentModeInvalid(t *testing.T) {
+	t.Parallel()
 	_, err := mustLoad(t, `{
 		"host": "h", "user": "u", "password": "p",
 		"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
@@ -132,6 +135,7 @@ func TestValidate_AgentModeInvalid(t *testing.T) {
 // --------------------------------------------------------------------------
 
 func TestValidate_AuthMissing(t *testing.T) {
+	t.Parallel()
 	_, err := mustLoad(t, `{
 		"host": "h", "user": "u",
 		"vm_storage": "s", "disk_storage": "s", "network_bridge": "br"
@@ -144,6 +148,7 @@ func TestValidate_AuthMissing(t *testing.T) {
 // --------------------------------------------------------------------------
 
 func TestValidate_AuthBoth(t *testing.T) {
+	t.Parallel()
 	cfg, err := mustLoad(t, `{
 		"host": "h", "user": "u",
 		"password": "pw", "api_token": "tok",
@@ -167,6 +172,7 @@ func TestValidate_AuthBoth(t *testing.T) {
 // --------------------------------------------------------------------------
 
 func TestValidate_RegistryRequiresFields(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name    string
 		json    string
@@ -216,6 +222,7 @@ func TestValidate_RegistryRequiresFields(t *testing.T) {
 // --------------------------------------------------------------------------
 
 func TestApplyDefaults_AllFields(t *testing.T) {
+	t.Parallel()
 	// Construct a zeroed config; ApplyDefaults fills everything.
 	var cfg config.CPIConfig
 	// VMStorage must be non-empty for StemcellStorage fallback to land on it.
@@ -258,6 +265,7 @@ func TestApplyDefaults_AllFields(t *testing.T) {
 // TestApplyDefaults_VerifySSLExplicitFalse ensures ApplyDefaults does not
 // overwrite an explicitly-set *false — the historical silent-overwrite bug.
 func TestApplyDefaults_VerifySSLExplicitFalse(t *testing.T) {
+	t.Parallel()
 	var cfg config.CPIConfig
 	cfg.VMStorage = "vm-store"
 	cfg.VerifySSL = boolPtr(false)
@@ -276,6 +284,7 @@ func TestApplyDefaults_VerifySSLExplicitFalse(t *testing.T) {
 // --------------------------------------------------------------------------
 
 func TestApplyDefaults_StemcellFallback(t *testing.T) {
+	t.Parallel()
 	var cfg config.CPIConfig
 	cfg.VMStorage = "local-lvm"
 	// StemcellStorage deliberately left empty.
@@ -288,6 +297,7 @@ func TestApplyDefaults_StemcellFallback(t *testing.T) {
 
 // TestApplyDefaults_StemcellNotOverwritten ensures an explicit StemcellStorage is preserved.
 func TestApplyDefaults_StemcellNotOverwritten(t *testing.T) {
+	t.Parallel()
 	var cfg config.CPIConfig
 	cfg.VMStorage = "local-lvm"
 	cfg.StemcellStorage = "local"
@@ -303,6 +313,7 @@ func TestApplyDefaults_StemcellNotOverwritten(t *testing.T) {
 // --------------------------------------------------------------------------
 
 func TestLoadFile_FileNotFound(t *testing.T) {
+	t.Parallel()
 	_, err := config.LoadFile("/nonexistent/path/config.json")
 	assertCloudError(t, err, "config: open")
 }
@@ -312,6 +323,7 @@ func TestLoadFile_FileNotFound(t *testing.T) {
 // --------------------------------------------------------------------------
 
 func TestLoadFile_MalformedJSON(t *testing.T) {
+	t.Parallel()
 	_, err := config.Load(strings.NewReader(`{this is not json}`))
 	assertCloudError(t, err, "config: decode failed")
 }
@@ -321,6 +333,7 @@ func TestLoadFile_MalformedJSON(t *testing.T) {
 // --------------------------------------------------------------------------
 
 func TestValidate_VMDiskFormatInvalid(t *testing.T) {
+	t.Parallel()
 	_, err := mustLoad(t, `{
 		"host":"h","user":"u","password":"p",
 		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
@@ -334,6 +347,7 @@ func TestValidate_VMDiskFormatInvalid(t *testing.T) {
 // --------------------------------------------------------------------------
 
 func TestValidate_LogLevelInvalid(t *testing.T) {
+	t.Parallel()
 	_, err := mustLoad(t, `{
 		"host":"h","user":"u","password":"p",
 		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
@@ -347,6 +361,7 @@ func TestValidate_LogLevelInvalid(t *testing.T) {
 // --------------------------------------------------------------------------
 
 func TestValidate_VMIDRangeStartTooLow(t *testing.T) {
+	t.Parallel()
 	_, err := mustLoad(t, `{
 		"host":"h","user":"u","password":"p",
 		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
@@ -360,6 +375,7 @@ func TestValidate_VMIDRangeStartTooLow(t *testing.T) {
 // --------------------------------------------------------------------------
 
 func TestValidate_PortInvalid(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name string
 		port int
@@ -394,6 +410,7 @@ func TestValidate_PortInvalid(t *testing.T) {
 // --------------------------------------------------------------------------
 
 func TestLoad_APIToken(t *testing.T) {
+	t.Parallel()
 	cfg, err := mustLoad(t, `{
 		"host":"pve.example.com","user":"root@pam","api_token":"PVEAPIToken=root@pam!mytoken=abc123",
 		"vm_storage":"local-lvm","disk_storage":"local-lvm","network_bridge":"vmbr0"
@@ -414,6 +431,7 @@ func TestLoad_APIToken(t *testing.T) {
 // --------------------------------------------------------------------------
 
 func TestValidate_MultipleErrors(t *testing.T) {
+	t.Parallel()
 	// Craft a config with multiple simultaneous failures.
 	cfg := &config.CPIConfig{
 		// Host, User, VMStorage, DiskStorage, NetworkBridge all empty.
@@ -444,6 +462,7 @@ func TestValidate_MultipleErrors(t *testing.T) {
 // TestApplyDefaults_RebootFields verifies that ApplyDefaults fills in the
 // reboot_mode and reboot_timeout defaults when both fields are absent.
 func TestApplyDefaults_RebootFields(t *testing.T) {
+	t.Parallel()
 	var cfg config.CPIConfig
 	cfg.VMStorage = "vm-store"
 	cfg.ApplyDefaults()
@@ -462,6 +481,7 @@ func TestApplyDefaults_RebootFields(t *testing.T) {
 
 // TestApplyDefaults_RebootFieldsExplicit ensures explicit values survive ApplyDefaults.
 func TestApplyDefaults_RebootFieldsExplicit(t *testing.T) {
+	t.Parallel()
 	var cfg config.CPIConfig
 	cfg.VMStorage = "vm-store"
 	cfg.RebootMode = "hard"
@@ -481,6 +501,7 @@ func TestApplyDefaults_RebootFieldsExplicit(t *testing.T) {
 // --------------------------------------------------------------------------
 
 func TestValidate_RebootModeInvalid(t *testing.T) {
+	t.Parallel()
 	_, err := mustLoad(t, `{
 		"host":"h","user":"u","password":"p",
 		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
@@ -496,6 +517,7 @@ func TestValidate_RebootModeInvalid(t *testing.T) {
 // TestValidate_RebootTimeoutZeroDefaulted confirms reboot_timeout=0 (absent from JSON)
 // is defaulted to 60 before Validate runs, so no validation error fires.
 func TestValidate_RebootTimeoutZeroDefaulted(t *testing.T) {
+	t.Parallel()
 	cfg, err := mustLoad(t, `{
 		"host":"h","user":"u","password":"p",
 		"vm_storage":"s","disk_storage":"s","network_bridge":"br"
@@ -513,6 +535,7 @@ func TestValidate_RebootTimeoutZeroDefaulted(t *testing.T) {
 // --------------------------------------------------------------------------
 
 func TestValidate_RebootTimeoutTooLarge(t *testing.T) {
+	t.Parallel()
 	// Must construct manually and call Validate after ApplyDefaults to force
 	// an out-of-range value through without JSON decode clamping it.
 	cfg := &config.CPIConfig{
@@ -540,6 +563,7 @@ func TestValidate_RebootTimeoutTooLarge(t *testing.T) {
 // --------------------------------------------------------------------------
 
 func TestLoad_RegistryMode_Valid(t *testing.T) {
+	t.Parallel()
 	cfg, err := mustLoad(t, `{
 		"host":"h","user":"u","password":"p",
 		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
@@ -562,6 +586,7 @@ func TestLoad_RegistryMode_Valid(t *testing.T) {
 
 // TestApplyDefaults_VMIDRangeEnd verifies VMIDRangeEnd defaults to 5999 when absent.
 func TestApplyDefaults_VMIDRangeEnd(t *testing.T) {
+	t.Parallel()
 	var cfg config.CPIConfig
 	cfg.VMStorage = "vm-store"
 	cfg.ApplyDefaults()
@@ -574,6 +599,7 @@ func TestApplyDefaults_VMIDRangeEnd(t *testing.T) {
 // TestApplyDefaults_VMIDRangeEndNotOverwritten ensures an explicit VMIDRangeEnd
 // is preserved by ApplyDefaults.
 func TestApplyDefaults_VMIDRangeEndNotOverwritten(t *testing.T) {
+	t.Parallel()
 	var cfg config.CPIConfig
 	cfg.VMStorage = "vm-store"
 	cfg.VMIDRangeEnd = 3000
@@ -590,6 +616,7 @@ func TestApplyDefaults_VMIDRangeEndNotOverwritten(t *testing.T) {
 
 // TestLoad_VMIDRangeEndOverride confirms that vmid_range_end from JSON is honored.
 func TestLoad_VMIDRangeEndOverride(t *testing.T) {
+	t.Parallel()
 	cfg, err := mustLoad(t, `{
 		"host":"h","user":"u","password":"p",
 		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
@@ -609,6 +636,7 @@ func TestLoad_VMIDRangeEndOverride(t *testing.T) {
 
 // TestValidate_VMIDRangeEndEqualToStart confirms end == start is rejected.
 func TestValidate_VMIDRangeEndEqualToStart(t *testing.T) {
+	t.Parallel()
 	cfg := &config.CPIConfig{
 		Host:           "h",
 		User:           "u",
@@ -631,6 +659,7 @@ func TestValidate_VMIDRangeEndEqualToStart(t *testing.T) {
 
 // TestValidate_VMIDRangeEndBelowStart confirms end < start is rejected.
 func TestValidate_VMIDRangeEndBelowStart(t *testing.T) {
+	t.Parallel()
 	cfg := &config.CPIConfig{
 		Host:           "h",
 		User:           "u",
@@ -653,6 +682,7 @@ func TestValidate_VMIDRangeEndBelowStart(t *testing.T) {
 
 // TestValidate_VMIDRangeEndTooHigh confirms end > 9999 is rejected.
 func TestValidate_VMIDRangeEndTooHigh(t *testing.T) {
+	t.Parallel()
 	cfg := &config.CPIConfig{
 		Host:           "h",
 		User:           "u",
@@ -675,6 +705,7 @@ func TestValidate_VMIDRangeEndTooHigh(t *testing.T) {
 
 // TestValidate_VMIDRangeEndAt9999 confirms end == 9999 is valid.
 func TestValidate_VMIDRangeEndAt9999(t *testing.T) {
+	t.Parallel()
 	cfg, err := mustLoad(t, `{
 		"host":"h","user":"u","password":"p",
 		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
@@ -696,6 +727,7 @@ func TestValidate_VMIDRangeEndAt9999(t *testing.T) {
 // (Go zero-value; ApplyDefaults has no explicit step for them — this test verifies
 // that no accidental default-to-true was introduced).
 func TestApplyDefaults_SnapshotGuardBools(t *testing.T) {
+	t.Parallel()
 	var cfg config.CPIConfig
 	cfg.VMStorage = "vm-store"
 	cfg.ApplyDefaults()
@@ -719,6 +751,7 @@ func TestApplyDefaults_SnapshotGuardBools(t *testing.T) {
 // TestApplyDefaults_NetworkMode_DefaultsToAuto verifies that a zero-value
 // CPIConfig gets NetworkMode="auto" after ApplyDefaults.
 func TestApplyDefaults_NetworkMode_DefaultsToAuto(t *testing.T) {
+	t.Parallel()
 	var cfg config.CPIConfig
 	cfg.VMStorage = "vm-store"
 	cfg.ApplyDefaults()
@@ -735,6 +768,7 @@ func TestApplyDefaults_NetworkMode_DefaultsToAuto(t *testing.T) {
 // TestApplyDefaults_SDNZoneType_DefaultsToSimple verifies that a zero-value
 // CPIConfig gets SDNZoneType="simple" after ApplyDefaults.
 func TestApplyDefaults_SDNZoneType_DefaultsToSimple(t *testing.T) {
+	t.Parallel()
 	var cfg config.CPIConfig
 	cfg.VMStorage = "vm-store"
 	cfg.ApplyDefaults()
@@ -749,6 +783,7 @@ func TestApplyDefaults_SDNZoneType_DefaultsToSimple(t *testing.T) {
 // --------------------------------------------------------------------------
 
 func TestValidate_NetworkMode_InvalidEnum(t *testing.T) {
+	t.Parallel()
 	_, err := mustLoad(t, `{
 		"host":"h","user":"u","password":"p",
 		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
@@ -762,6 +797,7 @@ func TestValidate_NetworkMode_InvalidEnum(t *testing.T) {
 // --------------------------------------------------------------------------
 
 func TestValidate_NetworkMode_ValidValues(t *testing.T) {
+	t.Parallel()
 	for _, mode := range []string{"sdn", "bridge", "auto"} {
 		t.Run(mode, func(t *testing.T) {
 			_, err := mustLoad(t, `{
@@ -781,6 +817,7 @@ func TestValidate_NetworkMode_ValidValues(t *testing.T) {
 // --------------------------------------------------------------------------
 
 func TestValidate_SDNZoneType_InvalidEnum_WhenSDNMode(t *testing.T) {
+	t.Parallel()
 	_, err := mustLoad(t, `{
 		"host":"h","user":"u","password":"p",
 		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
@@ -796,6 +833,7 @@ func TestValidate_SDNZoneType_InvalidEnum_WhenSDNMode(t *testing.T) {
 // TestValidate_SDNZoneType_NotValidated_WhenBridgeMode confirms that an invalid
 // sdn_zone_type is not rejected when network_mode="bridge" (SDN path unreachable).
 func TestValidate_SDNZoneType_NotValidated_WhenBridgeMode(t *testing.T) {
+	t.Parallel()
 	_, err := mustLoad(t, `{
 		"host":"h","user":"u","password":"p",
 		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
@@ -813,6 +851,7 @@ func TestValidate_SDNZoneType_NotValidated_WhenBridgeMode(t *testing.T) {
 // TestLoad_NetworkFields_RoundTrip verifies all four SDN config fields parse
 // correctly from JSON.
 func TestLoad_NetworkFields_RoundTrip(t *testing.T) {
+	t.Parallel()
 	cfg, err := mustLoad(t, `{
 		"host":"h","user":"u","password":"p",
 		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
@@ -850,6 +889,7 @@ func TestLoad_NetworkFields_RoundTrip(t *testing.T) {
 // containing an unrecognized field ("future_field") decodes successfully
 // and returns a valid config. The unknown field is ignored (forward-compat).
 func TestLoad_UnknownFields_LogsWarn_StillLoads(t *testing.T) {
+	t.Parallel()
 	cfg, err := mustLoad(t, `{
 		"host":"h","user":"u","password":"p",
 		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
@@ -870,6 +910,7 @@ func TestLoad_UnknownFields_LogsWarn_StillLoads(t *testing.T) {
 // TestLoad_NetworkMode_Omitted_GetsAuto confirms that omitting network_mode
 // from JSON results in NetworkMode="auto" after Load applies defaults.
 func TestLoad_NetworkMode_Omitted_GetsAuto(t *testing.T) {
+	t.Parallel()
 	cfg, err := mustLoad(t, `{
 		"host":"h","user":"u","password":"p",
 		"vm_storage":"s","disk_storage":"s","network_bridge":"br"
@@ -889,6 +930,7 @@ func TestLoad_NetworkMode_Omitted_GetsAuto(t *testing.T) {
 // TestLoad_SnapshotGuardBools confirms that explicit true values are honored
 // through JSON decode and that absent fields remain false.
 func TestLoad_SnapshotGuardBools(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name        string
 		json        string
@@ -989,6 +1031,7 @@ func registryBaseCfg() *config.CPIConfig {
 // would cause repeated Validate calls in diagnostic code to silently clear a
 // caller-provided password, which is surprising and hides bugs.
 func TestValidate_DoesNotMutatePassword(t *testing.T) {
+	t.Parallel()
 	cfg := &config.CPIConfig{
 		Host:           "h",
 		User:           "u",
@@ -1055,6 +1098,7 @@ func TestValidate_DoesNotMutatePassword(t *testing.T) {
 // the token wins and the password is cleared so downstream code never sends
 // stale Basic Auth credentials alongside a token.
 func TestApplyDefaults_BothCredentialsTokenWins(t *testing.T) {
+	t.Parallel()
 	var cfg config.CPIConfig
 	cfg.VMStorage = "vm-store"
 	cfg.Password = "foo"
@@ -1070,6 +1114,7 @@ func TestApplyDefaults_BothCredentialsTokenWins(t *testing.T) {
 }
 
 func TestValidate_RegistryHTTPRejected(t *testing.T) {
+	t.Parallel()
 	cfg := registryBaseCfg()
 	cfg.RegistryEndpoint = "http://registry.example.com:25777"
 	// RegistryAllowInsecure left false (default).
@@ -1086,6 +1131,7 @@ func TestValidate_RegistryHTTPRejected(t *testing.T) {
 }
 
 func TestValidate_RegistryHTTPAllowedWithOptIn(t *testing.T) {
+	t.Parallel()
 	cfg := registryBaseCfg()
 	cfg.RegistryEndpoint = "http://registry.example.com:25777"
 	cfg.RegistryAllowInsecure = true
@@ -1121,6 +1167,7 @@ func TestValidate_RegistryHTTPAllowedWithOptIn(t *testing.T) {
 }
 
 func TestValidate_RegistryHTTPSAccepted(t *testing.T) {
+	t.Parallel()
 	cfg := registryBaseCfg()
 	cfg.RegistryEndpoint = "https://registry.example.com:25777"
 
@@ -1130,6 +1177,7 @@ func TestValidate_RegistryHTTPSAccepted(t *testing.T) {
 }
 
 func TestValidate_NonRegistryModeIgnoresInsecureFlag(t *testing.T) {
+	t.Parallel()
 	cfg := registryBaseCfg()
 	cfg.AgentMode = "cloudinit"
 	// Registry endpoint left set with http:// — must be ignored entirely because
@@ -1143,6 +1191,7 @@ func TestValidate_NonRegistryModeIgnoresInsecureFlag(t *testing.T) {
 }
 
 func TestValidate_RegistryRejectsUnknownSchemeEvenWithOptIn(t *testing.T) {
+	t.Parallel()
 	cfg := registryBaseCfg()
 	cfg.RegistryEndpoint = "ftp://registry.example.com"
 	cfg.RegistryAllowInsecure = true
@@ -1157,6 +1206,7 @@ func TestValidate_RegistryRejectsUnknownSchemeEvenWithOptIn(t *testing.T) {
 }
 
 func TestValidate_RegistryRejectsMissingScheme(t *testing.T) {
+	t.Parallel()
 	cfg := registryBaseCfg()
 	cfg.RegistryEndpoint = "registry.example.com:25777"
 
@@ -1170,6 +1220,7 @@ func TestValidate_RegistryRejectsMissingScheme(t *testing.T) {
 }
 
 func TestValidateWithLogger_NilLoggerStillSucceedsOnHTTPSPath(t *testing.T) {
+	t.Parallel()
 	// Regression: ValidateWithLogger(nil) must behave identically to Validate()
 	// for the https success path (no warning to emit, so no logger needed).
 	cfg := registryBaseCfg()
@@ -1188,6 +1239,7 @@ func TestValidateWithLogger_NilLoggerStillSucceedsOnHTTPSPath(t *testing.T) {
 // override survives ApplyDefaults, and the empty-string "disabled" override
 // is honored verbatim.
 func TestHotplugValue_DefaultsAndOverrides(t *testing.T) {
+	t.Parallel()
 	t.Run("nil pointer returns canonical default", func(t *testing.T) {
 		var cfg config.CPIConfig
 		if got := cfg.HotplugValue(); got != "network,disk,cpu,memory" {
@@ -1275,6 +1327,7 @@ func TestHotplugValue_DefaultsAndOverrides(t *testing.T) {
 // requires numa=1 at create time) and that an explicit false override is
 // preserved through ApplyDefaults.
 func TestNUMAValue_DefaultTrue(t *testing.T) {
+	t.Parallel()
 	t.Run("nil pointer returns true", func(t *testing.T) {
 		var cfg config.CPIConfig
 		if !cfg.NUMAValue() {

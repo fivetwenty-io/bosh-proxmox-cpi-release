@@ -1,4 +1,3 @@
-// Package handlers contains the 22 BOSH CPI v2 method implementations.
 package handlers
 
 import (
@@ -143,7 +142,7 @@ func HandleResizeDisk(deps Deps) Handler {
 		// ----------------------------------------------------------------
 		cfg, err := deps.PVE.QEMU().Config(ctx, node, vmid)
 		if err != nil {
-			return nil, cpierrors.Wrap(err, fmt.Sprintf("resize_disk: failed to read VM %d config", vmid))
+			return nil, cpierrors.Wrap(err, fmt.Sprintf("resize_disk: read VM %d config", vmid))
 		}
 
 		diskOptStr, ok := cfg[diskID].(string)

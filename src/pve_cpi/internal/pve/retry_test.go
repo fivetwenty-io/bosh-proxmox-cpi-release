@@ -10,6 +10,7 @@ import (
 )
 
 func TestRetryOnStorageLock_SucceedsImmediately(t *testing.T) {
+	t.Parallel()
 	calls := 0
 	err := RetryOnStorageLock(context.Background(), nil, "test", 5, func() error {
 		calls++
@@ -24,6 +25,7 @@ func TestRetryOnStorageLock_SucceedsImmediately(t *testing.T) {
 }
 
 func TestRetryOnStorageLock_NonLockErrorPropagates(t *testing.T) {
+	t.Parallel()
 	want := errors.New("some other failure")
 	calls := 0
 	err := RetryOnStorageLock(context.Background(), nil, "test", 5, func() error {
@@ -39,6 +41,7 @@ func TestRetryOnStorageLock_NonLockErrorPropagates(t *testing.T) {
 }
 
 func TestRetryOnStorageLock_LockTimeoutRetriesThenSucceeds(t *testing.T) {
+	t.Parallel()
 	// Override sleep so the test does not actually wait through the
 	// exponential backoff. We can't stub StorageLockBackoff directly but
 	// we can keep attempts low and rely on test runner being patient (max
@@ -71,6 +74,7 @@ func TestRetryOnStorageLock_LockTimeoutRetriesThenSucceeds(t *testing.T) {
 }
 
 func TestRetryOnStorageLock_ExhaustsAndReturnsLastErr(t *testing.T) {
+	t.Parallel()
 	calls := 0
 	lockErr := errors.New("CAN'T LOCK FILE ... GOT TIMEOUT")
 	err := RetryOnStorageLock(context.Background(), nil, "test", 2, func() error {
@@ -86,6 +90,7 @@ func TestRetryOnStorageLock_ExhaustsAndReturnsLastErr(t *testing.T) {
 }
 
 func TestRetryOnStorageLock_ContextCancelShortCircuits(t *testing.T) {
+	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())
 	calls := 0
 	lockErr := errors.New("can't lock file 'x' - got timeout")
@@ -112,6 +117,7 @@ func TestRetryOnStorageLock_ContextCancelShortCircuits(t *testing.T) {
 }
 
 func TestRetryOnStorageLock_ZeroMaxAttemptsUsesDefault(t *testing.T) {
+	t.Parallel()
 	// With maxAttempts<=0 the helper substitutes DefaultStorageLockMaxAttempts
 	// (10). Verify by capturing a non-lock error on the second call so we
 	// never actually sleep.
@@ -133,6 +139,7 @@ func TestRetryOnStorageLock_ZeroMaxAttemptsUsesDefault(t *testing.T) {
 }
 
 func TestRetryOnTransient_SucceedsImmediately(t *testing.T) {
+	t.Parallel()
 	calls := 0
 	err := RetryOnTransient(context.Background(), nil, "test", 5, func() error {
 		calls++
@@ -147,6 +154,7 @@ func TestRetryOnTransient_SucceedsImmediately(t *testing.T) {
 }
 
 func TestRetryOnTransient_NonTransientPropagates(t *testing.T) {
+	t.Parallel()
 	want := errors.New("plain unrelated")
 	calls := 0
 	err := RetryOnTransient(context.Background(), nil, "test", 5, func() error {
@@ -162,6 +170,7 @@ func TestRetryOnTransient_NonTransientPropagates(t *testing.T) {
 }
 
 func TestRetryOnTransient_RetriesOnLoginEOF(t *testing.T) {
+	t.Parallel()
 	calls := 0
 	transient := errors.New("auto-login failed: authentication failed: failed to parse login response: EOF")
 	err := RetryOnTransient(context.Background(), nil, "test", 3, func() error {
@@ -180,6 +189,7 @@ func TestRetryOnTransient_RetriesOnLoginEOF(t *testing.T) {
 }
 
 func TestRetryOnTransient_ExhaustsAndReturnsLastErr(t *testing.T) {
+	t.Parallel()
 	calls := 0
 	transient := errors.New("HTTP 596 (code: 596)")
 	err := RetryOnTransient(context.Background(), nil, "test", 2, func() error {
@@ -195,6 +205,7 @@ func TestRetryOnTransient_ExhaustsAndReturnsLastErr(t *testing.T) {
 }
 
 func TestRetryOnTransientOrLock_SwitchesBackoffByReason(t *testing.T) {
+	t.Parallel()
 	// Mix a transient transport fault then a lock timeout to confirm both
 	// predicates participate. Cap attempts at 3 to keep the test fast
 	// (worst-case sleep ~3-4s).
@@ -221,6 +232,7 @@ func TestRetryOnTransientOrLock_SwitchesBackoffByReason(t *testing.T) {
 }
 
 func TestRetryOnTransientOrLock_NonRetryablePropagates(t *testing.T) {
+	t.Parallel()
 	want := errors.New("some other failure")
 	calls := 0
 	err := RetryOnTransientOrLock(context.Background(), nil, "test", 5, func() error {
@@ -236,6 +248,7 @@ func TestRetryOnTransientOrLock_NonRetryablePropagates(t *testing.T) {
 }
 
 func TestTransientBackoff_GrowsAndCaps(t *testing.T) {
+	t.Parallel()
 	d0 := TransientBackoff(0)
 	if d0 < 600*time.Millisecond || d0 > 1400*time.Millisecond {
 		t.Errorf("attempt 0 backoff out of expected band: %v", d0)
@@ -250,6 +263,7 @@ func TestTransientBackoff_GrowsAndCaps(t *testing.T) {
 }
 
 func TestStorageLockBackoff_GrowsAndCaps(t *testing.T) {
+	t.Parallel()
 	// At attempt 0 the floor is 2s − 30% = 1.4s. Past attempt ≈ 7 the
 	// raw exponent exceeds 30s and the cap kicks in (jittered down to
 	// ~21 s minimum).
@@ -275,6 +289,7 @@ func TestStorageLockBackoff_GrowsAndCaps(t *testing.T) {
 // the shadow, `cap(slice)` here will return the wrong value or fail to
 // compile, depending on how the shadow is reintroduced.
 func TestBackoff_NoCapShadow(t *testing.T) {
+	t.Parallel()
 	// Exercise both backoff helpers (executes the renamed constant paths)
 	// and then call cap() in the test scope to prove the builtin works.
 	_ = TransientBackoff(0)
@@ -297,6 +312,7 @@ func TestBackoff_NoCapShadow(t *testing.T) {
 // jitter window would crash the process; with the guard, all paths return
 // a valid duration.
 func TestBackoff_ZeroJitterNoPanic(t *testing.T) {
+	t.Parallel()
 	defer func() {
 		if r := recover(); r != nil {
 			t.Fatalf("backoff helper panicked: %v", r)

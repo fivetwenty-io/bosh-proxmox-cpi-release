@@ -158,7 +158,10 @@ func NewClientWithOptions(endpoint, user, pass string, opts Options) (*Client, e
 const retryMaxAttempts = 3
 
 // retryBaseDelay is the base backoff interval before the first retry.
-const retryBaseDelay = 200 * time.Millisecond
+//
+// Declared as a var (not const) so tests can swap the value via t.Cleanup
+// to drive retry loops without sleeping 200–400 ms per retry in CI.
+var retryBaseDelay = 200 * time.Millisecond
 
 // maxRegistryRespBody caps the bytes read from any registry response body.
 // The BOSH registry settings document is well under 64 KiB in production; a

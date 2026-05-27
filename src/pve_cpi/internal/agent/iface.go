@@ -1,6 +1,3 @@
-// Package agent defines the Agent interface and associated types for BOSH agent
-// bootstrap strategies. Implementations (ConfigDrive, RegistryAgent, NoAgent)
-// write, clean up, and update agent settings on PVE VMs.
 package agent
 
 import "context"
@@ -43,6 +40,9 @@ type AgentConfig struct {
 	NTP       []string
 }
 
+// DisksSpec describes the disk layout written into the agent settings payload,
+// identifying the system, ephemeral, and persistent disk bus indices by their
+// virtio slot numbers (as strings) so the BOSH agent can locate each device.
 type DisksSpec struct {
 	// System is the bus index (string) of the root disk; the stemcell's
 	// agent.json DevicePathResolutionType=virtio resolves "0" to /dev/vda.
@@ -54,11 +54,15 @@ type DisksSpec struct {
 	Persistent map[string]string `json:"persistent"` // disk_cid → bus index; empty at create time
 }
 
+// VMSpec carries the VM identity fields (name and VMID) embedded in the agent
+// settings payload so the BOSH agent can self-identify after first boot.
 type VMSpec struct {
 	Name string `json:"name"` // "vm-{vmid}"
 	ID   string `json:"id"`   // vmid as string
 }
 
+// NetworkSpec describes a single network interface entry in the agent settings
+// payload, including addressing, gateway, DNS resolvers, and default-route flags.
 type NetworkSpec struct {
 	Type    string   `json:"type"`
 	IP      string   `json:"ip"`
@@ -68,6 +72,8 @@ type NetworkSpec struct {
 	Default []string `json:"default"`
 }
 
+// BlobstoreSpec identifies the blobstore provider and its configuration options
+// as required by the BOSH agent settings payload.
 type BlobstoreSpec struct {
 	Provider string         `json:"provider"`
 	Options  map[string]any `json:"options"`

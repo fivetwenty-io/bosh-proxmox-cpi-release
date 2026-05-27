@@ -19,19 +19,19 @@ func NewNoAgent(logger *log.Logger) *NoAgent {
 }
 
 // Configure is a no-op. NoAgent does not write agent settings to the VM.
-func (a *NoAgent) Configure(ctx context.Context, node string, vmid int, cfg AgentConfig) error {
+func (a *NoAgent) Configure(_ context.Context, node string, vmid int, cfg AgentConfig) error {
 	a.logger.Debug("noagent: Configure skipped", log.String("node", node), log.Int("vmid", vmid))
 	return nil
 }
 
 // Remove is a no-op. NoAgent has no persistent state to clean up.
-func (a *NoAgent) Remove(ctx context.Context, node string, vmid int) error {
+func (a *NoAgent) Remove(_ context.Context, node string, vmid int) error {
 	a.logger.Debug("noagent: Remove skipped", log.String("node", node), log.Int("vmid", vmid))
 	return nil
 }
 
 // UpdateDiskHints is a no-op. NoAgent does not maintain a disk hint registry.
-func (a *NoAgent) UpdateDiskHints(ctx context.Context, vmid int, disks []DiskHint) error {
+func (a *NoAgent) UpdateDiskHints(_ context.Context, vmid int, disks []DiskHint) error {
 	a.logger.Debug("noagent: UpdateDiskHints skipped", log.Int("vmid", vmid), log.Int("disks", len(disks)))
 	return nil
 }

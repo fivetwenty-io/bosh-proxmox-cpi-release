@@ -50,6 +50,7 @@ func rawVnet(zone string) *sdkcluster.GetSdnVnetsResponse {
 // -- DN-01: SDN delete happy path (no subnets, zone not auto-managed) --
 
 func TestHandleDeleteNetwork_SDN_HappyPath(t *testing.T) {
+	t.Parallel()
 	var deleteVnetCalled bool
 	var updateSdnCalled bool
 
@@ -89,6 +90,7 @@ func TestHandleDeleteNetwork_SDN_HappyPath(t *testing.T) {
 // -- DN-02: SDN delete with subnets --
 
 func TestHandleDeleteNetwork_SDN_WithSubnets(t *testing.T) {
+	t.Parallel()
 	var deleteSubnetCalls []string
 
 	subnetsResp := sdkcluster.ListSdnVnetsSubnetsResponse{
@@ -129,6 +131,7 @@ func TestHandleDeleteNetwork_SDN_WithSubnets(t *testing.T) {
 // -- DN-03: SDN idempotent 404 (vnet not found → returns nil) --
 
 func TestHandleDeleteNetwork_SDN_Idempotent404(t *testing.T) {
+	t.Parallel()
 	var bridgeDeleteCalled bool
 
 	clusterSvc := &mockSDNCluster{
@@ -163,6 +166,7 @@ func TestHandleDeleteNetwork_SDN_Idempotent404(t *testing.T) {
 // -- DN-04: Zone kept when pinned (zone == config.SDNZone) --
 
 func TestHandleDeleteNetwork_SDN_ZoneKeptWhenPinned(t *testing.T) {
+	t.Parallel()
 	var deleteZoneCalled bool
 	clusterSvc := &mockSDNCluster{
 		getSdnVnetsFn: func(_ context.Context, _ string, _ *sdkcluster.GetSdnVnetsParams) (*sdkcluster.GetSdnVnetsResponse, error) {
@@ -201,6 +205,7 @@ func TestHandleDeleteNetwork_SDN_ZoneKeptWhenPinned(t *testing.T) {
 // -- DN-05: Zone deleted when owned + empty --
 
 func TestHandleDeleteNetwork_SDN_ZoneDeletedWhenOwnedAndEmpty(t *testing.T) {
+	t.Parallel()
 	var deleteZoneCalled bool
 	var applyAfterZoneCalled int
 
@@ -250,6 +255,7 @@ func TestHandleDeleteNetwork_SDN_ZoneDeletedWhenOwnedAndEmpty(t *testing.T) {
 // -- DN-06: Zone kept when remaining vnets exist --
 
 func TestHandleDeleteNetwork_SDN_ZoneKeptWhenRemainingVnets(t *testing.T) {
+	t.Parallel()
 	var deleteZoneCalled bool
 
 	remainingVnets := sdkcluster.ListSdnVnetsResponse{
@@ -291,6 +297,7 @@ func TestHandleDeleteNetwork_SDN_ZoneKeptWhenRemainingVnets(t *testing.T) {
 // -- DN-07: Bridge delete --
 
 func TestHandleDeleteNetwork_Bridge_HappyPath(t *testing.T) {
+	t.Parallel()
 	var bridgeDeleteCalled bool
 	var updateNetworkCalled bool
 
@@ -339,6 +346,7 @@ func TestHandleDeleteNetwork_Bridge_HappyPath(t *testing.T) {
 // isSDNNotFound must detect it for the bridge fallback to trigger. --
 
 func TestHandleDeleteNetwork_Bridge_SDNDoesNotExistMessage(t *testing.T) {
+	t.Parallel()
 	var bridgeDeleteCalled bool
 
 	nodesSvc := &mockBridgeNodes{
@@ -378,6 +386,7 @@ func TestHandleDeleteNetwork_Bridge_SDNDoesNotExistMessage(t *testing.T) {
 // -- DN-08: Bridge idempotent 404 --
 
 func TestHandleDeleteNetwork_Bridge_Idempotent404(t *testing.T) {
+	t.Parallel()
 	nodesSvc := &mockBridgeNodes{
 		deleteNetwork2Fn: func(_ context.Context, _ string, _ string) error {
 			return pveerr.ErrNotFound
@@ -404,6 +413,7 @@ func TestHandleDeleteNetwork_Bridge_Idempotent404(t *testing.T) {
 // -- DN-09: Missing args --
 
 func TestHandleDeleteNetwork_MissingArg(t *testing.T) {
+	t.Parallel()
 	cfg := testConfig()
 	deps := handlers.Deps{Config: cfg, Logger: log.NewNopLogger(), PVE: &mockPVEClient{clusterSvc: &mockSDNCluster{}}}
 	h := handlers.HandleDeleteNetwork(deps)
@@ -420,6 +430,7 @@ func TestHandleDeleteNetwork_MissingArg(t *testing.T) {
 // -- Non-string CID --
 
 func TestHandleDeleteNetwork_NonStringCID(t *testing.T) {
+	t.Parallel()
 	cfg := testConfig()
 	deps := handlers.Deps{Config: cfg, Logger: log.NewNopLogger(), PVE: &mockPVEClient{clusterSvc: &mockSDNCluster{}}}
 	h := handlers.HandleDeleteNetwork(deps)
@@ -436,6 +447,7 @@ func TestHandleDeleteNetwork_NonStringCID(t *testing.T) {
 // -- Empty CID --
 
 func TestHandleDeleteNetwork_EmptyCID(t *testing.T) {
+	t.Parallel()
 	cfg := testConfig()
 	deps := handlers.Deps{Config: cfg, Logger: log.NewNopLogger(), PVE: &mockPVEClient{clusterSvc: &mockSDNCluster{}}}
 	h := handlers.HandleDeleteNetwork(deps)
@@ -453,6 +465,7 @@ func TestHandleDeleteNetwork_EmptyCID(t *testing.T) {
 // -- subnet delete errors propagate (non-404) --
 
 func TestHandleDeleteNetwork_SDN_SubnetDeleteError(t *testing.T) {
+	t.Parallel()
 	subnetsResp := sdkcluster.ListSdnVnetsSubnetsResponse{
 		json.RawMessage(`{"subnet":"10.0.0.0/24","type":"subnet"}`),
 	}
@@ -480,6 +493,7 @@ func TestHandleDeleteNetwork_SDN_SubnetDeleteError(t *testing.T) {
 // -- SDN probe error (not 404) surfaces as error --
 
 func TestHandleDeleteNetwork_SDN_ProbeError(t *testing.T) {
+	t.Parallel()
 	clusterSvc := &mockSDNCluster{
 		getSdnVnetsFn: func(_ context.Context, _ string, _ *sdkcluster.GetSdnVnetsParams) (*sdkcluster.GetSdnVnetsResponse, error) {
 			return nil, &pveerr.APIError{} // non-404
@@ -498,6 +512,7 @@ func TestHandleDeleteNetwork_SDN_ProbeError(t *testing.T) {
 // -- zone auto-manage=false: zone never deleted even when empty --
 
 func TestHandleDeleteNetwork_SDN_ZoneNotDeletedWhenAutoManageFalse(t *testing.T) {
+	t.Parallel()
 	var deleteZoneCalled bool
 	clusterSvc := &mockSDNCluster{
 		getSdnVnetsFn: func(_ context.Context, _ string, _ *sdkcluster.GetSdnVnetsParams) (*sdkcluster.GetSdnVnetsResponse, error) {
@@ -536,6 +551,7 @@ func TestHandleDeleteNetwork_SDN_ZoneNotDeletedWhenAutoManageFalse(t *testing.T)
 // -- SDN delete vnet returns 404 (already gone): idempotent --
 
 func TestHandleDeleteNetwork_SDN_VnetAlreadyGone(t *testing.T) {
+	t.Parallel()
 	clusterSvc := &mockSDNCluster{
 		getSdnVnetsFn: func(_ context.Context, _ string, _ *sdkcluster.GetSdnVnetsParams) (*sdkcluster.GetSdnVnetsResponse, error) {
 			return rawVnet("z"), nil
@@ -567,6 +583,7 @@ func TestHandleDeleteNetwork_SDN_VnetAlreadyGone(t *testing.T) {
 // run" shape that BOSH retries can hit.
 
 func TestDeleteNetwork_NotFound_Idempotent(t *testing.T) {
+	t.Parallel()
 	clusterSvc := &mockSDNCluster{
 		getSdnVnetsFn: func(_ context.Context, _ string, _ *sdkcluster.GetSdnVnetsParams) (*sdkcluster.GetSdnVnetsResponse, error) {
 			return nil, sdnNotFound()
@@ -602,6 +619,7 @@ func TestDeleteNetwork_NotFound_Idempotent(t *testing.T) {
 // Each row asserts whether DeleteSdnZones was called.
 
 func TestDeleteNetwork_ZoneAutoDelete_OnlyWhenAllConditionsHold(t *testing.T) {
+	t.Parallel()
 	type row struct {
 		name              string
 		autoManage        bool

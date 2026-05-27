@@ -35,6 +35,7 @@ func logger(t *testing.T) *log.Logger {
 }
 
 func TestNewClient_TokenAuth(t *testing.T) {
+	t.Parallel()
 	cfg := baseConfig()
 	cfg.Password = ""
 	cfg.APIToken = "root@pam!mytoken=abc123"
@@ -49,6 +50,7 @@ func TestNewClient_TokenAuth(t *testing.T) {
 }
 
 func TestNewClient_PasswordAuth(t *testing.T) {
+	t.Parallel()
 	cfg := baseConfig()
 
 	c, err := pve.NewClient(cfg, logger(t))
@@ -61,6 +63,7 @@ func TestNewClient_PasswordAuth(t *testing.T) {
 }
 
 func TestNewClient_NoAuth(t *testing.T) {
+	t.Parallel()
 	cfg := baseConfig()
 	cfg.Password = ""
 	cfg.APIToken = ""
@@ -72,6 +75,7 @@ func TestNewClient_NoAuth(t *testing.T) {
 }
 
 func TestNewClient_VerifySSL_True(t *testing.T) {
+	t.Parallel()
 	cfg := baseConfig()
 	cfg.VerifySSL = boolPtr(true)
 
@@ -85,6 +89,7 @@ func TestNewClient_VerifySSL_True(t *testing.T) {
 }
 
 func TestNewClient_VerifySSL_False(t *testing.T) {
+	t.Parallel()
 	cfg := baseConfig()
 	cfg.VerifySSL = boolPtr(false)
 
@@ -98,6 +103,7 @@ func TestNewClient_VerifySSL_False(t *testing.T) {
 }
 
 func TestNewClient_BadURL(t *testing.T) {
+	t.Parallel()
 	cfg := baseConfig()
 	cfg.Host = ""
 
@@ -108,6 +114,7 @@ func TestNewClient_BadURL(t *testing.T) {
 }
 
 func TestNewClient_NilConfig(t *testing.T) {
+	t.Parallel()
 	_, err := pve.NewClient(nil, logger(t))
 	if err == nil {
 		t.Fatal("expected error for nil config, got nil")
@@ -115,6 +122,7 @@ func TestNewClient_NilConfig(t *testing.T) {
 }
 
 func TestServiceAccessors(t *testing.T) {
+	t.Parallel()
 	cfg := baseConfig()
 
 	c, err := pve.NewClient(cfg, logger(t))
@@ -143,6 +151,7 @@ func TestServiceAccessors(t *testing.T) {
 }
 
 func TestNewClient_DefaultPort(t *testing.T) {
+	t.Parallel()
 	cfg := baseConfig()
 	cfg.Port = 0
 
@@ -156,6 +165,7 @@ func TestNewClient_DefaultPort(t *testing.T) {
 }
 
 func TestNewClient_DefaultRealm(t *testing.T) {
+	t.Parallel()
 	cfg := baseConfig()
 	cfg.Realm = ""
 
@@ -195,6 +205,7 @@ func selfSignedCAPEM(t *testing.T) string {
 // change NewClient behavior: the call succeeds and returns a non-nil client
 // (byte-identical code path to prior releases).
 func TestNewClient_PVECACert_Empty(t *testing.T) {
+	t.Parallel()
 	cfg := baseConfig()
 	cfg.PVECACertPEM = ""
 
@@ -212,6 +223,7 @@ func TestNewClient_PVECACert_Empty(t *testing.T) {
 // is baked into the SDK's tls.Config at construction time; the temp file is
 // removed before this assertion runs.
 func TestNewClient_PVECACert_ValidPEM(t *testing.T) {
+	t.Parallel()
 	cfg := baseConfig()
 	cfg.PVECACertPEM = selfSignedCAPEM(t)
 
@@ -228,6 +240,7 @@ func TestNewClient_PVECACert_ValidPEM(t *testing.T) {
 // the CA cert is ignored and NewClient succeeds (insecure-skip-verify path is
 // unchanged; no PEM parsing attempted).
 func TestNewClient_PVECACert_VerifySSLFalse(t *testing.T) {
+	t.Parallel()
 	cfg := baseConfig()
 	cfg.VerifySSL = boolPtr(false)
 	// Supply malformed PEM to confirm it is NOT parsed (verify_ssl=false wins).

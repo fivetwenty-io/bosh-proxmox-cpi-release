@@ -40,6 +40,7 @@ func makeReq(method string) *jsonrpc.Request {
 // --------------------------------------------------------------------------
 
 func TestNewDispatcher_PreRegisters22(t *testing.T) {
+	t.Parallel()
 	d := cpi.NewDispatcher(nopLogger())
 	methods := cpi.Methods()
 
@@ -67,6 +68,7 @@ func TestNewDispatcher_PreRegisters22(t *testing.T) {
 // --------------------------------------------------------------------------
 
 func TestRegister_Overrides(t *testing.T) {
+	t.Parallel()
 	d := cpi.NewDispatcher(nopLogger())
 
 	called := false
@@ -92,6 +94,7 @@ func TestRegister_Overrides(t *testing.T) {
 // --------------------------------------------------------------------------
 
 func TestHandle_UnknownMethod(t *testing.T) {
+	t.Parallel()
 	d := cpi.NewDispatcher(nopLogger())
 	resp := d.Handle(context.Background(), makeReq("nonsense"))
 
@@ -114,6 +117,7 @@ func TestHandle_UnknownMethod(t *testing.T) {
 // --------------------------------------------------------------------------
 
 func TestHandle_HandlerReturnsResult(t *testing.T) {
+	t.Parallel()
 	d := cpi.NewDispatcher(nopLogger())
 
 	want := map[string]string{"stemcell_id": "sc-abc123"}
@@ -148,6 +152,7 @@ func TestHandle_HandlerReturnsResult(t *testing.T) {
 // --------------------------------------------------------------------------
 
 func TestHandle_HandlerReturnsError(t *testing.T) {
+	t.Parallel()
 	d := cpi.NewDispatcher(nopLogger())
 
 	vmCID := "vm-missing-001"
@@ -175,6 +180,7 @@ func TestHandle_HandlerReturnsError(t *testing.T) {
 // --------------------------------------------------------------------------
 
 func TestHandle_HandlerReturnsPlainError(t *testing.T) {
+	t.Parallel()
 	d := cpi.NewDispatcher(nopLogger())
 
 	mustRegister(t, d, "has_vm", cpi.HandlerFunc(func(_ context.Context, _ []json.RawMessage, _ jsonrpc.Context) (any, error) {
@@ -201,6 +207,7 @@ func TestHandle_HandlerReturnsPlainError(t *testing.T) {
 // --------------------------------------------------------------------------
 
 func TestHandle_NotImplementedDefault(t *testing.T) {
+	t.Parallel()
 	d := cpi.NewDispatcher(nopLogger())
 	resp := d.Handle(context.Background(), makeReq("info"))
 
@@ -220,6 +227,7 @@ func TestHandle_NotImplementedDefault(t *testing.T) {
 // --------------------------------------------------------------------------
 
 func TestMethods_Count22(t *testing.T) {
+	t.Parallel()
 	methods := cpi.Methods()
 
 	if len(methods) != 22 {
@@ -279,6 +287,7 @@ func TestMethods_Count22(t *testing.T) {
 // --------------------------------------------------------------------------
 
 func TestDispatcher_ConcurrentRegisterHandle_NoDataRace(t *testing.T) {
+	t.Parallel()
 	d := cpi.NewDispatcher(nopLogger())
 
 	const goroutines = 20
@@ -331,6 +340,7 @@ func TestDispatcher_ConcurrentRegisterHandle_NoDataRace(t *testing.T) {
 // --------------------------------------------------------------------------
 
 func TestRegister_RejectsUnknownMethod(t *testing.T) {
+	t.Parallel()
 	d := cpi.NewDispatcher(nopLogger())
 	err := d.Register("not_a_real_method", cpi.HandlerFunc(func(_ context.Context, _ []json.RawMessage, _ jsonrpc.Context) (any, error) {
 		return nil, nil
@@ -348,6 +358,7 @@ func TestRegister_RejectsUnknownMethod(t *testing.T) {
 // --------------------------------------------------------------------------
 
 func TestRegister_AcceptsCanonicalMethod(t *testing.T) {
+	t.Parallel()
 	d := cpi.NewDispatcher(nopLogger())
 	err := d.Register("create_vm", cpi.HandlerFunc(func(_ context.Context, _ []json.RawMessage, _ jsonrpc.Context) (any, error) {
 		return nil, nil
@@ -362,6 +373,7 @@ func TestRegister_AcceptsCanonicalMethod(t *testing.T) {
 // --------------------------------------------------------------------------
 
 func TestHandle_UnknownMethodReturnsMethodNotFound(t *testing.T) {
+	t.Parallel()
 	d := cpi.NewDispatcher(nopLogger())
 	resp := d.Handle(context.Background(), makeReq("bogus"))
 
@@ -387,6 +399,7 @@ func TestHandle_UnknownMethodReturnsMethodNotFound(t *testing.T) {
 // --------------------------------------------------------------------------
 
 func TestHandle_ResultMarshalError(t *testing.T) {
+	t.Parallel()
 	d := cpi.NewDispatcher(nopLogger())
 
 	// Channels are not JSON-serialisable; json.Marshal returns an error.

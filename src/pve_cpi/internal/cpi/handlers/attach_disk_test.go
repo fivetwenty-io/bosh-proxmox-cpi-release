@@ -204,6 +204,7 @@ func extractPath(t *testing.T, result any) string {
 //   - disk_hints {"path": "/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_drive-scsi2"} returned
 //   - UpdateDiskHints called with correct vmid and device_path
 func TestHandleAttachDisk_Happy(t *testing.T) {
+	t.Parallel()
 	const (
 		vmCID   = "100"
 		diskCID = "local-lvm:vm-9001-disk-0"
@@ -255,6 +256,7 @@ func TestHandleAttachDisk_Happy(t *testing.T) {
 // TestHandleAttachDisk_AlreadyAttached verifies idempotency: if AttachDisk returns
 // the existing diskID, the handler returns valid disk_hints without error.
 func TestHandleAttachDisk_AlreadyAttached(t *testing.T) {
+	t.Parallel()
 	const (
 		vmCID   = "100"
 		diskCID = "local-lvm:vm-9001-disk-0"
@@ -285,6 +287,7 @@ func TestHandleAttachDisk_AlreadyAttached(t *testing.T) {
 
 // TestHandleAttachDisk_VMNotFound verifies that a 404 from AttachDisk maps to VMNotFound.
 func TestHandleAttachDisk_VMNotFound(t *testing.T) {
+	t.Parallel()
 	qemuSvc := &attachQEMUService{
 		attachErr: &sdkerrors.APIError{Code: 404, Message: "not found"},
 	}
@@ -301,6 +304,7 @@ func TestHandleAttachDisk_VMNotFound(t *testing.T) {
 
 // TestHandleAttachDisk_AttachFail verifies a generic attach error propagates.
 func TestHandleAttachDisk_AttachFail(t *testing.T) {
+	t.Parallel()
 	qemuSvc := &attachQEMUService{
 		attachErr: errors.New("PVE connection refused"),
 	}
@@ -315,6 +319,7 @@ func TestHandleAttachDisk_AttachFail(t *testing.T) {
 // TestHandleAttachDisk_UpdateDiskHintsFail verifies that UpdateDiskHints failure
 // propagates (not silently dropped).
 func TestHandleAttachDisk_UpdateDiskHintsFail(t *testing.T) {
+	t.Parallel()
 	const volid = "vm-9001-disk-0"
 	qemuSvc := &attachQEMUService{
 		attachReturnDiskID: "scsi2",
@@ -331,6 +336,7 @@ func TestHandleAttachDisk_UpdateDiskHintsFail(t *testing.T) {
 
 // TestHandleAttachDisk_InvalidVMCID verifies non-integer vm_cid returns VMNotFound.
 func TestHandleAttachDisk_InvalidVMCID(t *testing.T) {
+	t.Parallel()
 	h := handlers.HandleAttachDisk(attachDeps(&attachQEMUService{}, &captureAgent{}))
 	_, err := h.Handle(context.Background(), attachArgs("not-a-number", "local:vol"), jsonrpc.Context{})
 	if err == nil {
@@ -343,6 +349,7 @@ func TestHandleAttachDisk_InvalidVMCID(t *testing.T) {
 
 // TestHandleAttachDisk_InvalidDiskCID verifies malformed disk_cid returns DiskNotFound.
 func TestHandleAttachDisk_InvalidDiskCID(t *testing.T) {
+	t.Parallel()
 	h := handlers.HandleAttachDisk(attachDeps(&attachQEMUService{}, &captureAgent{}))
 	_, err := h.Handle(context.Background(), attachArgs("100", "nodisk"), jsonrpc.Context{})
 	if err == nil {
@@ -355,6 +362,7 @@ func TestHandleAttachDisk_InvalidDiskCID(t *testing.T) {
 
 // TestHandleAttachDisk_MissingArgs verifies argument count validation.
 func TestHandleAttachDisk_MissingArgs(t *testing.T) {
+	t.Parallel()
 	h := handlers.HandleAttachDisk(attachDeps(&attachQEMUService{}, &captureAgent{}))
 	_, err := h.Handle(context.Background(), marshalArgs("100"), jsonrpc.Context{})
 	if err == nil {
@@ -364,6 +372,7 @@ func TestHandleAttachDisk_MissingArgs(t *testing.T) {
 
 // TestHandleAttachDisk_EmptyVMCID verifies empty vm_cid string is rejected.
 func TestHandleAttachDisk_EmptyVMCID(t *testing.T) {
+	t.Parallel()
 	h := handlers.HandleAttachDisk(attachDeps(&attachQEMUService{}, &captureAgent{}))
 	_, err := h.Handle(context.Background(), attachArgs("", "local:vol"), jsonrpc.Context{})
 	if err == nil {
@@ -373,6 +382,7 @@ func TestHandleAttachDisk_EmptyVMCID(t *testing.T) {
 
 // TestHandleAttachDisk_EmptyDiskCID verifies empty disk_cid string is rejected.
 func TestHandleAttachDisk_EmptyDiskCID(t *testing.T) {
+	t.Parallel()
 	h := handlers.HandleAttachDisk(attachDeps(&attachQEMUService{}, &captureAgent{}))
 	_, err := h.Handle(context.Background(), attachArgs("100", ""), jsonrpc.Context{})
 	if err == nil {
@@ -388,6 +398,7 @@ func TestHandleAttachDisk_EmptyDiskCID(t *testing.T) {
 // The first Config call (slot selection) must succeed; the second (resolve)
 // must fail. configErrAfter=1 implements that two-phase behavior.
 func TestHandleAttachDisk_ResolveFallback(t *testing.T) {
+	t.Parallel()
 	qemuSvc := &attachQEMUService{
 		attachReturnDiskID: "scsi3",
 		configCfg:          map[string]any{},
@@ -416,6 +427,7 @@ func TestHandleAttachDisk_ResolveFallback(t *testing.T) {
 // TestHandleAttachDisk_DiskHintsShape verifies the returned object has exactly
 // the "path" key required by the BOSH CPI v2 spec.
 func TestHandleAttachDisk_DiskHintsShape(t *testing.T) {
+	t.Parallel()
 	const volid = "vm-9001-disk-0"
 	qemuSvc := &attachQEMUService{
 		attachReturnDiskID: "scsi2",
@@ -452,6 +464,7 @@ func keysOf(m map[string]json.RawMessage) []string {
 // BOSH agent's mappedDevicePathResolver resolves /dev/sda hints to the virtio
 // root disk /dev/vda when one exists, shadowing the persistent disk.
 func TestHandleAttachDisk_FreshVMSkipsSCSI0(t *testing.T) {
+	t.Parallel()
 	const volid = "vm-9001-disk-0"
 	qemuSvc := &attachQEMUService{
 		attachReturnDiskID: "scsi1",
@@ -481,6 +494,7 @@ func TestHandleAttachDisk_FreshVMSkipsSCSI0(t *testing.T) {
 // when a disk is already attached at scsi0 (from a prior CPI version that
 // allowed it), attach_disk detaches scsi0 and reattaches at scsi1+.
 func TestHandleAttachDisk_LegacySCSI0Migration(t *testing.T) {
+	t.Parallel()
 	const volid = "vm-9001-disk-0"
 	const diskCID = "data:" + volid
 
@@ -517,6 +531,7 @@ func TestHandleAttachDisk_LegacySCSI0Migration(t *testing.T) {
 // TestHandleAttachDisk_PreservesExistingNonZeroSlot verifies that an existing
 // attachment at scsi >= 1 is preserved (idempotent reattach with no migration).
 func TestHandleAttachDisk_PreservesExistingNonZeroSlot(t *testing.T) {
+	t.Parallel()
 	const volid = "vm-9001-disk-0"
 	const diskCID = "data:" + volid
 
@@ -550,6 +565,7 @@ func TestHandleAttachDisk_PreservesExistingNonZeroSlot(t *testing.T) {
 // TestHandleAttachDisk_PicksLowestFreeAtOrAboveOne verifies the slot allocator
 // picks the lowest free index >= 1, skipping occupied slots.
 func TestHandleAttachDisk_PicksLowestFreeAtOrAboveOne(t *testing.T) {
+	t.Parallel()
 	const volid = "vm-9001-disk-0"
 	qemuSvc := &attachQEMUService{
 		attachReturnDiskID: "scsi2",
@@ -642,6 +658,7 @@ func snapQEMUSvc(
 // handler returns a Cloud error and does NOT call AttachDisk when the VM has
 // real snapshots and AllowDiskOpsWithSnapshots is false.
 func TestHandleAttachDisk_GuardBlocksWhenSnapshotsPresent(t *testing.T) {
+	t.Parallel()
 	const volid = "vm-9001-disk-0"
 	const diskCID = "data:" + volid
 	snapName1, snapName2 := "bosh-snap-a", "bosh-snap-b"
@@ -676,6 +693,7 @@ func TestHandleAttachDisk_GuardBlocksWhenSnapshotsPresent(t *testing.T) {
 // TestHandleAttachDisk_GuardProceedsWhenNoSnapshots verifies the happy path
 // when the VM has no real snapshots: AttachDisk is called and disk_hints returned.
 func TestHandleAttachDisk_GuardProceedsWhenNoSnapshots(t *testing.T) {
+	t.Parallel()
 	const volid = "vm-9001-disk-0"
 	const diskCID = "data:" + volid
 
@@ -699,6 +717,7 @@ func TestHandleAttachDisk_GuardProceedsWhenNoSnapshots(t *testing.T) {
 // returns an error and RequireSnapshotCheckPass is false, the handler WARNs and
 // proceeds: AttachDisk is called and disk_hints are returned.
 func TestHandleAttachDisk_GuardCheckErrorFailOpen(t *testing.T) {
+	t.Parallel()
 	const volid = "vm-9001-disk-0"
 	const diskCID = "data:" + volid
 
@@ -723,6 +742,7 @@ func TestHandleAttachDisk_GuardCheckErrorFailOpen(t *testing.T) {
 // returns an error and RequireSnapshotCheckPass is true, the handler returns an
 // error and does NOT call AttachDisk.
 func TestHandleAttachDisk_GuardCheckErrorFailClosed(t *testing.T) {
+	t.Parallel()
 	const volid = "vm-9001-disk-0"
 	const diskCID = "data:" + volid
 
@@ -749,6 +769,7 @@ func TestHandleAttachDisk_GuardCheckErrorFailClosed(t *testing.T) {
 // are present but AllowDiskOpsWithSnapshots is true, the handler WARNs and
 // proceeds: AttachDisk is called and disk_hints are returned.
 func TestHandleAttachDisk_GuardAllowOverrideProceeds(t *testing.T) {
+	t.Parallel()
 	const volid = "vm-9001-disk-0"
 	const diskCID = "data:" + volid
 
@@ -846,6 +867,7 @@ func attachDiskVMOnNode(vmid int, node string) *sdkcluster.ListResourcesResponse
 // pve-node1, attach_disk returns an error rather than issuing a cross-node
 // config PUT that PVE would reject with an opaque storage error.
 func TestHandleAttachDisk_LocalBackend_CoLocationEnforced(t *testing.T) {
+	t.Parallel()
 	const (
 		vmCID    = "100"
 		diskCID  = "local-lvm:vm-9001-disk-0"
@@ -914,6 +936,7 @@ func TestHandleAttachDisk_LocalBackend_CoLocationEnforced(t *testing.T) {
 // TestHandleAttachDisk_LVM_CID verifies that a standard LVM CID
 // ("local-lvm:vm-9001-disk-0") is parsed correctly and attach proceeds.
 func TestHandleAttachDisk_LVM_CID(t *testing.T) {
+	t.Parallel()
 	const (
 		diskCID = "local-lvm:vm-9001-disk-0"
 		volid   = "vm-9001-disk-0"
@@ -941,6 +964,7 @@ func TestHandleAttachDisk_LVM_CID(t *testing.T) {
 // TestHandleAttachDisk_ZFSPool_CID verifies that a ZFS pool bare-volname CID
 // ("local-zfs:vm-9001-disk-0") is parsed correctly and attach proceeds.
 func TestHandleAttachDisk_ZFSPool_CID(t *testing.T) {
+	t.Parallel()
 	const diskCID = "local-zfs:vm-9001-disk-0"
 	qemuSvc := &attachQEMUService{
 		attachReturnDiskID: "scsi1",
@@ -966,6 +990,7 @@ func TestHandleAttachDisk_ZFSPool_CID(t *testing.T) {
 // ParseDiskCID splits on the first colon; the volume segment ("9001/vm-9001-disk-0.raw")
 // is treated as opaque by the handler.
 func TestHandleAttachDisk_Dir_CID(t *testing.T) {
+	t.Parallel()
 	const diskCID = "local:9001/vm-9001-disk-0.raw"
 	qemuSvc := &attachQEMUService{
 		attachReturnDiskID: "scsi1",
@@ -989,6 +1014,7 @@ func TestHandleAttachDisk_Dir_CID(t *testing.T) {
 // TestHandleAttachDisk_LVMThin_CID verifies that an LVMThin bare-volname CID
 // ("local-lvm-thin:vm-9001-disk-0") is parsed correctly and attach proceeds.
 func TestHandleAttachDisk_LVMThin_CID(t *testing.T) {
+	t.Parallel()
 	const diskCID = "local-lvm-thin:vm-9001-disk-0"
 	qemuSvc := &attachQEMUService{
 		attachReturnDiskID: "scsi1",
@@ -1042,6 +1068,7 @@ func TestHandleAttachDisk_LVMThin_CID(t *testing.T) {
 // (wrong API token, expired ticket) are operator configuration issues; BOSH
 // must surface them immediately rather than retrying indefinitely.
 func TestHandleAttachDisk_AuthFailure(t *testing.T) {
+	t.Parallel()
 	authErr := &sdkerrors.APIError{HTTPCode: 401, Message: "authentication failure"}
 
 	qemuSvc := &attachQEMUService{

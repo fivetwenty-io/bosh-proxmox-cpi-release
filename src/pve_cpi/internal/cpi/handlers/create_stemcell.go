@@ -1,4 +1,3 @@
-// Package handlers contains the 22 BOSH CPI v2 method implementations.
 package handlers
 
 import (
@@ -8,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -960,6 +960,273 @@ func clusterNodeCount(ctx context.Context, deps Deps) (int, error) {
 	return len(*resp), nil
 }
 
+// writeTarEntry creates dst, copies exactly hdr.Size bytes from r while
+// computing a SHA-256 in one pass, and returns the hex digest plus bytes written.
+//
+// The output file is opened, written, and closed entirely within this function.
+// Closing is deferred so the file handle is released even if code inserted
+// between copy and close in future maintenance triggers an early return.
+// The close error is captured into the named return; a prior copy error takes
+// precedence.
+//
+// dst must be a CPI-owned path (e.g. filepath.Join(tmpDir, name)) where tmpDir
+// was created by os.MkdirTemp. No os.Root scoping is applied here.
+func writeTarEntry(hdr *tar.Header, r io.Reader, dst string) (sha256hex string, written int64, err error) {
+	out, oerr := os.Create(dst) // #nosec G304 -- dst is filepath.Join(tmpDir, name); tmpDir is CPI-owned MkdirTemp; not director-supplied; os.Root scoping not applicable
+	if oerr != nil {
+		return "", 0, cpierrors.Cloud("resolveStemcellImage: create %s: %s", dst, oerr.Error())
+	}
+	defer func() {
+		if cerr := out.Close(); cerr != nil && err == nil {
+			err = cerr
+		}
+	}()
+
+	h := sha256.New()
+	tee := io.TeeReader(r, h)
+	// Bound the per-file write at hdr.Size. archive/tar's reader is
+	// already capped at the header-declared size, so a well-formed
+	// entry copies exactly hdr.Size bytes and CopyN returns (n, nil).
+	// If the tar stream is truncated, CopyN returns io.ErrUnexpectedEOF
+	// after copying fewer than hdr.Size bytes; that is treated as an
+	// error here so callers cannot upload a half-written disk image.
+	n, cerr := io.CopyN(out, tee, hdr.Size)
+	if cerr != nil && !errors.Is(cerr, io.EOF) {
+		return "", n, cpierrors.Cloud(
+			"resolveStemcellImage: copy %s (wrote %d of %d declared bytes): %s",
+			dst, n, hdr.Size, cerr.Error())
+	}
+	return hex.EncodeToString(h.Sum(nil)), n, nil
+}
+
+// tarCandidate records a file extracted from a stemcell tarball that may be
+// the disk image. Two-pass selection: pass 1 extracts all candidates and
+// computes each one's SHA-256 via TeeReader during the single copy; pass 2
+// selects by preference order and returns the winner's pre-computed SHA so
+// the caller skips a second file-read pass.
+type tarCandidate struct {
+	path      string
+	size      int64
+	isImg     bool   // true when name ends in .img
+	sha256hex string // hex-encoded SHA-256 computed during extraction
+}
+
+// extractTarCandidates reads tr, extracting every regular file that is either
+// an .img or larger than 1 MiB into tmpDir. It enforces:
+//   - Negative tar header sizes → error (malformed/crafted archive).
+//   - Cumulative extracted size ≤ MaxStemcellTotalExtract (tar-bomb guard).
+//
+// cleanup is called on every error path so the caller's deferred cleanup is
+// also executed on failure. Returns a non-nil slice on success.
+func extractTarCandidates(tr *tar.Reader, tmpDir string, cleanup func()) ([]tarCandidate, error) {
+	var candidates []tarCandidate
+	var totalExtracted int64
+	for {
+		hdr, terr := tr.Next()
+		if errors.Is(terr, io.EOF) {
+			break
+		}
+		if terr != nil {
+			cleanup()
+			return nil, cpierrors.Cloud("resolveStemcellImage: tar: %s", terr.Error())
+		}
+		if hdr.Typeflag != tar.TypeReg {
+			continue
+		}
+		name := filepath.Base(hdr.Name)
+		isImg := strings.HasSuffix(strings.ToLower(name), ".img")
+		// Reject malformed tar headers up front. archive/tar permits a
+		// negative Size on synthetic entry types, but for TypeReg a
+		// negative value indicates a crafted or corrupt archive and must
+		// not be tolerated: it would skew the totalExtracted guard and
+		// invalidate the io.CopyN bound below.
+		if hdr.Size < 0 {
+			cleanup()
+			return nil, cpierrors.Cloud(
+				"create_stemcell: malformed tar header (negative size %d for %s)",
+				hdr.Size, hdr.Name)
+		}
+		// Skip obviously-not-disk small files that are neither .img nor large.
+		if !isImg && hdr.Size < 1024*1024 {
+			continue
+		}
+		// Tar-bomb guard: reject archives whose candidate entries sum to
+		// more than MaxStemcellTotalExtract before any extraction begins.
+		// hdr.Size is the declared size from the tar header; a malicious
+		// archive could lie, so io.CopyN below also caps each file at
+		// its declared size to detect bodies longer than the header.
+		totalExtracted += hdr.Size
+		if totalExtracted > MaxStemcellTotalExtract {
+			cleanup()
+			return nil, cpierrors.Cloud(
+				"create_stemcell: tarball entries exceed maximum %dGB; refusing to extract",
+				MaxStemcellTotalExtract/(1024*1024*1024))
+		}
+		dst := filepath.Join(tmpDir, name)
+		entrySHA, _, writeErr := writeTarEntry(hdr, tr, dst)
+		if writeErr != nil {
+			cleanup()
+			return nil, writeErr
+		}
+		candidates = append(candidates, tarCandidate{
+			path:      dst,
+			size:      hdr.Size,
+			isImg:     isImg,
+			sha256hex: entrySHA,
+		})
+	}
+	return candidates, nil
+}
+
+// selectTarCandidate picks the best disk image from candidates:
+//   - Prefers largest .img file; "root.img" wins ties.
+//   - Falls back to largest non-.img candidate.
+//
+// Returns a cloud error (calling cleanup) when no usable candidate exists.
+func selectTarCandidate(candidates []tarCandidate, imagePath string, cleanup func()) (imgPath, imgSHA string, err error) {
+	var imgSize int64
+	var fallbackPath string
+	var fallbackSHA string
+	var fallbackSize int64
+	// Pass 2: prefer largest .img file; fall back to largest non-.img.
+	// "root.img" is a standard BOSH stemcell name and is preferred if
+	// multiple .img files share the same size.
+	for _, c := range candidates {
+		if c.isImg {
+			if c.size > imgSize ||
+				(c.size == imgSize && filepath.Base(c.path) == "root.img") {
+				imgPath = c.path
+				imgSHA = c.sha256hex
+				imgSize = c.size
+			}
+		} else {
+			if c.size > fallbackSize {
+				fallbackPath = c.path
+				fallbackSHA = c.sha256hex
+				fallbackSize = c.size
+			}
+		}
+	}
+	if imgPath == "" {
+		// No .img found; use largest non-.img candidate.
+		imgPath = fallbackPath
+		imgSHA = fallbackSHA
+	}
+	if imgPath == "" {
+		// Neither an .img nor a non-trivial fallback file was extracted.
+		// Returning here prevents the rest of the function from running
+		// magic-byte detection against an empty path and uploading a
+		// zero-byte file to PVE.
+		cleanup()
+		return "", "", cpierrors.Cloud(
+			"create_stemcell: no usable disk image candidate in tarball %s",
+			imagePath)
+	}
+	return imgPath, imgSHA, nil
+}
+
+// detectExtractedFormat reads the first 4 magic bytes of imgPath and maps them
+// to a PVE disk format string. Accepted signatures:
+//
+//	qcow2 — 'Q','F','I',0xFB
+//	gzip  — 0x1F,0x8B (nested gzip inside tar; treat as raw for PVE)
+//	lz4   — 0x04,0x22,0x4D,0x18
+//	raw   — any other content of sufficient size (≥ 1 MiB)
+//
+// Files that do not match any known signature are rejected to prevent
+// accidentally uploading a manifest or other metadata file as the disk.
+// cleanup is called on every error path.
+func detectExtractedFormat(imgPath, defaultFormat string, cleanup func()) (string, error) {
+	mf, merr := os.Open(imgPath) // #nosec G304 -- imgPath is filepath.Join(tmpDir, name); tmpDir is CPI-owned MkdirTemp; not director-supplied; os.Root scoping not applicable
+	if merr != nil {
+		// Cannot open extracted file — fall back to defaultFormat rather than
+		// erroring. The subsequent upload will surface any real problem.
+		return defaultFormat, nil
+	}
+	var magic [4]byte
+	n, rerr := io.ReadFull(mf, magic[:])
+	_ = mf.Close()
+	if rerr != nil && n < 2 {
+		cleanup()
+		return "", cpierrors.Cloud(
+			"create_stemcell: extracted image at %s is too small to identify (read %d bytes)",
+			imgPath, n)
+	}
+	switch {
+	case magic[0] == 'Q' && magic[1] == 'F' && magic[2] == 'I' && magic[3] == 0xFB:
+		return "qcow2", nil
+	case magic[0] == 0x1F && magic[1] == 0x8B:
+		// Nested gzip inside a tar — treat as raw; PVE handles decompression.
+		return "raw", nil
+	case n >= 4 && magic[0] == 0x04 && magic[1] == 0x22 && magic[2] == 0x4D && magic[3] == 0x18:
+		// LZ4 frame magic.
+		return "raw", nil
+	default:
+		// Require the file to be a known .img or large enough to plausibly
+		// be a raw disk. If neither, it likely is not a disk image.
+		fi, sterr := os.Stat(imgPath)
+		if sterr != nil || fi.Size() < 1024*1024 {
+			cleanup()
+			return "", cpierrors.Cloud(
+				"create_stemcell: extracted image at %s has unknown magic bytes %x; expected qcow2/gzip/lz4/raw",
+				imgPath, magic[:n])
+		}
+		return "raw", nil
+	}
+}
+
+// resolveGzipTar handles the gzip-tar branch of resolveStemcellImage. It seeks
+// f back to the start, opens a gzip reader, creates a temp dir, extracts
+// candidates, selects the best, detects format, and logs the result.
+func resolveGzipTar(f *os.File, imagePath, defaultFormat string, logger *log.Logger) (string, func(), string, string, error) {
+	noop := func() {}
+	if _, seekErr := f.Seek(0, io.SeekStart); seekErr != nil {
+		return "", noop, "", "", cpierrors.Cloud("resolveStemcellImage: seek: %s", seekErr.Error())
+	}
+	gz, gzErr := gzip.NewReader(f)
+	if gzErr != nil {
+		return "", noop, "", "", cpierrors.Cloud("resolveStemcellImage: gzip: %s", gzErr.Error())
+	}
+	defer func() { _ = gz.Close() }()
+
+	// Find the largest regular file ending in .img (or just the first
+	// regular file if no .img is present). Stemcells contain root.img
+	// alongside small manifest files.
+	tmpDir, mkErr := os.MkdirTemp("", "bosh-stemcell-extract-")
+	if mkErr != nil {
+		return "", noop, "", "", cpierrors.Cloud("resolveStemcellImage: mktemp: %s", mkErr.Error())
+	}
+	cleanup := func() { _ = os.RemoveAll(tmpDir) }
+
+	tr := tar.NewReader(gz)
+	candidates, candErr := extractTarCandidates(tr, tmpDir, cleanup)
+	if candErr != nil {
+		return "", noop, "", "", candErr
+	}
+	if len(candidates) == 0 {
+		cleanup()
+		return "", noop, "", "", cpierrors.Cloud("resolveStemcellImage: no disk image inside tarball %s", imagePath)
+	}
+
+	imgPath, imgSHA, selErr := selectTarCandidate(candidates, imagePath, cleanup)
+	if selErr != nil {
+		return "", noop, "", "", selErr
+	}
+
+	format, fmtErr := detectExtractedFormat(imgPath, defaultFormat, cleanup)
+	if fmtErr != nil {
+		return "", noop, "", "", fmtErr
+	}
+
+	logger.Info("resolveStemcellImage: extracted",
+		log.String("source", imagePath),
+		log.String("disk", imgPath),
+		log.String("format", format),
+		log.String("sha256", imgSHA),
+	)
+	return imgPath, cleanup, format, imgSHA, nil
+}
+
 // resolveStemcellImage inspects imagePath and, if it is a gzipped tar (as
 // produced by the BOSH stemcell builder for openstack/kvm), extracts the
 // inner disk image to a temp file and returns its path. The returned cleanup
@@ -1002,204 +1269,7 @@ func resolveStemcellImage(imagePath, defaultFormat, stagingDir string, logger *l
 
 	// Gzip magic: 0x1F 0x8B
 	if n >= 2 && head[0] == 0x1F && head[1] == 0x8B {
-		if _, seekErr := f.Seek(0, io.SeekStart); seekErr != nil {
-			return "", noop, "", "", cpierrors.Cloud("resolveStemcellImage: seek: %s", seekErr.Error())
-		}
-		gz, gzErr := gzip.NewReader(f)
-		if gzErr != nil {
-			return "", noop, "", "", cpierrors.Cloud("resolveStemcellImage: gzip: %s", gzErr.Error())
-		}
-		defer func() { _ = gz.Close() }()
-
-		tr := tar.NewReader(gz)
-		// Find the largest regular file ending in .img (or just the first
-		// regular file if no .img is present). Stemcells contain root.img
-		// alongside small manifest files.
-		tmpDir, mkErr := os.MkdirTemp("", "bosh-stemcell-extract-")
-		if mkErr != nil {
-			return "", noop, "", "", cpierrors.Cloud("resolveStemcellImage: mktemp: %s", mkErr.Error())
-		}
-		cleanup := func() { _ = os.RemoveAll(tmpDir) }
-
-		// tarCandidate records a file extracted from the tarball that may be
-		// the disk image. Two-pass selection: pass 1 extracts all candidates
-		// and computes each one's SHA-256 via TeeReader during the single copy;
-		// pass 2 selects by preference order and returns the winner's pre-computed
-		// SHA so the caller skips a second file-read pass.
-		type tarCandidate struct {
-			path      string
-			size      int64
-			isImg     bool   // true when name ends in .img
-			sha256hex string // hex-encoded SHA-256 computed during extraction
-		}
-		var candidates []tarCandidate
-		var totalExtracted int64
-		for {
-			hdr, terr := tr.Next()
-			if terr == io.EOF {
-				break
-			}
-			if terr != nil {
-				cleanup()
-				return "", noop, "", "", cpierrors.Cloud("resolveStemcellImage: tar: %s", terr.Error())
-			}
-			if hdr.Typeflag != tar.TypeReg {
-				continue
-			}
-			name := filepath.Base(hdr.Name)
-			isImg := strings.HasSuffix(strings.ToLower(name), ".img")
-			// Reject malformed tar headers up front. archive/tar permits a
-			// negative Size on synthetic entry types, but for TypeReg a
-			// negative value indicates a crafted or corrupt archive and must
-			// not be tolerated: it would skew the totalExtracted guard and
-			// invalidate the io.CopyN bound below.
-			if hdr.Size < 0 {
-				cleanup()
-				return "", noop, "", "", cpierrors.Cloud(
-					"create_stemcell: malformed tar header (negative size %d for %s)",
-					hdr.Size, hdr.Name)
-			}
-			// Skip obviously-not-disk small files that are neither .img nor large.
-			if !isImg && hdr.Size < 1024*1024 {
-				continue
-			}
-			// Tar-bomb guard: reject archives whose candidate entries sum to
-			// more than MaxStemcellTotalExtract before any extraction begins.
-			// hdr.Size is the declared size from the tar header; a malicious
-			// archive could lie, so io.CopyN below also caps each file at
-			// its declared size to detect bodies longer than the header.
-			totalExtracted += hdr.Size
-			if totalExtracted > MaxStemcellTotalExtract {
-				cleanup()
-				return "", noop, "", "", cpierrors.Cloud(
-					"create_stemcell: tarball entries exceed maximum %dGB; refusing to extract",
-					MaxStemcellTotalExtract/(1024*1024*1024))
-			}
-			dst := filepath.Join(tmpDir, name)
-			out, oerr := os.Create(dst) // #nosec G304 -- dst is filepath.Join(tmpDir, name); tmpDir is CPI-owned MkdirTemp; not director-supplied; os.Root scoping not applicable
-			if oerr != nil {
-				cleanup()
-				return "", noop, "", "", cpierrors.Cloud("resolveStemcellImage: create %s: %s", dst, oerr.Error())
-			}
-			h := sha256.New()
-			tee := io.TeeReader(tr, h)
-			// Bound the per-file write at hdr.Size. archive/tar's reader is
-			// already capped at the header-declared size, so a well-formed
-			// entry copies exactly hdr.Size bytes and CopyN returns (n, nil).
-			// If the tar stream is truncated, CopyN returns io.ErrUnexpectedEOF
-			// after copying fewer than hdr.Size bytes; that is treated as an
-			// error here so callers cannot upload a half-written disk image.
-			written, cerr := io.CopyN(out, tee, hdr.Size)
-			if cerr != nil && cerr != io.EOF {
-				_ = out.Close()
-				cleanup()
-				return "", noop, "", "", cpierrors.Cloud(
-					"resolveStemcellImage: copy %s (wrote %d of %d declared bytes): %s",
-					dst, written, hdr.Size, cerr.Error())
-			}
-			_ = out.Close()
-			candidates = append(candidates, tarCandidate{
-				path:      dst,
-				size:      hdr.Size,
-				isImg:     isImg,
-				sha256hex: hex.EncodeToString(h.Sum(nil)),
-			})
-		}
-		if len(candidates) == 0 {
-			cleanup()
-			return "", noop, "", "", cpierrors.Cloud("resolveStemcellImage: no disk image inside tarball %s", imagePath)
-		}
-
-		// Pass 2: prefer largest .img file; fall back to largest non-.img.
-		// "root.img" is a standard BOSH stemcell name and is preferred if
-		// multiple .img files share the same size.
-		var imgPath string
-		var imgSHA string
-		var imgSize int64
-		var fallbackPath string
-		var fallbackSHA string
-		var fallbackSize int64
-		for _, c := range candidates {
-			if c.isImg {
-				if c.size > imgSize ||
-					(c.size == imgSize && filepath.Base(c.path) == "root.img") {
-					imgPath = c.path
-					imgSHA = c.sha256hex
-					imgSize = c.size
-				}
-			} else {
-				if c.size > fallbackSize {
-					fallbackPath = c.path
-					fallbackSHA = c.sha256hex
-					fallbackSize = c.size
-				}
-			}
-		}
-		if imgPath == "" {
-			// No .img found; use largest non-.img candidate.
-			imgPath = fallbackPath
-			imgSHA = fallbackSHA
-		}
-		if imgPath == "" {
-			// Neither an .img nor a non-trivial fallback file was extracted.
-			// Returning here prevents the rest of the function from running
-			// magic-byte detection against an empty path and uploading a
-			// zero-byte file to PVE.
-			cleanup()
-			return "", noop, "", "", cpierrors.Cloud(
-				"create_stemcell: no usable disk image candidate in tarball %s",
-				imagePath)
-		}
-
-		// Detect format and validate magic bytes. Read only the first 4 bytes
-		// to avoid OOM on multi-GB images. Accepted signatures:
-		//   qcow2  — 'Q','F','I',0xFB
-		//   gzip   — 0x1F,0x8B (compressed raw; treat as raw)
-		//   lz4    — 0x04,0x22,0x4D,0x18
-		//   raw    — any other non-zero content of sufficient size (>= 1 MiB)
-		//
-		// Files that do not match any known signature are rejected to prevent
-		// accidentally uploading a manifest or other metadata file as the disk.
-		format := defaultFormat
-		if mf, merr := os.Open(imgPath); merr == nil { // #nosec G304 -- imgPath is filepath.Join(tmpDir, name); tmpDir is CPI-owned MkdirTemp; not director-supplied; os.Root scoping not applicable
-			var magic [4]byte
-			n, rerr := io.ReadFull(mf, magic[:])
-			_ = mf.Close()
-			if rerr != nil && n < 2 {
-				cleanup()
-				return "", noop, "", "", cpierrors.Cloud(
-					"create_stemcell: extracted image at %s is too small to identify (read %d bytes)",
-					imgPath, n)
-			}
-			switch {
-			case magic[0] == 'Q' && magic[1] == 'F' && magic[2] == 'I' && magic[3] == 0xFB:
-				format = "qcow2"
-			case magic[0] == 0x1F && magic[1] == 0x8B:
-				// Nested gzip inside a tar — treat as raw; PVE handles decompression.
-				format = "raw"
-			case n >= 4 && magic[0] == 0x04 && magic[1] == 0x22 && magic[2] == 0x4D && magic[3] == 0x18:
-				// LZ4 frame magic.
-				format = "raw"
-			default:
-				// Require the file to be a known .img or large enough to plausibly
-				// be a raw disk. If neither, it likely is not a disk image.
-				fi, sterr := os.Stat(imgPath)
-				if sterr != nil || fi.Size() < 1024*1024 {
-					cleanup()
-					return "", noop, "", "", cpierrors.Cloud(
-						"create_stemcell: extracted image at %s has unknown magic bytes %x; expected qcow2/gzip/lz4/raw",
-						imgPath, magic[:n])
-				}
-				format = "raw"
-			}
-		}
-		logger.Info("resolveStemcellImage: extracted",
-			log.String("source", imagePath),
-			log.String("disk", imgPath),
-			log.String("format", format),
-			log.String("sha256", imgSHA),
-		)
-		return imgPath, cleanup, format, imgSHA, nil
+		return resolveGzipTar(f, imagePath, defaultFormat, logger)
 	}
 
 	// Not gzip, not qcow2 magic — treat as raw disk image. SHA computed by caller.

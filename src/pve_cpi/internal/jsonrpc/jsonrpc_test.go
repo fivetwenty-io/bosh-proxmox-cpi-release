@@ -38,6 +38,7 @@ func captureEncode(t *testing.T, fn func(w io.Writer) error) string {
 // -----------------------------------------------------------------------
 
 func TestDecode_Valid(t *testing.T) {
+	t.Parallel()
 	f, err := os.Open("testdata/request.json")
 	if err != nil {
 		t.Fatalf("open testdata/request.json: %v", err)
@@ -88,6 +89,7 @@ func TestDecode_Valid(t *testing.T) {
 }
 
 func TestDecode_MissingMethod(t *testing.T) {
+	t.Parallel()
 	input := `{"arguments":[],"context":{"director_uuid":"x","request_id":"y"}}`
 	_, err := Decode(strings.NewReader(input))
 	if err == nil {
@@ -99,6 +101,7 @@ func TestDecode_MissingMethod(t *testing.T) {
 }
 
 func TestDecode_MalformedJSON(t *testing.T) {
+	t.Parallel()
 	_, err := Decode(strings.NewReader(`{not valid json`))
 	if err == nil {
 		t.Fatal("expected error for malformed JSON, got nil")
@@ -106,6 +109,7 @@ func TestDecode_MalformedJSON(t *testing.T) {
 }
 
 func TestDecode_EmptyInput(t *testing.T) {
+	t.Parallel()
 	_, err := Decode(strings.NewReader(""))
 	if err == nil {
 		t.Fatal("expected error for empty input, got nil")
@@ -113,6 +117,7 @@ func TestDecode_EmptyInput(t *testing.T) {
 }
 
 func TestDecode_NilReader(t *testing.T) {
+	t.Parallel()
 	_, err := Decode(nil)
 	if err == nil {
 		t.Fatal("expected error for nil reader, got nil")
@@ -120,6 +125,7 @@ func TestDecode_NilReader(t *testing.T) {
 }
 
 func TestDecode_EmptyMethod(t *testing.T) {
+	t.Parallel()
 	input := `{"method":"","arguments":[],"context":{}}`
 	_, err := Decode(strings.NewReader(input))
 	if err == nil {
@@ -132,6 +138,7 @@ func TestDecode_EmptyMethod(t *testing.T) {
 // -----------------------------------------------------------------------
 
 func TestEncodeSuccess(t *testing.T) {
+	t.Parallel()
 	got := captureEncode(t, func(w io.Writer) error {
 		return EncodeSuccess(w, "vm-cid-001", "")
 	})
@@ -154,6 +161,7 @@ func TestEncodeSuccess(t *testing.T) {
 }
 
 func TestEncodeSuccess_MatchesGoldenFile(t *testing.T) {
+	t.Parallel()
 	got := captureEncode(t, func(w io.Writer) error {
 		return EncodeSuccess(w, "vm-cid-001", "")
 	})
@@ -166,6 +174,7 @@ func TestEncodeSuccess_MatchesGoldenFile(t *testing.T) {
 }
 
 func TestEncodeSuccess_NilResult(t *testing.T) {
+	t.Parallel()
 	var buf bytes.Buffer
 	if err := EncodeSuccess(&buf, nil, ""); err != nil {
 		t.Fatalf("EncodeSuccess: %v", err)
@@ -185,6 +194,7 @@ func TestEncodeSuccess_NilResult(t *testing.T) {
 }
 
 func TestEncodeSuccess_NilWriter(t *testing.T) {
+	t.Parallel()
 	err := EncodeSuccess(nil, "x", "")
 	if err == nil {
 		t.Fatal("expected error for nil writer, got nil")
@@ -192,6 +202,7 @@ func TestEncodeSuccess_NilWriter(t *testing.T) {
 }
 
 func TestEncodeSuccess_WithLog(t *testing.T) {
+	t.Parallel()
 	var buf bytes.Buffer
 	if err := EncodeSuccess(&buf, 42, "some log output"); err != nil {
 		t.Fatalf("EncodeSuccess: %v", err)
@@ -213,6 +224,7 @@ func TestEncodeSuccess_WithLog(t *testing.T) {
 // -----------------------------------------------------------------------
 
 func TestEncodeError(t *testing.T) {
+	t.Parallel()
 	got := captureEncode(t, func(w io.Writer) error {
 		return EncodeError(w, "Bosh::Clouds::CloudError", "something went wrong", false, "stack trace here")
 	})
@@ -224,6 +236,7 @@ func TestEncodeError(t *testing.T) {
 }
 
 func TestEncodeError_AllFields(t *testing.T) {
+	t.Parallel()
 	var buf bytes.Buffer
 	if err := EncodeError(&buf,
 		"Bosh::Clouds::RetriableCloudError",
@@ -259,6 +272,7 @@ func TestEncodeError_AllFields(t *testing.T) {
 }
 
 func TestEncodeError_EmptyTypeDefaultsToCloudError(t *testing.T) {
+	t.Parallel()
 	var buf bytes.Buffer
 	if err := EncodeError(&buf, "", "oops", false, ""); err != nil {
 		t.Fatalf("EncodeError: %v", err)
@@ -276,6 +290,7 @@ func TestEncodeError_EmptyTypeDefaultsToCloudError(t *testing.T) {
 }
 
 func TestEncodeError_NilWriter(t *testing.T) {
+	t.Parallel()
 	err := EncodeError(nil, "Bosh::Clouds::CloudError", "msg", false, "")
 	if err == nil {
 		t.Fatal("expected error for nil writer, got nil")
@@ -289,6 +304,7 @@ func TestEncodeError_NilWriter(t *testing.T) {
 // TestRoundTrip decodes a request, encodes a success response, then decodes
 // the response back to verify structural consistency across encode/decode.
 func TestRoundTrip(t *testing.T) {
+	t.Parallel()
 	// 1. Decode request from testdata.
 	f, err := os.Open("testdata/request.json")
 	if err != nil {
@@ -343,6 +359,7 @@ func TestRoundTrip(t *testing.T) {
 // TestOutputIsSingleLine verifies that encoder output does not contain
 // embedded newlines (i.e. is not pretty-printed).
 func TestOutputIsSingleLine(t *testing.T) {
+	t.Parallel()
 	t.Run("success", func(t *testing.T) {
 		var buf bytes.Buffer
 		if err := EncodeSuccess(&buf, map[string]any{"a": 1, "b": 2}, "log"); err != nil {

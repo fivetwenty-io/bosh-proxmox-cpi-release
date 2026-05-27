@@ -171,7 +171,7 @@ func (a *ConfigDrive) Configure(ctx context.Context, node string, vmid int, cfg 
 		// (via %w) to preserve its BOSH error type classification for retry logic;
 		// the cleanup error is appended as context via %v.
 		if rmErr := a.removeISOFromStorage(ctx, node, filename); rmErr != nil {
-			return fmt.Errorf("agent configure vm %d: attach configdrive iso failed (%w); cleanup also failed: %v",
+			return fmt.Errorf("agent configure vm %d: attach configdrive iso failed (%w); cleanup also failed: %w",
 				vmid, attachErr, rmErr)
 		}
 		return cpierrors.Wrap(attachErr, fmt.Sprintf("agent configure vm %d: attach configdrive iso", vmid))

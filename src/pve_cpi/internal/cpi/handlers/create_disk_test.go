@@ -168,6 +168,7 @@ func marshal(v any) json.RawMessage {
 // ---------------------------------------------------------------------------
 
 func TestHandleCreateDisk_Happy(t *testing.T) {
+	t.Parallel()
 	storageSvc := &mockStorageService{
 		createVolumeFn: func(_ context.Context, node, storage string, sizeGiB int, format string, vmid int, name string) (string, error) {
 			if node != "pve1" {
@@ -212,6 +213,7 @@ func TestHandleCreateDisk_Happy(t *testing.T) {
 }
 
 func TestHandleCreateDisk_CustomStorage(t *testing.T) {
+	t.Parallel()
 	var capturedStorage string
 	storageSvc := &mockStorageService{
 		createVolumeFn: func(_ context.Context, _, storage string, _ int, _ string, _ int, _ string) (string, error) {
@@ -236,6 +238,7 @@ func TestHandleCreateDisk_CustomStorage(t *testing.T) {
 }
 
 func TestHandleCreateDisk_DefaultStorage(t *testing.T) {
+	t.Parallel()
 	var capturedStorage string
 	storageSvc := &mockStorageService{
 		createVolumeFn: func(_ context.Context, _, storage string, _ int, _ string, _ int, _ string) (string, error) {
@@ -260,6 +263,7 @@ func TestHandleCreateDisk_DefaultStorage(t *testing.T) {
 }
 
 func TestHandleCreateDisk_CustomFormat(t *testing.T) {
+	t.Parallel()
 	var capturedFormat string
 	storageSvc := &mockStorageService{
 		createVolumeFn: func(_ context.Context, _, _ string, _ int, format string, _ int, _ string) (string, error) {
@@ -284,6 +288,7 @@ func TestHandleCreateDisk_CustomFormat(t *testing.T) {
 }
 
 func TestHandleCreateDisk_SizeCeiling(t *testing.T) {
+	t.Parallel()
 	// 1025 MiB → ceil → 2 GiB
 	var capturedSizeGiB int
 	storageSvc := &mockStorageService{
@@ -309,6 +314,7 @@ func TestHandleCreateDisk_SizeCeiling(t *testing.T) {
 }
 
 func TestHandleCreateDisk_VMCIDIgnoredForNaming(t *testing.T) {
+	t.Parallel()
 	// vm_cid is NOT used for naming — each persistent disk gets its own
 	// synthetic VMID from the 9xxx pool so it cannot collide with the
 	// owning VM's system disk (vm-{vmcid}-disk-0).
@@ -340,6 +346,7 @@ func TestHandleCreateDisk_VMCIDIgnoredForNaming(t *testing.T) {
 }
 
 func TestHandleCreateDisk_SDKError(t *testing.T) {
+	t.Parallel()
 	storageSvc := &mockStorageService{
 		createVolumeFn: func(_ context.Context, _, _ string, _ int, _ string, _ int, _ string) (string, error) {
 			return "", errors.New("PVE storage unavailable")
@@ -362,6 +369,7 @@ func TestHandleCreateDisk_SDKError(t *testing.T) {
 // volume (Exists=true), create_disk must DeleteVolume so the orphan does
 // not linger in storage. Verifies the best-effort cleanup branch.
 func TestHandleCreateDisk_OrphanCleanupAfterCreateVolumeError(t *testing.T) {
+	t.Parallel()
 	var deletedVolID string
 	storageSvc := &mockStorageService{
 		createVolumeFn: func(_ context.Context, _, _ string, _ int, _ string, _ int, _ string) (string, error) {
@@ -395,6 +403,7 @@ func TestHandleCreateDisk_OrphanCleanupAfterCreateVolumeError(t *testing.T) {
 // Verifies the success-flag pattern by asserting DeleteVolume is never
 // invoked when CreateVolume succeeds.
 func TestHandleCreateDisk_NoRollbackOnSuccess(t *testing.T) {
+	t.Parallel()
 	deleteCalls := 0
 	storageSvc := &mockStorageService{
 		createVolumeFn: func(_ context.Context, _, storage string, _ int, _ string, vmid int, _ string) (string, error) {
@@ -422,6 +431,7 @@ func TestHandleCreateDisk_NoRollbackOnSuccess(t *testing.T) {
 }
 
 func TestHandleCreateDisk_ZeroSizeMB(t *testing.T) {
+	t.Parallel()
 	storageSvc := &mockStorageService{}
 	deps := baseDepsForCreate(t, storageSvc, nil)
 
@@ -437,6 +447,7 @@ func TestHandleCreateDisk_ZeroSizeMB(t *testing.T) {
 }
 
 func TestHandleCreateDisk_NegativeSizeMB(t *testing.T) {
+	t.Parallel()
 	storageSvc := &mockStorageService{}
 	deps := baseDepsForCreate(t, storageSvc, nil)
 
@@ -452,6 +463,7 @@ func TestHandleCreateDisk_NegativeSizeMB(t *testing.T) {
 }
 
 func TestHandleCreateDisk_TooFewArgs(t *testing.T) {
+	t.Parallel()
 	storageSvc := &mockStorageService{}
 	deps := baseDepsForCreate(t, storageSvc, nil)
 
@@ -471,6 +483,7 @@ func TestHandleCreateDisk_TooFewArgs(t *testing.T) {
 // storage produces malformed CIDs like "data:data:vm-9003-disk-0" that
 // break every subsequent ParseDiskCID consumer.
 func TestHandleCreateDisk_DiskCIDNotDoublePrefixed(t *testing.T) {
+	t.Parallel()
 	storageSvc := &mockStorageService{
 		createVolumeFn: func(_ context.Context, _, storage string, _ int, _ string, vmid int, _ string) (string, error) {
 			return fmt.Sprintf("%s:vm-%d-disk-0", storage, vmid), nil
@@ -507,6 +520,7 @@ func TestHandleCreateDisk_DiskCIDNotDoublePrefixed(t *testing.T) {
 }
 
 func TestHandleCreateDisk_EmptyVolidFallback(t *testing.T) {
+	t.Parallel()
 	// When SDK returns an empty volid, CPI constructs one from storage+name.
 	storageSvc := &mockStorageService{
 		createVolumeFn: func(_ context.Context, _, storage string, _ int, _ string, _ int, name string) (string, error) {
@@ -535,6 +549,7 @@ func TestHandleCreateDisk_EmptyVolidFallback(t *testing.T) {
 // and re-attempt without firing the orphan-cleanup branch (a pure conflict
 // means PVE rejected the volume; no partial commit can exist).
 func TestHandleCreateDisk_VMIDConflictRetry(t *testing.T) {
+	t.Parallel()
 	attempt := 0
 	existsCalls := 0
 	deleteCalls := 0
@@ -580,6 +595,7 @@ func TestHandleCreateDisk_VMIDConflictRetry(t *testing.T) {
 }
 
 func TestHandleCreateDisk_MissingNode(t *testing.T) {
+	t.Parallel()
 	storageSvc := &mockStorageService{}
 	deps := handlers.Deps{
 		Config: &config.CPIConfig{
@@ -614,6 +630,7 @@ func TestHandleCreateDisk_MissingNode(t *testing.T) {
 // TestHandleCreateDisk_LVM_NoFormatArg — lvm block storage, no disk_format in
 // cloud_properties → CreateVolume must receive format="" (PVE auto-picks raw).
 func TestHandleCreateDisk_LVM_NoFormatArg(t *testing.T) {
+	t.Parallel()
 	var capturedFormat string
 	storageSvc := &mockStorageService{
 		createVolumeFn: func(_ context.Context, _, _ string, _ int, format string, vmid int, _ string) (string, error) {
@@ -641,6 +658,7 @@ func TestHandleCreateDisk_LVM_NoFormatArg(t *testing.T) {
 // TestHandleCreateDisk_LVMThin_NoFormatArg — lvmthin block storage, no
 // disk_format → format="" forwarded so PVE picks the correct raw default.
 func TestHandleCreateDisk_LVMThin_NoFormatArg(t *testing.T) {
+	t.Parallel()
 	var capturedFormat string
 	storageSvc := &mockStorageService{
 		createVolumeFn: func(_ context.Context, _, _ string, _ int, format string, vmid int, _ string) (string, error) {
@@ -668,6 +686,7 @@ func TestHandleCreateDisk_LVMThin_NoFormatArg(t *testing.T) {
 // TestHandleCreateDisk_ZFSPool_NoFormatArg — zfspool block storage, no
 // disk_format → format="" forwarded so PVE picks the correct default.
 func TestHandleCreateDisk_ZFSPool_NoFormatArg(t *testing.T) {
+	t.Parallel()
 	var capturedFormat string
 	storageSvc := &mockStorageService{
 		createVolumeFn: func(_ context.Context, _, _ string, _ int, format string, vmid int, _ string) (string, error) {
@@ -695,6 +714,7 @@ func TestHandleCreateDisk_ZFSPool_NoFormatArg(t *testing.T) {
 // TestHandleCreateDisk_Dir_NoFormatArg — dir (file) storage, no disk_format →
 // format="" forwarded; PVE auto-picks raw for dir-type without an explicit hint.
 func TestHandleCreateDisk_Dir_NoFormatArg(t *testing.T) {
+	t.Parallel()
 	var capturedFormat string
 	storageSvc := &mockStorageService{
 		createVolumeFn: func(_ context.Context, _, _ string, _ int, format string, vmid int, _ string) (string, error) {
@@ -724,6 +744,7 @@ func TestHandleCreateDisk_Dir_NoFormatArg(t *testing.T) {
 // cloud_properties.disk_format=qcow2 → format="qcow2" forwarded verbatim to
 // CreateVolume. Verifies the explicit-format forwarding path for file storages.
 func TestHandleCreateDisk_Dir_ExplicitFormat_Forwarded(t *testing.T) {
+	t.Parallel()
 	var capturedFormat string
 	storageSvc := &mockStorageService{
 		createVolumeFn: func(_ context.Context, _, _ string, _ int, format string, vmid int, _ string) (string, error) {
@@ -781,6 +802,7 @@ func TestHandleCreateDisk_Dir_ExplicitFormat_Forwarded(t *testing.T) {
 // Auth failures are operator configuration issues (wrong API token or expired
 // ticket) and must surface immediately — BOSH must not retry indefinitely.
 func TestHandleCreateDisk_AuthFailure(t *testing.T) {
+	t.Parallel()
 	authErr := &sdkerrors.APIError{HTTPCode: 401, Message: "authentication failure"}
 
 	storageSvc := &mockStorageService{

@@ -2,6 +2,7 @@ package stemcellfetch
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"net/http"
@@ -21,12 +22,13 @@ type httpsSource struct {
 	client *http.Client
 }
 
-// newHTTPSSource returns a Source whose http.Client uses a 30-minute timeout
-// and the default redirect policy (which honors up to 10 redirects).
+// newHTTPSSource returns a Source whose http.Client uses a 30-minute timeout,
+// a TLS 1.2 floor, and the default redirect policy (which honors up to 10 redirects).
 func newHTTPSSource() *httpsSource {
 	return &httpsSource{
 		client: &http.Client{
-			Timeout: 30 * time.Minute,
+			Timeout:   30 * time.Minute,
+			Transport: &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12}},
 		},
 	}
 }

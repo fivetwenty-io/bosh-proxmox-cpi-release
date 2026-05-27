@@ -1,4 +1,4 @@
-// Package pve provides task-await and VMID-allocation helpers used by CPI action handlers.
+// Task polling and await helpers for CPI action handlers.
 package pve
 
 import (

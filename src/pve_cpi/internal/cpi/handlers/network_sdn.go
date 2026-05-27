@@ -1,4 +1,4 @@
-// Package handlers — shared helpers for create_network and delete_network.
+// Shared helpers for create_network and delete_network.
 package handlers
 
 import (

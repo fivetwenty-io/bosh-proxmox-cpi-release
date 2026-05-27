@@ -103,6 +103,7 @@ func TestCreateDisk_StorageTypes(t *testing.T) {
 // resize logic; these subtests confirm ParseDiskCID handles each CID shape
 // and that ResizeDisk is called with the correct positive delta.
 func TestResizeDisk_StorageTypes(t *testing.T) {
+	t.Parallel()
 	type resizeCase struct {
 		storageType string
 		diskCID     string

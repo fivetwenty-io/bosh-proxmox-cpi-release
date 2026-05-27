@@ -86,6 +86,7 @@ func baseDepsForHas(t *testing.T, storageSvc *mockStorageService) handlers.Deps 
 // ---------------------------------------------------------------------------
 
 func TestHandleHasDisk_Exists(t *testing.T) {
+	t.Parallel()
 	storageSvc := &mockStorageService{
 		existsFn: func(_ context.Context, node, storage, volume string) (bool, error) {
 			if node != "pve1" {
@@ -120,6 +121,7 @@ func TestHandleHasDisk_Exists(t *testing.T) {
 }
 
 func TestHandleHasDisk_NotExists(t *testing.T) {
+	t.Parallel()
 	storageSvc := &mockStorageService{
 		existsFn: func(_ context.Context, _, _, _ string) (bool, error) {
 			return false, nil
@@ -145,6 +147,7 @@ func TestHandleHasDisk_NotExists(t *testing.T) {
 }
 
 func TestHandleHasDisk_SDKNotFoundError_ReturnsFalse(t *testing.T) {
+	t.Parallel()
 	// If SDK Exists returns a not-found error (unusual but defensive), CPI returns false.
 	storageSvc := &mockStorageService{
 		existsFn: func(_ context.Context, _, _, _ string) (bool, error) {
@@ -174,6 +177,7 @@ func TestHandleHasDisk_SDKNotFoundError_ReturnsFalse(t *testing.T) {
 }
 
 func TestHandleHasDisk_SDKError_Propagated(t *testing.T) {
+	t.Parallel()
 	storageSvc := &mockStorageService{
 		existsFn: func(_ context.Context, _, _, _ string) (bool, error) {
 			return false, errors.New("storage backend unavailable")
@@ -192,6 +196,7 @@ func TestHandleHasDisk_SDKError_Propagated(t *testing.T) {
 }
 
 func TestHandleHasDisk_MalformedCID_NoColon(t *testing.T) {
+	t.Parallel()
 	storageSvc := &mockStorageService{}
 	deps := baseDepsForHas(t, storageSvc)
 
@@ -206,6 +211,7 @@ func TestHandleHasDisk_MalformedCID_NoColon(t *testing.T) {
 }
 
 func TestHandleHasDisk_EmptyCID(t *testing.T) {
+	t.Parallel()
 	storageSvc := &mockStorageService{}
 	deps := baseDepsForHas(t, storageSvc)
 
@@ -220,6 +226,7 @@ func TestHandleHasDisk_EmptyCID(t *testing.T) {
 }
 
 func TestHandleHasDisk_TooFewArgs(t *testing.T) {
+	t.Parallel()
 	storageSvc := &mockStorageService{}
 	deps := baseDepsForHas(t, storageSvc)
 
@@ -232,6 +239,7 @@ func TestHandleHasDisk_TooFewArgs(t *testing.T) {
 }
 
 func TestHandleHasDisk_MissingNode(t *testing.T) {
+	t.Parallel()
 	storageSvc := &mockStorageService{}
 	deps := handlers.Deps{
 		Config: &config.CPIConfig{
@@ -253,6 +261,7 @@ func TestHandleHasDisk_MissingNode(t *testing.T) {
 }
 
 func TestHandleHasDisk_EmptyStoragePart(t *testing.T) {
+	t.Parallel()
 	storageSvc := &mockStorageService{}
 	deps := baseDepsForHas(t, storageSvc)
 
@@ -267,6 +276,7 @@ func TestHandleHasDisk_EmptyStoragePart(t *testing.T) {
 }
 
 func TestHandleHasDisk_EmptyVolumePart(t *testing.T) {
+	t.Parallel()
 	storageSvc := &mockStorageService{}
 	deps := baseDepsForHas(t, storageSvc)
 
@@ -289,6 +299,7 @@ func TestHandleHasDisk_EmptyVolumePart(t *testing.T) {
 // LocalBackend when no node holds the volume), the handler returns false, nil
 // rather than propagating the error. This mirrors the impl branch at has_disk.go:67-71.
 func TestHandleHasDisk_NodeForExistingDiskNotFound(t *testing.T) {
+	t.Parallel()
 	diskNotFound := cpierrors.DiskNotFound("local-lvm:vm-9001-disk-0")
 
 	backend := &hasDiskBackend{
@@ -333,6 +344,7 @@ func TestHandleHasDisk_NodeForExistingDiskNotFound(t *testing.T) {
 // returns a non-not-found error (e.g., a cluster API failure), the handler
 // propagates the error to the caller rather than swallowing it.
 func TestHandleHasDisk_NodeForExistingOtherError(t *testing.T) {
+	t.Parallel()
 	clusterErr := errors.New("cluster API unavailable")
 
 	backend := &hasDiskBackend{
@@ -370,6 +382,7 @@ func TestHandleHasDisk_NodeForExistingOtherError(t *testing.T) {
 // returns an error, the handler propagates it. This exercises the resolution
 // failure path at has_disk.go:61-64.
 func TestHandleHasDisk_BackendResolveError(t *testing.T) {
+	t.Parallel()
 	resolveErr := errors.New("storage info cache miss")
 
 	storageSvc := &mockStorageService{
@@ -413,6 +426,7 @@ func TestHandleHasDisk_BackendResolveError(t *testing.T) {
 // (storage:vmid/volname.ext). ParseDiskCID must split on the first colon only,
 // yielding storage="local" and volume="9001/vm-9001-disk-0.raw".
 func TestHandleHasDisk_Dir_CID(t *testing.T) {
+	t.Parallel()
 	const cid = "local:9001/vm-9001-disk-0.raw"
 
 	storageSvc := &mockStorageService{
@@ -452,6 +466,7 @@ func TestHandleHasDisk_Dir_CID(t *testing.T) {
 // (storage:volname — bare name, no subpath). ParseDiskCID yields
 // storage="local-zfs", volume="vm-9001-disk-0".
 func TestHandleHasDisk_ZFSPool_CID(t *testing.T) {
+	t.Parallel()
 	const cid = "local-zfs:vm-9001-disk-0"
 
 	storageSvc := &mockStorageService{
@@ -491,6 +506,7 @@ func TestHandleHasDisk_ZFSPool_CID(t *testing.T) {
 // (storage:volname — same bare-name shape as lvm and zfspool). ParseDiskCID
 // yields storage="local-lvm-thin", volume="vm-9001-disk-0".
 func TestHandleHasDisk_LVMThin_CID(t *testing.T) {
+	t.Parallel()
 	const cid = "local-lvm-thin:vm-9001-disk-0"
 
 	storageSvc := &mockStorageService{

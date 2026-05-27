@@ -1,4 +1,3 @@
-// Package handlers contains the 22 BOSH CPI v2 method implementations.
 package handlers
 
 import (
@@ -100,7 +99,7 @@ func HandleGetDisks(deps Deps) Handler {
 			if pve.IsNotFound(err) {
 				return nil, cpierrors.VMNotFound(vmCID)
 			}
-			return nil, cpierrors.Wrap(pve.WrapError(err), "get_disks: failed to fetch config for VM "+vmCID)
+			return nil, cpierrors.Wrap(pve.WrapError(err), "get_disks: fetch config for VM "+vmCID)
 		}
 
 		// ----------------------------------------------------------------

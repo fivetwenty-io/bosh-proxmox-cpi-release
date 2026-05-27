@@ -1,5 +1,3 @@
-// Package pve: SharedBackend implementation.
-//
 // SharedBackend governs storages that are cluster-visible (rbd/cephfs/nfs/cifs/
 // glusterfs/pbs, or any storage marked shared=1 in PVE). All cluster nodes can
 // access the volume, so node selection is a pure routing decision driven by

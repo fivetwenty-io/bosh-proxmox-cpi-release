@@ -23,6 +23,7 @@ import (
 // TestNewClient_AppliesTLSConfig verifies the default-options constructor pins
 // the TLS 1.2 minimum on the underlying *http.Transport.
 func TestNewClient_AppliesTLSConfig(t *testing.T) {
+	t.Parallel()
 	c := NewClient("https://example", "u", "p")
 	if c == nil {
 		t.Fatal("NewClient returned nil")
@@ -48,6 +49,7 @@ func TestNewClient_AppliesTLSConfig(t *testing.T) {
 // leaves RootCAs nil (i.e. crypto/tls falls back to x509.SystemCertPool at dial
 // time) rather than constructing an empty pool that would reject every cert.
 func TestNewClientWithOptions_NilCAPreservesSystemPool(t *testing.T) {
+	t.Parallel()
 	c, err := NewClientWithOptions("https://example", "u", "p", Options{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -62,6 +64,7 @@ func TestNewClientWithOptions_NilCAPreservesSystemPool(t *testing.T) {
 // installed into a non-nil RootCAs pool. We synthesize a self-signed cert at
 // runtime so the test owns the input bytes end-to-end (no embedded fixture).
 func TestNewClient_AppendsCustomCA(t *testing.T) {
+	t.Parallel()
 	pemBytes := genSelfSignedPEM(t)
 
 	c, err := NewClientWithOptions("https://example", "u", "p", Options{CACertPEM: string(pemBytes)})
@@ -92,6 +95,7 @@ func TestNewClient_AppendsCustomCA(t *testing.T) {
 // not silently swallowed: the constructor must return an error rather than
 // build a client with an empty RootCAs pool (which would reject every cert).
 func TestNewClientWithOptions_RejectsMalformedPEM(t *testing.T) {
+	t.Parallel()
 	_, err := NewClientWithOptions("https://example", "u", "p", Options{CACertPEM: "this is not pem"})
 	if err == nil {
 		t.Fatal("expected error for malformed PEM, got nil")
@@ -101,6 +105,7 @@ func TestNewClientWithOptions_RejectsMalformedPEM(t *testing.T) {
 // TestNewClientWithOptions_RespectsTimeoutOverride confirms the per-attempt
 // timeout override is applied; zero/negative falls back to the default.
 func TestNewClientWithOptions_RespectsTimeoutOverride(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name    string
 		opts    Options
@@ -149,10 +154,10 @@ func (b *closeCountingBody) Close() error {
 }
 
 // retryThenCancelTransport hands back a 500 response (retriable) with a
-// counted body on every call. After the first response is consumed by the
-// retry loop, the test cancels the request context so the backoff select
-// fires the ctx.Done() branch — that is the path where doWithRetry must
-// drain+close the prior response before returning.
+// counted body on every call. On the first call it cancels the context
+// synchronously before returning, so doWithRetry sees ctx.Done() already
+// closed when it evaluates the backoff select after attempt 0. This ensures
+// the ctx.Done() terminal path is taken without any timing dependency.
 type retryThenCancelTransport struct {
 	body      *closeCountingBody
 	bodyBytes []byte
@@ -166,16 +171,11 @@ func (t *retryThenCancelTransport) RoundTrip(_ *http.Request) (*http.Response, e
 	// The shared body is what the test inspects for Close() invocations.
 	t.body.off = 0
 	t.body.data = t.bodyBytes
-	// Trigger context cancellation AFTER returning the response so the
-	// retry loop sees a retriable response, then hits ctx.Done() in the
-	// backoff select. Schedule via goroutine to avoid blocking RoundTrip.
+	// Cancel the context synchronously on the first call so that by the time
+	// doWithRetry enters the backoff select, ctx.Done() is already closed and
+	// the ctx.Done() case wins deterministically. No sleep or goroutine needed.
 	if n == 1 && t.cancel != nil {
-		go func() {
-			// Small sleep ensures the wrapper has consumed the response
-			// and entered the backoff select before cancellation fires.
-			time.Sleep(10 * time.Millisecond)
-			t.cancel()
-		}()
+		t.cancel()
 	}
 	return &http.Response{
 		StatusCode: http.StatusInternalServerError,
@@ -189,7 +189,20 @@ func (t *retryThenCancelTransport) RoundTrip(_ *http.Request) (*http.Response, e
 // branch in the backoff select. This is one of the two terminal-failure
 // return paths; the other (GetBody failure) is symmetric.
 // A leak here would manifest as the body's Close() never being invoked.
+//
+// retryBaseDelay is set to 1ms to keep the test fast. The context is cancelled
+// synchronously inside RoundTrip on the first call, so ctx.Done() is already
+// closed before the backoff select is evaluated, making the terminal path
+// deterministic without any external sleep or goroutine synchronisation.
 func TestDoWithRetry_ClosesBodyOnTerminalErr(t *testing.T) {
+	// Not parallel: mutates the package-level retryBaseDelay seam.
+	// Running serially ensures no concurrent test reads the var while we write it.
+
+	// Override retryBaseDelay to 1ms; restore on cleanup.
+	prev := retryBaseDelay
+	retryBaseDelay = 1 * time.Millisecond
+	t.Cleanup(func() { retryBaseDelay = prev })
+
 	body := &closeCountingBody{}
 	ctx, cancel := context.WithCancel(context.Background())
 	tr := &retryThenCancelTransport{
@@ -248,6 +261,7 @@ func (t *redirectTransport) RoundTrip(_ *http.Request) (*http.Response, error) {
 // surfaces as an error rather than being silently followed by the HTTP client.
 // This prevents SSRF via redirect to a host not in the configured endpoint.
 func TestCheckRedirect_Disabled(t *testing.T) {
+	t.Parallel()
 	c := &Client{
 		endpoint:       "https://registry.example.com",
 		user:           "u",
@@ -287,6 +301,7 @@ func TestCheckRedirect_Disabled(t *testing.T) {
 // defends against URL-mutation bugs that would silently send credentials to
 // an unintended host.
 func TestHostInvariant_MismatchRejected(t *testing.T) {
+	t.Parallel()
 	c := &Client{
 		endpoint:       "https://registry.example.com",
 		user:           "u",
@@ -315,6 +330,7 @@ func TestHostInvariant_MismatchRejected(t *testing.T) {
 // request whose URL.Host matches configuredHost. The transport returns a 200
 // so the test validates the happy path through the invariant check.
 func TestHostInvariant_MatchAllowed(t *testing.T) {
+	t.Parallel()
 	c := &Client{
 		endpoint:       "https://registry.example.com",
 		user:           "u",
@@ -358,6 +374,7 @@ func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { retu
 // TestAllowedHosts_MatchPermitted verifies that a request whose host matches
 // an entry in allowedHosts is permitted through.
 func TestAllowedHosts_MatchPermitted(t *testing.T) {
+	t.Parallel()
 	c := &Client{
 		endpoint:       "https://registry.example.com",
 		user:           "u",
@@ -393,6 +410,7 @@ func TestAllowedHosts_MatchPermitted(t *testing.T) {
 // TestAllowedHosts_MismatchRejected verifies that a request whose resolved
 // host is not in allowedHosts is rejected before http.Do is called.
 func TestAllowedHosts_MismatchRejected(t *testing.T) {
+	t.Parallel()
 	c := &Client{
 		endpoint:       "https://registry.example.com",
 		user:           "u",
@@ -421,6 +439,7 @@ func TestAllowedHosts_MismatchRejected(t *testing.T) {
 // single-level subdomain (e.g. "registry.example.com") but not a multi-level
 // subdomain ("a.b.example.com") or the bare parent ("example.com").
 func TestAllowedHosts_WildcardMatch(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		host     string
 		patterns []string
@@ -447,6 +466,7 @@ func TestAllowedHosts_WildcardMatch(t *testing.T) {
 // TestAllowedHosts_EmptyListSkipsFilter verifies that an empty allowedHosts
 // slice does not reject any request (filter is disabled when empty).
 func TestAllowedHosts_EmptyListSkipsFilter(t *testing.T) {
+	t.Parallel()
 	c := &Client{
 		endpoint:       "https://registry.example.com",
 		user:           "u",
@@ -486,6 +506,7 @@ func TestAllowedHosts_EmptyListSkipsFilter(t *testing.T) {
 // TestNewClientWithOptions_AllowedHostsWired verifies that AllowedHosts from
 // Options is copied into the Client struct field.
 func TestNewClientWithOptions_AllowedHostsWired(t *testing.T) {
+	t.Parallel()
 	patterns := []string{"registry.example.com", "*.corp.example.com"}
 	c, err := NewClientWithOptions("https://registry.example.com", "u", "p", Options{
 		AllowedHosts: patterns,
@@ -507,6 +528,7 @@ func TestNewClientWithOptions_AllowedHostsWired(t *testing.T) {
 // configuredHost field is set to the host component of the endpoint URL,
 // not the full endpoint string.
 func TestNewClientWithOptions_ConfiguredHostExtracted(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		endpoint string
 		wantHost string
@@ -531,6 +553,7 @@ func TestNewClientWithOptions_ConfiguredHostExtracted(t *testing.T) {
 // TestNewClientWithOptions_CheckRedirectSet verifies that CheckRedirect is
 // set on the http.Client (i.e., is not nil) after construction.
 func TestNewClientWithOptions_CheckRedirectSet(t *testing.T) {
+	t.Parallel()
 	c, err := NewClientWithOptions("https://registry.example.com", "u", "p", Options{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)

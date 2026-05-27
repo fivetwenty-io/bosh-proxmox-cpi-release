@@ -31,6 +31,7 @@ func newRegistryAgent(t *testing.T, srv *httptest.Server) *agent.RegistryAgent {
 // --------------------------------------------------------------------------
 
 func TestConfigure_Put(t *testing.T) {
+	t.Parallel()
 	type captured struct {
 		method  string
 		path    string
@@ -117,6 +118,7 @@ func TestConfigure_Put(t *testing.T) {
 }
 
 func TestConfigure_RegistryError(t *testing.T) {
+	t.Parallel()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 	}))
@@ -133,6 +135,7 @@ func TestConfigure_RegistryError(t *testing.T) {
 }
 
 func TestConfigure_NilPersistentMap(t *testing.T) {
+	t.Parallel()
 	// Ensure nil Disks.Persistent is serialised as {} not null.
 	var settingsStr string
 
@@ -166,6 +169,7 @@ func TestConfigure_NilPersistentMap(t *testing.T) {
 // --------------------------------------------------------------------------
 
 func TestRemove_Delete(t *testing.T) {
+	t.Parallel()
 	var gotMethod, gotPath string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotMethod = r.Method
@@ -187,6 +191,7 @@ func TestRemove_Delete(t *testing.T) {
 }
 
 func TestRemove_404(t *testing.T) {
+	t.Parallel()
 	// 404 from registry Delete must propagate as nil (idempotent).
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
@@ -205,6 +210,7 @@ func TestRemove_404(t *testing.T) {
 
 // TestUpdateDiskHints_GetThenPut verifies the GET → merge → PUT flow.
 func TestUpdateDiskHints_GetThenPut(t *testing.T) {
+	t.Parallel()
 	// Existing settings stored in registry.
 	existingSettings := map[string]any{
 		"agent_id": "agent-xyz",
@@ -233,7 +239,7 @@ func TestUpdateDiskHints_GetThenPut(t *testing.T) {
 		case http.MethodGet:
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
-			w.Write(envelopeBody) //nolint:errcheck
+			w.Write(envelopeBody) //nolint:errcheck // test HTTP handler — write errors not actionable in handler context
 		case http.MethodPut:
 			putBody, _ = io.ReadAll(r.Body)
 			w.WriteHeader(http.StatusOK)
@@ -281,6 +287,7 @@ func TestUpdateDiskHints_GetThenPut(t *testing.T) {
 
 // TestUpdateDiskHints_404OnGet verifies that a 404 from GET returns an error.
 func TestUpdateDiskHints_404OnGet(t *testing.T) {
+	t.Parallel()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 	}))
@@ -298,6 +305,7 @@ func TestUpdateDiskHints_404OnGet(t *testing.T) {
 // TestUpdateDiskHints_EmptyHints verifies no-op on empty hints list still
 // round-trips correctly (GET + PUT with unchanged settings).
 func TestUpdateDiskHints_EmptyHints(t *testing.T) {
+	t.Parallel()
 	existing := map[string]any{
 		"agent_id":  "x",
 		"vm":        map[string]any{},
@@ -318,7 +326,7 @@ func TestUpdateDiskHints_EmptyHints(t *testing.T) {
 		switch r.Method {
 		case http.MethodGet:
 			w.Header().Set("Content-Type", "application/json")
-			w.Write(envelopeBody) //nolint:errcheck
+			w.Write(envelopeBody) //nolint:errcheck // test HTTP handler — write errors not actionable in handler context
 		case http.MethodPut:
 			w.WriteHeader(http.StatusOK)
 		}
@@ -336,6 +344,7 @@ func TestUpdateDiskHints_EmptyHints(t *testing.T) {
 
 // TestUpdateDiskHints_EmptyDevicePath verifies that an empty DevicePath removes the entry.
 func TestUpdateDiskHints_EmptyDevicePath(t *testing.T) {
+	t.Parallel()
 	existing := map[string]any{
 		"disks": map[string]any{
 			"system":    "/dev/sda",
@@ -354,7 +363,7 @@ func TestUpdateDiskHints_EmptyDevicePath(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
-			w.Write(envelopeBody) //nolint:errcheck
+			w.Write(envelopeBody) //nolint:errcheck // test HTTP handler — write errors not actionable in handler context
 		case http.MethodPut:
 			putBody, _ = io.ReadAll(r.Body)
 			w.WriteHeader(http.StatusOK)
@@ -416,6 +425,7 @@ func captureSettings(t *testing.T, cfg agent.AgentConfig) map[string]json.RawMes
 // returns an error when MBus is empty and the blobstore endpoint would produce
 // a credential-less NATS URL. Operators must supply mbus explicitly.
 func TestRegistryAgent_Configure_MBusFallbackReturnsError(t *testing.T) {
+	t.Parallel()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -440,6 +450,7 @@ func TestRegistryAgent_Configure_MBusFallbackReturnsError(t *testing.T) {
 }
 
 func TestRegistryAgent_Configure_MBusExplicitWinsOverFallback(t *testing.T) {
+	t.Parallel()
 	cfg := agent.AgentConfig{
 		AgentID: "x",
 		MBus:    "nats://explicit:4222",
@@ -457,6 +468,7 @@ func TestRegistryAgent_Configure_MBusExplicitWinsOverFallback(t *testing.T) {
 }
 
 func TestRegistryAgent_Configure_MBusEmptyWhenNoBlobstore(t *testing.T) {
+	t.Parallel()
 	cfg := agent.AgentConfig{AgentID: "x"}
 	settings := captureSettings(t, cfg)
 	var mbus string
@@ -471,6 +483,7 @@ func TestRegistryAgent_Configure_MBusEmptyWhenNoBlobstore(t *testing.T) {
 // is applied — registry agent must not write VM.Name="" to the
 // registry just because the caller omitted it.
 func TestRegistryAgent_Configure_AppliesVMNameDefault(t *testing.T) {
+	t.Parallel()
 	cfg := agent.AgentConfig{AgentID: "x"} // VM.Name intentionally empty
 	settings := captureSettings(t, cfg)
 	var vm agent.VMSpec
@@ -485,6 +498,7 @@ func TestRegistryAgent_Configure_AppliesVMNameDefault(t *testing.T) {
 // TestRegistryAgent_Configure_AppliesVMIDDefault verifies that an empty
 // cfg.VM.ID falls back to the vmid string passed to Configure.
 func TestRegistryAgent_Configure_AppliesVMIDDefault(t *testing.T) {
+	t.Parallel()
 	cfg := agent.AgentConfig{AgentID: "x"} // VM.ID intentionally empty
 	settings := captureSettings(t, cfg)
 	var vm agent.VMSpec
@@ -501,6 +515,7 @@ func TestRegistryAgent_Configure_AppliesVMIDDefault(t *testing.T) {
 // (not "networks": null). Empty objects are what the BOSH agent expects;
 // a null field is silently accepted but downstream tests assume {}.
 func TestRegistryAgent_Configure_NetworksRenderAsEmptyObject(t *testing.T) {
+	t.Parallel()
 	cfg := agent.AgentConfig{AgentID: "x"} // Networks intentionally nil
 	settings := captureSettings(t, cfg)
 	raw, ok := settings["networks"]

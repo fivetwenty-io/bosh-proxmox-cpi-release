@@ -8,6 +8,7 @@ import (
 )
 
 func TestBuildFetchedFilename_Happy(t *testing.T) {
+	t.Parallel()
 	name, version, sha := "ubuntu-jammy", "1.438", "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
 	got := BuildFetchedFilename(name, version, sha)
 	want := pve.BuildStemcellFilename(name, version, sha)
@@ -20,6 +21,7 @@ func TestBuildFetchedFilename_Happy(t *testing.T) {
 }
 
 func TestBuildFetchedFilename_ShortSHA(t *testing.T) {
+	t.Parallel()
 	// sha shorter than 8 chars → "00000000" placeholder embedded.
 	got := BuildFetchedFilename("ubuntu-jammy", "1.438", "abc")
 	want := pve.BuildStemcellFilename("ubuntu-jammy", "1.438", "abc")
@@ -32,6 +34,7 @@ func TestBuildFetchedFilename_ShortSHA(t *testing.T) {
 }
 
 func TestPartialFilename_Happy(t *testing.T) {
+	t.Parallel()
 	got := PartialFilename("bosh-stemcell-ubuntu-jammy-1.438-abcdef12.qcow2")
 	want := "bosh-stemcell-ubuntu-jammy-1.438-abcdef12.qcow2.partial"
 	if got != want {
@@ -40,12 +43,14 @@ func TestPartialFilename_Happy(t *testing.T) {
 }
 
 func TestPartialFilename_Empty(t *testing.T) {
+	t.Parallel()
 	if got := PartialFilename(""); got != "" {
 		t.Errorf("PartialFilename(\"\") = %q; want empty string", got)
 	}
 }
 
 func TestFilenamePrefixForDedup_Standard(t *testing.T) {
+	t.Parallel()
 	got := FilenamePrefixForDedup("ubuntu-jammy", "1.438")
 	want := "bosh-stemcell-ubuntu-jammy-1.438-"
 	if got != want {
@@ -59,6 +64,7 @@ func TestFilenamePrefixForDedup_Standard(t *testing.T) {
 }
 
 func TestFilenamePrefixForDedup_EmptyInputs(t *testing.T) {
+	t.Parallel()
 	// Empty name and version must not panic; result is a non-empty string
 	// (sanitizer maps empty to empty then BuildStemcellFilename returns a
 	// degenerate but non-empty filename).
@@ -69,6 +75,7 @@ func TestFilenamePrefixForDedup_EmptyInputs(t *testing.T) {
 }
 
 func TestFilenamePrefixForDedup_SpecialChars(t *testing.T) {
+	t.Parallel()
 	// Special chars in name/version get sanitized to dashes; prefix still
 	// matches files built from the same inputs.
 	got := FilenamePrefixForDedup("Ubuntu Jammy!", "1.438 RC1")

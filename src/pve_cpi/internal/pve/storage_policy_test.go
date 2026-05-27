@@ -39,6 +39,7 @@ func (s *stubPolicyDeps) ClusterNodeCount(_ context.Context) (int, error) {
 // ---- IsBlockStorage helper tests ----------------------------------------
 
 func TestIsBlockStorage(t *testing.T) {
+	t.Parallel()
 	trueTypes := []string{"lvm", "lvmthin", "zfspool", "rbd", "LVM", "LVMTHIN", "ZFSPool", "RBD"}
 	for _, typ := range trueTypes {
 		if !IsBlockStorage(typ) {
@@ -68,6 +69,7 @@ func singleStorageStub(name, typ string, shared bool, clusterSize int) *stubPoli
 
 // Test 1: block storage (lvm) rejected even on single-node cluster.
 func TestValidateLightStemcellStorage_BlockReject_LVM(t *testing.T) {
+	t.Parallel()
 	deps := singleStorageStub("vg0", "lvm", false, 1)
 	_, err := ValidateLightStemcellStorage(context.Background(), deps, "vg0", "")
 	if err == nil {
@@ -81,6 +83,7 @@ func TestValidateLightStemcellStorage_BlockReject_LVM(t *testing.T) {
 // Test 2: block storage (rbd) rejected even though PVE marks it shared by type.
 // Rule 1 (block) must trump rule 3 (shared).
 func TestValidateLightStemcellStorage_BlockReject_RBD(t *testing.T) {
+	t.Parallel()
 	// rbd: Shared flag false but IsShared() would return true via type heuristic —
 	// rule 1 must fire first.
 	deps := singleStorageStub("ceph", "rbd", false, 3)
@@ -98,6 +101,7 @@ func TestValidateLightStemcellStorage_BlockReject_RBD(t *testing.T) {
 
 // Test 3: lvmthin on single-node rejected (block rule beats single-node rule).
 func TestValidateLightStemcellStorage_BlockReject_LVMThin(t *testing.T) {
+	t.Parallel()
 	deps := singleStorageStub("lvtp", "lvmthin", false, 1)
 	_, err := ValidateLightStemcellStorage(context.Background(), deps, "lvtp", "")
 	if err == nil {
@@ -110,6 +114,7 @@ func TestValidateLightStemcellStorage_BlockReject_LVMThin(t *testing.T) {
 
 // Test 4: single-node cluster, dir storage, no node hint → accept, chosenNode="".
 func TestValidateLightStemcellStorage_SingleNode_NoHint(t *testing.T) {
+	t.Parallel()
 	deps := singleStorageStub("local", "dir", false, 1)
 	node, err := ValidateLightStemcellStorage(context.Background(), deps, "local", "")
 	if err != nil {
@@ -122,6 +127,7 @@ func TestValidateLightStemcellStorage_SingleNode_NoHint(t *testing.T) {
 
 // Test 5: single-node cluster, dir storage, node hint provided → accept, hint returned.
 func TestValidateLightStemcellStorage_SingleNode_WithHint(t *testing.T) {
+	t.Parallel()
 	deps := singleStorageStub("local", "dir", false, 1)
 	node, err := ValidateLightStemcellStorage(context.Background(), deps, "local", "pve1")
 	if err != nil {
@@ -134,6 +140,7 @@ func TestValidateLightStemcellStorage_SingleNode_WithHint(t *testing.T) {
 
 // Test 6: multi-node cluster + nfs (shared by type) → accept, no node required.
 func TestValidateLightStemcellStorage_MultiNode_SharedByType(t *testing.T) {
+	t.Parallel()
 	deps := singleStorageStub("nfs1", "nfs", false, 3)
 	node, err := ValidateLightStemcellStorage(context.Background(), deps, "nfs1", "")
 	if err != nil {
@@ -147,6 +154,7 @@ func TestValidateLightStemcellStorage_MultiNode_SharedByType(t *testing.T) {
 
 // Test 7: multi-node cluster + dir storage marked shared via Shared flag → accept.
 func TestValidateLightStemcellStorage_MultiNode_SharedByFlag(t *testing.T) {
+	t.Parallel()
 	deps := &stubPolicyDeps{
 		storages: map[string]StorageInfo{
 			"shared-dir": {Name: "shared-dir", Type: "dir", Shared: true},
@@ -164,6 +172,7 @@ func TestValidateLightStemcellStorage_MultiNode_SharedByFlag(t *testing.T) {
 
 // Test 8: multi-node cluster + cephfs (shared by type) → accept, node hint returned.
 func TestValidateLightStemcellStorage_MultiNode_CephFS(t *testing.T) {
+	t.Parallel()
 	deps := singleStorageStub("cfs", "cephfs", false, 5)
 	node, err := ValidateLightStemcellStorage(context.Background(), deps, "cfs", "pve3")
 	if err != nil {
@@ -176,6 +185,7 @@ func TestValidateLightStemcellStorage_MultiNode_CephFS(t *testing.T) {
 
 // Test 9: multi-node cluster + local dir + node pinned → accept, pin returned.
 func TestValidateLightStemcellStorage_MultiNode_LocalWithPin(t *testing.T) {
+	t.Parallel()
 	deps := singleStorageStub("local", "dir", false, 3)
 	node, err := ValidateLightStemcellStorage(context.Background(), deps, "local", "pve2")
 	if err != nil {
@@ -188,6 +198,7 @@ func TestValidateLightStemcellStorage_MultiNode_LocalWithPin(t *testing.T) {
 
 // Test 10: multi-node cluster + local dir + NO node → reject with actionable message.
 func TestValidateLightStemcellStorage_MultiNode_LocalNoPin_Reject(t *testing.T) {
+	t.Parallel()
 	deps := singleStorageStub("local", "dir", false, 3)
 	_, err := ValidateLightStemcellStorage(context.Background(), deps, "local", "")
 	if err == nil {
@@ -203,6 +214,7 @@ func TestValidateLightStemcellStorage_MultiNode_LocalNoPin_Reject(t *testing.T) 
 
 // Test 11: multi-node + zfspool (block) + node pinned → still rejected (rule 1 first).
 func TestValidateLightStemcellStorage_BlockReject_ZFSPool(t *testing.T) {
+	t.Parallel()
 	deps := singleStorageStub("rpool", "zfspool", false, 1)
 	_, err := ValidateLightStemcellStorage(context.Background(), deps, "rpool", "pve1")
 	if err == nil {
@@ -215,6 +227,7 @@ func TestValidateLightStemcellStorage_BlockReject_ZFSPool(t *testing.T) {
 
 // Test 12: empty storage name → immediate error before any deps call.
 func TestValidateLightStemcellStorage_EmptyStorageName(t *testing.T) {
+	t.Parallel()
 	deps := &stubPolicyDeps{size: 1}
 	_, err := ValidateLightStemcellStorage(context.Background(), deps, "", "")
 	if err == nil {
@@ -227,6 +240,7 @@ func TestValidateLightStemcellStorage_EmptyStorageName(t *testing.T) {
 
 // Test 13: StorageInfo lookup error → propagated as *cpierrors.Error.
 func TestValidateLightStemcellStorage_StorageInfoError(t *testing.T) {
+	t.Parallel()
 	sentinel := errors.New("pve api timeout")
 	deps := &stubPolicyDeps{
 		storages:   map[string]StorageInfo{},
@@ -247,6 +261,7 @@ func TestValidateLightStemcellStorage_StorageInfoError(t *testing.T) {
 
 // Test 14: ClusterNodeCount error → propagated as *cpierrors.Error.
 func TestValidateLightStemcellStorage_ClusterNodeCountError(t *testing.T) {
+	t.Parallel()
 	sentinel := errors.New("cluster unreachable")
 	deps := &stubPolicyDeps{
 		storages: map[string]StorageInfo{
@@ -269,6 +284,7 @@ func TestValidateLightStemcellStorage_ClusterNodeCountError(t *testing.T) {
 
 // Test 15: glusterfs on multi-node (shared by type) → accept.
 func TestValidateLightStemcellStorage_MultiNode_Glusterfs(t *testing.T) {
+	t.Parallel()
 	deps := singleStorageStub("gfs", "glusterfs", false, 4)
 	node, err := ValidateLightStemcellStorage(context.Background(), deps, "gfs", "")
 	if err != nil {
@@ -281,6 +297,7 @@ func TestValidateLightStemcellStorage_MultiNode_Glusterfs(t *testing.T) {
 
 // Test 16: cluster size exactly 2 (boundary) + local + pin → accept.
 func TestValidateLightStemcellStorage_TwoNodeCluster_LocalWithPin(t *testing.T) {
+	t.Parallel()
 	deps := singleStorageStub("local", "dir", false, 2)
 	node, err := ValidateLightStemcellStorage(context.Background(), deps, "local", "pve1")
 	if err != nil {
@@ -293,6 +310,7 @@ func TestValidateLightStemcellStorage_TwoNodeCluster_LocalWithPin(t *testing.T) 
 
 // Test 17: cluster size exactly 2 + local + no pin → reject.
 func TestValidateLightStemcellStorage_TwoNodeCluster_LocalNoPin(t *testing.T) {
+	t.Parallel()
 	deps := singleStorageStub("local", "dir", false, 2)
 	_, err := ValidateLightStemcellStorage(context.Background(), deps, "local", "")
 	if err == nil {

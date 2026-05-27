@@ -91,6 +91,7 @@ func parseResponse(t *testing.T, data string) jsonrpc.Response {
 
 // TestRunCPI_EOF verifies that empty input returns nil (clean exit).
 func TestRunCPI_EOF(t *testing.T) {
+	t.Parallel()
 	cfg, logger := makeTestDeps(t)
 	r := strings.NewReader("")
 	var w bytes.Buffer
@@ -108,6 +109,7 @@ func TestRunCPI_EOF(t *testing.T) {
 
 // TestRunCPI_SingleRequest feeds a valid JSON-RPC request and verifies a response is written.
 func TestRunCPI_SingleRequest(t *testing.T) {
+	t.Parallel()
 	cfg, logger := makeTestDeps(t)
 	r := strings.NewReader(validRequest("info"))
 	var w bytes.Buffer
@@ -132,6 +134,7 @@ func TestRunCPI_SingleRequest(t *testing.T) {
 // TestRunCPI_MalformedJSON feeds garbage JSON and verifies a CloudError is written,
 // then verifies the loop continues to process the subsequent valid request.
 func TestRunCPI_MalformedJSON(t *testing.T) {
+	t.Parallel()
 	cfg, logger := makeTestDeps(t)
 	// Garbage JSON followed by a valid request. The decoder should recover and
 	// process the second request after emitting a CloudError for the first.
@@ -180,6 +183,7 @@ func TestRunCPI_MalformedJSON(t *testing.T) {
 // TestRunCPI_TwoRequests sends two valid JSON-RPC requests and verifies both
 // responses are written in order.
 func TestRunCPI_TwoRequests(t *testing.T) {
+	t.Parallel()
 	cfg, logger := makeTestDeps(t)
 	req1 := `{"method":"create_stemcell","arguments":[],"context":{"request_id":"req-1"},"api_version":2}` + "\n"
 	req2 := `{"method":"delete_stemcell","arguments":[],"context":{"request_id":"req-2"},"api_version":2}` + "\n"
@@ -229,7 +233,7 @@ func TestMain_VersionFlag(t *testing.T) {
 	repoRoot := filepath.Join(filepath.Dir(thisFile), "..", "..")
 
 	binPath := filepath.Join(t.TempDir(), "cpi")
-	buildCmd := exec.Command("go", "build", "-o", binPath, "./cmd/cpi")
+	buildCmd := exec.CommandContext(t.Context(), "go", "build", "-o", binPath, "./cmd/cpi")
 	buildCmd.Dir = repoRoot
 	if out, err := buildCmd.CombinedOutput(); err != nil {
 		// Build failure must fail the test, not skip it — the binary is the
@@ -237,7 +241,7 @@ func TestMain_VersionFlag(t *testing.T) {
 		t.Fatalf("go build failed: %v\n%s", err, out)
 	}
 
-	versionCmd := exec.Command(binPath, "--version")
+	versionCmd := exec.CommandContext(t.Context(), binPath, "--version")
 	out, err := versionCmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("--version exited non-zero: %v\noutput: %s", err, out)
@@ -259,6 +263,7 @@ func TestMain_VersionFlag(t *testing.T) {
 // produced exactly one response carrying that error type. Complements
 // TestRunCPI_SingleRequest by also confirming the request_id flows through.
 func TestRunCPI_DispatchesRequest(t *testing.T) {
+	t.Parallel()
 	_, logger := makeTestDeps(t)
 	req := `{"method":"info","arguments":[],"context":{"request_id":"dispatch-id-1"},"api_version":2}` + "\n"
 	r := strings.NewReader(req)
@@ -296,6 +301,7 @@ func TestRunCPI_DispatchesRequest(t *testing.T) {
 // TestRunCPI_EOF in that it explicitly uses an io.Pipe-style reader that
 // has already returned EOF to exercise the empty-Scan path.
 func TestRunCPI_HandlesEOF(t *testing.T) {
+	t.Parallel()
 	_, logger := makeTestDeps(t)
 	// strings.NewReader("") returns (0, io.EOF) on the first Read, mirroring
 	// what stdin behaves like when the BOSH director closes its end without
@@ -318,6 +324,7 @@ func TestRunCPI_HandlesEOF(t *testing.T) {
 // TestRunCPI_MalformedJSON (which also covers loop continuation after the
 // error) by isolating the envelope contract.
 func TestRunCPI_MalformedJSONReturnsError(t *testing.T) {
+	t.Parallel()
 	_, logger := makeTestDeps(t)
 	r := strings.NewReader("{garbage\n")
 	var w bytes.Buffer

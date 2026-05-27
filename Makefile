@@ -129,7 +129,7 @@ vet: ## Run go vet
 # Pinned golangci-lint version — update here when upgrading.
 # go run is used as a fallback when the binary is not present, ensuring CI
 # (golang:1.26 image) runs lint without baking golangci-lint into the image.
-GOLANGCI_LINT_VERSION := v1.64.8
+GOLANGCI_LINT_VERSION := v2.12.2
 
 .PHONY: lint
 lint: ## Run golangci-lint (binary if installed, else go run @pinned version)

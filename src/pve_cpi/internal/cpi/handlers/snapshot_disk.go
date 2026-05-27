@@ -1,4 +1,3 @@
-// Package handlers contains the 22 BOSH CPI v2 method implementations.
 package handlers
 
 import (
@@ -80,7 +79,7 @@ func HandleSnapshotDisk(deps Deps) Handler {
 		// ----------------------------------------------------------------
 		snapName, err := generateSnapName()
 		if err != nil {
-			return nil, cpierrors.Wrap(err, "snapshot_disk: failed to generate snapshot name")
+			return nil, cpierrors.Wrap(err, "snapshot_disk: generate snapshot name")
 		}
 
 		// ----------------------------------------------------------------

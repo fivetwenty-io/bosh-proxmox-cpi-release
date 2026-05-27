@@ -151,6 +151,7 @@ func resizeQEMUWithDisk(diskSlot, diskOptStr string, resizeFn func(ctx context.C
 // ---------------------------------------------------------------------------
 
 func TestHandleResizeDisk_Grow(t *testing.T) {
+	t.Parallel()
 	const diskCID = "local-lvm:vm-9001-disk-0"
 	const volid = "local-lvm:vm-9001-disk-0"
 
@@ -177,6 +178,7 @@ func TestHandleResizeDisk_Grow(t *testing.T) {
 }
 
 func TestHandleResizeDisk_NoOp(t *testing.T) {
+	t.Parallel()
 	// new_size_mb == current_size → delta == 0 → no-op, no resize call.
 	const diskCID = "local-lvm:vm-9001-disk-0"
 
@@ -199,6 +201,7 @@ func TestHandleResizeDisk_NoOp(t *testing.T) {
 }
 
 func TestHandleResizeDisk_ShrinkRejected(t *testing.T) {
+	t.Parallel()
 	// new_size_mb < current_size → NotSupported error.
 	const diskCID = "local-lvm:vm-9001-disk-0"
 
@@ -216,6 +219,7 @@ func TestHandleResizeDisk_ShrinkRejected(t *testing.T) {
 }
 
 func TestHandleResizeDisk_WithUpid(t *testing.T) {
+	t.Parallel()
 	const diskCID = "local-lvm:vm-9001-disk-0"
 
 	var waitCalled bool
@@ -241,6 +245,7 @@ func TestHandleResizeDisk_WithUpid(t *testing.T) {
 }
 
 func TestHandleResizeDisk_DiskNotAttached(t *testing.T) {
+	t.Parallel()
 	const diskCID = "local-lvm:vm-9001-disk-0"
 
 	// Cluster has a VM but it doesn't have the disk.
@@ -258,6 +263,7 @@ func TestHandleResizeDisk_DiskNotAttached(t *testing.T) {
 }
 
 func TestHandleResizeDisk_SizeParseFail(t *testing.T) {
+	t.Parallel()
 	// Disk has no "size=" in option string → parseDiskSizeGiB returns error.
 	const diskCID = "local-lvm:vm-9001-disk-0"
 
@@ -271,6 +277,7 @@ func TestHandleResizeDisk_SizeParseFail(t *testing.T) {
 }
 
 func TestHandleResizeDisk_ResizeSDKError(t *testing.T) {
+	t.Parallel()
 	const diskCID = "local-lvm:vm-9001-disk-0"
 
 	qemuSvc := resizeQEMUWithDisk("scsi2", "local-lvm:vm-9001-disk-0,size=10G", func(_ context.Context, _ string, _ int, _ string, _ int) (string, error) {
@@ -285,6 +292,7 @@ func TestHandleResizeDisk_ResizeSDKError(t *testing.T) {
 }
 
 func TestHandleResizeDisk_MalformedDiskCID(t *testing.T) {
+	t.Parallel()
 	h := handlers.HandleResizeDisk(resizeDeps(&resizeQEMUService{}, &snapClusterService{}, nil))
 	_, err := h.Handle(context.Background(), marshalArgs("no-colon-cid", 10240), jsonrpc.Context{})
 	if err == nil {
@@ -293,6 +301,7 @@ func TestHandleResizeDisk_MalformedDiskCID(t *testing.T) {
 }
 
 func TestHandleResizeDisk_ZeroSizeMB(t *testing.T) {
+	t.Parallel()
 	h := handlers.HandleResizeDisk(resizeDeps(&resizeQEMUService{}, &snapClusterService{}, nil))
 	_, err := h.Handle(context.Background(), marshalArgs("local-lvm:vol", 0), jsonrpc.Context{})
 	if err == nil {
@@ -301,6 +310,7 @@ func TestHandleResizeDisk_ZeroSizeMB(t *testing.T) {
 }
 
 func TestHandleResizeDisk_TooFewArgs(t *testing.T) {
+	t.Parallel()
 	h := handlers.HandleResizeDisk(resizeDeps(&resizeQEMUService{}, &snapClusterService{}, nil))
 	_, err := h.Handle(context.Background(), marshalArgs("local-lvm:vol"), jsonrpc.Context{})
 	if err == nil {
@@ -315,6 +325,7 @@ func TestHandleResizeDisk_TooFewArgs(t *testing.T) {
 // drives node selection, and a successful scan with no matches is the new
 // failure surface.
 func TestHandleResizeDisk_NoConfigNodeAndEmptyCluster(t *testing.T) {
+	t.Parallel()
 	h := handlers.HandleResizeDisk(handlers.Deps{
 		Config: &config.CPIConfig{Node: ""},
 		PVE: &mockPVEClient{
@@ -330,6 +341,7 @@ func TestHandleResizeDisk_NoConfigNodeAndEmptyCluster(t *testing.T) {
 }
 
 func TestHandleResizeDisk_CeilingMath(t *testing.T) {
+	t.Parallel()
 	// 10241 MiB → ceil → 11 GiB; current = 10 GiB → delta = 1 GiB.
 	const diskCID = "local-lvm:vm-9001-disk-0"
 
@@ -381,6 +393,7 @@ func resizeQEMUWithDiskAndSnapshots(
 }
 
 func TestHandleResizeDisk_SnapshotsPresent_HardFail(t *testing.T) {
+	t.Parallel()
 	// Snapshots exist, AllowDiskOpsWithSnapshots=false → Cloud error; ResizeDisk NOT called.
 	const diskCID = "local-lvm:vm-9001-disk-0"
 
@@ -423,6 +436,7 @@ func TestHandleResizeDisk_SnapshotsPresent_HardFail(t *testing.T) {
 }
 
 func TestHandleResizeDisk_NoSnapshots_Proceeds(t *testing.T) {
+	t.Parallel()
 	// No real snapshots → guard passes → ResizeDisk called.
 	const diskCID = "local-lvm:vm-9001-disk-0"
 
@@ -451,6 +465,7 @@ func TestHandleResizeDisk_NoSnapshots_Proceeds(t *testing.T) {
 }
 
 func TestHandleResizeDisk_SnapshotCheckError_FailOpen(t *testing.T) {
+	t.Parallel()
 	// ListSnapshots returns error, RequireSnapshotCheckPass=false → WARN + proceed (ResizeDisk called).
 	const diskCID = "local-lvm:vm-9001-disk-0"
 
@@ -481,6 +496,7 @@ func TestHandleResizeDisk_SnapshotCheckError_FailOpen(t *testing.T) {
 }
 
 func TestHandleResizeDisk_SnapshotCheckError_FailClosed(t *testing.T) {
+	t.Parallel()
 	// ListSnapshots returns error, RequireSnapshotCheckPass=true → error returned; ResizeDisk NOT called.
 	const diskCID = "local-lvm:vm-9001-disk-0"
 
@@ -514,6 +530,7 @@ func TestHandleResizeDisk_SnapshotCheckError_FailClosed(t *testing.T) {
 }
 
 func TestHandleResizeDisk_SnapshotsPresent_AllowOverride(t *testing.T) {
+	t.Parallel()
 	// Snapshots exist, AllowDiskOpsWithSnapshots=true → WARN + ResizeDisk called.
 	const diskCID = "local-lvm:vm-9001-disk-0"
 
@@ -548,6 +565,7 @@ func TestHandleResizeDisk_SnapshotsPresent_AllowOverride(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestHandleResizeDisk_ConfigFetchError(t *testing.T) {
+	t.Parallel()
 	// Gap #1: QEMU().Config() returns an error after the disk is located.
 	// The handler must propagate the error rather than proceeding with
 	// an unknown current size.
@@ -579,6 +597,7 @@ func TestHandleResizeDisk_ConfigFetchError(t *testing.T) {
 }
 
 func TestHandleResizeDisk_UnknownSizeUnit(t *testing.T) {
+	t.Parallel()
 	// parseDiskSizeGiB accepts K/M/G/T/P case-insensitive; any other unit
 	// suffix is rejected. Confirm "xyz" trailing characters trigger the
 	// handler's error path.
@@ -593,6 +612,7 @@ func TestHandleResizeDisk_UnknownSizeUnit(t *testing.T) {
 }
 
 func TestHandleResizeDisk_AwaitTaskFailure(t *testing.T) {
+	t.Parallel()
 	// Gap #3: ResizeDisk returns a UPID; AwaitTask returns a non-OK ExitStatus.
 	// AwaitTaskWithLogger (pve/task.go) wraps non-OK exit status as a Cloud
 	// error; RetryOnTransientOrLock propagates it; the handler wraps it again
@@ -626,6 +646,7 @@ func TestHandleResizeDisk_AwaitTaskFailure(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestHandleResizeDisk_Dir_CID(t *testing.T) {
+	t.Parallel()
 	// dir-style CID: storage="local", volume="9001/vm-9001-disk-0.raw".
 	// ParseDiskCID splits on the first colon only; the subpath segment is
 	// opaque to the handler. FindVMByDiskVolid matches on the full CID string.
@@ -651,6 +672,7 @@ func TestHandleResizeDisk_Dir_CID(t *testing.T) {
 }
 
 func TestHandleResizeDisk_ZFSPool_CID(t *testing.T) {
+	t.Parallel()
 	// zfspool-style CID: bare volume name, no subpath or extension.
 	// ParseDiskCID splits on colon; volume segment is "vm-9001-disk-0".
 	const diskCID = "local-zfs:vm-9001-disk-0"
@@ -675,6 +697,7 @@ func TestHandleResizeDisk_ZFSPool_CID(t *testing.T) {
 }
 
 func TestHandleResizeDisk_LVMThin_CID(t *testing.T) {
+	t.Parallel()
 	// lvmthin-style CID: bare volume name, same format as lvm.
 	// ParseDiskCID splits on colon; volume segment is "vm-9001-disk-0".
 	const diskCID = "local-lvm-thin:vm-9001-disk-0"

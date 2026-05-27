@@ -35,6 +35,7 @@ func baseDepsForDelete(t *testing.T, storageSvc *mockStorageService) handlers.De
 // ---------------------------------------------------------------------------
 
 func TestHandleDeleteDisk_Happy(t *testing.T) {
+	t.Parallel()
 	var deleteCalled bool
 	storageSvc := &mockStorageService{
 		deleteVolumeFn: func(_ context.Context, node, storage, volume string) error {
@@ -70,6 +71,7 @@ func TestHandleDeleteDisk_Happy(t *testing.T) {
 }
 
 func TestHandleDeleteDisk_NotFound_Idempotent(t *testing.T) {
+	t.Parallel()
 	// SDK 404 → DeleteVolume already handles it; but test that a not-found
 	// error surfacing from a non-SDK path is also treated as success.
 	storageSvc := &mockStorageService{
@@ -97,6 +99,7 @@ func TestHandleDeleteDisk_NotFound_Idempotent(t *testing.T) {
 }
 
 func TestHandleDeleteDisk_SDKError(t *testing.T) {
+	t.Parallel()
 	storageSvc := &mockStorageService{
 		deleteVolumeFn: func(_ context.Context, _, _, _ string) error {
 			return errors.New("storage backend unavailable")
@@ -115,6 +118,7 @@ func TestHandleDeleteDisk_SDKError(t *testing.T) {
 }
 
 func TestHandleDeleteDisk_MalformedCID_NoColon(t *testing.T) {
+	t.Parallel()
 	storageSvc := &mockStorageService{}
 	deps := baseDepsForDelete(t, storageSvc)
 
@@ -129,6 +133,7 @@ func TestHandleDeleteDisk_MalformedCID_NoColon(t *testing.T) {
 }
 
 func TestHandleDeleteDisk_EmptyCID(t *testing.T) {
+	t.Parallel()
 	storageSvc := &mockStorageService{}
 	deps := baseDepsForDelete(t, storageSvc)
 
@@ -143,6 +148,7 @@ func TestHandleDeleteDisk_EmptyCID(t *testing.T) {
 }
 
 func TestHandleDeleteDisk_TooFewArgs(t *testing.T) {
+	t.Parallel()
 	storageSvc := &mockStorageService{}
 	deps := baseDepsForDelete(t, storageSvc)
 
@@ -155,6 +161,7 @@ func TestHandleDeleteDisk_TooFewArgs(t *testing.T) {
 }
 
 func TestHandleDeleteDisk_MissingNode(t *testing.T) {
+	t.Parallel()
 	storageSvc := &mockStorageService{}
 	deps := handlers.Deps{
 		Config: &config.CPIConfig{
@@ -176,6 +183,7 @@ func TestHandleDeleteDisk_MissingNode(t *testing.T) {
 }
 
 func TestHandleDeleteDisk_EmptyStoragePart(t *testing.T) {
+	t.Parallel()
 	storageSvc := &mockStorageService{}
 	deps := baseDepsForDelete(t, storageSvc)
 
@@ -190,6 +198,7 @@ func TestHandleDeleteDisk_EmptyStoragePart(t *testing.T) {
 }
 
 func TestHandleDeleteDisk_EmptyVolumePart(t *testing.T) {
+	t.Parallel()
 	storageSvc := &mockStorageService{}
 	deps := baseDepsForDelete(t, storageSvc)
 
@@ -214,6 +223,7 @@ func newHandlerMockClientNoCluster(storageSvc *mockStorageService) any /* pve.Cl
 // simulates a non-SDK not-found to exercise the CPI-level IsNotFound fallback.
 
 func TestHandleDeleteDisk_SDKDeleteVolumeReturnsNil(t *testing.T) {
+	t.Parallel()
 	// SDK already returns nil for 404 — most common production path.
 	storageSvc := &mockStorageService{
 		deleteVolumeFn: func(_ context.Context, _, _, _ string) error {
@@ -247,6 +257,7 @@ func TestHandleDeleteDisk_SDKDeleteVolumeReturnsNil(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestHandleDeleteDisk_LVM_CID(t *testing.T) {
+	t.Parallel()
 	const cid = "local-lvm:vm-9001-disk-0"
 	var capturedStorage, capturedVolume string
 	storageSvc := &mockStorageService{
@@ -272,6 +283,7 @@ func TestHandleDeleteDisk_LVM_CID(t *testing.T) {
 }
 
 func TestHandleDeleteDisk_LVMThin_CID(t *testing.T) {
+	t.Parallel()
 	const cid = "local-lvm-thin:vm-9001-disk-0"
 	var capturedStorage, capturedVolume string
 	storageSvc := &mockStorageService{
@@ -297,6 +309,7 @@ func TestHandleDeleteDisk_LVMThin_CID(t *testing.T) {
 }
 
 func TestHandleDeleteDisk_ZFSPool_CID(t *testing.T) {
+	t.Parallel()
 	const cid = "local-zfs:vm-9001-disk-0"
 	var capturedStorage, capturedVolume string
 	storageSvc := &mockStorageService{
@@ -322,6 +335,7 @@ func TestHandleDeleteDisk_ZFSPool_CID(t *testing.T) {
 }
 
 func TestHandleDeleteDisk_Dir_CID(t *testing.T) {
+	t.Parallel()
 	// dir-style CID: path-form volume — the portion after the first colon
 	// contains a subpath with vmid prefix and extension.
 	// ParseDiskCID splits on the first colon only, so storage="local" and
@@ -377,6 +391,7 @@ func TestHandleDeleteDisk_Dir_CID(t *testing.T) {
 // Ensure cluster list not needed when using newHandlerMockClient.
 // This validates the delete_disk handler does NOT call NextDiskVMID.
 func TestHandleDeleteDisk_NoClusterCallExpected(t *testing.T) {
+	t.Parallel()
 	clusterCalled := false
 	listFn := func(_ context.Context, _ *sdkclusterapi.ListResourcesParams) (*sdkclusterapi.ListResourcesResponse, error) {
 		clusterCalled = true
@@ -417,6 +432,7 @@ func TestHandleDeleteDisk_NoClusterCallExpected(t *testing.T) {
 // must not require the cluster service for volume deletion. newHandlerMockClientNoCluster
 // wires an empty cluster list, confirming the delete path never touches VMID allocation.
 func TestHandleDeleteDisk_WithoutClusterService(t *testing.T) {
+	t.Parallel()
 	var deleteCalled bool
 	storageSvc := &mockStorageService{
 		deleteVolumeFn: func(_ context.Context, _, storage, volume string) error {

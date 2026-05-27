@@ -9,6 +9,7 @@ import (
 // parseDiskSizeGiB across K/M/G/T/P (case-insensitive), unit-less bytes,
 // and an explicit rejection of unknown trailing units.
 func TestParseDiskSizeGiB_Units(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name    string
 		optStr  string
@@ -64,6 +65,7 @@ func TestParseDiskSizeGiB_Units(t *testing.T) {
 // surfaced as an error rather than silently truncated. PVE does not emit
 // negative sizes; this is a defense-in-depth guard against config corruption.
 func TestParseDiskSizeGiB_NegativeRejected(t *testing.T) {
+	t.Parallel()
 	_, err := parseDiskSizeGiB("vol,size=-1G")
 	if err == nil {
 		t.Fatal("expected error for negative size, got nil")

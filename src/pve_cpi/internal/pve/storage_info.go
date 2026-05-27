@@ -1,7 +1,7 @@
-// Package pve: storage classification cache for the persistent-disk backend
-// abstraction. StorageInfo distills the PVE /storage record into the two
-// fields the CPI needs at the backend layer: whether the storage is shared
-// across the cluster and which nodes (if restricted) can host volumes on it.
+// Storage classification cache for the persistent-disk backend abstraction.
+// StorageInfo distills the PVE /storage record into the two fields the CPI
+// needs at the backend layer: whether the storage is shared across the cluster
+// and which nodes (if restricted) can host volumes on it.
 package pve
 
 import (
@@ -34,7 +34,7 @@ func (s StorageInfo) IsShared() bool {
 		return true
 	}
 	switch strings.ToLower(s.Type) {
-	case "rbd", "cephfs", "nfs", "cifs", "glusterfs", "pbs":
+	case StorageTypeRBD, StorageTypeCephFS, StorageTypeNFS, StorageTypeCIFS, StorageTypeGlusterFS, StorageTypePBS:
 		return true
 	}
 	return false
@@ -90,7 +90,10 @@ type negativeCacheEntry struct {
 // enough that a transient PVE blip clears before any human-noticeable
 // extra latency, long enough that a thundering herd of CPI requests on
 // the same cold cache only triggers one upstream call per window.
-const negativeCacheTTL = 5 * time.Second
+//
+// Declared as a var (not const) so tests can swap the value via t.Cleanup
+// to exercise TTL expiry without sleeping 5+ seconds in CI.
+var negativeCacheTTL = 5 * time.Second
 
 // NewStorageInfoCache constructs a cache backed by lister. ttl <= 0 disables
 // caching (every Get triggers a fetch).
@@ -171,15 +174,26 @@ func (c *StorageInfoCache) Get(ctx context.Context, name string) (StorageInfo, e
 		// are parked on ch; goroutines for different keys proceed unobstructed.
 		refreshErr := c.refresh(ctx)
 
-		// Close the channel to unblock all waiters, then remove the sentinel.
+		// Ordering invariant: refresh() writes the negative-cache entry under
+		// c.mu before returning a non-nil error (see negCache writes in
+		// refresh). Closing ch under the same mutex ensures that release pairs
+		// with each waiter's c.mu acquire on re-entry, making the negCache
+		// write visible before the re-read. Without this ordering, waiters
+		// unblock on close(ch), find no valid entry and no negative-cache hit,
+		// and each spawns its own refresh (thundering herd).
+		if refreshErr != nil {
+			c.mu.Lock()
+			close(ch)
+			delete(c.inflight, name)
+			c.mu.Unlock()
+			return StorageInfo{}, refreshErr
+		}
+
+		// Success path: close the channel and remove the sentinel.
 		close(ch)
 		c.mu.Lock()
 		delete(c.inflight, name)
 		c.mu.Unlock()
-
-		if refreshErr != nil {
-			return StorageInfo{}, refreshErr
-		}
 
 		// Read the result under lock; absent entry is a not-found error.
 		c.mu.Lock()

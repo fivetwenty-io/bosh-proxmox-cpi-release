@@ -412,7 +412,7 @@ func AllocateWithRetry(
 	}
 
 	return 0, cpierrors.Cloud(
-		"AllocateWithRetry: failed to allocate VMID after %d attempts (last attempted VMID %d)",
+		"AllocateWithRetry: exhausted VMID allocation after %d attempts (last attempted VMID %d)",
 		maxAttempts, lastVMID,
 	)
 }
@@ -471,7 +471,7 @@ func AllocateDiskWithRetry(
 	}
 
 	return 0, cpierrors.Cloud(
-		"AllocateDiskWithRetry: failed to allocate disk VMID after %d attempts (last attempted VMID %d)",
+		"AllocateDiskWithRetry: exhausted disk VMID allocation after %d attempts (last attempted VMID %d)",
 		maxAttempts, lastVMID,
 	)
 }

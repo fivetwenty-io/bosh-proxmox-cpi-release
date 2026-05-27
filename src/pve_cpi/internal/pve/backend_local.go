@@ -1,5 +1,3 @@
-// Package pve: LocalBackend implementation.
-//
 // LocalBackend governs storages that live on a single node (lvm/lvmthin/zfspool/
 // dir/btrfs not flagged shared=1). Disk operations and the VM that attaches the
 // disk must target the same node.

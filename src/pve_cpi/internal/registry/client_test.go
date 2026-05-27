@@ -28,6 +28,7 @@ func newTestClient(t *testing.T, handler http.HandlerFunc) (*registry.Client, *h
 // --------------------------------------------------------------------------
 
 func TestPut_Success(t *testing.T) {
+	t.Parallel()
 	type settings struct {
 		AgentID string `json:"agent_id"`
 	}
@@ -77,6 +78,7 @@ func TestPut_Success(t *testing.T) {
 }
 
 func TestPut_Non2xx(t *testing.T) {
+	t.Parallel()
 	client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 	})
@@ -91,6 +93,7 @@ func TestPut_Non2xx(t *testing.T) {
 }
 
 func TestPut_EmptyInstanceID(t *testing.T) {
+	t.Parallel()
 	client := registry.NewClient("http://localhost:25777", "u", "p")
 	err := client.Put(context.Background(), "", map[string]string{})
 	if err == nil {
@@ -103,6 +106,7 @@ func TestPut_EmptyInstanceID(t *testing.T) {
 // --------------------------------------------------------------------------
 
 func TestGet_Success(t *testing.T) {
+	t.Parallel()
 	inner := map[string]any{
 		"agent_id": "xyz-789",
 		"mbus":     "nats://host:4222",
@@ -118,7 +122,7 @@ func TestGet_Success(t *testing.T) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		w.Write(envBody) //nolint:errcheck
+		w.Write(envBody) //nolint:errcheck // test HTTP handler — write errors not actionable in handler context
 	})
 
 	raw, err := client.Get(context.Background(), "100")
@@ -136,6 +140,7 @@ func TestGet_Success(t *testing.T) {
 }
 
 func TestGet_404(t *testing.T) {
+	t.Parallel()
 	client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 	})
@@ -153,6 +158,7 @@ func TestGet_404(t *testing.T) {
 }
 
 func TestGet_Non2xx(t *testing.T) {
+	t.Parallel()
 	client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
 	})
@@ -167,6 +173,7 @@ func TestGet_Non2xx(t *testing.T) {
 }
 
 func TestGet_EmptyInstanceID(t *testing.T) {
+	t.Parallel()
 	client := registry.NewClient("http://localhost:25777", "u", "p")
 	_, err := client.Get(context.Background(), "")
 	if err == nil {
@@ -179,6 +186,7 @@ func TestGet_EmptyInstanceID(t *testing.T) {
 // --------------------------------------------------------------------------
 
 func TestDelete_Success(t *testing.T) {
+	t.Parallel()
 	var gotMethod, gotPath string
 	client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		gotMethod = r.Method
@@ -198,6 +206,7 @@ func TestDelete_Success(t *testing.T) {
 }
 
 func TestDelete_404(t *testing.T) {
+	t.Parallel()
 	client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 	})
@@ -209,6 +218,7 @@ func TestDelete_404(t *testing.T) {
 }
 
 func TestDelete_500(t *testing.T) {
+	t.Parallel()
 	client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "crash", http.StatusInternalServerError)
 	})
@@ -223,6 +233,7 @@ func TestDelete_500(t *testing.T) {
 }
 
 func TestDelete_EmptyInstanceID(t *testing.T) {
+	t.Parallel()
 	client := registry.NewClient("http://localhost:25777", "u", "p")
 	err := client.Delete(context.Background(), "")
 	if err == nil {
@@ -235,6 +246,7 @@ func TestDelete_EmptyInstanceID(t *testing.T) {
 // --------------------------------------------------------------------------
 
 func TestAuthHeader_Encoded(t *testing.T) {
+	t.Parallel()
 	const user, pass = "admin", "s3cr3t!"
 	var gotAuth string
 
@@ -258,6 +270,7 @@ func TestAuthHeader_Encoded(t *testing.T) {
 // --------------------------------------------------------------------------
 
 func TestEndpointTrimmed(t *testing.T) {
+	t.Parallel()
 	var gotPath string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotPath = r.URL.Path
@@ -282,6 +295,7 @@ func TestEndpointTrimmed(t *testing.T) {
 // --------------------------------------------------------------------------
 
 func TestContextCancellation(t *testing.T) {
+	t.Parallel()
 	// Server that delays long enough for the context to expire.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		select {
@@ -314,6 +328,7 @@ func TestContextCancellation(t *testing.T) {
 // --------------------------------------------------------------------------
 
 func TestPut_ContentTypeJSON(t *testing.T) {
+	t.Parallel()
 	var gotCT string
 	client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		gotCT = r.Header.Get("Content-Type")
@@ -333,6 +348,7 @@ func TestPut_ContentTypeJSON(t *testing.T) {
 // TestPut_RetriesOnTransient verifies that Put retries on a 503 and succeeds
 // on the subsequent 200, issuing exactly 2 HTTP requests total.
 func TestPut_RetriesOnTransient(t *testing.T) {
+	t.Parallel()
 	var callCount int
 	client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		callCount++
@@ -356,6 +372,7 @@ func TestPut_RetriesOnTransient(t *testing.T) {
 // retry budget is exhausted by persistent 5xx responses, and that exactly
 // 3 HTTP requests are issued (1 initial + 2 retries).
 func TestPut_AllRetriesExhausted_5xx(t *testing.T) {
+	t.Parallel()
 	var callCount int
 	client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		callCount++
@@ -373,6 +390,7 @@ func TestPut_AllRetriesExhausted_5xx(t *testing.T) {
 
 // TestPut_NoRetryOn4xx verifies that Put does not retry on a 400 Bad Request.
 func TestPut_NoRetryOn4xx(t *testing.T) {
+	t.Parallel()
 	var callCount int
 	client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		callCount++
@@ -390,6 +408,7 @@ func TestPut_NoRetryOn4xx(t *testing.T) {
 
 // TestGet_RetriesOnTransient verifies that Get retries on a 503 response.
 func TestGet_RetriesOnTransient(t *testing.T) {
+	t.Parallel()
 	inner := map[string]any{"agent_id": "xyz"}
 	innerJSON, _ := json.Marshal(inner)
 	envelope := map[string]string{"settings": string(innerJSON)}
@@ -404,7 +423,7 @@ func TestGet_RetriesOnTransient(t *testing.T) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		w.Write(envBody) //nolint:errcheck
+		w.Write(envBody) //nolint:errcheck // test HTTP handler — write errors not actionable in handler context
 	})
 
 	raw, err := client.Get(context.Background(), "100")
@@ -421,6 +440,7 @@ func TestGet_RetriesOnTransient(t *testing.T) {
 
 // TestDelete_RetriesOnTransient verifies that Delete retries on a 503 response.
 func TestDelete_RetriesOnTransient(t *testing.T) {
+	t.Parallel()
 	var callCount int
 	client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		callCount++
@@ -445,6 +465,7 @@ func TestDelete_RetriesOnTransient(t *testing.T) {
 // --------------------------------------------------------------------------
 
 func TestPut_InstanceIDInPath(t *testing.T) {
+	t.Parallel()
 	var gotPath string
 	client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		gotPath = r.URL.Path
@@ -480,6 +501,7 @@ func TestPut_InstanceIDInPath(t *testing.T) {
 // the deterministic floor (405ms), which still proves the sleeps actually ran
 // rather than being silently skipped.
 func TestPut_RetryExhaustion_BackoffWallClock(t *testing.T) {
+	t.Parallel()
 	var callCount int
 	client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		callCount++
@@ -521,6 +543,7 @@ func TestPut_RetryExhaustion_BackoffWallClock(t *testing.T) {
 // with 2 MiB and a 200 status (so the success-path ReadAll fires) — the
 // unmarshal will fail, but the captured length tells us the cap held.
 func TestReadAll_CappedAt1MiB(t *testing.T) {
+	t.Parallel()
 	const (
 		oneMiB = 1 << 20
 		twoMiB = 2 * oneMiB

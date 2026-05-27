@@ -9,6 +9,7 @@ import (
 )
 
 func TestFieldConstructors_AllTypes(t *testing.T) {
+	t.Parallel()
 	if got := Int64("k", 42); got.Key != "k" || got.Value.Int64() != 42 {
 		t.Fatalf("Int64: got %+v", got)
 	}
@@ -25,6 +26,7 @@ func TestFieldConstructors_AllTypes(t *testing.T) {
 }
 
 func TestObserver_CapturesEntries(t *testing.T) {
+	t.Parallel()
 	l, obs := NewObservedLogger(slog.LevelDebug)
 	l.Info("hello", String("k", "v"), Int("n", 7))
 	l.Warn("watch", Bool("b", true))
@@ -49,6 +51,7 @@ func TestObserver_CapturesEntries(t *testing.T) {
 }
 
 func TestObserver_LevelFilter(t *testing.T) {
+	t.Parallel()
 	l, obs := NewObservedLogger(slog.LevelWarn)
 	l.Debug("d")
 	l.Info("i")
@@ -64,6 +67,7 @@ func TestObserver_LevelFilter(t *testing.T) {
 }
 
 func TestObserver_WithAttrsCarriesParent(t *testing.T) {
+	t.Parallel()
 	l, obs := NewObservedLogger(slog.LevelDebug)
 	child := l.With(String("scope", "test"))
 	child.Info("msg", Int("n", 1))
@@ -75,6 +79,7 @@ func TestObserver_WithAttrsCarriesParent(t *testing.T) {
 }
 
 func TestObserver_WithGroupIsTransparent(t *testing.T) {
+	t.Parallel()
 	obs := &Observer{}
 	h := &observerHandler{minLevel: slog.LevelDebug, obs: obs}
 	grouped := h.WithGroup("ignored")
@@ -87,6 +92,7 @@ func TestObserver_WithGroupIsTransparent(t *testing.T) {
 }
 
 func TestObserver_ConcurrentSafe(t *testing.T) {
+	t.Parallel()
 	l, obs := NewObservedLogger(slog.LevelDebug)
 	var wg sync.WaitGroup
 	const n = 50
@@ -104,6 +110,7 @@ func TestObserver_ConcurrentSafe(t *testing.T) {
 }
 
 func TestEnabledThreshold(t *testing.T) {
+	t.Parallel()
 	h := &observerHandler{minLevel: slog.LevelWarn, obs: &Observer{}}
 	if h.Enabled(context.TODO(), slog.LevelInfo) {
 		t.Fatal("info should be disabled when min is warn")
@@ -114,6 +121,7 @@ func TestEnabledThreshold(t *testing.T) {
 }
 
 func TestLevelAliases(t *testing.T) {
+	t.Parallel()
 	if LevelDebug != slog.LevelDebug || LevelInfo != slog.LevelInfo ||
 		LevelWarn != slog.LevelWarn || LevelError != slog.LevelError {
 		t.Fatal("level aliases drifted from slog")

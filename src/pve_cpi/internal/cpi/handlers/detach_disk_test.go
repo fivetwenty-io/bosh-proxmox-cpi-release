@@ -121,6 +121,7 @@ func detachArgs(vmCID, diskCID string) []json.RawMessage {
 //   - DetachDisk called with diskID "scsi2"
 //   - Returns nil (void success)
 func TestHandleDetachDisk_Happy(t *testing.T) {
+	t.Parallel()
 	const (
 		vmCID   = "100"
 		diskCID = "local-lvm:vm-9001-disk-0"
@@ -154,6 +155,7 @@ func TestHandleDetachDisk_Happy(t *testing.T) {
 // TestHandleDetachDisk_NotAttached verifies idempotency: disk not in VM config →
 // no DetachDisk call, nil error returned.
 func TestHandleDetachDisk_NotAttached(t *testing.T) {
+	t.Parallel()
 	const (
 		vmCID   = "100"
 		diskCID = "local-lvm:not-attached-vol"
@@ -183,6 +185,7 @@ func TestHandleDetachDisk_NotAttached(t *testing.T) {
 // detach whose unusedN sweep was blocked by a snapshot), a retry detach_disk
 // removes that slot. This is the recovery path the guard message promises.
 func TestHandleDetachDisk_SweepsLingeringUnusedSlot(t *testing.T) {
+	t.Parallel()
 	const (
 		vmCID   = "100"
 		diskCID = "local-lvm:vm-9001-disk-0"
@@ -216,6 +219,7 @@ func TestHandleDetachDisk_SweepsLingeringUnusedSlot(t *testing.T) {
 // TestHandleDetachDisk_UnusedSlotDifferentVolume verifies the sweep does not
 // touch an unusedN slot that references a different volume.
 func TestHandleDetachDisk_UnusedSlotDifferentVolume(t *testing.T) {
+	t.Parallel()
 	const (
 		vmCID   = "100"
 		diskCID = "local-lvm:vm-9001-disk-0"
@@ -238,6 +242,7 @@ func TestHandleDetachDisk_UnusedSlotDifferentVolume(t *testing.T) {
 
 // TestHandleDetachDisk_DetachFail verifies SDK DetachDisk failure propagates.
 func TestHandleDetachDisk_DetachFail(t *testing.T) {
+	t.Parallel()
 	const (
 		vmCID   = "100"
 		diskCID = "local-lvm:vm-9001-disk-0"
@@ -258,6 +263,7 @@ func TestHandleDetachDisk_DetachFail(t *testing.T) {
 
 // TestHandleDetachDisk_VMNotFound verifies 404 from DetachDisk maps to VMNotFound.
 func TestHandleDetachDisk_VMNotFound(t *testing.T) {
+	t.Parallel()
 	const (
 		vmCID   = "999"
 		diskCID = "local-lvm:vm-9001-disk-0"
@@ -281,6 +287,7 @@ func TestHandleDetachDisk_VMNotFound(t *testing.T) {
 
 // TestHandleDetachDisk_InvalidVMCID verifies non-integer vm_cid returns VMNotFound.
 func TestHandleDetachDisk_InvalidVMCID(t *testing.T) {
+	t.Parallel()
 	h := handlers.HandleDetachDisk(detachDeps(&detachQEMUService{}))
 	_, err := h.Handle(context.Background(), detachArgs("not-an-int", "local:vol"), jsonrpc.Context{})
 	if err == nil {
@@ -293,6 +300,7 @@ func TestHandleDetachDisk_InvalidVMCID(t *testing.T) {
 
 // TestHandleDetachDisk_InvalidDiskCID verifies malformed disk_cid returns DiskNotFound.
 func TestHandleDetachDisk_InvalidDiskCID(t *testing.T) {
+	t.Parallel()
 	h := handlers.HandleDetachDisk(detachDeps(&detachQEMUService{}))
 	_, err := h.Handle(context.Background(), detachArgs("100", "nodisk"), jsonrpc.Context{})
 	if err == nil {
@@ -305,6 +313,7 @@ func TestHandleDetachDisk_InvalidDiskCID(t *testing.T) {
 
 // TestHandleDetachDisk_MissingArgs verifies argument count validation.
 func TestHandleDetachDisk_MissingArgs(t *testing.T) {
+	t.Parallel()
 	h := handlers.HandleDetachDisk(detachDeps(&detachQEMUService{}))
 	_, err := h.Handle(context.Background(), marshalArgs("100"), jsonrpc.Context{})
 	if err == nil {
@@ -314,6 +323,7 @@ func TestHandleDetachDisk_MissingArgs(t *testing.T) {
 
 // TestHandleDetachDisk_EmptyVMCID verifies empty vm_cid string is rejected.
 func TestHandleDetachDisk_EmptyVMCID(t *testing.T) {
+	t.Parallel()
 	h := handlers.HandleDetachDisk(detachDeps(&detachQEMUService{}))
 	_, err := h.Handle(context.Background(), detachArgs("", "local:vol"), jsonrpc.Context{})
 	if err == nil {
@@ -323,6 +333,7 @@ func TestHandleDetachDisk_EmptyVMCID(t *testing.T) {
 
 // TestHandleDetachDisk_EmptyDiskCID verifies empty disk_cid string is rejected.
 func TestHandleDetachDisk_EmptyDiskCID(t *testing.T) {
+	t.Parallel()
 	h := handlers.HandleDetachDisk(detachDeps(&detachQEMUService{}))
 	_, err := h.Handle(context.Background(), detachArgs("100", ""), jsonrpc.Context{})
 	if err == nil {
@@ -333,6 +344,7 @@ func TestHandleDetachDisk_EmptyDiskCID(t *testing.T) {
 // TestHandleDetachDisk_ConfigFetchError verifies that a Config fetch error (not a
 // "not attached" CloudError but a real network error) propagates to the caller.
 func TestHandleDetachDisk_ConfigFetchError(t *testing.T) {
+	t.Parallel()
 	qemuSvc := &detachQEMUService{
 		configErr: errors.New("network unreachable"),
 	}
@@ -346,6 +358,7 @@ func TestHandleDetachDisk_ConfigFetchError(t *testing.T) {
 // TestHandleDetachDisk_EmptyConfigIdempotent verifies that an empty VM config
 // (no disks attached at all) is treated as "not attached" and returns nil.
 func TestHandleDetachDisk_EmptyConfigIdempotent(t *testing.T) {
+	t.Parallel()
 	qemuSvc := &detachQEMUService{
 		configCfg: map[string]any{},
 	}
@@ -397,6 +410,7 @@ func detachDepsWithCfg(qemuSvc qemu.Service, allow, require bool) handlers.Deps 
 // Cloud error and DetachDisk is NOT called. The error message must contain the
 // snapshot names, the disk CID, and the remediation hint.
 func TestHandleDetachDisk_SnapshotPresent_HardFail(t *testing.T) {
+	t.Parallel()
 	const (
 		vmCID   = "100"
 		diskCID = "local-lvm:vm-9001-disk-0"
@@ -432,6 +446,7 @@ func TestHandleDetachDisk_SnapshotPresent_HardFail(t *testing.T) {
 // TestHandleDetachDisk_NoSnapshots_Proceeds verifies the happy path when the
 // snapshot check returns no real snapshots — DetachDisk is called normally.
 func TestHandleDetachDisk_NoSnapshots_Proceeds(t *testing.T) {
+	t.Parallel()
 	const (
 		vmCID   = "100"
 		diskCID = "local-lvm:vm-9001-disk-0"
@@ -459,6 +474,7 @@ func TestHandleDetachDisk_NoSnapshots_Proceeds(t *testing.T) {
 // ListSnapshots returns an error and RequireSnapshotCheckPass=false, the
 // handler logs a warning and proceeds to call DetachDisk (fail-open, D3-C).
 func TestHandleDetachDisk_SnapshotCheckError_FailOpen(t *testing.T) {
+	t.Parallel()
 	const (
 		vmCID   = "100"
 		diskCID = "local-lvm:vm-9001-disk-0"
@@ -486,6 +502,7 @@ func TestHandleDetachDisk_SnapshotCheckError_FailOpen(t *testing.T) {
 // ListSnapshots returns an error and RequireSnapshotCheckPass=true, the
 // handler aborts with an error and DetachDisk is NOT called (fail-closed, D3-C).
 func TestHandleDetachDisk_SnapshotCheckError_FailClosed(t *testing.T) {
+	t.Parallel()
 	const (
 		vmCID   = "100"
 		diskCID = "local-lvm:vm-9001-disk-0"
@@ -513,6 +530,7 @@ func TestHandleDetachDisk_SnapshotCheckError_FailClosed(t *testing.T) {
 // snapshots exist and AllowDiskOpsWithSnapshots=true, the handler logs a
 // warning but proceeds to call DetachDisk (operator-override, D2-C).
 func TestHandleDetachDisk_SnapshotPresent_AllowOverride(t *testing.T) {
+	t.Parallel()
 	const (
 		vmCID   = "100"
 		diskCID = "local-lvm:vm-9001-disk-0"
@@ -548,6 +566,7 @@ func TestHandleDetachDisk_SnapshotPresent_AllowOverride(t *testing.T) {
 // TestHandleDetachDisk_LVM_CID verifies that a standard LVM CID
 // ("local-lvm:vm-9001-disk-0") is parsed correctly and detach proceeds.
 func TestHandleDetachDisk_LVM_CID(t *testing.T) {
+	t.Parallel()
 	const diskCID = "local-lvm:vm-9001-disk-0"
 
 	qemuSvc := &detachQEMUService{
@@ -570,6 +589,7 @@ func TestHandleDetachDisk_LVM_CID(t *testing.T) {
 // TestHandleDetachDisk_ZFSPool_CID verifies that a ZFS pool bare-volname CID
 // ("local-zfs:vm-9001-disk-0") is parsed correctly and detach proceeds.
 func TestHandleDetachDisk_ZFSPool_CID(t *testing.T) {
+	t.Parallel()
 	const diskCID = "local-zfs:vm-9001-disk-0"
 
 	qemuSvc := &detachQEMUService{
@@ -593,6 +613,7 @@ func TestHandleDetachDisk_ZFSPool_CID(t *testing.T) {
 // ("local:9001/vm-9001-disk-0.raw") is parsed correctly and detach proceeds.
 // ParseDiskCID splits on the first colon; the volume segment is opaque to the handler.
 func TestHandleDetachDisk_Dir_CID(t *testing.T) {
+	t.Parallel()
 	const diskCID = "local:9001/vm-9001-disk-0.raw"
 
 	qemuSvc := &detachQEMUService{
@@ -615,6 +636,7 @@ func TestHandleDetachDisk_Dir_CID(t *testing.T) {
 // TestHandleDetachDisk_LVMThin_CID verifies that an LVMThin bare-volname CID
 // ("local-lvm-thin:vm-9001-disk-0") is parsed correctly and detach proceeds.
 func TestHandleDetachDisk_LVMThin_CID(t *testing.T) {
+	t.Parallel()
 	const diskCID = "local-lvm-thin:vm-9001-disk-0"
 
 	qemuSvc := &detachQEMUService{
@@ -640,6 +662,7 @@ func TestHandleDetachDisk_LVMThin_CID(t *testing.T) {
 // and does not call DetachDisk. The sweep over unusedN entries also runs and
 // finds nothing for this volid, so DetachDisk stays untouched.
 func TestDetachDisk_SentinelIdempotent(t *testing.T) {
+	t.Parallel()
 	const (
 		vmCID   = "100"
 		diskCID = "local-lvm:vm-9001-disk-0"
@@ -672,6 +695,7 @@ func TestDetachDisk_SentinelIdempotent(t *testing.T) {
 // QEMU().Config() that returns cpierrors.Cloud directly, not the sentinel)
 // must propagate to the caller as a real error and must not call DetachDisk.
 func TestDetachDisk_OtherCloudErrorPropagates(t *testing.T) {
+	t.Parallel()
 	const (
 		vmCID   = "100"
 		diskCID = "local-lvm:vm-9001-disk-0"

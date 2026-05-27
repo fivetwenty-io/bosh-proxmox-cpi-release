@@ -255,6 +255,7 @@ func isCloudError(err error) bool {
 
 // TestHandleCreateVM_HappyPath verifies the complete create_vm direct-import flow.
 func TestHandleCreateVM_HappyPath(t *testing.T) {
+	t.Parallel()
 	q := &vmMockQEMU{}
 	n := &vmMockNodes{}
 	c := &vmMockCluster{}
@@ -356,6 +357,7 @@ func TestHandleCreateVM_HappyPath(t *testing.T) {
 
 // TestHandleCreateVM_VMIDAllocFail verifies cluster API failure propagates.
 func TestHandleCreateVM_VMIDAllocFail(t *testing.T) {
+	t.Parallel()
 	c := &vmMockCluster{
 		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
 			return nil, fmt.Errorf("cluster API unreachable")
@@ -375,6 +377,7 @@ func TestHandleCreateVM_VMIDAllocFail(t *testing.T) {
 // TestHandleCreateVM_CreateFail verifies error returned with NO rollback
 // (QEMU.Create itself failed — the VM was never created).
 func TestHandleCreateVM_CreateFail(t *testing.T) {
+	t.Parallel()
 	q := &vmMockQEMU{
 		createFn: func(_ context.Context, _ string, _ map[string]any) (string, error) {
 			return "", fmt.Errorf("storage full")
@@ -398,6 +401,7 @@ func TestHandleCreateVM_CreateFail(t *testing.T) {
 
 // TestHandleCreateVM_ConfigUpdateFail verifies rollback after VM config update failure.
 func TestHandleCreateVM_ConfigUpdateFail(t *testing.T) {
+	t.Parallel()
 	callCount := 0
 	n := &vmMockNodes{
 		updateConfigFn: func(_ context.Context, _, _ string, _ *sdknodes.UpdateQemuConfigParams) error {
@@ -425,6 +429,7 @@ func TestHandleCreateVM_ConfigUpdateFail(t *testing.T) {
 
 // TestHandleCreateVM_DiskAttachFail verifies rollback after disk attach failure.
 func TestHandleCreateVM_DiskAttachFail(t *testing.T) {
+	t.Parallel()
 	q := &vmMockQEMU{
 		attachDiskFn: func(_ context.Context, _ string, _ int, _, _ string, _ *sdkqemu.AttachOpts) (string, error) {
 			return "", fmt.Errorf("no such volume")
@@ -448,6 +453,7 @@ func TestHandleCreateVM_DiskAttachFail(t *testing.T) {
 
 // TestHandleCreateVM_AgentConfigureFail verifies rollback after agent.Configure failure.
 func TestHandleCreateVM_AgentConfigureFail(t *testing.T) {
+	t.Parallel()
 	a := &vmMockAgent{
 		configureFn: func(_ context.Context, _ string, _ int, _ agent.AgentConfig) error {
 			return fmt.Errorf("registry unreachable")
@@ -471,6 +477,7 @@ func TestHandleCreateVM_AgentConfigureFail(t *testing.T) {
 
 // TestHandleCreateVM_StartFail verifies rollback after VM start failure.
 func TestHandleCreateVM_StartFail(t *testing.T) {
+	t.Parallel()
 	q := &vmMockQEMU{
 		startFn: func(_ context.Context, _ string, _ int) (string, error) {
 			return "", fmt.Errorf("no free KVM slots")
@@ -494,6 +501,7 @@ func TestHandleCreateVM_StartFail(t *testing.T) {
 
 // TestHandleCreateVM_MultipleNICs verifies multiple networks generate multiple net=/ipconfig= entries.
 func TestHandleCreateVM_MultipleNICs(t *testing.T) {
+	t.Parallel()
 	var capturedNICParams *sdknodes.UpdateQemuConfigParams
 	callCount := 0
 	n := &vmMockNodes{
@@ -538,6 +546,7 @@ func TestHandleCreateVM_MultipleNICs(t *testing.T) {
 
 // TestHandleCreateVM_InvalidArgs verifies CloudErrors on bad arguments.
 func TestHandleCreateVM_InvalidArgs(t *testing.T) {
+	t.Parallel()
 	deps := buildVMDeps(&vmMockQEMU{}, &vmMockNodes{}, &vmMockCluster{}, &vmMockAgent{})
 	h := handlers.HandleCreateVM(deps)
 	ctx := context.Background()
@@ -577,6 +586,7 @@ func TestHandleCreateVM_InvalidArgs(t *testing.T) {
 // stemcell CID (legacy clone-based format, e.g. "5042") is rejected by
 // ParseStemcellCID and produces a CloudError — never an attempt to contact PVE.
 func TestCreateVM_InvalidStemcellCID_Integer(t *testing.T) {
+	t.Parallel()
 	deps := buildVMDeps(&vmMockQEMU{}, &vmMockNodes{}, &vmMockCluster{}, &vmMockAgent{})
 	h := handlers.HandleCreateVM(deps)
 
@@ -597,6 +607,7 @@ func TestCreateVM_InvalidStemcellCID_Integer(t *testing.T) {
 
 // TestHandleCreateVM_MissingNode verifies CloudError when node not configured anywhere.
 func TestHandleCreateVM_MissingNode(t *testing.T) {
+	t.Parallel()
 	deps := handlers.Deps{
 		Config: &config.CPIConfig{
 			Node:          "",
@@ -630,6 +641,7 @@ func TestHandleCreateVM_MissingNode(t *testing.T) {
 
 // TestHandleCreateVM_DynamicNetwork verifies DHCP ipconfig for dynamic network.
 func TestHandleCreateVM_DynamicNetwork(t *testing.T) {
+	t.Parallel()
 	var capturedNICParams *sdknodes.UpdateQemuConfigParams
 	callCount := 0
 	n := &vmMockNodes{
@@ -666,6 +678,7 @@ func TestHandleCreateVM_DynamicNetwork(t *testing.T) {
 
 // TestHandleCreateVM_EnvMBusBlobstore verifies mbus and blobstore propagate to agent config.
 func TestHandleCreateVM_EnvMBusBlobstore(t *testing.T) {
+	t.Parallel()
 	a := &vmMockAgent{}
 	h := handlers.HandleCreateVM(buildVMDeps(&vmMockQEMU{}, &vmMockNodes{}, &vmMockCluster{}, a))
 
@@ -699,6 +712,7 @@ func TestHandleCreateVM_EnvMBusBlobstore(t *testing.T) {
 // TestHandleCreateVM_TargetNodeFromCloudProperties verifies cloud_properties.target_node
 // takes precedence over config.node.
 func TestHandleCreateVM_TargetNodeFromCloudProperties(t *testing.T) {
+	t.Parallel()
 	var createNode string
 	q := &vmMockQEMU{
 		createFn: func(_ context.Context, node string, _ map[string]any) (string, error) {
@@ -726,6 +740,7 @@ func TestHandleCreateVM_TargetNodeFromCloudProperties(t *testing.T) {
 // a deployment carrying more than 28 persistent disks at creation time —
 // CPI reserves scsi29 and scsi30 for headroom and the cloud-init drive.
 func TestCreateVM_RejectsTooManyPersistentDisks(t *testing.T) {
+	t.Parallel()
 	h := handlers.HandleCreateVM(buildVMDeps(&vmMockQEMU{}, &vmMockNodes{}, &vmMockCluster{}, &vmMockAgent{}))
 
 	tooMany := make([]string, 29)
@@ -751,6 +766,7 @@ func TestCreateVM_RejectsTooManyPersistentDisks(t *testing.T) {
 // agent.Remove so ConfigDrive ISOs uploaded by the configdrive agent
 // do not leak in storage.
 func TestCreateVM_RollbackRemovesConfigDriveISO(t *testing.T) {
+	t.Parallel()
 	q := &vmMockQEMU{
 		startFn: func(_ context.Context, _ string, _ int) (string, error) {
 			return "", fmt.Errorf("simulated start failure")
@@ -786,6 +802,7 @@ func TestCreateVM_RollbackRemovesConfigDriveISO(t *testing.T) {
 // PVE "already exists" 500 errors (cross-process VMID collisions) and
 // eventually succeeds without rolling back the (non-existent) VM.
 func TestHandleCreateVM_VMIDConflictRetry(t *testing.T) {
+	t.Parallel()
 	attempt := 0
 	q := &vmMockQEMU{
 		createFn: func(_ context.Context, _ string, _ map[string]any) (string, error) {
@@ -824,6 +841,7 @@ func TestHandleCreateVM_VMIDConflictRetry(t *testing.T) {
 // non-conflict failure, the partial VM for that attempt is destroyed via
 // cleanupVM before propagating the error (so PVE state stays clean).
 func TestHandleCreateVM_AwaitTaskNonConflictRollsBack(t *testing.T) {
+	t.Parallel()
 	q := &vmMockQEMU{
 		createFn: func(_ context.Context, _ string, _ map[string]any) (string, error) {
 			return "UPID:pve:create:partial", nil
@@ -862,6 +880,7 @@ func TestHandleCreateVM_AwaitTaskNonConflictRollsBack(t *testing.T) {
 // completes and the original error propagates when agent.Remove itself
 // fails — the agent error is logged but must not overwrite the cause.
 func TestCreateVM_RollbackTolerantToRemoveError(t *testing.T) {
+	t.Parallel()
 	startErr := fmt.Errorf("simulated start failure")
 	q := &vmMockQEMU{
 		startFn: func(_ context.Context, _ string, _ int) (string, error) {
@@ -899,6 +918,7 @@ func TestCreateVM_RollbackTolerantToRemoveError(t *testing.T) {
 // returns a transient connection error, the returned cpierror is classified as
 // RetriableCloudError AND the VM rollback (DeleteQemu) is invoked.
 func TestCreateVM_NICConfigTransient_Retriable(t *testing.T) {
+	t.Parallel()
 	transientErr := &sdkerrors.ConnectionError{
 		Host:    "pve",
 		Port:    8006,
@@ -941,6 +961,7 @@ func TestCreateVM_NICConfigTransient_Retriable(t *testing.T) {
 // returns a transient connection error, the returned cpierror is classified as
 // RetriableCloudError AND the VM rollback (DeleteQemu) is invoked.
 func TestCreateVM_AttachDiskTransient_Retriable(t *testing.T) {
+	t.Parallel()
 	transientErr := &sdkerrors.ConnectionError{
 		Host:    "pve",
 		Port:    8006,
@@ -985,6 +1006,7 @@ func TestCreateVM_AttachDiskTransient_Retriable(t *testing.T) {
 // (AttachDisk fails after VM creation), the rollback path decodes the UPID
 // returned by DeleteQemu and awaits the destroy task before returning.
 func TestCreateVM_CleanupAwaitsDestroy(t *testing.T) {
+	t.Parallel()
 	const destroyUPID = "UPID:pve:00AABBCC:00112233:6789ABCD:qmdestroy:9999:root@pam:"
 
 	awaitCalled := false
@@ -1054,6 +1076,7 @@ func TestCreateVM_CleanupAwaitsDestroy(t *testing.T) {
 // No rollback DeleteQemu call should occur because Create itself failed — the VM
 // was never created on PVE.
 func TestHandleCreateVM_AuthFailure(t *testing.T) {
+	t.Parallel()
 	authErr := &sdkerrors.APIError{HTTPCode: 401, Message: "authentication failure"}
 
 	q := &vmMockQEMU{
@@ -1097,6 +1120,7 @@ func TestHandleCreateVM_AuthFailure(t *testing.T) {
 // includes that status information in the error so operators can distinguish a dead
 // VM from a network/registry misconfiguration.
 func TestCreateVM_AgentDead_EmitsDiagnostic(t *testing.T) {
+	t.Parallel()
 	const vmStatus = "stopped"
 
 	q := &vmMockQEMU{
@@ -1205,6 +1229,7 @@ func (s *agentDeadQEMUService) Status(ctx context.Context, node string, vmid int
 // every deploy of a light stemcell would fail with an invalid-storage error
 // from PVE.
 func TestHandleCreateVM_LightStemcellCID_StripsPrefix(t *testing.T) {
+	t.Parallel()
 	const lightCID = "light:" + testStemcellCID
 
 	q := &vmMockQEMU{}

@@ -1,0 +1,140 @@
+# golangci-lint v2 configuration (schema version "2", requires golangci-lint >= v2.0)
+# Installed: v2.12.2  |  Go module: go 1.26.3
+#
+# Complexity thresholds are set high (50) for initial gate installation.
+# createVM (cyclo 85, cognitive 115) and resolveStemcellImage (cyclo 49, cognitive 77)
+# are scheduled for extraction in Cluster F. Lower thresholds to 20/30 after that
+# refactor lands.
+#
+# Cluster F (lint cleanup) must satisfy every linter enabled below before
+# the gate can be declared green.
+
+version: "2"
+
+linters:
+  default: none
+  enable:
+    # Carried over from golangci-lint default set
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    # Extended gate — R1 CAT-2..14
+    - errorlint
+    - gocritic
+    - noctx
+    - revive
+    - godoclint
+    - nakedret
+    - forcetypeassert
+    - gocognit
+    - gocyclo
+    - goconst
+    - misspell
+    - prealloc
+    - unconvert
+    - unparam
+
+  settings:
+    gocyclo:
+      # Initial threshold — high to avoid blocking on createVM (85) and
+      # resolveStemcellImage (49) before the refactor.  Lower to 20 post-Cluster F.
+      min-complexity: 50
+
+    gocognit:
+      # Initial threshold — high to avoid blocking on createVM (115) and
+      # resolveStemcellImage (77).  Lower to 30 post-Cluster F.
+      min-complexity: 50
+
+    nakedret:
+      max-func-lines: 30
+
+    goconst:
+      min-occurrences: 5
+      min-len: 3
+
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - style
+        - performance
+      disabled-checks:
+        # single-case switch → if fires in generated stub files; suppress here.
+        - singleCaseSwitch
+
+    revive:
+      rules:
+        - name: exported
+        - name: var-naming
+        - name: package-comments
+        - name: unused-parameter
+          arguments:
+            - allowRegex: "^_$"
+        - name: receiver-naming
+        - name: error-strings
+        - name: errorf
+
+    errorlint:
+      errorf: true
+      asserts: true
+      comparison: true
+
+    unparam:
+      check-exported: false
+
+  exclusions:
+    # Skip auto-detected generated files (standard "// Code generated" marker).
+    generated: lax
+    rules:
+      # Exclude the panic stub test file — generated, not hand-maintained.
+      - path: ".*_stub_test\\.go$"
+        linters:
+          - errcheck
+          - govet
+          - ineffassign
+          - staticcheck
+          - unused
+          - errorlint
+          - gocritic
+          - noctx
+          - revive
+          - godoclint
+          - nakedret
+          - forcetypeassert
+          - gocognit
+          - gocyclo
+          - goconst
+          - misspell
+          - prealloc
+          - unconvert
+          - unparam
+      # Vendor directory — never lint dependencies.
+      - path: "vendor/"
+        linters:
+          - errcheck
+          - govet
+          - ineffassign
+          - staticcheck
+          - unused
+          - errorlint
+          - gocritic
+          - noctx
+          - revive
+          - godoclint
+          - nakedret
+          - forcetypeassert
+          - gocognit
+          - gocyclo
+          - goconst
+          - misspell
+          - prealloc
+          - unconvert
+          - unparam
+    paths:
+      - vendor/
+
+issues:
+  # Show all findings — Cluster F uses the full list to target cleanup.
+  max-issues-per-linter: 0
+  max-same-issues: 0

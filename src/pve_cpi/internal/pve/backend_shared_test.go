@@ -6,6 +6,7 @@ import (
 )
 
 func TestSharedBackend_NodeForCreate_PrefersCloudPropNode(t *testing.T) {
+	t.Parallel()
 	b := newSharedBackend(nil, StorageInfo{Name: "ceph", Type: "rbd", Shared: true}, "pve-default")
 	got, err := b.NodeForCreate(context.Background(), "100", "pve-explicit")
 	if err != nil {
@@ -17,6 +18,7 @@ func TestSharedBackend_NodeForCreate_PrefersCloudPropNode(t *testing.T) {
 }
 
 func TestSharedBackend_NodeForCreate_FallsBackToDefault(t *testing.T) {
+	t.Parallel()
 	b := newSharedBackend(nil, StorageInfo{Name: "ceph", Type: "rbd", Shared: true}, "pve-default")
 	got, err := b.NodeForCreate(context.Background(), "", "")
 	if err != nil {
@@ -28,6 +30,7 @@ func TestSharedBackend_NodeForCreate_FallsBackToDefault(t *testing.T) {
 }
 
 func TestSharedBackend_NodeForCreate_ErrorsWhenNothingResolves(t *testing.T) {
+	t.Parallel()
 	b := newSharedBackend(nil, StorageInfo{Name: "ceph", Type: "rbd", Shared: true}, "")
 	_, err := b.NodeForCreate(context.Background(), "", "")
 	if err == nil {
@@ -36,6 +39,7 @@ func TestSharedBackend_NodeForCreate_ErrorsWhenNothingResolves(t *testing.T) {
 }
 
 func TestSharedBackend_NodeForExisting_UsesDefault(t *testing.T) {
+	t.Parallel()
 	b := newSharedBackend(nil, StorageInfo{Name: "ceph", Type: "rbd", Shared: true}, "pve-default")
 	got, err := b.NodeForExisting(context.Background(), "vm-100-disk-0")
 	if err != nil {
@@ -47,6 +51,7 @@ func TestSharedBackend_NodeForExisting_UsesDefault(t *testing.T) {
 }
 
 func TestSharedBackend_NodeForExisting_FallsBackToInfoNodes(t *testing.T) {
+	t.Parallel()
 	b := newSharedBackend(nil, StorageInfo{Name: "nfs", Type: "nfs", Nodes: []string{"pve-02", "pve-03"}}, "")
 	got, err := b.NodeForExisting(context.Background(), "anything")
 	if err != nil {

@@ -1,10 +1,8 @@
-// Package handlers — delete_network handler.
-//
-// Implements the BOSH CPI v2 delete_network method. The handler probes the
-// SDN backend first to determine whether the network_cid refers to a PVE SDN
-// vnet; if so it tears down subnets, the vnet, and (conditionally) the parent
-// zone. If the SDN probe reports the entity is absent, the handler falls back
-// to deleting the Linux bridge of the same name via the nodes API.
+// delete_network handler: implements the BOSH CPI v2 delete_network method.
+// Probes the SDN backend first to determine whether network_cid refers to a
+// PVE SDN vnet; if so tears down subnets, the vnet, and (conditionally) the
+// parent zone. If the SDN probe reports the entity absent, falls back to
+// deleting the Linux bridge of the same name via the nodes API.
 //
 // Idempotency: every NotFound response is treated as success. Concurrent
 // deletes targeting the same network_cid both return nil. All cleanup I/O

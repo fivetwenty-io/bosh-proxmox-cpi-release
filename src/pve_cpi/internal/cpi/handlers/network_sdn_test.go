@@ -57,6 +57,7 @@ func sdnDeleteOnlyCluster(updateFn func(context.Context, *sdkcluster.UpdateSdnPa
 // testConfig().Node). The mockTasksService.Wait default returns ExitStatus "OK"
 // so AwaitTask succeeds without extra configuration.
 func TestApplySDN_HappyPath(t *testing.T) {
+	t.Parallel()
 	const upid = "UPID:pve-node1:00001234:00000001:aabbccdd:task:pve-node1:"
 
 	var updateSdnCalled bool
@@ -119,6 +120,7 @@ func TestApplySDN_HappyPath(t *testing.T) {
 // The UPID "UPID::rest" has an empty node field (parts[1] == ""). With
 // config.Node also empty the function hits the warn-and-return path.
 func TestApplySDN_MalformedUPID(t *testing.T) {
+	t.Parallel()
 	const malformedUPID = "UPID::00001234:00000001:aabbccdd:task::"
 
 	var updateSdnCalled bool

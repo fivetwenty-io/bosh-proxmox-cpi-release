@@ -92,6 +92,7 @@ func getDisksDeps(qemuSvc qemu.Service) handlers.Deps {
 // ---------------------------------------------------------------------------
 
 func TestHandleGetDisks_MultiplePersistentDisks(t *testing.T) {
+	t.Parallel()
 	qemuSvc := &getDisksQEMUService{
 		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
 			return map[string]any{
@@ -127,6 +128,7 @@ func TestHandleGetDisks_MultiplePersistentDisks(t *testing.T) {
 }
 
 func TestHandleGetDisks_SystemDiskOnly(t *testing.T) {
+	t.Parallel()
 	// VM has only a system disk → persistent disk list is empty.
 	qemuSvc := &getDisksQEMUService{
 		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
@@ -153,6 +155,7 @@ func TestHandleGetDisks_SystemDiskOnly(t *testing.T) {
 }
 
 func TestHandleGetDisks_VMNotFound(t *testing.T) {
+	t.Parallel()
 	qemuSvc := &getDisksQEMUService{
 		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
 			return nil, &sdkerrors.APIError{HTTPCode: 404, Message: "VM not found"}
@@ -170,6 +173,7 @@ func TestHandleGetDisks_VMNotFound(t *testing.T) {
 }
 
 func TestHandleGetDisks_ConfigFetchError(t *testing.T) {
+	t.Parallel()
 	qemuSvc := &getDisksQEMUService{
 		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
 			return nil, errors.New("storage backend unreachable")
@@ -184,6 +188,7 @@ func TestHandleGetDisks_ConfigFetchError(t *testing.T) {
 }
 
 func TestHandleGetDisks_InvalidVMCID(t *testing.T) {
+	t.Parallel()
 	h := handlers.HandleGetDisks(getDisksDeps(&getDisksQEMUService{}))
 	_, err := h.Handle(context.Background(), marshalArgs("not-an-int"), jsonrpc.Context{})
 	if err == nil {
@@ -195,6 +200,7 @@ func TestHandleGetDisks_InvalidVMCID(t *testing.T) {
 }
 
 func TestHandleGetDisks_EmptyVMCID(t *testing.T) {
+	t.Parallel()
 	h := handlers.HandleGetDisks(getDisksDeps(&getDisksQEMUService{}))
 	_, err := h.Handle(context.Background(), marshalArgs(""), jsonrpc.Context{})
 	if err == nil {
@@ -203,6 +209,7 @@ func TestHandleGetDisks_EmptyVMCID(t *testing.T) {
 }
 
 func TestHandleGetDisks_TooFewArgs(t *testing.T) {
+	t.Parallel()
 	h := handlers.HandleGetDisks(getDisksDeps(&getDisksQEMUService{}))
 	_, err := h.Handle(context.Background(), []json.RawMessage{}, jsonrpc.Context{})
 	if err == nil {
@@ -211,6 +218,7 @@ func TestHandleGetDisks_TooFewArgs(t *testing.T) {
 }
 
 func TestHandleGetDisks_MissingNode(t *testing.T) {
+	t.Parallel()
 	// With cluster-scan-based node resolution, a missing Config.Node is no longer
 	// an error: the node is resolved from the cluster scan. When the cluster scan
 	// returns not-found (empty list), the handler returns VMNotFound. This test
@@ -234,6 +242,7 @@ func TestHandleGetDisks_MissingNode(t *testing.T) {
 }
 
 func TestHandleGetDisks_CloudinitExcluded(t *testing.T) {
+	t.Parallel()
 	// Verify cloudinit drive (media=cdrom) is not included even when not on ide2.
 	qemuSvc := &getDisksQEMUService{
 		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
@@ -263,6 +272,7 @@ func TestHandleGetDisks_CloudinitExcluded(t *testing.T) {
 }
 
 func TestHandleGetDisks_EmptyVM(t *testing.T) {
+	t.Parallel()
 	// VM with no disks at all → empty list.
 	qemuSvc := &getDisksQEMUService{
 		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
@@ -289,6 +299,7 @@ func TestHandleGetDisks_EmptyVM(t *testing.T) {
 }
 
 func TestHandleGetDisks_BareVolidNoOptions(t *testing.T) {
+	t.Parallel()
 	// Disk stored as bare volid (no option string) → returned as-is.
 	qemuSvc := &getDisksQEMUService{
 		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
@@ -325,6 +336,7 @@ func TestHandleGetDisks_BareVolidNoOptions(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestHandleGetDisks_Dir_CID(t *testing.T) {
+	t.Parallel()
 	// dir storage: CID has subpath form "<storage>:<vmid>/<volname>.<ext>".
 	// The colon splits at first occurrence; the full CID is the volid returned.
 	const diskCID = "local:9001/vm-9001-disk-0.raw"
@@ -356,6 +368,7 @@ func TestHandleGetDisks_Dir_CID(t *testing.T) {
 }
 
 func TestHandleGetDisks_ZFSPool_CID(t *testing.T) {
+	t.Parallel()
 	// zfspool storage: bare volname (no subpath), e.g. "local-zfs:vm-9001-disk-0".
 	const diskCID = "local-zfs:vm-9001-disk-0"
 	qemuSvc := &getDisksQEMUService{
@@ -386,6 +399,7 @@ func TestHandleGetDisks_ZFSPool_CID(t *testing.T) {
 }
 
 func TestHandleGetDisks_LVMThin_CID(t *testing.T) {
+	t.Parallel()
 	// lvmthin storage: bare volname, e.g. "local-lvm-thin:vm-9001-disk-0".
 	const diskCID = "local-lvm-thin:vm-9001-disk-0"
 	qemuSvc := &getDisksQEMUService{

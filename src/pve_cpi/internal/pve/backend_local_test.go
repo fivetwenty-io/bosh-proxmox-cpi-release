@@ -75,6 +75,7 @@ func (f *fakeStorage) Exists(ctx context.Context, node, storage, volume string) 
 // ---------------------------------------------------------------------------
 
 func TestLocalBackend_NodeForCreate_CoLocatesWithVMHint(t *testing.T) {
+	t.Parallel()
 	c := &backendTestClient{
 		clusterSvc: &fakeCluster{
 			listFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
@@ -96,6 +97,7 @@ func TestLocalBackend_NodeForCreate_CoLocatesWithVMHint(t *testing.T) {
 }
 
 func TestLocalBackend_NodeForCreate_VMHintMiss_FallsBackToCloudProp(t *testing.T) {
+	t.Parallel()
 	c := &backendTestClient{
 		clusterSvc: &fakeCluster{
 			listFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
@@ -114,6 +116,7 @@ func TestLocalBackend_NodeForCreate_VMHintMiss_FallsBackToCloudProp(t *testing.T
 }
 
 func TestLocalBackend_NodeForCreate_EmptyVMHintAndNoCloudProp_UsesDefault(t *testing.T) {
+	t.Parallel()
 	b := newLocalBackend(nil, StorageInfo{Name: "local-zfs", Type: "zfspool"}, "pve-default")
 	got, err := b.NodeForCreate(context.Background(), "", "")
 	if err != nil {
@@ -125,6 +128,7 @@ func TestLocalBackend_NodeForCreate_EmptyVMHintAndNoCloudProp_UsesDefault(t *tes
 }
 
 func TestLocalBackend_NodeForCreate_NoResolution_Errors(t *testing.T) {
+	t.Parallel()
 	b := newLocalBackend(nil, StorageInfo{Name: "local-zfs", Type: "zfspool"}, "")
 	_, err := b.NodeForCreate(context.Background(), "", "")
 	if err == nil {
@@ -137,6 +141,7 @@ func TestLocalBackend_NodeForCreate_NoResolution_Errors(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestLocalBackend_NodeForExisting_FindsOwnerViaExistsProbe(t *testing.T) {
+	t.Parallel()
 	// pve-01 says no, pve-02 says yes.
 	c := &backendTestClient{
 		storageSvc: &fakeStorage{
@@ -164,6 +169,7 @@ func TestLocalBackend_NodeForExisting_FindsOwnerViaExistsProbe(t *testing.T) {
 }
 
 func TestLocalBackend_NodeForExisting_PrefersDefaultNodeFirst(t *testing.T) {
+	t.Parallel()
 	probedNodes := []string{}
 	c := &backendTestClient{
 		storageSvc: &fakeStorage{
@@ -195,6 +201,7 @@ func TestLocalBackend_NodeForExisting_PrefersDefaultNodeFirst(t *testing.T) {
 }
 
 func TestLocalBackend_NodeForExisting_NoOwner_DiskNotFound(t *testing.T) {
+	t.Parallel()
 	c := &backendTestClient{
 		storageSvc: &fakeStorage{
 			existsFn: func(_ context.Context, _, _, _ string) (bool, error) {
@@ -215,6 +222,7 @@ func TestLocalBackend_NodeForExisting_NoOwner_DiskNotFound(t *testing.T) {
 }
 
 func TestLocalBackend_NodeForExisting_ClusterListErrorPropagates(t *testing.T) {
+	t.Parallel()
 	c := &backendTestClient{
 		storageSvc: &fakeStorage{
 			existsFn: func(_ context.Context, _, _, _ string) (bool, error) {
@@ -235,6 +243,7 @@ func TestLocalBackend_NodeForExisting_ClusterListErrorPropagates(t *testing.T) {
 }
 
 func TestNodeForExisting_AllNodesError_ReturnsRetriable(t *testing.T) {
+	t.Parallel()
 	// All candidate Exists() probes fail → must return retriable error, NOT DiskNotFound.
 	probeErr := errors.New("connection refused")
 	c := &backendTestClient{
@@ -299,6 +308,7 @@ func containsStr(s, sub string) bool {
 // success path runs (NodeForExisting returns the expected node) and that
 // ListResources was invoked at least twice.
 func TestCandidateNodes_RetriesOnTransient(t *testing.T) {
+	t.Parallel()
 	var calls atomic.Int32
 	c := &backendTestClient{
 		storageSvc: &fakeStorage{
@@ -338,6 +348,7 @@ func TestCandidateNodes_RetriesOnTransient(t *testing.T) {
 }
 
 func TestLocalBackend_NodeForExisting_RestrictedNodes_SkipsClusterScan(t *testing.T) {
+	t.Parallel()
 	c := &backendTestClient{
 		storageSvc: &fakeStorage{
 			existsFn: func(_ context.Context, node, _, _ string) (bool, error) {

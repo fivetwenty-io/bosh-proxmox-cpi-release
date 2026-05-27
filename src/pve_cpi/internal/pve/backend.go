@@ -1,6 +1,4 @@
-// Package pve: persistent-disk backend abstraction.
-//
-// A Backend resolves the PVE node that every disk operation must target.
+// Backend resolves the PVE node that every disk operation must target.
 // Two flavours: SharedBackend (cluster-visible storages — any node works,
 // preference order: cloud_props.node → vmHint → default) and LocalBackend
 // (single-node storages — vmHint co-locates with the owning VM; existing

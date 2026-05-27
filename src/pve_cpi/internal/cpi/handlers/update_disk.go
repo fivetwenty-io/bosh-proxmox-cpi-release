@@ -1,4 +1,3 @@
-// Package handlers contains the 22 BOSH CPI v2 method implementations.
 package handlers
 
 import (
@@ -146,7 +145,7 @@ func HandleUpdateDisk(deps Deps) Handler {
 		// ----------------------------------------------------------------
 		cfg, err := deps.PVE.QEMU().Config(ctx, node, vmid)
 		if err != nil {
-			return nil, cpierrors.Wrap(pve.WrapError(err), fmt.Sprintf("update_disk: failed to read VM %d config", vmid))
+			return nil, cpierrors.Wrap(pve.WrapError(err), fmt.Sprintf("update_disk: read VM %d config", vmid))
 		}
 
 		diskOptStr, ok := cfg[diskID].(string)
@@ -173,7 +172,7 @@ func HandleUpdateDisk(deps Deps) Handler {
 			DiskID: diskID,
 		})
 		if err != nil {
-			return nil, cpierrors.Wrap(pve.WrapError(err), fmt.Sprintf("update_disk: failed to update disk options for %s on VM %d", diskCID, vmid))
+			return nil, cpierrors.Wrap(pve.WrapError(err), fmt.Sprintf("update_disk: update disk options for %s on VM %d", diskCID, vmid))
 		}
 
 		deps.Logger.Info("update_disk",
@@ -200,7 +199,7 @@ func resizeDiskInternal(
 ) error {
 	cfg, err := deps.PVE.QEMU().Config(ctx, node, vmid)
 	if err != nil {
-		return cpierrors.Wrap(pve.WrapError(err), fmt.Sprintf("update_disk: failed to read VM %d config for resize", vmid))
+		return cpierrors.Wrap(pve.WrapError(err), fmt.Sprintf("update_disk: read VM %d config for resize", vmid))
 	}
 
 	diskOptStr, ok := cfg[diskID].(string)
@@ -266,8 +265,7 @@ func updateSpecToOptions(spec map[string]any) map[string]string {
 	opts := make(map[string]string)
 
 	setBool := func(key string, raw any) {
-		switch v := raw.(type) {
-		case bool:
+		if v, ok := raw.(bool); ok {
 			if v {
 				opts[key] = "1"
 			} else {

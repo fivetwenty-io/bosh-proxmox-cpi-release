@@ -56,6 +56,7 @@ func newMockClient(tasksSvc sdktasks.Service) *mockClient {
 // ---- tests ----
 
 func TestAwaitTask_Success(t *testing.T) {
+	t.Parallel()
 	svc := &mockTasksService{
 		waitFn: func(_ context.Context, _, upid string, _ *sdktasks.WaitOptions) (*sdktasks.Status, error) {
 			return &sdktasks.Status{Status: "stopped", ExitStatus: "OK", UpID: upid}, nil
@@ -68,6 +69,7 @@ func TestAwaitTask_Success(t *testing.T) {
 }
 
 func TestAwaitTask_EmptyExitStatusReturnsError(t *testing.T) {
+	t.Parallel()
 	// Empty exit status means PVE never wrote a terminal ExitStatus — the task
 	// poller returned before the task completed or was killed without recording
 	// an outcome. AwaitTask must treat this as an error, not as success.
@@ -86,6 +88,7 @@ func TestAwaitTask_EmptyExitStatusReturnsError(t *testing.T) {
 }
 
 func TestAwaitTask_Failure(t *testing.T) {
+	t.Parallel()
 	svc := &mockTasksService{
 		waitFn: func(_ context.Context, _, upid string, _ *sdktasks.WaitOptions) (*sdktasks.Status, error) {
 			// SDK returns the status AND the error for non-OK exit.
@@ -100,6 +103,7 @@ func TestAwaitTask_Failure(t *testing.T) {
 }
 
 func TestAwaitTask_NonOKExitStatusNoSDKError(t *testing.T) {
+	t.Parallel()
 	// Edge: SDK returns non-OK exit but no error (defensive path in AwaitTask).
 	svc := &mockTasksService{
 		waitFn: func(_ context.Context, _, upid string, _ *sdktasks.WaitOptions) (*sdktasks.Status, error) {
@@ -113,6 +117,7 @@ func TestAwaitTask_NonOKExitStatusNoSDKError(t *testing.T) {
 }
 
 func TestAwaitTask_ContextCancelled(t *testing.T) {
+	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())
 
 	svc := &mockTasksService{
@@ -131,6 +136,7 @@ func TestAwaitTask_ContextCancelled(t *testing.T) {
 }
 
 func TestAwaitTask_PollIntervalOption(t *testing.T) {
+	t.Parallel()
 	var capturedOpts *sdktasks.WaitOptions
 	svc := &mockTasksService{
 		waitFn: func(_ context.Context, _, upid string, opts *sdktasks.WaitOptions) (*sdktasks.Status, error) {
@@ -154,6 +160,7 @@ func TestAwaitTask_PollIntervalOption(t *testing.T) {
 }
 
 func TestAwaitTask_MaxWaitOption(t *testing.T) {
+	t.Parallel()
 	var capturedOpts *sdktasks.WaitOptions
 	svc := &mockTasksService{
 		waitFn: func(_ context.Context, _, upid string, opts *sdktasks.WaitOptions) (*sdktasks.Status, error) {
@@ -174,6 +181,7 @@ func TestAwaitTask_MaxWaitOption(t *testing.T) {
 }
 
 func TestAwaitTask_EmptyUPID(t *testing.T) {
+	t.Parallel()
 	svc := &mockTasksService{}
 	err := pve.AwaitTask(context.Background(), newMockClient(svc), "node1", "")
 	if err == nil {
@@ -182,6 +190,7 @@ func TestAwaitTask_EmptyUPID(t *testing.T) {
 }
 
 func TestAwaitTask_EmptyNode(t *testing.T) {
+	t.Parallel()
 	svc := &mockTasksService{}
 	err := pve.AwaitTask(context.Background(), newMockClient(svc), "", "UPID:node1:abc")
 	if err == nil {
@@ -190,6 +199,7 @@ func TestAwaitTask_EmptyNode(t *testing.T) {
 }
 
 func TestAwaitTask_NilContext(t *testing.T) {
+	t.Parallel()
 	svc := &mockTasksService{}
 	//nolint:staticcheck // intentional nil ctx for validation test
 	err := pve.AwaitTask(nil, newMockClient(svc), "node1", "UPID:node1:abc")
@@ -199,6 +209,7 @@ func TestAwaitTask_NilContext(t *testing.T) {
 }
 
 func TestAwaitTask_NilClient(t *testing.T) {
+	t.Parallel()
 	err := pve.AwaitTask(context.Background(), nil, "node1", "UPID:node1:abc")
 	if err == nil {
 		t.Fatal("expected error for nil client, got nil")
@@ -206,6 +217,7 @@ func TestAwaitTask_NilClient(t *testing.T) {
 }
 
 func TestAwaitTask_SDKNetworkError(t *testing.T) {
+	t.Parallel()
 	svc := &mockTasksService{
 		waitFn: func(_ context.Context, _, _ string, _ *sdktasks.WaitOptions) (*sdktasks.Status, error) {
 			return nil, errors.New("connection refused")
@@ -218,6 +230,7 @@ func TestAwaitTask_SDKNetworkError(t *testing.T) {
 }
 
 func TestAwaitTaskWithLogger_Success(t *testing.T) {
+	t.Parallel()
 	svc := &mockTasksService{
 		waitFn: func(_ context.Context, _, upid string, _ *sdktasks.WaitOptions) (*sdktasks.Status, error) {
 			return &sdktasks.Status{Status: "stopped", ExitStatus: "OK", UpID: upid}, nil
@@ -231,6 +244,7 @@ func TestAwaitTaskWithLogger_Success(t *testing.T) {
 }
 
 func TestAwaitTaskWithLogger_SuccessWithLogger(t *testing.T) {
+	t.Parallel()
 	svc := &mockTasksService{
 		waitFn: func(_ context.Context, _, upid string, _ *sdktasks.WaitOptions) (*sdktasks.Status, error) {
 			return &sdktasks.Status{Status: "stopped", ExitStatus: "OK", UpID: upid}, nil
@@ -243,6 +257,7 @@ func TestAwaitTaskWithLogger_SuccessWithLogger(t *testing.T) {
 }
 
 func TestAwaitTaskWithLogger_Failure(t *testing.T) {
+	t.Parallel()
 	svc := &mockTasksService{
 		waitFn: func(_ context.Context, _, upid string, _ *sdktasks.WaitOptions) (*sdktasks.Status, error) {
 			return &sdktasks.Status{Status: "stopped", ExitStatus: "FAILED", UpID: upid},
@@ -257,6 +272,7 @@ func TestAwaitTaskWithLogger_Failure(t *testing.T) {
 }
 
 func TestAwaitTaskWithLogger_FailureWithLogger(t *testing.T) {
+	t.Parallel()
 	svc := &mockTasksService{
 		waitFn: func(_ context.Context, _, upid string, _ *sdktasks.WaitOptions) (*sdktasks.Status, error) {
 			return &sdktasks.Status{Status: "stopped", ExitStatus: "FAILED", UpID: upid},
@@ -270,6 +286,7 @@ func TestAwaitTaskWithLogger_FailureWithLogger(t *testing.T) {
 }
 
 func TestAwaitTask_WithPollInterval_Zero(t *testing.T) {
+	t.Parallel()
 	// Zero duration opt is ignored; default should be used.
 	var capturedOpts *sdktasks.WaitOptions
 	svc := &mockTasksService{

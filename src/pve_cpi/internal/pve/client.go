@@ -1,5 +1,4 @@
-// Package pve wraps the pve-apiclient-go SDK for use by the BOSH PVE CPI.
-// It exposes a mockable Client interface composed of per-domain service handles.
+// Client interface composed of per-domain service handles, mockable for tests.
 package pve
 
 import (

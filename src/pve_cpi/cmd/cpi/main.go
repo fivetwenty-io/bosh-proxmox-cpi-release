@@ -44,58 +44,79 @@ const exitSignaled = 130
 const maxLineBytes = 64 * 1024 * 1024
 
 func main() {
+	os.Exit(run())
+}
+
+// run is the thin os-wired entry point. It delegates to runWithArgs so the
+// startup logic is testable in-process without spawning a subprocess.
+func run() int {
+	return runWithArgs(os.Args[1:], os.Stdin, os.Stdout, os.Stderr)
+}
+
+// runWithArgs contains the full startup and event loop. Accepting args, stdin,
+// stdout, and stderr as parameters makes every flag-parse and config-load path
+// testable without spawning a subprocess or manipulating os.Args.
+//
+// Returning an int rather than calling os.Exit directly ensures that all
+// deferred calls (including signal.NotifyContext's cancel) fire before the
+// process exits.
+func runWithArgs(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("cpi", flag.ContinueOnError)
+	fs.SetOutput(stderr)
 	configPath := fs.String("config", "", "path to CPI JSON config file (required)")
 	showVersion := fs.Bool("version", false, "print version string and exit 0")
 
-	if err := fs.Parse(os.Args[1:]); err != nil {
+	if err := fs.Parse(args); err != nil {
 		// flag.ContinueOnError writes usage; add context line for clarity.
-		fmt.Fprintf(os.Stderr, "cpi: flag parse: %s\n", err)
-		os.Exit(1)
+		fmt.Fprintf(stderr, "cpi: flag parse: %s\n", err)
+		return 1
 	}
 	// Reject unexpected positional arguments.
 	if fs.NArg() > 0 {
-		fmt.Fprintf(os.Stderr, "cpi: unexpected arguments: %v\n", fs.Args())
+		fmt.Fprintf(stderr, "cpi: unexpected arguments: %v\n", fs.Args())
 		fs.Usage()
-		os.Exit(1)
+		return 1
 	}
 
 	if *showVersion {
-		fmt.Println(version.String())
-		os.Exit(0)
+		fmt.Fprintln(stdout, version.String())
+		return 0
 	}
 
 	if *configPath == "" {
-		fmt.Fprintln(os.Stderr, "cpi: --config is required")
+		fmt.Fprintln(stderr, "cpi: --config is required")
 		fs.Usage()
-		os.Exit(1)
+		return 1
 	}
 
 	cfg, err := config.LoadFile(*configPath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "cpi: config load failed: %s\n", err)
-		os.Exit(1)
+		fmt.Fprintf(stderr, "cpi: config load failed: %s\n", err)
+		return 1
 	}
 
-	logger, err := log.NewLogger(cfg.LogLevel, os.Stderr)
+	logger, err := log.NewLogger(cfg.LogLevel, stderr)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "cpi: logger init failed: %s\n", err)
-		os.Exit(1)
+		fmt.Fprintf(stderr, "cpi: logger init failed: %s\n", err)
+		return 1
 	}
 
 	client, err := pve.NewClient(cfg, logger)
 	if err != nil {
 		logger.Error("pve client init failed", log.Err(err))
-		os.Exit(1)
+		return 1
 	}
 
 	bootAgent, err := agent.NewAgent(cfg, client, logger)
 	if err != nil {
 		logger.Error("agent init failed", log.Err(err))
-		os.Exit(1)
+		return 1
 	}
 
-	// Root context cancelled on SIGINT/SIGTERM.
+	// Root context cancelled on SIGINT/SIGTERM. defer cancel() fires when
+	// runWithArgs returns, deregistering the signal handler and releasing
+	// resources even though main calls os.Exit — the exit is deferred until
+	// after run() returns.
 	rootCtx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
@@ -114,17 +135,15 @@ func main() {
 		Resolver: backendResolver,
 	})
 
-	exitCode := 0
-	runErr := runCPI(rootCtx, os.Stdin, os.Stdout, d, logger)
+	runErr := runCPI(rootCtx, stdin, stdout, d, logger)
 	if runErr != nil {
 		if errors.Is(runErr, errSignaled) {
-			exitCode = exitSignaled
-		} else {
-			logger.Error("cpi loop terminated with error", log.Err(runErr))
-			exitCode = 1
+			return exitSignaled
 		}
+		logger.Error("cpi loop terminated with error", log.Err(runErr))
+		return 1
 	}
-	os.Exit(exitCode)
+	return 0
 }
 
 // errSignaled is returned by runCPI when the parent context is cancelled by a signal.

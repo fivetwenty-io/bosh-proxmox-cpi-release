@@ -49,6 +49,7 @@ func invokeCreateNetwork(t *testing.T, deps handlers.Deps, args ...any) (any, er
 // -- CN-01: SDN happy path (zone exists, vnet absent, no range) --
 
 func TestHandleCreateNetwork_SDN_HappyPath(t *testing.T) {
+	t.Parallel()
 	var createVnetCalled bool
 	var updateSdnCalled bool
 
@@ -113,6 +114,7 @@ func TestHandleCreateNetwork_SDN_HappyPath(t *testing.T) {
 // -- CN-02: SDN with subnet --
 
 func TestHandleCreateNetwork_SDN_WithSubnet(t *testing.T) {
+	t.Parallel()
 	var subnetCalled bool
 	clusterSvc := &mockSDNCluster{
 		getSdnZonesFn: func(_ context.Context, _ string, _ *sdkcluster.GetSdnZonesParams) (*sdkcluster.GetSdnZonesResponse, error) {
@@ -171,6 +173,7 @@ func TestHandleCreateNetwork_SDN_WithSubnet(t *testing.T) {
 // -- CN-03: SDN idempotent re-create (vnet already exists) --
 
 func TestHandleCreateNetwork_SDN_IdempotentVnetExists(t *testing.T) {
+	t.Parallel()
 	var createVnetCalled bool
 	clusterSvc := &mockSDNCluster{
 		getSdnZonesFn: func(_ context.Context, _ string, _ *sdkcluster.GetSdnZonesParams) (*sdkcluster.GetSdnZonesResponse, error) {
@@ -216,6 +219,7 @@ func TestHandleCreateNetwork_SDN_IdempotentVnetExists(t *testing.T) {
 // -- CN-04: Bad vnet name (>8 chars) --
 
 func TestHandleCreateNetwork_SDN_BadVnetName(t *testing.T) {
+	t.Parallel()
 	spec := map[string]any{
 		"type": "manual",
 		"cloud_properties": map[string]any{
@@ -239,6 +243,7 @@ func TestHandleCreateNetwork_SDN_BadVnetName(t *testing.T) {
 // -- CN-05: Zone missing, autoManage=false --
 
 func TestHandleCreateNetwork_SDN_ZoneMissingAutoManageFalse(t *testing.T) {
+	t.Parallel()
 	clusterSvc := &mockSDNCluster{
 		getSdnZonesFn: func(_ context.Context, _ string, _ *sdkcluster.GetSdnZonesParams) (*sdkcluster.GetSdnZonesResponse, error) {
 			return nil, sdnNotFound()
@@ -264,6 +269,7 @@ func TestHandleCreateNetwork_SDN_ZoneMissingAutoManageFalse(t *testing.T) {
 // -- CN-06: Zone missing, autoManage=true → CreateSdnZones called --
 
 func TestHandleCreateNetwork_SDN_ZoneMissingAutoManageTrue(t *testing.T) {
+	t.Parallel()
 	var createZoneCalled bool
 	clusterSvc := &mockSDNCluster{
 		getSdnZonesFn: func(_ context.Context, _ string, _ *sdkcluster.GetSdnZonesParams) (*sdkcluster.GetSdnZonesResponse, error) {
@@ -312,6 +318,7 @@ func TestHandleCreateNetwork_SDN_ZoneMissingAutoManageTrue(t *testing.T) {
 // -- CN-07: Bridge fallback --
 
 func TestHandleCreateNetwork_Bridge_HappyPath(t *testing.T) {
+	t.Parallel()
 	var createNetworkCalled bool
 	var updateNetworkCalled bool
 
@@ -369,6 +376,7 @@ func TestHandleCreateNetwork_Bridge_HappyPath(t *testing.T) {
 // -- CN-08: Missing args --
 
 func TestHandleCreateNetwork_MissingArg(t *testing.T) {
+	t.Parallel()
 	h := handlers.HandleCreateNetwork(handlers.Deps{Config: testConfig(), Logger: log.NewNopLogger(), PVE: &mockPVEClient{clusterSvc: &mockSDNCluster{}}})
 	_, err := h.Handle(context.Background(), []json.RawMessage{}, jsonrpc.Context{})
 	if err == nil {
@@ -383,6 +391,7 @@ func TestHandleCreateNetwork_MissingArg(t *testing.T) {
 // -- CN-09: No routing info --
 
 func TestHandleCreateNetwork_NoRoutingInfo(t *testing.T) {
+	t.Parallel()
 	cfg := testConfig()
 	cfg.NetworkMode = "auto"
 	cfg.NetworkBridge = ""
@@ -410,6 +419,7 @@ func TestHandleCreateNetwork_NoRoutingInfo(t *testing.T) {
 // -- CN-10: Invalid JSON spec --
 
 func TestHandleCreateNetwork_InvalidJSON(t *testing.T) {
+	t.Parallel()
 	cfg := testConfig()
 	deps := handlers.Deps{Config: cfg, Logger: log.NewNopLogger(), PVE: &mockPVEClient{clusterSvc: &mockSDNCluster{}}}
 	h := handlers.HandleCreateNetwork(deps)
@@ -426,6 +436,7 @@ func TestHandleCreateNetwork_InvalidJSON(t *testing.T) {
 // -- CN-11: config.SDNZone used as zone fallback --
 
 func TestHandleCreateNetwork_SDN_ConfigZoneFallback(t *testing.T) {
+	t.Parallel()
 	var zoneChecked string
 	clusterSvc := &mockSDNCluster{
 		getSdnZonesFn: func(_ context.Context, zone string, _ *sdkcluster.GetSdnZonesParams) (*sdkcluster.GetSdnZonesResponse, error) {
@@ -469,6 +480,7 @@ func TestHandleCreateNetwork_SDN_ConfigZoneFallback(t *testing.T) {
 // -- CN-12: vnet name with invalid chars --
 
 func TestHandleCreateNetwork_SDN_VnetNameInvalidChars(t *testing.T) {
+	t.Parallel()
 	spec := map[string]any{
 		"type": "manual",
 		"cloud_properties": map[string]any{
@@ -489,6 +501,7 @@ func TestHandleCreateNetwork_SDN_VnetNameInvalidChars(t *testing.T) {
 // -- ensure bridge returned in cloud_properties_out uses vnet name not "vmbr"+vnet --
 
 func TestHandleCreateNetwork_SDN_BridgeEqualsVnet(t *testing.T) {
+	t.Parallel()
 	clusterSvc := &mockSDNCluster{
 		getSdnZonesFn: func(_ context.Context, _ string, _ *sdkcluster.GetSdnZonesParams) (*sdkcluster.GetSdnZonesResponse, error) {
 			raw := sdkcluster.GetSdnZonesResponse(`{"zone":"z"}`)
@@ -528,6 +541,7 @@ func TestHandleCreateNetwork_SDN_BridgeEqualsVnet(t *testing.T) {
 // -- CN-vnet-required: vnet name missing on SDN path --
 
 func TestHandleCreateNetwork_SDN_VnetRequired(t *testing.T) {
+	t.Parallel()
 	cfg := testConfig()
 	cfg.NetworkMode = "sdn"
 	cfg.SDNZone = "myzone"
@@ -553,6 +567,7 @@ func TestHandleCreateNetwork_SDN_VnetRequired(t *testing.T) {
 // -- bridge falls back to config.NetworkBridge when cloud_properties.bridge absent --
 
 func TestHandleCreateNetwork_Bridge_FallsBackToConfigBridge(t *testing.T) {
+	t.Parallel()
 	var ifaceUsed string
 	nodesSvc := &mockBridgeNodes{
 		createNetworkFn: func(_ context.Context, _ string, params *sdknodes.CreateNetworkParams) error {
@@ -587,6 +602,7 @@ func TestHandleCreateNetwork_Bridge_FallsBackToConfigBridge(t *testing.T) {
 // -- ensure config.Node is used as bridge node when cloud_properties.node absent --
 
 func TestHandleCreateNetwork_Bridge_UsesConfigNode(t *testing.T) {
+	t.Parallel()
 	var nodeUsed string
 	nodesSvc := &mockBridgeNodes{
 		createNetworkFn: func(_ context.Context, node string, _ *sdknodes.CreateNetworkParams) error {
@@ -616,6 +632,7 @@ func TestHandleCreateNetwork_Bridge_UsesConfigNode(t *testing.T) {
 // -- bridge returns node in cloud_properties_out --
 
 func TestHandleCreateNetwork_Bridge_CloudPropsOut(t *testing.T) {
+	t.Parallel()
 	nodesSvc := &mockBridgeNodes{}
 	cfg := testConfig()
 	cfg.NetworkMode = "bridge"
@@ -643,6 +660,7 @@ func TestHandleCreateNetwork_Bridge_CloudPropsOut(t *testing.T) {
 // -- addr_properties reserved field is always empty []string{} --
 
 func TestHandleCreateNetwork_SDN_ReservedIsEmptySlice(t *testing.T) {
+	t.Parallel()
 	clusterSvc := &mockSDNCluster{
 		getSdnZonesFn: func(_ context.Context, _ string, _ *sdkcluster.GetSdnZonesParams) (*sdkcluster.GetSdnZonesResponse, error) {
 			raw := sdkcluster.GetSdnZonesResponse(`{"zone":"z"}`)
@@ -677,6 +695,7 @@ func TestHandleCreateNetwork_SDN_ReservedIsEmptySlice(t *testing.T) {
 // -- bridge CreateNetwork error surfaces as CloudError --
 
 func TestHandleCreateNetwork_Bridge_CreateError(t *testing.T) {
+	t.Parallel()
 	nodesSvc := &mockBridgeNodes{
 		createNetworkFn: func(_ context.Context, _ string, _ *sdknodes.CreateNetworkParams) error {
 			return &pveerr.APIError{} // generic API error
@@ -706,6 +725,7 @@ func TestHandleCreateNetwork_Bridge_CreateError(t *testing.T) {
 // Verifies the rollback apply contract: vnetCreated gates rollback, not spec.Range.
 
 func TestHandleCreateNetwork_SDN_Rollback_SubnetFails(t *testing.T) {
+	t.Parallel()
 	var deleteVnetCalled bool
 	var updateSdnCalls int
 	subnetErr := &pveerr.APIError{} // non-409, non-404 error
@@ -760,6 +780,7 @@ func TestHandleCreateNetwork_SDN_Rollback_SubnetFails(t *testing.T) {
 // Verifies the rollback apply contract: subnetCreated=true gates subnet delete.
 
 func TestHandleCreateNetwork_SDN_Rollback_ApplyFails(t *testing.T) {
+	t.Parallel()
 	var deleteVnetCalled bool
 	var deleteSubnetCalled bool
 	applyCallCount := 0
@@ -828,6 +849,7 @@ func TestHandleCreateNetwork_SDN_Rollback_ApplyFails(t *testing.T) {
 // leave the operator's vnet and any pre-existing subnet untouched.
 
 func TestHandleCreateNetwork_SDN_Rollback_PreexistingVnet_NoRollbackDelete(t *testing.T) {
+	t.Parallel()
 	var deleteVnetCalled bool
 	var deleteSubnetCalled bool
 	applyFail := true
@@ -896,6 +918,7 @@ func TestHandleCreateNetwork_SDN_Rollback_PreexistingVnet_NoRollbackDelete(t *te
 //   - Handler returns the original subnet-create error.
 
 func TestHandleCreateNetwork_SubnetCreateFails_RollsBackZoneAndVnet(t *testing.T) {
+	t.Parallel()
 	var deleteVnetCalled bool
 	var deleteZoneCalled bool
 	var updateSdnCalls int
@@ -990,6 +1013,7 @@ var _ *config.CPIConfig = testConfig()
 //     though the parent context is already cancelled.
 
 func TestCreateNetwork_RollbackSurvivesParentCancel(t *testing.T) {
+	t.Parallel()
 	parentCtx, cancel := context.WithCancel(context.Background())
 
 	var deleteVnetCtxErr error
@@ -1063,6 +1087,7 @@ func TestCreateNetwork_RollbackSurvivesParentCancel(t *testing.T) {
 // observed vnet is applied for the new caller's session.
 
 func TestCreateNetwork_Concurrent_IdempotentOnExisting(t *testing.T) {
+	t.Parallel()
 	var createVnetCalled bool
 	var applyCalled bool
 
@@ -1126,6 +1151,7 @@ func TestCreateNetwork_Concurrent_IdempotentOnExisting(t *testing.T) {
 // therefore NOT delete the operator-owned zone, even if a later step fails.
 
 func TestCreateNetwork_ZoneAlreadyExists_NoError(t *testing.T) {
+	t.Parallel()
 	var createZoneCalled bool
 	var deleteZoneCalled bool
 	var deleteVnetCalled bool

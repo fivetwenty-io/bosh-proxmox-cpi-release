@@ -35,6 +35,7 @@ func (f *fakeLister) ListStorage(_ context.Context, _ *clusterstorage.ListStorag
 }
 
 func TestStorageInfoCache_ClassifiesByType(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name       string
 		storageRow map[string]any
@@ -70,6 +71,7 @@ func TestStorageInfoCache_ClassifiesByType(t *testing.T) {
 }
 
 func TestStorageInfoCache_ParsesNodesRestriction(t *testing.T) {
+	t.Parallel()
 	lister := &fakeLister{entries: []map[string]any{
 		{"storage": "local-zfs", "type": "zfspool", "nodes": "pve-01,pve-02 , pve-03"},
 	}}
@@ -90,6 +92,7 @@ func TestStorageInfoCache_ParsesNodesRestriction(t *testing.T) {
 }
 
 func TestStorageInfoCache_CachesUntilTTL(t *testing.T) {
+	t.Parallel()
 	lister := &fakeLister{entries: []map[string]any{
 		{"storage": "s1", "type": "rbd"},
 	}}
@@ -112,6 +115,7 @@ func TestStorageInfoCache_CachesUntilTTL(t *testing.T) {
 }
 
 func TestStorageInfoCache_MissingStorageReportsError(t *testing.T) {
+	t.Parallel()
 	lister := &fakeLister{entries: []map[string]any{
 		{"storage": "ceph", "type": "rbd"},
 	}}
@@ -123,6 +127,7 @@ func TestStorageInfoCache_MissingStorageReportsError(t *testing.T) {
 }
 
 func TestStorageInfoCache_PropagatesListerError(t *testing.T) {
+	t.Parallel()
 	lister := &fakeLister{err: errors.New("boom")}
 	cache := NewStorageInfoCache(lister, time.Minute)
 	_, err := cache.Get(context.Background(), "anything")
@@ -137,6 +142,7 @@ func TestStorageInfoCache_PropagatesListerError(t *testing.T) {
 // degraded PVE pool. After Invalidate the negative cache is cleared so the
 // next Get retries the upstream.
 func TestRefresh_NegativeCacheTTL(t *testing.T) {
+	t.Parallel()
 	lister := &fakeLister{err: errors.New("pve unreachable")}
 	cache := NewStorageInfoCache(lister, time.Minute)
 
@@ -185,13 +191,17 @@ func TestRefresh_NegativeCacheTTL(t *testing.T) {
 
 // TestNegativeCacheTTL_Expires confirms that after the negative-cache window
 // elapses, a new Get re-invokes the lister rather than indefinitely caching
-// the failure. Uses a tiny TTL override by manipulating the cache directly
-// since negativeCacheTTL is a package-level constant; this test runs in the
-// same package and can read it for the wait duration.
+// the failure. Sets the package-level negativeCacheTTL seam to 1ms so the
+// test is deterministic and completes in milliseconds rather than 5+ seconds.
 func TestNegativeCacheTTL_Expires(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping TTL expiry wait under -short")
-	}
+	// Not parallel: mutates the package-level negativeCacheTTL seam.
+	// Running in serial ensures no concurrent test reads the var while we write it.
+
+	// Override the package-level TTL to 1ms; restore on cleanup.
+	prev := negativeCacheTTL
+	negativeCacheTTL = 1 * time.Millisecond
+	t.Cleanup(func() { negativeCacheTTL = prev })
+
 	lister := &fakeLister{err: errors.New("pve unreachable")}
 	cache := NewStorageInfoCache(lister, time.Minute)
 
@@ -203,9 +213,8 @@ func TestNegativeCacheTTL_Expires(t *testing.T) {
 		t.Fatalf("calls=%d want 1", lister.calls)
 	}
 
-	// Wait out the negative-cache TTL plus a small slack. Suppressed
-	// under -short since 5s + slack exceeds typical short budget.
-	time.Sleep(negativeCacheTTL + 200*time.Millisecond)
+	// Wait out the overridden TTL (1ms) plus a small slack to ensure expiry.
+	time.Sleep(10 * time.Millisecond)
 
 	_, err = cache.Get(context.Background(), "ceph")
 	if err == nil {
@@ -217,6 +226,7 @@ func TestNegativeCacheTTL_Expires(t *testing.T) {
 }
 
 func TestBackendResolver_FallsBackToLocalOnLookupMiss(t *testing.T) {
+	t.Parallel()
 	lister := &fakeLister{entries: []map[string]any{}}
 	cache := NewStorageInfoCache(lister, time.Minute)
 	r := NewBackendResolver(nil, cache, "pve-default")
@@ -230,6 +240,7 @@ func TestBackendResolver_FallsBackToLocalOnLookupMiss(t *testing.T) {
 }
 
 func TestBackendResolver_PicksSharedForCephRBD(t *testing.T) {
+	t.Parallel()
 	lister := &fakeLister{entries: []map[string]any{
 		{"storage": "ceph", "type": "rbd"},
 	}}
@@ -245,6 +256,7 @@ func TestBackendResolver_PicksSharedForCephRBD(t *testing.T) {
 }
 
 func TestBackendResolver_PicksLocalForLVMThin(t *testing.T) {
+	t.Parallel()
 	lister := &fakeLister{entries: []map[string]any{
 		{"storage": "local-lvm", "type": "lvmthin"},
 	}}
@@ -260,6 +272,7 @@ func TestBackendResolver_PicksLocalForLVMThin(t *testing.T) {
 }
 
 func TestStaticResolver_AlwaysShared(t *testing.T) {
+	t.Parallel()
 	r := NewStaticBackendResolver(nil, "pve-x")
 	b, err := r.Resolve(context.Background(), "anything")
 	if err != nil {
@@ -311,6 +324,7 @@ func (a *atomicLister) ListStorage(_ context.Context, _ *clusterstorage.ListStor
 // any refresh completes, maximising the probability of observing the bug if
 // the fix is absent.
 func TestStorageInfoCache_ConcurrentGetCoalesces(t *testing.T) {
+	t.Parallel()
 	const goroutines = 100
 
 	// allStarted is closed after all Get goroutines have been launched.
