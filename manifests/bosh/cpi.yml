@@ -114,6 +114,13 @@
   path: /cloud_provider/properties/pve?
   value: *pve_props
 
-- type: replace
-  path: /cloud_provider/properties/agent?
-  value: *pve_agent_props
+# Note: do NOT replace /cloud_provider/properties/agent here. bosh-deployment's
+# bosh.yml supplies the create-env agent bind URL
+# (https://mbus:((mbus_bootstrap_password))@0.0.0.0:6868), and bosh int only
+# resolves ((vars)) at the manifest top level — pre-baking the URL via a
+# vars.yml value with an inner ((mbus_bootstrap_password)) reference does not
+# expand recursively, so an override here either wipes the bind URL (empty
+# pve_agent_mbus) or hard-codes a stale password. Leaving the bosh.yml default
+# in place keeps bosh-init <-> agent bootstrap working. The CPI-driven agent
+# properties for deployed instance groups still flow through
+# /instance_groups/name=bosh/jobs/-/properties/agent above.
