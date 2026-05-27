@@ -56,7 +56,10 @@ func NewAgent(cfg *config.CPIConfig, pveClient pve.Client, logger *log.Logger) (
 		}
 		regClient, err := registry.NewClientWithOptions(
 			cfg.RegistryEndpoint, cfg.RegistryUser, cfg.RegistryPassword,
-			registry.Options{CACertPEM: cfg.RegistryCACertPEM},
+			registry.Options{
+				CACertPEM:    cfg.RegistryCACertPEM,
+				AllowedHosts: cfg.RegistryAllowedHosts,
+			},
 		)
 		if err != nil {
 			return nil, cpierrors.Cloud("agent.NewAgent: build registry client: %s", err.Error())

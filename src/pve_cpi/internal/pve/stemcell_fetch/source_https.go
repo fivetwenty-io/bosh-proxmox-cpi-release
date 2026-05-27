@@ -23,14 +23,30 @@ type httpsSource struct {
 }
 
 // newHTTPSSource returns a Source whose http.Client uses a 30-minute timeout,
-// a TLS 1.2 floor, and the default redirect policy (which honors up to 10 redirects).
+// a TLS 1.2 floor, and a redirect policy that requires every redirect target
+// to use https:// (preventing accidental scheme downgrade and SSRF-adjacent
+// redirects to internal endpoints). Up to 10 redirects are still permitted,
+// matching Go's default cap.
 func newHTTPSSource() *httpsSource {
 	return &httpsSource{
 		client: &http.Client{
-			Timeout:   30 * time.Minute,
-			Transport: &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12}},
+			Timeout:       30 * time.Minute,
+			Transport:     &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12}},
+			CheckRedirect: httpsOnlyRedirect,
 		},
 	}
+}
+
+// httpsOnlyRedirect rejects any redirect whose target is not https://.
+// Mirrors Go's default 10-redirect cap.
+func httpsOnlyRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) >= 10 {
+		return fmt.Errorf("stemcell_fetch(https): stopped after 10 redirects")
+	}
+	if req.URL.Scheme != schemeHTTPS {
+		return fmt.Errorf("stemcell_fetch(https): refusing redirect to non-https URL %q", req.URL.String())
+	}
+	return nil
 }
 
 // Fetch opens a streaming GET to ref.URL, applies creds, and returns the
@@ -54,11 +70,11 @@ func (h *httpsSource) Fetch(ctx context.Context, ref Reference, creds Credential
 	if err != nil {
 		return nil, 0, fmt.Errorf("stemcell_fetch(https): parse URL %q: %w", ref.URL, err)
 	}
-	if parsed.Scheme != "https" {
+	if parsed.Scheme != schemeHTTPS {
 		return nil, 0, fmt.Errorf("stemcell_fetch(https): expected scheme https, got %q", parsed.Scheme)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ref.URL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ref.URL, http.NoBody)
 	if err != nil {
 		return nil, 0, fmt.Errorf("stemcell_fetch(https): build request: %w", err)
 	}

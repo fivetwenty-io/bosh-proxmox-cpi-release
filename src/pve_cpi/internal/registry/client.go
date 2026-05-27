@@ -343,7 +343,8 @@ func (c *Client) doWithRetry(req *http.Request) (*http.Response, error) {
 				req.URL.Host,
 			)
 		}
-		resp, err = c.http.Do(req) // #nosec G704 -- URL host enforced via configuredHost invariant + CheckRedirect rejects redirects; registry_allowed_hosts may further constrain
+		// URL host enforced via configuredHost invariant + CheckRedirect rejects redirects; registry_allowed_hosts may further constrain.
+		resp, err = c.http.Do(req) // #nosec G704 -- SSRF via taint analysis: req.URL is operator-configured and host-gated by configuredHost + AllowedHosts.
 		if !isRetriable(resp, err) {
 			// Terminal: when both resp and err are non-nil (rare but possible
 			// with some net.http edge cases) close the body now since the
@@ -385,9 +386,9 @@ func (c *Client) Put(ctx context.Context, instanceID string, settings any) error
 		return cpierrors.Cloud("registry: Put: marshal envelope: %s", err.Error())
 	}
 
-	url := fmt.Sprintf("%s/instances/%s/settings", c.endpoint, instanceID)
+	reqURL := fmt.Sprintf("%s/instances/%s/settings", c.endpoint, instanceID)
 	bodyReader := bytes.NewReader(body)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, bodyReader)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, reqURL, bodyReader)
 	if err != nil {
 		return cpierrors.Cloud("registry: Put: build request: %s", err.Error())
 	}
@@ -427,8 +428,8 @@ func (c *Client) Get(ctx context.Context, instanceID string) (json.RawMessage, e
 		return nil, cpierrors.Cloud("registry: Get: instanceID must not be empty")
 	}
 
-	url := fmt.Sprintf("%s/instances/%s/settings", c.endpoint, instanceID)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	reqURL := fmt.Sprintf("%s/instances/%s/settings", c.endpoint, instanceID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, http.NoBody)
 	if err != nil {
 		return nil, cpierrors.Cloud("registry: Get: build request: %s", err.Error())
 	}
@@ -474,8 +475,8 @@ func (c *Client) Delete(ctx context.Context, instanceID string) error {
 		return cpierrors.Cloud("registry: Delete: instanceID must not be empty")
 	}
 
-	url := fmt.Sprintf("%s/instances/%s/settings", c.endpoint, instanceID)
-	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, url, nil)
+	reqURL := fmt.Sprintf("%s/instances/%s/settings", c.endpoint, instanceID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, reqURL, http.NoBody)
 	if err != nil {
 		return cpierrors.Cloud("registry: Delete: build request: %s", err.Error())
 	}
