@@ -45,3 +45,4 @@ state.json
 ci/integration.yml
 ci/params.yml
 ci/cpi-config.json
+/src/pve_cpi/cpi
