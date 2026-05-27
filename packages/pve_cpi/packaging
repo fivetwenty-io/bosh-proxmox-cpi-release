@@ -87,11 +87,22 @@ fi
 
 # ---------------------------------------------------------------------------
 # 3. Sanitize BOSH_PACKAGE_VERSION for use in ldflags.
+#
 # The raw value may contain characters that are not safe inside Go -ldflags
-# (e.g. embedded spaces from dirty git tags).  Strip everything except
+# (e.g. embedded spaces from dirty git tags). Strip everything except
 # alphanumerics, dots, dashes, and plus signs.
+#
+# Notes:
+#   - Avoid `printf '%s' ...`: BOSH's package-compilation pipeline runs the
+#     packaging script through Go text/template before the agent executes
+#     it, and the literal '%s' renders as '%!s(MISSING)' (no template arg
+#     supplied), corrupting printf's format string.
+#   - Avoid `tr -cd '[:alnum:].-+'`: tr interprets `.-+` as a character range
+#     and aborts with "range-endpoints in reverse collating sequence order".
+#     Putting `-` last (`'[:alnum:].+-'`) keeps `-` literal.
 # ---------------------------------------------------------------------------
-BOSH_PACKAGE_VERSION_SANITIZED="$(printf '%s' "${BOSH_PACKAGE_VERSION:-0.0.0+dev}" | tr -cd '[:alnum:].-+')"
+RAW_VERSION="${BOSH_PACKAGE_VERSION:-0.0.0+dev}"
+BOSH_PACKAGE_VERSION_SANITIZED="$(echo -n "${RAW_VERSION}" | tr -cd '[:alnum:].+-')"
 if [ -z "${BOSH_PACKAGE_VERSION_SANITIZED}" ]; then
   BOSH_PACKAGE_VERSION_SANITIZED="0.0.0+dev"
 fi
