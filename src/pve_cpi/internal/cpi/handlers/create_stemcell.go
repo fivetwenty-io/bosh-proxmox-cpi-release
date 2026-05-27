@@ -197,16 +197,26 @@ func parseStemcellCloudProps(cp map[string]any) stemcellCloudProps {
 }
 
 // stemcellStagingRoots returns the absolute, cleaned set of directories under
-// which an incoming image_path is permitted to resolve. The BOSH director stages
-// stemcell tarballs in its scratch area (os.TempDir() on the CPI host), so that
-// root is always permitted. Additional roots may be added here in the future
-// (e.g. an explicit `stemcell_staging_dir` config field) without changing
-// callers.
+// which an incoming image_path is permitted to resolve. The set covers the two
+// standard BOSH stemcell staging locations:
+//
+//  1. os.TempDir() — the BOSH director stages stemcells in its scratch area on
+//     the CPI host; on Linux this is /tmp (or $TMPDIR), on macOS /var/folders/…
+//
+//  2. <HOME>/.bosh/installations — `bosh create-env` runs the CPI locally on
+//     the operator host and stages images under
+//     ~/.bosh/installations/<id>/tmp/stemcell-manager<n>/image. This path is
+//     NOT inside os.TempDir(), so without this root every create-env stemcell
+//     upload would be rejected as "outside permitted staging root".
+//
+// Both roots are resolved through EvalSymlinks once so a real image path that
+// resolves to a symlinked realpath (e.g. /tmp -> /private/tmp on macOS) still
+// matches.
 func stemcellStagingRoots() []string {
 	roots := []string{os.TempDir()}
-	// Resolve and clean each root once. Best-effort EvalSymlinks: if the root
-	// itself is a symlink (e.g. /tmp -> /private/tmp on macOS), comparison must
-	// use the realpath so a resolved image_path under the realpath matches.
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		roots = append(roots, filepath.Join(home, ".bosh", "installations"))
+	}
 	out := make([]string, 0, len(roots))
 	for _, r := range roots {
 		if r == "" {
