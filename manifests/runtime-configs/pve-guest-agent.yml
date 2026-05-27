@@ -16,14 +16,20 @@
 # sites should pre-bake the package or mirror it on a reachable apt repo.
 #
 # Residual gap: QGA is only reachable AFTER the detached install completes
-# (typically seconds when the mirror is healthy). During that brief window
-# the `unstick-agent` fallback (PVE `qm guest exec`) is unavailable, which
+# (typically seconds when the mirror is healthy). During that window the
+# `unstick-agent` fallback (PVE `qm guest exec`) is unavailable, which
 # matters only if bosh-agent itself wedges on the very same boot before the
-# QGA install finishes. Closing this gap fully requires installing QGA from
-# the CPI side via cloud-init runcmd at VM-create time so QGA is up before
-# bosh-agent starts. That path is feasible but needs a live ConfigDrive vs
-# PVE cicustom datasource-coexistence test on Ubuntu Noble — deferred to a
-# follow-up cycle.
+# QGA install finishes. A PVE-side cicustom cloud-init runcmd would close
+# this gap, but the BOSH openstack-kvm Noble stemcell ships neither
+# `cloud-init` nor `qemu-guest-agent` (verified via SBOM in stemcell
+# 1.364), so a cicustom snippet would never be parsed. Fully closing the
+# gap therefore requires a stemcell-level change (pre-bake QGA or
+# cloud-init). The pre-start path below is the smallest-blast-radius
+# mitigation until that change lands.
+#
+# `./scripts/cf unstick-agent` performs a QGA `ping` probe with a bounded
+# wait so an operator gets an actionable error rather than a raw
+# `qm guest exec` failure during the install window.
 
 releases:
 - name:    os-conf
@@ -73,6 +79,17 @@ addons:
           timeout 180 apt-get $opts install -y --no-install-recommends qemu-guest-agent \
             || echo "pve-guest-agent: qemu-guest-agent install failed/timed out"
           systemctl start qemu-guest-agent.service 2>/dev/null || true
+          # Briefly wait for the unit to settle so the log records an
+          # active state, and drop a sentinel for the unstick-agent path
+          # to confirm a completed install without re-probing apt.
+          for _ in 1 2 3 4 5; do
+            if systemctl is-active --quiet qemu-guest-agent.service; then
+              date -Iseconds > /var/vcap/sys/log/pve-guest-agent/installed.flag
+              echo "pve-guest-agent: qemu-guest-agent active"
+              break
+            fi
+            sleep 2
+          done
         ' </dev/null >>"$logdir/install.log" 2>&1 &
         exit 0
   include:

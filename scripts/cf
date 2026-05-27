@@ -223,6 +223,40 @@ def cmd_check_uaa_db(_extra: list[str]) -> None:
     print("    OK")
 
 
+def _qga_ping(
+    ssh_opts: list[str],
+    pve_host: str,
+    vmid: int,
+    max_wait_s: int,
+) -> tuple[bool, str]:
+    """Probe whether qemu-guest-agent on `vmid` is responsive via PVE host.
+
+    Polls `qm guest cmd <vmid> ping` until QGA replies or max_wait_s
+    seconds elapse. The detached install in the `pve-guest-agent`
+    runtime-config addon can take a few seconds after the VM reaches
+    multi-user.target before QGA is reachable, so a short wait avoids
+    spurious failures during the install window.
+
+    Returns (True, "") on success; (False, last_stderr_or_stdout) on
+    timeout so the caller can include the underlying PVE error in its
+    diagnostic message.
+    """
+    deadline = time.monotonic() + max_wait_s
+    last = ""
+    while True:
+        r = subprocess.run(
+            ["ssh", *ssh_opts, f"root@{pve_host}",
+             "qm", "guest", "cmd", str(vmid), "ping"],
+            capture_output=True, text=True, check=False, timeout=15,
+        )
+        last = ((r.stdout or "") + (r.stderr or "")).strip()
+        if r.returncode == 0:
+            return True, ""
+        if time.monotonic() >= deadline:
+            return False, last
+        time.sleep(2)
+
+
 def _coerce_vmid(raw_cid: str) -> int:
     """Parse a PVE VMID string to a positive integer.
 
@@ -269,6 +303,20 @@ def cmd_unstick_agent(extra: list[str]) -> None:
         first-boot or test environments where the host key is not yet trusted).
         WARNING: SCRIPTS_CF_SSH_UNSAFE=1 exposes the connection to MITM attacks.
         Never use in production.
+
+    QGA availability:
+        The BOSH Noble stemcell ships neither cloud-init nor
+        qemu-guest-agent. The `pve-guest-agent` runtime-config addon
+        installs QGA via a detached apt run on first boot — which runs
+        AFTER bosh-agent reaches NATS. If bosh-agent itself wedges before
+        that point, QGA is never installed and `qm guest exec` has no
+        in-guest channel to recover the agent.
+
+        unstick-agent probes QGA via `qm guest cmd <vmid> ping` before
+        attempting the restart and waits up to SCRIPTS_CF_QGA_WAIT
+        seconds (default 30) for the install window to settle. On
+        timeout it exits with an actionable diagnostic rather than the
+        raw guest-exec failure.
     """
     if not extra:
         sys.exit("usage: scripts/cf unstick-agent <instance>")
@@ -325,6 +373,31 @@ def cmd_unstick_agent(extra: list[str]) -> None:
             "Do not use in production."
         )
         ssh_opts += ["-o", "StrictHostKeyChecking=no"]
+
+    try:
+        qga_wait_s = int(os.environ.get("SCRIPTS_CF_QGA_WAIT", "30"))
+    except ValueError:
+        qga_wait_s = 30
+    print(f"    probing qemu-guest-agent (up to {qga_wait_s}s)...")
+    qga_ok, qga_diag = _qga_ping(ssh_opts, pve_host, vmid, qga_wait_s)
+    if not qga_ok:
+        sys.exit(
+            f"qemu-guest-agent on vmid {vmid} did not respond within {qga_wait_s}s.\n"
+            f"Last `qm guest cmd <vmid> ping` output:\n  {qga_diag or '(no output)'}\n\n"
+            "The BOSH Noble stemcell does not pre-install qemu-guest-agent;\n"
+            "the `pve-guest-agent` runtime-config addon installs it via a\n"
+            "detached apt run on first boot, AFTER bosh-agent reaches NATS.\n"
+            "When bosh-agent never reaches NATS (the wedge this command\n"
+            "unsticks), the install never runs and there is no in-guest\n"
+            "recovery channel.\n\n"
+            "Options:\n"
+            f"  - Increase the wait: SCRIPTS_CF_QGA_WAIT=120 ./scripts/cf unstick-agent {target}\n"
+            f"  - Recreate the VM:    bosh -d {DEPLOYMENT} recreate {target}\n"
+            "  - Install qemu-guest-agent by hand via the PVE VM console.\n"
+            "  - Check the addon's install log on the VM (once reachable):\n"
+            "      /var/vcap/sys/log/pve-guest-agent/install.log"
+        )
+    print("    qemu-guest-agent responsive")
 
     probe = (
         "set -e; "

@@ -59,5 +59,16 @@
           timeout 180 apt-get $opts install -y --no-install-recommends qemu-guest-agent \
             || echo "pve-guest-agent: qemu-guest-agent install failed/timed out"
           systemctl start qemu-guest-agent.service 2>/dev/null || true
+          # Briefly wait for the unit to settle so the log records an
+          # active state, and drop a sentinel for the unstick-agent path
+          # to confirm a completed install without re-probing apt.
+          for _ in 1 2 3 4 5; do
+            if systemctl is-active --quiet qemu-guest-agent.service; then
+              date -Iseconds > /var/vcap/sys/log/pve-guest-agent/installed.flag
+              echo "pve-guest-agent: qemu-guest-agent active"
+              break
+            fi
+            sleep 2
+          done
         ' </dev/null >>"$logdir/install.log" 2>&1 &
         exit 0

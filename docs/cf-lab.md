@@ -103,7 +103,14 @@ instance group.
   resurrection (so it is safe to invoke from inside another script that
   already manages it).
 - `scripts/cf unstick-agent <instance>` — bypass NATS and restart the
-  bosh-agent on a wedged VM via PVE QGA.
+  bosh-agent on a wedged VM via PVE QGA. Probes `qm guest cmd <vmid>
+  ping` first and waits up to `SCRIPTS_CF_QGA_WAIT` seconds (default 30)
+  for the runtime-config addon's detached QGA install to settle.
+  Note: the BOSH Noble stemcell ships neither `cloud-init` nor
+  `qemu-guest-agent`, so QGA is only reachable once the addon's
+  detached install on first boot completes. A bosh-agent that wedges
+  before that point has no in-guest recovery channel — recreate the
+  VM with `bosh recreate`.
 - `scripts/cf update-resurrection on|off` — manual toggle when needed.
 - `scripts/cf teardown` — delete the cf deployment.
 
