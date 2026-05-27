@@ -1,0 +1,46 @@
+---
+# Ops file: relax the director health-monitor and disable the resurrector
+# for the lab.
+#
+# Background
+# ----------
+# On a single-PVE-host lab the resurrector causes more pain than it
+# prevents: any agent that briefly stops replying to get_state inside the
+# 60s default agent_timeout (very common during deploy churn — see
+# nats-tuning.yml header for the SIGHUP-reload mechanism) gets flagged as
+# dead, and HM's scan-and-fix issues a recreate. The recreate triggers
+# cloud_controller_ng's shutdown_drain, which stops nginx on the api VM
+# for up to 30 seconds. During that drain window the gorouter prunes the
+# api route on first dial failure and returns no_endpoints to cf-cli.
+# The recreate then completes, route_registrar re-registers, and the
+# cycle repeats every few minutes for as long as anything else on the
+# cluster is being churned.
+#
+# In a one-host lab there is no fleet-wide outage to ride out — a truly
+# dead VM stays dead until an operator notices and recreates it
+# manually, which is the expected workflow here anyway. Disabling the
+# resurrector removes the false-positive recreate loop while keeping
+# HM's alerting/log channels intact.
+#
+# `agent_timeout` is widened to 180 s so the 45 s NATS RPC window
+# referenced in nats-tuning.yml's header cannot, by itself, convince HM
+# an agent is gone. `analyze_agents` is doubled to 120 s for the same
+# reason — fewer chances for a transient stall to coincide with a scan.
+#
+# Usage: applied automatically by `scripts/bosh create-env`.
+# Takes effect on the next director redeploy.
+#
+# Rollback: drop the ops file from scripts/bosh and redeploy the director.
+# HM defaults are restored on the next create-env.
+
+- type: replace
+  path: /instance_groups/name=bosh/properties/hm/resurrector_enabled
+  value: false
+
+- type: replace
+  path: /instance_groups/name=bosh/properties/hm/intervals?/agent_timeout?
+  value: 180
+
+- type: replace
+  path: /instance_groups/name=bosh/properties/hm/intervals?/analyze_agents?
+  value: 120

@@ -1,0 +1,24 @@
+---
+# Ops file: tighten route_registrar's api-route heartbeat so the
+# re-registration following an nginx_cc drain arrives inside gorouter's
+# empty_pool_timeout window (see gorouter-tuning.yml).
+#
+# Default registration_interval for the api route is 10 s in
+# cf-deployment (cf-deployment.yml:1029); the longest observed
+# re-registration tail in lab forensic data was 11.5 s (one missed
+# heartbeat). Halving the interval to 5 s nearly eliminates the >5 s
+# tail, which is the window gorouter-tuning.yml's
+# empty_pool_timeout=5s is configured to absorb.
+#
+# NATS impact: route_registrar publishes one tiny `router.register`
+# message per route per interval. With 1 api instance and the api
+# route, going from 20 s → 5 s on a single route is negligible against
+# the cf NATS topology. Do *not* lower below 5 s — cf-deployment
+# convention is ≥5 s.
+#
+# Usage: applied automatically by `scripts/cf bosh-deploy`.
+# Rollback: drop the ops file from scripts/cf; redeploy api.
+
+- type: replace
+  path: /instance_groups/name=api/jobs/name=route_registrar/properties/route_registrar/routes/name=api/registration_interval
+  value: 5s

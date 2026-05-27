@@ -1,0 +1,38 @@
+---
+# Ops file: absorb the cloud_controller_ng shutdown_drain window at the
+# gorouter so cf-cli does not see no_endpoints during a recreate or
+# self-restart of the api VM.
+#
+# Background
+# ----------
+# When BOSH or monit recreates / restarts the cloud_controller_ng job,
+# its shutdown_drain hook stops nginx (the listener on api:9024) up to
+# 30 seconds before puma exits. During that window the kernel returns
+# ECONNREFUSED in <1 ms to any gorouter dial attempt, gorouter prunes
+# the api route from its pool on the first failure, and serves
+# x_cf_routererror:"no_endpoints" (HTTP 503) until route_registrar
+# re-registers ~10 seconds later via the next heartbeat.
+#
+# Setting `empty_pool_timeout` to a non-zero value makes gorouter block
+# the request for that many seconds waiting for a re-registration
+# instead of returning 503 immediately. 5 seconds covers the typical
+# re-registration window (0.05–11.5 s observed in lab forensic data,
+# median ≤1 s) and absorbs the drain transparently for cf-cli
+# callers.
+#
+# Trade-off
+# ---------
+# During a *real* CC outage (ccdb down, puma crash loop) callers now
+# block for up to 5 s before seeing the 503 they used to see
+# immediately. Callers with short timeouts (3 s curl, aggressive health
+# checks) will see slow failures instead of fast errors. There is no
+# stock knob to distinguish "transient drain" from "real outage" so
+# the trade-off cannot be removed, only lived with.
+#
+# Usage: applied automatically by `scripts/cf bosh-deploy`.
+# Rollback: drop the ops file from scripts/cf; redeploy gorouter
+# (`bosh deploy ... --recreate router/0`).
+
+- type: replace
+  path: /instance_groups/name=router/jobs/name=gorouter/properties/router/empty_pool_timeout?
+  value: 5s

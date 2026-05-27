@@ -31,10 +31,27 @@
 # (cf-deployment with 16+ instance groups) agents can still get RST'd
 # server-side when bosh-nats-sync triggers SIGHUP reloads in quick
 # succession and an agent's NATS handler is busy. Mitigations available
-# within stock knobs: keep ping window wide (this file), avoid
-# back-to-back recreates that churn auth.json. To raise write_deadline
-# would require forking the bosh release or templating nats.cfg out of
-# band — not done here.
+# within stock knobs: keep ping window wide (this file), reduce
+# bosh-nats-sync poll frequency (below), avoid back-to-back recreates
+# that churn auth.json. To raise write_deadline would require forking
+# the bosh release or templating nats.cfg out of band — not done here.
+#
+# bosh-nats-sync polling
+# ----------------------
+# `bosh-nats-sync` polls the director every N seconds for the live
+# agent CN list and rewrites /var/vcap/data/nats/auth.json + SIGHUPs the
+# nats server when the CN set changes. With the stock 10 s cadence a
+# 2-hour CF deploy generates ~720 sync cycles and ~40 reload events,
+# each of which can drop in-flight RPCs to any agent whose connection
+# was being authenticated. Extending to 60 s cuts that by 6× without
+# meaningfully delaying new-VM admission (a new agent waits up to 60 s
+# for its CN to land in auth.json before its first NATS connection — in
+# a CF deploy creating one VM per ~2 min, that is invisible).
+#
+# Forensic data: 28.6 % of gorouter "connection refused → api:9024"
+# events fell within ±5 s of a Reloaded line; cutting reload frequency
+# 6× is the highest-leverage single knob currently available without a
+# fork.
 
 - type: replace
   path: /instance_groups/name=bosh/properties/nats/ping_interval?
@@ -43,3 +60,7 @@
 - type: replace
   path: /instance_groups/name=bosh/properties/nats/ping_max_outstanding?
   value: 2
+
+- type: replace
+  path: /instance_groups/name=bosh/properties/nats-sync?/intervals?/poll_user_sync?
+  value: 60

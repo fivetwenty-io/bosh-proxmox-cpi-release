@@ -360,8 +360,18 @@ def cmd_bosh_deploy(extra: list[str]) -> None:
         str(CF_DEPLOYMENT / "cf-deployment.yml"),
         "-o", str(CF_DEPLOYMENT / "operations/use-compiled-releases.yml"),
         "-o", str(CF_DEPLOYMENT / "operations/use-haproxy.yml"),
+        # cf-deployment stock ops file: removes policy-server-asg-syncer
+        # from the api instance group. The job had been flapping every
+        # ~90s (HTTP retries against CC during ccdb churn) which made
+        # the api VM look unhealthy to HM and triggered recreate loops.
+        # The lab has no use for dynamic ASG sync.
+        "-o", str(CF_DEPLOYMENT / "operations/disable-dynamic-asgs.yml"),
         "-o", "manifests/cf/ops-serialize-deploy.yml",
         "-o", "manifests/cf/ops-resize-cf.yml",
+        # Lab-local NATS-storm remediation. See header comments in each
+        # ops file for the rationale and rollback path.
+        "-o", "manifests/cf/gorouter-tuning.yml",
+        "-o", "manifests/cf/route-registrar-tuning.yml",
         "-l", "manifests/bosh/vars.yml",
         "-l", "manifests/cf/vars.yml",
         *extra,
@@ -495,12 +505,50 @@ def cmd_update_resurrection(extra: list[str]) -> None:
         sys.exit(rc)
 
 
+def _set_resurrection(state: str) -> None:
+    """Toggle director-wide resurrection through scripts/bosh dispatch.
+
+    State must be 'on' or 'off'. Errors are logged but do not raise:
+    the deploy itself is the load-bearing operation, and a transient
+    failure to toggle resurrection should not abort it.
+    """
+    if state not in ("on", "off"):
+        raise ValueError(f"resurrection state must be 'on' or 'off', got {state!r}")
+    try:
+        bosh_mod = _load_bosh_module()
+        rc = bosh_mod.main(["update-resurrection", state])
+        if rc != 0:
+            print(f"    WARNING: update-resurrection {state} returned rc={rc}")
+    except Exception as exc:  # pragma: no cover - best-effort
+        print(f"    WARNING: update-resurrection {state} raised: {exc}")
+
+
 def cmd_deploy(extra: list[str]) -> None:
-    cmd_runtime_config([])
-    cmd_cloud_config([])
-    cmd_stemcell([])
-    cmd_check_uaa_db([])
-    cmd_bosh_deploy(extra)
+    """Full CF deploy with resurrection gated off across the run.
+
+    HM's resurrector is already disabled lab-wide by
+    `manifests/bosh/hm-tuning.yml`, but the director-side
+    `update-resurrection` flag is a per-deployment toggle that survives
+    director restarts and is what `bosh recreate` and the scan-and-fix
+    plugin honour. Wrapping the deploy with off/on guarantees the
+    deploy itself, plus any auxiliary recreates it triggers, run with
+    no resurrection interference, and restores the operator-friendly
+    default on success or failure.
+
+    If the script is killed with SIGKILL the finally block does not run
+    and resurrection stays off. Operators should check
+    `bosh resurrection` at start of any subsequent deploy. The
+    integration harness asserts on this at start-of-run.
+    """
+    _set_resurrection("off")
+    try:
+        cmd_runtime_config([])
+        cmd_cloud_config([])
+        cmd_stemcell([])
+        cmd_check_uaa_db([])
+        cmd_bosh_deploy(extra)
+    finally:
+        _set_resurrection("on")
 
 
 COMMANDS = {

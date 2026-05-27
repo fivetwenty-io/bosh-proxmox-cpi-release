@@ -21,6 +21,7 @@ Integration flags:
     --config FILE   Path to integration config YAML (default: ci/integration.yml).
     --dry-run       Print each command without executing; exit 0.
     --keep          Skip cleanup steps after each tier (leave resources running).
+    --yes, -y       Skip the DESTRUCTIVE confirmation prompt for 'all' (required in CI/non-TTY).
 """
 
 from __future__ import annotations
@@ -28,6 +29,7 @@ from __future__ import annotations
 import atexit
 import os
 import shlex
+import socket
 import subprocess
 import sys
 import tempfile
@@ -468,11 +470,42 @@ def tier_bosh(cfg: dict, cpi_config_path: str, keep: bool) -> int:
     return 0
 
 
+def _preflight_dns(sys_domain: str) -> int:
+    """Resolve api.<system_domain> before tier_cf starts.
+
+    The CF lab depends on an external Cloudflare Tunnel + HAProxy chain
+    (see docs/cf-lab.md). If DNS is broken the cf-cli smoke would fail
+    for reasons unrelated to the CPI, leaving misleading test output.
+    Failing fast here gives a clear, actionable error.
+
+    Returns 0 when api.<sys_domain> resolves, 1 otherwise. Dry-run skips
+    the lookup entirely.
+    """
+    if _dry_run:
+        print(f"==> tier 3 preflight: would resolve api.{sys_domain}")
+        return 0
+    host = f"api.{sys_domain}"
+    print(f"==> tier 3 preflight: resolving {host}")
+    try:
+        socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)
+    except socket.gaierror as exc:
+        print(
+            f"tier 3 preflight failed: {host} does not resolve ({exc}). "
+            "Verify the Cloudflare Tunnel + HAProxy chain is up "
+            "(see docs/cf-lab.md). The CPI is not at fault here.",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"    {host} resolves; continuing")
+    return 0
+
+
 def tier_cf(cfg: dict, cpi_config_path: str, keep: bool) -> int:
     """Run the Tier 3 CF deploy and smoke app sequence.
 
-    Steps: cf deploy → cf login → create org/space → cf push smoke app →
-    map-route → curl HTTP 200 assert. Unless keep, deletes app/space/org.
+    Steps: dns-preflight → cf deploy → cf login → create org/space → cf
+    push smoke app → map-route → curl HTTP 200 assert. Unless keep,
+    deletes app/space/org.
 
     Args:
         cfg:             Validated config dict.
@@ -492,6 +525,13 @@ def tier_cf(cfg: dict, cpi_config_path: str, keep: bool) -> int:
         smoke_timeout = int(smoke_timeout)
 
     sys_domain = _integration.system_domain(cfg, dry_run=_dry_run)
+
+    # Fail fast on DNS — the most common cause of a flaky tier 3 outside
+    # of NATS churn is the Cloudflare Tunnel being down. A 5-second
+    # resolver check beats a 5-minute cf push timeout.
+    rc = _preflight_dns(sys_domain)
+    if rc != 0:
+        return rc
 
     # Disable resurrection before any deploy steps.  disable_resurrection()
     # registers an atexit callback to re-enable it unconditionally on exit.
@@ -788,7 +828,8 @@ def cmd_integration(argv: list[str]) -> int:
             "  bosh      — Tier 2: bosh create-env + emptyvm smoke.\n"
             "  cf        — Tier 3: CF deploy + smoke app.\n"
             "  light     — Tier 4: light stemcell upload + delete assertions.\n"
-            "  all       — Teardown existing env, then lifecycle → bosh → cf → light\n"
+            "  all       — DESTRUCTIVE: teardown existing env, then lifecycle → bosh → cf → light.\n"
+            "              Interactive operators are prompted to confirm; pass --yes/-y to skip.\n"
             "              (light is included when tiers.light is true and tier 2\n"
             "              has populated the director).\n"
             "  teardown  — Tear down CF deployment and BOSH director."
@@ -816,6 +857,17 @@ def cmd_integration(argv: list[str]) -> int:
         "--keep",
         action="store_true",
         help="Skip cleanup after each tier (leave resources running).",
+    )
+    parser.add_argument(
+        "--yes",
+        "-y",
+        "--force",
+        dest="yes",
+        action="store_true",
+        help=(
+            "Skip the DESTRUCTIVE confirmation prompt for 'all'. "
+            "Required when stdin/stdout is not a TTY (CI, pipes)."
+        ),
     )
 
     args = parser.parse_args(argv)
@@ -904,6 +956,33 @@ def cmd_integration(argv: list[str]) -> int:
             return tier_light(cfg, cpi_config_path, keep)
 
         # action == "all"
+        # TTY-gated DESTRUCTIVE confirmation: only prompt when both stdin and
+        # stdout are connected to a terminal (interactive operator).  CI/pipe
+        # callers bypass silently.  --yes/-y/--force skips the prompt entirely.
+        _interactive = sys.stdin.isatty() and sys.stdout.isatty()
+        if _interactive and not args.yes:
+            print(
+                "\n"
+                "WARNING: DESTRUCTIVE OPERATION\n"
+                "================================\n"
+                "The 'all' action will:\n"
+                "  1. Tear down any existing CF deployment.\n"
+                "  2. Tear down the BOSH director and all managed VMs.\n"
+                "  3. Run the full integration suite (lifecycle, bosh, cf, light).\n"
+                "\n"
+                "This deletes live infrastructure. There is no undo.\n"
+                "Pass --yes or -y to suppress this prompt (e.g. in CI).\n",
+                file=sys.stderr,
+            )
+            try:
+                answer = input("Type 'yes' to proceed: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\naborted.", file=sys.stderr)
+                return 1
+            if answer != "yes":
+                print("aborted: confirmation not received.", file=sys.stderr)
+                return 1
+
         rc = teardown(cfg)
         if rc != 0:
             return rc
@@ -955,7 +1034,7 @@ def main() -> int:
     # Unknown subcommand — fall through to make check for backward compat,
     # or print an error.  Treat as usage error.
     print(f"unknown subcommand: {argv[0]}", file=sys.stderr)
-    print("usage: scripts/test [integration [action] [--config FILE] [--dry-run] [--keep]]", file=sys.stderr)
+    print("usage: scripts/test [integration [action] [--config FILE] [--dry-run] [--keep] [--yes]]", file=sys.stderr)
     return 2
 
 
