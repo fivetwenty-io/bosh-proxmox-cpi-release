@@ -176,10 +176,16 @@ def cmd_check_uaa_db(_extra: list[str]) -> None:
         capture_output=True, text=True, check=False,
     )
     if result.returncode != 0:
-        stderr_snippet = (result.stderr or "").strip()[-500:]
+        stderr_snippet = (result.stderr or "").strip()
+        # On a fresh director the deployment does not yet exist; there is no
+        # database/0 to probe and no UAA schema to corrupt. Treat that as a
+        # clean precondition rather than a check failure.
+        if "doesn't exist" in stderr_snippet or "doesn’t exist" in stderr_snippet:
+            print("    skipped (cf deployment not yet present)")
+            return
         raise RuntimeError(
             f"bosh ssh to database/0 failed (rc={result.returncode}).\n"
-            f"stderr: {stderr_snippet}"
+            f"stderr: {stderr_snippet[-500:]}"
         )
     out = (result.stdout or "") + (result.stderr or "")
     if any(tok in out for tok in ("OK_DB_MISSING", "OK_FRESH", "SKIP_NO_PXC", "SKIP_NO_MYSQL_BIN")):
