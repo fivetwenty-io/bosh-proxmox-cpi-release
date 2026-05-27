@@ -38,12 +38,12 @@ const MaxStemcellTotalExtract = 32 * 1024 * 1024 * 1024 // 32 GiB
 // Anything not recognized is returned verbatim and will be validated by PVE.
 func normalizeOSType(v string) string {
 	switch v {
-	case "linux", "ubuntu", "centos", "rhel", "debian", "fedora", "alpine", "l26":
-		return "l26"
+	case "linux", "ubuntu", "centos", "rhel", "debian", "fedora", "alpine", osTypeLinux26:
+		return osTypeLinux26
 	case "linux24", "l24":
-		return "l24"
+		return osTypeLinux24
 	case "windows", "win", "win10":
-		return "win10"
+		return osTypeWindows
 	case "win11":
 		return "win11"
 	case "win7":
@@ -70,9 +70,9 @@ func pveDiskFormat(advertised string) string {
 	case "":
 		return ""
 	case "qcow2", "openstack-qcow2", "general-qcow2", "pve-qcow2":
-		return "qcow2"
+		return diskFormatQCOW2
 	case "raw", "openstack-raw", "general-raw", "pve-raw":
-		return "raw"
+		return diskFormatRaw
 	case "vmdk":
 		return "vmdk"
 	default:
@@ -144,8 +144,8 @@ func (p stemcellCloudProps) LightMode() string {
 // Missing or unrecognized keys are silently ignored; defaults apply.
 func parseStemcellCloudProps(cp map[string]any) stemcellCloudProps {
 	p := stemcellCloudProps{
-		DiskFormat: "qcow2",
-		OSType:     "l26",
+		DiskFormat: diskFormatQCOW2,
+		OSType:     osTypeLinux26,
 	}
 
 	if v, ok := cp["disk_format"].(string); ok && v != "" {
@@ -320,6 +320,8 @@ func validateStemcellImagePath(imagePath string) error {
 //   - Stemcell storage is local-only and cluster has more than one node.
 //   - Image extraction or SHA-256 failure.
 //   - qcow2 upload failure.
+//
+// nolint:gocognit // Orchestration shell: light-vs-heavy dispatch then heavy-path phases (resolveStemcellStorageAndNode, buildAndDeduplicateStemcellCID, uploadAndReturnCID). Phase logic lives in extracted helpers.
 func HandleCreateStemcell(deps Deps) cpi.Handler {
 	return cpi.HandlerFunc(func(ctx context.Context, args []json.RawMessage, _ jsonrpc.Context) (any, error) {
 		// ----------------------------------------------------------------
@@ -409,127 +411,200 @@ func HandleCreateStemcell(deps Deps) cpi.Handler {
 			return handleLightStemcellFetch(ctx, deps, cp)
 		}
 
-		// ----------------------------------------------------------------
-		// Step 4: Determine node and storage
-		// ----------------------------------------------------------------
-		node := deps.Config.Node
-		if node == "" {
-			return nil, cpierrors.Cloud("create_stemcell: config.node must not be empty")
+		// Steps 4-5: Resolve target node+storage and validate shared constraint.
+		node, storage, resolveErr := resolveStemcellStorageAndNode(ctx, deps)
+		if resolveErr != nil {
+			return nil, resolveErr
 		}
 
-		storage := deps.Config.StemcellStorage
-		if storage == "" {
-			storage = deps.Config.VMStorage
+		// Steps 6-10: Extract/hash image, build CID, dedup check.
+		// Cleanup is the tmpDir teardown for the (possibly extracted) image; the
+		// caller owns its lifetime so the upload step can reuse the same path.
+		stemcellCID, found, uploadSourcePath, cleanup, buildErr := buildAndDeduplicateStemcellCID(
+			ctx, deps, node, storage, imagePath, cp, deps.Logger)
+		if buildErr != nil {
+			return nil, buildErr
 		}
-		if storage == "" {
-			return nil, cpierrors.Cloud("create_stemcell: no stemcell storage configured (stemcell_storage and vm_storage both empty)")
-		}
-
-		// ----------------------------------------------------------------
-		// Step 5: Validate storage is shared
-		// ----------------------------------------------------------------
-		if validateErr := validateStemcellStorageShared(ctx, deps, storage); validateErr != nil {
-			return nil, validateErr
+		defer cleanup()
+		if found {
+			return stemcellCID, nil
 		}
 
-		// ----------------------------------------------------------------
-		// Step 6: Resolve disk image (extract from tarball if needed)
-		// ----------------------------------------------------------------
-		uploadSourcePath, cleanupExtract, detectedFormat, extractedSHA, detectErr := resolveStemcellImage(
-			imagePath, cp.DiskFormat, deps.Config.StemcellStagingDir, deps.Logger)
-		if detectErr != nil {
-			return nil, cpierrors.Wrap(detectErr, "create_stemcell: resolve image")
+		// Step 11: Upload and return CID. uploadSourcePath is reused so the
+		// tarball case extracts only once.
+		return uploadAndReturnCID(ctx, deps, node, storage, imagePath, uploadSourcePath, cp, stemcellCID, deps.Logger)
+	})
+}
+
+// resolveStemcellStorageAndNode resolves the target PVE node and storage for a
+// heavy-stemcell upload (steps 4-5 of the eleven-step flow).
+//
+// node comes from deps.Config.Node (required; empty is a cloud error).
+// storage is deps.Config.StemcellStorage with a fallback to VMStorage (both
+// empty is a cloud error). After the storage name is determined,
+// validateStemcellStorageShared enforces that local-only storage is rejected
+// when the cluster has more than one node.
+func resolveStemcellStorageAndNode(ctx context.Context, deps Deps) (node, storage string, err error) {
+	node = deps.Config.Node
+	if node == "" {
+		return "", "", cpierrors.Cloud("create_stemcell: config.node must not be empty")
+	}
+
+	storage = deps.Config.StemcellStorage
+	if storage == "" {
+		storage = deps.Config.VMStorage
+	}
+	if storage == "" {
+		return "", "", cpierrors.Cloud("create_stemcell: no stemcell storage configured (stemcell_storage and vm_storage both empty)")
+	}
+
+	if validateErr := validateStemcellStorageShared(ctx, deps, storage); validateErr != nil {
+		return "", "", validateErr
+	}
+	return node, storage, nil
+}
+
+// buildAndDeduplicateStemcellCID covers steps 6-10 of the eleven-step flow:
+// resolve the disk image from the tarball (or pass through a bare image),
+// compute SHA-256, build the deterministic qcow2 filename and CID, then check
+// whether that volume already exists in PVE storage.
+//
+// When found is true, stemcellCID is the existing CID and the caller must
+// return it immediately without uploading. When found is false, stemcellCID is
+// the CID to be created by uploadAndReturnCID, and uploadSourcePath points at
+// the resolved image (already extracted for tarball inputs) so the upload step
+// can reuse it without a second extraction pass.
+//
+// cleanup releases the staging tmpDir created by resolveStemcellImage (no-op
+// for bare-image passthroughs); the caller owns its lifetime and MUST defer it.
+//
+// imagePath is the director-supplied local path. cp supplies name, version, and
+// disk_format. deps.Config.StemcellStagingDir scopes file access when non-empty.
+func buildAndDeduplicateStemcellCID(
+	ctx context.Context,
+	deps Deps,
+	node, storage, imagePath string,
+	cp stemcellCloudProps,
+	logger *log.Logger,
+) (stemcellCID string, found bool, uploadSourcePath string, cleanup func(), err error) {
+	noop := func() {}
+
+	// Step 6: Resolve disk image (extract from tarball if needed). The
+	// returned cleanup is handed back to the caller — see doc comment.
+	uploadSourcePath, cleanupExtract, detectedFormat, extractedSHA, detectErr := resolveStemcellImage(
+		imagePath, cp.DiskFormat, deps.Config.StemcellStagingDir, logger)
+	if detectErr != nil {
+		return "", false, "", noop, cpierrors.Wrap(detectErr, "create_stemcell: resolve image")
+	}
+
+	// User-supplied disk_format wins when present; aliases like
+	// "openstack-qcow2" or "general-raw" are translated to PVE-native
+	// enum (qcow2/raw/vmdk). Unknown aliases fall back to magic-byte detection.
+	// uploadFormat is resolved here for future use when the upload API gains
+	// a format= parameter; PVE currently infers format from file content.
+	_ = func() string {
+		if f := pveDiskFormat(cp.DiskFormat); f != "" {
+			return f
 		}
-		defer cleanupExtract()
+		return detectedFormat
+	}()
 
-		// User-supplied disk_format wins when present; aliases like
-		// "openstack-qcow2" or "general-raw" are translated to PVE-native
-		// enum (qcow2/raw/vmdk). Unknown aliases fall back to magic-byte detection.
-		// uploadFormat is resolved here for future use when the upload API gains
-		// a format= parameter; PVE currently infers format from file content.
-		_ = func() string {
-			if f := pveDiskFormat(cp.DiskFormat); f != "" {
-				return f
-			}
-			return detectedFormat
-		}()
-
-		// ----------------------------------------------------------------
-		// Step 7: Obtain SHA-256 of resolved disk image
-		// ----------------------------------------------------------------
-		// For tarball inputs resolveStemcellImage computed the SHA via TeeReader
-		// during the single extraction pass. For bare images (qcow2 magic, raw
-		// passthrough) extractedSHA is empty and a second-pass file read is used.
-		sha256hex := extractedSHA
-		if sha256hex == "" {
-			var hashErr error
-			sha256hex, hashErr = sha256FilePath(uploadSourcePath, deps.Config.StemcellStagingDir)
-			if hashErr != nil {
-				return nil, cpierrors.Wrap(hashErr, "create_stemcell: compute sha256")
-			}
+	// Step 7: Obtain SHA-256 of resolved disk image.
+	// For tarball inputs resolveStemcellImage computed the SHA via TeeReader
+	// during the single extraction pass. For bare images (qcow2 magic, raw
+	// passthrough) extractedSHA is empty and a second-pass file read is used.
+	sha256hex := extractedSHA
+	if sha256hex == "" {
+		sha256hex, err = sha256FilePath(uploadSourcePath, deps.Config.StemcellStagingDir)
+		if err != nil {
+			cleanupExtract()
+			return "", false, "", noop, cpierrors.Wrap(err, "create_stemcell: compute sha256")
 		}
+	}
 
-		// ----------------------------------------------------------------
-		// Steps 8–9: Build filename and CID
-		// ----------------------------------------------------------------
-		qcow2Filename := pve.BuildStemcellFilename(cp.Name, cp.Version, sha256hex)
-		cid := pve.BuildStemcellCID(storage, qcow2Filename)
+	// Steps 8-9: Build filename and CID.
+	qcow2Filename := pve.BuildStemcellFilename(cp.Name, cp.Version, sha256hex)
+	cid := pve.BuildStemcellCID(storage, qcow2Filename)
 
-		deps.Logger.Info("create_stemcell: resolved filenames",
-			log.String("qcow2", qcow2Filename),
-			log.String("cid", cid),
-			log.String("sha256", sha256hex),
-		)
+	logger.Info("create_stemcell: resolved filenames",
+		log.String("qcow2", qcow2Filename),
+		log.String("cid", cid),
+		log.String("sha256", sha256hex),
+	)
 
-		// ----------------------------------------------------------------
-		// Step 10: Dedup — skip upload if volume already present
-		// ----------------------------------------------------------------
-		existing, findErr := pve.FindStemcellByFilename(ctx, deps.PVE, node, storage, qcow2Filename)
-		if findErr != nil {
-			return nil, cpierrors.Wrap(findErr, "create_stemcell: dedup lookup")
-		}
-		if existing != "" {
-			deps.Logger.Info("create_stemcell: stemcell already present, returning existing CID",
-				log.String("cid", existing),
-				log.String("name", cp.Name),
-				log.String("version", cp.Version),
-			)
-			return existing, nil
-		}
-
-		// ----------------------------------------------------------------
-		// Step 11: Upload qcow2 image
-		// ----------------------------------------------------------------
-		// uploadStagingDir is set only when uploadSourcePath is the director-supplied
-		// imagePath (bare qcow2 passthrough). When resolveStemcellImage extracted a
-		// file into a CPI-owned tmpDir, uploadSourcePath differs from imagePath and
-		// no staging-dir scoping is needed (the file is already CPI-controlled).
-		uploadStagingDir := ""
-		if uploadSourcePath == imagePath {
-			uploadStagingDir = deps.Config.StemcellStagingDir
-		}
-		if uploadErr := uploadStemcellImage(ctx, deps, node, storage, qcow2Filename, uploadSourcePath, uploadStagingDir); uploadErr != nil {
-			return nil, cpierrors.Wrap(uploadErr, "create_stemcell: upload qcow2")
-		}
-		deps.Logger.Info("create_stemcell: qcow2 uploaded",
-			log.String("volume", cid),
-			log.String("source", imagePath),
-		)
-
-		// Source of truth for stemcell identity is the qcow2 filename
-		// (encodes name/version/sha8) plus state held by the BOSH Director
-		// (name, version, cloud_properties on the stemcell record). PVE's
-		// content APIs don't accept arbitrary metadata for import volumes
-		// (uploads validate file extension; notes are backup-only), so no
-		// sidecar or volume-level annotation is written here.
-
-		deps.Logger.Info("create_stemcell: stemcell ready",
-			log.String("stemcell_cid", cid),
+	// Step 10: Dedup — skip upload if volume already present.
+	existing, findErr := pve.FindStemcellByFilename(ctx, deps.PVE, node, storage, qcow2Filename)
+	if findErr != nil {
+		cleanupExtract()
+		return "", false, "", noop, cpierrors.Wrap(findErr, "create_stemcell: dedup lookup")
+	}
+	if existing != "" {
+		logger.Info("create_stemcell: stemcell already present, returning existing CID",
+			log.String("cid", existing),
 			log.String("name", cp.Name),
 			log.String("version", cp.Version),
 		)
-		return cid, nil
-	})
+		return existing, true, uploadSourcePath, cleanupExtract, nil
+	}
+
+	return cid, false, uploadSourcePath, cleanupExtract, nil
+}
+
+// uploadAndReturnCID covers step 11 of the eleven-step flow: upload the qcow2
+// image to PVE storage and return the canonical stemcell CID.
+//
+// stemcellCID must be the value returned by buildAndDeduplicateStemcellCID when
+// found was false; it encodes storage, name, version, and sha8. imagePath is the
+// director-supplied local path and is used to set the upload staging-dir scope
+// and to log the source for observability. cp provides name and version for the
+// final "stemcell ready" log line.
+//
+// The uploadStagingDir passed to uploadStemcellImage is set only when
+// uploadSourcePath equals imagePath (bare qcow2 passthrough). When
+// resolveStemcellImage extracted the image into a CPI-owned tmpDir the source
+// path differs from imagePath and no staging-dir scoping applies.
+func uploadAndReturnCID(
+	ctx context.Context,
+	deps Deps,
+	node, storage, imagePath, uploadSourcePath string,
+	cp stemcellCloudProps,
+	stemcellCID string,
+	logger *log.Logger,
+) (string, error) {
+	// Re-derive qcow2 filename from the CID; BuildStemcellCID produces
+	// "<storage>:import/<filename>" so strip the prefix.
+	prefix := storage + ":import/"
+	qcow2Filename := strings.TrimPrefix(stemcellCID, prefix)
+
+	// uploadSourcePath was resolved by buildAndDeduplicateStemcellCID; its
+	// underlying tmpDir is kept alive by the caller-owned cleanup deferred in
+	// HandleCreateStemcell. No second extraction is needed.
+
+	uploadStagingDir := ""
+	if uploadSourcePath == imagePath {
+		uploadStagingDir = deps.Config.StemcellStagingDir
+	}
+	if uploadErr := uploadStemcellImage(ctx, deps, node, storage, qcow2Filename, uploadSourcePath, uploadStagingDir); uploadErr != nil {
+		return "", cpierrors.Wrap(uploadErr, "create_stemcell: upload qcow2")
+	}
+	logger.Info("create_stemcell: qcow2 uploaded",
+		log.String("volume", stemcellCID),
+		log.String("source", imagePath),
+	)
+
+	// Source of truth for stemcell identity is the qcow2 filename
+	// (encodes name/version/sha8) plus state held by the BOSH Director
+	// (name, version, cloud_properties on the stemcell record). PVE's
+	// content APIs don't accept arbitrary metadata for import volumes
+	// (uploads validate file extension; notes are backup-only), so no
+	// sidecar or volume-level annotation is written here.
+
+	logger.Info("create_stemcell: stemcell ready",
+		log.String("stemcell_cid", stemcellCID),
+		log.String("name", cp.Name),
+		log.String("version", cp.Version),
+	)
+	return stemcellCID, nil
 }
 
 // handleLightStemcellPreUploaded resolves a pre-uploaded light stemcell:
@@ -603,17 +678,15 @@ func handleLightStemcellPreUploaded(
 	return lightCID, nil
 }
 
-// fetchResolverOverride is set by tests to inject a stub source resolver.
-// Production code leaves it nil and uses stemcellfetch.ResolveSource directly.
-// This package-level seam avoids bloating Deps for a single test concern.
-var fetchResolverOverride func(rawURL string) (stemcellfetch.Source, stemcellfetch.Reference, error)
-
-// resolveFetchSource calls the override when set (tests), otherwise the real implementation.
-func resolveFetchSource(rawURL string) (stemcellfetch.Source, stemcellfetch.Reference, error) {
-	if fetchResolverOverride != nil {
-		return fetchResolverOverride(rawURL)
+// resolveFetchSource returns the source and reference for rawURL. When
+// deps.FetchResolver is non-nil (tests), it replaces the default
+// stemcellfetch.ResolveSource package function.
+func resolveFetchSource(deps Deps, rawURL string) (stemcellfetch.Source, stemcellfetch.Reference, error) {
+	resolver := stemcellfetch.ResolveSource
+	if deps.FetchResolver != nil {
+		resolver = deps.FetchResolver
 	}
-	return stemcellfetch.ResolveSource(rawURL)
+	return resolver(rawURL)
 }
 
 // handleLightStemcellFetch fetches a remote stemcell qcow2, uploads it to PVE
@@ -639,7 +712,7 @@ func handleLightStemcellFetch(
 	cp stemcellCloudProps,
 ) (any, error) {
 	// 1. Resolve source + credentials.
-	src, ref, resolveErr := resolveFetchSource(cp.ImageURL)
+	src, ref, resolveErr := resolveFetchSource(deps, cp.ImageURL)
 	if resolveErr != nil {
 		return nil, cpierrors.Cloud("create_stemcell: resolve source for %q: %s", cp.ImageURL, resolveErr.Error())
 	}
@@ -1154,13 +1227,13 @@ func detectExtractedFormat(imgPath, defaultFormat string, cleanup func()) (strin
 	}
 	switch {
 	case magic[0] == 'Q' && magic[1] == 'F' && magic[2] == 'I' && magic[3] == 0xFB:
-		return "qcow2", nil
+		return diskFormatQCOW2, nil
 	case magic[0] == 0x1F && magic[1] == 0x8B:
 		// Nested gzip inside a tar — treat as raw; PVE handles decompression.
-		return "raw", nil
+		return diskFormatRaw, nil
 	case n >= 4 && magic[0] == 0x04 && magic[1] == 0x22 && magic[2] == 0x4D && magic[3] == 0x18:
 		// LZ4 frame magic.
-		return "raw", nil
+		return diskFormatRaw, nil
 	default:
 		// Require the file to be a known .img or large enough to plausibly
 		// be a raw disk. If neither, it likely is not a disk image.
@@ -1171,7 +1244,7 @@ func detectExtractedFormat(imgPath, defaultFormat string, cleanup func()) (strin
 				"create_stemcell: extracted image at %s has unknown magic bytes %x; expected qcow2/gzip/lz4/raw",
 				imgPath, magic[:n])
 		}
-		return "raw", nil
+		return diskFormatRaw, nil
 	}
 }
 
@@ -1264,7 +1337,7 @@ func resolveStemcellImage(imagePath, defaultFormat, stagingDir string, logger *l
 
 	// Bare QCOW2 magic: 'Q','F','I',0xFB. SHA computed by caller (direct pass).
 	if n >= 4 && head[0] == 'Q' && head[1] == 'F' && head[2] == 'I' && head[3] == 0xFB {
-		return imagePath, noop, "qcow2", "", nil
+		return imagePath, noop, diskFormatQCOW2, "", nil
 	}
 
 	// Gzip magic: 0x1F 0x8B
@@ -1274,7 +1347,7 @@ func resolveStemcellImage(imagePath, defaultFormat, stagingDir string, logger *l
 
 	// Not gzip, not qcow2 magic — treat as raw disk image. SHA computed by caller.
 	logger.Info("resolveStemcellImage: passthrough as raw", log.String("source", imagePath))
-	return imagePath, noop, "raw", "", nil
+	return imagePath, noop, diskFormatRaw, "", nil
 }
 
 // openStagedFile opens path for reading, scoped to stagingDir when non-empty.

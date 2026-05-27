@@ -89,6 +89,121 @@ func nodeHasStorage(resp *nodes.ListStorageResponse, storageName string) bool {
 	return false // storage not listed on this node
 }
 
+// cloudPropsCandidate holds a single node that passed the storage-first
+// filter and CPU+RAM fit check, along with its free-byte count for ranking.
+type cloudPropsCandidate struct {
+	name      string
+	freeBytes int64
+}
+
+// candidateNodesForCloudProps runs the storage-first node selection pipeline
+// against the cluster status response and returns the set of nodes that pass
+// all three filters (online, storage active+images-capable, CPU+RAM fit),
+// ranked by descending free bytes.
+//
+// It also returns the list of nodes that would have qualified on CPU+RAM but
+// failed the storage check (used in the NotSupported error message). Both
+// slices may be nil when no nodes are present.
+//
+// Errors:
+//   - cluster.ListStatus API failure → returned as-is to the caller.
+//   - Per-node ListStorage errors → WARN, node excluded (fail-safe). Never fatal.
+func candidateNodesForCloudProps(
+	ctx context.Context,
+	deps Deps,
+	res vmResources,
+	effectiveStorage string,
+) (candidates []cloudPropsCandidate, cpuRAMFailedStorage []string, err error) {
+	ramBytes := int64(res.RAM) * 1024 * 1024 // MiB → bytes
+
+	statusResp, err := deps.PVE.Cluster().ListStatus(ctx)
+	if err != nil {
+		return nil, nil, cpierrors.Wrap(err, "calculate_vm_cloud_properties: cluster status fetch failed")
+	}
+
+	for i, raw := range *statusResp {
+		var item clusterStatusNode
+		if parseErr := json.Unmarshal(raw, &item); parseErr != nil {
+			// Skip items whose schema is incompatible (e.g., quorum-info entries).
+			deps.Logger.Debug("calculate_vm_cloud_properties: skip item",
+				log.Int("idx", i),
+				log.Err(parseErr),
+			)
+			continue
+		}
+		if item.Type != "node" {
+			continue
+		}
+		if item.Online == 0 {
+			continue // node offline
+		}
+
+		// Phase 2: storage check — first-class filter step.
+		storageResp, storErr := deps.PVE.Nodes().ListStorage(ctx, item.Name, &nodes.ListStorageParams{
+			Storage: &effectiveStorage,
+		})
+		if storErr != nil {
+			deps.Logger.Warn(
+				"calculate_vm_cloud_properties: ListStorage failed — excluding node",
+				log.String("node", item.Name),
+				log.String("storage", effectiveStorage),
+				log.Err(storErr),
+			)
+			// Track for the NotSupported message if it would have fit CPU+RAM,
+			// so an unreachable-storage node is reported like an inactive one.
+			freeBytes := item.Maxmem - item.Mem
+			if item.Maxcpu >= int64(res.CPU) && freeBytes >= ramBytes {
+				cpuRAMFailedStorage = append(cpuRAMFailedStorage, item.Name)
+			}
+			continue // fail-safe: never pick node with unknown storage status
+		}
+		if !nodeHasStorage(storageResp, effectiveStorage) {
+			deps.Logger.Warn(
+				fmt.Sprintf(
+					"calculate_vm_cloud_properties: storage %q not active/images-capable on node %q — excluding from candidates",
+					effectiveStorage, item.Name,
+				),
+			)
+			// Still track it for the error message if it would have fit CPU+RAM.
+			freeBytes := item.Maxmem - item.Mem
+			if item.Maxcpu >= int64(res.CPU) && freeBytes >= ramBytes {
+				cpuRAMFailedStorage = append(cpuRAMFailedStorage, item.Name)
+			}
+			continue
+		}
+
+		// Phase 3: CPU + RAM fit among storage-OK nodes.
+		freeBytes := item.Maxmem - item.Mem
+		if item.Maxcpu < int64(res.CPU) {
+			continue
+		}
+		if freeBytes < ramBytes {
+			continue
+		}
+
+		candidates = append(candidates, cloudPropsCandidate{
+			name:      item.Name,
+			freeBytes: freeBytes,
+		})
+	}
+
+	return candidates, cpuRAMFailedStorage, nil
+}
+
+// pickBestNode returns the name of the candidate with the most free bytes.
+// Returns an empty string when candidates is empty.
+func pickBestNode(candidates []cloudPropsCandidate) string {
+	best := ""
+	bestFree := int64(-1)
+	for _, c := range candidates {
+		if c.freeBytes > bestFree {
+			bestFree = c.freeBytes
+			best = c.name
+		}
+	}
+	return best
+}
+
 // HandleCalculateVMCloudProperties maps BOSH resource hints to PVE
 // cloud_properties by querying the PVE cluster for available node capacity.
 //
@@ -96,19 +211,13 @@ func nodeHasStorage(resp *nodes.ListStorageResponse, storageName string) bool {
 //
 //	"storage": string (optional, overrides config vm_storage) }
 //
-// Algorithm (storage-first, D5-C):
+// Algorithm (storage-first):
 //  1. Decode vm_resources from args[0].
 //  2. Resolve effectiveStorage: res.Storage when non-empty, else Config.VMStorage.
-//  3. Call cluster.ListStatus to retrieve all cluster members.
-//  4. For each online node, call Nodes().ListStorage to check whether
-//     effectiveStorage is active and images-capable on that node.
-//     - ListStorage error → WARN, exclude node (fail-safe).
-//     - Storage not active or not images-capable → WARN, exclude node.
-//  5. Among storage-OK nodes, apply CPU fit (maxcpu >= cpu) and RAM fit
-//     (maxmem-mem >= ram_bytes); rank by max free bytes.
-//  6. No node passes → NotSupported listing CPU/RAM-qualifying nodes that
+//  3. Call candidateNodesForCloudProps to run the storage-first pipeline.
+//  4. No node passes → NotSupported listing CPU/RAM-qualifying nodes that
 //     failed the storage check.
-//  7. Return cloud_properties: cores, sockets, memory, vm_disk_format,
+//  5. Return cloud_properties: cores, sockets, memory, vm_disk_format,
 //     target_node (winner), target_storage (effectiveStorage).
 //
 // Errors:
@@ -132,7 +241,7 @@ func HandleCalculateVMCloudProperties(deps Deps) cpi.Handler {
 			return nil, cpierrors.Cloud("calculate_vm_cloud_properties: ram must be > 0, got %d", res.RAM)
 		}
 
-		// Resolve effective storage (D6-B per-request override).
+		// Resolve effective storage (per-request override when set).
 		effectiveStorage := deps.Config.VMStorage
 		if res.Storage != "" {
 			effectiveStorage = res.Storage
@@ -143,105 +252,12 @@ func HandleCalculateVMCloudProperties(deps Deps) cpi.Handler {
 			)
 		}
 
-		ramBytes := int64(res.RAM) * 1024 * 1024 // MiB → bytes
-
-		// Fetch cluster node list.
-		statusResp, err := deps.PVE.Cluster().ListStatus(ctx)
+		candidates, cpuRAMFailedStorageNodes, err := candidateNodesForCloudProps(ctx, deps, res, effectiveStorage)
 		if err != nil {
-			return nil, cpierrors.Wrap(err, "calculate_vm_cloud_properties: cluster status fetch failed")
+			return nil, err
 		}
 
-		// Storage-first pipeline (D5-C):
-		// Phase 1 — collect online nodes from cluster status.
-		// Phase 2 — per-node storage check via ListStorage.
-		// Phase 3 — CPU+RAM fit among storage-OK nodes, rank by free bytes.
-
-		type candidateNode struct {
-			name      string
-			freeBytes int64
-		}
-
-		// storageOKNodes: nodes that passed the storage check.
-		// cpuRAMNodes: nodes that pass CPU+RAM but failed storage (for error message).
-		var storageOKNodes []candidateNode
-		var cpuRAMFailedStorageNodes []string
-
-		for i, raw := range *statusResp {
-			var item clusterStatusNode
-			if parseErr := json.Unmarshal(raw, &item); parseErr != nil {
-				// Skip items whose schema is incompatible (e.g., quorum-info entries).
-				deps.Logger.Debug("calculate_vm_cloud_properties: skip item",
-					log.Int("idx", i),
-					log.Err(parseErr),
-				)
-				continue
-			}
-			if item.Type != "node" {
-				continue
-			}
-			if item.Online == 0 {
-				continue // node offline
-			}
-
-			// Phase 2: storage check — first-class filter step.
-			storageResp, storErr := deps.PVE.Nodes().ListStorage(ctx, item.Name, &nodes.ListStorageParams{
-				Storage: &effectiveStorage,
-			})
-			if storErr != nil {
-				deps.Logger.Warn(
-					"calculate_vm_cloud_properties: ListStorage failed — excluding node",
-					log.String("node", item.Name),
-					log.String("storage", effectiveStorage),
-					log.Err(storErr),
-				)
-				// Track for the NotSupported message if it would have fit CPU+RAM,
-				// so an unreachable-storage node is reported like an inactive one.
-				freeBytes := item.Maxmem - item.Mem
-				if item.Maxcpu >= int64(res.CPU) && freeBytes >= ramBytes {
-					cpuRAMFailedStorageNodes = append(cpuRAMFailedStorageNodes, item.Name)
-				}
-				continue // fail-safe: never pick node with unknown storage status
-			}
-			if !nodeHasStorage(storageResp, effectiveStorage) {
-				deps.Logger.Warn(
-					fmt.Sprintf(
-						"calculate_vm_cloud_properties: storage %q not active/images-capable on node %q — excluding from candidates",
-						effectiveStorage, item.Name,
-					),
-				)
-				// Still track it for the error message if it would have fit CPU+RAM.
-				freeBytes := item.Maxmem - item.Mem
-				if item.Maxcpu >= int64(res.CPU) && freeBytes >= ramBytes {
-					cpuRAMFailedStorageNodes = append(cpuRAMFailedStorageNodes, item.Name)
-				}
-				continue
-			}
-
-			// Phase 3: CPU + RAM fit among storage-OK nodes.
-			freeBytes := item.Maxmem - item.Mem
-			if item.Maxcpu < int64(res.CPU) {
-				continue
-			}
-			if freeBytes < ramBytes {
-				continue
-			}
-
-			storageOKNodes = append(storageOKNodes, candidateNode{
-				name:      item.Name,
-				freeBytes: freeBytes,
-			})
-		}
-
-		// Pick winner: max free bytes among storage-OK, CPU+RAM-qualifying nodes.
-		bestNode := ""
-		bestFreeBytes := int64(-1)
-		for _, c := range storageOKNodes {
-			if c.freeBytes > bestFreeBytes {
-				bestFreeBytes = c.freeBytes
-				bestNode = c.name
-			}
-		}
-
+		bestNode := pickBestNode(candidates)
 		if bestNode == "" {
 			msg := fmt.Sprintf(
 				"no node satisfies requirements: cpu=%d ram=%d MiB with storage %q active and images-capable."+

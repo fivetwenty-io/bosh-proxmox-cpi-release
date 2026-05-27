@@ -456,44 +456,57 @@ func (c *CPIConfig) Validate() error {
 // default fallback (matching the legacy Validate behavior).
 func (c *CPIConfig) ValidateWithLogger(logger *log.Logger) error {
 	var errs []string
+	c.validateRequiredFields(&errs)
+	c.validateAuth(&errs)
+	c.validateEnumFields(&errs)
+	c.validateRanges(&errs)
+	c.validateRegistryConfig(&errs, logger)
+	if len(errs) > 0 {
+		return cpierrors.Cloud("config validation failed: %s", strings.Join(errs, "; "))
+	}
+	return nil
+}
 
-	// Required scalar fields.
+// validateRequiredFields appends an error for each required scalar field that
+// is absent. Covers host, user, vm_storage, disk_storage, and network_bridge.
+func (c *CPIConfig) validateRequiredFields(errs *[]string) {
 	if c.Host == "" {
-		errs = append(errs, "host is required")
+		*errs = append(*errs, "host is required")
 	}
 	if c.User == "" {
-		errs = append(errs, "user is required")
+		*errs = append(*errs, "user is required")
 	}
 	if c.VMStorage == "" {
-		errs = append(errs, "vm_storage is required")
+		*errs = append(*errs, "vm_storage is required")
 	}
 	if c.DiskStorage == "" {
-		errs = append(errs, "disk_storage is required")
+		*errs = append(*errs, "disk_storage is required")
 	}
 	if c.NetworkBridge == "" {
-		errs = append(errs, "network_bridge is required")
+		*errs = append(*errs, "network_bridge is required")
 	}
+}
 
-	// Authentication: at least one of password or api_token must be set.
-	// ApplyDefaults normalizes the "both supplied" case (token wins, password
-	// cleared) so Validate sees the merged result here without mutating c.
-	hasPassword := c.Password != ""
-	hasToken := c.APIToken != ""
-	if !hasPassword && !hasToken {
-		errs = append(errs, "one of password or api_token is required")
+// validateAuth appends an error when neither password nor api_token is set.
+// ApplyDefaults normalizes the "both supplied" case (token wins, password
+// cleared) so Validate sees the merged result here without mutating c.
+func (c *CPIConfig) validateAuth(errs *[]string) {
+	if c.Password == "" && c.APIToken == "" {
+		*errs = append(*errs, "one of password or api_token is required")
 	}
+}
 
-	// Port range.
-	if c.Port <= 0 || c.Port >= 65536 {
-		errs = append(errs, fmt.Sprintf("port must be 1–65535, got %d", c.Port))
-	}
-
+// validateEnumFields appends an error for each enum-bounded field whose value
+// is not in the declared set. Covers agent_mode, vm_disk_format, log_level,
+// network_mode, sdn_zone_type (conditional on network_mode), reboot_mode,
+// stemcell_staging_dir path constraints, and the pve_ca_cert PEM check.
+func (c *CPIConfig) validateEnumFields(errs *[]string) {
 	// AgentMode enum.
 	switch c.AgentMode {
 	case "cloudinit", "registry", "noagent":
 		// valid
 	default:
-		errs = append(errs, fmt.Sprintf(
+		*errs = append(*errs, fmt.Sprintf(
 			"agent_mode must be one of cloudinit|registry|noagent, got %q", c.AgentMode,
 		))
 	}
@@ -503,7 +516,7 @@ func (c *CPIConfig) ValidateWithLogger(logger *log.Logger) error {
 	case "qcow2", "raw", "vmdk":
 		// valid
 	default:
-		errs = append(errs, fmt.Sprintf(
+		*errs = append(*errs, fmt.Sprintf(
 			"vm_disk_format must be one of qcow2|raw|vmdk, got %q", c.VMDiskFormat,
 		))
 	}
@@ -513,27 +526,8 @@ func (c *CPIConfig) ValidateWithLogger(logger *log.Logger) error {
 	case "debug", "info", "warn", "error":
 		// valid
 	default:
-		errs = append(errs, fmt.Sprintf(
+		*errs = append(*errs, fmt.Sprintf(
 			"log_level must be one of debug|info|warn|error, got %q", c.LogLevel,
-		))
-	}
-
-	// VMIDRangeStart: PVE reserves 0–99.
-	if c.VMIDRangeStart < 100 {
-		errs = append(errs, fmt.Sprintf(
-			"vmid_range_start must be ≥100 (PVE reserved range), got %d", c.VMIDRangeStart,
-		))
-	}
-
-	// VMIDRangeEnd: must be strictly greater than VMIDRangeStart and within PVE
-	// VM VMID space (max 9999; disk range 9000-9999 is separate).
-	if c.VMIDRangeEnd <= c.VMIDRangeStart {
-		errs = append(errs, fmt.Sprintf(
-			"vmid_range_end must be > vmid_range_start (%d), got %d", c.VMIDRangeStart, c.VMIDRangeEnd,
-		))
-	} else if c.VMIDRangeEnd > 9999 {
-		errs = append(errs, fmt.Sprintf(
-			"vmid_range_end must be ≤9999, got %d", c.VMIDRangeEnd,
 		))
 	}
 
@@ -542,38 +536,9 @@ func (c *CPIConfig) ValidateWithLogger(logger *log.Logger) error {
 	case "soft", "hard":
 		// valid
 	default:
-		errs = append(errs, fmt.Sprintf(
+		*errs = append(*errs, fmt.Sprintf(
 			`reboot_mode must be one of soft|hard, got %q`, c.RebootMode,
 		))
-	}
-
-	// RebootTimeout range: 1–3600 seconds.
-	if c.RebootTimeout < 1 || c.RebootTimeout > 3600 {
-		errs = append(errs, fmt.Sprintf(
-			"reboot_timeout must be 1-3600 seconds, got %d", c.RebootTimeout,
-		))
-	}
-
-	// StemcellStagingDir: when set, must be an absolute path to an existing directory.
-	if c.StemcellStagingDir != "" {
-		if !strings.HasPrefix(c.StemcellStagingDir, "/") {
-			errs = append(errs, fmt.Sprintf(
-				"stemcell_staging_dir %q must be an absolute path", c.StemcellStagingDir))
-		} else {
-			fi, statErr := os.Stat(c.StemcellStagingDir)
-			if statErr != nil {
-				if os.IsNotExist(statErr) {
-					errs = append(errs, fmt.Sprintf(
-						"stemcell_staging_dir %q does not exist", c.StemcellStagingDir))
-				} else {
-					errs = append(errs, fmt.Sprintf(
-						"stemcell_staging_dir %q cannot be stat'd: %s", c.StemcellStagingDir, statErr.Error()))
-				}
-			} else if !fi.IsDir() {
-				errs = append(errs, fmt.Sprintf(
-					"stemcell_staging_dir %q is not a directory", c.StemcellStagingDir))
-			}
-		}
 	}
 
 	// NetworkMode enum.
@@ -581,7 +546,7 @@ func (c *CPIConfig) ValidateWithLogger(logger *log.Logger) error {
 	case "sdn", "bridge", "auto":
 		// valid
 	default:
-		errs = append(errs, fmt.Sprintf(
+		*errs = append(*errs, fmt.Sprintf(
 			"network_mode must be one of sdn|bridge|auto, got %q", c.NetworkMode,
 		))
 	}
@@ -592,9 +557,31 @@ func (c *CPIConfig) ValidateWithLogger(logger *log.Logger) error {
 		case "simple", "vlan", "qinq", "vxlan", "evpn":
 			// valid
 		default:
-			errs = append(errs, fmt.Sprintf(
+			*errs = append(*errs, fmt.Sprintf(
 				"sdn_zone_type must be one of simple|vlan|qinq|vxlan|evpn, got %q", c.SDNZoneType,
 			))
+		}
+	}
+
+	// StemcellStagingDir: when set, must be an absolute path to an existing directory.
+	if c.StemcellStagingDir != "" {
+		if !strings.HasPrefix(c.StemcellStagingDir, "/") {
+			*errs = append(*errs, fmt.Sprintf(
+				"stemcell_staging_dir %q must be an absolute path", c.StemcellStagingDir))
+		} else {
+			fi, statErr := os.Stat(c.StemcellStagingDir)
+			if statErr != nil {
+				if os.IsNotExist(statErr) {
+					*errs = append(*errs, fmt.Sprintf(
+						"stemcell_staging_dir %q does not exist", c.StemcellStagingDir))
+				} else {
+					*errs = append(*errs, fmt.Sprintf(
+						"stemcell_staging_dir %q cannot be stat'd: %s", c.StemcellStagingDir, statErr.Error()))
+				}
+			} else if !fi.IsDir() {
+				*errs = append(*errs, fmt.Sprintf(
+					"stemcell_staging_dir %q is not a directory", c.StemcellStagingDir))
+			}
 		}
 	}
 
@@ -605,55 +592,95 @@ func (c *CPIConfig) ValidateWithLogger(logger *log.Logger) error {
 	if c.PVECACertPEM != "" && c.VerifySSLValue() {
 		pool := x509.NewCertPool()
 		if !pool.AppendCertsFromPEM([]byte(c.PVECACertPEM)) {
-			errs = append(errs, "pve_ca_cert: no valid PEM certificates parsed from value")
+			*errs = append(*errs, "pve_ca_cert: no valid PEM certificates parsed from value")
+		}
+	}
+}
+
+// validateRanges appends an error for each numeric field outside its valid range.
+// Covers port (1–65535), vmid_range_start (≥100), vmid_range_end (>start, ≤9999),
+// and reboot_timeout (1–3600 s).
+func (c *CPIConfig) validateRanges(errs *[]string) {
+	// Port range.
+	if c.Port <= 0 || c.Port >= 65536 {
+		*errs = append(*errs, fmt.Sprintf("port must be 1–65535, got %d", c.Port))
+	}
+
+	// VMIDRangeStart: PVE reserves 0–99.
+	if c.VMIDRangeStart < 100 {
+		*errs = append(*errs, fmt.Sprintf(
+			"vmid_range_start must be ≥100 (PVE reserved range), got %d", c.VMIDRangeStart,
+		))
+	}
+
+	// VMIDRangeEnd: must be strictly greater than VMIDRangeStart and within PVE
+	// VM VMID space (max 9999; disk range 9000-9999 is separate).
+	if c.VMIDRangeEnd <= c.VMIDRangeStart {
+		*errs = append(*errs, fmt.Sprintf(
+			"vmid_range_end must be > vmid_range_start (%d), got %d", c.VMIDRangeStart, c.VMIDRangeEnd,
+		))
+	} else if c.VMIDRangeEnd > 9999 {
+		*errs = append(*errs, fmt.Sprintf(
+			"vmid_range_end must be ≤9999, got %d", c.VMIDRangeEnd,
+		))
+	}
+
+	// RebootTimeout range: 1–3600 seconds.
+	if c.RebootTimeout < 1 || c.RebootTimeout > 3600 {
+		*errs = append(*errs, fmt.Sprintf(
+			"reboot_timeout must be 1-3600 seconds, got %d", c.RebootTimeout,
+		))
+	}
+}
+
+// validateRegistryConfig appends errors for registry-related constraints when
+// agent_mode=registry. Checks endpoint presence, user presence, password presence,
+// scheme guard (https required unless registry_allow_insecure=true), and
+// registry_allowed_hosts format (host patterns only, no scheme or path).
+func (c *CPIConfig) validateRegistryConfig(errs *[]string, logger *log.Logger) {
+	if c.AgentMode != "registry" {
+		return
+	}
+
+	if c.RegistryEndpoint == "" {
+		*errs = append(*errs, "registry_endpoint is required when agent_mode=registry")
+	}
+	if c.RegistryUser == "" {
+		*errs = append(*errs, "registry_user is required when agent_mode=registry")
+	}
+	if c.RegistryPassword == "" {
+		*errs = append(*errs, "registry_password is required when agent_mode=registry")
+	}
+
+	// Scheme guard: refuse plaintext http:// (or any non-https scheme) unless
+	// the operator has explicitly set registry_allow_insecure=true. Credentials
+	// flow over this connection on every settings PUT/GET; default-deny matches
+	// the verify_ssl=true default for the PVE connection.
+	if c.RegistryEndpoint != "" {
+		if msg := c.validateRegistryScheme(logger); msg != "" {
+			*errs = append(*errs, msg)
 		}
 	}
 
-	// Registry mode requires endpoint + credentials.
-	if c.AgentMode == "registry" {
-		if c.RegistryEndpoint == "" {
-			errs = append(errs, "registry_endpoint is required when agent_mode=registry")
+	// registry_allowed_hosts: each entry must be a non-empty string with no
+	// scheme or path component (host patterns only).
+	for i, h := range c.RegistryAllowedHosts {
+		if h == "" {
+			*errs = append(*errs, fmt.Sprintf("registry_allowed_hosts[%d] must not be empty", i))
+			continue
 		}
-		if c.RegistryUser == "" {
-			errs = append(errs, "registry_user is required when agent_mode=registry")
+		if strings.Contains(h, "://") {
+			*errs = append(*errs, fmt.Sprintf(
+				"registry_allowed_hosts[%d] %q must be a host pattern (no scheme; use e.g. \"host.example.com\" or \"*.example.com\")", i, h,
+			))
+			continue
 		}
-		if c.RegistryPassword == "" {
-			errs = append(errs, "registry_password is required when agent_mode=registry")
-		}
-		// Scheme guard: refuse plaintext http:// (or any non-https scheme) unless
-		// the operator has explicitly set registry_allow_insecure=true. Credentials
-		// flow over this connection on every settings PUT/GET; default-deny matches
-		// the verify_ssl=true default for the PVE connection.
-		if c.RegistryEndpoint != "" {
-			if err := c.validateRegistryScheme(logger); err != "" {
-				errs = append(errs, err)
-			}
-		}
-		// registry_allowed_hosts: each entry must be a non-empty string with no
-		// scheme or path component (host patterns only).
-		for i, h := range c.RegistryAllowedHosts {
-			if h == "" {
-				errs = append(errs, fmt.Sprintf("registry_allowed_hosts[%d] must not be empty", i))
-				continue
-			}
-			if strings.Contains(h, "://") {
-				errs = append(errs, fmt.Sprintf(
-					"registry_allowed_hosts[%d] %q must be a host pattern (no scheme; use e.g. \"host.example.com\" or \"*.example.com\")", i, h,
-				))
-				continue
-			}
-			if strings.Contains(h, "/") {
-				errs = append(errs, fmt.Sprintf(
-					"registry_allowed_hosts[%d] %q must be a host pattern (no path component)", i, h,
-				))
-			}
+		if strings.Contains(h, "/") {
+			*errs = append(*errs, fmt.Sprintf(
+				"registry_allowed_hosts[%d] %q must be a host pattern (no path component)", i, h,
+			))
 		}
 	}
-
-	if len(errs) > 0 {
-		return cpierrors.Cloud("config validation failed: %s", strings.Join(errs, "; "))
-	}
-	return nil
 }
 
 // validateRegistryScheme parses RegistryEndpoint and applies the scheme guard.

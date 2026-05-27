@@ -93,6 +93,160 @@ func createNetwork(ctx context.Context, deps Deps, args []json.RawMessage) (any,
 	return createNetworkBridge(ctx, deps, spec, bridge)
 }
 
+// sdnZoneArgs carries all parameters needed by resolveOrCreateSDNZone.
+type sdnZoneArgs struct {
+	zone              string
+	zoneType          string
+	sdnAutoManageZone bool
+}
+
+// sdnVnetArgs carries all parameters needed by createVnetIdempotent.
+type sdnVnetArgs struct {
+	vnet string
+	zone string
+}
+
+// sdnSubnetArgs carries all parameters needed by createSubnetIdempotent.
+type sdnSubnetArgs struct {
+	vnet    string
+	subnet  string
+	gateway string
+}
+
+// sdnApplyArgs carries all parameters needed by applyWithRollback.
+type sdnApplyArgs struct {
+	opCtx string
+}
+
+// resolveOrCreateSDNZone checks that the named zone exists in PVE. When the
+// zone is absent and sdnAutoManageZone is true, it creates the zone. The bool
+// return value is true only when THIS call created the zone; callers must
+// delete it on rollback when true. Original-call errors are wrapped through
+// pve.WrapError so transient classes keep their Retriable type.
+func resolveOrCreateSDNZone(
+	ctx context.Context,
+	_ Deps,
+	clusterSvc sdkcluster.Service,
+	args sdnZoneArgs,
+) (zoneCreated bool, err error) {
+	_, zoneGetErr := clusterSvc.GetSdnZones(ctx, args.zone, nil)
+	if zoneGetErr == nil {
+		// Zone already exists — nothing to create.
+		return false, nil
+	}
+	if !isSDNNotFound(zoneGetErr) {
+		return false, cpierrors.Wrap(
+			pve.WrapError(zoneGetErr),
+			fmt.Sprintf("create_network: get SDN zone %q", args.zone),
+		)
+	}
+	// Zone does not exist in PVE.
+	if !args.sdnAutoManageZone {
+		return false, cpierrors.Cloud(
+			"create_network: SDN zone %q not found and sdn_auto_manage_zone is false — "+
+				"create the zone in PVE or enable sdn_auto_manage_zone",
+			args.zone,
+		)
+	}
+	zoneType := args.zoneType
+	if zoneType == "" {
+		zoneType = "simple"
+	}
+	if err := clusterSvc.CreateSdnZones(ctx, &sdkcluster.CreateSdnZonesParams{
+		Zone: args.zone,
+		Type: zoneType,
+	}); err != nil {
+		return false, cpierrors.Wrap(
+			pve.WrapError(err),
+			fmt.Sprintf("create_network: create SDN zone %q", args.zone),
+		)
+	}
+	return true, nil
+}
+
+// createVnetIdempotent probes PVE for an existing vnet and creates it when
+// absent. A 409 conflict from CreateSdnVnets (concurrent creation race) is
+// treated as idempotent success; the bool is false in that case so rollback
+// does not delete a vnet this call did not own. The bool return is true only
+// when THIS call created the vnet; callers must delete it on rollback.
+func createVnetIdempotent(
+	ctx context.Context,
+	_ Deps,
+	clusterSvc sdkcluster.Service,
+	args sdnVnetArgs,
+) (vnetCreated bool, err error) {
+	_, vnetGetErr := clusterSvc.GetSdnVnets(ctx, args.vnet, nil)
+	if vnetGetErr == nil {
+		// Vnet already exists — treat as idempotent, vnetCreated=false.
+		return false, nil
+	}
+	if !isSDNNotFound(vnetGetErr) {
+		return false, cpierrors.Wrap(
+			pve.WrapError(vnetGetErr),
+			fmt.Sprintf("create_network: get SDN vnet %q", args.vnet),
+		)
+	}
+	// Vnet does not exist — create it.
+	if createErr := clusterSvc.CreateSdnVnets(ctx, &sdkcluster.CreateSdnVnetsParams{
+		Vnet: args.vnet,
+		Zone: args.zone,
+	}); createErr != nil {
+		// 409 conflict = already exists from a concurrent call; treat as idempotent.
+		if isSDNConflict(createErr) {
+			return false, nil
+		}
+		return false, createErr
+	}
+	return true, nil
+}
+
+// createSubnetIdempotent creates the subnet on the named vnet. A 409 conflict
+// (subnet already exists) is treated as idempotent success; the bool stays
+// false so rollback does not delete a pre-existing subnet. The bool return is
+// true only when THIS call created the subnet.
+func createSubnetIdempotent(
+	ctx context.Context,
+	_ Deps,
+	clusterSvc sdkcluster.Service,
+	args sdnSubnetArgs,
+) (subnetCreated bool, err error) {
+	subnetParams := &sdkcluster.CreateSdnVnetsSubnetsParams{
+		Subnet: args.subnet,
+		Type:   "subnet",
+	}
+	if args.gateway != "" {
+		gw := args.gateway
+		subnetParams.Gateway = &gw
+	}
+	if createErr := clusterSvc.CreateSdnVnetsSubnets(ctx, args.vnet, subnetParams); createErr != nil {
+		// 409 = subnet already exists; idempotent.
+		if isSDNConflict(createErr) {
+			return false, nil
+		}
+		return false, createErr
+	}
+	return true, nil
+}
+
+// applyWithRollback calls applySDN and, on failure, invokes rollbackFn then
+// returns the original apply error. rollbackFn must use a detached context
+// (contextWithoutCancel) so cleanup completes even when the caller's context
+// is cancelled; the caller is responsible for constructing that context and
+// closing over it inside rollbackFn.
+func applyWithRollback(
+	ctx context.Context,
+	deps Deps,
+	clusterSvc sdkcluster.Service,
+	args sdnApplyArgs,
+	rollbackFn func(),
+) error {
+	if err := applySDN(ctx, deps, clusterSvc, args.opCtx); err != nil {
+		rollbackFn()
+		return err
+	}
+	return nil
+}
+
 // createNetworkSDN implements the SDN vnet creation flow.
 //
 // Rollback discipline: every best-effort cleanup call uses a context derived
@@ -100,6 +254,7 @@ func createNetwork(ctx context.Context, deps Deps, args []json.RawMessage) (any,
 // staged PVE state. Original-call errors are wrapped through pve.WrapError so
 // transient classes (5xx, ConnectionError, TimeoutError, storage lock) keep
 // their Retriable type all the way back to the BOSH director.
+// nolint:gocognit // Orchestration shell for 4 sequential SDN phases (zone, vnet, subnet, apply) with rollback chain; cognitive floor is set by the phase count, not by local complexity. Phase logic lives in resolveOrCreateSDNZone, createVnetIdempotent, createSubnetIdempotent, applyWithRollback.
 func createNetworkSDN(
 	ctx context.Context,
 	deps Deps,
@@ -130,7 +285,6 @@ func createNetworkSDN(
 	//     It does NOT derive or invent a zone name — the operator must still supply
 	//     cloud_properties.zone or config.sdn_zone. The flag only relaxes the
 	//     "zone not found" error into an auto-create action.
-	createdZone := false
 	if zone == "" {
 		if !cfg.SDNAutoManageZone {
 			return nil, cpierrors.Cloud(
@@ -147,176 +301,131 @@ func createNetworkSDN(
 		)
 	}
 
-	// Verify zone exists in PVE; create it when sdn_auto_manage_zone is enabled.
-	_, zoneGetErr := clusterSvc.GetSdnZones(ctx, zone, nil)
-	if zoneGetErr != nil {
-		if !isSDNNotFound(zoneGetErr) {
-			return nil, cpierrors.Wrap(
-				pve.WrapError(zoneGetErr),
-				fmt.Sprintf("create_network: get SDN zone %q", zone),
-			)
-		}
-		// Zone does not exist in PVE.
-		if !cfg.SDNAutoManageZone {
-			return nil, cpierrors.Cloud(
-				"create_network: SDN zone %q not found and sdn_auto_manage_zone is false — "+
-					"create the zone in PVE or enable sdn_auto_manage_zone",
-				zone,
-			)
-		}
-		zoneType := cpStr(cp, "zone_type")
-		if zoneType == "" {
-			zoneType = cfg.SDNZoneType
-		}
-		if zoneType == "" {
-			zoneType = "simple"
-		}
-		if err := clusterSvc.CreateSdnZones(ctx, &sdkcluster.CreateSdnZonesParams{
-			Zone: zone,
-			Type: zoneType,
-		}); err != nil {
-			return nil, cpierrors.Wrap(
-				pve.WrapError(err),
-				fmt.Sprintf("create_network: create SDN zone %q", zone),
-			)
-		}
-		createdZone = true
+	// Phase 1: verify zone exists in PVE; create it when sdn_auto_manage_zone is enabled.
+	zoneType := cpStr(cp, "zone_type")
+	if zoneType == "" {
+		zoneType = cfg.SDNZoneType
+	}
+	createdZone, err := resolveOrCreateSDNZone(ctx, deps, clusterSvc, sdnZoneArgs{
+		zone:              zone,
+		zoneType:          zoneType,
+		sdnAutoManageZone: cfg.SDNAutoManageZone,
+	})
+	if err != nil {
+		return nil, err
 	}
 
-	// Idempotent vnet create. A concurrent caller may have already created the
-	// vnet between our GetSdnVnets probe and our CreateSdnVnets call; the 409
-	// conflict path below handles that race. If GetSdnVnets succeeds we treat
-	// the vnet as pre-existing and do not mark vnetCreated, so rollback never
-	// deletes a vnet this call did not create.
-	vnetCreated := false
-	_, vnetGetErr := clusterSvc.GetSdnVnets(ctx, vnet, nil)
-	if vnetGetErr != nil {
-		if !isSDNNotFound(vnetGetErr) {
-			return nil, cpierrors.Wrap(
-				pve.WrapError(vnetGetErr),
-				fmt.Sprintf("create_network: get SDN vnet %q", vnet),
-			)
-		}
-		// Vnet does not exist — create it.
-		if err := clusterSvc.CreateSdnVnets(ctx, &sdkcluster.CreateSdnVnetsParams{
-			Vnet: vnet,
-			Zone: zone,
-		}); err != nil {
-			// 409 conflict = already exists from a concurrent call; treat as idempotent.
-			if !isSDNConflict(err) {
-				// Best-effort rollback of zone we created this call. Use a
-				// context detached from the parent's cancellation so cleanup
-				// runs even after the caller aborts.
-				if createdZone {
-					rollbackCtx := contextWithoutCancel(ctx)
-					if err := clusterSvc.DeleteSdnZones(rollbackCtx, zone, nil); err != nil {
-						deps.Logger.Warn("create_network: rollback delete zone failed", log.Err(err))
-					}
-					// Apply rollback so the staged zone deletion is committed.
-					if applyErr := applySDN(rollbackCtx, deps, clusterSvc,
-						"create_network: rollback zone after vnet-create failure"); applyErr != nil {
-						deps.Logger.Warn(
-							"create_network: rollback apply failed after zone delete",
-							log.Err(applyErr),
-						)
-					}
-				}
-				return nil, cpierrors.Wrap(
-					pve.WrapError(err),
-					fmt.Sprintf("create_network: create SDN vnet %q", vnet),
-				)
-			}
-			// 409: vnet exists from concurrent call — idempotent, do not mark vnetCreated.
-		} else {
-			vnetCreated = true
-		}
-	}
-
-	// Create subnet when range is present.
-	subnetCreated := false
-	if spec.Range != "" {
-		subnetParams := &sdkcluster.CreateSdnVnetsSubnetsParams{
-			Subnet: spec.Range,
-			Type:   "subnet",
-		}
-		if spec.Gateway != "" {
-			gw := spec.Gateway
-			subnetParams.Gateway = &gw
-		}
-		if err := clusterSvc.CreateSdnVnetsSubnets(ctx, vnet, subnetParams); err != nil {
-			// 409 = subnet already exists; idempotent.
-			if !isSDNConflict(err) {
-				// Best-effort rollback of what THIS call created. vnetCreated /
-				// createdZone guard against deleting pre-existing resources.
-				rollbackCtx := contextWithoutCancel(ctx)
-				if vnetCreated {
-					if err := clusterSvc.DeleteSdnVnets(rollbackCtx, vnet, nil); err != nil {
-						deps.Logger.Warn("create_network: rollback delete vnet failed", log.Err(err))
-					}
-				}
-				if createdZone {
-					if err := clusterSvc.DeleteSdnZones(rollbackCtx, zone, nil); err != nil {
-						deps.Logger.Warn("create_network: rollback delete zone failed", log.Err(err))
-					}
-				}
-				if vnetCreated || createdZone {
-					// Apply to commit the staged rollback deletions.
-					if applyErr := applySDN(rollbackCtx, deps, clusterSvc,
-						"create_network: rollback after subnet-create failure"); applyErr != nil {
-						deps.Logger.Warn(
-							"create_network: rollback apply failed after subnet-create failure",
-							log.Err(applyErr),
-						)
-					}
-				}
-				return nil, cpierrors.Wrap(
-					pve.WrapError(err),
-					fmt.Sprintf("create_network: create subnet %q on vnet %q", spec.Range, vnet),
-				)
-			}
-			// 409: subnet already existed — idempotent, subnetCreated stays false.
-		} else {
-			subnetCreated = true
-		}
-	}
-
-	// Apply SDN config to data plane.
-	if err := applySDN(ctx, deps, clusterSvc, "create_network"); err != nil {
-		// Best-effort rollback on apply failure. Only undo what THIS call created
-		// (subnetCreated / vnetCreated / createdZone guard against touching
-		// pre-existing state). Rollback runs on a detached context so it
-		// completes even when the caller cancelled the request.
-		rollbackCtx := contextWithoutCancel(ctx)
-		if subnetCreated {
-			if err := clusterSvc.DeleteSdnVnetsSubnets(rollbackCtx, vnet, spec.Range, nil); err != nil {
-				deps.Logger.Warn("create_network: rollback delete subnet failed", log.Err(err))
-			}
-		}
-		if vnetCreated {
-			if err := clusterSvc.DeleteSdnVnets(rollbackCtx, vnet, nil); err != nil {
-				deps.Logger.Warn("create_network: rollback delete vnet failed", log.Err(err))
-			}
-		}
+	// Phase 2: idempotent vnet create. A concurrent caller may have already
+	// created the vnet between our GetSdnVnets probe and our CreateSdnVnets call;
+	// the 409 conflict path inside createVnetIdempotent handles that race.
+	vnetCreated, vnetCreateErr := createVnetIdempotent(ctx, deps, clusterSvc, sdnVnetArgs{
+		vnet: vnet,
+		zone: zone,
+	})
+	if vnetCreateErr != nil {
+		// Best-effort rollback of zone we created this call. Use a context
+		// detached from the parent's cancellation so cleanup runs even after
+		// the caller aborts.
 		if createdZone {
-			if err := clusterSvc.DeleteSdnZones(rollbackCtx, zone, nil); err != nil {
-				deps.Logger.Warn("create_network: rollback delete zone failed", log.Err(err))
+			rollbackCtx := contextWithoutCancel(ctx)
+			if delErr := clusterSvc.DeleteSdnZones(rollbackCtx, zone, nil); delErr != nil {
+				deps.Logger.Warn("create_network: rollback delete zone failed", log.Err(delErr))
 			}
-		}
-		// Apply to commit the staged rollback deletions. Every SDN mutation
-		// must be followed by UpdateSdn or it stays pending in /etc/pve/sdn/.cfg.
-		if subnetCreated || vnetCreated || createdZone {
+			// Apply rollback so the staged zone deletion is committed.
 			if applyErr := applySDN(rollbackCtx, deps, clusterSvc,
-				"create_network: rollback after apply failure"); applyErr != nil {
+				"create_network: rollback zone after vnet-create failure"); applyErr != nil {
 				deps.Logger.Warn(
-					"create_network: rollback apply failed after main apply failure",
+					"create_network: rollback apply failed after zone delete",
 					log.Err(applyErr),
 				)
 			}
 		}
+		return nil, cpierrors.Wrap(
+			pve.WrapError(vnetCreateErr),
+			fmt.Sprintf("create_network: create SDN vnet %q", vnet),
+		)
+	}
+
+	// Phase 3: create subnet when range is present.
+	subnetCreated := false
+	if spec.Range != "" {
+		var subnetCreateErr error
+		subnetCreated, subnetCreateErr = createSubnetIdempotent(ctx, deps, clusterSvc, sdnSubnetArgs{
+			vnet:    vnet,
+			subnet:  spec.Range,
+			gateway: spec.Gateway,
+		})
+		if subnetCreateErr != nil {
+			// Best-effort rollback of what THIS call created. vnetCreated /
+			// createdZone guard against deleting pre-existing resources.
+			rollbackCtx := contextWithoutCancel(ctx)
+			if vnetCreated {
+				if delErr := clusterSvc.DeleteSdnVnets(rollbackCtx, vnet, nil); delErr != nil {
+					deps.Logger.Warn("create_network: rollback delete vnet failed", log.Err(delErr))
+				}
+			}
+			if createdZone {
+				if delErr := clusterSvc.DeleteSdnZones(rollbackCtx, zone, nil); delErr != nil {
+					deps.Logger.Warn("create_network: rollback delete zone failed", log.Err(delErr))
+				}
+			}
+			if vnetCreated || createdZone {
+				// Apply to commit the staged rollback deletions.
+				if applyErr := applySDN(rollbackCtx, deps, clusterSvc,
+					"create_network: rollback after subnet-create failure"); applyErr != nil {
+					deps.Logger.Warn(
+						"create_network: rollback apply failed after subnet-create failure",
+						log.Err(applyErr),
+					)
+				}
+			}
+			return nil, cpierrors.Wrap(
+				pve.WrapError(subnetCreateErr),
+				fmt.Sprintf("create_network: create subnet %q on vnet %q", spec.Range, vnet),
+			)
+		}
+	}
+
+	// Phase 4: apply SDN config to data plane. On failure roll back only what
+	// THIS call created (subnetCreated / vnetCreated / createdZone guard against
+	// touching pre-existing state). Rollback runs on a detached context so it
+	// completes even when the caller cancelled the request.
+	rollbackCtx := contextWithoutCancel(ctx)
+	applyErr := applyWithRollback(ctx, deps, clusterSvc, sdnApplyArgs{opCtx: "create_network"},
+		func() {
+			if subnetCreated {
+				if delErr := clusterSvc.DeleteSdnVnetsSubnets(rollbackCtx, vnet, spec.Range, nil); delErr != nil {
+					deps.Logger.Warn("create_network: rollback delete subnet failed", log.Err(delErr))
+				}
+			}
+			if vnetCreated {
+				if delErr := clusterSvc.DeleteSdnVnets(rollbackCtx, vnet, nil); delErr != nil {
+					deps.Logger.Warn("create_network: rollback delete vnet failed", log.Err(delErr))
+				}
+			}
+			if createdZone {
+				if delErr := clusterSvc.DeleteSdnZones(rollbackCtx, zone, nil); delErr != nil {
+					deps.Logger.Warn("create_network: rollback delete zone failed", log.Err(delErr))
+				}
+			}
+			// Apply to commit the staged rollback deletions. Every SDN mutation
+			// must be followed by UpdateSdn or it stays pending in /etc/pve/sdn/.cfg.
+			if subnetCreated || vnetCreated || createdZone {
+				if rb2Err := applySDN(rollbackCtx, deps, clusterSvc,
+					"create_network: rollback after apply failure"); rb2Err != nil {
+					deps.Logger.Warn(
+						"create_network: rollback apply failed after main apply failure",
+						log.Err(rb2Err),
+					)
+				}
+			}
+		},
+	)
+	if applyErr != nil {
 		// Return the apply error as-is. applySDN wraps the SDK error with its
 		// own context prefix already; adding another wrap layer here would
 		// double-prefix without adding information.
-		return nil, err
+		return nil, applyErr
 	}
 
 	// Build BOSH 3-element response.

@@ -6,6 +6,7 @@ import (
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/cpi"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
+	stemcellfetch "github.com/fivetwenty-io/bosh-pve-cpi/internal/pve/stemcell_fetch"
 )
 
 // Handler is a package-level alias for cpi.Handler so individual handler files
@@ -21,12 +22,17 @@ type HandlerFunc = cpi.HandlerFunc
 // Production wiring (main.go) constructs it from a StorageInfoCache; tests may
 // leave it nil to get the static "shared on Config.Node" default via the
 // backendResolverOrDefault helper.
+//
+// FetchResolver, when non-nil, replaces the default stemcellfetch.ResolveSource
+// call inside HandleCreateStemcell's resolveFetchSource path. Set by tests only;
+// production code leaves it nil.
 type Deps struct {
-	Config   *config.CPIConfig
-	PVE      pve.Client
-	Agent    agent.Agent
-	Logger   *log.Logger
-	Resolver pve.BackendResolver
+	Config        *config.CPIConfig
+	PVE           pve.Client
+	Agent         agent.Agent
+	Logger        *log.Logger
+	Resolver      pve.BackendResolver
+	FetchResolver func(rawURL string) (stemcellfetch.Source, stemcellfetch.Reference, error)
 }
 
 // backendResolverOrDefault returns d.Resolver if non-nil; otherwise it builds a

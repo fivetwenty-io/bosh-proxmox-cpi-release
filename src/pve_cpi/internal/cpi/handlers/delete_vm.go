@@ -75,127 +75,15 @@ func HandleDeleteVM(deps Deps) cpi.Handler {
 		logger.Debug("delete_vm: VM located", log.String("node", node))
 
 		// --- stop VM ---
-		// Stop returns a UPID; if VM is not found (already deleted), treat as success.
-		// Wrap in RetryOnTransient so a pvedaemon worker-recycle (HTTP 5xx /
-		// "got no worker upid - start worker failed") under burst load is
-		// absorbed in-process rather than surfacing as RetriableCloudError to
-		// the director.
-		logger.Debug("delete_vm: stopping VM")
-		var stopUPID string
-		stopErr := pve.RetryOnTransient(ctx, logger, "delete_vm.stop", 0, func() error {
-			var innerErr error
-			stopUPID, innerErr = deps.PVE.QEMU().Stop(ctx, node, vmid)
-			return innerErr
-		})
-		if stopErr != nil {
-			if pve.IsNotFound(stopErr) {
-				logger.Info("delete_vm: VM not found during stop — already deleted, returning success")
-				return nil, nil
-			}
-			return nil, cpierrors.Wrap(pve.WrapError(stopErr), fmt.Sprintf("delete_vm: stop VM %s", vmCID))
-		}
-		if stopUPID != "" {
-			if awaitErr := pve.AwaitTaskWithLogger(ctx, deps.PVE, node, stopUPID, logger); awaitErr != nil {
-				// A qmstop task can be accepted (Stop returns a UPID) yet fail
-				// when the VM's config has already been removed — surfaced as
-				// "unable to find configuration file for VM ...". For delete_vm
-				// that means the target is already gone, so treat it as success.
-				if pve.IsNotFound(awaitErr) || pve.IsPmxcfsConfigMissing(awaitErr) {
-					logger.Info("delete_vm: VM config missing during stop await — already deleted, returning success")
-					if agentErr := deps.Agent.Remove(ctx, node, vmid); agentErr != nil {
-						logger.Warn("delete_vm: agent.Remove failed after idempotent stop-await", log.Err(agentErr))
-					}
-					return nil, nil
-				}
-				return nil, cpierrors.Wrap(pve.WrapError(awaitErr),
-					fmt.Sprintf("delete_vm: await stop task for VM %s", vmCID))
-			}
+		if stopDone, stopErr := stopVMBeforeDelete(ctx, deps, node, vmid, vmCID, logger); stopErr != nil {
+			return nil, stopErr
+		} else if stopDone {
+			return nil, nil
 		}
 
 		// --- guard: refuse to destroy if a persistent volume is still attached ---
-		// PVE's PUT config delete:scsiN demotes a disk to unusedN rather than
-		// fully clearing the config entry. A DELETE /qemu/{vmid} then destroys
-		// every disk still referenced -- unusedN included -- silently nuking the
-		// volume. The SDK's DetachDisk sweeps unusedN automatically, but this
-		// guard catches future SDK regressions or any other code path that
-		// reaches delete_vm with a dangling volume reference.
-		//
-		// Belt-and-suspenders: we ALWAYS scan unusedN entries regardless of
-		// whether diskStorage is configured. When diskStorage is known we can
-		// run an existence probe and safely skip stale dangling references.
-		// When diskStorage is empty (operator did not configure pve_disk_storage)
-		// we cannot resolve which storage backs the volume, so we cannot probe
-		// existence -- we fail CLOSED to avoid silently nuking a live volume.
-		// A storage mismatch is treated identically: the slot may belong to an
-		// unrecognised storage pool we cannot probe, so it also fails closed.
-		diskStorage := deps.Config.DiskStorage
-		cfg, cfgErr := deps.PVE.QEMU().Config(ctx, node, vmid)
-		if cfgErr != nil {
-			if !pve.IsNotFound(cfgErr) {
-				return nil, cpierrors.Wrap(pve.WrapError(cfgErr),
-					fmt.Sprintf("delete_vm: read config for VM %s before destroy", vmCID))
-			}
-			// 404 here means the VM is gone -- fall through to the destroy
-			// call below, which handles the NotFound case idempotently.
-		} else {
-			// Only an unusedN slot whose volume STILL EXISTS represents a real
-			// persistent disk that the DELETE below would silently destroy. PVE
-			// demotes a disk to unusedN on detach; when a snapshot still
-			// references the volume the SDK's sweep cannot remove that slot, so
-			// it can linger. Once the volume itself is deleted (e.g. delete_disk
-			// runs before delete_vm) the slot is a dangling reference pointing at
-			// nothing -- destroying the VM cannot lose data, so it must not block
-			// delete_vm. Existence-probe failures fail closed (treated as
-			// present) so a transient error never green-lights destroying a live
-			// volume. Probe on the VM's node: any volume still referenced by this
-			// VM's config is reachable from there.
-			var protected []string
-			for slot, volid := range pve.FindUnusedDiskEntries(cfg) {
-				storage, _, parseErr := pve.ParseDiskCID(volid)
-				if parseErr != nil {
-					// Unparseable volid -- skip; can't determine storage.
-					logger.Warn("delete_vm: unused-slot has unparseable volid -- skipping",
-						log.String("slot", slot), log.String("volid", volid))
-					continue
-				}
-				if diskStorage == "" {
-					// No configured disk storage: cannot probe existence.
-					// Fail closed -- block destroy to avoid data loss.
-					logger.Warn("delete_vm: unused-slot present but pve_disk_storage not configured -- failing closed",
-						log.String("slot", slot), log.String("volid", volid))
-					protected = append(protected, fmt.Sprintf("%s=%s", slot, volid))
-					continue
-				}
-				if storage != diskStorage {
-					// Storage doesn't match configured disk storage: we cannot
-					// probe existence on an unknown pool. Fail closed.
-					logger.Warn("delete_vm: unused-slot storage does not match pve_disk_storage -- failing closed",
-						log.String("slot", slot), log.String("volid", volid),
-						log.String("slot_storage", storage), log.String("disk_storage", diskStorage))
-					protected = append(protected, fmt.Sprintf("%s=%s", slot, volid))
-					continue
-				}
-				// ExistsTolerant: block-backed storages return 500 with
-				// "Failed to find logical volume" for missing LVs rather
-				// than 404. Treat those as "volume gone" so a stale unused
-				// slot pointing at a deleted volume does not wedge delete_vm.
-				exists, existErr := pve.ExistsTolerant(ctx, deps.PVE, node, diskStorage, volid)
-				if existErr != nil {
-					logger.Warn("delete_vm: unused-slot volume existence probe failed -- treating slot as present (fail-closed)",
-						log.String("slot", slot), log.String("volid", volid), log.Err(existErr))
-				} else if !exists {
-					logger.Info("delete_vm: ignoring stale unused slot -- volume already deleted",
-						log.String("slot", slot), log.String("volid", volid))
-					continue
-				}
-				protected = append(protected, fmt.Sprintf("%s=%s", slot, volid))
-			}
-			if len(protected) > 0 {
-				return nil, cpierrors.Cloud(
-					"delete_vm: refusing to destroy VM %s -- persistent volumes still attached as unused slots: %v (call detach_disk first or verify pve_disk_storage configuration)",
-					vmCID, protected,
-				)
-			}
+		if guardErr := guardUnusedVolumes(ctx, deps, node, vmCID, vmid, deps.Config.DiskStorage); guardErr != nil {
+			return nil, guardErr
 		}
 
 		// --- delete VM ---
@@ -234,36 +122,193 @@ func HandleDeleteVM(deps Deps) cpi.Handler {
 		// Await the destroy task so the VM is fully purged from PVE before we
 		// return. DeleteQemu returns a UPID as a json.RawMessage; an empty or
 		// null response means PVE completed synchronously and no await is needed.
-		if deleteResp != nil {
-			deleteUPID, upidErr := pve.UPIDFromRaw(*deleteResp)
-			if upidErr != nil {
-				// Malformed UPID is unexpected but non-fatal: the delete call
-				// already succeeded; log and continue rather than fail the operation.
-				logger.Warn("delete_vm: cannot parse UPID from delete response -- skipping await",
-					log.Err(upidErr))
-			} else if deleteUPID != "" {
-				if awaitErr := pve.AwaitTaskWithLogger(ctx, deps.PVE, node, deleteUPID, logger); awaitErr != nil {
-					// NotFound or PmxcfsConfigMissing during destroy-await means
-					// the VM was already gone by the time we polled -- idempotent.
-					if pve.IsNotFound(awaitErr) || pve.IsPmxcfsConfigMissing(awaitErr) {
-						logger.Info("delete_vm: VM config missing during destroy await -- treating as already deleted")
-					} else {
-						return nil, cpierrors.Wrap(pve.WrapError(awaitErr),
-							fmt.Sprintf("delete_vm: await destroy task for VM %s", vmCID))
-					}
-				}
-			}
+		if awaitErr := awaitDeleteTask(ctx, deps, node, vmCID, deleteResp, logger); awaitErr != nil {
+			return nil, awaitErr
 		}
 
 		// --- agent cleanup ---
-		logger.Debug("delete_vm: calling agent.Remove")
-		if agentErr := deps.Agent.Remove(ctx, node, vmid); agentErr != nil {
-			// Agent errors are non-fatal: the VM is already destroyed in PVE.
-			// Log at warn and continue; BOSH Director does not retry delete_vm on error.
-			logger.Warn("delete_vm: agent.Remove returned error (VM already destroyed)", log.Err(agentErr))
-		}
+		cleanupAgentForVM(ctx, deps, node, vmid, logger)
 
 		logger.Info("delete_vm: VM deleted successfully")
 		return nil, nil
 	})
+}
+
+// stopVMBeforeDelete stops the VM and awaits the stop task.
+// Returns (true, nil) when the caller should treat the operation as already complete
+// (idempotent not-found paths). Returns (false, nil) on clean stop. Returns (false, err) on failure.
+func stopVMBeforeDelete(ctx context.Context, deps Deps, node string, vmid int, vmCID string, logger *log.Logger) (done bool, err error) {
+	// Stop returns a UPID; if VM is not found (already deleted), treat as success.
+	// Wrap in RetryOnTransient so a pvedaemon worker-recycle (HTTP 5xx /
+	// "got no worker upid - start worker failed") under burst load is
+	// absorbed in-process rather than surfacing as RetriableCloudError to
+	// the director.
+	logger.Debug("delete_vm: stopping VM")
+	var stopUPID string
+	stopErr := pve.RetryOnTransient(ctx, logger, "delete_vm.stop", 0, func() error {
+		var innerErr error
+		stopUPID, innerErr = deps.PVE.QEMU().Stop(ctx, node, vmid)
+		return innerErr
+	})
+	if stopErr != nil {
+		if pve.IsNotFound(stopErr) {
+			logger.Info("delete_vm: VM not found during stop — already deleted, returning success")
+			return true, nil
+		}
+		return false, cpierrors.Wrap(pve.WrapError(stopErr), fmt.Sprintf("delete_vm: stop VM %s", vmCID))
+	}
+	if stopUPID != "" {
+		if awaitErr := pve.AwaitTaskWithLogger(ctx, deps.PVE, node, stopUPID, logger); awaitErr != nil {
+			// A qmstop task can be accepted (Stop returns a UPID) yet fail
+			// when the VM's config has already been removed — surfaced as
+			// "unable to find configuration file for VM ...". For delete_vm
+			// that means the target is already gone, so treat it as success.
+			if pve.IsNotFound(awaitErr) || pve.IsPmxcfsConfigMissing(awaitErr) {
+				logger.Info("delete_vm: VM config missing during stop await — already deleted, returning success")
+				if agentErr := deps.Agent.Remove(ctx, node, vmid); agentErr != nil {
+					logger.Warn("delete_vm: agent.Remove failed after idempotent stop-await", log.Err(agentErr))
+				}
+				return true, nil
+			}
+			return false, cpierrors.Wrap(pve.WrapError(awaitErr),
+				fmt.Sprintf("delete_vm: await stop task for VM %s", vmCID))
+		}
+	}
+	return false, nil
+}
+
+// guardUnusedVolumes reads the VM config and refuses to destroy if any unusedN
+// slot still references a live persistent volume.
+//
+// PVE's PUT config delete:scsiN demotes a disk to unusedN rather than fully
+// clearing the config entry. A DELETE /qemu/{vmid} then destroys every disk
+// still referenced -- unusedN included -- silently nuking the volume. The
+// SDK's DetachDisk sweeps unusedN automatically, but this guard catches future
+// SDK regressions or any other code path that reaches delete_vm with a dangling
+// volume reference.
+//
+// Belt-and-suspenders: we ALWAYS scan unusedN entries regardless of whether
+// diskStorage is configured. When diskStorage is known we can run an existence
+// probe and safely skip stale dangling references. When diskStorage is empty
+// (operator did not configure pve_disk_storage) we cannot probe existence --
+// we fail CLOSED to avoid silently nuking a live volume. A storage mismatch is
+// treated identically: the slot may belong to an unrecognised storage pool we
+// cannot probe, so it also fails closed.
+//
+// Returns nil on success (no protected volumes found or VM config is 404).
+// Returns cpierrors.Cloud when protected volumes are present.
+// Returns a wrapped error when the config read fails for reasons other than 404.
+func guardUnusedVolumes(ctx context.Context, deps Deps, node, vmCID string, vmid int, diskStorage string) error {
+	vmCfg, cfgErr := deps.PVE.QEMU().Config(ctx, node, vmid)
+	if cfgErr != nil {
+		if !pve.IsNotFound(cfgErr) {
+			return cpierrors.Wrap(pve.WrapError(cfgErr),
+				fmt.Sprintf("delete_vm: read config for VM %s before destroy", vmCID))
+		}
+		// 404 here means the VM is gone -- fall through to the destroy
+		// call below, which handles the NotFound case idempotently.
+		return nil
+	}
+
+	// Only an unusedN slot whose volume STILL EXISTS represents a real
+	// persistent disk that the DELETE below would silently destroy. PVE
+	// demotes a disk to unusedN on detach; when a snapshot still
+	// references the volume the SDK's sweep cannot remove that slot, so
+	// it can linger. Once the volume itself is deleted (e.g. delete_disk
+	// runs before delete_vm) the slot is a dangling reference pointing at
+	// nothing -- destroying the VM cannot lose data, so it must not block
+	// delete_vm. Existence-probe failures fail closed (treated as
+	// present) so a transient error never green-lights destroying a live
+	// volume. Probe on the VM's node: any volume still referenced by this
+	// VM's config is reachable from there.
+	var protected []string
+	for slot, volid := range pve.FindUnusedDiskEntries(vmCfg) {
+		storage, _, parseErr := pve.ParseDiskCID(volid)
+		if parseErr != nil {
+			// Unparseable volid -- skip; can't determine storage.
+			deps.Logger.Warn("delete_vm: unused-slot has unparseable volid -- skipping",
+				log.String("slot", slot), log.String("volid", volid))
+			continue
+		}
+		if diskStorage == "" {
+			// No configured disk storage: cannot probe existence.
+			// Fail closed -- block destroy to avoid data loss.
+			deps.Logger.Warn("delete_vm: unused-slot present but pve_disk_storage not configured -- failing closed",
+				log.String("slot", slot), log.String("volid", volid))
+			protected = append(protected, fmt.Sprintf("%s=%s", slot, volid))
+			continue
+		}
+		if storage != diskStorage {
+			// Storage doesn't match configured disk storage: we cannot
+			// probe existence on an unknown pool. Fail closed.
+			deps.Logger.Warn("delete_vm: unused-slot storage does not match pve_disk_storage -- failing closed",
+				log.String("slot", slot), log.String("volid", volid),
+				log.String("slot_storage", storage), log.String("disk_storage", diskStorage))
+			protected = append(protected, fmt.Sprintf("%s=%s", slot, volid))
+			continue
+		}
+		// ExistsTolerant: block-backed storages return 500 with
+		// "Failed to find logical volume" for missing LVs rather
+		// than 404. Treat those as "volume gone" so a stale unused
+		// slot pointing at a deleted volume does not wedge delete_vm.
+		exists, existErr := pve.ExistsTolerant(ctx, deps.PVE, node, diskStorage, volid)
+		if existErr != nil {
+			deps.Logger.Warn("delete_vm: unused-slot volume existence probe failed -- treating slot as present (fail-closed)",
+				log.String("slot", slot), log.String("volid", volid), log.Err(existErr))
+		} else if !exists {
+			deps.Logger.Info("delete_vm: ignoring stale unused slot -- volume already deleted",
+				log.String("slot", slot), log.String("volid", volid))
+			continue
+		}
+		protected = append(protected, fmt.Sprintf("%s=%s", slot, volid))
+	}
+	if len(protected) > 0 {
+		return cpierrors.Cloud(
+			"delete_vm: refusing to destroy VM %s -- persistent volumes still attached as unused slots: %v (call detach_disk first or verify pve_disk_storage configuration)",
+			vmCID, protected,
+		)
+	}
+	return nil
+}
+
+// awaitDeleteTask extracts the UPID from the DeleteQemu response and awaits the
+// destroy task. An empty or null response means PVE completed synchronously;
+// NotFound or PmxcfsConfigMissing during the poll is treated as idempotent success.
+// Returns nil on success or idempotent not-found. Returns a wrapped error otherwise.
+func awaitDeleteTask(ctx context.Context, deps Deps, node, vmCID string, deleteResp *sdknodes.DeleteQemuResponse, logger *log.Logger) error {
+	if deleteResp == nil {
+		return nil
+	}
+	deleteUPID, upidErr := pve.UPIDFromRaw(*deleteResp)
+	if upidErr != nil {
+		// Malformed UPID is unexpected but non-fatal: the delete call
+		// already succeeded; log and continue rather than fail the operation.
+		logger.Warn("delete_vm: cannot parse UPID from delete response -- skipping await",
+			log.Err(upidErr))
+		return nil
+	}
+	if deleteUPID == "" {
+		return nil
+	}
+	if awaitErr := pve.AwaitTaskWithLogger(ctx, deps.PVE, node, deleteUPID, logger); awaitErr != nil {
+		// NotFound or PmxcfsConfigMissing during destroy-await means
+		// the VM was already gone by the time we polled -- idempotent.
+		if pve.IsNotFound(awaitErr) || pve.IsPmxcfsConfigMissing(awaitErr) {
+			logger.Info("delete_vm: VM config missing during destroy await -- treating as already deleted")
+			return nil
+		}
+		return cpierrors.Wrap(pve.WrapError(awaitErr),
+			fmt.Sprintf("delete_vm: await destroy task for VM %s", vmCID))
+	}
+	return nil
+}
+
+// cleanupAgentForVM calls agent.Remove to purge registry/cloud-init state for
+// the destroyed VM. Errors are non-fatal: the VM is already destroyed in PVE.
+// The BOSH Director does not retry delete_vm on agent errors.
+func cleanupAgentForVM(ctx context.Context, deps Deps, node string, vmid int, logger *log.Logger) {
+	logger.Debug("delete_vm: calling agent.Remove")
+	if agentErr := deps.Agent.Remove(ctx, node, vmid); agentErr != nil {
+		logger.Warn("delete_vm: agent.Remove returned error (VM already destroyed)", log.Err(agentErr))
+	}
 }

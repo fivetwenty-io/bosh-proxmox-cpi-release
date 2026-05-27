@@ -14,6 +14,87 @@ import (
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
 )
 
+// detachDiskResolveSlot resolves the PVE node hosting diskCID and the disk's
+// current bus slot (e.g. "scsi2") on the given VM.
+//
+// It performs three steps:
+//  1. Backend resolution to locate the node that holds diskCID in PVE storage.
+//  2. ResolveDiskID to find the active bus slot for diskCID in the VM config.
+//  3. If ResolveDiskID returns ErrDiskNotAttached or a not-found error,
+//     sweepUnusedDiskSlot is called to clean up any lingering unusedN entry.
+//
+// Return values:
+//   - node: the PVE node name (non-empty on success).
+//   - diskID: the slot string such as "scsi2" (non-empty when attached).
+//   - alreadyDetached: true when the disk is not on any active bus or unusedN
+//     slot — the caller should treat this as idempotent success and return nil.
+//   - err: non-nil only for genuine failures (network errors, VM not found, etc.).
+func detachDiskResolveSlot(
+	ctx context.Context,
+	deps Deps,
+	vmCID string,
+	vmid int,
+	diskCID string,
+) (node, diskID string, alreadyDetached bool, err error) {
+	storage, _, err := pve.ParseDiskCID(diskCID)
+	if err != nil {
+		return "", "", false, cpierrors.DiskNotFound(diskCID)
+	}
+
+	// Locate the PVE node that holds the volume via the storage backend.
+	backend, err := backendResolverOrDefault(deps).Resolve(ctx, storage)
+	if err != nil {
+		return "", "", false, cpierrors.Wrap(err, fmt.Sprintf("detach_disk: backend resolution failed for storage %q", storage))
+	}
+	node, err = backend.NodeForExisting(ctx, diskCID)
+	if err != nil {
+		if pve.IsNotFound(err) {
+			// Volume gone — disk already detached from its perspective; idempotent.
+			deps.Logger.Warn("detach_disk: volume not found on any node, treating as already detached",
+				log.String("vm_cid", vmCID),
+				log.String("disk_cid", diskCID),
+			)
+			return "", "", true, nil
+		}
+		return "", "", false, cpierrors.Wrap(err, "detach_disk: node lookup failed")
+	}
+
+	// Resolve the active bus slot for diskCID in the VM config.
+	diskID, err = pve.ResolveDiskID(ctx, deps.PVE, node, vmid, diskCID)
+	if err != nil {
+		if errors.Is(err, pve.ErrDiskNotAttached) || pve.IsNotFound(err) {
+			// Disk is not on an active bus. It may still linger as an unusedN
+			// slot: a prior detach with allow_disk_ops_with_snapshots=true
+			// parked it there, but PVE's unusedN sweep was blocked by a
+			// snapshot. Once the snapshot is gone a follow-up detach_disk lands
+			// here — completing that sweep is what makes the documented "delete
+			// snapshots, then retry detach_disk" recovery actually free the
+			// volume (delete_disk) and unblock delete_vm.
+			//
+			// The sentinel check (errors.Is) narrows the previously broad
+			// TypeCloud catch: any other Cloud error from ResolveDiskID
+			// (validation failures on node/vmid/volid) now propagates as a
+			// real error instead of being silently swallowed as idempotent.
+			swept, sweepErr := sweepUnusedDiskSlot(ctx, deps, node, vmid, vmCID, diskCID)
+			if sweepErr != nil {
+				return "", "", false, sweepErr
+			}
+			if !swept {
+				deps.Logger.Warn("detach_disk: disk not attached to VM; skipping",
+					log.String("vm_cid", vmCID),
+					log.String("disk_cid", diskCID),
+					log.Err(err),
+				)
+			}
+			return "", "", true, nil
+		}
+		// Config fetch error (network, 404 on VM itself, etc.).
+		return "", "", false, cpierrors.Wrap(pve.WrapError(err), fmt.Sprintf("detach_disk: config fetch failed for VM %s", vmCID))
+	}
+
+	return node, diskID, false, nil
+}
+
 // HandleDetachDisk returns a Handler for the BOSH CPI detach_disk method.
 //
 // Arguments (positional JSON array):
@@ -25,11 +106,9 @@ import (
 //
 // Logic:
 //  1. Parse vm_cid to VMID int; parse disk_cid to storage+volid components.
-//  2. Resolve the disk's current slot (diskID, e.g. "scsi2") via pve.ResolveDiskID
-//     by fetching the VM config and scanning for the matching volid.
-//  3. If the disk is not attached (ResolveDiskID returns a not-found error), log a
-//     warning and return nil (idempotent — Director may call detach_disk more than
-//     once for the same disk).
+//  2. Call detachDiskResolveSlot to locate the node and disk bus slot.
+//     Returns alreadyDetached=true → return nil (idempotent).
+//  3. Snapshot pre-flight guard (fail-closed or fail-open per config).
 //  4. Call qemu.DetachDisk with the resolved diskID. The SDK issues a synchronous
 //     PUT /nodes/{node}/qemu/{vmid}/config with {delete: diskID}. No UPID is returned
 //     and no AwaitTask is required.
@@ -67,85 +146,29 @@ func HandleDetachDisk(deps Deps) Handler {
 		}
 
 		// --------------------------------------------------------------------
-		// 2. Parse vm_cid → VMID; parse disk_cid → storage + volid.
+		// 2. Parse vm_cid → VMID; resolve node + disk slot via helper.
 		// --------------------------------------------------------------------
 		vmid, err := strconv.Atoi(vmCID)
 		if err != nil || vmid <= 0 {
 			return nil, cpierrors.VMNotFound(vmCID)
 		}
 
-		storage, _, err := pve.ParseDiskCID(diskCID)
+		node, diskID, alreadyDetached, err := detachDiskResolveSlot(ctx, deps, vmCID, vmid, diskCID)
 		if err != nil {
-			return nil, cpierrors.DiskNotFound(diskCID)
+			return nil, err
 		}
-
-		// detach_disk modifies VM config, which lives on the VM's node — which
-		// is the same node that holds the volume (the disk is attached). Resolve
-		// via the storage backend to share behavior with attach_disk. PVE's
-		// storage content endpoint wants the canonical "<storage>:<volname>"
-		// form, which is the disk_cid as-is.
-		backend, err := backendResolverOrDefault(deps).Resolve(ctx, storage)
-		if err != nil {
-			return nil, cpierrors.Wrap(err, fmt.Sprintf("detach_disk: backend resolution failed for storage %q", storage))
-		}
-		node, err := backend.NodeForExisting(ctx, diskCID)
-		if err != nil {
-			if pve.IsNotFound(err) {
-				// Volume gone → disk already detached from its perspective; idempotent.
-				deps.Logger.Warn("detach_disk: volume not found on any node, treating as already detached",
-					log.String("vm_cid", vmCID),
-					log.String("disk_cid", diskCID),
-				)
-				return nil, nil
-			}
-			return nil, cpierrors.Wrap(err, "detach_disk: node lookup failed")
+		if alreadyDetached {
+			return nil, nil
 		}
 
 		// --------------------------------------------------------------------
-		// 3. Resolve diskID from current VM config.
-		//    If not attached: log warning, return nil (idempotent).
-		// --------------------------------------------------------------------
-		diskID, err := pve.ResolveDiskID(ctx, deps.PVE, node, vmid, diskCID)
-		if err != nil {
-			if errors.Is(err, pve.ErrDiskNotAttached) || pve.IsNotFound(err) {
-				// Disk is not on an active bus. It may still linger as an unusedN
-				// slot: a prior detach with allow_disk_ops_with_snapshots=true
-				// parked it there, but PVE's unusedN sweep was blocked by a
-				// snapshot. Once the snapshot is gone a follow-up detach_disk lands
-				// here — completing that sweep is what makes the documented "delete
-				// snapshots, then retry detach_disk" recovery actually free the
-				// volume (delete_disk) and unblock delete_vm.
-				//
-				// The sentinel check (errors.Is) narrows the previously broad
-				// TypeCloud catch: any other Cloud error from ResolveDiskID
-				// (validation failures on node/vmid/volid) now propagates as a
-				// real error instead of being silently swallowed as idempotent.
-				swept, sweepErr := sweepUnusedDiskSlot(ctx, deps, node, vmid, vmCID, diskCID)
-				if sweepErr != nil {
-					return nil, sweepErr
-				}
-				if !swept {
-					// Truly detached (no active slot, no unusedN); idempotent success.
-					deps.Logger.Warn("detach_disk: disk not attached to VM; skipping",
-						log.String("vm_cid", vmCID),
-						log.String("disk_cid", diskCID),
-						log.Err(err),
-					)
-				}
-				return nil, nil
-			}
-			// Config fetch error (network, 404 on VM itself, etc.).
-			return nil, cpierrors.Wrap(pve.WrapError(err), fmt.Sprintf("detach_disk: config fetch failed for VM %s", vmCID))
-		}
-
-		// --------------------------------------------------------------------
-		// 4. Snapshot pre-flight guard.
+		// 3. Snapshot pre-flight guard.
 		//
 		// PVE rejects DetachDisk while a snapshot references the disk slot.
 		// Guard before any mutating call to surface the issue with an
 		// actionable message instead of an opaque PVE API error.
 		//
-		// Policy (D2-C, D3-C):
+		// Policy:
 		//   HasSnapshots error + RequireSnapshotCheckPass=true  → fail-closed (abort)
 		//   HasSnapshots error + RequireSnapshotCheckPass=false → WARN + proceed
 		//   Snapshots present + AllowDiskOpsWithSnapshots=false → Cloud error (hard fail)
@@ -183,7 +206,7 @@ func HandleDetachDisk(deps Deps) Handler {
 		}
 
 		// --------------------------------------------------------------------
-		// 5. Detach disk via SDK. Synchronous config PUT; no UPID returned.
+		// 4. Detach disk via SDK. Synchronous config PUT; no UPID returned.
 		// --------------------------------------------------------------------
 		// SDK ≥ v3.1.2 sweeps any unusedN slot PVE auto-creates on detach,
 		// so the disk is fully removed from the VM config and survives a
@@ -205,7 +228,7 @@ func HandleDetachDisk(deps Deps) Handler {
 		)
 
 		// --------------------------------------------------------------------
-		// 6. Return nil (void success).
+		// 5. Return nil (void success).
 		// --------------------------------------------------------------------
 		return nil, nil
 	})

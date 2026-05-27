@@ -147,7 +147,7 @@ func TestParseStemcellCloudProps_LightFields(t *testing.T) {
 }
 
 // ============================================================
-// White-box tests: handleLightStemcellFetch via fetchResolverOverride seam
+// White-box tests: handleLightStemcellFetch via Deps.FetchResolver seam
 // ============================================================
 
 // mockSource is a test-only stemcellfetch.Source that returns a fixed body.
@@ -298,10 +298,9 @@ func (s *wbMockStorage) DeleteVolumeIfExists(_ context.Context, _, _, _ string) 
 // TestHandleCreateStemcell_LightFetch_HappyPath verifies the full fetch success
 // path: mock Source returns fixed body, dedup misses (empty storage), upload
 // records the canonical filename, CID has "light:" prefix with sha8 from body.
-//
-// Not marked t.Parallel: sets the package-level fetchResolverOverride, which
-// is not safe to share concurrently with other tests that also set it.
 func TestHandleCreateStemcell_LightFetch_HappyPath(t *testing.T) {
+	t.Parallel()
+
 	// Fixed body — sha8 is deterministic from these bytes.
 	body := []byte("FAKE STEMCELL QCOW2 BYTES")
 	sum := sha256.Sum256(body)
@@ -310,16 +309,13 @@ func TestHandleCreateStemcell_LightFetch_HappyPath(t *testing.T) {
 	wantFilename := "bosh-stemcell-ubuntu-jammy-1.438-" + sha8 + ".qcow2"
 	wantCID := "light:nfs:import/" + wantFilename
 
-	// Install source override; restore after test.
-	fetchResolverOverride = func(rawURL string) (stemcellfetch.Source, stemcellfetch.Reference, error) {
+	var uploadedFilename string
+	deps := wbBuildFetchDeps(t, wbEmptyNodeListFn())
+	deps.FetchResolver = func(rawURL string) (stemcellfetch.Source, stemcellfetch.Reference, error) {
 		return &mockSource{body: body, contentLength: int64(len(body))},
 			stemcellfetch.Reference{Scheme: "https", URL: rawURL},
 			nil
 	}
-	t.Cleanup(func() { fetchResolverOverride = nil })
-
-	var uploadedFilename string
-	deps := wbBuildFetchDeps(t, wbEmptyNodeListFn())
 	deps.PVE.(*wbMockClient).storageSvc = &wbMockStorage{
 		uploadFn: func(_ context.Context, _, _, _, filename string, body io.Reader) (string, error) {
 			_, _ = io.Copy(io.Discard, body)
@@ -357,9 +353,9 @@ func TestHandleCreateStemcell_LightFetch_HappyPath(t *testing.T) {
 
 // TestHandleCreateStemcell_LightFetch_DedupBySHA verifies that when the exact
 // SHA-matched filename already exists on storage, no upload occurs and the
-// existing CID is returned. NOT parallel — mutates package-level
-// fetchResolverOverride which is shared with sibling tests.
+// existing CID is returned.
 func TestHandleCreateStemcell_LightFetch_DedupBySHA(t *testing.T) {
+	t.Parallel()
 
 	body := []byte("FAKE STEMCELL QCOW2 BYTES FOR DEDUP")
 	sum := sha256.Sum256(body)
@@ -368,15 +364,13 @@ func TestHandleCreateStemcell_LightFetch_DedupBySHA(t *testing.T) {
 	existingFilename := "bosh-stemcell-ubuntu-jammy-1.999-" + sha8 + ".qcow2"
 	wantCID := "light:nfs:import/" + existingFilename
 
-	fetchResolverOverride = func(rawURL string) (stemcellfetch.Source, stemcellfetch.Reference, error) {
+	var uploadCalled bool
+	deps := wbBuildFetchDeps(t, wbExistingVolumeListFn("nfs", existingFilename))
+	deps.FetchResolver = func(rawURL string) (stemcellfetch.Source, stemcellfetch.Reference, error) {
 		return &mockSource{body: body, contentLength: int64(len(body))},
 			stemcellfetch.Reference{Scheme: "https", URL: rawURL},
 			nil
 	}
-	t.Cleanup(func() { fetchResolverOverride = nil })
-
-	var uploadCalled bool
-	deps := wbBuildFetchDeps(t, wbExistingVolumeListFn("nfs", existingFilename))
 	deps.PVE.(*wbMockClient).storageSvc = &wbMockStorage{
 		uploadFn: func(_ context.Context, _, _, _, _ string, body io.Reader) (string, error) {
 			_, _ = io.Copy(io.Discard, body)

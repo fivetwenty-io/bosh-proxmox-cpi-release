@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/agent"
+	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
@@ -77,70 +78,17 @@ func HandleAttachDisk(deps Deps) Handler {
 		// --------------------------------------------------------------------
 		// 1. Unmarshal and validate arguments.
 		// --------------------------------------------------------------------
-		if len(args) < 2 {
-			return nil, cpierrors.Cloud("attach_disk: expected 2 arguments (vm_cid, disk_cid), got %d", len(args))
-		}
-
-		var vmCID string
-		if err := json.Unmarshal(args[0], &vmCID); err != nil {
-			return nil, cpierrors.Wrap(err, "attach_disk: args[0] vm_cid must be a string")
-		}
-		if vmCID == "" {
-			return nil, cpierrors.Cloud("attach_disk: args[0] vm_cid must not be empty")
-		}
-
-		var diskCID string
-		if err := json.Unmarshal(args[1], &diskCID); err != nil {
-			return nil, cpierrors.Wrap(err, "attach_disk: args[1] disk_cid must be a string")
-		}
-		if diskCID == "" {
-			return nil, cpierrors.Cloud("attach_disk: args[1] disk_cid must not be empty")
+		vmCID, diskCID, err := attachDiskParseArgs(args)
+		if err != nil {
+			return nil, err
 		}
 
 		// --------------------------------------------------------------------
 		// 2. Parse vm_cid → VMID; parse disk_cid → storage + volid.
 		// --------------------------------------------------------------------
-		vmid, err := strconv.Atoi(vmCID)
-		if err != nil || vmid <= 0 {
-			return nil, cpierrors.VMNotFound(vmCID)
-		}
-
-		storage, _, err := pve.ParseDiskCID(diskCID)
+		node, vmid, err := attachDiskResolveNode(ctx, deps, vmCID, diskCID)
 		if err != nil {
-			return nil, cpierrors.DiskNotFound(diskCID)
-		}
-
-		// Resolve disk's owning node via the backend abstraction. For shared
-		// backends this is the configured default; for local backends a
-		// cluster scan locates the node that holds the volume. attach_disk
-		// then runs the QEMU config PUT against that node. PVE's storage
-		// content endpoint wants the canonical "<storage>:<volname>" form,
-		// which is the disk_cid as-is.
-		backend, err := backendResolverOrDefault(deps).Resolve(ctx, storage)
-		if err != nil {
-			return nil, cpierrors.Wrap(err, fmt.Sprintf("attach_disk: backend resolution failed for storage %q", storage))
-		}
-		node, err := backend.NodeForExisting(ctx, diskCID)
-		if err != nil {
-			if pve.IsNotFound(err) {
-				return nil, cpierrors.DiskNotFound(diskCID)
-			}
-			return nil, cpierrors.Wrap(err, "attach_disk: node lookup failed")
-		}
-
-		// For local backends, the disk and VM MUST live on the same node — the
-		// SDK call would otherwise PUT a config update on a node that cannot
-		// see the volume, producing a confusing storage error. Verify
-		// co-location explicitly and surface a clear message when violated.
-		if backend.Kind() == pve.BackendLocal {
-			if vmNode, found, lookupErr := pve.FindVMNodeViaCluster(ctx, deps.PVE, vmid); lookupErr != nil {
-				return nil, cpierrors.Wrap(lookupErr, fmt.Sprintf("attach_disk: lookup VM %s node failed", vmCID))
-			} else if found && vmNode != "" && vmNode != node {
-				return nil, cpierrors.Cloud(
-					"attach_disk: local-backend disk %s lives on node %s but VM %s runs on node %s — local-storage disks cannot cross nodes",
-					diskCID, node, vmCID, vmNode,
-				)
-			}
+			return nil, err
 		}
 
 		// --------------------------------------------------------------------
@@ -158,33 +106,8 @@ func HandleAttachDisk(deps Deps) Handler {
 		//   Snapshots present + AllowDiskOpsWithSnapshots=true  → WARN + proceed
 		//   No snapshots                                        → proceed normally
 		// --------------------------------------------------------------------
-		if snapNames, snapErr := pve.HasSnapshots(ctx, deps.PVE, node, vmid); snapErr != nil {
-			if deps.Config.RequireSnapshotCheckPass {
-				return nil, cpierrors.Wrap(snapErr,
-					"attach_disk: snapshot pre-flight check failed and require_snapshot_check_pass is set",
-				)
-			}
-			deps.Logger.Warn("attach_disk: snapshot pre-flight check failed — proceeding (fail-open)",
-				log.String("node", node),
-				log.Int("vmid", vmid),
-				log.Err(snapErr),
-			)
-		} else if len(snapNames) > 0 {
-			if deps.Config.AllowDiskOpsWithSnapshots {
-				deps.Logger.Warn("attach_disk: proceeding despite snapshots (allow_disk_ops_with_snapshots=true)",
-					log.String("vm_cid", vmCID),
-					log.String("node", node),
-					log.String("snapshots", strings.Join(snapNames, ", ")),
-				)
-			} else {
-				return nil, cpierrors.Cloud(
-					"attach_disk: VM %s (node %s) has %d snapshot(s) [%s]: attaching a persistent disk while"+
-						" snapshots exist makes the disk invisible in all prior snapshot rollbacks."+
-						" Delete all snapshots before attaching persistent disks, or set"+
-						" pve.allow_disk_ops_with_snapshots=true in CPI config to bypass this guard.",
-					vmCID, node, len(snapNames), strings.Join(snapNames, ", "),
-				)
-			}
+		if err := attachDiskSnapshotGuard(ctx, deps, vmCID, node, vmid, deps.Config, deps.Logger); err != nil {
+			return nil, err
 		}
 
 		// --------------------------------------------------------------------
@@ -240,61 +163,26 @@ func HandleAttachDisk(deps Deps) Handler {
 		}
 
 		// --------------------------------------------------------------------
-		// 6. Confirm attachment by resolving diskID from current VM config.
-		//    This guards against edge cases where AttachDisk returns stale data.
+		// 6+7. Confirm attachment (resolve diskID) and derive device path.
 		// --------------------------------------------------------------------
-		resolvedDiskID, err := pve.ResolveDiskID(ctx, deps.PVE, node, vmid, diskCID)
+		devicePath, err := attachDiskConfirmAndPath(ctx, deps, vmCID, node, vmid, diskCID, diskID, deps.Logger)
 		if err != nil {
-			// ResolveDiskID failure after a successful AttachDisk is unexpected.
-			// Use the diskID returned by AttachDisk as fallback; log the anomaly.
-			deps.Logger.Warn("attach_disk: ResolveDiskID failed after successful attach; using diskID from AttachDisk",
-				log.String("vm_cid", vmCID),
-				log.String("disk_cid", diskCID),
-				log.String("fallback_disk_id", diskID),
-				log.Err(err),
-			)
-			resolvedDiskID = diskID
-		}
-
-		// --------------------------------------------------------------------
-		// 7. Derive device path from diskID.
-		//
-		// We use a PVE-stable by-id symlink rather than a "/dev/sd<X>" hint
-		// because BOSH agent's mappedDevicePathResolver substitutes /dev/sd
-		// prefixes with /dev/vd before falling back to /dev/sd (see
-		// infrastructure/devicepathresolver/mapped_device_path_resolver.go).
-		// A virtio root disk (/dev/vda) on this VM makes "/dev/sda" resolve
-		// to the root disk; the agent then runs persistent-disk partitioning
-		// against /dev/vda and fails with
-		//     "Persistent disks with many partitions are not supported.
-		//      Expected 1, got 4."
-		//
-		// PVE configures virtio-scsi-pci disks with QEMU disk serial
-		// "drive-scsi<N>" (where N is the slot index), and udev creates the
-		// symlink "/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_drive-scsi<N>"
-		// pointing to whatever /dev/sd<X> letter the guest kernel assigned.
-		// Because this path does not start with "/dev/sd", the agent's
-		// resolver skips its substitution table, follows the symlink, and
-		// returns the correct device.
-		// --------------------------------------------------------------------
-		devicePath, devErr := devicePathByID(resolvedDiskID)
-		if devErr != nil {
-			return nil, cpierrors.Wrap(devErr, fmt.Sprintf("attach_disk: cannot compute device path for diskID %q", resolvedDiskID))
+			return nil, err
 		}
 
 		// --------------------------------------------------------------------
 		// 8. Update agent disk hints (no-op for cloudinit/noagent modes).
 		// --------------------------------------------------------------------
-		if err := deps.Agent.UpdateDiskHints(ctx, vmid, []agent.DiskHint{
+		if err := attachDiskUpdateHints(ctx, deps, vmCID, diskCID, vmid, []agent.DiskHint{
 			{DiskCID: diskCID, DevicePath: devicePath},
-		}); err != nil {
-			return nil, cpierrors.Wrap(err, fmt.Sprintf("attach_disk: UpdateDiskHints failed for VM %s disk %s", vmCID, diskCID))
+		}, deps.Logger); err != nil {
+			return nil, err
 		}
 
 		deps.Logger.Info("attach_disk",
 			log.String("vm_cid", vmCID),
 			log.String("disk_cid", diskCID),
-			log.String("disk_id", resolvedDiskID),
+			log.String("disk_id", diskID),
 			log.String("device_path", devicePath),
 		)
 
@@ -303,6 +191,210 @@ func HandleAttachDisk(deps Deps) Handler {
 		// --------------------------------------------------------------------
 		return diskHints{Path: devicePath}, nil
 	})
+}
+
+// attachDiskParseArgs unmarshals and validates the two positional attach_disk
+// arguments. Returns (vmCID, diskCID, err).
+//
+// Failures:
+//   - len(args) < 2           → Cloud error (missing args)
+//   - args[0] not a JSON string → Wrap error
+//   - vmCID == ""             → Cloud error
+//   - args[1] not a JSON string → Wrap error
+//   - diskCID == ""           → Cloud error
+func attachDiskParseArgs(args []json.RawMessage) (vmCID, diskCID string, err error) {
+	if len(args) < 2 {
+		return "", "", cpierrors.Cloud("attach_disk: expected 2 arguments (vm_cid, disk_cid), got %d", len(args))
+	}
+
+	if err := json.Unmarshal(args[0], &vmCID); err != nil {
+		return "", "", cpierrors.Wrap(err, "attach_disk: args[0] vm_cid must be a string")
+	}
+	if vmCID == "" {
+		return "", "", cpierrors.Cloud("attach_disk: args[0] vm_cid must not be empty")
+	}
+
+	if err := json.Unmarshal(args[1], &diskCID); err != nil {
+		return "", "", cpierrors.Wrap(err, "attach_disk: args[1] disk_cid must be a string")
+	}
+	if diskCID == "" {
+		return "", "", cpierrors.Cloud("attach_disk: args[1] disk_cid must not be empty")
+	}
+
+	return vmCID, diskCID, nil
+}
+
+// attachDiskResolveNode parses vmCID to a VMID, parses diskCID to its storage
+// component, resolves the storage backend, and determines which cluster node
+// holds the disk. For local backends it also verifies VM/disk co-location.
+//
+// Returns (node, vmid, err).
+//
+// Failures:
+//   - vmCID not a positive integer        → VMNotFound
+//   - diskCID not in "<storage>:<volid>"  → DiskNotFound
+//   - backend resolution error            → Wrap(Cloud)
+//   - NodeForExisting: not-found          → DiskNotFound
+//   - NodeForExisting: other error        → Wrap
+//   - local backend + node mismatch       → Cloud error
+func attachDiskResolveNode(ctx context.Context, deps Deps, vmCID, diskCID string) (node string, vmid int, err error) {
+	vmid, err = strconv.Atoi(vmCID)
+	if err != nil || vmid <= 0 {
+		return "", 0, cpierrors.VMNotFound(vmCID)
+	}
+
+	storage, _, err := pve.ParseDiskCID(diskCID)
+	if err != nil {
+		return "", 0, cpierrors.DiskNotFound(diskCID)
+	}
+
+	// Resolve disk's owning node via the backend abstraction. For shared
+	// backends this is the configured default; for local backends a
+	// cluster scan locates the node that holds the volume. attach_disk
+	// then runs the QEMU config PUT against that node. PVE's storage
+	// content endpoint wants the canonical "<storage>:<volname>" form,
+	// which is the disk_cid as-is.
+	backend, err := backendResolverOrDefault(deps).Resolve(ctx, storage)
+	if err != nil {
+		return "", 0, cpierrors.Wrap(err, fmt.Sprintf("attach_disk: backend resolution failed for storage %q", storage))
+	}
+	node, err = backend.NodeForExisting(ctx, diskCID)
+	if err != nil {
+		if pve.IsNotFound(err) {
+			return "", 0, cpierrors.DiskNotFound(diskCID)
+		}
+		return "", 0, cpierrors.Wrap(err, "attach_disk: node lookup failed")
+	}
+
+	// For local backends, the disk and VM MUST live on the same node — the
+	// SDK call would otherwise PUT a config update on a node that cannot
+	// see the volume, producing a confusing storage error. Verify
+	// co-location explicitly and surface a clear message when violated.
+	if backend.Kind() == pve.BackendLocal {
+		if vmNode, found, lookupErr := pve.FindVMNodeViaCluster(ctx, deps.PVE, vmid); lookupErr != nil {
+			return "", 0, cpierrors.Wrap(lookupErr, fmt.Sprintf("attach_disk: lookup VM %s node failed", vmCID))
+		} else if found && vmNode != "" && vmNode != node {
+			return "", 0, cpierrors.Cloud(
+				"attach_disk: local-backend disk %s lives on node %s but VM %s runs on node %s — local-storage disks cannot cross nodes",
+				diskCID, node, vmCID, vmNode,
+			)
+		}
+	}
+
+	return node, vmid, nil
+}
+
+// attachDiskSnapshotGuard runs the snapshot pre-flight check. See the policy
+// comment in HandleAttachDisk step 3 for full semantics.
+//
+// Failures:
+//   - HasSnapshots error + cfg.RequireSnapshotCheckPass  → Wrap error (fail-closed)
+//   - HasSnapshots error + !cfg.RequireSnapshotCheckPass → nil (WARN + proceed)
+//   - snapshots present + !cfg.AllowDiskOpsWithSnapshots → Cloud error (hard fail)
+//   - snapshots present + cfg.AllowDiskOpsWithSnapshots  → nil (WARN + proceed)
+//   - no snapshots                                       → nil
+func attachDiskSnapshotGuard(ctx context.Context, deps Deps, vmCID, node string, vmid int, cfg *config.CPIConfig, logger *log.Logger) error {
+	snapNames, snapErr := pve.HasSnapshots(ctx, deps.PVE, node, vmid)
+	if snapErr != nil {
+		if cfg.RequireSnapshotCheckPass {
+			return cpierrors.Wrap(snapErr,
+				"attach_disk: snapshot pre-flight check failed and require_snapshot_check_pass is set",
+			)
+		}
+		logger.Warn("attach_disk: snapshot pre-flight check failed — proceeding (fail-open)",
+			log.String("node", node),
+			log.Int("vmid", vmid),
+			log.Err(snapErr),
+		)
+		return nil
+	}
+	if len(snapNames) > 0 {
+		if cfg.AllowDiskOpsWithSnapshots {
+			logger.Warn("attach_disk: proceeding despite snapshots (allow_disk_ops_with_snapshots=true)",
+				log.String("vm_cid", vmCID),
+				log.String("node", node),
+				log.String("snapshots", strings.Join(snapNames, ", ")),
+			)
+			return nil
+		}
+		return cpierrors.Cloud(
+			"attach_disk: VM %s (node %s) has %d snapshot(s) [%s]: attaching a persistent disk while"+
+				" snapshots exist makes the disk invisible in all prior snapshot rollbacks."+
+				" Delete all snapshots before attaching persistent disks, or set"+
+				" pve.allow_disk_ops_with_snapshots=true in CPI config to bypass this guard.",
+			vmCID, node, len(snapNames), strings.Join(snapNames, ", "),
+		)
+	}
+	return nil
+}
+
+// attachDiskConfirmAndPath resolves the canonical diskID from the current VM
+// config (step 6) then derives the PVE-stable device path (step 7).
+//
+// If ResolveDiskID fails after a successful AttachDisk, the function falls back
+// to the diskID returned by AttachDisk and logs a warning — the device path is
+// still valid because devicePathByID is a pure function of the slot index.
+//
+// Failures:
+//   - devicePathByID error (non-scsi diskID) → Wrap error
+func attachDiskConfirmAndPath(ctx context.Context, deps Deps, vmCID, node string, vmid int, diskCID, fallbackDiskID string, logger *log.Logger) (devicePath string, err error) {
+	// --------------------------------------------------------------------
+	// 6. Confirm attachment by resolving diskID from current VM config.
+	//    This guards against edge cases where AttachDisk returns stale data.
+	// --------------------------------------------------------------------
+	resolvedDiskID, resolveErr := pve.ResolveDiskID(ctx, deps.PVE, node, vmid, diskCID)
+	if resolveErr != nil {
+		// ResolveDiskID failure after a successful AttachDisk is unexpected.
+		// Use the diskID returned by AttachDisk as fallback; log the anomaly.
+		logger.Warn("attach_disk: ResolveDiskID failed after successful attach; using diskID from AttachDisk",
+			log.String("vm_cid", vmCID),
+			log.String("disk_cid", diskCID),
+			log.String("fallback_disk_id", fallbackDiskID),
+			log.Err(resolveErr),
+		)
+		resolvedDiskID = fallbackDiskID
+	}
+
+	// --------------------------------------------------------------------
+	// 7. Derive device path from diskID.
+	//
+	// We use a PVE-stable by-id symlink rather than a "/dev/sd<X>" hint
+	// because BOSH agent's mappedDevicePathResolver substitutes /dev/sd
+	// prefixes with /dev/vd before falling back to /dev/sd (see
+	// infrastructure/devicepathresolver/mapped_device_path_resolver.go).
+	// A virtio root disk (/dev/vda) on this VM makes "/dev/sda" resolve
+	// to the root disk; the agent then runs persistent-disk partitioning
+	// against /dev/vda and fails with
+	//     "Persistent disks with many partitions are not supported.
+	//      Expected 1, got 4."
+	//
+	// PVE configures virtio-scsi-pci disks with QEMU disk serial
+	// "drive-scsi<N>" (where N is the slot index), and udev creates the
+	// symlink "/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_drive-scsi<N>"
+	// pointing to whatever /dev/sd<X> letter the guest kernel assigned.
+	// Because this path does not start with "/dev/sd", the agent's
+	// resolver skips its substitution table, follows the symlink, and
+	// returns the correct device.
+	// --------------------------------------------------------------------
+	devicePath, devErr := devicePathByID(resolvedDiskID)
+	if devErr != nil {
+		return "", cpierrors.Wrap(devErr, fmt.Sprintf("attach_disk: cannot compute device path for diskID %q", resolvedDiskID))
+	}
+
+	return devicePath, nil
+}
+
+// attachDiskUpdateHints calls agent.UpdateDiskHints and wraps any error with
+// context. No-op for cloudinit and noagent modes (the Agent implementation
+// itself is a no-op for those modes).
+//
+// Failures:
+//   - agent.UpdateDiskHints error → Wrap error
+func attachDiskUpdateHints(ctx context.Context, deps Deps, vmCID, diskCID string, vmid int, hints []agent.DiskHint, _ *log.Logger) error {
+	if err := deps.Agent.UpdateDiskHints(ctx, vmid, hints); err != nil {
+		return cpierrors.Wrap(err, fmt.Sprintf("attach_disk: UpdateDiskHints failed for VM %s disk %s", vmCID, diskCID))
+	}
+	return nil
 }
 
 // chooseSCSISlotSkippingZero returns the diskID the persistent disk should be

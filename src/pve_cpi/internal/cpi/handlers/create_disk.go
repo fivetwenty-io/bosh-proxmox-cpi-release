@@ -48,6 +48,7 @@ type createDiskCloudProperties struct {
 // shared storage (e.g. ceph-rbd, NFS) is cluster-visible; local storage
 // requires the disk and its VM to reside on the same node. Operators using
 // local storage must ensure vm_cid and the new disk share the same node.
+// nolint:gocognit // Orchestration shell: parse args, attemptCreateVolume retry loop, deferred rollbackCreatedVolume. The retry+rollback wiring lives in extracted helpers; the closure carries the orchestration glue.
 func HandleCreateDisk(deps Deps) Handler {
 	return HandlerFunc(func(ctx context.Context, args []json.RawMessage, _ jsonrpc.Context) (any, error) {
 		// ----------------------------------------------------------------
@@ -97,7 +98,7 @@ func HandleCreateDisk(deps Deps) Handler {
 			format = cloudProps.DiskFormat
 		}
 		if format == "" {
-			format = "qcow2"
+			format = diskFormatQCOW2
 		}
 
 		backend, err := backendResolverOrDefault(deps).Resolve(ctx, storage)
@@ -142,82 +143,13 @@ func HandleCreateDisk(deps Deps) Handler {
 		// ----------------------------------------------------------------
 		// 4. Allocate a synthetic disk VMID + create the volume.
 		//
-		// AllocateDiskWithRetry re-runs NextDiskVMID(node, storage) every
+		// attemptCreateVolume re-runs NextDiskVMID(node, storage) every
 		// attempt so the storage scan picks up orphan volumes from prior
 		// failed iterations. On non-conflict CreateVolume failures the
 		// callback removes any partially-committed volume before propagating.
 		// ----------------------------------------------------------------
-		var (
-			namingVMID     int
-			volid          string
-			canonicalVolID string
-		)
-
-		namingVMID, err = pve.AllocateDiskWithRetry(ctx, deps.PVE, node, storage,
-			func(candidate int) error {
-				volName := fmt.Sprintf("vm-%d-disk-0", candidate)
-				candidateCanonical := fmt.Sprintf("%s:%s", storage, volName)
-
-				var v string
-				cerr := pve.RetryOnTransientOrLock(ctx, deps.Logger, "create_disk", lockAttempts, func() error {
-					var innerErr error
-					v, innerErr = deps.PVE.Storage().CreateVolume(
-						ctx, node, storage, sizeGiB, formatArg, candidate, volName,
-					)
-					return innerErr
-				})
-				if cerr != nil {
-					if pve.IsVMIDConflict(cerr) {
-						// Pure conflict (volume name already taken at storage
-						// level). No partial commit possible; let the helper
-						// pick a new VMID.
-						deps.Logger.Info("create_disk: vmid conflict, retrying",
-							log.Int("vmid_attempted", candidate),
-							log.String("storage", storage),
-						)
-						return cerr
-					}
-					// Non-conflict CreateVolume failure: PVE may have
-					// partially committed the volume (network drop mid-task,
-					// storage daemon timeout). Best-effort: remove it before
-					// propagating so retries (which won't run) and operator
-					// re-runs see a clean slate.
-					rollbackCtx := contextWithoutCancel(ctx)
-					if exists, exErr := deps.PVE.Storage().Exists(rollbackCtx, node, storage, candidateCanonical); exErr == nil && exists {
-						upid, delErr := deps.PVE.Storage().DeleteVolumeAsync(rollbackCtx, node, storage, candidateCanonical)
-						switch {
-						case delErr != nil:
-							deps.Logger.Warn("create_disk: orphan volume cleanup after CreateVolume error failed",
-								log.String("volid", candidateCanonical),
-								log.Err(delErr),
-							)
-						case upid != "":
-							if werr := pve.AwaitTaskWithLogger(rollbackCtx, deps.PVE, node, upid, deps.Logger); werr != nil {
-								deps.Logger.Warn("create_disk: orphan volume cleanup await failed",
-									log.String("volid", candidateCanonical),
-									log.String("upid", upid),
-									log.Err(werr),
-								)
-							} else {
-								deps.Logger.Info("create_disk: removed orphan volume after CreateVolume error",
-									log.String("volid", candidateCanonical),
-								)
-							}
-						default:
-							deps.Logger.Info("create_disk: removed orphan volume after CreateVolume error",
-								log.String("volid", candidateCanonical),
-							)
-						}
-					}
-					return cerr
-				}
-
-				volid = v
-				canonicalVolID = candidateCanonical
-				return nil
-			},
-			pve.IsVMIDConflict,
-			maxAttempts,
+		namingVMID, diskCID, canonicalVolID, err := attemptCreateVolume(
+			ctx, deps, node, storage, sizeGiB, formatArg, lockAttempts, maxAttempts,
 		)
 		if err != nil {
 			return nil, cpierrors.Wrap(err, "create_disk: CreateVolume failed on node "+node+" storage "+storage)
@@ -231,40 +163,9 @@ func HandleCreateDisk(deps Deps) Handler {
 			if success {
 				return
 			}
-			rollbackCtx := contextWithoutCancel(ctx)
-			upid, delErr := deps.PVE.Storage().DeleteVolumeAsync(rollbackCtx, node, storage, canonicalVolID)
-			if delErr != nil {
-				deps.Logger.Warn("create_disk: rollback DeleteVolume failed",
-					log.String("volid", canonicalVolID),
-					log.Err(delErr),
-				)
-				return
-			}
-			if upid != "" {
-				if werr := pve.AwaitTaskWithLogger(rollbackCtx, deps.PVE, node, upid, deps.Logger); werr != nil {
-					deps.Logger.Warn("create_disk: rollback DeleteVolume await failed",
-						log.String("volid", canonicalVolID),
-						log.String("upid", upid),
-						log.Err(werr),
-					)
-					return
-				}
-			}
-			deps.Logger.Info("create_disk: rolled back created volume after failure",
-				log.String("volid", canonicalVolID),
-			)
+			rollbackCreatedVolume(ctx, deps, node, storage, canonicalVolID, deps.Logger)
 		}()
 
-		// PVE returns the full volid in canonical "storage:name" form
-		// ("local-lvm:vm-9001-disk-0") or an empty string when it echoes
-		// the filename. Use the canonical form when empty so the disk_cid
-		// is always well-formed. The volid is already a valid disk CID;
-		// re-prefixing with storage would double it (e.g. "data:data:...").
-		if volid == "" {
-			volid = canonicalVolID
-		}
-
-		diskCID := volid
 		deps.Logger.Info("create_disk",
 			log.String("disk_cid", diskCID),
 			log.Int("size_mb", sizeMB),
@@ -307,6 +208,141 @@ func HandleCreateDisk(deps Deps) Handler {
 		success = true
 		return diskCID, nil
 	})
+}
+
+// attemptCreateVolume allocates a synthetic disk VMID and calls CreateVolume,
+// retrying on VMID conflicts up to maxAttempts times. On a non-conflict
+// CreateVolume failure it performs best-effort orphan cleanup before returning.
+//
+// Returns:
+//   - namingVMID: the VMID allocated by AllocateDiskWithRetry (for logging)
+//   - diskCID: the volid to use as the BOSH disk CID; equals the PVE-returned
+//     volid when non-empty, otherwise falls back to the constructed canonical form
+//   - canonicalVolID: the constructed "storage:name" form, used for rollback
+//   - err: non-nil when all attempts fail
+func attemptCreateVolume(
+	ctx context.Context,
+	deps Deps,
+	node, storage string,
+	sizeGiB int,
+	formatArg string,
+	lockAttempts, maxAttempts int,
+) (namingVMID int, diskCID, canonicalVolID string, err error) {
+	var volid string
+
+	namingVMID, err = pve.AllocateDiskWithRetry(ctx, deps.PVE, node, storage,
+		func(candidate int) error {
+			volName := fmt.Sprintf("vm-%d-disk-0", candidate)
+			candidateCanonical := fmt.Sprintf("%s:%s", storage, volName)
+
+			var v string
+			cerr := pve.RetryOnTransientOrLock(ctx, deps.Logger, "create_disk", lockAttempts, func() error {
+				var innerErr error
+				v, innerErr = deps.PVE.Storage().CreateVolume(
+					ctx, node, storage, sizeGiB, formatArg, candidate, volName,
+				)
+				return innerErr
+			})
+			if cerr != nil {
+				if pve.IsVMIDConflict(cerr) {
+					// Pure conflict (volume name already taken at storage
+					// level). No partial commit possible; let the helper
+					// pick a new VMID.
+					deps.Logger.Info("create_disk: vmid conflict, retrying",
+						log.Int("vmid_attempted", candidate),
+						log.String("storage", storage),
+					)
+					return cerr
+				}
+				// Non-conflict CreateVolume failure: PVE may have
+				// partially committed the volume (network drop mid-task,
+				// storage daemon timeout). Best-effort: remove it before
+				// propagating so retries (which won't run) and operator
+				// re-runs see a clean slate.
+				rollbackCtx := contextWithoutCancel(ctx)
+				if exists, exErr := deps.PVE.Storage().Exists(rollbackCtx, node, storage, candidateCanonical); exErr == nil && exists {
+					upid, delErr := deps.PVE.Storage().DeleteVolumeAsync(rollbackCtx, node, storage, candidateCanonical)
+					switch {
+					case delErr != nil:
+						deps.Logger.Warn("create_disk: orphan volume cleanup after CreateVolume error failed",
+							log.String("volid", candidateCanonical),
+							log.Err(delErr),
+						)
+					case upid != "":
+						if werr := pve.AwaitTaskWithLogger(rollbackCtx, deps.PVE, node, upid, deps.Logger); werr != nil {
+							deps.Logger.Warn("create_disk: orphan volume cleanup await failed",
+								log.String("volid", candidateCanonical),
+								log.String("upid", upid),
+								log.Err(werr),
+							)
+						} else {
+							deps.Logger.Info("create_disk: removed orphan volume after CreateVolume error",
+								log.String("volid", candidateCanonical),
+							)
+						}
+					default:
+						deps.Logger.Info("create_disk: removed orphan volume after CreateVolume error",
+							log.String("volid", candidateCanonical),
+						)
+					}
+				}
+				return cerr
+			}
+
+			volid = v
+			canonicalVolID = candidateCanonical
+			return nil
+		},
+		pve.IsVMIDConflict,
+		maxAttempts,
+	)
+	if err != nil {
+		return 0, "", "", err
+	}
+
+	// PVE returns the full volid in canonical "storage:name" form
+	// ("local-lvm:vm-9001-disk-0") or an empty string when it echoes the
+	// filename. Use the canonical form when empty so the disk_cid is always
+	// well-formed. The volid is already a valid disk CID; re-prefixing with
+	// storage would double it (e.g. "data:data:...").
+	diskCID = volid
+	if diskCID == "" {
+		diskCID = canonicalVolID
+	}
+	return namingVMID, diskCID, canonicalVolID, nil
+}
+
+// rollbackCreatedVolume best-effort deletes a successfully created volume when
+// a subsequent step in create_disk fails. Uses contextWithoutCancel so cleanup
+// completes even if the caller cancelled the request. Logs errors; never panics.
+func rollbackCreatedVolume(
+	ctx context.Context,
+	deps Deps,
+	node, storage, canonicalVolID string,
+	logger *log.Logger,
+) {
+	rollbackCtx := contextWithoutCancel(ctx)
+	upid, delErr := deps.PVE.Storage().DeleteVolumeAsync(rollbackCtx, node, storage, canonicalVolID)
+	if delErr != nil {
+		logger.Warn("create_disk: rollback DeleteVolume failed",
+			log.String("volid", canonicalVolID),
+			log.Err(delErr),
+		)
+		return
+	}
+	if upid != "" {
+		if werr := pve.AwaitTaskWithLogger(rollbackCtx, deps.PVE, node, upid, logger); werr != nil {
+			logger.Warn("create_disk: rollback DeleteVolume await failed",
+				log.String("volid", canonicalVolID),
+				log.String("upid", upid),
+				log.Err(werr),
+			)
+			return
+		}
+	}
+	logger.Info("create_disk: rolled back created volume after failure",
+		log.String("volid", canonicalVolID),
+	)
 }
 
 // contextWithoutCancel returns a context derived from parent that carries
