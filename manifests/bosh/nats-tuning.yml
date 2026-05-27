@@ -24,6 +24,17 @@
 #
 # Usage: applied automatically by `scripts/bosh create-env`.
 # Takes effect on the next director redeploy.
+#
+# Known limitation: the bosh nats job (cloudfoundry/bosh/jobs/nats/spec)
+# does not expose `write_deadline` as a property — only ping_interval,
+# ping_max_outstanding, and max_payload_mb. During heavy deploy churn
+# (cf-deployment with 16+ instance groups) agents can still get RST'd
+# server-side when bosh-nats-sync triggers SIGHUP reloads in quick
+# succession and an agent's NATS handler is busy. Mitigations available
+# within stock knobs: keep ping window wide (this file), avoid
+# back-to-back recreates that churn auth.json. To raise write_deadline
+# would require forking the bosh release or templating nats.cfg out of
+# band — not done here.
 
 - type: replace
   path: /instance_groups/name=bosh/properties/nats/ping_interval?
