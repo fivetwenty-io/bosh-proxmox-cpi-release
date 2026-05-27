@@ -34,14 +34,14 @@ type hasDiskBackend struct {
 func (b *hasDiskBackend) Kind() pve.BackendKind { return pve.BackendLocal }
 
 func (b *hasDiskBackend) NodeForCreate(_ context.Context, _, _ string) (string, error) {
-	return "pve1", nil
+	return testNode, nil
 }
 
 func (b *hasDiskBackend) NodeForExisting(ctx context.Context, volume string) (string, error) {
 	if b.nodeForExistingFn != nil {
 		return b.nodeForExistingFn(ctx, volume)
 	}
-	return "pve1", nil
+	return testNode, nil
 }
 
 // hasDiskResolver wraps a fixed hasDiskBackend and satisfies pve.BackendResolver.
@@ -73,8 +73,8 @@ func baseDepsForHas(t *testing.T, storageSvc *mockStorageService) handlers.Deps 
 	t.Helper()
 	return handlers.Deps{
 		Config: &config.CPIConfig{
-			Node:        "pve1",
-			DiskStorage: "local-lvm",
+			Node:        testNode,
+			DiskStorage: storageName,
 		},
 		PVE:    newHandlerMockClient(storageSvc, nil),
 		Logger: log.NewNopLogger(),
@@ -89,10 +89,10 @@ func TestHandleHasDisk_Exists(t *testing.T) {
 	t.Parallel()
 	storageSvc := &mockStorageService{
 		existsFn: func(_ context.Context, node, storage, volume string) (bool, error) {
-			if node != "pve1" {
+			if node != testNode {
 				t.Errorf("unexpected node %q", node)
 			}
-			if storage != "local-lvm" {
+			if storage != storageName {
 				t.Errorf("unexpected storage %q", storage)
 			}
 			if volume != "local-lvm:vm-9001-disk-0" {
@@ -244,7 +244,7 @@ func TestHandleHasDisk_MissingNode(t *testing.T) {
 	deps := handlers.Deps{
 		Config: &config.CPIConfig{
 			Node:        "",
-			DiskStorage: "local-lvm",
+			DiskStorage: storageName,
 		},
 		PVE:    newHandlerMockClient(storageSvc, nil),
 		Logger: log.NewNopLogger(),
@@ -315,8 +315,8 @@ func TestHandleHasDisk_NodeForExistingDiskNotFound(t *testing.T) {
 	}
 	deps := handlers.Deps{
 		Config: &config.CPIConfig{
-			Node:        "pve1",
-			DiskStorage: "local-lvm",
+			Node:        testNode,
+			DiskStorage: storageName,
 		},
 		PVE:      newHandlerMockClient(storageSvc, nil),
 		Logger:   log.NewNopLogger(),
@@ -360,8 +360,8 @@ func TestHandleHasDisk_NodeForExistingOtherError(t *testing.T) {
 	}
 	deps := handlers.Deps{
 		Config: &config.CPIConfig{
-			Node:        "pve1",
-			DiskStorage: "local-lvm",
+			Node:        testNode,
+			DiskStorage: storageName,
 		},
 		PVE:      newHandlerMockClient(storageSvc, nil),
 		Logger:   log.NewNopLogger(),
@@ -393,8 +393,8 @@ func TestHandleHasDisk_BackendResolveError(t *testing.T) {
 	}
 	deps := handlers.Deps{
 		Config: &config.CPIConfig{
-			Node:        "pve1",
-			DiskStorage: "local-lvm",
+			Node:        testNode,
+			DiskStorage: storageName,
 		},
 		PVE:      newHandlerMockClient(storageSvc, nil),
 		Logger:   log.NewNopLogger(),
@@ -418,7 +418,7 @@ func TestHandleHasDisk_BackendResolveError(t *testing.T) {
 // after ParseDiskCID splits on the first colon. These tests confirm ParseDiskCID
 // handles each volume-string shape and that the rest of the handler path
 // completes successfully. All use the default static resolver (Resolver: nil)
-// so NodeForExisting returns "pve1" unconditionally and Storage.Exists is
+// so NodeForExisting returns testNode unconditionally and Storage.Exists is
 // the only controlled outcome.
 // ---------------------------------------------------------------------------
 
@@ -431,7 +431,7 @@ func TestHandleHasDisk_Dir_CID(t *testing.T) {
 
 	storageSvc := &mockStorageService{
 		existsFn: func(_ context.Context, node, storage, volume string) (bool, error) {
-			if node != "pve1" {
+			if node != testNode {
 				t.Errorf("unexpected node %q", node)
 			}
 			if storage != "local" {
@@ -471,7 +471,7 @@ func TestHandleHasDisk_ZFSPool_CID(t *testing.T) {
 
 	storageSvc := &mockStorageService{
 		existsFn: func(_ context.Context, node, storage, volume string) (bool, error) {
-			if node != "pve1" {
+			if node != testNode {
 				t.Errorf("unexpected node %q", node)
 			}
 			if storage != "local-zfs" {
@@ -511,7 +511,7 @@ func TestHandleHasDisk_LVMThin_CID(t *testing.T) {
 
 	storageSvc := &mockStorageService{
 		existsFn: func(_ context.Context, node, storage, volume string) (bool, error) {
-			if node != "pve1" {
+			if node != testNode {
 				t.Errorf("unexpected node %q", node)
 			}
 			if storage != "local-lvm-thin" {

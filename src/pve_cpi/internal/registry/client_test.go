@@ -14,13 +14,13 @@ import (
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/registry"
 )
 
-// testServer creates an httptest.Server and returns it together with its URL.
-// Callers must close the server after the test.
-func newTestClient(t *testing.T, handler http.HandlerFunc) (*registry.Client, *httptest.Server) {
+// newTestClient creates an httptest.Server with the given handler, registers cleanup,
+// and returns a registry.Client pointed at the server. Server is closed via t.Cleanup.
+func newTestClient(t *testing.T, handler http.HandlerFunc) *registry.Client {
 	t.Helper()
 	srv := httptest.NewServer(handler)
 	t.Cleanup(srv.Close)
-	return registry.NewClient(srv.URL, "user", "secret"), srv
+	return registry.NewClient(srv.URL, "user", "secret")
 }
 
 // --------------------------------------------------------------------------
@@ -36,7 +36,7 @@ func TestPut_Success(t *testing.T) {
 	var gotMethod, gotPath, gotAuth string
 	var gotEnvelope map[string]string
 
-	client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+	client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		gotMethod = r.Method
 		gotPath = r.URL.Path
 		gotAuth = r.Header.Get("Authorization")
@@ -79,7 +79,7 @@ func TestPut_Success(t *testing.T) {
 
 func TestPut_Non2xx(t *testing.T) {
 	t.Parallel()
-	client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+	client := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 	})
 
@@ -115,7 +115,7 @@ func TestGet_Success(t *testing.T) {
 	envelope := map[string]string{"settings": string(innerJSON)}
 	envBody, _ := json.Marshal(envelope)
 
-	client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+	client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "wrong method", http.StatusMethodNotAllowed)
 			return
@@ -141,7 +141,7 @@ func TestGet_Success(t *testing.T) {
 
 func TestGet_404(t *testing.T) {
 	t.Parallel()
-	client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+	client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 	})
 
@@ -159,7 +159,7 @@ func TestGet_404(t *testing.T) {
 
 func TestGet_Non2xx(t *testing.T) {
 	t.Parallel()
-	client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+	client := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
 	})
 
@@ -188,7 +188,7 @@ func TestGet_EmptyInstanceID(t *testing.T) {
 func TestDelete_Success(t *testing.T) {
 	t.Parallel()
 	var gotMethod, gotPath string
-	client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+	client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		gotMethod = r.Method
 		gotPath = r.URL.Path
 		w.WriteHeader(http.StatusOK)
@@ -207,7 +207,7 @@ func TestDelete_Success(t *testing.T) {
 
 func TestDelete_404(t *testing.T) {
 	t.Parallel()
-	client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+	client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 	})
 
@@ -219,7 +219,7 @@ func TestDelete_404(t *testing.T) {
 
 func TestDelete_500(t *testing.T) {
 	t.Parallel()
-	client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+	client := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "crash", http.StatusInternalServerError)
 	})
 
@@ -334,7 +334,7 @@ func TestContextCancellation(t *testing.T) {
 func TestPut_ContentTypeJSON(t *testing.T) {
 	t.Parallel()
 	var gotCT string
-	client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+	client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		gotCT = r.Header.Get("Content-Type")
 		w.WriteHeader(http.StatusOK)
 	})
@@ -354,7 +354,7 @@ func TestPut_ContentTypeJSON(t *testing.T) {
 func TestPut_RetriesOnTransient(t *testing.T) {
 	t.Parallel()
 	var callCount int
-	client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+	client := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
 		callCount++
 		if callCount == 1 {
 			http.Error(w, "service unavailable", http.StatusServiceUnavailable)
@@ -378,7 +378,7 @@ func TestPut_RetriesOnTransient(t *testing.T) {
 func TestPut_AllRetriesExhausted_5xx(t *testing.T) {
 	t.Parallel()
 	var callCount int
-	client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+	client := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
 		callCount++
 		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
 	})
@@ -396,7 +396,7 @@ func TestPut_AllRetriesExhausted_5xx(t *testing.T) {
 func TestPut_NoRetryOn4xx(t *testing.T) {
 	t.Parallel()
 	var callCount int
-	client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+	client := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
 		callCount++
 		http.Error(w, "bad request", http.StatusBadRequest)
 	})
@@ -419,7 +419,7 @@ func TestGet_RetriesOnTransient(t *testing.T) {
 	envBody, _ := json.Marshal(envelope)
 
 	var callCount int
-	client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+	client := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
 		callCount++
 		if callCount == 1 {
 			http.Error(w, "service unavailable", http.StatusServiceUnavailable)
@@ -446,7 +446,7 @@ func TestGet_RetriesOnTransient(t *testing.T) {
 func TestDelete_RetriesOnTransient(t *testing.T) {
 	t.Parallel()
 	var callCount int
-	client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+	client := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
 		callCount++
 		if callCount == 1 {
 			http.Error(w, "service unavailable", http.StatusServiceUnavailable)
@@ -471,7 +471,7 @@ func TestDelete_RetriesOnTransient(t *testing.T) {
 func TestPut_InstanceIDInPath(t *testing.T) {
 	t.Parallel()
 	var gotPath string
-	client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+	client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		gotPath = r.URL.Path
 		w.WriteHeader(http.StatusOK)
 	})
@@ -507,7 +507,7 @@ func TestPut_InstanceIDInPath(t *testing.T) {
 func TestPut_RetryExhaustion_BackoffWallClock(t *testing.T) {
 	t.Parallel()
 	var callCount int
-	client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+	client := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
 		callCount++
 		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
 	})
@@ -557,7 +557,7 @@ func TestReadAll_CappedAt1MiB(t *testing.T) {
 		body[i] = 'A'
 	}
 
-	client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+	client := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
 		w.WriteHeader(http.StatusOK)
@@ -578,7 +578,7 @@ func TestReadAll_CappedAt1MiB(t *testing.T) {
 	// error alone. Instead, exercise the err-status path where the body
 	// flows through ReadAll directly into the message, then bound the
 	// returned message length.
-	client2, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+	client2 := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
 		w.WriteHeader(http.StatusBadRequest)
 		_, _ = w.Write(body)

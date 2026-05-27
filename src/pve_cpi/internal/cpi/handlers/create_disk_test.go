@@ -48,8 +48,8 @@ func baseDepsForCreate(t *testing.T, storageSvc *mockStorageService, clusterVMID
 	t.Helper()
 	return handlers.Deps{
 		Config: &config.CPIConfig{
-			Node:         "pve1",
-			DiskStorage:  "local-lvm",
+			Node:         testNode,
+			DiskStorage:  storageName,
 			VMDiskFormat: "qcow2",
 		},
 		PVE:    newHandlerMockClient(storageSvc, clusterVMIDs),
@@ -74,10 +74,10 @@ func TestHandleCreateDisk_Happy(t *testing.T) {
 	t.Parallel()
 	storageSvc := &mockStorageService{
 		createVolumeFn: func(_ context.Context, node, storage string, sizeGiB int, format string, vmid int, name string) (string, error) {
-			if node != "pve1" {
+			if node != testNode {
 				t.Errorf("unexpected node %q", node)
 			}
-			if storage != "local-lvm" {
+			if storage != storageName {
 				t.Errorf("unexpected storage %q", storage)
 			}
 			if sizeGiB != 1 {
@@ -160,8 +160,8 @@ func TestHandleCreateDisk_DefaultStorage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if capturedStorage != "local-lvm" {
-		t.Errorf("expected default storage %q, got %q", "local-lvm", capturedStorage)
+	if capturedStorage != storageName {
+		t.Errorf("expected default storage %q, got %q", storageName, capturedStorage)
 	}
 }
 
@@ -503,7 +503,7 @@ func TestHandleCreateDisk_MissingNode(t *testing.T) {
 	deps := handlers.Deps{
 		Config: &config.CPIConfig{
 			Node:        "", // missing
-			DiskStorage: "local-lvm",
+			DiskStorage: storageName,
 		},
 		PVE:    newHandlerMockClient(storageSvc, nil),
 		Logger: log.NewNopLogger(),
@@ -542,7 +542,7 @@ func TestHandleCreateDisk_LVM_NoFormatArg(t *testing.T) {
 		},
 	}
 	deps := baseDepsForCreate(t, storageSvc, nil)
-	deps.Config.DiskStorage = "local-lvm"
+	deps.Config.DiskStorage = storageName
 
 	h := handlers.HandleCreateDisk(deps)
 	_, err := h.Handle(context.Background(), []json.RawMessage{
@@ -726,8 +726,8 @@ func TestHandleCreateDisk_AuthFailure(t *testing.T) {
 	}
 
 	// 401 is a 4xx non-404 → WrapError returns a non-retriable Cloud error.
-	cpiErr, ok := err.(*cpierrors.Error)
-	if !ok {
+	var cpiErr *cpierrors.Error
+	if !errors.As(err, &cpiErr) {
 		// The error may not be wrapped as a CPI error if the handler does not
 		// call WrapError on storage errors; surface the raw error for diagnosis.
 		t.Fatalf("expected *cpierrors.Error, got %T: %v", err, err)

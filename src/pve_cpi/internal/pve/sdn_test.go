@@ -685,7 +685,7 @@ func TestApplySDN_CallsUpdateSdnWithNilParams(t *testing.T) {
 		updateSdnFn: func(_ context.Context, p *sdkcluster.UpdateSdnParams) (*sdkcluster.UpdateSdnResponse, error) {
 			called = true
 			gotParams = p
-			rm := sdkcluster.UpdateSdnResponse(json.RawMessage(`"UPID:pve:00:..."`))
+			rm := sdkcluster.UpdateSdnResponse(`"UPID:pve:00:..."`)
 			return &rm, nil
 		},
 	}

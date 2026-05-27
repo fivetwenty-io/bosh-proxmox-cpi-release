@@ -28,7 +28,7 @@ func TestHandleDeleteVM_Happy(t *testing.T) {
 
 	qemuSvc := &mockQEMUService{
 		stopFn: func(_ context.Context, node string, vmid int) (string, error) {
-			if node != "pve-node1" || vmid != 101 {
+			if node != vmNode || vmid != 101 {
 				t.Errorf("Stop: unexpected node=%q vmid=%d", node, vmid)
 			}
 			stopCalled = true
@@ -41,7 +41,7 @@ func TestHandleDeleteVM_Happy(t *testing.T) {
 	}
 	nodesSvc := &mockNodesService{
 		deleteQemuFn: func(_ context.Context, node string, vmid string, params *nodes.DeleteQemuParams) (*nodes.DeleteQemuResponse, error) {
-			if node != "pve-node1" || vmid != "101" {
+			if node != vmNode || vmid != "101" {
 				t.Errorf("DeleteQemu: unexpected node=%q vmid=%q", node, vmid)
 			}
 			if params == nil || params.Purge == nil || !*params.Purge {
@@ -65,7 +65,7 @@ func TestHandleDeleteVM_Happy(t *testing.T) {
 	}
 	agentSvc := &mockAgentService{
 		removeFn: func(_ context.Context, node string, vmid int) error {
-			if node != "pve-node1" || vmid != 101 {
+			if node != vmNode || vmid != 101 {
 				t.Errorf("Remove: unexpected node=%q vmid=%d", node, vmid)
 			}
 			removeCalled = true
@@ -686,8 +686,8 @@ func TestHandleDeleteVM_AuthFailure(t *testing.T) {
 	}
 
 	// 401 is a 4xx non-404 → WrapError returns a non-retriable Cloud error.
-	cpiErr, ok := err.(*cpierrors.Error)
-	if !ok {
+	var cpiErr *cpierrors.Error
+	if !errors.As(err, &cpiErr) {
 		t.Fatalf("expected *cpierrors.Error, got %T: %v", err, err)
 	}
 	if cpiErr.OkToRetry() {

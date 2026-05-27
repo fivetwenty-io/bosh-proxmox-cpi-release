@@ -89,11 +89,11 @@ var _ qemu.Service = (*delSnapQEMUService)(nil)
 func delSnapDeps(qemuSvc qemu.Service) handlers.Deps {
 	return handlers.Deps{
 		Config: &config.CPIConfig{
-			Node: "pve1",
+			Node: testNode,
 		},
 		PVE: &mockPVEClient{
 			qemuSvc:    qemuSvc,
-			clusterSvc: defaultClusterSvc(100, "pve1"),
+			clusterSvc: defaultClusterSvc(100, testNode),
 		},
 		Logger: log.NewNopLogger(),
 	}

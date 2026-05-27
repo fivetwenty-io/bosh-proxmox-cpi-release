@@ -96,7 +96,7 @@ var _ qemu.Service = (*updateDiskQEMUService)(nil)
 func updateDiskDeps(qemuSvc qemu.Service, clusterSvc sdkclusterapi.Service, tasksSvc tasks.Service) handlers.Deps {
 	return handlers.Deps{
 		Config: &config.CPIConfig{
-			Node: "pve1",
+			Node: testNode,
 		},
 		PVE: &mockPVEClient{
 			qemuSvc:    qemuSvc,
@@ -108,10 +108,12 @@ func updateDiskDeps(qemuSvc qemu.Service, clusterSvc sdkclusterapi.Service, task
 }
 
 // updateClusterWith builds a cluster service reporting one VM.
+//
+//nolint:unparam // vmid kept for call-site clarity; always 100 in this suite
 func updateClusterWith(vmid int) sdkclusterapi.Service {
 	return &snapClusterService{
 		listFn: func(_ context.Context, _ *sdkclusterapi.ListResourcesParams) (*sdkclusterapi.ListResourcesResponse, error) {
-			return clusterRespWith(vmid, "pve1"), nil
+			return clusterRespWith(vmid, testNode), nil
 		},
 	}
 }
@@ -122,7 +124,7 @@ func updateClusterWith(vmid int) sdkclusterapi.Service {
 
 func TestHandleUpdateDisk_OptionsOnly(t *testing.T) {
 	t.Parallel()
-	const diskCID = "local-lvm:vm-9001-disk-0"
+
 	const volid = "local-lvm:vm-9001-disk-0"
 
 	var capturedOptStr string
@@ -135,16 +137,16 @@ func TestHandleUpdateDisk_OptionsOnly(t *testing.T) {
 		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
 			callCount++
 			if callCount <= 2 {
-				return map[string]any{"scsi2": volid}, nil
+				return map[string]any{diskSlot: volid}, nil
 			}
-			return map[string]any{"scsi2": volid + ",size=10G"}, nil
+			return map[string]any{diskSlot: volid + ",size=10G"}, nil
 		},
 		attachDiskFn: func(_ context.Context, _ string, _ int, optStr string, _ string, opts *qemu.AttachOpts) (string, error) {
 			capturedOptStr = optStr
-			if opts == nil || opts.DiskID != "scsi2" {
+			if opts == nil || opts.DiskID != diskSlot {
 				t.Errorf("expected AttachDisk with DiskID=scsi2, got %v", opts)
 			}
-			return "scsi2", nil
+			return diskSlot, nil
 		},
 	}
 
@@ -174,7 +176,7 @@ func TestHandleUpdateDisk_OptionsOnly(t *testing.T) {
 
 func TestHandleUpdateDisk_SizeOnly(t *testing.T) {
 	t.Parallel()
-	const diskCID = "local-lvm:vm-9001-disk-0"
+
 	const volid = "local-lvm:vm-9001-disk-0"
 
 	var capturedDelta int
@@ -186,9 +188,9 @@ func TestHandleUpdateDisk_SizeOnly(t *testing.T) {
 		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
 			callCount++
 			if callCount <= 2 {
-				return map[string]any{"scsi2": volid}, nil
+				return map[string]any{diskSlot: volid}, nil
 			}
-			return map[string]any{"scsi2": volid + ",size=10G"}, nil
+			return map[string]any{diskSlot: volid + ",size=10G"}, nil
 		},
 		resizeDiskFn: func(_ context.Context, _ string, _ int, _ string, deltaGiB int) (string, error) {
 			capturedDelta = deltaGiB
@@ -196,7 +198,7 @@ func TestHandleUpdateDisk_SizeOnly(t *testing.T) {
 		},
 		attachDiskFn: func(_ context.Context, _ string, _ int, _ string, _ string, _ *qemu.AttachOpts) (string, error) {
 			attachCalled = true
-			return "scsi2", nil
+			return diskSlot, nil
 		},
 	}
 
@@ -219,7 +221,7 @@ func TestHandleUpdateDisk_SizeOnly(t *testing.T) {
 
 func TestHandleUpdateDisk_CombinedSizeAndOptions(t *testing.T) {
 	t.Parallel()
-	const diskCID = "local-lvm:vm-9001-disk-0"
+
 	const volid = "local-lvm:vm-9001-disk-0"
 
 	var resizeCalled bool
@@ -230,9 +232,9 @@ func TestHandleUpdateDisk_CombinedSizeAndOptions(t *testing.T) {
 		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
 			callCount++
 			if callCount <= 2 {
-				return map[string]any{"scsi2": volid}, nil
+				return map[string]any{diskSlot: volid}, nil
 			}
-			return map[string]any{"scsi2": volid + ",size=10G"}, nil
+			return map[string]any{diskSlot: volid + ",size=10G"}, nil
 		},
 		resizeDiskFn: func(_ context.Context, _ string, _ int, _ string, _ int) (string, error) {
 			resizeCalled = true
@@ -240,7 +242,7 @@ func TestHandleUpdateDisk_CombinedSizeAndOptions(t *testing.T) {
 		},
 		attachDiskFn: func(_ context.Context, _ string, _ int, _ string, _ string, _ *qemu.AttachOpts) (string, error) {
 			attachCalled = true
-			return "scsi2", nil
+			return diskSlot, nil
 		},
 	}
 
@@ -263,18 +265,18 @@ func TestHandleUpdateDisk_CombinedSizeAndOptions(t *testing.T) {
 func TestHandleUpdateDisk_EmptySpec_NoOp(t *testing.T) {
 	t.Parallel()
 	// Empty spec → no resize, no AttachDisk.
-	const diskCID = "local-lvm:vm-9001-disk-0"
+
 	const volid = "local-lvm:vm-9001-disk-0"
 
 	var attachCalled bool
 
 	qemuSvc := &updateDiskQEMUService{
 		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
-			return map[string]any{"scsi2": volid}, nil
+			return map[string]any{diskSlot: volid}, nil
 		},
 		attachDiskFn: func(_ context.Context, _ string, _ int, _ string, _ string, _ *qemu.AttachOpts) (string, error) {
 			attachCalled = true
-			return "scsi2", nil
+			return diskSlot, nil
 		},
 	}
 
@@ -290,7 +292,6 @@ func TestHandleUpdateDisk_EmptySpec_NoOp(t *testing.T) {
 
 func TestHandleUpdateDisk_DetachedDisk(t *testing.T) {
 	t.Parallel()
-	const diskCID = "local-lvm:vm-9001-disk-0"
 
 	// Cluster has no VMs → disk is not attached.
 	emptyCluster := &snapClusterService{
@@ -319,7 +320,6 @@ func TestHandleUpdateDisk_DetachedDisk(t *testing.T) {
 // this as "detached disk"; the fix propagates it as a distinct wrapped error.
 func TestHandleUpdateDisk_FindVMTransportError(t *testing.T) {
 	t.Parallel()
-	const diskCID = "local-lvm:vm-9001-disk-0"
 
 	transportErr := errors.New("connection refused dialing cluster API")
 	// Cluster ListResources returns a transport-level error (not "disk not found").
@@ -347,7 +347,7 @@ func TestHandleUpdateDisk_FindVMTransportError(t *testing.T) {
 
 func TestHandleUpdateDisk_ShrinkRejected(t *testing.T) {
 	t.Parallel()
-	const diskCID = "local-lvm:vm-9001-disk-0"
+
 	const volid = "local-lvm:vm-9001-disk-0"
 
 	callCount := 0
@@ -355,9 +355,9 @@ func TestHandleUpdateDisk_ShrinkRejected(t *testing.T) {
 		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
 			callCount++
 			if callCount <= 2 {
-				return map[string]any{"scsi2": volid}, nil
+				return map[string]any{diskSlot: volid}, nil
 			}
-			return map[string]any{"scsi2": volid + ",size=20G"}, nil
+			return map[string]any{diskSlot: volid + ",size=20G"}, nil
 		},
 	}
 
@@ -392,7 +392,7 @@ func TestHandleUpdateDisk_TooFewArgs(t *testing.T) {
 
 func TestHandleUpdateDisk_IOThreadFalseRemovesOption(t *testing.T) {
 	t.Parallel()
-	const diskCID = "local-lvm:vm-9001-disk-0"
+
 	const volid = "local-lvm:vm-9001-disk-0"
 
 	var capturedOptStr string
@@ -402,13 +402,13 @@ func TestHandleUpdateDisk_IOThreadFalseRemovesOption(t *testing.T) {
 		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
 			callCount++
 			if callCount <= 2 {
-				return map[string]any{"scsi2": volid}, nil
+				return map[string]any{diskSlot: volid}, nil
 			}
-			return map[string]any{"scsi2": volid + ",iothread=1,size=10G"}, nil
+			return map[string]any{diskSlot: volid + ",iothread=1,size=10G"}, nil
 		},
 		attachDiskFn: func(_ context.Context, _ string, _ int, optStr string, _ string, _ *qemu.AttachOpts) (string, error) {
 			capturedOptStr = optStr
-			return "scsi2", nil
+			return diskSlot, nil
 		},
 	}
 
@@ -428,7 +428,7 @@ func TestHandleUpdateDisk_IOThreadFalseRemovesOption(t *testing.T) {
 
 func TestHandleUpdateDisk_AttachSDKError(t *testing.T) {
 	t.Parallel()
-	const diskCID = "local-lvm:vm-9001-disk-0"
+
 	const volid = "local-lvm:vm-9001-disk-0"
 
 	callCount := 0
@@ -436,9 +436,9 @@ func TestHandleUpdateDisk_AttachSDKError(t *testing.T) {
 		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
 			callCount++
 			if callCount <= 2 {
-				return map[string]any{"scsi2": volid}, nil
+				return map[string]any{diskSlot: volid}, nil
 			}
-			return map[string]any{"scsi2": volid + ",size=10G"}, nil
+			return map[string]any{diskSlot: volid + ",size=10G"}, nil
 		},
 		attachDiskFn: func(_ context.Context, _ string, _ int, _ string, _ string, _ *qemu.AttachOpts) (string, error) {
 			return "", errors.New("PVE config update rejected")
@@ -456,7 +456,7 @@ func TestHandleUpdateDisk_AttachSDKError(t *testing.T) {
 
 func TestHandleUpdateDisk_ResizeWithUpid(t *testing.T) {
 	t.Parallel()
-	const diskCID = "local-lvm:vm-9001-disk-0"
+
 	const volid = "local-lvm:vm-9001-disk-0"
 
 	var waitCalled bool
@@ -472,9 +472,9 @@ func TestHandleUpdateDisk_ResizeWithUpid(t *testing.T) {
 		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
 			callCount++
 			if callCount <= 2 {
-				return map[string]any{"scsi2": volid}, nil
+				return map[string]any{diskSlot: volid}, nil
 			}
-			return map[string]any{"scsi2": volid + ",size=10G"}, nil
+			return map[string]any{diskSlot: volid + ",size=10G"}, nil
 		},
 		resizeDiskFn: func(_ context.Context, _ string, _ int, _ string, _ int) (string, error) {
 			return "UPID:pve1:resize:abc", nil
@@ -496,7 +496,7 @@ func TestHandleUpdateDisk_ResizeWithUpid(t *testing.T) {
 func TestHandleUpdateDisk_PreservesExistingOptions(t *testing.T) {
 	t.Parallel()
 	// Existing options not in update_spec must be preserved in the merged string.
-	const diskCID = "local-lvm:vm-9001-disk-0"
+
 	const volid = "local-lvm:vm-9001-disk-0"
 
 	var capturedOptStr string
@@ -506,14 +506,14 @@ func TestHandleUpdateDisk_PreservesExistingOptions(t *testing.T) {
 		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
 			callCount++
 			if callCount <= 2 {
-				return map[string]any{"scsi2": volid}, nil
+				return map[string]any{diskSlot: volid}, nil
 			}
 			// Existing options: size, backup.
-			return map[string]any{"scsi2": volid + ",backup=1,size=10G"}, nil
+			return map[string]any{diskSlot: volid + ",backup=1,size=10G"}, nil
 		},
 		attachDiskFn: func(_ context.Context, _ string, _ int, optStr string, _ string, _ *qemu.AttachOpts) (string, error) {
 			capturedOptStr = optStr
-			return "scsi2", nil
+			return diskSlot, nil
 		},
 	}
 
@@ -536,7 +536,7 @@ func TestHandleUpdateDisk_PreservesExistingOptions(t *testing.T) {
 func TestHandleUpdateDisk_BandwidthIOPS(t *testing.T) {
 	t.Parallel()
 	// Exercises mbps_rd, mbps_wr, iops_rd, iops_wr option fields.
-	const diskCID = "local-lvm:vm-9001-disk-0"
+
 	const volid = "local-lvm:vm-9001-disk-0"
 
 	var capturedOptStr string
@@ -546,13 +546,13 @@ func TestHandleUpdateDisk_BandwidthIOPS(t *testing.T) {
 		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
 			callCount++
 			if callCount <= 2 {
-				return map[string]any{"scsi2": volid}, nil
+				return map[string]any{diskSlot: volid}, nil
 			}
-			return map[string]any{"scsi2": volid + ",size=10G"}, nil
+			return map[string]any{diskSlot: volid + ",size=10G"}, nil
 		},
 		attachDiskFn: func(_ context.Context, _ string, _ int, optStr string, _ string, _ *qemu.AttachOpts) (string, error) {
 			capturedOptStr = optStr
-			return "scsi2", nil
+			return diskSlot, nil
 		},
 	}
 
@@ -576,7 +576,7 @@ func TestHandleUpdateDisk_BandwidthIOPS(t *testing.T) {
 func TestHandleUpdateDisk_SSDAndBackup(t *testing.T) {
 	t.Parallel()
 	// Exercises ssd and backup bool options.
-	const diskCID = "local-lvm:vm-9001-disk-0"
+
 	const volid = "local-lvm:vm-9001-disk-0"
 
 	var capturedOptStr string
@@ -586,13 +586,13 @@ func TestHandleUpdateDisk_SSDAndBackup(t *testing.T) {
 		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
 			callCount++
 			if callCount <= 2 {
-				return map[string]any{"scsi2": volid}, nil
+				return map[string]any{diskSlot: volid}, nil
 			}
-			return map[string]any{"scsi2": volid}, nil
+			return map[string]any{diskSlot: volid}, nil
 		},
 		attachDiskFn: func(_ context.Context, _ string, _ int, optStr string, _ string, _ *qemu.AttachOpts) (string, error) {
 			capturedOptStr = optStr
-			return "scsi2", nil
+			return diskSlot, nil
 		},
 	}
 
@@ -619,7 +619,7 @@ func TestHandleUpdateDisk_NullSpec_NoOp(t *testing.T) {
 
 	qemuSvc := &updateDiskQEMUService{
 		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
-			return map[string]any{"scsi2": volid}, nil
+			return map[string]any{diskSlot: volid}, nil
 		},
 	}
 
@@ -642,7 +642,7 @@ func TestHandleUpdateDisk_NullSpec_NoOp(t *testing.T) {
 // error (gap #12).
 func TestHandleUpdateDisk_ConfigReadError(t *testing.T) {
 	t.Parallel()
-	const diskCID = "local-lvm:vm-9001-disk-0"
+
 	const volid = "local-lvm:vm-9001-disk-0"
 
 	configCallCount := 0
@@ -651,7 +651,7 @@ func TestHandleUpdateDisk_ConfigReadError(t *testing.T) {
 			configCallCount++
 			if configCallCount <= 2 {
 				// Calls 1-2: FindVMByDiskVolid + ResolveDiskID — return canonical volid.
-				return map[string]any{"scsi2": volid}, nil
+				return map[string]any{diskSlot: volid}, nil
 			}
 			// Call 3: option read for merge — inject failure.
 			return nil, errors.New("config read failure injected")
@@ -675,7 +675,7 @@ func TestHandleUpdateDisk_ConfigReadError(t *testing.T) {
 // must propagate it (gap #13).
 func TestHandleUpdateDisk_ResolveDiskIDError(t *testing.T) {
 	t.Parallel()
-	const diskCID = "local-lvm:vm-9001-disk-0"
+
 	const volid = "local-lvm:vm-9001-disk-0"
 
 	configCallCount := 0
@@ -684,7 +684,7 @@ func TestHandleUpdateDisk_ResolveDiskIDError(t *testing.T) {
 			configCallCount++
 			if configCallCount == 1 {
 				// Call 1: FindVMByDiskVolid — returns canonical volid so VM is located.
-				return map[string]any{"scsi2": volid}, nil
+				return map[string]any{diskSlot: volid}, nil
 			}
 			// Call 2: ResolveDiskID config fetch — inject failure.
 			return nil, errors.New("resolve config error injected")
@@ -704,7 +704,7 @@ func TestHandleUpdateDisk_ResolveDiskIDError(t *testing.T) {
 // number). toInt() returns false → handler returns a descriptive error (gap #15).
 func TestHandleUpdateDisk_SizeWrongType(t *testing.T) {
 	t.Parallel()
-	const diskCID = "local-lvm:vm-9001-disk-0"
+
 	const volid = "local-lvm:vm-9001-disk-0"
 
 	configCallCount := 0
@@ -712,9 +712,9 @@ func TestHandleUpdateDisk_SizeWrongType(t *testing.T) {
 		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
 			configCallCount++
 			if configCallCount <= 2 {
-				return map[string]any{"scsi2": volid}, nil
+				return map[string]any{diskSlot: volid}, nil
 			}
-			return map[string]any{"scsi2": volid + ",size=10G"}, nil
+			return map[string]any{diskSlot: volid + ",size=10G"}, nil
 		},
 	}
 
@@ -764,16 +764,16 @@ func TestHandleUpdateDisk_Dir_CID(t *testing.T) {
 		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
 			configCallCount++
 			if configCallCount <= 2 {
-				return map[string]any{"scsi2": volid}, nil
+				return map[string]any{diskSlot: volid}, nil
 			}
-			return map[string]any{"scsi2": volid + ",size=10G"}, nil
+			return map[string]any{diskSlot: volid + ",size=10G"}, nil
 		},
 		attachDiskFn: func(_ context.Context, _ string, _ int, optStr string, _ string, opts *qemu.AttachOpts) (string, error) {
 			capturedOptStr = optStr
-			if opts == nil || opts.DiskID != "scsi2" {
+			if opts == nil || opts.DiskID != diskSlot {
 				t.Errorf("expected AttachDisk with DiskID=scsi2, got %v", opts)
 			}
-			return "scsi2", nil
+			return diskSlot, nil
 		},
 	}
 
@@ -805,16 +805,16 @@ func TestHandleUpdateDisk_ZFSPool_CID(t *testing.T) {
 		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
 			configCallCount++
 			if configCallCount <= 2 {
-				return map[string]any{"scsi2": volid}, nil
+				return map[string]any{diskSlot: volid}, nil
 			}
-			return map[string]any{"scsi2": volid + ",size=10G"}, nil
+			return map[string]any{diskSlot: volid + ",size=10G"}, nil
 		},
 		attachDiskFn: func(_ context.Context, _ string, _ int, optStr string, _ string, opts *qemu.AttachOpts) (string, error) {
 			capturedOptStr = optStr
-			if opts == nil || opts.DiskID != "scsi2" {
+			if opts == nil || opts.DiskID != diskSlot {
 				t.Errorf("expected AttachDisk with DiskID=scsi2, got %v", opts)
 			}
-			return "scsi2", nil
+			return diskSlot, nil
 		},
 	}
 
@@ -879,7 +879,7 @@ func storageLockErr() error {
 // because the final call returns an empty UPID.
 func TestHandleUpdateDisk_ResizeUnderStorageLock_RetriesAndSucceeds(t *testing.T) {
 	t.Parallel()
-	const diskCID = "local-lvm:vm-9001-disk-0"
+
 	const volid = "local-lvm:vm-9001-disk-0"
 
 	// Fail twice with a storage-lock error then succeed.
@@ -893,9 +893,9 @@ func TestHandleUpdateDisk_ResizeUnderStorageLock_RetriesAndSucceeds(t *testing.T
 			// Calls 1-2: FindVMByDiskVolid + ResolveDiskID — return canonical volid.
 			// Call 3+: resizeDiskInternal config read — return volid with size=10G.
 			if configCallCount <= 2 {
-				return map[string]any{"scsi2": volid}, nil
+				return map[string]any{diskSlot: volid}, nil
 			}
-			return map[string]any{"scsi2": volid + ",size=10G"}, nil
+			return map[string]any{diskSlot: volid + ",size=10G"}, nil
 		},
 		resizeDiskFn: func(_ context.Context, _ string, _ int, _ string, _ int) (string, error) {
 			resizeCallCount++
@@ -932,7 +932,7 @@ func TestHandleUpdateDisk_ResizeUnderStorageLock_RetriesAndSucceeds(t *testing.T
 // via ctx cancellation if somehow it exceeds the expected call count.
 func TestHandleUpdateDisk_ResizeUnderStorageLock_ExhaustsRetries(t *testing.T) {
 	t.Parallel()
-	const diskCID = "local-lvm:vm-9001-disk-0"
+
 	const volid = "local-lvm:vm-9001-disk-0"
 
 	// Always return a storage-lock error so RetryOnTransientOrLock exhausts.
@@ -943,9 +943,9 @@ func TestHandleUpdateDisk_ResizeUnderStorageLock_ExhaustsRetries(t *testing.T) {
 		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
 			configCallCount++
 			if configCallCount <= 2 {
-				return map[string]any{"scsi2": volid}, nil
+				return map[string]any{diskSlot: volid}, nil
 			}
-			return map[string]any{"scsi2": volid + ",size=10G"}, nil
+			return map[string]any{diskSlot: volid + ",size=10G"}, nil
 		},
 		resizeDiskFn: func(_ context.Context, _ string, _ int, _ string, _ int) (string, error) {
 			resizeCallCount++

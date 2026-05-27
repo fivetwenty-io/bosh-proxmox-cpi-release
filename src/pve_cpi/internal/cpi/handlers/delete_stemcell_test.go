@@ -54,7 +54,7 @@ func buildDeleteStemcellDeps(storageSvc sdkstorage.Service) handlers.Deps {
 	}
 	return handlers.Deps{
 		Config: &config.CPIConfig{
-			Node:            "pve-node1",
+			Node:            vmNode,
 			StemcellStorage: "local",
 			VMStorage:       "local",
 			DiskStorage:     "local",

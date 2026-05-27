@@ -30,7 +30,7 @@ func TestHandleSetVMMetadata_Happy(t *testing.T) {
 
 	nodesSvc := &mockNodesService{
 		updateQemuConfigFn: func(_ context.Context, node string, vmid string, params *nodes.UpdateQemuConfigParams) error {
-			if node != "pve-node1" || vmid != "101" {
+			if node != vmNode || vmid != "101" {
 				t.Errorf("UpdateQemuConfig: unexpected node=%q vmid=%q", node, vmid)
 			}
 			if params.Description != nil {

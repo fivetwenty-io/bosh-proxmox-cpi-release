@@ -12,7 +12,10 @@ import (
 	"testing"
 	"time"
 
+	diskfs "github.com/diskfs/go-diskfs"
+	"github.com/diskfs/go-diskfs/disk"
 	"github.com/diskfs/go-diskfs/filesystem"
+	"github.com/diskfs/go-diskfs/filesystem/iso9660"
 )
 
 // --------------------------------------------------------------------------
@@ -200,7 +203,10 @@ func (i *injectFS) OpenFile(name string, flag int) (filesystem.File, error) {
 	if i.writeFailOn != "" && name == i.writeFailOn {
 		// Wrap the underlying memFile in a writer that always fails so
 		// the caller sees the injected write error but Close still runs.
-		mf := f.(*memFile)
+		mf, ok := f.(*memFile) //nolint:forcetypeassert // trackingFS.OpenFile always returns *memFile
+		if !ok {
+			panic("injectFS: OpenFile returned unexpected type")
+		}
 		return &failWriteFile{memFile: mf, writeErr: i.writeErr}, nil
 	}
 	return f, nil
@@ -551,7 +557,10 @@ func (c *closeErrFS) OpenFile(name string, flag int) (filesystem.File, error) {
 		return nil, err
 	}
 	if name == c.closeFailOn {
-		mf := f.(*memFile)
+		mf, ok := f.(*memFile) //nolint:forcetypeassert // trackingFS.OpenFile always returns *memFile
+		if !ok {
+			panic("closeErrFS: OpenFile returned unexpected type")
+		}
 		return &closeErrFile{memFile: mf, closeErr: c.closeErr}, nil
 	}
 	return f, nil
@@ -585,5 +594,132 @@ func TestWriteISOFile_CloseErrorPropagates(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "/openstack/latest/user_data") {
 		t.Errorf("error %q should name the file whose Close failed", err.Error())
+	}
+}
+
+// --------------------------------------------------------------------------
+// Build error-path coverage — exercises the four injectable hooks in builder.go.
+//
+// These tests swap package-level func vars (diskCreate, createFS, populateFS,
+// finalizeISO) to inject failures at each step of Build. Because the hooks are
+// global state, each test runs sequentially (no t.Parallel) and restores the
+// original via t.Cleanup to prevent cross-test interference.
+// --------------------------------------------------------------------------
+
+// TestBuild_DiskCreateError exercises the diskfs.Create failure branch inside
+// Build. The hook returns an error; Build must call cleanupDir and return a
+// wrapped error without leaking the temp directory.
+func TestBuild_DiskCreateError(t *testing.T) {
+	sentinel := &errSentinel{msg: "injected: cannot create disk image"}
+
+	orig := diskCreate
+	diskCreate = func(_ string, _ int64, _ diskfs.SectorSize) (*disk.Disk, error) {
+		return nil, sentinel
+	}
+	t.Cleanup(func() { diskCreate = orig })
+
+	_, cleanup, err := Build([]byte(`{"x":1}`))
+	if err == nil {
+		if cleanup != nil {
+			cleanup()
+		}
+		t.Fatal("expected diskfs.Create error, got nil")
+	}
+	if !errors.Is(err, sentinel) {
+		t.Errorf("error %v should wrap sentinel via %%w", err)
+	}
+	if !strings.Contains(err.Error(), "diskfs.Create") {
+		t.Errorf("error %q should mention diskfs.Create", err.Error())
+	}
+	// cleanup must be nil — Build removes the temp dir before returning on error.
+	if cleanup != nil {
+		t.Error("expected nil cleanup on error path; got non-nil (possible temp dir leak)")
+	}
+}
+
+// TestBuild_CreateFilesystemError exercises the d.CreateFilesystem failure
+// branch inside Build. The hook returns an error after a real disk image has
+// been created; Build must clean up the temp dir and return a wrapped error.
+func TestBuild_CreateFilesystemError(t *testing.T) {
+	sentinel := &errSentinel{msg: "injected: CreateFilesystem failed"}
+
+	orig := createFS
+	createFS = func(_ *disk.Disk, _ disk.FilesystemSpec) (filesystem.FileSystem, error) {
+		return nil, sentinel
+	}
+	t.Cleanup(func() { createFS = orig })
+
+	_, cleanup, err := Build([]byte(`{"x":1}`))
+	if err == nil {
+		if cleanup != nil {
+			cleanup()
+		}
+		t.Fatal("expected CreateFilesystem error, got nil")
+	}
+	if !errors.Is(err, sentinel) {
+		t.Errorf("error %v should wrap sentinel via %%w", err)
+	}
+	if !strings.Contains(err.Error(), "CreateFilesystem") {
+		t.Errorf("error %q should mention CreateFilesystem", err.Error())
+	}
+	if cleanup != nil {
+		t.Error("expected nil cleanup on error path; got non-nil (possible temp dir leak)")
+	}
+}
+
+// TestBuild_PopulateFSError exercises the writeFiles failure branch inside
+// Build. The populateFS hook returns an error; Build must clean up and return
+// the error unwrapped (writeFiles errors already carry context).
+func TestBuild_PopulateFSError(t *testing.T) {
+	sentinel := &errSentinel{msg: "injected: populateFS failed"}
+
+	orig := populateFS
+	populateFS = func(_ filesystem.FileSystem, _ []byte) error {
+		return sentinel
+	}
+	t.Cleanup(func() { populateFS = orig })
+
+	_, cleanup, err := Build([]byte(`{"x":1}`))
+	if err == nil {
+		if cleanup != nil {
+			cleanup()
+		}
+		t.Fatal("expected populateFS error, got nil")
+	}
+	if !errors.Is(err, sentinel) {
+		t.Errorf("error %v should wrap sentinel via %%w", err)
+	}
+	if cleanup != nil {
+		t.Error("expected nil cleanup on error path; got non-nil (possible temp dir leak)")
+	}
+}
+
+// TestBuild_FinalizeError exercises the iso.Finalize failure branch inside
+// Build. The hook returns an error; Build must clean up and return a wrapped
+// error naming "Finalize".
+func TestBuild_FinalizeError(t *testing.T) {
+	sentinel := &errSentinel{msg: "injected: Finalize failed"}
+
+	orig := finalizeISO
+	finalizeISO = func(_ *iso9660.FileSystem, _ iso9660.FinalizeOptions) error {
+		return sentinel
+	}
+	t.Cleanup(func() { finalizeISO = orig })
+
+	_, cleanup, err := Build([]byte(`{"x":1}`))
+	if err == nil {
+		if cleanup != nil {
+			cleanup()
+		}
+		t.Fatal("expected Finalize error, got nil")
+	}
+	if !errors.Is(err, sentinel) {
+		t.Errorf("error %v should wrap sentinel via %%w", err)
+	}
+	if !strings.Contains(err.Error(), "Finalize") {
+		t.Errorf("error %q should mention Finalize", err.Error())
+	}
+	if cleanup != nil {
+		t.Error("expected nil cleanup on error path; got non-nil (possible temp dir leak)")
 	}
 }

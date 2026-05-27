@@ -3,6 +3,7 @@ package handlers_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -214,7 +215,7 @@ func buildVMDeps(q *vmMockQEMU, n *vmMockNodes, c *vmMockCluster, a *vmMockAgent
 	return handlers.Deps{
 		Config: &config.CPIConfig{
 			Node:           "pve",
-			VMStorage:      "local-lvm",
+			VMStorage:      storageName,
 			NetworkBridge:  "vmbr0",
 			VMIDRangeStart: 100,
 		},
@@ -245,8 +246,8 @@ func isCloudError(err error) bool {
 	if err == nil {
 		return false
 	}
-	_, ok := err.(*cpierrors.Error)
-	return ok
+	var cpiErr *cpierrors.Error
+	return errors.As(err, &cpiErr)
 }
 
 // --------------------------------------------------------------------------
@@ -440,7 +441,7 @@ func TestHandleCreateVM_DiskAttachFail(t *testing.T) {
 
 	args := mkArgs("agent-1", testStemcellCID, map[string]any{},
 		map[string]any{"default": map[string]any{"type": "dynamic", "cloud_properties": map[string]any{}}},
-		[]string{"local-lvm:vm-9001-disk-0"}, map[string]any{})
+		[]string{diskCID}, map[string]any{})
 
 	_, err := h.Handle(context.Background(), args, mkCtx("disk-fail"))
 	if err == nil {
@@ -611,7 +612,7 @@ func TestHandleCreateVM_MissingNode(t *testing.T) {
 	deps := handlers.Deps{
 		Config: &config.CPIConfig{
 			Node:          "",
-			VMStorage:     "local-lvm",
+			VMStorage:     storageName,
 			NetworkBridge: "vmbr0",
 		},
 		PVE: &mockPVEClient{
@@ -941,8 +942,8 @@ func TestCreateVM_NICConfigTransient_Retriable(t *testing.T) {
 		t.Fatal("expected error from transient NIC config failure")
 	}
 
-	cpiErr, ok := err.(*cpierrors.Error)
-	if !ok {
+	var cpiErr *cpierrors.Error
+	if !errors.As(err, &cpiErr) {
 		t.Fatalf("expected *cpierrors.Error, got %T: %v", err, err)
 	}
 	if !cpiErr.OkToRetry() {
@@ -986,8 +987,8 @@ func TestCreateVM_AttachDiskTransient_Retriable(t *testing.T) {
 		t.Fatal("expected error from transient AttachDisk failure")
 	}
 
-	cpiErr, ok := err.(*cpierrors.Error)
-	if !ok {
+	var cpiErr *cpierrors.Error
+	if !errors.As(err, &cpiErr) {
 		t.Fatalf("expected *cpierrors.Error, got %T: %v", err, err)
 	}
 	if !cpiErr.OkToRetry() {
@@ -1097,8 +1098,8 @@ func TestHandleCreateVM_AuthFailure(t *testing.T) {
 	}
 
 	// 401 is a 4xx non-404 → WrapError returns non-retriable CloudError.
-	cpiErr, ok := err.(*cpierrors.Error)
-	if !ok {
+	var cpiErr *cpierrors.Error
+	if !errors.As(err, &cpiErr) {
 		t.Fatalf("expected *cpierrors.Error, got %T: %v", err, err)
 	}
 	if cpiErr.OkToRetry() {
@@ -1121,7 +1122,6 @@ func TestHandleCreateVM_AuthFailure(t *testing.T) {
 // VM from a network/registry misconfiguration.
 func TestCreateVM_AgentDead_EmitsDiagnostic(t *testing.T) {
 	t.Parallel()
-	const vmStatus = "stopped"
 
 	q := &vmMockQEMU{
 		// Status is called during the diagnostic probe after agent.Configure fails.
@@ -1152,7 +1152,7 @@ func TestCreateVM_AgentDead_EmitsDiagnostic(t *testing.T) {
 	deps := handlers.Deps{
 		Config: &config.CPIConfig{
 			Node:           "pve",
-			VMStorage:      "local-lvm",
+			VMStorage:      storageName,
 			NetworkBridge:  "vmbr0",
 			VMIDRangeStart: 100,
 		},

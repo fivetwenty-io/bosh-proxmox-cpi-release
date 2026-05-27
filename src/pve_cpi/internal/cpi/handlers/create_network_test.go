@@ -3,6 +3,7 @@ package handlers_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
@@ -231,7 +232,10 @@ func TestHandleCreateNetwork_SDN_BadVnetName(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for long vnet name")
 	}
-	cpiErr := err.(*cpierrors.Error)
+	var cpiErr *cpierrors.Error
+	if !errors.As(err, &cpiErr) {
+		t.Fatalf("expected *cpierrors.Error, got %T: %v", err, err)
+	}
 	if cpiErr.Type() != cpierrors.TypeCloud {
 		t.Errorf("expected CloudError, got %q", cpiErr.Type())
 	}
@@ -260,7 +264,10 @@ func TestHandleCreateNetwork_SDN_ZoneMissingAutoManageFalse(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error")
 	}
-	cpiErr := err.(*cpierrors.Error)
+	var cpiErr *cpierrors.Error
+	if !errors.As(err, &cpiErr) {
+		t.Fatalf("expected *cpierrors.Error, got %T: %v", err, err)
+	}
 	if cpiErr.Type() != cpierrors.TypeCloud {
 		t.Errorf("expected CloudError, got %q", cpiErr.Type())
 	}
@@ -382,7 +389,10 @@ func TestHandleCreateNetwork_MissingArg(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error")
 	}
-	cpiErr := err.(*cpierrors.Error)
+	var cpiErr *cpierrors.Error
+	if !errors.As(err, &cpiErr) {
+		t.Fatalf("expected *cpierrors.Error, got %T: %v", err, err)
+	}
 	if cpiErr.Type() != cpierrors.TypeCloud {
 		t.Errorf("expected CloudError, got %q", cpiErr.Type())
 	}
@@ -410,7 +420,10 @@ func TestHandleCreateNetwork_NoRoutingInfo(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error when no routing info")
 	}
-	cpiErr := err.(*cpierrors.Error)
+	var cpiErr *cpierrors.Error
+	if !errors.As(err, &cpiErr) {
+		t.Fatalf("expected *cpierrors.Error, got %T: %v", err, err)
+	}
 	if cpiErr.Type() != cpierrors.TypeCloud {
 		t.Errorf("expected CloudError, got %q", cpiErr.Type())
 	}
@@ -427,7 +440,10 @@ func TestHandleCreateNetwork_InvalidJSON(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error")
 	}
-	cpiErr := err.(*cpierrors.Error)
+	var cpiErr *cpierrors.Error
+	if !errors.As(err, &cpiErr) {
+		t.Fatalf("expected *cpierrors.Error, got %T: %v", err, err)
+	}
 	if cpiErr.Type() != cpierrors.TypeCloud {
 		t.Errorf("expected CloudError, got %q", cpiErr.Type())
 	}
@@ -492,7 +508,10 @@ func TestHandleCreateNetwork_SDN_VnetNameInvalidChars(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for vnet name with hyphen")
 	}
-	cpiErr := err.(*cpierrors.Error)
+	var cpiErr *cpierrors.Error
+	if !errors.As(err, &cpiErr) {
+		t.Fatalf("expected *cpierrors.Error, got %T: %v", err, err)
+	}
 	if cpiErr.Type() != cpierrors.TypeCloud {
 		t.Errorf("expected CloudError, got %q", cpiErr.Type())
 	}
@@ -558,7 +577,10 @@ func TestHandleCreateNetwork_SDN_VnetRequired(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error when vnet is missing on SDN path")
 	}
-	cpiErr := err.(*cpierrors.Error)
+	var cpiErr *cpierrors.Error
+	if !errors.As(err, &cpiErr) {
+		t.Fatalf("expected *cpierrors.Error, got %T: %v", err, err)
+	}
 	if cpiErr.Type() != cpierrors.TypeCloud {
 		t.Errorf("expected CloudError, got %q", cpiErr.Type())
 	}
@@ -714,7 +736,10 @@ func TestHandleCreateNetwork_Bridge_CreateError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error")
 	}
-	cpiErr := err.(*cpierrors.Error)
+	var cpiErr *cpierrors.Error
+	if !errors.As(err, &cpiErr) {
+		t.Fatalf("expected *cpierrors.Error, got %T: %v", err, err)
+	}
 	if cpiErr.Type() != cpierrors.TypeCloud {
 		t.Errorf("expected CloudError, got %q", cpiErr.Type())
 	}

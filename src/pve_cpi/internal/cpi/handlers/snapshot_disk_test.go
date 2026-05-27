@@ -103,6 +103,7 @@ func (m *snapClusterService) ListResources(ctx context.Context, params *sdkclust
 // helper: build a cluster response with one VM entry.
 // ---------------------------------------------------------------------------
 
+//nolint:unparam // node kept for call-site clarity; always testNode in this suite
 func clusterRespWith(vmid int, node string) *sdkclusterapi.ListResourcesResponse {
 	type entry struct {
 		VMID int64  `json:"vmid"`
@@ -120,7 +121,7 @@ func clusterRespWith(vmid int, node string) *sdkclusterapi.ListResourcesResponse
 func snapDeps(qemuSvc qemu.Service, clusterSvc sdkclusterapi.Service, tasksSvc tasks.Service) handlers.Deps {
 	return handlers.Deps{
 		Config: &config.CPIConfig{
-			Node: "pve1",
+			Node: testNode,
 		},
 		PVE: &mockPVEClient{
 			qemuSvc:    qemuSvc,
@@ -137,7 +138,7 @@ func snapDeps(qemuSvc qemu.Service, clusterSvc sdkclusterapi.Service, tasksSvc t
 
 func TestHandleSnapshotDisk_Happy(t *testing.T) {
 	t.Parallel()
-	const diskCID = "local-lvm:vm-9001-disk-0"
+
 	const volid = "local-lvm:vm-9001-disk-0"
 
 	var snapCalled bool
@@ -147,7 +148,7 @@ func TestHandleSnapshotDisk_Happy(t *testing.T) {
 		configFn: func(_ context.Context, _ string, vmid int) (map[string]any, error) {
 			if vmid == 100 {
 				return map[string]any{
-					"scsi2": volid,
+					diskSlot: volid,
 				}, nil
 			}
 			return map[string]any{}, nil
@@ -161,7 +162,7 @@ func TestHandleSnapshotDisk_Happy(t *testing.T) {
 
 	clusterSvc := &snapClusterService{
 		listFn: func(_ context.Context, _ *sdkclusterapi.ListResourcesParams) (*sdkclusterapi.ListResourcesResponse, error) {
-			return clusterRespWith(100, "pve1"), nil
+			return clusterRespWith(100, testNode), nil
 		},
 	}
 
@@ -187,7 +188,7 @@ func TestHandleSnapshotDisk_Happy(t *testing.T) {
 
 func TestHandleSnapshotDisk_WithDescription(t *testing.T) {
 	t.Parallel()
-	const diskCID = "local-lvm:vm-9001-disk-0"
+
 	const volid = "local-lvm:vm-9001-disk-0"
 
 	var capturedOpts map[string]any
@@ -204,7 +205,7 @@ func TestHandleSnapshotDisk_WithDescription(t *testing.T) {
 
 	clusterSvc := &snapClusterService{
 		listFn: func(_ context.Context, _ *sdkclusterapi.ListResourcesParams) (*sdkclusterapi.ListResourcesResponse, error) {
-			return clusterRespWith(100, "pve1"), nil
+			return clusterRespWith(100, testNode), nil
 		},
 	}
 
@@ -222,7 +223,6 @@ func TestHandleSnapshotDisk_WithDescription(t *testing.T) {
 
 func TestHandleSnapshotDisk_WithUpid(t *testing.T) {
 	t.Parallel()
-	const diskCID = "local-lvm:vm-9001-disk-0"
 
 	var waitCalled bool
 	tasksSvc := &mockTasksService{
@@ -243,7 +243,7 @@ func TestHandleSnapshotDisk_WithUpid(t *testing.T) {
 
 	clusterSvc := &snapClusterService{
 		listFn: func(_ context.Context, _ *sdkclusterapi.ListResourcesParams) (*sdkclusterapi.ListResourcesResponse, error) {
-			return clusterRespWith(100, "pve1"), nil
+			return clusterRespWith(100, testNode), nil
 		},
 	}
 
@@ -262,7 +262,6 @@ func TestHandleSnapshotDisk_WithUpid(t *testing.T) {
 
 func TestHandleSnapshotDisk_DiskNotAttached(t *testing.T) {
 	t.Parallel()
-	const diskCID = "local-lvm:vm-9001-disk-0"
 
 	qemuSvc := &snapQEMUService{
 		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
@@ -273,7 +272,7 @@ func TestHandleSnapshotDisk_DiskNotAttached(t *testing.T) {
 
 	clusterSvc := &snapClusterService{
 		listFn: func(_ context.Context, _ *sdkclusterapi.ListResourcesParams) (*sdkclusterapi.ListResourcesResponse, error) {
-			return clusterRespWith(100, "pve1"), nil
+			return clusterRespWith(100, testNode), nil
 		},
 	}
 
@@ -287,7 +286,6 @@ func TestHandleSnapshotDisk_DiskNotAttached(t *testing.T) {
 
 func TestHandleSnapshotDisk_EmptyClusterList(t *testing.T) {
 	t.Parallel()
-	const diskCID = "local-lvm:vm-9001-disk-0"
 
 	clusterSvc := &snapClusterService{
 		listFn: func(_ context.Context, _ *sdkclusterapi.ListResourcesParams) (*sdkclusterapi.ListResourcesResponse, error) {
@@ -305,7 +303,6 @@ func TestHandleSnapshotDisk_EmptyClusterList(t *testing.T) {
 
 func TestHandleSnapshotDisk_SnapshotFails(t *testing.T) {
 	t.Parallel()
-	const diskCID = "local-lvm:vm-9001-disk-0"
 
 	qemuSvc := &snapQEMUService{
 		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
@@ -318,7 +315,7 @@ func TestHandleSnapshotDisk_SnapshotFails(t *testing.T) {
 
 	clusterSvc := &snapClusterService{
 		listFn: func(_ context.Context, _ *sdkclusterapi.ListResourcesParams) (*sdkclusterapi.ListResourcesResponse, error) {
-			return clusterRespWith(100, "pve1"), nil
+			return clusterRespWith(100, testNode), nil
 		},
 	}
 
@@ -349,7 +346,6 @@ func TestHandleSnapshotDisk_EmptyDiskCID(t *testing.T) {
 
 func TestHandleSnapshotDisk_ClusterListError(t *testing.T) {
 	t.Parallel()
-	const diskCID = "local-lvm:vm-9001-disk-0"
 
 	clusterSvc := &snapClusterService{
 		listFn: func(_ context.Context, _ *sdkclusterapi.ListResourcesParams) (*sdkclusterapi.ListResourcesResponse, error) {
@@ -367,7 +363,7 @@ func TestHandleSnapshotDisk_ClusterListError(t *testing.T) {
 func TestHandleSnapshotDisk_DiskInOptionString(t *testing.T) {
 	t.Parallel()
 	// Disk stored with option string: "local-lvm:vm-9001-disk-0,size=10G,cache=writeback"
-	const diskCID = "local-lvm:vm-9001-disk-0"
+
 	const volid = "local-lvm:vm-9001-disk-0"
 
 	var snapCalled bool
@@ -375,7 +371,7 @@ func TestHandleSnapshotDisk_DiskInOptionString(t *testing.T) {
 	qemuSvc := &snapQEMUService{
 		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
 			return map[string]any{
-				"scsi2": volid + ",size=10G,cache=writeback",
+				diskSlot: volid + ",size=10G,cache=writeback",
 			}, nil
 		},
 		snapshotFn: func(_ context.Context, _ string, _ int, _ string, _ map[string]any) (string, error) {
@@ -386,7 +382,7 @@ func TestHandleSnapshotDisk_DiskInOptionString(t *testing.T) {
 
 	clusterSvc := &snapClusterService{
 		listFn: func(_ context.Context, _ *sdkclusterapi.ListResourcesParams) (*sdkclusterapi.ListResourcesResponse, error) {
-			return clusterRespWith(100, "pve1"), nil
+			return clusterRespWith(100, testNode), nil
 		},
 	}
 
@@ -403,7 +399,6 @@ func TestHandleSnapshotDisk_DiskInOptionString(t *testing.T) {
 func TestHandleSnapshotDisk_SDKError404(t *testing.T) {
 	t.Parallel()
 	// A 404 API error from Snapshot should propagate as an error.
-	const diskCID = "local-lvm:vm-9001-disk-0"
 
 	qemuSvc := &snapQEMUService{
 		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
@@ -416,7 +411,7 @@ func TestHandleSnapshotDisk_SDKError404(t *testing.T) {
 
 	clusterSvc := &snapClusterService{
 		listFn: func(_ context.Context, _ *sdkclusterapi.ListResourcesParams) (*sdkclusterapi.ListResourcesResponse, error) {
-			return clusterRespWith(100, "pve1"), nil
+			return clusterRespWith(100, testNode), nil
 		},
 	}
 
@@ -456,7 +451,7 @@ func TestHandleSnapshotDisk_Dir_CID(t *testing.T) {
 	}
 	clusterSvc := &snapClusterService{
 		listFn: func(_ context.Context, _ *sdkclusterapi.ListResourcesParams) (*sdkclusterapi.ListResourcesResponse, error) {
-			return clusterRespWith(9001, "pve1"), nil
+			return clusterRespWith(9001, testNode), nil
 		},
 	}
 
@@ -494,7 +489,7 @@ func TestHandleSnapshotDisk_ZFSPool_CID(t *testing.T) {
 	}
 	clusterSvc := &snapClusterService{
 		listFn: func(_ context.Context, _ *sdkclusterapi.ListResourcesParams) (*sdkclusterapi.ListResourcesResponse, error) {
-			return clusterRespWith(9001, "pve1"), nil
+			return clusterRespWith(9001, testNode), nil
 		},
 	}
 
@@ -532,7 +527,7 @@ func TestHandleSnapshotDisk_LVMThin_CID(t *testing.T) {
 	}
 	clusterSvc := &snapClusterService{
 		listFn: func(_ context.Context, _ *sdkclusterapi.ListResourcesParams) (*sdkclusterapi.ListResourcesResponse, error) {
-			return clusterRespWith(9001, "pve1"), nil
+			return clusterRespWith(9001, testNode), nil
 		},
 	}
 

@@ -20,6 +20,35 @@ const volumeLabel = "config-2"
 // 10 MiB matches the upstream example and leaves headroom for filesystem overhead.
 const isoSize int64 = 10 * 1024 * 1024
 
+// diskCreate is the function used to create a new disk image. It defaults to
+// diskfs.Create. Tests replace it to exercise the diskfs.Create error branch
+// in Build without requiring a real disk operation to fail.
+//
+//nolint:gocritic // unlambda: wrapper is intentional — tests replace this var
+var diskCreate = func(filePath string, size int64, sectorSize diskfs.SectorSize) (*disk.Disk, error) {
+	return diskfs.Create(filePath, size, sectorSize)
+}
+
+// createFS wraps d.CreateFilesystem. Tests replace it to inject a
+// CreateFilesystem error without needing a corrupt on-disk image.
+var createFS = func(d *disk.Disk, spec disk.FilesystemSpec) (filesystem.FileSystem, error) {
+	return d.CreateFilesystem(spec)
+}
+
+// finalizeISO wraps iso.Finalize. Tests replace it to inject a Finalize error
+// without requiring a malformed ISO to be constructed.
+var finalizeISO = func(iso *iso9660.FileSystem, opts iso9660.FinalizeOptions) error {
+	return iso.Finalize(opts)
+}
+
+// populateFS writes all ConfigDrive files into the filesystem. Tests replace it
+// to inject a writeFiles error inside the Build code path.
+//
+//nolint:gocritic // unlambda: wrapper is intentional — tests replace this var
+var populateFS = func(fs filesystem.FileSystem, payload []byte) error {
+	return writeFiles(fs, payload)
+}
+
 // Build authors an ISO 9660 + Rock Ridge volume containing the OpenStack
 // ConfigDrive layout that BOSH agents on openstack-kvm stemcells expect.
 // payload is the raw settings.json bytes written to /openstack/latest/user_data
@@ -55,7 +84,7 @@ func Build(payload []byte) (path string, cleanup func(), err error) {
 
 	isoPath := filepath.Join(dir, "configdrive.iso")
 
-	d, err := diskfs.Create(isoPath, isoSize, diskfs.SectorSizeDefault)
+	d, err := diskCreate(isoPath, isoSize, diskfs.SectorSizeDefault)
 	if err != nil {
 		cleanupDir()
 		return "", nil, fmt.Errorf("configdrive: diskfs.Create: %w", err)
@@ -68,13 +97,13 @@ func Build(payload []byte) (path string, cleanup func(), err error) {
 		FSType:      filesystem.TypeISO9660,
 		VolumeLabel: volumeLabel,
 	}
-	fs, err := d.CreateFilesystem(spec)
+	fs, err := createFS(d, spec)
 	if err != nil {
 		cleanupDir()
 		return "", nil, fmt.Errorf("configdrive: CreateFilesystem: %w", err)
 	}
 
-	if err := writeFiles(fs, payload); err != nil {
+	if err := populateFS(fs, payload); err != nil {
 		cleanupDir()
 		return "", nil, err
 	}
@@ -88,7 +117,7 @@ func Build(payload []byte) (path string, cleanup func(), err error) {
 		RockRidge:        true,
 		VolumeIdentifier: volumeLabel,
 	}
-	if err := iso.Finalize(finalizeOpts); err != nil {
+	if err := finalizeISO(iso, finalizeOpts); err != nil {
 		cleanupDir()
 		return "", nil, fmt.Errorf("configdrive: Finalize: %w", err)
 	}

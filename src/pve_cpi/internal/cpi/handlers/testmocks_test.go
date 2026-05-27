@@ -21,6 +21,17 @@ import (
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/tasks"
 )
 
+// Package-level sentinel constants shared across handler test files.
+const (
+	testNode    = "pve1"
+	vmNode      = "pve-node1"
+	diskSlot    = "scsi2"
+	storageName = "local-lvm"
+	diskCID     = "local-lvm:vm-9001-disk-0"
+	testDiskCID = "local-lvm:vm-100-disk-0"
+	vmStatus    = "stopped"
+)
+
 // mockPVEClient implements pve.Client for tests.
 type mockPVEClient struct {
 	qemuSvc      qemu.Service
@@ -385,6 +396,8 @@ func testConfigWith(opts ...testConfigOption) *config.CPIConfig {
 // --------------------------------------------------------------------------
 
 // testDeps builds a Deps struct wiring the provided mock services.
+//
+//nolint:unparam // qemuSvc kept for future tests that need a non-nil QEMU mock
 func testDeps(qemuSvc qemu.Service, nodesSvc nodes.Service, tasksSvc tasks.Service, agentSvc agent.Agent) handlers.Deps {
 	return testDepsWithStorage(qemuSvc, nodesSvc, tasksSvc, agentSvc, &mockStorageService{})
 }

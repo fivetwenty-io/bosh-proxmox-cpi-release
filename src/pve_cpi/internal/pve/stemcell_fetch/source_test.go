@@ -11,6 +11,7 @@ import (
 
 // ---- ResolveSource ----
 
+// nolint:gocognit // Table-driven test with one case per supported URI scheme; complexity is from the test data, not from code under test.
 func TestResolveSource(t *testing.T) {
 	t.Parallel()
 
@@ -304,7 +305,7 @@ func TestBasicCreds_Apply(t *testing.T) {
 
 	bc := basicCreds{Username: "alice", Password: "s3cr3t"}
 
-	req, err := http.NewRequest(http.MethodGet, "https://example.com/", nil)
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "https://example.com/", http.NoBody)
 	if err != nil {
 		t.Fatalf("build request: %v", err)
 	}
@@ -343,7 +344,7 @@ func TestBearerCreds_Apply(t *testing.T) {
 	token := "my-bearer-token-12345"
 	br := bearerCreds{BearerToken: token}
 
-	req, err := http.NewRequest(http.MethodGet, "https://example.com/", nil)
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "https://example.com/", http.NoBody)
 	if err != nil {
 		t.Fatalf("build request: %v", err)
 	}
@@ -370,7 +371,7 @@ func TestNoCreds(t *testing.T) {
 
 	var nc noCreds
 
-	req, err := http.NewRequest(http.MethodGet, "https://example.com/", nil)
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "https://example.com/", http.NoBody)
 	if err != nil {
 		t.Fatalf("build request: %v", err)
 	}

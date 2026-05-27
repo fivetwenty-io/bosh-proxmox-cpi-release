@@ -332,6 +332,9 @@ func TestPickLayer_mediaTypeErrorSkipped(t *testing.T) {
 
 // newTestRegistry spins up an httptest server backed by an in-memory OCI
 // registry. Returns the server and the base host string (e.g. "127.0.0.1:PORT").
+//
+// nolint:unparam // *httptest.Server result is kept so tests that need direct
+// server access (e.g. closing early to simulate network failure) can use it.
 func newTestRegistry(t *testing.T) (*httptest.Server, string) {
 	t.Helper()
 	reg := registry.New()
@@ -343,6 +346,8 @@ func newTestRegistry(t *testing.T) (*httptest.Server, string) {
 
 // pushImage pushes img to registry at host under repoTag (e.g. "myrepo:v1").
 // Returns the full reference string.
+//
+// nolint:unparam // full-ref result kept for tests that assert exact ref text.
 func pushImage(t *testing.T, host string, repoTag string, img v1.Image) string {
 	t.Helper()
 	fullRef := fmt.Sprintf("%s/%s", host, repoTag)

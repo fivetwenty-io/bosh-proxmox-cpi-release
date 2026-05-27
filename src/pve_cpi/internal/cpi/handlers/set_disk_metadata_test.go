@@ -149,12 +149,13 @@ func (c *diskMetaClientMock) ClusterStorage() clusterstorage.Service { return ni
 // helper builders
 // ---------------------------------------------------------------------------
 
-const testDiskCID = "local-lvm:vm-100-disk-0"
-const testNode = "pve1"
 const testVMID = int64(100)
 
 // clusterResourcesWithVM builds a ListResourcesResponse with a single VM entry.
 // This is used by findVMsHostingDisk (via Cluster().ListResources) after the B9 fix.
+// node is always testNode in this suite; kept as parameter for call-site clarity.
+//
+//nolint:unparam // node kept for readability; call sites always pass testNode
 func clusterResourcesWithVM(vmid int64, node string) *sdkclusterapi.ListResourcesResponse {
 	type entry struct {
 		VMID int64  `json:"vmid"`
@@ -207,6 +208,8 @@ func (m *diskMetaClusterSvc) ListResources(ctx context.Context, params *sdkclust
 var _ sdkclusterapi.Service = (*diskMetaClusterSvc)(nil)
 
 // vmConfigWithDisk builds a QEMU config map that includes diskCID at scsi0.
+//
+//nolint:unparam // diskCID kept for call-site clarity; some callers vary it (cid local var)
 func vmConfigWithDisk(diskCID, desc string) map[string]any {
 	m := map[string]any{
 		"scsi0": diskCID,

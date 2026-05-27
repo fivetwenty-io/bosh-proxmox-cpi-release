@@ -51,20 +51,33 @@ func main() {
 	os.Exit(run())
 }
 
+// runOptions holds optional overrides for runWithArgs. The zero value is valid
+// and selects production defaults for every field.
+type runOptions struct {
+	// ClientFactory constructs the PVE client from a loaded config. When nil,
+	// runWithArgs uses pve.NewClient. Tests inject a factory that returns a
+	// nilPVEClient to exercise the pve.NewClient error path without a live PVE.
+	ClientFactory func(cfg *config.CPIConfig, logger *log.Logger) (pve.Client, error)
+}
+
 // run is the thin os-wired entry point. It delegates to runWithArgs so the
 // startup logic is testable in-process without spawning a subprocess.
 func run() int {
-	return runWithArgs(os.Args[1:], os.Stdin, os.Stdout, os.Stderr)
+	return runWithArgs(os.Args[1:], os.Stdin, os.Stdout, os.Stderr, runOptions{})
 }
 
 // runWithArgs contains the full startup and event loop. Accepting args, stdin,
-// stdout, and stderr as parameters makes every flag-parse and config-load path
-// testable without spawning a subprocess or manipulating os.Args.
+// stdout, stderr, and opts as parameters makes every flag-parse, config-load,
+// and client-init path testable without spawning a subprocess or manipulating
+// os.Args.
+//
+// opts.ClientFactory overrides pve.NewClient when non-nil. The zero value of
+// runOptions selects production defaults, so production callers pass runOptions{}.
 //
 // Returning an int rather than calling os.Exit directly ensures that all
 // deferred calls (including signal.NotifyContext's cancel) fire before the
 // process exits.
-func runWithArgs(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+func runWithArgs(args []string, stdin io.Reader, stdout, stderr io.Writer, opts runOptions) int {
 	fs := flag.NewFlagSet("cpi", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	configPath := fs.String("config", "", "path to CPI JSON config file (required)")
@@ -105,7 +118,11 @@ func runWithArgs(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return 1
 	}
 
-	client, err := pve.NewClient(cfg, logger)
+	clientFactory := opts.ClientFactory
+	if clientFactory == nil {
+		clientFactory = pve.NewClient
+	}
+	client, err := clientFactory(cfg, logger)
 	if err != nil {
 		logger.Error("pve client init failed", log.Err(err))
 		return 1

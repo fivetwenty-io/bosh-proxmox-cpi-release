@@ -67,6 +67,8 @@ func minimalCfg() *config.CPIConfig {
 }
 
 // makeTestDeps returns cfg and logger suitable for runCPI tests.
+//
+//nolint:unparam // cfg result used by most callers; some discard it with _
 func makeTestDeps(t *testing.T) (*config.CPIConfig, *log.Logger) {
 	t.Helper()
 	cfg := minimalCfg()

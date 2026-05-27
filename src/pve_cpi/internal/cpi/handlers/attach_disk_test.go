@@ -155,7 +155,7 @@ var _ agent.Agent = (*captureAgent)(nil)
 func attachDeps(qemuSvc qemu.Service, ag agent.Agent) handlers.Deps {
 	return handlers.Deps{
 		Config: &config.CPIConfig{
-			Node:         "pve1",
+			Node:         testNode,
 			VMDiskFormat: "qcow2",
 		},
 		PVE:    &mockPVEClient{qemuSvc: qemuSvc},
@@ -206,17 +206,16 @@ func extractPath(t *testing.T, result any) string {
 func TestHandleAttachDisk_Happy(t *testing.T) {
 	t.Parallel()
 	const (
-		vmCID   = "100"
-		diskCID = "local-lvm:vm-9001-disk-0"
-		volid   = "vm-9001-disk-0"
+		vmCID = "100"
+		volid = "vm-9001-disk-0"
 	)
 
 	qemuSvc := &attachQEMUService{
-		attachReturnDiskID: "scsi2",
+		attachReturnDiskID: diskSlot,
 		configCfg: map[string]any{
-			"scsi0": "local-lvm:vm-100-disk-0",
-			"scsi1": "local-lvm:vm-100-disk-1",
-			"scsi2": volid,
+			"scsi0":  testDiskCID,
+			"scsi1":  "local-lvm:vm-100-disk-1",
+			diskSlot: volid,
 		},
 	}
 	ag := &captureAgent{}
@@ -258,15 +257,14 @@ func TestHandleAttachDisk_Happy(t *testing.T) {
 func TestHandleAttachDisk_AlreadyAttached(t *testing.T) {
 	t.Parallel()
 	const (
-		vmCID   = "100"
-		diskCID = "local-lvm:vm-9001-disk-0"
-		volid   = "vm-9001-disk-0"
+		vmCID = "100"
+		volid = "vm-9001-disk-0"
 	)
 
 	qemuSvc := &attachQEMUService{
 		attachReturnDiskID: "scsi1",
 		configCfg: map[string]any{
-			"scsi0": "local-lvm:vm-100-disk-0",
+			"scsi0": testDiskCID,
 			"scsi1": volid,
 		},
 	}
@@ -322,8 +320,8 @@ func TestHandleAttachDisk_UpdateDiskHintsFail(t *testing.T) {
 	t.Parallel()
 	const volid = "vm-9001-disk-0"
 	qemuSvc := &attachQEMUService{
-		attachReturnDiskID: "scsi2",
-		configCfg:          map[string]any{"scsi2": volid},
+		attachReturnDiskID: diskSlot,
+		configCfg:          map[string]any{diskSlot: volid},
 	}
 	ag := &captureAgent{updateErr: errors.New("registry unavailable")}
 	h := handlers.HandleAttachDisk(attachDeps(qemuSvc, ag))
@@ -430,8 +428,8 @@ func TestHandleAttachDisk_DiskHintsShape(t *testing.T) {
 	t.Parallel()
 	const volid = "vm-9001-disk-0"
 	qemuSvc := &attachQEMUService{
-		attachReturnDiskID: "scsi2",
-		configCfg:          map[string]any{"scsi2": volid},
+		attachReturnDiskID: diskSlot,
+		configCfg:          map[string]any{diskSlot: volid},
 	}
 	h := handlers.HandleAttachDisk(attachDeps(qemuSvc, &captureAgent{}))
 
@@ -568,12 +566,12 @@ func TestHandleAttachDisk_PicksLowestFreeAtOrAboveOne(t *testing.T) {
 	t.Parallel()
 	const volid = "vm-9001-disk-0"
 	qemuSvc := &attachQEMUService{
-		attachReturnDiskID: "scsi2",
+		attachReturnDiskID: diskSlot,
 		configCfg: map[string]any{
 			"virtio0": "data:vm-100-disk-0",
 			"scsi1":   "data:other-a",
 			"scsi3":   "data:other-c",
-			"scsi2":   "data:" + volid, // post-attach resolve view
+			diskSlot:  "data:" + volid, // post-attach resolve view
 		},
 	}
 	ag := &captureAgent{}
@@ -609,7 +607,8 @@ func TestHandleAttachDisk_PicksLowestFreeAtOrAboveOne(t *testing.T) {
 // plus the mandatory synthetic "current" entry.
 func snapshots(names ...string) func(_ context.Context, _ string, _ int) ([]map[string]any, error) {
 	return func(_ context.Context, _ string, _ int) ([]map[string]any, error) {
-		out := []map[string]any{{"name": "current"}}
+		out := make([]map[string]any, 0, 1+len(names))
+		out = append(out, map[string]any{"name": "current"})
 		for _, n := range names {
 			out = append(out, map[string]any{"name": n})
 		}
@@ -631,7 +630,7 @@ func snapshotErr(err error) func(_ context.Context, _ string, _ int) ([]map[stri
 // backend so no vmNode lookup is triggered).
 func guardCfg(allowDiskOps, requireCheckPass bool) *config.CPIConfig {
 	return &config.CPIConfig{
-		Node:                      "pve1",
+		Node:                      testNode,
 		VMDiskFormat:              "qcow2",
 		AllowDiskOpsWithSnapshots: allowDiskOps,
 		RequireSnapshotCheckPass:  requireCheckPass,
@@ -643,8 +642,8 @@ func guardCfg(allowDiskOps, requireCheckPass bool) *config.CPIConfig {
 // used in the test.
 func snapQEMUSvc(
 	listFn func(context.Context, string, int) ([]map[string]any, error),
-	volid string,
 ) *attachQEMUService {
+	const volid = "vm-9001-disk-0"
 	return &attachQEMUService{
 		attachReturnDiskID: "scsi1",
 		configCfg: map[string]any{
@@ -659,11 +658,10 @@ func snapQEMUSvc(
 // real snapshots and AllowDiskOpsWithSnapshots is false.
 func TestHandleAttachDisk_GuardBlocksWhenSnapshotsPresent(t *testing.T) {
 	t.Parallel()
-	const volid = "vm-9001-disk-0"
-	const diskCID = "data:" + volid
+	const diskCID = "data:vm-9001-disk-0"
 	snapName1, snapName2 := "bosh-snap-a", "bosh-snap-b"
 
-	qemuSvc := snapQEMUSvc(snapshots(snapName1, snapName2), volid)
+	qemuSvc := snapQEMUSvc(snapshots(snapName1, snapName2))
 	// Sentinel: if AttachDisk is called unexpectedly it will return this error,
 	// and the test will catch it via the error message.
 	qemuSvc.attachErr = errors.New("AttachDisk must not be called")
@@ -697,7 +695,7 @@ func TestHandleAttachDisk_GuardProceedsWhenNoSnapshots(t *testing.T) {
 	const volid = "vm-9001-disk-0"
 	const diskCID = "data:" + volid
 
-	qemuSvc := snapQEMUSvc(snapshots( /* none */ ), volid)
+	qemuSvc := snapQEMUSvc(snapshots( /* none */ ))
 	ag := &captureAgent{}
 	h := handlers.HandleAttachDisk(attachDepsWithConfig(qemuSvc, ag, guardCfg(false, false)))
 
@@ -722,7 +720,7 @@ func TestHandleAttachDisk_GuardCheckErrorFailOpen(t *testing.T) {
 	const diskCID = "data:" + volid
 
 	listErr := errors.New("PVE transient: connection reset")
-	qemuSvc := snapQEMUSvc(snapshotErr(listErr), volid)
+	qemuSvc := snapQEMUSvc(snapshotErr(listErr))
 	ag := &captureAgent{}
 	h := handlers.HandleAttachDisk(attachDepsWithConfig(qemuSvc, ag, guardCfg(false, false)))
 
@@ -747,7 +745,7 @@ func TestHandleAttachDisk_GuardCheckErrorFailClosed(t *testing.T) {
 	const diskCID = "data:" + volid
 
 	listErr := errors.New("PVE transient: connection reset")
-	qemuSvc := snapQEMUSvc(snapshotErr(listErr), volid)
+	qemuSvc := snapQEMUSvc(snapshotErr(listErr))
 	qemuSvc.attachErr = errors.New("AttachDisk must not be called")
 
 	ag := &captureAgent{}
@@ -773,7 +771,7 @@ func TestHandleAttachDisk_GuardAllowOverrideProceeds(t *testing.T) {
 	const volid = "vm-9001-disk-0"
 	const diskCID = "data:" + volid
 
-	qemuSvc := snapQEMUSvc(snapshots("snap-override-test"), volid)
+	qemuSvc := snapQEMUSvc(snapshots("snap-override-test"))
 	ag := &captureAgent{}
 	h := handlers.HandleAttachDisk(attachDepsWithConfig(qemuSvc, ag, guardCfg(true, false)))
 
@@ -870,9 +868,7 @@ func TestHandleAttachDisk_LocalBackend_CoLocationEnforced(t *testing.T) {
 	t.Parallel()
 	const (
 		vmCID    = "100"
-		diskCID  = "local-lvm:vm-9001-disk-0"
 		diskNode = "pve-node2" // where the local-storage disk lives
-		vmNode   = "pve-node1" // where the VM runs (different node → violation)
 	)
 
 	// attachQEMUService: slot selection needs Config (returns empty — picks scsi1).
@@ -892,7 +888,7 @@ func TestHandleAttachDisk_LocalBackend_CoLocationEnforced(t *testing.T) {
 
 	deps := handlers.Deps{
 		Config: &config.CPIConfig{
-			Node:         "pve1",
+			Node:         testNode,
 			VMDiskFormat: "qcow2",
 		},
 		PVE: &mockPVEClient{
@@ -937,10 +933,7 @@ func TestHandleAttachDisk_LocalBackend_CoLocationEnforced(t *testing.T) {
 // ("local-lvm:vm-9001-disk-0") is parsed correctly and attach proceeds.
 func TestHandleAttachDisk_LVM_CID(t *testing.T) {
 	t.Parallel()
-	const (
-		diskCID = "local-lvm:vm-9001-disk-0"
-		volid   = "vm-9001-disk-0"
-	)
+	const volid = "vm-9001-disk-0"
 	qemuSvc := &attachQEMUService{
 		attachReturnDiskID: "scsi1",
 		configCfg:          map[string]any{"scsi1": diskCID},
@@ -1082,8 +1075,8 @@ func TestHandleAttachDisk_AuthFailure(t *testing.T) {
 	}
 
 	// 401 is a 4xx non-404 → WrapError returns a non-retriable Cloud error.
-	cpiErr, ok := err.(*cpierrors.Error)
-	if !ok {
+	var cpiErr *cpierrors.Error
+	if !errors.As(err, &cpiErr) {
 		t.Fatalf("expected *cpierrors.Error, got %T: %v", err, err)
 	}
 	if cpiErr.OkToRetry() {
@@ -1116,10 +1109,7 @@ func TestHandleAttachDisk_AuthFailure(t *testing.T) {
 func TestAttachDisk_ConcurrentSameVM(t *testing.T) {
 	t.Parallel()
 
-	const (
-		vmCID   = "100"
-		diskCID = "local-lvm:vm-9001-disk-0"
-	)
+	const vmCID = "100"
 
 	// newQEMU returns a fresh, unshared attachQEMUService for each goroutine.
 	// Sharing a single instance would cause a data race on configCalls.
@@ -1160,8 +1150,8 @@ func TestAttachDisk_ConcurrentSameVM(t *testing.T) {
 		if r.err == nil {
 			continue // success: idempotent attach
 		}
-		cpiErr, ok := r.err.(*cpierrors.Error)
-		if !ok {
+		var cpiErr *cpierrors.Error
+		if !errors.As(r.err, &cpiErr) {
 			// Non-CPI error — unexpected; surface it.
 			nonRetriableFailures = append(nonRetriableFailures, r.err)
 			continue

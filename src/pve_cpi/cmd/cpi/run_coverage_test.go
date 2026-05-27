@@ -28,9 +28,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/cpi"
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
+	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
+	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
 )
 
 // --------------------------------------------------------------------------
@@ -282,7 +285,7 @@ func TestRunCPI_ErrTooLong(t *testing.T) {
 func TestRunWithArgs_NoConfig(t *testing.T) {
 	t.Parallel()
 	var stdout, stderr bytes.Buffer
-	code := runWithArgs([]string{}, strings.NewReader(""), &stdout, &stderr)
+	code := runWithArgs([]string{}, strings.NewReader(""), &stdout, &stderr, runOptions{})
 	if code != 1 {
 		t.Errorf("expected exit code 1 for missing --config, got %d", code)
 	}
@@ -293,7 +296,7 @@ func TestRunWithArgs_NoConfig(t *testing.T) {
 func TestRunWithArgs_VersionFlag(t *testing.T) {
 	t.Parallel()
 	var stdout, stderr bytes.Buffer
-	code := runWithArgs([]string{"--version"}, strings.NewReader(""), &stdout, &stderr)
+	code := runWithArgs([]string{"--version"}, strings.NewReader(""), &stdout, &stderr, runOptions{})
 	if code != 0 {
 		t.Errorf("expected exit code 0 for --version, got %d; stderr=%q", code, stderr.String())
 	}
@@ -307,7 +310,7 @@ func TestRunWithArgs_VersionFlag(t *testing.T) {
 func TestRunWithArgs_UnknownFlag(t *testing.T) {
 	t.Parallel()
 	var stdout, stderr bytes.Buffer
-	code := runWithArgs([]string{"--unknown-xyz"}, strings.NewReader(""), &stdout, &stderr)
+	code := runWithArgs([]string{"--unknown-xyz"}, strings.NewReader(""), &stdout, &stderr, runOptions{})
 	if code != 1 {
 		t.Errorf("expected exit code 1 for unknown flag, got %d", code)
 	}
@@ -317,7 +320,7 @@ func TestRunWithArgs_UnknownFlag(t *testing.T) {
 func TestRunWithArgs_PositionalArgs(t *testing.T) {
 	t.Parallel()
 	var stdout, stderr bytes.Buffer
-	code := runWithArgs([]string{"unexpected"}, strings.NewReader(""), &stdout, &stderr)
+	code := runWithArgs([]string{"unexpected"}, strings.NewReader(""), &stdout, &stderr, runOptions{})
 	if code != 1 {
 		t.Errorf("expected exit code 1 for positional arg, got %d", code)
 	}
@@ -332,6 +335,7 @@ func TestRunWithArgs_MissingConfigFile(t *testing.T) {
 		[]string{"--config", "/nonexistent/bosh-pve-cpi-test-config.json"},
 		strings.NewReader(""),
 		&stdout, &stderr,
+		runOptions{},
 	)
 	if code != 1 {
 		t.Errorf("expected exit code 1 for missing config file, got %d", code)
@@ -370,6 +374,7 @@ func TestRunWithArgs_ValidConfigEOF(t *testing.T) {
 		[]string{"--config", cfgFile},
 		strings.NewReader(""), // EOF immediately
 		&stdout, &stderr,
+		runOptions{},
 	)
 	if code != 0 {
 		t.Errorf("expected exit code 0 for valid config + EOF stdin, got %d; stderr=%q", code, stderr.String())
@@ -405,6 +410,7 @@ func TestRunWithArgs_ValidConfigInfoRequest(t *testing.T) {
 		[]string{"--config", cfgFile},
 		strings.NewReader(req),
 		&stdout, &stderr,
+		runOptions{},
 	)
 	if code != 0 {
 		t.Errorf("expected exit code 0, got %d; stderr=%q", code, stderr.String())
@@ -450,6 +456,7 @@ func TestRunWithArgs_InvalidLogLevel(t *testing.T) {
 		[]string{"--config", cfgFile},
 		strings.NewReader(""),
 		&stdout, &stderr,
+		runOptions{},
 	)
 	// Logger init or config validation may fail — either 0 (if level is
 	// silently defaulted) or 1 (if rejected). Accept either but guard panic.
@@ -772,5 +779,139 @@ func TestWriteErrorResponse_WritesCloudError(t *testing.T) {
 	}
 	if _, ok := decoded["error"]; !ok {
 		t.Errorf("CloudError response missing 'error' key: %v", decoded)
+	}
+}
+
+// --------------------------------------------------------------------------
+// D1d — clientFactory seam tests
+// --------------------------------------------------------------------------
+
+// errFactoryFail is returned by the failing factory stub.
+var errFactoryFail = errors.New("test: pve client init failed")
+
+// TestRunWithArgs_ClientFactoryError exercises the pve.NewClient error path in
+// runWithArgs by injecting a factory that always returns errFactoryFail.
+// Expects exit code 1 and no panic.
+func TestRunWithArgs_ClientFactoryError(t *testing.T) {
+	t.Parallel()
+
+	cfgJSON := `{
+  "host": "127.0.0.1",
+  "user": "root",
+  "password": "test-password",
+  "vm_storage": "local-lvm",
+  "disk_storage": "local-lvm",
+  "stemcell_storage": "local",
+  "network_bridge": "vmbr0",
+  "node": "pve1",
+  "log_level": "error",
+  "verify_ssl": false
+}`
+	cfgFile := filepath.Join(t.TempDir(), "cpi.json")
+	if err := os.WriteFile(cfgFile, []byte(cfgJSON), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	failFactory := func(_ *config.CPIConfig, _ *log.Logger) (pve.Client, error) {
+		return nil, errFactoryFail
+	}
+	var stdout, stderr bytes.Buffer
+	code := runWithArgs(
+		[]string{"--config", cfgFile},
+		strings.NewReader(""),
+		&stdout, &stderr,
+		runOptions{ClientFactory: failFactory},
+	)
+	if code != 1 {
+		t.Errorf("expected exit code 1 for client factory error, got %d; stderr=%q", code, stderr.String())
+	}
+}
+
+// TestRunWithArgs_ClientFactorySuccess exercises the full startup path using
+// the nilPVEClient factory (zero overhead, no network calls). Feeds an "info"
+// request and expects exit 0 and a well-formed JSONRPC envelope.
+func TestRunWithArgs_ClientFactorySuccess(t *testing.T) {
+	t.Parallel()
+
+	cfgJSON := `{
+  "host": "127.0.0.1",
+  "user": "root",
+  "password": "test-password",
+  "vm_storage": "local-lvm",
+  "disk_storage": "local-lvm",
+  "stemcell_storage": "local",
+  "network_bridge": "vmbr0",
+  "node": "pve1",
+  "log_level": "error",
+  "verify_ssl": false
+}`
+	cfgFile := filepath.Join(t.TempDir(), "cpi.json")
+	if err := os.WriteFile(cfgFile, []byte(cfgJSON), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	nilFactory := func(_ *config.CPIConfig, _ *log.Logger) (pve.Client, error) {
+		return nilPVEClient{}, nil
+	}
+	req := `{"method":"info","arguments":[],"context":{"request_id":"factory-test-1"},"api_version":2}` + "\n"
+	var stdout, stderr bytes.Buffer
+	code := runWithArgs(
+		[]string{"--config", cfgFile},
+		strings.NewReader(req),
+		&stdout, &stderr,
+		runOptions{ClientFactory: nilFactory},
+	)
+	if code != 0 {
+		t.Errorf("expected exit code 0, got %d; stderr=%q", code, stderr.String())
+	}
+	out := strings.TrimSpace(stdout.String())
+	if out == "" {
+		t.Fatal("expected JSONRPC response on stdout, got empty buffer")
+	}
+	var resp jsonrpc.Response
+	if err := json.Unmarshal([]byte(out), &resp); err != nil {
+		t.Fatalf("unmarshal response: %v\nraw: %s", err, out)
+	}
+	if resp.Result == nil && resp.Error == nil {
+		t.Fatal("JSONRPC response has both nil result and nil error")
+	}
+}
+
+// TestRunWithArgs_AgentInitError exercises the agent.NewAgent error path by
+// injecting a nilPVEClient factory and setting agent_mode to an unsupported
+// value. NewAgent returns NotSupported, runWithArgs returns 1.
+func TestRunWithArgs_AgentInitError(t *testing.T) {
+	t.Parallel()
+
+	cfgJSON := `{
+  "host": "127.0.0.1",
+  "user": "root",
+  "password": "test-password",
+  "vm_storage": "local-lvm",
+  "disk_storage": "local-lvm",
+  "stemcell_storage": "local",
+  "network_bridge": "vmbr0",
+  "node": "pve1",
+  "log_level": "error",
+  "verify_ssl": false,
+  "agent_mode": "unsupported-mode-xyz"
+}`
+	cfgFile := filepath.Join(t.TempDir(), "cpi.json")
+	if err := os.WriteFile(cfgFile, []byte(cfgJSON), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	nilFactory := func(_ *config.CPIConfig, _ *log.Logger) (pve.Client, error) {
+		return nilPVEClient{}, nil
+	}
+	var stdout, stderr bytes.Buffer
+	code := runWithArgs(
+		[]string{"--config", cfgFile},
+		strings.NewReader(""),
+		&stdout, &stderr,
+		runOptions{ClientFactory: nilFactory},
+	)
+	if code != 1 {
+		t.Errorf("expected exit code 1 for agent init error, got %d; stderr=%q", code, stderr.String())
 	}
 }

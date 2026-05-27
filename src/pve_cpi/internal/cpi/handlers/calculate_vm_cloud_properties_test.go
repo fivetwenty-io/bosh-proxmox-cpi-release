@@ -118,7 +118,7 @@ func makeCalcDeps(svc *mockClusterService) handlers.Deps {
 	return handlers.Deps{
 		Config: &config.CPIConfig{
 			VMDiskFormat: "qcow2",
-			VMStorage:    "local-lvm",
+			VMStorage:    storageName,
 		},
 		PVE: &mockPVEClient{
 			clusterSvc: svc.asCanonical(),
@@ -134,7 +134,7 @@ func makeCalcDepsWithNodes(svc *mockClusterService, nodesSvc nodes.Service) hand
 	return handlers.Deps{
 		Config: &config.CPIConfig{
 			VMDiskFormat: "qcow2",
-			VMStorage:    "local-lvm",
+			VMStorage:    storageName,
 		},
 		PVE: &mockPVEClient{
 			clusterSvc: svc.asCanonical(),
@@ -188,7 +188,7 @@ func TestHandleCalculateVMCloudProperties_SingleNodeFit(t *testing.T) {
 
 	// Node has 8 cores, 8 GiB RAM, 2 GiB used → 6 GiB free.
 	resp := cluster.ListStatusResponse{
-		nodeJSON("pve1", 8, 8*1024*1024*1024, 2*1024*1024*1024, 1),
+		nodeJSON(testNode, 8, 8*1024*1024*1024, 2*1024*1024*1024, 1),
 	}
 	svc := &mockClusterService{statusResp: &resp}
 	deps := makeCalcDeps(svc)
@@ -219,11 +219,11 @@ func TestHandleCalculateVMCloudProperties_SingleNodeFit(t *testing.T) {
 		t.Errorf("vm_disk_format = %q; want qcow2", vmDiskFormat)
 	}
 	var targetNode string
-	if e := json.Unmarshal(m["target_node"], &targetNode); e != nil || targetNode != "pve1" {
+	if e := json.Unmarshal(m["target_node"], &targetNode); e != nil || targetNode != testNode {
 		t.Errorf("target_node = %q; want pve1", targetNode)
 	}
 	var targetStorage string
-	if e := json.Unmarshal(m["target_storage"], &targetStorage); e != nil || targetStorage != "local-lvm" {
+	if e := json.Unmarshal(m["target_storage"], &targetStorage); e != nil || targetStorage != storageName {
 		t.Errorf("target_storage = %q; want local-lvm", targetStorage)
 	}
 }
@@ -234,8 +234,8 @@ func TestHandleCalculateVMCloudProperties_MultiNodePicksBest(t *testing.T) {
 	// pve1: 16 cores, 4 GiB free. pve2: 16 cores, 12 GiB free → pick pve2.
 	gib := int64(1024 * 1024 * 1024)
 	resp := cluster.ListStatusResponse{
-		nodeJSON("pve1", 16, 16*gib, 12*gib, 1), // 4 GiB free
-		nodeJSON("pve2", 16, 16*gib, 4*gib, 1),  // 12 GiB free
+		nodeJSON(testNode, 16, 16*gib, 12*gib, 1), // 4 GiB free
+		nodeJSON("pve2", 16, 16*gib, 4*gib, 1),    // 12 GiB free
 	}
 	svc := &mockClusterService{statusResp: &resp}
 	deps := makeCalcDeps(svc)
@@ -259,7 +259,7 @@ func TestHandleCalculateVMCloudProperties_NoFit(t *testing.T) {
 	gib := int64(1024 * 1024 * 1024)
 	// Node only has 1 GiB free; request 4 GiB.
 	resp := cluster.ListStatusResponse{
-		nodeJSON("pve1", 8, 4*gib, 3*gib, 1),
+		nodeJSON(testNode, 8, 4*gib, 3*gib, 1),
 	}
 	svc := &mockClusterService{statusResp: &resp}
 	deps := makeCalcDeps(svc)
@@ -279,8 +279,8 @@ func TestHandleCalculateVMCloudProperties_OfflineNodeSkipped(t *testing.T) {
 
 	gib := int64(1024 * 1024 * 1024)
 	resp := cluster.ListStatusResponse{
-		nodeJSON("pve1", 8, 8*gib, 1*gib, 0), // offline
-		nodeJSON("pve2", 8, 8*gib, 1*gib, 1), // online, 7 GiB free
+		nodeJSON(testNode, 8, 8*gib, 1*gib, 0), // offline
+		nodeJSON("pve2", 8, 8*gib, 1*gib, 1),   // online, 7 GiB free
 	}
 	svc := &mockClusterService{statusResp: &resp}
 	deps := makeCalcDeps(svc)
@@ -304,7 +304,7 @@ func TestHandleCalculateVMCloudProperties_CPUShortfall(t *testing.T) {
 	gib := int64(1024 * 1024 * 1024)
 	// Node has only 4 cores; request 8.
 	resp := cluster.ListStatusResponse{
-		nodeJSON("pve1", 4, 16*gib, 1*gib, 1),
+		nodeJSON(testNode, 4, 16*gib, 1*gib, 1),
 	}
 	svc := &mockClusterService{statusResp: &resp}
 	deps := makeCalcDeps(svc)
@@ -371,8 +371,8 @@ func TestHandleCalculateVMCloudProperties_StorageFirst_AllHaveStorage(t *testing
 	gib := int64(1024 * 1024 * 1024)
 	// pve1: 4 GiB free. pve2: 10 GiB free. Both have local-lvm active.
 	clusterResp := cluster.ListStatusResponse{
-		nodeJSON("pve1", 8, 16*gib, 12*gib, 1), // 4 GiB free
-		nodeJSON("pve2", 8, 16*gib, 6*gib, 1),  // 10 GiB free
+		nodeJSON(testNode, 8, 16*gib, 12*gib, 1), // 4 GiB free
+		nodeJSON("pve2", 8, 16*gib, 6*gib, 1),    // 10 GiB free
 	}
 	clusterSvc := &mockClusterService{statusResp: &clusterResp}
 	nodesSvc := &mockNodesService{} // nil listStorageFn → all nodes have storage active+images
@@ -391,7 +391,7 @@ func TestHandleCalculateVMCloudProperties_StorageFirst_AllHaveStorage(t *testing
 		t.Errorf("target_node = %q; want pve2 (most free RAM)", targetNode)
 	}
 	var targetStorage string
-	if e := json.Unmarshal(m["target_storage"], &targetStorage); e != nil || targetStorage != "local-lvm" {
+	if e := json.Unmarshal(m["target_storage"], &targetStorage); e != nil || targetStorage != storageName {
 		t.Errorf("target_storage = %q; want local-lvm", targetStorage)
 	}
 }
@@ -406,18 +406,18 @@ func TestHandleCalculateVMCloudProperties_StorageFirst_BestRAMLacksStorage(t *te
 	// pve1: 10 GiB free but storage inactive. pve2: 6 GiB free, storage active.
 	// Expected winner: pve2.
 	clusterResp := cluster.ListStatusResponse{
-		nodeJSON("pve1", 8, 16*gib, 6*gib, 1),  // 10 GiB free, but storage bad
-		nodeJSON("pve2", 8, 16*gib, 10*gib, 1), // 6 GiB free, storage good
+		nodeJSON(testNode, 8, 16*gib, 6*gib, 1), // 10 GiB free, but storage bad
+		nodeJSON("pve2", 8, 16*gib, 10*gib, 1),  // 6 GiB free, storage good
 	}
 	clusterSvc := &mockClusterService{statusResp: &clusterResp}
 
 	nodesSvc := &mockNodesService{
 		listStorageFn: func(_ context.Context, node string, params *nodes.ListStorageParams) (*nodes.ListStorageResponse, error) {
 			switch node {
-			case "pve1":
-				return storageInactiveJSON("local-lvm"), nil
+			case testNode:
+				return storageInactiveJSON(storageName), nil
 			case "pve2":
-				return storageActiveImagesJSON("local-lvm"), nil
+				return storageActiveImagesJSON(storageName), nil
 			default:
 				return emptyStorageResponse(), nil
 			}
@@ -447,14 +447,14 @@ func TestHandleCalculateVMCloudProperties_StorageFirst_AllLackStorage(t *testing
 
 	gib := int64(1024 * 1024 * 1024)
 	clusterResp := cluster.ListStatusResponse{
-		nodeJSON("pve1", 8, 16*gib, 4*gib, 1), // 12 GiB free, storage bad
-		nodeJSON("pve2", 8, 16*gib, 4*gib, 1), // 12 GiB free, storage bad
+		nodeJSON(testNode, 8, 16*gib, 4*gib, 1), // 12 GiB free, storage bad
+		nodeJSON("pve2", 8, 16*gib, 4*gib, 1),   // 12 GiB free, storage bad
 	}
 	clusterSvc := &mockClusterService{statusResp: &clusterResp}
 
 	nodesSvc := &mockNodesService{
 		listStorageFn: func(_ context.Context, node string, params *nodes.ListStorageParams) (*nodes.ListStorageResponse, error) {
-			return storageInactiveJSON("local-lvm"), nil
+			return storageInactiveJSON(storageName), nil
 		},
 	}
 
@@ -470,11 +470,11 @@ func TestHandleCalculateVMCloudProperties_StorageFirst_AllLackStorage(t *testing
 	}
 	// Both pve1 and pve2 qualify on CPU+RAM but fail storage — must appear in message.
 	errMsg := err.Error()
-	if !strings.Contains(errMsg, "pve1") || !strings.Contains(errMsg, "pve2") {
+	if !strings.Contains(errMsg, testNode) || !strings.Contains(errMsg, "pve2") {
 		t.Errorf("error message should name pve1 and pve2 as storage-failed nodes; got: %s", errMsg)
 	}
-	if !strings.Contains(errMsg, "local-lvm") {
-		t.Errorf("error message should name effective storage %q; got: %s", "local-lvm", errMsg)
+	if !strings.Contains(errMsg, storageName) {
+		t.Errorf("error message should name effective storage %q; got: %s", storageName, errMsg)
 	}
 }
 
@@ -488,17 +488,17 @@ func TestHandleCalculateVMCloudProperties_StorageFirst_OneNodeListStorageError(t
 	// pve1: ListStorage fails (network error). pve2: storage active.
 	// Expected: pve1 excluded; pve2 wins.
 	clusterResp := cluster.ListStatusResponse{
-		nodeJSON("pve1", 8, 16*gib, 4*gib, 1), // 12 GiB free, ListStorage fails
-		nodeJSON("pve2", 8, 16*gib, 8*gib, 1), // 8 GiB free, storage good
+		nodeJSON(testNode, 8, 16*gib, 4*gib, 1), // 12 GiB free, ListStorage fails
+		nodeJSON("pve2", 8, 16*gib, 8*gib, 1),   // 8 GiB free, storage good
 	}
 	clusterSvc := &mockClusterService{statusResp: &clusterResp}
 
 	nodesSvc := &mockNodesService{
 		listStorageFn: func(_ context.Context, node string, params *nodes.ListStorageParams) (*nodes.ListStorageResponse, error) {
-			if node == "pve1" {
+			if node == testNode {
 				return nil, fmt.Errorf("connection refused")
 			}
-			return storageActiveImagesJSON("local-lvm"), nil
+			return storageActiveImagesJSON(storageName), nil
 		},
 	}
 
@@ -526,8 +526,8 @@ func TestHandleCalculateVMCloudProperties_StorageFirst_AllNodesListStorageError(
 
 	gib := int64(1024 * 1024 * 1024)
 	clusterResp := cluster.ListStatusResponse{
-		nodeJSON("pve1", 8, 16*gib, 4*gib, 1), // fits CPU/RAM, ListStorage fails
-		nodeJSON("pve2", 8, 16*gib, 8*gib, 1), // fits CPU/RAM, ListStorage fails
+		nodeJSON(testNode, 8, 16*gib, 4*gib, 1), // fits CPU/RAM, ListStorage fails
+		nodeJSON("pve2", 8, 16*gib, 8*gib, 1),   // fits CPU/RAM, ListStorage fails
 	}
 	clusterSvc := &mockClusterService{statusResp: &clusterResp}
 
@@ -548,7 +548,7 @@ func TestHandleCalculateVMCloudProperties_StorageFirst_AllNodesListStorageError(
 		t.Errorf("error type want NotSupported, got %v", err)
 	}
 	errMsg := err.Error()
-	if !strings.Contains(errMsg, "pve1") || !strings.Contains(errMsg, "pve2") {
+	if !strings.Contains(errMsg, testNode) || !strings.Contains(errMsg, "pve2") {
 		t.Errorf("error message must name the unreachable-storage nodes pve1 and pve2; got: %s", errMsg)
 	}
 }
@@ -561,17 +561,17 @@ func TestHandleCalculateVMCloudProperties_StorageOverride_Used(t *testing.T) {
 
 	gib := int64(1024 * 1024 * 1024)
 	clusterResp := cluster.ListStatusResponse{
-		nodeJSON("pve1", 8, 16*gib, 4*gib, 1),
+		nodeJSON(testNode, 8, 16*gib, 4*gib, 1),
 	}
 	clusterSvc := &mockClusterService{statusResp: &clusterResp}
 
-	// Only return active+images for "ceph-vm" (the override); return inactive for "local-lvm".
+	// Only return active+images for "ceph-vm" (the override); return inactive for storageName.
 	nodesSvc := &mockNodesService{
 		listStorageFn: func(_ context.Context, node string, params *nodes.ListStorageParams) (*nodes.ListStorageResponse, error) {
 			if params != nil && params.Storage != nil && *params.Storage == "ceph-vm" {
 				return storageActiveImagesJSON("ceph-vm"), nil
 			}
-			return storageInactiveJSON("local-lvm"), nil
+			return storageInactiveJSON(storageName), nil
 		},
 	}
 
@@ -589,7 +589,7 @@ func TestHandleCalculateVMCloudProperties_StorageOverride_Used(t *testing.T) {
 		t.Errorf("target_storage = %q; want ceph-vm (per-request override)", targetStorage)
 	}
 	var targetNode string
-	if e := json.Unmarshal(m["target_node"], &targetNode); e != nil || targetNode != "pve1" {
+	if e := json.Unmarshal(m["target_node"], &targetNode); e != nil || targetNode != testNode {
 		t.Errorf("target_node = %q; want pve1", targetNode)
 	}
 }
@@ -602,7 +602,7 @@ func TestHandleCalculateVMCloudProperties_StorageOverride_Absent(t *testing.T) {
 
 	gib := int64(1024 * 1024 * 1024)
 	clusterResp := cluster.ListStatusResponse{
-		nodeJSON("pve1", 8, 16*gib, 4*gib, 1),
+		nodeJSON(testNode, 8, 16*gib, 4*gib, 1),
 	}
 	clusterSvc := &mockClusterService{statusResp: &clusterResp}
 	nodesSvc := &mockNodesService{} // default: all nodes have storage
@@ -618,7 +618,7 @@ func TestHandleCalculateVMCloudProperties_StorageOverride_Absent(t *testing.T) {
 
 	m := decodeCloudProps(t, result)
 	var targetStorage string
-	if e := json.Unmarshal(m["target_storage"], &targetStorage); e != nil || targetStorage != "local-lvm" {
+	if e := json.Unmarshal(m["target_storage"], &targetStorage); e != nil || targetStorage != storageName {
 		t.Errorf("target_storage = %q; want local-lvm (config default)", targetStorage)
 	}
 }
@@ -632,18 +632,18 @@ func TestHandleCalculateVMCloudProperties_StorageFirst_StorageNoImages(t *testin
 	gib := int64(1024 * 1024 * 1024)
 	// pve1: storage active but content=backup,vztmpl (no images). pve2: storage active+images.
 	clusterResp := cluster.ListStatusResponse{
-		nodeJSON("pve1", 8, 16*gib, 4*gib, 1),  // 12 GiB free, no images
-		nodeJSON("pve2", 8, 16*gib, 10*gib, 1), // 6 GiB free, has images
+		nodeJSON(testNode, 8, 16*gib, 4*gib, 1), // 12 GiB free, no images
+		nodeJSON("pve2", 8, 16*gib, 10*gib, 1),  // 6 GiB free, has images
 	}
 	clusterSvc := &mockClusterService{statusResp: &clusterResp}
 
 	nodesSvc := &mockNodesService{
 		listStorageFn: func(_ context.Context, node string, params *nodes.ListStorageParams) (*nodes.ListStorageResponse, error) {
 			switch node {
-			case "pve1":
-				return storageNoImagesJSON("local-lvm"), nil
+			case testNode:
+				return storageNoImagesJSON(storageName), nil
 			case "pve2":
-				return storageActiveImagesJSON("local-lvm"), nil
+				return storageActiveImagesJSON(storageName), nil
 			default:
 				return emptyStorageResponse(), nil
 			}

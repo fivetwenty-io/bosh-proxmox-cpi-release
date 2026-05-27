@@ -22,8 +22,8 @@ func baseDepsForDelete(t *testing.T, storageSvc *mockStorageService) handlers.De
 	t.Helper()
 	return handlers.Deps{
 		Config: &config.CPIConfig{
-			Node:        "pve1",
-			DiskStorage: "local-lvm",
+			Node:        testNode,
+			DiskStorage: storageName,
 		},
 		PVE:    newHandlerMockClient(storageSvc, nil),
 		Logger: log.NewNopLogger(),
@@ -40,13 +40,13 @@ func TestHandleDeleteDisk_Happy(t *testing.T) {
 	storageSvc := &mockStorageService{
 		deleteVolumeFn: func(_ context.Context, node, storage, volume string) error {
 			deleteCalled = true
-			if node != "pve1" {
+			if node != testNode {
 				t.Errorf("unexpected node %q", node)
 			}
-			if storage != "local-lvm" {
+			if storage != storageName {
 				t.Errorf("unexpected storage %q", storage)
 			}
-			if volume != "local-lvm:vm-9001-disk-0" {
+			if volume != diskCID {
 				t.Errorf("unexpected volume %q", volume)
 			}
 			return nil
@@ -56,7 +56,7 @@ func TestHandleDeleteDisk_Happy(t *testing.T) {
 
 	h := handlers.HandleDeleteDisk(deps)
 	result, err := h.Handle(context.Background(), []json.RawMessage{
-		marshal("local-lvm:vm-9001-disk-0"),
+		marshal(diskCID),
 	}, jsonrpc.Context{})
 
 	if err != nil {
@@ -87,7 +87,7 @@ func TestHandleDeleteDisk_NotFound_Idempotent(t *testing.T) {
 
 	h := handlers.HandleDeleteDisk(deps)
 	result, err := h.Handle(context.Background(), []json.RawMessage{
-		marshal("local-lvm:vm-9001-disk-0"),
+		marshal(diskCID),
 	}, jsonrpc.Context{})
 
 	if err != nil {
@@ -109,7 +109,7 @@ func TestHandleDeleteDisk_SDKError(t *testing.T) {
 
 	h := handlers.HandleDeleteDisk(deps)
 	_, err := h.Handle(context.Background(), []json.RawMessage{
-		marshal("local-lvm:vm-9001-disk-0"),
+		marshal(diskCID),
 	}, jsonrpc.Context{})
 
 	if err == nil {
@@ -166,7 +166,7 @@ func TestHandleDeleteDisk_MissingNode(t *testing.T) {
 	deps := handlers.Deps{
 		Config: &config.CPIConfig{
 			Node:        "",
-			DiskStorage: "local-lvm",
+			DiskStorage: storageName,
 		},
 		PVE:    newHandlerMockClient(storageSvc, nil),
 		Logger: log.NewNopLogger(),
@@ -174,7 +174,7 @@ func TestHandleDeleteDisk_MissingNode(t *testing.T) {
 
 	h := handlers.HandleDeleteDisk(deps)
 	_, err := h.Handle(context.Background(), []json.RawMessage{
-		marshal("local-lvm:vm-9001-disk-0"),
+		marshal(diskCID),
 	}, jsonrpc.Context{})
 
 	if err == nil {
@@ -234,7 +234,7 @@ func TestHandleDeleteDisk_SDKDeleteVolumeReturnsNil(t *testing.T) {
 
 	h := handlers.HandleDeleteDisk(deps)
 	result, err := h.Handle(context.Background(), []json.RawMessage{
-		marshal("local-lvm:vm-9001-disk-0"),
+		marshal(diskCID),
 	}, jsonrpc.Context{})
 
 	if err != nil {
@@ -258,7 +258,7 @@ func TestHandleDeleteDisk_SDKDeleteVolumeReturnsNil(t *testing.T) {
 
 func TestHandleDeleteDisk_LVM_CID(t *testing.T) {
 	t.Parallel()
-	const cid = "local-lvm:vm-9001-disk-0"
+	const cid = diskCID
 	var capturedStorage, capturedVolume string
 	storageSvc := &mockStorageService{
 		deleteVolumeFn: func(_ context.Context, _, storage, volume string) error {
@@ -274,8 +274,8 @@ func TestHandleDeleteDisk_LVM_CID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if capturedStorage != "local-lvm" {
-		t.Errorf("storage: got %q, want %q", capturedStorage, "local-lvm")
+	if capturedStorage != storageName {
+		t.Errorf("storage: got %q, want %q", capturedStorage, storageName)
 	}
 	if capturedVolume != cid {
 		t.Errorf("volume: got %q, want %q", capturedVolume, cid)
@@ -407,8 +407,8 @@ func TestHandleDeleteDisk_NoClusterCallExpected(t *testing.T) {
 	}
 	deps := handlers.Deps{
 		Config: &config.CPIConfig{
-			Node:        "pve1",
-			DiskStorage: "local-lvm",
+			Node:        testNode,
+			DiskStorage: storageName,
 		},
 		PVE:    client,
 		Logger: log.NewNopLogger(),
@@ -416,7 +416,7 @@ func TestHandleDeleteDisk_NoClusterCallExpected(t *testing.T) {
 
 	h := handlers.HandleDeleteDisk(deps)
 	_, err := h.Handle(context.Background(), []json.RawMessage{
-		marshal("local-lvm:vm-9001-disk-0"),
+		marshal(diskCID),
 	}, jsonrpc.Context{})
 
 	if err != nil {
@@ -437,11 +437,11 @@ func TestHandleDeleteDisk_WithoutClusterService(t *testing.T) {
 	storageSvc := &mockStorageService{
 		deleteVolumeFn: func(_ context.Context, _, storage, volume string) error {
 			deleteCalled = true
-			if storage != "local-lvm" {
-				t.Errorf("expected storage %q, got %q", "local-lvm", storage)
+			if storage != storageName {
+				t.Errorf("expected storage %q, got %q", storageName, storage)
 			}
-			if volume != "local-lvm:vm-9001-disk-0" {
-				t.Errorf("expected volume %q, got %q", "local-lvm:vm-9001-disk-0", volume)
+			if volume != diskCID {
+				t.Errorf("expected volume %q, got %q", diskCID, volume)
 			}
 			return nil
 		},
@@ -454,8 +454,8 @@ func TestHandleDeleteDisk_WithoutClusterService(t *testing.T) {
 	client := newHandlerMockClientNoCluster(storageSvc).(pve.Client)
 	deps := handlers.Deps{
 		Config: &config.CPIConfig{
-			Node:        "pve1",
-			DiskStorage: "local-lvm",
+			Node:        testNode,
+			DiskStorage: storageName,
 		},
 		PVE:    client,
 		Logger: log.NewNopLogger(),
@@ -463,7 +463,7 @@ func TestHandleDeleteDisk_WithoutClusterService(t *testing.T) {
 
 	h := handlers.HandleDeleteDisk(deps)
 	result, err := h.Handle(context.Background(), []json.RawMessage{
-		marshal("local-lvm:vm-9001-disk-0"),
+		marshal(diskCID),
 	}, jsonrpc.Context{})
 
 	if err != nil {

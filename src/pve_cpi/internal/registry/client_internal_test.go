@@ -54,7 +54,10 @@ func TestNewClientWithOptions_NilCAPreservesSystemPool(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	tr := c.http.Transport.(*http.Transport)
+	tr, ok := c.http.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("http.Transport: expected *http.Transport, got %T", c.http.Transport)
+	}
 	if tr.TLSClientConfig.RootCAs != nil {
 		t.Errorf("RootCAs = %v, want nil for default Options", tr.TLSClientConfig.RootCAs)
 	}
@@ -71,7 +74,10 @@ func TestNewClient_AppendsCustomCA(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewClientWithOptions: unexpected error: %v", err)
 	}
-	tr := c.http.Transport.(*http.Transport)
+	tr, ok := c.http.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("http.Transport: expected *http.Transport, got %T", c.http.Transport)
+	}
 	if tr.TLSClientConfig.RootCAs == nil {
 		t.Fatal("RootCAs must not be nil after CACertPEM append")
 	}

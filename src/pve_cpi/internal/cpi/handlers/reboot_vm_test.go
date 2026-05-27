@@ -29,9 +29,8 @@ func testDepsReboot(
 	nodesSvc *mockNodesService,
 	tasksSvc *mockTasksService,
 	mode string,
-	timeout int,
 ) handlers.Deps {
-	return testDepsRebootCluster(qemuSvc, nodesSvc, tasksSvc, mode, timeout,
+	return testDepsRebootCluster(qemuSvc, nodesSvc, tasksSvc, mode, 60,
 		defaultClusterSvc(101, "pve-node1"))
 }
 
@@ -89,7 +88,7 @@ func rebootRawUPID(upid string) *nodes.CreateQemuStatusRebootResponse {
 
 // rebootRawEmpty returns a *nodes.CreateQemuStatusRebootResponse with empty JSON.
 func rebootRawEmpty() *nodes.CreateQemuStatusRebootResponse {
-	raw := nodes.CreateQemuStatusRebootResponse(json.RawMessage(`""`))
+	raw := nodes.CreateQemuStatusRebootResponse(`""`)
 	return &raw
 }
 
@@ -135,7 +134,7 @@ func TestHandleRebootVM_SoftHappy(t *testing.T) {
 		},
 	}
 
-	h := handlers.HandleRebootVM(testDepsReboot(qemuSvc, nodesSvc, tasksSvc, "soft", 60))
+	h := handlers.HandleRebootVM(testDepsReboot(qemuSvc, nodesSvc, tasksSvc, "soft"))
 	result, err := h.Handle(context.Background(), marshalArgs("101"), jsonrpc.Context{})
 
 	if err != nil {
@@ -188,7 +187,7 @@ func TestHandleRebootVM_SoftFallbackOnTaskFail(t *testing.T) {
 		},
 	}
 
-	h := handlers.HandleRebootVM(testDepsReboot(qemuSvc, nodesSvc, tasksSvc, "soft", 60))
+	h := handlers.HandleRebootVM(testDepsReboot(qemuSvc, nodesSvc, tasksSvc, "soft"))
 	result, err := h.Handle(context.Background(), marshalArgs("101"), jsonrpc.Context{})
 
 	if err != nil {
@@ -227,7 +226,7 @@ func TestHandleRebootVM_SoftFallbackOnRebootCallError(t *testing.T) {
 	}
 	tasksSvc := &mockTasksService{}
 
-	h := handlers.HandleRebootVM(testDepsReboot(qemuSvc, nodesSvc, tasksSvc, "soft", 60))
+	h := handlers.HandleRebootVM(testDepsReboot(qemuSvc, nodesSvc, tasksSvc, "soft"))
 	result, err := h.Handle(context.Background(), marshalArgs("101"), jsonrpc.Context{})
 
 	if err != nil {
@@ -269,7 +268,7 @@ func TestHandleRebootVM_HardMode(t *testing.T) {
 	}
 	tasksSvc := &mockTasksService{}
 
-	h := handlers.HandleRebootVM(testDepsReboot(qemuSvc, nodesSvc, tasksSvc, "hard", 60))
+	h := handlers.HandleRebootVM(testDepsReboot(qemuSvc, nodesSvc, tasksSvc, "hard"))
 	result, err := h.Handle(context.Background(), marshalArgs("101"), jsonrpc.Context{})
 
 	if err != nil {
@@ -323,7 +322,7 @@ func TestHandleRebootVM_StoppedStart(t *testing.T) {
 	}
 	tasksSvc := &mockTasksService{}
 
-	h := handlers.HandleRebootVM(testDepsReboot(qemuSvc, nodesSvc, tasksSvc, "soft", 60))
+	h := handlers.HandleRebootVM(testDepsReboot(qemuSvc, nodesSvc, tasksSvc, "soft"))
 	result, err := h.Handle(context.Background(), marshalArgs("101"), jsonrpc.Context{})
 
 	if err != nil {
@@ -359,7 +358,7 @@ func TestHandleRebootVM_StoppedStartError(t *testing.T) {
 		},
 	}
 
-	h := handlers.HandleRebootVM(testDepsReboot(qemuSvc, nil, nil, "soft", 60))
+	h := handlers.HandleRebootVM(testDepsReboot(qemuSvc, nil, nil, "soft"))
 	_, err := h.Handle(context.Background(), marshalArgs("101"), jsonrpc.Context{})
 
 	if err == nil {
@@ -384,7 +383,7 @@ func TestHandleRebootVM_StatusNotFound(t *testing.T) {
 		},
 	}
 
-	h := handlers.HandleRebootVM(testDepsReboot(qemuSvc, nil, nil, "soft", 60))
+	h := handlers.HandleRebootVM(testDepsReboot(qemuSvc, nil, nil, "soft"))
 	_, err := h.Handle(context.Background(), marshalArgs("101"), jsonrpc.Context{})
 
 	if err == nil {
@@ -412,7 +411,7 @@ func TestHandleRebootVM_StatusGenericError(t *testing.T) {
 		},
 	}
 
-	h := handlers.HandleRebootVM(testDepsReboot(qemuSvc, nil, nil, "soft", 60))
+	h := handlers.HandleRebootVM(testDepsReboot(qemuSvc, nil, nil, "soft"))
 	_, err := h.Handle(context.Background(), marshalArgs("101"), jsonrpc.Context{})
 
 	if err == nil {
@@ -452,7 +451,7 @@ func TestHandleRebootVM_RebootNotFound(t *testing.T) {
 		},
 	}
 
-	h := handlers.HandleRebootVM(testDepsReboot(qemuSvc, nodesSvc, nil, "soft", 60))
+	h := handlers.HandleRebootVM(testDepsReboot(qemuSvc, nodesSvc, nil, "soft"))
 	_, err := h.Handle(context.Background(), marshalArgs("101"), jsonrpc.Context{})
 
 	if err == nil {
@@ -477,7 +476,7 @@ func TestHandleRebootVM_RebootNotFound(t *testing.T) {
 func TestHandleRebootVM_MissingVMCID(t *testing.T) {
 	t.Parallel()
 
-	h := handlers.HandleRebootVM(testDepsReboot(nil, nil, nil, "soft", 60))
+	h := handlers.HandleRebootVM(testDepsReboot(nil, nil, nil, "soft"))
 	_, err := h.Handle(context.Background(), nil, jsonrpc.Context{})
 
 	if err == nil {
@@ -496,7 +495,7 @@ func TestHandleRebootVM_MissingVMCID(t *testing.T) {
 func TestHandleRebootVM_InvalidVMCID(t *testing.T) {
 	t.Parallel()
 
-	h := handlers.HandleRebootVM(testDepsReboot(nil, nil, nil, "soft", 60))
+	h := handlers.HandleRebootVM(testDepsReboot(nil, nil, nil, "soft"))
 	_, err := h.Handle(context.Background(), marshalArgs("not-a-vmid"), jsonrpc.Context{})
 
 	if err == nil {
@@ -541,7 +540,7 @@ func TestHandleRebootVM_SoftEmptyUPID(t *testing.T) {
 		},
 	}
 
-	h := handlers.HandleRebootVM(testDepsReboot(qemuSvc, nodesSvc, tasksSvc, "soft", 60))
+	h := handlers.HandleRebootVM(testDepsReboot(qemuSvc, nodesSvc, tasksSvc, "soft"))
 	result, err := h.Handle(context.Background(), marshalArgs("101"), jsonrpc.Context{})
 
 	if err != nil {
@@ -591,7 +590,7 @@ func TestHandleRebootVM_HardReset_RetriesOnTransient(t *testing.T) {
 		},
 	}
 
-	h := handlers.HandleRebootVM(testDepsReboot(qemuSvc, nil, tasksSvc, "hard", 60))
+	h := handlers.HandleRebootVM(testDepsReboot(qemuSvc, nil, tasksSvc, "hard"))
 	result, err := h.Handle(fastRetryCtx(context.Background()), marshalArgs("101"), jsonrpc.Context{})
 
 	if err != nil {
@@ -627,7 +626,7 @@ func TestRebootVM_StatusTransient_Retriable(t *testing.T) {
 		},
 	}
 
-	h := handlers.HandleRebootVM(testDepsReboot(qemuSvc, nil, nil, "soft", 60))
+	h := handlers.HandleRebootVM(testDepsReboot(qemuSvc, nil, nil, "soft"))
 	_, err := h.Handle(fastRetryCtx(context.Background()), marshalArgs("101"), jsonrpc.Context{})
 
 	if err == nil {
@@ -669,7 +668,7 @@ func TestRebootVM_StartTransient_Retriable(t *testing.T) {
 		},
 	}
 
-	h := handlers.HandleRebootVM(testDepsReboot(qemuSvc, nil, nil, "soft", 60))
+	h := handlers.HandleRebootVM(testDepsReboot(qemuSvc, nil, nil, "soft"))
 	_, err := h.Handle(fastRetryCtx(context.Background()), marshalArgs("101"), jsonrpc.Context{})
 
 	if err == nil {
@@ -742,7 +741,7 @@ func TestRebootVM_AwaitTransient_Retriable(t *testing.T) {
 				},
 			}
 
-			h := handlers.HandleRebootVM(testDepsReboot(qemuSvc, nil, tasksSvc, tc.mode, 60))
+			h := handlers.HandleRebootVM(testDepsReboot(qemuSvc, nil, tasksSvc, tc.mode))
 			_, err := h.Handle(context.Background(), marshalArgs("101"), jsonrpc.Context{})
 
 			if err == nil {

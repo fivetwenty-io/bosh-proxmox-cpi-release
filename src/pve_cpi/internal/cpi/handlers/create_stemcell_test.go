@@ -11,7 +11,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	sdkcloudinit "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cloudinit"
@@ -74,21 +73,20 @@ func (m *stemcellMockClusterStorage) ListStorage(ctx context.Context, params *sd
 
 // lightStemcellClusterStorage builds a stemcellMockClusterStorage whose
 // ListStorage returns a single entry with the given storage name and type.
-// shared=1 when isShared is true, 0 otherwise. nodes is comma-joined from
-// the nodeList slice (empty means no node restriction).
-func lightStemcellClusterStorage(storageName, storageType string, isShared bool, nodeList []string) *stemcellMockClusterStorage {
+// shared=1 when isShared is true, 0 otherwise. nodes is always empty (""),
+// meaning no node restriction.
+func lightStemcellClusterStorage(storageName, storageType string, isShared bool) *stemcellMockClusterStorage {
 	return &stemcellMockClusterStorage{
 		listStorageFn: func(_ context.Context, _ *sdkclusterstorage.ListStorageParams) (*sdkclusterstorage.ListStorageResponse, error) {
 			shared := 0
 			if isShared {
 				shared = 1
 			}
-			nodes := strings.Join(nodeList, ",")
 			raw, _ := json.Marshal(map[string]any{
 				"storage": storageName,
 				"type":    storageType,
 				"shared":  shared,
-				"nodes":   nodes,
+				"nodes":   "",
 			})
 			resp := sdkclusterstorage.ListStorageResponse{raw}
 			return &resp, nil
@@ -185,7 +183,8 @@ func (m *stemcellMockCluster) ListConfigNodes(ctx context.Context) (*sdkcluster.
 		return m.listConfigNodesFn(ctx)
 	}
 	// Default: single-node cluster — local storage is acceptable.
-	resp := sdkcluster.ListConfigNodesResponse{json.RawMessage(`{"node":"pve-node1"}`)}
+	nodeEntry, _ := json.Marshal(map[string]string{"node": vmNode})
+	resp := sdkcluster.ListConfigNodesResponse{nodeEntry}
 	return &resp, nil
 }
 
@@ -262,7 +261,7 @@ func defaultStemcellClient() *stemcellMockClient {
 func makeDeps(client pve.Client) handlers.Deps {
 	return handlers.Deps{
 		Config: &config.CPIConfig{
-			Node:            "pve-node1",
+			Node:            vmNode,
 			StemcellStorage: "local",
 			VMStorage:       "local",
 			DiskStorage:     "local",
@@ -333,10 +332,10 @@ type localBackend struct{}
 
 func (b *localBackend) Kind() pve.BackendKind { return pve.BackendLocal }
 func (b *localBackend) NodeForCreate(_ context.Context, _, _ string) (string, error) {
-	return "pve-node1", nil
+	return vmNode, nil
 }
 func (b *localBackend) NodeForExisting(_ context.Context, _ string) (string, error) {
-	return "pve-node1", nil
+	return vmNode, nil
 }
 
 // Ensure pve.Client interface is satisfied by stemcellMockClient at compile time.
@@ -1474,7 +1473,7 @@ func lightStemcellDeps(
 	client := buildLightStemcellClient(clusterStorage, nodes, cluster)
 	return handlers.Deps{
 		Config: &config.CPIConfig{
-			Node:            "pve-node1",
+			Node:            vmNode,
 			StemcellStorage: "nfs",
 			VMStorage:       "nfs",
 			DiskStorage:     "nfs",
@@ -1485,6 +1484,8 @@ func lightStemcellDeps(
 }
 
 // existingVolumeListFn returns a ListStorageContent that reports qcow2Filename as present.
+//
+//nolint:unparam // qcow2Filename kept for readability; future tests may vary it
 func existingVolumeListFn(storage, qcow2Filename string) func(_ context.Context, _, _ string, _ *sdknodes.ListStorageContentParams) (*sdknodes.ListStorageContentResponse, error) {
 	return func(_ context.Context, _, _ string, _ *sdknodes.ListStorageContentParams) (*sdknodes.ListStorageContentResponse, error) {
 		volid := storage + ":import/" + qcow2Filename
@@ -1514,7 +1515,7 @@ func TestHandleCreateStemcell_LightPreUploaded_HappyPath(t *testing.T) {
 		imageID     = storageName + ":import/" + filename
 	)
 
-	clusterStorage := lightStemcellClusterStorage(storageName, "nfs", true, nil)
+	clusterStorage := lightStemcellClusterStorage(storageName, "nfs", true)
 	deps := lightStemcellDeps(t, clusterStorage, existingVolumeListFn(storageName, filename), 1)
 
 	var uploadCalled bool
@@ -1557,7 +1558,7 @@ func TestHandleCreateStemcell_LightPreUploaded_HappyPath(t *testing.T) {
 func TestHandleCreateStemcell_LightPreUploaded_MalformedImageID(t *testing.T) {
 	t.Parallel()
 
-	clusterStorage := lightStemcellClusterStorage("nfs", "nfs", true, nil)
+	clusterStorage := lightStemcellClusterStorage("nfs", "nfs", true)
 	deps := lightStemcellDeps(t, clusterStorage, emptyVolumeListFn(), 1)
 
 	h := handlers.HandleCreateStemcell(deps)
@@ -1588,7 +1589,7 @@ func TestHandleCreateStemcell_LightPreUploaded_VolumeNotFound(t *testing.T) {
 		imageID     = storageName + ":import/" + filename
 	)
 
-	clusterStorage := lightStemcellClusterStorage(storageName, "nfs", true, nil)
+	clusterStorage := lightStemcellClusterStorage(storageName, "nfs", true)
 	deps := lightStemcellDeps(t, clusterStorage, emptyVolumeListFn(), 1)
 
 	h := handlers.HandleCreateStemcell(deps)
@@ -1621,7 +1622,7 @@ func TestHandleCreateStemcell_LightPreUploaded_BlockStorageRejected(t *testing.T
 	)
 
 	// lvm type → block-only → must be rejected.
-	clusterStorage := lightStemcellClusterStorage(storageName, "lvm", false, nil)
+	clusterStorage := lightStemcellClusterStorage(storageName, "lvm", false)
 	deps := lightStemcellDeps(t, clusterStorage, emptyVolumeListFn(), 1)
 
 	h := handlers.HandleCreateStemcell(deps)
@@ -1654,7 +1655,7 @@ func TestHandleCreateStemcell_LightPreUploaded_LocalMultiNodeNoPin(t *testing.T)
 	)
 
 	// dir type, not shared → local storage.
-	clusterStorage := lightStemcellClusterStorage(storageName, "dir", false, nil)
+	clusterStorage := lightStemcellClusterStorage(storageName, "dir", false)
 	// 2 nodes → must require pin.
 	deps := lightStemcellDeps(t, clusterStorage, emptyVolumeListFn(), 2)
 
@@ -1687,7 +1688,7 @@ func TestHandleCreateStemcell_LightPreUploaded_LocalSingleNodeAccepted(t *testin
 		imageID     = storageName + ":import/" + filename
 	)
 
-	clusterStorage := lightStemcellClusterStorage(storageName, "dir", false, nil)
+	clusterStorage := lightStemcellClusterStorage(storageName, "dir", false)
 	deps := lightStemcellDeps(t, clusterStorage, existingVolumeListFn(storageName, filename), 1)
 
 	h := handlers.HandleCreateStemcell(deps)
@@ -1724,7 +1725,7 @@ func TestHandleCreateStemcell_LightPreUploaded_AnyStorageAccepted(t *testing.T) 
 		imageID     = storageName + ":import/" + filename
 	)
 
-	clusterStorage := lightStemcellClusterStorage(storageName, "nfs", true, nil)
+	clusterStorage := lightStemcellClusterStorage(storageName, "nfs", true)
 	deps := lightStemcellDeps(t, clusterStorage, existingVolumeListFn(storageName, filename), 1)
 
 	h := handlers.HandleCreateStemcell(deps)
@@ -1759,7 +1760,7 @@ func TestHandleCreateStemcell_LightPreUploaded_StorageMatchSuccess(t *testing.T)
 		imageID     = storageName + ":import/" + filename
 	)
 
-	clusterStorage := lightStemcellClusterStorage(storageName, "nfs", true, nil)
+	clusterStorage := lightStemcellClusterStorage(storageName, "nfs", true)
 	deps := lightStemcellDeps(t, clusterStorage, existingVolumeListFn(storageName, filename), 1)
 
 	h := handlers.HandleCreateStemcell(deps)
@@ -1814,7 +1815,7 @@ func TestHandleCreateStemcell_LightFetch_BlockStorageRejected(t *testing.T) {
 	t.Parallel()
 
 	const storageName = "local-lvm"
-	clusterStorage := lightStemcellClusterStorage(storageName, "lvm", false, nil)
+	clusterStorage := lightStemcellClusterStorage(storageName, "lvm", false)
 	deps := lightStemcellDeps(t, clusterStorage, emptyVolumeListFn(), 1)
 	// Point StemcellStorage at the lvm pool so the fetch path resolves to it.
 	deps.Config.StemcellStorage = storageName
@@ -1849,7 +1850,7 @@ func TestHandleCreateStemcell_LightPreUploaded_LightPrefixStripped(t *testing.T)
 		imageID = "light:nfs:import/" + filename
 	)
 
-	clusterStorage := lightStemcellClusterStorage(storageName, "nfs", true, nil)
+	clusterStorage := lightStemcellClusterStorage(storageName, "nfs", true)
 	deps := lightStemcellDeps(t, clusterStorage, existingVolumeListFn(storageName, filename), 1)
 
 	h := handlers.HandleCreateStemcell(deps)

@@ -421,7 +421,10 @@ func TestHandleDeleteNetwork_MissingArg(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error")
 	}
-	cpiErr := err.(*cpierrors.Error)
+	var cpiErr *cpierrors.Error
+	if !errors.As(err, &cpiErr) {
+		t.Fatalf("expected *cpierrors.Error, got %T: %v", err, err)
+	}
 	if cpiErr.Type() != cpierrors.TypeCloud {
 		t.Errorf("expected CloudError, got %q", cpiErr.Type())
 	}
@@ -438,7 +441,10 @@ func TestHandleDeleteNetwork_NonStringCID(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error")
 	}
-	cpiErr := err.(*cpierrors.Error)
+	var cpiErr *cpierrors.Error
+	if !errors.As(err, &cpiErr) {
+		t.Fatalf("expected *cpierrors.Error, got %T: %v", err, err)
+	}
 	if cpiErr.Type() != cpierrors.TypeCloud {
 		t.Errorf("expected CloudError, got %q", cpiErr.Type())
 	}
@@ -456,7 +462,10 @@ func TestHandleDeleteNetwork_EmptyCID(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error")
 	}
-	cpiErr := err.(*cpierrors.Error)
+	var cpiErr *cpierrors.Error
+	if !errors.As(err, &cpiErr) {
+		t.Fatalf("expected *cpierrors.Error, got %T: %v", err, err)
+	}
 	if cpiErr.Type() != cpierrors.TypeCloud {
 		t.Errorf("expected CloudError, got %q", cpiErr.Type())
 	}
@@ -484,7 +493,10 @@ func TestHandleDeleteNetwork_SDN_SubnetDeleteError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error on subnet delete failure")
 	}
-	cpiErr := err.(*cpierrors.Error)
+	var cpiErr *cpierrors.Error
+	if !errors.As(err, &cpiErr) {
+		t.Fatalf("expected *cpierrors.Error, got %T: %v", err, err)
+	}
 	if cpiErr.Type() != cpierrors.TypeCloud {
 		t.Errorf("expected CloudError, got %q", cpiErr.Type())
 	}
@@ -503,7 +515,10 @@ func TestHandleDeleteNetwork_SDN_ProbeError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error on SDN probe failure")
 	}
-	cpiErr := err.(*cpierrors.Error)
+	var cpiErr *cpierrors.Error
+	if !errors.As(err, &cpiErr) {
+		t.Fatalf("expected *cpierrors.Error, got %T: %v", err, err)
+	}
 	if cpiErr.Type() != cpierrors.TypeCloud {
 		t.Errorf("expected CloudError, got %q", cpiErr.Type())
 	}
