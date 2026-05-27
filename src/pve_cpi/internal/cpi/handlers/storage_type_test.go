@@ -51,7 +51,6 @@ var storageTypeCases = []storageTypeCase{
 // require format="" so PVE selects the appropriate default per storage type.
 func TestCreateDisk_StorageTypes(t *testing.T) {
 	for _, tc := range storageTypeCases {
-		tc := tc // capture for parallel subtest
 		t.Run(tc.storageType, func(t *testing.T) {
 			t.Parallel()
 
@@ -141,7 +140,6 @@ func TestResizeDisk_StorageTypes(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		tc := tc
 		t.Run(tc.storageType, func(t *testing.T) {
 			t.Parallel()
 

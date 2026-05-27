@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/cpi"
@@ -291,48 +292,40 @@ func TestDispatcher_ConcurrentRegisterHandle_NoDataRace(t *testing.T) {
 	d := cpi.NewDispatcher(nopLogger())
 
 	const goroutines = 20
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		// Writer goroutines: concurrently register handlers.
-		writers := make(chan struct{}, goroutines)
-		for i := 0; i < goroutines; i++ {
-			go func(n int) {
-				defer func() { writers <- struct{}{} }()
-				method := "info"
-				if n%2 == 0 {
-					method = "create_stemcell"
-				}
-				if err := d.Register(method, cpi.HandlerFunc(func(_ context.Context, _ []json.RawMessage, _ jsonrpc.Context) (any, error) {
-					return map[string]int{"n": n}, nil
-				})); err != nil {
-					t.Errorf("goroutine %d: Register(%q): unexpected error: %v", n, method, err)
-				}
-			}(i)
-		}
-		// Reader goroutines: concurrently call Handle.
-		readers := make(chan struct{}, goroutines)
-		for i := 0; i < goroutines; i++ {
-			go func(n int) {
-				defer func() { readers <- struct{}{} }()
-				method := "has_vm"
-				if n%3 == 0 {
-					method = "info"
-				}
-				resp := d.Handle(context.Background(), makeReq(method))
-				if resp == nil {
-					t.Errorf("goroutine %d: Handle returned nil", n)
-				}
-			}(i)
-		}
-		for i := 0; i < goroutines; i++ {
-			<-writers
-		}
-		for i := 0; i < goroutines; i++ {
-			<-readers
-		}
-	}()
-	<-done
+	// sync.WaitGroup over channel-as-semaphore: a panicking goroutine no
+	// longer deadlocks the test under -timeout — Done() fires from defer
+	// even on panic. Failure surfaces immediately rather than appearing
+	// as a generic test-timeout.
+	var wg sync.WaitGroup
+	wg.Add(goroutines * 2)
+	for i := 0; i < goroutines; i++ {
+		go func(n int) {
+			defer wg.Done()
+			method := "info"
+			if n%2 == 0 {
+				method = "create_stemcell"
+			}
+			if err := d.Register(method, cpi.HandlerFunc(func(_ context.Context, _ []json.RawMessage, _ jsonrpc.Context) (any, error) {
+				return map[string]int{"n": n}, nil
+			})); err != nil {
+				t.Errorf("goroutine %d: Register(%q): unexpected error: %v", n, method, err)
+			}
+		}(i)
+	}
+	for i := 0; i < goroutines; i++ {
+		go func(n int) {
+			defer wg.Done()
+			method := "has_vm"
+			if n%3 == 0 {
+				method = "info"
+			}
+			resp := d.Handle(context.Background(), makeReq(method))
+			if resp == nil {
+				t.Errorf("goroutine %d: Handle returned nil", n)
+			}
+		}(i)
+	}
+	wg.Wait()
 }
 
 // --------------------------------------------------------------------------

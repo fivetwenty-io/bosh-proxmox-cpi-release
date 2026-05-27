@@ -97,20 +97,35 @@ func TestRunCPI_MissingMethodField(t *testing.T) {
 	}
 }
 
-// TestRunCPI_ContextCancelledBetweenRequests cancels the context between two
-// requests and verifies runCPI returns errSignaled after completing the first
-// request. The second request is never dispatched.
+// TestRunCPI_ContextCancelledBetweenRequests cancels the context while the
+// first request's handler is executing and verifies runCPI returns errSignaled.
+// Determinism comes from the handler closing handlerRunning before returning:
+// the test cancels at that moment, so by the time runCPI reaches its
+// post-writeResponse select on ctx.Done(), the context is already cancelled.
+// No reliance on polling, sleep, or pipe close ordering.
 func TestRunCPI_ContextCancelledBetweenRequests(t *testing.T) {
 	t.Parallel()
 	_, logger := makeTestDeps(t)
 
-	// Two requests, but we will cancel the context after the first response.
-	// Use an io.Pipe so we can control when data arrives.
 	pr, pw := io.Pipe()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	d := cpi.NewDispatcher(logger)
 	var w bytes.Buffer
+
+	// Override "info" with a handler that signals when it has begun and
+	// only returns once the test acknowledges. The test cancels between
+	// these two events; runCPI's post-writeResponse signal check then
+	// fires deterministically.
+	handlerStarted := make(chan struct{})
+	resume := make(chan struct{})
+	if err := d.Register("info", cpi.HandlerFunc(func(_ context.Context, _ []json.RawMessage, _ jsonrpc.Context) (any, error) {
+		close(handlerStarted)
+		<-resume
+		return map[string]any{"ok": true}, nil
+	})); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
 
 	var runErr error
 	done := make(chan struct{})
@@ -119,18 +134,18 @@ func TestRunCPI_ContextCancelledBetweenRequests(t *testing.T) {
 		runErr = runCPI(ctx, pr, &w, d, logger)
 	}()
 
-	// Write first request.
 	_, _ = fmt.Fprintln(pw, strings.TrimRight(validRequest("info"), "\n"))
-	// Cancel context; runCPI checks after dispatch completes.
+	<-handlerStarted
 	cancel()
-	// Close the pipe so the goroutine does not block on Scan forever.
+	close(resume)
+	// Let runCPI finish writeResponse and hit its post-write select. Close
+	// the pipe so a subsequent Scan call (should not happen — the select
+	// fires first) returns rather than blocking forever.
 	_ = pw.Close()
 	<-done
 
-	// runCPI may return errSignaled or nil (race between cancel and EOF), but
-	// must not return any other error.
-	if runErr != nil && !errors.Is(runErr, errSignaled) {
-		t.Fatalf("runCPI returned unexpected error: %v", runErr)
+	if !errors.Is(runErr, errSignaled) {
+		t.Fatalf("runCPI: want errSignaled, got %v", runErr)
 	}
 }
 
@@ -219,37 +234,26 @@ func TestRunCPI_WriteResponseFailure(t *testing.T) {
 
 // TestRunCPI_ErrTooLong feeds a line that exceeds maxLineBytes and verifies
 // runCPI writes a CloudError and returns nil (clean exit after ErrTooLong).
+//
+// Shrinks maxLineBytes to 4 KiB for the duration of the test so the oversize
+// payload stays at a few KiB rather than 65 MiB on disk. Test is no longer
+// parallel — maxLineBytes is a package var and parallel runs would race.
 func TestRunCPI_ErrTooLong(t *testing.T) {
-	t.Parallel()
+	prev := maxLineBytes
+	maxLineBytes = 4 * 1024 // 4 KiB
+	t.Cleanup(func() { maxLineBytes = prev })
+
 	_, logger := makeTestDeps(t)
 
-	// Write maxLineBytes+1 bytes to a temp file so we don't block on a pipe.
-	// The scanner's buffer cap is maxLineBytes; a single line with no embedded
-	// newline that is larger than the buffer triggers bufio.ErrTooLong.
-	tmpFile, err := os.CreateTemp(t.TempDir(), "errtoolong-*.txt")
-	if err != nil {
-		t.Fatalf("CreateTemp: %v", err)
-	}
-	defer tmpFile.Close()
-
-	// Write maxLineBytes+1 'x' bytes followed by a newline.
-	chunk := bytes.Repeat([]byte("x"), 1024*1024) // 1 MiB
-	for i := 0; i < 65; i++ {                     // 65 MiB > 64 MiB limit
-		if _, err := tmpFile.Write(chunk); err != nil {
-			t.Fatalf("write chunk %d: %v", i, err)
-		}
-	}
-	if _, err := tmpFile.Write([]byte("\n")); err != nil {
-		t.Fatalf("write newline: %v", err)
-	}
-	if _, err := tmpFile.Seek(0, io.SeekStart); err != nil {
-		t.Fatalf("seek: %v", err)
-	}
+	// One oversized line (a few bytes > maxLineBytes) triggers bufio.ErrTooLong.
+	oversized := bytes.Repeat([]byte("x"), maxLineBytes+1)
+	oversized = append(oversized, '\n')
+	r := bytes.NewReader(oversized)
 
 	var w bytes.Buffer
 	d := cpi.NewDispatcher(logger)
 
-	runErr := runCPI(context.Background(), tmpFile, &w, d, logger)
+	runErr := runCPI(context.Background(), r, &w, d, logger)
 
 	// runCPI should return nil after ErrTooLong (scanner is not reusable).
 	if runErr != nil {
@@ -674,28 +678,11 @@ func TestBinary_InvalidFlagReturnsError(t *testing.T) {
 	}
 }
 
-// TestRunCPI_WriteDecodeErrorResponseFailure exercises the
-// "cpi: write decode error response" return path. The reader delivers malformed
-// JSON (so runCPI calls writeErrorResponse) while the writer fails on flush.
-func TestRunCPI_WriteDecodeErrorResponseFailure(t *testing.T) {
-	t.Parallel()
-	_, logger := makeTestDeps(t)
-
-	// Malformed JSON triggers the decode-error path in runCPI.
-	r := strings.NewReader("{garbage\n")
-	// Writer fails at 0 bytes so bufio.Writer flush returns an error.
-	w := &failWriter{threshold: 0}
-	d := cpi.NewDispatcher(logger)
-
-	err := runCPI(context.Background(), r, w, d, logger)
-	// bufio.Writer buffers output; if the total encoded response fits in the
-	// 4096-byte default buffer, Flush triggers the error. Regardless, runCPI
-	// should not panic and should propagate a non-nil error OR return nil if
-	// the write error is absorbed before Flush is reached.
-	// We accept either outcome — the test guards against panics and verifies
-	// the code path is reachable without crashing.
-	_ = err
-}
+// Note: a prior TestRunCPI_WriteDecodeErrorResponseFailure test was removed.
+// It exercised the "cpi: write decode error response" path but swallowed the
+// result with `_ = err` and a comment accepting either outcome, contributing
+// nothing to regression signal. The symmetric write-response failure path is
+// already covered by TestRunCPI_WriteResponseFailure.
 
 // TestDecodeRequest_MissingMethod directly tests the decodeRequest helper
 // for the "missing method" branch (not covered by existing tests).

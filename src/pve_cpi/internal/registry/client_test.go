@@ -296,11 +296,15 @@ func TestEndpointTrimmed(t *testing.T) {
 
 func TestContextCancellation(t *testing.T) {
 	t.Parallel()
-	// Server that delays long enough for the context to expire.
+	// Server stalls until the request's context is cancelled OR a 200ms
+	// safety valve fires. The client's 50ms deadline trips first in the
+	// healthy case; the fallback only triggers if request-context propagation
+	// regresses, and even then bounds the test wall-clock cost. Was 5s —
+	// dominated the registry suite at 5.8s.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		select {
 		case <-r.Context().Done():
-		case <-time.After(5 * time.Second):
+		case <-time.After(200 * time.Millisecond):
 		}
 		w.WriteHeader(http.StatusOK)
 	}))

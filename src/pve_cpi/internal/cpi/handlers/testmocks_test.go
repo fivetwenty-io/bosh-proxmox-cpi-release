@@ -4,6 +4,8 @@ package handlers_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
 
@@ -215,6 +217,71 @@ func (m *mockTasksService) Wait(ctx context.Context, node, upid string, opts *ta
 	}
 	// Default: succeed immediately.
 	return &tasks.Status{ExitStatus: "OK"}, nil
+}
+
+// --------------------------------------------------------------------------
+// mockStorageService
+// --------------------------------------------------------------------------
+
+// mockStorageService lets individual tests wire CreateVolume, DeleteVolume,
+// Exists, DeleteVolumeIfExists, and Upload with function literals.
+// Methods not set are no-ops or return zero values.
+type mockStorageService struct {
+	createVolumeFn         func(ctx context.Context, node, storage string, sizeGiB int, format string, vmid int, name string) (string, error)
+	deleteVolumeFn         func(ctx context.Context, node, storage, volume string) error
+	existsFn               func(ctx context.Context, node, storage, volume string) (bool, error)
+	deleteVolumeIfExistsFn func(ctx context.Context, node, storage, volume string) (bool, error)
+	uploadFn               func(ctx context.Context, node, storage, content, filename string, body io.Reader) (string, error)
+}
+
+func (m *mockStorageService) CreateVolume(ctx context.Context, node, storage string, sizeGiB int, format string, vmid int, name string) (string, error) {
+	if m.createVolumeFn != nil {
+		return m.createVolumeFn(ctx, node, storage, sizeGiB, format, vmid, name)
+	}
+	return fmt.Sprintf("%s/%s", storage, name), nil
+}
+
+func (m *mockStorageService) DeleteVolume(ctx context.Context, node, storage, volume string) error {
+	if m.deleteVolumeFn != nil {
+		return m.deleteVolumeFn(ctx, node, storage, volume)
+	}
+	return nil
+}
+
+func (m *mockStorageService) DeleteVolumeAsync(ctx context.Context, node, storage, volume string) (string, error) {
+	if err := m.DeleteVolume(ctx, node, storage, volume); err != nil {
+		return "", err
+	}
+	return "", nil
+}
+
+func (m *mockStorageService) Exists(ctx context.Context, node, storage, volume string) (bool, error) {
+	if m.existsFn != nil {
+		return m.existsFn(ctx, node, storage, volume)
+	}
+	return false, nil
+}
+
+func (m *mockStorageService) DeleteVolumeIfExists(ctx context.Context, node, storage, volume string) (bool, error) {
+	if m.deleteVolumeIfExistsFn != nil {
+		return m.deleteVolumeIfExistsFn(ctx, node, storage, volume)
+	}
+	return false, nil
+}
+
+func (m *mockStorageService) DeleteVolumeIfExistsAsync(ctx context.Context, node, storage, volume string) (bool, string, error) {
+	existed, err := m.DeleteVolumeIfExists(ctx, node, storage, volume)
+	if err != nil {
+		return false, "", err
+	}
+	return existed, "", nil
+}
+
+func (m *mockStorageService) Upload(ctx context.Context, node, storage, content, filename string, body io.Reader) (string, error) {
+	if m.uploadFn != nil {
+		return m.uploadFn(ctx, node, storage, content, filename, body)
+	}
+	return "", nil
 }
 
 // --------------------------------------------------------------------------
@@ -554,10 +621,11 @@ func (m *mockBridgeNodes) UpdateNetwork(ctx context.Context, node string, params
 // queried VM on "pve-node1" (matching testConfig().Node) so existing tests that
 // do not exercise HA-failover node resolution pass without modification.
 //
-// Set listResourcesFn to override behavior for specific tests.
+// Set listResourcesFn / listStatusFn to override behavior for specific tests.
 type mockClusterSvc struct {
 	mockSDNCluster
 	listResourcesFn func(ctx context.Context, params *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error)
+	listStatusFn    func(ctx context.Context) (*cluster.ListStatusResponse, error)
 }
 
 var _ cluster.Service = (*mockClusterSvc)(nil)
@@ -571,6 +639,13 @@ func (m *mockClusterSvc) ListResources(ctx context.Context, params *cluster.List
 	// or use clusterVMOnNode to build a response.
 	empty := cluster.ListResourcesResponse{}
 	return &empty, nil
+}
+
+func (m *mockClusterSvc) ListStatus(ctx context.Context) (*cluster.ListStatusResponse, error) {
+	if m.listStatusFn != nil {
+		return m.listStatusFn(ctx)
+	}
+	panic("mockClusterSvc.ListStatus: not configured")
 }
 
 // clusterVMOnNode builds a ListResourcesResponse placing vmid on node.

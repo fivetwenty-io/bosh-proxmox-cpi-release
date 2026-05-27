@@ -5,16 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"testing"
 
-	sdkcloudinit "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cloudinit"
 	sdkcluster "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cluster"
-	sdkclusterstorage "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/clusterstorage"
-	sdknodes "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/nodes"
-	sdkqemu "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/qemu"
-	sdkstorage "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/storage"
-	sdktasks "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/tasks"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
 
@@ -26,100 +19,10 @@ import (
 	sdkerrors "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/errors"
 )
 
-// ---------------------------------------------------------------------------
-// Shared mock infrastructure (handlers_test package scope)
-// ---------------------------------------------------------------------------
+// mockStorageService is defined in testmocks_test.go (canonical taxonomy).
 
-// mockStorageService lets individual tests wire CreateVolume, DeleteVolume,
-// Exists, DeleteVolumeIfExists, and Upload with function literals.
-// Methods not set are no-ops or return zero values.
-type mockStorageService struct {
-	createVolumeFn         func(ctx context.Context, node, storage string, sizeGiB int, format string, vmid int, name string) (string, error)
-	deleteVolumeFn         func(ctx context.Context, node, storage, volume string) error
-	existsFn               func(ctx context.Context, node, storage, volume string) (bool, error)
-	deleteVolumeIfExistsFn func(ctx context.Context, node, storage, volume string) (bool, error)
-	uploadFn               func(ctx context.Context, node, storage, content, filename string, body io.Reader) (string, error)
-}
-
-func (m *mockStorageService) CreateVolume(ctx context.Context, node, storage string, sizeGiB int, format string, vmid int, name string) (string, error) {
-	if m.createVolumeFn != nil {
-		return m.createVolumeFn(ctx, node, storage, sizeGiB, format, vmid, name)
-	}
-	return fmt.Sprintf("%s/%s", storage, name), nil
-}
-
-func (m *mockStorageService) DeleteVolume(ctx context.Context, node, storage, volume string) error {
-	if m.deleteVolumeFn != nil {
-		return m.deleteVolumeFn(ctx, node, storage, volume)
-	}
-	return nil
-}
-
-func (m *mockStorageService) DeleteVolumeAsync(ctx context.Context, node, storage, volume string) (string, error) {
-	if err := m.DeleteVolume(ctx, node, storage, volume); err != nil {
-		return "", err
-	}
-	return "", nil
-}
-
-func (m *mockStorageService) Exists(ctx context.Context, node, storage, volume string) (bool, error) {
-	if m.existsFn != nil {
-		return m.existsFn(ctx, node, storage, volume)
-	}
-	return false, nil
-}
-
-func (m *mockStorageService) DeleteVolumeIfExists(ctx context.Context, node, storage, volume string) (bool, error) {
-	if m.deleteVolumeIfExistsFn != nil {
-		return m.deleteVolumeIfExistsFn(ctx, node, storage, volume)
-	}
-	return false, nil
-}
-
-func (m *mockStorageService) DeleteVolumeIfExistsAsync(ctx context.Context, node, storage, volume string) (bool, string, error) {
-	existed, err := m.DeleteVolumeIfExists(ctx, node, storage, volume)
-	if err != nil {
-		return false, "", err
-	}
-	return existed, "", nil
-}
-
-func (m *mockStorageService) Upload(ctx context.Context, node, storage, content, filename string, body io.Reader) (string, error) {
-	if m.uploadFn != nil {
-		return m.uploadFn(ctx, node, storage, content, filename, body)
-	}
-	return "", nil
-}
-
-// mockClusterServiceForHandlers implements cluster.Service with a configurable ListResources.
-type mockClusterServiceForHandlers struct {
-	sdkcluster.Service
-	listFn func(ctx context.Context, params *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error)
-}
-
-func (m *mockClusterServiceForHandlers) ListResources(ctx context.Context, params *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
-	if m.listFn != nil {
-		return m.listFn(ctx, params)
-	}
-	resp := sdkcluster.ListResourcesResponse{}
-	return &resp, nil
-}
-
-// handlerMockClient wires storage and cluster services for handler tests.
-type handlerMockClient struct {
-	storageSvc sdkstorage.Service
-	clusterSvc sdkcluster.Service
-}
-
-func (c *handlerMockClient) QEMU() sdkqemu.Service                     { return nil }
-func (c *handlerMockClient) Storage() sdkstorage.Service               { return c.storageSvc }
-func (c *handlerMockClient) CloudInit() sdkcloudinit.Service           { return nil }
-func (c *handlerMockClient) Tasks() sdktasks.Service                   { return nil }
-func (c *handlerMockClient) Nodes() sdknodes.Service                   { return nil }
-func (c *handlerMockClient) Cluster() sdkcluster.Service               { return c.clusterSvc }
-func (c *handlerMockClient) ClusterStorage() sdkclusterstorage.Service { return nil }
-
-// newHandlerMockClient builds a mock pve.Client with wired storage and cluster.
+// newHandlerMockClient builds a mock pve.Client with wired storage and cluster
+// using the canonical mockPVEClient / mockClusterSvc from testmocks_test.go.
 // clusterVMIDs is the set of VMIDs reported by the cluster (for NextDiskVMID).
 func newHandlerMockClient(storageSvc *mockStorageService, clusterVMIDs []int) pve.Client {
 	listFn := func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
@@ -134,9 +37,9 @@ func newHandlerMockClient(storageSvc *mockStorageService, clusterVMIDs []int) pv
 		}
 		return &resp, nil
 	}
-	return &handlerMockClient{
+	return &mockPVEClient{
 		storageSvc: storageSvc,
-		clusterSvc: &mockClusterServiceForHandlers{listFn: listFn},
+		clusterSvc: &mockClusterSvc{listResourcesFn: listFn},
 	}
 }
 
@@ -575,7 +478,7 @@ func TestHandleCreateDisk_VMIDConflictRetry(t *testing.T) {
 	deps.Config.VMIDAllocAttempts = 5
 
 	h := handlers.HandleCreateDisk(deps)
-	_, err := h.Handle(context.Background(), []json.RawMessage{
+	_, err := h.Handle(fastRetryCtx(context.Background()), []json.RawMessage{
 		marshal(1024),
 		marshal(map[string]string{}),
 	}, jsonrpc.Context{})

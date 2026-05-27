@@ -41,7 +41,11 @@ const exitSignaled = 130
 // maxLineBytes is the maximum allowed size of a single JSON-RPC request line (64 MiB).
 // bufio.Scanner returns bufio.ErrTooLong if this limit is exceeded; the loop
 // treats that as a decode error, writes a CloudError, and continues.
-const maxLineBytes = 64 * 1024 * 1024
+//
+// Declared as a var (not const) so the ErrTooLong test can shrink the cap to
+// a few KiB and avoid writing 64+ MiB of payload per run; production code
+// never mutates it.
+var maxLineBytes = 64 * 1024 * 1024
 
 func main() {
 	os.Exit(run())

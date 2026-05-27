@@ -401,9 +401,9 @@ func TestHandleDeleteDisk_NoClusterCallExpected(t *testing.T) {
 	storageSvc := &mockStorageService{
 		deleteVolumeFn: func(_ context.Context, _, _, _ string) error { return nil },
 	}
-	client := &handlerMockClient{
+	client := &mockPVEClient{
 		storageSvc: storageSvc,
-		clusterSvc: &mockClusterServiceForHandlers{listFn: listFn},
+		clusterSvc: &mockClusterSvc{listResourcesFn: listFn},
 	}
 	deps := handlers.Deps{
 		Config: &config.CPIConfig{

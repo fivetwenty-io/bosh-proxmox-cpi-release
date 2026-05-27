@@ -42,17 +42,17 @@ func TestRetryOnStorageLock_NonLockErrorPropagates(t *testing.T) {
 
 func TestRetryOnStorageLock_LockTimeoutRetriesThenSucceeds(t *testing.T) {
 	t.Parallel()
-	// Override sleep so the test does not actually wait through the
-	// exponential backoff. We can't stub StorageLockBackoff directly but
-	// we can keep attempts low and rely on test runner being patient (max
-	// 2 sleeps of ~1.4-2.6 s at attempts 0,1). To keep tests fast, lower
-	// the backoff temporarily by exercising only attempt 0 (the very
-	// first retry, which sleeps 1.4-2.6 s). Use 3 max attempts but only
-	// fail twice — call site #3 succeeds. We accept ~3 s of sleep here.
+	// Override the backoff curve via WithTestBackoff so the retry loop's
+	// behaviour (call count, log lines, return value) is verified without
+	// burning multi-second sleeps. A small non-zero spacer keeps the loop
+	// exercising the timer path; bump if backoff observability ever needs
+	// asserting independently.
+	const spacer = 5 * time.Millisecond
+	ctx := WithTestBackoff(context.Background(), func(int) time.Duration { return spacer })
 	calls := 0
 	lockErr := errors.New("can't lock file '/var/lock/pve-manager/pve-storage-data' - got timeout")
 	start := time.Now()
-	err := RetryOnStorageLock(context.Background(), log.NewNopLogger(), "test", 3, func() error {
+	err := RetryOnStorageLock(ctx, log.NewNopLogger(), "test", 3, func() error {
 		calls++
 		if calls < 3 {
 			return lockErr
@@ -66,10 +66,10 @@ func TestRetryOnStorageLock_LockTimeoutRetriesThenSucceeds(t *testing.T) {
 	if calls != 3 {
 		t.Fatalf("expected 3 calls, got %d", calls)
 	}
-	// Two backoff sleeps fired; first attempt (idx 0) is 1.4-2.6s,
-	// second (idx 1) is 2.1-3.9s — total ≥ ~3.5 s comfortably.
-	if elapsed < 1*time.Second {
-		t.Fatalf("expected at least 1 s of backoff, got %v", elapsed)
+	// Two backoff hops at spacer each; lower bound proves the timer path
+	// fired without locking the test to the production curve.
+	if elapsed < 2*spacer {
+		t.Fatalf("expected at least %v of backoff, got %v", 2*spacer, elapsed)
 	}
 }
 
@@ -207,12 +207,13 @@ func TestRetryOnTransient_ExhaustsAndReturnsLastErr(t *testing.T) {
 func TestRetryOnTransientOrLock_SwitchesBackoffByReason(t *testing.T) {
 	t.Parallel()
 	// Mix a transient transport fault then a lock timeout to confirm both
-	// predicates participate. Cap attempts at 3 to keep the test fast
-	// (worst-case sleep ~3-4s).
+	// predicates participate. WithTestBackoff zeros the curve so attempt
+	// budget is the only thing being measured.
+	ctx := WithTestBackoff(context.Background(), func(int) time.Duration { return 0 })
 	calls := 0
 	transient := errors.New("(code: 596)")
 	lockErr := errors.New("can't lock file '/var/lock/pve-manager/pve-storage-data' - got timeout")
-	err := RetryOnTransientOrLock(context.Background(), nil, "test", 3, func() error {
+	err := RetryOnTransientOrLock(ctx, nil, "test", 3, func() error {
 		calls++
 		switch calls {
 		case 1:

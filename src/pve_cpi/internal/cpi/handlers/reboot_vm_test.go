@@ -592,7 +592,7 @@ func TestHandleRebootVM_HardReset_RetriesOnTransient(t *testing.T) {
 	}
 
 	h := handlers.HandleRebootVM(testDepsReboot(qemuSvc, nil, tasksSvc, "hard", 60))
-	result, err := h.Handle(context.Background(), marshalArgs("101"), jsonrpc.Context{})
+	result, err := h.Handle(fastRetryCtx(context.Background()), marshalArgs("101"), jsonrpc.Context{})
 
 	if err != nil {
 		t.Fatalf("unexpected error after transient retry: %v", err)
@@ -628,7 +628,7 @@ func TestRebootVM_StatusTransient_Retriable(t *testing.T) {
 	}
 
 	h := handlers.HandleRebootVM(testDepsReboot(qemuSvc, nil, nil, "soft", 60))
-	_, err := h.Handle(context.Background(), marshalArgs("101"), jsonrpc.Context{})
+	_, err := h.Handle(fastRetryCtx(context.Background()), marshalArgs("101"), jsonrpc.Context{})
 
 	if err == nil {
 		t.Fatal("expected error from persistent transient Status failure, got nil")
@@ -670,7 +670,7 @@ func TestRebootVM_StartTransient_Retriable(t *testing.T) {
 	}
 
 	h := handlers.HandleRebootVM(testDepsReboot(qemuSvc, nil, nil, "soft", 60))
-	_, err := h.Handle(context.Background(), marshalArgs("101"), jsonrpc.Context{})
+	_, err := h.Handle(fastRetryCtx(context.Background()), marshalArgs("101"), jsonrpc.Context{})
 
 	if err == nil {
 		t.Fatal("expected error from persistent transient Start failure, got nil")
@@ -722,7 +722,6 @@ func TestRebootVM_AwaitTransient_Retriable(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 

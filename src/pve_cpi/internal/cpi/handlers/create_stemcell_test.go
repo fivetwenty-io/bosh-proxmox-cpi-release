@@ -1235,7 +1235,6 @@ func TestCreateStemcell_RejectsPathOutsideStagingRoot(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
@@ -1352,7 +1351,6 @@ func TestParseStemcellCloudProps_LightFields_BlackBox(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
@@ -1420,7 +1418,6 @@ func TestStemcellCloudProps_validateLightMutex(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 

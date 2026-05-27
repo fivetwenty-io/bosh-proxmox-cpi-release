@@ -98,11 +98,21 @@ func retryBackoff(ctx context.Context, ao *allocOpts, err error, attempt int) er
 		return nil
 	}
 	var d time.Duration
-	if ao != nil && ao.backoffFn != nil {
+	switch {
+	case ao != nil && ao.backoffFn != nil:
 		d = ao.backoffFn(err, attempt)
-	} else {
+	default:
 		// Default: uniform 50–250 ms.
 		d = 50*time.Millisecond + time.Duration(mrand.Int64N(int64(200*time.Millisecond))) // #nosec G404 -- VMID collision-avoidance jitter; non-cryptographic
+	}
+	// Test override via context wins over the default curve so handler tests
+	// can keep VMID-conflict-retry suites deterministic without threading an
+	// AllocOption all the way through the call stack. An explicit backoffFn
+	// installed by production callers takes precedence over the override.
+	if ao == nil || ao.backoffFn == nil {
+		if override := backoffFromCtx(ctx); override != nil {
+			d = override(attempt)
+		}
 	}
 	if d <= 0 {
 		return nil

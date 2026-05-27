@@ -65,6 +65,11 @@ type StorageLister interface {
 type StorageInfoCache struct {
 	lister StorageLister
 	ttl    time.Duration
+	// negTTL is the window during which a failed refresh is replayed
+	// from the negative cache instead of being re-attempted. Mirrors the
+	// package default but per-instance so tests can inject a sub-millisecond
+	// value without touching a global.
+	negTTL time.Duration
 
 	mu       sync.Mutex
 	entries  map[string]storageInfoEntry
@@ -95,15 +100,33 @@ type negativeCacheEntry struct {
 // to exercise TTL expiry without sleeping 5+ seconds in CI.
 var negativeCacheTTL = 5 * time.Second
 
+// StorageInfoCacheOption configures a StorageInfoCache at construction time.
+type StorageInfoCacheOption func(*StorageInfoCache)
+
+// WithNegativeCacheTTL overrides the negative-cache window. Use 0 to disable
+// negative caching (every failed refresh is retried immediately). Tests use
+// this to drive TTL-expiry behaviour without sleeping the production default.
+func WithNegativeCacheTTL(d time.Duration) StorageInfoCacheOption {
+	return func(c *StorageInfoCache) {
+		c.negTTL = d
+	}
+}
+
 // NewStorageInfoCache constructs a cache backed by lister. ttl <= 0 disables
-// caching (every Get triggers a fetch).
-func NewStorageInfoCache(lister StorageLister, ttl time.Duration) *StorageInfoCache {
-	return &StorageInfoCache{
+// positive caching (every Get triggers a fetch). The negative-cache window
+// defaults to negativeCacheTTL and may be overridden via WithNegativeCacheTTL.
+func NewStorageInfoCache(lister StorageLister, ttl time.Duration, opts ...StorageInfoCacheOption) *StorageInfoCache {
+	c := &StorageInfoCache{
 		lister:   lister,
 		ttl:      ttl,
+		negTTL:   negativeCacheTTL,
 		entries:  make(map[string]storageInfoEntry),
 		inflight: make(map[string]chan struct{}),
 	}
+	for _, o := range opts {
+		o(c)
+	}
+	return c
 }
 
 // Get returns the StorageInfo for the named storage. The first call (or a call
@@ -234,14 +257,14 @@ func (c *StorageInfoCache) refresh(ctx context.Context) error {
 	if err != nil {
 		wrapped := cpierrors.Wrap(WrapError(err), "storage_info: list cluster storage")
 		c.mu.Lock()
-		c.negCache = negativeCacheEntry{err: wrapped, exp: time.Now().Add(negativeCacheTTL)}
+		c.negCache = negativeCacheEntry{err: wrapped, exp: time.Now().Add(c.negTTL)}
 		c.mu.Unlock()
 		return wrapped
 	}
 	if resp == nil {
 		wrapped := cpierrors.Cloud("storage_info: nil response from cluster storage list")
 		c.mu.Lock()
-		c.negCache = negativeCacheEntry{err: wrapped, exp: time.Now().Add(negativeCacheTTL)}
+		c.negCache = negativeCacheEntry{err: wrapped, exp: time.Now().Add(c.negTTL)}
 		c.mu.Unlock()
 		return wrapped
 	}

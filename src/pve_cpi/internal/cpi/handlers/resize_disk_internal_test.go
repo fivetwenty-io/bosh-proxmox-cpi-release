@@ -42,7 +42,6 @@ func TestParseDiskSizeGiB_Units(t *testing.T) {
 		{"no_size_segment", "vol,cache=writeback", 0, true},
 	}
 	for _, tc := range cases {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := parseDiskSizeGiB(tc.optStr)
 			if tc.wantErr {

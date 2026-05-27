@@ -262,8 +262,9 @@ func TestConfigDrive_Configure_AttachesAsScsi30Cdrom(t *testing.T) {
 }
 
 func TestConfigDrive_Configure_DeletesLocalTempOnSuccess(t *testing.T) {
-	tempDir, _ := os.MkdirTemp("", "iso-temp-*")
-	defer func() { _ = os.RemoveAll(tempDir) }()
+	// t.TempDir auto-cleans even if Configure panics; manual MkdirTemp +
+	// defer RemoveAll leaks on panic. Can't t.Parallel here — t.Setenv.
+	tempDir := t.TempDir()
 	t.Setenv("TMPDIR", tempDir)
 
 	a := newISOAgent(nil, nil)
@@ -280,8 +281,7 @@ func TestConfigDrive_Configure_DeletesLocalTempOnSuccess(t *testing.T) {
 }
 
 func TestConfigDrive_Configure_DeletesLocalTempOnUploadFailure(t *testing.T) {
-	tempDir, _ := os.MkdirTemp("", "iso-temp-*")
-	defer func() { _ = os.RemoveAll(tempDir) }()
+	tempDir := t.TempDir()
 	t.Setenv("TMPDIR", tempDir)
 
 	storageSvc := &fakeStorageSvc{

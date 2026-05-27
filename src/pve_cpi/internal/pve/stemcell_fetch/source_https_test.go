@@ -205,16 +205,14 @@ func TestHTTPSSource_Fetch_Redirect(t *testing.T) {
 		http.Redirect(w, r, targetServer.URL+"/final", http.StatusFound)
 	})
 
-	// The source's client must trust both test servers' certs. Build a
-	// combined transport that accepts both test CAs.
+	// The source's client must trust both test servers' certs. Cloning the
+	// source transport returns a fresh TLSClientConfig (Transport.Clone deep-
+	// copies it), so mutating srcTransport.TLSClientConfig cannot leak into
+	// the httptest.Server's shared client. Use InsecureSkipVerify rather than
+	// merging both servers' RootCAs — equivalent for a redirect smoke test
+	// and keeps the setup short.
 	srcTransport := sourceServer.Client().Transport.(*http.Transport).Clone()
-	tgtTLSConfig := targetServer.Client().Transport.(*http.Transport).TLSClientConfig
-	srcTLSConfig := srcTransport.TLSClientConfig
-	// Merge: copy RootCAs from target into source transport's TLS config.
-	// Simplest: just set InsecureSkipVerify for the redirect test only.
-	srcTLSConfig.InsecureSkipVerify = true //nolint:gosec // test-only
-	tgtTLSConfig.InsecureSkipVerify = true //nolint:gosec // test-only
-	srcTransport.TLSClientConfig = srcTLSConfig
+	srcTransport.TLSClientConfig.InsecureSkipVerify = true //nolint:gosec // test-only
 
 	src := &httpsSource{
 		client: &http.Client{

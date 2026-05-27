@@ -8,6 +8,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"math/big"
 	"os"
 	"strings"
@@ -41,11 +42,10 @@ func assertCloudError(t *testing.T, err error, contains string) {
 	if err == nil {
 		t.Fatalf("expected error containing %q, got nil", contains)
 	}
+	// errors.As walks the wrap chain so future fmt.Errorf-wrapping inside
+	// config.Load won't silently turn this assertion into a false negative.
 	var ce *cpierrors.Error
-	var ok bool
-	// Use type assertion since cpierrors.Error is a concrete type.
-	ce, ok = err.(*cpierrors.Error)
-	if !ok {
+	if !errors.As(err, &ce) {
 		t.Fatalf("expected *cpierrors.Error, got %T: %v", err, err)
 	}
 	if ce.Type() != cpierrors.TypeCloud {

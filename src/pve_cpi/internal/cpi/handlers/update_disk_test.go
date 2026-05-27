@@ -181,11 +181,11 @@ func TestHandleUpdateDisk_SizeOnly(t *testing.T) {
 	var attachCalled bool
 
 	// calls 1-2: canonical volid; call 3+: option string with size (for resize).
-	callCount2 := 0
+	callCount := 0
 	qemuSvc := &updateDiskQEMUService{
 		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
-			callCount2++
-			if callCount2 <= 2 {
+			callCount++
+			if callCount <= 2 {
 				return map[string]any{"scsi2": volid}, nil
 			}
 			return map[string]any{"scsi2": volid + ",size=10G"}, nil
@@ -225,11 +225,11 @@ func TestHandleUpdateDisk_CombinedSizeAndOptions(t *testing.T) {
 	var resizeCalled bool
 	var attachCalled bool
 
-	callCount3 := 0
+	callCount := 0
 	qemuSvc := &updateDiskQEMUService{
 		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
-			callCount3++
-			if callCount3 <= 2 {
+			callCount++
+			if callCount <= 2 {
 				return map[string]any{"scsi2": volid}, nil
 			}
 			return map[string]any{"scsi2": volid + ",size=10G"}, nil
@@ -350,11 +350,11 @@ func TestHandleUpdateDisk_ShrinkRejected(t *testing.T) {
 	const diskCID = "local-lvm:vm-9001-disk-0"
 	const volid = "local-lvm:vm-9001-disk-0"
 
-	callCount4 := 0
+	callCount := 0
 	qemuSvc := &updateDiskQEMUService{
 		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
-			callCount4++
-			if callCount4 <= 2 {
+			callCount++
+			if callCount <= 2 {
 				return map[string]any{"scsi2": volid}, nil
 			}
 			return map[string]any{"scsi2": volid + ",size=20G"}, nil
@@ -397,11 +397,11 @@ func TestHandleUpdateDisk_IOThreadFalseRemovesOption(t *testing.T) {
 
 	var capturedOptStr string
 
-	callCount5 := 0
+	callCount := 0
 	qemuSvc := &updateDiskQEMUService{
 		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
-			callCount5++
-			if callCount5 <= 2 {
+			callCount++
+			if callCount <= 2 {
 				return map[string]any{"scsi2": volid}, nil
 			}
 			return map[string]any{"scsi2": volid + ",iothread=1,size=10G"}, nil
@@ -431,11 +431,11 @@ func TestHandleUpdateDisk_AttachSDKError(t *testing.T) {
 	const diskCID = "local-lvm:vm-9001-disk-0"
 	const volid = "local-lvm:vm-9001-disk-0"
 
-	callCount8 := 0
+	callCount := 0
 	qemuSvc := &updateDiskQEMUService{
 		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
-			callCount8++
-			if callCount8 <= 2 {
+			callCount++
+			if callCount <= 2 {
 				return map[string]any{"scsi2": volid}, nil
 			}
 			return map[string]any{"scsi2": volid + ",size=10G"}, nil
@@ -467,11 +467,11 @@ func TestHandleUpdateDisk_ResizeWithUpid(t *testing.T) {
 		},
 	}
 
-	callCount6 := 0
+	callCount := 0
 	qemuSvc := &updateDiskQEMUService{
 		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
-			callCount6++
-			if callCount6 <= 2 {
+			callCount++
+			if callCount <= 2 {
 				return map[string]any{"scsi2": volid}, nil
 			}
 			return map[string]any{"scsi2": volid + ",size=10G"}, nil
@@ -501,11 +501,11 @@ func TestHandleUpdateDisk_PreservesExistingOptions(t *testing.T) {
 
 	var capturedOptStr string
 
-	callCount7 := 0
+	callCount := 0
 	qemuSvc := &updateDiskQEMUService{
 		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
-			callCount7++
-			if callCount7 <= 2 {
+			callCount++
+			if callCount <= 2 {
 				return map[string]any{"scsi2": volid}, nil
 			}
 			// Existing options: size, backup.
@@ -541,11 +541,11 @@ func TestHandleUpdateDisk_BandwidthIOPS(t *testing.T) {
 
 	var capturedOptStr string
 
-	callCount9 := 0
+	callCount := 0
 	qemuSvc := &updateDiskQEMUService{
 		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
-			callCount9++
-			if callCount9 <= 2 {
+			callCount++
+			if callCount <= 2 {
 				return map[string]any{"scsi2": volid}, nil
 			}
 			return map[string]any{"scsi2": volid + ",size=10G"}, nil
@@ -581,11 +581,11 @@ func TestHandleUpdateDisk_SSDAndBackup(t *testing.T) {
 
 	var capturedOptStr string
 
-	callCount10 := 0
+	callCount := 0
 	qemuSvc := &updateDiskQEMUService{
 		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
-			callCount10++
-			if callCount10 <= 2 {
+			callCount++
+			if callCount <= 2 {
 				return map[string]any{"scsi2": volid}, nil
 			}
 			return map[string]any{"scsi2": volid}, nil
@@ -908,7 +908,7 @@ func TestHandleUpdateDisk_ResizeUnderStorageLock_RetriesAndSucceeds(t *testing.T
 	}
 
 	h := handlers.HandleUpdateDisk(updateDiskDeps(qemuSvc, updateClusterWith(100), nil))
-	_, err := h.Handle(context.Background(), marshalArgs(diskCID, map[string]any{
+	_, err := h.Handle(fastRetryCtx(context.Background()), marshalArgs(diskCID, map[string]any{
 		"size": 20480, // 20 GiB, current=10 GiB → delta=10 GiB
 	}), jsonrpc.Context{})
 	if err != nil {
@@ -953,9 +953,10 @@ func TestHandleUpdateDisk_ResizeUnderStorageLock_ExhaustsRetries(t *testing.T) {
 		},
 	}
 
-	// Use a short-deadline context so the retry backoff sleeps abort quickly,
-	// keeping the test runtime under a second even at DefaultStorageLockMaxAttempts.
-	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	// fastRetryCtx zeros the backoff so DefaultStorageLockMaxAttempts retries
+	// burn no wall-clock time. Cap with a short deadline so an infinite-loop
+	// regression still aborts.
+	ctx, cancel := context.WithTimeout(fastRetryCtx(context.Background()), 500*time.Millisecond)
 	defer cancel()
 
 	h := handlers.HandleUpdateDisk(updateDiskDeps(qemuSvc, updateClusterWith(100), nil))

@@ -14,53 +14,33 @@ import (
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
 
-	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cloudinit"
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cluster"
-	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/clusterstorage"
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/nodes"
-	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/qemu"
-	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/storage"
-	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/tasks"
 )
 
 // ---------------------------------------------------------------------------
-// mock cluster service
+// mock cluster service shim
 // ---------------------------------------------------------------------------
 
-// mockClusterService embeds cluster.Service to satisfy the full interface.
-// Only ListStatus is overridden; all other methods panic at runtime if called.
-// The embedded nil interface satisfies the compiler without listing every method.
+// mockClusterService is a thin shim over the canonical mockClusterSvc that
+// preserves the previous statusResp/statusErr literal-construction ergonomics
+// used by calculate_vm_cloud_properties tests. The shim returns a configured
+// *mockClusterSvc whose listStatusFn closes over the provided response/error.
 type mockClusterService struct {
-	cluster.Service // nil — panics if non-overridden methods are called
-	statusResp      *cluster.ListStatusResponse
-	statusErr       error
+	statusResp *cluster.ListStatusResponse
+	statusErr  error
 }
 
-func (m *mockClusterService) ListStatus(ctx context.Context) (*cluster.ListStatusResponse, error) {
-	return m.statusResp, m.statusErr
+// asCanonical adapts the shim into a *mockClusterSvc by wiring listStatusFn.
+func (m *mockClusterService) asCanonical() *mockClusterSvc {
+	resp := m.statusResp
+	err := m.statusErr
+	return &mockClusterSvc{
+		listStatusFn: func(_ context.Context) (*cluster.ListStatusResponse, error) {
+			return resp, err
+		},
+	}
 }
-
-// compile-time interface check.
-var _ cluster.Service = (*mockClusterService)(nil)
-
-// ---------------------------------------------------------------------------
-// calcMockClient wires mock cluster + nodes services into a pve.Client.
-// nodesSvc carries a *mockNodesService from testmocks_test.go which supports
-// a configurable listStorageFn (nil → safe default returns active+images).
-// ---------------------------------------------------------------------------
-
-type calcMockClient struct {
-	clusterSvc cluster.Service
-	nodesSvc   nodes.Service
-}
-
-func (c *calcMockClient) QEMU() qemu.Service                     { return nil }
-func (c *calcMockClient) Storage() storage.Service               { return nil }
-func (c *calcMockClient) CloudInit() cloudinit.Service           { return nil }
-func (c *calcMockClient) Tasks() tasks.Service                   { return nil }
-func (c *calcMockClient) Nodes() nodes.Service                   { return c.nodesSvc }
-func (c *calcMockClient) Cluster() cluster.Service               { return c.clusterSvc }
-func (c *calcMockClient) ClusterStorage() clusterstorage.Service { return nil }
 
 // ---------------------------------------------------------------------------
 // storage response helpers (calc-test-only)
@@ -140,8 +120,8 @@ func makeCalcDeps(svc *mockClusterService) handlers.Deps {
 			VMDiskFormat: "qcow2",
 			VMStorage:    "local-lvm",
 		},
-		PVE: &calcMockClient{
-			clusterSvc: svc,
+		PVE: &mockPVEClient{
+			clusterSvc: svc.asCanonical(),
 			nodesSvc:   &mockNodesService{}, // nil listStorageFn → safe default
 		},
 		Logger: log.NewNopLogger(),
@@ -156,8 +136,8 @@ func makeCalcDepsWithNodes(svc *mockClusterService, nodesSvc nodes.Service) hand
 			VMDiskFormat: "qcow2",
 			VMStorage:    "local-lvm",
 		},
-		PVE: &calcMockClient{
-			clusterSvc: svc,
+		PVE: &mockPVEClient{
+			clusterSvc: svc.asCanonical(),
 			nodesSvc:   nodesSvc,
 		},
 		Logger: log.NewNopLogger(),

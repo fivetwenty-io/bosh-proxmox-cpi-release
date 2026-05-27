@@ -104,7 +104,6 @@ func TestParseStemcellCloudProps_LightFields(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
@@ -550,7 +549,6 @@ func TestStemcellCloudProps_validateLightMutex_Direct(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			err := tc.p.validateLightMutex()

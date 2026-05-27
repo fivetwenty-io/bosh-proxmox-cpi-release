@@ -57,6 +57,30 @@ func TransientBackoff(attempt int) time.Duration {
 	return out
 }
 
+// testBackoffKey is the context key used by WithTestBackoff to install a
+// deterministic backoff function for use by the RetryOn* helpers. Test-only.
+type testBackoffKey struct{}
+
+// WithTestBackoff returns a derived context that overrides the backoff curve
+// used by RetryOnStorageLock, RetryOnTransient, and RetryOnTransientOrLock.
+// The returned duration is slept verbatim (return 0 to skip). Intended for
+// tests to skip multi-second exponential backoff without changing the retry
+// loop's other semantics (attempt count, context cancellation, log lines).
+//
+// Production code MUST NOT call this — leave the default curves in place.
+// The seam costs one context.Value lookup per retry cycle, which is
+// negligible compared to a real PVE round-trip.
+func WithTestBackoff(ctx context.Context, fn func(attempt int) time.Duration) context.Context {
+	return context.WithValue(ctx, testBackoffKey{}, fn)
+}
+
+// backoffFromCtx returns the test backoff override installed by
+// WithTestBackoff, or nil if none.
+func backoffFromCtx(ctx context.Context) func(attempt int) time.Duration {
+	fn, _ := ctx.Value(testBackoffKey{}).(func(attempt int) time.Duration)
+	return fn
+}
+
 // StorageLockBackoff returns the sleep duration after the attempt-th
 // (0-indexed) failed lock acquisition: exponential 2s × 1.5^attempt with
 // ±30% jitter, capped at 30s. PVE serialises every per-storage operation
@@ -127,6 +151,9 @@ func RetryOnStorageLock(
 			break
 		}
 		d := StorageLockBackoff(attempt)
+		if override := backoffFromCtx(ctx); override != nil {
+			d = override(attempt)
+		}
 		if logger != nil {
 			logger.Info("pve: storage lock timeout, retrying",
 				log.String("op", label),
@@ -178,6 +205,9 @@ func RetryOnTransient(
 			break
 		}
 		d := TransientBackoff(attempt)
+		if override := backoffFromCtx(ctx); override != nil {
+			d = override(attempt)
+		}
 		if logger != nil {
 			logger.Info("pve: transient transport fault, retrying",
 				log.String("op", label),
@@ -243,6 +273,9 @@ func RetryOnTransientOrLock(
 			d = StorageLockBackoff(attempt)
 		} else {
 			d = TransientBackoff(attempt)
+		}
+		if override := backoffFromCtx(ctx); override != nil {
+			d = override(attempt)
 		}
 		if logger != nil {
 			reason := "transient_transport"

@@ -232,7 +232,6 @@ func TestCreateVMRetryBackoff_NonRetriable(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			for attempt := 0; attempt <= 3; attempt++ {
@@ -307,7 +306,6 @@ func TestNormalizeOSType(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		tc := tc
 		t.Run(fmt.Sprintf("input=%q", tc.input), func(t *testing.T) {
 			t.Parallel()
 			got := normalizeOSType(tc.input)

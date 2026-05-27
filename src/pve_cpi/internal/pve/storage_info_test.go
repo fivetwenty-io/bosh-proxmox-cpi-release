@@ -191,19 +191,13 @@ func TestRefresh_NegativeCacheTTL(t *testing.T) {
 
 // TestNegativeCacheTTL_Expires confirms that after the negative-cache window
 // elapses, a new Get re-invokes the lister rather than indefinitely caching
-// the failure. Sets the package-level negativeCacheTTL seam to 1ms so the
-// test is deterministic and completes in milliseconds rather than 5+ seconds.
+// the failure. Uses WithNegativeCacheTTL to inject a 1ms window per-instance
+// so the test stays parallel-safe — no package-global mutation.
 func TestNegativeCacheTTL_Expires(t *testing.T) {
-	// Not parallel: mutates the package-level negativeCacheTTL seam.
-	// Running in serial ensures no concurrent test reads the var while we write it.
-
-	// Override the package-level TTL to 1ms; restore on cleanup.
-	prev := negativeCacheTTL
-	negativeCacheTTL = 1 * time.Millisecond
-	t.Cleanup(func() { negativeCacheTTL = prev })
+	t.Parallel()
 
 	lister := &fakeLister{err: errors.New("pve unreachable")}
-	cache := NewStorageInfoCache(lister, time.Minute)
+	cache := NewStorageInfoCache(lister, time.Minute, WithNegativeCacheTTL(1*time.Millisecond))
 
 	_, err := cache.Get(context.Background(), "ceph")
 	if err == nil {
@@ -213,7 +207,7 @@ func TestNegativeCacheTTL_Expires(t *testing.T) {
 		t.Fatalf("calls=%d want 1", lister.calls)
 	}
 
-	// Wait out the overridden TTL (1ms) plus a small slack to ensure expiry.
+	// Wait out the per-instance TTL (1ms) plus slack so expiry is reliable.
 	time.Sleep(10 * time.Millisecond)
 
 	_, err = cache.Get(context.Background(), "ceph")

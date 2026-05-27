@@ -35,6 +35,11 @@ const isoSize int64 = 10 * 1024 * 1024
 // The ISO path is placed inside a process-owned temp directory created with
 // os.MkdirTemp (random suffix) to eliminate the TOCTOU race that existed when
 // os.CreateTemp created a named placeholder that was then removed and re-opened.
+//
+// Build is not byte-deterministic. The output ISO9660 image embeds a creation
+// timestamp via diskfs and may embed other per-build fields. Tests assert on
+// the semantic content (round-tripped via diskfs.Open) rather than raw bytes;
+// see builder_test.go.
 func Build(payload []byte) (path string, cleanup func(), err error) {
 	// Create a process-owned temp directory. The directory name carries a random
 	// suffix chosen by the OS, so no other process can predict or race the ISO path.
