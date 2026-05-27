@@ -46,22 +46,43 @@ export GOMODCACHE="${BOSH_COMPILE_TARGET}/.gomodcache"
 # Force vendor mode globally so no stray `go` sub-invocation hits the network.
 export GOFLAGS="-mod=vendor"
 
-# Assert target platform — BOSH compilation VMs are always linux/amd64.
-# Set explicitly so cross-compilation from macOS produces the right binary.
-export GOOS=linux
-export GOARCH=amd64
-
-# Verify the toolchain can cross-compile for the target before attempting build.
+# Target platform selection.
+#
+# Inside a real BOSH compilation VM the host is always linux/amd64 and the
+# packaged Go runs natively, so this script's job there is to produce a
+# Linux ELF for the director or deployment VMs to execute.
+#
+# `bosh create-env` invokes this same packaging script locally on the operator
+# host (macOS, linux, …) to build a CPI binary it will then `exec` ITSELF on
+# that operator host to bring up the director VM. If we cross-compile to
+# linux/amd64 unconditionally, create-env on a non-linux/amd64 operator (this
+# Mac, an arm64 Linux laptop, etc.) gets a Linux ELF it cannot exec — bosh
+# create-env then fails with "cannot execute binary file".
+#
+# Detect which path we are on by inspecting the active toolchain. If `go env`
+# reports linux/amd64 the build target matches the deploy target — either a
+# real compilation VM or a linux/amd64 operator host; pin GOOS/GOARCH for
+# clarity. Otherwise we are on the host-fallback path on a non-linux/amd64
+# operator; build host-native so create-env can run the binary, and warn that
+# the resulting release tarball is operator-local (re-package on linux/amd64
+# before uploading to a director or pushing to other deploy VMs).
 if ! go version >/dev/null 2>&1; then
   echo "ERROR: go binary at ${GOROOT}/bin/go is not executable" >&2
   exit 1
 fi
-ACTUAL_GOOS="$(go env GOOS)"
-ACTUAL_GOARCH="$(go env GOARCH)"
-if [ "${ACTUAL_GOOS}" != "linux" ] || [ "${ACTUAL_GOARCH}" != "amd64" ]; then
-  echo "ERROR: go env reports GOOS=${ACTUAL_GOOS} GOARCH=${ACTUAL_GOARCH}" >&2
-  echo "ERROR: expected linux/amd64; the compiled binary would be unusable." >&2
-  exit 1
+HOST_GO_GOOS="$(go env GOOS)"
+HOST_GO_GOARCH="$(go env GOARCH)"
+
+if [ "${HOST_GO_GOOS}" = "linux" ] && [ "${HOST_GO_GOARCH}" = "amd64" ]; then
+  export GOOS=linux
+  export GOARCH=amd64
+else
+  echo "==> Host-native build: go is ${HOST_GO_GOOS}/${HOST_GO_GOARCH};" >&2
+  echo "==> producing a binary for THIS host so 'bosh create-env' can exec it." >&2
+  echo "==> Re-package on linux/amd64 before publishing the release tarball" >&2
+  echo "==> for use by a remote director or any deployed VM." >&2
+  unset GOOS
+  unset GOARCH
 fi
 
 # ---------------------------------------------------------------------------
@@ -80,7 +101,7 @@ fi
 # ---------------------------------------------------------------------------
 mkdir -p "${BOSH_INSTALL_TARGET}/bin"
 
-echo "==> Building pve_cpi (${GOOS}/${GOARCH}) version=${BOSH_PACKAGE_VERSION_SANITIZED}"
+echo "==> Building pve_cpi (${GOOS:-${HOST_GO_GOOS}}/${GOARCH:-${HOST_GO_GOARCH}}) version=${BOSH_PACKAGE_VERSION_SANITIZED}"
 pushd "${BOSH_COMPILE_TARGET}/pve_cpi" >/dev/null
 
   go build \
