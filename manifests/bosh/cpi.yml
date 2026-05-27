@@ -63,6 +63,18 @@
   value: pve_cpi
 
 # Insert pve_cpi job into the bosh instance group.
+#
+# Note: we deliberately do NOT set a job-level `agent` property here. BOSH
+# manifest property resolution makes a job-level `properties.agent` shadow the
+# instance-group-level `properties.agent` from bosh-deployment's bosh.yml
+# (which supplies `agent.mbus: nats://((internal_ip)):4222`). The director
+# reads its own `agent.mbus` to populate the `mbus` field in the agent_settings
+# JSON it hands to every CPI create_vm call. If we shadow that with an empty
+# string, every deployed VM's agent boots with mbus="" and the CPI rejects
+# the call with "agent settings vm N: mbus is empty". Leaving the bosh.yml
+# default in place is the correct behaviour: the CPI receives agent_settings
+# per-invocation and forwards them into the VM, so the release does not need
+# its own agent property override.
 - type: replace
   path: /instance_groups/name=bosh/jobs/-
   value:
@@ -99,9 +111,6 @@
         numa: ((pve_numa))
         reboot_mode: ((pve_reboot_mode))
         reboot_timeout: ((pve_reboot_timeout))
-      agent: &pve_agent_props
-        mbus: ((pve_agent_mbus))
-        blobstore: ((pve_agent_blobstore))
 
 # cloud_provider drives create-env itself.
 - type: replace

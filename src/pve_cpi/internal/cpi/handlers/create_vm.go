@@ -992,13 +992,17 @@ func composeVMName(prefix, deployment, job, index string) string {
 
 // --------------------------------------------------------------------------
 // extractMBusAndBlobstore pulls mbus and blobstore from the env map. BOSH
-// uses two distinct env shapes depending on the caller:
+// uses three distinct env shapes depending on the caller:
 //
-//   - Director deploys: top-level keys env["mbus"] (string), env["blobstore"]
-//     (object with provider/options).
-//   - create-env / bosh-init: keys live under env["bosh"], with
-//     env["bosh"]["mbus"]["url"] (string) and env["bosh"]["blobstores"]
-//     (array; the first entry is the director-side blobstore).
+//   - Director deploys (the common path): keys live under env["bosh"],
+//     with env["bosh"]["mbus"] as a STRING (e.g. "nats://10.0.0.1:4222")
+//     and env["bosh"]["blobstores"] as an array (first entry is the
+//     director-side blobstore).
+//   - create-env / bosh-init: keys also live under env["bosh"], but
+//     env["bosh"]["mbus"] is an OBJECT with at least env["bosh"]["mbus"]["url"]
+//     plus TLS cert fields. We extract .url.
+//   - Legacy / out-of-band callers: top-level env["mbus"] (string) and
+//     env["blobstore"] (object). Accepted as a fallback for compatibility.
 //
 // Tolerant: missing keys return zero values.
 // --------------------------------------------------------------------------
@@ -1013,6 +1017,14 @@ func extractMBusAndBlobstore(env map[string]any) (string, agent.BlobstoreSpec) {
 
 	if boshRaw, ok := env["bosh"].(map[string]any); ok {
 		if mbus == "" {
+			// Director-deploy shape: env.bosh.mbus is a flat string.
+			if s, ok := boshRaw["mbus"].(string); ok {
+				mbus = s
+			}
+		}
+		if mbus == "" {
+			// create-env / bosh-init shape: env.bosh.mbus is an object
+			// with .url (plus cert fields we forward via env elsewhere).
 			if mbusRaw, ok := boshRaw["mbus"].(map[string]any); ok {
 				if u, ok := mbusRaw["url"].(string); ok {
 					mbus = u
