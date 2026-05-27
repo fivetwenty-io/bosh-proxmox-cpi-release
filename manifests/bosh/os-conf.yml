@@ -6,6 +6,11 @@
 # inline job on the `bosh` instance group via os-conf-release's
 # pre-start-script.
 #
+# Install runs fully detached so a slow or unreachable apt mirror cannot
+# stall the director's first boot. Pre-start returns immediately; the
+# package lands moments later. Bounded with timeouts so it can never run
+# unattended forever.
+#
 # Layered by ./scripts/bosh create-env after manifests/bosh/cpi.yml.
 
 - type: replace
@@ -26,12 +31,33 @@
         #!/usr/bin/env bash
         set -euo pipefail
 
+        # qemu-guest-agent.service on Ubuntu Noble is a STATIC unit (no
+        # [Install] section, no WantedBy). It is activated by udev via the
+        # virtio-serial device. `systemctl enable` errors on static units, so
+        # use `start` only (idempotent — no-op if already running).
+        start_qga() {
+          systemctl start qemu-guest-agent.service 2>/dev/null || true
+        }
+
+        # Fast path: already installed — ensure it is running and return.
         if command -v qemu-ga >/dev/null 2>&1; then
-          systemctl enable --now qemu-guest-agent || true
+          start_qga
           exit 0
         fi
 
-        export DEBIAN_FRONTEND=noninteractive
-        apt-get update -y
-        apt-get install -y --no-install-recommends qemu-guest-agent
-        systemctl enable --now qemu-guest-agent
+        # Install path: NEVER block pre-start. Synchronous apt against a slow
+        # mirror can stall director boot for minutes. Install fully detached
+        # and best-effort. Bounded with timeouts and a single retry so it can
+        # never run unattended forever.
+        logdir=/var/vcap/sys/log/pve-guest-agent
+        mkdir -p "$logdir"
+        setsid bash -c '
+          export DEBIAN_FRONTEND=noninteractive
+          opts="-o Acquire::Retries=1 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20"
+          timeout 120 apt-get $opts update -y \
+            || echo "pve-guest-agent: apt-get update failed/timed out, continuing"
+          timeout 180 apt-get $opts install -y --no-install-recommends qemu-guest-agent \
+            || echo "pve-guest-agent: qemu-guest-agent install failed/timed out"
+          systemctl start qemu-guest-agent.service 2>/dev/null || true
+        ' </dev/null >>"$logdir/install.log" 2>&1 &
+        exit 0

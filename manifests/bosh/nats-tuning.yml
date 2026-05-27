@@ -17,10 +17,12 @@
 # In practice 15 s is too tight: UAA Java boot (Flyway + Spring
 # init), monit reloads after configure-jobs, large package installs
 # on diego-cells all easily block the agent's NATS handler past that
-# window. Bumping ping_interval to 30 s (with ping_max_outstanding=2
-# kept at default) widens the grace period to ~90 s. Heartbeat-based
-# liveness detection (hm.agent.heartbeat.*) is unaffected — that
-# channel is independent of the mbus PING/PONG.
+# window. Bumping ping_interval to 30 s and ping_max_outstanding to 3
+# widens the grace period to ~120 s. Heartbeat-based liveness
+# detection (hm.agent.heartbeat.*) is unaffected — that channel is
+# independent of the mbus PING/PONG. HM agent_timeout=180s
+# (hm-tuning.yml) still tears down truly dead agents, so the wider
+# NATS window does not mask real failures.
 #
 # Usage: applied automatically by `scripts/bosh create-env`.
 # Takes effect on the next director redeploy.
@@ -59,7 +61,7 @@
 
 - type: replace
   path: /instance_groups/name=bosh/properties/nats/ping_max_outstanding?
-  value: 2
+  value: 3
 
 - type: replace
   path: /instance_groups/name=bosh/properties/nats-sync?/intervals?/poll_user_sync?

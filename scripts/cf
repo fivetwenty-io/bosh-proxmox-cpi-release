@@ -43,6 +43,7 @@ import re
 import shlex
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import requests
@@ -355,7 +356,7 @@ def cmd_unstick_agent(extra: list[str]) -> None:
 
 def cmd_bosh_deploy(extra: list[str]) -> None:
     banner("Deploy")
-    run(
+    deploy_cmd = [
         "bosh", "-e", ENV, "-n", "-d", DEPLOYMENT, "deploy",
         str(CF_DEPLOYMENT / "cf-deployment.yml"),
         "-o", str(CF_DEPLOYMENT / "operations/use-compiled-releases.yml"),
@@ -372,10 +373,38 @@ def cmd_bosh_deploy(extra: list[str]) -> None:
         # ops file for the rationale and rollback path.
         "-o", "manifests/cf/gorouter-tuning.yml",
         "-o", "manifests/cf/route-registrar-tuning.yml",
+        # Canary updates deadlock when haproxy cannot resolve DNS for
+        # not-yet-updated routers. Lab tolerates full-rollout signal;
+        # the rolling-deploy safety net is not needed here.
+        "-o", "manifests/cf/no-canaries.yml",
         "-l", "manifests/bosh/vars.yml",
         "-l", "manifests/cf/vars.yml",
         *extra,
-    )
+    ]
+
+    # Retry loop. bosh-nats-sync SIGHUP-induced "unresponsive agent"
+    # timeouts typically self-resolve within 30-60s, but BOSH's
+    # "Preparing deployment" phase does not retry on its own. A
+    # `bosh cloud-check --auto` pass between attempts picks up the
+    # recovery so the next try proceeds. Capped at 3 attempts so a
+    # persistent failure surfaces promptly rather than looping.
+    max_attempts = 3
+    for attempt in range(1, max_attempts + 1):
+        result = subprocess.run(deploy_cmd, check=False)
+        if result.returncode == 0:
+            return
+        if attempt == max_attempts:
+            sys.exit(result.returncode)
+        print(
+            f"\n>>> deploy attempt {attempt}/{max_attempts} failed "
+            f"(rc={result.returncode}); running cloud-check and retrying"
+        )
+        subprocess.run(
+            ["bosh", "-e", ENV, "-n", "-d", DEPLOYMENT, "cloud-check", "--auto"],
+            check=False,
+        )
+        print(">>> sleeping 30s before retry")
+        time.sleep(30)
 
 
 def system_domain() -> str:

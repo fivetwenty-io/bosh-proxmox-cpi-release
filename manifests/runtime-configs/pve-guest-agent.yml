@@ -14,6 +14,16 @@
 # unreachable apt mirror can never stall pre-start (a long blocking pre-start
 # can drop the director<->agent NATS link and wedge the deploy). Air-gapped
 # sites should pre-bake the package or mirror it on a reachable apt repo.
+#
+# Residual gap: QGA is only reachable AFTER the detached install completes
+# (typically seconds when the mirror is healthy). During that brief window
+# the `unstick-agent` fallback (PVE `qm guest exec`) is unavailable, which
+# matters only if bosh-agent itself wedges on the very same boot before the
+# QGA install finishes. Closing this gap fully requires installing QGA from
+# the CPI side via cloud-init runcmd at VM-create time so QGA is up before
+# bosh-agent starts. That path is feasible but needs a live ConfigDrive vs
+# PVE cicustom datasource-coexistence test on Ubuntu Noble — deferred to a
+# follow-up cycle.
 
 releases:
 - name:    os-conf
