@@ -28,6 +28,9 @@ func TestNewClient_AppliesTLSConfig(t *testing.T) {
 	if c == nil {
 		t.Fatal("NewClient returned nil")
 	}
+	// TLS minimum version is not observable via transport injection; private-field
+	// inspection is unavoidable here because MinVersion is set inside NewClient
+	// before returning and no public getter exposes it.
 	tr, ok := c.http.Transport.(*http.Transport)
 	if !ok {
 		t.Fatalf("http.Transport: expected *http.Transport, got %T", c.http.Transport)
@@ -538,14 +541,17 @@ func TestNewClientWithOptions_ConfiguredHostExtracted(t *testing.T) {
 	cases := []struct {
 		endpoint string
 		wantHost string
+		opts     Options
 	}{
-		{"https://registry.example.com", "registry.example.com"},
-		{"https://registry.example.com:8080", "registry.example.com:8080"},
-		{"https://registry.example.com/", "registry.example.com"},
-		{"http://10.0.0.1:25777", "10.0.0.1:25777"},
+		{"https://registry.example.com", "registry.example.com", Options{}},
+		{"https://registry.example.com:8080", "registry.example.com:8080", Options{}},
+		{"https://registry.example.com/", "registry.example.com", Options{}},
+		// 10.0.0.1 is an RFC1918 private address. AllowPrivateIP must be true to
+		// construct a client pointing at it; the private-IP guard fires otherwise.
+		{"http://10.0.0.1:25777", "10.0.0.1:25777", Options{AllowPrivateIP: true}},
 	}
 	for _, tc := range cases {
-		c, err := NewClientWithOptions(tc.endpoint, "u", "p", Options{})
+		c, err := NewClientWithOptions(tc.endpoint, "u", "p", tc.opts)
 		if err != nil {
 			t.Fatalf("NewClientWithOptions(%q): unexpected error: %v", tc.endpoint, err)
 		}
@@ -571,6 +577,207 @@ func TestNewClientWithOptions_CheckRedirectSet(t *testing.T) {
 	redirectErr := c.http.CheckRedirect(nil, nil)
 	if redirectErr == nil {
 		t.Fatal("CheckRedirect must return an error to prevent redirect following")
+	}
+}
+
+// --------------------------------------------------------------------------
+// Private / loopback IP rejection (AllowPrivateIP=false, default).
+// --------------------------------------------------------------------------
+
+// mockResolver implements the resolver interface used by checkEndpointIPs.
+// It returns a fixed set of addresses for any host, making DNS behaviour
+// deterministic without network access.
+type mockResolver struct {
+	addrs []string
+	err   error
+}
+
+func (r *mockResolver) LookupHost(_ context.Context, _ string) ([]string, error) {
+	return r.addrs, r.err
+}
+
+// TestNewClient_RejectsPrivateIPHost verifies that an RFC1918 private IP
+// literal in the endpoint is rejected at construction time (AllowPrivateIP=false
+// by default for NewClientWithOptions).
+func TestNewClient_RejectsPrivateIPHost(t *testing.T) {
+	t.Parallel()
+	for _, endpoint := range []string{
+		"http://192.168.1.50:25777",
+		"http://10.0.0.1:25777",
+		"http://172.16.5.10:25777",
+	} {
+		t.Run(endpoint, func(t *testing.T) {
+			t.Parallel()
+			_, err := NewClientWithOptions(endpoint, "u", "p", Options{AllowPrivateIP: false})
+			if err == nil {
+				t.Fatalf("expected error for private-IP endpoint %q, got nil", endpoint)
+			}
+			if !strings.Contains(err.Error(), "private/loopback") {
+				t.Errorf("error %q should mention private/loopback", err.Error())
+			}
+			if !strings.Contains(err.Error(), "registry_allow_private_ip=true") {
+				t.Errorf("error %q should mention registry_allow_private_ip=true", err.Error())
+			}
+		})
+	}
+}
+
+// TestNewClient_RejectsLoopbackHost verifies that loopback addresses (127.x.x.x)
+// are rejected at construction time.
+func TestNewClient_RejectsLoopbackHost(t *testing.T) {
+	t.Parallel()
+	_, err := NewClientWithOptions("http://127.0.0.1:25777", "u", "p", Options{AllowPrivateIP: false})
+	if err == nil {
+		t.Fatal("expected error for loopback endpoint, got nil")
+	}
+	if !strings.Contains(err.Error(), "private/loopback") {
+		t.Errorf("error %q should mention private/loopback", err.Error())
+	}
+}
+
+// TestNewClient_RejectsLinkLocalHost verifies that IPv4 link-local addresses
+// (169.254.x.x) are rejected at construction time.
+func TestNewClient_RejectsLinkLocalHost(t *testing.T) {
+	t.Parallel()
+	_, err := NewClientWithOptions("http://169.254.0.1:25777", "u", "p", Options{AllowPrivateIP: false})
+	if err == nil {
+		t.Fatal("expected error for link-local endpoint, got nil")
+	}
+	if !strings.Contains(err.Error(), "private/loopback") {
+		t.Errorf("error %q should mention private/loopback", err.Error())
+	}
+}
+
+// TestNewClient_RejectsIPv6Loopback verifies that the IPv6 loopback (::1) is
+// rejected at construction time.
+func TestNewClient_RejectsIPv6Loopback(t *testing.T) {
+	t.Parallel()
+	_, err := NewClientWithOptions("http://[::1]:25777", "u", "p", Options{AllowPrivateIP: false})
+	if err == nil {
+		t.Fatal("expected error for IPv6 loopback endpoint, got nil")
+	}
+	if !strings.Contains(err.Error(), "private/loopback") {
+		t.Errorf("error %q should mention private/loopback", err.Error())
+	}
+}
+
+// TestNewClient_AllowsPrivateIPWithOverride verifies that a private-IP endpoint
+// is accepted when AllowPrivateIP=true.
+func TestNewClient_AllowsPrivateIPWithOverride(t *testing.T) {
+	t.Parallel()
+	for _, endpoint := range []string{
+		"https://192.168.1.50:25777",
+		"http://127.0.0.1:25777",
+		"http://169.254.0.1:25777",
+		"http://[::1]:25777",
+	} {
+		t.Run(endpoint, func(t *testing.T) {
+			t.Parallel()
+			c, err := NewClientWithOptions(endpoint, "u", "p", Options{AllowPrivateIP: true})
+			if err != nil {
+				t.Fatalf("AllowPrivateIP=true: unexpected error for %q: %v", endpoint, err)
+			}
+			if c == nil {
+				t.Fatal("AllowPrivateIP=true: expected non-nil client")
+			}
+		})
+	}
+}
+
+// TestNewClient_AllowsPublicIP verifies that publicly-routable IP literals are
+// accepted with the default options (AllowPrivateIP=false).
+func TestNewClient_AllowsPublicIP(t *testing.T) {
+	t.Parallel()
+	for _, endpoint := range []string{
+		"https://8.8.8.8:25777",
+		"https://203.0.113.5:25777", // TEST-NET-3 (RFC5737) — not private per IsPrivate()
+	} {
+		t.Run(endpoint, func(t *testing.T) {
+			t.Parallel()
+			c, err := NewClientWithOptions(endpoint, "u", "p", Options{})
+			if err != nil {
+				t.Fatalf("public IP %q: unexpected rejection error: %v", endpoint, err)
+			}
+			if c == nil {
+				t.Fatalf("public IP %q: expected non-nil client", endpoint)
+			}
+		})
+	}
+}
+
+// TestNewClient_RejectsHostnameResolvingToPrivate verifies that a hostname
+// resolving to a private IP is rejected. Uses an injected mock resolver so the
+// test does not depend on live DNS.
+func TestNewClient_RejectsHostnameResolvingToPrivate(t *testing.T) {
+	t.Parallel()
+	resolver := &mockResolver{addrs: []string{"192.168.100.5"}}
+	_, err := NewClientWithOptions("https://registry.internal.example.com:25777", "u", "p", Options{
+		resolver: resolver,
+	})
+	if err == nil {
+		t.Fatal("expected error for hostname resolving to private IP, got nil")
+	}
+	if !strings.Contains(err.Error(), "private/loopback") {
+		t.Errorf("error %q should mention private/loopback", err.Error())
+	}
+	if !strings.Contains(err.Error(), "192.168.100.5") {
+		t.Errorf("error %q should include the resolved private IP", err.Error())
+	}
+}
+
+// TestNewClient_AllowsHostnameResolvingToPrivate_WithOverride verifies that a
+// hostname resolving to a private IP is accepted when AllowPrivateIP=true.
+func TestNewClient_AllowsHostnameResolvingToPrivate_WithOverride(t *testing.T) {
+	t.Parallel()
+	resolver := &mockResolver{addrs: []string{"192.168.100.5"}}
+	c, err := NewClientWithOptions("https://registry.internal.example.com:25777", "u", "p", Options{
+		AllowPrivateIP: true,
+		resolver:       resolver,
+	})
+	if err != nil {
+		t.Fatalf("AllowPrivateIP=true: unexpected error for hostname resolving to private IP: %v", err)
+	}
+	if c == nil {
+		t.Fatal("AllowPrivateIP=true: expected non-nil client")
+	}
+}
+
+// TestNewClient_AllowsHostnameResolvingToPublic verifies that a hostname
+// resolving to a public IP is accepted with the default options.
+func TestNewClient_AllowsHostnameResolvingToPublic(t *testing.T) {
+	t.Parallel()
+	resolver := &mockResolver{addrs: []string{"93.184.216.34"}} // example.com
+	c, err := NewClientWithOptions("https://registry.example.com:25777", "u", "p", Options{
+		resolver: resolver,
+	})
+	if err != nil {
+		t.Fatalf("hostname resolving to public IP: unexpected rejection: %v", err)
+	}
+	if c == nil {
+		t.Fatal("hostname resolving to public IP: expected non-nil client")
+	}
+}
+
+// TestNewClient_DNSFailure_ProductionPathSkips verifies that when the
+// production path (nil resolver) encounters a DNS failure, construction
+// succeeds rather than aborting — the check is best-effort and the registry
+// may not be resolvable at CPI startup.
+//
+// Tested via a hostname that is guaranteed not to resolve ("this-hostname-is-
+// guaranteed-to-not-resolve.invalid" uses the ".invalid" TLD which RFC 2606
+// reserves for precisely this purpose).
+func TestNewClient_DNSFailure_ProductionPathSkips(t *testing.T) {
+	t.Parallel()
+	// ".invalid" TLD is RFC 2606 § 2 reserved — guaranteed no DNS resolution.
+	c, err := NewClientWithOptions(
+		"https://this-hostname-is-guaranteed-not-to-resolve.invalid:25777", "u", "p",
+		Options{AllowPrivateIP: false}, // nil resolver = production path
+	)
+	if err != nil {
+		t.Fatalf("production DNS failure must be non-fatal (best-effort check): %v", err)
+	}
+	if c == nil {
+		t.Fatal("expected non-nil client on DNS failure (production path skips)")
 	}
 }
 

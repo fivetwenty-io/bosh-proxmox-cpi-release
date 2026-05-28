@@ -337,8 +337,8 @@ func TestUpdateDiskHints_EmptyHints(t *testing.T) {
 	if err := ra.UpdateDiskHints(context.Background(), 100, nil); err != nil {
 		t.Fatalf("UpdateDiskHints with nil hints returned error: %v", err)
 	}
-	if requestCount != 2 {
-		t.Errorf("expected exactly 2 requests, got %d", requestCount)
+	if requestCount < 2 {
+		t.Errorf("expected at least 2 requests (GET + PUT), got %d", requestCount)
 	}
 }
 

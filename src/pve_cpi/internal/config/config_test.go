@@ -1451,10 +1451,15 @@ func TestValidate_StemcellStagingDir_RelativePath(t *testing.T) {
 // absolute path is rejected with a clear error message.
 func TestValidate_StemcellStagingDir_NonExistent(t *testing.T) {
 	t.Parallel()
+	// Create a temp dir, then remove it so the path is guaranteed absent on this OS.
+	absentDir := t.TempDir()
+	if err := os.Remove(absentDir); err != nil {
+		t.Fatalf("remove temp dir: %v", err)
+	}
 	_, err := mustLoad(t, `{
 		"host":"h","user":"u","password":"p",
 		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
-		"stemcell_staging_dir":"/nonexistent-bosh-cpi-test-dir-should-not-exist"
+		"stemcell_staging_dir":"`+absentDir+`"
 	}`)
 	assertCloudError(t, err, "stemcell_staging_dir")
 	assertCloudError(t, err, "does not exist")
@@ -1464,11 +1469,11 @@ func TestValidate_StemcellStagingDir_NonExistent(t *testing.T) {
 // is a regular file (not a directory) is rejected.
 func TestValidate_StemcellStagingDir_IsFile(t *testing.T) {
 	t.Parallel()
-	tmpFile, ferr := os.CreateTemp("", "cpi-test-not-a-dir-*")
+	dir := t.TempDir()
+	tmpFile, ferr := os.Create(dir + "/not-a-dir")
 	if ferr != nil {
 		t.Fatalf("create temp file: %v", ferr)
 	}
-	defer func() { _ = os.Remove(tmpFile.Name()) }()
 	_ = tmpFile.Close()
 
 	_, err := mustLoad(t, `{
@@ -1563,5 +1568,155 @@ func TestValidate_PVECACertPEM_IgnoredWhenVerifySSLFalse(t *testing.T) {
 	}`)
 	if err != nil {
 		t.Fatalf("malformed pve_ca_cert with verify_ssl=false: expected no error, got: %v", err)
+	}
+}
+
+// --------------------------------------------------------------------------
+// RegistryAllowPrivateIP field: accessor, JSON decode, validation warning.
+// --------------------------------------------------------------------------
+
+// TestRegistryAllowPrivateIPValue_Nil verifies nil pointer → false (guard active).
+func TestRegistryAllowPrivateIPValue_Nil(t *testing.T) {
+	t.Parallel()
+	var cfg config.CPIConfig
+	if cfg.RegistryAllowPrivateIPValue() {
+		t.Error("RegistryAllowPrivateIPValue() = true on nil pointer, want false")
+	}
+}
+
+// TestRegistryAllowPrivateIPValue_True verifies *true → true (guard disabled).
+func TestRegistryAllowPrivateIPValue_True(t *testing.T) {
+	t.Parallel()
+	cfg := &config.CPIConfig{RegistryAllowPrivateIP: boolPtr(true)}
+	if !cfg.RegistryAllowPrivateIPValue() {
+		t.Error("RegistryAllowPrivateIPValue() = false for *true, want true")
+	}
+}
+
+// TestRegistryAllowPrivateIPValue_False verifies *false → false (explicit; same as nil).
+func TestRegistryAllowPrivateIPValue_False(t *testing.T) {
+	t.Parallel()
+	cfg := &config.CPIConfig{RegistryAllowPrivateIP: boolPtr(false)}
+	if cfg.RegistryAllowPrivateIPValue() {
+		t.Error("RegistryAllowPrivateIPValue() = true for *false, want false")
+	}
+}
+
+// TestValidate_RegistryAllowPrivateIP_Unset verifies that omitting
+// registry_allow_private_ip from JSON leaves the pointer nil, passes
+// validation without error, and RegistryAllowPrivateIPValue() returns false.
+func TestValidate_RegistryAllowPrivateIP_Unset(t *testing.T) {
+	t.Parallel()
+	cfg, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+		"agent_mode":"registry",
+		"registry_endpoint":"https://registry.example.com:25777",
+		"registry_user":"ru","registry_password":"rp"
+	}`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.RegistryAllowPrivateIP != nil {
+		t.Errorf("RegistryAllowPrivateIP = %v, want nil (field absent from JSON)", cfg.RegistryAllowPrivateIP)
+	}
+	if cfg.RegistryAllowPrivateIPValue() {
+		t.Error("RegistryAllowPrivateIPValue() = true when field absent, want false")
+	}
+}
+
+// TestValidate_RegistryAllowPrivateIP_True verifies that registry_allow_private_ip=true
+// is accepted, the pointer is non-nil and true, and a warning log entry is emitted.
+func TestValidate_RegistryAllowPrivateIP_True(t *testing.T) {
+	t.Parallel()
+	cfg := registryBaseCfg()
+	cfg.RegistryEndpoint = "https://registry.example.com:25777"
+	cfg.RegistryAllowPrivateIP = boolPtr(true)
+
+	logger, obs := log.NewObservedLogger(log.LevelWarn)
+	if err := cfg.ValidateWithLogger(logger); err != nil {
+		t.Fatalf("expected nil error with allow_private_ip=true, got %v", err)
+	}
+
+	// Exactly one warn entry must be emitted mentioning the opt-in flag.
+	entries := obs.All()
+	found := false
+	for _, e := range entries {
+		if strings.Contains(e.Message, "registry_allow_private_ip=true") {
+			found = true
+			ep, ok := e.Attrs["endpoint"]
+			if !ok {
+				t.Errorf("warn entry missing 'endpoint' attribute: %+v", e)
+			}
+			if epStr, _ := ep.(string); !strings.Contains(epStr, "registry.example.com") {
+				t.Errorf("endpoint attr %q lost host", epStr)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("no warn entry matched registry_allow_private_ip=true; entries=%+v", entries)
+	}
+}
+
+// TestValidate_RegistryAllowPrivateIP_False verifies that registry_allow_private_ip=false
+// is accepted and no warning is emitted (same effective behavior as nil).
+func TestValidate_RegistryAllowPrivateIP_False(t *testing.T) {
+	t.Parallel()
+	cfg := registryBaseCfg()
+	cfg.RegistryEndpoint = "https://registry.example.com:25777"
+	cfg.RegistryAllowPrivateIP = boolPtr(false)
+
+	logger, obs := log.NewObservedLogger(log.LevelWarn)
+	if err := cfg.ValidateWithLogger(logger); err != nil {
+		t.Fatalf("expected nil error with allow_private_ip=false, got %v", err)
+	}
+
+	// Explicit false must not emit the warning (guard is active, no operator action needed).
+	for _, e := range obs.All() {
+		if strings.Contains(e.Message, "registry_allow_private_ip") {
+			t.Errorf("unexpected warn entry for explicit false: %+v", e)
+		}
+	}
+}
+
+// TestValidate_RegistryAllowPrivateIP_NonRegistryModeIgnored verifies that the
+// allow_private_ip field is not evaluated when agent_mode != registry (the entire
+// validateRegistryConfig guard fires only in registry mode).
+func TestValidate_RegistryAllowPrivateIP_NonRegistryModeIgnored(t *testing.T) {
+	t.Parallel()
+	cfg, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+		"agent_mode":"cloudinit",
+		"registry_allow_private_ip":true
+	}`)
+	if err != nil {
+		t.Fatalf("unexpected error in cloudinit mode with registry_allow_private_ip=true: %v", err)
+	}
+	if !cfg.RegistryAllowPrivateIPValue() {
+		t.Error("RegistryAllowPrivateIPValue() = false but JSON set it to true")
+	}
+}
+
+// TestLoad_RegistryAllowPrivateIP_JSONRoundTrip verifies the field decodes
+// correctly from JSON when present.
+func TestLoad_RegistryAllowPrivateIP_JSONRoundTrip(t *testing.T) {
+	t.Parallel()
+	cfg, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+		"agent_mode":"registry",
+		"registry_endpoint":"https://registry.example.com:25777",
+		"registry_user":"ru","registry_password":"rp",
+		"registry_allow_private_ip":true
+	}`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.RegistryAllowPrivateIP == nil {
+		t.Fatal("RegistryAllowPrivateIP = nil, want *true")
+	}
+	if !*cfg.RegistryAllowPrivateIP {
+		t.Error("*RegistryAllowPrivateIP = false, want true")
 	}
 }

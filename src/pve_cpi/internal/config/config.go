@@ -167,6 +167,17 @@ type CPIConfig struct {
 	// Defense-in-depth against SSRF via host mutation.
 	RegistryAllowedHosts []string `json:"registry_allowed_hosts,omitempty" yaml:"registry_allowed_hosts,omitempty"`
 
+	// RegistryAllowPrivateIP disables the private/loopback IP rejection guard
+	// on the registry endpoint when true. Default nil (treated as false): the
+	// registry client rejects endpoints whose IP address is private (RFC1918),
+	// loopback (127/8, ::1), link-local (169.254/16, fe80::/10), or unspecified
+	// (0.0.0.0, ::). Set to true only for lab/test deployments where the
+	// registry is intentionally on a private network (e.g. 192.168.x.x).
+	// Pointer-typed so nil (field absent from JSON) is distinguishable from an
+	// explicit false. Use RegistryAllowPrivateIPValue() to obtain the
+	// effective bool. Validate-only-when-set; omit from ERB output when nil.
+	RegistryAllowPrivateIP *bool `json:"registry_allow_private_ip,omitempty"`
+
 	// AgentMBus is the URL the BOSH agent should bind/listen on inside the VM
 	// (e.g. https://mbus:pw@0.0.0.0:6868). Sourced from
 	// cloud_provider.properties.agent.mbus during `bosh create-env` because
@@ -441,12 +452,24 @@ func (c *CPIConfig) NUMAValue() bool {
 	return *c.NUMA
 }
 
+// RegistryAllowPrivateIPValue returns the effective allow-private-IP toggle.
+// nil (field absent from JSON) → false (guard active, private IPs rejected).
+// *true  → true (guard disabled, private IPs permitted — lab/test only).
+// *false → false (guard active, identical to nil but explicit).
+func (c *CPIConfig) RegistryAllowPrivateIPValue() bool {
+	if c.RegistryAllowPrivateIP == nil {
+		return false
+	}
+	return *c.RegistryAllowPrivateIP
+}
+
 // Validate checks all required fields and enum constraints.
 // Returns a CloudError whose message lists every violation, separated by "; ".
 //
-// Validate may emit a warning log entry (registry_allow_insecure opt-in path).
-// The warning is written to a stderr-backed slog logger; callers who need to
-// capture it for assertions should use ValidateWithLogger instead.
+// Validate may emit warning log entries (registry_allow_insecure and
+// registry_allow_private_ip opt-in paths). Warnings are written to a
+// stderr-backed slog logger; callers who need to capture them for assertions
+// should use ValidateWithLogger instead.
 func (c *CPIConfig) Validate() error {
 	return c.ValidateWithLogger(nil)
 }
@@ -662,6 +685,13 @@ func (c *CPIConfig) validateRegistryConfig(errs *[]string, logger *log.Logger) {
 		}
 	}
 
+	// registry_allow_private_ip opt-in warning: when the operator has explicitly
+	// enabled the override, emit a single warning so the choice is visible in
+	// logs. Nil and explicit false are silent (guard active is the safe default).
+	if c.RegistryAllowPrivateIP != nil && *c.RegistryAllowPrivateIP {
+		emitRegistryPrivateIPWarning(logger, c.RegistryEndpoint)
+	}
+
 	// registry_allowed_hosts: each entry must be a non-empty string with no
 	// scheme or path component (host patterns only).
 	for i, h := range c.RegistryAllowedHosts {
@@ -736,6 +766,26 @@ func emitRegistryInsecureWarning(logger *log.Logger, endpoint string) {
 	}
 	target.Warn(
 		"registry_allow_insecure=true; transmitting credentials over cleartext http",
+		log.String("endpoint", redactEndpoint(endpoint)),
+	)
+}
+
+// emitRegistryPrivateIPWarning logs the allow-private-ip opt-in warning to
+// logger. When logger is nil it builds a stderr-backed warn-level logger
+// (matching the pattern used by emitRegistryInsecureWarning) so the warning
+// surfaces even when Validate is invoked before the application logger is
+// constructed.
+func emitRegistryPrivateIPWarning(logger *log.Logger, endpoint string) {
+	target := logger
+	if target == nil {
+		fallback, err := log.NewLogger("warn", os.Stderr)
+		if err != nil {
+			return
+		}
+		target = fallback
+	}
+	target.Warn(
+		"registry_allow_private_ip=true; private/loopback IP check disabled for registry endpoint",
 		log.String("endpoint", redactEndpoint(endpoint)),
 	)
 }

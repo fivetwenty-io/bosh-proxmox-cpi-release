@@ -71,6 +71,13 @@
     # zero-value ([]) is preserved and no behavior change occurs.
     registry_allowed_hosts = p("registry.allowed_hosts", [])
     config["registry_allowed_hosts"] = registry_allowed_hosts unless registry_allowed_hosts.nil? || registry_allowed_hosts.empty?
+    # Emit registry_allow_private_ip only when explicitly set to true. When
+    # absent or false (the default), the key is omitted so the Go config
+    # zero-value (nil *bool → false → guard active) is preserved. This mirrors
+    # the registry.ca_cert / registry.allow_insecure omit-when-empty pattern.
+    if p("registry.allow_private_ip", false)
+      config["registry_allow_private_ip"] = true
+    end
   end
   JSON.dump(config)
 %>

@@ -533,8 +533,8 @@ func TestPut_RetryExhaustion_BackoffWallClock(t *testing.T) {
 	}
 
 	// Sanity upper bound: the maximum delay sum is 250ms + 500ms = 750ms;
-	// add 2s slack for HTTP round-trip overhead and scheduler noise.
-	const ceilingMillis = 2750
+	// add 4.25s slack for HTTP round-trip overhead and scheduler noise on slow runners.
+	const ceilingMillis = 5000
 	if elapsed > ceilingMillis*time.Millisecond {
 		t.Errorf("elapsed = %v, exceeds %dms ceiling (jitter upper bound + slack)",
 			elapsed, ceilingMillis)

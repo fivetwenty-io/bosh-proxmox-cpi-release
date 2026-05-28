@@ -63,16 +63,178 @@ type Options struct {
 	// filtering; the configuredHost invariant and disabled redirects still
 	// apply regardless. Sourced from config.RegistryAllowedHosts.
 	AllowedHosts []string
+
+	// AllowPrivateIP disables the private/loopback IP rejection guard when
+	// true. Default false (guard active): NewClientWithOptions resolves the
+	// endpoint host and rejects any address that is private, loopback,
+	// link-local, or unspecified. Set true only for lab/test deployments
+	// where the registry is on a private network. Sourced from
+	// config.RegistryAllowPrivateIP.
+	AllowPrivateIP bool
+
+	// resolver is an optional DNS resolver for private-IP checks.
+	// When nil, net.DefaultResolver is used. Exported only for tests;
+	// production callers leave it nil.
+	resolver interface {
+		LookupHost(ctx context.Context, host string) ([]string, error)
+	}
+}
+
+// privateIPNets is the set of address blocks checked by isPrivateIP in
+// addition to the stdlib predicates. Go 1.17+ net.IP.IsPrivate covers
+// RFC1918 (10/8, 172.16/12, 192.168/16) and RFC4193 (fc00::/7 unique-local).
+// We add the remaining blocks the stdlib predicates handle individually so
+// all checks flow through a single function.
+//
+// Note: loopback (127/8, ::1), link-local unicast (169.254/16, fe80::/10),
+// and unspecified (0.0.0.0, ::) are handled by net.IP.IsLoopback(),
+// IsLinkLocalUnicast(), and IsUnspecified() respectively; they are not in
+// this list.
+var privateIPNets []*net.IPNet
+
+func init() {
+	// These CIDRs supplement the Go stdlib predicates. In practice all RFC1918
+	// + RFC4193 ranges are already covered by IsPrivate() in Go 1.17+, and the
+	// others by IsLoopback / IsLinkLocalUnicast / IsUnspecified. The list is
+	// kept explicit for clarity and forward safety.
+	for _, cidr := range []string{
+		// RFC1918 — covered by IsPrivate() in Go 1.17+ but listed for defence-in-depth.
+		"10.0.0.0/8",
+		"172.16.0.0/12",
+		"192.168.0.0/16",
+		// RFC4193 unique-local IPv6 — also covered by IsPrivate() in Go 1.17+.
+		"fc00::/7",
+	} {
+		_, ipNet, err := net.ParseCIDR(cidr)
+		if err != nil {
+			// Impossible: all literals are valid CIDRs; panic at init to fail fast.
+			panic("registry: bad CIDR in privateIPNets init: " + cidr + ": " + err.Error())
+		}
+		privateIPNets = append(privateIPNets, ipNet)
+	}
+}
+
+// isPrivateOrSpecial returns true when ip is a private, loopback, link-local,
+// unspecified, or any other non-globally-routable address. Defense-in-depth
+// against SSRF via DNS rebinding to an internal registry endpoint that the
+// operator did not explicitly opt into.
+//
+// Covered address classes:
+//   - RFC1918 private (10/8, 172.16/12, 192.168/16) via IsPrivate()
+//   - RFC4193 unique-local IPv6 (fc00::/7) via IsPrivate()
+//   - Loopback (127/8, ::1) via IsLoopback()
+//   - Link-local unicast (169.254/16, fe80::/10) via IsLinkLocalUnicast()
+//   - Unspecified (0.0.0.0, ::) via IsUnspecified()
+func isPrivateOrSpecial(ip net.IP) bool {
+	return ip.IsPrivate() ||
+		ip.IsLoopback() ||
+		ip.IsLinkLocalUnicast() ||
+		ip.IsUnspecified()
+}
+
+// checkEndpointIPs inspects the host component of endpoint for private,
+// loopback, link-local, or unspecified addresses and returns an error if any
+// are found. When opts.resolver is non-nil it is used for hostname DNS
+// resolution instead of net.DefaultResolver (test seam — inject to avoid
+// network calls in unit tests).
+//
+// IP-literal endpoints are always checked. For hostname endpoints:
+//   - When opts.resolver is non-nil (test-injected), the injected resolver is
+//     called and its result is checked. A lookup failure from an injected
+//     resolver is returned as a CloudError.
+//   - When opts.resolver is nil (production), net.DefaultResolver is used. A
+//     DNS failure is treated as a non-fatal skip: the check is best-effort
+//     because the registry service may not be resolvable at CPI startup, and
+//     the TOCTOU window means the dial-time address can differ from the
+//     check-time address regardless. The remaining defense layers
+//     (configuredHost invariant, no-redirect policy, AllowedHosts filter)
+//     remain active.
+//
+// TOCTOU caveat: DNS rebinding can change the resolved address between this
+// check and the actual TCP dial. This check is one layer of a defense-in-depth
+// stack; it is not the sole guard.
+func checkEndpointIPs(endpoint string, opts Options) error {
+	// Parse host from endpoint URL. Malformed URLs are caught by the config
+	// validator before construction; treat unparseable as a no-op here.
+	u, err := url.Parse(endpoint)
+	if err != nil || u.Host == "" {
+		return nil
+	}
+	// Strip port if present (Hostname() handles IPv6 bracket stripping too).
+	host := u.Hostname()
+	if host == "" {
+		return nil
+	}
+
+	// IP literal path: check directly without DNS.
+	if ip := net.ParseIP(host); ip != nil {
+		if isPrivateOrSpecial(ip) {
+			return cpierrors.Cloud(
+				"registry endpoint resolves to private/loopback IP %s; set registry_allow_private_ip=true to override",
+				ip.String(),
+			)
+		}
+		return nil
+	}
+
+	// Hostname path: resolve to IPs.
+	if opts.resolver != nil {
+		// Injected resolver (test seam): full check, DNS failure is fatal.
+		addrs, lookupErr := opts.resolver.LookupHost(context.Background(), host)
+		if lookupErr != nil {
+			return cpierrors.Cloud(
+				"registry: DNS lookup for %q failed: %s", host, lookupErr.Error(),
+			)
+		}
+		for _, addr := range addrs {
+			ip := net.ParseIP(addr)
+			if ip == nil {
+				continue
+			}
+			if isPrivateOrSpecial(ip) {
+				return cpierrors.Cloud(
+					"registry endpoint resolves to private/loopback IP %s; set registry_allow_private_ip=true to override",
+					ip.String(),
+				)
+			}
+		}
+		return nil
+	}
+
+	// Production path (no injected resolver): best-effort DNS check.
+	// DNS failure is non-fatal: the registry may not be resolvable at CPI
+	// startup and TOCTOU makes the check informational regardless.
+	addrs, lookupErr := net.DefaultResolver.LookupHost(context.Background(), host)
+	if lookupErr != nil {
+		// Non-fatal: skip the check; other defense layers remain active.
+		return nil
+	}
+	for _, addr := range addrs {
+		ip := net.ParseIP(addr)
+		if ip == nil {
+			continue
+		}
+		if isPrivateOrSpecial(ip) {
+			return cpierrors.Cloud(
+				"registry endpoint resolves to private/loopback IP %s; set registry_allow_private_ip=true to override",
+				ip.String(),
+			)
+		}
+	}
+	return nil
 }
 
 // NewClient constructs a Client for the registry at endpoint with default
 // transport options (TLS 1.2 floor, system trust pool, 30-second per-attempt
 // timeout). Trailing slashes on endpoint are trimmed.
 //
-// This is a thin wrapper over NewClientWithOptions retained for backward
-// compatibility with existing call sites.
+// This is a convenience wrapper over NewClientWithOptions retained for
+// backward compatibility. It passes AllowPrivateIP: true to preserve the
+// pre-existing behavior of not performing a private-IP rejection check at
+// construction. Production code that enforces the private-IP guard must call
+// NewClientWithOptions with opts.AllowPrivateIP derived from config.
 func NewClient(endpoint, user, pass string) *Client {
-	c, _ := NewClientWithOptions(endpoint, user, pass, Options{})
+	c, _ := NewClientWithOptions(endpoint, user, pass, Options{AllowPrivateIP: true})
 	return c
 }
 
@@ -89,10 +251,15 @@ func NewClient(endpoint, user, pass string) *Client {
 //     before every http.Do call, catching accidental URL mutation bugs.
 //   - When opts.AllowedHosts is non-empty, doWithRetry additionally verifies
 //     req.URL.Host against the allow-list (exact match or "*.example.com" wildcard).
+//   - Unless opts.AllowPrivateIP is true, the endpoint host is resolved at
+//     construction time and any private/loopback/link-local/unspecified address
+//     causes construction to fail. Set AllowPrivateIP=true only for lab/test
+//     deployments. DNS rebinding (TOCTOU) remains possible; this check is one
+//     layer of a defense-in-depth stack.
 //
-// Returns an error only when opts.CACertPEM is non-empty and cannot be parsed
-// (either x509.SystemCertPool fails or no certificates are decoded from PEM).
-// Callers may safely ignore the error when they pass an empty CACertPEM.
+// Returns an error when opts.CACertPEM is non-empty and cannot be parsed, or
+// when the endpoint host resolves to a private/loopback IP and
+// opts.AllowPrivateIP is false.
 func NewClientWithOptions(endpoint, user, pass string, opts Options) (*Client, error) {
 	tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12}
 	if opts.CACertPEM != "" {
@@ -131,6 +298,16 @@ func NewClientWithOptions(endpoint, user, pass string, opts Options) (*Client, e
 	if len(opts.AllowedHosts) > 0 {
 		allowedHosts = make([]string, len(opts.AllowedHosts))
 		copy(allowedHosts, opts.AllowedHosts)
+	}
+
+	// Private-IP guard: reject endpoints that resolve to private/loopback/
+	// link-local/unspecified addresses unless the operator explicitly opted in.
+	// Applied after TLS config and before returning the client so invalid
+	// endpoints are caught at construction rather than at first request.
+	if !opts.AllowPrivateIP {
+		if err := checkEndpointIPs(trimmedEndpoint, opts); err != nil {
+			return nil, err
+		}
 	}
 
 	return &Client{

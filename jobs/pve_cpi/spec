@@ -228,6 +228,16 @@ properties:
       Empty (default) disables host-allow-list filtering; the configuredHost
       invariant and disabled redirects still apply regardless.
     default: []
+  registry.allow_private_ip:
+    description: |
+      When true, disables the private/loopback IP rejection guard on the
+      registry endpoint. Default false: the registry client rejects endpoints
+      whose resolved IP is private (RFC1918: 10/8, 172.16/12, 192.168/16),
+      loopback (127/8, ::1), link-local (169.254/16, fe80::/10), or unspecified.
+      Set to true only for lab/test deployments where the registry is
+      intentionally on a private network. Production deployments must leave
+      this unset or false and use a publicly routable registry address.
+    default: false
   pve.fetch_credential_defaults:
     description: |
       Ordered list of URL-prefix to auth-payload mappings used by the CPI when
