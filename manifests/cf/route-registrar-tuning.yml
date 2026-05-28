@@ -16,9 +16,22 @@
 # the cf NATS topology. Do *not* lower below 5 s — cf-deployment
 # convention is ≥5 s.
 #
+# Healthcheck invariant: route_registrar refuses to start when a route's
+# health_check.timeout is not strictly less than its registration_interval
+# (config validation: "invalid healthcheck timeout: <t> must be less than
+# the registration interval: <i>"). cf-deployment ships the api route with
+# health_check.timeout: 6 s, which is valid against the stock 10 s interval
+# but not against the 5 s interval above. Lower the timeout to 4 s so the
+# invariant holds; the cloud_controller_ng health-check script is a fast
+# local probe and completes well inside 4 s.
+#
 # Usage: applied automatically by `scripts/cf bosh-deploy`.
 # Rollback: drop the ops file from scripts/cf; redeploy api.
 
 - type: replace
   path: /instance_groups/name=api/jobs/name=route_registrar/properties/route_registrar/routes/name=api/registration_interval
   value: 5s
+
+- type: replace
+  path: /instance_groups/name=api/jobs/name=route_registrar/properties/route_registrar/routes/name=api/health_check/timeout
+  value: 4s

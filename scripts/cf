@@ -445,8 +445,121 @@ def cmd_unstick_agent(extra: list[str]) -> None:
     print("    bosh-agent active")
 
 
+def _list_instances_json() -> "list[dict] | None":
+    """Return instance rows for DEPLOYMENT, or None when it is absent/unqueryable.
+
+    None means "do not wait" — either the deployment does not exist yet (fresh
+    deploy creates VMs) or the director could not be queried this instant.
+
+    Uses `bosh vms` (not `instances`) because only `vms` includes vm_cid, which
+    the reboot-based recovery needs to map an unresponsive agent to its VMID.
+    """
+    result = subprocess.run(
+        ["bosh", "-e", ENV, "-d", DEPLOYMENT, "vms", "--json"],
+        capture_output=True, text=True, check=False,
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        return json.loads(result.stdout)["Tables"][0]["Rows"]
+    except (ValueError, KeyError, IndexError):
+        return None
+
+
+def _unresponsive_instances(rows: "list[dict]") -> "list[tuple[str, str]]":
+    """Return (instance, vm_cid) for every instance whose agent is unresponsive."""
+    return [
+        (r.get("instance", "?"), str(r.get("vm_cid", "")).strip())
+        for r in rows
+        if "unresponsive" in (r.get("process_state") or "").lower()
+    ]
+
+
+def _ssh_opts() -> "list[str]":
+    """SSH options for reaching the PVE host (mirrors unstick-agent)."""
+    opts = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
+    if os.environ.get("SCRIPTS_CF_SSH_UNSAFE") == "1":
+        opts += ["-o", "StrictHostKeyChecking=no"]
+    return opts
+
+
+def _pve_reboot_cid(cid: str) -> bool:
+    """Reboot a VM by PVE VMID via `qm reboot` on the PVE host.
+
+    bosh cloud-check resolutions are unreliable on this director (they abort
+    with an empty-deployment error), so unresponsive agents are recovered by
+    rebooting the VM directly: the bosh-agent restarts on boot and
+    re-establishes its director NATS connection. The CPI uses the PVE VMID as
+    the cloud ID, so *cid* is the VMID. Best-effort: returns False on any error.
+    """
+    try:
+        vmid = _coerce_vmid(cid)
+    except ValueError:
+        return False
+    pve_host = capture("bosh", "int", str(BOSH_VARS), "--path=/pve_host")
+    result = subprocess.run(
+        ["ssh", *_ssh_opts(), f"root@{pve_host}", "qm", "reboot", str(vmid)],
+        capture_output=True, text=True, check=False,
+    )
+    return result.returncode == 0
+
+
+def wait_agents_responsive(timeout_s: int, settle_reads: int = 2, poll_s: int = 15) -> bool:
+    """Block until every agent in DEPLOYMENT answers the director, or *timeout_s*.
+
+    cf-deployment's "Preparing deployment" phase issues get_state to every
+    instance and aborts the whole deploy if any single one times out (45s). On
+    this lab the director<->agent NATS RPCs are intermittently lost during
+    connection re-authorization (see manifests/bosh/nats-tuning.yml header), so
+    one agent can show "unresponsive agent" transiently and sink an
+    otherwise-ready deploy. This preflight waits for a run of consecutive
+    all-responsive reads, and issues `cloud-check --auto` to reboot any agent
+    that stays unresponsive, so the deploy starts from a converged baseline.
+
+    Returns True when the deployment is absent (nothing to wait for) or all
+    agents are responsive; False on timeout.
+    """
+    banner("agent-stable preflight")
+    deadline = time.time() + timeout_s
+    clean_streak = 0
+    last_kick = 0.0
+    while time.time() < deadline:
+        rows = _list_instances_json()
+        if rows is None:
+            print("    deployment not present (or director busy); skipping wait")
+            return True
+        bad = _unresponsive_instances(rows)
+        if not bad:
+            clean_streak += 1
+            print(f"    all agents responsive ({clean_streak}/{settle_reads})")
+            if clean_streak >= settle_reads:
+                return True
+        else:
+            clean_streak = 0
+            names = ", ".join(i for i, _ in bad)
+            print(f"    unresponsive: {names}")
+            # A VM reboot takes ~90s to come back; rate-limit recovery kicks so
+            # we do not pile reboots on a VM that is still booting.
+            if time.time() - last_kick > 120:
+                last_kick = time.time()
+                for inst, cid in bad:
+                    if not cid:
+                        print(f"    {inst}: no vm_cid, cannot reboot")
+                        continue
+                    ok = _pve_reboot_cid(cid)
+                    print(f"    reboot {inst} (cid {cid}): {'issued' if ok else 'FAILED'}")
+        time.sleep(poll_s)
+    print(f"    timed out after {timeout_s}s waiting for responsive agents")
+    return False
+
+
 def cmd_bosh_deploy(extra: list[str]) -> None:
     banner("Deploy")
+    # Preflight: converge the agent baseline before the get_state-heavy
+    # "Preparing deployment" phase. SCRIPTS_CF_AGENT_WAIT seconds (0 disables).
+    preflight_s = int(os.environ.get("SCRIPTS_CF_AGENT_WAIT", "600") or "600")
+    if preflight_s > 0:
+        wait_agents_responsive(preflight_s)
     deploy_cmd = [
         "bosh", "-e", ENV, "-n", "-d", DEPLOYMENT, "deploy",
         str(CF_DEPLOYMENT / "cf-deployment.yml"),
@@ -473,13 +586,16 @@ def cmd_bosh_deploy(extra: list[str]) -> None:
         *extra,
     ]
 
-    # Retry loop. bosh-nats-sync SIGHUP-induced "unresponsive agent"
-    # timeouts typically self-resolve within 30-60s, but BOSH's
-    # "Preparing deployment" phase does not retry on its own. A
-    # `bosh cloud-check --auto` pass between attempts picks up the
-    # recovery so the next try proceeds. Capped at 3 attempts so a
-    # persistent failure surfaces promptly rather than looping.
-    max_attempts = 3
+    # Retry loop. Director<->agent "unresponsive agent" / get_state timeouts
+    # (see manifests/bosh/nats-tuning.yml header) typically self-resolve within
+    # 30-60s, but BOSH's "Preparing deployment" phase does not retry on its
+    # own. A `bosh cloud-check --auto` pass between attempts recovers the
+    # affected agent so the next try proceeds. A large foundation's prepare
+    # phase needs every agent responsive in one window, and a different agent
+    # can flap each attempt, so the default is several attempts. Tune via
+    # SCRIPTS_CF_DEPLOY_ATTEMPTS; a persistent (non-flap) failure still
+    # surfaces after the cap.
+    max_attempts = max(1, int(os.environ.get("SCRIPTS_CF_DEPLOY_ATTEMPTS", "8") or "8"))
     for attempt in range(1, max_attempts + 1):
         result = subprocess.run(deploy_cmd, check=False)
         if result.returncode == 0:
@@ -488,12 +604,13 @@ def cmd_bosh_deploy(extra: list[str]) -> None:
             sys.exit(result.returncode)
         print(
             f"\n>>> deploy attempt {attempt}/{max_attempts} failed "
-            f"(rc={result.returncode}); running cloud-check and retrying"
+            f"(rc={result.returncode}); recovering agents and retrying"
         )
-        subprocess.run(
-            ["bosh", "-e", ENV, "-n", "-d", DEPLOYMENT, "cloud-check", "--auto"],
-            check=False,
-        )
+        # cloud-check resolutions are unreliable on this director (they abort
+        # with an empty-deployment error), so converge agents the same way the
+        # preflight does: reboot any unresponsive VM, then wait for a stable
+        # all-responsive baseline before the next attempt.
+        wait_agents_responsive(min(preflight_s, 300) if preflight_s else 300)
         print(">>> sleeping 30s before retry")
         time.sleep(30)
 

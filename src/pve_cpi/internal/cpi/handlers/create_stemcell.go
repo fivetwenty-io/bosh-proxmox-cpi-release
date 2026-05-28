@@ -560,7 +560,7 @@ func ensureTemplateVM(
 
 	allocatedRaw, allocErr := pve.AllocateWithRetry(ctx, deps.PVE,
 		func(candidate int) error {
-			return attemptCreateTemplateVM(ctx, deps, logger, templateNode, candidate, templateName, importVolid, shaTag)
+			return attemptCreateTemplateVM(ctx, deps, logger, templateNode, candidate, templateName, importVolid, shaTag, storage)
 		},
 		isRetryable,
 		0, // use AllocateWithRetry default (3 attempts)
@@ -654,13 +654,15 @@ func attemptCreateTemplateVM(
 	logger *log.Logger,
 	node string,
 	candidate int,
-	templateName, importVolid, shaTag string,
+	templateName, importVolid, shaTag, storage string,
 ) error {
-	// virtio0: use 0 as the storage allocation target (import-from drives the
-	// actual disk placement). size=5G matches defaultStemcellDiskGiB; PVE will
-	// not shrink below the imported image's actual size.
-	virtio0Val := fmt.Sprintf("0,import-from=%s,format=%s,size=%dG",
-		importVolid, diskFormatQCOW2, defaultStemcellDiskGiB)
+	// virtio0: allocate on <storage> (PVE requires the "<storage>:<size>" form;
+	// a bare "0" is parsed as a volume ID and rejected with "unable to parse
+	// volume ID '0'"). import-from drives the actual disk placement. size=5G
+	// matches defaultStemcellDiskGiB; PVE will not shrink below the imported
+	// image's actual size.
+	virtio0Val := fmt.Sprintf("%s:0,import-from=%s,format=%s,size=%dG",
+		storage, importVolid, diskFormatQCOW2, defaultStemcellDiskGiB)
 
 	createParams := map[string]any{
 		"vmid":    candidate,
