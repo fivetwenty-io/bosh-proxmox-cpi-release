@@ -219,6 +219,34 @@ properties:
       reside under this directory when set. Must be an absolute path to an
       existing directory on the CPI host.
     default: ""
+  pve.stemcell_fetch_dial_timeout_sec:
+    description: |
+      Optional. Bounds the TCP dial step of every stemcell-fetch HTTP request
+      (https and bosh+blobstore sources). 0 (default) applies the built-in 30s
+      default. Valid range when set: 1-3600 seconds. Lower values make stalled
+      handshakes fail faster; raise only if reaching a high-latency artifact
+      mirror.
+    default: 0
+  pve.stemcell_fetch_tls_handshake_timeout_sec:
+    description: |
+      Optional. Bounds the TLS handshake step of every stemcell-fetch HTTPS
+      request. 0 (default) applies the built-in 15s default. Valid range when
+      set: 1-3600 seconds.
+    default: 0
+  pve.stemcell_fetch_response_header_timeout_sec:
+    description: |
+      Optional. Bounds the wait for response headers after a stemcell-fetch
+      request is sent. Guards against slow-loris drips on the response-header
+      phase. The request body transfer is bounded by the outer 30-minute
+      stemcell-fetch deadline, not by this field. 0 (default) applies the
+      built-in 120s default. Valid range when set: 1-3600 seconds.
+    default: 0
+  pve.stemcell_fetch_idle_conn_timeout_sec:
+    description: |
+      Optional. Bounds how long an idle keep-alive connection stays in the
+      connection pool before being closed. 0 (default) applies the built-in 90s
+      default. Valid range when set: 1-3600 seconds.
+    default: 0
   registry.allowed_hosts:
     description: |
       Optional. If non-empty, restricts the registry HTTP client to only

@@ -329,6 +329,113 @@ func TestLoadFile_MalformedJSON(t *testing.T) {
 }
 
 // --------------------------------------------------------------------------
+// TestLoad_ExceedsMaxBytes
+// --------------------------------------------------------------------------
+
+// TestLoad_ExceedsMaxBytes verifies the 1 MiB cap on config input. The cap
+// is defense-in-depth against a malformed or attacker-controlled config that
+// would otherwise drive an unbounded io.ReadAll allocation.
+func TestLoad_ExceedsMaxBytes(t *testing.T) {
+	t.Parallel()
+	oversize := strings.Repeat("a", config.MaxConfigBytes+1)
+	_, err := config.Load(strings.NewReader(oversize))
+	assertCloudError(t, err, "config: input exceeds")
+}
+
+// --------------------------------------------------------------------------
+// TestApplyDefaults_StemcellFetchTimeouts
+// --------------------------------------------------------------------------
+
+// TestApplyDefaults_StemcellFetchTimeouts verifies the stemcell-fetch transport
+// timeout defaults are applied when fields are zero.
+func TestApplyDefaults_StemcellFetchTimeouts(t *testing.T) {
+	t.Parallel()
+	var cfg config.CPIConfig
+	cfg.ApplyDefaults()
+
+	if cfg.StemcellFetchDialTimeoutSec != 30 {
+		t.Errorf("StemcellFetchDialTimeoutSec = %d, want 30", cfg.StemcellFetchDialTimeoutSec)
+	}
+	if cfg.StemcellFetchTLSHandshakeTimeoutSec != 15 {
+		t.Errorf("StemcellFetchTLSHandshakeTimeoutSec = %d, want 15", cfg.StemcellFetchTLSHandshakeTimeoutSec)
+	}
+	if cfg.StemcellFetchResponseHeaderTimeoutSec != 120 {
+		t.Errorf("StemcellFetchResponseHeaderTimeoutSec = %d, want 120", cfg.StemcellFetchResponseHeaderTimeoutSec)
+	}
+	if cfg.StemcellFetchIdleConnTimeoutSec != 90 {
+		t.Errorf("StemcellFetchIdleConnTimeoutSec = %d, want 90", cfg.StemcellFetchIdleConnTimeoutSec)
+	}
+}
+
+// --------------------------------------------------------------------------
+// TestApplyDefaults_StemcellFetchTimeoutsExplicit
+// --------------------------------------------------------------------------
+
+// TestApplyDefaults_StemcellFetchTimeoutsExplicit ensures operator-supplied
+// values are preserved through ApplyDefaults.
+func TestApplyDefaults_StemcellFetchTimeoutsExplicit(t *testing.T) {
+	t.Parallel()
+	cfg := config.CPIConfig{
+		StemcellFetchDialTimeoutSec:           45,
+		StemcellFetchTLSHandshakeTimeoutSec:   20,
+		StemcellFetchResponseHeaderTimeoutSec: 300,
+		StemcellFetchIdleConnTimeoutSec:       60,
+	}
+	cfg.ApplyDefaults()
+
+	if cfg.StemcellFetchDialTimeoutSec != 45 {
+		t.Errorf("StemcellFetchDialTimeoutSec = %d, want 45", cfg.StemcellFetchDialTimeoutSec)
+	}
+	if cfg.StemcellFetchTLSHandshakeTimeoutSec != 20 {
+		t.Errorf("StemcellFetchTLSHandshakeTimeoutSec = %d, want 20", cfg.StemcellFetchTLSHandshakeTimeoutSec)
+	}
+	if cfg.StemcellFetchResponseHeaderTimeoutSec != 300 {
+		t.Errorf("StemcellFetchResponseHeaderTimeoutSec = %d, want 300", cfg.StemcellFetchResponseHeaderTimeoutSec)
+	}
+	if cfg.StemcellFetchIdleConnTimeoutSec != 60 {
+		t.Errorf("StemcellFetchIdleConnTimeoutSec = %d, want 60", cfg.StemcellFetchIdleConnTimeoutSec)
+	}
+}
+
+// --------------------------------------------------------------------------
+// TestValidate_StemcellFetchTimeoutOutOfRange
+// --------------------------------------------------------------------------
+
+// TestValidate_StemcellFetchTimeoutOutOfRange verifies the 1-3600 cap is
+// enforced when an operator sets an explicit non-zero invalid value. Zero is
+// accepted (treated as "use default at ApplyDefaults time").
+func TestValidate_StemcellFetchTimeoutOutOfRange(t *testing.T) {
+	t.Parallel()
+	cfg := &config.CPIConfig{
+		Host:                                  "h",
+		User:                                  "u",
+		Password:                              "p",
+		VMStorage:                             "s",
+		DiskStorage:                           "s",
+		NetworkBridge:                         "br",
+		Port:                                  8006,
+		VerifySSL:                             boolPtr(true),
+		AgentMode:                             "cloudinit",
+		VMDiskFormat:                          "qcow2",
+		LogLevel:                              "info",
+		VMIDRangeStart:                        100,
+		VMIDRangeEnd:                          5999,
+		RebootMode:                            "soft",
+		RebootTimeout:                         60,
+		NetworkMode:                           "auto",
+		SDNZoneType:                           "simple",
+		StemcellFetchResponseHeaderTimeoutSec: 7200,
+	}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected validation error for response_header_timeout_sec=7200")
+	}
+	if !strings.Contains(err.Error(), "stemcell_fetch_response_header_timeout_sec") {
+		t.Errorf("error message missing field name: %v", err)
+	}
+}
+
+// --------------------------------------------------------------------------
 // TestValidate_VMDiskFormatInvalid
 // --------------------------------------------------------------------------
 

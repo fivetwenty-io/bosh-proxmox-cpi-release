@@ -207,7 +207,7 @@ func TestBlobstoreSource_Fetch_EmptyBlobID(t *testing.T) {
 	t.Parallel()
 
 	// No real server needed — error must fire before any network I/O.
-	src := newBlobstoreSource()
+	src := newBlobstoreSource(DefaultTransportConfig())
 	ctx := context.Background()
 	ref := Reference{
 		Scheme: "bosh+blobstore",
@@ -230,7 +230,7 @@ func TestBlobstoreSource_Fetch_EmptyBlobID(t *testing.T) {
 func TestBlobstoreSource_Fetch_NoCreds(t *testing.T) {
 	t.Parallel()
 
-	src := newBlobstoreSource()
+	src := newBlobstoreSource(DefaultTransportConfig())
 	ctx := context.Background()
 	ref := Reference{
 		Scheme: "bosh+blobstore",

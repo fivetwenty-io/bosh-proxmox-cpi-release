@@ -43,6 +43,20 @@
   stemcell_staging_dir = p("pve.stemcell_staging_dir", "")
   config["stemcell_staging_dir"] = stemcell_staging_dir unless stemcell_staging_dir.to_s.empty?
 
+  # Emit stemcell-fetch transport timeouts only when the operator sets them.
+  # When absent or 0 (the default), the key is omitted so the Go config
+  # zero-value (0) reaches ApplyDefaults and the built-in defaults apply
+  # (30s/15s/120s/90s). Mirrors the registry_ca_cert / verify_ssl pattern.
+  {
+    "stemcell_fetch_dial_timeout_sec"            => "pve.stemcell_fetch_dial_timeout_sec",
+    "stemcell_fetch_tls_handshake_timeout_sec"   => "pve.stemcell_fetch_tls_handshake_timeout_sec",
+    "stemcell_fetch_response_header_timeout_sec" => "pve.stemcell_fetch_response_header_timeout_sec",
+    "stemcell_fetch_idle_conn_timeout_sec"       => "pve.stemcell_fetch_idle_conn_timeout_sec",
+  }.each do |json_key, prop|
+    v = p(prop, 0).to_i
+    config[json_key] = v unless v == 0
+  end
+
   # Emit password / api_token only when non-empty. The Go config validator
   # rejects "both set" or "neither set" — this template never strips a value
   # the operator supplied. If both p() calls return non-empty, both keys

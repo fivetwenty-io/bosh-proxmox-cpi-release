@@ -1,6 +1,3 @@
-// Package config loads and validates the BOSH CPI configuration JSON passed
-// by the BOSH director at startup. It applies defaults for all optional fields
-// and returns a fully populated, validated CPIConfig.
 package config
 
 import (
@@ -221,6 +218,27 @@ type CPIConfig struct {
 	// means all stemcell fetches are unauthenticated unless
 	// cloud_properties.image_url_auth supplies per-stemcell credentials.
 	FetchCredentialDefaults []FetchCredentialDefault `json:"fetch_credential_defaults,omitempty"`
+
+	// StemcellFetchDialTimeoutSec bounds the TCP dial step of every
+	// stemcell-fetch HTTP request (https and bosh+blobstore sources). 0 (default)
+	// applies the built-in 30s default. Valid range: 1-3600 seconds.
+	StemcellFetchDialTimeoutSec int `json:"stemcell_fetch_dial_timeout_sec,omitempty"`
+
+	// StemcellFetchTLSHandshakeTimeoutSec bounds the TLS handshake step of every
+	// stemcell-fetch HTTPS request. 0 (default) applies the built-in 15s default.
+	// Valid range: 1-3600 seconds.
+	StemcellFetchTLSHandshakeTimeoutSec int `json:"stemcell_fetch_tls_handshake_timeout_sec,omitempty"`
+
+	// StemcellFetchResponseHeaderTimeoutSec bounds the wait for the response
+	// headers after a stemcell-fetch request is sent. Guards against slow-loris
+	// drips on the response-header phase. 0 (default) applies the built-in 120s
+	// default. Valid range: 1-3600 seconds.
+	StemcellFetchResponseHeaderTimeoutSec int `json:"stemcell_fetch_response_header_timeout_sec,omitempty"`
+
+	// StemcellFetchIdleConnTimeoutSec bounds how long an idle keep-alive
+	// connection stays in the connection pool before being closed. 0 (default)
+	// applies the built-in 90s default. Valid range: 1-3600 seconds.
+	StemcellFetchIdleConnTimeoutSec int `json:"stemcell_fetch_idle_conn_timeout_sec,omitempty"`
 }
 
 // FetchCredentialDefault maps a URL prefix to a JSON auth payload understood
@@ -294,16 +312,27 @@ func warnUnknownFields(raw []byte) {
 	)
 }
 
+// MaxConfigBytes caps the CPI configuration JSON at 1 MiB. Realistic BOSH
+// CPI configs are a few KiB at most; this is defense-in-depth against a
+// malformed or attacker-controlled config that would otherwise drive an
+// unbounded io.ReadAll allocation.
+const MaxConfigBytes = 1 << 20
+
 // Load decodes CPIConfig from r, applies defaults, then validates.
 // Unknown JSON fields are logged at Warn level and ignored to preserve
 // forward-compatibility with future BOSH director versions.
-// Returns a CloudError on read failure, decode failure, or validation failure.
+// Returns a CloudError on read failure, decode failure, validation failure,
+// or when the input exceeds MaxConfigBytes.
 func Load(r io.Reader) (*CPIConfig, error) {
 	// Buffer the input so we can decode twice: once into a raw map for unknown-
 	// field detection, then into CPIConfig for the actual value population.
-	raw, err := io.ReadAll(r)
+	// Read one extra byte to distinguish "exactly at the cap" from "exceeded the cap".
+	raw, err := io.ReadAll(io.LimitReader(r, MaxConfigBytes+1))
 	if err != nil {
 		return nil, cpierrors.Cloud("config: read: %s", err.Error())
+	}
+	if int64(len(raw)) > MaxConfigBytes {
+		return nil, cpierrors.Cloud("config: input exceeds %d bytes", MaxConfigBytes)
 	}
 	warnUnknownFields(raw)
 
@@ -393,6 +422,18 @@ func (c *CPIConfig) ApplyDefaults() {
 	}
 	if c.RebootTimeout <= 0 {
 		c.RebootTimeout = 60
+	}
+	if c.StemcellFetchDialTimeoutSec <= 0 {
+		c.StemcellFetchDialTimeoutSec = 30
+	}
+	if c.StemcellFetchTLSHandshakeTimeoutSec <= 0 {
+		c.StemcellFetchTLSHandshakeTimeoutSec = 15
+	}
+	if c.StemcellFetchResponseHeaderTimeoutSec <= 0 {
+		c.StemcellFetchResponseHeaderTimeoutSec = 120
+	}
+	if c.StemcellFetchIdleConnTimeoutSec <= 0 {
+		c.StemcellFetchIdleConnTimeoutSec = 90
 	}
 	if c.NetworkMode == "" {
 		c.NetworkMode = "auto"
@@ -654,6 +695,32 @@ func (c *CPIConfig) validateRanges(errs *[]string) {
 			"reboot_timeout must be 1-3600 seconds, got %d", c.RebootTimeout,
 		))
 	}
+
+	// Stemcell-fetch transport timeouts: 1–3600 seconds when ApplyDefaults has
+	// run. The fields are int seconds so the JSON shape stays human-friendly;
+	// the conversion to time.Duration happens at the call site.
+	c.appendStemcellFetchTimeoutErrors(errs)
+}
+
+// appendStemcellFetchTimeoutErrors validates each stemcell-fetch transport
+// timeout is within 1–3600 seconds when explicitly set. Zero is accepted and
+// is the signal for ApplyDefaults to fill in the built-in default. Negative
+// values and values >3600 are rejected.
+func (c *CPIConfig) appendStemcellFetchTimeoutErrors(errs *[]string) {
+	check := func(name string, v int) {
+		if v == 0 {
+			return
+		}
+		if v < 1 || v > 3600 {
+			*errs = append(*errs, fmt.Sprintf(
+				"%s must be 1-3600 seconds when set, got %d", name, v,
+			))
+		}
+	}
+	check("stemcell_fetch_dial_timeout_sec", c.StemcellFetchDialTimeoutSec)
+	check("stemcell_fetch_tls_handshake_timeout_sec", c.StemcellFetchTLSHandshakeTimeoutSec)
+	check("stemcell_fetch_response_header_timeout_sec", c.StemcellFetchResponseHeaderTimeoutSec)
+	check("stemcell_fetch_idle_conn_timeout_sec", c.StemcellFetchIdleConnTimeoutSec)
 }
 
 // validateRegistryConfig appends errors for registry-related constraints when

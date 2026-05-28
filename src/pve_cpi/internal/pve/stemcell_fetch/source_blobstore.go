@@ -19,14 +19,18 @@ type blobstoreSource struct {
 	client *http.Client
 }
 
-// newBlobstoreSource returns a Source whose http.Client uses a 30-minute
-// timeout and a TLS 1.2 floor. Large stemcells on slow Director blobstores
-// can saturate the default 5-second timeout.
-func newBlobstoreSource() *blobstoreSource {
+// newBlobstoreSource returns a Source whose http.Client uses a 30-minute total
+// timeout, a TLS 1.2 floor, and the supplied TransportConfig bounding dial/TLS/
+// response-header/idle timeouts. Large stemcells on slow Director blobstores
+// can saturate the default 5-second timeout, but each individual network step
+// is still bounded by TransportConfig.
+func newBlobstoreSource(tc TransportConfig) *blobstoreSource {
 	return &blobstoreSource{
 		client: &http.Client{
-			Timeout:   30 * time.Minute,
-			Transport: &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12}},
+			Timeout: 30 * time.Minute,
+			Transport: tc.applyTransport(&http.Transport{
+				TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12},
+			}),
 		},
 	}
 }

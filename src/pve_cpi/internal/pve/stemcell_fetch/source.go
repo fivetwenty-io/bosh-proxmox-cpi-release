@@ -1,16 +1,3 @@
-// Package stemcellfetch implements CPI-assisted-fetch for light stemcells.
-//
-// Operators reference a remote qcow2 via cloud_properties.image_url. The
-// fetch package resolves the URL to a Source implementation, streams the
-// image through SHA-256 hashing into the PVE Upload API, and returns a
-// canonical filename + sha8 for the resulting light CID.
-//
-// Sources are pluggable behind a single Source interface. Each scheme
-// (https, s3, bosh+blobstore, oci) has one file implementing Source.
-//
-// Package name: Go convention disallows underscores in package identifiers,
-// so the package is named "stemcellfetch" while the directory is named
-// "stemcell_fetch". See implementation notes in the workspace for rationale.
 package stemcellfetch
 
 import (
@@ -54,12 +41,21 @@ type Source interface {
 
 // ResolveSource inspects rawURL's scheme and returns the matching Source
 // along with a populated Reference. https://, s3://, bosh+blobstore:, and
-// oci:// are all wired.
+// oci:// are all wired. Sources are constructed with DefaultTransportConfig.
 //
 // Error conditions:
 //   - empty rawURL → error
 //   - unknown/unsupported scheme → error with list of supported schemes
 func ResolveSource(rawURL string) (Source, Reference, error) {
+	return ResolveSourceWith(rawURL, DefaultTransportConfig())
+}
+
+// ResolveSourceWith behaves like ResolveSource but constructs sources whose
+// HTTP clients honor the caller-supplied TransportConfig (applies only to the
+// https and bosh+blobstore sources; s3 and oci use their own SDK clients).
+// Used by production callers that thread operator-tunable timeouts from the
+// CPI config.
+func ResolveSourceWith(rawURL string, tc TransportConfig) (Source, Reference, error) {
 	if rawURL == "" {
 		return nil, Reference{}, fmt.Errorf("stemcell_fetch: image_url is empty")
 	}
@@ -69,7 +65,7 @@ func ResolveSource(rawURL string) (Source, Reference, error) {
 	switch {
 	case strings.HasPrefix(rawURL, "https://"):
 		ref.Scheme = schemeHTTPS
-		return newHTTPSSource(), ref, nil
+		return newHTTPSSource(tc), ref, nil
 
 	case strings.HasPrefix(rawURL, "s3://"):
 		ref.Scheme = "s3"
@@ -88,7 +84,7 @@ func ResolveSource(rawURL string) (Source, Reference, error) {
 		if ref.BlobID == "" {
 			return nil, ref, fmt.Errorf("stemcell_fetch: bosh+blobstore URL has empty blob id (got %q)", rawURL)
 		}
-		return newBlobstoreSource(), ref, nil
+		return newBlobstoreSource(tc), ref, nil
 
 	case strings.HasPrefix(rawURL, "oci://"):
 		ref.Scheme = schemeOCI

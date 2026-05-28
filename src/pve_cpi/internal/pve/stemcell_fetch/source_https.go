@@ -22,16 +22,19 @@ type httpsSource struct {
 	client *http.Client
 }
 
-// newHTTPSSource returns a Source whose http.Client uses a 30-minute timeout,
-// a TLS 1.2 floor, and a redirect policy that requires every redirect target
-// to use https:// (preventing accidental scheme downgrade and SSRF-adjacent
-// redirects to internal endpoints). Up to 10 redirects are still permitted,
-// matching Go's default cap.
-func newHTTPSSource() *httpsSource {
+// newHTTPSSource returns a Source whose http.Client uses a 30-minute total
+// timeout, a TLS 1.2 floor, the supplied TransportConfig bounding dial/TLS/
+// response-header/idle timeouts, and a redirect policy that requires every
+// redirect target to use https:// (preventing accidental scheme downgrade and
+// SSRF-adjacent redirects to internal endpoints). Up to 10 redirects are still
+// permitted, matching Go's default cap.
+func newHTTPSSource(tc TransportConfig) *httpsSource {
 	return &httpsSource{
 		client: &http.Client{
-			Timeout:       30 * time.Minute,
-			Transport:     &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12}},
+			Timeout: 30 * time.Minute,
+			Transport: tc.applyTransport(&http.Transport{
+				TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12},
+			}),
 			CheckRedirect: httpsOnlyRedirect,
 		},
 	}

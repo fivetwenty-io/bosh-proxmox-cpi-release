@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/cpi"
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
@@ -680,13 +681,21 @@ func handleLightStemcellPreUploaded(
 
 // resolveFetchSource returns the source and reference for rawURL. When
 // deps.FetchResolver is non-nil (tests), it replaces the default
-// stemcellfetch.ResolveSource package function.
+// stemcellfetch.ResolveSource package function. The production path uses
+// stemcellfetch.ResolveSourceWith so operator-tunable transport timeouts
+// (jobs/pve_cpi/spec stemcell_fetch_*_timeout_sec) reach the https and
+// bosh+blobstore sources.
 func resolveFetchSource(deps Deps, rawURL string) (stemcellfetch.Source, stemcellfetch.Reference, error) {
-	resolver := stemcellfetch.ResolveSource
 	if deps.FetchResolver != nil {
-		resolver = deps.FetchResolver
+		return deps.FetchResolver(rawURL)
 	}
-	return resolver(rawURL)
+	tc := stemcellfetch.TransportConfig{
+		DialTimeout:           time.Duration(deps.Config.StemcellFetchDialTimeoutSec) * time.Second,
+		TLSHandshakeTimeout:   time.Duration(deps.Config.StemcellFetchTLSHandshakeTimeoutSec) * time.Second,
+		ResponseHeaderTimeout: time.Duration(deps.Config.StemcellFetchResponseHeaderTimeoutSec) * time.Second,
+		IdleConnTimeout:       time.Duration(deps.Config.StemcellFetchIdleConnTimeoutSec) * time.Second,
+	}
+	return stemcellfetch.ResolveSourceWith(rawURL, tc)
 }
 
 // handleLightStemcellFetch fetches a remote stemcell qcow2, uploads it to PVE

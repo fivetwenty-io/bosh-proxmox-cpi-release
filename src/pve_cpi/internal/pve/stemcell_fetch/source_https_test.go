@@ -305,7 +305,7 @@ func TestHTTPSSource_Fetch_ContentLength(t *testing.T) {
 func TestHTTPSSource_Fetch_EmptyURL(t *testing.T) {
 	t.Parallel()
 
-	src := newHTTPSSource()
+	src := newHTTPSSource(DefaultTransportConfig())
 	ctx := context.Background()
 	ref := Reference{URL: "", Scheme: "https"}
 
@@ -323,7 +323,7 @@ func TestHTTPSSource_Fetch_EmptyURL(t *testing.T) {
 func TestHTTPSSource_Fetch_NonHTTPS(t *testing.T) {
 	t.Parallel()
 
-	src := newHTTPSSource()
+	src := newHTTPSSource(DefaultTransportConfig())
 	ctx := context.Background()
 	ref := Reference{URL: "http://example.com/stemcell.qcow2", Scheme: "https"}
 
