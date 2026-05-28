@@ -20,7 +20,7 @@ LDFLAGS := -X '$(PKG).Version=$(VERSION)' \
            -X '$(PKG).Commit=$(COMMIT)' \
            -X '$(PKG).BuildDate=$(DATE)'
 
-COVERAGE_THRESHOLD := 75
+COVERAGE_THRESHOLD := 80
 
 # BOSH release packaging
 RELEASE_NAME := bosh-pve-cpi
