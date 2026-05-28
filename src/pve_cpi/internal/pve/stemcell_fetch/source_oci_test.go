@@ -216,6 +216,18 @@ func TestResolveOCIAuthn_anonymous(t *testing.T) {
 	if auth == nil {
 		t.Fatal("expected non-nil authenticator")
 	}
+	// Anonymous authenticator must produce empty (no-credential) config.
+	cfg, authErr := auth.Authorization()
+	if authErr != nil {
+		t.Fatalf("auth.Authorization(): unexpected error: %v", authErr)
+	}
+	if cfg == nil {
+		t.Fatal("auth.Authorization(): expected non-nil *AuthConfig for anonymous auth")
+	}
+	if cfg.Username != "" || cfg.Password != "" || cfg.Auth != "" {
+		t.Errorf("anonymous AuthConfig must have empty credentials; got Username=%q Password=%q Auth=%q",
+			cfg.Username, cfg.Password, cfg.Auth)
+	}
 
 	// empty ociCredentials → Anonymous
 	auth2, err := resolveOCIAuthn(ociCredentials{})
@@ -224,6 +236,17 @@ func TestResolveOCIAuthn_anonymous(t *testing.T) {
 	}
 	if auth2 == nil {
 		t.Fatal("expected non-nil authenticator")
+	}
+	cfg2, authErr2 := auth2.Authorization()
+	if authErr2 != nil {
+		t.Fatalf("auth2.Authorization(): unexpected error: %v", authErr2)
+	}
+	if cfg2 == nil {
+		t.Fatal("auth2.Authorization(): expected non-nil *AuthConfig")
+	}
+	if cfg2.Username != "" || cfg2.Password != "" || cfg2.Auth != "" {
+		t.Errorf("anonymous ociCredentials AuthConfig must have empty credentials; got Username=%q Password=%q Auth=%q",
+			cfg2.Username, cfg2.Password, cfg2.Auth)
 	}
 }
 
@@ -503,9 +526,9 @@ func TestOCISource_Fetch_NoLayers(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for image with no layers, got nil")
 	}
-	// Error may come from empty layers check or from image parsing — either is valid.
-	// Just verify it's non-nil.
-	_ = err
+	if !strings.Contains(err.Error(), "has no layers") {
+		t.Errorf("error %q does not contain expected substring %q", err.Error(), "has no layers")
+	}
 }
 
 // TestOCISource_Fetch_BadRef verifies that a malformed reference string
