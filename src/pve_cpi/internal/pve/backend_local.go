@@ -33,6 +33,7 @@ func newLocalBackend(c Client, info StorageInfo, defaultNode string) Backend {
 	return &localBackend{client: c, info: info, defaultNode: defaultNode}
 }
 
+// Kind reports BackendLocal — node-pinned storage where the volume's host node determines VM placement.
 func (l *localBackend) Kind() BackendKind { return BackendLocal }
 
 // NodeForCreate picks the node for a new local-storage volume. Order:

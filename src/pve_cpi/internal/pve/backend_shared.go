@@ -20,6 +20,7 @@ func newSharedBackend(c Client, info StorageInfo, defaultNode string) Backend {
 	return &sharedBackend{client: c, info: info, defaultNode: defaultNode}
 }
 
+// Kind reports BackendShared — a cluster-visible storage pool where any node may host the VM.
 func (s *sharedBackend) Kind() BackendKind { return BackendShared }
 
 // NodeForCreate picks the node for a new volume on a shared storage. Order:

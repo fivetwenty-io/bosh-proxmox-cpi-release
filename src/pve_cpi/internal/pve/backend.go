@@ -132,6 +132,7 @@ func (s *staticResolver) Resolve(_ context.Context, _ string) (Backend, error) {
 // Used in tests and as the safe default when no Resolver is wired.
 type staticBackend struct{ defaultNode string }
 
+// Kind reports BackendShared because the static fallback is treated as cluster-visible (no node pinning is enforced).
 func (s *staticBackend) Kind() BackendKind { return BackendShared }
 
 func (s *staticBackend) NodeForCreate(_ context.Context, _ string, cloudPropNode string) (string, error) {
