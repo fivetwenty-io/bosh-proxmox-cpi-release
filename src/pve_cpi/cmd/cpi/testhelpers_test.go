@@ -117,3 +117,18 @@ func isTransientBuildErr(err error) bool {
 func makeExecCmd(ctx context.Context, bin string, args ...string) *exec.Cmd {
 	return exec.CommandContext(ctx, bin, args...)
 }
+
+// TestMain removes the buildOnce binary's parent temp directory after the test
+// process exits. The binary is built into os.MkdirTemp("", "bosh-pve-cpi-bin-*")
+// and reused across every test in this package (see buildOnce); t.TempDir is
+// not usable because its lifetime is bound to a single *testing.T.
+func TestMain(m *testing.M) {
+	code := m.Run()
+	buildState.mu.Lock()
+	bin := buildState.bin
+	buildState.mu.Unlock()
+	if bin != "" {
+		_ = os.RemoveAll(filepath.Dir(bin))
+	}
+	os.Exit(code)
+}
