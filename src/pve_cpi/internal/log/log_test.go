@@ -10,6 +10,16 @@ import (
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
 )
 
+// mustLogger creates a logger at the given level writing to buf. Fatal on error.
+func mustLogger(t *testing.T, level string, buf *bytes.Buffer) *log.Logger {
+	t.Helper()
+	l, err := log.NewLogger(level, buf)
+	if err != nil {
+		t.Fatalf("NewLogger(%q): %v", level, err)
+	}
+	return l
+}
+
 // TestNewLogger_Levels verifies each valid level constructs without error.
 func TestNewLogger_Levels(t *testing.T) {
 	t.Parallel()
@@ -154,7 +164,7 @@ func TestWithContext_BothValues(t *testing.T) {
 	ctx = log.WithMethod(ctx, "delete_vm")
 
 	var buf bytes.Buffer
-	l, _ := log.NewLogger("debug", &buf)
+	l := mustLogger(t, "debug", &buf)
 	l.WithContext(ctx).Info("both fields")
 
 	out := buf.String()
@@ -169,7 +179,7 @@ func TestWithContext_EmptyCtx(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	var buf bytes.Buffer
-	l, _ := log.NewLogger("info", &buf)
+	l := mustLogger(t, "info", &buf)
 	l2 := l.WithContext(ctx)
 	if l2 == nil {
 		t.Fatal("WithContext returned nil")
@@ -204,7 +214,7 @@ func TestFromContext_NoLogger(t *testing.T) {
 func TestFromContext_Roundtrip(t *testing.T) {
 	t.Parallel()
 	var buf bytes.Buffer
-	l, _ := log.NewLogger("info", &buf)
+	l := mustLogger(t, "info", &buf)
 
 	ctx := log.IntoContext(context.Background(), l)
 	l2 := log.FromContext(ctx)
@@ -222,7 +232,7 @@ func TestFromContext_Roundtrip(t *testing.T) {
 func TestWithFields(t *testing.T) {
 	t.Parallel()
 	var buf bytes.Buffer
-	l, _ := log.NewLogger("debug", &buf)
+	l := mustLogger(t, "debug", &buf)
 	l2 := l.WithFields(log.String("component", "pve"), log.Int("vmid", 100))
 	l2.Info("with fields")
 
@@ -236,7 +246,7 @@ func TestWithFields(t *testing.T) {
 func TestWithFields_Empty(t *testing.T) {
 	t.Parallel()
 	var buf bytes.Buffer
-	l, _ := log.NewLogger("info", &buf)
+	l := mustLogger(t, "info", &buf)
 	l2 := l.WithFields()
 	if l2 == nil {
 		t.Fatal("WithFields() returned nil")
@@ -268,7 +278,7 @@ func TestNopLogger_NoOutput(t *testing.T) {
 func TestLogger_AllLevelMethods(t *testing.T) {
 	t.Parallel()
 	var buf bytes.Buffer
-	l, _ := log.NewLogger("debug", &buf)
+	l := mustLogger(t, "debug", &buf)
 	l.Debug("debug msg", log.String("k", "v"))
 	l.Info("info msg", log.Int("n", 1))
 	l.Warn("warn msg")

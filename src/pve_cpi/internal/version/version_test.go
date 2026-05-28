@@ -28,6 +28,7 @@ func TestShortDefault(t *testing.T) {
 	}
 }
 
+// no t.Parallel: mutates package-level Version/Commit/BuildDate
 func TestStringWithOverride(t *testing.T) {
 	origVersion := Version
 	origCommit := Commit
