@@ -48,6 +48,7 @@ func (m *mockClient) Tasks() sdktasks.Service                   { return m.tasks
 func (m *mockClient) Nodes() sdknodes.Service                   { return m.nodesSvc }
 func (m *mockClient) Cluster() sdkcluster.Service               { return m.clusterSvc }
 func (m *mockClient) ClusterStorage() sdkclusterstorage.Service { return nil }
+func (m *mockClient) Pools() pve.PoolService                    { return nil }
 
 func newMockClient(tasksSvc sdktasks.Service) *mockClient {
 	return &mockClient{tasksSvc: tasksSvc}

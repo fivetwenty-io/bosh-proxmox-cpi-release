@@ -3,12 +3,15 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"strconv"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/cpi"
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
+	sdknodes "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/nodes"
 )
 
 // HandleDeleteStemcell returns a Handler for the BOSH CPI delete_stemcell method.
@@ -16,27 +19,31 @@ import (
 // Arguments (positional JSON array):
 //
 //	[0] stemcell_cid string — the CID returned by create_stemcell.
-//	    Format: "<storage>:import/<filename>" (e.g. "local:import/bosh-stemcell-ubuntu-jammy-1.0-abc12345.qcow2").
-//	    Legacy integer-only CIDs (e.g. "5042") are rejected.
+//	    Supported formats:
+//	      - "template:<vmid>"                        (new template CID, e.g. "template:6042")
+//	      - "<storage>:import/<filename>"            (volume CID, e.g. "local:import/bosh-stemcell-ubuntu-jammy-1.0-abc12345.qcow2")
+//	      - "light:<storage>:import/<filename>"      (pre-upgrade light CID, no-op)
+//	      - "<integer>"                              (pre-upgrade legacy integer CID, no-op)
 //
 // Returns: null / void on success.
 //
-// Flow:
+// CID routing (evaluated in order):
 //
-//  1. Parse args[0] as stemcell_cid string.
-//  2. Call pve.ParseStemcellCID to extract storage and volumePath ("import/<filename>").
-//  3. Delete the qcow2 volume via Storage().DeleteVolumeIfExists — log warning if absent.
-//     Volume notes attached to the qcow2 are removed transitively with the volume.
-//  4. Return nil (success).
+//  1. "template:<vmid>" → destroy the template VM with purge (removes all disks).
+//     Idempotent: VM already absent is treated as success.
+//  2. "light:..." → no-op (operator-managed volume; CPI never deletes it).
+//  3. Integer-only (e.g. "5042") → no-op (pre-upgrade legacy CID scrub).
+//  4. "<storage>:import/<filename>" → delete the qcow2 volume via Storage().DeleteVolumeIfExists.
 //
-// Idempotency: absent volumes are treated as success (warning logged, not an error).
+// Idempotency: absent resources (VM or volume) are treated as success (warning logged).
 // The BOSH Director expects delete_stemcell to be idempotent.
 //
 // Error cases returned as *cpierrors.Error (TypeCloud, not retriable):
 //   - Missing or non-string stemcell_cid.
-//   - stemcell_cid fails pve.ParseStemcellCID (bad format or legacy integer CID).
-//   - config.Node is empty.
-//   - PVE Storage API failure other than not-found.
+//   - template CID with invalid VMID.
+//   - stemcell_cid fails pve.ParseStemcellCID (bad format).
+//   - config.Node is empty (for volume and template paths).
+//   - PVE API failure other than not-found.
 func HandleDeleteStemcell(deps Deps) cpi.Handler {
 	return cpi.HandlerFunc(func(ctx context.Context, args []json.RawMessage, _ jsonrpc.Context) (any, error) {
 		// ----------------------------------------------------------------
@@ -48,6 +55,33 @@ func HandleDeleteStemcell(deps Deps) cpi.Handler {
 		var cidStr string
 		if err := json.Unmarshal(args[0], &cidStr); err != nil || cidStr == "" {
 			return nil, cpierrors.Cloud("delete_stemcell: stemcell_cid must be a non-empty string")
+		}
+
+		// ----------------------------------------------------------------
+		// Template stemcell CIDs ("template:<vmid>") identify a PVE template
+		// VM created by create_stemcell. Destroy it with purge=true so all
+		// disks are removed. Idempotent: if the VM is already gone, return
+		// success without error.
+		//
+		// Node resolution: StemcellTemplateNode if set (matches create_stemcell
+		// placement), otherwise config.Node. This mirrors the convention used
+		// by create_stemcell for ensureTemplateVM.
+		// ----------------------------------------------------------------
+		if pve.IsTemplateStemcellCID(cidStr) {
+			vmid, parseErr := pve.ParseTemplateStemcellCID(cidStr)
+			if parseErr != nil {
+				return nil, cpierrors.Cloud("delete_stemcell: invalid template stemcell CID %q: %s", cidStr, parseErr.Error())
+			}
+
+			node := deps.Config.StemcellTemplateNode
+			if node == "" {
+				node = deps.Config.Node
+			}
+			if node == "" {
+				return nil, cpierrors.Cloud("delete_stemcell: config.node must not be empty")
+			}
+
+			return nil, destroyTemplateVM(ctx, deps, node, vmid, cidStr)
 		}
 
 		// ----------------------------------------------------------------
@@ -127,4 +161,74 @@ func HandleDeleteStemcell(deps Deps) cpi.Handler {
 		)
 		return nil, nil
 	})
+}
+
+// destroyTemplateVM deletes the template VM identified by vmid on node with
+// purge=true (removes disks + unreferenced storage objects). Idempotent: a 404
+// response from PVE means the VM is already gone; that is treated as success
+// and a warning is logged. The UPID returned by DeleteQemu is awaited; a
+// not-found or pmxcfs-config-missing error during the await is also treated as
+// success. Any other error is returned as a cloud error.
+func destroyTemplateVM(ctx context.Context, deps Deps, node string, vmid int64, cidStr string) error {
+	vmCIDStr := strconv.FormatInt(vmid, 10)
+	logger := deps.Logger.With(
+		log.String("method", "delete_stemcell"),
+		log.String("stemcell_cid", cidStr),
+		log.String("node", node),
+		log.Int("vmid", int(vmid)),
+	)
+	logger.Info("delete_stemcell: destroying template VM")
+
+	purge := true
+	destroyDisks := true
+	var deleteResp *sdknodes.DeleteQemuResponse
+	deleteErr := pve.RetryOnTransientOrLock(ctx, logger, "delete_stemcell.destroy_template", 0, func() error {
+		var innerErr error
+		deleteResp, innerErr = deps.PVE.Nodes().DeleteQemu(ctx, node, vmCIDStr, &sdknodes.DeleteQemuParams{
+			Purge:                    &purge,
+			DestroyUnreferencedDisks: &destroyDisks,
+		})
+		return innerErr
+	})
+	if deleteErr != nil {
+		if pve.IsNotFound(deleteErr) {
+			logger.Warn("delete_stemcell: template VM not found during destroy — already deleted, returning success",
+				log.String("stemcell_cid", cidStr),
+			)
+			return nil
+		}
+		return cpierrors.Wrap(pve.WrapError(deleteErr),
+			fmt.Sprintf("delete_stemcell: destroy template VM %d node %q", vmid, node))
+	}
+
+	// Await the destroy task. An empty or null UPID means PVE completed
+	// synchronously. Not-found or pmxcfs-config-missing during await means
+	// the VM was already gone — treat as success.
+	if deleteResp == nil {
+		logger.Info("delete_stemcell: template VM destroyed (synchronous, no UPID)")
+		return nil
+	}
+	deleteUPID, upidErr := pve.UPIDFromRaw(*deleteResp)
+	if upidErr != nil {
+		// Malformed UPID is unexpected but the delete already succeeded.
+		logger.Warn("delete_stemcell: cannot parse UPID from template destroy response — skipping await",
+			log.Err(upidErr),
+		)
+		return nil
+	}
+	if deleteUPID == "" {
+		logger.Info("delete_stemcell: template VM destroyed (no UPID returned)")
+		return nil
+	}
+	if awaitErr := pve.AwaitTaskWithLogger(ctx, deps.PVE, node, deleteUPID, logger); awaitErr != nil {
+		if pve.IsNotFound(awaitErr) || pve.IsPmxcfsConfigMissing(awaitErr) {
+			logger.Info("delete_stemcell: template VM config missing during destroy await — treating as already deleted")
+			return nil
+		}
+		return cpierrors.Wrap(pve.WrapError(awaitErr),
+			fmt.Sprintf("delete_stemcell: await destroy task for template VM %d node %q", vmid, node))
+	}
+
+	logger.Info("delete_stemcell: template VM destroyed successfully")
+	return nil
 }

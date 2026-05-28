@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/nodes"
@@ -172,6 +173,56 @@ func ParseLightStemcellCID(cid string) (storage string, volumePath string, err e
 		return "", "", fmt.Errorf("ParseLightStemcellCID: CID %q missing \"light:\" prefix", cid)
 	}
 	return ParseStemcellCID(StripLightPrefix(cid))
+}
+
+// BuildTemplateStemcellCID encodes a template VMID as "template:<vmid>".
+//
+// Format: "template:<vmid>" (e.g. "template:6042").
+// vmid must be a positive integer; callers are responsible for supplying a
+// valid PVE VMID from the configured template range.
+func BuildTemplateStemcellCID(vmid int64) string {
+	return fmt.Sprintf("template:%d", vmid)
+}
+
+// IsTemplateStemcellCID reports whether cid starts with "template:" and has at
+// least one character after the prefix that forms a valid positive integer.
+//
+// Returns false for:
+//   - bare "template:" (empty remainder)
+//   - "template:abc" (non-digit remainder)
+//   - "template:-1" (leading minus — not all-digits)
+//   - "template:6.5" (decimal point — not all-digits)
+//   - "template:template:6042" (nested prefix — "template:6042" is not all-digits)
+func IsTemplateStemcellCID(cid string) bool {
+	const prefix = "template:"
+	if !strings.HasPrefix(cid, prefix) {
+		return false
+	}
+	remainder := cid[len(prefix):]
+	return isAllDigits(remainder)
+}
+
+// ParseTemplateStemcellCID extracts the VMID from a "template:<vmid>" CID.
+//
+// Returns an error when:
+//   - cid does not satisfy IsTemplateStemcellCID (missing prefix, empty remainder,
+//     non-digit characters, negative sign, decimal point, or nested prefix)
+//   - the VMID string overflows int64
+//   - the parsed VMID is zero or negative (template VMIDs must be positive)
+func ParseTemplateStemcellCID(cid string) (int64, error) {
+	if !IsTemplateStemcellCID(cid) {
+		return 0, fmt.Errorf("ParseTemplateStemcellCID: CID %q is not a valid template CID (expected \"template:<positive-integer>\")", cid)
+	}
+	const prefix = "template:"
+	remainder := cid[len(prefix):]
+	vmid, err := strconv.ParseInt(remainder, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("ParseTemplateStemcellCID: CID %q VMID %q: %w", cid, remainder, err)
+	}
+	if vmid <= 0 {
+		return 0, fmt.Errorf("ParseTemplateStemcellCID: CID %q VMID %d must be a positive integer", cid, vmid)
+	}
+	return vmid, nil
 }
 
 // isAllDigits reports whether s consists entirely of ASCII decimal digits.

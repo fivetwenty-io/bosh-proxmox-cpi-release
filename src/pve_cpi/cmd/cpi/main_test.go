@@ -37,6 +37,7 @@ func (nilPVEClient) Tasks() tasks.Service                   { return nil }
 func (nilPVEClient) Nodes() nodes.Service                   { return nil }
 func (nilPVEClient) Cluster() cluster.Service               { return nil }
 func (nilPVEClient) ClusterStorage() clusterstorage.Service { return nil }
+func (nilPVEClient) Pools() pve.PoolService                 { return nil }
 
 // compile-time check.
 var _ pve.Client = nilPVEClient{}

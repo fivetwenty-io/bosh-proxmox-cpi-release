@@ -889,6 +889,53 @@ func TestNextVMIDInRange_SpreadCheck(t *testing.T) {
 	}
 }
 
+// TestVMIDRangeTemplate_NoOverlapAndOrdered asserts that the template range
+// [VMIDRangeTemplateStart, VMIDRangeTemplateEnd] does not overlap the VM range
+// [VMIDRangeVMStart, VMIDRangeVMEnd] or the disk range
+// [VMIDRangeDiskStart, VMIDRangeDiskEnd], and that Start < End for each range.
+func TestVMIDRangeTemplate_NoOverlapAndOrdered(t *testing.T) {
+	t.Parallel()
+
+	// Each range must be internally ordered.
+	if pve.VMIDRangeTemplateStart >= pve.VMIDRangeTemplateEnd {
+		t.Errorf("template range not ordered: Start=%d >= End=%d",
+			pve.VMIDRangeTemplateStart, pve.VMIDRangeTemplateEnd)
+	}
+	if pve.VMIDRangeVMStart >= pve.VMIDRangeVMEnd {
+		t.Errorf("VM range not ordered: Start=%d >= End=%d",
+			pve.VMIDRangeVMStart, pve.VMIDRangeVMEnd)
+	}
+	if pve.VMIDRangeDiskStart >= pve.VMIDRangeDiskEnd {
+		t.Errorf("disk range not ordered: Start=%d >= End=%d",
+			pve.VMIDRangeDiskStart, pve.VMIDRangeDiskEnd)
+	}
+
+	// Template vs VM: no overlap ↔ template starts after VM ends, or template ends before VM starts.
+	vmVsTemplate := pve.VMIDRangeTemplateStart > pve.VMIDRangeVMEnd || pve.VMIDRangeTemplateEnd < pve.VMIDRangeVMStart
+	if !vmVsTemplate {
+		t.Errorf("template range [%d,%d] overlaps VM range [%d,%d]",
+			pve.VMIDRangeTemplateStart, pve.VMIDRangeTemplateEnd,
+			pve.VMIDRangeVMStart, pve.VMIDRangeVMEnd)
+	}
+
+	// Template vs disk: no overlap.
+	templateVsDisk := pve.VMIDRangeTemplateStart > pve.VMIDRangeDiskEnd || pve.VMIDRangeTemplateEnd < pve.VMIDRangeDiskStart
+	if !templateVsDisk {
+		t.Errorf("template range [%d,%d] overlaps disk range [%d,%d]",
+			pve.VMIDRangeTemplateStart, pve.VMIDRangeTemplateEnd,
+			pve.VMIDRangeDiskStart, pve.VMIDRangeDiskEnd)
+	}
+
+	// Spot-check expected values so a future refactor that changes the constants
+	// is forced to update this test deliberately.
+	if pve.VMIDRangeTemplateStart != 6000 {
+		t.Errorf("VMIDRangeTemplateStart: expected 6000, got %d", pve.VMIDRangeTemplateStart)
+	}
+	if pve.VMIDRangeTemplateEnd != 8999 {
+		t.Errorf("VMIDRangeTemplateEnd: expected 8999, got %d", pve.VMIDRangeTemplateEnd)
+	}
+}
+
 // TestNextVMID_LockNotHeldDuringAPICall demonstrates that globalVMIDMu is NOT
 // held while the PVE API call executes. A channel-blocking fake client stalls
 // the API call. A second goroutine calls NextVMID concurrently and must

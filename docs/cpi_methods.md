@@ -59,11 +59,13 @@ The CPI advertises `openstack-qcow2` and `openstack-raw` because OpenStack qcow2
 bosh-stemcell-<name>-<version>-<sha8>.qcow2
 ```
 
-If a volume with the same filename already exists on the storage pool, the upload is skipped and the existing CID is returned.
+After upload, the CPI creates a frozen PVE template VM from the qcow2 in the template VMID range and tags it with `bosh-stemcell-sha-<sha8>`. For CPI-owned images (heavy and light-fetch), the intermediate upload volume is deleted after the template is frozen. For operator-preuploaded light stemcell images, the upload volume is kept.
 
-The returned `stemcell_cid` is the PVE volume identifier: `<storage>:import/<filename>` (e.g. `nfs-pool:import/bosh-stemcell-ubuntu-jammy-1.438-a1b2c3d4.qcow2`).
+Template creation is idempotent: if a template VM named `bosh-stemcell-<name>-<version>` already exists, its VMID is reused.
 
-`cloud_properties` must include `name` and `version`; both are required to build the deterministic filename. `stemcell_storage` must be a shared storage pool accessible from all cluster nodes.
+The returned `stemcell_cid` is `template:<vmid>` (e.g. `template:6042`), identifying the frozen template VM.
+
+`cloud_properties` must include `name` and `version`; both are required to build the deterministic template name. `stemcell_storage` must be a shared storage pool accessible from all cluster nodes.
 
 ---
 
@@ -79,9 +81,14 @@ The returned `stemcell_cid` is the PVE volume identifier: `<storage>:import/<fil
 
 **Errors:** `Bosh::Clouds::CloudError` on PVE API failure
 
-**Notes:** Parses the stemcell CID as `<storage>:import/<filename>` and deletes the qcow2 volume. If the volume is absent the call still succeeds (idempotent). Legacy integer-only CIDs (from template-based deployments) are rejected with an error.
+**Notes:** Routes on the stemcell CID format:
 
-Because PVE copies qcow2 data into each VM's root disk at create time (block-copy semantics), running VMs have no dependency on the stemcell volume after creation. The stemcell can be deleted at any time without affecting running VMs.
+- `template:<vmid>` — destroys the template VM with `purge=true` (removes all associated disks). Idempotent: an absent VM is treated as success.
+- `<storage>:import/<filename>` — deletes the qcow2 upload volume. Absent volumes are treated as success.
+- `light:...` — no-op (operator-managed image; the CPI never deletes it).
+- Integer-only CIDs — no-op (pre-upgrade legacy scrub).
+
+Running VMs have no dependency on the template after cloning. The template can be deleted at any time without affecting running VMs.
 
 ---
 
@@ -94,7 +101,7 @@ Because PVE copies qcow2 data into each VM's root disk at create time (block-cop
 **Args:**
 
 - `args[0]` (String): `agent_id` — ID the Director has selected for the BOSH agent
-- `args[1]` (String): `stemcell_cid` — CID of the stemcell to import (`<storage>:import/<filename>` format)
+- `args[1]` (String): `stemcell_cid` — CID of the stemcell to clone. `template:<vmid>` for stemcells uploaded by this CPI version; `<storage>:import/<filename>` or `light:...` for pre-upgrade stemcells (the CPI opportunistically upgrades to the clone path)
 - `args[2]` (Hash): `cloud_properties` — resource pool properties from the manifest (e.g., `cpu`, `memory`, `ephemeral_disk_size`)
 - `args[3]` (Hash): `networks` — NetworkSpec map; each key is a network name, each value has `type`, `ip`, `netmask`, `gateway`, `dns`, and `cloud_properties`
 - `args[4]` (Array of String): `disk_cids` — persistent disks likely to be attached (for placement optimization)
@@ -107,11 +114,12 @@ Because PVE copies qcow2 data into each VM's root disk at create time (block-cop
 - `Bosh::Clouds::VMCreationFailed` if VM creation fails (CPI must clean up partial resources)
 - `Bosh::Clouds::CloudError` on PVE API failure
 
-**Notes:** Creates a new VM with the stemcell disk imported in a single PVE `POST /nodes/<node>/qemu` call. The stemcell CID is passed directly as the `import-from=` value on `scsi0`. No clone step occurs.
+**Notes:** Creates a new VM by cloning a stemcell template. The `stemcell_cid` drives dispatch:
 
-The `stemcell_cid` must be in `<storage>:import/<filename>` format. Integer CIDs from previous template-based deployments are rejected.
+- **`template:<vmid>`** — clones the identified template VM directly. On linked-clone–capable storage backends (`dir`, `nfs`, `cifs`, `zfspool`, `lvmthin`, `rbd`, `cephfs`) this is a copy-on-write clone that completes in seconds. On `lvm`-thick storage a full clone is performed. Clone type is controlled by `pve.clone_mode` (default `auto`).
+- **Pre-upgrade CID** (`<storage>:import/<file>` or `light:...`) — the CPI extracts the sha8 from the filename and searches for a matching template by PVE tag. If a template is found, it clones it (fast path). If not, it falls back to the original `import-from=` block-copy (slow path, roughly four minutes for a typical stemcell). No re-upload is required for pre-upgrade stemcells.
 
-A VMID is allocated from the range `[vmid_range_start, 5999]` (default: `[100, 5999]`). After the import task completes, the CPI configures NICs, attaches any pre-existing persistent disks, writes agent settings, and starts the VM. The returned `networks_with_mac` hash augments the input networks map with MAC addresses assigned by PVE.
+A VMID is allocated from the range `[vmid_range_start, vmid_range_end]` (default: `[100, 5999]`). After the clone task completes, the CPI configures NICs, attaches any pre-existing persistent disks, writes agent settings, and starts the VM. The returned `networks_with_mac` hash augments the input networks map with MAC addresses assigned by PVE.
 
 `cloud_properties.tags` (map of `key: value`) is applied to the PVE tags field on the new VM as sanitized `<key>--<value>` entries. The BOSH-managed `director--`, `deployment--`, and `job--` triple is not known at create time and is added later by `set_vm_metadata`. See [Custom Tags](configuration.md#custom-tags).
 

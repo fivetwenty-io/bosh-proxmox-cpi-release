@@ -90,11 +90,11 @@ Every PVE API call that returns a UPID is awaited via `internal/pve.AwaitTask` b
 
 ## Stemcell Model
 
-Stemcells are stored as raw qcow2 files on a shared PVE storage pool. No template VMs are created.
+Each stemcell is backed by a single frozen PVE template VM. `create_vm` clones that template instead of running a qcow2 block-copy per VM. On linked-clone–capable storage backends this reduces VM creation from roughly four minutes to seconds.
 
 ### create_stemcell
 
-The handler uploads the disk image (or extracts it from a gzip+tar tarball first) to the configured `stemcell_storage` pool under content type `import`. The storage volume is addressed as `<storage>:import/<filename>`.
+The handler uploads the disk image (or extracts it from a gzip+tar tarball first) to the configured `stemcell_storage` pool under content type `import`. The upload volume is addressed as `<storage>:import/<filename>`.
 
 Filename format:
 
@@ -102,32 +102,42 @@ Filename format:
 bosh-stemcell-<sanitized-name>-<sanitized-version>-<sha8>.qcow2
 ```
 
-where `sha8` is the first 8 hex characters of the SHA-256 hash of the disk image. This makes the filename a content-addressed key, enabling deduplication: if a volume with the same filename already exists, `create_stemcell` returns the existing CID without re-uploading.
+where `sha8` is the first 8 hex characters of the SHA-256 hash of the disk image.
 
-The returned **stemcell CID** is the full PVE volume identifier:
+After the upload, the handler creates a new QEMU VM in the template VMID range (`[stemcell_template_vmid_range_start, stemcell_template_vmid_range_end]`, default `[6000, 8999]`), imports the qcow2 into it, and freezes it with `MakeTemplate`. The VM is named `bosh-stemcell-<name>-<version>` and tagged with `bosh-stemcell-sha-<sha8>` for later lookup. For CPI-owned images (heavy tarball uploads and light-fetch images), the intermediate upload volume is deleted after the template is frozen; for operator-preuploaded light stemcell images the upload volume is left intact.
+
+Template creation is idempotent: if a template VM with the canonical name already exists in the template VMID range, the existing VMID is reused and the upload is skipped.
+
+The returned **stemcell CID** is:
 
 ```
-<storage>:import/<filename>
+template:<vmid>
 ```
 
-For example: `nfs-stemcells:import/bosh-stemcell-ubuntu-jammy-1.438-a1b2c3d4.qcow2`
+For example: `template:6042`
+
+All three create_stemcell paths (heavy tarball, light-preuploaded, light-fetch) return a `template:` CID. The older `<storage>:import/<filename>` CID form only appears in stemcell_cid values produced before this feature was introduced.
 
 ### create_vm
 
-The handler passes the stemcell CID directly to the PVE `POST /nodes/<node>/qemu` call as the `import-from=` parameter of `scsi0`:
+The handler dispatches on the stemcell CID format:
 
-```
-scsi0: <vm_storage>:0,import-from=<stemcell_cid>,format=<vm_disk_format>,size=<N>G
-```
+- **`template:<vmid>`** — clones the template VM directly. This is the fast path.
+- **Pre-upgrade CID** (`<storage>:import/<file>` or `light:...`) — extracts the sha8 from the filename and searches for a matching template by PVE tag. If found, clones it (fast path). If not found, falls back to the original `import-from=` slow path (block-copy per VM).
 
-PVE copies the qcow2 data into the VM's root disk at create time in a single API operation. No clone step occurs. Once the import task completes, the VM has no live dependency on the stemcell volume — stemcells can be deleted at any time without affecting running VMs.
+Clone type follows `pve.clone_mode` (default `auto`): linked CoW for snapshot-capable backends, full clone for `lvm`-thick.
 
-VMID allocation uses the range `[vmid_range_start, 5999]`. Stemcells no longer occupy a reserved VMID range.
+VMID allocation for the new VM uses the range `[vmid_range_start, vmid_range_end]` (default `[100, 5999]`).
 
 ### delete_stemcell
 
-The handler parses the CID to extract the storage name and volume path, then calls `DeleteVolumeIfExists` for the qcow2. Missing volumes are logged at WARN and treated as success (idempotent).
+The handler dispatches on the CID format:
+
+- **`template:<vmid>`** — destroys the template VM with `purge=true` (removes all associated disks). Idempotent: an already-absent VM is treated as success.
+- **`<storage>:import/<filename>`** — deletes the qcow2 volume via `DeleteVolumeIfExists`. Missing volumes are logged at WARN and treated as success.
+- **`light:...`** — no-op (operator-managed image; CPI never deletes it).
+- **Integer-only** — no-op (pre-upgrade legacy CID scrub).
 
 ### Shared-storage requirement
 
-`stemcell_storage` must be a shared PVE storage pool accessible from every cluster node (NFS, CIFS, CephFS, GlusterFS, or any other pool with `shared=1` in the PVE storage config). The CPI enforces this at `create_stemcell` time: local storage is rejected with a descriptive error when the cluster has more than one node. Single-node clusters may use local storage.
+`stemcell_storage` must be a shared PVE storage pool accessible from every cluster node (NFS, CIFS, CephFS, GlusterFS, or any pool with `shared=1` in the PVE storage config). The CPI enforces this at `create_stemcell` time: local storage is rejected with a descriptive error when the cluster has more than one node. Single-node clusters may use local storage.

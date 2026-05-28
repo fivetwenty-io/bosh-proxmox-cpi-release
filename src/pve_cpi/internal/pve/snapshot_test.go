@@ -56,6 +56,7 @@ func (c *snapMockClient) Tasks() tasks.Service                   { return nil }
 func (c *snapMockClient) Nodes() nodes.Service                   { return nil }
 func (c *snapMockClient) Cluster() cluster.Service               { return nil }
 func (c *snapMockClient) ClusterStorage() clusterstorage.Service { return nil }
+func (c *snapMockClient) Pools() pve.PoolService                 { return nil }
 
 var _ pve.Client = (*snapMockClient)(nil)
 

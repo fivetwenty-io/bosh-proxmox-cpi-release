@@ -48,6 +48,105 @@ func IsBlockStorage(storageType string) bool {
 	return ok
 }
 
+// IsLinkedCloneSupported reports whether the PVE storage type supports linked
+// (copy-on-write) clones. Only thick LVM ("lvm") lacks snapshot-backed linked
+// clone support; every other backend (dir, nfs, cifs, zfspool, lvmthin, rbd,
+// cephfs, and unknown/empty types) is treated as linked-capable.
+//
+// The check is case-insensitive. An empty string or unrecognised type returns
+// true (permissive default) so that new or custom storage backends do not
+// silently fall back to slower full clones.
+//
+// Callers should prefer StorageTypeLVM and related constants rather than raw
+// string literals to avoid silent mismatches on future PVE renames.
+func IsLinkedCloneSupported(storageType string) bool {
+	return !strings.EqualFold(storageType, StorageTypeLVM)
+}
+
+// ValidateTemplateCloneStorage enforces the clone placement policy (D-06):
+// in a multi-node cluster, a template on LOCAL (non-shared) storage can only
+// be cloned on the same node, so the operator must pin the node via
+// cloud_properties.node or use shared storage. Returns the node the clone
+// must run on, or a non-nil *cpierrors.Error when the configuration is
+// incompatible.
+//
+// Unlike ValidateLightStemcellStorage, block storage backends (rbd, lvmthin,
+// zfspool, lvm) are NOT rejected here — PVE linked clones work from block
+// backends for QEMU disk cloning. The constraint is topology only.
+//
+// Rules evaluated in order:
+//
+//  1. Single-node cluster (clusterSize <= 1) — ACCEPT any backend.
+//     With only one node, local vs. shared is irrelevant. Returns
+//     cloudPropsNode as chosenNode (empty string if none provided).
+//
+//  2. Multi-node cluster + shared storage (IsShared or rbd) — ACCEPT.
+//     Any node can host the clone. Returns cloudPropsNode unchanged.
+//
+//  3. Multi-node cluster + local storage + cloudPropsNode provided — ACCEPT.
+//     Clone must run on the pinned node. Returns cloudPropsNode.
+//
+//  4. Multi-node cluster + local storage + no cloudPropsNode — REJECT.
+//     CPI cannot guarantee clone and template land on the same node without
+//     migration. Returns a human-readable actionable error.
+//
+// Inputs:
+//   - ctx: standard context; passed to deps methods unchanged.
+//   - deps: storage info and cluster-size provider; must not be nil.
+//   - storage: PVE storage name; empty string returns immediate error.
+//   - cloudPropsNode: value of cloud_properties.node from the CPI request;
+//     empty string means "no pin provided".
+//
+// Failure modes:
+//   - storage == "" → *cpierrors.Error before any deps call.
+//   - deps.StorageInfo error → wrapped *cpierrors.Error.
+//   - deps.ClusterNodeCount error → wrapped *cpierrors.Error.
+//   - multi-node local + no pin → *cpierrors.Error with actionable message.
+func ValidateTemplateCloneStorage(
+	ctx context.Context,
+	deps PolicyDeps,
+	storage string,
+	cloudPropsNode string,
+) (chosenNode string, err error) {
+	if storage == "" {
+		return "", cpierrors.Cloud("validate_template_clone_storage: storage name required")
+	}
+
+	info, err := deps.StorageInfo(ctx, storage)
+	if err != nil {
+		return "", cpierrors.Cloud(
+			"validate_template_clone_storage: lookup storage %q: %s", storage, err.Error())
+	}
+
+	clusterSize, err := deps.ClusterNodeCount(ctx)
+	if err != nil {
+		return "", cpierrors.Cloud(
+			"validate_template_clone_storage: lookup cluster node count: %s", err.Error())
+	}
+
+	// Rule 1: single-node cluster accepts any backend.
+	if clusterSize <= 1 {
+		return cloudPropsNode, nil
+	}
+
+	// Rule 2: multi-node + shared storage — any node works.
+	if info.IsShared() {
+		return cloudPropsNode, nil
+	}
+
+	// Rules 3/4: multi-node + local storage — node pin required.
+	if cloudPropsNode == "" {
+		return "", cpierrors.Cloud(
+			"validate_template_clone_storage: storage %q is local on a multi-node cluster (%d nodes);"+
+				" template on local storage can only be cloned on the node that hosts it;"+
+				" set cloud_properties.node to pin the VM to that node,"+
+				" or use shared storage; CPI does not auto-migrate clones across nodes",
+			storage, clusterSize)
+	}
+
+	return cloudPropsNode, nil
+}
+
 // ValidateLightStemcellStorage applies the light-stemcell storage policy.
 // It returns the node the caller should target for the stemcell operation,
 // or a non-nil *cpierrors.Error when the storage configuration is incompatible.

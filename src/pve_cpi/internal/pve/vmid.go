@@ -17,12 +17,16 @@ import (
 
 // Default VMID ranges.
 // VM range expanded to 5999; the former stemcell sub-range [5000,5999] is now
-// part of the general VM pool. Disk synthetic VMIDs remain in [9000,9999].
+// part of the general VM pool. Template VMIDs occupy [6000,8999] and are
+// reserved for create_stemcell; operator-overridable via WithRange.
+// Disk synthetic VMIDs remain in [9000,9999].
 const (
-	VMIDRangeVMStart   = 100
-	VMIDRangeVMEnd     = 5999
-	VMIDRangeDiskStart = 9000
-	VMIDRangeDiskEnd   = 9999
+	VMIDRangeVMStart       = 100
+	VMIDRangeVMEnd         = 5999
+	VMIDRangeTemplateStart = 6000 // template VMs (create_stemcell); operator-overridable
+	VMIDRangeTemplateEnd   = 8999
+	VMIDRangeDiskStart     = 9000
+	VMIDRangeDiskEnd       = 9999
 )
 
 // allocOpts holds resolved configuration for a single NextVMID call or

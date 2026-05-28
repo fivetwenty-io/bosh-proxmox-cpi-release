@@ -38,6 +38,10 @@ type vmMockQEMU struct {
 	stopFn       func(ctx context.Context, node string, vmid int) (string, error)
 	configFn     func(ctx context.Context, node string, vmid int) (map[string]any, error)
 	attachDiskFn func(ctx context.Context, node string, vmid int, volid, bus string, opts *sdkqemu.AttachOpts) (string, error)
+	// cloneFn, when non-nil, is called by Clone instead of panicking. Tests that
+	// exercise the clone path set this field. Import-only tests leave it nil so
+	// the default panic fires on unexpected Clone calls — guarding the import path.
+	cloneFn func(ctx context.Context, node string, vmid int, params map[string]any) (string, error)
 
 	mu          sync.Mutex
 	createCalls []vmCreateCall
@@ -87,9 +91,13 @@ func (m *vmMockQEMU) AttachDisk(ctx context.Context, node string, vmid int, voli
 	return "scsi1", nil
 }
 
-// Clone panics — create_vm no longer calls Clone; tests that accidentally trigger
-// it reveal a regression in the handler.
-func (m *vmMockQEMU) Clone(_ context.Context, _ string, _ int, _ map[string]any) (string, error) {
+// Clone delegates to cloneFn when set; panics otherwise. Import-only tests
+// leave cloneFn nil so an unexpected Clone call triggers a panic and reveals
+// the regression. Clone-path tests wire cloneFn explicitly.
+func (m *vmMockQEMU) Clone(ctx context.Context, node string, vmid int, params map[string]any) (string, error) {
+	if m.cloneFn != nil {
+		return m.cloneFn(ctx, node, vmid, params)
+	}
 	panic("vmMockQEMU.Clone: create_vm must not call Clone (direct-import mode)")
 }
 
@@ -122,15 +130,30 @@ func (m *vmMockQEMU) RollbackSnapshot(_ context.Context, _ string, _ int, _ stri
 	panic("vmMockQEMU.RollbackSnapshot: not expected")
 }
 
-// vmMockNodes embeds panicNodesStub and overrides the two methods create_vm uses.
+// vmMockNodes embeds panicNodesStub and overrides the methods create_vm uses.
 type vmMockNodes struct {
 	panicNodesStub
 
-	updateConfigCalls []vmUpdateConfigCall
-	deleteQemuCalls   []vmDeleteQemuCall
+	updateConfigCalls    []vmUpdateConfigCall
+	deleteQemuCalls      []vmDeleteQemuCall
+	createQemuCloneCalls []vmCreateQemuCloneCall
 
 	updateConfigFn func(ctx context.Context, node, vmid string, params *sdknodes.UpdateQemuConfigParams) error
 	deleteQemuFn   func(ctx context.Context, node, vmid string, params *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error)
+	// CreateQemuCloneFn, when non-nil, is called by CreateQemuClone instead of
+	// the panic default. Clone-path tests set this to capture params and return
+	// a UPID. Import-only tests leave it nil so an unexpected call panics.
+	createQemuCloneFn func(ctx context.Context, node, vmid string, params *sdknodes.CreateQemuCloneParams) (*sdknodes.CreateQemuCloneResponse, error)
+	// listQemuFn, when non-nil, is called by ListQemu. Old-CID opportunistic
+	// lookup tests set this to simulate template presence/absence. When nil,
+	// ListQemu returns an empty list (no templates found → import-from path).
+	listQemuFn func(ctx context.Context, node string, params *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error)
+}
+
+type vmCreateQemuCloneCall struct {
+	node   string
+	vmid   string
+	params *sdknodes.CreateQemuCloneParams
 }
 
 type vmUpdateConfigCall struct {
@@ -159,6 +182,25 @@ func (m *vmMockNodes) DeleteQemu(ctx context.Context, node, vmid string, params 
 	}
 	raw := sdknodes.DeleteQemuResponse{}
 	return &raw, nil
+}
+
+func (m *vmMockNodes) CreateQemuClone(ctx context.Context, node, vmid string, params *sdknodes.CreateQemuCloneParams) (*sdknodes.CreateQemuCloneResponse, error) {
+	m.createQemuCloneCalls = append(m.createQemuCloneCalls, vmCreateQemuCloneCall{node, vmid, params})
+	if m.createQemuCloneFn != nil {
+		return m.createQemuCloneFn(ctx, node, vmid, params)
+	}
+	panic("vmMockNodes.CreateQemuClone: not expected in import-only tests (set createQemuCloneFn to enable)")
+}
+
+// ListQemu returns an empty list when listQemuFn is nil (no templates →
+// old-CID path falls through to import-from). Tests that exercise the
+// opportunistic lookup set listQemuFn to control which templates are visible.
+func (m *vmMockNodes) ListQemu(ctx context.Context, node string, params *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
+	if m.listQemuFn != nil {
+		return m.listQemuFn(ctx, node, params)
+	}
+	empty := sdknodes.ListQemuResponse{}
+	return &empty, nil
 }
 
 // vmMockCluster satisfies cluster.Service; only ListResources is needed for NextVMID.
@@ -1269,5 +1311,627 @@ func TestHandleCreateVM_LightStemcellCID_StripsPrefix(t *testing.T) {
 	}
 	if strings.Contains(virtio0, "light:") {
 		t.Errorf("virtio0 %q must NOT contain \"light:\" — prefix must be stripped before passing to PVE", virtio0)
+	}
+}
+
+// --------------------------------------------------------------------------
+// Template-CID dispatch tests (IMP-12/IMP-16)
+// --------------------------------------------------------------------------
+
+// buildVMDepsForTemplate constructs Deps with cluster storage + single-node
+// cluster wired. Used for template-CID dispatch tests that go through
+// ValidateTemplateCloneStorage.
+func buildVMDepsForTemplate(q *vmMockQEMU, n *vmMockNodes, c *vmMockCluster, a *vmMockAgent) handlers.Deps {
+	return handlers.Deps{
+		Config: &config.CPIConfig{
+			Node:           "pve",
+			VMStorage:      storageName,
+			NetworkBridge:  "vmbr0",
+			VMIDRangeStart: 100,
+		},
+		PVE: &mockPVEClient{
+			qemuSvc:    q,
+			nodesSvc:   n,
+			clusterSvc: withConfigNodes(c, 1),
+			tasksSvc: &mockTasksService{
+				waitFn: func(_ context.Context, _, _ string, _ *sdktasks.WaitOptions) (*sdktasks.Status, error) {
+					return &sdktasks.Status{ExitStatus: "OK"}, nil
+				},
+			},
+			clusterStorageSvc: &mockClusterStorage{
+				storageName: storageName,
+				storageType: "dir",
+				shared:      false,
+			},
+		},
+		Agent:  a,
+		Logger: log.NewNopLogger(),
+	}
+}
+
+// buildVMDepsForTemplateCrossNode constructs Deps for cross-node template tests
+// with a 2-node cluster and configurable storage shared flag.
+func buildVMDepsForTemplateCrossNode(q *vmMockQEMU, n *vmMockNodes, a *vmMockAgent, storageType string, shared bool) handlers.Deps {
+	return handlers.Deps{
+		Config: &config.CPIConfig{
+			Node:                 "pve",
+			VMStorage:            storageName,
+			NetworkBridge:        "vmbr0",
+			VMIDRangeStart:       100,
+			StemcellTemplateNode: "pve-tmpl",
+		},
+		PVE: &mockPVEClient{
+			qemuSvc:    q,
+			nodesSvc:   n,
+			clusterSvc: withConfigNodes(&vmMockCluster{}, 2),
+			tasksSvc: &mockTasksService{
+				waitFn: func(_ context.Context, _, _ string, _ *sdktasks.WaitOptions) (*sdktasks.Status, error) {
+					return &sdktasks.Status{ExitStatus: "OK"}, nil
+				},
+			},
+			clusterStorageSvc: &mockClusterStorage{
+				storageName: storageName,
+				storageType: storageType,
+				shared:      shared,
+			},
+		},
+		Agent:  a,
+		Logger: log.NewNopLogger(),
+	}
+}
+
+// withConfigNodes wraps a vmMockCluster so ListConfigNodes returns nodeCount
+// single-node entries. Returns the wrapped cluster.Service.
+func withConfigNodes(c *vmMockCluster, nodeCount int) *mockClusterSvc {
+	return &mockClusterSvc{
+		listConfigNodesFn: func(_ context.Context) (*sdkcluster.ListConfigNodesResponse, error) {
+			resp := make(sdkcluster.ListConfigNodesResponse, nodeCount)
+			for i := 0; i < nodeCount; i++ {
+				raw, _ := json.Marshal(map[string]any{"node": fmt.Sprintf("pve%02d", i+1)})
+				resp[i] = raw
+			}
+			return &resp, nil
+		},
+		listResourcesFn: func(ctx context.Context, params *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+			return c.ListResources(ctx, params)
+		},
+	}
+}
+
+// testTemplateCID is a sample template stemcell CID used in dispatch tests.
+const testTemplateCID = "template:6042"
+
+// TestCreateVM_TemplateCID_ClonesNotImports verifies that a "template:<vmid>"
+// CID routes to CreateQemuClone (not QEMU.Create), and the post-clone tail
+// (NIC config, agent configure, start) still runs.
+func TestCreateVM_TemplateCID_ClonesNotImports(t *testing.T) {
+	t.Parallel()
+
+	cloneCalled := false
+	n := &vmMockNodes{
+		createQemuCloneFn: func(_ context.Context, _, _ string, params *sdknodes.CreateQemuCloneParams) (*sdknodes.CreateQemuCloneResponse, error) {
+			cloneCalled = true
+			// Return a UPID for AwaitTask to consume.
+			raw := sdknodes.CreateQemuCloneResponse{}
+			if err := json.Unmarshal([]byte(`"UPID:pve:00001111:00000001:clone:ok"`), &raw); err != nil {
+				panic("clone response unmarshal: " + err.Error())
+			}
+			return &raw, nil
+		},
+	}
+	q := &vmMockQEMU{} // Create must NOT be called — panics if it is via createFn=nil path
+	a := &vmMockAgent{}
+
+	deps := buildVMDepsForTemplate(q, n, &vmMockCluster{}, a)
+	h := handlers.HandleCreateVM(deps)
+
+	args := mkArgs("agent-clone-1", testTemplateCID,
+		map[string]any{"cores": 2, "memory": 1024},
+		map[string]any{"default": map[string]any{
+			"type": "dynamic", "cloud_properties": map[string]any{},
+		}},
+		[]string{}, map[string]any{})
+
+	result, err := h.Handle(context.Background(), args, mkCtx("template-clone-1"))
+	if err != nil {
+		t.Fatalf("template CID: unexpected error: %v", err)
+	}
+
+	// Clone must have fired, QEMU.Create must NOT have fired.
+	if !cloneCalled {
+		t.Error("template CID: CreateQemuClone was not called (expected clone path)")
+	}
+	if len(q.createCalls) != 0 {
+		t.Errorf("template CID: QEMU.Create must not be called on clone path, got %d calls", len(q.createCalls))
+	}
+
+	// Post-clone tail must have run: NIC config, agent configure, start.
+	if len(n.updateConfigCalls) < 1 {
+		t.Errorf("template CID: expected >=1 UpdateQemuConfig (NIC) call, got %d", len(n.updateConfigCalls))
+	}
+	if len(a.configureCalls) != 1 {
+		t.Errorf("template CID: expected 1 agent.Configure call, got %d", len(a.configureCalls))
+	}
+	if len(q.startCalls) != 1 {
+		t.Errorf("template CID: expected 1 QEMU.Start call, got %d", len(q.startCalls))
+	}
+
+	// Response must include a VM CID.
+	tuple, ok := result.([]any)
+	if !ok || len(tuple) != 2 {
+		t.Fatalf("expected [vmCID, networks], got %T", result)
+	}
+	if vmCID, _ := tuple[0].(string); vmCID == "" {
+		t.Error("template CID: vm_cid in response must not be empty")
+	}
+}
+
+// TestCreateVM_TemplateCID_SameNode_NoTarget verifies that when config.Node ==
+// StemcellTemplateNode (same node), the clone params do NOT set Target.
+func TestCreateVM_TemplateCID_SameNode_NoTarget(t *testing.T) {
+	t.Parallel()
+
+	var capturedCloneParams *sdknodes.CreateQemuCloneParams
+	n := &vmMockNodes{
+		createQemuCloneFn: func(_ context.Context, _, _ string, params *sdknodes.CreateQemuCloneParams) (*sdknodes.CreateQemuCloneResponse, error) {
+			capturedCloneParams = params
+			raw := sdknodes.CreateQemuCloneResponse{}
+			_ = json.Unmarshal([]byte(`"UPID:pve:00002222:00000001:clone:ok"`), &raw)
+			return &raw, nil
+		},
+	}
+	q := &vmMockQEMU{}
+	a := &vmMockAgent{}
+
+	// Both config.Node and StemcellTemplateNode are "pve" (same node, single-node cluster).
+	deps := buildVMDepsForTemplate(q, n, &vmMockCluster{}, a)
+	h := handlers.HandleCreateVM(deps)
+
+	args := mkArgs("agent-samenode", testTemplateCID,
+		map[string]any{"cores": 1, "memory": 512},
+		map[string]any{"default": map[string]any{"type": "dynamic", "cloud_properties": map[string]any{}}},
+		[]string{}, map[string]any{})
+
+	if _, err := h.Handle(context.Background(), args, mkCtx("samenode")); err != nil {
+		t.Fatalf("same-node template clone: unexpected error: %v", err)
+	}
+	if capturedCloneParams == nil {
+		t.Fatal("same-node: clone params not captured")
+	}
+	if capturedCloneParams.Target != nil {
+		t.Errorf("same-node: Target must be nil, got %q", *capturedCloneParams.Target)
+	}
+}
+
+// TestCreateVM_TemplateCID_CrossNode_Shared_SetsTarget verifies that when
+// StemcellTemplateNode differs from config.Node and storage is shared, the
+// clone params set Target = config.Node.
+func TestCreateVM_TemplateCID_CrossNode_Shared_SetsTarget(t *testing.T) {
+	t.Parallel()
+
+	var capturedCloneParams *sdknodes.CreateQemuCloneParams
+	n := &vmMockNodes{
+		createQemuCloneFn: func(_ context.Context, _, _ string, params *sdknodes.CreateQemuCloneParams) (*sdknodes.CreateQemuCloneResponse, error) {
+			capturedCloneParams = params
+			raw := sdknodes.CreateQemuCloneResponse{}
+			_ = json.Unmarshal([]byte(`"UPID:pve:00003333:00000001:clone:ok"`), &raw)
+			return &raw, nil
+		},
+	}
+	q := &vmMockQEMU{}
+	a := &vmMockAgent{}
+
+	// StemcellTemplateNode="pve-tmpl", config.Node="pve", shared NFS storage, 2 nodes.
+	deps := buildVMDepsForTemplateCrossNode(q, n, a, "nfs", true)
+	h := handlers.HandleCreateVM(deps)
+
+	args := mkArgs("agent-crossnode", testTemplateCID,
+		map[string]any{"cores": 1, "memory": 512},
+		map[string]any{"default": map[string]any{"type": "dynamic", "cloud_properties": map[string]any{}}},
+		[]string{}, map[string]any{})
+
+	if _, err := h.Handle(context.Background(), args, mkCtx("crossnode-shared")); err != nil {
+		t.Fatalf("cross-node+shared template clone: unexpected error: %v", err)
+	}
+	if capturedCloneParams == nil {
+		t.Fatal("cross-node+shared: clone params not captured")
+	}
+	if capturedCloneParams.Target == nil {
+		t.Fatalf("cross-node+shared: Target must be set to %q, got nil", "pve")
+	}
+	if *capturedCloneParams.Target != "pve" {
+		t.Errorf("cross-node+shared: Target = %q, want %q", *capturedCloneParams.Target, "pve")
+	}
+	// QEMU.Create must not be called.
+	if len(q.createCalls) != 0 {
+		t.Errorf("cross-node+shared: QEMU.Create must not be called, got %d calls", len(q.createCalls))
+	}
+}
+
+// TestCreateVM_TemplateCID_CrossNode_Local_Error verifies that a template CID
+// with local storage and nodes that differ returns a D-06 error and does not
+// call CreateQemuClone.
+func TestCreateVM_TemplateCID_CrossNode_Local_Error(t *testing.T) {
+	t.Parallel()
+
+	n := &vmMockNodes{} // CreateQemuClone panics if called — leave createQemuCloneFn nil.
+	q := &vmMockQEMU{}
+	a := &vmMockAgent{}
+
+	// StemcellTemplateNode="pve-tmpl", config.Node="pve", LOCAL dir storage, 2 nodes.
+	deps := buildVMDepsForTemplateCrossNode(q, n, a, "dir", false)
+	h := handlers.HandleCreateVM(deps)
+
+	args := mkArgs("agent-crosslocal", testTemplateCID,
+		map[string]any{"cores": 1, "memory": 512},
+		map[string]any{"default": map[string]any{"type": "dynamic", "cloud_properties": map[string]any{}}},
+		[]string{}, map[string]any{})
+
+	_, err := h.Handle(context.Background(), args, mkCtx("crossnode-local"))
+	if err == nil {
+		t.Fatal("cross-node+local: expected D-06 error, got nil")
+	}
+	if !strings.Contains(err.Error(), "local") && !strings.Contains(err.Error(), "node") {
+		t.Errorf("cross-node+local: error lacks actionable context: %v", err)
+	}
+	if len(n.createQemuCloneCalls) != 0 {
+		t.Errorf("cross-node+local: CreateQemuClone must not be called on D-06 violation, got %d calls", len(n.createQemuCloneCalls))
+	}
+}
+
+// TestCreateVM_OldFormCID_NoTemplate_StillImports verifies that an old-form CID
+// ("<storage>:import/<file>") uses the QEMU.Create import-from= path when no
+// matching template is found by the opportunistic sha-tag lookup.
+func TestCreateVM_OldFormCID_NoTemplate_StillImports(t *testing.T) {
+	t.Parallel()
+
+	q := &vmMockQEMU{}
+	// listQemuFn returns empty (no templates) — the default when listQemuFn is nil.
+	n := &vmMockNodes{}
+	c := &vmMockCluster{}
+	a := &vmMockAgent{}
+	h := handlers.HandleCreateVM(buildVMDeps(q, n, c, a))
+
+	args := mkArgs("agent-import-1", testStemcellCID,
+		map[string]any{"cores": 1, "memory": 512},
+		map[string]any{"default": map[string]any{"type": "dynamic", "cloud_properties": map[string]any{}}},
+		[]string{}, map[string]any{})
+
+	if _, err := h.Handle(context.Background(), args, mkCtx("oldform-import")); err != nil {
+		t.Fatalf("old-form CID: unexpected error: %v", err)
+	}
+
+	// QEMU.Create must be called (import path), clone must NOT be called.
+	if len(q.createCalls) != 1 {
+		t.Fatalf("old-form CID: expected 1 QEMU.Create call, got %d", len(q.createCalls))
+	}
+	if len(n.createQemuCloneCalls) != 0 {
+		t.Errorf("old-form CID: CreateQemuClone must not be called, got %d calls", len(n.createQemuCloneCalls))
+	}
+}
+
+// TestCreateVM_TemplateCID_CloneConflict_Retries verifies that when a clone
+// attempt returns a VMID conflict error, AllocateWithRetry retries with a
+// fresh VMID candidate.
+func TestCreateVM_TemplateCID_CloneConflict_Retries(t *testing.T) {
+	t.Parallel()
+
+	cloneAttempts := 0
+	n := &vmMockNodes{
+		createQemuCloneFn: func(_ context.Context, _, vmidStr string, params *sdknodes.CreateQemuCloneParams) (*sdknodes.CreateQemuCloneResponse, error) {
+			cloneAttempts++
+			if cloneAttempts == 1 {
+				// First attempt: simulate VMID conflict.
+				return nil, fmt.Errorf("VM %d already exists on node 'pve'", params.Newid)
+			}
+			// Second attempt: succeed.
+			raw := sdknodes.CreateQemuCloneResponse{}
+			_ = json.Unmarshal([]byte(`"UPID:pve:00004444:00000001:clone:ok"`), &raw)
+			return &raw, nil
+		},
+	}
+	q := &vmMockQEMU{}
+	a := &vmMockAgent{}
+
+	deps := buildVMDepsForTemplate(q, n, &vmMockCluster{}, a)
+	h := handlers.HandleCreateVM(deps)
+
+	args := mkArgs("agent-retry-1", testTemplateCID,
+		map[string]any{"cores": 1, "memory": 512},
+		map[string]any{"default": map[string]any{"type": "dynamic", "cloud_properties": map[string]any{}}},
+		[]string{}, map[string]any{})
+
+	result, err := h.Handle(context.Background(), args, mkCtx("clone-retry"))
+	if err != nil {
+		t.Fatalf("clone conflict retry: unexpected error after retry: %v", err)
+	}
+	if cloneAttempts != 2 {
+		t.Errorf("expected 2 clone attempts (1 conflict + 1 success), got %d", cloneAttempts)
+	}
+	tuple, ok := result.([]any)
+	if !ok || len(tuple) != 2 {
+		t.Fatalf("expected [vmCID, networks], got %T", result)
+	}
+}
+
+// --------------------------------------------------------------------------
+// Old-CID opportunistic template dispatch tests (D-07 / D-08)
+// --------------------------------------------------------------------------
+
+// testStemcellCIDWithSHA is a stemcell CID whose filename contains a known sha8
+// so the opportunistic lookup can match it. sha8 = "abc12345" (from filename).
+const testStemcellCIDWithSHA = "test-storage:import/bosh-stemcell-ubuntu-jammy-1.438-abc12345.qcow2"
+
+// buildVMDepsForOldCIDLookup constructs Deps with cluster storage + single-node
+// cluster wired. The nodes mock has listQemuFn set to the provided function so
+// FindTemplateBySHATag exercises the correct code path.
+func buildVMDepsForOldCIDLookup(q *vmMockQEMU, n *vmMockNodes, a *vmMockAgent) handlers.Deps {
+	return handlers.Deps{
+		Config: &config.CPIConfig{
+			Node:           "pve",
+			VMStorage:      storageName,
+			NetworkBridge:  "vmbr0",
+			VMIDRangeStart: 100,
+		},
+		PVE: &mockPVEClient{
+			qemuSvc:    q,
+			nodesSvc:   n,
+			clusterSvc: withConfigNodes(&vmMockCluster{}, 1),
+			tasksSvc: &mockTasksService{
+				waitFn: func(_ context.Context, _, _ string, _ *sdktasks.WaitOptions) (*sdktasks.Status, error) {
+					return &sdktasks.Status{ExitStatus: "OK"}, nil
+				},
+			},
+			clusterStorageSvc: &mockClusterStorage{
+				storageName: storageName,
+				storageType: "dir",
+				shared:      false,
+			},
+		},
+		Agent:  a,
+		Logger: log.NewNopLogger(),
+	}
+}
+
+// listQemuWithTemplate returns a ListQemu stub that reports a single frozen
+// template carrying the given sha8 tag and VMID.
+func listQemuWithTemplate(vmid int64, sha8 string) func(context.Context, string, *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
+	return func(_ context.Context, _ string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
+		isTemplate := true
+		tag := "bosh-stemcell-sha-" + sha8
+		raw, _ := json.Marshal(map[string]any{
+			"vmid":     vmid,
+			"name":     "bosh-stemcell-ubuntu-jammy-1.438",
+			"tags":     tag,
+			"template": isTemplate,
+		})
+		resp := sdknodes.ListQemuResponse{raw}
+		return &resp, nil
+	}
+}
+
+// TestCreateVM_OldCID_TemplateFound_ClonesNotImports verifies that when the
+// opportunistic sha-tag lookup finds an existing template, CreateQemuClone is
+// called and QEMU.Create (import-from) is NOT called.
+func TestCreateVM_OldCID_TemplateFound_ClonesNotImports(t *testing.T) {
+	t.Parallel()
+
+	cloneCalled := false
+	n := &vmMockNodes{
+		// FindTemplateBySHATag calls ListQemu; return a matching template.
+		listQemuFn: listQemuWithTemplate(6042, "abc12345"),
+		// Clone path fires when template is found.
+		createQemuCloneFn: func(_ context.Context, _, _ string, params *sdknodes.CreateQemuCloneParams) (*sdknodes.CreateQemuCloneResponse, error) {
+			cloneCalled = true
+			raw := sdknodes.CreateQemuCloneResponse{}
+			_ = json.Unmarshal([]byte(`"UPID:pve:00005555:00000001:clone:ok"`), &raw)
+			return &raw, nil
+		},
+	}
+	q := &vmMockQEMU{} // Create must NOT be called — panics via nil createFn path
+	a := &vmMockAgent{}
+
+	deps := buildVMDepsForOldCIDLookup(q, n, a)
+	h := handlers.HandleCreateVM(deps)
+
+	args := mkArgs("agent-oldcid-found", testStemcellCIDWithSHA,
+		map[string]any{"cores": 1, "memory": 512},
+		map[string]any{"default": map[string]any{"type": "dynamic", "cloud_properties": map[string]any{}}},
+		[]string{}, map[string]any{})
+
+	result, err := h.Handle(context.Background(), args, mkCtx("oldcid-found"))
+	if err != nil {
+		t.Fatalf("old-CID+template-found: unexpected error: %v", err)
+	}
+
+	if !cloneCalled {
+		t.Error("old-CID+template-found: CreateQemuClone was not called")
+	}
+	if len(q.createCalls) != 0 {
+		t.Errorf("old-CID+template-found: QEMU.Create must not be called, got %d calls", len(q.createCalls))
+	}
+
+	// Post-clone tail must have run.
+	if len(n.updateConfigCalls) < 1 {
+		t.Errorf("old-CID+template-found: expected >=1 UpdateQemuConfig call, got %d", len(n.updateConfigCalls))
+	}
+	if len(a.configureCalls) != 1 {
+		t.Errorf("old-CID+template-found: expected 1 agent.Configure call, got %d", len(a.configureCalls))
+	}
+	if len(q.startCalls) != 1 {
+		t.Errorf("old-CID+template-found: expected 1 QEMU.Start call, got %d", len(q.startCalls))
+	}
+
+	tuple, ok := result.([]any)
+	if !ok || len(tuple) != 2 {
+		t.Fatalf("expected [vmCID, networks], got %T", result)
+	}
+	if vmCID, _ := tuple[0].(string); vmCID == "" {
+		t.Error("old-CID+template-found: vm_cid in response must not be empty")
+	}
+}
+
+// TestCreateVM_OldCID_NoTemplate_FallsBackToImport verifies that when the
+// opportunistic lookup returns no match, QEMU.Create (import-from) is called
+// and CreateQemuClone is NOT called.
+func TestCreateVM_OldCID_NoTemplate_FallsBackToImport(t *testing.T) {
+	t.Parallel()
+
+	// listQemuFn returns empty → not-found; the nil default on vmMockNodes does
+	// exactly this, but we set it explicitly to document the intent.
+	n := &vmMockNodes{
+		listQemuFn: func(_ context.Context, _ string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
+			empty := sdknodes.ListQemuResponse{}
+			return &empty, nil
+		},
+	}
+	q := &vmMockQEMU{}
+	a := &vmMockAgent{}
+
+	deps := buildVMDepsForOldCIDLookup(q, n, a)
+	h := handlers.HandleCreateVM(deps)
+
+	args := mkArgs("agent-oldcid-notfound", testStemcellCIDWithSHA,
+		map[string]any{"cores": 1, "memory": 512},
+		map[string]any{"default": map[string]any{"type": "dynamic", "cloud_properties": map[string]any{}}},
+		[]string{}, map[string]any{})
+
+	if _, err := h.Handle(context.Background(), args, mkCtx("oldcid-notfound")); err != nil {
+		t.Fatalf("old-CID+no-template: unexpected error: %v", err)
+	}
+
+	if len(q.createCalls) != 1 {
+		t.Fatalf("old-CID+no-template: expected 1 QEMU.Create call, got %d", len(q.createCalls))
+	}
+	if len(n.createQemuCloneCalls) != 0 {
+		t.Errorf("old-CID+no-template: CreateQemuClone must not be called, got %d calls", len(n.createQemuCloneCalls))
+	}
+}
+
+// TestCreateVM_OldCID_LookupError_FallsBackToImport verifies that when
+// FindTemplateBySHATag returns an error, create_vm does NOT fail — it logs
+// a warning and falls back to the import-from path.
+func TestCreateVM_OldCID_LookupError_FallsBackToImport(t *testing.T) {
+	t.Parallel()
+
+	lookupErr := fmt.Errorf("PVE API: connection refused")
+	n := &vmMockNodes{
+		listQemuFn: func(_ context.Context, _ string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
+			return nil, lookupErr
+		},
+	}
+	q := &vmMockQEMU{}
+	a := &vmMockAgent{}
+
+	deps := buildVMDepsForOldCIDLookup(q, n, a)
+	h := handlers.HandleCreateVM(deps)
+
+	args := mkArgs("agent-oldcid-lookuperr", testStemcellCIDWithSHA,
+		map[string]any{"cores": 1, "memory": 512},
+		map[string]any{"default": map[string]any{"type": "dynamic", "cloud_properties": map[string]any{}}},
+		[]string{}, map[string]any{})
+
+	// create_vm must succeed despite the lookup error (fallback to import-from).
+	if _, err := h.Handle(context.Background(), args, mkCtx("oldcid-lookuperr")); err != nil {
+		t.Fatalf("old-CID+lookup-error: expected success (fallback), got error: %v", err)
+	}
+
+	if len(q.createCalls) != 1 {
+		t.Fatalf("old-CID+lookup-error: expected 1 QEMU.Create (fallback) call, got %d", len(q.createCalls))
+	}
+	if len(n.createQemuCloneCalls) != 0 {
+		t.Errorf("old-CID+lookup-error: CreateQemuClone must not be called, got %d calls", len(n.createQemuCloneCalls))
+	}
+}
+
+// TestCreateVM_OldCID_TemplateFound_ConflictRetries verifies that when the
+// opportunistic clone path is taken and the first attempt hits a VMID conflict,
+// AllocateWithRetry retries with a fresh candidate.
+func TestCreateVM_OldCID_TemplateFound_ConflictRetries(t *testing.T) {
+	t.Parallel()
+
+	cloneAttempts := 0
+	n := &vmMockNodes{
+		listQemuFn: listQemuWithTemplate(6042, "abc12345"),
+		createQemuCloneFn: func(_ context.Context, _, _ string, params *sdknodes.CreateQemuCloneParams) (*sdknodes.CreateQemuCloneResponse, error) {
+			cloneAttempts++
+			if cloneAttempts == 1 {
+				return nil, fmt.Errorf("VM %d already exists on node 'pve'", params.Newid)
+			}
+			raw := sdknodes.CreateQemuCloneResponse{}
+			_ = json.Unmarshal([]byte(`"UPID:pve:00006666:00000001:clone:ok"`), &raw)
+			return &raw, nil
+		},
+	}
+	q := &vmMockQEMU{}
+	a := &vmMockAgent{}
+
+	deps := buildVMDepsForOldCIDLookup(q, n, a)
+	h := handlers.HandleCreateVM(deps)
+
+	args := mkArgs("agent-oldcid-retry", testStemcellCIDWithSHA,
+		map[string]any{"cores": 1, "memory": 512},
+		map[string]any{"default": map[string]any{"type": "dynamic", "cloud_properties": map[string]any{}}},
+		[]string{}, map[string]any{})
+
+	result, err := h.Handle(context.Background(), args, mkCtx("oldcid-clone-retry"))
+	if err != nil {
+		t.Fatalf("old-CID+clone-conflict-retry: unexpected error: %v", err)
+	}
+	if cloneAttempts != 2 {
+		t.Errorf("expected 2 clone attempts (1 conflict + 1 success), got %d", cloneAttempts)
+	}
+	if len(q.createCalls) != 0 {
+		t.Errorf("old-CID+clone-conflict-retry: QEMU.Create must not be called, got %d", len(q.createCalls))
+	}
+
+	tuple, ok := result.([]any)
+	if !ok || len(tuple) != 2 {
+		t.Fatalf("expected [vmCID, networks], got %T", result)
+	}
+}
+
+// TestCreateVM_TemplateCID_Regression_StillClones verifies that the template:<vmid>
+// path is unchanged by the old-CID opportunistic change — no ListQemu call
+// is made and CreateQemuClone fires directly.
+func TestCreateVM_TemplateCID_Regression_StillClones(t *testing.T) {
+	t.Parallel()
+
+	cloneCalled := false
+	n := &vmMockNodes{
+		// listQemuFn is nil: if ListQemu is called for a template:<vmid> CID
+		// it returns empty — but it must NOT be called at all on this path.
+		// We detect accidental calls via a sentinel.
+		listQemuFn: func(_ context.Context, _ string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
+			t.Error("template:<vmid> path must not call ListQemu")
+			empty := sdknodes.ListQemuResponse{}
+			return &empty, nil
+		},
+		createQemuCloneFn: func(_ context.Context, _, _ string, _ *sdknodes.CreateQemuCloneParams) (*sdknodes.CreateQemuCloneResponse, error) {
+			cloneCalled = true
+			raw := sdknodes.CreateQemuCloneResponse{}
+			_ = json.Unmarshal([]byte(`"UPID:pve:00007777:00000001:clone:ok"`), &raw)
+			return &raw, nil
+		},
+	}
+	q := &vmMockQEMU{}
+	a := &vmMockAgent{}
+
+	deps := buildVMDepsForTemplate(q, n, &vmMockCluster{}, a)
+	h := handlers.HandleCreateVM(deps)
+
+	args := mkArgs("agent-tmpl-regression", testTemplateCID,
+		map[string]any{"cores": 1, "memory": 512},
+		map[string]any{"default": map[string]any{"type": "dynamic", "cloud_properties": map[string]any{}}},
+		[]string{}, map[string]any{})
+
+	if _, err := h.Handle(context.Background(), args, mkCtx("tmpl-regression")); err != nil {
+		t.Fatalf("template:<vmid> regression: unexpected error: %v", err)
+	}
+	if !cloneCalled {
+		t.Error("template:<vmid> regression: CreateQemuClone was not called")
+	}
+	if len(q.createCalls) != 0 {
+		t.Errorf("template:<vmid> regression: QEMU.Create must not be called, got %d calls", len(q.createCalls))
 	}
 }

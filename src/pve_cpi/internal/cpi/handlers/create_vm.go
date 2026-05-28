@@ -18,6 +18,7 @@ import (
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
+	sdkclusterstorage "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/clusterstorage"
 	sdknodes "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/nodes"
 )
 
@@ -119,19 +120,25 @@ type createVMParsedArgs struct {
 // createVMShape holds the resolved VM-shape parameters derived from
 // createVMParsedArgs + Deps.Config.
 type createVMShape struct {
-	node         string
-	vmStorage    string
-	vmDiskFormat string
-	rootDiskGiB  int
-	cores        int
-	sockets      int
-	memMiB       int
-	hotplug      string
-	numaEnabled  bool
-	initialTags  string
-	rangeStart   int
-	maxAttempts  int
-	initialName  string
+	node      string
+	vmStorage string
+	// vmStorageType is the PVE storage type string for vmStorage (e.g. "dir",
+	// "nfs", "lvm", "lvmthin", "zfspool"). Used by cloneFromTemplate
+	// to select linked vs full clone via pve.IsLinkedCloneSupported. Empty when
+	// the cluster storage list is unavailable; IsLinkedCloneSupported treats ""
+	// as linked-capable (permissive default).
+	vmStorageType string
+	vmDiskFormat  string
+	rootDiskGiB   int
+	cores         int
+	sockets       int
+	memMiB        int
+	hotplug       string
+	numaEnabled   bool
+	initialTags   string
+	rangeStart    int
+	maxAttempts   int
+	initialName   string
 }
 
 // HandleCreateVM returns a cpi.Handler that implements the BOSH CPI create_vm method.
@@ -139,7 +146,12 @@ type createVMShape struct {
 // Arguments (positional, all required):
 //
 //	[0] agent_id      string
-//	[1] stemcell_cid  string  ("<storage>:import/<filename>" volid format)
+//	[1] stemcell_cid  string — CID returned by create_stemcell. Supported formats:
+//	                    "template:<vmid>"           — new template CID; VM is created by cloning the template.
+//	                    "<storage>:import/<file>"   — pre-upgrade volume CID; the CPI checks for a matching
+//	                                                  template by sha8 tag and clones it if found, otherwise
+//	                                                  falls back to import-from= (slow path).
+//	                    "light:<storage>:import/<file>" — pre-upgrade light CID; same opportunistic logic as above.
 //	[2] cloud_props   map     (cores, sockets, memory, vm_disk_format, target_node, ...)
 //	[3] networks      map[name]NetworkSpec
 //	[4] disk_cids     []string  (persistent disks to pre-attach)
@@ -174,7 +186,7 @@ func createVM(
 	// -----------------------------------------------------------------------
 	// 2–3. Resolve node and VM-shape parameters.
 	// -----------------------------------------------------------------------
-	shape, err := resolveVMShape(deps, parsed)
+	shape, err := resolveVMShape(ctx, deps, parsed)
 	if err != nil {
 		return nil, err
 	}
@@ -287,12 +299,27 @@ func parseCreateVMArgs(args []json.RawMessage) (*createVMParsedArgs, error) {
 	// delete_stemcell can recognize and no-op these CIDs without consulting
 	// any external state.
 	rawCID := pve.StripLightPrefix(stemcellCID)
-	// stemcellStorage is used as a fallback VMStorage when deps.Config.VMStorage
-	// is empty (see VMStorage resolution below). ParseStemcellCID guarantees a
-	// non-empty storage component when err == nil.
-	stemcellStor, _, err := pve.ParseStemcellCID(rawCID)
-	if err != nil {
-		return nil, cpierrors.Cloud("create_vm: invalid stemcell_cid %q: %s", stemcellCID, err.Error())
+	// stemcellStor is used as a fallback VMStorage when deps.Config.VMStorage
+	// is empty (see VMStorage resolution below). For template CIDs ("template:<vmid>")
+	// there is no storage component — stemcellStor is left empty and VMStorage
+	// must be set in config or cloud_properties.
+	var stemcellStor string
+	if pve.IsTemplateStemcellCID(stemcellCID) {
+		// Template CIDs carry only a VMID; validate the format now so errors
+		// surface at parse time rather than at candidate-allocation time.
+		if _, err := pve.ParseTemplateStemcellCID(stemcellCID); err != nil {
+			return nil, cpierrors.Cloud("create_vm: invalid template stemcell_cid %q: %s", stemcellCID, err.Error())
+		}
+		// stemcellStor stays "" — VMStorage from config or resolveVMShapeStorage
+		// must supply the target storage. Template clones carry no import-from path.
+	} else {
+		// Old-form CID: "light:<storage>:import/<file>" or "<storage>:import/<file>".
+		// ParseStemcellCID guarantees a non-empty storage component when err == nil.
+		var err error
+		stemcellStor, _, err = pve.ParseStemcellCID(rawCID)
+		if err != nil {
+			return nil, cpierrors.Cloud("create_vm: invalid stemcell_cid %q: %s", stemcellCID, err.Error())
+		}
 	}
 
 	var cloudProps createVMCloudProps
@@ -342,7 +369,10 @@ func parseCreateVMArgs(args []json.RawMessage) (*createVMParsedArgs, error) {
 
 // resolveVMShape derives the createVMShape from deps.Config + parsed args.
 // Returns cpierrors.CloudError if the target node cannot be determined.
-func resolveVMShape(deps Deps, parsed *createVMParsedArgs) (*createVMShape, error) {
+// vmStorageType is populated via a best-effort cluster storage list lookup;
+// on failure (PVE unavailable, ClusterStorage not wired) the field is left ""
+// so IsLinkedCloneSupported treats it as linked-capable (permissive default).
+func resolveVMShape(ctx context.Context, deps Deps, parsed *createVMParsedArgs) (*createVMShape, error) {
 	cp := parsed.cloudProps
 
 	node := cp.TargetNode
@@ -363,21 +393,59 @@ func resolveVMShape(deps Deps, parsed *createVMParsedArgs) (*createVMShape, erro
 	initialTags := mergeTagList(nil, buildCustomTags(cp.Tags), maxTagLength)
 	initialName := resolveVMShapeInitialName(deps.Config, parsed)
 
+	// Best-effort: populate vmStorageType for the clone-mode decision in
+	// cloneFromTemplate. A lookup error leaves the field "" which
+	// IsLinkedCloneSupported treats as linked-capable (permissive).
+	vmStorageType := lookupVMStorageType(ctx, deps, vmStorage)
+
 	return &createVMShape{
-		node:         node,
-		vmStorage:    vmStorage,
-		vmDiskFormat: vmDiskFormat,
-		rootDiskGiB:  rootDiskGiB,
-		cores:        cores,
-		sockets:      sockets,
-		memMiB:       memMiB,
-		hotplug:      hotplug,
-		numaEnabled:  numaEnabled,
-		initialTags:  initialTags,
-		rangeStart:   rangeStart,
-		maxAttempts:  maxAttempts,
-		initialName:  initialName,
+		node:          node,
+		vmStorage:     vmStorage,
+		vmStorageType: vmStorageType,
+		vmDiskFormat:  vmDiskFormat,
+		rootDiskGiB:   rootDiskGiB,
+		cores:         cores,
+		sockets:       sockets,
+		memMiB:        memMiB,
+		hotplug:       hotplug,
+		numaEnabled:   numaEnabled,
+		initialTags:   initialTags,
+		rangeStart:    rangeStart,
+		maxAttempts:   maxAttempts,
+		initialName:   initialName,
 	}, nil
+}
+
+// lookupVMStorageType fetches the PVE storage type for storageName by listing
+// the cluster storage index. Returns "" on any error — callers treat "" as
+// linked-clone-capable (permissive). This is intentionally best-effort: the
+// create_vm flow must not fail on a storage-lookup error that does not affect
+// the import path; the clone-mode decision downstream uses "" → linked safely.
+//
+// ClusterStorage() == nil (e.g. test mocks that don't wire it) is the expected
+// case in unit tests; the function returns "" without logging to keep test
+// output clean.
+func lookupVMStorageType(ctx context.Context, deps Deps, storageName string) string {
+	if deps.PVE == nil || deps.PVE.ClusterStorage() == nil || storageName == "" {
+		return ""
+	}
+	resp, err := deps.PVE.ClusterStorage().ListStorage(ctx, &sdkclusterstorage.ListStorageParams{})
+	if err != nil || resp == nil {
+		return ""
+	}
+	for _, raw := range *resp {
+		var entry struct {
+			Storage string `json:"storage"`
+			Type    string `json:"type"`
+		}
+		if jerr := json.Unmarshal(raw, &entry); jerr != nil {
+			continue
+		}
+		if entry.Storage == storageName {
+			return entry.Type
+		}
+	}
+	return ""
 }
 
 // resolveVMIDAllocParams returns the VMID range start and per-create allocation
@@ -518,9 +586,67 @@ func allocateVM(
 	return vmid, err
 }
 
-// attemptCreateVM builds the create params for one VMID candidate, calls
-// QEMU.Create, and awaits the task. On retryable failures it logs and
-// optionally cleans up the candidate VMID before returning the error so
+// extractSHA8FromFilename extracts the 8-hex-char content sha from a stemcell
+// qcow2 filename produced by BuildStemcellFilename.
+//
+// Format: bosh-stemcell-<name>-<version>-<sha8>.qcow2
+// The sha8 is the last "-"-delimited segment before ".qcow2". Because <name>
+// and <version> themselves may contain hyphens, the function takes the segment
+// between the final "-" and the ".qcow2" suffix rather than splitting on the
+// third hyphen.
+//
+// Returns ("", false) when:
+//   - filename does not end with ".qcow2"
+//   - there is no "-" before ".qcow2"
+//   - the candidate sha8 is not exactly 8 ASCII hex characters
+//
+// The caller treats ("", false) as "skip lookup, fall back to import-from".
+func extractSHA8FromFilename(filename string) (sha8 string, ok bool) {
+	const suffix = ".qcow2"
+	if !strings.HasSuffix(filename, suffix) {
+		return "", false
+	}
+	base := filename[:len(filename)-len(suffix)]
+	lastDash := strings.LastIndexByte(base, '-')
+	if lastDash < 0 {
+		return "", false
+	}
+	candidate := base[lastDash+1:]
+	if len(candidate) != 8 {
+		return "", false
+	}
+	for _, c := range candidate {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') && (c < 'A' || c > 'F') {
+			return "", false
+		}
+	}
+	return strings.ToLower(candidate), true
+}
+
+// extractSHA8FromFilenameInCID extracts the sha8 from the filename embedded in
+// a raw stemcell CID of the form "<storage>:import/<filename>".
+//
+// It calls ParseStemcellCID to get the volumePath ("import/<filename>"),
+// strips the "import/" prefix to obtain the bare filename, then delegates to
+// extractSHA8FromFilename. Returns ("", false) on any parse error or when the
+// filename does not match the expected pattern — callers skip the lookup.
+func extractSHA8FromFilenameInCID(rawCID string) (sha8 string, ok bool) {
+	_, volumePath, err := pve.ParseStemcellCID(rawCID)
+	if err != nil {
+		return "", false
+	}
+	const importPrefix = "import/"
+	if !strings.HasPrefix(volumePath, importPrefix) {
+		return "", false
+	}
+	filename := volumePath[len(importPrefix):]
+	return extractSHA8FromFilename(filename)
+}
+
+// attemptCreateVM builds the create params for one VMID candidate, then either
+// clones from a template (when stemcellCID is a "template:<vmid>" CID) or calls
+// QEMU.Create with import-from= (old-form CID). On retryable failures it logs
+// and optionally cleans up the candidate VMID before returning the error so
 // AllocateWithRetry can retry with a fresh candidate.
 func attemptCreateVM(
 	ctx context.Context,
@@ -530,12 +656,93 @@ func attemptCreateVM(
 	shape *createVMShape,
 	candidate int,
 ) error {
-	virtio0Val := fmt.Sprintf("%s:0,import-from=%s,format=%s,size=%dG",
-		shape.vmStorage, parsed.rawCID, shape.vmDiskFormat, shape.rootDiskGiB)
 	candidateName := shape.initialName
 	if candidateName == "" {
 		candidateName = fmt.Sprintf("vm-%d", candidate)
 	}
+
+	// --- Template-clone path ---
+	if pve.IsTemplateStemcellCID(parsed.stemcellCID) {
+		templateVMID, err := pve.ParseTemplateStemcellCID(parsed.stemcellCID)
+		if err != nil {
+			// Should never happen: parsing was validated in parseCreateVMArgs.
+			return cpierrors.Wrap(err, "create_vm: parse template CID")
+		}
+
+		// Compute the node that hosts the template. StemcellTemplateNode, when
+		// set, is where create_stemcell built the template; fall back to the
+		// general config.Node. The clone task is submitted to templateNode;
+		// Target= redirects the resulting VM to shape.node (cross-node shared).
+		templateNode := deps.Config.StemcellTemplateNode
+		if templateNode == "" {
+			templateNode = deps.Config.Node
+		}
+
+		cloneErr := cloneFromTemplate(ctx, deps, logger, shape, candidate, candidateName, templateNode, templateVMID)
+		if cloneErr != nil {
+			// Classify for retry: VMID conflicts and transient transport faults are
+			// retryable — they use the same retry classification as the import path.
+			return handleCloneError(ctx, deps, logger, shape.node, candidate, cloneErr)
+		}
+
+		logger.Info("create_vm: vm cloned from template",
+			log.Int("vmid_attempted", candidate),
+			log.Int64("template_vmid", templateVMID),
+			log.String("template_node", templateNode),
+		)
+		return nil
+	}
+
+	// --- Old-form CID: opportunistic template lookup before import-from ---
+	//
+	// D-07: if an existing template carries a matching sha tag, clone it
+	// (fast path). If not found or lookup fails, fall through to import-from
+	// (slow but correct). create_vm NEVER builds a template here — read-only
+	// lookup only.
+	//
+	// The sha8 lives in the filename: bosh-stemcell-<name>-<version>-<sha8>.qcow2.
+	// We extract it from the last "-"-separated segment before ".qcow2". If the
+	// filename does not match that pattern (pre-upgrade or custom stems), skip
+	// lookup silently.
+	if sha8, ok := extractSHA8FromFilenameInCID(parsed.rawCID); ok {
+		templateNode := deps.Config.StemcellTemplateNode
+		if templateNode == "" {
+			templateNode = deps.Config.Node
+		}
+		templateVMID, found, lookupErr := pve.FindTemplateBySHATag(ctx, deps.PVE, templateNode, sha8)
+		if lookupErr != nil {
+			// Lookup failure is non-fatal: log and fall through to import-from.
+			// Do NOT fail create_vm on a read-only lookup error — the safe path
+			// (import-from) is always available.
+			logger.Warn("create_vm: template SHA lookup failed, falling back to import-from",
+				log.String("sha8", sha8),
+				log.String("template_node", templateNode),
+				log.Err(lookupErr),
+			)
+		} else if found {
+			// A pre-built template matches this stemcell content — clone it.
+			logger.Info("create_vm: opportunistic template found by sha tag, cloning",
+				log.String("sha8", sha8),
+				log.Int64("template_vmid", templateVMID),
+				log.String("template_node", templateNode),
+			)
+			cloneErr := cloneFromTemplate(ctx, deps, logger, shape, candidate, candidateName, templateNode, templateVMID)
+			if cloneErr != nil {
+				return handleCloneError(ctx, deps, logger, shape.node, candidate, cloneErr)
+			}
+			logger.Info("create_vm: vm cloned from opportunistic template",
+				log.Int("vmid_attempted", candidate),
+				log.Int64("template_vmid", templateVMID),
+				log.String("template_node", templateNode),
+			)
+			return nil
+		}
+		// !found → fall through to import-from below.
+	}
+
+	// --- Import-from path (old-form CID: light: or plain <storage>:import/<file>) ---
+	virtio0Val := fmt.Sprintf("%s:0,import-from=%s,format=%s,size=%dG",
+		shape.vmStorage, parsed.rawCID, shape.vmDiskFormat, shape.rootDiskGiB)
 
 	createParams := map[string]any{
 		"vmid":    candidate,
@@ -574,6 +781,199 @@ func attemptCreateVM(
 		log.Int("vmid_attempted", candidate),
 		log.String("upid", upid),
 	)
+	return nil
+}
+
+// handleCloneError classifies a cloneFromTemplate error and logs appropriately.
+// VMID conflicts and transient transport faults are retryable (same semantics as
+// handleCreateError). Storage-lock timeouts from the clone task are also retried.
+// Local-storage cross-node violations are NOT retryable — they are
+// configuration errors that must propagate immediately.
+func handleCloneError(
+	ctx context.Context,
+	deps Deps,
+	logger *log.Logger,
+	node string,
+	candidate int,
+	cerr error,
+) error {
+	switch {
+	case pve.IsVMIDConflict(cerr):
+		logger.Info("create_vm: vmid conflict on clone, retrying",
+			log.Int("vmid_attempted", candidate),
+		)
+	case pve.IsStorageLockTimeout(cerr):
+		logger.Info("create_vm: storage lock timeout on clone, retrying",
+			log.Int("vmid_attempted", candidate),
+		)
+	case pve.IsTransientTransport(cerr):
+		// Clone POST may or may not have committed — sweep the candidate VMID
+		// before retrying so the cluster list is clean.
+		logger.Info("create_vm: transient transport fault on clone, retrying",
+			log.Int("vmid_attempted", candidate),
+			log.String("error", cerr.Error()),
+		)
+		cleanupVM(contextWithoutCancel(ctx), deps, node, candidate, logger)
+	default:
+		// Non-retryable error (e.g. local-storage cross-node violation,
+		// template not found, or other PVE fatal). Clean up any partial VM
+		// state and propagate — AllocateWithRetry will not retry.
+		cleanupVM(contextWithoutCancel(ctx), deps, node, candidate, logger)
+	}
+	return cerr
+}
+
+// cloneFromTemplate clones templateVMID (on templateNode) into the candidate
+// VMID, selecting linked vs full clone per clone_mode config and the storage
+// backend capability reported by IsLinkedCloneSupported. It also enforces the
+// cross-node placement policy via ValidateTemplateCloneStorage and sets
+// params.Target when the template node differs from the desired VM node and
+// the storage is confirmed shared.
+//
+// Clone-mode selection:
+//   - "linked" — forced linked; error if storage does not support it.
+//   - "full"   — forced full; Storage and Format are set on params.
+//   - "auto"/"" — linked when supported, full otherwise.
+//
+// Storage and Format are only set on full-clone params (SDK requirement).
+// Target is set only for cross-node clones on shared storage. Cross-node
+// clones on local storage return an actionable error.
+//
+// The returned upid identifies the async PVE clone task; the caller must await
+// it. An empty upid means PVE completed synchronously.
+func cloneFromTemplate(
+	ctx context.Context,
+	deps Deps,
+	logger *log.Logger,
+	shape *createVMShape,
+	candidate int,
+	candidateName string,
+	templateNode string,
+	templateVMID int64,
+) error {
+	mode := deps.Config.CloneMode
+	if mode == "" {
+		mode = "auto"
+	}
+
+	linkedOK := pve.IsLinkedCloneSupported(shape.vmStorageType)
+
+	var full *bool
+	switch mode {
+	case "linked":
+		if !linkedOK {
+			return cpierrors.Cloud(
+				"create_vm: clone_mode=linked but storage %q (type %q) does not support linked clones;"+
+					" use clone_mode=auto or clone_mode=full, or switch to a snapshot-capable storage backend",
+				shape.vmStorage, shape.vmStorageType,
+			)
+		}
+		// full remains nil → linked clone.
+	case "full":
+		t := true
+		full = &t
+	default: // "auto"
+		if !linkedOK {
+			t := true
+			full = &t
+		} else if shape.vmStorageType == "" {
+			// Storage type lookup failed or returned empty; IsLinkedCloneSupported
+			// treats unknown type as linked-capable (permissive default). Log at
+			// debug so a PVE rejection of a linked clone is diagnosable even when
+			// the storage type could not be determined at clone time.
+			logger.Debug("create_vm: clone_mode=auto: storage type unknown, assuming linked-clone support",
+				log.String("vm_storage", shape.vmStorage),
+			)
+		}
+		// Otherwise full remains nil → linked clone.
+	}
+
+	newid := int64(candidate)
+	params := &sdknodes.CreateQemuCloneParams{
+		Newid: newid,
+		Name:  &candidateName,
+		Full:  full,
+	}
+
+	// Set Storage and Format only for full clones. The SDK validates that
+	// these fields are absent on linked clones; setting them on a nil-Full
+	// (linked) request triggers a PVE API error.
+	if full != nil && *full {
+		params.Storage = &shape.vmStorage
+		params.Format = &shape.vmDiskFormat
+	}
+
+	// Cross-node Target= enforcement.
+	//
+	// The clone task is submitted to templateNode. When templateNode != shape.node
+	// (BOSH's desired VM node), PVE must move the resulting VM to shape.node.
+	// PVE supports cross-node placement via params.Target ONLY on shared storage.
+	// Local storage (dir, lvm, lvmthin, zfspool) cannot cross nodes — PVE rejects
+	// Target on local-storage clones with a hard error.
+	//
+	// Topology matrix:
+	//   single-node (≤1)          → accept any storage; templateNode==shape.node; no Target.
+	//   multi-node + shared       → accept; set Target when templateNode != shape.node.
+	//   multi-node + local + pin  → operator must pin to the template node; if
+	//       shape.node != templateNode the configuration is wrong — return error.
+	//   multi-node + local + no pin → ValidateTemplateCloneStorage rejects (rule 4).
+	policyDeps := newHandlerPolicyDeps(deps)
+	_, policyErr := pve.ValidateTemplateCloneStorage(ctx, policyDeps, shape.vmStorage, shape.node)
+	if policyErr != nil {
+		return policyErr
+	}
+
+	// After policy validation, enforce the local-storage cross-node constraint:
+	// if templateNode and shape.node differ AND storage is not shared, PVE cannot
+	// clone across nodes — the operator must fix this by
+	// pinning the VM node to match the template node or switching to shared storage.
+	if templateNode != shape.node {
+		storageInfo, infoErr := policyDeps.StorageInfo(ctx, shape.vmStorage)
+		if infoErr != nil {
+			return cpierrors.Cloud(
+				"create_vm: cross-node clone: cannot look up storage %q to determine if Target is safe: %s",
+				shape.vmStorage, infoErr.Error())
+		}
+		if !storageInfo.IsShared() {
+			return cpierrors.Cloud(
+				"create_vm: cross-node clone rejected: template is on node %q but VM is targeted to node %q;"+
+					" storage %q is local (not shared) — PVE cannot cross-node clone local storage;"+
+					" set cloud_properties.node to match the template node (%q),"+
+					" or use shared storage",
+				templateNode, shape.node, shape.vmStorage, templateNode)
+		}
+		// Shared storage confirmed: set Target so PVE lands the clone on shape.node.
+		targetNode := shape.node
+		params.Target = &targetNode
+	}
+
+	logger.Info("create_vm: cloning template",
+		log.Int("template_vmid", int(templateVMID)),
+		log.String("template_node", templateNode),
+		log.Int("new_vmid", candidate),
+		log.String("clone_mode", mode),
+		log.Bool("full_clone", full != nil && *full),
+	)
+
+	upid, cloneErr := pve.CloneQemuVM(ctx, deps.PVE, templateNode, templateVMID, params)
+	if cloneErr != nil {
+		return cpierrors.Wrap(cloneErr, fmt.Sprintf(
+			"create_vm: clone template vmid=%d → new vmid=%d", templateVMID, candidate))
+	}
+
+	if upid != "" {
+		if werr := pve.AwaitTaskWithLogger(ctx, deps.PVE, templateNode, upid, logger,
+			pve.WithMaxWait(pve.StemcellMaxWait)); werr != nil {
+			return cpierrors.Wrap(werr, fmt.Sprintf(
+				"create_vm: await clone task template vmid=%d → new vmid=%d", templateVMID, candidate))
+		}
+	}
+
+	logger.Info("create_vm: template clone complete",
+		log.Int("template_vmid", int(templateVMID)),
+		log.Int("new_vmid", candidate),
+	)
+
 	return nil
 }
 

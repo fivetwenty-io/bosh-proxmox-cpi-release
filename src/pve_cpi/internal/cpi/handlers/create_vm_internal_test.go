@@ -1,10 +1,22 @@
 package handlers
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"reflect"
 	"testing"
 	"time"
+
+	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
+	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
+	sdkcloudinit "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cloudinit"
+	sdkcluster "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cluster"
+	sdkclusterstorage "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/clusterstorage"
+	sdknodes "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/nodes"
+	sdkqemu "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/qemu"
+	sdkstorage "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/storage"
+	sdktasks "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/tasks"
 )
 
 // TestSortedNetworkNames_NoDefault_Deterministic verifies that sortedNetworkNames
@@ -319,6 +331,423 @@ func TestNormalizeOSType(t *testing.T) {
 			got := normalizeOSType(tc.input)
 			if got != tc.want {
 				t.Errorf("normalizeOSType(%q) = %q; want %q", tc.input, got, tc.want)
+			}
+		})
+	}
+}
+
+// --------------------------------------------------------------------------
+// resolveVMShape — vmStorageType field
+// --------------------------------------------------------------------------
+
+// shapeTestClusterStorage is a minimal clusterstorage.Service stub that returns
+// a fixed list of storage entries from ListStorage. All other Service methods
+// panic — they are not reached by resolveVMShape/lookupVMStorageType.
+type shapeTestClusterStorage struct {
+	entries []map[string]any
+	err     error
+}
+
+func (s *shapeTestClusterStorage) ListStorage(_ context.Context, _ *sdkclusterstorage.ListStorageParams) (*sdkclusterstorage.ListStorageResponse, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	resp := make(sdkclusterstorage.ListStorageResponse, 0, len(s.entries))
+	for _, e := range s.entries {
+		raw, _ := json.Marshal(e)
+		resp = append(resp, raw)
+	}
+	return &resp, nil
+}
+func (s *shapeTestClusterStorage) CreateStorage(_ context.Context, _ *sdkclusterstorage.CreateStorageParams) (*sdkclusterstorage.CreateStorageResponse, error) {
+	panic("shapeTestClusterStorage.CreateStorage: not expected")
+}
+func (s *shapeTestClusterStorage) DeleteStorage(_ context.Context, _ string) error {
+	panic("shapeTestClusterStorage.DeleteStorage: not expected")
+}
+func (s *shapeTestClusterStorage) GetStorage(_ context.Context, _ string) (*sdkclusterstorage.GetStorageResponse, error) {
+	panic("shapeTestClusterStorage.GetStorage: not expected")
+}
+func (s *shapeTestClusterStorage) UpdateStorage(_ context.Context, _ string, _ *sdkclusterstorage.UpdateStorageParams) (*sdkclusterstorage.UpdateStorageResponse, error) {
+	panic("shapeTestClusterStorage.UpdateStorage: not expected")
+}
+
+// compile-time check: shapeTestClusterStorage satisfies clusterstorage.Service.
+var _ sdkclusterstorage.Service = (*shapeTestClusterStorage)(nil)
+
+// shapeTestPVEClient implements pve.Client with a configurable ClusterStorage.
+// All other service methods panic on call — they are not reached by resolveVMShape.
+type shapeTestPVEClient struct {
+	clusterStorageSvc sdkclusterstorage.Service
+}
+
+func (c *shapeTestPVEClient) QEMU() sdkqemu.Service { panic("shapeTestPVEClient.QEMU: not expected") }
+func (c *shapeTestPVEClient) Storage() sdkstorage.Service {
+	panic("shapeTestPVEClient.Storage: not expected")
+}
+func (c *shapeTestPVEClient) CloudInit() sdkcloudinit.Service {
+	panic("shapeTestPVEClient.CloudInit: not expected")
+}
+func (c *shapeTestPVEClient) Tasks() sdktasks.Service {
+	panic("shapeTestPVEClient.Tasks: not expected")
+}
+func (c *shapeTestPVEClient) Nodes() sdknodes.Service {
+	panic("shapeTestPVEClient.Nodes: not expected")
+}
+func (c *shapeTestPVEClient) Cluster() sdkcluster.Service {
+	panic("shapeTestPVEClient.Cluster: not expected")
+}
+func (c *shapeTestPVEClient) ClusterStorage() sdkclusterstorage.Service { return c.clusterStorageSvc }
+func (c *shapeTestPVEClient) Pools() pve.PoolService {
+	panic("shapeTestPVEClient.Pools: not expected")
+}
+
+// compile-time check: shapeTestPVEClient satisfies pve.Client.
+var _ pve.Client = (*shapeTestPVEClient)(nil)
+
+// minimalParsedArgs returns a *createVMParsedArgs with the stem fields needed
+// by resolveVMShape. stemcellStorage is used as the fallback vmStorage when
+// deps.Config.VMStorage is empty.
+func minimalParsedArgs(stemcellStorage string) *createVMParsedArgs {
+	return &createVMParsedArgs{
+		agentID:      "agent-test",
+		stemcellCID:  stemcellStorage + ":import/bosh-stemcell-test-1.0.qcow2",
+		rawCID:       stemcellStorage + ":import/bosh-stemcell-test-1.0.qcow2",
+		stemcellStor: stemcellStorage,
+		cloudProps: createVMCloudProps{
+			TargetNode: "pve",
+		},
+		networks: map[string]createVMNetworkSpec{},
+		env:      map[string]any{},
+	}
+}
+
+// TestResolveVMShape_StorageTypeLookup verifies that resolveVMShape populates
+// shape.vmStorageType from the cluster storage list when ClusterStorage is wired.
+func TestResolveVMShape_StorageTypeLookup(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name        string
+		configStor  string // deps.Config.VMStorage
+		storEntries []map[string]any
+		wantType    string
+	}{
+		{
+			name:       "dir_storage_resolved",
+			configStor: "local",
+			storEntries: []map[string]any{
+				{"storage": "local", "type": "dir"},
+				{"storage": "local-lvm", "type": "lvm"},
+			},
+			wantType: "dir",
+		},
+		{
+			name:       "lvm_storage_resolved",
+			configStor: "local-lvm",
+			storEntries: []map[string]any{
+				{"storage": "local", "type": "dir"},
+				{"storage": "local-lvm", "type": "lvm"},
+			},
+			wantType: "lvm",
+		},
+		{
+			name:       "nfs_storage_resolved",
+			configStor: "nfs-store",
+			storEntries: []map[string]any{
+				{"storage": "nfs-store", "type": "nfs"},
+			},
+			wantType: "nfs",
+		},
+		{
+			name:       "storage_not_in_index_returns_empty",
+			configStor: "missing-store",
+			storEntries: []map[string]any{
+				{"storage": "other", "type": "dir"},
+			},
+			wantType: "",
+		},
+		{
+			name:        "empty_index_returns_empty",
+			configStor:  "local",
+			storEntries: []map[string]any{},
+			wantType:    "",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			deps := Deps{
+				Config: &config.CPIConfig{
+					Node:           "pve",
+					VMStorage:      tc.configStor,
+					VMIDRangeStart: 100,
+				},
+				PVE: &shapeTestPVEClient{
+					clusterStorageSvc: &shapeTestClusterStorage{entries: tc.storEntries},
+				},
+			}
+
+			shape, err := resolveVMShape(context.Background(), deps, minimalParsedArgs("test-storage"))
+			if err != nil {
+				t.Fatalf("resolveVMShape returned error: %v", err)
+			}
+			if shape.vmStorageType != tc.wantType {
+				t.Errorf("vmStorageType = %q; want %q", shape.vmStorageType, tc.wantType)
+			}
+			if shape.vmStorage != tc.configStor {
+				t.Errorf("vmStorage = %q; want %q (config storage)", shape.vmStorage, tc.configStor)
+			}
+		})
+	}
+}
+
+// TestResolveVMShape_StorageTypeNilClusterStorage verifies that resolveVMShape
+// succeeds with vmStorageType="" when ClusterStorage() returns nil (e.g. test
+// mocks that don't wire cluster storage).
+func TestResolveVMShape_StorageTypeNilClusterStorage(t *testing.T) {
+	t.Parallel()
+
+	deps := Deps{
+		Config: &config.CPIConfig{
+			Node:           "pve",
+			VMStorage:      "local-lvm",
+			VMIDRangeStart: 100,
+		},
+		PVE: &shapeTestPVEClient{
+			clusterStorageSvc: nil, // not wired — simulates old mocks
+		},
+	}
+
+	shape, err := resolveVMShape(context.Background(), deps, minimalParsedArgs("test-storage"))
+	if err != nil {
+		t.Fatalf("resolveVMShape returned error: %v", err)
+	}
+	if shape.vmStorageType != "" {
+		t.Errorf("vmStorageType = %q; want empty string when ClusterStorage is nil", shape.vmStorageType)
+	}
+}
+
+// TestResolveVMShape_StorageTypeLookupError verifies that a ClusterStorage
+// ListStorage error leaves vmStorageType="" rather than propagating an error.
+// create_vm must not fail due to a storage-type lookup that does not affect the
+// import path.
+func TestResolveVMShape_StorageTypeLookupError(t *testing.T) {
+	t.Parallel()
+
+	deps := Deps{
+		Config: &config.CPIConfig{
+			Node:           "pve",
+			VMStorage:      "local-lvm",
+			VMIDRangeStart: 100,
+		},
+		PVE: &shapeTestPVEClient{
+			clusterStorageSvc: &shapeTestClusterStorage{
+				err: fmt.Errorf("PVE /storage: connection refused"),
+			},
+		},
+	}
+
+	shape, err := resolveVMShape(context.Background(), deps, minimalParsedArgs("test-storage"))
+	if err != nil {
+		t.Fatalf("resolveVMShape must not return error on storage-type lookup failure; got: %v", err)
+	}
+	if shape.vmStorageType != "" {
+		t.Errorf("vmStorageType = %q; want empty string on lookup error", shape.vmStorageType)
+	}
+}
+
+// TestResolveVMShape_StorageTypeFallbackToStemcellStorage verifies that when
+// Config.VMStorage is empty the vmStorage falls back to the stemcell's storage,
+// and vmStorageType is looked up for that fallback storage.
+func TestResolveVMShape_StorageTypeFallbackToStemcellStorage(t *testing.T) {
+	t.Parallel()
+
+	deps := Deps{
+		Config: &config.CPIConfig{
+			Node:           "pve",
+			VMStorage:      "", // not set — falls back to stemcell storage
+			VMIDRangeStart: 100,
+		},
+		PVE: &shapeTestPVEClient{
+			clusterStorageSvc: &shapeTestClusterStorage{
+				entries: []map[string]any{
+					{"storage": "stemcell-store", "type": "nfs"},
+				},
+			},
+		},
+	}
+
+	parsed := minimalParsedArgs("stemcell-store")
+	shape, err := resolveVMShape(context.Background(), deps, parsed)
+	if err != nil {
+		t.Fatalf("resolveVMShape returned error: %v", err)
+	}
+	if shape.vmStorage != "stemcell-store" {
+		t.Errorf("vmStorage = %q; want stemcell-store (stemcell fallback)", shape.vmStorage)
+	}
+	if shape.vmStorageType != "nfs" {
+		t.Errorf("vmStorageType = %q; want nfs (looked up for fallback storage)", shape.vmStorageType)
+	}
+}
+
+// --------------------------------------------------------------------------
+// extractSHA8FromFilename
+// --------------------------------------------------------------------------
+
+// TestExtractSHA8FromFilename verifies sha8 extraction from stemcell filenames.
+// The sha8 is the last "-"-delimited segment before ".qcow2". Filenames with
+// hyphens in the name or version segments must still extract the trailing sha8.
+func TestExtractSHA8FromFilename(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name     string
+		filename string
+		wantSHA8 string
+		wantOK   bool
+	}{
+		{
+			name:     "simple name and version",
+			filename: "bosh-stemcell-ubuntu-jammy-1.438-abc12345.qcow2",
+			wantSHA8: "abc12345",
+			wantOK:   true,
+		},
+		{
+			name:     "name with hyphens",
+			filename: "bosh-stemcell-ubuntu-jammy-noble-1.438-deadbeef.qcow2",
+			wantSHA8: "deadbeef",
+			wantOK:   true,
+		},
+		{
+			name:     "version with hyphens",
+			filename: "bosh-stemcell-centos-9-stream-1.0-456-cafe1234.qcow2",
+			wantSHA8: "cafe1234",
+			wantOK:   true,
+		},
+		{
+			name:     "uppercase hex letters",
+			filename: "bosh-stemcell-foo-bar-1.0-ABCDEF01.qcow2",
+			wantSHA8: "abcdef01",
+			wantOK:   true,
+		},
+		{
+			name:     "mixed-case hex letters",
+			filename: "bosh-stemcell-test-1.0-AbCd1234.qcow2",
+			wantSHA8: "abcd1234",
+			wantOK:   true,
+		},
+		{
+			name:     "no .qcow2 suffix",
+			filename: "bosh-stemcell-ubuntu-jammy-1.438-abc12345.raw",
+			wantSHA8: "",
+			wantOK:   false,
+		},
+		{
+			name:     "sha8 too short (7 chars)",
+			filename: "bosh-stemcell-foo-1.0-abc1234.qcow2",
+			wantSHA8: "",
+			wantOK:   false,
+		},
+		{
+			name:     "sha8 too long (9 chars)",
+			filename: "bosh-stemcell-foo-1.0-abc123456.qcow2",
+			wantSHA8: "",
+			wantOK:   false,
+		},
+		{
+			name:     "non-hex char in sha8 (g)",
+			filename: "bosh-stemcell-foo-1.0-abcg1234.qcow2",
+			wantSHA8: "",
+			wantOK:   false,
+		},
+		{
+			name:     "last segment wrong length (14 chars not 8)",
+			filename: "bosh-stemcell-foobababcdef12.qcow2",
+			wantSHA8: "",
+			wantOK:   false,
+		},
+		{
+			name:     "empty string",
+			filename: "",
+			wantSHA8: "",
+			wantOK:   false,
+		},
+		{
+			name:     "only .qcow2",
+			filename: ".qcow2",
+			wantSHA8: "",
+			wantOK:   false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			gotSHA8, gotOK := extractSHA8FromFilename(tc.filename)
+			if gotOK != tc.wantOK {
+				t.Errorf("extractSHA8FromFilename(%q): ok=%v, want %v", tc.filename, gotOK, tc.wantOK)
+			}
+			if gotSHA8 != tc.wantSHA8 {
+				t.Errorf("extractSHA8FromFilename(%q): sha8=%q, want %q", tc.filename, gotSHA8, tc.wantSHA8)
+			}
+		})
+	}
+}
+
+// TestExtractSHA8FromFilenameInCID verifies sha8 extraction from raw CIDs.
+func TestExtractSHA8FromFilenameInCID(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name     string
+		rawCID   string
+		wantSHA8 string
+		wantOK   bool
+	}{
+		{
+			name:     "valid CID with sha8",
+			rawCID:   "local:import/bosh-stemcell-ubuntu-jammy-1.438-abc12345.qcow2",
+			wantSHA8: "abc12345",
+			wantOK:   true,
+		},
+		{
+			name:     "light-stripped CID with sha8",
+			rawCID:   "test-storage:import/bosh-stemcell-ubuntu-jammy-noble-1.438-deadbeef.qcow2",
+			wantSHA8: "deadbeef",
+			wantOK:   true,
+		},
+		{
+			name:     "CID without .qcow2 suffix",
+			rawCID:   "local:import/bosh-stemcell-ubuntu-1.0-abc12345.raw",
+			wantSHA8: "",
+			wantOK:   false,
+		},
+		{
+			name:     "invalid CID (no colon)",
+			rawCID:   "notavolid",
+			wantSHA8: "",
+			wantOK:   false,
+		},
+		{
+			name:     "empty CID",
+			rawCID:   "",
+			wantSHA8: "",
+			wantOK:   false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			gotSHA8, gotOK := extractSHA8FromFilenameInCID(tc.rawCID)
+			if gotOK != tc.wantOK {
+				t.Errorf("extractSHA8FromFilenameInCID(%q): ok=%v, want %v", tc.rawCID, gotOK, tc.wantOK)
+			}
+			if gotSHA8 != tc.wantSHA8 {
+				t.Errorf("extractSHA8FromFilenameInCID(%q): sha8=%q, want %q", tc.rawCID, gotSHA8, tc.wantSHA8)
 			}
 		})
 	}

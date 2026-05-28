@@ -258,6 +258,7 @@ func (c *diskMockClient) Tasks() tasks.Service                   { return nil }
 func (c *diskMockClient) Nodes() nodes.Service                   { return nil }
 func (c *diskMockClient) Cluster() cluster.Service               { return nil }
 func (c *diskMockClient) ClusterStorage() clusterstorage.Service { return nil }
+func (c *diskMockClient) Pools() pve.PoolService                 { return nil }
 
 func newMockClientWithConfig(cfg map[string]any, err error) pve.Client {
 	return &diskMockClient{
@@ -385,6 +386,7 @@ func (c *diskClusterClient) Tasks() tasks.Service                   { return nil
 func (c *diskClusterClient) Nodes() nodes.Service                   { return nil }
 func (c *diskClusterClient) Cluster() cluster.Service               { return c.clusterSvc }
 func (c *diskClusterClient) ClusterStorage() clusterstorage.Service { return nil }
+func (c *diskClusterClient) Pools() pve.PoolService                 { return nil }
 
 // diskFakeCluster is a minimal cluster.Service that delegates ListResources
 // to an injected function.

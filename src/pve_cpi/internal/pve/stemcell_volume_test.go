@@ -510,6 +510,113 @@ func TestBuildLightStemcellCID(t *testing.T) {
 	}
 }
 
+// ---- Template-stemcell CID helpers (D-01) ----
+
+// TestBuildTemplateStemcellCID verifies the canonical encoding.
+func TestBuildTemplateStemcellCID(t *testing.T) {
+	t.Parallel()
+	got := pve.BuildTemplateStemcellCID(6042)
+	want := "template:6042"
+	if got != want {
+		t.Errorf("BuildTemplateStemcellCID(6042) = %q; want %q", got, want)
+	}
+}
+
+// TestTemplateStemcellCIDRoundTrip verifies build→parse round-trip.
+func TestTemplateStemcellCIDRoundTrip(t *testing.T) {
+	t.Parallel()
+	cid := pve.BuildTemplateStemcellCID(6042)
+	vmid, err := pve.ParseTemplateStemcellCID(cid)
+	if err != nil {
+		t.Fatalf("ParseTemplateStemcellCID(%q) unexpected error: %v", cid, err)
+	}
+	if vmid != 6042 {
+		t.Errorf("round-trip VMID = %d; want 6042", vmid)
+	}
+}
+
+// TestIsTemplateStemcellCID covers the full predicate matrix from plan/P2 §B1.
+func TestIsTemplateStemcellCID(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		cid  string
+		want bool
+	}{
+		{name: "happy path", cid: "template:6042", want: true},
+		{name: "min valid VMID", cid: "template:1", want: true},
+		{name: "large VMID", cid: "template:999999999", want: true},
+		{name: "empty string", cid: "", want: false},
+		{name: "prefix only (empty remainder)", cid: "template:", want: false},
+		{name: "non-digit remainder", cid: "template:abc", want: false},
+		{name: "decimal in remainder", cid: "template:6.5", want: false},
+		{name: "negative VMID", cid: "template:-1", want: false},
+		{name: "nested prefix", cid: "template:template:6042", want: false},
+		{name: "light CID not template", cid: "light:nfs:import/x", want: false},
+		{name: "legacy integer no prefix", cid: "5042", want: false},
+		{name: "plain volume CID", cid: "local:import/x", want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := pve.IsTemplateStemcellCID(tc.cid); got != tc.want {
+				t.Errorf("IsTemplateStemcellCID(%q) = %v; want %v", tc.cid, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestParseTemplateStemcellCID covers valid and all rejection cases from plan/P2 §B1.
+func TestParseTemplateStemcellCID(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name    string
+		cid     string
+		wantID  int64
+		wantErr bool
+	}{
+		{name: "happy path", cid: "template:6042", wantID: 6042},
+		{name: "min positive VMID", cid: "template:1", wantID: 1},
+		{name: "large VMID", cid: "template:8999", wantID: 8999},
+		{name: "empty string", cid: "", wantErr: true},
+		{name: "prefix only", cid: "template:", wantErr: true},
+		{name: "non-digit remainder", cid: "template:abc", wantErr: true},
+		{name: "decimal", cid: "template:6.5", wantErr: true},
+		{name: "negative VMID", cid: "template:-1", wantErr: true},
+		{name: "nested prefix", cid: "template:template:6042", wantErr: true},
+		{name: "light CID", cid: "light:nfs:import/x", wantErr: true},
+		{name: "legacy integer", cid: "5042", wantErr: true},
+		{name: "plain volume CID", cid: "local:import/x", wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			vmid, err := pve.ParseTemplateStemcellCID(tc.cid)
+			if tc.wantErr {
+				if err == nil {
+					t.Errorf("ParseTemplateStemcellCID(%q) = %d, nil; want error", tc.cid, vmid)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ParseTemplateStemcellCID(%q) unexpected error: %v", tc.cid, err)
+			}
+			if vmid != tc.wantID {
+				t.Errorf("ParseTemplateStemcellCID(%q) = %d; want %d", tc.cid, vmid, tc.wantID)
+			}
+		})
+	}
+}
+
+// TestParseStemcellCID_RejectsTemplateCID is a regression assertion: the old
+// ParseStemcellCID must return an error for "template:6042" so that template
+// CIDs are NOT silently misrouted through the legacy volume path.
+func TestParseStemcellCID_RejectsTemplateCID(t *testing.T) {
+	t.Parallel()
+	_, _, err := pve.ParseStemcellCID("template:6042")
+	if err == nil {
+		t.Fatal("ParseStemcellCID(\"template:6042\") = nil error; want rejection so template CIDs are not misrouted as volume CIDs")
+	}
+}
+
 func TestParseLightStemcellCID(t *testing.T) {
 	cases := []struct {
 		name        string

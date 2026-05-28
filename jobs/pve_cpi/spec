@@ -150,6 +150,47 @@ properties:
       [vmid_range_start, vmid_range_end]. Default 5999. Must be > vmid_range_start
       and <= 9999. Persistent disks use synthetic VMIDs 9000-9999 (unaffected).
     default: 5999
+  pve.stemcell_template_vmid_range_start:
+    description: |
+      Starting VMID for template VM allocation. Template VMs are allocated in
+      [stemcell_template_vmid_range_start, stemcell_template_vmid_range_end].
+      When unset (0), the CPI derives the start as vmid_range_end+1; with the
+      default VM range (vmid_range_end=5999) this yields 6000. Must not overlap
+      with vmid_range_start..vmid_range_end (VM range) or the persistent disk
+      range 9000-9999.
+    default: 0
+  pve.stemcell_template_vmid_range_end:
+    description: |
+      Inclusive upper bound of the VMID range for template VM allocation.
+      When unset (0), defaults to 8999. Must be > stemcell_template_vmid_range_start
+      and <= 8999. Must not overlap the persistent disk range 9000-9999.
+    default: 0
+  pve.stemcell_template_pool:
+    description: |
+      Optional PVE resource pool name to assign to newly created template VMs.
+      When empty (default), templates are not assigned to any pool. The PVE API
+      validates pool existence at assignment time; an invalid pool name causes
+      create_stemcell to return an error. No effect when absent.
+    default: ""
+  pve.stemcell_template_node:
+    description: |
+      Optional PVE node on which template VMs are created. When empty (default),
+      falls back to pve.node. Useful when stemcell_storage is on shared storage
+      accessible to multiple nodes but template creation should be pinned to one
+      specific node. When using local stemcell_storage (dir, zfspool, lvmthin, or
+      lvm), this must equal the node where stemcell_storage is mounted; pointing
+      to a different node causes create_stemcell to fail because the uploaded
+      qcow2 is not visible from the other node.
+    default: ""
+  pve.clone_mode:
+    description: |
+      Controls the clone type used when create_vm clones a stemcell template.
+      "auto" (default when unset): linked clone for snapshot-capable backends
+      (dir, nfs, cifs, zfspool, lvmthin, rbd, cephfs); full clone for lvm-thick
+      (linked clone not supported on lvm-thick). "linked": force linked clone;
+      returns an error if the backing storage is lvm-thick. "full": force full
+      clone on all backends. One of auto|linked|full.
+    default: ""
   pve.allow_disk_ops_with_snapshots:
     description: |
       When true, bypasses the snapshot pre-flight guard in attach_disk, detach_disk,

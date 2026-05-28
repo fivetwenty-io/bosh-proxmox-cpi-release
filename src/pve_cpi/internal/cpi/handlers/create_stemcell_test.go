@@ -34,6 +34,12 @@ import (
 // Mock infrastructure shared across stemcell test files.
 // ============================================================
 
+// noopPoolService is a PoolService whose AddVM is a silent no-op.
+// Used by mocks when pool assignment is not under test.
+type noopPoolService struct{}
+
+func (n *noopPoolService) AddVM(_ context.Context, _ string, _ int64) error { return nil }
+
 // stemcellMockClient implements pve.Client. All services default to no-ops or
 // embed the interface (panics on unknown calls).
 type stemcellMockClient struct {
@@ -43,6 +49,8 @@ type stemcellMockClient struct {
 	clusterSvc        sdkcluster.Service
 	storageSvc        sdkstorage.Service
 	clusterStorageSvc sdkclusterstorage.Service
+	// poolsSvc controls pool assignment; nil uses noopPoolService (silent no-op).
+	poolsSvc pve.PoolService
 }
 
 func (m *stemcellMockClient) QEMU() sdkqemu.Service           { return m.qemuSvc }
@@ -53,6 +61,12 @@ func (m *stemcellMockClient) Nodes() sdknodes.Service         { return m.nodesSv
 func (m *stemcellMockClient) Cluster() sdkcluster.Service     { return m.clusterSvc }
 func (m *stemcellMockClient) ClusterStorage() sdkclusterstorage.Service {
 	return m.clusterStorageSvc
+}
+func (m *stemcellMockClient) Pools() pve.PoolService {
+	if m.poolsSvc != nil {
+		return m.poolsSvc
+	}
+	return &noopPoolService{}
 }
 
 // stemcellMockClusterStorage satisfies sdkclusterstorage.Service.
@@ -119,12 +133,19 @@ func (m *stemcellMockQEMU) Config(ctx context.Context, node string, vmid int) (m
 
 // stemcellMockNodes satisfies sdknodes.Service for create_stemcell tests.
 // UpdateQemuConfig and DeleteQemu are wired for legacy compat;
-// ListStorageContent is wired for the dedup path.
+// ListStorageContent is wired for the dedup path;
+// ListQemu is wired for FindTemplateByName (ensureTemplateVM idempotency).
 type stemcellMockNodes struct {
 	sdknodes.Service // embed nil — panics on unmocked methods
 	updateConfigFn   func(ctx context.Context, node, vmid string, params *sdknodes.UpdateQemuConfigParams) error
 	deleteQemuFn     func(ctx context.Context, node, vmid string, params *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error)
 	listStorageFn    func(ctx context.Context, node, storage string, params *sdknodes.ListStorageContentParams) (*sdknodes.ListStorageContentResponse, error)
+	// listQemuFn is called by FindTemplateByName inside ensureTemplateVM.
+	// Default (nil): returns an empty list (no templates found).
+	listQemuFn func(ctx context.Context, node string, params *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error)
+	// createQemuTemplateFn is called by MakeTemplate inside ensureTemplateVM.
+	// Default (nil): returns synchronous success with no UPID.
+	createQemuTemplateFn func(ctx context.Context, node, vmid string, params *sdknodes.CreateQemuTemplateParams) (*sdknodes.CreateQemuTemplateResponse, error)
 }
 
 func (m *stemcellMockNodes) UpdateQemuConfig(ctx context.Context, node, vmid string, params *sdknodes.UpdateQemuConfigParams) error {
@@ -149,6 +170,27 @@ func (m *stemcellMockNodes) ListStorageContent(ctx context.Context, node, storag
 	// Default: empty — no existing volumes.
 	empty := sdknodes.ListStorageContentResponse{}
 	return &empty, nil
+}
+
+func (m *stemcellMockNodes) ListQemu(ctx context.Context, node string, params *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
+	if m.listQemuFn != nil {
+		return m.listQemuFn(ctx, node, params)
+	}
+	// Default: empty list — no templates found; ensureTemplateVM proceeds to create.
+	empty := sdknodes.ListQemuResponse{}
+	return &empty, nil
+}
+
+// createQemuTemplateFn is the optional fn backing CreateQemuTemplate in stemcellMockNodes.
+// createQemuTemplateFn field is added below inside stemcellMockNodes; this
+// method routes through it so MakeTemplate (pve.MakeTemplate) can be tested.
+func (m *stemcellMockNodes) CreateQemuTemplate(ctx context.Context, node, vmid string, params *sdknodes.CreateQemuTemplateParams) (*sdknodes.CreateQemuTemplateResponse, error) {
+	if m.createQemuTemplateFn != nil {
+		return m.createQemuTemplateFn(ctx, node, vmid, params)
+	}
+	// Default: synchronous success, no UPID (freeze completed immediately).
+	raw := sdknodes.CreateQemuTemplateResponse(`""`)
+	return &raw, nil
 }
 
 // stemcellMockTasks satisfies sdktasks.Service. Always returns OK by default.
@@ -360,12 +402,20 @@ func TestCreateStemcell_HappyPath_NewFlow(t *testing.T) {
 		t.Fatalf("result is %T; want string", result)
 	}
 
-	wantFilename := "bosh-stemcell-ubuntu-jammy-1.234-" + sha8 + ".qcow2"
-	wantCID := "local:import/" + wantFilename
-	if cidStr != wantCID {
-		t.Errorf("CID = %q; want %q", cidStr, wantCID)
+	// New flow: handler builds a PVE template VM and returns "template:<vmid>".
+	if !pve.IsTemplateStemcellCID(cidStr) {
+		t.Errorf("CID = %q; want template:<vmid> format", cidStr)
+	}
+	vmid, parseErr := pve.ParseTemplateStemcellCID(cidStr)
+	if parseErr != nil {
+		t.Fatalf("ParseTemplateStemcellCID(%q) failed: %v", cidStr, parseErr)
+	}
+	if vmid <= 0 {
+		t.Errorf("parsed vmid = %d; want positive VMID", vmid)
 	}
 
+	// Upload still happens: qcow2 is staged to storage before template creation.
+	wantFilename := "bosh-stemcell-ubuntu-jammy-1.234-" + sha8 + ".qcow2"
 	if len(uploads) != 1 {
 		t.Fatalf("expected 1 Upload call, got %d: %v", len(uploads), uploads)
 	}
@@ -377,8 +427,11 @@ func TestCreateStemcell_HappyPath_NewFlow(t *testing.T) {
 	}
 }
 
-// TestCreateStemcell_Dedup_SameFilename verifies that when ListStorageContent
-// returns a matching volid, Upload is not called and the existing CID is returned.
+// TestCreateStemcell_Dedup_SameFilename verifies that when the qcow2 volume
+// already exists on storage AND a matching template VM already exists,
+// Upload is not called and the handler returns the existing template CID.
+// Idempotency is now at the template level: the same name+version always
+// maps to the same template VMID via FindTemplateByName.
 func TestCreateStemcell_Dedup_SameFilename(t *testing.T) {
 	t.Parallel()
 
@@ -388,6 +441,12 @@ func TestCreateStemcell_Dedup_SameFilename(t *testing.T) {
 	wantFilename := "bosh-stemcell-ubuntu-jammy-1.234-" + sha8 + ".qcow2"
 	existingVolid := "local:import/" + wantFilename
 
+	// existingVMID is the VMID of the pre-existing template. FindTemplateByName
+	// will return this so ensureTemplateVM reuses it without creating a new VM.
+	const existingVMID = int64(6042)
+	templateName := pve.BuildTemplateName("ubuntu-jammy", "1.234")
+	isTemplate := true
+
 	var uploadCalls []struct{}
 	storageSvc := &stemcellMockStorage{
 		uploadFn: func(_ context.Context, _, _, _, _ string, _ io.Reader) (string, error) {
@@ -396,11 +455,22 @@ func TestCreateStemcell_Dedup_SameFilename(t *testing.T) {
 		},
 	}
 
-	// ListStorageContent returns the matching entry.
+	// ListStorageContent returns the matching qcow2 volume (dedup hit).
+	// ListQemu returns the matching template (FindTemplateByName hit).
 	nodesSvc := &stemcellMockNodes{
 		listStorageFn: func(_ context.Context, _, _ string, _ *sdknodes.ListStorageContentParams) (*sdknodes.ListStorageContentResponse, error) {
 			entry, _ := json.Marshal(map[string]string{"volid": existingVolid})
 			resp := sdknodes.ListStorageContentResponse{entry}
+			return &resp, nil
+		},
+		listQemuFn: func(_ context.Context, _ string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
+			name := templateName
+			item, _ := json.Marshal(map[string]any{
+				"vmid":     existingVMID,
+				"name":     name,
+				"template": isTemplate,
+			})
+			resp := sdknodes.ListQemuResponse{item}
 			return &resp, nil
 		},
 	}
@@ -422,8 +492,16 @@ func TestCreateStemcell_Dedup_SameFilename(t *testing.T) {
 	if !ok {
 		t.Fatalf("result is %T; want string", result)
 	}
-	if cidStr != existingVolid {
-		t.Errorf("CID = %q; want existing volid %q", cidStr, existingVolid)
+	// Dedup returns the existing template CID, not the raw volid.
+	if !pve.IsTemplateStemcellCID(cidStr) {
+		t.Errorf("CID = %q; want template:<vmid> format", cidStr)
+	}
+	vmid, parseErr := pve.ParseTemplateStemcellCID(cidStr)
+	if parseErr != nil {
+		t.Fatalf("ParseTemplateStemcellCID(%q) failed: %v", cidStr, parseErr)
+	}
+	if vmid != existingVMID {
+		t.Errorf("CID vmid = %d; want existing template VMID %d", vmid, existingVMID)
 	}
 	if len(uploadCalls) != 0 {
 		t.Error("Upload called despite dedup hit; should be skipped")
@@ -698,15 +776,16 @@ func TestCreateStemcell_OpenstackRawTranslatedToRaw(t *testing.T) {
 	}
 }
 
-// TestCreateStemcell_CIDFormat verifies the returned CID matches the canonical
-// "<storage>:import/<filename>" format and that the filename encodes name,
-// version, and sha8 predictably.
+// TestCreateStemcell_CIDFormat verifies the returned CID is a valid template CID
+// ("template:<vmid>") with a positive VMID. The qcow2 filename (encoding name,
+// version, and sha8) is an internal staging detail used by ensureTemplateVM but
+// is not exposed in the returned CID — the CID now identifies the template VM
+// rather than the raw upload volume.
 func TestCreateStemcell_CIDFormat(t *testing.T) {
 	t.Parallel()
 
 	imgPath := tempImageFile(t)
-	wantSHA := computeFileSHA(t, imgPath)
-	sha8 := wantSHA[:8]
+	_ = computeFileSHA(t, imgPath) // ensure file is readable; sha is internal only
 
 	storageSvc := &stemcellMockStorage{
 		uploadFn: func(_ context.Context, _, _, _, _ string, body io.Reader) (string, error) {
@@ -733,26 +812,16 @@ func TestCreateStemcell_CIDFormat(t *testing.T) {
 		t.Fatalf("result is %T; want string", result)
 	}
 
-	wantPrefix := "local:import/bosh-stemcell-ubuntu-jammy-1.234-"
-	if !strings.Contains(cid, wantPrefix) {
-		t.Errorf("CID %q does not start with %q", cid, wantPrefix)
+	// CID must be a template CID and parse to a positive VMID.
+	if !pve.IsTemplateStemcellCID(cid) {
+		t.Errorf("CID %q is not a template CID; want template:<vmid> format", cid)
 	}
-	if !strings.Contains(cid, sha8) {
-		t.Errorf("CID %q does not contain sha8 %q", cid, sha8)
-	}
-	if !strings.Contains(cid, ".qcow2") {
-		t.Errorf("CID %q does not end with .qcow2", cid)
-	}
-	// CID must parse successfully via ParseStemcellCID.
-	storage, volPath, parseErr := pve.ParseStemcellCID(cid)
+	vmid, parseErr := pve.ParseTemplateStemcellCID(cid)
 	if parseErr != nil {
-		t.Fatalf("ParseStemcellCID(%q) failed: %v", cid, parseErr)
+		t.Fatalf("ParseTemplateStemcellCID(%q) failed: %v", cid, parseErr)
 	}
-	if storage != "local" {
-		t.Errorf("parsed storage = %q; want %q", storage, "local")
-	}
-	if !strings.Contains(volPath, "import/") {
-		t.Errorf("parsed volumePath = %q; does not start with import/", volPath)
+	if vmid <= 0 {
+		t.Errorf("parsed vmid = %d; want positive VMID", vmid)
 	}
 }
 
@@ -799,8 +868,17 @@ func TestCreateStemcell_QCow2FileBarePassthrough(t *testing.T) {
 	if !ok {
 		t.Fatalf("result is %T; want string", result)
 	}
-	if !strings.Contains(cid, "local:import/bosh-stemcell-ubuntu-focal-99.1-") {
-		t.Errorf("CID %q does not match expected prefix", cid)
+	// Bare qcow2 passthrough still produces a template CID — the handler builds
+	// a PVE template VM from the uploaded image regardless of input format.
+	if !pve.IsTemplateStemcellCID(cid) {
+		t.Errorf("CID %q is not a template CID; want template:<vmid> format", cid)
+	}
+	vmid, parseErr := pve.ParseTemplateStemcellCID(cid)
+	if parseErr != nil {
+		t.Fatalf("ParseTemplateStemcellCID(%q) failed: %v", cid, parseErr)
+	}
+	if vmid <= 0 {
+		t.Errorf("parsed vmid = %d; want positive VMID", vmid)
 	}
 }
 
@@ -1329,7 +1407,7 @@ func emptyVolumeListFn() func(_ context.Context, _, _ string, _ *sdknodes.ListSt
 
 // TestHandleCreateStemcell_LightPreUploaded_HappyPath verifies the end-to-end
 // success path: valid image_id, shared NFS storage on a single-node cluster,
-// file found on PVE — handler returns a "light:" CID, no upload occurs.
+// file found on PVE — handler returns a "template:<vmid>" CID, no upload occurs.
 func TestHandleCreateStemcell_LightPreUploaded_HappyPath(t *testing.T) {
 	t.Parallel()
 
@@ -1367,9 +1445,16 @@ func TestHandleCreateStemcell_LightPreUploaded_HappyPath(t *testing.T) {
 	if !ok {
 		t.Fatalf("result is %T; want string", result)
 	}
-	wantCID := "light:" + imageID
-	if cid != wantCID {
-		t.Errorf("CID = %q; want %q", cid, wantCID)
+	// Light-preuploaded now builds a PVE template VM and returns a template CID.
+	if !pve.IsTemplateStemcellCID(cid) {
+		t.Errorf("CID = %q; want template:<vmid> format", cid)
+	}
+	vmid, parseErr := pve.ParseTemplateStemcellCID(cid)
+	if parseErr != nil {
+		t.Fatalf("ParseTemplateStemcellCID(%q) failed: %v", cid, parseErr)
+	}
+	if vmid <= 0 {
+		t.Errorf("parsed vmid = %d; want positive VMID", vmid)
 	}
 	if len(uploadCalls) != 0 {
 		t.Error("Upload called for light stemcell; must be skipped")
@@ -1531,8 +1616,16 @@ func TestHandleCreateStemcell_LightPreUploaded_LocalSingleNodeAccepted(t *testin
 	if !ok {
 		t.Fatalf("result is %T; want string", result)
 	}
-	if !strings.Contains(cid, "light:") {
-		t.Errorf("CID %q missing 'light:' prefix", cid)
+	// Light-preuploaded now returns a template CID.
+	if !pve.IsTemplateStemcellCID(cid) {
+		t.Errorf("CID %q is not a template CID; want template:<vmid> format", cid)
+	}
+	vmid2, parseErr := pve.ParseTemplateStemcellCID(cid)
+	if parseErr != nil {
+		t.Fatalf("ParseTemplateStemcellCID(%q) failed: %v", cid, parseErr)
+	}
+	if vmid2 <= 0 {
+		t.Errorf("parsed vmid = %d; want positive VMID", vmid2)
 	}
 }
 
@@ -1568,13 +1661,23 @@ func TestHandleCreateStemcell_LightPreUploaded_AnyStorageAccepted(t *testing.T) 
 	if !ok {
 		t.Fatalf("result is %T; want string", result)
 	}
-	if !strings.Contains(cid, "light:") {
-		t.Errorf("CID %q missing 'light:' prefix", cid)
+	// Light-preuploaded now returns a template CID. The storage-policy acceptance
+	// (any shared-file storage is accepted) is still validated — only the CID
+	// format changes from "light:..." to "template:<vmid>".
+	if !pve.IsTemplateStemcellCID(cid) {
+		t.Errorf("CID %q is not a template CID; want template:<vmid> format", cid)
+	}
+	vmid, parseErr := pve.ParseTemplateStemcellCID(cid)
+	if parseErr != nil {
+		t.Fatalf("ParseTemplateStemcellCID(%q) failed: %v", cid, parseErr)
+	}
+	if vmid <= 0 {
+		t.Errorf("parsed vmid = %d; want positive VMID", vmid)
 	}
 }
 
 // TestHandleCreateStemcell_LightPreUploaded_StorageMatchSuccess verifies that
-// shared-file storage is accepted and produces a valid light: CID.
+// shared-file storage is accepted and produces a valid template CID.
 func TestHandleCreateStemcell_LightPreUploaded_StorageMatchSuccess(t *testing.T) {
 	t.Parallel()
 
@@ -1600,8 +1703,16 @@ func TestHandleCreateStemcell_LightPreUploaded_StorageMatchSuccess(t *testing.T)
 		t.Fatalf("unexpected error when storage matches config: %v", err)
 	}
 	cid, _ := result.(string)
-	if !strings.Contains(cid, "light:") {
-		t.Errorf("CID %q missing 'light:' prefix", cid)
+	// Light-preuploaded now returns a template CID, not a light: CID.
+	if !pve.IsTemplateStemcellCID(cid) {
+		t.Errorf("CID %q is not a template CID; want template:<vmid> format", cid)
+	}
+	vmid, parseErr := pve.ParseTemplateStemcellCID(cid)
+	if parseErr != nil {
+		t.Fatalf("ParseTemplateStemcellCID(%q) failed: %v", cid, parseErr)
+	}
+	if vmid <= 0 {
+		t.Errorf("parsed vmid = %d; want positive VMID", vmid)
 	}
 }
 
@@ -1662,8 +1773,9 @@ func TestHandleCreateStemcell_LightFetch_BlockStorageRejected(t *testing.T) {
 }
 
 // TestHandleCreateStemcell_LightPreUploaded_LightPrefixStripped verifies that
-// an image_id that already has the "light:" prefix is accepted (prefix is stripped
-// before parsing, so the volid parse succeeds).
+// an image_id that already has the "light:" prefix is accepted (the prefix is
+// stripped from the INPUT before volid parsing, so the handler succeeds).
+// The returned CID is a template CID ("template:<vmid>"), not a light: CID.
 func TestHandleCreateStemcell_LightPreUploaded_LightPrefixStripped(t *testing.T) {
 	t.Parallel()
 
@@ -1690,8 +1802,17 @@ func TestHandleCreateStemcell_LightPreUploaded_LightPrefixStripped(t *testing.T)
 		t.Fatalf("unexpected error when image_id has light: prefix: %v", err)
 	}
 	cid, _ := result.(string)
-	if !strings.Contains(cid, "light:") {
-		t.Errorf("CID %q missing 'light:' prefix", cid)
+	// Input light: prefix is stripped before parsing; the returned CID is a
+	// template CID (handler builds a PVE template from the preuploaded qcow2).
+	if !pve.IsTemplateStemcellCID(cid) {
+		t.Errorf("CID %q is not a template CID; want template:<vmid> format", cid)
+	}
+	vmid, parseErr := pve.ParseTemplateStemcellCID(cid)
+	if parseErr != nil {
+		t.Fatalf("ParseTemplateStemcellCID(%q) failed: %v", cid, parseErr)
+	}
+	if vmid <= 0 {
+		t.Errorf("parsed vmid = %d; want positive VMID", vmid)
 	}
 }
 

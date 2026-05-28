@@ -2,6 +2,7 @@
 package pve
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"strings"
@@ -21,6 +22,16 @@ import (
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 )
 
+// PoolService manages PVE resource pool membership.
+// PVE resource pools group VMs and containers for ACL/billing purposes.
+// The only operation the CPI needs is adding a VM to a named pool after creation.
+type PoolService interface {
+	// AddVM assigns vmid to the resource pool identified by poolID.
+	// Corresponds to PUT /pools/{poolid} with vms=[vmid].
+	// Returns an error when the pool does not exist or the PVE API rejects the call.
+	AddVM(ctx context.Context, poolID string, vmid int64) error
+}
+
 // Client wraps SDK services for mockability.
 type Client interface {
 	QEMU() qemu.Service
@@ -33,6 +44,8 @@ type Client interface {
 	// all storages across the cluster (StorageLister implementation for
 	// StorageInfoCache).
 	ClusterStorage() clusterstorage.Service
+	// Pools returns the resource pool service for pool membership management.
+	Pools() PoolService
 }
 
 // sdkClient is the concrete implementation returned by NewClient.
@@ -44,6 +57,7 @@ type sdkClient struct {
 	nodesSvc          nodes.Service
 	clusterSvc        cluster.Service
 	clusterStorageSvc clusterstorage.Service
+	poolsSvc          PoolService
 }
 
 func (c *sdkClient) QEMU() qemu.Service                     { return c.qemuSvc }
@@ -53,6 +67,36 @@ func (c *sdkClient) Tasks() tasks.Service                   { return c.tasksSvc 
 func (c *sdkClient) Nodes() nodes.Service                   { return c.nodesSvc }
 func (c *sdkClient) Cluster() cluster.Service               { return c.clusterSvc }
 func (c *sdkClient) ClusterStorage() clusterstorage.Service { return c.clusterStorageSvc }
+func (c *sdkClient) Pools() PoolService                     { return c.poolsSvc }
+
+// sdkPoolService implements PoolService using the raw SDK client via PutCtx.
+// PVE resource pool membership is managed via PUT /pools/{poolid} with a JSON
+// body containing vms=[vmid]. This endpoint is not exposed in the generated
+// nodes/cluster SDK packages, so we use the raw client directly.
+type sdkPoolService struct {
+	raw sdkclient.Client
+}
+
+// AddVM assigns vmid to the named PVE resource pool via PUT /pools/{poolid}.
+// Input validation: poolID empty → error. vmid <= 0 → error.
+// PVE API error (pool not found, auth failure, etc.) → wrapped error returned.
+func (s *sdkPoolService) AddVM(ctx context.Context, poolID string, vmid int64) error {
+	if poolID == "" {
+		return cpierrors.Cloud("PoolService.AddVM: poolID must not be empty")
+	}
+	if vmid <= 0 {
+		return cpierrors.Cloud("PoolService.AddVM: vmid must be a positive integer, got %d", vmid)
+	}
+	path := fmt.Sprintf("/pools/%s", poolID)
+	params := map[string]interface{}{
+		"vms": fmt.Sprintf("%d", vmid),
+	}
+	_, err := s.raw.PutCtx(ctx, path, params)
+	if err != nil {
+		return cpierrors.Wrap(err, fmt.Sprintf("PoolService.AddVM: assign vmid %d to pool %q", vmid, poolID))
+	}
+	return nil
+}
 
 // NewClient constructs a Client from CPIConfig.
 // Selects auth: APIToken if non-empty else User+Password+Realm.
@@ -157,5 +201,6 @@ func NewClient(cfg *config.CPIConfig, logger *log.Logger) (Client, error) {
 		nodesSvc:          nodes.New(raw),
 		clusterSvc:        cluster.New(raw),
 		clusterStorageSvc: clusterstorage.New(raw),
+		poolsSvc:          &sdkPoolService{raw: raw},
 	}, nil
 }

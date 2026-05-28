@@ -12,6 +12,7 @@ import (
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/agent"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/cpi/handlers"
+	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cloudinit"
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cluster"
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/clusterstorage"
@@ -34,12 +35,13 @@ const (
 
 // mockPVEClient implements pve.Client for tests.
 type mockPVEClient struct {
-	qemuSvc      qemu.Service
-	nodesSvc     nodes.Service
-	tasksSvc     tasks.Service
-	storageSvc   storage.Service
-	cloudInitSvc cloudinit.Service
-	clusterSvc   cluster.Service
+	qemuSvc           qemu.Service
+	nodesSvc          nodes.Service
+	tasksSvc          tasks.Service
+	storageSvc        storage.Service
+	cloudInitSvc      cloudinit.Service
+	clusterSvc        cluster.Service
+	clusterStorageSvc clusterstorage.Service
 }
 
 func (m *mockPVEClient) QEMU() qemu.Service                     { return m.qemuSvc }
@@ -48,7 +50,8 @@ func (m *mockPVEClient) Tasks() tasks.Service                   { return m.tasks
 func (m *mockPVEClient) Storage() storage.Service               { return m.storageSvc }
 func (m *mockPVEClient) CloudInit() cloudinit.Service           { return m.cloudInitSvc }
 func (m *mockPVEClient) Cluster() cluster.Service               { return m.clusterSvc }
-func (m *mockPVEClient) ClusterStorage() clusterstorage.Service { return nil }
+func (m *mockPVEClient) ClusterStorage() clusterstorage.Service { return m.clusterStorageSvc }
+func (m *mockPVEClient) Pools() pve.PoolService                 { return nil }
 
 // --------------------------------------------------------------------------
 // mockQEMUService
@@ -640,8 +643,9 @@ func (m *mockBridgeNodes) UpdateNetwork(ctx context.Context, node string, params
 // Set listResourcesFn / listStatusFn to override behavior for specific tests.
 type mockClusterSvc struct {
 	mockSDNCluster
-	listResourcesFn func(ctx context.Context, params *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error)
-	listStatusFn    func(ctx context.Context) (*cluster.ListStatusResponse, error)
+	listResourcesFn   func(ctx context.Context, params *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error)
+	listStatusFn      func(ctx context.Context) (*cluster.ListStatusResponse, error)
+	listConfigNodesFn func(ctx context.Context) (*cluster.ListConfigNodesResponse, error)
 }
 
 var _ cluster.Service = (*mockClusterSvc)(nil)
@@ -663,6 +667,54 @@ func (m *mockClusterSvc) ListStatus(ctx context.Context) (*cluster.ListStatusRes
 	}
 	panic("mockClusterSvc.ListStatus: not configured")
 }
+
+func (m *mockClusterSvc) ListConfigNodes(ctx context.Context) (*cluster.ListConfigNodesResponse, error) {
+	if m.listConfigNodesFn != nil {
+		return m.listConfigNodesFn(ctx)
+	}
+	// Default: single-node cluster (one entry). Tests exercising multi-node
+	// topology must set listConfigNodesFn explicitly.
+	raw, _ := json.Marshal(map[string]any{"node": "pve-node1"})
+	resp := cluster.ListConfigNodesResponse{raw}
+	return &resp, nil
+}
+
+// mockClusterStorage is a minimal clusterstorage.Service stub for create_vm
+// template dispatch tests. It reports a single named storage entry.
+type mockClusterStorage struct {
+	storageName string
+	storageType string
+	shared      bool
+}
+
+func (s *mockClusterStorage) ListStorage(_ context.Context, _ *clusterstorage.ListStorageParams) (*clusterstorage.ListStorageResponse, error) {
+	sharedInt := 0
+	if s.shared {
+		sharedInt = 1
+	}
+	raw, _ := json.Marshal(map[string]any{
+		"storage": s.storageName,
+		"type":    s.storageType,
+		"shared":  sharedInt,
+	})
+	resp := clusterstorage.ListStorageResponse{json.RawMessage(raw)}
+	return &resp, nil
+}
+
+func (s *mockClusterStorage) CreateStorage(_ context.Context, _ *clusterstorage.CreateStorageParams) (*clusterstorage.CreateStorageResponse, error) {
+	panic("mockClusterStorage.CreateStorage: not expected")
+}
+func (s *mockClusterStorage) DeleteStorage(_ context.Context, _ string) error {
+	panic("mockClusterStorage.DeleteStorage: not expected")
+}
+func (s *mockClusterStorage) GetStorage(_ context.Context, _ string) (*clusterstorage.GetStorageResponse, error) {
+	panic("mockClusterStorage.GetStorage: not expected")
+}
+func (s *mockClusterStorage) UpdateStorage(_ context.Context, _ string, _ *clusterstorage.UpdateStorageParams) (*clusterstorage.UpdateStorageResponse, error) {
+	panic("mockClusterStorage.UpdateStorage: not expected")
+}
+
+var _ clusterstorage.Service = (*mockClusterStorage)(nil)
 
 // clusterVMOnNode builds a ListResourcesResponse placing vmid on node.
 // Used to feed FindVMNodeViaCluster in tests that need the cluster scan to

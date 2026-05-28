@@ -35,6 +35,7 @@ func (b *backendTestClient) Tasks() tasks.Service                   { return nil
 func (b *backendTestClient) Nodes() nodes.Service                   { return nil }
 func (b *backendTestClient) Cluster() sdkcluster.Service            { return b.clusterSvc }
 func (b *backendTestClient) ClusterStorage() clusterstorage.Service { return nil }
+func (b *backendTestClient) Pools() PoolService                     { return nil }
 
 // ---------------------------------------------------------------------------
 // fake cluster.Service

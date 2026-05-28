@@ -93,5 +93,34 @@
       config["registry_allow_private_ip"] = true
     end
   end
+  # Emit stemcell_template_vmid_range_start only when the operator sets a non-zero
+  # value. When absent or 0 (the default), the key is omitted so ApplyDefaults
+  # derives the start as vmid_range_end+1 (6000 with the default VM range).
+  v = p("pve.stemcell_template_vmid_range_start", 0).to_i
+  config["stemcell_template_vmid_range_start"] = v unless v == 0
+
+  # Emit stemcell_template_vmid_range_end only when the operator sets a non-zero
+  # value. When absent or 0 (the default), the key is omitted so ApplyDefaults
+  # sets 8999.
+  v = p("pve.stemcell_template_vmid_range_end", 0).to_i
+  config["stemcell_template_vmid_range_end"] = v unless v == 0
+
+  # Emit stemcell_template_pool only when the operator supplies a non-empty value.
+  # When absent or empty (the default), the key is omitted and no pool is assigned.
+  stemcell_template_pool = p("pve.stemcell_template_pool", "")
+  config["stemcell_template_pool"] = stemcell_template_pool unless stemcell_template_pool.to_s.empty?
+
+  # Emit stemcell_template_node only when the operator supplies a non-empty value.
+  # When absent or empty (the default), the key is omitted and the CPI falls back
+  # to pve.node at call time.
+  stemcell_template_node = p("pve.stemcell_template_node", "")
+  config["stemcell_template_node"] = stemcell_template_node unless stemcell_template_node.to_s.empty?
+
+  # Emit clone_mode only when the operator supplies a non-empty value. When absent
+  # or empty (the default), the key is omitted; ApplyDefaults treats "" as "auto"
+  # and selects the correct clone type per storage backend.
+  clone_mode = p("pve.clone_mode", "")
+  config["clone_mode"] = clone_mode unless clone_mode.to_s.empty?
+
   JSON.dump(config)
 %>

@@ -239,6 +239,41 @@ type CPIConfig struct {
 	// connection stays in the connection pool before being closed. 0 (default)
 	// applies the built-in 90s default. Valid range: 1-3600 seconds.
 	StemcellFetchIdleConnTimeoutSec int `json:"stemcell_fetch_idle_conn_timeout_sec,omitempty"`
+
+	// StemcellTemplateVMIDRangeStart is the inclusive lower bound of the VMID
+	// range for template VMs created by create_stemcell. Must not overlap with
+	// VMIDRangeStart..VMIDRangeEnd (VM range) or the persistent disk range
+	// 9000-9999. ApplyDefaults sets to VMIDRangeEnd+1 when 0 (adaptive: with the
+	// default VM range, end=5999, this yields 6000 — the documented default).
+	// validate-only-when-set; omit from ERB when zero.
+	StemcellTemplateVMIDRangeStart int `json:"stemcell_template_vmid_range_start,omitempty"`
+
+	// StemcellTemplateVMIDRangeEnd is the inclusive upper bound of the VMID
+	// range for template VMs. Must be > StemcellTemplateVMIDRangeStart and ≤8999.
+	// ApplyDefaults sets to 8999 when 0 (mirrors pve.VMIDRangeTemplateEnd).
+	// validate-only-when-set; omit from ERB when zero.
+	StemcellTemplateVMIDRangeEnd int `json:"stemcell_template_vmid_range_end,omitempty"`
+
+	// StemcellTemplatePool is an optional PVE resource pool name to assign
+	// newly created template VMs. Empty (default) means no pool assignment.
+	// validate-only-when-set: any non-empty string is accepted; PVE validates
+	// pool existence at assignment time.
+	StemcellTemplatePool string `json:"stemcell_template_pool,omitempty"`
+
+	// StemcellTemplateNode is the PVE node on which template VMs are created.
+	// Empty (default) falls back to Node at the callsite. Useful when
+	// stemcell_storage is on shared storage but template creation should be
+	// pinned to one node. validate-only-when-set.
+	StemcellTemplateNode string `json:"stemcell_template_node,omitempty"`
+
+	// CloneMode controls the clone type used by create_vm when cloning a
+	// stemcell template. Values: "auto" (default), "linked", "full".
+	// "auto": linked clone for snapshot-capable backends (dir, nfs, cifs,
+	// zfspool, lvmthin, rbd, cephfs); full clone for lvm-thick (linked
+	// not supported). "linked": force linked clone; error on lvm-thick.
+	// "full": force full clone on all backends.
+	// ApplyDefaults treats empty string as "auto". omit from ERB when empty.
+	CloneMode string `json:"clone_mode,omitempty"`
 }
 
 // FetchCredentialDefault maps a URL prefix to a JSON auth payload understood
@@ -435,6 +470,22 @@ func (c *CPIConfig) ApplyDefaults() {
 	if c.StemcellFetchIdleConnTimeoutSec <= 0 {
 		c.StemcellFetchIdleConnTimeoutSec = 90
 	}
+	// Template VMID range: derive adaptively from the VM range when not set by the
+	// operator. This preserves back-compat — a pre-upgrade config with a high
+	// vmid_range_end (valid before template support) must not suddenly fail
+	// validation because a hardcoded 6000 overlaps. With the default VM range
+	// (end=5999) the adaptive start is 5999+1=6000, matching the documented
+	// default. config cannot import internal/pve (cycle), so the ceiling
+	// constant 8999 is inlined with a comment referencing pve.VMIDRangeTemplateEnd.
+	if c.StemcellTemplateVMIDRangeStart == 0 {
+		c.StemcellTemplateVMIDRangeStart = c.VMIDRangeEnd + 1 // adaptive; pve.VMIDRangeTemplateStart when default VM range
+	}
+	if c.StemcellTemplateVMIDRangeEnd == 0 {
+		c.StemcellTemplateVMIDRangeEnd = 8999 // pve.VMIDRangeTemplateEnd
+	}
+	if c.CloneMode == "" {
+		c.CloneMode = "auto"
+	}
 	if c.NetworkMode == "" {
 		c.NetworkMode = "auto"
 	}
@@ -627,6 +678,19 @@ func (c *CPIConfig) validateEnumFields(errs *[]string) {
 		}
 	}
 
+	// CloneMode enum: validate only when non-empty (ApplyDefaults sets "auto" when absent;
+	// "auto" and "linked" and "full" are the only valid values).
+	if c.CloneMode != "" {
+		switch c.CloneMode {
+		case "auto", "linked", "full":
+			// valid
+		default:
+			*errs = append(*errs, fmt.Sprintf(
+				"clone_mode must be one of auto|linked|full, got %q", c.CloneMode,
+			))
+		}
+	}
+
 	// StemcellStagingDir: when set, must be an absolute path to an existing directory.
 	if c.StemcellStagingDir != "" {
 		if !strings.HasPrefix(c.StemcellStagingDir, "/") {
@@ -661,9 +725,14 @@ func (c *CPIConfig) validateEnumFields(errs *[]string) {
 	}
 }
 
+// rangesOverlap reports whether [s1,e1] and [s2,e2] overlap (inclusive on both ends).
+func rangesOverlap(s1, e1, s2, e2 int) bool {
+	return s1 <= e2 && s2 <= e1
+}
+
 // validateRanges appends an error for each numeric field outside its valid range.
 // Covers port (1–65535), vmid_range_start (≥100), vmid_range_end (>start, ≤9999),
-// and reboot_timeout (1–3600 s).
+// reboot_timeout (1–3600 s), and stemcell template VMID range constraints.
 func (c *CPIConfig) validateRanges(errs *[]string) {
 	// Port range.
 	if c.Port <= 0 || c.Port >= 65536 {
@@ -694,6 +763,57 @@ func (c *CPIConfig) validateRanges(errs *[]string) {
 		*errs = append(*errs, fmt.Sprintf(
 			"reboot_timeout must be 1-3600 seconds, got %d", c.RebootTimeout,
 		))
+	}
+
+	// Stemcell template VMID range: validate only when at least one bound is
+	// non-zero (operator-supplied or ApplyDefaults-filled). Both zero means
+	// Validate is being called without ApplyDefaults — skip to avoid false
+	// positives on manually constructed configs that haven't been defaulted yet.
+	tStart := c.StemcellTemplateVMIDRangeStart
+	tEnd := c.StemcellTemplateVMIDRangeEnd
+	if tStart != 0 || tEnd != 0 {
+		if tStart < 100 {
+			*errs = append(*errs, fmt.Sprintf(
+				"stemcell_template_vmid_range_start must be ≥100 (PVE reserved range), got %d", tStart,
+			))
+		}
+		if tEnd > 8999 {
+			*errs = append(*errs, fmt.Sprintf(
+				"stemcell_template_vmid_range_end must be ≤8999, got %d", tEnd,
+			))
+		}
+		if tStart >= tEnd {
+			// When the derived start equals VMIDRangeEnd+1 the operator has pushed
+			// the VM range so high there is no gap below the persistent disk range.
+			// Emit a targeted message so they know exactly what to change.
+			if tStart == c.VMIDRangeEnd+1 {
+				*errs = append(*errs, fmt.Sprintf(
+					"no free VMID range for stemcell templates: vmid_range_end=%d leaves no space below"+
+						" the persistent disk range (9000); lower vmid_range_end below 9000 or set"+
+						" stemcell_template_vmid_range_start/_end explicitly",
+					c.VMIDRangeEnd,
+				))
+			} else {
+				*errs = append(*errs, fmt.Sprintf(
+					"stemcell_template_vmid_range_start (%d) must be < stemcell_template_vmid_range_end (%d)",
+					tStart, tEnd,
+				))
+			}
+		}
+		// Overlap with VM VMID range.
+		if tStart < tEnd && rangesOverlap(tStart, tEnd, c.VMIDRangeStart, c.VMIDRangeEnd) {
+			*errs = append(*errs, fmt.Sprintf(
+				"stemcell template VMID range [%d,%d] overlaps VM VMID range [%d,%d]",
+				tStart, tEnd, c.VMIDRangeStart, c.VMIDRangeEnd,
+			))
+		}
+		// Overlap with persistent disk range 9000-9999 (constant; not configurable).
+		if tStart < tEnd && rangesOverlap(tStart, tEnd, 9000, 9999) {
+			*errs = append(*errs, fmt.Sprintf(
+				"stemcell template VMID range [%d,%d] overlaps persistent disk range [9000,9999]",
+				tStart, tEnd,
+			))
+		}
 	}
 
 	// Stemcell-fetch transport timeouts: 1–3600 seconds when ApplyDefaults has

@@ -90,6 +90,7 @@ func (c *sdnClient) Tasks() sdktasks.Service                   { return nil }
 func (c *sdnClient) Nodes() sdknodes.Service                   { return nil }
 func (c *sdnClient) Cluster() sdkcluster.Service               { return c.clusterSvc }
 func (c *sdnClient) ClusterStorage() sdkclusterstorage.Service { return nil }
+func (c *sdnClient) Pools() pve.PoolService                    { return nil }
 
 // newSDNClient builds a pve.Client backed by the supplied fake.
 func newSDNClient(f *sdnFakeCluster) pve.Client {

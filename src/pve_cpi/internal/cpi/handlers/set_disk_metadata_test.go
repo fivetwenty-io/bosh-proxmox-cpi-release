@@ -144,6 +144,7 @@ func (c *diskMetaClientMock) Tasks() tasks.Service                   { return ni
 func (c *diskMetaClientMock) Nodes() sdknodes.Service                { return c.nodesSvc }
 func (c *diskMetaClientMock) Cluster() sdkclusterapi.Service         { return c.clusterSvc }
 func (c *diskMetaClientMock) ClusterStorage() clusterstorage.Service { return nil }
+func (c *diskMetaClientMock) Pools() pve.PoolService                 { return nil }
 
 // ---------------------------------------------------------------------------
 // helper builders
@@ -1013,12 +1014,11 @@ type diskMetaFullMock struct {
 	clusterSvc sdkclusterapi.Service
 }
 
-func (c *diskMetaFullMock) QEMU() qemu.Service             { return c.qemuSvc }
-func (c *diskMetaFullMock) Storage() storage.Service       { return nil }
-func (c *diskMetaFullMock) CloudInit() cloudinit.Service   { return nil }
-func (c *diskMetaFullMock) Tasks() tasks.Service           { return nil }
-func (c *diskMetaFullMock) Nodes() sdknodes.Service        { return c.nodesSvc }
-func (c *diskMetaFullMock) Cluster() sdkclusterapi.Service { return c.clusterSvc }
-func (c *diskMetaFullMock) ClusterStorage() clusterstorage.Service {
-	return nil
-}
+func (c *diskMetaFullMock) QEMU() qemu.Service                     { return c.qemuSvc }
+func (c *diskMetaFullMock) Storage() storage.Service               { return nil }
+func (c *diskMetaFullMock) CloudInit() cloudinit.Service           { return nil }
+func (c *diskMetaFullMock) Tasks() tasks.Service                   { return nil }
+func (c *diskMetaFullMock) Nodes() sdknodes.Service                { return c.nodesSvc }
+func (c *diskMetaFullMock) Cluster() sdkclusterapi.Service         { return c.clusterSvc }
+func (c *diskMetaFullMock) ClusterStorage() clusterstorage.Service { return nil }
+func (c *diskMetaFullMock) Pools() pve.PoolService                 { return nil }

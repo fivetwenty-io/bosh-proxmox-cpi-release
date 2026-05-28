@@ -31,6 +31,11 @@ The CPI is configured via properties in a BOSH deployment manifest. The job temp
 | `pve.log_level` | Structured log level (`debug`, `info`, `warn`, `error`) | `info` | no |
 | `pve.vmid_range_start` | First VMID used for VM allocation. VMs use `[vmid_range_start, vmid_range_end]`. Persistent disks use `[9000, 9999]`. | `100` | no |
 | `pve.vmid_range_end` | Inclusive upper bound of the VM VMID range. Must be greater than `vmid_range_start` and at most `9999`. The allocator scans this range from a randomized start so concurrent CPI invocations rarely pick the same VMID; a retry-on-conflict loop backstops the rare collision. | `5999` | no |
+| `pve.clone_mode` | Clone type used when `create_vm` clones a stemcell template. `auto` (default): linked clone for snapshot-capable backends (`dir`, `nfs`, `cifs`, `zfspool`, `lvmthin`, `rbd`, `cephfs`); full clone for `lvm`-thick (linked clone not supported). `linked`: force linked clone; returns an error on `lvm`-thick. `full`: force full clone on all backends. One of `auto`\|`linked`\|`full`. | `auto` | no |
+| `pve.stemcell_template_vmid_range_start` | Starting VMID for stemcell template VM allocation. When unset (`0`), the CPI derives the start as `vmid_range_end + 1`; with the default VM range (`vmid_range_end = 5999`) this yields `6000`. Must not overlap the VM range or the persistent-disk range `9000–9999`. | `0` (derived) | no |
+| `pve.stemcell_template_vmid_range_end` | Inclusive upper bound of the template VMID range. When unset (`0`), defaults to `8999`. Must be greater than `stemcell_template_vmid_range_start` and at most `8999`. Must not overlap the persistent-disk range. | `0` (derived) | no |
+| `pve.stemcell_template_pool` | Optional PVE resource pool to assign to newly created template VMs. When empty (default), templates are not assigned to any pool. An invalid pool name causes `create_stemcell` to return an error. | `""` | no |
+| `pve.stemcell_template_node` | Optional PVE node on which template VMs are created. When empty (default), falls back to `pve.node`. When using local `stemcell_storage`, this must equal the node where that storage is mounted; pointing to a different node with local storage causes the template import to fail because the uploaded qcow2 is not visible from the other node. | `""` | no |
 | `pve.vm_prefix` | Optional prefix prepended to every CPI-provisioned VM's PVE name. With `cpi`, names take the form `cpi-<deployment>-<job>-<index>`. Empty means the prefix is omitted. The prefix is cluster-wide — every VM created by this CPI deployment carries it. | `""` | no |
 | `pve.create_env_deployment` | Synthetic deployment name used for VMs created by `bosh create-env`. bosh-init does not pass a deployment in env, so a stable placeholder is required for the `<deployment>` segment of the VM name. | `create-env` | no |
 | `pve.allow_disk_ops_with_snapshots` | When `true`, bypasses the snapshot pre-flight guard in `attach_disk`, `detach_disk`, and `resize_disk`. Use only for emergency disk recovery — snapshot state becomes inconsistent after the operation. | `false` | no |
@@ -55,6 +60,53 @@ For multi-node clusters, `stemcell_storage` must additionally be shared. The `cr
 Recommended shared backends: NFS, CIFS, CephFS, GlusterFS, or any other PVE storage type configured with `shared=1` in `/etc/pve/storage.cfg`.
 
 The storage pool must have the `import` content type enabled. See [Proxmox VE Settings](pve-settings.md) for the steps to enable it.
+
+## Stemcell Template Cloning
+
+`create_stemcell` builds one frozen PVE template VM per stemcell and returns a `template:<vmid>` CID. `create_vm` then clones that template instead of running a full qcow2 block-copy per VM. On linked-clone–capable storage backends this reduces VM creation time from roughly four minutes to seconds.
+
+The five properties in the table above (`clone_mode`, `stemcell_template_vmid_range_start`, `stemcell_template_vmid_range_end`, `stemcell_template_pool`, `stemcell_template_node`) are all optional. Zero configuration is required; the defaults produce the correct behavior for most deployments.
+
+### Clone type by storage backend
+
+| Storage backend | Default clone type | Notes |
+|---|---|---|
+| `dir`, `nfs`, `cifs`, `cephfs` | Linked (CoW) | Fastest; backed by qcow2 snapshots |
+| `zfspool`, `lvmthin`, `rbd` | Linked (CoW) | Fastest; backed by ZFS/LVM-thin/RBD snapshots |
+| `lvm` (thick) | Full | `lvm`-thick does not support linked clones |
+
+Set `clone_mode: full` to force full clones everywhere, or `clone_mode: linked` to force linked clones and get an explicit error on `lvm`-thick rather than a silent fallback.
+
+### Template VMID range
+
+Template VMIDs default to `[vmid_range_end + 1, 8999]`. With the default VM range (`vmid_range_end = 5999`) this is `[6000, 8999]`. If you raise `vmid_range_end`, the template range start shifts up automatically; no explicit template range configuration is needed unless you want to override it.
+
+Override example:
+
+```yaml
+pve:
+  vmid_range_start: 100
+  vmid_range_end: 5999
+  stemcell_template_vmid_range_start: 6000
+  stemcell_template_vmid_range_end: 7999
+```
+
+The template range must not overlap `[vmid_range_start, vmid_range_end]` or the persistent-disk range `[9000, 9999]`. The validator rejects overlapping configurations at CPI startup.
+
+### Cross-node and multi-node considerations
+
+Template VMs are created on `stemcell_template_node` (or `pve.node` if unset). For shared storage backends (NFS, CIFS, CephFS, GlusterFS, RBD), any cluster node can clone the template — no additional configuration is needed.
+
+For local storage backends (`dir`, `zfspool`, `lvmthin`, `lvm`) on multi-node clusters, the template and the VM being cloned must be on the same node. Options:
+
+- Pin `stemcell_template_node` and set `cloud_properties.target_node` in your BOSH VM types to the same node.
+- Use shared storage for `stemcell_storage` (recommended for production multi-node clusters).
+
+The CPI does not auto-migrate templates between nodes. If a clone lands on the wrong node, the workaround is to manually live-migrate the resulting VM in the PVE UI after `create_vm` completes.
+
+### Back-compatibility
+
+Stemcells uploaded before this feature was introduced continue to work without operator action. When `create_vm` receives a pre-upgrade CID (a `<storage>:import/<file>` or `light:...` form), it looks for a matching template by content hash. If a template is found the fast clone path runs; if not the original slow `import-from=` path runs. No re-upload is required.
 
 ## Authentication
 

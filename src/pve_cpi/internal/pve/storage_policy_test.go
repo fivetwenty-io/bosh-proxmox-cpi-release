@@ -55,6 +55,50 @@ func TestIsBlockStorage(t *testing.T) {
 	}
 }
 
+// ---- IsLinkedCloneSupported tests ---------------------------------------
+
+func TestIsLinkedCloneSupported(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		storageType string
+		want        bool
+	}{
+		// File-backed and CoW-capable backends → true.
+		{StorageTypeNFS, true},
+		{StorageTypeCIFS, true},
+		{StorageTypeZFSPool, true},
+		{StorageTypeLVMThin, true},
+		{StorageTypeRBD, true},
+		{StorageTypeCephFS, true},
+		{"dir", true},
+
+		// Thick LVM: the sole backend without linked-clone support → false.
+		{StorageTypeLVM, false},
+
+		// Empty / unknown types: permissive default → true.
+		{"", true},
+		{"unknown-type", true},
+
+		// Case-insensitive: upper-case LVM still returns false.
+		{"LVM", false},
+		{"Lvm", false},
+
+		// Case-insensitive: upper-case lvmthin must still return true.
+		{"LVMTHIN", true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.storageType, func(t *testing.T) {
+			t.Parallel()
+			got := IsLinkedCloneSupported(tc.storageType)
+			if got != tc.want {
+				t.Errorf("IsLinkedCloneSupported(%q) = %v, want %v", tc.storageType, got, tc.want)
+			}
+		})
+	}
+}
+
 // ---- ValidateLightStemcellStorage tests ---------------------------------
 
 // helper builds a minimal stub with a single named storage.
@@ -319,5 +363,246 @@ func TestValidateLightStemcellStorage_TwoNodeCluster_LocalNoPin(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "cloud_properties.node") {
 		t.Errorf("error %q should mention cloud_properties.node", err.Error())
+	}
+}
+
+// ---- ValidateTemplateCloneStorage tests ---------------------------------
+
+// TC-01: single-node cluster → accept any backend, no pin needed.
+func TestValidateTemplateCloneStorage_SingleNode_NoPin(t *testing.T) {
+	t.Parallel()
+	deps := singleStorageStub("local", "dir", 1)
+	node, err := ValidateTemplateCloneStorage(context.Background(), deps, "local", "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if node != "" {
+		t.Errorf("chosenNode = %q, want empty string", node)
+	}
+}
+
+// TC-02: single-node cluster + node hint → hint returned.
+func TestValidateTemplateCloneStorage_SingleNode_WithPin(t *testing.T) {
+	t.Parallel()
+	deps := singleStorageStub("local", "dir", 1)
+	node, err := ValidateTemplateCloneStorage(context.Background(), deps, "local", "pve1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if node != "pve1" {
+		t.Errorf("chosenNode = %q, want pve1", node)
+	}
+}
+
+// TC-03: multi-node + shared storage (nfs) → accept, no pin required.
+func TestValidateTemplateCloneStorage_MultiNode_SharedNFS_NoPin(t *testing.T) {
+	t.Parallel()
+	deps := singleStorageStub("nfs1", "nfs", 3)
+	node, err := ValidateTemplateCloneStorage(context.Background(), deps, "nfs1", "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if node != "" {
+		t.Errorf("chosenNode = %q, want empty", node)
+	}
+}
+
+// TC-04: multi-node + shared storage (nfs) + pin → pin returned.
+func TestValidateTemplateCloneStorage_MultiNode_SharedNFS_WithPin(t *testing.T) {
+	t.Parallel()
+	deps := singleStorageStub("nfs1", "nfs", 3)
+	node, err := ValidateTemplateCloneStorage(context.Background(), deps, "nfs1", "pve2")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if node != "pve2" {
+		t.Errorf("chosenNode = %q, want pve2", node)
+	}
+}
+
+// TC-05: multi-node + local dir + node pinned → accept, pin returned.
+func TestValidateTemplateCloneStorage_MultiNode_LocalDir_WithPin(t *testing.T) {
+	t.Parallel()
+	deps := singleStorageStub("local", "dir", 3)
+	node, err := ValidateTemplateCloneStorage(context.Background(), deps, "local", "pve2")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if node != "pve2" {
+		t.Errorf("chosenNode = %q, want pve2", node)
+	}
+}
+
+// TC-06: multi-node + local dir + NO pin → error with actionable message.
+func TestValidateTemplateCloneStorage_MultiNode_LocalDir_NoPin_Reject(t *testing.T) {
+	t.Parallel()
+	deps := singleStorageStub("local", "dir", 3)
+	_, err := ValidateTemplateCloneStorage(context.Background(), deps, "local", "")
+	if err == nil {
+		t.Fatal("expected rejection for local storage on multi-node without node pin")
+	}
+	if !strings.Contains(err.Error(), "cloud_properties.node") {
+		t.Errorf("error %q should mention cloud_properties.node", err.Error())
+	}
+	if !strings.Contains(err.Error(), "3") {
+		t.Errorf("error %q should mention cluster size", err.Error())
+	}
+	if !strings.Contains(err.Error(), "auto-migrate") {
+		t.Errorf("error %q should mention auto-migrate", err.Error())
+	}
+}
+
+// TC-07: block storage that is also shared (rbd) → accept (block is OK for clones,
+// IsShared returns true for rbd by type).
+func TestValidateTemplateCloneStorage_MultiNode_RBD_Shared_NoPin(t *testing.T) {
+	t.Parallel()
+	// rbd: IsShared() returns true via type heuristic even without Shared flag.
+	deps := singleStorageStub("ceph", "rbd", 3)
+	node, err := ValidateTemplateCloneStorage(context.Background(), deps, "ceph", "")
+	if err != nil {
+		t.Fatalf("unexpected error for rbd (shared block): %v", err)
+	}
+	if node != "" {
+		t.Errorf("chosenNode = %q, want empty", node)
+	}
+}
+
+// TC-08: block + local (lvmthin) + multi-node + no pin → error (local rule applies).
+func TestValidateTemplateCloneStorage_MultiNode_LVMThin_Local_NoPin_Reject(t *testing.T) {
+	t.Parallel()
+	deps := singleStorageStub("lvtp", "lvmthin", 3)
+	_, err := ValidateTemplateCloneStorage(context.Background(), deps, "lvtp", "")
+	if err == nil {
+		t.Fatal("expected rejection for lvmthin local on multi-node without pin")
+	}
+	if !strings.Contains(err.Error(), "cloud_properties.node") {
+		t.Errorf("error %q should mention cloud_properties.node", err.Error())
+	}
+}
+
+// TC-09: block + local (lvmthin) + multi-node + pin → accept (pin satisfies constraint).
+func TestValidateTemplateCloneStorage_MultiNode_LVMThin_Local_WithPin(t *testing.T) {
+	t.Parallel()
+	deps := singleStorageStub("lvtp", "lvmthin", 3)
+	node, err := ValidateTemplateCloneStorage(context.Background(), deps, "lvtp", "pve1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if node != "pve1" {
+		t.Errorf("chosenNode = %q, want pve1", node)
+	}
+}
+
+// TC-10: empty storage name → immediate error before any deps call.
+func TestValidateTemplateCloneStorage_EmptyStorageName(t *testing.T) {
+	t.Parallel()
+	deps := &stubPolicyDeps{size: 3}
+	_, err := ValidateTemplateCloneStorage(context.Background(), deps, "", "")
+	if err == nil {
+		t.Fatal("expected error for empty storage name")
+	}
+	if !strings.Contains(err.Error(), "storage name required") {
+		t.Errorf("error %q should mention 'storage name required'", err.Error())
+	}
+}
+
+// TC-11: StorageInfo error → propagated.
+func TestValidateTemplateCloneStorage_StorageInfoError(t *testing.T) {
+	t.Parallel()
+	sentinel := errors.New("pve api timeout")
+	deps := &stubPolicyDeps{
+		storages:   map[string]StorageInfo{},
+		size:       3,
+		storageErr: sentinel,
+	}
+	_, err := ValidateTemplateCloneStorage(context.Background(), deps, "local", "")
+	if err == nil {
+		t.Fatal("expected error from StorageInfo, got nil")
+	}
+	if !strings.Contains(err.Error(), "lookup storage") {
+		t.Errorf("error %q should mention 'lookup storage'", err.Error())
+	}
+	if !strings.Contains(err.Error(), sentinel.Error()) {
+		t.Errorf("error %q should contain the original sentinel message", err.Error())
+	}
+}
+
+// TC-12: ClusterNodeCount error → propagated.
+func TestValidateTemplateCloneStorage_ClusterNodeCountError(t *testing.T) {
+	t.Parallel()
+	sentinel := errors.New("cluster unreachable")
+	deps := &stubPolicyDeps{
+		storages: map[string]StorageInfo{
+			"local": {Name: "local", Type: "dir"},
+		},
+		size:           0,
+		clusterSizeErr: sentinel,
+	}
+	_, err := ValidateTemplateCloneStorage(context.Background(), deps, "local", "")
+	if err == nil {
+		t.Fatal("expected error from ClusterNodeCount, got nil")
+	}
+	if !strings.Contains(err.Error(), "cluster node count") {
+		t.Errorf("error %q should mention 'cluster node count'", err.Error())
+	}
+	if !strings.Contains(err.Error(), sentinel.Error()) {
+		t.Errorf("error %q should contain the original sentinel message", err.Error())
+	}
+}
+
+// TC-13: multi-node + shared-by-flag dir → accept.
+func TestValidateTemplateCloneStorage_MultiNode_SharedByFlag(t *testing.T) {
+	t.Parallel()
+	deps := &stubPolicyDeps{
+		storages: map[string]StorageInfo{
+			"shared-dir": {Name: "shared-dir", Type: "dir", Shared: true},
+		},
+		size: 4,
+	}
+	node, err := ValidateTemplateCloneStorage(context.Background(), deps, "shared-dir", "pve1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if node != "pve1" {
+		t.Errorf("chosenNode = %q, want pve1", node)
+	}
+}
+
+// TC-14: two-node boundary + local + pin → accept.
+func TestValidateTemplateCloneStorage_TwoNodeCluster_LocalWithPin(t *testing.T) {
+	t.Parallel()
+	deps := singleStorageStub("local", "dir", 2)
+	node, err := ValidateTemplateCloneStorage(context.Background(), deps, "local", "pve1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if node != "pve1" {
+		t.Errorf("chosenNode = %q, want pve1", node)
+	}
+}
+
+// TC-15: two-node boundary + local + no pin → reject.
+func TestValidateTemplateCloneStorage_TwoNodeCluster_LocalNoPin(t *testing.T) {
+	t.Parallel()
+	deps := singleStorageStub("local", "dir", 2)
+	_, err := ValidateTemplateCloneStorage(context.Background(), deps, "local", "")
+	if err == nil {
+		t.Fatal("expected rejection for two-node cluster without pin")
+	}
+	if !strings.Contains(err.Error(), "cloud_properties.node") {
+		t.Errorf("error %q should mention cloud_properties.node", err.Error())
+	}
+}
+
+// TC-16: cephfs (shared by type) multi-node → accept.
+func TestValidateTemplateCloneStorage_MultiNode_CephFS_NoPin(t *testing.T) {
+	t.Parallel()
+	deps := singleStorageStub("cfs", "cephfs", 5)
+	node, err := ValidateTemplateCloneStorage(context.Background(), deps, "cfs", "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if node != "" {
+		t.Errorf("chosenNode = %q, want empty", node)
 	}
 }

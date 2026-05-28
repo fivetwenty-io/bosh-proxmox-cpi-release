@@ -810,19 +810,23 @@ func TestValidate_VMIDRangeEndTooHigh(t *testing.T) {
 	assertCloudError(t, cfg.Validate(), "vmid_range_end must be ≤9999")
 }
 
-// TestValidate_VMIDRangeEndAt9999 confirms end == 9999 is valid.
-func TestValidate_VMIDRangeEndAt9999(t *testing.T) {
+// TestValidate_VMIDRangeEndAt5999 confirms end == 5999 (the design default) is
+// valid and does not overlap the template VMID range [6000,8999]. The original
+// test used 9999 to exercise the ≤9999 ceiling, which conflicts with the template
+// range; vmid_range_end=9999 requires a non-default template range (see
+// TestValidate_VMIDRangeEndTooHigh for the >9999 rejection case).
+func TestValidate_VMIDRangeEndAt5999(t *testing.T) {
 	t.Parallel()
 	cfg, err := mustLoad(t, `{
 		"host":"h","user":"u","password":"p",
 		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
-		"vmid_range_end":9999
+		"vmid_range_end":5999
 	}`)
 	if err != nil {
-		t.Fatalf("unexpected error for vmid_range_end=9999: %v", err)
+		t.Fatalf("unexpected error for vmid_range_end=5999: %v", err)
 	}
-	if cfg.VMIDRangeEnd != 9999 {
-		t.Errorf("VMIDRangeEnd = %d, want 9999", cfg.VMIDRangeEnd)
+	if cfg.VMIDRangeEnd != 5999 {
+		t.Errorf("VMIDRangeEnd = %d, want 5999", cfg.VMIDRangeEnd)
 	}
 }
 
@@ -1825,5 +1829,487 @@ func TestLoad_RegistryAllowPrivateIP_JSONRoundTrip(t *testing.T) {
 	}
 	if !*cfg.RegistryAllowPrivateIP {
 		t.Error("*RegistryAllowPrivateIP = false, want true")
+	}
+}
+
+// --------------------------------------------------------------------------
+// Template config fields — ApplyDefaults
+// --------------------------------------------------------------------------
+
+// TestApplyDefaults_TemplateVMIDRange verifies that ApplyDefaults fills in
+// StemcellTemplateVMIDRangeStart=6000 and StemcellTemplateVMIDRangeEnd=8999
+// when both are zero (fields absent from JSON).
+func TestApplyDefaults_TemplateVMIDRange(t *testing.T) {
+	t.Parallel()
+	var cfg config.CPIConfig
+	cfg.VMStorage = "vm-store"
+	cfg.ApplyDefaults()
+
+	if cfg.StemcellTemplateVMIDRangeStart != 6000 {
+		t.Errorf("StemcellTemplateVMIDRangeStart = %d, want 6000 (default)", cfg.StemcellTemplateVMIDRangeStart)
+	}
+	if cfg.StemcellTemplateVMIDRangeEnd != 8999 {
+		t.Errorf("StemcellTemplateVMIDRangeEnd = %d, want 8999 (default)", cfg.StemcellTemplateVMIDRangeEnd)
+	}
+}
+
+// TestApplyDefaults_TemplateVMIDRangePreservesSet verifies that operator-supplied
+// values for both range fields are not overwritten by ApplyDefaults.
+func TestApplyDefaults_TemplateVMIDRangePreservesSet(t *testing.T) {
+	t.Parallel()
+	var cfg config.CPIConfig
+	cfg.VMStorage = "vm-store"
+	cfg.StemcellTemplateVMIDRangeStart = 6500
+	cfg.StemcellTemplateVMIDRangeEnd = 7500
+	cfg.ApplyDefaults()
+
+	if cfg.StemcellTemplateVMIDRangeStart != 6500 {
+		t.Errorf("StemcellTemplateVMIDRangeStart = %d, want 6500 (must not overwrite)", cfg.StemcellTemplateVMIDRangeStart)
+	}
+	if cfg.StemcellTemplateVMIDRangeEnd != 7500 {
+		t.Errorf("StemcellTemplateVMIDRangeEnd = %d, want 7500 (must not overwrite)", cfg.StemcellTemplateVMIDRangeEnd)
+	}
+}
+
+// TestApplyDefaults_CloneMode verifies that ApplyDefaults sets CloneMode to
+// "auto" when the field is empty (absent from JSON).
+func TestApplyDefaults_CloneMode(t *testing.T) {
+	t.Parallel()
+	var cfg config.CPIConfig
+	cfg.VMStorage = "vm-store"
+	cfg.ApplyDefaults()
+
+	if cfg.CloneMode != "auto" {
+		t.Errorf("CloneMode = %q, want %q (default)", cfg.CloneMode, "auto")
+	}
+}
+
+// TestApplyDefaults_CloneModePreservesSet verifies that an explicit CloneMode
+// value is not overwritten by ApplyDefaults.
+func TestApplyDefaults_CloneModePreservesSet(t *testing.T) {
+	t.Parallel()
+	for _, mode := range []string{"linked", "full", "auto"} {
+		t.Run(mode, func(t *testing.T) {
+			var cfg config.CPIConfig
+			cfg.VMStorage = "vm-store"
+			cfg.CloneMode = mode
+			cfg.ApplyDefaults()
+			if cfg.CloneMode != mode {
+				t.Errorf("CloneMode = %q, want %q (explicit value must survive ApplyDefaults)", cfg.CloneMode, mode)
+			}
+		})
+	}
+}
+
+// --------------------------------------------------------------------------
+// Template config fields — Validate
+// --------------------------------------------------------------------------
+
+// TestValidate_CloneMode_Invalid verifies that an unrecognized clone_mode value
+// is rejected with a clear error message.
+func TestValidate_CloneMode_Invalid(t *testing.T) {
+	t.Parallel()
+	_, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+		"clone_mode":"snapshot"
+	}`)
+	assertCloudError(t, err, "clone_mode must be one of auto|linked|full")
+	assertCloudError(t, err, `"snapshot"`)
+}
+
+// TestValidate_CloneMode_ValidValues verifies the three accepted clone_mode values.
+func TestValidate_CloneMode_ValidValues(t *testing.T) {
+	t.Parallel()
+	for _, mode := range []string{"auto", "linked", "full"} {
+		t.Run(mode, func(t *testing.T) {
+			_, err := mustLoad(t, `{
+				"host":"h","user":"u","password":"p",
+				"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+				"clone_mode":"`+mode+`"
+			}`)
+			if err != nil {
+				t.Errorf("clone_mode=%q: unexpected error: %v", mode, err)
+			}
+		})
+	}
+}
+
+// TestValidate_CloneMode_OmittedGetsAuto verifies that omitting clone_mode
+// results in "auto" after Load applies defaults (no validation error).
+func TestValidate_CloneMode_OmittedGetsAuto(t *testing.T) {
+	t.Parallel()
+	cfg, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br"
+	}`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.CloneMode != "auto" {
+		t.Errorf("CloneMode = %q, want %q (default when omitted)", cfg.CloneMode, "auto")
+	}
+}
+
+// TestValidate_TemplateRange_StartGEEnd verifies that start >= end is rejected.
+func TestValidate_TemplateRange_StartGEEnd(t *testing.T) {
+	t.Parallel()
+	// Build a config manually so we can set start == end after defaults apply.
+	cfg := &config.CPIConfig{
+		Host:                           "h",
+		User:                           "u",
+		Password:                       "p",
+		VMStorage:                      "s",
+		DiskStorage:                    "s",
+		NetworkBridge:                  "br",
+		Port:                           8006,
+		VerifySSL:                      boolPtr(true),
+		AgentMode:                      "cloudinit",
+		VMDiskFormat:                   "qcow2",
+		LogLevel:                       "info",
+		VMIDRangeStart:                 100,
+		VMIDRangeEnd:                   5999,
+		RebootMode:                     "soft",
+		RebootTimeout:                  60,
+		NetworkMode:                    "auto",
+		SDNZoneType:                    "simple",
+		CloneMode:                      "auto",
+		StemcellTemplateVMIDRangeStart: 7000,
+		StemcellTemplateVMIDRangeEnd:   7000, // equal to start — invalid
+	}
+	assertCloudError(t, cfg.Validate(), "stemcell_template_vmid_range_start")
+}
+
+// TestValidate_TemplateRange_EndTooHigh verifies that end > 8999 is rejected.
+func TestValidate_TemplateRange_EndTooHigh(t *testing.T) {
+	t.Parallel()
+	cfg := &config.CPIConfig{
+		Host:                           "h",
+		User:                           "u",
+		Password:                       "p",
+		VMStorage:                      "s",
+		DiskStorage:                    "s",
+		NetworkBridge:                  "br",
+		Port:                           8006,
+		VerifySSL:                      boolPtr(true),
+		AgentMode:                      "cloudinit",
+		VMDiskFormat:                   "qcow2",
+		LogLevel:                       "info",
+		VMIDRangeStart:                 100,
+		VMIDRangeEnd:                   5999,
+		RebootMode:                     "soft",
+		RebootTimeout:                  60,
+		NetworkMode:                    "auto",
+		SDNZoneType:                    "simple",
+		CloneMode:                      "auto",
+		StemcellTemplateVMIDRangeStart: 6000,
+		StemcellTemplateVMIDRangeEnd:   9500, // above max — invalid
+	}
+	assertCloudError(t, cfg.Validate(), "stemcell_template_vmid_range_end must be ≤8999")
+}
+
+// TestValidate_TemplateRange_StartTooLow verifies that start < 100 is rejected.
+func TestValidate_TemplateRange_StartTooLow(t *testing.T) {
+	t.Parallel()
+	cfg := &config.CPIConfig{
+		Host:                           "h",
+		User:                           "u",
+		Password:                       "p",
+		VMStorage:                      "s",
+		DiskStorage:                    "s",
+		NetworkBridge:                  "br",
+		Port:                           8006,
+		VerifySSL:                      boolPtr(true),
+		AgentMode:                      "cloudinit",
+		VMDiskFormat:                   "qcow2",
+		LogLevel:                       "info",
+		VMIDRangeStart:                 100,
+		VMIDRangeEnd:                   5999,
+		RebootMode:                     "soft",
+		RebootTimeout:                  60,
+		NetworkMode:                    "auto",
+		SDNZoneType:                    "simple",
+		CloneMode:                      "auto",
+		StemcellTemplateVMIDRangeStart: 50, // below PVE minimum — invalid
+		StemcellTemplateVMIDRangeEnd:   8999,
+	}
+	assertCloudError(t, cfg.Validate(), "stemcell_template_vmid_range_start must be ≥100")
+}
+
+// TestValidate_TemplateRange_OverlapsVMRange verifies that a template range
+// overlapping the VM VMID range is rejected.
+func TestValidate_TemplateRange_OverlapsVMRange(t *testing.T) {
+	t.Parallel()
+	// VM range 3000-5999; template range 4000-7000 → overlap at [4000,5999].
+	cfg := &config.CPIConfig{
+		Host:                           "h",
+		User:                           "u",
+		Password:                       "p",
+		VMStorage:                      "s",
+		DiskStorage:                    "s",
+		NetworkBridge:                  "br",
+		Port:                           8006,
+		VerifySSL:                      boolPtr(true),
+		AgentMode:                      "cloudinit",
+		VMDiskFormat:                   "qcow2",
+		LogLevel:                       "info",
+		VMIDRangeStart:                 3000,
+		VMIDRangeEnd:                   5999,
+		RebootMode:                     "soft",
+		RebootTimeout:                  60,
+		NetworkMode:                    "auto",
+		SDNZoneType:                    "simple",
+		CloneMode:                      "auto",
+		StemcellTemplateVMIDRangeStart: 4000, // overlaps VM range
+		StemcellTemplateVMIDRangeEnd:   7000,
+	}
+	assertCloudError(t, cfg.Validate(), "overlaps VM VMID range")
+}
+
+// TestValidate_TemplateRange_OverlapsDiskRange verifies that a template range
+// overlapping the persistent disk range 9000-9999 is rejected.
+func TestValidate_TemplateRange_OverlapsDiskRange(t *testing.T) {
+	t.Parallel()
+	// Template range 8000-9200 overlaps disk range [9000,9999] at [9000,9200].
+	cfg := &config.CPIConfig{
+		Host:                           "h",
+		User:                           "u",
+		Password:                       "p",
+		VMStorage:                      "s",
+		DiskStorage:                    "s",
+		NetworkBridge:                  "br",
+		Port:                           8006,
+		VerifySSL:                      boolPtr(true),
+		AgentMode:                      "cloudinit",
+		VMDiskFormat:                   "qcow2",
+		LogLevel:                       "info",
+		VMIDRangeStart:                 100,
+		VMIDRangeEnd:                   5999,
+		RebootMode:                     "soft",
+		RebootTimeout:                  60,
+		NetworkMode:                    "auto",
+		SDNZoneType:                    "simple",
+		CloneMode:                      "auto",
+		StemcellTemplateVMIDRangeStart: 8000,
+		StemcellTemplateVMIDRangeEnd:   9200, // tEnd > 8999 triggers end-too-high + overlap
+	}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected validation error for template range overlapping disk range, got nil")
+	}
+	// Both the end-too-high and disk-range-overlap errors must surface.
+	if !strings.Contains(err.Error(), "≤8999") {
+		t.Errorf("error %q missing end>8999 message", err.Error())
+	}
+	if !strings.Contains(err.Error(), "disk range") {
+		t.Errorf("error %q missing disk range overlap message", err.Error())
+	}
+}
+
+// TestValidate_TemplateRange_ValidDefaults verifies that the default values
+// (6000-8999) pass validation alongside the default VM range (100-5999)
+// and do not overlap either the VM range or the disk range.
+func TestValidate_TemplateRange_ValidDefaults(t *testing.T) {
+	t.Parallel()
+	cfg, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br"
+	}`)
+	if err != nil {
+		t.Fatalf("default template range: unexpected validation error: %v", err)
+	}
+	if cfg.StemcellTemplateVMIDRangeStart != 6000 {
+		t.Errorf("StemcellTemplateVMIDRangeStart = %d, want 6000", cfg.StemcellTemplateVMIDRangeStart)
+	}
+	if cfg.StemcellTemplateVMIDRangeEnd != 8999 {
+		t.Errorf("StemcellTemplateVMIDRangeEnd = %d, want 8999", cfg.StemcellTemplateVMIDRangeEnd)
+	}
+}
+
+// TestValidate_TemplateRange_ValidOperatorOverride verifies that a valid
+// operator-supplied template range passes all constraints.
+func TestValidate_TemplateRange_ValidOperatorOverride(t *testing.T) {
+	t.Parallel()
+	cfg, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+		"stemcell_template_vmid_range_start":6500,
+		"stemcell_template_vmid_range_end":7500
+	}`)
+	if err != nil {
+		t.Fatalf("valid operator template range: unexpected error: %v", err)
+	}
+	if cfg.StemcellTemplateVMIDRangeStart != 6500 {
+		t.Errorf("StemcellTemplateVMIDRangeStart = %d, want 6500", cfg.StemcellTemplateVMIDRangeStart)
+	}
+	if cfg.StemcellTemplateVMIDRangeEnd != 7500 {
+		t.Errorf("StemcellTemplateVMIDRangeEnd = %d, want 7500", cfg.StemcellTemplateVMIDRangeEnd)
+	}
+}
+
+// TestValidate_TemplatePool_AcceptsNonEmpty verifies that a non-empty
+// stemcell_template_pool passes validation (validate-only-when-set; any
+// non-empty string is accepted — PVE validates pool existence at assignment).
+func TestValidate_TemplatePool_AcceptsNonEmpty(t *testing.T) {
+	t.Parallel()
+	cfg, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+		"stemcell_template_pool":"bosh-templates"
+	}`)
+	if err != nil {
+		t.Fatalf("stemcell_template_pool non-empty: unexpected error: %v", err)
+	}
+	if cfg.StemcellTemplatePool != "bosh-templates" {
+		t.Errorf("StemcellTemplatePool = %q, want %q", cfg.StemcellTemplatePool, "bosh-templates")
+	}
+}
+
+// TestValidate_TemplateNode_AcceptsNonEmpty verifies that a non-empty
+// stemcell_template_node passes validation (validate-only-when-set).
+func TestValidate_TemplateNode_AcceptsNonEmpty(t *testing.T) {
+	t.Parallel()
+	cfg, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+		"stemcell_template_node":"pve-node-1"
+	}`)
+	if err != nil {
+		t.Fatalf("stemcell_template_node non-empty: unexpected error: %v", err)
+	}
+	if cfg.StemcellTemplateNode != "pve-node-1" {
+		t.Errorf("StemcellTemplateNode = %q, want %q", cfg.StemcellTemplateNode, "pve-node-1")
+	}
+}
+
+// TestValidate_TemplateFields_AllAbsent verifies that omitting all five new
+// fields still produces a valid config (additive-only; zero impact when absent).
+func TestValidate_TemplateFields_AllAbsent(t *testing.T) {
+	t.Parallel()
+	cfg, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br"
+	}`)
+	if err != nil {
+		t.Fatalf("all template fields absent: unexpected error: %v", err)
+	}
+	// ApplyDefaults must fill in all three with-default fields.
+	if cfg.CloneMode != "auto" {
+		t.Errorf("CloneMode = %q, want %q", cfg.CloneMode, "auto")
+	}
+	if cfg.StemcellTemplateVMIDRangeStart != 6000 {
+		t.Errorf("StemcellTemplateVMIDRangeStart = %d, want 6000", cfg.StemcellTemplateVMIDRangeStart)
+	}
+	if cfg.StemcellTemplateVMIDRangeEnd != 8999 {
+		t.Errorf("StemcellTemplateVMIDRangeEnd = %d, want 8999", cfg.StemcellTemplateVMIDRangeEnd)
+	}
+	// Pool and node default to empty (no default set).
+	if cfg.StemcellTemplatePool != "" {
+		t.Errorf("StemcellTemplatePool = %q, want empty (default)", cfg.StemcellTemplatePool)
+	}
+	if cfg.StemcellTemplateNode != "" {
+		t.Errorf("StemcellTemplateNode = %q, want empty (default)", cfg.StemcellTemplateNode)
+	}
+}
+
+// --------------------------------------------------------------------------
+// Adaptive template VMID range — back-compat regression guards
+// --------------------------------------------------------------------------
+
+// TestApplyDefaults_TemplateRangeAdaptive is the primary back-compat regression
+// guard for the adaptive template range default. A pre-upgrade config with
+// vmid_range_end=7000 and NO template props set must produce
+// StemcellTemplateVMIDRangeStart=7001, End=8999, and must pass Validate() with
+// no overlap error. A hardcoded 6000 default would cause the derived range
+// [7001,8999] to fail the VM-range overlap check.
+func TestApplyDefaults_TemplateRangeAdaptive(t *testing.T) {
+	t.Parallel()
+	cfg, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+		"vmid_range_end":7000
+	}`)
+	if err != nil {
+		t.Fatalf("vmid_range_end=7000 with no template props: unexpected error: %v", err)
+	}
+	if cfg.VMIDRangeEnd != 7000 {
+		t.Errorf("VMIDRangeEnd = %d, want 7000", cfg.VMIDRangeEnd)
+	}
+	if cfg.StemcellTemplateVMIDRangeStart != 7001 {
+		t.Errorf("StemcellTemplateVMIDRangeStart = %d, want 7001 (adaptive: VMIDRangeEnd+1)", cfg.StemcellTemplateVMIDRangeStart)
+	}
+	if cfg.StemcellTemplateVMIDRangeEnd != 8999 {
+		t.Errorf("StemcellTemplateVMIDRangeEnd = %d, want 8999", cfg.StemcellTemplateVMIDRangeEnd)
+	}
+}
+
+// TestLoad_HighVMIDRangeEnd_NoTemplateProps verifies a modestly raised
+// vmid_range_end (e.g. 6500) with NO template props loads cleanly. The adaptive
+// default places templates at [6501,8999] which is valid and non-overlapping.
+func TestLoad_HighVMIDRangeEnd_NoTemplateProps(t *testing.T) {
+	t.Parallel()
+	cfg, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+		"vmid_range_end":6500
+	}`)
+	if err != nil {
+		t.Fatalf("vmid_range_end=6500 no template props: unexpected error: %v", err)
+	}
+	if cfg.StemcellTemplateVMIDRangeStart != 6501 {
+		t.Errorf("StemcellTemplateVMIDRangeStart = %d, want 6501", cfg.StemcellTemplateVMIDRangeStart)
+	}
+	if cfg.StemcellTemplateVMIDRangeEnd != 8999 {
+		t.Errorf("StemcellTemplateVMIDRangeEnd = %d, want 8999", cfg.StemcellTemplateVMIDRangeEnd)
+	}
+}
+
+// TestLoad_HighVMIDRangeEnd_ExplicitTemplateRange verifies that an explicit
+// non-overlapping template range coexists with a high vmid_range_end.
+// vmid_range_end=8000 + explicit stemcell_template_vmid_range_start=8001,end=8999
+// must be valid.
+func TestLoad_HighVMIDRangeEnd_ExplicitTemplateRange(t *testing.T) {
+	t.Parallel()
+	cfg, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+		"vmid_range_end":8000,
+		"stemcell_template_vmid_range_start":8001,
+		"stemcell_template_vmid_range_end":8999
+	}`)
+	if err != nil {
+		t.Fatalf("vmid_range_end=8000 explicit template [8001,8999]: unexpected error: %v", err)
+	}
+	if cfg.VMIDRangeEnd != 8000 {
+		t.Errorf("VMIDRangeEnd = %d, want 8000", cfg.VMIDRangeEnd)
+	}
+	if cfg.StemcellTemplateVMIDRangeStart != 8001 {
+		t.Errorf("StemcellTemplateVMIDRangeStart = %d, want 8001", cfg.StemcellTemplateVMIDRangeStart)
+	}
+	if cfg.StemcellTemplateVMIDRangeEnd != 8999 {
+		t.Errorf("StemcellTemplateVMIDRangeEnd = %d, want 8999", cfg.StemcellTemplateVMIDRangeEnd)
+	}
+}
+
+// TestValidate_VMIDRangeEnd9999_NoTemplateProps verifies that vmid_range_end=9999
+// with no template props produces the clear "no free VMID range" error. The
+// adaptive default derives start=10000 which exceeds the ceiling (8999), so
+// there is no room for templates. A config that leaves no room for templates
+// cannot be silently accepted once template support exists.
+func TestValidate_VMIDRangeEnd9999_NoTemplateProps(t *testing.T) {
+	t.Parallel()
+	_, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+		"vmid_range_end":9999
+	}`)
+	if err == nil {
+		t.Fatal("expected validation error for vmid_range_end=9999 with no template props, got nil")
+	}
+	if !strings.Contains(err.Error(), "no free VMID range for stemcell templates") {
+		t.Errorf("error %q missing 'no free VMID range for stemcell templates'", err.Error())
+	}
+	if !strings.Contains(err.Error(), "vmid_range_end=9999") {
+		t.Errorf("error %q missing vmid_range_end value", err.Error())
 	}
 }

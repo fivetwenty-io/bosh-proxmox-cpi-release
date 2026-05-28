@@ -290,21 +290,35 @@ func validateStemcellImagePath(imagePath string) error {
 //	[0] image_path      string — absolute local path to stemcell disk image (or tarball).
 //	[1] cloud_properties object — stemcell.MF cloud_properties section (may be omitted).
 //
-// Returns: stemcell_cid string — "<storage>:import/<filename>" (e.g. "stemcell-store:import/bosh-stemcell-ubuntu-jammy-1.438-a1b2c3d4.qcow2").
+// Returns: stemcell_cid string — "template:<vmid>" (e.g. "template:6042").
+// The VMID identifies the frozen PVE template VM that backs this stemcell.
+// Internally the qcow2 is uploaded to "<storage>:import/<filename>" first,
+// then imported into the template VM; the upload volume is deleted after the
+// template is frozen (for CPI-owned images) or retained (for operator-preuploaded
+// light stemcells).
 //
-// Eleven-step direct-upload flow:
+// All three stemcell paths (heavy tarball, light-preuploaded, light-fetch) build
+// a frozen template VM and return "template:<vmid>". The "light:" CID prefix only
+// appears in stemcell_cid values produced before this feature was introduced.
+//
+// Template creation is idempotent: if a template VM named
+// "bosh-stemcell-<name>-<version>" already exists in the template VMID range,
+// its VMID is reused and the upload is skipped.
+//
+// Twelve-step flow:
 //
 //  1. Validate args[0] image_path.
 //  2. Parse cloud_properties → stemcellCloudProps.
-//  3. Validate cloud_properties.name and cloud_properties.version are non-empty (required for CID).
+//  3. Validate cloud_properties.name and cloud_properties.version are non-empty (required for template name and CID).
 //  4. Determine storage: config.StemcellStorage (falls back to config.VMStorage if empty).
 //  5. Validate storage is shared (required for multi-node clusters).
 //  6. Extract/resolve the disk image from the tarball if needed.
 //  7. Compute SHA-256 of the disk image.
 //  8. Build qcow2 filename from name/version/sha8.
-//  9. Build stemcell CID.
-//  10. Dedup: FindStemcellByFilename — return existing CID if found.
-//  11. Upload qcow2 to storage; await task with StemcellMaxWait.
+//  9. Dedup: FindTemplateByName — reuse existing template VMID and return "template:<vmid>" if found.
+//  10. Upload qcow2 to storage; await task with StemcellMaxWait.
+//  11. Import qcow2 into a new template VM; freeze it (MakeTemplate); tag with bosh-stemcell-sha-<sha8>.
+//  12. Return "template:<vmid>".
 //
 // PVE's content APIs do not accept arbitrary metadata for import volumes
 // (the upload endpoint validates file extension; the notes endpoint is
@@ -421,20 +435,283 @@ func HandleCreateStemcell(deps Deps) cpi.Handler {
 		// Steps 6-10: Extract/hash image, build CID, dedup check.
 		// Cleanup is the tmpDir teardown for the (possibly extracted) image; the
 		// caller owns its lifetime so the upload step can reuse the same path.
-		stemcellCID, found, uploadSourcePath, cleanup, buildErr := buildAndDeduplicateStemcellCID(
+		// sha256hex is returned alongside the CID so the template tag can be set
+		// without a second file-read pass.
+		dedup, buildErr := buildAndDeduplicateStemcellCIDWithHash(
 			ctx, deps, node, storage, imagePath, cp, deps.Logger)
 		if buildErr != nil {
 			return nil, buildErr
 		}
-		defer cleanup()
-		if found {
-			return stemcellCID, nil
+		defer dedup.Cleanup()
+
+		stemcellCID := dedup.CID
+		found := dedup.Found
+		uploadSourcePath := dedup.UploadSourcePath
+		sha256hex := dedup.SHA256Hex
+		qcow2Filename := strings.TrimPrefix(stemcellCID, storage+":import/")
+		templateNode := deps.Config.StemcellTemplateNode
+		if templateNode == "" {
+			templateNode = node
 		}
 
-		// Step 11: Upload and return CID. uploadSourcePath is reused so the
+		if found {
+			// Dedup: qcow2 already on storage. Build template from it (idempotent).
+			// CPI does NOT own this pre-existing qcow2 → cpiOwnsSource=false so the
+			// source is not deleted (it may be shared with other stemcell records).
+			vmid, tmplErr := ensureTemplateVM(ctx, deps, templateNode, storage, qcow2Filename, sha256hex, false, cp)
+			if tmplErr != nil {
+				return nil, fmt.Errorf("create_stemcell: ensure template (dedup path): %w", tmplErr)
+			}
+			return pve.BuildTemplateStemcellCID(vmid), nil
+		}
+
+		// Step 11: Upload qcow2 to storage. uploadSourcePath is reused so the
 		// tarball case extracts only once.
-		return uploadAndReturnCID(ctx, deps, node, storage, imagePath, uploadSourcePath, cp, stemcellCID, deps.Logger)
+		if _, uploadErr := uploadAndReturnCID(ctx, deps, node, storage, imagePath, uploadSourcePath, cp, stemcellCID, deps.Logger); uploadErr != nil {
+			return nil, uploadErr
+		}
+
+		// Step 12: Build template VM from the freshly uploaded qcow2 (D-11, D-05).
+		// heavy path: CPI uploaded the qcow2 → cpiOwnsSource=true; ensureTemplateVM
+		// deletes it after freeze (reclaims storage; template disk is the live copy).
+		vmid, tmplErr := ensureTemplateVM(ctx, deps, templateNode, storage, qcow2Filename, sha256hex, true, cp)
+		if tmplErr != nil {
+			return nil, fmt.Errorf("create_stemcell: ensure template: %w", tmplErr)
+		}
+		return pve.BuildTemplateStemcellCID(vmid), nil
 	})
+}
+
+// ensureTemplateVM builds or reuses a frozen PVE template VM for a stemcell.
+//
+// Sequence:
+//  1. BuildTemplateName(cp.Name, cp.Version) → deterministic name for idempotency.
+//  2. FindTemplateByName on templateNode — if found, return existing VMID immediately.
+//     Source qcow2 is NOT deleted on the reuse path regardless of cpiOwnsSource.
+//  3. Allocate a new VMID in [config.StemcellTemplateVMIDRangeStart, …End] via
+//     AllocateWithRetry, same retry/conflict pattern as create_vm.
+//  4. QEMU().Create with import-from=<storage>:import/<qcow2Filename>; no NIC,
+//     no agent, onboot=0; tag "bosh-stemcell-sha-<sha8>" where sha8 = first 8 chars
+//     of sha256hex; await UPID with StemcellMaxWait.
+//  5. MakeTemplate → freeze VM; await UPID if non-empty.
+//  6. Pool assignment (D config): if deps.Config.StemcellTemplatePool != "", assign
+//     the frozen template VM to that PVE resource pool via AssignVMToPool.
+//     Pool assignment failure is fatal — the operator explicitly requested the pool
+//     and a missing pool means a misconfiguration that must be visible immediately.
+//     The template VMID is still usable if the caller handles the error separately,
+//     but this function returns the error so the operator sees it right away.
+//  7. D-09 retention: if cpiOwnsSource, delete the raw qcow2 at
+//     <storage>:import/<qcow2Filename> via Storage().DeleteVolumeIfExists. Delete
+//     failure is logged as a warning and is not fatal — CID is returned regardless.
+//     If !cpiOwnsSource (light-preuploaded) the source is never deleted.
+//
+// Returns the VMID of the frozen template on success.
+//
+// Error contract:
+//   - FindTemplateByName API failure → wrapped error returned.
+//   - AllocateWithRetry exhausted → error returned.
+//   - QEMU.Create failure → error returned (cleanup attempted inside AllocateWithRetry retry).
+//   - MakeTemplate failure → error returned (template not safe to use; source NOT deleted).
+//   - AssignVMToPool failure (when StemcellTemplatePool != "") → error returned (fatal misconfiguration).
+//   - qcow2 delete failure (cpiOwnsSource=true) → warning logged, vmid still returned.
+//
+//nolint:gocognit // Multi-step allocation+freeze+cleanup; phases are load-bearing and cannot be further decomposed without losing clarity.
+func ensureTemplateVM(
+	ctx context.Context,
+	deps Deps,
+	templateNode, storage, qcow2Filename, sha256hex string,
+	cpiOwnsSource bool,
+	cp stemcellCloudProps,
+) (vmid int64, err error) {
+	logger := deps.Logger
+
+	// Step 1: Build deterministic template name (idempotency key).
+	templateName := pve.BuildTemplateName(cp.Name, cp.Version)
+
+	// Step 2: Check for existing template with the same name. If found, return
+	// the existing VMID without creating a new VM or deleting the source.
+	existingVMID, found, findErr := pve.FindTemplateByName(ctx, deps.PVE, templateNode, templateName)
+	if findErr != nil {
+		return 0, fmt.Errorf("ensureTemplateVM: lookup existing template %q: %w", templateName, findErr)
+	}
+	if found {
+		logger.Info("ensureTemplateVM: reusing existing template",
+			log.String("name", templateName),
+			log.Int64("vmid", existingVMID),
+		)
+		return existingVMID, nil
+	}
+
+	// Step 3-4: Allocate VMID + create VM with import-from.
+	sha8 := sha256hex
+	if len(sha8) > 8 {
+		sha8 = sha8[:8]
+	}
+	shaTag := "bosh-stemcell-sha-" + sha8
+	// import-from volid: "<storage>:import/<filename>"
+	importVolid := storage + ":import/" + qcow2Filename
+
+	isRetryable := func(e error) bool {
+		return pve.IsVMIDConflict(e) || pve.IsStorageLockTimeout(e) || pve.IsTransientTransport(e)
+	}
+
+	rangeStart := deps.Config.StemcellTemplateVMIDRangeStart
+	rangeEnd := deps.Config.StemcellTemplateVMIDRangeEnd
+
+	allocatedRaw, allocErr := pve.AllocateWithRetry(ctx, deps.PVE,
+		func(candidate int) error {
+			return attemptCreateTemplateVM(ctx, deps, logger, templateNode, candidate, templateName, importVolid, shaTag)
+		},
+		isRetryable,
+		0, // use AllocateWithRetry default (3 attempts)
+		pve.WithRange(rangeStart, rangeEnd),
+	)
+	if allocErr != nil {
+		return 0, fmt.Errorf("ensureTemplateVM: allocate+create template VM: %w", allocErr)
+	}
+	allocatedVMID := int64(allocatedRaw)
+
+	logger.Info("ensureTemplateVM: template VM created, freezing",
+		log.String("name", templateName),
+		log.Int64("vmid", allocatedVMID),
+	)
+
+	// Step 5: Freeze the VM into a PVE template.
+	freezeUPID, freezeErr := pve.MakeTemplate(ctx, deps.PVE, templateNode, allocatedVMID)
+	if freezeErr != nil {
+		return 0, fmt.Errorf("ensureTemplateVM: freeze template vmid=%d: %w", allocatedVMID, freezeErr)
+	}
+	if freezeUPID != "" {
+		if awaitErr := pve.AwaitTaskWithLogger(ctx, deps.PVE, templateNode, freezeUPID, logger,
+			pve.WithMaxWait(pve.StemcellMaxWait)); awaitErr != nil {
+			return 0, fmt.Errorf("ensureTemplateVM: await freeze task vmid=%d upid=%s: %w",
+				allocatedVMID, freezeUPID, awaitErr)
+		}
+	}
+
+	logger.Info("ensureTemplateVM: template frozen",
+		log.String("name", templateName),
+		log.Int64("vmid", allocatedVMID),
+	)
+
+	// Step 6: Pool assignment — assign the frozen template to the configured
+	// PVE resource pool when StemcellTemplatePool is set. Pool assignment uses
+	// PUT /pools/{poolid} with vms=[vmid] via pve.AssignVMToPool.
+	//
+	// Failure is fatal: the operator explicitly named a pool; a missing pool or
+	// auth failure indicates misconfiguration that must surface immediately rather
+	// than leaving a template silently outside the expected pool. The template VM
+	// was already frozen and is usable, but returning an error ensures the CPI
+	// reports a clear failure so the operator can fix the config and retry (the
+	// idempotency check in step 2 will reuse the existing template on the next call).
+	if deps.Config.StemcellTemplatePool != "" {
+		if poolErr := pve.AssignVMToPool(ctx, deps.PVE, deps.Config.StemcellTemplatePool, allocatedVMID); poolErr != nil {
+			return 0, fmt.Errorf("ensureTemplateVM: assign template vmid=%d to pool %q: %w",
+				allocatedVMID, deps.Config.StemcellTemplatePool, poolErr)
+		}
+		logger.Info("ensureTemplateVM: template assigned to pool",
+			log.String("pool", deps.Config.StemcellTemplatePool),
+			log.Int64("vmid", allocatedVMID),
+		)
+	}
+
+	// Step 8: D-09 retention — delete source qcow2 only when the CPI owns it.
+	// DeleteVolumeIfExists takes the storage pool and the volume PATH component
+	// ("import/<file>") as separate args — same contract delete_stemcell uses.
+	// Passing the full "<storage>:import/<file>" volid here double-prefixes the
+	// storage and the volume is never matched (silent best-effort no-op).
+	if cpiOwnsSource {
+		volumePath := "import/" + qcow2Filename
+		_, delErr := deps.PVE.Storage().DeleteVolumeIfExists(ctx, templateNode, storage, volumePath)
+		if delErr != nil {
+			logger.Warn("ensureTemplateVM: best-effort qcow2 delete failed (non-fatal)",
+				log.String("volume", volumePath),
+				log.Err(delErr),
+			)
+		} else {
+			logger.Info("ensureTemplateVM: source qcow2 deleted",
+				log.String("volume", volumePath),
+			)
+		}
+	}
+
+	return allocatedVMID, nil
+}
+
+// attemptCreateTemplateVM builds CreateQemuParams for a minimal template VM and
+// calls QEMU().Create + await. Called on each AllocateWithRetry attempt. Returns
+// an error on any failure so AllocateWithRetry can retry on conflict.
+//
+// Template VM characteristics (differs from create_vm):
+//   - No NIC (net0 absent) — templates carry only the root disk.
+//   - No QEMU guest agent — agent=0 (template is frozen; agent not needed).
+//   - onboot=0 — templates must not auto-start.
+//   - virtio0: import-from= with format=qcow2 and size=5G default.
+//   - Tags: "bosh-stemcell-sha-<sha8>" for old-CID opportunistic lookup (D-08).
+func attemptCreateTemplateVM(
+	ctx context.Context,
+	deps Deps,
+	logger *log.Logger,
+	node string,
+	candidate int,
+	templateName, importVolid, shaTag string,
+) error {
+	// virtio0: use 0 as the storage allocation target (import-from drives the
+	// actual disk placement). size=5G matches defaultStemcellDiskGiB; PVE will
+	// not shrink below the imported image's actual size.
+	virtio0Val := fmt.Sprintf("0,import-from=%s,format=%s,size=%dG",
+		importVolid, diskFormatQCOW2, defaultStemcellDiskGiB)
+
+	createParams := map[string]any{
+		"vmid":    candidate,
+		"name":    templateName,
+		"ostype":  osTypeLinux26,
+		"scsihw":  "virtio-scsi-pci",
+		"virtio0": virtio0Val,
+		"boot":    "order=virtio0",
+		"agent":   "enabled=0",
+		"onboot":  0,
+		"tags":    shaTag,
+	}
+
+	upid, cerr := deps.PVE.QEMU().Create(ctx, node, createParams)
+	if cerr != nil {
+		switch {
+		case pve.IsVMIDConflict(cerr):
+			logger.Info("ensureTemplateVM: vmid conflict, retrying",
+				log.Int("vmid_attempted", candidate),
+			)
+		case pve.IsStorageLockTimeout(cerr):
+			logger.Info("ensureTemplateVM: storage lock timeout on create, retrying",
+				log.Int("vmid_attempted", candidate),
+			)
+		case pve.IsTransientTransport(cerr):
+			logger.Info("ensureTemplateVM: transient transport fault on create, retrying",
+				log.Int("vmid_attempted", candidate),
+				log.String("error", cerr.Error()),
+			)
+		}
+		return cerr
+	}
+
+	if upid != "" {
+		if werr := pve.AwaitTaskWithLogger(ctx, deps.PVE, node, upid, logger,
+			pve.WithMaxWait(pve.StemcellMaxWait)); werr != nil {
+			if pve.IsVMIDConflict(werr) || pve.IsStorageLockTimeout(werr) || pve.IsTransientTransport(werr) {
+				logger.Info("ensureTemplateVM: retryable error awaiting create task",
+					log.Int("vmid_attempted", candidate),
+					log.String("error", werr.Error()),
+				)
+			}
+			return werr
+		}
+	}
+
+	logger.Info("ensureTemplateVM: VM disk imported",
+		log.Int("vmid_attempted", candidate),
+		log.String("upid", upid),
+	)
+	return nil
 }
 
 // resolveStemcellStorageAndNode resolves the target PVE node and storage for a
@@ -463,6 +740,66 @@ func resolveStemcellStorageAndNode(ctx context.Context, deps Deps) (node, storag
 		return "", "", validateErr
 	}
 	return node, storage, nil
+}
+
+// stemcellDedupResult bundles the outputs of buildAndDeduplicateStemcellCIDWithHash
+// into a single struct, keeping the return list under the 5-result linter limit.
+type stemcellDedupResult struct {
+	// CID is the stemcell content-ID (<storage>:import/<filename>).
+	CID string
+	// Found is true when the volume already exists in PVE storage (dedup path).
+	Found bool
+	// UploadSourcePath is the local path to the qcow2 to upload (or the existing path on dedup).
+	UploadSourcePath string
+	// Cleanup releases any temporary resources (e.g. extracted tarball dir). Always non-nil.
+	Cleanup func()
+	// SHA256Hex is the full SHA-256 hex digest of the resolved disk image. May be empty
+	// on hash failure (non-fatal; template tag is skipped in that case).
+	SHA256Hex string
+}
+
+// buildAndDeduplicateStemcellCIDWithHash is the sha256hex-returning variant of
+// buildAndDeduplicateStemcellCID. It returns the full SHA-256 hex digest of the
+// resolved disk image so callers can pass it to ensureTemplateVM for the
+// bosh-stemcell-sha-<sha8> tag without a second file-read pass.
+//
+// All other return values and semantics are identical to buildAndDeduplicateStemcellCID.
+func buildAndDeduplicateStemcellCIDWithHash(
+	ctx context.Context,
+	deps Deps,
+	node, storage, imagePath string,
+	cp stemcellCloudProps,
+	logger *log.Logger,
+) (stemcellDedupResult, error) {
+	cid, f, src, cl, buildErr := buildAndDeduplicateStemcellCID(ctx, deps, node, storage, imagePath, cp, logger)
+	if buildErr != nil {
+		return stemcellDedupResult{Cleanup: func() {}}, buildErr
+	}
+	// Extract sha256hex: the CID encodes <storage>:import/<name>-<version>-<sha8>.qcow2.
+	// We need the full hash for ensureTemplateVM's tag. Re-derive from the resolved
+	// source file (still valid — cleanup is deferred by caller).
+	// The SHA was computed during buildAndDeduplicateStemcellCID but is not returned
+	// from that helper. Re-compute from src (single read; same cost as the original).
+	stagingDirForHash := ""
+	if src == imagePath {
+		stagingDirForHash = deps.Config.StemcellStagingDir
+	}
+	hashHex, hashErr := sha256FilePath(src, stagingDirForHash)
+	if hashErr != nil {
+		// Hash failure after CID is built means the file is gone (cleanup already
+		// ran) or a race condition. Use empty string so the template tag is skipped.
+		logger.Warn("buildAndDeduplicateStemcellCIDWithHash: re-hash failed (non-fatal; template tag will be empty)",
+			log.Err(hashErr),
+		)
+		hashHex = ""
+	}
+	return stemcellDedupResult{
+		CID:              cid,
+		Found:            f,
+		UploadSourcePath: src,
+		Cleanup:          cl,
+		SHA256Hex:        hashHex,
+	}, nil
 }
 
 // buildAndDeduplicateStemcellCID covers steps 6-10 of the eleven-step flow:
@@ -667,16 +1004,29 @@ func handleLightStemcellPreUploaded(
 			imageID, storage, node)
 	}
 
-	// 6. Build canonical light: CID.
-	lightCID := pve.BuildLightStemcellCID(storage, qcow2Filename)
+	// 6. Build template VM from the operator-placed qcow2 (D-11).
+	// light-preuploaded: CPI does NOT own this qcow2 → cpiOwnsSource=false
+	// (operator placed it; must not be deleted). sha256hex is unavailable
+	// at this point (no local file, no stream); pass "" so the template tag
+	// field is empty (the template name+idempotency key is the lookup anchor).
+	// templateNode: StemcellTemplateNode falls back to config.Node.
+	templateNode := node
+	if deps.Config != nil && deps.Config.StemcellTemplateNode != "" {
+		templateNode = deps.Config.StemcellTemplateNode
+	}
+	vmid, tmplErr := ensureTemplateVM(ctx, deps, templateNode, storage, qcow2Filename, "", false, cp)
+	if tmplErr != nil {
+		return nil, fmt.Errorf("create_stemcell: light pre-uploaded: ensure template: %w", tmplErr)
+	}
 
-	deps.Logger.Info("create_stemcell: light stemcell (pre-uploaded) accepted",
+	templateCID := pve.BuildTemplateStemcellCID(vmid)
+	deps.Logger.Info("create_stemcell: light stemcell (pre-uploaded) template ready",
 		log.String("image_id", imageID),
 		log.String("storage", storage),
 		log.String("node", node),
-		log.String("cid", lightCID),
+		log.String("cid", templateCID),
 	)
-	return lightCID, nil
+	return templateCID, nil
 }
 
 // resolveFetchSource returns the source and reference for rawURL. When
@@ -766,18 +1116,33 @@ func handleLightStemcellFetch(
 	// 3. Pre-fetch prefix dedup: scan storage for any import volume matching the
 	// bosh-stemcell-<name>-<version>- prefix. We don't know sha8 yet, so this is
 	// best-effort — it only fires when a prior fetch for the same name+version
-	// already landed (regardless of sha8). On a hit we skip the network fetch.
+	// already landed (regardless of sha8). On a hit we skip the network fetch and
+	// build/reuse the template from the existing qcow2 (D-11).
 	prefix := stemcellfetch.FilenamePrefixForDedup(cp.Name, cp.Version)
 	if existingVol, prefixErr := fetchFindByPrefix(ctx, deps, node, storage, prefix); prefixErr == nil && existingVol != "" {
 		// Guard: only short-circuit when the found volid belongs to the target storage.
-		// A volid from a different storage would produce a mismatched light: CID.
+		// A volid from a different storage would produce a mismatched CID.
 		if strings.HasPrefix(existingVol, storage+":") {
 			extractedName := fetchExtractFilename(existingVol)
 			if extractedName != "" {
-				deps.Logger.Info("create_stemcell: light fetch — existing stemcell found by prefix, skipping fetch",
+				deps.Logger.Info("create_stemcell: light fetch — existing stemcell found by prefix, building template",
 					log.String("volid", existingVol),
 				)
-				return pve.BuildLightStemcellCID(storage, extractedName), nil
+				// sha256hex unknown (prefix-dedup, no download); pass "" for tag (non-fatal).
+				// light-fetch prefix-dedup: the qcow2 was originally uploaded by the CPI
+				// (fetch path), but on this dedup hit we have no sha256hex and treat the
+				// existing volume as not-CPI-owned to avoid deleting it (it may already
+				// have a template pointing at it). cpiOwnsSource=false is conservative
+				// and correct: the volume exists, the template lookup will find it.
+				prefixTemplateNode := node
+				if deps.Config != nil && deps.Config.StemcellTemplateNode != "" {
+					prefixTemplateNode = deps.Config.StemcellTemplateNode
+				}
+				prefixVMID, prefixTmplErr := ensureTemplateVM(ctx, deps, prefixTemplateNode, storage, extractedName, "", false, cp)
+				if prefixTmplErr != nil {
+					return nil, fmt.Errorf("create_stemcell: light fetch prefix-dedup: ensure template: %w", prefixTmplErr)
+				}
+				return pve.BuildTemplateStemcellCID(prefixVMID), nil
 			}
 		}
 	}
@@ -823,11 +1188,24 @@ func handleLightStemcellFetch(
 	if findErr != nil {
 		return nil, cpierrors.Wrap(findErr, "create_stemcell: light fetch dedup lookup")
 	}
+
+	fetchTemplateNode := node
+	if deps.Config != nil && deps.Config.StemcellTemplateNode != "" {
+		fetchTemplateNode = deps.Config.StemcellTemplateNode
+	}
+
 	if existingVol != "" {
-		deps.Logger.Info("create_stemcell: light fetch — SHA-matched existing stemcell, skipping upload",
+		deps.Logger.Info("create_stemcell: light fetch — SHA-matched existing stemcell, building template",
 			log.String("volid", existingVol),
 		)
-		return pve.BuildLightStemcellCID(storage, qcow2Filename), nil
+		// SHA-dedup: qcow2 already on storage. Build/reuse template (D-11).
+		// cpiOwnsSource=false: qcow2 exists and is the authoritative copy; we do
+		// not delete it (another stemcell record or clone may reference it).
+		dedupVMID, dedupTmplErr := ensureTemplateVM(ctx, deps, fetchTemplateNode, storage, qcow2Filename, sha256hex, false, cp)
+		if dedupTmplErr != nil {
+			return nil, fmt.Errorf("create_stemcell: light fetch SHA-dedup: ensure template: %w", dedupTmplErr)
+		}
+		return pve.BuildTemplateStemcellCID(dedupVMID), nil
 	}
 
 	// 6. Upload temp file under the final canonical filename. uploadStemcellImage
@@ -839,15 +1217,23 @@ func handleLightStemcellFetch(
 		return nil, cpierrors.Wrap(uploadErr, "create_stemcell: light fetch upload")
 	}
 
-	lightCID := pve.BuildLightStemcellCID(storage, qcow2Filename)
-	deps.Logger.Info("create_stemcell: light stemcell (fetched) ready",
+	// 7. Build template VM from the uploaded qcow2 (D-11, D-05).
+	// light-fetch: CPI uploaded the qcow2 → cpiOwnsSource=true; ensureTemplateVM
+	// deletes it after freeze (reclaims storage; template disk is the live copy).
+	fetchVMID, fetchTmplErr := ensureTemplateVM(ctx, deps, fetchTemplateNode, storage, qcow2Filename, sha256hex, true, cp)
+	if fetchTmplErr != nil {
+		return nil, fmt.Errorf("create_stemcell: light fetch: ensure template: %w", fetchTmplErr)
+	}
+
+	templateCID := pve.BuildTemplateStemcellCID(fetchVMID)
+	deps.Logger.Info("create_stemcell: light stemcell (fetched) template ready",
 		log.String("image_url", cp.ImageURL),
 		log.String("source_scheme", ref.Scheme),
 		log.String("creds_kind", creds.Kind()),
-		log.String("cid", lightCID),
+		log.String("cid", templateCID),
 		log.Int64("bytes", written),
 	)
-	return lightCID, nil
+	return templateCID, nil
 }
 
 // fetchFindByPrefix scans the named storage for any import volume whose volid

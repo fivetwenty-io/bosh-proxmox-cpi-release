@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -167,6 +168,7 @@ func (m *mockSource) Fetch(_ context.Context, _ stemcellfetch.Reference, _ stemc
 // wbBuildFetchDeps constructs a Deps suitable for white-box fetch tests.
 // Uses shared NFS storage on a single-node cluster so the policy check passes.
 // nodeListFn controls ListStorageContent responses.
+// QEMU and Tasks are wired with default no-op mocks so ensureTemplateVM can run.
 func wbBuildFetchDeps(
 	t *testing.T,
 	nodeListFn func(_ context.Context, _, _ string, _ *sdknodes.ListStorageContentParams) (*sdknodes.ListStorageContentResponse, error),
@@ -175,16 +177,33 @@ func wbBuildFetchDeps(
 
 	clusterStorage := &wbMockClusterStorage{storageName: "nfs", storageType: "nfs", isShared: true}
 	cluster := &wbMockCluster{nodeCount: 1}
-	nodes := &wbMockNodes{listStorageFn: nodeListFn}
-	storage := &wbMockStorage{}
+	nodesWithStorage := &wbTemplateNodes{
+		wbMockNodes: wbMockNodes{listStorageFn: nodeListFn},
+	}
+	storage := &wbTemplateStorage{}
+	qemu := &wbMockQEMU{}
+	tasks := &wbMockTasks{}
+
+	pveClient := &wbTemplateMockClient{
+		wbMockClient: wbMockClient{
+			nodesSvc:          nodesWithStorage,
+			clusterStorageSvc: clusterStorage,
+			clusterSvc:        cluster,
+			storageSvc:        storage,
+		},
+		qemuSvc:  qemu,
+		tasksSvc: tasks,
+	}
 
 	return Deps{
 		Config: &config.CPIConfig{
-			Node:            "pve-node1",
-			StemcellStorage: "nfs",
-			VMStorage:       "nfs",
+			Node:                           "pve-node1",
+			StemcellStorage:                "nfs",
+			VMStorage:                      "nfs",
+			StemcellTemplateVMIDRangeStart: 6000,
+			StemcellTemplateVMIDRangeEnd:   8999,
 		},
-		PVE:    &wbMockClient{nodesSvc: nodes, clusterStorageSvc: clusterStorage, clusterSvc: cluster, storageSvc: storage},
+		PVE:    pveClient,
 		Logger: log.NewNopLogger(),
 	}
 }
@@ -211,11 +230,18 @@ func wbExistingVolumeListFn(storage, qcow2Filename string) func(_ context.Contex
 // are minimal PVE client mocks for white-box tests. They are separate from the
 // _test package mocks to avoid import cycles (the wb file is package handlers).
 
+// wbNoopPoolService is a PoolService no-op for white-box tests not exercising pool logic.
+type wbNoopPoolService struct{}
+
+func (n *wbNoopPoolService) AddVM(_ context.Context, _ string, _ int64) error { return nil }
+
 type wbMockClient struct {
 	nodesSvc          sdknodes.Service
 	clusterStorageSvc sdkclusterstorage.Service
 	clusterSvc        sdkcluster.Service
 	storageSvc        sdkstorage.Service
+	// poolsSvc is nil → uses wbNoopPoolService.
+	poolsSvc pve.PoolService
 }
 
 func (c *wbMockClient) QEMU() sdkqemu.Service                     { return nil }
@@ -225,6 +251,12 @@ func (c *wbMockClient) Tasks() sdktasks.Service                   { return nil }
 func (c *wbMockClient) Nodes() sdknodes.Service                   { return c.nodesSvc }
 func (c *wbMockClient) Cluster() sdkcluster.Service               { return c.clusterSvc }
 func (c *wbMockClient) ClusterStorage() sdkclusterstorage.Service { return c.clusterStorageSvc }
+func (c *wbMockClient) Pools() pve.PoolService {
+	if c.poolsSvc != nil {
+		return c.poolsSvc
+	}
+	return &wbNoopPoolService{}
+}
 
 var _ pve.Client = (*wbMockClient)(nil)
 
@@ -264,9 +296,16 @@ func (c *wbMockCluster) ListConfigNodes(_ context.Context) (*sdkcluster.ListConf
 	return &resp, nil
 }
 
+func (c *wbMockCluster) ListResources(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+	// Default: no existing VMs → AllocateWithRetry/NextVMID starts at range start.
+	empty := sdkcluster.ListResourcesResponse{}
+	return &empty, nil
+}
+
 type wbMockNodes struct {
 	sdknodes.Service
 	listStorageFn func(_ context.Context, _, _ string, _ *sdknodes.ListStorageContentParams) (*sdknodes.ListStorageContentResponse, error)
+	listQemuFn    func(ctx context.Context, node string, params *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error)
 }
 
 func (n *wbMockNodes) ListStorageContent(ctx context.Context, node, storage string, params *sdknodes.ListStorageContentParams) (*sdknodes.ListStorageContentResponse, error) {
@@ -274,6 +313,15 @@ func (n *wbMockNodes) ListStorageContent(ctx context.Context, node, storage stri
 		return n.listStorageFn(ctx, node, storage, params)
 	}
 	empty := sdknodes.ListStorageContentResponse{}
+	return &empty, nil
+}
+
+func (n *wbMockNodes) ListQemu(ctx context.Context, node string, params *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
+	if n.listQemuFn != nil {
+		return n.listQemuFn(ctx, node, params)
+	}
+	// Default: no existing templates → ensureTemplateVM proceeds to create.
+	empty := sdknodes.ListQemuResponse{}
 	return &empty, nil
 }
 
@@ -297,7 +345,7 @@ func (s *wbMockStorage) DeleteVolumeIfExists(_ context.Context, _, _, _ string) 
 
 // TestHandleCreateStemcell_LightFetch_HappyPath verifies the full fetch success
 // path: mock Source returns fixed body, dedup misses (empty storage), upload
-// records the canonical filename, CID has "light:" prefix with sha8 from body.
+// records the canonical filename, CID is "template:<vmid>" (D-11).
 func TestHandleCreateStemcell_LightFetch_HappyPath(t *testing.T) {
 	t.Parallel()
 
@@ -307,7 +355,6 @@ func TestHandleCreateStemcell_LightFetch_HappyPath(t *testing.T) {
 	sha256hex := hex.EncodeToString(sum[:])
 	sha8 := sha256hex[:8]
 	wantFilename := "bosh-stemcell-ubuntu-jammy-1.438-" + sha8 + ".qcow2"
-	wantCID := "light:nfs:import/" + wantFilename
 
 	var uploadedFilename string
 	deps := wbBuildFetchDeps(t, wbEmptyNodeListFn())
@@ -316,11 +363,14 @@ func TestHandleCreateStemcell_LightFetch_HappyPath(t *testing.T) {
 			stemcellfetch.Reference{Scheme: "https", URL: rawURL},
 			nil
 	}
-	deps.PVE.(*wbMockClient).storageSvc = &wbMockStorage{
-		uploadFn: func(_ context.Context, _, _, _, filename string, body io.Reader) (string, error) {
-			_, _ = io.Copy(io.Discard, body)
-			uploadedFilename = filename
-			return "", nil
+	// Wire custom storage that records uploaded filename.
+	deps.PVE.(*wbTemplateMockClient).storageSvc = &wbTemplateStorage{
+		wbMockStorage: wbMockStorage{
+			uploadFn: func(_ context.Context, _, _, _, filename string, body io.Reader) (string, error) {
+				_, _ = io.Copy(io.Discard, body)
+				uploadedFilename = filename
+				return "", nil
+			},
 		},
 	}
 
@@ -343,8 +393,9 @@ func TestHandleCreateStemcell_LightFetch_HappyPath(t *testing.T) {
 	if !ok {
 		t.Fatalf("result is %T; want string", result)
 	}
-	if cid != wantCID {
-		t.Errorf("CID = %q; want %q", cid, wantCID)
+	// D-11: result is always "template:<vmid>" now.
+	if !pve.IsTemplateStemcellCID(cid) {
+		t.Errorf("CID = %q; want template:<vmid> format", cid)
 	}
 	if uploadedFilename != wantFilename {
 		t.Errorf("uploaded filename = %q; want %q", uploadedFilename, wantFilename)
@@ -353,7 +404,7 @@ func TestHandleCreateStemcell_LightFetch_HappyPath(t *testing.T) {
 
 // TestHandleCreateStemcell_LightFetch_DedupBySHA verifies that when the exact
 // SHA-matched filename already exists on storage, no upload occurs and the
-// existing CID is returned.
+// returned CID is "template:<vmid>" (template built from existing qcow2, D-11).
 func TestHandleCreateStemcell_LightFetch_DedupBySHA(t *testing.T) {
 	t.Parallel()
 
@@ -362,7 +413,6 @@ func TestHandleCreateStemcell_LightFetch_DedupBySHA(t *testing.T) {
 	sha256hex := hex.EncodeToString(sum[:])
 	sha8 := sha256hex[:8]
 	existingFilename := "bosh-stemcell-ubuntu-jammy-1.999-" + sha8 + ".qcow2"
-	wantCID := "light:nfs:import/" + existingFilename
 
 	var uploadCalls []struct{}
 	deps := wbBuildFetchDeps(t, wbExistingVolumeListFn("nfs", existingFilename))
@@ -371,11 +421,13 @@ func TestHandleCreateStemcell_LightFetch_DedupBySHA(t *testing.T) {
 			stemcellfetch.Reference{Scheme: "https", URL: rawURL},
 			nil
 	}
-	deps.PVE.(*wbMockClient).storageSvc = &wbMockStorage{
-		uploadFn: func(_ context.Context, _, _, _, _ string, body io.Reader) (string, error) {
-			_, _ = io.Copy(io.Discard, body)
-			uploadCalls = append(uploadCalls, struct{}{})
-			return "", nil
+	deps.PVE.(*wbTemplateMockClient).storageSvc = &wbTemplateStorage{
+		wbMockStorage: wbMockStorage{
+			uploadFn: func(_ context.Context, _, _, _, _ string, body io.Reader) (string, error) {
+				_, _ = io.Copy(io.Discard, body)
+				uploadCalls = append(uploadCalls, struct{}{})
+				return "", nil
+			},
 		},
 	}
 
@@ -398,8 +450,9 @@ func TestHandleCreateStemcell_LightFetch_DedupBySHA(t *testing.T) {
 	if !ok {
 		t.Fatalf("result is %T; want string", result)
 	}
-	if cid != wantCID {
-		t.Errorf("CID = %q; want %q", cid, wantCID)
+	// D-11: SHA-dedup hit → build template from existing qcow2 → "template:<vmid>".
+	if !pve.IsTemplateStemcellCID(cid) {
+		t.Errorf("CID = %q; want template:<vmid> format", cid)
 	}
 	if len(uploadCalls) != 0 {
 		t.Error("Upload called despite SHA dedup hit; should be skipped")
@@ -510,6 +563,479 @@ func TestOpenStagedFile_StagingDir_NonExistentFile(t *testing.T) {
 	}
 }
 
+// ============================================================
+// ensureTemplateVM unit tests (white-box; package handlers)
+// ============================================================
+
+// wbMockQEMU is a minimal sdkqemu.Service stub for ensureTemplateVM tests.
+// createFn controls Create; all other methods panic on accidental call.
+type wbMockQEMU struct {
+	sdkqemu.Service
+	createFn func(ctx context.Context, node string, params map[string]any) (string, error)
+}
+
+func (q *wbMockQEMU) Create(ctx context.Context, node string, params map[string]any) (string, error) {
+	if q.createFn != nil {
+		return q.createFn(ctx, node, params)
+	}
+	// Default: synchronous success, no UPID.
+	return "", nil
+}
+
+// wbMockTasks is a minimal sdktasks.Service stub for ensureTemplateVM tests.
+// waitFn controls Wait; all other methods panic on accidental call.
+type wbMockTasks struct {
+	sdktasks.Service
+	waitFn func(ctx context.Context, node, upid string, opts *sdktasks.WaitOptions) (*sdktasks.Status, error)
+}
+
+func (t *wbMockTasks) Wait(ctx context.Context, node, upid string, opts *sdktasks.WaitOptions) (*sdktasks.Status, error) {
+	if t.waitFn != nil {
+		return t.waitFn(ctx, node, upid, opts)
+	}
+	return &sdktasks.Status{Status: "stopped", ExitStatus: "OK", UpID: upid}, nil
+}
+
+// wbTemplateNodes extends wbMockNodes with ListQemu and CreateQemuTemplate support.
+type wbTemplateNodes struct {
+	wbMockNodes
+	listQemuFn           func(ctx context.Context, node string, params *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error)
+	createQemuTemplateFn func(ctx context.Context, node, vmid string, params *sdknodes.CreateQemuTemplateParams) (*sdknodes.CreateQemuTemplateResponse, error)
+}
+
+func (n *wbTemplateNodes) ListQemu(ctx context.Context, node string, params *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
+	if n.listQemuFn != nil {
+		return n.listQemuFn(ctx, node, params)
+	}
+	// Default: no existing templates.
+	empty := sdknodes.ListQemuResponse{}
+	return &empty, nil
+}
+
+func (n *wbTemplateNodes) CreateQemuTemplate(ctx context.Context, node, vmid string, params *sdknodes.CreateQemuTemplateParams) (*sdknodes.CreateQemuTemplateResponse, error) {
+	if n.createQemuTemplateFn != nil {
+		return n.createQemuTemplateFn(ctx, node, vmid, params)
+	}
+	// Default: synchronous freeze success, no UPID.
+	raw := sdknodes.CreateQemuTemplateResponse(`""`)
+	return &raw, nil
+}
+
+// wbTemplateMockClient wires QEMU + Tasks + Nodes for ensureTemplateVM tests.
+type wbTemplateMockClient struct {
+	wbMockClient
+	qemuSvc  sdkqemu.Service
+	tasksSvc sdktasks.Service
+}
+
+func (c *wbTemplateMockClient) QEMU() sdkqemu.Service   { return c.qemuSvc }
+func (c *wbTemplateMockClient) Tasks() sdktasks.Service { return c.tasksSvc }
+func (c *wbTemplateMockClient) Pools() pve.PoolService {
+	if c.poolsSvc != nil {
+		return c.poolsSvc
+	}
+	return &wbNoopPoolService{}
+}
+
+// wbTemplateStorage extends wbMockStorage with controllable DeleteVolumeIfExists.
+type wbTemplateStorage struct {
+	wbMockStorage
+	deleteVolumeIfExistsFn func(ctx context.Context, node, storage, volume string) (bool, error)
+}
+
+func (s *wbTemplateStorage) DeleteVolumeIfExists(ctx context.Context, node, storage, volume string) (bool, error) {
+	if s.deleteVolumeIfExistsFn != nil {
+		return s.deleteVolumeIfExistsFn(ctx, node, storage, volume)
+	}
+	// Default: volume absent, no error.
+	return false, nil
+}
+
+// buildEnsureTemplateDeps constructs a Deps suitable for ensureTemplateVM tests.
+// All fields default to success no-ops unless overridden by the caller.
+func buildEnsureTemplateDeps(
+	qemu *wbMockQEMU,
+	nodes *wbTemplateNodes,
+	tasks *wbMockTasks,
+	storage *wbTemplateStorage,
+) Deps {
+	pveClient := &wbTemplateMockClient{
+		wbMockClient: wbMockClient{
+			nodesSvc:   nodes,
+			storageSvc: storage,
+		},
+		qemuSvc:  qemu,
+		tasksSvc: tasks,
+	}
+	return Deps{
+		Config: &config.CPIConfig{
+			Node:            "pve-node1",
+			StemcellStorage: "nfs",
+			VMStorage:       "nfs",
+			// Template VMID range: adaptive default (set by ApplyDefaults in production;
+			// hand-set here for deterministic tests).
+			StemcellTemplateVMIDRangeStart: 6000,
+			StemcellTemplateVMIDRangeEnd:   8999,
+		},
+		PVE:    pveClient,
+		Logger: log.NewNopLogger(),
+	}
+}
+
+// listQemuOneTemplate returns a ListQemu stub reporting a single frozen template
+// with the given name and vmid. Used for idempotency tests.
+func listQemuOneTemplate(name string, vmid int64) func(ctx context.Context, node string, params *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
+	return func(_ context.Context, _ string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
+		isTemplate := true
+		raw, _ := json.Marshal(map[string]any{
+			"vmid":     vmid,
+			"name":     name,
+			"template": isTemplate,
+		})
+		resp := sdknodes.ListQemuResponse{raw}
+		return &resp, nil
+	}
+}
+
+// listQemuEmpty returns a ListQemu stub reporting no VMs.
+func listQemuEmpty() func(ctx context.Context, node string, params *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
+	return func(_ context.Context, _ string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
+		empty := sdknodes.ListQemuResponse{}
+		return &empty, nil
+	}
+}
+
+// listClusterResourcesEmpty returns a ListResources stub reporting no VMs.
+// Used to satisfy AllocateWithRetry's NextVMID call.
+func listClusterResourcesEmpty() func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+	return func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+		empty := sdkcluster.ListResourcesResponse{}
+		return &empty, nil
+	}
+}
+
+// wbClusterForAlloc satisfies the cluster service for AllocateWithRetry.
+type wbClusterForAlloc struct {
+	sdkcluster.Service
+	listResourcesFn func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error)
+}
+
+func (c *wbClusterForAlloc) ListResources(ctx context.Context, params *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+	if c.listResourcesFn != nil {
+		return c.listResourcesFn(ctx, params)
+	}
+	empty := sdkcluster.ListResourcesResponse{}
+	return &empty, nil
+}
+
+// TestEnsureTemplateVM_CreatePath_CpiOwnsSource verifies the create path
+// (no existing template): QEMU.Create called with import-from and sha tag,
+// MakeTemplate called (freeze), source qcow2 deleted (cpiOwnsSource=true),
+// and the returned VMID is in the template range.
+func TestEnsureTemplateVM_CreatePath_CpiOwnsSource(t *testing.T) {
+	t.Parallel()
+
+	const sha256hex = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
+	const sha8 = "abcdef12"
+	const storage = "nfs"
+	const qcow2Filename = "bosh-stemcell-ubuntu-jammy-1.0-" + sha8 + ".qcow2"
+
+	var createParams map[string]any
+	var createCalled bool
+	var freezeCalled bool
+	var deletedVolume string
+	var deletedStorage string
+
+	qemu := &wbMockQEMU{
+		createFn: func(_ context.Context, _ string, params map[string]any) (string, error) {
+			createCalled = true
+			createParams = params
+			return "", nil // synchronous success
+		},
+	}
+	nodes := &wbTemplateNodes{
+		listQemuFn: listQemuEmpty(),
+		createQemuTemplateFn: func(_ context.Context, _, _ string, _ *sdknodes.CreateQemuTemplateParams) (*sdknodes.CreateQemuTemplateResponse, error) {
+			freezeCalled = true
+			raw := sdknodes.CreateQemuTemplateResponse(`""`)
+			return &raw, nil
+		},
+	}
+	tasks := &wbMockTasks{}
+	stor := &wbTemplateStorage{
+		deleteVolumeIfExistsFn: func(_ context.Context, _, storageName, volume string) (bool, error) {
+			deletedStorage = storageName
+			deletedVolume = volume
+			return true, nil
+		},
+	}
+
+	deps := buildEnsureTemplateDeps(qemu, nodes, tasks, stor)
+	// Wire cluster service for AllocateWithRetry → NextVMID.
+	deps.PVE.(*wbTemplateMockClient).clusterSvc = &wbClusterForAlloc{
+		listResourcesFn: listClusterResourcesEmpty(),
+	}
+
+	cp := stemcellCloudProps{Name: "ubuntu-jammy", Version: "1.0"}
+	vmid, err := ensureTemplateVM(context.Background(), deps, "pve-node1", storage, qcow2Filename, sha256hex, true, cp)
+	if err != nil {
+		t.Fatalf("ensureTemplateVM returned error: %v", err)
+	}
+	if vmid < 6000 || vmid > 8999 {
+		t.Errorf("vmid %d outside expected template range [6000,8999]", vmid)
+	}
+	if !createCalled {
+		t.Error("QEMU.Create was not called")
+	}
+	if !freezeCalled {
+		t.Error("Nodes.CreateQemuTemplate (MakeTemplate) was not called")
+	}
+	// Verify sha tag in create params.
+	wantTag := "bosh-stemcell-sha-" + sha8
+	if tag, _ := createParams["tags"].(string); tag != wantTag {
+		t.Errorf("tags = %q; want %q", tag, wantTag)
+	}
+	// Verify import-from in virtio0.
+	wantImportFrom := storage + ":import/" + qcow2Filename
+	virtio0, _ := createParams["virtio0"].(string)
+	if !strings.Contains(virtio0, wantImportFrom) {
+		t.Errorf("virtio0 %q does not contain import-from %q", virtio0, wantImportFrom)
+	}
+	// Verify onboot=0 (no auto-start on template).
+	if onboot, _ := createParams["onboot"].(int); onboot != 0 {
+		t.Errorf("onboot = %d; want 0", onboot)
+	}
+	// Verify source qcow2 deleted (cpiOwnsSource=true). DeleteVolumeIfExists
+	// takes the storage pool and the volume PATH ("import/<file>") as SEPARATE
+	// args — same contract as delete_stemcell. The volume arg must NOT carry a
+	// "<storage>:" prefix, or the pool is double-prefixed and the delete no-ops.
+	wantDeleted := "import/" + qcow2Filename
+	if deletedVolume != wantDeleted {
+		t.Errorf("deleted volume = %q; want %q", deletedVolume, wantDeleted)
+	}
+	if deletedStorage != storage {
+		t.Errorf("delete storage arg = %q; want %q", deletedStorage, storage)
+	}
+}
+
+// TestEnsureTemplateVM_Idempotent_ExistingTemplate verifies that when
+// FindTemplateByName finds an existing template, the existing VMID is returned
+// immediately without creating a new VM or deleting the source qcow2.
+func TestEnsureTemplateVM_Idempotent_ExistingTemplate(t *testing.T) {
+	t.Parallel()
+
+	const existingVMID = int64(6042)
+	var createCalled bool
+	var deleteCalled bool
+
+	qemu := &wbMockQEMU{
+		createFn: func(_ context.Context, _ string, _ map[string]any) (string, error) {
+			createCalled = true
+			return "", nil
+		},
+	}
+	// BuildTemplateName("ubuntu-jammy","1.0") = "bosh-stemcell-ubuntu-jammy-1.0"
+	nodes := &wbTemplateNodes{
+		listQemuFn: listQemuOneTemplate("bosh-stemcell-ubuntu-jammy-1.0", existingVMID),
+	}
+	storage := &wbTemplateStorage{
+		deleteVolumeIfExistsFn: func(_ context.Context, _, _, _ string) (bool, error) {
+			deleteCalled = true
+			return true, nil
+		},
+	}
+	deps := buildEnsureTemplateDeps(qemu, nodes, &wbMockTasks{}, storage)
+	deps.PVE.(*wbTemplateMockClient).clusterSvc = &wbClusterForAlloc{
+		listResourcesFn: listClusterResourcesEmpty(),
+	}
+
+	cp := stemcellCloudProps{Name: "ubuntu-jammy", Version: "1.0"}
+	vmid, err := ensureTemplateVM(context.Background(), deps, "pve-node1", "nfs", "stem.qcow2",
+		"aabbccddee112233aabbccddee112233aabbccddee112233aabbccddee112233", true, cp)
+	if err != nil {
+		t.Fatalf("expected nil error on idempotent reuse, got: %v", err)
+	}
+	if vmid != existingVMID {
+		t.Errorf("vmid = %d; want %d", vmid, existingVMID)
+	}
+	if createCalled {
+		t.Error("QEMU.Create must NOT be called on idempotent reuse path")
+	}
+	if deleteCalled {
+		t.Error("DeleteVolumeIfExists must NOT be called on idempotent reuse path")
+	}
+}
+
+// TestEnsureTemplateVM_MakeTemplateFails_ErrorReturned verifies that when
+// MakeTemplate (freeze) fails, the error is returned and the source qcow2
+// is NOT deleted (template is not safe to use).
+func TestEnsureTemplateVM_MakeTemplateFails_ErrorReturned(t *testing.T) {
+	t.Parallel()
+
+	var deleteCalled bool
+	nodes := &wbTemplateNodes{
+		listQemuFn: listQemuEmpty(),
+		createQemuTemplateFn: func(_ context.Context, _, _ string, _ *sdknodes.CreateQemuTemplateParams) (*sdknodes.CreateQemuTemplateResponse, error) {
+			return nil, errors.New("PVE: cannot freeze: disk locked")
+		},
+	}
+	storage := &wbTemplateStorage{
+		deleteVolumeIfExistsFn: func(_ context.Context, _, _, _ string) (bool, error) {
+			deleteCalled = true
+			return true, nil
+		},
+	}
+	deps := buildEnsureTemplateDeps(&wbMockQEMU{}, nodes, &wbMockTasks{}, storage)
+	deps.PVE.(*wbTemplateMockClient).clusterSvc = &wbClusterForAlloc{
+		listResourcesFn: listClusterResourcesEmpty(),
+	}
+
+	cp := stemcellCloudProps{Name: "ubuntu-focal", Version: "2.0"}
+	_, err := ensureTemplateVM(context.Background(), deps, "pve-node1", "nfs", "focal.qcow2",
+		"aabbccddee112233aabbccddee112233aabbccddee112233aabbccddee112233", true, cp)
+	if err == nil {
+		t.Fatal("expected error when MakeTemplate fails; got nil")
+	}
+	if !strings.Contains(err.Error(), "freeze") {
+		t.Errorf("error %q does not mention freeze", err.Error())
+	}
+	if deleteCalled {
+		t.Error("source qcow2 must NOT be deleted when freeze fails")
+	}
+}
+
+// TestEnsureTemplateVM_CpiOwnsSourceFalse_SourceNotDeleted verifies that when
+// cpiOwnsSource=false (light-preuploaded path), the source qcow2 is never deleted
+// even after successful template creation and freeze.
+func TestEnsureTemplateVM_CpiOwnsSourceFalse_SourceNotDeleted(t *testing.T) {
+	t.Parallel()
+
+	var deleteCalled bool
+	nodes := &wbTemplateNodes{listQemuFn: listQemuEmpty()}
+	storage := &wbTemplateStorage{
+		deleteVolumeIfExistsFn: func(_ context.Context, _, _, _ string) (bool, error) {
+			deleteCalled = true
+			return true, nil
+		},
+	}
+	deps := buildEnsureTemplateDeps(&wbMockQEMU{}, nodes, &wbMockTasks{}, storage)
+	deps.PVE.(*wbTemplateMockClient).clusterSvc = &wbClusterForAlloc{
+		listResourcesFn: listClusterResourcesEmpty(),
+	}
+
+	cp := stemcellCloudProps{Name: "ubuntu-jammy", Version: "3.0"}
+	vmid, err := ensureTemplateVM(context.Background(), deps, "pve-node1", "nfs", "jammy.qcow2",
+		"aabbccddee112233aabbccddee112233aabbccddee112233aabbccddee112233",
+		false, // cpiOwnsSource = false (operator pre-uploaded)
+		cp)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if vmid == 0 {
+		t.Error("expected non-zero vmid")
+	}
+	if deleteCalled {
+		t.Error("DeleteVolumeIfExists must NOT be called when cpiOwnsSource=false")
+	}
+}
+
+// TestEnsureTemplateVM_DeleteFailsBestEffort_VmidStillReturned verifies the D-09
+// best-effort deletion contract: when Storage().DeleteVolumeIfExists fails (e.g.
+// network timeout), the function logs a warning but returns the vmid without error.
+func TestEnsureTemplateVM_DeleteFailsBestEffort_VmidStillReturned(t *testing.T) {
+	t.Parallel()
+
+	nodes := &wbTemplateNodes{listQemuFn: listQemuEmpty()}
+	storage := &wbTemplateStorage{
+		deleteVolumeIfExistsFn: func(_ context.Context, _, _, _ string) (bool, error) {
+			return false, errors.New("storage: timeout deleting volume")
+		},
+	}
+	deps := buildEnsureTemplateDeps(&wbMockQEMU{}, nodes, &wbMockTasks{}, storage)
+	deps.PVE.(*wbTemplateMockClient).clusterSvc = &wbClusterForAlloc{
+		listResourcesFn: listClusterResourcesEmpty(),
+	}
+
+	cp := stemcellCloudProps{Name: "ubuntu-bionic", Version: "4.0"}
+	vmid, err := ensureTemplateVM(context.Background(), deps, "pve-node1", "nfs", "bionic.qcow2",
+		"aabbccddee112233aabbccddee112233aabbccddee112233aabbccddee112233",
+		true, // cpiOwnsSource: delete attempted but fails
+		cp)
+	if err != nil {
+		t.Fatalf("delete failure must not surface as error (best-effort); got: %v", err)
+	}
+	if vmid < 6000 || vmid > 8999 {
+		t.Errorf("vmid %d outside expected template range [6000,8999]", vmid)
+	}
+}
+
+// TestEnsureTemplateVM_SHATagFormat verifies that the tag set on the template VM
+// has the exact format "bosh-stemcell-sha-<sha8>" where sha8 = first 8 hex chars.
+func TestEnsureTemplateVM_SHATagFormat(t *testing.T) {
+	t.Parallel()
+
+	const fullSHA = "deadbeef11223344deadbeef11223344deadbeef11223344deadbeef11223344"
+	const wantTag = "bosh-stemcell-sha-deadbeef"
+
+	var capturedTag string
+	qemu := &wbMockQEMU{
+		createFn: func(_ context.Context, _ string, params map[string]any) (string, error) {
+			capturedTag, _ = params["tags"].(string)
+			return "", nil
+		},
+	}
+	nodes := &wbTemplateNodes{listQemuFn: listQemuEmpty()}
+	deps := buildEnsureTemplateDeps(qemu, nodes, &wbMockTasks{}, &wbTemplateStorage{})
+	deps.PVE.(*wbTemplateMockClient).clusterSvc = &wbClusterForAlloc{
+		listResourcesFn: listClusterResourcesEmpty(),
+	}
+
+	cp := stemcellCloudProps{Name: "ubuntu-focal", Version: "5.0"}
+	vmid, err := ensureTemplateVM(context.Background(), deps, "pve-node1", "nfs", "focal.qcow2", fullSHA, false, cp)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if vmid == 0 {
+		t.Error("expected non-zero vmid")
+	}
+	if capturedTag != wantTag {
+		t.Errorf("tag = %q; want %q", capturedTag, wantTag)
+	}
+}
+
+// TestEnsureTemplateVM_FindTemplateByNameAPIError verifies that an API error
+// from FindTemplateByName (ListQemu) propagates as an error, no VM is created.
+func TestEnsureTemplateVM_FindTemplateByNameAPIError(t *testing.T) {
+	t.Parallel()
+
+	var createCalled bool
+	qemu := &wbMockQEMU{
+		createFn: func(_ context.Context, _ string, _ map[string]any) (string, error) {
+			createCalled = true
+			return "", nil
+		},
+	}
+	nodes := &wbTemplateNodes{
+		listQemuFn: func(_ context.Context, _ string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
+			return nil, errors.New("PVE: connection refused")
+		},
+	}
+	deps := buildEnsureTemplateDeps(qemu, nodes, &wbMockTasks{}, &wbTemplateStorage{})
+	deps.PVE.(*wbTemplateMockClient).clusterSvc = &wbClusterForAlloc{
+		listResourcesFn: listClusterResourcesEmpty(),
+	}
+
+	cp := stemcellCloudProps{Name: "ubuntu-focal", Version: "6.0"}
+	_, err := ensureTemplateVM(context.Background(), deps, "pve-node1", "nfs", "x.qcow2",
+		"aabbccddee112233aabbccddee112233aabbccddee112233aabbccddee112233", true, cp)
+	if err == nil {
+		t.Fatal("expected error when FindTemplateByName fails; got nil")
+	}
+	if createCalled {
+		t.Error("QEMU.Create must NOT be called when FindTemplateByName fails")
+	}
+}
+
 // TestStemcellCloudProps_validateLightMutex_Direct exercises the method
 // directly on constructed struct values. Complements the black-box handler test.
 func TestStemcellCloudProps_validateLightMutex_Direct(t *testing.T) {
@@ -567,5 +1093,149 @@ func TestStemcellCloudProps_validateLightMutex_Direct(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// ============================================================
+// ensureTemplateVM pool-assignment tests
+// ============================================================
+
+// wbRecordingPoolService records AddVM calls for assertion.
+// Replaces wbNoopPoolService in tests that exercise pool assignment.
+type wbRecordingPoolService struct {
+	calls  []wbPoolCall
+	addErr error // when non-nil, returned from every AddVM call
+}
+
+type wbPoolCall struct {
+	poolID string
+	vmid   int64
+}
+
+func (p *wbRecordingPoolService) AddVM(_ context.Context, poolID string, vmid int64) error {
+	p.calls = append(p.calls, wbPoolCall{poolID: poolID, vmid: vmid})
+	return p.addErr
+}
+
+// buildEnsureTemplateDepsWithPool returns a Deps wired with a recording pool service.
+func buildEnsureTemplateDepsWithPool(
+	qemu *wbMockQEMU,
+	nodes *wbTemplateNodes,
+	tasks *wbMockTasks,
+	storage *wbTemplateStorage,
+	pool *wbRecordingPoolService,
+	poolID string,
+) Deps {
+	pveClient := &wbTemplateMockClient{
+		wbMockClient: wbMockClient{
+			nodesSvc:   nodes,
+			storageSvc: storage,
+			poolsSvc:   pool,
+		},
+		qemuSvc:  qemu,
+		tasksSvc: tasks,
+	}
+	return Deps{
+		Config: &config.CPIConfig{
+			Node:                           "pve-node1",
+			StemcellStorage:                "nfs",
+			VMStorage:                      "nfs",
+			StemcellTemplateVMIDRangeStart: 6000,
+			StemcellTemplateVMIDRangeEnd:   8999,
+			StemcellTemplatePool:           poolID,
+		},
+		PVE:    pveClient,
+		Logger: log.NewNopLogger(),
+	}
+}
+
+// TestEnsureTemplateVM_PoolAssignment_Called verifies that when
+// StemcellTemplatePool is set, AssignVMToPool is called with the correct
+// poolID and the allocated VMID after the template is frozen.
+func TestEnsureTemplateVM_PoolAssignment_Called(t *testing.T) {
+	t.Parallel()
+
+	pool := &wbRecordingPoolService{}
+	nodes := &wbTemplateNodes{listQemuFn: listQemuEmpty()}
+	deps := buildEnsureTemplateDepsWithPool(
+		&wbMockQEMU{}, nodes, &wbMockTasks{}, &wbTemplateStorage{},
+		pool, "bosh-stemcells",
+	)
+	deps.PVE.(*wbTemplateMockClient).clusterSvc = &wbClusterForAlloc{
+		listResourcesFn: listClusterResourcesEmpty(),
+	}
+
+	cp := stemcellCloudProps{Name: "ubuntu-jammy", Version: "7.0"}
+	vmid, err := ensureTemplateVM(context.Background(), deps, "pve-node1", "nfs", "jammy.qcow2",
+		"aabbccddee112233aabbccddee112233aabbccddee112233aabbccddee112233", false, cp)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if vmid < 6000 || vmid > 8999 {
+		t.Errorf("vmid %d outside template range", vmid)
+	}
+	if len(pool.calls) != 1 {
+		t.Fatalf("AddVM called %d times; want 1", len(pool.calls))
+	}
+	if pool.calls[0].poolID != "bosh-stemcells" {
+		t.Errorf("AddVM poolID = %q; want %q", pool.calls[0].poolID, "bosh-stemcells")
+	}
+	if pool.calls[0].vmid != vmid {
+		t.Errorf("AddVM vmid = %d; want %d", pool.calls[0].vmid, vmid)
+	}
+}
+
+// TestEnsureTemplateVM_NoPool_AddVMNotCalled verifies that when
+// StemcellTemplatePool is empty, AddVM is never called.
+func TestEnsureTemplateVM_NoPool_AddVMNotCalled(t *testing.T) {
+	t.Parallel()
+
+	pool := &wbRecordingPoolService{}
+	nodes := &wbTemplateNodes{listQemuFn: listQemuEmpty()}
+	deps := buildEnsureTemplateDepsWithPool(
+		&wbMockQEMU{}, nodes, &wbMockTasks{}, &wbTemplateStorage{},
+		pool, "", // empty pool → AddVM must not fire
+	)
+	deps.PVE.(*wbTemplateMockClient).clusterSvc = &wbClusterForAlloc{
+		listResourcesFn: listClusterResourcesEmpty(),
+	}
+
+	cp := stemcellCloudProps{Name: "ubuntu-focal", Version: "8.0"}
+	_, err := ensureTemplateVM(context.Background(), deps, "pve-node1", "nfs", "focal.qcow2",
+		"aabbccddee112233aabbccddee112233aabbccddee112233aabbccddee112233", false, cp)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(pool.calls) != 0 {
+		t.Errorf("AddVM called %d times; want 0 when StemcellTemplatePool is empty", len(pool.calls))
+	}
+}
+
+// TestEnsureTemplateVM_PoolAssignmentError_ReturnsError verifies that an AddVM
+// error from the pool service causes ensureTemplateVM to return an error (fatal
+// misconfiguration contract). The returned error must mention the pool name.
+func TestEnsureTemplateVM_PoolAssignmentError_ReturnsError(t *testing.T) {
+	t.Parallel()
+
+	pool := &wbRecordingPoolService{
+		addErr: errors.New("PVE: resource pool 'bosh-stemcells' not found"),
+	}
+	nodes := &wbTemplateNodes{listQemuFn: listQemuEmpty()}
+	deps := buildEnsureTemplateDepsWithPool(
+		&wbMockQEMU{}, nodes, &wbMockTasks{}, &wbTemplateStorage{},
+		pool, "bosh-stemcells",
+	)
+	deps.PVE.(*wbTemplateMockClient).clusterSvc = &wbClusterForAlloc{
+		listResourcesFn: listClusterResourcesEmpty(),
+	}
+
+	cp := stemcellCloudProps{Name: "ubuntu-bionic", Version: "9.0"}
+	_, err := ensureTemplateVM(context.Background(), deps, "pve-node1", "nfs", "bionic.qcow2",
+		"aabbccddee112233aabbccddee112233aabbccddee112233aabbccddee112233", false, cp)
+	if err == nil {
+		t.Fatal("expected error when pool AddVM fails; got nil")
+	}
+	if !strings.Contains(err.Error(), "bosh-stemcells") {
+		t.Errorf("error %q does not mention pool name", err.Error())
 	}
 }
