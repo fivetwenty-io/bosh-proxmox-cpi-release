@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"slices"
 	"strings"
 	"testing"
 )
@@ -21,10 +22,13 @@ func TestSanitizeTagValue(t *testing.T) {
 		{"MixedCase123", "MixedCase123"},
 	}
 	for _, c := range cases {
-		got := sanitizeTagValue(c.in)
-		if got != c.want {
-			t.Errorf("sanitizeTagValue(%q) = %q, want %q", c.in, got, c.want)
-		}
+		t.Run(c.in, func(t *testing.T) {
+			t.Parallel()
+			got := sanitizeTagValue(c.in)
+			if got != c.want {
+				t.Errorf("sanitizeTagValue(%q) = %q, want %q", c.in, got, c.want)
+			}
+		})
 	}
 }
 
@@ -125,21 +129,25 @@ func TestMergeTagList_Empty(t *testing.T) {
 func TestParseTagsField(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
+		name string
 		in   string
 		want []string
 	}{
-		{"", nil},
-		{"a", []string{"a"}},
-		{"a;b;c", []string{"a", "b", "c"}},
-		{"a,b,c", []string{"a", "b", "c"}},
-		{"a; b ;c", []string{"a", "b", "c"}},
-		{";;a;;", []string{"a"}},
+		{"empty", "", nil},
+		{"single", "a", []string{"a"}},
+		{"semicolon-sep", "a;b;c", []string{"a", "b", "c"}},
+		{"comma-sep", "a,b,c", []string{"a", "b", "c"}},
+		{"with-spaces", "a; b ;c", []string{"a", "b", "c"}},
+		{"empty-tokens", ";;a;;", []string{"a"}},
 	}
 	for _, c := range cases {
-		got := parseTagsField(c.in)
-		if !equalStrings(got, c.want) {
-			t.Errorf("parseTagsField(%q) = %v, want %v", c.in, got, c.want)
-		}
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			got := parseTagsField(c.in)
+			if !slices.Equal(got, c.want) {
+				t.Errorf("parseTagsField(%q) = %v, want %v", c.in, got, c.want)
+			}
+		})
 	}
 }
 
@@ -155,7 +163,7 @@ func TestStripReservedBoshTags(t *testing.T) {
 	}
 	got := stripReservedBoshTags(in)
 	want := []string{"env--prod", "team--payments", "owner--alice"}
-	if !equalStrings(got, want) {
+	if !slices.Equal(got, want) {
 		t.Errorf("got %v, want %v", got, want)
 	}
 }
@@ -170,24 +178,29 @@ func TestStripReservedBoshTags_Empty(t *testing.T) {
 func TestSanitizeVMName(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
-		in, want string
+		name string
+		in   string
+		want string
 	}{
-		{"", ""},
-		{"diego-cell/2844c990-aef3-4de7-8bf3-d936fc2201be", "diego-cell-2844c990-aef3-4de7-8bf3-d936fc2201be"},
-		{"bosh/0", "bosh-0"},
-		{"job_with_underscores/abc", "job-with-underscores-abc"},
-		{"a/b/c", "a-b-c"},
-		{"---leading-and-trailing---", "leading-and-trailing"},
-		{"a..b", "a-b"},  // consecutive invalids collapse
-		{"a/_/b", "a-b"}, // mixed invalids collapse
-		{"MixedCase/123", "MixedCase-123"},
-		{"////", ""}, // all invalids collapse to empty after trim
+		{"empty", "", ""},
+		{"uuid-path", "diego-cell/2844c990-aef3-4de7-8bf3-d936fc2201be", "diego-cell-2844c990-aef3-4de7-8bf3-d936fc2201be"},
+		{"simple-path", "bosh/0", "bosh-0"},
+		{"underscores", "job_with_underscores/abc", "job-with-underscores-abc"},
+		{"multi-segment", "a/b/c", "a-b-c"},
+		{"leading-trailing-dashes", "---leading-and-trailing---", "leading-and-trailing"},
+		{"consecutive-invalids", "a..b", "a-b"},
+		{"mixed-invalids", "a/_/b", "a-b"},
+		{"mixed-case", "MixedCase/123", "MixedCase-123"},
+		{"all-invalids", "////", ""},
 	}
 	for _, c := range cases {
-		got := sanitizeVMName(c.in)
-		if got != c.want {
-			t.Errorf("sanitizeVMName(%q) = %q, want %q", c.in, got, c.want)
-		}
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			got := sanitizeVMName(c.in)
+			if got != c.want {
+				t.Errorf("sanitizeVMName(%q) = %q, want %q", c.in, got, c.want)
+			}
+		})
 	}
 }
 
@@ -201,16 +214,4 @@ func TestSanitizeVMName_TruncatesTo63(t *testing.T) {
 	if strings.HasSuffix(got, "-") {
 		t.Errorf("sanitizeVMName must not end in '-'; got %q", got)
 	}
-}
-
-func equalStrings(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
 }

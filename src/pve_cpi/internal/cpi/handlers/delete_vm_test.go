@@ -22,16 +22,30 @@ func notFoundAPIErr() error {
 func TestHandleDeleteVM_Happy(t *testing.T) {
 	t.Parallel()
 
-	stopCalled := false
-	deleteCalled := false
-	removeCalled := false
+	type stopCall struct {
+		node string
+		vmid int
+	}
+	type deleteCall struct {
+		node         string
+		vmid         string
+		purge        bool
+		destroyUnref bool
+	}
+	type removeCall struct {
+		node string
+		vmid int
+	}
+
+	var (
+		stopCalls   []stopCall
+		deleteCalls []deleteCall
+		removeCalls []removeCall
+	)
 
 	qemuSvc := &mockQEMUService{
 		stopFn: func(_ context.Context, node string, vmid int) (string, error) {
-			if node != vmNode || vmid != 101 {
-				t.Errorf("Stop: unexpected node=%q vmid=%d", node, vmid)
-			}
-			stopCalled = true
+			stopCalls = append(stopCalls, stopCall{node, vmid})
 			return "UPID:node:stop-task", nil
 		},
 		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
@@ -41,16 +55,14 @@ func TestHandleDeleteVM_Happy(t *testing.T) {
 	}
 	nodesSvc := &mockNodesService{
 		deleteQemuFn: func(_ context.Context, node string, vmid string, params *nodes.DeleteQemuParams) (*nodes.DeleteQemuResponse, error) {
-			if node != vmNode || vmid != "101" {
-				t.Errorf("DeleteQemu: unexpected node=%q vmid=%q", node, vmid)
+			dc := deleteCall{node: node, vmid: vmid}
+			if params != nil && params.Purge != nil {
+				dc.purge = *params.Purge
 			}
-			if params == nil || params.Purge == nil || !*params.Purge {
-				t.Error("DeleteQemu: expected purge=true")
+			if params != nil && params.DestroyUnreferencedDisks != nil {
+				dc.destroyUnref = *params.DestroyUnreferencedDisks
 			}
-			if params == nil || params.DestroyUnreferencedDisks == nil || !*params.DestroyUnreferencedDisks {
-				t.Error("DeleteQemu: expected destroy-unreferenced-disks=true")
-			}
-			deleteCalled = true
+			deleteCalls = append(deleteCalls, dc)
 			raw := nodes.DeleteQemuResponse{}
 			return &raw, nil
 		},
@@ -65,10 +77,7 @@ func TestHandleDeleteVM_Happy(t *testing.T) {
 	}
 	agentSvc := &mockAgentService{
 		removeFn: func(_ context.Context, node string, vmid int) error {
-			if node != vmNode || vmid != 101 {
-				t.Errorf("Remove: unexpected node=%q vmid=%d", node, vmid)
-			}
-			removeCalled = true
+			removeCalls = append(removeCalls, removeCall{node, vmid})
 			return nil
 		},
 	}
@@ -82,14 +91,75 @@ func TestHandleDeleteVM_Happy(t *testing.T) {
 	if result != nil {
 		t.Errorf("expected nil result, got %v", result)
 	}
-	if !stopCalled {
-		t.Error("Stop was not called")
+	if len(stopCalls) != 1 {
+		t.Fatalf("Stop: want 1 call, got %d", len(stopCalls))
 	}
-	if !deleteCalled {
-		t.Error("DeleteQemu was not called")
+	if stopCalls[0].node != vmNode || stopCalls[0].vmid != 101 {
+		t.Errorf("Stop: want node=%q vmid=101, got node=%q vmid=%d", vmNode, stopCalls[0].node, stopCalls[0].vmid)
 	}
-	if !removeCalled {
-		t.Error("Agent.Remove was not called")
+	if len(deleteCalls) != 1 {
+		t.Fatalf("DeleteQemu: want 1 call, got %d", len(deleteCalls))
+	}
+	if deleteCalls[0].node != vmNode || deleteCalls[0].vmid != "101" {
+		t.Errorf("DeleteQemu: want node=%q vmid=%q, got node=%q vmid=%q", vmNode, "101", deleteCalls[0].node, deleteCalls[0].vmid)
+	}
+	if !deleteCalls[0].purge {
+		t.Error("DeleteQemu: expected purge=true")
+	}
+	if !deleteCalls[0].destroyUnref {
+		t.Error("DeleteQemu: expected destroy-unreferenced-disks=true")
+	}
+	if len(removeCalls) != 1 {
+		t.Fatalf("Agent.Remove: want 1 call, got %d", len(removeCalls))
+	}
+	if removeCalls[0].node != vmNode || removeCalls[0].vmid != 101 {
+		t.Errorf("Agent.Remove: want node=%q vmid=101, got node=%q vmid=%d", vmNode, removeCalls[0].node, removeCalls[0].vmid)
+	}
+}
+
+// TestHandleDeleteVM_MultiNode_ResolvesCorrectNode verifies that delete_vm
+// forwards the cluster-resolved node to Stop and DeleteQemu even when the VM
+// lives on a non-default cluster member. The cluster response includes three
+// nodes; the VM is on pve02 (not the default pve-node1 from testConfig).
+func TestHandleDeleteVM_MultiNode_ResolvesCorrectNode(t *testing.T) {
+	t.Parallel()
+
+	const vmid = 202
+	const vmOnNode = "pve02"
+
+	var stopNode, deleteNode string
+	qemuSvc := &mockQEMUService{
+		stopFn: func(_ context.Context, node string, _ int) (string, error) {
+			stopNode = node
+			return "UPID:pve02:stop-multi", nil
+		},
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return map[string]any{}, nil
+		},
+	}
+	nodesSvc := &mockNodesService{
+		deleteQemuFn: func(_ context.Context, node string, _ string, _ *nodes.DeleteQemuParams) (*nodes.DeleteQemuResponse, error) {
+			deleteNode = node
+			return &nodes.DeleteQemuResponse{}, nil
+		},
+	}
+	tasksSvc := &mockTasksService{}
+	agentSvc := &mockAgentService{}
+
+	// Wire the multi-node cluster: VM 202 lives on pve02.
+	clusterSvc := defaultMultiNodeClusterSvc(vmid, vmOnNode)
+	deps := testDepsWithCluster(qemuSvc, nodesSvc, tasksSvc, agentSvc, &mockStorageService{}, clusterSvc)
+
+	h := handlers.HandleDeleteVM(deps)
+	_, err := h.Handle(context.Background(), marshalArgs("202"), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if stopNode != vmOnNode {
+		t.Errorf("Stop: want node=%q, got %q", vmOnNode, stopNode)
+	}
+	if deleteNode != vmOnNode {
+		t.Errorf("DeleteQemu: want node=%q, got %q", vmOnNode, deleteNode)
 	}
 }
 

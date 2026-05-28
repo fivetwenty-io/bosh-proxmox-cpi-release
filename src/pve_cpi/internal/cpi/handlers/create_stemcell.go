@@ -278,7 +278,7 @@ func validateStemcellImagePath(imagePath string) error {
 		return nil
 	}
 
-	return cpierrors.Cloud(
+	return cpierrors.StemcellEscapedRoot(
 		"create_stemcell: imagePath %q outside permitted staging root", imagePath)
 }
 
@@ -1101,7 +1101,7 @@ func extractTarCandidates(tr *tar.Reader, tmpDir string, cleanup func()) ([]tarC
 		}
 		if terr != nil {
 			cleanup()
-			return nil, cpierrors.Cloud("resolveStemcellImage: tar: %s", terr.Error())
+			return nil, cpierrors.StemcellInvalidTar("resolveStemcellImage: tar: %s", terr.Error())
 		}
 		if hdr.Typeflag != tar.TypeReg {
 			continue
@@ -1115,7 +1115,7 @@ func extractTarCandidates(tr *tar.Reader, tmpDir string, cleanup func()) ([]tarC
 		// invalidate the io.CopyN bound below.
 		if hdr.Size < 0 {
 			cleanup()
-			return nil, cpierrors.Cloud(
+			return nil, cpierrors.StemcellInvalidTar(
 				"create_stemcell: malformed tar header (negative size %d for %s)",
 				hdr.Size, hdr.Name)
 		}
@@ -1131,7 +1131,7 @@ func extractTarCandidates(tr *tar.Reader, tmpDir string, cleanup func()) ([]tarC
 		totalExtracted += hdr.Size
 		if totalExtracted > MaxStemcellTotalExtract {
 			cleanup()
-			return nil, cpierrors.Cloud(
+			return nil, cpierrors.StemcellExtractCap(
 				"create_stemcell: tarball entries exceed maximum %dGB; refusing to extract",
 				MaxStemcellTotalExtract/(1024*1024*1024))
 		}
@@ -1191,7 +1191,7 @@ func selectTarCandidate(candidates []tarCandidate, imagePath string, cleanup fun
 		// magic-byte detection against an empty path and uploading a
 		// zero-byte file to PVE.
 		cleanup()
-		return "", "", cpierrors.Cloud(
+		return "", "", cpierrors.StemcellNoCandidate(
 			"create_stemcell: no usable disk image candidate in tarball %s",
 			imagePath)
 	}
@@ -1240,7 +1240,7 @@ func detectExtractedFormat(imgPath, defaultFormat string, cleanup func()) (strin
 		fi, sterr := os.Stat(imgPath)
 		if sterr != nil || fi.Size() < 1024*1024 {
 			cleanup()
-			return "", cpierrors.Cloud(
+			return "", cpierrors.StemcellMagicMismatch(
 				"create_stemcell: extracted image at %s has unknown magic bytes %x; expected qcow2/gzip/lz4/raw",
 				imgPath, magic[:n])
 		}

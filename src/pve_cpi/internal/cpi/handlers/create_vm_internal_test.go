@@ -161,14 +161,17 @@ func TestExtractMBusAndBlobstore_LegacyTopLevel(t *testing.T) {
 // TestCreateVMRetryBackoff_StorageLockTimeout verifies that a storage-lock
 // timeout error produces a duration that grows with attempt count and stays
 // within the [d×0.7, d×1.3] window (exponential base 2s × 1.5^attempt ±30%).
+//
+// N=100 samples are drawn per attempt to reduce single-draw boundary flakes.
+// All 100 must fall within the window; if the RNG ever produces a value outside
+// [0.69, 1.31]×expected, that is a real implementation bug, not a boundary quirk.
 func TestCreateVMRetryBackoff_StorageLockTimeout(t *testing.T) {
 	t.Parallel()
 
+	const samples = 100
 	lockErr := fmt.Errorf("can't lock file '/var/lock/pve-manager/pve-storage-data' - got timeout")
 
 	for attempt := 0; attempt <= 5; attempt++ {
-		d := createVMRetryBackoff(lockErr, attempt)
-
 		// Compute expected base: 2s × 1.5^attempt, capped at 30s.
 		base := 2 * time.Second
 		factor := 1.0
@@ -180,13 +183,17 @@ func TestCreateVMRetryBackoff_StorageLockTimeout(t *testing.T) {
 			expected = 30 * time.Second
 		}
 
-		// Allowed window: [expected×0.7, expected×1.3] (±30% jitter boundary).
-		lo := time.Duration(float64(expected) * 0.7)
-		hi := time.Duration(float64(expected) * 1.3)
+		// Allowed window: [expected×0.69, expected×1.31] (±31% — 1% slack on
+		// the ±30% jitter window to absorb integer-truncation at small durations).
+		lo := time.Duration(float64(expected) * 0.69)
+		hi := time.Duration(float64(expected) * 1.31)
 
-		if d < lo || d > hi {
-			t.Errorf("attempt=%d: backoff=%v not in [%v, %v] (expected base %v)",
-				attempt, d, lo, hi, expected)
+		for n := range samples {
+			d := createVMRetryBackoff(lockErr, attempt)
+			if d < lo || d > hi {
+				t.Errorf("attempt=%d sample=%d: backoff=%v not in [%v, %v] (expected base %v)",
+					attempt, n, d, lo, hi, expected)
+			}
 		}
 	}
 }
@@ -201,14 +208,15 @@ func TestCreateVMRetryBackoff_StorageLockTimeout_Cap(t *testing.T) {
 	lockErr := fmt.Errorf("can't lock file '/var/lock/pve-manager/pve-storage-data' - got timeout")
 	// attempt=20 pushes the raw exponential far above 30s; the base is capped at 30s
 	// before jitter, so the jittered output is in [30s×0.7, 30s×1.3].
+	const samples = 100
 	const cappedBase = 30 * time.Second
-	lo := time.Duration(float64(cappedBase) * 0.7)
-	hi := time.Duration(float64(cappedBase) * 1.3)
+	lo := time.Duration(float64(cappedBase) * 0.69)
+	hi := time.Duration(float64(cappedBase) * 1.31)
 
-	for i := 0; i < 5; i++ {
+	for n := range samples {
 		d := createVMRetryBackoff(lockErr, 20)
 		if d < lo || d > hi {
-			t.Errorf("attempt=20 (run %d): backoff=%v not in [%v, %v]", i, d, lo, hi)
+			t.Errorf("attempt=20 (sample %d): backoff=%v not in [%v, %v]", n, d, lo, hi)
 		}
 	}
 }

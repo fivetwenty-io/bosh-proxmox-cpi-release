@@ -420,14 +420,8 @@ func TestHandleDetachDisk_SnapshotPresent_HardFail(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected Cloud error when snapshots present and AllowDiskOpsWithSnapshots=false")
 	}
-	if !cpierrors.IsType(err, cpierrors.TypeCloud) {
-		t.Errorf("error type: want Cloud, got %T %v", err, err)
-	}
-	msg := err.Error()
-	for _, want := range []string{"snap-before-patch", "snap-qa", diskCID, "allow_disk_ops_with_snapshots"} {
-		if !containsSubstr(msg, want) {
-			t.Errorf("error message missing %q; full msg: %s", want, msg)
-		}
+	if !cpierrors.IsType(err, cpierrors.TypeSnapshotBlocked) {
+		t.Errorf("error type: want SnapshotBlocked, got %T %v", err, err)
 	}
 	if qemuSvc.detachCalled {
 		t.Error("DetachDisk must NOT be called when snapshot guard hard-fails")

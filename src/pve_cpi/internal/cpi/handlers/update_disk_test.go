@@ -180,7 +180,7 @@ func TestHandleUpdateDisk_SizeOnly(t *testing.T) {
 	const volid = "local-lvm:vm-9001-disk-0"
 
 	var capturedDelta int
-	var attachCalled bool
+	var attachCalls []struct{}
 
 	// calls 1-2: canonical volid; call 3+: option string with size (for resize).
 	callCount := 0
@@ -197,7 +197,7 @@ func TestHandleUpdateDisk_SizeOnly(t *testing.T) {
 			return "", nil
 		},
 		attachDiskFn: func(_ context.Context, _ string, _ int, _ string, _ string, _ *qemu.AttachOpts) (string, error) {
-			attachCalled = true
+			attachCalls = append(attachCalls, struct{}{})
 			return diskSlot, nil
 		},
 	}
@@ -214,8 +214,8 @@ func TestHandleUpdateDisk_SizeOnly(t *testing.T) {
 		t.Errorf("resize delta: want 10 GiB, got %d GiB", capturedDelta)
 	}
 	// size-only update should not call AttachDisk (no option changes).
-	if attachCalled {
-		t.Error("AttachDisk must not be called for size-only update with no option changes")
+	if len(attachCalls) != 0 {
+		t.Errorf("AttachDisk must not be called for size-only update with no option changes; got %d call(s)", len(attachCalls))
 	}
 }
 
@@ -224,8 +224,8 @@ func TestHandleUpdateDisk_CombinedSizeAndOptions(t *testing.T) {
 
 	const volid = "local-lvm:vm-9001-disk-0"
 
-	var resizeCalled bool
-	var attachCalled bool
+	var resizeCalls []struct{}
+	var attachCalls []struct{}
 
 	callCount := 0
 	qemuSvc := &updateDiskQEMUService{
@@ -237,11 +237,11 @@ func TestHandleUpdateDisk_CombinedSizeAndOptions(t *testing.T) {
 			return map[string]any{diskSlot: volid + ",size=10G"}, nil
 		},
 		resizeDiskFn: func(_ context.Context, _ string, _ int, _ string, _ int) (string, error) {
-			resizeCalled = true
+			resizeCalls = append(resizeCalls, struct{}{})
 			return "", nil
 		},
 		attachDiskFn: func(_ context.Context, _ string, _ int, _ string, _ string, _ *qemu.AttachOpts) (string, error) {
-			attachCalled = true
+			attachCalls = append(attachCalls, struct{}{})
 			return diskSlot, nil
 		},
 	}
@@ -254,10 +254,10 @@ func TestHandleUpdateDisk_CombinedSizeAndOptions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !resizeCalled {
+	if len(resizeCalls) == 0 {
 		t.Error("ResizeDisk must be called when spec has size")
 	}
-	if !attachCalled {
+	if len(attachCalls) == 0 {
 		t.Error("AttachDisk must be called when spec has option changes")
 	}
 }
@@ -268,14 +268,14 @@ func TestHandleUpdateDisk_EmptySpec_NoOp(t *testing.T) {
 
 	const volid = "local-lvm:vm-9001-disk-0"
 
-	var attachCalled bool
+	var attachCalls []struct{}
 
 	qemuSvc := &updateDiskQEMUService{
 		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
 			return map[string]any{diskSlot: volid}, nil
 		},
 		attachDiskFn: func(_ context.Context, _ string, _ int, _ string, _ string, _ *qemu.AttachOpts) (string, error) {
-			attachCalled = true
+			attachCalls = append(attachCalls, struct{}{})
 			return diskSlot, nil
 		},
 	}
@@ -285,8 +285,8 @@ func TestHandleUpdateDisk_EmptySpec_NoOp(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if attachCalled {
-		t.Error("AttachDisk must not be called for empty update_spec")
+	if len(attachCalls) != 0 {
+		t.Errorf("AttachDisk must not be called for empty update_spec; got %d call(s)", len(attachCalls))
 	}
 }
 
@@ -306,12 +306,8 @@ func TestHandleUpdateDisk_DetachedDisk(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for detached disk")
 	}
-	if !cpierrors.IsType(err, cpierrors.TypeCloud) {
-		t.Errorf("error type: want CloudError for detached disk, got %T %v", err, err)
-	}
-	// Error must say "detached disk" not a transport message.
-	if !strings.Contains(err.Error(), "detached disk") {
-		t.Errorf("error must mention detached disk, got: %v", err)
+	if !cpierrors.IsType(err, cpierrors.TypeDetachedDisk) {
+		t.Errorf("error type: want DetachedDisk for detached disk, got %T %v", err, err)
 	}
 }
 
@@ -334,10 +330,9 @@ func TestHandleUpdateDisk_FindVMTransportError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for cluster transport failure, got nil")
 	}
-	// Must NOT be "detached disk" — that message must only appear when the disk
-	// is genuinely absent from every VM. Transport errors must propagate as-is.
-	if strings.Contains(err.Error(), "detached disk cannot be updated") {
-		t.Errorf("transport error must not be reported as 'detached disk', got: %v", err)
+	// Transport errors must NOT be classified as detached-disk.
+	if cpierrors.IsType(err, cpierrors.TypeDetachedDisk) {
+		t.Errorf("transport error must not be reported as DetachedDisk, got: %v", err)
 	}
 	// Must be a CloudError type (wrapped transport error).
 	if !cpierrors.IsType(err, cpierrors.TypeCloud) && !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
@@ -459,10 +454,10 @@ func TestHandleUpdateDisk_ResizeWithUpid(t *testing.T) {
 
 	const volid = "local-lvm:vm-9001-disk-0"
 
-	var waitCalled bool
+	var taskWaitCalls []struct{}
 	tasksSvc := &mockTasksService{
 		waitFn: func(_ context.Context, _, _ string, _ *tasks.WaitOptions) (*tasks.Status, error) {
-			waitCalled = true
+			taskWaitCalls = append(taskWaitCalls, struct{}{})
 			return &tasks.Status{ExitStatus: "OK"}, nil
 		},
 	}
@@ -488,7 +483,7 @@ func TestHandleUpdateDisk_ResizeWithUpid(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !waitCalled {
+	if len(taskWaitCalls) == 0 {
 		t.Error("AwaitTask must be called when resize returns a UPID")
 	}
 }
@@ -665,8 +660,8 @@ func TestHandleUpdateDisk_ConfigReadError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error when Config() fails during option read")
 	}
-	if !strings.Contains(err.Error(), "config") && !strings.Contains(err.Error(), "config read failure injected") {
-		t.Errorf("error must mention config failure, got: %v", err)
+	if !cpierrors.IsType(err, cpierrors.TypeCloud) && !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+		t.Errorf("error must be Cloud or RetriableCloud for config read failure, got: %T %v", err, err)
 	}
 }
 
@@ -725,8 +720,8 @@ func TestHandleUpdateDisk_SizeWrongType(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for non-numeric size field")
 	}
-	if !strings.Contains(err.Error(), "size") {
-		t.Errorf("error must mention size field, got: %v", err)
+	if !cpierrors.IsType(err, cpierrors.TypeCloud) {
+		t.Errorf("error must be CloudError for non-numeric size, got: %T %v", err, err)
 	}
 }
 

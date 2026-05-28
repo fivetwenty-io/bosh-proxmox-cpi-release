@@ -1126,6 +1126,10 @@ func TestAttachDisk_ConcurrentSameVM(t *testing.T) {
 		err error
 	}
 
+	// workers = 2: minimum concurrent load to prove the per-goroutine mock
+	// isolation prevents data races. Higher values would increase test runtime
+	// without exercising additional code paths; the race detector catches
+	// shared-state bugs regardless of goroutine count.
 	const workers = 2
 	results := make(chan callResult, workers)
 

@@ -31,6 +31,37 @@ const (
 
 	// TypeNotSupported signals an unsupported operation (e.g., shrink disk); not retriable.
 	TypeNotSupported Type = "Bosh::Clouds::NotSupported"
+
+	// TypeDetachedDisk signals that a disk operation was requested on a disk not
+	// attached to any VM; not retriable.
+	TypeDetachedDisk Type = "Bosh::Clouds::DetachedDisk"
+
+	// TypeSnapshotBlocked signals that a disk operation was rejected because the VM
+	// has active snapshots that prevent the operation; not retriable.
+	TypeSnapshotBlocked Type = "Bosh::Clouds::SnapshotBlocked"
+
+	// TypeStemcellExtractCap signals that a stemcell tarball declared cumulative
+	// entry sizes exceeding MaxStemcellTotalExtract; not retriable.
+	TypeStemcellExtractCap Type = "Bosh::Clouds::StemcellExtractCap"
+
+	// TypeStemcellMagicMismatch signals that the extracted image file has unknown
+	// or unsupported magic bytes (not qcow2, gzip, lz4, or raw); not retriable.
+	TypeStemcellMagicMismatch Type = "Bosh::Clouds::StemcellMagicMismatch"
+
+	// TypeStemcellNoCandidate signals that the stemcell tarball contained no usable
+	// disk image candidate; not retriable.
+	TypeStemcellNoCandidate Type = "Bosh::Clouds::StemcellNoCandidate"
+
+	// TypeStemcellEscapedRoot signals that the image path resolved outside the
+	// permitted staging root; not retriable.
+	TypeStemcellEscapedRoot Type = "Bosh::Clouds::StemcellEscapedRoot"
+
+	// TypeStemcellInvalidTar signals that the stemcell tarball contained a
+	// malformed tar header (e.g., negative declared size); not retriable.
+	TypeStemcellInvalidTar Type = "Bosh::Clouds::StemcellInvalidTar"
+
+	// TypeRegistryConflict signals a registry write conflict; not retriable.
+	TypeRegistryConflict Type = "Bosh::Clouds::RegistryConflict"
 )
 
 // Error is the unified BOSH CPI error value. All constructors return *Error.
@@ -135,6 +166,86 @@ func NotSupported(operation, reason string) *Error {
 	return &Error{
 		typ:       TypeNotSupported,
 		msg:       fmt.Sprintf("operation not supported: %s (%s)", operation, reason),
+		retriable: false,
+	}
+}
+
+// DetachedDisk returns a non-retriable error indicating the disk is not
+// attached to any VM and therefore cannot be operated on.
+func DetachedDisk(format string, args ...any) *Error {
+	return &Error{
+		typ:       TypeDetachedDisk,
+		msg:       fmt.Sprintf(format, args...),
+		retriable: false,
+	}
+}
+
+// SnapshotBlocked returns a non-retriable error indicating a disk operation was
+// blocked because active VM snapshots prevent it.
+func SnapshotBlocked(format string, args ...any) *Error {
+	return &Error{
+		typ:       TypeSnapshotBlocked,
+		msg:       fmt.Sprintf(format, args...),
+		retriable: false,
+	}
+}
+
+// StemcellExtractCap returns a non-retriable error indicating a stemcell tarball
+// declared sizes exceeding the extraction cap.
+func StemcellExtractCap(format string, args ...any) *Error {
+	return &Error{
+		typ:       TypeStemcellExtractCap,
+		msg:       fmt.Sprintf(format, args...),
+		retriable: false,
+	}
+}
+
+// StemcellMagicMismatch returns a non-retriable error indicating the extracted
+// image has unrecognized magic bytes.
+func StemcellMagicMismatch(format string, args ...any) *Error {
+	return &Error{
+		typ:       TypeStemcellMagicMismatch,
+		msg:       fmt.Sprintf(format, args...),
+		retriable: false,
+	}
+}
+
+// StemcellNoCandidate returns a non-retriable error indicating no usable disk
+// image candidate was found in the stemcell tarball.
+func StemcellNoCandidate(format string, args ...any) *Error {
+	return &Error{
+		typ:       TypeStemcellNoCandidate,
+		msg:       fmt.Sprintf(format, args...),
+		retriable: false,
+	}
+}
+
+// StemcellEscapedRoot returns a non-retriable error indicating the image path
+// resolved outside the permitted staging root.
+func StemcellEscapedRoot(format string, args ...any) *Error {
+	return &Error{
+		typ:       TypeStemcellEscapedRoot,
+		msg:       fmt.Sprintf(format, args...),
+		retriable: false,
+	}
+}
+
+// StemcellInvalidTar returns a non-retriable error indicating a malformed tar
+// entry in the stemcell archive.
+func StemcellInvalidTar(format string, args ...any) *Error {
+	return &Error{
+		typ:       TypeStemcellInvalidTar,
+		msg:       fmt.Sprintf(format, args...),
+		retriable: false,
+	}
+}
+
+// RegistryConflict returns a non-retriable error indicating a registry write
+// conflict.
+func RegistryConflict(format string, args ...any) *Error {
+	return &Error{
+		typ:       TypeRegistryConflict,
+		msg:       fmt.Sprintf(format, args...),
 		retriable: false,
 	}
 }

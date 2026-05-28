@@ -115,6 +115,32 @@ func TestHandleHasVM_EmptyVMCID(t *testing.T) {
 	}
 }
 
+// TestHandleHasVM_MultiNode_FoundOnNonDefaultNode verifies that has_vm returns
+// true when the cluster scan resolves the VM on a member other than the default
+// node. The cluster contains three members; the target VM lives on pve03.
+func TestHandleHasVM_MultiNode_FoundOnNonDefaultNode(t *testing.T) {
+	t.Parallel()
+
+	const vmid = 303
+	const vmOnNode = "pve03"
+
+	clusterSvc := defaultMultiNodeClusterSvc(vmid, vmOnNode)
+	deps := testDepsWithCluster(nil, nil, nil, &mockAgentService{}, &mockStorageService{}, clusterSvc)
+
+	h := handlers.HandleHasVM(deps)
+	result, err := h.Handle(context.Background(), marshalArgs("303"), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	got, ok := result.(bool)
+	if !ok {
+		t.Fatalf("expected bool result, got %T", result)
+	}
+	if !got {
+		t.Error("expected true (VM exists on pve03), got false")
+	}
+}
+
 // TestHandleHasVM_ZeroVMID verifies zero VMID is rejected.
 func TestHandleHasVM_ZeroVMID(t *testing.T) {
 	t.Parallel()

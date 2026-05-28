@@ -1,8 +1,9 @@
 package handlers
 
 import (
-	"strings"
 	"testing"
+
+	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 )
 
 // TestParseDiskSizeGiB_Units exercises the unit-handling branches of
@@ -43,6 +44,7 @@ func TestParseDiskSizeGiB_Units(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			got, err := parseDiskSizeGiB(tc.optStr)
 			if tc.wantErr {
 				if err == nil {
@@ -69,7 +71,7 @@ func TestParseDiskSizeGiB_NegativeRejected(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for negative size, got nil")
 	}
-	if !strings.Contains(err.Error(), "non-negative") && !strings.Contains(err.Error(), "parse") {
-		t.Errorf("error string should mention non-negative or parse failure; got %v", err)
+	if !cpierrors.IsType(err, cpierrors.TypeCloud) {
+		t.Errorf("error type: want CloudError for negative size, got %T %v", err, err)
 	}
 }

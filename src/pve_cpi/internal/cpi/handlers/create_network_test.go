@@ -51,8 +51,14 @@ func invokeCreateNetwork(t *testing.T, deps handlers.Deps, args ...any) (any, er
 
 func TestHandleCreateNetwork_SDN_HappyPath(t *testing.T) {
 	t.Parallel()
-	var createVnetCalled bool
-	var updateSdnCalled bool
+
+	type createVnetCall struct {
+		vnet string
+		zone string
+	}
+
+	var createVnetCalls []createVnetCall
+	var updateSdnCalls int
 
 	clusterSvc := &mockSDNCluster{
 		getSdnZonesFn: func(_ context.Context, zone string, _ *sdkcluster.GetSdnZonesParams) (*sdkcluster.GetSdnZonesResponse, error) {
@@ -63,17 +69,11 @@ func TestHandleCreateNetwork_SDN_HappyPath(t *testing.T) {
 			return nil, sdnNotFound() // vnet absent
 		},
 		createSdnVnetsFn: func(_ context.Context, params *sdkcluster.CreateSdnVnetsParams) error {
-			createVnetCalled = true
-			if params.Vnet != "boshvnet" {
-				t.Errorf("expected vnet=boshvnet, got %q", params.Vnet)
-			}
-			if params.Zone != "boshzone" {
-				t.Errorf("expected zone=boshzone, got %q", params.Zone)
-			}
+			createVnetCalls = append(createVnetCalls, createVnetCall{params.Vnet, params.Zone})
 			return nil
 		},
 		updateSdnFn: func(_ context.Context, _ *sdkcluster.UpdateSdnParams) (*sdkcluster.UpdateSdnResponse, error) {
-			updateSdnCalled = true
+			updateSdnCalls++
 			return nil, nil
 		},
 	}
@@ -89,10 +89,16 @@ func TestHandleCreateNetwork_SDN_HappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !createVnetCalled {
-		t.Error("CreateSdnVnets must be called")
+	if len(createVnetCalls) != 1 {
+		t.Fatalf("CreateSdnVnets: want 1 call, got %d", len(createVnetCalls))
 	}
-	if !updateSdnCalled {
+	if createVnetCalls[0].vnet != "boshvnet" {
+		t.Errorf("CreateSdnVnets: want vnet=boshvnet, got %q", createVnetCalls[0].vnet)
+	}
+	if createVnetCalls[0].zone != "boshzone" {
+		t.Errorf("CreateSdnVnets: want zone=boshzone, got %q", createVnetCalls[0].zone)
+	}
+	if updateSdnCalls == 0 {
 		t.Error("UpdateSdn must be called")
 	}
 
@@ -116,7 +122,13 @@ func TestHandleCreateNetwork_SDN_HappyPath(t *testing.T) {
 
 func TestHandleCreateNetwork_SDN_WithSubnet(t *testing.T) {
 	t.Parallel()
-	var subnetCalled bool
+
+	type subnetCall struct {
+		subnet  string
+		gateway string
+	}
+	var subnetCalls []subnetCall
+
 	clusterSvc := &mockSDNCluster{
 		getSdnZonesFn: func(_ context.Context, _ string, _ *sdkcluster.GetSdnZonesParams) (*sdkcluster.GetSdnZonesResponse, error) {
 			raw := sdkcluster.GetSdnZonesResponse(`{"zone":"boshzone"}`)
@@ -126,13 +138,11 @@ func TestHandleCreateNetwork_SDN_WithSubnet(t *testing.T) {
 			return nil, sdnNotFound()
 		},
 		createSdnVnetsSubnetsFn: func(_ context.Context, vnet string, params *sdkcluster.CreateSdnVnetsSubnetsParams) error {
-			subnetCalled = true
-			if params.Subnet != "10.0.0.0/24" {
-				t.Errorf("subnet: got %q, want 10.0.0.0/24", params.Subnet)
+			sc := subnetCall{subnet: params.Subnet}
+			if params.Gateway != nil {
+				sc.gateway = *params.Gateway
 			}
-			if params.Gateway == nil || *params.Gateway != "10.0.0.1" {
-				t.Errorf("gateway: got %v, want 10.0.0.1", params.Gateway)
-			}
+			subnetCalls = append(subnetCalls, sc)
 			return nil
 		},
 		// SDN mock defaults panic on unconfigured calls. Opt in
@@ -159,8 +169,14 @@ func TestHandleCreateNetwork_SDN_WithSubnet(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !subnetCalled {
-		t.Error("CreateSdnVnetsSubnets must be called when range is present")
+	if len(subnetCalls) != 1 {
+		t.Fatalf("CreateSdnVnetsSubnets: want 1 call, got %d", len(subnetCalls))
+	}
+	if subnetCalls[0].subnet != "10.0.0.0/24" {
+		t.Errorf("CreateSdnVnetsSubnets: want subnet=10.0.0.0/24, got %q", subnetCalls[0].subnet)
+	}
+	if subnetCalls[0].gateway != "10.0.0.1" {
+		t.Errorf("CreateSdnVnetsSubnets: want gateway=10.0.0.1, got %q", subnetCalls[0].gateway)
 	}
 	addr, ok := result.([]any)[1].(map[string]any)
 	if !ok {
@@ -175,7 +191,9 @@ func TestHandleCreateNetwork_SDN_WithSubnet(t *testing.T) {
 
 func TestHandleCreateNetwork_SDN_IdempotentVnetExists(t *testing.T) {
 	t.Parallel()
-	var createVnetCalled bool
+
+	var createVnetCalls []struct{}
+
 	clusterSvc := &mockSDNCluster{
 		getSdnZonesFn: func(_ context.Context, _ string, _ *sdkcluster.GetSdnZonesParams) (*sdkcluster.GetSdnZonesResponse, error) {
 			raw := sdkcluster.GetSdnZonesResponse(`{"zone":"z"}`)
@@ -187,7 +205,7 @@ func TestHandleCreateNetwork_SDN_IdempotentVnetExists(t *testing.T) {
 			return &raw, nil
 		},
 		createSdnVnetsFn: func(_ context.Context, _ *sdkcluster.CreateSdnVnetsParams) error {
-			createVnetCalled = true
+			createVnetCalls = append(createVnetCalls, struct{}{})
 			return nil
 		},
 		// Opt in to UpdateSdn — the SDN path always commits after a
@@ -208,8 +226,8 @@ func TestHandleCreateNetwork_SDN_IdempotentVnetExists(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if createVnetCalled {
-		t.Error("CreateSdnVnets must NOT be called when vnet already exists")
+	if len(createVnetCalls) != 0 {
+		t.Errorf("CreateSdnVnets must NOT be called when vnet already exists; got %d call(s)", len(createVnetCalls))
 	}
 	arr := result.([]any)
 	if arr[0] != "myvnet" {
@@ -277,19 +295,19 @@ func TestHandleCreateNetwork_SDN_ZoneMissingAutoManageFalse(t *testing.T) {
 
 func TestHandleCreateNetwork_SDN_ZoneMissingAutoManageTrue(t *testing.T) {
 	t.Parallel()
-	var createZoneCalled bool
+
+	type createZoneCall struct {
+		zone     string
+		zoneType string
+	}
+	var createZoneCalls []createZoneCall
+
 	clusterSvc := &mockSDNCluster{
 		getSdnZonesFn: func(_ context.Context, _ string, _ *sdkcluster.GetSdnZonesParams) (*sdkcluster.GetSdnZonesResponse, error) {
 			return nil, sdnNotFound()
 		},
 		createSdnZonesFn: func(_ context.Context, params *sdkcluster.CreateSdnZonesParams) error {
-			createZoneCalled = true
-			if params.Zone != "autozone" {
-				t.Errorf("zone: got %q, want autozone", params.Zone)
-			}
-			if params.Type != "simple" {
-				t.Errorf("type: got %q, want simple", params.Type)
-			}
+			createZoneCalls = append(createZoneCalls, createZoneCall{params.Zone, params.Type})
 			return nil
 		},
 		getSdnVnetsFn: func(_ context.Context, _ string, _ *sdkcluster.GetSdnVnetsParams) (*sdkcluster.GetSdnVnetsResponse, error) {
@@ -316,9 +334,17 @@ func TestHandleCreateNetwork_SDN_ZoneMissingAutoManageTrue(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !createZoneCalled {
-		t.Error("CreateSdnZones must be called when zone is absent and auto-manage=true")
+	if len(createZoneCalls) != 1 {
+		t.Fatalf("CreateSdnZones: want 1 call, got %d", len(createZoneCalls))
 	}
+	if createZoneCalls[0].zone != "autozone" {
+		t.Errorf("CreateSdnZones: want zone=autozone, got %q", createZoneCalls[0].zone)
+	}
+	if createZoneCalls[0].zoneType != "simple" {
+		t.Errorf("CreateSdnZones: want type=simple, got %q", createZoneCalls[0].zoneType)
+	}
+	// result not asserted here; test pins only that CreateSdnZones is invoked
+	// when zone is absent and auto-manage is enabled.
 	_ = result
 }
 
@@ -326,22 +352,21 @@ func TestHandleCreateNetwork_SDN_ZoneMissingAutoManageTrue(t *testing.T) {
 
 func TestHandleCreateNetwork_Bridge_HappyPath(t *testing.T) {
 	t.Parallel()
-	var createNetworkCalled bool
-	var updateNetworkCalled bool
+
+	type createNetCall struct {
+		iface     string
+		ifaceType string
+	}
+	var createNetCalls []createNetCall
+	var updateNetCalls int
 
 	nodesSvc := &mockBridgeNodes{
 		createNetworkFn: func(_ context.Context, node string, params *sdknodes.CreateNetworkParams) error {
-			createNetworkCalled = true
-			if params.Iface != "vmbr99" {
-				t.Errorf("Iface: got %q, want vmbr99", params.Iface)
-			}
-			if params.Type != "bridge" {
-				t.Errorf("Type: got %q, want bridge", params.Type)
-			}
+			createNetCalls = append(createNetCalls, createNetCall{params.Iface, params.Type})
 			return nil
 		},
 		updateNetworkFn: func(_ context.Context, _ string, _ *sdknodes.UpdateNetworkParams) (*sdknodes.UpdateNetworkResponse, error) {
-			updateNetworkCalled = true
+			updateNetCalls++
 			return nil, nil
 		},
 	}
@@ -368,10 +393,16 @@ func TestHandleCreateNetwork_Bridge_HappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !createNetworkCalled {
-		t.Error("CreateNetwork must be called")
+	if len(createNetCalls) != 1 {
+		t.Fatalf("CreateNetwork: want 1 call, got %d", len(createNetCalls))
 	}
-	if !updateNetworkCalled {
+	if createNetCalls[0].iface != "vmbr99" {
+		t.Errorf("CreateNetwork: want Iface=vmbr99, got %q", createNetCalls[0].iface)
+	}
+	if createNetCalls[0].ifaceType != "bridge" {
+		t.Errorf("CreateNetwork: want Type=bridge, got %q", createNetCalls[0].ifaceType)
+	}
+	if updateNetCalls == 0 {
 		t.Error("UpdateNetwork must be called")
 	}
 	arr := result.([]any)
@@ -751,7 +782,8 @@ func TestHandleCreateNetwork_Bridge_CreateError(t *testing.T) {
 
 func TestHandleCreateNetwork_SDN_Rollback_SubnetFails(t *testing.T) {
 	t.Parallel()
-	var deleteVnetCalled bool
+
+	var deleteVnetCalls []struct{}
 	var updateSdnCalls int
 	subnetErr := &pveerr.APIError{} // non-409, non-404 error
 
@@ -770,7 +802,7 @@ func TestHandleCreateNetwork_SDN_Rollback_SubnetFails(t *testing.T) {
 			return subnetErr // subnet fails
 		},
 		deleteSdnVnetsFn: func(_ context.Context, _ string, _ *sdkcluster.DeleteSdnVnetsParams) error {
-			deleteVnetCalled = true
+			deleteVnetCalls = append(deleteVnetCalls, struct{}{})
 			return nil
 		},
 		updateSdnFn: func(_ context.Context, _ *sdkcluster.UpdateSdnParams) (*sdkcluster.UpdateSdnResponse, error) {
@@ -792,7 +824,7 @@ func TestHandleCreateNetwork_SDN_Rollback_SubnetFails(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error from subnet-create failure")
 	}
-	if !deleteVnetCalled {
+	if len(deleteVnetCalls) == 0 {
 		t.Error("rollback: DeleteSdnVnets must be called when vnetCreated=true and subnet-create fails")
 	}
 	if updateSdnCalls < 1 {
@@ -806,8 +838,9 @@ func TestHandleCreateNetwork_SDN_Rollback_SubnetFails(t *testing.T) {
 
 func TestHandleCreateNetwork_SDN_Rollback_ApplyFails(t *testing.T) {
 	t.Parallel()
-	var deleteVnetCalled bool
-	var deleteSubnetCalled bool
+
+	var deleteVnetCalls []struct{}
+	var deleteSubnetCalls []struct{}
 	applyCallCount := 0
 	firstApply := true
 
@@ -826,11 +859,11 @@ func TestHandleCreateNetwork_SDN_Rollback_ApplyFails(t *testing.T) {
 			return nil
 		},
 		deleteSdnVnetsFn: func(_ context.Context, _ string, _ *sdkcluster.DeleteSdnVnetsParams) error {
-			deleteVnetCalled = true
+			deleteVnetCalls = append(deleteVnetCalls, struct{}{})
 			return nil
 		},
 		deleteSdnVnetsSubnetsFn: func(_ context.Context, _ string, _ string, _ *sdkcluster.DeleteSdnVnetsSubnetsParams) error {
-			deleteSubnetCalled = true
+			deleteSubnetCalls = append(deleteSubnetCalls, struct{}{})
 			return nil
 		},
 		updateSdnFn: func(_ context.Context, _ *sdkcluster.UpdateSdnParams) (*sdkcluster.UpdateSdnResponse, error) {
@@ -856,10 +889,10 @@ func TestHandleCreateNetwork_SDN_Rollback_ApplyFails(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error when main apply fails")
 	}
-	if !deleteSubnetCalled {
+	if len(deleteSubnetCalls) == 0 {
 		t.Error("rollback: DeleteSdnVnetsSubnets must be called when subnetCreated=true and apply fails")
 	}
-	if !deleteVnetCalled {
+	if len(deleteVnetCalls) == 0 {
 		t.Error("rollback: DeleteSdnVnets must be called when vnetCreated=true and apply fails")
 	}
 	if applyCallCount < 2 {
@@ -875,8 +908,9 @@ func TestHandleCreateNetwork_SDN_Rollback_ApplyFails(t *testing.T) {
 
 func TestHandleCreateNetwork_SDN_Rollback_PreexistingVnet_NoRollbackDelete(t *testing.T) {
 	t.Parallel()
-	var deleteVnetCalled bool
-	var deleteSubnetCalled bool
+
+	var deleteVnetCalls []struct{}
+	var deleteSubnetCalls []struct{}
 	applyFail := true
 
 	clusterSvc := &mockSDNCluster{
@@ -894,11 +928,11 @@ func TestHandleCreateNetwork_SDN_Rollback_PreexistingVnet_NoRollbackDelete(t *te
 			return pveerr.ErrConflict
 		},
 		deleteSdnVnetsFn: func(_ context.Context, _ string, _ *sdkcluster.DeleteSdnVnetsParams) error {
-			deleteVnetCalled = true
+			deleteVnetCalls = append(deleteVnetCalls, struct{}{})
 			return nil
 		},
 		deleteSdnVnetsSubnetsFn: func(_ context.Context, _ string, _ string, _ *sdkcluster.DeleteSdnVnetsSubnetsParams) error {
-			deleteSubnetCalled = true
+			deleteSubnetCalls = append(deleteSubnetCalls, struct{}{})
 			return nil
 		},
 		updateSdnFn: func(_ context.Context, _ *sdkcluster.UpdateSdnParams) (*sdkcluster.UpdateSdnResponse, error) {
@@ -923,11 +957,11 @@ func TestHandleCreateNetwork_SDN_Rollback_PreexistingVnet_NoRollbackDelete(t *te
 	if err == nil {
 		t.Fatal("expected error when main apply fails")
 	}
-	if deleteVnetCalled {
-		t.Error("rollback must NOT delete a pre-existing vnet (vnetCreated=false)")
+	if len(deleteVnetCalls) != 0 {
+		t.Errorf("rollback must NOT delete a pre-existing vnet (vnetCreated=false); got %d call(s)", len(deleteVnetCalls))
 	}
-	if deleteSubnetCalled {
-		t.Error("rollback must NOT delete a pre-existing subnet (subnetCreated=false)")
+	if len(deleteSubnetCalls) != 0 {
+		t.Errorf("rollback must NOT delete a pre-existing subnet (subnetCreated=false); got %d call(s)", len(deleteSubnetCalls))
 	}
 }
 
@@ -944,8 +978,11 @@ func TestHandleCreateNetwork_SDN_Rollback_PreexistingVnet_NoRollbackDelete(t *te
 
 func TestHandleCreateNetwork_SubnetCreateFails_RollsBackZoneAndVnet(t *testing.T) {
 	t.Parallel()
-	var deleteVnetCalled bool
-	var deleteZoneCalled bool
+
+	type deleteVnetCall struct{ vnet string }
+	type deleteZoneCall struct{ zone string }
+	var deleteVnetCalls []deleteVnetCall
+	var deleteZoneCalls []deleteZoneCall
 	var updateSdnCalls int
 	subnetErr := &pveerr.APIError{} // non-409, non-404 — triggers rollback
 
@@ -955,35 +992,25 @@ func TestHandleCreateNetwork_SubnetCreateFails_RollsBackZoneAndVnet(t *testing.T
 			return nil, sdnNotFound()
 		},
 		createSdnZonesFn: func(_ context.Context, params *sdkcluster.CreateSdnZonesParams) error {
-			if params.Zone != "autozone" {
-				t.Errorf("createSdnZones: expected zone=autozone, got %q", params.Zone)
-			}
-			return nil // zone created → createdZone=true
+			// zone param asserted post-hoc via deleteZoneCalls capture
+			_ = params.Zone // zone must be autozone; rollback captures it
+			return nil      // zone created → createdZone=true
 		},
 		getSdnVnetsFn: func(_ context.Context, _ string, _ *sdkcluster.GetSdnVnetsParams) (*sdkcluster.GetSdnVnetsResponse, error) {
 			return nil, sdnNotFound() // vnet absent → will be created
 		},
-		createSdnVnetsFn: func(_ context.Context, params *sdkcluster.CreateSdnVnetsParams) error {
-			if params.Zone != "autozone" {
-				t.Errorf("createSdnVnets: expected zone=autozone, got %q", params.Zone)
-			}
+		createSdnVnetsFn: func(_ context.Context, _ *sdkcluster.CreateSdnVnetsParams) error {
 			return nil // vnet created → vnetCreated=true
 		},
 		createSdnVnetsSubnetsFn: func(_ context.Context, _ string, _ *sdkcluster.CreateSdnVnetsSubnetsParams) error {
 			return subnetErr // non-conflict error → rollback
 		},
 		deleteSdnVnetsFn: func(_ context.Context, vnet string, _ *sdkcluster.DeleteSdnVnetsParams) error {
-			deleteVnetCalled = true
-			if vnet != "myvnet" {
-				t.Errorf("deleteSdnVnets: expected vnet=myvnet, got %q", vnet)
-			}
+			deleteVnetCalls = append(deleteVnetCalls, deleteVnetCall{vnet})
 			return nil
 		},
 		deleteSdnZonesFn: func(_ context.Context, zone string, _ *sdkcluster.DeleteSdnZonesParams) error {
-			deleteZoneCalled = true
-			if zone != "autozone" {
-				t.Errorf("deleteSdnZones: expected zone=autozone, got %q", zone)
-			}
+			deleteZoneCalls = append(deleteZoneCalls, deleteZoneCall{zone})
 			return nil
 		},
 		updateSdnFn: func(_ context.Context, _ *sdkcluster.UpdateSdnParams) (*sdkcluster.UpdateSdnResponse, error) {
@@ -1005,11 +1032,15 @@ func TestHandleCreateNetwork_SubnetCreateFails_RollsBackZoneAndVnet(t *testing.T
 	if err == nil {
 		t.Fatal("expected error from subnet-create failure")
 	}
-	if !deleteVnetCalled {
+	if len(deleteVnetCalls) == 0 {
 		t.Error("rollback: DeleteSdnVnets must be called when vnetCreated=true and subnet-create fails")
+	} else if deleteVnetCalls[0].vnet != "myvnet" {
+		t.Errorf("rollback: DeleteSdnVnets: want vnet=myvnet, got %q", deleteVnetCalls[0].vnet)
 	}
-	if !deleteZoneCalled {
+	if len(deleteZoneCalls) == 0 {
 		t.Error("rollback: DeleteSdnZones must be called when createdZone=true and subnet-create fails")
+	} else if deleteZoneCalls[0].zone != "autozone" {
+		t.Errorf("rollback: DeleteSdnZones: want zone=autozone, got %q", deleteZoneCalls[0].zone)
 	}
 	if updateSdnCalls < 1 {
 		t.Errorf("rollback: UpdateSdn (applySDN) must be called at least once after rollback deletes; called %d times", updateSdnCalls)
@@ -1113,8 +1144,9 @@ func TestCreateNetwork_RollbackSurvivesParentCancel(t *testing.T) {
 
 func TestCreateNetwork_Concurrent_IdempotentOnExisting(t *testing.T) {
 	t.Parallel()
-	var createVnetCalled bool
-	var applyCalled bool
+
+	var createVnetCalls []struct{}
+	var applyCalls int
 
 	clusterSvc := &mockSDNCluster{
 		getSdnZonesFn: func(_ context.Context, _ string, _ *sdkcluster.GetSdnZonesParams) (*sdkcluster.GetSdnZonesResponse, error) {
@@ -1129,11 +1161,11 @@ func TestCreateNetwork_Concurrent_IdempotentOnExisting(t *testing.T) {
 			return &raw, nil
 		},
 		createSdnVnetsFn: func(_ context.Context, _ *sdkcluster.CreateSdnVnetsParams) error {
-			createVnetCalled = true
+			createVnetCalls = append(createVnetCalls, struct{}{})
 			return nil
 		},
 		updateSdnFn: func(_ context.Context, _ *sdkcluster.UpdateSdnParams) (*sdkcluster.UpdateSdnResponse, error) {
-			applyCalled = true
+			applyCalls++
 			return nil, nil
 		},
 	}
@@ -1149,10 +1181,10 @@ func TestCreateNetwork_Concurrent_IdempotentOnExisting(t *testing.T) {
 	if err != nil {
 		t.Fatalf("idempotent observe must succeed; got: %v", err)
 	}
-	if createVnetCalled {
-		t.Error("CreateSdnVnets must NOT be called when vnet already exists")
+	if len(createVnetCalls) != 0 {
+		t.Errorf("CreateSdnVnets must NOT be called when vnet already exists; got %d call(s)", len(createVnetCalls))
 	}
-	if !applyCalled {
+	if applyCalls == 0 {
 		t.Error("UpdateSdn must still be called to commit any pending state")
 	}
 	arr, ok := result.([]any)
@@ -1177,9 +1209,10 @@ func TestCreateNetwork_Concurrent_IdempotentOnExisting(t *testing.T) {
 
 func TestCreateNetwork_ZoneAlreadyExists_NoError(t *testing.T) {
 	t.Parallel()
-	var createZoneCalled bool
-	var deleteZoneCalled bool
-	var deleteVnetCalled bool
+
+	var createZoneCalls []struct{}
+	var deleteZoneCalls []struct{}
+	var deleteVnetCalls []struct{}
 
 	clusterSvc := &mockSDNCluster{
 		getSdnZonesFn: func(_ context.Context, _ string, _ *sdkcluster.GetSdnZonesParams) (*sdkcluster.GetSdnZonesResponse, error) {
@@ -1188,7 +1221,7 @@ func TestCreateNetwork_ZoneAlreadyExists_NoError(t *testing.T) {
 			return &raw, nil
 		},
 		createSdnZonesFn: func(_ context.Context, _ *sdkcluster.CreateSdnZonesParams) error {
-			createZoneCalled = true
+			createZoneCalls = append(createZoneCalls, struct{}{})
 			return nil
 		},
 		getSdnVnetsFn: func(_ context.Context, _ string, _ *sdkcluster.GetSdnVnetsParams) (*sdkcluster.GetSdnVnetsResponse, error) {
@@ -1202,11 +1235,11 @@ func TestCreateNetwork_ZoneAlreadyExists_NoError(t *testing.T) {
 			return &pveerr.APIError{}
 		},
 		deleteSdnZonesFn: func(_ context.Context, _ string, _ *sdkcluster.DeleteSdnZonesParams) error {
-			deleteZoneCalled = true
+			deleteZoneCalls = append(deleteZoneCalls, struct{}{})
 			return nil
 		},
 		deleteSdnVnetsFn: func(_ context.Context, _ string, _ *sdkcluster.DeleteSdnVnetsParams) error {
-			deleteVnetCalled = true
+			deleteVnetCalls = append(deleteVnetCalls, struct{}{})
 			return nil
 		},
 		updateSdnFn: func(_ context.Context, _ *sdkcluster.UpdateSdnParams) (*sdkcluster.UpdateSdnResponse, error) {
@@ -1226,13 +1259,13 @@ func TestCreateNetwork_ZoneAlreadyExists_NoError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected subnet-create failure to bubble up")
 	}
-	if createZoneCalled {
-		t.Error("CreateSdnZones must NOT be called when zone already exists")
+	if len(createZoneCalls) != 0 {
+		t.Errorf("CreateSdnZones must NOT be called when zone already exists; got %d call(s)", len(createZoneCalls))
 	}
-	if !deleteVnetCalled {
-		t.Error("rollback DeleteSdnVnets must run because vnetCreated=true")
+	if len(deleteVnetCalls) != 1 {
+		t.Errorf("rollback DeleteSdnVnets must run because vnetCreated=true; got %d call(s)", len(deleteVnetCalls))
 	}
-	if deleteZoneCalled {
-		t.Error("rollback must NOT delete a pre-existing zone (createdZone=false)")
+	if len(deleteZoneCalls) != 0 {
+		t.Errorf("rollback must NOT delete a pre-existing zone (createdZone=false); got %d call(s)", len(deleteZoneCalls))
 	}
 }

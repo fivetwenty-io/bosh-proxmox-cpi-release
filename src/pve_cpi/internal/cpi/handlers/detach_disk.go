@@ -194,7 +194,7 @@ func HandleDetachDisk(deps Deps) Handler {
 					log.String("snapshots", strings.Join(snapNames, ", ")),
 				)
 			} else {
-				return nil, cpierrors.Cloud(
+				return nil, cpierrors.SnapshotBlocked(
 					"detach_disk: VM %s (node %s) has %d snapshot(s) [%s] that reference disk %s."+
 						" PVE will reject detach while snapshots reference this disk."+
 						" Delete snapshot(s) [%s] first, then retry detach_disk;"+

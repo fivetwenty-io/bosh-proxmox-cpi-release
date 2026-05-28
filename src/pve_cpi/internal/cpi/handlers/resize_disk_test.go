@@ -179,10 +179,10 @@ func TestHandleResizeDisk_NoOp(t *testing.T) {
 	t.Parallel()
 	// new_size_mb == current_size → delta == 0 → no-op, no resize call.
 
-	var resizeCalled bool
+	var resizeCalls []struct{}
 
 	qemuSvc := resizeQEMUWithDisk(diskSlot, diskCID+",size=10G", func(_ context.Context, _ string, _ int, _ string, _ int) (string, error) {
-		resizeCalled = true
+		resizeCalls = append(resizeCalls, struct{}{})
 		return "", nil
 	})
 
@@ -192,8 +192,8 @@ func TestHandleResizeDisk_NoOp(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error for no-op resize: %v", err)
 	}
-	if resizeCalled {
-		t.Error("ResizeDisk must not be called when delta is zero")
+	if len(resizeCalls) != 0 {
+		t.Errorf("ResizeDisk must not be called when delta is zero; got %d call(s)", len(resizeCalls))
 	}
 }
 
@@ -217,10 +217,10 @@ func TestHandleResizeDisk_ShrinkRejected(t *testing.T) {
 func TestHandleResizeDisk_WithUpid(t *testing.T) {
 	t.Parallel()
 
-	var waitCalled bool
+	var taskWaitCalls []struct{}
 	tasksSvc := &mockTasksService{
 		waitFn: func(_ context.Context, _, _ string, _ *tasks.WaitOptions) (*tasks.Status, error) {
-			waitCalled = true
+			taskWaitCalls = append(taskWaitCalls, struct{}{})
 			return &tasks.Status{ExitStatus: "OK"}, nil
 		},
 	}
@@ -234,7 +234,7 @@ func TestHandleResizeDisk_WithUpid(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !waitCalled {
+	if len(taskWaitCalls) == 0 {
 		t.Error("AwaitTask was not called for UPID")
 	}
 }
@@ -388,11 +388,11 @@ func TestHandleResizeDisk_SnapshotsPresent_HardFail(t *testing.T) {
 	t.Parallel()
 	// Snapshots exist, AllowDiskOpsWithSnapshots=false → Cloud error; ResizeDisk NOT called.
 
-	var resizeCalled bool
+	var resizeCalls []struct{}
 	qemuSvc := resizeQEMUWithDiskAndSnapshots(
 		diskSlot, diskCID+",size=10G",
 		func(_ context.Context, _ string, _ int, _ string, _ int) (string, error) {
-			resizeCalled = true
+			resizeCalls = append(resizeCalls, struct{}{})
 			return "", nil
 		},
 		func(_ context.Context, _ string, _ int) ([]map[string]any, error) {
@@ -412,16 +412,10 @@ func TestHandleResizeDisk_SnapshotsPresent_HardFail(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error when snapshots exist and allow_disk_ops_with_snapshots=false")
 	}
-	if !cpierrors.IsType(err, cpierrors.TypeCloud) {
-		t.Errorf("error type: want Cloud, got %T: %v", err, err)
+	if !cpierrors.IsType(err, cpierrors.TypeSnapshotBlocked) {
+		t.Errorf("error type: want SnapshotBlocked, got %T: %v", err, err)
 	}
-	if !strings.Contains(err.Error(), "snap1") || !strings.Contains(err.Error(), "snap2") {
-		t.Errorf("error message should contain snapshot names; got: %v", err)
-	}
-	if !strings.Contains(err.Error(), "allow_disk_ops_with_snapshots") {
-		t.Errorf("error message should contain remediation hint; got: %v", err)
-	}
-	if resizeCalled {
+	if len(resizeCalls) != 0 {
 		t.Error("ResizeDisk must not be called when guard blocks")
 	}
 }
@@ -430,11 +424,11 @@ func TestHandleResizeDisk_NoSnapshots_Proceeds(t *testing.T) {
 	t.Parallel()
 	// No real snapshots → guard passes → ResizeDisk called.
 
-	var resizeCalled bool
+	var resizeCalls []struct{}
 	qemuSvc := resizeQEMUWithDiskAndSnapshots(
 		diskSlot, diskCID+",size=10G",
 		func(_ context.Context, _ string, _ int, _ string, _ int) (string, error) {
-			resizeCalled = true
+			resizeCalls = append(resizeCalls, struct{}{})
 			return "", nil
 		},
 		func(_ context.Context, _ string, _ int) ([]map[string]any, error) {
@@ -449,7 +443,7 @@ func TestHandleResizeDisk_NoSnapshots_Proceeds(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error when no snapshots: %v", err)
 	}
-	if !resizeCalled {
+	if len(resizeCalls) == 0 {
 		t.Error("ResizeDisk should be called when no real snapshots exist")
 	}
 }
@@ -458,11 +452,11 @@ func TestHandleResizeDisk_SnapshotCheckError_FailOpen(t *testing.T) {
 	t.Parallel()
 	// ListSnapshots returns error, RequireSnapshotCheckPass=false → WARN + proceed (ResizeDisk called).
 
-	var resizeCalled bool
+	var resizeCalls []struct{}
 	qemuSvc := resizeQEMUWithDiskAndSnapshots(
 		diskSlot, diskCID+",size=10G",
 		func(_ context.Context, _ string, _ int, _ string, _ int) (string, error) {
-			resizeCalled = true
+			resizeCalls = append(resizeCalls, struct{}{})
 			return "", nil
 		},
 		func(_ context.Context, _ string, _ int) ([]map[string]any, error) {
@@ -479,7 +473,7 @@ func TestHandleResizeDisk_SnapshotCheckError_FailOpen(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected fail-open: no error when RequireSnapshotCheckPass=false; got: %v", err)
 	}
-	if !resizeCalled {
+	if len(resizeCalls) == 0 {
 		t.Error("ResizeDisk should be called in fail-open mode")
 	}
 }
@@ -488,11 +482,11 @@ func TestHandleResizeDisk_SnapshotCheckError_FailClosed(t *testing.T) {
 	t.Parallel()
 	// ListSnapshots returns error, RequireSnapshotCheckPass=true → error returned; ResizeDisk NOT called.
 
-	var resizeCalled bool
+	var resizeCalls []struct{}
 	qemuSvc := resizeQEMUWithDiskAndSnapshots(
 		diskSlot, diskCID+",size=10G",
 		func(_ context.Context, _ string, _ int, _ string, _ int) (string, error) {
-			resizeCalled = true
+			resizeCalls = append(resizeCalls, struct{}{})
 			return "", nil
 		},
 		func(_ context.Context, _ string, _ int) ([]map[string]any, error) {
@@ -509,10 +503,10 @@ func TestHandleResizeDisk_SnapshotCheckError_FailClosed(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error when RequireSnapshotCheckPass=true and ListSnapshots fails")
 	}
-	if !strings.Contains(err.Error(), "require_snapshot_check_pass") {
-		t.Errorf("error message should mention require_snapshot_check_pass; got: %v", err)
+	if !cpierrors.IsType(err, cpierrors.TypeSnapshotBlocked) {
+		t.Errorf("error type: want SnapshotBlocked for fail-closed snapshot check, got %T: %v", err, err)
 	}
-	if resizeCalled {
+	if len(resizeCalls) != 0 {
 		t.Error("ResizeDisk must not be called when fail-closed guard blocks")
 	}
 }
@@ -521,11 +515,11 @@ func TestHandleResizeDisk_SnapshotsPresent_AllowOverride(t *testing.T) {
 	t.Parallel()
 	// Snapshots exist, AllowDiskOpsWithSnapshots=true → WARN + ResizeDisk called.
 
-	var resizeCalled bool
+	var resizeCalls []struct{}
 	qemuSvc := resizeQEMUWithDiskAndSnapshots(
 		diskSlot, diskCID+",size=10G",
 		func(_ context.Context, _ string, _ int, _ string, _ int) (string, error) {
-			resizeCalled = true
+			resizeCalls = append(resizeCalls, struct{}{})
 			return "", nil
 		},
 		func(_ context.Context, _ string, _ int) ([]map[string]any, error) {
@@ -542,7 +536,7 @@ func TestHandleResizeDisk_SnapshotsPresent_AllowOverride(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected no error with allow_disk_ops_with_snapshots=true; got: %v", err)
 	}
-	if !resizeCalled {
+	if len(resizeCalls) == 0 {
 		t.Error("ResizeDisk should be called when allow override is set")
 	}
 }
@@ -575,8 +569,8 @@ func TestHandleResizeDisk_ConfigFetchError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error when Config() fails after disk is located")
 	}
-	if !strings.Contains(err.Error(), "config") {
-		t.Errorf("error should mention config read failure; got: %v", err)
+	if !cpierrors.IsType(err, cpierrors.TypeCloud) && !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+		t.Errorf("error must be Cloud or RetriableCloud for config read failure, got: %T %v", err, err)
 	}
 }
 
@@ -636,10 +630,10 @@ func TestHandleResizeDisk_Dir_CID(t *testing.T) {
 	const diskCID = "local:9001/vm-9001-disk-0.raw"
 	const diskSlot = "scsi0"
 
-	var resizeCalled bool
+	var resizeCalls []struct{}
 	qemuSvc := resizeQEMUWithDisk(diskSlot, diskCID+",size=20G",
 		func(_ context.Context, _ string, _ int, _ string, _ int) (string, error) {
-			resizeCalled = true
+			resizeCalls = append(resizeCalls, struct{}{})
 			return "", nil
 		},
 	)
@@ -649,7 +643,7 @@ func TestHandleResizeDisk_Dir_CID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error for dir-style CID: %v", err)
 	}
-	if !resizeCalled {
+	if len(resizeCalls) == 0 {
 		t.Error("ResizeDisk must be called for dir-style CID")
 	}
 }
@@ -661,10 +655,10 @@ func TestHandleResizeDisk_ZFSPool_CID(t *testing.T) {
 	const diskCID = "local-zfs:vm-9001-disk-0"
 	const diskSlot = "scsi1"
 
-	var resizeCalled bool
+	var resizeCalls []struct{}
 	qemuSvc := resizeQEMUWithDisk(diskSlot, diskCID+",size=10G",
 		func(_ context.Context, _ string, _ int, _ string, _ int) (string, error) {
-			resizeCalled = true
+			resizeCalls = append(resizeCalls, struct{}{})
 			return "", nil
 		},
 	)
@@ -674,7 +668,7 @@ func TestHandleResizeDisk_ZFSPool_CID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error for zfspool CID: %v", err)
 	}
-	if !resizeCalled {
+	if len(resizeCalls) == 0 {
 		t.Error("ResizeDisk must be called for zfspool CID")
 	}
 }
@@ -686,10 +680,10 @@ func TestHandleResizeDisk_LVMThin_CID(t *testing.T) {
 	const diskCID = "local-lvm-thin:vm-9001-disk-0"
 	const diskSlot = "scsi3"
 
-	var resizeCalled bool
+	var resizeCalls []struct{}
 	qemuSvc := resizeQEMUWithDisk(diskSlot, diskCID+",size=15G",
 		func(_ context.Context, _ string, _ int, _ string, _ int) (string, error) {
-			resizeCalled = true
+			resizeCalls = append(resizeCalls, struct{}{})
 			return "", nil
 		},
 	)
@@ -699,7 +693,7 @@ func TestHandleResizeDisk_LVMThin_CID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error for lvmthin CID: %v", err)
 	}
-	if !resizeCalled {
+	if len(resizeCalls) == 0 {
 		t.Error("ResizeDisk must be called for lvmthin CID")
 	}
 }

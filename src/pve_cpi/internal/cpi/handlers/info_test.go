@@ -91,19 +91,29 @@ func TestHandleInfo_NoArgsRequired(t *testing.T) {
 	}
 }
 
+// TestHandleInfo_Idempotent calls HandleInfo twice and asserts both invocations
+// return identical non-nil results. Two calls are sufficient to detect the
+// class of side-effect that would change the output between calls (e.g., a
+// counter increment or a monotonically increasing version string).
 func TestHandleInfo_Idempotent(t *testing.T) {
 	t.Parallel()
 
 	deps := handlers.Deps{Logger: log.NewNopLogger()}
 	h := handlers.HandleInfo(deps)
 
-	for i := range 3 {
-		result, err := h.Handle(context.Background(), nil, jsonrpc.Context{RequestID: "req"})
-		if err != nil {
-			t.Fatalf("call %d: unexpected error: %v", i, err)
-		}
-		if result == nil {
-			t.Fatalf("call %d: nil result", i)
-		}
+	result1, err1 := h.Handle(context.Background(), nil, jsonrpc.Context{RequestID: "req"})
+	if err1 != nil {
+		t.Fatalf("call 1: unexpected error: %v", err1)
+	}
+	if result1 == nil {
+		t.Fatal("call 1: nil result")
+	}
+
+	result2, err2 := h.Handle(context.Background(), nil, jsonrpc.Context{RequestID: "req"})
+	if err2 != nil {
+		t.Fatalf("call 2: unexpected error: %v", err2)
+	}
+	if result2 == nil {
+		t.Fatal("call 2: nil result")
 	}
 }

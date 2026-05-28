@@ -105,15 +105,16 @@ func delSnapDeps(qemuSvc qemu.Service) handlers.Deps {
 
 func TestHandleDeleteSnapshot_Happy(t *testing.T) {
 	t.Parallel()
-	var deleteCalled bool
-	var deletedVMID int
-	var deletedSnap string
+
+	type deleteSnapCall struct {
+		vmid int
+		name string
+	}
+	var deleteCalls []deleteSnapCall
 
 	qemuSvc := &delSnapQEMUService{
 		deleteSnapshotFn: func(_ context.Context, _ string, vmid int, name string) error {
-			deleteCalled = true
-			deletedVMID = vmid
-			deletedSnap = name
+			deleteCalls = append(deleteCalls, deleteSnapCall{vmid, name})
 			return nil
 		},
 	}
@@ -126,14 +127,14 @@ func TestHandleDeleteSnapshot_Happy(t *testing.T) {
 	if result != nil {
 		t.Errorf("result: want nil (void), got %v", result)
 	}
-	if !deleteCalled {
-		t.Error("DeleteSnapshot was not called")
+	if len(deleteCalls) != 1 {
+		t.Fatalf("DeleteSnapshot: want 1 call, got %d", len(deleteCalls))
 	}
-	if deletedVMID != 100 {
-		t.Errorf("vmid: want 100, got %d", deletedVMID)
+	if deleteCalls[0].vmid != 100 {
+		t.Errorf("vmid: want 100, got %d", deleteCalls[0].vmid)
 	}
-	if deletedSnap != "bosh-1234567890-abcd1234" {
-		t.Errorf("snap_name: want bosh-1234567890-abcd1234, got %q", deletedSnap)
+	if deleteCalls[0].name != "bosh-1234567890-abcd1234" {
+		t.Errorf("snap_name: want bosh-1234567890-abcd1234, got %q", deleteCalls[0].name)
 	}
 }
 

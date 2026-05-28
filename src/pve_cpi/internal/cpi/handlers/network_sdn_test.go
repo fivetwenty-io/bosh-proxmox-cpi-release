@@ -60,24 +60,22 @@ func TestApplySDN_HappyPath(t *testing.T) {
 	t.Parallel()
 	const upid = "UPID:pve-node1:00001234:00000001:aabbccdd:task:pve-node1:"
 
-	var updateSdnCalled bool
-	var taskWaitCalled bool
+	type taskWaitCall struct {
+		node string
+		upid string
+	}
+	var updateSdnCalls int
+	var taskWaitCalls []taskWaitCall
 
 	tasksSvc := &mockTasksService{
 		waitFn: func(_ context.Context, node, gotUPID string, _ *sdktasks.WaitOptions) (*sdktasks.Status, error) {
-			taskWaitCalled = true
-			if node != "pve-node1" {
-				t.Errorf("Tasks.Wait node: got %q, want pve-node1", node)
-			}
-			if gotUPID != upid {
-				t.Errorf("Tasks.Wait upid: got %q, want %q", gotUPID, upid)
-			}
+			taskWaitCalls = append(taskWaitCalls, taskWaitCall{node, gotUPID})
 			return &sdktasks.Status{ExitStatus: "OK"}, nil
 		},
 	}
 
 	clusterSvc := sdnDeleteOnlyCluster(func(_ context.Context, _ *sdkcluster.UpdateSdnParams) (*sdkcluster.UpdateSdnResponse, error) {
-		updateSdnCalled = true
+		updateSdnCalls++
 		// Return UPID as a bare JSON string — the standard PVE encoding.
 		b, _ := json.Marshal(upid)
 		resp := sdkcluster.UpdateSdnResponse(b)
@@ -103,11 +101,17 @@ func TestApplySDN_HappyPath(t *testing.T) {
 	if err := invokeDeleteNetworkRaw(t, deps, cidJSON); err != nil {
 		t.Fatalf("expected nil error, got: %v", err)
 	}
-	if !updateSdnCalled {
+	if updateSdnCalls == 0 {
 		t.Error("UpdateSdn must be called")
 	}
-	if !taskWaitCalled {
-		t.Error("Tasks.Wait must be called when UPID is present and node is known")
+	if len(taskWaitCalls) != 1 {
+		t.Fatalf("Tasks.Wait: want 1 call, got %d", len(taskWaitCalls))
+	}
+	if taskWaitCalls[0].node != "pve-node1" {
+		t.Errorf("Tasks.Wait node: got %q, want pve-node1", taskWaitCalls[0].node)
+	}
+	if taskWaitCalls[0].upid != upid {
+		t.Errorf("Tasks.Wait upid: got %q, want %q", taskWaitCalls[0].upid, upid)
 	}
 }
 
@@ -123,10 +127,10 @@ func TestApplySDN_MalformedUPID(t *testing.T) {
 	t.Parallel()
 	const malformedUPID = "UPID::00001234:00000001:aabbccdd:task::"
 
-	var updateSdnCalled bool
+	var updateSdnCalls int
 
 	clusterSvc := sdnDeleteOnlyCluster(func(_ context.Context, _ *sdkcluster.UpdateSdnParams) (*sdkcluster.UpdateSdnResponse, error) {
-		updateSdnCalled = true
+		updateSdnCalls++
 		b, _ := json.Marshal(malformedUPID)
 		resp := sdkcluster.UpdateSdnResponse(b)
 		return &resp, nil
@@ -151,7 +155,7 @@ func TestApplySDN_MalformedUPID(t *testing.T) {
 	if err := invokeDeleteNetworkRaw(t, deps, cidJSON); err != nil {
 		t.Fatalf("applySDN malformed-UPID path must return nil, got: %v", err)
 	}
-	if !updateSdnCalled {
+	if updateSdnCalls == 0 {
 		t.Error("UpdateSdn must be called")
 	}
 	// Absence of a panic from tasksSvc (nil) confirms Tasks().Wait was never called.

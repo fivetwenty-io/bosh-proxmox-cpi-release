@@ -54,6 +54,9 @@ func (m *mockPVEClient) ClusterStorage() clusterstorage.Service { return nil }
 // mockQEMUService
 // --------------------------------------------------------------------------
 
+// compile-time interface check.
+var _ qemu.Service = (*mockQEMUService)(nil)
+
 // mockQEMUService partially implements qemu.Service for handler tests.
 // Only methods used by the handlers are wired; others panic if called.
 // CreateFn defaults to ("upid-mock-create", nil) when nil so tests not
@@ -681,6 +684,38 @@ func defaultClusterSvc(vmid int, node string) *mockClusterSvc {
 	return &mockClusterSvc{
 		listResourcesFn: func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
 			return clusterVMOnNode(vmid, node), nil
+		},
+	}
+}
+
+// defaultMultiNodeClusterSvc returns a mockClusterSvc that places vmid on
+// node (which may be any of the three simulated cluster members: pve01, pve02,
+// pve03). The cluster response also includes two other VMs on the remaining
+// nodes to simulate a heterogeneous cluster — handlers must forward the
+// resolved node correctly regardless of which member hosts the target VM.
+func defaultMultiNodeClusterSvc(vmid int, node string) *mockClusterSvc {
+	otherEntries := []json.RawMessage{}
+	for _, n := range []struct {
+		id   int
+		node string
+	}{
+		{1000, "pve01"},
+		{1001, "pve02"},
+		{1002, "pve03"},
+	} {
+		if n.id == vmid {
+			continue
+		}
+		b, _ := json.Marshal(map[string]any{"vmid": n.id, "node": n.node, "type": "qemu"})
+		otherEntries = append(otherEntries, b)
+	}
+	target, _ := json.Marshal(map[string]any{"vmid": vmid, "node": node, "type": "qemu"})
+	all := append(otherEntries, target) //nolint:gocritic // append to named slice intentional
+	resp := cluster.ListResourcesResponse(all)
+
+	return &mockClusterSvc{
+		listResourcesFn: func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+			return &resp, nil
 		},
 	}
 }

@@ -141,8 +141,8 @@ func TestHandleSnapshotDisk_Happy(t *testing.T) {
 
 	const volid = "local-lvm:vm-9001-disk-0"
 
-	var snapCalled bool
-	var snapName string
+	type snapCall struct{ name string }
+	var snapCalls []snapCall
 
 	qemuSvc := &snapQEMUService{
 		configFn: func(_ context.Context, _ string, vmid int) (map[string]any, error) {
@@ -154,8 +154,7 @@ func TestHandleSnapshotDisk_Happy(t *testing.T) {
 			return map[string]any{}, nil
 		},
 		snapshotFn: func(_ context.Context, _ string, vmid int, name string, _ map[string]any) (string, error) {
-			snapCalled = true
-			snapName = name
+			snapCalls = append(snapCalls, snapCall{name})
 			return "", nil // no UPID (synchronous success)
 		},
 	}
@@ -172,18 +171,18 @@ func TestHandleSnapshotDisk_Happy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !snapCalled {
-		t.Error("Snapshot was not called")
+	if len(snapCalls) != 1 {
+		t.Fatalf("Snapshot: want 1 call, got %d", len(snapCalls))
 	}
 	sid, ok := result.(string)
 	if !ok || sid == "" {
 		t.Fatalf("result: want non-empty string snapshot_cid, got %T %v", result, result)
 	}
 	// snapshot_cid must contain the snap name.
-	if snapName == "" {
+	if snapCalls[0].name == "" {
 		t.Error("snap name must not be empty")
 	}
-	t.Logf("snapshot_cid = %s, snap_name = %s", sid, snapName)
+	t.Logf("snapshot_cid = %s, snap_name = %s", sid, snapCalls[0].name)
 }
 
 func TestHandleSnapshotDisk_WithDescription(t *testing.T) {
@@ -224,10 +223,10 @@ func TestHandleSnapshotDisk_WithDescription(t *testing.T) {
 func TestHandleSnapshotDisk_WithUpid(t *testing.T) {
 	t.Parallel()
 
-	var waitCalled bool
+	var taskWaitCalls []struct{}
 	tasksSvc := &mockTasksService{
 		waitFn: func(_ context.Context, _, _ string, _ *tasks.WaitOptions) (*tasks.Status, error) {
-			waitCalled = true
+			taskWaitCalls = append(taskWaitCalls, struct{}{})
 			return &tasks.Status{ExitStatus: "OK"}, nil
 		},
 	}
@@ -252,7 +251,7 @@ func TestHandleSnapshotDisk_WithUpid(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !waitCalled {
+	if len(taskWaitCalls) == 0 {
 		t.Error("AwaitTask was not called for UPID")
 	}
 	if result == nil {
@@ -366,7 +365,7 @@ func TestHandleSnapshotDisk_DiskInOptionString(t *testing.T) {
 
 	const volid = "local-lvm:vm-9001-disk-0"
 
-	var snapCalled bool
+	var snapCalls []struct{}
 
 	qemuSvc := &snapQEMUService{
 		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
@@ -375,7 +374,7 @@ func TestHandleSnapshotDisk_DiskInOptionString(t *testing.T) {
 			}, nil
 		},
 		snapshotFn: func(_ context.Context, _ string, _ int, _ string, _ map[string]any) (string, error) {
-			snapCalled = true
+			snapCalls = append(snapCalls, struct{}{})
 			return "", nil
 		},
 	}
@@ -391,7 +390,7 @@ func TestHandleSnapshotDisk_DiskInOptionString(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error for disk stored with option string: %v", err)
 	}
-	if !snapCalled {
+	if len(snapCalls) == 0 {
 		t.Error("Snapshot must be called when disk found via option-string prefix match")
 	}
 }
@@ -436,7 +435,7 @@ func TestHandleSnapshotDisk_Dir_CID(t *testing.T) {
 	// dir storage: CID has subpath form "<storage>:<vmid>/<volname>.<ext>".
 	const diskCID = "local:9001/vm-9001-disk-0.raw"
 
-	var snapCalled bool
+	var snapCalls []struct{}
 	qemuSvc := &snapQEMUService{
 		configFn: func(_ context.Context, _ string, vmid int) (map[string]any, error) {
 			if vmid == 9001 {
@@ -445,7 +444,7 @@ func TestHandleSnapshotDisk_Dir_CID(t *testing.T) {
 			return map[string]any{}, nil
 		},
 		snapshotFn: func(_ context.Context, _ string, _ int, _ string, _ map[string]any) (string, error) {
-			snapCalled = true
+			snapCalls = append(snapCalls, struct{}{})
 			return "", nil
 		},
 	}
@@ -460,7 +459,7 @@ func TestHandleSnapshotDisk_Dir_CID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Dir CID: unexpected error: %v", err)
 	}
-	if !snapCalled {
+	if len(snapCalls) == 0 {
 		t.Error("Dir CID: Snapshot was not called")
 	}
 	sid, ok := result.(string)
@@ -474,7 +473,7 @@ func TestHandleSnapshotDisk_ZFSPool_CID(t *testing.T) {
 	// zfspool storage: bare volname (no subpath), e.g. "local-zfs:vm-9001-disk-0".
 	const diskCID = "local-zfs:vm-9001-disk-0"
 
-	var snapCalled bool
+	var snapCalls []struct{}
 	qemuSvc := &snapQEMUService{
 		configFn: func(_ context.Context, _ string, vmid int) (map[string]any, error) {
 			if vmid == 9001 {
@@ -483,7 +482,7 @@ func TestHandleSnapshotDisk_ZFSPool_CID(t *testing.T) {
 			return map[string]any{}, nil
 		},
 		snapshotFn: func(_ context.Context, _ string, _ int, _ string, _ map[string]any) (string, error) {
-			snapCalled = true
+			snapCalls = append(snapCalls, struct{}{})
 			return "", nil
 		},
 	}
@@ -498,7 +497,7 @@ func TestHandleSnapshotDisk_ZFSPool_CID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ZFSPool CID: unexpected error: %v", err)
 	}
-	if !snapCalled {
+	if len(snapCalls) == 0 {
 		t.Error("ZFSPool CID: Snapshot was not called")
 	}
 	sid, ok := result.(string)
@@ -512,7 +511,7 @@ func TestHandleSnapshotDisk_LVMThin_CID(t *testing.T) {
 	// lvmthin storage: bare volname, e.g. "local-lvm-thin:vm-9001-disk-0".
 	const diskCID = "local-lvm-thin:vm-9001-disk-0"
 
-	var snapCalled bool
+	var snapCalls []struct{}
 	qemuSvc := &snapQEMUService{
 		configFn: func(_ context.Context, _ string, vmid int) (map[string]any, error) {
 			if vmid == 9001 {
@@ -521,7 +520,7 @@ func TestHandleSnapshotDisk_LVMThin_CID(t *testing.T) {
 			return map[string]any{}, nil
 		},
 		snapshotFn: func(_ context.Context, _ string, _ int, _ string, _ map[string]any) (string, error) {
-			snapCalled = true
+			snapCalls = append(snapCalls, struct{}{})
 			return "", nil
 		},
 	}
@@ -536,7 +535,7 @@ func TestHandleSnapshotDisk_LVMThin_CID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LVMThin CID: unexpected error: %v", err)
 	}
-	if !snapCalled {
+	if len(snapCalls) == 0 {
 		t.Error("LVMThin CID: Snapshot was not called")
 	}
 	sid, ok := result.(string)

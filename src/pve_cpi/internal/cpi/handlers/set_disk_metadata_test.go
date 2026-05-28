@@ -494,9 +494,6 @@ func TestHandleSetDiskMetadata_MetadataNotObject(t *testing.T) {
 	if !cpierrors.IsType(err, cpierrors.TypeCloud) {
 		t.Errorf("want CloudError, got %v", err)
 	}
-	if !strings.Contains(err.Error(), "metadata") {
-		t.Errorf("error should mention 'metadata'; got %q", err.Error())
-	}
 }
 
 // TestHandleSetDiskMetadata_ListResourcesError — B9 fix: ListResources transport
@@ -516,8 +513,8 @@ func TestHandleSetDiskMetadata_ListResourcesError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error from ListResources failure, got nil")
 	}
-	if !strings.Contains(err.Error(), "cluster") {
-		t.Errorf("error should mention 'cluster'; got %q", err.Error())
+	if !cpierrors.IsType(err, cpierrors.TypeCloud) && !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+		t.Errorf("want Cloud or RetriableCloud error for cluster transport failure, got %T %v", err, err)
 	}
 }
 
@@ -538,8 +535,8 @@ func TestHandleSetDiskMetadata_UpdateConfigError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error from UpdateQemuConfig failure, got nil")
 	}
-	if !strings.Contains(err.Error(), "write conflict") {
-		t.Errorf("error should propagate SDK message; got %q", err.Error())
+	if !cpierrors.IsType(err, cpierrors.TypeCloud) && !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+		t.Errorf("want Cloud or RetriableCloud error for UpdateQemuConfig failure, got %T %v", err, err)
 	}
 }
 

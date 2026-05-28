@@ -282,8 +282,6 @@ func TestUnwrap(t *testing.T) {
 	t.Parallel()
 
 	sentinel := errors.New("sentinel cause")
-	mid := cpierrors.Cloud("mid: %s", "layer")
-	mid2 := &struct{ error }{sentinel} // non-*Error wrapper to confirm As still reaches sentinel
 
 	// Direct unwrap
 	direct := cpierrors.Wrap(sentinel, "outer")
@@ -298,12 +296,95 @@ func TestUnwrap(t *testing.T) {
 		t.Error("errors.Is should find sentinel through two Wraps")
 	}
 
-	_ = mid
-	_ = mid2
-
 	// Unwrap nil cause returns nil
 	noWrap := cpierrors.Cloud("bare")
 	if noWrap.Unwrap() != nil {
 		t.Error("Unwrap() should return nil when no cause")
+	}
+}
+
+// --------------------------------------------------------------------------
+// TestNewTypeConstructors — verify new typed constructors produce correct Type
+// --------------------------------------------------------------------------
+
+func TestNewTypeConstructors(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name      string
+		err       *cpierrors.Error
+		wantType  cpierrors.Type
+		retriable bool
+	}{
+		{
+			name:      "DetachedDisk",
+			err:       cpierrors.DetachedDisk("disk %q not attached", "vol-1"),
+			wantType:  cpierrors.TypeDetachedDisk,
+			retriable: false,
+		},
+		{
+			name:      "SnapshotBlocked",
+			err:       cpierrors.SnapshotBlocked("snapshots present: %s", "snap1"),
+			wantType:  cpierrors.TypeSnapshotBlocked,
+			retriable: false,
+		},
+		{
+			name:      "StemcellExtractCap",
+			err:       cpierrors.StemcellExtractCap("tarball exceeds %dGB", 32),
+			wantType:  cpierrors.TypeStemcellExtractCap,
+			retriable: false,
+		},
+		{
+			name:      "StemcellMagicMismatch",
+			err:       cpierrors.StemcellMagicMismatch("unknown magic %x", []byte{0xCA, 0xFE}),
+			wantType:  cpierrors.TypeStemcellMagicMismatch,
+			retriable: false,
+		},
+		{
+			name:      "StemcellNoCandidate",
+			err:       cpierrors.StemcellNoCandidate("no candidate in %s", "tarball.tgz"),
+			wantType:  cpierrors.TypeStemcellNoCandidate,
+			retriable: false,
+		},
+		{
+			name:      "StemcellEscapedRoot",
+			err:       cpierrors.StemcellEscapedRoot("path %q escaped root", "/etc/passwd"),
+			wantType:  cpierrors.TypeStemcellEscapedRoot,
+			retriable: false,
+		},
+		{
+			name:      "StemcellInvalidTar",
+			err:       cpierrors.StemcellInvalidTar("invalid tar header: %s", "negative size"),
+			wantType:  cpierrors.TypeStemcellInvalidTar,
+			retriable: false,
+		},
+		{
+			name:      "RegistryConflict",
+			err:       cpierrors.RegistryConflict("write conflict on key %s", "vm/101"),
+			wantType:  cpierrors.TypeRegistryConflict,
+			retriable: false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if tc.err.Type() != tc.wantType {
+				t.Errorf("Type() = %q, want %q", tc.err.Type(), tc.wantType)
+			}
+			if tc.err.OkToRetry() != tc.retriable {
+				t.Errorf("OkToRetry() = %v, want %v", tc.err.OkToRetry(), tc.retriable)
+			}
+			if tc.err.Error() == "" {
+				t.Error("Error() must not be empty")
+			}
+			if tc.err.Unwrap() != nil {
+				t.Error("no-cause constructor: Unwrap() must return nil")
+			}
+			// IsType must recognize the type.
+			if !cpierrors.IsType(tc.err, tc.wantType) {
+				t.Errorf("IsType(%q) returned false", tc.wantType)
+			}
+		})
 	}
 }

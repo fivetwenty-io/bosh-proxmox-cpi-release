@@ -103,7 +103,7 @@ func HandleUpdateDisk(deps Deps) Handler {
 			// TypeRetriableCloud. pve.IsNotFound handles SDK 404 shapes; the message
 			// check handles FindVMByDiskVolid's own sentinel text.
 			if pve.IsNotFound(vmErr) || strings.Contains(vmErr.Error(), "not attached to any VM") {
-				return nil, cpierrors.Cloud(
+				return nil, cpierrors.DetachedDisk(
 					"update_disk: detached disk cannot be updated — disk %q not attached to any VM", diskCID,
 				)
 			}

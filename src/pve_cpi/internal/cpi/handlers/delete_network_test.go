@@ -40,19 +40,14 @@ func testDeleteDeps(clusterSvc sdkcluster.Service, autoManage bool, sdnZone stri
 	}
 }
 
-// rawVnet returns a GetSdnVnetsResponse containing zone field.
-func rawVnet(zone string) *sdkcluster.GetSdnVnetsResponse {
-	b, _ := json.Marshal(map[string]any{"vnet": "net01", "zone": zone})
-	raw := sdkcluster.GetSdnVnetsResponse(b)
-	return &raw
-}
-
 // -- DN-01: SDN delete happy path (no subnets, zone not auto-managed) --
 
 func TestHandleDeleteNetwork_SDN_HappyPath(t *testing.T) {
 	t.Parallel()
-	var deleteVnetCalled bool
-	var updateSdnCalled bool
+
+	type deleteVnetCall struct{ vnet string }
+	var deleteVnetCalls []deleteVnetCall
+	var updateSdnCalls int
 
 	clusterSvc := &mockSDNCluster{
 		getSdnVnetsFn: func(_ context.Context, vnet string, _ *sdkcluster.GetSdnVnetsParams) (*sdkcluster.GetSdnVnetsResponse, error) {
@@ -63,14 +58,11 @@ func TestHandleDeleteNetwork_SDN_HappyPath(t *testing.T) {
 			return &empty, nil
 		},
 		deleteSdnVnetsFn: func(_ context.Context, vnet string, _ *sdkcluster.DeleteSdnVnetsParams) error {
-			deleteVnetCalled = true
-			if vnet != "net01" {
-				t.Errorf("vnet: got %q, want net01", vnet)
-			}
+			deleteVnetCalls = append(deleteVnetCalls, deleteVnetCall{vnet})
 			return nil
 		},
 		updateSdnFn: func(_ context.Context, _ *sdkcluster.UpdateSdnParams) (*sdkcluster.UpdateSdnResponse, error) {
-			updateSdnCalled = true
+			updateSdnCalls++
 			return nil, nil
 		},
 	}
@@ -79,10 +71,13 @@ func TestHandleDeleteNetwork_SDN_HappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !deleteVnetCalled {
-		t.Error("DeleteSdnVnets must be called")
+	if len(deleteVnetCalls) != 1 {
+		t.Fatalf("DeleteSdnVnets: want 1 call, got %d", len(deleteVnetCalls))
 	}
-	if !updateSdnCalled {
+	if deleteVnetCalls[0].vnet != "net01" {
+		t.Errorf("DeleteSdnVnets: want vnet=net01, got %q", deleteVnetCalls[0].vnet)
+	}
+	if updateSdnCalls == 0 {
 		t.Error("UpdateSdn must be called")
 	}
 }
@@ -132,7 +127,8 @@ func TestHandleDeleteNetwork_SDN_WithSubnets(t *testing.T) {
 
 func TestHandleDeleteNetwork_SDN_Idempotent404(t *testing.T) {
 	t.Parallel()
-	var bridgeDeleteCalled bool
+
+	var bridgeDeleteCalls []struct{}
 
 	clusterSvc := &mockSDNCluster{
 		getSdnVnetsFn: func(_ context.Context, _ string, _ *sdkcluster.GetSdnVnetsParams) (*sdkcluster.GetSdnVnetsResponse, error) {
@@ -141,7 +137,7 @@ func TestHandleDeleteNetwork_SDN_Idempotent404(t *testing.T) {
 	}
 	nodesSvc := &mockBridgeNodes{
 		deleteNetwork2Fn: func(_ context.Context, _ string, _ string) error {
-			bridgeDeleteCalled = true
+			bridgeDeleteCalls = append(bridgeDeleteCalls, struct{}{})
 			return pveerr.ErrNotFound // bridge also gone
 		},
 	}
@@ -158,7 +154,7 @@ func TestHandleDeleteNetwork_SDN_Idempotent404(t *testing.T) {
 		t.Fatalf("expected nil on idempotent 404, got: %v", err)
 	}
 	// Bridge path was taken since SDN said 404.
-	if !bridgeDeleteCalled {
+	if len(bridgeDeleteCalls) == 0 {
 		t.Error("bridge delete must be attempted when SDN probe returns 404")
 	}
 }
@@ -167,7 +163,7 @@ func TestHandleDeleteNetwork_SDN_Idempotent404(t *testing.T) {
 
 func TestHandleDeleteNetwork_SDN_ZoneKeptWhenPinned(t *testing.T) {
 	t.Parallel()
-	var deleteZoneCalled bool
+	var deleteZoneCalls []struct{}
 	clusterSvc := &mockSDNCluster{
 		getSdnVnetsFn: func(_ context.Context, _ string, _ *sdkcluster.GetSdnVnetsParams) (*sdkcluster.GetSdnVnetsResponse, error) {
 			return rawVnet("pinnedzone"), nil
@@ -181,7 +177,7 @@ func TestHandleDeleteNetwork_SDN_ZoneKeptWhenPinned(t *testing.T) {
 			return &empty, nil
 		},
 		deleteSdnZonesFn: func(_ context.Context, _ string, _ *sdkcluster.DeleteSdnZonesParams) error {
-			deleteZoneCalled = true
+			deleteZoneCalls = append(deleteZoneCalls, struct{}{})
 			return nil
 		},
 		// Opt in to vnet delete + apply mutations.
@@ -197,8 +193,8 @@ func TestHandleDeleteNetwork_SDN_ZoneKeptWhenPinned(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected: %v", err)
 	}
-	if deleteZoneCalled {
-		t.Error("pinned zone (config.SDNZone) must NOT be deleted even with auto-manage=true")
+	if len(deleteZoneCalls) != 0 {
+		t.Errorf("pinned zone (config.SDNZone) must NOT be deleted even with auto-manage=true; got %d call(s)", len(deleteZoneCalls))
 	}
 }
 
@@ -206,7 +202,9 @@ func TestHandleDeleteNetwork_SDN_ZoneKeptWhenPinned(t *testing.T) {
 
 func TestHandleDeleteNetwork_SDN_ZoneDeletedWhenOwnedAndEmpty(t *testing.T) {
 	t.Parallel()
-	var deleteZoneCalled bool
+
+	type deleteZoneCall struct{ zone string }
+	var deleteZoneCalls []deleteZoneCall
 	var applyAfterZoneCalled int
 
 	clusterSvc := &mockSDNCluster{
@@ -223,10 +221,7 @@ func TestHandleDeleteNetwork_SDN_ZoneDeletedWhenOwnedAndEmpty(t *testing.T) {
 			return &empty, nil
 		},
 		deleteSdnZonesFn: func(_ context.Context, zone string, _ *sdkcluster.DeleteSdnZonesParams) error {
-			deleteZoneCalled = true
-			if zone != "autozone" {
-				t.Errorf("zone: got %q, want autozone", zone)
-			}
+			deleteZoneCalls = append(deleteZoneCalls, deleteZoneCall{zone})
 			return nil
 		},
 		updateSdnFn: func(_ context.Context, _ *sdkcluster.UpdateSdnParams) (*sdkcluster.UpdateSdnResponse, error) {
@@ -244,8 +239,10 @@ func TestHandleDeleteNetwork_SDN_ZoneDeletedWhenOwnedAndEmpty(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected: %v", err)
 	}
-	if !deleteZoneCalled {
+	if len(deleteZoneCalls) == 0 {
 		t.Error("zone must be deleted when auto-manage=true, not pinned, and zone is empty")
+	} else if deleteZoneCalls[0].zone != "autozone" {
+		t.Errorf("DeleteSdnZones: want zone=autozone, got %q", deleteZoneCalls[0].zone)
 	}
 	if applyAfterZoneCalled < 2 {
 		t.Errorf("UpdateSdn must be called at least twice (after vnet delete, after zone delete); called %d times", applyAfterZoneCalled)
@@ -256,7 +253,8 @@ func TestHandleDeleteNetwork_SDN_ZoneDeletedWhenOwnedAndEmpty(t *testing.T) {
 
 func TestHandleDeleteNetwork_SDN_ZoneKeptWhenRemainingVnets(t *testing.T) {
 	t.Parallel()
-	var deleteZoneCalled bool
+
+	var deleteZoneCalls []struct{}
 
 	remainingVnets := sdkcluster.ListSdnVnetsResponse{
 		json.RawMessage(`{"vnet":"other","zone":"autozone"}`),
@@ -274,7 +272,7 @@ func TestHandleDeleteNetwork_SDN_ZoneKeptWhenRemainingVnets(t *testing.T) {
 			return &remainingVnets, nil
 		},
 		deleteSdnZonesFn: func(_ context.Context, _ string, _ *sdkcluster.DeleteSdnZonesParams) error {
-			deleteZoneCalled = true
+			deleteZoneCalls = append(deleteZoneCalls, struct{}{})
 			return nil
 		},
 		// Opt in to vnet delete + apply mutations.
@@ -289,8 +287,8 @@ func TestHandleDeleteNetwork_SDN_ZoneKeptWhenRemainingVnets(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected: %v", err)
 	}
-	if deleteZoneCalled {
-		t.Error("zone must NOT be deleted when remaining vnets exist in zone")
+	if len(deleteZoneCalls) != 0 {
+		t.Errorf("zone must NOT be deleted when remaining vnets exist in zone; got %d call(s)", len(deleteZoneCalls))
 	}
 }
 
@@ -298,19 +296,18 @@ func TestHandleDeleteNetwork_SDN_ZoneKeptWhenRemainingVnets(t *testing.T) {
 
 func TestHandleDeleteNetwork_Bridge_HappyPath(t *testing.T) {
 	t.Parallel()
-	var bridgeDeleteCalled bool
-	var updateNetworkCalled bool
+
+	type bridgeDeleteCall struct{ iface string }
+	var bridgeDeleteCalls []bridgeDeleteCall
+	var updateNetCalls int
 
 	nodesSvc := &mockBridgeNodes{
 		deleteNetwork2Fn: func(_ context.Context, node string, iface string) error {
-			bridgeDeleteCalled = true
-			if iface != "vmbr99" {
-				t.Errorf("iface: got %q, want vmbr99", iface)
-			}
+			bridgeDeleteCalls = append(bridgeDeleteCalls, bridgeDeleteCall{iface})
 			return nil
 		},
 		updateNetworkFn: func(_ context.Context, _ string, _ *sdknodes.UpdateNetworkParams) (*sdknodes.UpdateNetworkResponse, error) {
-			updateNetworkCalled = true
+			updateNetCalls++
 			return nil, nil
 		},
 	}
@@ -332,10 +329,13 @@ func TestHandleDeleteNetwork_Bridge_HappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected: %v", err)
 	}
-	if !bridgeDeleteCalled {
-		t.Error("DeleteNetwork2 must be called")
+	if len(bridgeDeleteCalls) != 1 {
+		t.Fatalf("DeleteNetwork2: want 1 call, got %d", len(bridgeDeleteCalls))
 	}
-	if !updateNetworkCalled {
+	if bridgeDeleteCalls[0].iface != "vmbr99" {
+		t.Errorf("DeleteNetwork2: want iface=vmbr99, got %q", bridgeDeleteCalls[0].iface)
+	}
+	if updateNetCalls == 0 {
 		t.Error("UpdateNetwork must be called after bridge delete")
 	}
 }
@@ -347,14 +347,13 @@ func TestHandleDeleteNetwork_Bridge_HappyPath(t *testing.T) {
 
 func TestHandleDeleteNetwork_Bridge_SDNDoesNotExistMessage(t *testing.T) {
 	t.Parallel()
-	var bridgeDeleteCalled bool
+
+	type bridgeDeleteCall struct{ iface string }
+	var bridgeDeleteCalls []bridgeDeleteCall
 
 	nodesSvc := &mockBridgeNodes{
 		deleteNetwork2Fn: func(_ context.Context, _ string, iface string) error {
-			bridgeDeleteCalled = true
-			if iface != "vmbr9" {
-				t.Errorf("iface: got %q, want vmbr9", iface)
-			}
+			bridgeDeleteCalls = append(bridgeDeleteCalls, bridgeDeleteCall{iface})
 			return nil
 		},
 		updateNetworkFn: func(_ context.Context, _ string, _ *sdknodes.UpdateNetworkParams) (*sdknodes.UpdateNetworkResponse, error) {
@@ -378,8 +377,10 @@ func TestHandleDeleteNetwork_Bridge_SDNDoesNotExistMessage(t *testing.T) {
 	if err := invokeDeleteNetwork(t, deps, "vmbr9"); err != nil {
 		t.Fatalf("unexpected error — bridge fallback should have run: %v", err)
 	}
-	if !bridgeDeleteCalled {
+	if len(bridgeDeleteCalls) == 0 {
 		t.Error("DeleteNetwork2 must be called via bridge fallback on SDN 'does not exist'")
+	} else if bridgeDeleteCalls[0].iface != "vmbr9" {
+		t.Errorf("DeleteNetwork2: want iface=vmbr9, got %q", bridgeDeleteCalls[0].iface)
 	}
 }
 
@@ -528,7 +529,8 @@ func TestHandleDeleteNetwork_SDN_ProbeError(t *testing.T) {
 
 func TestHandleDeleteNetwork_SDN_ZoneNotDeletedWhenAutoManageFalse(t *testing.T) {
 	t.Parallel()
-	var deleteZoneCalled bool
+
+	var deleteZoneCalls []struct{}
 	clusterSvc := &mockSDNCluster{
 		getSdnVnetsFn: func(_ context.Context, _ string, _ *sdkcluster.GetSdnVnetsParams) (*sdkcluster.GetSdnVnetsResponse, error) {
 			return rawVnet("myzone"), nil
@@ -542,7 +544,7 @@ func TestHandleDeleteNetwork_SDN_ZoneNotDeletedWhenAutoManageFalse(t *testing.T)
 			return &empty, nil
 		},
 		deleteSdnZonesFn: func(_ context.Context, _ string, _ *sdkcluster.DeleteSdnZonesParams) error {
-			deleteZoneCalled = true
+			deleteZoneCalls = append(deleteZoneCalls, struct{}{})
 			return nil
 		},
 		// Opt in to vnet delete + apply mutations.
@@ -558,8 +560,8 @@ func TestHandleDeleteNetwork_SDN_ZoneNotDeletedWhenAutoManageFalse(t *testing.T)
 	if err != nil {
 		t.Fatalf("unexpected: %v", err)
 	}
-	if deleteZoneCalled {
-		t.Error("zone must NOT be deleted when SDNAutoManageZone=false")
+	if len(deleteZoneCalls) != 0 {
+		t.Errorf("zone must NOT be deleted when SDNAutoManageZone=false; got %d call(s)", len(deleteZoneCalls))
 	}
 }
 
@@ -688,7 +690,7 @@ func TestDeleteNetwork_ZoneAutoDelete_OnlyWhenAllConditionsHold(t *testing.T) {
 
 	for _, r := range rows {
 		t.Run(r.name, func(t *testing.T) {
-			var deleteZoneCalled bool
+			var deleteZoneCalls []struct{}
 			var updateSdnCalls int
 			remainingCopy := r.remainingVnets
 
@@ -709,7 +711,7 @@ func TestDeleteNetwork_ZoneAutoDelete_OnlyWhenAllConditionsHold(t *testing.T) {
 					return nil
 				},
 				deleteSdnZonesFn: func(_ context.Context, _ string, _ *sdkcluster.DeleteSdnZonesParams) error {
-					deleteZoneCalled = true
+					deleteZoneCalls = append(deleteZoneCalls, struct{}{})
 					return nil
 				},
 				updateSdnFn: func(_ context.Context, _ *sdkcluster.UpdateSdnParams) (*sdkcluster.UpdateSdnResponse, error) {
@@ -722,8 +724,9 @@ func TestDeleteNetwork_ZoneAutoDelete_OnlyWhenAllConditionsHold(t *testing.T) {
 			if err != nil {
 				t.Fatalf("unexpected: %v", err)
 			}
-			if deleteZoneCalled != r.wantDeleteZone {
-				t.Errorf("DeleteSdnZones called=%v, want=%v", deleteZoneCalled, r.wantDeleteZone)
+			gotDeleteZone := len(deleteZoneCalls) > 0
+			if gotDeleteZone != r.wantDeleteZone {
+				t.Errorf("DeleteSdnZones called=%v, want=%v", gotDeleteZone, r.wantDeleteZone)
 			}
 			if updateSdnCalls < r.wantApplyAfterMin {
 				t.Errorf("UpdateSdn calls=%d, want >= %d", updateSdnCalls, r.wantApplyAfterMin)

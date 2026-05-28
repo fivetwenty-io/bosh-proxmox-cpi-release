@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
@@ -38,6 +39,7 @@ type vmMockQEMU struct {
 	configFn     func(ctx context.Context, node string, vmid int) (map[string]any, error)
 	attachDiskFn func(ctx context.Context, node string, vmid int, volid, bus string, opts *sdkqemu.AttachOpts) (string, error)
 
+	mu          sync.Mutex
 	createCalls []vmCreateCall
 	startCalls  []int
 }
@@ -48,7 +50,9 @@ type vmCreateCall struct {
 }
 
 func (m *vmMockQEMU) Create(ctx context.Context, node string, params map[string]any) (string, error) {
+	m.mu.Lock()
 	m.createCalls = append(m.createCalls, vmCreateCall{node, params})
+	m.mu.Unlock()
 	if m.createFn != nil {
 		return m.createFn(ctx, node, params)
 	}
@@ -56,7 +60,9 @@ func (m *vmMockQEMU) Create(ctx context.Context, node string, params map[string]
 }
 
 func (m *vmMockQEMU) Start(ctx context.Context, node string, vmid int) (string, error) {
+	m.mu.Lock()
 	m.startCalls = append(m.startCalls, vmid)
+	m.mu.Unlock()
 	if m.startFn != nil {
 		return m.startFn(ctx, node, vmid)
 	}
@@ -757,7 +763,7 @@ func TestCreateVM_RejectsTooManyPersistentDisks(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected create_vm to reject 29 persistent disks")
 	}
-	if !containsSubstr(err.Error(), "too many persistent disks") {
+	if !strings.Contains(err.Error(), "too many persistent disks") {
 		t.Errorf("expected disk-cap error, got: %v", err)
 	}
 }
@@ -904,7 +910,7 @@ func TestCreateVM_RollbackTolerantToRemoveError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected original start error to propagate")
 	}
-	if !containsSubstr(err.Error(), "simulated start failure") {
+	if !strings.Contains(err.Error(), "simulated start failure") {
 		t.Errorf("expected original start failure in error chain, got %v", err)
 	}
 	if len(a.removeCalls) != 1 {
@@ -1134,7 +1140,7 @@ func TestCreateVM_AgentDead_EmitsDiagnostic(t *testing.T) {
 	// Wire the package-level agentDeadQEMUService so its Status method
 	// intercepts any diagnostic probe the handler may emit after agent.Configure fails.
 	customQ := &agentDeadQEMUService{
-		vmMockQEMU: *q,
+		vmMockQEMU: q,
 		statusCallFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
 			statusCalled = true
 			return map[string]any{"status": vmStatus, "qmpstatus": vmStatus}, nil
@@ -1210,8 +1216,9 @@ func TestCreateVM_AgentDead_EmitsDiagnostic(t *testing.T) {
 }
 
 // agentDeadQEMUService extends vmMockQEMU to override Status without panic.
+// The embedded vmMockQEMU is held by pointer to avoid copying a sync.Mutex.
 type agentDeadQEMUService struct {
-	vmMockQEMU
+	*vmMockQEMU
 	statusCallFn func(ctx context.Context, node string, vmid int) (map[string]any, error)
 }
 

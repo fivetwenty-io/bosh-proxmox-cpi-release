@@ -107,8 +107,9 @@ func HandleResizeDisk(deps Deps) Handler {
 		// ----------------------------------------------------------------
 		if snapNames, snapErr := pve.HasSnapshots(ctx, deps.PVE, node, vmid); snapErr != nil {
 			if deps.Config.RequireSnapshotCheckPass {
-				return nil, cpierrors.Wrap(snapErr,
-					"resize_disk: snapshot pre-flight check failed and require_snapshot_check_pass is set",
+				return nil, cpierrors.SnapshotBlocked(
+					"resize_disk: snapshot pre-flight check failed and require_snapshot_check_pass is set: %s",
+					snapErr.Error(),
 				)
 			}
 			deps.Logger.Warn("resize_disk: snapshot pre-flight check failed — proceeding (fail-open)",
@@ -124,7 +125,7 @@ func HandleResizeDisk(deps Deps) Handler {
 					log.String("snapshots", strings.Join(snapNames, ", ")),
 				)
 			} else {
-				return nil, cpierrors.Cloud(
+				return nil, cpierrors.SnapshotBlocked(
 					"resize_disk: VM %d (node %s) has %d snapshot(s) [%s]."+
 						" PVE cannot resize disks on LVM-thin or ZFS storage when snapshots exist;"+
 						" on qcow2/raw the resize succeeds but snapshot data becomes inconsistent."+

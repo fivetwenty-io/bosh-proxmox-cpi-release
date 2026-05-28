@@ -36,19 +36,17 @@ func baseDepsForDelete(t *testing.T, storageSvc *mockStorageService) handlers.De
 
 func TestHandleDeleteDisk_Happy(t *testing.T) {
 	t.Parallel()
-	var deleteCalled bool
+
+	type deleteVolumeCall struct {
+		node    string
+		storage string
+		volume  string
+	}
+	var deleteCalls []deleteVolumeCall
+
 	storageSvc := &mockStorageService{
 		deleteVolumeFn: func(_ context.Context, node, storage, volume string) error {
-			deleteCalled = true
-			if node != testNode {
-				t.Errorf("unexpected node %q", node)
-			}
-			if storage != storageName {
-				t.Errorf("unexpected storage %q", storage)
-			}
-			if volume != diskCID {
-				t.Errorf("unexpected volume %q", volume)
-			}
+			deleteCalls = append(deleteCalls, deleteVolumeCall{node, storage, volume})
 			return nil
 		},
 	}
@@ -65,8 +63,17 @@ func TestHandleDeleteDisk_Happy(t *testing.T) {
 	if result != nil {
 		t.Errorf("expected nil result for void method, got %v", result)
 	}
-	if !deleteCalled {
-		t.Error("expected DeleteVolume to be called")
+	if len(deleteCalls) != 1 {
+		t.Fatalf("DeleteVolume: want 1 call, got %d", len(deleteCalls))
+	}
+	if deleteCalls[0].node != testNode {
+		t.Errorf("DeleteVolume: want node=%q, got %q", testNode, deleteCalls[0].node)
+	}
+	if deleteCalls[0].storage != storageName {
+		t.Errorf("DeleteVolume: want storage=%q, got %q", storageName, deleteCalls[0].storage)
+	}
+	if deleteCalls[0].volume != diskCID {
+		t.Errorf("DeleteVolume: want volume=%q, got %q", diskCID, deleteCalls[0].volume)
 	}
 }
 
@@ -433,16 +440,16 @@ func TestHandleDeleteDisk_NoClusterCallExpected(t *testing.T) {
 // wires an empty cluster list, confirming the delete path never touches VMID allocation.
 func TestHandleDeleteDisk_WithoutClusterService(t *testing.T) {
 	t.Parallel()
-	var deleteCalled bool
+
+	type deleteVolumeCall struct {
+		storage string
+		volume  string
+	}
+	var deleteCalls []deleteVolumeCall
+
 	storageSvc := &mockStorageService{
 		deleteVolumeFn: func(_ context.Context, _, storage, volume string) error {
-			deleteCalled = true
-			if storage != storageName {
-				t.Errorf("expected storage %q, got %q", storageName, storage)
-			}
-			if volume != diskCID {
-				t.Errorf("expected volume %q, got %q", diskCID, volume)
-			}
+			deleteCalls = append(deleteCalls, deleteVolumeCall{storage, volume})
 			return nil
 		},
 	}
@@ -472,7 +479,14 @@ func TestHandleDeleteDisk_WithoutClusterService(t *testing.T) {
 	if result != nil {
 		t.Errorf("expected nil result, got %v", result)
 	}
-	if !deleteCalled {
+	if len(deleteCalls) == 0 {
 		t.Error("expected DeleteVolume to be called via no-cluster client")
+	} else {
+		if deleteCalls[0].storage != storageName {
+			t.Errorf("DeleteVolume: want storage=%q, got %q", storageName, deleteCalls[0].storage)
+		}
+		if deleteCalls[0].volume != diskCID {
+			t.Errorf("DeleteVolume: want volume=%q, got %q", diskCID, deleteCalls[0].volume)
+		}
 	}
 }

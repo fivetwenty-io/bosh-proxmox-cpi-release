@@ -364,7 +364,7 @@ func TestHandleCreateStemcell_LightFetch_DedupBySHA(t *testing.T) {
 	existingFilename := "bosh-stemcell-ubuntu-jammy-1.999-" + sha8 + ".qcow2"
 	wantCID := "light:nfs:import/" + existingFilename
 
-	var uploadCalled bool
+	var uploadCalls []struct{}
 	deps := wbBuildFetchDeps(t, wbExistingVolumeListFn("nfs", existingFilename))
 	deps.FetchResolver = func(rawURL string) (stemcellfetch.Source, stemcellfetch.Reference, error) {
 		return &mockSource{body: body, contentLength: int64(len(body))},
@@ -374,7 +374,7 @@ func TestHandleCreateStemcell_LightFetch_DedupBySHA(t *testing.T) {
 	deps.PVE.(*wbMockClient).storageSvc = &wbMockStorage{
 		uploadFn: func(_ context.Context, _, _, _, _ string, body io.Reader) (string, error) {
 			_, _ = io.Copy(io.Discard, body)
-			uploadCalled = true
+			uploadCalls = append(uploadCalls, struct{}{})
 			return "", nil
 		},
 	}
@@ -401,7 +401,7 @@ func TestHandleCreateStemcell_LightFetch_DedupBySHA(t *testing.T) {
 	if cid != wantCID {
 		t.Errorf("CID = %q; want %q", cid, wantCID)
 	}
-	if uploadCalled {
+	if len(uploadCalls) != 0 {
 		t.Error("Upload called despite SHA dedup hit; should be skipped")
 	}
 }

@@ -5,12 +5,12 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 
 	sdkcloudinit "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cloudinit"
@@ -24,6 +24,7 @@ import (
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/cpi/handlers"
+	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
@@ -281,45 +282,6 @@ func marshalArg(t *testing.T, v any) json.RawMessage {
 	return raw
 }
 
-// tempImageFile creates a temporary file with fixed deterministic bytes and
-// returns its path. The content is non-qcow2 (no magic header) so format
-// detection returns "raw".
-func tempImageFile(t *testing.T) string {
-	t.Helper()
-	f, err := os.CreateTemp(t.TempDir(), "stemcell-*.img")
-	if err != nil {
-		t.Fatalf("create temp image: %v", err)
-	}
-	_, _ = f.WriteString("FAKE STEMCELL IMAGE DATA")
-	_ = f.Close()
-	return f.Name()
-}
-
-// computeFileSHA hashes the contents of path and returns the hex digest.
-// Mirrors the production sha256FilePath helper so tests can predict the CID.
-func computeFileSHA(t *testing.T, path string) string {
-	t.Helper()
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read file: %v", err)
-	}
-	sum := sha256.Sum256(data)
-	return hex.EncodeToString(sum[:])
-}
-
-// containsSubstr is a substring check helper for test readability.
-func containsSubstr(s, sub string) bool {
-	return len(s) >= len(sub) && (s == sub || len(sub) == 0 ||
-		func() bool {
-			for i := 0; i <= len(s)-len(sub); i++ {
-				if s[i:i+len(sub)] == sub {
-					return true
-				}
-			}
-			return false
-		}())
-}
-
 // localBackendResolver is a test BackendResolver that always returns BackendLocal.
 // Used to trigger the shared-storage check in validateStemcellStorageShared.
 type localBackendResolver struct{}
@@ -364,12 +326,17 @@ func TestCreateStemcell_HappyPath_NewFlow(t *testing.T) {
 		content  string
 		filename string
 	}
-	var uploads []uploadCall
+	var (
+		uploadsMu sync.Mutex
+		uploads   []uploadCall
+	)
 
 	storageSvc := &stemcellMockStorage{
 		uploadFn: func(_ context.Context, _, _, content, filename string, body io.Reader) (string, error) {
 			_, _ = io.Copy(io.Discard, body)
+			uploadsMu.Lock()
 			uploads = append(uploads, uploadCall{content: content, filename: filename})
+			uploadsMu.Unlock()
 			return "", nil
 		},
 	}
@@ -421,10 +388,10 @@ func TestCreateStemcell_Dedup_SameFilename(t *testing.T) {
 	wantFilename := "bosh-stemcell-ubuntu-jammy-1.234-" + sha8 + ".qcow2"
 	existingVolid := "local:import/" + wantFilename
 
-	var uploadCalled bool
+	var uploadCalls []struct{}
 	storageSvc := &stemcellMockStorage{
 		uploadFn: func(_ context.Context, _, _, _, _ string, _ io.Reader) (string, error) {
-			uploadCalled = true
+			uploadCalls = append(uploadCalls, struct{}{})
 			return "", nil
 		},
 	}
@@ -458,7 +425,7 @@ func TestCreateStemcell_Dedup_SameFilename(t *testing.T) {
 	if cidStr != existingVolid {
 		t.Errorf("CID = %q; want existing volid %q", cidStr, existingVolid)
 	}
-	if uploadCalled {
+	if len(uploadCalls) != 0 {
 		t.Error("Upload called despite dedup hit; should be skipped")
 	}
 }
@@ -498,7 +465,7 @@ func TestCreateStemcell_RejectLocalStemcellStorage(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for local storage on multi-node cluster, got nil")
 	}
-	if !containsSubstr(err.Error(), "shared") {
+	if !strings.Contains(err.Error(), "shared") {
 		t.Errorf("error %q does not contain expected fragment %q", err.Error(), "shared")
 	}
 }
@@ -522,7 +489,7 @@ func TestCreateStemcell_MissingName_ReturnsError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for missing cloud_properties.name, got nil")
 	}
-	if !containsSubstr(err.Error(), "name") {
+	if !strings.Contains(err.Error(), "name") {
 		t.Errorf("error %q does not reference missing field %q", err.Error(), "name")
 	}
 }
@@ -546,7 +513,7 @@ func TestCreateStemcell_MissingVersion_ReturnsError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for missing cloud_properties.version, got nil")
 	}
-	if !containsSubstr(err.Error(), "version") {
+	if !strings.Contains(err.Error(), "version") {
 		t.Errorf("error %q does not reference missing field %q", err.Error(), "version")
 	}
 }
@@ -715,7 +682,7 @@ func captureUploadsForFormat(t *testing.T, diskFormat string) string {
 func TestCreateStemcell_OpenstackFormatTranslatedToQcow2(t *testing.T) {
 	t.Parallel()
 	filename := captureUploadsForFormat(t, "openstack-qcow2")
-	if !containsSubstr(filename, ".qcow2") {
+	if !strings.Contains(filename, ".qcow2") {
 		t.Errorf("upload filename %q does not end in .qcow2", filename)
 	}
 }
@@ -726,7 +693,7 @@ func TestCreateStemcell_OpenstackFormatTranslatedToQcow2(t *testing.T) {
 func TestCreateStemcell_OpenstackRawTranslatedToRaw(t *testing.T) {
 	t.Parallel()
 	filename := captureUploadsForFormat(t, "openstack-raw")
-	if !containsSubstr(filename, ".qcow2") {
+	if !strings.Contains(filename, ".qcow2") {
 		t.Errorf("upload filename %q does not end in .qcow2 (stemcell container always .qcow2)", filename)
 	}
 }
@@ -767,13 +734,13 @@ func TestCreateStemcell_CIDFormat(t *testing.T) {
 	}
 
 	wantPrefix := "local:import/bosh-stemcell-ubuntu-jammy-1.234-"
-	if !containsSubstr(cid, wantPrefix) {
+	if !strings.Contains(cid, wantPrefix) {
 		t.Errorf("CID %q does not start with %q", cid, wantPrefix)
 	}
-	if !containsSubstr(cid, sha8) {
+	if !strings.Contains(cid, sha8) {
 		t.Errorf("CID %q does not contain sha8 %q", cid, sha8)
 	}
-	if !containsSubstr(cid, ".qcow2") {
+	if !strings.Contains(cid, ".qcow2") {
 		t.Errorf("CID %q does not end with .qcow2", cid)
 	}
 	// CID must parse successfully via ParseStemcellCID.
@@ -784,7 +751,7 @@ func TestCreateStemcell_CIDFormat(t *testing.T) {
 	if storage != "local" {
 		t.Errorf("parsed storage = %q; want %q", storage, "local")
 	}
-	if !containsSubstr(volPath, "import/") {
+	if !strings.Contains(volPath, "import/") {
 		t.Errorf("parsed volumePath = %q; does not start with import/", volPath)
 	}
 }
@@ -832,7 +799,7 @@ func TestCreateStemcell_QCow2FileBarePassthrough(t *testing.T) {
 	if !ok {
 		t.Fatalf("result is %T; want string", result)
 	}
-	if !containsSubstr(cid, "local:import/bosh-stemcell-ubuntu-focal-99.1-") {
+	if !strings.Contains(cid, "local:import/bosh-stemcell-ubuntu-focal-99.1-") {
 		t.Errorf("CID %q does not match expected prefix", cid)
 	}
 }
@@ -840,59 +807,6 @@ func TestCreateStemcell_QCow2FileBarePassthrough(t *testing.T) {
 // ============================================================
 // Tests: tar extraction — B10 selection and magic-byte checks
 // ============================================================
-
-// makeStemcellTar builds an in-memory gzip+tar archive containing the given
-// files and writes it to a temp file. Each entry in files maps filename to
-// content bytes.
-func makeStemcellTar(t *testing.T, files map[string][]byte) string {
-	t.Helper()
-	f, err := os.CreateTemp(t.TempDir(), "stemcell-*.tgz")
-	if err != nil {
-		t.Fatalf("makeStemcellTar: create: %v", err)
-	}
-
-	gw, err := gzip.NewWriterLevel(f, gzip.BestSpeed)
-	if err != nil {
-		t.Fatalf("makeStemcellTar: gzip writer: %v", err)
-	}
-	tw := tar.NewWriter(gw)
-
-	for name, data := range files {
-		hdr := &tar.Header{
-			Typeflag: tar.TypeReg,
-			Name:     name,
-			Size:     int64(len(data)),
-			Mode:     0o644,
-		}
-		if err := tw.WriteHeader(hdr); err != nil {
-			t.Fatalf("makeStemcellTar: write header %s: %v", name, err)
-		}
-		if _, err := tw.Write(data); err != nil {
-			t.Fatalf("makeStemcellTar: write data %s: %v", name, err)
-		}
-	}
-
-	if err := tw.Close(); err != nil {
-		t.Fatalf("makeStemcellTar: close tar: %v", err)
-	}
-	if err := gw.Close(); err != nil {
-		t.Fatalf("makeStemcellTar: close gzip: %v", err)
-	}
-	if err := f.Close(); err != nil {
-		t.Fatalf("makeStemcellTar: close file: %v", err)
-	}
-	return f.Name()
-}
-
-// qcow2Bytes returns a minimal valid-magic qcow2 header padded to size bytes.
-func qcow2Bytes(size int) []byte {
-	b := make([]byte, size)
-	b[0] = 'Q'
-	b[1] = 'F'
-	b[2] = 'I'
-	b[3] = 0xFB
-	return b
-}
 
 // TestResolveStemcell_PrefersImgOverLargerNonImg verifies that when a tarball
 // contains a smaller root.img and a larger binary blob, the .img file wins.
@@ -976,8 +890,8 @@ func TestResolveStemcell_RejectsUnknownMagic(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for unknown magic bytes; got nil")
 	}
-	if !containsSubstr(err.Error(), "unknown magic bytes") {
-		t.Errorf("error %q does not mention 'unknown magic bytes'", err.Error())
+	if !cpierrors.IsType(err, cpierrors.TypeStemcellMagicMismatch) {
+		t.Errorf("error type: want StemcellMagicMismatch for unknown magic bytes, got %T %v", err, err)
 	}
 }
 
@@ -1040,94 +954,9 @@ func TestResolveStemcell_TarballExceedsMaxSize_Errors(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for tar-bomb (declared size > 32GB); got nil")
 	}
-	if !containsSubstr(err.Error(), "exceed") {
-		t.Errorf("error %q does not mention 'exceed'; expected the MaxStemcellTotalExtract message", err.Error())
+	if !cpierrors.IsType(err, cpierrors.TypeStemcellExtractCap) {
+		t.Errorf("error type: want StemcellExtractCap for tar-bomb, got %T %v", err, err)
 	}
-}
-
-// makeNegativeSizeTar builds a gzip+tar archive containing a single
-// regular-file entry whose Size field is overwritten with the GNU base-256
-// encoding of -1 after archive/tar.Writer has produced an otherwise valid
-// header. The Writer is used first so the checksum and other ustar fields
-// satisfy archive/tar.Reader's parser; the size field is then patched
-// in-place and the checksum is recomputed before the gzip stream is closed.
-//
-// archive/tar.Reader.Next() decodes the patched size as -1 (high bit of the
-// leading byte signals binary mode; remaining 0xFF bytes complete the
-// two's-complement -1). The production code's hdr.Size < 0 guard then fires
-// in resolveStemcellImage before any data is read.
-func makeNegativeSizeTar(t *testing.T, name string) string {
-	t.Helper()
-	// Step 1: build a valid 1-block ustar archive (no body) with the Writer.
-	var buf bytes.Buffer
-	tw := tar.NewWriter(&buf)
-	hdr := &tar.Header{
-		Typeflag: tar.TypeReg,
-		Name:     name,
-		Size:     0,
-		Mode:     0o644,
-		Format:   tar.FormatUSTAR,
-	}
-	if werr := tw.WriteHeader(hdr); werr != nil {
-		t.Fatalf("makeNegativeSizeTar: write header: %v", werr)
-	}
-	if cerr := tw.Close(); cerr != nil {
-		t.Fatalf("makeNegativeSizeTar: close writer: %v", cerr)
-	}
-
-	raw := buf.Bytes()
-	if len(raw) < 512 {
-		t.Fatalf("makeNegativeSizeTar: writer produced %d bytes; expected >= 512", len(raw))
-	}
-
-	// Step 2: overwrite the Size field (bytes 124..135 of the first header)
-	// with GNU base-256 -1 (0xFF repeated; high bit signals binary).
-	for i := 124; i < 136; i++ {
-		raw[i] = 0xFF
-	}
-
-	// Step 3: blank the checksum field (148..155) to spaces, recompute the
-	// 6-octal-digit checksum, then write it back as "NNNNNN\x00 ".
-	for i := 148; i < 156; i++ {
-		raw[i] = ' '
-	}
-	var sum uint32
-	for i := 0; i < 512; i++ {
-		sum += uint32(raw[i])
-	}
-	copy(raw[148:154], fmtOctal(sum, 6))
-	raw[154] = 0x00
-	raw[155] = ' '
-
-	// Step 4: wrap in gzip and write to a temp file.
-	f, err := os.CreateTemp(t.TempDir(), "stemcell-negsize-*.tgz")
-	if err != nil {
-		t.Fatalf("makeNegativeSizeTar: create: %v", err)
-	}
-	gw, err := gzip.NewWriterLevel(f, gzip.BestSpeed)
-	if err != nil {
-		t.Fatalf("makeNegativeSizeTar: gzip: %v", err)
-	}
-	if _, werr := gw.Write(raw); werr != nil {
-		t.Fatalf("makeNegativeSizeTar: gzip write: %v", werr)
-	}
-	if cerr := gw.Close(); cerr != nil {
-		t.Fatalf("makeNegativeSizeTar: gzip close: %v", cerr)
-	}
-	if cerr := f.Close(); cerr != nil {
-		t.Fatalf("makeNegativeSizeTar: file close: %v", cerr)
-	}
-	return f.Name()
-}
-
-// fmtOctal renders v as an n-digit zero-padded octal string.
-func fmtOctal(v uint32, n int) string {
-	buf := make([]byte, n)
-	for i := n - 1; i >= 0; i-- {
-		buf[i] = byte('0' + (v & 0o7))
-		v >>= 3
-	}
-	return string(buf)
 }
 
 // TestCreateStemcell_RejectsNegativeHdrSize verifies that a tarball whose
@@ -1162,9 +991,8 @@ func TestCreateStemcell_RejectsNegativeHdrSize(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for negative tar header size; got nil")
 	}
-	msg := err.Error()
-	if !containsSubstr(msg, "negative size") && !containsSubstr(msg, "invalid tar header") {
-		t.Errorf("error %q does not mention 'negative size' or 'invalid tar header'", msg)
+	if !cpierrors.IsType(err, cpierrors.TypeStemcellInvalidTar) {
+		t.Errorf("error type: want StemcellInvalidTar for negative tar header, got %T %v", err, err)
 	}
 }
 
@@ -1206,8 +1034,8 @@ func TestCreateStemcell_NoImgCandidateError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error when tarball has no usable disk image candidate; got nil")
 	}
-	if !containsSubstr(err.Error(), "no usable disk image candidate") {
-		t.Errorf("error %q does not mention 'no usable disk image candidate'", err.Error())
+	if !cpierrors.IsType(err, cpierrors.TypeStemcellNoCandidate) {
+		t.Errorf("error type: want StemcellNoCandidate for empty tarball, got %T %v", err, err)
 	}
 }
 
@@ -1247,12 +1075,8 @@ func TestCreateStemcell_RejectsPathOutsideStagingRoot(t *testing.T) {
 			if err == nil {
 				t.Fatalf("expected containment rejection for %q; got nil", tc.imagePath)
 			}
-			msg := err.Error()
-			if !containsSubstr(msg, "outside permitted staging root") {
-				t.Errorf("error %q does not mention 'outside permitted staging root'", msg)
-			}
-			if !containsSubstr(msg, tc.imagePath) {
-				t.Errorf("error %q does not echo the rejected path %q", msg, tc.imagePath)
+			if !cpierrors.IsType(err, cpierrors.TypeStemcellEscapedRoot) {
+				t.Errorf("error type: want StemcellEscapedRoot for escaped path, got %T %v", err, err)
 			}
 		})
 	}
@@ -1280,7 +1104,7 @@ func TestCreateStemcell_AcceptsPathUnderTempDir(t *testing.T) {
 	_, err := h.Handle(context.Background(), args, jsonrpc.Context{})
 	// Any later-stage error is acceptable; this test only guards against the
 	// staging-root rejection misfiring on a legitimate path.
-	if err != nil && containsSubstr(err.Error(), "outside permitted staging root") {
+	if err != nil && strings.Contains(err.Error(), "outside permitted staging root") {
 		t.Errorf("staging-root guard rejected a legitimate temp path %q: %v", imgPath, err)
 	}
 }
@@ -1364,14 +1188,14 @@ func TestParseStemcellCloudProps_LightFields_BlackBox(t *testing.T) {
 				if err == nil {
 					t.Fatal("expected mutex error; got nil")
 				}
-				if !containsSubstr(err.Error(), tc.wantMutexFrag) {
+				if !strings.Contains(err.Error(), tc.wantMutexFrag) {
 					t.Errorf("error %q does not contain %q", err.Error(), tc.wantMutexFrag)
 				}
 				return
 			}
 			// Non-mutex cases: error must NOT be the mutex error. Later-stage
 			// errors (missing name/version) are acceptable.
-			if err != nil && containsSubstr(err.Error(), "mutually exclusive") {
+			if err != nil && strings.Contains(err.Error(), "mutually exclusive") {
 				t.Errorf("unexpected mutex error for case %q: %v", tc.name, err)
 			}
 		})
@@ -1431,13 +1255,13 @@ func TestStemcellCloudProps_validateLightMutex(t *testing.T) {
 				if err == nil {
 					t.Fatalf("expected error containing %q; got nil", tc.errFrag)
 				}
-				if !containsSubstr(err.Error(), tc.errFrag) {
+				if !strings.Contains(err.Error(), tc.errFrag) {
 					t.Errorf("error %q does not contain %q", err.Error(), tc.errFrag)
 				}
 				return
 			}
 			// No mutex error expected. Later-stage errors (name/version missing) are fine.
-			if err != nil && containsSubstr(err.Error(), "mutually exclusive") {
+			if err != nil && strings.Contains(err.Error(), "mutually exclusive") {
 				t.Errorf("unexpected mutual-exclusion error: %v", err)
 			}
 		})
@@ -1518,10 +1342,10 @@ func TestHandleCreateStemcell_LightPreUploaded_HappyPath(t *testing.T) {
 	clusterStorage := lightStemcellClusterStorage(storageName, "nfs", true)
 	deps := lightStemcellDeps(t, clusterStorage, existingVolumeListFn(storageName, filename), 1)
 
-	var uploadCalled bool
+	var uploadCalls []struct{}
 	deps.PVE.(*stemcellMockClient).storageSvc = &stemcellMockStorage{
 		uploadFn: func(_ context.Context, _, _, _, _ string, _ io.Reader) (string, error) {
-			uploadCalled = true
+			uploadCalls = append(uploadCalls, struct{}{})
 			return "", nil
 		},
 	}
@@ -1547,7 +1371,7 @@ func TestHandleCreateStemcell_LightPreUploaded_HappyPath(t *testing.T) {
 	if cid != wantCID {
 		t.Errorf("CID = %q; want %q", cid, wantCID)
 	}
-	if uploadCalled {
+	if len(uploadCalls) != 0 {
 		t.Error("Upload called for light stemcell; must be skipped")
 	}
 }
@@ -1573,7 +1397,7 @@ func TestHandleCreateStemcell_LightPreUploaded_MalformedImageID(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for malformed image_id; got nil")
 	}
-	if !containsSubstr(err.Error(), "not-a-valid-volid") {
+	if !strings.Contains(err.Error(), "not-a-valid-volid") {
 		t.Errorf("error %q does not echo the bad image_id", err.Error())
 	}
 }
@@ -1604,7 +1428,7 @@ func TestHandleCreateStemcell_LightPreUploaded_VolumeNotFound(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for volume not found; got nil")
 	}
-	if !containsSubstr(err.Error(), "not found") {
+	if !strings.Contains(err.Error(), "not found") {
 		t.Errorf("error %q does not mention 'not found'", err.Error())
 	}
 }
@@ -1637,7 +1461,7 @@ func TestHandleCreateStemcell_LightPreUploaded_BlockStorageRejected(t *testing.T
 	if err == nil {
 		t.Fatal("expected error for block storage; got nil")
 	}
-	if !containsSubstr(err.Error(), "block") {
+	if !strings.Contains(err.Error(), "block") {
 		t.Errorf("error %q does not mention 'block'", err.Error())
 	}
 }
@@ -1672,7 +1496,7 @@ func TestHandleCreateStemcell_LightPreUploaded_LocalMultiNodeNoPin(t *testing.T)
 	if err == nil {
 		t.Fatal("expected error for local storage multi-node without node pin; got nil")
 	}
-	if !containsSubstr(err.Error(), "node") {
+	if !strings.Contains(err.Error(), "node") {
 		t.Errorf("error %q does not mention 'node'", err.Error())
 	}
 }
@@ -1707,7 +1531,7 @@ func TestHandleCreateStemcell_LightPreUploaded_LocalSingleNodeAccepted(t *testin
 	if !ok {
 		t.Fatalf("result is %T; want string", result)
 	}
-	if !containsSubstr(cid, "light:") {
+	if !strings.Contains(cid, "light:") {
 		t.Errorf("CID %q missing 'light:' prefix", cid)
 	}
 }
@@ -1744,7 +1568,7 @@ func TestHandleCreateStemcell_LightPreUploaded_AnyStorageAccepted(t *testing.T) 
 	if !ok {
 		t.Fatalf("result is %T; want string", result)
 	}
-	if !containsSubstr(cid, "light:") {
+	if !strings.Contains(cid, "light:") {
 		t.Errorf("CID %q missing 'light:' prefix", cid)
 	}
 }
@@ -1776,7 +1600,7 @@ func TestHandleCreateStemcell_LightPreUploaded_StorageMatchSuccess(t *testing.T)
 		t.Fatalf("unexpected error when storage matches config: %v", err)
 	}
 	cid, _ := result.(string)
-	if !containsSubstr(cid, "light:") {
+	if !strings.Contains(cid, "light:") {
 		t.Errorf("CID %q missing 'light:' prefix", cid)
 	}
 }
@@ -1802,7 +1626,7 @@ func TestHandleCreateStemcell_LightFetch_BadScheme(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for unsupported scheme; got nil")
 	}
-	if !containsSubstr(err.Error(), "ftp") && !containsSubstr(err.Error(), "scheme") && !containsSubstr(err.Error(), "unsupported") {
+	if !strings.Contains(err.Error(), "ftp") && !strings.Contains(err.Error(), "scheme") && !strings.Contains(err.Error(), "unsupported") {
 		t.Errorf("error %q does not mention unsupported scheme", err.Error())
 	}
 }
@@ -1832,7 +1656,7 @@ func TestHandleCreateStemcell_LightFetch_BlockStorageRejected(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for block storage in fetch mode; got nil")
 	}
-	if !containsSubstr(err.Error(), "block") {
+	if !strings.Contains(err.Error(), "block") {
 		t.Errorf("error %q does not mention 'block'", err.Error())
 	}
 }
@@ -1866,7 +1690,7 @@ func TestHandleCreateStemcell_LightPreUploaded_LightPrefixStripped(t *testing.T)
 		t.Fatalf("unexpected error when image_id has light: prefix: %v", err)
 	}
 	cid, _ := result.(string)
-	if !containsSubstr(cid, "light:") {
+	if !strings.Contains(cid, "light:") {
 		t.Errorf("CID %q missing 'light:' prefix", cid)
 	}
 }

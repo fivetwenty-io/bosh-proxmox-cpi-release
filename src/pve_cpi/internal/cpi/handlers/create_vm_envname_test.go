@@ -92,7 +92,6 @@ func TestExtractJobNameFromEnv_BasicGroups(t *testing.T) {
 	}
 
 	for _, c := range cases {
-		c := c
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()
 			got := extractJobNameFromEnv(c.env)
@@ -182,7 +181,6 @@ func TestExtractDeploymentFromEnv(t *testing.T) {
 	}
 
 	for _, c := range cases {
-		c := c
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()
 			got := extractDeploymentFromEnv(c.env, c.job)
@@ -217,7 +215,6 @@ func TestComposeVMName(t *testing.T) {
 	}
 
 	for _, c := range cases {
-		c := c
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()
 			got := composeVMName(c.prefix, c.deployment, c.job, c.index)

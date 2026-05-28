@@ -18,14 +18,17 @@ func TestDevicePathByID_BasicSlots(t *testing.T) {
 	}
 
 	for _, c := range cases {
-		got, err := devicePathByID(c.diskID)
-		if err != nil {
-			t.Errorf("%s: unexpected error: %v", c.diskID, err)
-			continue
-		}
-		if got != c.want {
-			t.Errorf("%s: got %q, want %q", c.diskID, got, c.want)
-		}
+		t.Run(c.diskID, func(t *testing.T) {
+			t.Parallel()
+			got, err := devicePathByID(c.diskID)
+			if err != nil {
+				t.Errorf("unexpected error: %v", err)
+				return
+			}
+			if got != c.want {
+				t.Errorf("got %q, want %q", got, c.want)
+			}
+		})
 	}
 }
 
@@ -35,9 +38,19 @@ func TestDevicePathByID_BasicSlots(t *testing.T) {
 // changes.
 func TestDevicePathByID_NonSCSIRejected(t *testing.T) {
 	t.Parallel()
-	for _, in := range []string{"virtio0", "ide0", "sata0", "", "garbage"} {
-		if _, err := devicePathByID(in); err == nil {
-			t.Errorf("devicePathByID(%q) succeeded, expected error", in)
-		}
+	cases := []struct{ name, diskID string }{
+		{"virtio", "virtio0"},
+		{"ide", "ide0"},
+		{"sata", "sata0"},
+		{"empty", ""},
+		{"garbage", "garbage"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			if _, err := devicePathByID(c.diskID); err == nil {
+				t.Errorf("devicePathByID(%q) succeeded, expected error", c.diskID)
+			}
+		})
 	}
 }
