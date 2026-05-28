@@ -15,6 +15,8 @@ import (
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/storage"
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/tasks"
 	sdkerrors "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/errors"
+
+	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 )
 
 // ---------------------------------------------------------------------------
@@ -268,10 +270,7 @@ func TestNodeForExisting_AllNodesError_ReturnsRetriable(t *testing.T) {
 	}
 
 	// Must NOT be DiskNotFound — that would silently hide the cluster outage.
-	if isDNF := func() bool {
-		// Check via string: DiskNotFound message contains "disk not found:".
-		return len(err.Error()) > 0 && containsStr(err.Error(), "disk not found:")
-	}(); isDNF {
+	if cpierrors.IsType(err, cpierrors.TypeDiskNotFound) {
 		t.Fatalf("got DiskNotFound but expected retriable error; err=%v", err)
 	}
 
@@ -286,18 +285,6 @@ func TestNodeForExisting_AllNodesError_ReturnsRetriable(t *testing.T) {
 	if !rc.OkToRetry() {
 		t.Fatalf("expected OkToRetry()=true, got false; err=%v", err)
 	}
-}
-
-// containsStr is a package-private substring helper for test assertions.
-func containsStr(s, sub string) bool {
-	return len(sub) > 0 && len(s) >= len(sub) && func() bool {
-		for i := 0; i <= len(s)-len(sub); i++ {
-			if s[i:i+len(sub)] == sub {
-				return true
-			}
-		}
-		return false
-	}()
 }
 
 // TestCandidateNodes_RetriesOnTransient confirms candidateNodes wraps the

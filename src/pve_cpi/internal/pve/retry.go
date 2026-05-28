@@ -9,10 +9,29 @@ package pve
 import (
 	"context"
 	mrand "math/rand/v2"
+	"sync"
 	"time"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
 )
+
+// jitterMu guards jitterSource so tests can swap it without a data race.
+var jitterMu sync.Mutex
+
+// jitterSource is the RNG used by TransientBackoff and StorageLockBackoff.
+// The default is a package-level Rand seeded from the global source so
+// behavior is identical to the prior direct mrand.Int64N calls. Tests in
+// package pve may swap this directly under jitterMu for deterministic output.
+var jitterSource = mrand.New(mrand.NewPCG(mrand.Uint64(), mrand.Uint64())) //nolint:gosec // backoff jitter; non-cryptographic
+
+// jitterInt64N returns a non-negative random int64 in [0, n) using the
+// package-level jitterSource, holding jitterMu for the duration.
+// Panics if n <= 0 (same contract as mrand.Int64N).
+func jitterInt64N(n int64) int64 {
+	jitterMu.Lock()
+	defer jitterMu.Unlock()
+	return jitterSource.Int64N(n)
+}
 
 // DefaultStorageLockMaxAttempts is the bound on per-storage lock retries when
 // callers do not specify their own. Each retry waits seconds, not ms (see
@@ -48,7 +67,7 @@ func TransientBackoff(attempt int) time.Duration {
 	jitterWindow := int64(d) * 6 / 10
 	var jitter time.Duration
 	if jitterWindow > 0 {
-		jitter = time.Duration(mrand.Int64N(jitterWindow)) // #nosec G404 -- backoff jitter; non-cryptographic
+		jitter = time.Duration(jitterInt64N(jitterWindow))
 	}
 	out := d - d*3/10 + jitter
 	if out > maxBackoff {
@@ -104,7 +123,7 @@ func StorageLockBackoff(attempt int) time.Duration {
 	jitterWindow := int64(d) * 6 / 10
 	var jitter time.Duration
 	if jitterWindow > 0 {
-		jitter = time.Duration(mrand.Int64N(jitterWindow)) // #nosec G404 -- backoff jitter; non-cryptographic
+		jitter = time.Duration(jitterInt64N(jitterWindow))
 	}
 	out := d - d*3/10 + jitter
 	if out > maxBackoff {

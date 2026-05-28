@@ -70,6 +70,9 @@ type StorageInfoCache struct {
 	// package default but per-instance so tests can inject a sub-millisecond
 	// value without touching a global.
 	negTTL time.Duration
+	// clock returns the current time. Defaults to time.Now. Tests inject a
+	// fake clock to drive TTL-expiry logic without wall-clock sleeps.
+	clock func() time.Time
 
 	mu       sync.Mutex
 	entries  map[string]storageInfoEntry
@@ -112,6 +115,17 @@ func WithNegativeCacheTTL(d time.Duration) StorageInfoCacheOption {
 	}
 }
 
+// WithCacheClock overrides the clock function used for TTL comparisons.
+// The default is time.Now. Tests inject a fake clock to advance time
+// deterministically without wall-clock sleeps.
+//
+// Production code MUST NOT call this.
+func WithCacheClock(fn func() time.Time) StorageInfoCacheOption {
+	return func(c *StorageInfoCache) {
+		c.clock = fn
+	}
+}
+
 // NewStorageInfoCache constructs a cache backed by lister. ttl <= 0 disables
 // positive caching (every Get triggers a fetch). The negative-cache window
 // defaults to negativeCacheTTL and may be overridden via WithNegativeCacheTTL.
@@ -120,6 +134,7 @@ func NewStorageInfoCache(lister StorageLister, ttl time.Duration, opts ...Storag
 		lister:   lister,
 		ttl:      ttl,
 		negTTL:   negativeCacheTTL,
+		clock:    time.Now,
 		entries:  make(map[string]storageInfoEntry),
 		inflight: make(map[string]chan struct{}),
 	}
@@ -157,7 +172,7 @@ func (c *StorageInfoCache) Get(ctx context.Context, name string) (StorageInfo, e
 		c.mu.Lock()
 
 		// Cache hit: valid entry exists and TTL not expired (or TTL disabled).
-		if entry, ok := c.entries[name]; ok && (c.ttl <= 0 || time.Now().Before(entry.exp)) {
+		if entry, ok := c.entries[name]; ok && (c.ttl <= 0 || c.clock().Before(entry.exp)) {
 			c.mu.Unlock()
 			return entry.info, nil
 		}
@@ -166,7 +181,7 @@ func (c *StorageInfoCache) Get(ctx context.Context, name string) (StorageInfo, e
 		// expired. Replay the cached error rather than hammering the upstream
 		// while the failure mode is still in effect. Preserves the wrapped
 		// retriable classification produced by refresh.
-		if c.negCache.err != nil && time.Now().Before(c.negCache.exp) {
+		if c.negCache.err != nil && c.clock().Before(c.negCache.exp) {
 			cachedErr := c.negCache.err
 			c.mu.Unlock()
 			return StorageInfo{}, cachedErr
@@ -257,19 +272,19 @@ func (c *StorageInfoCache) refresh(ctx context.Context) error {
 	if err != nil {
 		wrapped := cpierrors.Wrap(WrapError(err), "storage_info: list cluster storage")
 		c.mu.Lock()
-		c.negCache = negativeCacheEntry{err: wrapped, exp: time.Now().Add(c.negTTL)}
+		c.negCache = negativeCacheEntry{err: wrapped, exp: c.clock().Add(c.negTTL)}
 		c.mu.Unlock()
 		return wrapped
 	}
 	if resp == nil {
 		wrapped := cpierrors.Cloud("storage_info: nil response from cluster storage list")
 		c.mu.Lock()
-		c.negCache = negativeCacheEntry{err: wrapped, exp: time.Now().Add(c.negTTL)}
+		c.negCache = negativeCacheEntry{err: wrapped, exp: c.clock().Add(c.negTTL)}
 		c.mu.Unlock()
 		return wrapped
 	}
 
-	now := time.Now()
+	now := c.clock()
 	deadline := now.Add(c.ttl)
 
 	c.mu.Lock()

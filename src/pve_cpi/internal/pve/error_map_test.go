@@ -3,6 +3,7 @@ package pve_test
 import (
 	"errors"
 	"net"
+	"strconv"
 	"testing"
 
 	sdkerrors "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/errors"
@@ -29,27 +30,8 @@ func cpiErrIsRetriable(t *testing.T, err error) bool {
 // makeAPIErr builds an SDK error via ParseAPIError (which sets the sentinel and
 // HTTPCode correctly) so errors.Is(err, sdkerrors.ErrNotFound) etc. work.
 func makeAPIErr(httpCode int, msg string) error {
-	body := []byte(`{"message":"` + msg + `","code":` + itoa(httpCode) + `}`)
+	body := []byte(`{"message":"` + msg + `","code":` + strconv.Itoa(httpCode) + `}`)
 	return sdkerrors.ParseAPIError(httpCode, body)
-}
-
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	digits := []byte{}
-	neg := n < 0
-	if neg {
-		n = -n
-	}
-	for n > 0 {
-		digits = append([]byte{byte('0' + n%10)}, digits...)
-		n /= 10
-	}
-	if neg {
-		digits = append([]byte{'-'}, digits...)
-	}
-	return string(digits)
 }
 
 // fakeNetError satisfies net.Error with configurable Timeout/Temporary.
@@ -170,6 +152,34 @@ func TestWrapError_NonTimeout_NetError(t *testing.T) {
 	// Non-timeout net.Error is a generic error → CloudError, non-retriable.
 	if cpiErr.OkToRetry() {
 		t.Error("non-timeout net.Error should not be retriable")
+	}
+}
+
+func TestWrapError_Temporary_True_NetError(t *testing.T) {
+	t.Parallel()
+	// temporary=true alone does not change retriability; only Timeout() matters.
+	err := &fakeNetError{timeout: false, temporary: true}
+	got := pve.WrapError(err)
+	var cpiErr *cpierrors.Error
+	if !errors.As(got, &cpiErr) {
+		t.Fatalf("expected *cpierrors.Error, got %T", got)
+	}
+	if cpiErr.OkToRetry() {
+		t.Error("temporary-only net.Error should not be retriable (only Timeout() drives retriability)")
+	}
+}
+
+func TestWrapError_Temporary_False_NetError(t *testing.T) {
+	t.Parallel()
+	// temporary=false, timeout=false → non-retriable CloudError (same as base case).
+	err := &fakeNetError{timeout: false, temporary: false}
+	got := pve.WrapError(err)
+	var cpiErr *cpierrors.Error
+	if !errors.As(got, &cpiErr) {
+		t.Fatalf("expected *cpierrors.Error, got %T", got)
+	}
+	if cpiErr.OkToRetry() {
+		t.Error("non-timeout non-temporary net.Error should not be retriable")
 	}
 }
 
@@ -376,11 +386,21 @@ func TestIsVMIDConflict_HTTP500AlreadyExists(t *testing.T) {
 	}
 }
 
-func TestIsVMIDConflict_MixedCase(t *testing.T) {
+func TestIsVMIDConflict_VMAlreadyExistsMixedCase(t *testing.T) {
 	t.Parallel()
-	err := makeAPIErr(500, "Volume Already Exists")
+	// PVE perl die() message with mixed case — anchored to "vm" prefix.
+	err := makeAPIErr(500, "VM 200 Already Exists on node pve01")
 	if !pve.IsVMIDConflict(err) {
-		t.Errorf("mixed-case 'Already Exists' should be VMID conflict; err=%v", err)
+		t.Errorf("mixed-case 'VM N Already Exists' should be VMID conflict; err=%v", err)
+	}
+}
+
+func TestIsVMIDConflict_NonVMVolumeAlreadyExists(t *testing.T) {
+	t.Parallel()
+	// Ceph "image already exists" must NOT match — no "vm" prefix.
+	err := makeAPIErr(500, "Volume Already Exists")
+	if pve.IsVMIDConflict(err) {
+		t.Errorf("'Volume Already Exists' (no vm prefix) should NOT be VMID conflict; err=%v", err)
 	}
 }
 
@@ -400,11 +420,21 @@ func TestIsVMIDConflict_HTTP404(t *testing.T) {
 	}
 }
 
-func TestIsVMIDConflict_PlainAlreadyExists(t *testing.T) {
+func TestIsVMIDConflict_PlainVMAlreadyExists(t *testing.T) {
 	t.Parallel()
-	err := errors.New("already exists")
+	// PVE task-body plain error with VMID-specific wording.
+	err := errors.New("vm 101 already exists")
 	if !pve.IsVMIDConflict(err) {
-		t.Error("plain error with 'already exists' should be VMID conflict")
+		t.Error("plain error 'vm N already exists' should be VMID conflict")
+	}
+}
+
+func TestIsVMIDConflict_CephImageAlreadyExists(t *testing.T) {
+	t.Parallel()
+	// Ceph "image already exists" — must NOT match; it is not a VMID conflict.
+	err := errors.New("image already exists")
+	if pve.IsVMIDConflict(err) {
+		t.Error("Ceph 'image already exists' must NOT be classified as VMID conflict")
 	}
 }
 
@@ -536,6 +566,7 @@ func TestIsStorageLockTimeout_Nil(t *testing.T) {
 	}
 }
 
+// source: PVE pve-manager/PVE/Storage.pm (pve-manager v8.x)
 func TestIsStorageLockTimeout_RealPVEMessage(t *testing.T) {
 	t.Parallel()
 	err := errors.New("task failed: unable to create VM 131 - cannot import from 'local:import/foo.qcow2' - can't lock file '/var/lock/pve-manager/pve-storage-data' - got timeout")
@@ -576,6 +607,7 @@ func TestIsStorageLockTimeout_Unrelated(t *testing.T) {
 	}
 }
 
+// source: PVE pve-manager/PVE/API2/Qemu.pm + Storage/LVMThin.pm (pve-manager v8.x)
 func TestIsLVMCommandTimeout_RealPVEMessage(t *testing.T) {
 	t.Parallel()
 	err := errors.New("AwaitTask UPID:pve:00157ECF:00B4B70C:6A0E4D24:resize:112:root@pam:: poll failed: task failed: command '/sbin/lvs --separator : --noheadings --units b --unbuffered --nosuffix --options lv_size /dev/data/vm-112-disk-0' failed: got timeout")
@@ -620,6 +652,7 @@ func TestIsLVMCommandTimeout_Nil(t *testing.T) {
 	}
 }
 
+// source: PVE pve-manager/PVE/Cluster/Config.pm (pve-manager v8.x)
 func TestIsPmxcfsConfigMissing_RealPVEMessage(t *testing.T) {
 	t.Parallel()
 	err := errors.New("AwaitTask UPID:pve:001581E7:00B4C1C0:6A0E4D3F:resize:114:root@pam:: poll failed: task failed: Configuration file 'nodes/pve/qemu-server/114.conf' does not exist")
@@ -690,6 +723,7 @@ func TestIsSnapshotBlocked_Nil(t *testing.T) {
 	}
 }
 
+// source: PVE pve-manager/PVE/QemuServer.pm (pve-manager v8.x)
 func TestIsSnapshotBlocked_DetachMessage(t *testing.T) {
 	t.Parallel()
 	// Canonical PVE detach surface: PUT /config delete:scsiN rejected because

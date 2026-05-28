@@ -191,13 +191,32 @@ func TestRefresh_NegativeCacheTTL(t *testing.T) {
 
 // TestNegativeCacheTTL_Expires confirms that after the negative-cache window
 // elapses, a new Get re-invokes the lister rather than indefinitely caching
-// the failure. Uses WithNegativeCacheTTL to inject a 1ms window per-instance
-// so the test stays parallel-safe — no package-global mutation.
+// the failure. Uses WithNegativeCacheTTL and WithCacheClock to drive
+// TTL expiry deterministically — no wall-clock sleep required.
 func TestNegativeCacheTTL_Expires(t *testing.T) {
 	t.Parallel()
 
+	// fakeNow is a synthetic clock that the test advances manually.
+	// The initial value is arbitrary; only relative advancement matters.
+	fakeNow := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
+	var clockMu sync.Mutex
+	clock := func() time.Time {
+		clockMu.Lock()
+		defer clockMu.Unlock()
+		return fakeNow
+	}
+	advanceClock := func(d time.Duration) {
+		clockMu.Lock()
+		defer clockMu.Unlock()
+		fakeNow = fakeNow.Add(d)
+	}
+
+	const ttl = 5 * time.Millisecond
 	lister := &fakeLister{err: errors.New("pve unreachable")}
-	cache := NewStorageInfoCache(lister, time.Minute, WithNegativeCacheTTL(1*time.Millisecond))
+	cache := NewStorageInfoCache(lister, time.Minute,
+		WithNegativeCacheTTL(ttl),
+		WithCacheClock(clock),
+	)
 
 	_, err := cache.Get(context.Background(), "ceph")
 	if err == nil {
@@ -207,8 +226,9 @@ func TestNegativeCacheTTL_Expires(t *testing.T) {
 		t.Fatalf("calls=%d want 1", lister.calls)
 	}
 
-	// Wait out the per-instance TTL (1ms) plus slack so expiry is reliable.
-	time.Sleep(10 * time.Millisecond)
+	// Advance the fake clock past the negative-cache TTL so the next Get
+	// sees an expired window and re-invokes the lister.
+	advanceClock(ttl + time.Nanosecond)
 
 	_, err = cache.Get(context.Background(), "ceph")
 	if err == nil {

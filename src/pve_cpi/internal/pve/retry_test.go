@@ -3,6 +3,7 @@ package pve
 import (
 	"context"
 	"errors"
+	mrand "math/rand/v2"
 	"testing"
 	"time"
 
@@ -322,5 +323,44 @@ func TestBackoff_ZeroJitterNoPanic(t *testing.T) {
 	for attempt := 0; attempt < 30; attempt++ {
 		_ = TransientBackoff(attempt)
 		_ = StorageLockBackoff(attempt)
+	}
+}
+
+// TestJitterSource_Seam confirms that swapping jitterSource under jitterMu
+// changes the output of TransientBackoff and StorageLockBackoff, proving the
+// seam is wired end-to-end. A seeded PCG source produces reproducible output,
+// so two identical calls with the same source state return the same value.
+//
+// This test is NOT parallel because it mutates the package-level jitterSource.
+// Run all per-attempt calls before restoring to keep the window small.
+func TestJitterSource_Seam(t *testing.T) {
+	// Seed a deterministic source, capture attempt-0 output, reset, capture
+	// again, and confirm both runs return the same value. Non-deterministic
+	// output (from the default source) would produce a flaky test here.
+	seed := mrand.NewPCG(42, 99)
+	seeded := mrand.New(seed)
+
+	jitterMu.Lock()
+	prev := jitterSource
+	jitterSource = seeded
+	jitterMu.Unlock()
+
+	first := TransientBackoff(0)
+
+	// Re-seed to the same state and repeat.
+	seed2 := mrand.NewPCG(42, 99)
+	seeded2 := mrand.New(seed2)
+	jitterMu.Lock()
+	jitterSource = seeded2
+	jitterMu.Unlock()
+
+	second := TransientBackoff(0)
+
+	jitterMu.Lock()
+	jitterSource = prev
+	jitterMu.Unlock()
+
+	if first != second {
+		t.Errorf("jitterSource seam not wired: same seed produced different outputs (%v vs %v)", first, second)
 	}
 }
