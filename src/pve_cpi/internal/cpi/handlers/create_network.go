@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/cpi"
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
@@ -266,46 +267,12 @@ func createNetworkSDN(
 	cp := spec.CloudProperties
 	clusterSvc := deps.PVE.Cluster()
 
-	// vnet name is required.
-	if vnet == "" {
-		return nil, cpierrors.Cloud(
-			"create_network: cloud_properties.vnet is required for the SDN path",
-		)
-	}
-	if err := validateVnetName(vnet); err != nil {
+	zoneType, err := validateCreateNetworkSDNPreflight(cfg, cp, zone, vnet)
+	if err != nil {
 		return nil, err
 	}
 
-	// Resolve zone.
-	//
-	// What sdn_auto_manage_zone does and does NOT do:
-	//   - false (default): zone must exist in PVE before create_network is called.
-	//     The CPI returns an error if the zone is absent or unspecified.
-	//   - true: the CPI will CREATE the zone in PVE when it does not already exist.
-	//     It does NOT derive or invent a zone name — the operator must still supply
-	//     cloud_properties.zone or config.sdn_zone. The flag only relaxes the
-	//     "zone not found" error into an auto-create action.
-	if zone == "" {
-		if !cfg.SDNAutoManageZone {
-			return nil, cpierrors.Cloud(
-				"create_network: SDN zone is required — set cloud_properties.zone, config sdn_zone, " +
-					"or enable sdn_auto_manage_zone",
-			)
-		}
-		// sdn_auto_manage_zone is true but no zone name was provided (neither
-		// cloud_properties.zone nor config.sdn_zone). The flag cannot auto-create a
-		// zone without a name; the operator must supply one.
-		return nil, cpierrors.Cloud(
-			"create_network: cloud_properties.zone is required when sdn_auto_manage_zone is true " +
-				"and no sdn_zone is configured in the CPI config",
-		)
-	}
-
 	// Phase 1: verify zone exists in PVE; create it when sdn_auto_manage_zone is enabled.
-	zoneType := cpStr(cp, "zone_type")
-	if zoneType == "" {
-		zoneType = cfg.SDNZoneType
-	}
 	createdZone, err := resolveOrCreateSDNZone(ctx, deps, clusterSvc, sdnZoneArgs{
 		zone:              zone,
 		zoneType:          zoneType,
@@ -442,6 +409,45 @@ func createNetworkSDN(
 		"bridge": vnet,
 	}
 	return []any{vnet, addrProps, cloudPropsOut}, nil
+}
+
+// validateCreateNetworkSDNPreflight performs the pre-PVE-call validation for
+// the SDN create_network path:
+//   - vnet name is required + matches the PVE vnet name grammar.
+//   - zone must be supplied (cloud_properties.zone or config.sdn_zone). When
+//     sdn_auto_manage_zone is true the CPI will create the zone if absent, but
+//     it does NOT invent a zone name; the operator must still supply one.
+//
+// Returns the resolved zone type used for auto-create (cloud_properties.zone_type
+// → config.sdn_zone_type, in that order).
+func validateCreateNetworkSDNPreflight(cfg *config.CPIConfig, cp map[string]any, zone, vnet string) (string, error) {
+	if vnet == "" {
+		return "", cpierrors.Cloud(
+			"create_network: cloud_properties.vnet is required for the SDN path",
+		)
+	}
+	if err := validateVnetName(vnet); err != nil {
+		return "", err
+	}
+
+	if zone == "" {
+		if !cfg.SDNAutoManageZone {
+			return "", cpierrors.Cloud(
+				"create_network: SDN zone is required — set cloud_properties.zone, config sdn_zone, " +
+					"or enable sdn_auto_manage_zone",
+			)
+		}
+		return "", cpierrors.Cloud(
+			"create_network: cloud_properties.zone is required when sdn_auto_manage_zone is true " +
+				"and no sdn_zone is configured in the CPI config",
+		)
+	}
+
+	zoneType := cpStr(cp, "zone_type")
+	if zoneType == "" {
+		zoneType = cfg.SDNZoneType
+	}
+	return zoneType, nil
 }
 
 // createNetworkBridge implements the Linux bridge creation flow via the nodes API.

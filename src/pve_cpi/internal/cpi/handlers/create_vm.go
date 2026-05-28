@@ -13,6 +13,7 @@ import (
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/agent"
+	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/cpi"
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
@@ -344,9 +345,6 @@ func parseCreateVMArgs(args []json.RawMessage) (*createVMParsedArgs, error) {
 func resolveVMShape(deps Deps, parsed *createVMParsedArgs) (*createVMShape, error) {
 	cp := parsed.cloudProps
 
-	// -----------------------------------------------------------------------
-	// 2. Resolve node from cloud_properties or config default
-	// -----------------------------------------------------------------------
 	node := cp.TargetNode
 	if node == "" {
 		node = deps.Config.Node
@@ -355,113 +353,15 @@ func resolveVMShape(deps Deps, parsed *createVMParsedArgs) (*createVMShape, erro
 		return nil, cpierrors.Cloud("create_vm: target node not set in cloud_properties.target_node or config.node")
 	}
 
-	// -----------------------------------------------------------------------
-	// 3. Resolve VM-shape parameters used by every allocation attempt.
-	// -----------------------------------------------------------------------
-	rangeStart := deps.Config.VMIDRangeStart
-	if rangeStart < 100 {
-		rangeStart = pve.VMIDRangeVMStart
-	}
-	maxAttempts := deps.Config.VMIDAllocAttempts
-	if maxAttempts <= 0 {
-		// Default raised to 10 so a parallel CF deploy (many simultaneous
-		// stemcell imports against the same PVE storage) can survive
-		// transient per-storage lockfile timeouts in addition to VMID
-		// races. Each lock-timeout retry waits seconds, not ms, so 10 is
-		// still bounded.
-		maxAttempts = 10
-	}
+	rangeStart, maxAttempts := resolveVMIDAllocParams(deps.Config)
+	vmStorage, vmDiskFormat, rootDiskGiB := resolveVMShapeStorage(deps.Config, parsed)
+	cores, sockets, memMiB := resolveVMShapeCPUMem(cp)
+	hotplug, numaEnabled := resolveVMShapeHotplugNUMA(deps.Config, cp)
 
-	// Resolve disk format: prefer cloud_properties.vm_disk_format; fall back to "qcow2".
-	vmDiskFormat := cp.VMDiskFormat
-	if vmDiskFormat == "" {
-		vmDiskFormat = diskFormatQCOW2
-	}
-
-	// Resolve target storage: prefer config VMStorage; fall back to the stemcell's
-	// own storage so the import stays on-node when no override is configured.
-	vmStorage := deps.Config.VMStorage
-	if vmStorage == "" {
-		vmStorage = parsed.stemcellStor
-	}
-
-	// Compute root disk size in GiB. cloud_properties.disk is in MiB; round up.
-	// Minimum is defaultStemcellDiskGiB so we never request a size smaller than
-	// the imported image (PVE enforces a no-shrink rule — the import itself would
-	// succeed but the explicit size= directive would be ignored or error).
-	rootDiskGiB := defaultStemcellDiskGiB
-	if cp.Disk > 0 {
-		requestedGiB := (cp.Disk + 1023) / 1024
-		if requestedGiB > rootDiskGiB {
-			rootDiskGiB = requestedGiB
-		}
-	}
-
-	// cloud_properties supports two conventions:
-	//   - vSphere CPI style: cpu = total vCPU count (cores × sockets).
-	//   - PVE-native: cores/sockets explicit.
-	// Explicit cores/sockets win when present; otherwise fall back to cpu
-	// as cores with a single socket. Default is 1 vCPU.
-	cores := cp.Cores
-	if cores <= 0 && cp.CPU > 0 {
-		cores = cp.CPU
-	}
-	if cores <= 0 {
-		cores = 1
-	}
-	sockets := cp.Sockets
-	if sockets <= 0 {
-		sockets = 1
-	}
-	memMiB := cp.Memory
-	if memMiB <= 0 {
-		memMiB = cp.RAM
-	}
-	if memMiB <= 0 {
-		memMiB = 512
-	}
-
-	// Resolve hotplug + numa with cloud_properties → config → built-in default.
-	// Memory hotplug needs both numa=1 and "memory" in hotplug at create time;
-	// operators can override per-vm_type for stemcells that misbehave on
-	// memory hot-add.
-	hotplug := deps.Config.HotplugValue()
-	if cp.Hotplug != nil {
-		hotplug = *cp.Hotplug
-	}
-	numaEnabled := deps.Config.NUMAValue()
-	if cp.NUMA != nil {
-		numaEnabled = *cp.NUMA
-	}
-
-	// Pre-compute the operator-supplied tag string. The BOSH-managed
-	// director/deployment/job triple is added later by set_vm_metadata; here
-	// we set only the custom tags so the VM has them visible in the PVE UI
-	// immediately after creation.
+	// Operator-supplied tags only. The BOSH-managed director/deployment/job
+	// triple is added later by set_vm_metadata.
 	initialTags := mergeTagList(nil, buildCustomTags(cp.Tags), maxTagLength)
-
-	// Initial VM name derived from env.bosh.{group,groups} + Config so the
-	// PVE UI shows the deployment + instance-group immediately on come-online
-	// instead of the placeholder "vm-<vmid>". For director-mode deploys env
-	// carries director + deployment + job in env.bosh.group; for `bosh
-	// create-env` env has no deployment, so Config.CreateEnvDeployment
-	// (default "create-env") fills that segment. set_vm_metadata later
-	// refines this to "<prefix>-<deployment>-<job>-<index>" once the index
-	// is known (the index is not part of the create_vm env per the v2 CPI
-	// spec).
-	initialJobName := extractJobNameFromEnv(parsed.env)
-	initialDeployment := extractDeploymentFromEnv(parsed.env, initialJobName)
-	if initialDeployment == "" {
-		initialDeployment = deps.Config.CreateEnvDeployment
-	}
-	if initialJobName == "" {
-		// create-env path: env has no group/groups. Fall back to the BOSH
-		// instance-group baked into cloud_provider.template.name when it is
-		// detectable from env.bosh.instance.name; otherwise leave blank and
-		// let the "vm-<vmid>" placeholder stand.
-		initialJobName = extractInstanceNameFromEnv(parsed.env)
-	}
-	initialName := composeVMName(deps.Config.VMPrefix, initialDeployment, initialJobName, "")
+	initialName := resolveVMShapeInitialName(deps.Config, parsed)
 
 	return &createVMShape{
 		node:         node,
@@ -478,6 +378,118 @@ func resolveVMShape(deps Deps, parsed *createVMParsedArgs) (*createVMShape, erro
 		maxAttempts:  maxAttempts,
 		initialName:  initialName,
 	}, nil
+}
+
+// resolveVMIDAllocParams returns the VMID range start and per-create allocation
+// retry budget. maxAttempts defaults to 10 so a parallel CF deploy (many
+// simultaneous stemcell imports against the same PVE storage) can survive
+// transient per-storage lockfile timeouts in addition to VMID races. Each
+// lock-timeout retry waits seconds, not ms, so 10 is still bounded.
+func resolveVMIDAllocParams(cfg *config.CPIConfig) (rangeStart, maxAttempts int) {
+	rangeStart = cfg.VMIDRangeStart
+	if rangeStart < 100 {
+		rangeStart = pve.VMIDRangeVMStart
+	}
+	maxAttempts = cfg.VMIDAllocAttempts
+	if maxAttempts <= 0 {
+		maxAttempts = 10
+	}
+	return rangeStart, maxAttempts
+}
+
+// resolveVMShapeStorage returns the target VM storage, disk format, and root
+// disk size in GiB. VMStorage falls back to the stemcell's own storage so the
+// import stays on-node when no override is configured. Disk format defaults to
+// qcow2. Root disk size is the max of cloud_properties.disk (MiB, rounded up to
+// GiB) and defaultStemcellDiskGiB; PVE enforces a no-shrink rule so a smaller
+// request is silently ignored, hence the floor.
+func resolveVMShapeStorage(cfg *config.CPIConfig, parsed *createVMParsedArgs) (vmStorage, vmDiskFormat string, rootDiskGiB int) {
+	cp := parsed.cloudProps
+
+	vmStorage = cfg.VMStorage
+	if vmStorage == "" {
+		vmStorage = parsed.stemcellStor
+	}
+
+	vmDiskFormat = cp.VMDiskFormat
+	if vmDiskFormat == "" {
+		vmDiskFormat = diskFormatQCOW2
+	}
+
+	rootDiskGiB = defaultStemcellDiskGiB
+	if cp.Disk > 0 {
+		requestedGiB := (cp.Disk + 1023) / 1024
+		if requestedGiB > rootDiskGiB {
+			rootDiskGiB = requestedGiB
+		}
+	}
+	return vmStorage, vmDiskFormat, rootDiskGiB
+}
+
+// resolveVMShapeCPUMem returns cores, sockets, and memory (MiB) honoring two
+// cloud_properties conventions: vSphere-style (cpu = total vCPU count) and
+// PVE-native (cores/sockets explicit). Explicit cores/sockets win when present;
+// otherwise cp.CPU becomes cores with a single socket. Defaults are 1 vCPU and
+// 512 MiB.
+func resolveVMShapeCPUMem(cp createVMCloudProps) (cores, sockets, memMiB int) {
+	cores = cp.Cores
+	if cores <= 0 && cp.CPU > 0 {
+		cores = cp.CPU
+	}
+	if cores <= 0 {
+		cores = 1
+	}
+	sockets = cp.Sockets
+	if sockets <= 0 {
+		sockets = 1
+	}
+	memMiB = cp.Memory
+	if memMiB <= 0 {
+		memMiB = cp.RAM
+	}
+	if memMiB <= 0 {
+		memMiB = 512
+	}
+	return cores, sockets, memMiB
+}
+
+// resolveVMShapeHotplugNUMA resolves hotplug + numa using
+// cloud_properties → config → built-in default. Memory hotplug needs both
+// numa=1 and "memory" in hotplug at create time; operators can override
+// per-vm_type for stemcells that misbehave on memory hot-add.
+func resolveVMShapeHotplugNUMA(cfg *config.CPIConfig, cp createVMCloudProps) (hotplug string, numaEnabled bool) {
+	hotplug = cfg.HotplugValue()
+	if cp.Hotplug != nil {
+		hotplug = *cp.Hotplug
+	}
+	numaEnabled = cfg.NUMAValue()
+	if cp.NUMA != nil {
+		numaEnabled = *cp.NUMA
+	}
+	return hotplug, numaEnabled
+}
+
+// resolveVMShapeInitialName composes the initial PVE VM name from env.bosh
+// fields + Config so the PVE UI shows deployment + instance-group immediately
+// on come-online instead of the placeholder "vm-<vmid>". Director-mode deploys
+// carry director + deployment + job in env.bosh.group; `bosh create-env` paths
+// have no deployment, so Config.CreateEnvDeployment (default "create-env")
+// fills that segment. set_vm_metadata later refines this to
+// "<prefix>-<deployment>-<job>-<index>" once the index is known.
+func resolveVMShapeInitialName(cfg *config.CPIConfig, parsed *createVMParsedArgs) string {
+	initialJobName := extractJobNameFromEnv(parsed.env)
+	initialDeployment := extractDeploymentFromEnv(parsed.env, initialJobName)
+	if initialDeployment == "" {
+		initialDeployment = cfg.CreateEnvDeployment
+	}
+	if initialJobName == "" {
+		// create-env path: env has no group/groups. Fall back to the BOSH
+		// instance-group baked into cloud_provider.template.name when it is
+		// detectable from env.bosh.instance.name; otherwise leave blank and
+		// let the "vm-<vmid>" placeholder stand.
+		initialJobName = extractInstanceNameFromEnv(parsed.env)
+	}
+	return composeVMName(cfg.VMPrefix, initialDeployment, initialJobName, "")
 }
 
 // allocateVM runs AllocateWithRetry: picks a free VMID, calls QEMU.Create,
