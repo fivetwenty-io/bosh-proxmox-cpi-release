@@ -4,9 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"os/exec"
-	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 
@@ -91,16 +88,16 @@ func parseResponse(t *testing.T, data string) jsonrpc.Response {
 	return resp
 }
 
-// TestRunCPI_EOF verifies that empty input returns nil (clean exit).
+// TestRunCPI_EOF verifies that empty input returns nil (clean exit) and writes no output.
+// Covers the sc.Scan() → false with no error (clean EOF) path.
 func TestRunCPI_EOF(t *testing.T) {
 	t.Parallel()
-	cfg, logger := makeTestDeps(t)
+	_, logger := makeTestDeps(t)
 	r := strings.NewReader("")
 	var w bytes.Buffer
 
 	d := cpi.NewDispatcher(logger)
-	_ = cfg
-	err := runCPI(context.Background(), r, &w, d, logger)
+	err := runCPI(context.Background(), r, &w, d, logger, defaultMaxLineBytes)
 	if err != nil {
 		t.Fatalf("expected nil error on EOF, got: %v", err)
 	}
@@ -112,13 +109,12 @@ func TestRunCPI_EOF(t *testing.T) {
 // TestRunCPI_SingleRequest feeds a valid JSON-RPC request and verifies a response is written.
 func TestRunCPI_SingleRequest(t *testing.T) {
 	t.Parallel()
-	cfg, logger := makeTestDeps(t)
+	_, logger := makeTestDeps(t)
 	r := strings.NewReader(validRequest("info"))
 	var w bytes.Buffer
 
 	d := cpi.NewDispatcher(logger)
-	_ = cfg
-	err := runCPI(context.Background(), r, &w, d, logger)
+	err := runCPI(context.Background(), r, &w, d, logger, defaultMaxLineBytes)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -133,11 +129,12 @@ func TestRunCPI_SingleRequest(t *testing.T) {
 	}
 }
 
-// TestRunCPI_MalformedJSON feeds garbage JSON and verifies a CloudError is written,
-// then verifies the loop continues to process the subsequent valid request.
+// TestRunCPI_MalformedJSON feeds garbage JSON followed by a valid request.
+// Unique invariant: loop continues after a decode error — the second request
+// produces a NotImplemented response, proving the decoder state resets per line.
 func TestRunCPI_MalformedJSON(t *testing.T) {
 	t.Parallel()
-	cfg, logger := makeTestDeps(t)
+	_, logger := makeTestDeps(t)
 	// Garbage JSON followed by a valid request. The decoder should recover and
 	// process the second request after emitting a CloudError for the first.
 	input := "{not valid json}\n" + validRequest("has_vm")
@@ -145,8 +142,7 @@ func TestRunCPI_MalformedJSON(t *testing.T) {
 	var w bytes.Buffer
 
 	d := cpi.NewDispatcher(logger)
-	_ = cfg
-	err := runCPI(context.Background(), r, &w, d, logger)
+	err := runCPI(context.Background(), r, &w, d, logger, defaultMaxLineBytes)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -186,15 +182,14 @@ func TestRunCPI_MalformedJSON(t *testing.T) {
 // responses are written in order.
 func TestRunCPI_TwoRequests(t *testing.T) {
 	t.Parallel()
-	cfg, logger := makeTestDeps(t)
+	_, logger := makeTestDeps(t)
 	req1 := `{"method":"create_stemcell","arguments":[],"context":{"request_id":"req-1"},"api_version":2}` + "\n"
 	req2 := `{"method":"delete_stemcell","arguments":[],"context":{"request_id":"req-2"},"api_version":2}` + "\n"
 	r := strings.NewReader(req1 + req2)
 	var w bytes.Buffer
 
 	d := cpi.NewDispatcher(logger)
-	_ = cfg
-	err := runCPI(context.Background(), r, &w, d, logger)
+	err := runCPI(context.Background(), r, &w, d, logger, defaultMaxLineBytes)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -227,26 +222,16 @@ func TestMain_VersionFlag(t *testing.T) {
 		t.Skip("skipping --version binary test in short mode")
 	}
 
-	// Locate repo root (two directories up from cmd/cpi).
-	_, thisFile, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("runtime.Caller failed")
-	}
-	repoRoot := filepath.Join(filepath.Dir(thisFile), "..", "..")
-
-	binPath := filepath.Join(t.TempDir(), "cpi")
-	buildCmd := exec.CommandContext(t.Context(), "go", "build", "-o", binPath, "./cmd/cpi")
-	buildCmd.Dir = repoRoot
-	if out, err := buildCmd.CombinedOutput(); err != nil {
-		// Build failure must fail the test, not skip it — the binary is the
-		// product under test and a broken build is a regression to surface.
-		t.Fatalf("go build failed: %v\n%s", err, out)
-	}
-
-	versionCmd := exec.CommandContext(t.Context(), binPath, "--version")
-	out, err := versionCmd.CombinedOutput()
+	binPath, err := buildOnce(t)
 	if err != nil {
-		t.Fatalf("--version exited non-zero: %v\noutput: %s", err, out)
+		t.Fatalf("buildOnce: %v", err)
+	}
+
+	ctx := t.Context()
+	cmd := makeExecCmd(ctx, binPath, "--version")
+	out, execErr := cmd.CombinedOutput()
+	if execErr != nil {
+		t.Fatalf("--version exited non-zero: %v\noutput: %s", execErr, out)
 	}
 	output := strings.TrimSpace(string(out))
 	if !strings.Contains(output, "bosh-pve-cpi") {
@@ -272,7 +257,7 @@ func TestRunCPI_DispatchesRequest(t *testing.T) {
 	var w bytes.Buffer
 
 	d := cpi.NewDispatcher(logger)
-	if err := runCPI(context.Background(), r, &w, d, logger); err != nil {
+	if err := runCPI(context.Background(), r, &w, d, logger, defaultMaxLineBytes); err != nil {
 		t.Fatalf("runCPI returned unexpected error: %v", err)
 	}
 
@@ -295,66 +280,5 @@ func TestRunCPI_DispatchesRequest(t *testing.T) {
 	// Result field must be null when Error is set (BOSH JSON-RPC contract).
 	if resp.Result != nil {
 		t.Errorf("expected nil Result on error response, got %v", resp.Result)
-	}
-}
-
-// TestRunCPI_HandlesEOF verifies that an immediately-closed input stream
-// returns nil (clean exit) and writes no output. Distinct from
-// TestRunCPI_EOF in that it explicitly uses an io.Pipe-style reader that
-// has already returned EOF to exercise the empty-Scan path.
-func TestRunCPI_HandlesEOF(t *testing.T) {
-	t.Parallel()
-	_, logger := makeTestDeps(t)
-	// strings.NewReader("") returns (0, io.EOF) on the first Read, mirroring
-	// what stdin behaves like when the BOSH director closes its end without
-	// sending a request line.
-	r := strings.NewReader("")
-	var w bytes.Buffer
-
-	d := cpi.NewDispatcher(logger)
-	err := runCPI(context.Background(), r, &w, d, logger)
-	if err != nil {
-		t.Fatalf("runCPI on EOF returned %v, want nil (clean exit)", err)
-	}
-	if w.Len() != 0 {
-		t.Fatalf("expected no output on EOF, got %d bytes: %q", w.Len(), w.String())
-	}
-}
-
-// TestRunCPI_MalformedJSONReturnsError feeds a single malformed JSON line
-// and asserts a CloudError envelope is returned. Distinct from
-// TestRunCPI_MalformedJSON (which also covers loop continuation after the
-// error) by isolating the envelope contract.
-func TestRunCPI_MalformedJSONReturnsError(t *testing.T) {
-	t.Parallel()
-	_, logger := makeTestDeps(t)
-	r := strings.NewReader("{garbage\n")
-	var w bytes.Buffer
-
-	d := cpi.NewDispatcher(logger)
-	if err := runCPI(context.Background(), r, &w, d, logger); err != nil {
-		t.Fatalf("runCPI returned unexpected error: %v", err)
-	}
-
-	out := strings.TrimSpace(w.String())
-	if out == "" {
-		t.Fatal("expected CloudError envelope on stdout, got empty buffer")
-	}
-	lines := strings.Split(out, "\n")
-	if len(lines) != 1 {
-		t.Fatalf("expected exactly 1 response line for the malformed input, got %d:\n%s", len(lines), out)
-	}
-
-	resp := parseResponse(t, lines[0])
-	if resp.Error == nil {
-		t.Fatalf("expected error envelope for malformed JSON, got result: %v", resp.Result)
-	}
-	if !strings.Contains(resp.Error.Type, "CloudError") {
-		t.Errorf("error type: got %q, want substring CloudError", resp.Error.Type)
-	}
-	if !strings.Contains(strings.ToLower(resp.Error.Message), "decode") &&
-		!strings.Contains(strings.ToLower(resp.Error.Message), "parse") &&
-		!strings.Contains(strings.ToLower(resp.Error.Message), "json") {
-		t.Errorf("error message should describe the decode failure: %q", resp.Error.Message)
 	}
 }

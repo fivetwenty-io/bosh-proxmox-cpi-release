@@ -38,14 +38,10 @@ import (
 // exitSignaled is the exit code returned when the process catches SIGINT or SIGTERM.
 const exitSignaled = 130
 
-// maxLineBytes is the maximum allowed size of a single JSON-RPC request line (64 MiB).
+// defaultMaxLineBytes is the maximum allowed size of a single JSON-RPC request line (64 MiB).
 // bufio.Scanner returns bufio.ErrTooLong if this limit is exceeded; the loop
 // treats that as a decode error, writes a CloudError, and continues.
-//
-// Declared as a var (not const) so the ErrTooLong test can shrink the cap to
-// a few KiB and avoid writing 64+ MiB of payload per run; production code
-// never mutates it.
-var maxLineBytes = 64 * 1024 * 1024
+const defaultMaxLineBytes = 64 * 1024 * 1024
 
 func main() {
 	os.Exit(run())
@@ -58,6 +54,11 @@ type runOptions struct {
 	// runWithArgs uses pve.NewClient. Tests inject a factory that returns a
 	// nilPVEClient to exercise the pve.NewClient error path without a live PVE.
 	ClientFactory func(cfg *config.CPIConfig, logger *log.Logger) (pve.Client, error)
+
+	// MaxLineBytes overrides the per-request line size cap passed to runCPI.
+	// Zero selects defaultMaxLineBytes (64 MiB). Tests set a small value (e.g.
+	// 4 KiB) to keep oversized payloads manageable without mutating a package var.
+	MaxLineBytes int
 }
 
 // run is the thin os-wired entry point. It delegates to runWithArgs so the
@@ -156,7 +157,12 @@ func runWithArgs(args []string, stdin io.Reader, stdout, stderr io.Writer, opts 
 		Resolver: backendResolver,
 	})
 
-	runErr := runCPI(rootCtx, stdin, stdout, d, logger)
+	maxLine := opts.MaxLineBytes
+	if maxLine <= 0 {
+		maxLine = defaultMaxLineBytes
+	}
+
+	runErr := runCPI(rootCtx, stdin, stdout, d, logger, maxLine)
 	if runErr != nil {
 		if errors.Is(runErr, errSignaled) {
 			return exitSignaled
@@ -199,6 +205,7 @@ func runCPI(
 	w io.Writer,
 	d *cpi.Dispatcher,
 	logger *log.Logger,
+	maxLineBytes int,
 ) error {
 	bw := bufio.NewWriter(w)
 

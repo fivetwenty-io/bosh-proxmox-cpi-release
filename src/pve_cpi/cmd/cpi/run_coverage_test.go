@@ -7,7 +7,7 @@ package main
 //  D1a (in-process): unit tests for runCPI branches not covered by existing
 //       tests — blank lines, errSignaled, ErrTooLong, writeResponse success,
 //       missing-method decodeRequest error, write-failure paths.
-//  D1b (binary):     test run() early-exit paths through the compiled binary —
+//  D1b (in-process): tests for run() early-exit paths via runWithArgs —
 //       no args, unexpected positional args, --config missing-file,
 //       valid config + empty stdin reaching handlers.RegisterAll.
 
@@ -20,13 +20,10 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/cpi"
@@ -51,7 +48,7 @@ func TestRunCPI_BlankLinesSkipped(t *testing.T) {
 	var w bytes.Buffer
 
 	d := cpi.NewDispatcher(logger)
-	if err := runCPI(context.Background(), r, &w, d, logger); err != nil {
+	if err := runCPI(context.Background(), r, &w, d, logger, defaultMaxLineBytes); err != nil {
 		t.Fatalf("runCPI returned unexpected error: %v", err)
 	}
 
@@ -80,7 +77,7 @@ func TestRunCPI_MissingMethodField(t *testing.T) {
 	var w bytes.Buffer
 
 	d := cpi.NewDispatcher(logger)
-	if err := runCPI(context.Background(), r, &w, d, logger); err != nil {
+	if err := runCPI(context.Background(), r, &w, d, logger, defaultMaxLineBytes); err != nil {
 		t.Fatalf("runCPI returned unexpected error: %v", err)
 	}
 
@@ -134,7 +131,7 @@ func TestRunCPI_ContextCancelledBetweenRequests(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		runErr = runCPI(ctx, pr, &w, d, logger)
+		runErr = runCPI(ctx, pr, &w, d, logger, defaultMaxLineBytes)
 	}()
 
 	_, _ = fmt.Fprintln(pw, strings.TrimRight(validRequest("info"), "\n"))
@@ -170,7 +167,7 @@ func TestRunCPI_WriteResponseSuccessPath(t *testing.T) {
 	r := strings.NewReader(req)
 	var w bytes.Buffer
 
-	if err := runCPI(context.Background(), r, &w, d, logger); err != nil {
+	if err := runCPI(context.Background(), r, &w, d, logger, defaultMaxLineBytes); err != nil {
 		t.Fatalf("runCPI returned unexpected error: %v", err)
 	}
 
@@ -226,7 +223,7 @@ func TestRunCPI_WriteResponseFailure(t *testing.T) {
 	// Fail after 0 bytes so bufio.Writer flush triggers the error.
 	w := &failWriter{threshold: 0}
 
-	err := runCPI(context.Background(), r, w, d, logger)
+	err := runCPI(context.Background(), r, w, d, logger, defaultMaxLineBytes)
 	if err == nil {
 		t.Fatal("expected error from write failure, got nil")
 	}
@@ -235,28 +232,25 @@ func TestRunCPI_WriteResponseFailure(t *testing.T) {
 	}
 }
 
-// TestRunCPI_ErrTooLong feeds a line that exceeds maxLineBytes and verifies
-// runCPI writes a CloudError and returns nil (clean exit after ErrTooLong).
-//
-// Shrinks maxLineBytes to 4 KiB for the duration of the test so the oversize
-// payload stays at a few KiB rather than 65 MiB on disk. Test is no longer
-// parallel — maxLineBytes is a package var and parallel runs would race.
+// TestRunCPI_ErrTooLong feeds a line that exceeds the configured maxLineBytes
+// and verifies runCPI writes a CloudError and returns nil (clean exit after
+// ErrTooLong). Uses runOptions.MaxLineBytes (4 KiB) so the oversized payload
+// stays small — no package-var mutation, safe to run in parallel.
 func TestRunCPI_ErrTooLong(t *testing.T) {
-	prev := maxLineBytes
-	maxLineBytes = 4 * 1024 // 4 KiB
-	t.Cleanup(func() { maxLineBytes = prev })
-
+	t.Parallel()
 	_, logger := makeTestDeps(t)
 
-	// One oversized line (a few bytes > maxLineBytes) triggers bufio.ErrTooLong.
-	oversized := bytes.Repeat([]byte("x"), maxLineBytes+1)
+	const smallCap = 4 * 1024 // 4 KiB — keeps the oversized payload tiny
+
+	// One oversized line (a few bytes > smallCap) triggers bufio.ErrTooLong.
+	oversized := bytes.Repeat([]byte("x"), smallCap+1)
 	oversized = append(oversized, '\n')
 	r := bytes.NewReader(oversized)
 
 	var w bytes.Buffer
 	d := cpi.NewDispatcher(logger)
 
-	runErr := runCPI(context.Background(), r, &w, d, logger)
+	runErr := runCPI(context.Background(), r, &w, d, logger, smallCap)
 
 	// runCPI should return nil after ErrTooLong (scanner is not reusable).
 	if runErr != nil {
@@ -431,7 +425,9 @@ func TestRunWithArgs_ValidConfigInfoRequest(t *testing.T) {
 }
 
 // TestRunWithArgs_InvalidLogLevel verifies that an invalid log_level in the
-// config causes runWithArgs to return 1 (logger init fails).
+// config causes runWithArgs to return 1. log.NewLogger rejects unrecognized
+// levels with an error, so "logger init failed" is written to stderr and the
+// process exits 1.
 func TestRunWithArgs_InvalidLogLevel(t *testing.T) {
 	t.Parallel()
 
@@ -458,230 +454,8 @@ func TestRunWithArgs_InvalidLogLevel(t *testing.T) {
 		&stdout, &stderr,
 		runOptions{},
 	)
-	// Logger init or config validation may fail — either 0 (if level is
-	// silently defaulted) or 1 (if rejected). Accept either but guard panic.
-	if code < 0 {
-		t.Errorf("expected non-negative exit code, got %d", code)
-	}
-}
-
-// --------------------------------------------------------------------------
-// D1c — binary tests for run() bootstrap paths (kept as smoke tests)
-// --------------------------------------------------------------------------
-
-// buildCPIOnce builds the CPI binary once per test run and caches the path.
-// All binary tests share the same binary to avoid redundant compilations.
-var (
-	onceBuild    sync.Once
-	cachedBinDir string
-	cachedBinErr error
-)
-
-// cpiBinary returns the path to the compiled CPI binary, building it on first
-// call. t is used only for logging the build output on failure.
-func cpiBinary(t *testing.T) (string, error) {
-	t.Helper()
-	onceBuild.Do(func() {
-		_, thisFile, _, ok := runtime.Caller(0)
-		if !ok {
-			cachedBinErr = errors.New("runtime.Caller failed")
-			return
-		}
-		repoRoot := filepath.Join(filepath.Dir(thisFile), "..", "..")
-		dir, err := os.MkdirTemp("", "bosh-pve-cpi-bin-*")
-		if err != nil {
-			cachedBinErr = fmt.Errorf("MkdirTemp: %w", err)
-			return
-		}
-		binPath := filepath.Join(dir, "cpi")
-		cmd := exec.CommandContext(context.Background(), "go", "build", "-o", binPath, "./cmd/cpi")
-		cmd.Dir = repoRoot
-		if out, err := cmd.CombinedOutput(); err != nil {
-			cachedBinErr = fmt.Errorf("go build: %w\n%s", err, out)
-			return
-		}
-		cachedBinDir = dir
-	})
-	if cachedBinErr != nil {
-		return "", cachedBinErr
-	}
-	return filepath.Join(cachedBinDir, "cpi"), nil
-}
-
-// runBinary executes the CPI binary with the given args and stdin, returning
-// combined stdout, the exit code, and any exec error.
-func runBinary(t *testing.T, stdin string, args ...string) (stdout string, exitCode int, err error) {
-	t.Helper()
-	bin, err := cpiBinary(t)
-	if err != nil {
-		t.Fatalf("cpiBinary: %v", err)
-	}
-	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, bin, args...)
-	cmd.Stdin = strings.NewReader(stdin)
-	var stdoutBuf, stderrBuf bytes.Buffer
-	cmd.Stdout = &stdoutBuf
-	cmd.Stderr = &stderrBuf
-	runErr := cmd.Run()
-	if runErr != nil {
-		var exitErr *exec.ExitError
-		if errors.As(runErr, &exitErr) {
-			return stdoutBuf.String(), exitErr.ExitCode(), nil
-		}
-		return stdoutBuf.String(), -1, runErr
-	}
-	return stdoutBuf.String(), 0, nil
-}
-
-// TestBinary_NoArgs verifies that invoking the binary with no arguments prints
-// an error and exits non-zero (run() returns 1 for missing --config).
-func TestBinary_NoArgs(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping binary test in short mode")
-	}
-	stdout, code, err := runBinary(t, "")
-	if err != nil {
-		t.Fatalf("runBinary: %v", err)
-	}
-	if code == 0 {
-		t.Fatalf("expected non-zero exit for missing --config, got 0; stdout=%q", stdout)
-	}
-}
-
-// TestBinary_UnexpectedPositionalArgs verifies that unexpected positional
-// arguments cause a non-zero exit with a diagnostic message.
-func TestBinary_UnexpectedPositionalArgs(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping binary test in short mode")
-	}
-	stdout, code, err := runBinary(t, "", "unexpected-arg")
-	if err != nil {
-		t.Fatalf("runBinary: %v", err)
-	}
-	if code == 0 {
-		t.Fatalf("expected non-zero exit for unexpected positional arg, got 0; stdout=%q", stdout)
-	}
-}
-
-// TestBinary_MissingConfigFile verifies that --config pointing at a
-// nonexistent file exits non-zero with a diagnostic on stderr.
-func TestBinary_MissingConfigFile(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping binary test in short mode")
-	}
-	stdout, code, err := runBinary(t, "", "--config", "/nonexistent/bosh-pve-cpi-test.json")
-	if err != nil {
-		t.Fatalf("runBinary: %v", err)
-	}
-	if code == 0 {
-		t.Fatalf("expected non-zero exit for missing config file, got 0; stdout=%q", stdout)
-	}
-}
-
-// TestBinary_ValidConfigEOF writes a minimal valid config to a temp file,
-// invokes the binary with empty stdin, and asserts exit 0. This exercises
-// run()'s full startup path: config load, logger init, pve.NewClient,
-// agent.NewAgent, handlers.RegisterAll, and the clean-EOF return from runCPI.
-func TestBinary_ValidConfigEOF(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping binary test in short mode")
-	}
-
-	cfgJSON := `{
-  "host": "127.0.0.1",
-  "user": "root",
-  "password": "test-password",
-  "vm_storage": "local-lvm",
-  "disk_storage": "local-lvm",
-  "stemcell_storage": "local",
-  "network_bridge": "vmbr0",
-  "node": "pve1",
-  "log_level": "error",
-  "verify_ssl": false
-}`
-	cfgFile := filepath.Join(t.TempDir(), "cpi.json")
-	if err := os.WriteFile(cfgFile, []byte(cfgJSON), 0o600); err != nil {
-		t.Fatalf("WriteFile config: %v", err)
-	}
-
-	// Empty stdin — runCPI hits EOF immediately, loop exits cleanly.
-	stdout, code, err := runBinary(t, "", "--config", cfgFile)
-	if err != nil {
-		t.Fatalf("runBinary: %v", err)
-	}
-	if code != 0 {
-		t.Fatalf("expected exit 0 for valid config + EOF stdin, got %d; stdout=%q", code, stdout)
-	}
-	// No JSONRPC output on empty stdin.
-	if strings.TrimSpace(stdout) != "" {
-		t.Errorf("expected empty stdout on EOF stdin, got %q", stdout)
-	}
-}
-
-// TestBinary_ValidConfigInfoRequest sends a JSONRPC "info" request via the
-// binary's stdin and asserts exit 0 with a well-formed JSONRPC response.
-// This exercises handlers.RegisterAll dispatching a real request.
-func TestBinary_ValidConfigInfoRequest(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping binary test in short mode")
-	}
-
-	cfgJSON := `{
-  "host": "127.0.0.1",
-  "user": "root",
-  "password": "test-password",
-  "vm_storage": "local-lvm",
-  "disk_storage": "local-lvm",
-  "stemcell_storage": "local",
-  "network_bridge": "vmbr0",
-  "node": "pve1",
-  "log_level": "error",
-  "verify_ssl": false
-}`
-	cfgFile := filepath.Join(t.TempDir(), "cpi.json")
-	if err := os.WriteFile(cfgFile, []byte(cfgJSON), 0o600); err != nil {
-		t.Fatalf("WriteFile config: %v", err)
-	}
-
-	req := `{"method":"info","arguments":[],"context":{"request_id":"bin-test-1"},"api_version":2}` + "\n"
-	stdout, code, err := runBinary(t, req, "--config", cfgFile)
-	if err != nil {
-		t.Fatalf("runBinary: %v", err)
-	}
-	if code != 0 {
-		t.Fatalf("expected exit 0, got %d; stdout=%q", code, stdout)
-	}
-
-	out := strings.TrimSpace(stdout)
-	if out == "" {
-		t.Fatal("expected JSONRPC response, got empty stdout")
-	}
-
-	var resp jsonrpc.Response
-	if err := json.Unmarshal([]byte(out), &resp); err != nil {
-		t.Fatalf("unmarshal response: %v\nraw: %s", err, out)
-	}
-	// "info" is implemented in the handlers package and returns a real response.
-	// If not: it should at minimum be a well-formed JSONRPC envelope.
-	// Either a success result or a NotImplemented error is acceptable here.
-	if resp.Result == nil && resp.Error == nil {
-		t.Fatal("JSONRPC response has both nil result and nil error")
-	}
-}
-
-// TestBinary_InvalidFlagReturnsError verifies that an unknown flag causes a
-// non-zero exit. This exercises the fs.Parse error path in run().
-func TestBinary_InvalidFlagReturnsError(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping binary test in short mode")
-	}
-	_, code, err := runBinary(t, "", "--unknown-flag-xyz")
-	if err != nil {
-		t.Fatalf("runBinary: %v", err)
-	}
-	if code == 0 {
-		t.Fatalf("expected non-zero exit for unknown flag, got 0")
+	if code != 1 {
+		t.Errorf("expected exit code 1 for invalid log level, got %d; stderr=%q", code, stderr.String())
 	}
 }
 
