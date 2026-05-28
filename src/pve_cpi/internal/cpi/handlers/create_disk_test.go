@@ -241,10 +241,10 @@ func TestHandleCreateDisk_VMCIDIgnoredForNaming(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if capturedVMID == 200 {
-		t.Error("vm_cid leaked into naming VMID; persistent disks must use synthetic 9xxx VMIDs")
+		t.Error("vm_cid leaked into naming VMID; persistent disks must use synthetic disk-range VMIDs")
 	}
-	if capturedVMID < 9000 || capturedVMID > 9999 {
-		t.Errorf("expected namingVMID in [9000,9999], got %d", capturedVMID)
+	if capturedVMID < 9000 || capturedVMID > 29999 {
+		t.Errorf("expected namingVMID in [9000,29999], got %d", capturedVMID)
 	}
 }
 
@@ -409,7 +409,7 @@ func TestHandleCreateDisk_DiskCIDNotDoublePrefixed(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected string result, got %T", result)
 	}
-	// The disk VMID is allocated from the synthetic disk range [9000,9999]
+	// The disk VMID is allocated from the synthetic disk range [9000,29999]
 	// with a randomized scan start, so the exact ID is non-deterministic.
 	// The regression invariant is structural: a single "data:" prefix and
 	// the canonical "vm-<vmid>-disk-0" volid shape. A double-prefixed CID
@@ -417,8 +417,8 @@ func TestHandleCreateDisk_DiskCIDNotDoublePrefixed(t *testing.T) {
 	var vmid int
 	if n, serr := fmt.Sscanf(diskCID, "data:vm-%d-disk-0", &vmid); serr != nil || n != 1 {
 		t.Errorf("disk_cid = %q, want form data:vm-<vmid>-disk-0 (single prefix, no double-prefix bug)", diskCID)
-	} else if vmid < 9000 || vmid > 9999 {
-		t.Errorf("disk_cid = %q, vmid %d outside disk range [9000,9999]", diskCID, vmid)
+	} else if vmid < 9000 || vmid > 29999 {
+		t.Errorf("disk_cid = %q, vmid %d outside disk range [9000,29999]", diskCID, vmid)
 	}
 }
 

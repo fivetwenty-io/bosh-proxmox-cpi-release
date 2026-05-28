@@ -142,28 +142,39 @@ properties:
     description: |
       Starting VMID for VM allocation. VMs are allocated in the range
       [vmid_range_start, vmid_range_end]; default vmid_range_start is 100.
-      Persistent disks use synthetic VMIDs 9000-9999 (unchanged).
+      Persistent disks use synthetic VMIDs 9000-29999 (unchanged).
     default: 100
   pve.vmid_range_end:
     description: |
       Inclusive upper bound of the VMID range for VM allocation. VMs allocated in
-      [vmid_range_start, vmid_range_end]. Default 5999. Must be > vmid_range_start
-      and <= 9999. Persistent disks use synthetic VMIDs 9000-9999 (unaffected).
-    default: 5999
+      [vmid_range_start, vmid_range_end]. Default 8999. Must be > vmid_range_start
+      and must not overlap the persistent disk range or the template range.
+      With the default disk range (9000-29999) the effective maximum is 8999.
+    default: 8999
+  pve.disk_vmid_range_start:
+    description: |
+      Starting VMID for persistent-disk container allocation. Disk containers
+      are allocated in [disk_vmid_range_start, disk_vmid_range_end]. When unset
+      (0), defaults to 9000. Must not overlap the VM range or the template range.
+    default: 0
+  pve.disk_vmid_range_end:
+    description: |
+      Inclusive upper bound of the VMID range for persistent-disk containers.
+      When unset (0), defaults to 29999. Must be > disk_vmid_range_start.
+    default: 0
   pve.stemcell_template_vmid_range_start:
     description: |
       Starting VMID for template VM allocation. Template VMs are allocated in
-      [stemcell_template_vmid_range_start, stemcell_template_vmid_range_end].
-      When unset (0), the CPI derives the start as vmid_range_end+1; with the
-      default VM range (vmid_range_end=5999) this yields 6000. Must not overlap
-      with vmid_range_start..vmid_range_end (VM range) or the persistent disk
-      range 9000-9999.
+      [stemcell_template_vmid_range_start, stemcell_template_vmid_range_end], a
+      dedicated band above the persistent disk range. When unset (0), defaults
+      to 30000. Must not overlap with vmid_range_start..vmid_range_end (VM range)
+      or the persistent disk range 9000-29999.
     default: 0
   pve.stemcell_template_vmid_range_end:
     description: |
       Inclusive upper bound of the VMID range for template VM allocation.
-      When unset (0), defaults to 8999. Must be > stemcell_template_vmid_range_start
-      and <= 8999. Must not overlap the persistent disk range 9000-9999.
+      When unset (0), defaults to 30999. Must be > stemcell_template_vmid_range_start.
+      Must not overlap the persistent disk range 9000-29999.
     default: 0
   pve.stemcell_template_pool:
     description: |

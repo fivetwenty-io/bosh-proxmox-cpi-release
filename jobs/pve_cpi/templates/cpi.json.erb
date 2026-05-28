@@ -93,15 +93,27 @@
       config["registry_allow_private_ip"] = true
     end
   end
+  # Emit disk_vmid_range_start only when the operator sets a non-zero value.
+  # When absent or 0 (the default), the key is omitted so ApplyDefaults sets
+  # the default disk band start (9000).
+  v = p("pve.disk_vmid_range_start", 0).to_i
+  config["disk_vmid_range_start"] = v unless v == 0
+
+  # Emit disk_vmid_range_end only when the operator sets a non-zero value.
+  # When absent or 0 (the default), the key is omitted so ApplyDefaults sets
+  # the default disk band end (29999).
+  v = p("pve.disk_vmid_range_end", 0).to_i
+  config["disk_vmid_range_end"] = v unless v == 0
+
   # Emit stemcell_template_vmid_range_start only when the operator sets a non-zero
   # value. When absent or 0 (the default), the key is omitted so ApplyDefaults
-  # derives the start as vmid_range_end+1 (6000 with the default VM range).
+  # sets the fixed default band start (30000).
   v = p("pve.stemcell_template_vmid_range_start", 0).to_i
   config["stemcell_template_vmid_range_start"] = v unless v == 0
 
   # Emit stemcell_template_vmid_range_end only when the operator sets a non-zero
   # value. When absent or 0 (the default), the key is omitted so ApplyDefaults
-  # sets 8999.
+  # sets the fixed default band end (30999).
   v = p("pve.stemcell_template_vmid_range_end", 0).to_i
   config["stemcell_template_vmid_range_end"] = v unless v == 0
 

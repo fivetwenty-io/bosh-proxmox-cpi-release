@@ -251,7 +251,7 @@ lvremove -f <disk_storage>/vm-9000-disk-0 2>/dev/null
 rm -f /var/lib/vz/template/iso/vm-105-config.iso
 ```
 
-`qm destroy --purge` removes the VM and every disk listed in its config — including `unusedN` slots. Persistent disks live under a synthetic vmid (9000-9999); if they were never attached to the deleted VM (or were properly cleared via the SDK's two-PUT `DetachDisk`) they survive. Bare orphans on storage that no VM ever referenced must be removed explicitly with `lvremove` / `zfs destroy`.
+`qm destroy --purge` removes the VM and every disk listed in its config — including `unusedN` slots. Persistent disks live under a synthetic vmid (9000-29999); if they were never attached to the deleted VM (or were properly cleared via the SDK's two-PUT `DetachDisk`) they survive. Bare orphans on storage that no VM ever referenced must be removed explicitly with `lvremove` / `zfs destroy`.
 
 ## 10. Files in this workflow
 

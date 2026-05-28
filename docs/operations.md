@@ -328,8 +328,8 @@ Run `cloud-check` after any failed deploy or partial cleanup before attempting a
 pvesh get /cluster/resources --type vm \
   | jq '.[] | select(.tags != null) | {vmid:.vmid, name:.name, tags:.tags}'
 
-# Persistent-disk volumes use synthetic VMIDs 9000–9999
-pvesm list <disk_storage> | grep '^vm-9'
+# Persistent-disk volumes use synthetic VMIDs 9000–29999
+pvesm list <disk_storage> | grep '^vm-'
 
 # Stemcell import files
 pvesm list <stemcell_storage> --content import | grep bosh-stemcell
@@ -342,7 +342,7 @@ pvesm list <iso_storage> --content iso | grep config.iso
 
 **Danger: `qm destroy --purge` is irreversible and destroys every disk volume referenced in the VM config, including `unusedN` slots. Always inspect the config before running it.**
 
-Persistent disks use synthetic VMIDs 9000–9999 and survive `qm destroy` only if they are absent from the VM config at destroy time (that is, if `detach_disk` has already removed them). If a VM was torn down without a proper `detach_disk`, persistent disks may still appear in `unusedN` slots and will be deleted by `--purge`.
+Persistent disks use synthetic VMIDs 9000–29999 and survive `qm destroy` only if they are absent from the VM config at destroy time (that is, if `detach_disk` has already removed them). If a VM was torn down without a proper `detach_disk`, persistent disks may still appear in `unusedN` slots and will be deleted by `--purge`.
 
 Inspect before destroying:
 

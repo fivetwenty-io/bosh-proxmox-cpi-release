@@ -104,7 +104,7 @@ bosh-stemcell-<sanitized-name>-<sanitized-version>-<sha8>.qcow2
 
 where `sha8` is the first 8 hex characters of the SHA-256 hash of the disk image.
 
-After the upload, the handler creates a new QEMU VM in the template VMID range (`[stemcell_template_vmid_range_start, stemcell_template_vmid_range_end]`, default `[6000, 8999]`), imports the qcow2 into it, and freezes it with `MakeTemplate`. The VM is named `bosh-stemcell-<name>-<version>` and tagged with `bosh-stemcell-sha-<sha8>` for later lookup. For CPI-owned images (heavy tarball uploads and light-fetch images), the intermediate upload volume is deleted after the template is frozen; for operator-preuploaded light stemcell images the upload volume is left intact.
+After the upload, the handler creates a new QEMU VM in the template VMID range (`[stemcell_template_vmid_range_start, stemcell_template_vmid_range_end]`, default `[30000, 30999]`), imports the qcow2 into it, and freezes it with `MakeTemplate`. The VM is named `bosh-stemcell-<name>-<version>` and tagged with `bosh-stemcell-sha-<sha8>` for later lookup. For CPI-owned images (heavy tarball uploads and light-fetch images), the intermediate upload volume is deleted after the template is frozen; for operator-preuploaded light stemcell images the upload volume is left intact.
 
 Template creation is idempotent: if a template VM with the canonical name already exists in the template VMID range, the existing VMID is reused and the upload is skipped.
 
@@ -114,7 +114,7 @@ The returned **stemcell CID** is:
 template:<vmid>
 ```
 
-For example: `template:6042`
+For example: `template:30042`
 
 All three create_stemcell paths (heavy tarball, light-preuploaded, light-fetch) return a `template:` CID. The older `<storage>:import/<filename>` CID form only appears in stemcell_cid values produced before this feature was introduced.
 
@@ -127,7 +127,7 @@ The handler dispatches on the stemcell CID format:
 
 Clone type follows `pve.clone_mode` (default `auto`): linked CoW for snapshot-capable backends, full clone for `lvm`-thick.
 
-VMID allocation for the new VM uses the range `[vmid_range_start, vmid_range_end]` (default `[100, 5999]`).
+VMID allocation for the new VM uses the range `[vmid_range_start, vmid_range_end]` (default `[100, 8999]`).
 
 ### delete_stemcell
 

@@ -295,6 +295,7 @@ func attemptCreateVolume(
 		},
 		pve.IsVMIDConflict,
 		maxAttempts,
+		pve.WithRange(deps.Config.DiskVMIDRangeStart, deps.Config.DiskVMIDRangeEnd),
 	)
 	if err != nil {
 		return 0, "", "", err

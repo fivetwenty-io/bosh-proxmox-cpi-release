@@ -109,7 +109,7 @@ Watch the task output. A clean run takes roughly one to two minutes and walks th
 
 2. `create_vm` — clones the template to a new VMID, applies cpu/memory/network/scsihw, resizes `scsi0` to the requested disk size, generates an agent UUID, builds the `settings.json` payload.
 
-3. `create_disk` + `attach_disk` — allocates a synthetic vmid in `[9000,9999]`, creates `vm-9NNN-disk-0` on `pve_disk_storage`, attaches it to the new VM as `scsiN`.
+3. `create_disk` + `attach_disk` — allocates a synthetic vmid in `[9000,29999]`, creates `vm-<vmid>-disk-0` on `pve_disk_storage`, attaches it to the new VM as `scsiN`.
 
 4. Agent configuration — uploads the ConfigDrive ISO to `pve_iso_storage` (default `local`), attaches as `scsi6`, starts the VM.
 

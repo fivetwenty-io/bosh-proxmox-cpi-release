@@ -115,14 +115,27 @@ type CPIConfig struct {
 	VMIDRangeStart int `json:"vmid_range_start,omitempty"`
 	// VMIDRangeEnd is the inclusive upper bound of the VMID range for VM
 	// allocation. VMs are allocated in [VMIDRangeStart, VMIDRangeEnd].
-	// Defaults to 5999. Must be > VMIDRangeStart and <= 9999.
-	// Persistent disks use synthetic VMIDs 9000-9999 (unaffected by this field).
+	// Defaults to 8999. Must be > VMIDRangeStart and <= 8999 (the disk range
+	// begins at 9000). Persistent disks use synthetic VMIDs 9000-29999
+	// (unaffected by this field).
 	VMIDRangeEnd int `json:"vmid_range_end,omitempty"`
 	// VMIDAllocAttempts is the maximum number of retries for VMID-conflict
 	// recovery in create_vm / create_disk. ≤0 → use the handler default (5).
 	// Cross-process VMID collisions surface as PVE 500 "already exists"
 	// errors; the retry loop allocates a fresh VMID and re-attempts.
 	VMIDAllocAttempts int `json:"vmid_alloc_attempts,omitempty"`
+
+	// DiskVMIDRangeStart is the inclusive lower bound of the synthetic VMID
+	// range for persistent-disk containers (create_disk). ApplyDefaults sets
+	// to 9000 when 0 (mirrors pve.VMIDRangeDiskStart). Must not overlap the VM
+	// range or the template range. validate-only-when-set; omit from ERB when zero.
+	DiskVMIDRangeStart int `json:"disk_vmid_range_start,omitempty"`
+
+	// DiskVMIDRangeEnd is the inclusive upper bound of the synthetic VMID range
+	// for persistent-disk containers. Must be > DiskVMIDRangeStart.
+	// ApplyDefaults sets to 29999 when 0 (mirrors pve.VMIDRangeDiskEnd).
+	// validate-only-when-set; omit from ERB when zero.
+	DiskVMIDRangeEnd int `json:"disk_vmid_range_end,omitempty"`
 
 	// AllowDiskOpsWithSnapshots bypasses the snapshot pre-flight guard in
 	// attach_disk, detach_disk, and resize_disk when true. Use only for
@@ -241,16 +254,16 @@ type CPIConfig struct {
 	StemcellFetchIdleConnTimeoutSec int `json:"stemcell_fetch_idle_conn_timeout_sec,omitempty"`
 
 	// StemcellTemplateVMIDRangeStart is the inclusive lower bound of the VMID
-	// range for template VMs created by create_stemcell. Must not overlap with
-	// VMIDRangeStart..VMIDRangeEnd (VM range) or the persistent disk range
-	// 9000-9999. ApplyDefaults sets to VMIDRangeEnd+1 when 0 (adaptive: with the
-	// default VM range, end=5999, this yields 6000 — the documented default).
+	// range for template VMs created by create_stemcell. Templates occupy a
+	// dedicated band above the persistent-disk range so they never collide with
+	// the VM range (VMIDRangeStart..VMIDRangeEnd) or the disk range 9000-29999.
+	// ApplyDefaults sets to 30000 when 0 (mirrors pve.VMIDRangeTemplateStart).
 	// validate-only-when-set; omit from ERB when zero.
 	StemcellTemplateVMIDRangeStart int `json:"stemcell_template_vmid_range_start,omitempty"`
 
 	// StemcellTemplateVMIDRangeEnd is the inclusive upper bound of the VMID
-	// range for template VMs. Must be > StemcellTemplateVMIDRangeStart and ≤8999.
-	// ApplyDefaults sets to 8999 when 0 (mirrors pve.VMIDRangeTemplateEnd).
+	// range for template VMs. Must be > StemcellTemplateVMIDRangeStart.
+	// ApplyDefaults sets to 30999 when 0 (mirrors pve.VMIDRangeTemplateEnd).
 	// validate-only-when-set; omit from ERB when zero.
 	StemcellTemplateVMIDRangeEnd int `json:"stemcell_template_vmid_range_end,omitempty"`
 
@@ -432,7 +445,15 @@ func (c *CPIConfig) ApplyDefaults() {
 		c.VMIDRangeStart = 100
 	}
 	if c.VMIDRangeEnd == 0 {
-		c.VMIDRangeEnd = 5999
+		c.VMIDRangeEnd = 8999
+	}
+	// Persistent-disk VMID range. config cannot import internal/pve (cycle), so
+	// the constants are inlined with comments referencing pve.VMIDRangeDisk*.
+	if c.DiskVMIDRangeStart == 0 {
+		c.DiskVMIDRangeStart = 9000 // pve.VMIDRangeDiskStart
+	}
+	if c.DiskVMIDRangeEnd == 0 {
+		c.DiskVMIDRangeEnd = 29999 // pve.VMIDRangeDiskEnd
 	}
 	// StemcellStorage defaults to VMStorage when not specified.
 	if c.StemcellStorage == "" {
@@ -470,18 +491,16 @@ func (c *CPIConfig) ApplyDefaults() {
 	if c.StemcellFetchIdleConnTimeoutSec <= 0 {
 		c.StemcellFetchIdleConnTimeoutSec = 90
 	}
-	// Template VMID range: derive adaptively from the VM range when not set by the
-	// operator. This preserves back-compat — a pre-upgrade config with a high
-	// vmid_range_end (valid before template support) must not suddenly fail
-	// validation because a hardcoded 6000 overlaps. With the default VM range
-	// (end=5999) the adaptive start is 5999+1=6000, matching the documented
-	// default. config cannot import internal/pve (cycle), so the ceiling
-	// constant 8999 is inlined with a comment referencing pve.VMIDRangeTemplateEnd.
+	// Template VMID range defaults to a dedicated band above the persistent-disk
+	// range (30000-30999). Because this band sits above the disk range, it cannot
+	// collide with any VM range up to the disk floor, so no adaptive derivation is
+	// needed. config cannot import internal/pve (cycle), so the constants are
+	// inlined with comments referencing pve.VMIDRangeTemplateStart/End.
 	if c.StemcellTemplateVMIDRangeStart == 0 {
-		c.StemcellTemplateVMIDRangeStart = c.VMIDRangeEnd + 1 // adaptive; pve.VMIDRangeTemplateStart when default VM range
+		c.StemcellTemplateVMIDRangeStart = 30000 // pve.VMIDRangeTemplateStart
 	}
 	if c.StemcellTemplateVMIDRangeEnd == 0 {
-		c.StemcellTemplateVMIDRangeEnd = 8999 // pve.VMIDRangeTemplateEnd
+		c.StemcellTemplateVMIDRangeEnd = 30999 // pve.VMIDRangeTemplateEnd
 	}
 	if c.CloneMode == "" {
 		c.CloneMode = "auto"
@@ -731,31 +750,12 @@ func rangesOverlap(s1, e1, s2, e2 int) bool {
 }
 
 // validateRanges appends an error for each numeric field outside its valid range.
-// Covers port (1–65535), vmid_range_start (≥100), vmid_range_end (>start, ≤9999),
-// reboot_timeout (1–3600 s), and stemcell template VMID range constraints.
+// Covers port (1–65535), reboot_timeout (1–3600 s), the three VMID allocation
+// bands (delegated to validateVMIDBands), and the stemcell-fetch timeouts.
 func (c *CPIConfig) validateRanges(errs *[]string) {
 	// Port range.
 	if c.Port <= 0 || c.Port >= 65536 {
 		*errs = append(*errs, fmt.Sprintf("port must be 1–65535, got %d", c.Port))
-	}
-
-	// VMIDRangeStart: PVE reserves 0–99.
-	if c.VMIDRangeStart < 100 {
-		*errs = append(*errs, fmt.Sprintf(
-			"vmid_range_start must be ≥100 (PVE reserved range), got %d", c.VMIDRangeStart,
-		))
-	}
-
-	// VMIDRangeEnd: must be strictly greater than VMIDRangeStart and within PVE
-	// VM VMID space (max 9999; disk range 9000-9999 is separate).
-	if c.VMIDRangeEnd <= c.VMIDRangeStart {
-		*errs = append(*errs, fmt.Sprintf(
-			"vmid_range_end must be > vmid_range_start (%d), got %d", c.VMIDRangeStart, c.VMIDRangeEnd,
-		))
-	} else if c.VMIDRangeEnd > 9999 {
-		*errs = append(*errs, fmt.Sprintf(
-			"vmid_range_end must be ≤9999, got %d", c.VMIDRangeEnd,
-		))
 	}
 
 	// RebootTimeout range: 1–3600 seconds.
@@ -765,61 +765,95 @@ func (c *CPIConfig) validateRanges(errs *[]string) {
 		))
 	}
 
-	// Stemcell template VMID range: validate only when at least one bound is
-	// non-zero (operator-supplied or ApplyDefaults-filled). Both zero means
-	// Validate is being called without ApplyDefaults — skip to avoid false
-	// positives on manually constructed configs that haven't been defaulted yet.
-	tStart := c.StemcellTemplateVMIDRangeStart
-	tEnd := c.StemcellTemplateVMIDRangeEnd
-	if tStart != 0 || tEnd != 0 {
-		if tStart < 100 {
-			*errs = append(*errs, fmt.Sprintf(
-				"stemcell_template_vmid_range_start must be ≥100 (PVE reserved range), got %d", tStart,
-			))
-		}
-		if tEnd > 8999 {
-			*errs = append(*errs, fmt.Sprintf(
-				"stemcell_template_vmid_range_end must be ≤8999, got %d", tEnd,
-			))
-		}
-		if tStart >= tEnd {
-			// When the derived start equals VMIDRangeEnd+1 the operator has pushed
-			// the VM range so high there is no gap below the persistent disk range.
-			// Emit a targeted message so they know exactly what to change.
-			if tStart == c.VMIDRangeEnd+1 {
-				*errs = append(*errs, fmt.Sprintf(
-					"no free VMID range for stemcell templates: vmid_range_end=%d leaves no space below"+
-						" the persistent disk range (9000); lower vmid_range_end below 9000 or set"+
-						" stemcell_template_vmid_range_start/_end explicitly",
-					c.VMIDRangeEnd,
-				))
-			} else {
-				*errs = append(*errs, fmt.Sprintf(
-					"stemcell_template_vmid_range_start (%d) must be < stemcell_template_vmid_range_end (%d)",
-					tStart, tEnd,
-				))
-			}
-		}
-		// Overlap with VM VMID range.
-		if tStart < tEnd && rangesOverlap(tStart, tEnd, c.VMIDRangeStart, c.VMIDRangeEnd) {
-			*errs = append(*errs, fmt.Sprintf(
-				"stemcell template VMID range [%d,%d] overlaps VM VMID range [%d,%d]",
-				tStart, tEnd, c.VMIDRangeStart, c.VMIDRangeEnd,
-			))
-		}
-		// Overlap with persistent disk range 9000-9999 (constant; not configurable).
-		if tStart < tEnd && rangesOverlap(tStart, tEnd, 9000, 9999) {
-			*errs = append(*errs, fmt.Sprintf(
-				"stemcell template VMID range [%d,%d] overlaps persistent disk range [9000,9999]",
-				tStart, tEnd,
-			))
-		}
-	}
+	c.validateVMIDBands(errs)
 
 	// Stemcell-fetch transport timeouts: 1–3600 seconds when ApplyDefaults has
 	// run. The fields are int seconds so the JSON shape stays human-friendly;
 	// the conversion to time.Duration happens at the call site.
 	c.appendStemcellFetchTimeoutErrors(errs)
+}
+
+// Default VMID band bounds, inlined because config cannot import internal/pve
+// (cycle). They mirror pve.VMIDRangeDiskStart/End and pve.VMIDRangeTemplate*.
+const (
+	defaultDiskVMIDStart     = 9000
+	defaultDiskVMIDEnd       = 29999
+	defaultTemplateVMIDStart = 30000
+	defaultTemplateVMIDEnd   = 30999
+)
+
+// validateVMIDBands validates the three VMID allocation bands (VM, persistent
+// disk, stemcell template) and rejects any pairwise overlap.
+//
+// The VM range is always validated from its raw fields (ApplyDefaults fills it;
+// tests set it explicitly). The disk and template ranges are validated only
+// when explicitly set — both-zero means the caller skipped ApplyDefaults, so
+// the runtime defaults apply and there is nothing operator-supplied to reject.
+//
+// Overlap checks use *effective* ranges: an unset disk or template range falls
+// back to its default so the VM range is always cross-checked against the bands
+// that will exist at runtime. There is no hard VM-range ceiling — the VM range
+// may grow as far as the operator wants, provided it does not collide with the
+// (possibly relocated) disk or template band.
+func (c *CPIConfig) validateVMIDBands(errs *[]string) {
+	const maxVMID = 999999999 // PVE maximum VMID
+
+	checkBounds := func(name string, start, end int) {
+		if start < 100 {
+			*errs = append(*errs, fmt.Sprintf(
+				"%s_start must be ≥100 (PVE reserved range), got %d", name, start))
+		}
+		if end > maxVMID {
+			*errs = append(*errs, fmt.Sprintf(
+				"%s_end must be ≤%d (PVE maximum VMID), got %d", name, maxVMID, end))
+		}
+		if end <= start {
+			*errs = append(*errs, fmt.Sprintf(
+				"%s_end must be > %s_start (%d), got %d", name, name, start, end))
+		}
+	}
+
+	// VM range: always validated from raw fields.
+	checkBounds("vmid_range", c.VMIDRangeStart, c.VMIDRangeEnd)
+
+	// Disk and template ranges: bounds-checked only when explicitly set.
+	if c.DiskVMIDRangeStart != 0 || c.DiskVMIDRangeEnd != 0 {
+		checkBounds("disk_vmid_range", c.DiskVMIDRangeStart, c.DiskVMIDRangeEnd)
+	}
+	if c.StemcellTemplateVMIDRangeStart != 0 || c.StemcellTemplateVMIDRangeEnd != 0 {
+		checkBounds("stemcell_template_vmid_range", c.StemcellTemplateVMIDRangeStart, c.StemcellTemplateVMIDRangeEnd)
+	}
+
+	// Effective ranges for overlap checks (unset disk/template → defaults).
+	diskStart, diskEnd := c.DiskVMIDRangeStart, c.DiskVMIDRangeEnd
+	if diskStart == 0 && diskEnd == 0 {
+		diskStart, diskEnd = defaultDiskVMIDStart, defaultDiskVMIDEnd
+	}
+	tStart, tEnd := c.StemcellTemplateVMIDRangeStart, c.StemcellTemplateVMIDRangeEnd
+	if tStart == 0 && tEnd == 0 {
+		tStart, tEnd = defaultTemplateVMIDStart, defaultTemplateVMIDEnd
+	}
+
+	// Pairwise overlaps — only when each range is well-formed, so a bounds
+	// error above does not spawn a confusing second overlap error.
+	vmOK := c.VMIDRangeStart < c.VMIDRangeEnd
+	diskOK := diskStart < diskEnd
+	tOK := tStart < tEnd
+	if vmOK && diskOK && rangesOverlap(c.VMIDRangeStart, c.VMIDRangeEnd, diskStart, diskEnd) {
+		*errs = append(*errs, fmt.Sprintf(
+			"persistent disk VMID range [%d,%d] overlaps VM VMID range [%d,%d]",
+			diskStart, diskEnd, c.VMIDRangeStart, c.VMIDRangeEnd))
+	}
+	if vmOK && tOK && rangesOverlap(c.VMIDRangeStart, c.VMIDRangeEnd, tStart, tEnd) {
+		*errs = append(*errs, fmt.Sprintf(
+			"stemcell template VMID range [%d,%d] overlaps VM VMID range [%d,%d]",
+			tStart, tEnd, c.VMIDRangeStart, c.VMIDRangeEnd))
+	}
+	if diskOK && tOK && rangesOverlap(diskStart, diskEnd, tStart, tEnd) {
+		*errs = append(*errs, fmt.Sprintf(
+			"stemcell template VMID range [%d,%d] overlaps persistent disk range [%d,%d]",
+			tStart, tEnd, diskStart, diskEnd))
+	}
 }
 
 // appendStemcellFetchTimeoutErrors validates each stemcell-fetch transport

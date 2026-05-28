@@ -200,8 +200,8 @@ func wbBuildFetchDeps(
 			Node:                           "pve-node1",
 			StemcellStorage:                "nfs",
 			VMStorage:                      "nfs",
-			StemcellTemplateVMIDRangeStart: 6000,
-			StemcellTemplateVMIDRangeEnd:   8999,
+			StemcellTemplateVMIDRangeStart: 30000,
+			StemcellTemplateVMIDRangeEnd:   30999,
 		},
 		PVE:    pveClient,
 		Logger: log.NewNopLogger(),
@@ -672,10 +672,10 @@ func buildEnsureTemplateDeps(
 			Node:            "pve-node1",
 			StemcellStorage: "nfs",
 			VMStorage:       "nfs",
-			// Template VMID range: adaptive default (set by ApplyDefaults in production;
+			// Template VMID range: fixed band default (set by ApplyDefaults in production;
 			// hand-set here for deterministic tests).
-			StemcellTemplateVMIDRangeStart: 6000,
-			StemcellTemplateVMIDRangeEnd:   8999,
+			StemcellTemplateVMIDRangeStart: 30000,
+			StemcellTemplateVMIDRangeEnd:   30999,
 		},
 		PVE:    pveClient,
 		Logger: log.NewNopLogger(),
@@ -781,8 +781,8 @@ func TestEnsureTemplateVM_CreatePath_CpiOwnsSource(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ensureTemplateVM returned error: %v", err)
 	}
-	if vmid < 6000 || vmid > 8999 {
-		t.Errorf("vmid %d outside expected template range [6000,8999]", vmid)
+	if vmid < 30000 || vmid > 30999 {
+		t.Errorf("vmid %d outside expected template range [30000,30999]", vmid)
 	}
 	if !createCalled {
 		t.Error("QEMU.Create was not called")
@@ -824,7 +824,7 @@ func TestEnsureTemplateVM_CreatePath_CpiOwnsSource(t *testing.T) {
 func TestEnsureTemplateVM_Idempotent_ExistingTemplate(t *testing.T) {
 	t.Parallel()
 
-	const existingVMID = int64(6042)
+	const existingVMID = int64(10042)
 	var createCalled bool
 	var deleteCalled bool
 
@@ -964,8 +964,8 @@ func TestEnsureTemplateVM_DeleteFailsBestEffort_VmidStillReturned(t *testing.T) 
 	if err != nil {
 		t.Fatalf("delete failure must not surface as error (best-effort); got: %v", err)
 	}
-	if vmid < 6000 || vmid > 8999 {
-		t.Errorf("vmid %d outside expected template range [6000,8999]", vmid)
+	if vmid < 30000 || vmid > 30999 {
+		t.Errorf("vmid %d outside expected template range [30000,30999]", vmid)
 	}
 }
 
@@ -1140,8 +1140,8 @@ func buildEnsureTemplateDepsWithPool(
 			Node:                           "pve-node1",
 			StemcellStorage:                "nfs",
 			VMStorage:                      "nfs",
-			StemcellTemplateVMIDRangeStart: 6000,
-			StemcellTemplateVMIDRangeEnd:   8999,
+			StemcellTemplateVMIDRangeStart: 30000,
+			StemcellTemplateVMIDRangeEnd:   30999,
 			StemcellTemplatePool:           poolID,
 		},
 		PVE:    pveClient,
@@ -1171,7 +1171,7 @@ func TestEnsureTemplateVM_PoolAssignment_Called(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if vmid < 6000 || vmid > 8999 {
+	if vmid < 30000 || vmid > 30999 {
 		t.Errorf("vmid %d outside template range", vmid)
 	}
 	if len(pool.calls) != 1 {

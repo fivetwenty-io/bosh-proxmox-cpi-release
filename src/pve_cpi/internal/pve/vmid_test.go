@@ -87,8 +87,8 @@ func buildResources(vmids ...int) *sdkcluster.ListResourcesResponse {
 
 func TestNextVMID_FreeInRange(t *testing.T) {
 	t.Parallel()
-	// used: 100, 101, 103; free slots include 102, 104..5999.
-	// With randomised start the returned ID is any free slot in [100,5999].
+	// used: 100, 101, 103; free slots include 102, 104..8999.
+	// With randomised start the returned ID is any free slot in [100,8999].
 	c := newVMIDClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
 		return buildResources(100, 101, 103), nil
 	})
@@ -124,7 +124,7 @@ func TestNextVMID_EmptyCluster(t *testing.T) {
 
 func TestNextVMID_AllUsed(t *testing.T) {
 	t.Parallel()
-	// Fill entire VM range [100..5999].
+	// Fill entire VM range [100..8999].
 	all := make([]int, 0, pve.VMIDRangeVMEnd-pve.VMIDRangeVMStart+1)
 	for i := pve.VMIDRangeVMStart; i <= pve.VMIDRangeVMEnd; i++ {
 		all = append(all, i)
@@ -174,7 +174,7 @@ func TestNextVMID_CustomRange_AllUsed(t *testing.T) {
 
 func TestNextDiskVMID_InRange(t *testing.T) {
 	t.Parallel()
-	// 9000 used; any ID in [9001,9999] is valid with randomised start.
+	// 9000 used; any ID in [9001,29999] is valid with randomised start.
 	c := newVMIDClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
 		return buildResources(9000), nil
 	})
@@ -188,6 +188,54 @@ func TestNextDiskVMID_InRange(t *testing.T) {
 	}
 	if id == 9000 {
 		t.Errorf("returned used disk VMID 9000")
+	}
+}
+
+// TestNextDiskVMID_WithRange verifies an operator-supplied disk range overrides
+// the default band: every allocation lands inside [start,end].
+func TestNextDiskVMID_WithRange(t *testing.T) {
+	t.Parallel()
+	c := newVMIDClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+		return buildResources(), nil
+	})
+
+	id, err := pve.NextDiskVMID(context.Background(), c, "", "", pve.WithRange(50000, 50010))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if id < 50000 || id > 50010 {
+		t.Errorf("disk VMID %d outside custom range [50000,50010]", id)
+	}
+	// The default band must NOT be used when WithRange is supplied.
+	if id >= pve.VMIDRangeDiskStart && id <= pve.VMIDRangeDiskEnd {
+		t.Errorf("disk VMID %d fell in the default band despite WithRange override", id)
+	}
+}
+
+// TestAllocateDiskWithRetry_ForwardsRange verifies AllocateDiskWithRetry forwards
+// WithRange to NextDiskVMID so the create callback receives an in-range VMID.
+func TestAllocateDiskWithRetry_ForwardsRange(t *testing.T) {
+	t.Parallel()
+	c := newVMIDClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+		return buildResources(), nil
+	})
+
+	var seen int
+	id, err := pve.AllocateDiskWithRetry(context.Background(), c, "", "",
+		func(vmid int) error { seen = vmid; return nil },
+		func(error) bool { return false },
+		3,
+		pve.WithNoBackoff(),
+		pve.WithRange(60000, 60020),
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if id < 60000 || id > 60020 {
+		t.Errorf("allocated disk VMID %d outside custom range [60000,60020]", id)
+	}
+	if seen != id {
+		t.Errorf("create callback saw %d, allocator returned %d", seen, id)
 	}
 }
 
@@ -513,7 +561,7 @@ func TestNextVMID_WithRange_InvalidIgnored(t *testing.T) {
 func TestNextVMID_MalformedJSONSkipped(t *testing.T) {
 	t.Parallel()
 	// One malformed JSON entry must be skipped; allocation proceeds over remaining.
-	// used: {101}; free: all of [100,5999] except 101.
+	// used: {101}; free: all of [100,8999] except 101.
 	malformed := sdkcluster.ListResourcesResponse{
 		json.RawMessage(`{bad json`),
 		json.RawMessage(`{"vmid":101}`),
@@ -536,7 +584,7 @@ func TestNextVMID_MalformedJSONSkipped(t *testing.T) {
 
 func TestNextVMID_GapAtStart(t *testing.T) {
 	t.Parallel()
-	// used: 101 only; free: 100, 102..5999.
+	// used: 101 only; free: 100, 102..8999.
 	// Randomised start; any free slot in the VM range is valid.
 	c := newVMIDClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
 		return buildResources(101), nil
@@ -571,18 +619,18 @@ func TestNextVMID_VmidsOutsideRangeIgnored(t *testing.T) {
 	}
 }
 
-func TestVMIDRange_VMEndIs5999(t *testing.T) {
+func TestVMIDRange_VMEndIs8999(t *testing.T) {
 	t.Parallel()
-	if pve.VMIDRangeVMEnd != 5999 {
-		t.Errorf("VMIDRangeVMEnd: expected 5999, got %d", pve.VMIDRangeVMEnd)
+	if pve.VMIDRangeVMEnd != 8999 {
+		t.Errorf("VMIDRangeVMEnd: expected 8999, got %d", pve.VMIDRangeVMEnd)
 	}
 }
 
-// TestNextVMID_5500Allocatable verifies that VMIDs in [5500,5999], formerly in the
+// TestNextVMID_5500Allocatable verifies that VMIDs in [5500,8999], formerly in the
 // stemcell sub-range, are now allocatable as regular VM VMIDs.
 func TestNextVMID_5500Allocatable(t *testing.T) {
 	t.Parallel()
-	// Fill 100..5499; only 5500..5999 remain free.
+	// Fill 100..5499; only 5500..8999 remain free.
 	all := make([]int, 0, 5500-100)
 	for i := 100; i < 5500; i++ {
 		all = append(all, i)
@@ -595,7 +643,7 @@ func TestNextVMID_5500Allocatable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	// Randomised start: result is somewhere in [5500,5999].
+	// Randomised start: result is somewhere in [5500,8999].
 	if id < 5500 || id > pve.VMIDRangeVMEnd {
 		t.Errorf("expected free VMID in [5500,%d], got %d", pve.VMIDRangeVMEnd, id)
 	}
@@ -755,7 +803,7 @@ func TestAllocateDiskWithRetry_NilCreateFunc(t *testing.T) {
 func TestNextVMID_VmidNullField(t *testing.T) {
 	t.Parallel()
 	// JSON entry where vmid is null must be skipped (pointer nil).
-	// used: {100}; free: 101..5999 plus any others in the VM range.
+	// used: {100}; free: 101..8999 plus any others in the VM range.
 	entry := sdkcluster.ListResourcesResponse{
 		json.RawMessage(`{"vmid":null,"type":"node"}`),
 		json.RawMessage(fmt.Sprintf(`{"vmid":%d}`, 100)),
@@ -928,11 +976,11 @@ func TestVMIDRangeTemplate_NoOverlapAndOrdered(t *testing.T) {
 
 	// Spot-check expected values so a future refactor that changes the constants
 	// is forced to update this test deliberately.
-	if pve.VMIDRangeTemplateStart != 6000 {
-		t.Errorf("VMIDRangeTemplateStart: expected 6000, got %d", pve.VMIDRangeTemplateStart)
+	if pve.VMIDRangeTemplateStart != 30000 {
+		t.Errorf("VMIDRangeTemplateStart: expected 30000, got %d", pve.VMIDRangeTemplateStart)
 	}
-	if pve.VMIDRangeTemplateEnd != 8999 {
-		t.Errorf("VMIDRangeTemplateEnd: expected 8999, got %d", pve.VMIDRangeTemplateEnd)
+	if pve.VMIDRangeTemplateEnd != 30999 {
+		t.Errorf("VMIDRangeTemplateEnd: expected 30999, got %d", pve.VMIDRangeTemplateEnd)
 	}
 }
 

@@ -220,7 +220,7 @@ Set `pve.node` in the CPI config (the common case) or set `target_node` in `clou
 **Symptom**
 
 ```text
-no free VMID in range [100, 5999]: all 5900 IDs exhausted
+no free VMID in range [100, 8999]: all 8900 IDs exhausted
 ```
 
 or
@@ -239,7 +239,7 @@ pvesh get /cluster/resources --type vm | jq '.[].vmid' | sort -n
 
 **Fix**
 
-Delete unused VMs to free VMIDs, or widen the range by setting `pve.vmid_range_end` to a higher value (maximum 9999; the 9000–9999 band is reserved for persistent-disk VMIDs).
+Delete unused VMs to free VMIDs, or widen the range by setting `pve.vmid_range_end` to a higher value (maximum 8999; the 9000–29999 band is reserved for persistent-disk VMIDs).
 
 ### Too many persistent disks at create time
 
@@ -645,7 +645,7 @@ These properties control how the CPI behaves when it encounters the failure clas
 | `pve.allow_disk_ops_with_snapshots` | `false` | When `true`, bypasses the snapshot guard on attach, detach, and resize |
 | `pve.require_snapshot_check_pass` | `false` | When `false`, the CPI proceeds (with a warning) if the snapshot-check API call fails; when `true`, any API failure on the snapshot check is a hard error |
 | `pve.vmid_range_start` | `100` | Lower bound of the VMID range the CPI allocates from |
-| `pve.vmid_range_end` | `5999` | Upper bound of the VMID range the CPI allocates from |
+| `pve.vmid_range_end` | `8999` | Upper bound of the VMID range the CPI allocates from |
 | `pve.log_level` | `info` | Log verbosity: `debug`, `info`, `warn`, or `error` |
 
 ## Interpreting retry log lines

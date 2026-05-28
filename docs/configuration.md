@@ -29,11 +29,13 @@ The CPI is configured via properties in a BOSH deployment manifest. The job temp
 | `pve.reboot_mode` | `reboot_vm` strategy: `soft` (graceful ACPI reboot, hard-reset fallback) or `hard` (immediate reset). | `soft` | no |
 | `pve.reboot_timeout` | Seconds to wait for graceful shutdown before hard-reset fallback (soft mode only). Range 1–3600. | `60` | no |
 | `pve.log_level` | Structured log level (`debug`, `info`, `warn`, `error`) | `info` | no |
-| `pve.vmid_range_start` | First VMID used for VM allocation. VMs use `[vmid_range_start, vmid_range_end]`. Persistent disks use `[9000, 9999]`. | `100` | no |
-| `pve.vmid_range_end` | Inclusive upper bound of the VM VMID range. Must be greater than `vmid_range_start` and at most `9999`. The allocator scans this range from a randomized start so concurrent CPI invocations rarely pick the same VMID; a retry-on-conflict loop backstops the rare collision. | `5999` | no |
+| `pve.vmid_range_start` | First VMID used for VM allocation. VMs use `[vmid_range_start, vmid_range_end]`. Persistent disks use `[9000, 29999]`. | `100` | no |
+| `pve.vmid_range_end` | Inclusive upper bound of the VM VMID range. Must be greater than `vmid_range_start` and must not overlap the disk or template range (with the default disk range starting at 9000, the effective maximum is 8999). The allocator scans this range from a randomized start so concurrent CPI invocations rarely pick the same VMID; a retry-on-conflict loop backstops the rare collision. | `8999` | no |
+| `pve.disk_vmid_range_start` | First VMID used for persistent-disk container allocation. When unset (`0`), defaults to `9000`. Must not overlap the VM range or the template range. | `0` (→ `9000`) | no |
+| `pve.disk_vmid_range_end` | Inclusive upper bound of the persistent-disk VMID range. When unset (`0`), defaults to `29999`. Must be greater than `disk_vmid_range_start`. | `0` (→ `29999`) | no |
 | `pve.clone_mode` | Clone type used when `create_vm` clones a stemcell template. `auto` (default): linked clone for snapshot-capable backends (`dir`, `nfs`, `cifs`, `zfspool`, `lvmthin`, `rbd`, `cephfs`); full clone for `lvm`-thick (linked clone not supported). `linked`: force linked clone; returns an error on `lvm`-thick. `full`: force full clone on all backends. One of `auto`\|`linked`\|`full`. | `auto` | no |
-| `pve.stemcell_template_vmid_range_start` | Starting VMID for stemcell template VM allocation. When unset (`0`), the CPI derives the start as `vmid_range_end + 1`; with the default VM range (`vmid_range_end = 5999`) this yields `6000`. Must not overlap the VM range or the persistent-disk range `9000–9999`. | `0` (derived) | no |
-| `pve.stemcell_template_vmid_range_end` | Inclusive upper bound of the template VMID range. When unset (`0`), defaults to `8999`. Must be greater than `stemcell_template_vmid_range_start` and at most `8999`. Must not overlap the persistent-disk range. | `0` (derived) | no |
+| `pve.stemcell_template_vmid_range_start` | Starting VMID for stemcell template VM allocation — a dedicated band above the persistent-disk range. When unset (`0`), defaults to `30000`. Must not overlap the VM range or the persistent-disk range `9000–29999`. | `0` (→ `30000`) | no |
+| `pve.stemcell_template_vmid_range_end` | Inclusive upper bound of the template VMID range. When unset (`0`), defaults to `30999`. Must be greater than `stemcell_template_vmid_range_start`. Must not overlap the persistent-disk range. | `0` (→ `30999`) | no |
 | `pve.stemcell_template_pool` | Optional PVE resource pool to assign to newly created template VMs. When empty (default), templates are not assigned to any pool. An invalid pool name causes `create_stemcell` to return an error. | `""` | no |
 | `pve.stemcell_template_node` | Optional PVE node on which template VMs are created. When empty (default), falls back to `pve.node`. When using local `stemcell_storage`, this must equal the node where that storage is mounted; pointing to a different node with local storage causes the template import to fail because the uploaded qcow2 is not visible from the other node. | `""` | no |
 | `pve.vm_prefix` | Optional prefix prepended to every CPI-provisioned VM's PVE name. With `cpi`, names take the form `cpi-<deployment>-<job>-<index>`. Empty means the prefix is omitted. The prefix is cluster-wide — every VM created by this CPI deployment carries it. | `""` | no |
@@ -77,21 +79,31 @@ The five properties in the table above (`clone_mode`, `stemcell_template_vmid_ra
 
 Set `clone_mode: full` to force full clones everywhere, or `clone_mode: linked` to force linked clones and get an explicit error on `lvm`-thick rather than a silent fallback.
 
-### Template VMID range
+### VMID ranges
 
-Template VMIDs default to `[vmid_range_end + 1, 8999]`. With the default VM range (`vmid_range_end = 5999`) this is `[6000, 8999]`. If you raise `vmid_range_end`, the template range start shifts up automatically; no explicit template range configuration is needed unless you want to override it.
+The CPI allocates three classes of VMID from disjoint, contiguous bands. Each band is operator-configurable; all default to clean, non-overlapping ranges:
 
-Override example:
+| Class | Default range | Count | Config keys |
+| --- | --- | --- | --- |
+| VMs | `[100, 8999]` | 8,900 | `vmid_range_start`, `vmid_range_end` |
+| Persistent disks | `[9000, 29999]` | 21,000 | `disk_vmid_range_start`, `disk_vmid_range_end` |
+| Stemcell templates | `[30000, 30999]` | 1,000 | `stemcell_template_vmid_range_start`, `stemcell_template_vmid_range_end` |
+
+The disk band is sized at roughly 2× the VM ceiling so a foundation never exhausts persistent-disk identifiers before VMs. The template band is small because the live count of stemcell templates (one per stemcell name/version tuple) is tens, not thousands.
+
+Override example (the full default layout, written out):
 
 ```yaml
 pve:
   vmid_range_start: 100
-  vmid_range_end: 5999
-  stemcell_template_vmid_range_start: 6000
-  stemcell_template_vmid_range_end: 7999
+  vmid_range_end: 8999
+  disk_vmid_range_start: 9000
+  disk_vmid_range_end: 29999
+  stemcell_template_vmid_range_start: 30000
+  stemcell_template_vmid_range_end: 30999
 ```
 
-The template range must not overlap `[vmid_range_start, vmid_range_end]` or the persistent-disk range `[9000, 9999]`. The validator rejects overlapping configurations at CPI startup.
+The three ranges must not overlap one another. The validator cross-checks all pairs at CPI startup and rejects overlapping configurations. There is no hard ceiling on the VM range — it may grow as large as you like, provided you relocate the disk and template bands so nothing collides.
 
 ### Cross-node and multi-node considerations
 

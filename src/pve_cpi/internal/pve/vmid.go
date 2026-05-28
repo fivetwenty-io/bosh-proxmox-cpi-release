@@ -15,18 +15,24 @@ import (
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 )
 
-// Default VMID ranges.
-// VM range expanded to 5999; the former stemcell sub-range [5000,5999] is now
-// part of the general VM pool. Template VMIDs occupy [6000,8999] and are
-// reserved for create_stemcell; operator-overridable via WithRange.
-// Disk synthetic VMIDs remain in [9000,9999].
+// Default VMID ranges. The three classes occupy disjoint, contiguous bands:
+//
+//	VMs       [100, 8999]     general VM allocation (create_vm)
+//	disks     [9000, 29999]   synthetic VMIDs for persistent-disk containers
+//	templates [30000, 30999]  frozen stemcell template VMs (create_stemcell)
+//
+// Disks are sized at roughly 2x the VM ceiling so a foundation never exhausts
+// persistent-disk identifiers before VMs. Templates need only a small band (the
+// live count of stemcell name/version tuples is tens, not thousands). The VM
+// range and template range are operator-overridable; the disk range is fixed in
+// code today (see the configurability plan).
 const (
 	VMIDRangeVMStart       = 100
-	VMIDRangeVMEnd         = 5999
-	VMIDRangeTemplateStart = 6000 // template VMs (create_stemcell); operator-overridable
-	VMIDRangeTemplateEnd   = 8999
+	VMIDRangeVMEnd         = 8999
 	VMIDRangeDiskStart     = 9000
-	VMIDRangeDiskEnd       = 9999
+	VMIDRangeDiskEnd       = 29999
+	VMIDRangeTemplateStart = 30000 // template VMs (create_stemcell); operator-overridable
+	VMIDRangeTemplateEnd   = 30999
 )
 
 // allocOpts holds resolved configuration for a single NextVMID call or
@@ -255,27 +261,36 @@ func NextVMID(ctx context.Context, c Client, opts ...AllocOption) (int, error) {
 	return nextVMIDInRange(used, ao.rangeStart, ao.rangeEnd)
 }
 
-// NextDiskVMID returns the lowest free VMID in [VMIDRangeDiskStart, VMIDRangeDiskEnd].
-// Disk VMIDs are synthetic identifiers used for unattached persistent volumes
-// managed as QEMU VMs (for snapshotting support).
+// NextDiskVMID returns a free VMID in the disk range (default
+// [VMIDRangeDiskStart, VMIDRangeDiskEnd]; override with WithRange). Disk VMIDs
+// are synthetic identifiers used for unattached persistent volumes managed as
+// QEMU VMs (for snapshotting support).
 //
 // node and storage may be empty: when set, the function ALSO unions VMIDs
-// extracted from volume names ("vm-9NNN-disk-N") on that storage into the
+// extracted from volume names ("vm-<vmid>-disk-N") on that storage into the
 // "used" set. This is critical for synthetic VMIDs because the cluster VM
 // list does NOT include orphaned persistent disks — without the storage
 // scan, a stale "vm-9000-disk-0" left behind on storage would be invisible
-// to NextDiskVMID and the next call would happily return 9000 again,
+// to NextDiskVMID and the next call could hand out the same VMID again,
 // colliding on lvcreate.
 //
 // Both API calls (cluster list + storage content list) run outside the mutex
 // for the same reason as NextVMID: they can block for seconds and must not
 // head-of-line-block other goroutines.
-func NextDiskVMID(ctx context.Context, c Client, node, storage string) (int, error) {
+func NextDiskVMID(ctx context.Context, c Client, node, storage string, opts ...AllocOption) (int, error) {
 	if ctx == nil {
 		return 0, cpierrors.Cloud("NextDiskVMID: ctx must not be nil")
 	}
 	if c == nil {
 		return 0, cpierrors.Cloud("NextDiskVMID: client must not be nil")
+	}
+
+	ao := &allocOpts{
+		rangeStart: VMIDRangeDiskStart,
+		rangeEnd:   VMIDRangeDiskEnd,
+	}
+	for _, opt := range opts {
+		opt(ao)
 	}
 
 	// Fetch both data sources outside the mutex.
@@ -297,7 +312,7 @@ func NextDiskVMID(ctx context.Context, c Client, node, storage string) (int, err
 	globalVMIDMu.Lock()
 	defer globalVMIDMu.Unlock()
 
-	return nextVMIDInRange(used, VMIDRangeDiskStart, VMIDRangeDiskEnd)
+	return nextVMIDInRange(used, ao.rangeStart, ao.rangeEnd)
 }
 
 // volumeVMIDRegexp matches PVE volume names of the form "vm-NNN-disk-N",
@@ -432,9 +447,10 @@ func AllocateWithRetry(
 }
 
 // AllocateDiskWithRetry mirrors AllocateWithRetry for disk-range VMIDs. On
-// each attempt it calls NextDiskVMID(ctx, c, node, storage) so the
+// each attempt it calls NextDiskVMID(ctx, c, node, storage, opts...) so the
 // storage-volume scan re-runs every iteration and orphan volumes from prior
-// failed attempts remain visible. Same backoff/jitter treatment as
+// failed attempts remain visible. opts are forwarded to NextDiskVMID, so
+// WithRange overrides the default disk range. Same backoff/jitter treatment as
 // AllocateWithRetry.
 func AllocateDiskWithRetry(
 	ctx context.Context,
@@ -465,7 +481,7 @@ func AllocateDiskWithRetry(
 
 	var lastVMID int
 	for attempt := 0; attempt < maxAttempts; attempt++ {
-		vmid, err := NextDiskVMID(ctx, c, node, storage)
+		vmid, err := NextDiskVMID(ctx, c, node, storage, opts...)
 		if err != nil {
 			return 0, err
 		}
