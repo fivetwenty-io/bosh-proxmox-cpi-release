@@ -771,6 +771,10 @@ func TestEnsureTemplateVM_CreatePath_CpiOwnsSource(t *testing.T) {
 	}
 
 	deps := buildEnsureTemplateDeps(qemu, nodes, tasks, stor)
+	// Template disk target storage (images-capable) is intentionally distinct
+	// from the import-from source storage (StemcellStorage = "nfs"); they need
+	// not be the same PVE storage (local has "import" but not "images").
+	deps.Config.VMStorage = "images-pool"
 	// Wire cluster service for AllocateWithRetry → NextVMID.
 	deps.PVE.(*wbTemplateMockClient).clusterSvc = &wbClusterForAlloc{
 		listResourcesFn: listClusterResourcesEmpty(),
@@ -804,7 +808,7 @@ func TestEnsureTemplateVM_CreatePath_CpiOwnsSource(t *testing.T) {
 	// Verify the disk is allocated on <storage> via the "<storage>:0," prefix.
 	// A bare "0" prefix is parsed by PVE as a volume ID and rejected with
 	// "unable to parse volume ID '0'", breaking stemcell template creation.
-	wantPrefix := storage + ":0,"
+	wantPrefix := deps.Config.VMStorage + ":0,"
 	if !strings.HasPrefix(virtio0, wantPrefix) {
 		t.Errorf("virtio0 %q must start with storage-prefixed allocation %q", virtio0, wantPrefix)
 	}

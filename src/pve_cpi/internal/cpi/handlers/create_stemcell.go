@@ -560,7 +560,7 @@ func ensureTemplateVM(
 
 	allocatedRaw, allocErr := pve.AllocateWithRetry(ctx, deps.PVE,
 		func(candidate int) error {
-			return attemptCreateTemplateVM(ctx, deps, logger, templateNode, candidate, templateName, importVolid, shaTag, storage)
+			return attemptCreateTemplateVM(ctx, deps, logger, templateNode, candidate, templateName, importVolid, shaTag, deps.Config.VMStorage)
 		},
 		isRetryable,
 		0, // use AllocateWithRetry default (3 attempts)
@@ -654,15 +654,18 @@ func attemptCreateTemplateVM(
 	logger *log.Logger,
 	node string,
 	candidate int,
-	templateName, importVolid, shaTag, storage string,
+	templateName, importVolid, shaTag, targetStorage string,
 ) error {
-	// virtio0: allocate on <storage> (PVE requires the "<storage>:<size>" form;
-	// a bare "0" is parsed as a volume ID and rejected with "unable to parse
-	// volume ID '0'"). import-from drives the actual disk placement. size=5G
-	// matches defaultStemcellDiskGiB; PVE will not shrink below the imported
-	// image's actual size.
+	// virtio0: allocate the template's root disk on targetStorage (the VM/images
+	// storage). PVE requires the "<storage>:<size>" form — a bare "0" is parsed
+	// as a volume ID and rejected ("unable to parse volume ID '0'"). targetStorage
+	// MUST support the "images" content type and is intentionally distinct from
+	// the import-from source (importVolid lives on StemcellStorage, which only
+	// needs "import"); no single PVE storage need support both — mirrors the
+	// create_vm import-from path. size=5G matches defaultStemcellDiskGiB; PVE
+	// will not shrink below the imported image's actual size.
 	virtio0Val := fmt.Sprintf("%s:0,import-from=%s,format=%s,size=%dG",
-		storage, importVolid, diskFormatQCOW2, defaultStemcellDiskGiB)
+		targetStorage, importVolid, diskFormatQCOW2, defaultStemcellDiskGiB)
 
 	createParams := map[string]any{
 		"vmid":    candidate,
