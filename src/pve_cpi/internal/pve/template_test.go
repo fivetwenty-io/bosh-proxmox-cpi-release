@@ -68,19 +68,19 @@ func marshalUPID(upid string) json.RawMessage {
 
 func TestBuildTemplateName_Basic(t *testing.T) {
 	t.Parallel()
-	// Underscores are in the allowed set [a-z0-9._] and are preserved as-is.
+	// PVE VM names must be DNS-valid: '_' and '.' are replaced with '-'.
 	got := pve.BuildTemplateName("bosh-proxmox-kvm-ubuntu-jammy-go_agent", "1.234")
-	want := "bosh-stemcell-bosh-proxmox-kvm-ubuntu-jammy-go_agent-1.234"
+	want := "bosh-stemcell-bosh-proxmox-kvm-ubuntu-jammy-go-agent-1-234"
 	if got != want {
 		t.Errorf("BuildTemplateName: got %q, want %q", got, want)
 	}
 }
 
-func TestBuildTemplateName_UnderscorePreserved(t *testing.T) {
+func TestBuildTemplateName_UnderscoreReplaced(t *testing.T) {
 	t.Parallel()
-	// Underscores are in the allowed set and are kept intact (not collapsed).
+	// Underscores are invalid in a PVE/DNS name; runs collapse to a single '-'.
 	got := pve.BuildTemplateName("ubuntu__jammy", "2.0")
-	want := "bosh-stemcell-ubuntu__jammy-2.0"
+	want := "bosh-stemcell-ubuntu-jammy-2-0"
 	if got != want {
 		t.Errorf("BuildTemplateName: got %q, want %q", got, want)
 	}
@@ -89,7 +89,7 @@ func TestBuildTemplateName_UnderscorePreserved(t *testing.T) {
 func TestBuildTemplateName_UppercaseNormalized(t *testing.T) {
 	t.Parallel()
 	got := pve.BuildTemplateName("Ubuntu-Jammy", "1.0")
-	want := "bosh-stemcell-ubuntu-jammy-1.0"
+	want := "bosh-stemcell-ubuntu-jammy-1-0"
 	if got != want {
 		t.Errorf("BuildTemplateName: got %q, want %q", got, want)
 	}
@@ -130,8 +130,8 @@ func TestBuildTemplateName_EmptyInputs(t *testing.T) {
 func TestBuildTemplateName_SpecialCharsInVersion(t *testing.T) {
 	t.Parallel()
 	got := pve.BuildTemplateName("ubuntu-jammy", "1.0+build.3")
-	// '+' and spaces → '-'; '.' kept; collapses consecutive dashes.
-	want := "bosh-stemcell-ubuntu-jammy-1.0-build.3"
+	// '+', '.', and spaces → '-'; consecutive replacements collapse to one '-'.
+	want := "bosh-stemcell-ubuntu-jammy-1-0-build-3"
 	if got != want {
 		t.Errorf("BuildTemplateName: got %q, want %q", got, want)
 	}

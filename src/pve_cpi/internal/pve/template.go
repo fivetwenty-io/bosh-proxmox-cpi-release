@@ -41,8 +41,13 @@ type qemuListItem struct {
 // The name is used as the idempotency lookup key for FindTemplateByName: two
 // calls with the same (name, version) produce the same string.
 func BuildTemplateName(name, version string) string {
-	sanitizedName := sanitizeStemcellPart(name)
-	sanitizedVersion := sanitizeStemcellPart(version)
+	// PVE VM names must be valid DNS names (each label is [a-z0-9-]); '_' and
+	// '.' are rejected. Use the DNS-strict sanitizer here rather than
+	// sanitizeStemcellPart (which preserves '.'/'_' for volume/file names) —
+	// e.g. stemcell "...ubuntu-jammy-go_agent" / version "1.1202" would
+	// otherwise yield an underscore/dot the PVE qemu create rejects.
+	sanitizedName := dnsSafeStemcellPart(name)
+	sanitizedVersion := dnsSafeStemcellPart(version)
 
 	base := fmt.Sprintf("bosh-stemcell-%s-%s", sanitizedName, sanitizedVersion)
 	if len(base) > maxStemcellFilenameLen {
@@ -51,6 +56,27 @@ func BuildTemplateName(name, version string) string {
 	}
 
 	return base
+}
+
+// dnsSafeStemcellPart lowercases s and replaces every rune outside [a-z0-9-]
+// with '-' (collapsing consecutive replacements), trimming leading/trailing
+// '-'. Unlike sanitizeStemcellPart, '.' and '_' are NOT preserved: a PVE VM
+// name must be a valid DNS name and the qemu create API rejects both.
+func dnsSafeStemcellPart(s string) string {
+	s = strings.ToLower(s)
+	var buf []byte
+	prevDash := false
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			buf = append(buf, byte(r))
+			prevDash = false
+		} else if !prevDash {
+			buf = append(buf, '-')
+			prevDash = true
+		}
+	}
+
+	return strings.Trim(string(buf), "-")
 }
 
 // CloneQemuVM clones a PVE QEMU VM or template identified by templateVMID on
