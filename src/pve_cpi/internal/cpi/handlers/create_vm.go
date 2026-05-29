@@ -974,6 +974,30 @@ func cloneFromTemplate(
 		log.Int("new_vmid", candidate),
 	)
 
+	// The clone inherits the template's minimal resources (templates are created
+	// with PVE defaults: 512 MiB RAM, 1 core). Apply the requested CPU/memory
+	// shape to the cloned VM — the import-from path sets these in CreateQemuParams
+	// at create time, but a clone must set them explicitly or the VM boots
+	// undersized (e.g. a 512 MiB director that never reaches "running").
+	memStr := strconv.Itoa(shape.memMiB)
+	cores64 := int64(shape.cores)
+	sockets64 := int64(shape.sockets)
+	resourceParams := &sdknodes.UpdateQemuConfigParams{
+		Memory:  &memStr,
+		Cores:   &cores64,
+		Sockets: &sockets64,
+	}
+	if cfgErr := deps.PVE.Nodes().UpdateQemuConfig(ctx, shape.node, strconv.Itoa(candidate), resourceParams); cfgErr != nil {
+		return cpierrors.Wrap(pve.WrapError(cfgErr), fmt.Sprintf(
+			"create_vm: apply cpu/memory to cloned vmid=%d: %s", candidate, cfgErr.Error()))
+	}
+	logger.Info("create_vm: applied cpu/memory to cloned vm",
+		log.Int("new_vmid", candidate),
+		log.Int("cores", shape.cores),
+		log.Int("sockets", shape.sockets),
+		log.Int("memory_mib", shape.memMiB),
+	)
+
 	return nil
 }
 

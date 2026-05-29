@@ -31,8 +31,16 @@ import (
 // CreateQemuClone call and returns a configurable result.
 type cloneNodes struct {
 	sdknodes.Service
-	cloneFn func(ctx context.Context, node, vmid string, params *sdknodes.CreateQemuCloneParams) (*sdknodes.CreateQemuCloneResponse, error)
-	calls   []*sdknodes.CreateQemuCloneParams
+	cloneFn     func(ctx context.Context, node, vmid string, params *sdknodes.CreateQemuCloneParams) (*sdknodes.CreateQemuCloneResponse, error)
+	calls       []*sdknodes.CreateQemuCloneParams
+	updateCalls []*sdknodes.UpdateQemuConfigParams
+}
+
+// UpdateQemuConfig records the post-clone CPU/memory application so tests can
+// assert the cloned VM is resized off the template's minimal defaults.
+func (n *cloneNodes) UpdateQemuConfig(_ context.Context, _, _ string, params *sdknodes.UpdateQemuConfigParams) error {
+	n.updateCalls = append(n.updateCalls, params)
+	return nil
 }
 
 func (n *cloneNodes) CreateQemuClone(ctx context.Context, node, vmid string, params *sdknodes.CreateQemuCloneParams) (*sdknodes.CreateQemuCloneResponse, error) {
@@ -244,6 +252,37 @@ func TestCloneFromTemplate_AutoLinkedCapable(t *testing.T) {
 	wantName := "vm-200"
 	if p.Name == nil || *p.Name != wantName {
 		t.Errorf("Name: want %q, got %v", wantName, p.Name)
+	}
+}
+
+// TestCloneFromTemplate_AppliesShapeCPUMemory verifies the clone path resizes
+// the VM off the template's minimal defaults. Templates are created with PVE
+// defaults (512 MiB / 1 core); without an explicit post-clone UpdateQemuConfig
+// a cloned director boots undersized and never reaches "running".
+func TestCloneFromTemplate_AppliesShapeCPUMemory(t *testing.T) {
+	t.Parallel()
+	n := &cloneNodes{}
+	deps := buildCloneDeps(n, "auto", "local", "dir")
+	shape := buildCloneShape("local", "dir", "qcow2")
+	shape.cores = 8
+	shape.sockets = 1
+	shape.memMiB = 16384
+
+	if err := cloneFromTemplate(context.Background(), deps, log.NewNopLogger(), shape, 207, "vm-207", "pve", 6049); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(n.updateCalls) != 1 {
+		t.Fatalf("expected 1 UpdateQemuConfig call to apply CPU/memory, got %d", len(n.updateCalls))
+	}
+	u := n.updateCalls[0]
+	if u.Memory == nil || *u.Memory != "16384" {
+		t.Errorf("memory: want %q, got %v", "16384", u.Memory)
+	}
+	if u.Cores == nil || *u.Cores != 8 {
+		t.Errorf("cores: want 8, got %v", u.Cores)
+	}
+	if u.Sockets == nil || *u.Sockets != 1 {
+		t.Errorf("sockets: want 1, got %v", u.Sockets)
 	}
 }
 
