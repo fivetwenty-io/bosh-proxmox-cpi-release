@@ -27,7 +27,32 @@ type qemuListItem struct {
 	Tags *string `json:"tags,omitempty"`
 	// Template is true when the VM has been frozen as a PVE template.
 	// PVE omits the field entirely for normal VMs (not false, just absent).
-	Template *bool `json:"template,omitempty"`
+	//
+	// The PVE (Perl-backed) API serialises this boolean as the JSON number 1,
+	// not the JSON literal true, so the field is decoded through pveBool rather
+	// than *bool — a *bool decode fails on the integer and would silently drop
+	// every template from the scan, defeating stemcell-template deduplication.
+	Template *pveBool `json:"template,omitempty"`
+}
+
+// pveBool decodes a PVE API boolean. PVE renders booleans as the JSON numbers
+// 1 and 0 (its API is Perl-backed), but some endpoints — and most fixtures —
+// use the JSON literals true/false, and a handful return the strings "1"/"0".
+// All three encodings, plus null, are accepted; anything else is an error so a
+// genuinely malformed field still surfaces.
+type pveBool bool
+
+// UnmarshalJSON accepts 1/0, true/false, "1"/"0"/"true"/"false", and null.
+func (b *pveBool) UnmarshalJSON(data []byte) error {
+	switch s := strings.Trim(strings.TrimSpace(string(data)), `"`); s {
+	case "1", "true":
+		*b = true
+	case "0", "false", "", "null":
+		*b = false
+	default:
+		return fmt.Errorf("pveBool: cannot decode %q as a PVE boolean", s)
+	}
+	return nil
 }
 
 // BuildTemplateName returns the canonical PVE VM name for a stemcell template.

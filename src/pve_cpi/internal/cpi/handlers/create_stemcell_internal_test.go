@@ -7,9 +7,11 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -601,6 +603,7 @@ type wbTemplateNodes struct {
 	wbMockNodes
 	listQemuFn           func(ctx context.Context, node string, params *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error)
 	createQemuTemplateFn func(ctx context.Context, node, vmid string, params *sdknodes.CreateQemuTemplateParams) (*sdknodes.CreateQemuTemplateResponse, error)
+	deleteQemuFn         func(ctx context.Context, node, vmid string, params *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error)
 }
 
 func (n *wbTemplateNodes) ListQemu(ctx context.Context, node string, params *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
@@ -845,9 +848,10 @@ func TestEnsureTemplateVM_Idempotent_ExistingTemplate(t *testing.T) {
 			return "", nil
 		},
 	}
-	// BuildTemplateName("ubuntu-jammy","1.0") = "bosh-stemcell-ubuntu-jammy-1.0"
+	// BuildTemplateName("ubuntu-jammy","1.0") = "bosh-stemcell-ubuntu-jammy-1-0"
+	// (the version's "." is replaced by "-" by the DNS-safe sanitiser).
 	nodes := &wbTemplateNodes{
-		listQemuFn: listQemuOneTemplate("bosh-stemcell-ubuntu-jammy-1.0", existingVMID),
+		listQemuFn: listQemuOneTemplate("bosh-stemcell-ubuntu-jammy-1-0", existingVMID),
 	}
 	storage := &wbTemplateStorage{
 		deleteVolumeIfExistsFn: func(_ context.Context, _, _, _ string) (bool, error) {
@@ -1248,5 +1252,128 @@ func TestEnsureTemplateVM_PoolAssignmentError_ReturnsError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "bosh-stemcells") {
 		t.Errorf("error %q does not mention pool name", err.Error())
+	}
+}
+
+// listQemuTemplateWithTag returns a ListQemu stub reporting a single frozen
+// template carrying both a name and a tags string. PVE emits the template flag
+// as the integer 1 (Perl-backed API), matching the real wire shape.
+func listQemuTemplateWithTag(name, tags string, vmid int64) func(ctx context.Context, node string, params *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
+	return func(_ context.Context, _ string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
+		raw := json.RawMessage(fmt.Sprintf(`{"vmid":%d,"name":%q,"tags":%q,"template":1}`, vmid, name, tags))
+		resp := sdknodes.ListQemuResponse{raw}
+		return &resp, nil
+	}
+}
+
+// TestEnsureTemplateVM_DedupBySHATag_AcrossNameSchemeChange verifies that an
+// existing template is reused when its sha tag matches, even though its NAME
+// differs from the freshly-derived BuildTemplateName output. This is the
+// dot-vs-dash naming-scheme change (commit 2b01653): keying dedup solely on the
+// mutable display name orphaned identical-disk templates and created duplicates.
+func TestEnsureTemplateVM_DedupBySHATag_AcrossNameSchemeChange(t *testing.T) {
+	t.Parallel()
+
+	const existingVMID = int64(30203)
+	const sha8 = "891b3b74"
+	const fullSHA = sha8 + "00000000000000000000000000000000000000000000000000000000"
+	// Existing template carries the OLD dot-form name; the new derivation yields
+	// the dash form, so a name-only lookup would miss and create a duplicate.
+	const oldName = "bosh-stemcell-ubuntu-noble-1.364"
+
+	var createCalled bool
+	qemu := &wbMockQEMU{
+		createFn: func(_ context.Context, _ string, _ map[string]any) (string, error) {
+			createCalled = true
+			return "", nil
+		},
+	}
+	nodes := &wbTemplateNodes{
+		listQemuFn: listQemuTemplateWithTag(oldName, "bosh-stemcell-sha-"+sha8, existingVMID),
+	}
+	deps := buildEnsureTemplateDeps(qemu, nodes, &wbMockTasks{}, &wbTemplateStorage{})
+	deps.PVE.(*wbTemplateMockClient).clusterSvc = &wbClusterForAlloc{
+		listResourcesFn: listClusterResourcesEmpty(),
+	}
+
+	// cp produces the NEW dash-form name "bosh-stemcell-ubuntu-noble-1-364".
+	cp := stemcellCloudProps{Name: "ubuntu-noble", Version: "1.364"}
+	vmid, err := ensureTemplateVM(context.Background(), deps, "pve-node1", "nfs", "noble.qcow2", fullSHA, true, cp)
+	if err != nil {
+		t.Fatalf("ensureTemplateVM returned error: %v", err)
+	}
+	if vmid != existingVMID {
+		t.Errorf("vmid = %d; want %d (reuse by sha tag across name-scheme change)", vmid, existingVMID)
+	}
+	if createCalled {
+		t.Error("QEMU.Create must NOT be called: existing template matched by sha tag")
+	}
+}
+
+// deleteQemuFn lets wbTemplateNodes record/destroy a VM in race-reconcile tests.
+func (n *wbTemplateNodes) DeleteQemu(ctx context.Context, node, vmid string, params *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
+	if n.deleteQemuFn != nil {
+		return n.deleteQemuFn(ctx, node, vmid, params)
+	}
+	raw := sdknodes.DeleteQemuResponse(`""`)
+	return &raw, nil
+}
+
+// TestEnsureTemplateVM_LostRace_DeletesDuplicateAndReusesSurvivor verifies the
+// TOCTOU reconcile: when a concurrent create_stemcell froze a lower-VMID twin
+// in the window between our lookup and our freeze, ensureTemplateVM deletes the
+// template it just created and returns the survivor's VMID.
+func TestEnsureTemplateVM_LostRace_DeletesDuplicateAndReusesSurvivor(t *testing.T) {
+	const sha8 = "891b3b74"
+	const fullSHA = sha8 + "00000000000000000000000000000000000000000000000000000000"
+	const survivorVMID = int64(1) // impossibly low → guaranteed < our random allocation
+
+	var listCalls int
+	var allocatedVMID int64
+	var deletedVMID string
+
+	qemu := &wbMockQEMU{
+		createFn: func(_ context.Context, _ string, params map[string]any) (string, error) {
+			if v, ok := params["vmid"].(int); ok {
+				allocatedVMID = int64(v)
+			}
+			return "", nil
+		},
+	}
+	nodes := &wbTemplateNodes{}
+	nodes.listQemuFn = func(_ context.Context, _ string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
+		listCalls++
+		// First two scans are the pre-create lookups (sha tag, then name): empty.
+		// Any later scan is the post-freeze reconcile: report the lower-VMID twin.
+		if listCalls <= 2 {
+			empty := sdknodes.ListQemuResponse{}
+			return &empty, nil
+		}
+		raw := json.RawMessage(fmt.Sprintf(`{"vmid":%d,"name":"bosh-stemcell-x","tags":"bosh-stemcell-sha-%s","template":1}`, survivorVMID, sha8))
+		resp := sdknodes.ListQemuResponse{raw}
+		return &resp, nil
+	}
+	nodes.deleteQemuFn = func(_ context.Context, _, vmid string, _ *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
+		deletedVMID = vmid
+		raw := sdknodes.DeleteQemuResponse(`""`)
+		return &raw, nil
+	}
+
+	deps := buildEnsureTemplateDeps(qemu, nodes, &wbMockTasks{}, &wbTemplateStorage{})
+	deps.PVE.(*wbTemplateMockClient).clusterSvc = &wbClusterForAlloc{
+		listResourcesFn: listClusterResourcesEmpty(),
+	}
+
+	cp := stemcellCloudProps{Name: "ubuntu-noble", Version: "1.364"}
+	vmid, err := ensureTemplateVM(context.Background(), deps, "pve-node1", "nfs", "noble.qcow2", fullSHA, true, cp)
+	if err != nil {
+		t.Fatalf("ensureTemplateVM returned error: %v", err)
+	}
+	if vmid != survivorVMID {
+		t.Errorf("vmid = %d; want survivor %d", vmid, survivorVMID)
+	}
+	wantDeleted := strconv.FormatInt(allocatedVMID, 10)
+	if deletedVMID != wantDeleted {
+		t.Errorf("deleted VMID = %q; want our just-created allocation %q", deletedVMID, wantDeleted)
 	}
 }

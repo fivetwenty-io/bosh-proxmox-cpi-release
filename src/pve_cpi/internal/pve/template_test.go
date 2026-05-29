@@ -852,3 +852,87 @@ func TestFindTemplateBySHATag_EmptyNode(t *testing.T) {
 		t.Fatal("FindTemplateBySHATag: expected error for empty node")
 	}
 }
+
+// ---- regression: PVE serialises booleans as integers (0/1) ----
+//
+// The real PVE API (Perl-backed) returns "template":1 for frozen templates,
+// not the JSON boolean "template":true. These tests build the list response
+// from raw JSON with the integer shape to guard the dedup lookups against
+// regressing to a *bool decode that skips every template.
+
+// makeListQemuResponseRaw builds a ListQemuResponse directly from raw JSON
+// object strings, bypassing the *bool-typed listQemuItem helper so tests can
+// reproduce PVE's integer-boolean wire shape verbatim.
+func makeListQemuResponseRaw(objs ...string) *sdknodes.ListQemuResponse {
+	resp := make(sdknodes.ListQemuResponse, 0, len(objs))
+	for _, o := range objs {
+		resp = append(resp, json.RawMessage(o))
+	}
+	return &resp
+}
+
+func TestFindTemplateByName_MatchesIntegerTemplateFlag(t *testing.T) {
+	t.Parallel()
+	const wantVMID = int64(30231)
+	const wantName = "bosh-stemcell-bosh-openstack-kvm-ubuntu-noble-1-364"
+
+	c := newFindTemplateClient(func(_ context.Context, _ string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
+		return makeListQemuResponseRaw(
+			`{"vmid":101,"name":"some-vm"}`,
+			`{"vmid":30231,"name":"`+wantName+`","template":1}`,
+		), nil
+	})
+
+	vmid, found, err := pve.FindTemplateByName(context.Background(), c, "pve", wantName)
+	if err != nil {
+		t.Fatalf("FindTemplateByName: unexpected error: %v", err)
+	}
+	if !found {
+		t.Fatal("FindTemplateByName: expected found=true for integer template flag, got false")
+	}
+	if vmid != wantVMID {
+		t.Errorf("FindTemplateByName: vmid = %d, want %d", vmid, wantVMID)
+	}
+}
+
+func TestFindTemplateBySHATag_MatchesIntegerTemplateFlag(t *testing.T) {
+	t.Parallel()
+	const sha8 = "891b3b74"
+	const wantVMID = int64(30231)
+
+	c := newFindTemplateClient(func(_ context.Context, _ string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
+		return makeListQemuResponseRaw(
+			`{"vmid":30231,"name":"bosh-stemcell-x","tags":"bosh-stemcell-sha-` + sha8 + `","template":1}`,
+		), nil
+	})
+
+	vmid, found, err := pve.FindTemplateBySHATag(context.Background(), c, "pve", sha8)
+	if err != nil {
+		t.Fatalf("FindTemplateBySHATag: unexpected error: %v", err)
+	}
+	if !found {
+		t.Fatal("FindTemplateBySHATag: expected found=true for integer template flag, got false")
+	}
+	if vmid != wantVMID {
+		t.Errorf("FindTemplateBySHATag: vmid = %d, want %d", vmid, wantVMID)
+	}
+}
+
+func TestFindTemplateByName_IntegerZeroTemplateFlagNotMatched(t *testing.T) {
+	t.Parallel()
+	const name = "bosh-stemcell-x"
+	c := newFindTemplateClient(func(_ context.Context, _ string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
+		// template:0 is a regular VM that happens to share the name; must NOT match.
+		return makeListQemuResponseRaw(
+			`{"vmid":42,"name":"` + name + `","template":0}`,
+		), nil
+	})
+
+	_, found, err := pve.FindTemplateByName(context.Background(), c, "pve", name)
+	if err != nil {
+		t.Fatalf("FindTemplateByName: unexpected error: %v", err)
+	}
+	if found {
+		t.Fatal("FindTemplateByName: template:0 must not match")
+	}
+}

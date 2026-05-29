@@ -12,6 +12,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -528,8 +529,32 @@ func ensureTemplateVM(
 	// Step 1: Build deterministic template name (idempotency key).
 	templateName := pve.BuildTemplateName(cp.Name, cp.Version)
 
-	// Step 2: Check for existing template with the same name. If found, return
-	// the existing VMID without creating a new VM or deleting the source.
+	// Step 2a: Prefer the stable sha-tag identity. The bosh-stemcell-sha-<sha8>
+	// tag is derived from the disk content, so it survives changes to the
+	// template-name derivation (e.g. the dot→dash DNS-safe rename) that would
+	// otherwise orphan an identical-disk template and create a duplicate. Only
+	// attempted when sha256hex is known — the light-preuploaded path has no
+	// local image to hash and falls through to the name lookup below.
+	if sha256hex != "" {
+		shaTag8 := sha256hex
+		if len(shaTag8) > 8 {
+			shaTag8 = shaTag8[:8]
+		}
+		shaVMID, shaFound, shaErr := pve.FindTemplateBySHATag(ctx, deps.PVE, templateNode, shaTag8)
+		if shaErr != nil {
+			return 0, fmt.Errorf("ensureTemplateVM: lookup existing template by sha tag %q: %w", shaTag8, shaErr)
+		}
+		if shaFound {
+			logger.Info("ensureTemplateVM: reusing existing template (matched by sha tag)",
+				log.String("sha8", shaTag8),
+				log.Int64("vmid", shaVMID),
+			)
+			return shaVMID, nil
+		}
+	}
+
+	// Step 2b: Fall back to the deterministic name. Covers the light-preuploaded
+	// path (no sha available) and any template created before sha tagging.
 	existingVMID, found, findErr := pve.FindTemplateByName(ctx, deps.PVE, templateNode, templateName)
 	if findErr != nil {
 		return 0, fmt.Errorf("ensureTemplateVM: lookup existing template %q: %w", templateName, findErr)
@@ -594,6 +619,38 @@ func ensureTemplateVM(
 		log.Int64("vmid", allocatedVMID),
 	)
 
+	// Step 5b: Race reconciliation. The Step-2 dedup lookup and this freeze are
+	// not atomic: a concurrent create_stemcell for the same stemcell can pass its
+	// own lookup (seeing no frozen template, because ours was not yet frozen) and
+	// create a second template in the gap. Now that our template is frozen — and
+	// therefore visible to every scanner — re-scan and converge on the lowest
+	// VMID. If an older (lower-VMID) twin exists, we lost the race: delete the
+	// template we just created and return the survivor. This makes concurrent
+	// create_stemcell calls idempotent without cross-process locking.
+	winnerVMID := allocatedVMID
+	lostRace := false
+	if survivor, recErr := reconcileTemplateRace(ctx, deps, templateNode, templateName, sha256hex); recErr != nil {
+		// Non-fatal: a failed re-scan leaves our freshly-frozen template in place.
+		// A later create_stemcell will reconcile via the Step-2 lookup.
+		logger.Warn("ensureTemplateVM: race reconcile scan failed (non-fatal; keeping new template)",
+			log.Int64("vmid", allocatedVMID),
+			log.Err(recErr),
+		)
+	} else if survivor != 0 && survivor < allocatedVMID {
+		lostRace = true
+		winnerVMID = survivor
+		logger.Info("ensureTemplateVM: lost create race, deleting duplicate and reusing survivor",
+			log.Int64("deleted_vmid", allocatedVMID),
+			log.Int64("survivor_vmid", survivor),
+		)
+		if delErr := deleteTemplateVM(ctx, deps, templateNode, allocatedVMID, logger); delErr != nil {
+			logger.Warn("ensureTemplateVM: failed to delete duplicate template after lost race (non-fatal)",
+				log.Int64("vmid", allocatedVMID),
+				log.Err(delErr),
+			)
+		}
+	}
+
 	// Step 6: Pool assignment — assign the frozen template to the configured
 	// PVE resource pool when StemcellTemplatePool is set. Pool assignment uses
 	// PUT /pools/{poolid} with vms=[vmid] via pve.AssignVMToPool.
@@ -604,7 +661,9 @@ func ensureTemplateVM(
 	// was already frozen and is usable, but returning an error ensures the CPI
 	// reports a clear failure so the operator can fix the config and retry (the
 	// idempotency check in step 2 will reuse the existing template on the next call).
-	if deps.Config.StemcellTemplatePool != "" {
+	// Skipped when we lost the race: the survivor was already pool-assigned by
+	// the call that created it, and our template is being deleted.
+	if !lostRace && deps.Config.StemcellTemplatePool != "" {
 		if poolErr := pve.AssignVMToPool(ctx, deps.PVE, deps.Config.StemcellTemplatePool, allocatedVMID); poolErr != nil {
 			return 0, fmt.Errorf("ensureTemplateVM: assign template vmid=%d to pool %q: %w",
 				allocatedVMID, deps.Config.StemcellTemplatePool, poolErr)
@@ -635,7 +694,70 @@ func ensureTemplateVM(
 		}
 	}
 
-	return allocatedVMID, nil
+	return winnerVMID, nil
+}
+
+// reconcileTemplateRace returns the lowest VMID of a frozen template matching
+// the stemcell identity, used after freeze to detect a concurrently-created
+// duplicate. It prefers the stable sha tag (when sha256hex is known) and falls
+// back to the deterministic name. A return of (0, nil) means no matching
+// template was visible — treated by the caller as "no duplicate".
+func reconcileTemplateRace(ctx context.Context, deps Deps, templateNode, templateName, sha256hex string) (int64, error) {
+	if sha256hex != "" {
+		sha8 := sha256hex
+		if len(sha8) > 8 {
+			sha8 = sha8[:8]
+		}
+		vmid, found, err := pve.FindTemplateBySHATag(ctx, deps.PVE, templateNode, sha8)
+		if err != nil {
+			return 0, err
+		}
+		if found {
+			return vmid, nil
+		}
+		return 0, nil
+	}
+
+	vmid, found, err := pve.FindTemplateByName(ctx, deps.PVE, templateNode, templateName)
+	if err != nil {
+		return 0, err
+	}
+	if found {
+		return vmid, nil
+	}
+	return 0, nil
+}
+
+// deleteTemplateVM destroys a template VM (purge + destroy unreferenced disks)
+// and awaits the destroy task. A not-found result is treated as success: the
+// VM is already gone, which is the desired end state. Used by the race-reconcile
+// path to remove a duplicate template after losing a concurrent create.
+func deleteTemplateVM(ctx context.Context, deps Deps, node string, vmid int64, logger *log.Logger) error {
+	purge := true
+	destroyDisks := true
+	vmidStr := strconv.FormatInt(vmid, 10)
+
+	resp, err := deps.PVE.Nodes().DeleteQemu(ctx, node, vmidStr, &sdknodes.DeleteQemuParams{
+		Purge:                    &purge,
+		DestroyUnreferencedDisks: &destroyDisks,
+	})
+	if err != nil {
+		if pve.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("deleteTemplateVM: delete vmid=%d: %w", vmid, err)
+	}
+
+	if resp != nil {
+		upid, upidErr := pve.UPIDFromRaw(*resp)
+		if upidErr == nil && upid != "" {
+			if awaitErr := pve.AwaitTaskWithLogger(ctx, deps.PVE, node, upid, logger,
+				pve.WithMaxWait(pve.StemcellMaxWait)); awaitErr != nil {
+				return fmt.Errorf("deleteTemplateVM: await destroy vmid=%d upid=%s: %w", vmid, upid, awaitErr)
+			}
+		}
+	}
+	return nil
 }
 
 // attemptCreateTemplateVM builds CreateQemuParams for a minimal template VM and
