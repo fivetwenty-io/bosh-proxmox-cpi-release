@@ -43,6 +43,7 @@ import re
 import shlex
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -484,13 +485,22 @@ def _ssh_opts() -> "list[str]":
 
 
 def _pve_reboot_cid(cid: str) -> bool:
-    """Reboot a VM by PVE VMID via `qm reboot` on the PVE host.
+    """Hard-reset a VM by PVE VMID via `qm reset` on the PVE host.
 
     bosh cloud-check resolutions are unreliable on this director (they abort
     with an empty-deployment error), so unresponsive agents are recovered by
-    rebooting the VM directly: the bosh-agent restarts on boot and
+    resetting the VM directly: the bosh-agent restarts on boot and
     re-establishes its director NATS connection. The CPI uses the PVE VMID as
-    the cloud ID, so *cid* is the VMID. Best-effort: returns False on any error.
+    the cloud ID, so *cid* is the VMID.
+
+    `qm reset` is used rather than `qm reboot`: the CPI sets `agent: enabled=1`
+    on every VM, so `qm reboot`/`qm shutdown` attempt an ACPI/guest-agent
+    coordinated reboot and block on the QEMU Guest Agent. The Noble stemcell
+    does not run qemu-guest-agent, so those commands time out with
+    "QEMU Guest Agent is not running" and the VM is never actually rebooted.
+    `qm reset` is an immediate hardware reset that needs no guest cooperation.
+
+    Best-effort: returns False on any error.
     """
     try:
         vmid = _coerce_vmid(cid)
@@ -498,7 +508,7 @@ def _pve_reboot_cid(cid: str) -> bool:
         return False
     pve_host = capture("bosh", "int", str(BOSH_VARS), "--path=/pve_host")
     result = subprocess.run(
-        ["ssh", *_ssh_opts(), f"root@{pve_host}", "qm", "reboot", str(vmid)],
+        ["ssh", *_ssh_opts(), f"root@{pve_host}", "qm", "reset", str(vmid)],
         capture_output=True, text=True, check=False,
     )
     return result.returncode == 0
@@ -513,8 +523,8 @@ def wait_agents_responsive(timeout_s: int, settle_reads: int = 2, poll_s: int = 
     connection re-authorization (see manifests/bosh/nats-tuning.yml header), so
     one agent can show "unresponsive agent" transiently and sink an
     otherwise-ready deploy. This preflight waits for a run of consecutive
-    all-responsive reads, and issues `cloud-check --auto` to reboot any agent
-    that stays unresponsive, so the deploy starts from a converged baseline.
+    all-responsive reads, and hard-resets (qm reset) any agent that stays
+    unresponsive, so the deploy starts from a converged baseline.
 
     Returns True when the deployment is absent (nothing to wait for) or all
     agents are responsive; False on timeout.
@@ -538,19 +548,91 @@ def wait_agents_responsive(timeout_s: int, settle_reads: int = 2, poll_s: int = 
             clean_streak = 0
             names = ", ".join(i for i, _ in bad)
             print(f"    unresponsive: {names}")
-            # A VM reboot takes ~90s to come back; rate-limit recovery kicks so
-            # we do not pile reboots on a VM that is still booting.
+            # A VM reset takes ~90s to come back; rate-limit recovery kicks so
+            # we do not pile resets on a VM that is still booting.
             if time.time() - last_kick > 120:
                 last_kick = time.time()
                 for inst, cid in bad:
                     if not cid:
-                        print(f"    {inst}: no vm_cid, cannot reboot")
+                        print(f"    {inst}: no vm_cid, cannot reset")
                         continue
                     ok = _pve_reboot_cid(cid)
-                    print(f"    reboot {inst} (cid {cid}): {'issued' if ok else 'FAILED'}")
+                    print(f"    reset {inst} (cid {cid}): {'issued' if ok else 'FAILED'}")
         time.sleep(poll_s)
     print(f"    timed out after {timeout_s}s waiting for responsive agents")
     return False
+
+
+def _run_deploy_with_watchdog(deploy_cmd: list[str], stall_s: int) -> int:
+    """Run a bosh deploy, cancelling its task if progress stalls.
+
+    BOSH has no deploy-level timeout. A director<->agent mbus RPC lost during a
+    NATS authorization-reload reconnect gap (bosh-nats-sync regenerates
+    auth.json and SIGHUPs nats every poll_user_sync seconds; nats drops the
+    cert-mapped agent connections it re-evaluates — see
+    manifests/bosh/nats-tuning.yml) can wedge a long-running pre-stop / drain
+    get_task poll: the reply is lost, the director's poll never recovers, and
+    the deploy task hangs indefinitely while holding the deployment lock
+    (observed at 9h). The hung task never errors, so the retry loop below — which
+    only fires on a non-zero exit — can never recover from it.
+
+    `bosh deploy` streams staged progress to stdout continuously, so a hang
+    shows up as stdout going silent. This watchdog times the gap between output
+    lines; once it exceeds stall_s it parses the running task id from the stream
+    and `bosh cancel-task`s it. Cancelling makes `bosh deploy` exit non-zero and
+    releases the lock, so the existing recover-and-retry loop converges instead
+    of blocking forever. stall_s must exceed the longest legitimately-silent
+    step (UAA boot, package install); 900s is well clear of those on this lab
+    (compiled releases, so no compilation).
+    """
+    proc = subprocess.Popen(
+        deploy_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, bufsize=1,
+    )
+    state = {"last": time.monotonic(), "task_id": None, "cancelled": False}
+    task_re = re.compile(r"Task (\d+)")
+
+    def pump() -> None:
+        # proc.stdout is line-buffered; this blocks per line and updates the
+        # liveness timestamp, so silence (a hang) is detectable by the watcher.
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            state["last"] = time.monotonic()
+            match = task_re.search(line)
+            if match:
+                state["task_id"] = match.group(1)
+            sys.stdout.write(line)
+            sys.stdout.flush()
+
+    pump_thread = threading.Thread(target=pump, daemon=True)
+    pump_thread.start()
+
+    while proc.poll() is None:
+        time.sleep(5)
+        if state["cancelled"] or time.monotonic() - state["last"] <= stall_s:
+            continue
+        state["cancelled"] = True
+        tid = state["task_id"]
+        print(
+            f"\n>>> deploy stalled: no progress for {stall_s}s; "
+            f"cancelling task {tid or '(unknown)'} to release the lock and retry"
+        )
+        if tid:
+            subprocess.run(
+                ["bosh", "-e", ENV, "-n", "cancel-task", tid], check=False,
+            )
+        else:
+            # No task id seen yet (stall before the task started); kill the
+            # client so the loop can retry.
+            proc.terminate()
+
+    pump_thread.join(timeout=10)
+    rc = proc.wait()
+    # A stall-cancel can still let bosh exit 0 in a race; force non-zero so the
+    # caller treats it as a failed attempt and retries.
+    if state["cancelled"] and rc == 0:
+        return 1
+    return rc
 
 
 def cmd_bosh_deploy(extra: list[str]) -> None:
@@ -596,15 +678,22 @@ def cmd_bosh_deploy(extra: list[str]) -> None:
     # SCRIPTS_CF_DEPLOY_ATTEMPTS; a persistent (non-flap) failure still
     # surfaces after the cap.
     max_attempts = max(1, int(os.environ.get("SCRIPTS_CF_DEPLOY_ATTEMPTS", "8") or "8"))
+    # Watchdog stall threshold: if the deploy emits no progress for this long the
+    # task is cancelled so a wedged pre-stop/drain poll cannot hang forever
+    # holding the lock. 0 disables the watchdog (plain blocking run).
+    stall_s = int(os.environ.get("SCRIPTS_CF_DEPLOY_STALL_S", "900") or "900")
     for attempt in range(1, max_attempts + 1):
-        result = subprocess.run(deploy_cmd, check=False)
-        if result.returncode == 0:
+        if stall_s > 0:
+            rc = _run_deploy_with_watchdog(deploy_cmd, stall_s)
+        else:
+            rc = subprocess.run(deploy_cmd, check=False).returncode
+        if rc == 0:
             return
         if attempt == max_attempts:
-            sys.exit(result.returncode)
+            sys.exit(rc)
         print(
             f"\n>>> deploy attempt {attempt}/{max_attempts} failed "
-            f"(rc={result.returncode}); recovering agents and retrying"
+            f"(rc={rc}); recovering agents and retrying"
         )
         # cloud-check resolutions are unreliable on this director (they abort
         # with an empty-deployment error), so converge agents the same way the
