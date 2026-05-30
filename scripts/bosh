@@ -55,6 +55,11 @@ CPI_OPS = BOSH_DIR / "cpi.yml"
 OS_CONF_OPS = BOSH_DIR / "os-conf.yml"
 NATS_TUNING_OPS = BOSH_DIR / "nats-tuning.yml"
 HM_TUNING_OPS = BOSH_DIR / "hm-tuning.yml"
+# Reliable key-based SSH access to the director (os-conf user_add; no apt).
+# The director VM is created with the PVE QGA channel disabled, so
+# `qm guest exec` is unavailable — SSH via the jumpbox user is the only
+# dependable shell.  jumpbox_ssh already lives in creds.yml (vars-store).
+JUMPBOX_OPS = BOSH_DEPLOYMENT_DIR / "jumpbox-user.yml"
 CLOUD_CONFIG = BOSH_DIR / "cloud-config.yml"
 EMPTYVM = BOSH_DIR / "emptyvm.yml"
 PVE_GUEST_AGENT_RC = MANIFESTS / "runtime-configs" / "pve-guest-agent.yml"
@@ -155,6 +160,7 @@ def cmd_create_env(args: list[str]) -> int:
         "-o", str(OS_CONF_OPS),
         "-o", str(NATS_TUNING_OPS),
         "-o", str(HM_TUNING_OPS),
+        "-o", str(JUMPBOX_OPS),
         *env_network_ops(),
         "-l", str(VARS),
         "-v", "director_name=ocfp-mgmt",
@@ -166,21 +172,19 @@ def cmd_create_env(args: list[str]) -> int:
 
 
 def _state_is_empty() -> bool:
-    """Return True when state.json is absent or holds no BOSH state.
+    """Return True when state.json is absent or records no live director.
 
-    Parses the file as JSON and checks for a top-level `bosh:` or
-    `deployments` key, which are the fields BOSH writes once a
-    create-env run has produced real state.  An empty object `{}`, a
-    parse error (file corrupted / truncated), or an absent file all
-    resolve to True so that downstream callers default to "do the work"
-    rather than silently skip teardown.
+    bosh-init / `bosh create-env` writes the director VM identity at the
+    top level of state.json as `current_vm_cid` (plus `director_id`,
+    `disks`, `stemcells`).  A non-empty `current_vm_cid` is the canonical
+    signal that a director VM exists and must be torn down.  An empty
+    object `{}`, an absent file, or a state with no `current_vm_cid`
+    resolve to True (nothing to delete).
 
-    Conservative on JSON decode error: treats malformed content as
-    non-empty is WRONG for teardown safety — we want "do the work"
-    which means returning True (state looks empty, run delete-env).
-    Actually: returning True means "skip teardown" in cmd_teardown, so
-    corrupted state should return False (non-empty) to avoid skipping
-    a real teardown.  Corrupted state file → operator must inspect.
+    On JSON decode error the state file is malformed: return False
+    (non-empty) so cmd_teardown does NOT skip — it runs delete-env, which
+    fails loudly and prompts the operator to inspect rather than silently
+    leaving a real director VM orphaned.
     """
     if not STATE.exists():
         return True
@@ -196,8 +200,11 @@ def _state_is_empty() -> bool:
         return False
     if not isinstance(data, dict):
         return False
-    # BOSH state.json contains a "bosh" key once create-env succeeds.
-    # Older state formats may use a "deployments" key.
+    # A deployed director records its VM cid in `current_vm_cid`.
+    # Tolerate older/alternate formats that nested under `bosh` or
+    # tracked `deployments`.
+    if data.get("current_vm_cid"):
+        return False
     return "bosh" not in data and "deployments" not in data
 
 
@@ -216,6 +223,7 @@ def cmd_teardown(args: list[str]) -> int:
         "-o", str(OS_CONF_OPS),
         "-o", str(NATS_TUNING_OPS),
         "-o", str(HM_TUNING_OPS),
+        "-o", str(JUMPBOX_OPS),
         *env_network_ops(),
         "-l", str(VARS),
         "-v", "director_name=ocfp-mgmt",

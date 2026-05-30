@@ -476,55 +476,24 @@ def _unresponsive_instances(rows: "list[dict]") -> "list[tuple[str, str]]":
     ]
 
 
-def _ssh_opts() -> "list[str]":
-    """SSH options for reaching the PVE host (mirrors unstick-agent)."""
-    opts = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
-    if os.environ.get("SCRIPTS_CF_SSH_UNSAFE") == "1":
-        opts += ["-o", "StrictHostKeyChecking=no"]
-    return opts
-
-
-def _pve_reboot_cid(cid: str) -> bool:
-    """Hard-reset a VM by PVE VMID via `qm reset` on the PVE host.
-
-    bosh cloud-check resolutions are unreliable on this director (they abort
-    with an empty-deployment error), so unresponsive agents are recovered by
-    resetting the VM directly: the bosh-agent restarts on boot and
-    re-establishes its director NATS connection. The CPI uses the PVE VMID as
-    the cloud ID, so *cid* is the VMID.
-
-    `qm reset` is used rather than `qm reboot`: the CPI sets `agent: enabled=1`
-    on every VM, so `qm reboot`/`qm shutdown` attempt an ACPI/guest-agent
-    coordinated reboot and block on the QEMU Guest Agent. The Noble stemcell
-    does not run qemu-guest-agent, so those commands time out with
-    "QEMU Guest Agent is not running" and the VM is never actually rebooted.
-    `qm reset` is an immediate hardware reset that needs no guest cooperation.
-
-    Best-effort: returns False on any error.
-    """
-    try:
-        vmid = _coerce_vmid(cid)
-    except ValueError:
-        return False
-    pve_host = capture("bosh", "int", str(BOSH_VARS), "--path=/pve_host")
-    result = subprocess.run(
-        ["ssh", *_ssh_opts(), f"root@{pve_host}", "qm", "reset", str(vmid)],
-        capture_output=True, text=True, check=False,
-    )
-    return result.returncode == 0
-
-
 def wait_agents_responsive(timeout_s: int, settle_reads: int = 2, poll_s: int = 15) -> bool:
     """Block until every agent in DEPLOYMENT answers the director, or *timeout_s*.
 
     cf-deployment's "Preparing deployment" phase issues get_state to every
     instance and aborts the whole deploy if any single one times out (45s). On
-    this lab the director<->agent NATS RPCs are intermittently lost during
-    connection re-authorization (see manifests/bosh/nats-tuning.yml header), so
-    one agent can show "unresponsive agent" transiently and sink an
-    otherwise-ready deploy. This preflight waits for a run of consecutive
-    all-responsive reads, and hard-resets (qm reset) any agent that stays
-    unresponsive, so the deploy starts from a converged baseline.
+    this lab the director<->agent NATS RPCs are intermittently lost while a new
+    or changed agent is (re)authorized onto NATS (see
+    manifests/bosh/nats-tuning.yml header), so an agent can show "unresponsive
+    agent" transiently. The agent's NATS client reconnects on its own within a
+    few seconds, so this preflight is PASSIVE: it only waits for a run of
+    consecutive all-responsive reads and lets transient churn self-heal.
+
+    It deliberately does NOT reset/restart unresponsive agents. An earlier
+    version issued `qm reset` on any agent that looked unresponsive; because the
+    churn is transient and self-healing, that reset (≈90s of real downtime)
+    fought the recovery and made the deploy flap — resetting agents that would
+    have answered on their own. Recovery is left to the agent's own reconnect
+    and to the retry loop in cmd_bosh_deploy.
 
     Returns True when the deployment is absent (nothing to wait for) or all
     agents are responsive; False on timeout.
@@ -532,7 +501,6 @@ def wait_agents_responsive(timeout_s: int, settle_reads: int = 2, poll_s: int = 
     banner("agent-stable preflight")
     deadline = time.time() + timeout_s
     clean_streak = 0
-    last_kick = 0.0
     while time.time() < deadline:
         rows = _list_instances_json()
         if rows is None:
@@ -547,17 +515,7 @@ def wait_agents_responsive(timeout_s: int, settle_reads: int = 2, poll_s: int = 
         else:
             clean_streak = 0
             names = ", ".join(i for i, _ in bad)
-            print(f"    unresponsive: {names}")
-            # A VM reset takes ~90s to come back; rate-limit recovery kicks so
-            # we do not pile resets on a VM that is still booting.
-            if time.time() - last_kick > 120:
-                last_kick = time.time()
-                for inst, cid in bad:
-                    if not cid:
-                        print(f"    {inst}: no vm_cid, cannot reset")
-                        continue
-                    ok = _pve_reboot_cid(cid)
-                    print(f"    reset {inst} (cid {cid}): {'issued' if ok else 'FAILED'}")
+            print(f"    unresponsive (waiting for self-heal): {names}")
         time.sleep(poll_s)
     print(f"    timed out after {timeout_s}s waiting for responsive agents")
     return False
@@ -693,12 +651,12 @@ def cmd_bosh_deploy(extra: list[str]) -> None:
             sys.exit(rc)
         print(
             f"\n>>> deploy attempt {attempt}/{max_attempts} failed "
-            f"(rc={rc}); recovering agents and retrying"
+            f"(rc={rc}); waiting for agents to settle and retrying"
         )
-        # cloud-check resolutions are unreliable on this director (they abort
-        # with an empty-deployment error), so converge agents the same way the
-        # preflight does: reboot any unresponsive VM, then wait for a stable
-        # all-responsive baseline before the next attempt.
+        # Transient "unresponsive agent" churn self-heals as the agent's NATS
+        # client reconnects; wait passively for a stable all-responsive baseline
+        # before the next attempt rather than resetting VMs (which fought the
+        # self-heal and caused the deploy to flap).
         wait_agents_responsive(min(preflight_s, 300) if preflight_s else 300)
         print(">>> sleeping 30s before retry")
         time.sleep(30)
