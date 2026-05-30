@@ -284,6 +284,11 @@ func TestCloneFromTemplate_AppliesShapeCPUMemory(t *testing.T) {
 	if u.Sockets == nil || *u.Sockets != 1 {
 		t.Errorf("sockets: want 1, got %v", u.Sockets)
 	}
+	// The stemcell template carries agent=enabled=0; the clone must re-enable
+	// the QEMU guest agent channel so QGA can reach the guest out-of-band.
+	if u.Agent == nil || *u.Agent != "enabled=1" {
+		t.Errorf("agent: want %q, got %v", "enabled=1", u.Agent)
+	}
 }
 
 // TestCloneFromTemplate_AutoLVMFullClone verifies that auto mode on lvm

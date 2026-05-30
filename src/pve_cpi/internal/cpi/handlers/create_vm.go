@@ -979,13 +979,22 @@ func cloneFromTemplate(
 	// shape to the cloned VM — the import-from path sets these in CreateQemuParams
 	// at create time, but a clone must set them explicitly or the VM boots
 	// undersized (e.g. a 512 MiB director that never reaches "running").
+	//
+	// Also re-enable the QEMU guest agent channel. The stemcell template is
+	// created with agent=enabled=0 (a frozen template needs no agent), and a
+	// clone inherits that. Without overriding it here every cloned VM has the
+	// agent channel disabled, so `qm guest exec`/QGA cannot reach the guest —
+	// which removes the only out-of-band path to a VM whose bosh-agent has
+	// wedged (the import-from path sets agent=enabled=1 at create time).
 	memStr := strconv.Itoa(shape.memMiB)
 	cores64 := int64(shape.cores)
 	sockets64 := int64(shape.sockets)
+	agentEnabled := "enabled=1"
 	resourceParams := &sdknodes.UpdateQemuConfigParams{
 		Memory:  &memStr,
 		Cores:   &cores64,
 		Sockets: &sockets64,
+		Agent:   &agentEnabled,
 	}
 	if cfgErr := deps.PVE.Nodes().UpdateQemuConfig(ctx, shape.node, strconv.Itoa(candidate), resourceParams); cfgErr != nil {
 		return cpierrors.Wrap(pve.WrapError(cfgErr), fmt.Sprintf(
