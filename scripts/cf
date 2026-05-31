@@ -521,18 +521,125 @@ def wait_agents_responsive(timeout_s: int, settle_reads: int = 2, poll_s: int = 
     return False
 
 
-def _run_deploy_with_watchdog(deploy_cmd: list[str], stall_s: int) -> int:
+def _pve_ssh_opts() -> list[str]:
+    """SSH options for reaching the PVE host.
+
+    StrictHostKeyChecking stays on by default (the PVE host key is validated
+    against ~/.ssh/known_hosts). Set SCRIPTS_CF_SSH_UNSAFE=1 to bypass it for
+    first-boot/test environments — this exposes the connection to MITM, never
+    use it in production.
+    """
+    opts = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
+    if os.environ.get("SCRIPTS_CF_SSH_UNSAFE") == "1":
+        opts += ["-o", "StrictHostKeyChecking=no"]
+    return opts
+
+
+def _pve_host() -> "str | None":
+    """Resolve the PVE host from manifests/bosh/vars.yml, or None on failure."""
+    try:
+        return capture("bosh", "int", str(BOSH_VARS), "--path=/pve_host")
+    except subprocess.CalledProcessError:
+        return None
+
+
+def _pve_reset_vmid(ssh_opts: list[str], pve_host: str, vmid: int) -> "tuple[bool, str]":
+    """Hard-reset a VM via the PVE host (`qm reset`).
+
+    Recovers a black-holed bosh-agent: the guest OS stays healthy (sshd up,
+    disk fine) but the agent stopped servicing NATS RPC after its mbus
+    connection broke (the NATS server logs the close as a TCP "Read Error") and
+    never re-subscribed its RPC inbox. A reset restarts the agent, which
+    reconnects and re-subscribes cleanly, so the deploy's retry converges.
+    `qm reset` (hard) is used rather than `qm reboot`
+    (graceful ACPI) because a graceful shutdown can stall trying to stop the
+    wedged bosh-agent/monit; the guest filesystem is journaled, so a hard reset
+    is safe here.
+    """
+    r = subprocess.run(
+        ["ssh", *ssh_opts, f"root@{pve_host}", "qm", "reset", str(vmid)],
+        capture_output=True, text=True, check=False, timeout=30,
+    )
+    return r.returncode == 0, ((r.stdout or "") + (r.stderr or "")).strip()
+
+
+def _vm_cid_for_instance(inst: str) -> "str | None":
+    """Return the PVE VMID (vm_cid) for a bosh instance ('job/uuid'), or None."""
+    rows = _list_instances_json()
+    if not rows:
+        return None
+    for r in rows:
+        if r.get("instance") == inst:
+            cid = str(r.get("vm_cid", "")).strip()
+            return cid or None
+    return None
+
+
+def _make_agent_recovery() -> "callable | None":
+    """Build a recovery callback that hard-resets the VM of a wedged agent.
+
+    During a cf deploy an agent's NATS mbus connection can break (the NATS
+    server logs the close as a TCP "Read Error"); the agent reconnects at TCP
+    but never re-subscribes its RPC inbox, so the director's get_task/get_state
+    times out and the instance update fails. That agent never self-heals — only
+    an agent restart recovers it. The watchdog pump
+    calls this callback the instant the director prints such a timeout for an
+    instance; it maps the instance to its VMID and `qm reset`s exactly that VM,
+    so the next deploy attempt finds a healthy, re-subscribed agent.
+
+    Returns None (recovery disabled) when SCRIPTS_CF_AGENT_REBOOT=0 or the PVE
+    host cannot be resolved. A per-instance cooldown
+    (SCRIPTS_CF_REBOOT_COOLDOWN, default 180s) collapses a burst of repeated
+    timeout lines into at most one reset per window so a still-booting VM is not
+    reset again before its agent has had a chance to come back.
+    """
+    if os.environ.get("SCRIPTS_CF_AGENT_REBOOT", "1") == "0":
+        return None
+    pve_host = _pve_host()
+    if not pve_host:
+        print("    [watcher] PVE host unresolved; agent-reboot recovery disabled")
+        return None
+    ssh_opts = _pve_ssh_opts()
+    cooldown_s = int(os.environ.get("SCRIPTS_CF_REBOOT_COOLDOWN", "180") or "180")
+    last_reset: "dict[str, float]" = {}
+    lock = threading.Lock()
+
+    def recover(inst: str) -> None:
+        now = time.monotonic()
+        with lock:
+            if now - last_reset.get(inst, float("-inf")) < cooldown_s:
+                return
+            last_reset[inst] = now
+        cid = _vm_cid_for_instance(inst)
+        if not cid:
+            print(f"    [watcher] {inst}: no vm_cid found; cannot reset")
+            return
+        try:
+            vmid = _coerce_vmid(cid)
+        except ValueError as exc:
+            print(f"    [watcher] {inst}: {exc}")
+            return
+        print(
+            f"    [watcher] {inst} agent RPC timed out — hard-resetting vmid {vmid} "
+            "to recover the wedged agent"
+        )
+        ok, out = _pve_reset_vmid(ssh_opts, pve_host, vmid)
+        print(f"    [watcher] {inst}: qm reset " + ("issued" if ok else f"FAILED: {out[:200]}"))
+
+    return recover
+
+
+def _run_deploy_with_watchdog(deploy_cmd: list[str], stall_s: int, recover_cb=None) -> int:
     """Run a bosh deploy, cancelling its task if progress stalls.
 
-    BOSH has no deploy-level timeout. A director<->agent mbus RPC lost during a
-    NATS authorization-reload reconnect gap (bosh-nats-sync regenerates
-    auth.json and SIGHUPs nats every poll_user_sync seconds; nats drops the
-    cert-mapped agent connections it re-evaluates — see
-    manifests/bosh/nats-tuning.yml) can wedge a long-running pre-stop / drain
-    get_task poll: the reply is lost, the director's poll never recovers, and
-    the deploy task hangs indefinitely while holding the deployment lock
-    (observed at 9h). The hung task never errors, so the retry loop below — which
-    only fires on a non-zero exit — can never recover from it.
+    BOSH has no deploy-level timeout. When an agent's mbus connection breaks and
+    it never re-subscribes its RPC inbox (the NATS server logs the close as a TCP
+    "Read Error"; mechanism still under investigation), a long-running pre-stop /
+    drain get_task poll to that agent can wedge: the reply is lost, the
+    director's poll never recovers, and the deploy task hangs indefinitely while
+    holding the deployment lock (observed at 9h). The hung task never errors, so
+    the retry loop below — which only fires on a non-zero exit — can never
+    recover from it.
 
     `bosh deploy` streams staged progress to stdout continuously, so a hang
     shows up as stdout going silent. This watchdog times the gap between output
@@ -549,6 +656,10 @@ def _run_deploy_with_watchdog(deploy_cmd: list[str], stall_s: int) -> int:
     )
     state = {"last": time.monotonic(), "task_id": None, "cancelled": False}
     task_re = re.compile(r"Task (\d+)")
+    # The director prints this verbatim when an agent RPC times out (the wedge
+    # signature). Capturing the instance lets recover_cb hard-reset exactly that
+    # VM so the retry finds a healthy, re-subscribed agent.
+    timeout_re = re.compile(r"Timed out sending '[^']+' to instance: '([^']+)'")
 
     def pump() -> None:
         # proc.stdout is line-buffered; this blocks per line and updates the
@@ -559,6 +670,14 @@ def _run_deploy_with_watchdog(deploy_cmd: list[str], stall_s: int) -> int:
             match = task_re.search(line)
             if match:
                 state["task_id"] = match.group(1)
+            if recover_cb is not None:
+                tmatch = timeout_re.search(line)
+                if tmatch:
+                    # Reset the wedged VM off the pump thread so output keeps
+                    # flowing while qm reset runs over SSH.
+                    threading.Thread(
+                        target=recover_cb, args=(tmatch.group(1),), daemon=True
+                    ).start()
             sys.stdout.write(line)
             sys.stdout.flush()
 
@@ -640,9 +759,21 @@ def cmd_bosh_deploy(extra: list[str]) -> None:
     # task is cancelled so a wedged pre-stop/drain poll cannot hang forever
     # holding the lock. 0 disables the watchdog (plain blocking run).
     stall_s = int(os.environ.get("SCRIPTS_CF_DEPLOY_STALL_S", "900") or "900")
+    # Concurrent recovery: hard-reset any VM whose agent black-holes mid-deploy
+    # (its NATS mbus connection breaks — the server logs a TCP "Read Error" — and
+    # it never re-subscribes its RPC inbox; a wedge that never self-heals). Runs
+    # via the watchdog's output pump, so
+    # it is active whenever the watchdog is (stall_s > 0). SCRIPTS_CF_AGENT_REBOOT=0
+    # disables it.
+    recover_cb = _make_agent_recovery()
+    if recover_cb is not None and stall_s <= 0:
+        print(
+            "    [watcher] note: agent-reboot recovery rides the stall watchdog; "
+            "set SCRIPTS_CF_DEPLOY_STALL_S>0 to enable it"
+        )
     for attempt in range(1, max_attempts + 1):
         if stall_s > 0:
-            rc = _run_deploy_with_watchdog(deploy_cmd, stall_s)
+            rc = _run_deploy_with_watchdog(deploy_cmd, stall_s, recover_cb)
         else:
             rc = subprocess.run(deploy_cmd, check=False).returncode
         if rc == 0:
@@ -857,6 +988,17 @@ def usage(stream=sys.stdout) -> None:
 
 
 def main(argv: list[str]) -> None:
+    # Line-buffer stdout even when redirected to a file/pipe (default there is
+    # block buffering). Without this, the watchdog's recover_cb [watcher] lines
+    # and the retry banners — emitted by print() between the explicitly-flushed
+    # bosh passthrough lines — sit unflushed until the buffer fills or the
+    # process exits, so a live `tail -f` of a redirected deploy log shows the
+    # raw bosh stream but never the recovery actions taken against it.
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except (AttributeError, ValueError):
+        pass
+
     if not argv or argv[0] in ("-h", "--help", "help"):
         usage()
         return
