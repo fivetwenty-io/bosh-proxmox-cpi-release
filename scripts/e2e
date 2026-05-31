@@ -1,0 +1,981 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["pyyaml", "requests"]
+# ///
+"""End-to-end bootstrap + feature test runner for bosh-pve-cpi-release.
+
+Aggregates the existing per-tool wrappers (scripts/bosh, scripts/cf,
+scripts/test) and the cf CLI into a single high-signal orchestrator that
+bootstraps a BOSH director and CloudFoundry from nothing, then exercises every
+feature: the CPI lifecycle, a real `cf push`, and a real `cf ssh`. It adds the
+reporting layer the underlying wrappers lack — per-step timing, a final
+PASS/FAIL/SKIP summary table, failure call-outs with the tail of the offending
+command's output, and machine-readable results.json + junit.xml artifacts.
+
+Usage:
+    ./scripts/e2e [command] [flags]
+
+Commands:
+    all          (default) preflight -> build -> lifecycle -> bootstrap ->
+                 cf-deploy -> cf-push -> cf-ssh. Idempotent: re-runnable against
+                 partial state. Add --clean to teardown first.
+    bootstrap    Build release, stand up the BOSH director, then deploy CF.
+    teardown     Delete the CF deployment and the director (idempotent no-ops
+                 when already absent or the director is unreachable).
+    lifecycle    Run the CPI 16-step lifecycle test (delegates to
+                 `scripts/test integration lifecycle`).
+    cf-deploy    Run only `scripts/cf deploy`.
+    cf-push      Authenticate, create org/space, push an inline staticfile app,
+                 and assert HTTP 200 with the expected body.
+    cf-ssh       Assert `cf ssh` into the smoke app runs a command and returns
+                 its output (pushes the app first if it is missing).
+    report       Re-print the summary table from the most recent run.
+    help         Show this message.
+
+Flags:
+    --config FILE     Integration config YAML (default: ci/integration.yml).
+    --env NAME        BOSH_PVE_ENV overlay selector (default: $BOSH_PVE_ENV or 'lab').
+    --clean           For 'all': teardown before bootstrapping (DESTRUCTIVE).
+    --yes, -y         Skip the DESTRUCTIVE confirmation prompt for --clean/teardown.
+    --skip-build      Reuse the existing bin/cpi and release tarball; skip building.
+    --app NAME        Smoke app name (default: e2e-smoke).
+    --ssh-cmd CMD     Command to run over `cf ssh` (default: a marker echo).
+    --results-dir DIR Where to write results.json + junit.xml (default: .e2e-results).
+    --dry-run         Print every command without executing; exit 0. Primary
+                      validation path when no lab is available.
+    --no-color        Disable ANSI color.
+"""
+
+from __future__ import annotations
+
+import argparse
+import collections
+import datetime as _dt
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass, field
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+SCRIPTS_DIR = REPO_ROOT / "scripts"
+
+# _integration provides config loading, CPI-config synthesis, and env builders
+# shared with scripts/test. Reused here so config parsing lives in one place.
+sys.path.insert(0, str(SCRIPTS_DIR))
+import _integration  # noqa: E402
+
+BOSH = str(SCRIPTS_DIR / "bosh")
+CF = str(SCRIPTS_DIR / "cf")
+TEST = str(SCRIPTS_DIR / "test")
+CREATE_RELEASE = str(SCRIPTS_DIR / "create-release")
+
+DEFAULT_CONFIG = "ci/integration.yml"
+DEFAULT_APP = "e2e-smoke"
+DEFAULT_RESULTS_DIR = ".e2e-results"
+SSH_MARKER = "E2E-SSH-OK"
+STATIC_BODY = "e2e-OK"
+TAIL_LINES = 400
+
+
+def _kill_group(proc: subprocess.Popen) -> None:
+    """SIGKILL the child's whole process group.
+
+    Wrappers spawn grandchildren (scripts/bosh -> bosh -> ssh). Killing only the
+    immediate child leaves grandchildren holding the stdout pipe open, so a hung
+    process would not release until they exit. start_new_session=True makes the
+    child a group leader (pgid == pid); killpg takes the whole tree down.
+    """
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
+# --------------------------------------------------------------------------- #
+# Reporting
+# --------------------------------------------------------------------------- #
+
+class Color:
+    """ANSI color helpers, no-op when color is disabled."""
+
+    def __init__(self, enabled: bool) -> None:
+        self.enabled = enabled
+
+    def _wrap(self, code: str, text: str) -> str:
+        return f"\033[{code}m{text}\033[0m" if self.enabled else text
+
+    def bold(self, t: str) -> str:
+        return self._wrap("1", t)
+
+    def green(self, t: str) -> str:
+        return self._wrap("1;32", t)
+
+    def red(self, t: str) -> str:
+        return self._wrap("1;31", t)
+
+    def yellow(self, t: str) -> str:
+        return self._wrap("1;33", t)
+
+    def dim(self, t: str) -> str:
+        return self._wrap("2", t)
+
+
+PASS = "PASS"
+FAIL = "FAIL"
+SKIP = "SKIP"
+
+
+@dataclass
+class StepResult:
+    name: str
+    status: str
+    seconds: float
+    detail: str = ""
+    tail: list[str] = field(default_factory=list)
+
+
+class Reporter:
+    """Accumulates step results, streams live output, prints the summary."""
+
+    def __init__(self, color: Color, command: str, dry_run: bool) -> None:
+        self.color = color
+        self.command = command
+        self.dry_run = dry_run
+        self.results: list[StepResult] = []
+        self.started = time.time()
+        self._t0 = time.monotonic()
+
+    # -- section + step lifecycle ----------------------------------------- #
+
+    def section(self, title: str) -> None:
+        print()
+        print(self.color.bold(f"==> {title}"))
+
+    def begin(self, name: str) -> None:
+        print(self.color.bold(f"==> {name}"))
+
+    def _status_line(self, name: str, status: str, seconds: float, detail: str) -> str:
+        tag = {
+            PASS: self.color.green(f"[{PASS} {seconds:6.1f}s]"),
+            FAIL: self.color.red(f"[{FAIL} {seconds:6.1f}s]"),
+            SKIP: self.color.yellow(f"[{SKIP}]"),
+        }[status]
+        suffix = f"  {self.color.dim(detail)}" if detail else ""
+        return f"    {tag} {name}{suffix}"
+
+    def record(
+        self,
+        name: str,
+        status: str,
+        seconds: float,
+        detail: str = "",
+        tail: list[str] | None = None,
+    ) -> StepResult:
+        res = StepResult(name, status, seconds, detail, list(tail or []))
+        self.results.append(res)
+        print(self._status_line(name, status, seconds, detail))
+        if status == FAIL and res.tail:
+            print(self.color.red(f"    ! {name} failed — last {len(res.tail)} line(s):"))
+            for line in res.tail:
+                print(self.color.dim(f"      {line.rstrip()}"))
+        return res
+
+    def skip(self, name: str, reason: str) -> StepResult:
+        return self.record(name, SKIP, 0.0, reason)
+
+    # -- summary + artifacts ---------------------------------------------- #
+
+    def _totals(self) -> dict[str, int]:
+        t = {PASS: 0, FAIL: 0, SKIP: 0}
+        for r in self.results:
+            t[r.status] += 1
+        return t
+
+    def exit_code(self) -> int:
+        return 1 if self._totals()[FAIL] else 0
+
+    def summary(self) -> int:
+        total_s = time.monotonic() - self._t0
+        t = self._totals()
+        print()
+        print(self.color.bold("=" * 64))
+        print(self.color.bold(f"  E2E SUMMARY — command: {self.command}"
+                              + ("  (DRY-RUN)" if self.dry_run else "")))
+        print(self.color.bold("=" * 64))
+        for r in self.results:
+            print(self._status_line(r.name, r.status, r.seconds, r.detail))
+        verdict = (
+            self.color.green("ALL PASSED") if not t[FAIL]
+            else self.color.red(f"{t[FAIL]} FAILED")
+        )
+        print(self.color.bold("-" * 64))
+        print(
+            f"  {self.color.green(str(t[PASS]) + ' pass')}"
+            f"  {self.color.red(str(t[FAIL]) + ' fail')}"
+            f"  {self.color.yellow(str(t[SKIP]) + ' skip')}"
+            f"   total {total_s:.1f}s   ->  {verdict}"
+        )
+        print(self.color.bold("=" * 64))
+        if t[FAIL]:
+            failed = ", ".join(r.name for r in self.results if r.status == FAIL)
+            print(self.color.red(f"  FAILED STEPS: {failed}"))
+        return self.exit_code()
+
+    def write_artifacts(self, results_dir: Path) -> Path:
+        ts = _dt.datetime.fromtimestamp(self.started).strftime("%Y%m%d-%H%M%S")
+        run_dir = results_dir / ts
+        run_dir.mkdir(parents=True, exist_ok=True)
+        total_s = time.monotonic() - self._t0
+        t = self._totals()
+
+        payload = {
+            "command": self.command,
+            "dry_run": self.dry_run,
+            "started": _dt.datetime.fromtimestamp(self.started).isoformat(),
+            "finished": _dt.datetime.now().isoformat(),
+            "total_seconds": round(total_s, 3),
+            "totals": {"pass": t[PASS], "fail": t[FAIL], "skip": t[SKIP]},
+            "exit": self.exit_code(),
+            "results": [
+                {
+                    "name": r.name,
+                    "status": r.status,
+                    "seconds": round(r.seconds, 3),
+                    "detail": r.detail,
+                    "tail": r.tail if r.status == FAIL else [],
+                }
+                for r in self.results
+            ],
+        }
+        results_json = run_dir / "results.json"
+        results_json.write_text(json.dumps(payload, indent=2) + "\n")
+        # Stable pointer for the `report` command.
+        (results_dir / "latest.json").write_text(json.dumps(payload, indent=2) + "\n")
+
+        # JUnit XML.
+        suite = ET.Element(
+            "testsuite",
+            name=f"e2e:{self.command}",
+            tests=str(len(self.results)),
+            failures=str(t[FAIL]),
+            skipped=str(t[SKIP]),
+            time=f"{total_s:.3f}",
+        )
+        for r in self.results:
+            case = ET.SubElement(
+                suite, "testcase", name=r.name, classname="e2e", time=f"{r.seconds:.3f}"
+            )
+            if r.status == FAIL:
+                fail_el = ET.SubElement(case, "failure", message=r.detail or "failed")
+                fail_el.text = "\n".join(r.tail)
+            elif r.status == SKIP:
+                ET.SubElement(case, "skipped", message=r.detail or "skipped")
+        junit = run_dir / "junit.xml"
+        ET.ElementTree(suite).write(junit, encoding="unicode", xml_declaration=True)
+
+        print(self.color.dim(f"  wrote {results_json}"))
+        print(self.color.dim(f"  wrote {junit}"))
+        return run_dir
+
+
+# --------------------------------------------------------------------------- #
+# Subprocess execution
+# --------------------------------------------------------------------------- #
+
+def exec_stream(
+    argv: list[str],
+    *,
+    env: dict[str, str] | None,
+    cwd: Path,
+    timeout: int | None,
+    dry_run: bool,
+) -> tuple[int, list[str]]:
+    """Run argv, streaming combined stdout/stderr live while keeping a tail.
+
+    Returns (returncode, tail_lines). In dry-run, prints the command and
+    returns (0, []).
+    """
+    printable = " ".join(argv)
+    if dry_run:
+        print(f"    DRY-RUN: {printable}")
+        return 0, []
+
+    full_env = os.environ.copy()
+    if env:
+        full_env.update(env)
+
+    tail: collections.deque[str] = collections.deque(maxlen=TAIL_LINES)
+    try:
+        proc = subprocess.Popen(
+            argv,
+            cwd=str(cwd),
+            env=full_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            start_new_session=True,
+        )
+    except FileNotFoundError as exc:
+        msg = f"command not found: {argv[0]} ({exc})"
+        print(f"    {msg}")
+        return 127, [msg]
+
+    assert proc.stdout is not None
+
+    # Wall-clock timeout via a watchdog thread. The main thread does blocking
+    # readline; a chatty process streams fine, but a SILENTLY hung process
+    # (e.g. a wedged bosh/cf deploy producing no output) would never reach an
+    # in-loop deadline check — so the watchdog kills it independently. kill()
+    # closes stdout, the readline loop hits EOF, and we report exit 124.
+    timed_out = threading.Event()
+
+    def _watch() -> None:
+        try:
+            proc.wait(timeout)
+        except subprocess.TimeoutExpired:
+            timed_out.set()
+            _kill_group(proc)
+
+    watcher: threading.Thread | None = None
+    if timeout:
+        watcher = threading.Thread(target=_watch, daemon=True)
+        watcher.start()
+
+    try:
+        for line in proc.stdout:
+            sys.stdout.write("    | " + line)
+            tail.append(line.rstrip("\n"))
+        rc = proc.wait()
+    except KeyboardInterrupt:
+        _kill_group(proc)
+        proc.wait()
+        raise
+    finally:
+        if watcher is not None:
+            watcher.join(timeout=1)
+
+    if timed_out.is_set():
+        tail.append(f"TIMEOUT after {timeout}s — process killed")
+        return 124, list(tail)
+    return rc, list(tail)
+
+
+class Runner:
+    """Binds reporter + shared run context; runs subprocess steps."""
+
+    def __init__(self, rep: Reporter, base_env: dict[str, str], dry_run: bool) -> None:
+        self.rep = rep
+        self.base_env = base_env
+        self.dry_run = dry_run
+
+    def step(
+        self,
+        name: str,
+        argv: list[str],
+        *,
+        env: dict[str, str] | None = None,
+        cwd: Path = REPO_ROOT,
+        timeout: int | None = None,
+        retries: int = 0,
+        retry_delay: int = 10,
+    ) -> tuple[bool, list[str]]:
+        """Run a subprocess as a reported step. Returns (ok, tail)."""
+        self.rep.begin(name)
+        merged = dict(self.base_env)
+        if env:
+            merged.update(env)
+
+        attempt = 0
+        start = time.monotonic()
+        while True:
+            attempt += 1
+            rc, tail = exec_stream(
+                argv, env=merged, cwd=cwd, timeout=timeout, dry_run=self.dry_run
+            )
+            if rc == 0 or attempt > retries:
+                break
+            print(self.rep.color.yellow(
+                f"    retry {attempt}/{retries} after exit {rc}; sleeping {retry_delay}s"
+            ))
+            if not self.dry_run:
+                time.sleep(retry_delay)
+            start = time.monotonic()
+
+        seconds = time.monotonic() - start
+        if rc == 0:
+            self.rep.record(name, PASS, seconds)
+            return True, tail
+        self.rep.record(name, FAIL, seconds, f"exit {rc}", tail)
+        return False, tail
+
+    def capture(
+        self,
+        name: str,
+        argv: list[str],
+        *,
+        env: dict[str, str] | None = None,
+        cwd: Path = REPO_ROOT,
+        timeout: int | None = None,
+    ) -> tuple[bool, str]:
+        """Run a subprocess, capture full stdout, do NOT record a step.
+
+        Used for short auxiliary queries (e.g. credhub get). Returns (ok, out).
+        """
+        if self.dry_run:
+            print(f"    DRY-RUN: {' '.join(argv)}")
+            return True, ""
+        merged = os.environ.copy()
+        merged.update(self.base_env)
+        if env:
+            merged.update(env)
+        try:
+            cp = subprocess.run(
+                argv, cwd=str(cwd), env=merged, capture_output=True,
+                text=True, timeout=timeout,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+            return False, str(exc)
+        return cp.returncode == 0, cp.stdout
+
+
+# --------------------------------------------------------------------------- #
+# Phases
+# --------------------------------------------------------------------------- #
+
+class E2E:
+    def __init__(self, args: argparse.Namespace, rep: Reporter) -> None:
+        self.args = args
+        self.rep = rep
+        self.dry_run = args.dry_run
+        self.config_path = args.config
+        self.app = args.app
+        self.env_name = args.env
+
+        base_env = {"BOSH_PVE_ENV": self.env_name}
+        self.runner = Runner(rep, base_env, self.dry_run)
+
+        # Load config once. In dry-run, load_config tolerates absent secrets.
+        self.cfg = _integration.load_config(self.config_path, dry_run=self.dry_run)
+
+    # -- helpers ----------------------------------------------------------- #
+
+    def _stemcell_path(self) -> str:
+        if self.dry_run:
+            return "<dry-run:stemcell>"
+        return _integration.stemcell_path(self.cfg)
+
+    def _system_domain(self) -> str:
+        if self.dry_run:
+            return "dry-run.example"
+        return _integration.system_domain(self.cfg, dry_run=False)
+
+    def _tier3(self) -> dict:
+        return self.cfg.get("tier3", {}) or {}
+
+    def _smoke_org(self) -> str:
+        return str(self._tier3().get("smoke_org", "integration-smoke"))
+
+    def _smoke_space(self) -> str:
+        return str(self._tier3().get("smoke_space", "test"))
+
+    def _smoke_timeout(self) -> int:
+        """Budget for `cf push` (buildpack download + staging + start)."""
+        try:
+            return int(self._tier3().get("smoke_timeout_s", 900))
+        except (TypeError, ValueError):
+            return 900
+
+    def _http_timeout(self) -> int:
+        """Separate budget for the post-push HTTP-200 poll (route propagation)."""
+        try:
+            return int(self._tier3().get("http_assert_timeout_s", 300))
+        except (TypeError, ValueError):
+            return 300
+
+    def _app_route(self) -> str | None:
+        """Discover the app's actual route host from `cf app`, instead of
+        assuming <app>.<system_domain>. Returns None if it cannot be parsed."""
+        ok, out = self.runner.capture("cf-app-route", ["cf", "app", self.app], timeout=60)
+        if not ok:
+            return None
+        for line in out.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("routes:"):
+                routes = stripped.split(":", 1)[1].strip()
+                first = routes.split(",")[0].strip()
+                return first or None
+        return None
+
+    # -- preflight --------------------------------------------------------- #
+
+    def preflight(self, *, need_director: bool, need_cf: bool, need_cpi: bool) -> bool:
+        self.rep.section("preflight")
+        ok = True
+
+        tools = ["uv", "bosh"]
+        if need_cpi or need_director:
+            tools += ["go", "make"]
+        if need_director or need_cf:
+            tools += ["credhub", "ssh"]
+        if need_cf:
+            tools += ["cf"]
+        for tool in dict.fromkeys(tools):
+            present = shutil.which(tool) is not None
+            self.rep.record(
+                f"tool:{tool}", PASS if present else FAIL, 0.0,
+                "on PATH" if present else "MISSING from PATH",
+                [] if present else [f"{tool} not found; install it and retry"],
+            )
+            ok = ok and present
+
+        cfg_file = (REPO_ROOT / self.config_path) if not Path(self.config_path).is_absolute() \
+            else Path(self.config_path)
+        cfg_present = cfg_file.exists()
+        self.rep.record(
+            f"file:{self.config_path}", PASS if cfg_present else FAIL, 0.0,
+            "present" if cfg_present else "MISSING config",
+        )
+        ok = ok and cfg_present
+
+        if need_director or need_cf:
+            vars_yml = REPO_ROOT / "manifests" / "bosh" / "vars.yml"
+            vp = vars_yml.exists()
+            self.rep.record(
+                "file:manifests/bosh/vars.yml", PASS if vp else FAIL, 0.0,
+                "present" if vp else "MISSING (copy from vars.yml.example)",
+            )
+            ok = ok and vp
+
+        # External checkouts (warn-only; bootstrap will hard-fail if truly absent).
+        if need_director:
+            bd = Path(os.environ.get("BOSH_DEPLOYMENT_DIR",
+                                     os.path.expanduser("~/w/cloudfoundry/bosh-deployment")))
+            self.rep.record(
+                "checkout:bosh-deployment",
+                PASS if bd.exists() else SKIP, 0.0,
+                str(bd) if bd.exists() else f"absent: {bd} (set BOSH_DEPLOYMENT_DIR)",
+            )
+        if need_cf:
+            cd = Path(os.environ.get("CF_DEPLOYMENT",
+                                     os.path.expanduser("~/w/cloudfoundry/cf-deployment")))
+            self.rep.record(
+                "checkout:cf-deployment",
+                PASS if cd.exists() else SKIP, 0.0,
+                str(cd) if cd.exists() else f"absent: {cd} (set CF_DEPLOYMENT)",
+            )
+        return ok
+
+    # -- build ------------------------------------------------------------- #
+
+    def build_cpi_binary(self) -> bool:
+        if self.args.skip_build:
+            self.rep.skip("build:bin/cpi", "--skip-build")
+            return True
+        ok, _ = self.runner.step("build:bin/cpi", ["make", "bin/cpi"], timeout=900)
+        return ok
+
+    def build_release(self) -> bool:
+        if self.args.skip_build:
+            self.rep.skip("build:dev-release", "--skip-build")
+            return True
+        ok, _ = self.runner.step(
+            "build:dev-release", [CREATE_RELEASE, "dev"], timeout=1800
+        )
+        return ok
+
+    # -- lifecycle (CPI 16-step) ------------------------------------------ #
+
+    def lifecycle(self) -> bool:
+        self.rep.section("lifecycle (CPI 16-step)")
+        if not self.build_cpi_binary():
+            return False
+        argv = [TEST, "integration", "lifecycle", "--config", self.config_path]
+        if self.dry_run:
+            argv.append("--dry-run")
+        ok, _ = self.runner.step("lifecycle", argv, timeout=1800)
+        return ok
+
+    # -- bootstrap: director ---------------------------------------------- #
+
+    def bootstrap_director(self) -> bool:
+        self.rep.section("bootstrap: BOSH director")
+        if not self.build_release():
+            return False
+        stemcell_env = {"STEMCELL_PATH": self._stemcell_path()}
+        steps = [
+            ("bosh:create-env", [BOSH, "create-env"], 3600, {}),
+            ("bosh:alias-env", [BOSH, "alias-env"], 120, {}),
+            ("bosh:login", [BOSH, "login"], 120, {}),
+            ("bosh:cloud-config", [BOSH, "ucc"], 120, {}),
+            ("bosh:runtime-config", [BOSH, "runtime-config"], 120, {}),
+            ("bosh:upload-stemcell", [BOSH, "upload-stemcell"], 1200, stemcell_env),
+            ("bosh:emptyvm", [BOSH, "emptyvm"], 1800, {}),
+        ]
+        for name, argv, timeout, env in steps:
+            ok, _ = self.runner.step(name, argv, env=env, timeout=timeout)
+            if not ok:
+                return False
+        return True
+
+    # -- cf deploy --------------------------------------------------------- #
+
+    def cf_deploy(self) -> bool:
+        self.rep.section("cf-deploy")
+        argv = [CF, "deploy"]
+        # scripts/cf deploy already runs its own stall-watchdog + 8-retry loop;
+        # give the outer step a generous ceiling and no extra retries.
+        ok, _ = self.runner.step("cf:deploy", argv, timeout=14400)
+        return ok
+
+    # -- cf push ----------------------------------------------------------- #
+
+    def _cf_login(self) -> bool:
+        ok, _ = self.runner.step("cf:login", [CF, "login"], timeout=300)
+        return ok
+
+    def _ensure_org_space(self) -> bool:
+        org, space = self._smoke_org(), self._smoke_space()
+        seq = [
+            (f"cf:create-org:{org}", ["cf", "create-org", org]),
+            (f"cf:target-org:{org}", ["cf", "target", "-o", org]),
+            (f"cf:create-space:{space}", ["cf", "create-space", space, "-o", org]),
+            (f"cf:target-space:{space}", ["cf", "target", "-o", org, "-s", space]),
+        ]
+        for name, argv in seq:
+            ok, _ = self.runner.step(name, argv, timeout=120)
+            if not ok:
+                return False
+        return True
+
+    def _write_static_app(self) -> Path:
+        app_dir = Path(tempfile.mkdtemp(prefix="e2e-smoke-"))
+        (app_dir / "index.html").write_text(STATIC_BODY + "\n")
+        (app_dir / "Staticfile").write_text("")
+        return app_dir
+
+    def cf_push(self) -> bool:
+        self.rep.section("cf-push (staticfile smoke app)")
+        if not self._cf_login():
+            return False
+        if not self._ensure_org_space():
+            return False
+
+        if self.dry_run:
+            self.rep.begin(f"cf:push:{self.app}")
+            print(f"    DRY-RUN: cf push {self.app} -p <tmp> -b staticfile_buildpack")
+            self.rep.record(f"cf:push:{self.app}", PASS, 0.0, "dry-run")
+            self.rep.record(f"http-assert:{self.app}", SKIP, 0.0, "dry-run")
+            return True
+
+        app_dir = self._write_static_app()
+        try:
+            push_argv = [
+                "cf", "push", self.app, "-p", str(app_dir),
+                "-b", "staticfile_buildpack", "-m", "64M", "-k", "256M",
+            ]
+            ok, _ = self.runner.step(
+                f"cf:push:{self.app}", push_argv, timeout=self._smoke_timeout(),
+            )
+            if not ok:
+                return False
+        finally:
+            shutil.rmtree(app_dir, ignore_errors=True)
+
+        return self._http_assert()
+
+    def _http_assert(self) -> bool:
+        import requests  # PEP 723 dependency
+        from urllib3.exceptions import InsecureRequestWarning
+        requests.packages.urllib3.disable_warnings(InsecureRequestWarning)  # type: ignore
+
+        # Prefer the route cf actually assigned; fall back to the apex mapping.
+        route = self._app_route() or f"{self.app}.{self._system_domain()}"
+        url = f"https://{route}/"
+        name = f"http-assert:{self.app}"
+        self.rep.begin(name)
+        print(f"    GET {url}  (expect 200 containing {STATIC_BODY!r})")
+        deadline = time.monotonic() + self._http_timeout()
+        start = time.monotonic()
+        last = "no attempt made"
+        attempt = 0
+        while time.monotonic() < deadline:
+            attempt += 1
+            try:
+                resp = requests.get(url, verify=False, timeout=15)
+                if resp.status_code == 200 and STATIC_BODY in resp.text:
+                    self.rep.record(name, PASS, time.monotonic() - start,
+                                    f"200 OK after {attempt} attempt(s)")
+                    return True
+                last = f"HTTP {resp.status_code}, body[:80]={resp.text[:80]!r}"
+            except requests.RequestException as exc:
+                last = f"request error: {exc}"
+            print(f"    attempt {attempt}: {last}; retrying in 10s")
+            time.sleep(10)
+        self.rep.record(name, FAIL, time.monotonic() - start, "assert failed",
+                        [f"URL: {url}", f"last result: {last}"])
+        return False
+
+    # -- cf ssh ------------------------------------------------------------ #
+
+    def _app_exists(self) -> bool:
+        ok, _ = self.runner.capture("cf-app-check", ["cf", "app", self.app], timeout=60)
+        return ok
+
+    def cf_ssh(self) -> bool:
+        self.rep.section("cf-ssh")
+        if not self.dry_run:
+            if not self._cf_login() or not self._ensure_org_space():
+                return False
+            if not self._app_exists():
+                print(f"    app {self.app} absent — pushing it first")
+                if not self.cf_push():
+                    return False
+
+        ssh_cmd = self.args.ssh_cmd or f"echo {SSH_MARKER}; id; echo host=$(hostname)"
+        name = f"cf:ssh:{self.app}"
+        if self.dry_run:
+            self.rep.begin(f"cf:enable-ssh:{self.app}")
+            print(f"    DRY-RUN: cf enable-ssh {self.app}; cf restart {self.app}")
+            self.rep.record(f"cf:enable-ssh:{self.app}", PASS, 0.0, "dry-run")
+            self.rep.begin(name)
+            print(f"    DRY-RUN: cf ssh {self.app} -c {ssh_cmd!r}")
+            self.rep.record(name, PASS, 0.0, "dry-run")
+            return True
+
+        # cf requires an app restart for `enable-ssh` to take effect. Enable then
+        # restart UP FRONT so the first ssh attempt is valid (avoids a guaranteed
+        # ~120s first-run failure on a freshly pushed app). Idempotent when ssh
+        # was already enabled.
+        ok_enable, _ = self.runner.step(f"cf:enable-ssh:{self.app}",
+                                        ["cf", "enable-ssh", self.app], timeout=60)
+        if not ok_enable:
+            return False
+        ok_restart, _ = self.runner.step(f"cf:restart:{self.app}",
+                                         ["cf", "restart", self.app], timeout=300)
+        if not ok_restart:
+            return False
+
+        self.rep.begin(name)
+        start = time.monotonic()
+        expect = SSH_MARKER if not self.args.ssh_cmd else None
+        ok, out = self.runner.capture(name, ["cf", "ssh", self.app, "-c", ssh_cmd],
+                                      timeout=120)
+        for line in out.splitlines():
+            print(f"    | {line}")
+        seconds = time.monotonic() - start
+
+        if not ok:
+            self.rep.record(name, FAIL, seconds, "cf ssh failed",
+                            out.splitlines()[-TAIL_LINES:] or ["no output captured"])
+            return False
+        if expect and expect not in out:
+            self.rep.record(name, FAIL, seconds, f"missing marker {expect!r}",
+                            out.splitlines()[-TAIL_LINES:] or ["no output captured"])
+            return False
+        self.rep.record(name, PASS, seconds, "command output received")
+        return True
+
+    # -- teardown ---------------------------------------------------------- #
+
+    def teardown(self) -> bool:
+        self.rep.section("teardown")
+        # Best-effort smoke org cleanup before deployment delete.
+        if not self.dry_run:
+            self.runner.capture("cf-delete-org",
+                                ["cf", "delete-org", self._smoke_org(), "-f"], timeout=120)
+        ok_cf, _ = self.runner.step("cf:teardown", [CF, "teardown"], timeout=1800)
+        ok_bosh, _ = self.runner.step("bosh:teardown", [BOSH, "teardown"], timeout=1800)
+        return ok_cf and ok_bosh
+
+
+# --------------------------------------------------------------------------- #
+# Command dispatch
+# --------------------------------------------------------------------------- #
+
+def confirm_destructive(args: argparse.Namespace, action: str) -> bool:
+    if args.yes:
+        return True
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        print(f"refusing {action} without --yes in a non-interactive shell",
+              file=sys.stderr)
+        return False
+    print(f"\n!!! DESTRUCTIVE: {action} will delete lab resources.")
+    return input("Type 'yes' to proceed: ").strip() == "yes"
+
+
+def run_command(args: argparse.Namespace, rep: Reporter) -> bool:
+    e2e = E2E(args, rep)
+    cmd = args.command
+
+    if cmd == "all":
+        if args.clean:
+            if not args.dry_run and not confirm_destructive(args, "--clean teardown"):
+                rep.skip("teardown", "declined")
+                return False
+            if not e2e.teardown():
+                return False
+        if not e2e.preflight(need_director=True, need_cf=True, need_cpi=True):
+            return False
+        return (
+            e2e.lifecycle()
+            and e2e.bootstrap_director()
+            and e2e.cf_deploy()
+            and e2e.cf_push()
+            and e2e.cf_ssh()
+        )
+
+    if cmd == "bootstrap":
+        if not e2e.preflight(need_director=True, need_cf=True, need_cpi=False):
+            return False
+        return e2e.bootstrap_director() and e2e.cf_deploy()
+
+    if cmd == "teardown":
+        if not args.dry_run and not confirm_destructive(args, "teardown"):
+            rep.skip("teardown", "declined")
+            return False
+        return e2e.teardown()
+
+    if cmd == "lifecycle":
+        if not e2e.preflight(need_director=False, need_cf=False, need_cpi=True):
+            return False
+        return e2e.lifecycle()
+
+    if cmd == "cf-deploy":
+        if not e2e.preflight(need_director=False, need_cf=True, need_cpi=False):
+            return False
+        return e2e.cf_deploy()
+
+    if cmd == "cf-push":
+        if not e2e.preflight(need_director=False, need_cf=True, need_cpi=False):
+            return False
+        return e2e.cf_push()
+
+    if cmd == "cf-ssh":
+        if not e2e.preflight(need_director=False, need_cf=True, need_cpi=False):
+            return False
+        return e2e.cf_ssh()
+
+    raise ValueError(f"unhandled command: {cmd}")
+
+
+def cmd_report(args: argparse.Namespace, color: Color) -> int:
+    results_dir = Path(args.results_dir)
+    if not results_dir.is_absolute():
+        results_dir = REPO_ROOT / results_dir
+    latest = results_dir / "latest.json"
+    if not latest.exists():
+        print(f"no prior run found at {latest}", file=sys.stderr)
+        return 1
+    data = json.loads(latest.read_text())
+    print(color.bold("=" * 64))
+    print(color.bold(f"  LAST E2E RUN — command: {data['command']}"
+                     f"   ({data['started']})"))
+    print(color.bold("=" * 64))
+    for r in data["results"]:
+        tag = {
+            PASS: color.green(f"[{PASS} {r['seconds']:6.1f}s]"),
+            FAIL: color.red(f"[{FAIL} {r['seconds']:6.1f}s]"),
+            SKIP: color.yellow(f"[{SKIP}]"),
+        }[r["status"]]
+        suffix = f"  {color.dim(r['detail'])}" if r["detail"] else ""
+        print(f"    {tag} {r['name']}{suffix}")
+    t = data["totals"]
+    print(color.bold("-" * 64))
+    print(f"  {color.green(str(t['pass']) + ' pass')}"
+          f"  {color.red(str(t['fail']) + ' fail')}"
+          f"  {color.yellow(str(t['skip']) + ' skip')}"
+          f"   total {data['total_seconds']:.1f}s")
+    return int(data["exit"])
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="scripts/e2e",
+        description="End-to-end BOSH+CF bootstrap and feature test runner.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument(
+        "command", nargs="?", default="all",
+        choices=["all", "bootstrap", "teardown", "lifecycle", "cf-deploy",
+                 "cf-push", "cf-ssh", "report", "help"],
+        help="phase to run (default: all)",
+    )
+    p.add_argument("--config", default=DEFAULT_CONFIG)
+    p.add_argument("--env", default=os.environ.get("BOSH_PVE_ENV", "lab"))
+    p.add_argument("--clean", action="store_true")
+    p.add_argument("--yes", "-y", action="store_true")
+    p.add_argument("--skip-build", action="store_true")
+    p.add_argument("--app", default=DEFAULT_APP)
+    p.add_argument("--ssh-cmd", default=None)
+    p.add_argument("--results-dir", default=DEFAULT_RESULTS_DIR)
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--no-color", action="store_true")
+    return p
+
+
+def main(argv: list[str]) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    color_enabled = (
+        not args.no_color
+        and sys.stdout.isatty()
+        and os.environ.get("NO_COLOR") is None
+    )
+    color = Color(color_enabled)
+
+    if args.command == "help":
+        parser.print_help()
+        return 0
+
+    if args.command == "report":
+        return cmd_report(args, color)
+
+    rep = Reporter(color, args.command, args.dry_run)
+    print(color.bold(
+        f"e2e: command={args.command} env={args.env} config={args.config}"
+        + ("  [DRY-RUN]" if args.dry_run else "")
+    ))
+
+    interrupted = False
+    try:
+        run_command(args, rep)
+    except KeyboardInterrupt:
+        interrupted = True
+        print(color.red("\ninterrupted — writing partial results"), file=sys.stderr)
+    except SystemExit as exc:
+        # _integration.load_config and friends signal fatal config errors via
+        # sys.exit(<message>). Capture as a FAIL row so the summary + artifacts
+        # are still written instead of exiting silently before any report.
+        msg = str(exc.code) if exc.code not in (None, 0) else "exited"
+        rep.record("config-error", FAIL, 0.0, msg, [msg])
+    except Exception as exc:  # noqa: BLE001 — top-level guard: report, never crash silently
+        rep.record("internal-error", FAIL, 0.0, str(exc), [repr(exc)])
+
+    results_dir = Path(args.results_dir)
+    if not results_dir.is_absolute():
+        results_dir = REPO_ROOT / results_dir
+    rep.summary()
+    try:
+        rep.write_artifacts(results_dir)
+    except OSError as exc:
+        print(color.red(f"could not write artifacts: {exc}"), file=sys.stderr)
+
+    return 130 if interrupted else rep.exit_code()
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
