@@ -1,0 +1,17 @@
+---
+# Ops file: pin the cloudfoundry/bosh release version that bosh create-env
+# deploys, overriding whatever bosh-deployment's bosh.yml currently ships.
+#
+# bosh-deployment tracks its own release line; this repo pins an explicit,
+# reproducible version so create-env/teardown deploy the same director release
+# regardless of the local bosh-deployment checkout. Bump the three fields
+# together (version, url, sha1) when moving to a newer release.
+#
+# Usage: layered first in scripts/bosh create-env / teardown (see -o list).
+- type: replace
+  path: /releases/name=bosh
+  value:
+    name: bosh
+    version: "282.1.13"
+    url: https://bosh.io/d/github.com/cloudfoundry/bosh?v=282.1.13
+    sha1: sha256:809d815af1d5b55e9362cbd6462ba7abbc67f6d8bc142f46077058c930d0314f

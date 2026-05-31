@@ -51,6 +51,9 @@ BOSH_DIR = MANIFESTS / "bosh"
 VARS = BOSH_DIR / "vars.yml"
 CREDS = BOSH_DIR / "creds.yml"
 STATE = BOSH_DIR / "state.json"
+# Pins the cloudfoundry/bosh release version (282.1.13) regardless of the
+# local bosh-deployment checkout's default. See manifests/bosh/bosh-release.yml.
+BOSH_RELEASE_OPS = BOSH_DIR / "bosh-release.yml"
 CPI_OPS = BOSH_DIR / "cpi.yml"
 OS_CONF_OPS = BOSH_DIR / "os-conf.yml"
 NATS_TUNING_OPS = BOSH_DIR / "nats-tuning.yml"
@@ -154,6 +157,7 @@ def cmd_create_env(args: list[str]) -> int:
         "bosh", "create-env",
         str(BOSH_DEPLOYMENT_DIR / "bosh.yml"),
         "-n",
+        "-o", str(BOSH_RELEASE_OPS),
         "-o", str(CPI_OPS),
         "-o", str(BOSH_DEPLOYMENT_DIR / "uaa.yml"),
         "-o", str(BOSH_DEPLOYMENT_DIR / "credhub.yml"),
@@ -217,6 +221,7 @@ def cmd_teardown(args: list[str]) -> int:
         "bosh", "delete-env",
         str(BOSH_DEPLOYMENT_DIR / "bosh.yml"),
         "-n",
+        "-o", str(BOSH_RELEASE_OPS),
         "-o", str(CPI_OPS),
         "-o", str(BOSH_DEPLOYMENT_DIR / "uaa.yml"),
         "-o", str(BOSH_DEPLOYMENT_DIR / "credhub.yml"),

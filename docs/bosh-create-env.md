@@ -131,10 +131,15 @@ Use an API token for any non-interactive automation — it can be scoped and rev
 bosh create-env ~/w/cloudfoundry/bosh-deployment/bosh.yml \
   --state=manifests/state.json \
   --vars-store=manifests/creds.yml \
+  -o manifests/bosh/bosh-release.yml \
   -o manifests/cpi.yml \
   -o ~/w/cloudfoundry/bosh-deployment/jumpbox-user.yml \
   -l manifests/vars.yml
 ```
+
+`scripts/bosh create-env` wraps this exact invocation (with the full ops layering) — prefer it over the raw command above.
+
+The `bosh-release.yml` ops file pins the `cloudfoundry/bosh` release to **282.1.13**, overriding whatever version the local `bosh-deployment` checkout ships. Bump the `version`/`url`/`sha1` fields together to move to a newer release.
 
 The `jumpbox-user.yml` ops file (optional but recommended) adds a `jumpbox` user with a generated SSH keypair stored in `creds.yml`. Without it, the Director VM has no operator-accessible login — BOSH stemcells ship with root SSH disabled and the bosh-agent resets the `vcap` password on every boot, so direct SSH after deploy is impossible without this ops file.
 
@@ -147,6 +152,10 @@ What each flag does:
 - `--vars-store=manifests/creds.yml`
 
   Persists generated credentials (NATS, mbus, blobstore, jumpbox) across runs. Required for idempotent updates.
+
+- `-o manifests/bosh/bosh-release.yml`
+
+  Pins the `cloudfoundry/bosh` release to a reproducible version (282.1.13) instead of the local `bosh-deployment` default.
 
 - `-o manifests/cpi.yml`
 
@@ -257,6 +266,7 @@ rm -f /var/lib/vz/template/iso/vm-105-config.iso
 
 | Path | Role | Commit? |
 |---|---|---|
+| `manifests/bosh/bosh-release.yml` | Ops file pinning the `bosh` release version | yes |
 | `manifests/cpi.yml` | Ops file applied to `bosh.yml` | yes |
 | `manifests/vars.yml.example` | Template for variables | yes |
 | `manifests/vars.yml` | Real variables, includes secrets | **no** |
