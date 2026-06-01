@@ -1251,8 +1251,14 @@ def _cf_release_ops() -> list[str]:
     stemcell version): the precompiled-for-this-stemcell set is authoritative.
       store-ops      → layer manifests/cf/compiled-releases.yml.
       director-cache → [] (use-compiled-releases.yml dropped; reuse the cache).
-      absent/mismatch → fail fast with guidance (no silent fallback to a
-                        version-mismatched compiled set or a 30-60min source build).
+      absent/mismatch → behaviour controlled by CF_REQUIRE_PRECOMPILE:
+                        default ("1"/unset) fails fast with guidance (no silent
+                        fallback to a version-mismatched compiled set or a
+                        30-60min source build); "0"/"false"/"no" falls back to
+                        cf-deployment's operations/use-compiled-releases.yml
+                        (which targets a different stemcell version — BOSH then
+                        compiles whatever does not match, so the deploy can be
+                        slow, but it does not hard-stop).
     """
     want = "{}/{}".format(*stemcell_os_version())
     text = COMPILED_OPS_CF.read_text() if COMPILED_OPS_CF.exists() else ""
@@ -1263,11 +1269,20 @@ def _cf_release_ops() -> list[str]:
     if state == _cfcompile.CACHE_MODE:
         print(f"    using Director compiled-package cache ({want}); use-compiled-releases.yml dropped")
         return []
-    sys.exit(
-        f"cf deploy: CF releases are not precompiled for {want} (state={state}). "
-        f"Run `./scripts/cf precompile-releases` first "
-        f"(one-time; cf-deployment's use-compiled-releases.yml targets a different version)."
+    require = os.environ.get("CF_REQUIRE_PRECOMPILE", "1").strip().lower() not in ("0", "false", "no")
+    if require:
+        sys.exit(
+            f"cf deploy: CF releases are not precompiled for {want} (state={state}). "
+            f"Run `./scripts/cf precompile-releases` first "
+            f"(one-time; cf-deployment's use-compiled-releases.yml targets a different version), "
+            f"or set CF_REQUIRE_PRECOMPILE=0 to fall back to use-compiled-releases.yml."
+        )
+    ucr = CF_DEPLOYMENT / "operations/use-compiled-releases.yml"
+    print(
+        f"    CF_REQUIRE_PRECOMPILE=0: precompile {state} for {want}; "
+        f"falling back to {ucr.name} (targets a different stemcell — BOSH may recompile mismatches)"
     )
+    return ["-o", str(ucr)]
 
 
 def cmd_deploy(extra: list[str]) -> None:
