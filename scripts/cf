@@ -1,7 +1,6 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["requests"]
 # ///
 """Manage the cloudfoundry deployment on the bosh-pve director.
 
@@ -47,7 +46,8 @@ import threading
 import time
 from pathlib import Path
 
-import requests
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _lightstemcell  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CF_DEPLOYMENT = Path(os.environ.get("CF_DEPLOYMENT", Path.home() / "w/cloudfoundry/cf-deployment"))
@@ -81,16 +81,6 @@ def run_env(extra_env: dict[str, str], *cmd: str) -> None:
 
 def capture(*cmd: str) -> str:
     return subprocess.run(cmd, check=True, capture_output=True, text=True).stdout.strip()
-
-
-def stemcell_sha1(name: str, version: str) -> str:
-    resp = requests.get(f"https://bosh.io/api/v1/stemcells/{name}", timeout=30)
-    resp.raise_for_status()
-    match = next((s for s in resp.json() if s.get("version") == version), None)
-    sha1 = (match or {}).get("regular", {}).get("sha1")
-    if not sha1:
-        sys.exit(f"sha1 not found for {version}")
-    return sha1
 
 
 def cmd_runtime_config(_extra: list[str]) -> None:
@@ -177,27 +167,50 @@ def cmd_cloud_config(_extra: list[str]) -> None:
     )
 
 
+STEMCELL_CACHE = REPO_ROOT / "dev_releases" / "stemcell-cache"
+
+
+def _light_int_opt(json_path: str) -> str:
+    """Read one var from manifests/bosh/vars.yml, "" when absent."""
+    res = subprocess.run(
+        ["bosh", "int", str(BOSH_VARS), f"--path={json_path}"],
+        capture_output=True, text=True,
+    )
+    return res.stdout.strip() if res.returncode == 0 else ""
+
+
+def stemcell_os_version() -> "tuple[str, str]":
+    """(os, version) parsed from manifests/bosh/vars.yml stemcell_url, so the
+    CF deployment stemcell pin and the uploaded light record stay in lockstep
+    with the heavy source and the compiled-release cache."""
+    return _lightstemcell.parse_os_version(_light_int_opt("/stemcell_url"))
+
+
+def ensure_light_stemcell() -> "_lightstemcell.LightStemcell":
+    """Ensure the light stemcell is on PVE and return its descriptor (manifest)."""
+    source_url = _light_int_opt("/stemcell_url")
+    source_sha1 = _light_int_opt("/stemcell_sha1")
+    os_name, version = _lightstemcell.parse_os_version(source_url)
+    mode = _light_int_opt("/light_stemcell_mode") or "preuploaded"
+    fetch_url = _light_int_opt("/stemcell_fetch_url")
+    token = _light_int_opt("/stemcell_fetch_token")
+    cpi_cfg = _lightstemcell.pve_cfg_from_bosh_vars(BOSH_VARS)
+    print(f"    light stemcell ({mode}): {os_name} {version}")
+    return _lightstemcell.ensure_light_stemcell(
+        cpi_cfg=cpi_cfg, mode=mode, os_name=os_name, version=version,
+        source_url=source_url, source_sha1=source_sha1,
+        cache_dir=str(STEMCELL_CACHE),
+        image_url=(fetch_url or None), token=(token or None),
+        build_create_env_tarball=False,
+    )
+
+
 def cmd_stemcell(_extra: list[str]) -> None:
-    banner("Stemcell")
-    manifest = str(CF_DEPLOYMENT / "cf-deployment.yml")
-    os_name = capture("bosh", "int", manifest, "--path=/stemcells/alias=default/os")
-    version = capture("bosh", "int", manifest, "--path=/stemcells/alias=default/version")
-    name = f"bosh-openstack-kvm-{os_name}"
-    print(f"    stemcell: {name} v{version}")
-
-    existing = subprocess.run(
-        ["bosh", "-e", ENV, "stemcells", "--json"],
-        capture_output=True, text=True, check=False,
-    ).stdout
-    if name in existing and version in existing:
-        print("    already uploaded; skipping")
-        return
-
-    url = f"https://bosh.io/d/stemcells/{name}?v={version}"
-    sha1 = stemcell_sha1(name, version)
-    print(f"    sha1: {sha1}")
-    print()
-    run("bosh", "-e", ENV, "-n", "upload-stemcell", "--sha1", sha1, url)
+    banner("Stemcell (light)")
+    light = ensure_light_stemcell()
+    # --fix re-registers the version if a record already exists; the qcow2
+    # upload itself fast-paths on the cached SHA, so re-runs are cheap.
+    run("bosh", "-e", ENV, "-n", "upload-stemcell", str(light.manifest_path), "--fix")
 
 
 def _cf_has_database_vm() -> bool:
@@ -814,8 +827,12 @@ def cmd_bosh_deploy(extra: list[str]) -> None:
         # not-yet-updated routers. Lab tolerates full-rollout signal;
         # the rolling-deploy safety net is not needed here.
         "-o", "manifests/cf/no-canaries.yml",
+        # Pin the deployment stemcell to the standardized ubuntu-noble light
+        # stemcell uploaded by cmd_stemcell (matched by os+version).
+        "-o", "manifests/cf/ops-light-stemcell.yml",
         "-l", "manifests/bosh/vars.yml",
         "-l", "manifests/cf/vars.yml",
+        "-v", f"stemcell_version={stemcell_os_version()[1]}",
         *_env_vars_layer(),
         *extra,
     ]

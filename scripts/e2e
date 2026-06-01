@@ -472,11 +472,6 @@ class E2E:
 
     # -- helpers ----------------------------------------------------------- #
 
-    def _stemcell_path(self) -> str:
-        if self.dry_run:
-            return "<dry-run:stemcell>"
-        return _integration.stemcell_path(self.cfg)
-
     def _system_domain(self) -> str:
         if self.dry_run:
             return "dry-run.example"
@@ -614,14 +609,16 @@ class E2E:
         self.rep.section("bootstrap: BOSH director")
         if not self.build_release():
             return False
-        stemcell_env = {"STEMCELL_PATH": self._stemcell_path()}
+        # create-env and upload-stemcell are light (scripts/bosh derives the
+        # qcow2 from vars.yml stemcell_url and places it on PVE storage), so no
+        # STEMCELL_PATH is needed for the Director bootstrap.
         steps = [
             ("bosh:create-env", [BOSH, "create-env"], 3600, {}),
             ("bosh:alias-env", [BOSH, "alias-env"], 120, {}),
             ("bosh:login", [BOSH, "login"], 120, {}),
             ("bosh:cloud-config", [BOSH, "ucc"], 120, {}),
             ("bosh:runtime-config", [BOSH, "runtime-config"], 120, {}),
-            ("bosh:upload-stemcell", [BOSH, "upload-stemcell"], 1200, stemcell_env),
+            ("bosh:upload-stemcell", [BOSH, "upload-stemcell"], 1200, {}),
             ("bosh:emptyvm", [BOSH, "emptyvm"], 1800, {}),
         ]
         for name, argv, timeout, env in steps:

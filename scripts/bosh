@@ -74,6 +74,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _hostfw
 import _compiled
+import _lightstemcell
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 BOSH_DEPLOYMENT_DIR = Path(os.environ.get("BOSH_DEPLOYMENT_DIR", Path.home() / "w/cloudfoundry/bosh-deployment"))
@@ -227,8 +228,54 @@ def credhub_env() -> dict[str, str]:
     return env
 
 
+STEMCELL_CACHE = REPO_ROOT / "dev_releases" / "stemcell-cache"
+
+
+def _ensure_light_stemcell(*, build_tarball: bool) -> "_lightstemcell.LightStemcell":
+    """Ensure the light stemcell is available on PVE and return its descriptor.
+
+    Used by both create-env (build_tarball=True, the Director boots from a
+    locally-built light tarball whose stemcell.MF carries the light
+    cloud_properties) and upload-stemcell (build_tarball=False, registers the
+    rendered light manifest with a running Director). The qcow2 is derived once
+    from vars.yml stemcell_url — preuploaded uploads it to PVE storage, fetch
+    leaves the CPI to stream it. vars.yml stemcell_url/sha1 are left untouched so
+    compile-releases keeps parsing the heavy source version.
+    """
+    source_url = bosh_int(VARS, "/stemcell_url")
+    source_sha1 = bosh_int(VARS, "/stemcell_sha1")
+    os_name, version = _lightstemcell.parse_os_version(source_url)
+    mode = (_bosh_int_opt(VARS, "/light_stemcell_mode") or "preuploaded").strip()
+    fetch_url = (_bosh_int_opt(VARS, "/stemcell_fetch_url") or "").strip()
+    token = (_bosh_int_opt(VARS, "/stemcell_fetch_token") or "").strip()
+    cpi_cfg = _lightstemcell.pve_cfg_from_bosh_vars(VARS)
+    print(f"==> light stemcell ({mode}): ensuring {os_name} {version} is available on PVE")
+    return _lightstemcell.ensure_light_stemcell(
+        cpi_cfg=cpi_cfg,
+        mode=mode,
+        os_name=os_name,
+        version=version,
+        source_url=source_url,
+        source_sha1=source_sha1,
+        cache_dir=str(STEMCELL_CACHE),
+        image_url=(fetch_url or None),
+        token=(token or None),
+        build_create_env_tarball=build_tarball,
+    )
+
+
+def _light_stemcell_create_env_vars() -> list[str]:
+    """`-v` overrides pointing create-env at the locally-built light tarball."""
+    light = _ensure_light_stemcell(build_tarball=True)
+    return [
+        "-v", f"stemcell_url=file://{light.create_env_tarball}",
+        "-v", f"stemcell_sha1={light.create_env_tarball_sha1}",
+    ]
+
+
 def cmd_create_env(args: list[str]) -> int:
     release = cpi_release_path()
+    light_vars = _light_stemcell_create_env_vars()
     return run(
         "bosh", "create-env",
         str(BOSH_DEPLOYMENT_DIR / "bosh.yml"),
@@ -247,6 +294,9 @@ def cmd_create_env(args: list[str]) -> int:
         *env_vars_layer(),
         "-v", "director_name=ocfp-mgmt",
         "-v", f"pve_cpi_release_path={release}",
+        # Light-stemcell overrides win over vars.yml stemcell_url/sha1 so the
+        # Director boots from the light tarball (see _ensure_director_light_stemcell).
+        *light_vars,
         f"--state={STATE}",
         f"--vars-store={CREDS}",
         *args,
@@ -373,13 +423,15 @@ def cmd_emptyvm(args: list[str]) -> int:
 
 
 def cmd_upload_stemcell(args: list[str]) -> int:
-    stemcell = os.environ.get("STEMCELL_PATH", "").strip()
-    if not stemcell:
-        print("upload-stemcell: STEMCELL_PATH env var not set", file=sys.stderr)
-        return 1
-    # Idempotent: re-uploading an already-present stemcell version is a no-op.
+    # Light stemcell: ensure the qcow2 is on PVE storage (preuploaded) or
+    # reachable (fetch), render the upload-stemcell manifest, and register it
+    # with the Director. STEMCELL_PATH is no longer consumed — the light source
+    # is vars.yml stemcell_url. Idempotent: --fix re-registers an existing
+    # version; the qcow2 upload fast-paths on the cached SHA.
+    light = _ensure_light_stemcell(build_tarball=False)
     return run(
-        "bosh", "-e", "pve", "-n", "upload-stemcell", stemcell, *args, env=director_env()
+        "bosh", "-e", "pve", "-n", "upload-stemcell", str(light.manifest_path),
+        "--fix", *args, env=director_env(),
     )
 
 

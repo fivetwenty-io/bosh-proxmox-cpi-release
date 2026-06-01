@@ -1,0 +1,17 @@
+---
+# Pin the CF deployment stemcell to the lab-standardized ubuntu-noble light
+# stemcell.
+#
+# The light stemcell is uploaded by `scripts/cf stemcell` (via
+# scripts/_lightstemcell.py). BOSH matches a deployment's stemcell by
+# os + version, so these values must agree with the uploaded light record
+# (operating_system: ubuntu-noble, version: stemcell_version). stemcell_version
+# is supplied by scripts/cf, parsed from manifests/bosh/vars.yml stemcell_url so
+# it stays in lockstep with the heavy source and the compiled-release cache.
+- type: replace
+  path: /stemcells/alias=default/os
+  value: ubuntu-noble
+
+- type: replace
+  path: /stemcells/alias=default/version
+  value: ((stemcell_version))

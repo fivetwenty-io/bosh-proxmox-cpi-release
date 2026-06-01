@@ -6,39 +6,31 @@
 # to PVE storage automatically; subsequent uploads for the same name+version
 # are deduplicated by SHA-256 so re-uploading is safe and fast.
 #
+# scripts/{bosh,cf,e2e} select fetch mode when light_stemcell_mode: fetch and
+# render this template via scripts/_lightstemcell.py.
+#
 # cloud_properties.image_url       — remote URL of the qcow2 disk image.
 #   Supported schemes: https://, s3://, oci://, bosh+blobstore:
 #
 # cloud_properties.image_url_auth  — optional per-stemcell credentials.
 #   Supported types: basic, bearer, s3, blobstore, oci.
 #   This example uses type=bearer; see docs/light-stemcells.md for full schemas.
-#   Leave this block absent to rely on CPI-config fetch_credential_defaults
-#   or to fetch from a public URL without authentication.
+#   Leave stemcell_token empty for public URLs.
 #
-# Interpolation variables (supply with -l or --vars-store):
-#   stemcell_url    — full remote URL of the qcow2 image
-#                     (e.g. "https://artifacts.example.com/stemcells/ubuntu-jammy-1.438.qcow2")
-#   stemcell_token  — Bearer token for authenticated downloads; set to ""
-#                     for public URLs and remove the image_url_auth block
+# Interpolation variables (supply with -v or via the helper):
+#   stemcell_version — stemcell version (kept in lockstep with vars.yml, e.g. "1.383")
+#   stemcell_url     — full remote URL of the qcow2 image
+#   stemcell_token   — Bearer token for authenticated downloads; "" for public
 #
-# Example bosh upload-stemcell invocation (authenticated):
-#   bosh -e <env> upload-stemcell manifests/bosh/light-stemcell-fetch.yml \
-#     -v stemcell_url=https://artifacts.example.com/stemcells/ubuntu-jammy-1.438.qcow2 \
-#     -v stemcell_token=<your-token>
-#
-# Example bosh upload-stemcell invocation (public URL, no auth):
-#   bosh -e <env> upload-stemcell manifests/bosh/light-stemcell-fetch.yml \
-#     --var-errs-unused=false \
-#     -v stemcell_url=https://public.example.com/ubuntu-jammy-1.438.qcow2 \
-#     -v stemcell_token=""
+# OS is standardized on ubuntu-noble across all deployment paths.
 #
 # The CPI streams the image directly from the remote URL to PVE storage; the
 # full image is not staged locally on the BOSH Director before upload.
 
-name: bosh-proxmox-kvm-ubuntu-jammy-go_agent-light-fetch
-version: "1.438"
+name: bosh-proxmox-kvm-ubuntu-noble-go_agent-light-fetch
+version: ((stemcell_version))
 sha1: 0000000000000000000000000000000000000000
-operating_system: ubuntu-jammy
+operating_system: ubuntu-noble
 stemcell_formats:
 - proxmox-kvm
 cloud_properties:
@@ -46,8 +38,8 @@ cloud_properties:
   image_url_auth:
     type: bearer
     bearer_token: "((stemcell_token))"
-  name: ubuntu-jammy
-  version: "1.438"
+  name: ubuntu-noble
+  version: ((stemcell_version))
   disk_format: qcow2
   os_type: l26
   disk: 10240

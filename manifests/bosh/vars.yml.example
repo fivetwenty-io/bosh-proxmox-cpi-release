@@ -56,6 +56,18 @@ internal_ip:   192.168.1.10
 stemcell_url:  https://bosh.io/d/stemcells/bosh-openstack-kvm-ubuntu-jammy-go_agent?v=1.999
 stemcell_sha1: REPLACE_WITH_PUBLISHED_SHA1
 
+# --- Light stemcell -------------------------------------------------------
+# All deployment paths (create-env, cf, e2e) use a light stemcell. The qcow2 is
+# derived once from stemcell_url above (download -> extract -> normalize ->
+# upload to PVE storage), then referenced by volid (preuploaded) or fetched by
+# the CPI at create_stemcell time (fetch). OS + version stay identical to
+# stemcell_url, so the compiled-release cache keyed to that stemcell stays valid.
+#   preuploaded — scripts place the qcow2 on PVE storage; no per-stemcell fetch.
+#   fetch       — the CPI streams the qcow2 from stemcell_fetch_url on demand.
+light_stemcell_mode:  preuploaded   # preuploaded | fetch
+stemcell_fetch_url:   ""            # fetch mode only: remote qcow2 URL
+stemcell_fetch_token: ""            # fetch mode only: optional bearer token
+
 # --- Director identity ----------------------------------------------------
 director_name: bosh-pve
 

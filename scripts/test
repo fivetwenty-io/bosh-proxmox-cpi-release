@@ -144,6 +144,7 @@ def run_with_retries(
 
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 import _integration  # noqa: E402
+import _lightstemcell  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -658,6 +659,20 @@ def tier_light(cfg: dict, cpi_config_path: str, keep: bool) -> int:
     stemcell_url = str(tier4.get("stemcell_url", "")).strip()
     stemcell_token = str(tier4.get("stemcell_token", "")).strip()
 
+    # Stemcell version for the light manifests (now standardized on ubuntu-noble
+    # with a templated version). tier4.stemcell_version overrides; otherwise it
+    # is parsed from manifests/bosh/vars.yml stemcell_url so the Tier-4 record
+    # matches what the deployment scripts upload.
+    stemcell_version = str(tier4.get("stemcell_version", "")).strip()
+    if not stemcell_version:
+        if _dry_run:
+            stemcell_version = "0.0"
+        else:
+            _, stemcell_version = _lightstemcell.parse_os_version(
+                _integration.bosh_int(cfg["bosh_vars"], "/stemcell_url")
+            )
+    light_name = "bosh-proxmox-kvm-ubuntu-noble-go_agent-light"
+
     # Validate required preuploaded-mode config.
     if not _dry_run:
         if not stemcell_storage:
@@ -679,6 +694,7 @@ def tier_light(cfg: dict, cpi_config_path: str, keep: bool) -> int:
     rc = run_with_retries(
         [
             "bosh", "-e", alias, "upload-stemcell", preuploaded_manifest,
+            "-v", f"stemcell_version={stemcell_version}",
             "-v", f"stemcell_storage={stemcell_storage}",
             "-v", f"stemcell_filename={stemcell_filename}",
             "--fix",
@@ -717,7 +733,7 @@ def tier_light(cfg: dict, cpi_config_path: str, keep: bool) -> int:
         print("==> tier 4: light preuploaded — delete-stemcell")
         rc = run_with_retries(
             ["bosh", "-e", alias, "delete-stemcell",
-             "bosh-proxmox-kvm-ubuntu-jammy-go_agent-light/1.438",
+             f"{light_name}/{stemcell_version}",
              "-n"],
             env=d_env,
             cwd=REPO_ROOT,
@@ -744,6 +760,7 @@ def tier_light(cfg: dict, cpi_config_path: str, keep: bool) -> int:
         rc = run_with_retries(
             [
                 "bosh", "-e", alias, "upload-stemcell", fetch_manifest,
+                "-v", f"stemcell_version={stemcell_version}",
                 "-v", f"stemcell_url={stemcell_url}",
                 "-v", f"stemcell_token={stemcell_token}",
                 "--fix",
@@ -762,7 +779,7 @@ def tier_light(cfg: dict, cpi_config_path: str, keep: bool) -> int:
             print("==> tier 4: light fetch — delete-stemcell")
             rc = run_with_retries(
                 ["bosh", "-e", alias, "delete-stemcell",
-                 "bosh-proxmox-kvm-ubuntu-jammy-go_agent-light-fetch/1.438",
+                 f"{light_name}-fetch/{stemcell_version}",
                  "-n"],
                 env=d_env,
                 cwd=REPO_ROOT,
