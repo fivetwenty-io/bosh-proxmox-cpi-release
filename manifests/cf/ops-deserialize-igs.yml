@@ -1,0 +1,35 @@
+---
+# Per-instance-group de-serialization.
+#
+# ops-serialize-deploy.yml sets the deployment-level /update/serial: false, but
+# cf-deployment marks several singleton instance groups with their own
+# update.serial: true, which overrides the deployment default and turns each
+# into a stop-the-world barrier (nothing else updates while it does). On this
+# lab that serialized the update stage to ~1.5 avg concurrency.
+#
+# This file lifts the barrier only where it is safe:
+#
+#   router, tcp-router  stateless route tier — parallelizing is safe and also
+#                       helps no-canaries.yml (haproxy resolves the routers via
+#                       bosh-dns sooner when they update in the same wave).
+#
+# database and singleton-blobstore KEEP serial: true — they are stateful
+# singletons where the cf-deployment safety default is correct.
+- type: replace
+  path: /instance_groups/name=router/update?/serial
+  value: false
+
+- type: replace
+  path: /instance_groups/name=tcp-router/update?/serial
+  value: false
+
+# diego-cell carries no update block, so it inherits the deployment default —
+# yet its two instances updated strictly serially (~111s each, 223s total).
+# Pin an explicit per-group policy so both cells update in the same wave. Two
+# cells means max_in_flight: 2 covers the whole group; serial: false guards
+# against inheriting a barrier from any future deployment-level change.
+- type: replace
+  path: /instance_groups/name=diego-cell/update?
+  value:
+    serial: false
+    max_in_flight: 2

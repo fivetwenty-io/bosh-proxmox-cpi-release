@@ -45,6 +45,7 @@ state.json
 # the environment-specific generated ops file pinning them.
 compiled_releases/
 manifests/bosh/compiled-releases.yml
+manifests/cf/compiled-releases.yml
 
 # Integration test generated config (secrets resolved at runtime)
 ci/integration.yml
