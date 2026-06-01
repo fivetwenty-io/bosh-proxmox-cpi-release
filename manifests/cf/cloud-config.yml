@@ -83,8 +83,12 @@ vm_types:
 
 - name: compilation
   cloud_properties:
-    cores: 4
-    memory: 4096
+    # Sized for the heaviest CF source build: percona-xtradb-cluster (mysqld)
+    # final link peaks several GB; at 4 cores / 4096 MB the agent OOM'd at the
+    # link step mid-compile (get_task "could not be found"). 8 cores / 24 GB
+    # gives `make -j` ample headroom; these VMs are transient (host has ~1.5 TB).
+    cores: 8
+    memory: 24576
     disk: 32768
     network_bridge: ((pve_network_bridge))
 
