@@ -396,10 +396,19 @@ def cmd_env(args: list[str]) -> int:
 
 
 def cmd_ucc(args: list[str]) -> int:
+    # Layer the active env (BOSH_PVE_ENV) exactly as create-env does, so the
+    # cloud-config's default network resolves to the env's subnet + bridge.
+    # Without this, deployed VMs (emptyvm, anything before `cf cloud-config`
+    # replaces it) inherit manifests/bosh/vars.yml's base network while the
+    # Director sits on the env network — e.g. on cpitest the VM lands on vmbr1/
+    # 192.168.1.x but NATS is on cpitest0/172.31.0.10, so the agent can never
+    # reach mbus and the deploy fails with "Timed out pinging VM ... agent".
     return run(
         "bosh", "-e", "pve", "-n", "update-cloud-config",
         str(CLOUD_CONFIG),
+        *env_network_ops(),
         "-l", str(VARS),
+        *env_vars_layer(),
         *args,
         env=director_env(),
     )
