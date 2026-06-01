@@ -2,14 +2,22 @@
 
 `bosh create-env` compiles the director's packages on the director VM every run.
 On this lab that is ~18 min of the ~22 min total — dominated by the upstream
-`bosh` release (`director-ruby`, `postgres`, the cloud CLIs) plus our
-`bosh-pve-cpi` Go build. Upstream publishes no compiled `bosh` release for
-ubuntu-noble, and the `bosh` release is not a deployable deployment, so it cannot
-be `export-release`d directly.
+`bosh` release (`director-ruby`, `postgres`, the cloud CLIs). Upstream publishes
+no compiled `bosh` release for ubuntu-noble, and the `bosh` release is not a
+deployable deployment, so it cannot be `export-release`d directly.
 
-`scripts/bosh compile-releases` closes that gap: it compiles the heavy releases
-once against the active stemcell, stores the compiled tarballs, and pins them so
-every later create-env skips compilation.
+`scripts/bosh compile-releases` closes that gap: it compiles the `bosh` release
+once against the active stemcell, stores the compiled tarball, and pins it so
+every later create-env skips that compilation. On this lab it cut a cached
+create-env from **21m55s to 4m54s** (~78%).
+
+The `bosh-pve-cpi` release is deliberately **not** compiled by default: create-env
+runs the CPI binary on the **local host** (the `cloud_provider` driver), not on the
+director VM, so a Linux-compiled CPI cannot execute on a non-Linux workstation
+(`cannot execute binary file`). The CPI compiles locally for the create-env host's
+OS/arch in ~30s and is cached by bosh-init. Set `COMPILE_RELEASES_WITH_CPI=1` to
+also pin a compiled CPI — valid **only** when create-env runs on the same OS/arch
+as the compilation stemcell (e.g. a Linux CI host).
 
 ## How it works
 
@@ -17,7 +25,7 @@ every later create-env skips compilation.
 flowchart TD
     A[running director] --> B[upload stemcell + source releases]
     B --> C[deploy no-VM compilation deployment]
-    C --> D[export-release bosh + bosh-pve-cpi]
+    C --> D[export-release bosh]
     D --> E{store}
     E -->|file| F[compiled_releases/*.tgz]
     E -->|s3| G[S3-compatible bucket]
@@ -27,12 +35,13 @@ flowchart TD
 ```
 
 1. Ensures the stemcell pinned in `manifests/bosh/vars.yml` is on the director.
-2. Uploads the source `bosh` and `bosh-pve-cpi` releases.
+2. Uploads the source `bosh` release (plus `bosh-pve-cpi` when
+   `COMPILE_RELEASES_WITH_CPI=1`).
 3. Deploys a placeholder deployment with **empty `instance_groups`** (no VMs) that
-   merely references the releases + stemcell.
-4. Runs `bosh export-release <name>/<version> <os>/<stemcell>` for each, which
-   compiles the packages on the director's compilation VMs and emits a compiled
-   tarball.
+   merely references the release(s) + stemcell.
+4. Runs `bosh export-release <name>/<version> <os>/<stemcell>` for each target,
+   which compiles the packages on the director's compilation VMs and emits a
+   compiled tarball.
 5. Stores each tarball under a canonical, stemcell-encoded name
    (`<name>-<version>-<os>-<stemcell>.tgz`) and computes its `sha256`.
 6. Writes `manifests/bosh/compiled-releases.yml` — a generated ops file pinning
@@ -137,8 +146,9 @@ compiles from source rather than deploying a cache that cannot match.
 
 ## Scope
 
-Only `bosh` and `bosh-pve-cpi` are compiled here — they are the create-env
-compilation sink. `bpm`, `os-conf`, `uaa`, and `credhub` already arrive as
-compiled blobs from upstream and are left untouched. CloudFoundry uses
-`cf-deployment`'s own `operations/use-compiled-releases.yml` and is unaffected by
-this pipeline.
+Only `bosh` is compiled by default — it is the create-env compilation sink that
+runs on the director VM. `bosh-pve-cpi` runs locally and compiles per create-env
+host (opt in with `COMPILE_RELEASES_WITH_CPI=1` on same-OS/arch hosts). `bpm`,
+`os-conf`, `uaa`, and `credhub` already arrive as compiled blobs from upstream and
+are left untouched. CloudFoundry uses `cf-deployment`'s own
+`operations/use-compiled-releases.yml` and is unaffected by this pipeline.

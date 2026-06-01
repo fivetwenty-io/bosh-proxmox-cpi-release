@@ -974,32 +974,44 @@ def cmd_compile_releases(args: list[str]) -> int:
         if run("bosh", "-e", "pve", "-n", "upload-stemcell", "--sha1", sc_sha, sc_url, env=denv) != 0:
             sys.exit("compile-releases: stemcell upload failed")
 
-    # 2. Upload the source releases to compile.
+    # 2. Upload the source release(s) to compile.
+    #
+    # Only the bosh release is pinned compiled: it runs solely on the Linux
+    # director VM. The bosh-pve-cpi release is NOT compiled by default — create-env
+    # runs the CPI binary on the LOCAL host (cloud_provider driver), so a
+    # Linux-compiled CPI cannot execute on a non-Linux workstation ("cannot execute
+    # binary file"). It is left to compile locally for the create-env host's OS.
+    # Set COMPILE_RELEASES_WITH_CPI=1 only when create-env runs on the same
+    # OS/arch as the compilation stemcell (e.g. a Linux CI host).
+    include_cpi = os.environ.get("COMPILE_RELEASES_WITH_CPI", "").strip().lower() in ("1", "true", "yes")
     bosh_ver, bosh_url, bosh_sha = _bosh_release_pin()
-    cpi_path = cpi_release_path()
-    cpi_ver = _cpi_release_version(cpi_path)
-    print(f"    uploading source releases (bosh/{bosh_ver}, bosh-pve-cpi/{cpi_ver})")
+    targets = [("bosh", bosh_ver)]
+    print(f"    uploading source release bosh/{bosh_ver}")
     if run("bosh", "-e", "pve", "-n", "upload-release", "--sha1", bosh_sha, bosh_url, env=denv) != 0:
         sys.exit("compile-releases: upload bosh release failed")
-    if run("bosh", "-e", "pve", "-n", "upload-release", cpi_path, env=denv) != 0:
-        sys.exit("compile-releases: upload bosh-pve-cpi release failed")
-    # Verify the versions we will export-release actually registered on the
-    # director. A dev release.MF version that differs from what we parsed would
-    # otherwise surface as a confusing "release not found" from export-release.
+    # Verify the version we will export-release actually registered on the director;
+    # a mismatch would otherwise surface as a confusing "release not found".
     if not _release_present(denv, "bosh", bosh_ver):
         sys.exit(f"compile-releases: bosh/{bosh_ver} not on director after upload; check `bosh releases`")
-    if not _release_present(denv, "bosh-pve-cpi", cpi_ver):
-        sys.exit(
-            f"compile-releases: bosh-pve-cpi/{cpi_ver} not on director after upload "
-            f"(release.MF version may differ); check `bosh releases`"
-        )
+    if include_cpi:
+        cpi_path = cpi_release_path()
+        cpi_ver = _cpi_release_version(cpi_path)
+        print(f"    uploading source release bosh-pve-cpi/{cpi_ver} (COMPILE_RELEASES_WITH_CPI)")
+        if run("bosh", "-e", "pve", "-n", "upload-release", cpi_path, env=denv) != 0:
+            sys.exit("compile-releases: upload bosh-pve-cpi release failed")
+        if not _release_present(denv, "bosh-pve-cpi", cpi_ver):
+            sys.exit(
+                f"compile-releases: bosh-pve-cpi/{cpi_ver} not on director after upload "
+                f"(release.MF version may differ); check `bosh releases`"
+            )
+        targets.append(("bosh-pve-cpi", cpi_ver))
 
     # 3. Deploy the no-VM compilation deployment (empty instance_groups).
+    rel_lines = "".join(f"- name: {n}\n  version: \"{v}\"\n" for n, v in targets)
     manifest = (
         f"name: {COMPILE_DEPLOYMENT}\n"
         "releases:\n"
-        f"- name: bosh\n  version: \"{bosh_ver}\"\n"
-        f"- name: bosh-pve-cpi\n  version: \"{cpi_ver}\"\n"
+        f"{rel_lines}"
         "stemcells:\n"
         f"- alias: default\n  os: {os_name}\n  version: \"{sc_version}\"\n"
         "instance_groups: []\n"
@@ -1013,11 +1025,8 @@ def cmd_compile_releases(args: list[str]) -> int:
         mf.close()
         if run("bosh", "-e", "pve", "-n", "-d", COMPILE_DEPLOYMENT, "deploy", mf.name, env=denv) != 0:
             sys.exit("compile-releases: compilation deploy failed")
-        # 4. Export each release (compiles on the director's compilation VMs).
-        compiled = [
-            _export_compiled("bosh", bosh_ver, os_name, sc_version, cfg),
-            _export_compiled("bosh-pve-cpi", cpi_ver, os_name, sc_version, cfg),
-        ]
+        # 4. Export each target (compiles on the director's compilation VMs).
+        compiled = [_export_compiled(n, v, os_name, sc_version, cfg) for n, v in targets]
     finally:
         os.unlink(mf.name)
         run("bosh", "-e", "pve", "-n", "-d", COMPILE_DEPLOYMENT, "delete-deployment", "--force", env=denv)
