@@ -64,7 +64,9 @@ PLACEHOLDER_IMAGE = b"\x00"  # create-env tarball image; never read (IsLight sho
 DEFAULT_OS_TYPE = "l26"
 DEFAULT_DISK_FORMAT = "qcow2"
 DEFAULT_DISK_MIB = 10240
-STEMCELL_FORMAT = "proxmox-kvm"
+# Must be one of the formats the CPI advertises in info.go's stemcell_formats;
+# the Director rejects the upload otherwise. pve-qcow2 is the PVE-native qcow2.
+STEMCELL_FORMAT = "pve-qcow2"
 PLACEHOLDER_SHA1 = "0" * 40
 VALID_MODES = ("preuploaded", "fetch")
 

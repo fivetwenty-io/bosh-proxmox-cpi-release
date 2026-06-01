@@ -203,8 +203,13 @@ def stemcell_os_version() -> "tuple[str, str]":
     return _lightstemcell.parse_os_version(_light_int_opt("/stemcell_url"))
 
 
-def ensure_light_stemcell() -> "_lightstemcell.LightStemcell":
-    """Ensure the light stemcell is on PVE and return its descriptor (manifest)."""
+def ensure_light_stemcell(build_tarball: bool = False) -> "_lightstemcell.LightStemcell":
+    """Ensure the light stemcell is on PVE and return its descriptor.
+
+    build_tarball packs the light stemcell .tgz (stemcell.MF + placeholder image)
+    needed by `bosh upload-stemcell` — a raw rendered manifest is not a valid
+    upload-stemcell input (bosh expects a gzipped tarball).
+    """
     source_url = _light_int_opt("/stemcell_url")
     source_sha1 = _light_int_opt("/stemcell_sha1")
     os_name, version = _lightstemcell.parse_os_version(source_url)
@@ -218,16 +223,17 @@ def ensure_light_stemcell() -> "_lightstemcell.LightStemcell":
         source_url=source_url, source_sha1=source_sha1,
         cache_dir=str(STEMCELL_CACHE),
         image_url=(fetch_url or None), token=(token or None),
-        build_create_env_tarball=False,
+        build_create_env_tarball=build_tarball,
     )
 
 
 def cmd_stemcell(_extra: list[str]) -> None:
     banner("Stemcell (light)")
-    light = ensure_light_stemcell()
+    # upload-stemcell needs the light tarball, not the rendered MF.
+    light = ensure_light_stemcell(build_tarball=True)
     # --fix re-registers the version if a record already exists; the qcow2
     # upload itself fast-paths on the cached SHA, so re-runs are cheap.
-    run("bosh", "-e", ENV, "-n", "upload-stemcell", str(light.manifest_path), "--fix")
+    run("bosh", "-e", ENV, "-n", "upload-stemcell", str(light.create_env_tarball), "--fix")
 
 
 def _cf_has_database_vm() -> bool:
