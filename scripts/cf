@@ -126,6 +126,45 @@ def _env_cf_cloud_config_ops() -> list[str]:
     return ["-o", str(layer)]
 
 
+def _env_vars_layer() -> list[str]:
+    """Return `-l <env vars.yml>` for the active env, layered LAST so it wins.
+
+    BOSH_PVE_ENV selects manifests/envs/<env>/vars.yml when present. Placed
+    after manifests/cf/vars.yml on the command line so the env's network
+    overrides (internal_cidr, internal_gw, haproxy_private_ip,
+    pve_network_bridge) take precedence over the base/CF defaults — this is
+    what moves CF onto the env's isolated network. Pairs with the director
+    layer applied by scripts/bosh.
+    """
+    env_name = os.environ.get("BOSH_PVE_ENV", "").strip()
+    if not env_name:
+        return []
+    layer = REPO_ROOT / "manifests" / "envs" / env_name / "vars.yml"
+    if not layer.exists():
+        return []
+    return ["-l", str(layer)]
+
+
+def _bosh_var(json_path: str) -> str:
+    """Read a var, preferring the active env's vars.yml over the base vars.
+
+    The active env (BOSH_PVE_ENV) may override Director-network vars such as
+    internal_ip; resolving them env-first keeps credhub/login pointed at the
+    Director's real address when it has been moved onto an isolated network.
+    """
+    env_name = os.environ.get("BOSH_PVE_ENV", "").strip()
+    if env_name:
+        layer = REPO_ROOT / "manifests" / "envs" / env_name / "vars.yml"
+        if layer.exists():
+            res = subprocess.run(
+                ["bosh", "int", str(layer), f"--path={json_path}"],
+                capture_output=True, text=True,
+            )
+            if res.returncode == 0 and res.stdout.strip():
+                return res.stdout.strip()
+    return capture("bosh", "int", str(BOSH_VARS), f"--path={json_path}")
+
+
 def cmd_cloud_config(_extra: list[str]) -> None:
     banner("Cloud-config")
     run(
@@ -134,6 +173,7 @@ def cmd_cloud_config(_extra: list[str]) -> None:
         *_env_cf_cloud_config_ops(),
         "-l", "manifests/bosh/vars.yml",
         "-l", "manifests/cf/vars.yml",
+        *_env_vars_layer(),
     )
 
 
@@ -742,6 +782,7 @@ def cmd_bosh_deploy(extra: list[str]) -> None:
         "-o", "manifests/cf/no-canaries.yml",
         "-l", "manifests/bosh/vars.yml",
         "-l", "manifests/cf/vars.yml",
+        *_env_vars_layer(),
         *extra,
     ]
 
@@ -800,7 +841,7 @@ def system_domain() -> str:
 def credhub_env() -> dict[str, str]:
     if not BOSH_CREDS.exists():
         sys.exit(f"creds file missing: {BOSH_CREDS} — run 'scripts/bosh create-env' first")
-    director_ip = capture("bosh", "int", str(BOSH_VARS), "--path=/internal_ip")
+    director_ip = _bosh_var("/internal_ip")
     credhub_ca = capture("bosh", "int", str(BOSH_CREDS), "--path=/credhub_tls/ca")
     uaa_ca = capture("bosh", "int", str(BOSH_CREDS), "--path=/uaa_ssl/ca")
     env = os.environ.copy()

@@ -18,10 +18,25 @@ Subcommands:
     upload-stemcell        upload $STEMCELL_PATH to the director (needed before
                            emptyvm; idempotent for an already-present version)
     emptyvm                deploy manifests/bosh/emptyvm.yml
+    net-up | network-up    create the active env's isolated SDN test network
+                           (zone + vnet + subnet, idempotent) on the PVE host.
+                           Requires BOSH_PVE_ENV (e.g. cpitest). Run before
+                           create-env so the Director attaches to the vnet.
+    net-down | network-down
+                           tear the SDN subnet/vnet/zone back down (idempotent).
+    net-status | network-status
+                           show the SDN zone/vnet/subnet + node bridge state.
     credhub <args>         passthrough → credhub <args> with the director's
                            credhub URL, admin client, and CA pre-exported
     help                   show this help
     <anything else>        passthrough → bosh -e pve <args>
+
+Env selection (isolated networks):
+    BOSH_PVE_ENV=<name>    layer manifests/envs/<name>/{network.yml,vars.yml}
+                           onto create-env/teardown, moving the Director onto
+                           that env's network. Pairs with `scripts/cf` which
+                           layers the matching cf-cloud-config.yml + vars.yml.
+                           Ships with `cpitest` (isolated 172.x SDN vnet).
 
 Env (auto-exported for non-create-env subcommands when creds.yml exists):
     BOSH_ENVIRONMENT=pve
@@ -40,6 +55,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -112,6 +128,27 @@ def env_network_ops() -> list[str]:
         return []
     return ["-o", str(layer)]
 
+
+def env_vars_file() -> "Path | None":
+    """Return manifests/envs/<BOSH_PVE_ENV>/vars.yml when it exists.
+
+    This file carries env-specific overrides (network range, gateway,
+    bridge, Director IP, SDN parameters). It is layered AFTER
+    manifests/bosh/vars.yml so its keys win, which is how an env moves the
+    Director onto an isolated network without editing the base vars.
+    """
+    env_name = os.environ.get("BOSH_PVE_ENV", "").strip()
+    if not env_name:
+        return None
+    f = ENVS_DIR / env_name / "vars.yml"
+    return f if f.exists() else None
+
+
+def env_vars_layer() -> list[str]:
+    """Return the `-l <env vars.yml>` flag pair, or [] when absent."""
+    f = env_vars_file()
+    return ["-l", str(f)] if f else []
+
 USAGE = __doc__ or ""
 
 
@@ -167,6 +204,7 @@ def cmd_create_env(args: list[str]) -> int:
         "-o", str(JUMPBOX_OPS),
         *env_network_ops(),
         "-l", str(VARS),
+        *env_vars_layer(),
         "-v", "director_name=ocfp-mgmt",
         "-v", f"pve_cpi_release_path={release}",
         f"--state={STATE}",
@@ -231,6 +269,7 @@ def cmd_teardown(args: list[str]) -> int:
         "-o", str(JUMPBOX_OPS),
         *env_network_ops(),
         "-l", str(VARS),
+        *env_vars_layer(),
         "-v", "director_name=ocfp-mgmt",
         "-v", f"pve_cpi_release_path={release}",
         f"--state={STATE}",
@@ -307,6 +346,179 @@ def cmd_credhub(args: list[str]) -> int:
     return run("credhub", *args, env=credhub_env())
 
 
+# ---------------------------------------------------------------------------
+# SDN test-network lifecycle (net-up / net-down / net-status)
+#
+# Creates an isolated, CPI-owned network as a PVE SDN "simple" zone + vnet +
+# subnet, so the Director and deployment do not share an L2 segment with
+# unmanaged devices. That sharing is the root cause of the duplicate-IP / ARP
+# ambiguity agent flapping documented in docs/troubleshooting.md. Parameters
+# come from the active env's vars.yml (BOSH_PVE_ENV); see
+# manifests/envs/cpitest/. Idempotent: safe to re-run.
+# ---------------------------------------------------------------------------
+
+def _bosh_int_opt(path: Path, json_path: str) -> "str | None":
+    """Return a single var from a YAML file via `bosh int`, or None if absent."""
+    res = subprocess.run(
+        ["bosh", "int", str(path), "--path", json_path],
+        capture_output=True, text=True,
+    )
+    if res.returncode != 0:
+        return None
+    return res.stdout.rstrip("\n")
+
+
+def _sdn_params() -> dict[str, str]:
+    """Resolve SDN parameters from the active env's vars.yml + base vars.
+
+    Exits with guidance when BOSH_PVE_ENV is unset, its vars.yml is missing,
+    or any required cpitest_sdn_* key is absent.
+    """
+    env_name = os.environ.get("BOSH_PVE_ENV", "").strip()
+    if not env_name:
+        sys.exit(
+            "net-*: BOSH_PVE_ENV is not set. Point it at an env bundle that "
+            "defines the SDN network, e.g.\n"
+            "    BOSH_PVE_ENV=cpitest ./scripts/bosh net-up\n"
+            "See manifests/envs/cpitest/."
+        )
+    vfile = ENVS_DIR / env_name / "vars.yml"
+    if not vfile.exists():
+        sys.exit(f"net-*: env vars file missing: {vfile}")
+
+    def need(key: str) -> str:
+        val = _bosh_int_opt(vfile, f"/{key}")
+        if val is None or not val.strip():
+            sys.exit(f"net-*: {key} not set in {vfile}")
+        return val.strip()
+
+    pve_host = _bosh_int_opt(VARS, "/pve_host")
+    if not pve_host:
+        sys.exit(f"net-*: pve_host not set in {VARS}")
+
+    snat_raw = need("cpitest_sdn_snat").lower()
+    snat = "1" if snat_raw in ("1", "true", "yes", "on") else "0"
+
+    return {
+        "pve_host": pve_host,
+        "zone": need("cpitest_sdn_zone"),
+        "zone_type": need("cpitest_sdn_zone_type"),
+        "vnet": need("cpitest_sdn_vnet"),
+        "subnet": need("cpitest_sdn_subnet"),
+        "gateway": need("cpitest_sdn_gateway"),
+        "snat": snat,
+    }
+
+
+def _pve_ssh(pve_host: str, remote_script: str) -> int:
+    """Run a bash script on the PVE host as root over SSH, streaming output.
+
+    StrictHostKeyChecking is left to the operator's ssh config; set
+    SCRIPTS_PVE_SSH_INSECURE=1 to auto-accept an unknown host key (lab use).
+    """
+    ssh_opts = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
+    if os.environ.get("SCRIPTS_PVE_SSH_INSECURE", "").strip() in ("1", "true", "yes"):
+        ssh_opts += ["-o", "StrictHostKeyChecking=accept-new"]
+    return subprocess.run(
+        ["ssh", *ssh_opts, f"root@{pve_host}", "bash", "-s"],
+        input=remote_script, text=True,
+    ).returncode
+
+
+def _q(value: str) -> str:
+    """Shell-quote a value for safe interpolation into the remote script."""
+    return shlex.quote(value)
+
+
+def cmd_net_up(_args: list[str]) -> int:
+    p = _sdn_params()
+    print(
+        f">>> net-up: ensuring SDN zone={p['zone']} ({p['zone_type']}) "
+        f"vnet={p['vnet']} subnet={p['subnet']} gw={p['gateway']} snat={p['snat']} "
+        f"on {p['pve_host']}\n",
+        flush=True,
+    )
+    script = f"""set -euo pipefail
+ZONE={_q(p['zone'])}; ZTYPE={_q(p['zone_type'])}; VNET={_q(p['vnet'])}
+SUBNET={_q(p['subnet'])}; GW={_q(p['gateway'])}; SNAT={_q(p['snat'])}
+NET=${{SUBNET%/*}}
+if pvesh get /cluster/sdn/zones/"$ZONE" >/dev/null 2>&1; then
+  echo "zone $ZONE: exists"
+else
+  pvesh create /cluster/sdn/zones --type "$ZTYPE" --zone "$ZONE"
+  echo "zone $ZONE: created ($ZTYPE)"
+fi
+if pvesh get /cluster/sdn/vnets/"$VNET" >/dev/null 2>&1; then
+  echo "vnet $VNET: exists"
+else
+  pvesh create /cluster/sdn/vnets --vnet "$VNET" --zone "$ZONE"
+  echo "vnet $VNET: created (zone $ZONE)"
+fi
+if pvesh get /cluster/sdn/vnets/"$VNET"/subnets --output-format json 2>/dev/null | grep -q "$NET"; then
+  echo "subnet $SUBNET: exists"
+else
+  pvesh create /cluster/sdn/vnets/"$VNET"/subnets --type subnet --subnet "$SUBNET" --gateway "$GW" --snat "$SNAT"
+  echo "subnet $SUBNET: created (gw $GW snat=$SNAT)"
+fi
+pvesh set /cluster/sdn
+echo "sdn: applied (vnet $VNET is now a bridge on the node)"
+"""
+    return _pve_ssh(p["pve_host"], script)
+
+
+def cmd_net_down(_args: list[str]) -> int:
+    p = _sdn_params()
+    print(
+        f">>> net-down: removing SDN subnet/vnet/zone for vnet={p['vnet']} "
+        f"zone={p['zone']} on {p['pve_host']}\n",
+        flush=True,
+    )
+    # Best-effort (no `set -e`): each delete is idempotent and tolerates
+    # already-absent objects. The subnet id is read back from the API rather
+    # than reconstructed, since PVE derives it as "<zone>-<net>-<prefix>".
+    script = f"""set -uo pipefail
+ZONE={_q(p['zone'])}; VNET={_q(p['vnet'])}
+SUBID=$(pvesh get /cluster/sdn/vnets/"$VNET"/subnets --output-format json 2>/dev/null \
+  | sed -n 's/.*"subnet"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p' | head -1)
+if [ -n "${{SUBID:-}}" ]; then
+  pvesh delete /cluster/sdn/vnets/"$VNET"/subnets/"$SUBID" 2>/dev/null \
+    && echo "subnet $SUBID: deleted" || echo "subnet $SUBID: delete skipped"
+else
+  echo "subnet: none"
+fi
+if pvesh get /cluster/sdn/vnets/"$VNET" >/dev/null 2>&1; then
+  pvesh delete /cluster/sdn/vnets/"$VNET" && echo "vnet $VNET: deleted" || echo "vnet $VNET: delete skipped"
+else
+  echo "vnet $VNET: absent"
+fi
+if pvesh get /cluster/sdn/zones/"$ZONE" >/dev/null 2>&1; then
+  pvesh delete /cluster/sdn/zones/"$ZONE" && echo "zone $ZONE: deleted" \
+    || echo "zone $ZONE: delete skipped (still referenced?)"
+else
+  echo "zone $ZONE: absent"
+fi
+pvesh set /cluster/sdn
+echo "sdn: applied"
+"""
+    return _pve_ssh(p["pve_host"], script)
+
+
+def cmd_net_status(_args: list[str]) -> int:
+    p = _sdn_params()
+    script = f"""set -uo pipefail
+ZONE={_q(p['zone'])}; VNET={_q(p['vnet'])}
+echo "== zone $ZONE =="
+pvesh get /cluster/sdn/zones/"$ZONE" 2>/dev/null || echo "absent"
+echo "== vnet $VNET =="
+pvesh get /cluster/sdn/vnets/"$VNET" 2>/dev/null || echo "absent"
+echo "== subnets =="
+pvesh get /cluster/sdn/vnets/"$VNET"/subnets 2>/dev/null || echo "absent"
+echo "== bridge on node =="
+ip -br link show "$VNET" 2>/dev/null || echo "bridge $VNET not present (run net-up + apply)"
+"""
+    return _pve_ssh(p["pve_host"], script)
+
+
 def cmd_help(args: list[str]) -> int:
     print(USAGE)
     return 0
@@ -329,6 +541,12 @@ COMMANDS = {
     "runtime-config": cmd_runtime_config,
     "upload-stemcell": cmd_upload_stemcell,
     "emptyvm": cmd_emptyvm,
+    "net-up": cmd_net_up,
+    "network-up": cmd_net_up,
+    "net-down": cmd_net_down,
+    "network-down": cmd_net_down,
+    "net-status": cmd_net_status,
+    "network-status": cmd_net_status,
     "credhub": cmd_credhub,
     "help": cmd_help,
     "-h": cmd_help,

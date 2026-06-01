@@ -1,0 +1,36 @@
+---
+# ============================================================================
+# Env bundle: cpitest — CF cloud-config network override.
+#
+# Auto-layered by `scripts/cf cloud-config` (and the full `deploy`) when
+# BOSH_PVE_ENV=cpitest. Replaces the default subnet (192.168.1.0/24 on the
+# shared LAN bridge) with the isolated cpitest SDN vnet. All values are pulled
+# from manifests/envs/cpitest/vars.yml so a single edit there re-shapes both
+# the Director network and this cloud-config in lockstep.
+#
+# Direct invocation:
+#   bosh -e pve update-cloud-config manifests/cf/cloud-config.yml \
+#     -o manifests/envs/cpitest/cf-cloud-config.yml \
+#     -l manifests/bosh/vars.yml -l manifests/cf/vars.yml \
+#     -l manifests/envs/cpitest/vars.yml
+# ============================================================================
+
+- type: replace
+  path: /networks/name=default/subnets/0/range
+  value: ((internal_cidr))
+
+- type: replace
+  path: /networks/name=default/subnets/0/gateway
+  value: ((internal_gw))
+
+- type: replace
+  path: /networks/name=default/subnets/0/reserved
+  value: ((cpitest_reserved))
+
+- type: replace
+  path: /networks/name=default/subnets/0/static
+  value: ((cpitest_static))
+
+- type: replace
+  path: /networks/name=default/subnets/0/cloud_properties/bridge
+  value: ((pve_network_bridge))

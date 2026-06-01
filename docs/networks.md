@@ -147,7 +147,59 @@ The CPI will:
 2. Call `PUT /nodes/pve1/network` to reload the node network config.
 3. Return network CID `vmbr1`, address properties, and `cloud_properties` containing `bridge` and `node`.
 
+## Isolated test network (SDN)
+
+For deploy testing — especially CloudFoundry, where dozens of VMs are placed at
+once — never share an L2 segment with unmanaged devices. If the deployment
+subnet overlaps a physical office or lab LAN, an address BOSH assigns to a VM
+can collide with a device already using it; two MACs then answer ARP, the
+Director's ARP cache flaps, mbus packets are misdelivered, and agents loop
+`connection reset by peer` → reconnect, failing random instances with
+`Timed out sending 'get_state'`. See
+[Troubleshooting — duplicate IP on a shared LAN](troubleshooting.md#agent-never-comes-up).
+
+This repo ships a turnkey isolated network as a PVE SDN **simple** zone + vnet +
+subnet on a private `172.x` range. Selecting it moves both the Director and the
+deployment onto a network BOSH fully owns, so no foreign device can claim an
+address.
+
+```bash
+# 1. Create the SDN zone + vnet + subnet on the PVE host (idempotent).
+./scripts/bosh net-up
+
+# 2. Deploy the Director onto the isolated network.
+BOSH_PVE_ENV=cpitest ./scripts/bosh create-env
+BOSH_PVE_ENV=cpitest ./scripts/bosh alias-env
+
+# 3. Upload the cloud-config and deploy CF onto the same network.
+BOSH_PVE_ENV=cpitest ./scripts/cf deploy
+
+# Inspect / tear down.
+./scripts/bosh net-status
+./scripts/bosh net-down        # after delete-env + cf teardown
+```
+
+`net-up` creates a simple zone (a plain local bridge — an isolated L2 segment
+plus a gateway), one vnet whose name becomes the Linux bridge VMs attach to, and
+a subnet with `snat` enabled so VMs reach the internet via the PVE host's uplink
+while staying off the shared LAN. It commits with `pvesh set /cluster/sdn` and is
+idempotent.
+
+Everything is operator-configurable in a single file —
+[`manifests/envs/cpitest/vars.yml`](../manifests/envs/cpitest/vars.yml) — which
+defines the vnet name, zone, CIDR, gateway, reserved bands, and static IPs. The
+same `vars.yml` drives both the SDN objects (`net-up`) and the BOSH manifests
+(Director network + CF cloud-config), so they always agree. To run a different
+layout, copy `manifests/envs/cpitest/` to `manifests/envs/<name>/`, edit the
+copy, and drive it with `BOSH_PVE_ENV=<name>`. Keep these invariants:
+`pve_network_bridge` == `cpitest_sdn_vnet`, `internal_cidr` ==
+`cpitest_sdn_subnet`, `internal_gw` == `cpitest_sdn_gateway`, and every
+reserved/static/host IP inside `internal_cidr`. Proxmox limits zone and vnet
+names to 8 characters; vnet names must start with a letter. See
+[`manifests/envs/cpitest/README.md`](../manifests/envs/cpitest/README.md).
+
 ## Cross-references
 
 - [Configuration Reference](configuration.md) — full property table including `network_mode`, `sdn_zone`, `sdn_zone_type`, and `sdn_auto_manage_zone`.
 - [Operations Guide](operations.md) — operational guidance for SDN setup, troubleshooting apply failures, and bridge cleanup.
+- [Troubleshooting](troubleshooting.md#agent-never-comes-up) — duplicate-IP / ARP-ambiguity agent flapping and the isolated-network fix.

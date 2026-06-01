@@ -1,0 +1,68 @@
+---
+# ============================================================================
+# Env bundle: cpitest — isolated SDN test network.
+#
+# Single source of truth for an isolated, CPI-owned network used for CF (and
+# other) deploy testing. Selecting this env moves BOTH the Director and the
+# deployment onto a dedicated PVE SDN vnet on a private 172.x range, so BOSH
+# owns the entire address space and no foreign device on a shared office/lab
+# LAN can answer ARP for a VM's address. That ARP ambiguity is the root cause
+# of the "agent connects, runs ~15s, then 'connection reset by peer', repeat"
+# flapping documented in docs/troubleshooting.md ("duplicate IP on a shared
+# LAN") and docs/networks.md ("Isolated test network (SDN)").
+#
+# Everything here is operator-configurable. To run a different layout, copy
+# this directory to manifests/envs/<name>/ and edit the values, then drive it
+# with BOSH_PVE_ENV=<name>. Keep the four invariants below consistent:
+#
+#   1. pve_network_bridge MUST equal cpitest_sdn_vnet (the SDN vnet name is the
+#      Linux bridge that VMs attach to).
+#   2. internal_cidr MUST equal cpitest_sdn_subnet.
+#   3. internal_gw / cpitest_sdn_gateway MUST be the subnet's gateway.
+#   4. Every reserved/static entry and internal_ip / haproxy_private_ip MUST
+#      lie inside internal_cidr.
+#
+# Usage:
+#   ./scripts/bosh net-up                 # create zone+vnet+subnet on PVE
+#   BOSH_PVE_ENV=cpitest ./scripts/bosh create-env
+#   BOSH_PVE_ENV=cpitest ./scripts/cf deploy
+#   ./scripts/bosh net-down               # tear the SDN objects back down
+#
+# NOTE: this file is deliberately tracked in git (force-added past the global
+# `vars.yml` ignore rule) because it is pure network configuration. KEEP IT
+# SECRET-FREE — no passwords, tokens, or keys. Credentials belong in
+# manifests/bosh/vars.yml (gitignored), not here.
+# ============================================================================
+
+# --- Director + deployment network (overrides manifests/bosh/vars.yml) -----
+# Layered after bosh/vars.yml (and cf/vars.yml) so these win.
+internal_cidr:       172.31.0.0/24
+internal_gw:         172.31.0.1
+internal_ip:         172.31.0.10
+pve_network_bridge:  cpitest0
+# HAProxy entry point (CF). Wildcard system-domain DNS must resolve here.
+# Falls inside the static: band declared in cf-cloud-config.yml below.
+haproxy_private_ip:  172.31.0.50
+
+# --- SDN objects created by `scripts/bosh net-up` --------------------------
+# A "simple" zone is a pure local bridge with no VLAN/VXLAN encapsulation —
+# exactly an isolated L2 segment plus a gateway. SNAT lets VMs reach the
+# internet (apt, bosh.io, DNS) via the PVE host's uplink while staying off the
+# shared LAN. Zone name max 8 chars; vnet name max 8 chars, starts with a
+# letter.
+cpitest_sdn_zone:       cpitest
+cpitest_sdn_zone_type:  simple
+cpitest_sdn_vnet:       cpitest0
+cpitest_sdn_subnet:     172.31.0.0/24
+cpitest_sdn_gateway:    172.31.0.1
+cpitest_sdn_snat:       true
+
+# --- Cloud-config IPAM bands (consumed by cf-cloud-config.yml) -------------
+# Must lie inside internal_cidr. Reserve the gateway + infra band at the
+# bottom and a router/infra band at the top; the Director (.10) and haproxy
+# (.50) sit in the reserved/static slots, CF VMs take the dynamic middle.
+cpitest_reserved:
+- 172.31.0.1-172.31.0.19
+- 172.31.0.200-172.31.0.254
+cpitest_static:
+- 172.31.0.50

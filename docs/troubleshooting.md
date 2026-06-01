@@ -549,6 +549,30 @@ sysctl -w net.ipv4.tcp_keepalive_probes=4
 
 See [PVE Host Tuning](pve-host-tuning.md) for persistent configuration.
 
+**Diagnosis — duplicate IP on a shared LAN (ARP ambiguity)**
+
+This is the root cause of the most confusing variant: an agent that connects, runs fine for ~15 seconds, then drops with `connection reset by peer`, reconnects, and repeats — while every resource, NATS, firewall, and the agent process itself measure healthy. It surfaces during large deploys (cf-deployment) as random instances failing `Timed out sending 'get_state'` even though nothing is wrong inside the VM.
+
+The trigger is a second device on the same L2 segment answering ARP for an address BOSH assigned to a VM. When the deployment subnet overlaps a physical office/lab LAN (e.g. CF VMs placed directly on `192.168.1.0/24`), an address handed to a VM can collide with a printer, laptop, or appliance already using it. Two MACs then answer `who-has`, the Director's ARP cache flaps between them, and mbus packets are periodically delivered to the wrong host, which RSTs them. An idle connection (mbus between RPCs) drifts onto the wrong MAC on the next ARP refresh — hence the ~15 s reachable-then-break cadence that mimics a keepalive problem.
+
+Confirm it from the PVE node by watching who replies to ARP while sweeping the range:
+
+```bash
+# Terminal 1: capture ARP replies on the deployment bridge.
+tcpdump -i vmbr1 -nn -l arp
+
+# Terminal 2: provoke a reply from every address in the band.
+for o in $(seq 20 60); do ping -c1 -W1 192.168.1.$o >/dev/null 2>&1 & done; wait
+```
+
+In the capture, any IP that shows two distinct `is-at <mac>` answers is a duplicate. The genuine VM is the virtio NIC (its ARP frames are 28 bytes); a physical device's frame is padded to length 46. Each conflicting IP maps to exactly the instance that keeps flapping; non-conflicting IPs stay stable. Cross-check the VM MACs with `qm config <vmid> | grep -i net`.
+
+**Fix**
+
+Stop sharing an L2 segment with unmanaged devices. Put the Director and the deployment on a dedicated, isolated network the CPI controls, so BOSH owns the entire address range and no foreign device can claim an address. This repo ships a turnkey isolated network on a private `172.x` range backed by a PVE SDN vnet (`cpitest0` by default), created by `./scripts/bosh net-up` and selected with `BOSH_PVE_ENV=cpitest`. The vnet name, zone, CIDR, gateway, reserved bands, and static IPs are all operator-configurable. See [Isolated test network (SDN)](networks.md#isolated-test-network-sdn) for the full procedure.
+
+If an isolated network is not an option, reserve every colliding address in the deployment's cloud-config `reserved:` list so BOSH never assigns it — but re-scan whenever the physical LAN changes, since any new device can introduce a fresh collision.
+
 ## Storage lock contention and transient transport faults
 
 These two failure classes are handled by CPI retry logic and are usually absorbed without operator action.
