@@ -631,6 +631,21 @@ for b in {buckets}; do
     aws --endpoint-url "$EP"{aws_insecure} s3 mb "s3://$b" >/dev/null
     echo "    bucket: $b created"
   fi
+  # Grant anonymous read. The director fetches pinned compiled-release tarballs
+  # over plain HTTP (download_remote_file — no S3 signing), so the objects must
+  # be readable without credentials; otherwise the unsigned https url that
+  # scripts/cf pins in compiled-releases.yml returns 403 and `bosh deploy` fails
+  # at the "Uploading remote release" step. Idempotent — re-applying is a no-op.
+  aws --endpoint-url "$EP"{aws_insecure} s3api put-bucket-policy --bucket "$b" --policy "{{
+    \\"Version\\": \\"2012-10-17\\",
+    \\"Statement\\": [{{
+      \\"Sid\\": \\"AnonRead\\",
+      \\"Effect\\": \\"Allow\\",
+      \\"Principal\\": \\"*\\",
+      \\"Action\\": [\\"s3:GetObject\\"],
+      \\"Resource\\": [\\"arn:aws:s3:::$b/*\\"]
+    }}]
+  }}" >/dev/null 2>&1 && echo "    bucket: $b anonymous-read set" || echo "    bucket: $b WARN policy not set"
 done
 echo "    install: rustfs ready on $EP"
 """

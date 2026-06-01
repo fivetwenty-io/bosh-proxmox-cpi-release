@@ -47,6 +47,7 @@ SSH model: VM creation runs `qm` on the PVE host over root SSH (the same channel
 
 from __future__ import annotations
 
+import json
 import os
 import shlex
 import subprocess
@@ -501,11 +502,42 @@ def cmd_create_bucket(args: "list[str]") -> int:
     head = aws(state, "s3api", "head-bucket", "--bucket", name, capture=True)
     if head.returncode == 0:
         print(f"    bucket: {name} present")
+        _ensure_anon_read(state, name)
         return 0
     rc = aws(state, "s3", "mb", f"s3://{name}").returncode
     if rc == 0:
         print(f"    bucket: {name} created")
+        _ensure_anon_read(state, name)
     return rc
+
+
+def _ensure_anon_read(state: dict, name: str) -> None:
+    """Grant anonymous s3:GetObject on a bucket (idempotent).
+
+    The director fetches pinned compiled-release tarballs over plain HTTP with
+    no S3 signing, so objects must be world-readable; otherwise the unsigned
+    https url scripts/cf pins returns 403 and ``bosh deploy`` fails at the
+    "Uploading remote release" step.
+    """
+    policy = json.dumps(
+        {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Sid": "AnonRead",
+                    "Effect": "Allow",
+                    "Principal": "*",
+                    "Action": ["s3:GetObject"],
+                    "Resource": [f"arn:aws:s3:::{name}/*"],
+                }
+            ],
+        }
+    )
+    r = aws(state, "s3api", "put-bucket-policy", "--bucket", name, "--policy", policy, capture=True)
+    if r.returncode == 0:
+        print(f"    bucket: {name} anonymous-read set")
+    else:
+        print(f"    bucket: {name} WARN policy not set: {r.stderr.strip()[:200]}", file=sys.stderr)
 
 
 def cmd_delete_bucket(args: "list[str]") -> int:
