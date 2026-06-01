@@ -164,8 +164,8 @@ deployment onto a network BOSH fully owns, so no foreign device can claim an
 address.
 
 ```bash
-# 1. Create the SDN zone + vnet + subnet on the PVE host (idempotent).
-./scripts/bosh net-up
+# 1. Create the SDN zone + vnet + subnet + host-firewall allowance (idempotent).
+BOSH_PVE_ENV=cpitest ./scripts/bosh net-up
 
 # 2. Deploy the Director onto the isolated network.
 BOSH_PVE_ENV=cpitest ./scripts/bosh create-env
@@ -175,8 +175,8 @@ BOSH_PVE_ENV=cpitest ./scripts/bosh alias-env
 BOSH_PVE_ENV=cpitest ./scripts/cf deploy
 
 # Inspect / tear down.
-./scripts/bosh net-status
-./scripts/bosh net-down        # after delete-env + cf teardown
+BOSH_PVE_ENV=cpitest ./scripts/bosh net-status
+BOSH_PVE_ENV=cpitest ./scripts/bosh net-down   # after delete-env + cf teardown
 ```
 
 `net-up` creates a simple zone (a plain local bridge — an isolated L2 segment
@@ -184,6 +184,46 @@ plus a gateway), one vnet whose name becomes the Linux bridge VMs attach to, and
 a subnet with `snat` enabled so VMs reach the internet via the PVE host's uplink
 while staying off the shared LAN. It commits with `pvesh set /cluster/sdn` and is
 idempotent.
+
+### Host firewall: API access from the isolated subnet
+
+When `pve-firewall` is enabled, the host's INPUT policy DROPs new VM→host
+connections unless explicitly allowed, and the PVE API (`8006`) is further gated
+to a "management" source set. A Director on the shared LAN was implicitly inside
+that management range; once it moves to the isolated subnet it is not, so the
+**in-VM CPI** (which runs on the Director, unlike `create-env`'s CPI, which runs
+locally) can no longer reach `https://<pve_host>:8006`. Every `create_vm` then
+fails with `cluster.ListResources ... dial tcp <pve_host>:8006: connect:
+connection timed out`. `net-up` closes this gap automatically: it adds two
+idempotent rules to `/etc/pve/nodes/<node>/host.fw` permitting the configured
+subnet to reach `8006` (and ICMP), then reloads the firewall. `net-down` removes
+them; `net-status` prints them. This mirrors the existing hand-curated rules for
+other isolated SDN blocs on the host.
+
+### Operator reachability to the relocated Director
+
+The Director's API/CredHub/UAA listen on its `internal_ip`. After relocation
+that IP lives on the isolated subnet, which is only present on the PVE host —
+the workstation running `bosh`/`./scripts/cf` needs a route to it. If the
+workstation reaches the lab over Tailscale, advertise the subnet from the PVE
+node (`tailscale set --advertise-routes=...,172.31.0.0/24`) and approve it in the
+tailnet admin console; `create-env`'s local CPI still reaches the PVE API over
+the workstation's existing path. Without a route, `alias-env`/`deploy` time out
+against the new Director IP even though the Director itself is healthy.
+
+### Relocating the Director rotates IP-pinned certificates
+
+Moving the Director changes `internal_ip`, and several generated leaf
+certificates embed it in their SAN/CN: `mbus_bootstrap_ssl`, `director_ssl`,
+`nats_server_tls`, `blobstore_server_tls`, `credhub_tls`, `uaa_ssl`, and
+`uaa_service_provider_ssl`. The BOSH CLI only generates a variable when it is
+**absent** from the vars-store, so a plain `create-env` reuses the stale certs
+and the agent bootstrap fails with `x509: certificate is valid for <old-ip>, not
+<new-ip>`. Remove just those seven leaf entries from
+`manifests/bosh/creds.yml` (keep every `*_ca`, encryption key, and password) and
+re-run `create-env`; the CLI regenerates them for the new IP, re-signed by the
+unchanged CAs, so the trust chain and the bosh database (releases, stemcells,
+CredHub data) are preserved.
 
 Everything is operator-configurable in a single file —
 [`manifests/envs/cpitest/vars.yml`](../manifests/envs/cpitest/vars.yml) — which

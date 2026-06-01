@@ -313,6 +313,35 @@ pvesh get /cluster/resources --type vm | jq '.[] | select(.tags == null) | {vmid
 
 See the [Operations Runbook](operations.md) for orphan cleanup procedures. The CPI runs `cleanupVM` (stop + delete) automatically before retrying, but cleanup can itself fail and leave a leaked VMID requiring `qm destroy`.
 
+### Every create_vm times out reaching the PVE API
+
+**Symptom**
+
+A deploy reaches "Creating missing vms" and every instance fails with the same error, while `create-env` for the Director on the *same* network succeeded:
+
+```
+create_vm: allocate+create VM: vmid: list cluster resources: cluster.ListResources:
+... Get "https://<pve_host>:8006/api2/json/cluster/resources?type=vm":
+dial tcp <pve_host>:8006: connect: connection timed out
+```
+
+**Diagnosis**
+
+`create-env`'s CPI runs on the workstation, which can reach the PVE API; the **in-VM CPI** runs on the Director, so this only appears once a deploy drives the Director's CPI. It means the Director cannot reach `https://<pve_host>:8006`. The usual cause is the **host firewall**: with `pve-firewall` enabled, `8006` is allowed only from a management source set, and a Director on an isolated SDN subnet is not in it. A `connect: connection timed out` (no RST) is the signature of a DROP, not a routing black hole — the packet reaches the host and is dropped.
+
+Confirm from inside the Director (jumpbox user, key in `creds.yml:/jumpbox_ssh/private_key`):
+
+```bash
+ssh -i <key> -o IdentitiesOnly=yes jumpbox@<internal_ip> \
+  'curl -sk -o /dev/null -w "%{http_code}\n" --max-time 10 https://<pve_host>:8006/'
+```
+
+A timeout confirms the block; `200` means the API is reachable and the fault is elsewhere. Inspect the live rules on the host: `iptables -S | grep 8006`.
+
+**Fix**
+
+Permit the isolated subnet to reach the API. `BOSH_PVE_ENV=<env> ./scripts/bosh net-up` does this automatically (idempotent rules in `/etc/pve/nodes/<node>/host.fw` for the configured subnet → `8006` + ICMP, then a firewall reload); `net-status` shows them and `net-down` removes them. See [Networks — Host firewall: API access from the isolated subnet](networks.md#isolated-test-network-sdn).
+
 ## Stemcell upload and import failures
 
 ### Stemcell storage is local-only on a multi-node cluster

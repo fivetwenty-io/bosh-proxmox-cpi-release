@@ -200,6 +200,35 @@ def cmd_stemcell(_extra: list[str]) -> None:
     run("bosh", "-e", ENV, "-n", "upload-stemcell", "--sha1", sha1, url)
 
 
+def _cf_has_database_vm() -> bool:
+    """True when deployment DEPLOYMENT has a `database` instance with a live VM.
+
+    The uaa Flyway probe SSHes into database/0, which only exists once the
+    deployment has been deployed at least once. On a fresh director — or
+    after teardown, where the deployment record can linger with zero VMs
+    (e.g. a deploy that failed at create_vm) — there is no VM to probe and
+    no uaa schema to corrupt. In that state `bosh ssh database/0` fails with
+    "No instance with a VM ... matched filter", whose detail lives in the
+    task result, not the ssh stderr, so string-matching the error is
+    unreliable. Probe `bosh vms` (lists only instances that HAVE a VM)
+    instead: absent deployment or no database VM → skip the check.
+    """
+    r = subprocess.run(
+        ["bosh", "-e", ENV, "-d", DEPLOYMENT, "--json", "vms"],
+        capture_output=True, text=True, check=False,
+    )
+    if r.returncode != 0:
+        return False
+    try:
+        rows = json.loads(r.stdout)["Tables"][0]["Rows"]
+    except (KeyError, IndexError, TypeError, json.JSONDecodeError):
+        return False
+    return any(
+        (row.get("instance") or "").startswith("database/") and row.get("vm_cid")
+        for row in rows
+    )
+
+
 def cmd_check_uaa_db(_extra: list[str]) -> None:
     """Fail fast if the uaa Flyway history has a failed migration row.
 
@@ -218,6 +247,11 @@ def cmd_check_uaa_db(_extra: list[str]) -> None:
     remediation hint.
     """
     banner("uaa DB pre-deploy check")
+    if not _cf_has_database_vm():
+        # Fresh deploy (or a deployment record left with zero VMs): no
+        # database/0 to probe and no uaa schema to corrupt. Skip cleanly.
+        print("    skipped (no database VM present yet)")
+        return
     probe = (
         "set -e; "
         "cnf=/var/vcap/jobs/pxc-mysql/config/mylogin.cnf; "

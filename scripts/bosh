@@ -163,6 +163,25 @@ def run(*cmd: str, env: dict[str, str] | None = None) -> int:
     return subprocess.run(list(cmd), env=env, cwd=REPO_ROOT).returncode
 
 
+def internal_ip() -> str:
+    """Director IP, honoring the active BOSH_PVE_ENV vars layer.
+
+    manifests/bosh/vars.yml carries the base internal_ip; an env bundle's
+    vars.yml (manifests/envs/<env>/vars.yml) overrides it. These are plain
+    data docs, not templates, so they cannot be merged with `bosh int -l` —
+    read the env file's key directly and fall back to the base. Use this
+    everywhere the Director address is needed (alias-env, credhub) so they
+    target the env's network rather than the base one.
+    """
+    f = env_vars_file()
+    if f:
+        try:
+            return bosh_int(f, "/internal_ip")
+        except subprocess.CalledProcessError:
+            pass
+    return bosh_int(VARS, "/internal_ip")
+
+
 def director_env() -> dict[str, str]:
     if not CREDS.exists():
         sys.exit(f"creds file missing: {CREDS} — run 'scripts/bosh create-env' first")
@@ -177,7 +196,7 @@ def director_env() -> dict[str, str]:
 def credhub_env() -> dict[str, str]:
     if not CREDS.exists():
         sys.exit(f"creds file missing: {CREDS} — run 'scripts/bosh create-env' first")
-    director_ip = bosh_int(VARS, "/internal_ip")
+    director_ip = internal_ip()
     credhub_ca = bosh_int(CREDS, "/credhub_tls/ca")
     uaa_ca = bosh_int(CREDS, "/uaa_ssl/ca")
     env = os.environ.copy()
@@ -284,7 +303,7 @@ def cmd_teardown(args: list[str]) -> int:
 def cmd_alias_env(args: list[str]) -> int:
     if not CREDS.exists():
         sys.exit(f"creds.yml missing at {CREDS} — run 'scripts/bosh create-env' first")
-    director_ip = bosh_int(VARS, "/internal_ip")
+    director_ip = internal_ip()
     ca = bosh_int(CREDS, "/director_ssl/ca")
     proc = subprocess.run(
         ["bosh", "alias-env", "pve", "-e", director_ip, "--ca-cert", ca, *args],
@@ -396,11 +415,18 @@ def _sdn_params() -> dict[str, str]:
     if not pve_host:
         sys.exit(f"net-*: pve_host not set in {VARS}")
 
+    # Node name for the host firewall path (/etc/pve/nodes/<node>/host.fw);
+    # an env bundle may override it, else fall back to the base vars.
+    node = _bosh_int_opt(vfile, "/pve_node") or _bosh_int_opt(VARS, "/pve_node")
+    if not node or not node.strip():
+        sys.exit(f"net-*: pve_node not set in {vfile} or {VARS}")
+
     snat_raw = need("cpitest_sdn_snat").lower()
     snat = "1" if snat_raw in ("1", "true", "yes", "on") else "0"
 
     return {
         "pve_host": pve_host,
+        "node": node.strip(),
         "zone": need("cpitest_sdn_zone"),
         "zone_type": need("cpitest_sdn_zone_type"),
         "vnet": need("cpitest_sdn_vnet"),
@@ -441,6 +467,7 @@ def cmd_net_up(_args: list[str]) -> int:
     script = f"""set -euo pipefail
 ZONE={_q(p['zone'])}; ZTYPE={_q(p['zone_type'])}; VNET={_q(p['vnet'])}
 SUBNET={_q(p['subnet'])}; GW={_q(p['gateway'])}; SNAT={_q(p['snat'])}
+NODE={_q(p['node'])}
 NET=${{SUBNET%/*}}
 if pvesh get /cluster/sdn/zones/"$ZONE" >/dev/null 2>&1; then
   echo "zone $ZONE: exists"
@@ -462,6 +489,30 @@ else
 fi
 pvesh set /cluster/sdn
 echo "sdn: applied (vnet $VNET is now a bridge on the node)"
+
+# Host firewall: permit the isolated subnet to reach the PVE API (8006) so the
+# in-VM Director/CPI can drive create_vm. With pve-firewall enabled, the host
+# INPUT policy DROPs VM->host NEW unless explicitly allowed; the Director on an
+# isolated SDN segment is no longer in the management range, so without this the
+# CPI's /cluster/resources calls time out. Idempotent: keyed on the subnet.
+HOSTFW=/etc/pve/nodes/"$NODE"/host.fw
+if grep -q "source $SUBNET -p tcp -dport 8006" "$HOSTFW" 2>/dev/null; then
+  echo "firewall: API rule for $SUBNET present"
+else
+  [ -f "$HOSTFW" ] || printf '[RULES]\\n' > "$HOSTFW"
+  grep -qF '[RULES]' "$HOSTFW" || printf '\\n[RULES]\\n' >> "$HOSTFW"
+  awk -v sub="$SUBNET" '
+    {{print}}
+    /^\\[RULES\\]/ && !done {{
+      print "IN ACCEPT -source " sub " -p tcp -dport 8006 -log nolog # cpitest SDN -> PVE API (CPI)"
+      print "IN ACCEPT -source " sub " -p icmp -log nolog # cpitest SDN -> host icmp"
+      done=1
+    }}
+  ' "$HOSTFW" > /tmp/host.fw.$$ && cat /tmp/host.fw.$$ > "$HOSTFW" && rm -f /tmp/host.fw.$$
+  echo "firewall: API rule added for $SUBNET"
+fi
+pve-firewall compile >/dev/null 2>&1 && pve-firewall restart >/dev/null 2>&1 || true
+echo "firewall: reloaded"
 """
     return _pve_ssh(p["pve_host"], script)
 
@@ -477,7 +528,16 @@ def cmd_net_down(_args: list[str]) -> int:
     # already-absent objects. The subnet id is read back from the API rather
     # than reconstructed, since PVE derives it as "<zone>-<net>-<prefix>".
     script = f"""set -uo pipefail
-ZONE={_q(p['zone'])}; VNET={_q(p['vnet'])}
+ZONE={_q(p['zone'])}; VNET={_q(p['vnet'])}; SUBNET={_q(p['subnet'])}; NODE={_q(p['node'])}
+# Remove the host-firewall rules net-up added for this subnet (idempotent).
+HOSTFW=/etc/pve/nodes/"$NODE"/host.fw
+if [ -f "$HOSTFW" ] && grep -q "source $SUBNET -p" "$HOSTFW" 2>/dev/null; then
+  grep -v "source $SUBNET -p" "$HOSTFW" > /tmp/host.fw.$$ && cat /tmp/host.fw.$$ > "$HOSTFW" && rm -f /tmp/host.fw.$$
+  pve-firewall compile >/dev/null 2>&1 && pve-firewall restart >/dev/null 2>&1 || true
+  echo "firewall: rules for $SUBNET removed"
+else
+  echo "firewall: no rules for $SUBNET"
+fi
 SUBID=$(pvesh get /cluster/sdn/vnets/"$VNET"/subnets --output-format json 2>/dev/null \
   | sed -n 's/.*"subnet"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p' | head -1)
 if [ -n "${{SUBID:-}}" ]; then
@@ -506,7 +566,7 @@ echo "sdn: applied"
 def cmd_net_status(_args: list[str]) -> int:
     p = _sdn_params()
     script = f"""set -uo pipefail
-ZONE={_q(p['zone'])}; VNET={_q(p['vnet'])}
+ZONE={_q(p['zone'])}; VNET={_q(p['vnet'])}; SUBNET={_q(p['subnet'])}; NODE={_q(p['node'])}
 echo "== zone $ZONE =="
 pvesh get /cluster/sdn/zones/"$ZONE" 2>/dev/null || echo "absent"
 echo "== vnet $VNET =="
@@ -515,6 +575,8 @@ echo "== subnets =="
 pvesh get /cluster/sdn/vnets/"$VNET"/subnets 2>/dev/null || echo "absent"
 echo "== bridge on node =="
 ip -br link show "$VNET" 2>/dev/null || echo "bridge $VNET not present (run net-up + apply)"
+echo "== host firewall (API access for $SUBNET) =="
+grep "source $SUBNET -p" /etc/pve/nodes/"$NODE"/host.fw 2>/dev/null || echo "no host.fw rule for $SUBNET (run net-up)"
 """
     return _pve_ssh(p["pve_host"], script)
 
