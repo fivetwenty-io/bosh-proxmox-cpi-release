@@ -41,6 +41,11 @@ creds.yml
 vars.yml
 state.json
 
+# Compiled-release pipeline (scripts/bosh compile-releases): large tarballs and
+# the environment-specific generated ops file pinning them.
+compiled_releases/
+manifests/bosh/compiled-releases.yml
+
 # Integration test generated config (secrets resolved at runtime)
 ci/integration.yml
 ci/params.yml

@@ -28,6 +28,12 @@ Subcommands:
                            show the SDN zone/vnet/subnet + node bridge state.
     credhub <args>         passthrough → credhub <args> with the director's
                            credhub URL, admin client, and CA pre-exported
+    compile-releases       compile bosh + bosh-pve-cpi once against the active
+                           stemcell (no-VM compilation deployment + export-
+                           release), store the tarballs (file:// default or S3),
+                           and pin them so later create-envs skip compilation.
+                           Storage via COMPILED_RELEASES_STORE; see
+                           docs/compiled-releases.md.
     help                   show this help
     <anything else>        passthrough → bosh -e pve <args>
 
@@ -53,16 +59,21 @@ Credhub env (for credhub):
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
 import shlex
+import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
-# Host firewall text manipulation (pure Python, no awk/grep).
+# Host firewall text manipulation + compiled-release helpers (pure Python).
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _hostfw
+import _compiled
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 BOSH_DEPLOYMENT_DIR = Path(os.environ.get("BOSH_DEPLOYMENT_DIR", Path.home() / "w/cloudfoundry/bosh-deployment"))
@@ -88,6 +99,11 @@ EMPTYVM = BOSH_DIR / "emptyvm.yml"
 PVE_GUEST_AGENT_RC = MANIFESTS / "runtime-configs" / "pve-guest-agent.yml"
 ENVS_DIR = MANIFESTS / "envs"
 DEV_RELEASES_DIR = REPO_ROOT / "dev_releases" / "bosh-pve-cpi"
+# Compiled-release pipeline (scripts/bosh compile-releases): generated ops file
+# pinning compiled tarballs, and the default local store directory. Both are
+# gitignored — the ops file is environment-specific and the tarballs are large.
+COMPILED_OPS = BOSH_DIR / "compiled-releases.yml"
+COMPILED_DIR_DEFAULT = REPO_ROOT / "compiled_releases"
 
 
 def cpi_release_path() -> str:
@@ -219,6 +235,7 @@ def cmd_create_env(args: list[str]) -> int:
         "-n",
         "-o", str(BOSH_RELEASE_OPS),
         "-o", str(CPI_OPS),
+        *compiled_ops_layer(),
         "-o", str(BOSH_DEPLOYMENT_DIR / "uaa.yml"),
         "-o", str(BOSH_DEPLOYMENT_DIR / "credhub.yml"),
         "-o", str(OS_CONF_OPS),
@@ -284,6 +301,7 @@ def cmd_teardown(args: list[str]) -> int:
         "-n",
         "-o", str(BOSH_RELEASE_OPS),
         "-o", str(CPI_OPS),
+        *compiled_ops_layer(),
         "-o", str(BOSH_DEPLOYMENT_DIR / "uaa.yml"),
         "-o", str(BOSH_DEPLOYMENT_DIR / "credhub.yml"),
         "-o", str(OS_CONF_OPS),
@@ -742,6 +760,322 @@ def cmd_passthrough(args: list[str]) -> int:
     return run("bosh", "-e", "pve", *args, env=director_env())
 
 
+# ---------------------------------------------------------------------------
+# Compiled-release pipeline (compile-releases)
+#
+# create-env compiles the bosh + bosh-pve-cpi packages on the director VM every
+# run (~18 min: director-ruby, postgres, the cloud CLIs, the CPI go build).
+# Upstream publishes no compiled bosh release for noble, and the bosh release is
+# not a deployable deployment, so it cannot be export-released directly. This
+# pipeline compiles those releases ONCE against the active stemcell using a
+# no-VM "compilation deployment" on the already-running director, exports the
+# compiled tarballs to a configurable store, and pins them via a generated ops
+# file so subsequent create-envs skip compilation. See docs/compiled-releases.md.
+# ---------------------------------------------------------------------------
+COMPILE_DEPLOYMENT = "compile-pve-cpi-releases"
+
+
+def _stemcell_os_version() -> "tuple[str, str]":
+    """Parse (os, version) from vars.yml /stemcell_url.
+
+    e.g. https://bosh.io/d/stemcells/bosh-openstack-kvm-ubuntu-noble?v=1.383
+         -> ("ubuntu-noble", "1.383")
+    """
+    url = bosh_int(VARS, "/stemcell_url")
+    os_m = re.search(r"(ubuntu-[a-z0-9]+)", url)
+    ver_m = re.search(r"[?&]v=([0-9][0-9.]*)", url)
+    if not os_m or not ver_m:
+        sys.exit(f"compile-releases: cannot parse os/version from stemcell_url={url!r}")
+    return os_m.group(1), ver_m.group(1)
+
+
+def _sha256_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _cpi_release_version(path: str) -> str:
+    """Version of the local bosh-pve-cpi dev release.
+
+    Read from release.MF inside the tarball (the source of truth export-release
+    must match); fall back to the create-release filename convention
+    (bosh-pve-cpi-<version>.tgz) if the tarball cannot be read.
+    """
+    import tarfile
+
+    try:
+        with tarfile.open(path, "r:gz") as tf:
+            mf = next((n for n in tf.getnames() if n.endswith("release.MF")), None)
+            if mf:
+                member = tf.extractfile(mf)
+                if member is not None:
+                    data = member.read().decode("utf-8", "replace")
+                    m = re.search(r"^version:\s*['\"]?([^'\"\n]+)", data, re.M)
+                    if m:
+                        return m.group(1).strip()
+    except (tarfile.TarError, OSError):
+        pass
+    stem = Path(path).name
+    stem = stem[:-4] if stem.endswith(".tgz") else stem
+    prefix = "bosh-pve-cpi-"
+    return stem[len(prefix):] if stem.startswith(prefix) else stem
+
+
+def _store_put(cfg: "_compiled.StoreConfig", local_path: str, basename: str) -> str:
+    """Place a compiled tarball into the store; return the url create-env fetches.
+
+    file: copy into the local store directory. s3: upload via the `aws` CLI
+    (--endpoint-url for S3-compatible stores); the object must be readable by
+    whoever later runs create-env.
+    """
+    if cfg.kind == "file":
+        dst_dir = os.path.abspath(os.path.expanduser(cfg.directory))
+        os.makedirs(dst_dir, exist_ok=True)
+        shutil.copy2(local_path, os.path.join(dst_dir, basename))
+        return cfg.reference(basename)
+    if cfg.kind == "s3":
+        if shutil.which("aws") is None:
+            sys.exit("compile-releases: COMPILED_RELEASES_STORE=s3 requires the 'aws' CLI on PATH")
+        key = _compiled.s3_object_key(cfg.s3_prefix, basename)
+        s3uri = f"s3://{cfg.s3_bucket}/{key}"
+        envc = os.environ.copy()
+        if cfg.s3_access_key:
+            envc["AWS_ACCESS_KEY_ID"] = cfg.s3_access_key
+        if cfg.s3_secret_key:
+            envc["AWS_SECRET_ACCESS_KEY"] = cfg.s3_secret_key
+        if cfg.s3_region:
+            envc["AWS_DEFAULT_REGION"] = cfg.s3_region
+        # Force path-style addressing so the object lands where the path-style
+        # https reference (s3_https_url) later fetches it. The aws CLI otherwise
+        # defaults to virtual-host (<bucket>.<endpoint>), which would not match
+        # the <endpoint>/<bucket>/<key> url create-env uses.
+        envc["AWS_S3_ADDRESSING_STYLE"] = "path"
+        rc = subprocess.run(
+            ["aws", "s3", "cp", "--endpoint-url", cfg.s3_endpoint, local_path, s3uri],
+            env=envc,
+        ).returncode
+        if rc != 0:
+            sys.exit(f"compile-releases: aws s3 cp -> {s3uri} failed (rc={rc})")
+        return cfg.reference(basename)
+    sys.exit(f"compile-releases: unknown store kind {cfg.kind!r}")
+
+
+def _export_compiled(
+    name: str, version: str, os_name: str, sc_version: str, cfg: "_compiled.StoreConfig"
+) -> "_compiled.CompiledRelease":
+    """export-release one release, store its tarball, return a CompiledRelease."""
+    with tempfile.TemporaryDirectory(prefix="compiled-") as tmpd:
+        rc = run(
+            "bosh", "-e", "pve", "-d", COMPILE_DEPLOYMENT, "export-release",
+            f"{name}/{version}", f"{os_name}/{sc_version}", f"--dir={tmpd}",
+            env=director_env(),
+        )
+        if rc != 0:
+            sys.exit(f"compile-releases: export-release {name}/{version} failed (rc={rc})")
+        tars = sorted(Path(tmpd).glob("*.tgz"))
+        if not tars:
+            sys.exit(f"compile-releases: export-release {name}/{version} produced no tarball")
+        if len(tars) > 1:
+            print(
+                f"    warning: {len(tars)} tarballs for {name}; using {tars[-1].name}",
+                file=sys.stderr,
+            )
+        src = str(tars[-1])
+        basename = _compiled.compiled_basename(name, version, os_name, sc_version)
+        sha = "sha256:" + _sha256_file(src)
+        url = _store_put(cfg, src, basename)
+        print(f"    exported {name}/{version} -> {basename}")
+        return _compiled.CompiledRelease(name=name, version=version, url=url, sha1=sha)
+
+
+def _director_rows(denv: dict[str, str], what: str) -> list[dict]:
+    """Rows of `bosh <what> --json` (stemcells/releases), or [] on any failure."""
+    out = subprocess.run(
+        ["bosh", "-e", "pve", what, "--json"], env=denv, capture_output=True, text=True
+    ).stdout
+    try:
+        return json.loads(out)["Tables"][0]["Rows"]
+    except (KeyError, IndexError, TypeError, json.JSONDecodeError):
+        return []
+
+
+def _stemcell_present(denv: dict[str, str], os_name: str, sc_version: str) -> bool:
+    """Exact os+version match against `bosh stemcells --json` (not a substring)."""
+    for r in _director_rows(denv, "stemcells"):
+        if (r.get("os") or "") == os_name and (r.get("version") or "").rstrip("*") == sc_version:
+            return True
+    return False
+
+
+def _release_present(denv: dict[str, str], name: str, version: str) -> bool:
+    """True when `bosh releases --json` lists name/version exactly.
+
+    bosh groups a release's versions into rows where only the first carries the
+    name; later version rows leave name blank. Track the current name as we scan.
+    """
+    current = ""
+    for r in _director_rows(denv, "releases"):
+        current = (r.get("name") or "").strip() or current
+        if current == name and (r.get("version") or "").rstrip("*") == version:
+            return True
+    return False
+
+
+def _bosh_release_pin() -> "tuple[str, str, str]":
+    """(version, url, sha1) of the 'bosh' release op in bosh-release.yml, by name.
+
+    Selected by matching value/name == 'bosh' rather than a fixed array index, so
+    reordering or adding ops to bosh-release.yml cannot silently pin the wrong
+    release.
+    """
+    i = 0
+    while True:
+        if _bosh_int_opt(BOSH_RELEASE_OPS, f"/{i}/type") is None:
+            sys.exit("compile-releases: no 'bosh' release op found in bosh-release.yml")
+        if _bosh_int_opt(BOSH_RELEASE_OPS, f"/{i}/value/name") == "bosh":
+            return (
+                bosh_int(BOSH_RELEASE_OPS, f"/{i}/value/version"),
+                bosh_int(BOSH_RELEASE_OPS, f"/{i}/value/url"),
+                bosh_int(BOSH_RELEASE_OPS, f"/{i}/value/sha1"),
+            )
+        i += 1
+
+
+def cmd_compile_releases(args: list[str]) -> int:
+    """Compile the heavy create-env releases once and pin the compiled tarballs.
+
+    Compiles bosh + bosh-pve-cpi against the active stemcell via a no-VM
+    compilation deployment on the running director, exports the compiled
+    tarballs to the configured store (file:// default, or S3-compatible), and
+    writes manifests/bosh/compiled-releases.yml so later create-envs skip
+    compilation. Requires a reachable director (run after create-env + alias-env).
+
+    Storage via COMPILED_RELEASES_STORE=file|s3 — see docs/compiled-releases.md.
+    """
+    if not CREDS.exists():
+        sys.exit("compile-releases: creds.yml missing — run create-env + alias-env first")
+    os_name, sc_version = _stemcell_os_version()
+    sc_url = bosh_int(VARS, "/stemcell_url")
+    sc_sha = bosh_int(VARS, "/stemcell_sha1")
+    cfg = _compiled.store_config_from_env(os.environ, str(COMPILED_DIR_DEFAULT))
+    denv = director_env()
+
+    dest = cfg.directory if cfg.kind == "file" else f"{cfg.s3_endpoint}/{cfg.s3_bucket}"
+    print(f">>> compile-releases: stemcell {os_name}/{sc_version}, store={cfg.kind} ({dest})")
+
+    # 1. Ensure the target stemcell is on the director (exact os+version match).
+    if _stemcell_present(denv, os_name, sc_version):
+        print(f"    stemcell {os_name}/{sc_version} present")
+    else:
+        print(f"    uploading stemcell {os_name}/{sc_version}")
+        if run("bosh", "-e", "pve", "-n", "upload-stemcell", "--sha1", sc_sha, sc_url, env=denv) != 0:
+            sys.exit("compile-releases: stemcell upload failed")
+
+    # 2. Upload the source releases to compile.
+    bosh_ver, bosh_url, bosh_sha = _bosh_release_pin()
+    cpi_path = cpi_release_path()
+    cpi_ver = _cpi_release_version(cpi_path)
+    print(f"    uploading source releases (bosh/{bosh_ver}, bosh-pve-cpi/{cpi_ver})")
+    if run("bosh", "-e", "pve", "-n", "upload-release", "--sha1", bosh_sha, bosh_url, env=denv) != 0:
+        sys.exit("compile-releases: upload bosh release failed")
+    if run("bosh", "-e", "pve", "-n", "upload-release", cpi_path, env=denv) != 0:
+        sys.exit("compile-releases: upload bosh-pve-cpi release failed")
+    # Verify the versions we will export-release actually registered on the
+    # director. A dev release.MF version that differs from what we parsed would
+    # otherwise surface as a confusing "release not found" from export-release.
+    if not _release_present(denv, "bosh", bosh_ver):
+        sys.exit(f"compile-releases: bosh/{bosh_ver} not on director after upload; check `bosh releases`")
+    if not _release_present(denv, "bosh-pve-cpi", cpi_ver):
+        sys.exit(
+            f"compile-releases: bosh-pve-cpi/{cpi_ver} not on director after upload "
+            f"(release.MF version may differ); check `bosh releases`"
+        )
+
+    # 3. Deploy the no-VM compilation deployment (empty instance_groups).
+    manifest = (
+        f"name: {COMPILE_DEPLOYMENT}\n"
+        "releases:\n"
+        f"- name: bosh\n  version: \"{bosh_ver}\"\n"
+        f"- name: bosh-pve-cpi\n  version: \"{cpi_ver}\"\n"
+        "stemcells:\n"
+        f"- alias: default\n  os: {os_name}\n  version: \"{sc_version}\"\n"
+        "instance_groups: []\n"
+        "update:\n"
+        "  canaries: 1\n  max_in_flight: 1\n"
+        "  canary_watch_time: 1000-30000\n  update_watch_time: 1000-30000\n  serial: false\n"
+    )
+    mf = tempfile.NamedTemporaryFile("w", suffix=".yml", delete=False)
+    try:
+        mf.write(manifest)
+        mf.close()
+        if run("bosh", "-e", "pve", "-n", "-d", COMPILE_DEPLOYMENT, "deploy", mf.name, env=denv) != 0:
+            sys.exit("compile-releases: compilation deploy failed")
+        # 4. Export each release (compiles on the director's compilation VMs).
+        compiled = [
+            _export_compiled("bosh", bosh_ver, os_name, sc_version, cfg),
+            _export_compiled("bosh-pve-cpi", cpi_ver, os_name, sc_version, cfg),
+        ]
+    finally:
+        os.unlink(mf.name)
+        run("bosh", "-e", "pve", "-n", "-d", COMPILE_DEPLOYMENT, "delete-deployment", "--force", env=denv)
+
+    # 5. Write the create-env ops file pinning the compiled tarballs.
+    ops = _compiled.compiled_releases_ops(compiled, stemcell=f"{os_name}/{sc_version}")
+    COMPILED_OPS.write_text(ops, encoding="utf-8")
+    print(f">>> compile-releases: wrote {COMPILED_OPS} ({len(compiled)} releases)")
+    print("    create-env now uses the compiled tarballs (COMPILE_RELEASES_DISABLE=1 forces source)")
+    return 0
+
+
+def compiled_ops_layer() -> list[str]:
+    """Return ['-o', compiled-releases.yml] when a matching compiled cache exists.
+
+    Skipped when COMPILE_RELEASES_DISABLE is set, the ops file is absent, or it
+    targets a different stemcell than vars.yml (a stale cache must not be applied
+    — the compiled packages would not match and create-env would fail). Layered
+    after the source release ops so its compiled url+sha win.
+    """
+    if os.environ.get("COMPILE_RELEASES_DISABLE", "").strip().lower() in ("1", "true", "yes"):
+        return []
+    if not COMPILED_OPS.exists():
+        return []
+    text = COMPILED_OPS.read_text(encoding="utf-8")
+    target = _compiled.stemcell_from_ops(text)
+    # No marker → cannot prove the cache matches; refuse rather than risk pinning
+    # tarballs for an unknown stemcell (would fail with a confusing sha error).
+    if target is None:
+        print(
+            f"compile: {COMPILED_OPS.name} has no stemcell marker; ignoring "
+            "(re-run compile-releases)",
+            file=sys.stderr,
+        )
+        return []
+    os_name, sc_version = _stemcell_os_version()
+    active = f"{os_name}/{sc_version}"
+    if target != active:
+        print(
+            f"compile: {COMPILED_OPS.name} targets {target} but stemcell is {active}; "
+            "compiling from source",
+            file=sys.stderr,
+        )
+        return []
+    # A file:// ref pointing at a deleted tarball would fail not just create-env
+    # but delete-env (stranding the director VM). If any local tarball is gone,
+    # fall back to source — the source release urls are always reachable.
+    missing = [p for p in _compiled.local_paths_from_ops(text) if not os.path.exists(p)]
+    if missing:
+        print(
+            f"compile: compiled tarball(s) missing ({', '.join(missing)}); compiling from source",
+            file=sys.stderr,
+        )
+        return []
+    print(f"compile: using compiled releases ({active}) from {COMPILED_OPS.name}")
+    return ["-o", str(COMPILED_OPS)]
+
+
 COMMANDS = {
     "create-env": cmd_create_env,
     "deploy": cmd_create_env,
@@ -762,6 +1096,7 @@ COMMANDS = {
     "net-status": cmd_net_status,
     "network-status": cmd_net_status,
     "credhub": cmd_credhub,
+    "compile-releases": cmd_compile_releases,
     "help": cmd_help,
     "-h": cmd_help,
     "--help": cmd_help,
