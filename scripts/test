@@ -664,14 +664,15 @@ def tier_light(cfg: dict, cpi_config_path: str, keep: bool) -> int:
     # is parsed from manifests/bosh/vars.yml stemcell_url so the Tier-4 record
     # matches what the deployment scripts upload.
     stemcell_version = str(tier4.get("stemcell_version", "")).strip()
+    light_os = "ubuntu-noble"
     if not stemcell_version:
         if _dry_run:
             stemcell_version = "0.0"
         else:
-            _, stemcell_version = _lightstemcell.parse_os_version(
+            light_os, stemcell_version = _lightstemcell.parse_os_version(
                 _integration.bosh_int(cfg["bosh_vars"], "/stemcell_url")
             )
-    light_name = "bosh-proxmox-kvm-ubuntu-noble-go_agent-light"
+    light_name = f"bosh-proxmox-kvm-{light_os}-go_agent-light"
 
     # Validate required preuploaded-mode config.
     if not _dry_run:
@@ -683,7 +684,6 @@ def tier_light(cfg: dict, cpi_config_path: str, keep: bool) -> int:
             return 1
 
     preuploaded_manifest = str(REPO_ROOT / "manifests" / "bosh" / "light-stemcell-preuploaded.yml")
-    fetch_manifest = str(REPO_ROOT / "manifests" / "bosh" / "light-stemcell-fetch.yml")
 
     d_env = _integration.director_env(cfg, dry_run=_dry_run)
 
@@ -756,14 +756,20 @@ def tier_light(cfg: dict, cpi_config_path: str, keep: bool) -> int:
             print("tier 4 failed: tier4.stemcell_url required when light_fetch_enabled: true", file=sys.stderr)
             return 1
 
+        # Render the fetch manifest via the shared helper rather than feeding the
+        # static template to `bosh int -v`: the helper omits the image_url_auth
+        # block when the token is empty (public URL), whereas the static template
+        # would emit bearer_token: "" and force empty-bearer auth. It also avoids
+        # `bosh`'s rejection of empty -v values.
+        fetch_cache = REPO_ROOT / "dev_releases" / "stemcell-cache"
+        rendered_fetch = _lightstemcell.render_light_manifest(
+            str(fetch_cache), "fetch", os_name=light_os, version=stemcell_version,
+            image_url=stemcell_url, token=(stemcell_token or None),
+        )
         print("==> tier 4: light fetch — upload-stemcell")
         rc = run_with_retries(
             [
-                "bosh", "-e", alias, "upload-stemcell", fetch_manifest,
-                "-v", f"stemcell_version={stemcell_version}",
-                "-v", f"stemcell_url={stemcell_url}",
-                "-v", f"stemcell_token={stemcell_token}",
-                "--fix",
+                "bosh", "-e", alias, "upload-stemcell", rendered_fetch, "--fix",
             ],
             env=d_env,
             cwd=REPO_ROOT,

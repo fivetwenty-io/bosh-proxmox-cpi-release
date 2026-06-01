@@ -446,10 +446,16 @@ def extract_qcow2(
         root_img.replace(qcow2)
     else:
         log("    converting disk image to qcow2")
-        subprocess.run(
-            ["qemu-img", "convert", "-O", "qcow2", str(root_img), str(qcow2)],
-            check=True,
-        )
+        try:
+            subprocess.run(
+                ["qemu-img", "convert", "-O", "qcow2", str(root_img), str(qcow2)],
+                check=True,
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError(
+                "qemu-img not found — install it to derive the light stemcell qcow2 "
+                "(macOS: brew install qemu; Debian/Ubuntu: apt-get install qemu-utils)"
+            ) from exc
     return qcow2, file_sha256(qcow2)
 
 
@@ -462,6 +468,30 @@ def _qemu_img_format(path: "str | Path") -> str:
         return str(json.loads(out).get("format", ""))
     except (subprocess.CalledProcessError, FileNotFoundError, json.JSONDecodeError):
         return ""
+
+
+def multipart_frame(boundary: str, filename: str) -> "tuple[bytes, bytes, bytes]":
+    """Build the (preamble, file_head, epilogue) for the PVE upload multipart body.
+
+    PVE's upload endpoint takes exactly one text field (content=import) plus the
+    file under field name "filename" (the multipart filename= attribute is the
+    destination name). This mirrors the CPI SDK's Storage().Upload. There must be
+    exactly ONE part named "filename" (the file) — a second text "filename" field
+    would be a duplicate field and corrupt the upload. The file bytes go between
+    preamble+file_head and epilogue.
+    """
+    preamble = (
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="content"\r\n\r\n'
+        f"import\r\n"
+    ).encode()
+    file_head = (
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="filename"; filename="{filename}"\r\n'
+        f"Content-Type: application/octet-stream\r\n\r\n"
+    ).encode()
+    epilogue = f"\r\n--{boundary}--\r\n".encode()
+    return preamble, file_head, epilogue
 
 
 def _tls_ctx() -> ssl.SSLContext:
@@ -509,20 +539,7 @@ def upload_qcow2(
     boundary = "----pvelightstemcell" + hashlib.sha1(filename.encode()).hexdigest()[:16]
     headers = _auth_headers(cpi_cfg)
 
-    def part(name: str, value: str) -> bytes:
-        return (
-            f"--{boundary}\r\n"
-            f'Content-Disposition: form-data; name="{name}"\r\n\r\n'
-            f"{value}\r\n"
-        ).encode()
-
-    preamble = part("content", "import") + part("filename", filename)
-    file_head = (
-        f"--{boundary}\r\n"
-        f'Content-Disposition: form-data; name="filename"; filename="{filename}"\r\n'
-        f"Content-Type: application/octet-stream\r\n\r\n"
-    ).encode()
-    epilogue = f"\r\n--{boundary}--\r\n".encode()
+    preamble, file_head, epilogue = multipart_frame(boundary, filename)
     content_length = len(preamble) + len(file_head) + size + len(epilogue)
 
     host, port = cpi_cfg["host"], cpi_cfg.get("port", 8006)
@@ -561,14 +578,38 @@ def upload_qcow2(
 
 def _await_task(
     cpi_cfg: dict, node: str, upid: str, *, log: Callable[[str], None] = print,
-    timeout_s: int = 900,
+    timeout_s: int = 900, max_consecutive_failures: int = 5,
 ) -> None:
-    """Poll a PVE task UPID until stopped; raise on non-OK exit status."""
+    """Poll a PVE task UPID until stopped; raise on non-OK exit status.
+
+    The UPID is passed raw (it contains colons but no slashes), matching the
+    CPI SDK's task-status path. Transient pve_api_get errors and persistent
+    null statuses are tolerated up to max_consecutive_failures so a brief blip
+    does not abandon a possibly-successful upload, but a sustained failure
+    surfaces promptly rather than spinning for the full timeout.
+    """
     deadline = time.monotonic() + timeout_s
-    path = f"/nodes/{urllib.parse.quote(node)}/tasks/{urllib.parse.quote(upid)}/status"
+    path = f"/nodes/{urllib.parse.quote(node, safe='')}/tasks/{upid}/status"
+    failures = 0
     while time.monotonic() < deadline:
-        status = _integration.pve_api_get(cpi_cfg, path)
-        if status and status.get("status") == "stopped":
+        try:
+            status = _integration.pve_api_get(cpi_cfg, path)
+        except RuntimeError as exc:
+            failures += 1
+            if failures >= max_consecutive_failures:
+                raise RuntimeError(
+                    f"upload task {upid}: status poll failed {failures}x: {exc}"
+                ) from exc
+            time.sleep(2)
+            continue
+        if status is None:
+            failures += 1
+            if failures >= max_consecutive_failures:
+                raise RuntimeError(f"upload task {upid}: status unavailable")
+            time.sleep(2)
+            continue
+        failures = 0
+        if status.get("status") == "stopped":
             exit_status = status.get("exitstatus", "")
             if exit_status and exit_status != "OK":
                 raise RuntimeError(f"upload task {upid} failed: {exit_status}")

@@ -179,6 +179,26 @@ class ManifestVarsTests(unittest.TestCase):
             ls.manifest_vars("bogus", version="1.383", storage="local", filename="x.qcow2")
 
 
+class MultipartFrameTests(unittest.TestCase):
+    def test_exactly_one_filename_field(self) -> None:
+        pre, head, epi = ls.multipart_frame("BOUND", "disk.qcow2")
+        blob = (pre + head + epi).decode()
+        # Regression: must NOT emit a second text "filename" field (duplicate
+        # field corrupts the PVE upload). Exactly one name="filename" (the file).
+        self.assertEqual(blob.count('name="filename"'), 1)
+        self.assertIn('name="content"', blob)
+        self.assertIn("import", blob)
+        self.assertIn('filename="disk.qcow2"', blob)
+
+    def test_frame_boundaries_and_crlf(self) -> None:
+        pre, head, epi = ls.multipart_frame("BOUND", "x.qcow2")
+        self.assertTrue(pre.startswith(b"--BOUND\r\n"))
+        self.assertTrue(head.startswith(b"--BOUND\r\n"))
+        self.assertEqual(epi, b"\r\n--BOUND--\r\n")
+        # file_head ends with a blank line so the file bytes follow immediately.
+        self.assertTrue(head.endswith(b"\r\n\r\n"))
+
+
 class PveCfgFromVarsTests(unittest.TestCase):
     def _reader(self, mapping: dict) -> "callable":
         return lambda path: mapping.get(path, "")

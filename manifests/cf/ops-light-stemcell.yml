@@ -7,7 +7,16 @@
 # os + version, so these values must agree with the uploaded light record
 # (operating_system: ubuntu-noble, version: stemcell_version). stemcell_version
 # is supplied by scripts/cf, parsed from manifests/bosh/vars.yml stemcell_url so
-# it stays in lockstep with the heavy source and the compiled-release cache.
+# it stays in lockstep with the director and compile-releases.
+#
+# IMPORTANT — compiled releases must match this version. cf-deployment's
+# operations/use-compiled-releases.yml replaces every release with a compiled
+# tarball pinned to a specific ubuntu-noble version (no source to recompile
+# from). If that pinned version differs from stemcell_version here, BOSH finds
+# no compiled package and the deploy fails. When bumping stemcell_version,
+# regenerate use-compiled-releases.yml for the same version, or drop it from the
+# deploy ops list so BOSH compiles the CF releases from source against this
+# stemcell (slow first deploy).
 - type: replace
   path: /stemcells/alias=default/os
   value: ubuntu-noble

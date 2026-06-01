@@ -1,6 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
+# dependencies = ["pyyaml"]
 # ///
 """Manage the cloudfoundry deployment on the bosh-pve director.
 
@@ -15,6 +16,8 @@ Commands:
     check-uaa-db       Fail fast if uaa schema is in the Flyway-rename trap.
     unstick-agent      Restart bosh-agent on an instance via PVE qga (bypasses NATS).
     bosh-deploy        Run only the bosh deploy step.
+    compile-releases   Compile + pin the source haproxy release against the lab
+                       stemcell so fresh-director deploys skip its build.
     teardown           Delete the CF deployment (--force). Skips if director unreachable
                        or deployment not found. Alias: delete-deployment.
     delete-deployment  Alias for teardown.
@@ -42,11 +45,13 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _compiled  # noqa: E402
 import _lightstemcell  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -56,6 +61,14 @@ ENV = os.environ.get("BOSH_ENV", "pve")
 DEPLOYMENT = os.environ.get("BOSH_DEPLOYMENT_NAME", "cf")
 BOSH_VARS = REPO_ROOT / "manifests" / "bosh" / "vars.yml"
 BOSH_CREDS = REPO_ROOT / "manifests" / "bosh" / "creds.yml"
+
+# Compiled-release cache for CF. Only the haproxy release compiles from source
+# against the lab stemcell (the rest arrive compiled via cf-deployment's
+# use-compiled-releases.yml), so `scripts/cf compile-releases` pins a compiled
+# haproxy here and the deploy skips its ~3.5 min build on a fresh director.
+COMPILE_DEPLOYMENT_CF = "compile-cf-releases"
+COMPILED_OPS_CF = REPO_ROOT / "manifests" / "cf" / "compiled-releases.yml"
+COMPILED_DIR_DEFAULT = REPO_ROOT / "compiled_releases"
 
 
 def banner(title: str) -> None:
@@ -801,6 +814,12 @@ def _run_deploy_with_watchdog(deploy_cmd: list[str], stall_s: int, recover_cb=No
 
 def cmd_bosh_deploy(extra: list[str]) -> None:
     banner("Deploy")
+    # The deployment stemcell is pinned to the standardized ubuntu-noble version
+    # via ops-light-stemcell.yml. cf-deployment's use-compiled-releases.yml must
+    # provide compiled releases for this exact version (or be dropped so BOSH
+    # compiles from source) — otherwise the deploy fails with no compiled package.
+    print(f"    stemcell pinned: ubuntu-noble {stemcell_os_version()[1]} "
+          "(compiled releases must match this version)")
     # Preflight: converge the agent baseline before the get_state-heavy
     # "Preparing deployment" phase. SCRIPTS_CF_AGENT_WAIT seconds (0 disables).
     preflight_s = int(os.environ.get("SCRIPTS_CF_AGENT_WAIT", "600") or "600")
@@ -811,6 +830,11 @@ def cmd_bosh_deploy(extra: list[str]) -> None:
         str(CF_DEPLOYMENT / "cf-deployment.yml"),
         "-o", str(CF_DEPLOYMENT / "operations/use-compiled-releases.yml"),
         "-o", str(CF_DEPLOYMENT / "operations/use-haproxy.yml"),
+        # Pin the compiled haproxy release (built by `cf compile-releases`) so a
+        # fresh-director deploy skips its ~3.5 min source build. Layered right
+        # after use-haproxy.yml (which adds the source release) so the compiled
+        # url wins; a missing/stale cache yields [] and falls back to source.
+        *compiled_ops_layer(),
         # cf-deployment stock ops file: removes policy-server-asg-syncer
         # from the api instance group. The job had been flapping every
         # ~90s (HTTP retries against CC during ccdb churn) which made
@@ -827,6 +851,10 @@ def cmd_bosh_deploy(extra: list[str]) -> None:
         # not-yet-updated routers. Lab tolerates full-rollout signal;
         # the rolling-deploy safety net is not needed here.
         "-o", "manifests/cf/no-canaries.yml",
+        # Lift the per-IG serial:true barriers on the stateless route tier and
+        # let diego-cell's two instances update in one wave. Layered after
+        # ops-serialize-deploy.yml/no-canaries.yml so the per-group overrides win.
+        "-o", "manifests/cf/ops-deserialize-igs.yml",
         # Pin the deployment stemcell to the standardized ubuntu-noble light
         # stemcell uploaded by cmd_stemcell (matched by os+version).
         "-o", "manifests/cf/ops-light-stemcell.yml",
@@ -1030,6 +1058,145 @@ def _set_resurrection(state: str) -> None:
         print(f"    WARNING: update-resurrection {state} raised: {exc}")
 
 
+def _haproxy_release() -> "tuple[str, str, str, str]":
+    """(name, version, url, sha1) of the source haproxy release.
+
+    haproxy is added to the deployment by cf-deployment's
+    operations/use-haproxy.yml and is the only release that compiles from source
+    against the lab stemcell. `bosh int` resolves the stanza offline (no director
+    needed) so compile-releases can build its compile deployment from it.
+    """
+    base = str(CF_DEPLOYMENT / "cf-deployment.yml")
+    ophap = str(CF_DEPLOYMENT / "operations/use-haproxy.yml")
+
+    def field(p: str) -> str:
+        return capture("bosh", "int", base, "-o", ophap, f"--path=/releases/name=haproxy/{p}")
+
+    return ("haproxy", field("version"), field("url"), field("sha1"))
+
+
+def _export_compiled_cf(
+    name: str, version: str, os_name: str, sc_version: str,
+    cfg: "_compiled.StoreConfig", denv: dict, bosh_mod,
+) -> "_compiled.CompiledRelease":
+    """export-release one CF release from the compile deployment, store its
+    tarball, and return a CompiledRelease. Reuses the bosh module's store/sha
+    helpers so file:// and S3 storage behave identically across both pipelines.
+    """
+    with tempfile.TemporaryDirectory(prefix="compiled-cf-") as tmpd:
+        run_env(
+            denv, "bosh", "-e", ENV, "-n", "-d", COMPILE_DEPLOYMENT_CF,
+            "export-release", f"{name}/{version}", f"{os_name}/{sc_version}", f"--dir={tmpd}",
+        )
+        tars = sorted(Path(tmpd).glob("*.tgz"))
+        if not tars:
+            sys.exit(f"compile-releases: export-release {name}/{version} produced no tarball")
+        if len(tars) > 1:
+            print(f"    warning: {len(tars)} tarballs for {name}; using {tars[-1].name}", file=sys.stderr)
+        src = str(tars[-1])
+        basename = _compiled.compiled_basename(name, version, os_name, sc_version)
+        sha = "sha256:" + bosh_mod._sha256_file(src)
+        url = bosh_mod._store_put(cfg, src, basename)
+        print(f"    exported {name}/{version} -> {basename}")
+        return _compiled.CompiledRelease(name=name, version=version, url=url, sha1=sha)
+
+
+def cmd_compile_releases(_extra: list[str]) -> None:
+    """Compile + pin the CF source releases (haproxy) against the lab stemcell.
+
+    Mirrors `scripts/bosh compile-releases`: ensure the stemcell is on the
+    director, upload the source haproxy release, deploy a no-VM compilation
+    deployment, export-release the compiled tarball into the configured store
+    (file:// by default, S3-compatible when COMPILED_RELEASES_STORE=s3), and
+    write manifests/cf/compiled-releases.yml. `cf deploy` then layers that ops
+    file after use-haproxy.yml so a fresh-director deploy skips the haproxy
+    build (~3.5 min). Storage is configured with the same COMPILED_RELEASES_*
+    env as the bosh pipeline; see docs/compiled-releases.md.
+    """
+    banner("Compile CF releases (haproxy)")
+    bosh_mod = _load_bosh_module()
+    denv = bosh_mod.director_env()
+    os_name, sc_version = stemcell_os_version()
+    cfg = _compiled.store_config_from_env(os.environ, str(COMPILED_DIR_DEFAULT))
+    print(f"    store: {cfg.kind}   stemcell: {os_name}/{sc_version}")
+
+    # 1. Ensure the stemcell is on the director (upload the light record if not).
+    if not bosh_mod._stemcell_present(denv, os_name, sc_version):
+        cmd_stemcell([])
+    if not bosh_mod._stemcell_present(denv, os_name, sc_version):
+        sys.exit(f"compile-releases: stemcell {os_name}/{sc_version} not on director")
+
+    # 2. Upload the source haproxy release.
+    name, version, url, sha1 = _haproxy_release()
+    print(f"    uploading source release {name}/{version}")
+    run_env(denv, "bosh", "-e", ENV, "-n", "upload-release", "--sha1", sha1, url)
+    if not bosh_mod._release_present(denv, name, version):
+        sys.exit(f"compile-releases: {name}/{version} not on director after upload; check `bosh releases`")
+
+    # 3. Deploy a no-VM compilation deployment referencing haproxy + stemcell.
+    manifest = (
+        f"name: {COMPILE_DEPLOYMENT_CF}\n"
+        "releases:\n"
+        f"- name: {name}\n  version: \"{version}\"\n"
+        "stemcells:\n"
+        f"- alias: default\n  os: {os_name}\n  version: \"{sc_version}\"\n"
+        "instance_groups: []\n"
+        "update:\n"
+        "  canaries: 0\n"
+        "  max_in_flight: 1\n"
+        "  canary_watch_time: 1000-60000\n"
+        "  update_watch_time: 1000-60000\n"
+        "  serial: false\n"
+    )
+    mf = tempfile.NamedTemporaryFile("w", suffix=".yml", delete=False)
+    try:
+        mf.write(manifest)
+        mf.close()
+        run_env(denv, "bosh", "-e", ENV, "-n", "-d", COMPILE_DEPLOYMENT_CF, "deploy", mf.name)
+        # 4. Export each target (compiles on the director, or reuses its
+        #    compiled-package cache when a live deploy already built it).
+        compiled = [_export_compiled_cf(name, version, os_name, sc_version, cfg, denv, bosh_mod)]
+    finally:
+        os.unlink(mf.name)
+        subprocess.run(
+            ["bosh", "-e", ENV, "-n", "-d", COMPILE_DEPLOYMENT_CF, "delete-deployment", "--force"],
+            env=denv, check=False,
+        )
+
+    # 5. Write the generated ops file (pins compiled url + sha, stemcell marker).
+    ops = _compiled.compiled_releases_ops(compiled, stemcell=f"{os_name}/{sc_version}")
+    COMPILED_OPS_CF.write_text(ops)
+    print(f"    wrote {COMPILED_OPS_CF.relative_to(REPO_ROOT)}")
+    for cr in compiled:
+        print(f"      {cr.name}/{cr.version} -> {cr.url}")
+
+
+def compiled_ops_layer() -> list[str]:
+    """['-o', compiled-releases.yml] when a valid cache matches the stemcell, else [].
+
+    Mirrors scripts/bosh: disabled by COMPILE_RELEASES_DISABLE, and refuses a
+    missing file, a stemcell-marker mismatch, or a file:// tarball that has gone
+    missing — any of which falls back to compiling haproxy from source rather
+    than deploying a cache that cannot match.
+    """
+    if os.environ.get("COMPILE_RELEASES_DISABLE", "").strip():
+        return []
+    if not COMPILED_OPS_CF.exists():
+        return []
+    text = COMPILED_OPS_CF.read_text()
+    want = "{}/{}".format(*stemcell_os_version())
+    marker = _compiled.stemcell_from_ops(text)
+    if marker != want:
+        print(f"    compile: ignoring {COMPILED_OPS_CF.name} (stemcell {marker} != {want})")
+        return []
+    for p in _compiled.local_paths_from_ops(text):
+        if not Path(p).exists():
+            print(f"    compile: ignoring {COMPILED_OPS_CF.name} (missing tarball {p})")
+            return []
+    print(f"    compile: using compiled haproxy ({want}) from {COMPILED_OPS_CF.name}")
+    return ["-o", str(COMPILED_OPS_CF)]
+
+
 def cmd_deploy(extra: list[str]) -> None:
     """Full CF deploy with resurrection gated off across the run.
 
@@ -1047,15 +1214,30 @@ def cmd_deploy(extra: list[str]) -> None:
     `bosh resurrection` at start of any subsequent deploy. The
     integration harness asserts on this at start-of-run.
     """
+    timings: list[tuple[str, float]] = []
+
+    def step(label: str, fn) -> None:
+        t0 = time.monotonic()
+        try:
+            fn()
+        finally:
+            timings.append((label, time.monotonic() - t0))
+
     _set_resurrection("off")
+    deploy_t0 = time.monotonic()
     try:
-        cmd_runtime_config([])
-        cmd_cloud_config([])
-        cmd_stemcell([])
-        cmd_check_uaa_db([])
-        cmd_bosh_deploy(extra)
+        step("runtime-config", lambda: cmd_runtime_config([]))
+        step("cloud-config", lambda: cmd_cloud_config([]))
+        step("stemcell", lambda: cmd_stemcell([]))
+        step("check-uaa-db", lambda: cmd_check_uaa_db([]))
+        step("bosh-deploy", lambda: cmd_bosh_deploy(extra))
     finally:
         _set_resurrection("on")
+        total = time.monotonic() - deploy_t0
+        banner("Deploy step timings")
+        for label, secs in timings:
+            print(f"    {label:14s} {secs:7.1f}s  ({int(secs)//60}m{int(secs) % 60:02d}s)")
+        print(f"    {'TOTAL':14s} {total:7.1f}s  ({int(total)//60}m{int(total) % 60:02d}s)")
 
 
 COMMANDS = {
@@ -1066,6 +1248,7 @@ COMMANDS = {
     "check-uaa-db": cmd_check_uaa_db,
     "unstick-agent": cmd_unstick_agent,
     "bosh-deploy": cmd_bosh_deploy,
+    "compile-releases": cmd_compile_releases,
     "teardown": cmd_teardown,
     "delete-deployment": cmd_teardown,
     "api": cmd_api,
