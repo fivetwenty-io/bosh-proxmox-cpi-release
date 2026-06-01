@@ -516,7 +516,9 @@ def render_install_script(cfg: ArtifactsConfig) -> str:
     buckets = " ".join(q(b) for b in cfg.buckets)
 
     data_setup = "mkdir -p /data\n"
-    apt_pkgs = "unzip jq awscli curl ca-certificates"
+    # Ubuntu 24.04 (noble) dropped the awscli deb, so install AWS CLI v2 from the
+    # official bundled installer instead of apt.
+    apt_pkgs = "unzip jq curl ca-certificates"
     if cfg.data_disk_gib > 0:
         apt_pkgs += " zfsutils-linux"
         data_setup = """# ZFS data pool on the second disk (idempotent).
@@ -550,6 +552,15 @@ cloud-init status --wait >/dev/null 2>&1 || true
 echo "    install: apt packages"
 apt-get update -qq
 apt-get install -y -qq {apt_pkgs} >/dev/null
+
+# AWS CLI v2 (bundled installer; noble has no awscli deb) — only when missing.
+if ! command -v aws >/dev/null 2>&1; then
+  echo "    install: aws cli v2"
+  curl -fL --retry 3 -o /tmp/awscliv2.zip "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip"
+  unzip -q -o /tmp/awscliv2.zip -d /tmp
+  /tmp/aws/install --update >/dev/null
+  rm -rf /tmp/awscliv2.zip /tmp/aws
+fi
 
 # RustFS binary (musl static) — fetch only when missing.
 if [ ! -x /usr/local/bin/rustfs ]; then

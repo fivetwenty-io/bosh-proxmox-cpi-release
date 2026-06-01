@@ -163,11 +163,15 @@ def pve_ssh_capture(pve_host: str, script: str) -> "subprocess.CompletedProcess[
 
 def _guest_ssh_opts() -> "list[str]":
     # The guest is an ephemeral lab VM with a churning host key; don't persist it.
+    # IdentitiesOnly=yes is essential: without it, a loaded ssh-agent offers all
+    # its keys first and the guest rejects with "Too many authentication
+    # failures" before our dedicated -i key is ever tried.
     return [
         "-o", "BatchMode=yes",
         "-o", "ConnectTimeout=10",
         "-o", "StrictHostKeyChecking=no",
         "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "IdentitiesOnly=yes",
         "-o", "LogLevel=ERROR",
     ]
 
@@ -219,9 +223,13 @@ def ensure_keypair(env: str) -> Path:
 # --------------------------------------------------------------------------- #
 
 def find_vmid_by_name(pve_host: str, name: str) -> "int | None":
+    # Pass the name as an awk -v variable: shlex.quote handles the SHELL quoting,
+    # and `$2==n` compares against awk's string variable. Inlining the name into
+    # the awk program instead (e.g. `$2==cpi-artifacts`) would be parsed by awk
+    # as arithmetic on undefined vars, never matching.
     res = pve_ssh_capture(
         pve_host,
-        f"qm list 2>/dev/null | awk 'NR>1 && $2=={shlex.quote(name)} {{print $1}}'",
+        f"qm list 2>/dev/null | awk -v n={shlex.quote(name)} 'NR>1 && $2==n {{print $1}}'",
     )
     out = (res.stdout or "").strip().split()
     if out and out[0].isdigit():
@@ -248,17 +256,23 @@ def resolve_vmid(env: str, pve_host: str) -> int:
 
 
 def require_bridge(cpi_cfg: dict, cfg: A.ArtifactsConfig) -> None:
-    """Exit with guidance when the env's SDN bridge is not realized on the node."""
+    """Exit with guidance when the env's SDN network is not up.
+
+    A simple-zone SDN vnet is realized as a Linux bridge of the same name, but
+    that bridge is NOT enumerated under /nodes/<node>/network (it lives in the
+    SDN-applied interfaces.d config). So the authoritative check is the SDN vnet
+    itself; the node-network bridge is only a secondary confirmation.
+    """
     try:
         v = verifier(cpi_cfg)
-        if v.bridge_exists(cfg.bridge):
+        if v.vnet_exists(cfg.bridge) or v.bridge_exists(cfg.bridge):
             return
     except PVEVerifyError:
         # Can't confirm — let bootstrap proceed; qm will fail loudly if the
         # bridge is genuinely absent. Absence of proof is not proof of absence.
         return
     sys.exit(
-        f"artifacts: SDN bridge {cfg.bridge!r} not found on node {cfg.node!r}.\n"
+        f"artifacts: SDN network {cfg.bridge!r} not found on node {cfg.node!r}.\n"
         f"    Bring the isolated network up first:\n"
         f"        BOSH_PVE_ENV={cfg.env} ./scripts/bosh net-up"
     )
@@ -421,6 +435,7 @@ def cmd_status(_args: "list[str]") -> int:
     except (PVEVerifyError, ValueError):
         vm_present = False
 
+    import shutil
     online = A.probe_tcp(ip, port)
     print(f"artifacts status: env={env}")
     print(f"    vmid:     {state.get('vmid')} ({'present' if vm_present else 'absent/unknown'})")
@@ -428,9 +443,14 @@ def cmd_status(_args: "list[str]") -> int:
     print(f"    tls:      {state.get('tls_mode')}")
     print(f"    s3 port:  {'open' if online else 'closed'}")
     if online:
-        res = aws(state, "s3", "ls", capture=True)
-        listed = [ln.split()[-1] for ln in (res.stdout or "").splitlines() if ln.strip()]
-        print(f"    buckets:  {', '.join(listed) if listed else '(none)'}")
+        if shutil.which("aws") is None:
+            # The port answers; we just can't enumerate buckets without a client.
+            print(f"    buckets:  {', '.join(state.get('buckets', [])) or '(unknown)'} "
+                  "(from state; install 'aws' to query live)")
+        else:
+            res = aws(state, "s3", "ls", capture=True)
+            listed = [ln.split()[-1] for ln in (res.stdout or "").splitlines() if ln.strip()]
+            print(f"    buckets:  {', '.join(listed) if listed else '(none)'}")
         return 0
     return 3 if vm_present else 4
 
