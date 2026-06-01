@@ -1176,6 +1176,67 @@ def _warm_compile_cf(name: str, version: str, os_name: str, sc_version: str, den
     print(f"    compiled {name}/{version} (cached on director)")
 
 
+def _runtime_release_targets(denv: dict) -> "list[dict]":
+    """Releases injected by the Director's runtime-configs (e.g. bosh-dns).
+
+    Runtime-config addon jobs (bosh-dns on every instance, ...) reference
+    releases that are NOT in cf-deployment's /releases, so cf deploy compiles
+    them against the stemcell unless the Director cache already holds their
+    packages. Precompile warms them too. Enumerated by re-parsing each
+    runtime-config's YAML with `bosh int` (same index walk as the CF set, no
+    YAML dependency). Best-effort: returns [] when no runtime-configs are
+    readable. Returns deduped {name, version, url, sha1} (versions of "latest"
+    are skipped — they cannot be pinned/compiled deterministically).
+    """
+    listed = subprocess.run(
+        ["bosh", "-e", ENV, "configs", "--type=runtime", "--json"],
+        env=denv, capture_output=True, text=True,
+    )
+    if listed.returncode != 0:
+        return []
+    try:
+        rows = json.loads(listed.stdout)["Tables"][0]["Rows"]
+    except (json.JSONDecodeError, KeyError, IndexError):
+        return []
+    names = sorted({str(r.get("name", "")).strip() for r in rows if r.get("name")})
+
+    out: "dict[str, dict]" = {}
+    for cfg_name in names:
+        text = subprocess.run(
+            ["bosh", "-e", ENV, "runtime-config", f"--name={cfg_name}"],
+            env=denv, capture_output=True, text=True,
+        ).stdout
+        if not text.strip():
+            continue
+        tf = tempfile.NamedTemporaryFile("w", suffix=".yml", delete=False)
+        try:
+            tf.write(text)
+            tf.close()
+
+            def at(idx: int, field: str) -> str:
+                res = subprocess.run(
+                    ["bosh", "int", tf.name, f"--path=/releases/{idx}/{field}"],
+                    capture_output=True, text=True,
+                )
+                return res.stdout.strip() if res.returncode == 0 else ""
+
+            idx = 0
+            while True:
+                name = at(idx, "name")
+                if not name:
+                    break
+                version = at(idx, "version")
+                if name and version and version != "latest":
+                    out[f"{name}/{version}"] = {
+                        "name": name, "version": version,
+                        "url": at(idx, "url"), "sha1": at(idx, "sha1"),
+                    }
+                idx += 1
+        finally:
+            os.unlink(tf.name)
+    return list(out.values())
+
+
 def cmd_precompile_releases(_extra: list[str]) -> None:
     """Precompile the FULL CF release set against the standardized stemcell.
 
@@ -1226,11 +1287,19 @@ def cmd_precompile_releases(_extra: list[str]) -> None:
         sys.exit(f"precompile-releases: stemcell {stem} not on director")
 
     # 2. Upload every CF source release the director does not already have.
+    #    runtime-config releases (e.g. bosh-dns, added as addon jobs to every
+    #    instance) are compiled too — warmed only, never pinned into the CF
+    #    deployment ops — so cf deploy does not recompile them at deploy time.
     targets = _cf_source_releases()
-    print(f"    {len(targets)} CF source releases to compile")
-    for t in targets:
+    cf_names = {t["name"] for t in targets}
+    rt_targets = [t for t in _runtime_release_targets(denv) if t["name"] not in cf_names]
+    all_targets = targets + rt_targets
+    print(f"    {len(targets)} CF + {len(rt_targets)} runtime-config releases to compile")
+    for t in all_targets:
         if bosh_mod._release_present(denv, t["name"], t["version"]):
             continue
+        if not t["url"]:
+            sys.exit(f"precompile-releases: {t['name']}/{t['version']} not on director and has no url to upload")
         print(f"    uploading source release {t['name']}/{t['version']}")
         up = ["bosh", "-e", ENV, "-n", "upload-release"]
         if t["sha1"]:
@@ -1241,7 +1310,7 @@ def cmd_precompile_releases(_extra: list[str]) -> None:
             sys.exit(f"precompile-releases: {t['name']}/{t['version']} not on director after upload")
 
     # 3. Deploy the no-VM compilation deployment (forces compilation of all packages).
-    manifest = _cfcompile.compilation_manifest(COMPILE_DEPLOYMENT_CF, targets, os_name, sc_version)
+    manifest = _cfcompile.compilation_manifest(COMPILE_DEPLOYMENT_CF, all_targets, os_name, sc_version)
     mf = tempfile.NamedTemporaryFile("w", suffix=".yml", delete=False)
     compiled: "list[_compiled.CompiledRelease] | None" = None
     try:
@@ -1253,12 +1322,17 @@ def cmd_precompile_releases(_extra: list[str]) -> None:
         #    director-cache discards the tarball and relies on the warmed
         #    director compiled-package cache.
         if store_ops:
+            # Pin only the CF deployment releases; runtime-config releases are
+            # warmed (compiled into the Director cache) but not pinned — they
+            # belong to the runtime-config, not the cf deployment manifest.
             compiled = [
                 _export_compiled_cf(t["name"], t["version"], os_name, sc_version, cfg, denv, bosh_mod)
                 for t in targets
             ]
+            for t in rt_targets:
+                _warm_compile_cf(t["name"], t["version"], os_name, sc_version, denv)
         else:
-            for t in targets:
+            for t in all_targets:
                 _warm_compile_cf(t["name"], t["version"], os_name, sc_version, denv)
     finally:
         os.unlink(mf.name)
@@ -1269,7 +1343,10 @@ def cmd_precompile_releases(_extra: list[str]) -> None:
 
     # 5. Record the result so cf deploy knows how to source the CF releases.
     if compiled:
-        COMPILED_OPS_CF.write_text(_compiled.compiled_releases_ops(compiled, stemcell=stem))
+        COMPILED_OPS_CF.write_text(_compiled.compiled_releases_ops(
+            compiled, stemcell=stem,
+            generated_by="scripts/cf precompile-releases", consumer="cf deploy",
+        ))
         print(f"    wrote {COMPILED_OPS_CF.relative_to(REPO_ROOT)} (store-ops, {len(compiled)} releases)")
     else:
         COMPILED_OPS_CF.write_text(_cfcompile.cache_mode_ops(stem))
