@@ -64,6 +64,12 @@ CF_DEPLOYMENT = Path(os.environ.get("CF_DEPLOYMENT", Path.home() / "w/cloudfound
 BOSH_DEPLOYMENT = Path(os.environ.get("BOSH_DEPLOYMENT", Path.home() / "w/cloudfoundry/bosh-deployment"))
 ENV = os.environ.get("BOSH_ENV", "pve")
 DEPLOYMENT = os.environ.get("BOSH_DEPLOYMENT_NAME", "cf")
+# CF system database. "postgres" (default) layers operations/use-postgres.yml:
+# drop the pxc/Galera (MySQL) release + cluster jobs and run a single internal
+# postgres node — the same release family the BOSH Director itself uses, and no
+# 30-min percona-xtradb-cluster source build. "pxc"/"mysql" keeps cf-deployment's
+# stock internal Percona XtraDB Cluster.
+CF_DATABASE = os.environ.get("CF_DATABASE", "postgres").strip().lower()
 BOSH_VARS = REPO_ROOT / "manifests" / "bosh" / "vars.yml"
 BOSH_CREDS = REPO_ROOT / "manifests" / "bosh" / "creds.yml"
 
@@ -845,6 +851,10 @@ def cmd_bosh_deploy(extra: list[str]) -> None:
         # use-compiled-releases.yml (that targets a different stemcell version).
         # Layered after use-haproxy.yml so the compiled haproxy pin wins.
         "-o", str(CF_DEPLOYMENT / "operations/use-haproxy.yml"),
+        # CF system database (CF_DATABASE): postgres (default) drops pxc/Galera
+        # for one internal postgres node; layered before the release-sourcing
+        # and resize ops that reference the database instance group.
+        *_cf_db_ops(),
         *_cf_release_ops(),
         # cf-deployment stock ops file: removes policy-server-asg-syncer
         # from the api instance group. The job had been flapping every
@@ -1069,6 +1079,20 @@ def _set_resurrection(state: str) -> None:
         print(f"    WARNING: update-resurrection {state} raised: {exc}")
 
 
+def _cf_db_ops() -> list[str]:
+    """Ops selecting the CF system database (controlled by CF_DATABASE).
+
+    postgres (default) → operations/use-postgres.yml (drop pxc release + Galera
+        cluster jobs; run one internal postgres node — no percona compile).
+    pxc/mysql          → [] (cf-deployment's stock internal Percona XtraDB
+        Cluster). Layered the same way for precompile enumeration and deploy so
+        the compiled release set and the deployed release set always match.
+    """
+    if CF_DATABASE in ("postgres", "pg"):
+        return ["-o", str(CF_DEPLOYMENT / "operations/use-postgres.yml")]
+    return []
+
+
 def _cf_source_releases() -> "list[dict]":
     """Enumerate every CF source release (incl. haproxy) for precompilation.
 
@@ -1080,10 +1104,13 @@ def _cf_source_releases() -> "list[dict]":
     """
     base = str(CF_DEPLOYMENT / "cf-deployment.yml")
     ophap = str(CF_DEPLOYMENT / "operations/use-haproxy.yml")
+    # Match the deploy's database choice so the compiled set tracks the deployed
+    # set (e.g. postgres in, pxc out under CF_DATABASE=postgres).
+    db_ops = _cf_db_ops()
 
     def at(idx: int, field: str) -> str:
         res = subprocess.run(
-            ["bosh", "int", base, "-o", ophap, f"--path=/releases/{idx}/{field}"],
+            ["bosh", "int", base, "-o", ophap, *db_ops, f"--path=/releases/{idx}/{field}"],
             capture_output=True, text=True,
         )
         return res.stdout.strip() if res.returncode == 0 else ""
