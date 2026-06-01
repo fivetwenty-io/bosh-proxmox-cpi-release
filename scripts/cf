@@ -1129,6 +1129,25 @@ def _export_compiled_cf(
         return _compiled.CompiledRelease(name=name, version=version, url=url, sha1=sha)
 
 
+def _warm_compile_cf(name: str, version: str, os_name: str, sc_version: str, denv: dict) -> None:
+    """Force a release's packages into the director's compiled-package cache.
+
+    A no-VM (empty instance_groups) compile deployment registers releases but
+    compiles nothing — BOSH compiles only for colocated job packages or when
+    export-release is invoked. director-cache mode therefore drives compilation
+    with export-release per release and discards the tarball: the compiled
+    packages persist in the director blobstore keyed by package + stemcell
+    fingerprint, so a later cf deploy (use-compiled-releases dropped) reuses them
+    instead of recompiling. delete-deployment does not evict them.
+    """
+    with tempfile.TemporaryDirectory(prefix="warm-cf-") as tmpd:
+        run_env(
+            denv, "bosh", "-e", ENV, "-n", "-d", COMPILE_DEPLOYMENT_CF,
+            "export-release", f"{name}/{version}", f"{os_name}/{sc_version}", f"--dir={tmpd}",
+        )
+    print(f"    compiled {name}/{version} (cached on director)")
+
+
 def cmd_precompile_releases(_extra: list[str]) -> None:
     """Precompile the FULL CF release set against the standardized stemcell.
 
@@ -1197,12 +1216,18 @@ def cmd_precompile_releases(_extra: list[str]) -> None:
         mf.write(manifest)
         mf.close()
         run_env(denv, "bosh", "-e", ENV, "-n", "-d", COMPILE_DEPLOYMENT_CF, "deploy", mf.name)
-        # 4. In store mode, export each compiled release to the reachable store.
+        # 4. Drive compilation with export-release per release (a no-VM deploy
+        #    alone compiles nothing). store-ops keeps + pins each tarball;
+        #    director-cache discards the tarball and relies on the warmed
+        #    director compiled-package cache.
         if store_ops:
             compiled = [
                 _export_compiled_cf(t["name"], t["version"], os_name, sc_version, cfg, denv, bosh_mod)
                 for t in targets
             ]
+        else:
+            for t in targets:
+                _warm_compile_cf(t["name"], t["version"], os_name, sc_version, denv)
     finally:
         os.unlink(mf.name)
         subprocess.run(
