@@ -87,6 +87,30 @@ STATIC_BODY = "e2e-OK"
 TAIL_LINES = 400
 
 
+def ts() -> str:
+    """Wall-clock HH:MM:SS for live phase/step stamping (cleanroom-style)."""
+    return _dt.datetime.now().strftime("%H:%M:%S")
+
+
+def fmt_hms(seconds: float) -> str:
+    """Human duration: 0.2s / 12.3s under a minute, else 5m23s / 1h04m09s.
+
+    Sub-minute durations keep tenths so fast steps and dry-runs don't collapse
+    to a misleading '0m00s'; minute-and-up matches the cleanroom driver's form.
+    """
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    s = int(round(seconds))
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    return f"{h}h{m:02d}m{sec:02d}s" if h else f"{m}m{sec:02d}s"
+
+
+def paren_hms(seconds: float) -> str:
+    """' (m s)' suffix, only at >=60s so a sub-minute total isn't '12.3s (12.3s)'."""
+    return f" ({fmt_hms(seconds)})" if seconds >= 60 else ""
+
+
 def _kill_group(proc: subprocess.Popen) -> None:
     """SIGKILL the child's whole process group.
 
@@ -157,15 +181,41 @@ class Reporter:
         self.results: list[StepResult] = []
         self.started = time.time()
         self._t0 = time.monotonic()
+        # Section (cleanroom "phase") timing: name -> wall-clock elapsed.
+        self.sections: list[tuple[str, float]] = []
+        self._cur_section: str | None = None
+        self._section_t0: float = self._t0
 
     # -- section + step lifecycle ----------------------------------------- #
 
+    def _cum(self) -> float:
+        """Cumulative wall-clock since the run began (cleanroom 'cumulative=')."""
+        return time.monotonic() - self._t0
+
+    def _finish_section(self) -> None:
+        """Close the open section, record its elapsed, print a timed footer."""
+        if self._cur_section is None:
+            return
+        elapsed = time.monotonic() - self._section_t0
+        self.sections.append((self._cur_section, elapsed))
+        print(self.color.dim(
+            f"    <-- [{ts()}] {self._cur_section} done in {fmt_hms(elapsed)}"
+            f"  (cumulative {fmt_hms(self._cum())})"
+        ))
+        self._cur_section = None
+
     def section(self, title: str) -> None:
+        self._finish_section()
+        self._cur_section = title
+        self._section_t0 = time.monotonic()
+        bar = "=" * 18
         print()
-        print(self.color.bold(f"==> {title}"))
+        print(self.color.bold(
+            f"{bar} [{ts()}] {title}  (cumulative {fmt_hms(self._cum())}) {bar}"
+        ))
 
     def begin(self, name: str) -> None:
-        print(self.color.bold(f"==> {name}"))
+        print(self.color.bold(f"==> [{ts()}] {name}"))
 
     def _status_line(self, name: str, status: str, seconds: float, detail: str) -> str:
         tag = {
@@ -186,7 +236,10 @@ class Reporter:
     ) -> StepResult:
         res = StepResult(name, status, seconds, detail, list(tail or []))
         self.results.append(res)
-        print(self._status_line(name, status, seconds, detail))
+        line = self._status_line(name, status, seconds, detail)
+        if status != SKIP:
+            line += self.color.dim(f"   @{ts()} cumulative={fmt_hms(self._cum())}")
+        print(line)
         if status == FAIL and res.tail:
             print(self.color.red(f"    ! {name} failed — last {len(res.tail)} line(s):"))
             for line in res.tail:
@@ -208,6 +261,7 @@ class Reporter:
         return 1 if self._totals()[FAIL] else 0
 
     def summary(self) -> int:
+        self._finish_section()
         total_s = time.monotonic() - self._t0
         t = self._totals()
         print()
@@ -217,6 +271,11 @@ class Reporter:
         print(self.color.bold("=" * 64))
         for r in self.results:
             print(self._status_line(r.name, r.status, r.seconds, r.detail))
+        if self.sections:
+            print(self.color.bold("-" * 64))
+            print(self.color.bold("  PHASE TIMINGS"))
+            for sname, ssec in self.sections:
+                print(f"    {self.color.dim(f'{fmt_hms(ssec):>9}')}  {sname}")
         verdict = (
             self.color.green("ALL PASSED") if not t[FAIL]
             else self.color.red(f"{t[FAIL]} FAILED")
@@ -226,7 +285,7 @@ class Reporter:
             f"  {self.color.green(str(t[PASS]) + ' pass')}"
             f"  {self.color.red(str(t[FAIL]) + ' fail')}"
             f"  {self.color.yellow(str(t[SKIP]) + ' skip')}"
-            f"   total {total_s:.1f}s   ->  {verdict}"
+            f"   total {total_s:.1f}s{paren_hms(total_s)}   ->  {verdict}"
         )
         print(self.color.bold("=" * 64))
         if t[FAIL]:
@@ -247,6 +306,11 @@ class Reporter:
             "started": _dt.datetime.fromtimestamp(self.started).isoformat(),
             "finished": _dt.datetime.now().isoformat(),
             "total_seconds": round(total_s, 3),
+            "total_hms": fmt_hms(total_s),
+            "sections": [
+                {"name": n, "seconds": round(s, 3), "hms": fmt_hms(s)}
+                for n, s in self.sections
+            ],
             "totals": {"pass": t[PASS], "fail": t[FAIL], "skip": t[SKIP]},
             "exit": self.exit_code(),
             "results": [
@@ -915,12 +979,20 @@ def cmd_report(args: argparse.Namespace, color: Color) -> int:
         }[r["status"]]
         suffix = f"  {color.dim(r['detail'])}" if r["detail"] else ""
         print(f"    {tag} {r['name']}{suffix}")
+    sections = data.get("sections", [])
+    if sections:
+        print(color.bold("-" * 64))
+        print(color.bold("  PHASE TIMINGS"))
+        for s in sections:
+            hms = fmt_hms(s["seconds"])
+            print(f"    {color.dim(f'{hms:>9}')}  {s['name']}")
     t = data["totals"]
+    total_s = data["total_seconds"]
     print(color.bold("-" * 64))
     print(f"  {color.green(str(t['pass']) + ' pass')}"
           f"  {color.red(str(t['fail']) + ' fail')}"
           f"  {color.yellow(str(t['skip']) + ' skip')}"
-          f"   total {data['total_seconds']:.1f}s")
+          f"   total {total_s:.1f}s{paren_hms(total_s)}")
     return int(data["exit"])
 
 
