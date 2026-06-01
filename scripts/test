@@ -911,6 +911,21 @@ def cmd_integration(argv: list[str]) -> int:
         print(f"config error: {exc}", file=sys.stderr)
         sys.exit(2)
 
+    # Informational only: when the active env has a RustFS artifacts VM online,
+    # the bosh/cf tiers' compile/precompile steps route their tarballs into it
+    # automatically (via the scripts/bosh + scripts/cf store gate). Print one
+    # line so the operator knows; emit nothing when no artifacts VM is set up.
+    _artifacts_env = os.environ.get("BOSH_PVE_ENV", "").strip()
+    if _artifacts_env:
+        try:
+            import _artifacts
+            if _artifacts.read_state(_artifacts_env) is not None:
+                online = _artifacts.artifacts_online(_artifacts_env)
+                print(f"==> artifacts VM ({_artifacts_env}): "
+                      f"{'online — compiled releases route to RustFS' if online else 'offline — using env default store'}")
+        except Exception:  # noqa: BLE001 — never let an info probe fail the run
+            pass
+
     # Synthesize CPI config into a temp file.
     # mkstemp creates the file with mode 0600 (owner-read/write only), preventing
     # other users on the host from reading PVE credentials while the run is live.

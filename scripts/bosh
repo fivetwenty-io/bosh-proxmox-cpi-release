@@ -76,6 +76,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _hostfw
 import _compiled
 import _lightstemcell
+import _artifacts
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 BOSH_DEPLOYMENT_DIR = Path(os.environ.get("BOSH_DEPLOYMENT_DIR", Path.home() / "w/cloudfoundry/bosh-deployment"))
@@ -1013,11 +1014,17 @@ def cmd_compile_releases(args: list[str]) -> int:
     os_name, sc_version = _stemcell_os_version()
     sc_url = bosh_int(VARS, "/stemcell_url")
     sc_sha = bosh_int(VARS, "/stemcell_sha1")
-    cfg = _compiled.store_config_from_env(os.environ, str(COMPILED_DIR_DEFAULT))
+    # When the active env's artifacts VM (RustFS) is online and the operator has
+    # not set an explicit COMPILED_RELEASES_* override, store the compiled
+    # tarballs in its pve-cpi-bosh bucket; otherwise fall back to the env default
+    # (file:// or an explicit S3 store). Absent VM -> unchanged behavior.
+    artifacts_cfg = _artifacts.compiled_store_override(os.environ, "pve-cpi-bosh")
+    cfg = artifacts_cfg or _compiled.store_config_from_env(os.environ, str(COMPILED_DIR_DEFAULT))
     denv = director_env()
 
     dest = cfg.directory if cfg.kind == "file" else f"{cfg.s3_endpoint}/{cfg.s3_bucket}"
-    print(f">>> compile-releases: stemcell {os_name}/{sc_version}, store={cfg.kind} ({dest})")
+    src = "artifacts-vm" if artifacts_cfg else "env"
+    print(f">>> compile-releases: stemcell {os_name}/{sc_version}, store={cfg.kind} ({dest}) [{src}]")
 
     # 1. Ensure the target stemcell is on the director (exact os+version match).
     if _stemcell_present(denv, os_name, sc_version):

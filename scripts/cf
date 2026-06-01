@@ -57,6 +57,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _compiled  # noqa: E402
 import _cfcompile  # noqa: E402
 import _lightstemcell  # noqa: E402
+import _artifacts  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CF_DEPLOYMENT = Path(os.environ.get("CF_DEPLOYMENT", Path.home() / "w/cloudfoundry/cf-deployment"))
@@ -1183,7 +1184,11 @@ def cmd_precompile_releases(_extra: list[str]) -> None:
 
     bosh_mod = _load_bosh_module()
     denv = bosh_mod.director_env()
-    cfg = _compiled.store_config_from_env(os.environ, str(COMPILED_DIR_DEFAULT))
+    # Same fail-open gate as scripts/bosh: when the active env's artifacts VM is
+    # online and no explicit COMPILED_RELEASES_* override is set, precompiled CF
+    # release tarballs land in its pve-cpi-cf bucket; otherwise the env default.
+    cfg = _artifacts.compiled_store_override(os.environ, "pve-cpi-cf") \
+        or _compiled.store_config_from_env(os.environ, str(COMPILED_DIR_DEFAULT))
     store_ops = cfg.kind == "s3"
     print(f"    store: {cfg.kind} ({'store-ops' if store_ops else 'director-cache'})   stemcell: {stem}")
 

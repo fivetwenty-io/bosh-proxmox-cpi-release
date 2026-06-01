@@ -1,0 +1,548 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["pyyaml"]
+# ///
+"""Manage the cpi-artifacts VM: a RustFS S3 blobstore parallel to the director.
+
+The artifacts VM runs RustFS (an S3-compatible object store) on the active
+env's isolated SDN network, alongside the create-env BOSH director. Once it is
+online, `scripts/bosh compile-releases` and `scripts/cf precompile-releases`
+store their compiled tarballs in it (buckets pve-cpi-bosh / pve-cpi-cf) instead
+of a remote store, and the CPI can fetch the light stemcell from it. When it is
+absent, every other script behaves exactly as before (fail-open).
+
+Subcommands:
+    bootstrap        create + provision the VM and ensure its buckets (idempotent)
+    teardown         stop + destroy the VM and remove its state (needs --yes)
+    status           show VM power + S3 online state and bucket presence
+    info | creds     print the S3 endpoint + credentials as shell exports
+    list-buckets     list buckets on the RustFS endpoint
+    create-bucket <name>   create a bucket (idempotent)
+    delete-bucket <name> [--force]   delete a bucket (--force empties it first)
+    help             show this help
+
+Env selection:
+    BOSH_PVE_ENV=<name>   pick manifests/envs/<name>/ (default: cpitest). The VM
+                          attaches to that env's SDN vnet and Director network.
+
+Sizing + config (env var wins, then the env vars.yml key, then the default):
+    ARTIFACTS_VM_CPU / _MEMORY / _DISK     2 / 4096 (MiB) / 100 (GiB)
+    ARTIFACTS_VM_IP                        172.31.0.11
+    ARTIFACTS_S3_PORT / _CONSOLE_PORT      9000 / 9001
+    ARTIFACTS_TLS_MODE                     disabled | self-signed
+    ARTIFACTS_BUCKETS                      "pve-cpi-bosh pve-cpi-cf"
+    ARTIFACTS_S3_ACCESS_KEY / _SECRET_KEY  generated hex pair when unset
+    ARTIFACTS_DATA_DISK_GIB                unset (single root disk)
+    ARTIFACTS_RUSTFS_VERSION / _URL        1.0.0-beta.3 / musl zip
+    ARTIFACTS_IMAGE_URL                    Ubuntu 24.04 noble cloud image
+
+Exit codes (status/info for scripting): 0 online/ok, 3 VM up but S3 silent,
+4 no VM / no state, 2 usage/confirmation error.
+
+SSH model: VM creation runs `qm` on the PVE host over root SSH (the same channel
+`scripts/bosh net-up` uses); guest provisioning SSHes directly to the VM's IP
+(requires the operator's approved route to the SDN subnet, e.g. Tailscale).
+"""
+
+from __future__ import annotations
+
+import os
+import shlex
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _artifacts as A  # noqa: E402
+import _lightstemcell  # noqa: E402
+from _pve_verify import PVEVerifier, PVEVerifyError  # noqa: E402
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+ENVS_DIR = REPO_ROOT / "manifests" / "envs"
+VARS = REPO_ROOT / "manifests" / "bosh" / "vars.yml"
+USAGE = __doc__ or ""
+
+IMAGE_REMOTE_DIR = "/var/lib/vz/template/iso"  # cloud-image cache on the PVE host
+
+
+# --------------------------------------------------------------------------- #
+# Env + var resolution
+# --------------------------------------------------------------------------- #
+
+def env_name() -> str:
+    return os.environ.get("BOSH_PVE_ENV", "").strip() or "cpitest"
+
+
+def _bosh_int_opt(path: Path, json_path: str) -> str:
+    """Read one var via `bosh int`, returning "" when the file/key is absent."""
+    if not path.exists():
+        return ""
+    res = subprocess.run(
+        ["bosh", "int", str(path), "--path", json_path],
+        capture_output=True, text=True,
+    )
+    return res.stdout.strip() if res.returncode == 0 else ""
+
+
+def make_getvar(env: str):
+    """Build a getvar(key) reading env artifacts.yml, then env vars.yml, then base.
+
+    Resolution order (first non-empty wins):
+      1. manifests/envs/<env>/artifacts.yml — artifacts sizing/ports/tls knobs;
+      2. manifests/envs/<env>/vars.yml      — network (gw, cidr, bridge);
+      3. manifests/bosh/vars.yml            — PVE connection + credentials.
+    These key sets are disjoint, so the order only matters for an intentional
+    override. Credentials live only in the gitignored base vars.yml.
+    """
+    env_artifacts = ENVS_DIR / env / "artifacts.yml"
+    env_vars = ENVS_DIR / env / "vars.yml"
+
+    def getvar(key: str) -> str:
+        for src in (env_artifacts, env_vars, VARS):
+            val = _bosh_int_opt(src, f"/{key}")
+            if val:
+                return val
+        return ""
+
+    return getvar
+
+
+def resolve_config(env: str) -> A.ArtifactsConfig:
+    """Resolve the config, reusing a prior state file's credentials when present.
+
+    RustFS beta's secret-key rotation is destructive, so a re-run must never
+    re-seed credentials on a VM that already has them; the state file is the
+    authority once bootstrap has run once.
+    """
+    getvar = make_getvar(env)
+    state = A.read_state(env)
+    access = state.get("access_key") if state else None
+    secret = state.get("secret_key") if state else None
+    return A.build_config(
+        env, getenv=os.environ.get, getvar=getvar,
+        access_key=access, secret_key=secret,
+    )
+
+
+def pve_cpi_cfg() -> dict:
+    """Minimal PVE connection dict (host/port/node/auth) from base vars.yml."""
+    return _lightstemcell.pve_cfg_from_bosh_vars(VARS)
+
+
+def verifier(cpi_cfg: dict) -> PVEVerifier:
+    return PVEVerifier(cpi_cfg)
+
+
+# --------------------------------------------------------------------------- #
+# SSH plumbing
+# --------------------------------------------------------------------------- #
+
+def _ssh_opts() -> "list[str]":
+    opts = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
+    if os.environ.get("SCRIPTS_PVE_SSH_INSECURE", "").strip().lower() in A.TRUTHY:
+        opts += ["-o", "StrictHostKeyChecking=accept-new"]
+    return opts
+
+
+def pve_ssh(pve_host: str, script: str) -> int:
+    """Run a bash script on the PVE host as root, streaming output."""
+    return subprocess.run(
+        ["ssh", *_ssh_opts(), f"root@{pve_host}", "bash", "-s"],
+        input=script, text=True,
+    ).returncode
+
+
+def pve_ssh_capture(pve_host: str, script: str) -> "subprocess.CompletedProcess[str]":
+    return subprocess.run(
+        ["ssh", *_ssh_opts(), f"root@{pve_host}", "bash", "-s"],
+        input=script, text=True, capture_output=True,
+    )
+
+
+def _guest_ssh_opts() -> "list[str]":
+    # The guest is an ephemeral lab VM with a churning host key; don't persist it.
+    return [
+        "-o", "BatchMode=yes",
+        "-o", "ConnectTimeout=10",
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "LogLevel=ERROR",
+    ]
+
+
+def guest_ssh(cfg: A.ArtifactsConfig, key_path: Path, script: str) -> int:
+    return subprocess.run(
+        ["ssh", *_guest_ssh_opts(), "-i", str(key_path),
+         f"{cfg.ciuser}@{cfg.ip}", "sudo", "bash", "-s"],
+        input=script, text=True,
+    ).returncode
+
+
+def guest_reachable(cfg: A.ArtifactsConfig, key_path: Path) -> bool:
+    res = subprocess.run(
+        ["ssh", *_guest_ssh_opts(), "-i", str(key_path), f"{cfg.ciuser}@{cfg.ip}", "true"],
+        capture_output=True, text=True,
+    )
+    return res.returncode == 0
+
+
+# --------------------------------------------------------------------------- #
+# SSH key (dedicated keypair per env; private stays local, pubkey ships to PVE)
+# --------------------------------------------------------------------------- #
+
+def ensure_keypair(env: str) -> Path:
+    """Ensure a dedicated artifacts SSH keypair exists; return the private path.
+
+    The private key never leaves this host; only the public key is installed on
+    the guest (via the PVE host's cloud-init sshkeys path). Generated under the
+    gitignored env directory so it is not committed.
+    """
+    key = ENVS_DIR / env / "artifacts_ssh"
+    if not key.exists():
+        key.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            ["ssh-keygen", "-t", "ed25519", "-N", "", "-q",
+             "-C", f"cpi-artifacts-{env}", "-f", str(key)],
+            check=True,
+        )
+        try:
+            key.chmod(0o600)
+        except OSError:
+            pass
+    return key
+
+
+# --------------------------------------------------------------------------- #
+# PVE helpers (vmid allocation, bridge presence) over SSH/REST
+# --------------------------------------------------------------------------- #
+
+def find_vmid_by_name(pve_host: str, name: str) -> "int | None":
+    res = pve_ssh_capture(
+        pve_host,
+        f"qm list 2>/dev/null | awk 'NR>1 && $2=={shlex.quote(name)} {{print $1}}'",
+    )
+    out = (res.stdout or "").strip().split()
+    if out and out[0].isdigit():
+        return int(out[0])
+    return None
+
+
+def next_vmid(pve_host: str) -> int:
+    res = pve_ssh_capture(pve_host, "pvesh get /cluster/nextid 2>/dev/null")
+    out = (res.stdout or "").strip()
+    if not out.isdigit():
+        sys.exit("artifacts: could not allocate a VMID (pvesh get /cluster/nextid failed)")
+    return int(out)
+
+
+def resolve_vmid(env: str, pve_host: str) -> int:
+    state = A.read_state(env)
+    if state and isinstance(state.get("vmid"), int):
+        return int(state["vmid"])
+    existing = find_vmid_by_name(pve_host, A.VM_NAME)
+    if existing is not None:
+        return existing
+    return next_vmid(pve_host)
+
+
+def require_bridge(cpi_cfg: dict, cfg: A.ArtifactsConfig) -> None:
+    """Exit with guidance when the env's SDN bridge is not realized on the node."""
+    try:
+        v = verifier(cpi_cfg)
+        if v.bridge_exists(cfg.bridge):
+            return
+    except PVEVerifyError:
+        # Can't confirm — let bootstrap proceed; qm will fail loudly if the
+        # bridge is genuinely absent. Absence of proof is not proof of absence.
+        return
+    sys.exit(
+        f"artifacts: SDN bridge {cfg.bridge!r} not found on node {cfg.node!r}.\n"
+        f"    Bring the isolated network up first:\n"
+        f"        BOSH_PVE_ENV={cfg.env} ./scripts/bosh net-up"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# aws (operator-host S3 client against the RustFS endpoint)
+# --------------------------------------------------------------------------- #
+
+def _require_aws() -> None:
+    import shutil
+    if shutil.which("aws") is None:
+        sys.exit("artifacts: the 'aws' CLI is required on PATH for bucket operations")
+
+
+def aws(state: dict, *args: str, capture: bool = False) -> "subprocess.CompletedProcess[str]":
+    _require_aws()
+    endpoint = str(state.get("endpoint", ""))
+    insecure = ["--no-verify-ssl"] if str(state.get("tls_mode", "")) == "self-signed" else []
+    env = A.aws_env(state, dict(os.environ))
+    return subprocess.run(
+        ["aws", "--endpoint-url", endpoint, *insecure, *args],
+        env=env, text=True,
+        capture_output=capture,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Subcommands
+# --------------------------------------------------------------------------- #
+
+def cmd_bootstrap(_args: "list[str]") -> int:
+    env = env_name()
+    cfg = resolve_config(env)
+    if not cfg.node:
+        sys.exit("artifacts: pve_node not set in manifests/bosh/vars.yml")
+    if not cfg.vm_storage:
+        sys.exit("artifacts: pve_vm_storage (or pve_stemcell_storage) not set in manifests/bosh/vars.yml")
+
+    cpi_cfg = pve_cpi_cfg()
+    pve_host = str(cpi_cfg.get("host", "")).strip()
+    if not pve_host:
+        sys.exit("artifacts: pve_host not set in manifests/bosh/vars.yml")
+
+    print(f">>> artifacts bootstrap: env={env} ip={cfg.ip} "
+          f"size={cfg.cores}cpu/{cfg.memory_mib}MiB/{cfg.disk_gib}GiB tls={cfg.tls_mode}")
+    require_bridge(cpi_cfg, cfg)
+
+    key = ensure_keypair(env)
+    pubkey = key.with_suffix(".pub")
+    vmid = resolve_vmid(env, pve_host)
+    print(f"    vmid={vmid} on node={cfg.node} storage={cfg.vm_storage}")
+
+    # 1. Download the cloud image on the PVE host (once).
+    image_path = f"{IMAGE_REMOTE_DIR}/{Path(cfg.image_url).name}"
+    if pve_ssh(pve_host, A.render_image_fetch_script(cfg.image_url, image_path)) != 0:
+        sys.exit("artifacts: cloud image download failed on the PVE host")
+
+    # 2. Ship the public key to the PVE host for qm --sshkeys (path on the host).
+    remote_pub = f"/tmp/cpi-artifacts-{env}.pub"
+    ship = subprocess.run(
+        ["ssh", *_ssh_opts(), f"root@{pve_host}", f"cat > {shlex.quote(remote_pub)}"],
+        input=pubkey.read_text(encoding="utf-8"), text=True,
+    )
+    if ship.returncode != 0:
+        sys.exit("artifacts: failed to copy the public key to the PVE host")
+
+    # 3. Create + start the VM.
+    if pve_ssh(pve_host, A.render_qm_create_script(
+        cfg, vmid=vmid, image_path=image_path, sshkey_path=remote_pub,
+    )) != 0:
+        sys.exit("artifacts: qm create/start failed")
+
+    # 4. Wait for the guest to answer SSH (cloud-init brings sshd + the key up).
+    print(f"    waiting for guest ssh at {cfg.ciuser}@{cfg.ip} ...")
+    deadline = time.monotonic() + 300
+    while time.monotonic() < deadline:
+        if guest_reachable(cfg, key):
+            break
+        time.sleep(5)
+    else:
+        sys.exit(
+            f"artifacts: guest {cfg.ip} did not answer SSH within 300s.\n"
+            f"    Confirm your host has a route to {cfg.ip} (e.g. an approved "
+            f"Tailscale subnet route for the SDN subnet)."
+        )
+
+    # 5. Install RustFS + ensure buckets on the guest.
+    if guest_ssh(cfg, key, A.render_install_script(cfg)) != 0:
+        sys.exit("artifacts: RustFS install on the guest failed (VM left up for triage)")
+
+    # 6. Persist state (carries the generated secret -> gitignored).
+    state = A.state_from_config(cfg, vmid=vmid)
+    path = A.write_state(env, state)
+    print(f">>> artifacts bootstrap: ready — endpoint {cfg.endpoint}")
+    print(f"    buckets: {', '.join(cfg.buckets)}")
+    print(f"    state:   {path}")
+    return 0
+
+
+def cmd_teardown(args: "list[str]") -> int:
+    env = env_name()
+    confirmed = "--yes" in args or os.environ.get("ARTIFACTS_CONFIRM", "").strip().lower() in A.TRUTHY
+    if not confirmed:
+        print("artifacts teardown: refusing without confirmation. Re-run with --yes "
+              "(or set ARTIFACTS_CONFIRM=1).", file=sys.stderr)
+        return 2
+
+    cpi_cfg = pve_cpi_cfg()
+    pve_host = str(cpi_cfg.get("host", "")).strip()
+    state = A.read_state(env)
+    vmid = None
+    if state and isinstance(state.get("vmid"), int):
+        vmid = int(state["vmid"])
+    elif pve_host:
+        vmid = find_vmid_by_name(pve_host, A.VM_NAME)
+
+    if vmid is None:
+        print(f"artifacts teardown: no VM found for env={env} (already absent)")
+        A.delete_state(env)
+        return 0
+
+    print(f">>> artifacts teardown: env={env} vmid={vmid}")
+    rc = pve_ssh(pve_host, f"""set -euo pipefail
+VMID={int(vmid)}
+if qm config "$VMID" >/dev/null 2>&1; then
+  qm stop "$VMID" >/dev/null 2>&1 || true
+  for i in $(seq 1 15); do
+    [ "$(qm status "$VMID" 2>/dev/null | awk '{{print $2}}')" = "stopped" ] && break
+    sleep 1
+  done
+  qm destroy "$VMID" --purge --destroy-unreferenced-disks 1 >/dev/null
+  echo "    qm: destroyed VM $VMID"
+else
+  echo "    qm: VM $VMID already absent"
+fi
+rm -f {shlex.quote(f"/tmp/cpi-artifacts-{env}.pub")}
+""")
+    if rc != 0:
+        sys.exit("artifacts: qm destroy failed")
+    A.delete_state(env)
+    print(">>> artifacts teardown: done")
+    return 0
+
+
+def cmd_status(_args: "list[str]") -> int:
+    env = env_name()
+    state = A.read_state(env)
+    if not state:
+        print(f"artifacts status: env={env} — no state file (VM not bootstrapped)")
+        return 4
+    ip = str(state.get("ip", ""))
+    port = int(state.get("s3_port", A.DEFAULT_S3_PORT) or A.DEFAULT_S3_PORT)
+    endpoint = str(state.get("endpoint", ""))
+
+    vm_present = False
+    try:
+        cpi_cfg = pve_cpi_cfg()
+        vm_present = verifier(cpi_cfg).vm_exists(int(state.get("vmid", 0)))
+    except (PVEVerifyError, ValueError):
+        vm_present = False
+
+    online = A.probe_tcp(ip, port)
+    print(f"artifacts status: env={env}")
+    print(f"    vmid:     {state.get('vmid')} ({'present' if vm_present else 'absent/unknown'})")
+    print(f"    endpoint: {endpoint}")
+    print(f"    tls:      {state.get('tls_mode')}")
+    print(f"    s3 port:  {'open' if online else 'closed'}")
+    if online:
+        res = aws(state, "s3", "ls", capture=True)
+        listed = [ln.split()[-1] for ln in (res.stdout or "").splitlines() if ln.strip()]
+        print(f"    buckets:  {', '.join(listed) if listed else '(none)'}")
+        return 0
+    return 3 if vm_present else 4
+
+
+def cmd_info(_args: "list[str]") -> int:
+    env = env_name()
+    state = A.read_state(env)
+    if not state:
+        print(f"artifacts info: env={env} — no state file", file=sys.stderr)
+        return 4
+    reveal = "--reveal" in _args
+    secret = str(state.get("secret_key", ""))
+    shown_secret = secret if reveal else (secret[:4] + "…" if secret else "")
+    print(f"# artifacts S3 endpoint for env={env} (eval-able with --reveal)")
+    print(f"export ARTIFACTS_S3_ENDPOINT={shlex.quote(str(state.get('endpoint', '')))}")
+    print(f"export ARTIFACTS_S3_REGION={shlex.quote(str(state.get('region', A.DEFAULT_REGION)))}")
+    print(f"export ARTIFACTS_S3_ACCESS_KEY={shlex.quote(str(state.get('access_key', '')))}")
+    print(f"export ARTIFACTS_S3_SECRET_KEY={shlex.quote(shown_secret)}")
+    print(f"export AWS_S3_ADDRESSING_STYLE=path")
+    if not reveal:
+        print("# secret masked — re-run `info --reveal` to print it in full", file=sys.stderr)
+    return 0
+
+
+def cmd_list_buckets(_args: "list[str]") -> int:
+    env = env_name()
+    state = A.read_state(env)
+    if not state:
+        print(f"artifacts list-buckets: env={env} — no state file", file=sys.stderr)
+        return 4
+    if not A.probe_tcp(str(state.get("ip", "")), int(state.get("s3_port", A.DEFAULT_S3_PORT))):
+        print("artifacts list-buckets: endpoint unreachable", file=sys.stderr)
+        return 3
+    return aws(state, "s3", "ls").returncode
+
+
+def cmd_create_bucket(args: "list[str]") -> int:
+    env = env_name()
+    names = [a for a in args if not a.startswith("-")]
+    if not names:
+        print("usage: artifacts create-bucket <name>", file=sys.stderr)
+        return 2
+    state = A.read_state(env)
+    if not state:
+        print(f"artifacts create-bucket: env={env} — no state file (bootstrap first)", file=sys.stderr)
+        return 4
+    name = names[0]
+    head = aws(state, "s3api", "head-bucket", "--bucket", name, capture=True)
+    if head.returncode == 0:
+        print(f"    bucket: {name} present")
+        return 0
+    rc = aws(state, "s3", "mb", f"s3://{name}").returncode
+    if rc == 0:
+        print(f"    bucket: {name} created")
+    return rc
+
+
+def cmd_delete_bucket(args: "list[str]") -> int:
+    env = env_name()
+    force = "--force" in args
+    names = [a for a in args if not a.startswith("-")]
+    if not names:
+        print("usage: artifacts delete-bucket <name> [--force]", file=sys.stderr)
+        return 2
+    state = A.read_state(env)
+    if not state:
+        print(f"artifacts delete-bucket: env={env} — no state file", file=sys.stderr)
+        return 4
+    name = names[0]
+    if force:
+        aws(state, "s3", "rm", f"s3://{name}", "--recursive")
+    rc = aws(state, "s3", "rb", f"s3://{name}").returncode
+    if rc == 0:
+        print(f"    bucket: {name} deleted")
+    return rc
+
+
+def cmd_help(_args: "list[str]") -> int:
+    print(USAGE)
+    return 0
+
+
+COMMANDS = {
+    "bootstrap": cmd_bootstrap,
+    "teardown": cmd_teardown,
+    "status": cmd_status,
+    "info": cmd_info,
+    "creds": cmd_info,
+    "list-buckets": cmd_list_buckets,
+    "create-bucket": cmd_create_bucket,
+    "delete-bucket": cmd_delete_bucket,
+    "help": cmd_help,
+    "-h": cmd_help,
+    "--help": cmd_help,
+}
+
+
+def main(argv: "list[str]") -> int:
+    os.chdir(REPO_ROOT)
+    if not argv:
+        return cmd_help([])
+    sub, *rest = argv
+    handler = COMMANDS.get(sub)
+    if handler is None:
+        print(f"artifacts: unknown subcommand {sub!r}\n", file=sys.stderr)
+        cmd_help([])
+        return 2
+    return handler(rest)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except subprocess.CalledProcessError as e:
+        sys.exit(e.returncode)

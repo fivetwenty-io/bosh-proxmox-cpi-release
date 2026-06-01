@@ -76,6 +76,7 @@ import _integration  # noqa: E402
 BOSH = str(SCRIPTS_DIR / "bosh")
 CF = str(SCRIPTS_DIR / "cf")
 TEST = str(SCRIPTS_DIR / "test")
+ARTIFACTS = str(SCRIPTS_DIR / "artifacts")
 CREATE_RELEASE = str(SCRIPTS_DIR / "create-release")
 
 DEFAULT_CONFIG = "ci/integration.yml"
@@ -603,6 +604,21 @@ class E2E:
         ok, _ = self.runner.step("lifecycle", argv, timeout=1800)
         return ok
 
+    # -- artifacts VM (optional, opt-in) ----------------------------------- #
+
+    def artifacts_bootstrap(self) -> bool:
+        """Bring up the RustFS artifacts VM before the director (opt-in).
+
+        Only runs when --with-artifacts is passed. Once online, scripts/bosh and
+        scripts/cf automatically route their compiled-release tarballs into it.
+        No-op (and not in the flow) otherwise, so default e2e is unchanged.
+        """
+        if not getattr(self.args, "with_artifacts", False):
+            return True
+        self.rep.section("bootstrap: artifacts VM (RustFS)")
+        ok, _ = self.runner.step("artifacts:bootstrap", [ARTIFACTS, "bootstrap"], timeout=900)
+        return ok
+
     # -- bootstrap: director ---------------------------------------------- #
 
     def bootstrap_director(self) -> bool:
@@ -837,6 +853,7 @@ def run_command(args: argparse.Namespace, rep: Reporter) -> bool:
             return False
         return (
             e2e.lifecycle()
+            and e2e.artifacts_bootstrap()
             and e2e.bootstrap_director()
             and e2e.cf_deploy()
             and e2e.cf_push()
@@ -846,7 +863,7 @@ def run_command(args: argparse.Namespace, rep: Reporter) -> bool:
     if cmd == "bootstrap":
         if not e2e.preflight(need_director=True, need_cf=True, need_cpi=False):
             return False
-        return e2e.bootstrap_director() and e2e.cf_deploy()
+        return e2e.artifacts_bootstrap() and e2e.bootstrap_director() and e2e.cf_deploy()
 
     if cmd == "teardown":
         if not args.dry_run and not confirm_destructive(args, "teardown"):
@@ -929,6 +946,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--results-dir", default=DEFAULT_RESULTS_DIR)
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--no-color", action="store_true")
+    p.add_argument(
+        "--with-artifacts", action="store_true",
+        help="bootstrap the RustFS artifacts VM before the director so compiled "
+             "releases are stored in it (buckets pve-cpi-bosh/pve-cpi-cf)",
+    )
     return p
 
 

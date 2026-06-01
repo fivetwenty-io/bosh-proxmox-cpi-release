@@ -1,0 +1,41 @@
+---
+# ============================================================================
+# Env bundle: cpitest — cpi-artifacts VM (RustFS S3 blobstore) overrides.
+#
+# Optional, git-tracked, and deliberately SECRET-FREE. These keys tune the
+# `cpi-artifacts` VM that `./scripts/artifacts` stands up on the cpitest SDN
+# network (172.31.0.0/24), parallel to the create-env BOSH director. Once the
+# VM is online, `scripts/bosh compile-releases` and `scripts/cf
+# precompile-releases` route their compiled tarballs into its pve-cpi-bosh /
+# pve-cpi-cf buckets instead of the local file:// store.
+#
+# Precedence for every knob: environment variable (ARTIFACTS_*) wins, then the
+# key here, then the built-in default in scripts/_artifacts.py. The values
+# below are the built-in defaults, stated explicitly so this file is the single
+# place to retune cpitest without exporting env vars.
+#
+# Generated S3 credentials and the secret key are NOT stored here — they live
+# only in manifests/envs/cpitest/artifacts-state.json (git-ignored), written by
+# `./scripts/artifacts bootstrap`. KEEP THIS FILE SECRET-FREE.
+#
+# Usage:
+#   BOSH_PVE_ENV=cpitest ./scripts/bosh net-up        # network first
+#   BOSH_PVE_ENV=cpitest ./scripts/artifacts bootstrap
+#   BOSH_PVE_ENV=cpitest ./scripts/artifacts status
+# ============================================================================
+
+# --- VM placement + sizing --------------------------------------------------
+# IP must lie inside internal_cidr and outside any other reserved/static slot.
+# .11 is the slot just after the Director's .10, inside cpitest_reserved.
+artifacts_vm_ip:        172.31.0.11
+artifacts_vm_cpu:       2       # vCPU (cores; sockets fixed at 1)
+artifacts_vm_memory:    4096    # MiB (4 GiB)
+artifacts_vm_disk_gib:  100     # root disk GiB
+# artifacts_data_disk_gib: 200  # uncomment to attach a separate ZFS data disk
+
+# --- RustFS service ---------------------------------------------------------
+artifacts_s3_port:        9000
+artifacts_console_port:   9001
+artifacts_tls_mode:       disabled        # disabled | self-signed
+artifacts_buckets:        "pve-cpi-bosh pve-cpi-cf"
+artifacts_rustfs_version: 1.0.0-beta.3

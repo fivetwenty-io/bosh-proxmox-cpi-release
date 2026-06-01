@@ -47,6 +47,13 @@ compiled_releases/
 manifests/bosh/compiled-releases.yml
 manifests/cf/compiled-releases.yml
 
+# Artifacts VM (scripts/artifacts): runtime state carries the generated RustFS
+# secret key, and the dedicated SSH keypair is host-local. The git-tracked,
+# secret-free overrides live in manifests/envs/<env>/artifacts.yml.
+manifests/envs/*/artifacts-state.json
+manifests/envs/*/artifacts_ssh
+manifests/envs/*/artifacts_ssh.pub
+
 # Integration test generated config (secrets resolved at runtime)
 ci/integration.yml
 ci/params.yml
