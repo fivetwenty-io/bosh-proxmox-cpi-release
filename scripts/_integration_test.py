@@ -365,6 +365,16 @@ class TestCfScripts_CheckUaaDb_RaisesOnSSHFailure(unittest.TestCase):
 
     def setUp(self):
         self._cf = _load_cf_module()
+        # cmd_check_uaa_db gates the probe behind _cf_has_database_vm(), which
+        # runs its own `bosh vms`. These tests exercise the probe's SSH-failure
+        # handling, so force the precondition True; otherwise the globally
+        # mocked subprocess.run feeds the gate a fake result, it reads "no
+        # database VM", and the probe path under test is skipped entirely.
+        gate = unittest.mock.patch.object(
+            self._cf, "_cf_has_database_vm", return_value=True
+        )
+        gate.start()
+        self.addCleanup(gate.stop)
 
     def _make_completed_process(self, returncode: int, stdout: str = "", stderr: str = ""):
         import subprocess as _sp
