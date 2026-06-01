@@ -1,74 +1,43 @@
 ---
-# Ops file: reduce director<->agent NATS mbus disruption during deploys.
-#
-# Root cause (proven by packet capture + the director's own NATS log)
-# -------------------------------------------------------------------
-# The director runs `bosh-nats-sync`, which every `poll_user_sync` seconds
-# reads the managed-VM list from the director and regenerates the NATS
-# authorization users file (`/var/vcap/data/nats/auth.json`), then SIGHUPs
-# nats-server when it changes. nats.cfg uses `verify_and_map: true`, so every
-# agent is an individual cert-mapped NATS user pulled from that file. On each
-# reload nats-server re-evaluates connections and drops (RST) the agents whose
-# authorization entry changed. The agent's Go client reconnects ~2 s later
-# (a new source port), but core NATS does not buffer for an absent subscriber,
-# so any director<->agent RPC published during the gap is lost.
-#
-# What that loss looks like:
-#   * A one-shot get_state (the "Preparing deployment" phase) lost in a gap
-#     times out after 45 s -> `Timed out sending 'get_state' to instance: ...`
-#     and `bosh vms` shows `unresponsive agent`. Transient; the next query
-#     usually succeeds.
-#   * A long-running pre-stop / drain `get_task` poll (the instance-update
-#     phase) lost in a gap never recovers: the director keeps waiting, the
-#     deploy task hangs indefinitely holding the deployment lock. Observed at
-#     9 h before manual cancellation. The nats log showed a `Reloaded:
-#     authorization users` 4 s after the instance entered pre-stop.
-#
-# During an active deploy the managed-VM set churns on (almost) every poll, so
-# at the bosh release default this reloads roughly once a minute for the whole
-# deploy, giving many chances for an RPC to land in a reconnect gap. On a
-# stable (non-deploying) director the set does not change, no reload fires, and
-# connections are stable for hours.
-#
-# Two earlier diagnoses recorded in this repo were wrong and are corrected
-# here: (1) bosh-nats-sync DOES exist on this director and `poll_user_sync` IS
-# a live, tunable knob (a prior op targeted the wrong path, was declared a
-# "dead key", and removed — deleting the only real mitigation); (2) the
-# disruption is NATS auth-reload reconnect-gap RPC loss, not nginx_cc drain.
+# Ops file: minimise director<->agent NATS mbus disruption during deploys.
 #
 # Mitigations in this file
 # ------------------------
-# 1. Widen `nats-sync.intervals.poll_user_sync` (bosh release default 10 s;
-#    rendered 60 s on the deployed release) to 120 s. This cuts reload
-#    frequency — and therefore the number of reconnect gaps during a deploy —
-#    by ~2x. Cost: a freshly-created VM's agent waits up to poll_user_sync
-#    seconds to be authorized onto NATS before it can answer get_state; 120 s
-#    is well inside BOSH's create-vm agent-wait timeout, so onboarding still
-#    completes. Do not set this so high that the create phase times out.
-# 2. Widen the server ping window (ping_interval 30 s x ping_max_outstanding 3
-#    ~= 120 s) so a momentarily-busy agent is not additionally RST'd for a slow
+# 1. SHORTEN `nats-sync.intervals.poll_user_sync` to 10s (the bosh release
+#    default). The CF deploy runs PARALLEL (cf-deployment update.serial=false,
+#    canaries=0): BOSH creates all VMs first, then runs the heavy update steps.
+#    A short poll front-loads NATS-user registration so auth.json reaches its
+#    final, stable content within seconds of the create burst — i.e. BEFORE the
+#    instances enter "installing packages"/post-start. Once auth.json is stable
+#    no further reloads fire, so the heavy update window is reload-free and
+#    agents are not dropped while busy.
+#
+#    This is the opposite of the earlier tuning, which RAISED the poll to 120s
+#    to reduce reload frequency. That was counterproductive here: a long poll
+#    lets a late create-phase registration land DURING the update window, firing
+#    a reload exactly when an instance is mid-heavy-step — the wedge condition.
+#    Reload frequency during the (harmless) create window does not matter,
+#    because agents that are merely booting reconnect cleanly; what matters is
+#    that auth.json is settled before the update window, which a short poll
+#    guarantees.
+#
+# 2. Widen the server ping window (ping_interval 30s x ping_max_outstanding 3
+#    ~= 120s) so a momentarily-busy agent is not additionally RST'd for a slow
 #    PONG. Heartbeat liveness (hm.agent.heartbeat.*) is independent of mbus
-#    PING/PONG, and HM agent_timeout=180 s (hm-tuning.yml) still reaps truly
-#    dead agents, so this does not mask real failures.
+#    PING/PONG, and HM agent_timeout (hm-tuning.yml) still reaps truly dead
+#    agents, so this does not mask real failures.
 #
-# These reduce the probability of an RPC landing in a gap but cannot eliminate
-# it (the reload-drops-connections behaviour is upstream). The deploy is made
-# robust to the residual case by the stall-watchdog in `scripts/cf`, which
-# cancels a deploy task that stops making progress so the retry loop converges
-# instead of hanging forever. `write_deadline` is still not exposed by the bosh
-# nats job spec; it is not the lever here.
-#
-# Usage: applied automatically by `scripts/bosh create-env`.
-# Takes effect on the next director redeploy. VERIFY after redeploy that the
-# value rendered (an earlier attempt silently did not):
+# Usage: applied automatically by `scripts/bosh create-env`. Takes effect on the
+# next director redeploy. VERIFY the rendered value after redeploy:
 #   ssh root@<pve_host> qm guest exec <director_vmid> -- \
 #     grep poll_user_sync /var/vcap/jobs/nats/config/bosh_nats_sync_config.yml
+# (the director VM has QGA enabled via os-conf; cf VMs do not).
 #
 # Rollback: drop the ops file from scripts/bosh and redeploy the director.
 
 - type: replace
   path: /instance_groups/name=bosh/properties/nats-sync?/intervals?/poll_user_sync?
-  value: 120
+  value: 10
 
 - type: replace
   path: /instance_groups/name=bosh/properties/nats/ping_interval?
