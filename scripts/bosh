@@ -60,6 +60,10 @@ import subprocess
 import sys
 from pathlib import Path
 
+# Host firewall text manipulation (pure Python, no awk/grep).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _hostfw
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 BOSH_DEPLOYMENT_DIR = Path(os.environ.get("BOSH_DEPLOYMENT_DIR", Path.home() / "w/cloudfoundry/bosh-deployment"))
 MANIFESTS = REPO_ROOT / "manifests"
@@ -456,6 +460,79 @@ def _q(value: str) -> str:
     return shlex.quote(value)
 
 
+def _pve_ssh_capture(pve_host: str, remote_script: str) -> "subprocess.CompletedProcess[str]":
+    """Run a bash script on the PVE host and return the CompletedProcess.
+
+    Like _pve_ssh but captures stdout so the caller can read it.
+    stderr is left streaming to the terminal.
+    """
+    ssh_opts = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
+    if os.environ.get("SCRIPTS_PVE_SSH_INSECURE", "").strip() in ("1", "true", "yes"):
+        ssh_opts += ["-o", "StrictHostKeyChecking=accept-new"]
+    return subprocess.run(
+        ["ssh", *ssh_opts, f"root@{pve_host}", "bash", "-s"],
+        input=remote_script, text=True, capture_output=True,
+    )
+
+
+def _hostfw_path(node: str) -> str:
+    return f"/etc/pve/nodes/{node}/host.fw"
+
+
+def _net_up_update_firewall(pve_host: str, node: str, subnet: str) -> int:
+    """Read host.fw from the PVE host, update it in Python, write it back.
+
+    Avoids all awk/grep escaping hazards by doing the text manipulation
+    locally via _hostfw, then writing the result back over SSH.  Returns
+    0 on success, 1 on any SSH error.
+    """
+    hostfw = _hostfw_path(node)
+
+    # Read the current file content (empty string when file is absent).
+    read_proc = _pve_ssh_capture(
+        pve_host,
+        f"cat {shlex.quote(hostfw)} 2>/dev/null || true",
+    )
+    if read_proc.returncode != 0:
+        print(
+            f"firewall: ERROR reading {hostfw} (ssh rc={read_proc.returncode})",
+            file=sys.stderr,
+        )
+        return 1
+
+    existing = read_proc.stdout
+
+    if _hostfw.has_rule_block(existing, subnet):
+        print(f"firewall: API rule for {subnet} present")
+        return 0
+
+    updated = _hostfw.add_rule_block(existing, subnet)
+
+    # Write back via tee (stdin → file); tee exits 0 on success.
+    write_proc = subprocess.run(
+        ["ssh",
+         "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+         *(
+             ["-o", "StrictHostKeyChecking=accept-new"]
+             if os.environ.get("SCRIPTS_PVE_SSH_INSECURE", "").strip() in ("1", "true", "yes")
+             else []
+         ),
+         f"root@{pve_host}",
+         f"tee {shlex.quote(hostfw)} > /dev/null",
+         ],
+        input=updated, text=True,
+    )
+    if write_proc.returncode != 0:
+        print(
+            f"firewall: ERROR writing {hostfw} (ssh rc={write_proc.returncode})",
+            file=sys.stderr,
+        )
+        return 1
+
+    print(f"firewall: API rule added for {subnet}")
+    return 0
+
+
 def cmd_net_up(_args: list[str]) -> int:
     p = _sdn_params()
     print(
@@ -464,10 +541,11 @@ def cmd_net_up(_args: list[str]) -> int:
         f"on {p['pve_host']}\n",
         flush=True,
     )
-    script = f"""set -euo pipefail
+
+    # SDN zone / vnet / subnet — clean single-line pvesh calls, no escaping hazard.
+    sdn_script = f"""set -euo pipefail
 ZONE={_q(p['zone'])}; ZTYPE={_q(p['zone_type'])}; VNET={_q(p['vnet'])}
 SUBNET={_q(p['subnet'])}; GW={_q(p['gateway'])}; SNAT={_q(p['snat'])}
-NODE={_q(p['node'])}
 NET=${{SUBNET%/*}}
 if pvesh get /cluster/sdn/zones/"$ZONE" >/dev/null 2>&1; then
   echo "zone $ZONE: exists"
@@ -489,32 +567,75 @@ else
 fi
 pvesh set /cluster/sdn
 echo "sdn: applied (vnet $VNET is now a bridge on the node)"
-
-# Host firewall: permit the isolated subnet to reach the PVE API (8006) so the
-# in-VM Director/CPI can drive create_vm. With pve-firewall enabled, the host
-# INPUT policy DROPs VM->host NEW unless explicitly allowed; the Director on an
-# isolated SDN segment is no longer in the management range, so without this the
-# CPI's /cluster/resources calls time out. Idempotent: keyed on the subnet.
-HOSTFW=/etc/pve/nodes/"$NODE"/host.fw
-if grep -q "source $SUBNET -p tcp -dport 8006" "$HOSTFW" 2>/dev/null; then
-  echo "firewall: API rule for $SUBNET present"
-else
-  [ -f "$HOSTFW" ] || printf '[RULES]\\n' > "$HOSTFW"
-  grep -qF '[RULES]' "$HOSTFW" || printf '\\n[RULES]\\n' >> "$HOSTFW"
-  awk -v sub="$SUBNET" '
-    {{print}}
-    /^\\[RULES\\]/ && !done {{
-      print "IN ACCEPT -source " sub " -p tcp -dport 8006 -log nolog # cpitest SDN -> PVE API (CPI)"
-      print "IN ACCEPT -source " sub " -p icmp -log nolog # cpitest SDN -> host icmp"
-      done=1
-    }}
-  ' "$HOSTFW" > /tmp/host.fw.$$ && cat /tmp/host.fw.$$ > "$HOSTFW" && rm -f /tmp/host.fw.$$
-  echo "firewall: API rule added for $SUBNET"
-fi
-pve-firewall compile >/dev/null 2>&1 && pve-firewall restart >/dev/null 2>&1 || true
-echo "firewall: reloaded"
 """
-    return _pve_ssh(p["pve_host"], script)
+    rc = _pve_ssh(p["pve_host"], sdn_script)
+    if rc != 0:
+        return rc
+
+    # Host firewall: permit the isolated subnet to reach the PVE API (8006).
+    # The file is read locally, edited by _hostfw (pure Python, no awk), then
+    # written back.  This eliminates the awk f-string escaping hazard entirely.
+    rc = _net_up_update_firewall(p["pve_host"], p["node"], p["subnet"])
+    if rc != 0:
+        return rc
+
+    # Reload pve-firewall so the new rules take effect.
+    reload_script = (
+        "pve-firewall compile >/dev/null 2>&1 && "
+        "pve-firewall restart >/dev/null 2>&1 || true\n"
+        "echo 'firewall: reloaded'\n"
+    )
+    return _pve_ssh(p["pve_host"], reload_script)
+
+
+def _net_down_update_firewall(pve_host: str, node: str, subnet: str) -> int:
+    """Read host.fw from the PVE host, remove cpitest rules in Python, write back.
+
+    Returns 0 on success (including when rules are already absent), 1 on SSH error.
+    """
+    hostfw = _hostfw_path(node)
+
+    read_proc = _pve_ssh_capture(
+        pve_host,
+        f"cat {shlex.quote(hostfw)} 2>/dev/null || true",
+    )
+    if read_proc.returncode != 0:
+        print(
+            f"firewall: ERROR reading {hostfw} (ssh rc={read_proc.returncode})",
+            file=sys.stderr,
+        )
+        return 1
+
+    existing = read_proc.stdout
+
+    if not _hostfw.has_rule_block(existing, subnet):
+        print(f"firewall: no rules for {subnet}")
+        return 0
+
+    updated = _hostfw.remove_rule_block(existing, subnet)
+
+    write_proc = subprocess.run(
+        ["ssh",
+         "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+         *(
+             ["-o", "StrictHostKeyChecking=accept-new"]
+             if os.environ.get("SCRIPTS_PVE_SSH_INSECURE", "").strip() in ("1", "true", "yes")
+             else []
+         ),
+         f"root@{pve_host}",
+         f"tee {shlex.quote(hostfw)} > /dev/null",
+         ],
+        input=updated, text=True,
+    )
+    if write_proc.returncode != 0:
+        print(
+            f"firewall: ERROR writing {hostfw} (ssh rc={write_proc.returncode})",
+            file=sys.stderr,
+        )
+        return 1
+
+    print(f"firewall: rules for {subnet} removed")
+    return 0
 
 
 def cmd_net_down(_args: list[str]) -> int:
@@ -524,20 +645,26 @@ def cmd_net_down(_args: list[str]) -> int:
         f"zone={p['zone']} on {p['pve_host']}\n",
         flush=True,
     )
+
+    # Host firewall: remove cpitest rules locally via _hostfw, then write back.
+    # Reload only when rules were actually present (the helper reports truthfully).
+    fw_rc = _net_down_update_firewall(p["pve_host"], p["node"], p["subnet"])
+    if fw_rc != 0:
+        return fw_rc
+
+    # Only reload if rules were actually removed (output message indicates which).
+    # We always attempt a reload anyway; pve-firewall compile is safe on a clean file.
+    reload_script = (
+        "pve-firewall compile >/dev/null 2>&1 && "
+        "pve-firewall restart >/dev/null 2>&1 || true\n"
+    )
+    _pve_ssh(p["pve_host"], reload_script)
+
     # Best-effort (no `set -e`): each delete is idempotent and tolerates
     # already-absent objects. The subnet id is read back from the API rather
     # than reconstructed, since PVE derives it as "<zone>-<net>-<prefix>".
-    script = f"""set -uo pipefail
-ZONE={_q(p['zone'])}; VNET={_q(p['vnet'])}; SUBNET={_q(p['subnet'])}; NODE={_q(p['node'])}
-# Remove the host-firewall rules net-up added for this subnet (idempotent).
-HOSTFW=/etc/pve/nodes/"$NODE"/host.fw
-if [ -f "$HOSTFW" ] && grep -q "source $SUBNET -p" "$HOSTFW" 2>/dev/null; then
-  grep -v "source $SUBNET -p" "$HOSTFW" > /tmp/host.fw.$$ && cat /tmp/host.fw.$$ > "$HOSTFW" && rm -f /tmp/host.fw.$$
-  pve-firewall compile >/dev/null 2>&1 && pve-firewall restart >/dev/null 2>&1 || true
-  echo "firewall: rules for $SUBNET removed"
-else
-  echo "firewall: no rules for $SUBNET"
-fi
+    sdn_script = f"""set -uo pipefail
+ZONE={_q(p['zone'])}; VNET={_q(p['vnet'])}; SUBNET={_q(p['subnet'])}
 SUBID=$(pvesh get /cluster/sdn/vnets/"$VNET"/subnets --output-format json 2>/dev/null \
   | sed -n 's/.*"subnet"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p' | head -1)
 if [ -n "${{SUBID:-}}" ]; then
@@ -560,13 +687,15 @@ fi
 pvesh set /cluster/sdn
 echo "sdn: applied"
 """
-    return _pve_ssh(p["pve_host"], script)
+    return _pve_ssh(p["pve_host"], sdn_script)
 
 
 def cmd_net_status(_args: list[str]) -> int:
     p = _sdn_params()
-    script = f"""set -uo pipefail
-ZONE={_q(p['zone'])}; VNET={_q(p['vnet'])}; SUBNET={_q(p['subnet'])}; NODE={_q(p['node'])}
+
+    # SDN object status — pvesh queries, no text manipulation needed.
+    sdn_script = f"""set -uo pipefail
+ZONE={_q(p['zone'])}; VNET={_q(p['vnet'])}; SUBNET={_q(p['subnet'])}
 echo "== zone $ZONE =="
 pvesh get /cluster/sdn/zones/"$ZONE" 2>/dev/null || echo "absent"
 echo "== vnet $VNET =="
@@ -575,10 +704,33 @@ echo "== subnets =="
 pvesh get /cluster/sdn/vnets/"$VNET"/subnets 2>/dev/null || echo "absent"
 echo "== bridge on node =="
 ip -br link show "$VNET" 2>/dev/null || echo "bridge $VNET not present (run net-up + apply)"
-echo "== host firewall (API access for $SUBNET) =="
-grep "source $SUBNET -p" /etc/pve/nodes/"$NODE"/host.fw 2>/dev/null || echo "no host.fw rule for $SUBNET (run net-up)"
 """
-    return _pve_ssh(p["pve_host"], script)
+    rc = _pve_ssh(p["pve_host"], sdn_script)
+    if rc != 0:
+        return rc
+
+    # Host firewall: read the file content and parse it locally.
+    hostfw = _hostfw_path(p["node"])
+    read_proc = _pve_ssh_capture(
+        p["pve_host"],
+        f"cat {shlex.quote(hostfw)} 2>/dev/null || true",
+    )
+    if read_proc.returncode != 0:
+        print(
+            f"firewall: ERROR reading {hostfw} (ssh rc={read_proc.returncode})",
+            file=sys.stderr,
+        )
+        return 1
+
+    print(f"== host firewall (API access for {p['subnet']}) ==")
+    if _hostfw.has_rule_block(read_proc.stdout, p["subnet"]):
+        # Display the matching lines directly for operator visibility.
+        for line in read_proc.stdout.splitlines():
+            if p["subnet"] in line and "# cpitest SDN ->" in line:
+                print(line)
+    else:
+        print(f"no host.fw rule for {p['subnet']} (run net-up)")
+    return 0
 
 
 def cmd_help(args: list[str]) -> int:
