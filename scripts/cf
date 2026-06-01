@@ -12,12 +12,15 @@ Commands:
     deploy             Run all steps: runtime-config, cloud-config, stemcell, bosh-deploy.
     runtime-config     Upload the DNS runtime-config.
     cloud-config       Upload the cf cloud-config.
-    stemcell           Upload the stemcell pinned by cf-deployment (skips if present).
+    stemcell           Upload the light stemcell (derived from vars.yml stemcell_url).
     check-uaa-db       Fail fast if uaa schema is in the Flyway-rename trap.
     unstick-agent      Restart bosh-agent on an instance via PVE qga (bypasses NATS).
     bosh-deploy        Run only the bosh deploy step.
-    compile-releases   Compile + pin the source haproxy release against the lab
-                       stemcell so fresh-director deploys skip its build.
+    precompile-releases  One-time: compile the FULL CF release set against the
+                       standardized stemcell (replaces cf-deployment's
+                       use-compiled-releases.yml, which targets another version).
+                       Store via COMPILED_RELEASES_STORE=s3, else director cache.
+                       Alias: compile-releases.
     teardown           Delete the CF deployment (--force). Skips if director unreachable
                        or deployment not found. Alias: delete-deployment.
     delete-deployment  Alias for teardown.
@@ -52,6 +55,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _compiled  # noqa: E402
+import _cfcompile  # noqa: E402
 import _lightstemcell  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -828,13 +832,13 @@ def cmd_bosh_deploy(extra: list[str]) -> None:
     deploy_cmd = [
         "bosh", "-e", ENV, "-n", "-d", DEPLOYMENT, "deploy",
         str(CF_DEPLOYMENT / "cf-deployment.yml"),
-        "-o", str(CF_DEPLOYMENT / "operations/use-compiled-releases.yml"),
+        # use-haproxy.yml adds the haproxy instance group + its source release
+        # stanza. CF release SOURCING is decided by _cf_release_ops() from the
+        # precompiled-for-this-stemcell set, which replaces cf-deployment's
+        # use-compiled-releases.yml (that targets a different stemcell version).
+        # Layered after use-haproxy.yml so the compiled haproxy pin wins.
         "-o", str(CF_DEPLOYMENT / "operations/use-haproxy.yml"),
-        # Pin the compiled haproxy release (built by `cf compile-releases`) so a
-        # fresh-director deploy skips its ~3.5 min source build. Layered right
-        # after use-haproxy.yml (which adds the source release) so the compiled
-        # url wins; a missing/stale cache yields [] and falls back to source.
-        *compiled_ops_layer(),
+        *_cf_release_ops(),
         # cf-deployment stock ops file: removes policy-server-asg-syncer
         # from the api instance group. The job had been flapping every
         # ~90s (HTTP retries against CC during ccdb churn) which made
@@ -1058,21 +1062,39 @@ def _set_resurrection(state: str) -> None:
         print(f"    WARNING: update-resurrection {state} raised: {exc}")
 
 
-def _haproxy_release() -> "tuple[str, str, str, str]":
-    """(name, version, url, sha1) of the source haproxy release.
+def _cf_source_releases() -> "list[dict]":
+    """Enumerate every CF source release (incl. haproxy) for precompilation.
 
-    haproxy is added to the deployment by cf-deployment's
-    operations/use-haproxy.yml and is the only release that compiles from source
-    against the lab stemcell. `bosh int` resolves the stanza offline (no director
-    needed) so compile-releases can build its compile deployment from it.
+    Resolves cf-deployment.yml with operations/use-haproxy.yml layered (so the
+    haproxy source stanza is present) but WITHOUT use-compiled-releases.yml (we
+    want the source urls, not the prebuilt-for-another-version tarballs). Reads
+    by index via `bosh int` so no YAML library is needed; stops at the first
+    absent index. Returns normalized {name, version, url, sha1} targets.
     """
     base = str(CF_DEPLOYMENT / "cf-deployment.yml")
     ophap = str(CF_DEPLOYMENT / "operations/use-haproxy.yml")
 
-    def field(p: str) -> str:
-        return capture("bosh", "int", base, "-o", ophap, f"--path=/releases/name=haproxy/{p}")
+    def at(idx: int, field: str) -> str:
+        res = subprocess.run(
+            ["bosh", "int", base, "-o", ophap, f"--path=/releases/{idx}/{field}"],
+            capture_output=True, text=True,
+        )
+        return res.stdout.strip() if res.returncode == 0 else ""
 
-    return ("haproxy", field("version"), field("url"), field("sha1"))
+    rows: "list[dict]" = []
+    idx = 0
+    while True:
+        name = at(idx, "name")
+        if not name:
+            break
+        rows.append({
+            "name": name,
+            "version": at(idx, "version"),
+            "url": at(idx, "url"),
+            "sha1": at(idx, "sha1"),
+        })
+        idx += 1
+    return _cfcompile.parse_release_targets(rows)
 
 
 def _export_compiled_cf(
@@ -1101,61 +1123,80 @@ def _export_compiled_cf(
         return _compiled.CompiledRelease(name=name, version=version, url=url, sha1=sha)
 
 
-def cmd_compile_releases(_extra: list[str]) -> None:
-    """Compile + pin the CF source releases (haproxy) against the lab stemcell.
+def cmd_precompile_releases(_extra: list[str]) -> None:
+    """Precompile the FULL CF release set against the standardized stemcell.
 
-    Mirrors `scripts/bosh compile-releases`: ensure the stemcell is on the
-    director, upload the source haproxy release, deploy a no-VM compilation
-    deployment, export-release the compiled tarball into the configured store
-    (file:// by default, S3-compatible when COMPILED_RELEASES_STORE=s3), and
-    write manifests/cf/compiled-releases.yml. `cf deploy` then layers that ops
-    file after use-haproxy.yml so a fresh-director deploy skips the haproxy
-    build (~3.5 min). Storage is configured with the same COMPILED_RELEASES_*
-    env as the bosh pipeline; see docs/compiled-releases.md.
+    A one-time step (mirrors `scripts/bosh compile-releases`) that removes the
+    dependency on cf-deployment's operations/use-compiled-releases.yml, which is
+    pinned to a different ubuntu-noble version than the lab-standardized stemcell.
+    Enumerates every CF source release (incl. haproxy), ensures the stemcell is
+    on the director, uploads the sources, and deploys a no-VM compilation
+    deployment so the director compiles every package against the stemcell.
+
+    Result delivery (decided by COMPILED_RELEASES_STORE):
+      - s3   — export-release each compiled tarball to the director-reachable
+               store and write manifests/cf/compiled-releases.yml pinning them
+               (store-ops mode); cf deploy layers it instead of
+               use-compiled-releases.yml.
+      - file (default) — the director keeps the compiled packages it just built;
+               write a director-cache marker so cf deploy drops
+               use-compiled-releases.yml and reuses the cache. file:// urls are
+               not reachable by the director, so they are not pinned.
     """
-    banner("Compile CF releases (haproxy)")
+    banner("Precompile CF releases (full set)")
+    os_name, sc_version = stemcell_os_version()
+    stem = f"{os_name}/{sc_version}"
+
+    # Idempotent: skip the (expensive) compile when a valid result already
+    # exists for this stemcell. CF_PRECOMPILE_FORCE=1 forces a rebuild. This is
+    # what lets the e2e step run unconditionally yet pay the cost only once.
+    existing = COMPILED_OPS_CF.read_text() if COMPILED_OPS_CF.exists() else ""
+    state = _cfcompile.precompile_state(existing, stem)
+    if state in (_cfcompile.STORE_OPS_MODE, _cfcompile.CACHE_MODE) and not os.environ.get("CF_PRECOMPILE_FORCE", "").strip():
+        print(f"    already precompiled for {stem} ({state}); skipping (CF_PRECOMPILE_FORCE=1 to rebuild)")
+        return
+
     bosh_mod = _load_bosh_module()
     denv = bosh_mod.director_env()
-    os_name, sc_version = stemcell_os_version()
     cfg = _compiled.store_config_from_env(os.environ, str(COMPILED_DIR_DEFAULT))
-    print(f"    store: {cfg.kind}   stemcell: {os_name}/{sc_version}")
+    store_ops = cfg.kind == "s3"
+    print(f"    store: {cfg.kind} ({'store-ops' if store_ops else 'director-cache'})   stemcell: {stem}")
 
-    # 1. Ensure the stemcell is on the director (upload the light record if not).
+    # 1. Ensure the standardized stemcell is on the director.
     if not bosh_mod._stemcell_present(denv, os_name, sc_version):
         cmd_stemcell([])
     if not bosh_mod._stemcell_present(denv, os_name, sc_version):
-        sys.exit(f"compile-releases: stemcell {os_name}/{sc_version} not on director")
+        sys.exit(f"precompile-releases: stemcell {stem} not on director")
 
-    # 2. Upload the source haproxy release.
-    name, version, url, sha1 = _haproxy_release()
-    print(f"    uploading source release {name}/{version}")
-    run_env(denv, "bosh", "-e", ENV, "-n", "upload-release", "--sha1", sha1, url)
-    if not bosh_mod._release_present(denv, name, version):
-        sys.exit(f"compile-releases: {name}/{version} not on director after upload; check `bosh releases`")
+    # 2. Upload every CF source release the director does not already have.
+    targets = _cf_source_releases()
+    print(f"    {len(targets)} CF source releases to compile")
+    for t in targets:
+        if bosh_mod._release_present(denv, t["name"], t["version"]):
+            continue
+        print(f"    uploading source release {t['name']}/{t['version']}")
+        up = ["bosh", "-e", ENV, "-n", "upload-release"]
+        if t["sha1"]:
+            up += ["--sha1", t["sha1"]]
+        up.append(t["url"])
+        run_env(denv, *up)
+        if not bosh_mod._release_present(denv, t["name"], t["version"]):
+            sys.exit(f"precompile-releases: {t['name']}/{t['version']} not on director after upload")
 
-    # 3. Deploy a no-VM compilation deployment referencing haproxy + stemcell.
-    manifest = (
-        f"name: {COMPILE_DEPLOYMENT_CF}\n"
-        "releases:\n"
-        f"- name: {name}\n  version: \"{version}\"\n"
-        "stemcells:\n"
-        f"- alias: default\n  os: {os_name}\n  version: \"{sc_version}\"\n"
-        "instance_groups: []\n"
-        "update:\n"
-        "  canaries: 0\n"
-        "  max_in_flight: 1\n"
-        "  canary_watch_time: 1000-60000\n"
-        "  update_watch_time: 1000-60000\n"
-        "  serial: false\n"
-    )
+    # 3. Deploy the no-VM compilation deployment (forces compilation of all packages).
+    manifest = _cfcompile.compilation_manifest(COMPILE_DEPLOYMENT_CF, targets, os_name, sc_version)
     mf = tempfile.NamedTemporaryFile("w", suffix=".yml", delete=False)
+    compiled: "list[_compiled.CompiledRelease] | None" = None
     try:
         mf.write(manifest)
         mf.close()
         run_env(denv, "bosh", "-e", ENV, "-n", "-d", COMPILE_DEPLOYMENT_CF, "deploy", mf.name)
-        # 4. Export each target (compiles on the director, or reuses its
-        #    compiled-package cache when a live deploy already built it).
-        compiled = [_export_compiled_cf(name, version, os_name, sc_version, cfg, denv, bosh_mod)]
+        # 4. In store mode, export each compiled release to the reachable store.
+        if store_ops:
+            compiled = [
+                _export_compiled_cf(t["name"], t["version"], os_name, sc_version, cfg, denv, bosh_mod)
+                for t in targets
+            ]
     finally:
         os.unlink(mf.name)
         subprocess.run(
@@ -1163,38 +1204,39 @@ def cmd_compile_releases(_extra: list[str]) -> None:
             env=denv, check=False,
         )
 
-    # 5. Write the generated ops file (pins compiled url + sha, stemcell marker).
-    ops = _compiled.compiled_releases_ops(compiled, stemcell=f"{os_name}/{sc_version}")
-    COMPILED_OPS_CF.write_text(ops)
-    print(f"    wrote {COMPILED_OPS_CF.relative_to(REPO_ROOT)}")
-    for cr in compiled:
-        print(f"      {cr.name}/{cr.version} -> {cr.url}")
+    # 5. Record the result so cf deploy knows how to source the CF releases.
+    if compiled:
+        COMPILED_OPS_CF.write_text(_compiled.compiled_releases_ops(compiled, stemcell=stem))
+        print(f"    wrote {COMPILED_OPS_CF.relative_to(REPO_ROOT)} (store-ops, {len(compiled)} releases)")
+    else:
+        COMPILED_OPS_CF.write_text(_cfcompile.cache_mode_ops(stem))
+        print(f"    wrote {COMPILED_OPS_CF.relative_to(REPO_ROOT)} (director-cache marker)")
 
 
-def compiled_ops_layer() -> list[str]:
-    """['-o', compiled-releases.yml] when a valid cache matches the stemcell, else [].
+def _cf_release_ops() -> list[str]:
+    """Return the -o ops controlling CF release sourcing, per precompile state.
 
-    Mirrors scripts/bosh: disabled by COMPILE_RELEASES_DISABLE, and refuses a
-    missing file, a stemcell-marker mismatch, or a file:// tarball that has gone
-    missing — any of which falls back to compiling haproxy from source rather
-    than deploying a cache that cannot match.
+    Replaces the hardcoded use-compiled-releases.yml (pinned to a different
+    stemcell version): the precompiled-for-this-stemcell set is authoritative.
+      store-ops      → layer manifests/cf/compiled-releases.yml.
+      director-cache → [] (use-compiled-releases.yml dropped; reuse the cache).
+      absent/mismatch → fail fast with guidance (no silent fallback to a
+                        version-mismatched compiled set or a 30-60min source build).
     """
-    if os.environ.get("COMPILE_RELEASES_DISABLE", "").strip():
-        return []
-    if not COMPILED_OPS_CF.exists():
-        return []
-    text = COMPILED_OPS_CF.read_text()
     want = "{}/{}".format(*stemcell_os_version())
-    marker = _compiled.stemcell_from_ops(text)
-    if marker != want:
-        print(f"    compile: ignoring {COMPILED_OPS_CF.name} (stemcell {marker} != {want})")
+    text = COMPILED_OPS_CF.read_text() if COMPILED_OPS_CF.exists() else ""
+    state = _cfcompile.precompile_state(text, want)
+    if state == _cfcompile.STORE_OPS_MODE:
+        print(f"    using precompiled CF releases ({want}) from {COMPILED_OPS_CF.name}")
+        return ["-o", str(COMPILED_OPS_CF)]
+    if state == _cfcompile.CACHE_MODE:
+        print(f"    using Director compiled-package cache ({want}); use-compiled-releases.yml dropped")
         return []
-    for p in _compiled.local_paths_from_ops(text):
-        if not Path(p).exists():
-            print(f"    compile: ignoring {COMPILED_OPS_CF.name} (missing tarball {p})")
-            return []
-    print(f"    compile: using compiled haproxy ({want}) from {COMPILED_OPS_CF.name}")
-    return ["-o", str(COMPILED_OPS_CF)]
+    sys.exit(
+        f"cf deploy: CF releases are not precompiled for {want} (state={state}). "
+        f"Run `./scripts/cf precompile-releases` first "
+        f"(one-time; cf-deployment's use-compiled-releases.yml targets a different version)."
+    )
 
 
 def cmd_deploy(extra: list[str]) -> None:
@@ -1248,7 +1290,8 @@ COMMANDS = {
     "check-uaa-db": cmd_check_uaa_db,
     "unstick-agent": cmd_unstick_agent,
     "bosh-deploy": cmd_bosh_deploy,
-    "compile-releases": cmd_compile_releases,
+    "precompile-releases": cmd_precompile_releases,
+    "compile-releases": cmd_precompile_releases,  # alias (folded haproxy-only path)
     "teardown": cmd_teardown,
     "delete-deployment": cmd_teardown,
     "api": cmd_api,

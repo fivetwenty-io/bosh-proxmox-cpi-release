@@ -631,10 +631,19 @@ class E2E:
 
     def cf_deploy(self) -> bool:
         self.rep.section("cf-deploy")
-        argv = [CF, "deploy"]
+        # One-time: precompile the full CF release set against the standardized
+        # stemcell so the deploy does not depend on cf-deployment's
+        # use-compiled-releases.yml (pinned to another version). Idempotent —
+        # scripts/cf precompile-releases self-skips when already built for this
+        # stemcell, so the cost is paid once across e2e runs.
+        ok, _ = self.runner.step(
+            "cf:precompile-releases", [CF, "precompile-releases"], timeout=10800
+        )
+        if not ok:
+            return False
         # scripts/cf deploy already runs its own stall-watchdog + 8-retry loop;
         # give the outer step a generous ceiling and no extra retries.
-        ok, _ = self.runner.step("cf:deploy", argv, timeout=14400)
+        ok, _ = self.runner.step("cf:deploy", [CF, "deploy"], timeout=14400)
         return ok
 
     # -- cf push ----------------------------------------------------------- #
