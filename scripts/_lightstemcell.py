@@ -404,7 +404,10 @@ def download_tarball(
     dest.parent.mkdir(parents=True, exist_ok=True)
     log(f"    downloading stemcell source: {url}")
     tmp = dest.with_suffix(dest.suffix + ".part")
-    with urllib.request.urlopen(url, timeout=300) as resp, open(tmp, "wb") as out:
+    # bosh.io 403s the default Python-urllib User-Agent; send a conventional one
+    # so the 302 to the storage backend is issued (curl/browsers get 200).
+    req = urllib.request.Request(url, headers={"User-Agent": "curl/8.0"})
+    with urllib.request.urlopen(req, timeout=300) as resp, open(tmp, "wb") as out:
         for chunk in iter(lambda: resp.read(1 << 20), b""):
             out.write(chunk)
     got = file_sha1(tmp)
