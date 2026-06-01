@@ -108,6 +108,17 @@ class StemcellMFTests(unittest.TestCase):
         self.assertIn("image_url: https://example.com/x.qcow2", mf)
         self.assertNotIn("image_id:", mf)
 
+    def test_declares_registry_less_api_version(self) -> None:
+        # bosh-cli create-env rejects a stemcell whose api_version < 2 with the
+        # misleading "requires CPI v2.0 or greater" error. The MF must carry a
+        # top-level api_version >= 2 (the registry-less contract the CPI emits).
+        mf = ls.stemcell_mf("ubuntu-noble", "1.383", image_id="local:import/x.qcow2")
+        self.assertIn(f"api_version: {ls.STEMCELL_API_VERSION}", mf)
+        self.assertGreaterEqual(ls.STEMCELL_API_VERSION, 2)
+        # Top-level field, not nested under cloud_properties.
+        head = mf.split("cloud_properties:", 1)[0]
+        self.assertIn("api_version:", head)
+
     def test_requires_exactly_one_source(self) -> None:
         with self.assertRaises(ValueError):
             ls.stemcell_mf("ubuntu-noble", "1.383")

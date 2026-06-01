@@ -67,6 +67,14 @@ DEFAULT_DISK_MIB = 10240
 # Must be one of the formats the CPI advertises in info.go's stemcell_formats;
 # the Director rejects the upload otherwise. pve-qcow2 is the PVE-native qcow2.
 STEMCELL_FORMAT = "pve-qcow2"
+# Stemcell agent-settings API version. Must be >= 2 (registry-less contract):
+# bosh-cli's create-env gate (cmd/deployment_preparer.go) requires
+# stemcellApiVersion >= StemcellNoRegistryAsOfVersion (2) AND cpi api_version ==
+# MaxCpiApiVersionSupported (2); a stemcell.MF omitting api_version defaults to 1
+# and trips the misleading "requires CPI v2.0 or greater, you are using 2" error.
+# 2 matches the CPI's own info.go api_version (the registry-less settings the CPI
+# emits and the lifecycle test exercises).
+STEMCELL_API_VERSION = 2
 PLACEHOLDER_SHA1 = "0" * 40
 VALID_MODES = ("preuploaded", "fetch")
 
@@ -159,6 +167,7 @@ def stemcell_mf(
         "---",
         f"name: {name}",
         f'version: "{version}"',
+        f"api_version: {STEMCELL_API_VERSION}",
         f"sha1: {image_sha1}",
         f"operating_system: {os_name}",
         "stemcell_formats:",

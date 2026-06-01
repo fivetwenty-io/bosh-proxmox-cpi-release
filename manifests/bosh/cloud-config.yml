@@ -59,7 +59,7 @@ networks:
       bridge: ((pve_network_bridge))
 
 compilation:
-  workers:     2
+  workers:     4
   reuse_compilation_vms: true
   az:          z1
   vm_type:     compilation

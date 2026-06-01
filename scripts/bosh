@@ -236,10 +236,11 @@ STEMCELL_CACHE = REPO_ROOT / "dev_releases" / "stemcell-cache"
 def _ensure_light_stemcell(*, build_tarball: bool) -> "_lightstemcell.LightStemcell":
     """Ensure the light stemcell is available on PVE and return its descriptor.
 
-    Used by both create-env (build_tarball=True, the Director boots from a
-    locally-built light tarball whose stemcell.MF carries the light
-    cloud_properties) and upload-stemcell (build_tarball=False, registers the
-    rendered light manifest with a running Director). The qcow2 is derived once
+    Used by both create-env (the Director boots from a locally-built light
+    tarball whose stemcell.MF carries the light cloud_properties) and
+    upload-stemcell (registers the same light tarball with a running Director).
+    Both pass build_tarball=True; `bosh upload-stemcell` needs the gzipped
+    tarball, not the rendered .yml manifest. The qcow2 is derived once
     from vars.yml stemcell_url — preuploaded uploads it to PVE storage, fetch
     leaves the CPI to stream it. vars.yml stemcell_url/sha1 are left untouched so
     compile-releases keeps parsing the heavy source version.
@@ -426,13 +427,19 @@ def cmd_emptyvm(args: list[str]) -> int:
 
 def cmd_upload_stemcell(args: list[str]) -> int:
     # Light stemcell: ensure the qcow2 is on PVE storage (preuploaded) or
-    # reachable (fetch), render the upload-stemcell manifest, and register it
-    # with the Director. STEMCELL_PATH is no longer consumed — the light source
-    # is vars.yml stemcell_url. Idempotent: --fix re-registers an existing
-    # version; the qcow2 upload fast-paths on the cached SHA.
-    light = _ensure_light_stemcell(build_tarball=False)
+    # reachable (fetch), build the light stemcell tarball, and register it with
+    # the Director. `bosh upload-stemcell` requires a gzipped tarball (stemcell.MF
+    # + placeholder image), NOT a bare manifest — handing it the rendered .yml
+    # fails with "Retrieving stemcell info: gzip: invalid header". The same light
+    # tarball serves both create-env (bosh-init) and this director-side
+    # registration: the CPI's IsLight() short-circuit means the placeholder image
+    # is never read, and cloud_properties.image_id/image_url drives
+    # create_stemcell. STEMCELL_PATH is no longer consumed — the light source is
+    # vars.yml stemcell_url. Idempotent: --fix re-registers an existing version;
+    # the qcow2 upload fast-paths on the cached SHA.
+    light = _ensure_light_stemcell(build_tarball=True)
     return run(
-        "bosh", "-e", "pve", "-n", "upload-stemcell", str(light.manifest_path),
+        "bosh", "-e", "pve", "-n", "upload-stemcell", str(light.create_env_tarball),
         "--fix", *args, env=director_env(),
     )
 

@@ -141,7 +141,7 @@ compilation:
   # The CPI VMID allocator now scatters its scan start across the VMID
   # range and retries on conflict, so concurrent create_vm calls no longer
   # collide on the same VMID. Safe to run multiple compilation workers.
-  workers: 2
+  workers: 4
   reuse_compilation_vms: true
   az: z1
   vm_type: compilation
