@@ -30,8 +30,8 @@ vm_types:
 
 - name: compilation
   cloud_properties:
-    cores: 4
-    memory: 4096
+    cores: 8
+    memory: 12288
     disk: 16384
     network_bridge: ((pve_network_bridge))
 

@@ -83,12 +83,13 @@ vm_types:
 
 - name: compilation
   cloud_properties:
-    # Sized for the heaviest CF source build: percona-xtradb-cluster (mysqld)
-    # final link peaks several GB; at 4 cores / 4096 MB the agent OOM'd at the
-    # link step mid-compile (get_task "could not be found"). 8 cores / 24 GB
-    # gives `make -j` ample headroom; these VMs are transient (host has ~1.5 TB).
+    # 8 cores / 12 GB standard compilation sizing. NOTE: the heaviest CF source
+    # build, percona-xtradb-cluster (mysqld), peaks several GB at its final link
+    # step; at 4 cores / 4096 MB the agent OOM'd there (get_task "could not be
+    # found"). 12 GB clears that bar with headroom, but if a future percona bump
+    # OOMs at the link step, raise memory here. These VMs are transient.
     cores: 8
-    memory: 24576
+    memory: 12288
     disk: 32768
     network_bridge: ((pve_network_bridge))
 
@@ -140,7 +141,7 @@ compilation:
   # The CPI VMID allocator now scatters its scan start across the VMID
   # range and retries on conflict, so concurrent create_vm calls no longer
   # collide on the same VMID. Safe to run multiple compilation workers.
-  workers: 4
+  workers: 2
   reuse_compilation_vms: true
   az: z1
   vm_type: compilation
