@@ -203,6 +203,22 @@ func IsVMIDConflict(err error) bool {
 		strings.Contains(msg, "vmid ") && strings.Contains(msg, " already exists")
 }
 
+// IsCloneSourceMissing reports whether err signals that the clone SOURCE
+// template VM does not exist on the target node — e.g. a stemcell template was
+// removed out-of-band on a shared cluster. PVE surfaces this during a clone
+// POST as a 500-class "unable to find configuration file for VM <id>", which
+// errors.Is(…, ErrServer) would otherwise classify as a transient transport
+// fault. It is a PERMANENT condition for that template: retrying with a fresh
+// VMID cannot help, so callers must treat it as non-retryable and surface the
+// real cause instead of an "exhausted VMID allocation" message.
+func IsCloneSourceMissing(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "unable to find configuration file for vm")
+}
+
 // IsTransientTransport reports whether err signals a transient transport-layer
 // fault between the CPI and the PVE API surface, distinct from a deliberate
 // HTTP 4xx response. The canonical trigger is a pvedaemon worker cycling

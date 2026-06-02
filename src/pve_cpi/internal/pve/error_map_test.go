@@ -442,6 +442,31 @@ func TestIsVMIDConflict_CephImageAlreadyExists(t *testing.T) {
 // IsTransientTransport
 // ---------------------------------------------------------------------------
 
+func TestIsCloneSourceMissing_Nil(t *testing.T) {
+	t.Parallel()
+	if pve.IsCloneSourceMissing(nil) {
+		t.Error("nil should not be clone-source-missing")
+	}
+}
+
+func TestIsCloneSourceMissing_TemplateNotFound(t *testing.T) {
+	t.Parallel()
+	// Exact shape PVE returns on a clone POST when the source template VM is
+	// gone — the real failure behind the misleading "exhausted VMID allocation".
+	err := makeAPIErr(500, "unable to find configuration file for VM 30437 on node 'pve'")
+	if !pve.IsCloneSourceMissing(err) {
+		t.Errorf("template-not-found should be clone-source-missing, got false; err=%v", err)
+	}
+}
+
+func TestIsCloneSourceMissing_Unrelated500(t *testing.T) {
+	t.Parallel()
+	err := makeAPIErr(500, "storage 'zfs-0' is not online")
+	if pve.IsCloneSourceMissing(err) {
+		t.Error("unrelated 500 should not be clone-source-missing")
+	}
+}
+
 func TestIsTransientTransport_Nil(t *testing.T) {
 	t.Parallel()
 	if pve.IsTransientTransport(nil) {

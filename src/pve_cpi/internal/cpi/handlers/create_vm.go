@@ -17,6 +17,7 @@ import (
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/cpi"
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
+	"github.com/fivetwenty-io/bosh-pve-cpi/internal/placement"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
 	sdkclusterstorage "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/clusterstorage"
 	sdknodes "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/nodes"
@@ -91,6 +92,11 @@ type createVMCloudProps struct {
 	// these entries are purely custom. set_vm_metadata preserves them
 	// across re-syncs.
 	Tags map[string]string `json:"tags"`
+	// AvailabilityZone restricts node-scoring to the nodes declared in
+	// config.placement.az_map[availability_zone]. When set and the AZ key
+	// is absent from the map, create_vm returns a CloudError (operator
+	// misconfiguration). When empty, all online nodes are candidates.
+	AvailabilityZone string `json:"availability_zone,omitempty"`
 }
 
 // createVMNetworkSpec mirrors the BOSH v2 network spec shape.
@@ -249,6 +255,26 @@ func createVM(
 	}
 
 	// -----------------------------------------------------------------------
+	// 5b. IP-conflict pre-flight (static networks only, before any boot).
+	//
+	// Detects only statically-configured IPs stored in PVE VM config
+	// ipconfig{N} keys. DHCP-assigned addresses, physical hosts, containers,
+	// and devices outside PVE management are not detectable.
+	// -----------------------------------------------------------------------
+	if deps.Config.EnsureNoIPConflictsEnabled() {
+		staticIPs, bridge := collectStaticIPsForConflictCheck(parsed, deps.Config)
+		if len(staticIPs) > 0 {
+			conflict, conflictErr := detectIPConflict(ctx, deps, staticIPs, bridge)
+			if conflictErr != nil {
+				return nil, cpierrors.Wrap(conflictErr, "create_vm: IP-conflict pre-flight")
+			}
+			if conflict != nil {
+				return nil, IPConflictCloudError(conflict, bridge)
+			}
+		}
+	}
+
+	// -----------------------------------------------------------------------
 	// 6. Attach persistent disks (disk_cids pre-attach)
 	// -----------------------------------------------------------------------
 	if err := attachPersistentDisks(ctx, deps, logger, parsed, shape, vmid); err != nil {
@@ -375,12 +401,9 @@ func parseCreateVMArgs(args []json.RawMessage) (*createVMParsedArgs, error) {
 func resolveVMShape(ctx context.Context, deps Deps, parsed *createVMParsedArgs) (*createVMShape, error) {
 	cp := parsed.cloudProps
 
-	node := cp.TargetNode
-	if node == "" {
-		node = deps.Config.Node
-	}
-	if node == "" {
-		return nil, cpierrors.Cloud("create_vm: target node not set in cloud_properties.target_node or config.node")
+	node, err := resolveTargetNode(ctx, deps, cp)
+	if err != nil {
+		return nil, err
 	}
 
 	rangeStart, maxAttempts := resolveVMIDAllocParams(deps.Config)
@@ -414,6 +437,183 @@ func resolveVMShape(ctx context.Context, deps Deps, parsed *createVMParsedArgs) 
 		maxAttempts:   maxAttempts,
 		initialName:   initialName,
 	}, nil
+}
+
+// resolveTargetNode determines which PVE node the new VM will land on.
+//
+// Decision tree (evaluated in order):
+//  1. cp.TargetNode != "" → operator override; skip scoring entirely (backward compat).
+//  2. deps.Config.PlacementEnabled() == true → live placement scoring:
+//     a. If cp.AvailabilityZone is set, restrict candidates to the AZ node list
+//     from config.placement.az_map. An AZ name present in cloud_properties
+//     but absent from the map is a misconfiguration → CloudError.
+//     b. GatherNodeFacts from the cluster (ListStatus + ListResources + per-node
+//     ListStorage). Filter for online + (AZ nodes when AZ set).
+//     c. Score with EffectiveWeights, Pick best. Empty candidates after filter
+//     fall back to deps.Config.Node with a warning rather than hard-failing
+//     (e.g. all nodes offline — the subsequent create attempt will fail with
+//     a more specific error from PVE).
+//  3. deps.Config.PlacementEnabled() == false → deps.Config.Node (legacy behavior).
+//  4. All paths: if the resolved node is still "" → CloudError.
+//
+//nolint:gocognit // Three-branch decision tree; complexity is inherent to the spec.
+func resolveTargetNode(ctx context.Context, deps Deps, cp createVMCloudProps) (string, error) {
+	// Nil-guard the logger: internal unit tests that call resolveVMShape directly
+	// may leave deps.Logger unset. Use a nop logger in that case so logging calls
+	// are safe without requiring all callers to set a logger.
+	logger := deps.Logger
+	if logger == nil {
+		logger = log.NewNopLogger()
+	}
+
+	// Branch 1: operator pin — no scoring.
+	if cp.TargetNode != "" {
+		logger.Debug("create_vm: node selection: operator override via target_node",
+			log.String("node", cp.TargetNode),
+		)
+		return cp.TargetNode, nil
+	}
+
+	// Branch 2: live placement scoring.
+	// Skip when deps.PVE is nil (unit test minimal setup) — fall through to Branch 3.
+	if deps.Config.PlacementEnabled() && deps.PVE != nil {
+		az := cp.AvailabilityZone
+
+		// AZ lookup: if AZ is set, validate it exists in the map.
+		var candidateSet []string
+		if az != "" {
+			nodes, ok := deps.Config.AZCandidates(az)
+			if !ok {
+				// AZ key present in cloud_properties but absent from az_map → misconfiguration.
+				return "", cpierrors.Cloud(
+					"create_vm: availability_zone %q is not defined in placement.az_map; "+
+						"add the AZ to config.placement.az_map or remove availability_zone from cloud_properties",
+					az,
+				)
+			}
+			candidateSet = nodes
+			logger.Debug("create_vm: node selection: AZ candidate set",
+				log.String("az", az),
+				log.String("candidates", strings.Join(candidateSet, ",")),
+			)
+		}
+
+		// Gather live cluster facts.
+		storageName := deps.Config.VMStorage
+		facts, gatherErr := placement.GatherNodeFacts(ctx,
+			deps.PVE.Cluster(),
+			deps.PVE.Nodes(),
+			logger,
+			placement.GatherOptions{StorageName: storageName},
+		)
+		if gatherErr != nil {
+			// GatherNodeFacts returns a fatal error only when ListStatus fails.
+			// Wrap and propagate — director will retry create_vm.
+			return "", cpierrors.Wrap(pve.WrapError(gatherErr),
+				"create_vm: placement: gather node facts")
+		}
+
+		// Filter: online + AZ constraint.
+		req := placement.Request{
+			CandidateNodes: candidateSet, // nil = all nodes
+		}
+		pass, rejections := placement.Filter(facts, req)
+		if len(rejections) > 0 {
+			for n, reason := range rejections {
+				logger.Debug("create_vm: placement: node filtered",
+					log.String("node", n),
+					log.String("reason", reason),
+				)
+			}
+		}
+
+		if len(pass) > 0 {
+			w := deps.Config.EffectiveWeights()
+			scored := placement.Score(pass, placement.Weights{
+				Mem:        w.Mem,
+				Storage:    w.Storage,
+				CPU:        w.CPU,
+				GuestCount: w.GuestCount,
+			}, nil)
+			chosen := placement.Pick(scored, nil)
+			if chosen != "" {
+				logger.Info("create_vm: node selection: placement scoring chose node",
+					log.String("node", chosen),
+					log.String("az", az),
+				)
+				return chosen, nil
+			}
+		}
+
+		// Fallback: no candidates passed (all offline, AZ empty, etc.).
+		fallback := deps.Config.Node
+		logger.Warn("create_vm: placement: no viable candidates; falling back to config.node",
+			log.String("fallback", fallback),
+			log.String("az", az),
+		)
+		if fallback == "" {
+			return "", cpierrors.Cloud(
+				"create_vm: no viable placement candidates and config.node is empty; " +
+					"ensure at least one PVE node is online and reachable",
+			)
+		}
+		return fallback, nil
+	}
+
+	// Branch 3: placement disabled or PVE nil — legacy static node.
+	node := deps.Config.Node
+	if node == "" {
+		return "", cpierrors.Cloud(
+			"create_vm: target node not set in cloud_properties.target_node or config.node",
+		)
+	}
+	logger.Debug("create_vm: node selection: placement disabled, using config.node",
+		log.String("node", node),
+	)
+	return node, nil
+}
+
+// collectStaticIPsForConflictCheck extracts the bare IP addresses from the
+// parsed network specs that carry a static (manual, non-DHCP) assignment.
+// Dynamic (type=="dynamic") and VIP networks are skipped.
+//
+// Returns (staticIPs, bridge) where bridge is the default bridge for the VM
+// (cloud_properties.network_bridge or config.NetworkBridge). The bridge is
+// used by detectIPConflict as a best-effort NIC filter: only NICs on that
+// bridge are checked, so a VM on a different bridge sharing the same IP space
+// will not generate a false positive.
+//
+// When no static IPs are found, returns (nil, ""). Callers must check
+// len(staticIPs) > 0 before calling detectIPConflict.
+func collectStaticIPsForConflictCheck(parsed *createVMParsedArgs, cfg *config.CPIConfig) (staticIPs []string, bridge string) {
+	// Resolve the default bridge (same logic as configureNICs).
+	bridge = cfg.NetworkBridge
+	if bridge == "" {
+		bridge = "vmbr0"
+	}
+	if parsed.cloudProps.NetworkBridge != "" {
+		bridge = parsed.cloudProps.NetworkBridge
+	}
+
+	for _, spec := range parsed.networks {
+		switch strings.ToLower(spec.Type) {
+		case "manual":
+			if spec.IP == "" || strings.EqualFold(spec.IP, "dhcp") {
+				continue
+			}
+			// Per-network bridge override: if this network specifies a different
+			// bridge, use it. The conflict check is per-call (one bridge), so we
+			// use the first network's bridge when they differ. For heterogeneous
+			// multi-NIC setups, detectIPConflict with bridge="" covers all NICs.
+			if b, ok := spec.CloudProperties["bridge"].(string); ok && b != "" {
+				bridge = b
+			}
+			staticIPs = append(staticIPs, spec.IP)
+		default:
+			// dynamic, vip, "" → skip
+		}
+	}
+	return staticIPs, bridge
 }
 
 // lookupVMStorageType fetches the PVE storage type for storageName by listing
@@ -571,6 +771,13 @@ func allocateVM(
 	shape *createVMShape,
 ) (int, error) {
 	isRetryable := func(e error) bool {
+		// A missing clone source (stemcell template removed out-of-band) is
+		// permanent: it surfaces as a 5xx that IsTransientTransport would match,
+		// but retrying with a fresh VMID cannot help. Short-circuit so the real
+		// cause propagates instead of "exhausted VMID allocation".
+		if pve.IsCloneSourceMissing(e) {
+			return false
+		}
 		return pve.IsVMIDConflict(e) || pve.IsStorageLockTimeout(e) || pve.IsTransientTransport(e)
 	}
 
@@ -798,6 +1005,15 @@ func handleCloneError(
 	cerr error,
 ) error {
 	switch {
+	case pve.IsCloneSourceMissing(cerr):
+		// Permanent: the clone source template VM is gone on the node (stemcell
+		// template removed out-of-band). Retrying a fresh VMID cannot help —
+		// surface the real cause instead of "exhausted VMID allocation".
+		logger.Error("create_vm: clone source template missing, not retrying",
+			log.Int("vmid_attempted", candidate),
+			log.String("error", cerr.Error()),
+		)
+		cleanupVM(contextWithoutCancel(ctx), deps, node, candidate, logger)
 	case pve.IsVMIDConflict(cerr):
 		logger.Info("create_vm: vmid conflict on clone, retrying",
 			log.Int("vmid_attempted", candidate),
