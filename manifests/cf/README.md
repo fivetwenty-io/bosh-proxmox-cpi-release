@@ -33,6 +33,32 @@ flarectl dns create \
 
 Both `cf.wayne.pve.lab.fivetwenty.io` and `*.cf.wayne.pve.lab.fivetwenty.io` must resolve to the HAProxy IP. The system domain (`api.cf.wayne.pve.lab.fivetwenty.io`, `login.cf.wayne.pve.lab.fivetwenty.io`, etc.) is served via the wildcard; the apex record is for the system_domain itself.
 
+### `cf ssh` — dedicated DNS-only record
+
+`cf ssh` connects to `ssh.<system_domain>:2222` (the `app_ssh_endpoint` published by `/v2/info`). HAProxy already fronts the diego ssh-proxy on `2222` — `use-haproxy.yml` wires the `ssh_proxy` link, so no extra HAProxy config or static scheduler IP is needed.
+
+The problem is the *path* to `2222`. When the wildcard `*.cf.wayne.pve.lab` is a Cloudflare-**proxied** record (orange cloud), it carries only HTTP/HTTPS — Cloudflare drops `2222`, so `cf ssh` hangs and times out after 120s even though HTTP works.
+
+Add a dedicated **DNS-only** (grey-cloud) `A` record for the ssh host so it bypasses the proxied wildcard and points straight at HAProxy. The IP is private (RFC1918), so this only resolves usefully for clients on the lab network / Tailscale — which is exactly who runs `cf ssh`.
+
+```bash
+flarectl dns create \
+  --zone fivetwenty.io \
+  --type A \
+  --name 'ssh.cf.wayne.pve.lab' \
+  --content 172.31.0.50 \
+  --ttl 120 \
+  --proxy=false        # DNS-only — must NOT be Cloudflare-proxied
+```
+
+Set `--content` to the env's `haproxy_private_ip` (`172.31.0.50` for the `cpitest` env, `192.168.1.50` for the shared-LAN default). Verify:
+
+```bash
+dig +short ssh.cf.wayne.pve.lab.fivetwenty.io      # -> haproxy_private_ip, not a Cloudflare edge IP
+nc -z 172.31.0.50 2222                             # HAProxy -> diego ssh-proxy
+cf ssh <app> -c 'hostname'
+```
+
 ## Deploy
 
 ```bash
