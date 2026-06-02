@@ -973,15 +973,17 @@ def cmd_login(_extra: list[str]) -> None:
     domain = system_domain()
     pw = admin_password()
     run("cf", "api", f"https://api.{domain}", "--skip-ssl-validation")
-    # Pass the admin password via CF_PASSWORD so it never appears in the
-    # process table or shell history.  The CF CLI reads CF_PASSWORD when
-    # -p is absent, so no -p flag is supplied here.
+    # Authenticate with `cf auth`, not `cf login`. Pass the admin password via
+    # CF_PASSWORD so it never appears in the process table or shell history.
+    # `cf auth` reads CF_PASSWORD non-interactively; `cf login` does NOT — it
+    # prompts on stdin, so under a non-tty/redirected stdin (e.g. the e2e
+    # harness) it reads an empty password and fails with "Unable to
+    # authenticate". `cf api` above already set the endpoint; org/space
+    # targeting is handled by callers.
     run_env(
         {"CF_PASSWORD": pw},
-        "cf", "login",
-        "-a", f"https://api.{domain}",
-        "-u", "admin",
-        "--skip-ssl-validation",
+        "cf", "auth", "admin",
+        "--origin", "uaa",
     )
 
 
