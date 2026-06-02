@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"strings"
 )
 
@@ -82,7 +83,7 @@ func (s *service) buildAttachParams(diskID, volid string, opts *AttachOpts) map[
 }
 
 func (s *service) attachDiskToVM(ctx context.Context, node string, vmid int, params map[string]interface{}) error {
-	_, err := s.c.PutCtx(ctx, fmt.Sprintf("/nodes/%s/qemu/%d/config", node, vmid), params)
+	_, err := s.c.PutCtx(ctx, fmt.Sprintf("/nodes/%s/qemu/%d/config", url.PathEscape(node), vmid), params)
 	if err != nil {
 		return fmt.Errorf("failed to attach disk to VM %d on node %q: %w", vmid, node, err)
 	}
@@ -119,7 +120,7 @@ func (s *service) DetachDisk(ctx context.Context, node string, vmid int, diskID 
 
 	volid, _ := rawVal.(string)
 
-	configPath := fmt.Sprintf("/nodes/%s/qemu/%d/config", node, vmid)
+	configPath := fmt.Sprintf("/nodes/%s/qemu/%d/config", url.PathEscape(node), vmid)
 
 	_, err = s.c.PutCtx(ctx, configPath, map[string]interface{}{"delete": diskID})
 	if err != nil {
@@ -194,7 +195,7 @@ func (s *service) ResizeDisk(ctx context.Context, node string, vmid int, diskID 
 	}
 
 	// PVE's /resize endpoint uses PUT.
-	data, err := s.c.PutCtx(ctx, fmt.Sprintf("/nodes/%s/qemu/%d/resize", node, vmid), params)
+	data, err := s.c.PutCtx(ctx, fmt.Sprintf("/nodes/%s/qemu/%d/resize", url.PathEscape(node), vmid), params)
 	if err != nil {
 		return "", fmt.Errorf("failed to execute QEMU operation: %w", err)
 	}

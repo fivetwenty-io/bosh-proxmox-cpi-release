@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"net/url"
 	"strings"
 
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/client"
@@ -134,7 +135,7 @@ func (s *service) Attach(ctx context.Context, node string, vmid int, storage str
 		"ide2": storage + ":cloudinit",
 	}
 
-	_, err := s.c.PutCtx(ctx, fmt.Sprintf("/nodes/%s/qemu/%d/config", node, vmid), params)
+	_, err := s.c.PutCtx(ctx, fmt.Sprintf("/nodes/%s/qemu/%d/config", url.PathEscape(node), vmid), params)
 	if err != nil {
 		return fmt.Errorf("failed to set cloud-init IDE2 config: %w", err)
 	}
@@ -148,12 +149,12 @@ func (s *service) Attach(ctx context.Context, node string, vmid int, storage str
 			"content": "snippets",
 		}
 
-		_, err := s.c.UploadCtx(ctx, fmt.Sprintf("/nodes/%s/storage/%s/upload", node, storage), fields, "filename", filename, bytes.NewReader(userData))
+		_, err := s.c.UploadCtx(ctx, fmt.Sprintf("/nodes/%s/storage/%s/upload", url.PathEscape(node), url.PathEscape(storage)), fields, "filename", filename, bytes.NewReader(userData))
 		if err != nil {
 			return fmt.Errorf("failed to upload user-data file: %w", err)
 		}
 
-		_, err = s.c.PutCtx(ctx, fmt.Sprintf("/nodes/%s/qemu/%d/config", node, vmid), map[string]interface{}{
+		_, err = s.c.PutCtx(ctx, fmt.Sprintf("/nodes/%s/qemu/%d/config", url.PathEscape(node), vmid), map[string]interface{}{
 			"cicustom": fmt.Sprintf("user=%s:snippets/%s", storage, filename),
 		})
 		if err != nil {
@@ -185,12 +186,12 @@ func (s *service) AttachWithNetwork(ctx context.Context, node string, vmid int, 
 		"content": "snippets",
 	}
 
-	_, err = s.c.UploadCtx(ctx, fmt.Sprintf("/nodes/%s/storage/%s/upload", node, storage), fields, "filename", netFilename, bytes.NewReader(networkData))
+	_, err = s.c.UploadCtx(ctx, fmt.Sprintf("/nodes/%s/storage/%s/upload", url.PathEscape(node), url.PathEscape(storage)), fields, "filename", netFilename, bytes.NewReader(networkData))
 	if err != nil {
 		return fmt.Errorf("failed to upload network-data file: %w", err)
 	}
 	// Update cicustom to include network= as well; preserve existing user= from previous call
-	_, err = s.c.PutCtx(ctx, fmt.Sprintf("/nodes/%s/qemu/%d/config", node, vmid), map[string]interface{}{
+	_, err = s.c.PutCtx(ctx, fmt.Sprintf("/nodes/%s/qemu/%d/config", url.PathEscape(node), vmid), map[string]interface{}{
 		"cicustom": fmt.Sprintf("user=%s:snippets/%s,network=%s:snippets/%s", storage, fmt.Sprintf("user-data-vm-%d.yaml", vmid), storage, netFilename),
 	})
 	if err != nil {

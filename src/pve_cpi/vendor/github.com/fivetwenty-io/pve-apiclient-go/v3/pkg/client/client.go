@@ -446,8 +446,17 @@ func (a *internalHTTPAdapter) UploadCtx(ctx context.Context, path string, fields
 
 	return &Response{Data: r.Data, Errors: r.Errors, Code: r.Code}, nil
 }
-func (a *internalHTTPAdapter) SetHeader(key, value string) {}
-func (a *internalHTTPAdapter) RemoveHeader(key string)     {}
+func (a *internalHTTPAdapter) SetHeader(key, value string) {
+	if a.inner != nil {
+		a.inner.SetHeader(key, value)
+	}
+}
+
+func (a *internalHTTPAdapter) RemoveHeader(key string) {
+	if a.inner != nil {
+		a.inner.RemoveHeader(key)
+	}
+}
 
 func (a *internalHTTPAdapter) InvalidateCache(pattern string) int {
 	if a.inner != nil {

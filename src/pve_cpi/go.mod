@@ -8,7 +8,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.17
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.101.0
 	github.com/diskfs/go-diskfs v1.9.3
-	github.com/fivetwenty-io/pve-apiclient-go/v3 v3.2.1
+	github.com/fivetwenty-io/pve-apiclient-go/v3 v3.2.3
 	github.com/google/go-containerregistry v0.21.6
 	golang.org/x/sync v0.20.0
 )

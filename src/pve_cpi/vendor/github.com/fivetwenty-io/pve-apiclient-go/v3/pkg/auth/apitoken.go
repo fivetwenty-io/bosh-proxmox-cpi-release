@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"sync"
 
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/internal/constants"
 )
@@ -28,7 +29,12 @@ var (
 var tokenFormatRegex = regexp.MustCompile(`^\w+(?:=| )`)
 
 // APITokenAuthenticator provides API token-based authentication for PVE.
+//
+// It is safe for concurrent use: the token may be replaced via SetToken while
+// other goroutines read it through GetToken/GetHeaders, mirroring the locking
+// discipline of TicketAuthenticator.
 type APITokenAuthenticator struct {
+	mu        sync.RWMutex
 	token     *Token
 	tokenName string // Name prefix for Authorization header (default: "PVEAPIToken")
 }
@@ -62,7 +68,10 @@ func NewAPITokenAuthenticatorFromString(tokenString string) (*APITokenAuthentica
 // Authenticate performs the authentication process.
 // For API tokens, this is a no-op as tokens don't require login.
 func (ata *APITokenAuthenticator) Authenticate() error {
-	if ata.token == nil || ata.token.ID == "" || ata.token.Secret == "" {
+	ata.mu.RLock()
+	defer ata.mu.RUnlock()
+
+	if !ata.hasValidTokenLocked() {
 		return ErrInvalidAPIToken
 	}
 
@@ -71,13 +80,19 @@ func (ata *APITokenAuthenticator) Authenticate() error {
 
 // IsAuthenticated checks if the authenticator has a valid token.
 func (ata *APITokenAuthenticator) IsAuthenticated() bool {
-	return ata.token != nil && ata.token.ID != "" && ata.token.Secret != ""
+	ata.mu.RLock()
+	defer ata.mu.RUnlock()
+
+	return ata.hasValidTokenLocked()
 }
 
 // GetHeaders returns the authentication headers for API token auth.
 // Transparently adds the token name prefix if not already present in the format.
 func (ata *APITokenAuthenticator) GetHeaders() map[string]string {
-	if !ata.IsAuthenticated() {
+	ata.mu.RLock()
+	defer ata.mu.RUnlock()
+
+	if !ata.hasValidTokenLocked() {
 		return nil
 	}
 
@@ -107,12 +122,24 @@ func (ata *APITokenAuthenticator) Logout() error {
 
 // GetToken returns the API token.
 func (ata *APITokenAuthenticator) GetToken() *Token {
+	ata.mu.RLock()
+	defer ata.mu.RUnlock()
+
 	return ata.token
 }
 
 // SetToken sets the API token.
 func (ata *APITokenAuthenticator) SetToken(token *Token) {
+	ata.mu.Lock()
+	defer ata.mu.Unlock()
+
 	ata.token = token
+}
+
+// hasValidTokenLocked reports whether a usable token is present. The caller must
+// hold at least the read lock.
+func (ata *APITokenAuthenticator) hasValidTokenLocked() bool {
+	return ata.token != nil && ata.token.ID != "" && ata.token.Secret != ""
 }
 
 // ParseAPIToken parses an API token string into a Token struct.

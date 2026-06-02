@@ -3,6 +3,7 @@ package qemu
 import (
 	"context"
 	"fmt"
+	"net/url"
 
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/client"
 )
@@ -36,7 +37,7 @@ type service struct {
 func New(c client.Client) Service { return &service{c: c} }
 
 func (s *service) Create(ctx context.Context, node string, params map[string]interface{}) (string, error) {
-	data, err := s.c.PostCtx(ctx, fmt.Sprintf("/nodes/%s/qemu", node), params)
+	data, err := s.c.PostCtx(ctx, fmt.Sprintf("/nodes/%s/qemu", url.PathEscape(node)), params)
 	if err != nil {
 		return "", fmt.Errorf("failed to create VM: %w", err)
 	}
@@ -55,7 +56,7 @@ func (s *service) Create(ctx context.Context, node string, params map[string]int
 }
 
 func (s *service) Config(ctx context.Context, node string, vmid int) (map[string]interface{}, error) {
-	data, err := s.c.GetCtx(ctx, fmt.Sprintf("/nodes/%s/qemu/%d/config", node, vmid), nil)
+	data, err := s.c.GetCtx(ctx, fmt.Sprintf("/nodes/%s/qemu/%d/config", url.PathEscape(node), vmid), nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get VM config: %w", err)
 	}
@@ -68,7 +69,7 @@ func (s *service) Config(ctx context.Context, node string, vmid int) (map[string
 }
 
 func (s *service) Status(ctx context.Context, node string, vmid int) (map[string]interface{}, error) {
-	data, err := s.c.GetCtx(ctx, fmt.Sprintf("/nodes/%s/qemu/%d/status/current", node, vmid), nil)
+	data, err := s.c.GetCtx(ctx, fmt.Sprintf("/nodes/%s/qemu/%d/status/current", url.PathEscape(node), vmid), nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get VM status: %w", err)
 	}
@@ -81,33 +82,35 @@ func (s *service) Status(ctx context.Context, node string, vmid int) (map[string
 }
 
 func (s *service) Start(ctx context.Context, node string, vmid int) (string, error) {
-	return s.postUPID(ctx, fmt.Sprintf("/nodes/%s/qemu/%d/status/start", node, vmid), nil)
+	return s.postUPID(ctx, fmt.Sprintf("/nodes/%s/qemu/%d/status/start", url.PathEscape(node), vmid), nil)
 }
 func (s *service) Stop(ctx context.Context, node string, vmid int) (string, error) {
-	return s.postUPID(ctx, fmt.Sprintf("/nodes/%s/qemu/%d/status/stop", node, vmid), nil)
+	return s.postUPID(ctx, fmt.Sprintf("/nodes/%s/qemu/%d/status/stop", url.PathEscape(node), vmid), nil)
 }
 func (s *service) Reset(ctx context.Context, node string, vmid int) (string, error) {
-	return s.postUPID(ctx, fmt.Sprintf("/nodes/%s/qemu/%d/status/reset", node, vmid), nil)
+	return s.postUPID(ctx, fmt.Sprintf("/nodes/%s/qemu/%d/status/reset", url.PathEscape(node), vmid), nil)
 }
 func (s *service) Clone(ctx context.Context, node string, vmid int, params map[string]interface{}) (string, error) {
-	return s.postUPID(ctx, fmt.Sprintf("/nodes/%s/qemu/%d/clone", node, vmid), params)
+	return s.postUPID(ctx, fmt.Sprintf("/nodes/%s/qemu/%d/clone", url.PathEscape(node), vmid), params)
 }
 func (s *service) Template(ctx context.Context, node string, vmid int) (string, error) {
-	return s.postUPID(ctx, fmt.Sprintf("/nodes/%s/qemu/%d/template", node, vmid), nil)
+	return s.postUPID(ctx, fmt.Sprintf("/nodes/%s/qemu/%d/template", url.PathEscape(node), vmid), nil)
 }
 
 func (s *service) Snapshot(ctx context.Context, node string, vmid int, name string, opts map[string]interface{}) (string, error) {
-	if opts == nil {
-		opts = map[string]interface{}{}
+	// Copy into a fresh map so the caller's opts are not mutated as a side effect.
+	params := make(map[string]interface{}, len(opts)+1)
+	for k, v := range opts {
+		params[k] = v
 	}
 
-	opts["snapname"] = name
+	params["snapname"] = name
 
-	return s.postUPID(ctx, fmt.Sprintf("/nodes/%s/qemu/%d/snapshot", node, vmid), opts)
+	return s.postUPID(ctx, fmt.Sprintf("/nodes/%s/qemu/%d/snapshot", url.PathEscape(node), vmid), params)
 }
 
 func (s *service) DeleteSnapshot(ctx context.Context, node string, vmid int, name string) error {
-	_, err := s.c.DeleteCtx(ctx, fmt.Sprintf("/nodes/%s/qemu/%d/snapshot/%s", node, vmid, name), nil)
+	_, err := s.c.DeleteCtx(ctx, fmt.Sprintf("/nodes/%s/qemu/%d/snapshot/%s", url.PathEscape(node), vmid, url.PathEscape(name)), nil)
 	if err != nil {
 		return fmt.Errorf("failed to delete snapshot: %w", err)
 	}
@@ -116,7 +119,7 @@ func (s *service) DeleteSnapshot(ctx context.Context, node string, vmid int, nam
 }
 
 func (s *service) ListSnapshots(ctx context.Context, node string, vmid int) ([]map[string]interface{}, error) {
-	data, err := s.c.GetCtx(ctx, fmt.Sprintf("/nodes/%s/qemu/%d/snapshot", node, vmid), nil)
+	data, err := s.c.GetCtx(ctx, fmt.Sprintf("/nodes/%s/qemu/%d/snapshot", url.PathEscape(node), vmid), nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list snapshots for VM %d on node %q: %w", vmid, node, err)
 	}
@@ -136,7 +139,7 @@ func (s *service) ListSnapshots(ctx context.Context, node string, vmid int) ([]m
 }
 
 func (s *service) RollbackSnapshot(ctx context.Context, node string, vmid int, name string) (string, error) {
-	return s.postUPID(ctx, fmt.Sprintf("/nodes/%s/qemu/%d/snapshot/%s/rollback", node, vmid, name), nil)
+	return s.postUPID(ctx, fmt.Sprintf("/nodes/%s/qemu/%d/snapshot/%s/rollback", url.PathEscape(node), vmid, url.PathEscape(name)), nil)
 }
 
 func (s *service) postUPID(ctx context.Context, path string, params map[string]interface{}) (string, error) {

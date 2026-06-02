@@ -171,7 +171,7 @@ github.com/docker/docker-credential-helpers/credentials
 # github.com/elliotwutingfeng/asciiset v0.0.0-20260129054604-cfde2086bc57
 ## explicit; go 1.11
 github.com/elliotwutingfeng/asciiset
-# github.com/fivetwenty-io/pve-apiclient-go/v3 v3.2.1
+# github.com/fivetwenty-io/pve-apiclient-go/v3 v3.2.3
 ## explicit; go 1.25.0
 github.com/fivetwenty-io/pve-apiclient-go/v3/internal/constants
 github.com/fivetwenty-io/pve-apiclient-go/v3/internal/http

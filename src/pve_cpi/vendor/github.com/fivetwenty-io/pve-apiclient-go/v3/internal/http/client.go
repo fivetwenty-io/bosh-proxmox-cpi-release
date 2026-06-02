@@ -49,6 +49,10 @@ type Client struct {
 	loginMutex     sync.Mutex
 	loginAttempted bool
 
+	// Custom headers applied to every request.
+	headerMu sync.RWMutex
+	headers  map[string]string
+
 	// Caching
 	cache *cache.Cache
 }
@@ -426,15 +430,24 @@ func (c *Client) UploadWithContext(ctx context.Context, path string, fields map[
 	return r, perr
 }
 
-// SetHeader sets a header value for all requests.
+// SetHeader sets a header applied to every subsequent request.
 func (c *Client) SetHeader(key, value string) {
-	// This would be implemented with a header storage mechanism
-	// For now, headers are set per request
+	c.headerMu.Lock()
+	defer c.headerMu.Unlock()
+
+	if c.headers == nil {
+		c.headers = make(map[string]string)
+	}
+
+	c.headers[key] = value
 }
 
-// RemoveHeader removes a header from all requests.
+// RemoveHeader removes a previously set custom header.
 func (c *Client) RemoveHeader(key string) {
-	// This would be implemented with a header storage mechanism
+	c.headerMu.Lock()
+	defer c.headerMu.Unlock()
+
+	delete(c.headers, key)
 }
 
 // SetTimeout sets the request timeout.
@@ -586,6 +599,7 @@ func (c *Client) buildUploadRequest(ctx context.Context, path string, fields map
 	req.Header.Set("Content-Type", contentType)
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", "pve-apiclient-go/1.0")
+	c.applyCustomHeaders(req)
 
 	return req, nil
 }
@@ -715,6 +729,7 @@ func (c *Client) buildRequestWithContext(ctx context.Context, method, path strin
 	// Set standard headers
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", "pve-apiclient-go/1.0")
+	c.applyCustomHeaders(req)
 
 	return req, nil
 }
@@ -854,6 +869,18 @@ func (c *Client) applyAuthHeaders(req *http.Request) {
 
 	headers := c.authenticator.GetHeaders()
 	for key, value := range headers {
+		req.Header.Set(key, value)
+	}
+}
+
+// applyCustomHeaders sets caller-configured headers on the request. It runs
+// after the standard headers so callers may override defaults such as
+// User-Agent; authentication headers are applied later and always win.
+func (c *Client) applyCustomHeaders(req *http.Request) {
+	c.headerMu.RLock()
+	defer c.headerMu.RUnlock()
+
+	for key, value := range c.headers {
 		req.Header.Set(key, value)
 	}
 }

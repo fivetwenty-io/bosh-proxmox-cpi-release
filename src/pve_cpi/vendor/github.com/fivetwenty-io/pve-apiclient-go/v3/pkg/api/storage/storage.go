@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/client"
 	pveerr "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/errors"
@@ -79,7 +80,7 @@ func (s *service) CreateVolume(ctx context.Context, node, storage string, sizeGi
 		params["format"] = format
 	}
 
-	data, err := s.c.PostCtx(ctx, fmt.Sprintf("/nodes/%s/storage/%s/content", node, storage), params)
+	data, err := s.c.PostCtx(ctx, fmt.Sprintf("/nodes/%s/storage/%s/content", url.PathEscape(node), url.PathEscape(storage)), params)
 	if err != nil {
 		return "", fmt.Errorf("failed to create volume on storage %q node %q: %w", storage, node, err)
 	}
@@ -110,7 +111,7 @@ func (s *service) DeleteVolume(ctx context.Context, node, storage, volume string
 // run later (after another caller has uploaded the replacement) and silently
 // remove it.
 func (s *service) DeleteVolumeAsync(ctx context.Context, node, storage, volume string) (string, error) {
-	data, err := s.c.DeleteCtx(ctx, fmt.Sprintf("/nodes/%s/storage/%s/content/%s", node, storage, volume), nil)
+	data, err := s.c.DeleteCtx(ctx, fmt.Sprintf("/nodes/%s/storage/%s/content/%s", url.PathEscape(node), url.PathEscape(storage), url.PathEscape(volume)), nil)
 	if err == nil {
 		return upidFromDeleteResponse(data), nil
 	}
@@ -125,7 +126,7 @@ func (s *service) DeleteVolumeAsync(ctx context.Context, node, storage, volume s
 	return "", fmt.Errorf("failed to delete volume %q from storage %q on node %q: %w", volume, storage, node, err)
 }
 func (s *service) Exists(ctx context.Context, node, storage, volume string) (bool, error) {
-	_, err := s.c.GetCtx(ctx, fmt.Sprintf("/nodes/%s/storage/%s/content/%s", node, storage, volume), nil)
+	_, err := s.c.GetCtx(ctx, fmt.Sprintf("/nodes/%s/storage/%s/content/%s", url.PathEscape(node), url.PathEscape(storage), url.PathEscape(volume)), nil)
 	if err == nil {
 		return true, nil
 	}
@@ -153,7 +154,7 @@ func (s *service) DeleteVolumeIfExists(ctx context.Context, node, storage, volum
 // that re-upload to the same volume name must await UPID via Tasks() to avoid
 // a queued imgdel removing the replacement.
 func (s *service) DeleteVolumeIfExistsAsync(ctx context.Context, node, storage, volume string) (bool, string, error) {
-	data, err := s.c.DeleteCtx(ctx, fmt.Sprintf("/nodes/%s/storage/%s/content/%s", node, storage, volume), nil)
+	data, err := s.c.DeleteCtx(ctx, fmt.Sprintf("/nodes/%s/storage/%s/content/%s", url.PathEscape(node), url.PathEscape(storage), url.PathEscape(volume)), nil)
 	if err == nil {
 		return true, upidFromDeleteResponse(data), nil
 	}
@@ -186,7 +187,7 @@ func (s *service) Upload(ctx context.Context, node, storage, content, filename s
 	// same multipart part name appears twice.
 	fields := map[string]string{"content": content}
 
-	resp, err := s.c.UploadCtx(ctx, fmt.Sprintf("/nodes/%s/storage/%s/upload", node, storage), fields, "filename", filename, body)
+	resp, err := s.c.UploadCtx(ctx, fmt.Sprintf("/nodes/%s/storage/%s/upload", url.PathEscape(node), url.PathEscape(storage)), fields, "filename", filename, body)
 	if err != nil {
 		return "", fmt.Errorf("failed to upload %q to storage %q on node %q: %w", filename, storage, node, err)
 	}

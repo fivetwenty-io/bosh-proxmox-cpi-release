@@ -138,7 +138,7 @@ func (p *taskPoller) poll(ctx context.Context) (*Status, error) {
 	// Bail immediately if the context is already done before any I/O.
 	select {
 	case <-ctx.Done():
-		return nil, context.DeadlineExceeded
+		return nil, fmt.Errorf("task polling canceled before start: %w", ctx.Err())
 	default:
 	}
 
@@ -182,7 +182,7 @@ func (p *taskPoller) waitForInterval(ctx context.Context, intervalMillis int) er
 			<-timer.C
 		}
 
-		return context.DeadlineExceeded
+		return fmt.Errorf("task polling canceled: %w", ctx.Err())
 	case <-timer.C:
 		return nil
 	}
