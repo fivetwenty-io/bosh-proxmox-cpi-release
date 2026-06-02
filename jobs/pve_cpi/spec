@@ -373,14 +373,25 @@ properties:
       online cluster nodes are candidates regardless of availability_zone.
       Example: {us-east-1a: [pve01, pve02], us-east-1b: [pve03]}
     default: {}
-  pve.placement.anti_affinity:
+  pve.placement.anti_affinity.enabled:
     description: |
-      Reserved for Tier-2 implementation. When true, the CPI will apply
-      anti-affinity spreading to BOSH instance groups via PVE HA rules
-      (negative affinity rules in /cluster/ha/rules). Default false:
-      anti-affinity is inactive and no PVE HA resources are created.
-      Defining this property now ensures no spec change is required when
-      Tier-2 anti-affinity ships.
+      When true, the node scorer spreads members of the same BOSH instance
+      group across cluster nodes at create time (scheduler-soft anti-affinity):
+      a node already hosting members of the VM's instance group is penalized so
+      the next member prefers a different node. This is advisory — under
+      resource pressure two members may still co-locate. Default false (opt-in).
+    default: false
+  pve.placement.anti_affinity.use_ha_rules:
+    description: |
+      When true (and anti_affinity.enabled is also true), the CPI additionally
+      registers each VM as a PVE HA resource and maintains a cluster-level
+      negative resource-affinity rule (POST /cluster/ha/rules,
+      type=resource-affinity, affinity=negative) keyed on the BOSH instance
+      group, so PVE enforces spreading at the hypervisor level rather than only
+      at create time. On delete the VM is removed from the rule and empty rules
+      are pruned. HA-managed resources interact with the BOSH resurrector;
+      enable only when PVE-level enforcement is desired. Has no effect unless
+      anti_affinity.enabled is true. Default false.
     default: false
   pve.fetch_credential_defaults:
     description: |

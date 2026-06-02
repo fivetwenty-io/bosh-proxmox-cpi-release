@@ -155,10 +155,17 @@
   az_map = p("pve.placement.az_map", {})
   placement["az_map"] = az_map unless az_map.nil? || az_map.empty?
 
-  # placement.anti_affinity: emit only when explicitly set to true (default false).
-  if p("pve.placement.anti_affinity", false)
-    placement["anti_affinity"] = true
+  # placement.anti_affinity: nested block, emitted only when spreading is
+  # enabled. enabled=true turns on scheduler-soft spreading; use_ha_rules=true
+  # additionally maintains PVE HA negative-affinity rules. Both default false.
+  anti_affinity = {}
+  if p("pve.placement.anti_affinity.enabled", false)
+    anti_affinity["enabled"] = true
+    if p("pve.placement.anti_affinity.use_ha_rules", false)
+      anti_affinity["use_ha_rules"] = true
+    end
   end
+  placement["anti_affinity"] = anti_affinity unless anti_affinity.empty?
 
   # placement.weights: emit only when at least one weight is overridden.
   weights = {}

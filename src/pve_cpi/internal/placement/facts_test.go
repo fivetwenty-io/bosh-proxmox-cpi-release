@@ -231,15 +231,15 @@ func TestGatherNodeFacts_SameGroupCount(t *testing.T) {
 		statusNode("pve1", 8, 8*gib, 4*gib, 1, 0),
 	}
 	resResp := cluster.ListResourcesResponse{
-		resourceQEMU("pve1", "director-deploy-web-0", "bosh.director-deploy-web"),
-		resourceQEMU("pve1", "director-deploy-web-1", "bosh.director-deploy-web"),
-		resourceQEMU("pve1", "director-deploy-db-0", "bosh.director-deploy-db"),
+		resourceQEMU("pve1", "web-0", "deployment--cf;job--web;index--0"),
+		resourceQEMU("pve1", "web-1", "deployment--cf;job--web;index--1"),
+		resourceQEMU("pve1", "db-0", "deployment--cf;job--db;index--0"),
 	}
 	cl := &stubCluster{statusResp: &resp, resResp: &resResp}
 	ns := &stubNodes{}
 
 	facts, err := placement.GatherNodeFacts(context.Background(), cl, ns, nopLogger(), placement.GatherOptions{
-		BOSHGroup: "director-deploy-web",
+		GroupTag: "job--web",
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)

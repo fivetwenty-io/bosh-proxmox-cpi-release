@@ -330,11 +330,31 @@ type PlacementConfig struct {
 	// When empty or nil, all online nodes are candidates (default, zero regression).
 	AZMap map[string][]string `json:"az_map,omitempty"`
 
-	// AntiAffinity is a placeholder field reserved for Tier-2 implementation.
-	// Defining it here means Tier-2 needs no changes to config schema or ERB.
-	// Default nil (false): anti-affinity logic is inactive in Tier 1.
-	// Pointer-typed so nil and explicit false are both "off".
-	AntiAffinity *bool `json:"anti_affinity,omitempty"`
+	// AntiAffinity controls same-instance-group spreading. Pointer-typed so a
+	// fully-absent block (nil) means "off" with zero regression. When present
+	// and Enabled, the node scorer penalizes nodes already hosting members of
+	// the VM's BOSH instance group (scheduler-soft spreading). UseHaRules adds
+	// PVE-enforced negative HA affinity rules on top (opt-in within opt-in).
+	AntiAffinity *AntiAffinityConfig `json:"anti_affinity,omitempty"`
+}
+
+// AntiAffinityConfig holds the Tier-2 same-group spreading knobs.
+// Both fields are pointer-typed so nil and explicit false are both "off",
+// and an absent sub-key defers to the documented default.
+type AntiAffinityConfig struct {
+	// Enabled turns on scheduler-soft spreading: the node scorer subtracts a
+	// per-same-group-member penalty so members of one BOSH instance group are
+	// distributed across nodes at create time. Default false (opt-in). This is
+	// advisory only — under resource pressure two members may still co-locate.
+	Enabled *bool `json:"enabled,omitempty"`
+
+	// UseHaRules additionally registers each VM as a PVE HA resource and
+	// maintains a cluster-level negative resource-affinity rule keyed on the
+	// instance group, so PVE enforces spreading at the hypervisor level (not
+	// just at create time). Default false. Has no effect unless Enabled is true.
+	// Note: HA-managed resources interact with the BOSH resurrector; enable
+	// only when PVE-level enforcement is desired.
+	UseHaRules *bool `json:"use_ha_rules,omitempty"`
 }
 
 // PlacementWeights controls how each scoring axis contributes to the final
@@ -709,14 +729,25 @@ func (c *CPIConfig) EffectiveWeights() PlacementWeights {
 	return w
 }
 
-// AntiAffinityEnabled returns whether Tier-2 anti-affinity logic is active.
-// Default false (nil Placement or nil Placement.AntiAffinity).
-// Tier-2 implementation reads this; Tier-1 code may call it safely.
+// AntiAffinityEnabled reports whether scheduler-soft same-group spreading is
+// active. Default false (nil Placement, nil AntiAffinity, or nil Enabled).
 func (c *CPIConfig) AntiAffinityEnabled() bool {
-	if c.Placement == nil || c.Placement.AntiAffinity == nil {
+	if c.Placement == nil || c.Placement.AntiAffinity == nil || c.Placement.AntiAffinity.Enabled == nil {
 		return false
 	}
-	return *c.Placement.AntiAffinity
+	return *c.Placement.AntiAffinity.Enabled
+}
+
+// AntiAffinityUseHaRulesEnabled reports whether PVE HA negative-affinity rules
+// should be maintained on top of scheduler-soft spreading. Default false. HA
+// rule maintenance only runs when anti-affinity is also enabled, so this
+// returns false unless both AntiAffinityEnabled() and UseHaRules are true.
+func (c *CPIConfig) AntiAffinityUseHaRulesEnabled() bool {
+	if !c.AntiAffinityEnabled() {
+		return false
+	}
+	aa := c.Placement.AntiAffinity
+	return aa.UseHaRules != nil && *aa.UseHaRules
 }
 
 // AZCandidates returns the node list for az and true when az is a known key in

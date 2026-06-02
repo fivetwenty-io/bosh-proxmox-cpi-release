@@ -86,6 +86,17 @@ func HandleDeleteVM(deps Deps) cpi.Handler {
 			return nil, guardErr
 		}
 
+		// --- HA anti-affinity cleanup (opt-in: anti_affinity.use_ha_rules) ---
+		// Remove the VM from any CPI-managed negative-affinity rule and
+		// deregister its HA resource before destroying it. Keyed on vmid (the
+		// group name is unavailable at delete time). Best-effort: HA failures
+		// are logged and never block VM deletion.
+		if deps.Config.AntiAffinityUseHaRulesEnabled() {
+			if aaErr := removeAntiAffinityMembership(ctx, deps, vmid, logger); aaErr != nil {
+				logger.Warn("delete_vm: HA anti-affinity cleanup incomplete (non-fatal)", log.Err(aaErr))
+			}
+		}
+
 		// --- delete VM ---
 		// Purge removes VMID from backup/HA/replication configs.
 		// DestroyUnreferencedDisks removes orphaned volumes from storage.

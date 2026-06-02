@@ -307,6 +307,22 @@ func createVM(
 		return nil, err
 	}
 
+	// -----------------------------------------------------------------------
+	// 9. PVE HA anti-affinity membership (opt-in: anti_affinity.use_ha_rules).
+	//
+	// Best-effort and non-fatal: HA being unconfigured, or any rule-write
+	// failure, is logged as a warning and never fails create_vm (scheduler-soft
+	// spreading remains in effect via the scoring done at node selection).
+	// -----------------------------------------------------------------------
+	if deps.Config.AntiAffinityUseHaRulesEnabled() {
+		if groupKey := sanitizeTagValue(instanceGroupName(parsed.env)); groupKey != "" {
+			if aaErr := ensureAntiAffinityMembership(ctx, deps, groupKey, vmid, logger); aaErr != nil {
+				logger.Warn("create_vm: HA anti-affinity membership not fully applied (non-fatal)",
+					log.Int("vmid", vmid), log.String("group", groupKey), log.Err(aaErr))
+			}
+		}
+	}
+
 	vmCID := strconv.Itoa(vmid)
 	return []any{vmCID, responseNetworks}, nil
 }
@@ -412,7 +428,12 @@ func parseCreateVMArgs(args []json.RawMessage) (*createVMParsedArgs, error) {
 func resolveVMShape(ctx context.Context, deps Deps, parsed *createVMParsedArgs) (*createVMShape, error) {
 	cp := parsed.cloudProps
 
-	node, err := resolveTargetNode(ctx, deps, cp)
+	// Anti-affinity group tag (Tier 2, scheduler-soft spreading). Only computed
+	// when anti-affinity is enabled; otherwise the scorer ignores group membership
+	// and behavior is identical to Tier 1.
+	groupTag := antiAffinityGroupTag(deps.Config, parsed.env)
+
+	node, err := resolveTargetNode(ctx, deps, cp, groupTag)
 	if err != nil {
 		return nil, err
 	}
@@ -467,8 +488,13 @@ func resolveVMShape(ctx context.Context, deps Deps, parsed *createVMParsedArgs) 
 //  3. deps.Config.PlacementEnabled() == false → deps.Config.Node (legacy behavior).
 //  4. All paths: if the resolved node is still "" → CloudError.
 //
+// groupTag, when non-empty, is the anti-affinity tag (e.g. "job--diego-cell")
+// that activates scheduler-soft same-group spreading: GatherNodeFacts counts
+// existing same-group members per node and the scorer penalizes those nodes.
+// Empty groupTag means anti-affinity is off (Tier-1 behavior).
+//
 //nolint:gocognit // Three-branch decision tree; complexity is inherent to the spec.
-func resolveTargetNode(ctx context.Context, deps Deps, cp createVMCloudProps) (string, error) {
+func resolveTargetNode(ctx context.Context, deps Deps, cp createVMCloudProps, groupTag string) (string, error) {
 	// Nil-guard the logger: internal unit tests that call resolveVMShape directly
 	// may leave deps.Logger unset. Use a nop logger in that case so logging calls
 	// are safe without requiring all callers to set a logger.
@@ -509,13 +535,14 @@ func resolveTargetNode(ctx context.Context, deps Deps, cp createVMCloudProps) (s
 			)
 		}
 
-		// Gather live cluster facts.
+		// Gather live cluster facts. GroupTag (non-empty only when anti-affinity
+		// is enabled) makes GatherNodeFacts tally same-group members per node.
 		storageName := deps.Config.VMStorage
 		facts, gatherErr := placement.GatherNodeFacts(ctx,
 			deps.PVE.Cluster(),
 			deps.PVE.Nodes(),
 			logger,
-			placement.GatherOptions{StorageName: storageName},
+			placement.GatherOptions{StorageName: storageName, GroupTag: groupTag},
 		)
 		if gatherErr != nil {
 			// GatherNodeFacts returns a fatal error only when ListStatus fails.
@@ -540,12 +567,19 @@ func resolveTargetNode(ctx context.Context, deps Deps, cp createVMCloudProps) (s
 
 		if len(pass) > 0 {
 			w := deps.Config.EffectiveWeights()
-			scored := placement.Score(pass, placement.Weights{
+			weights := placement.Weights{
 				Mem:        w.Mem,
 				Storage:    w.Storage,
 				CPU:        w.CPU,
 				GuestCount: w.GuestCount,
-			}, nil)
+			}
+			// Activate the anti-affinity penalty axis only when a group tag is
+			// present (anti-affinity enabled); otherwise leave it zero so the
+			// scorer ignores SameGroupCount and Tier-1 behavior is preserved.
+			if groupTag != "" {
+				weights.AntiAffinity = placement.DefaultWeights().AntiAffinity
+			}
+			scored := placement.Score(pass, weights, nil)
 			chosen := placement.Pick(scored, nil)
 			if chosen != "" {
 				logger.Info("create_vm: node selection: placement scoring chose node",
@@ -964,17 +998,17 @@ func attemptCreateVM(
 		shape.vmStorage, parsed.rawCID, shape.vmDiskFormat, shape.rootDiskGiB)
 
 	createParams := map[string]any{
-		"vmid":             candidate,
-		metadataKeyName:    candidateName,
-		"memory":           shape.memMiB,
-		"cores":   shape.cores,
-		"ostype":  osTypeLinux26,
-		"scsihw":  "virtio-scsi-pci",
-		"virtio0": virtio0Val,
-		"boot":    "order=virtio0",
-		"agent":   "enabled=1",
-		"hotplug": shape.hotplug,
-		"onboot":  0,
+		"vmid":          candidate,
+		metadataKeyName: candidateName,
+		"memory":        shape.memMiB,
+		"cores":         shape.cores,
+		"ostype":        osTypeLinux26,
+		"scsihw":        "virtio-scsi-pci",
+		"virtio0":       virtio0Val,
+		"boot":          "order=virtio0",
+		"agent":         "enabled=1",
+		"hotplug":       shape.hotplug,
+		"onboot":        0,
 	}
 	if shape.numaEnabled {
 		createParams["numa"] = 1
@@ -1877,6 +1911,34 @@ func extractInstanceNameFromEnv(env map[string]any) string {
 		}
 	}
 	return ""
+}
+
+// instanceGroupName returns the BOSH instance-group name for the VM being
+// created — the unit of anti-affinity spreading. It prefers the job suffix
+// derived from env.bosh.group/groups (director deploys) and falls back to
+// env.bosh.instance.name (create-env / bosh-init). Returns "" when neither is
+// derivable.
+func instanceGroupName(env map[string]any) string {
+	if job := extractJobNameFromEnv(env); job != "" {
+		return job
+	}
+	return extractInstanceNameFromEnv(env)
+}
+
+// antiAffinityGroupTag returns the PVE tag that marks membership in the VM's
+// BOSH instance group, formed to match the tag scheme set_vm_metadata stamps
+// ("job--<sanitized>"). It returns "" — disabling scheduler-soft spreading for
+// this create — when anti-affinity is not enabled or the instance group cannot
+// be derived from env.
+func antiAffinityGroupTag(cfg *config.CPIConfig, env map[string]any) string {
+	if !cfg.AntiAffinityEnabled() {
+		return ""
+	}
+	group := sanitizeTagValue(instanceGroupName(env))
+	if group == "" {
+		return ""
+	}
+	return "job--" + group
 }
 
 // composeVMName builds the PVE VM name from prefix + deployment + job +

@@ -2804,23 +2804,23 @@ func TestValidate_Placement_EmptyNodeList(t *testing.T) {
 	t.Parallel()
 	// Must use struct path — JSON cannot encode empty slice without omitempty issues.
 	cfg := &config.CPIConfig{
-		Host:          "h",
-		User:          "u",
-		Password:      "p",
-		VMStorage:     "s",
-		DiskStorage:   "s",
-		NetworkBridge: "br",
-		Port:          8006,
-		VerifySSL:     boolPtr(true),
-		AgentMode:     "cloudinit",
-		VMDiskFormat:  "qcow2",
-		LogLevel:      "info",
+		Host:           "h",
+		User:           "u",
+		Password:       "p",
+		VMStorage:      "s",
+		DiskStorage:    "s",
+		NetworkBridge:  "br",
+		Port:           8006,
+		VerifySSL:      boolPtr(true),
+		AgentMode:      "cloudinit",
+		VMDiskFormat:   "qcow2",
+		LogLevel:       "info",
 		VMIDRangeStart: 100,
-		VMIDRangeEnd:  8999,
-		RebootMode:    "soft",
-		RebootTimeout: 60,
-		NetworkMode:   "auto",
-		SDNZoneType:   "simple",
+		VMIDRangeEnd:   8999,
+		RebootMode:     "soft",
+		RebootTimeout:  60,
+		NetworkMode:    "auto",
+		SDNZoneType:    "simple",
 		Placement: &config.PlacementConfig{
 			AZMap: map[string][]string{"az1": {}},
 		},
@@ -2863,7 +2863,7 @@ func TestValidate_Placement_ValidFull(t *testing.T) {
 		"placement":{
 			"enabled":true,
 			"az_map":{"az1":["pve01","pve02"],"az2":["pve03"]},
-			"anti_affinity":false,
+			"anti_affinity":{"enabled":true,"use_ha_rules":true},
 			"weights":{"mem":2.0,"storage":1.0,"cpu":1.0,"guest_count":0.5}
 		}
 	}`)
@@ -2873,8 +2873,11 @@ func TestValidate_Placement_ValidFull(t *testing.T) {
 	if !cfg.PlacementEnabled() {
 		t.Error("PlacementEnabled() = false, want true")
 	}
-	if cfg.AntiAffinityEnabled() {
-		t.Error("AntiAffinityEnabled() = true, want false")
+	if !cfg.AntiAffinityEnabled() {
+		t.Error("AntiAffinityEnabled() = false, want true")
+	}
+	if !cfg.AntiAffinityUseHaRulesEnabled() {
+		t.Error("AntiAffinityUseHaRulesEnabled() = false, want true")
 	}
 	w := cfg.EffectiveWeights()
 	if w.Mem != 2.0 || w.Storage != 1.0 || w.CPU != 1.0 || w.GuestCount != 0.5 {
@@ -2925,11 +2928,37 @@ func TestAntiAffinityEnabled_ExplicitTrue(t *testing.T) {
 	t.Parallel()
 	cfg := config.CPIConfig{
 		Placement: &config.PlacementConfig{
-			AntiAffinity: boolPtr(true),
+			AntiAffinity: &config.AntiAffinityConfig{Enabled: boolPtr(true)},
 		},
 	}
 	if !cfg.AntiAffinityEnabled() {
 		t.Error("AntiAffinityEnabled() = false with explicit *true, want true")
+	}
+}
+
+// TestAntiAffinityUseHaRulesEnabled covers the two-flag gate: HA rules only
+// activate when both Enabled and UseHaRules are true.
+func TestAntiAffinityUseHaRulesEnabled(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		aa   *config.AntiAffinityConfig
+		want bool
+	}{
+		{"nil block", nil, false},
+		{"enabled only", &config.AntiAffinityConfig{Enabled: boolPtr(true)}, false},
+		{"ha without enabled", &config.AntiAffinityConfig{UseHaRules: boolPtr(true)}, false},
+		{"both true", &config.AntiAffinityConfig{Enabled: boolPtr(true), UseHaRules: boolPtr(true)}, true},
+		{"enabled true ha false", &config.AntiAffinityConfig{Enabled: boolPtr(true), UseHaRules: boolPtr(false)}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := config.CPIConfig{Placement: &config.PlacementConfig{AntiAffinity: tc.aa}}
+			if got := cfg.AntiAffinityUseHaRulesEnabled(); got != tc.want {
+				t.Errorf("AntiAffinityUseHaRulesEnabled() = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 

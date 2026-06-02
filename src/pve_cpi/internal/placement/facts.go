@@ -52,12 +52,12 @@ type clusterResourceItem = NodeResource
 
 // storageEntry is the typed shape of each entry in GET /nodes/{node}/storage.
 type storageEntry struct {
-	Storage  string `json:"storage"`
-	Active   int    `json:"active"`   // 1 = active
-	Enabled  int    `json:"enabled"`  // 1 = enabled
-	Content  string `json:"content"`  // comma-separated content types
-	Avail    int64  `json:"avail"`    // available bytes
-	Total    int64  `json:"total"`    // total bytes
+	Storage string `json:"storage"`
+	Active  int    `json:"active"`  // 1 = active
+	Enabled int    `json:"enabled"` // 1 = enabled
+	Content string `json:"content"` // comma-separated content types
+	Avail   int64  `json:"avail"`   // available bytes
+	Total   int64  `json:"total"`   // total bytes
 }
 
 // GatherOptions holds optional parameters for GatherNodeFacts.
@@ -66,10 +66,14 @@ type GatherOptions struct {
 	// When empty, storage facts (FreeStorageBytes, TotalStorageBytes) are zero.
 	StorageName string
 
-	// BOSHGroup is the BOSH instance group name used to compute SameGroupCount
-	// (the number of existing VMs on each node from the same group). When empty,
+	// GroupTag is the exact PVE tag that marks membership in the BOSH instance
+	// group being placed (e.g. "job--diego-cell"). GatherNodeFacts counts, per
+	// node, how many existing QEMU guests carry this tag and records the total
+	// in SameGroupCount, which the scorer's anti-affinity axis penalizes. The
+	// caller is responsible for forming the tag with the same sanitization the
+	// CPI uses when it stamps tags (see set_vm_metadata). When empty,
 	// SameGroupCount remains 0 for all nodes.
-	BOSHGroup string
+	GroupTag string
 }
 
 // GatherNodeFacts assembles NodeFacts for every node reported by the PVE cluster.
@@ -115,7 +119,7 @@ func GatherNodeFacts(
 	}
 
 	// Phase 2: ListResources for guest count and group tags (non-fatal).
-	guestCounts, sameGroupCounts := gatherGuestCounts(ctx, clusterClient, logger, opts.BOSHGroup)
+	guestCounts, sameGroupCounts := gatherGuestCounts(ctx, clusterClient, logger, opts.GroupTag)
 
 	// Phase 3: per-node storage query (non-fatal per node).
 	storageAvail, storageTotal := gatherStorageFacts(ctx, nodesClient, logger, nodeItems, opts.StorageName)
@@ -148,7 +152,7 @@ func gatherGuestCounts(
 	ctx context.Context,
 	clusterClient ClusterClient,
 	logger *log.Logger,
-	boshGroup string,
+	groupTag string,
 ) (map[string]int, map[string]int) {
 	guestCounts := make(map[string]int)
 	sameGroupCounts := make(map[string]int)
@@ -171,7 +175,7 @@ func gatherGuestCounts(
 			continue
 		}
 		guestCounts[ri.Node]++
-		if boshGroup != "" && matchesBOSHGroup(ri.Tags, boshGroup) {
+		if groupTag != "" && hasTag(ri.Tags, groupTag) {
 			sameGroupCounts[ri.Node]++
 		}
 	}
@@ -242,45 +246,23 @@ func ParseNodeResources(raw []json.RawMessage) ([]NodeResource, error) {
 	return out, nil
 }
 
-// matchesBOSHGroup returns true when the space-separated PVE tags string
-// contains a tag that matches the expected BOSH group name. PVE stores BOSH
-// group tags in the format "bosh.<group>" where <group> is sanitized.
-// The match first checks the exact group name, then the prefixed form.
-func matchesBOSHGroup(tags, group string) bool {
-	if tags == "" || group == "" {
+// hasTag returns true when the PVE tags string contains an exact match for
+// want. PVE returns the per-resource tags field as a delimited list; different
+// PVE versions and endpoints use ";", "," or whitespace as the separator, so
+// the scan splits on all three. The caller supplies want already formed and
+// sanitized to match the CPI's stored tag scheme (e.g. "job--diego-cell").
+func hasTag(tags, want string) bool {
+	if tags == "" || want == "" {
 		return false
 	}
-	prefixed := "bosh." + sanitizeTagValue(group)
-	sanitizedGroup := sanitizeTagValue(group)
-	for _, tag := range strings.Fields(tags) {
-		tag = strings.TrimSpace(tag)
-		if tag == sanitizedGroup || tag == prefixed || tag == group {
+	for _, tag := range strings.FieldsFunc(tags, func(r rune) bool {
+		return r == ';' || r == ',' || r == ' ' || r == '\t' || r == '\n'
+	}) {
+		if tag == want {
 			return true
 		}
 	}
 	return false
-}
-
-// sanitizeTagValue maps a BOSH group name to a PVE-safe tag value.
-// PVE tag names allow [a-z0-9_-]; uppercase is lowercased, other chars become "-".
-func sanitizeTagValue(s string) string {
-	out := make([]byte, 0, len(s))
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		switch {
-		case c >= 'A' && c <= 'Z':
-			out = append(out, c+32) // lowercase
-		case c >= 'a' && c <= 'z':
-			out = append(out, c)
-		case c >= '0' && c <= '9':
-			out = append(out, c)
-		case c == '_' || c == '-' || c == '.':
-			out = append(out, c)
-		default:
-			out = append(out, '-')
-		}
-	}
-	return string(out)
 }
 
 // hasImagesContent returns true when the comma-separated content string contains
