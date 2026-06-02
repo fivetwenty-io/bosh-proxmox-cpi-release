@@ -1,0 +1,26 @@
+---
+# Ops file: raise the director's task-worker count for this lab.
+#
+# Background
+# ----------
+# `director.workers` is the number of bosh_worker processes the director runs
+# to pull tasks off its queue — it caps how many director tasks (create-env,
+# deploy, errand, cloud-check, vms, etc.) execute concurrently. The upstream
+# bosh-deployment/bosh.yml default is 4.
+#
+# The scripts in this repo drive several director tasks in parallel (per-IG
+# deploys with cf_max_in_flight, compiled-release export/upload, and the
+# net-up/down/status helpers), and the PVE node is sized for 12 worker
+# threads. Lifting the director to 8 workers gives those concurrent tasks
+# their own queue slots so a long-running task (e.g. a stuck get_task poll)
+# cannot starve the others, while staying well under the host's thread budget.
+#
+# Usage: applied automatically by `scripts/bosh create-env`. Takes effect on
+# the next director redeploy.
+#
+# Rollback: drop the ops file from scripts/bosh and redeploy the director.
+# The upstream default of 4 is restored on the next create-env.
+
+- type: replace
+  path: /instance_groups/name=bosh/properties/director/workers
+  value: 8

@@ -92,6 +92,7 @@ CPI_OPS = BOSH_DIR / "cpi.yml"
 OS_CONF_OPS = BOSH_DIR / "os-conf.yml"
 NATS_TUNING_OPS = BOSH_DIR / "nats-tuning.yml"
 HM_TUNING_OPS = BOSH_DIR / "hm-tuning.yml"
+DIRECTOR_TUNING_OPS = BOSH_DIR / "director-tuning.yml"
 # Reliable key-based SSH access to the director (os-conf user_add; no apt).
 # The director VM is created with the PVE QGA channel disabled, so
 # `qm guest exec` is unavailable — SSH via the jumpbox user is the only
@@ -291,6 +292,7 @@ def cmd_create_env(args: list[str]) -> int:
         "-o", str(OS_CONF_OPS),
         "-o", str(NATS_TUNING_OPS),
         "-o", str(HM_TUNING_OPS),
+        "-o", str(DIRECTOR_TUNING_OPS),
         "-o", str(JUMPBOX_OPS),
         *env_network_ops(),
         "-l", str(VARS),
@@ -360,6 +362,7 @@ def cmd_teardown(args: list[str]) -> int:
         "-o", str(OS_CONF_OPS),
         "-o", str(NATS_TUNING_OPS),
         "-o", str(HM_TUNING_OPS),
+        "-o", str(DIRECTOR_TUNING_OPS),
         "-o", str(JUMPBOX_OPS),
         *env_network_ops(),
         "-l", str(VARS),
