@@ -1,0 +1,15 @@
+---
+# update-cloud-config-only override (applied by `scripts/bosh ucc`, never by
+# create-env). Widens the bosh cloud-config's default-network reserved band to
+# the same infra band CF uses (cpitest_reserved), so a VM placed on the bosh
+# cloud-config — emptyvm in particular — lands in the dynamic middle (.20+)
+# instead of .2.
+#
+# The base bosh cloud-config reserves only the gateway + Director (.1, .10),
+# which leaves .2 (conventionally a routing slot) and the artifacts VM (.11)
+# eligible for dynamic placement. cpitest_reserved is the single source of
+# truth for the infra band and is layered in by `scripts/bosh ucc` via the
+# env vars file.
+- type: replace
+  path: /networks/name=default/subnets/0/reserved
+  value: ((cpitest_reserved))
