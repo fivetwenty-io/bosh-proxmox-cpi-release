@@ -1,0 +1,25 @@
+---
+# ops-update-watchtime.yml — trim the update watch-time floor (lab-only).
+#
+# cf-deployment's deployment-level /update sets:
+#
+#   update_watch_time: 5000-1200000   # min 5s, max 20m
+#   canary_watch_time: 30000-1200000  # min 30s, max 20m
+#
+# The MIN is a floor: after updating an instance BOSH will not declare it
+# healthy before MIN ms elapse, even when the agent reports the jobs running
+# almost immediately. On this lab the CF jobs come up fast, so the 5s floor is
+# pure dead time paid once per update wave (and the 30s canary floor would be,
+# but no-canaries.yml already sets canaries: 0, so canary_watch_time is moot).
+#
+# Lowering the floor to 2s lets BOSH confirm a fast-healthy instance ~3s sooner
+# per wave. The MAX is unchanged at 20m, so a genuinely slow job still gets the
+# full safety window before BOSH gives up — only the optimistic floor moves.
+#
+# Lab-only: a production foundation should keep the stock 5s floor to avoid
+# declaring an instance healthy before its jobs have settled under load.
+# Rollback: drop this -o from scripts/cf deploy.
+
+- type: replace
+  path: /update/update_watch_time
+  value: 2000-1200000

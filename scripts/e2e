@@ -214,6 +214,18 @@ class Reporter:
             f"{bar} [{ts()}] {title}  (cumulative {fmt_hms(self._cum())}) {bar}"
         ))
 
+    def end_section(self) -> None:
+        """Public: close the currently open section (record its elapsed + print
+        the footer) without opening a new one. Used before recording a
+        concurrently-measured section so PHASE TIMINGS stays in run order."""
+        self._finish_section()
+
+    def record_section(self, title: str, elapsed: float) -> None:
+        """Append a section whose elapsed was measured outside the live
+        section() timer — e.g. a phase that ran concurrently with another in a
+        background thread. Does not touch the live-section bookkeeping."""
+        self.sections.append((title, elapsed))
+
     def begin(self, name: str) -> None:
         print(self.color.bold(f"==> [{ts()}] {name}"))
 
@@ -366,11 +378,17 @@ def exec_stream(
     cwd: Path,
     timeout: int | None,
     dry_run: bool,
+    live: bool = True,
 ) -> tuple[int, list[str]]:
     """Run argv, streaming combined stdout/stderr live while keeping a tail.
 
     Returns (returncode, tail_lines). In dry-run, prints the command and
     returns (0, []).
+
+    When ``live`` is False the child's output is NOT written to stdout as it
+    arrives — it is buffered and returned in full (not truncated to the tail).
+    This lets a background phase run concurrently with a live foreground phase
+    without interleaving their output; the caller replays the buffer afterward.
     """
     printable = " ".join(argv)
     if dry_run:
@@ -382,6 +400,7 @@ def exec_stream(
         full_env.update(env)
 
     tail: collections.deque[str] = collections.deque(maxlen=TAIL_LINES)
+    buffered: list[str] = []
     try:
         proc = subprocess.Popen(
             argv,
@@ -421,7 +440,10 @@ def exec_stream(
 
     try:
         for line in proc.stdout:
-            sys.stdout.write("    | " + line)
+            if live:
+                sys.stdout.write("    | " + line)
+            else:
+                buffered.append(line.rstrip("\n"))
             tail.append(line.rstrip("\n"))
         rc = proc.wait()
     except KeyboardInterrupt:
@@ -432,10 +454,11 @@ def exec_stream(
         if watcher is not None:
             watcher.join(timeout=1)
 
+    out = buffered if not live else list(tail)
     if timed_out.is_set():
-        tail.append(f"TIMEOUT after {timeout}s — process killed")
-        return 124, list(tail)
-    return rc, list(tail)
+        out.append(f"TIMEOUT after {timeout}s — process killed")
+        return 124, out
+    return rc, out
 
 
 class Runner:
@@ -683,6 +706,79 @@ class E2E:
         ok, _ = self.runner.step("artifacts:bootstrap", [ARTIFACTS, "bootstrap"], timeout=900)
         return ok
 
+    # -- lifecycle + artifacts, run concurrently --------------------------- #
+
+    def run_lifecycle_with_artifacts(self) -> bool:
+        """Run the lifecycle test and the artifacts VM bootstrap concurrently.
+
+        The two phases touch disjoint resources — the lifecycle CPI test creates
+        its VM on vmbr0 (ci/integration.yml), while the artifacts VM lives on the
+        cpitest SDN at .11 — so they can overlap with no contention. The artifacts
+        bootstrap (~27s) is the shorter of the two, so it hides entirely behind the
+        lifecycle test (~2m46s), reclaiming its wall-clock from the critical path.
+
+        The artifacts bootstrap runs in a background thread with its output
+        buffered (live=False) so it does not interleave with the lifecycle test's
+        live stream; its buffered output is replayed and recorded after lifecycle
+        completes. When --with-artifacts is not set, this is just lifecycle().
+        """
+        art = self._start_artifacts_bg()
+        life_ok = self.lifecycle()
+        art_ok = self._finish_artifacts_bg(art)
+        return life_ok and art_ok
+
+    def _start_artifacts_bg(self) -> dict | None:
+        """Launch the artifacts VM bootstrap in a daemon thread. Returns a handle
+        dict (or None when --with-artifacts is off)."""
+        if not getattr(self.args, "with_artifacts", False):
+            return None
+        handle: dict = {"t0": time.monotonic(), "rc": None, "out": [], "elapsed": 0.0}
+
+        def _run() -> None:
+            merged = dict(self.runner.base_env)
+            rc, out = exec_stream(
+                [ARTIFACTS, "bootstrap"], env=merged, cwd=REPO_ROOT,
+                timeout=900, dry_run=self.dry_run, live=False,
+            )
+            handle["rc"] = rc
+            handle["out"] = out
+            handle["elapsed"] = time.monotonic() - handle["t0"]
+
+        th = threading.Thread(target=_run, daemon=True)
+        th.start()
+        handle["thread"] = th
+        return handle
+
+    def _finish_artifacts_bg(self, handle: dict | None) -> bool:
+        """Join the background artifacts bootstrap, replay its buffered output
+        under its own section header, and record the step + a concurrent section."""
+        if handle is None:
+            return True
+        handle["thread"].join()
+        elapsed = handle.get("elapsed") or (time.monotonic() - handle["t0"])
+        rc = handle["rc"]
+        out = handle["out"]
+        # Close the lifecycle section first so PHASE TIMINGS lists it before
+        # the (concurrently-run) artifacts section.
+        self.rep.end_section()
+        bar = "=" * 18
+        title = "bootstrap: artifacts VM (RustFS)"
+        print()
+        print(self.rep.color.bold(
+            f"{bar} [{ts()}] {title} — ran concurrently with lifecycle {bar}"
+        ))
+        for line in out:
+            print(self.rep.color.dim("    | " + line))
+        ok = rc == 0
+        if ok:
+            self.rep.record("artifacts:bootstrap", PASS, elapsed)
+        else:
+            self.rep.record(
+                "artifacts:bootstrap", FAIL, elapsed, f"exit {rc}", out[-TAIL_LINES:]
+            )
+        self.rep.record_section(title, elapsed)
+        return ok
+
     # -- bootstrap: director ---------------------------------------------- #
 
     def bootstrap_director(self) -> bool:
@@ -916,8 +1012,7 @@ def run_command(args: argparse.Namespace, rep: Reporter) -> bool:
         if not e2e.preflight(need_director=True, need_cf=True, need_cpi=True):
             return False
         return (
-            e2e.lifecycle()
-            and e2e.artifacts_bootstrap()
+            e2e.run_lifecycle_with_artifacts()
             and e2e.bootstrap_director()
             and e2e.cf_deploy()
             and e2e.cf_push()

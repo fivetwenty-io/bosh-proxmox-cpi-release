@@ -32,6 +32,10 @@ instance_groups:
 update:
   canaries:          1
   max_in_flight:     1
-  canary_watch_time: 5000-30000
-  update_watch_time: 5000-30000
+  # Trimmed watch-time floors (5s -> 2s): the single jobless instance reports
+  # healthy as soon as the agent is up, so the 5s floor is dead time. MAX
+  # window unchanged. The step is dominated by the stemcell clone + agent
+  # handshake, so this is a marginal (few-second) trim.
+  canary_watch_time: 2000-30000
+  update_watch_time: 2000-30000
   serial:            true

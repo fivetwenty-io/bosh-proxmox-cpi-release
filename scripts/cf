@@ -876,6 +876,9 @@ def cmd_bosh_deploy(extra: list[str]) -> None:
         # let diego-cell's two instances update in one wave. Layered after
         # ops-serialize-deploy.yml/no-canaries.yml so the per-group overrides win.
         "-o", "manifests/cf/ops-deserialize-igs.yml",
+        # Trim the update_watch_time floor (5s -> 2s) so BOSH confirms a
+        # fast-healthy instance sooner per wave; MAX window unchanged. Lab-only.
+        "-o", "manifests/cf/ops-update-watchtime.yml",
         # Pin the deployment stemcell to the standardized ubuntu-noble light
         # stemcell uploaded by cmd_stemcell (matched by os+version).
         "-o", "manifests/cf/ops-light-stemcell.yml",
