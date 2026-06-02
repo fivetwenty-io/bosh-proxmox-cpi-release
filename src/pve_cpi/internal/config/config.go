@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"strings"
 
+	"github.com/fivetwenty-io/bosh-pve-cpi/internal/cpi/hooks"
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
 )
@@ -303,6 +304,25 @@ type CPIConfig struct {
 	// an explicit false. Use EnsureNoIPConflictsEnabled() to obtain the effective
 	// bool. Validate-only-when-set; omit from ERB output when nil.
 	EnsureNoIPConflicts *bool `json:"ensure_no_ip_conflicts,omitempty"`
+
+	// VMFirewall sets PVE's per-NIC firewall flag (firewall=1) on every NIC of
+	// newly created VMs. When nil/false (default), NICs are created without the
+	// flag — byte-identical to prior releases. A per-NIC network cloud property
+	// (cloud_properties.firewall: true|false) overrides this global default for
+	// that NIC. The NIC flag alone does not activate packet filtering: PVE also
+	// requires the VM-level firewall to be enabled, which the security_groups
+	// cloud property does. Pointer-typed so an explicit false survives JSON
+	// omission. Use VMFirewallEnabled() for the effective bool. Omit from ERB
+	// when nil; emit only when true.
+	VMFirewall *bool `json:"vm_firewall,omitempty"`
+
+	// Hooks names the built-in dispatch middleware hooks to activate, applied in
+	// listed order. Each name must resolve in the hook registry
+	// (internal/cpi/hooks; currently "audit_log"). When empty (default),
+	// dispatch runs with no middleware — byte-identical to prior releases and
+	// zero per-call overhead. Validated against the registry: an unknown name
+	// fails config validation at startup. Use HooksValue() to read.
+	Hooks []string `json:"hooks,omitempty"`
 }
 
 // PlacementConfig holds all availability-aware node-selection knobs.
@@ -336,6 +356,12 @@ type PlacementConfig struct {
 	// the VM's BOSH instance group (scheduler-soft spreading). UseHaRules adds
 	// PVE-enforced negative HA affinity rules on top (opt-in within opt-in).
 	AntiAffinity *AntiAffinityConfig `json:"anti_affinity,omitempty"`
+
+	// DLB holds the PVE 9.2+ Dynamic Load Balancer integration knobs. Pointer-
+	// typed so a fully-absent block (nil) means DLB is off with zero regression
+	// for existing configurations. Use DLBExplicitlyEnabled(), DLBAZName(), and
+	// related accessors rather than reading this pointer directly.
+	DLB *DLBConfig `json:"dlb,omitempty"`
 }
 
 // AntiAffinityConfig holds the Tier-2 same-group spreading knobs.
@@ -355,6 +381,67 @@ type AntiAffinityConfig struct {
 	// Note: HA-managed resources interact with the BOSH resurrector; enable
 	// only when PVE-level enforcement is desired.
 	UseHaRules *bool `json:"use_ha_rules,omitempty"`
+
+	// Strict controls whether the PVE HA negative resource-affinity rule is
+	// set to strict mode. Default false (soft/advisory). When true, PVE refuses
+	// to start or migrate a VM onto a node that already hosts another member of
+	// the same HA group — this provides hard enforcement at the cost of reduced
+	// scheduler flexibility. WARNING: strict=true on a small cluster (two or
+	// three nodes) can prevent PVE from evacuating a faulting node because no
+	// other node satisfies every strict negative rule simultaneously. Enable
+	// only when the cluster is large enough to absorb the constraint. Has no
+	// effect unless UseHaRules is also true.
+	Strict *bool `json:"strict,omitempty"`
+}
+
+// DLBConfig holds the PVE 9.2+ Dynamic Load Balancer integration knobs.
+// All fields are pointer-typed so nil means "use the documented default" and
+// an absent placement.dlb block (nil DLB pointer on PlacementConfig) means
+// DLB is fully off with zero regression on existing configurations.
+// Defaults live in the accessor methods — ApplyDefaults does NOT materialize
+// this block or any of its fields.
+type DLBConfig struct {
+	// Enabled is the master override that marks all VMs for DLB registration
+	// regardless of their availability_zone. Default false (opt-in). When true,
+	// every VM created by this CPI instance (except Director/bootstrap, which
+	// use a separate cpi.json) is registered as a PVE HA resource with
+	// auto-rebalance=1 so CRS/DLB places and continuously rebalances it.
+	// Setting Enabled=true does not conflict with operator AZ topologies: the
+	// CPI still restricts initial placement to the AZ candidate set when
+	// AZMap is configured; DLB rebalances within the allowed nodes afterward.
+	Enabled *bool `json:"enabled,omitempty"`
+
+	// AZName is the sentinel availability-zone name that triggers DLB
+	// registration for a VM. Default "dlb". When a BOSH cloud_properties block
+	// sets availability_zone to this value, the CPI treats the VM as
+	// DLB-delegated: it skips its own node-scoring AZ restriction (any online
+	// node is a candidate) and registers the VM for DLB. Setting AZName to an
+	// explicit empty string ("") disables the sentinel mechanism entirely so
+	// only the master Enabled flag can trigger DLB. A nil pointer returns the
+	// default "dlb"; a non-nil pointer to "" is honored as "disabled".
+	AZName *string `json:"az_name,omitempty"`
+
+	// ManageClusterCRS controls whether the CPI actively ensures the PVE
+	// cluster CRS (Cluster Resource Scheduler) setting is configured for
+	// dynamic load balancing. Default false. When false (default), the CPI
+	// reads /cluster/options and logs a clear warning if crs is not set to
+	// "ha=dynamic,...", directing the operator to run:
+	//   pvesh set /cluster/options --crs ha=dynamic,...
+	// When true, the CPI calls UpdateOptions to set crs=dynamic+auto-rebalance
+	// automatically. Setting this to true writes a cluster-wide option that
+	// affects all HA guests, so it is an explicit opt-in rather than the
+	// default.
+	ManageClusterCRS *bool `json:"manage_cluster_crs,omitempty"`
+
+	// RequireSharedStorage guards DLB registration against VMs whose root disk
+	// or persistent disk resides on node-local storage. Default true. When true,
+	// a VM on local storage (dir, lvm, lvmthin, zfspool) is silently
+	// skipped for DLB registration with a debug log entry — registering such a
+	// VM for HA/DLB would cause PVE to attempt live-migration of a non-shared
+	// disk, which fails. Set to false only when all VMs are guaranteed to use
+	// shared storage (rbd, nfs, cifs, glusterfs, cephfs) and the storage type
+	// cannot be determined from the PVE API at create time.
+	RequireSharedStorage *bool `json:"require_shared_storage,omitempty"`
 }
 
 // PlacementWeights controls how each scoring axis contributes to the final
@@ -761,6 +848,92 @@ func (c *CPIConfig) AZCandidates(az string) ([]string, bool) {
 	return nodes, ok
 }
 
+// DLBExplicitlyEnabled reports whether the master DLB override is set to true.
+// Returns false when: c is nil, Placement is nil, Placement.DLB is nil, or
+// DLB.Enabled is nil or *false. Only an explicit *true returns true.
+// Use this to check whether ALL VMs (regardless of AZ) should be DLB-registered.
+func (c *CPIConfig) DLBExplicitlyEnabled() bool {
+	if c == nil || c.Placement == nil || c.Placement.DLB == nil || c.Placement.DLB.Enabled == nil {
+		return false
+	}
+	return *c.Placement.DLB.Enabled
+}
+
+// DLBAZName returns the sentinel availability-zone name used to trigger DLB
+// registration. When Placement.DLB is nil or DLB.AZName is nil (absent from
+// JSON), returns "dlb" (the built-in default). When DLB.AZName is a non-nil
+// pointer to an empty string (""), returns "" — the caller interprets "" as
+// "sentinel disabled". Explicit non-empty strings are returned verbatim.
+func (c *CPIConfig) DLBAZName() string {
+	if c == nil || c.Placement == nil || c.Placement.DLB == nil || c.Placement.DLB.AZName == nil {
+		return "dlb"
+	}
+	return *c.Placement.DLB.AZName
+}
+
+// DLBManageClusterCRS reports whether the CPI should actively manage the PVE
+// cluster CRS setting. Default false (nil DLB block, nil field, or *false).
+// When true, the CPI calls UpdateOptions to set crs=dynamic+auto-rebalance.
+func (c *CPIConfig) DLBManageClusterCRS() bool {
+	if c == nil || c.Placement == nil || c.Placement.DLB == nil || c.Placement.DLB.ManageClusterCRS == nil {
+		return false
+	}
+	return *c.Placement.DLB.ManageClusterCRS
+}
+
+// DLBRequireSharedStorage reports whether DLB registration must be skipped for
+// VMs on node-local storage. Default true (protective: nil DLB block or nil
+// field returns true so local-storage VMs are never accidentally DLB-registered).
+// Set RequireSharedStorage=false only when all VMs are guaranteed shared-storage.
+func (c *CPIConfig) DLBRequireSharedStorage() bool {
+	if c == nil || c.Placement == nil || c.Placement.DLB == nil || c.Placement.DLB.RequireSharedStorage == nil {
+		return true
+	}
+	return *c.Placement.DLB.RequireSharedStorage
+}
+
+// DLBEligibleForAZ reports whether a VM with the given availability_zone string
+// qualifies for DLB registration. Returns true when either:
+//   - The master flag is on (DLBExplicitlyEnabled() == true), OR
+//   - The sentinel AZ name is non-empty AND az matches it exactly.
+//
+// A nil or empty az argument never matches the sentinel (requires exact string
+// equality). When both the master flag is off and the sentinel is disabled
+// (DLBAZName() == ""), DLBEligibleForAZ always returns false.
+func (c *CPIConfig) DLBEligibleForAZ(az string) bool {
+	if c.DLBExplicitlyEnabled() {
+		return true
+	}
+	sentinel := c.DLBAZName()
+	return sentinel != "" && az == sentinel
+}
+
+// DLBConfigured reports whether the DLB block is present and carries at least
+// one active configuration (master flag true OR a non-empty sentinel AZ name).
+// Used to gate delete-time HA cleanup: when DLBConfigured() returns true, the
+// delete_vm path broadens its HA deregistration check so DLB-registered VMs
+// are cleaned up even when anti_affinity.use_ha_rules is false.
+// Returns false when: Placement is nil, DLB is nil, master flag is false/nil,
+// and AZName is nil or "". An explicit AZName="" (sentinel disabled) also
+// returns false because no VMs could have been DLB-registered via the sentinel.
+func (c *CPIConfig) DLBConfigured() bool {
+	if c == nil || c.Placement == nil || c.Placement.DLB == nil {
+		return false
+	}
+	return c.DLBExplicitlyEnabled() || c.DLBAZName() != ""
+}
+
+// AntiAffinityStrict reports whether PVE HA negative-affinity rules should be
+// created in strict mode. Default false (nil Placement, nil AntiAffinity, or
+// nil Strict pointer). When true, PVE enforces hard node-separation for HA
+// group members; see AntiAffinityConfig.Strict for the small-cluster hazard.
+func (c *CPIConfig) AntiAffinityStrict() bool {
+	if c == nil || c.Placement == nil || c.Placement.AntiAffinity == nil || c.Placement.AntiAffinity.Strict == nil {
+		return false
+	}
+	return *c.Placement.AntiAffinity.Strict
+}
+
 // EnsureNoIPConflictsEnabled returns the effective IP-conflict guard toggle.
 // nil (field absent from JSON) → true (DEC-2: protective default for static networks).
 // *false → false (operator opt-out, e.g. pure-DHCP networks).
@@ -770,6 +943,19 @@ func (c *CPIConfig) EnsureNoIPConflictsEnabled() bool {
 		return true
 	}
 	return *c.EnsureNoIPConflicts
+}
+
+// VMFirewallEnabled returns the effective global per-NIC firewall default.
+// nil (field absent from JSON) → false (no behavior change versus prior
+// releases). *false → false; *true → true.
+func (c *CPIConfig) VMFirewallEnabled() bool {
+	return c.VMFirewall != nil && *c.VMFirewall
+}
+
+// HooksValue returns the configured hook names in order, or nil when none are
+// set.
+func (c *CPIConfig) HooksValue() []string {
+	return c.Hooks
 }
 
 // Validate checks all required fields and enum constraints.
@@ -794,6 +980,7 @@ func (c *CPIConfig) ValidateWithLogger(logger *log.Logger) error {
 	c.validateRanges(&errs)
 	c.validateRegistryConfig(&errs, logger)
 	c.validatePlacement(&errs)
+	c.validateHooks(&errs)
 	if len(errs) > 0 {
 		return cpierrors.Cloud("config validation failed: %s", strings.Join(errs, "; "))
 	}
@@ -1215,6 +1402,7 @@ func emitRegistryPrivateIPWarning(logger *log.Logger, endpoint string) {
 //   - AZMap: every AZ name is non-empty (always true by map key semantics),
 //     every node name list is non-empty, every node name is non-empty.
 //   - Weights (when present): all axes ≥ 0 (negative weights invert scoring).
+//   - DLB (when present): see validateDLB.
 //
 // No PVE API calls are made; node names are not checked for cluster membership.
 func (c *CPIConfig) validatePlacement(errs *[]string) {
@@ -1252,6 +1440,39 @@ func (c *CPIConfig) validatePlacement(errs *[]string) {
 		checkWeight("cpu", w.CPU)
 		checkWeight("guest_count", w.GuestCount)
 	}
+	// DLB: validate when the sub-block is present.
+	c.validateDLB(errs)
+}
+
+// validateHooks appends an error for each configured hook name that does not
+// resolve in the built-in hook registry. Empty Hooks is valid (no middleware).
+func (c *CPIConfig) validateHooks(errs *[]string) {
+	for _, name := range c.Hooks {
+		if !hooks.Known(name) {
+			*errs = append(*errs, fmt.Sprintf(
+				"unknown hook %q; known hooks: %s", name, strings.Join(hooks.Names(), ", "),
+			))
+		}
+	}
+}
+
+// validateDLB validates the optional Placement.DLB sub-block. Skipped when
+// Placement.DLB is nil (validate-only-when-set). All DLBConfig fields are
+// optional *bool or *string with no enum or range constraints — the only
+// invariant enforced here is that, when Enabled is explicitly false and
+// AZName is explicitly "" (sentinel disabled), at least one of them must be
+// non-nil for the block to be meaningful. This is advisory only (a warning
+// path rather than a hard error) so the operator is not blocked by a
+// vacuously-empty dlb block. No error is appended for an all-nil DLB block;
+// the block is simply inert.
+func (c *CPIConfig) validateDLB(errs *[]string) {
+	if c.Placement == nil || c.Placement.DLB == nil {
+		return
+	}
+	// No numeric fields; no enum fields; AZName accepts any string including "".
+	// The Strict field on AntiAffinityConfig is a *bool — Go's type system
+	// guarantees the pointer target is a valid bool, so no additional check is
+	// needed. Nothing further to validate.
 }
 
 // redactEndpoint strips userinfo from a URL so the endpoint can be logged

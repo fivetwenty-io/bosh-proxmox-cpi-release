@@ -99,10 +99,11 @@ func ensureAntiAffinityMembership(ctx context.Context, deps Deps, groupKey strin
 	}
 
 	csv := sidsCSV(members)
+	strict := deps.Config.AntiAffinityStrict()
 
 	// 4a. No rule yet: create it.
 	if existing == nil {
-		return createNegativeRule(ctx, svc, ruleName, csv, groupKey)
+		return createNegativeRule(ctx, svc, ruleName, csv, groupKey, strict)
 	}
 
 	// 4b. Rule exists: recreate only when the membership actually changed
@@ -113,7 +114,7 @@ func ensureAntiAffinityMembership(ctx context.Context, deps Deps, groupKey strin
 	if err := svc.DeleteHaRules(ctx, ruleName); err != nil && !isHaNotFound(err) {
 		return fmt.Errorf("anti-affinity: delete rule %q for recreate: %w", ruleName, err)
 	}
-	return createNegativeRule(ctx, svc, ruleName, csv, groupKey)
+	return createNegativeRule(ctx, svc, ruleName, csv, groupKey, strict)
 }
 
 // removeAntiAffinityMembership removes a VM from any CPI-managed HA anti-affinity
@@ -156,7 +157,7 @@ func removeAntiAffinityMembership(ctx context.Context, deps Deps, vmid int, logg
 			}
 			continue
 		}
-		if err := createNegativeRule(ctx, svc, r.Rule, sidsCSV(sids), groupKey); err != nil && firstErr == nil {
+		if err := createNegativeRule(ctx, svc, r.Rule, sidsCSV(sids), groupKey, deps.Config.AntiAffinityStrict()); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
@@ -172,10 +173,12 @@ func removeAntiAffinityMembership(ctx context.Context, deps Deps, vmid int, logg
 	return firstErr
 }
 
-// createNegativeRule creates a non-strict negative resource-affinity rule.
-func createNegativeRule(ctx context.Context, svc cluster.Service, ruleName, csv, groupKey string) error {
+// createNegativeRule creates a negative resource-affinity rule. When strict is
+// true PVE enforces hard node-separation for the rule members; when false
+// (the default) the rule is advisory only. See AntiAffinityConfig.Strict for
+// the small-cluster hazard of enabling strict mode.
+func createNegativeRule(ctx context.Context, svc cluster.Service, ruleName, csv, groupKey string, strict bool) error {
 	affinity := haRuleAffinity
-	strict := false
 	comment := "BOSH anti-affinity for instance group " + groupKey
 	if err := svc.CreateHaRules(ctx, &cluster.CreateHaRulesParams{
 		Rule:      ruleName,

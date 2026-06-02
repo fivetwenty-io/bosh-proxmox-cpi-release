@@ -106,6 +106,13 @@ type createVMCloudProps struct {
 	// is absent from the map, create_vm returns a CloudError (operator
 	// misconfiguration). When empty, all online nodes are candidates.
 	AvailabilityZone string `json:"availability_zone,omitempty"`
+	// SecurityGroups names PVE cluster firewall groups
+	// (/cluster/firewall/groups) to attach to the new VM. Each group must
+	// already exist in PVE; the CPI references group content but never creates
+	// or modifies it. After attaching the groups the CPI enables the VM-level
+	// firewall so the rules take effect. A missing group is a non-retriable
+	// CloudError. Empty (default) means no firewall API calls are made.
+	SecurityGroups []string `json:"security_groups,omitempty"`
 }
 
 // createVMNetworkSpec mirrors the BOSH v2 network spec shape.
@@ -308,6 +315,20 @@ func createVM(
 	}
 
 	// -----------------------------------------------------------------------
+	// 8b. Attach firewall security groups (cloud_properties.security_groups).
+	//
+	// Validates each named PVE cluster firewall group exists, attaches it as a
+	// group-type rule, and enables the VM-level firewall. A missing group is a
+	// non-retriable CloudError; any error here triggers the create_vm rollback
+	// (the VM is destroyed) so a half-firewalled VM is never left behind.
+	// -----------------------------------------------------------------------
+	if len(parsed.cloudProps.SecurityGroups) > 0 {
+		if fwErr := applySecurityGroups(ctx, deps, shape.node, vmid, parsed.cloudProps.SecurityGroups, logger); fwErr != nil {
+			return nil, fwErr
+		}
+	}
+
+	// -----------------------------------------------------------------------
 	// 9. PVE HA anti-affinity membership (opt-in: anti_affinity.use_ha_rules).
 	//
 	// Best-effort and non-fatal: HA being unconfigured, or any rule-write
@@ -320,6 +341,22 @@ func createVM(
 				logger.Warn("create_vm: HA anti-affinity membership not fully applied (non-fatal)",
 					log.Int("vmid", vmid), log.String("group", groupKey), log.Err(aaErr))
 			}
+		}
+	}
+
+	// -----------------------------------------------------------------------
+	// 10. PVE Dynamic Load Balancer membership (opt-in: placement.dlb).
+	//
+	// Best-effort and non-fatal. When the VM is DLB-eligible (master flag or
+	// sentinel AZ) it is registered as a PVE HA resource with auto-rebalance so
+	// the 9.2 CRS dynamic load balancer places and rebalances it. All guards
+	// (PVE>=9.2, multi-node, shared storage) live in ensureDLBMembership; any
+	// failure is logged and never fails create_vm.
+	// -----------------------------------------------------------------------
+	if deps.Config.DLBEligibleForAZ(parsed.cloudProps.AvailabilityZone) {
+		if dlbErr := ensureDLBMembership(ctx, deps, vmid, parsed.cloudProps.AvailabilityZone, logger); dlbErr != nil {
+			logger.Warn("create_vm: DLB membership not fully applied (non-fatal)",
+				log.Int("vmid", vmid), log.Err(dlbErr))
 		}
 	}
 
@@ -521,18 +558,29 @@ func resolveTargetNode(ctx context.Context, deps Deps, cp createVMCloudProps, gr
 		if az != "" {
 			nodes, ok := deps.Config.AZCandidates(az)
 			if !ok {
-				// AZ key present in cloud_properties but absent from az_map → misconfiguration.
-				return "", cpierrors.Cloud(
-					"create_vm: availability_zone %q is not defined in placement.az_map; "+
-						"add the AZ to config.placement.az_map or remove availability_zone from cloud_properties",
-					az,
+				// Sentinel DLB AZ: not a real az_map zone — delegate placement to the
+				// PVE Dynamic Load Balancer. Use all online nodes as candidates; the
+				// scorer picks an initial landing node and CRS/DLB rebalances later.
+				if az == deps.Config.DLBAZName() && deps.Config.DLBAZName() != "" {
+					logger.Debug("create_vm: node selection: DLB sentinel AZ — candidates = all online nodes",
+						log.String("az", az),
+					)
+					// leave candidateSet nil (all nodes); do NOT error
+				} else {
+					// AZ key present in cloud_properties but absent from az_map → misconfiguration.
+					return "", cpierrors.Cloud(
+						"create_vm: availability_zone %q is not defined in placement.az_map; "+
+							"add the AZ to config.placement.az_map or remove availability_zone from cloud_properties",
+						az,
+					)
+				}
+			} else {
+				candidateSet = nodes
+				logger.Debug("create_vm: node selection: AZ candidate set",
+					log.String("az", az),
+					log.String("candidates", strings.Join(candidateSet, ",")),
 				)
 			}
-			candidateSet = nodes
-			logger.Debug("create_vm: node selection: AZ candidate set",
-				log.String("az", az),
-				log.String("candidates", strings.Join(candidateSet, ",")),
-			)
 		}
 
 		// Gather live cluster facts. GroupTag (non-empty only when anti-affinity
@@ -1459,6 +1507,18 @@ func configureNICs(
 
 		// net0 = "virtio,bridge=vmbr0" (no MAC — PVE assigns one)
 		netMap[i] = fmt.Sprintf("%s,bridge=%s", model, bridge)
+
+		// Per-NIC firewall flag. The network cloud_property "firewall" (bool)
+		// overrides the global cfg.VMFirewallEnabled() default for this NIC.
+		// firewall=1 on the NIC alone does not activate filtering — the
+		// VM-level firewall must also be enabled (see applySecurityGroups).
+		nicFirewall := deps.Config.VMFirewallEnabled()
+		if cp, ok := spec.CloudProperties["firewall"].(bool); ok {
+			nicFirewall = cp
+		}
+		if nicFirewall {
+			netMap[i] += ",firewall=1"
+		}
 
 		// ipconfig: dynamic → dhcp; manual → ip=<cidr>,gw=<gw>
 		switch strings.ToLower(spec.Type) {

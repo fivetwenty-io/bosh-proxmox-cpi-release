@@ -140,6 +140,12 @@ type vmMockNodes struct {
 
 	updateConfigFn func(ctx context.Context, node, vmid string, params *sdknodes.UpdateQemuConfigParams) error
 	deleteQemuFn   func(ctx context.Context, node, vmid string, params *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error)
+	// listVersionFn, when non-nil, is called by ListVersion. Tests that exercise
+	// ensureDLBMembership set this to control the PVE version reported. When nil,
+	// ListVersion returns a response with version "0.0" so the DLB version guard
+	// (PVE >= 9.2) causes ensureDLBMembership to skip silently — keeping tests
+	// that do not focus on DLB membership from being polluted by DLB side-effects.
+	listVersionFn func(ctx context.Context, node string) (*sdknodes.ListVersionResponse, error)
 	// CreateQemuCloneFn, when non-nil, is called by CreateQemuClone instead of
 	// the panic default. Clone-path tests set this to capture params and return
 	// a UPID. Import-only tests leave it nil so an unexpected call panics.
@@ -216,6 +222,17 @@ func (m *vmMockNodes) ListStorage(ctx context.Context, node string, params *sdkn
 	}
 	empty := sdknodes.ListStorageResponse{}
 	return &empty, nil
+}
+
+// ListVersion returns version "0.0" when listVersionFn is nil, causing the DLB
+// version guard (PVE >= 9.2) to skip ensureDLBMembership silently. Tests that
+// focus on DLB membership behavior set listVersionFn explicitly.
+func (m *vmMockNodes) ListVersion(ctx context.Context, node string) (*sdknodes.ListVersionResponse, error) {
+	if m.listVersionFn != nil {
+		return m.listVersionFn(ctx, node)
+	}
+	v := "0.0"
+	return &sdknodes.ListVersionResponse{Version: v}, nil
 }
 
 // vmMockCluster satisfies cluster.Service for create_vm tests.
@@ -2625,5 +2642,137 @@ func TestCreateVM_IPConflict_NoSelfConflict(t *testing.T) {
 	// VM must have booted — the conflict check did not abort the flow.
 	if len(q.startCalls) != 1 {
 		t.Errorf("expected 1 Start call (VM boots normally), got %d", len(q.startCalls))
+	}
+}
+
+// TestCreateVM_DLBSentinelAZ_AllNodesCandidate verifies that when
+// availability_zone equals the sentinel DLB AZ name ("dlb") and it is absent
+// from az_map, resolveTargetNode does NOT return a CloudError and instead uses
+// all online nodes as candidates (candidateSet = nil path). The VM is created
+// on whichever node the scorer chooses.
+func TestCreateVM_DLBSentinelAZ_AllNodesCandidate(t *testing.T) {
+	t.Parallel()
+
+	var createNode string
+	q := &vmMockQEMU{
+		createFn: func(_ context.Context, node string, _ map[string]any) (string, error) {
+			createNode = node
+			return "UPID:pve:dlb-sentinel:ok", nil
+		},
+	}
+	n := &vmMockNodes{}
+	a := &vmMockAgent{}
+
+	// Cluster has a single node "pve"; az_map does NOT contain "dlb".
+	// DLBAZName is the default "dlb" (nil pointer → default).
+	deps := buildVMDepsPlacement(q, n, listStatusSingleNode(), emptyListResources, a, func(c *config.CPIConfig) {
+		c.Node = "pve"
+		c.Placement = &config.PlacementConfig{
+			// AZMap intentionally omits "dlb" — the sentinel must not trigger CloudError.
+			AZMap: map[string][]string{
+				"zone-a": {"pve"},
+			},
+			// DLB block: AZName nil → accessor returns default "dlb".
+			DLB: &config.DLBConfig{},
+		}
+		c.EnsureNoIPConflicts = placementDisabled
+	})
+	h := handlers.HandleCreateVM(deps)
+
+	args := mkArgs("agent-dlb-sentinel", testStemcellCID,
+		map[string]any{"availability_zone": "dlb"},
+		map[string]any{"default": map[string]any{"type": "dynamic", "cloud_properties": map[string]any{}}},
+		[]string{}, map[string]any{})
+
+	if _, err := h.Handle(context.Background(), args, mkCtx("dlb-sentinel")); err != nil {
+		t.Fatalf("DLB sentinel AZ must not return an error: %v", err)
+	}
+	if createNode == "" {
+		t.Errorf("expected a node to be chosen; got empty string")
+	}
+}
+
+// TestCreateVM_UnknownAZ_NotSentinel_CloudError verifies that specifying an AZ
+// that is neither the sentinel DLB AZ nor present in az_map still returns a
+// CloudError (unchanged behavior for non-DLB unknown AZs).
+func TestCreateVM_UnknownAZ_NotSentinel_CloudError(t *testing.T) {
+	t.Parallel()
+
+	n := &vmMockNodes{}
+	a := &vmMockAgent{}
+
+	// ListStatus must not be reached — AZ validation fires before GatherNodeFacts.
+	panicStatus := func(_ context.Context) (*sdkcluster.ListStatusResponse, error) {
+		panic("ListStatus must not be called before AZ validation fails")
+	}
+	deps := buildVMDepsPlacement(&vmMockQEMU{}, n, panicStatus, emptyListResources, a, func(c *config.CPIConfig) {
+		c.Placement = &config.PlacementConfig{
+			AZMap: map[string][]string{
+				"zone-a": {"pve"},
+			},
+			// DLB sentinel is "dlb"; "unknownzone" is not sentinel → must error.
+			DLB: &config.DLBConfig{},
+		}
+		c.EnsureNoIPConflicts = placementDisabled
+	})
+	h := handlers.HandleCreateVM(deps)
+
+	args := mkArgs("agent-badaz2", testStemcellCID,
+		map[string]any{"availability_zone": "unknownzone"},
+		map[string]any{"default": map[string]any{"type": "dynamic", "cloud_properties": map[string]any{}}},
+		[]string{}, map[string]any{})
+
+	_, err := h.Handle(context.Background(), args, mkCtx("unknown-az-not-sentinel"))
+	if err == nil {
+		t.Fatal("expected CloudError for unknown non-sentinel AZ, got nil")
+	}
+	if !isCloudError(err) {
+		t.Errorf("expected *cpierrors.Error, got %T: %v", err, err)
+	}
+	if !strings.Contains(err.Error(), "unknownzone") {
+		t.Errorf("error must mention the unknown AZ name; got: %v", err)
+	}
+}
+
+// TestCreateVM_RealAZMap_Restricted_WithDLBConfigured verifies that when DLB is
+// configured but a real az_map zone is used, placement scoring still restricts
+// candidates to mapped nodes (master-flag-on + AZ topology unchanged).
+func TestCreateVM_RealAZMap_Restricted_WithDLBConfigured(t *testing.T) {
+	t.Parallel()
+
+	var createNode string
+	q := &vmMockQEMU{
+		createFn: func(_ context.Context, node string, _ map[string]any) (string, error) {
+			createNode = node
+			return "UPID:pve2:az-dlb:ok", nil
+		},
+	}
+	n := &vmMockNodes{}
+	a := &vmMockAgent{}
+
+	// Cluster: pve1 and pve2; AZ "zone-b" maps only to pve2.
+	// DLB configured (AZName = "dlb"); real AZ must still restrict to az_map nodes.
+	deps := buildVMDepsPlacement(q, n, listStatusTwoNodes(), emptyListResources, a, func(c *config.CPIConfig) {
+		c.Node = "pve1"
+		c.Placement = &config.PlacementConfig{
+			AZMap: map[string][]string{
+				"zone-b": {"pve2"},
+			},
+			DLB: &config.DLBConfig{},
+		}
+		c.EnsureNoIPConflicts = placementDisabled
+	})
+	h := handlers.HandleCreateVM(deps)
+
+	args := mkArgs("agent-realaz-dlb", testStemcellCID,
+		map[string]any{"availability_zone": "zone-b"},
+		map[string]any{"default": map[string]any{"type": "dynamic", "cloud_properties": map[string]any{}}},
+		[]string{}, map[string]any{})
+
+	if _, err := h.Handle(context.Background(), args, mkCtx("realaz-with-dlb")); err != nil {
+		t.Fatalf("expected success with real AZ and DLB configured, got: %v", err)
+	}
+	if createNode != "pve2" {
+		t.Errorf("expected pve2 (only node in zone-b), got %q", createNode)
 	}
 }

@@ -86,14 +86,16 @@ func HandleDeleteVM(deps Deps) cpi.Handler {
 			return nil, guardErr
 		}
 
-		// --- HA anti-affinity cleanup (opt-in: anti_affinity.use_ha_rules) ---
+		// --- HA anti-affinity / DLB cleanup (opt-in: anti_affinity.use_ha_rules or placement.dlb) ---
 		// Remove the VM from any CPI-managed negative-affinity rule and
-		// deregister its HA resource before destroying it. Keyed on vmid (the
-		// group name is unavailable at delete time). Best-effort: HA failures
-		// are logged and never block VM deletion.
-		if deps.Config.AntiAffinityUseHaRulesEnabled() {
+		// deregister its HA resource before destroying it. Also covers DLB-only
+		// VMs: removeAntiAffinityMembership purges the HA resource and prunes any
+		// associated rules; for a DLB-only VM with no affinity rule it simply
+		// deregisters the HA resource. Keyed on vmid (the group name is unavailable
+		// at delete time). Best-effort: HA failures are logged and never block VM deletion.
+		if deps.Config.AntiAffinityUseHaRulesEnabled() || deps.Config.DLBConfigured() {
 			if aaErr := removeAntiAffinityMembership(ctx, deps, vmid, logger); aaErr != nil {
-				logger.Warn("delete_vm: HA anti-affinity cleanup incomplete (non-fatal)", log.Err(aaErr))
+				logger.Warn("delete_vm: HA anti-affinity/DLB cleanup incomplete (non-fatal)", log.Err(aaErr))
 			}
 		}
 

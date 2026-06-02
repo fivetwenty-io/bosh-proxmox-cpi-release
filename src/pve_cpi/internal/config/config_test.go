@@ -3031,3 +3031,405 @@ func TestEnsureNoIPConflictsEnabled_ExplicitFalseFromJSON(t *testing.T) {
 		t.Error("EnsureNoIPConflictsEnabled() = true with explicit false in JSON, want false")
 	}
 }
+
+// --------------------------------------------------------------------------
+// DLB config accessor tests
+// --------------------------------------------------------------------------
+
+// stringPtr returns a pointer to s, for constructing *string fields in test literals.
+func stringPtr(s string) *string { return &s }
+
+// TestDLB_NilEverything verifies all DLB accessors return safe defaults when
+// both Placement and DLB are nil. This is the zero-regression path: existing
+// configs with no placement block must behave identically to before.
+func TestDLB_NilEverything(t *testing.T) {
+	t.Parallel()
+	var cfg config.CPIConfig
+
+	if cfg.DLBExplicitlyEnabled() {
+		t.Error("DLBExplicitlyEnabled() = true with nil Placement, want false")
+	}
+	if got := cfg.DLBAZName(); got != "dlb" {
+		t.Errorf("DLBAZName() = %q with nil Placement, want %q", got, "dlb")
+	}
+	if cfg.DLBManageClusterCRS() {
+		t.Error("DLBManageClusterCRS() = true with nil Placement, want false")
+	}
+	if !cfg.DLBRequireSharedStorage() {
+		t.Error("DLBRequireSharedStorage() = false with nil Placement, want true (protective default)")
+	}
+	if cfg.DLBConfigured() {
+		t.Error("DLBConfigured() = true with nil Placement, want false")
+	}
+	// Sentinel default is "dlb", so DLBEligibleForAZ("dlb") must return true via sentinel.
+	if !cfg.DLBEligibleForAZ("dlb") {
+		t.Error("DLBEligibleForAZ(\"dlb\") = false with nil Placement, want true (sentinel default matches)")
+	}
+	// Non-sentinel AZ must not match.
+	if cfg.DLBEligibleForAZ("z1") {
+		t.Error("DLBEligibleForAZ(\"z1\") = true with nil Placement, want false")
+	}
+	if cfg.AntiAffinityStrict() {
+		t.Error("AntiAffinityStrict() = true with nil Placement, want false")
+	}
+}
+
+// TestDLB_NilDLBBlock verifies all DLB accessors return safe defaults when
+// Placement is present but DLB is nil.
+func TestDLB_NilDLBBlock(t *testing.T) {
+	t.Parallel()
+	cfg := config.CPIConfig{
+		Placement: &config.PlacementConfig{},
+	}
+
+	if cfg.DLBExplicitlyEnabled() {
+		t.Error("DLBExplicitlyEnabled() = true with nil DLB, want false")
+	}
+	if got := cfg.DLBAZName(); got != "dlb" {
+		t.Errorf("DLBAZName() = %q with nil DLB, want %q (default sentinel)", got, "dlb")
+	}
+	if cfg.DLBManageClusterCRS() {
+		t.Error("DLBManageClusterCRS() = true with nil DLB, want false")
+	}
+	if !cfg.DLBRequireSharedStorage() {
+		t.Error("DLBRequireSharedStorage() = false with nil DLB, want true")
+	}
+	if cfg.DLBConfigured() {
+		t.Error("DLBConfigured() = true with nil DLB, want false")
+	}
+	if !cfg.DLBEligibleForAZ("dlb") {
+		t.Error("DLBEligibleForAZ(\"dlb\") = false with nil DLB and default sentinel, want true")
+	}
+	if cfg.DLBEligibleForAZ("z1") {
+		t.Error("DLBEligibleForAZ(\"z1\") = true with nil DLB, want false")
+	}
+}
+
+// TestDLB_EnabledTrue verifies the master flag: DLBExplicitlyEnabled true,
+// DLBEligibleForAZ true for ANY az, DLBConfigured true.
+func TestDLB_EnabledTrue(t *testing.T) {
+	t.Parallel()
+	cfg := config.CPIConfig{
+		Placement: &config.PlacementConfig{
+			DLB: &config.DLBConfig{
+				Enabled: boolPtr(true),
+			},
+		},
+	}
+
+	if !cfg.DLBExplicitlyEnabled() {
+		t.Error("DLBExplicitlyEnabled() = false with *true, want true")
+	}
+	if !cfg.DLBEligibleForAZ("z1") {
+		t.Error("DLBEligibleForAZ(\"z1\") = false with master Enabled=true, want true (master overrides)")
+	}
+	if !cfg.DLBEligibleForAZ("dlb") {
+		t.Error("DLBEligibleForAZ(\"dlb\") = false with master Enabled=true, want true")
+	}
+	if !cfg.DLBEligibleForAZ("") {
+		t.Error("DLBEligibleForAZ(\"\") = false with master Enabled=true, want true (master catches all)")
+	}
+	if !cfg.DLBConfigured() {
+		t.Error("DLBConfigured() = false with DLB block present and Enabled=true, want true")
+	}
+}
+
+// TestDLB_AZNameExplicitEmpty verifies that AZName="" (explicit pointer-to-empty)
+// disables the sentinel: DLBAZName returns "", sentinel is disabled.
+func TestDLB_AZNameExplicitEmpty(t *testing.T) {
+	t.Parallel()
+	cfg := config.CPIConfig{
+		Placement: &config.PlacementConfig{
+			DLB: &config.DLBConfig{
+				AZName: stringPtr(""),
+			},
+		},
+	}
+
+	if got := cfg.DLBAZName(); got != "" {
+		t.Errorf("DLBAZName() = %q with explicit empty string, want %q (sentinel disabled)", got, "")
+	}
+	// Sentinel disabled: DLBEligibleForAZ("dlb") must be false (not master-enabled either).
+	if cfg.DLBEligibleForAZ("dlb") {
+		t.Error("DLBEligibleForAZ(\"dlb\") = true with sentinel disabled (AZName=\"\"), want false")
+	}
+	if cfg.DLBEligibleForAZ("") {
+		t.Error("DLBEligibleForAZ(\"\") = true with sentinel disabled, want false")
+	}
+	// DLBConfigured: DLB block is present but Enabled is nil/false AND AZName is "".
+	// No VMs could have been registered — return false.
+	if cfg.DLBConfigured() {
+		t.Error("DLBConfigured() = true with DLB present but Enabled nil and AZName empty, want false")
+	}
+}
+
+// TestDLB_AZNameCustom verifies a custom sentinel AZ name matches correctly.
+func TestDLB_AZNameCustom(t *testing.T) {
+	t.Parallel()
+	cfg := config.CPIConfig{
+		Placement: &config.PlacementConfig{
+			DLB: &config.DLBConfig{
+				AZName: stringPtr("dlbzone"),
+			},
+		},
+	}
+
+	if got := cfg.DLBAZName(); got != "dlbzone" {
+		t.Errorf("DLBAZName() = %q, want %q", got, "dlbzone")
+	}
+	if !cfg.DLBEligibleForAZ("dlbzone") {
+		t.Error("DLBEligibleForAZ(\"dlbzone\") = false with AZName=dlbzone, want true")
+	}
+	// Default sentinel name "dlb" must NOT match when overridden.
+	if cfg.DLBEligibleForAZ("dlb") {
+		t.Error("DLBEligibleForAZ(\"dlb\") = true with AZName=dlbzone, want false")
+	}
+	if cfg.DLBEligibleForAZ("z1") {
+		t.Error("DLBEligibleForAZ(\"z1\") = true with AZName=dlbzone, want false")
+	}
+	if !cfg.DLBConfigured() {
+		t.Error("DLBConfigured() = false with DLB present and non-empty AZName, want true")
+	}
+}
+
+// TestDLB_RequireSharedStorageFalse verifies the explicit false override.
+func TestDLB_RequireSharedStorageFalse(t *testing.T) {
+	t.Parallel()
+	cfg := config.CPIConfig{
+		Placement: &config.PlacementConfig{
+			DLB: &config.DLBConfig{
+				RequireSharedStorage: boolPtr(false),
+			},
+		},
+	}
+
+	if cfg.DLBRequireSharedStorage() {
+		t.Error("DLBRequireSharedStorage() = true with explicit *false, want false")
+	}
+}
+
+// TestDLB_ManageClusterCRSTrue verifies the explicit true override.
+func TestDLB_ManageClusterCRSTrue(t *testing.T) {
+	t.Parallel()
+	cfg := config.CPIConfig{
+		Placement: &config.PlacementConfig{
+			DLB: &config.DLBConfig{
+				ManageClusterCRS: boolPtr(true),
+			},
+		},
+	}
+
+	if !cfg.DLBManageClusterCRS() {
+		t.Error("DLBManageClusterCRS() = false with explicit *true, want true")
+	}
+}
+
+// TestDLB_AntiAffinityStrict verifies Strict accessor reads from AntiAffinityConfig.
+func TestDLB_AntiAffinityStrict(t *testing.T) {
+	t.Parallel()
+
+	t.Run("nil AntiAffinity → false", func(t *testing.T) {
+		var cfg config.CPIConfig
+		if cfg.AntiAffinityStrict() {
+			t.Error("AntiAffinityStrict() = true with nil everything, want false")
+		}
+	})
+
+	t.Run("Strict nil → false", func(t *testing.T) {
+		cfg := config.CPIConfig{
+			Placement: &config.PlacementConfig{
+				AntiAffinity: &config.AntiAffinityConfig{},
+			},
+		}
+		if cfg.AntiAffinityStrict() {
+			t.Error("AntiAffinityStrict() = true with nil Strict field, want false")
+		}
+	})
+
+	t.Run("Strict *true → true", func(t *testing.T) {
+		cfg := config.CPIConfig{
+			Placement: &config.PlacementConfig{
+				AntiAffinity: &config.AntiAffinityConfig{
+					Strict: boolPtr(true),
+				},
+			},
+		}
+		if !cfg.AntiAffinityStrict() {
+			t.Error("AntiAffinityStrict() = false with explicit *true, want true")
+		}
+	})
+
+	t.Run("Strict *false → false", func(t *testing.T) {
+		cfg := config.CPIConfig{
+			Placement: &config.PlacementConfig{
+				AntiAffinity: &config.AntiAffinityConfig{
+					Strict: boolPtr(false),
+				},
+			},
+		}
+		if cfg.AntiAffinityStrict() {
+			t.Error("AntiAffinityStrict() = true with explicit *false, want false")
+		}
+	})
+}
+
+// TestDLB_JSONRoundTrip verifies a placement.dlb JSON blob decodes into the
+// correct struct fields and all accessors return the decoded values.
+func TestDLB_JSONRoundTrip(t *testing.T) {
+	t.Parallel()
+	cfg, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+		"placement":{
+			"dlb":{
+				"enabled":true,
+				"az_name":"myzone",
+				"manage_cluster_crs":true,
+				"require_shared_storage":false
+			},
+			"anti_affinity":{
+				"strict":true
+			}
+		}
+	}`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Placement == nil {
+		t.Fatal("Placement = nil, want non-nil")
+	}
+	if cfg.Placement.DLB == nil {
+		t.Fatal("Placement.DLB = nil, want non-nil")
+	}
+
+	if !cfg.DLBExplicitlyEnabled() {
+		t.Error("DLBExplicitlyEnabled() = false, want true")
+	}
+	if got := cfg.DLBAZName(); got != "myzone" {
+		t.Errorf("DLBAZName() = %q, want %q", got, "myzone")
+	}
+	if !cfg.DLBManageClusterCRS() {
+		t.Error("DLBManageClusterCRS() = false, want true")
+	}
+	if cfg.DLBRequireSharedStorage() {
+		t.Error("DLBRequireSharedStorage() = true, want false")
+	}
+	if !cfg.DLBConfigured() {
+		t.Error("DLBConfigured() = false, want true")
+	}
+	if !cfg.DLBEligibleForAZ("myzone") {
+		t.Error("DLBEligibleForAZ(\"myzone\") = false, want true")
+	}
+	if !cfg.DLBEligibleForAZ("z1") {
+		t.Error("DLBEligibleForAZ(\"z1\") = false with master enabled=true, want true")
+	}
+	if !cfg.AntiAffinityStrict() {
+		t.Error("AntiAffinityStrict() = false, want true")
+	}
+}
+
+// TestDLB_ConfiguredGating verifies DLBConfigured edge cases for delete-time cleanup.
+func TestDLB_ConfiguredGating(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name    string
+		dlb     *config.DLBConfig
+		wantCfg bool
+	}{
+		{
+			name:    "nil DLB block",
+			dlb:     nil,
+			wantCfg: false,
+		},
+		{
+			name:    "all-nil DLB fields",
+			dlb:     &config.DLBConfig{},
+			wantCfg: true, // AZName nil → default "dlb" → non-empty → true
+		},
+		{
+			name:    "Enabled false, AZName nil",
+			dlb:     &config.DLBConfig{Enabled: boolPtr(false)},
+			wantCfg: true, // AZName nil → "dlb" → non-empty
+		},
+		{
+			name:    "Enabled false, AZName empty string",
+			dlb:     &config.DLBConfig{Enabled: boolPtr(false), AZName: stringPtr("")},
+			wantCfg: false, // both off: sentinel disabled, master off
+		},
+		{
+			name:    "Enabled true, AZName empty string",
+			dlb:     &config.DLBConfig{Enabled: boolPtr(true), AZName: stringPtr("")},
+			wantCfg: true, // master on → configured
+		},
+		{
+			name:    "Enabled nil, AZName custom",
+			dlb:     &config.DLBConfig{AZName: stringPtr("dlbzone")},
+			wantCfg: true, // sentinel non-empty → configured
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := config.CPIConfig{
+				Placement: &config.PlacementConfig{
+					DLB: tc.dlb,
+				},
+			}
+			if got := cfg.DLBConfigured(); got != tc.wantCfg {
+				t.Errorf("DLBConfigured() = %v, want %v", got, tc.wantCfg)
+			}
+		})
+	}
+}
+
+// TestDLB_ValidateDLBBlock verifies that a placement block containing a DLB
+// sub-block passes validation without error (validate-only-when-set; no
+// enum or range constraints on DLB fields).
+func TestDLB_ValidateDLBBlock(t *testing.T) {
+	t.Parallel()
+	_, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+		"placement":{
+			"dlb":{
+				"enabled":true,
+				"az_name":"",
+				"manage_cluster_crs":false,
+				"require_shared_storage":false
+			}
+		}
+	}`)
+	if err != nil {
+		t.Fatalf("DLB block with all fields set: unexpected validation error: %v", err)
+	}
+}
+
+// TestDLB_AbsentDLBBlock_NoRegression verifies that a placement block without
+// a dlb key produces no error and leaves Placement.DLB nil.
+func TestDLB_AbsentDLBBlock_NoRegression(t *testing.T) {
+	t.Parallel()
+	cfg, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+		"placement":{
+			"enabled":true,
+			"az_map":{"z1":["pve1"]}
+		}
+	}`)
+	if err != nil {
+		t.Fatalf("placement without dlb: unexpected error: %v", err)
+	}
+	if cfg.Placement == nil {
+		t.Fatal("Placement = nil, want non-nil")
+	}
+	if cfg.Placement.DLB != nil {
+		t.Error("Placement.DLB = non-nil when key absent from JSON, want nil")
+	}
+	// Accessor defaults must still work.
+	if cfg.DLBExplicitlyEnabled() {
+		t.Error("DLBExplicitlyEnabled() = true with nil DLB block, want false")
+	}
+	if got := cfg.DLBAZName(); got != "dlb" {
+		t.Errorf("DLBAZName() = %q with nil DLB block, want %q", got, "dlb")
+	}
+}

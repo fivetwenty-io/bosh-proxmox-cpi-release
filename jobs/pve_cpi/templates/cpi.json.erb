@@ -158,14 +158,56 @@
   # placement.anti_affinity: nested block, emitted only when spreading is
   # enabled. enabled=true turns on scheduler-soft spreading; use_ha_rules=true
   # additionally maintains PVE HA negative-affinity rules. Both default false.
+  # strict is emitted only when anti_affinity.enabled is true because strict has
+  # no effect when the outer HA-rules block is absent; suppressing it when the
+  # block is absent avoids a stray key that could mislead the Go config reader.
   anti_affinity = {}
   if p("pve.placement.anti_affinity.enabled", false)
     anti_affinity["enabled"] = true
     if p("pve.placement.anti_affinity.use_ha_rules", false)
       anti_affinity["use_ha_rules"] = true
     end
+    # Emit strict only when true (default false). Has no effect unless
+    # use_ha_rules is also true, but we emit whenever anti_affinity is enabled
+    # so the Go config can validate the combination and warn appropriately.
+    if p("pve.placement.anti_affinity.strict", false)
+      anti_affinity["strict"] = true
+    end
   end
   placement["anti_affinity"] = anti_affinity unless anti_affinity.empty?
+
+  # placement.dlb: PVE 9.2+ Dynamic Load Balancer integration sub-block.
+  # Emitted only when at least one DLB property deviates from its default so
+  # existing deployments that set none of these properties see zero regression
+  # (nil *DLBConfig in Go = all accessors return safe OFF defaults).
+  #
+  # Omit-when-default contract per key:
+  #   enabled                default false → emit only when true
+  #   az_name                default "dlb" → emit only when operator overrides
+  #                                          (includes explicit "" to disable sentinel)
+  #   manage_cluster_crs     default false → emit only when true
+  #   require_shared_storage default true  → emit only when explicitly false
+  dlb = {}
+  # dlb.enabled: master override; emit only when true.
+  if p("pve.placement.dlb.enabled", false)
+    dlb["enabled"] = true
+  end
+  # dlb.az_name: emit only when the operator sets a value other than the default
+  # "dlb". An explicit "" is a legitimate override (disables sentinel) and must
+  # be emitted so the Go config honors it; use != "dlb" not .empty? for this.
+  dlb_az_name = p("pve.placement.dlb.az_name", "dlb")
+  dlb["az_name"] = dlb_az_name unless dlb_az_name == "dlb"
+  # dlb.manage_cluster_crs: emit only when true (default false).
+  if p("pve.placement.dlb.manage_cluster_crs", false)
+    dlb["manage_cluster_crs"] = true
+  end
+  # dlb.require_shared_storage: emit only when explicitly false (default true).
+  # When absent or true the Go config nil *bool accessor returns true, preserving
+  # the protective default; emit false only to override it.
+  unless p("pve.placement.dlb.require_shared_storage", true)
+    dlb["require_shared_storage"] = false
+  end
+  placement["dlb"] = dlb unless dlb.empty?
 
   # placement.weights: emit only when at least one weight is overridden.
   weights = {}
@@ -180,6 +222,17 @@
   placement["weights"] = weights unless weights.empty?
 
   config["placement"] = placement unless placement.empty?
+
+  # Emit vm_firewall only when explicitly true. The Go accessor defaults
+  # nil *bool -> false (no behavior change); omitting the key preserves that.
+  if p("pve.vm_firewall", false)
+    config["vm_firewall"] = true
+  end
+
+  # Emit hooks only when the operator activates at least one. Empty (default)
+  # means no dispatch middleware and zero per-call overhead.
+  hooks = p("pve.hooks", [])
+  config["hooks"] = hooks unless hooks.nil? || hooks.empty?
 
   JSON.dump(config)
 %>

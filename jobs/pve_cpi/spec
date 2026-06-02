@@ -393,6 +393,79 @@ properties:
       enable only when PVE-level enforcement is desired. Has no effect unless
       anti_affinity.enabled is true. Default false.
     default: false
+  pve.vm_firewall:
+    description: |
+      When true, every NIC of newly created VMs is given PVE's per-NIC firewall
+      flag (firewall=1). A per-NIC network cloud_property (firewall: true|false)
+      overrides this global default for that NIC. Note: enabling the NIC flag
+      alone does not activate packet filtering — PVE also requires the VM-level
+      firewall to be enabled. The security_groups VM cloud_property enables both
+      the group rules and the VM-level firewall. Default false (no behavior
+      change).
+    default: false
+  pve.hooks:
+    description: |
+      Optional list of built-in dispatch middleware hooks to activate, applied
+      in listed order. Each entry must be a known hook name; an unknown name
+      fails CPI startup. Currently the only built-in hook is "audit_log", which
+      logs each CPI method call with its duration and outcome (it does not log
+      argument content). When empty (default), no middleware runs and there is
+      zero per-call overhead. Example: [audit_log]
+    default: []
+  pve.placement.anti_affinity.strict:
+    description: |
+      When true, the PVE HA negative resource-affinity rule created by
+      anti_affinity.use_ha_rules is set to strict mode (hard spread): PVE
+      refuses to place or failover a VM onto a node that already hosts another
+      member of the same instance group. Strict mode can block HA failover on
+      small clusters when no compliant node exists. Default false (advisory
+      spreading — PVE honors the rule as a soft preference, not an absolute
+      constraint). Has no effect unless anti_affinity.use_ha_rules is true.
+    default: false
+  pve.placement.dlb.enabled:
+    description: |
+      Master switch for PVE 9.2+ Dynamic Load Balancer (CRS dynamic mode)
+      integration. When true, every VM created by this CPI is registered as a
+      PVE HA resource with auto-rebalance=1 and state=started, delegating
+      initial placement and continuous rebalancing to the DLB. Works alongside
+      operator-defined availability zones: master-flag-on VMs are still scored
+      within their AZ candidate set at create time; DLB then rebalances within
+      allowed nodes afterward. Default false (opt-in). See also
+      placement.dlb.az_name for per-workload sentinel-AZ opt-in.
+    default: false
+  pve.placement.dlb.az_name:
+    description: |
+      Sentinel availability-zone name. When a VM is created with
+      cloud_properties.availability_zone equal to this value, the VM is treated
+      as DLB-delegated even when dlb.enabled is false: the CPI skips its own
+      AZ-map node restriction (any online node is a candidate) and registers the
+      VM as a PVE HA resource with auto-rebalance so the DLB places and balances
+      it. Default "dlb". Set to "" to disable the sentinel trigger entirely
+      (DLB opt-in via master flag only). When both dlb.enabled and the sentinel
+      AZ match, the master flag takes precedence (same registration path).
+    default: "dlb"
+  pve.placement.dlb.manage_cluster_crs:
+    description: |
+      When true, the CPI ensures the cluster-wide CRS option is set to
+      ha=dynamic (auto-rebalance on) via POST /cluster/options before registering
+      a DLB VM, so CRS/DLB is active without manual `pvesh set /cluster/options`
+      steps. When false (default), the CPI only reads the cluster CRS setting and
+      logs a clear warning if a DLB workload is requested but the cluster is not
+      in dynamic mode; the operator is responsible for setting the option via
+      `pvesh set /cluster/options --crs ha=dynamic,...`. Writing the cluster CRS
+      option affects ALL HA guests cluster-wide; default false keeps blast radius
+      minimal.
+    default: false
+  pve.placement.dlb.require_shared_storage:
+    description: |
+      When true (default), the CPI skips DLB/HA registration for VMs whose root
+      disk resides on local storage (dir, lvm, lvmthin, zfspool) that cannot be
+      live-migrated. Registering a non-shared VM as an HA resource would cause
+      PVE to attempt live-migration during rebalance and fail. Set to false to
+      register regardless — not recommended unless all storage is shared. When
+      the storage type cannot be determined at create time, the CPI fails open
+      (proceeds with registration) and logs a debug entry.
+    default: true
   pve.fetch_credential_defaults:
     description: |
       Ordered list of URL-prefix to auth-payload mappings used by the CPI when
