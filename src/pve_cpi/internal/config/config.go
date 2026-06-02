@@ -1465,7 +1465,7 @@ func (c *CPIConfig) validateHooks(errs *[]string) {
 // path rather than a hard error) so the operator is not blocked by a
 // vacuously-empty dlb block. No error is appended for an all-nil DLB block;
 // the block is simply inert.
-func (c *CPIConfig) validateDLB(errs *[]string) {
+func (c *CPIConfig) validateDLB(_ *[]string) {
 	if c.Placement == nil || c.Placement.DLB == nil {
 		return
 	}

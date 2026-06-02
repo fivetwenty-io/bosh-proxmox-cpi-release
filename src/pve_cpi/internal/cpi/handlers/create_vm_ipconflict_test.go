@@ -259,6 +259,7 @@ func TestIPConflictCloudError_Internal(t *testing.T) {
 type icPVEClient struct {
 	qemuSvc    qemu.Service
 	clusterSvc sdkcluster.Service
+	nodesSvc   nodes.Service
 }
 
 var _ pve.Client = (*icPVEClient)(nil)
@@ -268,7 +269,7 @@ func (c *icPVEClient) Cluster() sdkcluster.Service            { return c.cluster
 func (c *icPVEClient) Storage() storage.Service               { return nil }
 func (c *icPVEClient) CloudInit() cloudinit.Service           { return nil }
 func (c *icPVEClient) Tasks() tasks.Service                   { return nil }
-func (c *icPVEClient) Nodes() nodes.Service                   { return nil }
+func (c *icPVEClient) Nodes() nodes.Service                   { return c.nodesSvc }
 func (c *icPVEClient) ClusterStorage() clusterstorage.Service { return nil }
 func (c *icPVEClient) Pools() pve.PoolService                 { return nil }
 

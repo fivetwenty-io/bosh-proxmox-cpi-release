@@ -28,6 +28,7 @@ import (
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/cpi"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/cpi/handlers"
+	"github.com/fivetwenty-io/bosh-pve-cpi/internal/cpi/hooks"
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
@@ -148,7 +149,19 @@ func runWithArgs(args []string, stdin io.Reader, stdout, stderr io.Writer, opts 
 	storageInfoCache := pve.NewStorageInfoCache(client.ClusterStorage(), 60*time.Second)
 	backendResolver := pve.NewBackendResolver(client, storageInfoCache, cfg.Node)
 
-	d := cpi.NewDispatcher(logger)
+	// Resolve configured middleware hooks via the registry. config.Validate has
+	// already rejected unknown names, so a miss here is defensive only.
+	var hookChain []cpi.Hook
+	for _, name := range cfg.HooksValue() {
+		ctor, ok := hooks.Registry[name]
+		if !ok {
+			logger.Error("unknown hook configured", log.String("hook", name))
+			return 1
+		}
+		hookChain = append(hookChain, ctor(logger))
+	}
+
+	d := cpi.NewDispatcherWithOptions(logger, cpi.WithHooks(hookChain...))
 	handlers.RegisterAll(d, handlers.Deps{
 		Config:   cfg,
 		PVE:      client,

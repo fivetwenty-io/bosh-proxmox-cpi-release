@@ -452,6 +452,10 @@ func validateCreateNetworkSDNPreflight(cfg *config.CPIConfig, cp map[string]any,
 
 // createNetworkBridge implements the Linux bridge creation flow via the nodes API.
 //
+// cloudPropNodeKey is the network cloud_properties field naming the PVE node a
+// bridge belongs to; read from the create_network spec and echoed back out.
+const cloudPropNodeKey = "node"
+
 // PVE's POST /nodes/{node}/network creates a staged interface entry; the
 // follow-up UpdateNetwork (PUT /nodes/{node}/network) reloads ifupdown2 so
 // the bridge is realized on the host. Both calls flow through pve.WrapError
@@ -463,7 +467,7 @@ func createNetworkBridge(
 	bridge string,
 ) (any, error) {
 	cp := spec.CloudProperties
-	node := cpStr(cp, "node")
+	node := cpStr(cp, cloudPropNodeKey)
 	if node == "" {
 		node = deps.Config.Node
 	}
@@ -502,8 +506,8 @@ func createNetworkBridge(
 		"reserved": []string{},
 	}
 	cloudPropsOut := map[string]any{
-		"bridge": bridge,
-		"node":   node,
+		"bridge":         bridge,
+		cloudPropNodeKey: node,
 	}
 	return []any{bridge, addrProps, cloudPropsOut}, nil
 }

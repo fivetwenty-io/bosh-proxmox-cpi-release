@@ -36,6 +36,11 @@ type Dispatcher struct {
 	handlers     map[string]Handler
 	allowedNames map[string]struct{}
 	logger       *log.Logger
+	// hooks is the middleware chain applied to each handler at Register time.
+	// nil (the default, and what NewDispatcher produces) means Register installs
+	// handlers verbatim — identical call stack and zero overhead versus prior
+	// releases. Populated via WithHooks through NewDispatcherWithOptions.
+	hooks []Hook
 }
 
 // NewDispatcher returns a Dispatcher with all 22 CPI methods pre-registered as
@@ -63,6 +68,29 @@ func NewDispatcher(logger *log.Logger) *Dispatcher {
 	return d
 }
 
+// NewDispatcherWithOptions returns a Dispatcher configured by the supplied
+// options. It is equivalent to NewDispatcher(logger) with each option applied
+// in order before any handler is registered, so a WithHooks option installed
+// here is honored by every subsequent Register call. With no options it behaves
+// exactly like NewDispatcher.
+func NewDispatcherWithOptions(logger *log.Logger, opts ...func(*Dispatcher)) *Dispatcher {
+	d := NewDispatcher(logger)
+	for _, opt := range opts {
+		opt(d)
+	}
+	return d
+}
+
+// WithHooks returns an option that sets the dispatcher's middleware chain. The
+// hooks apply to every handler registered after the option runs (i.e. every
+// RegisterAll handler). Passing no hooks leaves the chain empty, which is the
+// same as not using the option at all.
+func WithHooks(hooks ...Hook) func(*Dispatcher) {
+	return func(d *Dispatcher) {
+		d.hooks = hooks
+	}
+}
+
 // Register installs h as the handler for the given method name.
 // If a handler already exists for method it is replaced.
 // Register returns an error when method is not a canonical CPI method name.
@@ -75,7 +103,9 @@ func (d *Dispatcher) Register(method string, h Handler) error {
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	d.handlers[method] = h
+	// WrapHandler returns h unchanged when d.hooks is empty, so an unhooked
+	// dispatcher installs the handler verbatim.
+	d.handlers[method] = WrapHandler(method, h, d.hooks)
 	return nil
 }
 

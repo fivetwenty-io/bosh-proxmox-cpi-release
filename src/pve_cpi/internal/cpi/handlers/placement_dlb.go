@@ -15,6 +15,10 @@ import (
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
 )
 
+// crsModeDynamic is the PVE cluster-resource-scheduler "ha" mode that enables
+// the Dynamic Load Balancer; set via /cluster/options crs=ha=dynamic.
+const crsModeDynamic = "dynamic"
+
 // ensureDLBMembership registers an eligible VM as a PVE HA resource with
 // auto-rebalance enabled so the PVE 9.2+ Dynamic Load Balancer places and
 // continuously rebalances it. It is best-effort: every guard failure or PVE
@@ -170,7 +174,7 @@ func ensureDLBClusterCRS(ctx context.Context, deps Deps, svc cluster.Service, lo
 			return nil
 		}
 		// Merge the required keys into whatever is currently configured.
-		crsMap["ha"] = "dynamic"
+		crsMap["ha"] = crsModeDynamic
 		crsMap["ha-rebalance-on-start"] = "1"
 		crsMap["ha-auto-rebalance"] = "1"
 		newCRS := formatCRS(crsMap)
@@ -335,7 +339,7 @@ func parseCRS(s string) map[string]string {
 
 // crsHasDynamic reports whether the parsed CRS map has ha=dynamic.
 func crsHasDynamic(m map[string]string) bool {
-	return m["ha"] == "dynamic"
+	return m["ha"] == crsModeDynamic
 }
 
 // formatCRS serializes a CRS map back to the PVE "key=value,..." string format

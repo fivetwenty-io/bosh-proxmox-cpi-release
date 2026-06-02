@@ -15,6 +15,9 @@ import (
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/nodes"
 )
 
+// resourceTypeNode is the /cluster/resources item type identifying a PVE node.
+const resourceTypeNode = "node"
+
 // vmResources maps BOSH vm_resources hint fields.
 // All values are integers: cpu in cores, ram in MiB, ephemeral_disk_size in MiB.
 // Storage, when non-empty, overrides deps.Config.VMStorage for this call only (D6-B).
@@ -139,7 +142,7 @@ func candidateNodesForCloudProps(
 			)
 			continue
 		}
-		if item.Type != "node" {
+		if item.Type != resourceTypeNode {
 			continue
 		}
 		if item.Online == 0 {
