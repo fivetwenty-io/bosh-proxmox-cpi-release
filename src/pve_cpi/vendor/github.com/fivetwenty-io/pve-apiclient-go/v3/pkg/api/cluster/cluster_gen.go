@@ -120,13 +120,13 @@ type Service interface {
 	// get the status of all ceph flags
 	ListCephFlags(ctx context.Context) (*ListCephFlagsResponse, error)
 	// UpdateCephFlags PUT /cluster/ceph/flags
-	// Set/Unset multiple ceph flags at once.
+	// Set/Unset multiple Ceph flags at once. Each flag is a top-level optional boolean: passing true sets the flag, false unsets it, omitting it leaves the current state untouched. Runs as a worker task; returns a UPID to follow.
 	UpdateCephFlags(ctx context.Context, params *UpdateCephFlagsParams) (*UpdateCephFlagsResponse, error)
 	// GetCephFlags GET /cluster/ceph/flags/{flag}
 	// Get the status of a specific ceph flag.
 	GetCephFlags(ctx context.Context, flag string) (*GetCephFlagsResponse, error)
 	// UpdateCephFlags2 PUT /cluster/ceph/flags/{flag}
-	// Set or clear (unset) a specific ceph flag
+	// Set or clear (unset) a specific Ceph flag. Runs synchronously (unlike the bulk PUT /cluster/ceph/flags endpoint, which forks a worker task).
 	UpdateCephFlags2(ctx context.Context, flag string, params *UpdateCephFlags2Params) error
 	// ListCephMetadata GET /cluster/ceph/metadata
 	// Get ceph metadata.
@@ -521,6 +521,27 @@ type Service interface {
 	// UpdateOptions PUT /cluster/options
 	// Set datacenter options.
 	UpdateOptions(ctx context.Context, params *UpdateOptionsParams) error
+	// ListQemu GET /cluster/qemu
+	// Cluster-wide QEMU index
+	ListQemu(ctx context.Context) (*ListQemuResponse, error)
+	// ListQemuCpuFlags GET /cluster/qemu/cpu-flags
+	// List of available CPU flags. Currently only implemented for x86_64, returns an empty list for aarch64.
+	ListQemuCpuFlags(ctx context.Context, params *ListQemuCpuFlagsParams) (*ListQemuCpuFlagsResponse, error)
+	// ListQemuCustomCpuModels GET /cluster/qemu/custom-cpu-models
+	// List all custom CPU model definitions visible to the user.
+	ListQemuCustomCpuModels(ctx context.Context) (*ListQemuCustomCpuModelsResponse, error)
+	// CreateQemuCustomCpuModels POST /cluster/qemu/custom-cpu-models
+	// Add a custom CPU model definition.
+	CreateQemuCustomCpuModels(ctx context.Context, params *CreateQemuCustomCpuModelsParams) error
+	// DeleteQemuCustomCpuModels DELETE /cluster/qemu/custom-cpu-models/{cputype}
+	// Delete a custom CPU model definition.
+	DeleteQemuCustomCpuModels(ctx context.Context, cputype string) error
+	// GetQemuCustomCpuModels GET /cluster/qemu/custom-cpu-models/{cputype}
+	// Retrieve details about a specific custom CPU model.
+	GetQemuCustomCpuModels(ctx context.Context, cputype string) (*GetQemuCustomCpuModelsResponse, error)
+	// UpdateQemuCustomCpuModels PUT /cluster/qemu/custom-cpu-models/{cputype}
+	// Update a custom CPU model definition.
+	UpdateQemuCustomCpuModels(ctx context.Context, cputype string, params *UpdateQemuCustomCpuModelsParams) error
 	// ListReplication GET /cluster/replication
 	// List replication jobs.
 	ListReplication(ctx context.Context) (*ListReplicationResponse, error)
@@ -1518,8 +1539,6 @@ type CreateBackupParams struct {
 	Mailnotification *string `json:"mailnotification,omitempty"`
 	// Mailto Deprecated: Use notification targets/matchers instead. Comma-separated list of email addresses or users that should receive email notifications.
 	Mailto *string `json:"mailto,omitempty"`
-	// Maxfiles Deprecated: use 'prune-backups' instead. Maximal number of backup files per guest system.
-	Maxfiles *int64 `json:"maxfiles,omitempty"`
 	// Mode Backup mode.
 	Mode *string `json:"mode,omitempty"`
 	// Node Only run if executed on this node.
@@ -1710,8 +1729,6 @@ type GetBackupResponse struct {
 	Mailnotification *string `json:"mailnotification,omitempty"`
 	// Mailto Deprecated: Use notification targets/matchers instead. Comma-separated list of email addresses or users that should receive email notifications.
 	Mailto *string `json:"mailto,omitempty"`
-	// Maxfiles Deprecated: use 'prune-backups' instead. Maximal number of backup files per guest system.
-	Maxfiles *int64 `json:"maxfiles,omitempty"`
 	// Mode Backup mode.
 	Mode *string `json:"mode,omitempty"`
 	// NextRun UNIX timestamp when this backup job will be executed next
@@ -1821,8 +1838,6 @@ type UpdateBackupParams struct {
 	Mailnotification *string `json:"mailnotification,omitempty"`
 	// Mailto Deprecated: Use notification targets/matchers instead. Comma-separated list of email addresses or users that should receive email notifications.
 	Mailto *string `json:"mailto,omitempty"`
-	// Maxfiles Deprecated: use 'prune-backups' instead. Maximal number of backup files per guest system.
-	Maxfiles *int64 `json:"maxfiles,omitempty"`
 	// Mode Backup mode.
 	Mode *string `json:"mode,omitempty"`
 	// Node Only run if executed on this node.
@@ -2431,18 +2446,19 @@ func (s *service) UpdateCephFlags2(ctx context.Context, flag string, params *Upd
 
 // ListCephMetadataParams is the request payload for ListCephMetadata.
 type ListCephMetadataParams struct {
+	// Scope Which metadata facet to return: 'all' enriches the per-daemon metadata with the PVE-side service state (presence of unit, data directory), 'versions' collects only per-node Ceph binary version data.
 	Scope *string `json:"scope,omitempty"`
 }
 
 // ListCephMetadataResponse mirrors the shape returned by GET /cluster/ceph/metadata.
 type ListCephMetadataResponse struct {
-	// Mds Metadata servers configured in the cluster and their properties.
+	// Mds Metadata servers configured in the cluster and their properties, keyed by '<name>@<host>'.
 	Mds json.RawMessage `json:"mds"`
-	// Mgr Managers configured in the cluster and their properties.
+	// Mgr Managers configured in the cluster and their properties, keyed by '<name>@<host>'.
 	Mgr json.RawMessage `json:"mgr"`
-	// Mon Monitors configured in the cluster and their properties.
+	// Mon Monitors configured in the cluster and their properties, keyed by '<name>@<host>'.
 	Mon json.RawMessage `json:"mon"`
-	// Node Ceph version installed on the nodes.
+	// Node Ceph version installed on the nodes, keyed by node name.
 	Node json.RawMessage `json:"node"`
 	// Osd OSDs configured in the cluster and their properties.
 	Osd []json.RawMessage `json:"osd"`
@@ -4571,6 +4587,8 @@ func (s *service) ListHaResources(ctx context.Context, params *ListHaResourcesPa
 
 // CreateHaResourcesParams is the request payload for CreateHaResources.
 type CreateHaResourcesParams struct {
+	// AutoRebalance HA resource may be migrated during automatic rebalancing
+	AutoRebalance *bool `json:"auto-rebalance,omitempty"`
 	// Comment Description.
 	Comment *string `json:"comment,omitempty"`
 	// Failback Automatically migrate HA resource to the node with the highest priority according to their node affinity  rules, if a node with a higher priority than the current node comes online.
@@ -4653,6 +4671,8 @@ func (s *service) DeleteHaResources(ctx context.Context, sid string, params *Del
 
 // GetHaResourcesResponse mirrors the shape returned by GET /cluster/ha/resources/{sid}.
 type GetHaResourcesResponse struct {
+	// AutoRebalance HA resource may be migrated during automatic rebalancing.
+	AutoRebalance *bool `json:"auto-rebalance,omitempty"`
 	// Comment Description.
 	Comment *string `json:"comment,omitempty"`
 	// Digest Can be used to prevent concurrent modifications.
@@ -4704,6 +4724,8 @@ func (s *service) GetHaResources(ctx context.Context, sid string) (*GetHaResourc
 
 // UpdateHaResourcesParams is the request payload for UpdateHaResources.
 type UpdateHaResourcesParams struct {
+	// AutoRebalance HA resource may be migrated during automatic rebalancing
+	AutoRebalance *bool `json:"auto-rebalance,omitempty"`
 	// Comment Description.
 	Comment *string `json:"comment,omitempty"`
 	// Delete A list of settings you want to delete.
@@ -7784,6 +7806,290 @@ func (s *service) UpdateOptions(ctx context.Context, params *UpdateOptionsParams
 	return nil
 }
 
+// ListQemuResponse mirrors the shape returned by GET /cluster/qemu.
+type ListQemuResponse []json.RawMessage
+
+// ListQemu implements Service.ListQemu. GET /cluster/qemu.
+func (s *service) ListQemu(ctx context.Context) (*ListQemuResponse, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("cluster.ListQemu: ctx must not be nil")
+	}
+	path := "/cluster/qemu"
+	var body map[string]interface{}
+	resp, err := s.c.GetRawCtx(ctx, path, body)
+	if err != nil {
+		return nil, fmt.Errorf("cluster.ListQemu: %w", err)
+	}
+	if resp == nil {
+		return nil, fmt.Errorf("cluster.ListQemu: nil response from client")
+	}
+	if resp.Data == nil {
+		out := ListQemuResponse{}
+		return &out, nil
+	}
+	raw, err := json.Marshal(resp.Data)
+	if err != nil {
+		return nil, fmt.Errorf("cluster.ListQemu: re-marshal data: %w", err)
+	}
+	out := &ListQemuResponse{}
+	err = json.Unmarshal(raw, out)
+	if err != nil {
+		return nil, fmt.Errorf("cluster.ListQemu: unmarshal data: %w", err)
+	}
+	return out, nil
+}
+
+// ListQemuCpuFlagsParams is the request payload for ListQemuCpuFlags.
+type ListQemuCpuFlagsParams struct {
+	// Accel Acceleration type to check node compatibility for.
+	Accel *string `json:"accel,omitempty"`
+	// Arch Virtual processor architecture. Defaults to the host architecture.
+	Arch *string `json:"arch,omitempty"`
+}
+
+// ListQemuCpuFlagsResponse mirrors the shape returned by GET /cluster/qemu/cpu-flags.
+type ListQemuCpuFlagsResponse []json.RawMessage
+
+// ListQemuCpuFlags implements Service.ListQemuCpuFlags. GET /cluster/qemu/cpu-flags.
+func (s *service) ListQemuCpuFlags(ctx context.Context, params *ListQemuCpuFlagsParams) (*ListQemuCpuFlagsResponse, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("cluster.ListQemuCpuFlags: ctx must not be nil")
+	}
+	path := "/cluster/qemu/cpu-flags"
+	var body map[string]interface{}
+	if params != nil {
+		raw, err := json.Marshal(params)
+		if err != nil {
+			return nil, fmt.Errorf("cluster.ListQemuCpuFlags: marshal params: %w", err)
+		}
+		err = json.Unmarshal(raw, &body)
+		if err != nil {
+			return nil, fmt.Errorf("cluster.ListQemuCpuFlags: decode params: %w", err)
+		}
+	}
+	resp, err := s.c.GetRawCtx(ctx, path, body)
+	if err != nil {
+		return nil, fmt.Errorf("cluster.ListQemuCpuFlags: %w", err)
+	}
+	if resp == nil {
+		return nil, fmt.Errorf("cluster.ListQemuCpuFlags: nil response from client")
+	}
+	if resp.Data == nil {
+		out := ListQemuCpuFlagsResponse{}
+		return &out, nil
+	}
+	raw, err := json.Marshal(resp.Data)
+	if err != nil {
+		return nil, fmt.Errorf("cluster.ListQemuCpuFlags: re-marshal data: %w", err)
+	}
+	out := &ListQemuCpuFlagsResponse{}
+	err = json.Unmarshal(raw, out)
+	if err != nil {
+		return nil, fmt.Errorf("cluster.ListQemuCpuFlags: unmarshal data: %w", err)
+	}
+	return out, nil
+}
+
+// ListQemuCustomCpuModelsResponse mirrors the shape returned by GET /cluster/qemu/custom-cpu-models.
+type ListQemuCustomCpuModelsResponse []json.RawMessage
+
+// ListQemuCustomCpuModels implements Service.ListQemuCustomCpuModels. GET /cluster/qemu/custom-cpu-models.
+func (s *service) ListQemuCustomCpuModels(ctx context.Context) (*ListQemuCustomCpuModelsResponse, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("cluster.ListQemuCustomCpuModels: ctx must not be nil")
+	}
+	path := "/cluster/qemu/custom-cpu-models"
+	var body map[string]interface{}
+	resp, err := s.c.GetRawCtx(ctx, path, body)
+	if err != nil {
+		return nil, fmt.Errorf("cluster.ListQemuCustomCpuModels: %w", err)
+	}
+	if resp == nil {
+		return nil, fmt.Errorf("cluster.ListQemuCustomCpuModels: nil response from client")
+	}
+	if resp.Data == nil {
+		out := ListQemuCustomCpuModelsResponse{}
+		return &out, nil
+	}
+	raw, err := json.Marshal(resp.Data)
+	if err != nil {
+		return nil, fmt.Errorf("cluster.ListQemuCustomCpuModels: re-marshal data: %w", err)
+	}
+	out := &ListQemuCustomCpuModelsResponse{}
+	err = json.Unmarshal(raw, out)
+	if err != nil {
+		return nil, fmt.Errorf("cluster.ListQemuCustomCpuModels: unmarshal data: %w", err)
+	}
+	return out, nil
+}
+
+// CreateQemuCustomCpuModelsParams is the request payload for CreateQemuCustomCpuModels.
+type CreateQemuCustomCpuModelsParams struct {
+	// Cputype Name for the custom CPU model. The 'custom-' prefix is optional.
+	Cputype string `json:"cputype"`
+	// Flags List of additional CPU flags separated by ';'. Use '+FLAG' to enable, '-FLAG' to disable a flag. There is a special 'nested-virt' shorthand which controls nested virtualization for the current CPU ('svm' for AMD and 'vmx' for Intel). Custom CPU models can specify any flag supported by QEMU/KVM, VM-specific flags must be from the following set for security reasons: aes, amd-no-ssb, amd-ssbd, hv-evmcs, hv-tlbflush, ibpb, md-clear, nested-virt, pcid, pdpe1gb, spec-ctrl, ssbd, virt-ssbd
+	Flags *string `json:"flags,omitempty"`
+	// GuestPhysBits Number of physical address bits available to the guest.
+	GuestPhysBits *int64 `json:"guest-phys-bits,omitempty"`
+	// Hidden Do not identify as a KVM virtual machine. Only affects vCPUs with x86-64 architecture.
+	Hidden *bool `json:"hidden,omitempty"`
+	// HvVendorId The Hyper-V vendor ID. Some drivers or programs inside Windows guests need a specific ID.
+	HvVendorId *string `json:"hv-vendor-id,omitempty"`
+	// Level Maximum input value for the basic CPUID leaves the guest can query - that is the vendor (leaf 0), family/model/stepping and feature bits (leaf 1), cache and topology info (leaves 4 and B), and so on. Higher-numbered leaves are hidden. Setting '30' is a common workaround for Hyper-V boot failures on Windows guests running on recent Intel hosts. Only applies when the vCPU architecture is x86_64.
+	Level *int64 `json:"level,omitempty"`
+	// PhysBits The physical memory address bits that are reported to the guest OS. Should be smaller or equal to the host's. Set to 'host' to use value from host CPU, but note that doing so will break live migration to CPUs with other values.
+	PhysBits *string `json:"phys-bits,omitempty"`
+	// ReportedModel CPU model and vendor to report to the guest. Must be a QEMU/KVM supported model. Only valid for custom CPU model definitions, default models will always report themselves to the guest OS.
+	ReportedModel string `json:"reported-model"`
+}
+
+// CreateQemuCustomCpuModels implements Service.CreateQemuCustomCpuModels. POST /cluster/qemu/custom-cpu-models.
+func (s *service) CreateQemuCustomCpuModels(ctx context.Context, params *CreateQemuCustomCpuModelsParams) error {
+	if ctx == nil {
+		return fmt.Errorf("cluster.CreateQemuCustomCpuModels: ctx must not be nil")
+	}
+	path := "/cluster/qemu/custom-cpu-models"
+	var body map[string]interface{}
+	if params != nil {
+		raw, err := json.Marshal(params)
+		if err != nil {
+			return fmt.Errorf("cluster.CreateQemuCustomCpuModels: marshal params: %w", err)
+		}
+		err = json.Unmarshal(raw, &body)
+		if err != nil {
+			return fmt.Errorf("cluster.CreateQemuCustomCpuModels: decode params: %w", err)
+		}
+	}
+	resp, err := s.c.PostRawCtx(ctx, path, body)
+	if err != nil {
+		return fmt.Errorf("cluster.CreateQemuCustomCpuModels: %w", err)
+	}
+	if resp == nil {
+		return fmt.Errorf("cluster.CreateQemuCustomCpuModels: nil response from client")
+	}
+	_ = resp
+	return nil
+}
+
+// DeleteQemuCustomCpuModels implements Service.DeleteQemuCustomCpuModels. DELETE /cluster/qemu/custom-cpu-models/{cputype}.
+func (s *service) DeleteQemuCustomCpuModels(ctx context.Context, cputype string) error {
+	if ctx == nil {
+		return fmt.Errorf("cluster.DeleteQemuCustomCpuModels: ctx must not be nil")
+	}
+	path := fmt.Sprintf("/cluster/qemu/custom-cpu-models/%s", url.PathEscape(cputype))
+	var body map[string]interface{}
+	resp, err := s.c.DeleteRawCtx(ctx, path, body)
+	if err != nil {
+		return fmt.Errorf("cluster.DeleteQemuCustomCpuModels: %w", err)
+	}
+	if resp == nil {
+		return fmt.Errorf("cluster.DeleteQemuCustomCpuModels: nil response from client")
+	}
+	_ = resp
+	return nil
+}
+
+// GetQemuCustomCpuModelsResponse mirrors the shape returned by GET /cluster/qemu/custom-cpu-models/{cputype}.
+type GetQemuCustomCpuModelsResponse struct {
+	// Cputype Emulated CPU type. Can be default or custom name (custom model names must be prefixed with 'custom-').
+	Cputype *string `json:"cputype,omitempty"`
+	// Digest Prevent changes if current configuration file has a different digest. This can be used to prevent concurrent modifications.
+	Digest *string `json:"digest,omitempty"`
+	// Flags List of additional CPU flags separated by ';'. Use '+FLAG' to enable, '-FLAG' to disable a flag. There is a special 'nested-virt' shorthand which controls nested virtualization for the current CPU ('svm' for AMD and 'vmx' for Intel). Custom CPU models can specify any flag supported by QEMU/KVM, VM-specific flags must be from the following set for security reasons: aes, amd-no-ssb, amd-ssbd, hv-evmcs, hv-tlbflush, ibpb, md-clear, nested-virt, pcid, pdpe1gb, spec-ctrl, ssbd, virt-ssbd
+	Flags *string `json:"flags,omitempty"`
+	// GuestPhysBits Number of physical address bits available to the guest.
+	GuestPhysBits *int64 `json:"guest-phys-bits,omitempty"`
+	// Hidden Do not identify as a KVM virtual machine. Only affects vCPUs with x86-64 architecture.
+	Hidden *bool `json:"hidden,omitempty"`
+	// HvVendorId The Hyper-V vendor ID. Some drivers or programs inside Windows guests need a specific ID.
+	HvVendorId *string `json:"hv-vendor-id,omitempty"`
+	// Level Maximum input value for the basic CPUID leaves the guest can query - that is the vendor (leaf 0), family/model/stepping and feature bits (leaf 1), cache and topology info (leaves 4 and B), and so on. Higher-numbered leaves are hidden. Setting '30' is a common workaround for Hyper-V boot failures on Windows guests running on recent Intel hosts. Only applies when the vCPU architecture is x86_64.
+	Level *int64 `json:"level,omitempty"`
+	// PhysBits The physical memory address bits that are reported to the guest OS. Should be smaller or equal to the host's. Set to 'host' to use value from host CPU, but note that doing so will break live migration to CPUs with other values.
+	PhysBits *string `json:"phys-bits,omitempty"`
+	// ReportedModel CPU model and vendor to report to the guest. Must be a QEMU/KVM supported model. Only valid for custom CPU model definitions, default models will always report themselves to the guest OS.
+	ReportedModel *string `json:"reported-model,omitempty"`
+}
+
+// GetQemuCustomCpuModels implements Service.GetQemuCustomCpuModels. GET /cluster/qemu/custom-cpu-models/{cputype}.
+func (s *service) GetQemuCustomCpuModels(ctx context.Context, cputype string) (*GetQemuCustomCpuModelsResponse, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("cluster.GetQemuCustomCpuModels: ctx must not be nil")
+	}
+	path := fmt.Sprintf("/cluster/qemu/custom-cpu-models/%s", url.PathEscape(cputype))
+	var body map[string]interface{}
+	resp, err := s.c.GetRawCtx(ctx, path, body)
+	if err != nil {
+		return nil, fmt.Errorf("cluster.GetQemuCustomCpuModels: %w", err)
+	}
+	if resp == nil {
+		return nil, fmt.Errorf("cluster.GetQemuCustomCpuModels: nil response from client")
+	}
+	if resp.Data == nil {
+		return nil, fmt.Errorf("cluster.GetQemuCustomCpuModels: empty data in response (code=%d)", resp.Code)
+	}
+	raw, err := json.Marshal(resp.Data)
+	if err != nil {
+		return nil, fmt.Errorf("cluster.GetQemuCustomCpuModels: re-marshal data: %w", err)
+	}
+	out := &GetQemuCustomCpuModelsResponse{}
+	err = json.Unmarshal(raw, out)
+	if err != nil {
+		return nil, fmt.Errorf("cluster.GetQemuCustomCpuModels: unmarshal data: %w", err)
+	}
+	return out, nil
+}
+
+// UpdateQemuCustomCpuModelsParams is the request payload for UpdateQemuCustomCpuModels.
+type UpdateQemuCustomCpuModelsParams struct {
+	// Delete A list of properties to delete.
+	Delete *string `json:"delete,omitempty"`
+	// Digest Prevent changes if current configuration file has a different digest. This can be used to prevent concurrent modifications.
+	Digest *string `json:"digest,omitempty"`
+	// Flags List of additional CPU flags separated by ';'. Use '+FLAG' to enable, '-FLAG' to disable a flag. There is a special 'nested-virt' shorthand which controls nested virtualization for the current CPU ('svm' for AMD and 'vmx' for Intel). Custom CPU models can specify any flag supported by QEMU/KVM, VM-specific flags must be from the following set for security reasons: aes, amd-no-ssb, amd-ssbd, hv-evmcs, hv-tlbflush, ibpb, md-clear, nested-virt, pcid, pdpe1gb, spec-ctrl, ssbd, virt-ssbd
+	Flags *string `json:"flags,omitempty"`
+	// GuestPhysBits Number of physical address bits available to the guest.
+	GuestPhysBits *int64 `json:"guest-phys-bits,omitempty"`
+	// Hidden Do not identify as a KVM virtual machine. Only affects vCPUs with x86-64 architecture.
+	Hidden *bool `json:"hidden,omitempty"`
+	// HvVendorId The Hyper-V vendor ID. Some drivers or programs inside Windows guests need a specific ID.
+	HvVendorId *string `json:"hv-vendor-id,omitempty"`
+	// Level Maximum input value for the basic CPUID leaves the guest can query - that is the vendor (leaf 0), family/model/stepping and feature bits (leaf 1), cache and topology info (leaves 4 and B), and so on. Higher-numbered leaves are hidden. Setting '30' is a common workaround for Hyper-V boot failures on Windows guests running on recent Intel hosts. Only applies when the vCPU architecture is x86_64.
+	Level *int64 `json:"level,omitempty"`
+	// PhysBits The physical memory address bits that are reported to the guest OS. Should be smaller or equal to the host's. Set to 'host' to use value from host CPU, but note that doing so will break live migration to CPUs with other values.
+	PhysBits *string `json:"phys-bits,omitempty"`
+	// ReportedModel CPU model and vendor to report to the guest. Must be a QEMU/KVM supported model. Only valid for custom CPU model definitions, default models will always report themselves to the guest OS.
+	ReportedModel *string `json:"reported-model,omitempty"`
+}
+
+// UpdateQemuCustomCpuModels implements Service.UpdateQemuCustomCpuModels. PUT /cluster/qemu/custom-cpu-models/{cputype}.
+func (s *service) UpdateQemuCustomCpuModels(ctx context.Context, cputype string, params *UpdateQemuCustomCpuModelsParams) error {
+	if ctx == nil {
+		return fmt.Errorf("cluster.UpdateQemuCustomCpuModels: ctx must not be nil")
+	}
+	path := fmt.Sprintf("/cluster/qemu/custom-cpu-models/%s", url.PathEscape(cputype))
+	var body map[string]interface{}
+	if params != nil {
+		raw, err := json.Marshal(params)
+		if err != nil {
+			return fmt.Errorf("cluster.UpdateQemuCustomCpuModels: marshal params: %w", err)
+		}
+		err = json.Unmarshal(raw, &body)
+		if err != nil {
+			return fmt.Errorf("cluster.UpdateQemuCustomCpuModels: decode params: %w", err)
+		}
+	}
+	resp, err := s.c.PutRawCtx(ctx, path, body)
+	if err != nil {
+		return fmt.Errorf("cluster.UpdateQemuCustomCpuModels: %w", err)
+	}
+	if resp == nil {
+		return fmt.Errorf("cluster.UpdateQemuCustomCpuModels: nil response from client")
+	}
+	_ = resp
+	return nil
+}
+
 // ListReplicationResponse mirrors the shape returned by GET /cluster/replication.
 type ListReplicationResponse []json.RawMessage
 
@@ -8198,6 +8504,8 @@ func (s *service) ListSdnControllers(ctx context.Context, params *ListSdnControl
 type CreateSdnControllersParams struct {
 	// Asn autonomous system number
 	Asn *int64 `json:"asn,omitempty"`
+	// BgpMode Whether to use eBGP or iBGP. Auto mode chooses depending on BGP controller or falls back to iBGP.
+	BgpMode *string `json:"bgp-mode,omitempty"`
 	// BgpMultipathAsPathRelax Consider different AS paths of equal length for multipath computation.
 	BgpMultipathAsPathRelax *bool `json:"bgp-multipath-as-path-relax,omitempty"`
 	// Controller The SDN controller object identifier.
@@ -8220,6 +8528,10 @@ type CreateSdnControllersParams struct {
 	Loopback *string `json:"loopback,omitempty"`
 	// Node The cluster node name.
 	Node *string `json:"node,omitempty"`
+	// Nodes List of cluster node names.
+	Nodes *string `json:"nodes,omitempty"`
+	// PeerGroupName Name of the peer group for this EVPN controller
+	PeerGroupName *string `json:"peer-group-name,omitempty"`
 	// Peers peers address list.
 	Peers *string `json:"peers,omitempty"`
 	// RouteMapIn Route Map that should be applied for incoming routes
@@ -8347,6 +8659,8 @@ func (s *service) GetSdnControllers(ctx context.Context, controller string, para
 type UpdateSdnControllersParams struct {
 	// Asn autonomous system number
 	Asn *int64 `json:"asn,omitempty"`
+	// BgpMode Whether to use eBGP or iBGP. Auto mode chooses depending on BGP controller or falls back to iBGP.
+	BgpMode *string `json:"bgp-mode,omitempty"`
 	// BgpMultipathAsPathRelax Consider different AS paths of equal length for multipath computation.
 	BgpMultipathAsPathRelax *bool `json:"bgp-multipath-as-path-relax,omitempty"`
 	// Delete A list of settings you want to delete.
@@ -8371,6 +8685,10 @@ type UpdateSdnControllersParams struct {
 	Loopback *string `json:"loopback,omitempty"`
 	// Node The cluster node name.
 	Node *string `json:"node,omitempty"`
+	// Nodes List of cluster node names.
+	Nodes *string `json:"nodes,omitempty"`
+	// PeerGroupName Name of the peer group for this EVPN controller
+	PeerGroupName *string `json:"peer-group-name,omitempty"`
 	// Peers peers address list.
 	Peers *string `json:"peers,omitempty"`
 	// RouteMapIn Route Map that should be applied for incoming routes
@@ -8823,7 +9141,8 @@ type CreateSdnFabricsFabricParams struct {
 	// PersistentKeepalive A seconds interval, between 1 and 65535 inclusive, of how often to send an authenticated empty packet to the peer for the purpose of keeping a stateful firewall or NAT mapping valid persistently. For example, if the interface very rarely sends traffic, but it might at anytime receive traffic from another node, and it is behind NAT, the interface might benefit from having a persistent keepalive interval of 25 seconds. If unset or set to 0, it is turned off
 	PersistentKeepalive *float64 `json:"persistent_keepalive,omitempty"`
 	// Protocol Type of configuration entry in an SDN Fabric section config
-	Protocol string `json:"protocol"`
+	Protocol     string            `json:"protocol"`
+	Redistribute []json.RawMessage `json:"redistribute"`
 	// RouteFilter A prefix list that should be used for filtering routes that are to be installed into the kernel routing table
 	RouteFilter *string `json:"route_filter,omitempty"`
 }
@@ -8895,7 +9214,8 @@ type GetSdnFabricsFabricResponse struct {
 	// PersistentKeepalive A seconds interval, between 1 and 65535 inclusive, of how often to send an authenticated empty packet to the peer for the purpose of keeping a stateful firewall or NAT mapping valid persistently. For example, if the interface very rarely sends traffic, but it might at anytime receive traffic from another node, and it is behind NAT, the interface might benefit from having a persistent keepalive interval of 25 seconds. If unset or set to 0, it is turned off
 	PersistentKeepalive *float64 `json:"persistent_keepalive,omitempty"`
 	// Protocol Type of configuration entry in an SDN Fabric section config
-	Protocol string `json:"protocol"`
+	Protocol     string            `json:"protocol"`
+	Redistribute []json.RawMessage `json:"redistribute"`
 	// RouteFilter A prefix list that should be used for filtering routes that are to be installed into the kernel routing table
 	RouteFilter *string `json:"route_filter,omitempty"`
 }
@@ -8949,7 +9269,8 @@ type UpdateSdnFabricsFabricParams struct {
 	// PersistentKeepalive A seconds interval, between 1 and 65535 inclusive, of how often to send an authenticated empty packet to the peer for the purpose of keeping a stateful firewall or NAT mapping valid persistently. For example, if the interface very rarely sends traffic, but it might at anytime receive traffic from another node, and it is behind NAT, the interface might benefit from having a persistent keepalive interval of 25 seconds. If unset or set to 0, it is turned off
 	PersistentKeepalive *float64 `json:"persistent_keepalive,omitempty"`
 	// Protocol Type of configuration entry in an SDN Fabric section config
-	Protocol string `json:"protocol"`
+	Protocol     string            `json:"protocol"`
+	Redistribute []json.RawMessage `json:"redistribute"`
 	// RouteFilter A prefix list that should be used for filtering routes that are to be installed into the kernel routing table
 	RouteFilter *string `json:"route_filter,omitempty"`
 }
@@ -11344,6 +11665,8 @@ type CreateSdnZonesParams struct {
 	Reversedns *string `json:"reversedns,omitempty"`
 	// RtImport List of Route Targets that should be imported into the VRF of the zone.
 	RtImport *string `json:"rt-import,omitempty"`
+	// SecondaryControllers Additional controllers.
+	SecondaryControllers []string `json:"secondary-controllers,omitempty"`
 	// Tag Service-VLAN Tag (outer VLAN)
 	Tag *int64 `json:"tag,omitempty"`
 	// Type Plugin type.
@@ -11519,6 +11842,8 @@ type UpdateSdnZonesParams struct {
 	Reversedns *string `json:"reversedns,omitempty"`
 	// RtImport List of Route Targets that should be imported into the VRF of the zone.
 	RtImport *string `json:"rt-import,omitempty"`
+	// SecondaryControllers Additional controllers.
+	SecondaryControllers []string `json:"secondary-controllers,omitempty"`
 	// Tag Service-VLAN Tag (outer VLAN)
 	Tag *int64 `json:"tag,omitempty"`
 	// VlanProtocol Which VLAN protocol should be used for the creation of the QinQ zone.

@@ -54,6 +54,15 @@ func createVMRetryBackoff(err error, attempt int) time.Duration {
 // this large; PVE refuses to shrink below the imported image size anyway.
 const defaultStemcellDiskGiB = 5
 
+// defaultNetworkBridge is the PVE Linux bridge used when neither the CPI
+// config nor the network cloud_properties specifies an explicit bridge.
+const defaultNetworkBridge = "vmbr0"
+
+// metadataKeyName is the BOSH metadata map key that carries the VM name
+// (e.g. "<job>/<id>"). Defined as a constant to avoid repeated string
+// literals across the handlers package.
+const metadataKeyName = "name"
+
 // createVMCloudProps holds the fields we care about from Args[2].
 type createVMCloudProps struct {
 	// CPU is the total vCPU count using the vSphere CPI convention. When
@@ -262,9 +271,11 @@ func createVM(
 	// and devices outside PVE management are not detectable.
 	// -----------------------------------------------------------------------
 	if deps.Config.EnsureNoIPConflictsEnabled() {
-		staticIPs, bridge := collectStaticIPsForConflictCheck(parsed, deps.Config)
-		if len(staticIPs) > 0 {
-			conflict, conflictErr := detectIPConflict(ctx, deps, staticIPs, bridge)
+		ipsByBridge := collectStaticIPsForConflictCheck(parsed, deps.Config)
+		for bridge, ips := range ipsByBridge {
+			// Pass vmid as excludeVMID so the newly created VM's own ipconfig
+			// entries are not treated as a conflict against itself.
+			conflict, conflictErr := detectIPConflict(ctx, deps, ips, bridge, vmid)
 			if conflictErr != nil {
 				return nil, cpierrors.Wrap(conflictErr, "create_vm: IP-conflict pre-flight")
 			}
@@ -577,43 +588,44 @@ func resolveTargetNode(ctx context.Context, deps Deps, cp createVMCloudProps) (s
 // parsed network specs that carry a static (manual, non-DHCP) assignment.
 // Dynamic (type=="dynamic") and VIP networks are skipped.
 //
-// Returns (staticIPs, bridge) where bridge is the default bridge for the VM
-// (cloud_properties.network_bridge or config.NetworkBridge). The bridge is
-// used by detectIPConflict as a best-effort NIC filter: only NICs on that
-// bridge are checked, so a VM on a different bridge sharing the same IP space
-// will not generate a false positive.
+// collectStaticIPsForConflictCheck groups static IPs by their bridge so that
+// the caller can call detectIPConflict once per bridge with the correct NIC
+// filter, preventing conflicts on any bridge from being silently missed.
 //
-// When no static IPs are found, returns (nil, ""). Callers must check
-// len(staticIPs) > 0 before calling detectIPConflict.
-func collectStaticIPsForConflictCheck(parsed *createVMParsedArgs, cfg *config.CPIConfig) (staticIPs []string, bridge string) {
+// Returns a map[bridge][]IP. The default bridge (cloud_properties.network_bridge
+// → config.NetworkBridge → "vmbr0") applies to networks that do not specify an
+// explicit bridge override. Networks of type dynamic/vip or with empty/DHCP IPs
+// are skipped. An empty map means no static IPs were found; callers must check
+// len(result) > 0 before calling detectIPConflict.
+func collectStaticIPsForConflictCheck(parsed *createVMParsedArgs, cfg *config.CPIConfig) map[string][]string {
 	// Resolve the default bridge (same logic as configureNICs).
-	bridge = cfg.NetworkBridge
-	if bridge == "" {
-		bridge = "vmbr0"
+	defaultBridge := cfg.NetworkBridge
+	if defaultBridge == "" {
+		defaultBridge = defaultNetworkBridge
 	}
 	if parsed.cloudProps.NetworkBridge != "" {
-		bridge = parsed.cloudProps.NetworkBridge
+		defaultBridge = parsed.cloudProps.NetworkBridge
 	}
 
-	for _, spec := range parsed.networks {
+	result := make(map[string][]string)
+	for netName := range parsed.networks {
+		spec := parsed.networks[netName]
 		switch strings.ToLower(spec.Type) {
 		case "manual":
 			if spec.IP == "" || strings.EqualFold(spec.IP, "dhcp") {
 				continue
 			}
-			// Per-network bridge override: if this network specifies a different
-			// bridge, use it. The conflict check is per-call (one bridge), so we
-			// use the first network's bridge when they differ. For heterogeneous
-			// multi-NIC setups, detectIPConflict with bridge="" covers all NICs.
+			// Use per-network bridge override when present; otherwise the VM default.
+			bridge := defaultBridge
 			if b, ok := spec.CloudProperties["bridge"].(string); ok && b != "" {
 				bridge = b
 			}
-			staticIPs = append(staticIPs, spec.IP)
+			result[bridge] = append(result[bridge], spec.IP)
 		default:
 			// dynamic, vip, "" → skip
 		}
 	}
-	return staticIPs, bridge
+	return result
 }
 
 // lookupVMStorageType fetches the PVE storage type for storageName by listing
@@ -952,9 +964,9 @@ func attemptCreateVM(
 		shape.vmStorage, parsed.rawCID, shape.vmDiskFormat, shape.rootDiskGiB)
 
 	createParams := map[string]any{
-		"vmid":    candidate,
-		"name":    candidateName,
-		"memory":  shape.memMiB,
+		"vmid":             candidate,
+		metadataKeyName:    candidateName,
+		"memory":           shape.memMiB,
 		"cores":   shape.cores,
 		"ostype":  osTypeLinux26,
 		"scsihw":  "virtio-scsi-pci",
@@ -1382,7 +1394,7 @@ func configureNICs(
 	// bridge and model defaults
 	defaultBridge := deps.Config.NetworkBridge
 	if defaultBridge == "" {
-		defaultBridge = "vmbr0"
+		defaultBridge = defaultNetworkBridge
 	}
 	if parsed.cloudProps.NetworkBridge != "" {
 		defaultBridge = parsed.cloudProps.NetworkBridge
@@ -1860,7 +1872,7 @@ func extractInstanceNameFromEnv(env map[string]any) string {
 		return ""
 	}
 	if inst, ok := boshRaw["instance"].(map[string]any); ok {
-		if s, _ := inst["name"].(string); s != "" {
+		if s, _ := inst[metadataKeyName].(string); s != "" {
 			return s
 		}
 	}

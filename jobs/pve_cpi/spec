@@ -318,6 +318,70 @@ properties:
       intentionally on a private network. Production deployments must leave
       this unset or false and use a publicly routable registry address.
     default: false
+  pve.ensure_no_ip_conflicts:
+    description: |
+      When true (default), create_vm checks that no existing VM on the candidate
+      node already holds the requested static IP before provisioning. Prevents
+      duplicate-IP collisions on static networks. Set to false only for
+      dynamic (DHCP) networks where IP pre-assignment is not meaningful.
+      Protective default: true. Omitting this property preserves the default.
+    default: true
+  pve.placement.enabled:
+    description: |
+      When true (default), create_vm runs live node-scoring to select the
+      best-fit PVE node based on available memory, CPU headroom, storage
+      capacity, and guest density. When false, create_vm falls back to
+      pve.node (the existing static behavior). An explicit cloud_properties
+      target_node always wins over scoring regardless of this setting.
+      Protective default: true. Set to false to opt out of scoring and
+      preserve legacy single-node behavior.
+    default: true
+  pve.placement.weights.mem:
+    description: |
+      Weight applied to the free-memory headroom axis in the node scorer.
+      Higher value = stronger preference for nodes with more available RAM.
+      Must be >= 0. When unset (0), defaults to 1.0 at runtime.
+    default: 0.0
+  pve.placement.weights.storage:
+    description: |
+      Weight applied to the free-storage-fraction axis in the node scorer.
+      Higher value = stronger preference for nodes with more available storage.
+      Must be >= 0. When unset (0), defaults to 0.5 at runtime.
+    default: 0.0
+  pve.placement.weights.cpu:
+    description: |
+      Weight applied to the free-CPU-headroom axis in the node scorer.
+      Higher value = stronger preference for nodes with more available CPU.
+      Must be >= 0. When unset (0), defaults to 0.5 at runtime.
+    default: 0.0
+  pve.placement.weights.guest_count:
+    description: |
+      Weight applied to the inverse-guest-count axis in the node scorer.
+      Higher value = stronger preference for nodes hosting fewer guests
+      (spreads load across the cluster). Must be >= 0. When unset (0),
+      defaults to 0.3 at runtime.
+    default: 0.0
+  pve.placement.az_map:
+    description: |
+      Optional. Maps availability-zone names to the PVE node names that
+      serve each AZ. When a VM is created with cloud_properties.availability_zone
+      set to a key in this map, candidate nodes are restricted to the mapped
+      list and the scorer picks the best-fit node within that set.
+      If availability_zone is set in cloud_properties but the value is not
+      present in this map, create_vm returns an error (explicit
+      misconfiguration, not silent fall-through). When empty (default), all
+      online cluster nodes are candidates regardless of availability_zone.
+      Example: {us-east-1a: [pve01, pve02], us-east-1b: [pve03]}
+    default: {}
+  pve.placement.anti_affinity:
+    description: |
+      Reserved for Tier-2 implementation. When true, the CPI will apply
+      anti-affinity spreading to BOSH instance groups via PVE HA rules
+      (negative affinity rules in /cluster/ha/rules). Default false:
+      anti-affinity is inactive and no PVE HA resources are created.
+      Defining this property now ensures no spec change is required when
+      Tier-2 anti-affinity ships.
+    default: false
   pve.fetch_credential_defaults:
     description: |
       Ordered list of URL-prefix to auth-payload mappings used by the CPI when

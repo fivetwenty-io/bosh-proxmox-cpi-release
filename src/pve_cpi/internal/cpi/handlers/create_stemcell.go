@@ -156,7 +156,7 @@ func parseStemcellCloudProps(cp map[string]any) stemcellCloudProps {
 	if v, ok := cp["os_type"].(string); ok && v != "" {
 		p.OSType = normalizeOSType(v)
 	}
-	if v, ok := cp["name"].(string); ok {
+	if v, ok := cp[metadataKeyName].(string); ok {
 		p.Name = v
 	}
 	if v, ok := cp["version"].(string); ok {
@@ -790,15 +790,15 @@ func attemptCreateTemplateVM(
 		targetStorage, importVolid, diskFormatQCOW2, defaultStemcellDiskGiB)
 
 	createParams := map[string]any{
-		"vmid":    candidate,
-		"name":    templateName,
-		"ostype":  osTypeLinux26,
-		"scsihw":  "virtio-scsi-pci",
-		"virtio0": virtio0Val,
-		"boot":    "order=virtio0",
-		"agent":   "enabled=0",
-		"onboot":  0,
-		"tags":    shaTag,
+		"vmid":          candidate,
+		metadataKeyName: templateName,
+		"ostype":        osTypeLinux26,
+		"scsihw":        "virtio-scsi-pci",
+		"virtio0":       virtio0Val,
+		"boot":          "order=virtio0",
+		"agent":         "enabled=0",
+		"onboot":        0,
+		"tags":          shaTag,
 	}
 
 	upid, cerr := deps.PVE.QEMU().Create(ctx, node, createParams)

@@ -12,6 +12,8 @@ import (
 	"golang.org/x/term"
 )
 
+const realmPAM = "pam"
+
 var (
 	ErrHardwareTokenRequiresBrowser = errors.New("hardware token authentication (U2F/WebAuthn) requires browser interaction")
 	ErrNoTFAResponseConfigured      = errors.New("no TFA response configured for available types")
@@ -270,7 +272,7 @@ func PromptCredentials() (*Credentials, error) {
 	}
 
 	// Parse realm from username if present (user@realm format)
-	realm := "pam" // default realm
+	realm := realmPAM // default realm
 
 	if parts := strings.Split(username, "@"); len(parts) == constants.ExpectedPartsCount {
 		username = parts[0]

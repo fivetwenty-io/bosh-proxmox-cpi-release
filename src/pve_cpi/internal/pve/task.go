@@ -56,15 +56,17 @@ func WithMaxWait(d time.Duration) AwaitOption {
 // tasks.Service.Wait with CPI-standard defaults and error normalization.
 //
 // Returns nil when the task exits with status "OK".
-// Returns a *cpierrors.Error (TypeCloud) when:
-//   - upid is empty — validated before the SDK call.
-//   - node is empty — validated before the SDK call.
-//   - ctx is nil — validated before the SDK call.
-//   - the task exits with a non-OK exit status.
-//   - the SDK call itself fails (network, timeout, etc.).
-//
-// ctx cancellation is propagated through the SDK poller; when ctx is cancelled
-// the function returns a *cpierrors.Error wrapping ctx.Err().
+// Returns a *cpierrors.Error with the following retriable classification:
+//   - upid is empty — non-retriable CloudError (programming error).
+//   - node is empty — non-retriable CloudError (programming error).
+//   - ctx is nil — non-retriable CloudError (programming error).
+//   - ctx cancelled / deadline exceeded — retriable RetriableCloudError; the
+//     BOSH director re-issues the CPI action with a new VMID.
+//   - transient poll fault (5xx, connection error, network timeout) — retriable
+//     RetriableCloudError via WrapError classification.
+//   - nil status — non-retriable CloudError (SDK contract violation).
+//   - empty exit status — non-retriable CloudError (PVE never wrote outcome).
+//   - non-OK exit status — non-retriable CloudError (permanent task failure).
 func AwaitTask(ctx context.Context, c Client, node, upid string, opts ...AwaitOption) error {
 	if ctx == nil {
 		return cpierrors.Cloud("AwaitTask: ctx must not be nil")
@@ -97,11 +99,16 @@ func AwaitTask(ctx context.Context, c Client, node, upid string, opts ...AwaitOp
 
 	status, err := c.Tasks().Wait(ctx, node, upid, waitOpts)
 	if err != nil {
-		// ctx cancellation surfaces as context.DeadlineExceeded from the SDK poller.
+		// ctx cancellation / deadline: retriable so the director re-issues the
+		// CPI action. The in-flight PVE task is orphaned; the director supplies
+		// a fresh VMID on retry and the VMID range-scan prevents collision.
 		if ctx.Err() != nil {
-			return cpierrors.Wrap(ctx.Err(), fmt.Sprintf("AwaitTask %s: context cancelled", upid))
+			return cpierrors.WrapAs(ctx.Err(), cpierrors.TypeRetriableCloud,
+				fmt.Sprintf("AwaitTask %s: context cancelled", upid))
 		}
-		return cpierrors.Wrap(err, fmt.Sprintf("AwaitTask %s: poll failed", upid))
+		// Route through WrapError: 5xx, ConnectionError, TimeoutError, net.Error
+		// Timeout all surface as retriable; permanent SDK errors stay non-retriable.
+		return wrapPollError(err, upid)
 	}
 
 	if status == nil {
@@ -120,6 +127,25 @@ func AwaitTask(ctx context.Context, c Client, node, upid string, opts ...AwaitOp
 	}
 
 	return nil
+}
+
+// wrapPollError maps a task poll SDK error to the appropriate CPI error type.
+//
+// 404 errors are wrapped directly via cpierrors.Wrap (non-retriable, SDK chain
+// preserved) so callers can still detect them with pve.IsNotFound — a not-found
+// task UPID is a permanent condition, not a transient one.
+//
+// All other errors route through WrapError for standard retriability
+// classification: 5xx → retriable, ConnectionError/TimeoutError/net.Timeout →
+// retriable, 4xx non-404 → non-retriable, unknown → non-retriable.
+func wrapPollError(err error, upid string) error {
+	label := fmt.Sprintf("AwaitTask %s: poll failed", upid)
+	if IsNotFound(err) {
+		// Preserve SDK error chain so handlers can detect not-found via IsNotFound.
+		return cpierrors.Wrap(err, label)
+	}
+	mapped := WrapError(err)
+	return cpierrors.Wrap(mapped, label)
 }
 
 // AwaitTaskWithLogger is like AwaitTask but emits debug/error log entries via the

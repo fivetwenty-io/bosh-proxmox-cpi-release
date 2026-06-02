@@ -69,7 +69,7 @@ type Service interface {
 	// List all custom and default CPU models.
 	ListCapabilitiesQemuCpu(ctx context.Context, node string, params *ListCapabilitiesQemuCpuParams) (*ListCapabilitiesQemuCpuResponse, error)
 	// ListCapabilitiesQemuCpuFlags GET /nodes/{node}/capabilities/qemu/cpu-flags
-	// List of available VM-specific CPU flags.
+	// List of available VM-specific CPU flags. Returns an empty list for 'aarch64' as no VM-specific flags are defined for it yet.
 	ListCapabilitiesQemuCpuFlags(ctx context.Context, node string, params *ListCapabilitiesQemuCpuFlagsParams) (*ListCapabilitiesQemuCpuFlagsResponse, error)
 	// ListCapabilitiesQemuMachines GET /nodes/{node}/capabilities/qemu/machines
 	// Get available QEMU/KVM machine types.
@@ -90,7 +90,7 @@ type Service interface {
 	// Get the Ceph configuration file.
 	ListCephCfgRaw(ctx context.Context, node string) (*ListCephCfgRawResponse, error)
 	// ListCephCfgValue GET /nodes/{node}/ceph/cfg/value
-	// Get configured values from either the config file or config DB.
+	// Get configured values from either ceph.conf or the mon config DB. Underscores in section and key names are normalised to hyphens in the response, regardless of how they're written in the source.
 	ListCephCfgValue(ctx context.Context, node string, params *ListCephCfgValueParams) (*ListCephCfgValueResponse, error)
 	// ListCephCmdSafety GET /nodes/{node}/ceph/cmd-safety
 	// Heuristical check if it is safe to perform an action.
@@ -101,11 +101,14 @@ type Service interface {
 	// ListCephFs GET /nodes/{node}/ceph/fs
 	// Directory index.
 	ListCephFs(ctx context.Context, node string) (*ListCephFsResponse, error)
+	// DeleteCephFs DELETE /nodes/{node}/ceph/fs/{name}
+	// Destroy a Ceph filesystem. Refuses if any PVE storage entry of type 'cephfs' still references the filesystem and is not disabled. Optionally also removes the storage entries and/or the underlying metadata and data pools.
+	DeleteCephFs(ctx context.Context, node string, name string, params *DeleteCephFsParams) (*DeleteCephFsResponse, error)
 	// CreateCephFs POST /nodes/{node}/ceph/fs/{name}
 	// Create a Ceph filesystem
 	CreateCephFs(ctx context.Context, node string, name string, params *CreateCephFsParams) (*CreateCephFsResponse, error)
 	// CreateCephInit POST /nodes/{node}/ceph/init
-	// Create initial ceph default configuration and setup symlinks.
+	// Create the initial Ceph default configuration and set up symlinks. Idempotent on re-call: if a [global] section already exists in ceph.conf, the existing fsid / auth / pool defaults are preserved and most parameters are silently ignored.
 	CreateCephInit(ctx context.Context, node string, params *CreateCephInitParams) error
 	// ListCephLog GET /nodes/{node}/ceph/log
 	// Read ceph log
@@ -132,10 +135,10 @@ type Service interface {
 	// Get Ceph monitor list.
 	ListCephMon(ctx context.Context, node string) (*ListCephMonResponse, error)
 	// DeleteCephMon DELETE /nodes/{node}/ceph/mon/{monid}
-	// Destroy Ceph Monitor and Manager.
+	// Destroy a Ceph Monitor. Refuses to remove the last monitor of the cluster. Does not destroy any Manager on the same node; use /nodes/{node}/ceph/mgr/{id} for that.
 	DeleteCephMon(ctx context.Context, node string, monid string) (*DeleteCephMonResponse, error)
 	// CreateCephMon POST /nodes/{node}/ceph/mon/{monid}
-	// Create Ceph Monitor and Manager
+	// Create a Ceph Monitor. Also auto-creates a Manager for the first monitor.
 	CreateCephMon(ctx context.Context, node string, monid string, params *CreateCephMonParams) (*CreateCephMonResponse, error)
 	// ListCephOsd GET /nodes/{node}/ceph/osd
 	// Get Ceph osd list/tree.
@@ -192,7 +195,7 @@ type Service interface {
 	// Start ceph services.
 	CreateCephStart(ctx context.Context, node string, params *CreateCephStartParams) (*CreateCephStartResponse, error)
 	// ListCephStatus GET /nodes/{node}/ceph/status
-	// Get ceph status.
+	// Get the Ceph cluster status (raw 'ceph status' output). The response is cluster-wide and identical to /cluster/ceph/status; this node-level alias exists for operator convenience.
 	ListCephStatus(ctx context.Context, node string) (*ListCephStatusResponse, error)
 	// CreateCephStop POST /nodes/{node}/ceph/stop
 	// Stop ceph services.
@@ -1692,6 +1695,8 @@ func (s *service) ListCapabilitiesQemuCpu(ctx context.Context, node string, para
 
 // ListCapabilitiesQemuCpuFlagsParams is the request payload for ListCapabilitiesQemuCpuFlags.
 type ListCapabilitiesQemuCpuFlagsParams struct {
+	// Accel Acceleration type to check node compatibility for.
+	Accel *string `json:"accel,omitempty"`
 	// Arch Virtual processor architecture. Defaults to the host architecture.
 	Arch *string `json:"arch,omitempty"`
 }
@@ -1957,7 +1962,7 @@ func (s *service) ListCephCfgRaw(ctx context.Context, node string) (*ListCephCfg
 
 // ListCephCfgValueParams is the request payload for ListCephCfgValue.
 type ListCephCfgValueParams struct {
-	// ConfigKeys List of <section>:<config key> items.
+	// ConfigKeys List of <section>:<config key> items separated by semicolon, comma or space.
 	ConfigKeys string `json:"config-keys"`
 }
 
@@ -2016,9 +2021,9 @@ type ListCephCmdSafetyParams struct {
 
 // ListCephCmdSafetyResponse mirrors the shape returned by GET /nodes/{node}/ceph/cmd-safety.
 type ListCephCmdSafetyResponse struct {
-	// Safe If it is safe to run the command.
+	// Safe True if Ceph reports the requested action is safe.
 	Safe bool `json:"safe"`
-	// Status Status message given by Ceph.
+	// Status Human-readable status message from Ceph (typically the reason an action is not safe); absent when Ceph returned no message.
 	Status *string `json:"status,omitempty"`
 }
 
@@ -2127,6 +2132,57 @@ func (s *service) ListCephFs(ctx context.Context, node string) (*ListCephFsRespo
 	return out, nil
 }
 
+// DeleteCephFsParams is the request payload for DeleteCephFs.
+type DeleteCephFsParams struct {
+	// RemovePools Remove the metadata and data pools used by this filesystem.
+	RemovePools *bool `json:"remove-pools,omitempty"`
+	// RemoveStorages Remove pveceph-managed storages configured for this filesystem.
+	RemoveStorages *bool `json:"remove-storages,omitempty"`
+}
+
+// DeleteCephFsResponse is the raw JSON returned by DELETE /nodes/{node}/ceph/fs/{name}.
+type DeleteCephFsResponse = json.RawMessage
+
+// DeleteCephFs implements Service.DeleteCephFs. DELETE /nodes/{node}/ceph/fs/{name}.
+func (s *service) DeleteCephFs(ctx context.Context, node string, name string, params *DeleteCephFsParams) (*DeleteCephFsResponse, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("nodes.DeleteCephFs: ctx must not be nil")
+	}
+	path := fmt.Sprintf("/nodes/%s/ceph/fs/%s", url.PathEscape(node), url.PathEscape(name))
+	var body map[string]interface{}
+	if params != nil {
+		raw, err := json.Marshal(params)
+		if err != nil {
+			return nil, fmt.Errorf("nodes.DeleteCephFs: marshal params: %w", err)
+		}
+		err = json.Unmarshal(raw, &body)
+		if err != nil {
+			return nil, fmt.Errorf("nodes.DeleteCephFs: decode params: %w", err)
+		}
+	}
+	resp, err := s.c.DeleteRawCtx(ctx, path, body)
+	if err != nil {
+		return nil, fmt.Errorf("nodes.DeleteCephFs: %w", err)
+	}
+	if resp == nil {
+		return nil, fmt.Errorf("nodes.DeleteCephFs: nil response from client")
+	}
+	if resp.Data == nil {
+		out := DeleteCephFsResponse{}
+		return &out, nil
+	}
+	raw, err := json.Marshal(resp.Data)
+	if err != nil {
+		return nil, fmt.Errorf("nodes.DeleteCephFs: re-marshal data: %w", err)
+	}
+	out := &DeleteCephFsResponse{}
+	err = json.Unmarshal(raw, out)
+	if err != nil {
+		return nil, fmt.Errorf("nodes.DeleteCephFs: unmarshal data: %w", err)
+	}
+	return out, nil
+}
+
 // CreateCephFsParams is the request payload for CreateCephFs.
 type CreateCephFsParams struct {
 	// AddStorage Configure the created CephFS as storage for this cluster.
@@ -2180,7 +2236,7 @@ func (s *service) CreateCephFs(ctx context.Context, node string, name string, pa
 
 // CreateCephInitParams is the request payload for CreateCephInit.
 type CreateCephInitParams struct {
-	// ClusterNetwork Declare a separate cluster network, OSDs will routeheartbeat, object replication and recovery traffic over it
+	// ClusterNetwork Declare a separate cluster network, OSDs will route heartbeat, object replication and recovery traffic over it
 	ClusterNetwork *string `json:"cluster-network,omitempty"`
 	// DisableCephx Disable cephx authentication.  WARNING: cephx is a security feature protecting against man-in-the-middle attacks. Only consider disabling cephx if your network is private!
 	DisableCephx *bool `json:"disable_cephx,omitempty"`
@@ -2224,7 +2280,9 @@ func (s *service) CreateCephInit(ctx context.Context, node string, params *Creat
 
 // ListCephLogParams is the request payload for ListCephLog.
 type ListCephLogParams struct {
+	// Limit Maximum number of log lines to return. Defaults to the dump_logfile limit (typically 50) when omitted.
 	Limit *int64 `json:"limit,omitempty"`
+	// Start Offset of the first log line to return (0-based).
 	Start *int64 `json:"start,omitempty"`
 }
 
@@ -2600,8 +2658,13 @@ func (s *service) CreateCephMon(ctx context.Context, node string, monid string, 
 	return out, nil
 }
 
-// ListCephOsdResponse is the raw JSON returned by GET /nodes/{node}/ceph/osd.
-type ListCephOsdResponse = json.RawMessage
+// ListCephOsdResponse mirrors the shape returned by GET /nodes/{node}/ceph/osd.
+type ListCephOsdResponse struct {
+	// Flags Comma-joined list of currently-set OSD flags; absent when no flags are set on the cluster.
+	Flags *string `json:"flags,omitempty"`
+	// Root Top-level CRUSH bucket; recursive structure with 'children' lists holding nested buckets and OSD leaves. Per-node properties (status, weight, in, usage, latencies, etc.) vary by node type and are not statically typed here.
+	Root json.RawMessage `json:"root"`
+}
 
 // ListCephOsd implements Service.ListCephOsd. GET /nodes/{node}/ceph/osd.
 func (s *service) ListCephOsd(ctx context.Context, node string) (*ListCephOsdResponse, error) {
@@ -2618,8 +2681,7 @@ func (s *service) ListCephOsd(ctx context.Context, node string) (*ListCephOsdRes
 		return nil, fmt.Errorf("nodes.ListCephOsd: nil response from client")
 	}
 	if resp.Data == nil {
-		out := ListCephOsdResponse{}
-		return &out, nil
+		return nil, fmt.Errorf("nodes.ListCephOsd: empty data in response (code=%d)", resp.Code)
 	}
 	raw, err := json.Marshal(resp.Data)
 	if err != nil {
@@ -2645,7 +2707,7 @@ type CreateCephOsdParams struct {
 	Dev string `json:"dev"`
 	// Encrypted Enables encryption of the OSD.
 	Encrypted *bool `json:"encrypted,omitempty"`
-	// OsdsPerDevice OSD services per physical device. Only useful for fast NVMe devices"       ." to utilize their performance better.
+	// OsdsPerDevice OSD services per physical device. Only useful for fast NVMe devices to utilize their performance better. Mutually exclusive with 'db_dev' and 'wal_dev'.
 	OsdsPerDevice *int64 `json:"osds-per-device,omitempty"`
 	// WalDev Block device name for block.wal.
 	WalDev *string `json:"wal_dev,omitempty"`
@@ -2698,7 +2760,7 @@ func (s *service) CreateCephOsd(ctx context.Context, node string, params *Create
 
 // DeleteCephOsdParams is the request payload for DeleteCephOsd.
 type DeleteCephOsdParams struct {
-	// Cleanup If set, we remove partition table entries.
+	// Cleanup If set, also destroy the underlying logical volumes via 'ceph-volume lvm zap --destroy', remove the volume group's physical volume with pvremove, and wipe any journal/block.db/block.wal partitions left over from filestore OSDs. Without this flag the LVs and partitions are left intact for inspection.
 	Cleanup *bool `json:"cleanup,omitempty"`
 }
 
@@ -2981,7 +3043,7 @@ func (s *service) ListCephPool(ctx context.Context, node string) (*ListCephPoolR
 
 // CreateCephPoolParams is the request payload for CreateCephPool.
 type CreateCephPoolParams struct {
-	// AddStorages Configure VM and CT storage using the new pool.
+	// AddStorages Configure VM and CT storage using the new pool. Defaults to false for replicated pools and to true for erasure-coded pools (since EC pools are typically only useful when wired up to storage).
 	AddStorages *bool `json:"add_storages,omitempty"`
 	// Application The application of the pool.
 	Application *string `json:"application,omitempty"`
@@ -3210,39 +3272,53 @@ type ListCephPoolStatusParams struct {
 // ListCephPoolStatusResponse mirrors the shape returned by GET /nodes/{node}/ceph/pool/{name}/status.
 type ListCephPoolStatusResponse struct {
 	// Application The application of the pool.
-	Application     *string           `json:"application,omitempty"`
-	ApplicationList []json.RawMessage `json:"application_list,omitempty"`
-	AutoscaleStatus json.RawMessage   `json:"autoscale_status,omitempty"`
+	Application *string `json:"application,omitempty"`
+	// ApplicationList Names of applications currently associated with the pool.
+	ApplicationList []string `json:"application_list,omitempty"`
+	// AutoscaleStatus Raw pg_autoscaler status object for this pool; shape varies between Ceph releases.
+	AutoscaleStatus json.RawMessage `json:"autoscale_status,omitempty"`
 	// CrushRule The rule to use for mapping object placement in the cluster.
-	CrushRule  *string `json:"crush_rule,omitempty"`
-	FastRead   bool    `json:"fast_read"`
-	Hashpspool bool    `json:"hashpspool"`
-	Id         int64   `json:"id"`
+	CrushRule *string `json:"crush_rule,omitempty"`
+	// FastRead Set if the pool uses fast-read for erasure-coded reads.
+	FastRead bool `json:"fast_read"`
+	// Hashpspool Set if the pool hashes pool id into its CRUSH placement-seed.
+	Hashpspool bool `json:"hashpspool"`
+	// Id Numeric pool id assigned by Ceph.
+	Id int64 `json:"id"`
 	// MinSize Minimum number of replicas per object
 	MinSize *int64 `json:"min_size,omitempty"`
 	// Name The name of the pool. It must be unique.
-	Name         string `json:"name"`
-	NodeepScrub  bool   `json:"nodeep-scrub"`
-	Nodelete     bool   `json:"nodelete"`
-	Nopgchange   bool   `json:"nopgchange"`
-	Noscrub      bool   `json:"noscrub"`
-	Nosizechange bool   `json:"nosizechange"`
+	Name string `json:"name"`
+	// NodeepScrub Set if deep-scrubbing is disabled for this pool.
+	NodeepScrub bool `json:"nodeep-scrub"`
+	// Nodelete Set if pool delete is blocked.
+	Nodelete bool `json:"nodelete"`
+	// Nopgchange Set if changing the placement-group count is blocked.
+	Nopgchange bool `json:"nopgchange"`
+	// Noscrub Set if scrubbing is disabled for this pool.
+	Noscrub bool `json:"noscrub"`
+	// Nosizechange Set if changing the replication size is blocked.
+	Nosizechange bool `json:"nosizechange"`
 	// PgAutoscaleMode The automatic PG scaling mode of the pool.
 	PgAutoscaleMode *string `json:"pg_autoscale_mode,omitempty"`
 	// PgNum Number of placement groups.
 	PgNum *int64 `json:"pg_num,omitempty"`
 	// PgNumMin Minimal number of placement groups.
 	PgNumMin *int64 `json:"pg_num_min,omitempty"`
-	PgpNum   int64  `json:"pgp_num"`
+	// PgpNum Placement-group-for-placement count.
+	PgpNum int64 `json:"pgp_num"`
 	// Size Number of replicas per object
-	Size       *int64          `json:"size,omitempty"`
+	Size *int64 `json:"size,omitempty"`
+	// Statistics Optional pool usage and IO statistics (only present when verbose=1 is requested).
 	Statistics json.RawMessage `json:"statistics,omitempty"`
 	// TargetSize The estimated target size of the pool for the PG autoscaler.
 	TargetSize *string `json:"target_size,omitempty"`
 	// TargetSizeRatio The estimated target ratio of the pool for the PG autoscaler.
-	TargetSizeRatio      *float64 `json:"target_size_ratio,omitempty"`
-	UseGmtHitset         bool     `json:"use_gmt_hitset"`
-	WriteFadviseDontneed bool     `json:"write_fadvise_dontneed"`
+	TargetSizeRatio *float64 `json:"target_size_ratio,omitempty"`
+	// UseGmtHitset Set if hitsets use GMT timestamps (for cache-tier pools).
+	UseGmtHitset bool `json:"use_gmt_hitset"`
+	// WriteFadviseDontneed Set if the pool sets the FADV_DONTNEED hint on writes.
+	WriteFadviseDontneed bool `json:"write_fadvise_dontneed"`
 }
 
 // ListCephPoolStatus implements Service.ListCephPoolStatus. GET /nodes/{node}/ceph/pool/{name}/status.
@@ -3853,6 +3929,8 @@ type ListConfigResponse struct {
 	Description *string `json:"description,omitempty"`
 	// Digest Prevent changes if current configuration file has different SHA1 digest. This can be used to prevent concurrent modifications.
 	Digest *string `json:"digest,omitempty"`
+	// Location The location of the node. Overrides the default from the datacenter config.
+	Location *string `json:"location,omitempty"`
 	// StartallOnbootDelay Initial delay in seconds, before starting all the Virtual Guests with on-boot enabled.
 	StartallOnbootDelay *int64 `json:"startall-onboot-delay,omitempty"`
 	// Wakeonlan Node specific wake on LAN settings.
@@ -3910,6 +3988,8 @@ type UpdateConfigParams struct {
 	Description *string `json:"description,omitempty"`
 	// Digest Prevent changes if current configuration file has different SHA1 digest. This can be used to prevent concurrent modifications.
 	Digest *string `json:"digest,omitempty"`
+	// Location The location of the node. Overrides the default from the datacenter config.
+	Location *string `json:"location,omitempty"`
 	// StartallOnbootDelay Initial delay in seconds, before starting all the Virtual Guests with on-boot enabled.
 	StartallOnbootDelay *int64 `json:"startall-onboot-delay,omitempty"`
 	// Wakeonlan Node specific wake on LAN settings.
@@ -18495,8 +18575,6 @@ type CreateVzdumpParams struct {
 	Mailnotification *string `json:"mailnotification,omitempty"`
 	// Mailto Deprecated: Use notification targets/matchers instead. Comma-separated list of email addresses or users that should receive email notifications.
 	Mailto *string `json:"mailto,omitempty"`
-	// Maxfiles Deprecated: use 'prune-backups' instead. Maximal number of backup files per guest system.
-	Maxfiles *int64 `json:"maxfiles,omitempty"`
 	// Mode Backup mode.
 	Mode *string `json:"mode,omitempty"`
 	// NotesTemplate Template string for generating notes for the backup(s). It can contain variables which will be replaced by their values. Currently supported are {{cluster}}, {{guestname}}, {{node}}, and {{vmid}}, but more might be added in the future. Needs to be a single line, newline and backslash need to be escaped as '\n' and '\\' respectively.
@@ -18612,8 +18690,6 @@ type ListVzdumpDefaultsResponse struct {
 	Mailnotification *string `json:"mailnotification,omitempty"`
 	// Mailto Deprecated: Use notification targets/matchers instead. Comma-separated list of email addresses or users that should receive email notifications.
 	Mailto *string `json:"mailto,omitempty"`
-	// Maxfiles Deprecated: use 'prune-backups' instead. Maximal number of backup files per guest system.
-	Maxfiles *int64 `json:"maxfiles,omitempty"`
 	// Mode Backup mode.
 	Mode *string `json:"mode,omitempty"`
 	// Node Only run if executed on this node.

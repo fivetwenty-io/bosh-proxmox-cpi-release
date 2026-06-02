@@ -8,6 +8,28 @@ import (
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/cache"
 )
 
+// Package-level string constants used across multiple files in this package.
+const (
+	// Content-type strings.
+	contentTypeJSON           = "application/json"
+	contentTypeFormURLEncoded = "application/x-www-form-urlencoded"
+	contentTypeTextPlain      = "text/plain"
+
+	// Protocol string.
+	protoHTTPS = "https"
+
+	// Log field keys.
+	logFieldMethod = "method"
+	logFieldURL    = "url"
+	logFieldError  = "error"
+
+	// Redaction sentinel.
+	redactedValue = "REDACTED"
+
+	// Redact param keys used in defaultLogConfig.
+	redactParamPassword = "password"
+)
+
 // SSLVerifyMode defines how SSL certificates should be verified.
 type SSLVerifyMode int
 

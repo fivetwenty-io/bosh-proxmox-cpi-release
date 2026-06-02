@@ -205,6 +205,10 @@ func (m *stemcellMockTasks) Wait(ctx context.Context, node, upid string, opts *s
 	return &sdktasks.Status{Status: "stopped", ExitStatus: "OK", UpID: upid}, nil
 }
 
+func (m *stemcellMockTasks) WaitForUPID(ctx context.Context, upid string, opts *sdktasks.WaitOptions) (*sdktasks.Status, error) {
+	panic("stemcellMockTasks.WaitForUPID: not expected in stemcell tests")
+}
+
 // stemcellMockCluster satisfies sdkcluster.Service for stemcell tests.
 // ListResources and ListConfigNodes are wired; other methods panic.
 type stemcellMockCluster struct {

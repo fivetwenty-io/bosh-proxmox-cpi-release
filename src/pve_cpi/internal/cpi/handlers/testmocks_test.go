@@ -236,6 +236,10 @@ func (m *mockTasksService) Wait(ctx context.Context, node, upid string, opts *ta
 	return &tasks.Status{ExitStatus: "OK"}, nil
 }
 
+func (m *mockTasksService) WaitForUPID(ctx context.Context, upid string, opts *tasks.WaitOptions) (*tasks.Status, error) {
+	panic("mockTasksService.WaitForUPID: not expected in handler tests")
+}
+
 // --------------------------------------------------------------------------
 // mockStorageService
 // --------------------------------------------------------------------------

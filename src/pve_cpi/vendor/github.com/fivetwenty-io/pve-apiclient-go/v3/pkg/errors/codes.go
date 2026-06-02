@@ -108,13 +108,16 @@ func IsServerErrorCode(code int) bool {
 }
 
 // IsRetryableCode returns true if the error code indicates the request can be retried.
+// 423 (resource locked) is intentionally excluded: a PVE lock is held for the
+// duration of another operation, so an immediate retry would just hit the lock
+// again. Callers that want to wait for a lock should poll the relevant task
+// rather than relying on transport-level retries.
 func IsRetryableCode(code int) bool {
 	switch code {
 	case StatusTooManyRequests,
 		StatusServiceUnavailable,
 		StatusGatewayTimeout,
-		StatusBadGateway,
-		CodeResourceLocked:
+		StatusBadGateway:
 		return true
 	default:
 		return false

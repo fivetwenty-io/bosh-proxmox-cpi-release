@@ -287,6 +287,70 @@ type CPIConfig struct {
 	// "full": force full clone on all backends.
 	// ApplyDefaults treats empty string as "auto". omit from ERB when empty.
 	CloneMode string `json:"clone_mode,omitempty"`
+
+	// Placement is an optional nested block that controls availability-aware
+	// node selection and anti-affinity at create_vm time. When nil (field absent
+	// from JSON), all placement behavior defaults to safe defaults via accessors.
+	// When present, sub-fields follow the pointer-optional pattern: nil = absent
+	// = use default; explicit value overrides.
+	Placement *PlacementConfig `json:"placement,omitempty"`
+
+	// EnsureNoIPConflicts, when true (default), causes create_vm to verify that
+	// no existing VM on the candidate node already holds the same static IP before
+	// provisioning. Prevents duplicate-IP collisions on static networks. Set
+	// false only for dynamic (DHCP) networks where IP pre-assignment is not
+	// meaningful. Pointer-typed so nil (absent from JSON) is distinguishable from
+	// an explicit false. Use EnsureNoIPConflictsEnabled() to obtain the effective
+	// bool. Validate-only-when-set; omit from ERB output when nil.
+	EnsureNoIPConflicts *bool `json:"ensure_no_ip_conflicts,omitempty"`
+}
+
+// PlacementConfig holds all availability-aware node-selection knobs.
+// The struct is embedded as a pointer in CPIConfig so that a fully-absent
+// placement block (nil) is cheap to detect and preserves zero-regression for
+// existing configurations.
+type PlacementConfig struct {
+	// Enabled controls whether live node scoring runs at create_vm time.
+	// Default true (DEC-2: fully protective). When false, create_vm falls
+	// back to Config.Node (existing behavior). Pointer-typed so nil is
+	// treated as the default rather than explicit false.
+	Enabled *bool `json:"enabled,omitempty"`
+
+	// Weights tunes the node-scoring formula. When nil, ApplyDefaults
+	// fills each axis with a sane default. Individual nil sub-fields also
+	// defer to defaults. Pointer-typed so an absent weights block never
+	// forces materialization of the parent Placement block.
+	Weights *PlacementWeights `json:"weights,omitempty"`
+
+	// AZMap maps availability-zone names to the list of PVE node names that
+	// serve that AZ. When create_vm receives a cloud_properties.availability_zone
+	// that is present in this map, the candidate set is restricted to those
+	// nodes. An AZ name present in cloud_properties but absent from the map
+	// yields a CloudError (explicit misconfiguration, not silent fall-through).
+	// When empty or nil, all online nodes are candidates (default, zero regression).
+	AZMap map[string][]string `json:"az_map,omitempty"`
+
+	// AntiAffinity is a placeholder field reserved for Tier-2 implementation.
+	// Defining it here means Tier-2 needs no changes to config schema or ERB.
+	// Default nil (false): anti-affinity logic is inactive in Tier 1.
+	// Pointer-typed so nil and explicit false are both "off".
+	AntiAffinity *bool `json:"anti_affinity,omitempty"`
+}
+
+// PlacementWeights controls how each scoring axis contributes to the final
+// per-node score at create_vm time. Higher weight = stronger preference.
+// All fields are float64 ≥ 0; negative values are rejected by Validate.
+// ApplyDefaults fills zero-value fields with documented sane defaults.
+type PlacementWeights struct {
+	// Mem weights free-memory headroom. Default 1.0 (highest priority axis:
+	// prefer the node with the most available RAM).
+	Mem float64 `json:"mem,omitempty"`
+	// Storage weights free-storage fraction on the target pool. Default 0.5.
+	Storage float64 `json:"storage,omitempty"`
+	// CPU weights free-CPU headroom (max_cpu − used_cpu fraction). Default 0.5.
+	CPU float64 `json:"cpu,omitempty"`
+	// GuestCount weights inverse guest count (prefer emptier nodes). Default 0.3.
+	GuestCount float64 `json:"guest_count,omitempty"`
 }
 
 // FetchCredentialDefault maps a URL prefix to a JSON auth payload understood
@@ -511,6 +575,7 @@ func (c *CPIConfig) ApplyDefaults() {
 	if c.SDNZoneType == "" {
 		c.SDNZoneType = "simple"
 	}
+	c.applyPlacementDefaults()
 	// Authentication precedence: when both password and api_token are present
 	// (e.g. a kit renders a placeholder password alongside a real api_token
 	// because credhub entombment rejects empty values), the api_token wins —
@@ -523,6 +588,38 @@ func (c *CPIConfig) ApplyDefaults() {
 	// validation pass observes it.
 	if c.Password != "" && c.APIToken != "" {
 		c.Password = ""
+	}
+}
+
+// applyPlacementDefaults fills zero-value Placement.Weights axes when the
+// Placement block is present. Never materializes a nil Placement pointer.
+// Extracted from ApplyDefaults to reduce its cognitive complexity.
+func (c *CPIConfig) applyPlacementDefaults() {
+	// Only when the block is present. Never materialize a nil Placement to
+	// avoid phantom JSON output. Accessors handle nil → default.
+	// EnsureNoIPConflicts: nil means absent → default true via accessor; no
+	// field mutation needed (accessor handles nil safely).
+	if c.Placement == nil {
+		return
+	}
+	// Enabled: nil → default true via accessor; no mutation needed.
+	// Weights: if block is present, fill any zero axes so consumers see
+	// documented defaults even when inspecting Weights directly (not via
+	// EffectiveWeights). Only fill when Weights block is present.
+	if c.Placement.Weights == nil {
+		return
+	}
+	if c.Placement.Weights.Mem == 0 {
+		c.Placement.Weights.Mem = 1.0
+	}
+	if c.Placement.Weights.Storage == 0 {
+		c.Placement.Weights.Storage = 0.5
+	}
+	if c.Placement.Weights.CPU == 0 {
+		c.Placement.Weights.CPU = 0.5
+	}
+	if c.Placement.Weights.GuestCount == 0 {
+		c.Placement.Weights.GuestCount = 0.3
 	}
 }
 
@@ -574,6 +671,76 @@ func (c *CPIConfig) RegistryAllowPrivateIPValue() bool {
 	return *c.RegistryAllowPrivateIP
 }
 
+// PlacementEnabled returns the effective placement-scoring toggle.
+// nil Placement block OR nil Placement.Enabled → true (DEC-2: fully protective default).
+// Explicit *false → false (operator opt-out).
+func (c *CPIConfig) PlacementEnabled() bool {
+	if c.Placement == nil || c.Placement.Enabled == nil {
+		return true
+	}
+	return *c.Placement.Enabled
+}
+
+// EffectiveWeights returns PlacementWeights with all zero-value axes filled to
+// their sane defaults. Callers always get a non-nil, fully-populated struct:
+//   - Mem        → 1.0
+//   - Storage    → 0.5
+//   - CPU        → 0.5
+//   - GuestCount → 0.3
+//
+// Explicit operator-supplied values are preserved (ApplyDefaults already ran).
+func (c *CPIConfig) EffectiveWeights() PlacementWeights {
+	var w PlacementWeights
+	if c.Placement != nil && c.Placement.Weights != nil {
+		w = *c.Placement.Weights
+	}
+	if w.Mem == 0 {
+		w.Mem = 1.0
+	}
+	if w.Storage == 0 {
+		w.Storage = 0.5
+	}
+	if w.CPU == 0 {
+		w.CPU = 0.5
+	}
+	if w.GuestCount == 0 {
+		w.GuestCount = 0.3
+	}
+	return w
+}
+
+// AntiAffinityEnabled returns whether Tier-2 anti-affinity logic is active.
+// Default false (nil Placement or nil Placement.AntiAffinity).
+// Tier-2 implementation reads this; Tier-1 code may call it safely.
+func (c *CPIConfig) AntiAffinityEnabled() bool {
+	if c.Placement == nil || c.Placement.AntiAffinity == nil {
+		return false
+	}
+	return *c.Placement.AntiAffinity
+}
+
+// AZCandidates returns the node list for az and true when az is a known key in
+// Placement.AZMap. Returns nil, false when: Placement is nil, AZMap is empty,
+// or az is not in the map. Callers treat (nil, false) as "all online nodes".
+func (c *CPIConfig) AZCandidates(az string) ([]string, bool) {
+	if c.Placement == nil || len(c.Placement.AZMap) == 0 || az == "" {
+		return nil, false
+	}
+	nodes, ok := c.Placement.AZMap[az]
+	return nodes, ok
+}
+
+// EnsureNoIPConflictsEnabled returns the effective IP-conflict guard toggle.
+// nil (field absent from JSON) → true (DEC-2: protective default for static networks).
+// *false → false (operator opt-out, e.g. pure-DHCP networks).
+// *true  → true.
+func (c *CPIConfig) EnsureNoIPConflictsEnabled() bool {
+	if c.EnsureNoIPConflicts == nil {
+		return true
+	}
+	return *c.EnsureNoIPConflicts
+}
+
 // Validate checks all required fields and enum constraints.
 // Returns a CloudError whose message lists every violation, separated by "; ".
 //
@@ -595,6 +762,7 @@ func (c *CPIConfig) ValidateWithLogger(logger *log.Logger) error {
 	c.validateEnumFields(&errs)
 	c.validateRanges(&errs)
 	c.validateRegistryConfig(&errs, logger)
+	c.validatePlacement(&errs)
 	if len(errs) > 0 {
 		return cpierrors.Cloud("config validation failed: %s", strings.Join(errs, "; "))
 	}
@@ -1009,6 +1177,50 @@ func emitRegistryPrivateIPWarning(logger *log.Logger, endpoint string) {
 		"registry_allow_private_ip=true; private/loopback IP check disabled for registry endpoint",
 		log.String("endpoint", redactEndpoint(endpoint)),
 	)
+}
+
+// validatePlacement validates the optional Placement block. Skipped entirely
+// when Placement is nil (validate-only-when-set). Checks:
+//   - AZMap: every AZ name is non-empty (always true by map key semantics),
+//     every node name list is non-empty, every node name is non-empty.
+//   - Weights (when present): all axes ≥ 0 (negative weights invert scoring).
+//
+// No PVE API calls are made; node names are not checked for cluster membership.
+func (c *CPIConfig) validatePlacement(errs *[]string) {
+	if c.Placement == nil {
+		return
+	}
+	// AZMap: each AZ must have at least one non-empty node name.
+	for az, nodes := range c.Placement.AZMap {
+		if len(nodes) == 0 {
+			*errs = append(*errs, fmt.Sprintf(
+				"placement.az_map[%q] must contain at least one node name", az,
+			))
+			continue
+		}
+		for i, n := range nodes {
+			if n == "" {
+				*errs = append(*errs, fmt.Sprintf(
+					"placement.az_map[%q][%d] must not be an empty string", az, i,
+				))
+			}
+		}
+	}
+	// Weights: negative values invert the scoring formula and are rejected.
+	if c.Placement.Weights != nil {
+		w := c.Placement.Weights
+		checkWeight := func(name string, v float64) {
+			if v < 0 {
+				*errs = append(*errs, fmt.Sprintf(
+					"placement.weights.%s must be ≥ 0, got %g", name, v,
+				))
+			}
+		}
+		checkWeight("mem", w.Mem)
+		checkWeight("storage", w.Storage)
+		checkWeight("cpu", w.CPU)
+		checkWeight("guest_count", w.GuestCount)
+	}
 }
 
 // redactEndpoint strips userinfo from a URL so the endpoint can be logged

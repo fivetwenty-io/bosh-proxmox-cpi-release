@@ -301,13 +301,25 @@ func (c *client) Logout() error {
 }
 
 // UpdateTicket updates the authentication ticket.
+// The new ticket is propagated to the live authenticator so subsequent requests
+// carry it; the cached CSRF token is reused unless separately updated.
 func (c *client) UpdateTicket(ticket string) {
 	c.options.Ticket = ticket
+
+	if a, ok := c.httpClient.(*internalHTTPAdapter); ok && a.inner != nil {
+		a.inner.SetTicketValue(ticket, c.options.CSRFToken)
+	}
 }
 
 // UpdateCSRFToken updates the CSRF prevention token.
+// The new token is propagated to the live authenticator, preserving the
+// current ticket value.
 func (c *client) UpdateCSRFToken(token string) {
 	c.options.CSRFToken = token
+
+	if a, ok := c.httpClient.(*internalHTTPAdapter); ok && a.inner != nil {
+		a.inner.SetCSRFToken(token)
+	}
 }
 
 // SetTimeout sets the request timeout.

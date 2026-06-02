@@ -1442,3 +1442,7 @@ func (s *panicNodesStub) ListVzdumpExtractconfig(ctx context.Context, node strin
 func (s *panicNodesStub) CreateWakeonlan(ctx context.Context, node string) (*nodes.CreateWakeonlanResponse, error) {
 	panic("panicNodesStub.CreateWakeonlan: not expected")
 }
+
+func (s *panicNodesStub) DeleteCephFs(ctx context.Context, node string, name string, params *nodes.DeleteCephFsParams) (*nodes.DeleteCephFsResponse, error) {
+	panic("panicNodesStub.DeleteCephFs: not expected")
+}

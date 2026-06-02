@@ -1023,3 +1023,31 @@ func (s *panicClusterStub) ListStatus(_ context.Context) (*cluster.ListStatusRes
 func (s *panicClusterStub) ListTasks(_ context.Context) (*cluster.ListTasksResponse, error) {
 	panic("panicClusterStub.ListTasks: not configured for SDN test; opt in by setting ListTasksFn")
 }
+
+func (s *panicClusterStub) ListQemu(_ context.Context) (*cluster.ListQemuResponse, error) {
+	panic("panicClusterStub.ListQemu: not configured for SDN test; opt in by setting ListQemuFn")
+}
+
+func (s *panicClusterStub) ListQemuCpuFlags(_ context.Context, _ *cluster.ListQemuCpuFlagsParams) (*cluster.ListQemuCpuFlagsResponse, error) {
+	panic("panicClusterStub.ListQemuCpuFlags: not configured for SDN test; opt in by setting ListQemuCpuFlagsFn")
+}
+
+func (s *panicClusterStub) ListQemuCustomCpuModels(_ context.Context) (*cluster.ListQemuCustomCpuModelsResponse, error) {
+	panic("panicClusterStub.ListQemuCustomCpuModels: not configured for SDN test; opt in by setting ListQemuCustomCpuModelsFn")
+}
+
+func (s *panicClusterStub) CreateQemuCustomCpuModels(_ context.Context, _ *cluster.CreateQemuCustomCpuModelsParams) error {
+	panic("panicClusterStub.CreateQemuCustomCpuModels: not configured for SDN test; opt in by setting CreateQemuCustomCpuModelsFn")
+}
+
+func (s *panicClusterStub) GetQemuCustomCpuModels(_ context.Context, _ string) (*cluster.GetQemuCustomCpuModelsResponse, error) {
+	panic("panicClusterStub.GetQemuCustomCpuModels: not configured for SDN test; opt in by setting GetQemuCustomCpuModelsFn")
+}
+
+func (s *panicClusterStub) UpdateQemuCustomCpuModels(_ context.Context, _ string, _ *cluster.UpdateQemuCustomCpuModelsParams) error {
+	panic("panicClusterStub.UpdateQemuCustomCpuModels: not configured for SDN test; opt in by setting UpdateQemuCustomCpuModelsFn")
+}
+
+func (s *panicClusterStub) DeleteQemuCustomCpuModels(_ context.Context, _ string) error {
+	panic("panicClusterStub.DeleteQemuCustomCpuModels: not configured for SDN test; opt in by setting DeleteQemuCustomCpuModelsFn")
+}

@@ -63,7 +63,7 @@ type Handler func(*http.Request) (*http.Response, error)
 func NewClient(options *Options) (*Client, error) {
 	transport := createHTTPTransport(options)
 
-	if options.Protocol == "https" {
+	if options.Protocol == protoHTTPS {
 		tlsConfig, err := configureTLS(options)
 		if err != nil {
 			return nil, err
@@ -218,7 +218,8 @@ func configureVerifierCallbacks(verifier *issl.FingerprintVerifier, options *Opt
 }
 
 func createAuthenticator(options *Options, httpClient *http.Client) auth.Authenticator { //nolint:ireturn // Factory function pattern
-	if options.APIToken != "" {
+	switch {
+	case options.APIToken != "":
 		token, err := auth.ParseAPIToken(options.APIToken)
 		if err != nil {
 			// Caller cannot receive this error through NewClient currently; surface it via a
@@ -229,7 +230,8 @@ func createAuthenticator(options *Options, httpClient *http.Client) auth.Authent
 		}
 
 		return auth.NewAPITokenAuthenticator(token, options.APITokenName)
-	} else if options.Username != "" {
+
+	case options.Username != "":
 		credentials := &auth.Credentials{
 			Username: options.Username,
 			Password: options.Password,
@@ -242,9 +244,83 @@ func createAuthenticator(options *Options, httpClient *http.Client) auth.Authent
 		}
 
 		return auth.NewTicketAuthenticator(options.BaseURL(), credentials, httpClient, options.CookieName, options.PVENewFormat)
+
+	case options.Ticket != "":
+		// A pre-existing ticket was supplied without a token or username. Build a
+		// ticket authenticator seeded with it so requests are authenticated and
+		// the ticket can later be updated via SetTicket / renewed if it ages out.
+		return auth.NewTicketAuthenticatorFromTicket(
+			options.BaseURL(),
+			options.Ticket,
+			"",
+			options.Username,
+			nil,
+			httpClient,
+			options.CookieName,
+			options.PVENewFormat,
+		)
 	}
 
 	return nil
+}
+
+// SetTicketValue updates the active ticket on a ticket-based authenticator.
+// It is used to propagate an externally supplied ticket and CSRF token (for
+// example after an out-of-band login) onto the live authenticator so subsequent
+// requests carry the new credentials. It is a no-op when the configured
+// authenticator is not ticket based.
+func (c *Client) SetTicketValue(ticketValue, csrfToken string) {
+	ticketAuth, ok := c.authenticator.(*auth.TicketAuthenticator)
+	if !ok {
+		return
+	}
+
+	existing := ticketAuth.GetTicket()
+
+	username := ""
+	if existing != nil {
+		username = existing.Username
+	}
+
+	if csrfToken == "" && existing != nil {
+		csrfToken = existing.CSRFToken
+	}
+
+	validUntil := time.Now().Add(constants.TicketValidity())
+
+	createdAt, parseErr := auth.ParseTicketTimestamp(ticketValue)
+	if parseErr == nil {
+		validUntil = createdAt.Add(constants.TicketValidity())
+	}
+
+	ticketAuth.SetTicket(&auth.Ticket{
+		Value:      ticketValue,
+		CSRFToken:  csrfToken,
+		Username:   username,
+		ValidUntil: validUntil,
+	})
+}
+
+// SetCSRFToken updates only the CSRF prevention token on a ticket-based
+// authenticator, preserving the current ticket value. It is a no-op when the
+// authenticator is not ticket based or no ticket is currently set.
+func (c *Client) SetCSRFToken(csrfToken string) {
+	ticketAuth, ok := c.authenticator.(*auth.TicketAuthenticator)
+	if !ok {
+		return
+	}
+
+	existing := ticketAuth.GetTicket()
+	if existing == nil {
+		return
+	}
+
+	ticketAuth.SetTicket(&auth.Ticket{
+		Value:      existing.Value,
+		CSRFToken:  csrfToken,
+		Username:   existing.Username,
+		ValidUntil: existing.ValidUntil,
+	})
 }
 
 func createTLSConfig(sslOptions *SSLOptions) (*tls.Config, error) {
@@ -303,7 +379,7 @@ func (c *Client) DoWithContext(ctx context.Context, method, path string, params 
 		if closeErr != nil {
 			if c.logger != nil && c.logConfig.Enabled {
 				c.logger.Warn("failed to close response body", map[string]interface{}{
-					"error": closeErr.Error(),
+					logFieldError: closeErr.Error(),
 				})
 			}
 		}
@@ -338,7 +414,7 @@ func (c *Client) UploadWithContext(ctx context.Context, path string, fields map[
 		if closeErr != nil {
 			if c.logger != nil && c.logConfig.Enabled {
 				c.logger.Warn("failed to close response body", map[string]interface{}{
-					"error": closeErr.Error(),
+					logFieldError: closeErr.Error(),
 				})
 			}
 		}
@@ -562,10 +638,10 @@ func (c *Client) logResponse(req *http.Request, resp *http.Response, bodyBytes [
 	}
 
 	fields := map[string]interface{}{
-		"method":   req.Method,
-		"url":      req.URL.String(),
-		"status":   resp.StatusCode,
-		"duration": int64(time.Since(start) / time.Millisecond),
+		logFieldMethod: req.Method,
+		logFieldURL:    req.URL.String(),
+		"status":       resp.StatusCode,
+		"duration":     int64(time.Since(start) / time.Millisecond),
 	}
 
 	if c.logConfig.LogResponseHeader {
@@ -622,7 +698,7 @@ func (c *Client) buildRequestWithContext(ctx context.Context, method, path strin
 			}
 
 			body = strings.NewReader(formData.Encode())
-			contentType = "application/x-www-form-urlencoded"
+			contentType = contentTypeFormURLEncoded
 		}
 	}
 
@@ -791,8 +867,12 @@ func (c *Client) handleAuthenticationRetry(req *http.Request, resp *http.Respons
 	// Close the response body
 	_ = resp.Body.Close()
 
-	// Try to refresh authentication
-	err := c.authenticator.Refresh()
+	// A 401 means the credentials the request carried were rejected, even if the
+	// locally cached ticket still looks valid. A plain Refresh() is a no-op while
+	// the ticket is locally unexpired, which would make us replay the same
+	// rejected credentials and loop on 401. Force a fresh authentication so the
+	// single retry below carries new credentials.
+	err := c.forceReauthenticate()
 	if err != nil {
 		return nil, fmt.Errorf("failed to refresh authentication: %w", err)
 	}
@@ -800,8 +880,46 @@ func (c *Client) handleAuthenticationRetry(req *http.Request, resp *http.Respons
 	// Update headers with new authentication
 	c.applyAuthHeaders(req)
 
-	// Retry the request
+	// Rewind the body so the retried request resends it intact (the first send
+	// drained it). GetBody is populated for the in-memory bodies this client
+	// builds; if absent there is no body to rewind.
+	if req.GetBody != nil {
+		body, bodyErr := req.GetBody()
+		if bodyErr != nil {
+			return nil, fmt.Errorf("failed to rewind request body after re-auth: %w", bodyErr)
+		}
+
+		req.Body = body
+	}
+
+	// Retry the request exactly once with refreshed credentials.
 	return next(req)
+}
+
+// forceReauthenticate re-establishes credentials after a 401. For ticket-based
+// authentication it forces a renewal (RefreshForce) regardless of local ticket
+// validity, since the server has rejected the current ticket. For other
+// authenticator types it falls back to Refresh.
+func (c *Client) forceReauthenticate() error {
+	if c.authenticator == nil {
+		return nil
+	}
+
+	if ta, ok := c.authenticator.(*auth.TicketAuthenticator); ok {
+		err := ta.RefreshForce()
+		if err != nil {
+			return fmt.Errorf("forced re-authentication failed: %w", err)
+		}
+
+		return nil
+	}
+
+	err := c.authenticator.Refresh()
+	if err != nil {
+		return fmt.Errorf("re-authentication failed: %w", err)
+	}
+
+	return nil
 }
 
 // cachedResponse wraps an HTTP response for caching.
@@ -964,14 +1082,83 @@ func (c *Client) performAutoLogin() error {
 	return nil
 }
 
-func (c *Client) retryMiddleware(req *http.Request, next Handler) (*http.Response, error) {
-	var (
-		lastErr  error
-		lastResp *http.Response
-	)
+// pveConnectionPseudoStatus is the non-standard status PVE proxies emit when an
+// upstream connection cannot be established. It must be treated as a connection
+// failure rather than fed back into the HTTP-status retry path (which would
+// otherwise loop on it).
+const pveConnectionPseudoStatus = 596
 
+func (c *Client) retryMiddleware(req *http.Request, next Handler) (*http.Response, error) {
+	retries, delay, forceRetry := c.resolveRetryPolicy(req)
+
+	// Whether this request may be retried at all. Idempotent methods are always
+	// eligible; non-idempotent methods only when the caller explicitly opted in,
+	// because a retry can duplicate server-side side effects (e.g. VM create).
+	retryAllowed := isIdempotentMethod(req.Method) || forceRetry
+
+	// Buffer the body once up front so every allowed retry resends it intact.
+	// req.GetBody is populated by http.NewRequestWithContext for the in-memory
+	// body readers this client uses; capture it before the first send because
+	// the first send drains req.Body.
+	getBody, err := c.captureRequestBody(req)
+	if err != nil {
+		return nil, err
+	}
+
+	for attempt := 0; ; attempt++ {
+		if attempt > 0 {
+			time.Sleep(delay * time.Duration(attempt))
+
+			rewindErr := rewindRequestBody(req, getBody)
+			if rewindErr != nil {
+				return nil, rewindErr
+			}
+		}
+
+		resp, doErr := next(req)
+		if doErr != nil {
+			if attempt >= retries || !retryAllowed {
+				return nil, fmt.Errorf("request failed after %d attempt(s): %w", attempt+1, doErr)
+			}
+
+			continue
+		}
+
+		// Treat the PVE pseudo-status as a connection failure: never feed it back
+		// into the status retry loop. It may be retried like a network error only
+		// when the request is retry-eligible and attempts remain.
+		if resp.StatusCode == pveConnectionPseudoStatus {
+			_ = resp.Body.Close()
+
+			if attempt >= retries || !retryAllowed {
+				return nil, &apierrors.ConnectionError{
+					Host:    req.URL.Hostname(),
+					Message: "PVE reported an upstream connection failure (596)",
+				}
+			}
+
+			continue
+		}
+
+		if retryAllowed && attempt < retries && apierrors.IsRetryableCode(resp.StatusCode) {
+			_ = resp.Body.Close()
+
+			continue
+		}
+
+		// Success, non-retryable status, or a retryable status with no attempts
+		// left / not eligible for retry: hand the response back to the caller so
+		// parseResponse can surface the appropriate error.
+		return resp, nil
+	}
+}
+
+// resolveRetryPolicy returns the effective retry count, delay, and force-retry
+// flag for a request, applying any per-request context overrides.
+func (c *Client) resolveRetryPolicy(req *http.Request) (int, time.Duration, bool) {
 	retries := c.maxRetries
 	delay := c.retryDelay
+	force := false
 
 	if opts := FromContext(req.Context()); opts != nil {
 		if opts.Retries != nil {
@@ -981,44 +1168,74 @@ func (c *Client) retryMiddleware(req *http.Request, next Handler) (*http.Respons
 		if opts.RetryDelay != nil {
 			delay = *opts.RetryDelay
 		}
+
+		if opts.ForceRetry != nil {
+			force = *opts.ForceRetry
+		}
 	}
 
-	for attempt := 0; attempt <= retries; attempt++ {
-		if attempt > 0 {
-			// Wait before retry
-			time.Sleep(delay * time.Duration(attempt))
-
-			// Clone the request body for retry if present
-			if req.Body != nil {
-				bodyBytes, _ := io.ReadAll(req.Body)
-				req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-			}
-		}
-
-		resp, err := next(req)
-		if err != nil {
-			lastErr = err
-
-			continue
-		}
-
-		// Check if we should retry based on status code
-		if apierrors.IsRetryableCode(resp.StatusCode) {
-			lastResp = resp
-			_ = resp.Body.Close()
-
-			continue
-		}
-
-		// Success or non-retryable error
-		return resp, nil
+	if retries < 0 {
+		retries = 0
 	}
 
-	if lastResp != nil {
-		return lastResp, nil
+	return retries, delay, force
+}
+
+// captureRequestBody returns a function that produces a fresh ReadCloser for the
+// request body, used to rewind the body before each retry. For bodyless requests
+// it returns nil. It surfaces any error so a buffering failure is not silently
+// converted into an empty-body retry.
+func (c *Client) captureRequestBody(req *http.Request) (func() (io.ReadCloser, error), error) {
+	if req.Body == nil || req.Body == http.NoBody {
+		return nil, nil //nolint:nilnil // nil getter signals "no body"; callers handle nil getter explicitly
 	}
 
-	return nil, fmt.Errorf("request failed after %d retries: %w", c.maxRetries, lastErr)
+	if req.GetBody != nil {
+		return req.GetBody, nil
+	}
+
+	// Fallback: buffer the body bytes ourselves. Reading here does not lose the
+	// first attempt because we restore req.Body immediately afterward.
+	bodyBytes, readErr := io.ReadAll(req.Body)
+
+	_ = req.Body.Close()
+
+	if readErr != nil {
+		return nil, fmt.Errorf("failed to buffer request body for retry: %w", readErr)
+	}
+
+	req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+	req.ContentLength = int64(len(bodyBytes))
+
+	return func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(bodyBytes)), nil
+	}, nil
+}
+
+// rewindRequestBody resets req.Body to a fresh copy before a retry attempt.
+func rewindRequestBody(req *http.Request, getBody func() (io.ReadCloser, error)) error {
+	if getBody == nil {
+		return nil
+	}
+
+	body, err := getBody()
+	if err != nil {
+		return fmt.Errorf("failed to rewind request body for retry: %w", err)
+	}
+
+	req.Body = body
+
+	return nil
+}
+
+// isIdempotentMethod reports whether an HTTP method is safe to auto-retry.
+func isIdempotentMethod(method string) bool {
+	switch method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
+		return true
+	default:
+		return false
+	}
 }
 
 func (c *Client) loggingMiddleware(req *http.Request, next Handler) (*http.Response, error) {
@@ -1040,10 +1257,10 @@ func (c *Client) loggingMiddleware(req *http.Request, next Handler) (*http.Respo
 
 	if c.logger != nil && c.logConfig.Enabled {
 		fields := map[string]interface{}{
-			"method":   event.Method,
-			"url":      event.URL,
-			"status":   event.Status,
-			"duration": int64(event.Duration / time.Millisecond),
+			logFieldMethod: event.Method,
+			logFieldURL:    event.URL,
+			"status":       event.Status,
+			"duration":     int64(event.Duration / time.Millisecond),
 		}
 		// propagate request fields
 		for k, v := range opts.Fields {

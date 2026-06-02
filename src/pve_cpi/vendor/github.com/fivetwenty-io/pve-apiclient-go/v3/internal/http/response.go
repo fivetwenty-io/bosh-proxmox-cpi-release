@@ -110,8 +110,12 @@ func (rp *ResponseParser) parseJSON(body []byte, target interface{}) error {
 		return nil
 	}
 
-	// Check for API-level errors
-	if envelope.Success == 0 && envelope.Message != "" {
+	// Check for API-level errors.
+	// Promote to error when:
+	//   (a) Success==0 with a message (classic PVE failure envelope), or
+	//   (b) errors map is non-empty, regardless of Success/Message values —
+	//       field-level errors on a 2xx must not be silently swallowed.
+	if (envelope.Success == 0 && envelope.Message != "") || len(envelope.Errors) > 0 {
 		return &apierrors.APIError{
 			Message: envelope.Message,
 			Errors:  envelope.Errors,
@@ -227,14 +231,14 @@ func (rp *ResponseParser) tryStringConversion(str string, targetElem reflect.Val
 
 // isJSONContent checks if the content type is JSON.
 func isJSONContent(contentType string) bool {
-	return contentType == "application/json" ||
+	return contentType == contentTypeJSON ||
 		contentType == "application/json; charset=utf-8" ||
 		contentType == "text/json"
 }
 
 // isTextContent checks if the content type is text.
 func isTextContent(contentType string) bool {
-	return contentType == "text/plain" ||
+	return contentType == contentTypeTextPlain ||
 		contentType == "text/plain; charset=utf-8" ||
 		contentType == "text/html" ||
 		contentType == "text/html; charset=utf-8"

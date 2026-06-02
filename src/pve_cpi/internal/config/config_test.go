@@ -2473,3 +2473,532 @@ func TestValidate_DiskFields_Absent(t *testing.T) {
 		t.Errorf("disk range = [%d,%d], want default [9000,29999]", cfg.DiskVMIDRangeStart, cfg.DiskVMIDRangeEnd)
 	}
 }
+
+// --------------------------------------------------------------------------
+// Placement config tests
+// --------------------------------------------------------------------------
+
+// TestPlacementEnabled_NilPlacement verifies PlacementEnabled returns true
+// when the entire Placement block is absent (DEC-2: fully protective default).
+func TestPlacementEnabled_NilPlacement(t *testing.T) {
+	t.Parallel()
+	var cfg config.CPIConfig
+	if !cfg.PlacementEnabled() {
+		t.Error("PlacementEnabled() = false with nil Placement, want true (protective default)")
+	}
+}
+
+// TestPlacementEnabled_NilEnabled verifies PlacementEnabled returns true when
+// Placement block is present but Enabled field is nil.
+func TestPlacementEnabled_NilEnabled(t *testing.T) {
+	t.Parallel()
+	cfg := config.CPIConfig{
+		Placement: &config.PlacementConfig{},
+	}
+	if !cfg.PlacementEnabled() {
+		t.Error("PlacementEnabled() = false with Placement present but Enabled nil, want true")
+	}
+}
+
+// TestPlacementEnabled_ExplicitFalse verifies PlacementEnabled returns false
+// when the operator explicitly disables scoring.
+func TestPlacementEnabled_ExplicitFalse(t *testing.T) {
+	t.Parallel()
+	cfg := config.CPIConfig{
+		Placement: &config.PlacementConfig{
+			Enabled: boolPtr(false),
+		},
+	}
+	if cfg.PlacementEnabled() {
+		t.Error("PlacementEnabled() = true with explicit *false, want false")
+	}
+}
+
+// TestPlacementEnabled_ExplicitTrue verifies PlacementEnabled returns true when
+// explicitly set to true.
+func TestPlacementEnabled_ExplicitTrue(t *testing.T) {
+	t.Parallel()
+	cfg := config.CPIConfig{
+		Placement: &config.PlacementConfig{
+			Enabled: boolPtr(true),
+		},
+	}
+	if !cfg.PlacementEnabled() {
+		t.Error("PlacementEnabled() = false with explicit *true, want true")
+	}
+}
+
+// TestPlacementEnabled_JSONRoundTrip verifies placement.enabled=false survives
+// JSON decode and produces PlacementEnabled()=false.
+func TestPlacementEnabled_JSONRoundTrip(t *testing.T) {
+	t.Parallel()
+	cfg, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+		"placement":{"enabled":false}
+	}`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.PlacementEnabled() {
+		t.Error("PlacementEnabled() = true after JSON enabled:false, want false")
+	}
+}
+
+// TestPlacementEnabled_AbsentFromJSON verifies omitting the placement block
+// entirely from JSON yields PlacementEnabled()=true.
+func TestPlacementEnabled_AbsentFromJSON(t *testing.T) {
+	t.Parallel()
+	cfg, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br"
+	}`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !cfg.PlacementEnabled() {
+		t.Error("PlacementEnabled() = false with no placement block in JSON, want true")
+	}
+	if cfg.Placement != nil {
+		t.Error("Placement should be nil when block is absent from JSON")
+	}
+}
+
+// --------------------------------------------------------------------------
+// EffectiveWeights tests
+// --------------------------------------------------------------------------
+
+// TestEffectiveWeights_NilPlacement verifies all defaults are filled when
+// Placement is nil.
+func TestEffectiveWeights_NilPlacement(t *testing.T) {
+	t.Parallel()
+	var cfg config.CPIConfig
+	w := cfg.EffectiveWeights()
+	if w.Mem != 1.0 {
+		t.Errorf("Mem = %g, want 1.0", w.Mem)
+	}
+	if w.Storage != 0.5 {
+		t.Errorf("Storage = %g, want 0.5", w.Storage)
+	}
+	if w.CPU != 0.5 {
+		t.Errorf("CPU = %g, want 0.5", w.CPU)
+	}
+	if w.GuestCount != 0.3 {
+		t.Errorf("GuestCount = %g, want 0.3", w.GuestCount)
+	}
+}
+
+// TestEffectiveWeights_NilWeights verifies defaults fill in when Placement block
+// is present but Weights is nil.
+func TestEffectiveWeights_NilWeights(t *testing.T) {
+	t.Parallel()
+	cfg := config.CPIConfig{
+		Placement: &config.PlacementConfig{},
+	}
+	w := cfg.EffectiveWeights()
+	if w.Mem != 1.0 || w.Storage != 0.5 || w.CPU != 0.5 || w.GuestCount != 0.3 {
+		t.Errorf("EffectiveWeights defaults wrong: %+v", w)
+	}
+}
+
+// TestEffectiveWeights_PartialOverride verifies that set weights are preserved
+// and zero weights get the default.
+func TestEffectiveWeights_PartialOverride(t *testing.T) {
+	t.Parallel()
+	cfg := config.CPIConfig{
+		Placement: &config.PlacementConfig{
+			Weights: &config.PlacementWeights{
+				Mem: 2.0,
+				// Storage, CPU, GuestCount left 0 → should get defaults.
+			},
+		},
+	}
+	w := cfg.EffectiveWeights()
+	if w.Mem != 2.0 {
+		t.Errorf("Mem = %g, want 2.0 (explicit override)", w.Mem)
+	}
+	if w.Storage != 0.5 {
+		t.Errorf("Storage = %g, want 0.5 (default)", w.Storage)
+	}
+	if w.CPU != 0.5 {
+		t.Errorf("CPU = %g, want 0.5 (default)", w.CPU)
+	}
+	if w.GuestCount != 0.3 {
+		t.Errorf("GuestCount = %g, want 0.3 (default)", w.GuestCount)
+	}
+}
+
+// TestEffectiveWeights_AllExplicit verifies fully-explicit weights are all preserved.
+func TestEffectiveWeights_AllExplicit(t *testing.T) {
+	t.Parallel()
+	cfg := config.CPIConfig{
+		Placement: &config.PlacementConfig{
+			Weights: &config.PlacementWeights{
+				Mem:        3.0,
+				Storage:    1.5,
+				CPU:        2.0,
+				GuestCount: 0.8,
+			},
+		},
+	}
+	w := cfg.EffectiveWeights()
+	if w.Mem != 3.0 || w.Storage != 1.5 || w.CPU != 2.0 || w.GuestCount != 0.8 {
+		t.Errorf("EffectiveWeights all-explicit wrong: %+v", w)
+	}
+}
+
+// TestApplyDefaults_FillsWeightBlock verifies ApplyDefaults fills zero axes
+// inside an existing Weights block.
+func TestApplyDefaults_FillsWeightBlock(t *testing.T) {
+	t.Parallel()
+	cfg := config.CPIConfig{
+		Placement: &config.PlacementConfig{
+			Weights: &config.PlacementWeights{
+				Mem: 2.5, // explicit; others left 0
+			},
+		},
+	}
+	cfg.ApplyDefaults()
+
+	if cfg.Placement.Weights.Mem != 2.5 {
+		t.Errorf("Mem overwritten by ApplyDefaults, got %g want 2.5", cfg.Placement.Weights.Mem)
+	}
+	if cfg.Placement.Weights.Storage != 0.5 {
+		t.Errorf("Storage = %g, want 0.5 after ApplyDefaults", cfg.Placement.Weights.Storage)
+	}
+	if cfg.Placement.Weights.CPU != 0.5 {
+		t.Errorf("CPU = %g, want 0.5 after ApplyDefaults", cfg.Placement.Weights.CPU)
+	}
+	if cfg.Placement.Weights.GuestCount != 0.3 {
+		t.Errorf("GuestCount = %g, want 0.3 after ApplyDefaults", cfg.Placement.Weights.GuestCount)
+	}
+}
+
+// TestApplyDefaults_NilPlacementNotMaterialized verifies ApplyDefaults does NOT
+// create a Placement block when one was absent. Critical for zero-regression.
+func TestApplyDefaults_NilPlacementNotMaterialized(t *testing.T) {
+	t.Parallel()
+	var cfg config.CPIConfig
+	cfg.VMStorage = "vm-store"
+	cfg.ApplyDefaults()
+	if cfg.Placement != nil {
+		t.Error("ApplyDefaults materialized a nil Placement block, want nil preserved")
+	}
+}
+
+// --------------------------------------------------------------------------
+// AZCandidates tests
+// --------------------------------------------------------------------------
+
+// TestAZCandidates_NilPlacement verifies (nil, false) returned when Placement is nil.
+func TestAZCandidates_NilPlacement(t *testing.T) {
+	t.Parallel()
+	var cfg config.CPIConfig
+	nodes, ok := cfg.AZCandidates("us-east-1a")
+	if ok || nodes != nil {
+		t.Errorf("AZCandidates with nil Placement = (%v, %v), want (nil, false)", nodes, ok)
+	}
+}
+
+// TestAZCandidates_EmptyAZ verifies (nil, false) when az is the empty string.
+func TestAZCandidates_EmptyAZ(t *testing.T) {
+	t.Parallel()
+	cfg := config.CPIConfig{
+		Placement: &config.PlacementConfig{
+			AZMap: map[string][]string{"us-east-1a": {"pve01"}},
+		},
+	}
+	nodes, ok := cfg.AZCandidates("")
+	if ok || nodes != nil {
+		t.Errorf("AZCandidates empty az = (%v, %v), want (nil, false)", nodes, ok)
+	}
+}
+
+// TestAZCandidates_AZFound verifies the node list is returned for a known AZ.
+func TestAZCandidates_AZFound(t *testing.T) {
+	t.Parallel()
+	cfg := config.CPIConfig{
+		Placement: &config.PlacementConfig{
+			AZMap: map[string][]string{
+				"us-east-1a": {"pve01", "pve02"},
+				"us-east-1b": {"pve03"},
+			},
+		},
+	}
+	nodes, ok := cfg.AZCandidates("us-east-1a")
+	if !ok {
+		t.Fatal("AZCandidates us-east-1a: ok=false, want true")
+	}
+	if len(nodes) != 2 || nodes[0] != "pve01" || nodes[1] != "pve02" {
+		t.Errorf("AZCandidates us-east-1a nodes = %v, want [pve01 pve02]", nodes)
+	}
+}
+
+// TestAZCandidates_AZMissing verifies (nil, false) for unknown AZ.
+func TestAZCandidates_AZMissing(t *testing.T) {
+	t.Parallel()
+	cfg := config.CPIConfig{
+		Placement: &config.PlacementConfig{
+			AZMap: map[string][]string{"us-east-1a": {"pve01"}},
+		},
+	}
+	nodes, ok := cfg.AZCandidates("us-west-2a")
+	if ok || nodes != nil {
+		t.Errorf("AZCandidates unknown az = (%v, %v), want (nil, false)", nodes, ok)
+	}
+}
+
+// TestAZCandidates_JSONRoundTrip verifies az_map parses from JSON correctly.
+func TestAZCandidates_JSONRoundTrip(t *testing.T) {
+	t.Parallel()
+	cfg, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+		"placement":{
+			"az_map":{
+				"az1":["pve01","pve02"],
+				"az2":["pve03"]
+			}
+		}
+	}`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	nodes, ok := cfg.AZCandidates("az1")
+	if !ok {
+		t.Fatal("az1 not found in parsed az_map")
+	}
+	if len(nodes) != 2 {
+		t.Errorf("az1 node count = %d, want 2", len(nodes))
+	}
+	nodes2, ok2 := cfg.AZCandidates("az2")
+	if !ok2 || len(nodes2) != 1 || nodes2[0] != "pve03" {
+		t.Errorf("az2 nodes = %v ok=%v, want [pve03] true", nodes2, ok2)
+	}
+}
+
+// --------------------------------------------------------------------------
+// Validate placement tests
+// --------------------------------------------------------------------------
+
+// TestValidate_Placement_EmptyNodeName verifies an empty node name in AZMap is rejected.
+func TestValidate_Placement_EmptyNodeName(t *testing.T) {
+	t.Parallel()
+	cfg, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+		"placement":{
+			"az_map":{"az1":["pve01","","pve02"]}
+		}
+	}`)
+	if err == nil {
+		t.Fatalf("expected error for empty node name, got nil (cfg=%+v)", cfg)
+	}
+	if !strings.Contains(err.Error(), "placement.az_map") {
+		t.Errorf("error %q missing placement.az_map context", err.Error())
+	}
+}
+
+// TestValidate_Placement_EmptyNodeList verifies an AZ with zero nodes is rejected.
+func TestValidate_Placement_EmptyNodeList(t *testing.T) {
+	t.Parallel()
+	// Must use struct path — JSON cannot encode empty slice without omitempty issues.
+	cfg := &config.CPIConfig{
+		Host:          "h",
+		User:          "u",
+		Password:      "p",
+		VMStorage:     "s",
+		DiskStorage:   "s",
+		NetworkBridge: "br",
+		Port:          8006,
+		VerifySSL:     boolPtr(true),
+		AgentMode:     "cloudinit",
+		VMDiskFormat:  "qcow2",
+		LogLevel:      "info",
+		VMIDRangeStart: 100,
+		VMIDRangeEnd:  8999,
+		RebootMode:    "soft",
+		RebootTimeout: 60,
+		NetworkMode:   "auto",
+		SDNZoneType:   "simple",
+		Placement: &config.PlacementConfig{
+			AZMap: map[string][]string{"az1": {}},
+		},
+	}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error for empty node list, got nil")
+	}
+	if !strings.Contains(err.Error(), "at least one node name") {
+		t.Errorf("error %q missing 'at least one node name'", err.Error())
+	}
+}
+
+// TestValidate_Placement_NegativeWeight verifies negative weights are rejected.
+func TestValidate_Placement_NegativeWeight(t *testing.T) {
+	t.Parallel()
+	cfg, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+		"placement":{"weights":{"mem":-0.1}}
+	}`)
+	if err == nil {
+		t.Fatalf("expected error for negative weight, got nil (cfg=%+v)", cfg)
+	}
+	if !strings.Contains(err.Error(), "placement.weights.mem") {
+		t.Errorf("error %q missing placement.weights.mem", err.Error())
+	}
+	if !strings.Contains(err.Error(), "≥ 0") {
+		t.Errorf("error %q missing ≥ 0 constraint message", err.Error())
+	}
+}
+
+// TestValidate_Placement_ValidFull verifies a fully-specified valid placement
+// block passes Validate without error.
+func TestValidate_Placement_ValidFull(t *testing.T) {
+	t.Parallel()
+	cfg, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+		"placement":{
+			"enabled":true,
+			"az_map":{"az1":["pve01","pve02"],"az2":["pve03"]},
+			"anti_affinity":false,
+			"weights":{"mem":2.0,"storage":1.0,"cpu":1.0,"guest_count":0.5}
+		}
+	}`)
+	if err != nil {
+		t.Fatalf("valid full placement block: unexpected error: %v", err)
+	}
+	if !cfg.PlacementEnabled() {
+		t.Error("PlacementEnabled() = false, want true")
+	}
+	if cfg.AntiAffinityEnabled() {
+		t.Error("AntiAffinityEnabled() = true, want false")
+	}
+	w := cfg.EffectiveWeights()
+	if w.Mem != 2.0 || w.Storage != 1.0 || w.CPU != 1.0 || w.GuestCount != 0.5 {
+		t.Errorf("weights wrong: %+v", w)
+	}
+}
+
+// TestValidate_Placement_NilIsSkipped verifies that a nil Placement block
+// (absent from JSON) produces no validation errors.
+func TestValidate_Placement_NilIsSkipped(t *testing.T) {
+	t.Parallel()
+	cfg, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br"
+	}`)
+	if err != nil {
+		t.Fatalf("nil placement: unexpected error: %v", err)
+	}
+	if cfg.Placement != nil {
+		t.Error("Placement should be nil when absent from JSON")
+	}
+}
+
+// --------------------------------------------------------------------------
+// AntiAffinityEnabled tests
+// --------------------------------------------------------------------------
+
+// TestAntiAffinityEnabled_NilPlacement verifies false when Placement is nil.
+func TestAntiAffinityEnabled_NilPlacement(t *testing.T) {
+	t.Parallel()
+	var cfg config.CPIConfig
+	if cfg.AntiAffinityEnabled() {
+		t.Error("AntiAffinityEnabled() = true with nil Placement, want false")
+	}
+}
+
+// TestAntiAffinityEnabled_NilField verifies false when Placement.AntiAffinity is nil.
+func TestAntiAffinityEnabled_NilField(t *testing.T) {
+	t.Parallel()
+	cfg := config.CPIConfig{Placement: &config.PlacementConfig{}}
+	if cfg.AntiAffinityEnabled() {
+		t.Error("AntiAffinityEnabled() = true with nil AntiAffinity field, want false")
+	}
+}
+
+// TestAntiAffinityEnabled_ExplicitTrue verifies true when explicitly set.
+func TestAntiAffinityEnabled_ExplicitTrue(t *testing.T) {
+	t.Parallel()
+	cfg := config.CPIConfig{
+		Placement: &config.PlacementConfig{
+			AntiAffinity: boolPtr(true),
+		},
+	}
+	if !cfg.AntiAffinityEnabled() {
+		t.Error("AntiAffinityEnabled() = false with explicit *true, want true")
+	}
+}
+
+// --------------------------------------------------------------------------
+// EnsureNoIPConflicts tests
+// --------------------------------------------------------------------------
+
+// TestEnsureNoIPConflictsEnabled_Nil verifies true when field is nil (DEC-2 default).
+func TestEnsureNoIPConflictsEnabled_Nil(t *testing.T) {
+	t.Parallel()
+	var cfg config.CPIConfig
+	if !cfg.EnsureNoIPConflictsEnabled() {
+		t.Error("EnsureNoIPConflictsEnabled() = false with nil field, want true (protective default)")
+	}
+}
+
+// TestEnsureNoIPConflictsEnabled_ExplicitFalse verifies false when explicitly disabled.
+func TestEnsureNoIPConflictsEnabled_ExplicitFalse(t *testing.T) {
+	t.Parallel()
+	cfg := config.CPIConfig{EnsureNoIPConflicts: boolPtr(false)}
+	if cfg.EnsureNoIPConflictsEnabled() {
+		t.Error("EnsureNoIPConflictsEnabled() = true with explicit *false, want false")
+	}
+}
+
+// TestEnsureNoIPConflictsEnabled_ExplicitTrue verifies true when explicitly enabled.
+func TestEnsureNoIPConflictsEnabled_ExplicitTrue(t *testing.T) {
+	t.Parallel()
+	cfg := config.CPIConfig{EnsureNoIPConflicts: boolPtr(true)}
+	if !cfg.EnsureNoIPConflictsEnabled() {
+		t.Error("EnsureNoIPConflictsEnabled() = false with explicit *true, want true")
+	}
+}
+
+// TestEnsureNoIPConflictsEnabled_AbsentFromJSON verifies nil *bool when key absent
+// from JSON, yielding protective default from accessor.
+func TestEnsureNoIPConflictsEnabled_AbsentFromJSON(t *testing.T) {
+	t.Parallel()
+	cfg, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br"
+	}`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.EnsureNoIPConflicts != nil {
+		t.Error("EnsureNoIPConflicts should be nil when absent from JSON")
+	}
+	if !cfg.EnsureNoIPConflictsEnabled() {
+		t.Error("EnsureNoIPConflictsEnabled() = false with nil field, want true")
+	}
+}
+
+// TestEnsureNoIPConflictsEnabled_ExplicitFalseFromJSON verifies false survives
+// JSON decode.
+func TestEnsureNoIPConflictsEnabled_ExplicitFalseFromJSON(t *testing.T) {
+	t.Parallel()
+	cfg, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+		"ensure_no_ip_conflicts":false
+	}`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.EnsureNoIPConflicts == nil {
+		t.Fatal("EnsureNoIPConflicts should be non-nil when explicitly false in JSON")
+	}
+	if cfg.EnsureNoIPConflictsEnabled() {
+		t.Error("EnsureNoIPConflictsEnabled() = true with explicit false in JSON, want false")
+	}
+}

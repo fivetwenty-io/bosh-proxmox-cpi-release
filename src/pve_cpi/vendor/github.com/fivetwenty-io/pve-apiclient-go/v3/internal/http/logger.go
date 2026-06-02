@@ -35,7 +35,7 @@ func defaultLogConfig() LogConfig {
 	return LogConfig{
 		Enabled:           true,
 		RedactHeaders:     []string{"authorization", "cookie", "csrfpreventiontoken"},
-		RedactParams:      []string{"password", "token", "secret"},
+		RedactParams:      []string{redactParamPassword, "token", "secret"},
 		LogRequestHeader:  false,
 		LogResponseHeader: false,
 		LogQueryParams:    true,
@@ -75,7 +75,7 @@ func redact(in map[string][]string, redactKeys []string) map[string]interface{} 
 		}
 
 		if redacted {
-			out[key] = "REDACTED"
+			out[key] = redactedValue
 		} else {
 			// copy values
 			cp := make([]string, len(vals))
@@ -101,8 +101,8 @@ func (c *Client) logRequest(req *http.Request, msg string, extra map[string]inte
 	}
 
 	fields := map[string]interface{}{
-		"method": req.Method,
-		"url":    req.URL.String(),
+		logFieldMethod: req.Method,
+		logFieldURL:    req.URL.String(),
 	}
 
 	for k, v := range extra {

@@ -8,8 +8,9 @@ require (
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.17
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.101.0
 	github.com/diskfs/go-diskfs v1.9.3
-	github.com/fivetwenty-io/pve-apiclient-go/v3 v3.1.7
+	github.com/fivetwenty-io/pve-apiclient-go/v3 v3.2.1
 	github.com/google/go-containerregistry v0.21.6
+	golang.org/x/sync v0.20.0
 )
 
 require (
@@ -40,7 +41,7 @@ require (
 	github.com/pkg/xattr v0.4.12 // indirect
 	github.com/sirupsen/logrus v1.9.4 // indirect
 	github.com/ulikunitz/xz v0.5.15 // indirect
-	golang.org/x/sync v0.20.0 // indirect
 	golang.org/x/sys v0.44.0 // indirect
 	golang.org/x/term v0.34.0 // indirect
+	gotest.tools/v3 v3.5.2 // indirect
 )

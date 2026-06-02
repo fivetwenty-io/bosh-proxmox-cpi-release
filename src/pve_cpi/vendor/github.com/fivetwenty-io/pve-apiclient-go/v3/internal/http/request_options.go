@@ -13,6 +13,12 @@ type RequestOptions struct {
 	RetryDelay *time.Duration
 	Logging    *bool
 	Fields     map[string]interface{}
+	// ForceRetry, when true, allows the retry middleware to retry
+	// non-idempotent methods (POST/PUT/DELETE/PATCH). It is an explicit
+	// caller opt-in because retrying these methods can duplicate side
+	// effects (e.g. VM create/clone). When false (the default) only
+	// idempotent methods (GET/HEAD/OPTIONS) are auto-retried.
+	ForceRetry *bool
 }
 
 // FromContext extracts RequestOptions from context.
@@ -47,6 +53,11 @@ func with(ctx context.Context, update func(*RequestOptions)) context.Context {
 		opts.Logging = &b
 	}
 
+	if existing.ForceRetry != nil {
+		f := *existing.ForceRetry
+		opts.ForceRetry = &f
+	}
+
 	if existing.Fields != nil {
 		opts.Fields = make(map[string]interface{}, len(existing.Fields))
 		for k, v := range existing.Fields {
@@ -67,6 +78,13 @@ func WithRetries(ctx context.Context, n int) context.Context {
 // WithRetryDelay sets per-request retry base delay.
 func WithRetryDelay(ctx context.Context, d time.Duration) context.Context {
 	return with(ctx, func(opts *RequestOptions) { opts.RetryDelay = &d })
+}
+
+// WithForceRetry opts a single request in to retrying non-idempotent methods
+// (POST/PUT/DELETE/PATCH). Use only when the target operation is known to be
+// safe to repeat; otherwise a retry may duplicate server-side side effects.
+func WithForceRetry(ctx context.Context, enabled bool) context.Context {
+	return with(ctx, func(opts *RequestOptions) { opts.ForceRetry = &enabled })
 }
 
 // WithLogging toggles logging for this request.

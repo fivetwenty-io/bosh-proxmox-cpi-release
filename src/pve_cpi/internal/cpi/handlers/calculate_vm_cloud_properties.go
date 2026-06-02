@@ -10,6 +10,8 @@ import (
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
+	"github.com/fivetwenty-io/bosh-pve-cpi/internal/placement"
+	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/nodes"
 )
 
@@ -56,6 +58,8 @@ type storageStatusEntry struct {
 	Active  int    `json:"active"`  // 1 = active, 0 = inactive
 	Enabled int    `json:"enabled"` // 1 = enabled, 0 = disabled
 	Content string `json:"content"` // comma-separated content types, e.g. "images,rootdir"
+	Avail   int64  `json:"avail"`   // available bytes reported by PVE
+	Total   int64  `json:"total"`   // total bytes reported by PVE
 }
 
 // nodeHasStorage returns true when the per-node storage list returned by
@@ -106,7 +110,7 @@ type cloudPropsCandidate struct {
 // slices may be nil when no nodes are present.
 //
 // Errors:
-//   - cluster.ListStatus API failure → returned as-is to the caller.
+//   - cluster.ListStatus API failure → returned via pve.WrapError so 5xx is retriable.
 //   - Per-node ListStorage errors → WARN, node excluded (fail-safe). Never fatal.
 func candidateNodesForCloudProps(
 	ctx context.Context,
@@ -118,7 +122,11 @@ func candidateNodesForCloudProps(
 
 	statusResp, err := deps.PVE.Cluster().ListStatus(ctx)
 	if err != nil {
-		return nil, nil, cpierrors.Wrap(err, "calculate_vm_cloud_properties: cluster status fetch failed")
+		// Route through pve.WrapError so PVE 5xx and connection errors produce
+		// a retriable error (TypeRetriableCloud) rather than a non-retriable
+		// CloudError. This matches the retryability pattern used by all other
+		// handlers (see internal/cpi/handlers/README.md rule #1).
+		return nil, nil, cpierrors.Wrap(pve.WrapError(err), "calculate_vm_cloud_properties: cluster status fetch failed")
 	}
 
 	for i, raw := range *statusResp {
@@ -190,18 +198,36 @@ func candidateNodesForCloudProps(
 	return candidates, cpuRAMFailedStorage, nil
 }
 
-// pickBestNode returns the name of the candidate with the most free bytes.
+// pickBestNode delegates to the placement package to select the highest-scoring
+// candidate by free memory. It preserves the original pickBestNode behavior
+// (max free bytes wins) when called with mem-only weights.
+//
 // Returns an empty string when candidates is empty.
 func pickBestNode(candidates []cloudPropsCandidate) string {
-	best := ""
-	bestFree := int64(-1)
-	for _, c := range candidates {
-		if c.freeBytes > bestFree {
-			bestFree = c.freeBytes
-			best = c.name
+	if len(candidates) == 0 {
+		return ""
+	}
+
+	// Build NodeFacts from cloudPropsCandidate values.
+	// TotalMemBytes is estimated as freeBytes + 1 so the free-mem fraction
+	// is still comparable across nodes. The relative order is identical to
+	// the original max-freeBytes comparison because the weight and denominator
+	// are constant across all candidates.
+	// For absolute accuracy, set TotalMemBytes = Maxmem when refactoring to
+	// GatherNodeFacts in create_vm (where Maxmem is available).
+	facts := make([]placement.NodeFacts, len(candidates))
+	for i, c := range candidates {
+		facts[i] = placement.NodeFacts{
+			Node:          c.name,
+			Online:        true,
+			FreeMemBytes:  c.freeBytes,
+			TotalMemBytes: c.freeBytes + 1, // non-zero denominator
 		}
 	}
-	return best
+
+	w := placement.Weights{Mem: 1.0}
+	scored := placement.Score(facts, w, nil)
+	return placement.Pick(scored, nil)
 }
 
 // HandleCalculateVMCloudProperties maps BOSH resource hints to PVE
@@ -222,7 +248,7 @@ func pickBestNode(candidates []cloudPropsCandidate) string {
 //
 // Errors:
 //   - args[0] missing or malformed → CloudError.
-//   - cluster.ListStatus API error → CloudError wrapping SDK error.
+//   - cluster.ListStatus API error → retriable CloudError (5xx/conn) or non-retriable (4xx).
 //   - No qualifying node → NotSupported.
 func HandleCalculateVMCloudProperties(deps Deps) cpi.Handler {
 	return cpi.HandlerFunc(func(ctx context.Context, args []json.RawMessage, _ jsonrpc.Context) (any, error) {

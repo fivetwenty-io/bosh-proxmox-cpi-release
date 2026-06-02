@@ -109,7 +109,7 @@ type CreateStorageParams struct {
 	Authsupported *string `json:"authsupported,omitempty"`
 	// Base Base volume. This volume is automatically activated.
 	Base *string `json:"base,omitempty"`
-	// Blocksize block size
+	// Blocksize ZFS block size
 	Blocksize *string `json:"blocksize,omitempty"`
 	// Bwlimit Set I/O bandwidth limit for various operations (in KiB/s).
 	Bwlimit *string `json:"bwlimit,omitempty"`
@@ -213,7 +213,7 @@ type CreateStorageParams struct {
 	Storage string `json:"storage"`
 	// Subdir Subdir to mount.
 	Subdir *string `json:"subdir,omitempty"`
-	// TaggedOnly Only use logical volumes tagged with 'pve-vm-ID'.
+	// TaggedOnly Only list logical volumes tagged with 'pve-vm-ID'.
 	TaggedOnly *bool `json:"tagged_only,omitempty"`
 	// Target iSCSI target.
 	Target *string `json:"target,omitempty"`
@@ -331,7 +331,7 @@ func (s *service) GetStorage(ctx context.Context, storage string) (*GetStorageRe
 
 // UpdateStorageParams is the request payload for UpdateStorage.
 type UpdateStorageParams struct {
-	// Blocksize block size
+	// Blocksize ZFS block size
 	Blocksize *string `json:"blocksize,omitempty"`
 	// Bwlimit Set I/O bandwidth limit for various operations (in KiB/s).
 	Bwlimit *string `json:"bwlimit,omitempty"`
@@ -425,7 +425,7 @@ type UpdateStorageParams struct {
 	Sparse *bool `json:"sparse,omitempty"`
 	// Subdir Subdir to mount.
 	Subdir *string `json:"subdir,omitempty"`
-	// TaggedOnly Only use logical volumes tagged with 'pve-vm-ID'.
+	// TaggedOnly Only list logical volumes tagged with 'pve-vm-ID'.
 	TaggedOnly *bool `json:"tagged_only,omitempty"`
 	// Username RBD Id.
 	Username *string `json:"username,omitempty"`

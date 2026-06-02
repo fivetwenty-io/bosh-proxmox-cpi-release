@@ -247,6 +247,13 @@ func attachDiskResolveNode(ctx context.Context, deps Deps, vmCID, diskCID string
 	if err != nil {
 		return "", 0, cpierrors.DiskNotFound(diskCID)
 	}
+	// The storage pool is recovered directly from the volid prefix (e.g.
+	// "data" in "data:vm-9003-disk-0") — it was baked in at create_disk
+	// time. attach_disk therefore routes to exactly the pool that held the
+	// disk at creation without any extra metadata lookup. This is the
+	// stickiness guarantee: a disk placed on storage pool X at create_disk
+	// is always re-attached from pool X across every director round-trip,
+	// because the volid itself carries the pool name as its prefix.
 
 	// Resolve disk's owning node via the backend abstraction. For shared
 	// backends this is the configured default; for local backends a

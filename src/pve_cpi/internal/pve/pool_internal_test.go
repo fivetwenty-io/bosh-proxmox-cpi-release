@@ -5,142 +5,63 @@ package pve
 import (
 	"context"
 	"errors"
-	"io"
 	"strings"
 	"testing"
-	"time"
 
-	sdkclient "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/client"
-	sdkmetrics "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/metrics"
+	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/pools"
 )
 
-// fakeRawClient is a minimal sdkclient.Client implementation for unit tests.
-// All methods panic unless explicitly overridden — this forces the test to
-// control exactly which SDK calls fire. Only PutCtx is relevant for AddVM.
-//
-// Why not embed sdkclient.Client directly: the interface has ~20 methods;
-// embedding and calling an unimplemented method would nil-deref, making
-// test failures confusing. Explicit panics give a clear "unexpected call"
-// signal.
-type fakeRawClient struct {
-	putCtxFn func(ctx context.Context, path string, params map[string]interface{}) (interface{}, error)
+// fakePoolsService implements pools.Service for unit tests.
+// Only UpdatePools2 is wired; all other methods panic on call.
+type fakePoolsService struct {
+	updatePools2Fn func(ctx context.Context, poolid string, params *pools.UpdatePools2Params) error
 }
 
-// PutCtx is the only SDK method AddVM exercises after input validation.
-func (f *fakeRawClient) PutCtx(ctx context.Context, path string, params map[string]interface{}) (interface{}, error) {
-	if f.putCtxFn != nil {
-		return f.putCtxFn(ctx, path, params)
+func (f *fakePoolsService) UpdatePools2(ctx context.Context, poolid string, params *pools.UpdatePools2Params) error {
+	if f.updatePools2Fn != nil {
+		return f.updatePools2Fn(ctx, poolid, params)
 	}
-	return nil, nil
+	return nil
 }
 
-// The remaining sdkclient.Client methods are intentionally unimplemented.
-// A test that accidentally triggers one of these will panic with a clear message.
-
-func (f *fakeRawClient) Get(_ string, _ map[string]interface{}) (interface{}, error) {
-	panic("fakeRawClient: Get not implemented in this test")
-}
-func (f *fakeRawClient) GetRaw(_ string, _ map[string]interface{}) (*sdkclient.Response, error) {
-	panic("fakeRawClient: GetRaw not implemented in this test")
-}
-func (f *fakeRawClient) Post(_ string, _ map[string]interface{}) (interface{}, error) {
-	panic("fakeRawClient: Post not implemented in this test")
-}
-func (f *fakeRawClient) PostRaw(_ string, _ map[string]interface{}) (*sdkclient.Response, error) {
-	panic("fakeRawClient: PostRaw not implemented in this test")
-}
-func (f *fakeRawClient) Put(_ string, _ map[string]interface{}) (interface{}, error) {
-	panic("fakeRawClient: Put not implemented in this test")
-}
-func (f *fakeRawClient) PutRaw(_ string, _ map[string]interface{}) (*sdkclient.Response, error) {
-	panic("fakeRawClient: PutRaw not implemented in this test")
-}
-func (f *fakeRawClient) Delete(_ string, _ map[string]interface{}) (interface{}, error) {
-	panic("fakeRawClient: Delete not implemented in this test")
-}
-func (f *fakeRawClient) DeleteRaw(_ string, _ map[string]interface{}) (*sdkclient.Response, error) {
-	panic("fakeRawClient: DeleteRaw not implemented in this test")
-}
-func (f *fakeRawClient) GetCtx(_ context.Context, _ string, _ map[string]interface{}) (interface{}, error) {
-	panic("fakeRawClient: GetCtx not implemented in this test")
-}
-func (f *fakeRawClient) GetRawCtx(_ context.Context, _ string, _ map[string]interface{}) (*sdkclient.Response, error) {
-	panic("fakeRawClient: GetRawCtx not implemented in this test")
-}
-func (f *fakeRawClient) PostCtx(_ context.Context, _ string, _ map[string]interface{}) (interface{}, error) {
-	panic("fakeRawClient: PostCtx not implemented in this test")
-}
-func (f *fakeRawClient) PostRawCtx(_ context.Context, _ string, _ map[string]interface{}) (*sdkclient.Response, error) {
-	panic("fakeRawClient: PostRawCtx not implemented in this test")
-}
-func (f *fakeRawClient) PutRawCtx(_ context.Context, _ string, _ map[string]interface{}) (*sdkclient.Response, error) {
-	panic("fakeRawClient: PutRawCtx not implemented in this test")
-}
-func (f *fakeRawClient) DeleteCtx(_ context.Context, _ string, _ map[string]interface{}) (interface{}, error) {
-	panic("fakeRawClient: DeleteCtx not implemented in this test")
-}
-func (f *fakeRawClient) DeleteRawCtx(_ context.Context, _ string, _ map[string]interface{}) (*sdkclient.Response, error) {
-	panic("fakeRawClient: DeleteRawCtx not implemented in this test")
-}
-func (f *fakeRawClient) UploadCtx(_ context.Context, _ string, _ map[string]string, _, _ string, _ io.Reader) (*sdkclient.Response, error) {
-	panic("fakeRawClient: UploadCtx not implemented in this test")
-}
-func (f *fakeRawClient) Login() error  { panic("fakeRawClient: Login not implemented in this test") }
-func (f *fakeRawClient) Logout() error { panic("fakeRawClient: Logout not implemented in this test") }
-func (f *fakeRawClient) UpdateTicket(_ string) {
-	panic("fakeRawClient: UpdateTicket not implemented in this test")
-}
-func (f *fakeRawClient) UpdateCSRFToken(_ string) {
-	panic("fakeRawClient: UpdateCSRFToken not implemented in this test")
-}
-func (f *fakeRawClient) SetTimeout(_ time.Duration) {
-	panic("fakeRawClient: SetTimeout not implemented in this test")
-}
-func (f *fakeRawClient) SetKeepAlive(_ int) {
-	panic("fakeRawClient: SetKeepAlive not implemented in this test")
-}
-func (f *fakeRawClient) SetLogger(_ sdkclient.Logger) {
-	panic("fakeRawClient: SetLogger not implemented in this test")
-}
-func (f *fakeRawClient) SetLogConfig(_ sdkclient.LogConfig) {
-	panic("fakeRawClient: SetLogConfig not implemented in this test")
-}
-func (f *fakeRawClient) AddLogHook(_ sdkclient.Hook) {
-	panic("fakeRawClient: AddLogHook not implemented in this test")
-}
-func (f *fakeRawClient) GetLogConfig() sdkclient.LogConfig {
-	panic("fakeRawClient: GetLogConfig not implemented in this test")
-}
-func (f *fakeRawClient) SetMetrics(_ *sdkmetrics.DefaultMetrics) {
-	panic("fakeRawClient: SetMetrics not implemented in this test")
-}
-func (f *fakeRawClient) SetTFAHandler(_ sdkclient.TFAHandler) {
-	panic("fakeRawClient: SetTFAHandler not implemented in this test")
-}
-func (f *fakeRawClient) InvalidateCache(_ string) int {
-	panic("fakeRawClient: InvalidateCache not implemented in this test")
-}
-func (f *fakeRawClient) ClearCache() {
-	panic("fakeRawClient: ClearCache not implemented in this test")
-}
-func (f *fakeRawClient) CacheStats() *sdkclient.CacheStats {
-	panic("fakeRawClient: CacheStats not implemented in this test")
+func (f *fakePoolsService) ListPools(_ context.Context, _ *pools.ListPoolsParams) (*pools.ListPoolsResponse, error) {
+	panic("fakePoolsService: ListPools unexpected call")
 }
 
-// Verify fakeRawClient satisfies sdkclient.Client at compile time.
-var _ sdkclient.Client = (*fakeRawClient)(nil)
+func (f *fakePoolsService) CreatePools(_ context.Context, _ *pools.CreatePoolsParams) error {
+	panic("fakePoolsService: CreatePools unexpected call")
+}
+
+func (f *fakePoolsService) DeletePools(_ context.Context, _ *pools.DeletePoolsParams) error {
+	panic("fakePoolsService: DeletePools unexpected call")
+}
+
+func (f *fakePoolsService) GetPools(_ context.Context, _ string, _ *pools.GetPoolsParams) (*pools.GetPoolsResponse, error) {
+	panic("fakePoolsService: GetPools unexpected call")
+}
+
+func (f *fakePoolsService) UpdatePools(_ context.Context, _ *pools.UpdatePoolsParams) error {
+	panic("fakePoolsService: UpdatePools unexpected call")
+}
+
+func (f *fakePoolsService) DeletePools2(_ context.Context, _ string) error {
+	panic("fakePoolsService: DeletePools2 unexpected call")
+}
+
+// Compile-time check.
+var _ pools.Service = (*fakePoolsService)(nil)
 
 // TestSDKPoolService_AddVM_EmptyPoolID verifies that an empty poolID returns
-// a validation error without calling PutCtx.
+// a validation error without calling UpdatePools2.
 func TestSDKPoolService_AddVM_EmptyPoolID(t *testing.T) {
 	t.Parallel()
 
-	var putCalled bool
+	var called bool
 	svc := &sdkPoolService{
-		raw: &fakeRawClient{
-			putCtxFn: func(_ context.Context, _ string, _ map[string]interface{}) (interface{}, error) {
-				putCalled = true
-				return nil, nil
+		svc: &fakePoolsService{
+			updatePools2Fn: func(_ context.Context, _ string, _ *pools.UpdatePools2Params) error {
+				called = true
+				return nil
 			},
 		},
 	}
@@ -152,13 +73,13 @@ func TestSDKPoolService_AddVM_EmptyPoolID(t *testing.T) {
 	if !strings.Contains(err.Error(), "poolID") {
 		t.Errorf("error %q does not mention poolID", err.Error())
 	}
-	if putCalled {
-		t.Error("PutCtx must NOT be called when poolID is empty")
+	if called {
+		t.Error("UpdatePools2 must NOT be called when poolID is empty")
 	}
 }
 
 // TestSDKPoolService_AddVM_NegativeVMID verifies that vmid <= 0 returns a
-// validation error without calling PutCtx.
+// validation error without calling UpdatePools2.
 func TestSDKPoolService_AddVM_NegativeVMID(t *testing.T) {
 	t.Parallel()
 
@@ -175,12 +96,12 @@ func TestSDKPoolService_AddVM_NegativeVMID(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			var putCalled bool
+			var called bool
 			svc := &sdkPoolService{
-				raw: &fakeRawClient{
-					putCtxFn: func(_ context.Context, _ string, _ map[string]interface{}) (interface{}, error) {
-						putCalled = true
-						return nil, nil
+				svc: &fakePoolsService{
+					updatePools2Fn: func(_ context.Context, _ string, _ *pools.UpdatePools2Params) error {
+						called = true
+						return nil
 					},
 				},
 			}
@@ -192,30 +113,30 @@ func TestSDKPoolService_AddVM_NegativeVMID(t *testing.T) {
 			if !strings.Contains(err.Error(), "vmid") {
 				t.Errorf("vmid=%d: error %q does not mention vmid", tc.vmid, err.Error())
 			}
-			if putCalled {
-				t.Errorf("vmid=%d: PutCtx must NOT be called on invalid vmid", tc.vmid)
+			if called {
+				t.Errorf("vmid=%d: UpdatePools2 must NOT be called on invalid vmid", tc.vmid)
 			}
 		})
 	}
 }
 
-// TestSDKPoolService_AddVM_ValidCallsRawPut verifies that valid inputs reach
-// PutCtx with the correct path ("/pools/<poolID>") and params (vms="<vmid>").
-func TestSDKPoolService_AddVM_ValidCallsRawPut(t *testing.T) {
+// TestSDKPoolService_AddVM_ValidCallsUpdatePools2 verifies that valid inputs
+// reach UpdatePools2 with the correct poolid and vms="<vmid>".
+func TestSDKPoolService_AddVM_ValidCallsUpdatePools2(t *testing.T) {
 	t.Parallel()
 
 	const poolID = "bosh-stemcells"
 	const vmid = int64(7001)
 
-	var capturedPath string
-	var capturedParams map[string]interface{}
+	var capturedPoolID string
+	var capturedParams *pools.UpdatePools2Params
 
 	svc := &sdkPoolService{
-		raw: &fakeRawClient{
-			putCtxFn: func(_ context.Context, path string, params map[string]interface{}) (interface{}, error) {
-				capturedPath = path
+		svc: &fakePoolsService{
+			updatePools2Fn: func(_ context.Context, pid string, params *pools.UpdatePools2Params) error {
+				capturedPoolID = pid
 				capturedParams = params
-				return nil, nil
+				return nil
 			},
 		},
 	}
@@ -224,33 +145,38 @@ func TestSDKPoolService_AddVM_ValidCallsRawPut(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	wantPath := "/pools/" + poolID
-	if capturedPath != wantPath {
-		t.Errorf("PutCtx path = %q; want %q", capturedPath, wantPath)
+	if capturedPoolID != poolID {
+		t.Errorf("UpdatePools2 poolid = %q; want %q", capturedPoolID, poolID)
 	}
-	wantVMs := "7001"
-	if got, ok := capturedParams["vms"].(string); !ok || got != wantVMs {
-		t.Errorf("PutCtx params[vms] = %v; want %q", capturedParams["vms"], wantVMs)
+	if capturedParams == nil {
+		t.Fatal("UpdatePools2 params is nil")
+	}
+	if capturedParams.Vms == nil {
+		t.Fatal("UpdatePools2 params.Vms is nil")
+	}
+	const wantVMs = "7001"
+	if *capturedParams.Vms != wantVMs {
+		t.Errorf("UpdatePools2 params.Vms = %q; want %q", *capturedParams.Vms, wantVMs)
 	}
 }
 
-// TestSDKPoolService_AddVM_PutCtxError verifies that a PutCtx error is wrapped
-// and returned to the caller (not swallowed).
-func TestSDKPoolService_AddVM_PutCtxError(t *testing.T) {
+// TestSDKPoolService_AddVM_UpdatePools2Error verifies that an UpdatePools2 error
+// is wrapped and returned to the caller (not swallowed).
+func TestSDKPoolService_AddVM_UpdatePools2Error(t *testing.T) {
 	t.Parallel()
 
 	rawErr := errors.New("PVE: pool bosh-stemcells not found (500)")
 	svc := &sdkPoolService{
-		raw: &fakeRawClient{
-			putCtxFn: func(_ context.Context, _ string, _ map[string]interface{}) (interface{}, error) {
-				return nil, rawErr
+		svc: &fakePoolsService{
+			updatePools2Fn: func(_ context.Context, _ string, _ *pools.UpdatePools2Params) error {
+				return rawErr
 			},
 		},
 	}
 
 	err := svc.AddVM(context.Background(), "bosh-stemcells", 7002)
 	if err == nil {
-		t.Fatal("expected error from PutCtx; got nil")
+		t.Fatal("expected error from UpdatePools2; got nil")
 	}
 	if !errors.Is(err, rawErr) && !strings.Contains(err.Error(), rawErr.Error()) {
 		t.Errorf("error %q does not wrap or contain raw error %q", err.Error(), rawErr.Error())

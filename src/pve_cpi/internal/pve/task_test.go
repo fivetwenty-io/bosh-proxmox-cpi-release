@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"strings"
 	"testing"
 	"time"
@@ -15,7 +16,9 @@ import (
 	sdkqemu "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/qemu"
 	sdkstorage "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/storage"
 	sdktasks "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/tasks"
+	sdkerrors "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/errors"
 
+	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
 )
 
@@ -30,6 +33,10 @@ func (m *mockTasksService) Wait(ctx context.Context, node, upid string, opts *sd
 		return m.waitFn(ctx, node, upid, opts)
 	}
 	return &sdktasks.Status{Status: "stopped", ExitStatus: "OK", UpID: upid}, nil
+}
+
+func (m *mockTasksService) WaitForUPID(ctx context.Context, upid string, opts *sdktasks.WaitOptions) (*sdktasks.Status, error) {
+	panic("mockTasksService.WaitForUPID: not expected in pve tests")
 }
 
 // ---- mock client ----
@@ -133,6 +140,146 @@ func TestAwaitTask_ContextCancelled(t *testing.T) {
 	err := pve.AwaitTask(ctx, newMockClient(svc), "node1", "UPID:node1:abc")
 	if err == nil {
 		t.Fatal("expected error for cancelled context, got nil")
+	}
+	// DEC-4: ctx-cancel must be retriable so the director re-issues the action.
+	var cpiErr *cpierrors.Error
+	if !errors.As(err, &cpiErr) {
+		t.Fatalf("expected *cpierrors.Error, got %T: %v", err, err)
+	}
+	if !cpiErr.OkToRetry() {
+		t.Errorf("ctx-cancel error must be retriable (OkToRetry=true), got false; err=%v", err)
+	}
+	if cpiErr.Type() != cpierrors.TypeRetriableCloud {
+		t.Errorf("ctx-cancel error type = %q, want %q", cpiErr.Type(), cpierrors.TypeRetriableCloud)
+	}
+}
+
+// TestAwaitTask_ContextDeadline checks that a context.DeadlineExceeded
+// (distinct from Canceled) also surfaces as retriable.
+func TestAwaitTask_ContextDeadline(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-1*time.Second))
+	defer cancel()
+
+	svc := &mockTasksService{
+		waitFn: func(ctx context.Context, _, _ string, _ *sdktasks.WaitOptions) (*sdktasks.Status, error) {
+			<-ctx.Done()
+			return nil, context.DeadlineExceeded
+		},
+	}
+
+	err := pve.AwaitTask(ctx, newMockClient(svc), "node1", "UPID:node1:abc")
+	if err == nil {
+		t.Fatal("expected error for deadline-exceeded context, got nil")
+	}
+	var cpiErr *cpierrors.Error
+	if !errors.As(err, &cpiErr) {
+		t.Fatalf("expected *cpierrors.Error, got %T: %v", err, err)
+	}
+	if !cpiErr.OkToRetry() {
+		t.Errorf("deadline-exceeded error must be retriable, got OkToRetry=false; err=%v", err)
+	}
+}
+
+// TestAwaitTask_PermanentTaskFailure verifies that a non-OK exit status is NOT retriable.
+func TestAwaitTask_PermanentTaskFailure(t *testing.T) {
+	t.Parallel()
+	svc := &mockTasksService{
+		waitFn: func(_ context.Context, _, upid string, _ *sdktasks.WaitOptions) (*sdktasks.Status, error) {
+			return &sdktasks.Status{Status: "stopped", ExitStatus: "ERROR: disk not found", UpID: upid},
+				fmt.Errorf("task failed: ERROR: disk not found")
+		},
+	}
+	err := pve.AwaitTask(context.Background(), newMockClient(svc), "node1", "UPID:node1:abc")
+	if err == nil {
+		t.Fatal("expected error for permanent task failure, got nil")
+	}
+	var cpiErr *cpierrors.Error
+	if !errors.As(err, &cpiErr) {
+		t.Fatalf("expected *cpierrors.Error, got %T: %v", err, err)
+	}
+	// Permanent task failure must NOT be retriable — retrying with the same
+	// args won't fix a disk-not-found or similar terminal condition.
+	if cpiErr.OkToRetry() {
+		t.Errorf("permanent task failure must NOT be retriable, got OkToRetry=true; err=%v", err)
+	}
+}
+
+// fakeNetError is a net.Error whose Timeout() returns true.
+type fakeNetTimeoutError struct{ msg string }
+
+func (e *fakeNetTimeoutError) Error() string   { return e.msg }
+func (e *fakeNetTimeoutError) Timeout() bool   { return true }
+func (e *fakeNetTimeoutError) Temporary() bool { return true }
+
+// Verify fakeNetTimeoutError satisfies net.Error.
+var _ net.Error = (*fakeNetTimeoutError)(nil)
+
+// TestAwaitTask_TransientPollError_SDKConnection verifies that a ConnectionError
+// during polling surfaces as retriable.
+func TestAwaitTask_TransientPollError_SDKConnection(t *testing.T) {
+	t.Parallel()
+	connErr := &sdkerrors.ConnectionError{Host: "pve1", Port: 8006, Message: "connection refused"}
+	svc := &mockTasksService{
+		waitFn: func(_ context.Context, _, _ string, _ *sdktasks.WaitOptions) (*sdktasks.Status, error) {
+			return nil, connErr
+		},
+	}
+	err := pve.AwaitTask(context.Background(), newMockClient(svc), "node1", "UPID:node1:abc")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	var cpiErr *cpierrors.Error
+	if !errors.As(err, &cpiErr) {
+		t.Fatalf("expected *cpierrors.Error, got %T: %v", err, err)
+	}
+	if !cpiErr.OkToRetry() {
+		t.Errorf("SDK ConnectionError poll fault must be retriable, got OkToRetry=false; err=%v", err)
+	}
+}
+
+// TestAwaitTask_TransientPollError_NetTimeout verifies that a net timeout
+// during polling surfaces as retriable.
+func TestAwaitTask_TransientPollError_NetTimeout(t *testing.T) {
+	t.Parallel()
+	netErr := &fakeNetTimeoutError{msg: "i/o timeout"}
+	svc := &mockTasksService{
+		waitFn: func(_ context.Context, _, _ string, _ *sdktasks.WaitOptions) (*sdktasks.Status, error) {
+			return nil, netErr
+		},
+	}
+	err := pve.AwaitTask(context.Background(), newMockClient(svc), "node1", "UPID:node1:abc")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	var cpiErr *cpierrors.Error
+	if !errors.As(err, &cpiErr) {
+		t.Fatalf("expected *cpierrors.Error, got %T: %v", err, err)
+	}
+	if !cpiErr.OkToRetry() {
+		t.Errorf("net timeout poll fault must be retriable, got OkToRetry=false; err=%v", err)
+	}
+}
+
+// TestAwaitTask_SDKNetworkError_NonRetriable verifies that a plain (non-timeout,
+// non-connection) SDK error during polling is NOT retriable.
+func TestAwaitTask_SDKNetworkError_NonRetriable(t *testing.T) {
+	t.Parallel()
+	svc := &mockTasksService{
+		waitFn: func(_ context.Context, _, _ string, _ *sdktasks.WaitOptions) (*sdktasks.Status, error) {
+			return nil, errors.New("unexpected internal error")
+		},
+	}
+	err := pve.AwaitTask(context.Background(), newMockClient(svc), "node1", "UPID:node1:abc")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	var cpiErr *cpierrors.Error
+	if !errors.As(err, &cpiErr) {
+		t.Fatalf("expected *cpierrors.Error, got %T: %v", err, err)
+	}
+	if cpiErr.OkToRetry() {
+		t.Errorf("plain SDK error must NOT be retriable, got OkToRetry=true; err=%v", err)
 	}
 }
 

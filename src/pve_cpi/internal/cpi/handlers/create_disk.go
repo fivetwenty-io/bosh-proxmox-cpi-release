@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"strings"
 
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
@@ -16,7 +17,14 @@ import (
 // argument of create_disk. All fields are optional; missing fields fall back to
 // CPI configuration defaults.
 type createDiskCloudProperties struct {
-	// Storage overrides deps.Config.DiskStorage for this disk.
+	// StoragePool is the preferred storage pool for this disk. Takes highest
+	// precedence in the storage resolution chain:
+	//   disk cloud_properties.storage_pool
+	//     → disk cloud_properties.storage  (backward-compat alias)
+	//       → config.DiskStorage           (global default)
+	StoragePool string `json:"storage_pool"`
+	// Storage is the backward-compatible alias for StoragePool. Manifests that
+	// already set cloud_properties.storage continue to work unchanged.
 	Storage string `json:"storage"`
 	// DiskFormat overrides deps.Config.VMDiskFormat for this disk.
 	DiskFormat string `json:"disk_format"`
@@ -30,6 +38,35 @@ type createDiskCloudProperties struct {
 	// (see applyCustomTagsToVM). Tags are deferred when create_disk has no
 	// vm_cid hint; set_disk_metadata applies them on the next sync.
 	Tags map[string]string `json:"tags"`
+}
+
+// resolveStorage returns the storage pool name to use for a create_disk call.
+//
+// Precedence (highest to lowest):
+//  1. cloud_properties.storage_pool — explicit per-disk pool, trimmed whitespace
+//  2. cloud_properties.storage — backward-compat alias for storage_pool
+//  3. config.DiskStorage — global CPI default
+//
+// An empty or whitespace-only value at any level is treated as unset and the
+// next level is consulted. Returns an error only when all three levels resolve
+// to empty, which indicates a misconfigured CPI manifest.
+//
+// No PVE storage-type query is performed (v1: name-only resolution). The
+// caller is responsible for backend resolution via backendResolverOrDefault.
+func resolveStorage(cloudProps createDiskCloudProperties, configDiskStorage string) (string, error) {
+	if s := strings.TrimSpace(cloudProps.StoragePool); s != "" {
+		return s, nil
+	}
+	if s := strings.TrimSpace(cloudProps.Storage); s != "" {
+		return s, nil
+	}
+	if s := strings.TrimSpace(configDiskStorage); s != "" {
+		return s, nil
+	}
+	return "", cpierrors.Cloud(
+		"create_disk: no storage configured (disk_storage empty and neither" +
+			" cloud_properties.storage_pool nor cloud_properties.storage is set)",
+	)
 }
 
 // HandleCreateDisk returns a Handler for the BOSH CPI create_disk method.
@@ -83,14 +120,9 @@ func HandleCreateDisk(deps Deps) Handler {
 		// ----------------------------------------------------------------
 		// 2. Resolve storage, format, and node from config + cloud_props.
 		// ----------------------------------------------------------------
-		storage := deps.Config.DiskStorage
-		if cloudProps.Storage != "" {
-			storage = cloudProps.Storage
-		}
-		if storage == "" {
-			return nil, cpierrors.Cloud(
-				"create_disk: no storage configured (disk_storage empty and cloud_properties.storage not set)",
-			)
+		storage, err := resolveStorage(cloudProps, deps.Config.DiskStorage)
+		if err != nil {
+			return nil, err
 		}
 
 		format := deps.Config.VMDiskFormat

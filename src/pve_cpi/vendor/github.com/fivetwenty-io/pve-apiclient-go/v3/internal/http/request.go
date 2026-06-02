@@ -149,14 +149,14 @@ func (rb *RequestBuilder) BuildBody() (io.Reader, string, error) {
 				return nil, "", fmt.Errorf("failed to marshal JSON body: %w", err)
 			}
 
-			return bytes.NewReader(body), "application/json", nil
+			return bytes.NewReader(body), contentTypeJSON, nil
 		}
 
 		// Default to form-encoded body
 		if len(rb.formParams) > 0 {
 			body := rb.formParams.Encode()
 
-			return strings.NewReader(body), "application/x-www-form-urlencoded", nil
+			return strings.NewReader(body), contentTypeFormURLEncoded, nil
 		}
 
 		// No body

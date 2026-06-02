@@ -3,6 +3,7 @@ package handlers_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cluster"
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/nodes"
+	sdkerrors "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/errors"
 )
 
 // ---------------------------------------------------------------------------
@@ -357,6 +359,56 @@ func TestHandleCalculateVMCloudProperties_ClusterAPIError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error from cluster API failure, got nil")
 	}
+}
+
+// TestHandleCalculateVMCloudProperties_ClusterAPIConnErrorIsRetriable verifies
+// that a PVE connection error on the ListStatus call produces a retriable error.
+// This is the retryability fix from Tier 1 (pve.WrapError route for cluster status).
+// A *sdkerrors.ConnectionError is used because it has exported fields and WrapError
+// maps it to TypeRetriableCloud unconditionally.
+func TestHandleCalculateVMCloudProperties_ClusterAPIConnErrorIsRetriable(t *testing.T) {
+	t.Parallel()
+
+	// *sdkerrors.ConnectionError → pve.WrapError → TypeRetriableCloud.
+	connErr := &sdkerrors.ConnectionError{
+		Host:    "pve.test.local",
+		Port:    8006,
+		Message: "connection refused",
+	}
+
+	svc := &mockClusterService{statusErr: connErr}
+	deps := makeCalcDeps(svc)
+	h := handlers.HandleCalculateVMCloudProperties(deps)
+
+	_, err := h.Handle(context.Background(), makeCalcArgs(2, 1024, 0), jsonrpc.Context{})
+	if err == nil {
+		t.Fatal("expected error from connection failure, got nil")
+	}
+
+	if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+		t.Errorf("connection error on ListStatus must be TypeRetriableCloud; got type in: %v", err)
+	}
+
+	// OkToRetry must be true.
+	var cpiErr *cpierrors.Error
+	if errs, ok := extractCPIError(err); ok {
+		cpiErr = errs
+	}
+	if cpiErr == nil {
+		t.Fatalf("expected *cpierrors.Error in chain; got %T: %v", err, err)
+	}
+	if !cpiErr.OkToRetry() {
+		t.Errorf("connection error on ListStatus must have OkToRetry=true; got false. Error: %v", err)
+	}
+}
+
+// extractCPIError walks the error chain to find the outermost *cpierrors.Error.
+func extractCPIError(err error) (*cpierrors.Error, bool) {
+	var target *cpierrors.Error
+	if errors.As(err, &target) {
+		return target, true
+	}
+	return nil, false
 }
 
 // ---------------------------------------------------------------------------

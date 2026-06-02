@@ -194,7 +194,7 @@ func buildVMName(metadata map[string]any, prefix string) string {
 			return s
 		}
 	}
-	if v, ok := metadata["name"]; ok && v != nil {
+	if v, ok := metadata[metadataKeyName]; ok && v != nil {
 		raw := fmt.Sprintf("%v", v)
 		if prefix != "" {
 			raw = prefix + "-" + raw
@@ -263,7 +263,7 @@ func buildBoshManagedTags(metadata map[string]any) []string {
 		}
 		parts = append(parts, key+"--"+s)
 	}
-	if v, ok := metadata["name"]; ok && v != nil {
+	if v, ok := metadata[metadataKeyName]; ok && v != nil {
 		raw := strings.ReplaceAll(fmt.Sprintf("%v", v), "/", "--")
 		if s := sanitizeTagValue(raw); s != "" {
 			parts = append(parts, s)

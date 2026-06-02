@@ -70,6 +70,21 @@ func addEncodedParam(dst url.Values, key string, val interface{}) {
 		dst.Add(key, encodeNestedMap(typedVal))
 
 		return
+
+	case OptionString:
+		dst.Add(key, (&typedVal).Encode())
+
+		return
+
+	case *OptionString:
+		dst.Add(key, typedVal.Encode())
+
+		return
+
+	case IndexedSlice:
+		typedVal.addTo(dst, key)
+
+		return
 	}
 
 	// Slice handling via reflection (covers []string, []int, []any, etc.).
@@ -136,6 +151,166 @@ func encodeNestedMap(nested map[string]interface{}) string {
 	}
 
 	return strings.Join(parts, ",")
+}
+
+// KV is a single key/value entry within an ordered Proxmox option-string.
+//
+// A KV with an empty Key is a bare positional token (the leading value of a
+// Proxmox option-string, such as the storage:size in a disk spec
+// "local-lvm:32,size=64G" or the model in a NIC spec "virtio,bridge=vmbr0").
+// A KV with a non-empty Key is emitted as "Key=Value".
+type KV struct {
+	// Key is the option name. Empty means this entry is a bare positional token.
+	Key string
+
+	// Value is the option value. It is stringified with the same rules as
+	// encodeSingleValue (bool → "1"/"0", time.Time → Unix seconds, etc.).
+	Value interface{}
+}
+
+// OptionString is an ordered Proxmox option-string. Unlike map[string]interface{},
+// which sorts keys lexicographically and can only emit "key=value" pairs,
+// OptionString preserves insertion order and supports bare positional leading
+// tokens. This is required for PVE specs whose first element is positional, for
+// example a disk ("local-lvm:32,size=64G,ssd=1") or a NIC
+// ("virtio,bridge=vmbr0,firewall=1").
+//
+// Use OptionString (not map[string]interface{}) whenever element order matters
+// or a positional leading token is present. The map[string]interface{} path is
+// retained for order-insensitive option-strings only.
+//
+// Construct one directly or via OptionStringOf:
+//
+//	NewOptionString().Positional("local-lvm:32").Set("size", "64G").Set("ssd", true)
+//	  → "local-lvm:32,size=64G,ssd=1"
+type OptionString struct {
+	entries []KV
+}
+
+// NewOptionString returns an empty OptionString ready for chained building.
+func NewOptionString() *OptionString {
+	return &OptionString{}
+}
+
+// OptionStringOf builds an OptionString from an ordered slice of KV entries.
+// Order is preserved exactly as given.
+func OptionStringOf(entries ...KV) *OptionString {
+	out := &OptionString{entries: make([]KV, 0, len(entries))}
+	out.entries = append(out.entries, entries...)
+
+	return out
+}
+
+// Positional appends a bare positional token (no key). Returns the receiver so
+// calls can be chained. Typically used once for the leading token, but PVE
+// permits multiple positional tokens, so this method does not enforce a limit.
+func (o *OptionString) Positional(value interface{}) *OptionString {
+	o.entries = append(o.entries, KV{Key: "", Value: value})
+
+	return o
+}
+
+// Set appends a "key=value" entry, preserving insertion order. Returns the
+// receiver so calls can be chained. An empty key is treated as a positional
+// token to avoid emitting a malformed leading "=value".
+func (o *OptionString) Set(key string, value interface{}) *OptionString {
+	o.entries = append(o.entries, KV{Key: key, Value: value})
+
+	return o
+}
+
+// Len reports the number of entries in the option-string.
+func (o *OptionString) Len() int {
+	return len(o.entries)
+}
+
+// Encode serialises the option-string in insertion order using Proxmox rules:
+// bare positional tokens emit their value alone, keyed entries emit "key=value",
+// and all values are stringified via encodeSingleValue (bool → "1"/"0", etc.).
+// Entries are joined with commas. An empty OptionString encodes to "".
+func (o *OptionString) Encode() string {
+	if len(o.entries) == 0 {
+		return ""
+	}
+
+	parts := make([]string, 0, len(o.entries))
+
+	for _, entry := range o.entries {
+		valStr := encodeSingleValue(entry.Value)
+		if entry.Key == "" {
+			parts = append(parts, valStr)
+
+			continue
+		}
+
+		parts = append(parts, entry.Key+"="+valStr)
+	}
+
+	return strings.Join(parts, ",")
+}
+
+// String implements fmt.Stringer, returning the encoded option-string.
+func (o *OptionString) String() string {
+	return o.Encode()
+}
+
+// ArrayMode selects how a slice value is encoded into url.Values.
+type ArrayMode int
+
+const (
+	// ArrayRepeated emits one repeated entry per element (key=a&key=b&key=c).
+	// This is the default behaviour for plain slices passed to encodeParams.
+	ArrayRepeated ArrayMode = iota
+
+	// ArrayIndexed emits one indexed entry per element (key0=a&key1=b&key2=c),
+	// matching the convention used by many Proxmox endpoints (e.g. ipset, acl,
+	// and bulk-style list parameters).
+	ArrayIndexed
+)
+
+// IndexedSlice wraps a slice of values together with an explicit ArrayMode so a
+// caller can choose indexed-key encoding (key0,key1,...) instead of the default
+// repeated-key encoding (key=a&key=b). Pass an IndexedSlice as a parameter value
+// to select the mode explicitly; a plain slice continues to use ArrayRepeated.
+//
+//	IndexedSliceOf(ArrayIndexed, "a", "b") under key "ip" → ip0=a, ip1=b
+//	IndexedSliceOf(ArrayRepeated, "a", "b") under key "ip" → ip=a, ip=b
+type IndexedSlice struct {
+	mode   ArrayMode
+	values []interface{}
+}
+
+// IndexedSliceOf builds an IndexedSlice from the given mode and elements.
+func IndexedSliceOf(mode ArrayMode, values ...interface{}) IndexedSlice {
+	out := IndexedSlice{mode: mode, values: make([]interface{}, 0, len(values))}
+	out.values = append(out.values, values...)
+
+	return out
+}
+
+// Mode reports the configured ArrayMode.
+func (s IndexedSlice) Mode() ArrayMode {
+	return s.mode
+}
+
+// Len reports the number of elements.
+func (s IndexedSlice) Len() int {
+	return len(s.values)
+}
+
+// addTo writes the slice into dst under key using the configured mode. Each
+// element is stringified via encodeSingleValue. An empty slice adds nothing.
+func (s IndexedSlice) addTo(dst url.Values, key string) {
+	for i, v := range s.values {
+		valStr := encodeSingleValue(v)
+		if s.mode == ArrayIndexed {
+			dst.Add(key+strconv.Itoa(i), valStr)
+
+			continue
+		}
+
+		dst.Add(key, valStr)
+	}
 }
 
 // sortStrings sorts a slice of strings in place using insertion sort.

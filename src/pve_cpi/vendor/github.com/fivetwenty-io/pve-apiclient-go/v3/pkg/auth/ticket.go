@@ -44,7 +44,7 @@ func NewTicketAuthenticator(
 	pveNewFormat bool,
 ) *TicketAuthenticator {
 	if credentials.Realm == "" {
-		credentials.Realm = "pam"
+		credentials.Realm = realmPAM
 	}
 
 	return &TicketAuthenticator{
@@ -54,6 +54,60 @@ func NewTicketAuthenticator(
 		cookieName:   firstNonEmpty(cookieName, "PVEAuthCookie"),
 		pveNewFormat: pveNewFormat,
 	}
+}
+
+// NewTicketAuthenticatorFromTicket creates a ticket authenticator seeded with a
+// pre-existing ticket value and CSRF token. This supports callers that already
+// hold a valid PVE ticket (e.g. restored from storage) and want it used for
+// authentication without performing a username/password login.
+//
+// The ticket's creation time is derived from the ticket value when it encodes a
+// PVE timestamp; otherwise validity is anchored to now so proactive renewal can
+// still occur. Credentials are retained (when non-nil) so the authenticator can
+// renew the ticket using the ticket-as-password mechanism.
+func NewTicketAuthenticatorFromTicket(
+	baseURL string,
+	ticketValue string,
+	csrfToken string,
+	username string,
+	credentials *Credentials,
+	httpClient *http.Client,
+	cookieName string,
+	pveNewFormat bool,
+) *TicketAuthenticator {
+	if credentials == nil {
+		credentials = &Credentials{}
+	}
+
+	if credentials.Realm == "" {
+		credentials.Realm = realmPAM
+	}
+
+	ticketAuth := &TicketAuthenticator{
+		baseURL:      baseURL,
+		httpClient:   httpClient,
+		credentials:  credentials,
+		cookieName:   firstNonEmpty(cookieName, "PVEAuthCookie"),
+		pveNewFormat: pveNewFormat,
+	}
+
+	if ticketValue != "" {
+		validUntil := time.Now().Add(constants.TicketValidity())
+
+		createdAt, parseErr := ParseTicketTimestamp(ticketValue)
+		if parseErr == nil {
+			validUntil = createdAt.Add(constants.TicketValidity())
+		}
+
+		ticketAuth.ticket = &Ticket{
+			Value:      ticketValue,
+			CSRFToken:  csrfToken,
+			Username:   username,
+			ValidUntil: validUntil,
+		}
+	}
+
+	return ticketAuth
 }
 
 func firstNonEmpty(values ...string) string {

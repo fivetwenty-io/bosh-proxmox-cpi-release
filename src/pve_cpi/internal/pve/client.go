@@ -13,6 +13,7 @@ import (
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cluster"
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/clusterstorage"
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/nodes"
+	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/pools"
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/qemu"
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/storage"
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/tasks"
@@ -69,12 +70,11 @@ func (c *sdkClient) Cluster() cluster.Service               { return c.clusterSv
 func (c *sdkClient) ClusterStorage() clusterstorage.Service { return c.clusterStorageSvc }
 func (c *sdkClient) Pools() PoolService                     { return c.poolsSvc }
 
-// sdkPoolService implements PoolService using the raw SDK client via PutCtx.
-// PVE resource pool membership is managed via PUT /pools/{poolid} with a JSON
-// body containing vms=[vmid]. This endpoint is not exposed in the generated
-// nodes/cluster SDK packages, so we use the raw client directly.
+// sdkPoolService implements PoolService using the typed pools binding.
+// PVE resource pool membership is managed via PUT /pools/{poolid} with a body
+// containing vms=[vmid] (pools.Service.UpdatePools2).
 type sdkPoolService struct {
-	raw sdkclient.Client
+	svc pools.Service
 }
 
 // AddVM assigns vmid to the named PVE resource pool via PUT /pools/{poolid}.
@@ -87,12 +87,8 @@ func (s *sdkPoolService) AddVM(ctx context.Context, poolID string, vmid int64) e
 	if vmid <= 0 {
 		return cpierrors.Cloud("PoolService.AddVM: vmid must be a positive integer, got %d", vmid)
 	}
-	path := fmt.Sprintf("/pools/%s", poolID)
-	params := map[string]interface{}{
-		"vms": fmt.Sprintf("%d", vmid),
-	}
-	_, err := s.raw.PutCtx(ctx, path, params)
-	if err != nil {
+	vms := fmt.Sprintf("%d", vmid)
+	if err := s.svc.UpdatePools2(ctx, poolID, &pools.UpdatePools2Params{Vms: &vms}); err != nil {
 		return cpierrors.Wrap(err, fmt.Sprintf("PoolService.AddVM: assign vmid %d to pool %q", vmid, poolID))
 	}
 	return nil
@@ -201,6 +197,6 @@ func NewClient(cfg *config.CPIConfig, logger *log.Logger) (Client, error) {
 		nodesSvc:          nodes.New(raw),
 		clusterSvc:        cluster.New(raw),
 		clusterStorageSvc: clusterstorage.New(raw),
-		poolsSvc:          &sdkPoolService{raw: raw},
+		poolsSvc:          &sdkPoolService{svc: pools.New(raw)},
 	}, nil
 }

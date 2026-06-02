@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"strings"
 	"time"
 
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/internal/constants"
@@ -21,6 +22,9 @@ var (
 // Service defines task-related helpers.
 type Service interface {
 	Wait(ctx context.Context, node, upid string, opts *WaitOptions) (*Status, error)
+	// WaitForUPID is a convenience wrapper that parses the node from the UPID string
+	// and delegates to Wait, so callers need not extract the node separately.
+	WaitForUPID(ctx context.Context, upid string, opts *WaitOptions) (*Status, error)
 }
 
 // WaitOptions controls polling behavior.
@@ -40,6 +44,9 @@ type Status struct {
 	Status     string
 	ExitStatus string
 	UpID       string
+	// Warned is true when the task completed with "WARNINGS: N" exit status.
+	// This is a non-failure terminal state: the task succeeded but emitted warnings.
+	Warned bool
 }
 
 // service implements Service.
@@ -128,10 +135,26 @@ type taskPoller struct {
 func (p *taskPoller) poll(ctx context.Context) (*Status, error) {
 	cur := p.intervalMillis
 
+	// Bail immediately if the context is already done before any I/O.
+	select {
+	case <-ctx.Done():
+		return nil, context.DeadlineExceeded
+	default:
+	}
+
+	// Check once immediately before the first sleep: tasks that finish quickly
+	// should not incur a full interval delay on the first observation.
+	status, checkErr := p.checkTaskStatus(ctx)
+	if checkErr == nil && status != nil {
+		return status, nil
+	} else if checkErr != nil && !errors.Is(checkErr, errTaskInProgress) {
+		return nil, checkErr
+	}
+
 	for {
-		err := p.waitForInterval(ctx, cur)
-		if err != nil {
-			return nil, err
+		waitErr := p.waitForInterval(ctx, cur)
+		if waitErr != nil {
+			return nil, waitErr
 		}
 
 		status, err := p.checkTaskStatus(ctx)
@@ -186,13 +209,23 @@ func (p *taskPoller) parseTaskStatus(taskData map[string]interface{}) (*Status, 
 	}
 
 	exitStatus, _ := taskData["exitstatus"].(string)
-	statusObj := &Status{Status: status, ExitStatus: exitStatus, UpID: p.upid}
 
-	if p.isSuccessExitStatus(exitStatus) {
+	// An empty exitstatus on a stopped task is treated as success: PVE may omit
+	// the field entirely when the task completes cleanly without a log entry.
+	warned := isWarningExitStatus(exitStatus)
+	statusObj := &Status{Status: status, ExitStatus: exitStatus, UpID: p.upid, Warned: warned}
+
+	if warned || p.isSuccessExitStatus(exitStatus) {
 		return statusObj, nil
 	}
 
 	return statusObj, fmt.Errorf("%w: %s", errTaskFailed, exitStatus)
+}
+
+// isWarningExitStatus returns true for "WARNINGS: N" exit statuses produced by PVE
+// when a task completes successfully but emitted N warning log entries.
+func isWarningExitStatus(exitStatus string) bool {
+	return strings.HasPrefix(exitStatus, "WARNINGS: ")
 }
 
 func (p *taskPoller) isSuccessExitStatus(exitStatus string) bool {

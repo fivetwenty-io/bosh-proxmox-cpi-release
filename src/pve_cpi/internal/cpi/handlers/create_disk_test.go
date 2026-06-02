@@ -140,6 +140,60 @@ func TestHandleCreateDisk_CustomStorage(t *testing.T) {
 	}
 }
 
+// TestHandleCreateDisk_StoragePoolCloudProp verifies that cloud_properties.storage_pool
+// is the highest-precedence storage selector and reaches CreateVolume.
+func TestHandleCreateDisk_StoragePoolCloudProp(t *testing.T) {
+	t.Parallel()
+	var capturedStorage string
+	storageSvc := &mockStorageService{
+		createVolumeFn: func(_ context.Context, _, storage string, _ int, _ string, vmid int, _ string) (string, error) {
+			capturedStorage = storage
+			return fmt.Sprintf("%s:vm-%d-disk-0", storage, vmid), nil
+		},
+	}
+	deps := baseDepsForCreate(t, storageSvc, nil)
+	// config.DiskStorage is "local-lvm" (storageName from baseDepsForCreate);
+	// storage_pool must override it.
+	h := handlers.HandleCreateDisk(deps)
+	_, err := h.Handle(context.Background(), []json.RawMessage{
+		marshal(1024),
+		marshal(map[string]string{"storage_pool": "ceph-rbd", "storage": "local-lvm"}),
+	}, jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if capturedStorage != "ceph-rbd" {
+		t.Errorf("storage_pool precedence: CreateVolume received storage=%q, want %q", capturedStorage, "ceph-rbd")
+	}
+}
+
+// TestHandleCreateDisk_StoragePoolAliasFallback verifies that cloud_properties.storage
+// (alias) is used when storage_pool is absent, and config.DiskStorage is the final fallback.
+func TestHandleCreateDisk_StoragePoolAliasFallback(t *testing.T) {
+	t.Parallel()
+	var capturedStorage string
+	storageSvc := &mockStorageService{
+		createVolumeFn: func(_ context.Context, _, storage string, _ int, _ string, vmid int, _ string) (string, error) {
+			capturedStorage = storage
+			return fmt.Sprintf("%s:vm-%d-disk-0", storage, vmid), nil
+		},
+	}
+	deps := baseDepsForCreate(t, storageSvc, nil)
+
+	h := handlers.HandleCreateDisk(deps)
+	// Only storage (alias) set, no storage_pool.
+	_, err := h.Handle(context.Background(), []json.RawMessage{
+		marshal(1024),
+		marshal(map[string]string{"storage": "nfs-store"}),
+	}, jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if capturedStorage != "nfs-store" {
+		t.Errorf("storage alias fallback: CreateVolume received storage=%q, want %q", capturedStorage, "nfs-store")
+	}
+}
+
 func TestHandleCreateDisk_DefaultStorage(t *testing.T) {
 	t.Parallel()
 	var capturedStorage string

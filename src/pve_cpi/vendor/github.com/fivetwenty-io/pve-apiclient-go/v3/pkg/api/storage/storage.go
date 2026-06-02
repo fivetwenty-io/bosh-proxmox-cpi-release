@@ -98,6 +98,7 @@ func (s *service) CreateVolume(ctx context.Context, node, storage string, sizeGi
 }
 func (s *service) DeleteVolume(ctx context.Context, node, storage, volume string) error {
 	_, err := s.DeleteVolumeAsync(ctx, node, storage, volume)
+
 	return err
 }
 
@@ -141,6 +142,7 @@ func (s *service) Exists(ctx context.Context, node, storage, volume string) (boo
 
 func (s *service) DeleteVolumeIfExists(ctx context.Context, node, storage, volume string) (bool, error) {
 	existed, _, err := s.DeleteVolumeIfExistsAsync(ctx, node, storage, volume)
+
 	return existed, err
 }
 
@@ -173,6 +175,7 @@ func upidFromDeleteResponse(data any) string {
 	if s, ok := data.(string); ok {
 		return s
 	}
+
 	return ""
 }
 

@@ -148,6 +148,10 @@ type vmMockNodes struct {
 	// lookup tests set this to simulate template presence/absence. When nil,
 	// ListQemu returns an empty list (no templates found → import-from path).
 	listQemuFn func(ctx context.Context, node string, params *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error)
+	// listStorageFn, when non-nil, is called by ListStorage (used by placement
+	// scoring via GatherNodeFacts). When nil, returns an empty active storage
+	// response so placement scoring degrades gracefully (storage axis = 0).
+	listStorageFn func(ctx context.Context, node string, params *sdknodes.ListStorageParams) (*sdknodes.ListStorageResponse, error)
 }
 
 type vmCreateQemuCloneCall struct {
@@ -203,11 +207,25 @@ func (m *vmMockNodes) ListQemu(ctx context.Context, node string, params *sdknode
 	return &empty, nil
 }
 
-// vmMockCluster satisfies cluster.Service; only ListResources is needed for NextVMID.
+// ListStorage returns an empty response when listStorageFn is nil.
+// GatherNodeFacts calls this for per-node storage scoring; an empty response
+// means the storage axis contributes 0 to the score (graceful degradation).
+func (m *vmMockNodes) ListStorage(ctx context.Context, node string, params *sdknodes.ListStorageParams) (*sdknodes.ListStorageResponse, error) {
+	if m.listStorageFn != nil {
+		return m.listStorageFn(ctx, node, params)
+	}
+	empty := sdknodes.ListStorageResponse{}
+	return &empty, nil
+}
+
+// vmMockCluster satisfies cluster.Service for create_vm tests.
+// ListResources is used by AllocateWithRetry (NextVMID) and detectIPConflict.
+// ListStatus is used by placement.GatherNodeFacts when PlacementEnabled()==true.
 type vmMockCluster struct {
 	sdkcluster.Service // embed nil — panics on unmocked calls
 
 	listResourcesFn func(ctx context.Context, params *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error)
+	listStatusFn    func(ctx context.Context) (*sdkcluster.ListStatusResponse, error)
 }
 
 func (m *vmMockCluster) ListResources(ctx context.Context, params *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
@@ -215,6 +233,25 @@ func (m *vmMockCluster) ListResources(ctx context.Context, params *sdkcluster.Li
 		return m.listResourcesFn(ctx, params)
 	}
 	resp := sdkcluster.ListResourcesResponse{}
+	return &resp, nil
+}
+
+func (m *vmMockCluster) ListStatus(ctx context.Context) (*sdkcluster.ListStatusResponse, error) {
+	if m.listStatusFn != nil {
+		return m.listStatusFn(ctx)
+	}
+	// Default: single online node "pve" — matches the default config.Node used by buildVMDeps.
+	// Placement scoring picks "pve" (only candidate), preserving existing test invariants.
+	raw, _ := json.Marshal(map[string]any{
+		"type":   "node",
+		"name":   "pve",
+		"online": 1,
+		"maxcpu": int64(4),
+		"maxmem": int64(8 * 1024 * 1024 * 1024),
+		"mem":    int64(2 * 1024 * 1024 * 1024),
+		"cpu":    0.1,
+	})
+	resp := sdkcluster.ListStatusResponse{raw}
 	return &resp, nil
 }
 
@@ -259,6 +296,10 @@ func (m *vmMockAgent) UpdateDiskHints(_ context.Context, _ int, _ []agent.DiskHi
 // Helpers
 // --------------------------------------------------------------------------
 
+// placementDisabled is a convenience *bool for disabling placement scoring in
+// tests that predate the feature and pin config.Node explicitly.
+var placementDisabled = func() *bool { f := false; return &f }()
+
 func buildVMDeps(q *vmMockQEMU, n *vmMockNodes, c *vmMockCluster, a *vmMockAgent) handlers.Deps {
 	return handlers.Deps{
 		Config: &config.CPIConfig{
@@ -266,6 +307,12 @@ func buildVMDeps(q *vmMockQEMU, n *vmMockNodes, c *vmMockCluster, a *vmMockAgent
 			VMStorage:      storageName,
 			NetworkBridge:  "vmbr0",
 			VMIDRangeStart: 100,
+			// Placement disabled so pre-placement tests keep their existing
+			// behavior: node is taken directly from Config.Node ("pve").
+			Placement: &config.PlacementConfig{Enabled: placementDisabled},
+			// IP-conflict check disabled so pre-placement tests that use a
+			// live mock cluster (ListResources returns empty) are not affected.
+			EnsureNoIPConflicts: placementDisabled,
 		},
 		PVE: &mockPVEClient{
 			qemuSvc:    q,
@@ -654,14 +701,17 @@ func TestCreateVM_InvalidStemcellCID_Integer(t *testing.T) {
 	}
 }
 
-// TestHandleCreateVM_MissingNode verifies CloudError when node not configured anywhere.
+// TestHandleCreateVM_MissingNode verifies CloudError when node not configured anywhere
+// and placement is explicitly disabled (so no cluster scan can salvage a node).
 func TestHandleCreateVM_MissingNode(t *testing.T) {
 	t.Parallel()
 	deps := handlers.Deps{
 		Config: &config.CPIConfig{
-			Node:          "",
-			VMStorage:     storageName,
-			NetworkBridge: "vmbr0",
+			Node:                "",
+			VMStorage:           storageName,
+			NetworkBridge:       "vmbr0",
+			Placement:           &config.PlacementConfig{Enabled: placementDisabled},
+			EnsureNoIPConflicts: placementDisabled,
 		},
 		PVE: &mockPVEClient{
 			qemuSvc:    &vmMockQEMU{},
@@ -1199,10 +1249,12 @@ func TestCreateVM_AgentDead_EmitsDiagnostic(t *testing.T) {
 	// Build deps wiring the custom Status-aware QEMU service.
 	deps := handlers.Deps{
 		Config: &config.CPIConfig{
-			Node:           "pve",
-			VMStorage:      storageName,
-			NetworkBridge:  "vmbr0",
-			VMIDRangeStart: 100,
+			Node:                "pve",
+			VMStorage:           storageName,
+			NetworkBridge:       "vmbr0",
+			VMIDRangeStart:      100,
+			Placement:           &config.PlacementConfig{Enabled: placementDisabled},
+			EnsureNoIPConflicts: placementDisabled,
 		},
 		PVE: &mockPVEClient{
 			qemuSvc:    customQ,
@@ -1324,10 +1376,12 @@ func TestHandleCreateVM_LightStemcellCID_StripsPrefix(t *testing.T) {
 func buildVMDepsForTemplate(q *vmMockQEMU, n *vmMockNodes, c *vmMockCluster, a *vmMockAgent) handlers.Deps {
 	return handlers.Deps{
 		Config: &config.CPIConfig{
-			Node:           "pve",
-			VMStorage:      storageName,
-			NetworkBridge:  "vmbr0",
-			VMIDRangeStart: 100,
+			Node:                "pve",
+			VMStorage:           storageName,
+			NetworkBridge:       "vmbr0",
+			VMIDRangeStart:      100,
+			Placement:           &config.PlacementConfig{Enabled: placementDisabled},
+			EnsureNoIPConflicts: placementDisabled,
 		},
 		PVE: &mockPVEClient{
 			qemuSvc:    q,
@@ -1359,6 +1413,8 @@ func buildVMDepsForTemplateCrossNode(q *vmMockQEMU, n *vmMockNodes, a *vmMockAge
 			NetworkBridge:        "vmbr0",
 			VMIDRangeStart:       100,
 			StemcellTemplateNode: "pve-tmpl",
+			Placement:            &config.PlacementConfig{Enabled: placementDisabled},
+			EnsureNoIPConflicts:  placementDisabled,
 		},
 		PVE: &mockPVEClient{
 			qemuSvc:    q,
@@ -1668,10 +1724,12 @@ const testStemcellCIDWithSHA = "test-storage:import/bosh-stemcell-ubuntu-jammy-1
 func buildVMDepsForOldCIDLookup(q *vmMockQEMU, n *vmMockNodes, a *vmMockAgent) handlers.Deps {
 	return handlers.Deps{
 		Config: &config.CPIConfig{
-			Node:           "pve",
-			VMStorage:      storageName,
-			NetworkBridge:  "vmbr0",
-			VMIDRangeStart: 100,
+			Node:                "pve",
+			VMStorage:           storageName,
+			NetworkBridge:       "vmbr0",
+			VMIDRangeStart:      100,
+			Placement:           &config.PlacementConfig{Enabled: placementDisabled},
+			EnsureNoIPConflicts: placementDisabled,
 		},
 		PVE: &mockPVEClient{
 			qemuSvc:    q,
@@ -1933,5 +1991,639 @@ func TestCreateVM_TemplateCID_Regression_StillClones(t *testing.T) {
 	}
 	if len(q.createCalls) != 0 {
 		t.Errorf("template:<vmid> regression: QEMU.Create must not be called, got %d calls", len(q.createCalls))
+	}
+}
+
+// --------------------------------------------------------------------------
+// Placement + IP-conflict tests
+// --------------------------------------------------------------------------
+
+// buildVMDepsPlacement constructs Deps with placement enabled and IP-conflict
+// check enabled. listStatusFn controls which nodes the cluster reports.
+// listResourcesFn provides the ListResources response (used by detectIPConflict
+// and GatherNodeFacts). Both are required.
+func buildVMDepsPlacement(
+	q *vmMockQEMU,
+	n *vmMockNodes,
+	listStatusFn func(ctx context.Context) (*sdkcluster.ListStatusResponse, error),
+	listResourcesFn func(ctx context.Context, params *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error),
+	a *vmMockAgent,
+	extraCfg func(*config.CPIConfig),
+) handlers.Deps {
+	c := &vmMockCluster{
+		listStatusFn:    listStatusFn,
+		listResourcesFn: listResourcesFn,
+	}
+	cfg := &config.CPIConfig{
+		Node:           "pve",
+		VMStorage:      storageName,
+		NetworkBridge:  "vmbr0",
+		VMIDRangeStart: 100,
+		// Placement enabled explicitly; IP-conflict guard enabled.
+	}
+	if extraCfg != nil {
+		extraCfg(cfg)
+	}
+	return handlers.Deps{
+		Config: cfg,
+		PVE: &mockPVEClient{
+			qemuSvc:    q,
+			nodesSvc:   n,
+			clusterSvc: c,
+			tasksSvc: &mockTasksService{
+				waitFn: func(_ context.Context, _, _ string, _ *sdktasks.WaitOptions) (*sdktasks.Status, error) {
+					return &sdktasks.Status{ExitStatus: "OK"}, nil
+				},
+			},
+		},
+		Agent:  a,
+		Logger: log.NewNopLogger(),
+	}
+}
+
+// listStatusSingleNode returns a ListStatus response with one online node named "pve".
+func listStatusSingleNode() func(context.Context) (*sdkcluster.ListStatusResponse, error) {
+	return func(_ context.Context) (*sdkcluster.ListStatusResponse, error) {
+		raw, _ := json.Marshal(map[string]any{
+			"type":   "node",
+			"name":   "pve",
+			"online": 1,
+			"maxcpu": int64(4),
+			"maxmem": int64(8 * 1024 * 1024 * 1024),
+			"mem":    int64(1 * 1024 * 1024 * 1024),
+			"cpu":    0.05,
+		})
+		resp := sdkcluster.ListStatusResponse{raw}
+		return &resp, nil
+	}
+}
+
+// listStatusTwoNodes returns a ListStatus response with two online nodes.
+// pve1 has more free memory, so the scorer should prefer it.
+func listStatusTwoNodes() func(context.Context) (*sdkcluster.ListStatusResponse, error) {
+	return func(_ context.Context) (*sdkcluster.ListStatusResponse, error) {
+		gib := int64(1024 * 1024 * 1024)
+		raw1, _ := json.Marshal(map[string]any{
+			"type": "node", "name": "pve1", "online": 1,
+			"maxcpu": int64(8), "maxmem": 16 * gib, "mem": 4 * gib, "cpu": 0.1,
+		})
+		raw2, _ := json.Marshal(map[string]any{
+			"type": "node", "name": "pve2", "online": 1,
+			"maxcpu": int64(8), "maxmem": 16 * gib, "mem": 14 * gib, "cpu": 0.8,
+		})
+		resp := sdkcluster.ListStatusResponse{raw1, raw2}
+		return &resp, nil
+	}
+}
+
+// emptyListResources is a ListResources response with no VMs (clean cluster for IP checks).
+func emptyListResources(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+	resp := sdkcluster.ListResourcesResponse{}
+	return &resp, nil
+}
+
+// TestCreateVM_PlacementEnabled_TargetNodeOverride verifies that when
+// cloud_properties.target_node is set, placement scoring is bypassed entirely.
+// The test would fail if GatherNodeFacts were called because ListStatus panics.
+func TestCreateVM_PlacementEnabled_TargetNodeOverride(t *testing.T) {
+	t.Parallel()
+
+	var createNode string
+	q := &vmMockQEMU{
+		createFn: func(_ context.Context, node string, _ map[string]any) (string, error) {
+			createNode = node
+			return "UPID:pve2:ok", nil
+		},
+	}
+	n := &vmMockNodes{}
+	a := &vmMockAgent{}
+
+	// Use a cluster that panics on ListStatus — proves GatherNodeFacts is never called.
+	panicStatus := func(_ context.Context) (*sdkcluster.ListStatusResponse, error) {
+		panic("ListStatus must not be called when target_node is set")
+	}
+	deps := buildVMDepsPlacement(q, n, panicStatus, emptyListResources, a, nil)
+	deps.Config.EnsureNoIPConflicts = placementDisabled // no static IPs in this test
+	h := handlers.HandleCreateVM(deps)
+
+	args := mkArgs("agent-override", testStemcellCID,
+		map[string]any{"target_node": "pve2"},
+		map[string]any{"default": map[string]any{"type": "dynamic", "cloud_properties": map[string]any{}}},
+		[]string{}, map[string]any{})
+
+	if _, err := h.Handle(context.Background(), args, mkCtx("override")); err != nil {
+		t.Fatalf("expected success with target_node override, got: %v", err)
+	}
+	if createNode != "pve2" {
+		t.Errorf("create node: want pve2, got %q", createNode)
+	}
+}
+
+// TestCreateVM_PlacementEnabled_MultiNode_BestNodePicked verifies that when
+// placement is enabled and multiple nodes are online, the scorer picks the node
+// with the highest score (most free memory = lowest utilisation).
+func TestCreateVM_PlacementEnabled_MultiNode_BestNodePicked(t *testing.T) {
+	t.Parallel()
+
+	var createNode string
+	q := &vmMockQEMU{
+		createFn: func(_ context.Context, node string, _ map[string]any) (string, error) {
+			createNode = node
+			return "UPID:pve1:ok", nil
+		},
+	}
+	n := &vmMockNodes{}
+	a := &vmMockAgent{}
+
+	// pve1 has 12 GiB free (16-4), pve2 has 2 GiB free (16-14) — pve1 wins.
+	deps := buildVMDepsPlacement(q, n, listStatusTwoNodes(), emptyListResources, a, func(c *config.CPIConfig) {
+		c.Node = "pve1" // config.Node is the fallback only; scoring should pick pve1
+		c.EnsureNoIPConflicts = placementDisabled
+	})
+	h := handlers.HandleCreateVM(deps)
+
+	args := mkArgs("agent-multi", testStemcellCID,
+		map[string]any{},
+		map[string]any{"default": map[string]any{"type": "dynamic", "cloud_properties": map[string]any{}}},
+		[]string{}, map[string]any{})
+
+	if _, err := h.Handle(context.Background(), args, mkCtx("multi-node")); err != nil {
+		t.Fatalf("expected success, got: %v", err)
+	}
+	if createNode != "pve1" {
+		t.Errorf("expected placement to choose pve1 (most free RAM), got %q", createNode)
+	}
+}
+
+// TestCreateVM_PlacementDisabled_UsesConfigNode verifies that when
+// Placement.Enabled=false, Config.Node is used directly without GatherNodeFacts.
+func TestCreateVM_PlacementDisabled_UsesConfigNode(t *testing.T) {
+	t.Parallel()
+
+	var createNode string
+	q := &vmMockQEMU{
+		createFn: func(_ context.Context, node string, _ map[string]any) (string, error) {
+			createNode = node
+			return "UPID:pve-static:ok", nil
+		},
+	}
+	// buildVMDeps disables placement — reuse it.
+	deps := buildVMDeps(q, &vmMockNodes{}, &vmMockCluster{}, &vmMockAgent{})
+	h := handlers.HandleCreateVM(deps)
+
+	args := mkArgs("agent-disabled", testStemcellCID,
+		map[string]any{},
+		map[string]any{"default": map[string]any{"type": "dynamic", "cloud_properties": map[string]any{}}},
+		[]string{}, map[string]any{})
+
+	if _, err := h.Handle(context.Background(), args, mkCtx("placement-disabled")); err != nil {
+		t.Fatalf("expected success, got: %v", err)
+	}
+	if createNode != "pve" {
+		t.Errorf("expected config.Node \"pve\", got %q", createNode)
+	}
+}
+
+// TestCreateVM_AZSet_CandidatesRestricted verifies that when availability_zone
+// is set and matches an entry in placement.az_map, only those nodes are scored.
+func TestCreateVM_AZSet_CandidatesRestricted(t *testing.T) {
+	t.Parallel()
+
+	var createNode string
+	q := &vmMockQEMU{
+		createFn: func(_ context.Context, node string, _ map[string]any) (string, error) {
+			createNode = node
+			return "UPID:az-node:ok", nil
+		},
+	}
+	n := &vmMockNodes{}
+	a := &vmMockAgent{}
+
+	// Cluster has pve1 and pve2; AZ "zone-a" maps to only pve2.
+	deps := buildVMDepsPlacement(q, n, listStatusTwoNodes(), emptyListResources, a, func(c *config.CPIConfig) {
+		c.Node = "pve1"
+		c.Placement = &config.PlacementConfig{
+			AZMap: map[string][]string{
+				"zone-a": {"pve2"},
+			},
+		}
+		c.EnsureNoIPConflicts = placementDisabled
+	})
+	h := handlers.HandleCreateVM(deps)
+
+	args := mkArgs("agent-az", testStemcellCID,
+		map[string]any{"availability_zone": "zone-a"},
+		map[string]any{"default": map[string]any{"type": "dynamic", "cloud_properties": map[string]any{}}},
+		[]string{}, map[string]any{})
+
+	if _, err := h.Handle(context.Background(), args, mkCtx("az-restrict")); err != nil {
+		t.Fatalf("expected success, got: %v", err)
+	}
+	if createNode != "pve2" {
+		t.Errorf("expected pve2 (only node in zone-a), got %q", createNode)
+	}
+}
+
+// TestCreateVM_AZSet_UnknownAZ_CloudError verifies that specifying an AZ not
+// present in placement.az_map returns a CloudError immediately.
+func TestCreateVM_AZSet_UnknownAZ_CloudError(t *testing.T) {
+	t.Parallel()
+
+	n := &vmMockNodes{}
+	a := &vmMockAgent{}
+
+	panicStatus := func(_ context.Context) (*sdkcluster.ListStatusResponse, error) {
+		panic("ListStatus must not be called before AZ validation fails")
+	}
+	deps := buildVMDepsPlacement(&vmMockQEMU{}, n, panicStatus, emptyListResources, a, func(c *config.CPIConfig) {
+		c.Placement = &config.PlacementConfig{
+			AZMap: map[string][]string{
+				"zone-a": {"pve1"},
+			},
+		}
+		c.EnsureNoIPConflicts = placementDisabled
+	})
+	h := handlers.HandleCreateVM(deps)
+
+	args := mkArgs("agent-badaz", testStemcellCID,
+		map[string]any{"availability_zone": "zone-unknown"},
+		map[string]any{"default": map[string]any{"type": "dynamic", "cloud_properties": map[string]any{}}},
+		[]string{}, map[string]any{})
+
+	_, err := h.Handle(context.Background(), args, mkCtx("az-unknown"))
+	if err == nil {
+		t.Fatal("expected CloudError for unknown AZ, got nil")
+	}
+	if !isCloudError(err) {
+		t.Errorf("expected *cpierrors.Error, got %T: %v", err, err)
+	}
+	if !strings.Contains(err.Error(), "zone-unknown") {
+		t.Errorf("error should mention the unknown AZ name; got: %v", err)
+	}
+}
+
+// TestCreateVM_IPConflict_StaticIP_Refused verifies that when a static IP in
+// the network spec is already claimed by another VM, create_vm returns a
+// CloudError and does not proceed to boot.
+func TestCreateVM_IPConflict_StaticIP_Refused(t *testing.T) {
+	t.Parallel()
+
+	q := &vmMockQEMU{}
+	n := &vmMockNodes{}
+	a := &vmMockAgent{}
+
+	// ListResources returns one existing VM with VMID 200.
+	conflictingVMListFn := func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+		raw, _ := json.Marshal(map[string]any{
+			"vmid": 200,
+			"node": "pve",
+			"name": "existing-vm",
+			"type": "qemu",
+		})
+		resp := sdkcluster.ListResourcesResponse{raw}
+		return &resp, nil
+	}
+	// The conflicting VM's Config returns ipconfig0 holding the target IP.
+	conflictingIP := "10.99.0.5"
+	q.configFn = func(_ context.Context, _ string, vmid int) (map[string]any, error) {
+		if vmid == 200 {
+			return map[string]any{
+				"ipconfig0": "ip=" + conflictingIP + "/24,gw=10.99.0.1",
+				"net0":      "virtio=aa:bb:cc:dd:ee:ff,bridge=vmbr0",
+			}, nil
+		}
+		// For any new VM created during the test, return normal config.
+		return map[string]any{"net0": "virtio=aa:bb:cc:dd:ee:ff,bridge=vmbr0"}, nil
+	}
+
+	deps := buildVMDepsPlacement(q, n, listStatusSingleNode(), conflictingVMListFn, a, func(c *config.CPIConfig) {
+		// EnsureNoIPConflicts defaults to true (nil), so leave it unset.
+		// Placement disabled to keep node fixed at "pve".
+		c.Placement = &config.PlacementConfig{Enabled: placementDisabled}
+	})
+	h := handlers.HandleCreateVM(deps)
+
+	args := mkArgs("agent-conflict", testStemcellCID,
+		map[string]any{},
+		map[string]any{"default": map[string]any{
+			"type": "manual", "ip": conflictingIP,
+			"netmask": "255.255.255.0", "gateway": "10.99.0.1",
+			"cloud_properties": map[string]any{"bridge": "vmbr0"},
+		}},
+		[]string{}, map[string]any{})
+
+	_, err := h.Handle(context.Background(), args, mkCtx("ip-conflict"))
+	if err == nil {
+		t.Fatal("expected CloudError for IP conflict, got nil")
+	}
+	if !isCloudError(err) {
+		t.Errorf("expected *cpierrors.Error, got %T: %v", err, err)
+	}
+	if !strings.Contains(err.Error(), conflictingIP) {
+		t.Errorf("error must mention conflicting IP %q; got: %v", conflictingIP, err)
+	}
+	if !strings.Contains(err.Error(), "200") {
+		t.Errorf("error must mention conflicting VMID 200; got: %v", err)
+	}
+	// Start must NOT have been called — conflict check fires before boot.
+	if len(q.startCalls) != 0 {
+		t.Errorf("QEMU.Start must not be called when IP conflict detected; got %d calls", len(q.startCalls))
+	}
+}
+
+// TestCreateVM_IPConflict_Clear_Proceeds verifies that when no IP conflict is
+// detected, create_vm proceeds normally.
+func TestCreateVM_IPConflict_Clear_Proceeds(t *testing.T) {
+	t.Parallel()
+
+	q := &vmMockQEMU{}
+	n := &vmMockNodes{}
+	a := &vmMockAgent{}
+
+	// ListResources returns one existing VM, but it holds a DIFFERENT IP.
+	noConflictFn := func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+		raw, _ := json.Marshal(map[string]any{
+			"vmid": 201, "node": "pve", "name": "other-vm", "type": "qemu",
+		})
+		resp := sdkcluster.ListResourcesResponse{raw}
+		return &resp, nil
+	}
+	q.configFn = func(_ context.Context, _ string, vmid int) (map[string]any, error) {
+		if vmid == 201 {
+			// VM 201 holds a different IP — no conflict.
+			return map[string]any{
+				"ipconfig0": "ip=10.99.0.99/24,gw=10.99.0.1",
+				"net0":      "virtio=aa:bb:cc:dd:ee:ff,bridge=vmbr0",
+			}, nil
+		}
+		return map[string]any{"net0": "virtio=aa:bb:cc:dd:ee:ff,bridge=vmbr0"}, nil
+	}
+
+	deps := buildVMDepsPlacement(q, n, listStatusSingleNode(), noConflictFn, a, func(c *config.CPIConfig) {
+		c.Placement = &config.PlacementConfig{Enabled: placementDisabled}
+		// EnsureNoIPConflicts nil (default true).
+	})
+	h := handlers.HandleCreateVM(deps)
+
+	args := mkArgs("agent-noconflict", testStemcellCID,
+		map[string]any{},
+		map[string]any{"default": map[string]any{
+			"type": "manual", "ip": "10.99.0.5",
+			"netmask": "255.255.255.0", "gateway": "10.99.0.1",
+			"cloud_properties": map[string]any{"bridge": "vmbr0"},
+		}},
+		[]string{}, map[string]any{})
+
+	if _, err := h.Handle(context.Background(), args, mkCtx("no-conflict")); err != nil {
+		t.Fatalf("expected success when no IP conflict, got: %v", err)
+	}
+	if len(q.startCalls) != 1 {
+		t.Errorf("expected 1 Start call after clean conflict check, got %d", len(q.startCalls))
+	}
+}
+
+// TestCreateVM_IPConflict_DynamicNetworkSkipped verifies that dynamic (DHCP)
+// networks are not checked for IP conflicts. The QEMU.Config mock for the
+// conflicting VM would return an IP that matches the target if the check ran
+// (but it cannot match, since DHCP networks have no static target IP).
+// The test passes if and only if create_vm succeeds (no spurious conflict error).
+func TestCreateVM_IPConflict_DynamicNetworkSkipped(t *testing.T) {
+	t.Parallel()
+
+	q := &vmMockQEMU{}
+	n := &vmMockNodes{}
+	a := &vmMockAgent{}
+
+	// Wire a ListResources that returns a VM whose Config holds "ip=dhcp" —
+	// same as the new VM's ipconfig. detectIPConflict, if mistakenly called,
+	// would see "ip=dhcp" and return nil (extractStaticIP returns "" for dhcp).
+	// But the intent of the test is: no conflict check at all for DHCP networks.
+	conflictCheckListFn := func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+		// Return empty so AllocateWithRetry can pick a VMID.
+		resp := sdkcluster.ListResourcesResponse{}
+		return &resp, nil
+	}
+	// Config for VMID 9999: return "ip=dhcp" — safe; extractStaticIP returns "".
+	q.configFn = func(_ context.Context, _ string, _ int) (map[string]any, error) {
+		return map[string]any{"net0": "virtio=aa:bb:cc:dd:ee:ff,bridge=vmbr0"}, nil
+	}
+
+	deps := buildVMDepsPlacement(q, n, listStatusSingleNode(), conflictCheckListFn, a, func(c *config.CPIConfig) {
+		c.Placement = &config.PlacementConfig{Enabled: placementDisabled}
+		// EnsureNoIPConflicts nil (default true) — but DHCP network has no static IP,
+		// so collectStaticIPsForConflictCheck returns empty and detectIPConflict is never called.
+	})
+	h := handlers.HandleCreateVM(deps)
+
+	// Dynamic network — no static IP to check.
+	args := mkArgs("agent-dhcp", testStemcellCID,
+		map[string]any{},
+		map[string]any{"default": map[string]any{"type": "dynamic", "cloud_properties": map[string]any{}}},
+		[]string{}, map[string]any{})
+
+	// The invariant: create_vm succeeds without any IP-conflict CloudError.
+	// If the check incorrectly fires for DHCP, it would still pass (dhcp → no
+	// static IP → no conflict), but if collectStaticIPsForConflictCheck
+	// incorrectly extracts a non-empty IP, an error would surface here.
+	if _, err := h.Handle(context.Background(), args, mkCtx("dhcp-skip")); err != nil {
+		t.Fatalf("expected success for DHCP network (conflict check must be skipped), got: %v", err)
+	}
+	if len(q.startCalls) != 1 {
+		t.Errorf("expected 1 Start call (VM should boot), got %d", len(q.startCalls))
+	}
+}
+
+// TestCreateVM_IPConflict_MultiBridge_NonLastBridgeDetected verifies that when a
+// VM has static IPs on two bridges (net0=vmbr0, net1=vmbr1), a conflict on the
+// non-last bridge is detected and refused. This is the regression test for the
+// multi-bridge gap: the old single-bridge implementation only checked the bridge
+// of the last NIC, silently missing conflicts on earlier bridges.
+func TestCreateVM_IPConflict_MultiBridge_NonLastBridgeDetected(t *testing.T) {
+	t.Parallel()
+
+	q := &vmMockQEMU{}
+	n := &vmMockNodes{}
+	a := &vmMockAgent{}
+
+	// The conflicting VM (VMID 300) holds the vmbr0 IP on vmbr0 only.
+	// The new VM will request net0=vmbr0 (conflicting) and net1=vmbr1 (clean).
+	// With the old bug, if vmbr1 was the "last" bridge seen, detectIPConflict
+	// would only scan vmbr1-filtered NICs and miss the vmbr0 conflict entirely.
+	conflictIP := "10.1.0.5"
+	listFn := func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+		raw, _ := json.Marshal(map[string]any{
+			"vmid": 300, "node": "pve", "name": "conflicting-vm", "type": "qemu",
+		})
+		resp := sdkcluster.ListResourcesResponse{raw}
+		return &resp, nil
+	}
+	q.configFn = func(_ context.Context, _ string, vmid int) (map[string]any, error) {
+		if vmid == 300 {
+			// VM 300 has the conflicting IP on vmbr0 (net0).
+			// net1=vmbr1 has a different, non-conflicting IP.
+			return map[string]any{
+				"ipconfig0": "ip=" + conflictIP + "/24,gw=10.1.0.1",
+				"net0":      "virtio=aa:bb:cc:dd:ee:ff,bridge=vmbr0",
+				"ipconfig1": "ip=10.2.0.50/24,gw=10.2.0.1",
+				"net1":      "virtio=bb:cc:dd:ee:ff:00,bridge=vmbr1",
+			}, nil
+		}
+		return map[string]any{
+			"net0": "virtio=aa:bb:cc:dd:ee:ff,bridge=vmbr0",
+			"net1": "virtio=bb:cc:dd:ee:ff:00,bridge=vmbr1",
+		}, nil
+	}
+
+	deps := buildVMDepsPlacement(q, n, listStatusSingleNode(), listFn, a, func(c *config.CPIConfig) {
+		c.Placement = &config.PlacementConfig{Enabled: placementDisabled}
+		// EnsureNoIPConflicts nil (default true).
+	})
+	h := handlers.HandleCreateVM(deps)
+
+	// New VM requests two manual networks: net0 on vmbr0 (IP conflicts with VM 300),
+	// net1 on vmbr1 (clean IP). The conflict on vmbr0 must be caught even though
+	// vmbr1 is processed later in the map iteration.
+	args := mkArgs("agent-multibr", testStemcellCID,
+		map[string]any{},
+		map[string]any{
+			"net0": map[string]any{
+				"type": "manual", "ip": conflictIP,
+				"netmask": "255.255.255.0", "gateway": "10.1.0.1",
+				"cloud_properties": map[string]any{"bridge": "vmbr0"},
+			},
+			"net1": map[string]any{
+				"type": "manual", "ip": "10.2.0.99",
+				"netmask": "255.255.255.0", "gateway": "10.2.0.1",
+				"cloud_properties": map[string]any{"bridge": "vmbr1"},
+			},
+		},
+		[]string{}, map[string]any{})
+
+	_, err := h.Handle(context.Background(), args, mkCtx("multi-bridge-conflict"))
+	if err == nil {
+		t.Fatal("expected CloudError for multi-bridge IP conflict on vmbr0, got nil")
+	}
+	if !isCloudError(err) {
+		t.Errorf("expected *cpierrors.Error, got %T: %v", err, err)
+	}
+	if !strings.Contains(err.Error(), conflictIP) {
+		t.Errorf("error must mention conflicting IP %q; got: %v", conflictIP, err)
+	}
+	if !strings.Contains(err.Error(), "300") {
+		t.Errorf("error must mention conflicting VMID 300; got: %v", err)
+	}
+	// VM must not be booted when a conflict is detected.
+	if len(q.startCalls) != 0 {
+		t.Errorf("QEMU.Start must not be called when IP conflict detected; got %d calls", len(q.startCalls))
+	}
+}
+
+// TestCreateVM_IPConflict_NoSelfConflict verifies that a static-IP create_vm
+// succeeds even when the cluster's ListResources conflict scan returns the
+// newly-created VM itself holding that IP. Without the excludeVMID fix, this
+// would return a CloudError ("IP conflict") against the VM's own ipconfig,
+// aborting every static-IP deployment.
+func TestCreateVM_IPConflict_NoSelfConflict(t *testing.T) {
+	t.Parallel()
+
+	q := &vmMockQEMU{}
+	n := &vmMockNodes{}
+	a := &vmMockAgent{}
+
+	const staticIP = "10.77.0.250"
+
+	// createdVMID captures the VMID actually allocated by AllocateWithRetry so
+	// the listResourcesFn can return it in the detectIPConflict scan. The VMID
+	// is random within the range (nextVMIDInRange uses a random offset), so we
+	// cannot hardcode it.
+	var createdVMID int
+	var createdMu sync.Mutex
+
+	// createFn: record the VMID from the params map, then succeed normally.
+	q.createFn = func(_ context.Context, _ string, params map[string]any) (string, error) {
+		if v, ok := params["vmid"]; ok {
+			switch id := v.(type) {
+			case int:
+				createdMu.Lock()
+				createdVMID = id
+				createdMu.Unlock()
+			case int64:
+				createdMu.Lock()
+				createdVMID = int(id)
+				createdMu.Unlock()
+			case float64:
+				createdMu.Lock()
+				createdVMID = int(id)
+				createdMu.Unlock()
+			}
+		}
+		return "UPID:pve:create:ok", nil
+	}
+
+	// listResourcesFn: always return empty so NextVMID has a free range, AND
+	// so detectIPConflict's initial resource list is also empty (no other VMs).
+	// After the VM is created, we want detectIPConflict to see it — but since
+	// we control configFn, we simulate that by returning the new VM once the
+	// VMID has been captured.
+	//
+	// Note: ListResources is called first by listClusterVMIDs (VMID allocation)
+	// and then by detectIPConflict. Both calls go through the same fn. After the
+	// createFn fires, createdVMID is set. The conflict-check call happens later,
+	// so we return the new VM's entry for any call after createdVMID is set.
+	listResourcesFn := func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+		createdMu.Lock()
+		vmid := createdVMID
+		createdMu.Unlock()
+
+		if vmid == 0 {
+			// VMID not yet allocated — return empty for NextVMID.
+			resp := sdkcluster.ListResourcesResponse{}
+			return &resp, nil
+		}
+		// VM was created: conflict scan sees the new VM holding the target IP.
+		// This simulates the self-conflict scenario that the fix must prevent.
+		raw, _ := json.Marshal(map[string]any{
+			"vmid": vmid, "node": "pve", "name": "new-vm", "type": "qemu",
+		})
+		resp := sdkcluster.ListResourcesResponse{raw}
+		return &resp, nil
+	}
+
+	// configFn: for the new VM, return its own ipconfig with the target IP —
+	// exactly what configureNICs writes via UpdateQemuConfig before the check.
+	q.configFn = func(_ context.Context, _ string, vmid int) (map[string]any, error) {
+		createdMu.Lock()
+		newID := createdVMID
+		createdMu.Unlock()
+		if vmid == newID && newID != 0 {
+			return map[string]any{
+				"ipconfig0": "ip=" + staticIP + "/24,gw=10.77.0.1",
+				"net0":      "virtio=de:ad:be:ef:00:01,bridge=vmbr0",
+			}, nil
+		}
+		return map[string]any{"net0": "virtio=de:ad:be:ef:00:01,bridge=vmbr0"}, nil
+	}
+
+	deps := buildVMDepsPlacement(q, n, listStatusSingleNode(), listResourcesFn, a, func(c *config.CPIConfig) {
+		c.Placement = &config.PlacementConfig{Enabled: placementDisabled}
+		// EnsureNoIPConflicts nil (default true) — the guard is active.
+	})
+	h := handlers.HandleCreateVM(deps)
+
+	args := mkArgs("agent-selfconflict", testStemcellCID,
+		map[string]any{},
+		map[string]any{"default": map[string]any{
+			"type": "manual", "ip": staticIP,
+			"netmask": "255.255.255.0", "gateway": "10.77.0.1",
+			"cloud_properties": map[string]any{"bridge": "vmbr0"},
+		}},
+		[]string{}, map[string]any{})
+
+	if _, err := h.Handle(context.Background(), args, mkCtx("no-self-conflict")); err != nil {
+		t.Fatalf("static-IP create_vm must not self-conflict: %v", err)
+	}
+	// VM must have booted — the conflict check did not abort the flow.
+	if len(q.startCalls) != 1 {
+		t.Errorf("expected 1 Start call (VM boots normally), got %d", len(q.startCalls))
 	}
 }

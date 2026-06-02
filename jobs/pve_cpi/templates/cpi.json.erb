@@ -134,5 +134,45 @@
   clone_mode = p("pve.clone_mode", "")
   config["clone_mode"] = clone_mode unless clone_mode.to_s.empty?
 
+  # Emit ensure_no_ip_conflicts only when explicitly set to false. The Go config
+  # accessor defaults nil *bool -> true (protective); omitting the key preserves
+  # that default. Emit only when the operator explicitly disables the guard.
+  unless p("pve.ensure_no_ip_conflicts", true)
+    config["ensure_no_ip_conflicts"] = false
+  end
+
+  # Emit the placement block only when at least one placement property is set.
+  # When the block would be empty, omit it entirely so the Go config zero-value
+  # (nil *PlacementConfig) is preserved and existing deployments are unaffected.
+  placement = {}
+
+  # placement.enabled: emit only when explicitly set to false (protective default
+  # is true; omitting the key lets the Go accessor return true naturally).
+  placement_enabled = p("pve.placement.enabled", true)
+  placement["enabled"] = placement_enabled unless placement_enabled
+
+  # placement.az_map: emit only when the operator supplies a non-empty hash.
+  az_map = p("pve.placement.az_map", {})
+  placement["az_map"] = az_map unless az_map.nil? || az_map.empty?
+
+  # placement.anti_affinity: emit only when explicitly set to true (default false).
+  if p("pve.placement.anti_affinity", false)
+    placement["anti_affinity"] = true
+  end
+
+  # placement.weights: emit only when at least one weight is overridden.
+  weights = {}
+  { "mem"         => "pve.placement.weights.mem",
+    "storage"     => "pve.placement.weights.storage",
+    "cpu"         => "pve.placement.weights.cpu",
+    "guest_count" => "pve.placement.weights.guest_count",
+  }.each do |json_key, prop|
+    v = p(prop, 0.0).to_f
+    weights[json_key] = v unless v == 0.0
+  end
+  placement["weights"] = weights unless weights.empty?
+
+  config["placement"] = placement unless placement.empty?
+
   JSON.dump(config)
 %>
