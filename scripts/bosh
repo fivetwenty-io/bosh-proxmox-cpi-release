@@ -173,6 +173,27 @@ def env_vars_layer() -> list[str]:
     f = env_vars_file()
     return ["-l", str(f)] if f else []
 
+
+def env_cc_reserved_ops() -> list[str]:
+    """Return -o for the active env's cloud-config reserved override.
+
+    Applied ONLY by update-cloud-config (cmd_ucc), never by create-env: it
+    widens the bosh cloud-config's default-network reserved band so a VM placed
+    on that cloud-config (emptyvm in particular) avoids the low infra slots the
+    env keeps for the gateway, Director, and artifacts VM. Without it the base
+    bosh cloud-config reserves only the gateway + Director, so emptyvm grabs
+    .2 — an address conventionally kept for routing, and a low slot a fresh
+    create-env Director (empty IPAM) can re-hand to a new VM while a prior
+    deployment still holds it (duplicate IP -> agent NATS flap). Optional:
+    absent file means no override (base envs unchanged).
+    """
+    env_name = os.environ.get("BOSH_PVE_ENV", "").strip()
+    if not env_name:
+        return []
+    layer = ENVS_DIR / env_name / "cc-reserved.yml"
+    return ["-o", str(layer)] if layer.exists() else []
+
+
 USAGE = __doc__ or ""
 
 
@@ -345,10 +366,54 @@ def _state_is_empty() -> bool:
     return "bosh" not in data and "deployments" not in data
 
 
+def _delete_all_deployments() -> None:
+    """Best-effort: delete every deployment on the Director before delete-env.
+
+    `bosh delete-env` removes ONLY the Director VM. Any deployment's VMs
+    (notably emptyvm) outlive it as orphans on PVE. Because a later create-env
+    builds a fresh Director with empty IPAM, that Director can re-hand an
+    orphan's address to a new VM, producing a duplicate-IP / NATS flap (the new
+    VM's agent shows 'unresponsive' while ARP resolves the shared IP to the
+    orphan). Deleting the deployments here, while the Director still exists,
+    guarantees their VMs are removed first.
+
+    Best-effort by design: if the Director is unreachable (already torn down,
+    creds gone) we log and fall through to delete-env, which handles the
+    Director VM itself.
+    """
+    try:
+        proc = subprocess.run(
+            ["bosh", "-e", "pve", "deployments", "--column=name", "--json"],
+            cwd=REPO_ROOT, env=director_env(),
+            capture_output=True, text=True, timeout=60,
+        )
+    except (subprocess.SubprocessError, OSError) as exc:
+        print(f"teardown: could not reach Director to list deployments ({exc}); "
+              "proceeding to delete-env", file=sys.stderr)
+        return
+    if proc.returncode != 0:
+        print("teardown: Director not reachable for deployment cleanup; "
+              "proceeding to delete-env", file=sys.stderr)
+        return
+    try:
+        rows = json.loads(proc.stdout)["Tables"][0]["Rows"]
+        names = [r.get("name", "").strip() for r in rows if r.get("name", "").strip()]
+    except (json.JSONDecodeError, KeyError, IndexError, TypeError):
+        names = []
+    for name in names:
+        print(f"teardown: deleting deployment '{name}' before delete-env")
+        run("bosh", "-e", "pve", "-n", "-d", name, "delete-deployment", "--force",
+            env=director_env())
+
+
 def cmd_teardown(args: list[str]) -> int:
     if _state_is_empty():
         print(f"teardown: state file absent or empty ({STATE}), nothing to delete")
         return 0
+    # Remove all deployments (their VMs) before delete-env strands them as
+    # orphans on the SDN — see _delete_all_deployments for the duplicate-IP
+    # failure this prevents.
+    _delete_all_deployments()
     release = cpi_release_path()
     rc = run(
         "bosh", "delete-env",
@@ -410,6 +475,7 @@ def cmd_ucc(args: list[str]) -> int:
         "bosh", "-e", "pve", "-n", "update-cloud-config",
         str(CLOUD_CONFIG),
         *env_network_ops(),
+        *env_cc_reserved_ops(),
         "-l", str(VARS),
         *env_vars_layer(),
         *args,
