@@ -476,7 +476,7 @@ func HandleCreateStemcell(deps Deps) cpi.Handler {
 			// Dedup: qcow2 already on storage. Build template from it (idempotent).
 			// CPI does NOT own this pre-existing qcow2 → cpiOwnsSource=false so the
 			// source is not deleted (it may be shared with other stemcell records).
-			vmid, tmplErr := ensureTemplateVM(ctx, deps, templateNode, storage, qcow2Filename, sha256hex, false, cp)
+			vmid, tmplErr := ensureTemplateVM(ctx, deps, templateNode, storage, qcow2Filename, sha256hex, false, cp, imagePath)
 			if tmplErr != nil {
 				return nil, fmt.Errorf("create_stemcell: ensure template (dedup path): %w", tmplErr)
 			}
@@ -496,7 +496,7 @@ func HandleCreateStemcell(deps Deps) cpi.Handler {
 						uploadStagingDir = deps.Config.StemcellStagingDir
 					}
 					replicateStemcellToNodes(ctx, deps, templateNode, storage, qcow2Filename,
-						sha256hex, clusterNodes, uploadSourcePath, uploadStagingDir, cp)
+						sha256hex, clusterNodes, uploadSourcePath, uploadStagingDir, cp, imagePath)
 				}
 			}
 
@@ -512,7 +512,7 @@ func HandleCreateStemcell(deps Deps) cpi.Handler {
 		// Step 12: Build template VM from the freshly uploaded qcow2.
 		// heavy path: CPI uploaded the qcow2 → cpiOwnsSource=true; ensureTemplateVM
 		// deletes it after freeze (reclaims storage; template disk is the live copy).
-		vmid, tmplErr := ensureTemplateVM(ctx, deps, templateNode, storage, qcow2Filename, sha256hex, true, cp)
+		vmid, tmplErr := ensureTemplateVM(ctx, deps, templateNode, storage, qcow2Filename, sha256hex, true, cp, imagePath)
 		if tmplErr != nil {
 			return nil, fmt.Errorf("create_stemcell: ensure template: %w", tmplErr)
 		}
@@ -533,7 +533,7 @@ func HandleCreateStemcell(deps Deps) cpi.Handler {
 					uploadStagingDir = deps.Config.StemcellStagingDir
 				}
 				replicateStemcellToNodes(ctx, deps, templateNode, storage, qcow2Filename,
-					sha256hex, clusterNodes, uploadSourcePath, uploadStagingDir, cp)
+					sha256hex, clusterNodes, uploadSourcePath, uploadStagingDir, cp, imagePath)
 			}
 		}
 
@@ -581,6 +581,7 @@ func ensureTemplateVM(
 	templateNode, storage, qcow2Filename, sha256hex string,
 	cpiOwnsSource bool,
 	cp stemcellCloudProps,
+	source string,
 ) (vmid int64, err error) {
 	logger := deps.Logger
 
@@ -643,7 +644,7 @@ func ensureTemplateVM(
 
 	allocatedRaw, allocErr := pve.AllocateWithRetry(ctx, deps.PVE,
 		func(candidate int) error {
-			return attemptCreateTemplateVM(ctx, deps, logger, templateNode, candidate, templateName, importVolid, shaTag, deps.Config.VMStorage)
+			return attemptCreateTemplateVM(ctx, deps, logger, templateNode, candidate, templateName, importVolid, shaTag, deps.Config.VMStorage, cp, source, nil)
 		},
 		isRetryable,
 		0, // use AllocateWithRetry default (3 attempts)
@@ -828,6 +829,20 @@ func deleteTemplateVM(ctx context.Context, deps Deps, node string, vmid int64, l
 //   - onboot=0 — templates must not auto-start.
 //   - virtio0: import-from= with format=qcow2 and size=5G default.
 //   - Tags: "bosh-stemcell-sha-<sha8>" for content-based template dedup lookup.
+//
+// shaTag must be the pure "bosh-stemcell-sha-<sha8>" tag for the primary path.
+// extraBaseTags holds any additional identity tags (e.g. the per-node replica
+// tag) that belong in the base set alongside shaTag regardless of provenance
+// mode. When nil, only shaTag appears in the base set.
+//
+// When deps.Config.StemcellProvenanceEnabled() is true, additional provenance
+// tags (marker, name, version, director) are merged into the tags field and a
+// JSON provenance block is written to the description field. When disabled the
+// createParams are byte-identical to the pre-provenance behaviour: tags equals
+// shaTag for the primary path and "shaTag;extraBaseTags[0]" for the replica.
+//
+// cp and source are used only when provenance is enabled. source is the
+// human-readable origin label (image_path, image_id, or image_url).
 func attemptCreateTemplateVM(
 	ctx context.Context,
 	deps Deps,
@@ -835,6 +850,9 @@ func attemptCreateTemplateVM(
 	node string,
 	candidate int,
 	templateName, importVolid, shaTag, targetStorage string,
+	cp stemcellCloudProps,
+	source string,
+	extraBaseTags []string,
 ) error {
 	// virtio0: allocate the template's root disk on targetStorage (the VM/images
 	// storage). PVE requires the "<storage>:<size>" form — a bare "0" is parsed
@@ -847,8 +865,15 @@ func attemptCreateTemplateVM(
 	virtio0Val := fmt.Sprintf("%s:0,import-from=%s,format=%s,size=%dG",
 		targetStorage, importVolid, diskFormatQCOW2, defaultStemcellDiskGiB)
 
+	// baseTags is the ordered set of identity tags that always appear in the
+	// template's tags field regardless of provenance mode. For the primary path
+	// this is [shaTag]; for replicas it also includes the per-node tag.
+	baseTags := make([]string, 0, 1+len(extraBaseTags))
+	baseTags = append(baseTags, shaTag)
+	baseTags = append(baseTags, extraBaseTags...)
+
 	createParams := map[string]any{
-		metadataKeyVMID:          candidate,
+		metadataKeyVMID: candidate,
 		metadataKeyName: templateName,
 		"ostype":        osTypeLinux26,
 		"scsihw":        "virtio-scsi-pci",
@@ -856,7 +881,23 @@ func attemptCreateTemplateVM(
 		"boot":          "order=virtio0",
 		"agent":         "enabled=0",
 		"onboot":        0,
-		"tags":          shaTag,
+		"tags":          strings.Join(baseTags, ";"),
+	}
+
+	if deps.Config.StemcellProvenanceEnabled() {
+		// sha8 is derived from shaTag which is always the pure
+		// "bosh-stemcell-sha-<sha8>" tag; TrimPrefix is safe here.
+		sha8 := strings.TrimPrefix(shaTag, stemcellSHATagPrefix)
+		notes, notesErr := buildStemcellProvenanceNotes(cp, sha8, source, deps.Config.StemcellDirectorID(), time.Now().UTC())
+		if notesErr != nil {
+			logger.Warn("attemptCreateTemplateVM: provenance notes build failed (skipping description)",
+				log.Err(notesErr),
+			)
+		} else {
+			createParams["description"] = notes
+		}
+		provTags := buildStemcellProvenanceTags(cp, deps.Config.StemcellDirectorID())
+		createParams["tags"] = mergeTagList(baseTags, provTags, maxTagLength)
 	}
 
 	upid, cerr := deps.PVE.QEMU().Create(ctx, node, createParams)
@@ -1236,7 +1277,7 @@ func handleLightStemcellPreUploaded(
 	if deps.Config != nil && deps.Config.StemcellTemplateNode != "" {
 		templateNode = deps.Config.StemcellTemplateNode
 	}
-	vmid, tmplErr := ensureTemplateVM(ctx, deps, templateNode, storage, qcow2Filename, "", false, cp)
+	vmid, tmplErr := ensureTemplateVM(ctx, deps, templateNode, storage, qcow2Filename, "", false, cp, cp.ImageID)
 	if tmplErr != nil {
 		return nil, fmt.Errorf("create_stemcell: light pre-uploaded: ensure template: %w", tmplErr)
 	}
@@ -1360,7 +1401,7 @@ func handleLightStemcellFetch(
 				if deps.Config != nil && deps.Config.StemcellTemplateNode != "" {
 					prefixTemplateNode = deps.Config.StemcellTemplateNode
 				}
-				prefixVMID, prefixTmplErr := ensureTemplateVM(ctx, deps, prefixTemplateNode, storage, extractedName, "", false, cp)
+				prefixVMID, prefixTmplErr := ensureTemplateVM(ctx, deps, prefixTemplateNode, storage, extractedName, "", false, cp, cp.ImageURL)
 				if prefixTmplErr != nil {
 					return nil, fmt.Errorf("create_stemcell: light fetch prefix-dedup: ensure template: %w", prefixTmplErr)
 				}
@@ -1441,7 +1482,7 @@ func handleLightStemcellFetch(
 		// SHA-dedup: qcow2 already on storage. Build/reuse template.
 		// cpiOwnsSource=false: qcow2 exists and is the authoritative copy; we do
 		// not delete it (another stemcell record or clone may reference it).
-		dedupVMID, dedupTmplErr := ensureTemplateVM(ctx, deps, fetchTemplateNode, storage, qcow2Filename, sha256hex, false, cp)
+		dedupVMID, dedupTmplErr := ensureTemplateVM(ctx, deps, fetchTemplateNode, storage, qcow2Filename, sha256hex, false, cp, cp.ImageURL)
 		if dedupTmplErr != nil {
 			return nil, fmt.Errorf("create_stemcell: light fetch SHA-dedup: ensure template: %w", dedupTmplErr)
 		}
@@ -1460,7 +1501,7 @@ func handleLightStemcellFetch(
 	// 7. Build template VM from the uploaded qcow2.
 	// light-fetch: CPI uploaded the qcow2 → cpiOwnsSource=true; ensureTemplateVM
 	// deletes it after freeze (reclaims storage; template disk is the live copy).
-	fetchVMID, fetchTmplErr := ensureTemplateVM(ctx, deps, fetchTemplateNode, storage, qcow2Filename, sha256hex, true, cp)
+	fetchVMID, fetchTmplErr := ensureTemplateVM(ctx, deps, fetchTemplateNode, storage, qcow2Filename, sha256hex, true, cp, cp.ImageURL)
 	if fetchTmplErr != nil {
 		return nil, fmt.Errorf("create_stemcell: light fetch: ensure template: %w", fetchTmplErr)
 	}
@@ -2280,6 +2321,7 @@ func replicateStemcellToNodes(
 	targetNodes []string,
 	uploadSourcePath, uploadStagingDir string,
 	cp stemcellCloudProps,
+	source string,
 ) {
 	sha8 := sha256hex
 	if len(sha8) > 8 {
@@ -2322,7 +2364,7 @@ func replicateStemcellToNodes(
 		// pinned; ensureTemplateVM is called with node as templateNode.
 		replicaCP := cp
 		replicaCP.Node = node
-		replicaVMID, tmplErr := ensureReplicaTemplateVM(ctx, deps, node, storage, qcow2Filename, sha256hex, replicaCP)
+		replicaVMID, tmplErr := ensureReplicaTemplateVM(ctx, deps, node, storage, qcow2Filename, sha256hex, replicaCP, source)
 		if tmplErr != nil {
 			nodeLogger.Warn("create_stemcell: replication: ensure template failed (non-fatal; replica not created)",
 				log.Err(tmplErr),
@@ -2354,6 +2396,7 @@ func ensureReplicaTemplateVM(
 	deps Deps,
 	node, storage, qcow2Filename, sha256hex string,
 	cp stemcellCloudProps,
+	source string,
 ) (int64, error) {
 	sha8 := sha256hex
 	if len(sha8) > 8 {
@@ -2380,7 +2423,6 @@ func ensureReplicaTemplateVM(
 	importVolid := storage + ":import/" + qcow2Filename
 	shaTag := "bosh-stemcell-sha-" + sha8
 	nodeTag := pve.ReplicaNodeTagForNode(node)
-	combinedTags := shaTag + ";" + nodeTag
 
 	isRetryable := func(e error) bool {
 		return pve.IsVMIDConflict(e) || pve.IsStorageLockTimeout(e) || pve.IsTransientTransport(e)
@@ -2389,9 +2431,14 @@ func ensureReplicaTemplateVM(
 	rangeStart := deps.Config.StemcellTemplateVMIDRangeStart
 	rangeEnd := deps.Config.StemcellTemplateVMIDRangeEnd
 
+	// extraBaseTags carries the per-node replica tag so attemptCreateTemplateVM
+	// includes it in the base tag set alongside shaTag for both the OFF path
+	// (byte-identical "shaTag;nodeTag" join) and the ON path (merged with provTags).
+	extraBaseTags := []string{nodeTag}
+
 	allocatedRaw, allocErr := pve.AllocateWithRetry(ctx, deps.PVE,
 		func(candidate int) error {
-			return attemptCreateTemplateVM(ctx, deps, logger, node, candidate, templateName, importVolid, combinedTags, deps.Config.VMStorage)
+			return attemptCreateTemplateVM(ctx, deps, logger, node, candidate, templateName, importVolid, shaTag, deps.Config.VMStorage, cp, source, extraBaseTags)
 		},
 		isRetryable,
 		0,

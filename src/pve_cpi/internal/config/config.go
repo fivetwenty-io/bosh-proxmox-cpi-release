@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"reflect"
+	"regexp"
 	"strings"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/cpi/hooks"
@@ -406,6 +407,13 @@ type CPIConfig struct {
 	// (absent from JSON) emits nothing and preserves byte-identical behavior.
 	// validate-only-when-set; omit from ERB when nil.
 	DiskPerformance *DiskPerformanceDefaults `json:"disk_performance,omitempty"`
+
+	// Stemcell holds optional stemcell provenance and orphan-pruning knobs.
+	// Pointer-typed so a nil block (absent from JSON) emits nothing and preserves
+	// byte-identical behavior. validate-only-when-set; omit from ERB when nil.
+	// Distinct from the scalar StemcellStorage/StemcellTemplateNode/etc. fields
+	// which remain untouched.
+	Stemcell *StemcellProvenanceConfig `json:"stemcell,omitempty"`
 }
 
 // TypeProfile is a named bundle of default cloud_properties applied by the
@@ -438,6 +446,33 @@ type DiskPerformanceDefaults struct {
 	IOPSRd           *int     `json:"iops_rd,omitempty"`
 	IOPSWr           *int     `json:"iops_wr,omitempty"`
 	VirtioSCSISingle *bool    `json:"virtio_scsi_single,omitempty"`
+}
+
+// StemcellProvenanceConfig holds optional stemcell provenance tracking and
+// orphan-pruning knobs. All fields are optional; a nil block (default) emits
+// nothing and preserves byte-identical behavior. Accessors on *CPIConfig handle
+// nil blocks safely so callers never dereference this pointer directly.
+type StemcellProvenanceConfig struct {
+	// Provenance enables tagging stemcell templates with BOSH director metadata
+	// so provenance can be verified at upload and delete time. Default false
+	// (nil or absent → false via StemcellProvenanceEnabled accessor).
+	Provenance *bool `json:"provenance,omitempty"`
+
+	// DirectorID is an optional human-readable identifier for the BOSH director
+	// that owns the stemcell templates. Used in provenance tags when Provenance
+	// is enabled. Empty string is valid (feature off). Must contain at least one
+	// alphanumeric or hyphen character when non-empty.
+	DirectorID string `json:"director_id,omitempty"`
+
+	// PruneOrphans enables pruning of stemcell templates whose associated
+	// director is no longer active. Requires Provenance=true to be meaningful.
+	// Default false (nil or absent → false via StemcellOrphanPruneEnabled accessor).
+	PruneOrphans *bool `json:"prune_orphans,omitempty"`
+
+	// PruneDryRun controls whether orphan pruning logs but does not delete.
+	// When true, pruning actions are logged without performing any deletions.
+	// Default false (nil or absent → false via StemcellOrphanPruneDryRun accessor).
+	PruneDryRun *bool `json:"prune_dry_run,omitempty"`
 }
 
 // RetryConfig holds the operator-tunable retry/backoff policies. Each field is
@@ -1447,6 +1482,45 @@ func (c *CPIConfig) OperationTimeoutDefaultSec() int {
 	return c.OperationTimeout.DefaultSec
 }
 
+// StemcellProvenanceEnabled reports whether stemcell provenance tracking is
+// active. Returns false when the block is nil, Provenance is nil, or Provenance
+// is *false. Only an explicit *true returns true.
+func (c *CPIConfig) StemcellProvenanceEnabled() bool {
+	if c == nil || c.Stemcell == nil || c.Stemcell.Provenance == nil {
+		return false
+	}
+	return *c.Stemcell.Provenance
+}
+
+// StemcellOrphanPruneEnabled reports whether stemcell orphan pruning is active.
+// Returns false when the block is nil, PruneOrphans is nil, or PruneOrphans is
+// *false. Only an explicit *true returns true.
+func (c *CPIConfig) StemcellOrphanPruneEnabled() bool {
+	if c == nil || c.Stemcell == nil || c.Stemcell.PruneOrphans == nil {
+		return false
+	}
+	return *c.Stemcell.PruneOrphans
+}
+
+// StemcellOrphanPruneDryRun reports whether orphan pruning runs in dry-run mode
+// (log only, no deletions). Returns false when the block is nil, PruneDryRun is
+// nil, or PruneDryRun is *false. Only an explicit *true returns true.
+func (c *CPIConfig) StemcellOrphanPruneDryRun() bool {
+	if c == nil || c.Stemcell == nil || c.Stemcell.PruneDryRun == nil {
+		return false
+	}
+	return *c.Stemcell.PruneDryRun
+}
+
+// StemcellDirectorID returns the configured director identifier for provenance
+// tagging. Returns empty string when the block is nil or DirectorID is unset.
+func (c *CPIConfig) StemcellDirectorID() string {
+	if c == nil || c.Stemcell == nil {
+		return ""
+	}
+	return c.Stemcell.DirectorID
+}
+
 // Validate checks all required fields and enum constraints.
 // Returns a CloudError whose message lists every violation, separated by "; ".
 //
@@ -1475,6 +1549,7 @@ func (c *CPIConfig) ValidateWithLogger(logger *log.Logger) error {
 	c.validateOperationTimeout(&errs)
 	c.validateStorageTiers(&errs)
 	c.validateDiskPerformance(&errs)
+	c.validateStemcell(&errs)
 	if len(errs) > 0 {
 		return cpierrors.Cloud("config validation failed: %s", strings.Join(errs, "; "))
 	}
@@ -2147,6 +2222,34 @@ func (c *CPIConfig) validateDiskPerformance(errs *[]string) {
 		))
 	}
 }
+
+// validateStemcell validates the optional Stemcell block.
+// Skipped entirely when Stemcell is nil (validate-only-when-set).
+// Rules enforced when the block is present:
+//   - DirectorID non-empty after TrimSpace must contain at least one
+//     [A-Za-z0-9-] character; a value consisting entirely of non-word/non-hyphen
+//     characters (e.g. "@@@") is rejected.
+//
+// Boolean fields (Provenance, PruneOrphans, PruneDryRun) are *bool with no
+// further constraints; any non-nil *bool is valid.
+func (c *CPIConfig) validateStemcell(errs *[]string) {
+	if c.Stemcell == nil {
+		return
+	}
+	id := strings.TrimSpace(c.Stemcell.DirectorID)
+	if id != "" {
+		if !stemcellDirectorIDRe.MatchString(id) {
+			*errs = append(*errs, fmt.Sprintf(
+				"stemcell.director_id must contain at least one alphanumeric or hyphen character, got %q",
+				c.Stemcell.DirectorID,
+			))
+		}
+	}
+}
+
+// stemcellDirectorIDRe matches any string that contains at least one
+// alphanumeric character or hyphen. Used by validateStemcell.
+var stemcellDirectorIDRe = regexp.MustCompile(`[A-Za-z0-9-]`)
 
 // knownPVEStorageTypes is the exhaustive set of PVE storage plugin names
 // accepted in StorageTierCriteria.Types. Hardcoded here to avoid an import

@@ -382,5 +382,18 @@
 
   config["disk_performance"] = disk_performance unless disk_performance.empty?
 
+  # Emit stemcell only when the operator sets at least one sub-field.
+  # When all sub-fields are unset the block is omitted entirely so the Go config
+  # zero-value (nil *StemcellConfig) is preserved — byte-identical to prior
+  # releases. Bool fields use if_p (no default in spec → nil when unset).
+  # director_id uses p(..., "") with unless-empty guard.
+  stemcell = {}
+  if_p("pve.stemcell.provenance")    { |v| stemcell["provenance"]    = v }
+  sc_dir_id = p("pve.stemcell.director_id", "")
+  stemcell["director_id"] = sc_dir_id unless sc_dir_id.to_s.empty?
+  if_p("pve.stemcell.prune_orphans") { |v| stemcell["prune_orphans"] = v }
+  if_p("pve.stemcell.prune_dry_run") { |v| stemcell["prune_dry_run"] = v }
+  config["stemcell"] = stemcell unless stemcell.empty?
+
   JSON.dump(config)
 %>

@@ -767,3 +767,36 @@ properties:
       controller. Required to use iothread per disk on virtio-scsi. Overridden
       per VM by cloud_properties.virtio_scsi_single. When unset (default), the
       key is omitted and PVE uses its own default.
+
+  pve.stemcell.provenance:
+    description: |
+      When true, stamps BOSH provenance into each uploaded stemcell template:
+      the template Notes field receives a JSON object containing the stemcell
+      name, version, OS type, disk format, content hash, source, and owning
+      Director, and the template is tagged with a stable bosh-stemcell tag set
+      (marker, name, version, and director tags). Provenance records assist
+      orphan detection and audit. Default false (no behavior change).
+
+  pve.stemcell.director_id:
+    description: |
+      Identity string for the owning BOSH Director, stamped into the provenance
+      Notes object and used to scope orphan-prune operations to templates
+      uploaded by this Director only. Orphan pruning requires this value: when
+      unset or empty, prune_orphans is skipped (with a warning) to avoid
+      deleting templates owned by other Directors. Omitted from the rendered
+      config when empty.
+
+  pve.stemcell.prune_orphans:
+    description: |
+      When true, the delete_stemcell call performs an opt-in garbage-collection
+      pass over bosh-stemcell-tagged templates owned by this Director that no
+      longer have a referencing linked clone. Pruning is best-effort: failures
+      are logged and do not cause delete_stemcell to fail. Requires director_id
+      to be set, else the pass is skipped. Default false (no behavior change).
+
+  pve.stemcell.prune_dry_run:
+    description: |
+      When true and prune_orphans is enabled, the GC pass logs each candidate
+      template it would delete but performs no deletions. Use to audit orphan
+      accumulation before enabling live pruning. Has no effect when
+      prune_orphans is false. Default false.

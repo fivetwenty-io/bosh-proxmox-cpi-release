@@ -488,7 +488,7 @@ gate would surface earlier with actionable diagnostics. AWS babysits with
 `qm status` and the last serial lines via the API and fold them into the error before
 rollback. Reuse the task-waiter poll-fault classification.
 
-#### 7.13 Stemcell provenance metadata and orphaned-template GC
+#### 7.13 DONE — Stemcell provenance metadata and orphaned-template GC
 
 *References: vSphere, AWS, Azure.* PVE encodes name + version in the template name and a
 sha8 content tag, but does not store full BOSH stemcell metadata (version, os_type,
@@ -504,6 +504,28 @@ add stable `bosh-stemcell*` tags (reusing the tag-sanitization path). In
 `delete_stemcell`, best-effort remove all sha-tag matches across nodes (covers §7.2
 replicas); add an opt-in prune of `bosh-stemcell`-tagged templates with no referencing
 clones (cross-check `/cluster/resources`). Best-effort, config-gated, warn-never-fail.
+
+**Shipped.** At template finalization, when `pve.stemcell.provenance` is enabled the CPI
+stamps the template Notes field with a JSON provenance block containing name, version,
+os_type, disk_format, sha8, source, director_id, and created timestamp, and adds stable
+tags: a bare `bosh-stemcell` marker plus `bosh-stemcell-name-<v>`,
+`bosh-stemcell-version-<v>`, and `director--<id>` (sanitized), alongside the existing
+`bosh-stemcell-sha-<sha8>` content tag. Both the primary template and per-node replica
+templates (§7.2) receive the same stamps. The feature is off by default; with it unset,
+template config is byte-identical to prior releases.
+
+`delete_stemcell` now always performs a best-effort cross-node sweep: it resolves the
+stemcell sha8 from the primary template, then deletes every template across the cluster
+carrying `bosh-stemcell-sha-<sha8>` (discovered via `/cluster/resources`), covering
+replicas created by §7.2. Errors are warned, never fatal.
+
+Opt-in orphan pruning is available via `pve.stemcell.prune_orphans` (with
+`pve.stemcell.prune_dry_run` for a preview pass). The prune runs as a tail of
+`delete_stemcell` and is director-scoped: it requires `pve.stemcell.director_id`,
+enumerates all `bosh-stemcell`-tagged templates owned by that director, and attempts
+deletion for each. Rather than pre-scanning linked clones, it relies on Proxmox to
+atomically refuse removal of a base volume still referenced by a linked clone — such
+templates are skipped with a warning. Best-effort, config-gated, warn-never-fail.
 
 #### 7.14 Allowed-address-pairs / VIP ipfilter for in-deployment floating VIPs
 

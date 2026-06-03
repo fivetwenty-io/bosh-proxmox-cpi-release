@@ -356,6 +356,34 @@ func IsSnapshotBlocked(err error) bool {
 		strings.Contains(msg, "referenced in snapshot")
 }
 
+// IsBaseVolumeInUse reports whether err signals that PVE refused to delete a
+// template or VM because a linked clone still holds a reference to its base
+// volume. PVE surfaces this condition in several shapes:
+//
+//   - "volume '...' is still in use by '...'" — DELETE /storage/content/<volid>
+//     on an lvmthin/ZFS base that one or more linked clones depend on.
+//   - "base volume ... in use" — zfspool variant.
+//   - "cannot remove ... used by" — directory-backed variant.
+//   - "still in use by" — generic task-body wrapper.
+//
+// All shapes share "in use" together with at least one of "volume", "base", or
+// "clone". The predicate is best-effort: callers use it only to downgrade an
+// orphan-prune failure to a skip/log rather than to drive hard business logic.
+//
+// nil → false.
+func IsBaseVolumeInUse(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	if !strings.Contains(s, "in use") {
+		return false
+	}
+	return strings.Contains(s, "volume") ||
+		strings.Contains(s, "base") ||
+		strings.Contains(s, "clone")
+}
+
 // IsPmxcfsConfigMissing reports whether err is a task-level failure caused by
 // PVE failing to read a VM's config file from /etc/pve (the pmxcfs cluster
 // filesystem). Surface text:

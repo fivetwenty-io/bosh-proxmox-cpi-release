@@ -784,7 +784,7 @@ func TestEnsureTemplateVM_CreatePath_CpiOwnsSource(t *testing.T) {
 	}
 
 	cp := stemcellCloudProps{Name: "ubuntu-jammy", Version: "1.0"}
-	vmid, err := ensureTemplateVM(context.Background(), deps, "pve-node1", storage, qcow2Filename, sha256hex, true, cp)
+	vmid, err := ensureTemplateVM(context.Background(), deps, "pve-node1", storage, qcow2Filename, sha256hex, true, cp, "/tmp/test.qcow2")
 	if err != nil {
 		t.Fatalf("ensureTemplateVM returned error: %v", err)
 	}
@@ -866,7 +866,7 @@ func TestEnsureTemplateVM_Idempotent_ExistingTemplate(t *testing.T) {
 
 	cp := stemcellCloudProps{Name: "ubuntu-jammy", Version: "1.0"}
 	vmid, err := ensureTemplateVM(context.Background(), deps, "pve-node1", "nfs", "stem.qcow2",
-		"aabbccddee112233aabbccddee112233aabbccddee112233aabbccddee112233", true, cp)
+		"aabbccddee112233aabbccddee112233aabbccddee112233aabbccddee112233", true, cp, "")
 	if err != nil {
 		t.Fatalf("expected nil error on idempotent reuse, got: %v", err)
 	}
@@ -907,7 +907,7 @@ func TestEnsureTemplateVM_MakeTemplateFails_ErrorReturned(t *testing.T) {
 
 	cp := stemcellCloudProps{Name: "ubuntu-focal", Version: "2.0"}
 	_, err := ensureTemplateVM(context.Background(), deps, "pve-node1", "nfs", "focal.qcow2",
-		"aabbccddee112233aabbccddee112233aabbccddee112233aabbccddee112233", true, cp)
+		"aabbccddee112233aabbccddee112233aabbccddee112233aabbccddee112233", true, cp, "")
 	if err == nil {
 		t.Fatal("expected error when MakeTemplate fails; got nil")
 	}
@@ -942,7 +942,7 @@ func TestEnsureTemplateVM_CpiOwnsSourceFalse_SourceNotDeleted(t *testing.T) {
 	vmid, err := ensureTemplateVM(context.Background(), deps, "pve-node1", "nfs", "jammy.qcow2",
 		"aabbccddee112233aabbccddee112233aabbccddee112233aabbccddee112233",
 		false, // cpiOwnsSource = false (operator pre-uploaded)
-		cp)
+		cp, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -975,7 +975,7 @@ func TestEnsureTemplateVM_DeleteFailsBestEffort_VmidStillReturned(t *testing.T) 
 	vmid, err := ensureTemplateVM(context.Background(), deps, "pve-node1", "nfs", "bionic.qcow2",
 		"aabbccddee112233aabbccddee112233aabbccddee112233aabbccddee112233",
 		true, // cpiOwnsSource: delete attempted but fails
-		cp)
+		cp, "")
 	if err != nil {
 		t.Fatalf("delete failure must not surface as error (best-effort); got: %v", err)
 	}
@@ -1006,7 +1006,7 @@ func TestEnsureTemplateVM_SHATagFormat(t *testing.T) {
 	}
 
 	cp := stemcellCloudProps{Name: "ubuntu-focal", Version: "5.0"}
-	vmid, err := ensureTemplateVM(context.Background(), deps, "pve-node1", "nfs", "focal.qcow2", fullSHA, false, cp)
+	vmid, err := ensureTemplateVM(context.Background(), deps, "pve-node1", "nfs", "focal.qcow2", fullSHA, false, cp, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1042,7 +1042,7 @@ func TestEnsureTemplateVM_FindTemplateByNameAPIError(t *testing.T) {
 
 	cp := stemcellCloudProps{Name: "ubuntu-focal", Version: "6.0"}
 	_, err := ensureTemplateVM(context.Background(), deps, "pve-node1", "nfs", "x.qcow2",
-		"aabbccddee112233aabbccddee112233aabbccddee112233aabbccddee112233", true, cp)
+		"aabbccddee112233aabbccddee112233aabbccddee112233aabbccddee112233", true, cp, "")
 	if err == nil {
 		t.Fatal("expected error when FindTemplateByName fails; got nil")
 	}
@@ -1182,7 +1182,7 @@ func TestEnsureTemplateVM_PoolAssignment_Called(t *testing.T) {
 
 	cp := stemcellCloudProps{Name: "ubuntu-jammy", Version: "7.0"}
 	vmid, err := ensureTemplateVM(context.Background(), deps, "pve-node1", "nfs", "jammy.qcow2",
-		"aabbccddee112233aabbccddee112233aabbccddee112233aabbccddee112233", false, cp)
+		"aabbccddee112233aabbccddee112233aabbccddee112233aabbccddee112233", false, cp, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1217,7 +1217,7 @@ func TestEnsureTemplateVM_NoPool_AddVMNotCalled(t *testing.T) {
 
 	cp := stemcellCloudProps{Name: "ubuntu-focal", Version: "8.0"}
 	_, err := ensureTemplateVM(context.Background(), deps, "pve-node1", "nfs", "focal.qcow2",
-		"aabbccddee112233aabbccddee112233aabbccddee112233aabbccddee112233", false, cp)
+		"aabbccddee112233aabbccddee112233aabbccddee112233aabbccddee112233", false, cp, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1246,7 +1246,7 @@ func TestEnsureTemplateVM_PoolAssignmentError_ReturnsError(t *testing.T) {
 
 	cp := stemcellCloudProps{Name: "ubuntu-bionic", Version: "9.0"}
 	_, err := ensureTemplateVM(context.Background(), deps, "pve-node1", "nfs", "bionic.qcow2",
-		"aabbccddee112233aabbccddee112233aabbccddee112233aabbccddee112233", false, cp)
+		"aabbccddee112233aabbccddee112233aabbccddee112233aabbccddee112233", false, cp, "")
 	if err == nil {
 		t.Fatal("expected error when pool AddVM fails; got nil")
 	}
@@ -1298,7 +1298,7 @@ func TestEnsureTemplateVM_DedupBySHATag_AcrossNameSchemeChange(t *testing.T) {
 
 	// cp produces the NEW dash-form name "bosh-stemcell-ubuntu-noble-1-364".
 	cp := stemcellCloudProps{Name: "ubuntu-noble", Version: "1.364"}
-	vmid, err := ensureTemplateVM(context.Background(), deps, "pve-node1", "nfs", "noble.qcow2", fullSHA, true, cp)
+	vmid, err := ensureTemplateVM(context.Background(), deps, "pve-node1", "nfs", "noble.qcow2", fullSHA, true, cp, "")
 	if err != nil {
 		t.Fatalf("ensureTemplateVM returned error: %v", err)
 	}
@@ -1365,7 +1365,7 @@ func TestEnsureTemplateVM_LostRace_DeletesDuplicateAndReusesSurvivor(t *testing.
 	}
 
 	cp := stemcellCloudProps{Name: "ubuntu-noble", Version: "1.364"}
-	vmid, err := ensureTemplateVM(context.Background(), deps, "pve-node1", "nfs", "noble.qcow2", fullSHA, true, cp)
+	vmid, err := ensureTemplateVM(context.Background(), deps, "pve-node1", "nfs", "noble.qcow2", fullSHA, true, cp, "")
 	if err != nil {
 		t.Fatalf("ensureTemplateVM returned error: %v", err)
 	}
@@ -1375,5 +1375,239 @@ func TestEnsureTemplateVM_LostRace_DeletesDuplicateAndReusesSurvivor(t *testing.
 	wantDeleted := strconv.FormatInt(allocatedVMID, 10)
 	if deletedVMID != wantDeleted {
 		t.Errorf("deleted VMID = %q; want our just-created allocation %q", deletedVMID, wantDeleted)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Stemcell provenance tests
+// ---------------------------------------------------------------------------
+
+// wbProvCapture records the map[string]any passed to QEMU.Create. A pointer
+// to a map avoids the ptrToRefParam lint warning (gocritic) while still
+// allowing callers to receive the captured params by reference.
+type wbProvCapture struct {
+	params map[string]any
+}
+
+// buildProvDeps returns a Deps wired for attemptCreateTemplateVM provenance
+// tests. qemu.createFn captures createParams into the returned wbProvCapture.
+// provenanceOn controls whether deps.Config.Stemcell.Provenance is set to true.
+func buildProvDeps(t *testing.T, provenanceOn bool, directorID string) (Deps, *wbProvCapture) {
+	t.Helper()
+	captured := &wbProvCapture{params: make(map[string]any)}
+	qemu := &wbMockQEMU{
+		createFn: func(_ context.Context, _ string, params map[string]any) (string, error) {
+			for k, v := range params {
+				captured.params[k] = v
+			}
+			return "", nil
+		},
+	}
+	nodes := &wbTemplateNodes{listQemuFn: listQemuEmpty()}
+	deps := buildEnsureTemplateDeps(qemu, nodes, &wbMockTasks{}, &wbTemplateStorage{})
+	deps.PVE.(*wbTemplateMockClient).clusterSvc = &wbClusterForAlloc{
+		listResourcesFn: listClusterResourcesEmpty(),
+	}
+	if provenanceOn {
+		trueVal := true
+		deps.Config.Stemcell = &config.StemcellProvenanceConfig{
+			Provenance: &trueVal,
+			DirectorID: directorID,
+		}
+	}
+	return deps, captured
+}
+
+// TestAttemptCreateTemplateVM_ProvenanceOFF verifies that when provenance is
+// disabled (default), createParams["tags"] equals exactly the raw shaTag string
+// and no "description" key is present — byte-identical to pre-provenance.
+func TestAttemptCreateTemplateVM_ProvenanceOFF(t *testing.T) {
+	t.Parallel()
+
+	const sha8 = "abcdef12"
+	const shaTag = stemcellSHATagPrefix + sha8
+
+	deps, got := buildProvDeps(t, false, "")
+
+	cp := stemcellCloudProps{Name: "ubuntu-jammy", Version: "1.0"}
+	err := attemptCreateTemplateVM(
+		context.Background(), deps, deps.Logger,
+		"pve-node1", 30001,
+		"bosh-stemcell-ubuntu-jammy-1-0", "nfs:import/test.qcow2", shaTag, "nfs",
+		cp, "/tmp/test.qcow2", nil,
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// tags must be exactly shaTag — no merging, no extra tokens.
+	gotTags, _ := got.params["tags"].(string)
+	if gotTags != shaTag {
+		t.Errorf("tags = %q; want %q (byte-identical OFF path)", gotTags, shaTag)
+	}
+
+	// description must be absent when provenance is off.
+	if _, hasDesc := got.params["description"]; hasDesc {
+		t.Errorf("description key must not be present when provenance is OFF; got %q", got.params["description"])
+	}
+}
+
+// TestAttemptCreateTemplateVM_ProvenanceON verifies that when provenance is
+// enabled, createParams["description"] is valid JSON with the expected fields
+// and createParams["tags"] includes shaTag plus the provenance marker/name/
+// version/director tokens.
+func TestAttemptCreateTemplateVM_ProvenanceON(t *testing.T) {
+	t.Parallel()
+
+	const sha8 = "abcdef12"
+	const shaTag = stemcellSHATagPrefix + sha8
+	const directorID = "prod-director"
+	const stemcellName = "ubuntu-jammy"
+	const stemcellVersion = "1.438"
+
+	deps, got := buildProvDeps(t, true, directorID)
+
+	cp := stemcellCloudProps{Name: stemcellName, Version: stemcellVersion}
+	source := "https://s3.example.com/ubuntu-jammy.qcow2"
+	err := attemptCreateTemplateVM(
+		context.Background(), deps, deps.Logger,
+		"pve-node1", 30001,
+		"bosh-stemcell-ubuntu-jammy-1-438", "nfs:import/jammy.qcow2", shaTag, "nfs",
+		cp, source, nil,
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// tags must contain shaTag + marker + name + version + director tokens.
+	gotTags, _ := got.params["tags"].(string)
+	for _, wantToken := range []string{
+		shaTag,
+		stemcellMarkerTag,
+		stemcellNameTagPrefix + sanitizeTagValue(stemcellName),
+		stemcellVersionTagPrefix + sanitizeTagValue(stemcellVersion),
+		"director--" + sanitizeTagValue(directorID),
+	} {
+		if !strings.Contains(gotTags, wantToken) {
+			t.Errorf("tags %q missing expected token %q", gotTags, wantToken)
+		}
+	}
+
+	// description must be valid JSON with required provenance fields.
+	descRaw, hasDesc := got.params["description"].(string)
+	if !hasDesc || descRaw == "" {
+		t.Fatalf("description key missing or empty when provenance is ON")
+	}
+	var prov stemcellProvenance
+	if err := json.Unmarshal([]byte(descRaw), &prov); err != nil {
+		t.Fatalf("description is not valid JSON: %v — raw: %q", err, descRaw)
+	}
+	if prov.Name != stemcellName {
+		t.Errorf("provenance.name = %q; want %q", prov.Name, stemcellName)
+	}
+	if prov.Version != stemcellVersion {
+		t.Errorf("provenance.version = %q; want %q", prov.Version, stemcellVersion)
+	}
+	if prov.SHA8 != sha8 {
+		t.Errorf("provenance.sha8 = %q; want %q", prov.SHA8, sha8)
+	}
+	if prov.DirectorID != directorID {
+		t.Errorf("provenance.director_id = %q; want %q", prov.DirectorID, directorID)
+	}
+	if prov.Source != source {
+		t.Errorf("provenance.source = %q; want %q", prov.Source, source)
+	}
+	if prov.Created == "" {
+		t.Error("provenance.created must not be empty")
+	}
+}
+
+// TestAttemptCreateTemplateVM_ReplicaProvenanceOFF verifies that with
+// extraBaseTags=[nodeTag] and provenance OFF, the tags field is exactly
+// "shaTag;nodeTag" — byte-identical to the old combinedTags join.
+func TestAttemptCreateTemplateVM_ReplicaProvenanceOFF(t *testing.T) {
+	t.Parallel()
+
+	const sha8 = "abcdef12"
+	const shaTag = stemcellSHATagPrefix + sha8
+	const replicaNode = "pve-node2"
+	nodeTag := pve.ReplicaNodeTagForNode(replicaNode)
+	wantTags := shaTag + ";" + nodeTag
+
+	deps, got := buildProvDeps(t, false, "")
+	cp := stemcellCloudProps{Name: "ubuntu-jammy", Version: "1.0"}
+	err := attemptCreateTemplateVM(
+		context.Background(), deps, deps.Logger,
+		replicaNode, 30002,
+		"bosh-stemcell-ubuntu-jammy-1-0", "nfs:import/jammy.qcow2", shaTag, "nfs",
+		cp, "/tmp/jammy.qcow2", []string{nodeTag},
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	gotTags, _ := got.params["tags"].(string)
+	if gotTags != wantTags {
+		t.Errorf("replica OFF tags = %q; want %q (byte-identical combinedTags)", gotTags, wantTags)
+	}
+	if _, hasDesc := got.params["description"]; hasDesc {
+		t.Error("description must not be present when provenance is OFF")
+	}
+}
+
+// TestAttemptCreateTemplateVM_ReplicaProvenanceON verifies that with
+// extraBaseTags=[nodeTag] and provenance ON, combinedTags (sha+node) AND
+// provenance tokens all appear in tags, and description is valid JSON.
+func TestAttemptCreateTemplateVM_ReplicaProvenanceON(t *testing.T) {
+	t.Parallel()
+
+	const sha8 = "abcdef12"
+	const shaTag = stemcellSHATagPrefix + sha8
+	const replicaNode = "pve-node2"
+	const stemcellName = "ubuntu-jammy"
+	const stemcellVersion = "1.438"
+	const directorID = "lab-director"
+	nodeTag := pve.ReplicaNodeTagForNode(replicaNode)
+
+	deps, got := buildProvDeps(t, true, directorID)
+	cp := stemcellCloudProps{Name: stemcellName, Version: stemcellVersion}
+	err := attemptCreateTemplateVM(
+		context.Background(), deps, deps.Logger,
+		replicaNode, 30002,
+		"bosh-stemcell-ubuntu-jammy-1-438", "nfs:import/jammy.qcow2", shaTag, "nfs",
+		cp, "/tmp/jammy.qcow2", []string{nodeTag},
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	gotTags, _ := got.params["tags"].(string)
+	// sha, node, marker, name, version, director all present.
+	for _, wantToken := range []string{
+		shaTag,
+		nodeTag,
+		stemcellMarkerTag,
+		stemcellNameTagPrefix + sanitizeTagValue(stemcellName),
+		stemcellVersionTagPrefix + sanitizeTagValue(stemcellVersion),
+		"director--" + sanitizeTagValue(directorID),
+	} {
+		if !strings.Contains(gotTags, wantToken) {
+			t.Errorf("replica ON tags %q missing expected token %q", gotTags, wantToken)
+		}
+	}
+
+	descRaw, hasDesc := got.params["description"].(string)
+	if !hasDesc || descRaw == "" {
+		t.Fatalf("description key missing or empty when provenance is ON (replica path)")
+	}
+	var prov stemcellProvenance
+	if err := json.Unmarshal([]byte(descRaw), &prov); err != nil {
+		t.Fatalf("description not valid JSON: %v — raw: %q", err, descRaw)
+	}
+	if prov.SHA8 != sha8 {
+		t.Errorf("provenance.sha8 = %q; want %q", prov.SHA8, sha8)
+	}
+	if prov.DirectorID != directorID {
+		t.Errorf("provenance.director_id = %q; want %q", prov.DirectorID, directorID)
 	}
 }

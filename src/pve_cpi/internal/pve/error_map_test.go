@@ -865,3 +865,59 @@ func TestIsVolumeMissing_Nil(t *testing.T) {
 		t.Error("nil should not classify as missing")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// IsBaseVolumeInUse — PVE refusal to delete a template whose base volume is
+// still referenced by a linked clone.
+// ---------------------------------------------------------------------------
+
+func TestIsBaseVolumeInUse_Nil(t *testing.T) {
+	t.Parallel()
+	if pve.IsBaseVolumeInUse(nil) {
+		t.Error("nil should not classify as base-volume-in-use")
+	}
+}
+
+func TestIsBaseVolumeInUse_VolumeStillInUseByClone(t *testing.T) {
+	t.Parallel()
+	// Canonical lvmthin DELETE /storage/content/<volid> refusal.
+	err := errors.New("volume 'vm-9000-disk-0' is still in use by 'vm-101-disk-0'")
+	if !pve.IsBaseVolumeInUse(err) {
+		t.Errorf("volume-in-use message should classify as base-volume-in-use; err=%v", err)
+	}
+}
+
+func TestIsBaseVolumeInUse_BaseVolumeStillInUse(t *testing.T) {
+	t.Parallel()
+	// ZFS variant with "base" keyword.
+	err := errors.New("base volume still in use")
+	if !pve.IsBaseVolumeInUse(err) {
+		t.Errorf("'base volume still in use' should classify as base-volume-in-use; err=%v", err)
+	}
+}
+
+func TestIsBaseVolumeInUse_Unrelated500(t *testing.T) {
+	t.Parallel()
+	err := errors.New("500 internal error")
+	if pve.IsBaseVolumeInUse(err) {
+		t.Errorf("unrelated 500 message should not classify as base-volume-in-use; err=%v", err)
+	}
+}
+
+func TestIsBaseVolumeInUse_Timeout(t *testing.T) {
+	t.Parallel()
+	err := errors.New("timeout")
+	if pve.IsBaseVolumeInUse(err) {
+		t.Errorf("timeout error should not classify as base-volume-in-use; err=%v", err)
+	}
+}
+
+func TestIsBaseVolumeInUse_WrappedCPIError(t *testing.T) {
+	t.Parallel()
+	// A CPI CloudError wrapping the PVE message must also classify correctly.
+	inner := errors.New("volume 'data:vm-200-disk-0' is still in use by linked clone")
+	wrapped := cpierrors.Wrap(inner, "PVE error: "+inner.Error())
+	if !pve.IsBaseVolumeInUse(wrapped) {
+		t.Errorf("CPI-wrapped base-volume-in-use message should classify correctly; err=%v", wrapped)
+	}
+}

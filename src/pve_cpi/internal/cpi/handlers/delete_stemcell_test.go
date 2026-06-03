@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"testing"
 
@@ -12,6 +13,7 @@ import (
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
+	sdkcluster "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cluster"
 	sdknodes "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/nodes"
 	sdkstorage "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/storage"
 	sdkerrors "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/errors"
@@ -681,6 +683,494 @@ func TestDeleteStemcell_LightCID_Regression_TemplateRouteNotTriggered(t *testing
 		t.Errorf("expected 0 DeleteVolumeIfExists calls for light CID, got %d", storageSvc.deleteVolumeIfExistsCalls)
 	}
 }
+
+// ============================================================
+// Tests: sha-sweep (D-03 — always cross-node)
+// ============================================================
+
+// buildDeleteStemcellDepsWithCluster constructs Deps for sha-sweep and
+// orphan-prune tests that need a wired cluster mock.
+func buildDeleteStemcellDepsWithCluster(
+	nodesSvc *stemcellMockNodes,
+	clusterSvc *stemcellMockCluster,
+	cfg *config.CPIConfig,
+) handlers.Deps {
+	client := &stemcellMockClient{
+		qemuSvc:    &stemcellMockQEMU{},
+		nodesSvc:   nodesSvc,
+		tasksSvc:   &stemcellMockTasks{},
+		clusterSvc: clusterSvc,
+		storageSvc: &deleteStemcellMockStorage{},
+	}
+	return handlers.Deps{
+		Config: cfg,
+		PVE:    client,
+		Logger: log.NewNopLogger(),
+	}
+}
+
+// makeStemcellClusterItem builds a raw JSON cluster resource entry for a
+// stemcell template with the given vmid, node, and semicolon-separated tags.
+func makeStemcellClusterItem(vmid int64, node, name, tags string) json.RawMessage {
+	templateVal := 1
+	raw, _ := json.Marshal(map[string]any{
+		"type":     "qemu",
+		"vmid":     vmid,
+		"node":     node,
+		"name":     name,
+		"tags":     tags,
+		"template": templateVal,
+	})
+	return raw
+}
+
+// TestDeleteStemcell_ShaSwep_DeletesCrossNodeReplicas verifies that the sha-sweep
+// deletes two cross-node template VMs carrying the sha8 tag.
+func TestDeleteStemcell_ShaSwep_DeletesCrossNodeReplicas(t *testing.T) {
+	t.Parallel()
+
+	const sha8 = "abc12345"
+	const primaryVMID = int64(6042)
+	const replica1VMID = int64(6043)
+	const replica2VMID = int64(6044)
+
+	// Primary tag set for resolveStemcellSHA8FromVMID (ListQemu on primary node).
+	primaryTagsStr := "bosh-stemcell;bosh-stemcell-sha-" + sha8
+	nodesSvc := &stemcellMockNodes{
+		listQemuFn: func(_ context.Context, node string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
+			if node != vmNode {
+				return &sdknodes.ListQemuResponse{}, nil
+			}
+			raw, _ := json.Marshal(map[string]any{
+				"vmid": primaryVMID,
+				"tags": primaryTagsStr,
+			})
+			resp := sdknodes.ListQemuResponse{raw}
+			return &resp, nil
+		},
+		deleteQemuFn: func(_ context.Context, _, _ string, _ *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
+			resp := sdknodes.DeleteQemuResponse(`""`)
+			return &resp, nil
+		},
+	}
+
+	var destroyedVMIDs []int64
+	origDelete := nodesSvc.deleteQemuFn
+	nodesSvc.deleteQemuFn = func(_ context.Context, node, vmid string, params *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
+		id := int64(0)
+		for _, v := range []int64{primaryVMID, replica1VMID, replica2VMID} {
+			if vmid == fmt.Sprintf("%d", v) {
+				id = v
+			}
+		}
+		if id != 0 {
+			destroyedVMIDs = append(destroyedVMIDs, id)
+		}
+		return origDelete(context.Background(), node, vmid, params)
+	}
+
+	shaTag := "bosh-stemcell-sha-" + sha8
+	clusterSvc := &stemcellMockCluster{
+		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+			items := sdkcluster.ListResourcesResponse{
+				makeStemcellClusterItem(replica1VMID, "pve2", "stemcell-r1", shaTag),
+				makeStemcellClusterItem(replica2VMID, "pve3", "stemcell-r2", shaTag),
+				// non-template (template==0) — must not be touched
+				func() json.RawMessage {
+					tmplZero := 0
+					raw, _ := json.Marshal(map[string]any{
+						"type":     "qemu",
+						"vmid":     int64(9999),
+						"node":     "pve4",
+						"tags":     shaTag,
+						"template": tmplZero,
+					})
+					return raw
+				}(),
+			}
+			return &items, nil
+		},
+	}
+
+	cfg := &config.CPIConfig{
+		Node:            vmNode,
+		StemcellStorage: "local",
+		VMStorage:       "local",
+		DiskStorage:     "local",
+	}
+	deps := buildDeleteStemcellDepsWithCluster(nodesSvc, clusterSvc, cfg)
+	h := handlers.HandleDeleteStemcell(deps)
+
+	args := []json.RawMessage{marshalArg(t, fmt.Sprintf("template:%d", primaryVMID))}
+	result, err := h.Handle(context.Background(), args, jsonrpc.Context{RequestID: "req-sweep-1"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result != nil {
+		t.Errorf("expected nil result, got %v", result)
+	}
+
+	// Primary + both replicas must have been destroyed.
+	found := map[int64]bool{}
+	for _, id := range destroyedVMIDs {
+		found[id] = true
+	}
+	for _, want := range []int64{primaryVMID, replica1VMID, replica2VMID} {
+		if !found[want] {
+			t.Errorf("expected VMID %d to be destroyed; destroyed set: %v", want, destroyedVMIDs)
+		}
+	}
+}
+
+// TestDeleteStemcell_ShaSwep_BestEffort verifies that a destroy error on one
+// replica does not prevent the handler from returning success.
+func TestDeleteStemcell_ShaSwep_BestEffort(t *testing.T) {
+	t.Parallel()
+
+	const sha8 = "deadbeef"
+	const primaryVMID = int64(7001)
+	const replica1VMID = int64(7002)
+	const replica2VMID = int64(7003)
+
+	primaryTagsStr := "bosh-stemcell;bosh-stemcell-sha-" + sha8
+	var destroyCount int
+	nodesSvc := &stemcellMockNodes{
+		listQemuFn: func(_ context.Context, node string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
+			if node != vmNode {
+				return &sdknodes.ListQemuResponse{}, nil
+			}
+			raw, _ := json.Marshal(map[string]any{"vmid": primaryVMID, "tags": primaryTagsStr})
+			resp := sdknodes.ListQemuResponse{raw}
+			return &resp, nil
+		},
+		deleteQemuFn: func(_ context.Context, _, vmid string, _ *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
+			destroyCount++
+			// Fail on replica1 only.
+			if vmid == fmt.Sprintf("%d", replica1VMID) {
+				return nil, errors.New("PVE: transient error on replica")
+			}
+			resp := sdknodes.DeleteQemuResponse(`""`)
+			return &resp, nil
+		},
+	}
+
+	shaTag := "bosh-stemcell-sha-" + sha8
+	clusterSvc := &stemcellMockCluster{
+		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+			items := sdkcluster.ListResourcesResponse{
+				makeStemcellClusterItem(replica1VMID, "pve2", "r1", shaTag),
+				makeStemcellClusterItem(replica2VMID, "pve3", "r2", shaTag),
+			}
+			return &items, nil
+		},
+	}
+
+	cfg := &config.CPIConfig{Node: vmNode, StemcellStorage: "local", VMStorage: "local", DiskStorage: "local"}
+	deps := buildDeleteStemcellDepsWithCluster(nodesSvc, clusterSvc, cfg)
+	h := handlers.HandleDeleteStemcell(deps)
+
+	args := []json.RawMessage{marshalArg(t, fmt.Sprintf("template:%d", primaryVMID))}
+	_, err := h.Handle(context.Background(), args, jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("delete_stemcell must succeed even when a replica destroy fails; got: %v", err)
+	}
+	// primary + 2 sweep attempts = 3 calls (replica1 fails, replica2 succeeds)
+	if destroyCount != 3 {
+		t.Errorf("expected 3 DeleteQemu calls (primary + 2 replicas), got %d", destroyCount)
+	}
+}
+
+// ============================================================
+// Tests: orphan prune (D-04 — opt-in director-scoped)
+// ============================================================
+
+// TestDeleteStemcell_OrphanPrune_Disabled verifies no prune ListResources call
+// when pruning is not enabled.
+func TestDeleteStemcell_OrphanPrune_Disabled(t *testing.T) {
+	t.Parallel()
+
+	var listResourcesCalled bool
+	clusterSvc := &stemcellMockCluster{
+		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+			listResourcesCalled = true
+			return &sdkcluster.ListResourcesResponse{}, nil
+		},
+	}
+
+	nodesSvc := &stemcellMockNodes{
+		deleteQemuFn: func(_ context.Context, _, _ string, _ *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
+			resp := sdknodes.DeleteQemuResponse(`""`)
+			return &resp, nil
+		},
+	}
+
+	// Prune is off (nil Stemcell block = default).
+	cfg := &config.CPIConfig{Node: vmNode, StemcellStorage: "local", VMStorage: "local", DiskStorage: "local"}
+	deps := buildDeleteStemcellDepsWithCluster(nodesSvc, clusterSvc, cfg)
+	h := handlers.HandleDeleteStemcell(deps)
+
+	// Use a volume CID — avoids sha-sweep ListResources path entirely.
+	args := []json.RawMessage{marshalArg(t, "local:import/bosh-stemcell-ubuntu-jammy-1.0-abc12345.qcow2")}
+	_, err := h.Handle(context.Background(), args, jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if listResourcesCalled {
+		t.Error("ListResources must NOT be called when orphan prune is disabled")
+	}
+}
+
+// TestDeleteStemcell_OrphanPrune_DryRun verifies that candidates are logged but
+// no DeleteQemu is issued when dry_run is true.
+func TestDeleteStemcell_OrphanPrune_DryRun(t *testing.T) {
+	t.Parallel()
+
+	const dirID = "bosh-dir-test"
+	const sha8 = "cafebabe"
+	const primaryVMID = int64(8001)
+	const orphanVMID = int64(8002)
+
+	primaryTagsStr := "bosh-stemcell;bosh-stemcell-sha-" + sha8 + ";director--" + dirID
+
+	nodesSvc := &stemcellMockNodes{
+		listQemuFn: func(_ context.Context, node string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
+			if node != vmNode {
+				return &sdknodes.ListQemuResponse{}, nil
+			}
+			raw, _ := json.Marshal(map[string]any{"vmid": primaryVMID, "tags": primaryTagsStr})
+			resp := sdknodes.ListQemuResponse{raw}
+			return &resp, nil
+		},
+		deleteQemuFn: func(_ context.Context, _, vmid string, _ *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
+			// Only primary delete is expected (sha sweep finds nothing extra in cluster).
+			if vmid != fmt.Sprintf("%d", primaryVMID) {
+				t.Errorf("unexpected DeleteQemu for vmid %s in dry-run test", vmid)
+			}
+			resp := sdknodes.DeleteQemuResponse(`""`)
+			return &resp, nil
+		},
+	}
+
+	// sha-sweep: cluster returns only the primary (already gone = idempotent).
+	// prune candidate: orphanVMID carries marker + director tag.
+	shaTag := "bosh-stemcell-sha-" + sha8
+	dirTag := "director--" + dirID
+	clusterSvc := &stemcellMockCluster{
+		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+			items := sdkcluster.ListResourcesResponse{
+				// sha-sweep candidate (primary — already gone, idempotent)
+				makeStemcellClusterItem(primaryVMID, vmNode, "primary", shaTag),
+				// orphan candidate: has marker+director, no sha tag
+				makeStemcellClusterItem(orphanVMID, "pve2", "orphan", "bosh-stemcell;"+dirTag),
+			}
+			return &items, nil
+		},
+	}
+
+	tr := true
+	cfg := &config.CPIConfig{
+		Node:            vmNode,
+		StemcellStorage: "local",
+		VMStorage:       "local",
+		DiskStorage:     "local",
+		Stemcell: &config.StemcellProvenanceConfig{
+			PruneOrphans: &tr,
+			PruneDryRun:  &tr,
+			DirectorID:   dirID,
+		},
+	}
+	deps := buildDeleteStemcellDepsWithCluster(nodesSvc, clusterSvc, cfg)
+	h := handlers.HandleDeleteStemcell(deps)
+
+	args := []json.RawMessage{marshalArg(t, fmt.Sprintf("template:%d", primaryVMID))}
+	_, err := h.Handle(context.Background(), args, jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("delete_stemcell must succeed in dry-run; got: %v", err)
+	}
+	// deleteQemuFn would call t.Errorf if orphanVMID was passed — test passes
+	// if no unexpected call occurs.
+}
+
+// TestDeleteStemcell_OrphanPrune_Live verifies that an orphan is destroyed, and
+// that a base-in-use error causes a skip rather than failure.
+func TestDeleteStemcell_OrphanPrune_Live(t *testing.T) {
+	t.Parallel()
+
+	const dirID = "bosh-dir-prod"
+	const sha8 = "11223344"
+	const primaryVMID = int64(9001)
+	const orphanVMID = int64(9002)
+	const baseInUseVMID = int64(9003)
+
+	primaryTagsStr := "bosh-stemcell;bosh-stemcell-sha-" + sha8 + ";director--" + dirID
+
+	var deletedVMIDs []string
+	nodesSvc := &stemcellMockNodes{
+		listQemuFn: func(_ context.Context, node string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
+			if node != vmNode {
+				return &sdknodes.ListQemuResponse{}, nil
+			}
+			raw, _ := json.Marshal(map[string]any{"vmid": primaryVMID, "tags": primaryTagsStr})
+			resp := sdknodes.ListQemuResponse{raw}
+			return &resp, nil
+		},
+		deleteQemuFn: func(_ context.Context, _, vmid string, _ *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
+			deletedVMIDs = append(deletedVMIDs, vmid)
+			if vmid == fmt.Sprintf("%d", baseInUseVMID) {
+				// Simulate PVE "base volume still in use" error.
+				return nil, &sdkerrors.APIError{HTTPCode: 500, Message: "base volume still in use"}
+			}
+			resp := sdknodes.DeleteQemuResponse(`""`)
+			return &resp, nil
+		},
+	}
+
+	shaTag := "bosh-stemcell-sha-" + sha8
+	dirTag := "director--" + dirID
+	clusterSvc := &stemcellMockCluster{
+		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+			items := sdkcluster.ListResourcesResponse{
+				// sha-sweep: primary already gone — idempotent 404 path
+				makeStemcellClusterItem(primaryVMID, vmNode, "primary", shaTag),
+				// orphan: should be deleted
+				makeStemcellClusterItem(orphanVMID, "pve2", "orphan", "bosh-stemcell;"+dirTag),
+				// base-in-use: should be skipped
+				makeStemcellClusterItem(baseInUseVMID, "pve3", "base-in-use", "bosh-stemcell;"+dirTag),
+			}
+			return &items, nil
+		},
+	}
+
+	tr := true
+	cfg := &config.CPIConfig{
+		Node:            vmNode,
+		StemcellStorage: "local",
+		VMStorage:       "local",
+		DiskStorage:     "local",
+		Stemcell: &config.StemcellProvenanceConfig{
+			PruneOrphans: &tr,
+			PruneDryRun:  nil, // live mode
+			DirectorID:   dirID,
+		},
+	}
+	deps := buildDeleteStemcellDepsWithCluster(nodesSvc, clusterSvc, cfg)
+	h := handlers.HandleDeleteStemcell(deps)
+
+	args := []json.RawMessage{marshalArg(t, fmt.Sprintf("template:%d", primaryVMID))}
+	_, err := h.Handle(context.Background(), args, jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("delete_stemcell must succeed even with base-in-use skip; got: %v", err)
+	}
+
+	// orphanVMID must have been attempted.
+	foundOrphan := false
+	for _, id := range deletedVMIDs {
+		if id == fmt.Sprintf("%d", orphanVMID) {
+			foundOrphan = true
+		}
+	}
+	if !foundOrphan {
+		t.Errorf("expected orphanVMID %d to be deleted; deletedVMIDs: %v", orphanVMID, deletedVMIDs)
+	}
+}
+
+// TestDeleteStemcell_OrphanPrune_EmptyDirectorID verifies that when director_id
+// is empty, pruning is skipped with a warning and no deletions occur.
+func TestDeleteStemcell_OrphanPrune_EmptyDirectorID(t *testing.T) {
+	t.Parallel()
+
+	const sha8 = "55667788"
+	const primaryVMID = int64(5501)
+
+	primaryTagsStr := "bosh-stemcell;bosh-stemcell-sha-" + sha8
+	var orphanDeleteCalled bool
+
+	nodesSvc := &stemcellMockNodes{
+		listQemuFn: func(_ context.Context, node string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
+			if node != vmNode {
+				return &sdknodes.ListQemuResponse{}, nil
+			}
+			raw, _ := json.Marshal(map[string]any{"vmid": primaryVMID, "tags": primaryTagsStr})
+			resp := sdknodes.ListQemuResponse{raw}
+			return &resp, nil
+		},
+		deleteQemuFn: func(_ context.Context, _, vmid string, _ *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
+			if vmid != fmt.Sprintf("%d", primaryVMID) {
+				orphanDeleteCalled = true
+			}
+			resp := sdknodes.DeleteQemuResponse(`""`)
+			return &resp, nil
+		},
+	}
+
+	shaTag := "bosh-stemcell-sha-" + sha8
+	clusterSvc := &stemcellMockCluster{
+		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+			// Provide a sha-sweep item (primary) and an orphan with no director tag.
+			items := sdkcluster.ListResourcesResponse{
+				makeStemcellClusterItem(primaryVMID, vmNode, "primary", shaTag),
+				makeStemcellClusterItem(int64(5502), "pve2", "orphan-no-dir", "bosh-stemcell"),
+			}
+			return &items, nil
+		},
+	}
+
+	tr := true
+	cfg := &config.CPIConfig{
+		Node:            vmNode,
+		StemcellStorage: "local",
+		VMStorage:       "local",
+		DiskStorage:     "local",
+		Stemcell: &config.StemcellProvenanceConfig{
+			PruneOrphans: &tr,
+			DirectorID:   "", // empty — prune must be skipped
+		},
+	}
+	deps := buildDeleteStemcellDepsWithCluster(nodesSvc, clusterSvc, cfg)
+	h := handlers.HandleDeleteStemcell(deps)
+
+	args := []json.RawMessage{marshalArg(t, fmt.Sprintf("template:%d", primaryVMID))}
+	_, err := h.Handle(context.Background(), args, jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("delete_stemcell must succeed when director_id is empty; got: %v", err)
+	}
+	if orphanDeleteCalled {
+		t.Error("expected no orphan deletions when director_id is empty")
+	}
+}
+
+// TestDeleteStemcell_ShaSwep_Idempotent_Primary404 verifies that a 404 on the
+// primary delete is still treated as success.
+func TestDeleteStemcell_ShaSwep_Idempotent_Primary404(t *testing.T) {
+	t.Parallel()
+
+	const primaryVMID = int64(4040)
+
+	nodesSvc := &stemcellMockNodes{
+		listQemuFn: func(_ context.Context, _ string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
+			// Primary already gone — empty list.
+			return &sdknodes.ListQemuResponse{}, nil
+		},
+		deleteQemuFn: func(_ context.Context, _, _ string, _ *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
+			return nil, &sdkerrors.APIError{HTTPCode: 404}
+		},
+	}
+
+	clusterSvc := &stemcellMockCluster{} // returns empty list by default
+
+	cfg := &config.CPIConfig{Node: vmNode, StemcellStorage: "local", VMStorage: "local", DiskStorage: "local"}
+	deps := buildDeleteStemcellDepsWithCluster(nodesSvc, clusterSvc, cfg)
+	h := handlers.HandleDeleteStemcell(deps)
+
+	args := []json.RawMessage{marshalArg(t, fmt.Sprintf("template:%d", primaryVMID))}
+	_, err := h.Handle(context.Background(), args, jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("expected nil error for 404 on primary (idempotent); got: %v", err)
+	}
+}
+
+// Ensure sdkcluster import is used even if other test variants are skipped.
+var _ *sdkcluster.ListResourcesParams
 
 // Ensure sdkerrors import is used even if other test variants are skipped.
 var _ = sdkerrors.APIError{}

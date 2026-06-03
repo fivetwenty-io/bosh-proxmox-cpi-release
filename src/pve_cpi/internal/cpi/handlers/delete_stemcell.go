@@ -12,6 +12,7 @@ import (
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
+	sdkcluster "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cluster"
 	sdknodes "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/nodes"
 )
 
@@ -82,16 +83,33 @@ func HandleDeleteStemcell(deps Deps) cpi.Handler {
 				return nil, cpierrors.Cloud("delete_stemcell: config.node must not be empty")
 			}
 
-			// Destroy primary template VM.
+			// Resolve sha8 from the primary BEFORE destroying it; the tag is
+			// unreadable once the VM is gone.
+			sha8 := resolveStemcellSHA8FromVMID(ctx, deps, node, vmid)
+
+			// Destroy the primary template VM.
 			if err := destroyTemplateVM(ctx, deps, node, vmid, cidStr); err != nil {
 				return nil, err
 			}
 
-			// When per-node replication is enabled, also remove replicas on all
-			// other cluster nodes. Replica removal is best-effort: a per-node
-			// failure is logged as a warning and does not abort the overall delete.
-			if deps.Config.StemcellReplicateLocal {
-				destroyTemplateReplicas(ctx, deps, vmid, node, cidStr)
+			// Always sweep all cluster nodes for template VMs that carry the
+			// same sha8 tag. This subsumes the old StemcellReplicateLocal-gated
+			// replica-cleanup path: replicas carry the sha tag and will be found
+			// regardless of the replication-enabled flag. Best-effort: sweep
+			// failures are logged at Warn and never fail the delete.
+			if sha8 != "" {
+				sweepStemcellByShaTag(ctx, deps, sha8, cidStr)
+			} else {
+				deps.Logger.Warn("delete_stemcell: sha8 unresolvable before primary destroy; cross-node sweep skipped",
+					log.String("stemcell_cid", cidStr),
+				)
+			}
+
+			// Opt-in orphan prune: remove all stemcell templates tagged with
+			// this director's ID that are no longer linked. Best-effort; never
+			// fails delete_stemcell.
+			if deps.Config.StemcellOrphanPruneEnabled() {
+				pruneOrphanStemcellTemplates(ctx, deps, cidStr)
 			}
 
 			return nil, nil
@@ -176,81 +194,147 @@ func HandleDeleteStemcell(deps Deps) cpi.Handler {
 	})
 }
 
-// destroyTemplateReplicas scans all cluster nodes (except primaryNode) for template
-// VMs that carry the replica node tag matching a node and the same sha8 as the
-// primary, then deletes any found. The scan uses ListQemu on each node; a match
-// requires BOTH "bosh-stemcell-node-<node>" AND "bosh-stemcell-sha-<sha8>" tags
-// to prevent deleting replicas belonging to a different stemcell.
-//
-// The primary VM's sha8 is resolved from its tags on primaryNode before the
-// replica scan. If the primary is already gone (destroy just succeeded) the tag
-// cannot be read; in that case sha8 is empty and findReplicaVMIDsOnNode
-// falls back to node-tag-only matching (safe for single-stemcell environments;
-// a warning is logged so the operator is aware).
-//
-// This function is best-effort: per-node scan or delete failures are logged at
-// Warn level and do not abort processing on remaining nodes. It is only called
-// when StemcellReplicateLocal is true (enforced by the caller).
-//
-// primaryNode is already deleted by destroyTemplateVM; it is excluded from the
-// replica scan. cidStr is used for log context only.
-func destroyTemplateReplicas(ctx context.Context, deps Deps, primaryVMID int64, primaryNode, cidStr string) {
-	// Resolve the sha8 of the stemcell being deleted so replica filtering is
-	// scoped to this stemcell only. The primary VM was just destroyed, so we
-	// attempt tag resolution via ListQemu on primaryNode first (the VM may still
-	// appear in the list briefly) and fall back gracefully when absent.
-	sha8 := resolveStemcellSHA8FromVMID(ctx, deps, primaryNode, primaryVMID)
-	if sha8 == "" {
-		deps.Logger.Warn("delete_stemcell: could not resolve sha8 for primary template (replica filter will use node-tag only)",
-			log.String("stemcell_cid", cidStr),
-			log.Int64("primary_vmid", primaryVMID),
-		)
-	}
+// sweepStemcellByShaTag lists all QEMU resources cluster-wide and destroys every
+// template VM tagged with stemcellSHATagPrefix+sha8. It is called after the
+// primary template is already deleted, so finding the primary VMID absent is
+// normal and treated as success. All failures are logged at Warn; the function
+// never returns an error. cidStr is used for log context only.
+func sweepStemcellByShaTag(ctx context.Context, deps Deps, sha8, cidStr string) {
+	logger := deps.Logger.With(
+		log.String("method", "delete_stemcell.sha_sweep"),
+		log.String("stemcell_cid", cidStr),
+		log.String("sha8", sha8),
+	)
 
-	clusterNodes, listErr := listClusterNodes(ctx, deps)
-	if listErr != nil {
-		deps.Logger.Warn("delete_stemcell: cannot list cluster nodes for replica cleanup (best-effort, skipping)",
-			log.String("stemcell_cid", cidStr),
-			log.Err(listErr),
-		)
+	if deps.PVE == nil || deps.PVE.Cluster() == nil {
+		logger.Warn("delete_stemcell: cluster service unavailable; sha sweep skipped")
 		return
 	}
 
-	for _, node := range clusterNodes {
-		if node == primaryNode {
+	resp, err := deps.PVE.Cluster().ListResources(ctx, &sdkcluster.ListResourcesParams{})
+	if err != nil {
+		logger.Warn("delete_stemcell: ListResources failed; sha sweep skipped", log.Err(err))
+		return
+	}
+	if resp == nil {
+		return
+	}
+
+	type clusterItem struct {
+		Type     string `json:"type"`
+		VMID     int64  `json:"vmid"`
+		Node     string `json:"node"`
+		Name     string `json:"name"`
+		Tags     string `json:"tags"`
+		Template *int   `json:"template"`
+	}
+
+	shaTag := stemcellSHATagPrefix + sha8
+	for _, raw := range *resp {
+		var item clusterItem
+		if json.Unmarshal(raw, &item) != nil {
 			continue
 		}
-		nodeLogger := deps.Logger.With(
-			log.String("method", "delete_stemcell"),
-			log.String("stemcell_cid", cidStr),
-			log.String("replica_node", node),
+		if item.Type != "qemu" || item.VMID == 0 {
+			continue
+		}
+		if item.Template == nil || *item.Template != 1 {
+			continue
+		}
+		if !tagsContain(item.Tags, shaTag) {
+			continue
+		}
+		nodeLogger := logger.With(
+			log.String("node", item.Node),
+			log.Int("vmid", int(item.VMID)),
+			log.String("name", item.Name),
 		)
+		if delErr := destroyTemplateVM(ctx, deps, item.Node, item.VMID, cidStr); delErr != nil {
+			nodeLogger.Warn("delete_stemcell: sha sweep: destroy failed (best-effort, continuing)", log.Err(delErr))
+		} else {
+			nodeLogger.Info("delete_stemcell: sha sweep: template destroyed")
+		}
+	}
+}
 
-		// Scan for template VMs carrying this node's replica tag AND the
-		// matching sha8 tag (when sha8 is known) to avoid deleting replicas
-		// belonging to a different stemcell on the same cluster node.
-		replicaVMIDs, scanErr := findReplicaVMIDsOnNode(ctx, deps, node, sha8)
-		if scanErr != nil {
-			nodeLogger.Warn("delete_stemcell: cannot scan replicas on node (best-effort, skipping)",
-				log.Err(scanErr),
-			)
+// pruneOrphanStemcellTemplates removes template VMs cluster-wide that carry
+// both stemcellMarkerTag and a "director--<directorID>" tag, indicating they
+// belong to this director but were never cleaned up (e.g. failed deployments).
+// A VM that is a linked-clone base is skipped with a warning. All failures are
+// logged; the function never returns an error. cidStr is used for log context.
+func pruneOrphanStemcellTemplates(ctx context.Context, deps Deps, cidStr string) {
+	dryRun := deps.Config.StemcellOrphanPruneDryRun()
+	dir := deps.Config.StemcellDirectorID()
+	logger := deps.Logger.With(
+		log.String("method", "delete_stemcell.orphan_prune"),
+		log.String("stemcell_cid", cidStr),
+		log.Bool("dry_run", dryRun),
+	)
+
+	if dir == "" {
+		logger.Warn("delete_stemcell: orphan prune enabled but director_id unset; skipping")
+		return
+	}
+
+	dirTag := "director--" + sanitizeTagValue(dir)
+
+	if deps.PVE == nil || deps.PVE.Cluster() == nil {
+		logger.Warn("delete_stemcell: cluster service unavailable; orphan prune skipped")
+		return
+	}
+
+	resp, err := deps.PVE.Cluster().ListResources(ctx, &sdkcluster.ListResourcesParams{})
+	if err != nil {
+		logger.Warn("delete_stemcell: ListResources failed; orphan prune skipped", log.Err(err))
+		return
+	}
+	if resp == nil {
+		return
+	}
+
+	type clusterItem struct {
+		Type     string `json:"type"`
+		VMID     int64  `json:"vmid"`
+		Node     string `json:"node"`
+		Name     string `json:"name"`
+		Tags     string `json:"tags"`
+		Template *int   `json:"template"`
+	}
+
+	for _, raw := range *resp {
+		var item clusterItem
+		if json.Unmarshal(raw, &item) != nil {
 			continue
 		}
-
-		for _, replicaVMID := range replicaVMIDs {
-			if replicaVMID == primaryVMID {
-				continue
-			}
-			if delErr := destroyTemplateVM(ctx, deps, node, replicaVMID, cidStr); delErr != nil {
-				nodeLogger.Warn("delete_stemcell: replica delete failed (best-effort, continuing)",
-					log.Int64("replica_vmid", replicaVMID),
-					log.Err(delErr),
-				)
+		if item.Type != "qemu" || item.VMID == 0 {
+			continue
+		}
+		if item.Template == nil || *item.Template != 1 {
+			continue
+		}
+		if !tagsContain(item.Tags, stemcellMarkerTag) {
+			continue
+		}
+		if !tagsContain(item.Tags, dirTag) {
+			continue
+		}
+		nodeLogger := logger.With(
+			log.String("node", item.Node),
+			log.Int("vmid", int(item.VMID)),
+			log.String("name", item.Name),
+		)
+		if dryRun {
+			nodeLogger.Info("delete_stemcell: orphan prune: would prune (dry-run)")
+			continue
+		}
+		if delErr := destroyTemplateVM(ctx, deps, item.Node, item.VMID, cidStr); delErr != nil {
+			if pve.IsBaseVolumeInUse(delErr) {
+				nodeLogger.Warn("delete_stemcell: orphan prune: skip — referenced by linked clone")
 			} else {
-				nodeLogger.Info("delete_stemcell: replica deleted",
-					log.Int64("replica_vmid", replicaVMID),
-				)
+				nodeLogger.Warn("delete_stemcell: orphan prune: destroy failed (best-effort, continuing)", log.Err(delErr))
 			}
+		} else {
+			nodeLogger.Info("delete_stemcell: orphan prune: template pruned")
 		}
 	}
 }
@@ -258,8 +342,8 @@ func destroyTemplateReplicas(ctx context.Context, deps Deps, primaryVMID int64, 
 // resolveStemcellSHA8FromVMID reads tags from the QEMU VM list on node and
 // extracts the "bosh-stemcell-sha-<sha8>" tag value for the given vmid.
 // Returns "" when the VM is not found, has no tags, or carries no sha tag.
-// This is a best-effort helper used by destroyTemplateReplicas to scope
-// replica deletion to the correct stemcell.
+// This is a best-effort helper used by the cross-node sha sweep (sweepStemcellByShaTag)
+// to scope replica deletion to the correct stemcell.
 func resolveStemcellSHA8FromVMID(ctx context.Context, deps Deps, node string, vmid int64) string {
 	if deps.PVE == nil || deps.PVE.Nodes() == nil {
 		return ""
@@ -291,74 +375,6 @@ func resolveStemcellSHA8FromVMID(ctx context.Context, deps Deps, node string, vm
 		return ""
 	}
 	return ""
-}
-
-// findReplicaVMIDsOnNode returns VMIDs of template VMs on node that carry a
-// "bosh-stemcell-node-<node>" tag and, when sha8 is non-empty, also carry
-// "bosh-stemcell-sha-<sha8>". The sha8 filter prevents deleting replicas that
-// belong to a different stemcell when multiple stemcells are replicated on the
-// same cluster node.
-//
-// When sha8 is empty (primary sha tag could not be resolved), only the node tag
-// is required. This is a best-effort degraded path and is acceptable for
-// single-stemcell environments.
-//
-// The scan uses ListQemu and filters by tag. These are per-node replicas created
-// by replicateStemcellToNodes.
-func findReplicaVMIDsOnNode(ctx context.Context, deps Deps, node, sha8 string) ([]int64, error) {
-	if deps.PVE == nil || deps.PVE.Nodes() == nil {
-		return nil, fmt.Errorf("findReplicaVMIDsOnNode: nodes service unavailable")
-	}
-	resp, err := deps.PVE.Nodes().ListQemu(ctx, node, nil)
-	if err != nil {
-		return nil, fmt.Errorf("findReplicaVMIDsOnNode: node %s: %w", node, err)
-	}
-	if resp == nil || len(*resp) == 0 {
-		return nil, nil
-	}
-
-	nodeTag := pve.ReplicaNodeTagForNode(node)
-	shaTag := ""
-	if sha8 != "" {
-		shaTag = "bosh-stemcell-sha-" + sha8
-	}
-
-	type qemuItem struct {
-		Vmid     int64   `json:"vmid"`
-		Tags     *string `json:"tags,omitempty"`
-		Template *int    `json:"template,omitempty"`
-	}
-
-	var vmids []int64
-	for _, raw := range *resp {
-		var item qemuItem
-		if jerr := json.Unmarshal(raw, &item); jerr != nil {
-			continue
-		}
-		if item.Template == nil || *item.Template == 0 {
-			continue
-		}
-		if item.Tags == nil {
-			continue
-		}
-		// Split tags and check for node-specific replica tag (and sha tag when known).
-		tags := strings.ReplaceAll(*item.Tags, ",", ";")
-		hasNodeTag := false
-		hasSHATag := shaTag == "" // vacuously true when sha8 unknown
-		for _, tok := range strings.Split(tags, ";") {
-			tok = strings.TrimSpace(tok)
-			if tok == nodeTag {
-				hasNodeTag = true
-			}
-			if shaTag != "" && tok == shaTag {
-				hasSHATag = true
-			}
-		}
-		if hasNodeTag && hasSHATag {
-			vmids = append(vmids, item.Vmid)
-		}
-	}
-	return vmids, nil
 }
 
 // destroyTemplateVM deletes the template VM identified by vmid on node with

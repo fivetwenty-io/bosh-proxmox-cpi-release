@@ -463,7 +463,7 @@ func TestReplicateStemcellToNodes_Disabled(t *testing.T) {
 	// does not check the flag — the flag guard lives in HandleCreateStemcell.
 	// Calling it with only the primary node means no replicas should be attempted.
 	replicateStemcellToNodes(context.Background(), deps, "pve1", "local", "test.qcow2",
-		sha256hex, []string{"pve1"}, "/dev/null", "", cp)
+		sha256hex, []string{"pve1"}, "/dev/null", "", cp, "")
 
 	// Primary node must never receive an upload.
 	if uploadCalls["pve1"] != 0 {
@@ -593,7 +593,7 @@ func TestReplicateStemcellToNodes_Enabled_TwoNodes(t *testing.T) {
 	clusterNodes := []string{"pve1", "pve2", "pve3"}
 
 	replicateStemcellToNodes(context.Background(), deps, "pve1", "local", "bosh-stemcell.qcow2",
-		sha256hex, clusterNodes, srcPath, "", cp)
+		sha256hex, clusterNodes, srcPath, "", cp, "")
 
 	// pve1 is primary — should NOT receive a replica upload.
 	if uploadedNodes["pve1"] != 0 {
@@ -610,93 +610,6 @@ func TestReplicateStemcellToNodes_Enabled_TwoNodes(t *testing.T) {
 		if frozenNodes[n] != 1 {
 			t.Errorf("node %s: expected 1 MakeTemplate call, got %d", n, frozenNodes[n])
 		}
-	}
-}
-
-// ============================================================
-// Part B — delete_stemcell removes replicas across nodes
-// ============================================================
-
-// TestDestroyTemplateReplicas_RemovesAllReplicas verifies destroyTemplateReplicas
-// calls DeleteQemu for each node-local replica tag match.
-func TestDestroyTemplateReplicas_RemovesAllReplicas(t *testing.T) {
-	t.Parallel()
-
-	deletedByNode := map[string][]string{}
-
-	// pve2 has a replica with tag "bosh-stemcell-node-pve2", template=1
-	buildQemuItem := func(vmid int64, template int, tags string) json.RawMessage {
-		raw, _ := json.Marshal(map[string]any{
-			"vmid":     vmid,
-			"template": template,
-			"tags":     tags,
-		})
-		return raw
-	}
-
-	nodesSvc := &countingNodesService{
-		listQemuFn: func(_ context.Context, node string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
-			nodeTag := pve.ReplicaNodeTagForNode(node)
-			switch node {
-			case "pve2":
-				item := buildQemuItem(30101, 1, "bosh-stemcell-sha-abc12345;"+nodeTag)
-				resp := sdknodes.ListQemuResponse{item}
-				return &resp, nil
-			case "pve3":
-				item := buildQemuItem(30102, 1, "bosh-stemcell-sha-abc12345;"+nodeTag)
-				resp := sdknodes.ListQemuResponse{item}
-				return &resp, nil
-			default:
-				empty := sdknodes.ListQemuResponse{}
-				return &empty, nil
-			}
-		},
-		deleteQemuFn: func(_ context.Context, node, vmid string, _ *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
-			deletedByNode[node] = append(deletedByNode[node], vmid)
-			resp := sdknodes.DeleteQemuResponse{}
-			return &resp, nil
-		},
-	}
-
-	clusterSvc := &countingClusterService{
-		listConfigNodesFn: func(_ context.Context) (*sdkcluster.ListConfigNodesResponse, error) {
-			raw2, _ := json.Marshal(map[string]any{"name": "pve2"})
-			raw3, _ := json.Marshal(map[string]any{"name": "pve3"})
-			resp := sdkcluster.ListConfigNodesResponse{raw2, raw3}
-			return &resp, nil
-		},
-	}
-
-	tasksSvc := &replicationMockTasks{}
-
-	cfg := &config.CPIConfig{
-		Node:                   "pve1",
-		StemcellReplicateLocal: true,
-	}
-
-	logger, _ := log.NewLogger("debug", io.Discard)
-	deps := Deps{
-		Config: cfg,
-		PVE: &digestReplicationMockClient{
-			clusterSvc: clusterSvc,
-			nodesSvc:   nodesSvc,
-			tasksSvc:   tasksSvc,
-		},
-		Logger: logger,
-	}
-
-	// Simulate delete_stemcell calling destroyTemplateReplicas for primaryVMID=30100 on pve1.
-	destroyTemplateReplicas(context.Background(), deps, 30100, "pve1", "template:30100")
-
-	// Both pve2 and pve3 should have their replicas deleted.
-	for _, n := range []string{"pve2", "pve3"} {
-		if len(deletedByNode[n]) != 1 {
-			t.Errorf("node %s: expected 1 delete call, got %d (deleted: %v)", n, len(deletedByNode[n]), deletedByNode[n])
-		}
-	}
-	// pve1 is primary — must NOT appear in deleted map from this call.
-	if len(deletedByNode["pve1"]) > 0 {
-		t.Errorf("primary node pve1 should not be deleted by replica cleaner, got: %v", deletedByNode["pve1"])
 	}
 }
 
@@ -814,7 +727,7 @@ func TestReplicateStemcellToNodes_PartialFailure(t *testing.T) {
 	// Calling replicateStemcellToNodes must not panic or return an error.
 	// It is void (best-effort); errors are logged as warnings.
 	replicateStemcellToNodes(context.Background(), deps, "pve1", "local", "bosh-stemcell.qcow2",
-		sha256hex, clusterNodes, srcPath, "", cp)
+		sha256hex, clusterNodes, srcPath, "", cp, "")
 
 	// pve1 = primary, no upload.
 	if uploadedNodes["pve1"] != 0 {
@@ -838,115 +751,6 @@ func TestReplicateStemcellToNodes_PartialFailure(t *testing.T) {
 	// pve2: no VM created (upload failed before VM creation).
 	if createdVMIDsByNode["pve2"] != 0 {
 		t.Errorf("pve2: expected 0 VMs created (upload failed), got %d", createdVMIDsByNode["pve2"])
-	}
-}
-
-// ============================================================
-// Part C — cross-stemcell delete isolation
-// ============================================================
-
-// TestDestroyTemplateReplicas_CrossStemcellIsolation verifies that deleting
-// stemcell A's replicas leaves stemcell B's replicas intact when both are
-// replicated to the same cluster nodes (fixes sha8-agnostic delete bug).
-func TestDestroyTemplateReplicas_CrossStemcellIsolation(t *testing.T) {
-	t.Parallel()
-
-	// Stemcell A: primary VMID=40100 on pve1, sha8="aaaaaaaa"
-	// Stemcell B: primary VMID=40200 on pve1, sha8="bbbbbbbb"
-	// Both replicated to pve2.
-	// pve2 has:
-	//   VMID=40101 tags="bosh-stemcell-sha-aaaaaaaa;bosh-stemcell-node-pve2" (A replica)
-	//   VMID=40201 tags="bosh-stemcell-sha-bbbbbbbb;bosh-stemcell-node-pve2" (B replica)
-	const shaA = "aaaaaaaa"
-	const shaB = "bbbbbbbb"
-
-	buildItem := func(vmid int64, sha8, node string) json.RawMessage {
-		nodeTag := pve.ReplicaNodeTagForNode(node)
-		tags := "bosh-stemcell-sha-" + sha8 + ";" + nodeTag
-		raw, _ := json.Marshal(map[string]any{
-			"vmid":     vmid,
-			"template": 1,
-			"tags":     tags,
-		})
-		return raw
-	}
-
-	deletedByNode := map[string][]string{}
-
-	nodesSvc := &countingNodesService{
-		listQemuFn: func(_ context.Context, node string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
-			switch node {
-			case "pve1":
-				// Primary for A: VMID=40100 with sha=aaaaaaaa (no node tag = primary)
-				raw, _ := json.Marshal(map[string]any{
-					"vmid":     int64(40100),
-					"template": 1,
-					"tags":     "bosh-stemcell-sha-" + shaA,
-				})
-				resp := sdknodes.ListQemuResponse{raw}
-				return &resp, nil
-			case "pve2":
-				itemA := buildItem(40101, shaA, "pve2")
-				itemB := buildItem(40201, shaB, "pve2")
-				resp := sdknodes.ListQemuResponse{itemA, itemB}
-				return &resp, nil
-			default:
-				empty := sdknodes.ListQemuResponse{}
-				return &empty, nil
-			}
-		},
-		deleteQemuFn: func(_ context.Context, node, vmid string, _ *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
-			deletedByNode[node] = append(deletedByNode[node], vmid)
-			resp := sdknodes.DeleteQemuResponse{}
-			return &resp, nil
-		},
-	}
-
-	clusterSvc := &countingClusterService{
-		listConfigNodesFn: func(_ context.Context) (*sdkcluster.ListConfigNodesResponse, error) {
-			raw2, _ := json.Marshal(map[string]any{"name": "pve2"})
-			resp := sdkcluster.ListConfigNodesResponse{raw2}
-			return &resp, nil
-		},
-	}
-
-	tasksSvc := &replicationMockTasks{}
-
-	cfg := &config.CPIConfig{
-		Node:                   "pve1",
-		StemcellReplicateLocal: true,
-	}
-	logger, _ := log.NewLogger("debug", io.Discard)
-	deps := Deps{
-		Config: cfg,
-		PVE: &digestReplicationMockClient{
-			clusterSvc: clusterSvc,
-			nodesSvc:   nodesSvc,
-			tasksSvc:   tasksSvc,
-		},
-		Logger: logger,
-	}
-
-	// Delete stemcell A (primary VMID=40100 on pve1).
-	// resolveStemcellSHA8FromVMID reads pve1's ListQemu → finds sha8="aaaaaaaa".
-	// findReplicaVMIDsOnNode on pve2 must match ONLY VMID=40101 (sha=aaaaaaaa),
-	// NOT VMID=40201 (sha=bbbbbbbb).
-	destroyTemplateReplicas(context.Background(), deps, 40100, "pve1", "template:40100")
-
-	// Only stemcell A's replica (40101) on pve2 should be deleted.
-	pve2Deleted := deletedByNode["pve2"]
-	if len(pve2Deleted) != 1 {
-		t.Fatalf("pve2: expected 1 delete (stemcell A replica only), got %d: %v", len(pve2Deleted), pve2Deleted)
-	}
-	if pve2Deleted[0] != "40101" {
-		t.Errorf("pve2: expected delete of VMID 40101 (stemcell A replica), got %q", pve2Deleted[0])
-	}
-
-	// Stemcell B's replica (40201) must NOT be deleted.
-	for _, vmid := range pve2Deleted {
-		if vmid == "40201" {
-			t.Errorf("pve2: stemcell B replica VMID 40201 was deleted — cross-stemcell isolation broken")
-		}
 	}
 }
 
