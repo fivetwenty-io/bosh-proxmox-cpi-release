@@ -843,6 +843,182 @@ func TestHandleCreateDisk_NoAZ_MetaAZEmpty(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Layered resolver handler-level tests
+// ---------------------------------------------------------------------------
+
+// TestHandleCreateDisk_DiskTypeProfileSelectsPool verifies that a disk_type
+// selector in cloud_properties resolves storage_pool from the named profile
+// when no explicit storage_pool is given in the call.
+func TestHandleCreateDisk_DiskTypeProfileSelectsPool(t *testing.T) {
+	t.Parallel()
+	var capturedStorage string
+	storageSvc := &mockStorageService{
+		createVolumeFn: func(_ context.Context, _, storage string, _ int, _ string, vmid int, _ string) (string, error) {
+			capturedStorage = storage
+			return fmt.Sprintf("%s:vm-%d-disk-0", storage, vmid), nil
+		},
+	}
+	deps := baseDepsForCreate(t, storageSvc, nil)
+	// Add a disk_type profile that supplies storage_pool.
+	deps.Config.DiskTypes = map[string]config.TypeProfile{
+		"fast-disk": {
+			CloudProperties: map[string]any{
+				"storage_pool": "ssd-pool",
+			},
+		},
+	}
+
+	h := handlers.HandleCreateDisk(deps)
+	_, err := h.Handle(context.Background(), []json.RawMessage{
+		marshal(1024),
+		marshal(map[string]string{"disk_type": "fast-disk"}),
+	}, jsonrpc.Context{})
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if capturedStorage != "ssd-pool" {
+		t.Errorf("disk_type profile storage_pool: CreateVolume received storage=%q, want %q", capturedStorage, "ssd-pool")
+	}
+}
+
+// TestHandleCreateDisk_VMTypeProfileSelectsPool verifies that a vm_type
+// selector in cloud_properties resolves storage_pool from the named profile
+// when no explicit storage_pool and no disk_type are given.
+func TestHandleCreateDisk_VMTypeProfileSelectsPool(t *testing.T) {
+	t.Parallel()
+	var capturedStorage string
+	storageSvc := &mockStorageService{
+		createVolumeFn: func(_ context.Context, _, storage string, _ int, _ string, vmid int, _ string) (string, error) {
+			capturedStorage = storage
+			return fmt.Sprintf("%s:vm-%d-disk-0", storage, vmid), nil
+		},
+	}
+	deps := baseDepsForCreate(t, storageSvc, nil)
+	deps.Config.VMTypes = map[string]config.TypeProfile{
+		"large": {
+			CloudProperties: map[string]any{
+				"storage_pool": "hdd-pool",
+			},
+		},
+	}
+
+	h := handlers.HandleCreateDisk(deps)
+	_, err := h.Handle(context.Background(), []json.RawMessage{
+		marshal(1024),
+		marshal(map[string]string{"vm_type": "large"}),
+	}, jsonrpc.Context{})
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if capturedStorage != "hdd-pool" {
+		t.Errorf("vm_type profile storage_pool: CreateVolume received storage=%q, want %q", capturedStorage, "hdd-pool")
+	}
+}
+
+// TestHandleCreateDisk_ExplicitStoragePoolBeatsProfile verifies that an
+// explicit storage_pool in cloud_properties beats any profile-supplied value.
+func TestHandleCreateDisk_ExplicitStoragePoolBeatsProfile(t *testing.T) {
+	t.Parallel()
+	var capturedStorage string
+	storageSvc := &mockStorageService{
+		createVolumeFn: func(_ context.Context, _, storage string, _ int, _ string, vmid int, _ string) (string, error) {
+			capturedStorage = storage
+			return fmt.Sprintf("%s:vm-%d-disk-0", storage, vmid), nil
+		},
+	}
+	deps := baseDepsForCreate(t, storageSvc, nil)
+	deps.Config.DiskTypes = map[string]config.TypeProfile{
+		"fast-disk": {
+			CloudProperties: map[string]any{
+				"storage_pool": "ssd-pool",
+			},
+		},
+	}
+
+	h := handlers.HandleCreateDisk(deps)
+	_, err := h.Handle(context.Background(), []json.RawMessage{
+		marshal(1024),
+		// explicit storage_pool must win over disk_type profile
+		marshal(map[string]string{"storage_pool": "call-explicit", "disk_type": "fast-disk"}),
+	}, jsonrpc.Context{})
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if capturedStorage != "call-explicit" {
+		t.Errorf("explicit storage_pool beats profile: CreateVolume received storage=%q, want call-explicit", capturedStorage)
+	}
+}
+
+// TestHandleCreateDisk_DiskFormatFromProfile verifies that disk_format supplied
+// by a disk_type profile is forwarded to CreateVolume as formatArg.
+func TestHandleCreateDisk_DiskFormatFromProfile(t *testing.T) {
+	t.Parallel()
+	var capturedFormat string
+	storageSvc := &mockStorageService{
+		createVolumeFn: func(_ context.Context, _, storage string, _ int, format string, vmid int, _ string) (string, error) {
+			capturedFormat = format
+			return fmt.Sprintf("%s:vm-%d-disk-0", storage, vmid), nil
+		},
+	}
+	deps := baseDepsForCreate(t, storageSvc, nil)
+	deps.Config.DiskTypes = map[string]config.TypeProfile{
+		"raw-disk": {
+			CloudProperties: map[string]any{
+				"storage_pool": storageName,
+				"disk_format":  "raw",
+			},
+		},
+	}
+
+	h := handlers.HandleCreateDisk(deps)
+	_, err := h.Handle(context.Background(), []json.RawMessage{
+		marshal(1024),
+		marshal(map[string]string{"disk_type": "raw-disk"}),
+	}, jsonrpc.Context{})
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if capturedFormat != "raw" {
+		t.Errorf("disk_format from profile: CreateVolume received format=%q, want raw", capturedFormat)
+	}
+}
+
+// TestHandleCreateDisk_UnknownDiskTypeSelector verifies that an unknown
+// disk_type selector causes a non-retriable CloudError before any PVE call.
+func TestHandleCreateDisk_UnknownDiskTypeSelector(t *testing.T) {
+	t.Parallel()
+	storageSvc := &mockStorageService{
+		createVolumeFn: func(_ context.Context, _, _ string, _ int, _ string, _ int, _ string) (string, error) {
+			t.Error("CreateVolume must not be called when selector resolution fails")
+			return "", nil
+		},
+	}
+	deps := baseDepsForCreate(t, storageSvc, nil)
+	// DiskTypes map is empty; any disk_type selector is unknown.
+
+	h := handlers.HandleCreateDisk(deps)
+	_, err := h.Handle(context.Background(), []json.RawMessage{
+		marshal(1024),
+		marshal(map[string]string{"disk_type": "nonexistent"}),
+	}, jsonrpc.Context{})
+
+	if err == nil {
+		t.Fatal("expected CloudError for unknown disk_type selector, got nil")
+	}
+	var cpiErr *cpierrors.Error
+	if !errors.As(err, &cpiErr) {
+		t.Fatalf("expected *cpierrors.Error, got %T: %v", err, err)
+	}
+	if cpiErr.OkToRetry() {
+		t.Error("unknown selector error must not be retriable")
+	}
+}
+
 func TestHandleCreateDisk_AuthFailure(t *testing.T) {
 	t.Parallel()
 	authErr := &sdkerrors.APIError{HTTPCode: 401, Message: "authentication failure"}

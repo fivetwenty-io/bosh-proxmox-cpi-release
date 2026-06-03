@@ -284,7 +284,7 @@ the existing sha8 content tag; resolve the template VMID on the chosen node at
 node that lacks it), behind `stemcell.replicate_local` (default off). `delete_stemcell`
 removes all per-node replicas (mirror vSphere parallel replica deletion).
 
-#### 7.3 VM-disk fault-domain co-location
+#### 7.3 DONE — VM-disk fault-domain co-location
 
 *References: AWS, Google, Azure, OpenStack-Go.* `create_disk` resolves only a storage
 pool name with no node/AZ awareness, and `attach_disk` does not validate that a disk's
@@ -316,7 +316,7 @@ backstop in `main.go`; convert the recovered value to `Cloud("panic in %s: %v", 
 log the stack at error level with `request_id` attached. Mirrors the OpenStack-Go panic
 handler. Zero new dependencies.
 
-#### 7.5 Active IP-conflict probe (ARP / guest-agent) for DHCP and foreign devices
+#### 7.5 PARTIAL — Active IP-conflict probe (ARP / guest-agent) for DHCP and foreign devices
 
 *References: vSphere, OpenStack-Go, AWS, Alicloud.* The shipped detector scans static
 `ipconfig{N}` entries only; its source notes it cannot detect DHCP-assigned addresses
@@ -332,6 +332,16 @@ after a ping sweep) to catch any responder, physical or virtual. Optionally fan 
 QEMU guest-agent `network-get-interfaces` across running guests to catch DHCP-assigned
 addresses not in `ipconfig`. Reuse the existing conflict error path. Keep the cheap
 static scan as default; gate the active probe opt-in since it needs node exec.
+
+**Status:** the guest-agent half shipped — opt-in `ip_conflict_probe: agent` fans out
+`network-get-interfaces` across running guests to catch DHCP-assigned addresses absent
+from `ipconfig`, fail-open, reusing the conflict error path. The host-level ARP half is
+NOT shipped: the CPI client is PVE-API-only and PVE exposes no arbitrary host shell
+(`/nodes/{node}/execute` is a bulk API-call runner, not a shell), so `arping` on the
+bridge is not reachable without adding node SSH. Detecting physical/non-PVE responders
+therefore remains open; the config is an enum so an `arp` mode can be added if node SSH
+is introduced. The physical-device vector from the NATS-churn incident is separately
+mitigated by the isolated-SDN migration.
 
 #### 7.6 DONE — Stemcell image checksum verification
 
@@ -366,7 +376,7 @@ delete path already tolerates `light:`-prefixed and bare CIDs). `create_disk` re
 pool + home node; `attach_disk` and scoring read it. Ship this before §7.3, which
 depends on it.
 
-#### 7.8 Layered cloud_properties resolution (vm_type → disk_type → global)
+#### 7.8 DONE — Layered cloud_properties resolution (vm_type → disk_type → global)
 
 *References: vSphere, AWS, Azure, Alicloud.* PVE config is single-level: only per-call
 cloud_properties override global config. Storage resolves
@@ -384,6 +394,22 @@ that already have a single home — storage pool, disk format, clone mode, bridg
 security groups, firewall, placement weights/AZ. Optionally match by PVE storage
 attributes from `/cluster/storage` (type, shared) so a `storage_tier: fast` resolves by
 attribute, mirroring vSphere PBM.
+
+**Shipped.** A generic layered resolver now applies the precedence `per-call
+cloud_properties → disk_type profile → vm_type profile → global config` to every attribute
+named above. Because the BOSH director merges vm_type/disk_type cloud_properties into one
+flat dict before the CPI call (the CPI never receives the type name), profiles are defined
+in CPI config (`vm_types`, `disk_types`) and selected per deployment via the
+`cloud_properties.vm_type` / `cloud_properties.disk_type` keys — mirroring vSphere
+storage-policy-by-name. `create_vm` now honors a profile- or call-selected root/ephemeral
+storage pool (previously only `config.vm_storage`, the keystone gap). `storage_tier`
+attribute matching is implemented: `cloud_properties.storage_tier` resolves against live
+`/cluster/storage` using operator-defined `storage_tiers` criteria (allowed types and a
+shared/local predicate), returning the first matching pool; an unknown tier or no match is
+a non-retriable error rather than a silent fallback. A global default `security_groups`
+list and a per-profile firewall toggle are also resolved through the chain. Every property
+is opt-in: with no profiles, selectors, or tiers configured, resolution is byte-identical
+to prior releases.
 
 #### 7.9 Per-disk performance options (iothread / cache / discard / ssd / IO limits)
 

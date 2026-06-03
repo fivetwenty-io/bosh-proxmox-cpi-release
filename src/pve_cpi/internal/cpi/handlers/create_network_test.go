@@ -148,7 +148,7 @@ func TestHandleCreateNetwork_SDN_WithSubnet(t *testing.T) {
 		// SDN mock defaults panic on unconfigured calls. Opt in
 		// to the create-vnet + apply mutations the SDN path performs after a
 		// 404 from GetSdnVnets.
-		createSdnVnetsFn: func(_ context.Context, _ *sdkcluster.CreateSdnVnetsParams) error {
+		createSdnVnetsFn: func(_ context.Context, params *sdkcluster.CreateSdnVnetsParams) error {
 			return nil
 		},
 		updateSdnFn: func(_ context.Context, _ *sdkcluster.UpdateSdnParams) (*sdkcluster.UpdateSdnResponse, error) {
@@ -204,7 +204,7 @@ func TestHandleCreateNetwork_SDN_IdempotentVnetExists(t *testing.T) {
 			raw := sdkcluster.GetSdnVnetsResponse(`{"vnet":"myvnet","zone":"z"}`)
 			return &raw, nil
 		},
-		createSdnVnetsFn: func(_ context.Context, _ *sdkcluster.CreateSdnVnetsParams) error {
+		createSdnVnetsFn: func(_ context.Context, params *sdkcluster.CreateSdnVnetsParams) error {
 			createVnetCalls = append(createVnetCalls, struct{}{})
 			return nil
 		},
@@ -315,7 +315,7 @@ func TestHandleCreateNetwork_SDN_ZoneMissingAutoManageTrue(t *testing.T) {
 		},
 		// Opt in to vnet create + apply mutations the SDN path runs
 		// after auto-managed zone creation.
-		createSdnVnetsFn: func(_ context.Context, _ *sdkcluster.CreateSdnVnetsParams) error {
+		createSdnVnetsFn: func(_ context.Context, params *sdkcluster.CreateSdnVnetsParams) error {
 			return nil
 		},
 		updateSdnFn: func(_ context.Context, _ *sdkcluster.UpdateSdnParams) (*sdkcluster.UpdateSdnResponse, error) {
@@ -495,7 +495,7 @@ func TestHandleCreateNetwork_SDN_ConfigZoneFallback(t *testing.T) {
 			return nil, sdnNotFound()
 		},
 		// Opt in to vnet create + apply mutations the SDN path runs.
-		createSdnVnetsFn: func(_ context.Context, _ *sdkcluster.CreateSdnVnetsParams) error {
+		createSdnVnetsFn: func(_ context.Context, params *sdkcluster.CreateSdnVnetsParams) error {
 			return nil
 		},
 		updateSdnFn: func(_ context.Context, _ *sdkcluster.UpdateSdnParams) (*sdkcluster.UpdateSdnResponse, error) {
@@ -561,7 +561,7 @@ func TestHandleCreateNetwork_SDN_BridgeEqualsVnet(t *testing.T) {
 			return nil, sdnNotFound()
 		},
 		// Opt in to vnet create + apply mutations.
-		createSdnVnetsFn: func(_ context.Context, _ *sdkcluster.CreateSdnVnetsParams) error {
+		createSdnVnetsFn: func(_ context.Context, params *sdkcluster.CreateSdnVnetsParams) error {
 			return nil
 		},
 		updateSdnFn: func(_ context.Context, _ *sdkcluster.UpdateSdnParams) (*sdkcluster.UpdateSdnResponse, error) {
@@ -723,7 +723,7 @@ func TestHandleCreateNetwork_SDN_ReservedIsEmptySlice(t *testing.T) {
 			return nil, sdnNotFound()
 		},
 		// Opt in to vnet create + apply mutations.
-		createSdnVnetsFn: func(_ context.Context, _ *sdkcluster.CreateSdnVnetsParams) error {
+		createSdnVnetsFn: func(_ context.Context, params *sdkcluster.CreateSdnVnetsParams) error {
 			return nil
 		},
 		updateSdnFn: func(_ context.Context, _ *sdkcluster.UpdateSdnParams) (*sdkcluster.UpdateSdnResponse, error) {
@@ -795,7 +795,7 @@ func TestHandleCreateNetwork_SDN_Rollback_SubnetFails(t *testing.T) {
 		getSdnVnetsFn: func(_ context.Context, _ string, _ *sdkcluster.GetSdnVnetsParams) (*sdkcluster.GetSdnVnetsResponse, error) {
 			return nil, sdnNotFound() // vnet absent → will be created
 		},
-		createSdnVnetsFn: func(_ context.Context, _ *sdkcluster.CreateSdnVnetsParams) error {
+		createSdnVnetsFn: func(_ context.Context, params *sdkcluster.CreateSdnVnetsParams) error {
 			return nil // vnet created successfully
 		},
 		createSdnVnetsSubnetsFn: func(_ context.Context, _ string, _ *sdkcluster.CreateSdnVnetsSubnetsParams) error {
@@ -852,7 +852,7 @@ func TestHandleCreateNetwork_SDN_Rollback_ApplyFails(t *testing.T) {
 		getSdnVnetsFn: func(_ context.Context, _ string, _ *sdkcluster.GetSdnVnetsParams) (*sdkcluster.GetSdnVnetsResponse, error) {
 			return nil, sdnNotFound()
 		},
-		createSdnVnetsFn: func(_ context.Context, _ *sdkcluster.CreateSdnVnetsParams) error {
+		createSdnVnetsFn: func(_ context.Context, params *sdkcluster.CreateSdnVnetsParams) error {
 			return nil
 		},
 		createSdnVnetsSubnetsFn: func(_ context.Context, _ string, _ *sdkcluster.CreateSdnVnetsSubnetsParams) error {
@@ -999,7 +999,7 @@ func TestHandleCreateNetwork_SubnetCreateFails_RollsBackZoneAndVnet(t *testing.T
 		getSdnVnetsFn: func(_ context.Context, _ string, _ *sdkcluster.GetSdnVnetsParams) (*sdkcluster.GetSdnVnetsResponse, error) {
 			return nil, sdnNotFound() // vnet absent → will be created
 		},
-		createSdnVnetsFn: func(_ context.Context, _ *sdkcluster.CreateSdnVnetsParams) error {
+		createSdnVnetsFn: func(_ context.Context, params *sdkcluster.CreateSdnVnetsParams) error {
 			return nil // vnet created → vnetCreated=true
 		},
 		createSdnVnetsSubnetsFn: func(_ context.Context, _ string, _ *sdkcluster.CreateSdnVnetsSubnetsParams) error {
@@ -1053,6 +1053,348 @@ func TestHandleCreateNetwork_SubnetCreateFails_RollsBackZoneAndVnet(t *testing.T
 // ensure testConfig() satisfies compile-time check that *config.CPIConfig is used
 var _ *config.CPIConfig = testConfig()
 
+// ---------------------------------------------------------------------------
+// Layered-resolver integration tests for create_network
+// ---------------------------------------------------------------------------
+
+// testSDNDepsWithProfiles returns Deps wired with clusterSvc and vm_type/disk_type profile maps.
+func testSDNDepsWithProfiles(
+	clusterSvc sdkcluster.Service,
+	networkMode, sdnZone string,
+	vmTypes map[string]config.TypeProfile,
+) handlers.Deps {
+	cfg := testConfig()
+	cfg.NetworkMode = networkMode
+	cfg.SDNZone = sdnZone
+	cfg.SDNZoneType = "simple"
+	cfg.SDNAutoManageZone = false
+	cfg.VMTypes = vmTypes
+	return handlers.Deps{
+		Config: cfg,
+		PVE: &mockPVEClient{
+			clusterSvc: clusterSvc,
+			nodesSvc:   &mockNodesService{},
+		},
+		Logger: log.NewNopLogger(),
+	}
+}
+
+// sdnHappyCluster builds a mockSDNCluster where the zone exists, vnet is absent,
+// and apply succeeds. zoneChecked and vnetCreatedName let callers assert routing.
+func sdnHappyCluster(zoneResult string) (*mockSDNCluster, *string) {
+	var zoneChecked string
+	clusterSvc := &mockSDNCluster{
+		getSdnZonesFn: func(_ context.Context, zone string, _ *sdkcluster.GetSdnZonesParams) (*sdkcluster.GetSdnZonesResponse, error) {
+			zoneChecked = zone
+			raw := sdkcluster.GetSdnZonesResponse(`{"zone":"` + zoneResult + `"}`)
+			return &raw, nil
+		},
+		getSdnVnetsFn: func(_ context.Context, _ string, _ *sdkcluster.GetSdnVnetsParams) (*sdkcluster.GetSdnVnetsResponse, error) {
+			return nil, sdnNotFound()
+		},
+		createSdnVnetsFn: func(_ context.Context, _ *sdkcluster.CreateSdnVnetsParams) error {
+			return nil
+		},
+		updateSdnFn: func(_ context.Context, _ *sdkcluster.UpdateSdnParams) (*sdkcluster.UpdateSdnResponse, error) {
+			return nil, nil
+		},
+	}
+	return clusterSvc, &zoneChecked
+}
+
+// -- LR-CN-01: no selectors — byte-identical to pre-resolver behavior --
+// zone + vnet supplied directly in call CP; config zone fallback not triggered.
+func TestHandleCreateNetwork_LayeredResolver_NoSelectors_SameAsPlain(t *testing.T) {
+	t.Parallel()
+	clusterSvc, zoneChecked := sdnHappyCluster("myzone")
+	spec := map[string]any{
+		"type": "manual",
+		"cloud_properties": map[string]any{
+			"zone": "myzone",
+			"vnet": "myvnet",
+		},
+	}
+	result, err := invokeCreateNetwork(t,
+		testSDNDepsWithProfiles(clusterSvc, "sdn", "", nil),
+		spec,
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if *zoneChecked != "myzone" {
+		t.Errorf("zone: got %q, want myzone", *zoneChecked)
+	}
+	arr := result.([]any)
+	if arr[0] != "myvnet" {
+		t.Errorf("network_cid: got %v, want myvnet", arr[0])
+	}
+}
+
+// -- LR-CN-02: vm_type profile supplies zone; call CP lacks zone --
+// Verifies profile layer is consulted when call map is missing the key.
+func TestHandleCreateNetwork_LayeredResolver_VMTypeProfile_SuppliesZone(t *testing.T) {
+	t.Parallel()
+	clusterSvc, zoneChecked := sdnHappyCluster("profilezone")
+	vmTypes := map[string]config.TypeProfile{
+		"small": {
+			CloudProperties: map[string]any{
+				"zone": "profilezone",
+			},
+		},
+	}
+	spec := map[string]any{
+		"type": "manual",
+		"cloud_properties": map[string]any{
+			"vm_type": "small",
+			"vnet":    "testvnet",
+			// zone deliberately absent — should come from profile
+		},
+	}
+	result, err := invokeCreateNetwork(t,
+		testSDNDepsWithProfiles(clusterSvc, "sdn", "", vmTypes),
+		spec,
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if *zoneChecked != "profilezone" {
+		t.Errorf("zone from profile: got %q, want profilezone", *zoneChecked)
+	}
+	cp := result.([]any)[2].(map[string]any)
+	if cp["zone"] != "profilezone" {
+		t.Errorf("cloud_props_out zone: got %v, want profilezone", cp["zone"])
+	}
+}
+
+// -- LR-CN-03: call CP zone beats profile zone --
+// The call layer has highest precedence; profile zone must NOT win.
+func TestHandleCreateNetwork_LayeredResolver_CallZoneBeatsProfile(t *testing.T) {
+	t.Parallel()
+	clusterSvc, zoneChecked := sdnHappyCluster("callzone")
+	vmTypes := map[string]config.TypeProfile{
+		"small": {
+			CloudProperties: map[string]any{
+				"zone": "profilezone",
+			},
+		},
+	}
+	spec := map[string]any{
+		"type": "manual",
+		"cloud_properties": map[string]any{
+			"vm_type": "small",
+			"zone":    "callzone", // call beats profile
+			"vnet":    "testvnet",
+		},
+	}
+	result, err := invokeCreateNetwork(t,
+		testSDNDepsWithProfiles(clusterSvc, "sdn", "", vmTypes),
+		spec,
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if *zoneChecked != "callzone" {
+		t.Errorf("call zone must win; got %q, want callzone", *zoneChecked)
+	}
+	cp := result.([]any)[2].(map[string]any)
+	if cp["zone"] != "callzone" {
+		t.Errorf("cloud_props_out zone: got %v, want callzone", cp["zone"])
+	}
+}
+
+// -- LR-CN-04: profile supplies bridge; call CP has no bridge key --
+// vm_type profile carries bridge; config.NetworkBridge is also present but
+// the profile layer (below call, above config) should supply the value since
+// the call layer has no "bridge" key and the profile does.
+// Verifies resolver profile layer is consulted for bridge before config fallback.
+func TestHandleCreateNetwork_LayeredResolver_BridgeDefault(t *testing.T) {
+	t.Parallel()
+	var ifaceUsed string
+	nodesSvc := &mockBridgeNodes{
+		createNetworkFn: func(_ context.Context, _ string, params *sdknodes.CreateNetworkParams) error {
+			ifaceUsed = params.Iface
+			return nil
+		},
+	}
+	cfg := testConfig()
+	cfg.NetworkMode = "bridge"
+	cfg.NetworkBridge = "vmbr0" // config default — should be beaten by profile
+	cfg.Node = "pve1"
+	vmTypes := map[string]config.TypeProfile{
+		"web": {
+			CloudProperties: map[string]any{
+				"bridge": "vmbr99", // profile supplies bridge
+			},
+		},
+	}
+	cfg.VMTypes = vmTypes
+	deps := handlers.Deps{
+		Config: cfg,
+		PVE:    &mockPVEClient{clusterSvc: &mockSDNCluster{}, nodesSvc: nodesSvc},
+		Logger: log.NewNopLogger(),
+	}
+	spec := map[string]any{
+		"type": "manual",
+		"cloud_properties": map[string]any{
+			"vm_type": "web",
+			// no bridge in call CP — profile should supply vmbr99
+		},
+	}
+	result, err := invokeCreateNetwork(t, deps, spec)
+	if err != nil {
+		t.Fatalf("unexpected: %v", err)
+	}
+	if ifaceUsed != "vmbr99" {
+		t.Errorf("expected profile bridge vmbr99, got %q", ifaceUsed)
+	}
+	if result.([]any)[0] != "vmbr99" {
+		t.Errorf("network_cid: got %v, want vmbr99", result.([]any)[0])
+	}
+}
+
+// -- LR-CN-05: unknown selector in call CP → CloudError --
+func TestHandleCreateNetwork_LayeredResolver_UnknownVMType_CloudError(t *testing.T) {
+	t.Parallel()
+	cfg := testConfig()
+	cfg.NetworkMode = "sdn"
+	cfg.SDNZone = "myzone"
+	cfg.VMTypes = map[string]config.TypeProfile{} // empty — "bogus" is unknown
+	deps := handlers.Deps{
+		Config: cfg,
+		PVE:    &mockPVEClient{clusterSvc: &mockSDNCluster{}},
+		Logger: log.NewNopLogger(),
+	}
+	spec := map[string]any{
+		"type": "manual",
+		"cloud_properties": map[string]any{
+			"vm_type": "bogus",
+			"vnet":    "myvnet",
+		},
+	}
+	_, err := invokeCreateNetwork(t, deps, spec)
+	if err == nil {
+		t.Fatal("expected CloudError for unknown vm_type")
+	}
+	var cpiErr *cpierrors.Error
+	if !errors.As(err, &cpiErr) {
+		t.Fatalf("expected *cpierrors.Error, got %T: %v", err, err)
+	}
+	if cpiErr.Type() != cpierrors.TypeCloud {
+		t.Errorf("expected TypeCloud, got %q", cpiErr.Type())
+	}
+	if !strings.Contains(cpiErr.Error(), "unknown profile") {
+		t.Errorf("error should mention unknown profile: %v", cpiErr)
+	}
+}
+
+// -- LR-CN-06: config zone still applies when no selectors and call CP has no zone --
+// Ensures the config fallback after the resolver still works (resolver returns not-found,
+// caller falls back to cfg.SDNZone exactly as before).
+func TestHandleCreateNetwork_LayeredResolver_ConfigZoneFallback_NoSelectors(t *testing.T) {
+	t.Parallel()
+	var zoneChecked string
+	clusterSvc := &mockSDNCluster{
+		getSdnZonesFn: func(_ context.Context, zone string, _ *sdkcluster.GetSdnZonesParams) (*sdkcluster.GetSdnZonesResponse, error) {
+			zoneChecked = zone
+			raw := sdkcluster.GetSdnZonesResponse(`{"zone":"cfgzone"}`)
+			return &raw, nil
+		},
+		getSdnVnetsFn: func(_ context.Context, _ string, _ *sdkcluster.GetSdnVnetsParams) (*sdkcluster.GetSdnVnetsResponse, error) {
+			return nil, sdnNotFound()
+		},
+		createSdnVnetsFn: func(_ context.Context, params *sdkcluster.CreateSdnVnetsParams) error {
+			return nil
+		},
+		updateSdnFn: func(_ context.Context, _ *sdkcluster.UpdateSdnParams) (*sdkcluster.UpdateSdnResponse, error) {
+			return nil, nil
+		},
+	}
+	spec := map[string]any{
+		"type": "manual",
+		"cloud_properties": map[string]any{
+			"vnet": "cfgvnet",
+			// no zone, no vm_type selector
+		},
+	}
+	result, err := invokeCreateNetwork(t,
+		testSDNDepsWithProfiles(clusterSvc, "auto", "cfgzone", nil),
+		spec,
+	)
+	if err != nil {
+		t.Fatalf("unexpected: %v", err)
+	}
+	if zoneChecked != "cfgzone" {
+		t.Errorf("config zone fallback: got %q, want cfgzone", zoneChecked)
+	}
+	cp := result.([]any)[2].(map[string]any)
+	if cp["zone"] != "cfgzone" {
+		t.Errorf("cloud_props_out zone: got %v, want cfgzone", cp["zone"])
+	}
+}
+
+// -- LR-CN-07: nil cloud_properties → resolver handles nil map without panic --
+func TestHandleCreateNetwork_LayeredResolver_NilCloudProperties(t *testing.T) {
+	t.Parallel()
+	cfg := testConfig()
+	cfg.NetworkMode = "bridge"
+	cfg.NetworkBridge = "vmbr0"
+	cfg.Node = "pve1"
+	deps := handlers.Deps{
+		Config: cfg,
+		PVE:    &mockPVEClient{clusterSvc: &mockSDNCluster{}, nodesSvc: &mockBridgeNodes{}},
+		Logger: log.NewNopLogger(),
+	}
+	// Sending a spec with explicitly null cloud_properties.
+	raw := []json.RawMessage{json.RawMessage(`{"type":"manual","cloud_properties":null}`)}
+	h := handlers.HandleCreateNetwork(deps)
+	_, err := h.Handle(context.Background(), raw, jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("nil cloud_properties must not panic or error: %v", err)
+	}
+}
+
+// -- LR-CN-08: profile node supplies node for bridge path --
+func TestHandleCreateNetwork_LayeredResolver_VMTypeProfile_SuppliesNode(t *testing.T) {
+	t.Parallel()
+	var nodeUsed string
+	nodesSvc := &mockBridgeNodes{
+		createNetworkFn: func(_ context.Context, node string, _ *sdknodes.CreateNetworkParams) error {
+			nodeUsed = node
+			return nil
+		},
+	}
+	cfg := testConfig()
+	cfg.NetworkMode = "bridge"
+	cfg.NetworkBridge = "vmbr0"
+	cfg.Node = "" // empty so config fallback doesn't win
+	cfg.VMTypes = map[string]config.TypeProfile{
+		"rack1": {
+			CloudProperties: map[string]any{
+				"node": "racknode1",
+			},
+		},
+	}
+	deps := handlers.Deps{
+		Config: cfg,
+		PVE:    &mockPVEClient{clusterSvc: &mockSDNCluster{}, nodesSvc: nodesSvc},
+		Logger: log.NewNopLogger(),
+	}
+	spec := map[string]any{
+		"type": "manual",
+		"cloud_properties": map[string]any{
+			"vm_type": "rack1",
+			// no node in call CP
+		},
+	}
+	_, err := invokeCreateNetwork(t, deps, spec)
+	if err != nil {
+		t.Fatalf("unexpected: %v", err)
+	}
+	if nodeUsed != "racknode1" {
+		t.Errorf("node from profile: got %q, want racknode1", nodeUsed)
+	}
+}
+
 // -- TestCreateNetwork_RollbackSurvivesParentCancel --
 //
 // Verifies that when the caller's context is cancelled mid-flow, the
@@ -1084,7 +1426,7 @@ func TestCreateNetwork_RollbackSurvivesParentCancel(t *testing.T) {
 		getSdnVnetsFn: func(_ context.Context, _ string, _ *sdkcluster.GetSdnVnetsParams) (*sdkcluster.GetSdnVnetsResponse, error) {
 			return nil, sdnNotFound()
 		},
-		createSdnVnetsFn: func(_ context.Context, _ *sdkcluster.CreateSdnVnetsParams) error {
+		createSdnVnetsFn: func(_ context.Context, params *sdkcluster.CreateSdnVnetsParams) error {
 			// Vnet created — now cancel the parent ctx, simulating an abort
 			// from the upstream caller right before subnet create runs.
 			cancel()
@@ -1160,7 +1502,7 @@ func TestCreateNetwork_Concurrent_IdempotentOnExisting(t *testing.T) {
 			raw := sdkcluster.GetSdnVnetsResponse(`{"vnet":"shared","zone":"z"}`)
 			return &raw, nil
 		},
-		createSdnVnetsFn: func(_ context.Context, _ *sdkcluster.CreateSdnVnetsParams) error {
+		createSdnVnetsFn: func(_ context.Context, params *sdkcluster.CreateSdnVnetsParams) error {
 			createVnetCalls = append(createVnetCalls, struct{}{})
 			return nil
 		},
@@ -1227,7 +1569,7 @@ func TestCreateNetwork_ZoneAlreadyExists_NoError(t *testing.T) {
 		getSdnVnetsFn: func(_ context.Context, _ string, _ *sdkcluster.GetSdnVnetsParams) (*sdkcluster.GetSdnVnetsResponse, error) {
 			return nil, sdnNotFound()
 		},
-		createSdnVnetsFn: func(_ context.Context, _ *sdkcluster.CreateSdnVnetsParams) error {
+		createSdnVnetsFn: func(_ context.Context, params *sdkcluster.CreateSdnVnetsParams) error {
 			return nil
 		},
 		createSdnVnetsSubnetsFn: func(_ context.Context, _ string, _ *sdkcluster.CreateSdnVnetsSubnetsParams) error {

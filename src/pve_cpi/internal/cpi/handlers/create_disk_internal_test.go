@@ -4,25 +4,52 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
 )
 
+// buildResolverForStorage builds a layeredResolver from a call-level map and an
+// optional CPIConfig, for use in TestResolveStorage* cases. The call map is
+// built from storagePool and storage string args (empty string = key absent).
+func buildResolverForStorage(t *testing.T, storagePool, storage, configDiskStorage string, cfg *config.CPIConfig) *layeredResolver {
+	t.Helper()
+	callCP := map[string]any{}
+	if storagePool != "" {
+		callCP["storage_pool"] = storagePool
+	}
+	if storage != "" {
+		callCP["storage"] = storage
+	}
+	// Use supplied cfg or a minimal one that just carries DiskStorage.
+	if cfg == nil {
+		cfg = &config.CPIConfig{DiskStorage: configDiskStorage}
+	}
+	r, err := newLayeredResolver(callCP, cfg)
+	if err != nil {
+		t.Fatalf("newLayeredResolver: unexpected error: %v", err)
+	}
+	return r
+}
+
 // TestResolveStorage verifies the three-level precedence chain for storage
-// pool selection in create_disk:
+// pool selection in create_disk, now driven through resolveStorageLayered:
 //
-//  1. cloud_properties.storage_pool  (highest)
-//  2. cloud_properties.storage       (backward-compat alias)
-//  3. config.DiskStorage             (global default / lowest)
+//  1. r.String("storage_pool","storage") — per-call cloud_properties (highest)
+//  2. config.DiskStorage                 — global default / lowest
 //
 // Empty or whitespace-only values at any level are treated as unset and the
-// next level is consulted. All three levels empty → error.
+// next level is consulted. All levels empty → error.
+//
+// The 13 original cases are ported verbatim; the call map contains the
+// storage_pool / storage keys when non-empty, so the resolver sees them in
+// the call layer (layer 0). Global fallback is still configDiskStorage.
 func TestResolveStorage(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
 		name              string
-		storagePool       string // cloud_properties.storage_pool
-		storage           string // cloud_properties.storage (alias)
+		storagePool       string // cloud_properties.storage_pool (call layer)
+		storage           string // cloud_properties.storage (call layer alias)
 		configDiskStorage string // config.DiskStorage
 		wantStorage       string // expected resolved pool name; "" means expect error
 		wantErr           bool
@@ -69,6 +96,8 @@ func TestResolveStorage(t *testing.T) {
 			configDiskStorage: "",
 			wantErr:           true,
 		},
+		// Whitespace cases: the resolver's String() trims and skips whitespace-only
+		// values, so whitespace keys fall through exactly as before.
 		{
 			name:              "whitespace storage_pool treated as unset, falls through to alias",
 			storagePool:       "   ",
@@ -125,17 +154,26 @@ func TestResolveStorage(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			cloudProps := createDiskCloudProperties{
-				StoragePool: tc.storagePool,
-				Storage:     tc.storage,
+			// Build call map, passing whitespace values explicitly so the resolver
+			// can skip them (whitespace string key present, but String() trims+skips).
+			callCP := map[string]any{}
+			if tc.storagePool != "" {
+				callCP["storage_pool"] = tc.storagePool
+			}
+			if tc.storage != "" {
+				callCP["storage"] = tc.storage
+			}
+			cfg := &config.CPIConfig{DiskStorage: tc.configDiskStorage}
+			r, err := newLayeredResolver(callCP, cfg)
+			if err != nil {
+				t.Fatalf("newLayeredResolver: unexpected error: %v", err)
 			}
 
-			got, err := resolveStorage(cloudProps, tc.configDiskStorage)
+			got, err := resolveStorageLayered(r, tc.configDiskStorage)
 
 			if tc.wantErr {
 				if err == nil {
-					t.Fatalf("resolveStorage(%+v, %q): expected error, got nil (resolved %q)",
-						cloudProps, tc.configDiskStorage, got)
+					t.Fatalf("resolveStorageLayered: expected error, got nil (resolved %q)", got)
 				}
 				// Error must mention "storage" to be actionable for the operator.
 				if !strings.Contains(err.Error(), "storage") {
@@ -145,48 +183,202 @@ func TestResolveStorage(t *testing.T) {
 			}
 
 			if err != nil {
-				t.Fatalf("resolveStorage(%+v, %q): unexpected error: %v",
-					cloudProps, tc.configDiskStorage, err)
+				t.Fatalf("resolveStorageLayered: unexpected error: %v", err)
 			}
 			if got != tc.wantStorage {
-				t.Errorf("resolveStorage(%+v, %q) = %q, want %q",
-					cloudProps, tc.configDiskStorage, got, tc.wantStorage)
+				t.Errorf("resolveStorageLayered() = %q, want %q", got, tc.wantStorage)
 			}
 		})
 	}
 }
 
 // TestResolveStorage_StoragePoolAliasIndependence verifies that storage_pool
-// and storage are parsed as independent fields from distinct JSON keys. A
-// manifest setting only "storage_pool" must not influence "storage" and vice
-// versa — both keys must coexist without interference.
+// and storage are independent keys in the call map and do not bleed into each other.
 func TestResolveStorage_StoragePoolAliasIndependence(t *testing.T) {
 	t.Parallel()
 
-	// Only storage_pool set (storage absent / zero-value).
-	cpOnlyPool := createDiskCloudProperties{StoragePool: "pool-a"}
-	got, err := resolveStorage(cpOnlyPool, "fallback")
-	if err != nil || got != "pool-a" {
-		t.Errorf("only storage_pool set: got %q err %v, want pool-a nil", got, err)
+	// Only storage_pool set.
+	{
+		r := buildResolverForStorage(t, "pool-a", "", "fallback", nil)
+		got, err := resolveStorageLayered(r, "fallback")
+		if err != nil || got != "pool-a" {
+			t.Errorf("only storage_pool set: got %q err %v, want pool-a nil", got, err)
+		}
 	}
 
-	// Only storage (alias) set (storage_pool absent / zero-value).
-	cpOnlyAlias := createDiskCloudProperties{Storage: "pool-b"}
-	got, err = resolveStorage(cpOnlyAlias, "fallback")
-	if err != nil || got != "pool-b" {
-		t.Errorf("only storage alias set: got %q err %v, want pool-b nil", got, err)
+	// Only storage (alias) set.
+	{
+		r := buildResolverForStorage(t, "", "pool-b", "fallback", nil)
+		got, err := resolveStorageLayered(r, "fallback")
+		if err != nil || got != "pool-b" {
+			t.Errorf("only storage alias set: got %q err %v, want pool-b nil", got, err)
+		}
 	}
 
 	// Both set: storage_pool must win.
-	cpBoth := createDiskCloudProperties{StoragePool: "pool-a", Storage: "pool-b"}
-	got, err = resolveStorage(cpBoth, "fallback")
-	if err != nil || got != "pool-a" {
-		t.Errorf("both set: got %q err %v, want pool-a nil", got, err)
+	{
+		r := buildResolverForStorage(t, "pool-a", "pool-b", "fallback", nil)
+		got, err := resolveStorageLayered(r, "fallback")
+		if err != nil || got != "pool-a" {
+			t.Errorf("both set: got %q err %v, want pool-a nil", got, err)
+		}
+	}
+}
+
+// TestResolveStorage_DiskTypeProfileSuppliesPool verifies that when the call map
+// carries no storage keys, a disk_type profile with storage_pool is used.
+func TestResolveStorage_DiskTypeProfileSuppliesPool(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.CPIConfig{
+		DiskStorage: "global-pool",
+		DiskTypes: map[string]config.TypeProfile{
+			"fast": {
+				CloudProperties: map[string]any{
+					"storage_pool": "ssd-pool",
+				},
+			},
+		},
+	}
+	callCP := map[string]any{
+		"disk_type": "fast",
+		// no storage_pool/storage in call
+	}
+	r, err := newLayeredResolver(callCP, cfg)
+	if err != nil {
+		t.Fatalf("newLayeredResolver: %v", err)
+	}
+
+	got, err := resolveStorageLayered(r, cfg.DiskStorage)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != "ssd-pool" {
+		t.Errorf("disk_type profile storage_pool: got %q, want ssd-pool", got)
+	}
+}
+
+// TestResolveStorage_VMTypeProfileSuppliesPool verifies that when neither call
+// nor disk_type profile supplies a storage key, the vm_type profile is used.
+func TestResolveStorage_VMTypeProfileSuppliesPool(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.CPIConfig{
+		DiskStorage: "global-pool",
+		VMTypes: map[string]config.TypeProfile{
+			"standard": {
+				CloudProperties: map[string]any{
+					"storage_pool": "vm-pool",
+				},
+			},
+		},
+	}
+	callCP := map[string]any{
+		"vm_type": "standard",
+	}
+	r, err := newLayeredResolver(callCP, cfg)
+	if err != nil {
+		t.Fatalf("newLayeredResolver: %v", err)
+	}
+
+	got, err := resolveStorageLayered(r, cfg.DiskStorage)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != "vm-pool" {
+		t.Errorf("vm_type profile storage_pool: got %q, want vm-pool", got)
+	}
+}
+
+// TestResolveStorage_DiskTypeBeatsVMType verifies disk_type profile takes
+// precedence over vm_type profile when both supply storage_pool.
+func TestResolveStorage_DiskTypeBeatsVMType(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.CPIConfig{
+		DiskTypes: map[string]config.TypeProfile{
+			"fast": {CloudProperties: map[string]any{"storage_pool": "disk-ssd"}},
+		},
+		VMTypes: map[string]config.TypeProfile{
+			"large": {CloudProperties: map[string]any{"storage_pool": "vm-hdd"}},
+		},
+	}
+	callCP := map[string]any{
+		"disk_type": "fast",
+		"vm_type":   "large",
+	}
+	r, err := newLayeredResolver(callCP, cfg)
+	if err != nil {
+		t.Fatalf("newLayeredResolver: %v", err)
+	}
+
+	got, err := resolveStorageLayered(r, "global")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != "disk-ssd" {
+		t.Errorf("disk_type beats vm_type: got %q, want disk-ssd", got)
+	}
+}
+
+// TestResolveStorage_CallBeatsProfiles verifies that an explicit storage_pool
+// in the call map wins over both disk_type and vm_type profiles.
+func TestResolveStorage_CallBeatsProfiles(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.CPIConfig{
+		DiskTypes: map[string]config.TypeProfile{
+			"fast": {CloudProperties: map[string]any{"storage_pool": "disk-ssd"}},
+		},
+		VMTypes: map[string]config.TypeProfile{
+			"large": {CloudProperties: map[string]any{"storage_pool": "vm-hdd"}},
+		},
+	}
+	callCP := map[string]any{
+		"storage_pool": "call-explicit",
+		"disk_type":    "fast",
+		"vm_type":      "large",
+	}
+	r, err := newLayeredResolver(callCP, cfg)
+	if err != nil {
+		t.Fatalf("newLayeredResolver: %v", err)
+	}
+
+	got, err := resolveStorageLayered(r, "global")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != "call-explicit" {
+		t.Errorf("call beats profiles: got %q, want call-explicit", got)
+	}
+}
+
+// TestResolveStorage_UnknownDiskTypeSelector verifies that an unknown disk_type
+// selector in the call map causes newLayeredResolver to return a CloudError
+// before resolveStorageLayered is ever reached.
+func TestResolveStorage_UnknownDiskTypeSelector(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.CPIConfig{
+		DiskTypes: map[string]config.TypeProfile{
+			"fast": {CloudProperties: map[string]any{"storage_pool": "ssd-pool"}},
+		},
+	}
+	callCP := map[string]any{
+		"disk_type": "nonexistent",
+	}
+
+	_, err := newLayeredResolver(callCP, cfg)
+	if err == nil {
+		t.Fatal("expected CloudError for unknown disk_type selector, got nil")
+	}
+	if !strings.Contains(err.Error(), "nonexistent") {
+		t.Errorf("error should mention unknown selector name, got: %v", err)
 	}
 }
 
 // ---------------------------------------------------------------------------
-// IMP-A1: createDiskCloudProperties.AvailabilityZone → DiskCIDMeta.AZ
+// createDiskCloudProperties.AvailabilityZone → DiskCIDMeta.AZ
 // ---------------------------------------------------------------------------
 
 // TestCreateDiskCloudProperties_AZField_ParsedFromJSON verifies that the
@@ -328,4 +520,3 @@ func TestHandleCreateDisk_NoAZ_BackwardCompatCID(t *testing.T) {
 		t.Errorf("meta.AZ = %q; want empty string when cloud_properties.availability_zone not set", meta.AZ)
 	}
 }
-

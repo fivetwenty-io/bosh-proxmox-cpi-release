@@ -44,16 +44,6 @@ func parseNetworkSpec(raw json.RawMessage) (*networkSpec, error) {
 	return &spec, nil
 }
 
-// cpStr extracts a string cloud_property by key; returns "" when absent or non-string.
-func cpStr(cp map[string]any, key string) string {
-	v, ok := cp[key]
-	if !ok {
-		return ""
-	}
-	s, _ := v.(string)
-	return s
-}
-
 // validateVnetName returns cpierrors.Cloud when name is invalid per PVE rules.
 func validateVnetName(name string) error {
 	if name == "" {

@@ -3681,3 +3681,212 @@ func baseConfigJSON(extra string) string {
 		"network_bridge": "vmbr0"` + comma + extra + `
 	}`
 }
+
+// --------------------------------------------------------------------------
+// TestLoad_VMTypes_RoundTrip
+// --------------------------------------------------------------------------
+
+// TestLoad_VMTypes_RoundTrip verifies that vm_types loaded from JSON are
+// preserved through Load and that the omit-when-empty contract holds: an
+// absent vm_types key leaves the field nil (Go zero-value).
+func TestLoad_VMTypes_RoundTrip(t *testing.T) {
+	t.Parallel()
+
+	t.Run("present", func(t *testing.T) {
+		cfg, err := mustLoad(t, `{
+			"host":"h","user":"u","password":"p",
+			"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+			"vm_types": {
+				"large": {"cloud_properties": {"cpu": 8, "ram": 16384}},
+				"small": {"cloud_properties": {"cpu": 2, "ram": 2048}}
+			}
+		}`)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(cfg.VMTypes) != 2 {
+			t.Errorf("VMTypes len = %d, want 2", len(cfg.VMTypes))
+		}
+		large, ok := cfg.VMTypes["large"]
+		if !ok {
+			t.Fatal("VMTypes missing 'large'")
+		}
+		if large.CloudProperties == nil {
+			t.Error("large.CloudProperties is nil, want non-nil")
+		}
+		if cpu, _ := large.CloudProperties["cpu"].(float64); int(cpu) != 8 {
+			t.Errorf("large.CloudProperties[cpu] = %v, want 8", large.CloudProperties["cpu"])
+		}
+	})
+
+	t.Run("absent — nil map", func(t *testing.T) {
+		cfg, err := mustLoad(t, `{
+			"host":"h","user":"u","password":"p",
+			"vm_storage":"s","disk_storage":"s","network_bridge":"br"
+		}`)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.VMTypes != nil {
+			t.Errorf("VMTypes = %v, want nil when absent", cfg.VMTypes)
+		}
+	})
+}
+
+// --------------------------------------------------------------------------
+// TestLoad_DiskTypes_RoundTrip
+// --------------------------------------------------------------------------
+
+// TestLoad_DiskTypes_RoundTrip verifies that disk_types loaded from JSON are
+// preserved through Load and that the omit-when-empty contract holds.
+func TestLoad_DiskTypes_RoundTrip(t *testing.T) {
+	t.Parallel()
+
+	t.Run("present", func(t *testing.T) {
+		cfg, err := mustLoad(t, `{
+			"host":"h","user":"u","password":"p",
+			"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+			"disk_types": {
+				"ssd": {"cloud_properties": {"storage": "local-ssd"}},
+				"archive": {"cloud_properties": {"storage": "bulk-pool"}}
+			}
+		}`)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(cfg.DiskTypes) != 2 {
+			t.Errorf("DiskTypes len = %d, want 2", len(cfg.DiskTypes))
+		}
+		ssd, ok := cfg.DiskTypes["ssd"]
+		if !ok {
+			t.Fatal("DiskTypes missing 'ssd'")
+		}
+		if ssd.CloudProperties["storage"] != "local-ssd" {
+			t.Errorf("ssd.CloudProperties[storage] = %v, want %q", ssd.CloudProperties["storage"], "local-ssd")
+		}
+	})
+
+	t.Run("absent — nil map", func(t *testing.T) {
+		cfg, err := mustLoad(t, `{
+			"host":"h","user":"u","password":"p",
+			"vm_storage":"s","disk_storage":"s","network_bridge":"br"
+		}`)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.DiskTypes != nil {
+			t.Errorf("DiskTypes = %v, want nil when absent", cfg.DiskTypes)
+		}
+	})
+}
+
+// --------------------------------------------------------------------------
+// TestLoad_StorageTiers_RoundTrip
+// --------------------------------------------------------------------------
+
+// TestLoad_StorageTiers_RoundTrip verifies that storage_tiers loaded from JSON
+// are preserved through Load and that the omit-when-empty contract holds.
+func TestLoad_StorageTiers_RoundTrip(t *testing.T) {
+	t.Parallel()
+
+	t.Run("present with types and shared", func(t *testing.T) {
+		cfg, err := mustLoad(t, `{
+			"host":"h","user":"u","password":"p",
+			"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+			"storage_tiers": {
+				"fast": {"types": ["lvmthin","rbd"], "shared": true},
+				"local": {"types": ["dir","lvm"], "shared": false}
+			}
+		}`)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(cfg.StorageTiers) != 2 {
+			t.Errorf("StorageTiers len = %d, want 2", len(cfg.StorageTiers))
+		}
+		fast, ok := cfg.StorageTiers["fast"]
+		if !ok {
+			t.Fatal("StorageTiers missing 'fast'")
+		}
+		if len(fast.Types) != 2 || fast.Types[0] != "lvmthin" {
+			t.Errorf("fast.Types = %v, want [lvmthin rbd]", fast.Types)
+		}
+		if fast.Shared == nil || !*fast.Shared {
+			t.Error("fast.Shared = nil or false, want *true")
+		}
+		local, ok := cfg.StorageTiers["local"]
+		if !ok {
+			t.Fatal("StorageTiers missing 'local'")
+		}
+		if local.Shared == nil || *local.Shared {
+			t.Error("local.Shared = nil or true, want *false")
+		}
+	})
+
+	t.Run("invalid type rejected", func(t *testing.T) {
+		_, err := mustLoad(t, `{
+			"host":"h","user":"u","password":"p",
+			"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+			"storage_tiers": {"bad": {"types": ["xfs"]}}
+		}`)
+		if err == nil {
+			t.Fatal("expected validation error for unknown storage type")
+		}
+		if !strings.Contains(err.Error(), "storage_tiers") {
+			t.Errorf("error %q does not mention storage_tiers", err.Error())
+		}
+	})
+
+	t.Run("absent — nil map", func(t *testing.T) {
+		cfg, err := mustLoad(t, `{
+			"host":"h","user":"u","password":"p",
+			"vm_storage":"s","disk_storage":"s","network_bridge":"br"
+		}`)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.StorageTiers != nil {
+			t.Errorf("StorageTiers = %v, want nil when absent", cfg.StorageTiers)
+		}
+	})
+}
+
+// --------------------------------------------------------------------------
+// TestLoad_SecurityGroups_RoundTrip
+// --------------------------------------------------------------------------
+
+// TestLoad_SecurityGroups_RoundTrip verifies that security_groups loaded from
+// JSON are preserved through Load and that the omit-when-empty contract holds.
+func TestLoad_SecurityGroups_RoundTrip(t *testing.T) {
+	t.Parallel()
+
+	t.Run("present", func(t *testing.T) {
+		cfg, err := mustLoad(t, `{
+			"host":"h","user":"u","password":"p",
+			"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+			"security_groups": ["web-dmz", "bosh-vms"]
+		}`)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(cfg.SecurityGroups) != 2 {
+			t.Errorf("SecurityGroups len = %d, want 2", len(cfg.SecurityGroups))
+		}
+		if cfg.SecurityGroups[0] != "web-dmz" || cfg.SecurityGroups[1] != "bosh-vms" {
+			t.Errorf("SecurityGroups = %v, want [web-dmz bosh-vms]", cfg.SecurityGroups)
+		}
+	})
+
+	t.Run("absent — nil slice", func(t *testing.T) {
+		cfg, err := mustLoad(t, `{
+			"host":"h","user":"u","password":"p",
+			"vm_storage":"s","disk_storage":"s","network_bridge":"br"
+		}`)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.SecurityGroups != nil {
+			t.Errorf("SecurityGroups = %v, want nil when absent", cfg.SecurityGroups)
+		}
+	})
+}

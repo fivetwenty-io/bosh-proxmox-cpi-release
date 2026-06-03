@@ -138,8 +138,15 @@ type vmMockNodes struct {
 	deleteQemuCalls      []vmDeleteQemuCall
 	createQemuCloneCalls []vmCreateQemuCloneCall
 
-	updateConfigFn func(ctx context.Context, node, vmid string, params *sdknodes.UpdateQemuConfigParams) error
-	deleteQemuFn   func(ctx context.Context, node, vmid string, params *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error)
+	// firewallRuleActions records "<type>:<action>" for each CreateQemuFirewallRules call.
+	firewallRuleActions []string
+	// firewallEnableOptCalls counts UpdateQemuFirewallOptions calls with Enable=true.
+	firewallEnableOptCalls int
+
+	updateConfigFn              func(ctx context.Context, node, vmid string, params *sdknodes.UpdateQemuConfigParams) error
+	deleteQemuFn                func(ctx context.Context, node, vmid string, params *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error)
+	createQemuFirewallRulesFn   func(ctx context.Context, node, vmid string, params *sdknodes.CreateQemuFirewallRulesParams) error
+	updateQemuFirewallOptionsFn func(ctx context.Context, node, vmid string, params *sdknodes.UpdateQemuFirewallOptionsParams) error
 	// listVersionFn, when non-nil, is called by ListVersion. Tests that exercise
 	// ensureDLBMembership set this to control the PVE version reported. When nil,
 	// ListVersion returns a response with version "0.0" so the DLB version guard
@@ -235,14 +242,39 @@ func (m *vmMockNodes) ListVersion(ctx context.Context, node string) (*sdknodes.L
 	return &sdknodes.ListVersionResponse{Version: v}, nil
 }
 
+// CreateQemuFirewallRules records rule calls; delegates to fn when set.
+// Default: success (no error) — tests that do not exercise firewall rules pass
+// without configuration.
+func (m *vmMockNodes) CreateQemuFirewallRules(_ context.Context, _ string, _ string, p *sdknodes.CreateQemuFirewallRulesParams) error {
+	if m.createQemuFirewallRulesFn != nil {
+		return m.createQemuFirewallRulesFn(context.Background(), "", "", p)
+	}
+	m.firewallRuleActions = append(m.firewallRuleActions, p.Type+":"+p.Action)
+	return nil
+}
+
+// UpdateQemuFirewallOptions counts enable calls; delegates to fn when set.
+// Default: success — tests not focused on firewall enable pass without configuration.
+func (m *vmMockNodes) UpdateQemuFirewallOptions(_ context.Context, _ string, _ string, p *sdknodes.UpdateQemuFirewallOptionsParams) error {
+	if m.updateQemuFirewallOptionsFn != nil {
+		return m.updateQemuFirewallOptionsFn(context.Background(), "", "", p)
+	}
+	if p.Enable != nil && *p.Enable {
+		m.firewallEnableOptCalls++
+	}
+	return nil
+}
+
 // vmMockCluster satisfies cluster.Service for create_vm tests.
 // ListResources is used by AllocateWithRetry (NextVMID) and detectIPConflict.
 // ListStatus is used by placement.GatherNodeFacts when PlacementEnabled()==true.
+// ListFirewallGroups is used by applySecurityGroups / listFirewallGroupNames.
 type vmMockCluster struct {
 	sdkcluster.Service // embed nil — panics on unmocked calls
 
-	listResourcesFn func(ctx context.Context, params *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error)
-	listStatusFn    func(ctx context.Context) (*sdkcluster.ListStatusResponse, error)
+	listResourcesFn      func(ctx context.Context, params *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error)
+	listStatusFn         func(ctx context.Context) (*sdkcluster.ListStatusResponse, error)
+	listFirewallGroupsFn func() (*sdkcluster.ListFirewallGroupsResponse, error)
 }
 
 func (m *vmMockCluster) ListResources(ctx context.Context, params *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
@@ -276,6 +308,17 @@ func (m *vmMockCluster) ListHaStatusCurrent(_ context.Context) (*sdkcluster.List
 	// Default: no nodes in HA maintenance. Tests that need HA-maintenance behavior
 	// must override via a custom cluster mock.
 	empty := sdkcluster.ListHaStatusCurrentResponse{}
+	return &empty, nil
+}
+
+// listFirewallGroupsFn, when non-nil, is called by ListFirewallGroups. When nil,
+// returns an empty groups response so tests that do not exercise firewall group
+// attachment do not receive unexpected call panics.
+func (m *vmMockCluster) ListFirewallGroups(_ context.Context) (*sdkcluster.ListFirewallGroupsResponse, error) {
+	if m.listFirewallGroupsFn != nil {
+		return m.listFirewallGroupsFn()
+	}
+	empty := sdkcluster.ListFirewallGroupsResponse{}
 	return &empty, nil
 }
 
@@ -1391,7 +1434,7 @@ func TestHandleCreateVM_LightStemcellCID_StripsPrefix(t *testing.T) {
 }
 
 // --------------------------------------------------------------------------
-// Template-CID dispatch tests (IMP-12/IMP-16)
+// Template-CID dispatch tests
 // --------------------------------------------------------------------------
 
 // buildVMDepsForTemplate constructs Deps with cluster storage + single-node
@@ -1629,7 +1672,7 @@ func TestCreateVM_TemplateCID_CrossNode_Shared_SetsTarget(t *testing.T) {
 }
 
 // TestCreateVM_TemplateCID_CrossNode_Local_Error verifies that a template CID
-// with local storage and nodes that differ returns a D-06 error and does not
+// with local storage and nodes that differ returns a cross-node local-storage error and does not
 // call CreateQemuClone.
 func TestCreateVM_TemplateCID_CrossNode_Local_Error(t *testing.T) {
 	t.Parallel()
@@ -1649,13 +1692,13 @@ func TestCreateVM_TemplateCID_CrossNode_Local_Error(t *testing.T) {
 
 	_, err := h.Handle(context.Background(), args, mkCtx("crossnode-local"))
 	if err == nil {
-		t.Fatal("cross-node+local: expected D-06 error, got nil")
+		t.Fatal("cross-node+local: expected cross-node local-storage error, got nil")
 	}
 	if !strings.Contains(err.Error(), "local") && !strings.Contains(err.Error(), "node") {
 		t.Errorf("cross-node+local: error lacks actionable context: %v", err)
 	}
 	if len(n.createQemuCloneCalls) != 0 {
-		t.Errorf("cross-node+local: CreateQemuClone must not be called on D-06 violation, got %d calls", len(n.createQemuCloneCalls))
+		t.Errorf("cross-node+local: CreateQemuClone must not be called on cross-node local-storage violation, got %d calls", len(n.createQemuCloneCalls))
 	}
 }
 
@@ -1735,7 +1778,7 @@ func TestCreateVM_TemplateCID_CloneConflict_Retries(t *testing.T) {
 }
 
 // --------------------------------------------------------------------------
-// Old-CID opportunistic template dispatch tests (D-07 / D-08)
+// Old-CID opportunistic template dispatch tests
 // --------------------------------------------------------------------------
 
 // testStemcellCIDWithSHA is a stemcell CID whose filename contains a known sha8
@@ -2741,6 +2784,242 @@ func TestCreateVM_UnknownAZ_NotSentinel_CloudError(t *testing.T) {
 	}
 }
 
+// --------------------------------------------------------------------------
+// VM-storage cloud_properties / vm_type profile resolution
+// --------------------------------------------------------------------------
+
+// buildVMDepsWithVMTypes constructs Deps including VMTypes map for profile tests.
+func buildVMDepsWithVMTypes(q *vmMockQEMU, n *vmMockNodes, c *vmMockCluster, a *vmMockAgent, vmTypes map[string]config.TypeProfile) handlers.Deps {
+	return handlers.Deps{
+		Config: &config.CPIConfig{
+			Node:                "pve",
+			VMStorage:           storageName,
+			NetworkBridge:       "vmbr0",
+			VMIDRangeStart:      100,
+			Placement:           &config.PlacementConfig{Enabled: placementDisabled},
+			EnsureNoIPConflicts: placementDisabled,
+			VMTypes:             vmTypes,
+		},
+		PVE: &mockPVEClient{
+			qemuSvc:    q,
+			nodesSvc:   n,
+			clusterSvc: c,
+			tasksSvc: &mockTasksService{
+				waitFn: func(_ context.Context, _, _ string, _ *sdktasks.WaitOptions) (*sdktasks.Status, error) {
+					return &sdktasks.Status{ExitStatus: "OK"}, nil
+				},
+			},
+		},
+		Agent:  a,
+		Logger: log.NewNopLogger(),
+	}
+}
+
+// defaultNetMap returns a minimal single-network args[3] for create_vm tests.
+func defaultNetMap() map[string]any {
+	return map[string]any{
+		"default": map[string]any{
+			"type": "manual", "ip": "10.0.0.5",
+			"netmask": "255.255.255.0", "gateway": "10.0.0.1",
+			"dns": []string{"8.8.8.8"}, "default": []string{"dns", "gateway"},
+			"cloud_properties": map[string]any{"bridge": "vmbr0"},
+		},
+	}
+}
+
+// TestCreateVM_NoProfile_StorageFromConfig verifies that with no vm_type selector
+// and no storage_pool in cloud_properties, vmStorage equals config.VMStorage.
+func TestCreateVM_NoProfile_StorageFromConfig(t *testing.T) {
+	t.Parallel()
+
+	var capturedParams map[string]any
+	q := &vmMockQEMU{
+		createFn: func(_ context.Context, _ string, params map[string]any) (string, error) {
+			capturedParams = params
+			return "UPID:pve:create:ok", nil
+		},
+	}
+	h := handlers.HandleCreateVM(buildVMDepsWithVMTypes(q, &vmMockNodes{}, &vmMockCluster{}, &vmMockAgent{}, nil))
+
+	args := mkArgs("agent-1", testStemcellCID,
+		map[string]any{"cores": 1, "memory": 512},
+		defaultNetMap(), []string{}, map[string]any{})
+
+	if _, err := h.Handle(context.Background(), args, mkCtx("no-profile")); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	virtio0, _ := capturedParams["virtio0"].(string)
+	// storage= in virtio0 string must be storageName (config.VMStorage).
+	if !strings.Contains(virtio0, storageName) {
+		t.Errorf("virtio0 %q must contain config.VMStorage %q", virtio0, storageName)
+	}
+}
+
+// TestCreateVM_CallCP_StoragePool_OverridesConfig verifies that
+// cloud_properties.storage_pool overrides config.VMStorage in the QEMU create call.
+func TestCreateVM_CallCP_StoragePool_OverridesConfig(t *testing.T) {
+	t.Parallel()
+
+	var capturedParams map[string]any
+	q := &vmMockQEMU{
+		createFn: func(_ context.Context, _ string, params map[string]any) (string, error) {
+			capturedParams = params
+			return "UPID:pve:create:ok", nil
+		},
+	}
+	h := handlers.HandleCreateVM(buildVMDepsWithVMTypes(q, &vmMockNodes{}, &vmMockCluster{}, &vmMockAgent{}, nil))
+
+	args := mkArgs("agent-2", testStemcellCID,
+		map[string]any{"cores": 1, "memory": 512, "storage_pool": "override-pool"},
+		defaultNetMap(), []string{}, map[string]any{})
+
+	if _, err := h.Handle(context.Background(), args, mkCtx("call-cp-storage")); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	virtio0, _ := capturedParams["virtio0"].(string)
+	if !strings.Contains(virtio0, "override-pool") {
+		t.Errorf("virtio0 %q: expected override-pool; got config/default pool instead", virtio0)
+	}
+}
+
+// TestCreateVM_VMTypeProfile_StoragePool verifies that a vm_type profile
+// supplying storage_pool is used when the call has no storage_pool override.
+func TestCreateVM_VMTypeProfile_StoragePool(t *testing.T) {
+	t.Parallel()
+
+	var capturedParams map[string]any
+	q := &vmMockQEMU{
+		createFn: func(_ context.Context, _ string, params map[string]any) (string, error) {
+			capturedParams = params
+			return "UPID:pve:create:ok", nil
+		},
+	}
+
+	vmTypes := map[string]config.TypeProfile{
+		"gpu": {
+			CloudProperties: map[string]any{
+				"storage_pool": "ceph-ssd",
+			},
+		},
+	}
+	h := handlers.HandleCreateVM(buildVMDepsWithVMTypes(q, &vmMockNodes{}, &vmMockCluster{}, &vmMockAgent{}, vmTypes))
+
+	args := mkArgs("agent-3", testStemcellCID,
+		map[string]any{"cores": 2, "memory": 4096, "vm_type": "gpu"},
+		defaultNetMap(), []string{}, map[string]any{})
+
+	if _, err := h.Handle(context.Background(), args, mkCtx("vmtype-profile")); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	virtio0, _ := capturedParams["virtio0"].(string)
+	if !strings.Contains(virtio0, "ceph-ssd") {
+		t.Errorf("virtio0 %q: expected ceph-ssd from vm_type profile", virtio0)
+	}
+}
+
+// TestCreateVM_CallStoragePool_BeatsVMTypeProfile verifies that an explicit
+// storage_pool in the call beats the vm_type profile's storage_pool.
+func TestCreateVM_CallStoragePool_BeatsVMTypeProfile(t *testing.T) {
+	t.Parallel()
+
+	var capturedParams map[string]any
+	q := &vmMockQEMU{
+		createFn: func(_ context.Context, _ string, params map[string]any) (string, error) {
+			capturedParams = params
+			return "UPID:pve:create:ok", nil
+		},
+	}
+
+	vmTypes := map[string]config.TypeProfile{
+		"gpu": {
+			CloudProperties: map[string]any{
+				"storage_pool": "ceph-ssd",
+			},
+		},
+	}
+	h := handlers.HandleCreateVM(buildVMDepsWithVMTypes(q, &vmMockNodes{}, &vmMockCluster{}, &vmMockAgent{}, vmTypes))
+
+	args := mkArgs("agent-4", testStemcellCID,
+		map[string]any{"cores": 2, "memory": 4096, "vm_type": "gpu", "storage_pool": "nvme-fast"},
+		defaultNetMap(), []string{}, map[string]any{})
+
+	if _, err := h.Handle(context.Background(), args, mkCtx("call-beats-profile")); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	virtio0, _ := capturedParams["virtio0"].(string)
+	if !strings.Contains(virtio0, "nvme-fast") {
+		t.Errorf("virtio0 %q: expected nvme-fast (call beats vm_type profile)", virtio0)
+	}
+	if strings.Contains(virtio0, "ceph-ssd") {
+		t.Errorf("virtio0 %q: must NOT contain profile pool ceph-ssd when call overrides", virtio0)
+	}
+}
+
+// TestCreateVM_UnknownVMType_ReturnsCloudError verifies that an unknown vm_type
+// selector returns a CloudError from create_vm without creating a VM.
+func TestCreateVM_UnknownVMType_ReturnsCloudError(t *testing.T) {
+	t.Parallel()
+
+	q := &vmMockQEMU{}
+	h := handlers.HandleCreateVM(buildVMDepsWithVMTypes(q, &vmMockNodes{}, &vmMockCluster{}, &vmMockAgent{},
+		map[string]config.TypeProfile{}))
+
+	args := mkArgs("agent-5", testStemcellCID,
+		map[string]any{"vm_type": "does-not-exist"},
+		defaultNetMap(), []string{}, map[string]any{})
+
+	_, err := h.Handle(context.Background(), args, mkCtx("unknown-vmtype"))
+	if err == nil {
+		t.Fatal("expected CloudError for unknown vm_type; got nil")
+	}
+	if !isCloudError(err) {
+		t.Errorf("expected CloudError, got %T: %v", err, err)
+	}
+	if len(q.createCalls) != 0 {
+		t.Errorf("expected no QEMU.Create calls on CloudError; got %d", len(q.createCalls))
+	}
+}
+
+// TestCreateVM_VMTypeProfile_DiskFormat verifies that vm_disk_format from a
+// vm_type profile is applied to the virtio0 disk format parameter.
+func TestCreateVM_VMTypeProfile_DiskFormat(t *testing.T) {
+	t.Parallel()
+
+	var capturedParams map[string]any
+	q := &vmMockQEMU{
+		createFn: func(_ context.Context, _ string, params map[string]any) (string, error) {
+			capturedParams = params
+			return "UPID:pve:create:ok", nil
+		},
+	}
+
+	vmTypes := map[string]config.TypeProfile{
+		"raw-vm": {
+			CloudProperties: map[string]any{
+				"vm_disk_format": "raw",
+			},
+		},
+	}
+	h := handlers.HandleCreateVM(buildVMDepsWithVMTypes(q, &vmMockNodes{}, &vmMockCluster{}, &vmMockAgent{}, vmTypes))
+
+	args := mkArgs("agent-6", testStemcellCID,
+		map[string]any{"cores": 1, "memory": 512, "vm_type": "raw-vm"},
+		defaultNetMap(), []string{}, map[string]any{})
+
+	if _, err := h.Handle(context.Background(), args, mkCtx("profile-diskfmt")); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	virtio0, _ := capturedParams["virtio0"].(string)
+	if !strings.Contains(virtio0, "format=raw") {
+		t.Errorf("virtio0 %q: expected format=raw from vm_type profile", virtio0)
+	}
+}
+
 // TestCreateVM_RealAZMap_Restricted_WithDLBConfigured verifies that when DLB is
 // configured but a real az_map zone is used, placement scoring still restricts
 // candidates to mapped nodes (master-flag-on + AZ topology unchanged).
@@ -2781,5 +3060,290 @@ func TestCreateVM_RealAZMap_Restricted_WithDLBConfigured(t *testing.T) {
 	}
 	if createNode != "pve2" {
 		t.Errorf("expected pve2 (only node in zone-b), got %q", createNode)
+	}
+}
+
+// --------------------------------------------------------------------------
+// Firewall + security-group resolution end-to-end tests
+// --------------------------------------------------------------------------
+
+// firewallGroupsClusterFn builds a listFirewallGroupsFn that reports groups as present.
+func firewallGroupsClusterFn(groups ...string) func() (*sdkcluster.ListFirewallGroupsResponse, error) {
+	return func() (*sdkcluster.ListFirewallGroupsResponse, error) {
+		resp := make(sdkcluster.ListFirewallGroupsResponse, 0, len(groups))
+		for _, g := range groups {
+			raw, _ := json.Marshal(map[string]any{"group": g})
+			resp = append(resp, raw)
+		}
+		return &resp, nil
+	}
+}
+
+// buildVMDepsFirewall builds Deps with optional VMTypes, DiskTypes, SecurityGroups,
+// and VMFirewall for firewall-resolution e2e tests.
+type vmFirewallDepsOpts struct {
+	vmTypes        map[string]config.TypeProfile
+	securityGroups []string
+	vmFirewall     *bool
+}
+
+func buildVMDepsFirewall(q *vmMockQEMU, n *vmMockNodes, c *vmMockCluster, a *vmMockAgent, opts vmFirewallDepsOpts) handlers.Deps {
+	return handlers.Deps{
+		Config: &config.CPIConfig{
+			Node:                "pve",
+			VMStorage:           storageName,
+			NetworkBridge:       "vmbr0",
+			VMIDRangeStart:      100,
+			Placement:           &config.PlacementConfig{Enabled: placementDisabled},
+			EnsureNoIPConflicts: placementDisabled,
+			VMTypes:             opts.vmTypes,
+			SecurityGroups:      opts.securityGroups,
+			VMFirewall:          opts.vmFirewall,
+		},
+		PVE: &mockPVEClient{
+			qemuSvc:    q,
+			nodesSvc:   n,
+			clusterSvc: c,
+			tasksSvc: &mockTasksService{
+				waitFn: func(_ context.Context, _, _ string, _ *sdktasks.WaitOptions) (*sdktasks.Status, error) {
+					return &sdktasks.Status{ExitStatus: "OK"}, nil
+				},
+			},
+		},
+		Agent:  a,
+		Logger: log.NewNopLogger(),
+	}
+}
+
+// TestCreateVM_NoGroupsNoFirewall_ZeroFirewallAPICalls is the critical no-op proof:
+// nil VMFirewall + no SecurityGroups + no profile => zero firewall API calls.
+func TestCreateVM_NoGroupsNoFirewall_ZeroFirewallAPICalls(t *testing.T) {
+	t.Parallel()
+	q := &vmMockQEMU{}
+	n := &vmMockNodes{}
+	c := &vmMockCluster{} // no listFirewallGroupsFn — if called would return empty, but should not be called at all
+	a := &vmMockAgent{}
+	h := handlers.HandleCreateVM(buildVMDepsFirewall(q, n, c, a, vmFirewallDepsOpts{}))
+
+	args := mkArgs("agent-noop", testStemcellCID,
+		map[string]any{"cores": 1, "memory": 512},
+		defaultNetMap(), []string{}, map[string]any{})
+
+	if _, err := h.Handle(context.Background(), args, mkCtx("noop-fw")); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(n.firewallRuleActions) != 0 {
+		t.Errorf("no firewall rule calls expected; got %v", n.firewallRuleActions)
+	}
+	if n.firewallEnableOptCalls != 0 {
+		t.Errorf("no firewall enable calls expected; got %d", n.firewallEnableOptCalls)
+	}
+}
+
+// TestCreateVM_CallSecurityGroups_AppliedAsToday verifies per-call security_groups
+// are applied (regression guard for existing behavior).
+func TestCreateVM_CallSecurityGroups_AppliedAsToday(t *testing.T) {
+	t.Parallel()
+	q := &vmMockQEMU{}
+	n := &vmMockNodes{}
+	c := &vmMockCluster{listFirewallGroupsFn: firewallGroupsClusterFn("web")}
+	a := &vmMockAgent{}
+	h := handlers.HandleCreateVM(buildVMDepsFirewall(q, n, c, a, vmFirewallDepsOpts{}))
+
+	args := mkArgs("agent-sg-call", testStemcellCID,
+		map[string]any{"cores": 1, "memory": 512, "security_groups": []any{"web"}},
+		defaultNetMap(), []string{}, map[string]any{})
+
+	if _, err := h.Handle(context.Background(), args, mkCtx("sg-call")); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(n.firewallRuleActions) != 1 || n.firewallRuleActions[0] != "group:web" {
+		t.Errorf("firewallRuleActions = %v; want [group:web]", n.firewallRuleActions)
+	}
+	if n.firewallEnableOptCalls != 1 {
+		t.Errorf("firewallEnableOptCalls = %d; want 1", n.firewallEnableOptCalls)
+	}
+}
+
+// TestCreateVM_VMTypeProfileSecurityGroups verifies vm_type profile security_groups
+// are applied when the per-call list is empty.
+func TestCreateVM_VMTypeProfileSecurityGroups(t *testing.T) {
+	t.Parallel()
+	q := &vmMockQEMU{}
+	n := &vmMockNodes{}
+	c := &vmMockCluster{listFirewallGroupsFn: firewallGroupsClusterFn("db")}
+	a := &vmMockAgent{}
+	vmTypes := map[string]config.TypeProfile{
+		"secured": {CloudProperties: map[string]any{"security_groups": []any{"db"}}},
+	}
+	h := handlers.HandleCreateVM(buildVMDepsFirewall(q, n, c, a, vmFirewallDepsOpts{vmTypes: vmTypes}))
+
+	args := mkArgs("agent-sg-profile", testStemcellCID,
+		map[string]any{"cores": 1, "memory": 512, "vm_type": "secured"},
+		defaultNetMap(), []string{}, map[string]any{})
+
+	if _, err := h.Handle(context.Background(), args, mkCtx("sg-profile")); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(n.firewallRuleActions) != 1 || n.firewallRuleActions[0] != "group:db" {
+		t.Errorf("firewallRuleActions = %v; want [group:db]", n.firewallRuleActions)
+	}
+	if n.firewallEnableOptCalls != 1 {
+		t.Errorf("firewallEnableOptCalls = %d; want 1", n.firewallEnableOptCalls)
+	}
+}
+
+// TestCreateVM_CallSecurityGroupsBeatsProfile verifies per-call security_groups
+// win over vm_type profile security_groups.
+func TestCreateVM_CallSecurityGroupsBeatsProfile(t *testing.T) {
+	t.Parallel()
+	q := &vmMockQEMU{}
+	n := &vmMockNodes{}
+	c := &vmMockCluster{listFirewallGroupsFn: firewallGroupsClusterFn("from-call", "from-profile")}
+	a := &vmMockAgent{}
+	vmTypes := map[string]config.TypeProfile{
+		"secured": {CloudProperties: map[string]any{"security_groups": []any{"from-profile"}}},
+	}
+	h := handlers.HandleCreateVM(buildVMDepsFirewall(q, n, c, a, vmFirewallDepsOpts{vmTypes: vmTypes}))
+
+	args := mkArgs("agent-sg-beats", testStemcellCID,
+		map[string]any{"cores": 1, "memory": 512, "vm_type": "secured", "security_groups": []any{"from-call"}},
+		defaultNetMap(), []string{}, map[string]any{})
+
+	if _, err := h.Handle(context.Background(), args, mkCtx("sg-beats")); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(n.firewallRuleActions) != 1 || n.firewallRuleActions[0] != "group:from-call" {
+		t.Errorf("firewallRuleActions = %v; want [group:from-call]", n.firewallRuleActions)
+	}
+}
+
+// TestCreateVM_GlobalDefaultSecurityGroups verifies config.SecurityGroups is used
+// when neither call nor profile specify security_groups.
+func TestCreateVM_GlobalDefaultSecurityGroups(t *testing.T) {
+	t.Parallel()
+	q := &vmMockQEMU{}
+	n := &vmMockNodes{}
+	c := &vmMockCluster{listFirewallGroupsFn: firewallGroupsClusterFn("global")}
+	a := &vmMockAgent{}
+	h := handlers.HandleCreateVM(buildVMDepsFirewall(q, n, c, a, vmFirewallDepsOpts{
+		securityGroups: []string{"global"},
+	}))
+
+	args := mkArgs("agent-sg-global", testStemcellCID,
+		map[string]any{"cores": 1, "memory": 512},
+		defaultNetMap(), []string{}, map[string]any{})
+
+	if _, err := h.Handle(context.Background(), args, mkCtx("sg-global")); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(n.firewallRuleActions) != 1 || n.firewallRuleActions[0] != "group:global" {
+		t.Errorf("firewallRuleActions = %v; want [group:global]", n.firewallRuleActions)
+	}
+	if n.firewallEnableOptCalls != 1 {
+		t.Errorf("firewallEnableOptCalls = %d; want 1", n.firewallEnableOptCalls)
+	}
+}
+
+// TestCreateVM_FirewallFlagTrueViaProfile_NoGroups verifies that a vm_type profile
+// with firewall=true and no groups enables the VM-level firewall once (no group attaches).
+func TestCreateVM_FirewallFlagTrueViaProfile_NoGroups(t *testing.T) {
+	t.Parallel()
+	q := &vmMockQEMU{}
+	n := &vmMockNodes{}
+	c := &vmMockCluster{}
+	a := &vmMockAgent{}
+	vmTypes := map[string]config.TypeProfile{
+		"fw-only": {CloudProperties: map[string]any{"firewall": true}},
+	}
+	h := handlers.HandleCreateVM(buildVMDepsFirewall(q, n, c, a, vmFirewallDepsOpts{vmTypes: vmTypes}))
+
+	args := mkArgs("agent-fw-profile", testStemcellCID,
+		map[string]any{"cores": 1, "memory": 512, "vm_type": "fw-only"},
+		defaultNetMap(), []string{}, map[string]any{})
+
+	if _, err := h.Handle(context.Background(), args, mkCtx("fw-profile")); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(n.firewallRuleActions) != 0 {
+		t.Errorf("no group rules expected when no groups; got %v", n.firewallRuleActions)
+	}
+	if n.firewallEnableOptCalls != 1 {
+		t.Errorf("firewallEnableOptCalls = %d; want 1 (standalone enable)", n.firewallEnableOptCalls)
+	}
+}
+
+// TestCreateVM_FirewallFlagTrueViaConfig_NoGroups verifies config.VMFirewall=true
+// without groups enables the VM-level firewall once standalone.
+func TestCreateVM_FirewallFlagTrueViaConfig_NoGroups(t *testing.T) {
+	t.Parallel()
+	q := &vmMockQEMU{}
+	n := &vmMockNodes{}
+	c := &vmMockCluster{}
+	a := &vmMockAgent{}
+	trueBool := true
+	h := handlers.HandleCreateVM(buildVMDepsFirewall(q, n, c, a, vmFirewallDepsOpts{vmFirewall: &trueBool}))
+
+	args := mkArgs("agent-fw-config", testStemcellCID,
+		map[string]any{"cores": 1, "memory": 512},
+		defaultNetMap(), []string{}, map[string]any{})
+
+	if _, err := h.Handle(context.Background(), args, mkCtx("fw-config")); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(n.firewallRuleActions) != 0 {
+		t.Errorf("no group rules expected when no groups; got %v", n.firewallRuleActions)
+	}
+	if n.firewallEnableOptCalls != 1 {
+		t.Errorf("firewallEnableOptCalls = %d; want 1 (standalone enable)", n.firewallEnableOptCalls)
+	}
+}
+
+// TestCreateVM_FirewallFlagTrue_WithGroups_NoDoubleEnable verifies that when both
+// groups are present and firewall flag is true, the VM firewall is enabled exactly once.
+func TestCreateVM_FirewallFlagTrue_WithGroups_NoDoubleEnable(t *testing.T) {
+	t.Parallel()
+	q := &vmMockQEMU{}
+	n := &vmMockNodes{}
+	c := &vmMockCluster{listFirewallGroupsFn: firewallGroupsClusterFn("web")}
+	a := &vmMockAgent{}
+	trueBool := true
+	h := handlers.HandleCreateVM(buildVMDepsFirewall(q, n, c, a, vmFirewallDepsOpts{vmFirewall: &trueBool}))
+
+	args := mkArgs("agent-fw-no-double", testStemcellCID,
+		map[string]any{"cores": 1, "memory": 512, "security_groups": []any{"web"}},
+		defaultNetMap(), []string{}, map[string]any{})
+
+	if _, err := h.Handle(context.Background(), args, mkCtx("fw-no-double")); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(n.firewallRuleActions) != 1 {
+		t.Errorf("firewallRuleActions = %v; want [group:web]", n.firewallRuleActions)
+	}
+	if n.firewallEnableOptCalls != 1 {
+		t.Errorf("firewallEnableOptCalls = %d; want exactly 1 (no double-enable)", n.firewallEnableOptCalls)
+	}
+}
+
+// TestCreateVM_UnknownVMTypeInCloudProps_ReturnsCloudError verifies that an unknown
+// vm_type selector in cloud_properties returns a non-retriable CloudError.
+func TestCreateVM_UnknownVMTypeInCloudProps_ReturnsCloudError(t *testing.T) {
+	t.Parallel()
+	q := &vmMockQEMU{}
+	n := &vmMockNodes{}
+	c := &vmMockCluster{}
+	a := &vmMockAgent{}
+	h := handlers.HandleCreateVM(buildVMDepsFirewall(q, n, c, a, vmFirewallDepsOpts{}))
+
+	args := mkArgs("agent-bad-vmtype", testStemcellCID,
+		map[string]any{"cores": 1, "memory": 512, "vm_type": "no-such-profile"},
+		defaultNetMap(), []string{}, map[string]any{})
+
+	_, err := h.Handle(context.Background(), args, mkCtx("bad-vmtype"))
+	if err == nil {
+		t.Fatal("expected CloudError for unknown vm_type selector")
+	}
+	if !isCloudError(err) {
+		t.Errorf("expected CloudError, got %T: %v", err, err)
 	}
 }

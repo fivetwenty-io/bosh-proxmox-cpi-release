@@ -655,3 +655,48 @@ properties:
         access_key_id: "AKIA..."
         secret_access_key: "..."
         endpoint: "https://s3.lab.local"
+
+  pve.vm_types:
+    description: |
+      Optional map of operator-named VM-type profiles. Each key is a profile name
+      (e.g. "large", "cpu-heavy") and each value is an object whose
+      cloud_properties key holds default cloud_properties for that profile.
+      A VM is associated with a profile by setting cloud_properties.vm_type to
+      the profile name at deploy time. Attribute resolution precedence (highest
+      to lowest): per-call cloud_properties, disk_type profile, vm_type profile,
+      global config. When unset (default {}), no profiles are defined and no
+      behavior change occurs.
+    default: {}
+
+  pve.disk_types:
+    description: |
+      Optional map of operator-named disk-type profiles. Each key is a profile
+      name (e.g. "ssd", "archive") and each value is an object whose
+      cloud_properties key holds default cloud_properties for that profile.
+      A disk is associated with a profile by setting cloud_properties.disk_type
+      to the profile name at deploy time. Disk-type profiles take precedence over
+      vm_type profiles when both define the same attribute. When unset
+      (default {}), no profiles are defined and no behavior change occurs.
+    default: {}
+
+  pve.storage_tiers:
+    description: |
+      Optional map of operator-named storage tiers. Each key is a tier label
+      (e.g. "fast", "bulk") and each value is an object with up to two fields:
+      types (list of PVE storage types such as lvm, lvmthin, zfspool, dir, nfs,
+      cifs, rbd, cephfs, btrfs, glusterfs, pbs) and shared (bool). At create_vm
+      or create_disk time the CPI selects the first live cluster storage whose
+      type and shared flag match the criteria. A tier is selected by setting
+      cloud_properties.storage_tier to the tier name. When unset (default {}),
+      no tier matching runs and storage is chosen by the existing vm_storage /
+      disk_storage config fields.
+    default: {}
+
+  pve.security_groups:
+    description: |
+      Optional global default list of PVE firewall group names applied to every
+      VM that does not carry a per-call or per-profile security_groups override.
+      Each entry must be a group name that already exists in the PVE firewall
+      configuration. When empty (default []), no global firewall groups are
+      applied and behavior is unchanged from prior releases.
+    default: []

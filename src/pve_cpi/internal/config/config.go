@@ -379,6 +379,42 @@ type CPIConfig struct {
 	// the Director can act on rather than an un-cancellable hang holding a queue
 	// slot. Pointer-typed so a fully-absent block is cheap to detect.
 	OperationTimeout *OperationTimeoutConfig `json:"operation_timeout,omitempty"`
+
+	// VMTypes maps operator-named VM-type profiles to default cloud_properties.
+	// A create_vm call selects a profile via cloud_properties.vm_type="<name>".
+	// Profile values sit BELOW per-call cloud_properties and ABOVE global config
+	// in resolution precedence. Empty/absent = no profiles (today's behavior).
+	VMTypes map[string]TypeProfile `json:"vm_types,omitempty"`
+
+	// DiskTypes maps operator-named disk-type profiles to default cloud_properties.
+	// Selected via cloud_properties.disk_type="<name>"; higher precedence than VMTypes.
+	DiskTypes map[string]TypeProfile `json:"disk_types,omitempty"`
+
+	// StorageTiers maps a tier label (e.g. "fast") to selection criteria matched
+	// against live PVE /storage. cloud_properties.storage_tier="<name>" resolves to
+	// a concrete pool when no explicit pool is set. Empty/absent = feature off.
+	StorageTiers map[string]StorageTierCriteria `json:"storage_tiers,omitempty"`
+
+	// SecurityGroups is an optional GLOBAL default list of PVE firewall groups
+	// attached to every VM lacking a per-call/profile security_groups override.
+	// Empty/absent = no global default (today's behavior).
+	SecurityGroups []string `json:"security_groups,omitempty"`
+}
+
+// TypeProfile is a named bundle of default cloud_properties applied by the
+// layered resolver. CloudProperties is free-form (BOSH passes a flat merged
+// dict; the CPI cannot validate keys at load time), so no key validation here.
+type TypeProfile struct {
+	CloudProperties map[string]any `json:"cloud_properties,omitempty"`
+}
+
+// StorageTierCriteria selects PVE storages by attribute. Types lists allowed
+// PVE storage type strings (lvm, lvmthin, zfspool, dir, nfs, cifs, rbd, cephfs,
+// btrfs, glusterfs, pbs). Shared requires shared (true) / local (false) / any
+// (nil). At least one of Types or Shared must be set.
+type StorageTierCriteria struct {
+	Types  []string `json:"types,omitempty"`
+	Shared *bool    `json:"shared,omitempty"`
 }
 
 // RetryConfig holds the operator-tunable retry/backoff policies. Each field is
@@ -1414,6 +1450,7 @@ func (c *CPIConfig) ValidateWithLogger(logger *log.Logger) error {
 	c.validateHealthCheck(&errs)
 	c.validateRetry(&errs)
 	c.validateOperationTimeout(&errs)
+	c.validateStorageTiers(&errs)
 	if len(errs) > 0 {
 		return cpierrors.Cloud("config validation failed: %s", strings.Join(errs, "; "))
 	}
@@ -2018,6 +2055,53 @@ func (c *CPIConfig) validateOperationTimeout(errs *[]string) {
 	checkSec("delete_sec", ot.DeleteSec)
 	checkSec("query_sec", ot.QuerySec)
 	checkSec("default_sec", ot.DefaultSec)
+}
+
+// knownPVEStorageTypes is the exhaustive set of PVE storage plugin names
+// accepted in StorageTierCriteria.Types. Hardcoded here to avoid an import
+// cycle with internal/pve (which itself imports internal/config). The set
+// mirrors pve/storage_types.go plus "dir" and "btrfs", which that file omits
+// but which PVE exposes as valid storage types.
+var knownPVEStorageTypes = map[string]struct{}{
+	"lvm":       {},
+	"lvmthin":   {},
+	"zfspool":   {},
+	"dir":       {},
+	"nfs":       {},
+	"cifs":      {},
+	"rbd":       {},
+	"cephfs":    {},
+	"btrfs":     {},
+	"glusterfs": {},
+	"pbs":       {},
+}
+
+// validateStorageTiers validates every entry in StorageTiers. Skipped entirely
+// when StorageTiers is nil or empty (validate-only-when-set). For each entry:
+//   - At least one of Types or Shared must be set; an entry with neither is
+//     a CloudError naming the tier.
+//   - Every string in Types must be a known PVE storage type; unknown values
+//     produce a CloudError naming the tier and the unknown type.
+//
+// VMTypes, DiskTypes, and SecurityGroups carry no structural constraints beyond
+// what their Go types enforce, so they are not validated here.
+func (c *CPIConfig) validateStorageTiers(errs *[]string) {
+	for name, criteria := range c.StorageTiers {
+		if len(criteria.Types) == 0 && criteria.Shared == nil {
+			*errs = append(*errs, fmt.Sprintf(
+				"storage_tiers[%s]: must set types or shared", name,
+			))
+			continue
+		}
+		for _, t := range criteria.Types {
+			if _, ok := knownPVEStorageTypes[t]; !ok {
+				*errs = append(*errs, fmt.Sprintf(
+					"storage_tiers[%s]: unknown storage type %q; valid types: lvm, lvmthin, zfspool, dir, nfs, cifs, rbd, cephfs, btrfs, glusterfs, pbs",
+					name, t,
+				))
+			}
+		}
+	}
 }
 
 // redactEndpoint strips userinfo from a URL so the endpoint can be logged

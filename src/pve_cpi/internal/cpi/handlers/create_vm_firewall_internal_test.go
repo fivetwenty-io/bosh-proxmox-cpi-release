@@ -14,6 +14,9 @@ import (
 	sdknodes "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/nodes"
 )
 
+// fwClusterStubWithFirewall is a compile-time reminder that fwClusterStub already
+// satisfies both the groups-present and groups-absent cases used by the new tests.
+
 // fwClusterStub provides ListFirewallGroups; other cluster methods panic via the
 // embedded nil interface.
 type fwClusterStub struct {
@@ -208,5 +211,190 @@ func TestConfigureNICs_FirewallFlag(t *testing.T) {
 				t.Errorf("net0 = %q; firewall flag present=%v want=%v", nd.lastNet[0], got, tc.wantFlag)
 			}
 		})
+	}
+}
+
+// --------------------------------------------------------------------------
+// enableVMFirewall
+// --------------------------------------------------------------------------
+
+func TestEnableVMFirewall_CallsUpdateOptionsOnce(t *testing.T) {
+	nd := &fwNodesStub{}
+	if err := enableVMFirewall(context.Background(), fwDeps(&fwClusterStub{}, nd, icMinConfig()), "pve1", 200, log.NewNopLogger()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if nd.enableOptCall != 1 {
+		t.Errorf("enableOptCall = %d; want 1", nd.enableOptCall)
+	}
+	if len(nd.ruleActions) != 0 {
+		t.Errorf("enableVMFirewall must not attach any group rules; got %v", nd.ruleActions)
+	}
+}
+
+func TestEnableVMFirewall_PropagatesError(t *testing.T) {
+	nd := &fwNodesStub{optErr: errors.New("pve 503")}
+	err := enableVMFirewall(context.Background(), fwDeps(&fwClusterStub{}, nd, icMinConfig()), "pve1", 200, log.NewNopLogger())
+	if err == nil {
+		t.Fatal("expected error when UpdateQemuFirewallOptions fails")
+	}
+}
+
+// --------------------------------------------------------------------------
+// applySecurityGroups uses enableVMFirewall — verify no double-enable
+// --------------------------------------------------------------------------
+
+func TestApplySecurityGroups_EnableCalledExactlyOnce(t *testing.T) {
+	// Two groups: applySecurityGroups internally calls enableVMFirewall once.
+	cl := &fwClusterStub{groups: []string{"app", "db"}}
+	nd := &fwNodesStub{}
+	if err := applySecurityGroups(context.Background(), fwDeps(cl, nd, icMinConfig()), "pve1", 300,
+		[]string{"app", "db"}, log.NewNopLogger()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if nd.enableOptCall != 1 {
+		t.Errorf("VM firewall must be enabled exactly once even with multiple groups; got %d", nd.enableOptCall)
+	}
+}
+
+// --------------------------------------------------------------------------
+// resolveEffectiveSecurityGroups
+// --------------------------------------------------------------------------
+
+func TestResolveEffectiveSecurityGroups_CallBeatsProfile(t *testing.T) {
+	cfg := icMinConfig()
+	cfg.VMTypes = map[string]config.TypeProfile{
+		"web": {CloudProperties: map[string]any{"security_groups": []any{"from-profile"}}},
+	}
+	callCP := map[string]any{"vm_type": "web", "security_groups": []any{"from-call"}}
+	got, err := resolveEffectiveSecurityGroups(callCP, cfg, []string{"from-call"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(got) != 1 || got[0] != "from-call" {
+		t.Errorf("got %v; want [from-call]", got)
+	}
+}
+
+func TestResolveEffectiveSecurityGroups_ProfileUsedWhenCallEmpty(t *testing.T) {
+	cfg := icMinConfig()
+	cfg.VMTypes = map[string]config.TypeProfile{
+		"web": {CloudProperties: map[string]any{"security_groups": []any{"from-profile"}}},
+	}
+	callCP := map[string]any{"vm_type": "web"}
+	got, err := resolveEffectiveSecurityGroups(callCP, cfg, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(got) != 1 || got[0] != "from-profile" {
+		t.Errorf("got %v; want [from-profile]", got)
+	}
+}
+
+func TestResolveEffectiveSecurityGroups_GlobalDefaultFallback(t *testing.T) {
+	cfg := icMinConfig()
+	cfg.SecurityGroups = []string{"global-default"}
+	callCP := map[string]any{}
+	got, err := resolveEffectiveSecurityGroups(callCP, cfg, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(got) != 1 || got[0] != "global-default" {
+		t.Errorf("got %v; want [global-default]", got)
+	}
+}
+
+func TestResolveEffectiveSecurityGroups_AllEmptyReturnsNil(t *testing.T) {
+	cfg := icMinConfig()
+	callCP := map[string]any{}
+	got, err := resolveEffectiveSecurityGroups(callCP, cfg, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("got %v; want empty", got)
+	}
+}
+
+func TestResolveEffectiveSecurityGroups_UnknownVMTypeErrors(t *testing.T) {
+	cfg := icMinConfig()
+	callCP := map[string]any{"vm_type": "does-not-exist"}
+	_, err := resolveEffectiveSecurityGroups(callCP, cfg, nil)
+	if err == nil {
+		t.Fatal("expected CloudError for unknown vm_type")
+	}
+	if !strings.Contains(err.Error(), "does-not-exist") {
+		t.Errorf("error %q should name the unknown selector", err.Error())
+	}
+}
+
+// --------------------------------------------------------------------------
+// resolveEffectiveFirewall
+// --------------------------------------------------------------------------
+
+func TestResolveEffectiveFirewall_CallCPTrue(t *testing.T) {
+	cfg := icMinConfig()
+	callCP := map[string]any{"firewall": true}
+	got, err := resolveEffectiveFirewall(callCP, cfg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !got {
+		t.Error("expected firewall=true from call cloud_properties")
+	}
+}
+
+func TestResolveEffectiveFirewall_CallCPFalseExplicit(t *testing.T) {
+	cfg := icMinConfig()
+	v := true
+	cfg.VMFirewall = &v
+	callCP := map[string]any{"firewall": false}
+	got, err := resolveEffectiveFirewall(callCP, cfg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got {
+		t.Error("explicit false in call cloud_properties must override config true")
+	}
+}
+
+func TestResolveEffectiveFirewall_ProfileTrue(t *testing.T) {
+	cfg := icMinConfig()
+	cfg.VMTypes = map[string]config.TypeProfile{
+		"secure": {CloudProperties: map[string]any{"firewall": true}},
+	}
+	callCP := map[string]any{"vm_type": "secure"}
+	got, err := resolveEffectiveFirewall(callCP, cfg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !got {
+		t.Error("expected firewall=true from vm_type profile")
+	}
+}
+
+func TestResolveEffectiveFirewall_ConfigDefault(t *testing.T) {
+	cfg := icMinConfig()
+	v := true
+	cfg.VMFirewall = &v
+	callCP := map[string]any{}
+	got, err := resolveEffectiveFirewall(callCP, cfg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !got {
+		t.Error("expected firewall=true from config.VMFirewall")
+	}
+}
+
+func TestResolveEffectiveFirewall_NilConfigDefaultIsFalse(t *testing.T) {
+	cfg := icMinConfig()
+	// VMFirewall deliberately nil — ensure no firewall calls would occur.
+	callCP := map[string]any{}
+	got, err := resolveEffectiveFirewall(callCP, cfg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got {
+		t.Error("nil VMFirewall config must return false (zero firewall API calls)")
 	}
 }

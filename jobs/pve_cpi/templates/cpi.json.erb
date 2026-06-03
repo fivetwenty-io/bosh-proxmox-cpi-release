@@ -320,5 +320,29 @@
     config["operation_timeout"] = operation_timeout
   end
 
+  # Emit vm_types only when the operator defines at least one profile. When
+  # absent or empty (the default {}), the key is omitted so the Go config
+  # zero-value (nil map) is preserved and behavior is unchanged.
+  vm_types = p("pve.vm_types", {})
+  config["vm_types"] = vm_types unless vm_types.nil? || vm_types.empty?
+
+  # Emit disk_types only when the operator defines at least one profile. When
+  # absent or empty (the default {}), the key is omitted so the Go config
+  # zero-value (nil map) is preserved and behavior is unchanged.
+  disk_types = p("pve.disk_types", {})
+  config["disk_types"] = disk_types unless disk_types.nil? || disk_types.empty?
+
+  # Emit storage_tiers only when the operator defines at least one tier. When
+  # absent or empty (the default {}), the key is omitted so the Go config
+  # zero-value (nil map) is preserved and behavior is unchanged.
+  storage_tiers = p("pve.storage_tiers", {})
+  config["storage_tiers"] = storage_tiers unless storage_tiers.nil? || storage_tiers.empty?
+
+  # Emit security_groups only when the operator supplies a non-empty list. When
+  # absent or empty (the default []), the key is omitted so the Go config
+  # zero-value (nil slice) is preserved and no global firewall groups are applied.
+  security_groups = p("pve.security_groups", [])
+  config["security_groups"] = security_groups unless security_groups.nil? || security_groups.empty?
+
   JSON.dump(config)
 %>

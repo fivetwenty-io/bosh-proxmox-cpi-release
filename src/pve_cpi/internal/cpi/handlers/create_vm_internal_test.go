@@ -2,8 +2,8 @@ package handlers
 
 import (
 	"context"
-	stderrors "errors"
 	"encoding/json"
+	stderrors "errors"
 	"fmt"
 	"math/rand"
 	"reflect"
@@ -14,8 +14,8 @@ import (
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/placement"
+	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
 	sdkcloudinit "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cloudinit"
 	sdkcluster "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cluster"
 	sdkclusterstorage "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/clusterstorage"
@@ -871,12 +871,14 @@ type placementInternalTestPVE struct {
 	clusterClient *placementInternalTestCluster
 }
 
-func (p *placementInternalTestPVE) QEMU() sdkqemu.Service         { panic("not needed") }
-func (p *placementInternalTestPVE) Nodes() sdknodes.Service       { return &placementInternalNodesSvc{} }
-func (p *placementInternalTestPVE) Tasks() sdktasks.Service        { panic("not needed") }
-func (p *placementInternalTestPVE) Storage() sdkstorage.Service    { panic("not needed") }
+func (p *placementInternalTestPVE) QEMU() sdkqemu.Service           { panic("not needed") }
+func (p *placementInternalTestPVE) Nodes() sdknodes.Service         { return &placementInternalNodesSvc{} }
+func (p *placementInternalTestPVE) Tasks() sdktasks.Service         { panic("not needed") }
+func (p *placementInternalTestPVE) Storage() sdkstorage.Service     { panic("not needed") }
 func (p *placementInternalTestPVE) CloudInit() sdkcloudinit.Service { panic("not needed") }
-func (p *placementInternalTestPVE) Cluster() sdkcluster.Service    { return &fullClusterAdapter{sub: p.clusterClient} }
+func (p *placementInternalTestPVE) Cluster() sdkcluster.Service {
+	return &fullClusterAdapter{sub: p.clusterClient}
+}
 func (p *placementInternalTestPVE) ClusterStorage() sdkclusterstorage.Service {
 	return &localStorageSvc{}
 }
@@ -889,7 +891,7 @@ var _ pve.Client = (*placementInternalTestPVE)(nil)
 // for any method not overridden. Only the three methods used by placement are forwarded.
 type fullClusterAdapter struct {
 	sdkcluster.Service // nil — panics on any non-overridden call
-	sub placement.ClusterClient
+	sub                placement.ClusterClient
 }
 
 func (a *fullClusterAdapter) ListStatus(ctx context.Context) (*sdkcluster.ListStatusResponse, error) {
@@ -981,7 +983,7 @@ func TestResolveTargetNodeWithRNG_SingleAZ_BackwardCompat(t *testing.T) {
 		}
 	})
 	cp := createVMCloudProps{AvailabilityZone: "zone-a"}
-	node, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", nil, nil)
+	node, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", nil, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1001,7 +1003,7 @@ func TestResolveTargetNodeWithRNG_MultiAZ_FirstAZViable(t *testing.T) {
 		}
 	})
 	cp := createVMCloudProps{AvailabilityZones: []string{"zone-a", "zone-b"}}
-	node, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", nil, nil)
+	node, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", nil, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1025,7 +1027,7 @@ func TestResolveTargetNodeWithRNG_MultiAZ_FirstExhausted_FallsToSecond(t *testin
 		}
 	})
 	cp := createVMCloudProps{AvailabilityZones: []string{"zone-a", "zone-b"}}
-	node, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", nil, nil)
+	node, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", nil, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1050,7 +1052,7 @@ func TestResolveTargetNodeWithRNG_MultiAZ_AllExhausted_RetriableError(t *testing
 		}
 	})
 	cp := createVMCloudProps{AvailabilityZones: []string{"zone-a", "zone-b"}}
-	_, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", nil, nil)
+	_, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", nil, nil, nil)
 	if err == nil {
 		t.Fatal("expected error for all-AZs-exhausted")
 	}
@@ -1081,7 +1083,7 @@ func TestResolveTargetNodeWithRNG_InAZOffline_OutAZOnline_Retriable(t *testing.T
 		}
 	})
 	cp := createVMCloudProps{AvailabilityZones: []string{"zone-a"}}
-	_, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", nil, nil)
+	_, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", nil, nil, nil)
 	if err == nil {
 		t.Fatal("expected error when all in-AZ candidates are offline")
 	}
@@ -1102,7 +1104,7 @@ func TestResolveTargetNodeWithRNG_UnknownAZ_PermanentError(t *testing.T) {
 		}
 	})
 	cp := createVMCloudProps{AvailabilityZone: "zone-unknown"}
-	_, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", nil, nil)
+	_, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", nil, nil, nil)
 	if err == nil {
 		t.Fatal("expected error for unknown AZ")
 	}
@@ -1125,8 +1127,9 @@ func TestResolveTargetNodeWithRNG_UnknownAZ_PermanentError(t *testing.T) {
 // selected nodes. This proves the shuffle actually reorders, not just stabilises.
 //
 // Empirically (rand.New(rand.NewSource(N)).Shuffle on ["zone-a","zone-b"]):
-//   seed 0 → [zone-a, zone-b] → pve1 selected (zone-a tried first).
-//   seed 2 → [zone-b, zone-a] → pve2 selected (zone-b tried first).
+//
+//	seed 0 → [zone-a, zone-b] → pve1 selected (zone-a tried first).
+//	seed 2 → [zone-b, zone-a] → pve2 selected (zone-b tried first).
 func TestResolveTargetNodeWithRNG_AZShuffle_SeedControlsOrder(t *testing.T) {
 	t.Parallel()
 	tr := true
@@ -1144,21 +1147,21 @@ func TestResolveTargetNodeWithRNG_AZShuffle_SeedControlsOrder(t *testing.T) {
 
 	// seed 0: shuffle keeps [zone-a, zone-b] → zone-a first → pve1 wins.
 	rngA := rand.New(rand.NewSource(0)) //nolint:gosec // fixed seed — deterministic test
-	nodeA, errA := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", nil, rngA)
+	nodeA, errA := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", nil, rngA, nil)
 	if errA != nil {
 		t.Fatalf("seed=0 error: %v", errA)
 	}
 
 	// seed 2: shuffle produces [zone-b, zone-a] → zone-b first → pve2 wins.
 	rngB := rand.New(rand.NewSource(2)) //nolint:gosec // fixed seed — deterministic test
-	nodeB, errB := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", nil, rngB)
+	nodeB, errB := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", nil, rngB, nil)
 	if errB != nil {
 		t.Fatalf("seed=2 error: %v", errB)
 	}
 
 	// Same seed must be deterministic.
 	rngA2 := rand.New(rand.NewSource(0)) //nolint:gosec // fixed seed — deterministic test
-	nodeA2, _ := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", nil, rngA2)
+	nodeA2, _ := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", nil, rngA2, nil)
 	if nodeA != nodeA2 {
 		t.Errorf("same seed must be deterministic; seed=0 got %q then %q", nodeA, nodeA2)
 	}
@@ -1209,7 +1212,7 @@ func TestResolveTargetNodeWithRNG_MaintenanceNodeExcluded(t *testing.T) {
 		PVE:    &rawNodeTestPVE{cluster},
 		Logger: log.NewNopLogger(),
 	}
-	node, err := resolveTargetNodeWithRNG(context.Background(), deps, createVMCloudProps{}, "", nil, nil)
+	node, err := resolveTargetNodeWithRNG(context.Background(), deps, createVMCloudProps{}, "", nil, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1241,12 +1244,12 @@ var _ placement.ClusterClient = (*rawNodeCluster)(nil)
 // rawNodeTestPVE wraps rawNodeCluster as pve.Client.
 type rawNodeTestPVE struct{ cluster *rawNodeCluster }
 
-func (p *rawNodeTestPVE) QEMU() sdkqemu.Service         { panic("not needed") }
-func (p *rawNodeTestPVE) Nodes() sdknodes.Service       { return &placementInternalNodesSvc{} }
-func (p *rawNodeTestPVE) Tasks() sdktasks.Service        { panic("not needed") }
-func (p *rawNodeTestPVE) Storage() sdkstorage.Service    { panic("not needed") }
+func (p *rawNodeTestPVE) QEMU() sdkqemu.Service           { panic("not needed") }
+func (p *rawNodeTestPVE) Nodes() sdknodes.Service         { return &placementInternalNodesSvc{} }
+func (p *rawNodeTestPVE) Tasks() sdktasks.Service         { panic("not needed") }
+func (p *rawNodeTestPVE) Storage() sdkstorage.Service     { panic("not needed") }
 func (p *rawNodeTestPVE) CloudInit() sdkcloudinit.Service { panic("not needed") }
-func (p *rawNodeTestPVE) Cluster() sdkcluster.Service    { return &fullClusterAdapter{sub: p.cluster} }
+func (p *rawNodeTestPVE) Cluster() sdkcluster.Service     { return &fullClusterAdapter{sub: p.cluster} }
 func (p *rawNodeTestPVE) ClusterStorage() sdkclusterstorage.Service {
 	return &localStorageSvc{}
 }
@@ -1336,9 +1339,9 @@ var _ sdkclusterstorage.Service = (*templateGapClusterStorageSvc)(nil)
 // test can set cloneErr to stop the clone early without wiring the full tail.
 type templateGapNodesSvc struct {
 	sdknodes.Service // nil — panics on non-overridden calls
-	listQemuFn   func(ctx context.Context, node string) (*sdknodes.ListQemuResponse, error)
-	cloneCapture *struct{ node, vmidStr string }
-	cloneErr     error
+	listQemuFn       func(ctx context.Context, node string) (*sdknodes.ListQemuResponse, error)
+	cloneCapture     *struct{ node, vmidStr string }
+	cloneErr         error
 }
 
 func (n *templateGapNodesSvc) ListQemu(ctx context.Context, node string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
@@ -1367,12 +1370,12 @@ type templateGapPVE struct {
 	storage *templateGapClusterStorageSvc
 }
 
-func (p *templateGapPVE) QEMU() sdkqemu.Service         { panic("not needed") }
-func (p *templateGapPVE) Nodes() sdknodes.Service       { return p.nodes }
-func (p *templateGapPVE) Tasks() sdktasks.Service        { panic("not needed") }
-func (p *templateGapPVE) Storage() sdkstorage.Service    { panic("not needed") }
+func (p *templateGapPVE) QEMU() sdkqemu.Service           { panic("not needed") }
+func (p *templateGapPVE) Nodes() sdknodes.Service         { return p.nodes }
+func (p *templateGapPVE) Tasks() sdktasks.Service         { panic("not needed") }
+func (p *templateGapPVE) Storage() sdkstorage.Service     { panic("not needed") }
 func (p *templateGapPVE) CloudInit() sdkcloudinit.Service { panic("not needed") }
-func (p *templateGapPVE) Cluster() sdkcluster.Service    { return p.cluster }
+func (p *templateGapPVE) Cluster() sdkcluster.Service     { return p.cluster }
 func (p *templateGapPVE) ClusterStorage() sdkclusterstorage.Service {
 	return p.storage
 }
@@ -1387,7 +1390,7 @@ func buildTemplateGapArgs(shared bool) (*createVMParsedArgs, *createVMShape) {
 	parsed := &createVMParsedArgs{
 		stemcellCID: "template:6042",
 		// rawCID carries sha8 "abcd1234" → extractSHA8FromTemplateCIDContext returns it.
-		rawCID:    "local-lvm:import/bosh-stemcell-ubuntu-jammy-1.0-abcd1234.qcow2",
+		rawCID:     "local-lvm:import/bosh-stemcell-ubuntu-jammy-1.0-abcd1234.qcow2",
 		cloudProps: createVMCloudProps{},
 		networks:   map[string]createVMNetworkSpec{},
 	}
@@ -1396,7 +1399,7 @@ func buildTemplateGapArgs(shared bool) (*createVMParsedArgs, *createVMShape) {
 		vmStorageType = "nfs"
 	}
 	shape := &createVMShape{
-		node:          "pve-vm",   // VM target node
+		node:          "pve-vm", // VM target node
 		vmStorage:     "local-lvm",
 		vmStorageType: vmStorageType,
 		vmDiskFormat:  "raw",
@@ -1507,10 +1510,10 @@ func TestAttemptCreateVM_TemplateGap_NotFound_ReplicateDisabled(t *testing.T) {
 	}
 	deps := Deps{
 		Config: &config.CPIConfig{
-			Node:                  "",
-			StemcellTemplateNode:  "pve-tmpl",
-			VMStorage:             "local-lvm",
-			NetworkBridge:         "vmbr0",
+			Node:                   "",
+			StemcellTemplateNode:   "pve-tmpl",
+			VMStorage:              "local-lvm",
+			NetworkBridge:          "vmbr0",
 			StemcellReplicateLocal: false,
 		},
 		PVE:    pveCli,
@@ -1597,7 +1600,7 @@ func TestAttemptCreateVM_TemplateGap_SharedStorage_NoGuard(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// IMP-A2: deriveDiskFaultConstraints
+// deriveDiskFaultConstraints
 // ---------------------------------------------------------------------------
 
 // encodeLocalCID builds an encoded disk CID for a local-backend disk on node.
@@ -1641,14 +1644,16 @@ type faultDomainTestPVE struct {
 	clusterStorage sdkclusterstorage.Service
 }
 
-func (p *faultDomainTestPVE) QEMU() sdkqemu.Service          { panic("not needed") }
-func (p *faultDomainTestPVE) Nodes() sdknodes.Service        { return &placementInternalNodesSvc{} }
+func (p *faultDomainTestPVE) QEMU() sdkqemu.Service           { panic("not needed") }
+func (p *faultDomainTestPVE) Nodes() sdknodes.Service         { return &placementInternalNodesSvc{} }
 func (p *faultDomainTestPVE) Tasks() sdktasks.Service         { panic("not needed") }
 func (p *faultDomainTestPVE) Storage() sdkstorage.Service     { panic("not needed") }
-func (p *faultDomainTestPVE) CloudInit() sdkcloudinit.Service  { panic("not needed") }
-func (p *faultDomainTestPVE) Cluster() sdkcluster.Service     { return &fullClusterAdapter{sub: p.clusterClient} }
+func (p *faultDomainTestPVE) CloudInit() sdkcloudinit.Service { panic("not needed") }
+func (p *faultDomainTestPVE) Cluster() sdkcluster.Service {
+	return &fullClusterAdapter{sub: p.clusterClient}
+}
 func (p *faultDomainTestPVE) ClusterStorage() sdkclusterstorage.Service { return p.clusterStorage }
-func (p *faultDomainTestPVE) Pools() pve.PoolService          { return nil }
+func (p *faultDomainTestPVE) Pools() pve.PoolService                    { return nil }
 
 var _ pve.Client = (*faultDomainTestPVE)(nil)
 
@@ -1820,8 +1825,8 @@ func TestDeriveDiskFaultConstraints_SharedDisk_AZConstraint(t *testing.T) {
 func TestDeriveDiskFaultConstraints_MixedLegacyAndEncoded(t *testing.T) {
 	t.Parallel()
 	deps := buildFaultDomainDeps(nil, nil, nil)
-	legacyCID := "local-lvm:vm-100-disk-0"          // bare — no constraint
-	encodedCID := encodeLocalCID("pve1") // local — pins node
+	legacyCID := "local-lvm:vm-100-disk-0" // bare — no constraint
+	encodedCID := encodeLocalCID("pve1")   // local — pins node
 	c, err := deriveDiskFaultConstraints(context.Background(), deps, []string{legacyCID, encodedCID})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -1832,7 +1837,7 @@ func TestDeriveDiskFaultConstraints_MixedLegacyAndEncoded(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// IMP-A2: applyDiskAZConstraint
+// applyDiskAZConstraint
 // ---------------------------------------------------------------------------
 
 // TestApplyDiskAZConstraint_EmptyVMAZOrder_ConstrainedToDiskAZs verifies that when
@@ -1903,7 +1908,7 @@ func TestApplyDiskAZConstraint_NoRequiredAZs_Unchanged(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// IMP-A2: resolveTargetNodeWithRNG — disk fault-domain cases
+// resolveTargetNodeWithRNG — disk fault-domain cases
 // ---------------------------------------------------------------------------
 
 // TestResolveTargetNodeWithRNG_LocalDisk_PinsNode verifies that a single local-backend
@@ -1922,7 +1927,7 @@ func TestResolveTargetNodeWithRNG_LocalDisk_PinsNode(t *testing.T) {
 		},
 	)
 	diskCIDs := []string{encodeLocalCID("pve1")}
-	node, err := resolveTargetNodeWithRNG(context.Background(), deps, createVMCloudProps{}, "", diskCIDs, nil)
+	node, err := resolveTargetNodeWithRNG(context.Background(), deps, createVMCloudProps{}, "", diskCIDs, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1948,7 +1953,7 @@ func TestResolveTargetNodeWithRNG_TwoLocalDisks_SameNode_OK(t *testing.T) {
 		encodeLocalCID("pve1"),
 		encodeLocalCID("pve1"),
 	}
-	node, err := resolveTargetNodeWithRNG(context.Background(), deps, createVMCloudProps{}, "", diskCIDs, nil)
+	node, err := resolveTargetNodeWithRNG(context.Background(), deps, createVMCloudProps{}, "", diskCIDs, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1978,7 +1983,7 @@ func TestResolveTargetNodeWithRNG_TwoLocalDisks_DifferentNodes_Error(t *testing.
 		encodeLocalCID("pve1"),
 		encodeLocalCID("pve2"),
 	}
-	_, err := resolveTargetNodeWithRNG(context.Background(), deps, createVMCloudProps{}, "", diskCIDs, nil)
+	_, err := resolveTargetNodeWithRNG(context.Background(), deps, createVMCloudProps{}, "", diskCIDs, nil, nil)
 	if err == nil {
 		t.Fatal("expected error for disks on different nodes; got nil")
 	}
@@ -2010,7 +2015,7 @@ func TestResolveTargetNodeWithRNG_SharedDisk_AZConstrains_Compatible(t *testing.
 	)
 	diskCIDs := []string{encodeSharedCID("ceph-pool", "zone-a")}
 	cp := createVMCloudProps{AvailabilityZones: []string{"zone-a", "zone-b"}}
-	node, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", diskCIDs, nil)
+	node, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", diskCIDs, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -2039,7 +2044,7 @@ func TestResolveTargetNodeWithRNG_SharedDisk_AZConflicts_Error(t *testing.T) {
 	)
 	diskCIDs := []string{encodeSharedCID("ceph-pool", "zone-b")}
 	cp := createVMCloudProps{AvailabilityZone: "zone-a"} // singular AZ — zone-a only
-	_, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", diskCIDs, nil)
+	_, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", diskCIDs, nil, nil)
 	if err == nil {
 		t.Fatal("expected error for AZ conflict; got nil")
 	}
@@ -2068,7 +2073,7 @@ func TestResolveTargetNodeWithRNG_LocalDiskPinnedNodeOffline_Error(t *testing.T)
 		},
 	)
 	diskCIDs := []string{encodeLocalCID("pve1")}
-	_, err := resolveTargetNodeWithRNG(context.Background(), deps, createVMCloudProps{}, "", diskCIDs, nil)
+	_, err := resolveTargetNodeWithRNG(context.Background(), deps, createVMCloudProps{}, "", diskCIDs, nil, nil)
 	if err == nil {
 		t.Fatal("expected error when disk's home node is offline; got nil")
 	}
@@ -2096,7 +2101,7 @@ func TestResolveTargetNodeWithRNG_BareLocalCID_Inert(t *testing.T) {
 		},
 	)
 	diskCIDs := []string{"local-lvm:vm-100-disk-0"} // bare legacy — no constraint
-	_, err := resolveTargetNodeWithRNG(context.Background(), deps, createVMCloudProps{}, "", diskCIDs, nil)
+	_, err := resolveTargetNodeWithRNG(context.Background(), deps, createVMCloudProps{}, "", diskCIDs, nil, nil)
 	if err != nil {
 		t.Fatalf("bare CID must impose no constraint; got error: %v", err)
 	}
@@ -2111,7 +2116,7 @@ func TestResolveTargetNodeWithRNG_PlacementDisabled_LocalDiskPinsNode(t *testing
 	deps := Deps{
 		Config: &config.CPIConfig{
 			Host:          "pve.test",
-			Node:          "pve2",       // config.node differs from disk's node
+			Node:          "pve2", // config.node differs from disk's node
 			VMStorage:     "local-lvm",
 			NetworkBridge: "vmbr0",
 		},
@@ -2120,7 +2125,7 @@ func TestResolveTargetNodeWithRNG_PlacementDisabled_LocalDiskPinsNode(t *testing
 		Resolver: &staticKindResolver{sharedPools: nil}, // all pools are local
 	}
 	diskCIDs := []string{encodeLocalCID("pve1")}
-	node, err := resolveTargetNodeWithRNG(context.Background(), deps, createVMCloudProps{}, "", diskCIDs, nil)
+	node, err := resolveTargetNodeWithRNG(context.Background(), deps, createVMCloudProps{}, "", diskCIDs, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -2148,7 +2153,7 @@ func TestResolveTargetNodeWithRNG_TargetNodeConflictsLocalDisk_Error(t *testing.
 	}
 	diskCIDs := []string{encodeLocalCID("pve1")}
 	cp := createVMCloudProps{TargetNode: "pve2"} // conflicts with disk on pve1
-	_, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", diskCIDs, nil)
+	_, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", diskCIDs, nil, nil)
 	if err == nil {
 		t.Fatal("expected error for target_node/disk conflict; got nil")
 	}
@@ -2179,11 +2184,1110 @@ func TestResolveTargetNodeWithRNG_TargetNodeMatchesLocalDisk_OK(t *testing.T) {
 	}
 	diskCIDs := []string{encodeLocalCID("pve1")}
 	cp := createVMCloudProps{TargetNode: "pve1"} // consistent with disk
-	node, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", diskCIDs, nil)
+	node, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", diskCIDs, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error when target_node matches disk node: %v", err)
 	}
 	if node != "pve1" {
 		t.Errorf("got node %q; want pve1", node)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// buildAZOrder — layered resolver integration
+// ---------------------------------------------------------------------------
+
+// TestBuildAZOrder_NoResolver_NoProfile_Unchanged verifies that passing nil
+// resolver produces the same result as the pre-resolver behavior.
+func TestBuildAZOrder_NoResolver_NoProfile_Unchanged(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.CPIConfig{
+		Placement: &config.PlacementConfig{
+			AZMap:           map[string][]string{"zone-a": {"pve1"}},
+			AZFallbackOrder: []string{"zone-a"},
+		},
+	}
+	cp := createVMCloudProps{} // no per-call AZ
+	got := buildAZOrder(cp, cfg, nil, nil)
+	if len(got) != 1 || got[0] != "zone-a" {
+		t.Errorf("buildAZOrder nil resolver: got %v; want [zone-a]", got)
+	}
+}
+
+// TestBuildAZOrder_PerCallSingularBeatsProfile verifies that a per-call
+// availability_zone always wins over a profile-supplied one.
+func TestBuildAZOrder_PerCallSingularBeatsProfile(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.CPIConfig{
+		VMTypes: map[string]config.TypeProfile{
+			"med": {CloudProperties: map[string]any{"availability_zone": "profile-zone"}},
+		},
+	}
+	r, _ := newLayeredResolver(map[string]any{"vm_type": "med"}, cfg)
+	cp := createVMCloudProps{AvailabilityZone: "call-zone"}
+	got := buildAZOrder(cp, cfg, nil, r)
+	if len(got) != 1 || got[0] != "call-zone" {
+		t.Errorf("per-call AZ must win; got %v; want [call-zone]", got)
+	}
+}
+
+// TestBuildAZOrder_ProfileSingularUsedWhenCallAbsent verifies that when no
+// per-call AZ is set the resolver's singular availability_zone is used.
+func TestBuildAZOrder_ProfileSingularUsedWhenCallAbsent(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.CPIConfig{
+		VMTypes: map[string]config.TypeProfile{
+			"med": {CloudProperties: map[string]any{"availability_zone": "profile-zone"}},
+		},
+	}
+	r, _ := newLayeredResolver(map[string]any{"vm_type": "med"}, cfg)
+	cp := createVMCloudProps{}
+	got := buildAZOrder(cp, cfg, nil, r)
+	if len(got) != 1 || got[0] != "profile-zone" {
+		t.Errorf("profile singular AZ: got %v; want [profile-zone]", got)
+	}
+}
+
+// TestBuildAZOrder_ProfileSingularBeatsProfilePlural verifies that a singular
+// availability_zone in the profile beats a plural availability_zones in the
+// same profile (same precedence hierarchy as cp.AvailabilityZone vs cp.AvailabilityZones).
+func TestBuildAZOrder_ProfileSingularBeatsProfilePlural(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.CPIConfig{
+		VMTypes: map[string]config.TypeProfile{
+			"med": {CloudProperties: map[string]any{
+				"availability_zone":  "singular-zone",
+				"availability_zones": []any{"plural-a", "plural-b"},
+			}},
+		},
+	}
+	r, _ := newLayeredResolver(map[string]any{"vm_type": "med"}, cfg)
+	cp := createVMCloudProps{}
+	got := buildAZOrder(cp, cfg, nil, r)
+	if len(got) != 1 || got[0] != "singular-zone" {
+		t.Errorf("singular profile AZ beats plural; got %v; want [singular-zone]", got)
+	}
+}
+
+// TestBuildAZOrder_ProfilePluralFeedsMultiAZPath verifies that a plural
+// availability_zones from a profile populates the multi-AZ list.
+func TestBuildAZOrder_ProfilePluralFeedsMultiAZPath(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.CPIConfig{
+		VMTypes: map[string]config.TypeProfile{
+			"med": {CloudProperties: map[string]any{
+				"availability_zones": []any{"zone-a", "zone-b"},
+			}},
+		},
+	}
+	r, _ := newLayeredResolver(map[string]any{"vm_type": "med"}, cfg)
+	cp := createVMCloudProps{}
+	got := buildAZOrder(cp, cfg, nil, r)
+	if len(got) != 2 || got[0] != "zone-a" || got[1] != "zone-b" {
+		t.Errorf("profile plural AZs: got %v; want [zone-a zone-b]", got)
+	}
+}
+
+// TestBuildAZOrder_PerCallPluralBeatsProfile verifies per-call plurality wins over profile.
+func TestBuildAZOrder_PerCallPluralBeatsProfile(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.CPIConfig{
+		VMTypes: map[string]config.TypeProfile{
+			"med": {CloudProperties: map[string]any{
+				"availability_zones": []any{"profile-a"},
+			}},
+		},
+	}
+	r, _ := newLayeredResolver(map[string]any{"vm_type": "med"}, cfg)
+	cp := createVMCloudProps{AvailabilityZones: []string{"call-a", "call-b"}}
+	got := buildAZOrder(cp, cfg, nil, r)
+	if len(got) != 2 || got[0] != "call-a" || got[1] != "call-b" {
+		t.Errorf("per-call plural must win; got %v; want [call-a call-b]", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// resolveTargetNodeWithRNG — placement weight overrides via cloud_properties
+// ---------------------------------------------------------------------------
+
+// TestResolveTargetNodeWithRNG_WeightOverride_NoProfile_NoOp verifies that
+// with no weight keys in cloud_properties the resolved weights equal the config
+// defaults (golden no-op: byte-identical to pre-resolver behavior).
+func TestResolveTargetNodeWithRNG_WeightOverride_NoProfile_NoOp(t *testing.T) {
+	t.Parallel()
+
+	deps := buildPlacementDeps([]map[string]any{onlineNode("pve1")}, func(c *config.CPIConfig) {
+		c.Placement = &config.PlacementConfig{
+			AZMap: map[string][]string{"zone-a": {"pve1"}},
+		}
+	})
+	cp := createVMCloudProps{AvailabilityZone: "zone-a"}
+	// No weight keys in cloudPropsMap → must succeed with config defaults.
+	node, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", nil, nil, map[string]any{})
+	if err != nil {
+		t.Fatalf("no-override: unexpected error: %v", err)
+	}
+	if node != "pve1" {
+		t.Errorf("expected pve1; got %q", node)
+	}
+}
+
+// TestResolveTargetNodeWithRNG_WeightOverride_PerCall_MemAxis verifies that a
+// per-call placement_weight_mem overrides only the Mem axis; other axes stay at
+// config defaults.
+func TestResolveTargetNodeWithRNG_WeightOverride_PerCall_MemAxis(t *testing.T) {
+	t.Parallel()
+
+	deps := buildPlacementDeps([]map[string]any{onlineNode("pve1"), onlineNode("pve2")}, func(c *config.CPIConfig) {
+		c.Placement = &config.PlacementConfig{
+			AZMap: map[string][]string{
+				"zone-a": {"pve1"},
+				"zone-b": {"pve2"},
+			},
+		}
+	})
+	// Set a heavy placement_weight_mem; first viable AZ (zone-a → pve1) should win.
+	cp := createVMCloudProps{AvailabilityZone: "zone-a"}
+	cpMap := map[string]any{"placement_weight_mem": float64(2.0)}
+	node, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", nil, nil, cpMap)
+	if err != nil {
+		t.Fatalf("weight override mem: unexpected error: %v", err)
+	}
+	if node != "pve1" {
+		t.Errorf("expected pve1 (only candidate in zone-a); got %q", node)
+	}
+}
+
+// TestResolveTargetNodeWithRNG_WeightOverride_VMTypeProfile verifies that a
+// vm_type profile can supply a placement weight axis.
+func TestResolveTargetNodeWithRNG_WeightOverride_VMTypeProfile(t *testing.T) {
+	t.Parallel()
+
+	deps := buildPlacementDeps([]map[string]any{onlineNode("pve1")}, func(c *config.CPIConfig) {
+		c.Placement = &config.PlacementConfig{
+			AZMap: map[string][]string{"zone-a": {"pve1"}},
+		}
+		c.VMTypes = map[string]config.TypeProfile{
+			"heavy": {CloudProperties: map[string]any{"placement_weight_mem": float64(3.0)}},
+		}
+	})
+	cp := createVMCloudProps{AvailabilityZone: "zone-a"}
+	cpMap := map[string]any{"vm_type": "heavy"}
+	node, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", nil, nil, cpMap)
+	if err != nil {
+		t.Fatalf("vm_type weight profile: unexpected error: %v", err)
+	}
+	if node != "pve1" {
+		t.Errorf("expected pve1; got %q", node)
+	}
+}
+
+// TestResolveTargetNodeWithRNG_WeightOverride_PerCallBeatsProfile verifies that
+// a per-call weight key beats the same key supplied by a vm_type profile.
+func TestResolveTargetNodeWithRNG_WeightOverride_PerCallBeatsProfile(t *testing.T) {
+	t.Parallel()
+
+	deps := buildPlacementDeps([]map[string]any{onlineNode("pve1")}, func(c *config.CPIConfig) {
+		c.Placement = &config.PlacementConfig{
+			AZMap: map[string][]string{"zone-a": {"pve1"}},
+		}
+		c.VMTypes = map[string]config.TypeProfile{
+			"heavy": {CloudProperties: map[string]any{"placement_weight_mem": float64(3.0)}},
+		}
+	})
+	cp := createVMCloudProps{AvailabilityZone: "zone-a"}
+	// Per-call value (2.0) must win over profile value (3.0); node is still pve1 either way.
+	cpMap := map[string]any{
+		"vm_type":              "heavy",
+		"placement_weight_mem": float64(2.0),
+	}
+	node, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", nil, nil, cpMap)
+	if err != nil {
+		t.Fatalf("per-call beats profile: unexpected error: %v", err)
+	}
+	if node != "pve1" {
+		t.Errorf("expected pve1; got %q", node)
+	}
+}
+
+// TestResolveTargetNodeWithRNG_UnknownVMTypeSelector_CloudError verifies that
+// an unknown vm_type selector in cloudPropsMap returns a CloudError immediately.
+func TestResolveTargetNodeWithRNG_UnknownVMTypeSelector_CloudError(t *testing.T) {
+	t.Parallel()
+
+	deps := buildPlacementDeps([]map[string]any{onlineNode("pve1")}, func(c *config.CPIConfig) {
+		c.Placement = &config.PlacementConfig{
+			AZMap: map[string][]string{"zone-a": {"pve1"}},
+		}
+		c.VMTypes = map[string]config.TypeProfile{
+			"known": {CloudProperties: map[string]any{}},
+		}
+	})
+	cp := createVMCloudProps{AvailabilityZone: "zone-a"}
+	cpMap := map[string]any{"vm_type": "unknown-profile"}
+	_, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", nil, nil, cpMap)
+	if err == nil {
+		t.Fatal("expected CloudError for unknown vm_type selector; got nil")
+	}
+	var cpiErr *cpierrors.Error
+	if !stderrors.As(err, &cpiErr) {
+		t.Fatalf("expected *cpierrors.Error; got %T: %v", err, err)
+	}
+	if cpiErr.OkToRetry() {
+		t.Error("unknown selector must produce non-retriable CloudError")
+	}
+}
+
+// TestResolveTargetNodeWithRNG_AZFromVMTypeProfile_SingularUsed verifies that
+// when cp.AvailabilityZone and cp.AvailabilityZones are both absent, the
+// availability_zone from the vm_type profile is used as the singular AZ.
+func TestResolveTargetNodeWithRNG_AZFromVMTypeProfile_SingularUsed(t *testing.T) {
+	t.Parallel()
+
+	deps := buildPlacementDeps([]map[string]any{onlineNode("pve1"), onlineNode("pve2")}, func(c *config.CPIConfig) {
+		c.Placement = &config.PlacementConfig{
+			AZMap: map[string][]string{
+				"zone-a": {"pve1"},
+				"zone-b": {"pve2"},
+			},
+		}
+		c.VMTypes = map[string]config.TypeProfile{
+			"zoned": {CloudProperties: map[string]any{"availability_zone": "zone-a"}},
+		}
+	})
+	cp := createVMCloudProps{} // no per-call AZ
+	cpMap := map[string]any{"vm_type": "zoned"}
+	node, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", nil, nil, cpMap)
+	if err != nil {
+		t.Fatalf("profile singular AZ: unexpected error: %v", err)
+	}
+	if node != "pve1" {
+		t.Errorf("profile az=zone-a → expected pve1; got %q", node)
+	}
+}
+
+// TestResolveTargetNodeWithRNG_AZFromVMTypeProfile_PluralUsed verifies that
+// availability_zones (plural) from the vm_type profile feeds the multi-AZ path.
+func TestResolveTargetNodeWithRNG_AZFromVMTypeProfile_PluralUsed(t *testing.T) {
+	t.Parallel()
+
+	// pve1 is offline → zone-a exhausted → zone-b (pve2) wins via profile plural list.
+	deps := buildPlacementDeps([]map[string]any{
+		{"type": "node", "name": "pve1", "online": 0, "maxcpu": int64(4), "maxmem": int64(8 * 1024 * 1024 * 1024), "mem": int64(0), "cpu": 0.0},
+		onlineNode("pve2"),
+	}, func(c *config.CPIConfig) {
+		c.Placement = &config.PlacementConfig{
+			AZMap: map[string][]string{
+				"zone-a": {"pve1"},
+				"zone-b": {"pve2"},
+			},
+		}
+		c.VMTypes = map[string]config.TypeProfile{
+			"multi": {CloudProperties: map[string]any{
+				"availability_zones": []any{"zone-a", "zone-b"},
+			}},
+		}
+	})
+	cp := createVMCloudProps{} // no per-call AZ
+	cpMap := map[string]any{"vm_type": "multi"}
+	node, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", nil, nil, cpMap)
+	if err != nil {
+		t.Fatalf("profile plural AZs: unexpected error: %v", err)
+	}
+	if node != "pve2" {
+		t.Errorf("zone-a exhausted (pve1 offline), zone-b should win; got %q", node)
+	}
+}
+
+// TestResolveTargetNodeWithRNG_AZCallBeatsProfile verifies that per-call
+// availability_zone beats the profile's availability_zone.
+func TestResolveTargetNodeWithRNG_AZCallBeatsProfile(t *testing.T) {
+	t.Parallel()
+
+	deps := buildPlacementDeps([]map[string]any{onlineNode("pve1"), onlineNode("pve2")}, func(c *config.CPIConfig) {
+		c.Placement = &config.PlacementConfig{
+			AZMap: map[string][]string{
+				"zone-a": {"pve1"},
+				"zone-b": {"pve2"},
+			},
+		}
+		c.VMTypes = map[string]config.TypeProfile{
+			"zoned": {CloudProperties: map[string]any{"availability_zone": "zone-b"}},
+		}
+	})
+	// Per-call says zone-a → pve1; profile says zone-b → pve2.
+	cp := createVMCloudProps{AvailabilityZone: "zone-a"}
+	cpMap := map[string]any{"vm_type": "zoned"}
+	node, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", nil, nil, cpMap)
+	if err != nil {
+		t.Fatalf("call AZ beats profile: unexpected error: %v", err)
+	}
+	if node != "pve1" {
+		t.Errorf("per-call zone-a must win over profile zone-b; got %q", node)
+	}
+}
+
+// --------------------------------------------------------------------------
+// resolveVMShapeStorage — layered resolver integration
+// --------------------------------------------------------------------------
+
+// minimalParsedArgsWithCP returns a *createVMParsedArgs with cloudPropsMap set.
+func minimalParsedArgsWithCP(stemcellStorage string, cpMap map[string]any) *createVMParsedArgs {
+	p := minimalParsedArgs(stemcellStorage)
+	p.cloudPropsMap = cpMap
+	return p
+}
+
+// TestResolveVMShapeStorage_NoProfile_UsesConfigVMStorage verifies byte-identical
+// behavior when no vm_type profile or storage_pool override is present: vmStorage
+// equals config.VMStorage.
+func TestResolveVMShapeStorage_NoProfile_UsesConfigVMStorage(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.CPIConfig{VMStorage: "local-lvm"}
+	parsed := minimalParsedArgsWithCP("stemcell-store", map[string]any{})
+
+	vmStorage, vmDiskFormat, _, err := resolveVMShapeStorage(cfg, parsed)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if vmStorage != "local-lvm" {
+		t.Errorf("vmStorage = %q; want local-lvm (config)", vmStorage)
+	}
+	if vmDiskFormat != diskFormatQCOW2 {
+		t.Errorf("vmDiskFormat = %q; want %q (default)", vmDiskFormat, diskFormatQCOW2)
+	}
+}
+
+// TestResolveVMShapeStorage_NoProfile_NoConfig_FallbackToStemcell verifies that
+// when config.VMStorage is empty the stemcell storage is used as fallback.
+func TestResolveVMShapeStorage_NoProfile_NoConfig_FallbackToStemcell(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.CPIConfig{VMStorage: ""}
+	parsed := minimalParsedArgsWithCP("stemcell-store", map[string]any{})
+
+	vmStorage, _, _, err := resolveVMShapeStorage(cfg, parsed)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if vmStorage != "stemcell-store" {
+		t.Errorf("vmStorage = %q; want stemcell-store (stemcell fallback)", vmStorage)
+	}
+}
+
+// TestResolveVMShapeStorage_CallCP_StoragePool_OverridesConfig verifies that
+// cloud_properties.storage_pool in the call layer overrides config.VMStorage.
+func TestResolveVMShapeStorage_CallCP_StoragePool_OverridesConfig(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.CPIConfig{VMStorage: "local-lvm"}
+	parsed := minimalParsedArgsWithCP("stemcell-store", map[string]any{
+		"storage_pool": "fast-nvme",
+	})
+
+	vmStorage, _, _, err := resolveVMShapeStorage(cfg, parsed)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if vmStorage != "fast-nvme" {
+		t.Errorf("vmStorage = %q; want fast-nvme (call cloud_properties override)", vmStorage)
+	}
+}
+
+// TestResolveVMShapeStorage_VMTypeProfile_StoragePool verifies that a vm_type
+// profile's storage_pool is used when the call layer has no storage_pool set.
+func TestResolveVMShapeStorage_VMTypeProfile_StoragePool(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.CPIConfig{
+		VMStorage: "local-lvm",
+		VMTypes: map[string]config.TypeProfile{
+			"large": {
+				CloudProperties: map[string]any{
+					"storage_pool": "ceph-fast",
+				},
+			},
+		},
+	}
+	// Call layer selects vm_type "large" but supplies no storage_pool itself.
+	parsed := minimalParsedArgsWithCP("stemcell-store", map[string]any{
+		"vm_type": "large",
+	})
+
+	vmStorage, _, _, err := resolveVMShapeStorage(cfg, parsed)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if vmStorage != "ceph-fast" {
+		t.Errorf("vmStorage = %q; want ceph-fast (vm_type profile)", vmStorage)
+	}
+}
+
+// TestResolveVMShapeStorage_CallOverridesProfile verifies that an explicit
+// storage_pool in the call layer wins over a vm_type profile storage_pool.
+func TestResolveVMShapeStorage_CallOverridesProfile(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.CPIConfig{
+		VMStorage: "local-lvm",
+		VMTypes: map[string]config.TypeProfile{
+			"large": {
+				CloudProperties: map[string]any{
+					"storage_pool": "ceph-fast",
+				},
+			},
+		},
+	}
+	parsed := minimalParsedArgsWithCP("stemcell-store", map[string]any{
+		"vm_type":      "large",
+		"storage_pool": "override-pool",
+	})
+
+	vmStorage, _, _, err := resolveVMShapeStorage(cfg, parsed)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if vmStorage != "override-pool" {
+		t.Errorf("vmStorage = %q; want override-pool (call beats profile)", vmStorage)
+	}
+}
+
+// TestResolveVMShapeStorage_DiskFormat_FromProfile verifies that vm_disk_format
+// in a vm_type profile is applied when the call layer has no disk format.
+func TestResolveVMShapeStorage_DiskFormat_FromProfile(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.CPIConfig{
+		VMStorage: "local-lvm",
+		VMTypes: map[string]config.TypeProfile{
+			"fast": {
+				CloudProperties: map[string]any{
+					"vm_disk_format": "raw",
+				},
+			},
+		},
+	}
+	parsed := minimalParsedArgsWithCP("stemcell-store", map[string]any{
+		"vm_type": "fast",
+	})
+	// struct field left empty — profile should supply the format.
+	parsed.cloudProps.VMDiskFormat = ""
+
+	_, vmDiskFormat, _, err := resolveVMShapeStorage(cfg, parsed)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if vmDiskFormat != "raw" {
+		t.Errorf("vmDiskFormat = %q; want raw (from vm_type profile)", vmDiskFormat)
+	}
+}
+
+// TestResolveVMShapeStorage_DiskFormat_CallBeatsProfile verifies that an explicit
+// vm_disk_format in the call layer beats the profile value.
+func TestResolveVMShapeStorage_DiskFormat_CallBeatsProfile(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.CPIConfig{
+		VMStorage: "local-lvm",
+		VMTypes: map[string]config.TypeProfile{
+			"fast": {
+				CloudProperties: map[string]any{
+					"vm_disk_format": "raw",
+				},
+			},
+		},
+	}
+	parsed := minimalParsedArgsWithCP("stemcell-store", map[string]any{
+		"vm_type":        "fast",
+		"vm_disk_format": "vmdk",
+	})
+	// struct field mirrors call layer value (it was unmarshalled from args[2]).
+	parsed.cloudProps.VMDiskFormat = "vmdk"
+
+	_, vmDiskFormat, _, err := resolveVMShapeStorage(cfg, parsed)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if vmDiskFormat != "vmdk" {
+		t.Errorf("vmDiskFormat = %q; want vmdk (call beats profile)", vmDiskFormat)
+	}
+}
+
+// TestResolveVMShapeStorage_UnknownVMType_ReturnsCloudError verifies that an
+// unknown vm_type selector produces a CloudError from resolveVMShapeStorage.
+func TestResolveVMShapeStorage_UnknownVMType_ReturnsCloudError(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.CPIConfig{
+		VMStorage: "local-lvm",
+		VMTypes:   map[string]config.TypeProfile{},
+	}
+	parsed := minimalParsedArgsWithCP("stemcell-store", map[string]any{
+		"vm_type": "unknown-profile",
+	})
+
+	_, _, _, err := resolveVMShapeStorage(cfg, parsed)
+
+	if err == nil {
+		t.Fatal("expected CloudError for unknown vm_type; got nil")
+	}
+	var cpiErr *cpierrors.Error
+	if !stderrors.As(err, &cpiErr) {
+		t.Errorf("expected *cpierrors.Error, got %T: %v", err, err)
+	}
+}
+
+// TestResolveVMShape_StoragePool_FlowsToStorageTypeLookup verifies that a
+// storage_pool from the call layer flows through resolveVMShape into
+// shape.vmStorage and shape.vmStorageType is looked up for the resolved pool.
+func TestResolveVMShape_StoragePool_FlowsToStorageTypeLookup(t *testing.T) {
+	t.Parallel()
+
+	deps := Deps{
+		Config: &config.CPIConfig{
+			Node:           "pve",
+			VMStorage:      "local-lvm",
+			VMIDRangeStart: 100,
+		},
+		PVE: &shapeTestPVEClient{
+			clusterStorageSvc: &shapeTestClusterStorage{
+				entries: []map[string]any{
+					{"storage": "local-lvm", "type": "dir"},
+					{"storage": "ceph-pool", "type": "rbd"},
+				},
+			},
+		},
+	}
+
+	parsed := minimalParsedArgsWithCP("test-storage", map[string]any{
+		"storage_pool": "ceph-pool",
+	})
+
+	shape, err := resolveVMShape(context.Background(), deps, parsed)
+	if err != nil {
+		t.Fatalf("resolveVMShape returned error: %v", err)
+	}
+	if shape.vmStorage != "ceph-pool" {
+		t.Errorf("vmStorage = %q; want ceph-pool (from call storage_pool)", shape.vmStorage)
+	}
+	if shape.vmStorageType != "rbd" {
+		t.Errorf("vmStorageType = %q; want rbd (looked up for ceph-pool)", shape.vmStorageType)
+	}
+}
+
+// TestResolveVMShape_UnknownVMType_PropagatesCloudError verifies that an unknown
+// vm_type selector in cloud_properties propagates a CloudError out of resolveVMShape.
+func TestResolveVMShape_UnknownVMType_PropagatesCloudError(t *testing.T) {
+	t.Parallel()
+
+	deps := Deps{
+		Config: &config.CPIConfig{
+			Node:           "pve",
+			VMStorage:      "local-lvm",
+			VMIDRangeStart: 100,
+			VMTypes:        map[string]config.TypeProfile{},
+		},
+		PVE: &shapeTestPVEClient{
+			clusterStorageSvc: &shapeTestClusterStorage{entries: nil},
+		},
+	}
+
+	parsed := minimalParsedArgsWithCP("test-storage", map[string]any{
+		"vm_type": "no-such-profile",
+	})
+
+	_, err := resolveVMShape(context.Background(), deps, parsed)
+	if err == nil {
+		t.Fatal("expected CloudError for unknown vm_type; got nil")
+	}
+	var cpiErr *cpierrors.Error
+	if !stderrors.As(err, &cpiErr) {
+		t.Errorf("expected *cpierrors.Error, got %T: %v", err, err)
+	}
+}
+
+// --------------------------------------------------------------------------
+// resolveVMShapeHotplugNUMA — layered resolver integration
+// --------------------------------------------------------------------------
+
+// TestResolveVMShapeHotplugNUMA_NoProfile_ByteIdentical verifies that when no
+// vm_type/disk_type profile and no call-layer hotplug/numa keys are set, the
+// result is identical to the pre-resolver behavior: config values win.
+func TestResolveVMShapeHotplugNUMA_NoProfile_ByteIdentical(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.CPIConfig{VMStorage: "local-lvm"}
+	// cp.Hotplug nil, cp.NUMA nil → config defaults.
+	cp := createVMCloudProps{}
+	cpMap := map[string]any{}
+
+	hotplug, numaEnabled := resolveVMShapeHotplugNUMA(cfg, cp, cpMap)
+
+	if hotplug != cfg.HotplugValue() {
+		t.Errorf("hotplug = %q; want %q (config default)", hotplug, cfg.HotplugValue())
+	}
+	if numaEnabled != cfg.NUMAValue() {
+		t.Errorf("numaEnabled = %v; want %v (config default)", numaEnabled, cfg.NUMAValue())
+	}
+}
+
+// TestResolveVMShapeHotplugNUMA_CallHotplugEmpty_DisablesHotplug verifies that
+// an explicit cp.Hotplug = "" (empty pointer) still wins — it means "disable
+// hotplug" and must not be overridden by a profile value.
+func TestResolveVMShapeHotplugNUMA_CallHotplugEmpty_DisablesHotplug(t *testing.T) {
+	t.Parallel()
+
+	emptyStr := ""
+	cp := createVMCloudProps{Hotplug: &emptyStr}
+	cpMap := map[string]any{
+		"vm_type": "fast",
+	}
+	cfg := &config.CPIConfig{
+		VMStorage: "local-lvm",
+		VMTypes: map[string]config.TypeProfile{
+			"fast": {
+				CloudProperties: map[string]any{
+					"hotplug": "network,disk,memory",
+				},
+			},
+		},
+	}
+
+	hotplug, _ := resolveVMShapeHotplugNUMA(cfg, cp, cpMap)
+
+	// Explicit empty pointer wins over profile value — empty string disables hotplug.
+	if hotplug != "" {
+		t.Errorf("hotplug = %q; want empty string (explicit cp.Hotplug='' disables, must beat profile)", hotplug)
+	}
+}
+
+// TestResolveVMShapeHotplugNUMA_ProfileHotplug_UsedWhenCallAbsent verifies that
+// a hotplug value from a vm_type profile is used when cp.Hotplug is nil.
+func TestResolveVMShapeHotplugNUMA_ProfileHotplug_UsedWhenCallAbsent(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.CPIConfig{
+		VMStorage: "local-lvm",
+		VMTypes: map[string]config.TypeProfile{
+			"memhot": {
+				CloudProperties: map[string]any{
+					"hotplug": "memory",
+				},
+			},
+		},
+	}
+	cp := createVMCloudProps{} // Hotplug nil
+	cpMap := map[string]any{"vm_type": "memhot"}
+
+	hotplug, _ := resolveVMShapeHotplugNUMA(cfg, cp, cpMap)
+
+	if hotplug != "memory" {
+		t.Errorf("hotplug = %q; want memory (from vm_type profile)", hotplug)
+	}
+}
+
+// TestResolveVMShapeHotplugNUMA_CallHotplugBeatsProfile verifies that an
+// explicit non-empty cp.Hotplug beats the profile value.
+func TestResolveVMShapeHotplugNUMA_CallHotplugBeatsProfile(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.CPIConfig{
+		VMStorage: "local-lvm",
+		VMTypes: map[string]config.TypeProfile{
+			"memhot": {
+				CloudProperties: map[string]any{
+					"hotplug": "memory",
+				},
+			},
+		},
+	}
+	callHotplug := "disk"
+	cp := createVMCloudProps{Hotplug: &callHotplug}
+	cpMap := map[string]any{"vm_type": "memhot", "hotplug": "disk"}
+
+	hotplug, _ := resolveVMShapeHotplugNUMA(cfg, cp, cpMap)
+
+	if hotplug != "disk" {
+		t.Errorf("hotplug = %q; want disk (call beats profile)", hotplug)
+	}
+}
+
+// TestResolveVMShapeHotplugNUMA_NUMAFalse_HonoredInCall verifies that an
+// explicit cp.NUMA = false is preserved (not overridden by config or profile).
+func TestResolveVMShapeHotplugNUMA_NUMAFalse_HonoredInCall(t *testing.T) {
+	t.Parallel()
+
+	numaTrue := true
+	cfg := &config.CPIConfig{
+		VMStorage: "local-lvm",
+		NUMA:      &numaTrue, // config says true
+		VMTypes: map[string]config.TypeProfile{
+			"numa-on": {
+				CloudProperties: map[string]any{
+					"numa": true,
+				},
+			},
+		},
+	}
+	numaFalse := false
+	cp := createVMCloudProps{NUMA: &numaFalse}
+	cpMap := map[string]any{"vm_type": "numa-on"}
+
+	_, numaEnabled := resolveVMShapeHotplugNUMA(cfg, cp, cpMap)
+
+	if numaEnabled {
+		t.Error("numaEnabled = true; want false (explicit cp.NUMA=false must win over config+profile)")
+	}
+}
+
+// TestResolveVMShapeHotplugNUMA_ProfileNUMAFalse_HonoredWhenCallAbsent verifies
+// that a profile can set numa=false when the call does not specify cp.NUMA.
+func TestResolveVMShapeHotplugNUMA_ProfileNUMAFalse_HonoredWhenCallAbsent(t *testing.T) {
+	t.Parallel()
+
+	numaTrue := true
+	cfg := &config.CPIConfig{
+		VMStorage: "local-lvm",
+		NUMA:      &numaTrue, // config default is true
+		VMTypes: map[string]config.TypeProfile{
+			"numa-off": {
+				CloudProperties: map[string]any{
+					"numa": false, // profile says off
+				},
+			},
+		},
+	}
+	cp := createVMCloudProps{} // NUMA nil
+	cpMap := map[string]any{"vm_type": "numa-off"}
+
+	_, numaEnabled := resolveVMShapeHotplugNUMA(cfg, cp, cpMap)
+
+	if numaEnabled {
+		t.Error("numaEnabled = true; want false (profile numa=false must override config default)")
+	}
+}
+
+// TestResolveVMShapeHotplugNUMA_ProfileNUMATrue_UsedWhenCallAbsent verifies that
+// a profile numa=true is respected when cp.NUMA is nil.
+func TestResolveVMShapeHotplugNUMA_ProfileNUMATrue_UsedWhenCallAbsent(t *testing.T) {
+	t.Parallel()
+
+	numaFalse := false
+	cfg := &config.CPIConfig{
+		VMStorage: "local-lvm",
+		NUMA:      &numaFalse, // config default is false
+		VMTypes: map[string]config.TypeProfile{
+			"numa-on": {
+				CloudProperties: map[string]any{
+					"numa": true,
+				},
+			},
+		},
+	}
+	cp := createVMCloudProps{}
+	cpMap := map[string]any{"vm_type": "numa-on"}
+
+	_, numaEnabled := resolveVMShapeHotplugNUMA(cfg, cp, cpMap)
+
+	if !numaEnabled {
+		t.Error("numaEnabled = false; want true (profile numa=true must override config default false)")
+	}
+}
+
+// TestResolveVMShapeHotplugNUMA_UnknownVMType_ReturnsCloudError verifies that an
+// unknown vm_type selector in cloud_properties causes a CloudError.
+func TestResolveVMShapeHotplugNUMA_UnknownVMType_ReturnsCloudError(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.CPIConfig{
+		VMStorage: "local-lvm",
+		VMTypes:   map[string]config.TypeProfile{},
+	}
+	cp := createVMCloudProps{}
+	cpMap := map[string]any{"vm_type": "no-such-profile"}
+
+	_, _, err := resolveVMShapeHotplugNUMAWithError(cfg, cp, cpMap)
+	if err == nil {
+		t.Fatal("expected CloudError for unknown vm_type; got nil")
+	}
+	var cpiErr *cpierrors.Error
+	if !stderrors.As(err, &cpiErr) {
+		t.Errorf("expected *cpierrors.Error, got %T: %v", err, err)
+	}
+}
+
+// --------------------------------------------------------------------------
+// configureNICs bridge/model — layered resolver integration
+// --------------------------------------------------------------------------
+
+// TestConfigureNICs_NoProfile_ByteIdentical verifies the exact bridge/model
+// precedence that existed before the resolver was added:
+//
+//	config.NetworkBridge → cp.NetworkBridge (VM-level) → per-NIC bridge override
+//
+// This acts as a golden no-op regression test.
+func TestConfigureNICs_BridgeModel_NoProfile_ByteIdentical(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.CPIConfig{
+		VMStorage:     "local-lvm",
+		NetworkBridge: "vmbr1",
+	}
+	cp := createVMCloudProps{TargetNode: "pve"} // NetworkBridge/NetworkModel empty
+	cpMap := map[string]any{}
+
+	bridge, model := resolveVMNICDefaults(cfg, cp, cpMap)
+
+	if bridge != "vmbr1" {
+		t.Errorf("bridge = %q; want vmbr1 (config.NetworkBridge)", bridge)
+	}
+	if model != "virtio" {
+		t.Errorf("model = %q; want virtio (built-in default)", model)
+	}
+}
+
+// TestConfigureNICs_BridgeModel_CallBridge_Wins verifies that cp.NetworkBridge
+// (call layer) beats config.NetworkBridge.
+func TestConfigureNICs_BridgeModel_CallBridge_Wins(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.CPIConfig{
+		VMStorage:     "local-lvm",
+		NetworkBridge: "vmbr1",
+	}
+	cp := createVMCloudProps{NetworkBridge: "vmbr99"}
+	cpMap := map[string]any{"network_bridge": "vmbr99"}
+
+	bridge, _ := resolveVMNICDefaults(cfg, cp, cpMap)
+
+	if bridge != "vmbr99" {
+		t.Errorf("bridge = %q; want vmbr99 (call beats config)", bridge)
+	}
+}
+
+// TestConfigureNICs_BridgeModel_ProfileBridge_UsedWhenCallAbsent verifies that
+// a network_bridge value in a vm_type profile supplies the VM-level default when
+// the call does not include a network_bridge.
+func TestConfigureNICs_BridgeModel_ProfileBridge_UsedWhenCallAbsent(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.CPIConfig{
+		VMStorage:     "local-lvm",
+		NetworkBridge: "vmbr0",
+		VMTypes: map[string]config.TypeProfile{
+			"isolated": {
+				CloudProperties: map[string]any{
+					"network_bridge": "vmbr10",
+				},
+			},
+		},
+	}
+	cp := createVMCloudProps{} // NetworkBridge empty
+	cpMap := map[string]any{"vm_type": "isolated"}
+
+	bridge, _ := resolveVMNICDefaults(cfg, cp, cpMap)
+
+	if bridge != "vmbr10" {
+		t.Errorf("bridge = %q; want vmbr10 (from vm_type profile)", bridge)
+	}
+}
+
+// TestConfigureNICs_BridgeModel_CallBridgeBeatsProfile verifies that an explicit
+// cp.NetworkBridge in the call beats the profile value.
+func TestConfigureNICs_BridgeModel_CallBridgeBeatsProfile(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.CPIConfig{
+		VMStorage: "local-lvm",
+		VMTypes: map[string]config.TypeProfile{
+			"isolated": {
+				CloudProperties: map[string]any{
+					"network_bridge": "vmbr10",
+				},
+			},
+		},
+	}
+	cp := createVMCloudProps{NetworkBridge: "vmbr5"}
+	cpMap := map[string]any{"vm_type": "isolated", "network_bridge": "vmbr5"}
+
+	bridge, _ := resolveVMNICDefaults(cfg, cp, cpMap)
+
+	if bridge != "vmbr5" {
+		t.Errorf("bridge = %q; want vmbr5 (call beats profile)", bridge)
+	}
+}
+
+// TestConfigureNICs_BridgeModel_ProfileModel_UsedWhenCallAbsent verifies that
+// network_model from a vm_type profile is used when the call has no model.
+func TestConfigureNICs_BridgeModel_ProfileModel_UsedWhenCallAbsent(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.CPIConfig{
+		VMStorage: "local-lvm",
+		VMTypes: map[string]config.TypeProfile{
+			"compat": {
+				CloudProperties: map[string]any{
+					"network_model": "e1000",
+				},
+			},
+		},
+	}
+	cp := createVMCloudProps{} // NetworkModel empty
+	cpMap := map[string]any{"vm_type": "compat"}
+
+	_, model := resolveVMNICDefaults(cfg, cp, cpMap)
+
+	if model != "e1000" {
+		t.Errorf("model = %q; want e1000 (from vm_type profile)", model)
+	}
+}
+
+// TestConfigureNICs_BridgeModel_UnknownVMType_ReturnsCloudError verifies that an
+// unknown vm_type selector causes a CloudError from resolveVMNICDefaults.
+func TestConfigureNICs_BridgeModel_UnknownVMType_ReturnsCloudError(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.CPIConfig{
+		VMStorage: "local-lvm",
+		VMTypes:   map[string]config.TypeProfile{},
+	}
+	cp := createVMCloudProps{}
+	cpMap := map[string]any{"vm_type": "no-such"}
+
+	_, _, err := resolveVMNICDefaultsWithError(cfg, cp, cpMap)
+	if err == nil {
+		t.Fatal("expected CloudError for unknown vm_type; got nil")
+	}
+	var cpiErr *cpierrors.Error
+	if !stderrors.As(err, &cpiErr) {
+		t.Errorf("expected *cpierrors.Error, got %T: %v", err, err)
+	}
+}
+
+// --------------------------------------------------------------------------
+// resolveCloneMode — layered resolver integration
+// --------------------------------------------------------------------------
+
+// TestResolveCloneMode_NoProfile_ByteIdentical verifies that when no vm_type
+// profile and no call-layer clone_mode key are present, the result equals
+// config.CloneMode (default "auto").
+func TestResolveCloneMode_NoProfile_ByteIdentical(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.CPIConfig{VMStorage: "local-lvm", CloneMode: "auto"}
+	cpMap := map[string]any{}
+
+	mode, err := resolveCloneMode(cfg, cpMap)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if mode != "auto" {
+		t.Errorf("clone_mode = %q; want auto (config default)", mode)
+	}
+}
+
+// TestResolveCloneMode_ProfileOverridesConfig verifies that a clone_mode in a
+// vm_type profile overrides config.CloneMode.
+func TestResolveCloneMode_ProfileOverridesConfig(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.CPIConfig{
+		VMStorage: "local-lvm",
+		CloneMode: "auto",
+		VMTypes: map[string]config.TypeProfile{
+			"linked-only": {
+				CloudProperties: map[string]any{
+					"clone_mode": "linked",
+				},
+			},
+		},
+	}
+	cpMap := map[string]any{"vm_type": "linked-only"}
+
+	mode, err := resolveCloneMode(cfg, cpMap)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if mode != "linked" {
+		t.Errorf("clone_mode = %q; want linked (from vm_type profile)", mode)
+	}
+}
+
+// TestResolveCloneMode_CallBeatsProfile verifies that an explicit clone_mode in
+// the call layer beats the profile value.
+func TestResolveCloneMode_CallBeatsProfile(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.CPIConfig{
+		VMStorage: "local-lvm",
+		CloneMode: "auto",
+		VMTypes: map[string]config.TypeProfile{
+			"linked-only": {
+				CloudProperties: map[string]any{
+					"clone_mode": "linked",
+				},
+			},
+		},
+	}
+	cpMap := map[string]any{"vm_type": "linked-only", "clone_mode": "full"}
+
+	mode, err := resolveCloneMode(cfg, cpMap)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if mode != "full" {
+		t.Errorf("clone_mode = %q; want full (call beats profile)", mode)
+	}
+}
+
+// TestResolveCloneMode_ConfigDefault_WhenNilEmpty verifies that an empty
+// config.CloneMode defaults to "auto".
+func TestResolveCloneMode_ConfigDefault_WhenNilEmpty(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.CPIConfig{VMStorage: "local-lvm"} // CloneMode not set
+	cpMap := map[string]any{}
+
+	mode, err := resolveCloneMode(cfg, cpMap)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if mode != "auto" {
+		t.Errorf("clone_mode = %q; want auto (empty config defaults to auto)", mode)
+	}
+}
+
+// TestResolveCloneMode_UnknownVMType_ReturnsCloudError verifies that an unknown
+// vm_type selector causes a CloudError from resolveCloneMode.
+func TestResolveCloneMode_UnknownVMType_ReturnsCloudError(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.CPIConfig{
+		VMStorage: "local-lvm",
+		VMTypes:   map[string]config.TypeProfile{},
+	}
+	cpMap := map[string]any{"vm_type": "no-such"}
+
+	_, err := resolveCloneMode(cfg, cpMap)
+	if err == nil {
+		t.Fatal("expected CloudError for unknown vm_type; got nil")
+	}
+	var cpiErr *cpierrors.Error
+	if !stderrors.As(err, &cpiErr) {
+		t.Errorf("expected *cpierrors.Error, got %T: %v", err, err)
 	}
 }

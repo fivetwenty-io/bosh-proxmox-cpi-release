@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strconv"
 
+	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
@@ -15,6 +16,27 @@ import (
 // fwGroupRuleType is the PVE firewall rule type used to reference a cluster
 // firewall group from a VM: a rule with type=group and action=<group name>.
 const fwGroupRuleType = "group"
+
+// enableVMFirewall enables the VM-level PVE firewall without attaching any group
+// rules. It is called standalone when the operator has set the firewall flag but
+// provided no security groups, and is also called by applySecurityGroups after
+// group rules are attached so that the enable path is never duplicated.
+//
+// PVE API faults are wrapped retriable via pve.WrapError. Every error path
+// returns to create_vm, which rolls the VM back.
+func enableVMFirewall(ctx context.Context, deps Deps, node string, vmid int, logger *log.Logger) error {
+	nodeSvc := deps.PVE.Nodes()
+	vmidStr := strconv.Itoa(vmid)
+	enableFW := true
+	if optErr := nodeSvc.UpdateQemuFirewallOptions(ctx, node, vmidStr, &sdknodes.UpdateQemuFirewallOptionsParams{
+		Enable: &enableFW,
+	}); optErr != nil {
+		return cpierrors.Wrap(pve.WrapError(optErr),
+			fmt.Sprintf("create_vm: enable VM firewall vmid=%d", vmid))
+	}
+	logger.Info("create_vm: VM-level firewall enabled", log.Int("vmid", vmid))
+	return nil
+}
 
 // applySecurityGroups attaches each named PVE cluster firewall group to the VM
 // as a group-type firewall rule and enables the VM-level firewall so the rules
@@ -71,12 +93,9 @@ func applySecurityGroups(
 	}
 
 	// 3. Enable the VM-level firewall so the attached group rules filter traffic.
-	enableFW := true
-	if optErr := nodeSvc.UpdateQemuFirewallOptions(ctx, node, vmidStr, &sdknodes.UpdateQemuFirewallOptionsParams{
-		Enable: &enableFW,
-	}); optErr != nil {
-		return cpierrors.Wrap(pve.WrapError(optErr),
-			fmt.Sprintf("create_vm: enable VM firewall vmid=%d", vmid))
+	//    Delegate to enableVMFirewall to keep the enable path in one place.
+	if err := enableVMFirewall(ctx, deps, node, vmid, logger); err != nil {
+		return err
 	}
 
 	logger.Info("create_vm: applied firewall security groups",
@@ -84,6 +103,56 @@ func applySecurityGroups(
 		log.Int("group_count", len(groups)),
 	)
 	return nil
+}
+
+// resolveEffectiveSecurityGroups returns the ordered security group list to apply
+// to a new VM. Precedence (highest first):
+//
+//  1. callGroups — the parsed cloud_properties.security_groups from the create_vm call.
+//  2. resolver.StringSlice("security_groups") — disk_type then vm_type profile layers.
+//  3. cfg.SecurityGroups — global config default.
+//
+// A nil/empty result means no firewall group API calls should be made.
+//
+// callCP is the raw cloud_properties map used to build the layered resolver.
+// A nil callCP is treated as an empty map. Unknown vm_type or disk_type selectors
+// in callCP return a non-retriable CloudError.
+func resolveEffectiveSecurityGroups(callCP map[string]any, cfg *config.CPIConfig, callGroups []string) ([]string, error) {
+	if len(callGroups) > 0 {
+		return callGroups, nil
+	}
+	r, err := newLayeredResolver(callCP, cfg)
+	if err != nil {
+		return nil, err
+	}
+	if ss, ok := r.StringSlice("security_groups"); ok {
+		return ss, nil
+	}
+	if len(cfg.SecurityGroups) > 0 {
+		return cfg.SecurityGroups, nil
+	}
+	return nil, nil
+}
+
+// resolveEffectiveFirewall returns whether the VM-level firewall should be
+// enabled. Precedence (highest first):
+//
+//  1. resolver.Bool("firewall") — per-call cloud_properties or profile layer.
+//     Explicit false here overrides config (returned as (false, nil)).
+//  2. cfg.VMFirewallEnabled() — global config default (*bool VMFirewall field).
+//
+// Returns (false, nil) when no layer sets the flag (nil VMFirewall + no callCP key).
+//
+// A nil callCP is treated as an empty map. Unknown selectors return a CloudError.
+func resolveEffectiveFirewall(callCP map[string]any, cfg *config.CPIConfig) (bool, error) {
+	r, err := newLayeredResolver(callCP, cfg)
+	if err != nil {
+		return false, err
+	}
+	if v, ok := r.Bool("firewall"); ok {
+		return v, nil
+	}
+	return cfg.VMFirewallEnabled(), nil
 }
 
 // listFirewallGroupNames returns the set of PVE cluster firewall group names.

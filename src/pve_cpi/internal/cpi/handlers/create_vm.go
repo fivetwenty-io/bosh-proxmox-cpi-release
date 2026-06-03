@@ -165,9 +165,14 @@ type createVMParsedArgs struct {
 	rawCID       string // stripped of "light:" prefix
 	stemcellStor string // storage component of rawCID
 	cloudProps   createVMCloudProps
-	networks     map[string]createVMNetworkSpec
-	diskCIDs     []string
-	env          map[string]any
+	// cloudPropsMap is the raw map decoded from args[2] (same JSON as
+	// cloudProps). It carries the vm_type / disk_type selector keys and any
+	// extra cloud_properties (e.g. storage_pool) that are not modelled as
+	// struct fields, and feeds the layered resolver in resolveVMShapeStorage.
+	cloudPropsMap map[string]any
+	networks      map[string]createVMNetworkSpec
+	diskCIDs      []string
+	env           map[string]any
 }
 
 // createVMShape holds the resolved VM-shape parameters derived from
@@ -192,6 +197,10 @@ type createVMShape struct {
 	rangeStart    int
 	maxAttempts   int
 	initialName   string
+	// cloudPropsMap is the raw cloud_properties map from the parsed args. It is
+	// carried forward so cloneFromTemplate can consult it for clone_mode resolution
+	// via the layered resolver (vm_type profile may override config.CloneMode).
+	cloudPropsMap map[string]any
 }
 
 // HandleCreateVM returns a cpi.Handler that implements the BOSH CPI create_vm method.
@@ -331,16 +340,40 @@ func createVM(
 	}
 
 	// -----------------------------------------------------------------------
-	// 8b. Attach firewall security groups (cloud_properties.security_groups).
+	// 8b. Firewall: resolve and apply security groups and VM-level firewall flag.
 	//
-	// Validates each named PVE cluster firewall group exists, attaches it as a
-	// group-type rule, and enables the VM-level firewall. A missing group is a
-	// non-retriable CloudError; any error here triggers the create_vm rollback
-	// (the VM is destroyed) so a half-firewalled VM is never left behind.
+	// Precedence for security_groups: per-call > vm_type/disk_type profile >
+	// config global default. Precedence for firewall flag: per-call cloud_properties
+	// > profile > config.VMFirewall.
+	//
+	// Behavior:
+	//   - effective groups non-empty  => applySecurityGroups (attaches rules +
+	//     enables firewall); the flag is NOT checked here to prevent double-enable.
+	//   - no groups but firewall flag true => enableVMFirewall (standalone enable).
+	//   - no groups and flag false/unset => no firewall API calls (byte-identical
+	//     to prior behavior when VMFirewall is nil and no groups are set).
+	//
+	// Any error triggers the create_vm rollback (the VM is destroyed) so a
+	// half-firewalled VM is never left behind.
 	// -----------------------------------------------------------------------
-	if len(parsed.cloudProps.SecurityGroups) > 0 {
-		if fwErr := applySecurityGroups(ctx, deps, shape.node, vmid, parsed.cloudProps.SecurityGroups, logger); fwErr != nil {
+	effectiveGroups, groupErr := resolveEffectiveSecurityGroups(
+		parsed.cloudPropsMap, deps.Config, parsed.cloudProps.SecurityGroups)
+	if groupErr != nil {
+		return nil, groupErr
+	}
+	if len(effectiveGroups) > 0 {
+		if fwErr := applySecurityGroups(ctx, deps, shape.node, vmid, effectiveGroups, logger); fwErr != nil {
 			return nil, fwErr
+		}
+	} else {
+		firewallEnabled, fwFlagErr := resolveEffectiveFirewall(parsed.cloudPropsMap, deps.Config)
+		if fwFlagErr != nil {
+			return nil, fwFlagErr
+		}
+		if firewallEnabled {
+			if fwErr := enableVMFirewall(ctx, deps, shape.node, vmid, logger); fwErr != nil {
+				return nil, fwErr
+			}
 		}
 	}
 
@@ -448,6 +481,17 @@ func parseCreateVMArgs(args []json.RawMessage) (*createVMParsedArgs, error) {
 		return nil, cpierrors.Cloud("create_vm: parse cloud_properties: %s", err.Error())
 	}
 
+	// Also decode into a raw map so the layered resolver can access keys not
+	// modelled in createVMCloudProps (e.g. storage_pool, vm_type, disk_type).
+	// null args[2] unmarshals to a nil map; treat nil as empty (no overrides).
+	var cloudPropsMap map[string]any
+	if err := json.Unmarshal(args[2], &cloudPropsMap); err != nil {
+		return nil, cpierrors.Cloud("create_vm: parse cloud_properties (raw): %s", err.Error())
+	}
+	if cloudPropsMap == nil {
+		cloudPropsMap = map[string]any{}
+	}
+
 	var networks map[string]createVMNetworkSpec
 	if err := json.Unmarshal(args[3], &networks); err != nil {
 		return nil, cpierrors.Cloud("create_vm: parse networks: %s", err.Error())
@@ -477,14 +521,15 @@ func parseCreateVMArgs(args []json.RawMessage) (*createVMParsedArgs, error) {
 	}
 
 	return &createVMParsedArgs{
-		agentID:      agentID,
-		stemcellCID:  stemcellCID,
-		rawCID:       rawCID,
-		stemcellStor: stemcellStor,
-		cloudProps:   cloudProps,
-		networks:     networks,
-		diskCIDs:     diskCIDs,
-		env:          env,
+		agentID:       agentID,
+		stemcellCID:   stemcellCID,
+		rawCID:        rawCID,
+		stemcellStor:  stemcellStor,
+		cloudProps:    cloudProps,
+		cloudPropsMap: cloudPropsMap,
+		networks:      networks,
+		diskCIDs:      diskCIDs,
+		env:           env,
 	}, nil
 }
 
@@ -501,15 +546,33 @@ func resolveVMShape(ctx context.Context, deps Deps, parsed *createVMParsedArgs) 
 	// and behavior is identical to Tier 1.
 	groupTag := antiAffinityGroupTag(deps.Config, parsed.env)
 
-	node, err := resolveTargetNode(ctx, deps, cp, groupTag, parsed.diskCIDs)
+	node, err := resolveTargetNode(ctx, deps, cp, groupTag, parsed.diskCIDs, parsed.cloudPropsMap)
 	if err != nil {
 		return nil, err
 	}
 
 	rangeStart, maxAttempts := resolveVMIDAllocParams(deps.Config)
-	vmStorage, vmDiskFormat, rootDiskGiB := resolveVMShapeStorage(deps.Config, parsed)
+	// Build a tier-resolver closure so resolveVMShapeStorage can call
+	// resolveStorageTier without its signature carrying ctx/Deps directly.
+	// The closure is only invoked when cloud_properties.storage_tier is set
+	// in the resolver layers; nil ClusterStorage falls through to config fallback.
+	var tierFnForVM vmStorageTierFn
+	if deps.PVE != nil && deps.PVE.ClusterStorage() != nil {
+		lister := deps.PVE.ClusterStorage()
+		cfg := deps.Config
+		tierFnForVM = func(tier string) (string, error) {
+			return resolveStorageTier(ctx, lister, cfg, tier)
+		}
+	}
+	vmStorage, vmDiskFormat, rootDiskGiB, err := resolveVMShapeStorage(deps.Config, parsed, tierFnForVM)
+	if err != nil {
+		return nil, err
+	}
 	cores, sockets, memMiB := resolveVMShapeCPUMem(cp)
-	hotplug, numaEnabled := resolveVMShapeHotplugNUMA(deps.Config, cp)
+	hotplug, numaEnabled, err := resolveVMShapeHotplugNUMAWithError(deps.Config, cp, parsed.cloudPropsMap)
+	if err != nil {
+		return nil, err
+	}
 
 	// Operator-supplied tags only. The BOSH-managed director/deployment/job
 	// triple is added later by set_vm_metadata.
@@ -536,6 +599,7 @@ func resolveVMShape(ctx context.Context, deps Deps, parsed *createVMParsedArgs) 
 		rangeStart:    rangeStart,
 		maxAttempts:   maxAttempts,
 		initialName:   initialName,
+		cloudPropsMap: parsed.cloudPropsMap,
 	}, nil
 }
 
@@ -570,12 +634,15 @@ func resolveVMShape(ctx context.Context, deps Deps, parsed *createVMParsedArgs) 
 // (a fresh rand source is created from the current time).
 //
 //nolint:gocognit // Multi-AZ loop + maintenance + retryability; inherent complexity.
-func resolveTargetNode(ctx context.Context, deps Deps, cp createVMCloudProps, groupTag string, diskCIDs []string) (string, error) {
-	return resolveTargetNodeWithRNG(ctx, deps, cp, groupTag, diskCIDs, nil)
+func resolveTargetNode(ctx context.Context, deps Deps, cp createVMCloudProps, groupTag string, diskCIDs []string, cloudPropsMap map[string]any) (string, error) {
+	return resolveTargetNodeWithRNG(ctx, deps, cp, groupTag, diskCIDs, nil, cloudPropsMap)
 }
 
 // resolveTargetNodeWithRNG is the testable implementation of resolveTargetNode.
 // rng controls AZ shuffle order; pass nil for production (non-deterministic).
+// cloudPropsMap is the raw cloud_properties map used to build the layered resolver
+// for per-call placement weight overrides and AZ resolution via vm_type profiles.
+// Pass nil to skip resolver-based overrides (existing behavior preserved byte-identically).
 //
 //nolint:gocognit // Multi-AZ loop + maintenance + retryability; inherent complexity.
 func resolveTargetNodeWithRNG(
@@ -585,6 +652,7 @@ func resolveTargetNodeWithRNG(
 	groupTag string,
 	diskCIDs []string,
 	rng *rand.Rand,
+	cloudPropsMap map[string]any,
 ) (string, error) {
 	// Nil-guard the logger: internal unit tests that call resolveVMShape directly
 	// may leave deps.Logger unset. Use a nop logger in that case so logging calls
@@ -620,13 +688,26 @@ func resolveTargetNodeWithRNG(
 		return cp.TargetNode, nil
 	}
 
+	// Build the layered resolver for per-call placement weight and AZ overrides.
+	// A nil or empty cloudPropsMap produces a call-only resolver with no profile layers;
+	// all lookups return not-found and behavior is byte-identical to the pre-resolver path.
+	// An unknown vm_type/disk_type selector returns a CloudError immediately.
+	var cpResolver *layeredResolver
+	if deps.Config != nil {
+		var resolverErr error
+		cpResolver, resolverErr = newLayeredResolver(cloudPropsMap, deps.Config)
+		if resolverErr != nil {
+			return "", resolverErr
+		}
+	}
+
 	// Branch 2: live placement scoring.
 	// Skip when deps.PVE is nil (unit test minimal setup) — fall through to Branch 3.
 	if deps.Config.PlacementEnabled() && deps.PVE != nil {
 		// Build the AZ iteration order.
 		// Singular availability_zone (backward compat) → single-element list,
 		// no multi-AZ fallback behavior.
-		azOrder := buildAZOrder(cp, deps.Config, rng)
+		azOrder := buildAZOrder(cp, deps.Config, rng, cpResolver)
 
 		// Apply shared-disk AZ constraint: if disks declare required AZs and the
 		// VM's AZ order is empty, constrain placement to the disk AZs. If the VM's
@@ -683,6 +764,23 @@ func resolveTargetNodeWithRNG(
 			Storage:    w.Storage,
 			CPU:        w.CPU,
 			GuestCount: w.GuestCount,
+		}
+		// Per-call cloud_properties weight overrides (opt-in, no global mutation).
+		// Only axes with an explicit value in the resolver override the config axis;
+		// absent keys leave the config value intact. AntiAffinity is config-only.
+		if cpResolver != nil {
+			if f, found := cpResolver.Float("placement_weight_mem"); found {
+				weights.Mem = f
+			}
+			if f, found := cpResolver.Float("placement_weight_storage"); found {
+				weights.Storage = f
+			}
+			if f, found := cpResolver.Float("placement_weight_cpu"); found {
+				weights.CPU = f
+			}
+			if f, found := cpResolver.Float("placement_weight_guest_count"); found {
+				weights.GuestCount = f
+			}
 		}
 		if groupTag != "" {
 			weights.AntiAffinity = placement.DefaultWeights().AntiAffinity
@@ -865,22 +963,45 @@ func applyDiskAZConstraint(azOrder []string, requiredAZs map[string]struct{}) ([
 }
 
 // buildAZOrder constructs the ordered AZ list for a placement attempt.
-// When singular availability_zone is set it returns a single-element slice
-// (backward compat; no fallback). Otherwise it starts from availability_zones
-// (plural), optionally shuffles a copy, then appends config az_fallback_order
-// entries not already present.
-func buildAZOrder(cp createVMCloudProps, cfg *config.CPIConfig, rng *rand.Rand) []string {
-	// Singular takes precedence — backward compat, no multi-AZ behavior.
+//
+// Priority (highest to lowest):
+//  1. cp.AvailabilityZone (singular, per-call) — backward compat; returns 1-elem slice, no fallback.
+//  2. cp.AvailabilityZones (plural, per-call) — iterate in operator order.
+//  3. resolver.String("availability_zone") — singular from profile; same semantics as #1.
+//  4. resolver.StringSlice("availability_zones") — plural from profile; feeds multi-AZ path.
+//  5. cfg.AZFallbackOrderValue() — config-level fallback appended after any plural list.
+//
+// Steps 3–4 are only consulted when both per-call fields are absent (empty).
+// Pass a nil resolver to skip profile-based AZ resolution entirely (byte-identical to the
+// pre-resolver behavior).
+func buildAZOrder(cp createVMCloudProps, cfg *config.CPIConfig, rng *rand.Rand, resolver *layeredResolver) []string {
+	// Singular per-call takes precedence — backward compat, no multi-AZ behavior.
 	if cp.AvailabilityZone != "" {
 		return []string{cp.AvailabilityZone}
 	}
-	if len(cp.AvailabilityZones) == 0 && len(cfg.AZFallbackOrderValue()) == 0 {
+
+	// Plural per-call list is the starting point for multi-AZ behavior.
+	startList := cp.AvailabilityZones
+
+	// When the per-call fields are both absent, consult the resolver for profile-supplied AZ.
+	if len(startList) == 0 && resolver != nil {
+		if az, found := resolver.String("availability_zone"); found {
+			// Singular profile AZ: same backward-compat semantics as cp.AvailabilityZone.
+			return []string{az}
+		}
+		if azs, found := resolver.StringSlice("availability_zones"); found {
+			// Plural profile AZ list: use as starting point for multi-AZ + fallback logic.
+			startList = azs
+		}
+	}
+
+	if len(startList) == 0 && len(cfg.AZFallbackOrderValue()) == 0 {
 		return nil // no AZ constraint
 	}
 
-	// Start from plural list (copy to avoid mutating caller's slice).
-	order := make([]string, len(cp.AvailabilityZones))
-	copy(order, cp.AvailabilityZones)
+	// Start from the resolved list (copy to avoid mutating caller's slice or resolver output).
+	order := make([]string, len(startList))
+	copy(order, startList)
 
 	if cfg.AZShuffleEnabled() && len(order) > 1 {
 		if rng == nil {
@@ -1143,14 +1264,10 @@ func formatRejections(rejections map[string]string) string {
 // are skipped. An empty map means no static IPs were found; callers must check
 // len(result) > 0 before calling detectIPConflict.
 func collectStaticIPsForConflictCheck(parsed *createVMParsedArgs, cfg *config.CPIConfig) map[string][]string {
-	// Resolve the default bridge (same logic as configureNICs).
-	defaultBridge := cfg.NetworkBridge
-	if defaultBridge == "" {
-		defaultBridge = defaultNetworkBridge
-	}
-	if parsed.cloudProps.NetworkBridge != "" {
-		defaultBridge = parsed.cloudProps.NetworkBridge
-	}
+	// Resolve the default bridge using the same layered logic as configureNICs.
+	// Errors from an unknown vm_type selector are suppressed here: this is a
+	// pre-flight check and the main create_vm path will surface the error later.
+	defaultBridge, _, _ := resolveVMNICDefaultsWithError(cfg, parsed.cloudProps, parsed.cloudPropsMap)
 
 	result := make(map[string][]string)
 	for netName := range parsed.networks {
@@ -1275,22 +1392,68 @@ func resolveVMIDAllocParams(cfg *config.CPIConfig) (rangeStart, maxAttempts int)
 	return rangeStart, maxAttempts
 }
 
-// resolveVMShapeStorage returns the target VM storage, disk format, and root
-// disk size in GiB. VMStorage falls back to the stemcell's own storage so the
-// import stays on-node when no override is configured. Disk format defaults to
-// qcow2. Root disk size is the max of cloud_properties.disk (MiB, rounded up to
-// GiB) and defaultStemcellDiskGiB; PVE enforces a no-shrink rule so a smaller
-// request is silently ignored, hence the floor.
-func resolveVMShapeStorage(cfg *config.CPIConfig, parsed *createVMParsedArgs) (vmStorage, vmDiskFormat string, rootDiskGiB int) {
+// vmStorageTierFn resolves a named storage tier to a concrete pool name.
+// Passed as an optional parameter to resolveVMShapeStorage so the function
+// can stay testable in the internal package without requiring ctx or Deps.
+// Production callers supply a closure over ctx + deps; internal unit tests
+// omit the parameter entirely (nil = tier resolution skipped).
+type vmStorageTierFn func(tier string) (string, error)
+
+// resolveVMShapeStorage returns the target VM storage, disk format, root disk
+// size in GiB, and an error. The resolver checks for storage_pool and
+// vm_disk_format through the layered resolver (call cloud_properties →
+// disk_type profile → vm_type profile), then falls back to existing config /
+// struct-field / default logic. Returns a CloudError if the vm_type or disk_type
+// selector names an unknown profile. Behavior is byte-identical to the
+// pre-resolver path when no profiles or storage_pool keys are present.
+//
+// The optional tierFn parameter enables storage_tier resolution. When nil (the
+// default for internal tests and callers that do not need tier resolution),
+// storage_tier in cloud_properties is silently ignored and the existing
+// fallback chain applies: config.VMStorage → stemcell storage.
+func resolveVMShapeStorage(cfg *config.CPIConfig, parsed *createVMParsedArgs, tierFn ...vmStorageTierFn) (vmStorage, vmDiskFormat string, rootDiskGiB int, retErr error) {
 	cp := parsed.cloudProps
 
-	vmStorage = cfg.VMStorage
-	if vmStorage == "" {
-		vmStorage = parsed.stemcellStor
+	// Build a layered resolver from the raw cloud_properties map. This resolves
+	// vm_type / disk_type selectors and sets up precedence-ordered layers.
+	// A nil cloudPropsMap (e.g. old callers / unit tests) is treated as empty.
+	r, err := newLayeredResolver(parsed.cloudPropsMap, cfg)
+	if err != nil {
+		return "", "", 0, err
 	}
 
-	vmDiskFormat = cp.VMDiskFormat
-	if vmDiskFormat == "" {
+	// Extract the tier resolver (nil when not provided).
+	var resolveTier vmStorageTierFn
+	if len(tierFn) > 0 {
+		resolveTier = tierFn[0]
+	}
+
+	// Storage pool resolution: explicit pool → storage_tier (if tierFn wired) → config → stemcell fallback.
+	if pool, ok := r.String("storage_pool"); ok {
+		vmStorage = pool
+	} else if tier, hasTier := r.String("storage_tier"); hasTier && resolveTier != nil {
+		resolved, tierErr := resolveTier(tier)
+		if tierErr != nil {
+			return "", "", 0, tierErr
+		}
+		vmStorage = resolved
+	} else {
+		vmStorage = cfg.VMStorage
+		if vmStorage == "" {
+			vmStorage = parsed.stemcellStor
+		}
+	}
+
+	// Disk format: resolver wins (handles both "vm_disk_format" key in call
+	// layer and profile layers) → struct field from JSON unmarshal → qcow2.
+	// The struct field cp.VMDiskFormat is already populated from args[2] by
+	// the standard unmarshal in parseCreateVMArgs, so we only consult it when
+	// the resolver finds nothing in any layer.
+	if df, ok := r.String("vm_disk_format", "disk_format"); ok {
+		vmDiskFormat = df
+	} else if cp.VMDiskFormat != "" {
+		vmDiskFormat = cp.VMDiskFormat
+	} else {
 		vmDiskFormat = diskFormatQCOW2
 	}
 
@@ -1301,7 +1464,7 @@ func resolveVMShapeStorage(cfg *config.CPIConfig, parsed *createVMParsedArgs) (v
 			rootDiskGiB = requestedGiB
 		}
 	}
-	return vmStorage, vmDiskFormat, rootDiskGiB
+	return vmStorage, vmDiskFormat, rootDiskGiB, nil
 }
 
 // resolveVMShapeCPUMem returns cores, sockets, and memory (MiB) honoring two
@@ -1332,19 +1495,67 @@ func resolveVMShapeCPUMem(cp createVMCloudProps) (cores, sockets, memMiB int) {
 }
 
 // resolveVMShapeHotplugNUMA resolves hotplug + numa using
-// cloud_properties → config → built-in default. Memory hotplug needs both
-// numa=1 and "memory" in hotplug at create time; operators can override
-// per-vm_type for stemcells that misbehave on memory hot-add.
-func resolveVMShapeHotplugNUMA(cfg *config.CPIConfig, cp createVMCloudProps) (hotplug string, numaEnabled bool) {
+// cloud_properties → vm_type/disk_type profile → config → built-in default.
+// Memory hotplug needs both numa=1 and "memory" in hotplug at create time;
+// operators can override per-vm_type for stemcells that misbehave on hot-add.
+//
+// Hotplug precedence (pointer semantics preserved):
+//  1. cp.Hotplug != nil → use *cp.Hotplug (includes explicit "" to disable)
+//  2. profile layer via r.String("hotplug") (disk_type then vm_type)
+//  3. config.HotplugValue()
+//
+// NUMA precedence:
+//  1. cp.NUMA != nil → use *cp.NUMA (includes explicit false)
+//  2. profile layer via r.Bool("numa") (explicit false honored)
+//  3. config.NUMAValue()
+//
+// Panics on resolver error — callers should use resolveVMShapeHotplugNUMAWithError
+// when the error must propagate. resolveVMShape uses resolveVMShapeHotplugNUMAWithError
+// directly so unknown-selector errors surface as CloudErrors.
+func resolveVMShapeHotplugNUMA(cfg *config.CPIConfig, cp createVMCloudProps, cpMap map[string]any) (hotplug string, numaEnabled bool) {
+	h, n, err := resolveVMShapeHotplugNUMAWithError(cfg, cp, cpMap)
+	if err != nil {
+		// Should not reach here: resolveVMShape validates the selector before
+		// calling this. Panic makes any regression visible immediately.
+		panic("resolveVMShapeHotplugNUMA: unexpected resolver error: " + err.Error())
+	}
+	return h, n
+}
+
+// resolveVMShapeHotplugNUMAWithError is the error-returning variant used by
+// resolveVMShape and tests. It returns a CloudError when an unknown vm_type or
+// disk_type selector is present in cpMap.
+func resolveVMShapeHotplugNUMAWithError(cfg *config.CPIConfig, cp createVMCloudProps, cpMap map[string]any) (hotplug string, numaEnabled bool, err error) {
+	r, err := newLayeredResolver(cpMap, cfg)
+	if err != nil {
+		return "", false, err
+	}
+
+	// Hotplug: call struct pointer wins (includes explicit "").
+	// The call layer IS already in r (cpMap layer 0), but cp.Hotplug is a typed
+	// struct pointer — using r.String would drop an explicit "" (empty is skipped
+	// by r.String). Keep the struct-pointer check as the authoritative call gate.
 	hotplug = cfg.HotplugValue()
 	if cp.Hotplug != nil {
 		hotplug = *cp.Hotplug
+	} else if v, ok := r.String("hotplug"); ok {
+		// Profiles only: the call layer's "hotplug" key (if any) was already
+		// covered by cp.Hotplug above — this branch reads disk_type/vm_type layers.
+		// r.String skips empty strings, so a profile "" is also treated as absent
+		// (consistent with explicit-value semantics; only cp.Hotplug carries the
+		// disable-via-empty-string meaning).
+		hotplug = v
 	}
+
+	// NUMA: call struct pointer wins (includes explicit false).
 	numaEnabled = cfg.NUMAValue()
 	if cp.NUMA != nil {
 		numaEnabled = *cp.NUMA
+	} else if b, ok := r.Bool("numa"); ok {
+		numaEnabled = b
 	}
-	return hotplug, numaEnabled
+
+	return hotplug, numaEnabled, nil
 }
 
 // resolveVMShapeInitialName composes the initial PVE VM name from env.bosh
@@ -1659,7 +1870,7 @@ func attemptCreateVM(
 		shape.vmStorage, parsed.rawCID, shape.vmDiskFormat, shape.rootDiskGiB)
 
 	createParams := map[string]any{
-		metadataKeyVMID:          candidate,
+		metadataKeyVMID: candidate,
 		metadataKeyName: candidateName,
 		"memory":        shape.memMiB,
 		"cores":         shape.cores,
@@ -1774,9 +1985,11 @@ func cloneFromTemplate(
 	templateNode string,
 	templateVMID int64,
 ) error {
-	mode := deps.Config.CloneMode
-	if mode == "" {
-		mode = "auto"
+	// Clone mode: call cloud_properties.clone_mode → vm_type profile → config → "auto".
+	// shape carries the resolved cloudPropsMap from the parsed args.
+	mode, err := resolveCloneMode(deps.Config, shape.cloudPropsMap)
+	if err != nil {
+		return err
 	}
 
 	linkedOK := pve.IsLinkedCloneSupported(shape.vmStorageType)
@@ -2071,6 +2284,85 @@ func resizeRootDisk(
 	return nil
 }
 
+// resolveVMNICDefaults resolves the VM-level NIC bridge and model defaults using
+// the layered resolver. Precedence for bridge:
+//  1. cp.NetworkBridge (call struct field, non-empty wins)
+//  2. profile layers via r.String("network_bridge")
+//  3. config.NetworkBridge
+//  4. defaultNetworkBridge ("vmbr0")
+//
+// Precedence for model:
+//  1. cp.NetworkModel (call struct field, non-empty wins)
+//  2. profile layers via r.String("network_model")
+//  3. built-in default "virtio"
+//
+// Per-NIC spec.CloudProperties["bridge"] / ["model"] overrides sit above these
+// VM-level defaults and are applied in configureNICs after this call.
+//
+// Panics on resolver error — callers requiring error propagation use
+// resolveVMNICDefaultsWithError.
+func resolveVMNICDefaults(cfg *config.CPIConfig, cp createVMCloudProps, cpMap map[string]any) (bridge, model string) {
+	b, m, err := resolveVMNICDefaultsWithError(cfg, cp, cpMap)
+	if err != nil {
+		panic("resolveVMNICDefaults: unexpected resolver error: " + err.Error())
+	}
+	return b, m
+}
+
+// resolveVMNICDefaultsWithError is the error-returning variant of resolveVMNICDefaults.
+// Returns a CloudError when cpMap contains an unknown vm_type or disk_type selector.
+func resolveVMNICDefaultsWithError(cfg *config.CPIConfig, cp createVMCloudProps, cpMap map[string]any) (bridge, model string, err error) {
+	r, err := newLayeredResolver(cpMap, cfg)
+	if err != nil {
+		return "", "", err
+	}
+
+	// Bridge resolution: call struct field (non-empty) → profile → config → constant.
+	bridge = cfg.NetworkBridge
+	if bridge == "" {
+		bridge = defaultNetworkBridge
+	}
+	if cp.NetworkBridge != "" {
+		bridge = cp.NetworkBridge
+	} else if v, ok := r.String("network_bridge"); ok {
+		// Profile layers only; call layer is already covered by cp.NetworkBridge above.
+		// r.String reads all layers in order — call layer first — but since we only
+		// land here when cp.NetworkBridge is empty, any non-empty "network_bridge" in
+		// the call map would be redundant with the struct field. Profile wins over
+		// config when the struct field is empty.
+		bridge = v
+	}
+
+	// Model resolution: call struct field (non-empty) → profile → built-in "virtio".
+	model = "virtio"
+	if cp.NetworkModel != "" {
+		model = cp.NetworkModel
+	} else if v, ok := r.String("network_model"); ok {
+		model = v
+	}
+
+	return bridge, model, nil
+}
+
+// resolveCloneMode returns the effective clone_mode by consulting the layered
+// resolver (call cloud_properties → profile layers) then falling back to
+// config.CloneMode. An empty config.CloneMode defaults to "auto".
+// Returns a CloudError when cpMap contains an unknown vm_type or disk_type selector.
+func resolveCloneMode(cfg *config.CPIConfig, cpMap map[string]any) (string, error) {
+	r, err := newLayeredResolver(cpMap, cfg)
+	if err != nil {
+		return "", err
+	}
+	if v, ok := r.String("clone_mode"); ok {
+		return v, nil
+	}
+	mode := cfg.CloneMode
+	if mode == "" {
+		mode = "auto"
+	}
+	return mode, nil
+}
+
 // configureNICs builds and applies the NIC configuration for the new VM from
 // the networks map. Returns the ordered list of network names (used later for
 // MAC extraction) and any error.
@@ -2085,17 +2377,11 @@ func configureNICs(
 	// Build an ordered list of network names for deterministic NIC assignment.
 	netNames := sortedNetworkNames(parsed.networks)
 
-	// bridge and model defaults
-	defaultBridge := deps.Config.NetworkBridge
-	if defaultBridge == "" {
-		defaultBridge = defaultNetworkBridge
-	}
-	if parsed.cloudProps.NetworkBridge != "" {
-		defaultBridge = parsed.cloudProps.NetworkBridge
-	}
-	defaultModel := "virtio"
-	if parsed.cloudProps.NetworkModel != "" {
-		defaultModel = parsed.cloudProps.NetworkModel
+	// VM-level bridge and model defaults via layered resolver.
+	// Per-NIC spec.CloudProperties["bridge"]/["model"] overrides are applied below.
+	defaultBridge, defaultModel, err := resolveVMNICDefaultsWithError(deps.Config, parsed.cloudProps, parsed.cloudPropsMap)
+	if err != nil {
+		return nil, err
 	}
 
 	// Build net map[int]string and ipconfig map[int]string for UpdateQemuConfigParams

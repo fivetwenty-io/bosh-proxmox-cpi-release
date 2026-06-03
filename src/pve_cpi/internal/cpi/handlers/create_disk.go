@@ -21,11 +21,17 @@ type createDiskCloudProperties struct {
 	// precedence in the storage resolution chain:
 	//   disk cloud_properties.storage_pool
 	//     → disk cloud_properties.storage  (backward-compat alias)
-	//       → config.DiskStorage           (global default)
+	//       → cloud_properties.storage_tier (live criteria match)
+	//         → config.DiskStorage          (global default)
 	StoragePool string `json:"storage_pool"`
 	// Storage is the backward-compatible alias for StoragePool. Manifests that
 	// already set cloud_properties.storage continue to work unchanged.
 	Storage string `json:"storage"`
+	// StorageTier selects a storage pool by matching live PVE cluster storage
+	// attributes against config.StorageTiers[StorageTier]. Only consulted when
+	// neither storage_pool nor storage is set. Empty (default) disables tier
+	// resolution and preserves byte-identical behavior to prior releases.
+	StorageTier string `json:"storage_tier,omitempty"`
 	// DiskFormat overrides deps.Config.VMDiskFormat for this disk.
 	DiskFormat string `json:"disk_format"`
 	// Node pins the new disk to a specific PVE node. Required-on-local-backend
@@ -46,27 +52,56 @@ type createDiskCloudProperties struct {
 	AvailabilityZone string `json:"availability_zone,omitempty"`
 }
 
-// resolveStorage returns the storage pool name to use for a create_disk call.
+// resolveStorageLayered returns the storage pool name to use for a create_disk call,
+// consulting layers in precedence order:
 //
-// Precedence (highest to lowest):
-//  1. cloud_properties.storage_pool — explicit per-disk pool, trimmed whitespace
-//  2. cloud_properties.storage — backward-compat alias for storage_pool
-//  3. config.DiskStorage — global CPI default
+//  1. r.String("storage_pool","storage") — per-call or profile cloud_properties
+//  2. configDiskStorage — global CPI config default
 //
-// An empty or whitespace-only value at any level is treated as unset and the
-// next level is consulted. Returns an error only when all three levels resolve
-// to empty, which indicates a misconfigured CPI manifest.
+// An empty or whitespace-only result at all levels is a misconfigured CPI manifest;
+// the returned error is a non-retriable CloudError.
 //
 // No PVE storage-type query is performed (v1: name-only resolution). The
 // caller is responsible for backend resolution via backendResolverOrDefault.
-func resolveStorage(cloudProps createDiskCloudProperties, configDiskStorage string) (string, error) {
-	if s := strings.TrimSpace(cloudProps.StoragePool); s != "" {
-		return s, nil
-	}
-	if s := strings.TrimSpace(cloudProps.Storage); s != "" {
+func resolveStorageLayered(r *layeredResolver, configDiskStorage string) (string, error) {
+	if s, found := r.String("storage_pool", "storage"); found {
 		return s, nil
 	}
 	if s := strings.TrimSpace(configDiskStorage); s != "" {
+		return s, nil
+	}
+	return "", cpierrors.Cloud(
+		"create_disk: no storage configured (disk_storage empty and neither" +
+			" cloud_properties.storage_pool nor cloud_properties.storage is set)",
+	)
+}
+
+// resolveStorageForDisk resolves the target storage pool for a create_disk call.
+// Precedence order (first non-empty result wins):
+//
+//  1. r.String("storage_pool","storage") — explicit per-call or profile override
+//  2. r.String("storage_tier") — opt-in live criteria match against cluster storages
+//  3. deps.Config.DiskStorage — global config default
+//
+// The tier path is only taken when storage_tier is set in the resolver layers and
+// deps.PVE.ClusterStorage() is non-nil. When no tier is set, no live query is
+// issued and the behavior is byte-identical to the pre-tier path.
+// All levels empty or unmatched → non-retriable CloudError.
+func resolveStorageForDisk(ctx context.Context, r *layeredResolver, deps Deps) (string, error) {
+	// Level 1: explicit pool name (highest precedence, no live query).
+	if s, found := r.String("storage_pool", "storage"); found {
+		return s, nil
+	}
+	// Level 2: storage_tier — opt-in live cluster storage query.
+	if tier, found := r.String("storage_tier"); found {
+		if deps.PVE != nil && deps.PVE.ClusterStorage() != nil {
+			return resolveStorageTier(ctx, deps.PVE.ClusterStorage(), deps.Config, tier)
+		}
+		// ClusterStorage not wired (misconfigured test or unusual deployment):
+		// fall through to config default rather than panic.
+	}
+	// Level 3: global config default.
+	if s := strings.TrimSpace(deps.Config.DiskStorage); s != "" {
 		return s, nil
 	}
 	return "", cpierrors.Cloud(
@@ -115,6 +150,15 @@ func HandleCreateDisk(deps Deps) Handler {
 			return nil, cpierrors.Wrap(err, "create_disk: args[1] cloud_properties must be an object")
 		}
 
+		// Also unmarshal args[1] into a raw map for the layered resolver.
+		// Tolerate null/missing: nil and empty map are both safe for the resolver.
+		var callCP map[string]any
+		if args[1] != nil {
+			// Unmarshal errors here are non-fatal: a null/empty JSON value decodes
+			// to a nil map, which newLayeredResolver handles as an empty call layer.
+			_ = json.Unmarshal(args[1], &callCP)
+		}
+
 		// args[2] (vm_cid) is optional; an absent or null third argument is fine.
 		var vmCID string
 		if len(args) >= 3 && args[2] != nil {
@@ -124,19 +168,30 @@ func HandleCreateDisk(deps Deps) Handler {
 		}
 
 		// ----------------------------------------------------------------
-		// 2. Resolve storage, format, and node from config + cloud_props.
+		// 2. Build layered resolver, then resolve storage, format, and node.
 		// ----------------------------------------------------------------
-		storage, err := resolveStorage(cloudProps, deps.Config.DiskStorage)
+		r, err := newLayeredResolver(callCP, deps.Config)
+		if err != nil {
+			// CloudError: unknown vm_type/disk_type selector or non-string value.
+			return nil, err
+		}
+
+		storage, err := resolveStorageForDisk(ctx, r, deps)
 		if err != nil {
 			return nil, err
 		}
 
-		format := deps.Config.VMDiskFormat
-		if cloudProps.DiskFormat != "" {
-			format = cloudProps.DiskFormat
-		}
-		if format == "" {
-			format = diskFormatQCOW2
+		// Resolve disk_format through the resolver: per-call or profile wins;
+		// else global config; else the QCOW2 built-in default.
+		// found tracks whether an explicit value was supplied at any layer so
+		// formatArg is only set when the operator expressed a preference.
+		resolvedFormat, formatFound := r.String("disk_format")
+		format := resolvedFormat
+		if !formatFound {
+			format = deps.Config.VMDiskFormat
+			if format == "" {
+				format = diskFormatQCOW2
+			}
 		}
 
 		backend, err := backendResolverOrDefault(deps).Resolve(ctx, storage)
@@ -158,11 +213,12 @@ func HandleCreateDisk(deps Deps) Handler {
 
 		// Block storages (lvm/lvmthin/zfspool) reject qcow2 and only accept
 		// raw. The CPI's default disk_format is qcow2 which works for file
-		// storages (dir/nfs/cifs). If the operator did not explicitly set a
-		// disk_format in cloud_properties, omit the format param so PVE
-		// auto-selects the right default for the target storage type.
+		// storages (dir/nfs/cifs). Only pass the explicit format to CreateVolume
+		// when the operator expressed a preference at some layer (call or profile);
+		// when no layer supplied a value, omit the param so PVE auto-selects the
+		// right default for the target storage type.
 		formatArg := ""
-		if cloudProps.DiskFormat != "" {
+		if formatFound {
 			formatArg = format
 		}
 

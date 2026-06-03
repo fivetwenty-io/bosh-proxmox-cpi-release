@@ -58,14 +58,30 @@ func createNetwork(ctx context.Context, deps Deps, args []json.RawMessage) (any,
 	cfg := deps.Config
 	cp := spec.CloudProperties
 
-	// Determine path.
-	zone := cpStr(cp, "zone")
-	if zone == "" {
+	// Build a layered resolver so operator profiles (vm_type / disk_type) can
+	// supply attribute defaults above config but below direct call values.
+	r, rErr := newLayeredResolver(cp, cfg)
+	if rErr != nil {
+		return nil, rErr
+	}
+
+	// Determine path using layered resolution with config fallbacks.
+	var zone string
+	if v, ok := r.String("zone"); ok {
+		zone = v
+	} else {
 		zone = cfg.SDNZone
 	}
-	vnet := cpStr(cp, "vnet")
-	bridge := cpStr(cp, "bridge")
-	if bridge == "" {
+
+	var vnet string
+	if v, ok := r.String("vnet"); ok {
+		vnet = v
+	}
+
+	var bridge string
+	if v, ok := r.String("bridge"); ok {
+		bridge = v
+	} else if cfg.NetworkBridge != "" {
 		bridge = cfg.NetworkBridge
 	}
 
@@ -418,8 +434,8 @@ func createNetworkSDN(
 //     sdn_auto_manage_zone is true the CPI will create the zone if absent, but
 //     it does NOT invent a zone name; the operator must still supply one.
 //
-// Returns the resolved zone type used for auto-create (cloud_properties.zone_type
-// → config.sdn_zone_type, in that order).
+// Returns the resolved zone type used for auto-create. Resolution order:
+// resolver (call CP → disk_type profile → vm_type profile) → config.SDNZoneType.
 func validateCreateNetworkSDNPreflight(cfg *config.CPIConfig, cp map[string]any, zone, vnet string) (string, error) {
 	if vnet == "" {
 		return "", cpierrors.Cloud(
@@ -443,8 +459,22 @@ func validateCreateNetworkSDNPreflight(cfg *config.CPIConfig, cp map[string]any,
 		)
 	}
 
-	zoneType := cpStr(cp, "zone_type")
-	if zoneType == "" {
+	// Resolve zone_type via layered resolver so profiles can supply it.
+	// Errors from newLayeredResolver have already been checked upstream
+	// (createNetwork builds and validates the resolver before calling this
+	// function). Build a fresh resolver here using only the call CP; the
+	// profile layers have no zone_type in most configurations so the extra
+	// allocations are negligible, and correctness trumps micro-optimization.
+	r, rErr := newLayeredResolver(cp, cfg)
+	if rErr != nil {
+		// Resolver error here means an unknown vm_type/disk_type in the call CP.
+		// Return it as-is — it is already a CloudError.
+		return "", rErr
+	}
+	var zoneType string
+	if v, ok := r.String("zone_type"); ok {
+		zoneType = v
+	} else {
 		zoneType = cfg.SDNZoneType
 	}
 	return zoneType, nil
@@ -467,7 +497,16 @@ func createNetworkBridge(
 	bridge string,
 ) (any, error) {
 	cp := spec.CloudProperties
-	node := cpStr(cp, cloudPropNodeKey)
+	// Resolve node via layered resolver so profiles can supply the target node.
+	// Errors from newLayeredResolver are already caught by createNetwork upstream;
+	// a second call here handles the slim case where cp changed (it hasn't) —
+	// guard the error path defensively for correctness.
+	var node string
+	if r, rErr := newLayeredResolver(cp, deps.Config); rErr == nil {
+		if v, ok := r.String(cloudPropNodeKey); ok {
+			node = v
+		}
+	}
 	if node == "" {
 		node = deps.Config.Node
 	}
