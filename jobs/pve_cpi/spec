@@ -326,6 +326,19 @@ properties:
       dynamic (DHCP) networks where IP pre-assignment is not meaningful.
       Protective default: true. Omitting this property preserves the default.
     default: true
+  pve.ip_conflict_probe:
+    description: |
+      Selects the active IP-conflict probe mode. When empty or "off" (default),
+      no active probe runs and behavior is identical to prior releases.
+      When "agent", create_vm additionally calls the QEMU guest agent on each
+      running VM to collect dynamically assigned IP addresses and checks them
+      against the target IPs before provisioning. This detects DHCP-assigned
+      addresses that the static-config scan (ensure_no_ip_conflicts) cannot see.
+      The probe is fail-open: a guest agent error is logged and that guest is
+      skipped, never blocking provisioning.
+      Valid values: "" (empty, same as "off"), "off", "agent".
+      Only meaningful when ensure_no_ip_conflicts is true or unset.
+    default: ""
   pve.placement.enabled:
     description: |
       When true (default), create_vm runs live node-scoring to select the

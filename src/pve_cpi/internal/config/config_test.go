@@ -3533,3 +3533,151 @@ func TestAZShuffleEnabled_ExplicitTrue(t *testing.T) {
 		t.Error("AZShuffleEnabled() = false with *true; want true")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// IPConflictProbeMode / ActiveIPProbeEnabled
+// ---------------------------------------------------------------------------
+
+// TestIPConflictProbeMode_Empty verifies empty field normalizes to "off".
+func TestIPConflictProbeMode_Empty(t *testing.T) {
+	t.Parallel()
+	cfg := &config.CPIConfig{}
+	if got := cfg.IPConflictProbeMode(); got != "off" {
+		t.Errorf("IPConflictProbeMode() = %q with empty field; want %q", got, "off")
+	}
+}
+
+// TestIPConflictProbeMode_Off verifies "off" is returned verbatim.
+func TestIPConflictProbeMode_Off(t *testing.T) {
+	t.Parallel()
+	cfg := &config.CPIConfig{IPConflictProbe: "off"}
+	if got := cfg.IPConflictProbeMode(); got != "off" {
+		t.Errorf("IPConflictProbeMode() = %q; want %q", got, "off")
+	}
+}
+
+// TestIPConflictProbeMode_OffUppercase verifies "OFF" normalizes to "off".
+func TestIPConflictProbeMode_OffUppercase(t *testing.T) {
+	t.Parallel()
+	cfg := &config.CPIConfig{IPConflictProbe: "OFF"}
+	if got := cfg.IPConflictProbeMode(); got != "off" {
+		t.Errorf("IPConflictProbeMode() = %q for %q; want %q", got, "OFF", "off")
+	}
+}
+
+// TestIPConflictProbeMode_Agent verifies "agent" is returned normalized.
+func TestIPConflictProbeMode_Agent(t *testing.T) {
+	t.Parallel()
+	cfg := &config.CPIConfig{IPConflictProbe: "agent"}
+	if got := cfg.IPConflictProbeMode(); got != "agent" {
+		t.Errorf("IPConflictProbeMode() = %q; want %q", got, "agent")
+	}
+}
+
+// TestActiveIPProbeEnabled_EmptyField verifies empty → not enabled.
+func TestActiveIPProbeEnabled_EmptyField(t *testing.T) {
+	t.Parallel()
+	cfg := &config.CPIConfig{}
+	if cfg.ActiveIPProbeEnabled() {
+		t.Error("ActiveIPProbeEnabled() = true with empty IPConflictProbe; want false")
+	}
+}
+
+// TestActiveIPProbeEnabled_Off verifies "off" → not enabled.
+func TestActiveIPProbeEnabled_Off(t *testing.T) {
+	t.Parallel()
+	cfg := &config.CPIConfig{IPConflictProbe: "off"}
+	if cfg.ActiveIPProbeEnabled() {
+		t.Error("ActiveIPProbeEnabled() = true with IPConflictProbe=off; want false")
+	}
+}
+
+// TestActiveIPProbeEnabled_Agent verifies "agent" → enabled.
+func TestActiveIPProbeEnabled_Agent(t *testing.T) {
+	t.Parallel()
+	cfg := &config.CPIConfig{IPConflictProbe: "agent"}
+	if !cfg.ActiveIPProbeEnabled() {
+		t.Error("ActiveIPProbeEnabled() = false with IPConflictProbe=agent; want true")
+	}
+}
+
+// TestIPConflictProbeValidation_Valid_Agent verifies "agent" passes validation.
+func TestIPConflictProbeValidation_Valid_Agent(t *testing.T) {
+	t.Parallel()
+	json := baseConfigJSON(`"ip_conflict_probe": "agent"`)
+	_, err := mustLoad(t, json)
+	if err != nil {
+		t.Errorf("unexpected validation error for ip_conflict_probe=agent: %v", err)
+	}
+}
+
+// TestIPConflictProbeValidation_Valid_Off verifies "off" passes validation.
+func TestIPConflictProbeValidation_Valid_Off(t *testing.T) {
+	t.Parallel()
+	json := baseConfigJSON(`"ip_conflict_probe": "off"`)
+	_, err := mustLoad(t, json)
+	if err != nil {
+		t.Errorf("unexpected validation error for ip_conflict_probe=off: %v", err)
+	}
+}
+
+// TestIPConflictProbeValidation_Valid_Empty verifies absent field passes validation.
+func TestIPConflictProbeValidation_Valid_Empty(t *testing.T) {
+	t.Parallel()
+	json := baseConfigJSON(``)
+	_, err := mustLoad(t, json)
+	if err != nil {
+		t.Errorf("unexpected validation error for absent ip_conflict_probe: %v", err)
+	}
+}
+
+// TestIPConflictProbeValidation_Invalid_ARP verifies "arp" fails validation.
+func TestIPConflictProbeValidation_Invalid_ARP(t *testing.T) {
+	t.Parallel()
+	json := baseConfigJSON(`"ip_conflict_probe": "arp"`)
+	_, err := mustLoad(t, json)
+	assertCloudError(t, err, "ip_conflict_probe")
+}
+
+// TestIPConflictProbeValidation_Invalid_Garbage verifies unknown value fails validation.
+func TestIPConflictProbeValidation_Invalid_Garbage(t *testing.T) {
+	t.Parallel()
+	json := baseConfigJSON(`"ip_conflict_probe": "garbage"`)
+	_, err := mustLoad(t, json)
+	assertCloudError(t, err, "ip_conflict_probe")
+}
+
+// TestIPConflictProbeMode_NilReceiver verifies nil *CPIConfig returns "off" (LOW-1 guard).
+func TestIPConflictProbeMode_NilReceiver(t *testing.T) {
+	t.Parallel()
+	var c *config.CPIConfig
+	if got := c.IPConflictProbeMode(); got != "off" {
+		t.Errorf("IPConflictProbeMode() on nil receiver = %q; want %q", got, "off")
+	}
+}
+
+// TestActiveIPProbeEnabled_NilReceiver verifies nil *CPIConfig returns false.
+func TestActiveIPProbeEnabled_NilReceiver(t *testing.T) {
+	t.Parallel()
+	var c *config.CPIConfig
+	if c.ActiveIPProbeEnabled() {
+		t.Error("ActiveIPProbeEnabled() on nil receiver = true; want false")
+	}
+}
+
+// baseConfigJSON builds a minimal valid config JSON with an optional extra
+// field (comma-prefixed) injected after network_bridge.
+func baseConfigJSON(extra string) string {
+	comma := ""
+	if extra != "" {
+		comma = ", "
+	}
+	return `{
+		"host": "pve.test.local",
+		"user": "root@pam",
+		"api_token": "test-token",
+		"vm_storage": "local-lvm",
+		"disk_storage": "local-lvm",
+		"network_bridge": "vmbr0"` + comma + extra + `
+	}`
+}

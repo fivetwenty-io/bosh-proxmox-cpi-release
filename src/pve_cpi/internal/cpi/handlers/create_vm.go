@@ -24,30 +24,51 @@ import (
 	sdknodes "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/nodes"
 )
 
-// createVMRetryBackoff selects the sleep duration between AllocateWithRetry
-// attempts in create_vm. VMID conflicts only need a brief jitter to
-// decorrelate herds across concurrent CPI processes; storage lock-file
-// timeouts mean PVE is serialising imports against a busy storage and
-// retrying immediately wins us nothing — back off seconds, exponentially,
-// up to 30s.
-func createVMRetryBackoff(err error, attempt int) time.Duration {
-	if pve.IsStorageLockTimeout(err) {
-		// Exponential base 2s × 1.5^attempt with ±30% jitter, capped at 30s.
-		base := 2 * time.Second
-		factor := 1.0
-		for i := 0; i < attempt; i++ {
-			factor *= 1.5
+// newCreateVMRetryBackoff builds the backoff function used between
+// AllocateWithRetry attempts in create_vm from the operator's retry policies.
+// VMID conflicts only need a brief jitter to decorrelate herds across
+// concurrent CPI processes (the vmid_alloc curve: uniform in [BaseMs,CapMs]);
+// storage lock-file timeouts mean PVE is serialising imports against a busy
+// storage and retrying immediately wins us nothing — back off exponentially
+// (the storage_import curve: BaseMs × 1.5^attempt, ±JitterPct, capped at
+// CapMs). With unset config both curves resolve to the constants the CPI
+// shipped with (2s × 1.5, cap 30s, ±30%; and 50–250ms), so the default
+// behavior is byte-identical to prior releases.
+func newCreateVMRetryBackoff(storage, vmid config.EffectiveRetryPolicy) func(err error, attempt int) time.Duration {
+	storageBase := time.Duration(storage.BaseMs) * time.Millisecond
+	storageCap := time.Duration(storage.CapMs) * time.Millisecond
+	vmidBase := time.Duration(vmid.BaseMs) * time.Millisecond
+	vmidSpan := time.Duration(vmid.CapMs-vmid.BaseMs) * time.Millisecond
+	jitterPct := int64(storage.JitterPct)
+
+	return func(err error, attempt int) time.Duration {
+		if pve.IsStorageLockTimeout(err) {
+			// Exponential storageBase × 1.5^attempt, capped at storageCap.
+			factor := 1.0
+			for i := 0; i < attempt; i++ {
+				factor *= 1.5
+			}
+			d := time.Duration(float64(storageBase) * factor)
+			if d > storageCap {
+				d = storageCap
+			}
+			// Jitter ±jitterPct: d - d*p/100 + rand(d*2*p/100).
+			if jitterPct > 0 && d > 0 {
+				span := int64(d) * 2 * jitterPct / 100
+				if span > 0 {
+					jitter := time.Duration(mrand.Int64N(span)) // #nosec G404 -- retry jitter; non-cryptographic
+					return d - time.Duration(int64(d)*jitterPct/100) + jitter
+				}
+			}
+			return d
 		}
-		d := time.Duration(float64(base) * factor)
-		if d > 30*time.Second {
-			d = 30 * time.Second
+		// VMID conflict (or anything else flagged retryable): uniform draw in
+		// [vmidBase, vmidBase+vmidSpan].
+		if vmidSpan > 0 {
+			return vmidBase + time.Duration(mrand.Int64N(int64(vmidSpan))) // #nosec G404 -- retry jitter; non-cryptographic
 		}
-		// Jitter ±30%.
-		jitter := time.Duration(mrand.Int64N(int64(d) * 6 / 10)) // #nosec G404 -- VMID jitter; non-cryptographic
-		return d - d*3/10 + jitter
+		return vmidBase
 	}
-	// VMID conflict (or anything else flagged retryable): uniform 50-250 ms.
-	return 50*time.Millisecond + time.Duration(mrand.Int64N(int64(200*time.Millisecond))) // #nosec G404 -- retry jitter; non-cryptographic
 }
 
 // defaultStemcellDiskGiB is the minimum root-disk size assumed when
@@ -281,25 +302,10 @@ func createVM(
 	}
 
 	// -----------------------------------------------------------------------
-	// 5b. IP-conflict pre-flight (static networks only, before any boot).
-	//
-	// Detects only statically-configured IPs stored in PVE VM config
-	// ipconfig{N} keys. DHCP-assigned addresses, physical hosts, containers,
-	// and devices outside PVE management are not detectable.
+	// 5b–5c. IP-conflict pre-flight (static scan + optional agent probe).
 	// -----------------------------------------------------------------------
-	if deps.Config.EnsureNoIPConflictsEnabled() {
-		ipsByBridge := collectStaticIPsForConflictCheck(parsed, deps.Config)
-		for bridge, ips := range ipsByBridge {
-			// Pass vmid as excludeVMID so the newly created VM's own ipconfig
-			// entries are not treated as a conflict against itself.
-			conflict, conflictErr := detectIPConflict(ctx, deps, ips, bridge, vmid)
-			if conflictErr != nil {
-				return nil, cpierrors.Wrap(conflictErr, "create_vm: IP-conflict pre-flight")
-			}
-			if conflict != nil {
-				return nil, IPConflictCloudError(conflict, bridge)
-			}
-		}
+	if err := runIPConflictChecks(ctx, deps, logger, parsed, vmid); err != nil {
+		return nil, err
 	}
 
 	// -----------------------------------------------------------------------
@@ -495,7 +501,7 @@ func resolveVMShape(ctx context.Context, deps Deps, parsed *createVMParsedArgs) 
 	// and behavior is identical to Tier 1.
 	groupTag := antiAffinityGroupTag(deps.Config, parsed.env)
 
-	node, err := resolveTargetNode(ctx, deps, cp, groupTag)
+	node, err := resolveTargetNode(ctx, deps, cp, groupTag, parsed.diskCIDs)
 	if err != nil {
 		return nil, err
 	}
@@ -551,6 +557,12 @@ func resolveVMShape(ctx context.Context, deps Deps, parsed *createVMParsedArgs) 
 //  3. deps.Config.PlacementEnabled() == false → deps.Config.Node (legacy behavior).
 //  4. All paths: if the resolved node is still "" → CloudError.
 //
+// diskCIDs carries the persistent disk CIDs passed to create_vm. When non-empty,
+// disk fault-domain constraints are derived before placement runs:
+//   - local-storage disks pin the VM to the disk's home node (hard constraint).
+//   - shared-storage disks with an AZ label constrain the AZ order.
+//   - bare legacy CIDs (no metadata) impose no constraint.
+//
 // groupTag, when non-empty, is the anti-affinity tag (e.g. "job--diego-cell")
 // that activates scheduler-soft same-group spreading.
 //
@@ -558,8 +570,8 @@ func resolveVMShape(ctx context.Context, deps Deps, parsed *createVMParsedArgs) 
 // (a fresh rand source is created from the current time).
 //
 //nolint:gocognit // Multi-AZ loop + maintenance + retryability; inherent complexity.
-func resolveTargetNode(ctx context.Context, deps Deps, cp createVMCloudProps, groupTag string) (string, error) {
-	return resolveTargetNodeWithRNG(ctx, deps, cp, groupTag, nil)
+func resolveTargetNode(ctx context.Context, deps Deps, cp createVMCloudProps, groupTag string, diskCIDs []string) (string, error) {
+	return resolveTargetNodeWithRNG(ctx, deps, cp, groupTag, diskCIDs, nil)
 }
 
 // resolveTargetNodeWithRNG is the testable implementation of resolveTargetNode.
@@ -571,6 +583,7 @@ func resolveTargetNodeWithRNG(
 	deps Deps,
 	cp createVMCloudProps,
 	groupTag string,
+	diskCIDs []string,
 	rng *rand.Rand,
 ) (string, error) {
 	// Nil-guard the logger: internal unit tests that call resolveVMShape directly
@@ -581,8 +594,26 @@ func resolveTargetNodeWithRNG(
 		logger = log.NewNopLogger()
 	}
 
+	// Derive hard fault-domain constraints from persistent disk CIDs before any
+	// placement decision. Bare legacy CIDs (no metadata) impose no constraint.
+	// Backend resolution uses the static resolver when Deps.Resolver is unset, so
+	// this step is safe in both production and test environments.
+	diskConstraints, dcErr := deriveDiskFaultConstraints(ctx, deps, diskCIDs)
+	if dcErr != nil {
+		return "", dcErr
+	}
+
 	// Branch 1: operator pin — no scoring.
+	// If a local disk's node is known, validate consistency with the operator override:
+	// pinning to a conflicting node would leave the disk unreachable.
 	if cp.TargetNode != "" {
+		if diskConstraints.requiredLocalNode != "" && diskConstraints.requiredLocalNode != cp.TargetNode {
+			return "", cpierrors.Cloud(
+				"create_vm: cloud_properties.target_node=%q conflicts with local disk placement constraint (disk node=%q); "+
+					"set target_node=%q or move the disk to shared storage",
+				cp.TargetNode, diskConstraints.requiredLocalNode, diskConstraints.requiredLocalNode,
+			)
+		}
 		logger.Debug("create_vm: node selection: operator override via target_node",
 			log.String("node", cp.TargetNode),
 		)
@@ -596,6 +627,18 @@ func resolveTargetNodeWithRNG(
 		// Singular availability_zone (backward compat) → single-element list,
 		// no multi-AZ fallback behavior.
 		azOrder := buildAZOrder(cp, deps.Config, rng)
+
+		// Apply shared-disk AZ constraint: if disks declare required AZs and the
+		// VM's AZ order is empty, constrain placement to the disk AZs. If the VM's
+		// AZ order is set and required AZs are a subset, keep the intersection in
+		// their original order. If required AZs are not a subset of the VM's AZ
+		// order, return a clear non-retriable error.
+		if len(diskConstraints.requiredAZs) > 0 {
+			azOrder, dcErr = applyDiskAZConstraint(azOrder, diskConstraints.requiredAZs)
+			if dcErr != nil {
+				return "", dcErr
+			}
+		}
 
 		// Pre-validate AZs: any unknown AZ name is a permanent misconfiguration.
 		// This check runs before GatherNodeFacts to preserve the existing behavior
@@ -643,6 +686,49 @@ func resolveTargetNodeWithRNG(
 		}
 		if groupTag != "" {
 			weights.AntiAffinity = placement.DefaultWeights().AntiAffinity
+		}
+
+		// Local-disk node pin: if all local disks share one node, force the
+		// candidate set to that single node for all AZ iterations. This is checked
+		// after GatherNodeFacts so we can report whether the node is
+		// offline/maintenance rather than returning a generic "no candidates" error.
+		localPin := diskConstraints.requiredLocalNode
+		if localPin != "" {
+			// Search facts slice for the pinned node name.
+			var pinnedFact *placement.NodeFacts
+			for i := range facts {
+				if facts[i].Node == localPin {
+					pinnedFact = &facts[i]
+					break
+				}
+			}
+			if pinnedFact == nil {
+				return "", cpierrors.Cloud(
+					"create_vm: local disk is pinned to node %q but that node "+
+						"is not reachable in the cluster (offline, removed, or unknown); "+
+						"ensure the disk's home node is online before creating the VM",
+					localPin,
+				)
+			}
+			if pinnedFact.InMaintenance {
+				return "", cpierrors.Cloud(
+					"create_vm: local disk is pinned to node %q but that node "+
+						"is currently in maintenance; wait for maintenance to complete or "+
+						"migrate the disk to a different node",
+					localPin,
+				)
+			}
+			if !pinnedFact.Online {
+				return "", cpierrors.Cloud(
+					"create_vm: local disk is pinned to node %q but that node "+
+						"is offline; bring the node online before creating the VM",
+					localPin,
+				)
+			}
+			logger.Debug("create_vm: node selection: local disk pins node",
+				log.String("node", localPin),
+			)
+			return localPin, nil
 		}
 
 		// AZ loop. When azOrder is empty (no AZ set at all), run a single
@@ -708,6 +794,17 @@ func resolveTargetNodeWithRNG(
 	}
 
 	// Branch 3: placement disabled or PVE nil — legacy static node.
+	// When a local disk's home node is known, the VM must land there regardless
+	// of placement being disabled. This ensures co-location even in single-node
+	// static configs where config.node and the disk's node should agree; if they
+	// conflict we surface a clear error rather than silently creating an inaccessible VM.
+	if diskConstraints.requiredLocalNode != "" {
+		logger.Debug("create_vm: node selection: local disk pins node (placement disabled)",
+			log.String("node", diskConstraints.requiredLocalNode),
+		)
+		return diskConstraints.requiredLocalNode, nil
+	}
+
 	node := deps.Config.Node
 	if node == "" {
 		return "", cpierrors.Cloud(
@@ -718,6 +815,53 @@ func resolveTargetNodeWithRNG(
 		log.String("node", node),
 	)
 	return node, nil
+}
+
+// applyDiskAZConstraint reconciles the VM's AZ order with the AZs required by
+// shared-storage persistent disk CIDs.
+//
+// Rules (all non-retriable — disk AZ conflicts are operator configuration errors):
+//   - VM AZ order empty: return the sorted required AZ list (constrain to disk AZs).
+//   - VM AZ order non-empty: return only the AZs present in both the VM order and
+//     requiredAZs, in the VM's original order (intersection). If the intersection
+//     is empty, return a CloudError: the VM's AZ configuration is incompatible with
+//     the disk's AZ requirement.
+func applyDiskAZConstraint(azOrder []string, requiredAZs map[string]struct{}) ([]string, error) {
+	if len(requiredAZs) == 0 {
+		return azOrder, nil
+	}
+
+	if len(azOrder) == 0 {
+		// No VM AZ preference: constrain to disk AZs in sorted order for determinism.
+		result := make([]string, 0, len(requiredAZs))
+		for az := range requiredAZs {
+			result = append(result, az)
+		}
+		sort.Strings(result)
+		return result, nil
+	}
+
+	// Intersect: keep VM AZ order but drop AZs not in requiredAZs.
+	result := make([]string, 0, len(azOrder))
+	for _, az := range azOrder {
+		if _, required := requiredAZs[az]; required {
+			result = append(result, az)
+		}
+	}
+	if len(result) == 0 {
+		reqList := make([]string, 0, len(requiredAZs))
+		for az := range requiredAZs {
+			reqList = append(reqList, az)
+		}
+		sort.Strings(reqList)
+		return nil, cpierrors.Cloud(
+			"create_vm: VM availability_zone(s) %v do not include the AZ(s) required "+
+				"by persistent disk(s): %v; update cloud_properties.availability_zone(s) "+
+				"to include a matching AZ, or move the disk(s) to shared storage without an AZ label",
+			azOrder, reqList,
+		)
+	}
+	return result, nil
 }
 
 // buildAZOrder constructs the ordered AZ list for a placement attempt.
@@ -757,6 +901,124 @@ func buildAZOrder(cp createVMCloudProps, cfg *config.CPIConfig, rng *rand.Rand) 
 		}
 	}
 	return order
+}
+
+// diskFaultConstraints carries the hard placement constraints derived from
+// persistent disk CIDs before VM placement runs.
+//
+// requiredLocalNode, when non-empty, is the single PVE node that all
+// local-storage disks share. The VM must land on this node.
+//
+// requiredAZs, when non-empty, is the set of AZ labels from shared-storage
+// disks whose CID metadata carries an AZ. The VM's AZ order must intersect
+// this set when an AZ is configured; if not, placement is constrained to only
+// those AZs.
+type diskFaultConstraints struct {
+	// requiredLocalNode is set when one or more local-storage disks have a node
+	// recorded in their CID metadata. Empty means no local-node pin.
+	requiredLocalNode string
+	// requiredAZs collects AZ labels from shared-storage disks. Empty means
+	// no AZ constraint from persistent disks.
+	requiredAZs map[string]struct{}
+}
+
+// deriveDiskFaultConstraints inspects each disk CID and builds the set of
+// placement constraints it implies. Bare legacy CIDs (no metadata) are silently
+// skipped to preserve backward compatibility.
+//
+// Errors returned:
+//   - Two or more local-storage disks on different nodes → cpierrors.Cloud.
+//   - Backend resolution failure → cpierrors.Wrap (unexpected; safe to retry).
+//
+// The ctx is used only for backend Resolve calls (cached in production).
+func deriveDiskFaultConstraints(ctx context.Context, deps Deps, diskCIDs []string) (diskFaultConstraints, error) {
+	var c diskFaultConstraints
+	if len(diskCIDs) == 0 {
+		return c, nil
+	}
+
+	resolver := backendResolverOrDefault(deps)
+	localNodes := make(map[string]struct{}) // unique local nodes seen
+
+	for _, cid := range diskCIDs {
+		if cid == "" {
+			continue
+		}
+		_, meta, err := pve.ParseEncodedDiskCID(cid)
+		if err != nil || meta == nil {
+			// Bare legacy CID or parse failure: impose no constraint.
+			// Parse errors on bare CIDs are not possible (ParseEncodedDiskCID
+			// returns err only when "|" present but suffix malformed); the
+			// caller already validated CIDs at parse time.
+			continue
+		}
+
+		// Determine backend kind for this disk's pool.
+		pool := meta.Pool
+		if pool == "" {
+			// Pool absent from meta but node/AZ may still be set (e.g. CID
+			// written by an older CPI version that set Node/AZ without Pool).
+			// Derive the pool from the bare CID so the node/AZ constraint is
+			// not silently dropped. Fail closed: if ParseDiskCID cannot extract
+			// a storage prefix, skip with no constraint (cannot classify).
+			if meta.Node == "" && meta.AZ == "" {
+				// Truly empty meta — legacy upgrade path, no constraint.
+				continue
+			}
+			bareCID, _, parseErr := pve.ParseEncodedDiskCID(cid)
+			if parseErr != nil {
+				continue
+			}
+			derivedPool, _, parseErr := pve.ParseDiskCID(bareCID)
+			if parseErr != nil {
+				// Bare CID malformed; cannot classify. Skip — fail closed.
+				continue
+			}
+			pool = derivedPool
+		}
+
+		backend, resolveErr := resolver.Resolve(ctx, pool)
+		if resolveErr != nil {
+			return diskFaultConstraints{}, cpierrors.Wrap(resolveErr,
+				"create_vm: fault-domain: cannot resolve backend for disk pool "+pool)
+		}
+
+		if backend.Kind() == pve.BackendLocal {
+			if meta.Node != "" {
+				localNodes[meta.Node] = struct{}{}
+			}
+		} else {
+			// Shared backend: AZ constraint only.
+			if meta.AZ != "" {
+				if c.requiredAZs == nil {
+					c.requiredAZs = make(map[string]struct{})
+				}
+				c.requiredAZs[meta.AZ] = struct{}{}
+			}
+		}
+	}
+
+	// Validate local-node set: all local disks must share one node.
+	if len(localNodes) > 1 {
+		nodes := make([]string, 0, len(localNodes))
+		for n := range localNodes {
+			nodes = append(nodes, n)
+		}
+		sort.Strings(nodes)
+		return diskFaultConstraints{}, cpierrors.Cloud(
+			"create_vm: persistent disks are pinned to different local nodes %v — "+
+				"local-storage disks cannot span nodes; ensure all persistent disks "+
+				"reside on the same PVE node or use shared storage",
+			nodes,
+		)
+	}
+	if len(localNodes) == 1 {
+		for n := range localNodes {
+			c.requiredLocalNode = n
+		}
+	}
+
+	return c, nil
 }
 
 // resolveAZCandidatesValidated looks up the node list for az in the AZ map.
@@ -911,6 +1173,47 @@ func collectStaticIPsForConflictCheck(parsed *createVMParsedArgs, cfg *config.CP
 	return result
 }
 
+// runIPConflictChecks runs the static ipconfig{N} scan (step 5b) and, when
+// enabled, the guest-agent active probe (step 5c). Returns nil when
+// EnsureNoIPConflictsEnabled is false. The vmid argument is the newly created
+// VM so its own ipconfig entries are excluded from conflict detection.
+func runIPConflictChecks(ctx context.Context, deps Deps, logger *log.Logger, parsed *createVMParsedArgs, vmid int) error {
+	if !deps.Config.EnsureNoIPConflictsEnabled() {
+		return nil
+	}
+
+	// 5b. Static ipconfig{N} scan — DHCP/dynamic addresses are not visible here.
+	ipsByBridge := collectStaticIPsForConflictCheck(parsed, deps.Config)
+	for bridge, ips := range ipsByBridge {
+		// Pass vmid as excludeVMID so the newly created VM's own ipconfig
+		// entries are not treated as a conflict against itself.
+		conflict, conflictErr := detectIPConflict(ctx, deps, ips, bridge, vmid)
+		if conflictErr != nil {
+			return cpierrors.Wrap(conflictErr, "create_vm: IP-conflict pre-flight")
+		}
+		if conflict != nil {
+			return IPConflictCloudError(conflict, bridge)
+		}
+	}
+
+	// 5c. Active IP probe via guest agent (opt-in: ip_conflict_probe=agent).
+	//
+	// Extends the static-config scan with a live fan-out to running VM guest
+	// agents, detecting DHCP-assigned and dynamically configured addresses
+	// that do not appear in ipconfig{N} keys. Fail-open per guest: an
+	// unreachable agent is logged and skipped, never blocking provisioning.
+	if deps.Config.ActiveIPProbeEnabled() {
+		var allTargetIPs []string
+		for _, ips := range ipsByBridge {
+			allTargetIPs = append(allTargetIPs, ips...)
+		}
+		if probeErr := probeGuestAgentIPConflict(ctx, deps, logger, allTargetIPs); probeErr != nil {
+			return cpierrors.Wrap(probeErr, "create_vm: active IP probe")
+		}
+	}
+	return nil
+}
+
 // lookupVMStorageType fetches the PVE storage type for storageName by listing
 // the cluster storage index. Returns "" on any error — callers treat "" as
 // linked-clone-capable (permissive). This is intentionally best-effort: the
@@ -948,13 +1251,25 @@ func lookupVMStorageType(ctx context.Context, deps Deps, storageName string) str
 // simultaneous stemcell imports against the same PVE storage) can survive
 // transient per-storage lockfile timeouts in addition to VMID races. Each
 // lock-timeout retry waits seconds, not ms, so 10 is still bounded.
+//
+// Attempt-budget precedence (first set wins): retry.storage_import.max_attempts,
+// retry.vmid_alloc.max_attempts, vmid_alloc_attempts, then the built-in 10. The
+// create_vm allocation loop handles both storage-lock and VMID-conflict retries
+// in one budget, and the lock retries dominate (seconds vs ms), so the
+// storage_import override is consulted first.
 func resolveVMIDAllocParams(cfg *config.CPIConfig) (rangeStart, maxAttempts int) {
 	rangeStart = cfg.VMIDRangeStart
 	if rangeStart < 100 {
 		rangeStart = pve.VMIDRangeVMStart
 	}
-	maxAttempts = cfg.VMIDAllocAttempts
-	if maxAttempts <= 0 {
+	switch {
+	case cfg.RetryStorageImport().MaxAttempts > 0:
+		maxAttempts = cfg.RetryStorageImport().MaxAttempts
+	case cfg.RetryVMIDAlloc().MaxAttempts > 0:
+		maxAttempts = cfg.RetryVMIDAlloc().MaxAttempts
+	case cfg.VMIDAllocAttempts > 0:
+		maxAttempts = cfg.VMIDAllocAttempts
+	default:
 		maxAttempts = 10
 	}
 	return rangeStart, maxAttempts
@@ -1083,7 +1398,8 @@ func allocateVM(
 		isRetryable,
 		shape.maxAttempts,
 		pve.WithRange(shape.rangeStart, deps.Config.VMIDRangeEnd),
-		pve.WithBackoffFunc(createVMRetryBackoff),
+		pve.WithBackoffFunc(newCreateVMRetryBackoff(
+			deps.Config.RetryStorageImport(), deps.Config.RetryVMIDAlloc())),
 	)
 	return vmid, err
 }

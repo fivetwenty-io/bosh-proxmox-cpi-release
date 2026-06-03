@@ -251,7 +251,7 @@ These six are not enhancements; they are bugs or missing safety primitives. The 
 three exist *because* placement intelligence shipped: each subsystem still assumes the
 create-time node is fixed and reachable.
 
-#### DONE — 7.1 Maintenance / unhealthy-node exclusion in the scorer
+#### 7.1 DONE — Maintenance / unhealthy-node exclusion in the scorer
 
 *References: vSphere, Google.* The scorer's `Filter()` rejects a node only when it is
 offline or outside the candidate set; node facts never read HA or maintenance state.
@@ -267,7 +267,7 @@ same "placed a workload where it must not live" class as the documented NATS inc
 on a status-fetch error, exactly like the existing storage-facts gathering, so a
 diagnostics gap never fails `create_vm`.
 
-#### DONE — 7.2 Multi-node template reachability (per-node stemcell replication)
+#### 7.2 DONE — Multi-node template reachability (per-node stemcell replication)
 
 *References: vSphere, Azure, AWS, Alicloud.* The stemcell template is created on a single
 node, and `create_vm` clones from it. The clone path sets a cross-node `Target` only
@@ -302,7 +302,7 @@ storage is local and absent on the VM's node, return a clear error instead of an
 PVE failure. Extend the DLB shared-storage requirement to cover the local-disk +
 anti-affinity combination.
 
-#### DONE — 7.4 Process-level panic recovery in the dispatch path
+#### 7.4 DONE — Process-level panic recovery in the dispatch path
 
 *Reference: OpenStack-Go.* There is no `recover()` anywhere in `internal/` or
 `cmd/cpi/main.go` (verified). A nil-deref or index panic in any of the 22 handlers —
@@ -333,7 +333,7 @@ QEMU guest-agent `network-get-interfaces` across running guests to catch DHCP-as
 addresses not in `ipconfig`. Reuse the existing conflict error path. Keep the cheap
 static scan as default; gate the active probe opt-in since it needs node exec.
 
-#### DONE — 7.6 Stemcell image checksum verification
+#### 7.6 DONE — Stemcell image checksum verification
 
 *References: Google, Alicloud, OpenStack-Go.* PVE validates magic bytes and a size cap
 and computes a sha256 **after** import for the identity tag, but never compares against
@@ -352,7 +352,7 @@ but warn that integrity was unverified.
 
 ### Tier 2 — Operability
 
-#### DONE — 7.7 CID-encoded placement and storage stickiness
+#### 7.7 DONE — CID-encoded placement and storage stickiness
 
 *References: vSphere, Azure.* The disk CID is a bare `<storage>:<volid>`; the chosen
 pool, tier, and home node are forgotten on detach. In tiered clusters (ceph-nvme hot
@@ -403,7 +403,7 @@ On `attach_disk` marshal enabled options into `AttachOpts.Extra`. On `create_vm`
 same on the root disk and switch the controller to `virtio-scsi-single` when `iothread`
 is requested. Validate-only-when-set, omit-when-empty.
 
-#### DONE — 7.10 Multi-AZ candidate spread with next-AZ fallback
+#### 7.10 DONE — Multi-AZ candidate spread with next-AZ fallback
 
 *References: OpenStack-Go, AWS, vSphere.* `availability_zone` is a single string yielding
 one candidate set; if that AZ is full, all in maintenance (§7.1), or yields no viable
@@ -417,7 +417,7 @@ run the existing filter+score per set, advance to the next AZ on empty-after-fil
 Reuse the scorer unchanged — only the candidate-set loop is new. Default to current
 single-AZ strict behavior (opt-in, since it relaxes the AZ guarantee).
 
-#### DONE — 7.11 Retryability-flag boundary audit across all 22 handlers
+#### 7.11 DONE — Retryability-flag boundary audit across all 22 handlers
 
 *References: AWS, Google, Alicloud.* The taxonomy and the error mapper exist, but not
 every error return is confirmed to set the retriable bit on the correct boundary
@@ -430,7 +430,7 @@ the documented NATS-churn, wedged-task, and orphan-VM fragility.
 through the wrap functions so the classifier sets the retriable bit; add table-driven
 boundary tests asserting `IsRetriable()` for representative SDK error shapes per handler.
 
-#### DONE — 7.12 Post-boot guest-agent / VM health verification
+#### 7.12 DONE — Post-boot guest-agent / VM health verification
 
 *References: AWS, Azure.* `create_vm` returns once the start task completes; it never
 verifies the VM booted or that the QEMU/BOSH agent is reachable. The documented emptyvm
@@ -478,7 +478,7 @@ omit-when-empty.
 
 ### Tier 3 — Integration and hardening
 
-#### DONE — 7.15 Per-operation deadline / timeout envelope
+#### 7.15 DONE — Per-operation deadline / timeout envelope
 
 *References: OpenStack-Go, Google.* No `context.WithTimeout`/`WithDeadline` wraps handler
 execution (verified). Retry budgets bound individual SDK calls, but a pathological
@@ -590,7 +590,7 @@ v1 from the already-extracted stemcell api_version. Add a settings-completeness 
 `create_vm` early with a clear error instead of booting a half-configured agent. Add a
 v1/v2 × mode test matrix.
 
-#### DONE — 7.23 Placement-failure retryability signaling
+#### 7.23 DONE — Placement-failure retryability signaling
 
 *References: vSphere, AWS, Google.* A hard placement failure (no viable candidate after
 filter) surfaces as a non-retriable error. With strict HA anti-affinity on a small
@@ -618,7 +618,7 @@ matching every reference CPI). Optionally create a second disk of `ephemeral_dis
 on a separately-resolvable `ephemeral_storage_pool` (via §7.8) and surface it to the agent
 as `disks.ephemeral`. Both opt-in; the proven grow-root path stays default.
 
-#### DONE — 7.25 Configurable per-method retry/backoff policy
+#### 7.25 DONE — Configurable per-method retry/backoff policy
 
 *References: OpenStack-Go, Alicloud, Azure, Google.* Two hard-coded backoff classes
 exist; only the VMID-alloc attempt count is tunable. PVE serializes storage imports under

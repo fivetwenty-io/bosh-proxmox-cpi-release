@@ -66,8 +66,8 @@ type resolver struct {
 }
 
 // NewBackendResolver builds the production resolver. The cache may be nil — in
-// which case every Resolve falls back to BackendShared on defaultNode (matching
-// the "treat unknown as shared on the configured node" safety default).
+// which case every Resolve falls back to BackendLocal on defaultNode (matching
+// the "treat unknown as local, require explicit node" safety default).
 func NewBackendResolver(client Client, cache *StorageInfoCache, defaultNode string) BackendResolver {
 	return &resolver{client: client, cache: cache, defaultNode: defaultNode}
 }

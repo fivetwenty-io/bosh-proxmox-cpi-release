@@ -322,6 +322,19 @@ type CPIConfig struct {
 	// bool. Validate-only-when-set; omit from ERB output when nil.
 	EnsureNoIPConflicts *bool `json:"ensure_no_ip_conflicts,omitempty"`
 
+	// IPConflictProbe selects the active IP-conflict probe mode. When empty or
+	// "off" (default), no active probe runs and behavior is byte-identical to
+	// prior releases. When "agent", create_vm additionally calls the QEMU guest
+	// agent on each running VM to collect dynamically assigned IPs and checks
+	// them against the target IPs before provisioning. This detects DHCP-assigned
+	// addresses that the static-config scan (EnsureNoIPConflicts) cannot see.
+	// The probe is fail-open: a guest agent error is logged at debug level and
+	// that guest is skipped. Only valid when EnsureNoIPConflicts is also enabled
+	// (or defaulting to enabled). Enum: ""|"off"|"agent". Validation rejects any
+	// other value. Use IPConflictProbeMode() and ActiveIPProbeEnabled() for the
+	// effective values.
+	IPConflictProbe string `json:"ip_conflict_probe,omitempty"`
+
 	// VMFirewall sets PVE's per-NIC firewall flag (firewall=1) on every NIC of
 	// newly created VMs. When nil/false (default), NICs are created without the
 	// flag — byte-identical to prior releases. A per-NIC network cloud property
@@ -1152,6 +1165,26 @@ func (c *CPIConfig) EnsureNoIPConflictsEnabled() bool {
 	return *c.EnsureNoIPConflicts
 }
 
+// IPConflictProbeMode returns the normalized active IP-probe mode.
+// Empty or absent maps to "off"; the value is lowercased and trimmed.
+// Valid return values: "off", "agent".
+func (c *CPIConfig) IPConflictProbeMode() string {
+	if c == nil {
+		return "off"
+	}
+	v := strings.ToLower(strings.TrimSpace(c.IPConflictProbe))
+	if v == "" {
+		return "off"
+	}
+	return v
+}
+
+// ActiveIPProbeEnabled reports whether the guest-agent IP fan-out probe is
+// active. Returns true only when IPConflictProbeMode() == "agent".
+func (c *CPIConfig) ActiveIPProbeEnabled() bool {
+	return c.IPConflictProbeMode() == "agent"
+}
+
 // VMFirewallEnabled returns the effective global per-NIC firewall default.
 // nil (field absent from JSON) → false (no behavior change versus prior
 // releases). *false → false; *true → true.
@@ -1492,6 +1525,19 @@ func (c *CPIConfig) validateEnumFields(errs *[]string) {
 		default:
 			*errs = append(*errs, fmt.Sprintf(
 				"clone_mode must be one of auto|linked|full, got %q", c.CloneMode,
+			))
+		}
+	}
+
+	// IPConflictProbe enum: validate only when non-empty.
+	if c.IPConflictProbe != "" {
+		switch strings.ToLower(strings.TrimSpace(c.IPConflictProbe)) {
+		case "off", "agent":
+			// valid
+		default:
+			*errs = append(*errs, fmt.Sprintf(
+				"ip_conflict_probe must be one of off|agent (or empty for default off), got %q",
+				c.IPConflictProbe,
 			))
 		}
 	}

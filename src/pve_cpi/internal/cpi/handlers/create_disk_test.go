@@ -758,6 +758,91 @@ func TestHandleCreateDisk_Dir_ExplicitFormat_Forwarded(t *testing.T) {
 // the storage CreateVolume call is classified as a non-retriable Cloud error.
 // Auth failures are operator configuration issues (wrong API token or expired
 // ticket) and must surface immediately — BOSH must not retry indefinitely.
+// ---------------------------------------------------------------------------
+// AvailabilityZone → disk CID metadata wiring tests
+// ---------------------------------------------------------------------------
+
+// TestHandleCreateDisk_AZ_InCIDMeta exercises the full production path:
+// HandleCreateDisk receives cloud_properties.availability_zone, passes it
+// through attemptCreateVolume, and the returned disk CID decodes to meta.AZ
+// equal to the supplied zone. Also asserts meta.Pool matches the resolved
+// storage. Fails if any link in the chain is severed.
+func TestHandleCreateDisk_AZ_InCIDMeta(t *testing.T) {
+	t.Parallel()
+	storageSvc := &mockStorageService{
+		createVolumeFn: func(_ context.Context, _, storage string, _ int, _ string, vmid int, _ string) (string, error) {
+			return fmt.Sprintf("%s:vm-%d-disk-0", storage, vmid), nil
+		},
+	}
+	deps := baseDepsForCreate(t, storageSvc, nil)
+
+	h := handlers.HandleCreateDisk(deps)
+	result, err := h.Handle(context.Background(), []json.RawMessage{
+		marshal(1024),
+		marshal(map[string]string{
+			"availability_zone": "zone-a",
+		}),
+	}, jsonrpc.Context{})
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	diskCID, ok := result.(string)
+	if !ok || diskCID == "" {
+		t.Fatalf("expected non-empty string result, got %T %v", result, result)
+	}
+
+	_, meta, parseErr := pve.ParseEncodedDiskCID(diskCID)
+	if parseErr != nil {
+		t.Fatalf("ParseEncodedDiskCID(%q): %v", diskCID, parseErr)
+	}
+	if meta == nil {
+		t.Fatal("meta is nil; AvailabilityZone not encoded into disk CID — wiring broken")
+	}
+	if meta.AZ != "zone-a" {
+		t.Errorf("meta.AZ = %q; want %q — cloud_properties.availability_zone not propagated through HandleCreateDisk → attemptCreateVolume → EncodeDiskCID", meta.AZ, "zone-a")
+	}
+	if meta.Pool != storageName {
+		t.Errorf("meta.Pool = %q; want %q", meta.Pool, storageName)
+	}
+}
+
+// TestHandleCreateDisk_NoAZ_MetaAZEmpty verifies that when
+// cloud_properties.availability_zone is absent, the returned disk CID has
+// meta.AZ == "" (backward-compatible; no AZ constraint imposed on create_vm).
+func TestHandleCreateDisk_NoAZ_MetaAZEmpty(t *testing.T) {
+	t.Parallel()
+	storageSvc := &mockStorageService{
+		createVolumeFn: func(_ context.Context, _, storage string, _ int, _ string, vmid int, _ string) (string, error) {
+			return fmt.Sprintf("%s:vm-%d-disk-0", storage, vmid), nil
+		},
+	}
+	deps := baseDepsForCreate(t, storageSvc, nil)
+
+	h := handlers.HandleCreateDisk(deps)
+	result, err := h.Handle(context.Background(), []json.RawMessage{
+		marshal(1024),
+		marshal(map[string]string{}), // no availability_zone
+	}, jsonrpc.Context{})
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	diskCID, ok := result.(string)
+	if !ok || diskCID == "" {
+		t.Fatalf("expected non-empty string result, got %T %v", result, result)
+	}
+
+	_, meta, parseErr := pve.ParseEncodedDiskCID(diskCID)
+	if parseErr != nil {
+		t.Fatalf("ParseEncodedDiskCID(%q): %v", diskCID, parseErr)
+	}
+	// meta may be nil (bare CID) or non-nil but AZ must be empty.
+	if meta != nil && meta.AZ != "" {
+		t.Errorf("meta.AZ = %q; want empty string when cloud_properties.availability_zone not set", meta.AZ)
+	}
+}
+
 func TestHandleCreateDisk_AuthFailure(t *testing.T) {
 	t.Parallel()
 	authErr := &sdkerrors.APIError{HTTPCode: 401, Message: "authentication failure"}

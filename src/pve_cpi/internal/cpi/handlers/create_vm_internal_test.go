@@ -173,8 +173,17 @@ func TestExtractMBusAndBlobstore_LegacyTopLevel(t *testing.T) {
 }
 
 // --------------------------------------------------------------------------
-// createVMRetryBackoff
+// createVM retry backoff (newCreateVMRetryBackoff with default policies)
 // --------------------------------------------------------------------------
+
+// defaultCreateVMBackoff builds the create_vm backoff closure from the shipped
+// default retry policies (no operator override), so these tests assert the
+// behavior-preserving defaults: storage-lock 2s × 1.5^attempt ±30% cap 30s, and
+// VMID-conflict uniform 50–250 ms.
+func defaultCreateVMBackoff() func(error, int) time.Duration {
+	var empty config.CPIConfig
+	return newCreateVMRetryBackoff(empty.RetryStorageImport(), empty.RetryVMIDAlloc())
+}
 
 // TestCreateVMRetryBackoff_StorageLockTimeout verifies that a storage-lock
 // timeout error produces a duration that grows with attempt count and stays
@@ -207,7 +216,7 @@ func TestCreateVMRetryBackoff_StorageLockTimeout(t *testing.T) {
 		hi := time.Duration(float64(expected) * 1.31)
 
 		for n := range samples {
-			d := createVMRetryBackoff(lockErr, attempt)
+			d := defaultCreateVMBackoff()(lockErr, attempt)
 			if d < lo || d > hi {
 				t.Errorf("attempt=%d sample=%d: backoff=%v not in [%v, %v] (expected base %v)",
 					attempt, n, d, lo, hi, expected)
@@ -232,7 +241,7 @@ func TestCreateVMRetryBackoff_StorageLockTimeout_Cap(t *testing.T) {
 	hi := time.Duration(float64(cappedBase) * 1.31)
 
 	for n := range samples {
-		d := createVMRetryBackoff(lockErr, 20)
+		d := defaultCreateVMBackoff()(lockErr, 20)
 		if d < lo || d > hi {
 			t.Errorf("attempt=20 (sample %d): backoff=%v not in [%v, %v]", n, d, lo, hi)
 		}
@@ -261,7 +270,7 @@ func TestCreateVMRetryBackoff_NonRetriable(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			for attempt := 0; attempt <= 3; attempt++ {
-				d := createVMRetryBackoff(tc.err, attempt)
+				d := defaultCreateVMBackoff()(tc.err, attempt)
 				const lo = 50 * time.Millisecond
 				const hi = 250 * time.Millisecond
 				if d < lo || d > hi {
@@ -279,7 +288,7 @@ func TestCreateVMRetryBackoff_UnknownErrorType(t *testing.T) {
 	t.Parallel()
 
 	unknownErr := fmt.Errorf("some opaque error with no pve fingerprint whatsoever")
-	d := createVMRetryBackoff(unknownErr, 0)
+	d := defaultCreateVMBackoff()(unknownErr, 0)
 	const lo = 50 * time.Millisecond
 	const hi = 250 * time.Millisecond
 	if d < lo || d > hi {
@@ -972,7 +981,7 @@ func TestResolveTargetNodeWithRNG_SingleAZ_BackwardCompat(t *testing.T) {
 		}
 	})
 	cp := createVMCloudProps{AvailabilityZone: "zone-a"}
-	node, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", nil)
+	node, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -992,7 +1001,7 @@ func TestResolveTargetNodeWithRNG_MultiAZ_FirstAZViable(t *testing.T) {
 		}
 	})
 	cp := createVMCloudProps{AvailabilityZones: []string{"zone-a", "zone-b"}}
-	node, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", nil)
+	node, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1016,7 +1025,7 @@ func TestResolveTargetNodeWithRNG_MultiAZ_FirstExhausted_FallsToSecond(t *testin
 		}
 	})
 	cp := createVMCloudProps{AvailabilityZones: []string{"zone-a", "zone-b"}}
-	node, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", nil)
+	node, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1041,7 +1050,7 @@ func TestResolveTargetNodeWithRNG_MultiAZ_AllExhausted_RetriableError(t *testing
 		}
 	})
 	cp := createVMCloudProps{AvailabilityZones: []string{"zone-a", "zone-b"}}
-	_, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", nil)
+	_, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", nil, nil)
 	if err == nil {
 		t.Fatal("expected error for all-AZs-exhausted")
 	}
@@ -1072,7 +1081,7 @@ func TestResolveTargetNodeWithRNG_InAZOffline_OutAZOnline_Retriable(t *testing.T
 		}
 	})
 	cp := createVMCloudProps{AvailabilityZones: []string{"zone-a"}}
-	_, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", nil)
+	_, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", nil, nil)
 	if err == nil {
 		t.Fatal("expected error when all in-AZ candidates are offline")
 	}
@@ -1093,7 +1102,7 @@ func TestResolveTargetNodeWithRNG_UnknownAZ_PermanentError(t *testing.T) {
 		}
 	})
 	cp := createVMCloudProps{AvailabilityZone: "zone-unknown"}
-	_, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", nil)
+	_, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", nil, nil)
 	if err == nil {
 		t.Fatal("expected error for unknown AZ")
 	}
@@ -1135,21 +1144,21 @@ func TestResolveTargetNodeWithRNG_AZShuffle_SeedControlsOrder(t *testing.T) {
 
 	// seed 0: shuffle keeps [zone-a, zone-b] → zone-a first → pve1 wins.
 	rngA := rand.New(rand.NewSource(0)) //nolint:gosec // fixed seed — deterministic test
-	nodeA, errA := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", rngA)
+	nodeA, errA := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", nil, rngA)
 	if errA != nil {
 		t.Fatalf("seed=0 error: %v", errA)
 	}
 
 	// seed 2: shuffle produces [zone-b, zone-a] → zone-b first → pve2 wins.
 	rngB := rand.New(rand.NewSource(2)) //nolint:gosec // fixed seed — deterministic test
-	nodeB, errB := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", rngB)
+	nodeB, errB := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", nil, rngB)
 	if errB != nil {
 		t.Fatalf("seed=2 error: %v", errB)
 	}
 
 	// Same seed must be deterministic.
 	rngA2 := rand.New(rand.NewSource(0)) //nolint:gosec // fixed seed — deterministic test
-	nodeA2, _ := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", rngA2)
+	nodeA2, _ := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", nil, rngA2)
 	if nodeA != nodeA2 {
 		t.Errorf("same seed must be deterministic; seed=0 got %q then %q", nodeA, nodeA2)
 	}
@@ -1200,7 +1209,7 @@ func TestResolveTargetNodeWithRNG_MaintenanceNodeExcluded(t *testing.T) {
 		PVE:    &rawNodeTestPVE{cluster},
 		Logger: log.NewNopLogger(),
 	}
-	node, err := resolveTargetNodeWithRNG(context.Background(), deps, createVMCloudProps{}, "", nil)
+	node, err := resolveTargetNodeWithRNG(context.Background(), deps, createVMCloudProps{}, "", nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1584,5 +1593,597 @@ func TestAttemptCreateVM_TemplateGap_SharedStorage_NoGuard(t *testing.T) {
 	// Clone must fire with the primary VMID (6042), not a replica.
 	if capture.vmidStr != "6042" {
 		t.Errorf("clone vmidStr: want %q (primary), got %q", "6042", capture.vmidStr)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// IMP-A2: deriveDiskFaultConstraints
+// ---------------------------------------------------------------------------
+
+// encodeLocalCID builds an encoded disk CID for a local-backend disk on node.
+// Uses "local-lvm" as the storage pool (the only pool used in these tests).
+func encodeLocalCID(node string) string {
+	const pool = "local-lvm"
+	bareCID := pool + ":vm-9001-disk-0"
+	return pve.EncodeDiskCID(bareCID, &pve.DiskCIDMeta{Pool: pool, Node: node})
+}
+
+// encodeSharedCID builds an encoded disk CID for a shared-backend disk with an AZ.
+func encodeSharedCID(pool, az string) string {
+	bareCID := pool + ":vm-9001-disk-0"
+	return pve.EncodeDiskCID(bareCID, &pve.DiskCIDMeta{Pool: pool, AZ: az})
+}
+
+// sharedStorageSvc reports the test storage as shared (cluster-visible).
+type sharedStorageSvc struct{}
+
+func (s *sharedStorageSvc) ListStorage(_ context.Context, _ *sdkclusterstorage.ListStorageParams) (*sdkclusterstorage.ListStorageResponse, error) {
+	raw, _ := json.Marshal(map[string]any{"storage": "ceph-pool", "type": "rbd", "shared": 1})
+	resp := sdkclusterstorage.ListStorageResponse{json.RawMessage(raw)}
+	return &resp, nil
+}
+func (s *sharedStorageSvc) CreateStorage(_ context.Context, _ *sdkclusterstorage.CreateStorageParams) (*sdkclusterstorage.CreateStorageResponse, error) {
+	panic("not needed")
+}
+func (s *sharedStorageSvc) DeleteStorage(_ context.Context, _ string) error { panic("not needed") }
+func (s *sharedStorageSvc) GetStorage(_ context.Context, _ string) (*sdkclusterstorage.GetStorageResponse, error) {
+	panic("not needed")
+}
+func (s *sharedStorageSvc) UpdateStorage(_ context.Context, _ string, _ *sdkclusterstorage.UpdateStorageParams) (*sdkclusterstorage.UpdateStorageResponse, error) {
+	panic("not needed")
+}
+
+var _ sdkclusterstorage.Service = (*sharedStorageSvc)(nil)
+
+// faultDomainTestPVE wraps placementInternalTestCluster with configurable ClusterStorage.
+type faultDomainTestPVE struct {
+	clusterClient  *placementInternalTestCluster
+	clusterStorage sdkclusterstorage.Service
+}
+
+func (p *faultDomainTestPVE) QEMU() sdkqemu.Service          { panic("not needed") }
+func (p *faultDomainTestPVE) Nodes() sdknodes.Service        { return &placementInternalNodesSvc{} }
+func (p *faultDomainTestPVE) Tasks() sdktasks.Service         { panic("not needed") }
+func (p *faultDomainTestPVE) Storage() sdkstorage.Service     { panic("not needed") }
+func (p *faultDomainTestPVE) CloudInit() sdkcloudinit.Service  { panic("not needed") }
+func (p *faultDomainTestPVE) Cluster() sdkcluster.Service     { return &fullClusterAdapter{sub: p.clusterClient} }
+func (p *faultDomainTestPVE) ClusterStorage() sdkclusterstorage.Service { return p.clusterStorage }
+func (p *faultDomainTestPVE) Pools() pve.PoolService          { return nil }
+
+var _ pve.Client = (*faultDomainTestPVE)(nil)
+
+// staticKindResolver is a BackendResolver that classifies storages by name using
+// a fixed mapping. Used in fault-domain tests to avoid StorageInfoCache complexity.
+// Any pool name mapped to true is shared; false or absent means local.
+type staticKindResolver struct {
+	sharedPools map[string]bool // pool name → true if shared
+	defaultNode string
+}
+
+func (r *staticKindResolver) Resolve(_ context.Context, storage string) (pve.Backend, error) {
+	if r.sharedPools[storage] {
+		return pve.NewStaticBackendResolver(nil, r.defaultNode).Resolve(context.Background(), storage)
+	}
+	// Local: return a local-kind backend. We use a private helper type below.
+	return &localKindBackend{}, nil
+}
+
+// localKindBackend is a minimal Backend that reports Kind()=BackendLocal.
+// NodeForCreate / NodeForExisting are not called in deriveDiskFaultConstraints
+// (which only uses Kind()), so they panic to detect unexpected calls.
+type localKindBackend struct{}
+
+func (l *localKindBackend) Kind() pve.BackendKind { return pve.BackendLocal }
+func (l *localKindBackend) NodeForCreate(_ context.Context, _, _ string) (string, error) {
+	panic("localKindBackend.NodeForCreate: not expected in fault-domain tests")
+}
+func (l *localKindBackend) NodeForExisting(_ context.Context, _ string) (string, error) {
+	panic("localKindBackend.NodeForExisting: not expected in fault-domain tests")
+}
+
+// buildFaultDomainDeps builds Deps for deriveDiskFaultConstraints / resolveTargetNodeWithRNG
+// tests that need configurable node lists and storage classification.
+// clusterNodes is used by GatherNodeFacts; sharedPools maps pool names to shared=true
+// for the BackendResolver that deriveDiskFaultConstraints uses.
+func buildFaultDomainDeps(clusterNodes []map[string]any, sharedPools map[string]bool, cfgFn func(*config.CPIConfig)) Deps {
+	cfg := &config.CPIConfig{
+		Host:          "pve.test",
+		Node:          "",
+		VMStorage:     "local-lvm",
+		NetworkBridge: "vmbr0",
+	}
+	if cfgFn != nil {
+		cfgFn(cfg)
+	}
+	pveCli := &faultDomainTestPVE{
+		clusterClient:  &placementInternalTestCluster{nodes: clusterNodes},
+		clusterStorage: &localStorageSvc{}, // used by GatherNodeFacts storage queries
+	}
+	return Deps{
+		Config:   cfg,
+		PVE:      pveCli,
+		Logger:   log.NewNopLogger(),
+		Resolver: &staticKindResolver{sharedPools: sharedPools, defaultNode: ""},
+	}
+}
+
+// TestDeriveDiskFaultConstraints_NoDiskCIDs verifies that an empty diskCIDs slice
+// returns zero-value constraints with no error (inert behavior).
+func TestDeriveDiskFaultConstraints_NoDiskCIDs(t *testing.T) {
+	t.Parallel()
+	deps := buildFaultDomainDeps(nil, nil, nil)
+	c, err := deriveDiskFaultConstraints(context.Background(), deps, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if c.requiredLocalNode != "" {
+		t.Errorf("requiredLocalNode = %q; want empty", c.requiredLocalNode)
+	}
+	if len(c.requiredAZs) != 0 {
+		t.Errorf("requiredAZs = %v; want empty", c.requiredAZs)
+	}
+}
+
+// TestDeriveDiskFaultConstraints_BareLegacyCID verifies that a bare CID (no metadata)
+// imposes no constraint (backward compatibility for pre-AZ deployments).
+func TestDeriveDiskFaultConstraints_BareLegacyCID(t *testing.T) {
+	t.Parallel()
+	deps := buildFaultDomainDeps(nil, nil, nil)
+	bareCID := "local-lvm:vm-100-disk-0"
+	c, err := deriveDiskFaultConstraints(context.Background(), deps, []string{bareCID})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if c.requiredLocalNode != "" {
+		t.Errorf("bare CID: requiredLocalNode = %q; want empty", c.requiredLocalNode)
+	}
+	if len(c.requiredAZs) != 0 {
+		t.Errorf("bare CID: requiredAZs = %v; want empty", c.requiredAZs)
+	}
+}
+
+// TestDeriveDiskFaultConstraints_SingleLocalDisk_PinsNode verifies that a single
+// local-backend disk with node="pve1" produces requiredLocalNode="pve1".
+func TestDeriveDiskFaultConstraints_SingleLocalDisk_PinsNode(t *testing.T) {
+	t.Parallel()
+	deps := buildFaultDomainDeps(nil, nil, nil)
+	cid := encodeLocalCID("pve1")
+	c, err := deriveDiskFaultConstraints(context.Background(), deps, []string{cid})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if c.requiredLocalNode != "pve1" {
+		t.Errorf("requiredLocalNode = %q; want pve1", c.requiredLocalNode)
+	}
+}
+
+// TestDeriveDiskFaultConstraints_TwoLocalDisks_SameNode_OK verifies that two
+// local-backend disks on the same node produce requiredLocalNode set to that node
+// without error.
+func TestDeriveDiskFaultConstraints_TwoLocalDisks_SameNode_OK(t *testing.T) {
+	t.Parallel()
+	deps := buildFaultDomainDeps(nil, nil, nil)
+	cid1 := encodeLocalCID("pve1")
+	cid2 := encodeLocalCID("pve1")
+	c, err := deriveDiskFaultConstraints(context.Background(), deps, []string{cid1, cid2})
+	if err != nil {
+		t.Fatalf("unexpected error for same-node disks: %v", err)
+	}
+	if c.requiredLocalNode != "pve1" {
+		t.Errorf("requiredLocalNode = %q; want pve1", c.requiredLocalNode)
+	}
+}
+
+// TestDeriveDiskFaultConstraints_TwoLocalDisks_DifferentNodes_Error verifies that
+// two local-backend disks on different nodes produce a CloudError naming both nodes.
+func TestDeriveDiskFaultConstraints_TwoLocalDisks_DifferentNodes_Error(t *testing.T) {
+	t.Parallel()
+	deps := buildFaultDomainDeps(nil, nil, nil)
+	cid1 := encodeLocalCID("pve1")
+	cid2 := encodeLocalCID("pve2")
+	_, err := deriveDiskFaultConstraints(context.Background(), deps, []string{cid1, cid2})
+	if err == nil {
+		t.Fatal("expected error for disks on different nodes; got nil")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "pve1") || !strings.Contains(msg, "pve2") {
+		t.Errorf("error must mention both nodes; got: %v", msg)
+	}
+	var cpiErr *cpierrors.Error
+	if stderrors.As(err, &cpiErr) && cpiErr.OkToRetry() {
+		t.Error("cross-node disk error must not be retriable (permanent misconfiguration)")
+	}
+}
+
+// TestDeriveDiskFaultConstraints_SharedDisk_AZConstraint verifies that a shared-backend
+// disk with AZ="zone-a" populates requiredAZs with "zone-a".
+func TestDeriveDiskFaultConstraints_SharedDisk_AZConstraint(t *testing.T) {
+	t.Parallel()
+	// sharedStorageSvc returns ceph-pool as shared.
+	deps := buildFaultDomainDeps(nil, map[string]bool{"ceph-pool": true}, nil)
+	cid := encodeSharedCID("ceph-pool", "zone-a")
+	c, err := deriveDiskFaultConstraints(context.Background(), deps, []string{cid})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if c.requiredLocalNode != "" {
+		t.Errorf("shared disk: requiredLocalNode = %q; want empty", c.requiredLocalNode)
+	}
+	if _, ok := c.requiredAZs["zone-a"]; !ok {
+		t.Errorf("requiredAZs = %v; want zone-a", c.requiredAZs)
+	}
+}
+
+// TestDeriveDiskFaultConstraints_MixedLegacyAndEncoded verifies that a mix of
+// bare legacy CIDs and encoded CIDs correctly ignores the legacy ones while
+// applying constraints from the encoded ones.
+func TestDeriveDiskFaultConstraints_MixedLegacyAndEncoded(t *testing.T) {
+	t.Parallel()
+	deps := buildFaultDomainDeps(nil, nil, nil)
+	legacyCID := "local-lvm:vm-100-disk-0"          // bare — no constraint
+	encodedCID := encodeLocalCID("pve1") // local — pins node
+	c, err := deriveDiskFaultConstraints(context.Background(), deps, []string{legacyCID, encodedCID})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if c.requiredLocalNode != "pve1" {
+		t.Errorf("requiredLocalNode = %q; want pve1", c.requiredLocalNode)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// IMP-A2: applyDiskAZConstraint
+// ---------------------------------------------------------------------------
+
+// TestApplyDiskAZConstraint_EmptyVMAZOrder_ConstrainedToDiskAZs verifies that when
+// the VM has no AZ preference, the result is the sorted set of required AZs.
+func TestApplyDiskAZConstraint_EmptyVMAZOrder_ConstrainedToDiskAZs(t *testing.T) {
+	t.Parallel()
+	required := map[string]struct{}{"zone-b": {}, "zone-a": {}}
+	got, err := applyDiskAZConstraint(nil, required)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := []string{"zone-a", "zone-b"} // sorted
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("got %v; want %v", got, want)
+	}
+}
+
+// TestApplyDiskAZConstraint_VMOrderConsistentWithDisk_ReturnsIntersection verifies
+// that when the VM's AZ order includes the required AZ, the intersection (in VM order)
+// is returned.
+func TestApplyDiskAZConstraint_VMOrderConsistentWithDisk_ReturnsIntersection(t *testing.T) {
+	t.Parallel()
+	vmOrder := []string{"zone-a", "zone-b", "zone-c"}
+	required := map[string]struct{}{"zone-b": {}}
+	got, err := applyDiskAZConstraint(vmOrder, required)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := []string{"zone-b"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("got %v; want %v", got, want)
+	}
+}
+
+// TestApplyDiskAZConstraint_VMOrderIncompatibleWithDisk_Error verifies that when
+// the VM's AZ order has no overlap with the required AZs, a non-retriable CloudError
+// is returned naming both the VM AZs and required AZs.
+func TestApplyDiskAZConstraint_VMOrderIncompatibleWithDisk_Error(t *testing.T) {
+	t.Parallel()
+	vmOrder := []string{"zone-a"}
+	required := map[string]struct{}{"zone-b": {}}
+	_, err := applyDiskAZConstraint(vmOrder, required)
+	if err == nil {
+		t.Fatal("expected error for incompatible VM AZ and disk AZ; got nil")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "zone-a") || !strings.Contains(msg, "zone-b") {
+		t.Errorf("error must mention both VM AZ and required AZ; got: %v", msg)
+	}
+	var cpiErr *cpierrors.Error
+	if stderrors.As(err, &cpiErr) && cpiErr.OkToRetry() {
+		t.Error("AZ conflict must not be retriable")
+	}
+}
+
+// TestApplyDiskAZConstraint_NoRequiredAZs_Unchanged verifies that empty requiredAZs
+// returns the VM's original AZ order unchanged.
+func TestApplyDiskAZConstraint_NoRequiredAZs_Unchanged(t *testing.T) {
+	t.Parallel()
+	vmOrder := []string{"zone-a", "zone-b"}
+	got, err := applyDiskAZConstraint(vmOrder, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !reflect.DeepEqual(got, vmOrder) {
+		t.Errorf("got %v; want %v (unchanged)", got, vmOrder)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// IMP-A2: resolveTargetNodeWithRNG — disk fault-domain cases
+// ---------------------------------------------------------------------------
+
+// TestResolveTargetNodeWithRNG_LocalDisk_PinsNode verifies that a single local-backend
+// disk with node="pve1" causes the VM to be placed on pve1 (both nodes online).
+func TestResolveTargetNodeWithRNG_LocalDisk_PinsNode(t *testing.T) {
+	t.Parallel()
+	deps := buildFaultDomainDeps(
+		[]map[string]any{onlineNode("pve1"), onlineNode("pve2")},
+		nil, // local-lvm is non-shared (default: all pools local)
+		func(c *config.CPIConfig) {
+			c.Placement = &config.PlacementConfig{
+				AZMap: map[string][]string{
+					"zone-a": {"pve1", "pve2"},
+				},
+			}
+		},
+	)
+	diskCIDs := []string{encodeLocalCID("pve1")}
+	node, err := resolveTargetNodeWithRNG(context.Background(), deps, createVMCloudProps{}, "", diskCIDs, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if node != "pve1" {
+		t.Errorf("got node %q; want pve1 (local disk pin)", node)
+	}
+}
+
+// TestResolveTargetNodeWithRNG_TwoLocalDisks_SameNode_OK verifies that two local disks
+// on the same node ("pve1") still resolve to "pve1" without error.
+func TestResolveTargetNodeWithRNG_TwoLocalDisks_SameNode_OK(t *testing.T) {
+	t.Parallel()
+	deps := buildFaultDomainDeps(
+		[]map[string]any{onlineNode("pve1"), onlineNode("pve2")},
+		nil,
+		func(c *config.CPIConfig) {
+			c.Placement = &config.PlacementConfig{
+				AZMap: map[string][]string{"zone-a": {"pve1", "pve2"}},
+			}
+		},
+	)
+	diskCIDs := []string{
+		encodeLocalCID("pve1"),
+		encodeLocalCID("pve1"),
+	}
+	node, err := resolveTargetNodeWithRNG(context.Background(), deps, createVMCloudProps{}, "", diskCIDs, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if node != "pve1" {
+		t.Errorf("got node %q; want pve1", node)
+	}
+}
+
+// TestResolveTargetNodeWithRNG_TwoLocalDisks_DifferentNodes_Error verifies that two
+// local disks on different nodes produce a non-retriable CloudError before any placement
+// attempt.
+func TestResolveTargetNodeWithRNG_TwoLocalDisks_DifferentNodes_Error(t *testing.T) {
+	t.Parallel()
+	deps := buildFaultDomainDeps(
+		[]map[string]any{onlineNode("pve1"), onlineNode("pve2")},
+		nil,
+		func(c *config.CPIConfig) {
+			c.Placement = &config.PlacementConfig{
+				AZMap: map[string][]string{
+					"zone-a": {"pve1"},
+					"zone-b": {"pve2"},
+				},
+			}
+		},
+	)
+	diskCIDs := []string{
+		encodeLocalCID("pve1"),
+		encodeLocalCID("pve2"),
+	}
+	_, err := resolveTargetNodeWithRNG(context.Background(), deps, createVMCloudProps{}, "", diskCIDs, nil)
+	if err == nil {
+		t.Fatal("expected error for disks on different nodes; got nil")
+	}
+	var cpiErr *cpierrors.Error
+	if stderrors.As(err, &cpiErr) && cpiErr.OkToRetry() {
+		t.Error("different-node disk error must not be retriable")
+	}
+	if !strings.Contains(err.Error(), "pve1") || !strings.Contains(err.Error(), "pve2") {
+		t.Errorf("error should name both nodes; got: %v", err)
+	}
+}
+
+// TestResolveTargetNodeWithRNG_SharedDisk_AZConstrains_Compatible verifies that a
+// shared-backend disk with AZ="zone-a" constrains placement to zone-a when the VM
+// has availability_zones: [zone-a, zone-b].
+func TestResolveTargetNodeWithRNG_SharedDisk_AZConstrains_Compatible(t *testing.T) {
+	t.Parallel()
+	deps := buildFaultDomainDeps(
+		[]map[string]any{onlineNode("pve1"), onlineNode("pve2")},
+		map[string]bool{"ceph-pool": true},
+		func(c *config.CPIConfig) {
+			c.Placement = &config.PlacementConfig{
+				AZMap: map[string][]string{
+					"zone-a": {"pve1"},
+					"zone-b": {"pve2"},
+				},
+			}
+		},
+	)
+	diskCIDs := []string{encodeSharedCID("ceph-pool", "zone-a")}
+	cp := createVMCloudProps{AvailabilityZones: []string{"zone-a", "zone-b"}}
+	node, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", diskCIDs, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// Only zone-a remains after intersection; pve1 is the only candidate.
+	if node != "pve1" {
+		t.Errorf("got node %q; want pve1 (shared disk constrains to zone-a)", node)
+	}
+}
+
+// TestResolveTargetNodeWithRNG_SharedDisk_AZConflicts_Error verifies that a shared-backend
+// disk with AZ="zone-b" conflicts with a VM configured for only zone-a, producing
+// a non-retriable CloudError.
+func TestResolveTargetNodeWithRNG_SharedDisk_AZConflicts_Error(t *testing.T) {
+	t.Parallel()
+	deps := buildFaultDomainDeps(
+		[]map[string]any{onlineNode("pve1"), onlineNode("pve2")},
+		map[string]bool{"ceph-pool": true},
+		func(c *config.CPIConfig) {
+			c.Placement = &config.PlacementConfig{
+				AZMap: map[string][]string{
+					"zone-a": {"pve1"},
+					"zone-b": {"pve2"},
+				},
+			}
+		},
+	)
+	diskCIDs := []string{encodeSharedCID("ceph-pool", "zone-b")}
+	cp := createVMCloudProps{AvailabilityZone: "zone-a"} // singular AZ — zone-a only
+	_, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", diskCIDs, nil)
+	if err == nil {
+		t.Fatal("expected error for AZ conflict; got nil")
+	}
+	var cpiErr *cpierrors.Error
+	if stderrors.As(err, &cpiErr) && cpiErr.OkToRetry() {
+		t.Error("AZ conflict error must not be retriable")
+	}
+}
+
+// TestResolveTargetNodeWithRNG_LocalDiskPinnedNodeOffline_Error verifies that when
+// the local disk's home node is offline, a non-retriable CloudError is returned
+// (not a generic "no candidates" retriable error).
+func TestResolveTargetNodeWithRNG_LocalDiskPinnedNodeOffline_Error(t *testing.T) {
+	t.Parallel()
+	deps := buildFaultDomainDeps(
+		[]map[string]any{
+			{"type": "node", "name": "pve1", "online": 0, "maxcpu": int64(4), "maxmem": int64(8 * 1024 * 1024 * 1024), "mem": int64(0), "cpu": 0.0},
+			onlineNode("pve2"),
+		},
+		nil,
+		func(c *config.CPIConfig) {
+			c.Node = ""
+			c.Placement = &config.PlacementConfig{
+				AZMap: map[string][]string{"zone-a": {"pve1", "pve2"}},
+			}
+		},
+	)
+	diskCIDs := []string{encodeLocalCID("pve1")}
+	_, err := resolveTargetNodeWithRNG(context.Background(), deps, createVMCloudProps{}, "", diskCIDs, nil)
+	if err == nil {
+		t.Fatal("expected error when disk's home node is offline; got nil")
+	}
+	if !strings.Contains(err.Error(), "pve1") {
+		t.Errorf("error must name the pinned node; got: %v", err)
+	}
+	// Must be non-retriable: this is a hard constraint violation.
+	var cpiErr *cpierrors.Error
+	if stderrors.As(err, &cpiErr) && cpiErr.OkToRetry() {
+		t.Error("offline pinned node error must not be retriable (hard constraint)")
+	}
+}
+
+// TestResolveTargetNodeWithRNG_BareLocalCID_Inert verifies that a bare legacy CID
+// imposes no constraint — placement proceeds normally without pinning.
+func TestResolveTargetNodeWithRNG_BareLocalCID_Inert(t *testing.T) {
+	t.Parallel()
+	deps := buildFaultDomainDeps(
+		[]map[string]any{onlineNode("pve1"), onlineNode("pve2")},
+		nil,
+		func(c *config.CPIConfig) {
+			c.Placement = &config.PlacementConfig{
+				AZMap: map[string][]string{"zone-a": {"pve1", "pve2"}},
+			}
+		},
+	)
+	diskCIDs := []string{"local-lvm:vm-100-disk-0"} // bare legacy — no constraint
+	_, err := resolveTargetNodeWithRNG(context.Background(), deps, createVMCloudProps{}, "", diskCIDs, nil)
+	if err != nil {
+		t.Fatalf("bare CID must impose no constraint; got error: %v", err)
+	}
+}
+
+// TestResolveTargetNodeWithRNG_PlacementDisabled_LocalDiskPinsNode verifies that even
+// with placement disabled (config.Node fallback path), a local disk's home node wins.
+// This prevents silent VM placement on the wrong node when placement is off.
+func TestResolveTargetNodeWithRNG_PlacementDisabled_LocalDiskPinsNode(t *testing.T) {
+	t.Parallel()
+	// No Placement config → PlacementEnabled() == false.
+	deps := Deps{
+		Config: &config.CPIConfig{
+			Host:          "pve.test",
+			Node:          "pve2",       // config.node differs from disk's node
+			VMStorage:     "local-lvm",
+			NetworkBridge: "vmbr0",
+		},
+		PVE:      nil, // placement disabled path never queries PVE
+		Logger:   log.NewNopLogger(),
+		Resolver: &staticKindResolver{sharedPools: nil}, // all pools are local
+	}
+	diskCIDs := []string{encodeLocalCID("pve1")}
+	node, err := resolveTargetNodeWithRNG(context.Background(), deps, createVMCloudProps{}, "", diskCIDs, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// Disk's home node (pve1) must win over config.node (pve2).
+	if node != "pve1" {
+		t.Errorf("got node %q; want pve1 (local disk pin wins over config.node)", node)
+	}
+}
+
+// TestResolveTargetNodeWithRNG_TargetNodeConflictsLocalDisk_Error verifies that
+// cloud_properties.target_node conflicts with the local disk's home node produce
+// a non-retriable CloudError explaining the conflict.
+func TestResolveTargetNodeWithRNG_TargetNodeConflictsLocalDisk_Error(t *testing.T) {
+	t.Parallel()
+	deps := Deps{
+		Config: &config.CPIConfig{
+			Host:          "pve.test",
+			Node:          "",
+			VMStorage:     "local-lvm",
+			NetworkBridge: "vmbr0",
+		},
+		PVE:      nil,
+		Logger:   log.NewNopLogger(),
+		Resolver: &staticKindResolver{sharedPools: nil}, // all pools are local
+	}
+	diskCIDs := []string{encodeLocalCID("pve1")}
+	cp := createVMCloudProps{TargetNode: "pve2"} // conflicts with disk on pve1
+	_, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", diskCIDs, nil)
+	if err == nil {
+		t.Fatal("expected error for target_node/disk conflict; got nil")
+	}
+	if !strings.Contains(err.Error(), "pve2") || !strings.Contains(err.Error(), "pve1") {
+		t.Errorf("error must name both target_node and disk node; got: %v", err)
+	}
+	var cpiErr *cpierrors.Error
+	if stderrors.As(err, &cpiErr) && cpiErr.OkToRetry() {
+		t.Error("target_node/disk conflict must not be retriable")
+	}
+}
+
+// TestResolveTargetNodeWithRNG_TargetNodeMatchesLocalDisk_OK verifies that when
+// cloud_properties.target_node matches the local disk's home node, the call
+// succeeds and returns that node.
+func TestResolveTargetNodeWithRNG_TargetNodeMatchesLocalDisk_OK(t *testing.T) {
+	t.Parallel()
+	deps := Deps{
+		Config: &config.CPIConfig{
+			Host:          "pve.test",
+			Node:          "",
+			VMStorage:     "local-lvm",
+			NetworkBridge: "vmbr0",
+		},
+		PVE:      nil,
+		Logger:   log.NewNopLogger(),
+		Resolver: &staticKindResolver{sharedPools: nil}, // all pools are local
+	}
+	diskCIDs := []string{encodeLocalCID("pve1")}
+	cp := createVMCloudProps{TargetNode: "pve1"} // consistent with disk
+	node, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", diskCIDs, nil)
+	if err != nil {
+		t.Fatalf("unexpected error when target_node matches disk node: %v", err)
+	}
+	if node != "pve1" {
+		t.Errorf("got node %q; want pve1", node)
 	}
 }

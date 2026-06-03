@@ -38,6 +38,12 @@ type createDiskCloudProperties struct {
 	// (see applyCustomTagsToVM). Tags are deferred when create_disk has no
 	// vm_cid hint; set_disk_metadata applies them on the next sync.
 	Tags map[string]string `json:"tags"`
+	// AvailabilityZone records the AZ label for this disk at create time. When
+	// non-empty it is encoded into the disk CID metadata so create_vm can use it
+	// for fault-domain co-location: shared-storage disks in a given AZ constrain
+	// the VM to that AZ, preventing cross-AZ attachment. Empty (default) imposes
+	// no AZ constraint; create_vm placement proceeds unconstrained by this disk.
+	AvailabilityZone string `json:"availability_zone,omitempty"`
 }
 
 // resolveStorage returns the storage pool name to use for a create_disk call.
@@ -160,14 +166,23 @@ func HandleCreateDisk(deps Deps) Handler {
 			formatArg = format
 		}
 
-		maxAttempts := deps.Config.VMIDAllocAttempts
+		// VMID-collision attempts: retry.vmid_alloc.max_attempts overrides the
+		// existing vmid_alloc_attempts, which overrides the built-in default 5.
+		maxAttempts := deps.Config.RetryVMIDAlloc().MaxAttempts
+		if maxAttempts <= 0 {
+			maxAttempts = deps.Config.VMIDAllocAttempts
+		}
 		if maxAttempts <= 0 {
 			maxAttempts = 5
 		}
 		// Lock retries scale with how busy the storage is, not with how many
-		// VMID collisions we can tolerate. Use the package default unless an
-		// operator overrides it explicitly.
-		lockAttempts := deps.Config.VMIDAllocAttempts
+		// VMID collisions we can tolerate. retry.storage_import.max_attempts
+		// overrides the existing vmid_alloc_attempts, which overrides the
+		// package default.
+		lockAttempts := deps.Config.RetryStorageImport().MaxAttempts
+		if lockAttempts <= 0 {
+			lockAttempts = deps.Config.VMIDAllocAttempts
+		}
 		if lockAttempts <= 0 {
 			lockAttempts = pve.DefaultStorageLockMaxAttempts
 		}
@@ -182,6 +197,7 @@ func HandleCreateDisk(deps Deps) Handler {
 		// ----------------------------------------------------------------
 		namingVMID, diskCID, canonicalVolID, err := attemptCreateVolume(
 			ctx, deps, node, storage, sizeGiB, formatArg, lockAttempts, maxAttempts,
+			cloudProps.AvailabilityZone,
 		)
 		if err != nil {
 			return nil, cpierrors.Wrap(err, "create_disk: CreateVolume failed on node "+node+" storage "+storage)
@@ -246,6 +262,11 @@ func HandleCreateDisk(deps Deps) Handler {
 // retrying on VMID conflicts up to maxAttempts times. On a non-conflict
 // CreateVolume failure it performs best-effort orphan cleanup before returning.
 //
+// az is the availability-zone label from cloud_properties.availability_zone.
+// When non-empty it is encoded into the returned disk CID metadata so that
+// create_vm can enforce fault-domain co-location for shared-storage disks.
+// An empty az produces a CID identical to pre-AZ releases (backward-compatible).
+//
 // Returns:
 //   - namingVMID: the VMID allocated by AllocateDiskWithRetry (for logging)
 //   - diskCID: the volid to use as the BOSH disk CID; equals the PVE-returned
@@ -259,6 +280,7 @@ func attemptCreateVolume(
 	sizeGiB int,
 	formatArg string,
 	lockAttempts, maxAttempts int,
+	az string,
 ) (namingVMID int, diskCID, canonicalVolID string, err error) {
 	var volid string
 
@@ -343,13 +365,15 @@ func attemptCreateVolume(
 		diskCID = canonicalVolID
 	}
 	// Append placement metadata so downstream handlers (attach_disk and
-	// future fault-domain co-location) can read pool and node without an extra
-	// PVE API call. Pool is always the resolved storage; node is the PVE node
-	// that holds the volume (meaningful for local-backend deployments). AZ
-	// is not available at create_disk time and is left empty.
+	// fault-domain co-location in create_vm) can read pool, node, and AZ
+	// without an extra PVE API call. Pool is always the resolved storage;
+	// node is the PVE node that holds the volume (meaningful for local-backend
+	// deployments). AZ is set from cloud_properties.availability_zone when
+	// provided; otherwise left empty so the CID is backward-compatible.
 	diskCID = pve.EncodeDiskCID(diskCID, &pve.DiskCIDMeta{
 		Pool: storage,
 		Node: node,
+		AZ:   az,
 	})
 	return namingVMID, diskCID, canonicalVolID, nil
 }

@@ -141,6 +141,12 @@
     config["ensure_no_ip_conflicts"] = false
   end
 
+  # Emit ip_conflict_probe only when set to a non-empty value. The Go config
+  # accessor defaults empty string to "off"; omitting the key preserves that
+  # default with no behavioral change. Emit only when the operator opts in.
+  ip_conflict_probe = p("pve.ip_conflict_probe", "")
+  config["ip_conflict_probe"] = ip_conflict_probe unless ip_conflict_probe.to_s.empty?
+
   # Emit the placement block only when at least one placement property is set.
   # When the block would be empty, omit it entirely so the Go config zero-value
   # (nil *PlacementConfig) is preserved and existing deployments are unaffected.
