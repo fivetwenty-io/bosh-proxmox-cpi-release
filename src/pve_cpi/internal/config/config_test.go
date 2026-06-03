@@ -3433,3 +3433,103 @@ func TestDLB_AbsentDLBBlock_NoRegression(t *testing.T) {
 		t.Errorf("DLBAZName() = %q with nil DLB block, want %q", got, "dlb")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// ExcludeMaintenanceNodesEnabled
+// ---------------------------------------------------------------------------
+
+func TestExcludeMaintenanceNodesEnabled_NilPlacement(t *testing.T) {
+	t.Parallel()
+	cfg := &config.CPIConfig{}
+	// nil Placement → default true (protective).
+	if !cfg.ExcludeMaintenanceNodesEnabled() {
+		t.Error("ExcludeMaintenanceNodesEnabled() = false with nil Placement; want true")
+	}
+}
+
+func TestExcludeMaintenanceNodesEnabled_NilField(t *testing.T) {
+	t.Parallel()
+	cfg := &config.CPIConfig{Placement: &config.PlacementConfig{}}
+	// Placement present, ExcludeMaintenanceNodes nil → default true.
+	if !cfg.ExcludeMaintenanceNodesEnabled() {
+		t.Error("ExcludeMaintenanceNodesEnabled() = false with nil field; want true")
+	}
+}
+
+func TestExcludeMaintenanceNodesEnabled_ExplicitFalse(t *testing.T) {
+	t.Parallel()
+	f := false
+	cfg := &config.CPIConfig{Placement: &config.PlacementConfig{ExcludeMaintenanceNodes: &f}}
+	if cfg.ExcludeMaintenanceNodesEnabled() {
+		t.Error("ExcludeMaintenanceNodesEnabled() = true with *false; want false")
+	}
+}
+
+func TestExcludeMaintenanceNodesEnabled_ExplicitTrue(t *testing.T) {
+	t.Parallel()
+	tr := true
+	cfg := &config.CPIConfig{Placement: &config.PlacementConfig{ExcludeMaintenanceNodes: &tr}}
+	if !cfg.ExcludeMaintenanceNodesEnabled() {
+		t.Error("ExcludeMaintenanceNodesEnabled() = false with *true; want true")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// MaintenanceNodeTagsValue
+// ---------------------------------------------------------------------------
+
+func TestMaintenanceNodeTagsValue_Default(t *testing.T) {
+	t.Parallel()
+	cfg := &config.CPIConfig{}
+	got := cfg.MaintenanceNodeTagsValue()
+	if len(got) != 1 || got[0] != "maintenance" {
+		t.Errorf("MaintenanceNodeTagsValue() = %v; want [maintenance]", got)
+	}
+}
+
+func TestMaintenanceNodeTagsValue_Custom(t *testing.T) {
+	t.Parallel()
+	cfg := &config.CPIConfig{Placement: &config.PlacementConfig{MaintenanceNodeTags: []string{"maint", "drain"}}}
+	got := cfg.MaintenanceNodeTagsValue()
+	if len(got) != 2 || got[0] != "maint" || got[1] != "drain" {
+		t.Errorf("MaintenanceNodeTagsValue() = %v; want [maint drain]", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// AZFallbackOrderValue / AZShuffleEnabled
+// ---------------------------------------------------------------------------
+
+func TestAZFallbackOrderValue_NilPlacement(t *testing.T) {
+	t.Parallel()
+	cfg := &config.CPIConfig{}
+	if got := cfg.AZFallbackOrderValue(); got != nil {
+		t.Errorf("AZFallbackOrderValue() = %v; want nil", got)
+	}
+}
+
+func TestAZFallbackOrderValue_Set(t *testing.T) {
+	t.Parallel()
+	cfg := &config.CPIConfig{Placement: &config.PlacementConfig{AZFallbackOrder: []string{"az-a", "az-b"}}}
+	got := cfg.AZFallbackOrderValue()
+	if len(got) != 2 || got[0] != "az-a" || got[1] != "az-b" {
+		t.Errorf("AZFallbackOrderValue() = %v; want [az-a az-b]", got)
+	}
+}
+
+func TestAZShuffleEnabled_Default(t *testing.T) {
+	t.Parallel()
+	cfg := &config.CPIConfig{}
+	if cfg.AZShuffleEnabled() {
+		t.Error("AZShuffleEnabled() = true with nil Placement; want false")
+	}
+}
+
+func TestAZShuffleEnabled_ExplicitTrue(t *testing.T) {
+	t.Parallel()
+	tr := true
+	cfg := &config.CPIConfig{Placement: &config.PlacementConfig{AZShuffle: &tr}}
+	if !cfg.AZShuffleEnabled() {
+		t.Error("AZShuffleEnabled() = false with *true; want true")
+	}
+}

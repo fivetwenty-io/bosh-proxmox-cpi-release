@@ -342,6 +342,15 @@ func attemptCreateVolume(
 	if diskCID == "" {
 		diskCID = canonicalVolID
 	}
+	// Append placement metadata so downstream handlers (attach_disk and
+	// future fault-domain co-location) can read pool and node without an extra
+	// PVE API call. Pool is always the resolved storage; node is the PVE node
+	// that holds the volume (meaningful for local-backend deployments). AZ
+	// is not available at create_disk time and is left empty.
+	diskCID = pve.EncodeDiskCID(diskCID, &pve.DiskCIDMeta{
+		Pool: storage,
+		Node: node,
+	})
 	return namingVMID, diskCID, canonicalVolID, nil
 }
 

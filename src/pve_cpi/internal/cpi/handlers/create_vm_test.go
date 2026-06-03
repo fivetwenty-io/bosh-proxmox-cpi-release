@@ -272,6 +272,13 @@ func (m *vmMockCluster) ListStatus(ctx context.Context) (*sdkcluster.ListStatusR
 	return &resp, nil
 }
 
+func (m *vmMockCluster) ListHaStatusCurrent(_ context.Context) (*sdkcluster.ListHaStatusCurrentResponse, error) {
+	// Default: no nodes in HA maintenance. Tests that need HA-maintenance behavior
+	// must override via a custom cluster mock.
+	empty := sdkcluster.ListHaStatusCurrentResponse{}
+	return &empty, nil
+}
+
 // vmMockAgent implements agent.Agent for create_vm tests.
 type vmMockAgent struct {
 	configureFn    func(ctx context.Context, node string, vmid int, cfg agent.AgentConfig) error

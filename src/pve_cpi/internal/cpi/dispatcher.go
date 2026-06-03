@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -119,10 +120,47 @@ func (d *Dispatcher) Register(method string, h Handler) error {
 //  5. On any other non-nil error: wrap as CloudError, OkToRetry=false.
 //  6. On success: marshal result to json.RawMessage and build success response.
 //  7. If json.Marshal of result fails: return CloudError describing the failure.
+//  8. If the handler panics: recover, emit a non-retriable CloudError with method
+//     context and request_id, log the stack trace at error level.
 //
 // Every dispatch is logged at Info level with method, request_id, and duration_ms.
-func (d *Dispatcher) Handle(ctx context.Context, req *jsonrpc.Request) *jsonrpc.Response {
+func (d *Dispatcher) Handle(ctx context.Context, req *jsonrpc.Request) (resp *jsonrpc.Response) {
 	start := time.Now()
+
+	// Recover from any panic in the handler. A panic means the handler hit an
+	// unrecoverable condition (e.g., nil-deref). Convert it to a non-retriable
+	// CloudError so the Director receives a structured response and the process
+	// stays alive to serve subsequent requests.
+	//
+	// Nil-req guard: if req is nil (should not happen in production, but is
+	// theoretically reachable via a bug in runCPI or tests), reading req.Method /
+	// req.Context inside the defer would itself panic — unrecovered. Extract the
+	// safe values before the defer so the closure captures copies.
+	method := "unknown"
+	requestID := ""
+	if req != nil {
+		method = req.Method
+		requestID = req.Context.RequestID
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			stack := debug.Stack()
+			d.logger.Error("handler panic recovered",
+				log.String("method", method),
+				log.String("request_id", requestID),
+				log.Any("panic", r),
+				log.String("stack", string(stack)),
+			)
+			resp = errorResponse(cpierrors.Cloud("panic in %s [request_id=%s]: %v", method, requestID, r))
+		}
+	}()
+
+	// After the safe-extract above, a nil req would panic on req.Method below.
+	// Return a typed error immediately rather than letting the recover fire for
+	// what is effectively a caller bug.
+	if req == nil {
+		return errorResponse(cpierrors.Cloud("dispatcher: nil request"))
+	}
 
 	// Reject non-canonical method names before consulting the handlers map.
 	// This is the allow-list guard: even if a handler were somehow installed

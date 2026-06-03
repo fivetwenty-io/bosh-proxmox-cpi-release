@@ -936,3 +936,171 @@ func TestFindTemplateByName_IntegerZeroTemplateFlagNotMatched(t *testing.T) {
 		t.Fatal("FindTemplateByName: template:0 must not match")
 	}
 }
+
+// ============================================================
+// ResolveTemplateVMIDForNode tests
+// ============================================================
+
+// resolveTemplateClient builds a mockClient wired with a single listQemuFn.
+func resolveTemplateClient(fn func(ctx context.Context, node string, params *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error)) *mockClient {
+	return newTemplateClient(&templateNodesService{listQemuFn: fn})
+}
+
+// TestResolveTemplateVMIDForNode_PrimaryTemplate verifies a primary template (sha
+// tag, no node tag) is found.
+func TestResolveTemplateVMIDForNode_PrimaryTemplate(t *testing.T) {
+	t.Parallel()
+	sha8 := "abc12345"
+	c := resolveTemplateClient(func(_ context.Context, _ string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
+		// Primary: sha tag present, no node tag.
+		return makeListQemuResponseRaw(
+			`{"vmid":30001,"template":1,"tags":"bosh-stemcell-sha-` + sha8 + `"}`,
+		), nil
+	})
+
+	vmid, found, err := pve.ResolveTemplateVMIDForNode(context.Background(), c, "pve1", sha8)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !found {
+		t.Fatal("expected found=true for primary template")
+	}
+	if vmid != 30001 {
+		t.Errorf("vmid = %d; want 30001", vmid)
+	}
+}
+
+// TestResolveTemplateVMIDForNode_Replica verifies a per-node replica (sha + node tag) is found.
+func TestResolveTemplateVMIDForNode_Replica(t *testing.T) {
+	t.Parallel()
+	sha8 := "def45678"
+	node := "pve2"
+	nodeTag := pve.ReplicaNodeTagForNode(node)
+	c := resolveTemplateClient(func(_ context.Context, _ string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
+		return makeListQemuResponseRaw(
+			`{"vmid":30002,"template":1,"tags":"bosh-stemcell-sha-` + sha8 + `;` + nodeTag + `"}`,
+		), nil
+	})
+
+	vmid, found, err := pve.ResolveTemplateVMIDForNode(context.Background(), c, node, sha8)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !found {
+		t.Fatal("expected found=true for replica template")
+	}
+	if vmid != 30002 {
+		t.Errorf("vmid = %d; want 30002", vmid)
+	}
+}
+
+// TestResolveTemplateVMIDForNode_OtherNodeReplicaNotMatched verifies a replica
+// tagged for a different node is NOT returned.
+func TestResolveTemplateVMIDForNode_OtherNodeReplicaNotMatched(t *testing.T) {
+	t.Parallel()
+	sha8 := "ghi90abc"
+	node := "pve2"
+	otherTag := pve.ReplicaNodeTagForNode("pve3")
+	c := resolveTemplateClient(func(_ context.Context, _ string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
+		// This replica is for pve3, not pve2.
+		return makeListQemuResponseRaw(
+			`{"vmid":30003,"template":1,"tags":"bosh-stemcell-sha-` + sha8 + `;` + otherTag + `"}`,
+		), nil
+	})
+
+	_, found, err := pve.ResolveTemplateVMIDForNode(context.Background(), c, node, sha8)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if found {
+		t.Fatal("should NOT find pve3 replica when searching for pve2")
+	}
+}
+
+// TestResolveTemplateVMIDForNode_NotFound verifies false when no matching template.
+func TestResolveTemplateVMIDForNode_NotFound(t *testing.T) {
+	t.Parallel()
+	c := resolveTemplateClient(func(_ context.Context, _ string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
+		empty := sdknodes.ListQemuResponse{}
+		return &empty, nil
+	})
+	_, found, err := pve.ResolveTemplateVMIDForNode(context.Background(), c, "pve1", "sha8xxxxx")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if found {
+		t.Fatal("expected not-found on empty list")
+	}
+}
+
+// TestResolveTemplateVMIDForNode_EmptySHA8_ReturnsNotFound verifies empty sha8 returns false.
+func TestResolveTemplateVMIDForNode_EmptySHA8_ReturnsNotFound(t *testing.T) {
+	t.Parallel()
+	c := resolveTemplateClient(func(_ context.Context, _ string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
+		return makeListQemuResponseRaw(`{"vmid":30004,"template":1,"tags":"bosh-stemcell-sha-"}`), nil
+	})
+	_, found, err := pve.ResolveTemplateVMIDForNode(context.Background(), c, "pve1", "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if found {
+		t.Fatal("expected not-found when sha8 is empty")
+	}
+}
+
+// TestResolveTemplateVMIDForNode_APIError propagates ListQemu errors.
+func TestResolveTemplateVMIDForNode_APIError(t *testing.T) {
+	t.Parallel()
+	c := resolveTemplateClient(func(_ context.Context, _ string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
+		return nil, errors.New("connection refused")
+	})
+	_, _, err := pve.ResolveTemplateVMIDForNode(context.Background(), c, "pve1", "sha8test")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+}
+
+// TestResolveTemplateVMIDForNode_LowestVMIDWins verifies tie-break by VMID.
+func TestResolveTemplateVMIDForNode_LowestVMIDWins(t *testing.T) {
+	t.Parallel()
+	sha8 := "jkl12345"
+	c := resolveTemplateClient(func(_ context.Context, _ string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
+		item1 := json.RawMessage(`{"vmid":30010,"template":1,"tags":"bosh-stemcell-sha-` + sha8 + `"}`)
+		item2 := json.RawMessage(`{"vmid":30005,"template":1,"tags":"bosh-stemcell-sha-` + sha8 + `"}`)
+		resp := sdknodes.ListQemuResponse{item1, item2}
+		return &resp, nil
+	})
+
+	vmid, found, err := pve.ResolveTemplateVMIDForNode(context.Background(), c, "pve1", sha8)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !found {
+		t.Fatal("expected found=true")
+	}
+	if vmid != 30005 {
+		t.Errorf("vmid = %d; want 30005 (lowest)", vmid)
+	}
+}
+
+// TestReplicaNodeTagForNode_Format checks the tag format is correct.
+func TestReplicaNodeTagForNode_Format(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		node string
+		want string
+	}{
+		{"pve1", "bosh-stemcell-node-pve1"},
+		{"pve-node-2", "bosh-stemcell-node-pve-node-2"},
+		{"PVE_HOST_3", "bosh-stemcell-node-pve-host-3"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.node, func(t *testing.T) {
+			t.Parallel()
+			got := pve.ReplicaNodeTagForNode(tc.node)
+			if got != tc.want {
+				t.Errorf("ReplicaNodeTagForNode(%q) = %q; want %q", tc.node, got, tc.want)
+			}
+		})
+	}
+}

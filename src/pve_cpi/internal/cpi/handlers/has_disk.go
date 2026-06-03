@@ -41,11 +41,16 @@ func HandleHasDisk(deps Deps) Handler {
 		if diskCID == "" {
 			return nil, cpierrors.Cloud("has_disk: disk_cid must not be empty")
 		}
+		// Strip optional metadata suffix before any PVE API or storage lookup.
+		bareDiskCID, _, decErr := pve.ParseEncodedDiskCID(diskCID)
+		if decErr != nil {
+			return nil, cpierrors.DiskNotFound(diskCID)
+		}
 
 		// ----------------------------------------------------------------
 		// 2. Parse disk CID → storage + volume.
 		// ----------------------------------------------------------------
-		storage, _, err := pve.ParseDiskCID(diskCID)
+		storage, _, err := pve.ParseDiskCID(bareDiskCID)
 		if err != nil {
 			return nil, cpierrors.Wrap(err, "has_disk: invalid disk_cid "+diskCID)
 		}
@@ -61,7 +66,7 @@ func HandleHasDisk(deps Deps) Handler {
 		if err != nil {
 			return nil, cpierrors.Wrap(err, "has_disk: backend resolution failed for storage "+storage)
 		}
-		node, err := backend.NodeForExisting(ctx, diskCID)
+		node, err := backend.NodeForExisting(ctx, bareDiskCID)
 		if err != nil {
 			if pve.IsNotFound(err) {
 				deps.Logger.Debug("has_disk: backend reports volume not present on any node",
@@ -80,7 +85,7 @@ func HandleHasDisk(deps Deps) Handler {
 		//    must answer false for a just-deleted disk regardless of
 		//    backend, not raise a retriable cloud error.
 		// ----------------------------------------------------------------
-		exists, err := pve.ExistsTolerant(ctx, deps.PVE, node, storage, diskCID)
+		exists, err := pve.ExistsTolerant(ctx, deps.PVE, node, storage, bareDiskCID)
 		if err != nil {
 			// Belt-and-braces: any not-found classification surfacing through
 			// a non-Exists path still resolves to false.

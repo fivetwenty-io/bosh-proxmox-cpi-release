@@ -82,11 +82,19 @@ func HandleAttachDisk(deps Deps) Handler {
 		if err != nil {
 			return nil, err
 		}
+		// Strip optional metadata suffix so all PVE API calls receive a plain
+		// "<storage>:<volid>" string. diskCID (the full encoded form) is
+		// preserved for agent hints and log fields so the Director can match
+		// the CID it originally stored.
+		bareDiskCID, _, err := pve.ParseEncodedDiskCID(diskCID)
+		if err != nil {
+			return nil, cpierrors.DiskNotFound(diskCID)
+		}
 
 		// --------------------------------------------------------------------
 		// 2. Parse vm_cid → VMID; parse disk_cid → storage + volid.
 		// --------------------------------------------------------------------
-		node, vmid, err := attachDiskResolveNode(ctx, deps, vmCID, diskCID)
+		node, vmid, err := attachDiskResolveNode(ctx, deps, vmCID, bareDiskCID)
 		if err != nil {
 			return nil, err
 		}
@@ -138,7 +146,7 @@ func HandleAttachDisk(deps Deps) Handler {
 		// --------------------------------------------------------------------
 		const bus = "scsi"
 
-		desiredDiskID, prepErr := chooseSCSISlotSkippingZero(ctx, deps, node, vmid, diskCID)
+		desiredDiskID, prepErr := chooseSCSISlotSkippingZero(ctx, deps, node, vmid, bareDiskCID)
 		if prepErr != nil {
 			if pve.IsNotFound(prepErr) {
 				return nil, cpierrors.VMNotFound(vmCID)
@@ -149,7 +157,7 @@ func HandleAttachDisk(deps Deps) Handler {
 		var diskID string
 		err = pve.RetryOnTransient(ctx, deps.Logger, "attach_disk", 0, func() error {
 			var attachErr error
-			diskID, attachErr = deps.PVE.QEMU().AttachDisk(ctx, node, vmid, diskCID, bus, &qemu.AttachOpts{
+			diskID, attachErr = deps.PVE.QEMU().AttachDisk(ctx, node, vmid, bareDiskCID, bus, &qemu.AttachOpts{
 				DiskID: desiredDiskID,
 			})
 			return attachErr
@@ -165,7 +173,7 @@ func HandleAttachDisk(deps Deps) Handler {
 		// --------------------------------------------------------------------
 		// 6+7. Confirm attachment (resolve diskID) and derive device path.
 		// --------------------------------------------------------------------
-		devicePath, err := attachDiskConfirmAndPath(ctx, deps, vmCID, node, vmid, diskCID, diskID, deps.Logger)
+		devicePath, err := attachDiskConfirmAndPath(ctx, deps, vmCID, node, vmid, bareDiskCID, diskID, deps.Logger)
 		if err != nil {
 			return nil, err
 		}

@@ -280,6 +280,23 @@ type CPIConfig struct {
 	// pinned to one node. validate-only-when-set.
 	StemcellTemplateNode string `json:"stemcell_template_node,omitempty"`
 
+	// StemcellReplicateLocal enables per-node template replication when stemcell
+	// storage is node-local (dir, lvm, lvmthin) and the cluster has more than one
+	// node. When true, create_stemcell builds a template VM on every candidate
+	// cluster node by uploading the qcow2 independently to each node's local
+	// storage, then calling ensureTemplateVM per node. Each replica carries the
+	// tag "bosh-stemcell-node-<node>" in addition to the shared content tag
+	// "bosh-stemcell-sha-<sha8>". delete_stemcell removes all replicas across all
+	// cluster nodes (best-effort; a single-node failure is logged and skipped
+	// rather than aborting).
+	//
+	// Default false. When false, the existing behavior applies: local storage on a
+	// multi-node cluster is rejected at create_stemcell time with a clear error
+	// directing the operator to use shared storage. Setting this to true opts the
+	// operator into the replication strategy as an alternative to shared storage.
+	// validate-only-when-set; omit from ERB when false.
+	StemcellReplicateLocal bool `json:"stemcell_replicate_local,omitempty"`
+
 	// CloneMode controls the clone type used by create_vm when cloning a
 	// stemcell template. Values: "auto" (default), "linked", "full".
 	// "auto": linked clone for snapshot-capable backends (dir, nfs, cifs,
@@ -323,6 +340,17 @@ type CPIConfig struct {
 	// zero per-call overhead. Validated against the registry: an unknown name
 	// fails config validation at startup. Use HooksValue() to read.
 	Hooks []string `json:"hooks,omitempty"`
+
+	// HealthCheck holds opt-in post-create VM health babysitting configuration.
+	// When nil (the default), or when Enabled is absent or *false, no agent
+	// ping is performed after the start task completes — behavior is byte-identical
+	// to prior releases. When Enabled is *true, create_vm polls the guest QEMU
+	// agent via POST /agent/ping until the agent answers or the deadline expires.
+	// On failure, VM status diagnostics are folded into the error before the
+	// standard rollback cleans up the VM.
+	// Pointer-typed so a fully-absent block (nil) is cheap to detect. Accessors
+	// handle nil safely; Validate runs only when the block is present and enabled.
+	HealthCheck *HealthCheckConfig `json:"health_check,omitempty"`
 }
 
 // PlacementConfig holds all availability-aware node-selection knobs.
@@ -362,6 +390,35 @@ type PlacementConfig struct {
 	// for existing configurations. Use DLBExplicitlyEnabled(), DLBAZName(), and
 	// related accessors rather than reading this pointer directly.
 	DLB *DLBConfig `json:"dlb,omitempty"`
+
+	// ExcludeMaintenanceNodes controls whether nodes in a PVE HA maintenance or
+	// error state are excluded from placement candidates at create_vm time.
+	// Default true (protective): when nil or absent, the accessor returns true so
+	// VMs are not placed on degraded nodes unless the operator explicitly opts out.
+	// Set to false only when the HA API is unavailable or when placing on
+	// maintenance nodes is intentional.
+	ExcludeMaintenanceNodes *bool `json:"exclude_maintenance_nodes,omitempty"`
+
+	// MaintenanceNodeTags is the list of PVE node tags that indicate a node is in
+	// maintenance and should be excluded from placement. A node carrying any tag in
+	// this list is excluded when ExcludeMaintenanceNodes is true (or defaults to
+	// true). Default ["maintenance"]. Empty slice disables tag-based detection
+	// while still honoring HA-status-based detection.
+	MaintenanceNodeTags []string `json:"maintenance_node_tags,omitempty"`
+
+	// AZFallbackOrder is an ordered list of AZ names appended as fallback after
+	// cloud_properties.availability_zones are exhausted. Useful for a cluster-wide
+	// "prefer AZ-a then AZ-b" policy without per-VM cloud_properties. Empty (default)
+	// means no config-level fallback chain; placement uses only AZ candidates from
+	// cloud_properties.
+	AZFallbackOrder []string `json:"az_fallback_order,omitempty"`
+
+	// AZShuffle, when true, randomizes the AZ order within availability_zones before
+	// scoring, breaking ordering ties with a random draw. Default false
+	// (deterministic: preference order preserved). Pointer-typed so nil (absent) is
+	// distinguishable from explicit false. Use AZShuffleEnabled() for the effective
+	// bool.
+	AZShuffle *bool `json:"az_shuffle,omitempty"`
 }
 
 // AntiAffinityConfig holds the Tier-2 same-group spreading knobs.
@@ -442,6 +499,30 @@ type DLBConfig struct {
 	// shared storage (rbd, nfs, cifs, glusterfs, cephfs) and the storage type
 	// cannot be determined from the PVE API at create time.
 	RequireSharedStorage *bool `json:"require_shared_storage,omitempty"`
+}
+
+// HealthCheckConfig holds opt-in post-create VM health babysitting knobs.
+// All fields are checked only when Enabled is *true; validate-only-when-set.
+// An absent block (nil pointer on CPIConfig.HealthCheck) is equivalent to
+// Enabled=*false and produces zero overhead at create_vm time.
+type HealthCheckConfig struct {
+	// Enabled turns on post-create agent ping polling. Default false (opt-in).
+	// nil pointer or absent JSON key is treated as false by HealthCheckEnabled().
+	Enabled *bool `json:"enabled,omitempty"`
+
+	// TimeoutSec is the maximum time in seconds to wait for the guest agent to
+	// respond before giving up, gathering diagnostics, and returning an error.
+	// Must be 0–3600 when Enabled is true. Zero (absent or explicit 0) maps to
+	// the built-in default of 300 s via HealthCheckTimeoutSec(). Negative values
+	// are rejected. validate-only-when-set: ignored entirely when Enabled is
+	// false or nil.
+	TimeoutSec int `json:"timeout_sec,omitempty"`
+
+	// IntervalSec is the pause in seconds between successive agent ping attempts.
+	// Must be 0–3600 when Enabled is true. Zero means no sleep between retries
+	// (fast test mode). Default 5 s via HealthCheckIntervalSec().
+	// validate-only-when-set.
+	IntervalSec int `json:"interval_sec,omitempty"`
 }
 
 // PlacementWeights controls how each scoring axis contributes to the final
@@ -848,6 +929,43 @@ func (c *CPIConfig) AZCandidates(az string) ([]string, bool) {
 	return nodes, ok
 }
 
+// ExcludeMaintenanceNodesEnabled returns the effective maintenance-node exclusion
+// toggle. nil Placement block OR nil ExcludeMaintenanceNodes field → true
+// (default-on: protective). Explicit *false → false (operator opt-out).
+func (c *CPIConfig) ExcludeMaintenanceNodesEnabled() bool {
+	if c.Placement == nil || c.Placement.ExcludeMaintenanceNodes == nil {
+		return true
+	}
+	return *c.Placement.ExcludeMaintenanceNodes
+}
+
+// MaintenanceNodeTagsValue returns the effective list of operator maintenance
+// tags. When the field is nil or empty, returns ["maintenance"] (the default).
+func (c *CPIConfig) MaintenanceNodeTagsValue() []string {
+	if c.Placement == nil || len(c.Placement.MaintenanceNodeTags) == 0 {
+		return []string{"maintenance"}
+	}
+	return c.Placement.MaintenanceNodeTags
+}
+
+// AZFallbackOrderValue returns the operator-configured AZ fallback chain.
+// Returns nil when Placement is nil or the field is empty.
+func (c *CPIConfig) AZFallbackOrderValue() []string {
+	if c.Placement == nil {
+		return nil
+	}
+	return c.Placement.AZFallbackOrder
+}
+
+// AZShuffleEnabled reports whether AZ ordering randomization is on.
+// Default false (nil Placement, nil AZShuffle, or *false).
+func (c *CPIConfig) AZShuffleEnabled() bool {
+	if c.Placement == nil || c.Placement.AZShuffle == nil {
+		return false
+	}
+	return *c.Placement.AZShuffle
+}
+
 // DLBExplicitlyEnabled reports whether the master DLB override is set to true.
 // Returns false when: c is nil, Placement is nil, Placement.DLB is nil, or
 // DLB.Enabled is nil or *false. Only an explicit *true returns true.
@@ -958,6 +1076,43 @@ func (c *CPIConfig) HooksValue() []string {
 	return c.Hooks
 }
 
+// HealthCheckEnabled reports whether the post-create agent ping loop is active.
+// Returns false when HealthCheck is nil, Enabled is nil, or Enabled is *false.
+// Only an explicit *true returns true.
+func (c *CPIConfig) HealthCheckEnabled() bool {
+	if c == nil || c.HealthCheck == nil || c.HealthCheck.Enabled == nil {
+		return false
+	}
+	return *c.HealthCheck.Enabled
+}
+
+// HealthCheckTimeoutSec returns the effective agent-ping deadline in seconds.
+// Returns 300 when the block is absent, Enabled is false, or TimeoutSec is zero
+// (zero means "use built-in default"). Callers should gate on
+// HealthCheckEnabled() before using this value.
+func (c *CPIConfig) HealthCheckTimeoutSec() int {
+	const defaultHealthCheckTimeout = 300
+	if c == nil || c.HealthCheck == nil || c.HealthCheck.TimeoutSec <= 0 {
+		return defaultHealthCheckTimeout
+	}
+	return c.HealthCheck.TimeoutSec
+}
+
+// HealthCheckIntervalSec returns the effective sleep duration in seconds between
+// successive agent ping attempts. Returns 5 when the block is absent or
+// IntervalSec is zero. Zero is valid at runtime (no sleep); the accessor only
+// returns the default when the field has not been explicitly configured.
+func (c *CPIConfig) HealthCheckIntervalSec() int {
+	const defaultHealthCheckInterval = 5
+	if c == nil || c.HealthCheck == nil {
+		return defaultHealthCheckInterval
+	}
+	// Zero is a valid explicit setting (no sleep between retries). Return the
+	// default only when the block is absent (handled above). An explicitly
+	// set IntervalSec of 0 is returned as-is.
+	return c.HealthCheck.IntervalSec
+}
+
 // Validate checks all required fields and enum constraints.
 // Returns a CloudError whose message lists every violation, separated by "; ".
 //
@@ -981,6 +1136,7 @@ func (c *CPIConfig) ValidateWithLogger(logger *log.Logger) error {
 	c.validateRegistryConfig(&errs, logger)
 	c.validatePlacement(&errs)
 	c.validateHooks(&errs)
+	c.validateHealthCheck(&errs)
 	if len(errs) > 0 {
 		return cpierrors.Cloud("config validation failed: %s", strings.Join(errs, "; "))
 	}
@@ -1473,6 +1629,29 @@ func (c *CPIConfig) validateDLB(_ *[]string) {
 	// The Strict field on AntiAffinityConfig is a *bool — Go's type system
 	// guarantees the pointer target is a valid bool, so no additional check is
 	// needed. Nothing further to validate.
+}
+
+// validateHealthCheck validates the optional HealthCheck block.
+// Skipped entirely when HealthCheck is nil or Enabled is not *true
+// (validate-only-when-set). When enabled, TimeoutSec must be 0–3600 and
+// IntervalSec must be 0–3600. TimeoutSec == 0 is accepted and maps to the
+// built-in default of 300 s via HealthCheckTimeoutSec(). Negative values
+// are rejected.
+func (c *CPIConfig) validateHealthCheck(errs *[]string) {
+	if !c.HealthCheckEnabled() {
+		return
+	}
+	hc := c.HealthCheck
+	if hc.TimeoutSec < 0 || hc.TimeoutSec > 3600 {
+		*errs = append(*errs, fmt.Sprintf(
+			"health_check.timeout_sec must be 0-3600 when enabled, got %d", hc.TimeoutSec,
+		))
+	}
+	if hc.IntervalSec < 0 || hc.IntervalSec > 3600 {
+		*errs = append(*errs, fmt.Sprintf(
+			"health_check.interval_sec must be 0-3600 when enabled, got %d", hc.IntervalSec,
+		))
+	}
 }
 
 // redactEndpoint strips userinfo from a URL so the endpoint can be logged

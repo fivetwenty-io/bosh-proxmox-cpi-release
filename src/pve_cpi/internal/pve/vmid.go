@@ -166,7 +166,7 @@ func listClusterVMIDs(ctx context.Context, c Client) (map[int]struct{}, error) {
 		return inner
 	})
 	if err != nil {
-		return nil, cpierrors.Wrap(err, "vmid: list cluster resources")
+		return nil, cpierrors.Wrap(WrapError(err), "vmid: list cluster resources")
 	}
 	if resp == nil {
 		return nil, cpierrors.Cloud("vmid: nil response from cluster resources")

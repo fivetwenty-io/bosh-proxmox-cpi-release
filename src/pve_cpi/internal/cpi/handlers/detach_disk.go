@@ -144,6 +144,12 @@ func HandleDetachDisk(deps Deps) Handler {
 		if diskCID == "" {
 			return nil, cpierrors.Cloud("detach_disk: args[1] disk_cid must not be empty")
 		}
+		// Strip optional metadata suffix; PVE API and volid comparisons need
+		// the bare "<storage>:<volid>" form.
+		bareDiskCID, _, decErr := pve.ParseEncodedDiskCID(diskCID)
+		if decErr != nil {
+			return nil, cpierrors.DiskNotFound(diskCID)
+		}
 
 		// --------------------------------------------------------------------
 		// 2. Parse vm_cid → VMID; resolve node + disk slot via helper.
@@ -153,7 +159,7 @@ func HandleDetachDisk(deps Deps) Handler {
 			return nil, cpierrors.VMNotFound(vmCID)
 		}
 
-		node, diskID, alreadyDetached, err := detachDiskResolveSlot(ctx, deps, vmCID, vmid, diskCID)
+		node, diskID, alreadyDetached, err := detachDiskResolveSlot(ctx, deps, vmCID, vmid, bareDiskCID)
 		if err != nil {
 			return nil, err
 		}

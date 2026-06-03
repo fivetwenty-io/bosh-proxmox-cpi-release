@@ -41,11 +41,16 @@ func HandleDeleteDisk(deps Deps) Handler {
 		if diskCID == "" {
 			return nil, cpierrors.Cloud("delete_disk: disk_cid must not be empty")
 		}
+		// Strip optional metadata suffix before any PVE API or storage lookup.
+		bareDiskCID, _, decErr := pve.ParseEncodedDiskCID(diskCID)
+		if decErr != nil {
+			return nil, cpierrors.DiskNotFound(diskCID)
+		}
 
 		// ----------------------------------------------------------------
 		// 2. Parse disk CID → storage + volume.
 		// ----------------------------------------------------------------
-		storage, _, err := pve.ParseDiskCID(diskCID)
+		storage, _, err := pve.ParseDiskCID(bareDiskCID)
 		if err != nil {
 			return nil, cpierrors.Wrap(err, "delete_disk: invalid disk_cid "+diskCID)
 		}
@@ -60,7 +65,7 @@ func HandleDeleteDisk(deps Deps) Handler {
 		if err != nil {
 			return nil, cpierrors.Wrap(err, "delete_disk: backend resolution failed for storage "+storage)
 		}
-		node, err := backend.NodeForExisting(ctx, diskCID)
+		node, err := backend.NodeForExisting(ctx, bareDiskCID)
 		if err != nil {
 			if pve.IsNotFound(err) {
 				deps.Logger.Info("delete_disk: volume not found on any node, treating as already-deleted",
@@ -78,7 +83,7 @@ func HandleDeleteDisk(deps Deps) Handler {
 		//    cannot fire after delete_disk has already returned success.
 		// ----------------------------------------------------------------
 		delErr := pve.RetryOnTransientOrLock(ctx, deps.Logger, "delete_disk", 0, func() error {
-			upid, err := deps.PVE.Storage().DeleteVolumeAsync(ctx, node, storage, diskCID)
+			upid, err := deps.PVE.Storage().DeleteVolumeAsync(ctx, node, storage, bareDiskCID)
 			if err != nil {
 				return err
 			}

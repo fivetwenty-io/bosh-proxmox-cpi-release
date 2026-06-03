@@ -295,7 +295,7 @@ func AssignVMToPool(ctx context.Context, c Client, poolID string, vmid int64) er
 		return cpierrors.Cloud("AssignVMToPool: vmid must be a positive integer, got %d", vmid)
 	}
 	if err := c.Pools().AddVM(ctx, poolID, vmid); err != nil {
-		return fmt.Errorf("AssignVMToPool: pool %q vmid %d: %w", poolID, vmid, err)
+		return cpierrors.Wrap(WrapError(err), fmt.Sprintf("AssignVMToPool: pool %q vmid %d", poolID, vmid))
 	}
 	return nil
 }
@@ -404,4 +404,108 @@ func FindTemplateBySHATag(ctx context.Context, c Client, node, sha8 string) (vmi
 		return 0, false, nil
 	}
 	return bestVMID, true, nil
+}
+
+// replicaNodeTag returns the canonical per-node replica tag for node.
+// Format: "bosh-stemcell-node-<sanitized-node>" where sanitized-node has
+// characters outside [a-z0-9-] replaced with "-" (mirrors dnsSafeStemcellPart).
+func replicaNodeTag(node string) string {
+	safe := dnsSafeStemcellPart(node)
+	return "bosh-stemcell-node-" + safe
+}
+
+// ReplicaNodeTagForNode is the exported form of replicaNodeTag, used by handler
+// code in internal/cpi/handlers when composing the combined tag string for a
+// replica template VM. Both this function and replicaNodeTag produce the same
+// output; the unexported form is used internally within this package.
+func ReplicaNodeTagForNode(node string) string {
+	return replicaNodeTag(node)
+}
+
+// ResolveTemplateVMIDForNode returns the VMID of a stemcell template residing
+// on node that matches sha8. It accepts both the primary template (on the
+// canonical template node) and per-node replicas tagged with
+// "bosh-stemcell-node-<node>".
+//
+// Match criteria (both candidate types accepted; lowest VMID wins on tie):
+//  1. Template carries "bosh-stemcell-sha-<sha8>" AND "bosh-stemcell-node-<node>". → replica.
+//  2. Template carries "bosh-stemcell-sha-<sha8>" AND no "bosh-stemcell-node-" tag. → primary.
+//
+// Return values:
+//   - (vmid, true, nil)  — match found on node.
+//   - (0, false, nil)    — no match; sha8 empty; nil/empty list.
+//   - (0, false, err)    — ListQemu API error.
+//
+// The placement scorer consumes this helper to check whether a per-node replica
+// exists before choosing a target node for clone.
+func ResolveTemplateVMIDForNode(ctx context.Context, c Client, node, sha8 string) (vmid int, found bool, err error) {
+	if ctx == nil {
+		return 0, false, cpierrors.Cloud("ResolveTemplateVMIDForNode: ctx must not be nil")
+	}
+	if c == nil {
+		return 0, false, cpierrors.Cloud("ResolveTemplateVMIDForNode: client must not be nil")
+	}
+	if node == "" {
+		return 0, false, cpierrors.Cloud("ResolveTemplateVMIDForNode: node must not be empty")
+	}
+	if sha8 == "" {
+		return 0, false, nil
+	}
+
+	shaTag := "bosh-stemcell-sha-" + sha8
+	nodeTag := replicaNodeTag(node)
+
+	resp, listErr := c.Nodes().ListQemu(ctx, node, nil)
+	if listErr != nil {
+		return 0, false, cpierrors.Wrap(listErr,
+			fmt.Sprintf("ResolveTemplateVMIDForNode: node %s sha8 %q", node, sha8))
+	}
+	if resp == nil || len(*resp) == 0 {
+		return 0, false, nil
+	}
+
+	var bestVMID int64
+	for _, raw := range *resp {
+		var item qemuListItem
+		if jsonErr := json.Unmarshal(raw, &item); jsonErr != nil {
+			continue
+		}
+		if item.Template == nil || !*item.Template {
+			continue
+		}
+		if item.Tags == nil {
+			continue
+		}
+		tokens := splitPVETags(*item.Tags)
+
+		hasSHA := false
+		hasNodeTag := false
+		hasAnyNodeTag := false
+		for _, tok := range tokens {
+			if tok == shaTag {
+				hasSHA = true
+			}
+			if tok == nodeTag {
+				hasNodeTag = true
+			}
+			if strings.HasPrefix(tok, "bosh-stemcell-node-") {
+				hasAnyNodeTag = true
+			}
+		}
+		if !hasSHA {
+			continue
+		}
+		// Accept: replica with this node's tag, OR primary with no node tag.
+		if !hasNodeTag && hasAnyNodeTag {
+			continue
+		}
+		if bestVMID == 0 || item.Vmid < bestVMID {
+			bestVMID = item.Vmid
+		}
+	}
+
+	if bestVMID == 0 {
+		return 0, false, nil
+	}
+	return int(bestVMID), true, nil
 }

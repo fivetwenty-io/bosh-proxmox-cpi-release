@@ -46,6 +46,11 @@ func HandleSnapshotDisk(deps Deps) Handler {
 		if diskCID == "" {
 			return nil, cpierrors.Cloud("snapshot_disk: args[0] disk_cid must not be empty")
 		}
+		// Strip optional metadata suffix before any PVE API or storage lookup.
+		bareDiskCID, _, decErr := pve.ParseEncodedDiskCID(diskCID)
+		if decErr != nil {
+			return nil, cpierrors.DiskNotFound(diskCID)
+		}
 
 		// metadata arg is optional and may be null or absent.
 		var metadata map[string]any
@@ -56,7 +61,7 @@ func HandleSnapshotDisk(deps Deps) Handler {
 		// ----------------------------------------------------------------
 		// 2. Parse disk_cid → storage + volid components.
 		// ----------------------------------------------------------------
-		if _, _, err := pve.ParseDiskCID(diskCID); err != nil {
+		if _, _, err := pve.ParseDiskCID(bareDiskCID); err != nil {
 			return nil, cpierrors.DiskNotFound(diskCID)
 		}
 
@@ -69,7 +74,7 @@ func HandleSnapshotDisk(deps Deps) Handler {
 		//    config stores disk values in canonical "<storage>:<volname>"
 		//    form — the disk_cid is that form.
 		// ----------------------------------------------------------------
-		vmid, node, err := pve.FindVMByDiskVolid(ctx, deps.PVE, deps.Config.Node, diskCID)
+		vmid, node, err := pve.FindVMByDiskVolid(ctx, deps.PVE, deps.Config.Node, bareDiskCID)
 		if err != nil {
 			return nil, err
 		}

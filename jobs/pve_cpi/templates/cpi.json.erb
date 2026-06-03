@@ -221,6 +221,30 @@
   end
   placement["weights"] = weights unless weights.empty?
 
+  # placement.exclude_maintenance_nodes: default-ON via Go accessor (nil → true).
+  # Emit only when the operator explicitly disables the guard (sets false).
+  # Omitting the key lets the accessor return true — behavior-preserving default.
+  unless p("pve.placement.exclude_maintenance_nodes", true)
+    placement["exclude_maintenance_nodes"] = false
+  end
+
+  # placement.maintenance_node_tags: emit only when the operator overrides the
+  # default ["maintenance"] with a non-empty list. When unset or empty, the Go
+  # accessor supplies ["maintenance"] so the key is omitted here.
+  maintenance_node_tags = p("pve.placement.maintenance_node_tags", [])
+  placement["maintenance_node_tags"] = maintenance_node_tags unless maintenance_node_tags.nil? || maintenance_node_tags.empty?
+
+  # placement.az_fallback_order: emit only when the operator provides a non-empty
+  # list. When unset or empty, Go defaults to no config-level fallback chain.
+  az_fallback_order = p("pve.placement.az_fallback_order", [])
+  placement["az_fallback_order"] = az_fallback_order unless az_fallback_order.nil? || az_fallback_order.empty?
+
+  # placement.az_shuffle: emit only when true (default false). Omitting preserves
+  # deterministic AZ ordering via the Go accessor default.
+  if p("pve.placement.az_shuffle", false)
+    placement["az_shuffle"] = true
+  end
+
   config["placement"] = placement unless placement.empty?
 
   # Emit vm_firewall only when explicitly true. The Go accessor defaults
@@ -233,6 +257,28 @@
   # means no dispatch middleware and zero per-call overhead.
   hooks = p("pve.hooks", [])
   config["hooks"] = hooks unless hooks.nil? || hooks.empty?
+
+  # Emit stemcell_replicate_local only when true. The Go zero-value (false)
+  # means local-storage multi-node replication is off; omitting the key
+  # preserves that default — byte-identical to prior releases.
+  if p("pve.stemcell_replicate_local", false)
+    config["stemcell_replicate_local"] = true
+  end
+
+  # Emit health_check block only when the operator sets at least one sub-field.
+  # When entirely absent, the Go nil *HealthCheckConfig means health polling is
+  # off — byte-identical to prior releases. Individual sub-fields follow
+  # omit-when-default: enabled only when true; timeout_sec/interval_sec only
+  # when non-zero (Go accessors supply 300 s / 5 s defaults otherwise).
+  health_check = {}
+  if p("pve.health_check.enabled", false)
+    health_check["enabled"] = true
+  end
+  hc_timeout = p("pve.health_check.timeout_sec", 0).to_i
+  health_check["timeout_sec"] = hc_timeout unless hc_timeout == 0
+  hc_interval = p("pve.health_check.interval_sec", 0).to_i
+  health_check["interval_sec"] = hc_interval unless hc_interval == 0
+  config["health_check"] = health_check unless health_check.empty?
 
   JSON.dump(config)
 %>

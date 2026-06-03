@@ -59,6 +59,13 @@ type NodeFacts struct {
 	// Online is true when PVE reports the node as reachable (online==1).
 	Online bool
 
+	// InMaintenance is true when GatherNodeFacts detected that this node is
+	// in a maintenance or degraded HA state, or carries an operator maintenance
+	// tag. Zero value (false) means not in maintenance, which is the safe default
+	// for callers that do not populate this field (e.g. tests that construct
+	// NodeFacts by hand).
+	InMaintenance bool
+
 	// FreeMemBytes is current free memory in bytes (Maxmem - Mem from cluster status).
 	FreeMemBytes int64
 
@@ -108,6 +115,11 @@ type Request struct {
 	// The penalty deducted from a node's score is Weights.AntiAffinity × avoidCount.
 	// Pass nil or an empty map when anti-affinity is not active.
 	AvoidNodes map[string]int
+
+	// ExcludeMaintenanceNodes, when true, causes Filter to hard-reject any node
+	// whose NodeFacts.InMaintenance is true. Zero value (false) preserves legacy
+	// behavior: maintenance nodes pass through Filter unchanged.
+	ExcludeMaintenanceNodes bool
 }
 
 // ScoredNode is a node with its computed score.
@@ -140,6 +152,11 @@ func Filter(facts []NodeFacts, req Request) (pass []NodeFacts, rejections map[st
 	for _, f := range facts {
 		if !f.Online {
 			rejections[f.Node] = "node offline"
+			continue
+		}
+
+		if req.ExcludeMaintenanceNodes && f.InMaintenance {
+			rejections[f.Node] = "node in maintenance"
 			continue
 		}
 

@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"compress/gzip"
 	"context"
+	cryptosha1 "crypto/sha1" //nolint:gosec // SHA-1 used only for operator-supplied expected-digest comparison, not for security
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -109,6 +110,16 @@ type stemcellCloudProps struct {
 	// Node pins light-stemcell placement to a specific cluster node.
 	// Used when stemcell storage is local-dir and multi-node placement matters.
 	Node string
+
+	// ExpectedSHA256 is the expected SHA-256 hex digest from cloud_properties.sha256.
+	// When non-empty the CPI verifies the computed digest matches after
+	// download or extraction. SHA-256 takes precedence over SHA-1 when both
+	// are provided. Empty means integrity is unverified (warn only).
+	ExpectedSHA256 string
+
+	// ExpectedSHA1 is the expected SHA-1 hex digest from cloud_properties.sha1.
+	// Compared only when ExpectedSHA256 is empty. Empty means no SHA-1 check.
+	ExpectedSHA1 string
 }
 
 // validateLightMutex returns an error when both ImageID and ImageURL are set.
@@ -193,6 +204,12 @@ func parseStemcellCloudProps(cp map[string]any) stemcellCloudProps {
 	}
 	if v, ok := cp["node"].(string); ok {
 		p.Node = v
+	}
+	if v, ok := cp["sha256"].(string); ok {
+		p.ExpectedSHA256 = v
+	}
+	if v, ok := cp["sha1"].(string); ok {
+		p.ExpectedSHA1 = v
 	}
 
 	return p
@@ -463,6 +480,26 @@ func HandleCreateStemcell(deps Deps) cpi.Handler {
 			if tmplErr != nil {
 				return nil, fmt.Errorf("create_stemcell: ensure template (dedup path): %w", tmplErr)
 			}
+
+			// Per-node replication on dedup path: re-running create_stemcell when the
+			// primary already exists must still converge any missing per-node replicas.
+			// Only applicable when sha256hex is known (required for replica idempotency check).
+			if deps.Config.StemcellReplicateLocal && sha256hex != "" {
+				clusterNodes, listErr := listClusterNodes(ctx, deps)
+				if listErr != nil {
+					deps.Logger.Warn("create_stemcell: replication (dedup): cannot list cluster nodes (skipping)",
+						log.Err(listErr),
+					)
+				} else if len(clusterNodes) > 1 {
+					uploadStagingDir := ""
+					if uploadSourcePath == imagePath {
+						uploadStagingDir = deps.Config.StemcellStagingDir
+					}
+					replicateStemcellToNodes(ctx, deps, templateNode, storage, qcow2Filename,
+						sha256hex, clusterNodes, uploadSourcePath, uploadStagingDir, cp)
+				}
+			}
+
 			return pve.BuildTemplateStemcellCID(vmid), nil
 		}
 
@@ -472,13 +509,34 @@ func HandleCreateStemcell(deps Deps) cpi.Handler {
 			return nil, uploadErr
 		}
 
-		// Step 12: Build template VM from the freshly uploaded qcow2 (D-11, D-05).
+		// Step 12: Build template VM from the freshly uploaded qcow2.
 		// heavy path: CPI uploaded the qcow2 → cpiOwnsSource=true; ensureTemplateVM
 		// deletes it after freeze (reclaims storage; template disk is the live copy).
 		vmid, tmplErr := ensureTemplateVM(ctx, deps, templateNode, storage, qcow2Filename, sha256hex, true, cp)
 		if tmplErr != nil {
 			return nil, fmt.Errorf("create_stemcell: ensure template: %w", tmplErr)
 		}
+
+		// Per-node replication (opt-in, default off). When stemcell_replicate_local
+		// is true and the storage is local, replicate the template to all other
+		// cluster nodes. This is a best-effort fire-and-forget: individual node
+		// failures are logged as warnings and do not fail create_stemcell.
+		if deps.Config.StemcellReplicateLocal {
+			clusterNodes, listErr := listClusterNodes(ctx, deps)
+			if listErr != nil {
+				deps.Logger.Warn("create_stemcell: replication: cannot list cluster nodes (skipping replication)",
+					log.Err(listErr),
+				)
+			} else if len(clusterNodes) > 1 {
+				uploadStagingDir := ""
+				if uploadSourcePath == imagePath {
+					uploadStagingDir = deps.Config.StemcellStagingDir
+				}
+				replicateStemcellToNodes(ctx, deps, templateNode, storage, qcow2Filename,
+					sha256hex, clusterNodes, uploadSourcePath, uploadStagingDir, cp)
+			}
+		}
+
 		return pve.BuildTemplateStemcellCID(vmid), nil
 	})
 }
@@ -501,7 +559,7 @@ func HandleCreateStemcell(deps Deps) cpi.Handler {
 //     and a missing pool means a misconfiguration that must be visible immediately.
 //     The template VMID is still usable if the caller handles the error separately,
 //     but this function returns the error so the operator sees it right away.
-//  7. D-09 retention: if cpiOwnsSource, delete the raw qcow2 at
+//  7. Source retention: if cpiOwnsSource, delete the raw qcow2 at
 //     <storage>:import/<qcow2Filename> via Storage().DeleteVolumeIfExists. Delete
 //     failure is logged as a warning and is not fatal — CID is returned regardless.
 //     If !cpiOwnsSource (light-preuploaded) the source is never deleted.
@@ -547,7 +605,7 @@ func ensureTemplateVM(
 		if shaFound {
 			logger.Info("ensureTemplateVM: reusing existing template (matched by sha tag)",
 				log.String("sha8", shaTag8),
-				log.Int64("vmid", shaVMID),
+				log.Int64(metadataKeyVMID, shaVMID),
 			)
 			return shaVMID, nil
 		}
@@ -562,7 +620,7 @@ func ensureTemplateVM(
 	if found {
 		logger.Info("ensureTemplateVM: reusing existing template",
 			log.String("name", templateName),
-			log.Int64("vmid", existingVMID),
+			log.Int64(metadataKeyVMID, existingVMID),
 		)
 		return existingVMID, nil
 	}
@@ -598,7 +656,7 @@ func ensureTemplateVM(
 
 	logger.Info("ensureTemplateVM: template VM created, freezing",
 		log.String("name", templateName),
-		log.Int64("vmid", allocatedVMID),
+		log.Int64(metadataKeyVMID, allocatedVMID),
 	)
 
 	// Step 5: Freeze the VM into a PVE template.
@@ -616,7 +674,7 @@ func ensureTemplateVM(
 
 	logger.Info("ensureTemplateVM: template frozen",
 		log.String("name", templateName),
-		log.Int64("vmid", allocatedVMID),
+		log.Int64(metadataKeyVMID, allocatedVMID),
 	)
 
 	// Step 5b: Race reconciliation. The Step-2 dedup lookup and this freeze are
@@ -633,7 +691,7 @@ func ensureTemplateVM(
 		// Non-fatal: a failed re-scan leaves our freshly-frozen template in place.
 		// A later create_stemcell will reconcile via the Step-2 lookup.
 		logger.Warn("ensureTemplateVM: race reconcile scan failed (non-fatal; keeping new template)",
-			log.Int64("vmid", allocatedVMID),
+			log.Int64(metadataKeyVMID, allocatedVMID),
 			log.Err(recErr),
 		)
 	} else if survivor != 0 && survivor < allocatedVMID {
@@ -645,7 +703,7 @@ func ensureTemplateVM(
 		)
 		if delErr := deleteTemplateVM(ctx, deps, templateNode, allocatedVMID, logger); delErr != nil {
 			logger.Warn("ensureTemplateVM: failed to delete duplicate template after lost race (non-fatal)",
-				log.Int64("vmid", allocatedVMID),
+				log.Int64(metadataKeyVMID, allocatedVMID),
 				log.Err(delErr),
 			)
 		}
@@ -670,11 +728,11 @@ func ensureTemplateVM(
 		}
 		logger.Info("ensureTemplateVM: template assigned to pool",
 			log.String("pool", deps.Config.StemcellTemplatePool),
-			log.Int64("vmid", allocatedVMID),
+			log.Int64(metadataKeyVMID, allocatedVMID),
 		)
 	}
 
-	// Step 8: D-09 retention — delete source qcow2 only when the CPI owns it.
+	// Step 8: retention — delete source qcow2 only when the CPI owns it.
 	// DeleteVolumeIfExists takes the storage pool and the volume PATH component
 	// ("import/<file>") as separate args — same contract delete_stemcell uses.
 	// Passing the full "<storage>:import/<file>" volid here double-prefixes the
@@ -769,7 +827,7 @@ func deleteTemplateVM(ctx context.Context, deps Deps, node string, vmid int64, l
 //   - No QEMU guest agent — agent=0 (template is frozen; agent not needed).
 //   - onboot=0 — templates must not auto-start.
 //   - virtio0: import-from= with format=qcow2 and size=5G default.
-//   - Tags: "bosh-stemcell-sha-<sha8>" for old-CID opportunistic lookup (D-08).
+//   - Tags: "bosh-stemcell-sha-<sha8>" for content-based template dedup lookup.
 func attemptCreateTemplateVM(
 	ctx context.Context,
 	deps Deps,
@@ -790,7 +848,7 @@ func attemptCreateTemplateVM(
 		targetStorage, importVolid, diskFormatQCOW2, defaultStemcellDiskGiB)
 
 	createParams := map[string]any{
-		"vmid":          candidate,
+		metadataKeyVMID:          candidate,
 		metadataKeyName: templateName,
 		"ostype":        osTypeLinux26,
 		"scsihw":        "virtio-scsi-pci",
@@ -987,6 +1045,43 @@ func buildAndDeduplicateStemcellCID(
 		}
 	}
 
+	// Step 7b: Verify expected digest when supplied in cloud_properties.
+	// Heavy tarball path: source is local (non-retriable on mismatch).
+	//
+	// BOSH sets sha1/sha256 in cloud_properties to the digest of the original
+	// stemcell tarball (.tgz), NOT the extracted inner disk image. When the input
+	// is a tarball (uploadSourcePath differs from imagePath because an extraction
+	// occurred), the expected digest must be compared against imagePath (the tarball)
+	// rather than uploadSourcePath (the extracted .img). For bare images
+	// (qcow2/raw passthrough where uploadSourcePath == imagePath), no extraction
+	// happened and sha256hex of the file itself is correct.
+	digestPath := uploadSourcePath
+	digestSHA256 := sha256hex
+	isTarball := uploadSourcePath != imagePath
+	if isTarball {
+		// Tarball input: BOSH digest covers the original .tgz.
+		// Compute tarball hash separately; keep sha256hex (of the .img) for the
+		// dedup CID/tag — that still encodes disk content identity.
+		var tarbullErr error
+		digestSHA256, tarbullErr = sha256FilePath(imagePath, deps.Config.StemcellStagingDir)
+		if tarbullErr != nil {
+			// Hash failure for the tarball is non-fatal for the upload path
+			// (the upload uses the extracted .img, not the tarball). But it
+			// means we cannot verify the expected digest, so warn and skip
+			// verification rather than blocking a valid stemcell upload.
+			logger.Warn("create_stemcell: cannot compute tarball sha256 for digest verification (skipping check)",
+				log.Err(tarbullErr),
+				log.String("tarball", imagePath),
+			)
+			digestSHA256 = ""
+		}
+		digestPath = imagePath
+	}
+	if verifyErr := verifyExpectedDigest(ctx, logger, cp, digestSHA256, digestPath, deps.Config.StemcellStagingDir, stemcellSourceLocal); verifyErr != nil {
+		cleanupExtract()
+		return "", false, "", noop, verifyErr
+	}
+
 	// Steps 8-9: Build filename and CID.
 	qcow2Filename := pve.BuildStemcellFilename(cp.Name, cp.Version, sha256hex)
 	cid := pve.BuildStemcellCID(storage, qcow2Filename)
@@ -1131,7 +1226,7 @@ func handleLightStemcellPreUploaded(
 			imageID, storage, node)
 	}
 
-	// 6. Build template VM from the operator-placed qcow2 (D-11).
+	// 6. Build template VM from the operator-placed qcow2.
 	// light-preuploaded: CPI does NOT own this qcow2 → cpiOwnsSource=false
 	// (operator placed it; must not be deleted). sha256hex is unavailable
 	// at this point (no local file, no stream); pass "" so the template tag
@@ -1244,7 +1339,7 @@ func handleLightStemcellFetch(
 	// bosh-stemcell-<name>-<version>- prefix. We don't know sha8 yet, so this is
 	// best-effort — it only fires when a prior fetch for the same name+version
 	// already landed (regardless of sha8). On a hit we skip the network fetch and
-	// build/reuse the template from the existing qcow2 (D-11).
+	// build/reuse the template from the existing qcow2.
 	prefix := stemcellfetch.FilenamePrefixForDedup(cp.Name, cp.Version)
 	if existingVol, prefixErr := fetchFindByPrefix(ctx, deps, node, storage, prefix); prefixErr == nil && existingVol != "" {
 		// Guard: only short-circuit when the found volid belongs to the target storage.
@@ -1298,6 +1393,18 @@ func handleLightStemcellFetch(
 	}
 	sha256hex := hex.EncodeToString(h.Sum(nil))
 
+	// Detect truncated download: when the server advertised a Content-Length and
+	// fewer bytes arrived (body closed early without error), the resulting file is
+	// corrupt. No expected digest means this would otherwise be silently accepted.
+	// Network sources are retriable — a transient connection drop or proxy
+	// truncation may clear on retry.
+	if contentLength > 0 && written != contentLength {
+		return nil, cpierrors.Retriable(
+			"create_stemcell: light fetch truncated: expected %d bytes, got %d (retriable)",
+			contentLength, written,
+		)
+	}
+
 	// Sync to disk before uploadStemcellImage reopens the file for upload.
 	if syncErr := tmpFile.Sync(); syncErr != nil {
 		return nil, cpierrors.Wrap(syncErr, "create_stemcell: sync fetch temp file")
@@ -1308,6 +1415,12 @@ func handleLightStemcellFetch(
 		log.Int64("content_length", contentLength),
 		log.String("sha256", sha256hex),
 	)
+
+	// Verify expected digest when supplied in cloud_properties.
+	// Light-fetch path: source is network (retriable on mismatch).
+	if verifyErr := verifyExpectedDigest(ctx, deps.Logger, cp, sha256hex, tmpPath, "", stemcellSourceNetwork); verifyErr != nil {
+		return nil, verifyErr
+	}
 
 	// 5. Build canonical filename + exact dedup check.
 	qcow2Filename := stemcellfetch.BuildFetchedFilename(cp.Name, cp.Version, sha256hex)
@@ -1325,7 +1438,7 @@ func handleLightStemcellFetch(
 		deps.Logger.Info("create_stemcell: light fetch — SHA-matched existing stemcell, building template",
 			log.String("volid", existingVol),
 		)
-		// SHA-dedup: qcow2 already on storage. Build/reuse template (D-11).
+		// SHA-dedup: qcow2 already on storage. Build/reuse template.
 		// cpiOwnsSource=false: qcow2 exists and is the authoritative copy; we do
 		// not delete it (another stemcell record or clone may reference it).
 		dedupVMID, dedupTmplErr := ensureTemplateVM(ctx, deps, fetchTemplateNode, storage, qcow2Filename, sha256hex, false, cp)
@@ -1344,7 +1457,7 @@ func handleLightStemcellFetch(
 		return nil, cpierrors.Wrap(uploadErr, "create_stemcell: light fetch upload")
 	}
 
-	// 7. Build template VM from the uploaded qcow2 (D-11, D-05).
+	// 7. Build template VM from the uploaded qcow2.
 	// light-fetch: CPI uploaded the qcow2 → cpiOwnsSource=true; ensureTemplateVM
 	// deletes it after freeze (reclaims storage; template disk is the live copy).
 	fetchVMID, fetchTmplErr := ensureTemplateVM(ctx, deps, fetchTemplateNode, storage, qcow2Filename, sha256hex, true, cp)
@@ -1445,7 +1558,7 @@ func (h *handlerPolicyDeps) StorageInfo(ctx context.Context, name string) (pve.S
 	}
 	resp, err := h.deps.PVE.ClusterStorage().ListStorage(ctx, &sdkclusterstorage.ListStorageParams{})
 	if err != nil {
-		return pve.StorageInfo{}, err
+		return pve.StorageInfo{}, pve.WrapError(err)
 	}
 	if resp == nil {
 		return pve.StorageInfo{}, fmt.Errorf("handlerPolicyDeps: nil response from cluster storage list")
@@ -1527,10 +1640,15 @@ func validateStemcellStorageShared(ctx context.Context, deps Deps, storage strin
 	}
 
 	if clusterSize > 1 {
+		// When replication is opt-in enabled, skip the rejection: each cluster
+		// node will receive its own copy of the template via replicateStemcellToNodes.
+		if deps.Config != nil && deps.Config.StemcellReplicateLocal {
+			return nil
+		}
 		return cpierrors.Cloud(
 			"create_stemcell: stemcell storage %q is local-only but the cluster has %d nodes; "+
-				"stemcell_storage must be a shared storage pool (NFS, Ceph, CIFS, etc.) "+
-				"accessible from all cluster nodes",
+				"set stemcell_replicate_local=true to replicate the template to each node, "+
+				"or use a shared storage pool (NFS, Ceph, CIFS, etc.) accessible from all cluster nodes",
 			storage, clusterSize,
 		)
 	}
@@ -1547,7 +1665,7 @@ func clusterNodeCount(ctx context.Context, deps Deps) (int, error) {
 	}
 	resp, err := deps.PVE.Cluster().ListConfigNodes(ctx)
 	if err != nil {
-		return 0, cpierrors.Wrap(err, "clusterNodeCount: list cluster config nodes")
+		return 0, cpierrors.Wrap(pve.WrapError(err), "clusterNodeCount: list cluster config nodes")
 	}
 	if resp == nil {
 		return 0, nil
@@ -1988,4 +2106,328 @@ func uploadStemcellImage(
 		return cpierrors.Cloud("uploadStemcellImage: upload to %s/%s: %s", node, storageName, rerr.Error())
 	}
 	return nil
+}
+
+// stemcellSource classifies where a stemcell image originates for error
+// retriability decisions in verifyExpectedDigest.
+type stemcellSource int
+
+const (
+	// stemcellSourceLocal means the image came from a director-supplied local
+	// tarball or path. Digest mismatches are non-retriable: the file is
+	// authoritative and retrying with identical bytes would produce the same
+	// mismatch.
+	stemcellSourceLocal stemcellSource = iota
+	// stemcellSourceNetwork means the image was streamed from a remote source
+	// (https/s3/blobstore/oci). Digest mismatches may be caused by in-transit
+	// corruption; the director should retry to fetch a fresh copy.
+	stemcellSourceNetwork
+)
+
+// verifyExpectedDigest compares a known hex digest against the expected values
+// in cp. The function implements the following policy:
+//
+//   - SHA-256 takes precedence: if cp.ExpectedSHA256 is non-empty, only it is
+//     checked (SHA-1 is ignored even when present).
+//   - SHA-1 fallback: if cp.ExpectedSHA256 is empty but cp.ExpectedSHA1 is set,
+//     sha1FilePath is computed and compared.
+//   - No expected digest: a warning is logged and nil is returned (compute-only).
+//
+// Comparison is case-insensitive (both sides lowercased).
+//
+// Error retriability:
+//   - stemcellSourceNetwork mismatch → cpierrors.Retriable
+//   - stemcellSourceLocal mismatch   → cpierrors.Cloud (non-retriable)
+//
+// sha256hex is the already-computed SHA-256 hex for the resolved image (may be
+// empty for light-preuploaded, in which case SHA-256 comparison is skipped and
+// only SHA-1 is attempted when set). stagingDir scopes file access for SHA-1
+// computation (mirrors sha256FilePath convention).
+func verifyExpectedDigest(
+	ctx context.Context,
+	logger *log.Logger,
+	cp stemcellCloudProps,
+	sha256hex string,
+	resolvedPath string,
+	stagingDir string,
+	src stemcellSource,
+) error {
+	_ = ctx // reserved for future use (e.g. deadline propagation)
+
+	// SHA-256 check.
+	if cp.ExpectedSHA256 != "" {
+		if sha256hex == "" {
+			// Cannot verify because we have no computed hash. Treat as unverified
+			// (caller already warned) — same as no-digest path.
+			logger.Warn("create_stemcell: cannot verify sha256: computed hash unavailable",
+				log.String("expected_sha256", cp.ExpectedSHA256),
+			)
+			return nil
+		}
+		if !strings.EqualFold(sha256hex, cp.ExpectedSHA256) {
+			msg := fmt.Sprintf(
+				"create_stemcell: sha256 digest mismatch: expected %s, got %s",
+				strings.ToLower(cp.ExpectedSHA256), strings.ToLower(sha256hex),
+			)
+			if src == stemcellSourceNetwork {
+				return cpierrors.Retriable("%s", msg)
+			}
+			return cpierrors.Cloud("%s", msg)
+		}
+		logger.Info("create_stemcell: sha256 digest verified",
+			log.String("sha256", sha256hex),
+		)
+		return nil
+	}
+
+	// SHA-1 check (only when SHA-256 not expected).
+	if cp.ExpectedSHA1 != "" {
+		actual, hashErr := sha1FilePath(resolvedPath, stagingDir)
+		if hashErr != nil {
+			// Hash computation failure: warn and skip (cannot block upload on it).
+			logger.Warn("create_stemcell: cannot compute sha1 for expected-digest check",
+				log.Err(hashErr),
+			)
+			return nil
+		}
+		if !strings.EqualFold(actual, cp.ExpectedSHA1) {
+			msg := fmt.Sprintf(
+				"create_stemcell: sha1 digest mismatch: expected %s, got %s",
+				strings.ToLower(cp.ExpectedSHA1), strings.ToLower(actual),
+			)
+			if src == stemcellSourceNetwork {
+				return cpierrors.Retriable("%s", msg)
+			}
+			return cpierrors.Cloud("%s", msg)
+		}
+		logger.Info("create_stemcell: sha1 digest verified",
+			log.String("sha1", actual),
+		)
+		return nil
+	}
+
+	// No expected digest provided — log unverified warning.
+	logger.Warn("create_stemcell: stemcell integrity unverified (no expected digest in cloud_properties)")
+	return nil
+}
+
+// sha1FilePath computes the SHA-1 hex digest of the file at path.
+// When stagingDir is non-empty, file access is scoped via openStagedFile.
+// When empty, os.Open is called directly.
+//
+//nolint:gosec // SHA-1 used only for operator-supplied expected-digest comparison, not for security
+func sha1FilePath(path, stagingDir string) (string, error) {
+	f, err := openStagedFile(stagingDir, path)
+	if err != nil {
+		return "", cpierrors.Cloud("sha1FilePath: open %s: %s", path, err.Error())
+	}
+	defer func() { _ = f.Close() }()
+	h := cryptosha1.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", cpierrors.Cloud("sha1FilePath: read %s: %s", path, err.Error())
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// listClusterNodes returns all node names from GET /cluster/config/nodes.
+// Returns nil, nil on an empty list. Used by replication paths to enumerate
+// target nodes.
+func listClusterNodes(ctx context.Context, deps Deps) ([]string, error) {
+	if deps.PVE == nil || deps.PVE.Cluster() == nil {
+		return nil, cpierrors.Cloud("listClusterNodes: cluster service unavailable")
+	}
+	resp, err := deps.PVE.Cluster().ListConfigNodes(ctx)
+	if err != nil {
+		return nil, cpierrors.Wrap(err, "listClusterNodes: list cluster config nodes")
+	}
+	if resp == nil || len(*resp) == 0 {
+		return nil, nil
+	}
+	// Each item is a json.RawMessage; extract the "name" field.
+	type nodeItem struct {
+		Name string `json:"name"`
+	}
+	nodes := make([]string, 0, len(*resp))
+	for _, raw := range *resp {
+		var item nodeItem
+		if jerr := json.Unmarshal(raw, &item); jerr != nil || item.Name == "" {
+			continue
+		}
+		nodes = append(nodes, item.Name)
+	}
+	return nodes, nil
+}
+
+// replicateStemcellToNodes uploads qcow2 and builds a template VM on every
+// cluster node in targetNodes except for primaryNode (which already has the
+// primary template). Each replica VM carries both the sha tag and a per-node
+// tag "bosh-stemcell-node-<node>".
+//
+// This function is called only when StemcellReplicateLocal is true and the
+// storage backend is node-local. On shared storage it is never called (the
+// single primary template is accessible from all nodes via the shared pool).
+//
+// Each node's upload+ensureTemplateVM is attempted independently. A per-node
+// failure is logged as a warning and does not abort replication to remaining
+// nodes (best-effort semantics). The caller should treat a partial replication
+// as a degraded-but-usable state: create_vm on a node without a replica will
+// fail fast with a clear actionable error (from the create_vm guard), giving
+// the operator a chance to re-run create_stemcell to complete replication.
+func replicateStemcellToNodes(
+	ctx context.Context,
+	deps Deps,
+	primaryNode, storage, qcow2Filename, sha256hex string,
+	targetNodes []string,
+	uploadSourcePath, uploadStagingDir string,
+	cp stemcellCloudProps,
+) {
+	sha8 := sha256hex
+	if len(sha8) > 8 {
+		sha8 = sha8[:8]
+	}
+	logger := deps.Logger
+
+	for _, node := range targetNodes {
+		if node == primaryNode {
+			continue
+		}
+		nodeLogger := logger.With(log.String("replica_node", node))
+
+		// Check whether a replica already exists on this node (idempotent).
+		existingVMID, alreadyExists, checkErr := pve.ResolveTemplateVMIDForNode(ctx, deps.PVE, node, sha8)
+		if checkErr != nil {
+			nodeLogger.Warn("create_stemcell: replication: cannot check existing replica (skipping node)",
+				log.Err(checkErr),
+			)
+			continue
+		}
+		if alreadyExists {
+			nodeLogger.Info("create_stemcell: replication: replica already exists (skipping upload)",
+				log.Int(metadataKeyVMID, existingVMID),
+			)
+			continue
+		}
+
+		// Upload qcow2 to this node's local storage. The upload reopens the
+		// source file, so tmpDir must still be alive (caller defers cleanup).
+		if uploadErr := uploadStemcellImage(ctx, deps, node, storage, qcow2Filename, uploadSourcePath, uploadStagingDir); uploadErr != nil {
+			nodeLogger.Warn("create_stemcell: replication: upload failed (non-fatal; replica not created)",
+				log.Err(uploadErr),
+			)
+			continue
+		}
+
+		// Build template VM on this node. The replica carries both sha tag and
+		// the per-node tag. We set cp.Node to the target so the replica is
+		// pinned; ensureTemplateVM is called with node as templateNode.
+		replicaCP := cp
+		replicaCP.Node = node
+		replicaVMID, tmplErr := ensureReplicaTemplateVM(ctx, deps, node, storage, qcow2Filename, sha256hex, replicaCP)
+		if tmplErr != nil {
+			nodeLogger.Warn("create_stemcell: replication: ensure template failed (non-fatal; replica not created)",
+				log.Err(tmplErr),
+			)
+			// Best-effort: delete the uploaded qcow2 to reclaim storage.
+			volumePath := "import/" + qcow2Filename
+			if _, delErr := deps.PVE.Storage().DeleteVolumeIfExists(ctx, node, storage, volumePath); delErr != nil {
+				nodeLogger.Warn("create_stemcell: replication: cleanup of failed upload also failed (non-fatal)",
+					log.Err(delErr),
+				)
+			}
+			continue
+		}
+		nodeLogger.Info("create_stemcell: replication: replica template created",
+			log.Int64(metadataKeyVMID, replicaVMID),
+		)
+	}
+}
+
+// ensureReplicaTemplateVM is like ensureTemplateVM but tags the created VM with
+// both the sha tag and the per-node replica tag "bosh-stemcell-node-<node>".
+// The combined tag string lets ResolveTemplateVMIDForNode distinguish replicas
+// from the primary template when scanning a node's QEMU list.
+//
+// The replica qcow2 is CPI-owned (uploaded just above in replicateStemcellToNodes)
+// so cpiOwnsSource=true; ensureTemplateVM will delete it after freeze.
+func ensureReplicaTemplateVM(
+	ctx context.Context,
+	deps Deps,
+	node, storage, qcow2Filename, sha256hex string,
+	cp stemcellCloudProps,
+) (int64, error) {
+	sha8 := sha256hex
+	if len(sha8) > 8 {
+		sha8 = sha8[:8]
+	}
+	logger := deps.Logger
+
+	// Build deterministic template name (same as primary, differentiator is tag).
+	templateName := pve.BuildTemplateName(cp.Name, cp.Version)
+
+	// Dedup: check sha tag + node tag combo.
+	existingVMID, alreadyExists, checkErr := pve.ResolveTemplateVMIDForNode(ctx, deps.PVE, node, sha8)
+	if checkErr != nil {
+		return 0, fmt.Errorf("ensureReplicaTemplateVM: check existing %q node %q: %w", sha8, node, checkErr)
+	}
+	if alreadyExists {
+		logger.Info("ensureReplicaTemplateVM: replica already exists",
+			log.String("node", node),
+			log.Int(metadataKeyVMID, existingVMID),
+		)
+		return int64(existingVMID), nil
+	}
+
+	importVolid := storage + ":import/" + qcow2Filename
+	shaTag := "bosh-stemcell-sha-" + sha8
+	nodeTag := pve.ReplicaNodeTagForNode(node)
+	combinedTags := shaTag + ";" + nodeTag
+
+	isRetryable := func(e error) bool {
+		return pve.IsVMIDConflict(e) || pve.IsStorageLockTimeout(e) || pve.IsTransientTransport(e)
+	}
+
+	rangeStart := deps.Config.StemcellTemplateVMIDRangeStart
+	rangeEnd := deps.Config.StemcellTemplateVMIDRangeEnd
+
+	allocatedRaw, allocErr := pve.AllocateWithRetry(ctx, deps.PVE,
+		func(candidate int) error {
+			return attemptCreateTemplateVM(ctx, deps, logger, node, candidate, templateName, importVolid, combinedTags, deps.Config.VMStorage)
+		},
+		isRetryable,
+		0,
+		pve.WithRange(rangeStart, rangeEnd),
+	)
+	if allocErr != nil {
+		return 0, fmt.Errorf("ensureReplicaTemplateVM: allocate+create replica VM node %q: %w", node, allocErr)
+	}
+	allocatedVMID := int64(allocatedRaw)
+
+	// Freeze into template.
+	freezeUPID, freezeErr := pve.MakeTemplate(ctx, deps.PVE, node, allocatedVMID)
+	if freezeErr != nil {
+		return 0, fmt.Errorf("ensureReplicaTemplateVM: freeze node=%q vmid=%d: %w", node, allocatedVMID, freezeErr)
+	}
+	if freezeUPID != "" {
+		if awaitErr := pve.AwaitTaskWithLogger(ctx, deps.PVE, node, freezeUPID, logger,
+			pve.WithMaxWait(pve.StemcellMaxWait)); awaitErr != nil {
+			return 0, fmt.Errorf("ensureReplicaTemplateVM: await freeze node=%q vmid=%d upid=%s: %w",
+				node, allocatedVMID, freezeUPID, awaitErr)
+		}
+	}
+
+	// Delete the per-node uploaded qcow2 (CPI-owned). Best-effort.
+	volumePath := "import/" + qcow2Filename
+	if _, delErr := deps.PVE.Storage().DeleteVolumeIfExists(ctx, node, storage, volumePath); delErr != nil {
+		logger.Warn("ensureReplicaTemplateVM: best-effort qcow2 delete failed (non-fatal)",
+			log.String("node", node),
+			log.String("volume", volumePath),
+			log.Err(delErr),
+		)
+	}
+
+	logger.Info("ensureReplicaTemplateVM: replica template frozen",
+		log.String("node", node),
+		log.Int64(metadataKeyVMID, allocatedVMID),
+	)
+	return allocatedVMID, nil
 }

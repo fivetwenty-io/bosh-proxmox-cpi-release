@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cloudinit"
@@ -281,5 +283,82 @@ func TestRunCPI_DispatchesRequest(t *testing.T) {
 	// Result field must be null when Error is set (BOSH JSON-RPC contract).
 	if resp.Result != nil {
 		t.Errorf("expected nil Result on error response, got %v", resp.Result)
+	}
+}
+
+// panicOnFirstWrite is an io.Writer that panics on the first Write call and
+// delegates subsequent writes to buf. It simulates a broken write path (e.g.,
+// a corrupted response encoder) to exercise the dispatchOne backstop recover.
+type panicOnFirstWrite struct {
+	calls atomic.Int32
+	buf   bytes.Buffer
+}
+
+func (w *panicOnFirstWrite) Write(p []byte) (int, error) {
+	if w.calls.Add(1) == 1 {
+		panic("write path exploded")
+	}
+	return w.buf.Write(p)
+}
+
+// TestDispatchOne_WriteResponsePanic_EmitsCloudError verifies that dispatchOne's
+// deferred recover catches a panic from writeResponse (i.e., a panic that occurs
+// outside the dispatcher's own recover), emits a CloudError JSON body to bw, and
+// returns nil (not a write error) so the loop can continue.
+//
+// Mechanism: the underlying writer panics on the first Write call (which comes
+// from writeResponse encoding the handler's normal result). The recover fires,
+// calls writeErrorResponse on the same bw — which now delegates to buf because
+// calls > 1. The output in buf is a valid CloudError JSON-RPC response.
+func TestDispatchOne_WriteResponsePanic_EmitsCloudError(t *testing.T) {
+	t.Parallel()
+
+	_, logger := makeTestDeps(t)
+	d := cpi.NewDispatcher(logger)
+	// "info" returns NotImplemented — a normal (non-panicking) handler. The panic
+	// comes from the writer, not the handler, so it bypasses the dispatcher recover
+	// and is caught by dispatchOne's backstop.
+	req := &jsonrpc.Request{
+		Method:     "info",
+		Arguments:  []json.RawMessage{},
+		Context:    jsonrpc.Context{RequestID: "backstop-req-006"},
+		APIVersion: 2,
+	}
+
+	sink := &panicOnFirstWrite{}
+	bw := bufio.NewWriter(sink)
+
+	err := dispatchOne(context.Background(), bw, sink, d, req, logger)
+
+	// dispatchOne must not propagate the panic, and must return nil (write of the
+	// CloudError succeeded — the second write path no longer panics).
+	if err != nil {
+		t.Fatalf("dispatchOne returned unexpected error: %v", err)
+	}
+
+	// The CloudError JSON must be present in sink.buf (written on the 2nd+ call).
+	out := sink.buf.String()
+	if out == "" {
+		t.Fatal("expected CloudError JSON in sink; got empty buffer")
+	}
+
+	var resp jsonrpc.Response
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &resp); err != nil {
+		t.Fatalf("could not parse CloudError from sink: %v\nraw: %s", err, out)
+	}
+	if resp.Error == nil {
+		t.Fatal("expected error body in recovered response; got nil error")
+	}
+	if !strings.Contains(resp.Error.Type, "CloudError") {
+		t.Errorf("error type = %q; want CloudError", resp.Error.Type)
+	}
+	if resp.Error.OkToRetry {
+		t.Error("backstop-recovered error must not be retriable")
+	}
+	if !strings.Contains(resp.Error.Message, "info") {
+		t.Errorf("error message %q missing method name", resp.Error.Message)
+	}
+	if !strings.Contains(resp.Error.Message, "backstop-req-006") {
+		t.Errorf("error message %q missing request_id", resp.Error.Message)
 	}
 }

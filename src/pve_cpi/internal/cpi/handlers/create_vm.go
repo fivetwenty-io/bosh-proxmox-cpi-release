@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math/rand"
 	mrand "math/rand/v2"
 	"sort"
 	"strconv"
@@ -62,6 +63,7 @@ const defaultNetworkBridge = "vmbr0"
 // (e.g. "<job>/<id>"). Defined as a constant to avoid repeated string
 // literals across the handlers package.
 const metadataKeyName = "name"
+const metadataKeyVMID = "vmid"
 
 // createVMCloudProps holds the fields we care about from Args[2].
 type createVMCloudProps struct {
@@ -105,7 +107,15 @@ type createVMCloudProps struct {
 	// config.placement.az_map[availability_zone]. When set and the AZ key
 	// is absent from the map, create_vm returns a CloudError (operator
 	// misconfiguration). When empty, all online nodes are candidates.
+	// Singular form; takes precedence over AvailabilityZones when both set.
 	AvailabilityZone string `json:"availability_zone,omitempty"`
+	// AvailabilityZones lists AZ names in preference order. When set and
+	// AvailabilityZone (singular) is empty, placement iterates these AZs in
+	// order (with optional shuffle via placement.az_shuffle), advancing to
+	// the next AZ when the current one yields no viable candidates after
+	// filter. Mutually exclusive with AvailabilityZone; singular wins when
+	// both are present. Requires config.placement.az_map entries for each AZ.
+	AvailabilityZones []string `json:"availability_zones,omitempty"`
 	// SecurityGroups names PVE cluster firewall groups
 	// (/cluster/firewall/groups) to attach to the new VM. Each group must
 	// already exist in PVE; the CPI references group content but never creates
@@ -241,7 +251,7 @@ func createVM(
 	}()
 
 	logger.Info("create_vm: vm created and disk imported",
-		log.Int("vmid", vmid),
+		log.Int(metadataKeyVMID, vmid),
 		log.String("stemcell_cid", parsed.stemcellCID),
 		log.String("storage", shape.vmStorage),
 		log.Int("root_disk_gib", shape.rootDiskGiB),
@@ -339,7 +349,7 @@ func createVM(
 		if groupKey := sanitizeTagValue(instanceGroupName(parsed.env)); groupKey != "" {
 			if aaErr := ensureAntiAffinityMembership(ctx, deps, groupKey, vmid, logger); aaErr != nil {
 				logger.Warn("create_vm: HA anti-affinity membership not fully applied (non-fatal)",
-					log.Int("vmid", vmid), log.String("group", groupKey), log.Err(aaErr))
+					log.Int(metadataKeyVMID, vmid), log.String("group", groupKey), log.Err(aaErr))
 			}
 		}
 	}
@@ -356,7 +366,22 @@ func createVM(
 	if deps.Config.DLBEligibleForAZ(parsed.cloudProps.AvailabilityZone) {
 		if dlbErr := ensureDLBMembership(ctx, deps, vmid, parsed.cloudProps.AvailabilityZone, logger); dlbErr != nil {
 			logger.Warn("create_vm: DLB membership not fully applied (non-fatal)",
-				log.Int("vmid", vmid), log.Err(dlbErr))
+				log.Int(metadataKeyVMID, vmid), log.Err(dlbErr))
+		}
+	}
+
+	// -----------------------------------------------------------------------
+	// 11. Post-create health gate (opt-in: health_check.enabled).
+	//
+	// When enabled, poll the QEMU guest agent until it answers or the deadline
+	// expires. On failure, diagnostics from ListQemuStatusCurrent are folded
+	// into the error before the standard rollback defer fires and destroys the
+	// VM. Default off — behavior is byte-identical to prior releases when the
+	// block is absent or Enabled is false.
+	// -----------------------------------------------------------------------
+	if deps.Config.HealthCheckEnabled() {
+		if hcErr := waitUntilAgentReady(ctx, deps, shape.node, vmid, logger); hcErr != nil {
+			return nil, hcErr
 		}
 	}
 
@@ -513,25 +538,41 @@ func resolveVMShape(ctx context.Context, deps Deps, parsed *createVMParsedArgs) 
 // Decision tree (evaluated in order):
 //  1. cp.TargetNode != "" → operator override; skip scoring entirely (backward compat).
 //  2. deps.Config.PlacementEnabled() == true → live placement scoring:
-//     a. If cp.AvailabilityZone is set, restrict candidates to the AZ node list
-//     from config.placement.az_map. An AZ name present in cloud_properties
-//     but absent from the map is a misconfiguration → CloudError.
-//     b. GatherNodeFacts from the cluster (ListStatus + ListResources + per-node
-//     ListStorage). Filter for online + (AZ nodes when AZ set).
-//     c. Score with EffectiveWeights, Pick best. Empty candidates after filter
-//     fall back to deps.Config.Node with a warning rather than hard-failing
-//     (e.g. all nodes offline — the subsequent create attempt will fail with
-//     a more specific error from PVE).
+//     a. Build AZ order: singular availability_zone → single-element list (backward
+//     compat). Plural availability_zones → iterate in operator order (shuffle if
+//     placement.az_shuffle is true). Append config.placement.az_fallback_order.
+//     b. GatherNodeFacts once (cluster-wide). ExcludeMaintenanceNodes wired from
+//     config default (true).
+//     c. For each AZ: resolve candidate set, Filter+Score+Pick. Advance to next
+//     AZ on empty-after-filter. Return chosen node on first viable AZ.
+//     d. No viable AZ: classify rejection causes. Transient causes →
+//     cpierrors.Retriable. Permanent (bad AZ name) → cpierrors.Cloud.
+//     e. After all AZs exhausted, fall back to config.node with a warning.
 //  3. deps.Config.PlacementEnabled() == false → deps.Config.Node (legacy behavior).
 //  4. All paths: if the resolved node is still "" → CloudError.
 //
 // groupTag, when non-empty, is the anti-affinity tag (e.g. "job--diego-cell")
-// that activates scheduler-soft same-group spreading: GatherNodeFacts counts
-// existing same-group members per node and the scorer penalizes those nodes.
-// Empty groupTag means anti-affinity is off (Tier-1 behavior).
+// that activates scheduler-soft same-group spreading.
 //
-//nolint:gocognit // Three-branch decision tree; complexity is inherent to the spec.
+// rng is injected for deterministic shuffle in tests; pass nil for production
+// (a fresh rand source is created from the current time).
+//
+//nolint:gocognit // Multi-AZ loop + maintenance + retryability; inherent complexity.
 func resolveTargetNode(ctx context.Context, deps Deps, cp createVMCloudProps, groupTag string) (string, error) {
+	return resolveTargetNodeWithRNG(ctx, deps, cp, groupTag, nil)
+}
+
+// resolveTargetNodeWithRNG is the testable implementation of resolveTargetNode.
+// rng controls AZ shuffle order; pass nil for production (non-deterministic).
+//
+//nolint:gocognit // Multi-AZ loop + maintenance + retryability; inherent complexity.
+func resolveTargetNodeWithRNG(
+	ctx context.Context,
+	deps Deps,
+	cp createVMCloudProps,
+	groupTag string,
+	rng *rand.Rand,
+) (string, error) {
 	// Nil-guard the logger: internal unit tests that call resolveVMShape directly
 	// may leave deps.Logger unset. Use a nop logger in that case so logging calls
 	// are safe without requiring all callers to set a logger.
@@ -551,46 +592,40 @@ func resolveTargetNode(ctx context.Context, deps Deps, cp createVMCloudProps, gr
 	// Branch 2: live placement scoring.
 	// Skip when deps.PVE is nil (unit test minimal setup) — fall through to Branch 3.
 	if deps.Config.PlacementEnabled() && deps.PVE != nil {
-		az := cp.AvailabilityZone
+		// Build the AZ iteration order.
+		// Singular availability_zone (backward compat) → single-element list,
+		// no multi-AZ fallback behavior.
+		azOrder := buildAZOrder(cp, deps.Config, rng)
 
-		// AZ lookup: if AZ is set, validate it exists in the map.
-		var candidateSet []string
-		if az != "" {
-			nodes, ok := deps.Config.AZCandidates(az)
-			if !ok {
-				// Sentinel DLB AZ: not a real az_map zone — delegate placement to the
-				// PVE Dynamic Load Balancer. Use all online nodes as candidates; the
-				// scorer picks an initial landing node and CRS/DLB rebalances later.
-				if az == deps.Config.DLBAZName() && deps.Config.DLBAZName() != "" {
-					logger.Debug("create_vm: node selection: DLB sentinel AZ — candidates = all online nodes",
-						log.String("az", az),
-					)
-					// leave candidateSet nil (all nodes); do NOT error
-				} else {
-					// AZ key present in cloud_properties but absent from az_map → misconfiguration.
-					return "", cpierrors.Cloud(
-						"create_vm: availability_zone %q is not defined in placement.az_map; "+
-							"add the AZ to config.placement.az_map or remove availability_zone from cloud_properties",
-						az,
-					)
-				}
-			} else {
-				candidateSet = nodes
-				logger.Debug("create_vm: node selection: AZ candidate set",
-					log.String("az", az),
-					log.String("candidates", strings.Join(candidateSet, ",")),
+		// Pre-validate AZs: any unknown AZ name is a permanent misconfiguration.
+		// This check runs before GatherNodeFacts to preserve the existing behavior
+		// that unknown-AZ errors surface without making any cluster API calls.
+		// DLB sentinel AZs are silently skipped (not an error).
+		for _, az := range azOrder {
+			_, ok := deps.Config.AZCandidates(az)
+			if !ok && (az != deps.Config.DLBAZName() || deps.Config.DLBAZName() == "") {
+				return "", cpierrors.Cloud(
+					"create_vm: availability_zone %q is not defined in placement.az_map; "+
+						"add the AZ to config.placement.az_map or remove availability_zone from cloud_properties",
+					az,
 				)
 			}
 		}
 
-		// Gather live cluster facts. GroupTag (non-empty only when anti-affinity
-		// is enabled) makes GatherNodeFacts tally same-group members per node.
+		// Gather live cluster facts once before the AZ loop.
+		// ExcludeMaintenanceNodes defaults true; MaintenanceNodeTags defaults ["maintenance"].
 		storageName := deps.Config.VMStorage
+		excludeMaintenance := deps.Config.ExcludeMaintenanceNodesEnabled()
 		facts, gatherErr := placement.GatherNodeFacts(ctx,
 			deps.PVE.Cluster(),
 			deps.PVE.Nodes(),
 			logger,
-			placement.GatherOptions{StorageName: storageName, GroupTag: groupTag},
+			placement.GatherOptions{
+				StorageName:             storageName,
+				GroupTag:                groupTag,
+				ExcludeMaintenanceNodes: excludeMaintenance,
+				MaintenanceNodeTags:     deps.Config.MaintenanceNodeTagsValue(),
+			},
 		)
 		if gatherErr != nil {
 			// GatherNodeFacts returns a fatal error only when ListStatus fails.
@@ -599,55 +634,74 @@ func resolveTargetNode(ctx context.Context, deps Deps, cp createVMCloudProps, gr
 				"create_vm: placement: gather node facts")
 		}
 
-		// Filter: online + AZ constraint.
-		req := placement.Request{
-			CandidateNodes: candidateSet, // nil = all nodes
+		w := deps.Config.EffectiveWeights()
+		weights := placement.Weights{
+			Mem:        w.Mem,
+			Storage:    w.Storage,
+			CPU:        w.CPU,
+			GuestCount: w.GuestCount,
 		}
-		pass, rejections := placement.Filter(facts, req)
-		if len(rejections) > 0 {
-			for n, reason := range rejections {
-				logger.Debug("create_vm: placement: node filtered",
-					log.String("node", n),
-					log.String("reason", reason),
-				)
-			}
+		if groupTag != "" {
+			weights.AntiAffinity = placement.DefaultWeights().AntiAffinity
 		}
 
-		if len(pass) > 0 {
-			w := deps.Config.EffectiveWeights()
-			weights := placement.Weights{
-				Mem:        w.Mem,
-				Storage:    w.Storage,
-				CPU:        w.CPU,
-				GuestCount: w.GuestCount,
+		// AZ loop. When azOrder is empty (no AZ set at all), run a single
+		// iteration with no candidate restriction (all nodes).
+		allRejections := make(map[string]string)
+
+		if len(azOrder) == 0 {
+			// No AZ constraint: all nodes are candidates.
+			req := placement.Request{
+				ExcludeMaintenanceNodes: excludeMaintenance,
 			}
-			// Activate the anti-affinity penalty axis only when a group tag is
-			// present (anti-affinity enabled); otherwise leave it zero so the
-			// scorer ignores SameGroupCount and Tier-1 behavior is preserved.
-			if groupTag != "" {
-				weights.AntiAffinity = placement.DefaultWeights().AntiAffinity
-			}
-			scored := placement.Score(pass, weights, nil)
-			chosen := placement.Pick(scored, nil)
-			if chosen != "" {
-				logger.Info("create_vm: node selection: placement scoring chose node",
-					log.String("node", chosen),
-					log.String("az", az),
-				)
+			pass, rejections := placement.Filter(facts, req)
+			mergeRejections(allRejections, rejections)
+			logFilterRejections(logger, rejections, "")
+			if chosen := scoreAndPick(pass, weights, logger, ""); chosen != "" {
 				return chosen, nil
 			}
+		} else {
+			for _, az := range azOrder {
+				candidateSet, skipSilently := resolveAZCandidatesValidated(az, deps.Config, logger)
+				if skipSilently {
+					// DLB sentinel AZ: skip scoring, no error (pre-validation already passed).
+					continue
+				}
+
+				req := placement.Request{
+					CandidateNodes:          candidateSet,
+					ExcludeMaintenanceNodes: excludeMaintenance,
+				}
+				pass, rejections := placement.Filter(facts, req)
+				mergeRejections(allRejections, rejections)
+				logFilterRejections(logger, rejections, az)
+
+				if chosen := scoreAndPick(pass, weights, logger, az); chosen != "" {
+					return chosen, nil
+				}
+				logger.Debug("create_vm: placement: AZ exhausted, trying next",
+					log.String("az", az),
+				)
+			}
 		}
 
-		// Fallback: no candidates passed (all offline, AZ empty, etc.).
+		// All AZs exhausted (or no-AZ single pass had no candidates).
 		fallback := deps.Config.Node
 		logger.Warn("create_vm: placement: no viable candidates; falling back to config.node",
 			log.String("fallback", fallback),
-			log.String("az", az),
 		)
 		if fallback == "" {
+			if classifyFilterResult(allRejections) {
+				return "", cpierrors.Retriable(
+					"create_vm: no viable placement candidates (transient); "+
+						"all nodes rejected: %s",
+					formatRejections(allRejections),
+				)
+			}
 			return "", cpierrors.Cloud(
-				"create_vm: no viable placement candidates and config.node is empty; " +
-					"ensure at least one PVE node is online and reachable",
+				"create_vm: no viable placement candidates; "+
+					"all nodes rejected: %s",
+				formatRejections(allRejections),
 			)
 		}
 		return fallback, nil
@@ -664,6 +718,153 @@ func resolveTargetNode(ctx context.Context, deps Deps, cp createVMCloudProps, gr
 		log.String("node", node),
 	)
 	return node, nil
+}
+
+// buildAZOrder constructs the ordered AZ list for a placement attempt.
+// When singular availability_zone is set it returns a single-element slice
+// (backward compat; no fallback). Otherwise it starts from availability_zones
+// (plural), optionally shuffles a copy, then appends config az_fallback_order
+// entries not already present.
+func buildAZOrder(cp createVMCloudProps, cfg *config.CPIConfig, rng *rand.Rand) []string {
+	// Singular takes precedence — backward compat, no multi-AZ behavior.
+	if cp.AvailabilityZone != "" {
+		return []string{cp.AvailabilityZone}
+	}
+	if len(cp.AvailabilityZones) == 0 && len(cfg.AZFallbackOrderValue()) == 0 {
+		return nil // no AZ constraint
+	}
+
+	// Start from plural list (copy to avoid mutating caller's slice).
+	order := make([]string, len(cp.AvailabilityZones))
+	copy(order, cp.AvailabilityZones)
+
+	if cfg.AZShuffleEnabled() && len(order) > 1 {
+		if rng == nil {
+			rng = rand.New(rand.NewSource(time.Now().UnixNano())) //nolint:gosec // shuffle; non-cryptographic
+		}
+		rng.Shuffle(len(order), func(i, j int) { order[i], order[j] = order[j], order[i] })
+	}
+
+	// Append fallback AZs not already in the list.
+	inOrder := make(map[string]struct{}, len(order))
+	for _, az := range order {
+		inOrder[az] = struct{}{}
+	}
+	for _, az := range cfg.AZFallbackOrderValue() {
+		if _, already := inOrder[az]; !already {
+			order = append(order, az)
+			inOrder[az] = struct{}{}
+		}
+	}
+	return order
+}
+
+// resolveAZCandidatesValidated looks up the node list for az in the AZ map.
+// Called only after pre-validation confirmed all AZ names are known; unknown
+// names are not expected here. Returns (nil, true) for the DLB sentinel AZ.
+// Returns (nodes, false) for a valid AZ.
+func resolveAZCandidatesValidated(az string, cfg *config.CPIConfig, logger *log.Logger) (candidates []string, skipSilently bool) {
+	nodes, ok := cfg.AZCandidates(az)
+	if ok {
+		logger.Debug("create_vm: node selection: AZ candidate set",
+			log.String("az", az),
+			log.String("candidates", strings.Join(nodes, ",")),
+		)
+		return nodes, false
+	}
+	// DLB sentinel: skip scoring for this AZ.
+	if az == cfg.DLBAZName() && cfg.DLBAZName() != "" {
+		logger.Debug("create_vm: node selection: DLB sentinel AZ — candidates = all online nodes",
+			log.String("az", az),
+		)
+		return nil, true
+	}
+	// Should not reach here after pre-validation; treat as skip.
+	return nil, true
+}
+
+// scoreAndPick scores the passed nodes and picks the best. Returns "" when
+// pass is empty.
+func scoreAndPick(pass []placement.NodeFacts, weights placement.Weights, logger *log.Logger, az string) string {
+	if len(pass) == 0 {
+		return ""
+	}
+	scored := placement.Score(pass, weights, nil)
+	chosen := placement.Pick(scored, nil)
+	if chosen != "" {
+		logger.Info("create_vm: node selection: placement scoring chose node",
+			log.String("node", chosen),
+			log.String("az", az),
+		)
+	}
+	return chosen
+}
+
+// logFilterRejections emits a Debug entry for each rejection.
+func logFilterRejections(logger *log.Logger, rejections map[string]string, az string) {
+	for n, reason := range rejections {
+		logger.Debug("create_vm: placement: node filtered",
+			log.String("node", n),
+			log.String("reason", reason),
+			log.String("az", az),
+		)
+	}
+}
+
+// mergeRejections merges src into dst, keeping existing entries (first rejection wins).
+func mergeRejections(dst, src map[string]string) {
+	for k, v := range src {
+		if _, exists := dst[k]; !exists {
+			dst[k] = v
+		}
+	}
+}
+
+// classifyFilterResult returns true when all rejection reasons are transient
+// (node may come back without operator intervention). Returns true on empty
+// rejections (cluster temporarily unreachable → retriable).
+// Returns false when any rejection is a permanent misconfiguration.
+func classifyFilterResult(rejections map[string]string) (retriable bool) {
+	if len(rejections) == 0 {
+		return true // no facts = cluster may be temporarily unreachable
+	}
+	for _, reason := range rejections {
+		if !isTransientRejectionReason(reason) {
+			return false
+		}
+	}
+	return true
+}
+
+// isTransientRejectionReason reports whether a single rejection reason string
+// corresponds to a transient condition that may clear without operator action.
+//
+// "not in candidate node set" is a scope constraint, not a node-health signal.
+// It is neutral — it does not indicate a permanent misconfiguration. Returning
+// true here ensures it never prevents retriability when other nodes are offline
+// (a transient cause). A pure "all nodes outside candidate set" result is still
+// retriable because the cluster topology may change (node added to AZ, config
+// reload).
+func isTransientRejectionReason(reason string) bool {
+	switch reason {
+	case "node offline", "node in maintenance", "insufficient CPU", "insufficient free memory",
+		"not in candidate node set":
+		return true
+	}
+	return false
+}
+
+// formatRejections returns a compact human-readable summary of a rejection map.
+func formatRejections(rejections map[string]string) string {
+	if len(rejections) == 0 {
+		return "(no candidates available)"
+	}
+	parts := make([]string, 0, len(rejections))
+	for node, reason := range rejections {
+		parts = append(parts, node+": "+reason)
+	}
+	sort.Strings(parts)
+	return strings.Join(parts, "; ")
 }
 
 // collectStaticIPsForConflictCheck extracts the bare IP addresses from the
@@ -944,6 +1145,59 @@ func extractSHA8FromFilenameInCID(rawCID string) (sha8 string, ok bool) {
 	return extractSHA8FromFilename(filename)
 }
 
+// needsReplicaCheck reports whether the template-gap guard should run for the
+// given vmStorage. The guard is needed when storage is local (not shared across
+// the cluster): on a multi-node cluster, a local-storage template is only
+// accessible on the node that holds it. When storage information is unavailable
+// (lookup error or nil PVE client), returns false (fail-open: skip guard).
+func needsReplicaCheck(ctx context.Context, deps Deps, vmStorage string) bool {
+	if deps.PVE == nil || deps.PVE.ClusterStorage() == nil || vmStorage == "" {
+		return false
+	}
+	resp, err := deps.PVE.ClusterStorage().ListStorage(ctx, &sdkclusterstorage.ListStorageParams{})
+	if err != nil || resp == nil {
+		return false
+	}
+	for _, raw := range *resp {
+		var entry struct {
+			Storage string `json:"storage"`
+			Type    string `json:"type"`
+			Shared  int    `json:"shared"` // PVE integer bool: 1 = shared
+		}
+		if jerr := json.Unmarshal(raw, &entry); jerr != nil {
+			continue
+		}
+		if entry.Storage != vmStorage {
+			continue
+		}
+		// Shared storage: no guard needed (template accessible from any node).
+		if entry.Shared == 1 {
+			return false
+		}
+		// Local storage: guard needed.
+		return true
+	}
+	// Storage not found in index: fail-open (skip guard).
+	return false
+}
+
+// extractSHA8FromTemplateCIDContext extracts the sha8 digest from the parsed
+// args when the stemcell CID is a template CID. Template CIDs carry no filename
+// (they are "template:<vmid>"), so the sha8 must come from a previous lookup
+// context. For now we use the raw CID filename when present (old-form CIDs
+// carry sha8 in the filename). Returns ("", false) when the sha8 cannot be
+// determined — the caller skips the replica lookup in that case.
+func extractSHA8FromTemplateCIDContext(parsed *createVMParsedArgs) (sha8 string, ok bool) {
+	// Template CIDs (template:<vmid>) do not embed a sha8. The sha8 is available
+	// from the raw CID if the operator is using an old-form CID at the same time
+	// (not the case for pure template CIDs). Return not-found so the guard is
+	// skipped for pure template CIDs without a raw CID fallback.
+	if parsed.rawCID == "" {
+		return "", false
+	}
+	return extractSHA8FromFilenameInCID(parsed.rawCID)
+}
+
 // attemptCreateVM builds the create params for one VMID candidate, then either
 // clones from a template (when stemcellCID is a "template:<vmid>" CID) or calls
 // QEMU.Create with import-from= (old-form CID). On retryable failures it logs
@@ -979,7 +1233,50 @@ func attemptCreateVM(
 			templateNode = deps.Config.Node
 		}
 
-		cloneErr := cloneFromTemplate(ctx, deps, logger, shape, candidate, candidateName, templateNode, templateVMID)
+		// Template-gap guard: when the chosen VM node differs from the template
+		// node and the stemcell storage is local (not shared), the template is
+		// not accessible from shape.node. Check for a per-node replica first;
+		// if none exists, return a clear actionable error instead of letting the
+		// clone task fail with an opaque PVE error.
+		effectiveTemplateVMID := templateVMID
+		effectiveTemplateNode := templateNode
+		if shape.node != "" && shape.node != templateNode {
+			if needsReplicaCheck(ctx, deps, shape.vmStorage) {
+				// Extract sha8 from the stemcell CID to look up a replica.
+				sha8, hasSHA := extractSHA8FromTemplateCIDContext(parsed)
+				if hasSHA && sha8 != "" {
+					replicaVMID, found, lookupErr := pve.ResolveTemplateVMIDForNode(ctx, deps.PVE, shape.node, sha8)
+					switch {
+					case lookupErr != nil:
+						logger.Warn("create_vm: template replica lookup failed (continuing with primary)",
+							log.String("node", shape.node),
+							log.String("sha8", sha8),
+							log.Err(lookupErr),
+						)
+					case found:
+						logger.Info("create_vm: using per-node template replica",
+							log.String("node", shape.node),
+							log.Int("replica_vmid", replicaVMID),
+							log.String("sha8", sha8),
+						)
+						effectiveTemplateVMID = int64(replicaVMID)
+						effectiveTemplateNode = shape.node
+					case !deps.Config.StemcellReplicateLocal:
+						// No replica found and replication is disabled — fail fast with
+						// an actionable message rather than letting the clone fail opaquely.
+						return cpierrors.Cloud(
+							"create_vm: stemcell template (vmid=%d sha8=%s) is not present on node %q "+
+								"and stemcell_replicate_local is disabled; "+
+								"either enable stemcell_replicate_local to allow per-node replication, "+
+								"or use shared storage for the stemcell pool (%s)",
+							templateVMID, sha8, shape.node, shape.vmStorage,
+						)
+					}
+				}
+			}
+		}
+
+		cloneErr := cloneFromTemplate(ctx, deps, logger, shape, candidate, candidateName, effectiveTemplateNode, effectiveTemplateVMID)
 		if cloneErr != nil {
 			// Classify for retry: VMID conflicts and transient transport faults are
 			// retryable — they use the same retry classification as the import path.
@@ -988,15 +1285,15 @@ func attemptCreateVM(
 
 		logger.Info("create_vm: vm cloned from template",
 			log.Int("vmid_attempted", candidate),
-			log.Int64("template_vmid", templateVMID),
-			log.String("template_node", templateNode),
+			log.Int64("template_vmid", effectiveTemplateVMID),
+			log.String("template_node", effectiveTemplateNode),
 		)
 		return nil
 	}
 
 	// --- Old-form CID: opportunistic template lookup before import-from ---
 	//
-	// D-07: if an existing template carries a matching sha tag, clone it
+	// If an existing template carries a matching sha tag, clone it
 	// (fast path). If not found or lookup fails, fall through to import-from
 	// (slow but correct). create_vm NEVER builds a template here — read-only
 	// lookup only.
@@ -1046,7 +1343,7 @@ func attemptCreateVM(
 		shape.vmStorage, parsed.rawCID, shape.vmDiskFormat, shape.rootDiskGiB)
 
 	createParams := map[string]any{
-		"vmid":          candidate,
+		metadataKeyVMID:          candidate,
 		metadataKeyName: candidateName,
 		"memory":        shape.memMiB,
 		"cores":         shape.cores,
@@ -1240,9 +1537,8 @@ func cloneFromTemplate(
 	if templateNode != shape.node {
 		storageInfo, infoErr := policyDeps.StorageInfo(ctx, shape.vmStorage)
 		if infoErr != nil {
-			return cpierrors.Cloud(
-				"create_vm: cross-node clone: cannot look up storage %q to determine if Target is safe: %s",
-				shape.vmStorage, infoErr.Error())
+			return cpierrors.Wrap(infoErr,
+				"create_vm: cross-node clone: cannot look up storage "+shape.vmStorage+" to determine if Target is safe")
 		}
 		if !storageInfo.IsShared() {
 			return cpierrors.Cloud(
@@ -1452,7 +1748,7 @@ func resizeRootDisk(
 			fmt.Sprintf("create_vm: resize virtio0 vmid=%d +%dG", vmid, growGiB))
 	}
 	logger.Info("create_vm: grew virtio0",
-		log.Int("vmid", vmid),
+		log.Int(metadataKeyVMID, vmid),
 		log.Int("delta_gib", growGiB),
 		log.Int("final_gib", shape.rootDiskGiB),
 	)
@@ -1577,20 +1873,22 @@ func attachPersistentDisks(
 			continue
 		}
 		// PVE disk config values are the canonical "<storage>:<volname>"
-		// form (e.g. "data:vm-9003-disk-0"). The disk_cid is already in
-		// that form, so pass it through verbatim. Stripping the storage
-		// prefix produces a bare volname that PVE rejects with
+		// form (e.g. "data:vm-9003-disk-0"). Strip any encoded metadata suffix
+		// before passing to AttachDisk; PVE rejects non-volid suffixes with
 		// "scsi0.file: invalid format - unable to parse volume ID ...".
-		// ParseDiskCID is still used to validate the shape.
-		if _, _, parseErr := pve.ParseDiskCID(diskCID); parseErr != nil {
+		bareDiskCID, _, decErr := pve.ParseEncodedDiskCID(diskCID)
+		if decErr != nil {
+			return cpierrors.Cloud("create_vm: parse disk_cid %q: %s", diskCID, decErr.Error())
+		}
+		if _, _, parseErr := pve.ParseDiskCID(bareDiskCID); parseErr != nil {
 			return cpierrors.Cloud("create_vm: parse disk_cid %q: %s", diskCID, parseErr.Error())
 		}
-		diskID, err := deps.PVE.QEMU().AttachDisk(ctx, shape.node, vmid, diskCID, "scsi", nil)
+		diskID, err := deps.PVE.QEMU().AttachDisk(ctx, shape.node, vmid, bareDiskCID, "scsi", nil)
 		if err != nil {
 			return cpierrors.Wrap(pve.WrapError(err), fmt.Sprintf("create_vm: attach disk %q to vmid=%d: %s", diskCID, vmid, err.Error()))
 		}
 		logger.Info("create_vm: attached persistent disk",
-			log.Int("vmid", vmid),
+			log.Int(metadataKeyVMID, vmid),
 			log.String("disk_cid", diskCID),
 			log.String("disk_id", diskID),
 		)
@@ -1702,7 +2000,7 @@ func startVMAndReadConfig(
 			fmt.Sprintf("create_vm: await start task vmid=%d", vmid))
 	}
 
-	logger.Info("create_vm: VM started", log.Int("vmid", vmid))
+	logger.Info("create_vm: VM started", log.Int(metadataKeyVMID, vmid))
 
 	// -----------------------------------------------------------------------
 	// 9. Read back VM config to extract assigned MAC addresses
@@ -1711,7 +2009,7 @@ func startVMAndReadConfig(
 	if err != nil {
 		// Non-fatal: return networks without MAC rather than rolling back
 		logger.Warn("create_vm: could not read VM config for MAC extraction",
-			log.Int("vmid", vmid),
+			log.Int(metadataKeyVMID, vmid),
 			log.Err(err),
 		)
 		vmCfg = map[string]any{}
@@ -1725,7 +2023,7 @@ func startVMAndReadConfig(
 // logged but suppressed so the original error propagates unmodified.
 // --------------------------------------------------------------------------
 func cleanupVM(ctx context.Context, deps Deps, node string, vmid int, logger *log.Logger) {
-	logger.Warn("create_vm: rolling back, destroying created VM", log.Int("vmid", vmid))
+	logger.Warn("create_vm: rolling back, destroying created VM", log.Int(metadataKeyVMID, vmid))
 
 	// Stop (best-effort; VM may not have started yet). Wrap in RetryOnTransient
 	// so a pvedaemon worker-recycle during rollback doesn't bubble out — this
@@ -1739,7 +2037,7 @@ func cleanupVM(ctx context.Context, deps Deps, node string, vmid int, logger *lo
 	})
 	if stopErr == nil && stopUPID != "" {
 		if awaitErr := pve.AwaitTask(ctx, deps.PVE, node, stopUPID); awaitErr != nil {
-			logger.Warn("create_vm: rollback stop task failed", log.Int("vmid", vmid), log.Err(awaitErr))
+			logger.Warn("create_vm: rollback stop task failed", log.Int(metadataKeyVMID, vmid), log.Err(awaitErr))
 		}
 	}
 
@@ -1752,9 +2050,9 @@ func cleanupVM(ctx context.Context, deps Deps, node string, vmid int, logger *lo
 	})
 	if delErr != nil {
 		if pve.IsNotFound(delErr) || pve.IsPmxcfsConfigMissing(delErr) {
-			logger.Info("create_vm: rollback delete -- VM already gone (idempotent)", log.Int("vmid", vmid))
+			logger.Info("create_vm: rollback delete -- VM already gone (idempotent)", log.Int(metadataKeyVMID, vmid))
 		} else {
-			logger.Error("create_vm: rollback delete failed", log.Int("vmid", vmid), log.Err(delErr))
+			logger.Error("create_vm: rollback delete failed", log.Int(metadataKeyVMID, vmid), log.Err(delErr))
 		}
 	} else {
 		// Await the destroy task so PVE fully releases the VMID before we return.
@@ -1763,20 +2061,20 @@ func cleanupVM(ctx context.Context, deps Deps, node string, vmid int, logger *lo
 			delUPID, upidErr := pve.UPIDFromRaw(*delResp)
 			if upidErr != nil {
 				logger.Warn("create_vm: cannot parse UPID from rollback delete response -- skipping await",
-					log.Int("vmid", vmid), log.Err(upidErr))
+					log.Int(metadataKeyVMID, vmid), log.Err(upidErr))
 			} else if delUPID != "" {
 				if awaitErr := pve.AwaitTaskWithLogger(ctx, deps.PVE, node, delUPID, logger); awaitErr != nil {
 					if pve.IsNotFound(awaitErr) || pve.IsPmxcfsConfigMissing(awaitErr) {
 						logger.Info("create_vm: rollback destroy await -- VM already gone (idempotent)",
-							log.Int("vmid", vmid))
+							log.Int(metadataKeyVMID, vmid))
 					} else {
 						logger.Error("create_vm: rollback destroy await failed",
-							log.Int("vmid", vmid), log.Err(awaitErr))
+							log.Int(metadataKeyVMID, vmid), log.Err(awaitErr))
 					}
 				}
 			}
 		}
-		logger.Info("create_vm: rollback complete", log.Int("vmid", vmid))
+		logger.Info("create_vm: rollback complete", log.Int(metadataKeyVMID, vmid))
 	}
 
 	// Remove any agent-side artifacts (e.g. the ConfigDrive ISO uploaded by
@@ -1787,7 +2085,7 @@ func cleanupVM(ctx context.Context, deps Deps, node string, vmid int, logger *lo
 	if deps.Agent != nil {
 		if remErr := deps.Agent.Remove(ctx, node, vmid); remErr != nil {
 			logger.Warn("create_vm: rollback agent remove failed",
-				log.Int("vmid", vmid), log.Err(remErr))
+				log.Int(metadataKeyVMID, vmid), log.Err(remErr))
 		}
 	}
 }
@@ -2162,4 +2460,167 @@ func parseMACFromNetValue(val string) string {
 		return strings.ToLower(mac)
 	}
 	return ""
+}
+
+// waitUntilAgentReady polls the QEMU guest agent via CreateQemuAgentPing until
+// the agent responds or the deadline derived from health_check.timeout_sec expires.
+//
+// Behavior:
+//   - A successful ping (nil error) returns nil immediately.
+//   - A transient ping error (transport fault, connection refused, 5xx) is
+//     retried after the effective poll interval.
+//   - A permanent ping error (auth failure, 4xx non-transport) fails fast
+//     without waiting for the deadline; diagnostics are still gathered.
+//   - On deadline expiry or parent context cancellation, ListQemuStatusCurrent
+//     is called to gather VM status diagnostics; the diagnostics are folded into
+//     the returned error so the existing rollback defer has context.
+//   - Parent context cancellation is honored: if ctx.Done() fires, the function
+//     returns promptly regardless of the health-check deadline.
+//   - The effective poll interval is max(configured interval, healthPollMinInterval)
+//     so a configured value of 0 never produces a tight busy-loop in production.
+//     The interval sleep is deadline-aware: both hcCtx.Done() and ctx.Done()
+//     wake it early.
+//
+// Diagnostics source: VM status from ListQemuStatusCurrent only. There is no
+// clean REST surface to retrieve arbitrary task-log lines without a UPID, so
+// status-only enrichment is the intended and complete behavior.
+//
+// The returned error is a non-retriable CloudError. The existing create_vm
+// rollback (cleanupVM defer) fires automatically because retErr != nil.
+func waitUntilAgentReady(
+	ctx context.Context,
+	deps Deps,
+	node string,
+	vmid int,
+	logger *log.Logger,
+) error {
+	timeoutSec := deps.Config.HealthCheckTimeoutSec()
+	intervalSec := deps.Config.HealthCheckIntervalSec()
+	vmidStr := strconv.Itoa(vmid)
+
+	// Compute effective poll interval. The configured value of 0 is valid
+	// ("no explicit preference") but must not produce a tight busy-loop in
+	// production. Apply the package-level floor; tests may lower it to zero.
+	effectiveInterval := time.Duration(intervalSec) * time.Second
+	if floor := healthPollMinInterval(); effectiveInterval < floor {
+		effectiveInterval = floor
+	}
+
+	deadline := time.Now().Add(time.Duration(timeoutSec) * time.Second)
+	hcCtx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+
+	logger.Debug("create_vm: health gate: polling guest agent",
+		log.Int(metadataKeyVMID, vmid),
+		log.String("node", node),
+		log.Int("timeout_sec", timeoutSec),
+	)
+
+	for {
+		// Respect parent context cancellation.
+		select {
+		case <-ctx.Done():
+			return gatherHealthDiagnostics(ctx, deps, node, vmid, vmidStr, logger,
+				fmt.Sprintf("create_vm: health gate: context cancelled waiting for agent on vm %d: %v",
+					vmid, ctx.Err()))
+		default:
+		}
+
+		_, pingErr := deps.PVE.Nodes().CreateQemuAgentPing(hcCtx, node, vmidStr)
+		if pingErr == nil {
+			logger.Debug("create_vm: health gate: guest agent ready",
+				log.Int(metadataKeyVMID, vmid))
+			return nil
+		}
+
+		// Check whether the health-check deadline or parent context expired.
+		if hcCtx.Err() != nil {
+			msg := fmt.Sprintf(
+				"create_vm: health gate: timeout waiting for guest agent on vm %d after %ds",
+				vmid, timeoutSec)
+			return gatherHealthDiagnostics(ctx, deps, node, vmid, vmidStr, logger, msg)
+		}
+		if ctx.Err() != nil {
+			return gatherHealthDiagnostics(ctx, deps, node, vmid, vmidStr, logger,
+				fmt.Sprintf("create_vm: health gate: context cancelled waiting for agent on vm %d: %v",
+					vmid, ctx.Err()))
+		}
+
+		// Classify the ping error: transient faults are retried; permanent faults
+		// (auth failures, 4xx non-transport responses) fail fast to avoid spinning
+		// for the full timeout when the outcome is already determined.
+		if !pve.IsTransientTransport(pingErr) {
+			logger.Error("create_vm: health gate: permanent agent ping error, failing fast",
+				log.Int(metadataKeyVMID, vmid),
+				log.String("node", node),
+				log.Err(pingErr),
+			)
+			return gatherHealthDiagnostics(ctx, deps, node, vmid, vmidStr, logger,
+				fmt.Sprintf("create_vm: health gate: permanent error pinging agent on vm %d: %v",
+					vmid, pingErr))
+		}
+
+		logger.Debug("create_vm: health gate: agent ping failed (retrying)",
+			log.Int(metadataKeyVMID, vmid),
+			log.String("node", node),
+			log.Err(pingErr),
+		)
+
+		// Deadline-aware sleep. Both hcCtx.Done() and ctx.Done() wake the select
+		// early so the deadline still bounds total wait time regardless of interval.
+		select {
+		case <-time.After(effectiveInterval):
+		case <-ctx.Done():
+			return gatherHealthDiagnostics(ctx, deps, node, vmid, vmidStr, logger,
+				fmt.Sprintf("create_vm: health gate: context cancelled waiting for agent on vm %d: %v",
+					vmid, ctx.Err()))
+		case <-hcCtx.Done():
+			msg := fmt.Sprintf(
+				"create_vm: health gate: timeout waiting for guest agent on vm %d after %ds",
+				vmid, timeoutSec)
+			return gatherHealthDiagnostics(ctx, deps, node, vmid, vmidStr, logger, msg)
+		}
+	}
+}
+
+// gatherHealthDiagnostics calls ListQemuStatusCurrent to enrich the error with
+// VM state at the time of the health-gate failure. Task-log lines are not
+// included: no clean REST surface exists for retrieving arbitrary log content
+// without a UPID, so status-only enrichment is the complete intended behavior.
+// On ListQemuStatusCurrent error the base message is returned without
+// enrichment (best-effort). Always returns a non-retriable CloudError.
+func gatherHealthDiagnostics(
+	_ context.Context,
+	deps Deps,
+	node string,
+	vmid int,
+	vmidStr string,
+	logger *log.Logger,
+	baseMsg string,
+) error {
+	// Use a fresh context for the diagnostic scrape; the original context may
+	// already be cancelled or at its deadline.
+	diagCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	status, statusErr := deps.PVE.Nodes().ListQemuStatusCurrent(diagCtx, node, vmidStr)
+	if statusErr != nil {
+		logger.Warn("create_vm: health gate: could not gather VM status for diagnostics",
+			log.Int(metadataKeyVMID, vmid), log.Err(statusErr))
+		return cpierrors.Cloud("%s (diagnostics unavailable: %s)", baseMsg, statusErr.Error())
+	}
+
+	qmpStatus := ""
+	if status.Qmpstatus != nil {
+		qmpStatus = *status.Qmpstatus
+	}
+	logger.Error("create_vm: health gate failed",
+		log.Int(metadataKeyVMID, vmid),
+		log.String("node", node),
+		log.String("vm_status", status.Status),
+		log.String("qmp_status", qmpStatus),
+	)
+
+	return cpierrors.Cloud("%s (vm_status=%s qmp_status=%s)",
+		baseMsg, status.Status, qmpStatus)
 }

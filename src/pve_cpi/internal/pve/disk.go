@@ -4,6 +4,7 @@ package pve
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -80,6 +81,95 @@ func ParseDiskCID(cid string) (storage, volume string, err error) {
 // FormatDiskCID joins storage and volume into the canonical disk CID string.
 func FormatDiskCID(storage, volume string) string {
 	return storage + ":" + volume
+}
+
+// DiskCIDMeta carries optional placement metadata encoded into a disk CID
+// suffix. Fields use omitempty so a partially-populated struct produces a
+// compact JSON payload. All fields are informational: consumers that do not
+// need them can safely discard the meta return value of ParseEncodedDiskCID.
+type DiskCIDMeta struct {
+	// Pool is the PVE storage pool name ("local-lvm", "data", …). Populated
+	// from the resolved storage at create_disk time.
+	Pool string `json:"pool,omitempty"`
+	// Node is the PVE node that owns the disk. Populated for node-local
+	// backends; empty for shared storage where the volume is reachable from
+	// any node.
+	Node string `json:"node,omitempty"`
+	// AZ is the availability-zone label at create_disk time. Populated when
+	// the placement layer resolves an AZ; empty otherwise.
+	AZ string `json:"az,omitempty"`
+}
+
+// diskCIDSep is the delimiter between the bare PVE volid and the optional
+// base64url-encoded metadata suffix. PVE volids are always "<storage>:<name>"
+// where name is "vm-<int>-disk-<int>" or a path — neither form ever contains
+// a pipe character, so "|" is safe as an unambiguous separator.
+const diskCIDSep = "|"
+
+// EncodeDiskCID appends a base64url-JSON metadata suffix to a bare disk CID.
+//
+// If meta is nil or all fields are zero-valued the bare CID is returned
+// unchanged, preserving backward compatibility with consumers that store the
+// string directly.
+//
+// The encoded form is:
+//
+//	<bare-cid>|<base64url(json(meta))>
+//
+// where base64url uses standard RFC 4648 §5 encoding with no padding (URL-safe
+// alphabet, no '=' padding characters).
+func EncodeDiskCID(bareCID string, meta *DiskCIDMeta) string {
+	if meta == nil || (meta.Pool == "" && meta.Node == "" && meta.AZ == "") {
+		return bareCID
+	}
+	b, err := json.Marshal(meta)
+	if err != nil {
+		// json.Marshal on a plain struct never returns an error; guard anyway
+		// to satisfy the contract that EncodeDiskCID never panics.
+		return bareCID
+	}
+	return bareCID + diskCIDSep + base64.RawURLEncoding.EncodeToString(b)
+}
+
+// ParseEncodedDiskCID splits an optionally-annotated disk CID into its bare
+// volid component and the optional DiskCIDMeta.
+//
+// Accepted forms:
+//   - "<storage>:<volid>"          — bare legacy CID; returns meta=nil, err=nil
+//   - "<storage>:<volid>|<base64>" — annotated CID; decodes suffix into meta
+//
+// Returns an error when:
+//   - cid is empty
+//   - the "|" separator is present but the suffix is empty, not valid base64url,
+//     or not valid JSON for DiskCIDMeta
+//
+// ParseDiskCID may be called on the returned bareCID without modification; it
+// is guaranteed to be a valid "storage:volume" string when the original CID was
+// well-formed (validation of the bare portion is left to ParseDiskCID itself so
+// error messages are consistent).
+func ParseEncodedDiskCID(cid string) (bareCID string, meta *DiskCIDMeta, err error) {
+	if cid == "" {
+		return "", nil, cpierrors.Cloud("disk CID must not be empty")
+	}
+	idx := strings.Index(cid, diskCIDSep)
+	if idx < 0 {
+		// No separator — bare legacy CID; meta is absent.
+		return cid, nil, nil
+	}
+	bareCID = cid[:idx]
+	suffix := cid[idx+len(diskCIDSep):]
+	if suffix == "" {
+		return "", nil, cpierrors.Cloud("invalid disk CID %q: pipe separator present but suffix is empty", cid)
+	}
+	raw, decErr := base64.RawURLEncoding.DecodeString(suffix)
+	if decErr != nil {
+		return "", nil, cpierrors.Cloud("invalid disk CID %q: suffix is not valid base64url: %v", cid, decErr)
+	}
+	var m DiskCIDMeta
+	if jsonErr := json.Unmarshal(raw, &m); jsonErr != nil {
+		return "", nil, cpierrors.Cloud("invalid disk CID %q: suffix JSON decode failed: %v", cid, jsonErr)
+	}
+	return bareCID, &m, nil
 }
 
 // ParseSnapshotCID splits a snapshot CID of the form "<vm_cid>:<snap_name>" on the

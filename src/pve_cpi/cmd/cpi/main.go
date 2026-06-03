@@ -21,6 +21,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"syscall"
 	"time"
 
@@ -277,10 +278,16 @@ func runCPI(
 		reqLogger := logger.WithContext(reqCtx)
 		reqCtx = log.IntoContext(reqCtx, reqLogger)
 
-		resp := d.Handle(reqCtx, req)
-
-		if writeErr := writeResponse(bw, resp); writeErr != nil {
-			return fmt.Errorf("cpi: write response: %w", writeErr)
+		// dispatchOne handles the request and writes the response to bw.
+		// A deferred recover here is a backstop for panics that occur outside the
+		// dispatcher's own recover (e.g., in writeResponse or helper code called
+		// before d.Handle). The dispatcher already recovers handler panics; this
+		// catches anything else in the per-request path.
+		// w is passed alongside bw so the backstop can write a clean CloudError
+		// to a fresh bufio.Writer if bw's internal state was corrupted by a panic
+		// mid-flush.
+		if loopErr := dispatchOne(reqCtx, bw, w, d, req, logger); loopErr != nil {
+			return loopErr
 		}
 
 		// Check for signal after completing the request. This ensures the current
@@ -328,4 +335,50 @@ func writeErrorResponse(bw *bufio.Writer, e *cpierrors.Error) error {
 		return err
 	}
 	return bw.Flush()
+}
+
+// dispatchOne dispatches req through d, writes the response to bw, and returns
+// any write error. It also catches panics that occur outside the dispatcher's
+// own recover (e.g., in writeResponse) and converts them to a non-retriable
+// CloudError. When a panic occurs mid-write, bw may have partial buffered bytes
+// in an indeterminate state; the backstop discards those bytes by resetting bw
+// against w (the underlying writer) before writing the CloudError, ensuring a
+// clean JSON-RPC response reaches the Director rather than a partial + error
+// concatenation.
+func dispatchOne(
+	ctx context.Context,
+	bw *bufio.Writer,
+	w io.Writer,
+	d *cpi.Dispatcher,
+	req *jsonrpc.Request,
+	logger *log.Logger,
+) (retErr error) {
+	defer func() {
+		if r := recover(); r != nil {
+			stack := debug.Stack()
+			logger.Error("cpi loop panic recovered",
+				log.String("method", req.Method),
+				log.String("request_id", req.Context.RequestID),
+				log.Any("panic", r),
+				log.String("stack", string(stack)),
+			)
+			cpiErr := cpierrors.Cloud(
+				"panic in %s [request_id=%s]: %v",
+				req.Method, req.Context.RequestID, r,
+			)
+			// Reset bw against the underlying writer to discard any bytes that were
+			// buffered before the panic. Without this, a partial response followed by
+			// the CloudError would produce a malformed concatenated output.
+			bw.Reset(w)
+			if writeErr := writeErrorResponse(bw, cpiErr); writeErr != nil {
+				retErr = fmt.Errorf("cpi: write panic error response: %w", writeErr)
+			}
+		}
+	}()
+
+	resp := d.Handle(ctx, req)
+	if writeErr := writeResponse(bw, resp); writeErr != nil {
+		return fmt.Errorf("cpi: write response: %w", writeErr)
+	}
+	return nil
 }

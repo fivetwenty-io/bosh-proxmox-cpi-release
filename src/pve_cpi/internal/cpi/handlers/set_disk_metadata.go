@@ -76,6 +76,11 @@ func HandleSetDiskMetadata(deps Deps) cpi.Handler {
 		if err := json.Unmarshal(args[0], &diskCID); err != nil || diskCID == "" {
 			return nil, cpierrors.Cloud("set_disk_metadata: disk_cid must be a non-empty string")
 		}
+		// Strip optional metadata suffix before any PVE API or storage lookup.
+		bareDiskCID, _, decErr := pve.ParseEncodedDiskCID(diskCID)
+		if decErr != nil {
+			return nil, cpierrors.DiskNotFound(diskCID)
+		}
 
 		var metadata map[string]any
 		if err := json.Unmarshal(args[1], &metadata); err != nil {
@@ -83,7 +88,7 @@ func HandleSetDiskMetadata(deps Deps) cpi.Handler {
 		}
 
 		// Validate disk_cid structure (storage:volume).
-		if _, _, err := pve.ParseDiskCID(diskCID); err != nil {
+		if _, _, err := pve.ParseDiskCID(bareDiskCID); err != nil {
 			return nil, err
 		}
 
@@ -98,7 +103,7 @@ func HandleSetDiskMetadata(deps Deps) cpi.Handler {
 		}
 
 		// --- scan VMs for disk ---
-		matches, err := findVMsHostingDisk(ctx, deps, diskCID)
+		matches, err := findVMsHostingDisk(ctx, deps, bareDiskCID)
 		if err != nil {
 			return nil, err
 		}
@@ -110,7 +115,7 @@ func HandleSetDiskMetadata(deps Deps) cpi.Handler {
 			return nil, nil
 
 		case 1:
-			if err := persistMetadata(ctx, deps, matches[0], diskCID, metadata); err != nil {
+			if err := persistMetadata(ctx, deps, matches[0], bareDiskCID, metadata); err != nil {
 				return nil, err
 			}
 			if len(diskTags) > 0 {

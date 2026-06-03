@@ -17,10 +17,12 @@ import (
 // ---------------------------------------------------------------------------
 
 type stubCluster struct {
-	statusResp *cluster.ListStatusResponse
-	statusErr  error
-	resResp    *cluster.ListResourcesResponse
-	resErr     error
+	statusResp    *cluster.ListStatusResponse
+	statusErr     error
+	resResp       *cluster.ListResourcesResponse
+	resErr        error
+	haStatusFn    func() (*cluster.ListHaStatusCurrentResponse, error)
+	haStatusCalled bool
 }
 
 func (s *stubCluster) ListStatus(_ context.Context) (*cluster.ListStatusResponse, error) {
@@ -29,6 +31,16 @@ func (s *stubCluster) ListStatus(_ context.Context) (*cluster.ListStatusResponse
 
 func (s *stubCluster) ListResources(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
 	return s.resResp, s.resErr
+}
+
+func (s *stubCluster) ListHaStatusCurrent(_ context.Context) (*cluster.ListHaStatusCurrentResponse, error) {
+	s.haStatusCalled = true
+	if s.haStatusFn != nil {
+		return s.haStatusFn()
+	}
+	// Default: empty response (no nodes in maintenance).
+	empty := cluster.ListHaStatusCurrentResponse{}
+	return &empty, nil
 }
 
 type stubNodes struct {
@@ -392,6 +404,203 @@ func TestGatherNodeFacts_MultipleNodes(t *testing.T) {
 		if f.Node == "pve3" && f.Online {
 			t.Error("pve3 should be offline")
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ParseNodeResources tests
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Maintenance node exclusion tests
+// ---------------------------------------------------------------------------
+
+func TestGatherNodeFacts_HAMaintenanceNode(t *testing.T) {
+	t.Parallel()
+	resp := cluster.ListStatusResponse{
+		statusNode("pve1", 8, 8*gib, 4*gib, 1, 0),
+		statusNode("pve2", 8, 8*gib, 4*gib, 1, 0),
+	}
+	// pve1 is in HA maintenance state.
+	haResp := make(cluster.ListHaStatusCurrentResponse, 0, 1)
+	raw, _ := json.Marshal(map[string]any{"type": "manager_status", "node": "pve1", "state": "maintenance"})
+	haResp = append(haResp, json.RawMessage(raw))
+
+	cl := &stubCluster{
+		statusResp: &resp,
+		resResp:    &cluster.ListResourcesResponse{},
+		haStatusFn: func() (*cluster.ListHaStatusCurrentResponse, error) {
+			return &haResp, nil
+		},
+	}
+	ns := &stubNodes{}
+
+	facts, err := placement.GatherNodeFacts(context.Background(), cl, ns, nopLogger(), placement.GatherOptions{
+		ExcludeMaintenanceNodes: true,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(facts) != 2 {
+		t.Fatalf("expected 2 facts; got %d", len(facts))
+	}
+	for _, f := range facts {
+		switch f.Node {
+		case "pve1":
+			if !f.InMaintenance {
+				t.Error("pve1 should be InMaintenance=true (HA state)")
+			}
+		case "pve2":
+			if f.InMaintenance {
+				t.Error("pve2 should be InMaintenance=false")
+			}
+		}
+	}
+}
+
+func TestGatherNodeFacts_MaintenanceViaOperatorTag(t *testing.T) {
+	t.Parallel()
+	// pve1 carries a "maintenance" operator tag in cluster status.
+	statusRaw, _ := json.Marshal(map[string]any{
+		"type":   "node",
+		"name":   "pve1",
+		"maxcpu": 8,
+		"maxmem": 8 * gib,
+		"mem":    4 * gib,
+		"online": 1,
+		"cpu":    0.0,
+		"tags":   "maintenance",
+	})
+	resp := cluster.ListStatusResponse{json.RawMessage(statusRaw)}
+
+	cl := &stubCluster{
+		statusResp: &resp,
+		resResp:    &cluster.ListResourcesResponse{},
+	}
+	ns := &stubNodes{}
+
+	facts, err := placement.GatherNodeFacts(context.Background(), cl, ns, nopLogger(), placement.GatherOptions{
+		ExcludeMaintenanceNodes: true,
+		MaintenanceNodeTags:     []string{"maintenance"},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(facts) != 1 {
+		t.Fatalf("expected 1 fact; got %d", len(facts))
+	}
+	if !facts[0].InMaintenance {
+		t.Error("pve1 should be InMaintenance=true (operator tag)")
+	}
+}
+
+func TestGatherNodeFacts_HAStatusError_FailOpen(t *testing.T) {
+	t.Parallel()
+	resp := cluster.ListStatusResponse{
+		statusNode("pve1", 8, 8*gib, 4*gib, 1, 0),
+	}
+	cl := &stubCluster{
+		statusResp: &resp,
+		resResp:    &cluster.ListResourcesResponse{},
+		haStatusFn: func() (*cluster.ListHaStatusCurrentResponse, error) {
+			return nil, errors.New("HA API unavailable")
+		},
+	}
+	ns := &stubNodes{}
+
+	// Must NOT return error; node must NOT be marked in maintenance (fail-open).
+	facts, err := placement.GatherNodeFacts(context.Background(), cl, ns, nopLogger(), placement.GatherOptions{
+		ExcludeMaintenanceNodes: true,
+	})
+	if err != nil {
+		t.Fatalf("expected no error on HA fetch failure; got: %v", err)
+	}
+	if len(facts) != 1 {
+		t.Fatalf("expected 1 fact; got %d", len(facts))
+	}
+	if facts[0].InMaintenance {
+		t.Error("InMaintenance should be false when HA API errors (fail-open)")
+	}
+}
+
+func TestGatherNodeFacts_ExcludeDisabled_HANotCalled(t *testing.T) {
+	t.Parallel()
+	resp := cluster.ListStatusResponse{
+		statusNode("pve1", 8, 8*gib, 4*gib, 1, 0),
+	}
+	cl := &stubCluster{
+		statusResp: &resp,
+		resResp:    &cluster.ListResourcesResponse{},
+		haStatusFn: func() (*cluster.ListHaStatusCurrentResponse, error) {
+			// Should not be called when ExcludeMaintenanceNodes is false.
+			return nil, errors.New("should not be called")
+		},
+	}
+	ns := &stubNodes{}
+
+	facts, err := placement.GatherNodeFacts(context.Background(), cl, ns, nopLogger(), placement.GatherOptions{
+		ExcludeMaintenanceNodes: false,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(facts) != 1 {
+		t.Fatalf("expected 1 fact; got %d", len(facts))
+	}
+	if cl.haStatusCalled {
+		t.Error("ListHaStatusCurrent should NOT be called when ExcludeMaintenanceNodes=false")
+	}
+	if facts[0].InMaintenance {
+		t.Error("InMaintenance should be false when exclusion is disabled")
+	}
+}
+
+func TestGatherNodeFacts_MaintenanceUnionHAAndTag(t *testing.T) {
+	t.Parallel()
+	// pve1 has HA maintenance; pve2 has operator tag; pve3 is clean.
+	statusRaw1 := statusNode("pve1", 8, 8*gib, 4*gib, 1, 0)
+	taggedRaw, _ := json.Marshal(map[string]any{
+		"type": "node", "name": "pve2", "maxcpu": 8, "maxmem": 8 * gib,
+		"mem": 4 * gib, "online": 1, "cpu": 0.0, "tags": "maintenance;other",
+	})
+	statusRaw3 := statusNode("pve3", 8, 8*gib, 4*gib, 1, 0)
+	resp := cluster.ListStatusResponse{
+		statusRaw1, json.RawMessage(taggedRaw), statusRaw3,
+	}
+
+	haResp := make(cluster.ListHaStatusCurrentResponse, 0, 1)
+	raw, _ := json.Marshal(map[string]any{"type": "manager_status", "node": "pve1", "state": "maintenance"})
+	haResp = append(haResp, json.RawMessage(raw))
+
+	cl := &stubCluster{
+		statusResp: &resp,
+		resResp:    &cluster.ListResourcesResponse{},
+		haStatusFn: func() (*cluster.ListHaStatusCurrentResponse, error) { return &haResp, nil },
+	}
+	ns := &stubNodes{}
+
+	facts, err := placement.GatherNodeFacts(context.Background(), cl, ns, nopLogger(), placement.GatherOptions{
+		ExcludeMaintenanceNodes: true,
+		MaintenanceNodeTags:     []string{"maintenance"},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(facts) != 3 {
+		t.Fatalf("expected 3 facts; got %d", len(facts))
+	}
+	maintenance := map[string]bool{}
+	for _, f := range facts {
+		maintenance[f.Node] = f.InMaintenance
+	}
+	if !maintenance["pve1"] {
+		t.Error("pve1: expected InMaintenance=true (HA state)")
+	}
+	if !maintenance["pve2"] {
+		t.Error("pve2: expected InMaintenance=true (operator tag)")
+	}
+	if maintenance["pve3"] {
+		t.Error("pve3: expected InMaintenance=false")
 	}
 }
 

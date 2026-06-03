@@ -55,6 +55,11 @@ func HandleResizeDisk(deps Deps) Handler {
 		if diskCID == "" {
 			return nil, cpierrors.Cloud("resize_disk: args[0] disk_cid must not be empty")
 		}
+		// Strip optional metadata suffix before any PVE API or storage lookup.
+		bareDiskCID, _, decErr := pve.ParseEncodedDiskCID(diskCID)
+		if decErr != nil {
+			return nil, cpierrors.DiskNotFound(diskCID)
+		}
 
 		var newSizeMB int
 		if err := json.Unmarshal(args[1], &newSizeMB); err != nil {
@@ -67,7 +72,7 @@ func HandleResizeDisk(deps Deps) Handler {
 		// ----------------------------------------------------------------
 		// 2. Parse disk_cid → volid.
 		// ----------------------------------------------------------------
-		if _, _, err := pve.ParseDiskCID(diskCID); err != nil {
+		if _, _, err := pve.ParseDiskCID(bareDiskCID); err != nil {
 			return nil, cpierrors.DiskNotFound(diskCID)
 		}
 
@@ -78,12 +83,12 @@ func HandleResizeDisk(deps Deps) Handler {
 		//    the VM's node. PVE VM config stores disk values in canonical
 		//    "<storage>:<volname>" form — the disk_cid is that form.
 		// ----------------------------------------------------------------
-		vmid, node, err := pve.FindVMByDiskVolid(ctx, deps.PVE, deps.Config.Node, diskCID)
+		vmid, node, err := pve.FindVMByDiskVolid(ctx, deps.PVE, deps.Config.Node, bareDiskCID)
 		if err != nil {
 			return nil, err
 		}
 
-		diskID, err := pve.ResolveDiskID(ctx, deps.PVE, node, vmid, diskCID)
+		diskID, err := pve.ResolveDiskID(ctx, deps.PVE, node, vmid, bareDiskCID)
 		if err != nil {
 			// ResolveDiskID returns CloudError when disk not attached.
 			return nil, cpierrors.Wrap(err, fmt.Sprintf("resize_disk: cannot resolve diskID for %s on VM %d", diskCID, vmid))

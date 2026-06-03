@@ -466,6 +466,68 @@ properties:
       the storage type cannot be determined at create time, the CPI fails open
       (proceeds with registration) and logs a debug entry.
     default: true
+  pve.placement.exclude_maintenance_nodes:
+    description: |
+      When true (default), nodes in a PVE HA maintenance or error state, or carrying
+      any tag listed in placement.maintenance_node_tags, are excluded from placement
+      candidates at create_vm time. Set to false only when HA status is unavailable
+      or placing on maintenance nodes is intentional. The Go accessor defaults nil to
+      true — leave this property unset to accept the default.
+    default: true
+  pve.placement.maintenance_node_tags:
+    description: |
+      List of PVE node tags that mark a node as in maintenance. A node carrying any
+      tag in this list is excluded from placement when placement.exclude_maintenance_nodes
+      is true (or defaults true). Default ["maintenance"]. Set to [] to disable tag-based
+      detection while still honoring HA-status-based detection. Leave unset to accept
+      the default.
+    default: []
+  pve.placement.az_fallback_order:
+    description: |
+      Ordered list of AZ names appended as fallback candidates after
+      cloud_properties.availability_zones are exhausted. Use to express a cluster-wide
+      "prefer AZ-a then AZ-b" policy without per-VM cloud_properties. Empty (default)
+      means no config-level fallback chain; placement considers only AZs from
+      cloud_properties.
+    default: []
+  pve.placement.az_shuffle:
+    description: |
+      When true, randomizes the AZ order within availability_zones before scoring,
+      breaking ordering ties with a random draw. Default false: preference order is
+      preserved (deterministic). Set to true to distribute VMs across AZs
+      non-deterministically.
+    default: false
+  pve.stemcell_replicate_local:
+    description: |
+      When true, create_stemcell uploads the stemcell qcow2 independently to every
+      candidate cluster node's local storage and creates a template VM per node (tagged
+      "bosh-stemcell-node-<node>"). Enables create_vm on local-storage nodes in
+      multi-node clusters. delete_stemcell removes all replicas (best-effort; a
+      single-node failure is logged and skipped rather than aborting). Default false:
+      local stemcell storage on a multi-node cluster is rejected at create_stemcell
+      time with a clear error directing the operator to use shared storage.
+    default: false
+  pve.health_check.enabled:
+    description: |
+      When true, create_vm polls the guest QEMU agent via ping after the start task
+      completes, waiting until the agent responds or the deadline (health_check.timeout_sec)
+      expires. On timeout, VM status diagnostics are folded into the error before the
+      standard rollback runs. Default false (opt-in): no polling occurs and create_vm
+      returns as soon as PVE reports the start task complete.
+    default: false
+  pve.health_check.timeout_sec:
+    description: |
+      Maximum seconds to wait for the QEMU guest agent to respond after VM start.
+      Valid range 1-3600 when health_check.enabled is true. Zero (default) applies the
+      built-in 300 s default. Ignored when health_check.enabled is false.
+    default: 0
+  pve.health_check.interval_sec:
+    description: |
+      Seconds between successive agent ping attempts. Valid range 0-3600 when
+      health_check.enabled is true. Zero (default) applies the built-in 5 s default.
+      Set to 0 for back-to-back pings (fast test mode). Ignored when
+      health_check.enabled is false.
+    default: 0
   pve.fetch_credential_defaults:
     description: |
       Ordered list of URL-prefix to auth-payload mappings used by the CPI when

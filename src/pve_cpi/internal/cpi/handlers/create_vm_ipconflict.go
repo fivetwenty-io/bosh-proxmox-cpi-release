@@ -76,6 +76,7 @@ func IPConflictCloudError(conflict *IPConflict, bridge string) *cpierrors.Error 
 //   - Per-VM Config fetch errors → logged at debug, VM skipped (same policy as
 //     findVMsHostingDisk; templates and ephemeral VMs often return errors here).
 //   - First non-skip error from a worker goroutine propagates to the caller.
+//
 //nolint:gocognit // Structured scan: list → parallel per-VM Config fetch → IP parse. Cognitive load is inherent to the three-phase algorithm, not to local complexity.
 func detectIPConflict(
 	ctx context.Context,
@@ -357,4 +358,3 @@ func extractStaticIP(ipconfig string) string {
 	}
 	return ""
 }
-

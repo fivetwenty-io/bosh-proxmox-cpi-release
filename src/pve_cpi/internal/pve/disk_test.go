@@ -466,6 +466,225 @@ func TestFindVMByDiskVolid_TransientThenSuccess(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// EncodeDiskCID / ParseEncodedDiskCID
+// ---------------------------------------------------------------------------
+
+func TestEncodeDiskCID_NilMeta(t *testing.T) {
+	t.Parallel()
+	bare := "local-lvm:vm-100-disk-0"
+	if got := pve.EncodeDiskCID(bare, nil); got != bare {
+		t.Errorf("nil meta: want %q unchanged, got %q", bare, got)
+	}
+}
+
+func TestEncodeDiskCID_ZeroMeta(t *testing.T) {
+	t.Parallel()
+	bare := "local-lvm:vm-100-disk-0"
+	meta := &pve.DiskCIDMeta{}
+	if got := pve.EncodeDiskCID(bare, meta); got != bare {
+		t.Errorf("zero meta: want %q unchanged, got %q", bare, got)
+	}
+}
+
+func TestParseEncodedDiskCID_Bare(t *testing.T) {
+	t.Parallel()
+	bare := "local-lvm:vm-100-disk-0"
+	gotBase, gotMeta, err := pve.ParseEncodedDiskCID(bare)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if gotBase != bare {
+		t.Errorf("base: want %q, got %q", bare, gotBase)
+	}
+	if gotMeta != nil {
+		t.Errorf("meta: want nil, got %+v", gotMeta)
+	}
+}
+
+func TestParseEncodedDiskCID_Empty(t *testing.T) {
+	t.Parallel()
+	_, _, err := pve.ParseEncodedDiskCID("")
+	if err == nil {
+		t.Fatal("expected error for empty CID")
+	}
+}
+
+func TestEncodeParseDiskCID_RoundTripFullMeta(t *testing.T) {
+	t.Parallel()
+	bare := "local-lvm:vm-9003-disk-0"
+	meta := &pve.DiskCIDMeta{Pool: "local-lvm", Node: "pve1", AZ: "z1"}
+	encoded := pve.EncodeDiskCID(bare, meta)
+
+	if encoded == bare {
+		t.Fatal("encoded CID should differ from bare when meta is non-empty")
+	}
+
+	gotBase, gotMeta, err := pve.ParseEncodedDiskCID(encoded)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	if gotBase != bare {
+		t.Errorf("base: want %q, got %q", bare, gotBase)
+	}
+	if gotMeta == nil {
+		t.Fatal("meta: want non-nil")
+	}
+	if gotMeta.Pool != "local-lvm" {
+		t.Errorf("Pool: want %q, got %q", "local-lvm", gotMeta.Pool)
+	}
+	if gotMeta.Node != "pve1" {
+		t.Errorf("Node: want %q, got %q", "pve1", gotMeta.Node)
+	}
+	if gotMeta.AZ != "z1" {
+		t.Errorf("AZ: want %q, got %q", "z1", gotMeta.AZ)
+	}
+}
+
+func TestEncodeParseDiskCID_RoundTripPoolOnly(t *testing.T) {
+	t.Parallel()
+	bare := "data:vm-9003-disk-0"
+	meta := &pve.DiskCIDMeta{Pool: "data"}
+	encoded := pve.EncodeDiskCID(bare, meta)
+
+	gotBase, gotMeta, err := pve.ParseEncodedDiskCID(encoded)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	if gotBase != bare {
+		t.Errorf("base: want %q, got %q", bare, gotBase)
+	}
+	if gotMeta == nil {
+		t.Fatal("meta: want non-nil")
+	}
+	if gotMeta.Pool != "data" {
+		t.Errorf("Pool: want %q, got %q", "data", gotMeta.Pool)
+	}
+	if gotMeta.Node != "" {
+		t.Errorf("Node: want empty, got %q", gotMeta.Node)
+	}
+	if gotMeta.AZ != "" {
+		t.Errorf("AZ: want empty, got %q", gotMeta.AZ)
+	}
+}
+
+func TestParseEncodedDiskCID_MalformedBase64(t *testing.T) {
+	t.Parallel()
+	cid := "local-lvm:vm-100-disk-0|!!!notbase64!!!"
+	_, _, err := pve.ParseEncodedDiskCID(cid)
+	if err == nil {
+		t.Fatal("expected error for malformed base64 suffix")
+	}
+}
+
+func TestParseEncodedDiskCID_MalformedJSON(t *testing.T) {
+	t.Parallel()
+	import64 := "bm90anNvbg==" // base64url of "notjson"
+	cid := "local-lvm:vm-100-disk-0|" + import64
+	_, _, err := pve.ParseEncodedDiskCID(cid)
+	if err == nil {
+		t.Fatal("expected error for base64-encoded non-JSON suffix")
+	}
+}
+
+func TestParseEncodedDiskCID_EmptySuffix(t *testing.T) {
+	t.Parallel()
+	// Pipe present but no suffix is malformed.
+	cid := "local-lvm:vm-100-disk-0|"
+	_, _, err := pve.ParseEncodedDiskCID(cid)
+	if err == nil {
+		t.Fatal("expected error for empty suffix after pipe")
+	}
+}
+
+func TestParseEncodedDiskCID_BaseStillParseable(t *testing.T) {
+	t.Parallel()
+	// Round-trip: encoded CID base must still pass ParseDiskCID.
+	bare := "local-lvm:vm-9003-disk-0"
+	meta := &pve.DiskCIDMeta{Pool: "local-lvm", Node: "pve2", AZ: "az-a"}
+	encoded := pve.EncodeDiskCID(bare, meta)
+
+	gotBase, _, err := pve.ParseEncodedDiskCID(encoded)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	storage, volume, err2 := pve.ParseDiskCID(gotBase)
+	if err2 != nil {
+		t.Fatalf("ParseDiskCID on base: %v", err2)
+	}
+	if storage != "local-lvm" {
+		t.Errorf("storage: want %q, got %q", "local-lvm", storage)
+	}
+	if volume != "vm-9003-disk-0" {
+		t.Errorf("volume: want %q, got %q", "vm-9003-disk-0", volume)
+	}
+}
+
+// Table-driven tests cover all call-site wrapping patterns: ParseEncodedDiskCID
+// strips the suffix, then ParseDiskCID on the base yields the same storage/volume
+// as parsing the bare CID directly. This verifies that the 10 call site wrappers
+// produce identical results to legacy bare CID behaviour.
+func TestCallSiteWrapperBehaviour(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name        string
+		cid         string // may be bare or encoded
+		wantStorage string
+		wantVolume  string
+	}{
+		{
+			name:        "bare lvm volid",
+			cid:         "local-lvm:vm-100-disk-0",
+			wantStorage: "local-lvm",
+			wantVolume:  "vm-100-disk-0",
+		},
+		{
+			name:        "bare dir volid with subpath",
+			cid:         "local:9001/vm-9001-disk-0.raw",
+			wantStorage: "local",
+			wantVolume:  "9001/vm-9001-disk-0.raw",
+		},
+		{
+			name: "encoded full meta wraps to same base",
+			cid: pve.EncodeDiskCID(
+				"local-lvm:vm-9003-disk-0",
+				&pve.DiskCIDMeta{Pool: "local-lvm", Node: "pve1", AZ: "z1"},
+			),
+			wantStorage: "local-lvm",
+			wantVolume:  "vm-9003-disk-0",
+		},
+		{
+			name: "encoded pool-only meta wraps to same base",
+			cid: pve.EncodeDiskCID(
+				"data:vm-200-disk-0",
+				&pve.DiskCIDMeta{Pool: "data"},
+			),
+			wantStorage: "data",
+			wantVolume:  "vm-200-disk-0",
+		},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			base, _, err := pve.ParseEncodedDiskCID(tc.cid)
+			if err != nil {
+				t.Fatalf("ParseEncodedDiskCID: %v", err)
+			}
+			storage, volume, err2 := pve.ParseDiskCID(base)
+			if err2 != nil {
+				t.Fatalf("ParseDiskCID: %v", err2)
+			}
+			if storage != tc.wantStorage {
+				t.Errorf("storage: want %q, got %q", tc.wantStorage, storage)
+			}
+			if volume != tc.wantVolume {
+				t.Errorf("volume: want %q, got %q", tc.wantVolume, volume)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
 // FindUnusedDiskEntries
 // ---------------------------------------------------------------------------
 

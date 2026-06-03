@@ -63,7 +63,7 @@ func IsLinkedCloneSupported(storageType string) bool {
 	return !strings.EqualFold(storageType, StorageTypeLVM)
 }
 
-// ValidateTemplateCloneStorage enforces the clone placement policy (D-06):
+// ValidateTemplateCloneStorage enforces the clone placement policy:
 // in a multi-node cluster, a template on LOCAL (non-shared) storage can only
 // be cloned on the same node, so the operator must pin the node via
 // cloud_properties.node or use shared storage. Returns the node the clone
@@ -114,14 +114,13 @@ func ValidateTemplateCloneStorage(
 
 	info, err := deps.StorageInfo(ctx, storage)
 	if err != nil {
-		return "", cpierrors.Cloud(
-			"validate_template_clone_storage: lookup storage %q: %s", storage, err.Error())
+		return "", cpierrors.Wrap(err,
+			"validate_template_clone_storage: lookup storage "+storage)
 	}
 
 	clusterSize, err := deps.ClusterNodeCount(ctx)
 	if err != nil {
-		return "", cpierrors.Cloud(
-			"validate_template_clone_storage: lookup cluster node count: %s", err.Error())
+		return "", cpierrors.Wrap(err, "validate_template_clone_storage: lookup cluster node count")
 	}
 
 	// Rule 1: single-node cluster accepts any backend.
@@ -197,8 +196,8 @@ func ValidateLightStemcellStorage(
 
 	info, err := deps.StorageInfo(ctx, storage)
 	if err != nil {
-		return "", cpierrors.Cloud(
-			"validate_light_stemcell_storage: lookup storage %q: %s", storage, err.Error())
+		return "", cpierrors.Wrap(err,
+			"validate_light_stemcell_storage: lookup storage "+storage)
 	}
 
 	// Rule 1: block storage rejected regardless of cluster topology.
@@ -211,8 +210,7 @@ func ValidateLightStemcellStorage(
 
 	clusterSize, err := deps.ClusterNodeCount(ctx)
 	if err != nil {
-		return "", cpierrors.Cloud(
-			"validate_light_stemcell_storage: lookup cluster node count: %s", err.Error())
+		return "", cpierrors.Wrap(err, "validate_light_stemcell_storage: lookup cluster node count")
 	}
 
 	// Rule 2: single-node cluster accepts any file-capable backend.
