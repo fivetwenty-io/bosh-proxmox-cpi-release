@@ -3347,3 +3347,280 @@ func TestCreateVM_UnknownVMTypeInCloudProps_ReturnsCloudError(t *testing.T) {
 		t.Errorf("expected CloudError, got %T: %v", err, err)
 	}
 }
+
+// --------------------------------------------------------------------------
+// Root-disk performance options: import path
+// --------------------------------------------------------------------------
+
+// TestCreateVM_ImportPath_NoPerfOpts_ByteIdentical verifies that when no perf
+// opts and no virtio_scsi_single are set, createParams virtio0 and scsihw are
+// byte-identical to the pre-feature values.
+func TestCreateVM_ImportPath_NoPerfOpts_ByteIdentical(t *testing.T) {
+	t.Parallel()
+	q := &vmMockQEMU{}
+	n := &vmMockNodes{}
+	c := &vmMockCluster{}
+	a := &vmMockAgent{}
+	h := handlers.HandleCreateVM(buildVMDeps(q, n, c, a))
+
+	args := mkArgs("agent-noperf", testStemcellCID,
+		map[string]any{"cores": 1, "memory": 512},
+		defaultNetMap(), []string{}, map[string]any{})
+
+	if _, err := h.Handle(context.Background(), args, mkCtx("noperf")); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(q.createCalls) != 1 {
+		t.Fatalf("expected 1 Create call, got %d", len(q.createCalls))
+	}
+	p := q.createCalls[0].params
+
+	// scsihw must be exactly "virtio-scsi-pci" — the historic default.
+	if scsihw, _ := p["scsihw"].(string); scsihw != "virtio-scsi-pci" {
+		t.Errorf("scsihw = %q; want virtio-scsi-pci (byte-identical default)", scsihw)
+	}
+
+	// virtio0 must contain format= and import-from= but no extra comma-separated
+	// perf options (no cache=, iothread=, ssd=, etc).
+	virtio0, _ := p["virtio0"].(string)
+	for _, forbidden := range []string{"cache=", "iothread=", "ssd=", "discard="} {
+		if strings.Contains(virtio0, forbidden) {
+			t.Errorf("virtio0 %q must not contain %q when no perf opts set", virtio0, forbidden)
+		}
+	}
+	if !strings.Contains(virtio0, "import-from=") {
+		t.Errorf("virtio0 %q must contain import-from=", virtio0)
+	}
+}
+
+// TestCreateVM_ImportPath_PerfOpts_AppliedToVirtio0 verifies that
+// iothread:true + cache:"writeback" are appended to virtio0 in createParams,
+// and ssd is NOT present (virtio bus drops it).
+func TestCreateVM_ImportPath_PerfOpts_AppliedToVirtio0(t *testing.T) {
+	t.Parallel()
+	q := &vmMockQEMU{}
+	n := &vmMockNodes{}
+	c := &vmMockCluster{}
+	a := &vmMockAgent{}
+	h := handlers.HandleCreateVM(buildVMDeps(q, n, c, a))
+
+	args := mkArgs("agent-perfimport", testStemcellCID,
+		map[string]any{
+			"cores":    1,
+			"memory":   512,
+			"iothread": true,
+			"cache":    "writeback",
+			"ssd":      true, // virtio bus must drop this
+		},
+		defaultNetMap(), []string{}, map[string]any{})
+
+	if _, err := h.Handle(context.Background(), args, mkCtx("perfimport")); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(q.createCalls) != 1 {
+		t.Fatalf("expected 1 Create call, got %d", len(q.createCalls))
+	}
+	p := q.createCalls[0].params
+	virtio0, _ := p["virtio0"].(string)
+
+	if !strings.Contains(virtio0, "cache=writeback") {
+		t.Errorf("virtio0 %q must contain cache=writeback", virtio0)
+	}
+	if !strings.Contains(virtio0, "iothread=1") {
+		t.Errorf("virtio0 %q must contain iothread=1", virtio0)
+	}
+	if strings.Contains(virtio0, "ssd=") {
+		t.Errorf("virtio0 %q must NOT contain ssd= (virtio bus drops it)", virtio0)
+	}
+	// scsihw: no virtio_scsi_single opt-in → stays "virtio-scsi-pci".
+	if scsihw, _ := p["scsihw"].(string); scsihw != "virtio-scsi-pci" {
+		t.Errorf("scsihw = %q; want virtio-scsi-pci", scsihw)
+	}
+}
+
+// TestCreateVM_ImportPath_VirtioSCSISingle_SetsCorrectScsihw verifies that
+// virtio_scsi_single:true switches createParams["scsihw"] to "virtio-scsi-single".
+func TestCreateVM_ImportPath_VirtioSCSISingle_SetsCorrectScsihw(t *testing.T) {
+	t.Parallel()
+	q := &vmMockQEMU{}
+	n := &vmMockNodes{}
+	c := &vmMockCluster{}
+	a := &vmMockAgent{}
+	h := handlers.HandleCreateVM(buildVMDeps(q, n, c, a))
+
+	args := mkArgs("agent-vscsisingle", testStemcellCID,
+		map[string]any{
+			"cores":              1,
+			"memory":             512,
+			"virtio_scsi_single": true,
+		},
+		defaultNetMap(), []string{}, map[string]any{})
+
+	if _, err := h.Handle(context.Background(), args, mkCtx("vscsisingle")); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(q.createCalls) != 1 {
+		t.Fatalf("expected 1 Create call, got %d", len(q.createCalls))
+	}
+	p := q.createCalls[0].params
+	if scsihw, _ := p["scsihw"].(string); scsihw != "virtio-scsi-single" {
+		t.Errorf("scsihw = %q; want virtio-scsi-single", scsihw)
+	}
+}
+
+// --------------------------------------------------------------------------
+// Root-disk performance options: clone path
+// --------------------------------------------------------------------------
+
+// TestCreateVM_ClonePath_NoPerfOpts_NoExtraKeys verifies that the post-clone
+// UpdateQemuConfig params do NOT carry scsihw or virtio keys when no perf opts
+// and no virtio_scsi_single are set (byte-identical to pre-feature behaviour).
+func TestCreateVM_ClonePath_NoPerfOpts_NoExtraKeys(t *testing.T) {
+	t.Parallel()
+
+	n := &vmMockNodes{
+		createQemuCloneFn: func(_ context.Context, _, _ string, _ *sdknodes.CreateQemuCloneParams) (*sdknodes.CreateQemuCloneResponse, error) {
+			raw := sdknodes.CreateQemuCloneResponse{}
+			_ = json.Unmarshal([]byte(`"UPID:pve:00009001:00000001:clone:ok"`), &raw)
+			return &raw, nil
+		},
+	}
+	q := &vmMockQEMU{}
+	a := &vmMockAgent{}
+
+	deps := buildVMDepsForTemplate(q, n, &vmMockCluster{}, a)
+	h := handlers.HandleCreateVM(deps)
+
+	args := mkArgs("agent-clone-noperf", testTemplateCID,
+		map[string]any{"cores": 1, "memory": 512},
+		map[string]any{"default": map[string]any{"type": "dynamic", "cloud_properties": map[string]any{}}},
+		[]string{}, map[string]any{})
+
+	if _, err := h.Handle(context.Background(), args, mkCtx("clone-noperf")); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// The first UpdateQemuConfig call is the resource (cpu/memory/agent) apply.
+	if len(n.updateConfigCalls) < 1 {
+		t.Fatalf("expected >=1 UpdateQemuConfig calls, got %d", len(n.updateConfigCalls))
+	}
+	resourceCall := n.updateConfigCalls[0]
+	if resourceCall.params.Scsihw != nil {
+		t.Errorf("Scsihw must be nil in UpdateQemuConfig params when not switching (byte-identical)")
+	}
+	if len(resourceCall.params.Virtio) != 0 {
+		t.Errorf("Virtio map must be empty when no perf opts set, got %v", resourceCall.params.Virtio)
+	}
+}
+
+// TestCreateVM_ClonePath_PerfOpts_AppliedViaUpdateConfig verifies that perf
+// opts (iothread+cache) and scsihw switch appear in the post-clone
+// UpdateQemuConfig call when opted in.
+func TestCreateVM_ClonePath_PerfOpts_AppliedViaUpdateConfig(t *testing.T) {
+	t.Parallel()
+
+	n := &vmMockNodes{
+		createQemuCloneFn: func(_ context.Context, _, _ string, _ *sdknodes.CreateQemuCloneParams) (*sdknodes.CreateQemuCloneResponse, error) {
+			raw := sdknodes.CreateQemuCloneResponse{}
+			_ = json.Unmarshal([]byte(`"UPID:pve:00009002:00000001:clone:ok"`), &raw)
+			return &raw, nil
+		},
+	}
+	q := &vmMockQEMU{}
+	a := &vmMockAgent{}
+
+	deps := buildVMDepsForTemplate(q, n, &vmMockCluster{}, a)
+	h := handlers.HandleCreateVM(deps)
+
+	args := mkArgs("agent-clone-perf", testTemplateCID,
+		map[string]any{
+			"cores":              1,
+			"memory":             512,
+			"iothread":           true,
+			"cache":              "writeback",
+			"virtio_scsi_single": true,
+		},
+		map[string]any{"default": map[string]any{"type": "dynamic", "cloud_properties": map[string]any{}}},
+		[]string{}, map[string]any{})
+
+	if _, err := h.Handle(context.Background(), args, mkCtx("clone-perf")); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(n.updateConfigCalls) < 1 {
+		t.Fatalf("expected >=1 UpdateQemuConfig calls, got %d", len(n.updateConfigCalls))
+	}
+	resourceCall := n.updateConfigCalls[0]
+
+	// scsihw must be set to "virtio-scsi-single".
+	if resourceCall.params.Scsihw == nil {
+		t.Fatal("Scsihw must not be nil when virtio_scsi_single:true")
+	}
+	if *resourceCall.params.Scsihw != "virtio-scsi-single" {
+		t.Errorf("Scsihw = %q; want virtio-scsi-single", *resourceCall.params.Scsihw)
+	}
+
+	// Virtio[0] must include iothread=1 and cache=writeback.
+	virtio0, ok := resourceCall.params.Virtio[0]
+	if !ok {
+		t.Fatal("Virtio[0] must be present when perf opts set")
+	}
+	if !strings.Contains(virtio0, "iothread=1") {
+		t.Errorf("Virtio[0] %q must contain iothread=1", virtio0)
+	}
+	if !strings.Contains(virtio0, "cache=writeback") {
+		t.Errorf("Virtio[0] %q must contain cache=writeback", virtio0)
+	}
+}
+
+// TestCreateVM_ClonePath_OnlyScsihwSwitch_NoVirtio0Key verifies that when
+// virtio_scsi_single is set but no perf opts, Scsihw is set but Virtio map
+// is empty (don't emit a virtio0 key with no opts appended).
+func TestCreateVM_ClonePath_OnlyScsihwSwitch_NoVirtio0Key(t *testing.T) {
+	t.Parallel()
+
+	n := &vmMockNodes{
+		createQemuCloneFn: func(_ context.Context, _, _ string, _ *sdknodes.CreateQemuCloneParams) (*sdknodes.CreateQemuCloneResponse, error) {
+			raw := sdknodes.CreateQemuCloneResponse{}
+			_ = json.Unmarshal([]byte(`"UPID:pve:00009003:00000001:clone:ok"`), &raw)
+			return &raw, nil
+		},
+	}
+	q := &vmMockQEMU{}
+	a := &vmMockAgent{}
+
+	deps := buildVMDepsForTemplate(q, n, &vmMockCluster{}, a)
+	h := handlers.HandleCreateVM(deps)
+
+	args := mkArgs("agent-clone-scsionly", testTemplateCID,
+		map[string]any{
+			"cores":              1,
+			"memory":             512,
+			"virtio_scsi_single": true,
+		},
+		map[string]any{"default": map[string]any{"type": "dynamic", "cloud_properties": map[string]any{}}},
+		[]string{}, map[string]any{})
+
+	if _, err := h.Handle(context.Background(), args, mkCtx("clone-scsionly")); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(n.updateConfigCalls) < 1 {
+		t.Fatalf("expected >=1 UpdateQemuConfig calls, got %d", len(n.updateConfigCalls))
+	}
+	resourceCall := n.updateConfigCalls[0]
+
+	if resourceCall.params.Scsihw == nil || *resourceCall.params.Scsihw != "virtio-scsi-single" {
+		scsihwVal := "<nil>"
+		if resourceCall.params.Scsihw != nil {
+			scsihwVal = *resourceCall.params.Scsihw
+		}
+		t.Errorf("Scsihw = %q; want virtio-scsi-single", scsihwVal)
+	}
+	if len(resourceCall.params.Virtio) != 0 {
+		t.Errorf("Virtio map must be empty when only scsihw switch (no perf opts), got %v", resourceCall.params.Virtio)
+	}
+}

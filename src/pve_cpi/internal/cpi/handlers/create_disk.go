@@ -176,6 +176,11 @@ func HandleCreateDisk(deps Deps) Handler {
 			return nil, err
 		}
 
+		diskPerfOpts, err := resolveDiskPerfOptions(r, deps.Config)
+		if err != nil {
+			return nil, err // non-retriable CloudError: bad cache mode / negative throttle
+		}
+
 		storage, err := resolveStorageForDisk(ctx, r, deps)
 		if err != nil {
 			return nil, err
@@ -253,7 +258,7 @@ func HandleCreateDisk(deps Deps) Handler {
 		// ----------------------------------------------------------------
 		namingVMID, diskCID, canonicalVolID, err := attemptCreateVolume(
 			ctx, deps, node, storage, sizeGiB, formatArg, lockAttempts, maxAttempts,
-			cloudProps.AvailabilityZone,
+			cloudProps.AvailabilityZone, diskPerfOpts,
 		)
 		if err != nil {
 			return nil, cpierrors.Wrap(err, "create_disk: CreateVolume failed on node "+node+" storage "+storage)
@@ -323,6 +328,11 @@ func HandleCreateDisk(deps Deps) Handler {
 // create_vm can enforce fault-domain co-location for shared-storage disks.
 // An empty az produces a CID identical to pre-AZ releases (backward-compatible).
 //
+// diskPerfOpts holds per-disk PVE performance options (iothread, cache, etc.)
+// resolved by resolveDiskPerfOptions from the §7.8 layered resolver. A nil or
+// empty map is encoded as-is; omitempty on DiskCIDMeta.Opts keeps the CID
+// byte-identical to pre-performance-options releases when no options are set.
+//
 // Returns:
 //   - namingVMID: the VMID allocated by AllocateDiskWithRetry (for logging)
 //   - diskCID: the volid to use as the BOSH disk CID; equals the PVE-returned
@@ -337,6 +347,7 @@ func attemptCreateVolume(
 	formatArg string,
 	lockAttempts, maxAttempts int,
 	az string,
+	diskPerfOpts map[string]string,
 ) (namingVMID int, diskCID, canonicalVolID string, err error) {
 	var volid string
 
@@ -430,6 +441,7 @@ func attemptCreateVolume(
 		Pool: storage,
 		Node: node,
 		AZ:   az,
+		Opts: diskPerfOpts,
 	})
 	return namingVMID, diskCID, canonicalVolID, nil
 }

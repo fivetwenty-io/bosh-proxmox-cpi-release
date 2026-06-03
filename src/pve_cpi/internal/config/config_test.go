@@ -3890,3 +3890,260 @@ func TestLoad_SecurityGroups_RoundTrip(t *testing.T) {
 		}
 	})
 }
+
+// --------------------------------------------------------------------------
+// TestValidate_DiskPerformance
+// --------------------------------------------------------------------------
+
+// floatPtr returns a pointer to f for constructing *float64 fields in literals.
+func floatPtr(f float64) *float64 { return &f }
+
+// intPtr returns a pointer to i for constructing *int fields in literals.
+func intPtr(i int) *int { return &i }
+
+// TestValidate_DiskPerformance_NilBlock confirms that a nil DiskPerformance block
+// passes validation without error (only-when-set contract).
+func TestValidate_DiskPerformance_NilBlock(t *testing.T) {
+	t.Parallel()
+	_, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br"
+	}`)
+	if err != nil {
+		t.Fatalf("nil disk_performance block: unexpected error: %v", err)
+	}
+}
+
+// TestValidate_DiskPerformance_ValidCache confirms accepted cache mode values.
+func TestValidate_DiskPerformance_ValidCache(t *testing.T) {
+	t.Parallel()
+	for _, mode := range []string{"none", "writethrough", "writeback", "unsafe", "directsync"} {
+		t.Run(mode, func(t *testing.T) {
+			_, err := mustLoad(t, `{
+				"host":"h","user":"u","password":"p",
+				"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+				"disk_performance":{"cache":"`+mode+`"}
+			}`)
+			if err != nil {
+				t.Errorf("cache=%q: unexpected error: %v", mode, err)
+			}
+		})
+	}
+}
+
+// TestValidate_DiskPerformance_InvalidCache confirms an unknown cache string is rejected.
+func TestValidate_DiskPerformance_InvalidCache(t *testing.T) {
+	t.Parallel()
+	_, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+		"disk_performance":{"cache":"bogus"}
+	}`)
+	assertCloudError(t, err, "disk_performance.cache")
+}
+
+// TestValidate_DiskPerformance_NegativeMBpsRd confirms mbps_rd < 0 is rejected.
+func TestValidate_DiskPerformance_NegativeMBpsRd(t *testing.T) {
+	t.Parallel()
+	cfg := &config.CPIConfig{
+		Host:           "h",
+		User:           "u",
+		Password:       "p",
+		VMStorage:      "s",
+		DiskStorage:    "s",
+		NetworkBridge:  "br",
+		Port:           8006,
+		VerifySSL:      boolPtr(true),
+		AgentMode:      "cloudinit",
+		VMDiskFormat:   "qcow2",
+		LogLevel:       "info",
+		VMIDRangeStart: 100,
+		VMIDRangeEnd:   5999,
+		RebootMode:     "soft",
+		RebootTimeout:  60,
+		NetworkMode:    "auto",
+		SDNZoneType:    "simple",
+		DiskPerformance: &config.DiskPerformanceDefaults{
+			MBpsRd: floatPtr(-1),
+		},
+	}
+	assertCloudError(t, cfg.Validate(), "disk_performance.mbps_rd")
+}
+
+// TestValidate_DiskPerformance_NegativeIOPSWr confirms iops_wr < 0 is rejected.
+func TestValidate_DiskPerformance_NegativeIOPSWr(t *testing.T) {
+	t.Parallel()
+	cfg := &config.CPIConfig{
+		Host:           "h",
+		User:           "u",
+		Password:       "p",
+		VMStorage:      "s",
+		DiskStorage:    "s",
+		NetworkBridge:  "br",
+		Port:           8006,
+		VerifySSL:      boolPtr(true),
+		AgentMode:      "cloudinit",
+		VMDiskFormat:   "qcow2",
+		LogLevel:       "info",
+		VMIDRangeStart: 100,
+		VMIDRangeEnd:   5999,
+		RebootMode:     "soft",
+		RebootTimeout:  60,
+		NetworkMode:    "auto",
+		SDNZoneType:    "simple",
+		DiskPerformance: &config.DiskPerformanceDefaults{
+			IOPSWr: intPtr(-5),
+		},
+	}
+	assertCloudError(t, cfg.Validate(), "disk_performance.iops_wr")
+}
+
+// TestValidate_DiskPerformance_FullValidBlock confirms a fully-populated valid
+// block passes validation without error.
+func TestValidate_DiskPerformance_FullValidBlock(t *testing.T) {
+	t.Parallel()
+	cfg := &config.CPIConfig{
+		Host:           "h",
+		User:           "u",
+		Password:       "p",
+		VMStorage:      "s",
+		DiskStorage:    "s",
+		NetworkBridge:  "br",
+		Port:           8006,
+		VerifySSL:      boolPtr(true),
+		AgentMode:      "cloudinit",
+		VMDiskFormat:   "qcow2",
+		LogLevel:       "info",
+		VMIDRangeStart: 100,
+		VMIDRangeEnd:   5999,
+		RebootMode:     "soft",
+		RebootTimeout:  60,
+		NetworkMode:    "auto",
+		SDNZoneType:    "simple",
+		DiskPerformance: &config.DiskPerformanceDefaults{
+			Iothread:         boolPtr(true),
+			Cache:            "writeback",
+			Discard:          boolPtr(true),
+			SSD:              boolPtr(false),
+			MBpsRd:           floatPtr(500),
+			MBpsWr:           floatPtr(250),
+			IOPSRd:           intPtr(1000),
+			IOPSWr:           intPtr(500),
+			VirtioSCSISingle: boolPtr(true),
+		},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("full valid disk_performance block: unexpected error: %v", err)
+	}
+}
+
+// TestValidate_DiskPerformance_NegativeMBpsWr confirms mbps_wr < 0 is rejected.
+func TestValidate_DiskPerformance_NegativeMBpsWr(t *testing.T) {
+	t.Parallel()
+	cfg := &config.CPIConfig{
+		Host:           "h",
+		User:           "u",
+		Password:       "p",
+		VMStorage:      "s",
+		DiskStorage:    "s",
+		NetworkBridge:  "br",
+		Port:           8006,
+		VerifySSL:      boolPtr(true),
+		AgentMode:      "cloudinit",
+		VMDiskFormat:   "qcow2",
+		LogLevel:       "info",
+		VMIDRangeStart: 100,
+		VMIDRangeEnd:   5999,
+		RebootMode:     "soft",
+		RebootTimeout:  60,
+		NetworkMode:    "auto",
+		SDNZoneType:    "simple",
+		DiskPerformance: &config.DiskPerformanceDefaults{
+			MBpsWr: floatPtr(-0.5),
+		},
+	}
+	assertCloudError(t, cfg.Validate(), "disk_performance.mbps_wr")
+}
+
+// TestValidate_DiskPerformance_NegativeIOPSRd confirms iops_rd < 0 is rejected.
+func TestValidate_DiskPerformance_NegativeIOPSRd(t *testing.T) {
+	t.Parallel()
+	cfg := &config.CPIConfig{
+		Host:           "h",
+		User:           "u",
+		Password:       "p",
+		VMStorage:      "s",
+		DiskStorage:    "s",
+		NetworkBridge:  "br",
+		Port:           8006,
+		VerifySSL:      boolPtr(true),
+		AgentMode:      "cloudinit",
+		VMDiskFormat:   "qcow2",
+		LogLevel:       "info",
+		VMIDRangeStart: 100,
+		VMIDRangeEnd:   5999,
+		RebootMode:     "soft",
+		RebootTimeout:  60,
+		NetworkMode:    "auto",
+		SDNZoneType:    "simple",
+		DiskPerformance: &config.DiskPerformanceDefaults{
+			IOPSRd: intPtr(-1),
+		},
+	}
+	assertCloudError(t, cfg.Validate(), "disk_performance.iops_rd")
+}
+
+// TestLoad_DiskPerformance_RoundTrip confirms all DiskPerformance fields parse
+// and survive the Load → JSON round-trip.
+func TestLoad_DiskPerformance_RoundTrip(t *testing.T) {
+	t.Parallel()
+	cfg, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+		"disk_performance":{
+			"iothread":true,
+			"cache":"writeback",
+			"discard":true,
+			"ssd":false,
+			"mbps_rd":500.0,
+			"mbps_wr":250.0,
+			"iops_rd":1000,
+			"iops_wr":500,
+			"virtio_scsi_single":true
+		}
+	}`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	dp := cfg.DiskPerformance
+	if dp == nil {
+		t.Fatal("DiskPerformance is nil, want non-nil")
+	}
+	if dp.Iothread == nil || !*dp.Iothread {
+		t.Errorf("Iothread = %v, want *true", dp.Iothread)
+	}
+	if dp.Cache != "writeback" {
+		t.Errorf("Cache = %q, want %q", dp.Cache, "writeback")
+	}
+	if dp.Discard == nil || !*dp.Discard {
+		t.Errorf("Discard = %v, want *true", dp.Discard)
+	}
+	if dp.SSD == nil || *dp.SSD {
+		t.Errorf("SSD = %v, want *false", dp.SSD)
+	}
+	if dp.MBpsRd == nil || *dp.MBpsRd != 500.0 {
+		t.Errorf("MBpsRd = %v, want 500.0", dp.MBpsRd)
+	}
+	if dp.MBpsWr == nil || *dp.MBpsWr != 250.0 {
+		t.Errorf("MBpsWr = %v, want 250.0", dp.MBpsWr)
+	}
+	if dp.IOPSRd == nil || *dp.IOPSRd != 1000 {
+		t.Errorf("IOPSRd = %v, want 1000", dp.IOPSRd)
+	}
+	if dp.IOPSWr == nil || *dp.IOPSWr != 500 {
+		t.Errorf("IOPSWr = %v, want 500", dp.IOPSWr)
+	}
+	if dp.VirtioSCSISingle == nil || !*dp.VirtioSCSISingle {
+		t.Errorf("VirtioSCSISingle = %v, want *true", dp.VirtioSCSISingle)
+	}
+}

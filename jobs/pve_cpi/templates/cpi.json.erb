@@ -344,5 +344,43 @@
   security_groups = p("pve.security_groups", [])
   config["security_groups"] = security_groups unless security_groups.nil? || security_groups.empty?
 
+  # Emit disk_performance only when the operator sets at least one sub-field.
+  # When all sub-fields are unset the block is omitted entirely so the Go config
+  # zero-value (nil *DiskPerformanceDefaults) is preserved — byte-identical to
+  # prior releases. Each key follows its own omit-when-default contract:
+  #   iothread/discard/ssd/virtio_scsi_single  bool  — omit when nil/unset
+  #   cache                                    string — omit when empty
+  #   mbps_rd/mbps_wr                          float  — omit when 0 or unset
+  #   iops_rd/iops_wr                          int    — omit when 0 or unset
+  disk_performance = {}
+
+  # Boolean flags: emit only when the operator explicitly sets a value. The Go
+  # struct uses *bool so nil (field absent from JSON) means "use Go zero" — here
+  # we mirror by omitting when the property is unset in BOSH manifest. No default
+  # in spec means p(..., nil) returns nil; if_p fires only when the operator set
+  # the property.
+  if_p("pve.disk_performance.iothread")           { |v| disk_performance["iothread"]           = v }
+  if_p("pve.disk_performance.discard")            { |v| disk_performance["discard"]            = v }
+  if_p("pve.disk_performance.ssd")                { |v| disk_performance["ssd"]                = v }
+  if_p("pve.disk_performance.virtio_scsi_single") { |v| disk_performance["virtio_scsi_single"] = v }
+
+  # String: emit only when non-empty.
+  dp_cache = p("pve.disk_performance.cache", "")
+  disk_performance["cache"] = dp_cache unless dp_cache.to_s.empty?
+
+  # Floats: emit only when non-zero (zero means "no cap", same as omitted).
+  dp_mbps_rd = p("pve.disk_performance.mbps_rd", 0.0).to_f
+  disk_performance["mbps_rd"] = dp_mbps_rd unless dp_mbps_rd == 0.0
+  dp_mbps_wr = p("pve.disk_performance.mbps_wr", 0.0).to_f
+  disk_performance["mbps_wr"] = dp_mbps_wr unless dp_mbps_wr == 0.0
+
+  # Integers: emit only when non-zero (zero means "no cap", same as omitted).
+  dp_iops_rd = p("pve.disk_performance.iops_rd", 0).to_i
+  disk_performance["iops_rd"] = dp_iops_rd unless dp_iops_rd == 0
+  dp_iops_wr = p("pve.disk_performance.iops_wr", 0).to_i
+  disk_performance["iops_wr"] = dp_iops_wr unless dp_iops_wr == 0
+
+  config["disk_performance"] = disk_performance unless disk_performance.empty?
+
   JSON.dump(config)
 %>

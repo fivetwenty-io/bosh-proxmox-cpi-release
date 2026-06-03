@@ -685,6 +685,94 @@ func TestCallSiteWrapperBehaviour(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// DiskCIDMeta.Opts — per-disk performance options round-trip
+// ---------------------------------------------------------------------------
+
+// TestEncodeParseDiskCID_OptsRoundTrip encodes a meta with Opts set and verifies
+// ParseEncodedDiskCID returns a deep-equal Opts map.
+func TestEncodeParseDiskCID_OptsRoundTrip(t *testing.T) {
+	t.Parallel()
+	bare := "local-lvm:vm-9003-disk-0"
+	meta := &pve.DiskCIDMeta{
+		Pool: "local-lvm",
+		Node: "pve1",
+		AZ:   "z1",
+		Opts: map[string]string{
+			"iothread": "1",
+			"cache":    "writeback",
+		},
+	}
+	encoded := pve.EncodeDiskCID(bare, meta)
+
+	if encoded == bare {
+		t.Fatal("encoded CID should differ from bare when meta is non-empty")
+	}
+
+	gotBase, gotMeta, err := pve.ParseEncodedDiskCID(encoded)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	if gotBase != bare {
+		t.Errorf("base: want %q, got %q", bare, gotBase)
+	}
+	if gotMeta == nil {
+		t.Fatal("meta: want non-nil")
+	}
+	if len(gotMeta.Opts) != 2 {
+		t.Fatalf("Opts len: want 2, got %d (%v)", len(gotMeta.Opts), gotMeta.Opts)
+	}
+	if gotMeta.Opts["iothread"] != "1" {
+		t.Errorf("Opts[iothread]: want %q, got %q", "1", gotMeta.Opts["iothread"])
+	}
+	if gotMeta.Opts["cache"] != "writeback" {
+		t.Errorf("Opts[cache]: want %q, got %q", "writeback", gotMeta.Opts["cache"])
+	}
+}
+
+// TestEncodeDiskCID_NilOptsIdentical proves that nil Opts produces a CID
+// byte-identical to encoding the same meta without Opts (omitempty guarantee).
+// Also verifies the zero-meta short-circuit still applies when all fields are
+// zero-valued including Opts.
+func TestEncodeDiskCID_NilOptsIdentical(t *testing.T) {
+	t.Parallel()
+	bare := "local-lvm:vm-100-disk-0"
+
+	// Zero meta with nil Opts — must return bare unchanged.
+	metaNilOpts := &pve.DiskCIDMeta{}
+	if got := pve.EncodeDiskCID(bare, metaNilOpts); got != bare {
+		t.Errorf("zero meta + nil Opts: want bare %q, got %q", bare, got)
+	}
+
+	// Non-zero meta: encoding with explicit nil Opts must equal encoding
+	// without the Opts field (omitempty drops it from JSON).
+	metaWith := &pve.DiskCIDMeta{Pool: "local-lvm", Node: "pve1", AZ: "z1", Opts: nil}
+	metaWithout := &pve.DiskCIDMeta{Pool: "local-lvm", Node: "pve1", AZ: "z1"}
+	if pve.EncodeDiskCID(bare, metaWith) != pve.EncodeDiskCID(bare, metaWithout) {
+		t.Errorf("nil Opts must produce identical CID to omitted Opts field")
+	}
+}
+
+// TestEncodeDiskCID_EmptyOptsIdentical proves an empty (non-nil) Opts map is
+// treated as omitted by JSON omitempty, producing a CID identical to nil Opts.
+func TestEncodeDiskCID_EmptyOptsIdentical(t *testing.T) {
+	t.Parallel()
+	bare := "local-lvm:vm-100-disk-0"
+
+	// Zero meta + empty map must return bare unchanged (zero-meta guard).
+	metaEmptyOpts := &pve.DiskCIDMeta{Opts: map[string]string{}}
+	if got := pve.EncodeDiskCID(bare, metaEmptyOpts); got != bare {
+		t.Errorf("zero meta + empty Opts: want bare %q, got %q", bare, got)
+	}
+
+	// Non-zero meta + empty map must equal non-zero meta + nil Opts.
+	metaEmpty := &pve.DiskCIDMeta{Pool: "local-lvm", Opts: map[string]string{}}
+	metaNil := &pve.DiskCIDMeta{Pool: "local-lvm"}
+	if pve.EncodeDiskCID(bare, metaEmpty) != pve.EncodeDiskCID(bare, metaNil) {
+		t.Errorf("empty Opts map must produce identical CID to nil Opts")
+	}
+}
+
+// ---------------------------------------------------------------------------
 // FindUnusedDiskEntries
 // ---------------------------------------------------------------------------
 

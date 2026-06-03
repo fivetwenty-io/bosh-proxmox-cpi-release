@@ -1054,3 +1054,144 @@ func TestHandleCreateDisk_AuthFailure(t *testing.T) {
 		t.Errorf("auth failure classified as RetriableCloud; want non-retriable TypeCloud; type=%s", cpiErr.Type())
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Per-disk performance options → disk CID metadata (§7.8 layered resolver)
+// ---------------------------------------------------------------------------
+
+// TestHandleCreateDisk_PerfOpts_InCIDMeta verifies that cloud_properties perf
+// options are resolved and encoded into the returned disk CID metadata. The
+// test round-trips through ParseEncodedDiskCID to assert meta.Opts content.
+func TestHandleCreateDisk_PerfOpts_InCIDMeta(t *testing.T) {
+	t.Parallel()
+	storageSvc := &mockStorageService{
+		createVolumeFn: func(_ context.Context, _, storage string, _ int, _ string, vmid int, _ string) (string, error) {
+			return fmt.Sprintf("%s:vm-%d-disk-0", storage, vmid), nil
+		},
+	}
+	deps := baseDepsForCreate(t, storageSvc, nil)
+
+	h := handlers.HandleCreateDisk(deps)
+	result, err := h.Handle(context.Background(), []json.RawMessage{
+		marshal(1024),
+		marshal(map[string]any{
+			"storage_pool": storageName,
+			"iothread":     true,
+			"cache":        "writeback",
+			"mbps_rd":      100,
+		}),
+	}, jsonrpc.Context{})
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	diskCID, ok := result.(string)
+	if !ok || diskCID == "" {
+		t.Fatalf("expected non-empty string result, got %T %v", result, result)
+	}
+
+	_, meta, parseErr := pve.ParseEncodedDiskCID(diskCID)
+	if parseErr != nil {
+		t.Fatalf("ParseEncodedDiskCID(%q): %v", diskCID, parseErr)
+	}
+	if meta == nil {
+		t.Fatal("meta is nil; perf opts not encoded into disk CID")
+	}
+	wantOpts := map[string]string{
+		"iothread": "1",
+		"cache":    "writeback",
+		"mbps_rd":  "100",
+	}
+	for k, wantV := range wantOpts {
+		if gotV := meta.Opts[k]; gotV != wantV {
+			t.Errorf("meta.Opts[%q] = %q; want %q", k, gotV, wantV)
+		}
+	}
+	// No extra keys beyond the three supplied.
+	if len(meta.Opts) != len(wantOpts) {
+		t.Errorf("meta.Opts has %d keys, want %d: %v", len(meta.Opts), len(wantOpts), meta.Opts)
+	}
+}
+
+// TestHandleCreateDisk_NoPerfOpts_ByteIdenticalCID verifies that when no perf
+// options are supplied, the returned disk CID is byte-identical to one produced
+// without any Opts field — preserving backward compatibility.
+func TestHandleCreateDisk_NoPerfOpts_ByteIdenticalCID(t *testing.T) {
+	t.Parallel()
+	var capturedVMID int
+	var capturedStorage string
+	storageSvc := &mockStorageService{
+		createVolumeFn: func(_ context.Context, _, storage string, _ int, _ string, vmid int, _ string) (string, error) {
+			capturedVMID = vmid
+			capturedStorage = storage
+			return fmt.Sprintf("%s:vm-%d-disk-0", storage, vmid), nil
+		},
+	}
+	deps := baseDepsForCreate(t, storageSvc, nil)
+
+	h := handlers.HandleCreateDisk(deps)
+	result, err := h.Handle(context.Background(), []json.RawMessage{
+		marshal(1024),
+		marshal(map[string]string{}), // no perf opts
+	}, jsonrpc.Context{})
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	diskCID, ok := result.(string)
+	if !ok || diskCID == "" {
+		t.Fatalf("expected non-empty string result, got %T %v", result, result)
+	}
+
+	// Construct the expected CID as EncodeDiskCID would without Opts.
+	bareCID := fmt.Sprintf("%s:vm-%d-disk-0", capturedStorage, capturedVMID)
+	expectedCID := pve.EncodeDiskCID(bareCID, &pve.DiskCIDMeta{
+		Pool: capturedStorage,
+		Node: deps.Config.Node,
+	})
+	if diskCID != expectedCID {
+		t.Errorf("no-perf-opts CID not byte-identical to pre-change form:\n  got  = %q\n  want = %q", diskCID, expectedCID)
+	}
+
+	_, meta, parseErr := pve.ParseEncodedDiskCID(diskCID)
+	if parseErr != nil {
+		t.Fatalf("ParseEncodedDiskCID(%q): %v", diskCID, parseErr)
+	}
+	// meta.Opts must be nil or empty when no options were set.
+	if meta != nil && len(meta.Opts) != 0 {
+		t.Errorf("meta.Opts = %v; want nil/empty when no perf options set", meta.Opts)
+	}
+}
+
+// TestHandleCreateDisk_BadCacheMode_CloudError verifies that an invalid cache
+// mode in cloud_properties causes a non-retriable CloudError before any PVE
+// call is made. resolveDiskPerfOptions validates cache values.
+func TestHandleCreateDisk_BadCacheMode_CloudError(t *testing.T) {
+	t.Parallel()
+	storageSvc := &mockStorageService{
+		createVolumeFn: func(_ context.Context, _, _ string, _ int, _ string, _ int, _ string) (string, error) {
+			t.Error("CreateVolume must not be called when perf option validation fails")
+			return "", nil
+		},
+	}
+	deps := baseDepsForCreate(t, storageSvc, nil)
+
+	h := handlers.HandleCreateDisk(deps)
+	_, err := h.Handle(context.Background(), []json.RawMessage{
+		marshal(1024),
+		marshal(map[string]any{
+			"cache": "bogus",
+		}),
+	}, jsonrpc.Context{})
+
+	if err == nil {
+		t.Fatal("expected CloudError for invalid cache mode, got nil")
+	}
+	var cpiErr *cpierrors.Error
+	if !errors.As(err, &cpiErr) {
+		t.Fatalf("expected *cpierrors.Error, got %T: %v", err, err)
+	}
+	if cpiErr.OkToRetry() {
+		t.Error("bad cache mode error must not be retriable")
+	}
+}

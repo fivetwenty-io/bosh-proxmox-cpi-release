@@ -399,6 +399,13 @@ type CPIConfig struct {
 	// attached to every VM lacking a per-call/profile security_groups override.
 	// Empty/absent = no global default (today's behavior).
 	SecurityGroups []string `json:"security_groups,omitempty"`
+
+	// DiskPerformance holds optional global per-disk performance option defaults.
+	// Applied when a create_disk/create_vm cloud_properties (or vm_type/disk_type
+	// profile) does not set the corresponding option. Pointer-typed so a nil block
+	// (absent from JSON) emits nothing and preserves byte-identical behavior.
+	// validate-only-when-set; omit from ERB when nil.
+	DiskPerformance *DiskPerformanceDefaults `json:"disk_performance,omitempty"`
 }
 
 // TypeProfile is a named bundle of default cloud_properties applied by the
@@ -415,6 +422,22 @@ type TypeProfile struct {
 type StorageTierCriteria struct {
 	Types  []string `json:"types,omitempty"`
 	Shared *bool    `json:"shared,omitempty"`
+}
+
+// DiskPerformanceDefaults holds optional global PVE per-disk performance option
+// defaults applied when a create_disk/create_vm cloud_properties (or vm_type/
+// disk_type profile) does not set the corresponding option. All fields optional;
+// a nil block (default) emits nothing and preserves byte-identical behavior.
+type DiskPerformanceDefaults struct {
+	Iothread         *bool    `json:"iothread,omitempty"`
+	Cache            string   `json:"cache,omitempty"`
+	Discard          *bool    `json:"discard,omitempty"`
+	SSD              *bool    `json:"ssd,omitempty"`
+	MBpsRd           *float64 `json:"mbps_rd,omitempty"`
+	MBpsWr           *float64 `json:"mbps_wr,omitempty"`
+	IOPSRd           *int     `json:"iops_rd,omitempty"`
+	IOPSWr           *int     `json:"iops_wr,omitempty"`
+	VirtioSCSISingle *bool    `json:"virtio_scsi_single,omitempty"`
 }
 
 // RetryConfig holds the operator-tunable retry/backoff policies. Each field is
@@ -1451,6 +1474,7 @@ func (c *CPIConfig) ValidateWithLogger(logger *log.Logger) error {
 	c.validateRetry(&errs)
 	c.validateOperationTimeout(&errs)
 	c.validateStorageTiers(&errs)
+	c.validateDiskPerformance(&errs)
 	if len(errs) > 0 {
 		return cpierrors.Cloud("config validation failed: %s", strings.Join(errs, "; "))
 	}
@@ -2055,6 +2079,73 @@ func (c *CPIConfig) validateOperationTimeout(errs *[]string) {
 	checkSec("delete_sec", ot.DeleteSec)
 	checkSec("query_sec", ot.QuerySec)
 	checkSec("default_sec", ot.DefaultSec)
+}
+
+// knownDiskCacheModes is the set of PVE per-disk cache mode strings accepted in
+// DiskPerformanceDefaults.Cache. Mirrors the values accepted by the PVE qemu
+// disk bus configuration; an empty string means "no override" and is valid.
+var knownDiskCacheModes = map[string]struct{}{
+	"none":         {},
+	"writethrough": {},
+	"writeback":    {},
+	"unsafe":       {},
+	"directsync":   {},
+}
+
+// IsKnownDiskCacheMode reports whether mode is a PVE per-disk cache mode the CPI
+// accepts. An empty string ("no override") is reported as valid. Exported so the
+// handlers package can validate call-time cache values against the single
+// authoritative set without duplicating the literals.
+func IsKnownDiskCacheMode(mode string) bool {
+	if mode == "" {
+		return true
+	}
+	_, ok := knownDiskCacheModes[mode]
+	return ok
+}
+
+// validateDiskPerformance validates the optional DiskPerformance block.
+// Skipped entirely when DiskPerformance is nil (validate-only-when-set).
+// Rules enforced when the block is present:
+//   - Cache non-empty and not in {none,writethrough,writeback,unsafe,directsync} → error.
+//   - MBpsRd/MBpsWr non-nil and < 0 → error.
+//   - IOPSRd/IOPSWr non-nil and < 0 → error.
+//
+// Boolean fields (Iothread, Discard, SSD, VirtioSCSISingle) are *bool with no
+// further constraints; any non-nil *bool is valid.
+func (c *CPIConfig) validateDiskPerformance(errs *[]string) {
+	if c.DiskPerformance == nil {
+		return
+	}
+	dp := c.DiskPerformance
+	if dp.Cache != "" {
+		if _, ok := knownDiskCacheModes[dp.Cache]; !ok {
+			*errs = append(*errs, fmt.Sprintf(
+				"disk_performance.cache must be one of none|writethrough|writeback|unsafe|directsync, got %q",
+				dp.Cache,
+			))
+		}
+	}
+	if dp.MBpsRd != nil && *dp.MBpsRd < 0 {
+		*errs = append(*errs, fmt.Sprintf(
+			"disk_performance.mbps_rd must be >= 0, got %g", *dp.MBpsRd,
+		))
+	}
+	if dp.MBpsWr != nil && *dp.MBpsWr < 0 {
+		*errs = append(*errs, fmt.Sprintf(
+			"disk_performance.mbps_wr must be >= 0, got %g", *dp.MBpsWr,
+		))
+	}
+	if dp.IOPSRd != nil && *dp.IOPSRd < 0 {
+		*errs = append(*errs, fmt.Sprintf(
+			"disk_performance.iops_rd must be >= 0, got %d", *dp.IOPSRd,
+		))
+	}
+	if dp.IOPSWr != nil && *dp.IOPSWr < 0 {
+		*errs = append(*errs, fmt.Sprintf(
+			"disk_performance.iops_wr must be >= 0, got %d", *dp.IOPSWr,
+		))
+	}
 }
 
 // knownPVEStorageTypes is the exhaustive set of PVE storage plugin names

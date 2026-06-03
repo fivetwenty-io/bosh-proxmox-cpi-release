@@ -477,6 +477,67 @@ func TestHandleCreateDisk_AZ_WiredThroughToMeta(t *testing.T) {
 	}
 }
 
+// TestHandleCreateDisk_PerfOpts_EncodedInMeta verifies that diskPerfOpts
+// are encoded into DiskCIDMeta.Opts via EncodeDiskCID (the production path
+// exercised by attemptCreateVolume). Uses the same encoder/decoder directly
+// to confirm the contract from opts map → CID suffix → parsed meta.Opts.
+func TestHandleCreateDisk_PerfOpts_EncodedInMeta(t *testing.T) {
+	t.Parallel()
+
+	bareCID := "local-lvm:vm-9001-disk-0"
+	diskPerfOpts := map[string]string{
+		"iothread": "1",
+		"cache":    "writeback",
+		"mbps_rd":  "100",
+	}
+
+	// Mirror the production call in attemptCreateVolume.
+	encoded := pve.EncodeDiskCID(bareCID, &pve.DiskCIDMeta{
+		Pool: "local-lvm",
+		Node: "pve1",
+		AZ:   "",
+		Opts: diskPerfOpts,
+	})
+
+	_, meta, err := pve.ParseEncodedDiskCID(encoded)
+	if err != nil {
+		t.Fatalf("ParseEncodedDiskCID(%q): %v", encoded, err)
+	}
+	if meta == nil {
+		t.Fatal("meta is nil; Opts not encoded into CID")
+	}
+	for k, wantV := range diskPerfOpts {
+		if gotV := meta.Opts[k]; gotV != wantV {
+			t.Errorf("meta.Opts[%q] = %q; want %q", k, gotV, wantV)
+		}
+	}
+}
+
+// TestHandleCreateDisk_NoPerfOpts_OmitemptyKeepsCIDIdentical verifies that
+// an empty diskPerfOpts map produces a CID byte-identical to one where Opts
+// is nil — confirming omitempty keeps the no-options path backward-compatible.
+func TestHandleCreateDisk_NoPerfOpts_OmitemptyKeepsCIDIdentical(t *testing.T) {
+	t.Parallel()
+
+	bareCID := "local-lvm:vm-9001-disk-0"
+
+	withEmptyOpts := pve.EncodeDiskCID(bareCID, &pve.DiskCIDMeta{
+		Pool: "local-lvm",
+		Node: "pve1",
+		Opts: map[string]string{}, // empty — omitempty must suppress
+	})
+	withNilOpts := pve.EncodeDiskCID(bareCID, &pve.DiskCIDMeta{
+		Pool: "local-lvm",
+		Node: "pve1",
+		Opts: nil,
+	})
+
+	if withEmptyOpts != withNilOpts {
+		t.Errorf("empty Opts must produce identical CID to nil Opts (omitempty):\n  empty = %q\n  nil   = %q",
+			withEmptyOpts, withNilOpts)
+	}
+}
+
 // TestHandleCreateDisk_NoAZ_BackwardCompatCID verifies that when
 // cloud_properties.availability_zone is absent (empty string), the disk CID
 // produced by attemptCreateVolume is structurally identical to a CID that

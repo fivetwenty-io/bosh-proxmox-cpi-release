@@ -3291,3 +3291,139 @@ func TestResolveCloneMode_UnknownVMType_ReturnsCloudError(t *testing.T) {
 		t.Errorf("expected *cpierrors.Error, got %T: %v", err, err)
 	}
 }
+
+// --------------------------------------------------------------------------
+// resolveVMShape: rootDiskPerfOpts + scsihw field tests
+// --------------------------------------------------------------------------
+
+// TestResolveVMShape_NoPerfOpts_ByteIdentical verifies that when no perf opts
+// and no virtio_scsi_single are set, the shape carries empty rootDiskPerfOpts
+// and scsihw=="virtio-scsi-pci" (byte-identical to pre-feature behaviour).
+func TestResolveVMShape_NoPerfOpts_ByteIdentical(t *testing.T) {
+	t.Parallel()
+
+	deps := Deps{
+		Config: &config.CPIConfig{
+			Node:           "pve",
+			VMStorage:      "local-lvm",
+			VMIDRangeStart: 100,
+		},
+		PVE: &shapeTestPVEClient{
+			clusterStorageSvc: nil,
+		},
+	}
+
+	shape, err := resolveVMShape(context.Background(), deps, minimalParsedArgs("test-storage"))
+	if err != nil {
+		t.Fatalf("resolveVMShape error: %v", err)
+	}
+	if len(shape.rootDiskPerfOpts) != 0 {
+		t.Errorf("rootDiskPerfOpts = %v; want empty map (no perf opts set)", shape.rootDiskPerfOpts)
+	}
+	if shape.scsihw != "virtio-scsi-pci" {
+		t.Errorf("scsihw = %q; want virtio-scsi-pci (default, no opt-in)", shape.scsihw)
+	}
+}
+
+// TestResolveVMShape_PerfOpts_IOThreadCache verifies that iothread+cache in
+// cloud_properties resolve to rootDiskPerfOpts.
+func TestResolveVMShape_PerfOpts_IOThreadCache(t *testing.T) {
+	t.Parallel()
+
+	deps := Deps{
+		Config: &config.CPIConfig{
+			Node:           "pve",
+			VMStorage:      "local-lvm",
+			VMIDRangeStart: 100,
+		},
+		PVE: &shapeTestPVEClient{
+			clusterStorageSvc: nil,
+		},
+	}
+
+	parsed := minimalParsedArgs("test-storage")
+	parsed.cloudPropsMap = map[string]any{
+		"iothread": true,
+		"cache":    "writeback",
+	}
+
+	shape, err := resolveVMShape(context.Background(), deps, parsed)
+	if err != nil {
+		t.Fatalf("resolveVMShape error: %v", err)
+	}
+	if shape.rootDiskPerfOpts["iothread"] != "1" {
+		t.Errorf("rootDiskPerfOpts[iothread] = %q; want 1", shape.rootDiskPerfOpts["iothread"])
+	}
+	if shape.rootDiskPerfOpts["cache"] != "writeback" {
+		t.Errorf("rootDiskPerfOpts[cache] = %q; want writeback", shape.rootDiskPerfOpts["cache"])
+	}
+	// ssd absent — virtio bus drops it; no virtio_scsi_single opt-in.
+	if shape.scsihw != "virtio-scsi-pci" {
+		t.Errorf("scsihw = %q; want virtio-scsi-pci (no virtio_scsi_single)", shape.scsihw)
+	}
+}
+
+// TestResolveVMShape_SSD_DroppedByVirtioBusFilter verifies that ssd:true in
+// cloud_properties is absent from rootDiskPerfOpts (virtio bus drops it).
+func TestResolveVMShape_SSD_DroppedByVirtioBusFilter(t *testing.T) {
+	t.Parallel()
+
+	deps := Deps{
+		Config: &config.CPIConfig{
+			Node:           "pve",
+			VMStorage:      "local-lvm",
+			VMIDRangeStart: 100,
+		},
+		PVE: &shapeTestPVEClient{
+			clusterStorageSvc: nil,
+		},
+	}
+
+	parsed := minimalParsedArgs("test-storage")
+	parsed.cloudPropsMap = map[string]any{
+		"ssd":      true,
+		"iothread": true,
+	}
+
+	shape, err := resolveVMShape(context.Background(), deps, parsed)
+	if err != nil {
+		t.Fatalf("resolveVMShape error: %v", err)
+	}
+	if _, ok := shape.rootDiskPerfOpts["ssd"]; ok {
+		t.Error("rootDiskPerfOpts must not contain ssd (virtio bus drops it)")
+	}
+	// iothread still present.
+	if shape.rootDiskPerfOpts["iothread"] != "1" {
+		t.Errorf("rootDiskPerfOpts[iothread] = %q; want 1", shape.rootDiskPerfOpts["iothread"])
+	}
+}
+
+// TestResolveVMShape_VirtioSCSISingle_Opt_In verifies that
+// virtio_scsi_single:true sets scsihw=="virtio-scsi-single".
+func TestResolveVMShape_VirtioSCSISingle_Opt_In(t *testing.T) {
+	t.Parallel()
+
+	deps := Deps{
+		Config: &config.CPIConfig{
+			Node:           "pve",
+			VMStorage:      "local-lvm",
+			VMIDRangeStart: 100,
+		},
+		PVE: &shapeTestPVEClient{
+			clusterStorageSvc: nil,
+		},
+	}
+
+	parsed := minimalParsedArgs("test-storage")
+	parsed.cloudPropsMap = map[string]any{
+		"virtio_scsi_single": true,
+	}
+
+	shape, err := resolveVMShape(context.Background(), deps, parsed)
+	if err != nil {
+		t.Fatalf("resolveVMShape error: %v", err)
+	}
+	if shape.scsihw != "virtio-scsi-single" {
+		t.Errorf("scsihw = %q; want virtio-scsi-single", shape.scsihw)
+	}
+}

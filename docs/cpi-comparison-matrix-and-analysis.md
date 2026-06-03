@@ -411,7 +411,7 @@ list and a per-profile firewall toggle are also resolved through the chain. Ever
 is opt-in: with no profiles, selectors, or tiers configured, resolution is byte-identical
 to prior releases.
 
-#### 7.9 Per-disk performance options (iothread / cache / discard / ssd / IO limits)
+#### 7.9 DONE — Per-disk performance options (iothread / cache / discard / ssd / IO limits)
 
 *References: AWS, Azure, Alicloud.* The PVE-native analogue of AWS `iops`/`throughput`
 and Azure `iops`/`mbps`. QEMU disks accept per-disk options governing performance and
@@ -428,6 +428,24 @@ optional `mbps_rd/wr` + `iops_rd/wr`) plus vm_type/global defaults resolved thro
 On `attach_disk` marshal enabled options into `AttachOpts.Extra`. On `create_vm` set the
 same on the root disk and switch the controller to `virtio-scsi-single` when `iothread`
 is requested. Validate-only-when-set, omit-when-empty.
+
+**Shipped.** All eight options (`iothread`, `cache`, `discard`, `ssd`, `mbps_rd`,
+`mbps_wr`, `iops_rd`, `iops_wr`) plus an opt-in `virtio_scsi_single` controller toggle now
+resolve through the §7.8 layered resolver (per-call cloud_properties → `disk_type` profile →
+`vm_type` profile → a global `disk_performance` config block). Options are baked into the
+PVE disk value string (`scsi1: store:vol,iothread=1,cache=writeback,…`), reusing the disk
+option codec already proven in `update_disk` — not `AttachOpts.Extra`, which the SDK merges
+as top-level VM config keys rather than per-disk options. Because `attach_disk` receives no
+cloud_properties (CPI v2 passes only `vm_cid` and `disk_cid`), `create_disk` resolves the
+options and encodes them into the disk CID metadata; `attach_disk` decodes them and merges
+over any global defaults, with the per-disk values winning. On `create_vm` the resolved
+options are applied to the `virtio0` root disk on both the import and clone paths, and
+`scsihw` switches to `virtio-scsi-single` only when explicitly opted in (default stays
+`virtio-scsi-pci`). Resolution is bus-aware: `ssd` is dropped on the virtio-blk root disk
+(invalid there) but kept for scsi persistent disks. Cache mode and non-negative throttles
+are validated at config-load and call time, surfacing a non-retriable error on bad input
+rather than a late PVE rejection. Every option is opt-in: with none set, the encoded CID,
+the attach call, and the create parameters are byte-identical to prior releases.
 
 #### 7.10 DONE — Multi-AZ candidate spread with next-AZ fallback
 

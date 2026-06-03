@@ -85,8 +85,9 @@ func HandleAttachDisk(deps Deps) Handler {
 		// Strip optional metadata suffix so all PVE API calls receive a plain
 		// "<storage>:<volid>" string. diskCID (the full encoded form) is
 		// preserved for agent hints and log fields so the Director can match
-		// the CID it originally stored.
-		bareDiskCID, _, err := pve.ParseEncodedDiskCID(diskCID)
+		// the CID it originally stored. meta carries per-disk performance
+		// options resolved at create_disk time; nil for bare (legacy) CIDs.
+		bareDiskCID, meta, err := pve.ParseEncodedDiskCID(diskCID)
 		if err != nil {
 			return nil, cpierrors.DiskNotFound(diskCID)
 		}
@@ -154,10 +155,40 @@ func HandleAttachDisk(deps Deps) Handler {
 			return nil, cpierrors.Wrap(pve.WrapError(prepErr), fmt.Sprintf("attach_disk: slot selection for VM %s disk %s", vmCID, diskCID))
 		}
 
+		// --------------------------------------------------------------------
+		// 5a. Compute effective per-disk performance options.
+		//
+		// Global defaults come from config (no call-level cloud_properties at
+		// attach time). Per-disk options stored in the CID metadata at
+		// create_disk time take precedence over globals. The merged set is
+		// bus-filtered (scsi keeps all) then baked into the volid argument
+		// passed to AttachDisk. When no options are present the call is
+		// byte-identical to the pre-feature behavior.
+		// --------------------------------------------------------------------
+		globalR, gerr := newLayeredResolver(nil, deps.Config)
+		if gerr != nil {
+			return nil, gerr
+		}
+		globalOpts, gerr := resolveDiskPerfOptions(globalR, deps.Config)
+		if gerr != nil {
+			return nil, gerr
+		}
+		var metaOpts map[string]string
+		if meta != nil {
+			metaOpts = meta.Opts
+		}
+		effectiveOpts := filterDiskPerfForBus(mergeDiskOptions(globalOpts, metaOpts), bus)
+
+		// Build the volid arg: bake options in when present, bare CID otherwise.
+		volidArg := bareDiskCID
+		if len(effectiveOpts) > 0 {
+			volidArg = buildDiskOptStr(bareDiskCID, effectiveOpts)
+		}
+
 		var diskID string
 		err = pve.RetryOnTransient(ctx, deps.Logger, "attach_disk", 0, func() error {
 			var attachErr error
-			diskID, attachErr = deps.PVE.QEMU().AttachDisk(ctx, node, vmid, bareDiskCID, bus, &qemu.AttachOpts{
+			diskID, attachErr = deps.PVE.QEMU().AttachDisk(ctx, node, vmid, volidArg, bus, &qemu.AttachOpts{
 				DiskID: desiredDiskID,
 			})
 			return attachErr

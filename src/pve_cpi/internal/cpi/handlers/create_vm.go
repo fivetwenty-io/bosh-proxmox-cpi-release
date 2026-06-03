@@ -201,6 +201,16 @@ type createVMShape struct {
 	// carried forward so cloneFromTemplate can consult it for clone_mode resolution
 	// via the layered resolver (vm_type profile may override config.CloneMode).
 	cloudPropsMap map[string]any
+	// rootDiskPerfOpts holds the resolved PVE per-disk performance options for
+	// the root disk (virtio0). Derived once in resolveVMShape via
+	// resolveDiskPerfOptions + filterDiskPerfForBus("virtio"). Empty map when no
+	// options are set (byte-identical path: nothing appended to virtio0 string).
+	rootDiskPerfOpts map[string]string
+	// scsihw is the resolved SCSI controller model. Defaults to "virtio-scsi-pci";
+	// set to "virtio-scsi-single" only when virtio_scsi_single is opted in via
+	// the layered resolver. Both import-path (createParams) and clone-path
+	// (UpdateQemuConfig) use this value.
+	scsihw string
 }
 
 // HandleCreateVM returns a cpi.Handler that implements the BOSH CPI create_vm method.
@@ -584,22 +594,46 @@ func resolveVMShape(ctx context.Context, deps Deps, parsed *createVMParsedArgs) 
 	// IsLinkedCloneSupported treats as linked-capable (permissive).
 	vmStorageType := lookupVMStorageType(ctx, deps, vmStorage)
 
+	// Resolve per-disk performance options for the root disk (virtio0).
+	// newLayeredResolver is cheap (no I/O); building a dedicated resolver here
+	// avoids threading it through resolveVMShapeStorage's signature.
+	// On error (invalid cloud_property value) we propagate a CloudError
+	// immediately before any VM is created.
+	perfR, perfRErr := newLayeredResolver(parsed.cloudPropsMap, deps.Config)
+	if perfRErr != nil {
+		return nil, perfRErr
+	}
+	rawPerfOpts, perfOptsErr := resolveDiskPerfOptions(perfR, deps.Config)
+	if perfOptsErr != nil {
+		return nil, perfOptsErr
+	}
+	// virtio0 is a virtio-blk device: the "ssd" flag is invalid on that bus.
+	// filterDiskPerfForBus("virtio") removes it while keeping iothread/cache/etc.
+	rootDiskPerfOpts := filterDiskPerfForBus(rawPerfOpts, "virtio")
+
+	scsihwVal := "virtio-scsi-pci"
+	if resolveVirtioSCSISingle(perfR, deps.Config) {
+		scsihwVal = "virtio-scsi-single"
+	}
+
 	return &createVMShape{
-		node:          node,
-		vmStorage:     vmStorage,
-		vmStorageType: vmStorageType,
-		vmDiskFormat:  vmDiskFormat,
-		rootDiskGiB:   rootDiskGiB,
-		cores:         cores,
-		sockets:       sockets,
-		memMiB:        memMiB,
-		hotplug:       hotplug,
-		numaEnabled:   numaEnabled,
-		initialTags:   initialTags,
-		rangeStart:    rangeStart,
-		maxAttempts:   maxAttempts,
-		initialName:   initialName,
-		cloudPropsMap: parsed.cloudPropsMap,
+		node:             node,
+		vmStorage:        vmStorage,
+		vmStorageType:    vmStorageType,
+		vmDiskFormat:     vmDiskFormat,
+		rootDiskGiB:      rootDiskGiB,
+		cores:            cores,
+		sockets:          sockets,
+		memMiB:           memMiB,
+		hotplug:          hotplug,
+		numaEnabled:      numaEnabled,
+		initialTags:      initialTags,
+		rangeStart:       rangeStart,
+		maxAttempts:      maxAttempts,
+		initialName:      initialName,
+		cloudPropsMap:    parsed.cloudPropsMap,
+		rootDiskPerfOpts: rootDiskPerfOpts,
+		scsihw:           scsihwVal,
 	}, nil
 }
 
@@ -1868,6 +1902,13 @@ func attemptCreateVM(
 	// --- Import-from path (old-form CID: light: or plain <storage>:import/<file>) ---
 	virtio0Val := fmt.Sprintf("%s:0,import-from=%s,format=%s,size=%dG",
 		shape.vmStorage, parsed.rawCID, shape.vmDiskFormat, shape.rootDiskGiB)
+	// Append resolved per-disk performance options (iothread, cache, etc.) when
+	// any are set. buildDiskOptStr treats the whole virtio0Val string as the bare
+	// volid prefix and appends ",key=value" pairs in deterministic alpha order.
+	// When rootDiskPerfOpts is empty the value is unchanged (byte-identical path).
+	if len(shape.rootDiskPerfOpts) > 0 {
+		virtio0Val = buildDiskOptStr(virtio0Val, shape.rootDiskPerfOpts)
+	}
 
 	createParams := map[string]any{
 		metadataKeyVMID: candidate,
@@ -1875,7 +1916,7 @@ func attemptCreateVM(
 		"memory":        shape.memMiB,
 		"cores":         shape.cores,
 		"ostype":        osTypeLinux26,
-		"scsihw":        "virtio-scsi-pci",
+		"scsihw":        shape.scsihw,
 		"virtio0":       virtio0Val,
 		"boot":          "order=virtio0",
 		"agent":         "enabled=1",
@@ -2130,6 +2171,48 @@ func cloneFromTemplate(
 		Cores:   &cores64,
 		Sockets: &sockets64,
 		Agent:   &agentEnabled,
+	}
+	// Apply scsihw override only when switched away from the historic default.
+	// Emitting "virtio-scsi-pci" explicitly would be byte-identical in effect but
+	// would produce unnecessary diff in the config PUT — keep default path clean.
+	if shape.scsihw != "virtio-scsi-pci" {
+		scsiVal := shape.scsihw
+		resourceParams.Scsihw = &scsiVal
+	}
+	// Apply root-disk performance options to virtio0 when any are set.
+	// The clone inherits the template's virtio0 string; we append our opts to it.
+	// When rootDiskPerfOpts is empty nothing is emitted (byte-identical path).
+	if len(shape.rootDiskPerfOpts) > 0 {
+		// PVE's config PUT requires the full "volid,opts" value for virtio0 — an
+		// options-only delta (",cache=writeback") is rejected as a bad volid. The
+		// clone inherited the template's virtio0 string, so fetch the cloned VM's
+		// current value, strip any existing options, and re-append our resolved
+		// opts. A Config read failure is non-fatal: the VM is already cloned and
+		// functional, so we log and skip rather than roll back over a tuning patch.
+		clonedCfg, cfgGetErr := deps.PVE.QEMU().Config(ctx, shape.node, candidate)
+		if cfgGetErr != nil {
+			// Non-fatal best-effort: log and skip the perf-opts patch. The VM is
+			// functional; operator can set opts manually. A CloudError here would
+			// roll back a successfully cloned VM unnecessarily.
+			logger.Warn("create_vm: could not fetch cloned VM config to apply root-disk perf opts; skipping",
+				log.Int("vmid", candidate),
+				log.String("error", cfgGetErr.Error()),
+			)
+		} else {
+			currentVirtio0, _ := clonedCfg["virtio0"].(string)
+			if currentVirtio0 == "" {
+				// Fallback: use storage:index bare form that PVE recognises.
+				currentVirtio0 = shape.vmStorage + ":vm-" + strconv.Itoa(candidate) + "-disk-0"
+			}
+			// splitDiskOptStr extracts the bare volid (stripping any existing opts)
+			// so we can re-append fresh opts cleanly without duplicates.
+			bareVolid, _ := splitDiskOptStr(currentVirtio0)
+			patchedVirtio0 := buildDiskOptStr(bareVolid, shape.rootDiskPerfOpts)
+			if resourceParams.Virtio == nil {
+				resourceParams.Virtio = make(map[int]string)
+			}
+			resourceParams.Virtio[0] = patchedVirtio0
+		}
 	}
 	if cfgErr := deps.PVE.Nodes().UpdateQemuConfig(ctx, shape.node, strconv.Itoa(candidate), resourceParams); cfgErr != nil {
 		return cpierrors.Wrap(pve.WrapError(cfgErr), fmt.Sprintf(

@@ -29,6 +29,10 @@ type attachQEMUService struct {
 	// AttachDisk control.
 	attachReturnDiskID string
 	attachErr          error
+	// attachLastVolid captures the volid argument passed to the most recent
+	// AttachDisk call. Tests use this to assert that performance options are
+	// baked into the volid string (not into AttachOpts.Extra).
+	attachLastVolid string
 
 	// Config control. Two modes:
 	//   - configCfgs (when non-nil): staged responses; call N returns
@@ -52,7 +56,8 @@ type attachQEMUService struct {
 	listSnapshotsFn func(ctx context.Context, node string, vmid int) ([]map[string]any, error)
 }
 
-func (m *attachQEMUService) AttachDisk(_ context.Context, _ string, _ int, _ string, _ string, _ *qemu.AttachOpts) (string, error) {
+func (m *attachQEMUService) AttachDisk(_ context.Context, _ string, _ int, volid string, _ string, _ *qemu.AttachOpts) (string, error) {
+	m.attachLastVolid = volid
 	return m.attachReturnDiskID, m.attachErr
 }
 
@@ -1170,5 +1175,171 @@ func TestAttachDisk_ConcurrentSameVM(t *testing.T) {
 	if len(nonRetriableFailures) > 0 {
 		t.Errorf("concurrent attach_disk produced %d non-retriable failure(s): %v",
 			len(nonRetriableFailures), nonRetriableFailures)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Per-disk performance option tests.
+//
+// These tests verify that attach_disk bakes performance options into the volid
+// argument passed to AttachDisk. The volid string format is:
+//
+//	"<bareDiskCID>[,key=value,...]"   (sorted alphabetically after "size")
+//
+// Options come from two sources, merged with per-disk CID metadata winning:
+//   - Global config (deps.Config.DiskPerformance)
+//   - Per-disk metadata encoded in the CID suffix (meta.Opts)
+//
+// All assertions use attachLastVolid captured by the mock's AttachDisk method.
+// ---------------------------------------------------------------------------
+
+// perfDiskCID encodes a bare disk CID with the given option map in its
+// metadata suffix. Mirrors what create_disk produces at CID-encode time.
+func perfDiskCID(bare string, opts map[string]string) string {
+	return pve.EncodeDiskCID(bare, &pve.DiskCIDMeta{Opts: opts})
+}
+
+// attachDepsPerf builds Deps with a caller-supplied CPIConfig for perf tests.
+func attachDepsPerf(qemuSvc qemu.Service, ag agent.Agent, cfg *config.CPIConfig) handlers.Deps {
+	return handlers.Deps{
+		Config: cfg,
+		PVE:    &mockPVEClient{qemuSvc: qemuSvc},
+		Agent:  ag,
+		Logger: log.NewNopLogger(),
+	}
+}
+
+// TestHandleAttachDisk_PerfOpts_MetaOptsApplied verifies that when the disk CID
+// encodes meta.Opts {iothread:1, cache:writeback}, AttachDisk receives a volid
+// with those options baked in ("bareDiskCID,cache=writeback,iothread=1" in
+// alphabetical order per buildDiskOptStr), at a scsi slot >= 1.
+func TestHandleAttachDisk_PerfOpts_MetaOptsApplied(t *testing.T) {
+	t.Parallel()
+	const bareCID = "local-lvm:vm-9001-disk-0"
+	metaOpts := map[string]string{"iothread": "1", "cache": "writeback"}
+	encodedCID := perfDiskCID(bareCID, metaOpts)
+
+	qemuSvc := &attachQEMUService{
+		attachReturnDiskID: "scsi1",
+		configCfg: map[string]any{
+			"scsi1": bareCID,
+		},
+	}
+	cfg := &config.CPIConfig{
+		Node:         testNode,
+		VMDiskFormat: "qcow2",
+	}
+	h := handlers.HandleAttachDisk(attachDepsPerf(qemuSvc, &captureAgent{}, cfg))
+
+	_, err := h.Handle(context.Background(), attachArgs("100", encodedCID), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// buildDiskOptStr: "size" first, then remaining keys alphabetically.
+	// meta opts: cache=writeback, iothread=1 → "local-lvm:vm-9001-disk-0,cache=writeback,iothread=1"
+	wantVolid := bareCID + ",cache=writeback,iothread=1"
+	if qemuSvc.attachLastVolid != wantVolid {
+		t.Errorf("AttachDisk volid: want %q, got %q", wantVolid, qemuSvc.attachLastVolid)
+	}
+}
+
+// TestHandleAttachDisk_PerfOpts_BareNoOptions verifies byte-identical behavior:
+// when the CID has no meta opts and config has nil DiskPerformance, AttachDisk
+// receives the bareDiskCID with no option suffix.
+func TestHandleAttachDisk_PerfOpts_BareNoOptions(t *testing.T) {
+	t.Parallel()
+	const bareCID = "local-lvm:vm-9001-disk-0"
+
+	qemuSvc := &attachQEMUService{
+		attachReturnDiskID: "scsi1",
+		configCfg: map[string]any{
+			"scsi1": bareCID,
+		},
+	}
+	cfg := &config.CPIConfig{
+		Node:            testNode,
+		VMDiskFormat:    "qcow2",
+		DiskPerformance: nil, // no global defaults
+	}
+	h := handlers.HandleAttachDisk(attachDepsPerf(qemuSvc, &captureAgent{}, cfg))
+
+	_, err := h.Handle(context.Background(), attachArgs("100", bareCID), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// No options → volid must be byte-identical to bareCID.
+	if qemuSvc.attachLastVolid != bareCID {
+		t.Errorf("AttachDisk volid: want bare %q (no options), got %q", bareCID, qemuSvc.attachLastVolid)
+	}
+}
+
+// TestHandleAttachDisk_PerfOpts_GlobalDefaultApplied verifies that when the CID
+// has no meta opts but deps.Config.DiskPerformance.Iothread is true, the volid
+// passed to AttachDisk includes "iothread=1".
+func TestHandleAttachDisk_PerfOpts_GlobalDefaultApplied(t *testing.T) {
+	t.Parallel()
+	const bareCID = "local-lvm:vm-9001-disk-0"
+
+	qemuSvc := &attachQEMUService{
+		attachReturnDiskID: "scsi1",
+		configCfg: map[string]any{
+			"scsi1": bareCID,
+		},
+	}
+	ioTrue := true
+	cfg := &config.CPIConfig{
+		Node:         testNode,
+		VMDiskFormat: "qcow2",
+		DiskPerformance: &config.DiskPerformanceDefaults{
+			Iothread: &ioTrue,
+		},
+	}
+	h := handlers.HandleAttachDisk(attachDepsPerf(qemuSvc, &captureAgent{}, cfg))
+
+	_, err := h.Handle(context.Background(), attachArgs("100", bareCID), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	wantVolid := bareCID + ",iothread=1"
+	if qemuSvc.attachLastVolid != wantVolid {
+		t.Errorf("AttachDisk volid: want %q (global iothread=1), got %q", wantVolid, qemuSvc.attachLastVolid)
+	}
+}
+
+// TestHandleAttachDisk_PerfOpts_PerDiskWinsOverGlobal verifies that per-disk
+// meta opts override global config defaults: config sets cache=none but the
+// disk CID encodes cache=writeback — the volid must carry cache=writeback.
+func TestHandleAttachDisk_PerfOpts_PerDiskWinsOverGlobal(t *testing.T) {
+	t.Parallel()
+	const bareCID = "local-lvm:vm-9001-disk-0"
+	// Per-disk meta overrides cache with writeback.
+	encodedCID := perfDiskCID(bareCID, map[string]string{"cache": "writeback"})
+
+	qemuSvc := &attachQEMUService{
+		attachReturnDiskID: "scsi1",
+		configCfg: map[string]any{
+			"scsi1": bareCID,
+		},
+	}
+	cfg := &config.CPIConfig{
+		Node:         testNode,
+		VMDiskFormat: "qcow2",
+		DiskPerformance: &config.DiskPerformanceDefaults{
+			Cache: "none", // global default — must be overridden by meta
+		},
+	}
+	h := handlers.HandleAttachDisk(attachDepsPerf(qemuSvc, &captureAgent{}, cfg))
+
+	_, err := h.Handle(context.Background(), attachArgs("100", encodedCID), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	wantVolid := bareCID + ",cache=writeback"
+	if qemuSvc.attachLastVolid != wantVolid {
+		t.Errorf("AttachDisk volid: want %q (per-disk cache overrides global), got %q", wantVolid, qemuSvc.attachLastVolid)
 	}
 }

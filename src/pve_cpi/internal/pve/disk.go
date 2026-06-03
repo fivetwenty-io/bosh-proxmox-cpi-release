@@ -98,6 +98,12 @@ type DiskCIDMeta struct {
 	// AZ is the availability-zone label at create_disk time. Populated when
 	// the placement layer resolves an AZ; empty otherwise.
 	AZ string `json:"az,omitempty"`
+	// Opts carries PVE per-disk performance options (iothread, cache, discard,
+	// ssd, mbps_rd, mbps_wr, iops_rd, iops_wr) resolved at create_disk time so
+	// attach_disk can apply them on the VM config attach. Empty (default) means
+	// no options were requested; the encoded CID is byte-identical to prior
+	// releases.
+	Opts map[string]string `json:"opts,omitempty"`
 }
 
 // diskCIDSep is the delimiter between the bare PVE volid and the optional
@@ -119,7 +125,7 @@ const diskCIDSep = "|"
 // where base64url uses standard RFC 4648 §5 encoding with no padding (URL-safe
 // alphabet, no '=' padding characters).
 func EncodeDiskCID(bareCID string, meta *DiskCIDMeta) string {
-	if meta == nil || (meta.Pool == "" && meta.Node == "" && meta.AZ == "") {
+	if meta == nil || (meta.Pool == "" && meta.Node == "" && meta.AZ == "" && len(meta.Opts) == 0) {
 		return bareCID
 	}
 	b, err := json.Marshal(meta)

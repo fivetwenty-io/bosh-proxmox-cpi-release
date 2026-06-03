@@ -700,3 +700,70 @@ properties:
       configuration. When empty (default []), no global firewall groups are
       applied and behavior is unchanged from prior releases.
     default: []
+
+  pve.disk_performance.iothread:
+    description: |
+      When true, enables the PVE iothread option on every disk created by this
+      CPI. One I/O thread per disk reduces contention on the QEMU main loop.
+      Applicable to virtio-scsi-single and virtio-blk buses; ignored on ide/sata
+      buses by PVE. Overridden per disk by cloud_properties.iothread. When unset
+      (default), the key is omitted and PVE uses its own default.
+
+  pve.disk_performance.cache:
+    description: |
+      Default PVE disk cache mode applied to every disk created by this CPI.
+      Valid values: none, writethrough, writeback, unsafe, directsync.
+      "writeback" offers best throughput for most workloads; "none" is required
+      for data safety on Ceph/RBD. Overridden per disk by cloud_properties.cache.
+      When unset (default), the key is omitted and PVE uses its own default.
+
+  pve.disk_performance.discard:
+    description: |
+      When true, passes discard=on to every disk created by this CPI, enabling
+      TRIM/UNMAP passthrough to the underlying storage. Effective only on
+      thin-provisioned backends (lvmthin, zfspool, rbd). Overridden per disk by
+      cloud_properties.discard. When unset (default), the key is omitted and PVE
+      uses its own default.
+
+  pve.disk_performance.ssd:
+    description: |
+      When true, marks every disk created by this CPI as an SSD-backed device,
+      enabling rotation=0 in the guest. Signals to the guest OS that the device
+      is solid-state. Overridden per disk by cloud_properties.ssd. When unset
+      (default), the key is omitted and PVE uses its own default.
+
+  pve.disk_performance.mbps_rd:
+    description: |
+      Default read throughput cap in MB/s for every disk created by this CPI.
+      Zero or unset means no cap. Fractional values are accepted (e.g. 100.5).
+      Overridden per disk by cloud_properties.mbps_rd. When unset (default), the
+      key is omitted and PVE imposes no throughput limit.
+
+  pve.disk_performance.mbps_wr:
+    description: |
+      Default write throughput cap in MB/s for every disk created by this CPI.
+      Zero or unset means no cap. Fractional values are accepted. Overridden per
+      disk by cloud_properties.mbps_wr. When unset (default), the key is omitted
+      and PVE imposes no throughput limit.
+
+  pve.disk_performance.iops_rd:
+    description: |
+      Default read IOPS cap for every disk created by this CPI. Zero or unset
+      means no cap. Must be a non-negative integer. Overridden per disk by
+      cloud_properties.iops_rd. When unset (default), the key is omitted and PVE
+      imposes no IOPS limit.
+
+  pve.disk_performance.iops_wr:
+    description: |
+      Default write IOPS cap for every disk created by this CPI. Zero or unset
+      means no cap. Must be a non-negative integer. Overridden per disk by
+      cloud_properties.iops_wr. When unset (default), the key is omitted and PVE
+      imposes no IOPS limit.
+
+  pve.disk_performance.virtio_scsi_single:
+    description: |
+      When true, sets the SCSI controller to virtio-scsi-single mode for every
+      VM created by this CPI, giving each disk its own dedicated virtio-scsi
+      controller. Required to use iothread per disk on virtio-scsi. Overridden
+      per VM by cloud_properties.virtio_scsi_single. When unset (default), the
+      key is omitted and PVE uses its own default.
