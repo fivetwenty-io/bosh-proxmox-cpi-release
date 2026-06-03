@@ -81,20 +81,31 @@ func AwaitTask(ctx context.Context, c Client, node, upid string, opts ...AwaitOp
 		return cpierrors.Cloud("AwaitTask: upid must not be empty")
 	}
 
+	// Resolve the poll cadence from the process-wide (operator-configurable)
+	// defaults. WithPollInterval still overrides the base interval per call.
+	pollIntervalMs, pollMaxIntervalMs, pollJitterPct := taskPollDefaults()
 	ao := &awaitOptions{
-		pollIntervalMs: defaultPollIntervalMs,
+		pollIntervalMs: pollIntervalMs,
 		maxWaitSeconds: defaultMaxWaitSeconds,
 	}
 	for _, opt := range opts {
 		opt(ao)
 	}
 
+	// The maximum poll interval must never fall below the (possibly overridden)
+	// base interval, or the SDK would back off to a value smaller than its
+	// starting point.
+	maxIntervalMs := pollMaxIntervalMs
+	if maxIntervalMs < ao.pollIntervalMs {
+		maxIntervalMs = ao.pollIntervalMs
+	}
+
 	waitOpts := &sdktasks.WaitOptions{
 		TimeoutSeconds:    ao.maxWaitSeconds,
 		IntervalMillis:    ao.pollIntervalMs,
-		MaxIntervalMillis: ao.pollIntervalMs * 5,
+		MaxIntervalMillis: maxIntervalMs,
 		Backoff:           false,
-		JitterPct:         10,
+		JitterPct:         pollJitterPct,
 	}
 
 	status, err := c.Tasks().Wait(ctx, node, upid, waitOpts)

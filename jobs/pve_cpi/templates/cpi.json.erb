@@ -280,5 +280,39 @@
   health_check["interval_sec"] = hc_interval unless hc_interval == 0
   config["health_check"] = health_check unless health_check.empty?
 
+  # Emit the retry block only when the operator overrides at least one curve.
+  # Each sub-policy and field is omit-when-zero so an untouched curve keeps the
+  # Go accessor's shipped default (byte-identical to prior releases).
+  retry_cfg = {}
+  {
+    "storage_import" => ["max_attempts", "base_ms", "cap_ms", "jitter_pct"],
+    "vmid_alloc"     => ["max_attempts", "base_ms", "cap_ms"],
+    "task_poll"      => ["base_ms", "cap_ms", "jitter_pct"],
+  }.each do |klass, fields|
+    policy = {}
+    fields.each do |f|
+      v = p("pve.retry.#{klass}.#{f}", 0).to_i
+      policy[f] = v unless v == 0
+    end
+    retry_cfg[klass] = policy unless policy.empty?
+  end
+  config["retry"] = retry_cfg unless retry_cfg.empty?
+
+  # Emit operation_timeout only when explicitly enabled. The per-class seconds
+  # are omit-when-zero so the Go accessors supply the built-in class defaults
+  # (1800/900/120/600 s). When the block is absent the envelope is off.
+  if p("pve.operation_timeout.enabled", false)
+    operation_timeout = { "enabled" => true }
+    { "create_sec"  => "pve.operation_timeout.create_sec",
+      "delete_sec"  => "pve.operation_timeout.delete_sec",
+      "query_sec"   => "pve.operation_timeout.query_sec",
+      "default_sec" => "pve.operation_timeout.default_sec",
+    }.each do |key, prop|
+      v = p(prop, 0).to_i
+      operation_timeout[key] = v unless v == 0
+    end
+    config["operation_timeout"] = operation_timeout
+  end
+
   JSON.dump(config)
 %>

@@ -42,6 +42,13 @@ type Dispatcher struct {
 	// handlers verbatim — identical call stack and zero overhead versus prior
 	// releases. Populated via WithHooks through NewDispatcherWithOptions.
 	hooks []Hook
+	// methodTimeout resolves the per-method deadline budget. nil (the default)
+	// means no deadline wraps handler execution — context flows through
+	// unchanged, identical to prior releases. A non-nil resolver that returns
+	// 0 for a method also means "no deadline for this method". Populated via
+	// WithMethodTimeouts. The dispatcher takes a plain func rather than a config
+	// value so it stays decoupled from the config package.
+	methodTimeout func(method string) time.Duration
 }
 
 // NewDispatcher returns a Dispatcher with all 22 CPI methods pre-registered as
@@ -89,6 +96,19 @@ func NewDispatcherWithOptions(logger *log.Logger, opts ...func(*Dispatcher)) *Di
 func WithHooks(hooks ...Hook) func(*Dispatcher) {
 	return func(d *Dispatcher) {
 		d.hooks = hooks
+	}
+}
+
+// WithMethodTimeouts returns an option that installs a per-method deadline
+// resolver. For each dispatched request the resolver is consulted with the
+// method name; a positive duration wraps the handler in a context.WithTimeout
+// of that size, and a zero (or a nil resolver) leaves the context unwrapped.
+// When the deadline fires before the handler returns, Handle converts the
+// resulting error into a retriable CloudError so the Director retries the
+// operation rather than treating a wedged call as a permanent failure.
+func WithMethodTimeouts(resolver func(method string) time.Duration) func(*Dispatcher) {
+	return func(d *Dispatcher) {
+		d.methodTimeout = resolver
 	}
 }
 
@@ -189,7 +209,46 @@ func (d *Dispatcher) Handle(ctx context.Context, req *jsonrpc.Request) (resp *js
 		return errorResponse(cpierrors.Cloud("unknown method: %s", req.Method))
 	}
 
-	result, err := h.Handle(ctx, req.Arguments, req.Context)
+	// Per-method deadline envelope (opt-in). When a resolver is installed and
+	// returns a positive budget, wrap the handler context so a wedged retry or
+	// poll loop cannot hold the request indefinitely. The handler's own retry
+	// loops and task polls already observe ctx.Done(), so this composes without
+	// any handler change. A zero budget (or nil resolver) leaves ctx untouched.
+	callCtx := ctx
+	var budget time.Duration
+	if d.methodTimeout != nil {
+		if budget = d.methodTimeout(req.Method); budget > 0 {
+			var cancel context.CancelFunc
+			callCtx, cancel = context.WithTimeout(ctx, budget)
+			defer cancel()
+		}
+	}
+
+	result, err := h.Handle(callCtx, req.Arguments, req.Context)
+
+	// If our deadline fired before the handler returned, translate whatever the
+	// handler reported into a retriable timeout so the Director gets a clear,
+	// actionable signal. Only do this when the handler actually errored: a
+	// handler that returned success just as the deadline elapsed genuinely
+	// succeeded and its result must not be clobbered. Parent (signal) shutdown
+	// is deliberately excluded — that is process shutdown, not a per-operation
+	// budget overrun. The ctx.Err()==nil guard closes the razor-thin race where
+	// the parent is cancelled at the same instant the child deadline fires: in
+	// that window callCtx.Err() may report DeadlineExceeded even though the real
+	// cause was shutdown, so we additionally require the parent to be live.
+	if err != nil && budget > 0 && callCtx.Err() == context.DeadlineExceeded && ctx.Err() == nil {
+		durationMS := float64(time.Since(start).Microseconds()) / 1000.0
+		d.logger.Info("dispatch",
+			log.String("method", req.Method),
+			log.String("request_id", req.Context.RequestID),
+			log.Float64("duration_ms", durationMS),
+			log.String("outcome", "timeout"),
+			log.Err(err),
+		)
+		return dispatchError(cpierrors.Retriable(
+			"operation %s exceeded its %s deadline [request_id=%s]; aborted and may be retried",
+			req.Method, budget, requestID))
+	}
 
 	durationMS := float64(time.Since(start).Microseconds()) / 1000.0
 	if err != nil {
@@ -257,6 +316,64 @@ func Methods() []string {
 		"update_disk",
 		"create_network",
 		"delete_network",
+	}
+}
+
+// methodClass partitions the canonical CPI methods into the four budget
+// classes the operation-timeout envelope sizes deadlines by. Any method not
+// listed in create/delete/query falls into the default class. Keeping this map
+// beside Methods() means a new method is a compile-adjacent edit, not a hunt
+// across packages.
+var methodClass = map[string]string{
+	// create class
+	"create_stemcell": "create",
+	"create_vm":       "create",
+	"create_disk":     "create",
+	"create_network":  "create",
+	// delete class
+	"delete_stemcell": "delete",
+	"delete_vm":       "delete",
+	"delete_disk":     "delete",
+	"delete_snapshot": "delete",
+	"delete_network":  "delete",
+	// query class (read-only / cheap)
+	"info":                          "query",
+	"has_vm":                        "query",
+	"has_disk":                      "query",
+	"get_disks":                     "query",
+	"calculate_vm_cloud_properties": "query",
+	// everything else (reboot_vm, set_vm_metadata, attach_disk, detach_disk,
+	// snapshot_disk, resize_disk, set_disk_metadata, update_disk) → default.
+}
+
+// NewMethodTimeoutResolver returns a per-method deadline resolver suitable for
+// WithMethodTimeouts. It classifies each method into create/delete/query and
+// returns the matching budget; any other (or unknown) method gets def. A class
+// duration of 0 (or any negative value, which is normalized to 0) disables the
+// envelope for that class (the resolver returns 0, which WithMethodTimeouts
+// treats as "do not wrap"). The four arguments are typically built from the
+// operator's operation_timeout config.
+func NewMethodTimeoutResolver(create, del, query, def time.Duration) func(string) time.Duration {
+	// Normalize negatives to 0 ("disabled") so a bad config value can never
+	// produce a context.WithTimeout with a negative (already-expired) deadline.
+	nonNeg := func(d time.Duration) time.Duration {
+		if d < 0 {
+			return 0
+		}
+		return d
+	}
+	create, del, query, def = nonNeg(create), nonNeg(del), nonNeg(query), nonNeg(def)
+	return func(method string) time.Duration {
+		switch methodClass[method] {
+		case "create":
+			return create
+		case "delete":
+			return del
+		case "query":
+			return query
+		default:
+			return def
+		}
 	}
 }
 

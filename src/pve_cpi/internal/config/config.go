@@ -351,6 +351,95 @@ type CPIConfig struct {
 	// Pointer-typed so a fully-absent block (nil) is cheap to detect. Accessors
 	// handle nil safely; Validate runs only when the block is present and enabled.
 	HealthCheck *HealthCheckConfig `json:"health_check,omitempty"`
+
+	// Retry groups operator-tunable retry/backoff curves. Every sub-policy is
+	// optional; an absent policy (or absent field within one) falls back to the
+	// constant the CPI used before this block existed, so an unset retry block
+	// is byte-identical behavior. Pointer-typed for cheap absence detection.
+	Retry *RetryConfig `json:"retry,omitempty"`
+
+	// OperationTimeout is the opt-in per-method deadline envelope. When nil, or
+	// when Enabled is absent or *false, no context deadline wraps handler
+	// dispatch — behavior is identical to prior releases. When Enabled is *true,
+	// each handler runs under a context.WithTimeout sized by its method class so
+	// a pathological retry/poll combination converts into a retriable timeout
+	// the Director can act on rather than an un-cancellable hang holding a queue
+	// slot. Pointer-typed so a fully-absent block is cheap to detect.
+	OperationTimeout *OperationTimeoutConfig `json:"operation_timeout,omitempty"`
+}
+
+// RetryConfig holds the operator-tunable retry/backoff policies. Each field is
+// optional and behavior-preserving when unset (the accessors return the
+// constants the CPI shipped with). Only policies that map to an existing
+// backoff seam are exposed — there is deliberately no generic "default" policy
+// because there is no generic curve to attach it to.
+type RetryConfig struct {
+	// StorageImport governs the exponential backoff used between create_vm /
+	// create_disk allocation attempts when PVE is serialising imports under a
+	// storage lock. Defaults: max_attempts per-handler (vm 10 / disk pkg
+	// default), base_ms 2000, cap_ms 30000, jitter_pct 30.
+	StorageImport *RetryPolicy `json:"storage_import,omitempty"`
+
+	// VMIDAlloc governs the brief uniform jitter between VMID-conflict retries
+	// and the allocation attempt budget. Defaults: max_attempts falls back to
+	// vmid_alloc_attempts then the per-handler default, base_ms 50, cap_ms 250,
+	// jitter_pct unused (uniform in [base_ms,cap_ms]).
+	VMIDAlloc *RetryPolicy `json:"vmid_alloc,omitempty"`
+
+	// TaskPoll governs PVE task polling cadence in AwaitTask. base_ms is the
+	// poll interval, cap_ms the maximum interval, jitter_pct the per-poll
+	// jitter. max_attempts is not applicable (polling is wall-clock bounded by
+	// WithMaxWait and the operation-timeout envelope) and is ignored. Defaults:
+	// base_ms 2000, cap_ms 10000, jitter_pct 10.
+	TaskPoll *RetryPolicy `json:"task_poll,omitempty"`
+}
+
+// RetryPolicy is the parameter bag shared by every retry class. Each consuming
+// curve interprets the fields in the way documented on its RetryConfig field;
+// not every field is meaningful for every class. Zero in any field means "use
+// the built-in default for this class" — never "zero attempts" or "zero delay"
+// — so a partially-specified policy still composes with the shipped constants.
+type RetryPolicy struct {
+	// MaxAttempts caps the number of attempts. Zero means "use the class
+	// default". Ignored by TaskPoll.
+	MaxAttempts int `json:"max_attempts,omitempty"`
+
+	// BaseMs is the base delay (StorageImport/VMIDAlloc) or poll interval
+	// (TaskPoll) in milliseconds. Zero means "use the class default".
+	BaseMs int `json:"base_ms,omitempty"`
+
+	// CapMs is the maximum delay (StorageImport/VMIDAlloc) or maximum poll
+	// interval (TaskPoll) in milliseconds. Zero means "use the class default".
+	CapMs int `json:"cap_ms,omitempty"`
+
+	// JitterPct is the +/- jitter percentage applied to the delay. Zero means
+	// "use the class default". Unused by VMIDAlloc (uniform draw).
+	JitterPct int `json:"jitter_pct,omitempty"`
+}
+
+// OperationTimeoutConfig holds the opt-in per-method deadline envelope. All
+// fields are honored only when Enabled is *true (validate-only-when-set). An
+// absent block (nil pointer) is equivalent to Enabled=*false and adds zero
+// overhead to dispatch.
+type OperationTimeoutConfig struct {
+	// Enabled turns on the per-method context deadline. Default false (opt-in);
+	// nil or absent JSON key is treated as false by OperationTimeoutEnabled().
+	Enabled *bool `json:"enabled,omitempty"`
+
+	// CreateSec is the deadline for create_* methods. Zero maps to 1800 s.
+	CreateSec int `json:"create_sec,omitempty"`
+
+	// DeleteSec is the deadline for delete_* methods. Zero maps to 900 s.
+	DeleteSec int `json:"delete_sec,omitempty"`
+
+	// QuerySec is the deadline for read-only methods (info, has_*, get_disks,
+	// calculate_vm_cloud_properties). Zero maps to 120 s.
+	QuerySec int `json:"query_sec,omitempty"`
+
+	// DefaultSec is the deadline for every other mutating method (reboot_vm,
+	// attach/detach/resize/snapshot_disk, set_*_metadata, update_disk). Zero
+	// maps to 600 s.
+	DefaultSec int `json:"default_sec,omitempty"`
 }
 
 // PlacementConfig holds all availability-aware node-selection knobs.
@@ -359,7 +448,7 @@ type CPIConfig struct {
 // existing configurations.
 type PlacementConfig struct {
 	// Enabled controls whether live node scoring runs at create_vm time.
-	// Default true (DEC-2: fully protective). When false, create_vm falls
+	// Default true (fully protective). When false, create_vm falls
 	// back to Config.Node (existing behavior). Pointer-typed so nil is
 	// treated as the default rather than explicit false.
 	Enabled *bool `json:"enabled,omitempty"`
@@ -860,7 +949,7 @@ func (c *CPIConfig) RegistryAllowPrivateIPValue() bool {
 }
 
 // PlacementEnabled returns the effective placement-scoring toggle.
-// nil Placement block OR nil Placement.Enabled → true (DEC-2: fully protective default).
+// nil Placement block OR nil Placement.Enabled → true (fully protective default).
 // Explicit *false → false (operator opt-out).
 func (c *CPIConfig) PlacementEnabled() bool {
 	if c.Placement == nil || c.Placement.Enabled == nil {
@@ -1053,7 +1142,7 @@ func (c *CPIConfig) AntiAffinityStrict() bool {
 }
 
 // EnsureNoIPConflictsEnabled returns the effective IP-conflict guard toggle.
-// nil (field absent from JSON) → true (DEC-2: protective default for static networks).
+// nil (field absent from JSON) → true (protective default for static networks).
 // *false → false (operator opt-out, e.g. pure-DHCP networks).
 // *true  → true.
 func (c *CPIConfig) EnsureNoIPConflictsEnabled() bool {
@@ -1113,6 +1202,159 @@ func (c *CPIConfig) HealthCheckIntervalSec() int {
 	return c.HealthCheck.IntervalSec
 }
 
+// EffectiveRetryPolicy is a fully-resolved retry policy: every field carries a
+// concrete value (the operator override when set, otherwise the class default).
+// Consumers convert BaseMs/CapMs to durations as needed. This keeps the config
+// package free of a time dependency while giving callers a single resolved view.
+type EffectiveRetryPolicy struct {
+	MaxAttempts int
+	BaseMs      int
+	CapMs       int
+	JitterPct   int
+}
+
+// Class defaults for the retry policies. These are exactly the constants the
+// CPI used before the retry config block existed, so an unset policy resolves
+// to byte-identical behavior.
+const (
+	defaultStorageImportBaseMs    = 2000
+	defaultStorageImportCapMs     = 30000
+	defaultStorageImportJitterPct = 30
+
+	defaultVMIDAllocBaseMs = 50
+	defaultVMIDAllocCapMs  = 250
+
+	defaultTaskPollBaseMs    = 2000
+	defaultTaskPollCapMs     = 10000
+	defaultTaskPollJitterPct = 10
+)
+
+// retryPolicyOrNil returns the named sub-policy, or nil when the retry block or
+// the sub-policy is absent. Centralizes the nil-guard the accessors share.
+func (c *CPIConfig) retryPolicyOf(pick func(*RetryConfig) *RetryPolicy) *RetryPolicy {
+	if c == nil || c.Retry == nil {
+		return nil
+	}
+	return pick(c.Retry)
+}
+
+// resolveField returns override when it is > 0, otherwise def. Used field-wise
+// so a partially-specified policy fills only the fields the operator set.
+func resolveField(override, def int) int {
+	if override > 0 {
+		return override
+	}
+	return def
+}
+
+// RetryStorageImport returns the resolved storage-import backoff policy.
+// MaxAttempts is left at 0 when the operator has not set it, signaling callers
+// to keep their own per-handler default (vm 10 / disk package default).
+func (c *CPIConfig) RetryStorageImport() EffectiveRetryPolicy {
+	p := c.retryPolicyOf(func(r *RetryConfig) *RetryPolicy { return r.StorageImport })
+	out := EffectiveRetryPolicy{
+		BaseMs:    defaultStorageImportBaseMs,
+		CapMs:     defaultStorageImportCapMs,
+		JitterPct: defaultStorageImportJitterPct,
+	}
+	if p != nil {
+		out.MaxAttempts = p.MaxAttempts // 0 → caller default
+		out.BaseMs = resolveField(p.BaseMs, defaultStorageImportBaseMs)
+		out.CapMs = resolveField(p.CapMs, defaultStorageImportCapMs)
+		out.JitterPct = resolveField(p.JitterPct, defaultStorageImportJitterPct)
+	}
+	return out
+}
+
+// RetryVMIDAlloc returns the resolved VMID-conflict retry policy. MaxAttempts
+// precedence: retry.vmid_alloc.max_attempts (>0) wins; otherwise 0 is returned
+// so the caller falls back to vmid_alloc_attempts then its per-handler default.
+// JitterPct is unused (the curve draws uniformly in [BaseMs,CapMs]).
+func (c *CPIConfig) RetryVMIDAlloc() EffectiveRetryPolicy {
+	p := c.retryPolicyOf(func(r *RetryConfig) *RetryPolicy { return r.VMIDAlloc })
+	out := EffectiveRetryPolicy{
+		BaseMs: defaultVMIDAllocBaseMs,
+		CapMs:  defaultVMIDAllocCapMs,
+	}
+	if p != nil {
+		out.MaxAttempts = p.MaxAttempts // 0 → caller default
+		out.BaseMs = resolveField(p.BaseMs, defaultVMIDAllocBaseMs)
+		out.CapMs = resolveField(p.CapMs, defaultVMIDAllocCapMs)
+	}
+	return out
+}
+
+// RetryTaskPoll returns the resolved task-poll cadence. BaseMs is the poll
+// interval, CapMs the maximum interval, JitterPct the per-poll jitter.
+// MaxAttempts is not applicable to polling and is always 0.
+func (c *CPIConfig) RetryTaskPoll() EffectiveRetryPolicy {
+	p := c.retryPolicyOf(func(r *RetryConfig) *RetryPolicy { return r.TaskPoll })
+	out := EffectiveRetryPolicy{
+		BaseMs:    defaultTaskPollBaseMs,
+		CapMs:     defaultTaskPollCapMs,
+		JitterPct: defaultTaskPollJitterPct,
+	}
+	if p != nil {
+		out.BaseMs = resolveField(p.BaseMs, defaultTaskPollBaseMs)
+		out.CapMs = resolveField(p.CapMs, defaultTaskPollCapMs)
+		out.JitterPct = resolveField(p.JitterPct, defaultTaskPollJitterPct)
+	}
+	return out
+}
+
+// OperationTimeoutEnabled reports whether the per-method deadline envelope is
+// active. Returns false when the block is nil, Enabled is nil, or Enabled is
+// *false. Only an explicit *true returns true.
+func (c *CPIConfig) OperationTimeoutEnabled() bool {
+	if c == nil || c.OperationTimeout == nil || c.OperationTimeout.Enabled == nil {
+		return false
+	}
+	return *c.OperationTimeout.Enabled
+}
+
+// Operation-timeout class defaults in seconds. Generous so the envelope only
+// fires on a genuinely wedged operation, never on a slow-but-progressing one.
+const (
+	defaultOpTimeoutCreateSec  = 1800
+	defaultOpTimeoutDeleteSec  = 900
+	defaultOpTimeoutQuerySec   = 120
+	defaultOpTimeoutDefaultSec = 600
+)
+
+// OperationTimeoutCreateSec returns the effective create-class deadline. Callers
+// should gate on OperationTimeoutEnabled() first.
+func (c *CPIConfig) OperationTimeoutCreateSec() int {
+	if c == nil || c.OperationTimeout == nil || c.OperationTimeout.CreateSec <= 0 {
+		return defaultOpTimeoutCreateSec
+	}
+	return c.OperationTimeout.CreateSec
+}
+
+// OperationTimeoutDeleteSec returns the effective delete-class deadline.
+func (c *CPIConfig) OperationTimeoutDeleteSec() int {
+	if c == nil || c.OperationTimeout == nil || c.OperationTimeout.DeleteSec <= 0 {
+		return defaultOpTimeoutDeleteSec
+	}
+	return c.OperationTimeout.DeleteSec
+}
+
+// OperationTimeoutQuerySec returns the effective query-class deadline.
+func (c *CPIConfig) OperationTimeoutQuerySec() int {
+	if c == nil || c.OperationTimeout == nil || c.OperationTimeout.QuerySec <= 0 {
+		return defaultOpTimeoutQuerySec
+	}
+	return c.OperationTimeout.QuerySec
+}
+
+// OperationTimeoutDefaultSec returns the effective deadline for every method not
+// in the create/delete/query classes.
+func (c *CPIConfig) OperationTimeoutDefaultSec() int {
+	if c == nil || c.OperationTimeout == nil || c.OperationTimeout.DefaultSec <= 0 {
+		return defaultOpTimeoutDefaultSec
+	}
+	return c.OperationTimeout.DefaultSec
+}
+
 // Validate checks all required fields and enum constraints.
 // Returns a CloudError whose message lists every violation, separated by "; ".
 //
@@ -1137,6 +1379,8 @@ func (c *CPIConfig) ValidateWithLogger(logger *log.Logger) error {
 	c.validatePlacement(&errs)
 	c.validateHooks(&errs)
 	c.validateHealthCheck(&errs)
+	c.validateRetry(&errs)
+	c.validateOperationTimeout(&errs)
 	if len(errs) > 0 {
 		return cpierrors.Cloud("config validation failed: %s", strings.Join(errs, "; "))
 	}
@@ -1652,6 +1896,82 @@ func (c *CPIConfig) validateHealthCheck(errs *[]string) {
 			"health_check.interval_sec must be 0-3600 when enabled, got %d", hc.IntervalSec,
 		))
 	}
+}
+
+// validateRetry rejects negative or contradictory retry-policy values. Zero is
+// always valid (means "use the class default"). Only fields the operator
+// actually set are present, so validation is cheap and never fires for an unset
+// block.
+//
+// The cap-vs-base ordering is checked on the EFFECTIVE (resolved) values, not
+// the raw fields: an operator who sets only cap_ms leaves base_ms at 0, which
+// resolves to the class default base. Comparing raw fields would skip the check
+// (raw base 0 fails the >0 guard) and let an effective cap smaller than the
+// effective base through, producing a degenerate near-zero backoff. eff returns
+// the resolved (base, cap) the runtime curve actually uses.
+func (c *CPIConfig) validateRetry(errs *[]string) {
+	if c == nil || c.Retry == nil {
+		return
+	}
+	checkRaw := func(name string, p *RetryPolicy) {
+		if p == nil {
+			return
+		}
+		if p.MaxAttempts < 0 {
+			*errs = append(*errs, fmt.Sprintf("retry.%s.max_attempts must be >= 0, got %d", name, p.MaxAttempts))
+		}
+		if p.BaseMs < 0 {
+			*errs = append(*errs, fmt.Sprintf("retry.%s.base_ms must be >= 0, got %d", name, p.BaseMs))
+		}
+		if p.CapMs < 0 {
+			*errs = append(*errs, fmt.Sprintf("retry.%s.cap_ms must be >= 0, got %d", name, p.CapMs))
+		}
+		if p.JitterPct < 0 || p.JitterPct > 100 {
+			*errs = append(*errs, fmt.Sprintf("retry.%s.jitter_pct must be 0-100, got %d", name, p.JitterPct))
+		}
+	}
+	checkRaw("storage_import", c.Retry.StorageImport)
+	checkRaw("vmid_alloc", c.Retry.VMIDAlloc)
+	checkRaw("task_poll", c.Retry.TaskPoll)
+
+	// Effective cap >= base. Only meaningful when the operator set at least one
+	// of the two fields for that class (an entirely-absent policy resolves to
+	// the shipped defaults, which always satisfy cap >= base).
+	checkEffective := func(name string, p *RetryPolicy, eff EffectiveRetryPolicy) {
+		if p == nil || (p.BaseMs == 0 && p.CapMs == 0) {
+			return
+		}
+		if eff.CapMs < eff.BaseMs {
+			*errs = append(*errs, fmt.Sprintf(
+				"retry.%s: effective cap_ms (%d) must be >= effective base_ms (%d)",
+				name, eff.CapMs, eff.BaseMs))
+		}
+	}
+	checkEffective("storage_import", c.Retry.StorageImport, c.RetryStorageImport())
+	checkEffective("vmid_alloc", c.Retry.VMIDAlloc, c.RetryVMIDAlloc())
+	checkEffective("task_poll", c.Retry.TaskPoll, c.RetryTaskPoll())
+}
+
+// validateOperationTimeout rejects out-of-range per-class deadlines. Honored
+// only when the envelope is enabled (validate-only-when-set); zero is valid and
+// maps to the class default. The upper bound (24h) is a sanity ceiling that
+// still leaves the envelope able to bound any realistic operation.
+func (c *CPIConfig) validateOperationTimeout(errs *[]string) {
+	if !c.OperationTimeoutEnabled() {
+		return
+	}
+	const maxSec = 86400
+	ot := c.OperationTimeout
+	checkSec := func(name string, v int) {
+		if v < 0 || v > maxSec {
+			*errs = append(*errs, fmt.Sprintf(
+				"operation_timeout.%s must be 0-%d when enabled, got %d", name, maxSec, v))
+		}
+	}
+	checkSec("create_sec", ot.CreateSec)
+	checkSec("delete_sec", ot.DeleteSec)
+	checkSec("query_sec", ot.QuerySec)
+	checkSec("default_sec", ot.DefaultSec)
 }
 
 // redactEndpoint strips userinfo from a URL so the endpoint can be logged

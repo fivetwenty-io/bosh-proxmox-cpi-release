@@ -2479,7 +2479,7 @@ func TestValidate_DiskFields_Absent(t *testing.T) {
 // --------------------------------------------------------------------------
 
 // TestPlacementEnabled_NilPlacement verifies PlacementEnabled returns true
-// when the entire Placement block is absent (DEC-2: fully protective default).
+// when the entire Placement block is absent (fully protective default).
 func TestPlacementEnabled_NilPlacement(t *testing.T) {
 	t.Parallel()
 	var cfg config.CPIConfig
@@ -2966,7 +2966,7 @@ func TestAntiAffinityUseHaRulesEnabled(t *testing.T) {
 // EnsureNoIPConflicts tests
 // --------------------------------------------------------------------------
 
-// TestEnsureNoIPConflictsEnabled_Nil verifies true when field is nil (DEC-2 default).
+// TestEnsureNoIPConflictsEnabled_Nil verifies true when field is nil.
 func TestEnsureNoIPConflictsEnabled_Nil(t *testing.T) {
 	t.Parallel()
 	var cfg config.CPIConfig

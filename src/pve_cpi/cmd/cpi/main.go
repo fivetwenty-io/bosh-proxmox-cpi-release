@@ -162,7 +162,33 @@ func runWithArgs(args []string, stdin io.Reader, stdout, stderr io.Writer, opts 
 		hookChain = append(hookChain, ctor(logger))
 	}
 
-	d := cpi.NewDispatcherWithOptions(logger, cpi.WithHooks(hookChain...))
+	// Apply the operator's task-poll cadence process-wide before serving. With
+	// an unset retry.task_poll block these resolve to the shipped defaults, so
+	// polling is identical to prior releases.
+	tp := cfg.RetryTaskPoll()
+	pve.ConfigureTaskPolling(tp.BaseMs, tp.CapMs, tp.JitterPct)
+
+	dispatcherOpts := []func(*cpi.Dispatcher){cpi.WithHooks(hookChain...)}
+	// Per-method deadline envelope is opt-in. When enabled, install a resolver
+	// sized by the operator's per-class budgets so a wedged operation converts
+	// into a retriable timeout instead of holding a Director queue slot forever.
+	if cfg.OperationTimeoutEnabled() {
+		dispatcherOpts = append(dispatcherOpts, cpi.WithMethodTimeouts(
+			cpi.NewMethodTimeoutResolver(
+				time.Duration(cfg.OperationTimeoutCreateSec())*time.Second,
+				time.Duration(cfg.OperationTimeoutDeleteSec())*time.Second,
+				time.Duration(cfg.OperationTimeoutQuerySec())*time.Second,
+				time.Duration(cfg.OperationTimeoutDefaultSec())*time.Second,
+			),
+		))
+		logger.Info("operation timeout envelope enabled",
+			log.Int("create_sec", cfg.OperationTimeoutCreateSec()),
+			log.Int("delete_sec", cfg.OperationTimeoutDeleteSec()),
+			log.Int("query_sec", cfg.OperationTimeoutQuerySec()),
+			log.Int("default_sec", cfg.OperationTimeoutDefaultSec()),
+		)
+	}
+	d := cpi.NewDispatcherWithOptions(logger, dispatcherOpts...)
 	handlers.RegisterAll(d, handlers.Deps{
 		Config:   cfg,
 		PVE:      client,

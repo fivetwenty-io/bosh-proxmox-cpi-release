@@ -528,6 +528,97 @@ properties:
       Set to 0 for back-to-back pings (fast test mode). Ignored when
       health_check.enabled is false.
     default: 0
+
+  pve.retry.storage_import.max_attempts:
+    description: |
+      Maximum allocation attempts when PVE serialises disk/template imports
+      under a storage lock. Zero (default) keeps the built-in per-handler budget
+      (create_vm 10, create_disk package default). Raise this on slow Ceph where
+      lock windows are wide. Overrides vmid_alloc_attempts for the storage-lock
+      retry loop.
+    default: 0
+  pve.retry.storage_import.base_ms:
+    description: |
+      Base delay in milliseconds for the storage-import exponential backoff
+      (base x 1.5^attempt). Zero (default) applies the built-in 2000 ms.
+    default: 0
+  pve.retry.storage_import.cap_ms:
+    description: |
+      Maximum delay in milliseconds for the storage-import backoff. Zero
+      (default) applies the built-in 30000 ms. Must be >= base_ms when both set.
+    default: 0
+  pve.retry.storage_import.jitter_pct:
+    description: |
+      Plus/minus jitter percentage (0-100) applied to each storage-import
+      backoff delay. Zero (default) applies the built-in 30.
+    default: 0
+
+  pve.retry.vmid_alloc.max_attempts:
+    description: |
+      Maximum attempts for VMID-conflict retries. Zero (default) falls back to
+      vmid_alloc_attempts, then the per-handler default (create_vm 10,
+      create_disk 5).
+    default: 0
+  pve.retry.vmid_alloc.base_ms:
+    description: |
+      Lower bound in milliseconds of the uniform VMID-conflict retry jitter.
+      Zero (default) applies the built-in 50 ms.
+    default: 0
+  pve.retry.vmid_alloc.cap_ms:
+    description: |
+      Upper bound in milliseconds of the uniform VMID-conflict retry jitter.
+      Zero (default) applies the built-in 250 ms. Must be >= base_ms when set.
+    default: 0
+
+  pve.retry.task_poll.base_ms:
+    description: |
+      PVE task poll interval in milliseconds. Zero (default) applies the
+      built-in 2000 ms. Raise to reduce API pressure on large clusters.
+    default: 0
+  pve.retry.task_poll.cap_ms:
+    description: |
+      Maximum PVE task poll interval in milliseconds (the poller backs off
+      toward this value). Zero (default) applies the built-in 10000 ms. Clamped
+      up to base_ms if smaller.
+    default: 0
+  pve.retry.task_poll.jitter_pct:
+    description: |
+      Plus/minus jitter percentage (0-100) applied to each task poll interval.
+      Zero (default) applies the built-in 10.
+    default: 0
+
+  pve.operation_timeout.enabled:
+    description: |
+      Opt-in per-method deadline envelope. When false (default) no deadline
+      wraps handler execution and behavior is identical to prior releases. When
+      true, each CPI method runs under a context deadline sized by its class so a
+      wedged retry/poll combination converts into a retriable timeout the
+      Director can act on instead of holding a queue slot indefinitely.
+    default: false
+  pve.operation_timeout.create_sec:
+    description: |
+      Deadline in seconds for create_* methods. Zero (default) applies the
+      built-in 1800 s. Honored only when operation_timeout.enabled is true.
+    default: 0
+  pve.operation_timeout.delete_sec:
+    description: |
+      Deadline in seconds for delete_* methods. Zero (default) applies the
+      built-in 900 s. Honored only when operation_timeout.enabled is true.
+    default: 0
+  pve.operation_timeout.query_sec:
+    description: |
+      Deadline in seconds for read-only methods (info, has_vm, has_disk,
+      get_disks, calculate_vm_cloud_properties). Zero (default) applies the
+      built-in 120 s. Honored only when operation_timeout.enabled is true.
+    default: 0
+  pve.operation_timeout.default_sec:
+    description: |
+      Deadline in seconds for every other mutating method (reboot_vm,
+      attach/detach/resize/snapshot_disk, set_*_metadata, update_disk). Zero
+      (default) applies the built-in 600 s. Honored only when
+      operation_timeout.enabled is true.
+    default: 0
+
   pve.fetch_credential_defaults:
     description: |
       Ordered list of URL-prefix to auth-payload mappings used by the CPI when
