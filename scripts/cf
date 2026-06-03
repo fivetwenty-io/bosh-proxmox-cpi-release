@@ -123,15 +123,26 @@ def cmd_runtime_config(_extra: list[str]) -> None:
     )
 
 
+def active_env() -> str:
+    """Active env-bundle name, defaulting to 'cpitest' when unset.
+
+    Mirrors scripts/bosh.active_env so a bare `./scripts/cf` deploy lands on
+    the same isolated env as the director it pairs with, rather than the shared
+    LAN default. Keeping the two in lockstep avoids the tailscale LAN route
+    hazard (memory: tailscale-lan-route-hazard).
+    """
+    return os.environ.get("BOSH_PVE_ENV", "").strip() or "cpitest"
+
+
 def _env_cf_cloud_config_ops() -> list[str]:
     """Return -o flags for the active env's CF cloud-config layer.
 
     BOSH_PVE_ENV selects manifests/envs/<env>/cf-cloud-config.yml when present;
-    unset or missing file means no layer applied. Pairs with the director
-    network layer applied by scripts/bosh — skipping one re-triggers the
-    tailscale LAN route hazard (memory: tailscale-lan-route-hazard).
+    defaults to cpitest. Missing file means no layer applied. Pairs with the
+    director network layer applied by scripts/bosh — skipping one re-triggers
+    the tailscale LAN route hazard (memory: tailscale-lan-route-hazard).
     """
-    env_name = os.environ.get("BOSH_PVE_ENV", "").strip()
+    env_name = active_env()
     if not env_name:
         return []
     layer = REPO_ROOT / "manifests" / "envs" / env_name / "cf-cloud-config.yml"
@@ -150,7 +161,7 @@ def _env_vars_layer() -> list[str]:
     what moves CF onto the env's isolated network. Pairs with the director
     layer applied by scripts/bosh.
     """
-    env_name = os.environ.get("BOSH_PVE_ENV", "").strip()
+    env_name = active_env()
     if not env_name:
         return []
     layer = REPO_ROOT / "manifests" / "envs" / env_name / "vars.yml"
@@ -166,7 +177,7 @@ def _bosh_var(json_path: str) -> str:
     internal_ip; resolving them env-first keeps credhub/login pointed at the
     Director's real address when it has been moved onto an isolated network.
     """
-    env_name = os.environ.get("BOSH_PVE_ENV", "").strip()
+    env_name = active_env()
     if env_name:
         layer = REPO_ROOT / "manifests" / "envs" / env_name / "vars.yml"
         if layer.exists():

@@ -35,7 +35,7 @@ Commands:
 
 Flags:
     --config FILE     Integration config YAML (default: ci/integration.yml).
-    --env NAME        BOSH_PVE_ENV overlay selector (default: $BOSH_PVE_ENV or 'lab').
+    --env NAME        BOSH_PVE_ENV overlay selector (default: $BOSH_PVE_ENV or 'cpitest').
     --clean           For 'all': teardown before bootstrapping (DESTRUCTIVE).
     --yes, -y         Skip the DESTRUCTIVE confirmation prompt for --clean/teardown.
     --skip-build      Reuse the existing bin/cpi and release tarball; skip building.
@@ -1104,7 +1104,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="phase to run (default: all)",
     )
     p.add_argument("--config", default=DEFAULT_CONFIG)
-    p.add_argument("--env", default=os.environ.get("BOSH_PVE_ENV", "lab"))
+    p.add_argument("--env", default=os.environ.get("BOSH_PVE_ENV", "cpitest"))
     p.add_argument("--clean", action="store_true")
     p.add_argument("--yes", "-y", action="store_true")
     p.add_argument("--skip-build", action="store_true")

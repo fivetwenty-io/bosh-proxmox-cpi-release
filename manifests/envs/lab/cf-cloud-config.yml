@@ -1,56 +1,36 @@
 ---
 # ============================================================================
-# Env bundle: lab — CF cloud-config layer.
+# Env bundle: lab — CF cloud-config network override.
 #
-# Auto-layered by scripts/cf cloud-config when BOSH_PVE_ENV=lab. Paired with
-# manifests/envs/lab/network.yml (director network layer). Mismatch between
-# the two re-triggers the tailscale LAN route hazard (memory:
-# tailscale-lan-route-hazard): traffic destined for 192.168.1.x is hijacked
-# by the pve Tailscale peer's advertised subnet route, causing "no route to
-# host" for userland clients.
-#
-# Replaces the cf/cloud-config.yml subnet CIDR (192.168.1.0/24) with the lab
-# bloc 10.64.64.0/18 (lvnet001 bridge, 10.64.64.0-10.64.127.255).
-#
-# Usage:
-#   BOSH_PVE_ENV=lab ./scripts/cf cloud-config
+# Auto-layered by `scripts/cf cloud-config` (and the full `deploy`) when
+# BOSH_PVE_ENV=lab. Replaces the default subnet (192.168.1.0/24 on the shared
+# LAN bridge) with the isolated lab network. All values are pulled from
+# manifests/envs/lab/vars.yml so a single edit there re-shapes both the
+# Director network and this cloud-config in lockstep.
 #
 # Direct invocation:
 #   bosh -e pve update-cloud-config manifests/cf/cloud-config.yml \
 #     -o manifests/envs/lab/cf-cloud-config.yml \
-#     -l manifests/bosh/vars.yml -l manifests/cf/vars.yml
-#
-# CIDR layout (mirrors manifests/envs/lab/network.yml IPAM):
-#   10.64.64.1        gateway (lvnet001)
-#   10.64.64.2-9      reserved infrastructure
-#   10.64.64.10       mgmt-BOSH director
-#   10.64.64.11       reserved (artifacts VM)
-#   10.64.64.12       env-BOSH director
-#   10.64.64.13-19    reserved infrastructure band
-#   10.64.64.20-49    dynamic (CF VMs, BOSH-managed)
-#   10.64.64.50       haproxy (static — matches ((haproxy_private_ip)))
-#   10.64.64.51-254   dynamic continuation
-#   10.64.64.255      reserved (broadcast / infrastructure)
-#   10.64.65.0-10.64.127.255  available for future expansion
+#     -l manifests/bosh/vars.yml -l manifests/cf/vars.yml \
+#     -l manifests/envs/lab/vars.yml
 # ============================================================================
 
-# Replace the subnet range with the lab CIDR.
 - type: replace
   path: /networks/name=default/subnets/0/range
-  value: 10.64.64.0/18
+  value: ((internal_cidr))
 
-# Replace the gateway.
 - type: replace
   path: /networks/name=default/subnets/0/gateway
-  value: 10.64.64.1
+  value: ((internal_gw))
 
-# Replace reserved bands. Mirrors the reserved list in
-# manifests/envs/lab/network.yml plus a top-of-range band analogous to
-# 192.168.1.200-254 in the base config.
 - type: replace
   path: /networks/name=default/subnets/0/reserved
-  value:
-  - 10.64.64.1-10.64.64.9
-  - 10.64.64.11
-  - 10.64.64.13-10.64.64.19
-  - 10.64.127.200-10.64.127.255
+  value: ((lab_reserved))
+
+- type: replace
+  path: /networks/name=default/subnets/0/static
+  value: ((lab_static))
+
+- type: replace
+  path: /networks/name=default/subnets/0/cloud_properties/bridge
+  value: ((pve_network_bridge))

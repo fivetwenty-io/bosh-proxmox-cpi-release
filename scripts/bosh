@@ -138,13 +138,24 @@ def cpi_release_path() -> str:
     return str(tarballs[0])
 
 
+def active_env() -> str:
+    """Active env-bundle name, defaulting to 'cpitest' when unset.
+
+    cpitest is the validated isolated-SDN env (172.31.0.0/24); making it the
+    default keeps a bare `./scripts/bosh create-env` (no BOSH_PVE_ENV) off the
+    shared LAN, where the duplicate-IP hazard lives. The destructive net-*
+    commands still require an explicit env (see _sdn_params).
+    """
+    return os.environ.get("BOSH_PVE_ENV", "").strip() or "cpitest"
+
+
 def env_network_ops() -> list[str]:
     """Return -o flags for the active env's director network layer.
 
     BOSH_PVE_ENV selects manifests/envs/<env>/network.yml when present;
-    unset or missing file means no layer applied.
+    defaults to cpitest. Missing file means no layer applied.
     """
-    env_name = os.environ.get("BOSH_PVE_ENV", "").strip()
+    env_name = active_env()
     if not env_name:
         return []
     layer = ENVS_DIR / env_name / "network.yml"
@@ -161,7 +172,7 @@ def env_vars_file() -> "Path | None":
     manifests/bosh/vars.yml so its keys win, which is how an env moves the
     Director onto an isolated network without editing the base vars.
     """
-    env_name = os.environ.get("BOSH_PVE_ENV", "").strip()
+    env_name = active_env()
     if not env_name:
         return None
     f = ENVS_DIR / env_name / "vars.yml"
@@ -187,7 +198,7 @@ def env_cc_reserved_ops() -> list[str]:
     deployment still holds it (duplicate IP -> agent NATS flap). Optional:
     absent file means no override (base envs unchanged).
     """
-    env_name = os.environ.get("BOSH_PVE_ENV", "").strip()
+    env_name = active_env()
     if not env_name:
         return []
     layer = ENVS_DIR / env_name / "cc-reserved.yml"

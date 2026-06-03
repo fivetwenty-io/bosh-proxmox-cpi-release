@@ -1,7 +1,7 @@
 ---
 # ============================================================================
 # Env bundle pairing: when an env's network layer changes the director CIDR
-# (e.g. BOSH_PVE_ENV=lab swaps 192.168.1.0/24 for 10.64.64.0/18), this file
+# (e.g. BOSH_PVE_ENV=cpitest swaps 192.168.1.0/24 for 172.31.0.0/24), this file
 # must be paired with the env's CF cloud-config layer. scripts/cf cloud-config
 # auto-layers manifests/envs/$BOSH_PVE_ENV/cf-cloud-config.yml when the env
 # is set. Skipping the pairing leaves this file's reserved bands in the base

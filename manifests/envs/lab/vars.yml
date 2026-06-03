@@ -1,0 +1,56 @@
+---
+# ============================================================================
+# Env bundle: lab — director + deployment network overrides.
+#
+# Single source of truth for the lab env's network. Layered after
+# manifests/bosh/vars.yml (and manifests/cf/vars.yml) by scripts/bosh and
+# scripts/cf, so these keys win. Selecting BOSH_PVE_ENV=lab moves BOTH the
+# Director and the CF deployment onto the private 172.16.0.0/18 range, off the
+# shared office LAN (192.168.1.0/24) where the duplicate-IP / tailscale LAN
+# route hazard lives (memory: tailscale-lan-route-hazard, cf-deploy-nats-churn).
+#
+# Transport: lab REUSES the cpitest SDN vnet `cpitest0` rather than creating
+# its own. `scripts/bosh net-up` is therefore NOT a lab operation (no SDN
+# block below, so net-* refuses BOSH_PVE_ENV=lab by design); bring cpitest0 up
+# once with BOSH_PVE_ENV=cpitest ./scripts/bosh net-up.
+#
+#   OPERATIONAL CAVEAT: cpitest0's SDN subnet/gateway is 172.31.0.0/24 →
+#   172.31.0.1. A lab guest on 172.16.0.0/18 points its default route at
+#   172.16.0.1, which does not exist on cpitest0 until that subnet+gateway is
+#   added to the vnet (or SNAT is widened to cover 172.16/18). Off-subnet
+#   reachability (PVE API, apt, bosh.io) depends on that gateway existing.
+#
+# Keep these invariants consistent (mirrors cpitest header):
+#   1. pve_network_bridge MUST be the Linux bridge VMs attach to (cpitest0).
+#   2. internal_cidr MUST contain internal_ip, haproxy_private_ip, and every
+#      lab_reserved / lab_static entry.
+#   3. internal_gw MUST be the subnet's gateway.
+#
+# Usage:
+#   BOSH_PVE_ENV=lab ./scripts/bosh create-env
+#   BOSH_PVE_ENV=lab ./scripts/cf deploy
+#
+# Tracked in git (force-added past the global vars.yml ignore) because it is
+# pure network configuration. KEEP IT SECRET-FREE — credentials belong in
+# manifests/bosh/vars.yml (gitignored), not here.
+# ============================================================================
+
+# --- Director + deployment network (overrides manifests/bosh/vars.yml) -----
+internal_cidr:       172.16.0.0/18
+internal_gw:         172.16.0.1
+internal_ip:         172.16.0.10
+pve_network_bridge:  cpitest0
+# HAProxy entry point (CF). Wildcard system-domain DNS must resolve here.
+# Falls inside the lab_static band below.
+haproxy_private_ip:  172.16.0.50
+
+# --- Cloud-config IPAM bands (consumed by cf-cloud-config.yml + cc-reserved.yml)
+# Must lie inside internal_cidr. Reserve the gateway + infra band at the bottom
+# and a router/infra band at the top of the .0.x octet; the Director (.10) and
+# haproxy (.50) sit in the reserved/static slots, CF VMs take the dynamic
+# middle. The /18 leaves 172.16.1.0-172.16.63.255 free for future expansion.
+lab_reserved:
+- 172.16.0.1-172.16.0.19
+- 172.16.0.200-172.16.0.254
+lab_static:
+- 172.16.0.50
