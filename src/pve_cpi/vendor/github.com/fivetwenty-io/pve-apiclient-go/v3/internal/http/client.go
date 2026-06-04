@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -117,12 +118,47 @@ func NewClient(options *Options) (*Client, error) {
 }
 
 func createHTTPTransport(options *Options) *http.Transport {
-	return &http.Transport{
+	// Resolve per-host idle conn cap: explicit knob when set, else match KeepAlive
+	// (preserves current default behaviour when knob is zero).
+	maxIdlePerHost := options.KeepAlive
+	if options.MaxIdleConnsPerHost > 0 {
+		maxIdlePerHost = options.MaxIdleConnsPerHost
+	}
+
+	// Resolve idle-connection timeout: explicit knob when set, else LongTimeout()
+	// (preserves current default behaviour when knob is zero).
+	idleConnTimeout := constants.LongTimeout()
+	if options.IdleConnTimeoutSec > 0 {
+		idleConnTimeout = time.Duration(options.IdleConnTimeoutSec) * time.Second
+	}
+
+	t := &http.Transport{
 		MaxIdleConns:        options.KeepAlive,
-		MaxIdleConnsPerHost: options.KeepAlive,
-		IdleConnTimeout:     constants.LongTimeout(),
+		MaxIdleConnsPerHost: maxIdlePerHost,
+		IdleConnTimeout:     idleConnTimeout,
 		DisableCompression:  false,
 	}
+
+	// TLS handshake timeout: only set when the knob is non-zero; leaving it zero
+	// preserves Go's default (no explicit handshake deadline).
+	if options.TLSHandshakeTimeoutSec > 0 {
+		t.TLSHandshakeTimeout = time.Duration(options.TLSHandshakeTimeoutSec) * time.Second
+	}
+
+	// Dial context: set only when at least one dial-level knob is non-zero so that
+	// the zero-knob path leaves DialContext nil (byte-identical to the prior transport).
+	if options.DialTimeoutSec > 0 || options.TCPKeepAliveSec > 0 {
+		dialer := &net.Dialer{}
+		if options.DialTimeoutSec > 0 {
+			dialer.Timeout = time.Duration(options.DialTimeoutSec) * time.Second
+		}
+		if options.TCPKeepAliveSec > 0 {
+			dialer.KeepAlive = time.Duration(options.TCPKeepAliveSec) * time.Second
+		}
+		t.DialContext = dialer.DialContext
+	}
+
+	return t
 }
 
 func configureTLS(options *Options) (*tls.Config, error) {

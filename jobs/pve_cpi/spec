@@ -325,6 +325,45 @@ properties:
       connection pool before being closed. 0 (default) applies the built-in 90s
       default. Valid range when set: 1-3600 seconds.
     default: 0
+  pve.api_dial_timeout_sec:
+    description: |
+      Optional. Bounds the TCP dial step of every PVE API HTTP request.
+      0 (default) leaves the transport at the SDK default (no explicit dial
+      timeout). When set, the TCP dial is cancelled if it has not completed
+      within this many seconds. Useful on high-latency or flaky networks to
+      surface connection failures faster. Must be >= 0.
+    default: 0
+  pve.api_tls_handshake_timeout_sec:
+    description: |
+      Optional. Bounds the TLS handshake step of every PVE API HTTPS request.
+      0 (default) leaves the transport at the SDK default (no explicit handshake
+      timeout). When set, the handshake is cancelled if it has not completed
+      within this many seconds. Must be >= 0.
+    default: 0
+  pve.api_max_idle_conns_per_host:
+    description: |
+      Optional. Maximum number of idle (keep-alive) connections retained in the
+      transport pool per PVE host. 0 (default) falls back to the SDK default
+      (KeepAlive value). Higher values reduce connection-setup latency under
+      burst load; lower values conserve file descriptors on constrained CPI
+      hosts. Must be >= 0.
+    default: 0
+  pve.api_idle_conn_timeout_sec:
+    description: |
+      Optional. How long an idle keep-alive PVE API connection remains in the
+      transport pool before being closed, in seconds. 0 (default) leaves the
+      transport at the SDK default. Shorter values free sockets sooner on
+      clusters with infrequent CPI activity; longer values retain warmed
+      connections across calls. Must be >= 0.
+    default: 0
+  pve.api_tcp_keepalive_sec:
+    description: |
+      Optional. TCP keep-alive probe interval for PVE API connections, in
+      seconds. 0 (default) leaves the transport at the Go default. A positive
+      value enables periodic TCP keep-alive probes at this interval, which helps
+      detect silently-dropped connections on stateful firewalls between the CPI
+      host and the PVE API endpoint. Must be >= 0.
+    default: 0
   registry.allowed_hosts:
     description: |
       Optional. If non-empty, restricts the registry HTTP client to only

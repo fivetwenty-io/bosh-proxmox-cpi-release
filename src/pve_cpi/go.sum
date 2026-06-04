@@ -48,8 +48,8 @@ github.com/docker/docker-credential-helpers v0.9.3 h1:gAm/VtF9wgqJMoxzT3Gj5p4AqI
 github.com/docker/docker-credential-helpers v0.9.3/go.mod h1:x+4Gbw9aGmChi3qTLZj8Dfn0TD20M/fuWy0E5+WDeCo=
 github.com/elliotwutingfeng/asciiset v0.0.0-20260129054604-cfde2086bc57 h1:x5yxNrq8XffV/OoNUeFPM6hxHVi5OTspSTBxr/9pemg=
 github.com/elliotwutingfeng/asciiset v0.0.0-20260129054604-cfde2086bc57/go.mod h1:GLo/8fDswSAniFG+BFIaiSPcK610jyzgEhWYPQwuQdw=
-github.com/fivetwenty-io/pve-apiclient-go/v3 v3.2.3 h1:V1vPMdu/RzrC9LG33h+0zE3WlWbfrv6ak55co5aA4fY=
-github.com/fivetwenty-io/pve-apiclient-go/v3 v3.2.3/go.mod h1:kI9uD3tPLg2Q/KhsYEr5y4E1MV+xRhmTGG3XaxVCwZA=
+github.com/fivetwenty-io/pve-apiclient-go/v3 v3.2.7 h1:ahlWRuamC5TkWnVgKw9geEcCMAf8B0XsygJrGf2eMso=
+github.com/fivetwenty-io/pve-apiclient-go/v3 v3.2.7/go.mod h1:kI9uD3tPLg2Q/KhsYEr5y4E1MV+xRhmTGG3XaxVCwZA=
 github.com/go-test/deep v1.1.1 h1:0r/53hagsehfO4bzD2Pgr/+RgHqhmf+k1Bpse2cTu1U=
 github.com/go-test/deep v1.1.1/go.mod h1:5C2ZWiW0ErCdrYzpqxLbTX7MG14M9iiw8DgHncVwcsE=
 github.com/google/go-cmp v0.7.0 h1:wk8382ETsv4JYUZwIsn6YpYiWiBsYLSJiTsyBybVuN8=

@@ -67,6 +67,14 @@ type Options struct {
 	Timeout   time.Duration
 	KeepAlive int
 
+	// Transport tuning — all fields default to zero, which preserves the existing
+	// transport behaviour (see createHTTPTransport for the zero-knob contract).
+	DialTimeoutSec         int // TCP dial timeout seconds; 0 = no explicit timeout (Go default)
+	TLSHandshakeTimeoutSec int // TLS handshake timeout seconds; 0 = no explicit timeout (Go default)
+	MaxIdleConnsPerHost    int // max idle conns per host; 0 = falls back to KeepAlive
+	IdleConnTimeoutSec     int // idle connection timeout seconds; 0 = constants.LongTimeout()
+	TCPKeepAliveSec        int // TCP keepalive probe interval seconds; 0 = Go default
+
 	// Caching configuration
 	CacheConfig *cache.Config
 

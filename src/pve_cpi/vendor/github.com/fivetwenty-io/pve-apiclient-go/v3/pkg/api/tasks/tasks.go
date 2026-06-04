@@ -1,12 +1,3 @@
-// LOCAL VENDOR MODIFICATION (bosh-pve-cpi §7.28): this file carries additions
-// not yet present upstream — the Status.Progress field and the Service.GetStatus
-// single-shot status read. They back progress-aware adaptive task polling.
-//
-// WARNING: `go mod vendor` will OVERWRITE this file and silently drop those
-// additions, breaking the build (internal/pve depends on GetStatus). Until the
-// changes are upstreamed into pve-apiclient-go, re-apply them after any vendor
-// refresh. internal/pve/task.go holds a compile-time assertion that fails with a
-// pointer to this header if the method goes missing.
 package tasks
 
 import (
@@ -78,27 +69,6 @@ type service struct {
 //nolint:ireturn // Factory pattern - returns interface to encapsulate implementation and enable mocking
 func New(c client.Client) Service { return &service{c: c} }
 
-// Wait polls a task until completion or timeout.
-func (s *service) Wait(ctx context.Context, node, upid string, opts *WaitOptions) (*Status, error) {
-	config := s.parseWaitOptions(opts)
-
-	ctx, cancel := context.WithTimeout(ctx, time.Duration(config.timeoutSeconds)*time.Second)
-	defer cancel()
-
-	path := fmt.Sprintf("/nodes/%s/tasks/%s/status", node, upid)
-	poller := &taskPoller{
-		service:        s,
-		path:           path,
-		upid:           upid,
-		intervalMillis: config.intervalMillis,
-		backoff:        config.backoff,
-		maxInterval:    config.maxInterval,
-		jitterPct:      config.jitterPct,
-	}
-
-	return poller.poll(ctx)
-}
-
 // GetStatus performs a single task-status read without polling. See the Service
 // interface doc. The returned Status carries the live Status/ExitStatus/Progress
 // fields; a still-running task is returned with a nil error (not errTaskInProgress).
@@ -136,6 +106,27 @@ func parseProgress(v interface{}) float64 {
 	default:
 		return 0
 	}
+}
+
+// Wait polls a task until completion or timeout.
+func (s *service) Wait(ctx context.Context, node, upid string, opts *WaitOptions) (*Status, error) {
+	config := s.parseWaitOptions(opts)
+
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(config.timeoutSeconds)*time.Second)
+	defer cancel()
+
+	path := fmt.Sprintf("/nodes/%s/tasks/%s/status", node, upid)
+	poller := &taskPoller{
+		service:        s,
+		path:           path,
+		upid:           upid,
+		intervalMillis: config.intervalMillis,
+		backoff:        config.backoff,
+		maxInterval:    config.maxInterval,
+		jitterPct:      config.jitterPct,
+	}
+
+	return poller.poll(ctx)
 }
 
 type waitConfig struct {

@@ -50,7 +50,7 @@ GC — now recorded as "Limits" under each feature. Second, the wider reference 
 up **ten genuinely new gaps (§7.26–§7.35)**, none of which appeared in the prior report; they
 are extensions of the shipped work (enforce the invariants §7.9 records, monitor the resizes
 §7.24 sizes, make the polling §7.25 fixed adaptive, and so on). The first four (§7.26–§7.29)
-have since been **shipped**; §7.30–§7.35 remain **open**.
+have since been **shipped**; §7.30 has also shipped; §7.31–§7.35 remain **open**.
 The §3 matrix gained one correction (Azure `update_disk` is a full method, now `Y`), and the
 §6 standout list was corrected against source in several places — most notably that
 process-level panic recovery (§7.4) is *not* unique to OpenStack-Go (Google has it too). The
@@ -1182,7 +1182,7 @@ curves are pure and deterministic except for seeded jitter.
 
 These ten did not appear in the prior report. They surfaced from the deeper reference
 re-read and the source-level verification of the shipped features above. The first four
-(§7.26–§7.29) have since been **shipped**; §7.30–§7.35 remain **open**. Each follows the same
+(§7.26–§7.30) have since been **shipped**; §7.31–§7.35 remain **open**. Each follows the same
 additive-optional convention the shipped work established: validate only when set, omit from
 VM config when empty, zero behavior change for existing manifests. They are ordered roughly by
 effort-to-value, not severity.
@@ -1268,17 +1268,21 @@ never blocks provisioning when it cannot positively confirm tampering. The comma
 argument vector (no shell), and the assertion is skipped when the digest is unset, so behavior
 is unchanged for existing deployments.
 
-#### 7.30 OPEN — PVE API client connection-pool / keepalive tuning
+#### 7.30 DONE — PVE API client connection-pool / keepalive tuning
 
 *Reference: OpenStack-Go.* §11 flags the placement fan-out (the scorer plus the IP scan,
 which run on *every* `create_vm`) as unmeasured and interacting with §7.16 pushback. The
-SDK's `http.Transport` tuning is currently unspecified, so under a parallel deploy each scan
-call may be a fresh TLS handshake against pmxcfs, amplifying both load and latency — and
-because the §7.16 in-flight cap gates at placement-decision time, the scan itself runs
-*outside* the cap. **Build:** audit and explicitly set `http.Transport`
-(`MaxIdleConnsPerHost ≥ node count`, `IdleConnTimeout`, TCP keepalive, a bounded dial
-timeout) and surface it as optional config. A named resilience lever the report previously
-omitted; pairs with §7.28 as the two pre-timing-pass mitigations for the scale risk.
+SDK's `http.Transport` tuning was previously unspecified, so under a parallel deploy each
+scan call could be a fresh TLS handshake, amplifying both load and latency. Five transport
+fields are now configurable via CPI config and wired into the SDK `Options` struct at
+`NewClient` time: `pve_api_dial_timeout_sec` (TCP dial timeout), `pve_api_tls_handshake_timeout_sec`
+(TLS handshake timeout), `pve_api_max_idle_conns_per_host` (idle connection pool cap),
+`pve_api_idle_conn_timeout_sec` (idle connection eviction), and `pve_api_tcp_keepalive_sec`
+(TCP keepalive probe interval). All five default to 0, which is the SDK no-op sentinel —
+behavior is byte-identical to prior releases when unset. Requires upstream SDK v3.2.7, which
+adds the five `Options` fields. Pairs with §7.28 (adaptive task polling) as the two
+pre-timing-pass scale mitigations. Validated ≥ 0 at config load; negative values are
+rejected. Spec properties added under `pve.api_*`; ERB emits each key only when non-zero.
 
 #### 7.31 OPEN — Post-selection fallback placement on transient create/start failure
 

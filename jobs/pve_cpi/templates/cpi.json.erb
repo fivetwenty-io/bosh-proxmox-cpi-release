@@ -57,6 +57,22 @@
     config[json_key] = v unless v == 0
   end
 
+  # Emit PVE API transport tuning knobs only when the operator sets them.
+  # When absent or 0 (the default), the key is omitted so the Go config
+  # zero-value (0) reaches NewClient unchanged and the SDK transport default
+  # applies (byte-identical to prior releases). Mirrors the stemcell-fetch
+  # timeout omit-when-zero pattern.
+  {
+    "pve_api_dial_timeout_sec"         => "pve.api_dial_timeout_sec",
+    "pve_api_tls_handshake_timeout_sec" => "pve.api_tls_handshake_timeout_sec",
+    "pve_api_max_idle_conns_per_host"  => "pve.api_max_idle_conns_per_host",
+    "pve_api_idle_conn_timeout_sec"    => "pve.api_idle_conn_timeout_sec",
+    "pve_api_tcp_keepalive_sec"        => "pve.api_tcp_keepalive_sec",
+  }.each do |json_key, prop|
+    v = p(prop, 0).to_i
+    config[json_key] = v unless v == 0
+  end
+
   # Emit password / api_token only when non-empty. The Go config validator
   # rejects "both set" or "neither set" — this template never strips a value
   # the operator supplied. If both p() calls return non-empty, both keys

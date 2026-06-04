@@ -490,6 +490,42 @@ type CPIConfig struct {
 	// omit from ERB when zero.
 	MaxInflightPerNode int `json:"max_inflight_per_node,omitempty"`
 
+	// PVEDialTimeoutSec bounds the TCP dial step of every PVE API HTTP request.
+	// 0 (default) leaves the transport at the SDK default (no explicit dial
+	// timeout). When > 0, the TCP dial is cancelled if it has not completed within
+	// this many seconds. Valid range: >= 0; negative values are rejected.
+	// validate-only-when-set; omit from ERB when zero.
+	PVEDialTimeoutSec int `json:"pve_api_dial_timeout_sec,omitempty"`
+
+	// PVETLSHandshakeTimeoutSec bounds the TLS handshake step of every PVE API
+	// HTTPS request. 0 (default) leaves the transport at the SDK default (no
+	// explicit handshake timeout). When > 0, the handshake is cancelled if it
+	// has not completed within this many seconds. Useful on high-latency paths.
+	// validate-only-when-set; omit from ERB when zero.
+	PVETLSHandshakeTimeoutSec int `json:"pve_api_tls_handshake_timeout_sec,omitempty"`
+
+	// PVEMaxIdleConnsPerHost sets the maximum number of idle (keep-alive)
+	// connections per PVE host in the transport pool. 0 (default) falls back to
+	// the SDK default (KeepAlive value). Values > 0 cap the pool. Higher values
+	// reduce connection-setup latency under burst load; lower values conserve
+	// file descriptors on constrained CPI hosts. validate-only-when-set;
+	// omit from ERB when zero.
+	PVEMaxIdleConnsPerHost int `json:"pve_api_max_idle_conns_per_host,omitempty"`
+
+	// PVEIdleConnTimeoutSec bounds how long an idle keep-alive connection stays
+	// in the transport pool before being closed. 0 (default) leaves the transport
+	// at the SDK default. Shorter values free sockets sooner on clusters with
+	// infrequent CPI activity; longer values retain warmed connections across
+	// calls. validate-only-when-set; omit from ERB when zero.
+	PVEIdleConnTimeoutSec int `json:"pve_api_idle_conn_timeout_sec,omitempty"`
+
+	// PVETCPKeepAliveSec sets the TCP keep-alive probe interval for PVE API
+	// connections. 0 (default) leaves the transport at the Go default. A positive
+	// value enables periodic TCP keep-alive probes at this interval in seconds,
+	// which helps detect silently-dropped connections on stateful firewalls between
+	// the CPI host and the PVE API. validate-only-when-set; omit from ERB when zero.
+	PVETCPKeepAliveSec int `json:"pve_api_tcp_keepalive_sec,omitempty"`
+
 	// StrictConfigValidation enables fail-fast config validation. When nil or
 	// *false (the default), unknown top-level keys produce a Warn log and
 	// inconsistent cross-field combinations are tolerated — byte-identical to
@@ -2079,6 +2115,30 @@ func (c *CPIConfig) validateRanges(errs *[]string) {
 	if c.MaxInflightPerNode < 0 {
 		*errs = append(*errs, fmt.Sprintf(
 			"max_inflight_per_node must be >= 0, got %d", c.MaxInflightPerNode))
+	}
+
+	// PVE API transport tuning: 0 = SDK default (byte-identical). Negative values
+	// are never valid (they would pass nonsensical negative durations to the
+	// transport); reject them at config load time.
+	if c.PVEDialTimeoutSec < 0 {
+		*errs = append(*errs, fmt.Sprintf(
+			"pve_api_dial_timeout_sec must be >= 0, got %d", c.PVEDialTimeoutSec))
+	}
+	if c.PVETLSHandshakeTimeoutSec < 0 {
+		*errs = append(*errs, fmt.Sprintf(
+			"pve_api_tls_handshake_timeout_sec must be >= 0, got %d", c.PVETLSHandshakeTimeoutSec))
+	}
+	if c.PVEMaxIdleConnsPerHost < 0 {
+		*errs = append(*errs, fmt.Sprintf(
+			"pve_api_max_idle_conns_per_host must be >= 0, got %d", c.PVEMaxIdleConnsPerHost))
+	}
+	if c.PVEIdleConnTimeoutSec < 0 {
+		*errs = append(*errs, fmt.Sprintf(
+			"pve_api_idle_conn_timeout_sec must be >= 0, got %d", c.PVEIdleConnTimeoutSec))
+	}
+	if c.PVETCPKeepAliveSec < 0 {
+		*errs = append(*errs, fmt.Sprintf(
+			"pve_api_tcp_keepalive_sec must be >= 0, got %d", c.PVETCPKeepAliveSec))
 	}
 }
 

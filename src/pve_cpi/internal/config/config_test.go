@@ -5111,3 +5111,133 @@ func TestApplyDefaults_AutoNotDefault(t *testing.T) {
 		t.Errorf("blank AgentMode: ApplyDefaults must set cloudinit, got %q", cfg.AgentMode)
 	}
 }
+
+// --------------------------------------------------------------------------
+// §7.30 PVE API transport tuning — round-trip and validation tests.
+// --------------------------------------------------------------------------
+
+// TestLoad_PVEAPITransportTuning_RoundTrip verifies all 5 transport fields
+// decode correctly from JSON and land in the struct with the expected values.
+func TestLoad_PVEAPITransportTuning_RoundTrip(t *testing.T) {
+	t.Parallel()
+	cfg, err := mustLoad(t, `{
+		"host": "h", "user": "u", "password": "p",
+		"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
+		"pve_api_dial_timeout_sec": 15,
+		"pve_api_tls_handshake_timeout_sec": 20,
+		"pve_api_max_idle_conns_per_host": 50,
+		"pve_api_idle_conn_timeout_sec": 120,
+		"pve_api_tcp_keepalive_sec": 30
+	}`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.PVEDialTimeoutSec != 15 {
+		t.Errorf("PVEDialTimeoutSec: got %d, want 15", cfg.PVEDialTimeoutSec)
+	}
+	if cfg.PVETLSHandshakeTimeoutSec != 20 {
+		t.Errorf("PVETLSHandshakeTimeoutSec: got %d, want 20", cfg.PVETLSHandshakeTimeoutSec)
+	}
+	if cfg.PVEMaxIdleConnsPerHost != 50 {
+		t.Errorf("PVEMaxIdleConnsPerHost: got %d, want 50", cfg.PVEMaxIdleConnsPerHost)
+	}
+	if cfg.PVEIdleConnTimeoutSec != 120 {
+		t.Errorf("PVEIdleConnTimeoutSec: got %d, want 120", cfg.PVEIdleConnTimeoutSec)
+	}
+	if cfg.PVETCPKeepAliveSec != 30 {
+		t.Errorf("PVETCPKeepAliveSec: got %d, want 30", cfg.PVETCPKeepAliveSec)
+	}
+}
+
+// TestLoad_PVEAPITransportTuning_ZeroByteIdentical verifies that absent fields
+// produce zero values — byte-identical behavior to prior releases (SDK no-op).
+func TestLoad_PVEAPITransportTuning_ZeroByteIdentical(t *testing.T) {
+	t.Parallel()
+	cfg, err := mustLoad(t, `{
+		"host": "h", "user": "u", "password": "p",
+		"vm_storage": "s", "disk_storage": "s", "network_bridge": "br"
+	}`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.PVEDialTimeoutSec != 0 {
+		t.Errorf("PVEDialTimeoutSec: got %d, want 0 (byte-identical)", cfg.PVEDialTimeoutSec)
+	}
+	if cfg.PVETLSHandshakeTimeoutSec != 0 {
+		t.Errorf("PVETLSHandshakeTimeoutSec: got %d, want 0 (byte-identical)", cfg.PVETLSHandshakeTimeoutSec)
+	}
+	if cfg.PVEMaxIdleConnsPerHost != 0 {
+		t.Errorf("PVEMaxIdleConnsPerHost: got %d, want 0 (byte-identical)", cfg.PVEMaxIdleConnsPerHost)
+	}
+	if cfg.PVEIdleConnTimeoutSec != 0 {
+		t.Errorf("PVEIdleConnTimeoutSec: got %d, want 0 (byte-identical)", cfg.PVEIdleConnTimeoutSec)
+	}
+	if cfg.PVETCPKeepAliveSec != 0 {
+		t.Errorf("PVETCPKeepAliveSec: got %d, want 0 (byte-identical)", cfg.PVETCPKeepAliveSec)
+	}
+}
+
+// TestValidate_PVEAPITransportTuning_NegativeRejected verifies that negative
+// values for any of the 5 transport fields are rejected at Validate time.
+func TestValidate_PVEAPITransportTuning_NegativeRejected(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name    string
+		json    string
+		wantMsg string
+	}{
+		{
+			name:    "pve_api_dial_timeout_sec negative",
+			json:    `{"host":"h","user":"u","password":"p","vm_storage":"s","disk_storage":"s","network_bridge":"br","pve_api_dial_timeout_sec":-1}`,
+			wantMsg: "pve_api_dial_timeout_sec must be >= 0",
+		},
+		{
+			name:    "pve_api_tls_handshake_timeout_sec negative",
+			json:    `{"host":"h","user":"u","password":"p","vm_storage":"s","disk_storage":"s","network_bridge":"br","pve_api_tls_handshake_timeout_sec":-1}`,
+			wantMsg: "pve_api_tls_handshake_timeout_sec must be >= 0",
+		},
+		{
+			name:    "pve_api_max_idle_conns_per_host negative",
+			json:    `{"host":"h","user":"u","password":"p","vm_storage":"s","disk_storage":"s","network_bridge":"br","pve_api_max_idle_conns_per_host":-1}`,
+			wantMsg: "pve_api_max_idle_conns_per_host must be >= 0",
+		},
+		{
+			name:    "pve_api_idle_conn_timeout_sec negative",
+			json:    `{"host":"h","user":"u","password":"p","vm_storage":"s","disk_storage":"s","network_bridge":"br","pve_api_idle_conn_timeout_sec":-1}`,
+			wantMsg: "pve_api_idle_conn_timeout_sec must be >= 0",
+		},
+		{
+			name:    "pve_api_tcp_keepalive_sec negative",
+			json:    `{"host":"h","user":"u","password":"p","vm_storage":"s","disk_storage":"s","network_bridge":"br","pve_api_tcp_keepalive_sec":-1}`,
+			wantMsg: "pve_api_tcp_keepalive_sec must be >= 0",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := mustLoad(t, tc.json)
+			assertCloudError(t, err, tc.wantMsg)
+		})
+	}
+}
+
+// TestValidate_PVEAPITransportTuning_PositiveValid verifies that positive
+// values for all 5 fields pass validation.
+func TestValidate_PVEAPITransportTuning_PositiveValid(t *testing.T) {
+	t.Parallel()
+	cfg, err := mustLoad(t, `{
+		"host": "h", "user": "u", "password": "p",
+		"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
+		"pve_api_dial_timeout_sec": 5,
+		"pve_api_tls_handshake_timeout_sec": 10,
+		"pve_api_max_idle_conns_per_host": 100,
+		"pve_api_idle_conn_timeout_sec": 60,
+		"pve_api_tcp_keepalive_sec": 45
+	}`)
+	if err != nil {
+		t.Fatalf("positive values should pass validation, got: %v", err)
+	}
+	if cfg.PVEDialTimeoutSec != 5 {
+		t.Errorf("PVEDialTimeoutSec: got %d, want 5", cfg.PVEDialTimeoutSec)
+	}
+}

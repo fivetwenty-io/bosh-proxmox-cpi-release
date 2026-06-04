@@ -1171,7 +1171,7 @@ type ListAcmeMetaResponse struct {
 	// CaaIdentities Hostnames referring to the ACME servers.
 	CaaIdentities []string `json:"caaIdentities,omitempty"`
 	// ExternalAccountRequired EAB Required
-	ExternalAccountRequired *bool `json:"externalAccountRequired,omitempty"`
+	ExternalAccountRequired *client.PVEBool `json:"externalAccountRequired,omitempty"`
 	// TermsOfService ACME TermsOfService URL.
 	TermsOfService *string `json:"termsOfService,omitempty"`
 	// Website URL to more information about the ACME server.
@@ -1339,7 +1339,7 @@ type GetAcmePluginsResponse struct {
 	// Digest Prevent changes if current configuration file has a different digest. This can be used to prevent concurrent modifications.
 	Digest *string `json:"digest,omitempty"`
 	// Disable Flag to disable the config.
-	Disable *bool `json:"disable,omitempty"`
+	Disable *client.PVEBool `json:"disable,omitempty"`
 	// Nodes List of cluster node names.
 	Nodes *string `json:"nodes,omitempty"`
 	// Plugin Unique identifier for ACME plugin instance.
@@ -1702,7 +1702,7 @@ func (s *service) DeleteBackup(ctx context.Context, id string) error {
 // GetBackupResponse mirrors the shape returned by GET /cluster/backup/{id}.
 type GetBackupResponse struct {
 	// All Backup all known guest systems on this host.
-	All *bool `json:"all,omitempty"`
+	All *client.PVEBool `json:"all,omitempty"`
 	// Bwlimit Limit I/O bandwidth (in KiB/s).
 	Bwlimit *int64 `json:"bwlimit,omitempty"`
 	// Comment Description for the Job.
@@ -1712,7 +1712,7 @@ type GetBackupResponse struct {
 	// Dumpdir Store resulting files to specified directory.
 	Dumpdir *string `json:"dumpdir,omitempty"`
 	// Enabled Enable or disable the job.
-	Enabled *bool `json:"enabled,omitempty"`
+	Enabled *client.PVEBool `json:"enabled,omitempty"`
 	// Exclude Exclude specified guest systems (assumes --all)
 	Exclude *string `json:"exclude,omitempty"`
 	// ExcludePath Exclude certain files/directories (shell globs). Paths starting with '/' are anchored to the container's root, other paths match relative to each subdirectory.
@@ -1748,23 +1748,23 @@ type GetBackupResponse struct {
 	// Pool Backup all known guest systems included in the specified pool.
 	Pool *string `json:"pool,omitempty"`
 	// Protected If true, mark backup(s) as protected.
-	Protected *bool `json:"protected,omitempty"`
+	Protected *client.PVEBool `json:"protected,omitempty"`
 	// PruneBackups Use these retention options instead of those from the storage configuration.
 	PruneBackups json.RawMessage `json:"prune-backups,omitempty"`
 	// Quiet Be quiet.
-	Quiet *bool `json:"quiet,omitempty"`
+	Quiet *client.PVEBool `json:"quiet,omitempty"`
 	// Remove Prune older backups according to 'prune-backups'.
-	Remove *bool `json:"remove,omitempty"`
+	Remove *client.PVEBool `json:"remove,omitempty"`
 	// RepeatMissed If true, the job will be run as soon as possible if it was missed while the scheduler was not running.
-	RepeatMissed *bool `json:"repeat-missed,omitempty"`
+	RepeatMissed *client.PVEBool `json:"repeat-missed,omitempty"`
 	// Schedule Backup schedule. The format is a subset of `systemd` calendar events.
 	Schedule *string `json:"schedule,omitempty"`
 	// Script Use specified hook script.
 	Script *string `json:"script,omitempty"`
 	// Stdexcludes Exclude temporary files and logs.
-	Stdexcludes *bool `json:"stdexcludes,omitempty"`
+	Stdexcludes *client.PVEBool `json:"stdexcludes,omitempty"`
 	// Stop Stop running backup jobs on this host.
-	Stop *bool `json:"stop,omitempty"`
+	Stop *client.PVEBool `json:"stop,omitempty"`
 	// Stopwait Maximal time to wait until a guest system is stopped (minutes).
 	Stopwait *int64 `json:"stopwait,omitempty"`
 	// Storage Store resulting file to this storage.
@@ -3936,7 +3936,7 @@ func (s *service) ListFirewallMacros(ctx context.Context) (*ListFirewallMacrosRe
 // ListFirewallOptionsResponse mirrors the shape returned by GET /cluster/firewall/options.
 type ListFirewallOptionsResponse struct {
 	// Ebtables Enable ebtables rules cluster wide.
-	Ebtables *bool `json:"ebtables,omitempty"`
+	Ebtables *client.PVEBool `json:"ebtables,omitempty"`
 	// Enable Enable or disable the firewall cluster wide.
 	Enable *int64 `json:"enable,omitempty"`
 	// LogRatelimit Log ratelimiting settings
@@ -4672,13 +4672,13 @@ func (s *service) DeleteHaResources(ctx context.Context, sid string, params *Del
 // GetHaResourcesResponse mirrors the shape returned by GET /cluster/ha/resources/{sid}.
 type GetHaResourcesResponse struct {
 	// AutoRebalance HA resource may be migrated during automatic rebalancing.
-	AutoRebalance *bool `json:"auto-rebalance,omitempty"`
+	AutoRebalance *client.PVEBool `json:"auto-rebalance,omitempty"`
 	// Comment Description.
 	Comment *string `json:"comment,omitempty"`
 	// Digest Can be used to prevent concurrent modifications.
 	Digest string `json:"digest"`
 	// Failback The HA resource is automatically migrated to the node with the highest priority according to their node affinity rule, if a node with a higher priority than the current node comes online.
-	Failback *bool `json:"failback,omitempty"`
+	Failback *client.PVEBool `json:"failback,omitempty"`
 	// Group The HA group identifier.
 	Group *string `json:"group,omitempty"`
 	// MaxRelocate Maximal number of service relocate tries when a service fails to start.
@@ -6672,7 +6672,7 @@ type GetNotificationsEndpointsGotifyResponse struct {
 	// Digest Prevent changes if current configuration file has a different digest. This can be used to prevent concurrent modifications.
 	Digest *string `json:"digest,omitempty"`
 	// Disable Disable this target
-	Disable *bool `json:"disable,omitempty"`
+	Disable *client.PVEBool `json:"disable,omitempty"`
 	// Name The name of the endpoint.
 	Name string `json:"name"`
 	// Server Server URL
@@ -6858,7 +6858,7 @@ type GetNotificationsEndpointsSendmailResponse struct {
 	// Digest Prevent changes if current configuration file has a different digest. This can be used to prevent concurrent modifications.
 	Digest *string `json:"digest,omitempty"`
 	// Disable Disable this target
-	Disable *bool `json:"disable,omitempty"`
+	Disable *client.PVEBool `json:"disable,omitempty"`
 	// FromAddress `From` address for the mail
 	FromAddress *string `json:"from-address,omitempty"`
 	// Mailto List of email recipients
@@ -7062,7 +7062,7 @@ type GetNotificationsEndpointsSmtpResponse struct {
 	// Digest Prevent changes if current configuration file has a different digest. This can be used to prevent concurrent modifications.
 	Digest *string `json:"digest,omitempty"`
 	// Disable Disable this target
-	Disable *bool `json:"disable,omitempty"`
+	Disable *client.PVEBool `json:"disable,omitempty"`
 	// FromAddress `From` address for the mail
 	FromAddress string `json:"from-address"`
 	// Mailto List of email recipients
@@ -7276,7 +7276,7 @@ type GetNotificationsEndpointsWebhookResponse struct {
 	// Digest Prevent changes if current configuration file has a different digest. This can be used to prevent concurrent modifications.
 	Digest *string `json:"digest,omitempty"`
 	// Disable Disable this target
-	Disable *bool `json:"disable,omitempty"`
+	Disable *client.PVEBool `json:"disable,omitempty"`
 	// Header HTTP headers to set. These have to be formatted as a property string in the format name=<name>,value=<base64 of value>
 	Header []string `json:"header,omitempty"`
 	// Method HTTP method
@@ -7542,9 +7542,9 @@ type GetNotificationsMatchersResponse struct {
 	// Digest Prevent changes if current configuration file has a different digest. This can be used to prevent concurrent modifications.
 	Digest *string `json:"digest,omitempty"`
 	// Disable Disable this matcher
-	Disable *bool `json:"disable,omitempty"`
+	Disable *client.PVEBool `json:"disable,omitempty"`
 	// InvertMatch Invert match of the whole matcher
-	InvertMatch *bool `json:"invert-match,omitempty"`
+	InvertMatch *client.PVEBool `json:"invert-match,omitempty"`
 	// MatchCalendar Match notification timestamp
 	MatchCalendar []string `json:"match-calendar,omitempty"`
 	// MatchField Metadata fields to match (regex or exact match). Must be in the form (regex|exact):<field>=<value>
@@ -8000,7 +8000,7 @@ type GetQemuCustomCpuModelsResponse struct {
 	// GuestPhysBits Number of physical address bits available to the guest.
 	GuestPhysBits *int64 `json:"guest-phys-bits,omitempty"`
 	// Hidden Do not identify as a KVM virtual machine. Only affects vCPUs with x86-64 architecture.
-	Hidden *bool `json:"hidden,omitempty"`
+	Hidden *client.PVEBool `json:"hidden,omitempty"`
 	// HvVendorId The Hyper-V vendor ID. Some drivers or programs inside Windows guests need a specific ID.
 	HvVendorId *string `json:"hv-vendor-id,omitempty"`
 	// Level Maximum input value for the basic CPUID leaves the guest can query - that is the vendor (leaf 0), family/model/stepping and feature bits (leaf 1), cache and topology info (leaves 4 and B), and so on. Higher-numbered leaves are hidden. Setting '30' is a common workaround for Hyper-V boot failures on Windows guests running on recent Intel hosts. Only applies when the vCPU architecture is x86_64.
@@ -8216,7 +8216,7 @@ type GetReplicationResponse struct {
 	// Digest Prevent changes if current configuration file has a different digest. This can be used to prevent concurrent modifications.
 	Digest *string `json:"digest,omitempty"`
 	// Disable Flag to disable/deactivate the entry.
-	Disable *bool `json:"disable,omitempty"`
+	Disable *client.PVEBool `json:"disable,omitempty"`
 	// Guest Guest ID.
 	Guest int64 `json:"guest"`
 	// Id Replication Job ID. The ID is composed of a Guest ID and a job number, separated by a hyphen, i.e. '<GUEST>-<JOBNUM>'.
@@ -8224,7 +8224,7 @@ type GetReplicationResponse struct {
 	// Jobnum Unique, sequential ID assigned to each job.
 	Jobnum int64 `json:"jobnum"`
 	// Rate Rate limit in mbps (megabytes per second) as floating point number.
-	Rate *float64 `json:"rate,omitempty"`
+	Rate *client.PVEFloat `json:"rate,omitempty"`
 	// RemoveJob Mark the replication job for removal. The job will remove all local replication snapshots. When set to 'full', it also tries to remove replicated volumes on the target. The job then removes itself from the configuration file.
 	RemoveJob *string `json:"remove_job,omitempty"`
 	// Schedule Storage replication schedule. The format is a subset of `systemd` calendar events.
@@ -9198,11 +9198,11 @@ type GetSdnFabricsFabricResponse struct {
 	// Area OSPF area. Either a IPv4 address or a 32-bit number. Gets validated in rust.
 	Area *string `json:"area,omitempty"`
 	// CsnpInterval The csnp_interval property for Openfabric
-	CsnpInterval *float64 `json:"csnp_interval,omitempty"`
+	CsnpInterval *client.PVEFloat `json:"csnp_interval,omitempty"`
 	// Digest Prevent changes if current configuration file has a different digest. This can be used to prevent concurrent modifications.
 	Digest *string `json:"digest,omitempty"`
 	// HelloInterval The hello_interval property for Openfabric
-	HelloInterval *float64 `json:"hello_interval,omitempty"`
+	HelloInterval *client.PVEFloat `json:"hello_interval,omitempty"`
 	// Id Identifier for SDN fabrics
 	Id string `json:"id"`
 	// Ip6Prefix The IP prefix for Node IPs
@@ -9212,7 +9212,7 @@ type GetSdnFabricsFabricResponse struct {
 	// LockToken the token for unlocking the global SDN configuration
 	LockToken *string `json:"lock-token,omitempty"`
 	// PersistentKeepalive A seconds interval, between 1 and 65535 inclusive, of how often to send an authenticated empty packet to the peer for the purpose of keeping a stateful firewall or NAT mapping valid persistently. For example, if the interface very rarely sends traffic, but it might at anytime receive traffic from another node, and it is behind NAT, the interface might benefit from having a persistent keepalive interval of 25 seconds. If unset or set to 0, it is turned off
-	PersistentKeepalive *float64 `json:"persistent_keepalive,omitempty"`
+	PersistentKeepalive *client.PVEFloat `json:"persistent_keepalive,omitempty"`
 	// Protocol Type of configuration entry in an SDN Fabric section config
 	Protocol     string            `json:"protocol"`
 	Redistribute []json.RawMessage `json:"redistribute"`
@@ -10887,7 +10887,7 @@ func (s *service) ListSdnVnetsFirewall(ctx context.Context, vnet string) (*ListS
 // ListSdnVnetsFirewallOptionsResponse mirrors the shape returned by GET /cluster/sdn/vnets/{vnet}/firewall/options.
 type ListSdnVnetsFirewallOptionsResponse struct {
 	// Enable Enable/disable firewall rules.
-	Enable *bool `json:"enable,omitempty"`
+	Enable *client.PVEBool `json:"enable,omitempty"`
 	// LogLevelForward Log level for forwarded traffic.
 	LogLevelForward *string `json:"log_level_forward,omitempty"`
 	// PolicyForward Forward policy.

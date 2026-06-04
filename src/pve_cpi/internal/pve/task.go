@@ -17,11 +17,10 @@ const (
 	defaultMaxWaitSeconds = 300  // 5 min
 )
 
-// taskStatusGetter mirrors the subset of the vendored tasks.Service that §7.28
-// adaptive polling depends on. GetStatus is a LOCAL addition to the vendored SDK
-// (see the header in vendor/.../pkg/api/tasks/tasks.go). This compile-time
-// assertion makes an accidental `go mod vendor` revert fail HERE, with this
-// comment, rather than at a confusing call site.
+// taskStatusGetter mirrors the subset of the vendored tasks.Service that
+// adaptive polling depends on. GetStatus was upstreamed in v3.2.7. The
+// compile-time assertion below ensures the interface stays satisfied across
+// future vendor refreshes.
 type taskStatusGetter interface {
 	GetStatus(ctx context.Context, node, upid string) (*sdktasks.Status, error)
 }

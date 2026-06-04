@@ -1796,7 +1796,7 @@ func (s *service) ListCapabilitiesQemuMachines(ctx context.Context, node string,
 // ListCapabilitiesQemuMigrationResponse mirrors the shape returned by GET /nodes/{node}/capabilities/qemu/migration.
 type ListCapabilitiesQemuMigrationResponse struct {
 	// HasDbusVmstate Whether the host supports live-migrating additional VM state via the dbus-vmstate helper.
-	HasDbusVmstate bool `json:"has-dbus-vmstate"`
+	HasDbusVmstate client.PVEBool `json:"has-dbus-vmstate"`
 }
 
 // ListCapabilitiesQemuMigration implements Service.ListCapabilitiesQemuMigration. GET /nodes/{node}/capabilities/qemu/migration.
@@ -2022,7 +2022,7 @@ type ListCephCmdSafetyParams struct {
 // ListCephCmdSafetyResponse mirrors the shape returned by GET /nodes/{node}/ceph/cmd-safety.
 type ListCephCmdSafetyResponse struct {
 	// Safe True if Ceph reports the requested action is safe.
-	Safe bool `json:"safe"`
+	Safe client.PVEBool `json:"safe"`
 	// Status Human-readable status message from Ceph (typically the reason an action is not safe); absent when Ceph returned no message.
 	Status *string `json:"status,omitempty"`
 }
@@ -3280,9 +3280,9 @@ type ListCephPoolStatusResponse struct {
 	// CrushRule The rule to use for mapping object placement in the cluster.
 	CrushRule *string `json:"crush_rule,omitempty"`
 	// FastRead Set if the pool uses fast-read for erasure-coded reads.
-	FastRead bool `json:"fast_read"`
+	FastRead client.PVEBool `json:"fast_read"`
 	// Hashpspool Set if the pool hashes pool id into its CRUSH placement-seed.
-	Hashpspool bool `json:"hashpspool"`
+	Hashpspool client.PVEBool `json:"hashpspool"`
 	// Id Numeric pool id assigned by Ceph.
 	Id int64 `json:"id"`
 	// MinSize Minimum number of replicas per object
@@ -3290,15 +3290,15 @@ type ListCephPoolStatusResponse struct {
 	// Name The name of the pool. It must be unique.
 	Name string `json:"name"`
 	// NodeepScrub Set if deep-scrubbing is disabled for this pool.
-	NodeepScrub bool `json:"nodeep-scrub"`
+	NodeepScrub client.PVEBool `json:"nodeep-scrub"`
 	// Nodelete Set if pool delete is blocked.
-	Nodelete bool `json:"nodelete"`
+	Nodelete client.PVEBool `json:"nodelete"`
 	// Nopgchange Set if changing the placement-group count is blocked.
-	Nopgchange bool `json:"nopgchange"`
+	Nopgchange client.PVEBool `json:"nopgchange"`
 	// Noscrub Set if scrubbing is disabled for this pool.
-	Noscrub bool `json:"noscrub"`
+	Noscrub client.PVEBool `json:"noscrub"`
 	// Nosizechange Set if changing the replication size is blocked.
-	Nosizechange bool `json:"nosizechange"`
+	Nosizechange client.PVEBool `json:"nosizechange"`
 	// PgAutoscaleMode The automatic PG scaling mode of the pool.
 	PgAutoscaleMode *string `json:"pg_autoscale_mode,omitempty"`
 	// PgNum Number of placement groups.
@@ -3314,11 +3314,11 @@ type ListCephPoolStatusResponse struct {
 	// TargetSize The estimated target size of the pool for the PG autoscaler.
 	TargetSize *string `json:"target_size,omitempty"`
 	// TargetSizeRatio The estimated target ratio of the pool for the PG autoscaler.
-	TargetSizeRatio *float64 `json:"target_size_ratio,omitempty"`
+	TargetSizeRatio *client.PVEFloat `json:"target_size_ratio,omitempty"`
 	// UseGmtHitset Set if hitsets use GMT timestamps (for cache-tier pools).
-	UseGmtHitset bool `json:"use_gmt_hitset"`
+	UseGmtHitset client.PVEBool `json:"use_gmt_hitset"`
 	// WriteFadviseDontneed Set if the pool sets the FADV_DONTNEED hint on writes.
-	WriteFadviseDontneed bool `json:"write_fadvise_dontneed"`
+	WriteFadviseDontneed client.PVEBool `json:"write_fadvise_dontneed"`
 }
 
 // ListCephPoolStatus implements Service.ListCephPoolStatus. GET /nodes/{node}/ceph/pool/{name}/status.
@@ -4343,7 +4343,7 @@ func (s *service) ListDisksList(ctx context.Context, node string, params *ListDi
 // ListDisksLvmResponse mirrors the shape returned by GET /nodes/{node}/disks/lvm.
 type ListDisksLvmResponse struct {
 	Children []json.RawMessage `json:"children"`
-	Leaf     bool              `json:"leaf"`
+	Leaf     client.PVEBool    `json:"leaf"`
 }
 
 // ListDisksLvm implements Service.ListDisksLvm. GET /nodes/{node}/disks/lvm.
@@ -5132,7 +5132,7 @@ func (s *service) ListFirewallLog(ctx context.Context, node string, params *List
 // ListFirewallOptionsResponse mirrors the shape returned by GET /nodes/{node}/firewall/options.
 type ListFirewallOptionsResponse struct {
 	// Enable Enable host firewall rules.
-	Enable *bool `json:"enable,omitempty"`
+	Enable *client.PVEBool `json:"enable,omitempty"`
 	// LogLevelForward Log level for forwarded traffic.
 	LogLevelForward *string `json:"log_level_forward,omitempty"`
 	// LogLevelIn Log level for incoming traffic.
@@ -5140,11 +5140,11 @@ type ListFirewallOptionsResponse struct {
 	// LogLevelOut Log level for outgoing traffic.
 	LogLevelOut *string `json:"log_level_out,omitempty"`
 	// LogNfConntrack Enable logging of conntrack information.
-	LogNfConntrack *bool `json:"log_nf_conntrack,omitempty"`
+	LogNfConntrack *client.PVEBool `json:"log_nf_conntrack,omitempty"`
 	// Ndp Enable NDP (Neighbor Discovery Protocol).
-	Ndp *bool `json:"ndp,omitempty"`
+	Ndp *client.PVEBool `json:"ndp,omitempty"`
 	// NfConntrackAllowInvalid Allow invalid packets on connection tracking.
-	NfConntrackAllowInvalid *bool `json:"nf_conntrack_allow_invalid,omitempty"`
+	NfConntrackAllowInvalid *client.PVEBool `json:"nf_conntrack_allow_invalid,omitempty"`
 	// NfConntrackHelpers Enable conntrack helpers for specific protocols. Supported protocols: amanda, ftp, irc, netbios-ns, pptp, sane, sip, snmp, tftp
 	NfConntrackHelpers *string `json:"nf_conntrack_helpers,omitempty"`
 	// NfConntrackMax Maximum number of tracked connections.
@@ -5154,11 +5154,11 @@ type ListFirewallOptionsResponse struct {
 	// NfConntrackTcpTimeoutSynRecv Conntrack syn recv timeout.
 	NfConntrackTcpTimeoutSynRecv *int64 `json:"nf_conntrack_tcp_timeout_syn_recv,omitempty"`
 	// Nftables Enable nftables based firewall (tech preview)
-	Nftables *bool `json:"nftables,omitempty"`
+	Nftables *client.PVEBool `json:"nftables,omitempty"`
 	// Nosmurfs Enable SMURFS filter.
-	Nosmurfs *bool `json:"nosmurfs,omitempty"`
+	Nosmurfs *client.PVEBool `json:"nosmurfs,omitempty"`
 	// ProtectionSynflood Enable synflood protection
-	ProtectionSynflood *bool `json:"protection_synflood,omitempty"`
+	ProtectionSynflood *client.PVEBool `json:"protection_synflood,omitempty"`
 	// ProtectionSynfloodBurst Synflood protection rate burst by ip src.
 	ProtectionSynfloodBurst *int64 `json:"protection_synflood_burst,omitempty"`
 	// ProtectionSynfloodRate Synflood protection rate syn/sec by ip src.
@@ -5168,7 +5168,7 @@ type ListFirewallOptionsResponse struct {
 	// TcpFlagsLogLevel Log level for illegal tcp flags filter.
 	TcpFlagsLogLevel *string `json:"tcp_flags_log_level,omitempty"`
 	// Tcpflags Filter illegal combinations of TCP flags.
-	Tcpflags *bool `json:"tcpflags,omitempty"`
+	Tcpflags *client.PVEBool `json:"tcpflags,omitempty"`
 }
 
 // ListFirewallOptions implements Service.ListFirewallOptions. GET /nodes/{node}/firewall/options.
@@ -6268,15 +6268,15 @@ type ListLxcConfigResponse struct {
 	// Cmode Console mode. By default, the console command tries to open a connection to one of the available tty devices. By setting cmode to 'console' it tries to attach to /dev/console instead. If you set cmode to 'shell', it simply invokes a shell inside the container (no login).
 	Cmode *string `json:"cmode,omitempty"`
 	// Console Attach a console device (/dev/console) to the container.
-	Console *bool `json:"console,omitempty"`
+	Console *client.PVEBool `json:"console,omitempty"`
 	// Cores The number of cores assigned to the container. A container can use all available cores by default.
 	Cores *int64 `json:"cores,omitempty"`
 	// Cpulimit Limit of CPU usage.  NOTE: If the computer has 2 CPUs, it has a total of '2' CPU time. Value '0' indicates no CPU limit.
-	Cpulimit *float64 `json:"cpulimit,omitempty"`
+	Cpulimit *client.PVEFloat `json:"cpulimit,omitempty"`
 	// Cpuunits CPU weight for a container, will be clamped to [1, 10000] in cgroup v2.
 	Cpuunits *int64 `json:"cpuunits,omitempty"`
 	// Debug Try to be more verbose. For now this only enables debug log-level on start.
-	Debug *bool `json:"debug,omitempty"`
+	Debug *client.PVEBool `json:"debug,omitempty"`
 	// Description Description for the Container. Shown in the web-interface CT's summary. This is saved as comment inside the configuration file.
 	Description *string `json:"description,omitempty"`
 	// Devn Device to pass through to the container
@@ -6306,11 +6306,11 @@ type ListLxcConfigResponse struct {
 	// Netn Specifies network interfaces for the container.
 	Netn *string `json:"net[n],omitempty"`
 	// Onboot Specifies whether a container will be started during system bootup.
-	Onboot *bool `json:"onboot,omitempty"`
+	Onboot *client.PVEBool `json:"onboot,omitempty"`
 	// Ostype OS type. This is used to setup configuration inside the container, and corresponds to lxc setup scripts in /usr/share/lxc/config/<ostype>.common.conf. Value 'unmanaged' can be used to skip and OS specific setup.
 	Ostype *string `json:"ostype,omitempty"`
 	// Protection Sets the protection flag of the container. This will prevent the CT or CT's disk remove/update operation.
-	Protection *bool `json:"protection,omitempty"`
+	Protection *client.PVEBool `json:"protection,omitempty"`
 	// Rootfs Use volume as container root.
 	Rootfs *string `json:"rootfs,omitempty"`
 	// Searchdomain Sets DNS search domains for a container. Create will automatically use the setting from the host if you neither set searchdomain nor nameserver.
@@ -6322,13 +6322,13 @@ type ListLxcConfigResponse struct {
 	// Tags Tags of the Container. This is only meta information.
 	Tags *string `json:"tags,omitempty"`
 	// Template Enable/disable Template.
-	Template *bool `json:"template,omitempty"`
+	Template *client.PVEBool `json:"template,omitempty"`
 	// Timezone Time zone to use in the container. If option isn't set, then nothing will be done. Can be set to 'host' to match the host time zone, or an arbitrary time zone option from /usr/share/zoneinfo/zone.tab
 	Timezone *string `json:"timezone,omitempty"`
 	// Tty Specify the number of tty available to the container
 	Tty *int64 `json:"tty,omitempty"`
 	// Unprivileged Makes the container run as unprivileged user. For creation, the default is 1. For restore, the default is the value from the backup. (Should not be modified manually.)
-	Unprivileged *bool `json:"unprivileged,omitempty"`
+	Unprivileged *client.PVEBool `json:"unprivileged,omitempty"`
 	// Unusedn Reference to unused volumes. This is used internally, and should not be modified manually.
 	Unusedn *string `json:"unused[n],omitempty"`
 }
@@ -6573,7 +6573,7 @@ type ListLxcFeatureParams struct {
 
 // ListLxcFeatureResponse mirrors the shape returned by GET /nodes/{node}/lxc/{vmid}/feature.
 type ListLxcFeatureResponse struct {
-	HasFeature bool `json:"hasFeature"`
+	HasFeature client.PVEBool `json:"hasFeature"`
 }
 
 // ListLxcFeature implements Service.ListLxcFeature. GET /nodes/{node}/lxc/{vmid}/feature.
@@ -7158,25 +7158,25 @@ func (s *service) ListLxcFirewallLog(ctx context.Context, node string, vmid stri
 // ListLxcFirewallOptionsResponse mirrors the shape returned by GET /nodes/{node}/lxc/{vmid}/firewall/options.
 type ListLxcFirewallOptionsResponse struct {
 	// Dhcp Enable DHCP.
-	Dhcp *bool `json:"dhcp,omitempty"`
+	Dhcp *client.PVEBool `json:"dhcp,omitempty"`
 	// Enable Enable/disable firewall rules.
-	Enable *bool `json:"enable,omitempty"`
+	Enable *client.PVEBool `json:"enable,omitempty"`
 	// Ipfilter Enable default IP filters. This is equivalent to adding an empty ipfilter-net<id> ipset for every interface. Such ipsets implicitly contain sane default restrictions such as restricting IPv6 link local addresses to the one derived from the interface's MAC address. For containers the configured IP addresses will be implicitly added.
-	Ipfilter *bool `json:"ipfilter,omitempty"`
+	Ipfilter *client.PVEBool `json:"ipfilter,omitempty"`
 	// LogLevelIn Log level for incoming traffic.
 	LogLevelIn *string `json:"log_level_in,omitempty"`
 	// LogLevelOut Log level for outgoing traffic.
 	LogLevelOut *string `json:"log_level_out,omitempty"`
 	// Macfilter Enable/disable MAC address filter.
-	Macfilter *bool `json:"macfilter,omitempty"`
+	Macfilter *client.PVEBool `json:"macfilter,omitempty"`
 	// Ndp Enable NDP (Neighbor Discovery Protocol).
-	Ndp *bool `json:"ndp,omitempty"`
+	Ndp *client.PVEBool `json:"ndp,omitempty"`
 	// PolicyIn Input policy.
 	PolicyIn *string `json:"policy_in,omitempty"`
 	// PolicyOut Output policy.
 	PolicyOut *string `json:"policy_out,omitempty"`
 	// Radv Allow sending Router Advertisement.
-	Radv *bool `json:"radv,omitempty"`
+	Radv *client.PVEBool `json:"radv,omitempty"`
 }
 
 // ListLxcFirewallOptions implements Service.ListLxcFirewallOptions. GET /nodes/{node}/lxc/{vmid}/firewall/options.
@@ -7617,7 +7617,7 @@ type ListLxcMigrateResponse struct {
 	// NotAllowedNodes List of not allowed nodes with additional information.
 	NotAllowedNodes json.RawMessage `json:"not-allowed-nodes,omitempty"`
 	// Running Determines if the container is running.
-	Running bool `json:"running"`
+	Running client.PVEBool `json:"running"`
 }
 
 // ListLxcMigrate implements Service.ListLxcMigrate. GET /nodes/{node}/lxc/{vmid}/migrate.
@@ -8508,9 +8508,9 @@ func (s *service) ListLxcStatus(ctx context.Context, node string, vmid string) (
 // ListLxcStatusCurrentResponse mirrors the shape returned by GET /nodes/{node}/lxc/{vmid}/status/current.
 type ListLxcStatusCurrentResponse struct {
 	// Cpu Current CPU usage.
-	Cpu *float64 `json:"cpu,omitempty"`
+	Cpu *client.PVEFloat `json:"cpu,omitempty"`
 	// Cpus Maximum usable CPUs.
-	Cpus *float64 `json:"cpus,omitempty"`
+	Cpus *client.PVEFloat `json:"cpus,omitempty"`
 	// Disk Root disk image space-usage in bytes.
 	Disk *int64 `json:"disk,omitempty"`
 	// Diskread The amount of bytes the guest read from it's block devices since the guest was started. (Note: This info is not available for all storage types.)
@@ -8536,21 +8536,21 @@ type ListLxcStatusCurrentResponse struct {
 	// Netout The amount of traffic in bytes that was sent from the guest over the network since it was started.
 	Netout *int64 `json:"netout,omitempty"`
 	// Pressurecpusome CPU Some pressure stall average over the last 10 seconds.
-	Pressurecpusome *float64 `json:"pressurecpusome,omitempty"`
+	Pressurecpusome *client.PVEFloat `json:"pressurecpusome,omitempty"`
 	// Pressureiofull IO Full pressure stall average over the last 10 seconds.
-	Pressureiofull *float64 `json:"pressureiofull,omitempty"`
+	Pressureiofull *client.PVEFloat `json:"pressureiofull,omitempty"`
 	// Pressureiosome IO Some pressure stall average over the last 10 seconds.
-	Pressureiosome *float64 `json:"pressureiosome,omitempty"`
+	Pressureiosome *client.PVEFloat `json:"pressureiosome,omitempty"`
 	// Pressurememoryfull Memory Full pressure stall average over the last 10 seconds.
-	Pressurememoryfull *float64 `json:"pressurememoryfull,omitempty"`
+	Pressurememoryfull *client.PVEFloat `json:"pressurememoryfull,omitempty"`
 	// Pressurememorysome Memory Some pressure stall average over the last 10 seconds.
-	Pressurememorysome *float64 `json:"pressurememorysome,omitempty"`
+	Pressurememorysome *client.PVEFloat `json:"pressurememorysome,omitempty"`
 	// Status LXC Container status.
 	Status string `json:"status"`
 	// Tags The current configured tags, if any.
 	Tags *string `json:"tags,omitempty"`
 	// Template Determines if the guest is a template.
-	Template *bool `json:"template,omitempty"`
+	Template *client.PVEBool `json:"template,omitempty"`
 	// Uptime Uptime in seconds.
 	Uptime *int64 `json:"uptime,omitempty"`
 	// Vmid The (unique) ID of the VM.
@@ -10199,15 +10199,15 @@ type ListQemuAgentExecStatusResponse struct {
 	// ErrData stderr of the process
 	ErrData *string `json:"err-data,omitempty"`
 	// ErrTruncated true if stderr was not fully captured
-	ErrTruncated *bool `json:"err-truncated,omitempty"`
+	ErrTruncated *client.PVEBool `json:"err-truncated,omitempty"`
 	// Exitcode process exit code if it was normally terminated.
 	Exitcode *int64 `json:"exitcode,omitempty"`
 	// Exited Tells if the given command has exited yet.
-	Exited bool `json:"exited"`
+	Exited client.PVEBool `json:"exited"`
 	// OutData stdout of the process
 	OutData *string `json:"out-data,omitempty"`
 	// OutTruncated true if stdout was not fully captured
-	OutTruncated *bool `json:"out-truncated,omitempty"`
+	OutTruncated *client.PVEBool `json:"out-truncated,omitempty"`
 	// Signal signal number or exception code if the process was abnormally terminated.
 	Signal *int64 `json:"signal,omitempty"`
 }
@@ -10268,7 +10268,7 @@ type ListQemuAgentFileReadResponse struct {
 	// Content The content of the file, maximum 16777216
 	Content string `json:"content"`
 	// Truncated If set to 1, the read did not reach the end of the file.
-	Truncated *bool `json:"truncated,omitempty"`
+	Truncated *client.PVEBool `json:"truncated,omitempty"`
 }
 
 // ListQemuAgentFileRead implements Service.ListQemuAgentFileRead. GET /nodes/{node}/qemu/{vmid}/agent/file-read.
@@ -11239,13 +11239,13 @@ type ListQemuConfigParams struct {
 // ListQemuConfigResponse mirrors the shape returned by GET /nodes/{node}/qemu/{vmid}/config.
 type ListQemuConfigResponse struct {
 	// Acpi Enable/disable ACPI.
-	Acpi *bool `json:"acpi,omitempty"`
+	Acpi *client.PVEBool `json:"acpi,omitempty"`
 	// Affinity List of host cores used to execute guest processes, for example: 0,5,8-11
 	Affinity *string `json:"affinity,omitempty"`
 	// Agent Enable/disable communication with the QEMU Guest Agent and its properties.
 	Agent *string `json:"agent,omitempty"`
 	// AllowKsm Allow memory pages of this guest to be merged via KSM (Kernel Samepage Merging).
-	AllowKsm *bool `json:"allow-ksm,omitempty"`
+	AllowKsm *client.PVEBool `json:"allow-ksm,omitempty"`
 	// AmdSev Secure Encrypted Virtualization (SEV) features by AMD CPUs
 	AmdSev *string `json:"amd-sev,omitempty"`
 	// Arch Virtual processor architecture. Defaults to the host architecture.
@@ -11255,7 +11255,7 @@ type ListQemuConfigResponse struct {
 	// Audio0 Configure a audio device, useful in combination with QXL/Spice.
 	Audio0 *string `json:"audio0,omitempty"`
 	// Autostart Automatic restart after crash (currently ignored).
-	Autostart *bool `json:"autostart,omitempty"`
+	Autostart *client.PVEBool `json:"autostart,omitempty"`
 	// Balloon Amount of target RAM for the VM in MiB. The balloon driver is enabled by default, unless it is explicitly disabled by setting the value to zero.
 	Balloon *int64 `json:"balloon,omitempty"`
 	// Bios Select BIOS implementation.
@@ -11273,7 +11273,7 @@ type ListQemuConfigResponse struct {
 	// Citype Specifies the cloud-init configuration format. The default depends on the configured operating system type (`ostype`. We use the `nocloud` format for Linux, and `configdrive2` for windows.
 	Citype *string `json:"citype,omitempty"`
 	// Ciupgrade cloud-init: do an automatic package upgrade after the first boot.
-	Ciupgrade *bool `json:"ciupgrade,omitempty"`
+	Ciupgrade *client.PVEBool `json:"ciupgrade,omitempty"`
 	// Ciuser cloud-init: User name to change ssh keys and password for instead of the image's configured default user.
 	Ciuser *string `json:"ciuser,omitempty"`
 	// Cores The number of cores per socket.
@@ -11281,7 +11281,7 @@ type ListQemuConfigResponse struct {
 	// Cpu Emulated CPU type.
 	Cpu *string `json:"cpu,omitempty"`
 	// Cpulimit Limit of CPU usage.
-	Cpulimit *float64 `json:"cpulimit,omitempty"`
+	Cpulimit *client.PVEFloat `json:"cpulimit,omitempty"`
 	// Cpuunits CPU weight for a VM, will be clamped to [1, 10000] in cgroup v2.
 	Cpuunits *int64 `json:"cpuunits,omitempty"`
 	// Description Description for the VM. Shown in the web-interface VM's summary. This is saved as comment inside the configuration file.
@@ -11291,7 +11291,7 @@ type ListQemuConfigResponse struct {
 	// Efidisk0 Configure a disk for storing EFI vars.
 	Efidisk0 *string `json:"efidisk0,omitempty"`
 	// Freeze Freeze CPU at startup (use 'c' monitor command to start execution).
-	Freeze *bool `json:"freeze,omitempty"`
+	Freeze *client.PVEBool `json:"freeze,omitempty"`
 	// Hookscript Script that will be executed during various steps in the vms lifetime.
 	Hookscript *string `json:"hookscript,omitempty"`
 	// Hostpcin Map host PCI devices into guest.
@@ -11309,13 +11309,13 @@ type ListQemuConfigResponse struct {
 	// Ivshmem Inter-VM shared memory. Useful for direct communication between VMs, or to the host.
 	Ivshmem *string `json:"ivshmem,omitempty"`
 	// Keephugepages Use together with hugepages. If enabled, hugepages will not not be deleted after VM shutdown and can be used for subsequent starts.
-	Keephugepages *bool `json:"keephugepages,omitempty"`
+	Keephugepages *client.PVEBool `json:"keephugepages,omitempty"`
 	// Keyboard Keyboard layout for VNC server. This option is generally not required and is often better handled from within the guest OS.
 	Keyboard *string `json:"keyboard,omitempty"`
 	// Kvm Enable/disable KVM hardware virtualization.
-	Kvm *bool `json:"kvm,omitempty"`
+	Kvm *client.PVEBool `json:"kvm,omitempty"`
 	// Localtime Set the real time clock (RTC) to local time. This is enabled by default if the `ostype` indicates a Microsoft Windows OS.
-	Localtime *bool `json:"localtime,omitempty"`
+	Localtime *client.PVEBool `json:"localtime,omitempty"`
 	// Lock Lock/unlock the VM.
 	Lock *string `json:"lock,omitempty"`
 	// Machine Specify the QEMU machine.
@@ -11325,7 +11325,7 @@ type ListQemuConfigResponse struct {
 	// Meta Some (read-only) meta-information about this guest.
 	Meta *string `json:"meta,omitempty"`
 	// MigrateDowntime Set maximum tolerated downtime (in seconds) for migrations. Should the migration not be able to converge in the very end, because too much newly dirtied RAM needs to be transferred, the limit will be increased automatically step-by-step until migration can converge. Will be capped to 2000 seconds (maximum in QEMU).
-	MigrateDowntime *float64 `json:"migrate_downtime,omitempty"`
+	MigrateDowntime *client.PVEFloat `json:"migrate_downtime,omitempty"`
 	// MigrateSpeed Set maximum speed (in MB/s) for migrations. Value 0 is no limit.
 	MigrateSpeed *int64 `json:"migrate_speed,omitempty"`
 	// Name Set a name for the VM. Only used on the configuration web interface.
@@ -11335,11 +11335,11 @@ type ListQemuConfigResponse struct {
 	// Netn Specify network devices.
 	Netn *string `json:"net[n],omitempty"`
 	// Numa Enable/disable NUMA.
-	Numa *bool `json:"numa,omitempty"`
+	Numa *client.PVEBool `json:"numa,omitempty"`
 	// Numan NUMA topology.
 	Numan *string `json:"numa[n],omitempty"`
 	// Onboot Specifies whether a VM will be started during system bootup.
-	Onboot *bool `json:"onboot,omitempty"`
+	Onboot *client.PVEBool `json:"onboot,omitempty"`
 	// Ostype Specify guest operating system.
 	Ostype *string `json:"ostype,omitempty"`
 	// Paralleln Map host parallel devices (n is 0 to 2).
@@ -11347,9 +11347,9 @@ type ListQemuConfigResponse struct {
 	// Parent Parent snapshot name. This is used internally, and should not be modified.
 	Parent *string `json:"parent,omitempty"`
 	// Protection Sets the protection flag of the VM. This will disable the remove VM and remove disk operations.
-	Protection *bool `json:"protection,omitempty"`
+	Protection *client.PVEBool `json:"protection,omitempty"`
 	// Reboot Allow reboot. If set to '0' the VM exit on reboot.
-	Reboot *bool `json:"reboot,omitempty"`
+	Reboot *client.PVEBool `json:"reboot,omitempty"`
 	// Rng0 Configure a VirtIO-based Random Number Generator.
 	Rng0 *string `json:"rng0,omitempty"`
 	// RunningNetsHostMtu List of VirtIO network devices and their effective host_mtu setting. A value of 0 means that the host_mtu parameter is to be avoided for the corresponding device. This is used internally for snapshots.
@@ -11387,13 +11387,13 @@ type ListQemuConfigResponse struct {
 	// Startup Startup and shutdown behavior. Order is a non-negative number defining the general startup order. Shutdown in done with reverse ordering. Additionally you can set the 'up' or 'down' delay in seconds, which specifies a delay to wait before the next VM is started or stopped.
 	Startup *string `json:"startup,omitempty"`
 	// Tablet Enable/disable the USB tablet device.
-	Tablet *bool `json:"tablet,omitempty"`
+	Tablet *client.PVEBool `json:"tablet,omitempty"`
 	// Tags Tags of the VM. This is only meta information.
 	Tags *string `json:"tags,omitempty"`
 	// Tdf Enable/disable time drift fix.
-	Tdf *bool `json:"tdf,omitempty"`
+	Tdf *client.PVEBool `json:"tdf,omitempty"`
 	// Template Enable/disable Template.
-	Template *bool `json:"template,omitempty"`
+	Template *client.PVEBool `json:"template,omitempty"`
 	// Tpmstate0 Configure a Disk for storing TPM state. The format is fixed to 'raw'.
 	Tpmstate0 *string `json:"tpmstate0,omitempty"`
 	// Unusedn Reference to unused volumes. This is used internally, and should not be modified manually.
@@ -12412,8 +12412,8 @@ type ListQemuFeatureParams struct {
 
 // ListQemuFeatureResponse mirrors the shape returned by GET /nodes/{node}/qemu/{vmid}/feature.
 type ListQemuFeatureResponse struct {
-	HasFeature bool     `json:"hasFeature"`
-	Nodes      []string `json:"nodes"`
+	HasFeature client.PVEBool `json:"hasFeature"`
+	Nodes      []string       `json:"nodes"`
 }
 
 // ListQemuFeature implements Service.ListQemuFeature. GET /nodes/{node}/qemu/{vmid}/feature.
@@ -12998,25 +12998,25 @@ func (s *service) ListQemuFirewallLog(ctx context.Context, node string, vmid str
 // ListQemuFirewallOptionsResponse mirrors the shape returned by GET /nodes/{node}/qemu/{vmid}/firewall/options.
 type ListQemuFirewallOptionsResponse struct {
 	// Dhcp Enable DHCP.
-	Dhcp *bool `json:"dhcp,omitempty"`
+	Dhcp *client.PVEBool `json:"dhcp,omitempty"`
 	// Enable Enable/disable firewall rules.
-	Enable *bool `json:"enable,omitempty"`
+	Enable *client.PVEBool `json:"enable,omitempty"`
 	// Ipfilter Enable default IP filters. This is equivalent to adding an empty ipfilter-net<id> ipset for every interface. Such ipsets implicitly contain sane default restrictions such as restricting IPv6 link local addresses to the one derived from the interface's MAC address. For containers the configured IP addresses will be implicitly added.
-	Ipfilter *bool `json:"ipfilter,omitempty"`
+	Ipfilter *client.PVEBool `json:"ipfilter,omitempty"`
 	// LogLevelIn Log level for incoming traffic.
 	LogLevelIn *string `json:"log_level_in,omitempty"`
 	// LogLevelOut Log level for outgoing traffic.
 	LogLevelOut *string `json:"log_level_out,omitempty"`
 	// Macfilter Enable/disable MAC address filter.
-	Macfilter *bool `json:"macfilter,omitempty"`
+	Macfilter *client.PVEBool `json:"macfilter,omitempty"`
 	// Ndp Enable NDP (Neighbor Discovery Protocol).
-	Ndp *bool `json:"ndp,omitempty"`
+	Ndp *client.PVEBool `json:"ndp,omitempty"`
 	// PolicyIn Input policy.
 	PolicyIn *string `json:"policy_in,omitempty"`
 	// PolicyOut Output policy.
 	PolicyOut *string `json:"policy_out,omitempty"`
 	// Radv Allow sending Router Advertisement.
-	Radv *bool `json:"radv,omitempty"`
+	Radv *client.PVEBool `json:"radv,omitempty"`
 }
 
 // ListQemuFirewallOptions implements Service.ListQemuFirewallOptions. GET /nodes/{node}/qemu/{vmid}/firewall/options.
@@ -13422,7 +13422,7 @@ type ListQemuMigrateResponse struct {
 	// DependentHaResources HA resources, which will be migrated to the same target node as the VM, because these are in positive affinity with the VM.
 	DependentHaResources []string `json:"dependent-ha-resources,omitempty"`
 	// HasDbusVmstate Whether the VM host supports migrating additional VM state, such as conntrack entries.
-	HasDbusVmstate bool `json:"has-dbus-vmstate"`
+	HasDbusVmstate client.PVEBool `json:"has-dbus-vmstate"`
 	// LocalDisks List local disks including CD-Rom, unused and not referenced disks
 	LocalDisks []json.RawMessage `json:"local_disks"`
 	// LocalResources List local resources (e.g. pci, usb) that block migration.
@@ -13434,7 +13434,7 @@ type ListQemuMigrateResponse struct {
 	// NotAllowedNodes List of not allowed nodes with additional information.
 	NotAllowedNodes json.RawMessage `json:"not_allowed_nodes,omitempty"`
 	// Running Determines if the VM is running.
-	Running bool `json:"running"`
+	Running client.PVEBool `json:"running"`
 }
 
 // ListQemuMigrate implements Service.ListQemuMigrate. GET /nodes/{node}/qemu/{vmid}/migrate.
@@ -14418,13 +14418,13 @@ func (s *service) ListQemuStatus(ctx context.Context, node string, vmid string) 
 // ListQemuStatusCurrentResponse mirrors the shape returned by GET /nodes/{node}/qemu/{vmid}/status/current.
 type ListQemuStatusCurrentResponse struct {
 	// Agent QEMU Guest Agent is enabled in config.
-	Agent *bool `json:"agent,omitempty"`
+	Agent *client.PVEBool `json:"agent,omitempty"`
 	// Clipboard Enable a specific clipboard. If not set, depending on the display type the SPICE one will be added.
 	Clipboard *string `json:"clipboard,omitempty"`
 	// Cpu Current CPU usage.
-	Cpu *float64 `json:"cpu,omitempty"`
+	Cpu *client.PVEFloat `json:"cpu,omitempty"`
 	// Cpus Maximum usable CPUs.
-	Cpus *float64 `json:"cpus,omitempty"`
+	Cpus *client.PVEFloat `json:"cpus,omitempty"`
 	// Diskread The amount of bytes the guest read from it's block devices since the guest was started. (Note: This info is not available for all storage types.)
 	Diskread *int64 `json:"diskread,omitempty"`
 	// Diskwrite The amount of bytes the guest wrote from it's block devices since the guest was started. (Note: This info is not available for all storage types.)
@@ -14450,17 +14450,17 @@ type ListQemuStatusCurrentResponse struct {
 	// Pid PID of the QEMU process, if the VM is running.
 	Pid *int64 `json:"pid,omitempty"`
 	// Pressurecpufull CPU Full pressure stall average over the last 10 seconds.
-	Pressurecpufull *float64 `json:"pressurecpufull,omitempty"`
+	Pressurecpufull *client.PVEFloat `json:"pressurecpufull,omitempty"`
 	// Pressurecpusome CPU Some pressure stall average over the last 10 seconds.
-	Pressurecpusome *float64 `json:"pressurecpusome,omitempty"`
+	Pressurecpusome *client.PVEFloat `json:"pressurecpusome,omitempty"`
 	// Pressureiofull IO Full pressure stall average over the last 10 seconds.
-	Pressureiofull *float64 `json:"pressureiofull,omitempty"`
+	Pressureiofull *client.PVEFloat `json:"pressureiofull,omitempty"`
 	// Pressureiosome IO Some pressure stall average over the last 10 seconds.
-	Pressureiosome *float64 `json:"pressureiosome,omitempty"`
+	Pressureiosome *client.PVEFloat `json:"pressureiosome,omitempty"`
 	// Pressurememoryfull Memory Full pressure stall average over the last 10 seconds.
-	Pressurememoryfull *float64 `json:"pressurememoryfull,omitempty"`
+	Pressurememoryfull *client.PVEFloat `json:"pressurememoryfull,omitempty"`
 	// Pressurememorysome Memory Some pressure stall average over the last 10 seconds.
-	Pressurememorysome *float64 `json:"pressurememorysome,omitempty"`
+	Pressurememorysome *client.PVEFloat `json:"pressurememorysome,omitempty"`
 	// Qmpstatus VM run state from the 'query-status' QMP monitor command.
 	Qmpstatus *string `json:"qmpstatus,omitempty"`
 	// RunningMachine The currently running machine type (if running).
@@ -14468,15 +14468,15 @@ type ListQemuStatusCurrentResponse struct {
 	// RunningQemu The QEMU version the VM is currently using (if running).
 	RunningQemu *string `json:"running-qemu,omitempty"`
 	// Serial Guest has serial device configured.
-	Serial *bool `json:"serial,omitempty"`
+	Serial *client.PVEBool `json:"serial,omitempty"`
 	// Spice QEMU VGA configuration supports spice.
-	Spice *bool `json:"spice,omitempty"`
+	Spice *client.PVEBool `json:"spice,omitempty"`
 	// Status QEMU process status.
 	Status string `json:"status"`
 	// Tags The current configured tags, if any
 	Tags *string `json:"tags,omitempty"`
 	// Template Determines if the guest is a template.
-	Template *bool `json:"template,omitempty"`
+	Template *client.PVEBool `json:"template,omitempty"`
 	// Uptime Uptime in seconds.
 	Uptime *int64 `json:"uptime,omitempty"`
 	// Vmid The (unique) ID of the VM.
@@ -16676,7 +16676,7 @@ type ListStatusResponse struct {
 	// BootInfo Meta-information about the boot mode.
 	BootInfo json.RawMessage `json:"boot-info"`
 	// Cpu The current cpu usage.
-	Cpu     float64         `json:"cpu"`
+	Cpu     client.PVEFloat `json:"cpu"`
 	Cpuinfo json.RawMessage `json:"cpuinfo"`
 	// CurrentKernel Meta-information about the currently booted kernel of this node.
 	CurrentKernel json.RawMessage `json:"current-kernel"`
@@ -17060,7 +17060,7 @@ type GetStorageContentResponse struct {
 	// Path The Path
 	Path string `json:"path"`
 	// Protected Protection status. Currently only supported for backups.
-	Protected *bool `json:"protected,omitempty"`
+	Protected *client.PVEBool `json:"protected,omitempty"`
 	// Size Volume size in bytes.
 	Size int64 `json:"size"`
 	// Used Used space. Please note that most storage plugins do not report anything useful here.
@@ -17711,15 +17711,15 @@ func (s *service) ListStorageRrddata(ctx context.Context, node string, storage s
 // ListStorageStatusResponse mirrors the shape returned by GET /nodes/{node}/storage/{storage}/status.
 type ListStorageStatusResponse struct {
 	// Active Set when storage is accessible.
-	Active *bool `json:"active,omitempty"`
+	Active *client.PVEBool `json:"active,omitempty"`
 	// Avail Available storage space in bytes.
 	Avail *int64 `json:"avail,omitempty"`
 	// Content Allowed storage content types.
 	Content string `json:"content"`
 	// Enabled Set when storage is enabled (not disabled).
-	Enabled *bool `json:"enabled,omitempty"`
+	Enabled *client.PVEBool `json:"enabled,omitempty"`
 	// Shared Shared flag from storage configuration.
-	Shared *bool `json:"shared,omitempty"`
+	Shared *client.PVEBool `json:"shared,omitempty"`
 	// Total Total storage space in bytes.
 	Total *int64 `json:"total,omitempty"`
 	// Type Storage type.
@@ -18669,7 +18669,7 @@ type ListVzdumpDefaultsParams struct {
 // ListVzdumpDefaultsResponse mirrors the shape returned by GET /nodes/{node}/vzdump/defaults.
 type ListVzdumpDefaultsResponse struct {
 	// All Backup all known guest systems on this host.
-	All *bool `json:"all,omitempty"`
+	All *client.PVEBool `json:"all,omitempty"`
 	// Bwlimit Limit I/O bandwidth (in KiB/s).
 	Bwlimit *int64 `json:"bwlimit,omitempty"`
 	// Compress Compress dump file.
@@ -18707,19 +18707,19 @@ type ListVzdumpDefaultsResponse struct {
 	// Pool Backup all known guest systems included in the specified pool.
 	Pool *string `json:"pool,omitempty"`
 	// Protected If true, mark backup(s) as protected.
-	Protected *bool `json:"protected,omitempty"`
+	Protected *client.PVEBool `json:"protected,omitempty"`
 	// PruneBackups Use these retention options instead of those from the storage configuration.
 	PruneBackups *string `json:"prune-backups,omitempty"`
 	// Quiet Be quiet.
-	Quiet *bool `json:"quiet,omitempty"`
+	Quiet *client.PVEBool `json:"quiet,omitempty"`
 	// Remove Prune older backups according to 'prune-backups'.
-	Remove *bool `json:"remove,omitempty"`
+	Remove *client.PVEBool `json:"remove,omitempty"`
 	// Script Use specified hook script.
 	Script *string `json:"script,omitempty"`
 	// Stdexcludes Exclude temporary files and logs.
-	Stdexcludes *bool `json:"stdexcludes,omitempty"`
+	Stdexcludes *client.PVEBool `json:"stdexcludes,omitempty"`
 	// Stop Stop running backup jobs on this host.
-	Stop *bool `json:"stop,omitempty"`
+	Stop *client.PVEBool `json:"stop,omitempty"`
 	// Stopwait Maximal time to wait until a guest system is stopped (minutes).
 	Stopwait *int64 `json:"stopwait,omitempty"`
 	// Storage Store resulting file to this storage.

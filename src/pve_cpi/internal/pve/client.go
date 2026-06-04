@@ -94,6 +94,42 @@ func (s *sdkPoolService) AddVM(ctx context.Context, poolID string, vmid int64) e
 	return nil
 }
 
+// buildTransportOpts constructs the base sdkclient.Options from cfg, setting
+// only connection, timeout, and transport-tuning fields. Auth and SSL fields
+// are filled in by NewClient after this call. Extracted as a seam for unit
+// testing so the Options values can be asserted without standing up a real
+// PVE host.
+//
+// All five PVE API transport fields (DialTimeoutSec, TLSHandshakeTimeoutSec,
+// MaxIdleConnsPerHost, IdleConnTimeoutSec, TCPKeepAliveSec) are assigned
+// directly from cfg: 0 is the SDK's "use default" sentinel, so an unset cfg
+// produces Options identical to those built before §7.30 was introduced
+// (byte-identical guarantee).
+func buildTransportOpts(cfg *config.CPIConfig) sdkclient.Options {
+	port := cfg.Port
+	if port == 0 {
+		port = 8006
+	}
+	return sdkclient.Options{
+		Host:     cfg.Host,
+		Port:     port,
+		Protocol: sdkclient.ProtocolHTTPS,
+		// Long timeout: stemcell uploads (multi-GB) and import tasks
+		// can run for several minutes.
+		Timeout: 30 * time.Minute,
+		// PVE API transport tuning — all fields are 0 by default. Zero is the
+		// SDK no-op sentinel: it leaves the transport field at the SDK internal
+		// default, so an unset config is byte-identical to prior releases.
+		// Direct assignment is safe: the SDK treats 0 as "use default" for each
+		// field (see vendor/pkg/client/options.go). Validated >= 0 in config.Validate.
+		DialTimeoutSec:         cfg.PVEDialTimeoutSec,
+		TLSHandshakeTimeoutSec: cfg.PVETLSHandshakeTimeoutSec,
+		MaxIdleConnsPerHost:    cfg.PVEMaxIdleConnsPerHost,
+		IdleConnTimeoutSec:     cfg.PVEIdleConnTimeoutSec,
+		TCPKeepAliveSec:        cfg.PVETCPKeepAliveSec,
+	}
+}
+
 // NewClient constructs a Client from CPIConfig.
 // Selects auth: APIToken if non-empty else User+Password+Realm.
 // Honors VerifySSL (false = skip TLS verify).
@@ -111,19 +147,7 @@ func NewClient(cfg *config.CPIConfig, logger *log.Logger) (Client, error) {
 		return nil, cpierrors.Cloud("pve client init: one of api_token or password is required")
 	}
 
-	port := cfg.Port
-	if port == 0 {
-		port = 8006
-	}
-
-	opts := sdkclient.Options{
-		Host:     cfg.Host,
-		Port:     port,
-		Protocol: sdkclient.ProtocolHTTPS,
-		// Long timeout: stemcell uploads (multi-GB) and import tasks
-		// can run for several minutes.
-		Timeout: 30 * time.Minute,
-	}
+	opts := buildTransportOpts(cfg)
 
 	if hasToken {
 		opts.APIToken = cfg.APIToken

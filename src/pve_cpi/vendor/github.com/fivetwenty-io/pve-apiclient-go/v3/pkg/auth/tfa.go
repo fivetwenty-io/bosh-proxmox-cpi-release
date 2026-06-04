@@ -233,8 +233,10 @@ func (h *AutoTFAHandler) HandleTFAChallenge(challenge *TFAChallenge) (*TFARespon
 func PromptPassword(prompt string) (string, error) {
 	_, _ = fmt.Fprint(os.Stderr, prompt)
 
-	// Read password without echo
-	password, err := term.ReadPassword(syscall.Stdin)
+	// Read password without echo. Convert to int explicitly: on Windows
+	// syscall.Stdin is a syscall.Handle (uintptr), not an int, so the bare
+	// value fails to cross-compile for windows/*.
+	password, err := term.ReadPassword(int(syscall.Stdin))
 
 	_, _ = fmt.Fprintln(os.Stderr) // Print newline after password input
 
