@@ -526,7 +526,14 @@ def main() -> int:
         step("8. get_disks")
         disks = call("get_disks", [state["vm_cid"]])
         print(f"disks={json.dumps(disks)}")
-        if state["disk_cid"] not in disks:
+        # get_disks reads the bare volid from the PVE VM config and cannot
+        # reconstruct the disk-CID codec metadata suffix that create_disk
+        # appends ("<volid>|<base64>"). Compare on the bare volid (the part
+        # before the first '|') on both sides so an annotated create_disk CID
+        # matches the un-annotated volid get_disks reports.
+        want_bare = state["disk_cid"].split("|", 1)[0]
+        got_bare = [d.split("|", 1)[0] for d in disks]
+        if want_bare not in got_bare:
             raise RuntimeError(f"get_disks did not include {state['disk_cid']}")
 
         step("9. snapshot_disk")

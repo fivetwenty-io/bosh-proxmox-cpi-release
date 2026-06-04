@@ -215,6 +215,14 @@ def build_cpi_config(
     # verify_ssl: always false for test isolation regardless of vars value.
     del verify_ssl_raw  # intentionally ignored
 
+    # agent_mbus: the URL the registry-less (cloudinit, the default agent_mode)
+    # agent binds inside the VM. A real create-env sources this from
+    # cloud_provider.properties.agent.mbus; the lifecycle VM never boots its
+    # agent, so the value is cosmetic here, but create_vm asserts it is
+    # non-empty before provisioning a registry-less VM. tier1.agent_mbus
+    # overrides the standard bootstrap bind URL.
+    agent_mbus = str(tier1.get("agent_mbus", "")).strip() or "https://mbus:mbus@0.0.0.0:6868"
+
     cpi_cfg: dict = {
         "host": host,
         "port": port,
@@ -227,6 +235,7 @@ def build_cpi_config(
         "network_bridge": network_bridge,
         "verify_ssl": False,
         "vmid_range_start": int(tier1["vmid_range_start"]),
+        "agent_mbus": agent_mbus,
     }
 
     # Attach auth — api_token wins if non-empty (and not a dry-run placeholder).

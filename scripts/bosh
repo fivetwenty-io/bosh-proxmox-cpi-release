@@ -504,7 +504,50 @@ def cmd_runtime_config(args: list[str]) -> int:
     )
 
 
+def _emptyvm_is_wedged() -> bool:
+    """True when a prior emptyvm instance exists with an unresponsive agent.
+
+    create-env reattaches the Director's persistent disk, so its DB survives
+    across runs. If a previous emptyvm VM was deleted out-of-band on PVE (a
+    stray teardown, a manual cleanup) the Director still holds the deployment
+    record pointing at the now-gone VM. A redeploy then blocks ~45s in
+    'Preparing deployment' sending get_state to the dead agent before failing
+    with "Timed out sending 'get_state'". Detect that wedged state so the deploy
+    can force-delete the stale record first. Any error (no such deployment,
+    Director unreachable, unparseable output) returns False — nothing to heal.
+    """
+    res = subprocess.run(
+        ["bosh", "-e", "pve", "-d", "emptyvm", "instances", "--json"],
+        cwd=REPO_ROOT, env=director_env(), capture_output=True, text=True,
+    )
+    if res.returncode != 0:
+        return False
+    try:
+        data = json.loads(res.stdout)
+    except json.JSONDecodeError:
+        return False
+    for tbl in data.get("Tables") or []:
+        for row in tbl.get("Rows") or []:
+            if "unresponsive" in (row.get("process_state") or "").lower():
+                return True
+    return False
+
+
 def cmd_emptyvm(args: list[str]) -> int:
+    # Self-heal a stale Director record before deploying: a prior emptyvm whose
+    # VM was deleted on PVE leaves an unresponsive-agent instance that wedges the
+    # redeploy for 45s then fails. emptyvm is a jobless, persistent-disk-free
+    # smoke deployment, so force-deleting the stale record discards nothing.
+    if _emptyvm_is_wedged():
+        print(
+            "emptyvm: prior instance has an unresponsive agent (stale Director "
+            "record for a VM no longer on PVE); force-deleting before redeploy"
+        )
+        run(
+            "bosh", "-e", "pve", "-n", "-d", "emptyvm",
+            "delete-deployment", "--force",
+            env=director_env(),
+        )
     return run(
         "bosh", "-e", "pve", "-n", "-d", "emptyvm", "deploy",
         str(EMPTYVM),

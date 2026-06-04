@@ -209,21 +209,24 @@ class PVEVerifier:
         return self.bridge_exists(vnet)
 
     def volume_exists(self, disk_cid: str) -> bool:
-        """True when a storage volume with volid == disk_cid exists.
+        """True when a storage volume with volid == the bare disk_cid exists.
 
-        disk_cid is '<storage>:<volid>'; the storage content listing reports the
-        full volid (storage-qualified), so match disk_cid directly.
+        A CPI disk CID may carry a '|<base64url-metadata>' suffix appended by the
+        disk-CID codec (EncodeDiskCID); PVE's storage content listing reports only
+        the bare '<storage>:<volid>'. Strip the suffix at the first '|' before
+        matching so annotated CIDs verify against the un-annotated PVE volid.
         """
         node = self._require_node()
-        if ":" not in disk_cid:
+        bare_cid = disk_cid.split("|", 1)[0]
+        if ":" not in bare_cid:
             raise PVEVerifyError(f"disk_cid {disk_cid!r} is not '<storage>:<volid>'")
-        storage = disk_cid.split(":", 1)[0]
+        storage = bare_cid.split(":", 1)[0]
         path = (
             f"/nodes/{urllib.parse.quote(node)}"
             f"/storage/{urllib.parse.quote(storage)}/content"
         )
         for e in self._as_list(self._get(path)):
-            if e.get("volid") == disk_cid:
+            if e.get("volid") == bare_cid:
                 return True
         return False
 

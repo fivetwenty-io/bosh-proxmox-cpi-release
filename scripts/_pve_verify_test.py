@@ -482,6 +482,20 @@ class TestVolumeExists(unittest.TestCase):
         with self._urlopen_with([{"volid": "local-lvm:vm-200-disk-0"}]):
             self.assertFalse(v.volume_exists("local-lvm:vm-101-disk-0"))
 
+    def test_annotated_cid_matches_bare_volid(self) -> None:
+        """A disk CID with a '|<base64-metadata>' codec suffix must match the
+        bare volid PVE reports (regression: create_disk verify in lifecycle)."""
+        v = self._verifier()
+        annotated = "data:vm-9897-disk-0|eyJwb29sIjoiZGF0YSIsIm5vZGUiOiJwdmUifQ"
+        with self._urlopen_with([{"volid": "data:vm-9897-disk-0"}]):
+            self.assertTrue(v.volume_exists(annotated))
+
+    def test_annotated_cid_not_found(self) -> None:
+        v = self._verifier()
+        annotated = "data:vm-9897-disk-0|eyJwb29sIjoiZGF0YSJ9"
+        with self._urlopen_with([{"volid": "data:vm-200-disk-0"}]):
+            self.assertFalse(v.volume_exists(annotated))
+
     def test_happy_path_empty_list(self) -> None:
         v = self._verifier()
         with self._urlopen_with([]):
