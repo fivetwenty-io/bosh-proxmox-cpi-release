@@ -536,7 +536,7 @@ func createVM(
 	// block is absent or Enabled is false.
 	// -----------------------------------------------------------------------
 	if deps.Config.HealthCheckEnabled() {
-		if hcErr := waitUntilAgentReady(ctx, deps, shape.node, vmid, logger); hcErr != nil {
+		if hcErr := runHealthGate(ctx, deps, shape.node, vmid, logger); hcErr != nil {
 			return nil, hcErr
 		}
 	}

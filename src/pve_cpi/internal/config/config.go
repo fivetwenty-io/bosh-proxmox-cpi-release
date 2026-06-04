@@ -830,6 +830,15 @@ type HealthCheckConfig struct {
 	// (fast test mode). Default 5 s via HealthCheckIntervalSec().
 	// validate-only-when-set.
 	IntervalSec int `json:"interval_sec,omitempty"`
+
+	// ExpectedAgentSHA256 is the expected hex SHA-256 of the BOSH agent binary
+	// (/var/vcap/bosh/bin/bosh-agent) inside the booted guest. When non-empty
+	// and Enabled is true, create_vm runs sha256sum via the QEMU guest agent
+	// after the ping succeeds and fails (triggering rollback) only on a CONFIRMED
+	// digest mismatch; any inability to verify (guest-agent error, unparseable
+	// output) is fail-open. Empty (default) disables the assertion. Must be 64
+	// hex characters when set. Use HealthCheckExpectedAgentSHA256().
+	ExpectedAgentSHA256 string `json:"expected_agent_sha256,omitempty"`
 }
 
 // PlacementWeights controls how each scoring axis contributes to the final
@@ -1522,6 +1531,16 @@ func (c *CPIConfig) HealthCheckEnabled() bool {
 		return false
 	}
 	return *c.HealthCheck.Enabled
+}
+
+// HealthCheckExpectedAgentSHA256 returns the configured expected agent-binary
+// SHA-256, normalized to lower case, or "" when unset. Empty disables the
+// §7.29 checksum assertion.
+func (c *CPIConfig) HealthCheckExpectedAgentSHA256() string {
+	if c == nil || c.HealthCheck == nil {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSpace(c.HealthCheck.ExpectedAgentSHA256))
 }
 
 // KeepFailedVMsEnabled reports whether the create_vm keep-failed diagnostic mode
@@ -2483,6 +2502,27 @@ func (c *CPIConfig) validateHealthCheck(errs *[]string) {
 			"health_check.interval_sec must be 0-3600 when enabled, got %d", hc.IntervalSec,
 		))
 	}
+	if sha := strings.TrimSpace(hc.ExpectedAgentSHA256); sha != "" && !isHex64(sha) {
+		*errs = append(*errs, fmt.Sprintf(
+			"health_check.expected_agent_sha256 must be 64 hex characters, got %q", hc.ExpectedAgentSHA256,
+		))
+	}
+}
+
+// isHex64 reports whether s is exactly 64 hexadecimal characters (a SHA-256 hex
+// digest), case-insensitive.
+func isHex64(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	for _, r := range s {
+		switch {
+		case r >= '0' && r <= '9', r >= 'a' && r <= 'f', r >= 'A' && r <= 'F':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // validateRetry rejects negative or contradictory retry-policy values. Zero is

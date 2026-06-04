@@ -309,6 +309,8 @@
   health_check["timeout_sec"] = hc_timeout unless hc_timeout == 0
   hc_interval = p("pve.health_check.interval_sec", 0).to_i
   health_check["interval_sec"] = hc_interval unless hc_interval == 0
+  hc_agent_sha = p("pve.health_check.expected_agent_sha256", "")
+  health_check["expected_agent_sha256"] = hc_agent_sha unless hc_agent_sha.to_s.empty?
   config["health_check"] = health_check unless health_check.empty?
 
   # Emit lb_register block only when the operator sets an endpoint. Required

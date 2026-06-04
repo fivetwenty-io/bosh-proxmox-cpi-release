@@ -239,6 +239,48 @@ func TestResizeConvergenceAccessors(t *testing.T) {
 }
 
 // --------------------------------------------------------------------------
+// §7.29 health_check.expected_agent_sha256 — validation + accessor.
+// --------------------------------------------------------------------------
+
+func TestValidate_ExpectedAgentSHA256Invalid(t *testing.T) {
+	t.Parallel()
+	_, err := mustLoad(t, `{
+		"host": "h", "user": "u", "password": "p",
+		"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
+		"health_check": {"enabled": true, "expected_agent_sha256": "not-a-real-digest"}
+	}`)
+	assertCloudError(t, err, "expected_agent_sha256 must be 64 hex characters")
+}
+
+func TestValidate_ExpectedAgentSHA256Valid(t *testing.T) {
+	t.Parallel()
+	cfg, err := mustLoad(t, `{
+		"host": "h", "user": "u", "password": "p",
+		"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
+		"health_check": {"enabled": true, "expected_agent_sha256": "E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855"}
+	}`)
+	if err != nil {
+		t.Fatalf("valid 64-hex digest should pass, got: %v", err)
+	}
+	// Accessor lower-cases the value.
+	want := "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+	if got := cfg.HealthCheckExpectedAgentSHA256(); got != want {
+		t.Errorf("accessor: got %q, want lower-cased %q", got, want)
+	}
+}
+
+func TestHealthCheckExpectedAgentSHA256_EmptyWhenUnset(t *testing.T) {
+	t.Parallel()
+	var nilCfg *config.CPIConfig
+	if got := nilCfg.HealthCheckExpectedAgentSHA256(); got != "" {
+		t.Errorf("nil receiver: got %q, want empty", got)
+	}
+	if got := (&config.CPIConfig{}).HealthCheckExpectedAgentSHA256(); got != "" {
+		t.Errorf("no health_check block: got %q, want empty", got)
+	}
+}
+
+// --------------------------------------------------------------------------
 // TestValidate_AuthMissing
 // --------------------------------------------------------------------------
 

@@ -688,6 +688,16 @@ properties:
       Set to 0 for back-to-back pings (fast test mode). Ignored when
       health_check.enabled is false.
     default: 0
+  pve.health_check.expected_agent_sha256:
+    description: |
+      Expected SHA-256 hex digest of the BOSH agent binary
+      (/var/vcap/bosh/bin/bosh-agent) inside the booted VM. When non-empty and
+      health_check.enabled is true, create_vm runs sha256sum via the QEMU guest
+      agent after the ping succeeds and fails (destroying the VM) only on a
+      confirmed digest mismatch; any inability to verify (guest-agent error,
+      non-zero exit, unparseable output) is fail-open. Must be 64 hex characters
+      when set. Empty (default) disables the assertion.
+    default: ""
 
   pve.retry.storage_import.max_attempts:
     description: |

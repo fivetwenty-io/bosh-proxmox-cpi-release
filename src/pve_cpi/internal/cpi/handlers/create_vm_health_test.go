@@ -32,8 +32,26 @@ type healthNodes struct {
 	updateConfigFn func(ctx context.Context, node, vmid string, p *sdknodes.UpdateQemuConfigParams) error
 	listQemuFn     func(ctx context.Context, node string, p *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error)
 	listStorageFn  func(ctx context.Context, node string, p *sdknodes.ListStorageParams) (*sdknodes.ListStorageResponse, error)
+	agentExecFn    func(ctx context.Context, node, vmid string, p *sdknodes.CreateQemuAgentExecParams) (*sdknodes.CreateQemuAgentExecResponse, error)
+	agentExecStatusFn func(ctx context.Context, node, vmid string, p *sdknodes.ListQemuAgentExecStatusParams) (*sdknodes.ListQemuAgentExecStatusResponse, error)
 
 	pingCalls int
+	execCalls int
+}
+
+func (h *healthNodes) CreateQemuAgentExec(ctx context.Context, node, vmid string, p *sdknodes.CreateQemuAgentExecParams) (*sdknodes.CreateQemuAgentExecResponse, error) {
+	h.execCalls++
+	if h.agentExecFn != nil {
+		return h.agentExecFn(ctx, node, vmid, p)
+	}
+	panic("healthNodes.CreateQemuAgentExec: not configured")
+}
+
+func (h *healthNodes) ListQemuAgentExecStatus(ctx context.Context, node, vmid string, p *sdknodes.ListQemuAgentExecStatusParams) (*sdknodes.ListQemuAgentExecStatusResponse, error) {
+	if h.agentExecStatusFn != nil {
+		return h.agentExecStatusFn(ctx, node, vmid, p)
+	}
+	panic("healthNodes.ListQemuAgentExecStatus: not configured")
 }
 
 func (h *healthNodes) CreateQemuAgentPing(ctx context.Context, node, vmid string) (*sdknodes.CreateQemuAgentPingResponse, error) {
@@ -591,4 +609,208 @@ func minimalValidCPIConfig() *config.CPIConfig {
 	}
 	c.ApplyDefaults()
 	return c
+}
+
+// --------------------------------------------------------------------------
+// §7.29 boot-path agent integrity / checksum assertion
+// --------------------------------------------------------------------------
+
+// testAgentSHA is a valid 64-hex SHA-256 used as the expected agent digest.
+const testAgentSHA = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+// readyPingFn returns a healthNodes pingFn that reports the agent ready.
+func readyPingFn() func(context.Context, string, string) (*sdknodes.CreateQemuAgentPingResponse, error) {
+	return func(_ context.Context, _, _ string) (*sdknodes.CreateQemuAgentPingResponse, error) {
+		resp := sdknodes.CreateQemuAgentPingResponse(`{}`)
+		return &resp, nil
+	}
+}
+
+// execReturning builds an agentExecStatusFn that reports an exited sha256sum
+// whose stdout is "<digest>  <path>".
+func execStatusReturning(digest string, exitCode int64) func(context.Context, string, string, *sdknodes.ListQemuAgentExecStatusParams) (*sdknodes.ListQemuAgentExecStatusResponse, error) {
+	return func(_ context.Context, _, _ string, _ *sdknodes.ListQemuAgentExecStatusParams) (*sdknodes.ListQemuAgentExecStatusResponse, error) {
+		out := digest + "  /var/vcap/bosh/bin/bosh-agent\n"
+		ec := exitCode
+		return &sdknodes.ListQemuAgentExecStatusResponse{Exited: true, Exitcode: &ec, OutData: &out}, nil
+	}
+}
+
+func healthCfgWithSHA() *config.HealthCheckConfig {
+	hc := healthCheckCfg(true, 10, 0)
+	hc.ExpectedAgentSHA256 = testAgentSHA
+	return hc
+}
+
+func TestCreateVM_AgentChecksum_Match(t *testing.T) {
+	t.Parallel()
+	defer handlers.SetAgentChecksumTimings(50*time.Millisecond, time.Millisecond)()
+
+	n := &healthNodes{
+		pingFn: readyPingFn(),
+		agentExecFn: func(_ context.Context, _, _ string, _ *sdknodes.CreateQemuAgentExecParams) (*sdknodes.CreateQemuAgentExecResponse, error) {
+			return &sdknodes.CreateQemuAgentExecResponse{Pid: 42}, nil
+		},
+		agentExecStatusFn: execStatusReturning(testAgentSHA, 0),
+	}
+	deleteCalled := false
+	n.deleteQemuFn = func(_ context.Context, _, _ string, _ *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
+		deleteCalled = true
+		return &sdknodes.DeleteQemuResponse{}, nil
+	}
+	deps := buildHealthDeps(n, healthCfgWithSHA())
+
+	args := mkArgs("agent-checksum-match", testStemcellCID,
+		map[string]any{"cores": 1, "memory": 512}, standardNetworks(), []string{}, map[string]any{})
+	_, err := handlers.HandleCreateVM(deps).Handle(context.Background(), args, mkCtx("checksum-match"))
+	if err != nil {
+		t.Fatalf("matching checksum must succeed, got: %v", err)
+	}
+	if n.execCalls < 1 {
+		t.Error("expected sha256sum exec to run")
+	}
+	if deleteCalled {
+		t.Error("rollback must NOT run when checksum matches")
+	}
+}
+
+func TestCreateVM_AgentChecksum_Mismatch_FailsAndRollsBack(t *testing.T) {
+	t.Parallel()
+	defer handlers.SetAgentChecksumTimings(50*time.Millisecond, time.Millisecond)()
+
+	wrong := "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+	n := &healthNodes{
+		pingFn: readyPingFn(),
+		agentExecFn: func(_ context.Context, _, _ string, _ *sdknodes.CreateQemuAgentExecParams) (*sdknodes.CreateQemuAgentExecResponse, error) {
+			return &sdknodes.CreateQemuAgentExecResponse{Pid: 7}, nil
+		},
+		agentExecStatusFn: execStatusReturning(wrong, 0),
+	}
+	deleteCalled := false
+	n.deleteQemuFn = func(_ context.Context, _, _ string, _ *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
+		deleteCalled = true
+		return &sdknodes.DeleteQemuResponse{}, nil
+	}
+	deps := buildHealthDeps(n, healthCfgWithSHA())
+
+	args := mkArgs("agent-checksum-mismatch", testStemcellCID,
+		map[string]any{"cores": 1, "memory": 512}, standardNetworks(), []string{}, map[string]any{})
+	_, err := handlers.HandleCreateVM(deps).Handle(context.Background(), args, mkCtx("checksum-mismatch"))
+	if err == nil {
+		t.Fatal("mismatched checksum must fail create_vm")
+	}
+	if !strings.Contains(err.Error(), "agent integrity check failed") {
+		t.Errorf("unexpected error message: %v", err)
+	}
+	if !deleteCalled {
+		t.Error("rollback (DeleteQemu) must run on checksum mismatch")
+	}
+}
+
+func TestCreateVM_AgentChecksum_ExecError_FailOpen(t *testing.T) {
+	t.Parallel()
+	defer handlers.SetAgentChecksumTimings(50*time.Millisecond, time.Millisecond)()
+
+	n := &healthNodes{
+		pingFn: readyPingFn(),
+		agentExecFn: func(_ context.Context, _, _ string, _ *sdknodes.CreateQemuAgentExecParams) (*sdknodes.CreateQemuAgentExecResponse, error) {
+			return nil, errors.New("guest agent not running")
+		},
+	}
+	deleteCalled := false
+	n.deleteQemuFn = func(_ context.Context, _, _ string, _ *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
+		deleteCalled = true
+		return &sdknodes.DeleteQemuResponse{}, nil
+	}
+	deps := buildHealthDeps(n, healthCfgWithSHA())
+
+	args := mkArgs("agent-checksum-execerr", testStemcellCID,
+		map[string]any{"cores": 1, "memory": 512}, standardNetworks(), []string{}, map[string]any{})
+	_, err := handlers.HandleCreateVM(deps).Handle(context.Background(), args, mkCtx("checksum-execerr"))
+	if err != nil {
+		t.Fatalf("exec error must be fail-open (success), got: %v", err)
+	}
+	if deleteCalled {
+		t.Error("rollback must NOT run on fail-open exec error")
+	}
+}
+
+// execPidFn returns an agentExecFn that always reports a started PID.
+func execPidFn(pid int64) func(context.Context, string, string, *sdknodes.CreateQemuAgentExecParams) (*sdknodes.CreateQemuAgentExecResponse, error) {
+	return func(_ context.Context, _, _ string, _ *sdknodes.CreateQemuAgentExecParams) (*sdknodes.CreateQemuAgentExecResponse, error) {
+		return &sdknodes.CreateQemuAgentExecResponse{Pid: pid}, nil
+	}
+}
+
+// runChecksumFailOpenCase drives create_vm with the checksum assertion enabled
+// and the given exec-status behavior, asserting the run succeeds (fail-open) and
+// no rollback fires.
+func runChecksumFailOpenCase(t *testing.T, name string, statusFn func(context.Context, string, string, *sdknodes.ListQemuAgentExecStatusParams) (*sdknodes.ListQemuAgentExecStatusResponse, error)) {
+	t.Helper()
+	defer handlers.SetAgentChecksumTimings(40*time.Millisecond, time.Millisecond)()
+
+	n := &healthNodes{
+		pingFn:            readyPingFn(),
+		agentExecFn:       execPidFn(99),
+		agentExecStatusFn: statusFn,
+	}
+	deleteCalled := false
+	n.deleteQemuFn = func(_ context.Context, _, _ string, _ *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
+		deleteCalled = true
+		return &sdknodes.DeleteQemuResponse{}, nil
+	}
+	deps := buildHealthDeps(n, healthCfgWithSHA())
+
+	args := mkArgs(name, testStemcellCID,
+		map[string]any{"cores": 1, "memory": 512}, standardNetworks(), []string{}, map[string]any{})
+	_, err := handlers.HandleCreateVM(deps).Handle(context.Background(), args, mkCtx(name))
+	if err != nil {
+		t.Fatalf("%s: must be fail-open (success), got: %v", name, err)
+	}
+	if deleteCalled {
+		t.Errorf("%s: rollback must NOT run on fail-open", name)
+	}
+}
+
+func TestCreateVM_AgentChecksum_NonZeroExit_FailOpen(t *testing.T) {
+	t.Parallel()
+	// sha256sum could not read the binary (exit 1) → cannot confirm a mismatch.
+	runChecksumFailOpenCase(t, "agent-checksum-nonzero", execStatusReturning(testAgentSHA, 1))
+}
+
+func TestCreateVM_AgentChecksum_Unparseable_FailOpen(t *testing.T) {
+	t.Parallel()
+	runChecksumFailOpenCase(t, "agent-checksum-unparseable",
+		func(_ context.Context, _, _ string, _ *sdknodes.ListQemuAgentExecStatusParams) (*sdknodes.ListQemuAgentExecStatusResponse, error) {
+			garbage := "not-a-digest\n"
+			ec := int64(0)
+			return &sdknodes.ListQemuAgentExecStatusResponse{Exited: true, Exitcode: &ec, OutData: &garbage}, nil
+		})
+}
+
+func TestCreateVM_AgentChecksum_NeverExits_TimeoutFailOpen(t *testing.T) {
+	t.Parallel()
+	// Command never reports exited → awaitAgentExec hits its bound and fails open.
+	runChecksumFailOpenCase(t, "agent-checksum-neverexits",
+		func(_ context.Context, _, _ string, _ *sdknodes.ListQemuAgentExecStatusParams) (*sdknodes.ListQemuAgentExecStatusResponse, error) {
+			return &sdknodes.ListQemuAgentExecStatusResponse{Exited: false}, nil
+		})
+}
+
+func TestCreateVM_AgentChecksum_EmptyExpected_NoExec(t *testing.T) {
+	t.Parallel()
+
+	n := &healthNodes{pingFn: readyPingFn()}
+	// Health enabled, but no expected checksum → assertion skipped, no exec call.
+	deps := buildHealthDeps(n, healthCheckCfg(true, 10, 0))
+
+	args := mkArgs("agent-checksum-empty", testStemcellCID,
+		map[string]any{"cores": 1, "memory": 512}, standardNetworks(), []string{}, map[string]any{})
+	_, err := handlers.HandleCreateVM(deps).Handle(context.Background(), args, mkCtx("checksum-empty"))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if n.execCalls != 0 {
+		t.Errorf("no expected checksum: want 0 exec calls, got %d", n.execCalls)
+	}
 }
