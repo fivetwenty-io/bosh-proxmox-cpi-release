@@ -507,5 +507,10 @@
   if_p("pve.stemcell.prune_dry_run") { |v| stemcell["prune_dry_run"] = v }
   config["stemcell"] = stemcell unless stemcell.empty?
 
+  # Emit fast_path_delete only when the operator explicitly opts in. The Go
+  # config defaults to synchronous await (false) when the key is absent, so
+  # omitting it preserves byte-identical behavior on existing deployments.
+  if_p("pve.fast_path_delete") { |v| config["fast_path_delete"] = v }
+
   JSON.dump(config)
 %>

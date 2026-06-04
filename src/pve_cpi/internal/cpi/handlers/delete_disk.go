@@ -77,15 +77,28 @@ func HandleDeleteDisk(deps Deps) Handler {
 		}
 
 		// ----------------------------------------------------------------
-		// 4. Delete the volume. SDK DeleteVolumeAsync is already 404-safe;
-		//    we do NOT propagate 404 as an error. Await the returned
-		//    imgdel UPID so a queued imgdel under storage-lock contention
-		//    cannot fire after delete_disk has already returned success.
+		// 4. Delete the volume.
+		//
+		// Fast-path mode (fast_path_delete=true): issue DeleteVolumeAsync and
+		// return immediately without awaiting the imgdel task. Eventual
+		// consistency: has_disk may briefly still see the volume. Disk volumes
+		// cannot carry PVE tags, so no "bosh-deleting" marker is applied here;
+		// the operator must rely on the volume eventually disappearing from
+		// storage. The §7.13 orphan-GC sweep (for VM templates) does not cover
+		// raw volumes; PVE's own storage GC handles stale imgdel residue.
+		//
+		// Slow-path mode (default): issue DeleteVolumeAsync and await the
+		// returned imgdel UPID so a queued imgdel under storage-lock contention
+		// cannot fire after delete_disk has already returned success.
 		// ----------------------------------------------------------------
 		delErr := pve.RetryOnTransientOrLock(ctx, deps.Logger, "delete_disk", 0, func() error {
 			upid, err := deps.PVE.Storage().DeleteVolumeAsync(ctx, node, storage, bareDiskCID)
 			if err != nil {
 				return err
+			}
+			// Fast-path: return without awaiting the task UPID.
+			if deps.Config.FastPathDeleteEnabled() {
+				return nil
 			}
 			if upid == "" {
 				return nil

@@ -50,7 +50,7 @@ GC — now recorded as "Limits" under each feature. Second, the wider reference 
 up **ten genuinely new gaps (§7.26–§7.35)**, none of which appeared in the prior report; they
 are extensions of the shipped work (enforce the invariants §7.9 records, monitor the resizes
 §7.24 sizes, make the polling §7.25 fixed adaptive, and so on). The first four (§7.26–§7.29)
-have since been **shipped**; §7.30 has also shipped; §7.31–§7.35 remain **open**.
+have since been **shipped**; §7.30 has also shipped; §7.32 has also shipped; §7.31, §7.33–§7.35 remain **open**.
 The §3 matrix gained one correction (Azure `update_disk` is a full method, now `Y`), and the
 §6 standout list was corrected against source in several places — most notably that
 process-level panic recovery (§7.4) is *not* unique to OpenStack-Go (Google has it too). The
@@ -1182,7 +1182,7 @@ curves are pure and deterministic except for seeded jitter.
 
 These ten did not appear in the prior report. They surfaced from the deeper reference
 re-read and the source-level verification of the shipped features above. The first four
-(§7.26–§7.30) have since been **shipped**; §7.31–§7.35 remain **open**. Each follows the same
+(§7.26–§7.30) have since been **shipped**; §7.32 has also been **shipped**; §7.31, §7.33–§7.35 remain **open**. Each follows the same
 additive-optional convention the shipped work established: validate only when set, omit from
 VM config when empty, zero behavior change for existing manifests. They are ordered roughly by
 effort-to-value, not severity.
@@ -1296,17 +1296,40 @@ fall through to the next-ranked candidate from the §7.10 scorer (which already 
 ranked list) instead of failing `create_vm`, using the §7.23 classifier to decide
 retry-vs-fail. The post-selection analogue of the already-shipped pre-selection fallback.
 
-#### 7.32 OPEN — Fast-path delete (tag-and-return without terminal-state poll)
+#### 7.32 DONE — Fast-path delete (tag-and-return without terminal-state poll)
 
 *Reference: AWS.* `delete_vm`/`delete_disk` always wait for the resource to disappear. The
 documented wedged-task incident — a `get_task` poll that never returns, holding a director
 queue slot — is the cost of synchronously waiting on a pathological task. AWS's
-`fast_path_delete` tags the resource and returns immediately. **Build:** an opt-in
-`fast_path_delete` that tags the VM `deleting`, issues the destroy, and returns without
-polling terminal state; pair it with the §7.13 orphan-GC sweep to reap leftovers. It must
-*bypass* the §7.15 envelope (inverse philosophy: skip the wait rather than bound it). The
-two are complementary fixes for the same queue-slot hazard — bound the wait (§7.15) and skip
-the wait (§7.32) cover different operations.
+`fast_path_delete` tags the resource and returns immediately.
+
+**Shipped:** opt-in `pve.fast_path_delete` boolean (default false, nil-absent → byte-identical
+to prior releases). When enabled:
+
+- `delete_vm` stamps the PVE tag `bosh-deleting` on the VM before issuing the destroy
+  (best-effort, fail-open: a tag write failure is logged and never blocks the destroy). It then
+  issues the stop fire-and-forget (the stop UPID is discarded — no await, so a wedged stop task
+  cannot hold a director queue slot) and issues the destroy (`DeleteQemu` with `purge=true`,
+  `destroy_unreferenced_disks=true`, `skiplock=true` so a still-running or locked VM is removed),
+  returning immediately without calling `AwaitTaskWithLogger`. Existing BOSH-managed tags are
+  preserved via `mergeTagList`.
+- `delete_disk` issues `DeleteVolumeAsync` and returns without awaiting the imgdel UPID. Disk
+  volumes cannot carry PVE tags, so no `bosh-deleting` marker is applied; the operator relies
+  on the volume eventually disappearing from storage.
+- Idempotency is preserved in both modes: a 404 on the destroy or delete call returns success
+  without error.
+
+**Eventual-consistency tradeoff:** a subsequent `has_vm` or `has_disk` call may briefly still
+see the resource until PVE's async destroy completes. A stalled async destroy is reaped by
+`sweepFastDeleteStragglers`, which runs at the start of every fast-path `delete_vm`: it scans the
+cluster for VMs still carrying `bosh-deleting` and re-issues a `skiplock`+`purge` destroy for
+each (best-effort, fire-and-forget, idempotent on 404). The `bosh-deleting` tag therefore acts as
+a self-draining work queue, so leftover VMs do not accumulate across deployments. (This is a
+fast-delete-specific sweep, distinct from the §7.13 orphan-GC, which keys on stemcell sha and
+director-scoped base volumes rather than this tag.) The fast path bypasses the §7.15
+operation-timeout envelope naturally: the handler returns before any task-poll loop begins, so
+the two are complementary fixes — bound the wait (§7.15) and skip the wait (§7.32) cover
+different operations.
 
 #### 7.33 DONE — Articulate the idempotency-collision model
 
@@ -1411,11 +1434,11 @@ graph TD
         D2[7.27 Resize completion monitor]
         D3[7.28 Adaptive task-poll]
         D4[7.29 Boot-path agent integrity]
+        D11[7.32 Fast-path delete]
     end
     subgraph OPEN["Still open"]
         D5[7.30 API connection-pool tuning]
         D6[7.31 Post-selection fallback]
-        D7[7.32 Fast-path delete]
         D8[7.33 Idempotency-collision model]
         D9[7.34 Network-property override]
         D10[7.35 Multipart stemcell upload]

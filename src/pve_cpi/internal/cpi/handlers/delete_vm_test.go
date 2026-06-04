@@ -2,12 +2,15 @@ package handlers_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/cpi/handlers"
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
+	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cluster"
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/nodes"
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/tasks"
 	sdkerrors "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/errors"
@@ -730,6 +733,800 @@ func TestDeleteVM_AwaitDestroyTransientRetriable(t *testing.T) {
 	var cpiErr *cpierrors.Error
 	if !errors.As(err, &cpiErr) {
 		t.Fatalf("expected *cpierrors.Error, got %T: %v", err, err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// §7.32 fast-path delete tests
+// ---------------------------------------------------------------------------
+
+// fastPathDeps builds Deps with fast_path_delete enabled. It wires the same
+// cluster service as testDepsFoundVM (target VM on vmNode; no straggler VMs).
+func fastPathDeps(vmid int, qemuSvc *mockQEMUService, nodesSvc *mockNodesService, tasksSvc *mockTasksService, agentSvc *mockAgentService) handlers.Deps {
+	deps := testDepsFoundVMWithStorage(vmid, qemuSvc, nodesSvc, tasksSvc, agentSvc, &mockStorageService{})
+	enabled := true
+	deps.Config.FastPathDelete = &enabled
+	return deps
+}
+
+// TestHandleDeleteVM_FastPath_NoAwait verifies that when fast_path_delete is
+// enabled, delete_vm issues the destroy but does NOT call the task poll for
+// either the stop UPID or the destroy UPID. The mockTasksService.waitFn
+// records every UPID passed to it; any call is a test failure.
+func TestHandleDeleteVM_FastPath_NoAwait(t *testing.T) {
+	t.Parallel()
+
+	const stopUPID = "UPID:pve-node1:00AABBCC:00112233:6789ABCD:qmstop:701:root@pam:"
+	const destroyUPID = "UPID:pve-node1:00AABBCC:00112233:6789ABCD:qmdestroy:701:root@pam:"
+	awaitCalledForAny := false
+
+	qemuSvc := &mockQEMUService{
+		stopFn: func(_ context.Context, _ string, _ int) (string, error) {
+			// Return a real stop UPID. The fast path must discard it without await.
+			return stopUPID, nil
+		},
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return map[string]any{}, nil
+		},
+	}
+	deleteResp := nodes.DeleteQemuResponse(`"` + destroyUPID + `"`)
+	nodesSvc := &mockNodesService{
+		deleteQemuFn: func(_ context.Context, _ string, _ string, _ *nodes.DeleteQemuParams) (*nodes.DeleteQemuResponse, error) {
+			return &deleteResp, nil
+		},
+		updateQemuConfigFn: func(_ context.Context, _ string, _ string, _ *nodes.UpdateQemuConfigParams) error {
+			return nil
+		},
+	}
+	tasksSvc := &mockTasksService{
+		waitFn: func(_ context.Context, _, upid string, _ *tasks.WaitOptions) (*tasks.Status, error) {
+			// Any Wait call on the fast path is a defect.
+			awaitCalledForAny = true
+			t.Errorf("fast-path delete: tasks.Wait must NOT be called; got upid=%q", upid)
+			return &tasks.Status{ExitStatus: "OK"}, nil
+		},
+	}
+	agentSvc := &mockAgentService{}
+
+	h := handlers.HandleDeleteVM(fastPathDeps(701, qemuSvc, nodesSvc, tasksSvc, agentSvc))
+	result, err := h.Handle(context.Background(), marshalArgs("701"), jsonrpc.Context{})
+
+	if err != nil {
+		t.Fatalf("fast-path delete: unexpected error: %v", err)
+	}
+	if result != nil {
+		t.Errorf("fast-path delete: expected nil result, got %v", result)
+	}
+	if awaitCalledForAny {
+		t.Error("fast-path delete: task poll must NOT be called for any UPID (stop or destroy)")
+	}
+}
+
+// TestHandleDeleteVM_FastPath_TagsVM verifies that when fast_path_delete is
+// enabled, the VM is tagged with "bosh-deleting" via UpdateQemuConfig.
+// Existing tags on the VM are preserved (mergeTagList).
+func TestHandleDeleteVM_FastPath_TagsVM(t *testing.T) {
+	t.Parallel()
+
+	tagCallCount := 0
+	var capturedTags string
+
+	qemuSvc := &mockQEMUService{
+		stopFn: func(_ context.Context, _ string, _ int) (string, error) {
+			return "", nil
+		},
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			// Return existing tags so mergeTagList is exercised with a non-empty base.
+			return map[string]any{"tags": "existing-tag"}, nil
+		},
+	}
+	nodesSvc := &mockNodesService{
+		deleteQemuFn: func(_ context.Context, _ string, _ string, _ *nodes.DeleteQemuParams) (*nodes.DeleteQemuResponse, error) {
+			raw := nodes.DeleteQemuResponse{}
+			return &raw, nil
+		},
+		updateQemuConfigFn: func(_ context.Context, _ string, _ string, params *nodes.UpdateQemuConfigParams) error {
+			tagCallCount++
+			if params != nil && params.Tags != nil {
+				capturedTags = *params.Tags
+			}
+			return nil
+		},
+	}
+	tasksSvc := &mockTasksService{}
+	agentSvc := &mockAgentService{}
+
+	h := handlers.HandleDeleteVM(fastPathDeps(702, qemuSvc, nodesSvc, tasksSvc, agentSvc))
+	_, err := h.Handle(context.Background(), marshalArgs("702"), jsonrpc.Context{})
+
+	if err != nil {
+		t.Fatalf("fast-path tag test: unexpected error: %v", err)
+	}
+	if tagCallCount == 0 {
+		t.Error("fast-path delete: UpdateQemuConfig must be called to stamp bosh-deleting tag")
+	}
+	if !strings.Contains(capturedTags, "bosh-deleting") {
+		t.Errorf("fast-path delete: tags must include 'bosh-deleting'; got %q", capturedTags)
+	}
+	if !strings.Contains(capturedTags, "existing-tag") {
+		t.Errorf("fast-path delete: existing tags must be preserved; got %q", capturedTags)
+	}
+}
+
+// TestHandleDeleteVM_FastPath_TagFailOpen verifies that a tagging failure
+// (UpdateQemuConfig error) does NOT block the destroy call.
+func TestHandleDeleteVM_FastPath_TagFailOpen(t *testing.T) {
+	t.Parallel()
+
+	deleteCalled := false
+
+	qemuSvc := &mockQEMUService{
+		stopFn: func(_ context.Context, _ string, _ int) (string, error) {
+			return "", nil
+		},
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return map[string]any{}, nil
+		},
+	}
+	nodesSvc := &mockNodesService{
+		deleteQemuFn: func(_ context.Context, _ string, _ string, _ *nodes.DeleteQemuParams) (*nodes.DeleteQemuResponse, error) {
+			deleteCalled = true
+			raw := nodes.DeleteQemuResponse{}
+			return &raw, nil
+		},
+		updateQemuConfigFn: func(_ context.Context, _ string, _ string, _ *nodes.UpdateQemuConfigParams) error {
+			return errors.New("pve: config write: lock timeout")
+		},
+	}
+	tasksSvc := &mockTasksService{}
+	agentSvc := &mockAgentService{}
+
+	h := handlers.HandleDeleteVM(fastPathDeps(703, qemuSvc, nodesSvc, tasksSvc, agentSvc))
+	result, err := h.Handle(context.Background(), marshalArgs("703"), jsonrpc.Context{})
+
+	if err != nil {
+		t.Fatalf("fast-path tag-fail-open: tagging error must not propagate, got: %v", err)
+	}
+	if result != nil {
+		t.Errorf("fast-path tag-fail-open: expected nil result, got %v", result)
+	}
+	if !deleteCalled {
+		t.Error("fast-path tag-fail-open: destroy must still be issued after tag failure")
+	}
+}
+
+// TestHandleDeleteVM_FastPath_NotFound_Idempotent verifies that when the VM is
+// not found during the fast-path destroy call, the handler returns success.
+func TestHandleDeleteVM_FastPath_NotFound_Idempotent(t *testing.T) {
+	t.Parallel()
+
+	qemuSvc := &mockQEMUService{
+		stopFn: func(_ context.Context, _ string, _ int) (string, error) {
+			return "", nil
+		},
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return map[string]any{}, nil
+		},
+	}
+	nodesSvc := &mockNodesService{
+		deleteQemuFn: func(_ context.Context, _ string, _ string, _ *nodes.DeleteQemuParams) (*nodes.DeleteQemuResponse, error) {
+			return nil, notFoundAPIErr()
+		},
+		updateQemuConfigFn: func(_ context.Context, _ string, _ string, _ *nodes.UpdateQemuConfigParams) error {
+			return nil
+		},
+	}
+	tasksSvc := &mockTasksService{}
+	agentSvc := &mockAgentService{}
+
+	h := handlers.HandleDeleteVM(fastPathDeps(704, qemuSvc, nodesSvc, tasksSvc, agentSvc))
+	result, err := h.Handle(context.Background(), marshalArgs("704"), jsonrpc.Context{})
+
+	if err != nil {
+		t.Fatalf("fast-path NotFound idempotent: expected nil error, got: %v", err)
+	}
+	if result != nil {
+		t.Errorf("fast-path NotFound idempotent: expected nil result, got %v", result)
+	}
+}
+
+// TestHandleDeleteVM_SlowPath_AwaitsTask confirms that when fast_path_delete is
+// OFF (default), the destroy task IS awaited — byte-identical behavior.
+func TestHandleDeleteVM_SlowPath_AwaitsTask(t *testing.T) {
+	t.Parallel()
+
+	const destroyUPID = "UPID:pve-node1:00AABBCC:00112233:6789ABCD:qmdestroy:705:root@pam:"
+	awaitCalled := false
+
+	qemuSvc := &mockQEMUService{
+		stopFn: func(_ context.Context, _ string, _ int) (string, error) {
+			return "", nil
+		},
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return map[string]any{}, nil
+		},
+	}
+	deleteResp := nodes.DeleteQemuResponse(`"` + destroyUPID + `"`)
+	nodesSvc := &mockNodesService{
+		deleteQemuFn: func(_ context.Context, _ string, _ string, _ *nodes.DeleteQemuParams) (*nodes.DeleteQemuResponse, error) {
+			return &deleteResp, nil
+		},
+	}
+	tasksSvc := &mockTasksService{
+		waitFn: func(_ context.Context, _, upid string, _ *tasks.WaitOptions) (*tasks.Status, error) {
+			if upid == destroyUPID {
+				awaitCalled = true
+			}
+			return &tasks.Status{ExitStatus: "OK"}, nil
+		},
+	}
+	agentSvc := &mockAgentService{}
+
+	// Use testDepsFoundVM (no FastPathDelete set → nil → off).
+	h := handlers.HandleDeleteVM(testDepsFoundVM(705, qemuSvc, nodesSvc, tasksSvc, agentSvc))
+	_, err := h.Handle(context.Background(), marshalArgs("705"), jsonrpc.Context{})
+
+	if err != nil {
+		t.Fatalf("slow-path byte-identical: unexpected error: %v", err)
+	}
+	if !awaitCalled {
+		t.Error("slow-path byte-identical: destroy task must be awaited when fast_path_delete is OFF")
+	}
+}
+
+// TestHandleDeleteVM_FastPath_ExplicitFalse_AwaitsTask confirms that
+// fast_path_delete=*false (explicit false, not nil) preserves the synchronous
+// await path — byte-identical to nil.
+func TestHandleDeleteVM_FastPath_ExplicitFalse_AwaitsTask(t *testing.T) {
+	t.Parallel()
+
+	const destroyUPID = "UPID:pve-node1:00AABBCC:00112233:6789ABCD:qmdestroy:706:root@pam:"
+	awaitCalled := false
+
+	qemuSvc := &mockQEMUService{
+		stopFn: func(_ context.Context, _ string, _ int) (string, error) {
+			return "", nil
+		},
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return map[string]any{}, nil
+		},
+	}
+	deleteResp := nodes.DeleteQemuResponse(`"` + destroyUPID + `"`)
+	nodesSvc := &mockNodesService{
+		deleteQemuFn: func(_ context.Context, _ string, _ string, _ *nodes.DeleteQemuParams) (*nodes.DeleteQemuResponse, error) {
+			return &deleteResp, nil
+		},
+	}
+	tasksSvc := &mockTasksService{
+		waitFn: func(_ context.Context, _, upid string, _ *tasks.WaitOptions) (*tasks.Status, error) {
+			if upid == destroyUPID {
+				awaitCalled = true
+			}
+			return &tasks.Status{ExitStatus: "OK"}, nil
+		},
+	}
+	agentSvc := &mockAgentService{}
+
+	deps := testDepsFoundVM(706, qemuSvc, nodesSvc, tasksSvc, agentSvc)
+	disabled := false
+	deps.Config.FastPathDelete = &disabled // explicit *false
+
+	h := handlers.HandleDeleteVM(deps)
+	_, err := h.Handle(context.Background(), marshalArgs("706"), jsonrpc.Context{})
+
+	if err != nil {
+		t.Fatalf("explicit-false: unexpected error: %v", err)
+	}
+	if !awaitCalled {
+		t.Error("explicit-false: destroy task must be awaited when fast_path_delete is explicit *false")
+	}
+}
+
+// TestHandleDeleteVM_FastPath_StaggerSweepReapsStraggler verifies that the
+// straggler sweep (sweepFastDeleteStragglers) finds a VM tagged bosh-deleting
+// in the cluster list and re-issues a destroy for it before the current delete.
+func TestHandleDeleteVM_FastPath_StaggerSweepReapsStraggler(t *testing.T) {
+	t.Parallel()
+
+	const currentVMID = 710
+	const stragglerVMID = 711
+	const stragglerNode = "pve-node1"
+
+	stragglerDestroyCalled := false
+	currentDestroyCalled := false
+
+	// Build a cluster response that contains:
+	//   - stragglerVMID: tagged bosh-deleting (straggler from a prior fast-path delete)
+	//   - currentVMID: not tagged (the VM being deleted now)
+	stragglerRaw, _ := json.Marshal(map[string]any{
+		"vmid": stragglerVMID,
+		"node": stragglerNode,
+		"type": "qemu",
+		"tags": "bosh-deleting",
+	})
+	currentRaw, _ := json.Marshal(map[string]any{
+		"vmid": currentVMID,
+		"node": vmNode,
+		"type": "qemu",
+	})
+	clusterSvc := &mockClusterSvc{
+		listResourcesFn: func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+			resp := cluster.ListResourcesResponse{currentRaw, stragglerRaw}
+			return &resp, nil
+		},
+	}
+
+	qemuSvc := &mockQEMUService{
+		stopFn: func(_ context.Context, _ string, _ int) (string, error) {
+			return "", nil
+		},
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return map[string]any{}, nil
+		},
+	}
+	nodesSvc := &mockNodesService{
+		deleteQemuFn: func(_ context.Context, _ string, vmidStr string, _ *nodes.DeleteQemuParams) (*nodes.DeleteQemuResponse, error) {
+			switch vmidStr {
+			case "711":
+				stragglerDestroyCalled = true
+			case "710":
+				currentDestroyCalled = true
+			}
+			raw := nodes.DeleteQemuResponse{}
+			return &raw, nil
+		},
+		updateQemuConfigFn: func(_ context.Context, _ string, _ string, _ *nodes.UpdateQemuConfigParams) error {
+			return nil
+		},
+	}
+	tasksSvc := &mockTasksService{}
+	agentSvc := &mockAgentService{}
+
+	deps := testDepsWithCluster(qemuSvc, nodesSvc, tasksSvc, agentSvc, &mockStorageService{}, clusterSvc)
+	enabled := true
+	deps.Config.FastPathDelete = &enabled
+
+	h := handlers.HandleDeleteVM(deps)
+	_, err := h.Handle(context.Background(), marshalArgs("710"), jsonrpc.Context{})
+
+	if err != nil {
+		t.Fatalf("straggler sweep: unexpected error: %v", err)
+	}
+	if !stragglerDestroyCalled {
+		t.Error("straggler sweep: must re-issue destroy for bosh-deleting VM 711")
+	}
+	if !currentDestroyCalled {
+		t.Error("straggler sweep: current VM 710 destroy must also be issued")
+	}
+}
+
+// TestHandleDeleteVM_FastPath_SweepSkipsGoneStraggler verifies that the sweep
+// treats a 404 on a straggler destroy as idempotent success (VM already gone).
+func TestHandleDeleteVM_FastPath_SweepSkipsGoneStraggler(t *testing.T) {
+	t.Parallel()
+
+	const currentVMID = 720
+	const stragglerVMID = 721
+
+	sweepErrPropagated := false
+
+	stragglerRaw, _ := json.Marshal(map[string]any{
+		"vmid": stragglerVMID,
+		"node": vmNode,
+		"type": "qemu",
+		"tags": "bosh-deleting",
+	})
+	currentRaw, _ := json.Marshal(map[string]any{
+		"vmid": currentVMID,
+		"node": vmNode,
+		"type": "qemu",
+	})
+	clusterSvc := &mockClusterSvc{
+		listResourcesFn: func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+			resp := cluster.ListResourcesResponse{currentRaw, stragglerRaw}
+			return &resp, nil
+		},
+	}
+
+	qemuSvc := &mockQEMUService{
+		stopFn: func(_ context.Context, _ string, _ int) (string, error) {
+			return "", nil
+		},
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return map[string]any{}, nil
+		},
+	}
+	nodesSvc := &mockNodesService{
+		deleteQemuFn: func(_ context.Context, _ string, vmidStr string, _ *nodes.DeleteQemuParams) (*nodes.DeleteQemuResponse, error) {
+			if vmidStr == "721" {
+				// Straggler already gone — 404.
+				return nil, notFoundAPIErr()
+			}
+			// Current VM succeeds.
+			raw := nodes.DeleteQemuResponse{}
+			return &raw, nil
+		},
+		updateQemuConfigFn: func(_ context.Context, _ string, _ string, _ *nodes.UpdateQemuConfigParams) error {
+			return nil
+		},
+	}
+	tasksSvc := &mockTasksService{}
+	agentSvc := &mockAgentService{
+		removeFn: func(_ context.Context, _ string, _ int) error {
+			return nil
+		},
+	}
+
+	deps := testDepsWithCluster(qemuSvc, nodesSvc, tasksSvc, agentSvc, &mockStorageService{}, clusterSvc)
+	enabled := true
+	deps.Config.FastPathDelete = &enabled
+
+	h := handlers.HandleDeleteVM(deps)
+	_, err := h.Handle(context.Background(), marshalArgs("720"), jsonrpc.Context{})
+
+	// Straggler 404 must NOT cause the current delete to fail.
+	if err != nil {
+		sweepErrPropagated = true
+		t.Fatalf("straggler sweep: 404 on straggler must be non-fatal, got: %v", err)
+	}
+	if sweepErrPropagated {
+		t.Error("straggler 404 propagated as error")
+	}
+}
+
+// TestHandleDeleteVM_FastPath_SweepFailOpen verifies that a ListResources
+// failure in the straggler sweep does not block the current delete.
+//
+// HandleDeleteVM calls ListResources TWICE when fast_path_delete is on:
+//   - Call #1: FindVMNodeViaCluster (locate step) — must succeed so the delete proceeds.
+//   - Call #2: sweepFastDeleteStragglers — may fail; failure must be non-fatal.
+//
+// The call-counter mock returns the target VM on the first call and an error on
+// the second, proving locate succeeds while sweep fails open.
+func TestHandleDeleteVM_FastPath_SweepFailOpen(t *testing.T) {
+	t.Parallel()
+
+	const currentVMID = 730
+	currentDestroyCalled := false
+
+	// Build the locate response: a single qemu VM entry for VMID 730 on pve-node1.
+	locateRaw, _ := json.Marshal(map[string]any{
+		"vmid": currentVMID,
+		"node": vmNode,
+		"type": "qemu",
+	})
+	locateResp := cluster.ListResourcesResponse{locateRaw}
+
+	var listCallCount int
+	clusterSvc := &mockClusterSvc{
+		listResourcesFn: func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+			listCallCount++
+			if listCallCount == 1 {
+				// First call: FindVMNodeViaCluster — return the target VM so locate succeeds.
+				return &locateResp, nil
+			}
+			// Second call: sweepFastDeleteStragglers — simulate cluster unreachable.
+			return nil, errors.New("cluster: connection refused")
+		},
+	}
+
+	qemuSvc := &mockQEMUService{
+		stopFn: func(_ context.Context, _ string, _ int) (string, error) {
+			return "", nil
+		},
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return map[string]any{}, nil
+		},
+	}
+	nodesSvc := &mockNodesService{
+		deleteQemuFn: func(_ context.Context, _ string, _ string, _ *nodes.DeleteQemuParams) (*nodes.DeleteQemuResponse, error) {
+			currentDestroyCalled = true
+			raw := nodes.DeleteQemuResponse{}
+			return &raw, nil
+		},
+		updateQemuConfigFn: func(_ context.Context, _ string, _ string, _ *nodes.UpdateQemuConfigParams) error {
+			return nil
+		},
+	}
+	tasksSvc := &mockTasksService{}
+	agentSvc := &mockAgentService{}
+
+	deps := testDepsWithCluster(qemuSvc, nodesSvc, tasksSvc, agentSvc, &mockStorageService{}, clusterSvc)
+	enabled := true
+	deps.Config.FastPathDelete = &enabled
+
+	h := handlers.HandleDeleteVM(deps)
+	result, err := h.Handle(context.Background(), marshalArgs("730"), jsonrpc.Context{})
+
+	if err != nil {
+		t.Fatalf("sweep-fail-open: sweep ListResources error must not block delete, got: %v", err)
+	}
+	if result != nil {
+		t.Errorf("sweep-fail-open: expected nil result, got %v", result)
+	}
+	if !currentDestroyCalled {
+		t.Error("sweep-fail-open: current VM destroy must still be issued after sweep failure")
+	}
+	if listCallCount < 2 {
+		t.Errorf("sweep-fail-open: expected ≥2 ListResources calls (locate + sweep), got %d", listCallCount)
+	}
+}
+
+// TestHandleDeleteVM_FastPath_SweepSkipsNonQemu verifies that the straggler
+// sweep ignores non-qemu cluster resources (e.g. storage, node entries) and
+// untagged qemu VMs. DeleteQemu must not be called for either category.
+func TestHandleDeleteVM_FastPath_SweepSkipsNonQemu(t *testing.T) {
+	t.Parallel()
+
+	const currentVMID = 731
+
+	// Cluster list contains:
+	//   - a storage resource (type != "qemu") — must be skipped
+	//   - an untagged qemu VM — must be skipped (no bosh-deleting tag)
+	//   - the current VM being deleted (no tag) — will be destroyed by the main path
+	storageRaw, _ := json.Marshal(map[string]any{
+		"type":    "storage",
+		"storage": "local-lvm",
+		"node":    vmNode,
+	})
+	untaggedRaw, _ := json.Marshal(map[string]any{
+		"vmid": 799,
+		"node": vmNode,
+		"type": "qemu",
+		// no "tags" field → sweep must skip this VM
+	})
+	currentRaw, _ := json.Marshal(map[string]any{
+		"vmid": currentVMID,
+		"node": vmNode,
+		"type": "qemu",
+	})
+	allEntries := cluster.ListResourcesResponse{storageRaw, untaggedRaw, currentRaw}
+
+	// listResourcesFn is shared between FindVMNodeViaCluster and sweep; return
+	// the same list each time. The locate step finds currentVMID; the sweep
+	// step must skip both non-qemu and untagged entries.
+	clusterSvc := &mockClusterSvc{
+		listResourcesFn: func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+			return &allEntries, nil
+		},
+	}
+
+	deleteQemuCalled := false
+	qemuSvc := &mockQEMUService{
+		stopFn: func(_ context.Context, _ string, _ int) (string, error) {
+			return "", nil
+		},
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return map[string]any{}, nil
+		},
+	}
+	nodesSvc := &mockNodesService{
+		deleteQemuFn: func(_ context.Context, _ string, vmidStr string, _ *nodes.DeleteQemuParams) (*nodes.DeleteQemuResponse, error) {
+			// Only the current VM's destroy (731) is expected; any other call is a defect.
+			if vmidStr != "731" {
+				deleteQemuCalled = true
+				t.Errorf("sweep: unexpected DeleteQemu for vmid=%q (want only 731 for current VM)", vmidStr)
+			}
+			raw := nodes.DeleteQemuResponse{}
+			return &raw, nil
+		},
+		updateQemuConfigFn: func(_ context.Context, _ string, _ string, _ *nodes.UpdateQemuConfigParams) error {
+			return nil
+		},
+	}
+	tasksSvc := &mockTasksService{}
+	agentSvc := &mockAgentService{}
+
+	deps := testDepsWithCluster(qemuSvc, nodesSvc, tasksSvc, agentSvc, &mockStorageService{}, clusterSvc)
+	enabled := true
+	deps.Config.FastPathDelete = &enabled
+
+	h := handlers.HandleDeleteVM(deps)
+	_, err := h.Handle(context.Background(), marshalArgs("731"), jsonrpc.Context{})
+
+	if err != nil {
+		t.Fatalf("sweep-skip-non-qemu: unexpected error: %v", err)
+	}
+	if deleteQemuCalled {
+		t.Error("sweep-skip-non-qemu: DeleteQemu must not be called for non-qemu or untagged VMs")
+	}
+}
+
+// TestHandleDeleteVM_FastPath_SweepDestroyError verifies that a non-NotFound
+// error from DeleteQemu during the straggler sweep is logged but never
+// propagated — the current VM delete must still succeed.
+func TestHandleDeleteVM_FastPath_SweepDestroyError(t *testing.T) {
+	t.Parallel()
+
+	const currentVMID = 732
+	const stragglerVMID = 733
+
+	stragglerRaw, _ := json.Marshal(map[string]any{
+		"vmid": stragglerVMID,
+		"node": vmNode,
+		"type": "qemu",
+		"tags": "bosh-deleting",
+	})
+	currentRaw, _ := json.Marshal(map[string]any{
+		"vmid": currentVMID,
+		"node": vmNode,
+		"type": "qemu",
+	})
+	allEntries := cluster.ListResourcesResponse{currentRaw, stragglerRaw}
+
+	clusterSvc := &mockClusterSvc{
+		listResourcesFn: func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+			return &allEntries, nil
+		},
+	}
+
+	currentDestroyCalled := false
+	qemuSvc := &mockQEMUService{
+		stopFn: func(_ context.Context, _ string, _ int) (string, error) {
+			return "", nil
+		},
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return map[string]any{}, nil
+		},
+	}
+	nodesSvc := &mockNodesService{
+		deleteQemuFn: func(_ context.Context, _ string, vmidStr string, _ *nodes.DeleteQemuParams) (*nodes.DeleteQemuResponse, error) {
+			if vmidStr == "733" {
+				// Straggler destroy fails with a non-404 error.
+				return nil, errors.New("pve: task queue full")
+			}
+			// Current VM destroy succeeds.
+			currentDestroyCalled = true
+			raw := nodes.DeleteQemuResponse{}
+			return &raw, nil
+		},
+		updateQemuConfigFn: func(_ context.Context, _ string, _ string, _ *nodes.UpdateQemuConfigParams) error {
+			return nil
+		},
+	}
+	tasksSvc := &mockTasksService{}
+	agentSvc := &mockAgentService{}
+
+	deps := testDepsWithCluster(qemuSvc, nodesSvc, tasksSvc, agentSvc, &mockStorageService{}, clusterSvc)
+	enabled := true
+	deps.Config.FastPathDelete = &enabled
+
+	h := handlers.HandleDeleteVM(deps)
+	_, err := h.Handle(context.Background(), marshalArgs("732"), jsonrpc.Context{})
+
+	if err != nil {
+		t.Fatalf("sweep-destroy-error: non-404 straggler destroy error must be non-fatal, got: %v", err)
+	}
+	if !currentDestroyCalled {
+		t.Error("sweep-destroy-error: current VM destroy must proceed after straggler destroy failure")
+	}
+}
+
+// TestHandleDeleteVM_FastPath_StopError_NonFatal verifies that when Stop returns
+// a non-NotFound error on the fast path, the error is logged but the destroy
+// still proceeds (skiplock=true handles running/locked VMs).
+func TestHandleDeleteVM_FastPath_StopError_NonFatal(t *testing.T) {
+	t.Parallel()
+
+	destroyCalled := false
+
+	qemuSvc := &mockQEMUService{
+		stopFn: func(_ context.Context, _ string, _ int) (string, error) {
+			// Transient PVE error — not a 404. Fast path must log and continue.
+			return "", errors.New("pve: worker busy")
+		},
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return map[string]any{}, nil
+		},
+	}
+	nodesSvc := &mockNodesService{
+		deleteQemuFn: func(_ context.Context, _ string, _ string, _ *nodes.DeleteQemuParams) (*nodes.DeleteQemuResponse, error) {
+			destroyCalled = true
+			raw := nodes.DeleteQemuResponse{}
+			return &raw, nil
+		},
+		updateQemuConfigFn: func(_ context.Context, _ string, _ string, _ *nodes.UpdateQemuConfigParams) error {
+			return nil
+		},
+	}
+	tasksSvc := &mockTasksService{}
+	agentSvc := &mockAgentService{}
+
+	h := handlers.HandleDeleteVM(fastPathDeps(734, qemuSvc, nodesSvc, tasksSvc, agentSvc))
+	_, err := h.Handle(context.Background(), marshalArgs("734"), jsonrpc.Context{})
+
+	if err != nil {
+		t.Fatalf("fast-path stop-error non-fatal: expected nil error, got: %v", err)
+	}
+	if !destroyCalled {
+		t.Error("fast-path stop-error non-fatal: destroy must still be issued after non-fatal stop error")
+	}
+}
+
+// TestHandleDeleteVM_FastPath_DestroyError_Propagates verifies that a real
+// (non-NotFound) error from DeleteQemu on the fast path is wrapped and returned
+// to the caller. This is the only error path that blocks a fast-path delete.
+func TestHandleDeleteVM_FastPath_DestroyError_Propagates(t *testing.T) {
+	t.Parallel()
+
+	qemuSvc := &mockQEMUService{
+		stopFn: func(_ context.Context, _ string, _ int) (string, error) {
+			return "", nil
+		},
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return map[string]any{}, nil
+		},
+	}
+	nodesSvc := &mockNodesService{
+		deleteQemuFn: func(_ context.Context, _ string, _ string, _ *nodes.DeleteQemuParams) (*nodes.DeleteQemuResponse, error) {
+			return nil, errors.New("pve: storage backend failure")
+		},
+		updateQemuConfigFn: func(_ context.Context, _ string, _ string, _ *nodes.UpdateQemuConfigParams) error {
+			return nil
+		},
+	}
+	tasksSvc := &mockTasksService{}
+	agentSvc := &mockAgentService{}
+
+	h := handlers.HandleDeleteVM(fastPathDeps(735, qemuSvc, nodesSvc, tasksSvc, agentSvc))
+	_, err := h.Handle(context.Background(), marshalArgs("735"), jsonrpc.Context{})
+
+	if err == nil {
+		t.Fatal("fast-path destroy-error: expected wrapped error from DeleteQemu failure, got nil")
+	}
+	var cpiErr *cpierrors.Error
+	if !errors.As(err, &cpiErr) {
+		t.Fatalf("fast-path destroy-error: expected *cpierrors.Error, got %T: %v", err, err)
+	}
+}
+
+// TestHandleDeleteVM_FastPath_StopNotFound_EarlyReturn verifies that when Stop
+// returns IsNotFound on the fast path, the handler cleans up agent state and
+// returns success immediately without issuing DeleteQemu.
+func TestHandleDeleteVM_FastPath_StopNotFound_EarlyReturn(t *testing.T) {
+	t.Parallel()
+
+	destroyCalled := false
+
+	qemuSvc := &mockQEMUService{
+		stopFn: func(_ context.Context, _ string, _ int) (string, error) {
+			return "", &sdkerrors.APIError{HTTPCode: 404}
+		},
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return map[string]any{}, nil
+		},
+	}
+	nodesSvc := &mockNodesService{
+		deleteQemuFn: func(_ context.Context, _ string, _ string, _ *nodes.DeleteQemuParams) (*nodes.DeleteQemuResponse, error) {
+			destroyCalled = true
+			t.Error("fast-path: DeleteQemu must NOT be called when Stop returns IsNotFound (early return)")
+			raw := nodes.DeleteQemuResponse{}
+			return &raw, nil
+		},
+		updateQemuConfigFn: func(_ context.Context, _ string, _ string, _ *nodes.UpdateQemuConfigParams) error {
+			return nil
+		},
+	}
+	tasksSvc := &mockTasksService{}
+	agentRemoveCalled := false
+	agentSvc := &mockAgentService{
+		removeFn: func(_ context.Context, _ string, _ int) error {
+			agentRemoveCalled = true
+			return nil
+		},
+	}
+
+	h := handlers.HandleDeleteVM(fastPathDeps(736, qemuSvc, nodesSvc, tasksSvc, agentSvc))
+	_, err := h.Handle(context.Background(), marshalArgs("736"), jsonrpc.Context{})
+
+	if err != nil {
+		t.Fatalf("fast-path stop-not-found early-return: expected nil error, got: %v", err)
+	}
+	if destroyCalled {
+		t.Error("fast-path stop-not-found early-return: DeleteQemu must not be called after Stop IsNotFound")
+	}
+	if !agentRemoveCalled {
+		t.Error("fast-path stop-not-found early-return: agent.Remove must be called for cleanup")
 	}
 }
 

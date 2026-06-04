@@ -534,6 +534,21 @@ type CPIConfig struct {
 	// distinguishable from an explicit false. Use StrictConfigValidationEnabled()
 	// to obtain the effective bool. Validate-only-when-set; omit from ERB when nil.
 	StrictConfigValidation *bool `json:"strict_config_validation,omitempty"`
+
+	// FastPathDelete enables opt-in fast-path delete for delete_vm and delete_disk.
+	// When nil or *false (the default), delete_vm and delete_disk issue the destroy
+	// and await the PVE task until the resource is confirmed gone — fully synchronous
+	// and consistent. When *true, the handlers tag the VM "bosh-deleting" (best-effort,
+	// fail-open), issue the destroy call, and return without polling the task's terminal
+	// state. This eliminates the queue-slot hazard described in §7.15 for the delete
+	// path at the cost of eventual consistency: a subsequent has_vm/has_disk may briefly
+	// still see the resource until the async destroy completes. The §7.13 orphan-GC sweep
+	// reaps any VM whose async destroy never completes.
+	//
+	// Default false (nil → false via FastPathDeleteEnabled). Pointer-typed so nil (absent
+	// from JSON) is distinguishable from an explicit false. Validate-only-when-set; omit
+	// from ERB when nil.
+	FastPathDelete *bool `json:"fast_path_delete,omitempty"`
 }
 
 // TypeProfile is a named bundle of default cloud_properties applied by the
@@ -1863,6 +1878,16 @@ func (c *CPIConfig) StrictConfigValidationEnabled() bool {
 		return false
 	}
 	return *c.StrictConfigValidation
+}
+
+// FastPathDeleteEnabled reports whether opt-in fast-path delete is active.
+// When false (nil/absent/explicit *false), delete_vm and delete_disk await
+// the PVE task until the resource is confirmed gone — fully synchronous.
+// When true, the handlers tag-and-return without polling terminal state
+// (eventual consistency; pairs with §7.13 orphan-GC to reap leftovers).
+// Default false (nil → false).
+func (c *CPIConfig) FastPathDeleteEnabled() bool {
+	return c != nil && c.FastPathDelete != nil && *c.FastPathDelete
 }
 
 // Validate checks all required fields and enum constraints.

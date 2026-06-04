@@ -12,8 +12,170 @@ import (
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
+	sdkcluster "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cluster"
 	sdknodes "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/nodes"
 )
+
+// tagDeletingVM is the PVE tag stamped on a VM before an async fast-path destroy.
+// It is a diagnostic marker: any operator or script can list VMs tagged
+// bosh-deleting to find those whose fast-path destroy was issued but has not
+// yet completed. The sweepFastDeleteStragglers function consumes this tag on
+// subsequent fast-path deletes to re-issue destroy for any straggler VM, making
+// the tag part of a self-draining work queue.
+const tagDeletingVM = "bosh-deleting"
+
+// stampDeletingTag reads the VM's current tags, merges in tagDeletingVM, and
+// writes back via UpdateQemuConfig. Failures are logged but never propagated:
+// the caller treats tagging as best-effort. Existing operator tags are
+// preserved via mergeTagList.
+func stampDeletingTag(ctx context.Context, deps Deps, node, vmCID string, vmid int, logger *log.Logger) {
+	// Best-effort read of existing tags. On failure existing is nil and
+	// mergeTagList still adds tagDeletingVM as the sole entry.
+	var existing []string
+	if cfg, cfgErr := deps.PVE.QEMU().Config(ctx, node, vmid); cfgErr == nil {
+		if v, ok := cfg["tags"]; ok {
+			if s, ok := v.(string); ok {
+				existing = parseTagsField(s)
+			}
+		}
+	}
+	tags := mergeTagList(existing, []string{tagDeletingVM}, maxTagLength)
+	if err := deps.PVE.Nodes().UpdateQemuConfig(ctx, node, vmCID,
+		&sdknodes.UpdateQemuConfigParams{Tags: &tags}); err != nil {
+		logger.Warn("delete_vm: fast-path tag write failed (non-fatal; destroy will proceed)",
+			log.String("vmid", vmCID), log.Err(err))
+	}
+}
+
+// sweepFastDeleteStragglers scans the cluster for VMs carrying tagDeletingVM
+// (bosh-deleting) and re-issues a skiplock+purge destroy for each one. This
+// makes fast-path deletes self-healing: a VM whose async destroy stalled is
+// reaped by the next fast-path delete call. The sweep is:
+//   - Best-effort: all errors are logged, never propagated.
+//   - Bounded: no AwaitTaskWithLogger call; the destroy is fire-and-forget.
+//   - Idempotent: a VM already gone (IsNotFound) is silently skipped.
+//
+// Call from the fast path before issuing the current delete so a straggler
+// accumulation does not grow unbounded across deployments.
+func sweepFastDeleteStragglers(ctx context.Context, deps Deps, logger *log.Logger) {
+	if deps.PVE == nil || deps.PVE.Cluster() == nil {
+		return
+	}
+	resp, err := deps.PVE.Cluster().ListResources(ctx, &sdkcluster.ListResourcesParams{})
+	if err != nil {
+		logger.Warn("delete_vm: straggler sweep: ListResources failed (non-fatal)", log.Err(err))
+		return
+	}
+	if resp == nil {
+		return
+	}
+
+	type clusterItem struct {
+		Type string `json:"type"`
+		VMID int64  `json:"vmid"`
+		Node string `json:"node"`
+		Tags string `json:"tags"`
+	}
+
+	purge := true
+	destroyDisks := true
+	skiplock := true
+	for _, raw := range *resp {
+		var item clusterItem
+		if json.Unmarshal(raw, &item) != nil {
+			continue
+		}
+		if item.Type != "qemu" || item.VMID == 0 || item.Node == "" {
+			continue
+		}
+		if !tagsContain(item.Tags, tagDeletingVM) {
+			continue
+		}
+		vmIDStr := strconv.FormatInt(item.VMID, 10)
+		sweepLogger := logger.With(
+			log.String("node", item.Node),
+			log.String("vmid", vmIDStr),
+		)
+		// Fire-and-forget: discard the UPID, no await.
+		_, delErr := deps.PVE.Nodes().DeleteQemu(ctx, item.Node, vmIDStr, &sdknodes.DeleteQemuParams{
+			Purge:                    &purge,
+			DestroyUnreferencedDisks: &destroyDisks,
+			Skiplock:                 &skiplock,
+		})
+		if delErr != nil {
+			if pve.IsNotFound(delErr) {
+				sweepLogger.Debug("delete_vm: straggler sweep: VM already gone")
+			} else {
+				sweepLogger.Warn("delete_vm: straggler sweep: destroy failed (non-fatal)", log.Err(delErr))
+			}
+			continue
+		}
+		sweepLogger.Info("delete_vm: straggler sweep: re-issued destroy for bosh-deleting VM")
+	}
+}
+
+// fastPathDeleteVM executes the fast-path delete for a single VM. It:
+//  1. Runs sweepFastDeleteStragglers to reap any prior stalled fast-path destroys.
+//  2. Stamps bosh-deleting on the current VM (best-effort, fail-open).
+//  3. Issues Stop fire-and-forget (UPID discarded, no await).
+//  4. Issues DeleteQemu with skiplock=true (handles running/locked VMs) without
+//     awaiting the returned task UPID.
+//  5. Returns immediately — no unbounded get_task poll on any task.
+//
+// skiplock=true requires root@pam or a token with Sys.Modify privilege.
+// Eventual consistency: has_vm may briefly still see this VM after return.
+func fastPathDeleteVM(ctx context.Context, deps Deps, node, vmCID string, vmid int, logger *log.Logger) error {
+	// Reap any straggler fast-path VMs cluster-wide before issuing our own
+	// destroy. Best-effort; never blocks the current delete.
+	sweepFastDeleteStragglers(ctx, deps, logger)
+
+	// Stamp diagnostic tag — fail-open.
+	stampDeletingTag(ctx, deps, node, vmCID, vmid, logger)
+
+	// Fire-and-forget stop. The UPID is discarded; no await. PVE may not finish
+	// the stop before destroy arrives; skiplock=true on DeleteQemu handles that.
+	logger.Debug("delete_vm: fast-path: issuing stop fire-and-forget")
+	_, stopErr := deps.PVE.QEMU().Stop(ctx, node, vmid)
+	if stopErr != nil && !pve.IsNotFound(stopErr) {
+		// Log but do not abort: the skiplock destroy handles a still-running VM.
+		logger.Warn("delete_vm: fast-path: stop issued but returned error (non-fatal; destroy proceeds with skiplock)",
+			log.Err(stopErr))
+	}
+	if pve.IsNotFound(stopErr) {
+		// VM already gone — clean up agent state and return success.
+		logger.Info("delete_vm: fast-path: VM not found during stop — already deleted")
+		if agentErr := deps.Agent.Remove(ctx, node, vmid); agentErr != nil {
+			logger.Warn("delete_vm: agent.Remove failed after fast-path not-found stop", log.Err(agentErr))
+		}
+		return nil
+	}
+
+	// Issue destroy with skiplock=true. Discard the UPID; no await.
+	logger.Debug("delete_vm: fast-path: issuing skiplock destroy without await")
+	purge := true
+	destroyDisks := true
+	skiplock := true
+	_, delErr := deps.PVE.Nodes().DeleteQemu(ctx, node, vmCID, &sdknodes.DeleteQemuParams{
+		Purge:                    &purge,
+		DestroyUnreferencedDisks: &destroyDisks,
+		Skiplock:                 &skiplock,
+	})
+	if delErr != nil {
+		if pve.IsNotFound(delErr) {
+			logger.Info("delete_vm: fast-path: VM not found during destroy — already deleted")
+			if agentErr := deps.Agent.Remove(ctx, node, vmid); agentErr != nil {
+				logger.Warn("delete_vm: agent.Remove failed after fast-path idempotent destroy", log.Err(agentErr))
+			}
+			return nil
+		}
+		return cpierrors.Wrap(pve.WrapError(delErr), fmt.Sprintf("delete_vm: fast-path destroy VM %s", vmCID))
+	}
+
+	// Agent cleanup is best-effort; VM may still be tearing down asynchronously.
+	cleanupAgentForVM(ctx, deps, node, vmid, logger)
+	logger.Info("delete_vm: fast-path: destroy issued, returning without task await (eventual consistency)")
+	return nil
+}
 
 // HandleDeleteVM returns a handler for the delete_vm CPI method.
 //
@@ -85,7 +247,34 @@ func HandleDeleteVM(deps Deps) cpi.Handler {
 			defer inflightRelease()
 		}
 
-		// --- stop VM ---
+		// --- fast-path branch: tag-and-return without terminal-state poll ---
+		// When fast_path_delete is enabled the handler must return in bounded time
+		// regardless of PVE task behaviour. This requires bypassing ALL unbounded
+		// AwaitTaskWithLogger calls — including the stop-task await that
+		// stopVMBeforeDelete performs. The fast path therefore takes its own stop
+		// approach: issue Stop fire-and-forget (UPID discarded, no await), then
+		// issue DeleteQemu with skiplock=true so PVE destroys the VM even if it is
+		// still running or holds a config lock. The destroy call itself is NOT
+		// awaited — the UPID is discarded and the handler returns immediately.
+		//
+		// skiplock=true requires root@pam or a PVEAdmin-role token. Operators who
+		// use a least-privilege token without Sys.Modify may need to grant it.
+		//
+		// Eventual consistency: a subsequent has_vm call may briefly still see the
+		// VM while PVE's async destroy runs. The bosh-deleting tag marks VMs whose
+		// fast-path destroy was issued but may not have completed; sweepFastDeleteStragglers
+		// reaps them on the next fast-path delete (a self-draining work queue), so a
+		// stalled async destroy is retried automatically rather than left for manual
+		// `qm destroy <vmid>` cleanup.
+		//
+		// The fast path bypasses the §7.15 operation-timeout envelope naturally:
+		// no poll loop runs; the handler returns as soon as the destroy API call
+		// returns (which itself is bounded by the HTTP transport timeout).
+		if deps.Config.FastPathDeleteEnabled() {
+			return nil, fastPathDeleteVM(ctx, deps, node, vmCID, vmid, logger)
+		}
+
+		// --- stop VM (synchronous path) ---
 		if stopDone, stopErr := stopVMBeforeDelete(ctx, deps, node, vmid, vmCID, logger); stopErr != nil {
 			return nil, stopErr
 		} else if stopDone {
@@ -120,7 +309,7 @@ func HandleDeleteVM(deps Deps) cpi.Handler {
 			}
 		}
 
-		// --- delete VM ---
+		// --- delete VM (synchronous path) ---
 		// Purge removes VMID from backup/HA/replication configs.
 		// DestroyUnreferencedDisks removes orphaned volumes from storage.
 		//

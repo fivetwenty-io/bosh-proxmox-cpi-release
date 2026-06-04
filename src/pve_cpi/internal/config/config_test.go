@@ -288,6 +288,29 @@ func TestTaskPollAdaptiveEnabled(t *testing.T) {
 	}
 }
 
+func TestFastPathDeleteEnabled(t *testing.T) {
+	t.Parallel()
+	var nilCfg *config.CPIConfig
+	// nil receiver: must return false, not panic.
+	if nilCfg.FastPathDeleteEnabled() {
+		t.Error("nil receiver: want false")
+	}
+	// absent field (nil *bool): must return false.
+	if (&config.CPIConfig{}).FastPathDeleteEnabled() {
+		t.Error("nil *bool: want false")
+	}
+	// explicit *true: must return true.
+	tru := true
+	if !(&config.CPIConfig{FastPathDelete: &tru}).FastPathDeleteEnabled() {
+		t.Error("explicit *true: want true")
+	}
+	// explicit *false: must return false.
+	fal := false
+	if (&config.CPIConfig{FastPathDelete: &fal}).FastPathDeleteEnabled() {
+		t.Error("explicit *false: want false")
+	}
+}
+
 func TestHealthCheckExpectedAgentSHA256_EmptyWhenUnset(t *testing.T) {
 	t.Parallel()
 	var nilCfg *config.CPIConfig

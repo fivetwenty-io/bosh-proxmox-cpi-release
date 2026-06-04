@@ -1018,6 +1018,19 @@ properties:
       (marker, name, version, and director tags). Provenance records assist
       orphan detection and audit. Default false (no behavior change).
 
+  pve.fast_path_delete:
+    description: |
+      When true, delete_vm and delete_disk issue the PVE destroy call and return
+      immediately without awaiting the task's terminal state. delete_vm additionally
+      stamps a "bosh-deleting" tag on the VM before issuing the destroy; each
+      subsequent fast-path delete_vm sweeps the cluster for VMs still carrying that
+      tag and re-issues the destroy, so a stalled async destroy is reaped automatically.
+      Disk volumes cannot carry PVE tags, so no marker is applied there.
+      This eliminates the queue-slot hazard of a hung destroy-task poll at the
+      cost of eventual consistency: a subsequent has_vm or has_disk call may
+      briefly still see the resource until PVE's async destroy completes.
+      Default false (synchronous, fully-consistent behavior unchanged).
+
   pve.stemcell.director_id:
     description: |
       Identity string for the owning BOSH Director, stamped into the provenance

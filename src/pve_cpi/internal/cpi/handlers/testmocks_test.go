@@ -251,11 +251,12 @@ func (m *mockTasksService) GetStatus(_ context.Context, _, upid string) (*tasks.
 // --------------------------------------------------------------------------
 
 // mockStorageService lets individual tests wire CreateVolume, DeleteVolume,
-// Exists, DeleteVolumeIfExists, and Upload with function literals.
-// Methods not set are no-ops or return zero values.
+// DeleteVolumeAsync, Exists, DeleteVolumeIfExists, and Upload with function
+// literals. Methods not set are no-ops or return zero values.
 type mockStorageService struct {
 	createVolumeFn         func(ctx context.Context, node, storage string, sizeGiB int, format string, vmid int, name string) (string, error)
 	deleteVolumeFn         func(ctx context.Context, node, storage, volume string) error
+	deleteVolumeAsyncFn    func(ctx context.Context, node, storage, volume string) (string, error)
 	existsFn               func(ctx context.Context, node, storage, volume string) (bool, error)
 	deleteVolumeIfExistsFn func(ctx context.Context, node, storage, volume string) (bool, error)
 	uploadFn               func(ctx context.Context, node, storage, content, filename string, body io.Reader) (string, error)
@@ -276,6 +277,9 @@ func (m *mockStorageService) DeleteVolume(ctx context.Context, node, storage, vo
 }
 
 func (m *mockStorageService) DeleteVolumeAsync(ctx context.Context, node, storage, volume string) (string, error) {
+	if m.deleteVolumeAsyncFn != nil {
+		return m.deleteVolumeAsyncFn(ctx, node, storage, volume)
+	}
 	if err := m.DeleteVolume(ctx, node, storage, volume); err != nil {
 		return "", err
 	}

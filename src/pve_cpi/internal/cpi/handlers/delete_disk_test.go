@@ -10,6 +10,7 @@ import (
 
 	sdkclusterapi "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cluster"
 	sdkerrors "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/errors"
+	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/tasks"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/cpi/handlers"
@@ -431,6 +432,133 @@ func TestHandleDeleteDisk_NoClusterCallExpected(t *testing.T) {
 	}
 	if clusterCalled {
 		t.Error("delete_disk must not call the cluster service (no VMID allocation needed)")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// §7.32 fast-path delete_disk tests
+// ---------------------------------------------------------------------------
+
+// fastPathDepsForDisk builds Deps with fast_path_delete enabled for delete_disk.
+func fastPathDepsForDisk(t *testing.T, storageSvc *mockStorageService) handlers.Deps {
+	t.Helper()
+	deps := baseDepsForDelete(t, storageSvc)
+	enabled := true
+	deps.Config.FastPathDelete = &enabled
+	return deps
+}
+
+// TestHandleDeleteDisk_FastPath_NoAwait verifies that when fast_path_delete is
+// enabled, delete_disk issues DeleteVolumeAsync but does NOT call task await.
+// The mockStorageService.DeleteVolumeAsync returns a UPID; if tasksSvc.Wait
+// were called (it is not wired in baseDepsForDelete), the test would panic,
+// confirming await is skipped.
+func TestHandleDeleteDisk_FastPath_NoAwait(t *testing.T) {
+	t.Parallel()
+
+	// Return a non-empty UPID from DeleteVolumeAsync to prove the handler
+	// does not pass it to AwaitTask (which would require tasksSvc.waitFn).
+	deleteAsyncCalled := false
+	storageSvc := &mockStorageService{
+		deleteVolumeFn: func(_ context.Context, _, _, _ string) error {
+			// DeleteVolumeAsync delegates to DeleteVolume in the mock.
+			deleteAsyncCalled = true
+			return nil
+		},
+	}
+
+	deps := fastPathDepsForDisk(t, storageSvc)
+	h := handlers.HandleDeleteDisk(deps)
+	result, err := h.Handle(context.Background(), []json.RawMessage{
+		marshal(diskCID),
+	}, jsonrpc.Context{})
+
+	if err != nil {
+		t.Fatalf("fast-path delete_disk: unexpected error: %v", err)
+	}
+	if result != nil {
+		t.Errorf("fast-path delete_disk: expected nil result, got %v", result)
+	}
+	if !deleteAsyncCalled {
+		t.Error("fast-path delete_disk: DeleteVolumeAsync must be called")
+	}
+}
+
+// TestHandleDeleteDisk_FastPath_NotFound_Idempotent verifies that a 404 from
+// DeleteVolumeAsync on the fast path still returns success.
+func TestHandleDeleteDisk_FastPath_NotFound_Idempotent(t *testing.T) {
+	t.Parallel()
+
+	storageSvc := &mockStorageService{
+		deleteVolumeFn: func(_ context.Context, _, _, _ string) error {
+			return &sdkerrors.APIError{HTTPCode: 404, Message: "volume not found"}
+		},
+	}
+
+	deps := fastPathDepsForDisk(t, storageSvc)
+	h := handlers.HandleDeleteDisk(deps)
+	result, err := h.Handle(context.Background(), []json.RawMessage{
+		marshal(diskCID),
+	}, jsonrpc.Context{})
+
+	if err != nil {
+		t.Fatalf("fast-path delete_disk NotFound idempotent: expected nil error, got: %v", err)
+	}
+	if result != nil {
+		t.Errorf("fast-path delete_disk NotFound idempotent: expected nil result, got %v", result)
+	}
+}
+
+// TestHandleDeleteDisk_SlowPath_AwaitsTask confirms that when fast_path_delete
+// is OFF (default, nil), delete_disk awaits the UPID returned by
+// DeleteVolumeAsync before returning. The mock returns a real UPID; if the
+// fast path were active the handler would skip the await and awaitCalled would
+// stay false. The slow path must call tasks.Wait for the UPID.
+func TestHandleDeleteDisk_SlowPath_AwaitsTask(t *testing.T) {
+	t.Parallel()
+
+	const imgdelUPID = "UPID:pve1:00AABBCC:00112233:6789ABCD:imgdel:local-lvm:root@pam:"
+	awaitCalled := false
+
+	storageSvc := &mockStorageService{
+		deleteVolumeAsyncFn: func(_ context.Context, _, _, _ string) (string, error) {
+			// Return a real UPID — the slow path must await it.
+			return imgdelUPID, nil
+		},
+	}
+	tasksSvc := &mockTasksService{
+		waitFn: func(_ context.Context, _, upid string, _ *tasks.WaitOptions) (*tasks.Status, error) {
+			if upid == imgdelUPID {
+				awaitCalled = true
+			}
+			return &tasks.Status{ExitStatus: "OK"}, nil
+		},
+	}
+	client := &mockPVEClient{
+		tasksSvc:   tasksSvc,
+		storageSvc: storageSvc,
+		clusterSvc: &mockClusterSvc{},
+	}
+	deps := handlers.Deps{
+		Config: &config.CPIConfig{
+			Node:        testNode,
+			DiskStorage: storageName,
+			// FastPathDelete is nil → off (slow path)
+		},
+		PVE:    client,
+		Logger: log.NewNopLogger(),
+	}
+
+	h := handlers.HandleDeleteDisk(deps)
+	_, err := h.Handle(context.Background(), []json.RawMessage{
+		marshal(diskCID),
+	}, jsonrpc.Context{})
+
+	if err != nil {
+		t.Fatalf("slow-path delete_disk: unexpected error: %v", err)
+	}
+	if !awaitCalled {
+		t.Error("slow-path delete_disk: tasks.Wait must be called for the imgdel UPID when fast_path_delete is OFF")
 	}
 }
 
