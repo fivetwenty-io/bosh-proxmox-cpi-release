@@ -15,4 +15,11 @@ const (
 	osTypeLinux24 = "l24"
 	// osTypeWindows is the PVE OS type for Windows 10/11/2016+ guests.
 	osTypeWindows = "win10"
+
+	// diskOptCache is the PVE per-disk cache-mode option key.
+	diskOptCache = "cache"
+	// diskOptIothread is the PVE per-disk iothread toggle option key.
+	diskOptIothread = "iothread"
+	// diskOptSSD is the PVE per-disk SSD-emulation toggle option key.
+	diskOptSSD = "ssd"
 )

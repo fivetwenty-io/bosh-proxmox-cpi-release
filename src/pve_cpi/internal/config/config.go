@@ -337,6 +337,26 @@ type CPIConfig struct {
 	// effective values.
 	IPConflictProbe string `json:"ip_conflict_probe,omitempty"`
 
+	// DiskPerfInvariantMode controls enforcement of creation-time disk-performance
+	// invariants at attach_disk time. The structural options cache, iothread, and
+	// ssd are baked into the disk CID at create_disk time (§7.9). On re-attach the
+	// CPI merges global disk_performance defaults over the CID-recorded options; if
+	// global config has since introduced a structural option the disk did not have
+	// at creation, the disk's runtime profile would silently diverge from its
+	// recorded one. This knob governs that case:
+	//
+	//	enforce (default) — reject the attach with a non-retriable CloudError
+	//	warn              — log the divergence and proceed with the merged options
+	//	off               — skip the check entirely
+	//
+	// Throttle options (mbps_*, iops_*) and discard are NOT invariants — PVE can
+	// change them on a live device — so they are never enforced. The check is a
+	// no-op for any disk whose CID carries no performance options (bare/legacy
+	// CIDs), so behavior is byte-identical unless §7.9 options were recorded.
+	// Enum: ""|"enforce"|"warn"|"off"; empty resolves to "enforce". Use
+	// DiskPerfInvariantModeValue() for the effective value.
+	DiskPerfInvariantMode string `json:"disk_perf_invariant_mode,omitempty"`
+
 	// VMFirewall sets PVE's per-NIC firewall flag (firewall=1) on every NIC of
 	// newly created VMs. When nil/false (default), NICs are created without the
 	// flag — byte-identical to prior releases. A per-NIC network cloud property
@@ -1408,6 +1428,20 @@ func (c *CPIConfig) IPConflictProbeMode() string {
 	return v
 }
 
+// DiskPerfInvariantModeValue returns the effective disk-performance invariant
+// enforcement mode, normalized to lower case and trimmed. Empty (the default)
+// resolves to "enforce". See the DiskPerfInvariantMode field doc for semantics.
+func (c *CPIConfig) DiskPerfInvariantModeValue() string {
+	if c == nil {
+		return "enforce"
+	}
+	v := strings.ToLower(strings.TrimSpace(c.DiskPerfInvariantMode))
+	if v == "" {
+		return "enforce"
+	}
+	return v
+}
+
 // ActiveIPProbeEnabled reports whether the guest-agent IP fan-out probe is
 // active. Returns true only when IPConflictProbeMode() == "agent".
 func (c *CPIConfig) ActiveIPProbeEnabled() bool {
@@ -1884,6 +1918,19 @@ func (c *CPIConfig) validateEnumFields(errs *[]string) {
 			*errs = append(*errs, fmt.Sprintf(
 				"ip_conflict_probe must be one of off|agent (or empty for default off), got %q",
 				c.IPConflictProbe,
+			))
+		}
+	}
+
+	// DiskPerfInvariantMode enum: validate only when non-empty.
+	if c.DiskPerfInvariantMode != "" {
+		switch strings.ToLower(strings.TrimSpace(c.DiskPerfInvariantMode)) {
+		case "enforce", "warn", "off":
+			// valid
+		default:
+			*errs = append(*errs, fmt.Sprintf(
+				"disk_perf_invariant_mode must be one of enforce|warn|off (or empty for default enforce), got %q",
+				c.DiskPerfInvariantMode,
 			))
 		}
 	}

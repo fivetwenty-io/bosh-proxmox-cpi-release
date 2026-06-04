@@ -347,6 +347,23 @@ properties:
       Valid values: "" (empty, same as "off"), "off", "agent".
       Only meaningful when ensure_no_ip_conflicts is true or unset.
     default: ""
+  pve.disk_perf_invariant_mode:
+    description: |
+      Controls enforcement of creation-time disk-performance invariants at
+      attach_disk time. The structural options cache, iothread, and ssd are
+      baked into the disk CID at create_disk time; on re-attach the CPI merges
+      global disk_performance defaults over the recorded options. If global
+      config has since introduced a structural option the disk did not have at
+      creation, the disk's runtime profile would silently diverge from its
+      recorded one. This knob governs that case:
+        enforce (default) - reject the attach with a non-retriable error
+        warn              - log the divergence and proceed with the merged options
+        off               - skip the check entirely
+      Throttle options (mbps_*, iops_*) and discard are never enforced. The
+      check is a no-op for any disk whose CID carries no performance options, so
+      behavior is unchanged unless disk_performance options were recorded.
+      Valid values: "" (empty, same as "enforce"), "enforce", "warn", "off".
+    default: ""
   pve.placement.enabled:
     description: |
       When true (default), create_vm runs live node-scoring to select the

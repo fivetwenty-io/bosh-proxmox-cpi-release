@@ -147,6 +147,12 @@
   ip_conflict_probe = p("pve.ip_conflict_probe", "")
   config["ip_conflict_probe"] = ip_conflict_probe unless ip_conflict_probe.to_s.empty?
 
+  # Emit disk_perf_invariant_mode only when set to a non-empty value. The Go
+  # config accessor defaults empty string to "enforce"; omitting the key
+  # preserves that default. Emit only when the operator overrides it.
+  disk_perf_invariant_mode = p("pve.disk_perf_invariant_mode", "")
+  config["disk_perf_invariant_mode"] = disk_perf_invariant_mode unless disk_perf_invariant_mode.to_s.empty?
+
   # Emit the placement block only when at least one placement property is set.
   # When the block would be empty, omit it entirely so the Go config zero-value
   # (nil *PlacementConfig) is preserved and existing deployments are unaffected.

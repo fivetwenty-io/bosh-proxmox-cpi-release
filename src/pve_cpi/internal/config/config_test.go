@@ -132,6 +132,59 @@ func TestValidate_AgentModeInvalid(t *testing.T) {
 }
 
 // --------------------------------------------------------------------------
+// TestValidate_DiskPerfInvariantModeInvalid — §7.26 enum validation.
+// --------------------------------------------------------------------------
+
+func TestValidate_DiskPerfInvariantModeInvalid(t *testing.T) {
+	t.Parallel()
+	_, err := mustLoad(t, `{
+		"host": "h", "user": "u", "password": "p",
+		"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
+		"disk_perf_invariant_mode": "strict"
+	}`)
+	assertCloudError(t, err, "disk_perf_invariant_mode must be one of")
+}
+
+func TestValidate_DiskPerfInvariantModeValid(t *testing.T) {
+	t.Parallel()
+	for _, mode := range []string{"enforce", "warn", "off"} {
+		t.Run(mode, func(t *testing.T) {
+			t.Parallel()
+			cfg, err := mustLoad(t, `{
+				"host": "h", "user": "u", "password": "p",
+				"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
+				"disk_perf_invariant_mode": "`+mode+`"
+			}`)
+			if err != nil {
+				t.Fatalf("mode %q should be valid, got: %v", mode, err)
+			}
+			if got := cfg.DiskPerfInvariantModeValue(); got != mode {
+				t.Errorf("DiskPerfInvariantModeValue(): got %q, want %q", got, mode)
+			}
+		})
+	}
+}
+
+func TestDiskPerfInvariantModeValue_DefaultsToEnforce(t *testing.T) {
+	t.Parallel()
+	// Empty config field resolves to enforce.
+	cfg := &config.CPIConfig{}
+	if got := cfg.DiskPerfInvariantModeValue(); got != "enforce" {
+		t.Errorf("empty mode: got %q, want enforce", got)
+	}
+	// Nil receiver resolves to enforce (defensive).
+	var nilCfg *config.CPIConfig
+	if got := nilCfg.DiskPerfInvariantModeValue(); got != "enforce" {
+		t.Errorf("nil receiver: got %q, want enforce", got)
+	}
+	// Mixed case / whitespace normalized.
+	cfg.DiskPerfInvariantMode = "  WARN "
+	if got := cfg.DiskPerfInvariantModeValue(); got != "warn" {
+		t.Errorf("normalize: got %q, want warn", got)
+	}
+}
+
+// --------------------------------------------------------------------------
 // TestValidate_AuthMissing
 // --------------------------------------------------------------------------
 

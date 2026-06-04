@@ -190,6 +190,14 @@ func HandleAttachDisk(deps Deps) Handler {
 		}
 		effectiveOpts := filterDiskPerfForBus(mergeDiskOptions(globalOpts, metaOpts), bus)
 
+		// --------------------------------------------------------------------
+		// 5b. Enforce creation-time disk-performance invariants (§7.26), before
+		// any mutating PVE call so an enforce-mode reject leaves no orphan.
+		// --------------------------------------------------------------------
+		if err := enforceDiskPerfInvariants(deps.Config, deps.Logger, vmCID, diskCID, meta, effectiveOpts); err != nil {
+			return nil, err
+		}
+
 		// Build the volid arg: bake options in when present, bare CID otherwise.
 		volidArg := bareDiskCID
 		if len(effectiveOpts) > 0 {
@@ -241,6 +249,64 @@ func HandleAttachDisk(deps Deps) Handler {
 		// --------------------------------------------------------------------
 		return diskHints{Path: devicePath}, nil
 	})
+}
+
+// enforceDiskPerfInvariants applies the §7.26 creation-time disk-performance
+// invariant policy at attach_disk time. Structural options (cache/iothread/ssd)
+// recorded in the disk CID at create_disk time must not change on re-attach. The
+// §7.9 merge already pins CID-recorded values (per-disk wins over global), so the
+// only way an invariant diverges is when global config has introduced a
+// structural option the disk lacked at creation.
+//
+// Opt-in by data presence: a disk whose CID carries no performance options
+// (bare/legacy CID, meta == nil) is skipped, so behavior is byte-identical for
+// those disks regardless of mode. On divergence the disk_perf_invariant_mode
+// knob decides: enforce (default) → non-retriable CloudError; warn → log and
+// proceed; off → skip.
+//
+// Ordering note: this runs after chooseSCSISlotSkippingZero, which may detach a
+// legacy scsi0 attachment (a config PUT) before this check. That migration is
+// data-loss-safe (a scsi0 persistent disk was never successfully partitioned by
+// the agent) and idempotent, so an enforce-mode reject after it leaves no
+// orphaned data — only a slot freed for the (now rejected) re-attach. The
+// reject still precedes the AttachDisk that would bind the volume.
+//
+// A nil cfg is safe: DiskPerfInvariantModeValue defaults a nil receiver to
+// enforce, so a divergence with no config is rejected (fail-closed).
+func enforceDiskPerfInvariants(
+	cfg *config.CPIConfig,
+	logger *log.Logger,
+	vmCID, diskCID string,
+	meta *pve.DiskCIDMeta,
+	effectiveOpts map[string]string,
+) error {
+	if meta == nil || len(meta.Opts) == 0 {
+		return nil
+	}
+	violations := diskPerfInvariantViolations(meta.Opts, effectiveOpts)
+	if len(violations) == 0 {
+		return nil
+	}
+
+	switch cfg.DiskPerfInvariantModeValue() {
+	case "off":
+		return nil
+	case "warn":
+		logger.Warn("attach_disk: disk-performance invariant divergence (warn mode — proceeding)",
+			log.String("vm_cid", vmCID),
+			log.String("disk_cid", diskCID),
+			log.String("violations", strings.Join(violations, "; ")),
+		)
+		return nil
+	default: // "enforce"
+		return cpierrors.Cloud(
+			"attach_disk: disk-performance invariant divergence for disk %s: %s."+
+				" The disk's structural options changed since create_disk."+
+				" Align CPI disk_performance config to the disk's creation-time options,"+
+				" or set pve.disk_perf_invariant_mode=warn|off to bypass this guard.",
+			diskCID, strings.Join(violations, "; "),
+		)
+	}
 }
 
 // attachDiskParseArgs unmarshals and validates the two positional attach_disk

@@ -1343,3 +1343,115 @@ func TestHandleAttachDisk_PerfOpts_PerDiskWinsOverGlobal(t *testing.T) {
 		t.Errorf("AttachDisk volid: want %q (per-disk cache overrides global), got %q", wantVolid, qemuSvc.attachLastVolid)
 	}
 }
+
+// invariantDivergenceSetup builds the canonical §7.26 divergence scenario: the
+// disk CID records cache=writeback (and nothing else), but global config
+// introduces iothread=true. The merge pins cache=writeback (per-disk wins) yet
+// adds iothread=1, which the disk did not have at creation — a structural
+// invariant divergence. mode is the disk_perf_invariant_mode config value.
+func invariantDivergenceSetup(mode string) (*attachQEMUService, *config.CPIConfig, string) {
+	const bareCID = "local-lvm:vm-9100-disk-0"
+	encodedCID := perfDiskCID(bareCID, map[string]string{"cache": "writeback"})
+	qemuSvc := &attachQEMUService{
+		attachReturnDiskID: "scsi1",
+		configCfg:          map[string]any{"scsi1": bareCID},
+	}
+	ioTrue := true
+	cfg := &config.CPIConfig{
+		Node:                  testNode,
+		VMDiskFormat:          "qcow2",
+		DiskPerfInvariantMode: mode,
+		DiskPerformance:       &config.DiskPerformanceDefaults{Iothread: &ioTrue},
+	}
+	return qemuSvc, cfg, encodedCID
+}
+
+// TestHandleAttachDisk_Invariant_EnforceRejects verifies that in the default
+// (enforce) mode a structural invariant divergence is rejected with a
+// non-retriable CloudError BEFORE any AttachDisk call (no orphan).
+func TestHandleAttachDisk_Invariant_EnforceRejects(t *testing.T) {
+	t.Parallel()
+	qemuSvc, cfg, encodedCID := invariantDivergenceSetup("") // empty → enforce
+
+	h := handlers.HandleAttachDisk(attachDepsPerf(qemuSvc, &captureAgent{}, cfg))
+	_, err := h.Handle(context.Background(), attachArgs("100", encodedCID), jsonrpc.Context{})
+
+	if err == nil {
+		t.Fatal("expected enforce-mode invariant divergence to error, got nil")
+	}
+	if !cpierrors.IsType(err, cpierrors.TypeCloud) {
+		t.Errorf("error type: want TypeCloud (non-retriable), got %v", err)
+	}
+	if !strings.Contains(err.Error(), "iothread") {
+		t.Errorf("error should name the diverging option iothread, got: %v", err)
+	}
+	if qemuSvc.attachLastVolid != "" {
+		t.Errorf("AttachDisk must NOT be called on enforce reject; got volid %q", qemuSvc.attachLastVolid)
+	}
+}
+
+// TestHandleAttachDisk_Invariant_WarnProceeds verifies that warn mode logs and
+// proceeds, applying the merged options (cache=writeback,iothread=1).
+func TestHandleAttachDisk_Invariant_WarnProceeds(t *testing.T) {
+	t.Parallel()
+	qemuSvc, cfg, encodedCID := invariantDivergenceSetup("warn")
+
+	h := handlers.HandleAttachDisk(attachDepsPerf(qemuSvc, &captureAgent{}, cfg))
+	_, err := h.Handle(context.Background(), attachArgs("100", encodedCID), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("warn mode must not error, got: %v", err)
+	}
+
+	wantVolid := "local-lvm:vm-9100-disk-0,cache=writeback,iothread=1"
+	if qemuSvc.attachLastVolid != wantVolid {
+		t.Errorf("AttachDisk volid: want %q, got %q", wantVolid, qemuSvc.attachLastVolid)
+	}
+}
+
+// TestHandleAttachDisk_Invariant_OffSkips verifies that off mode skips the check
+// entirely and proceeds with the merged options.
+func TestHandleAttachDisk_Invariant_OffSkips(t *testing.T) {
+	t.Parallel()
+	qemuSvc, cfg, encodedCID := invariantDivergenceSetup("off")
+
+	h := handlers.HandleAttachDisk(attachDepsPerf(qemuSvc, &captureAgent{}, cfg))
+	_, err := h.Handle(context.Background(), attachArgs("100", encodedCID), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("off mode must not error, got: %v", err)
+	}
+
+	wantVolid := "local-lvm:vm-9100-disk-0,cache=writeback,iothread=1"
+	if qemuSvc.attachLastVolid != wantVolid {
+		t.Errorf("AttachDisk volid: want %q, got %q", wantVolid, qemuSvc.attachLastVolid)
+	}
+}
+
+// TestHandleAttachDisk_Invariant_EnforceNoDivergence verifies that enforce mode
+// does NOT reject when the effective options match the creation-time CID — the
+// per-disk-wins merge keeps cache=writeback and global cache=none is overridden,
+// so there is no divergence. Regression guard for the common case.
+func TestHandleAttachDisk_Invariant_EnforceNoDivergence(t *testing.T) {
+	t.Parallel()
+	const bareCID = "local-lvm:vm-9001-disk-0"
+	encodedCID := perfDiskCID(bareCID, map[string]string{"cache": "writeback"})
+	qemuSvc := &attachQEMUService{
+		attachReturnDiskID: "scsi1",
+		configCfg:          map[string]any{"scsi1": bareCID},
+	}
+	cfg := &config.CPIConfig{
+		Node:                  testNode,
+		VMDiskFormat:          "qcow2",
+		DiskPerfInvariantMode: "enforce",
+		DiskPerformance:       &config.DiskPerformanceDefaults{Cache: "writethrough"}, // overridden by meta
+	}
+
+	h := handlers.HandleAttachDisk(attachDepsPerf(qemuSvc, &captureAgent{}, cfg))
+	_, err := h.Handle(context.Background(), attachArgs("100", encodedCID), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("enforce mode must not error when effective matches creation, got: %v", err)
+	}
+	wantVolid := bareCID + ",cache=writeback"
+	if qemuSvc.attachLastVolid != wantVolid {
+		t.Errorf("AttachDisk volid: want %q, got %q", wantVolid, qemuSvc.attachLastVolid)
+	}
+}
