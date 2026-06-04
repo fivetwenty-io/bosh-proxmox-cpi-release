@@ -49,7 +49,8 @@ text-pattern pushback fragility, post-import (not pre-commit) checksum, reactive
 GC — now recorded as "Limits" under each feature. Second, the wider reference re-read turned
 up **ten genuinely new gaps (§7.26–§7.35)**, none of which appeared in the prior report; they
 are extensions of the shipped work (enforce the invariants §7.9 records, monitor the resizes
-§7.24 sizes, make the polling §7.25 fixed adaptive, and so on) and are all still **open**.
+§7.24 sizes, make the polling §7.25 fixed adaptive, and so on). The first four (§7.26–§7.29)
+have since been **shipped**; §7.30–§7.35 remain **open**.
 The §3 matrix gained one correction (Azure `update_disk` is a full method, now `Y`), and the
 §6 standout list was corrected against source in several places — most notably that
 process-level panic recovery (§7.4) is *not* unique to OpenStack-Go (Google has it too). The
@@ -1177,63 +1178,95 @@ curves are pure and deterministic except for seeded jitter.
   chain emitting method + duration + outcome. Low value: the audit-log hook already
   carries the signal for a log pipeline.
 
-### Newly identified gaps (this round — OPEN)
+### Newly identified gaps (this round)
 
 These ten did not appear in the prior report. They surfaced from the deeper reference
-re-read and the source-level verification of the shipped features above. Unlike §7.1–7.25
-(all shipped), every item here is **open**. Each follows the same additive-optional
-convention the shipped work established: validate only when set, omit from VM config when
-empty, zero behavior change for existing manifests. They are ordered roughly by
+re-read and the source-level verification of the shipped features above. The first four
+(§7.26–§7.29) have since been **shipped**; §7.30–§7.35 remain **open**. Each follows the same
+additive-optional convention the shipped work established: validate only when set, omit from
+VM config when empty, zero behavior change for existing manifests. They are ordered roughly by
 effort-to-value, not severity.
 
-#### 7.26 OPEN — Enforce creation-time disk-performance invariants on re-attach
+#### 7.26 DONE — Enforce creation-time disk-performance invariants on re-attach
 
 *References: Azure, AWS.* §7.9 bakes `cache`/`iothread`/`ssd`/bus into the disk-CID
 metadata and merges global `disk_performance` defaults at `attach_disk` time — but nothing
-*rejects* drift. If the global config changes between create and a later re-attach, the disk
-silently comes back with a different cache mode than its create-time CID records, so its
-runtime profile diverges from its recorded one. Recording an invariant is worthless if no
+*rejected* drift. If the global config changed between create and a later re-attach, the disk
+silently came back with a different cache mode than its create-time CID records, so its
+runtime profile diverged from its recorded one. Recording an invariant is worthless if no
 code path enforces it. Azure makes this explicit: `update_disk` rejects a caching-mode change
 as `NotSupported` (caching is creation-time-only), and AWS waits out a volume modification
-before treating it as applied. **Build:** in the §7.9 attach-codec merge, compare the
-incoming `cache`/bus/`iothread` against the values encoded in the CID at create time and
-reject a divergence with a non-retriable `CloudError`. The values already round-trip through
-the CID (§7.7), so the comparison is nearly free. Opt-in: with no encoded options, behavior
-is unchanged.
+before treating it as applied.
 
-#### 7.27 OPEN — Disk-resize completion monitoring
+**Shipped.** `enforceDiskPerfInvariants` (`internal/cpi/handlers/attach_disk.go`) runs in
+`HandleAttachDisk` after the §7.9 option merge and before any mutating PVE call, so a reject
+never orphans. The pure `diskPerfInvariantViolations` (`disk_performance.go`) compares the
+structural options `{cache, iothread, ssd}` recorded in the CID against the effective merged
+options; throttle knobs (`mbps_*`, `iops_*`) and `discard` are never enforced. Because the
+§7.9 merge already pins CID-recorded values (per-disk wins over global), the only divergence
+that fires in practice is global config introducing a structural option the disk lacked at
+creation. The `disk_perf_invariant_mode` knob governs the response: `enforce` (default)
+rejects with a non-retriable `CloudError`, `warn` logs and proceeds, `off` skips. A disk
+whose CID carries no performance options is skipped entirely, so behavior is unchanged for
+those disks regardless of mode.
 
-*Reference: AWS.* `resize_disk` issues the PVE resize and returns immediately. On
-asynchronous backends (Ceph RBD, LVM-thin) the agent can read the *old* size, or a
-subsequent operation can race the still-in-flight resize. §7.24 fixed the sizing *math*
+#### 7.27 DONE — Disk-resize completion monitoring
+
+*Reference: AWS.* `resize_disk` issued the PVE resize and returned immediately. On
+asynchronous backends (Ceph RBD, LVM-thin) the agent could read the *old* size, or a
+subsequent operation could race the still-in-flight resize. §7.24 fixed the sizing *math*
 (delta against the real template size) but not post-resize *convergence*. AWS's
 `ResourceWait.for_volume_modification` waits for the EBS modification to reach
-`completed`/`optimizing` before returning. **Build:** after the resize call, poll the
-reported disk size (via `qm config` / storage status) until it matches the request, bounded
-by the §7.15 timeout envelope and the §7.25 backoff curves. Opt-in and best-effort so the
-default stays byte-identical.
+`completed`/`optimizing` before returning.
 
-#### 7.28 OPEN — Progress-aware adaptive task-poll interval
+**Shipped.** `waitForResizeConvergence` (`internal/cpi/handlers/resize_disk.go`) polls
+`QEMU().Config` and re-parses the disk size (`parseDiskSizeGiB`) after the resize task
+completes, until the reported size reaches the target. It is **best-effort**: the helper is
+void and never returns an error, so a slow or non-converging backend cannot fail the
+resize — on timeout it logs a warning and the handler returns success. The whole step is
+opt-in via `resize_wait_for_convergence` (default off → zero extra calls, byte-identical) and
+bounded by `resize_convergence_timeout_sec` (default 120s), an independent budget so the poll
+is bounded even when the §7.15 operation-timeout envelope is disabled.
+
+#### 7.28 DONE — Progress-aware adaptive task-poll interval
 
 *References: vSphere, Alicloud.* §7.25 uses fixed per-method backoff curves. PVE UPID tasks
-expose a `progress` field for long operations (clone, move-disk), which the poller ignores.
+expose a `progress` field for long operations (clone, move-disk), which the poller ignored.
 A fixed curve polls too often early — adding to the §7.16 pushback pressure that §11 flags
 as the unquantified scale risk — and too slowly late. vSphere derives its interval from the
-ETA: `(elapsed·100/progress − elapsed)/5`, clamped 1–10s. **Build:** when a UPID task
-reports `progress`, derive the next poll interval from elapsed/progress clamped to 1–10s;
-fall back to the §7.25 fixed curve when progress is absent. Folds into the existing poll
-loop; directly reduces poll storms under the large parallel CF-deploy scenario.
+ETA: `(elapsed·100/progress − elapsed)/5`, clamped 1–10s.
 
-#### 7.29 OPEN — Boot-path agent integrity / checksum verification
+**Shipped.** When `task_poll_adaptive` is enabled, `AwaitTask` (`internal/pve/task.go`)
+routes to the CPI-owned `awaitTaskAdaptive` loop, so no call site changes. `adaptiveTaskInterval`
+applies the vSphere estimator — projected remaining time over five — clamped to 1–10s, and
+falls back to the fixed §7.25 cadence when `progress` is absent or non-positive (so
+progress-less short tasks poll exactly as before). The loop reads progress through a new
+single-shot `tasks.GetStatus` added to the vendored `pve-apiclient-go` SDK alongside a
+`Status.Progress` field (both additive), and mirrors `AwaitTask`'s terminal/error
+classification via `classifyTaskExit`. Disabled (default) the SDK's fixed-interval `Wait` is
+used, byte-identical to prior releases. A warning header in the vendored file and a
+compile-time assertion in `internal/pve/task.go` guard against a `go mod vendor` refresh
+silently dropping the addition.
+
+#### 7.29 DONE — Boot-path agent integrity / checksum verification
 
 *Reference: OpenStack-Go.* §7.12 pings the guest agent and §7.6 verifies the *stemcell*
-digest (post-import, per its own caveat). Neither verifies that the BOSH **agent binary**
-inside the booted guest is the expected one — a tampered or partially-written agent passes
+digest (post-import, per its own caveat). Neither verified that the BOSH **agent binary**
+inside the booted guest is the expected one — a tampered or partially-written agent passed
 both checks. OpenStack-Go injects an expected agent checksum into the configdrive for
-boot-time self-verification. **Build:** when the stemcell manifest carries an agent
-checksum, inject it into agent settings (cloudinit/configdrive/registry) for boot-time
-self-verify, and optionally assert it via a guest-agent file read inside the §7.12 health
-gate. Opt-in; reuses §7.12 machinery.
+boot-time self-verification.
+
+**Shipped.** PVE exposes a guest-agent exec API, so the CPI verifies directly rather than
+relying on an agent-side self-check. When `health_check.expected_agent_sha256` is set (and the
+health gate is enabled), `assertAgentChecksum` (`internal/cpi/handlers/create_vm_agent_checksum.go`)
+runs `sha256sum /var/vcap/bosh/bin/bosh-agent` via `CreateQemuAgentExec` after the §7.12 ping
+succeeds and compares the digest. A **confirmed mismatch** fails `create_vm` with a
+non-retriable `CloudError`, triggering the existing rollback that destroys the VM. Every other
+outcome — guest-agent exec error, non-zero `sha256sum` exit, unparseable output, or an exec
+that does not finish within the bound — is **fail-open** (warns and proceeds), so the check
+never blocks provisioning when it cannot positively confirm tampering. The command is a fixed
+argument vector (no shell), and the assertion is skipped when the digest is unset, so behavior
+is unchanged for existing deployments.
 
 #### 7.30 OPEN — PVE API client connection-pool / keepalive tuning
 
@@ -1354,11 +1387,13 @@ graph TD
         C10[Root/ephemeral sizing]
         C11[Configurable retry policy]
     end
-    subgraph OPEN["Newly identified this round — OPEN"]
+    subgraph T4["Tier 4 — shipped this round"]
         D1[7.26 Disk-perf invariant enforce]
         D2[7.27 Resize completion monitor]
         D3[7.28 Adaptive task-poll]
         D4[7.29 Boot-path agent integrity]
+    end
+    subgraph OPEN["Still open"]
         D5[7.30 API connection-pool tuning]
         D6[7.31 Post-selection fallback]
         D7[7.32 Fast-path delete]
