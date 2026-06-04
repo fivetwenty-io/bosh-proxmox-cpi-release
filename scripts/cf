@@ -331,6 +331,25 @@ def cmd_check_uaa_db(_extra: list[str]) -> None:
         if "doesn't exist" in stderr_snippet or "doesn’t exist" in stderr_snippet:
             print("    skipped (cf deployment not yet present)")
             return
+        # The VM is unreachable: `bosh vms` recorded a vm_cid (so the early
+        # _cf_has_database_vm gate passed) but the agent cannot be reached —
+        # the VM was deleted out-of-band on the IaaS while the Director DB
+        # (persisted across create-env runs) kept the record, or the agent is
+        # unresponsive. Either way there is no live schema to corrupt and the
+        # ensuing deploy recreates the VM, so this best-effort pre-check must
+        # fail open rather than block the deploy.
+        unreachable_markers = (
+            "Setting up SSH",          # ssh-setup task errored before the probe ran
+            "unresponsive agent",
+            "Timed out sending",       # get_state RPC to a dead agent
+            "No instance with a VM",   # record exists but no live VM
+        )
+        if any(m in stderr_snippet for m in unreachable_markers):
+            print(
+                "    skipped (database/0 unreachable — stale record for a VM no "
+                "longer on the IaaS; deploy will recreate it)"
+            )
+            return
         raise RuntimeError(
             f"bosh ssh to database/0 failed (rc={result.returncode}).\n"
             f"stderr: {stderr_snippet[-500:]}"
@@ -1282,16 +1301,31 @@ def cmd_precompile_releases(_extra: list[str]) -> None:
     # what lets the e2e step run unconditionally yet pay the cost only once.
     existing = COMPILED_OPS_CF.read_text() if COMPILED_OPS_CF.exists() else ""
     state = _cfcompile.precompile_state(existing, stem)
-    if state in (_cfcompile.STORE_OPS_MODE, _cfcompile.CACHE_MODE) and not os.environ.get("CF_PRECOMPILE_FORCE", "").strip():
+    # A store-ops precompiled set pins each release tarball by URL in the
+    # artifacts-VM S3. If that store is unreachable this run — the artifacts VM
+    # is opt-in (--with-artifacts) and absent by default, or it was torn down —
+    # those URLs are dead and the set is unusable: a cf deploy that layers it
+    # fails with "No route to host" against the artifacts IP. Detect that and
+    # recompile (into the director cache, since the store is offline) rather
+    # than idempotently skipping onto a dead set.
+    artifacts_store = _artifacts.compiled_store_override(os.environ, "pve-cpi-cf")
+    store_ops_stale = state == _cfcompile.STORE_OPS_MODE and artifacts_store is None
+    forced = bool(os.environ.get("CF_PRECOMPILE_FORCE", "").strip())
+    if state in (_cfcompile.STORE_OPS_MODE, _cfcompile.CACHE_MODE) and not forced and not store_ops_stale:
         print(f"    already precompiled for {stem} ({state}); skipping (CF_PRECOMPILE_FORCE=1 to rebuild)")
         return
+    if store_ops_stale:
+        print(
+            f"    existing store-ops precompiled set for {stem} pins tarballs in an "
+            f"offline artifacts store; recompiling into the director cache"
+        )
 
     bosh_mod = _load_bosh_module()
     denv = bosh_mod.director_env()
     # Same fail-open gate as scripts/bosh: when the active env's artifacts VM is
     # online and no explicit COMPILED_RELEASES_* override is set, precompiled CF
     # release tarballs land in its pve-cpi-cf bucket; otherwise the env default.
-    cfg = _artifacts.compiled_store_override(os.environ, "pve-cpi-cf") \
+    cfg = artifacts_store \
         or _compiled.store_config_from_env(os.environ, str(COMPILED_DIR_DEFAULT))
     store_ops = cfg.kind == "s3"
     print(f"    store: {cfg.kind} ({'store-ops' if store_ops else 'director-cache'})   stemcell: {stem}")
