@@ -72,7 +72,7 @@ func pveDiskFormat(advertised string) string {
 	switch strings.ToLower(advertised) {
 	case "":
 		return ""
-	case "qcow2", "openstack-qcow2", "general-qcow2", "pve-qcow2":
+	case diskFormatQCOW2, "openstack-qcow2", "general-qcow2", "pve-qcow2":
 		return diskFormatQCOW2
 	case "raw", "openstack-raw", "general-raw", "pve-raw":
 		return diskFormatRaw
@@ -892,8 +892,8 @@ func attemptCreateTemplateVM(
 		metadataKeyName: templateName,
 		"ostype":        osTypeLinux26,
 		"scsihw":        "virtio-scsi-pci",
-		"virtio0":       virtio0Val,
-		"boot":          "order=virtio0",
+		diskKeyVirtio0:  virtio0Val,
+		"boot":          "order=" + diskKeyVirtio0,
 		"agent":         "enabled=0",
 		"onboot":        0,
 		"tags":          strings.Join(baseTags, ";"),

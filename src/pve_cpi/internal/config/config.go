@@ -1802,11 +1802,11 @@ func (c *CPIConfig) validateAuth(errs *[]string) {
 func (c *CPIConfig) validateEnumFields(errs *[]string) {
 	// AgentMode enum.
 	switch c.AgentMode {
-	case "cloudinit", "registry", "noagent":
+	case "cloudinit", "registry", "noagent", "auto":
 		// valid
 	default:
 		*errs = append(*errs, fmt.Sprintf(
-			"agent_mode must be one of cloudinit|registry|noagent, got %q", c.AgentMode,
+			"agent_mode must be one of cloudinit|registry|noagent|auto, got %q", c.AgentMode,
 		))
 	}
 

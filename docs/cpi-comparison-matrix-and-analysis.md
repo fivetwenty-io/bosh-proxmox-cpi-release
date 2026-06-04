@@ -745,7 +745,7 @@ Best-effort and non-fatal: a pin failure is logged, never failing create_vm, sin
 already on a correct AZ node from scoring. Default off — byte-identical when unset. Live PVE
 9 validation of the `node-affinity` rule type is pending.
 
-#### 7.22 Agent registry-less auto-selection and settings-completeness assertion
+#### 7.22 DONE — Agent registry-less auto-selection and settings-completeness assertion
 
 *References: AWS, OpenStack-Go, Google, Alicloud.* All three agent modes ship and exceed
 vSphere, but mode selection is config-driven, not auto-negotiated from the stemcell's
@@ -755,10 +755,17 @@ payload carries every setting the agent needs. With configdrive now the default 
 deployments, a mis-paired mode or a missing field silently mis-bootstraps — the same
 agent-dead/pre-start-NATS failure class already documented.
 
-**Build:** when `agent.mode` is unset/auto, select configdrive for v2+ and registry for
-v1 from the already-extracted stemcell api_version. Add a settings-completeness assertion
-(registry-less requires non-empty mbus, agent_id, networks, and system disk); fail
-`create_vm` early with a clear error instead of booting a half-configured agent. Add a
+**Shipped.** A new `agent_mode: auto` reads the stemcell `api_version` from the create_vm
+request context (previously discarded) and selects registry-less configdrive for v2+ and
+registry for v1. At boot the configdrive agent is always built, and a registry agent is
+built too when `registry_endpoint` is set; a v1 stemcell with no registry agent fails
+early with a clear error rather than mis-bootstrapping. A missing `api_version` fails open
+to configdrive, the modern default. The api_version parse accepts float, integer, and
+numeric-string forms so a v1 stemcell is never silently misread. A settings-completeness
+assertion now guards the registry-less path: a configdrive boot with an empty mbus or
+agent_id, or no networks, fails `create_vm` immediately instead of booting a
+half-configured agent. The registry and noagent paths are unchanged, and the explicit
+`cloudinit`, `registry`, and `noagent` modes keep their existing behavior. Covered by a
 v1/v2 × mode test matrix.
 
 #### 7.23 DONE — Placement-failure retryability signaling
@@ -775,7 +782,7 @@ project runs.
 rejection map in the message; keep a permanent error for permanent causes (e.g. a
 misconfigured AZ name). This is the placement slice of §7.11.
 
-#### 7.24 Stemcell-driven root/ephemeral disk sizing and dedicated ephemeral pool
+#### 7.24 DONE — Stemcell-driven root/ephemeral disk sizing and dedicated ephemeral pool
 
 *References: Azure, OpenStack-Go, Google, AWS, Alicloud.* PVE clones the template disk
 as-is and the agent carves an ephemeral partition from the grown root — functional, but
@@ -783,11 +790,20 @@ operators cannot request a larger root or place ephemeral on a separate (e.g.
 fast-volatile local-NVMe) pool to keep churn off Ceph. Reference CPIs size root/ephemeral
 from stemcell + cloud_properties and offer a separate ephemeral disk.
 
-**Build:** after clone, if `cloud_properties.root_disk_size` exceeds the template disk,
-call the existing online-resize path on the root disk during `create_vm` (reject shrink,
-matching every reference CPI). Optionally create a second disk of `ephemeral_disk_size_mb`
-on a separately-resolvable `ephemeral_storage_pool` (via §7.8) and surface it to the agent
-as `disks.ephemeral`. Both opt-in; the proven grow-root path stays default.
+**Shipped.** The root-disk resize now reads the actual template disk size from the VM
+config after clone and grows by the correct delta, fixing a latent bug where the delta was
+computed against a hardcoded 5 GiB assumption (wrong for any other template size). The
+requested size comes from a new `root_disk_size` cloud_property (the existing `disk` key
+still works); a request smaller than the template is rejected with a clear error instead
+of being silently ignored. A transient failure to read the template size surfaces as a
+retriable error rather than fabricating a wrong delta. Separately, setting
+`ephemeral_disk_size_mb` creates a dedicated ephemeral disk on a `ephemeral_storage_pool`
+resolved through the layered cloud_properties resolver (falling back to the VM storage),
+attaches it on the next free scsi slot (never scsi0, which would collide with the virtio
+root), and surfaces its stable by-id device path to the agent as `disks.ephemeral`. A
+created volume is cleaned up if the follow-on attach fails. Both knobs are opt-in: with
+neither set, the proven grow-root-then-agent-carves-ephemeral path is byte-identical to
+before.
 
 #### 7.25 DONE — Configurable per-method retry/backoff policy
 

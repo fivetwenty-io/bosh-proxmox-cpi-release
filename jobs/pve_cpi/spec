@@ -102,7 +102,15 @@ properties:
       registry.ca_cert.
     default: ""
   pve.agent_mode:
-    description: "Agent bootstrap mode: cloudinit, registry, noagent"
+    description: |
+      Agent bootstrap mode. Valid values: cloudinit, registry, noagent, auto.
+      "cloudinit" — uses cloud-init (default).
+      "registry" — uses BOSH registry at registry.endpoint.
+      "noagent" — no agent bootstrap; assumes DNS/manual setup.
+      "auto" — selects registry-less mode (configdrive) for stemcell api_version >= 2,
+               falls back to registry for v1 stemcells. Requires registry_endpoint to be
+               set for v1 stemcell compatibility. Omitted from rendered cpi.json when
+               default "cloudinit" is used.
     default: "cloudinit"
   pve.vm_disk_format:
     description: "Disk format: qcow2, raw, vmdk"

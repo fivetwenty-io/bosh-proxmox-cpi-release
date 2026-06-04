@@ -42,6 +42,10 @@ type vmMockQEMU struct {
 	// exercise the clone path set this field. Import-only tests leave it nil so
 	// the default panic fires on unexpected Clone calls — guarding the import path.
 	cloneFn func(ctx context.Context, node string, vmid int, params map[string]any) (string, error)
+	// resizeDiskFn, when non-nil, is called by ResizeDisk. Tests that exercise
+	// the root disk grow path set this field. Tests that must not call ResizeDisk
+	// leave it nil so ResizeDisk panics on unexpected calls.
+	resizeDiskFn func(ctx context.Context, node string, vmid int, diskID string, sizeGiB int) (string, error)
 
 	mu          sync.Mutex
 	createCalls []vmCreateCall
@@ -114,8 +118,11 @@ func (m *vmMockQEMU) Template(_ context.Context, _ string, _ int) (string, error
 func (m *vmMockQEMU) DetachDisk(_ context.Context, _ string, _ int, _ string) error {
 	panic("vmMockQEMU.DetachDisk: not expected")
 }
-func (m *vmMockQEMU) ResizeDisk(_ context.Context, _ string, _ int, _ string, _ int) (string, error) {
-	panic("vmMockQEMU.ResizeDisk: not expected")
+func (m *vmMockQEMU) ResizeDisk(ctx context.Context, node string, vmid int, diskID string, sizeGiB int) (string, error) {
+	if m.resizeDiskFn != nil {
+		return m.resizeDiskFn(ctx, node, vmid, diskID, sizeGiB)
+	}
+	panic("vmMockQEMU.ResizeDisk: not expected in this test")
 }
 func (m *vmMockQEMU) Snapshot(_ context.Context, _ string, _ int, _ string, _ map[string]any) (string, error) {
 	panic("vmMockQEMU.Snapshot: not expected")
@@ -3137,6 +3144,181 @@ func TestCreateVM_NoGroupsNoFirewall_ZeroFirewallAPICalls(t *testing.T) {
 	}
 	if n.firewallEnableOptCalls != 0 {
 		t.Errorf("no firewall enable calls expected; got %d", n.firewallEnableOptCalls)
+	}
+}
+
+// --------------------------------------------------------------------------
+// Ephemeral disk full-stack tests
+// --------------------------------------------------------------------------
+
+// buildVMDepsWithStorage constructs Deps like buildVMDeps but also wires a
+// mockStorageService so tests that exercise the ephemeral disk path
+// (attachEphemeralDisk → Storage().CreateVolume) have a storage service.
+func buildVMDepsWithStorage(q *vmMockQEMU, n *vmMockNodes, c *vmMockCluster, a *vmMockAgent, stor *mockStorageService) handlers.Deps {
+	d := buildVMDeps(q, n, c, a)
+	d.PVE.(*mockPVEClient).storageSvc = stor
+	return d
+}
+
+// TestHandleCreateVM_Ephemeral_Unset verifies byte-identical behavior when
+// ephemeral_disk_size_mb is absent: CreateVolume is not called and
+// agentCfg.Disks.Ephemeral remains empty (agent carves from root).
+func TestHandleCreateVM_Ephemeral_Unset(t *testing.T) {
+	t.Parallel()
+
+	createVolumeCalled := false
+	stor := &mockStorageService{
+		createVolumeFn: func(_ context.Context, _, _ string, _ int, _ string, _ int, _ string) (string, error) {
+			createVolumeCalled = true
+			return "", nil
+		},
+	}
+	var gotEphemeral string
+	a := &vmMockAgent{
+		configureFn: func(_ context.Context, _ string, _ int, cfg agent.AgentConfig) error {
+			gotEphemeral = cfg.Disks.Ephemeral
+			return nil
+		},
+	}
+	h := handlers.HandleCreateVM(buildVMDepsWithStorage(&vmMockQEMU{}, &vmMockNodes{}, &vmMockCluster{}, a, stor))
+
+	args := mkArgs("agent-eph-unset", testStemcellCID,
+		map[string]any{"cores": 1, "memory": 512},
+		defaultNetMap(), []string{}, map[string]any{})
+
+	if _, err := h.Handle(context.Background(), args, mkCtx("eph-unset")); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if createVolumeCalled {
+		t.Error("CreateVolume called when ephemeral_disk_size_mb is unset — must be no-op")
+	}
+	if gotEphemeral != "" {
+		t.Errorf("Disks.Ephemeral = %q; want empty (agent carves from root)", gotEphemeral)
+	}
+}
+
+// TestHandleCreateVM_Ephemeral_Success verifies the full happy path:
+// ephemeral_disk_size_mb=4096, CreateVolume returns a volid, Config returns
+// empty VM config (slot 1 free), AttachDisk returns "scsi1", and
+// agentCfg.Disks.Ephemeral is set to the expected by-id device path.
+func TestHandleCreateVM_Ephemeral_Success(t *testing.T) {
+	t.Parallel()
+
+	const volid = "local-lvm:vm-ephemeral-0"
+	stor := &mockStorageService{
+		createVolumeFn: func(_ context.Context, _, _ string, _ int, _ string, _ int, _ string) (string, error) {
+			return volid, nil
+		},
+	}
+	q := &vmMockQEMU{
+		// Config is called at multiple points: for readVirtio0SizeGiB (fallback)
+		// and for attachEphemeralDisk slot detection. Return a config with net0
+		// so readVirtio0SizeGiB falls back to defaultStemcellDiskGiB, and no
+		// scsi slots taken so nextFreeSCSIIndexAtLeast returns 1.
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return map[string]any{"net0": "virtio=aa:bb:cc:dd:ee:ff,bridge=vmbr0"}, nil
+		},
+		attachDiskFn: func(_ context.Context, _ string, _ int, gotVolid, bus string, _ *sdkqemu.AttachOpts) (string, error) {
+			if gotVolid == volid {
+				return "scsi1", nil
+			}
+			// Persistent-disk attach (none in this test); fall through to default.
+			return "scsi1", nil
+		},
+	}
+	var gotEphemeral string
+	a := &vmMockAgent{
+		configureFn: func(_ context.Context, _ string, _ int, cfg agent.AgentConfig) error {
+			gotEphemeral = cfg.Disks.Ephemeral
+			return nil
+		},
+	}
+	h := handlers.HandleCreateVM(buildVMDepsWithStorage(q, &vmMockNodes{}, &vmMockCluster{}, a, stor))
+
+	args := mkArgs("agent-eph-ok", testStemcellCID,
+		map[string]any{"cores": 1, "memory": 512, "ephemeral_disk_size_mb": 4096},
+		defaultNetMap(), []string{}, map[string]any{})
+
+	if _, err := h.Handle(context.Background(), args, mkCtx("eph-ok")); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := "/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_drive-scsi1"
+	if gotEphemeral != want {
+		t.Errorf("Disks.Ephemeral = %q; want %q", gotEphemeral, want)
+	}
+}
+
+// TestHandleCreateVM_Ephemeral_ExplicitPool verifies that ephemeral_storage_pool
+// in cloud_properties is passed to CreateVolume.
+func TestHandleCreateVM_Ephemeral_ExplicitPool(t *testing.T) {
+	t.Parallel()
+
+	var gotStorage string
+	stor := &mockStorageService{
+		createVolumeFn: func(_ context.Context, _, storage string, _ int, _ string, _ int, _ string) (string, error) {
+			gotStorage = storage
+			return storage + ":vm-eph-0", nil
+		},
+	}
+	q := &vmMockQEMU{
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return map[string]any{}, nil
+		},
+		attachDiskFn: func(_ context.Context, _ string, _ int, _, _ string, _ *sdkqemu.AttachOpts) (string, error) {
+			return "scsi1", nil
+		},
+	}
+	h := handlers.HandleCreateVM(buildVMDepsWithStorage(q, &vmMockNodes{}, &vmMockCluster{}, &vmMockAgent{}, stor))
+
+	args := mkArgs("agent-eph-pool", testStemcellCID,
+		map[string]any{
+			"cores": 1, "memory": 512,
+			"ephemeral_disk_size_mb":  4096,
+			"ephemeral_storage_pool": "fast-ssd",
+		},
+		defaultNetMap(), []string{}, map[string]any{})
+
+	if _, err := h.Handle(context.Background(), args, mkCtx("eph-pool")); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if gotStorage != "fast-ssd" {
+		t.Errorf("CreateVolume storage = %q; want fast-ssd", gotStorage)
+	}
+}
+
+// TestHandleCreateVM_Ephemeral_CreateFail_VMRolledBack verifies that when
+// CreateVolume fails, a Cloud error is returned and the VM is rolled back
+// (deleteQemuCalls >= 1).
+func TestHandleCreateVM_Ephemeral_CreateFail_VMRolledBack(t *testing.T) {
+	t.Parallel()
+
+	stor := &mockStorageService{
+		createVolumeFn: func(_ context.Context, _, _ string, _ int, _ string, _ int, _ string) (string, error) {
+			return "", errors.New("storage pool full")
+		},
+	}
+	q := &vmMockQEMU{
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return map[string]any{}, nil
+		},
+	}
+	n := &vmMockNodes{}
+	h := handlers.HandleCreateVM(buildVMDepsWithStorage(q, n, &vmMockCluster{}, &vmMockAgent{}, stor))
+
+	args := mkArgs("agent-eph-fail", testStemcellCID,
+		map[string]any{"cores": 1, "memory": 512, "ephemeral_disk_size_mb": 4096},
+		defaultNetMap(), []string{}, map[string]any{})
+
+	_, err := h.Handle(context.Background(), args, mkCtx("eph-fail"))
+	if err == nil {
+		t.Fatal("expected error from CreateVolume failure, got nil")
+	}
+	// Accept Cloud or Retriable — WrapError may classify storage error as transient.
+	if err.Error() == "" {
+		t.Error("returned error has empty message")
+	}
+	if len(n.deleteQemuCalls) == 0 {
+		t.Error("VM not rolled back (deleteQemuCalls=0) after ephemeral CreateVolume failure")
 	}
 }
 

@@ -131,10 +131,30 @@ func runWithArgs(args []string, stdin io.Reader, stdout, stderr io.Writer, opts 
 		return 1
 	}
 
-	bootAgent, err := agent.NewAgent(cfg, client, logger)
+	// When agent_mode="auto", the primary boot agent is always configdrive.
+	// Pass a synthetic cfg copy with AgentMode="cloudinit" so factory.go's
+	// default-error branch stays accurate and iso/stemcell storage resolves
+	// normally. All other modes pass cfg unchanged.
+	cfgForBoot := *cfg
+	if cfgForBoot.AgentMode == "auto" {
+		cfgForBoot.AgentMode = "cloudinit"
+	}
+	bootAgent, err := agent.NewAgent(&cfgForBoot, client, logger)
 	if err != nil {
 		logger.Error("agent init failed", log.Err(err))
 		return 1
+	}
+
+	// When agent_mode="auto" and registry_endpoint is set, also build the
+	// optional secondary registry agent for per-call v1 stemcell selection.
+	// Nil when absent — configureAgent nil-guards before use.
+	var registryAgent agent.Agent
+	if cfg.AgentMode == "auto" && cfg.RegistryEndpoint != "" {
+		registryAgent, err = agent.NewRegistryAgentIfConfigured(cfg, logger)
+		if err != nil {
+			logger.Error("registry agent init failed", log.Err(err))
+			return 1
+		}
 	}
 
 	// Root context cancelled on SIGINT/SIGTERM. defer cancel() fires when
@@ -202,11 +222,12 @@ func runWithArgs(args []string, stdin io.Reader, stdout, stderr io.Writer, opts 
 	}
 	d := cpi.NewDispatcherWithOptions(logger, dispatcherOpts...)
 	handlers.RegisterAll(d, handlers.Deps{
-		Config:   cfg,
-		PVE:      client,
-		Agent:    bootAgent,
-		Logger:   logger,
-		Resolver: backendResolver,
+		Config:        cfg,
+		PVE:           client,
+		Agent:         bootAgent,
+		RegistryAgent: registryAgent, // nil unless agent_mode=auto and registry_endpoint set
+		Logger:        logger,
+		Resolver:      backendResolver,
 	})
 
 	maxLine := opts.MaxLineBytes

@@ -89,6 +89,40 @@ func NewAgent(cfg *config.CPIConfig, pveClient pve.Client, logger *log.Logger) (
 	}
 }
 
+// NewRegistryAgentIfConfigured builds a registry-backed Agent when
+// cfg.RegistryEndpoint is non-empty, or returns (nil, nil) when it is empty.
+// This is the opt-in secondary registry path for agent_mode=auto: callers
+// must fall back to their primary agent when this returns nil.
+//
+// Registry client construction mirrors the "registry" case in NewAgent exactly
+// (CACertPEM, AllowedHosts, AllowPrivateIP). Returns (nil, CloudError) when
+// the endpoint is set but NewClientWithOptions rejects it.
+//
+// cfg and logger must not be nil.
+func NewRegistryAgentIfConfigured(cfg *config.CPIConfig, logger *log.Logger) (Agent, error) {
+	if cfg == nil {
+		return nil, cpierrors.Cloud("agent.NewRegistryAgentIfConfigured: cfg must not be nil")
+	}
+	if logger == nil {
+		return nil, cpierrors.Cloud("agent.NewRegistryAgentIfConfigured: logger must not be nil")
+	}
+	if cfg.RegistryEndpoint == "" {
+		return nil, nil
+	}
+	regClient, err := registry.NewClientWithOptions(
+		cfg.RegistryEndpoint, cfg.RegistryUser, cfg.RegistryPassword,
+		registry.Options{
+			CACertPEM:      cfg.RegistryCACertPEM,
+			AllowedHosts:   cfg.RegistryAllowedHosts,
+			AllowPrivateIP: cfg.RegistryAllowPrivateIPValue(),
+		},
+	)
+	if err != nil {
+		return nil, cpierrors.Cloud("agent.NewRegistryAgentIfConfigured: build registry client: %s", err.Error())
+	}
+	return NewRegistryAgent(regClient, logger), nil
+}
+
 // redactURL strips userinfo from a URL before logging. A parse failure returns
 // the original string so the operator still sees something useful in logs.
 func redactURL(endpoint string) string {

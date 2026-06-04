@@ -25,7 +25,7 @@ import (
 // the first disk on the boot bus (index 0).
 var systemDiskSlots = map[string]bool{
 	"scsi0":   true,
-	"virtio0": true,
+	diskKeyVirtio0: true,
 	"ide0":    true,
 	"ide2":    true, // conventional cloudinit slot
 }

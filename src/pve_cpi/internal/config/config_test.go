@@ -4900,3 +4900,46 @@ func TestStrictOff_DlbRequireSharedStorageWithDlbDisabled_NoError(t *testing.T) 
 		t.Errorf("flag off: require_shared_storage with dlb disabled must not error; got: %v", err)
 	}
 }
+
+// --------------------------------------------------------------------------
+// TestValidate_AgentModeAuto_Valid
+// --------------------------------------------------------------------------
+
+func TestValidate_AgentModeAuto_Valid(t *testing.T) {
+	t.Parallel()
+	_, err := mustLoad(t, `{
+		"host": "h", "user": "u", "password": "p",
+		"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
+		"agent_mode": "auto"
+	}`)
+	if err != nil {
+		t.Errorf("agent_mode=auto must be valid; got: %v", err)
+	}
+}
+
+// --------------------------------------------------------------------------
+// TestValidate_AgentModeUnknown_StillFails
+// --------------------------------------------------------------------------
+
+func TestValidate_AgentModeUnknown_StillFails(t *testing.T) {
+	t.Parallel()
+	_, err := mustLoad(t, `{
+		"host": "h", "user": "u", "password": "p",
+		"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
+		"agent_mode": "bogus"
+	}`)
+	assertCloudError(t, err, "agent_mode must be one of")
+}
+
+// --------------------------------------------------------------------------
+// TestApplyDefaults_AutoNotDefault
+// --------------------------------------------------------------------------
+
+func TestApplyDefaults_AutoNotDefault(t *testing.T) {
+	t.Parallel()
+	cfg := &config.CPIConfig{}
+	cfg.ApplyDefaults()
+	if cfg.AgentMode != "cloudinit" {
+		t.Errorf("blank AgentMode: ApplyDefaults must set cloudinit, got %q", cfg.AgentMode)
+	}
+}

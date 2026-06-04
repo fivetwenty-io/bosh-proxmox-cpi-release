@@ -23,6 +23,7 @@ import (
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
 	sdkclusterstorage "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/clusterstorage"
 	sdknodes "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/nodes"
+	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/qemu"
 )
 
 // newCreateVMRetryBackoff builds the backoff function used between
@@ -96,6 +97,10 @@ const defaultNetworkName = "default"
 // shares the literal value but belongs to an unrelated domain.
 const nicTypeDynamic = "dynamic"
 
+// diskKeyVirtio0 is the PVE VM config key for the primary root disk.
+// Used across create_vm, create_stemcell, and get_disks to avoid repeated literals.
+const diskKeyVirtio0 = "virtio0"
+
 // createVMCloudProps holds the fields we care about from Args[2].
 type createVMCloudProps struct {
 	// CPU is the total vCPU count using the vSphere CPI convention. When
@@ -114,8 +119,15 @@ type createVMCloudProps struct {
 	// 5 GiB; the size= directive in the virtio0 import-from param sets the
 	// root disk to max(defaultStemcellDiskGiB, ceil(Disk/1024)) GiB so
 	// the agent has room to carve an ephemeral partition (CreatePartitionIfNoEphemeralDisk).
-	Disk          int    `json:"disk"`
-	NetworkBridge string `json:"network_bridge"` // per-VM bridge override
+	Disk int `json:"disk"`
+	// RootDiskSize is the requested root disk size in MiB. Takes precedence
+	// over Disk when both are set. Zero = use Disk field or defaultStemcellDiskGiB.
+	RootDiskSize int `json:"root_disk_size"`
+	// EphemeralStoragePool is the PVE storage pool for the dedicated ephemeral disk.
+	// Opt-in; empty = falls back to cfg.VMStorage. Layered resolver key
+	// "ephemeral_storage_pool" also feeds this (resolver wins over struct field).
+	EphemeralStoragePool string `json:"ephemeral_storage_pool"`
+	NetworkBridge        string `json:"network_bridge"` // per-VM bridge override
 	NetworkModel  string `json:"network_model"`  // virtio|e1000 etc.
 	// Hotplug overrides the CPI default for this VM (config.Hotplug).
 	// Pointer-typed so the caller can distinguish "not set" (use config
@@ -222,6 +234,12 @@ type createVMShape struct {
 	// the layered resolver. Both import-path (createParams) and clone-path
 	// (UpdateQemuConfig) use this value.
 	scsihw string
+	// ephemeralDiskGiB is the size of the dedicated ephemeral disk in GiB.
+	// Zero means no dedicated ephemeral disk (default: agent carves from root).
+	ephemeralDiskGiB int
+	// ephemeralStorage is the PVE storage pool for the ephemeral disk.
+	// Only meaningful when ephemeralDiskGiB > 0.
+	ephemeralStorage string
 }
 
 // HandleCreateVM returns a cpi.Handler that implements the BOSH CPI create_vm method.
@@ -245,8 +263,8 @@ type createVMShape struct {
 // Rollback: if any step after VM creation fails, the VM is stopped (best-effort)
 // and destroyed (purge=true) before the error is returned.
 func HandleCreateVM(deps Deps) cpi.Handler {
-	return cpi.HandlerFunc(func(ctx context.Context, args []json.RawMessage, _ jsonrpc.Context) (any, error) {
-		return createVM(ctx, deps, args)
+	return cpi.HandlerFunc(func(ctx context.Context, args []json.RawMessage, jrCtx jsonrpc.Context) (any, error) {
+		return createVM(ctx, deps, args, jrCtx)
 	})
 }
 
@@ -255,6 +273,7 @@ func createVM(
 	ctx context.Context,
 	deps Deps,
 	args []json.RawMessage,
+	jrCtx jsonrpc.Context,
 ) (result any, retErr error) {
 	logger := deps.Logger
 
@@ -275,6 +294,16 @@ func createVM(
 	// -----------------------------------------------------------------------
 	if err := validateVIPAllowedAddressPairs(parsed.networks); err != nil {
 		return nil, err
+	}
+
+	// -----------------------------------------------------------------------
+	// 1c. Pre-flight agent-mode selection. For agent_mode=auto with a v1 stemcell
+	// and no registry endpoint configured, fail immediately before any VM is
+	// created so there is no orphan to clean up. The full per-call selection runs
+	// again inside configureAgent; this check is purely pre-creation guard.
+	// -----------------------------------------------------------------------
+	if _, _, selErr := selectAgentForCall(deps, jrCtx); selErr != nil {
+		return nil, selErr
 	}
 
 	// -----------------------------------------------------------------------
@@ -374,9 +403,20 @@ func createVM(
 	}
 
 	// -----------------------------------------------------------------------
+	// 6.5. Create and attach dedicated ephemeral disk (opt-in).
+	//      When ephemeral_disk_size_mb is unset (zero), this is a no-op —
+	//      byte-identical to pre-feature behavior (agent carves ephemeral
+	//      from root disk via CreatePartitionIfNoEphemeralDisk).
+	// -----------------------------------------------------------------------
+	ephemeralDevPath, err := attachEphemeralDisk(ctx, deps, logger, shape, vmid)
+	if err != nil {
+		return nil, err
+	}
+
+	// -----------------------------------------------------------------------
 	// 7. Build AgentConfig and call agent.Configure
 	// -----------------------------------------------------------------------
-	if err := configureAgent(ctx, deps, logger, parsed, shape, vmid, vmName); err != nil {
+	if err := configureAgent(ctx, deps, logger, parsed, shape, vmid, vmName, ephemeralDevPath, jrCtx); err != nil {
 		return nil, err
 	}
 
@@ -690,6 +730,11 @@ func resolveVMShape(ctx context.Context, deps Deps, parsed *createVMParsedArgs) 
 		scsihwVal = "virtio-scsi-single"
 	}
 
+	ephemeralDiskGiB, ephemeralStorage, err := resolveEphemeralShape(deps.Config, cp, parsed.cloudPropsMap)
+	if err != nil {
+		return nil, err
+	}
+
 	return &createVMShape{
 		node:             node,
 		vmStorage:        vmStorage,
@@ -708,6 +753,8 @@ func resolveVMShape(ctx context.Context, deps Deps, parsed *createVMParsedArgs) 
 		cloudPropsMap:    parsed.cloudPropsMap,
 		rootDiskPerfOpts: rootDiskPerfOpts,
 		scsihw:           scsihwVal,
+		ephemeralDiskGiB: ephemeralDiskGiB,
+		ephemeralStorage: ephemeralStorage,
 	}, nil
 }
 
@@ -1566,8 +1613,18 @@ func resolveVMShapeStorage(cfg *config.CPIConfig, parsed *createVMParsedArgs, ti
 	}
 
 	rootDiskGiB = defaultStemcellDiskGiB
-	if cp.Disk > 0 {
-		requestedGiB := (cp.Disk + 1023) / 1024
+	// root_disk_size (MiB) takes precedence; fall back to disk (MiB, legacy).
+	requestedMiB := 0
+	if rsz, ok := r.Int("root_disk_size"); ok && rsz > 0 {
+		requestedMiB = rsz
+	} else if cp.RootDiskSize > 0 {
+		requestedMiB = cp.RootDiskSize
+	}
+	if requestedMiB == 0 {
+		requestedMiB = cp.Disk // may be 0 — handled below
+	}
+	if requestedMiB > 0 {
+		requestedGiB := (requestedMiB + 1023) / 1024
 		if requestedGiB > rootDiskGiB {
 			rootDiskGiB = requestedGiB
 		}
@@ -1991,8 +2048,8 @@ func attemptCreateVM(
 		"cores":         shape.cores,
 		"ostype":        osTypeLinux26,
 		"scsihw":        shape.scsihw,
-		"virtio0":       virtio0Val,
-		"boot":          "order=virtio0",
+		diskKeyVirtio0:  virtio0Val,
+		"boot":          "order=" + diskKeyVirtio0,
 		"agent":         "enabled=1",
 		"hotplug":       shape.hotplug,
 		"onboot":        0,
@@ -2273,7 +2330,7 @@ func cloneFromTemplate(
 				log.String("error", cfgGetErr.Error()),
 			)
 		} else {
-			currentVirtio0, _ := clonedCfg["virtio0"].(string)
+			currentVirtio0, _ := clonedCfg[diskKeyVirtio0].(string)
 			if currentVirtio0 == "" {
 				// Fallback: use storage:index bare form that PVE recognises.
 				currentVirtio0 = shape.vmStorage + ":vm-" + strconv.Itoa(candidate) + "-disk-0"
@@ -2387,8 +2444,37 @@ func handleAwaitError(
 	return werr
 }
 
-// resizeRootDisk grows virtio0 by the delta between rootDiskGiB and the
-// imported stemcell base size. It is a no-op when no growth is needed.
+// readVirtio0SizeGiB reads the virtio0 disk size from the VM config.
+//
+// A failed Config call is propagated (not swallowed): on a non-5-GiB template a
+// transient read failure would otherwise fabricate base=5 and grow by the wrong
+// delta — over-growing a large template or under-growing a small one (risking
+// the very ephemeral-space boot failure the resize exists to prevent). The
+// caller wraps this through pve.WrapError so a transient surfaces as retriable.
+//
+// Falls back to defaultStemcellDiskGiB only when the config is readable but
+// virtio0 is absent or unparseable — there is no transient ambiguity there and
+// 5 GiB is the safe BOSH-stemcell baseline.
+func readVirtio0SizeGiB(ctx context.Context, deps Deps, node string, vmid int) (int, error) {
+	cfg, err := deps.PVE.QEMU().Config(ctx, node, vmid)
+	if err != nil {
+		return 0, err
+	}
+	v0, ok := cfg[diskKeyVirtio0].(string)
+	if !ok || v0 == "" {
+		return defaultStemcellDiskGiB, nil
+	}
+	gib, parseErr := parseDiskSizeGiB(v0)
+	if parseErr != nil {
+		return defaultStemcellDiskGiB, nil
+	}
+	return gib, nil
+}
+
+// resizeRootDisk grows virtio0 by the delta between shape.rootDiskGiB and the
+// actual template size read from the VM config after creation. It is a no-op
+// when the requested size equals the template size, and returns a Cloud error
+// when the requested size is smaller (shrink not supported).
 //
 // PVE silently ignores the `size=<N>G` directive on the import-from
 // scsi/virtio param when the source image is smaller than N — the new
@@ -2404,8 +2490,19 @@ func resizeRootDisk(
 	shape *createVMShape,
 	vmid int,
 ) error {
-	growGiB := shape.rootDiskGiB - defaultStemcellDiskGiB
-	if growGiB <= 0 {
+	actualTemplateGiB, sizeErr := readVirtio0SizeGiB(ctx, deps, shape.node, vmid)
+	if sizeErr != nil {
+		return cpierrors.Wrap(pve.WrapError(sizeErr),
+			fmt.Sprintf("create_vm: read template disk size for resize vmid=%d", vmid))
+	}
+	growGiB := shape.rootDiskGiB - actualTemplateGiB
+	if growGiB < 0 {
+		return cpierrors.Cloud(
+			"create_vm: root disk shrink not supported: requested %d GiB, template %d GiB; use a larger disk size or a smaller stemcell",
+			shape.rootDiskGiB, actualTemplateGiB,
+		)
+	}
+	if growGiB == 0 {
 		return nil
 	}
 	// PVE's `qm resize` runs `qemu-img resize` under the per-storage
@@ -2415,7 +2512,7 @@ func resizeRootDisk(
 	// in the task log. Retry the whole submit+await with seconds-scale
 	// backoff against the lock holder finishing.
 	rerr := pve.RetryOnTransientOrLock(ctx, logger, "resize_virtio0", shape.maxAttempts, func() error {
-		upid, e := deps.PVE.QEMU().ResizeDisk(ctx, shape.node, vmid, "virtio0", growGiB)
+		upid, e := deps.PVE.QEMU().ResizeDisk(ctx, shape.node, vmid, diskKeyVirtio0, growGiB)
 		if e != nil {
 			return e
 		}
@@ -2439,6 +2536,132 @@ func resizeRootDisk(
 		log.Int("final_gib", shape.rootDiskGiB),
 	)
 	return nil
+}
+
+// resolveEphemeralShape resolves the ephemeral disk size and storage pool from
+// cloud_properties. Returns (0, "", nil) when EphemeralDiskSizeMB is unset —
+// no ephemeral disk is created and the agent carves ephemeral storage from the
+// root disk (default behavior, byte-identical to pre-feature behavior).
+//
+// Storage resolution order: layered resolver "ephemeral_storage_pool" key →
+// struct field EphemeralStoragePool → cfg.VMStorage fallback.
+func resolveEphemeralShape(cfg *config.CPIConfig, cp createVMCloudProps, cpMap map[string]any) (int, string, error) {
+	if cp.EphemeralDiskSizeMB <= 0 {
+		return 0, "", nil
+	}
+	r, rErr := newLayeredResolver(cpMap, cfg)
+	if rErr != nil {
+		return 0, "", rErr
+	}
+	gib := (cp.EphemeralDiskSizeMB + 1023) / 1024
+	stor := ""
+	if pool, ok := r.String("ephemeral_storage_pool"); ok {
+		stor = pool
+	} else if cp.EphemeralStoragePool != "" {
+		stor = cp.EphemeralStoragePool
+	} else {
+		stor = cfg.VMStorage
+	}
+	if stor == "" {
+		return 0, "", cpierrors.Cloud(
+			"create_vm: ephemeral_disk_size_mb set but no storage pool resolved (set ephemeral_storage_pool or vm_storage)")
+	}
+	return gib, stor, nil
+}
+
+// attachEphemeralDisk creates and attaches a dedicated ephemeral disk when
+// shape.ephemeralDiskGiB > 0. Returns the device path the BOSH agent expects
+// (e.g. "/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_drive-scsi2"), or ("", nil)
+// when no dedicated ephemeral disk is requested (default no-op path).
+//
+// Orphan safety: if CreateVolume succeeds but a subsequent step fails, the
+// created volume is deleted before the error is returned. The VM-rollback
+// defer in createVM (purge=true) auto-purges attached disks but not unattached
+// orphan volumes — so explicit cleanup is needed between CreateVolume and
+// AttachDisk.
+func attachEphemeralDisk(
+	ctx context.Context,
+	deps Deps,
+	logger *log.Logger,
+	shape *createVMShape,
+	vmid int,
+) (string, error) {
+	if shape.ephemeralDiskGiB <= 0 {
+		return "", nil
+	}
+
+	volName := fmt.Sprintf("vm-%d-ephemeral-0", vmid)
+	createdVolid, err := deps.PVE.Storage().CreateVolume(
+		ctx, shape.node, shape.ephemeralStorage,
+		shape.ephemeralDiskGiB, shape.vmDiskFormat, vmid, volName,
+	)
+	if err != nil {
+		return "", cpierrors.Wrap(pve.WrapError(err),
+			fmt.Sprintf("create_vm: create ephemeral volume vmid=%d size=%dG storage=%s",
+				vmid, shape.ephemeralDiskGiB, shape.ephemeralStorage))
+	}
+
+	cleanupVol := func() {
+		rollbackCtx := contextWithoutCancel(ctx)
+		stor, _, _ := pve.ParseDiskCID(createdVolid)
+		if stor == "" {
+			stor = shape.ephemeralStorage
+		}
+		if delErr := deps.PVE.Storage().DeleteVolume(rollbackCtx, shape.node, stor, createdVolid); delErr != nil {
+			logger.Warn("create_vm: ephemeral volume orphan cleanup failed",
+				log.Int(metadataKeyVMID, vmid),
+				log.String("volid", createdVolid),
+				log.Err(delErr),
+			)
+		}
+	}
+
+	// Read current VM config to find next free scsi slot.
+	vmCfg, cfgErr := deps.PVE.QEMU().Config(ctx, shape.node, vmid)
+	if cfgErr != nil {
+		cleanupVol()
+		return "", cpierrors.Wrap(pve.WrapError(cfgErr),
+			fmt.Sprintf("create_vm: read VM config for ephemeral slot vmid=%d", vmid))
+	}
+
+	slot := nextFreeSCSIIndexAtLeast(vmCfg, 1)
+	if slot >= 29 {
+		cleanupVol()
+		return "", cpierrors.Cloud(
+			"create_vm: no free scsi slot for ephemeral disk vmid=%d (scsi1..28 exhausted by persistent disks)", vmid)
+	}
+
+	// Force the computed slot via AttachOpts.DiskID. Passing nil here would let
+	// the SDK assign from scsi0, which the agent's mappedDevicePathResolver maps
+	// onto /dev/sda and collides with the virtio0 root disk — the same reason
+	// attach_disk uses chooseSCSISlotSkippingZero. The floor of 1 guarantees a
+	// non-zero slot.
+	desiredDiskID := fmt.Sprintf("scsi%d", slot)
+	if _, attachErr := deps.PVE.QEMU().AttachDisk(
+		ctx, shape.node, vmid, createdVolid, "scsi",
+		&qemu.AttachOpts{DiskID: desiredDiskID},
+	); attachErr != nil {
+		cleanupVol()
+		return "", cpierrors.Wrap(pve.WrapError(attachErr),
+			fmt.Sprintf("create_vm: attach ephemeral disk vmid=%d volid=%s", vmid, createdVolid))
+	}
+
+	devPath, pathErr := devicePathByID(desiredDiskID)
+	if pathErr != nil {
+		// Disk is attached; the VM-rollback defer (purge=true) will destroy
+		// it along with the VM. Return a Cloud error to trigger the rollback.
+		return "", cpierrors.Cloud(
+			"create_vm: ephemeral disk attached as %q but devicePathByID failed: %s",
+			desiredDiskID, pathErr.Error())
+	}
+
+	logger.Info("create_vm: attached ephemeral disk",
+		log.Int(metadataKeyVMID, vmid),
+		log.String("volid", createdVolid),
+		log.String("slot", desiredDiskID),
+		log.String("dev_path", devPath),
+	)
+	return devPath, nil
 }
 
 // resolveVMNICDefaults resolves the VM-level NIC bridge and model defaults using
@@ -2669,7 +2892,114 @@ func attachPersistentDisks(
 	return nil
 }
 
-// configureAgent builds the agent.AgentConfig and calls deps.Agent.Configure.
+// selectAgentForCall chooses which agent.Agent to call for this create_vm
+// invocation and whether the call is registry-less (configdrive path).
+//
+// Routing rules:
+//
+//   - mode != "auto" → always use deps.Agent; registryLess = (mode=="cloudinit").
+//   - mode == "auto", api_version >= 2 (or absent — fail-open) → deps.Agent (configdrive), registryLess=true.
+//   - mode == "auto", api_version < 2, deps.RegistryAgent != nil → deps.RegistryAgent, registryLess=false.
+//   - mode == "auto", api_version < 2, deps.RegistryAgent == nil → Cloud error (no orphan).
+//
+// api_version is read from jrCtx.VM["stemcell"]["api_version"] (float64) first,
+// then jrCtx.Stemcell["api_version"] as fallback. Nil or missing → treated as absent.
+// parseAPIVersion coerces a stemcell api_version from the decoded JSON-RPC
+// context into a float64. The standard library decoder yields float64 for JSON
+// numbers, but this also accepts json.Number, integer types, and numeric
+// strings so a v1 stemcell is never silently misread as registry-less when the
+// decoder configuration changes (e.g. UseNumber). Returns ok=false when the
+// value is absent or not numeric.
+func parseAPIVersion(v any) (float64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return n, true
+	case float32:
+		return float64(n), true
+	case json.Number:
+		f, err := n.Float64()
+		if err != nil {
+			return 0, false
+		}
+		return f, true
+	case int:
+		return float64(n), true
+	case int64:
+		return float64(n), true
+	case string:
+		f, err := strconv.ParseFloat(n, 64)
+		if err != nil {
+			return 0, false
+		}
+		return f, true
+	default:
+		return 0, false
+	}
+}
+
+func selectAgentForCall(deps Deps, jrCtx jsonrpc.Context) (chosen agent.Agent, registryLess bool, err error) {
+	mode := deps.Config.AgentMode
+	if mode != "auto" {
+		return deps.Agent, mode == "cloudinit", nil
+	}
+
+	// Extract api_version: check VM["stemcell"]["api_version"] first, then Stemcell["api_version"].
+	var apiVersion float64
+	var apiVersionPresent bool
+	if vmMap := jrCtx.VM; vmMap != nil {
+		if sc, ok := vmMap["stemcell"].(map[string]any); ok {
+			apiVersion, apiVersionPresent = parseAPIVersion(sc["api_version"])
+		}
+	}
+	if !apiVersionPresent {
+		if sc := jrCtx.Stemcell; sc != nil {
+			apiVersion, apiVersionPresent = parseAPIVersion(sc["api_version"])
+		}
+	}
+
+	// Absent api_version → fail-open to configdrive.
+	if !apiVersionPresent || apiVersion >= 2 {
+		return deps.Agent, true, nil
+	}
+
+	// api_version < 2: registry path.
+	if deps.RegistryAgent == nil {
+		return nil, false, cpierrors.Cloud(
+			"create_vm: agent_mode=auto with v1 stemcell (api_version=%.0f) requires registry_endpoint configured",
+			apiVersion,
+		)
+	}
+	return deps.RegistryAgent, false, nil
+}
+
+// assertRegistryLessCompleteness verifies that all fields required for a
+// configdrive (registry-less) agent boot are non-empty. Called only on the
+// configdrive path; registry and noagent skip this assertion entirely.
+//
+// Returns a Cloud error naming the first missing field. A well-configured
+// deploy never hits this — it surfaces already-failing misconfigurations early
+// instead of producing a silent agent-dead VM.
+func assertRegistryLessCompleteness(agentCfg agent.AgentConfig) error {
+	if agentCfg.MBus == "" {
+		return cpierrors.Cloud("create_vm: registry-less agent requires non-empty mbus (agent.mbus in CPI config)")
+	}
+	if agentCfg.AgentID == "" {
+		return cpierrors.Cloud("create_vm: registry-less agent requires non-empty agent_id")
+	}
+	if len(agentCfg.Networks) == 0 {
+		return cpierrors.Cloud("create_vm: registry-less agent requires at least one network configured")
+	}
+	if agentCfg.Disks.System == "" {
+		return cpierrors.Cloud("create_vm: registry-less agent requires non-empty system disk path")
+	}
+	return nil
+}
+
+// configureAgent builds the agent.AgentConfig and calls the chosen agent's Configure.
+// When agent_mode="auto", the agent is selected per stemcell api_version from jrCtx.
+// For configdrive (registry-less) paths a completeness assertion fires before Configure.
+// ephemeralDevPath is the by-id device path for a dedicated ephemeral disk created in
+// step 6.5; empty string = no dedicated disk (agent carves ephemeral from root, default).
 func configureAgent(
 	ctx context.Context,
 	deps Deps,
@@ -2678,7 +3008,21 @@ func configureAgent(
 	shape *createVMShape,
 	vmid int,
 	vmName string,
+	ephemeralDevPath string,
+	jrCtx jsonrpc.Context,
 ) error {
+	chosenAgent, registryLess, err := selectAgentForCall(deps, jrCtx)
+	if err != nil {
+		return err
+	}
+
+	// noagent: nothing to configure.
+	if deps.Config.AgentMode == "noagent" {
+		return nil
+	}
+	// When auto selected registry path, chosen != deps.Agent — honor it.
+	// When mode is "noagent" the switch above already returned.
+
 	agentNetworks := buildAgentNetworks(parsed.networks)
 	mbus, blobstore := extractMBusAndBlobstore(parsed.env)
 	if bsRaw, ok := parsed.env["blobstore"].(map[string]any); ok && len(bsRaw) > 0 && blobstore.Provider == "" {
@@ -2719,12 +3063,11 @@ func configureAgent(
 			// which globs /dev/disk/by-id/*0 — that file does not exist
 			// unless we also set a matching `serial=` on the PVE disk.
 			System: "/dev/sda",
-			// Leave Ephemeral empty: we do not attach a second disk for
-			// ephemeral storage. The agent honors
-			// CreatePartitionIfNoEphemeralDisk=true (set in agent.json on
-			// the stemcell) and carves the ephemeral partition out of the
-			// root disk. Setting Ephemeral here would cause the agent's
-			// DevicePathResolver to poll forever for a second disk to appear.
+			// Ephemeral: empty = agent carves ephemeral from root disk
+			// (CreatePartitionIfNoEphemeralDisk=true in stemcell agent.json).
+			// Non-empty = dedicated ephemeral disk was attached in step 6.5;
+			// the agent's idDevicePathResolver finds it via the by-id symlink.
+			Ephemeral:  ephemeralDevPath,
 			Persistent: map[string]string{},
 		},
 		Env:       parsed.env,
@@ -2736,7 +3079,16 @@ func configureAgent(
 		},
 	}
 
-	if err := deps.Agent.Configure(ctx, shape.node, vmid, agentCfg); err != nil {
+	// Completeness assertion: configdrive (registry-less) path only. Registry
+	// manages its own settings; noagent is intentionally empty. This converts
+	// a guaranteed silent mis-bootstrap into an early Cloud error.
+	if registryLess {
+		if assertErr := assertRegistryLessCompleteness(agentCfg); assertErr != nil {
+			return assertErr
+		}
+	}
+
+	if err := chosenAgent.Configure(ctx, shape.node, vmid, agentCfg); err != nil {
 		return cpierrors.Wrap(err, fmt.Sprintf("create_vm: agent configure vmid=%d", vmid))
 	}
 	return nil

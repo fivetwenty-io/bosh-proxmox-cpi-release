@@ -8,6 +8,7 @@ import (
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/agent"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
+	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
 
@@ -29,6 +30,7 @@ type etQEMU struct {
 	qemu.Service
 	resizeFn func(ctx context.Context, node string, vmid int, disk string, grow int) (string, error)
 	stopFn   func(ctx context.Context, node string, vmid int) (string, error)
+	configFn func(ctx context.Context, node string, vmid int) (map[string]any, error)
 }
 
 func (q *etQEMU) ResizeDisk(ctx context.Context, node string, vmid int, disk string, grow int) (string, error) {
@@ -37,6 +39,16 @@ func (q *etQEMU) ResizeDisk(ctx context.Context, node string, vmid int, disk str
 
 func (q *etQEMU) Stop(ctx context.Context, node string, vmid int) (string, error) {
 	return q.stopFn(ctx, node, vmid)
+}
+
+// Config returns an empty map when configFn is nil, triggering the
+// readVirtio0SizeGiB fallback to defaultStemcellDiskGiB. Tests that need a
+// specific size wire configFn explicitly.
+func (q *etQEMU) Config(ctx context.Context, node string, vmid int) (map[string]any, error) {
+	if q.configFn != nil {
+		return q.configFn(ctx, node, vmid)
+	}
+	return map[string]any{}, nil
 }
 
 type etNodes struct {
@@ -246,8 +258,12 @@ func TestResizeRootDisk_SubmitError(t *testing.T) {
 // --------------------------------------------------------------------------
 
 func configureAgentDeps(configureFn func(context.Context, string, int, agent.AgentConfig) error) Deps {
+	cfg := etConfig()
+	// Provide AgentMBus so the registry-less completeness assertion passes for the
+	// cloudinit path that etConfig() defaults to.
+	cfg.AgentMBus = "nats://mbus.test:4222"
 	return Deps{
-		Config: etConfig(),
+		Config: cfg,
 		PVE:    &etClient{},
 		Agent:  &etAgent{configureFn: configureFn},
 		Logger: log.NewNopLogger(),
@@ -256,11 +272,18 @@ func configureAgentDeps(configureFn func(context.Context, string, int, agent.Age
 
 func configureAgentParsed() *createVMParsedArgs {
 	return &createVMParsedArgs{
-		agentID:  "agent-1",
-		networks: map[string]createVMNetworkSpec{},
-		env:      map[string]any{},
+		agentID: "agent-1",
+		// One network entry is required for the registry-less completeness assertion.
+		networks: map[string]createVMNetworkSpec{
+			"default": {Type: "manual", IP: "10.0.0.5"},
+		},
+		env: map[string]any{},
 	}
 }
+
+// emptyJRCtx is a zero-value jsonrpc.Context used where the context carries no
+// stemcell api_version (the existing configureAgent unit tests predate auto-mode).
+var emptyJRCtx = jsonrpc.Context{}
 
 // TestConfigureAgent_Success verifies the happy path forwards a populated
 // AgentConfig and returns nil.
@@ -273,7 +296,7 @@ func TestConfigureAgent_Success(t *testing.T) {
 	})
 	shape := &createVMShape{node: "node1"}
 
-	err := configureAgent(context.Background(), deps, log.NewNopLogger(), configureAgentParsed(), shape, 300, "vm-300")
+	err := configureAgent(context.Background(), deps, log.NewNopLogger(), configureAgentParsed(), shape, 300, "vm-300", "", emptyJRCtx)
 	if err != nil {
 		t.Fatalf("configureAgent returned error: %v", err)
 	}
@@ -297,7 +320,7 @@ func TestConfigureAgent_Error(t *testing.T) {
 	})
 	shape := &createVMShape{node: "node1"}
 
-	err := configureAgent(context.Background(), deps, log.NewNopLogger(), configureAgentParsed(), shape, 301, "vm-301")
+	err := configureAgent(context.Background(), deps, log.NewNopLogger(), configureAgentParsed(), shape, 301, "vm-301", "", emptyJRCtx)
 	if err == nil {
 		t.Fatal("expected error from agent.Configure failure, got nil")
 	}
@@ -323,7 +346,7 @@ func TestConfigureAgent_MBusAndBlobstoreFallback(t *testing.T) {
 	}
 	shape := &createVMShape{node: "node1"}
 
-	err := configureAgent(context.Background(), deps, log.NewNopLogger(), configureAgentParsed(), shape, 302, "vm-302")
+	err := configureAgent(context.Background(), deps, log.NewNopLogger(), configureAgentParsed(), shape, 302, "vm-302", "", emptyJRCtx)
 	if err != nil {
 		t.Fatalf("configureAgent returned error: %v", err)
 	}

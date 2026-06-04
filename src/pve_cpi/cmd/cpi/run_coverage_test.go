@@ -651,6 +651,114 @@ func TestRunWithArgs_ClientFactorySuccess(t *testing.T) {
 	}
 }
 
+// TestRunWithArgs_AutoMode_NoRegistry_Starts exercises agent_mode=auto with no
+// registry_endpoint. The primary boot agent resolves as configdrive (cloudinit
+// path via synthetic mode) and registryAgent is nil. Expects exit 0 and a
+// well-formed JSONRPC response.
+func TestRunWithArgs_AutoMode_NoRegistry_Starts(t *testing.T) {
+	t.Parallel()
+
+	cfgJSON := `{
+  "host": "127.0.0.1",
+  "user": "root",
+  "password": "test-password",
+  "vm_storage": "local-lvm",
+  "disk_storage": "local-lvm",
+  "stemcell_storage": "local",
+  "network_bridge": "vmbr0",
+  "node": "pve1",
+  "log_level": "error",
+  "verify_ssl": false,
+  "agent_mode": "auto"
+}`
+	cfgFile := filepath.Join(t.TempDir(), "cpi.json")
+	if err := os.WriteFile(cfgFile, []byte(cfgJSON), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	nilFactory := func(_ *config.CPIConfig, _ *log.Logger) (pve.Client, error) {
+		return nilPVEClient{}, nil
+	}
+	req := `{"method":"info","arguments":[],"context":{"request_id":"auto-noreg-1"},"api_version":2}` + "\n"
+	var stdout, stderr bytes.Buffer
+	code := runWithArgs(
+		[]string{"--config", cfgFile},
+		strings.NewReader(req),
+		&stdout, &stderr,
+		runOptions{ClientFactory: nilFactory},
+	)
+	if code != 0 {
+		t.Errorf("expected exit code 0 for auto mode + no registry, got %d; stderr=%q", code, stderr.String())
+	}
+	out := strings.TrimSpace(stdout.String())
+	if out == "" {
+		t.Fatal("expected JSONRPC response on stdout, got empty buffer")
+	}
+	var resp jsonrpc.Response
+	if err := json.Unmarshal([]byte(out), &resp); err != nil {
+		t.Fatalf("unmarshal response: %v\nraw: %s", err, out)
+	}
+	if resp.Result == nil && resp.Error == nil {
+		t.Fatal("JSONRPC response has both nil result and nil error")
+	}
+}
+
+// TestRunWithArgs_AutoMode_WithRegistry_Starts exercises agent_mode=auto with a
+// registry_endpoint set. Both the primary configdrive agent and the secondary
+// registry agent must build without error. Expects exit 0 and a well-formed
+// JSONRPC response.
+func TestRunWithArgs_AutoMode_WithRegistry_Starts(t *testing.T) {
+	t.Parallel()
+
+	cfgJSON := `{
+  "host": "127.0.0.1",
+  "user": "root",
+  "password": "test-password",
+  "vm_storage": "local-lvm",
+  "disk_storage": "local-lvm",
+  "stemcell_storage": "local",
+  "network_bridge": "vmbr0",
+  "node": "pve1",
+  "log_level": "error",
+  "verify_ssl": false,
+  "agent_mode": "auto",
+  "registry_endpoint": "http://127.0.0.1:25777",
+  "registry_user": "admin",
+  "registry_password": "registry-pass",
+  "registry_allow_private_ip": true
+}`
+	cfgFile := filepath.Join(t.TempDir(), "cpi.json")
+	if err := os.WriteFile(cfgFile, []byte(cfgJSON), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	nilFactory := func(_ *config.CPIConfig, _ *log.Logger) (pve.Client, error) {
+		return nilPVEClient{}, nil
+	}
+	req := `{"method":"info","arguments":[],"context":{"request_id":"auto-withreg-1"},"api_version":2}` + "\n"
+	var stdout, stderr bytes.Buffer
+	code := runWithArgs(
+		[]string{"--config", cfgFile},
+		strings.NewReader(req),
+		&stdout, &stderr,
+		runOptions{ClientFactory: nilFactory},
+	)
+	if code != 0 {
+		t.Errorf("expected exit code 0 for auto mode + registry, got %d; stderr=%q", code, stderr.String())
+	}
+	out := strings.TrimSpace(stdout.String())
+	if out == "" {
+		t.Fatal("expected JSONRPC response on stdout, got empty buffer")
+	}
+	var resp jsonrpc.Response
+	if err := json.Unmarshal([]byte(out), &resp); err != nil {
+		t.Fatalf("unmarshal response: %v\nraw: %s", err, out)
+	}
+	if resp.Result == nil && resp.Error == nil {
+		t.Fatal("JSONRPC response has both nil result and nil error")
+	}
+}
+
 // TestRunWithArgs_AgentInitError exercises the agent.NewAgent error path by
 // injecting a nilPVEClient factory and setting agent_mode to an unsupported
 // value. NewAgent returns NotSupported, runWithArgs returns 1.
