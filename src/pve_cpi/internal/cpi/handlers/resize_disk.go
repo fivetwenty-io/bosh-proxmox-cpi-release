@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
@@ -207,6 +208,16 @@ func HandleResizeDisk(deps Deps) Handler {
 			return nil, cpierrors.Wrap(pve.WrapError(rerr), fmt.Sprintf("resize_disk: ResizeDisk failed for VM %d disk %s (+%dG)", vmid, diskCID, deltaGiB))
 		}
 
+		// ----------------------------------------------------------------
+		// 10. Optional post-resize size-convergence wait (§7.27, opt-in).
+		// Best-effort: never errors, so a slow async backend cannot fail the
+		// resize. Skipped entirely (zero extra calls) when disabled.
+		// ----------------------------------------------------------------
+		if deps.Config.ResizeWaitForConvergenceEnabled() {
+			timeout := time.Duration(deps.Config.ResizeConvergenceTimeoutSecValue()) * time.Second
+			waitForResizeConvergence(ctx, deps, node, vmid, diskID, currentGiB+deltaGiB, timeout)
+		}
+
 		deps.Logger.Info("resize_disk",
 			log.String("disk_cid", diskCID),
 			log.Int("vmid", vmid),
@@ -218,6 +229,74 @@ func HandleResizeDisk(deps Deps) Handler {
 
 		return nil, nil
 	})
+}
+
+// waitForResizeConvergence polls the VM config until the disk at diskID reports
+// a size >= targetGiB, or until the timeout (or parent context) elapses. It is
+// best-effort and never returns an error: a backend that has not yet propagated
+// the new size logs a warning and the caller proceeds. The poll interval comes
+// from the resizeConvergencePollInterval seam; the bound is an independent
+// timeout so it works even when the operation_timeout envelope is disabled.
+//
+// Read errors during polling are tolerated (logged at debug and retried until
+// the bound) — the convergence wait must not convert a transient read blip into
+// a resize failure.
+func waitForResizeConvergence(
+	ctx context.Context,
+	deps Deps,
+	node string,
+	vmid int,
+	diskID string,
+	targetGiB int,
+	timeout time.Duration,
+) {
+	cctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	interval := resizeConvergencePollInterval()
+	for {
+		cfg, err := deps.PVE.QEMU().Config(cctx, node, vmid)
+		if err != nil {
+			deps.Logger.Debug("resize_disk: convergence poll config read failed — retrying",
+				log.Int("vmid", vmid),
+				log.String("disk_id", diskID),
+				log.Err(err),
+			)
+		} else if optStr, ok := cfg[diskID].(string); ok && optStr != "" {
+			gib, perr := parseDiskSizeGiB(optStr)
+			switch {
+			case perr != nil:
+				// Unparseable size= keeps polling until the bound; log so a
+				// permanently-malformed value is visible rather than silent.
+				deps.Logger.Debug("resize_disk: convergence poll could not parse disk size — retrying",
+					log.Int("vmid", vmid),
+					log.String("disk_id", diskID),
+					log.String("disk_opt", optStr),
+					log.Err(perr),
+				)
+			case gib >= targetGiB:
+				deps.Logger.Info("resize_disk: size converged",
+					log.Int("vmid", vmid),
+					log.String("disk_id", diskID),
+					log.Int("reported_gib", gib),
+					log.Int("target_gib", targetGiB),
+				)
+				return
+			}
+		}
+
+		select {
+		case <-cctx.Done():
+			deps.Logger.Warn("resize_disk: disk size did not converge within budget — proceeding (best-effort)",
+				log.Int("vmid", vmid),
+				log.String("disk_id", diskID),
+				log.Int("target_gib", targetGiB),
+				log.String("timeout", timeout.String()),
+			)
+			return
+		case <-time.After(interval):
+		}
+	}
 }
 
 // parseDiskSizeGiB extracts the size from a PVE disk option string and

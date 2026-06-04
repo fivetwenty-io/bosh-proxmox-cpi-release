@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/cpi/handlers"
@@ -172,6 +173,104 @@ func TestHandleResizeDisk_Grow(t *testing.T) {
 	}
 	if capturedDelta != 5 {
 		t.Errorf("resize delta: want 5 GiB, got %d GiB", capturedDelta)
+	}
+}
+
+// scriptedSizeQEMU returns a resize mock whose Config serves the bare volid for
+// the first two calls (FindVMByDiskVolid + ResolveDiskID), then the size option
+// strings from sizes[] for each subsequent call (call 3 = sizes[0] for the delta
+// read, calls 4+ = the convergence polls). The last sizes entry is repeated once
+// the slice is exhausted. configCalls counts every Config call.
+func scriptedSizeQEMU(diskSlot, bareVolid string, sizes []string, configCalls *int) *resizeQEMUService {
+	idx := 0
+	return &resizeQEMUService{
+		resizeDiskFn: func(_ context.Context, _ string, _ int, _ string, _ int) (string, error) {
+			return "", nil // synchronous resize, no UPID
+		},
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			*configCalls++
+			if *configCalls <= 2 {
+				return map[string]any{diskSlot: bareVolid}, nil
+			}
+			s := sizes[idx]
+			if idx < len(sizes)-1 {
+				idx++
+			}
+			return map[string]any{diskSlot: bareVolid + ",size=" + s}, nil
+		},
+	}
+}
+
+// TestHandleResizeDisk_ConvergenceWaitsThenConverges verifies that with
+// resize_wait_for_convergence enabled, the handler polls the config until the
+// reported size reaches the target, then returns success.
+func TestHandleResizeDisk_ConvergenceWaitsThenConverges(t *testing.T) {
+	t.Parallel()
+	defer handlers.SetResizeConvergencePollInterval(time.Millisecond)()
+
+	var configCalls int
+	// call3=10G (current → delta 10, target 20); calls 4,5=10G (lagging); 6+=20G.
+	qemuSvc := scriptedSizeQEMU(diskSlot, diskCID, []string{"10G", "10G", "10G", "20G"}, &configCalls)
+
+	deps := resizeDeps(qemuSvc, resizeClusterWith(100), nil)
+	tru := true
+	deps.Config.ResizeWaitForConvergence = &tru
+
+	_, err := handlers.HandleResizeDisk(deps).Handle(context.Background(), marshalArgs(diskCID, 20480), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// 2 lookup + 1 delta-read + at least 1 convergence poll that observed 20G.
+	if configCalls < 4 {
+		t.Errorf("expected convergence polling (>=4 Config calls), got %d", configCalls)
+	}
+}
+
+// TestHandleResizeDisk_ConvergenceBestEffortTimeout verifies that when the size
+// never converges, the handler logs a warning and still returns success (never
+// blocks the director). A short-deadline context bounds the wait.
+func TestHandleResizeDisk_ConvergenceBestEffortTimeout(t *testing.T) {
+	t.Parallel()
+	defer handlers.SetResizeConvergencePollInterval(time.Millisecond)()
+
+	var configCalls int
+	// Always report the old 10G — target 20G is never reached.
+	qemuSvc := scriptedSizeQEMU(diskSlot, diskCID, []string{"10G"}, &configCalls)
+
+	deps := resizeDeps(qemuSvc, resizeClusterWith(100), nil)
+	tru := true
+	deps.Config.ResizeWaitForConvergence = &tru
+	deps.Config.ResizeConvergenceTimeoutSec = 3600 // large; parent ctx bounds the test
+
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+	defer cancel()
+
+	_, err := handlers.HandleResizeDisk(deps).Handle(ctx, marshalArgs(diskCID, 20480), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("best-effort convergence must not error on non-convergence, got: %v", err)
+	}
+	if configCalls < 4 {
+		t.Errorf("expected polling before timeout (>=4 Config calls), got %d", configCalls)
+	}
+}
+
+// TestHandleResizeDisk_ConvergenceDisabledNoExtraCalls verifies that when the
+// knob is off (default), resize_disk performs no convergence polling: exactly
+// the 3 baseline Config calls (find, resolve, size-read).
+func TestHandleResizeDisk_ConvergenceDisabledNoExtraCalls(t *testing.T) {
+	t.Parallel()
+
+	var configCalls int
+	qemuSvc := scriptedSizeQEMU(diskSlot, diskCID, []string{"10G"}, &configCalls)
+
+	deps := resizeDeps(qemuSvc, resizeClusterWith(100), nil) // convergence not enabled
+
+	_, err := handlers.HandleResizeDisk(deps).Handle(context.Background(), marshalArgs(diskCID, 20480), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if configCalls != 3 {
+		t.Errorf("convergence disabled: want exactly 3 Config calls, got %d", configCalls)
 	}
 }
 

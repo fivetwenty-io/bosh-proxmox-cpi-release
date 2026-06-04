@@ -153,6 +153,14 @@
   disk_perf_invariant_mode = p("pve.disk_perf_invariant_mode", "")
   config["disk_perf_invariant_mode"] = disk_perf_invariant_mode unless disk_perf_invariant_mode.to_s.empty?
 
+  # Emit resize-convergence knobs only when the operator opts in. The Go config
+  # defaults (disabled; 120s budget) hold when the keys are omitted.
+  if p("pve.resize_wait_for_convergence", false)
+    config["resize_wait_for_convergence"] = true
+    timeout_sec = p("pve.resize_convergence_timeout_sec", 0).to_i
+    config["resize_convergence_timeout_sec"] = timeout_sec if timeout_sec > 0
+  end
+
   # Emit the placement block only when at least one placement property is set.
   # When the block would be empty, omit it entirely so the Go config zero-value
   # (nil *PlacementConfig) is preserved and existing deployments are unaffected.

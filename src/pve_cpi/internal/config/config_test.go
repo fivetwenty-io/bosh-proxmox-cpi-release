@@ -185,6 +185,60 @@ func TestDiskPerfInvariantModeValue_DefaultsToEnforce(t *testing.T) {
 }
 
 // --------------------------------------------------------------------------
+// §7.27 resize-convergence config — accessors + validation.
+// --------------------------------------------------------------------------
+
+func TestValidate_ResizeConvergenceTimeoutNegative(t *testing.T) {
+	t.Parallel()
+	_, err := mustLoad(t, `{
+		"host": "h", "user": "u", "password": "p",
+		"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
+		"resize_convergence_timeout_sec": -5
+	}`)
+	assertCloudError(t, err, "resize_convergence_timeout_sec must be >= 0")
+}
+
+func TestResizeConvergenceAccessors(t *testing.T) {
+	t.Parallel()
+
+	// Nil receiver: disabled, default budget.
+	var nilCfg *config.CPIConfig
+	if nilCfg.ResizeWaitForConvergenceEnabled() {
+		t.Error("nil receiver: want disabled")
+	}
+	if got := nilCfg.ResizeConvergenceTimeoutSecValue(); got != 120 {
+		t.Errorf("nil receiver budget: got %d, want 120", got)
+	}
+
+	// Empty config: disabled, default budget.
+	cfg := &config.CPIConfig{}
+	if cfg.ResizeWaitForConvergenceEnabled() {
+		t.Error("empty config: want disabled")
+	}
+	if got := cfg.ResizeConvergenceTimeoutSecValue(); got != 120 {
+		t.Errorf("empty config budget: got %d, want 120 (0 → default)", got)
+	}
+
+	// Enabled with explicit budget.
+	tru := true
+	cfg.ResizeWaitForConvergence = &tru
+	cfg.ResizeConvergenceTimeoutSec = 300
+	if !cfg.ResizeWaitForConvergenceEnabled() {
+		t.Error("want enabled")
+	}
+	if got := cfg.ResizeConvergenceTimeoutSecValue(); got != 300 {
+		t.Errorf("explicit budget: got %d, want 300", got)
+	}
+
+	// Explicit false pointer → disabled.
+	fal := false
+	cfg.ResizeWaitForConvergence = &fal
+	if cfg.ResizeWaitForConvergenceEnabled() {
+		t.Error("explicit false: want disabled")
+	}
+}
+
+// --------------------------------------------------------------------------
 // TestValidate_AuthMissing
 // --------------------------------------------------------------------------
 

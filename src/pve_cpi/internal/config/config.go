@@ -152,6 +152,24 @@ type CPIConfig struct {
 	// warning and proceeds (fail-open).
 	RequireSnapshotCheckPass bool `json:"require_snapshot_check_pass,omitempty"`
 
+	// ResizeWaitForConvergence, when true, makes resize_disk poll the VM config
+	// after the PVE resize task completes until the reported disk size reaches
+	// the requested size, before returning. On asynchronous storage backends
+	// (Ceph RBD, LVM-thin) the size metadata can lag the task completion, so a
+	// follow-on operation may otherwise observe the old size. The poll is
+	// best-effort: if the size has not converged within the bound it logs a
+	// warning and returns success, never blocking the director. Default false
+	// (nil → disabled), so behavior is byte-identical. Use
+	// ResizeWaitForConvergenceEnabled().
+	ResizeWaitForConvergence *bool `json:"resize_wait_for_convergence,omitempty"`
+
+	// ResizeConvergenceTimeoutSec bounds the resize_wait_for_convergence poll.
+	// The poll uses this independent budget (not the operation_timeout envelope)
+	// so it is bounded even when that envelope is disabled. <= 0 (default)
+	// resolves to 120 seconds. Negative values are rejected at validation. Use
+	// ResizeConvergenceTimeoutSecValue().
+	ResizeConvergenceTimeoutSec int `json:"resize_convergence_timeout_sec,omitempty"`
+
 	// Registry (required only when agent_mode == "registry")
 	RegistryEndpoint string `json:"registry_endpoint,omitempty"`
 	RegistryUser     string `json:"registry_user,omitempty"`
@@ -1442,6 +1460,23 @@ func (c *CPIConfig) DiskPerfInvariantModeValue() string {
 	return v
 }
 
+// ResizeWaitForConvergenceEnabled reports whether resize_disk should poll for
+// post-resize size convergence. Nil (default) → false.
+func (c *CPIConfig) ResizeWaitForConvergenceEnabled() bool {
+	return c != nil && c.ResizeWaitForConvergence != nil && *c.ResizeWaitForConvergence
+}
+
+// ResizeConvergenceTimeoutSecValue returns the effective convergence poll budget
+// in seconds. A nil receiver or a non-positive configured value resolves to the
+// 120-second default.
+func (c *CPIConfig) ResizeConvergenceTimeoutSecValue() int {
+	const defaultSec = 120
+	if c == nil || c.ResizeConvergenceTimeoutSec <= 0 {
+		return defaultSec
+	}
+	return c.ResizeConvergenceTimeoutSec
+}
+
 // ActiveIPProbeEnabled reports whether the guest-agent IP fan-out probe is
 // active. Returns true only when IPConflictProbeMode() == "agent".
 func (c *CPIConfig) ActiveIPProbeEnabled() bool {
@@ -1955,6 +1990,15 @@ func (c *CPIConfig) validateEnumFields(errs *[]string) {
 					"stemcell_staging_dir %q is not a directory", c.StemcellStagingDir))
 			}
 		}
+	}
+
+	// ResizeConvergenceTimeoutSec: negative is invalid (0 → default). An overly
+	// long budget is allowed (operator's choice); only nonsense is rejected.
+	if c.ResizeConvergenceTimeoutSec < 0 {
+		*errs = append(*errs, fmt.Sprintf(
+			"resize_convergence_timeout_sec must be >= 0 (0 means default 120s), got %d",
+			c.ResizeConvergenceTimeoutSec,
+		))
 	}
 
 	// PVECACertPEM: when non-empty AND verify_ssl=true, the PEM must parse to at

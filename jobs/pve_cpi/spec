@@ -222,6 +222,24 @@ properties:
       fails (cannot reach PVE to list snapshots). Default false: on check failure
       the CPI logs a warning and proceeds (fail-open).
     default: false
+  pve.resize_wait_for_convergence:
+    description: |
+      When true, resize_disk polls the VM config after the PVE resize task
+      completes until the reported disk size reaches the requested size, before
+      returning. On asynchronous backends (Ceph RBD, LVM-thin) the size metadata
+      can lag the task completion, so a follow-on operation might otherwise read
+      the old size. The poll is best-effort: if the size has not converged within
+      resize_convergence_timeout_sec it logs a warning and returns success, never
+      blocking the director. Default false (no extra polling).
+    default: false
+  pve.resize_convergence_timeout_sec:
+    description: |
+      Bounds the resize_wait_for_convergence poll, in seconds. This is an
+      independent budget (not the operation_timeout envelope) so the poll is
+      bounded even when that envelope is disabled. 0 means the built-in default
+      of 120 seconds. Negative values are rejected. Only meaningful when
+      resize_wait_for_convergence is true.
+    default: 0
   pve.vm_prefix:
     description: |
       Optional prefix prepended to every CPI-provisioned VM's PVE name.
