@@ -86,6 +86,15 @@ const defaultNetworkBridge = "vmbr0"
 const metadataKeyName = "name"
 const metadataKeyVMID = "vmid"
 
+// defaultNetworkName is the BOSH reserved name for the primary network.
+// sortedNetworkNames always places it first when present.
+const defaultNetworkName = "default"
+
+// nicTypeDynamic is the BOSH network spec type for a dynamically-assigned
+// (DHCP) NIC. Distinct from crsModeDynamic (a PVE CRS placement mode) which
+// shares the literal value but belongs to an unrelated domain.
+const nicTypeDynamic = "dynamic"
+
 // createVMCloudProps holds the fields we care about from Args[2].
 type createVMCloudProps struct {
 	// CPU is the total vCPU count using the vSphere CPI convention. When
@@ -256,6 +265,17 @@ func createVM(
 	}
 
 	// -----------------------------------------------------------------------
+	// 1b. Early VIP validation — fail-fast before any VM mutation.
+	// Malformed allowed_address_pairs entries (bad IPs, non-string types) are
+	// operator errors that must be surfaced before the VM is created, consistent
+	// with §7.18 static-IP validation. Any PVE-API failure is deferred to step 8c
+	// where it is handled best-effort (fail-open).
+	// -----------------------------------------------------------------------
+	if err := validateVIPAllowedAddressPairs(parsed.networks); err != nil {
+		return nil, err
+	}
+
+	// -----------------------------------------------------------------------
 	// 2–3. Resolve node and VM-shape parameters.
 	// -----------------------------------------------------------------------
 	shape, err := resolveVMShape(ctx, deps, parsed)
@@ -385,6 +405,21 @@ func createVM(
 				return nil, fwErr
 			}
 		}
+	}
+
+	// -----------------------------------------------------------------------
+	// 8c. VIP allowed-address-pairs: seed per-NIC ipfilter ipsets and enable the
+	// VM-level ipfilter option when any NIC declares allowed_address_pairs.
+	//
+	// Best-effort and non-fatal: PVE API failures are logged as warnings and
+	// leave ipfilter OFF rather than risk locking out the VM. The safety guard in
+	// applyVIPAllowedAddressPairs ensures ipfilter is never enabled unless every
+	// firewalled NIC ipset is fully seeded. Unset manifest = byte-identical (no
+	// PVE calls). Entry format errors were rejected at step 1b before VM mutation.
+	// -----------------------------------------------------------------------
+	if vipErr := applyVIPAllowedAddressPairs(ctx, deps, shape.node, vmid, parsed.networks, logger); vipErr != nil {
+		logger.Warn("create_vm: VIP ipfilter not fully applied (non-fatal)",
+			log.Int(metadataKeyVMID, vmid), log.Err(vipErr))
 	}
 
 	// -----------------------------------------------------------------------
@@ -2503,7 +2538,7 @@ func configureNICs(
 
 		// ipconfig: dynamic → dhcp; manual → ip=<cidr>,gw=<gw>
 		switch strings.ToLower(spec.Type) {
-		case "dynamic", "":
+		case nicTypeDynamic, "":
 			ipconfigMap[i] = "ip=dhcp"
 		case "manual":
 			if spec.IP != "" {
@@ -2791,7 +2826,7 @@ func sortedNetworkNames(networks map[string]createVMNetworkSpec) []string {
 	names := make([]string, 0, len(networks))
 	hasDefault := false
 	for n := range networks {
-		if n == "default" {
+		if n == defaultNetworkName {
 			hasDefault = true
 			continue
 		}
@@ -2799,7 +2834,7 @@ func sortedNetworkNames(networks map[string]createVMNetworkSpec) []string {
 	}
 	sort.Strings(names)
 	if hasDefault {
-		return append([]string{"default"}, names...)
+		return append([]string{defaultNetworkName}, names...)
 	}
 	return names
 }

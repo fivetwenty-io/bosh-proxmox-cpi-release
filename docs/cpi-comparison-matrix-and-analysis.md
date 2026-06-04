@@ -527,7 +527,7 @@ deletion for each. Rather than pre-scanning linked clones, it relies on Proxmox 
 atomically refuse removal of a base volume still referenced by a linked clone — such
 templates are skipped with a warning. Best-effort, config-gated, warn-never-fail.
 
-#### 7.14 Allowed-address-pairs / VIP ipfilter for in-deployment floating VIPs
+#### 7.14 DONE — Allowed-address-pairs / VIP ipfilter for in-deployment floating VIPs
 
 *References: OpenStack-Go, AWS, Google, Azure.* Now that the per-VM firewall has shipped,
 its default anti-spoof `ipfilter` can silently drop traffic for a floated VIP that is not
@@ -541,6 +541,33 @@ exactly this.
 `ipfilter-net{N}` ipset (the ipset API is already exercised by the firewall work) with
 the declared VIPs so the anti-spoof filter permits them. Additive, best-effort,
 omit-when-empty.
+
+**Shipped.** A per-NIC network cloud property `allowed_address_pairs` (a list of IP or
+CIDR strings) now declares the floating VIPs a NIC may source traffic from. When a
+firewalled NIC carries this property, `create_vm` seeds the PVE `ipfilter-net{N}` ipset
+for every firewalled NIC with that NIC's own primary IP as a `/32` plus the declared VIP
+entries, then enables the VM-level firewall and `ipfilter` option in a single call so the
+anti-spoof allowlist is actually enforced. Because the PVE `ipfilter` option is VM-wide
+and the QEMU ipset is the complete source allowlist (the primary IP is not auto-added),
+every firewalled NIC is seeded with its own IP first — so turning on the filter never
+locks a NIC out of its own network. Bare IPs are normalized to `/32`; a CIDR entry permits
+that whole range as a source, so prefer host `/32` entries unless a subnet is intended.
+
+The feature is opt-in by the presence of the property: with no `allowed_address_pairs` on
+any network, `create_vm` makes no firewall-ipset calls and leaves `ipfilter` off, so
+behavior is byte-identical to prior releases. Application is best-effort and ordered for
+safety: all ipset entries are written before `ipfilter` is enabled, and any PVE API
+failure leaves `ipfilter` off and the VM working (logged as a warning) rather than risk an
+incomplete allowlist. Two configurations are skipped with a warning instead of enabling a
+filter that would break connectivity: a firewalled NIC using DHCP/dynamic addressing (its
+runtime IP is unknown at create time) and a firewalled NIC whose static IP does not parse.
+Malformed entries are rejected before the VM is created, so a typo fails the deploy fast
+rather than silently leaving an unprotected VIP.
+
+Operator note for VRRP/keepalived: the PVE per-NIC `macfilter` (on by default) blocks the
+RFC-3768 virtual MAC, so run keepalived without `use_vmac` — ARP and VRRP advertisements
+then use the NIC's real MAC and pass the filter, while `allowed_address_pairs` permits the
+floated IP at layer 3.
 
 ### Tier 3 — Integration and hardening
 

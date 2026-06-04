@@ -46,6 +46,13 @@ type fwNodesStub struct {
 	lastNet       map[int]string
 	ruleErr       error
 	optErr        error
+	// VIP ipset recording fields (§7.14).
+	ipsetCreated       []string            // ipset names in creation order
+	ipsetEntries       map[string][]string // ipset name → CIDR entries in add order
+	ipfilterEnabled    bool                // true if UpdateQemuFirewallOptions{Ipfilter:&true} called
+	ipsetCreateErr     error               // if non-nil, returned by CreateQemuFirewallIpset
+	ipsetEntryErr      error               // if non-nil, returned by CreateQemuFirewallIpset2
+	ipsetCreateErrName string              // if non-empty, only fail CreateQemuFirewallIpset for this name
 }
 
 func (s *fwNodesStub) CreateQemuFirewallRules(_ context.Context, _ string, _ string, p *sdknodes.CreateQemuFirewallRulesParams) error {
@@ -63,11 +70,39 @@ func (s *fwNodesStub) UpdateQemuFirewallOptions(_ context.Context, _ string, _ s
 	if p.Enable != nil && *p.Enable {
 		s.enableOptCall++
 	}
+	// Record ipfilter enable (§7.14).
+	if p.Ipfilter != nil && *p.Ipfilter {
+		s.ipfilterEnabled = true
+	}
 	return nil
 }
 
 func (s *fwNodesStub) UpdateQemuConfig(_ context.Context, _ string, _ string, p *sdknodes.UpdateQemuConfigParams) error {
 	s.lastNet = p.Net
+	return nil
+}
+
+// CreateQemuFirewallIpset records the ipset creation (§7.14).
+func (s *fwNodesStub) CreateQemuFirewallIpset(_ context.Context, _ string, _ string, p *sdknodes.CreateQemuFirewallIpsetParams) error {
+	if s.ipsetCreateErr != nil {
+		// If ipsetCreateErrName is set, only fail for that specific name.
+		if s.ipsetCreateErrName == "" || s.ipsetCreateErrName == p.Name {
+			return s.ipsetCreateErr
+		}
+	}
+	s.ipsetCreated = append(s.ipsetCreated, p.Name)
+	return nil
+}
+
+// CreateQemuFirewallIpset2 records the ipset entry addition (§7.14).
+func (s *fwNodesStub) CreateQemuFirewallIpset2(_ context.Context, _ string, _ string, name string, p *sdknodes.CreateQemuFirewallIpset2Params) error {
+	if s.ipsetEntryErr != nil {
+		return s.ipsetEntryErr
+	}
+	if s.ipsetEntries == nil {
+		s.ipsetEntries = make(map[string][]string)
+	}
+	s.ipsetEntries[name] = append(s.ipsetEntries[name], p.Cidr)
 	return nil
 }
 
