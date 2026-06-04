@@ -1304,19 +1304,27 @@ polling terminal state; pair it with the §7.13 orphan-GC sweep to reap leftover
 two are complementary fixes for the same queue-slot hazard — bound the wait (§7.15) and skip
 the wait (§7.32) cover different operations.
 
-#### 7.33 OPEN — Articulate the idempotency-collision model
+#### 7.33 DONE — Articulate the idempotency-collision model
 
 *References: Alicloud (regenerate identity), AWS/Azure (retry same identity).* PVE's
-VMID allocate-with-retry already regenerates the VMID on conflict — which is correct — but
-the report never states the classification rule, so the reasoning is implicit. There are two
-correct responses to a collision: *regenerate identity* when the collision means "taken"
-(Alicloud regenerates its `ClientToken` on `IdempotentFailed`; PVE regenerates the VMID),
-versus *retry the same identity* when it means "in flight" (AWS/Azure retry the same token).
-Retrying the same identity against a real conflict loops forever. **Build:** mostly
-documentation and a hardening assertion — confirm the §7.23 classifier treats "VMID already
-in use" as regenerate-identity (it does, via allocate-retry) and document this as the
-chosen model, contrasting same-token-retry clouds. Low effort; closes a reasoning gap that
-makes the existing behavior auditable.
+VMID collision model is **regenerate-identity**: when `AllocateWithRetry` receives a
+conflict error ("VMID already in use"), it discards the conflicted VMID and calls
+`NextVMID` again to obtain a fresh one. The conflicted VMID is never presented to a
+second create attempt. This is correct because a VMID conflict on PVE means the numeric
+identity is already occupied by a live VM — retrying the same VMID would loop forever.
+
+This contrasts with same-token-retry clouds: AWS `ClientToken` and Azure
+`x-ms-client-request-id` signal "this request is in flight", not "this identity is taken".
+Those clouds must retry the same token; generating a new token would create a duplicate
+resource. The classification rule is: regenerate when the collision means *taken*; retry
+the same identity when it means *in flight*. PVE's model falls firmly in the first
+category.
+
+The §7.23 error classifier already treats "vm already exists" / HTTP 409 as a conflict
+that routes to `AllocateWithRetry`, not to a same-VMID retry path. This model is stated
+explicitly in the `AllocateWithRetry` doc comment and locked by
+`TestAllocateWithRetry_RegeneratesDistinctVMID`, which asserts that every VMID across
+all conflict-retry attempts is distinct.
 
 #### 7.34 OPEN — Network-property override precedence (VM props override network defaults)
 

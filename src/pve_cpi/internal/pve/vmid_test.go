@@ -498,6 +498,104 @@ func TestAllocateWithRetry_ConflictRetry(t *testing.T) {
 	}
 }
 
+// TestAllocateWithRetry_RegeneratesDistinctVMID asserts the regenerate-identity
+// collision model: when a create call returns a conflict error, AllocateWithRetry
+// must call NextVMID again and present a FRESH VMID to the next create attempt.
+// It must NEVER retry the same conflicted VMID.
+//
+// Determinism guarantee: the fake cluster-list function accumulates each
+// conflicted VMID into the returned used-set on the next call. That means
+// NextVMID physically cannot return a previously conflicted VMID — it sees it as
+// occupied. If AllocateWithRetry were to reuse VMID N (retry-same-identity bug),
+// NextVMID would return N from the still-empty list on that attempt, but the
+// seen-map assertion would catch the reuse. The accumulation layer makes the
+// failure deterministic: a buggy same-VMID loop would always fail, not ~0.03%
+// of the time as with a pure random-collision check.
+//
+// Speed: WithNoBackoff() eliminates jitter sleep so -count=100 finishes in
+// well under a second.
+func TestAllocateWithRetry_RegeneratesDistinctVMID(t *testing.T) {
+	t.Parallel()
+
+	conflictErr := errors.New("vm already exists")
+
+	// sequence records every VMID the create callback receives, in order.
+	var (
+		mu       sync.Mutex
+		sequence []int
+	)
+
+	// The fake list-fn accumulates each conflicted VMID so that on the next
+	// NextVMID call that VMID appears in the used-set and cannot be returned.
+	// This makes distinctness enforcement deterministic rather than probabilistic.
+	usedSet := make(map[int]struct{})
+
+	c := newVMIDClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+		mu.Lock()
+		// Snapshot current conflicted VMIDs into the response.
+		ids := make([]int, 0, len(usedSet))
+		for id := range usedSet {
+			ids = append(ids, id)
+		}
+		mu.Unlock()
+		return buildResources(ids...), nil
+	})
+
+	// Only one conflict: keep maxAttempts=2 so wall-time is minimal even
+	// without WithNoBackoff, and use WithNoBackoff for fast -count=N runs.
+	const maxAttempts = 2
+	attempt := 0
+	id, err := pve.AllocateWithRetry(context.Background(), c,
+		func(vmid int) error {
+			mu.Lock()
+			sequence = append(sequence, vmid)
+			if attempt == 0 {
+				// Register this VMID as conflicted so the next list-fn call
+				// returns it in the used-set, forcing NextVMID to pick elsewhere.
+				usedSet[vmid] = struct{}{}
+			}
+			mu.Unlock()
+			attempt++
+			if attempt < maxAttempts {
+				return conflictErr
+			}
+			return nil
+		},
+		func(e error) bool { return errors.Is(e, conflictErr) },
+		maxAttempts,
+		pve.WithNoBackoff(),
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	mu.Lock()
+	seq := make([]int, len(sequence))
+	copy(seq, sequence)
+	mu.Unlock()
+
+	if len(seq) != maxAttempts {
+		t.Fatalf("expected %d create calls, got %d", maxAttempts, len(seq))
+	}
+
+	// Core invariant: every VMID across all attempts must be distinct.
+	// Because the conflicted VMID is in the used-set for attempt 1, NextVMID
+	// cannot return it — so if this assertion fires, the allocator skipped the
+	// NextVMID call entirely (retry-same-identity bug).
+	seen := make(map[int]int) // vmid → first attempt index
+	for i, v := range seq {
+		if prev, dup := seen[v]; dup {
+			t.Errorf("regenerate-identity violated: VMID %d (attempt %d) reused at attempt %d", v, prev, i)
+		}
+		seen[v] = i
+	}
+
+	// The returned VMID must differ from the one that conflicted.
+	if id == seq[0] {
+		t.Errorf("returned VMID %d equals the conflicted VMID — regeneration failed", id)
+	}
+}
+
 func TestAllocateWithRetry_ExhaustedAttempts(t *testing.T) {
 	t.Parallel()
 	c := newVMIDClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {

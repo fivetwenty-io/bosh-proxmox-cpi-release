@@ -386,6 +386,16 @@ func listStorageVMIDs(ctx context.Context, c Client, node, storage string) (map[
 // decorrelates retry herds across concurrent CPI processes. Any other error
 // is returned immediately.
 //
+// Idempotency-collision model — regenerate-identity: a VMID conflict means the
+// numeric identity is already taken by another VM. The correct response is to
+// allocate a brand-new VMID, never to retry the same one. This is the
+// "regenerate-identity" model. It contrasts with clouds whose idempotency token
+// (AWS ClientToken, Azure x-ms-client-request-id) means "this request is in
+// flight" — those clouds must retry the same token; regenerating a fresh token
+// would create a duplicate resource. PVE has no in-flight reservation: a VMID
+// that conflicts is simply occupied, so regeneration is the only safe path.
+// TestAllocateWithRetry_RegeneratesDistinctVMID asserts this invariant.
+//
 // On final exhaustion the error message includes the last VMID attempted so
 // operator logs surface the contended range.
 //
