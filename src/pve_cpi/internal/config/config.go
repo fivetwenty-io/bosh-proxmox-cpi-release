@@ -549,6 +549,21 @@ type CPIConfig struct {
 	// from JSON) is distinguishable from an explicit false. Validate-only-when-set; omit
 	// from ERB when nil.
 	FastPathDelete *bool `json:"fast_path_delete,omitempty"`
+
+	// StemcellReplicationConcurrency controls how many nodes receive a stemcell
+	// replica upload concurrently inside replicateStemcellToNodes. Only meaningful
+	// when StemcellReplicateLocal is true. Values:
+	//
+	//   0 or absent — defaults to 1 (serial, byte-identical to prior releases).
+	//   1           — serial: one node at a time, deterministic order.
+	//   N > 1       — up to N nodes replicated in parallel; each node's semantics
+	//                 (idempotent skip, best-effort failure, in-flight gate) are
+	//                 preserved independently per goroutine.
+	//
+	// Negative values and values > 64 are rejected at config validation.
+	// Use StemcellReplicationConcurrencyValue() to obtain the effective worker count.
+	// validate-only-when-set; omit from ERB when zero (serial default).
+	StemcellReplicationConcurrency int `json:"stemcell_replication_concurrency,omitempty"`
 }
 
 // TypeProfile is a named bundle of default cloud_properties applied by the
@@ -1890,6 +1905,18 @@ func (c *CPIConfig) FastPathDeleteEnabled() bool {
 	return c != nil && c.FastPathDelete != nil && *c.FastPathDelete
 }
 
+// StemcellReplicationConcurrencyValue returns the effective worker count for
+// parallel stemcell replication. 0 or absent resolves to 1 (serial, byte-identical
+// to prior releases). Valid positive values are returned as-is.
+// Negative values and values > 64 are rejected at config validation, so this
+// accessor assumes a validated config and clamps only 0 to 1.
+func (c *CPIConfig) StemcellReplicationConcurrencyValue() int {
+	if c == nil || c.StemcellReplicationConcurrency <= 0 {
+		return 1
+	}
+	return c.StemcellReplicationConcurrency
+}
+
 // Validate checks all required fields and enum constraints.
 // Returns a CloudError whose message lists every violation, separated by "; ".
 //
@@ -2140,6 +2167,19 @@ func (c *CPIConfig) validateRanges(errs *[]string) {
 	if c.MaxInflightPerNode < 0 {
 		*errs = append(*errs, fmt.Sprintf(
 			"max_inflight_per_node must be >= 0, got %d", c.MaxInflightPerNode))
+	}
+
+	// stemcell_replication_concurrency: 0 = serial default (resolved to 1).
+	// Negative is invalid. Values > 64 are rejected as an unreasonable cap (a
+	// PVE cluster rarely exceeds 32 nodes; the concurrency limit cannot exceed
+	// the node count in practice, but the config cannot know that at load time,
+	// so 64 is chosen as a sane guard).
+	if c.StemcellReplicationConcurrency < 0 {
+		*errs = append(*errs, fmt.Sprintf(
+			"stemcell_replication_concurrency must be >= 0, got %d", c.StemcellReplicationConcurrency))
+	} else if c.StemcellReplicationConcurrency > 64 {
+		*errs = append(*errs, fmt.Sprintf(
+			"stemcell_replication_concurrency must be <= 64, got %d", c.StemcellReplicationConcurrency))
 	}
 
 	// PVE API transport tuning: 0 = SDK default (byte-identical). Negative values

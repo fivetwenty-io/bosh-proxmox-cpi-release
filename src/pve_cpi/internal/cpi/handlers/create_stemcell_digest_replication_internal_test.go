@@ -12,7 +12,10 @@ import (
 	"io"
 	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	sdkcloudinit "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cloudinit"
 	sdkcluster "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cluster"
@@ -332,8 +335,10 @@ type noopReplicationPoolService struct{}
 func (n *noopReplicationPoolService) AddVM(_ context.Context, _ string, _ int64) error { return nil }
 
 // countingNodesService wraps sdknodes.Service and counts ListQemu calls per node.
+// mu guards listQemuCallsByNode so the service is safe for concurrent callers.
 type countingNodesService struct {
 	sdknodes.Service
+	mu                   sync.Mutex
 	listQemuCallsByNode  map[string]int
 	listQemuFn           func(ctx context.Context, node string, params *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error)
 	listStorageContentFn func(ctx context.Context, node, storage string, params *sdknodes.ListStorageContentParams) (*sdknodes.ListStorageContentResponse, error)
@@ -342,10 +347,12 @@ type countingNodesService struct {
 }
 
 func (c *countingNodesService) ListQemu(ctx context.Context, node string, params *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
+	c.mu.Lock()
 	if c.listQemuCallsByNode == nil {
 		c.listQemuCallsByNode = map[string]int{}
 	}
 	c.listQemuCallsByNode[node]++
+	c.mu.Unlock()
 	if c.listQemuFn != nil {
 		return c.listQemuFn(ctx, node, params)
 	}
@@ -796,4 +803,449 @@ type replicationMockTasks struct {
 
 func (m *replicationMockTasks) Wait(_ context.Context, _, _ string, _ *sdktasks.WaitOptions) (*sdktasks.Status, error) {
 	return &sdktasks.Status{Status: "stopped", ExitStatus: "OK"}, nil
+}
+
+// ============================================================
+// Part C — §7.35 bounded-concurrency parallel replication tests
+// ============================================================
+
+// buildReplicationDeps constructs Deps for concurrency tests. concurrency is
+// set as StemcellReplicationConcurrency; nodes beyond primary are non-primary
+// targets. All services are passed as pointers to avoid lock-copy (countingNodesService
+// embeds sync.Mutex since §7.35 concurrency hardening).
+func buildReplicationDeps(
+	t *testing.T,
+	concurrency int,
+	storageSvc *replicationMockStorage,
+	nodesSvc *countingNodesService,
+	qemuSvc *replicationMockQEMU,
+) Deps {
+	t.Helper()
+	cfg := &config.CPIConfig{
+		Node:                           "pve1",
+		VMStorage:                      "local",
+		StemcellReplicateLocal:         true,
+		StemcellTemplateVMIDRangeStart: 30000,
+		StemcellTemplateVMIDRangeEnd:   30999,
+		StemcellReplicationConcurrency: concurrency,
+	}
+	logger, _ := log.NewLogger("debug", io.Discard)
+	mc := &digestReplicationMockClient{
+		clusterSvc: &countingClusterService{},
+		nodesSvc:   nodesSvc,
+		qemuSvc:    qemuSvc,
+		storageSvc: storageSvc,
+		tasksSvc:   &replicationMockTasks{},
+	}
+	return Deps{Config: cfg, PVE: mc, Logger: logger}
+}
+
+// makeSrcFile writes content to a temp file and returns its path.
+func makeSrcFile(t *testing.T, content []byte) string {
+	t.Helper()
+	tmpDir := t.TempDir()
+	path := fmt.Sprintf("%s/source.qcow2", tmpDir)
+	if err := os.WriteFile(path, content, 0o644); err != nil {
+		t.Fatalf("makeSrcFile: %v", err)
+	}
+	return path
+}
+
+// TestReplicateStemcellToNodes_Concurrency_AllNodesAttempted verifies that with
+// concurrency > 1 and M target non-primary nodes:
+//   - all M nodes receive an upload attempt
+//   - peak concurrent uploads never exceeds the limit
+//   - peak concurrent uploads is > 1 (i.e. goroutines actually overlap)
+//
+// A rendezvous channel forces uploads to block until 'limit' are in flight
+// simultaneously, proving the pool dispatches multiple goroutines concurrently.
+func TestReplicateStemcellToNodes_Concurrency_AllNodesAttempted(t *testing.T) {
+	t.Parallel()
+
+	const limit = 2
+	targetNodes := []string{"pve1", "pve2", "pve3", "pve4"} // pve1 = primary; 3 non-primary
+	nonPrimary := targetNodes[1:]
+
+	content := []byte("concurrency-all-nodes-test")
+	sha256hex := sha256OfBytes(content)
+	srcPath := makeSrcFile(t, content)
+
+	var (
+		uploadedNodes sync.Map
+		inFlight      atomic.Int64
+		peakInFlight  atomic.Int64
+	)
+
+	// rendezvous: when 'limit' uploads are in flight simultaneously, all are
+	// released. If the pool is serial, only 1 upload runs at a time and the
+	// WaitGroup never reaches Done — the test would deadlock (caught by
+	// -timeout flag or t.Cleanup). We use a channel instead of a WaitGroup
+	// to avoid deadlock if the pool actually IS serial, so the test just fails
+	// (peak ≤ 1, assertion below catches it).
+	ready := make(chan struct{}, len(nonPrimary)) // buffered: non-blocking send
+	release := make(chan struct{})               // closed when all in-limit are ready
+
+	var releaseOnce sync.Once
+
+	storageSvc := replicationMockStorage{
+		uploadFn: func(_ context.Context, node, _, _, _ string, r io.Reader) (string, error) {
+			_, _ = io.Copy(io.Discard, r)
+			cur := inFlight.Add(1)
+			defer inFlight.Add(-1)
+			// Update peak.
+			for {
+				peak := peakInFlight.Load()
+				if cur <= peak || peakInFlight.CompareAndSwap(peak, cur) {
+					break
+				}
+			}
+			// Signal this goroutine is in the upload phase.
+			ready <- struct{}{}
+			if inFlight.Load() >= int64(limit) {
+				// 'limit' uploads are simultaneous — release all.
+				releaseOnce.Do(func() { close(release) })
+			}
+			// Wait for the release signal (or a short timeout so we don't
+			// deadlock if fewer than 'limit' goroutines ever overlap).
+			select {
+			case <-release:
+			case <-time.After(2 * time.Second):
+				// Timed out waiting for concurrent overlap — that's OK;
+				// the peak assertion below will catch the serial case.
+			}
+			uploadedNodes.Store(node, struct{}{})
+			return "", nil
+		},
+		deleteVolumeIfExistsFn: func(_ context.Context, _, _, _ string) (bool, error) {
+			return true, nil
+		},
+	}
+	nodesSvc := countingNodesService{
+		listQemuFn: func(_ context.Context, _ string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
+			return &sdknodes.ListQemuResponse{}, nil
+		},
+		listStorageContentFn: func(_ context.Context, _, _ string, _ *sdknodes.ListStorageContentParams) (*sdknodes.ListStorageContentResponse, error) {
+			return &sdknodes.ListStorageContentResponse{}, nil
+		},
+		createQemuTemplateFn: func(_ context.Context, _ string, _ string, _ *sdknodes.CreateQemuTemplateParams) (*sdknodes.CreateQemuTemplateResponse, error) {
+			return &sdknodes.CreateQemuTemplateResponse{}, nil
+		},
+		deleteQemuFn: func(_ context.Context, _ string, _ string, _ *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
+			return &sdknodes.DeleteQemuResponse{}, nil
+		},
+	}
+	var createSeq atomic.Int64
+	qemuSvc := replicationMockQEMU{
+		createFn: func(_ context.Context, _ string, _ map[string]any) (string, error) {
+			createSeq.Add(1)
+			return "", nil
+		},
+	}
+
+	deps := buildReplicationDeps(t, limit, &storageSvc, &nodesSvc, &qemuSvc)
+	cp := stemcellCloudProps{Name: "ubuntu-jammy", Version: "1.0"}
+
+	replicateStemcellToNodes(context.Background(), deps, "pve1", "local", "bosh-stemcell.qcow2",
+		sha256hex, targetNodes, srcPath, "", cp, "")
+
+	// All non-primary nodes must have received an upload.
+	for _, n := range nonPrimary {
+		if _, ok := uploadedNodes.Load(n); !ok {
+			t.Errorf("node %s: expected upload attempt, got none", n)
+		}
+	}
+
+	// Primary must NOT receive an upload.
+	if _, ok := uploadedNodes.Load("pve1"); ok {
+		t.Errorf("primary node pve1 must not receive upload")
+	}
+
+	// Peak concurrency must be > 1 (concurrency is real) and ≤ limit.
+	peak := peakInFlight.Load()
+	if peak < 2 {
+		t.Errorf("peak concurrent uploads = %d; want >= 2 (concurrency limit=%d, %d non-primary nodes)",
+			peak, limit, len(nonPrimary))
+	}
+	if peak > int64(limit) {
+		t.Errorf("peak concurrent uploads = %d; want <= %d", peak, limit)
+	}
+}
+
+// TestReplicateStemcellToNodes_Concurrency_Serial verifies that with concurrency
+// 1 (the default), peak concurrent uploads is exactly 1 even with multiple nodes.
+func TestReplicateStemcellToNodes_Concurrency_Serial(t *testing.T) {
+	t.Parallel()
+
+	const limit = 0 // 0 → resolves to 1 (serial)
+	targetNodes := []string{"pve1", "pve2", "pve3"}
+
+	content := []byte("serial-concurrency-test")
+	sha256hex := sha256OfBytes(content)
+	srcPath := makeSrcFile(t, content)
+
+	var (
+		uploadedNodes sync.Map
+		inFlight      atomic.Int64
+		peakInFlight  atomic.Int64
+	)
+
+	storageSvc := replicationMockStorage{
+		uploadFn: func(_ context.Context, node, _, _, _ string, r io.Reader) (string, error) {
+			_, _ = io.Copy(io.Discard, r)
+			cur := inFlight.Add(1)
+			for {
+				peak := peakInFlight.Load()
+				if cur <= peak || peakInFlight.CompareAndSwap(peak, cur) {
+					break
+				}
+			}
+			defer inFlight.Add(-1)
+			uploadedNodes.Store(node, struct{}{})
+			return "", nil
+		},
+		deleteVolumeIfExistsFn: func(_ context.Context, _, _, _ string) (bool, error) {
+			return true, nil
+		},
+	}
+	nodesSvc := countingNodesService{
+		listQemuFn: func(_ context.Context, _ string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
+			return &sdknodes.ListQemuResponse{}, nil
+		},
+		listStorageContentFn: func(_ context.Context, _, _ string, _ *sdknodes.ListStorageContentParams) (*sdknodes.ListStorageContentResponse, error) {
+			return &sdknodes.ListStorageContentResponse{}, nil
+		},
+		createQemuTemplateFn: func(_ context.Context, _ string, _ string, _ *sdknodes.CreateQemuTemplateParams) (*sdknodes.CreateQemuTemplateResponse, error) {
+			return &sdknodes.CreateQemuTemplateResponse{}, nil
+		},
+		deleteQemuFn: func(_ context.Context, _ string, _ string, _ *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
+			return &sdknodes.DeleteQemuResponse{}, nil
+		},
+	}
+	var createSeq2 atomic.Int64
+	qemuSvc := replicationMockQEMU{
+		createFn: func(_ context.Context, _ string, _ map[string]any) (string, error) {
+			createSeq2.Add(1)
+			return "", nil
+		},
+	}
+
+	deps := buildReplicationDeps(t, limit, &storageSvc, &nodesSvc, &qemuSvc)
+	cp := stemcellCloudProps{Name: "ubuntu-jammy", Version: "1.0"}
+
+	replicateStemcellToNodes(context.Background(), deps, "pve1", "local", "bosh-stemcell.qcow2",
+		sha256hex, targetNodes, srcPath, "", cp, "")
+
+	// Both non-primary nodes must have been attempted.
+	for _, n := range []string{"pve2", "pve3"} {
+		if _, ok := uploadedNodes.Load(n); !ok {
+			t.Errorf("node %s: expected upload attempt, got none", n)
+		}
+	}
+
+	// Peak concurrency must be exactly 1 (serial).
+	peak := peakInFlight.Load()
+	if peak != 1 {
+		t.Errorf("peak concurrent uploads = %d; want 1 (serial mode)", peak)
+	}
+}
+
+// TestReplicateStemcellToNodes_Concurrency_NonFatal verifies that a per-node
+// upload failure in parallel mode does not abort other nodes. All successful
+// nodes complete; the failed node leaves no VM.
+func TestReplicateStemcellToNodes_Concurrency_NonFatal(t *testing.T) {
+	t.Parallel()
+
+	const limit = 3
+	targetNodes := []string{"pve1", "pve2", "pve3", "pve4"} // pve1=primary; pve2 fails
+
+	content := []byte("nonfatal-concurrency-test")
+	sha256hex := sha256OfBytes(content)
+	srcPath := makeSrcFile(t, content)
+
+	var (
+		uploadedNodes sync.Map // node → bool
+		vmCreated     sync.Map // node → bool
+	)
+
+	storageSvc := replicationMockStorage{
+		uploadFn: func(_ context.Context, node, _, _, _ string, r io.Reader) (string, error) {
+			_, _ = io.Copy(io.Discard, r)
+			if node == "pve2" {
+				return "", errors.New("simulated upload failure on pve2")
+			}
+			uploadedNodes.Store(node, true)
+			return "", nil
+		},
+		deleteVolumeIfExistsFn: func(_ context.Context, _, _, _ string) (bool, error) {
+			return true, nil
+		},
+	}
+	nodesSvc := countingNodesService{
+		listQemuFn: func(_ context.Context, _ string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
+			return &sdknodes.ListQemuResponse{}, nil
+		},
+		listStorageContentFn: func(_ context.Context, _, _ string, _ *sdknodes.ListStorageContentParams) (*sdknodes.ListStorageContentResponse, error) {
+			return &sdknodes.ListStorageContentResponse{}, nil
+		},
+		createQemuTemplateFn: func(_ context.Context, _ string, _ string, _ *sdknodes.CreateQemuTemplateParams) (*sdknodes.CreateQemuTemplateResponse, error) {
+			return &sdknodes.CreateQemuTemplateResponse{}, nil
+		},
+		deleteQemuFn: func(_ context.Context, _ string, _ string, _ *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
+			return &sdknodes.DeleteQemuResponse{}, nil
+		},
+	}
+	qemuSvc := replicationMockQEMU{
+		createFn: func(_ context.Context, node string, _ map[string]any) (string, error) {
+			vmCreated.Store(node, true)
+			return "", nil
+		},
+	}
+
+	deps := buildReplicationDeps(t, limit, &storageSvc, &nodesSvc, &qemuSvc)
+	cp := stemcellCloudProps{Name: "ubuntu-jammy", Version: "1.0"}
+
+	// Must not panic or return error — best-effort.
+	replicateStemcellToNodes(context.Background(), deps, "pve1", "local", "bosh-stemcell.qcow2",
+		sha256hex, targetNodes, srcPath, "", cp, "")
+
+	// pve2 upload failed → no VM for pve2.
+	if _, ok := vmCreated.Load("pve2"); ok {
+		t.Errorf("pve2: VM created despite upload failure")
+	}
+
+	// pve3 and pve4 must have completed successfully.
+	for _, n := range []string{"pve3", "pve4"} {
+		if _, ok := uploadedNodes.Load(n); !ok {
+			t.Errorf("node %s: expected successful upload", n)
+		}
+		if _, ok := vmCreated.Load(n); !ok {
+			t.Errorf("node %s: expected VM created", n)
+		}
+	}
+
+	// pve1 = primary, must not receive upload.
+	if _, ok := uploadedNodes.Load("pve1"); ok {
+		t.Errorf("primary pve1 must not receive upload")
+	}
+}
+
+// TestReplicateStemcellToNodes_Concurrency_IdempotentSkip verifies that a node
+// whose replica already exists (ResolveTemplateVMIDForNode hit) is skipped: no
+// upload and no VM create — even in parallel mode.
+func TestReplicateStemcellToNodes_Concurrency_IdempotentSkip(t *testing.T) {
+	t.Parallel()
+
+	const limit = 4
+	content := []byte("idempotent-skip-concurrency-test")
+	sha256hex := sha256OfBytes(content)
+	sha8 := sha256hex[:8]
+	srcPath := makeSrcFile(t, content)
+
+	targetNodes := []string{"pve1", "pve2", "pve3"}
+	// pve2 already has a replica: ListQemu returns a matching template.
+	pve2TemplateName := "bosh-stemcell-ubuntu-jammy-1.0"
+
+	var (
+		uploadedNodes sync.Map
+		vmCreated     sync.Map
+	)
+
+	storageSvc := replicationMockStorage{
+		uploadFn: func(_ context.Context, node, _, _, _ string, r io.Reader) (string, error) {
+			_, _ = io.Copy(io.Discard, r)
+			uploadedNodes.Store(node, true)
+			return "", nil
+		},
+		deleteVolumeIfExistsFn: func(_ context.Context, _, _, _ string) (bool, error) {
+			return true, nil
+		},
+	}
+	isTemplate := true
+	_ = sha8 // used in the tag inside the template entry below
+	nodesSvc := countingNodesService{
+		listQemuFn: func(_ context.Context, node string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
+			if node == "pve2" {
+				// Return an existing template tagged with the sha8 so
+				// ResolveTemplateVMIDForNode returns alreadyExists=true.
+				entry, _ := json.Marshal(map[string]any{
+					"vmid":     30500,
+					"name":     pve2TemplateName,
+					"template": isTemplate,
+					"tags":     "bosh-stemcell-sha-" + sha8 + ";bosh-stemcell-node-pve2",
+				})
+				resp := sdknodes.ListQemuResponse{entry}
+				return &resp, nil
+			}
+			return &sdknodes.ListQemuResponse{}, nil
+		},
+		listStorageContentFn: func(_ context.Context, _, _ string, _ *sdknodes.ListStorageContentParams) (*sdknodes.ListStorageContentResponse, error) {
+			return &sdknodes.ListStorageContentResponse{}, nil
+		},
+		createQemuTemplateFn: func(_ context.Context, _ string, _ string, _ *sdknodes.CreateQemuTemplateParams) (*sdknodes.CreateQemuTemplateResponse, error) {
+			return &sdknodes.CreateQemuTemplateResponse{}, nil
+		},
+		deleteQemuFn: func(_ context.Context, _ string, _ string, _ *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
+			return &sdknodes.DeleteQemuResponse{}, nil
+		},
+	}
+	qemuSvc := replicationMockQEMU{
+		createFn: func(_ context.Context, node string, _ map[string]any) (string, error) {
+			vmCreated.Store(node, true)
+			return "", nil
+		},
+	}
+
+	deps := buildReplicationDeps(t, limit, &storageSvc, &nodesSvc, &qemuSvc)
+	cp := stemcellCloudProps{Name: "ubuntu-jammy", Version: "1.0"}
+
+	replicateStemcellToNodes(context.Background(), deps, "pve1", "local", "bosh-stemcell.qcow2",
+		sha256hex, targetNodes, srcPath, "", cp, "")
+
+	// pve2 already had a replica — no upload, no VM create.
+	if _, ok := uploadedNodes.Load("pve2"); ok {
+		t.Errorf("pve2: upload called despite existing replica (idempotent skip failed)")
+	}
+	if _, ok := vmCreated.Load("pve2"); ok {
+		t.Errorf("pve2: VM created despite existing replica (idempotent skip failed)")
+	}
+
+	// pve3 must have been replicated normally.
+	if _, ok := uploadedNodes.Load("pve3"); !ok {
+		t.Errorf("pve3: expected upload, got none")
+	}
+}
+
+// TestStemcellReplicationConcurrencyValue verifies the accessor returns correct
+// effective values for boundary inputs.
+func TestStemcellReplicationConcurrencyValue(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name       string
+		configured int
+		want       int
+	}{
+		{"nil config resolves to 1", 0, 1},  // tested via nil pointer below
+		{"zero resolves to 1", 0, 1},
+		{"one stays 1", 1, 1},
+		{"two stays 2", 2, 2},
+		{"64 stays 64", 64, 64},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := &config.CPIConfig{StemcellReplicationConcurrency: tc.configured}
+			got := cfg.StemcellReplicationConcurrencyValue()
+			if got != tc.want {
+				t.Errorf("StemcellReplicationConcurrencyValue() = %d; want %d", got, tc.want)
+			}
+		})
+	}
+	// nil pointer.
+	t.Run("nil pointer resolves to 1", func(t *testing.T) {
+		t.Parallel()
+		var cfg *config.CPIConfig
+		if got := cfg.StemcellReplicationConcurrencyValue(); got != 1 {
+			t.Errorf("nil CPIConfig.StemcellReplicationConcurrencyValue() = %d; want 1", got)
+		}
+	})
 }

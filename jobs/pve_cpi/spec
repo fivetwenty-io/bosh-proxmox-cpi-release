@@ -715,6 +715,19 @@ properties:
       local stemcell storage on a multi-node cluster is rejected at create_stemcell
       time with a clear error directing the operator to use shared storage.
     default: false
+  pve.stemcell_replication_concurrency:
+    description: |
+      Maximum number of cluster nodes that receive a stemcell replica upload
+      concurrently during create_stemcell. Only meaningful when
+      stemcell_replicate_local is true. Zero (default) resolves to 1, which
+      replicates one node at a time (serial, byte-identical to prior releases). Set
+      a positive value up to 64 to replicate multiple nodes in parallel and reduce
+      total replication time on large clusters. Per-node semantics are preserved in
+      all modes: a per-node failure is best-effort (logged, does not abort other
+      nodes), idempotent skip applies when a replica already exists, and the
+      per-node in-flight gate is honored. Negative values and values > 64 are
+      rejected at config validation.
+    default: 0
   pve.health_check.enabled:
     description: |
       When true, create_vm polls the guest QEMU agent via ping after the start task

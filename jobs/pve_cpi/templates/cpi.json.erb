@@ -318,6 +318,13 @@
     config["stemcell_replicate_local"] = true
   end
 
+  # Emit stemcell_replication_concurrency only when non-zero. Zero (default)
+  # resolves to 1 (serial) in Go; omitting the key preserves that default —
+  # byte-identical to prior releases. The Go accessor clamps nil/0 to 1 so
+  # there is no need to emit 1 explicitly.
+  repl_concurrency = p("pve.stemcell_replication_concurrency", 0).to_i
+  config["stemcell_replication_concurrency"] = repl_concurrency unless repl_concurrency == 0
+
   # Emit health_check block only when the operator sets at least one sub-field.
   # When entirely absent, the Go nil *HealthCheckConfig means health polling is
   # off — byte-identical to prior releases. Individual sub-fields follow

@@ -50,7 +50,7 @@ GC — now recorded as "Limits" under each feature. Second, the wider reference 
 up **ten genuinely new gaps (§7.26–§7.35)**, none of which appeared in the prior report; they
 are extensions of the shipped work (enforce the invariants §7.9 records, monitor the resizes
 §7.24 sizes, make the polling §7.25 fixed adaptive, and so on). The first four (§7.26–§7.29)
-have since been **shipped**; §7.30 has also shipped; §7.32 has also shipped; §7.31, §7.33–§7.35 remain **open**.
+have since been **shipped**; §7.30 has also shipped; §7.32 has also shipped; §7.35 has also shipped; §7.31, §7.33–§7.34 remain **open**.
 The §3 matrix gained one correction (Azure `update_disk` is a full method, now `Y`), and the
 §6 standout list was corrected against source in several places — most notably that
 process-level panic recovery (§7.4) is *not* unique to OpenStack-Go (Google has it too). The
@@ -1182,7 +1182,7 @@ curves are pure and deterministic except for seeded jitter.
 
 These ten did not appear in the prior report. They surfaced from the deeper reference
 re-read and the source-level verification of the shipped features above. The first four
-(§7.26–§7.30) have since been **shipped**; §7.32 has also been **shipped**; §7.31, §7.33–§7.35 remain **open**. Each follows the same
+(§7.26–§7.30) have since been **shipped**; §7.32 has also been **shipped**; §7.35 has also been **shipped**; §7.31, §7.33–§7.34 remain **open**. Each follows the same
 additive-optional convention the shipped work established: validate only when set, omit from
 VM config when empty, zero behavior change for existing manifests. They are ordered roughly by
 effort-to-value, not severity.
@@ -1370,15 +1370,29 @@ pre-feature state. Extends the §7.8 layered resolver model to network attribute
 changing any resolver, config, spec, or ERB file — `network_defaults` is a call-time
 cloud_property, not CPI config.
 
-#### 7.35 OPEN — Multipart / parallel stemcell upload for large heavy tarballs
+#### 7.35 DONE — Bounded-concurrency parallel stemcell replication across cluster nodes
 
-*Reference: Alicloud.* The heavy-tarball import streams serially to storage; over a
-constrained link to the artifacts/RustFS VM, serial upload is the long pole. Alicloud uploads
-in parallel parts (`MultipartUploadFile`, `oss.Routines(5)`, 5 MB parts). The §7.6 digest
-work already wraps the upload reader, so a chunked path is adjacent. **Build:** for backends
-that support chunked or parallel writes (the S3-backed RustFS import path), upload parts with
-bounded concurrency. Performance-only, no correctness impact — list as Tier-4
-deployment-driven.
+*Reference: Alicloud (parallel-upload pattern).* The original analysis framed this as
+multipart S3 upload; on closer inspection the stemcell upload path targets the PVE
+single-POST storage endpoint — there is no S3 stemcell path and multipart chunking is not
+applicable. The real performance long-pole is the serial per-node replication loop in
+`replicateStemcellToNodes`: when `stemcell_replicate_local` is true, the CPI uploads the
+qcow2 and builds a template VM on each cluster node one at a time.
+
+**Shipped:** `stemcell_replication_concurrency` (default 0 → serial, up to 64). The serial
+`for` loop is refactored into a bounded worker pool (`sem chan struct{}` + `sync.WaitGroup`):
+up to `stemcell_replication_concurrency` goroutines run concurrently, each owning one node's
+full upload+ensureTemplate sequence. With the default (0/absent → 1), behavior is
+byte-identical to prior releases. With N > 1, total replication time on a K-node cluster
+scales to approximately `ceil(K/N)` upload round-trips instead of K.
+
+**Concurrency safety:** `uploadStemcellImage` opens its own file handle per goroutine (no
+shared `*os.File`); `deps.Logger.With(...)` returns a new zap logger per node (zap is
+concurrency-safe); `inflightSems.acquire` is guarded by `sync.Mutex` internally; VMID
+allocation uses `AllocateWithRetry` (regenerates on conflict) so parallel goroutines on
+different nodes do not collide. Per-node best-effort semantics (idempotent skip, non-fatal
+failure) are preserved identically in both serial and parallel modes. `go test -race` is
+clean.
 
 ### Explicitly not recommended as core CPI work
 

@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/cpi"
@@ -2329,6 +2330,19 @@ func listClusterNodes(ctx context.Context, deps Deps) ([]string, error) {
 // as a degraded-but-usable state: create_vm on a node without a replica will
 // fail fast with a clear actionable error (from the create_vm guard), giving
 // the operator a chance to re-run create_stemcell to complete replication.
+//
+// Concurrency is controlled by deps.Config.StemcellReplicationConcurrencyValue():
+//   - 1 (default, nil/0 config) → serial, deterministic, byte-identical to prior releases.
+//   - N > 1 → up to N nodes replicated concurrently via a bounded semaphore.
+//
+// Concurrency safety:
+//   - uploadStemcellImage opens its own file handle per call — no shared *os.File.
+//   - deps.Logger.With(...) returns a new zap logger; zap is concurrency-safe.
+//   - inflightSems.acquire keys by node name and uses sync.Mutex internally — safe
+//     under concurrent different-node calls from multiple goroutines.
+//   - VMID allocation uses AllocateWithRetry which regenerates on conflict — safe
+//     under concurrent cluster-wide allocation from parallel goroutines.
+//   - No mutable state is shared between goroutines; all results are logged directly.
 func replicateStemcellToNodes(
 	ctx context.Context,
 	deps Deps,
@@ -2344,76 +2358,129 @@ func replicateStemcellToNodes(
 	}
 	logger := deps.Logger
 
+	// Determine worker pool size. 0 or absent resolves to 1 (serial).
+	workerLimit := 1
+	if deps.Config != nil {
+		workerLimit = deps.Config.StemcellReplicationConcurrencyValue()
+	}
+
+	// Collect non-primary nodes to replicate.
+	var replicaNodes []string
 	for _, node := range targetNodes {
-		if node == primaryNode {
-			continue
+		if node != primaryNode {
+			replicaNodes = append(replicaNodes, node)
 		}
+	}
+	if len(replicaNodes) == 0 {
+		return
+	}
+
+	// sem is a buffered channel acting as a counting semaphore: at most
+	// workerLimit goroutines hold a token simultaneously. With workerLimit=1
+	// this is exactly the serial behavior of the original loop.
+	sem := make(chan struct{}, workerLimit)
+
+	var wg sync.WaitGroup
+	for _, node := range replicaNodes {
+		node := node // capture per iteration
 		nodeLogger := logger.With(log.String("replica_node", node))
 
-		// Check whether a replica already exists on this node (idempotent).
-		existingVMID, alreadyExists, checkErr := pve.ResolveTemplateVMIDForNode(ctx, deps.PVE, node, sha8)
-		if checkErr != nil {
-			nodeLogger.Warn("create_stemcell: replication: cannot check existing replica (skipping node)",
-				log.Err(checkErr),
-			)
-			continue
-		}
-		if alreadyExists {
-			nodeLogger.Info("create_stemcell: replication: replica already exists (skipping upload)",
-				log.Int(metadataKeyVMID, existingVMID),
-			)
-			continue
-		}
+		wg.Add(1)
+		// Acquire a semaphore slot before launching the goroutine so the pool
+		// is bounded by workerLimit active goroutines at any moment.
+		sem <- struct{}{}
 
-		// Upload qcow2 to this node's local storage. The upload reopens the
-		// source file, so tmpDir must still be alive (caller defers cleanup).
-		if uploadErr := uploadStemcellImage(ctx, deps, node, storage, qcow2Filename, uploadSourcePath, uploadStagingDir); uploadErr != nil {
-			nodeLogger.Warn("create_stemcell: replication: upload failed (non-fatal; replica not created)",
-				log.Err(uploadErr),
-			)
-			continue
-		}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }() // release slot when node work is done
 
-		// Build template VM on this node. The replica carries both sha tag and
-		// the per-node tag. We set cp.Node to the target so the replica is
-		// pinned; ensureTemplateVM is called with node as templateNode.
-		//
-		// Per-node in-flight gate wrapped in an IIFE so defer fires at the
-		// end of this node's work rather than the end of the loop function,
-		// avoiding the deferInLoop resource-leak pattern.
-		replicaCP := cp
-		replicaCP.Node = node
-		func() {
-			if deps.Config != nil {
-				replicaRelease, replicaInflightErr := inflightSems.acquire(ctx, node, deps.Config.MaxInflightPerNodeLimit())
-				if replicaInflightErr != nil {
-					nodeLogger.Warn("create_stemcell: replication: in-flight limit; skipping replica node",
-						log.String("node", node),
-						log.Err(replicaInflightErr),
-					)
-					return
-				}
-				defer replicaRelease()
-			}
-			replicaVMID, tmplErr := ensureReplicaTemplateVM(ctx, deps, node, storage, qcow2Filename, sha256hex, replicaCP, source)
-			if tmplErr != nil {
-				nodeLogger.Warn("create_stemcell: replication: ensure template failed (non-fatal; replica not created)",
-					log.Err(tmplErr),
-				)
-				// Best-effort: delete the uploaded qcow2 to reclaim storage.
-				volumePath := "import/" + qcow2Filename
-				if _, delErr := deps.PVE.Storage().DeleteVolumeIfExists(ctx, node, storage, volumePath); delErr != nil {
-					nodeLogger.Warn("create_stemcell: replication: cleanup of failed upload also failed (non-fatal)",
-						log.Err(delErr),
-					)
-				}
-				return
-			}
-			nodeLogger.Info("create_stemcell: replication: replica template created",
-				log.Int64(metadataKeyVMID, replicaVMID),
-			)
+			replicateOneNode(ctx, deps, nodeLogger, node, storage,
+				qcow2Filename, sha256hex, sha8, uploadSourcePath, uploadStagingDir, cp, source)
 		}()
 	}
+	wg.Wait()
+}
+
+// replicateOneNode performs the full upload+ensureTemplate sequence for a single
+// replica node. It is called from a goroutine inside replicateStemcellToNodes.
+// All failures are best-effort: logged as warnings, never returned as errors.
+// The function is self-contained — it holds no references to shared mutable state.
+func replicateOneNode(
+	ctx context.Context,
+	deps Deps,
+	nodeLogger *log.Logger,
+	node, storage,
+	qcow2Filename, sha256hex, sha8,
+	uploadSourcePath, uploadStagingDir string,
+	cp stemcellCloudProps,
+	source string,
+) {
+	// Check whether a replica already exists on this node (idempotent).
+	existingVMID, alreadyExists, checkErr := pve.ResolveTemplateVMIDForNode(ctx, deps.PVE, node, sha8)
+	if checkErr != nil {
+		nodeLogger.Warn("create_stemcell: replication: cannot check existing replica (skipping node)",
+			log.Err(checkErr),
+		)
+		return
+	}
+	if alreadyExists {
+		nodeLogger.Info("create_stemcell: replication: replica already exists (skipping upload)",
+			log.Int(metadataKeyVMID, existingVMID),
+		)
+		return
+	}
+
+	// Upload qcow2 to this node's local storage. uploadStemcellImage opens its
+	// own file handle (openStagedFile inside), so concurrent calls for different
+	// nodes read the same source file independently without sharing an *os.File.
+	if uploadErr := uploadStemcellImage(ctx, deps, node, storage, qcow2Filename, uploadSourcePath, uploadStagingDir); uploadErr != nil {
+		nodeLogger.Warn("create_stemcell: replication: upload failed (non-fatal; replica not created)",
+			log.Err(uploadErr),
+		)
+		return
+	}
+
+	// Build template VM on this node. The replica carries both sha tag and
+	// the per-node tag. We set cp.Node to the target so the replica is
+	// pinned; ensureTemplateVM is called with node as templateNode.
+	//
+	// Per-node in-flight gate wrapped in an IIFE so defer fires at the
+	// end of this node's work, avoiding the deferInLoop resource-leak pattern.
+	// inflightSems.acquire is concurrency-safe (uses sync.Mutex internally);
+	// different-node goroutines contend only on the registry mutex, not on each
+	// other's semaphore channels.
+	replicaCP := cp
+	replicaCP.Node = node
+	func() {
+		if deps.Config != nil {
+			replicaRelease, replicaInflightErr := inflightSems.acquire(ctx, node, deps.Config.MaxInflightPerNodeLimit())
+			if replicaInflightErr != nil {
+				nodeLogger.Warn("create_stemcell: replication: in-flight limit; skipping replica node",
+					log.String("node", node),
+					log.Err(replicaInflightErr),
+				)
+				return
+			}
+			defer replicaRelease()
+		}
+		replicaVMID, tmplErr := ensureReplicaTemplateVM(ctx, deps, node, storage, qcow2Filename, sha256hex, replicaCP, source)
+		if tmplErr != nil {
+			nodeLogger.Warn("create_stemcell: replication: ensure template failed (non-fatal; replica not created)",
+				log.Err(tmplErr),
+			)
+			// Best-effort: delete the uploaded qcow2 to reclaim storage.
+			volumePath := "import/" + qcow2Filename
+			if _, delErr := deps.PVE.Storage().DeleteVolumeIfExists(ctx, node, storage, volumePath); delErr != nil {
+				nodeLogger.Warn("create_stemcell: replication: cleanup of failed upload also failed (non-fatal)",
+					log.Err(delErr),
+				)
+			}
+			return
+		}
+		nodeLogger.Info("create_stemcell: replication: replica template created",
+			log.Int64(metadataKeyVMID, replicaVMID),
+		)
+	}()
 }
 
 // ensureReplicaTemplateVM is like ensureTemplateVM but tags the created VM with

@@ -5264,3 +5264,119 @@ func TestValidate_PVEAPITransportTuning_PositiveValid(t *testing.T) {
 		t.Errorf("PVEDialTimeoutSec: got %d, want 5", cfg.PVEDialTimeoutSec)
 	}
 }
+
+// --------------------------------------------------------------------------
+// StemcellReplicationConcurrency — accessor + validation tests
+// --------------------------------------------------------------------------
+
+// TestStemcellReplicationConcurrencyValue_ZeroResolves confirms 0 → 1 (serial default).
+func TestStemcellReplicationConcurrencyValue_ZeroResolves(t *testing.T) {
+	t.Parallel()
+	c := &config.CPIConfig{StemcellReplicationConcurrency: 0}
+	if got := c.StemcellReplicationConcurrencyValue(); got != 1 {
+		t.Errorf("StemcellReplicationConcurrencyValue() = %d; want 1", got)
+	}
+}
+
+// TestStemcellReplicationConcurrencyValue_NilConfigResolves confirms nil pointer → 1.
+func TestStemcellReplicationConcurrencyValue_NilConfigResolves(t *testing.T) {
+	t.Parallel()
+	var c *config.CPIConfig
+	if got := c.StemcellReplicationConcurrencyValue(); got != 1 {
+		t.Errorf("nil.StemcellReplicationConcurrencyValue() = %d; want 1", got)
+	}
+}
+
+// TestStemcellReplicationConcurrencyValue_PositivePassThrough confirms 4 → 4.
+func TestStemcellReplicationConcurrencyValue_PositivePassThrough(t *testing.T) {
+	t.Parallel()
+	c := &config.CPIConfig{StemcellReplicationConcurrency: 4}
+	if got := c.StemcellReplicationConcurrencyValue(); got != 4 {
+		t.Errorf("StemcellReplicationConcurrencyValue() = %d; want 4", got)
+	}
+}
+
+// TestValidate_StemcellReplicationConcurrency_NegativeRejected confirms negative fails.
+func TestValidate_StemcellReplicationConcurrency_NegativeRejected(t *testing.T) {
+	t.Parallel()
+	c := registryBaseCfg()
+	c.RegistryEndpoint = "https://registry.example.com"
+	c.StemcellReplicationConcurrency = -1
+	err := c.Validate()
+	if err == nil {
+		t.Fatal("expected error for negative stemcell_replication_concurrency, got nil")
+	}
+	if !strings.Contains(err.Error(), "stemcell_replication_concurrency") {
+		t.Errorf("error must mention stemcell_replication_concurrency; got %v", err)
+	}
+}
+
+// TestValidate_StemcellReplicationConcurrency_TooHighRejected confirms > 64 fails.
+func TestValidate_StemcellReplicationConcurrency_TooHighRejected(t *testing.T) {
+	t.Parallel()
+	c := registryBaseCfg()
+	c.RegistryEndpoint = "https://registry.example.com"
+	c.StemcellReplicationConcurrency = 65
+	err := c.Validate()
+	if err == nil {
+		t.Fatal("expected error for stemcell_replication_concurrency > 64, got nil")
+	}
+	if !strings.Contains(err.Error(), "stemcell_replication_concurrency") {
+		t.Errorf("error must mention stemcell_replication_concurrency; got %v", err)
+	}
+}
+
+// TestValidate_StemcellReplicationConcurrency_ZeroValid confirms 0 passes (serial default).
+func TestValidate_StemcellReplicationConcurrency_ZeroValid(t *testing.T) {
+	t.Parallel()
+	c := registryBaseCfg()
+	c.RegistryEndpoint = "https://registry.example.com"
+	c.StemcellReplicationConcurrency = 0
+	if err := c.Validate(); err != nil {
+		t.Errorf("expected no error for stemcell_replication_concurrency=0, got: %v", err)
+	}
+}
+
+// TestValidate_StemcellReplicationConcurrency_64Valid confirms 64 passes (max allowed).
+func TestValidate_StemcellReplicationConcurrency_64Valid(t *testing.T) {
+	t.Parallel()
+	c := registryBaseCfg()
+	c.RegistryEndpoint = "https://registry.example.com"
+	c.StemcellReplicationConcurrency = 64
+	if err := c.Validate(); err != nil {
+		t.Errorf("expected no error for stemcell_replication_concurrency=64, got: %v", err)
+	}
+}
+
+// TestStemcellReplicationConcurrency_JSONRoundTrip confirms JSON marshal/unmarshal.
+func TestStemcellReplicationConcurrency_JSONRoundTrip(t *testing.T) {
+	t.Parallel()
+	c := &config.CPIConfig{StemcellReplicationConcurrency: 8}
+	raw, err := json.Marshal(c)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(raw), `"stemcell_replication_concurrency":8`) {
+		t.Errorf("marshaled JSON does not contain field: %s", raw)
+	}
+	var c2 config.CPIConfig
+	if err := json.Unmarshal(raw, &c2); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if c2.StemcellReplicationConcurrency != 8 {
+		t.Errorf("after round-trip, expected 8, got %d", c2.StemcellReplicationConcurrency)
+	}
+}
+
+// TestStemcellReplicationConcurrency_OmitWhenZero confirms omitempty drops the field at 0.
+func TestStemcellReplicationConcurrency_OmitWhenZero(t *testing.T) {
+	t.Parallel()
+	c := &config.CPIConfig{StemcellReplicationConcurrency: 0}
+	raw, err := json.Marshal(c)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(raw), "stemcell_replication_concurrency") {
+		t.Errorf("zero value should be omitted in JSON, but got: %s", raw)
+	}
+}
