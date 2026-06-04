@@ -269,6 +269,25 @@ func TestValidate_ExpectedAgentSHA256Valid(t *testing.T) {
 	}
 }
 
+func TestTaskPollAdaptiveEnabled(t *testing.T) {
+	t.Parallel()
+	var nilCfg *config.CPIConfig
+	if nilCfg.TaskPollAdaptiveEnabled() {
+		t.Error("nil receiver: want disabled")
+	}
+	if (&config.CPIConfig{}).TaskPollAdaptiveEnabled() {
+		t.Error("unset: want disabled")
+	}
+	tru := true
+	if !(&config.CPIConfig{TaskPollAdaptive: &tru}).TaskPollAdaptiveEnabled() {
+		t.Error("explicit true: want enabled")
+	}
+	fal := false
+	if (&config.CPIConfig{TaskPollAdaptive: &fal}).TaskPollAdaptiveEnabled() {
+		t.Error("explicit false: want disabled")
+	}
+}
+
 func TestHealthCheckExpectedAgentSHA256_EmptyWhenUnset(t *testing.T) {
 	t.Parallel()
 	var nilCfg *config.CPIConfig

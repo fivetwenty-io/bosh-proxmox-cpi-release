@@ -194,6 +194,11 @@ func runWithArgs(args []string, stdin io.Reader, stdout, stderr io.Writer, opts 
 	tp := cfg.RetryTaskPoll()
 	pve.ConfigureTaskPolling(tp.BaseMs, tp.CapMs, tp.JitterPct)
 
+	// Enable progress-aware adaptive task polling when the operator opts in
+	// (§7.28). Default off → fixed-cadence polling, byte-identical to prior
+	// releases.
+	pve.ConfigureAdaptiveTaskPoll(cfg.TaskPollAdaptiveEnabled())
+
 	// Apply the operator's pushback-backoff curve process-wide. With an unset
 	// retry.pushback block these resolve to the shipped defaults (5s/60s), so
 	// backoff is byte-identical to prior releases.

@@ -21,6 +21,26 @@ var (
 	taskPollJitterPct     atomic.Int64 // default 10
 )
 
+// adaptivePollEnabled gates progress-aware adaptive task polling (§7.28). When
+// false (default) AwaitTask uses the SDK's fixed-interval Wait, byte-identical
+// to prior releases. When true, AwaitTask runs a CPI-owned loop that derives the
+// poll interval from the task's reported progress, falling back to the fixed
+// cadence when progress is absent.
+var adaptivePollEnabled atomic.Bool
+
+// ConfigureAdaptiveTaskPoll sets the process-wide adaptive-poll toggle from
+// operator config. Call once at startup, before serving requests.
+func ConfigureAdaptiveTaskPoll(enabled bool) { adaptivePollEnabled.Store(enabled) }
+
+// SetAdaptiveTaskPollForTest overrides the adaptive-poll toggle for a test and
+// returns a restore function.
+//
+//	defer pve.SetAdaptiveTaskPollForTest(true)()
+func SetAdaptiveTaskPollForTest(enabled bool) func() {
+	prev := adaptivePollEnabled.Swap(enabled)
+	return func() { adaptivePollEnabled.Store(prev) }
+}
+
 func init() {
 	taskPollIntervalNs.Store(int64(defaultPollIntervalMs) * int64(time.Millisecond))
 	taskPollMaxIntervalNs.Store(int64(defaultPollIntervalMs*5) * int64(time.Millisecond))

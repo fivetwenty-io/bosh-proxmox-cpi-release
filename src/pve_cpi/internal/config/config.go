@@ -375,6 +375,14 @@ type CPIConfig struct {
 	// DiskPerfInvariantModeValue() for the effective value.
 	DiskPerfInvariantMode string `json:"disk_perf_invariant_mode,omitempty"`
 
+	// TaskPollAdaptive enables progress-aware adaptive task polling (§7.28). When
+	// true, AwaitTask derives the poll interval from a PVE task's reported
+	// progress (clamped 1–10s) for long operations (clone, move-disk), falling
+	// back to the fixed task_poll cadence when progress is absent. Default false
+	// (nil → disabled): polling is byte-identical to prior releases. Use
+	// TaskPollAdaptiveEnabled().
+	TaskPollAdaptive *bool `json:"task_poll_adaptive,omitempty"`
+
 	// VMFirewall sets PVE's per-NIC firewall flag (firewall=1) on every NIC of
 	// newly created VMs. When nil/false (default), NICs are created without the
 	// flag — byte-identical to prior releases. A per-NIC network cloud property
@@ -1467,6 +1475,12 @@ func (c *CPIConfig) DiskPerfInvariantModeValue() string {
 		return "enforce"
 	}
 	return v
+}
+
+// TaskPollAdaptiveEnabled reports whether progress-aware adaptive task polling
+// is active. Nil (default) → false.
+func (c *CPIConfig) TaskPollAdaptiveEnabled() bool {
+	return c != nil && c.TaskPollAdaptive != nil && *c.TaskPollAdaptive
 }
 
 // ResizeWaitForConvergenceEnabled reports whether resize_disk should poll for

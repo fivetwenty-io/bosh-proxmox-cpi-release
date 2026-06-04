@@ -1,3 +1,12 @@
+// LOCAL VENDOR MODIFICATION (bosh-pve-cpi §7.28): this file carries additions
+// not yet present upstream — the Status.Progress field and the Service.GetStatus
+// single-shot status read. They back progress-aware adaptive task polling.
+//
+// WARNING: `go mod vendor` will OVERWRITE this file and silently drop those
+// additions, breaking the build (internal/pve depends on GetStatus). Until the
+// changes are upstreamed into pve-apiclient-go, re-apply them after any vendor
+// refresh. internal/pve/task.go holds a compile-time assertion that fails with a
+// pointer to this header if the method goes missing.
 package tasks
 
 import (
@@ -25,6 +34,13 @@ type Service interface {
 	// WaitForUPID is a convenience wrapper that parses the node from the UPID string
 	// and delegates to Wait, so callers need not extract the node separately.
 	WaitForUPID(ctx context.Context, upid string, opts *WaitOptions) (*Status, error)
+	// GetStatus performs a single task-status read without polling. Unlike Wait
+	// it returns the current Status even while the task is still running, so
+	// callers can implement their own poll loop (e.g. progress-aware adaptive
+	// intervals). It does not return errTaskInProgress or errTaskFailed; task
+	// outcome is conveyed via the returned Status fields (Status, ExitStatus,
+	// Progress).
+	GetStatus(ctx context.Context, node, upid string) (*Status, error)
 }
 
 // WaitOptions controls polling behavior.
@@ -47,6 +63,9 @@ type Status struct {
 	// Warned is true when the task completed with "WARNINGS: N" exit status.
 	// This is a non-failure terminal state: the task succeeded but emitted warnings.
 	Warned bool
+	// Progress is the task's reported progress in the range [0,1] for long
+	// operations (clone, move-disk). Zero when PVE does not report progress.
+	Progress float64
 }
 
 // service implements Service.
@@ -78,6 +97,45 @@ func (s *service) Wait(ctx context.Context, node, upid string, opts *WaitOptions
 	}
 
 	return poller.poll(ctx)
+}
+
+// GetStatus performs a single task-status read without polling. See the Service
+// interface doc. The returned Status carries the live Status/ExitStatus/Progress
+// fields; a still-running task is returned with a nil error (not errTaskInProgress).
+func (s *service) GetStatus(ctx context.Context, node, upid string) (*Status, error) {
+	path := fmt.Sprintf("/nodes/%s/tasks/%s/status", node, upid)
+	data, err := s.c.GetCtx(ctx, path, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get task status: %w", err)
+	}
+	taskData, ok := data.(map[string]interface{})
+	if !ok {
+		return nil, errUnexpectedTaskStatusFormat
+	}
+	status, _ := taskData["status"].(string)
+	exitStatus, _ := taskData["exitstatus"].(string)
+	return &Status{
+		Status:     status,
+		ExitStatus: exitStatus,
+		UpID:       upid,
+		Warned:     isWarningExitStatus(exitStatus),
+		Progress:   parseProgress(taskData["progress"]),
+	}, nil
+}
+
+// parseProgress coerces the PVE task-status "progress" field to a float64,
+// tolerating the int/float JSON variants. Returns 0 for absent or unparseable.
+func parseProgress(v interface{}) float64 {
+	switch p := v.(type) {
+	case float64:
+		return p
+	case int:
+		return float64(p)
+	case int64:
+		return float64(p)
+	default:
+		return 0
+	}
 }
 
 type waitConfig struct {

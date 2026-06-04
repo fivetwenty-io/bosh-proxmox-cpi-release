@@ -153,6 +153,12 @@
   disk_perf_invariant_mode = p("pve.disk_perf_invariant_mode", "")
   config["disk_perf_invariant_mode"] = disk_perf_invariant_mode unless disk_perf_invariant_mode.to_s.empty?
 
+  # Emit task_poll_adaptive only when the operator opts in. The Go config
+  # defaults to fixed-cadence polling when the key is omitted.
+  if p("pve.task_poll_adaptive", false)
+    config["task_poll_adaptive"] = true
+  end
+
   # Emit resize-convergence knobs only when the operator opts in. The Go config
   # defaults (disabled; 120s budget) hold when the keys are omitted.
   if p("pve.resize_wait_for_convergence", false)

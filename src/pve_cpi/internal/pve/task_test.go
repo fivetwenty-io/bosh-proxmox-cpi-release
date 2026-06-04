@@ -25,7 +25,8 @@ import (
 // ---- mock task service ----
 
 type mockTasksService struct {
-	waitFn func(ctx context.Context, node, upid string, opts *sdktasks.WaitOptions) (*sdktasks.Status, error)
+	waitFn      func(ctx context.Context, node, upid string, opts *sdktasks.WaitOptions) (*sdktasks.Status, error)
+	getStatusFn func(ctx context.Context, node, upid string) (*sdktasks.Status, error)
 }
 
 func (m *mockTasksService) Wait(ctx context.Context, node, upid string, opts *sdktasks.WaitOptions) (*sdktasks.Status, error) {
@@ -37,6 +38,13 @@ func (m *mockTasksService) Wait(ctx context.Context, node, upid string, opts *sd
 
 func (m *mockTasksService) WaitForUPID(ctx context.Context, upid string, opts *sdktasks.WaitOptions) (*sdktasks.Status, error) {
 	panic("mockTasksService.WaitForUPID: not expected in pve tests")
+}
+
+func (m *mockTasksService) GetStatus(ctx context.Context, node, upid string) (*sdktasks.Status, error) {
+	if m.getStatusFn != nil {
+		return m.getStatusFn(ctx, node, upid)
+	}
+	return &sdktasks.Status{Status: "stopped", ExitStatus: "OK", UpID: upid}, nil
 }
 
 // ---- mock client ----
@@ -62,6 +70,152 @@ func newMockClient(tasksSvc sdktasks.Service) *mockClient {
 }
 
 // ---- tests ----
+
+// TestAwaitTask_Adaptive_PollsThenSucceeds verifies that with adaptive polling
+// enabled, AwaitTask drives its own loop via GetStatus (not the SDK Wait),
+// tolerates a running task with progress, and succeeds on the terminal read.
+func TestAwaitTask_Adaptive_PollsThenSucceeds(t *testing.T) {
+	defer pve.SetAdaptiveTaskPollForTest(true)()
+
+	calls := 0
+	svc := &mockTasksService{
+		waitFn: func(_ context.Context, _, _ string, _ *sdktasks.WaitOptions) (*sdktasks.Status, error) {
+			t.Error("SDK Wait must NOT be called when adaptive polling is enabled")
+			return nil, nil
+		},
+		getStatusFn: func(_ context.Context, _, upid string) (*sdktasks.Status, error) {
+			calls++
+			if calls < 3 {
+				return &sdktasks.Status{Status: "running", UpID: upid, Progress: 0.4 * float64(calls)}, nil
+			}
+			return &sdktasks.Status{Status: "stopped", ExitStatus: "OK", UpID: upid}, nil
+		},
+	}
+	// Instant polling via the test backoff seam.
+	ctx := pve.WithTestBackoff(context.Background(), func(int) time.Duration { return 0 })
+	if err := pve.AwaitTask(ctx, newMockClient(svc), "node1", "UPID:node1:clone"); err != nil {
+		t.Fatalf("expected success, got: %v", err)
+	}
+	if calls < 3 {
+		t.Errorf("expected adaptive loop to poll until terminal, got %d GetStatus calls", calls)
+	}
+}
+
+// TestAwaitTask_Adaptive_TerminalFailure verifies a non-OK terminal exit is a
+// non-retriable failure in the adaptive loop.
+func TestAwaitTask_Adaptive_TerminalFailure(t *testing.T) {
+	defer pve.SetAdaptiveTaskPollForTest(true)()
+
+	svc := &mockTasksService{
+		getStatusFn: func(_ context.Context, _, upid string) (*sdktasks.Status, error) {
+			return &sdktasks.Status{Status: "stopped", ExitStatus: "clone failed", UpID: upid}, nil
+		},
+	}
+	ctx := pve.WithTestBackoff(context.Background(), func(int) time.Duration { return 0 })
+	err := pve.AwaitTask(ctx, newMockClient(svc), "node1", "UPID:node1:clone")
+	if err == nil {
+		t.Fatal("expected error for non-OK terminal exit")
+	}
+	if !cpierrors.IsType(err, cpierrors.TypeCloud) {
+		t.Errorf("terminal task failure must be a non-retriable CloudError, got: %v", err)
+	}
+	if cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+		t.Errorf("terminal task failure must NOT be retriable, got: %v", err)
+	}
+}
+
+// TestAwaitTask_Adaptive_DisabledUsesWait confirms the default (disabled) path
+// uses the SDK Wait and never calls GetStatus — byte-identical routing.
+func TestAwaitTask_Adaptive_DisabledUsesWait(t *testing.T) {
+	t.Parallel() // adaptive flag defaults false; no global mutation here
+
+	waitCalled := false
+	svc := &mockTasksService{
+		waitFn: func(_ context.Context, _, upid string, _ *sdktasks.WaitOptions) (*sdktasks.Status, error) {
+			waitCalled = true
+			return &sdktasks.Status{Status: "stopped", ExitStatus: "OK", UpID: upid}, nil
+		},
+		getStatusFn: func(_ context.Context, _, _ string) (*sdktasks.Status, error) {
+			t.Error("GetStatus must NOT be called when adaptive polling is disabled")
+			return nil, nil
+		},
+	}
+	if err := pve.AwaitTask(context.Background(), newMockClient(svc), "node1", "UPID:node1:x"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !waitCalled {
+		t.Error("disabled path must use SDK Wait")
+	}
+}
+
+// TestAwaitTask_Adaptive_TransientErrorThenSucceeds verifies the adaptive loop
+// tolerates transient GetStatus errors (falls through and retries) rather than
+// failing, then succeeds on the terminal read.
+func TestAwaitTask_Adaptive_TransientErrorThenSucceeds(t *testing.T) {
+	defer pve.SetAdaptiveTaskPollForTest(true)()
+
+	calls := 0
+	svc := &mockTasksService{
+		getStatusFn: func(_ context.Context, _, upid string) (*sdktasks.Status, error) {
+			calls++
+			if calls < 3 {
+				return nil, errors.New("transient read blip")
+			}
+			return &sdktasks.Status{Status: "stopped", ExitStatus: "OK", UpID: upid}, nil
+		},
+	}
+	ctx := pve.WithTestBackoff(context.Background(), func(int) time.Duration { return 0 })
+	if err := pve.AwaitTask(ctx, newMockClient(svc), "node1", "UPID:node1:x"); err != nil {
+		t.Fatalf("transient errors must be retried, got: %v", err)
+	}
+	if calls < 3 {
+		t.Errorf("expected retries past transient errors, got %d calls", calls)
+	}
+}
+
+// TestAwaitTask_Adaptive_NotFoundIsNonRetriable verifies a not-found task UPID is
+// classified non-retriable (preserves IsNotFound) in the adaptive loop.
+func TestAwaitTask_Adaptive_NotFoundIsNonRetriable(t *testing.T) {
+	defer pve.SetAdaptiveTaskPollForTest(true)()
+
+	svc := &mockTasksService{
+		getStatusFn: func(_ context.Context, _, _ string) (*sdktasks.Status, error) {
+			return nil, sdkerrors.ErrNotFound
+		},
+	}
+	ctx := pve.WithTestBackoff(context.Background(), func(int) time.Duration { return 0 })
+	err := pve.AwaitTask(ctx, newMockClient(svc), "node1", "UPID:node1:gone")
+	if err == nil {
+		t.Fatal("expected error for not-found task")
+	}
+	if cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+		t.Errorf("not-found must be non-retriable, got: %v", err)
+	}
+	if !pve.IsNotFound(err) {
+		t.Errorf("not-found classification must be preserved, got: %v", err)
+	}
+}
+
+// TestAwaitTask_Adaptive_ContextCancelledIsRetriable verifies parent-context
+// cancellation surfaces as a retriable error.
+func TestAwaitTask_Adaptive_ContextCancelledIsRetriable(t *testing.T) {
+	defer pve.SetAdaptiveTaskPollForTest(true)()
+
+	svc := &mockTasksService{
+		getStatusFn: func(_ context.Context, _, upid string) (*sdktasks.Status, error) {
+			return &sdktasks.Status{Status: "running", UpID: upid, Progress: 0.5}, nil
+		},
+	}
+	ctx, cancel := context.WithCancel(pve.WithTestBackoff(context.Background(), func(int) time.Duration { return 0 }))
+	cancel() // cancel before the call so the running-task select takes the ctx.Done arm
+	err := pve.AwaitTask(ctx, newMockClient(svc), "node1", "UPID:node1:slow")
+	if err == nil {
+		t.Fatal("expected error on cancelled context")
+	}
+	if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+		t.Errorf("context cancellation must be retriable, got: %v", err)
+	}
+}
 
 func TestAwaitTask_Success(t *testing.T) {
 	t.Parallel()

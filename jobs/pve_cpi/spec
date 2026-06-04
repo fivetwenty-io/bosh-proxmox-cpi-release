@@ -382,6 +382,15 @@ properties:
       behavior is unchanged unless disk_performance options were recorded.
       Valid values: "" (empty, same as "enforce"), "enforce", "warn", "off".
     default: ""
+  pve.task_poll_adaptive:
+    description: |
+      When true, PVE task polling derives its interval from the task's reported
+      progress (clamped 1-10 seconds) for long operations such as clone and
+      move-disk, instead of the fixed task_poll cadence. Tasks that report no
+      progress fall back to the fixed cadence, so short tasks are unaffected.
+      This reduces poll-storm pressure early in a long operation and tightens
+      polling as it nears completion. Default false (fixed-cadence polling).
+    default: false
   pve.placement.enabled:
     description: |
       When true (default), create_vm runs live node-scoring to select the

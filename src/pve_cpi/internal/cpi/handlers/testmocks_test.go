@@ -240,6 +240,12 @@ func (m *mockTasksService) WaitForUPID(ctx context.Context, upid string, opts *t
 	panic("mockTasksService.WaitForUPID: not expected in handler tests")
 }
 
+func (m *mockTasksService) GetStatus(_ context.Context, _, upid string) (*tasks.Status, error) {
+	// Default: report a completed task. Handler tests do not enable adaptive
+	// polling, so this is only reached if a test opts in explicitly.
+	return &tasks.Status{Status: "stopped", ExitStatus: "OK", UpID: upid}, nil
+}
+
 // --------------------------------------------------------------------------
 // mockStorageService
 // --------------------------------------------------------------------------

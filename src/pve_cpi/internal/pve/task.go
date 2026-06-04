@@ -17,6 +17,17 @@ const (
 	defaultMaxWaitSeconds = 300  // 5 min
 )
 
+// taskStatusGetter mirrors the subset of the vendored tasks.Service that §7.28
+// adaptive polling depends on. GetStatus is a LOCAL addition to the vendored SDK
+// (see the header in vendor/.../pkg/api/tasks/tasks.go). This compile-time
+// assertion makes an accidental `go mod vendor` revert fail HERE, with this
+// comment, rather than at a confusing call site.
+type taskStatusGetter interface {
+	GetStatus(ctx context.Context, node, upid string) (*sdktasks.Status, error)
+}
+
+var _ taskStatusGetter = sdktasks.Service(nil)
+
 // StemcellMaxWait is the task timeout for stemcell upload + create_vm
 // import-from operations, which may include qcow2->raw format conversion
 // on LVM/ZFS storages.
@@ -79,6 +90,14 @@ func AwaitTask(ctx context.Context, c Client, node, upid string, opts ...AwaitOp
 	}
 	if upid == "" {
 		return cpierrors.Cloud("AwaitTask: upid must not be empty")
+	}
+
+	// §7.28: when progress-aware adaptive polling is enabled, run the CPI-owned
+	// loop. It is byte-equivalent in cadence for tasks that report no progress
+	// (falls back to the fixed interval) and tightens polling for long ops
+	// (clone, move-disk) that do report progress.
+	if adaptivePollEnabled.Load() {
+		return awaitTaskAdaptive(ctx, c, node, upid, opts...)
 	}
 
 	// Resolve the poll cadence from the process-wide (operator-configurable)
@@ -145,6 +164,124 @@ func AwaitTask(ctx context.Context, c Client, node, upid string, opts ...AwaitOp
 	}
 
 	return nil
+}
+
+// adaptiveTaskPollBounds are the clamp on the progress-derived poll interval.
+const (
+	adaptivePollMinInterval = 1 * time.Second
+	adaptivePollMaxInterval = 10 * time.Second
+)
+
+// adaptiveTaskInterval derives the next poll interval from how long the task has
+// been running and its reported progress, using vSphere's estimator: the
+// projected remaining time (elapsed/progress − elapsed) divided by 5, clamped to
+// [1s, 10s]. PVE reports progress in [0,1]; a value in (1,100] (some operations
+// report a percentage) is normalized by /100. When progress is non-positive (no
+// estimate available) the fixed fallback interval is returned instead.
+func adaptiveTaskInterval(elapsed time.Duration, progress float64, fallback time.Duration) time.Duration {
+	if progress > 1 {
+		progress /= 100
+	}
+	if progress <= 0 {
+		return fallback
+	}
+	if progress > 1 {
+		progress = 1
+	}
+	eta := time.Duration(float64(elapsed) / progress)
+	next := (eta - elapsed) / 5
+	if next < adaptivePollMinInterval {
+		return adaptivePollMinInterval
+	}
+	if next > adaptivePollMaxInterval {
+		return adaptivePollMaxInterval
+	}
+	return next
+}
+
+// awaitTaskAdaptive is the §7.28 progress-aware poll loop. It mirrors AwaitTask's
+// terminal/error classification exactly:
+//   - terminal "stopped" with exit OK/ok/"" or a WARNINGS status → nil
+//   - terminal "stopped" with any other exit → non-retriable CloudError
+//   - poll deadline exceeded while still running → retriable (task still running)
+//   - ctx cancelled → retriable
+//   - not-found task → non-retriable (preserves IsNotFound)
+//   - other transient read errors → retried until the deadline
+//
+// The per-iteration sleep is the progress-derived interval (adaptiveTaskInterval)
+// with the fixed cadence as fallback; the WithTestBackoff seam overrides it so
+// tests poll instantly.
+func awaitTaskAdaptive(ctx context.Context, c Client, node, upid string, opts ...AwaitOption) error {
+	intervalMs, _, _ := taskPollDefaults()
+	ao := &awaitOptions{pollIntervalMs: intervalMs, maxWaitSeconds: defaultMaxWaitSeconds}
+	for _, opt := range opts {
+		opt(ao)
+	}
+	fallback := time.Duration(ao.pollIntervalMs) * time.Millisecond
+
+	actx, cancel := context.WithTimeout(ctx, time.Duration(ao.maxWaitSeconds)*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	for attempt := 0; ; attempt++ {
+		status, err := c.Tasks().GetStatus(actx, node, upid)
+		switch {
+		case err != nil:
+			if ctx.Err() != nil {
+				return cpierrors.WrapAs(ctx.Err(), cpierrors.TypeRetriableCloud,
+					fmt.Sprintf("AwaitTask %s: context cancelled", upid))
+			}
+			if actx.Err() != nil {
+				return cpierrors.WrapAs(
+					fmt.Errorf("task %s: poll timeout — task still running", upid),
+					cpierrors.TypeRetriableCloud,
+					fmt.Sprintf("task %s: poll timeout — task still running", upid))
+			}
+			if IsNotFound(err) {
+				return wrapPollError(err, upid)
+			}
+			// Transient read fault: fall through and retry until the deadline.
+		case status == nil:
+			return cpierrors.Cloud("AwaitTask %s: nil status returned from task service", upid)
+		case status.Status == taskStatusStopped:
+			return classifyTaskExit(upid, status.ExitStatus, status.Warned)
+		}
+
+		var d time.Duration
+		if status != nil {
+			d = adaptiveTaskInterval(time.Since(start), status.Progress, fallback)
+		} else {
+			d = fallback
+		}
+		if override := backoffFromCtx(ctx); override != nil {
+			d = override(attempt)
+		}
+
+		select {
+		case <-ctx.Done():
+			return cpierrors.WrapAs(ctx.Err(), cpierrors.TypeRetriableCloud,
+				fmt.Sprintf("AwaitTask %s: context cancelled", upid))
+		case <-actx.Done():
+			return cpierrors.WrapAs(
+				fmt.Errorf("task %s: poll timeout — task still running", upid),
+				cpierrors.TypeRetriableCloud,
+				fmt.Sprintf("task %s: poll timeout — task still running", upid))
+		case <-time.After(d):
+		}
+	}
+}
+
+// taskStatusStopped is the PVE task status string for a finished task.
+const taskStatusStopped = "stopped"
+
+// classifyTaskExit maps a terminal task's exit status to the CPI result, mirroring
+// AwaitTask: OK/ok/"" or a WARNINGS status is success; anything else is a
+// non-retriable failure.
+func classifyTaskExit(upid, exit string, warned bool) error {
+	if warned || exit == "" || exit == "OK" || exit == "ok" {
+		return nil
+	}
+	return cpierrors.Cloud("task %s failed: exit status %q", upid, exit)
 }
 
 // wrapPollError maps a task poll SDK error to the appropriate CPI error type.
