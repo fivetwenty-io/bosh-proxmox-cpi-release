@@ -7,13 +7,6 @@ report covered, confirm which earlier recommendations have shipped, and rank the
 capabilities still worth adding — with a PVE-specific rationale and a concrete
 build approach for each.
 
-This supersedes `docs/cpi-comparison-and-roadmap.md`. That report compared against
-two reference CPIs (AWS, vSphere) and recommended a Tier 1–4 roadmap; most of its
-Tier 1–3 items have since been implemented. This report widens the comparison to
-six reference CPIs, records what shipped, and identifies the next layer of genuinely
-missing capability — including a new class of latent multi-node coupling bugs that
-the newly shipped placement intelligence introduced.
-
 ## 1. Reference Set and Method
 
 Six reference CPIs were inventoried in depth (real handler source, not just READMEs),
@@ -56,45 +49,6 @@ The §3 matrix gained one correction (Azure `update_disk` is a full method, now 
 process-level panic recovery (§7.4) is *not* unique to OpenStack-Go (Google has it too). The
 remainder of this summary is the original framing that motivated §7.1–§7.25, retained for
 provenance.
-
-**The prior roadmap largely succeeded.** Of its eight ranked items, the entire Tier 1
-and most of Tier 3 have shipped: live node scoring at `create_vm`, BOSH-group
-anti-affinity via PVE HA rules, AZ-to-node mapping, pre-create IP-conflict detection,
-per-VM/per-NIC firewall with security groups, dispatcher hook middleware, and — beyond
-the original scope — opt-in PVE 9.2 Dynamic Load Balancer (CRS) integration. By method
-count and by depth of resiliency infrastructure, the PVE CPI now equals or exceeds
-every CPI in the reference set in several areas (error taxonomy, retry curves, clone
-intelligence, three stemcell modes, three agent-delivery modes).
-
-**The widened comparison surfaces three findings the two-CPI study could not:**
-
-1. **The new placement intelligence introduced a class of latent multi-node coupling
-   bugs.** Live scoring, anti-affinity, and DLB all move a VM to a node chosen at
-   create time — but three other subsystems still assume the create-time node is
-   fixed and reachable: the stemcell template lives on a single node, persistent disks
-   on node-local storage are pinned to their creation node, and the scorer has no
-   notion of a node being drained for maintenance. On a multi-node cluster with
-   node-local storage (the documented lab topology), each of these turns the placement
-   feature into a correctness bug. Closing them is the headline of this report.
-
-2. **The shipped IP-conflict detector covers the easier half of the failure it was
-   built for.** It scans static `ipconfig{N}` entries only; its own source comments
-   note it "cannot detect DHCP-assigned addresses" and does not see physical hosts or
-   non-PVE devices. The documented CF NATS-churn incident was caused by exactly that
-   uncovered half — a BOSH VM IP that also answered ARP from a physical device on the
-   shared LAN. An active ARP/guest-agent probe closes the class.
-
-3. **Structural-safety primitives that every robust CPI has are still absent.** There
-   is no `recover()` anywhere in the dispatch path (a handler panic becomes an opaque
-   non-zero exit with no typed error, no `request_id`, no method context), and no
-   per-operation timeout envelope (the documented wedged-task incident — an
-   un-cancellable poll holding a director queue slot forever — is exactly what a
-   deadline would convert into a retriable error).
-
-The highest-value work is therefore **not** new breadth. It is closing the multi-node
-coupling bugs the new placement features created, adding the active IP probe that
-finishes the job the static detector started, and installing the two missing
-structural-safety primitives (panic recovery, operation deadlines).
 
 ## 3. Method Implementation Matrix
 
@@ -1424,95 +1378,7 @@ clean.
 | In-process distributed tracing (OTel/Jaeger) | (none ship it) | A single-shot per-RPC CLI has no long-lived span; `request_id` is the correct correlation point. |
 | First-class metrics/telemetry pipeline | Azure, vSphere | Wrong layer; BOSH (bosh-monitor, Prometheus) owns this. Offer as an optional hook only. |
 
-## 8. Consolidated Prioritized Roadmap
-
-```mermaid
-graph TD
-    subgraph T1["Tier 1 — correctness & safety"]
-        A1[Maintenance/unhealthy-node exclusion]
-        A2[Per-node template replication]
-        A3[VM-disk fault-domain co-location]
-        A4[Panic recovery in dispatch]
-        A5[Active IP probe ARP/guest-agent]
-        A6[Stemcell checksum verification]
-    end
-    subgraph T2["Tier 2 — operability"]
-        B1[CID-encoded stickiness]
-        B2[Layered cloud_properties]
-        B3[Disk performance options]
-        B4[Multi-AZ fallback]
-        B5[Retryability boundary audit]
-        B6[Post-boot health gate]
-        B7[Stemcell provenance + GC]
-        B8[VIP ipfilter / allowed-address-pairs]
-    end
-    subgraph T3["Tier 3 — integration & hardening"]
-        C1[Operation timeout envelope]
-        C2[PVE pushback / 429 / in-flight cap]
-        C3[Fail-fast config validation]
-        C4[Static-IP range + DNS audit]
-        C5[LB hook + rollback contract]
-        C6[Keep-failed-VM mode]
-        C7[Positive node-affinity HA pin]
-        C8[Agent mode auto-select]
-        C9[Placement retryability signal]
-        C10[Root/ephemeral sizing]
-        C11[Configurable retry policy]
-    end
-    subgraph T4["Tier 4 — shipped this round"]
-        D1[7.26 Disk-perf invariant enforce]
-        D2[7.27 Resize completion monitor]
-        D3[7.28 Adaptive task-poll]
-        D4[7.29 Boot-path agent integrity]
-        D11[7.32 Fast-path delete]
-    end
-    subgraph OPEN["Still open"]
-        D5[7.30 API connection-pool tuning]
-        D6[7.31 Post-selection fallback]
-        D8[7.33 Idempotency-collision model]
-        D9[7.34 Network-property override]
-        D10[7.35 Multipart stemcell upload]
-    end
-    B1 --> A3
-    A2 --> A3
-    B2 --> B3
-    B2 --> C10
-    C1 --> C2
-    B3 --> D1
-    C10 --> D2
-    C11 --> D3
-    C2 --> D5
-    B4 --> D6
-    C1 --> D7
-    B6 --> D4
-    B2 --> D9
-```
-
-The OPEN cluster shows each new gap hanging off the shipped work it extends: the
-disk-performance invariant (7.26) and resize monitor (7.27) build on disk performance (7.9)
-and root/ephemeral sizing (7.24); adaptive polling (7.28) and connection-pool tuning (7.30)
-build on the retry policy (7.25) and pushback handling (7.16) and are the two pre-timing-pass
-mitigations for the scale risk in §11; fast-path delete (7.32) is the skip-the-wait
-complement to the bound-the-wait timeout envelope (7.15); post-selection fallback (7.31)
-extends multi-AZ fallback (7.10); the network-property override (7.34) extends the layered
-resolver (7.8); boot-path agent integrity (7.29) extends the post-boot health gate (7.12).
-
-**Sequencing notes.**
-
-- **Tier 1 is a coherent unit, not a menu.** Items 7.1–7.3 close the multi-node coupling
-  bugs the placement features created; 7.4–7.6 install missing safety primitives. The
-  CID-encoding work (7.7) is a prerequisite for the disk fault-domain fix (7.3), so it is
-  worth pulling forward from Tier 2 and doing alongside Tier 1.
-
-- **The layered resolver (7.8) is a keystone.** Disk performance options (7.9),
-  root/ephemeral sizing (7.24), and richer perf properties all read through it; building
-  it first makes the rest small additions.
-
-- **Disk performance options (7.9) is the best effort-to-value ratio in the report** —
-  one `AttachOpts.Extra` field, native PVE/QEMU support, and it covers `discard` (thin-pool
-  space reclaim), `iothread` (throughput), and IO throttling (noisy-neighbor defense).
-
-## 9. Cross-CPI Engineering Lessons
+## 8. Cross-CPI Engineering Lessons
 
 These are the transferable principles behind the specific gaps — the "why," distilled from
 reading six mature CPIs against this one. They are worth keeping in view independent of any
