@@ -19,7 +19,7 @@ func TestAuditLogHook_OkPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("logger: %v", err)
 	}
-	h := hooks.NewAuditLogHook(logger)
+	h := hooks.NewAuditLogHook(hooks.Deps{Logger: logger})
 
 	ctx := h.Before(context.Background(), "create_vm", nil, jsonrpc.Context{})
 	res, e := h.After(ctx, "create_vm", "result", nil)
@@ -38,7 +38,7 @@ func TestAuditLogHook_OkPath(t *testing.T) {
 func TestAuditLogHook_ErrorPath(t *testing.T) {
 	var buf bytes.Buffer
 	logger, _ := log.NewLogger("info", &buf)
-	h := hooks.NewAuditLogHook(logger)
+	h := hooks.NewAuditLogHook(hooks.Deps{Logger: logger})
 
 	wantErr := cpierrors.Cloud("boom")
 	ctx := h.Before(context.Background(), "create_vm", nil, jsonrpc.Context{})
@@ -69,7 +69,13 @@ func TestRegistry_AuditLogKnown(t *testing.T) {
 		t.Error("Registry[audit_log] constructor must be non-nil")
 	}
 	names := hooks.Names()
-	if len(names) != 1 || names[0] != "audit_log" {
-		t.Errorf("Names() = %v; want [audit_log]", names)
+	want := []string{"audit_log", "external_command", "lb_register", "notes_audit"}
+	if len(names) != len(want) {
+		t.Fatalf("Names() = %v; want %v", names, want)
+	}
+	for i, w := range want {
+		if names[i] != w {
+			t.Errorf("Names()[%d] = %q; want %q (full: %v)", i, names[i], w, names)
+		}
 	}
 }

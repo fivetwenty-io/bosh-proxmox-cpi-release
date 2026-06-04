@@ -4,15 +4,19 @@ import (
 	"sort"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/cpi"
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
 )
 
 // Registry maps each built-in hook name to its constructor. Config validation
 // (internal/config) rejects any pve.hooks entry absent from this map, and
 // cmd/cpi/main.go resolves configured names through it when building the
-// dispatcher. Adding a hook means adding one entry here.
-var Registry = map[string]func(*log.Logger) cpi.Hook{
-	"audit_log": NewAuditLogHook,
+// dispatcher. Adding a hook means adding one entry here. Each constructor takes
+// a Deps so config-driven hooks (lb_register, external_command) read their
+// sub-block; observe-only hooks (audit_log) use only Deps.Logger.
+var Registry = map[string]func(Deps) cpi.Hook{
+	"audit_log":        NewAuditLogHook,
+	"notes_audit":      NewNotesAuditHook,
+	"lb_register":      NewLBRegisterHook,
+	"external_command": NewExternalCommandHook,
 }
 
 // Known reports whether name is a registered built-in hook.

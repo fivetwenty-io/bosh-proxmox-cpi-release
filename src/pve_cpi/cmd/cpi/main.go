@@ -152,6 +152,12 @@ func runWithArgs(args []string, stdin io.Reader, stdout, stderr io.Writer, opts 
 
 	// Resolve configured middleware hooks via the registry. config.Validate has
 	// already rejected unknown names, so a miss here is defensive only.
+	hookDeps := hooks.Deps{
+		Logger:          logger,
+		LBRegister:      cfg.LBRegisterConfig(),
+		ExternalCommand: cfg.ExternalCommandConfig(),
+		Annotator:       handlers.NewVMAnnotator(handlers.Deps{Config: cfg, PVE: client, Logger: logger}),
+	}
 	var hookChain []cpi.Hook
 	for _, name := range cfg.HooksValue() {
 		ctor, ok := hooks.Registry[name]
@@ -159,7 +165,7 @@ func runWithArgs(args []string, stdin io.Reader, stdout, stderr io.Writer, opts 
 			logger.Error("unknown hook configured", log.String("hook", name))
 			return 1
 		}
-		hookChain = append(hookChain, ctor(logger))
+		hookChain = append(hookChain, ctor(hookDeps))
 	}
 
 	// Apply the operator's task-poll cadence process-wide before serving. With

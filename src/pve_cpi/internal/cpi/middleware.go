@@ -3,6 +3,7 @@ package cpi
 import (
 	"context"
 	"encoding/json"
+	"time"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
 )
@@ -56,18 +57,41 @@ var _ Hook = HookFunc{}
 // identical to an unhooked dispatch. Before callbacks fire in slice order
 // (outer-to-inner); After callbacks fire in reverse (inner-to-outer), so hooks
 // nest like conventional middleware.
+//
+// For create_vm specifically, WrapHandler installs a rollback holder into the
+// context before invoking the handler, then checks whether a post-hook (After)
+// introduced a new error after the handler itself succeeded. When
+// handlerErr==nil && err!=nil (hook turned success into failure), fireRollback
+// is called on a cancellation-detached context so cleanup completes even when
+// the caller's context has been cancelled. This prevents an orphaned VM when a
+// post-hook (e.g. stemcell provenance, HA membership) fails after the VM is
+// already committed — without double-cleanup with the handler's own defer.
 func WrapHandler(method string, inner Handler, hooks []Hook) Handler {
 	if len(hooks) == 0 {
 		return inner
 	}
 	return HandlerFunc(func(ctx context.Context, args []json.RawMessage, reqCtx jsonrpc.Context) (any, error) {
+		ctx = withRollbackHolder(ctx)
 		for _, h := range hooks {
 			ctx = h.Before(ctx, method, args, reqCtx)
 		}
-		result, err := inner.Handle(ctx, args, reqCtx)
+		result, handlerErr := inner.Handle(ctx, args, reqCtx)
+		err := handlerErr
 		for i := len(hooks) - 1; i >= 0; i-- {
 			result, err = hooks[i].After(ctx, method, result, err)
+		}
+		if method == "create_vm" && handlerErr == nil && err != nil {
+			// Detach from the caller's cancellation so a Director-cancelled call
+			// still cleans up, but apply a bounded deadline so a wedged PVE
+			// during rollback cannot hang the dispatch indefinitely.
+			rbCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), rollbackCleanupTimeout)
+			fireRollback(rbCtx)
+			cancel()
 		}
 		return result, err
 	})
 }
+
+// rollbackCleanupTimeout bounds the post-hook rollback cleanup so a wedged PVE
+// API cannot hang dispatch indefinitely while detached from the caller context.
+const rollbackCleanupTimeout = 2 * time.Minute

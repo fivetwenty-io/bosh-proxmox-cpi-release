@@ -110,6 +110,16 @@ func HandleDeleteVM(deps Deps) cpi.Handler {
 			}
 		}
 
+		// --- HA node-affinity pin cleanup (opt-in: placement.pin_az_via_ha_rules) ---
+		// Remove the per-VM node-affinity pin rule and deregister its HA resource.
+		// Keyed on vmid; idempotent and best-effort. Safe alongside the
+		// anti-affinity cleanup above (both tolerate a not-found HA resource).
+		if deps.Config.HANodeAffinityPinEnabled() {
+			if pinErr := removeNodeAffinityPin(ctx, deps, vmid, logger); pinErr != nil {
+				logger.Warn("delete_vm: HA node-affinity pin cleanup incomplete (non-fatal)", log.Err(pinErr))
+			}
+		}
+
 		// --- delete VM ---
 		// Purge removes VMID from backup/HA/replication configs.
 		// DestroyUnreferencedDisks removes orphaned volumes from storage.

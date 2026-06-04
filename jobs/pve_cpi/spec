@@ -420,11 +420,98 @@ properties:
     description: |
       Optional list of built-in dispatch middleware hooks to activate, applied
       in listed order. Each entry must be a known hook name; an unknown name
-      fails CPI startup. Currently the only built-in hook is "audit_log", which
-      logs each CPI method call with its duration and outcome (it does not log
-      argument content). When empty (default), no middleware runs and there is
-      zero per-call overhead. Example: [audit_log]
+      fails CPI startup. Built-in hooks: "audit_log" (logs each CPI call's
+      duration and outcome, never argument content); "notes_audit" (writes the
+      BOSH deploy identity into the VM's PVE Notes after create_vm);
+      "lb_register" (registers/deregisters the VM in an HAProxy backend via the
+      Data Plane API on create_vm/delete_vm — requires the lb_register block);
+      "external_command" (runs an allowlisted host command on selected methods —
+      requires the external_command block). When empty (default), no middleware
+      runs and there is zero per-call overhead. Example: [audit_log]
     default: []
+  pve.lb_register.endpoint:
+    description: |
+      HAProxy Data Plane API base URL (e.g. https://lb.example:5555). Required
+      when "lb_register" is listed in pve.hooks. Registration is best-effort: a
+      Data Plane API failure is logged and never fails the CPI call.
+    default: ""
+  pve.lb_register.backend:
+    description: |
+      HAProxy backend name that VMs are added to and removed from. Required when
+      "lb_register" is listed in pve.hooks.
+    default: ""
+  pve.lb_register.port:
+    description: |
+      Server port registered for each VM in the HAProxy backend (e.g. the Cloud
+      Foundry router port). Default 0 leaves the port unset on the server entry.
+    default: 0
+  pve.lb_register.user:
+    description: |
+      HAProxy Data Plane API basic-auth username.
+    default: ""
+  pve.lb_register.password:
+    description: |
+      HAProxy Data Plane API basic-auth password.
+    default: ""
+  pve.lb_register.ca_cert:
+    description: |
+      Optional PEM-encoded CA certificate (or chain) that pins the HAProxy Data
+      Plane API server certificate. When empty, the system trust store is used.
+    default: ""
+  pve.lb_register.allow_private_ip:
+    description: |
+      When false (default), an endpoint resolving to a private or loopback
+      address is rejected (SSRF guard). Set true only for a Data Plane API on a
+      trusted private network.
+    default: false
+  pve.lb_register.timeout_ms:
+    description: |
+      Per-call timeout in milliseconds for HAProxy Data Plane API requests. Zero
+      (default) applies a built-in 10 s default.
+    default: 0
+  pve.external_command.command:
+    description: |
+      Absolute path of the executable to run. Must also appear in
+      external_command.allowlist. Required when "external_command" is in
+      pve.hooks. The command runs with no shell, a scrubbed environment, and a
+      timeout; arguments are passed verbatim as discrete argv.
+    default: ""
+  pve.external_command.args:
+    description: |
+      Arguments passed verbatim to the command as discrete argv (no shell
+      interpretation). The CPI also injects CPI_METHOD and CPI_VMID into the
+      scrubbed environment.
+    default: []
+  pve.external_command.allowlist:
+    description: |
+      Allowlist of absolute executable paths permitted to run. Must be non-empty
+      and contain external_command.command. An empty allowlist makes the hook
+      inert (it never executes anything).
+    default: []
+  pve.external_command.env_passlist:
+    description: |
+      Names of environment variables passed through from the CPI process to the
+      child. Everything else is scrubbed; the child does not inherit the CPI
+      environment.
+    default: []
+  pve.external_command.timeout_ms:
+    description: |
+      Per-invocation timeout in milliseconds. Zero (default) applies a built-in
+      30 s default. The child process is killed when the deadline passes.
+    default: 0
+  pve.external_command.methods:
+    description: |
+      CPI methods that trigger the command. Empty (default) runs it on create_vm
+      and delete_vm.
+    default: []
+  pve.debug.keep_failed_vms:
+    description: |
+      Diagnostic mode. When true, a VM that fails mid-creation is NOT destroyed.
+      Instead it is tagged "bosh-create-failed" (plus the deployment/job derived
+      from the BOSH env) and create_vm returns an error naming the VMID and node,
+      leaving the VM intact for post-mortem. This deliberately breaks the normal
+      no-orphan guarantee, so it is for debugging only. Default false (opt-in).
+    default: false
   pve.placement.anti_affinity.strict:
     description: |
       When true, the PVE HA negative resource-affinity rule created by
@@ -510,6 +597,23 @@ properties:
       preserved (deterministic). Set to true to distribute VMs across AZs
       non-deterministically.
     default: false
+  pve.placement.pin_az_via_ha_rules:
+    description: |
+      When true and placement.az_map is set, create_vm writes a PVE HA
+      node-affinity rule binding each VM to its AZ's node set after scoring, so
+      the AZ placement is durable across HA failover and DLB rebalance (scoring
+      alone only pins the VM at creation). delete_vm removes the rule. Best-effort
+      and non-fatal. Incompatible with the DLB sentinel AZ (rejected at config
+      validation, since DLB intentionally un-pins guests). Default false (opt-in).
+    default: false
+  pve.placement.pin_az_strict:
+    description: |
+      Controls the strictness of the rule created by pin_az_via_ha_rules. Default
+      true: a strict rule is a hard AZ guarantee — HA will not relocate the VM off
+      its AZ node set even if every AZ node is down (durability of locality over
+      availability). Set false for a preferred pin that lets HA relocate off-AZ on
+      total AZ failure. Ignored when pin_az_via_ha_rules is false.
+    default: true
   pve.stemcell_replicate_local:
     description: |
       When true, create_stemcell uploads the stemcell qcow2 independently to every

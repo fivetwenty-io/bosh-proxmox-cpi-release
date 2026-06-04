@@ -657,7 +657,7 @@ domain from the network's `search_domain`/`dns_search`/`domain` cloud property w
 (omitted otherwise, byte-identical). A manual network with a static IP but no gateway is
 logged as a warning rather than silently accepted.
 
-#### 7.19 External LB registration hook and expanded hook catalog with rollback contract
+#### 7.19 DONE — External LB registration hook and expanded hook catalog with rollback contract
 
 *References: vSphere, AWS, OpenStack-Go, Google, Azure, Alicloud.* All six reference CPIs
 register VMs into an LB at create and deregister at delete. PVE has no native LB
@@ -677,7 +677,24 @@ best-effort), a notes-audit hook writing deploy/job/index into guest Notes for P
 visibility, and an allowlisted `external_command` hook (the right vehicle for the
 not-recommended VIP/LB/IPAM items); (3) keep the static registry + config-name validation.
 
-#### 7.20 Keep-failed-VM diagnostic mode
+**Shipped.** The dispatch middleware now carries a rollback contract: a `create_vm`
+post-hook that turns success into a failure triggers cleanup of the just-created VM before
+the error propagates, closing the orphan window the audit-only hook framework left open.
+Cleanup is a stack — each participant registers its own undo — so a post-hook failure
+unwinds both the VM teardown and any LB registration. The rollback path is panic-safe and
+fires at most once, never double-cleaning with the handler's own failure defer. Three
+built-in hooks ship: `notes_audit` writes the BOSH deploy identity into the guest Notes for
+PVE-UI visibility; `lb_register` registers and deregisters the VM in an HAProxy backend via
+the Data Plane API (best-effort, with a dial-time private-IP guard and redirect blocking,
+and a deregister-on-rollback so a rolled-back create never leaves a stale backend entry);
+and `external_command` runs an operator-allowlisted host command with no shell, an
+absolute-path allowlist resolved through symlinks, a scrubbed environment, a timeout, and
+process-group kill. Each hook's config is validated at start-up (an active `lb_register`
+requires an endpoint and backend; an active `external_command` requires a non-empty
+absolute-path allowlist containing the command). All hooks are opt-in and omitted from the
+rendered config when unset, so an existing manifest is byte-identical.
+
+#### 7.20 DONE — Keep-failed-VM diagnostic mode
 
 *Reference: Azure.* `create_vm` always rolls back, correct for production but destructive
 of the evidence operators need to debug the wedged-pre-start and dead-agent failures this
@@ -688,7 +705,19 @@ resource-listing error for post-mortem.
 (`bosh-create-failed` plus director/deployment/job via the existing tag sync) and return
 an error naming VMID + node instead of destroying it.
 
-#### 7.21 Positive node-affinity HA pin (durable AZ guarantee)
+**Shipped.** An opt-in `debug.keep_failed_vms` flag gates the post-clone rollback. When set,
+a VM that fails mid-creation is preserved instead of destroyed: it is tagged
+`bosh-create-failed` plus the deployment and instance group derived from the BOSH env
+(merged into the VM's existing tags rather than overwriting them), and `create_vm` returns a
+non-retriable error naming the VMID and node — non-retriable so the director does not
+re-create and strand a second failed VM. Only the final post-clone rollback is gated; the
+per-attempt cleanups inside the VMID-allocation retry loop still destroy their throwaway
+attempts, so the mode preserves exactly one VM. The gate also honors the post-hook rollback
+and panic paths, and it composes with the LB hook (a preserved-but-failed VM is still pulled
+from the load balancer so it stops receiving traffic). Default off — byte-identical to prior
+releases.
+
+#### 7.21 DONE — Positive node-affinity HA pin (durable AZ guarantee)
 
 *References: vSphere, Google.* Only negative resource-affinity is built; the AZ map pins
 placement at create time only and does not survive HA failover or DLB rebalance — a VM
@@ -700,6 +729,21 @@ locality deployments needing a durable AZ guarantee.
 scoring create a PVE HA node-affinity rule binding the VM to the AZ node set, reusing the
 existing HA-rule plumbing; self-clean on delete; reject the node-affinity + DLB-sentinel-AZ
 combination at config-validate time (DLB intentionally un-pins).
+
+**Shipped.** When `placement.pin_az_via_ha_rules` is enabled and an AZ map is set, create_vm
+writes a per-VM PVE HA node-affinity rule (`bosh-na-<vmid>`, distinct from the anti-affinity
+`bosh-aa-` rules) binding the VM to its AZ's node set after scoring, so the AZ placement
+survives HA failover and DLB rebalance. The pinned AZ is derived from the node the scorer
+actually chose, so it works for both the singular `availability_zone` and the plural
+`availability_zones` forms. Strictness is operator-selectable via `placement.pin_az_strict`
+(default true — a hard AZ guarantee that keeps the VM on its node set even under total
+node-set failure; set false for a preferred pin that lets HA relocate off-AZ). The rule and
+its HA resource self-clean on delete and on any create_vm rollback. Config validation
+rejects the pin without an AZ map and the pin combined with the DLB sentinel AZ (DLB
+intentionally un-pins), and the runtime additionally skips pinning for the sentinel AZ.
+Best-effort and non-fatal: a pin failure is logged, never failing create_vm, since the VM is
+already on a correct AZ node from scoring. Default off — byte-identical when unset. Live PVE
+9 validation of the `node-affinity` rule type is pending.
 
 #### 7.22 Agent registry-less auto-selection and settings-completeness assertion
 

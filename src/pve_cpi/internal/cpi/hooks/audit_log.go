@@ -32,10 +32,11 @@ type AuditLogHook struct {
 	logger *log.Logger
 }
 
-// NewAuditLogHook constructs an AuditLogHook bound to logger. It matches the
-// hooks.Registry constructor signature.
-func NewAuditLogHook(logger *log.Logger) cpi.Hook {
-	return &AuditLogHook{logger: logger}
+// NewAuditLogHook constructs an AuditLogHook bound to Deps.Logger. It matches
+// the hooks.Registry constructor signature; it ignores all other Deps fields
+// because it observes only.
+func NewAuditLogHook(d Deps) cpi.Hook {
+	return &AuditLogHook{logger: d.Logger}
 }
 
 var _ cpi.Hook = (*AuditLogHook)(nil)

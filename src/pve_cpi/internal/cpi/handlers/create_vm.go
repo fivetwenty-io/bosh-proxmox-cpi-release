@@ -314,14 +314,20 @@ func createVM(
 		vmName = fmt.Sprintf("vm-%d", vmid)
 	}
 
-	// Arm rollback for stages 4b–8: any failure after this point destroys
-	// the winning VM.
+	// Arm rollback for stages 4b–8: any failure after this point destroys the
+	// winning VM. See rollbackOnExit for the error-path and panic-path handling.
 	vmCreated := true
-	defer func() {
-		if retErr != nil && vmCreated {
-			cleanupVM(contextWithoutCancel(ctx), deps, shape.node, vmid, logger)
-		}
-	}()
+	defer rollbackOnExit(ctx, deps, shape.node, vmid, parsed.env, logger, &vmCreated, &retErr)
+
+	// Register a middleware-level rollback so that post-hooks (After callbacks
+	// in WrapHandler) can trigger cleanup when they flip a nil handler error
+	// to non-nil. fireRollback is idempotent and only fires when handlerErr==nil,
+	// so this never double-fires with the defer above (which guards on retErr!=nil).
+	// Honors keep_failed_vms: a post-hook failure preserves+tags the VM instead
+	// of destroying it, matching the handler-failure path.
+	cpi.RegisterRollback(ctx, func(c context.Context) {
+		disposeFailedVM(c, deps, shape.node, vmid, parsed.env, logger)
+	})
 
 	logger.Info("create_vm: vm created and disk imported",
 		log.Int(metadataKeyVMID, vmid),
@@ -450,6 +456,19 @@ func createVM(
 			}
 		}
 	}
+
+	// -----------------------------------------------------------------------
+	// 9b. AZ node-affinity HA pin (opt-in: placement.pin_az_via_ha_rules).
+	//
+	// After scoring placed the VM on a node within its AZ, write a PVE HA
+	// node-affinity rule binding it to the AZ node set, so the AZ placement is
+	// durable across HA failover and DLB rebalance (scoring alone only pins at
+	// birth). Best-effort and non-fatal: a failure is logged and never fails
+	// create_vm — the VM is already on a correct AZ node; only the durability
+	// layer is affected. The DLB sentinel AZ is skipped (DLB intentionally
+	// un-pins guests); config validation also rejects that combination.
+	// -----------------------------------------------------------------------
+	applyAZNodeAffinityPin(ctx, deps, vmid, parsed.cloudProps, shape.node, logger)
 
 	// -----------------------------------------------------------------------
 	// 10. PVE Dynamic Load Balancer membership (opt-in: placement.dlb).
@@ -2772,6 +2791,99 @@ func startVMAndReadConfig(
 	return buildResponseNetworks(parsed.networks, netNames, vmCfg), nil
 }
 
+// rollbackOnExit is createVM's deferred cleanup for the post-allocation stages.
+// It destroys the just-created VM when createVM returns an error (*retErr set)
+// or panics, so a failed create never leaks a VM. On panic it cleans up and
+// re-panics so the dispatcher's recover still maps the panic to a CPI error —
+// Go does not assign the named return on a panic unwind, so the *retErr guard
+// alone would miss the panic path. vmCreated and retErr are read through
+// pointers because both are still mutating when the defer is registered.
+//nolint:gocritic // retErr and vmCreated are pointers by necessity: this is a
+// deferred guard that must observe createVM's final named-return error and the
+// latest vmCreated value, both still mutating when the defer is registered.
+func rollbackOnExit(
+	ctx context.Context, deps Deps, node string, vmid int, env map[string]any,
+	logger *log.Logger, vmCreated *bool, retErr *error,
+) {
+	if r := recover(); r != nil {
+		if *vmCreated {
+			disposeFailedVM(contextWithoutCancel(ctx), deps, node, vmid, env, logger)
+		}
+		panic(r)
+	}
+	if *retErr != nil && *vmCreated {
+		if deps.Config.KeepFailedVMsEnabled() {
+			tagFailedVM(contextWithoutCancel(ctx), deps, node, vmid, env, logger)
+			*retErr = preserveFailedVMError(*retErr, vmid, node)
+			return
+		}
+		cleanupVM(contextWithoutCancel(ctx), deps, node, vmid, logger)
+	}
+}
+
+// disposeFailedVM either preserves (keep-failed mode) or destroys a VM that is
+// being abandoned on the panic path. On the panic path retErr is not assigned,
+// so the caller re-panics afterward; here we only need to tag-or-destroy.
+func disposeFailedVM(ctx context.Context, deps Deps, node string, vmid int, env map[string]any, logger *log.Logger) {
+	if deps.Config.KeepFailedVMsEnabled() {
+		tagFailedVM(ctx, deps, node, vmid, env, logger)
+		return
+	}
+	cleanupVM(ctx, deps, node, vmid, logger)
+}
+
+// tagFailedVM marks a VM that failed mid-creation with "bosh-create-failed"
+// plus the deployment/job derived from env, so an operator can find it in the
+// PVE UI. Existing tags (operator custom tags stamped at create) are preserved:
+// PVE's Tags field is full-replace, so the current tags are read and merged
+// rather than overwritten. It is best-effort: a tagging failure is logged, never
+// propagated — the create error is what matters. The VM is left running, intact.
+func tagFailedVM(ctx context.Context, deps Deps, node string, vmid int, env map[string]any, logger *log.Logger) {
+	entries := []string{"bosh-create-failed"}
+	// instanceGroupName falls back to the env.bosh.instance name on the
+	// create-env path (where env.bosh.group is absent), so a failed bootstrap VM
+	// still gets a job tag.
+	job := instanceGroupName(env)
+	if deployment := sanitizeTagValue(extractDeploymentFromEnv(env, extractJobNameFromEnv(env))); deployment != "" {
+		entries = append(entries, "deployment--"+deployment)
+	}
+	if j := sanitizeTagValue(job); j != "" {
+		entries = append(entries, "job--"+j)
+	}
+
+	// Preserve whatever tags the VM already carries (operator custom tags set at
+	// QEMU.Create). Best-effort read: on failure we still apply the failure tag.
+	var existing []string
+	if cfg, cfgErr := deps.PVE.QEMU().Config(ctx, node, vmid); cfgErr == nil {
+		if v, ok := cfg["tags"]; ok {
+			if s, ok := v.(string); ok {
+				existing = parseTagsField(s)
+			}
+		}
+	}
+
+	tags := mergeTagList(existing, entries, maxTagLength)
+	if err := deps.PVE.Nodes().UpdateQemuConfig(ctx, node, strconv.Itoa(vmid),
+		&sdknodes.UpdateQemuConfigParams{Tags: &tags}); err != nil {
+		logger.Warn("create_vm: keep_failed_vms tag write failed (non-fatal)",
+			log.Int(metadataKeyVMID, vmid), log.String("node", node), log.Err(err))
+		return
+	}
+	logger.Info("create_vm: VM preserved for diagnostics (debug.keep_failed_vms)",
+		log.Int(metadataKeyVMID, vmid), log.String("node", node), log.String("tags", tags))
+}
+
+// preserveFailedVMError wraps the original create failure with a message naming
+// the preserved VMID and node, so the director's error clearly states the VM was
+// retained rather than destroyed. Non-retriable: a retry would re-create and
+// fail again, leaving a second preserved VM.
+func preserveFailedVMError(orig error, vmid int, node string) error {
+	return cpierrors.Cloud(
+		"create_vm: VM %d on node %q preserved for diagnostics (debug.keep_failed_vms=true); original error: %s",
+		vmid, node, orig.Error(),
+	)
+}
+
 // --------------------------------------------------------------------------
 // cleanupVM attempts to stop and purge a created VM on error. All errors are
 // logged but suppressed so the original error propagates unmodified.
@@ -2840,6 +2952,17 @@ func cleanupVM(ctx context.Context, deps Deps, node string, vmid int, logger *lo
 		if remErr := deps.Agent.Remove(ctx, node, vmid); remErr != nil {
 			logger.Warn("create_vm: rollback agent remove failed",
 				log.Int(metadataKeyVMID, vmid), log.Err(remErr))
+		}
+	}
+
+	// Remove the AZ node-affinity HA pin (bosh-na-<vmid>) and deregister its HA
+	// resource. VM purge does not GC the cluster-level HA rule, so without this
+	// a rolled-back create that reached the pin step would leave an orphan rule
+	// referencing a destroyed VM. Gated + best-effort + idempotent.
+	if deps.Config.HANodeAffinityPinEnabled() {
+		if pinErr := removeNodeAffinityPin(ctx, deps, vmid, logger); pinErr != nil {
+			logger.Warn("create_vm: rollback node-affinity pin cleanup incomplete (non-fatal)",
+				log.Int(metadataKeyVMID, vmid), log.Err(pinErr))
 		}
 	}
 }

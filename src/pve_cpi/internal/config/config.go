@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/url"
 	"os"
+	"path/filepath"
 	"reflect"
 	"regexp"
 	"strings"
@@ -355,6 +356,17 @@ type CPIConfig struct {
 	// fails config validation at startup. Use HooksValue() to read.
 	Hooks []string `json:"hooks,omitempty"`
 
+	// LBRegister configures the lb_register hook (HAProxy Data Plane API target).
+	// Required only when "lb_register" is listed in Hooks; nil otherwise. The
+	// config struct lives in internal/cpi/hooks to avoid an import cycle
+	// (internal/config already imports internal/cpi/hooks for name validation).
+	LBRegister *hooks.LBRegisterConfig `json:"lb_register,omitempty"`
+
+	// ExternalCommand configures the external_command hook (allowlisted host
+	// command). Required only when "external_command" is listed in Hooks; nil
+	// otherwise.
+	ExternalCommand *hooks.ExternalCommandConfig `json:"external_command,omitempty"`
+
 	// HealthCheck holds opt-in post-create VM health babysitting configuration.
 	// When nil (the default), or when Enabled is absent or *false, no agent
 	// ping is performed after the start task completes — behavior is byte-identical
@@ -365,6 +377,12 @@ type CPIConfig struct {
 	// Pointer-typed so a fully-absent block (nil) is cheap to detect. Accessors
 	// handle nil safely; Validate runs only when the block is present and enabled.
 	HealthCheck *HealthCheckConfig `json:"health_check,omitempty"`
+
+	// Debug holds optional diagnostic knobs that change CPI behavior to aid
+	// post-mortem investigation. Nil (the default) means all diagnostic modes
+	// are off — behavior is byte-identical to prior releases. Use the typed
+	// accessors (e.g. KeepFailedVMsEnabled).
+	Debug *DebugConfig `json:"debug,omitempty"`
 
 	// Retry groups operator-tunable retry/backoff curves. Every sub-policy is
 	// optional; an absent policy (or absent field within one) falls back to the
@@ -642,6 +660,22 @@ type PlacementConfig struct {
 	// distinguishable from explicit false. Use AZShuffleEnabled() for the effective
 	// bool.
 	AZShuffle *bool `json:"az_shuffle,omitempty"`
+
+	// PinAZViaHARules, when true and an AZMap is set, makes create_vm write a PVE
+	// HA node-affinity rule binding the VM to its AZ's node set after scoring, so
+	// the AZ placement is durable across HA failover and DLB rebalance (scoring
+	// alone only pins at birth). delete_vm removes the rule. Default false
+	// (opt-in); nil/absent means no HA pin and zero regression. Use
+	// HANodeAffinityPinEnabled().
+	PinAZViaHARules *bool `json:"pin_az_via_ha_rules,omitempty"`
+
+	// PinAZStrict controls the strictness of the node-affinity rule created by
+	// PinAZViaHARules. Default true (nil → true): a strict rule is a hard AZ
+	// guarantee — HA will not relocate the VM off its AZ node set even if every
+	// AZ node is down (durability of locality over availability). Set false for a
+	// non-strict (preferred) pin that lets HA relocate off-AZ on total AZ
+	// failure. Use PinAZStrict().
+	PinAZStrict *bool `json:"pin_az_strict,omitempty"`
 }
 
 // AntiAffinityConfig holds the Tier-2 same-group spreading knobs.
@@ -722,6 +756,18 @@ type DLBConfig struct {
 	// shared storage (rbd, nfs, cifs, glusterfs, cephfs) and the storage type
 	// cannot be determined from the PVE API at create time.
 	RequireSharedStorage *bool `json:"require_shared_storage,omitempty"`
+}
+
+// DebugConfig holds optional diagnostic knobs. All fields default to off when
+// the block or the field is absent, preserving production behavior.
+type DebugConfig struct {
+	// KeepFailedVMs, when *true, suppresses the create_vm rollback that destroys
+	// a VM after a mid-creation failure. Instead the VM is tagged
+	// "bosh-create-failed" (plus the deployment/job derived from env) and an
+	// error naming the VMID and node is returned, leaving the VM intact for
+	// post-mortem. Default false (opt-in). This is destructive of the normal
+	// no-orphan guarantee, so it is intended for debugging, not production.
+	KeepFailedVMs *bool `json:"keep_failed_vms,omitempty"`
 }
 
 // HealthCheckConfig holds opt-in post-create VM health babysitting knobs.
@@ -1182,6 +1228,27 @@ func (c *CPIConfig) AntiAffinityUseHaRulesEnabled() bool {
 	return aa.UseHaRules != nil && *aa.UseHaRules
 }
 
+// HANodeAffinityPinEnabled reports whether create_vm should write a PVE HA
+// node-affinity rule binding the VM to its AZ node set. Requires a non-nil
+// Placement, an explicit *true PinAZViaHARules, and a non-empty AZMap (a pin is
+// meaningless without AZ-to-node mappings). Default false (opt-in).
+func (c *CPIConfig) HANodeAffinityPinEnabled() bool {
+	if c == nil || c.Placement == nil || c.Placement.PinAZViaHARules == nil || !*c.Placement.PinAZViaHARules {
+		return false
+	}
+	return len(c.Placement.AZMap) > 0
+}
+
+// PinAZStrict reports whether the node-affinity rule is strict (hard AZ
+// guarantee). Defaults to true: nil/absent PinAZStrict returns true. Only an
+// explicit *false returns false (non-strict, preferred pin).
+func (c *CPIConfig) PinAZStrict() bool {
+	if c == nil || c.Placement == nil || c.Placement.PinAZStrict == nil {
+		return true
+	}
+	return *c.Placement.PinAZStrict
+}
+
 // AZCandidates returns the node list for az and true when az is a known key in
 // Placement.AZMap. Returns nil, false when: Placement is nil, AZMap is empty,
 // or az is not in the map. Callers treat (nil, false) as "all online nodes".
@@ -1360,6 +1427,24 @@ func (c *CPIConfig) HooksValue() []string {
 	return c.Hooks
 }
 
+// LBRegisterConfig returns the lb_register hook configuration, or nil when no
+// block is set. The pointer is shared with the hook constructor in main.go.
+func (c *CPIConfig) LBRegisterConfig() *hooks.LBRegisterConfig {
+	if c == nil {
+		return nil
+	}
+	return c.LBRegister
+}
+
+// ExternalCommandConfig returns the external_command hook configuration, or nil
+// when no block is set.
+func (c *CPIConfig) ExternalCommandConfig() *hooks.ExternalCommandConfig {
+	if c == nil {
+		return nil
+	}
+	return c.ExternalCommand
+}
+
 // HealthCheckEnabled reports whether the post-create agent ping loop is active.
 // Returns false when HealthCheck is nil, Enabled is nil, or Enabled is *false.
 // Only an explicit *true returns true.
@@ -1368,6 +1453,16 @@ func (c *CPIConfig) HealthCheckEnabled() bool {
 		return false
 	}
 	return *c.HealthCheck.Enabled
+}
+
+// KeepFailedVMsEnabled reports whether the create_vm keep-failed diagnostic mode
+// is active. Returns false when Debug is nil, KeepFailedVMs is nil, or it is
+// *false. Only an explicit *true returns true.
+func (c *CPIConfig) KeepFailedVMsEnabled() bool {
+	if c == nil || c.Debug == nil || c.Debug.KeepFailedVMs == nil {
+		return false
+	}
+	return *c.Debug.KeepFailedVMs
 }
 
 // HealthCheckTimeoutSec returns the effective agent-ping deadline in seconds.
@@ -2146,17 +2241,103 @@ func (c *CPIConfig) validatePlacement(errs *[]string) {
 	}
 	// DLB: validate when the sub-block is present.
 	c.validateDLB(errs)
+	// Node-affinity HA pin: cross-field rules.
+	c.validateHANodeAffinityPin(errs)
+}
+
+// validateHANodeAffinityPin enforces the cross-field rules for the
+// pin_az_via_ha_rules option: it requires an AZMap to pin against, and it is
+// incompatible with the DLB sentinel AZ (DLB intentionally un-pins guests, so a
+// durable pin would fight the rebalancer).
+func (c *CPIConfig) validateHANodeAffinityPin(errs *[]string) {
+	if c.Placement == nil || c.Placement.PinAZViaHARules == nil || !*c.Placement.PinAZViaHARules {
+		return
+	}
+	if len(c.Placement.AZMap) == 0 {
+		*errs = append(*errs,
+			"placement.pin_az_via_ha_rules requires a non-empty placement.az_map to pin against")
+	}
+	sentinel := c.DLBAZName()
+	if sentinel != "" {
+		if _, ok := c.Placement.AZMap[sentinel]; ok {
+			*errs = append(*errs, fmt.Sprintf(
+				"placement.pin_az_via_ha_rules is incompatible with the DLB sentinel AZ %q in az_map; "+
+					"DLB intentionally un-pins guests", sentinel))
+		}
+	}
 }
 
 // validateHooks appends an error for each configured hook name that does not
 // resolve in the built-in hook registry. Empty Hooks is valid (no middleware).
 func (c *CPIConfig) validateHooks(errs *[]string) {
+	active := make(map[string]bool, len(c.Hooks))
 	for _, name := range c.Hooks {
 		if !hooks.Known(name) {
 			*errs = append(*errs, fmt.Sprintf(
 				"unknown hook %q; known hooks: %s", name, strings.Join(hooks.Names(), ", "),
 			))
+			continue
 		}
+		active[name] = true
+	}
+	if active["lb_register"] {
+		c.validateLBRegister(errs)
+	}
+	if active["external_command"] {
+		c.validateExternalCommand(errs)
+	}
+}
+
+// validateLBRegister enforces that an active lb_register hook has the minimum
+// HAProxy Data Plane API target it needs: an endpoint and a backend name.
+func (c *CPIConfig) validateLBRegister(errs *[]string) {
+	if c.LBRegister == nil {
+		*errs = append(*errs, "hook \"lb_register\" is active but no lb_register block is configured")
+		return
+	}
+	if strings.TrimSpace(c.LBRegister.Endpoint) == "" {
+		*errs = append(*errs, "lb_register.endpoint is required when the lb_register hook is active")
+	}
+	if strings.TrimSpace(c.LBRegister.Backend) == "" {
+		*errs = append(*errs, "lb_register.backend is required when the lb_register hook is active")
+	}
+}
+
+// validateExternalCommand enforces the safety preconditions for an active
+// external_command hook: a non-empty allowlist of absolute paths, a command,
+// and the command being a member of the allowlist. The runtime runner re-checks
+// these, but failing fast at config load surfaces a misconfiguration before any
+// dispatch.
+func (c *CPIConfig) validateExternalCommand(errs *[]string) {
+	if c.ExternalCommand == nil {
+		*errs = append(*errs, "hook \"external_command\" is active but no external_command block is configured")
+		return
+	}
+	ec := c.ExternalCommand
+	if len(ec.Allowlist) == 0 {
+		*errs = append(*errs, "external_command.allowlist must be non-empty when the external_command hook is active")
+	}
+	for _, p := range ec.Allowlist {
+		if !filepath.IsAbs(p) {
+			*errs = append(*errs, fmt.Sprintf("external_command.allowlist entry %q must be an absolute path", p))
+		}
+	}
+	if strings.TrimSpace(ec.Command) == "" {
+		*errs = append(*errs, "external_command.command is required when the external_command hook is active")
+		return
+	}
+	if !filepath.IsAbs(ec.Command) {
+		*errs = append(*errs, fmt.Sprintf("external_command.command %q must be an absolute path", ec.Command))
+	}
+	inAllowlist := false
+	for _, p := range ec.Allowlist {
+		if filepath.Clean(p) == filepath.Clean(ec.Command) {
+			inAllowlist = true
+			break
+		}
+	}
+	if !inAllowlist {
+		*errs = append(*errs, fmt.Sprintf("external_command.command %q must be a member of external_command.allowlist", ec.Command))
 	}
 }
 

@@ -251,6 +251,17 @@
     placement["az_shuffle"] = true
   end
 
+  # placement.pin_az_via_ha_rules: emit only when true (default false). Omitting
+  # preserves "no HA pin" via the Go accessor default. pin_az_strict is emitted
+  # only alongside an enabled pin (and only when explicitly false, since the Go
+  # accessor defaults nil -> true), so an unrelated config stays byte-identical.
+  if p("pve.placement.pin_az_via_ha_rules", false)
+    placement["pin_az_via_ha_rules"] = true
+    unless p("pve.placement.pin_az_strict", true)
+      placement["pin_az_strict"] = false
+    end
+  end
+
   config["placement"] = placement unless placement.empty?
 
   # Emit vm_firewall only when explicitly true. The Go accessor defaults
@@ -285,6 +296,54 @@
   hc_interval = p("pve.health_check.interval_sec", 0).to_i
   health_check["interval_sec"] = hc_interval unless hc_interval == 0
   config["health_check"] = health_check unless health_check.empty?
+
+  # Emit lb_register block only when the operator sets an endpoint. Required
+  # when "lb_register" is in hooks; when absent the hook constructs inert.
+  lb_register = {}
+  lb_endpoint = p("pve.lb_register.endpoint", "")
+  lb_register["endpoint"] = lb_endpoint unless lb_endpoint.to_s.empty?
+  lb_backend = p("pve.lb_register.backend", "")
+  lb_register["backend"] = lb_backend unless lb_backend.to_s.empty?
+  lb_port = p("pve.lb_register.port", 0).to_i
+  lb_register["port"] = lb_port unless lb_port == 0
+  lb_user = p("pve.lb_register.user", "")
+  lb_register["user"] = lb_user unless lb_user.to_s.empty?
+  lb_password = p("pve.lb_register.password", "")
+  lb_register["password"] = lb_password unless lb_password.to_s.empty?
+  lb_ca = p("pve.lb_register.ca_cert", "")
+  lb_register["ca_cert"] = lb_ca unless lb_ca.to_s.empty?
+  if p("pve.lb_register.allow_private_ip", false)
+    lb_register["allow_private_ip"] = true
+  end
+  lb_timeout = p("pve.lb_register.timeout_ms", 0).to_i
+  lb_register["timeout_ms"] = lb_timeout unless lb_timeout == 0
+  config["lb_register"] = lb_register unless lb_register.empty?
+
+  # Emit external_command block only when the operator sets a command. Required
+  # when "external_command" is in hooks; when absent the hook constructs inert.
+  external_command = {}
+  ec_command = p("pve.external_command.command", "")
+  external_command["command"] = ec_command unless ec_command.to_s.empty?
+  ec_args = p("pve.external_command.args", [])
+  external_command["args"] = ec_args unless ec_args.nil? || ec_args.empty?
+  ec_allowlist = p("pve.external_command.allowlist", [])
+  external_command["allowlist"] = ec_allowlist unless ec_allowlist.nil? || ec_allowlist.empty?
+  ec_env = p("pve.external_command.env_passlist", [])
+  external_command["env_passlist"] = ec_env unless ec_env.nil? || ec_env.empty?
+  ec_timeout = p("pve.external_command.timeout_ms", 0).to_i
+  external_command["timeout_ms"] = ec_timeout unless ec_timeout == 0
+  ec_methods = p("pve.external_command.methods", [])
+  external_command["methods"] = ec_methods unless ec_methods.nil? || ec_methods.empty?
+  config["external_command"] = external_command unless external_command.empty?
+
+  # Emit debug block only when a diagnostic mode is turned on. Absent (default)
+  # means the Go nil *DebugConfig leaves all diagnostic modes off —
+  # byte-identical to prior releases.
+  debug = {}
+  if p("pve.debug.keep_failed_vms", false)
+    debug["keep_failed_vms"] = true
+  end
+  config["debug"] = debug unless debug.empty?
 
   # Emit the retry block only when the operator overrides at least one curve.
   # Each sub-policy and field is omit-when-zero so an untouched curve keeps the
