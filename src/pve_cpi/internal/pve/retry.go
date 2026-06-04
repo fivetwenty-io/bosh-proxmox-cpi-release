@@ -132,6 +132,53 @@ func StorageLockBackoff(attempt int) time.Duration {
 	return out
 }
 
+// StorageLockBackoffCap returns the maximum duration that StorageLockBackoff
+// can return. Exported for tests that need to compare curve ceilings.
+func StorageLockBackoffCap() time.Duration { return 30 * time.Second }
+
+// PushbackBackoffCap returns the maximum duration that PushbackBackoff can
+// return. Reads the current process-wide cap from the pushback seam so the
+// operator's configured value (or the shipped 60s default) is always returned.
+func PushbackBackoffCap() time.Duration {
+	_, capMs := pushbackDefaults()
+	return time.Duration(capMs) * time.Millisecond
+}
+
+// PushbackBackoff returns the sleep duration after the attempt-th (0-indexed)
+// failed call that hit PVE rate-limiting or worker-pool exhaustion:
+// exponential base × 1.5^attempt with ±30% jitter, capped at the configured
+// ceiling. Default base 5s, default cap 60s — both operator-configurable via
+// ConfigurePushbackBackoff.
+//
+// The longer base (5s vs 2s) and cap (60s vs 30s) relative to
+// StorageLockBackoff reflect that PVE worker-pool saturation takes longer to
+// drain than a single per-storage lock hold.
+func PushbackBackoff(attempt int) time.Duration {
+	baseMs, capMs := pushbackDefaults()
+	base := time.Duration(baseMs) * time.Millisecond
+	maxBackoff := time.Duration(capMs) * time.Millisecond
+	factor := 1.0
+	for i := 0; i < attempt; i++ {
+		factor *= 1.5
+	}
+	d := time.Duration(float64(base) * factor)
+	if d > maxBackoff {
+		d = maxBackoff
+	}
+	// Guard against Int64N(0) which panics. With a zero/negative jitter
+	// window fall back to the deterministic base delay.
+	jitterWindow := int64(d) * 6 / 10
+	var jitter time.Duration
+	if jitterWindow > 0 {
+		jitter = time.Duration(jitterInt64N(jitterWindow))
+	}
+	out := d - d*3/10 + jitter
+	if out > maxBackoff {
+		out = maxBackoff
+	}
+	return out
+}
+
 // RetryOnStorageLock invokes op up to maxAttempts times, retrying only when
 // the returned error is a PVE per-storage lockfile timeout
 // (IsStorageLockTimeout). Other errors (or success) return immediately.
@@ -191,13 +238,16 @@ func RetryOnStorageLock(
 	return lastErr
 }
 
-// RetryOnTransient invokes op up to maxAttempts times, retrying only when the
-// returned error is a transient transport-layer fault (IsTransientTransport).
-// Other errors (or success) return immediately. Backoff uses TransientBackoff.
-// Context cancellation short-circuits the sleep.
+// RetryOnTransient invokes op up to maxAttempts times, retrying when the
+// returned error is a transient transport-layer fault (IsTransientTransport)
+// or a PVE rate-limit / worker-pool exhaustion signal (IsPVEPushback).
+// Other errors (or success) return immediately. Backoff curve: pushback errors
+// use PushbackBackoff; transient errors use TransientBackoff. Context
+// cancellation short-circuits the sleep.
 //
 // Use for SDK calls that don't touch the per-storage lock (config edits,
-// listings, login) but can still die to a pvedaemon worker recycling.
+// listings, login) but can still die to a pvedaemon worker recycling or a
+// temporary cluster-saturation pushback.
 //
 // maxAttempts ≤ 0 falls back to DefaultTransientMaxAttempts.
 func RetryOnTransient(
@@ -216,91 +266,27 @@ func RetryOnTransient(
 		if err == nil {
 			return nil
 		}
-		if !IsTransientTransport(err) {
+		isPushback := IsPVEPushback(err)
+		if !isPushback && !IsTransientTransport(err) {
 			return err
 		}
 		lastErr = err
 		if attempt == maxAttempts-1 {
 			break
 		}
-		d := TransientBackoff(attempt)
-		if override := backoffFromCtx(ctx); override != nil {
-			d = override(attempt)
-		}
-		if logger != nil {
-			logger.Info("pve: transient transport fault, retrying",
-				log.String("op", label),
-				log.Int("attempt", attempt+1),
-				log.Int("max_attempts", maxAttempts),
-				log.Int("backoff_ms", int(d/time.Millisecond)),
-				log.String("error", err.Error()),
-			)
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(d):
-		}
-	}
-	return lastErr
-}
-
-// RetryOnTransientOrLock invokes op up to maxAttempts times, retrying when the
-// returned error is either a per-storage lockfile timeout (IsStorageLockTimeout)
-// or a transient transport-layer fault (IsTransientTransport). The longer
-// StorageLockBackoff curve is used because storage-lock holds dominate the
-// wait when both failure modes coexist; a sub-second transport retry inside
-// a 30-second lock window is just noise.
-//
-// Use for storage-touching SDK calls that may collide on either condition.
-// Backoff continues from a single attempt counter — a deploy that hits a
-// transient fault on attempt 3 then a lock timeout on attempt 4 keeps
-// climbing the same curve rather than restarting from zero.
-//
-// maxAttempts ≤ 0 falls back to DefaultStorageLockMaxAttempts (the longer of
-// the two budgets — the helper subsumes both failure modes).
-func RetryOnTransientOrLock(
-	ctx context.Context,
-	logger *log.Logger,
-	label string,
-	maxAttempts int,
-	op func() error,
-) error {
-	if maxAttempts <= 0 {
-		maxAttempts = DefaultStorageLockMaxAttempts
-	}
-	var lastErr error
-	for attempt := 0; attempt < maxAttempts; attempt++ {
-		err := op()
-		if err == nil {
-			return nil
-		}
-		isLock := IsStorageLockTimeout(err)
-		isTransient := IsTransientTransport(err)
-		if !isLock && !isTransient {
-			return err
-		}
-		lastErr = err
-		if attempt == maxAttempts-1 {
-			break
-		}
-		// Transport faults clear in sub-second, lock holds in tens of
-		// seconds; pick the shorter curve when only the transport mode
-		// fired so a fast retry doesn't waste the lock-tuned budget.
 		var d time.Duration
-		if isLock {
-			d = StorageLockBackoff(attempt)
+		var reason string
+		if isPushback {
+			d = PushbackBackoff(attempt)
+			reason = "pushback"
 		} else {
 			d = TransientBackoff(attempt)
+			reason = "transient_transport"
 		}
 		if override := backoffFromCtx(ctx); override != nil {
 			d = override(attempt)
 		}
 		if logger != nil {
-			reason := "transient_transport"
-			if isLock {
-				reason = "storage_lock"
-			}
 			logger.Info("pve: retrying after retryable fault",
 				log.String("op", label),
 				log.String("reason", reason),
@@ -318,3 +304,82 @@ func RetryOnTransientOrLock(
 	}
 	return lastErr
 }
+
+// retryOrLockCurve selects the backoff curve and reason label for a
+// RetryOnTransientOrLock retry iteration. Pushback takes priority (longest
+// curve) because worker-pool saturation is the most conservative condition;
+// within non-pushback errors, storage-lock dominates transient transport.
+func retryOrLockCurve(isPushback, isLock bool, attempt int) (d time.Duration, reason string) {
+	switch {
+	case isPushback:
+		return PushbackBackoff(attempt), "pushback"
+	case isLock:
+		return StorageLockBackoff(attempt), "storage_lock"
+	default:
+		return TransientBackoff(attempt), "transient_transport"
+	}
+}
+
+// RetryOnTransientOrLock invokes op up to maxAttempts times, retrying when the
+// returned error is a per-storage lockfile timeout (IsStorageLockTimeout), a
+// transient transport-layer fault (IsTransientTransport), or a PVE rate-limit /
+// worker-pool exhaustion signal (IsPVEPushback). Backoff curve priority:
+// pushback (PushbackBackoff) > storage lock (StorageLockBackoff) > transient
+// (TransientBackoff). Pushback is the most conservative because worker-pool
+// saturation takes the longest to drain.
+//
+// Use for storage-touching SDK calls that may collide on any of the three
+// conditions. Backoff continues from a single attempt counter across all
+// failure modes.
+//
+// maxAttempts ≤ 0 falls back to DefaultStorageLockMaxAttempts (the longer of
+// the non-pushback budgets — the helper subsumes all three failure modes).
+func RetryOnTransientOrLock(
+	ctx context.Context,
+	logger *log.Logger,
+	label string,
+	maxAttempts int,
+	op func() error,
+) error {
+	if maxAttempts <= 0 {
+		maxAttempts = DefaultStorageLockMaxAttempts
+	}
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		err := op()
+		if err == nil {
+			return nil
+		}
+		isPushback := IsPVEPushback(err)
+		isLock := IsStorageLockTimeout(err)
+		isTransient := IsTransientTransport(err)
+		if !isPushback && !isLock && !isTransient {
+			return err
+		}
+		lastErr = err
+		if attempt == maxAttempts-1 {
+			break
+		}
+		d, reason := retryOrLockCurve(isPushback, isLock, attempt)
+		if override := backoffFromCtx(ctx); override != nil {
+			d = override(attempt)
+		}
+		if logger != nil {
+			logger.Info("pve: retrying after retryable fault",
+				log.String("op", label),
+				log.String("reason", reason),
+				log.Int("attempt", attempt+1),
+				log.Int("max_attempts", maxAttempts),
+				log.Int("backoff_ms", int(d/time.Millisecond)),
+				log.String("error", err.Error()),
+			)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(d):
+		}
+	}
+	return lastErr
+}
+

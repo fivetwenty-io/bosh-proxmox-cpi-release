@@ -120,6 +120,17 @@ func HandleAttachDisk(deps Deps) Handler {
 		}
 
 		// --------------------------------------------------------------------
+		// 4b. Per-node in-flight gate (opt-in; limit=0 → unlimited, no gating).
+		// --------------------------------------------------------------------
+		if deps.Config != nil {
+			inflightRelease, inflightErr := inflightSems.acquire(ctx, node, deps.Config.MaxInflightPerNodeLimit())
+			if inflightErr != nil {
+				return nil, cpierrors.Retriable("attach_disk: in-flight limit exceeded or context cancelled on node %s: %s", node, inflightErr.Error())
+			}
+			defer inflightRelease()
+		}
+
+		// --------------------------------------------------------------------
 		// 5. Attach disk via SDK at scsi1 or higher (NEVER scsi0).
 		//
 		// The SDK's default slot selection picks the lowest free index — 0 for

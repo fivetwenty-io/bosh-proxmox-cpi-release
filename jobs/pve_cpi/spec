@@ -600,6 +600,42 @@ properties:
       Zero (default) applies the built-in 10.
     default: 0
 
+  pve.retry.pushback.base_ms:
+    description: |
+      Initial pushback backoff in milliseconds. Zero (default) applies the
+      built-in 5000 ms (longer than the storage-lock curve). Raise to ease off
+      a saturated cluster more aggressively.
+    default: 0
+  pve.retry.pushback.cap_ms:
+    description: |
+      Maximum pushback backoff in milliseconds (the backoff grows toward this
+      value). Zero (default) applies the built-in 60000 ms. Clamped up to
+      base_ms if smaller.
+    default: 0
+
+  pve.max_inflight_per_node:
+    description: |
+      Maximum number of concurrent mutating PVE operations (create_vm,
+      delete_vm, create_disk, attach_disk, create_stemcell) allowed against a
+      single node at once. Zero (default) means unlimited and is byte-identical
+      to prior releases. Set a small positive value (for example 4) to prevent
+      large parallel BOSH deploys from saturating a node's fixed pvedaemon /
+      pveproxy worker pool. A slot is held for the full lifetime of the
+      operation, including any retry backoff (a create retrying against pushback
+      keeps its slot through the 5-60s backoff), so size this with headroom.
+    default: 0
+
+  pve.strict_config_validation:
+    description: |
+      When false (default) unknown configuration keys are logged as warnings and
+      a handful of contradictory option combinations are tolerated, preserving
+      behavior identical to prior releases. When true the CPI fails fast at
+      start-up, rejecting unknown top-level keys and these cross-field
+      contradictions: use_ha_rules without anti_affinity enabled; network_mode
+      sdn without an sdn_zone or sdn_auto_manage_zone; and a DLB
+      require_shared_storage setting while the dynamic load balancer is disabled.
+    default: false
+
   pve.operation_timeout.enabled:
     description: |
       Opt-in per-method deadline envelope. When false (default) no deadline

@@ -76,11 +76,12 @@ func TestAwaitTask_Success(t *testing.T) {
 	}
 }
 
-func TestAwaitTask_EmptyExitStatusReturnsError(t *testing.T) {
+func TestAwaitTask_EmptyExitStatusReturnsRetriableError(t *testing.T) {
 	t.Parallel()
-	// Empty exit status means PVE never wrote a terminal ExitStatus — the task
-	// poller returned before the task completed or was killed without recording
-	// an outcome. AwaitTask must treat this as an error, not as success.
+	// Empty exit status means the SDK's TimeoutSeconds elapsed before PVE wrote
+	// a terminal ExitStatus. This is a transient timeout — the PVE task is still
+	// running. Return a retriable error so the director re-issues the action
+	// rather than holding a queue slot forever.
 	svc := &mockTasksService{
 		waitFn: func(_ context.Context, _, upid string, _ *sdktasks.WaitOptions) (*sdktasks.Status, error) {
 			return &sdktasks.Status{Status: "stopped", ExitStatus: "", UpID: upid}, nil
@@ -92,6 +93,15 @@ func TestAwaitTask_EmptyExitStatusReturnsError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "empty exit status") {
 		t.Errorf("error message should mention empty exit status, got: %v", err)
+	}
+	// The empty-exit-status case must be retriable: it is a polling timeout,
+	// not a permanent task failure. The director must re-issue the action.
+	var cpiErr *cpierrors.Error
+	if !errors.As(err, &cpiErr) {
+		t.Fatalf("expected *cpierrors.Error, got %T: %v", err, err)
+	}
+	if !cpiErr.OkToRetry() {
+		t.Errorf("empty exit status error must be retriable (OkToRetry=true), got false; err=%v", err)
 	}
 }
 

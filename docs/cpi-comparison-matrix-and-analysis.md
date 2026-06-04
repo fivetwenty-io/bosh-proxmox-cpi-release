@@ -584,7 +584,7 @@ from config (create 30m, delete 15m, has/get 2m defaults). The existing retry lo
 already honor `ctx.Done()`, so this composes cleanly and converts the wedged-poll hang
 into a retriable timeout the director can act on.
 
-#### 7.16 PVE pushback handling (429 / lock-storm / bounded in-flight)
+#### 7.16 DONE — PVE pushback handling (429 / lock-storm / bounded in-flight)
 
 *References: Azure, AWS, Alicloud.* PVE classifies 5xx as retriable but has no explicit
 handling of PVE's own pushback — pvedaemon/pveproxy worker saturation, `/cluster/tasks`
@@ -597,7 +597,20 @@ bounded semaphore over outstanding mutating calls per node (reuse the bounded-go
 pattern from the IP-conflict scan); bound the poll duration and surface a retriable error
 rather than holding a queue slot (reinforces §7.15).
 
-#### 7.17 Fail-fast config validation (schema strictness)
+**Shipped.** HTTP 429 and the conservative pushback phrase set (worker busy, lock-acquire
+timeout, too many requests) are classified as a distinct retriable subtype that backs off
+on a longer curve (5s base, 60s cap) than the generic transient (1s/15s) and storage-lock
+(2s/30s) curves. The curve is folded into the central retry helpers, so every mutating call
+site inherits it, and is tunable through `pve.retry.pushback.{base_ms,cap_ms}`. An opt-in
+`pve.max_inflight_per_node` caps concurrent mutating operations per node through a
+per-node semaphore across create_vm, delete_vm, create_disk, attach_disk, and
+create_stemcell; zero (the default) means unlimited and is byte-identical to prior
+releases. A semaphore-wait cancellation returns a retriable error rather than a fatal one.
+The task poller's empty-exit-on-timeout path now returns a retriable error so a wedged
+await re-queues instead of holding a Director slot. The only always-on change is the 429
+reclassification (previously a fatal 4xx); everything else is opt-in.
+
+#### 7.17 DONE — Fail-fast config validation (schema strictness)
 
 *References: vSphere, OpenStack-Go, Azure.* `ApplyDefaults` is permissive — no rejection
 of unknown keys, contradictory combinations, or out-of-range values. A typo'd
@@ -610,7 +623,17 @@ enforce enums, enforce documented cross-field rules (HA anti-affinity requires
 anti-affinity enabled; DLB shared-storage requirement only with DLB enabled; SDN mode
 requires a zone), and validate ranges (non-overlapping VMID ranges, weights ≥ 0).
 
-#### 7.18 Static-IP-in-range validation and gateway/DNS propagation audit
+**Shipped.** Enum validation and range validation (non-overlapping VMID bands, weights ≥ 0,
+backoff bounds) were already enforced unconditionally. The remaining strictness is gated
+behind an opt-in `pve.strict_config_validation` flag so existing manifests keep loading
+unchanged by default. When enabled, the validator rejects unknown top-level keys and three
+documented cross-field contradictions: `use_ha_rules` without anti-affinity enabled,
+`network_mode: sdn` without a zone or `sdn_auto_manage_zone`, and a DLB
+`require_shared_storage` setting while the dynamic load balancer is disabled. Each rejection
+names the offending key or combination so the failure is actionable at start-up rather than
+mid-deploy. Unknown-key checking is top-level only, matching the build scope.
+
+#### 7.18 DONE — Static-IP-in-range validation and gateway/DNS propagation audit
 
 *References: AWS, vSphere, Google, OpenStack-Go.* The network spec's
 range/gateway/netmask are captured but not consumed; a BOSH static IP outside the
@@ -622,6 +645,17 @@ that it reaches the guest.
 containment; return an error listing the offending IP + range if outside. Separately
 audit ipconfig assembly to confirm gateway + DNS from the network spec reach the guest;
 add if missing. Additive, no behavior change for already-correct manifests.
+
+**Shipped.** The network spec now decodes its `range`, and create_vm validates containment
+before any VM is allocated: a manual network whose static IP falls outside its declared
+range CIDR fails with a non-retriable error naming the network, IP, and range, so a bad
+manifest fails fast instead of producing a non-booting VM. Validation is skipped when the
+range is absent, the network is dynamic, or no IP is set, so correct manifests are
+unaffected. The ipconfig audit confirmed gateway and DNS nameservers already reach the
+guest; the one gap — `searchdomain` was never set — is closed by propagating a search
+domain from the network's `search_domain`/`dns_search`/`domain` cloud property when present
+(omitted otherwise, byte-identical). A manual network with a static IP but no gateway is
+logged as a warning rather than silently accepted.
 
 #### 7.19 External LB registration hook and expanded hook catalog with rollback contract
 

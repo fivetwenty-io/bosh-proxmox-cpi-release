@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/rand"
 	mrand "math/rand/v2"
+	"net"
 	"sort"
 	"strconv"
 	"strings"
@@ -162,7 +163,8 @@ type createVMNetworkSpec struct {
 	Netmask         string         `json:"netmask"`
 	Gateway         string         `json:"gateway"`
 	DNS             []string       `json:"dns"`
-	Default         []string       `json:"default"` // ["dns","gateway"]
+	Default         []string       `json:"default"`          // ["dns","gateway"]
+	Range           string         `json:"range,omitempty"`  // CIDR for static-IP containment validation
 	CloudProperties map[string]any `json:"cloud_properties"`
 	MAC             string         `json:"mac,omitempty"` // filled in response
 }
@@ -268,7 +270,7 @@ func createVM(
 	// 1b. Early VIP validation — fail-fast before any VM mutation.
 	// Malformed allowed_address_pairs entries (bad IPs, non-string types) are
 	// operator errors that must be surfaced before the VM is created, consistent
-	// with §7.18 static-IP validation. Any PVE-API failure is deferred to step 8c
+	// with static-IP-in-range validation. Any PVE-API failure is deferred to step 8c
 	// where it is handled best-effort (fail-open).
 	// -----------------------------------------------------------------------
 	if err := validateVIPAllowedAddressPairs(parsed.networks); err != nil {
@@ -281,6 +283,17 @@ func createVM(
 	shape, err := resolveVMShape(ctx, deps, parsed)
 	if err != nil {
 		return nil, err
+	}
+
+	// -----------------------------------------------------------------------
+	// 3b. Per-node in-flight gate (opt-in; limit=0 → unlimited, no gating).
+	// -----------------------------------------------------------------------
+	if deps.Config != nil {
+		inflightRelease, inflightErr := inflightSems.acquire(ctx, shape.node, deps.Config.MaxInflightPerNodeLimit())
+		if inflightErr != nil {
+			return nil, cpierrors.Retriable("create_vm: in-flight limit exceeded or context cancelled on node %s: %s", shape.node, inflightErr.Error())
+		}
+		defer inflightRelease()
 	}
 
 	// -----------------------------------------------------------------------
@@ -540,6 +553,13 @@ func parseCreateVMArgs(args []json.RawMessage) (*createVMParsedArgs, error) {
 	var networks map[string]createVMNetworkSpec
 	if err := json.Unmarshal(args[3], &networks); err != nil {
 		return nil, cpierrors.Cloud("create_vm: parse networks: %s", err.Error())
+	}
+	// Static-IP containment: validate each manual network's IP against its
+	// declared range CIDR before any PVE resources are allocated. This is a
+	// manifest error that will not resolve on retry, so a non-retriable
+	// CloudError is returned immediately.
+	if err := validateNetworkContainment(networks); err != nil {
+		return nil, err
 	}
 
 	var diskCIDs []string
@@ -2487,7 +2507,7 @@ func resolveCloneMode(cfg *config.CPIConfig, cpMap map[string]any) (string, erro
 func configureNICs(
 	ctx context.Context,
 	deps Deps,
-	_ *log.Logger,
+	logger *log.Logger,
 	parsed *createVMParsedArgs,
 	shape *createVMShape,
 	vmid int,
@@ -2542,6 +2562,13 @@ func configureNICs(
 			ipconfigMap[i] = "ip=dhcp"
 		case "manual":
 			if spec.IP != "" {
+				// Warn when a static IP has no gateway — this is likely an
+				// operator oversight. The VM still deploys; routing may be
+				// impaired without a default gateway.
+				if spec.Gateway == "" {
+					logger.Warn("create_vm: manual network has no gateway",
+						log.String("network", name))
+				}
 				cidr := ipToCIDR(spec.IP, spec.Netmask)
 				cfg := "ip=" + cidr
 				if spec.Gateway != "" {
@@ -2569,6 +2596,13 @@ func configureNICs(
 	if len(nameservers) > 0 {
 		ns := strings.Join(nameservers, " ")
 		nicParams.Nameserver = &ns
+	}
+	// Propagate search domain to PVE cloud-init searchdomain when any network
+	// spec supplies one via cloud_properties "search_domain", "dns_search", or
+	// "domain". First non-empty value wins across specs. When absent the field
+	// is left unset — byte-identical to pre-existing behavior.
+	if sd := pickSearchDomain(netNames, parsed.networks); sd != "" {
+		nicParams.Searchdomain = &sd
 	}
 
 	if err := deps.PVE.Nodes().UpdateQemuConfig(ctx, shape.node, strconv.Itoa(vmid), nicParams); err != nil {
@@ -2870,6 +2904,60 @@ func netmaskToCIDR(netmask string) int {
 		}
 	}
 	return bits
+}
+
+// --------------------------------------------------------------------------
+// validateNetworkContainment checks that every manual static-IP network whose
+// spec carries a Range CIDR has its IP within that range. Returns a
+// non-retriable CloudError on the first violation; returns nil when all
+// networks pass. Skip conditions (no error): Type != "manual", IP == "",
+// Range == "".
+// --------------------------------------------------------------------------
+func validateNetworkContainment(networks map[string]createVMNetworkSpec) error {
+	// Process names in sorted order so the first reported error is deterministic.
+	names := sortedNetworkNames(networks)
+	for _, name := range names {
+		spec := networks[name]
+		if !strings.EqualFold(spec.Type, "manual") || spec.IP == "" || spec.Range == "" {
+			continue
+		}
+		_, cidrNet, err := net.ParseCIDR(spec.Range)
+		if err != nil {
+			return cpierrors.Cloud(
+				"create_vm: network %q has malformed range %q: %s",
+				name, spec.Range, err.Error())
+		}
+		ip := net.ParseIP(spec.IP)
+		if ip == nil {
+			return cpierrors.Cloud(
+				"create_vm: network %q has malformed IP %q",
+				name, spec.IP)
+		}
+		if !cidrNet.Contains(ip) {
+			return cpierrors.Cloud(
+				"create_vm: network %q IP %s is outside declared range %s",
+				name, spec.IP, spec.Range)
+		}
+	}
+	return nil
+}
+
+// --------------------------------------------------------------------------
+// pickSearchDomain scans the ordered network specs and returns the first
+// non-empty search domain found under the cloud_properties keys
+// "search_domain", "dns_search", or "domain" (first key wins per spec,
+// first spec wins across specs). Returns "" when none found.
+// --------------------------------------------------------------------------
+func pickSearchDomain(netNames []string, networks map[string]createVMNetworkSpec) string {
+	for _, name := range netNames {
+		spec := networks[name]
+		for _, key := range []string{"search_domain", "dns_search", "domain"} {
+			if v, ok := spec.CloudProperties[key].(string); ok && v != "" {
+				return v
+			}
+		}
+	}
+	return ""
 }
 
 // --------------------------------------------------------------------------

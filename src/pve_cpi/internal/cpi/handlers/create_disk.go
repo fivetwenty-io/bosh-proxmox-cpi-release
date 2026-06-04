@@ -249,7 +249,18 @@ func HandleCreateDisk(deps Deps) Handler {
 		}
 
 		// ----------------------------------------------------------------
-		// 4. Allocate a synthetic disk VMID + create the volume.
+		// 4. Per-node in-flight gate (opt-in; limit=0 → unlimited, no gating).
+		// ----------------------------------------------------------------
+		if deps.Config != nil {
+			inflightRelease, inflightErr := inflightSems.acquire(ctx, node, deps.Config.MaxInflightPerNodeLimit())
+			if inflightErr != nil {
+				return nil, cpierrors.Retriable("create_disk: in-flight limit exceeded or context cancelled on node %s: %s", node, inflightErr.Error())
+			}
+			defer inflightRelease()
+		}
+
+		// ----------------------------------------------------------------
+		// 5. Allocate a synthetic disk VMID + create the volume.
 		//
 		// attemptCreateVolume re-runs NextDiskVMID(node, storage) every
 		// attempt so the storage scan picks up orphan volumes from prior

@@ -294,6 +294,7 @@
     "storage_import" => ["max_attempts", "base_ms", "cap_ms", "jitter_pct"],
     "vmid_alloc"     => ["max_attempts", "base_ms", "cap_ms"],
     "task_poll"      => ["base_ms", "cap_ms", "jitter_pct"],
+    "pushback"       => ["base_ms", "cap_ms"],
   }.each do |klass, fields|
     policy = {}
     fields.each do |f|
@@ -303,6 +304,20 @@
     retry_cfg[klass] = policy unless policy.empty?
   end
   config["retry"] = retry_cfg unless retry_cfg.empty?
+
+  # Per-node in-flight cap on mutating operations. Omitted when zero so the
+  # default (unlimited) stays byte-identical to prior releases.
+  max_inflight = p("pve.max_inflight_per_node", 0).to_i
+  config["max_inflight_per_node"] = max_inflight unless max_inflight == 0
+
+  # Emit strict_config_validation only when explicitly enabled. When absent or
+  # false (the default) the key is omitted so the Go config zero-value
+  # (nil *bool -> off -> warn-only) is preserved, byte-identical to prior
+  # releases. When true the CPI fails fast on unknown keys and contradictory
+  # cross-field combinations.
+  if p("pve.strict_config_validation", false)
+    config["strict_config_validation"] = true
+  end
 
   # Emit operation_timeout only when explicitly enabled. The per-class seconds
   # are omit-when-zero so the Go accessors supply the built-in class defaults

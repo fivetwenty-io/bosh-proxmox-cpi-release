@@ -168,6 +168,12 @@ func runWithArgs(args []string, stdin io.Reader, stdout, stderr io.Writer, opts 
 	tp := cfg.RetryTaskPoll()
 	pve.ConfigureTaskPolling(tp.BaseMs, tp.CapMs, tp.JitterPct)
 
+	// Apply the operator's pushback-backoff curve process-wide. With an unset
+	// retry.pushback block these resolve to the shipped defaults (5s/60s), so
+	// backoff is byte-identical to prior releases.
+	pb := cfg.RetryPushback()
+	pve.ConfigurePushbackBackoff(pb.BaseMs, pb.CapMs)
+
 	dispatcherOpts := []func(*cpi.Dispatcher){cpi.WithHooks(hookChain...)}
 	// Per-method deadline envelope is opt-in. When enabled, install a resolver
 	// sized by the operator's per-class budgets so a wedged operation converts

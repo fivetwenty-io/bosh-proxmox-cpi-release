@@ -4385,3 +4385,518 @@ func TestStemcell_JSONMarshal_SetBlockIncluded(t *testing.T) {
 		t.Errorf("non-nil Stemcell: JSON missing provenance:true; got %s", b)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// RetryConfig.Pushback — accessor defaults, JSON round-trip, validation
+// ---------------------------------------------------------------------------
+
+func TestRetryPushback_Defaults_WhenUnset(t *testing.T) {
+	t.Parallel()
+	// A nil config returns the class defaults (5000ms base, 60000ms cap).
+	var c *config.CPIConfig
+	p := c.RetryPushback()
+	if p.BaseMs != 5000 {
+		t.Errorf("default BaseMs = %d, want 5000", p.BaseMs)
+	}
+	if p.CapMs != 60000 {
+		t.Errorf("default CapMs = %d, want 60000", p.CapMs)
+	}
+	if p.MaxAttempts != 0 {
+		t.Errorf("default MaxAttempts = %d, want 0 (caller chooses)", p.MaxAttempts)
+	}
+}
+
+func TestRetryPushback_Defaults_WhenRetryBlockNil(t *testing.T) {
+	t.Parallel()
+	c := &config.CPIConfig{}
+	p := c.RetryPushback()
+	if p.BaseMs != 5000 {
+		t.Errorf("default BaseMs = %d, want 5000", p.BaseMs)
+	}
+	if p.CapMs != 60000 {
+		t.Errorf("default CapMs = %d, want 60000", p.CapMs)
+	}
+}
+
+func TestRetryPushback_Defaults_WhenPushbackSubfieldNil(t *testing.T) {
+	t.Parallel()
+	c := &config.CPIConfig{
+		Retry: &config.RetryConfig{},
+	}
+	p := c.RetryPushback()
+	if p.BaseMs != 5000 {
+		t.Errorf("default BaseMs = %d, want 5000", p.BaseMs)
+	}
+	if p.CapMs != 60000 {
+		t.Errorf("default CapMs = %d, want 60000", p.CapMs)
+	}
+}
+
+func TestRetryPushback_SetValues_Override(t *testing.T) {
+	t.Parallel()
+	c := &config.CPIConfig{
+		Retry: &config.RetryConfig{
+			Pushback: &config.RetryPolicy{
+				BaseMs:      8000,
+				CapMs:       90000,
+				MaxAttempts: 7,
+			},
+		},
+	}
+	p := c.RetryPushback()
+	if p.BaseMs != 8000 {
+		t.Errorf("BaseMs = %d, want 8000", p.BaseMs)
+	}
+	if p.CapMs != 90000 {
+		t.Errorf("CapMs = %d, want 90000", p.CapMs)
+	}
+	if p.MaxAttempts != 7 {
+		t.Errorf("MaxAttempts = %d, want 7", p.MaxAttempts)
+	}
+}
+
+func TestRetryPushback_JSONMarshal_NilOmitted(t *testing.T) {
+	t.Parallel()
+	c := &config.CPIConfig{
+		Retry: &config.RetryConfig{},
+	}
+	b, err := json.Marshal(c)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if bytes.Contains(b, []byte(`"pushback"`)) {
+		t.Errorf("nil Pushback block must not appear in JSON; got %s", b)
+	}
+}
+
+func TestRetryPushback_JSONMarshal_SetIncluded(t *testing.T) {
+	t.Parallel()
+	c := &config.CPIConfig{
+		Retry: &config.RetryConfig{
+			Pushback: &config.RetryPolicy{
+				BaseMs: 6000,
+				CapMs:  70000,
+			},
+		},
+	}
+	b, err := json.Marshal(c)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if !bytes.Contains(b, []byte(`"pushback"`)) {
+		t.Errorf("non-nil Pushback must appear in JSON; got %s", b)
+	}
+	if !bytes.Contains(b, []byte(`"base_ms":6000`)) {
+		t.Errorf("base_ms:6000 missing; got %s", b)
+	}
+}
+
+func TestValidate_RetryPushback_NegativeBaseMs(t *testing.T) {
+	t.Parallel()
+	c := registryBaseCfg()
+	c.Retry = &config.RetryConfig{
+		Pushback: &config.RetryPolicy{BaseMs: -1},
+	}
+	err := c.Validate()
+	if err == nil {
+		t.Fatal("expected error for negative base_ms, got nil")
+	}
+	if !strings.Contains(err.Error(), "retry.pushback.base_ms") {
+		t.Errorf("error must mention retry.pushback.base_ms; got %v", err)
+	}
+}
+
+func TestValidate_RetryPushback_NegativeCapMs(t *testing.T) {
+	t.Parallel()
+	c := registryBaseCfg()
+	c.Retry = &config.RetryConfig{
+		Pushback: &config.RetryPolicy{CapMs: -1},
+	}
+	err := c.Validate()
+	if err == nil {
+		t.Fatal("expected error for negative cap_ms, got nil")
+	}
+	if !strings.Contains(err.Error(), "retry.pushback.cap_ms") {
+		t.Errorf("error must mention retry.pushback.cap_ms; got %v", err)
+	}
+}
+
+func TestValidate_RetryPushback_CapLtBase(t *testing.T) {
+	t.Parallel()
+	c := registryBaseCfg()
+	c.Retry = &config.RetryConfig{
+		Pushback: &config.RetryPolicy{BaseMs: 10000, CapMs: 5000},
+	}
+	err := c.Validate()
+	if err == nil {
+		t.Fatal("expected error for cap_ms < base_ms, got nil")
+	}
+	if !strings.Contains(err.Error(), "retry.pushback") {
+		t.Errorf("error must mention retry.pushback; got %v", err)
+	}
+}
+
+func TestValidate_RetryPushback_CapEqualsBase_Valid(t *testing.T) {
+	t.Parallel()
+	c := registryBaseCfg()
+	c.RegistryEndpoint = "https://registry.example.com:25777"
+	c.Retry = &config.RetryConfig{
+		Pushback: &config.RetryPolicy{BaseMs: 5000, CapMs: 5000},
+	}
+	if err := c.Validate(); err != nil {
+		t.Errorf("cap == base should be valid; got %v", err)
+	}
+}
+
+func TestValidate_RetryPushback_NegativeMaxAttempts(t *testing.T) {
+	t.Parallel()
+	c := registryBaseCfg()
+	c.Retry = &config.RetryConfig{
+		Pushback: &config.RetryPolicy{MaxAttempts: -1},
+	}
+	err := c.Validate()
+	if err == nil {
+		t.Fatal("expected error for negative max_attempts, got nil")
+	}
+	if !strings.Contains(err.Error(), "retry.pushback.max_attempts") {
+		t.Errorf("error must mention retry.pushback.max_attempts; got %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// max_inflight_per_node
+// ---------------------------------------------------------------------------
+
+// TestMaxInflightPerNode_DefaultZero confirms that an unset max_inflight_per_node
+// produces 0 via the accessor (unlimited, byte-identical current behavior).
+func TestMaxInflightPerNode_DefaultZero(t *testing.T) {
+	t.Parallel()
+	c := &config.CPIConfig{}
+	if got := c.MaxInflightPerNodeLimit(); got != 0 {
+		t.Errorf("expected 0 for unset field, got %d", got)
+	}
+}
+
+// TestMaxInflightPerNode_SetValue confirms accessor returns the configured value.
+func TestMaxInflightPerNode_SetValue(t *testing.T) {
+	t.Parallel()
+	c := &config.CPIConfig{MaxInflightPerNode: 4}
+	if got := c.MaxInflightPerNodeLimit(); got != 4 {
+		t.Errorf("expected 4, got %d", got)
+	}
+}
+
+// TestMaxInflightPerNode_JSONRoundTrip confirms the field marshals and unmarshals.
+func TestMaxInflightPerNode_JSONRoundTrip(t *testing.T) {
+	t.Parallel()
+	c := &config.CPIConfig{MaxInflightPerNode: 8}
+	b, err := json.Marshal(c)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(b), `"max_inflight_per_node":8`) {
+		t.Errorf("marshaled JSON missing field: %s", b)
+	}
+	var c2 config.CPIConfig
+	if err := json.Unmarshal(b, &c2); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if c2.MaxInflightPerNode != 8 {
+		t.Errorf("after round-trip, expected 8, got %d", c2.MaxInflightPerNode)
+	}
+}
+
+// TestMaxInflightPerNode_OmitWhenZero confirms omitempty drops the field at zero.
+func TestMaxInflightPerNode_OmitWhenZero(t *testing.T) {
+	t.Parallel()
+	c := &config.CPIConfig{}
+	b, err := json.Marshal(c)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(b), "max_inflight_per_node") {
+		t.Errorf("zero value should be omitted from JSON; got %s", b)
+	}
+}
+
+// TestValidate_MaxInflightPerNode_NegativeRejected confirms negative values fail validation.
+func TestValidate_MaxInflightPerNode_NegativeRejected(t *testing.T) {
+	t.Parallel()
+	c := registryBaseCfg()
+	c.MaxInflightPerNode = -1
+	err := c.Validate()
+	if err == nil {
+		t.Fatal("expected error for negative max_inflight_per_node, got nil")
+	}
+	if !strings.Contains(err.Error(), "max_inflight_per_node") {
+		t.Errorf("error must mention max_inflight_per_node; got %v", err)
+	}
+}
+
+// TestValidate_MaxInflightPerNode_ZeroValid confirms zero (unlimited) passes validation.
+func TestValidate_MaxInflightPerNode_ZeroValid(t *testing.T) {
+	t.Parallel()
+	c := registryBaseCfg()
+	c.RegistryEndpoint = "https://registry.example.com"
+	c.MaxInflightPerNode = 0
+	if err := c.Validate(); err != nil {
+		t.Errorf("expected no error for zero max_inflight_per_node, got: %v", err)
+	}
+}
+
+// TestValidate_MaxInflightPerNode_PositiveValid confirms a positive value passes.
+func TestValidate_MaxInflightPerNode_PositiveValid(t *testing.T) {
+	t.Parallel()
+	c := registryBaseCfg()
+	c.RegistryEndpoint = "https://registry.example.com"
+	c.MaxInflightPerNode = 4
+	if err := c.Validate(); err != nil {
+		t.Errorf("expected no error for max_inflight_per_node=4, got: %v", err)
+	}
+}
+
+// --------------------------------------------------------------------------
+// StrictConfigValidation — accessor tests
+// --------------------------------------------------------------------------
+
+// TestStrictConfigValidationEnabled_NilField confirms nil *bool → false.
+func TestStrictConfigValidationEnabled_NilField(t *testing.T) {
+	t.Parallel()
+	c := &config.CPIConfig{}
+	if c.StrictConfigValidationEnabled() {
+		t.Error("nil StrictConfigValidation should return false")
+	}
+}
+
+// TestStrictConfigValidationEnabled_ExplicitFalse confirms *false → false.
+func TestStrictConfigValidationEnabled_ExplicitFalse(t *testing.T) {
+	t.Parallel()
+	c := &config.CPIConfig{StrictConfigValidation: boolPtr(false)}
+	if c.StrictConfigValidationEnabled() {
+		t.Error("explicit false should return false")
+	}
+}
+
+// TestStrictConfigValidationEnabled_ExplicitTrue confirms *true → true.
+func TestStrictConfigValidationEnabled_ExplicitTrue(t *testing.T) {
+	t.Parallel()
+	c := &config.CPIConfig{StrictConfigValidation: boolPtr(true)}
+	if !c.StrictConfigValidationEnabled() {
+		t.Error("explicit true should return true")
+	}
+}
+
+// TestStrictConfigValidationEnabled_NilReceiver confirms nil *CPIConfig → false.
+func TestStrictConfigValidationEnabled_NilReceiver(t *testing.T) {
+	t.Parallel()
+	var c *config.CPIConfig
+	if c.StrictConfigValidationEnabled() {
+		t.Error("nil receiver should return false")
+	}
+}
+
+// --------------------------------------------------------------------------
+// StrictConfigValidation — flag OFF: byte-identical guarantee
+// --------------------------------------------------------------------------
+
+// TestStrictOff_UseHaRulesWithoutAntiAffinityStillLoads confirms that with the
+// flag off, a config with use_ha_rules=true but anti_affinity.enabled=false
+// loads without error (current tolerated behavior preserved).
+func TestStrictOff_UseHaRulesWithoutAntiAffinityStillLoads(t *testing.T) {
+	t.Parallel()
+	_, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+		"placement": {
+			"anti_affinity": {
+				"enabled": false,
+				"use_ha_rules": true
+			}
+		}
+	}`)
+	if err != nil {
+		t.Errorf("flag off: use_ha_rules without anti_affinity.enabled must not error; got: %v", err)
+	}
+}
+
+// TestStrictOff_UnknownKeyOnlyWarns confirms an unknown top-level key loads
+// without error when strict is off.
+func TestStrictOff_UnknownKeyOnlyWarns(t *testing.T) {
+	t.Parallel()
+	_, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+		"totally_unknown_key_xyz": 42
+	}`)
+	if err != nil {
+		t.Errorf("flag off: unknown key must not produce an error; got: %v", err)
+	}
+}
+
+// --------------------------------------------------------------------------
+// StrictConfigValidation — flag ON: each rule fires
+// --------------------------------------------------------------------------
+
+// TestStrictOn_UnknownKey confirms an unknown top-level key becomes a hard
+// error when strict_config_validation=true.
+func TestStrictOn_UnknownKey(t *testing.T) {
+	t.Parallel()
+	_, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+		"strict_config_validation": true,
+		"totally_unknown_key_xyz": 42
+	}`)
+	if err == nil {
+		t.Fatal("expected error for unknown key under strict mode, got nil")
+	}
+	if !strings.Contains(err.Error(), "totally_unknown_key_xyz") {
+		t.Errorf("error must name the unknown key; got: %v", err)
+	}
+}
+
+// TestStrictOn_UseHaRulesWithoutAntiAffinity confirms that use_ha_rules=true
+// without anti_affinity.enabled=true is a hard error under strict mode.
+func TestStrictOn_UseHaRulesWithoutAntiAffinity(t *testing.T) {
+	t.Parallel()
+	_, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+		"strict_config_validation": true,
+		"placement": {
+			"anti_affinity": {
+				"enabled": false,
+				"use_ha_rules": true
+			}
+		}
+	}`)
+	if err == nil {
+		t.Fatal("expected error for use_ha_rules without anti_affinity.enabled, got nil")
+	}
+	if !strings.Contains(err.Error(), "use_ha_rules") {
+		t.Errorf("error must mention use_ha_rules; got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "anti_affinity") {
+		t.Errorf("error must mention anti_affinity; got: %v", err)
+	}
+}
+
+// TestStrictOn_NetworkModeSdnNeedsZone confirms that network_mode=sdn with no
+// sdn_zone and sdn_auto_manage_zone=false is a hard error under strict mode.
+func TestStrictOn_NetworkModeSdnNeedsZone(t *testing.T) {
+	t.Parallel()
+	_, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+		"strict_config_validation": true,
+		"network_mode": "sdn",
+		"sdn_zone": "",
+		"sdn_auto_manage_zone": false
+	}`)
+	if err == nil {
+		t.Fatal("expected error for sdn mode without zone, got nil")
+	}
+	if !strings.Contains(err.Error(), "sdn_zone") {
+		t.Errorf("error must mention sdn_zone; got: %v", err)
+	}
+}
+
+// TestStrictOn_NetworkModeAutoZoneEmptyNoError confirms that network_mode=auto
+// with an empty sdn_zone does NOT error under strict mode (auto exempted).
+func TestStrictOn_NetworkModeAutoZoneEmptyNoError(t *testing.T) {
+	t.Parallel()
+	_, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+		"strict_config_validation": true,
+		"network_mode": "auto"
+	}`)
+	if err != nil {
+		t.Errorf("network_mode=auto with empty sdn_zone must not error under strict; got: %v", err)
+	}
+}
+
+// TestStrictOn_DlbRequireSharedStorageWithDlbDisabled confirms that setting
+// require_shared_storage when DLB is not enabled is a hard error under strict.
+func TestStrictOn_DlbRequireSharedStorageWithDlbDisabled(t *testing.T) {
+	t.Parallel()
+	_, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+		"strict_config_validation": true,
+		"placement": {
+			"dlb": {
+				"enabled": false,
+				"require_shared_storage": false
+			}
+		}
+	}`)
+	if err == nil {
+		t.Fatal("expected error for require_shared_storage with dlb disabled, got nil")
+	}
+	if !strings.Contains(err.Error(), "require_shared_storage") {
+		t.Errorf("error must mention require_shared_storage; got: %v", err)
+	}
+}
+
+// TestStrictOn_ValidStrictConfig confirms a fully consistent config loads
+// cleanly under strict mode.
+func TestStrictOn_ValidStrictConfig(t *testing.T) {
+	t.Parallel()
+	_, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+		"strict_config_validation": true,
+		"network_mode": "sdn",
+		"sdn_zone": "myzone",
+		"placement": {
+			"anti_affinity": {
+				"enabled": true,
+				"use_ha_rules": true
+			},
+			"dlb": {
+				"enabled": true,
+				"require_shared_storage": false
+			}
+		}
+	}`)
+	if err != nil {
+		t.Errorf("valid strict config must load cleanly; got: %v", err)
+	}
+}
+
+// TestStrictOn_NetworkModeSdnAutoManageZoneNoError confirms that
+// network_mode=sdn with sdn_auto_manage_zone=true does not require sdn_zone.
+func TestStrictOn_NetworkModeSdnAutoManageZoneNoError(t *testing.T) {
+	t.Parallel()
+	_, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+		"strict_config_validation": true,
+		"network_mode": "sdn",
+		"sdn_auto_manage_zone": true
+	}`)
+	if err != nil {
+		t.Errorf("network_mode=sdn with sdn_auto_manage_zone=true must not error; got: %v", err)
+	}
+}
+
+// TestStrictOff_DlbRequireSharedStorageWithDlbDisabled_NoError confirms that
+// with the flag off, require_shared_storage with DLB disabled still loads
+// without error (byte-identical behavior preserved).
+func TestStrictOff_DlbRequireSharedStorageWithDlbDisabled_NoError(t *testing.T) {
+	t.Parallel()
+	_, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+		"placement": {
+			"dlb": {
+				"enabled": false,
+				"require_shared_storage": false
+			}
+		}
+	}`)
+	if err != nil {
+		t.Errorf("flag off: require_shared_storage with dlb disabled must not error; got: %v", err)
+	}
+}

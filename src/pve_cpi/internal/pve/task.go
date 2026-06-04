@@ -128,10 +128,17 @@ func AwaitTask(ctx context.Context, c Client, node, upid string, opts ...AwaitOp
 
 	exit := status.ExitStatus
 	if exit == "" {
-		// Empty exit status means the task poller returned before PVE wrote
-		// the terminal ExitStatus field. Treating this as success silently
-		// masks tasks that stalled or were killed without a recorded outcome.
-		return cpierrors.Cloud("task %s: empty exit status (polling did not surface completion state)", upid)
+		// Empty exit status means the SDK's TimeoutSeconds window elapsed
+		// before PVE wrote a terminal ExitStatus field — the underlying PVE
+		// task is still running. This is a polling timeout, not a permanent
+		// task failure. Return a retriable error so the BOSH director
+		// re-issues the CPI action (with a fresh VMID if applicable) rather
+		// than holding a queue slot or treating a live task as failed.
+		return cpierrors.WrapAs(
+			fmt.Errorf("task %s: empty exit status (poll timeout — task still running)", upid),
+			cpierrors.TypeRetriableCloud,
+			fmt.Sprintf("task %s: empty exit status (poll timeout — task still running)", upid),
+		)
 	}
 	if exit != "OK" && exit != "ok" {
 		return cpierrors.Cloud("task %s failed: exit status %q", upid, exit)

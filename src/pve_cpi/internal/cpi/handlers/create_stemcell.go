@@ -472,6 +472,21 @@ func HandleCreateStemcell(deps Deps) cpi.Handler {
 			templateNode = node
 		}
 
+		// Per-node in-flight gate (opt-in; limit=0 → unlimited, no gating).
+		// Acquire before the first ensureTemplateVM call on templateNode so
+		// concurrent create_stemcell calls for the same node are serialised when
+		// max_inflight_per_node is set. Replication to other nodes is gated
+		// per-node inside replicateStemcellToNodes.
+		if deps.Config != nil {
+			inflightRelease, inflightErr := inflightSems.acquire(ctx, templateNode, deps.Config.MaxInflightPerNodeLimit())
+			if inflightErr != nil {
+				return nil, cpierrors.Retriable(
+					"create_stemcell: in-flight limit exceeded or context cancelled on node %s: %s",
+					templateNode, inflightErr.Error())
+			}
+			defer inflightRelease()
+		}
+
 		if found {
 			// Dedup: qcow2 already on storage. Build template from it (idempotent).
 			// CPI does NOT own this pre-existing qcow2 → cpiOwnsSource=false so the
@@ -2362,25 +2377,42 @@ func replicateStemcellToNodes(
 		// Build template VM on this node. The replica carries both sha tag and
 		// the per-node tag. We set cp.Node to the target so the replica is
 		// pinned; ensureTemplateVM is called with node as templateNode.
+		//
+		// Per-node in-flight gate wrapped in an IIFE so defer fires at the
+		// end of this node's work rather than the end of the loop function,
+		// avoiding the deferInLoop resource-leak pattern.
 		replicaCP := cp
 		replicaCP.Node = node
-		replicaVMID, tmplErr := ensureReplicaTemplateVM(ctx, deps, node, storage, qcow2Filename, sha256hex, replicaCP, source)
-		if tmplErr != nil {
-			nodeLogger.Warn("create_stemcell: replication: ensure template failed (non-fatal; replica not created)",
-				log.Err(tmplErr),
-			)
-			// Best-effort: delete the uploaded qcow2 to reclaim storage.
-			volumePath := "import/" + qcow2Filename
-			if _, delErr := deps.PVE.Storage().DeleteVolumeIfExists(ctx, node, storage, volumePath); delErr != nil {
-				nodeLogger.Warn("create_stemcell: replication: cleanup of failed upload also failed (non-fatal)",
-					log.Err(delErr),
-				)
+		func() {
+			if deps.Config != nil {
+				replicaRelease, replicaInflightErr := inflightSems.acquire(ctx, node, deps.Config.MaxInflightPerNodeLimit())
+				if replicaInflightErr != nil {
+					nodeLogger.Warn("create_stemcell: replication: in-flight limit; skipping replica node",
+						log.String("node", node),
+						log.Err(replicaInflightErr),
+					)
+					return
+				}
+				defer replicaRelease()
 			}
-			continue
-		}
-		nodeLogger.Info("create_stemcell: replication: replica template created",
-			log.Int64(metadataKeyVMID, replicaVMID),
-		)
+			replicaVMID, tmplErr := ensureReplicaTemplateVM(ctx, deps, node, storage, qcow2Filename, sha256hex, replicaCP, source)
+			if tmplErr != nil {
+				nodeLogger.Warn("create_stemcell: replication: ensure template failed (non-fatal; replica not created)",
+					log.Err(tmplErr),
+				)
+				// Best-effort: delete the uploaded qcow2 to reclaim storage.
+				volumePath := "import/" + qcow2Filename
+				if _, delErr := deps.PVE.Storage().DeleteVolumeIfExists(ctx, node, storage, volumePath); delErr != nil {
+					nodeLogger.Warn("create_stemcell: replication: cleanup of failed upload also failed (non-fatal)",
+						log.Err(delErr),
+					)
+				}
+				return
+			}
+			nodeLogger.Info("create_stemcell: replication: replica template created",
+				log.Int64(metadataKeyVMID, replicaVMID),
+			)
+		}()
 	}
 }
 

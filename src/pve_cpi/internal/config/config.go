@@ -414,6 +414,26 @@ type CPIConfig struct {
 	// Distinct from the scalar StemcellStorage/StemcellTemplateNode/etc. fields
 	// which remain untouched.
 	Stemcell *StemcellProvenanceConfig `json:"stemcell,omitempty"`
+
+	// MaxInflightPerNode caps the number of concurrently outstanding mutating PVE
+	// calls per node. When 0 (the default), no cap is applied and behavior is
+	// byte-identical to prior releases. When > 0, a per-node bounded semaphore
+	// limits concurrent outstanding calls in the five mutating handlers
+	// (create_vm, delete_vm, create_disk, attach_disk, create_stemcell).
+	// The semaphore is process-scoped and sized on first acquisition for a given
+	// node; the limit is process-stable (restart to resize). Must be >= 0; negative
+	// values are rejected at config validation. validate-only-when-set;
+	// omit from ERB when zero.
+	MaxInflightPerNode int `json:"max_inflight_per_node,omitempty"`
+
+	// StrictConfigValidation enables fail-fast config validation. When nil or
+	// *false (the default), unknown top-level keys produce a Warn log and
+	// inconsistent cross-field combinations are tolerated — byte-identical to
+	// prior releases. When *true, the same conditions become hard CloudErrors
+	// that abort startup. Pointer-typed so nil (field absent from JSON) is
+	// distinguishable from an explicit false. Use StrictConfigValidationEnabled()
+	// to obtain the effective bool. Validate-only-when-set; omit from ERB when nil.
+	StrictConfigValidation *bool `json:"strict_config_validation,omitempty"`
 }
 
 // TypeProfile is a named bundle of default cloud_properties applied by the
@@ -499,6 +519,13 @@ type RetryConfig struct {
 	// WithMaxWait and the operation-timeout envelope) and is ignored. Defaults:
 	// base_ms 2000, cap_ms 10000, jitter_pct 10.
 	TaskPoll *RetryPolicy `json:"task_poll,omitempty"`
+
+	// Pushback governs the backoff used when PVE returns HTTP 429 or a
+	// worker-busy / lock-acquire-timeout signal. The PushbackBackoff curve
+	// (5s/60s) is longer than StorageLock (2s/30s) to match PVE's slower
+	// worker-pool drain. max_attempts caps retries; 0 = class default.
+	// Defaults: max_attempts per-handler default, base_ms 5000, cap_ms 60000.
+	Pushback *RetryPolicy `json:"pushback,omitempty"`
 }
 
 // RetryPolicy is the parameter bag shared by every retry class. Each consuming
@@ -778,16 +805,15 @@ func insertionSort(s []string) {
 	}
 }
 
-// warnUnknownFields decodes raw into a flat map, finds keys absent from
-// knownConfigFields, and emits a single Warn entry listing them.
-// Uses a stderr logger so the warning surfaces even before the application
-// logger is fully initialized. Unknown fields are ignored, not rejected, to
-// preserve forward-compatibility when the director sends fields added by
-// future CPI versions.
-func warnUnknownFields(raw []byte) {
+// unknownConfigKeys decodes raw into a flat map and returns the sorted list of
+// top-level keys absent from knownConfigFields. Returns nil when the JSON is
+// malformed (the main decode path handles that error) or when all keys are
+// known. Shared by warnUnknownFields (always-on warn) and the strict-mode
+// unknown-key check (hard error when strict is on).
+func unknownConfigKeys(raw []byte) []string {
 	var flat map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &flat); err != nil {
-		return // malformed JSON is handled by the main decode path
+		return nil
 	}
 	var unknown []string
 	for k := range flat {
@@ -796,9 +822,23 @@ func warnUnknownFields(raw []byte) {
 		}
 	}
 	if len(unknown) == 0 {
-		return
+		return nil
 	}
 	insertionSort(unknown)
+	return unknown
+}
+
+// warnUnknownFields decodes raw into a flat map, finds keys absent from
+// knownConfigFields, and emits a single Warn entry listing them.
+// Uses a stderr logger so the warning surfaces even before the application
+// logger is fully initialized. Unknown fields are ignored, not rejected, to
+// preserve forward-compatibility when the director sends fields added by
+// future CPI versions.
+func warnUnknownFields(raw []byte) {
+	unknown := unknownConfigKeys(raw)
+	if len(unknown) == 0 {
+		return
+	}
 	logger, err := log.NewLogger("warn", os.Stderr)
 	if err != nil {
 		return
@@ -806,6 +846,18 @@ func warnUnknownFields(raw []byte) {
 	logger.Warn("config: unknown fields ignored (forward-compat)",
 		log.String("fields", strings.Join(unknown, ", ")),
 	)
+}
+
+// validateStrictUnknownKeys appends an error to errs for each unknown
+// top-level key found in raw, but only when strict config validation is
+// enabled. When strict is off this is a no-op so behavior is byte-identical.
+func (c *CPIConfig) validateStrictUnknownKeys(raw []byte, errs *[]string) {
+	if !c.StrictConfigValidationEnabled() {
+		return
+	}
+	for _, k := range unknownConfigKeys(raw) {
+		*errs = append(*errs, fmt.Sprintf("unknown config key %q (strict_config_validation=true)", k))
+	}
 }
 
 // MaxConfigBytes caps the CPI configuration JSON at 1 MiB. Realistic BOSH
@@ -837,8 +889,24 @@ func Load(r io.Reader) (*CPIConfig, error) {
 		return nil, cpierrors.Cloud("config: decode failed: %s", err.Error())
 	}
 	cfg.ApplyDefaults()
-	if err := cfg.Validate(); err != nil {
-		return nil, err
+
+	// Collect strict unknown-key errors here (needs raw bytes) alongside the
+	// standard Validate pass. Both accumulate into the same error list so the
+	// operator sees all violations in one shot.
+	var strictErrs []string
+	cfg.validateStrictUnknownKeys(raw, &strictErrs)
+	if err := cfg.ValidateWithLogger(nil); err != nil {
+		if len(strictErrs) == 0 {
+			return nil, err
+		}
+		// Merge strict unknown-key errors into the existing validation error.
+		return nil, cpierrors.Cloud("config validation failed: %s; %s",
+			strings.TrimPrefix(err.Error(), "config validation failed: "),
+			strings.Join(strictErrs, "; "),
+		)
+	}
+	if len(strictErrs) > 0 {
+		return nil, cpierrors.Cloud("config validation failed: %s", strings.Join(strictErrs, "; "))
 	}
 	return &cfg, nil
 }
@@ -1354,6 +1422,9 @@ const (
 	defaultTaskPollBaseMs    = 2000
 	defaultTaskPollCapMs     = 10000
 	defaultTaskPollJitterPct = 10
+
+	defaultPushbackBaseMs = 5000
+	defaultPushbackCapMs  = 60000
 )
 
 // retryPolicyOrNil returns the named sub-policy, or nil when the retry block or
@@ -1425,6 +1496,24 @@ func (c *CPIConfig) RetryTaskPoll() EffectiveRetryPolicy {
 		out.BaseMs = resolveField(p.BaseMs, defaultTaskPollBaseMs)
 		out.CapMs = resolveField(p.CapMs, defaultTaskPollCapMs)
 		out.JitterPct = resolveField(p.JitterPct, defaultTaskPollJitterPct)
+	}
+	return out
+}
+
+// RetryPushback returns the resolved pushback (HTTP 429 / worker-busy) backoff
+// policy. BaseMs is the initial delay, CapMs the ceiling, MaxAttempts the
+// retry budget (0 → caller chooses its own default).
+func (c *CPIConfig) RetryPushback() EffectiveRetryPolicy {
+	p := c.retryPolicyOf(func(r *RetryConfig) *RetryPolicy { return r.Pushback })
+	out := EffectiveRetryPolicy{
+		BaseMs: defaultPushbackBaseMs,
+		CapMs:  defaultPushbackCapMs,
+	}
+	if p != nil {
+		out.MaxAttempts = p.MaxAttempts // 0 → caller default
+		out.BaseMs = resolveField(p.BaseMs, defaultPushbackBaseMs)
+		out.CapMs = resolveField(p.CapMs, defaultPushbackCapMs)
+		out.JitterPct = resolveField(p.JitterPct, 0) // not used by PushbackBackoff today
 	}
 	return out
 }
@@ -1521,6 +1610,28 @@ func (c *CPIConfig) StemcellDirectorID() string {
 	return c.Stemcell.DirectorID
 }
 
+// MaxInflightPerNodeLimit returns the configured per-node in-flight cap.
+// Returns 0 (unlimited) when the field is absent or zero, preserving
+// byte-identical behavior for existing configurations.
+func (c *CPIConfig) MaxInflightPerNodeLimit() int {
+	if c == nil {
+		return 0
+	}
+	return c.MaxInflightPerNode
+}
+
+// StrictConfigValidationEnabled reports whether strict config validation is
+// active. Returns false when: c is nil, StrictConfigValidation is nil, or
+// StrictConfigValidation is *false. Only an explicit *true returns true.
+// When false, unknown keys warn and cross-field inconsistencies are tolerated
+// (byte-identical to prior releases). When true, both become hard CloudErrors.
+func (c *CPIConfig) StrictConfigValidationEnabled() bool {
+	if c == nil || c.StrictConfigValidation == nil {
+		return false
+	}
+	return *c.StrictConfigValidation
+}
+
 // Validate checks all required fields and enum constraints.
 // Returns a CloudError whose message lists every violation, separated by "; ".
 //
@@ -1550,6 +1661,10 @@ func (c *CPIConfig) ValidateWithLogger(logger *log.Logger) error {
 	c.validateStorageTiers(&errs)
 	c.validateDiskPerformance(&errs)
 	c.validateStemcell(&errs)
+	// Cross-field strict checks. No raw bytes needed; struct fields are read
+	// directly. Appended after all other validators so existing error order is
+	// preserved and strict errors group at the end.
+	c.validateStrictCrossFields(&errs)
 	if len(errs) > 0 {
 		return cpierrors.Cloud("config validation failed: %s", strings.Join(errs, "; "))
 	}
@@ -1739,6 +1854,13 @@ func (c *CPIConfig) validateRanges(errs *[]string) {
 	// run. The fields are int seconds so the JSON shape stays human-friendly;
 	// the conversion to time.Duration happens at the call site.
 	c.appendStemcellFetchTimeoutErrors(errs)
+
+	// max_inflight_per_node: 0 = unlimited (no gating, byte-identical). Negative
+	// is always invalid since it would produce a zero-capacity channel at runtime.
+	if c.MaxInflightPerNode < 0 {
+		*errs = append(*errs, fmt.Sprintf(
+			"max_inflight_per_node must be >= 0, got %d", c.MaxInflightPerNode))
+	}
 }
 
 // Default VMID band bounds, inlined because config cannot import internal/pve
@@ -2040,21 +2162,32 @@ func (c *CPIConfig) validateHooks(errs *[]string) {
 
 // validateDLB validates the optional Placement.DLB sub-block. Skipped when
 // Placement.DLB is nil (validate-only-when-set). All DLBConfig fields are
-// optional *bool or *string with no enum or range constraints — the only
-// invariant enforced here is that, when Enabled is explicitly false and
-// AZName is explicitly "" (sentinel disabled), at least one of them must be
-// non-nil for the block to be meaningful. This is advisory only (a warning
-// path rather than a hard error) so the operator is not blocked by a
-// vacuously-empty dlb block. No error is appended for an all-nil DLB block;
-// the block is simply inert.
-func (c *CPIConfig) validateDLB(_ *[]string) {
+// optional *bool or *string with no enum or range constraints.
+//
+// Rule (d): when DLB is not enabled (master flag off and sentinel AZ not
+// configured), setting require_shared_storage explicitly is meaningless
+// because no VMs are ever DLB-registered. Under strict_config_validation=true
+// this is a hard error. Under strict off it is a no-op (byte-identical).
+func (c *CPIConfig) validateDLB(errs *[]string) {
 	if c.Placement == nil || c.Placement.DLB == nil {
 		return
 	}
-	// No numeric fields; no enum fields; AZName accepts any string including "".
-	// The Strict field on AntiAffinityConfig is a *bool — Go's type system
-	// guarantees the pointer target is a valid bool, so no additional check is
-	// needed. Nothing further to validate.
+	dlb := c.Placement.DLB
+	// No numeric, enum, or string-range constraints beyond what Go types enforce.
+
+	// Rule (d): require_shared_storage meaningful only when DLB is active.
+	// "DLB active" = master Enabled=*true OR a non-empty sentinel AZName.
+	// We check the raw Enabled field (not DLBExplicitlyEnabled) to distinguish
+	// "explicitly false" from "nil/absent". An explicitly false Enabled with a
+	// non-nil RequireSharedStorage that deviates from the default (true) is the
+	// indicator of an inconsistent config.
+	if !c.StrictConfigValidationEnabled() {
+		return
+	}
+	dlbActive := (dlb.Enabled != nil && *dlb.Enabled) || (dlb.AZName != nil && *dlb.AZName != "")
+	if !dlbActive && dlb.RequireSharedStorage != nil {
+		*errs = append(*errs, "placement.dlb.require_shared_storage is only meaningful when DLB is enabled (strict_config_validation=true)")
+	}
 }
 
 // validateHealthCheck validates the optional HealthCheck block.
@@ -2115,6 +2248,7 @@ func (c *CPIConfig) validateRetry(errs *[]string) {
 	checkRaw("storage_import", c.Retry.StorageImport)
 	checkRaw("vmid_alloc", c.Retry.VMIDAlloc)
 	checkRaw("task_poll", c.Retry.TaskPoll)
+	checkRaw("pushback", c.Retry.Pushback)
 
 	// Effective cap >= base. Only meaningful when the operator set at least one
 	// of the two fields for that class (an entirely-absent policy resolves to
@@ -2132,6 +2266,7 @@ func (c *CPIConfig) validateRetry(errs *[]string) {
 	checkEffective("storage_import", c.Retry.StorageImport, c.RetryStorageImport())
 	checkEffective("vmid_alloc", c.Retry.VMIDAlloc, c.RetryVMIDAlloc())
 	checkEffective("task_poll", c.Retry.TaskPoll, c.RetryTaskPoll())
+	checkEffective("pushback", c.Retry.Pushback, c.RetryPushback())
 }
 
 // validateOperationTimeout rejects out-of-range per-class deadlines. Honored
@@ -2250,6 +2385,58 @@ func (c *CPIConfig) validateStemcell(errs *[]string) {
 // stemcellDirectorIDRe matches any string that contains at least one
 // alphanumeric character or hyphen. Used by validateStemcell.
 var stemcellDirectorIDRe = regexp.MustCompile(`[A-Za-z0-9-]`)
+
+// validateStrictCrossFields checks cross-field consistency rules that are
+// advisory (no-op) when strict_config_validation is off, and hard errors when
+// it is on. Called from ValidateWithLogger after all other validators so
+// existing error ordering is preserved. No raw bytes required — all checks
+// read struct fields directly.
+//
+// Rules enforced when strict is on:
+//   (b) use_ha_rules=true requires anti_affinity.enabled=true.
+//   (c) network_mode=sdn requires sdn_zone != "" OR sdn_auto_manage_zone=true.
+//       network_mode=auto is exempt (auto falls back to bridge when no zone).
+//
+// Rule (d) (DLB require_shared_storage without DLB enabled) lives in
+// validateDLB so it shares placement's nil-guard and is co-located with DLB
+// logic.
+func (c *CPIConfig) validateStrictCrossFields(errs *[]string) {
+	if !c.StrictConfigValidationEnabled() {
+		return
+	}
+	c.strictCheckUseHaRules(errs)
+	c.strictCheckSDNZone(errs)
+}
+
+// strictCheckUseHaRules appends an error when use_ha_rules is explicitly true
+// but anti_affinity.enabled is not true. Reads the raw UseHaRules field (not
+// the guarded AntiAffinityUseHaRulesEnabled accessor, which silently returns
+// false when anti-affinity is off).
+func (c *CPIConfig) strictCheckUseHaRules(errs *[]string) {
+	if c.Placement == nil || c.Placement.AntiAffinity == nil {
+		return
+	}
+	aa := c.Placement.AntiAffinity
+	if aa.UseHaRules == nil || !*aa.UseHaRules {
+		return
+	}
+	if aa.Enabled == nil || !*aa.Enabled {
+		*errs = append(*errs, "placement.anti_affinity.use_ha_rules=true requires placement.anti_affinity.enabled=true (strict_config_validation=true)")
+	}
+}
+
+// strictCheckSDNZone appends an error when network_mode=sdn but neither
+// sdn_zone nor sdn_auto_manage_zone satisfies the zone requirement.
+// network_mode=auto is exempt because auto falls back to bridge when no zone.
+func (c *CPIConfig) strictCheckSDNZone(errs *[]string) {
+	if c.NetworkMode != "sdn" {
+		return
+	}
+	if c.SDNZone != "" || c.SDNAutoManageZone {
+		return
+	}
+	*errs = append(*errs, "network_mode=sdn requires sdn_zone or sdn_auto_manage_zone=true (strict_config_validation=true)")
+}
 
 // knownPVEStorageTypes is the exhaustive set of PVE storage plugin names
 // accepted in StorageTierCriteria.Types. Hardcoded here to avoid an import

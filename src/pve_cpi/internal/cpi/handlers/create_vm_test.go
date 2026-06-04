@@ -3624,3 +3624,372 @@ func TestCreateVM_ClonePath_OnlyScsihwSwitch_NoVirtio0Key(t *testing.T) {
 		t.Errorf("Virtio map must be empty when only scsihw switch (no perf opts), got %v", resourceCall.params.Virtio)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// static-IP-in-range containment, gateway audit, searchdomain
+// ---------------------------------------------------------------------------
+
+// TestHandleCreateVM_IPContainment_InRange verifies that a manual IP within the
+// declared range passes without error and the VM is allocated normally.
+func TestHandleCreateVM_IPContainment_InRange(t *testing.T) {
+	t.Parallel()
+	q := &vmMockQEMU{}
+	n := &vmMockNodes{}
+	h := handlers.HandleCreateVM(buildVMDeps(q, n, &vmMockCluster{}, &vmMockAgent{}))
+
+	args := mkArgs("agent-1", testStemcellCID, map[string]any{},
+		map[string]any{
+			"default": map[string]any{
+				"type": "manual", "ip": "10.0.0.5", "netmask": "255.255.255.0",
+				"gateway": "10.0.0.1",
+				"range":   "10.0.0.0/24",
+				"cloud_properties": map[string]any{"bridge": "vmbr0"},
+			},
+		},
+		[]string{}, map[string]any{})
+
+	_, err := h.Handle(context.Background(), args, mkCtx("ip-in-range"))
+	if err != nil {
+		t.Fatalf("expected no error for IP in range, got: %v", err)
+	}
+	if len(q.createCalls) != 1 {
+		t.Errorf("expected 1 VM create call (IP in range), got %d", len(q.createCalls))
+	}
+}
+
+// TestHandleCreateVM_IPContainment_OutOfRange verifies that a manual IP outside
+// the declared range returns a non-retriable CloudError BEFORE any VM is allocated.
+func TestHandleCreateVM_IPContainment_OutOfRange(t *testing.T) {
+	t.Parallel()
+	q := &vmMockQEMU{}
+	n := &vmMockNodes{}
+	h := handlers.HandleCreateVM(buildVMDeps(q, n, &vmMockCluster{}, &vmMockAgent{}))
+
+	args := mkArgs("agent-1", testStemcellCID, map[string]any{},
+		map[string]any{
+			"default": map[string]any{
+				"type": "manual", "ip": "10.0.1.5", "netmask": "255.255.255.0",
+				"gateway": "10.0.0.1",
+				"range":   "10.0.0.0/24",
+				"cloud_properties": map[string]any{"bridge": "vmbr0"},
+			},
+		},
+		[]string{}, map[string]any{})
+
+	_, err := h.Handle(context.Background(), args, mkCtx("ip-out-of-range"))
+	if err == nil {
+		t.Fatal("expected CloudError for IP outside range, got nil")
+	}
+	if !isCloudError(err) {
+		t.Errorf("expected *cpierrors.Error (non-retriable CloudError), got %T: %v", err, err)
+	}
+	// Error must be non-retriable.
+	var cpiErr *cpierrors.Error
+	if errors.As(err, &cpiErr) && cpiErr.OkToRetry() {
+		t.Errorf("containment error must be non-retriable (OkToRetry=false), got OkToRetry=true")
+	}
+	// Message must name the offending IP and range.
+	msg := err.Error()
+	if !strings.Contains(msg, "10.0.1.5") {
+		t.Errorf("error message must contain offending IP 10.0.1.5, got: %s", msg)
+	}
+	if !strings.Contains(msg, "10.0.0.0/24") {
+		t.Errorf("error message must contain the range 10.0.0.0/24, got: %s", msg)
+	}
+	// No VM must have been allocated.
+	if len(q.createCalls) != 0 {
+		t.Errorf("no VM should be allocated when IP is out of range, got %d create calls", len(q.createCalls))
+	}
+}
+
+// TestHandleCreateVM_IPContainment_NoRange verifies that omitting range skips
+// validation — the create succeeds without error.
+func TestHandleCreateVM_IPContainment_NoRange(t *testing.T) {
+	t.Parallel()
+	h := handlers.HandleCreateVM(buildVMDeps(&vmMockQEMU{}, &vmMockNodes{}, &vmMockCluster{}, &vmMockAgent{}))
+
+	args := mkArgs("agent-1", testStemcellCID, map[string]any{},
+		map[string]any{
+			"default": map[string]any{
+				"type": "manual", "ip": "192.168.99.5", "netmask": "255.255.255.0",
+				"gateway": "192.168.99.1",
+				"cloud_properties": map[string]any{"bridge": "vmbr0"},
+			},
+		},
+		[]string{}, map[string]any{})
+
+	_, err := h.Handle(context.Background(), args, mkCtx("no-range"))
+	if err != nil {
+		t.Fatalf("expected no error when range absent, got: %v", err)
+	}
+}
+
+// TestHandleCreateVM_IPContainment_DynamicSkipped verifies that dynamic-type
+// networks are not subject to range containment even when range is set.
+func TestHandleCreateVM_IPContainment_DynamicSkipped(t *testing.T) {
+	t.Parallel()
+	h := handlers.HandleCreateVM(buildVMDeps(&vmMockQEMU{}, &vmMockNodes{}, &vmMockCluster{}, &vmMockAgent{}))
+
+	args := mkArgs("agent-1", testStemcellCID, map[string]any{},
+		map[string]any{
+			"default": map[string]any{
+				"type":  "dynamic",
+				"range": "10.0.0.0/24",
+				"cloud_properties": map[string]any{"bridge": "vmbr0"},
+			},
+		},
+		[]string{}, map[string]any{})
+
+	_, err := h.Handle(context.Background(), args, mkCtx("dynamic-skip"))
+	if err != nil {
+		t.Fatalf("expected no error for dynamic network with range, got: %v", err)
+	}
+}
+
+// TestHandleCreateVM_IPContainment_MalformedRange verifies that a malformed CIDR
+// in range returns a non-retriable CloudError.
+func TestHandleCreateVM_IPContainment_MalformedRange(t *testing.T) {
+	t.Parallel()
+	q := &vmMockQEMU{}
+	h := handlers.HandleCreateVM(buildVMDeps(q, &vmMockNodes{}, &vmMockCluster{}, &vmMockAgent{}))
+
+	args := mkArgs("agent-1", testStemcellCID, map[string]any{},
+		map[string]any{
+			"default": map[string]any{
+				"type": "manual", "ip": "10.0.0.5", "netmask": "255.255.255.0",
+				"gateway": "10.0.0.1",
+				"range":   "not-a-cidr",
+				"cloud_properties": map[string]any{"bridge": "vmbr0"},
+			},
+		},
+		[]string{}, map[string]any{})
+
+	_, err := h.Handle(context.Background(), args, mkCtx("malformed-range"))
+	if err == nil {
+		t.Fatal("expected CloudError for malformed range, got nil")
+	}
+	if !isCloudError(err) {
+		t.Errorf("expected *cpierrors.Error for malformed range, got %T: %v", err, err)
+	}
+	if len(q.createCalls) != 0 {
+		t.Errorf("no VM should be allocated when range is malformed, got %d create calls", len(q.createCalls))
+	}
+}
+
+// TestHandleCreateVM_IPContainment_MultiNIC_SecondOutOfRange verifies that when
+// the second NIC has an out-of-range IP the error names the second network and
+// no VM is allocated.
+func TestHandleCreateVM_IPContainment_MultiNIC_SecondOutOfRange(t *testing.T) {
+	t.Parallel()
+	q := &vmMockQEMU{}
+	h := handlers.HandleCreateVM(buildVMDeps(q, &vmMockNodes{}, &vmMockCluster{}, &vmMockAgent{}))
+
+	args := mkArgs("agent-1", testStemcellCID, map[string]any{},
+		map[string]any{
+			"default": map[string]any{
+				"type": "manual", "ip": "10.0.0.5", "netmask": "255.255.255.0",
+				"gateway": "10.0.0.1",
+				"range":   "10.0.0.0/24",
+				"cloud_properties": map[string]any{"bridge": "vmbr0"},
+			},
+			"storage": map[string]any{
+				"type":  "manual",
+				"ip":    "192.168.2.200",
+				"netmask": "255.255.255.0",
+				"range": "192.168.1.0/24",
+				"cloud_properties": map[string]any{"bridge": "vmbr1"},
+			},
+		},
+		[]string{}, map[string]any{})
+
+	_, err := h.Handle(context.Background(), args, mkCtx("multi-nic-second-out"))
+	if err == nil {
+		t.Fatal("expected CloudError for second NIC out of range, got nil")
+	}
+	if !isCloudError(err) {
+		t.Errorf("expected *cpierrors.Error, got %T: %v", err, err)
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "192.168.2.200") {
+		t.Errorf("error must name offending IP 192.168.2.200, got: %s", msg)
+	}
+	if len(q.createCalls) != 0 {
+		t.Errorf("no VM should be allocated when second NIC IP is out of range, got %d", len(q.createCalls))
+	}
+}
+
+// TestHandleCreateVM_GatewayAudit_WarnOnMissing verifies that a manual network
+// with a static IP but no gateway still succeeds (warn-only, no error).
+// The ipconfig string must not contain "gw=" when gateway is absent.
+func TestHandleCreateVM_GatewayAudit_WarnOnMissing(t *testing.T) {
+	t.Parallel()
+	var capturedNICParams *sdknodes.UpdateQemuConfigParams
+	callCount := 0
+	n := &vmMockNodes{
+		updateConfigFn: func(_ context.Context, _, _ string, params *sdknodes.UpdateQemuConfigParams) error {
+			callCount++
+			if callCount == 1 {
+				capturedNICParams = params
+			}
+			return nil
+		},
+	}
+	h := handlers.HandleCreateVM(buildVMDeps(&vmMockQEMU{}, n, &vmMockCluster{}, &vmMockAgent{}))
+
+	args := mkArgs("agent-1", testStemcellCID, map[string]any{},
+		map[string]any{
+			"default": map[string]any{
+				"type": "manual", "ip": "10.0.0.5", "netmask": "255.255.255.0",
+				// gateway deliberately absent
+				"cloud_properties": map[string]any{"bridge": "vmbr0"},
+			},
+		},
+		[]string{}, map[string]any{})
+
+	_, err := h.Handle(context.Background(), args, mkCtx("no-gw"))
+	if err != nil {
+		t.Fatalf("expected no error when gateway absent (warn only), got: %v", err)
+	}
+	if capturedNICParams == nil {
+		t.Fatal("NIC params not captured")
+	}
+	ipconf := capturedNICParams.Ipconfig[0]
+	if strings.Contains(ipconf, "gw=") {
+		t.Errorf("ipconfig must not contain gw= when gateway is absent, got %q", ipconf)
+	}
+}
+
+// TestHandleCreateVM_Searchdomain_Set verifies that a search_domain in
+// cloud_properties propagates to nicParams.Searchdomain on the UpdateQemuConfig
+// call, and that Nameserver is still set when DNS is present.
+func TestHandleCreateVM_Searchdomain_Set(t *testing.T) {
+	t.Parallel()
+	var capturedNICParams *sdknodes.UpdateQemuConfigParams
+	callCount := 0
+	n := &vmMockNodes{
+		updateConfigFn: func(_ context.Context, _, _ string, params *sdknodes.UpdateQemuConfigParams) error {
+			callCount++
+			if callCount == 1 {
+				capturedNICParams = params
+			}
+			return nil
+		},
+	}
+	h := handlers.HandleCreateVM(buildVMDeps(&vmMockQEMU{}, n, &vmMockCluster{}, &vmMockAgent{}))
+
+	args := mkArgs("agent-1", testStemcellCID, map[string]any{},
+		map[string]any{
+			"default": map[string]any{
+				"type": "manual", "ip": "10.0.0.5", "netmask": "255.255.255.0",
+				"gateway": "10.0.0.1",
+				"dns":     []string{"8.8.8.8"},
+				"cloud_properties": map[string]any{
+					"bridge":        "vmbr0",
+					"search_domain": "corp.example.com",
+				},
+			},
+		},
+		[]string{}, map[string]any{})
+
+	_, err := h.Handle(context.Background(), args, mkCtx("searchdomain-set"))
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+	if capturedNICParams == nil {
+		t.Fatal("NIC params not captured")
+	}
+	if capturedNICParams.Searchdomain == nil {
+		t.Fatal("Searchdomain must be set when search_domain cloud_property is present")
+	}
+	if *capturedNICParams.Searchdomain != "corp.example.com" {
+		t.Errorf("Searchdomain = %q; want corp.example.com", *capturedNICParams.Searchdomain)
+	}
+	// Nameserver must still be set.
+	if capturedNICParams.Nameserver == nil || !strings.Contains(*capturedNICParams.Nameserver, "8.8.8.8") {
+		t.Errorf("Nameserver must still be set when DNS present, got %v", capturedNICParams.Nameserver)
+	}
+}
+
+// TestHandleCreateVM_Searchdomain_DnsSearchAlias verifies that the "dns_search"
+// cloud_property key is also accepted as a search domain source.
+func TestHandleCreateVM_Searchdomain_DnsSearchAlias(t *testing.T) {
+	t.Parallel()
+	var capturedNICParams *sdknodes.UpdateQemuConfigParams
+	callCount := 0
+	n := &vmMockNodes{
+		updateConfigFn: func(_ context.Context, _, _ string, params *sdknodes.UpdateQemuConfigParams) error {
+			callCount++
+			if callCount == 1 {
+				capturedNICParams = params
+			}
+			return nil
+		},
+	}
+	h := handlers.HandleCreateVM(buildVMDeps(&vmMockQEMU{}, n, &vmMockCluster{}, &vmMockAgent{}))
+
+	args := mkArgs("agent-1", testStemcellCID, map[string]any{},
+		map[string]any{
+			"default": map[string]any{
+				"type": "manual", "ip": "10.0.0.5", "netmask": "255.255.255.0",
+				"gateway": "10.0.0.1",
+				"cloud_properties": map[string]any{
+					"bridge":     "vmbr0",
+					"dns_search": "search.example.com",
+				},
+			},
+		},
+		[]string{}, map[string]any{})
+
+	_, err := h.Handle(context.Background(), args, mkCtx("dns-search-alias"))
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+	if capturedNICParams == nil {
+		t.Fatal("NIC params not captured")
+	}
+	if capturedNICParams.Searchdomain == nil {
+		t.Fatal("Searchdomain must be set when dns_search cloud_property is present")
+	}
+	if *capturedNICParams.Searchdomain != "search.example.com" {
+		t.Errorf("Searchdomain = %q; want search.example.com", *capturedNICParams.Searchdomain)
+	}
+}
+
+// TestHandleCreateVM_Searchdomain_Absent verifies byte-identical behavior when
+// no search domain cloud_property is supplied: Searchdomain remains nil.
+func TestHandleCreateVM_Searchdomain_Absent(t *testing.T) {
+	t.Parallel()
+	var capturedNICParams *sdknodes.UpdateQemuConfigParams
+	callCount := 0
+	n := &vmMockNodes{
+		updateConfigFn: func(_ context.Context, _, _ string, params *sdknodes.UpdateQemuConfigParams) error {
+			callCount++
+			if callCount == 1 {
+				capturedNICParams = params
+			}
+			return nil
+		},
+	}
+	h := handlers.HandleCreateVM(buildVMDeps(&vmMockQEMU{}, n, &vmMockCluster{}, &vmMockAgent{}))
+
+	args := mkArgs("agent-1", testStemcellCID, map[string]any{},
+		map[string]any{
+			"default": map[string]any{
+				"type": "manual", "ip": "10.0.0.5", "netmask": "255.255.255.0",
+				"gateway": "10.0.0.1",
+				"cloud_properties": map[string]any{"bridge": "vmbr0"},
+			},
+		},
+		[]string{}, map[string]any{})
+
+	_, err := h.Handle(context.Background(), args, mkCtx("searchdomain-absent"))
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+	if capturedNICParams == nil {
+		t.Fatal("NIC params not captured")
+	}
+	if capturedNICParams.Searchdomain != nil {
+		t.Errorf("Searchdomain must be nil when no search_domain property set, got %q", *capturedNICParams.Searchdomain)
+	}
+}

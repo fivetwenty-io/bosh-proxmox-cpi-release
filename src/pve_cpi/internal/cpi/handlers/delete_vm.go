@@ -30,6 +30,8 @@ import (
 //  5. Call deps.Agent.Remove to clean up registry/cloud-init state.
 //
 // Returns nil result on success (including when the VM was already absent).
+//
+//nolint:gocognit // Orchestration shell: locate+stop+guard+delete+await+agent-cleanup. Steps are individually simple; combined complexity is inherent to the idempotent delete contract.
 func HandleDeleteVM(deps Deps) cpi.Handler {
 	return cpi.HandlerFunc(func(ctx context.Context, args []json.RawMessage, _ jsonrpc.Context) (any, error) {
 		// --- argument extraction ---
@@ -73,6 +75,15 @@ func HandleDeleteVM(deps Deps) cpi.Handler {
 			return nil, nil
 		}
 		logger.Debug("delete_vm: VM located", log.String("node", node))
+
+		// --- per-node in-flight gate (opt-in; limit=0 → unlimited, no gating) ---
+		if deps.Config != nil {
+			inflightRelease, inflightErr := inflightSems.acquire(ctx, node, deps.Config.MaxInflightPerNodeLimit())
+			if inflightErr != nil {
+				return nil, cpierrors.Retriable("delete_vm: in-flight limit exceeded or context cancelled on node %s: %s", node, inflightErr.Error())
+			}
+			defer inflightRelease()
+		}
 
 		// --- stop VM ---
 		if stopDone, stopErr := stopVMBeforeDelete(ctx, deps, node, vmid, vmCID, logger); stopErr != nil {

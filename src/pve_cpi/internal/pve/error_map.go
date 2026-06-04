@@ -12,11 +12,26 @@ import (
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 )
 
+// pvePushbackPhrases is the conservative set of lower-cased substrings that
+// identify PVE server-side rate-limiting or worker-pool exhaustion. Each phrase
+// is matched case-insensitively against the full error string. The set is kept
+// intentionally narrow — false positives (non-retriable errors misclassified as
+// pushback) are worse than false negatives (missing a retriable case).
+var pvePushbackPhrases = []string{
+	"too many requests",
+	"worker busy",
+	"worker pool",
+	"unable to acquire lock",
+	"lock-acquire timeout",
+	"got timeout",
+}
+
 // WrapError maps an SDK or network error to the appropriate BOSH CPI error type:
 //   - nil → nil
 //   - SDK 404 (APIError.IsNotFound) → non-retriable CloudError
 //   - SDK 5xx (errors.Is ErrServer) → retriable RetriableCloudError
-//   - SDK 4xx non-404 → non-retriable CloudError
+//   - SDK 429 / pushback phrase → retriable RetriableCloudError (pushback subtype)
+//   - SDK 4xx non-404 non-429 → non-retriable CloudError
 //   - net.Error Timeout() → retriable RetriableCloudError
 //   - SDK ConnectionError or TimeoutError → retriable RetriableCloudError
 //   - everything else → non-retriable CloudError wrapping original message
@@ -43,7 +58,7 @@ func WrapError(err error) error {
 		return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, "network timeout: "+err.Error())
 	}
 
-	// SDK APIError: check HTTP code for 404 vs 5xx vs other 4xx.
+	// SDK APIError: check HTTP code for 404 vs 5xx vs 429 vs other 4xx.
 	var apiErr *sdkerrors.APIError
 	if errors.As(err, &apiErr) {
 		if apiErr.IsNotFound() {
@@ -53,7 +68,12 @@ func WrapError(err error) error {
 		if errors.Is(err, sdkerrors.ErrServer) {
 			return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, "PVE server error: "+apiErr.Error())
 		}
-		// 4xx non-404 → non-retriable.
+		// 429 Too Many Requests → retriable pushback. Checked inside the APIError
+		// branch so the HTTPCode field is available without a second errors.As.
+		if apiErr.HTTPCode == 429 {
+			return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, "PVE pushback (429): "+apiErr.Error())
+		}
+		// 4xx non-404 non-429 → non-retriable.
 		return cpierrors.Cloud("PVE API error: %s", apiErr.Error())
 	}
 
@@ -66,6 +86,10 @@ func WrapError(err error) error {
 	}
 	if IsPmxcfsConfigMissing(err) {
 		return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, "PVE pmxcfs race (config gone mid-flight): "+err.Error())
+	}
+	// Plain-text pushback phrases (task-body or non-APIError surfaces).
+	if IsPVEPushback(err) {
+		return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, "PVE pushback: "+err.Error())
 	}
 
 	// Fallback: generic wrap as non-retriable CloudError.
@@ -410,4 +434,41 @@ func IsPmxcfsConfigMissing(err error) bool {
 	return (strings.Contains(msg, "Configuration file ") &&
 		strings.Contains(msg, "does not exist")) ||
 		strings.Contains(msg, "unable to find configuration file")
+}
+
+// IsPVEPushback reports whether err signals PVE server-side rate-limiting or
+// worker-pool exhaustion. Two signal surfaces are covered:
+//
+//  1. HTTP 429 Too Many Requests — pveproxy enforces a per-source request cap;
+//     the SDK surfaces this as an *sdkerrors.APIError with HTTPCode 429.
+//
+//  2. Conservative phrase set matched case-insensitively against the full error
+//     string. The phrases are kept intentionally narrow — the goal is to catch
+//     well-known PVE pushback messages without false-positive-classifying
+//     unrelated permanent errors as retriable.
+//
+// Callers that need the longer PushbackBackoff curve (5s/60s) rather than the
+// StorageLockBackoff (2s/30s) should check IsPVEPushback first. Note that
+// storage-lock timeout strings ("can't lock file … got timeout") overlap with
+// the "got timeout" phrase so IsPVEPushback is a superset of IsStorageLockTimeout
+// for plain-text errors — both return true for the same lock-timeout string.
+//
+// nil → false.
+func IsPVEPushback(err error) bool {
+	if err == nil {
+		return false
+	}
+	// HTTP 429 via SDK APIError (HTTPCode field is set by ParseAPIError).
+	var apiErr *sdkerrors.APIError
+	if errors.As(err, &apiErr) && apiErr.HTTPCode == 429 {
+		return true
+	}
+	// Plain-text phrase matching (task-body errors, non-APIError surfaces).
+	msg := strings.ToLower(err.Error())
+	for _, phrase := range pvePushbackPhrases {
+		if strings.Contains(msg, phrase) {
+			return true
+		}
+	}
+	return false
 }
