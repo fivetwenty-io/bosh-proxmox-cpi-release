@@ -705,6 +705,20 @@ properties:
       availability). Set false for a preferred pin that lets HA relocate off-AZ on
       total AZ failure. Ignored when pin_az_via_ha_rules is false.
     default: true
+  pve.placement.fallback_max:
+    description: |
+      Maximum number of alternate candidate nodes to try after a transient clone or
+      VM start failure on the initially selected node. When 0 (default), create_vm
+      makes a single attempt on the selected node and returns any failure immediately
+      — behavior is unchanged from prior releases. When > 0, on a transient failure
+      (classified by the same transient/permanent classifier used for intra-attempt
+      retries) the CPI cleans up the partial VM (purges it, freeing the VMID) and
+      retries on the next-ranked candidate from the same constrained placement set
+      (same AZ restriction and disk fault-domain co-location constraints). Permanent
+      errors (missing clone source, non-retriable PVE errors) fail immediately
+      without consuming alternates. Valid range: 0 (off) to 5. Recommended
+      operational value: 2.
+    default: 0
   pve.stemcell_replicate_local:
     description: |
       When true, create_stemcell uploads the stemcell qcow2 independently to every

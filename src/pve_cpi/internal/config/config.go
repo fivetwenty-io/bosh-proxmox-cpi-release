@@ -788,6 +788,24 @@ type PlacementConfig struct {
 	// non-strict (preferred) pin that lets HA relocate off-AZ on total AZ
 	// failure. Use PinAZStrict().
 	PinAZStrict *bool `json:"pin_az_strict,omitempty"`
+
+	// FallbackMax controls post-selection fallback placement. When a clone or VM
+	// start fails transiently after node selection, the CPI cleans up the failed
+	// attempt and retries on the next-ranked candidate from the same scored set,
+	// up to FallbackMax alternates (so at most 1+FallbackMax total attempts).
+	//
+	// Default 0 (nil or zero): disabled. The handler makes a single attempt on
+	// the winner and propagates any error without fallback — byte-identical to
+	// pre-feature behavior. Recommended operational value: 2.
+	//
+	// Valid range: 0–5. Negative values and values >5 are rejected by Validate.
+	// Fallback only applies when placement scoring is active (PlacementEnabled).
+	// Transient vs permanent failure classification uses the same pve classifiers
+	// as the existing intra-attempt retry (IsTransientTransport, IsStorageLockTimeout,
+	// IsVMIDConflict for clone; IsTransientTransport for start). Permanent errors
+	// (IsCloneSourceMissing, any non-transient error) surface immediately without
+	// consuming alternates. Use PlacementFallbackMaxValue() for the effective int.
+	FallbackMax *int `json:"fallback_max,omitempty"`
 }
 
 // AntiAffinityConfig holds the Tier-2 same-group spreading knobs.
@@ -1368,6 +1386,19 @@ func (c *CPIConfig) PinAZStrict() bool {
 		return true
 	}
 	return *c.Placement.PinAZStrict
+}
+
+// PlacementFallbackMaxValue returns the maximum number of alternate nodes to
+// try after a transient create or start failure on the initially selected node.
+//
+// Returns 0 when: c is nil, Placement is nil, or FallbackMax is nil or zero.
+// 0 means the fallback path is fully disabled — behavior is byte-identical to
+// pre-feature releases. Positive values enable the post-selection fallback loop.
+func (c *CPIConfig) PlacementFallbackMaxValue() int {
+	if c == nil || c.Placement == nil || c.Placement.FallbackMax == nil {
+		return 0
+	}
+	return *c.Placement.FallbackMax
 }
 
 // AZCandidates returns the node list for az and true when az is a known key in
@@ -2492,6 +2523,20 @@ func (c *CPIConfig) validatePlacement(errs *[]string) {
 	c.validateDLB(errs)
 	// Node-affinity HA pin: cross-field rules.
 	c.validateHANodeAffinityPin(errs)
+	// FallbackMax: must be in [0, 5].
+	const placementFallbackMaxCap = 5
+	if c.Placement.FallbackMax != nil {
+		v := *c.Placement.FallbackMax
+		if v < 0 {
+			*errs = append(*errs, fmt.Sprintf(
+				"placement.fallback_max must be >= 0, got %d", v,
+			))
+		} else if v > placementFallbackMaxCap {
+			*errs = append(*errs, fmt.Sprintf(
+				"placement.fallback_max must be <= %d, got %d", placementFallbackMaxCap, v,
+			))
+		}
+	}
 }
 
 // validateHANodeAffinityPin enforces the cross-field rules for the

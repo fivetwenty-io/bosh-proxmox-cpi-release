@@ -333,6 +333,25 @@ func createVM(
 	// -----------------------------------------------------------------------
 	// 2–3. Resolve node and VM-shape parameters.
 	// -----------------------------------------------------------------------
+
+	// Post-selection fallback (opt-in: placement.fallback_max > 0).
+	// When disabled (default 0), the single-shot path below runs byte-identical
+	// to pre-feature behavior — no extra cluster calls, no behavior change.
+	// When enabled, a separate path resolves the ranked candidate list and loops
+	// over alternates on transient clone or start failure.
+	fallbackMax := 0
+	if deps.Config != nil {
+		fallbackMax = deps.Config.PlacementFallbackMaxValue()
+	}
+
+	if fallbackMax > 0 {
+		return createVMWithFallback(ctx, deps, logger, parsed, jrCtx, fallbackMax, &retErr)
+	}
+
+	// -----------------------------------------------------------------------
+	// Single-shot path (fallback disabled, default) — byte-identical to
+	// pre-feature behavior.
+	// -----------------------------------------------------------------------
 	shape, err := resolveVMShape(ctx, deps, parsed)
 	if err != nil {
 		return nil, err
@@ -569,6 +588,191 @@ func createVM(
 	return []any{vmCID, responseNetworks}, nil
 }
 
+// createVMWithFallback runs the post-selection fallback loop for create_vm.
+// Called only when PlacementFallbackMaxValue() > 0.
+//
+// Invariants:
+//   - Intermediate (non-final) failed attempts are fully purged via cleanupVM
+//     before the next candidate is tried. No orphan VMs are left.
+//   - keep_failed_vms tagging and rollbackOnExit apply only to the FINAL outcome
+//     (success or terminal-fail). Intermediate failures are silently cleaned up.
+//   - Fallback only activates on transient clone errors (IsTransientTransport,
+//     IsStorageLockTimeout) or transient start errors (IsTransientTransport).
+//     Permanent errors (IsCloneSourceMissing, any non-transient error) surface
+//     immediately without consuming alternates.
+//   - The in-flight semaphore from step 3b is NOT acquired here to keep the
+//     fallback loop simple; the semaphore protects per-node concurrency and is
+//     best applied to the final committed node rather than each attempt node.
+//
+//nolint:gocognit,gocritic // Fallback loop + rollback + final-side-effects; inherent complexity.
+// ptrToRefParam: retErr is a pointer to createVM's named return value so
+// rollbackOnExit and RegisterRollback can observe the final error at defer-time.
+// This is the same pattern as createVM itself; gocritic's suggestion (*error →
+// non-pointer) would break the caller's named-return observation.
+func createVMWithFallback(
+	ctx context.Context,
+	deps Deps,
+	logger *log.Logger,
+	parsed *createVMParsedArgs,
+	jrCtx jsonrpc.Context,
+	fallbackMax int,
+	retErr *error, //nolint:gocritic // ptrToRefParam: same named-return pointer pattern as createVM
+) (any, error) {
+	shape, alternates, err := resolveVMShapeWithAlternates(ctx, deps, parsed, fallbackMax)
+	if err != nil {
+		return nil, err
+	}
+
+	// Build the ordered list of candidates: [winner, alternates...].
+	candidates := make([]string, 0, 1+len(alternates))
+	candidates = append(candidates, shape.node)
+	candidates = append(candidates, alternates...)
+
+	var lastErr error
+	for attemptIdx, candidateNode := range candidates {
+		isLast := attemptIdx == len(candidates)-1
+
+		vmid, responseNetworks, allocErr, startErr, otherErr := buildAndStartVMAttempt(
+			ctx, deps, logger, parsed, shape, candidateNode, jrCtx)
+
+		// Determine whether to fall back or commit.
+		var attemptErr error
+		var shouldFallback bool
+		switch {
+		case allocErr != nil:
+			attemptErr = allocErr
+			shouldFallback = isTransientAllocateError(allocErr)
+		case otherErr != nil:
+			// Resize, NICs, disks, ephemeral, agent — non-fallback errors.
+			attemptErr = otherErr
+			shouldFallback = false
+		case startErr != nil:
+			attemptErr = startErr
+			shouldFallback = isTransientStartError(startErr)
+		}
+
+		if attemptErr != nil {
+			// Clean up this attempt's partial VM (if any was created).
+			if vmid != 0 {
+				cleanupVM(contextWithoutCancel(ctx), deps, candidateNode, vmid, logger)
+			}
+
+			if !shouldFallback || isLast {
+				// Permanent error OR exhausted candidates — propagate last error.
+				lastErr = attemptErr
+				break
+			}
+
+			// Transient and alternates remain — log and advance.
+			logger.Warn("create_vm: fallback: transient error on candidate, trying next",
+				log.String("node", candidateNode),
+				log.Int("attempt", attemptIdx+1),
+				log.Int("remaining", len(candidates)-attemptIdx-1),
+				log.Err(attemptErr),
+			)
+			lastErr = attemptErr
+			continue
+		}
+
+		// Success on this candidate. Arm rollback for post-start steps 8b-11.
+		// shape.node is set to the winning candidateNode for all subsequent calls.
+		winningNode := candidateNode
+		winningVMID := vmid
+		vmCreated := true
+		defer rollbackOnExit(ctx, deps, winningNode, winningVMID, parsed.env, logger, &vmCreated, retErr) //nolint:gocritic // deferInLoop: intentional — defer fires at function return, not loop-end; only one candidate succeeds
+		cpi.RegisterRollback(ctx, func(c context.Context) {
+			disposeFailedVM(c, deps, winningNode, winningVMID, parsed.env, logger)
+		})
+
+		logger.Info("create_vm: vm created and disk imported",
+			log.Int(metadataKeyVMID, winningVMID),
+			log.String("stemcell_cid", parsed.stemcellCID),
+			log.String("storage", shape.vmStorage),
+			log.Int("root_disk_gib", shape.rootDiskGiB),
+			log.String("node", winningNode),
+			log.Int("attempt", attemptIdx+1),
+		)
+
+		// Build a node-specific shape copy for post-start steps that read shape.node.
+		winShape := *shape
+		winShape.node = winningNode
+
+		// -----------------------------------------------------------------------
+		// 8b. Firewall
+		// -----------------------------------------------------------------------
+		effectiveGroups, groupErr := resolveEffectiveSecurityGroups(
+			parsed.cloudPropsMap, deps.Config, parsed.cloudProps.SecurityGroups)
+		if groupErr != nil {
+			return nil, groupErr
+		}
+		if len(effectiveGroups) > 0 {
+			if fwErr := applySecurityGroups(ctx, deps, winShape.node, winningVMID, effectiveGroups, logger); fwErr != nil {
+				return nil, fwErr
+			}
+		} else {
+			firewallEnabled, fwFlagErr := resolveEffectiveFirewall(parsed.cloudPropsMap, deps.Config)
+			if fwFlagErr != nil {
+				return nil, fwFlagErr
+			}
+			if firewallEnabled {
+				if fwErr := enableVMFirewall(ctx, deps, winShape.node, winningVMID, logger); fwErr != nil {
+					return nil, fwErr
+				}
+			}
+		}
+
+		// -----------------------------------------------------------------------
+		// 8c. VIP ipfilter
+		// -----------------------------------------------------------------------
+		if vipErr := applyVIPAllowedAddressPairs(ctx, deps, winShape.node, winningVMID, parsed.networks, logger); vipErr != nil {
+			logger.Warn("create_vm: VIP ipfilter not fully applied (non-fatal)",
+				log.Int(metadataKeyVMID, winningVMID), log.Err(vipErr))
+		}
+
+		// -----------------------------------------------------------------------
+		// 9. HA anti-affinity
+		// -----------------------------------------------------------------------
+		if deps.Config.AntiAffinityUseHaRulesEnabled() {
+			if groupKey := sanitizeTagValue(instanceGroupName(parsed.env)); groupKey != "" {
+				if aaErr := ensureAntiAffinityMembership(ctx, deps, groupKey, winningVMID, logger); aaErr != nil {
+					logger.Warn("create_vm: HA anti-affinity membership not fully applied (non-fatal)",
+						log.Int(metadataKeyVMID, winningVMID), log.String("group", groupKey), log.Err(aaErr))
+				}
+			}
+		}
+
+		// -----------------------------------------------------------------------
+		// 9b. AZ node-affinity HA pin
+		// -----------------------------------------------------------------------
+		applyAZNodeAffinityPin(ctx, deps, winningVMID, parsed.cloudProps, winShape.node, logger)
+
+		// -----------------------------------------------------------------------
+		// 10. DLB membership
+		// -----------------------------------------------------------------------
+		if deps.Config.DLBEligibleForAZ(parsed.cloudProps.AvailabilityZone) {
+			if dlbErr := ensureDLBMembership(ctx, deps, winningVMID, parsed.cloudProps.AvailabilityZone, logger); dlbErr != nil {
+				logger.Warn("create_vm: DLB membership not fully applied (non-fatal)",
+					log.Int(metadataKeyVMID, winningVMID), log.Err(dlbErr))
+			}
+		}
+
+		// -----------------------------------------------------------------------
+		// 11. Health gate
+		// -----------------------------------------------------------------------
+		if deps.Config.HealthCheckEnabled() {
+			if hcErr := runHealthGate(ctx, deps, winShape.node, winningVMID, logger); hcErr != nil {
+				return nil, hcErr
+			}
+		}
+
+		vmCID := strconv.Itoa(winningVMID)
+		return []any{vmCID, responseNetworks}, nil
+	}
+
+	// All candidates exhausted (or single permanent-fail).
+	return nil, lastErr
+}
+
 // parseCreateVMArgs validates and unmarshals the 6-element create_vm JSON args array.
 // Returns cpierrors.CloudError on any validation failure.
 func parseCreateVMArgs(args []json.RawMessage) (*createVMParsedArgs, error) {
@@ -780,6 +984,95 @@ func resolveVMShape(ctx context.Context, deps Deps, parsed *createVMParsedArgs) 
 		ephemeralDiskGiB: ephemeralDiskGiB,
 		ephemeralStorage: ephemeralStorage,
 	}, nil
+}
+
+// resolveVMShapeWithAlternates is like resolveVMShape but additionally returns
+// the ordered list of alternate node names (from the same scored candidate pass)
+// capped at fallbackMax. Used by the post-selection fallback path when
+// PlacementFallbackMaxValue() > 0.
+//
+// Returns (shape, nil, err) when placement scoring produces no alternates
+// (operator target_node, static config.node, or single-node cluster), so the
+// caller must treat a nil alternates slice as "no fallback available".
+func resolveVMShapeWithAlternates(
+	ctx context.Context,
+	deps Deps,
+	parsed *createVMParsedArgs,
+	fallbackMax int,
+) (shape *createVMShape, alternates []string, err error) {
+	cp := parsed.cloudProps
+	groupTag := antiAffinityGroupTag(deps.Config, parsed.env)
+
+	winner, alts, nodeErr := resolveTargetNodeWithFallbacks(
+		ctx, deps, cp, groupTag, parsed.diskCIDs, nil, parsed.cloudPropsMap, fallbackMax)
+	if nodeErr != nil {
+		return nil, nil, nodeErr
+	}
+
+	rangeStart, maxAttempts := resolveVMIDAllocParams(deps.Config)
+	var tierFnForVM vmStorageTierFn
+	if deps.PVE != nil && deps.PVE.ClusterStorage() != nil {
+		lister := deps.PVE.ClusterStorage()
+		cfg := deps.Config
+		tierFnForVM = func(tier string) (string, error) {
+			return resolveStorageTier(ctx, lister, cfg, tier)
+		}
+	}
+	vmStorage, vmDiskFormat, rootDiskGiB, err := resolveVMShapeStorage(deps.Config, parsed, tierFnForVM)
+	if err != nil {
+		return nil, nil, err
+	}
+	cores, sockets, memMiB := resolveVMShapeCPUMem(cp)
+	hotplug, numaEnabled, err := resolveVMShapeHotplugNUMAWithError(deps.Config, cp, parsed.cloudPropsMap)
+	if err != nil {
+		return nil, nil, err
+	}
+	initialTags := mergeTagList(nil, buildCustomTags(cp.Tags), maxTagLength)
+	initialName := resolveVMShapeInitialName(deps.Config, parsed)
+	vmStorageType := lookupVMStorageType(ctx, deps, vmStorage)
+
+	perfR, perfRErr := newLayeredResolver(parsed.cloudPropsMap, deps.Config)
+	if perfRErr != nil {
+		return nil, nil, perfRErr
+	}
+	rawPerfOpts, perfOptsErr := resolveDiskPerfOptions(perfR, deps.Config)
+	if perfOptsErr != nil {
+		return nil, nil, perfOptsErr
+	}
+	rootDiskPerfOpts := filterDiskPerfForBus(rawPerfOpts, "virtio")
+
+	scsihwVal := "virtio-scsi-pci"
+	if resolveVirtioSCSISingle(perfR, deps.Config) {
+		scsihwVal = "virtio-scsi-single"
+	}
+
+	ephemeralDiskGiB, ephemeralStorage, err := resolveEphemeralShape(deps.Config, cp, parsed.cloudPropsMap)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	s := &createVMShape{
+		node:             winner,
+		vmStorage:        vmStorage,
+		vmStorageType:    vmStorageType,
+		vmDiskFormat:     vmDiskFormat,
+		rootDiskGiB:      rootDiskGiB,
+		cores:            cores,
+		sockets:          sockets,
+		memMiB:           memMiB,
+		hotplug:          hotplug,
+		numaEnabled:      numaEnabled,
+		initialTags:      initialTags,
+		rangeStart:       rangeStart,
+		maxAttempts:      maxAttempts,
+		initialName:      initialName,
+		cloudPropsMap:    parsed.cloudPropsMap,
+		rootDiskPerfOpts: rootDiskPerfOpts,
+		scsihw:           scsihwVal,
+		ephemeralDiskGiB: ephemeralDiskGiB,
+		ephemeralStorage: ephemeralStorage,
+	}
+	return s, alts, nil
 }
 
 // resolveTargetNode determines which PVE node the new VM will land on.
@@ -1094,6 +1387,267 @@ func resolveTargetNodeWithRNG(
 	return node, nil
 }
 
+// resolveTargetNodeWithFallbacks extends resolveTargetNodeWithRNG to also return
+// the ordered list of alternate node names from the same scored pass, capped at
+// fallbackMax. When fallbackMax == 0, this is equivalent to the existing single-
+// winner path and no alternates are returned (nil). When the winner comes from
+// Branch 1 (operator target_node), Branch 3 (static config.node), or the
+// config.node fallback inside Branch 2, no ranked alternates are available and
+// alternates is nil — the caller must treat nil as "no fallback candidates".
+//
+// The alternates slice does NOT include the winner; it is the tail of the ranked
+// list starting at rank 2. All alternates passed the same Filter constraints
+// (same AZ, same maintenance/CPU/mem filter) as the winner.
+//
+//nolint:gocognit // Mirrors resolveTargetNodeWithRNG complexity; inherent multi-AZ loop.
+func resolveTargetNodeWithFallbacks(
+	ctx context.Context,
+	deps Deps,
+	cp createVMCloudProps,
+	groupTag string,
+	diskCIDs []string,
+	rng *rand.Rand,
+	cloudPropsMap map[string]any,
+	fallbackMax int,
+) (winner string, alternates []string, err error) {
+	logger := deps.Logger
+	if logger == nil {
+		logger = log.NewNopLogger()
+	}
+
+	diskConstraints, dcErr := deriveDiskFaultConstraints(ctx, deps, diskCIDs)
+	if dcErr != nil {
+		return "", nil, dcErr
+	}
+
+	// Branch 1: operator pin — no alternates.
+	if cp.TargetNode != "" {
+		if diskConstraints.requiredLocalNode != "" && diskConstraints.requiredLocalNode != cp.TargetNode {
+			return "", nil, cpierrors.Cloud(
+				"create_vm: cloud_properties.target_node=%q conflicts with local disk placement constraint (disk node=%q); "+
+					"set target_node=%q or move the disk to shared storage",
+				cp.TargetNode, diskConstraints.requiredLocalNode, diskConstraints.requiredLocalNode,
+			)
+		}
+		logger.Debug("create_vm: node selection: operator override via target_node",
+			log.String("node", cp.TargetNode),
+		)
+		return cp.TargetNode, nil, nil
+	}
+
+	var cpResolver *layeredResolver
+	if deps.Config != nil {
+		var resolverErr error
+		cpResolver, resolverErr = newLayeredResolver(cloudPropsMap, deps.Config)
+		if resolverErr != nil {
+			return "", nil, resolverErr
+		}
+	}
+
+	// Branch 2: live placement scoring — alternates available.
+	if deps.Config.PlacementEnabled() && deps.PVE != nil {
+		azOrder := buildAZOrder(cp, deps.Config, rng, cpResolver)
+
+		if len(diskConstraints.requiredAZs) > 0 {
+			azOrder, dcErr = applyDiskAZConstraint(azOrder, diskConstraints.requiredAZs)
+			if dcErr != nil {
+				return "", nil, dcErr
+			}
+		}
+
+		for _, az := range azOrder {
+			_, ok := deps.Config.AZCandidates(az)
+			if !ok && (az != deps.Config.DLBAZName() || deps.Config.DLBAZName() == "") {
+				return "", nil, cpierrors.Cloud(
+					"create_vm: availability_zone %q is not defined in placement.az_map; "+
+						"add the AZ to config.placement.az_map or remove availability_zone from cloud_properties",
+					az,
+				)
+			}
+		}
+
+		storageName := deps.Config.VMStorage
+		excludeMaintenance := deps.Config.ExcludeMaintenanceNodesEnabled()
+		facts, gatherErr := placement.GatherNodeFacts(ctx,
+			deps.PVE.Cluster(),
+			deps.PVE.Nodes(),
+			logger,
+			placement.GatherOptions{
+				StorageName:             storageName,
+				GroupTag:                groupTag,
+				ExcludeMaintenanceNodes: excludeMaintenance,
+				MaintenanceNodeTags:     deps.Config.MaintenanceNodeTagsValue(),
+			},
+		)
+		if gatherErr != nil {
+			return "", nil, cpierrors.Wrap(pve.WrapError(gatherErr),
+				"create_vm: placement: gather node facts")
+		}
+
+		w := deps.Config.EffectiveWeights()
+		weights := placement.Weights{
+			Mem:        w.Mem,
+			Storage:    w.Storage,
+			CPU:        w.CPU,
+			GuestCount: w.GuestCount,
+		}
+		if cpResolver != nil {
+			if f, found := cpResolver.Float("placement_weight_mem"); found {
+				weights.Mem = f
+			}
+			if f, found := cpResolver.Float("placement_weight_storage"); found {
+				weights.Storage = f
+			}
+			if f, found := cpResolver.Float("placement_weight_cpu"); found {
+				weights.CPU = f
+			}
+			if f, found := cpResolver.Float("placement_weight_guest_count"); found {
+				weights.GuestCount = f
+			}
+		}
+		if groupTag != "" {
+			weights.AntiAffinity = placement.DefaultWeights().AntiAffinity
+		}
+
+		localPin := diskConstraints.requiredLocalNode
+		if localPin != "" {
+			var pinnedFact *placement.NodeFacts
+			for i := range facts {
+				if facts[i].Node == localPin {
+					pinnedFact = &facts[i]
+					break
+				}
+			}
+			if pinnedFact == nil {
+				return "", nil, cpierrors.Cloud(
+					"create_vm: local disk is pinned to node %q but that node "+
+						"is not reachable in the cluster (offline, removed, or unknown); "+
+						"ensure the disk's home node is online before creating the VM",
+					localPin,
+				)
+			}
+			if pinnedFact.InMaintenance {
+				return "", nil, cpierrors.Cloud(
+					"create_vm: local disk is pinned to node %q but that node "+
+						"is currently in maintenance; wait for maintenance to complete or "+
+						"migrate the disk to a different node",
+					localPin,
+				)
+			}
+			if !pinnedFact.Online {
+				return "", nil, cpierrors.Cloud(
+					"create_vm: local disk is pinned to node %q but that node "+
+						"is offline; bring the node online before creating the VM",
+					localPin,
+				)
+			}
+			logger.Debug("create_vm: node selection: local disk pins node",
+				log.String("node", localPin),
+			)
+			return localPin, nil, nil
+		}
+
+		allRejections := make(map[string]string)
+
+		if len(azOrder) == 0 {
+			req := placement.Request{
+				ExcludeMaintenanceNodes: excludeMaintenance,
+			}
+			pass, rejections := placement.Filter(facts, req)
+			mergeRejections(allRejections, rejections)
+			logFilterRejections(logger, rejections, "")
+			if chosen, ranked := scoreAndPickWithRanked(pass, weights, logger, ""); chosen != "" {
+				alts := buildAlternates(chosen, ranked, fallbackMax)
+				return chosen, alts, nil
+			}
+		} else {
+			for _, az := range azOrder {
+				candidateSet, skipSilently := resolveAZCandidatesValidated(az, deps.Config, logger)
+				if skipSilently {
+					continue
+				}
+				req := placement.Request{
+					CandidateNodes:          candidateSet,
+					ExcludeMaintenanceNodes: excludeMaintenance,
+				}
+				pass, rejections := placement.Filter(facts, req)
+				mergeRejections(allRejections, rejections)
+				logFilterRejections(logger, rejections, az)
+				if chosen, ranked := scoreAndPickWithRanked(pass, weights, logger, az); chosen != "" {
+					alts := buildAlternates(chosen, ranked, fallbackMax)
+					return chosen, alts, nil
+				}
+				logger.Debug("create_vm: placement: AZ exhausted, trying next",
+					log.String("az", az),
+				)
+			}
+		}
+
+		// All AZs exhausted — fall back to config.node (no alternates).
+		fallback := deps.Config.Node
+		logger.Warn("create_vm: placement: no viable candidates; falling back to config.node",
+			log.String("fallback", fallback),
+		)
+		if fallback == "" {
+			if classifyFilterResult(allRejections) {
+				return "", nil, cpierrors.Retriable(
+					"create_vm: no viable placement candidates (transient); "+
+						"all nodes rejected: %s",
+					formatRejections(allRejections),
+				)
+			}
+			return "", nil, cpierrors.Cloud(
+				"create_vm: no viable placement candidates; "+
+					"all nodes rejected: %s",
+				formatRejections(allRejections),
+			)
+		}
+		return fallback, nil, nil
+	}
+
+	// Branch 3: placement disabled or PVE nil — no alternates.
+	if diskConstraints.requiredLocalNode != "" {
+		logger.Debug("create_vm: node selection: local disk pins node (placement disabled)",
+			log.String("node", diskConstraints.requiredLocalNode),
+		)
+		return diskConstraints.requiredLocalNode, nil, nil
+	}
+
+	node := deps.Config.Node
+	if node == "" {
+		return "", nil, cpierrors.Cloud(
+			"create_vm: target node not set in cloud_properties.target_node or config.node",
+		)
+	}
+	logger.Debug("create_vm: node selection: placement disabled, using config.node",
+		log.String("node", node),
+	)
+	return node, nil, nil
+}
+
+// buildAlternates extracts up to fallbackMax alternate node names from the ranked
+// list, skipping the winner (first entry). Returns nil when fallbackMax == 0 or
+// the ranked list has only one entry.
+func buildAlternates(winner string, ranked []string, fallbackMax int) []string {
+	if fallbackMax <= 0 || len(ranked) <= 1 {
+		return nil
+	}
+	alts := make([]string, 0, fallbackMax)
+	for _, n := range ranked {
+		if n == winner {
+			continue
+		}
+		alts = append(alts, n)
+		if len(alts) >= fallbackMax {
+			break
+		}
+	}
+	if len(alts) == 0 {
+		return nil
+	}
+	return alts
+}
+
 // applyDiskAZConstraint reconciles the VM's AZ order with the AZs required by
 // shared-storage persistent disk CIDs.
 //
@@ -1360,6 +1914,30 @@ func scoreAndPick(pass []placement.NodeFacts, weights placement.Weights, logger 
 		)
 	}
 	return chosen
+}
+
+// scoreAndPickWithRanked scores the passed nodes, picks the best, and returns
+// the full ranked list alongside the winner. The ranked list is in descending
+// score order (winner first) and contains the node names in that order.
+// Returns ("", nil) when pass is empty.
+func scoreAndPickWithRanked(pass []placement.NodeFacts, weights placement.Weights, logger *log.Logger, az string) (winner string, rankedNodes []string) {
+	if len(pass) == 0 {
+		return "", nil
+	}
+	scored := placement.Score(pass, weights, nil)
+	chosen := placement.Pick(scored, nil)
+	if chosen == "" {
+		return "", nil
+	}
+	logger.Info("create_vm: node selection: placement scoring chose node",
+		log.String("node", chosen),
+		log.String("az", az),
+	)
+	nodes := make([]string, len(scored))
+	for i, sn := range scored {
+		nodes[i] = sn.Node
+	}
+	return chosen, nodes
 }
 
 // logFilterRejections emits a Debug entry for each rejection.
@@ -1770,6 +2348,130 @@ func resolveVMShapeInitialName(cfg *config.CPIConfig, parsed *createVMParsedArgs
 	return composeVMName(cfg.VMPrefix, initialDeployment, initialJobName, "")
 }
 
+// isTransientAllocateError reports whether the error returned by allocateVM
+// (after its internal per-VMID retry exhaustion) is a transient condition that
+// post-selection fallback should treat as "try a different node". Only errors
+// whose root cause may change when a different cluster node is chosen are
+// returned true; VMID-conflict and similar VMID-only conditions are excluded
+// because retrying on a fresh node with the same VMID pool is not guaranteed
+// to resolve the conflict.
+//
+// Permanent conditions (IsCloneSourceMissing) return false — the stemcell
+// template is missing cluster-wide, not just on this node; a fallback would
+// not help and would only delay surfacing the real error.
+func isTransientAllocateError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if pve.IsCloneSourceMissing(err) {
+		return false
+	}
+	return pve.IsTransientTransport(err) || pve.IsStorageLockTimeout(err)
+}
+
+// isTransientStartError reports whether the error returned by
+// startVMAndReadConfig is a transient condition that warrants a post-selection
+// fallback to the next-ranked node.
+//
+// startVMAndReadConfig wraps start errors as cpierrors.Cloud strings, breaking
+// the SDK error chain. To detect transient start failures, this function checks
+// both the unwrapped chain (for raw SDK errors that escaped the RetryOnTransient
+// wrapper) and the error message string (for errors whose chain was string-wrapped).
+// It also checks if the wrapped cpierrors is retriable (WrapAs + TypeRetriableCloud).
+func isTransientStartError(err error) bool {
+	if err == nil {
+		return false
+	}
+	// Check the SDK error chain first (raw transport error, not string-wrapped).
+	if pve.IsTransientTransport(err) {
+		return true
+	}
+	// cpierrors.Cloud wraps as TypeCloud (non-retriable), so OkToRetry() won't
+	// help here. Fall back to message-string inspection as a last resort.
+	// The string check covers the "create_vm: start vmid=N: <transport error>"
+	// message shape produced by startVMAndReadConfig.
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "connection refused") ||
+		strings.Contains(msg, "connection reset") ||
+		strings.Contains(msg, "auto-login failed") ||
+		strings.Contains(msg, "failed to parse login response") ||
+		strings.Contains(msg, "(code: 596)") ||
+		strings.Contains(msg, "http 596") ||
+		strings.Contains(msg, "i/o timeout") ||
+		strings.Contains(msg, "deadline exceeded")
+}
+
+// buildAndStartVMAttempt runs steps 4–8 (allocate, resize, NICs, disks,
+// ephemeral, agent, start) on the given candidate node. On success it returns
+// the allocated VMID and populated response-networks map.
+// On any error it is the CALLER's responsibility to call cleanupVM when the
+// VMID is non-zero (the VM was created but a later step failed).
+//
+// shape.node is overridden with candidateNode for this attempt; the shape
+// struct is not mutated — a local copy is used.
+//
+// Three error outputs distinguish error categories for the fallback loop:
+//   - allocErr: returned when allocateVM fails (eligible for fallback on transient).
+//   - startErr: returned when startVMAndReadConfig fails (eligible for fallback on transient).
+//   - otherErr: returned when any intermediate step (resize, NICs, etc.) fails
+//     (permanent, no fallback).
+func buildAndStartVMAttempt(
+	ctx context.Context,
+	deps Deps,
+	logger *log.Logger,
+	parsed *createVMParsedArgs,
+	shape *createVMShape,
+	candidateNode string,
+	jrCtx jsonrpc.Context,
+) (vmid int, responseNetworks map[string]createVMNetworkSpec, allocErr error, startErr error, otherErr error) {
+	// Use a node-overridden copy so we never mutate the caller's shape.
+	nodeShape := *shape
+	nodeShape.node = candidateNode
+
+	vmid, err := allocateVMForFallback(ctx, deps, logger, parsed, &nodeShape)
+	if err != nil {
+		return 0, nil, cpierrors.Wrap(err, "create_vm: allocate+create VM"), nil, nil
+	}
+
+	vmName := nodeShape.initialName
+	if vmName == "" {
+		vmName = fmt.Sprintf("vm-%d", vmid)
+	}
+
+	if err := resizeRootDisk(ctx, deps, logger, &nodeShape, vmid); err != nil {
+		return vmid, nil, nil, nil, err
+	}
+
+	netNames, err := configureNICs(ctx, deps, logger, parsed, &nodeShape, vmid)
+	if err != nil {
+		return vmid, nil, nil, nil, err
+	}
+
+	if err := runIPConflictChecks(ctx, deps, logger, parsed, vmid); err != nil {
+		return vmid, nil, nil, nil, err
+	}
+
+	if err := attachPersistentDisks(ctx, deps, logger, parsed, &nodeShape, vmid); err != nil {
+		return vmid, nil, nil, nil, err
+	}
+
+	ephemeralDevPath, err := attachEphemeralDisk(ctx, deps, logger, &nodeShape, vmid)
+	if err != nil {
+		return vmid, nil, nil, nil, err
+	}
+
+	if err := configureAgent(ctx, deps, logger, parsed, &nodeShape, vmid, vmName, ephemeralDevPath, jrCtx); err != nil {
+		return vmid, nil, nil, nil, err
+	}
+
+	responseNetworks, err = startVMAndReadConfig(ctx, deps, logger, parsed, &nodeShape, vmid, netNames)
+	if err != nil {
+		return vmid, nil, nil, err, nil
+	}
+
+	return vmid, responseNetworks, nil, nil, nil
+}
+
 // allocateVM runs AllocateWithRetry: picks a free VMID, calls QEMU.Create,
 // awaits the import task. On conflict or transient errors it retries up to
 // shape.maxAttempts times. Returns the winning vmid.
@@ -1789,6 +2491,45 @@ func allocateVM(
 			return false
 		}
 		return pve.IsVMIDConflict(e) || pve.IsStorageLockTimeout(e) || pve.IsTransientTransport(e)
+	}
+
+	vmid, err := pve.AllocateWithRetry(ctx, deps.PVE,
+		func(candidate int) error {
+			return attemptCreateVM(ctx, deps, logger, parsed, shape, candidate)
+		},
+		isRetryable,
+		shape.maxAttempts,
+		pve.WithRange(shape.rangeStart, deps.Config.VMIDRangeEnd),
+		pve.WithBackoffFunc(newCreateVMRetryBackoff(
+			deps.Config.RetryStorageImport(), deps.Config.RetryVMIDAlloc())),
+	)
+	return vmid, err
+}
+
+// allocateVMForFallback is a variant of allocateVM used by the post-selection
+// fallback path. It differs from allocateVM in one critical way: transient
+// transport errors are NOT retried internally. Instead they propagate immediately
+// so the fallback loop can decide whether to try the next candidate node.
+//
+// VMID conflicts and storage-lock timeouts are still retried internally (they
+// are VMID-specific, not node-specific, and retrying with a fresh VMID on the
+// same node is still correct). Clone-source-missing remains permanent.
+func allocateVMForFallback(
+	ctx context.Context,
+	deps Deps,
+	logger *log.Logger,
+	parsed *createVMParsedArgs,
+	shape *createVMShape,
+) (int, error) {
+	isRetryable := func(e error) bool {
+		if pve.IsCloneSourceMissing(e) {
+			return false
+		}
+		// Transient transport: NOT retried here — let the fallback loop handle it.
+		if pve.IsTransientTransport(e) {
+			return false
+		}
+		return pve.IsVMIDConflict(e) || pve.IsStorageLockTimeout(e)
 	}
 
 	vmid, err := pve.AllocateWithRetry(ctx, deps.PVE,

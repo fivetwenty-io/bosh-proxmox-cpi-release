@@ -298,6 +298,12 @@
     end
   end
 
+  # placement.fallback_max: emit only when > 0. Zero (default) means the fallback
+  # path is disabled — omitting the key preserves the Go nil *int -> 0 -> OFF
+  # behavior, byte-identical to prior releases.
+  v = p("pve.placement.fallback_max", 0).to_i
+  placement["fallback_max"] = v unless v == 0
+
   config["placement"] = placement unless placement.empty?
 
   # Emit vm_firewall only when explicitly true. The Go accessor defaults

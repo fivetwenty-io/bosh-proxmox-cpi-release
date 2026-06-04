@@ -50,7 +50,7 @@ GC — now recorded as "Limits" under each feature. Second, the wider reference 
 up **ten genuinely new gaps (§7.26–§7.35)**, none of which appeared in the prior report; they
 are extensions of the shipped work (enforce the invariants §7.9 records, monitor the resizes
 §7.24 sizes, make the polling §7.25 fixed adaptive, and so on). The first four (§7.26–§7.29)
-have since been **shipped**; §7.30 has also shipped; §7.32 has also shipped; §7.35 has also shipped; §7.31, §7.33–§7.34 remain **open**.
+have since been **shipped**; §7.30 has also shipped; §7.31 has also shipped; §7.32 has also shipped; §7.35 has also shipped; §7.33–§7.34 remain **open**.
 The §3 matrix gained one correction (Azure `update_disk` is a full method, now `Y`), and the
 §6 standout list was corrected against source in several places — most notably that
 process-level panic recovery (§7.4) is *not* unique to OpenStack-Go (Google has it too). The
@@ -1182,7 +1182,7 @@ curves are pure and deterministic except for seeded jitter.
 
 These ten did not appear in the prior report. They surfaced from the deeper reference
 re-read and the source-level verification of the shipped features above. The first four
-(§7.26–§7.30) have since been **shipped**; §7.32 has also been **shipped**; §7.35 has also been **shipped**; §7.31, §7.33–§7.34 remain **open**. Each follows the same
+(§7.26–§7.32) have since been **shipped**; §7.35 has also been **shipped**; §7.33–§7.34 remain **open**. Each follows the same
 additive-optional convention the shipped work established: validate only when set, omit from
 VM config when empty, zero behavior change for existing manifests. They are ordered roughly by
 effort-to-value, not severity.
@@ -1284,17 +1284,33 @@ adds the five `Options` fields. Pairs with §7.28 (adaptive task polling) as the
 pre-timing-pass scale mitigations. Validated ≥ 0 at config load; negative values are
 rejected. Spec properties added under `pve.api_*`; ERB emits each key only when non-zero.
 
-#### 7.31 OPEN — Post-selection fallback placement on transient create/start failure
+#### 7.31 DONE — Post-selection fallback placement on transient create/start failure
 
 *References: vSphere, AWS.* §7.10 ships multi-AZ candidate fallback at *placement-decision*
-time, but once a node is chosen and the clone or start fails transiently (ephemeral storage
-briefly full, a node momentarily wedged), there is no retry-on-alternate — an immediately
-failing clone is treated as permanent. vSphere keeps a primary-plus-fallback placement list
-and retries the next placement on `GenericVmConfigFault`; AWS retries up to twice on
-`AbruptlyTerminated`. **Build:** on a transient create/start failure after node selection,
-fall through to the next-ranked candidate from the §7.10 scorer (which already produces a
-ranked list) instead of failing `create_vm`, using the §7.23 classifier to decide
-retry-vs-fail. The post-selection analogue of the already-shipped pre-selection fallback.
+time (pre-selection). §7.31 is the complementary *post-selection* analogue: once a node is
+chosen and the clone or start fails transiently (ephemeral storage briefly full, a node
+momentarily wedged), the CPI retries on the next-ranked candidate rather than surfacing the
+failure immediately.
+
+**Shipped:** opt-in `pve.placement.fallback_max` integer (default 0, byte-identical to prior
+releases). When set to a positive value (valid range 1–5; recommended 2):
+
+- On a transient clone or VM start failure, the partial VM is cleaned up — purged from PVE
+  and its VMID freed — before the next attempt begins.
+- The next-ranked candidate is drawn from the same constrained scored set that produced the
+  original winner: AZ node restriction and disk fault-domain co-location constraints are
+  preserved across all attempts.
+- The transient/permanent classification reuses the shared error classifier: a clone failure
+  falls back when it is `IsTransientTransport` or `IsStorageLockTimeout`; a start failure falls
+  back when it is `IsTransientTransport`. VMID conflicts are not a fallback trigger — they are
+  resolved on the same node by the allocate-with-retry loop, which regenerates the VMID (see
+  §7.33), so they never surface to the candidate loop. Permanent errors (missing clone source,
+  non-retriable PVE errors) fail immediately without consuming alternates.
+- At most `1 + fallback_max` total attempts are made; 0 means the feature is fully off.
+
+This is the post-selection analogue of the §7.10 pre-selection multi-AZ fallback, closing
+the gap observed in vSphere (primary-plus-fallback placement list, retries on
+`GenericVmConfigFault`) and AWS (up to two retries on `AbruptlyTerminated`).
 
 #### 7.32 DONE — Fast-path delete (tag-and-return without terminal-state poll)
 

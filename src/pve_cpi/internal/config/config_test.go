@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"math/big"
 	"os"
 	"strings"
@@ -5378,5 +5379,127 @@ func TestStemcellReplicationConcurrency_OmitWhenZero(t *testing.T) {
 	}
 	if strings.Contains(string(raw), "stemcell_replication_concurrency") {
 		t.Errorf("zero value should be omitted in JSON, but got: %s", raw)
+	}
+}
+
+// --------------------------------------------------------------------------
+// PlacementFallbackMax (§7.31)
+// --------------------------------------------------------------------------
+
+// TestPlacementFallbackMax_Negative rejects negative values.
+func TestPlacementFallbackMax_Negative(t *testing.T) {
+	t.Parallel()
+	_, err := mustLoad(t, `{
+		"host": "h", "user": "u", "password": "p",
+		"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
+		"placement": {"fallback_max": -1}
+	}`)
+	assertCloudError(t, err, "placement.fallback_max must be >= 0")
+}
+
+// TestPlacementFallbackMax_OverCap rejects values > 5.
+func TestPlacementFallbackMax_OverCap(t *testing.T) {
+	t.Parallel()
+	_, err := mustLoad(t, `{
+		"host": "h", "user": "u", "password": "p",
+		"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
+		"placement": {"fallback_max": 6}
+	}`)
+	assertCloudError(t, err, "placement.fallback_max must be <= 5")
+}
+
+// TestPlacementFallbackMax_ZeroIsValid confirms 0 (disabled) passes validation.
+func TestPlacementFallbackMax_ZeroIsValid(t *testing.T) {
+	t.Parallel()
+	cfg, err := mustLoad(t, `{
+		"host": "h", "user": "u", "password": "p",
+		"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
+		"placement": {"fallback_max": 0}
+	}`)
+	if err != nil {
+		t.Fatalf("expected valid config, got: %v", err)
+	}
+	if got := cfg.PlacementFallbackMaxValue(); got != 0 {
+		t.Errorf("PlacementFallbackMaxValue(): want 0, got %d", got)
+	}
+}
+
+// TestPlacementFallbackMax_ValidRange tests accepted values 1-5.
+func TestPlacementFallbackMax_ValidRange(t *testing.T) {
+	t.Parallel()
+	for _, v := range []int{1, 2, 3, 4, 5} {
+		v := v
+		t.Run(fmt.Sprintf("max=%d", v), func(t *testing.T) {
+			t.Parallel()
+			cfg, err := mustLoad(t, fmt.Sprintf(`{
+				"host": "h", "user": "u", "password": "p",
+				"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
+				"placement": {"fallback_max": %d}
+			}`, v))
+			if err != nil {
+				t.Fatalf("fallback_max=%d should be valid, got: %v", v, err)
+			}
+			if got := cfg.PlacementFallbackMaxValue(); got != v {
+				t.Errorf("PlacementFallbackMaxValue(): want %d, got %d", v, got)
+			}
+		})
+	}
+}
+
+// TestPlacementFallbackMax_NilReturnsZero confirms nil Placement returns 0.
+func TestPlacementFallbackMax_NilReturnsZero(t *testing.T) {
+	t.Parallel()
+	cfg := &config.CPIConfig{} // nil Placement
+	if got := cfg.PlacementFallbackMaxValue(); got != 0 {
+		t.Errorf("nil Placement: PlacementFallbackMaxValue() = %d, want 0", got)
+	}
+}
+
+// TestPlacementFallbackMax_NilFallbackMaxReturnsZero confirms nil FallbackMax returns 0.
+func TestPlacementFallbackMax_NilFallbackMaxReturnsZero(t *testing.T) {
+	t.Parallel()
+	cfg := &config.CPIConfig{
+		Placement: &config.PlacementConfig{
+			// FallbackMax nil (absent from JSON)
+		},
+	}
+	if got := cfg.PlacementFallbackMaxValue(); got != 0 {
+		t.Errorf("nil FallbackMax: PlacementFallbackMaxValue() = %d, want 0", got)
+	}
+}
+
+// TestPlacementFallbackMax_RoundTrip confirms JSON marshal/unmarshal preserves the value.
+func TestPlacementFallbackMax_RoundTrip(t *testing.T) {
+	t.Parallel()
+	original := &config.CPIConfig{
+		Placement: &config.PlacementConfig{
+			FallbackMax: intPtr(2),
+		},
+	}
+	raw, err := json.Marshal(original)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var decoded config.CPIConfig
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got := decoded.PlacementFallbackMaxValue(); got != 2 {
+		t.Errorf("round-trip: want 2, got %d", got)
+	}
+}
+
+// TestPlacementFallbackMax_OmitWhenNil confirms nil FallbackMax is omitted from JSON.
+func TestPlacementFallbackMax_OmitWhenNil(t *testing.T) {
+	t.Parallel()
+	cfg := &config.CPIConfig{
+		Placement: &config.PlacementConfig{},
+	}
+	raw, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(raw), "fallback_max") {
+		t.Errorf("nil FallbackMax should be omitted in JSON, but got: %s", raw)
 	}
 }
