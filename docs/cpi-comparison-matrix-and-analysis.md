@@ -1326,15 +1326,22 @@ explicitly in the `AllocateWithRetry` doc comment and locked by
 `TestAllocateWithRetry_RegeneratesDistinctVMID`, which asserts that every VMID across
 all conflict-retry attempts is distinct.
 
-#### 7.34 OPEN — Network-property override precedence (VM props override network defaults)
+#### 7.34 DONE — Network-property override precedence (VM props override network defaults)
 
-*Reference: Google.* §7.8 layered resolution covers disk and VM properties, but network
-settings (bridge, vnet, firewall, MTU) resolve from the per-NIC spec only. There is no
-documented precedence for a VM-level property overriding a network-level default; Google
-models this explicitly (`create_vm.go:162-170`, VM props override `IPForwarding`/
-`EphemeralExternalIP`). **Build:** extend the §7.8 layered model to network attributes so a
-VM `cloud_properties.network_defaults` overrides the per-NIC spec where present. Additive,
-opt-in; mostly a resolver extension over the seam §7.8 already established.
+*Reference: Google.* Shipped in `create_vm.go` (`createVMCloudProps.NetworkDefaults`,
+`configureNICs`). A VM `cloud_properties.network_defaults` map is the final override layer
+for per-NIC attributes. Precedence (highest first):
+
+```
+network_defaults[key]  >  per-NIC spec.cloud_properties[key]  >  resolver default
+```
+
+Supported keys: `bridge` (string), `model` (string), `firewall` (bool). Unknown keys are
+ignored gracefully — cloud_properties are loosely typed and not subject to
+`strict_config_validation`. Absent map or absent key leaves behavior byte-identical to
+pre-feature state. Extends the §7.8 layered resolver model to network attributes without
+changing any resolver, config, spec, or ERB file — `network_defaults` is a call-time
+cloud_property, not CPI config.
 
 #### 7.35 OPEN — Multipart / parallel stemcell upload for large heavy tarballs
 

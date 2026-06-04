@@ -19,6 +19,12 @@ import (
 	sdknodes "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/nodes"
 )
 
+// networkModeBridge is the config.NetworkMode value that forces the bridge path.
+// Defined as a constant because the literal "bridge" appears in both the mode
+// switch and as a PVE node API Type string; keeping them named avoids the goconst
+// threshold while making the distinct semantics explicit.
+const networkModeBridge = "bridge"
+
 // HandleCreateNetwork returns a Handler that implements the BOSH create_network method.
 //
 // Arguments:
@@ -79,7 +85,7 @@ func createNetwork(ctx context.Context, deps Deps, args []json.RawMessage) (any,
 	}
 
 	var bridge string
-	if v, ok := r.String("bridge"); ok {
+	if v, ok := r.String(nicCPKeyBridge); ok {
 		bridge = v
 	} else if cfg.NetworkBridge != "" {
 		bridge = cfg.NetworkBridge
@@ -89,7 +95,7 @@ func createNetwork(ctx context.Context, deps Deps, args []json.RawMessage) (any,
 	switch cfg.NetworkMode {
 	case "sdn":
 		useSDN = true
-	case "bridge":
+	case networkModeBridge:
 		useSDN = false
 	default: // "auto"
 		// Use SDN when a zone is resolvable or vnet name is explicitly provided.
@@ -420,9 +426,9 @@ func createNetworkSDN(
 		"reserved": []string{},
 	}
 	cloudPropsOut := map[string]any{
-		"zone":   zone,
-		"vnet":   vnet,
-		"bridge": vnet,
+		"zone":          zone,
+		"vnet":          vnet,
+		nicCPKeyBridge: vnet,
 	}
 	return []any{vnet, addrProps, cloudPropsOut}, nil
 }
@@ -519,7 +525,7 @@ func createNetworkBridge(
 	autostart := true
 	if err := deps.PVE.Nodes().CreateNetwork(ctx, node, &sdknodes.CreateNetworkParams{
 		Iface:     bridge,
-		Type:      "bridge",
+		Type:      networkModeBridge,
 		Autostart: &autostart,
 	}); err != nil {
 		// 409 = bridge already exists; idempotent.
@@ -545,7 +551,7 @@ func createNetworkBridge(
 		"reserved": []string{},
 	}
 	cloudPropsOut := map[string]any{
-		"bridge":         bridge,
+		nicCPKeyBridge:   bridge,
 		cloudPropNodeKey: node,
 	}
 	return []any{bridge, addrProps, cloudPropsOut}, nil

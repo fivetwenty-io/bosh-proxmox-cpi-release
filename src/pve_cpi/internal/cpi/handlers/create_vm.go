@@ -97,6 +97,16 @@ const defaultNetworkName = "default"
 // shares the literal value but belongs to an unrelated domain.
 const nicTypeDynamic = "dynamic"
 
+// nicCPKeyBridge, nicCPKeyModel, and nicCPKeyFirewall are the cloud_properties
+// map keys used in both per-NIC network specs and VM-level network_defaults
+// (§7.34). Defined as constants to satisfy goconst (>3 occurrences across the
+// package) and to make the key contract explicit.
+const (
+	nicCPKeyBridge   = "bridge"
+	nicCPKeyModel    = "model"
+	nicCPKeyFirewall = "firewall"
+)
+
 // diskKeyVirtio0 is the PVE VM config key for the primary root disk.
 // Used across create_vm, create_stemcell, and get_disks to avoid repeated literals.
 const diskKeyVirtio0 = "virtio0"
@@ -166,6 +176,20 @@ type createVMCloudProps struct {
 	// firewall so the rules take effect. A missing group is a non-retriable
 	// CloudError. Empty (default) means no firewall API calls are made.
 	SecurityGroups []string `json:"security_groups,omitempty"`
+	// NetworkDefaults is an optional map of NIC attribute overrides that apply
+	// to every NIC created by this VM, regardless of the per-NIC
+	// spec.cloud_properties. It is the final override layer in the precedence
+	// chain (highest priority):
+	//
+	//   NetworkDefaults[key] > per-NIC spec.CloudProperties[key] > resolver default
+	//
+	// Supported keys: "bridge" (string), "model" (string), "firewall" (bool).
+	// Unknown keys are ignored gracefully — this is a cloud_property map, not
+	// CPI config, so strict validation does not apply here.
+	// Absent map or absent key → unchanged (byte-identical to pre-override behavior).
+	// Extensibility: add new NIC attributes here as PVE support grows (e.g. mtu,
+	// vlan_tag) without touching the resolver or per-NIC spec parsing.
+	NetworkDefaults map[string]any `json:"network_defaults,omitempty"`
 }
 
 // createVMNetworkSpec mirrors the BOSH v2 network spec shape.
@@ -1434,7 +1458,7 @@ func collectStaticIPsForConflictCheck(parsed *createVMParsedArgs, cfg *config.CP
 			}
 			// Use per-network bridge override when present; otherwise the VM default.
 			bridge := defaultBridge
-			if b, ok := spec.CloudProperties["bridge"].(string); ok && b != "" {
+			if b, ok := spec.CloudProperties[nicCPKeyBridge].(string); ok && b != "" {
 				bridge = b
 			}
 			result[bridge] = append(result[bridge], spec.IP)
@@ -2775,25 +2799,43 @@ func configureNICs(
 
 		// NIC bridge from cloud_properties within the network spec
 		bridge := defaultBridge
-		if cp, ok := spec.CloudProperties["bridge"].(string); ok && cp != "" {
+		if cp, ok := spec.CloudProperties[nicCPKeyBridge].(string); ok && cp != "" {
 			bridge = cp
 		}
 		model := defaultModel
-		if cp, ok := spec.CloudProperties["model"].(string); ok && cp != "" {
+		if cp, ok := spec.CloudProperties[nicCPKeyModel].(string); ok && cp != "" {
 			model = cp
 		}
-
-		// net0 = "virtio,bridge=vmbr0" (no MAC — PVE assigns one)
-		netMap[i] = fmt.Sprintf("%s,bridge=%s", model, bridge)
 
 		// Per-NIC firewall flag. The network cloud_property "firewall" (bool)
 		// overrides the global cfg.VMFirewallEnabled() default for this NIC.
 		// firewall=1 on the NIC alone does not activate filtering — the
 		// VM-level firewall must also be enabled (see applySecurityGroups).
 		nicFirewall := deps.Config.VMFirewallEnabled()
-		if cp, ok := spec.CloudProperties["firewall"].(bool); ok {
+		if cp, ok := spec.CloudProperties[nicCPKeyFirewall].(bool); ok {
 			nicFirewall = cp
 		}
+
+		// §7.34 VM-level network_defaults: final override layer for NIC attributes.
+		// Precedence (highest first):
+		//   parsed.cloudProps.NetworkDefaults[key]
+		//     > per-NIC spec.CloudProperties[key]   (applied above)
+		//     > resolver default (struct field / profile / config / const)
+		// Supported keys: nicCPKeyBridge, nicCPKeyModel, nicCPKeyFirewall.
+		// Unknown keys are silently ignored — cloud_properties are loosely typed.
+		netDefaults := parsed.cloudProps.NetworkDefaults
+		if v, ok := netDefaults[nicCPKeyBridge].(string); ok && v != "" {
+			bridge = v
+		}
+		if v, ok := netDefaults[nicCPKeyModel].(string); ok && v != "" {
+			model = v
+		}
+		if v, ok := netDefaults[nicCPKeyFirewall].(bool); ok {
+			nicFirewall = v
+		}
+
+		// net0 = "virtio,bridge=vmbr0" (no MAC — PVE assigns one)
+		netMap[i] = fmt.Sprintf("%s,bridge=%s", model, bridge)
 		if nicFirewall {
 			netMap[i] += ",firewall=1"
 		}
