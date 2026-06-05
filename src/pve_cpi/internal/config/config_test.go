@@ -146,6 +146,70 @@ func TestValidate_DiskPerfInvariantModeInvalid(t *testing.T) {
 	assertCloudError(t, err, "disk_perf_invariant_mode must be one of")
 }
 
+func TestValidate_ClusterLockModeInvalid(t *testing.T) {
+	t.Parallel()
+	_, err := mustLoad(t, `{
+		"host": "h", "user": "u", "password": "p",
+		"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
+		"cluster_lock_mode": "sdn"
+	}`)
+	assertCloudError(t, err, "cluster_lock_mode must be one of")
+}
+
+func TestValidate_ClusterLockTimeoutNegative(t *testing.T) {
+	t.Parallel()
+	_, err := mustLoad(t, `{
+		"host": "h", "user": "u", "password": "p",
+		"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
+		"cluster_lock_timeout_sec": -1
+	}`)
+	assertCloudError(t, err, "cluster_lock_timeout_sec must be >= 0")
+}
+
+func TestClusterLockAccessors(t *testing.T) {
+	t.Parallel()
+	// Defaults: off, not enabled, verify off, timeout 60.
+	def := &config.CPIConfig{}
+	if def.ClusterLockMode() != "off" || def.ClusterLockEnabled() {
+		t.Errorf("default lock mode should be off/disabled; got %q enabled=%v", def.ClusterLockMode(), def.ClusterLockEnabled())
+	}
+	if def.AntiAffinityVerifyEnabled() {
+		t.Error("default antiaffinity_verify should be false")
+	}
+	if got := def.ClusterLockTimeoutSecValue(); got != 60 {
+		t.Errorf("default timeout should resolve to 60; got %d", got)
+	}
+	// Enabled pool mode + verify + custom timeout.
+	v := true
+	on := &config.CPIConfig{ClusterLock: " POOL ", ClusterLockTimeoutSec: 15, AntiAffinityVerify: &v}
+	if on.ClusterLockMode() != "pool" || !on.ClusterLockEnabled() {
+		t.Errorf("pool mode should normalize+enable; got %q enabled=%v", on.ClusterLockMode(), on.ClusterLockEnabled())
+	}
+	if !on.AntiAffinityVerifyEnabled() {
+		t.Error("antiaffinity_verify should be true")
+	}
+	if got := on.ClusterLockTimeoutSecValue(); got != 15 {
+		t.Errorf("custom timeout should be 15; got %d", got)
+	}
+}
+
+func TestClusterLockModeValid(t *testing.T) {
+	t.Parallel()
+	for _, mode := range []string{"off", "pool"} {
+		cfg, err := mustLoad(t, `{
+			"host": "h", "user": "u", "password": "p",
+			"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
+			"cluster_lock_mode": "`+mode+`"
+		}`)
+		if err != nil {
+			t.Fatalf("mode %q should be valid, got: %v", mode, err)
+		}
+		if got := cfg.ClusterLockMode(); got != mode {
+			t.Errorf("ClusterLockMode(): got %q, want %q", got, mode)
+		}
+	}
+}
+
 func TestValidate_DiskPerfInvariantModeValid(t *testing.T) {
 	t.Parallel()
 	for _, mode := range []string{"enforce", "warn", "off"} {

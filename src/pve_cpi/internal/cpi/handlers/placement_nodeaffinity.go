@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
+	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cluster"
 )
@@ -32,9 +33,14 @@ func naRuleNameFor(vmid int) string {
 // plural availability_zones forms — the scorer picks one AZ but returns only the
 // node), skips the DLB sentinel AZ (DLB intentionally un-pins), and logs any pin
 // failure without failing create_vm. A no-op when pinning is disabled.
-func applyAZNodeAffinityPin(ctx context.Context, deps Deps, vmid int, cp createVMCloudProps, node string, logger *log.Logger) {
+//
+// Selective propagation (C1): a TypeRetriableCloud error (lock-timeout, verify
+// failure) is returned so the director re-drives rather than silently losing the
+// AZ pin guarantee. Generic HA-API failures (HA unconfigured, rule-write hiccup)
+// are logged as warnings and do not fail create_vm, preserving the §7.21 intent.
+func applyAZNodeAffinityPin(ctx context.Context, deps Deps, vmid int, cp createVMCloudProps, node string, logger *log.Logger) error {
 	if !deps.Config.HANodeAffinityPinEnabled() {
-		return
+		return nil
 	}
 	az := pinAZForNode(cp, deps.Config, node)
 	if az == "" {
@@ -44,16 +50,21 @@ func applyAZNodeAffinityPin(ctx context.Context, deps Deps, vmid int, cp createV
 		// is visible rather than mysterious.
 		logger.Debug("create_vm: node-affinity pin skipped; placed node has no requested-AZ membership",
 			log.Int(metadataKeyVMID, vmid), log.String("node", node))
-		return
+		return nil
 	}
 	azNodes, ok := deps.Config.AZCandidates(az)
 	if !ok {
-		return
+		return nil
 	}
 	if pinErr := ensureNodeAffinityPin(ctx, deps, vmid, azNodes, deps.Config.PinAZStrict(), logger); pinErr != nil {
+		if cpierrors.IsType(pinErr, cpierrors.TypeRetriableCloud) {
+			// Lock-timeout or verify-failure: propagate so the director re-drives.
+			return pinErr
+		}
 		logger.Warn("create_vm: HA node-affinity pin not fully applied (non-fatal)",
 			log.Int(metadataKeyVMID, vmid), log.String("az", az), log.Err(pinErr))
 	}
+	return nil
 }
 
 // pinAZForNode returns the AZ the VM was placed in by walking the same AZ order
@@ -114,7 +125,18 @@ func ensureNodeAffinityPin(
 			return fmt.Errorf("node-affinity: delete rule %q for refresh: %w", ruleName, err)
 		}
 	}
-	return createNodeAffinityRule(ctx, svc, ruleName, sid, nodesCSV, strict)
+	if err := createNodeAffinityRule(ctx, svc, ruleName, sid, nodesCSV, strict); err != nil {
+		return err
+	}
+
+	// The node-affinity rule is per-VM (bosh-na-<vmid>), so the only contention
+	// is a create_vm retry of the SAME vmid — there is no cross-group/cross-VM
+	// RMW hazard, and the dedicated per-VMID guest-VMID conflict model already
+	// serializes same-vmid retries. The coarse cluster pool lock is therefore
+	// intentionally NOT taken here. The read-after-write verify is cheap (one
+	// re-list) and applied symmetrically with anti-affinity when enabled, to
+	// catch a rule that a concurrent same-vmid retry left without this resource.
+	return verifyAntiAffinityMember(ctx, deps, ruleName, sid, logger)
 }
 
 // removeNodeAffinityPin deletes a VM's node-affinity rule and deregisters its HA

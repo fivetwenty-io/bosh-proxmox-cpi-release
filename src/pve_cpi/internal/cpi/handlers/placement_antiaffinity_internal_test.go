@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
@@ -23,6 +24,19 @@ type aaClusterStub struct {
 	deleteRuleCalls int
 	failCreateRule  bool
 	failListRules   bool
+	// events, when non-nil, records an ordered op log shared with a fake pool
+	// service so lock/RMW ordering can be asserted across both services.
+	events *[]string
+	// dropMemberOnRecreate, when non-empty, simulates a concurrent writer: on the
+	// next CreateHaRules the named sid is removed from the persisted CSV, so a
+	// read-after-write verify observes the lost member.
+	dropMemberOnRecreate string
+}
+
+func (s *aaClusterStub) record(ev string) {
+	if s.events != nil {
+		*s.events = append(*s.events, ev)
+	}
 }
 
 var _ cluster.Service = (*aaClusterStub)(nil)
@@ -32,6 +46,7 @@ func newAAStub() *aaClusterStub {
 }
 
 func (s *aaClusterStub) ListResources(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+	s.record("list-resources")
 	if s.listResourcesFn != nil {
 		return s.listResourcesFn(), nil
 	}
@@ -50,6 +65,7 @@ func (s *aaClusterStub) DeleteHaResources(_ context.Context, sid string, _ *clus
 }
 
 func (s *aaClusterStub) ListHaRules(_ context.Context, _ *cluster.ListHaRulesParams) (*cluster.ListHaRulesResponse, error) {
+	s.record("list-rules")
 	if s.failListRules {
 		return nil, fmt.Errorf("ha not configured on this cluster")
 	}
@@ -67,18 +83,39 @@ func (s *aaClusterStub) ListHaRules(_ context.Context, _ *cluster.ListHaRulesPar
 }
 
 func (s *aaClusterStub) CreateHaRules(_ context.Context, p *cluster.CreateHaRulesParams) error {
+	s.record("create-rule:" + p.Rule)
 	s.createRuleCalls++
 	if s.failCreateRule {
 		return fmt.Errorf("create rule failed")
 	}
-	s.rules[p.Rule] = p.Resources
+	resources := p.Resources
+	if s.dropMemberOnRecreate != "" {
+		// Simulate a concurrent writer dropping a member from the persisted rule.
+		resources = dropSidFromCSV(resources, s.dropMemberOnRecreate)
+		s.dropMemberOnRecreate = ""
+	}
+	s.rules[p.Rule] = resources
 	return nil
 }
 
 func (s *aaClusterStub) DeleteHaRules(_ context.Context, rule string) error {
+	s.record("delete-rule:" + rule)
 	s.deleteRuleCalls++
 	delete(s.rules, rule)
 	return nil
+}
+
+// dropSidFromCSV returns csv with sid removed, used to simulate a concurrent
+// lost-update in read-after-write verify tests.
+func dropSidFromCSV(csv, sid string) string {
+	parts := strings.Split(csv, ",")
+	out := parts[:0]
+	for _, p := range parts {
+		if p != sid {
+			out = append(out, p)
+		}
+	}
+	return strings.Join(out, ",")
 }
 
 // aaQEMU builds a /cluster/resources qemu entry with a vmid and tags string.

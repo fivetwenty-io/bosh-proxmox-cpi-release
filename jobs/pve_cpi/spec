@@ -421,6 +421,35 @@ properties:
       behavior is unchanged unless disk_performance options were recorded.
       Valid values: "" (empty, same as "enforce"), "enforce", "warn", "off".
     default: ""
+  pve.cluster_lock_mode:
+    description: |
+      Selects the cross-process cluster mutex used to serialize the
+      read-modify-write on a shared HA anti-affinity rule. Two concurrent
+      create_vm invocations for the same instance group both read the old member
+      set and recreate the rule (PVE rules have no partial edit); the last writer
+      wins, silently dropping a member and losing the spread guarantee. When
+      "pool", the CPI acquires a sentinel resource pool (POST /pools is
+      pmxcfs-serialized, create-or-fail) keyed on the group name around that
+      read-modify-write. When empty or "off" (default), no lock is taken and
+      behavior is identical to prior releases.
+      Valid values: "" (empty, same as "off"), "off", "pool".
+    default: ""
+  pve.cluster_lock_timeout_sec:
+    description: |
+      Bounds how long the anti-affinity read-modify-write waits to acquire the
+      cluster lock before returning a retriable error (the BOSH director then
+      re-drives the operation). It also serves as the lock's TTL: a holder whose
+      recorded expiry has passed is treated as crashed and its lock is stolen.
+      Only meaningful when cluster_lock_mode is "pool"; 0 resolves to 60 seconds.
+    default: 0
+  pve.antiaffinity_verify:
+    description: |
+      When true, after recreating an anti-affinity rule the CPI re-lists the HA
+      rules and asserts the target VM is present in the rule's members. A
+      concurrent writer that dropped the member surfaces as a retriable error
+      rather than a silent loss of spread. When false (default), no check runs
+      and behavior is identical to prior releases.
+    default: false
   pve.task_poll_adaptive:
     description: |
       When true, PVE task polling derives its interval from the task's reported

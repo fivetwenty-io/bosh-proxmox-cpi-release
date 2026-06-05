@@ -4,13 +4,31 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
+	"time"
 
+	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
+	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cluster"
 )
+
+// aaOwnerSeq distinguishes successive lock acquisitions within one CPI process
+// so the owner token stamped on a sentinel pool is unique per acquire (the pid
+// alone would repeat across concurrent goroutines in the same process).
+var aaOwnerSeq atomic.Uint64
+
+// clusterLockOwner builds a process-and-request-unique owner token for a
+// sentinel cluster lock: "<pid>-<seq>-<key>-<vmid>". It is stamped into the
+// pool comment for diagnostics and to let an expired holder be distinguished
+// from a live one. The token never needs to be parsed back.
+func clusterLockOwner(key string, vmid int) string {
+	return fmt.Sprintf("%d-%d-%s-%d", os.Getpid(), aaOwnerSeq.Add(1), key, vmid)
+}
 
 // haRuleNamePrefix namespaces every CPI-managed HA anti-affinity rule so a
 // cluster-wide scan can find and clean them by vmid without knowing the group.
@@ -44,6 +62,32 @@ func haRuleNameFor(groupKey string) string {
 	return haRuleNamePrefix + groupKey
 }
 
+// applyAntiAffinityMembership is the create_vm entry point for opt-in HA
+// anti-affinity. It is a no-op unless anti_affinity.use_ha_rules is enabled and
+// the VM carries an instance-group name. Generic HA failures (HA unconfigured,
+// a transient rule-write hiccup) are logged non-fatally, preserving the §7.21
+// best-effort intent; a TypeRetriableCloud error (cluster-lock timeout or
+// read-after-write verify failure) is returned so the director re-drives rather
+// than silently dropping the VM from its spread rule.
+func applyAntiAffinityMembership(ctx context.Context, deps Deps, vmid int, env map[string]any, logger *log.Logger) error {
+	if !deps.Config.AntiAffinityUseHaRulesEnabled() {
+		return nil
+	}
+	groupKey := sanitizeTagValue(instanceGroupName(env))
+	if groupKey == "" {
+		return nil
+	}
+	if aaErr := ensureAntiAffinityMembership(ctx, deps, groupKey, vmid, logger); aaErr != nil {
+		if cpierrors.IsType(aaErr, cpierrors.TypeRetriableCloud) {
+			// Lock-timeout or verify-failure: propagate so the director re-drives.
+			return aaErr
+		}
+		logger.Warn("create_vm: HA anti-affinity membership not fully applied (non-fatal)",
+			log.Int(metadataKeyVMID, vmid), log.String("group", groupKey), log.Err(aaErr))
+	}
+	return nil
+}
+
 // ensureAntiAffinityMembership registers the VM as a PVE HA resource and adds it
 // to the cluster-level negative resource-affinity rule for its BOSH instance
 // group, so PVE enforces spreading at the hypervisor level. It is best-effort:
@@ -58,6 +102,59 @@ func ensureAntiAffinityMembership(ctx context.Context, deps Deps, groupKey strin
 	if groupKey == "" {
 		return nil
 	}
+
+	// When the cross-process cluster lock is enabled, serialize the entire
+	// read-modify-write on the shared bosh-aa-<group> rule against concurrent
+	// create_vm invocations on other hosts. The lock is keyed on the group so
+	// different instance groups never block each other. Acquire failure/timeout
+	// surfaces as a retriable error (the caller logs it best-effort, the director
+	// re-drives); the lock is always released on return, including on RMW error.
+	if deps.Config.ClusterLockEnabled() {
+		handle, lockErr := acquireAntiAffinityLock(ctx, deps, groupKey, vmid)
+		if lockErr != nil {
+			return lockErr
+		}
+		defer func() {
+			if relErr := handle.Release(ctx); relErr != nil {
+				logger.Warn("anti-affinity: release cluster lock failed (non-fatal)",
+					log.String("group", groupKey), log.Err(relErr))
+			}
+		}()
+	}
+
+	return ensureAntiAffinityMembershipLocked(ctx, deps, groupKey, vmid, logger)
+}
+
+// acquireAntiAffinityLock acquires the per-group cross-process sentinel lock.
+// Separated so the lock plumbing (owner token, timeout/TTL from config) stays
+// out of the RMW body.
+func acquireAntiAffinityLock(ctx context.Context, deps Deps, groupKey string, vmid int) (*pve.ClusterLockHandle, error) {
+	poolSvc := deps.PVE.Pools()
+	if poolSvc == nil {
+		// No pool service wired: cannot lock. Treat as retriable so the operator
+		// notices the misconfiguration rather than racing silently.
+		return nil, cpierrors.WrapAs(
+			cpierrors.Cloud("anti-affinity: cluster_lock_mode=pool but no pool service available"),
+			cpierrors.TypeRetriableCloud, "anti-affinity: acquire cluster lock")
+	}
+	// TTL and timeout are deliberately decoupled (M5): TTL is 2× the acquire
+	// timeout so a holder whose RMW runs for the full timeout duration is not
+	// stolen mid-flight by a concurrent waiter. A crashed holder (RMW aborted,
+	// release never called) is reclaimed at 2×timeout — acceptable for the
+	// advisory lock use-case. The 2× factor is a sane default; the exact ratio
+	// is tunable by adjusting cluster_lock_timeout_sec (timeout) independently.
+	timeout := time.Duration(deps.Config.ClusterLockTimeoutSecValue()) * time.Second
+	ttl := 2 * timeout
+	owner := clusterLockOwner(groupKey, vmid)
+	return pve.AcquireClusterLock(ctx, poolSvc, "aa-"+groupKey, owner, ttl, timeout)
+}
+
+// ensureAntiAffinityMembershipLocked is the read-modify-write body, run under
+// the cluster lock when enabled. It registers the HA resource, recomputes the
+// member set, and recreates the bosh-aa-<group> rule when membership changed.
+func ensureAntiAffinityMembershipLocked(
+	ctx context.Context, deps Deps, groupKey string, vmid int, logger *log.Logger,
+) error {
 	svc := deps.PVE.Cluster()
 	sid := haResourceSid(vmid)
 	ruleName := haRuleNameFor(groupKey)
@@ -103,7 +200,10 @@ func ensureAntiAffinityMembership(ctx context.Context, deps Deps, groupKey strin
 
 	// 4a. No rule yet: create it.
 	if existing == nil {
-		return createNegativeRule(ctx, svc, ruleName, csv, groupKey, strict)
+		if err := createNegativeRule(ctx, svc, ruleName, csv, groupKey, strict); err != nil {
+			return err
+		}
+		return verifyAntiAffinityMember(ctx, deps, ruleName, sid, logger)
 	}
 
 	// 4b. Rule exists: recreate only when the membership actually changed
@@ -114,7 +214,48 @@ func ensureAntiAffinityMembership(ctx context.Context, deps Deps, groupKey strin
 	if err := svc.DeleteHaRules(ctx, ruleName); err != nil && !isHaNotFound(err) {
 		return fmt.Errorf("anti-affinity: delete rule %q for recreate: %w", ruleName, err)
 	}
-	return createNegativeRule(ctx, svc, ruleName, csv, groupKey, strict)
+	if err := createNegativeRule(ctx, svc, ruleName, csv, groupKey, strict); err != nil {
+		return err
+	}
+	return verifyAntiAffinityMember(ctx, deps, ruleName, sid, logger)
+}
+
+// verifyAntiAffinityMember performs the opt-in read-after-write check: it
+// re-lists the HA rules and asserts that sid is present in ruleName's member
+// set. A concurrent writer that recreated the rule without this VM (lost-update)
+// is caught here and surfaced as a retriable error so the director re-drives,
+// rather than silently losing the spread guarantee. A no-op when
+// antiaffinity_verify is off.
+//
+// A single re-read is used here (M6). PVE HA-rule reads are strongly consistent
+// within the same cluster because pmxcfs serializes writes; a false-negative
+// (rule absent) is therefore a real concurrent drop, not read lag, so a single
+// re-read is sufficient. A false-negative triggers a bounded director re-drive
+// (not a storm): the director re-issues create_vm once before declaring failure.
+func verifyAntiAffinityMember(ctx context.Context, deps Deps, ruleName, sid string, logger *log.Logger) error {
+	if !deps.Config.AntiAffinityVerifyEnabled() {
+		return nil
+	}
+	svc := deps.PVE.Cluster()
+	rule, err := findHaRule(ctx, svc, ruleName)
+	if err != nil {
+		return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
+			fmt.Sprintf("anti-affinity: verify re-list rule %q", ruleName))
+	}
+	if rule == nil {
+		return cpierrors.WrapAs(
+			cpierrors.Cloud("anti-affinity: rule %q absent after recreate (concurrent drop)", ruleName),
+			cpierrors.TypeRetriableCloud, "anti-affinity: verify membership")
+	}
+	members := parseHaResources(rule.Resources)
+	if _, ok := members[sid]; !ok {
+		return cpierrors.WrapAs(
+			cpierrors.Cloud("anti-affinity: %s missing from rule %q after recreate (concurrent drop)", sid, ruleName),
+			cpierrors.TypeRetriableCloud, "anti-affinity: verify membership")
+	}
+	logger.Debug("anti-affinity: read-after-write verify passed",
+		log.String("rule", ruleName), log.String("sid", sid))
+	return nil
 }
 
 // removeAntiAffinityMembership removes a VM from any CPI-managed HA anti-affinity

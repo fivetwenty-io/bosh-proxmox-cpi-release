@@ -47,6 +47,11 @@ type retryBoundaryPoolService struct {
 func (s *retryBoundaryPoolService) AddVM(_ context.Context, _ string, _ int64) error {
 	return s.err
 }
+func (s *retryBoundaryPoolService) CreatePool(_ context.Context, _, _ string) error { return nil }
+func (s *retryBoundaryPoolService) DeletePool(_ context.Context, _ string) error     { return nil }
+func (s *retryBoundaryPoolService) GetPoolComment(_ context.Context, _ string) (string, bool, error) {
+	return "", false, nil
+}
 
 // assertHandlerRetriable calls t.Fatal unless err's chain contains a *cpierrors.Error
 // with OkToRetry()==want.

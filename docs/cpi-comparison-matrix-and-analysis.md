@@ -1541,7 +1541,7 @@ and in-flight-operation safety* — which §8 names directly. They follow the sa
 convention: validate only when set, omit from VM config when empty, zero behavior change for
 existing manifests. Ordered by value, not severity.
 
-#### 7.36 OPEN — Cross-process cluster mutex for HA-rule and anti-affinity mutation
+#### 7.36 DONE — Cross-process cluster mutex for HA-rule and anti-affinity mutation
 
 *References: vSphere, Azure.* vSphere serializes every DRS-group / anti-affinity reconfiguration
 behind a platform-native distributed mutex: `DrsLock#with_drs_lock` creates a vCenter custom field
@@ -1576,6 +1576,24 @@ stable lock name (e.g. `bosh-cpi-ha`). The natural PVE primitive is a create-or-
 writes cluster-wide, an alternative is a lock file under `/etc/pve` taken via the API with a
 TTL-stamped owner token so a crashed holder self-expires. Keep the unguarded path as the default so
 existing deployments are unchanged.
+
+**Shipped.** Both mechanisms landed, both opt-in and byte-identical when unset. A pool-sentinel
+cluster lock (`internal/pve/cluster_lock.go`: `AcquireClusterLock`/`Release` over POST/DELETE/GET
+`/pools`, poolid `bosh-lock-<name>`, comment `owner=<token> exp=<unix>`) wraps the per-group
+anti-affinity read-modify-write: create-or-fail is the test-and-set, a dup whose recorded expiry has
+passed is stolen (delete+recreate) with a post-steal owner re-read to refuse a displaced handle, and
+release is deferred so it fires even on a mid-RMW error. The matcher is **fail-closed** — an error
+that cannot be positively classified as duplicate is mapped to a retriable acquire failure rather
+than wrongly assumed to mean "lock held". A read-after-write **verify** re-lists the rule and asserts
+the VMID is present; an absent member returns `TypeRetriableCloud`. Both the anti-affinity and the
+node-affinity create_vm call sites now propagate that retriable class to the director (selectively —
+a generic HA-API blip stays fail-open per §7.21), so the spread/pin guarantee is re-driven rather
+than silently lost. Knobs: `pve.cluster_lock_mode` (`off`|`pool`), `pve.cluster_lock_timeout_sec`,
+`pve.antiaffinity_verify`. The node-affinity pin is per-VMID (no cross-group RMW), so it takes the
+verify but intentionally skips the coarse lock. *Live-validation caveat:* the exact PVE status/text
+for a duplicate poolid and the comment round-trip are inferred from the API shape and pmxcfs
+serialization; unit tests assert the contract against a fake `PoolService`, and a true multi-process
+race must be validated on a live cluster.
 
 #### 7.37 OPEN — Adopt-and-wait on a racing concurrent template clone (clone-target-exists)
 

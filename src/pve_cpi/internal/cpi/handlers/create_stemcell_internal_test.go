@@ -236,6 +236,11 @@ func wbExistingVolumeListFn(storage, qcow2Filename string) func(_ context.Contex
 type wbNoopPoolService struct{}
 
 func (n *wbNoopPoolService) AddVM(_ context.Context, _ string, _ int64) error { return nil }
+func (n *wbNoopPoolService) CreatePool(_ context.Context, _, _ string) error  { return nil }
+func (n *wbNoopPoolService) DeletePool(_ context.Context, _ string) error      { return nil }
+func (n *wbNoopPoolService) GetPoolComment(_ context.Context, _ string) (string, bool, error) {
+	return "", false, nil
+}
 
 type wbMockClient struct {
 	nodesSvc          sdknodes.Service
@@ -1130,6 +1135,11 @@ type wbPoolCall struct {
 func (p *wbRecordingPoolService) AddVM(_ context.Context, poolID string, vmid int64) error {
 	p.calls = append(p.calls, wbPoolCall{poolID: poolID, vmid: vmid})
 	return p.addErr
+}
+func (p *wbRecordingPoolService) CreatePool(_ context.Context, _, _ string) error { return nil }
+func (p *wbRecordingPoolService) DeletePool(_ context.Context, _ string) error     { return nil }
+func (p *wbRecordingPoolService) GetPoolComment(_ context.Context, _ string) (string, bool, error) {
+	return "", false, nil
 }
 
 // buildEnsureTemplateDepsWithPool returns a Deps wired with a recording pool service.

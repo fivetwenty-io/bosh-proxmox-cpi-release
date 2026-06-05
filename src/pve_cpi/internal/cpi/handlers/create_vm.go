@@ -531,13 +531,8 @@ func createVM(
 	// failure, is logged as a warning and never fails create_vm (scheduler-soft
 	// spreading remains in effect via the scoring done at node selection).
 	// -----------------------------------------------------------------------
-	if deps.Config.AntiAffinityUseHaRulesEnabled() {
-		if groupKey := sanitizeTagValue(instanceGroupName(parsed.env)); groupKey != "" {
-			if aaErr := ensureAntiAffinityMembership(ctx, deps, groupKey, vmid, logger); aaErr != nil {
-				logger.Warn("create_vm: HA anti-affinity membership not fully applied (non-fatal)",
-					log.Int(metadataKeyVMID, vmid), log.String("group", groupKey), log.Err(aaErr))
-			}
-		}
+	if aaErr := applyAntiAffinityMembership(ctx, deps, vmid, parsed.env, logger); aaErr != nil {
+		return nil, aaErr
 	}
 
 	// -----------------------------------------------------------------------
@@ -546,12 +541,14 @@ func createVM(
 	// After scoring placed the VM on a node within its AZ, write a PVE HA
 	// node-affinity rule binding it to the AZ node set, so the AZ placement is
 	// durable across HA failover and DLB rebalance (scoring alone only pins at
-	// birth). Best-effort and non-fatal: a failure is logged and never fails
-	// create_vm — the VM is already on a correct AZ node; only the durability
-	// layer is affected. The DLB sentinel AZ is skipped (DLB intentionally
-	// un-pins guests); config validation also rejects that combination.
+	// birth). Best-effort and non-fatal for generic HA failures: a failure is
+	// logged and never fails create_vm. TypeRetriableCloud (lock-timeout, verify
+	// failure) is returned so the director re-drives rather than silently losing
+	// the pin guarantee.
 	// -----------------------------------------------------------------------
-	applyAZNodeAffinityPin(ctx, deps, vmid, parsed.cloudProps, shape.node, logger)
+	if naErr := applyAZNodeAffinityPin(ctx, deps, vmid, parsed.cloudProps, shape.node, logger); naErr != nil {
+		return nil, naErr
+	}
 
 	// -----------------------------------------------------------------------
 	// 10. PVE Dynamic Load Balancer membership (opt-in: placement.dlb).
@@ -732,19 +729,16 @@ func createVMWithFallback(
 		// -----------------------------------------------------------------------
 		// 9. HA anti-affinity
 		// -----------------------------------------------------------------------
-		if deps.Config.AntiAffinityUseHaRulesEnabled() {
-			if groupKey := sanitizeTagValue(instanceGroupName(parsed.env)); groupKey != "" {
-				if aaErr := ensureAntiAffinityMembership(ctx, deps, groupKey, winningVMID, logger); aaErr != nil {
-					logger.Warn("create_vm: HA anti-affinity membership not fully applied (non-fatal)",
-						log.Int(metadataKeyVMID, winningVMID), log.String("group", groupKey), log.Err(aaErr))
-				}
-			}
+		if aaErr := applyAntiAffinityMembership(ctx, deps, winningVMID, parsed.env, logger); aaErr != nil {
+			return nil, aaErr
 		}
 
 		// -----------------------------------------------------------------------
 		// 9b. AZ node-affinity HA pin
 		// -----------------------------------------------------------------------
-		applyAZNodeAffinityPin(ctx, deps, winningVMID, parsed.cloudProps, winShape.node, logger)
+		if naErr := applyAZNodeAffinityPin(ctx, deps, winningVMID, parsed.cloudProps, winShape.node, logger); naErr != nil {
+			return nil, naErr
+		}
 
 		// -----------------------------------------------------------------------
 		// 10. DLB membership

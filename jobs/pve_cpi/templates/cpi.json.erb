@@ -169,6 +169,23 @@
   disk_perf_invariant_mode = p("pve.disk_perf_invariant_mode", "")
   config["disk_perf_invariant_mode"] = disk_perf_invariant_mode unless disk_perf_invariant_mode.to_s.empty?
 
+  # Emit cluster_lock_mode only when set to a non-empty value. The Go config
+  # accessor defaults empty string to "off"; omitting the key preserves that
+  # default with no behavioral change. Emit only when the operator opts in.
+  cluster_lock_mode = p("pve.cluster_lock_mode", "")
+  config["cluster_lock_mode"] = cluster_lock_mode unless cluster_lock_mode.to_s.empty?
+
+  # Emit cluster_lock_timeout_sec only when set to a non-zero value. The Go
+  # config resolves 0 (omitted) to a 60s default.
+  cluster_lock_timeout_sec = p("pve.cluster_lock_timeout_sec", 0).to_i
+  config["cluster_lock_timeout_sec"] = cluster_lock_timeout_sec unless cluster_lock_timeout_sec == 0
+
+  # Emit antiaffinity_verify only when explicitly true. The Go accessor defaults
+  # nil *bool -> false (no behavior change); omitting the key preserves that.
+  if p("pve.antiaffinity_verify", false)
+    config["antiaffinity_verify"] = true
+  end
+
   # Emit task_poll_adaptive only when the operator opts in. The Go config
   # defaults to fixed-cadence polling when the key is omitted.
   if p("pve.task_poll_adaptive", false)

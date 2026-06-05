@@ -333,6 +333,11 @@ func (m *digestReplicationMockClient) Pools() pve.PoolService                   
 type noopReplicationPoolService struct{}
 
 func (n *noopReplicationPoolService) AddVM(_ context.Context, _ string, _ int64) error { return nil }
+func (n *noopReplicationPoolService) CreatePool(_ context.Context, _, _ string) error  { return nil }
+func (n *noopReplicationPoolService) DeletePool(_ context.Context, _ string) error      { return nil }
+func (n *noopReplicationPoolService) GetPoolComment(_ context.Context, _ string) (string, bool, error) {
+	return "", false, nil
+}
 
 // countingNodesService wraps sdknodes.Service and counts ListQemu calls per node.
 // mu guards listQemuCallsByNode so the service is safe for concurrent callers.

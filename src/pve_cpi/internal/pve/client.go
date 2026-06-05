@@ -3,6 +3,7 @@ package pve
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -18,6 +19,7 @@ import (
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/storage"
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/tasks"
 	sdkclient "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/client"
+	sdkerrors "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/errors"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
@@ -25,12 +27,29 @@ import (
 
 // PoolService manages PVE resource pool membership.
 // PVE resource pools group VMs and containers for ACL/billing purposes.
-// The only operation the CPI needs is adding a VM to a named pool after creation.
+// Besides VM-to-pool membership, the CPI uses create/delete/read-comment of a
+// dedicated sentinel pool as a cluster-wide advisory mutex (see cluster_lock.go).
 type PoolService interface {
 	// AddVM assigns vmid to the resource pool identified by poolID.
 	// Corresponds to PUT /pools/{poolid} with vms=[vmid].
 	// Returns an error when the pool does not exist or the PVE API rejects the call.
 	AddVM(ctx context.Context, poolID string, vmid int64) error
+
+	// CreatePool creates a resource pool named poolID with the given comment.
+	// Corresponds to POST /pools. PVE rejects a duplicate poolid with a 4xx
+	// error (pmxcfs serializes user.cfg), which the cluster-lock primitive
+	// treats as "lock already held". An empty comment is sent as-is.
+	CreatePool(ctx context.Context, poolID, comment string) error
+
+	// DeletePool removes the resource pool named poolID. Corresponds to
+	// DELETE /pools?poolid=<poolID>. A not-found pool is reported via the
+	// returned error; the cluster-lock release path treats not-found as success.
+	DeletePool(ctx context.Context, poolID string) error
+
+	// GetPoolComment returns the comment string stored on poolID. Corresponds to
+	// GET /pools?poolid=<poolID>. found is false (with a nil error) when the pool
+	// does not exist. A nil/absent comment is returned as the empty string.
+	GetPoolComment(ctx context.Context, poolID string) (comment string, found bool, err error)
 }
 
 // Client wraps SDK services for mockability.
@@ -92,6 +111,75 @@ func (s *sdkPoolService) AddVM(ctx context.Context, poolID string, vmid int64) e
 		return cpierrors.Wrap(err, fmt.Sprintf("PoolService.AddVM: assign vmid %d to pool %q", vmid, poolID))
 	}
 	return nil
+}
+
+// CreatePool creates a resource pool via POST /pools. The raw SDK error is
+// returned unwrapped so callers (cluster_lock.go) can classify duplicate-pool
+// 4xx responses without a wrapper hiding the HTTP status.
+func (s *sdkPoolService) CreatePool(ctx context.Context, poolID, comment string) error {
+	if poolID == "" {
+		return cpierrors.Cloud("PoolService.CreatePool: poolID must not be empty")
+	}
+	params := &pools.CreatePoolsParams{Poolid: poolID}
+	if comment != "" {
+		params.Comment = &comment
+	}
+	return s.svc.CreatePools(ctx, params)
+}
+
+// DeletePool removes a resource pool via DELETE /pools?poolid=<poolID>. The raw
+// SDK error is returned unwrapped so callers can classify not-found responses.
+func (s *sdkPoolService) DeletePool(ctx context.Context, poolID string) error {
+	if poolID == "" {
+		return cpierrors.Cloud("PoolService.DeletePool: poolID must not be empty")
+	}
+	return s.svc.DeletePools(ctx, &pools.DeletePoolsParams{Poolid: poolID})
+}
+
+// GetPoolComment reads a pool's comment via GET /pools/{poolid}. This uses the
+// single-object endpoint (not the list endpoint) so the response is decoded into
+// the correct shape: {comment, members:[...]}. A pool that does not exist yields
+// ("", false, nil) so the caller can distinguish "absent" from "present with
+// empty comment". Any other API error propagates.
+func (s *sdkPoolService) GetPoolComment(ctx context.Context, poolID string) (string, bool, error) {
+	if poolID == "" {
+		return "", false, cpierrors.Cloud("PoolService.GetPoolComment: poolID must not be empty")
+	}
+	resp, err := s.svc.GetPools(ctx, poolID, nil)
+	if err != nil {
+		// A not-found response means the pool does not exist — caller treats as absent.
+		if isPoolNotFound(err) {
+			return "", false, nil
+		}
+		return "", false, cpierrors.Wrap(err, fmt.Sprintf("PoolService.GetPoolComment: read pool %q", poolID))
+	}
+	if resp == nil {
+		// Should not happen per SDK contract, but guard defensively.
+		return "", false, nil
+	}
+	if resp.Comment == nil {
+		return "", true, nil
+	}
+	return *resp.Comment, true, nil
+}
+
+// isPoolNotFound reports whether err indicates the queried pool does not exist.
+// Fail-closed: only returns true when we POSITIVELY identify a 404. Unknown errors
+// propagate as failures rather than being treated as absent (fail-open would let
+// a transient error be mistaken for an available slot).
+func isPoolNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	// Prefer SDK sentinel — errors.Is traverses the Unwrap chain.
+	if errors.Is(err, sdkerrors.ErrNotFound) {
+		return true
+	}
+	var apiErr *sdkerrors.APIError
+	if errors.As(err, &apiErr) {
+		return apiErr.IsNotFound()
+	}
+	return false
 }
 
 // buildTransportOpts constructs the base sdkclient.Options from cfg, setting

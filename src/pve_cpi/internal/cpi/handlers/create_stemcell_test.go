@@ -39,6 +39,11 @@ import (
 type noopPoolService struct{}
 
 func (n *noopPoolService) AddVM(_ context.Context, _ string, _ int64) error { return nil }
+func (n *noopPoolService) CreatePool(_ context.Context, _, _ string) error  { return nil }
+func (n *noopPoolService) DeletePool(_ context.Context, _ string) error      { return nil }
+func (n *noopPoolService) GetPoolComment(_ context.Context, _ string) (string, bool, error) {
+	return "", false, nil
+}
 
 // stemcellMockClient implements pve.Client. All services default to no-ops or
 // embed the interface (panics on unknown calls).

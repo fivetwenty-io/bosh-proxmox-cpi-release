@@ -260,6 +260,7 @@ type icPVEClient struct {
 	qemuSvc    qemu.Service
 	clusterSvc sdkcluster.Service
 	nodesSvc   nodes.Service
+	poolsSvc   pve.PoolService
 }
 
 var _ pve.Client = (*icPVEClient)(nil)
@@ -271,7 +272,7 @@ func (c *icPVEClient) CloudInit() cloudinit.Service           { return nil }
 func (c *icPVEClient) Tasks() tasks.Service                   { return nil }
 func (c *icPVEClient) Nodes() nodes.Service                   { return c.nodesSvc }
 func (c *icPVEClient) ClusterStorage() clusterstorage.Service { return nil }
-func (c *icPVEClient) Pools() pve.PoolService                 { return nil }
+func (c *icPVEClient) Pools() pve.PoolService                 { return c.poolsSvc }
 
 // icQEMUService satisfies qemu.Service for IP-conflict tests.
 // Only Config() is exercised; all other methods panic on accidental call.

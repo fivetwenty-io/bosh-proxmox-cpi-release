@@ -375,6 +375,34 @@ type CPIConfig struct {
 	// DiskPerfInvariantModeValue() for the effective value.
 	DiskPerfInvariantMode string `json:"disk_perf_invariant_mode,omitempty"`
 
+	// ClusterLockMode selects the cross-process cluster mutex used to serialize
+	// the read-modify-write on a shared HA anti-affinity rule. Two concurrent
+	// create_vm invocations for the same instance group both read the old member
+	// set and recreate the rule (PVE rules have no partial edit); the last writer
+	// wins, silently dropping a member. When "pool", the CPI acquires a sentinel
+	// resource pool (POST /pools is pmxcfs-serialized, create-or-fail) keyed on the
+	// group name around that RMW. When empty or "off" (default) no lock is taken
+	// and behavior is byte-identical to prior releases. Enum: ""|"off"|"pool".
+	// Use ClusterLockMode()/ClusterLockEnabled().
+	ClusterLock string `json:"cluster_lock_mode,omitempty"`
+
+	// ClusterLockTimeoutSec bounds how long the anti-affinity RMW waits to acquire
+	// the cluster lock before returning a retriable error (the BOSH director then
+	// re-drives the operation). It also serves as the lock's TTL: a holder whose
+	// recorded expiry has passed is treated as crashed and its lock is stolen. Only
+	// meaningful when ClusterLockMode is "pool"; 0 resolves to 60s. Validate >= 0
+	// when set. Use ClusterLockTimeoutSecValue().
+	ClusterLockTimeoutSec int `json:"cluster_lock_timeout_sec,omitempty"`
+
+	// AntiAffinityVerify enables a read-after-write check: after recreating a
+	// bosh-aa-<group> rule the CPI re-lists the HA rules and asserts the target
+	// VMID is present in the rule's members. A concurrent writer that dropped the
+	// member surfaces as a retriable error rather than silent loss of spread.
+	// Pointer-typed so an explicit false survives JSON omission; nil/false
+	// (default) is byte-identical. Use AntiAffinityVerifyEnabled(). Omit from ERB
+	// when nil; emit only when true.
+	AntiAffinityVerify *bool `json:"antiaffinity_verify,omitempty"`
+
 	// TaskPollAdaptive enables progress-aware adaptive task polling (§7.28). When
 	// true, AwaitTask derives the poll interval from a PVE task's reported
 	// progress (clamped 1–10s) for long operations (clone, move-disk), falling
@@ -1535,6 +1563,44 @@ func (c *CPIConfig) AntiAffinityStrict() bool {
 	return *c.Placement.AntiAffinity.Strict
 }
 
+// ClusterLockMode returns the normalized cross-process cluster lock mode.
+// Empty or absent maps to "off"; the value is lowercased and trimmed.
+// Valid return values: "off", "pool".
+func (c *CPIConfig) ClusterLockMode() string {
+	if c == nil {
+		return "off"
+	}
+	v := strings.ToLower(strings.TrimSpace(c.ClusterLock))
+	if v == "" {
+		return "off"
+	}
+	return v
+}
+
+// ClusterLockEnabled reports whether a cross-process cluster lock is active
+// (mode == "pool"). Default off → byte-identical behavior.
+func (c *CPIConfig) ClusterLockEnabled() bool {
+	return c.ClusterLockMode() == "pool"
+}
+
+// ClusterLockTimeoutSecValue returns the effective lock acquire timeout / TTL in
+// seconds. 0 (unset) resolves to the conventional 60s default.
+func (c *CPIConfig) ClusterLockTimeoutSecValue() int {
+	if c == nil || c.ClusterLockTimeoutSec <= 0 {
+		return 60
+	}
+	return c.ClusterLockTimeoutSec
+}
+
+// AntiAffinityVerifyEnabled returns the effective read-after-write verify
+// toggle. nil/false (default) → false (byte-identical). *true → true.
+func (c *CPIConfig) AntiAffinityVerifyEnabled() bool {
+	if c == nil || c.AntiAffinityVerify == nil {
+		return false
+	}
+	return *c.AntiAffinityVerify
+}
+
 // EnsureNoIPConflictsEnabled returns the effective IP-conflict guard toggle.
 // nil (field absent from JSON) → true (protective default for static networks).
 // *false → false (operator opt-out, e.g. pure-DHCP networks).
@@ -2120,6 +2186,27 @@ func (c *CPIConfig) validateEnumFields(errs *[]string) {
 				c.DiskPerfInvariantMode,
 			))
 		}
+	}
+
+	// ClusterLock mode enum: validate only when non-empty.
+	if c.ClusterLock != "" {
+		switch strings.ToLower(strings.TrimSpace(c.ClusterLock)) {
+		case "off", "pool":
+			// valid
+		default:
+			*errs = append(*errs, fmt.Sprintf(
+				"cluster_lock_mode must be one of off|pool (or empty for default off), got %q",
+				c.ClusterLock,
+			))
+		}
+	}
+
+	// ClusterLockTimeoutSec: 0 resolves to the 60s default; negative is invalid.
+	if c.ClusterLockTimeoutSec < 0 {
+		*errs = append(*errs, fmt.Sprintf(
+			"cluster_lock_timeout_sec must be >= 0 (0 means default 60s), got %d",
+			c.ClusterLockTimeoutSec,
+		))
 	}
 
 	// StemcellStagingDir: when set, must be an absolute path to an existing directory.
