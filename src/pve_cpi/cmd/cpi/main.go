@@ -225,6 +225,13 @@ func runWithArgs(args []string, stdin io.Reader, stdout, stderr io.Writer, opts 
 			log.Int("default_sec", cfg.OperationTimeoutDefaultSec()),
 		)
 	}
+	// Redacted request/response trace is opt-in. When enabled, the dispatcher
+	// emits a debug-level, credential-masked trace of each call's payloads. Off
+	// (default) adds no log records — byte-identical to prior releases.
+	if cfg.RedactLogsEnabled() {
+		dispatcherOpts = append(dispatcherOpts, cpi.WithRequestTrace(true))
+		logger.Info("redacted request/response trace enabled")
+	}
 	d := cpi.NewDispatcherWithOptions(logger, dispatcherOpts...)
 	handlers.RegisterAll(d, handlers.Deps{
 		Config:        cfg,

@@ -515,6 +515,25 @@ func TestTaskPollAdaptiveEnabled(t *testing.T) {
 	}
 }
 
+func TestRedactLogsEnabled(t *testing.T) {
+	t.Parallel()
+	var nilCfg *config.CPIConfig
+	if nilCfg.RedactLogsEnabled() {
+		t.Error("nil receiver: want disabled")
+	}
+	if (&config.CPIConfig{}).RedactLogsEnabled() {
+		t.Error("unset: want disabled")
+	}
+	tru := true
+	if !(&config.CPIConfig{RedactLogs: &tru}).RedactLogsEnabled() {
+		t.Error("explicit true: want enabled")
+	}
+	fal := false
+	if (&config.CPIConfig{RedactLogs: &fal}).RedactLogsEnabled() {
+		t.Error("explicit false: want disabled")
+	}
+}
+
 func TestFastPathDeleteEnabled(t *testing.T) {
 	t.Parallel()
 	var nilCfg *config.CPIConfig

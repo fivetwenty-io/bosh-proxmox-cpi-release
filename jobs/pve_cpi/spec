@@ -459,6 +459,17 @@ properties:
       This reduces poll-storm pressure early in a long operation and tightens
       polling as it nears completion. Default false (fixed-cadence polling).
     default: false
+  pve.redact_logs:
+    description: |
+      When true, the CPI emits a debug-level trace of each call's request
+      arguments and result with credentials masked — the mbus URL's embedded
+      NATS credentials, blobstore secret_access_key/password, registry
+      credentials, and any other sensitive-named key are replaced with
+      <redacted> while the structure is preserved. When false (default), no
+      payload trace is emitted and logging is identical to prior releases.
+      Recommended on so an operator raising the log level to triage a deploy
+      cannot accidentally write agent credentials to syslog.
+    default: false
   pve.placement.enabled:
     description: |
       When true (default), create_vm runs live node-scoring to select the

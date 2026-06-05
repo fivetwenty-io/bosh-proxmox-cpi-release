@@ -192,6 +192,12 @@
     config["task_poll_adaptive"] = true
   end
 
+  # Emit redact_logs only when explicitly true. The Go accessor defaults to no
+  # payload trace when the key is omitted.
+  if p("pve.redact_logs", false)
+    config["redact_logs"] = true
+  end
+
   # Emit resize-convergence knobs only when the operator opts in. The Go config
   # defaults (disabled; 120s budget) hold when the keys are omitted.
   if p("pve.resize_wait_for_convergence", false)

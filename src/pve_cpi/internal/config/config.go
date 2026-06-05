@@ -474,6 +474,17 @@ type CPIConfig struct {
 	// TaskPollAdaptiveEnabled().
 	TaskPollAdaptive *bool `json:"task_poll_adaptive,omitempty"`
 
+	// RedactLogs enables a debug-level redacted request/response trace at the
+	// dispatcher boundary (§7.41). When true, each CPI call's argument tree and
+	// result are logged at debug level with credentials masked by
+	// log.RedactSecrets (mbus URL userinfo, blobstore secret_access_key/password,
+	// registry credentials, and any other sensitive-named key). When nil/false
+	// (default), no payload trace is emitted and logging is byte-identical to
+	// prior releases. Pointer-typed so an explicit false survives JSON omission.
+	// Use RedactLogsEnabled() for the effective bool. Omit from ERB when nil;
+	// emit only when true.
+	RedactLogs *bool `json:"redact_logs,omitempty"`
+
 	// VMFirewall sets PVE's per-NIC firewall flag (firewall=1) on every NIC of
 	// newly created VMs. When nil/false (default), NICs are created without the
 	// flag — byte-identical to prior releases. A per-NIC network cloud property
@@ -1724,6 +1735,12 @@ func (c *CPIConfig) DiskPerfInvariantModeValue() string {
 // is active. Nil (default) → false.
 func (c *CPIConfig) TaskPollAdaptiveEnabled() bool {
 	return c != nil && c.TaskPollAdaptive != nil && *c.TaskPollAdaptive
+}
+
+// RedactLogsEnabled reports whether the redacted request/response dispatcher
+// trace is enabled (§7.41). Nil receiver or unset field → false (no trace).
+func (c *CPIConfig) RedactLogsEnabled() bool {
+	return c != nil && c.RedactLogs != nil && *c.RedactLogs
 }
 
 // ResizeWaitForConvergenceEnabled reports whether resize_disk should poll for

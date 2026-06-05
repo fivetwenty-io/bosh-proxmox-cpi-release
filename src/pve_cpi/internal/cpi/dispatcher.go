@@ -49,6 +49,13 @@ type Dispatcher struct {
 	// WithMethodTimeouts. The dispatcher takes a plain func rather than a config
 	// value so it stays decoupled from the config package.
 	methodTimeout func(method string) time.Duration
+	// requestTrace, when true, makes Handle emit a debug-level trace of each
+	// request's arguments and the handler's result, with credentials masked by
+	// log.RedactSecrets. false (the default) emits nothing extra — the log
+	// stream is byte-identical to prior releases. A plain bool keeps the
+	// dispatcher decoupled from the config package; main wires it from
+	// pve.redact_logs via WithRequestTrace.
+	requestTrace bool
 }
 
 // NewDispatcher returns a Dispatcher with all 22 CPI methods pre-registered as
@@ -109,6 +116,18 @@ func WithHooks(hooks ...Hook) func(*Dispatcher) {
 func WithMethodTimeouts(resolver func(method string) time.Duration) func(*Dispatcher) {
 	return func(d *Dispatcher) {
 		d.methodTimeout = resolver
+	}
+}
+
+// WithRequestTrace returns an option that toggles the redacted request/response
+// trace. When enabled, Handle emits a debug-level "cpi request" record (the
+// argument tree) before invoking the handler and a "cpi response" record (the
+// result tree) after a successful call, each passed through log.RedactSecrets so
+// mbus, blobstore, and registry credentials are masked. Disabled (the default)
+// adds no log records and no per-call work — byte-identical to prior releases.
+func WithRequestTrace(enabled bool) func(*Dispatcher) {
+	return func(d *Dispatcher) {
+		d.requestTrace = enabled
 	}
 }
 
@@ -224,6 +243,8 @@ func (d *Dispatcher) Handle(ctx context.Context, req *jsonrpc.Request) (resp *js
 		}
 	}
 
+	d.traceRequest(req.Method, requestID, req.Arguments)
+
 	result, err := h.Handle(callCtx, req.Arguments, req.Context)
 
 	// If our deadline fired before the handler returned, translate whatever the
@@ -276,6 +297,8 @@ func (d *Dispatcher) Handle(ctx context.Context, req *jsonrpc.Request) (resp *js
 		)
 		return errorResponse(cpierrors.Cloud("result marshal failed: %s", marshalErr.Error()))
 	}
+
+	d.traceResponse(req.Method, requestID, result)
 
 	d.logger.Info("dispatch",
 		log.String("method", req.Method),
@@ -380,6 +403,55 @@ func NewMethodTimeoutResolver(create, del, query, def time.Duration) func(string
 // --------------------------------------------------------------------------
 // internal helpers
 // --------------------------------------------------------------------------
+
+// traceRequest emits a debug-level, credential-masked trace of a request's
+// argument tree. It is a no-op unless the request trace is enabled, so a
+// dispatcher without WithRequestTrace produces byte-identical log output. Each
+// raw argument is decoded to a generic tree and passed through
+// log.RedactSecrets; an argument that fails to decode is logged as an opaque
+// placeholder rather than its raw bytes, so a malformed payload can never leak
+// an unredacted credential.
+func (d *Dispatcher) traceRequest(method, requestID string, args []json.RawMessage) {
+	if !d.requestTrace {
+		return
+	}
+	redacted := make([]any, len(args))
+	for i, raw := range args {
+		var tree any
+		if err := json.Unmarshal(raw, &tree); err != nil {
+			redacted[i] = "<unparsable argument>"
+			continue
+		}
+		redacted[i] = log.RedactSecrets(tree)
+	}
+	d.logger.Debug("cpi request",
+		log.String("method", method),
+		log.String("request_id", requestID),
+		log.Any("arguments", redacted),
+	)
+}
+
+// traceResponse emits a debug-level, credential-masked trace of a handler's
+// result tree. Like traceRequest it is a no-op unless the trace is enabled. The
+// result is round-tripped through JSON so that a typed struct is normalized to
+// the same generic tree shape RedactSecrets operates on; a result that fails to
+// marshal is logged as an opaque placeholder.
+func (d *Dispatcher) traceResponse(method, requestID string, result any) {
+	if !d.requestTrace {
+		return
+	}
+	var tree any
+	if raw, err := json.Marshal(result); err != nil {
+		tree = "<unserializable result>"
+	} else if err := json.Unmarshal(raw, &tree); err != nil {
+		tree = "<unparsable result>"
+	}
+	d.logger.Debug("cpi response",
+		log.String("method", method),
+		log.String("request_id", requestID),
+		log.Any("result", log.RedactSecrets(tree)),
+	)
+}
 
 // dispatchError converts any error returned by a handler to a *jsonrpc.Response.
 // *cpierrors.Error values are mapped faithfully; plain errors become CloudError.

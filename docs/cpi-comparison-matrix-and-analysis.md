@@ -1780,7 +1780,7 @@ check is skipped entirely when no dedicated ephemeral disk is requested (the age
 ephemeral space from the grown root disk, unchanged). With the ratio at `0` the create_vm path is
 byte-identical to prior releases.
 
-#### 7.41 OPEN — Secret redaction over the dispatcher request/response log path
+#### 7.41 DONE — Secret redaction over the dispatcher request/response log path
 
 *References: AWS, Google.* AWS clones-and-redacts instance params and spot specs (`user_data`, access
 keys) before logging (`instance_manager.rb:36-41`, `spot_manager.rb:28`). Google wraps every
@@ -1804,6 +1804,26 @@ byte-identical; recommend on). The scrubber masks known-sensitive keys/paths in 
 — `mbus`, `blobstore.options.secret_access_key`/`password`, `registry` credentials, and any
 `env`/`agent` settings blob — replacing values with `<redacted>` while preserving structure. No PVE
 primitive is required; this is pure log hygiene. Validate-only-when-set, omit from the ERB when empty.
+
+**Shipped.** `internal/log/redact.go` adds `RedactSecrets(tree any) any` — a config-free, deep-copying
+scrubber that returns a new tree with every value under a sensitive key replaced by `<redacted>` while
+preserving map and slice structure (the input is never mutated, so the live argument tree the handler
+goes on to use is untouched). A key is sensitive by case-insensitive substring match (`password`,
+`secret`, `token`, `credential`, `mbus`, `private_key`, `access_key`, `api_key`, `authorization` —
+catching prefixed variants such as `nats_password` and `client_secret`) or by exact match on
+`user`/`username` (exact, so the diagnostic `user_data`/`user_agent` keys are not collateral-masked).
+String values are additionally URL-scrubbed: credentials in a `scheme://user:pass@host` userinfo
+segment **and** in a sensitive query parameter (`?password=`, `?access_token=` — the query vocabulary
+is built from the same fragment list) are masked, including when the URL is whitespace-prefixed or
+embedded mid-string. `RedactSecrets` is idempotent. The dispatcher (`internal/cpi/dispatcher.go`) gains
+a `WithRequestTrace(bool)` option and, when enabled, emits a debug-level `cpi request` record (the
+redacted argument tree, before the handler runs) and a `cpi response` record (the redacted result,
+round-tripped through JSON so a typed struct normalizes to the same tree shape) — a malformed argument
+or unserializable result logs an opaque placeholder, never raw bytes. The dispatcher takes a plain
+bool, so the `log` package does not import `config` and the dispatcher gains no config dependency:
+`cmd/cpi/main.go` translates the opt-in `pve.redact_logs` (pointer-typed `*bool`, default off) into
+`WithRequestTrace`. With the knob off, both trace helpers early-return before any allocation — logging
+is byte-identical to prior releases. Emitted from the ERB only when explicitly true.
 
 ### Explicitly not recommended as core CPI work
 
