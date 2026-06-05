@@ -23,6 +23,12 @@ type fwClusterStub struct {
 	sdkcluster.Service
 	groups  []string
 	listErr error
+	// SDN vnet listing for the §7.39 consume-side bridge gate. sdnVnets is the
+	// set of vnet names ListSdnVnets reports; sdnVnetsErr (when set) forces an
+	// error from that call. Only consulted when the gate is enabled.
+	sdnVnets         []string
+	sdnVnetsErr      error
+	listSdnVnetsCall int
 }
 
 func (s *fwClusterStub) ListFirewallGroups(_ context.Context) (*sdkcluster.ListFirewallGroupsResponse, error) {
@@ -33,6 +39,18 @@ func (s *fwClusterStub) ListFirewallGroups(_ context.Context) (*sdkcluster.ListF
 	for _, g := range s.groups {
 		raw, _ := json.Marshal(map[string]any{"group": g})
 		out = append(out, raw)
+	}
+	return &out, nil
+}
+
+func (s *fwClusterStub) ListSdnVnets(_ context.Context, _ *sdkcluster.ListSdnVnetsParams) (*sdkcluster.ListSdnVnetsResponse, error) {
+	s.listSdnVnetsCall++
+	if s.sdnVnetsErr != nil {
+		return nil, s.sdnVnetsErr
+	}
+	out := sdkcluster.ListSdnVnetsResponse{}
+	for _, v := range s.sdnVnets {
+		out = append(out, json.RawMessage(`{"vnet":"`+v+`","zone":"z1"}`))
 	}
 	return &out, nil
 }
@@ -53,6 +71,12 @@ type fwNodesStub struct {
 	ipsetCreateErr     error               // if non-nil, returned by CreateQemuFirewallIpset
 	ipsetEntryErr      error               // if non-nil, returned by CreateQemuFirewallIpset2
 	ipsetCreateErrName string              // if non-empty, only fail CreateQemuFirewallIpset for this name
+	// Node-network listing for the §7.39 consume-side bridge gate. nodeIfaces is
+	// the set of iface names ListNetwork reports; nodeIfaceErr (when set) forces
+	// an error; listNetCalls counts the polls. Only consulted when the gate runs.
+	nodeIfaces   []string
+	nodeIfaceErr error
+	listNetCalls int
 }
 
 func (s *fwNodesStub) CreateQemuFirewallRules(_ context.Context, _ string, _ string, p *sdknodes.CreateQemuFirewallRulesParams) error {
@@ -80,6 +104,18 @@ func (s *fwNodesStub) UpdateQemuFirewallOptions(_ context.Context, _ string, _ s
 func (s *fwNodesStub) UpdateQemuConfig(_ context.Context, _ string, _ string, p *sdknodes.UpdateQemuConfigParams) error {
 	s.lastNet = p.Net
 	return nil
+}
+
+func (s *fwNodesStub) ListNetwork(_ context.Context, _ string, _ *sdknodes.ListNetworkParams) (*sdknodes.ListNetworkResponse, error) {
+	s.listNetCalls++
+	if s.nodeIfaceErr != nil {
+		return nil, s.nodeIfaceErr
+	}
+	out := sdknodes.ListNetworkResponse{}
+	for _, iface := range s.nodeIfaces {
+		out = append(out, json.RawMessage(`{"iface":"`+iface+`","type":"bridge"}`))
+	}
+	return &out, nil
 }
 
 // CreateQemuFirewallIpset records the ipset creation (§7.14).

@@ -234,6 +234,50 @@ func TestValidate_DiskDeleteStateGuardInvalid(t *testing.T) {
 	assertCloudError(t, err, "disk_delete_state_guard must be one of off|on")
 }
 
+func TestNetworkResolveAccessors(t *testing.T) {
+	t.Parallel()
+	// Default (zero) → gate disabled, timeout resolves to 60.
+	def := &config.CPIConfig{}
+	if def.NetworkResolveEnabled() || def.NetworkResolveRetriesValue() != 0 {
+		t.Errorf("default should be disabled with 0 retries; got enabled=%v retries=%d",
+			def.NetworkResolveEnabled(), def.NetworkResolveRetriesValue())
+	}
+	if got := def.NetworkResolveTimeoutSecValue(); got != 60 {
+		t.Errorf("default timeout should resolve to 60; got %d", got)
+	}
+	// Negative is clamped to disabled/default by the accessors (validation
+	// rejects it separately).
+	neg := &config.CPIConfig{NetworkResolveRetries: -1, NetworkResolveTimeoutSec: -5}
+	if neg.NetworkResolveEnabled() || neg.NetworkResolveTimeoutSecValue() != 60 {
+		t.Errorf("negative values should resolve to disabled/default; got enabled=%v timeout=%d",
+			neg.NetworkResolveEnabled(), neg.NetworkResolveTimeoutSecValue())
+	}
+	// Enabled with custom timeout.
+	on := &config.CPIConfig{NetworkResolveRetries: 5, NetworkResolveTimeoutSec: 120}
+	if !on.NetworkResolveEnabled() || on.NetworkResolveRetriesValue() != 5 {
+		t.Errorf("retries=5 should enable; got enabled=%v retries=%d",
+			on.NetworkResolveEnabled(), on.NetworkResolveRetriesValue())
+	}
+	if got := on.NetworkResolveTimeoutSecValue(); got != 120 {
+		t.Errorf("custom timeout should be 120; got %d", got)
+	}
+	// Nil receiver is defensive.
+	var nilCfg *config.CPIConfig
+	if nilCfg.NetworkResolveEnabled() || nilCfg.NetworkResolveTimeoutSecValue() != 60 {
+		t.Error("nil receiver should be disabled with default timeout")
+	}
+}
+
+func TestValidate_NetworkResolveNegative(t *testing.T) {
+	t.Parallel()
+	_, err := mustLoad(t, `{
+		"host": "h", "user": "u", "password": "p",
+		"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
+		"network_resolve_retries": -1
+	}`)
+	assertCloudError(t, err, "network_resolve_retries must be >= 0")
+}
+
 func TestClusterLockAccessors(t *testing.T) {
 	t.Parallel()
 	// Defaults: off, not enabled, verify off, timeout 60.

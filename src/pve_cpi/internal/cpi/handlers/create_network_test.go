@@ -524,6 +524,84 @@ func TestHandleCreateNetwork_SDN_ConfigZoneFallback(t *testing.T) {
 	}
 }
 
+// -- §7.39 produce-side SDN convergence gate --
+
+func TestHandleCreateNetwork_SDN_ConvergenceGate_Converges(t *testing.T) {
+	t.Parallel()
+	var runningListCalls int
+	clusterSvc := &mockSDNCluster{
+		getSdnZonesFn: func(_ context.Context, _ string, _ *sdkcluster.GetSdnZonesParams) (*sdkcluster.GetSdnZonesResponse, error) {
+			raw := sdkcluster.GetSdnZonesResponse(`{"zone":"boshzone","type":"simple"}`)
+			return &raw, nil
+		},
+		getSdnVnetsFn: func(_ context.Context, _ string, _ *sdkcluster.GetSdnVnetsParams) (*sdkcluster.GetSdnVnetsResponse, error) {
+			return nil, sdnNotFound()
+		},
+		createSdnVnetsFn: func(_ context.Context, _ *sdkcluster.CreateSdnVnetsParams) error { return nil },
+		updateSdnFn: func(_ context.Context, _ *sdkcluster.UpdateSdnParams) (*sdkcluster.UpdateSdnResponse, error) {
+			return nil, nil
+		},
+		// Produce-side gate polls the running (non-pending) vnet list; the vnet is
+		// present on the first poll, so the gate returns without sleeping.
+		listSdnVnetsFn: func(_ context.Context, _ *sdkcluster.ListSdnVnetsParams) (*sdkcluster.ListSdnVnetsResponse, error) {
+			runningListCalls++
+			raw := sdkcluster.ListSdnVnetsResponse{json.RawMessage(`{"vnet":"boshvnet","zone":"boshzone"}`)}
+			return &raw, nil
+		},
+	}
+
+	deps := testSDNDeps(clusterSvc, "sdn", "", false)
+	deps.Config.NetworkResolveRetries = 3
+	spec := map[string]any{
+		"type":             "manual",
+		"cloud_properties": map[string]any{"zone": "boshzone", "vnet": "boshvnet"},
+	}
+	result, err := invokeCreateNetwork(t, deps, spec)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if runningListCalls != 1 {
+		t.Errorf("convergence gate: want 1 running-vnet poll, got %d", runningListCalls)
+	}
+	if result.([]any)[0] != "boshvnet" {
+		t.Errorf("network_cid: got %v, want boshvnet", result.([]any)[0])
+	}
+}
+
+func TestHandleCreateNetwork_SDN_ConvergenceGate_Retriable(t *testing.T) {
+	t.Parallel()
+	clusterSvc := &mockSDNCluster{
+		getSdnZonesFn: func(_ context.Context, _ string, _ *sdkcluster.GetSdnZonesParams) (*sdkcluster.GetSdnZonesResponse, error) {
+			raw := sdkcluster.GetSdnZonesResponse(`{"zone":"boshzone","type":"simple"}`)
+			return &raw, nil
+		},
+		getSdnVnetsFn: func(_ context.Context, _ string, _ *sdkcluster.GetSdnVnetsParams) (*sdkcluster.GetSdnVnetsResponse, error) {
+			return nil, sdnNotFound()
+		},
+		createSdnVnetsFn: func(_ context.Context, _ *sdkcluster.CreateSdnVnetsParams) error { return nil },
+		updateSdnFn: func(_ context.Context, _ *sdkcluster.UpdateSdnParams) (*sdkcluster.UpdateSdnResponse, error) {
+			return nil, nil
+		},
+		// The vnet never appears in the running config → gate exhausts its budget
+		// and returns a retriable error so the director re-drives.
+		listSdnVnetsFn: func(_ context.Context, _ *sdkcluster.ListSdnVnetsParams) (*sdkcluster.ListSdnVnetsResponse, error) {
+			raw := sdkcluster.ListSdnVnetsResponse{json.RawMessage(`{"vnet":"other","zone":"boshzone"}`)}
+			return &raw, nil
+		},
+	}
+
+	deps := testSDNDeps(clusterSvc, "sdn", "", false)
+	deps.Config.NetworkResolveRetries = 1 // one retry → at most one ~1s sleep
+	spec := map[string]any{
+		"type":             "manual",
+		"cloud_properties": map[string]any{"zone": "boshzone", "vnet": "boshvnet"},
+	}
+	_, err := invokeCreateNetwork(t, deps, spec)
+	if err == nil || !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+		t.Fatalf("non-converging vnet: want retriable-cloud, got %v", err)
+	}
+}
+
 // -- CN-12: vnet name with invalid chars --
 
 func TestHandleCreateNetwork_SDN_VnetNameInvalidChars(t *testing.T) {

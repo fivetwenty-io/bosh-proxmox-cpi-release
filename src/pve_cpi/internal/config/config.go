@@ -379,6 +379,26 @@ type CPIConfig struct {
 	// ""|"off"|"on". Use DiskDeleteStateGuardEnabled() for the effective value.
 	DiskDeleteStateGuard string `json:"disk_delete_state_guard,omitempty"`
 
+	// NetworkResolveRetries bounds eventual-consistency polling for freshly
+	// created SDN networks. A newly applied SDN vnet is not immediately usable
+	// cluster-wide: the data-plane realization (ifupdown2 reload, pmxcfs
+	// propagation) is asynchronous and per-node. When > 0, create_network polls
+	// the running cluster SDN config until the new vnet converges, and create_vm
+	// confirms each SDN-managed NIC bridge is present on the target node before
+	// attaching, classifying a not-yet-present bridge as retriable so the BOSH
+	// Director re-drives rather than booting a NIC into a bridge that does not yet
+	// exist. When 0 (default) neither poll runs and behavior is byte-identical to
+	// prior releases; external/static bridges (e.g. vmbr0) are never gated.
+	// Validate >= 0 when set. Use NetworkResolveRetriesValue()/NetworkResolveEnabled().
+	NetworkResolveRetries int `json:"network_resolve_retries,omitempty"`
+
+	// NetworkResolveTimeoutSec is the companion absolute bound on the SDN
+	// eventual-consistency poll described on NetworkResolveRetries: the poll stops
+	// once this many seconds have elapsed even if the retry budget is not yet
+	// spent. Only meaningful when NetworkResolveRetries > 0; 0 resolves to 60s.
+	// Validate >= 0 when set. Use NetworkResolveTimeoutSecValue().
+	NetworkResolveTimeoutSec int `json:"network_resolve_timeout_sec,omitempty"`
+
 	// DiskPerfInvariantMode controls enforcement of creation-time disk-performance
 	// invariants at attach_disk time. The structural options cache, iothread, and
 	// ssd are baked into the disk CID at create_disk time (§7.9). On re-attach the
@@ -1722,6 +1742,23 @@ func (c *CPIConfig) DiskDeleteStateGuardEnabled() bool {
 	return strings.ToLower(strings.TrimSpace(c.DiskDeleteStateGuard)) == "on"
 }
 
+// validateIPConflictProbeEnum appends an error when ip_conflict_probe is set to
+// a value other than off|agent. Empty (the default) is valid.
+func (c *CPIConfig) validateIPConflictProbeEnum(errs *[]string) {
+	if c.IPConflictProbe == "" {
+		return
+	}
+	switch strings.ToLower(strings.TrimSpace(c.IPConflictProbe)) {
+	case enumValueOff, "agent":
+		// valid
+	default:
+		*errs = append(*errs, fmt.Sprintf(
+			"ip_conflict_probe must be one of off|agent (or empty for default off), got %q",
+			c.IPConflictProbe,
+		))
+	}
+}
+
 // validateDiskDeleteStateGuardEnum appends an error when disk_delete_state_guard
 // is set to a value other than off|on. Empty (the default) is valid.
 func (c *CPIConfig) validateDiskDeleteStateGuardEnum(errs *[]string) {
@@ -1737,6 +1774,29 @@ func (c *CPIConfig) validateDiskDeleteStateGuardEnum(errs *[]string) {
 			c.DiskDeleteStateGuard,
 		))
 	}
+}
+
+// NetworkResolveRetriesValue returns the configured SDN eventual-consistency
+// poll retry count. nil receiver or a non-positive value → 0 (gate disabled).
+func (c *CPIConfig) NetworkResolveRetriesValue() int {
+	if c == nil || c.NetworkResolveRetries <= 0 {
+		return 0
+	}
+	return c.NetworkResolveRetries
+}
+
+// NetworkResolveEnabled reports whether the SDN convergence gates run.
+func (c *CPIConfig) NetworkResolveEnabled() bool {
+	return c.NetworkResolveRetriesValue() > 0
+}
+
+// NetworkResolveTimeoutSecValue returns the effective absolute poll bound in
+// seconds. nil receiver or a non-positive value → 60.
+func (c *CPIConfig) NetworkResolveTimeoutSecValue() int {
+	if c == nil || c.NetworkResolveTimeoutSec <= 0 {
+		return 60
+	}
+	return c.NetworkResolveTimeoutSec
 }
 
 // VMFirewallEnabled returns the effective global per-NIC firewall default.
@@ -2233,17 +2293,7 @@ func (c *CPIConfig) validateEnumFields(errs *[]string) {
 	}
 
 	// IPConflictProbe enum: validate only when non-empty.
-	if c.IPConflictProbe != "" {
-		switch strings.ToLower(strings.TrimSpace(c.IPConflictProbe)) {
-		case enumValueOff, "agent":
-			// valid
-		default:
-			*errs = append(*errs, fmt.Sprintf(
-				"ip_conflict_probe must be one of off|agent (or empty for default off), got %q",
-				c.IPConflictProbe,
-			))
-		}
-	}
+	c.validateIPConflictProbeEnum(errs)
 
 	// DiskDeleteStateGuard enum: validate only when non-empty.
 	c.validateDiskDeleteStateGuardEnum(errs)
@@ -2287,6 +2337,22 @@ func (c *CPIConfig) validateEnumFields(errs *[]string) {
 		*errs = append(*errs, fmt.Sprintf(
 			"cluster_lock_timeout_sec must be >= 0 (0 means default 60s), got %d",
 			c.ClusterLockTimeoutSec,
+		))
+	}
+
+	// NetworkResolveRetries: 0 disables the SDN convergence gates; negative is invalid.
+	if c.NetworkResolveRetries < 0 {
+		*errs = append(*errs, fmt.Sprintf(
+			"network_resolve_retries must be >= 0 (0 disables SDN convergence polling), got %d",
+			c.NetworkResolveRetries,
+		))
+	}
+
+	// NetworkResolveTimeoutSec: 0 resolves to the 60s default; negative is invalid.
+	if c.NetworkResolveTimeoutSec < 0 {
+		*errs = append(*errs, fmt.Sprintf(
+			"network_resolve_timeout_sec must be >= 0 (0 means default 60s), got %d",
+			c.NetworkResolveTimeoutSec,
 		))
 	}
 

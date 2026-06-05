@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/cpi"
@@ -415,6 +416,19 @@ func createNetworkSDN(
 		// own context prefix already; adding another wrap layer here would
 		// double-prefix without adding information.
 		return nil, applyErr
+	}
+
+	// Optional produce-side eventual-consistency gate. SDN apply commits the
+	// config but data-plane realization is asynchronous; when enabled, poll the
+	// running cluster SDN config until this vnet converges so create_network does
+	// not report success before the next create_vm can resolve the bridge. On
+	// timeout the error is retriable and the director re-drives. Off → no poll.
+	if cfg.NetworkResolveEnabled() {
+		if waitErr := pve.WaitForSDNVnetConverged(ctx, deps.PVE, vnet,
+			cfg.NetworkResolveRetriesValue(),
+			time.Duration(cfg.NetworkResolveTimeoutSecValue())*time.Second); waitErr != nil {
+			return nil, cpierrors.Wrap(waitErr, "create_network")
+		}
 	}
 
 	// Build BOSH 3-element response.

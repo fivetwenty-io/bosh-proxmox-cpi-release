@@ -794,6 +794,30 @@ properties:
       the attached VM is left with a stuck config lock, delete_disk will keep
       deferring; clear it with "qm unlock <vmid>" on that VM's node.
     default: "off"
+  pve.network_resolve_retries:
+    description: |
+      Eventual-consistency poll budget for freshly created SDN networks. A newly
+      applied SDN vnet is not immediately usable cluster-wide: the data-plane
+      realization (ifupdown2 reload, pmxcfs propagation) is asynchronous and
+      per-node, so a create_vm that immediately follows a create_network on a
+      different node can attach a NIC to a bridge that does not yet exist there.
+      When > 0, create_network polls the running cluster SDN config until the new
+      vnet converges, and create_vm confirms each SDN-managed NIC bridge is present
+      on the target node before writing the NIC config — a not-yet-present bridge
+      is treated as a retriable error so the BOSH Director re-drives rather than
+      booting a NIC into a bridge that does not exist. Only SDN-managed vnets are
+      gated; external or static Linux bridges (e.g. vmbr0) always pass straight
+      through. Both polls are bounded by network_resolve_timeout_sec. Default 0
+      disables the gates, leaving create_network and create_vm byte-identical to
+      prior releases. A conventional value is 60.
+    default: 0
+  pve.network_resolve_timeout_sec:
+    description: |
+      Absolute time bound (seconds) on the SDN eventual-consistency poll described
+      under network_resolve_retries: polling stops once this many seconds have
+      elapsed even if the retry budget is not yet spent. Only meaningful when
+      network_resolve_retries > 0. Zero (default) resolves to 60 seconds.
+    default: 0
   pve.stemcell_replication_concurrency:
     description: |
       Maximum number of cluster nodes that receive a stemcell replica upload

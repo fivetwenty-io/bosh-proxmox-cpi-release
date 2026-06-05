@@ -1694,7 +1694,7 @@ until an operator runs `qm unlock <vmid>` — the deferral log names the VM, nod
 Live-validation caveat: exercised against fakes asserting the resolution + lock-classification
 contract; the real attached-VM-mid-operation race needs a live PVE cluster.
 
-#### 7.39 OPEN — Eventual-consistency retry resolving a freshly-created SDN vnet/bridge
+#### 7.39 DONE — Eventual-consistency retry resolving a freshly-created SDN vnet/bridge
 
 *Reference: vSphere.* vSphere wraps network lookup in `find_network_retryably` — `Bosh::Retryable`
 with 62 tries (~10 min) on `NetworkNotFoundError` — explicitly to tolerate the lag between a portgroup
@@ -1719,6 +1719,26 @@ vnet/bridge is resolvable, bounded by the timeout. On the consume side, optional
 in `create_vm` with the same bounded retry resolving the per-NIC bridge before writing `netN=`,
 classifying a not-yet-present bridge as retriable so the director re-drives rather than booting a NIC
 into the void. With retries at 0 the apply-and-return behavior is unchanged.
+
+**Shipped.** Two opt-in knobs, `network_resolve_retries` (default 0 → byte-identical) and the companion
+`network_resolve_timeout_sec` (0 → 60s), gate both sides via `pve.WaitForSDNVnetConverged` and
+`pve.ResolveNodeBridgeOnNode` (`internal/pve/network_resolve.go`), each a bounded poll (retry count
+plus absolute timeout) over the shared `lockClock` seam. Produce side: after `applySDN` succeeds,
+`createNetworkSDN` polls the **running** (`pending=false`) cluster SDN vnet list until the new vnet is
+committed, returning a retriable error on exhaustion so the director re-drives — the vnet is left in
+place (the gate runs after the apply/rollback block, so a convergence wait never tears down a
+committed vnet). This confirms cluster **commit**, not per-node realization. Consume side:
+`configureNICs` collects every NIC bridge during the build loop and, before the single
+`UpdateQemuConfig` write, resolves each on the **target node** via `nodes.ListNetwork` — so no `netN=`
+is written for any NIC until all bridges resolve (no partial config). Only SDN-managed vnets are
+gated: a bridge that is not a known SDN vnet (external/static, e.g. `vmbr0`) passes straight through,
+and the per-node check is the authoritative realization signal. The gate is best-effort where it must
+be — an SDN-membership lookup failure fails open (never blocks a deploy on the guard's own blip),
+while a transient node-network read counts as "not yet present" and keeps polling, ultimately
+surfacing a retriable error rather than aborting. A bridge still converging past the budget yields
+`TypeRetriableCloud`, preserved through the handler `cpierrors.Wrap`. Validation rejects negative
+counts; the ERB emits each key only when set. Live multi-node SDN convergence timing remains to be
+validated against a real cluster.
 
 #### 7.40 OPEN — Ephemeral-disk minimum-size invariant (≥ 2× RAM) on `create_vm`
 

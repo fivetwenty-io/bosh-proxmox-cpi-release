@@ -3526,53 +3526,26 @@ func configureNICs(
 	// Build net map[int]string and ipconfig map[int]string for UpdateQemuConfigParams
 	netMap := make(map[int]string, len(netNames))
 	ipconfigMap := make(map[int]string, len(netNames))
+	// bridgeSet collects the finalized bridge for each NIC so the optional SDN
+	// eventual-consistency gate can resolve them all on the target node before
+	// any config write (no partial netN= on a not-yet-realized bridge).
+	bridgeSet := make(map[string]struct{}, len(netNames))
 	var nameservers []string
 	firstNS := true
 
 	for i, name := range netNames {
 		spec := parsed.networks[name]
 
-		// NIC bridge from cloud_properties within the network spec
-		bridge := defaultBridge
-		if cp, ok := spec.CloudProperties[nicCPKeyBridge].(string); ok && cp != "" {
-			bridge = cp
-		}
-		model := defaultModel
-		if cp, ok := spec.CloudProperties[nicCPKeyModel].(string); ok && cp != "" {
-			model = cp
-		}
-
-		// Per-NIC firewall flag. The network cloud_property "firewall" (bool)
-		// overrides the global cfg.VMFirewallEnabled() default for this NIC.
-		// firewall=1 on the NIC alone does not activate filtering — the
-		// VM-level firewall must also be enabled (see applySecurityGroups).
-		nicFirewall := deps.Config.VMFirewallEnabled()
-		if cp, ok := spec.CloudProperties[nicCPKeyFirewall].(bool); ok {
-			nicFirewall = cp
-		}
-
-		// §7.34 VM-level network_defaults: final override layer for NIC attributes.
-		// Precedence (highest first):
-		//   parsed.cloudProps.NetworkDefaults[key]
-		//     > per-NIC spec.CloudProperties[key]   (applied above)
-		//     > resolver default (struct field / profile / config / const)
-		// Supported keys: nicCPKeyBridge, nicCPKeyModel, nicCPKeyFirewall.
-		// Unknown keys are silently ignored — cloud_properties are loosely typed.
-		netDefaults := parsed.cloudProps.NetworkDefaults
-		if v, ok := netDefaults[nicCPKeyBridge].(string); ok && v != "" {
-			bridge = v
-		}
-		if v, ok := netDefaults[nicCPKeyModel].(string); ok && v != "" {
-			model = v
-		}
-		if v, ok := netDefaults[nicCPKeyFirewall].(bool); ok {
-			nicFirewall = v
-		}
+		bridge, model, nicFirewall := resolveNICAttributes(
+			deps, parsed.cloudProps.NetworkDefaults, spec.CloudProperties, defaultBridge, defaultModel)
 
 		// net0 = "virtio,bridge=vmbr0" (no MAC — PVE assigns one)
 		netMap[i] = fmt.Sprintf("%s,bridge=%s", model, bridge)
 		if nicFirewall {
 			netMap[i] += ",firewall=1"
+		}
+		if bridge != "" {
+			bridgeSet[bridge] = struct{}{}
 		}
 
 		// ipconfig: dynamic → dhcp; manual → ip=<cidr>,gw=<gw>
@@ -3624,11 +3597,76 @@ func configureNICs(
 		nicParams.Searchdomain = &sd
 	}
 
+	// Optional consume-side eventual-consistency gate. Resolve every NIC bridge
+	// on the target node before writing any netN= so a not-yet-realized SDN
+	// bridge cannot leave a partial config.
+	if err := resolveNICBridges(ctx, deps, shape.node, bridgeSet); err != nil {
+		return nil, err
+	}
+
 	if err := deps.PVE.Nodes().UpdateQemuConfig(ctx, shape.node, strconv.Itoa(vmid), nicParams); err != nil {
 		return nil, cpierrors.Wrap(pve.WrapError(err), fmt.Sprintf("create_vm: configure NICs vmid=%d: %s", vmid, err.Error()))
 	}
 
 	return netNames, nil
+}
+
+// resolveNICAttributes computes the effective bridge, model, and per-NIC
+// firewall flag for one NIC. Precedence (highest first):
+//
+//	VM-level network_defaults[key] (§7.34)
+//	  > per-NIC spec cloud_properties[key]
+//	  > resolver default (struct field / profile / config / const)
+//
+// Supported keys: bridge, model, firewall. Unknown keys are silently ignored —
+// cloud_properties are loosely typed. The firewall flag here only selects the
+// NIC's firewall=1 bit; the VM-level firewall must also be enabled for filtering
+// to take effect (see applySecurityGroups).
+func resolveNICAttributes(
+	deps Deps, netDefaults, nicCP map[string]any, defaultBridge, defaultModel string,
+) (bridge, model string, firewall bool) {
+	bridge = defaultBridge
+	if cp, ok := nicCP[nicCPKeyBridge].(string); ok && cp != "" {
+		bridge = cp
+	}
+	model = defaultModel
+	if cp, ok := nicCP[nicCPKeyModel].(string); ok && cp != "" {
+		model = cp
+	}
+	firewall = deps.Config.VMFirewallEnabled()
+	if cp, ok := nicCP[nicCPKeyFirewall].(bool); ok {
+		firewall = cp
+	}
+	if v, ok := netDefaults[nicCPKeyBridge].(string); ok && v != "" {
+		bridge = v
+	}
+	if v, ok := netDefaults[nicCPKeyModel].(string); ok && v != "" {
+		model = v
+	}
+	if v, ok := netDefaults[nicCPKeyFirewall].(bool); ok {
+		firewall = v
+	}
+	return bridge, model, firewall
+}
+
+// resolveNICBridges is the consume-side SDN eventual-consistency gate. When
+// enabled, it confirms each bridge in bridgeSet is realized on node before the
+// caller writes the NIC config. A bridge that is not an SDN vnet (external/
+// static, e.g. vmbr0) passes through untouched; a bridge still converging
+// surfaces as a retriable error so the director re-drives rather than attaching
+// a NIC to a bridge that does not yet exist. Off (retries 0) → no calls.
+func resolveNICBridges(ctx context.Context, deps Deps, node string, bridgeSet map[string]struct{}) error {
+	if !deps.Config.NetworkResolveEnabled() {
+		return nil
+	}
+	retries := deps.Config.NetworkResolveRetriesValue()
+	timeout := time.Duration(deps.Config.NetworkResolveTimeoutSecValue()) * time.Second
+	for bridge := range bridgeSet {
+		if gateErr := pve.ResolveNodeBridgeOnNode(ctx, deps.PVE, node, bridge, retries, timeout); gateErr != nil {
+			return cpierrors.Wrap(gateErr, fmt.Sprintf("create_vm: resolve bridge %q on node %q", bridge, node))
+		}
+	}
+	return nil
 }
 
 // attachPersistentDisks attaches each disk CID in parsed.diskCIDs to the VM
