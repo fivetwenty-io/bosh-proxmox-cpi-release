@@ -371,6 +371,17 @@
     config["network_resolve_timeout_sec"] = network_resolve_timeout_sec unless network_resolve_timeout_sec == 0
   end
 
+  # Emit the ephemeral-disk minimum-size invariant knobs only when the ratio is
+  # non-zero. Zero (default) disables the check; omitting the key keeps create_vm
+  # byte-identical. The mode companion is emitted only when set non-empty (it has
+  # no effect unless the ratio is active).
+  ephemeral_disk_min_ratio = p("pve.ephemeral_disk_min_ratio", 0).to_f
+  unless ephemeral_disk_min_ratio == 0
+    config["ephemeral_disk_min_ratio"] = ephemeral_disk_min_ratio
+    ephemeral_disk_min_mode = p("pve.ephemeral_disk_min_mode", "")
+    config["ephemeral_disk_min_mode"] = ephemeral_disk_min_mode unless ephemeral_disk_min_mode.to_s.empty?
+  end
+
   # Emit health_check block only when the operator sets at least one sub-field.
   # When entirely absent, the Go nil *HealthCheckConfig means health polling is
   # off — byte-identical to prior releases. Individual sub-fields follow

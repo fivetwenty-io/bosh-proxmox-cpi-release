@@ -278,6 +278,56 @@ func TestValidate_NetworkResolveNegative(t *testing.T) {
 	assertCloudError(t, err, "network_resolve_retries must be >= 0")
 }
 
+func TestEphemeralDiskMinAccessors(t *testing.T) {
+	t.Parallel()
+	// Default (zero) → no check; mode resolves to enforce.
+	def := &config.CPIConfig{}
+	if got := def.EphemeralDiskMinRatioValue(); got != 0 {
+		t.Errorf("default ratio should be 0 (disabled); got %v", got)
+	}
+	if got := def.EphemeralDiskMinModeValue(); got != "enforce" {
+		t.Errorf("default mode should resolve to enforce; got %q", got)
+	}
+	// Negative ratio clamps to 0 in the accessor (validation rejects separately).
+	neg := &config.CPIConfig{EphemeralDiskMinRatio: -2}
+	if got := neg.EphemeralDiskMinRatioValue(); got != 0 {
+		t.Errorf("negative ratio should resolve to 0; got %v", got)
+	}
+	// Custom ratio + warn mode normalize.
+	on := &config.CPIConfig{EphemeralDiskMinRatio: 2, EphemeralDiskMinMode: " WARN "}
+	if got := on.EphemeralDiskMinRatioValue(); got != 2 {
+		t.Errorf("ratio should be 2; got %v", got)
+	}
+	if got := on.EphemeralDiskMinModeValue(); got != "warn" {
+		t.Errorf("mode should normalize to warn; got %q", got)
+	}
+	// Nil receiver is defensive.
+	var nilCfg *config.CPIConfig
+	if nilCfg.EphemeralDiskMinRatioValue() != 0 || nilCfg.EphemeralDiskMinModeValue() != "enforce" {
+		t.Error("nil receiver should be ratio 0 / mode enforce")
+	}
+}
+
+func TestValidate_EphemeralDiskMinNegativeRatio(t *testing.T) {
+	t.Parallel()
+	_, err := mustLoad(t, `{
+		"host": "h", "user": "u", "password": "p",
+		"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
+		"ephemeral_disk_min_ratio": -1
+	}`)
+	assertCloudError(t, err, "ephemeral_disk_min_ratio must be >= 0")
+}
+
+func TestValidate_EphemeralDiskMinBadMode(t *testing.T) {
+	t.Parallel()
+	_, err := mustLoad(t, `{
+		"host": "h", "user": "u", "password": "p",
+		"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
+		"ephemeral_disk_min_mode": "block"
+	}`)
+	assertCloudError(t, err, "ephemeral_disk_min_mode must be one of enforce|warn")
+}
+
 func TestClusterLockAccessors(t *testing.T) {
 	t.Parallel()
 	// Defaults: off, not enabled, verify off, timeout 60.

@@ -1740,7 +1740,7 @@ surfacing a retriable error rather than aborting. A bridge still converging past
 counts; the ERB emits each key only when set. Live multi-node SDN convergence timing remains to be
 validated against a real cluster.
 
-#### 7.40 OPEN — Ephemeral-disk minimum-size invariant (≥ 2× RAM) on `create_vm`
+#### 7.40 DONE — Ephemeral-disk minimum-size invariant (≥ 2× RAM) on `create_vm`
 
 *Reference: OpenStack.* OpenStack's flavor resolver rejects an `instance_type` whose
 `flavor.Ephemeral > 0` but is smaller than `(RAM/1024)*2`, enforcing that the ephemeral disk has
@@ -1763,6 +1763,22 @@ GiB against the VM's configured memory (already available in the create_vm shape
 naming the deficit, or warn — operator's choice via an `enforce|warn` knob mirroring §7.26's
 `disk_perf_invariant_mode`. This reuses the §7.26 enforce/warn pattern verbatim. With the ratio at 0
 nothing changes.
+
+**Shipped.** `create_vm` gained an opt-in `pve.ephemeral_disk_min_ratio` (float, default `0` →
+no check, byte-identical) with a companion `pve.ephemeral_disk_min_mode` (`enforce` default | `warn`),
+mirroring the §7.26 `disk_perf_invariant_mode` pattern. When the ratio is set and a *dedicated*
+ephemeral disk is being provisioned (`ephemeral_disk_size_mb` > 0), `resolveEphemeralShape`'s resolved
+ephemeral GiB is checked against the VM's configured RAM as
+`ephemeral_GiB >= ratio × (memory_MiB / 1024)` — both sides in binary GiB so the comparison is
+unit-consistent with the agent's own swap-plus-`/var/vcap/data` layout, with a `1e-9` epsilon so an
+exact-boundary disk is never falsely rejected by floating-point drift. The check is wired into *both*
+shape builders (`resolveVMShape` and the placement-fallback `resolveVMShapeWithAlternates`), so the
+fallback path is gated identically. On violation, `enforce` returns a non-retriable cloud error naming
+the deficit (a configuration error, not a transient — it is never classified retriable, so the Director
+does not re-drive a deploy that can only fail again), while `warn` logs the deficit and proceeds. The
+check is skipped entirely when no dedicated ephemeral disk is requested (the agent then carves
+ephemeral space from the grown root disk, unchanged). With the ratio at `0` the create_vm path is
+byte-identical to prior releases.
 
 #### 7.41 OPEN — Secret redaction over the dispatcher request/response log path
 

@@ -956,6 +956,9 @@ func resolveVMShape(ctx context.Context, deps Deps, parsed *createVMParsedArgs) 
 	if err != nil {
 		return nil, err
 	}
+	if err := enforceEphemeralMinSize(deps.Config, deps.Logger, ephemeralDiskGiB, memMiB); err != nil {
+		return nil, err
+	}
 
 	return &createVMShape{
 		node:             node,
@@ -1042,6 +1045,9 @@ func resolveVMShapeWithAlternates(
 
 	ephemeralDiskGiB, ephemeralStorage, err := resolveEphemeralShape(deps.Config, cp, parsed.cloudPropsMap)
 	if err != nil {
+		return nil, nil, err
+	}
+	if err := enforceEphemeralMinSize(deps.Config, deps.Logger, ephemeralDiskGiB, memMiB); err != nil {
 		return nil, nil, err
 	}
 
@@ -3326,6 +3332,64 @@ func resolveEphemeralShape(cfg *config.CPIConfig, cp createVMCloudProps, cpMap m
 			"create_vm: ephemeral_disk_size_mb set but no storage pool resolved (set ephemeral_storage_pool or vm_storage)")
 	}
 	return gib, stor, nil
+}
+
+// ephemeralMinSizeViolation reports a human-readable deficit string when the
+// opt-in §7.40 ephemeral-disk minimum-size invariant is violated, or "" when it
+// is satisfied, disabled (ratio 0), or not applicable (no dedicated ephemeral
+// disk / unknown RAM). The invariant is
+//
+//	ephemeralGiB >= ratio * (memMiB / 1024)
+//
+// Both sizes are binary GiB: ephemeralGiB is already ceil-rounded from
+// ephemeral_disk_size_mb in resolveEphemeralShape, and memMiB is the VM's
+// configured RAM in MiB, so the comparison is unit-consistent with the agent's
+// own swap+/var/vcap/data layout.
+func ephemeralMinSizeViolation(cfg *config.CPIConfig, ephemeralGiB, memMiB int) string {
+	ratio := cfg.EphemeralDiskMinRatioValue()
+	if ratio <= 0 || ephemeralGiB <= 0 || memMiB <= 0 {
+		return ""
+	}
+	ramGiB := float64(memMiB) / 1024.0
+	required := ratio * ramGiB
+	// epsilon absorbs IEEE-754 drift so an exact-boundary disk (e.g. ratio×RAM
+	// that is mathematically an integer but computes to N+1e-15) is not falsely
+	// reported "N is below N". 1e-9 GiB is ~1 byte — orders below the 1 GiB
+	// sizing granularity, so it never wrongly passes a genuinely undersized disk.
+	if float64(ephemeralGiB)+1e-9 >= required {
+		return ""
+	}
+	return fmt.Sprintf(
+		"ephemeral disk %dGiB is below the required %.2fGiB (ratio %.2f × RAM %.2fGiB)",
+		ephemeralGiB, required, ratio, ramGiB)
+}
+
+// enforceEphemeralMinSize applies the opt-in §7.40 ephemeral-disk minimum-size
+// invariant. When ephemeral_disk_min_ratio is unset (0) or no dedicated
+// ephemeral disk is being created, it is a no-op so behavior is byte-identical.
+// On violation the ephemeral_disk_min_mode knob decides: enforce (default) →
+// non-retriable CloudError naming the deficit; warn → log and proceed. The
+// logger may be nil (defensive — some early shape-resolution paths run before
+// deps.Logger is set); a nil logger silently skips the warn log.
+func enforceEphemeralMinSize(cfg *config.CPIConfig, logger *log.Logger, ephemeralGiB, memMiB int) error {
+	violation := ephemeralMinSizeViolation(cfg, ephemeralGiB, memMiB)
+	if violation == "" {
+		return nil
+	}
+	if cfg.EphemeralDiskMinModeValue() == "warn" {
+		if logger != nil {
+			logger.Warn("create_vm: ephemeral-disk minimum-size invariant violation (warn mode — proceeding)",
+				log.String("deficit", violation),
+			)
+		}
+		return nil
+	}
+	// enforce (default): a config error, not a transient — must not be retriable.
+	return cpierrors.Cloud(
+		"create_vm: %s. The BOSH agent places a RAM-sized swap file and /var/vcap/data on the"+
+			" ephemeral disk, so it must be at least ratio×RAM. Increase ephemeral_disk_size_mb,"+
+			" lower pve.ephemeral_disk_min_ratio, or set pve.ephemeral_disk_min_mode=warn to bypass.",
+		violation)
 }
 
 // attachEphemeralDisk creates and attaches a dedicated ephemeral disk when

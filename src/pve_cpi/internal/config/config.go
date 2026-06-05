@@ -419,6 +419,25 @@ type CPIConfig struct {
 	// DiskPerfInvariantModeValue() for the effective value.
 	DiskPerfInvariantMode string `json:"disk_perf_invariant_mode,omitempty"`
 
+	// EphemeralDiskMinRatio is the opt-in floor for a dedicated ephemeral disk's
+	// size relative to VM RAM: when set and create_vm provisions a dedicated
+	// ephemeral disk, the disk must be at least ratio × RAM (GiB). The BOSH agent
+	// lays a RAM-sized swap file plus /var/vcap/data on the ephemeral disk, so an
+	// ephemeral disk below ~2× RAM cannot satisfy the agent's own layout. The
+	// conventional value is 2. 0 (the default) disables the check entirely, so
+	// behavior is byte-identical when unset. The check is also a no-op when no
+	// dedicated ephemeral disk is requested (the agent carves ephemeral storage
+	// from the grown root disk). See EphemeralDiskMinMode for enforce vs warn.
+	EphemeralDiskMinRatio float64 `json:"ephemeral_disk_min_ratio,omitempty"`
+
+	// EphemeralDiskMinMode selects the action when the EphemeralDiskMinRatio
+	// invariant is violated: enforce (default) → reject create_vm with a
+	// non-retriable CloudError naming the deficit; warn → log and proceed. It has
+	// no effect unless EphemeralDiskMinRatio is set. Enum: ""|"enforce"|"warn";
+	// empty resolves to "enforce". Use EphemeralDiskMinModeValue() for the
+	// effective value.
+	EphemeralDiskMinMode string `json:"ephemeral_disk_min_mode,omitempty"`
+
 	// ClusterLockMode selects the cross-process cluster mutex used to serialize
 	// the read-modify-write on a shared HA anti-affinity rule. Two concurrent
 	// create_vm invocations for the same instance group both read the old member
@@ -1759,6 +1778,24 @@ func (c *CPIConfig) validateIPConflictProbeEnum(errs *[]string) {
 	}
 }
 
+// validateEphemeralDiskMinModeEnum appends an error when ephemeral_disk_min_mode
+// is set to a value other than enforce|warn. Empty (the default) is valid and
+// resolves to enforce.
+func (c *CPIConfig) validateEphemeralDiskMinModeEnum(errs *[]string) {
+	if c.EphemeralDiskMinMode == "" {
+		return
+	}
+	switch strings.ToLower(strings.TrimSpace(c.EphemeralDiskMinMode)) {
+	case "enforce", "warn":
+		// valid
+	default:
+		*errs = append(*errs, fmt.Sprintf(
+			"ephemeral_disk_min_mode must be one of enforce|warn (or empty for default enforce), got %q",
+			c.EphemeralDiskMinMode,
+		))
+	}
+}
+
 // validateDiskDeleteStateGuardEnum appends an error when disk_delete_state_guard
 // is set to a value other than off|on. Empty (the default) is valid.
 func (c *CPIConfig) validateDiskDeleteStateGuardEnum(errs *[]string) {
@@ -1797,6 +1834,31 @@ func (c *CPIConfig) NetworkResolveTimeoutSecValue() int {
 		return 60
 	}
 	return c.NetworkResolveTimeoutSec
+}
+
+// EphemeralDiskMinRatioValue returns the effective ephemeral-disk minimum-size
+// ratio. A nil receiver or a non-positive value resolves to 0, which disables
+// the invariant (byte-identical behavior).
+func (c *CPIConfig) EphemeralDiskMinRatioValue() float64 {
+	if c == nil || c.EphemeralDiskMinRatio <= 0 {
+		return 0
+	}
+	return c.EphemeralDiskMinRatio
+}
+
+// EphemeralDiskMinModeValue returns the effective enforcement mode for the
+// ephemeral-disk minimum-size invariant, normalized to lower case and trimmed.
+// Empty (the default) resolves to "enforce". See the EphemeralDiskMinMode field
+// doc for semantics.
+func (c *CPIConfig) EphemeralDiskMinModeValue() string {
+	if c == nil {
+		return "enforce"
+	}
+	v := strings.ToLower(strings.TrimSpace(c.EphemeralDiskMinMode))
+	if v == "" {
+		return "enforce"
+	}
+	return v
 }
 
 // VMFirewallEnabled returns the effective global per-NIC firewall default.
@@ -2355,6 +2417,17 @@ func (c *CPIConfig) validateEnumFields(errs *[]string) {
 			c.NetworkResolveTimeoutSec,
 		))
 	}
+
+	// EphemeralDiskMinRatio: 0 disables the invariant; negative is invalid.
+	if c.EphemeralDiskMinRatio < 0 {
+		*errs = append(*errs, fmt.Sprintf(
+			"ephemeral_disk_min_ratio must be >= 0 (0 disables the check), got %v",
+			c.EphemeralDiskMinRatio,
+		))
+	}
+
+	// EphemeralDiskMinMode enum: validate only when non-empty.
+	c.validateEphemeralDiskMinModeEnum(errs)
 
 	// StemcellStagingDir: when set, must be an absolute path to an existing directory.
 	if c.StemcellStagingDir != "" {

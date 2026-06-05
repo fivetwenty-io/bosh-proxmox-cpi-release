@@ -818,6 +818,28 @@ properties:
       elapsed even if the retry budget is not yet spent. Only meaningful when
       network_resolve_retries > 0. Zero (default) resolves to 60 seconds.
     default: 0
+  pve.ephemeral_disk_min_ratio:
+    description: |
+      Minimum size floor, as a multiple of VM RAM, for a dedicated ephemeral disk
+      created by create_vm (when ephemeral_disk_size_mb is set). The BOSH agent
+      lays a RAM-sized swap file plus /var/vcap/data on the ephemeral disk, so an
+      ephemeral disk smaller than ratio × RAM cannot satisfy the agent's own
+      layout and the job fails to come up at boot. When set, create_vm asserts
+      ephemeral_GiB >= ratio × (RAM_MiB / 1024) and, on violation, rejects (or
+      warns — see ephemeral_disk_min_mode). 0 (the default) disables the check
+      entirely, leaving create_vm byte-identical to prior releases. The check is
+      also skipped when no dedicated ephemeral disk is requested (the agent then
+      carves ephemeral storage from the grown root disk). A conventional value is
+      2.
+    default: 0
+  pve.ephemeral_disk_min_mode:
+    description: |
+      Action when the ephemeral_disk_min_ratio invariant is violated: "enforce"
+      (the default) rejects create_vm with a non-retriable error naming the
+      deficit; "warn" logs the deficit and proceeds. No effect unless
+      ephemeral_disk_min_ratio is set. One of enforce|warn; empty resolves to
+      enforce.
+    default: ""
   pve.stemcell_replication_concurrency:
     description: |
       Maximum number of cluster nodes that receive a stemcell replica upload
