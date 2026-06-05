@@ -14,6 +14,7 @@ import (
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/cpi/handlers"
+	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
 )
@@ -432,6 +433,185 @@ func TestHandleDeleteDisk_NoClusterCallExpected(t *testing.T) {
 	}
 	if clusterCalled {
 		t.Error("delete_disk must not call the cluster service (no VMID allocation needed)")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// disk_delete_state_guard tests
+// ---------------------------------------------------------------------------
+
+// guardDeleteClient wires storage + qemu(config) + cluster services so the
+// owner-lock guard can resolve the VM the disk is ATTACHED to and read its lock.
+// The disk-name VMID (9001 in diskCID) is only a placeholder; the disk is
+// attached to attachedVMID, whose config carries diskCID at scsi0 plus lock.
+// attachedLock is the config "lock" value; attachedNode is where the cluster
+// scan places that VM.
+func guardDeleteClient(
+	t *testing.T, storageSvc *mockStorageService, attachedVMID int, attachedNode, attachedLock string,
+) (*mockPVEClient, *int, *int) {
+	t.Helper()
+	var configReads, listCalls int
+	cfg := map[string]any{"scsi0": diskCID}
+	if attachedLock != "" {
+		cfg["lock"] = attachedLock
+	}
+	return &mockPVEClient{
+		storageSvc: storageSvc,
+		qemuSvc: &mockQEMUService{
+			configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+				configReads++
+				return cfg, nil
+			},
+		},
+		clusterSvc: &mockClusterSvc{
+			listResourcesFn: func(_ context.Context, _ *sdkclusterapi.ListResourcesParams) (*sdkclusterapi.ListResourcesResponse, error) {
+				listCalls++
+				return attachDiskVMOnNode(attachedVMID, attachedNode), nil
+			},
+		},
+	}, &configReads, &listCalls
+}
+
+func guardDepsForDelete(client *mockPVEClient) handlers.Deps {
+	return handlers.Deps{
+		Config: &config.CPIConfig{
+			Node:                 testNode,
+			DiskStorage:          storageName,
+			DiskDeleteStateGuard: "on",
+		},
+		PVE:    client,
+		Logger: log.NewNopLogger(),
+	}
+}
+
+// TestHandleDeleteDisk_Guard_OwnerLocked_Retriable: guard on, the owning VM is
+// mid-migrate → delete_disk defers with a retriable error and never issues the
+// volume delete.
+func TestHandleDeleteDisk_Guard_OwnerLocked_Retriable(t *testing.T) {
+	t.Parallel()
+	deleteCalled := false
+	storageSvc := &mockStorageService{
+		deleteVolumeFn: func(_ context.Context, _, _, _ string) error {
+			deleteCalled = true
+			return nil
+		},
+	}
+	// Disk attached to VM 9002 (≠ placeholder name VMID 9001), mid-migrate.
+	client, _, _ := guardDeleteClient(t, storageSvc, 9002, testNode, "migrate")
+	deps := guardDepsForDelete(client)
+
+	h := handlers.HandleDeleteDisk(deps)
+	_, err := h.Handle(context.Background(), []json.RawMessage{marshal(diskCID)}, jsonrpc.Context{})
+
+	if err == nil {
+		t.Fatal("expected retriable error when the attached VM is locked, got nil")
+	}
+	if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+		t.Errorf("expected retriable-cloud error, got %v", err)
+	}
+	if deleteCalled {
+		t.Error("delete_disk must NOT delete the volume while the attached VM is locked")
+	}
+}
+
+// TestHandleDeleteDisk_Guard_OwnerUnlocked_Deletes: guard on, the attached VM
+// has no lock → guard passes and the volume is deleted normally.
+func TestHandleDeleteDisk_Guard_OwnerUnlocked_Deletes(t *testing.T) {
+	t.Parallel()
+	deleteCalled := false
+	storageSvc := &mockStorageService{
+		deleteVolumeFn: func(_ context.Context, _, _, _ string) error {
+			deleteCalled = true
+			return nil
+		},
+	}
+	client, configReads, _ := guardDeleteClient(t, storageSvc, 9002, testNode, "")
+	deps := guardDepsForDelete(client)
+
+	h := handlers.HandleDeleteDisk(deps)
+	_, err := h.Handle(context.Background(), []json.RawMessage{marshal(diskCID)}, jsonrpc.Context{})
+
+	if err != nil {
+		t.Fatalf("unexpected error when the attached VM is unlocked: %v", err)
+	}
+	if !deleteCalled {
+		t.Error("delete_disk must delete the volume when the attached VM is unlocked")
+	}
+	if *configReads == 0 {
+		t.Error("guard should have read the attached VM config when enabled")
+	}
+}
+
+// TestHandleDeleteDisk_Guard_Off_NoOwnerLookup proves the guard is byte-identical
+// when disabled: with no DiskDeleteStateGuard set, neither the cluster scan nor
+// the config read runs, and the delete proceeds.
+func TestHandleDeleteDisk_Guard_Off_NoOwnerLookup(t *testing.T) {
+	t.Parallel()
+	deleteCalled := false
+	storageSvc := &mockStorageService{
+		deleteVolumeFn: func(_ context.Context, _, _, _ string) error {
+			deleteCalled = true
+			return nil
+		},
+	}
+	// The attached VM would be locked, but the guard is OFF → it must not look.
+	client, configReads, listCalls := guardDeleteClient(t, storageSvc, 9002, testNode, "migrate")
+	deps := handlers.Deps{
+		Config: &config.CPIConfig{
+			Node:        testNode,
+			DiskStorage: storageName,
+			// DiskDeleteStateGuard unset → off.
+		},
+		PVE:    client,
+		Logger: log.NewNopLogger(),
+	}
+
+	h := handlers.HandleDeleteDisk(deps)
+	_, err := h.Handle(context.Background(), []json.RawMessage{marshal(diskCID)}, jsonrpc.Context{})
+
+	if err != nil {
+		t.Fatalf("unexpected error with guard off: %v", err)
+	}
+	if !deleteCalled {
+		t.Error("guard off: delete must proceed")
+	}
+	if *configReads != 0 || *listCalls != 0 {
+		t.Errorf("guard off: must not query owner (config=%d, list=%d)", *configReads, *listCalls)
+	}
+}
+
+// TestHandleDeleteDisk_Guard_NotAttached_Deletes: guard on, but the disk is
+// attached to no VM (the normal pre-delete state) → guard finds no owner and
+// the delete runs.
+func TestHandleDeleteDisk_Guard_NotAttached_Deletes(t *testing.T) {
+	t.Parallel()
+	deleteCalled := false
+	storageSvc := &mockStorageService{
+		deleteVolumeFn: func(_ context.Context, _, _, _ string) error {
+			deleteCalled = true
+			return nil
+		},
+	}
+	client := &mockPVEClient{
+		storageSvc: storageSvc,
+		qemuSvc:    &mockQEMUService{},
+		clusterSvc: &mockClusterSvc{
+			listResourcesFn: func(_ context.Context, _ *sdkclusterapi.ListResourcesParams) (*sdkclusterapi.ListResourcesResponse, error) {
+				empty := sdkclusterapi.ListResourcesResponse{}
+				return &empty, nil
+			},
+		},
+	}
+	deps := guardDepsForDelete(client)
+
+	h := handlers.HandleDeleteDisk(deps)
+	_, err := h.Handle(context.Background(), []json.RawMessage{marshal(diskCID)}, jsonrpc.Context{})
+
+	if err != nil {
+		t.Fatalf("unexpected error when disk is not attached: %v", err)
+	}
+	if !deleteCalled {
+		t.Error("guard on + not attached: delete must proceed")
 	}
 }
 

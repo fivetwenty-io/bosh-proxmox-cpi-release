@@ -1651,7 +1651,7 @@ fields are exercised against a fake PVE client asserting the contract; a true mu
 race and a stuck-lock winner (which requires operator `qm unlock` recovery, noted in the spec) need a
 live cluster to validate.
 
-#### 7.38 OPEN — Pre-delete lock/status guard on `delete_disk` against in-flight volume operations
+#### 7.38 DONE — Pre-delete lock/status guard on `delete_disk` against in-flight volume operations
 
 *References: Google, OpenStack.* Google's disk delete refuses when `disk.Status` is neither `READY`
 nor `FAILED`, returning an error rather than racing a `CREATING`/`RESTORING` disk
@@ -1673,6 +1673,26 @@ before freeing; if it is set to a destructive/in-flight value, treat it as *retr
 director re-drives the delete after the lock clears (mirroring §7.27's convergence posture), or
 fail-fast with a clear non-retriable error. Keep the existing 404-idempotent skip. With the guard off,
 current behavior is preserved exactly.
+
+**Shipped.** Opt-in `pve.disk_delete_state_guard` (`off` default → byte-identical; `on` to enable).
+When enabled, `HandleDeleteDisk` runs `pve.GuardDiskDeleteState` between node resolution and the
+`imgdel` call. The critical design point: the VMID baked into a managed volid name
+(`<storage>:vm-<VMID>-disk-<N>`) is only the allocation-time placeholder this CPI assigns at
+`create_disk` — BOSH attaches the volume to a different guest without renaming it, so the guard
+resolves the *currently-attached* VM by scanning VM configs for the volid (`FindVMByDiskVolid`),
+**not** by parsing the name. It then reads that VM's `lock` config field; a destructive/in-flight
+value (`backup`, `clone`, `migrate`, `snapshot`, `rollback`, `create`) yields a `TypeRetriableCloud`
+error so the director re-drives the delete after the lock clears (mirroring §7.27's convergence
+posture). The guard is best-effort and fails open on every uncertainty: a disk attached to no VM (the
+normal pre-delete state), an attachment-resolution failure, a config-read error, or a 404 all pass
+straight through, so an enabled guard can never convert a hiccup into a delete failure. The existing
+404-idempotent skip and the `RetryOnTransientOrLock`-wrapped `imgdel` are unchanged; with the guard
+off (the default) no attachment lookup runs and behavior is byte-identical. Residual: the
+check-then-delete window is inherently best-effort (a lock taken between the guard read and the
+`imgdel` is not caught), and if the attached VM is left with a stuck config lock the delete defers
+until an operator runs `qm unlock <vmid>` — the deferral log names the VM, node, and lock.
+Live-validation caveat: exercised against fakes asserting the resolution + lock-classification
+contract; the real attached-VM-mid-operation race needs a live PVE cluster.
 
 #### 7.39 OPEN — Eventual-consistency retry resolving a freshly-created SDN vnet/bridge
 

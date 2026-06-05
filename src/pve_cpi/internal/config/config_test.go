@@ -201,6 +201,39 @@ func TestValidate_ReplicaAdoptTimeoutNegative(t *testing.T) {
 	assertCloudError(t, err, "replica_adopt_timeout_sec must be >= 0")
 }
 
+func TestDiskDeleteStateGuardAccessor(t *testing.T) {
+	t.Parallel()
+	// Default (empty) → disabled, byte-identical behavior.
+	if (&config.CPIConfig{}).DiskDeleteStateGuardEnabled() {
+		t.Error("empty disk_delete_state_guard should be disabled")
+	}
+	// Explicit "off" → disabled.
+	if (&config.CPIConfig{DiskDeleteStateGuard: "off"}).DiskDeleteStateGuardEnabled() {
+		t.Error(`"off" should be disabled`)
+	}
+	// "on" (any case, padded) → enabled.
+	for _, v := range []string{"on", "ON", " On "} {
+		if !(&config.CPIConfig{DiskDeleteStateGuard: v}).DiskDeleteStateGuardEnabled() {
+			t.Errorf("%q should enable the guard", v)
+		}
+	}
+	// Nil receiver is defensive.
+	var nilCfg *config.CPIConfig
+	if nilCfg.DiskDeleteStateGuardEnabled() {
+		t.Error("nil receiver should be disabled")
+	}
+}
+
+func TestValidate_DiskDeleteStateGuardInvalid(t *testing.T) {
+	t.Parallel()
+	_, err := mustLoad(t, `{
+		"host": "h", "user": "u", "password": "p",
+		"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
+		"disk_delete_state_guard": "maybe"
+	}`)
+	assertCloudError(t, err, "disk_delete_state_guard must be one of off|on")
+}
+
 func TestClusterLockAccessors(t *testing.T) {
 	t.Parallel()
 	// Defaults: off, not enabled, verify off, timeout 60.

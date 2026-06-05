@@ -368,6 +368,17 @@ type CPIConfig struct {
 	// effective values.
 	IPConflictProbe string `json:"ip_conflict_probe,omitempty"`
 
+	// DiskDeleteStateGuard selects whether delete_disk first checks the lock
+	// state of the VM that owns the target volume. When empty or "off" (default),
+	// no owner lookup runs and behavior is byte-identical to prior releases. When
+	// "on", delete_disk resolves the owning guest (from the managed volid) and,
+	// if that guest holds a destructive/in-flight lock (backup, clone, migrate,
+	// snapshot, rollback, create), defers the delete with a retriable error so
+	// the BOSH Director re-drives it after the operation completes. The guard is
+	// best-effort and fails open on any resolution uncertainty. Enum:
+	// ""|"off"|"on". Use DiskDeleteStateGuardEnabled() for the effective value.
+	DiskDeleteStateGuard string `json:"disk_delete_state_guard,omitempty"`
+
 	// DiskPerfInvariantMode controls enforcement of creation-time disk-performance
 	// invariants at attach_disk time. The structural options cache, iothread, and
 	// ssd are baked into the disk CID at create_disk time (§7.9). On re-attach the
@@ -1581,11 +1592,11 @@ func (c *CPIConfig) AntiAffinityStrict() bool {
 // Valid return values: "off", "pool".
 func (c *CPIConfig) ClusterLockMode() string {
 	if c == nil {
-		return "off"
+		return enumValueOff
 	}
 	v := strings.ToLower(strings.TrimSpace(c.ClusterLock))
 	if v == "" {
-		return "off"
+		return enumValueOff
 	}
 	return v
 }
@@ -1647,11 +1658,11 @@ func (c *CPIConfig) EnsureNoIPConflictsEnabled() bool {
 // Valid return values: "off", "agent".
 func (c *CPIConfig) IPConflictProbeMode() string {
 	if c == nil {
-		return "off"
+		return enumValueOff
 	}
 	v := strings.ToLower(strings.TrimSpace(c.IPConflictProbe))
 	if v == "" {
-		return "off"
+		return enumValueOff
 	}
 	return v
 }
@@ -1697,6 +1708,35 @@ func (c *CPIConfig) ResizeConvergenceTimeoutSecValue() int {
 // active. Returns true only when IPConflictProbeMode() == "agent".
 func (c *CPIConfig) ActiveIPProbeEnabled() bool {
 	return c.IPConflictProbeMode() == "agent"
+}
+
+// enumValueOff is the shared "off" literal used by the opt-in enum knobs.
+const enumValueOff = "off"
+
+// DiskDeleteStateGuardEnabled reports whether delete_disk should check the
+// owning VM's lock state before deleting. Empty or "off" (default) → false.
+func (c *CPIConfig) DiskDeleteStateGuardEnabled() bool {
+	if c == nil {
+		return false
+	}
+	return strings.ToLower(strings.TrimSpace(c.DiskDeleteStateGuard)) == "on"
+}
+
+// validateDiskDeleteStateGuardEnum appends an error when disk_delete_state_guard
+// is set to a value other than off|on. Empty (the default) is valid.
+func (c *CPIConfig) validateDiskDeleteStateGuardEnum(errs *[]string) {
+	if c.DiskDeleteStateGuard == "" {
+		return
+	}
+	switch strings.ToLower(strings.TrimSpace(c.DiskDeleteStateGuard)) {
+	case enumValueOff, "on":
+		// valid
+	default:
+		*errs = append(*errs, fmt.Sprintf(
+			"disk_delete_state_guard must be one of off|on (or empty for default off), got %q",
+			c.DiskDeleteStateGuard,
+		))
+	}
 }
 
 // VMFirewallEnabled returns the effective global per-NIC firewall default.
@@ -2195,7 +2235,7 @@ func (c *CPIConfig) validateEnumFields(errs *[]string) {
 	// IPConflictProbe enum: validate only when non-empty.
 	if c.IPConflictProbe != "" {
 		switch strings.ToLower(strings.TrimSpace(c.IPConflictProbe)) {
-		case "off", "agent":
+		case enumValueOff, "agent":
 			// valid
 		default:
 			*errs = append(*errs, fmt.Sprintf(
@@ -2205,10 +2245,13 @@ func (c *CPIConfig) validateEnumFields(errs *[]string) {
 		}
 	}
 
+	// DiskDeleteStateGuard enum: validate only when non-empty.
+	c.validateDiskDeleteStateGuardEnum(errs)
+
 	// DiskPerfInvariantMode enum: validate only when non-empty.
 	if c.DiskPerfInvariantMode != "" {
 		switch strings.ToLower(strings.TrimSpace(c.DiskPerfInvariantMode)) {
-		case "enforce", "warn", "off":
+		case "enforce", "warn", enumValueOff:
 			// valid
 		default:
 			*errs = append(*errs, fmt.Sprintf(
@@ -2229,7 +2272,7 @@ func (c *CPIConfig) validateEnumFields(errs *[]string) {
 	// ClusterLock mode enum: validate only when non-empty.
 	if c.ClusterLock != "" {
 		switch strings.ToLower(strings.TrimSpace(c.ClusterLock)) {
-		case "off", "pool":
+		case enumValueOff, "pool":
 			// valid
 		default:
 			*errs = append(*errs, fmt.Sprintf(
