@@ -201,6 +201,63 @@ func TestRedactSecrets_ScrubsQueryAndEmbeddedURLs(t *testing.T) {
 	}
 }
 
+// TestRedactSecrets_URLUserinfoWithAtInPassword verifies a userinfo password
+// containing a literal "@" is fully masked. The host begins after the LAST "@"
+// before the path, so masking up to the first "@" would leak the password tail.
+func TestRedactSecrets_URLUserinfoWithAtInPassword(t *testing.T) {
+	t.Parallel()
+	in := map[string]any{
+		// Benign key names so the URL string-scrubber — not key-name matching —
+		// does the masking. Password "p@ss-tail" carries a raw "@"; BOSH-generated
+		// mbus/NATS credentials are not percent-encoded, so this occurs in the wild.
+		"broker_addr": "nats://nats:p@ss-tail@10.0.0.1:4222",
+		"https_url":   "https://admin:pw@with@at@host.example:8006/api",
+	}
+	out := log.RedactSecrets(in).(map[string]any)
+	if got := out["broker_addr"].(string); strings.Contains(got, "ss-tail") {
+		t.Errorf("userinfo password tail after literal @ leaked: %v", got)
+	}
+	if got := out["broker_addr"].(string); !strings.Contains(got, "10.0.0.1:4222") {
+		t.Errorf("host portion should be preserved: %v", got)
+	}
+	if got := out["https_url"].(string); strings.Contains(got, "with@at") {
+		t.Errorf("userinfo password with multiple @ leaked: %v", got)
+	}
+	if got := out["https_url"].(string); !strings.Contains(got, "host.example:8006") {
+		t.Errorf("host portion should be preserved: %v", got)
+	}
+}
+
+// TestRedactSecrets_ScrubsSignatureQueryParams verifies presigned-URL signature
+// parameters — S3 "X-Amz-Signature", legacy "Signature", and Azure SAS "sig" —
+// are masked, while a benign query name that merely contains the letters "sig"
+// (such as "design") is left intact.
+func TestRedactSecrets_ScrubsSignatureQueryParams(t *testing.T) {
+	t.Parallel()
+	in := map[string]any{
+		"s3_presigned":  "https://bucket.s3.amazonaws.com/key?X-Amz-Signature=deadbeefcafe&X-Amz-Expires=900",
+		"s3_v2_query":   "https://bucket.s3.amazonaws.com/key?Signature=legacysigval&Expires=123",
+		"azure_sas":     "https://acct.blob.core.windows.net/c/b?sv=2021&sig=azuresasval&se=2026",
+		"benign_design": "https://host.example/render?design=modern&size=large",
+	}
+	out := log.RedactSecrets(in).(map[string]any)
+	for _, secret := range []string{"deadbeefcafe", "legacysigval", "azuresasval"} {
+		for k, v := range out {
+			if s, ok := v.(string); ok && strings.Contains(s, secret) {
+				t.Errorf("signature %q leaked under %q: %v", secret, k, s)
+			}
+		}
+	}
+	// A non-secret param whose name only contains the substring "sig" survives.
+	if got := out["benign_design"].(string); !strings.Contains(got, "design=modern") {
+		t.Errorf("benign design= param must not be redacted: %v", got)
+	}
+	// Non-secret siblings of a redacted signature param survive.
+	if got := out["s3_presigned"].(string); !strings.Contains(got, "X-Amz-Expires=900") {
+		t.Errorf("non-secret sibling param dropped: %v", got)
+	}
+}
+
 // TestRedactSecrets_UserExactMatch verifies "user"/"username" are masked on an
 // exact key match while user_data and user_agent (non-secret diagnostics) are
 // preserved — substring matching "user" would have clobbered them.
