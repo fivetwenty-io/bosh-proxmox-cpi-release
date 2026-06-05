@@ -133,14 +133,15 @@ func TestWaitForSDNVnetConverged_Timeout_Retriable(t *testing.T) {
 		return vnetsResp("other"), nil
 	}}
 	c := &nrFakeClient{cluster: fc}
-	// step (10s) far exceeds timeout (1s) so the deadline trips before the large
-	// retry budget is consumed.
+	// step (10s) far exceeds timeout (1s): poll 1 fails, the clock advances 10s
+	// past the 1s deadline during the sleep, so poll 2 runs and then the deadline
+	// check returns — exactly two polls, well short of the 1000-retry budget.
 	err := waitForSDNVnetConverged(context.Background(), c, "v1", 1000, time.Second, fixedClock(time.Unix(0, 0), 10*time.Second))
 	if err == nil || !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
 		t.Errorf("timeout: want retriable-cloud, got %v", err)
 	}
-	if fc.calls >= 1000 {
-		t.Errorf("timeout must trip before retry budget; got %d polls", fc.calls)
+	if fc.calls != 2 {
+		t.Errorf("deadline must trip after exactly two polls; got %d polls", fc.calls)
 	}
 }
 

@@ -272,10 +272,10 @@ func asError(err error, target **cpierrors.Error) bool {
 func TestParseStemcellCloudProps_DigestFields(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
-		name           string
-		cp             map[string]any
-		wantSHA256     string
-		wantSHA1       string
+		name       string
+		cp         map[string]any
+		wantSHA256 string
+		wantSHA1   string
 	}{
 		{
 			name:       "sha256 only",
@@ -339,7 +339,7 @@ type noopReplicationPoolService struct{}
 
 func (n *noopReplicationPoolService) AddVM(_ context.Context, _ string, _ int64) error { return nil }
 func (n *noopReplicationPoolService) CreatePool(_ context.Context, _, _ string) error  { return nil }
-func (n *noopReplicationPoolService) DeletePool(_ context.Context, _ string) error      { return nil }
+func (n *noopReplicationPoolService) DeletePool(_ context.Context, _ string) error     { return nil }
 func (n *noopReplicationPoolService) GetPoolComment(_ context.Context, _ string) (string, bool, error) {
 	return "", false, nil
 }
@@ -424,12 +424,10 @@ func (c *countingClusterService) ListResources(ctx context.Context, params *sdkc
 // Part B — ReplicateLocal=false → current behavior unchanged
 // ============================================================
 
-// TestReplicateStemcellToNodes_Disabled exercises replicateStemcellToNodes directly
-// with a node list but asserts the guard in the real production call path. The
-// prior version of this test was a tautology (the production call was inside a
-// hard-false if-branch and was never reached). This version calls the real function
-// and asserts: no upload to primary, and that StemcellReplicateLocal=false prevents
-// listClusterNodes from being called in the HandleCreateStemcell production guard.
+// TestReplicateStemcellToNodes_Disabled calls replicateStemcellToNodes directly
+// with only the primary node in the list and asserts no replica upload is
+// attempted. (The StemcellReplicateLocal flag guard itself lives in
+// HandleCreateStemcell and is covered by the enabled/handler tests.)
 func TestReplicateStemcellToNodes_Disabled(t *testing.T) {
 	t.Parallel()
 
@@ -482,20 +480,10 @@ func TestReplicateStemcellToNodes_Disabled(t *testing.T) {
 	replicateStemcellToNodes(context.Background(), deps, "pve1", "local", "test.qcow2",
 		sha256hex, []string{"pve1"}, "/dev/null", "", cp, "")
 
-	// Primary node must never receive an upload.
+	// Primary node must never receive an upload: given only the primary in the
+	// node list, replicateStemcellToNodes has no other node to replicate to.
 	if uploadCalls["pve1"] != 0 {
 		t.Errorf("primary node pve1 should not receive upload, got %d", uploadCalls["pve1"])
-	}
-
-	// Verify production guard: with StemcellReplicateLocal=false, listClusterNodes is
-	// not called inside the guard.
-	clusterCallsBefore := clusterSvc.listConfigNodesCalls
-	if cfg.StemcellReplicateLocal {
-		// This branch must NOT execute.
-		_, _ = listClusterNodes(context.Background(), deps)
-	}
-	if clusterSvc.listConfigNodesCalls != clusterCallsBefore {
-		t.Errorf("listClusterNodes was called despite StemcellReplicateLocal=false")
 	}
 }
 
@@ -893,7 +881,7 @@ func TestReplicateStemcellToNodes_Concurrency_AllNodesAttempted(t *testing.T) {
 	// to avoid deadlock if the pool actually IS serial, so the test just fails
 	// (peak ≤ 1, assertion below catches it).
 	ready := make(chan struct{}, len(nonPrimary)) // buffered: non-blocking send
-	release := make(chan struct{})               // closed when all in-limit are ready
+	release := make(chan struct{})                // closed when all in-limit are ready
 
 	var releaseOnce sync.Once
 
@@ -916,12 +904,13 @@ func TestReplicateStemcellToNodes_Concurrency_AllNodesAttempted(t *testing.T) {
 				releaseOnce.Do(func() { close(release) })
 			}
 			// Wait for the release signal (or a short timeout so we don't
-			// deadlock if fewer than 'limit' goroutines ever overlap).
+			// deadlock if fewer than 'limit' goroutines ever overlap). Truly
+			// concurrent uploads overlap within microseconds, so a serial-pool
+			// regression only waits this backstop once before the peak assertion
+			// below catches it.
 			select {
 			case <-release:
-			case <-time.After(2 * time.Second):
-				// Timed out waiting for concurrent overlap — that's OK;
-				// the peak assertion below will catch the serial case.
+			case <-time.After(300 * time.Millisecond):
 			}
 			uploadedNodes.Store(node, struct{}{})
 			return "", nil
@@ -1402,7 +1391,7 @@ func TestStemcellReplicationConcurrencyValue(t *testing.T) {
 		configured int
 		want       int
 	}{
-		{"nil config resolves to 1", 0, 1},  // tested via nil pointer below
+		{"nil config resolves to 1", 0, 1}, // tested via nil pointer below
 		{"zero resolves to 1", 0, 1},
 		{"one stays 1", 1, 1},
 		{"two stays 2", 2, 2},

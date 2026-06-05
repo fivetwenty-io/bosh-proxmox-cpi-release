@@ -9,8 +9,8 @@ import (
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
 
 	sdkclusterapi "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cluster"
-	sdkerrors "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/errors"
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/tasks"
+	sdkerrors "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/errors"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/cpi/handlers"
@@ -373,29 +373,12 @@ func TestHandleDeleteDisk_Dir_CID(t *testing.T) {
 	}
 }
 
-// TODO(storage-network): nfs — wired to PVE network-call boundary, stubbed pending
-// live shared-storage test infrastructure. Storage: nfs-store:9001/vm-9001-disk-0.qcow2. Re-enable when
-// integration-test harness provides a nfs pool via env.
-//
-// func TestHandleDeleteDisk_NFS_CID(t *testing.T) { ... }
-
-// TODO(storage-network): rbd — wired to PVE network-call boundary, stubbed pending
-// live shared-storage test infrastructure. Storage: ceph-pool:vm-9001-disk-0. Re-enable when
-// integration-test harness provides a rbd pool via env.
-//
-// func TestHandleDeleteDisk_RBD_CID(t *testing.T) { ... }
-
-// TODO(storage-network): cephfs — wired to PVE network-call boundary, stubbed pending
-// live shared-storage test infrastructure. Storage: cephfs-pool:vm-9001-disk-0. Re-enable when
-// integration-test harness provides a cephfs pool via env.
-//
-// func TestHandleDeleteDisk_CephFS_CID(t *testing.T) { ... }
-
-// TODO(storage-network): cifs — wired to PVE network-call boundary, stubbed pending
-// live shared-storage test infrastructure. Storage: cifs-store:9001/vm-9001-disk-0.qcow2. Re-enable when
-// integration-test harness provides a cifs pool via env.
-//
-// func TestHandleDeleteDisk_CIFS_CID(t *testing.T) { ... }
+// TODO(storage-network): network-backed storage CID variants (nfs
+// "nfs-store:9001/vm-9001-disk-0.qcow2", rbd "ceph-pool:vm-9001-disk-0", cephfs
+// "cephfs-pool:vm-9001-disk-0", cifs "cifs-store:9001/vm-9001-disk-0.qcow2") are
+// not unit-tested here: their delete path crosses the PVE network-call boundary
+// and needs a live shared-storage pool. Add these cases once the integration-test
+// harness provisions those pools via env.
 
 // Ensure cluster list not needed when using newHandlerMockClient.
 // This validates the delete_disk handler does NOT call NextDiskVMID.

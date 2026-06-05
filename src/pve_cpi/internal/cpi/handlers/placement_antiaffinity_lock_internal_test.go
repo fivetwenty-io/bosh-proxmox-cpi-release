@@ -153,27 +153,27 @@ func TestEnsureAntiAffinity_LockPool_AcquireBeforeReadReleaseAfter(t *testing.T)
 }
 
 // --------------------------------------------------------------------------
-// acquire when lock held + expiry in the future → polls then times out → retriable.
+// acquire fails (lock unobtainable) → retriable, and the RMW never runs.
 // --------------------------------------------------------------------------
 
-func TestEnsureAntiAffinity_LockPool_HeldLiveTimesOutRetriable(t *testing.T) {
+func TestEnsureAntiAffinity_LockPool_AcquireFailsRetriableNoRMW(t *testing.T) {
 	events := []string{}
 	stub := newAAStub()
 	stub.events = &events
 	pools := newAALockPools(&events)
-	// Lock permanently held: every CreatePool reports duplicate, and the holder's
-	// comment records a far-future expiry so it is never stolen. A 1s timeout keeps
-	// the real-clock poll loop short.
-	pools.pools["bosh-lock-aa-web"] = encodeAALockComment("other", 1<<40)
-	pools.createErr = func(_ string) error { return fmt.Errorf("pool already exists") }
+	// A non-duplicate create failure (transport/pmxcfs fault) is classified
+	// retriable immediately, so the acquire never enters its poll loop — the test
+	// stays deterministic with no real sleep. The held-live → wait → timeout path
+	// is covered against a fake clock in the internal/pve cluster-lock tests.
+	pools.createErr = func(_ string) error { return fmt.Errorf("pmxcfs unavailable") }
 
 	cfg := aaLockConfig("pool", false, 1)
 	err := ensureAntiAffinityMembership(context.Background(), aaDepsLock(cfg, stub, pools), "web", 101, log.NewNopLogger())
 	if err == nil {
-		t.Fatal("expected retriable timeout error when lock held by live owner")
+		t.Fatal("expected retriable error when the lock cannot be acquired")
 	}
 	if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
-		t.Errorf("held-lock timeout must be retriable; got %v", err)
+		t.Errorf("lock-acquire failure must be retriable; got %v", err)
 	}
 	// No RMW must have run (rule never touched).
 	if stub.createRuleCalls != 0 || stub.deleteRuleCalls != 0 {

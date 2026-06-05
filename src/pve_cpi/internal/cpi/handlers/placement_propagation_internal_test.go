@@ -1,10 +1,9 @@
-// Internal tests proving that TypeRetriableCloud errors from
-// ensureAntiAffinityMembership and applyAZNodeAffinityPin propagate to the
-// caller rather than being swallowed as best-effort warnings.
-//
-// These tests close a false-confidence gap: an earlier test asserted the error
-// was returned by ensureAntiAffinityMembership itself but never proved that the
-// create_vm call-site routing forwarded it.
+// Internal tests proving that the create_vm call-site routing functions —
+// applyAntiAffinityMembership and applyAZNodeAffinityPin — forward
+// TypeRetriableCloud errors to the director while swallowing generic HA blips as
+// best-effort warnings. The tests drive the REAL routing functions end-to-end
+// rather than a test-local copy of the conditional, so a drift between the test
+// and the production routing cannot pass unnoticed.
 package handlers
 
 import (
@@ -16,114 +15,6 @@ import (
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
 )
-
-// callSiteRoute mirrors the exact conditional the create_vm call sites use:
-// propagate TypeRetriableCloud, swallow everything else as a warning.
-// Extracting it here makes the contract explicit and verifiable.
-func callSiteRoute(err error) error {
-	if err == nil {
-		return nil
-	}
-	if cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
-		return err // caller must return this to the director
-	}
-	return nil // generic HA blip: warn-and-continue
-}
-
-// --------------------------------------------------------------------------
-// anti-affinity call-site routing
-// --------------------------------------------------------------------------
-
-// TestCallSiteRoute_PropagatesRetriable asserts the call-site routing function
-// forwards TypeRetriableCloud errors.
-func TestCallSiteRoute_PropagatesRetriable(t *testing.T) {
-	t.Parallel()
-	retriable := cpierrors.WrapAs(
-		cpierrors.Cloud("lock timeout"),
-		cpierrors.TypeRetriableCloud, "lock")
-	if got := callSiteRoute(retriable); got == nil {
-		t.Error("call-site must propagate TypeRetriableCloud")
-	}
-}
-
-// TestCallSiteRoute_SwallowsGeneric asserts that a non-retriable HA error is
-// swallowed (preserves §7.21 fail-open intent for generic HA API blips).
-func TestCallSiteRoute_SwallowsGeneric(t *testing.T) {
-	t.Parallel()
-	generic := cpierrors.Cloud("HA not configured")
-	if got := callSiteRoute(generic); got != nil {
-		t.Errorf("call-site must swallow non-retriable HA errors; got %v", got)
-	}
-}
-
-// TestAntiAffinityRetriable_LockTimeout_Propagated asserts that a lock-timeout
-// retriable error from ensureAntiAffinityMembership is propagated by callSiteRoute.
-func TestAntiAffinityRetriable_LockTimeout_Propagated(t *testing.T) {
-	t.Parallel()
-	events := []string{}
-	stub := newAAStub()
-	stub.listResourcesFn = aaResourcesFn(aaQEMU(100, "job--web"))
-	lockPools := newAALockPools(&events)
-	// Pre-hold the lock with a far-future expiry; every CreatePool returns dup.
-	lockPools.pools["bosh-lock-aa-web"] = encodeAALockComment("other-owner", 1<<40)
-	lockPools.createErr = func(_ string) error { return fmt.Errorf("already exists") }
-
-	cfg := aaLockConfig("pool", false, 1) // 1s timeout → fast
-	deps := aaDepsLock(cfg, stub, lockPools)
-	err := ensureAntiAffinityMembership(context.Background(), deps, "web", 101, log.NewNopLogger())
-	if err == nil {
-		t.Fatal("expected retriable error from lock-timeout")
-	}
-	if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
-		t.Fatalf("lock-timeout must be TypeRetriableCloud; got %v", err)
-	}
-	// Apply the call-site routing — must propagate.
-	if callSiteRoute(err) == nil {
-		t.Fatal("call-site routing must propagate the lock-timeout error to the director")
-	}
-}
-
-// TestAntiAffinityRetriable_VerifyAbsent_Propagated asserts that a verify-absent
-// retriable error propagates through the call-site routing.
-func TestAntiAffinityRetriable_VerifyAbsent_Propagated(t *testing.T) {
-	t.Parallel()
-	stub := newAAStub()
-	stub.listResourcesFn = aaResourcesFn(aaQEMU(100, "job--web"))
-	stub.dropMemberOnRecreate = "vm:101"
-
-	cfg := aaLockConfig("off", true, 0)
-	deps := aaDepsLock(cfg, stub, newAALockPools(nil))
-	err := ensureAntiAffinityMembership(context.Background(), deps, "web", 101, log.NewNopLogger())
-	if err == nil {
-		t.Fatal("expected retriable error from verify-absent")
-	}
-	if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
-		t.Fatalf("verify-absent must be TypeRetriableCloud; got %v", err)
-	}
-	if callSiteRoute(err) == nil {
-		t.Fatal("call-site routing must propagate the verify-absent error to the director")
-	}
-}
-
-// TestAntiAffinityGeneric_Swallowed asserts that a generic HA list-rules failure
-// is NOT propagated (preserves §7.21 best-effort / fail-open behaviour).
-func TestAntiAffinityGeneric_Swallowed(t *testing.T) {
-	t.Parallel()
-	stub := newAAStub()
-	stub.listResourcesFn = aaResourcesFn(aaQEMU(100, "job--web"))
-	stub.failListRules = true // generic HA blip
-
-	cfg := aaLockConfig("off", false, 0)
-	deps := aaDepsLock(cfg, stub, newAALockPools(nil))
-	err := ensureAntiAffinityMembership(context.Background(), deps, "web", 101, log.NewNopLogger())
-	if err == nil {
-		t.Fatal("ensureAntiAffinityMembership should return the list error")
-	}
-	// Non-retriable error must be swallowed at the call site.
-	if callSiteRoute(err) != nil {
-		t.Fatal("generic HA error must be swallowed (fail-open); should not reach the director")
-	}
-}
 
 // aaEnvForGroup builds a BOSH env whose instanceGroupName resolves to group:
 // the full group ("d-<group>") plus a groups list from which the shortest
@@ -152,24 +43,51 @@ func aaMembershipConfig(mode string, verify bool, timeoutSec int) *config.CPICon
 	return c
 }
 
-// TestApplyAntiAffinityMembership_RetriableLockTimeout_Propagates drives the REAL
-// create_vm routing function end-to-end: a held cluster lock that never frees
-// must surface as a TypeRetriableCloud the director re-drives — proving the
-// propagation at the actual call-site function, not a test-local mirror.
-func TestApplyAntiAffinityMembership_RetriableLockTimeout_Propagates(t *testing.T) {
+// TestApplyAntiAffinityMembership_RetriableLockLost_Propagates drives the REAL
+// create_vm routing function end-to-end: a retriable error from the cluster-lock
+// acquire must surface as a TypeRetriableCloud the director re-drives — proving
+// the propagation at the actual call-site function, not a test-local mirror.
+//
+// The acquire fails fast here with a transport-class error (which the lock maps
+// to retriable without entering its poll loop), so the test stays deterministic
+// with no real sleep. The held-lock → wait → timeout → retriable mechanic itself
+// is proven against a fake clock in the internal/pve cluster-lock tests.
+func TestApplyAntiAffinityMembership_RetriableLockLost_Propagates(t *testing.T) {
 	t.Parallel()
 	stub := newAAStub()
 	stub.listResourcesFn = aaResourcesFn(aaQEMU(100, "job--web"))
 	events := []string{}
 	lockPools := newAALockPools(&events)
-	lockPools.pools["bosh-lock-aa-web"] = encodeAALockComment("other-owner", 1<<40)
-	lockPools.createErr = func(_ string) error { return fmt.Errorf("already exists") }
+	// A non-duplicate create failure (transport/pmxcfs fault) is classified
+	// retriable immediately, no poll loop.
+	lockPools.createErr = func(_ string) error { return fmt.Errorf("pmxcfs unavailable") }
 
 	cfg := aaMembershipConfig("pool", false, 1)
 	deps := aaDepsLock(cfg, stub, lockPools)
 	err := applyAntiAffinityMembership(context.Background(), deps, 101, aaEnvForGroup("web"), log.NewNopLogger())
 	if err == nil {
-		t.Fatal("applyAntiAffinityMembership must propagate the lock-timeout retriable to the director")
+		t.Fatal("applyAntiAffinityMembership must propagate the lock-acquire retriable to the director")
+	}
+	if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+		t.Fatalf("must be TypeRetriableCloud; got %v", err)
+	}
+}
+
+// TestApplyAntiAffinityMembership_RetriableVerify_Propagates proves the same real
+// routing function forwards a verify-absent retriable: when a concurrent writer
+// drops the new member from the recreated rule, the TypeRetriableCloud from the
+// read-after-write verify must reach the director.
+func TestApplyAntiAffinityMembership_RetriableVerify_Propagates(t *testing.T) {
+	t.Parallel()
+	stub := newAAStub()
+	stub.listResourcesFn = aaResourcesFn(aaQEMU(100, "job--web"))
+	stub.dropMemberOnRecreate = "vm:101" // concurrent drop → verify sees member absent
+
+	cfg := aaMembershipConfig("off", true, 0) // verify on, lock off
+	deps := aaDepsLock(cfg, stub, newAALockPools(nil))
+	err := applyAntiAffinityMembership(context.Background(), deps, 101, aaEnvForGroup("web"), log.NewNopLogger())
+	if err == nil {
+		t.Fatal("applyAntiAffinityMembership must propagate the verify-absent retriable to the director")
 	}
 	if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
 		t.Fatalf("must be TypeRetriableCloud; got %v", err)
@@ -241,7 +159,7 @@ func TestApplyAZNodeAffinityPin_RetriableVerify_Propagates(t *testing.T) {
 func TestApplyAZNodeAffinityPin_GenericFail_Swallowed(t *testing.T) {
 	t.Parallel()
 	stub := newAAStub()
-	stub.failListRules = true // causes ensureNodeAffinityPin to return a generic error
+	stub.failListRules = true         // causes ensureNodeAffinityPin to return a generic error
 	deps := naVerifyDeps(stub, false) // verify off so only the list-rules error fires
 	cp := createVMCloudProps{AvailabilityZone: "z1"}
 	err := applyAZNodeAffinityPin(context.Background(), deps, 101, cp, "pve-node1", log.NewNopLogger())
