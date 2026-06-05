@@ -137,7 +137,7 @@ func acquireAntiAffinityLock(ctx context.Context, deps Deps, groupKey string, vm
 			cpierrors.Cloud("anti-affinity: cluster_lock_mode=pool but no pool service available"),
 			cpierrors.TypeRetriableCloud, "anti-affinity: acquire cluster lock")
 	}
-	// TTL and timeout are deliberately decoupled (M5): TTL is 2× the acquire
+	// TTL and timeout are deliberately decoupled: TTL is 2× the acquire
 	// timeout so a holder whose RMW runs for the full timeout duration is not
 	// stolen mid-flight by a concurrent waiter. A crashed holder (RMW aborted,
 	// release never called) is reclaimed at 2×timeout — acceptable for the
@@ -227,7 +227,7 @@ func ensureAntiAffinityMembershipLocked(
 // rather than silently losing the spread guarantee. A no-op when
 // antiaffinity_verify is off.
 //
-// A single re-read is used here (M6). PVE HA-rule reads are strongly consistent
+// A single re-read is used here. PVE HA-rule reads are strongly consistent
 // within the same cluster because pmxcfs serializes writes; a false-negative
 // (rule absent) is therefore a real concurrent drop, not read lag, so a single
 // re-read is sufficient. A false-negative triggers a bounded director re-drive

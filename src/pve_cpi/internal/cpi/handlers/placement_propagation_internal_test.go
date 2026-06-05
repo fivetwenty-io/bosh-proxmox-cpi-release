@@ -2,9 +2,9 @@
 // ensureAntiAffinityMembership and applyAZNodeAffinityPin propagate to the
 // caller rather than being swallowed as best-effort warnings.
 //
-// These tests close the false-confidence gap identified in review finding C1:
-// the earlier tests asserted the error was returned by ensureAntiAffinityMembership
-// itself but never proved that the create_vm call-site routing forwarded it.
+// These tests close a false-confidence gap: an earlier test asserted the error
+// was returned by ensureAntiAffinityMembership itself but never proved that the
+// create_vm call-site routing forwarded it.
 package handlers
 
 import (
@@ -31,7 +31,7 @@ func callSiteRoute(err error) error {
 }
 
 // --------------------------------------------------------------------------
-// C1 — anti-affinity call-site routing
+// anti-affinity call-site routing
 // --------------------------------------------------------------------------
 
 // TestCallSiteRoute_PropagatesRetriable asserts the call-site routing function
@@ -154,8 +154,8 @@ func aaMembershipConfig(mode string, verify bool, timeoutSec int) *config.CPICon
 
 // TestApplyAntiAffinityMembership_RetriableLockTimeout_Propagates drives the REAL
 // create_vm routing function end-to-end: a held cluster lock that never frees
-// must surface as a TypeRetriableCloud the director re-drives — proving the C1
-// fix at the actual call-site function, not a test-local mirror.
+// must surface as a TypeRetriableCloud the director re-drives — proving the
+// propagation at the actual call-site function, not a test-local mirror.
 func TestApplyAntiAffinityMembership_RetriableLockTimeout_Propagates(t *testing.T) {
 	t.Parallel()
 	stub := newAAStub()
@@ -194,7 +194,7 @@ func TestApplyAntiAffinityMembership_GenericFail_Swallowed(t *testing.T) {
 }
 
 // --------------------------------------------------------------------------
-// C1 — node-affinity call-site propagation via applyAZNodeAffinityPin
+// node-affinity call-site propagation via applyAZNodeAffinityPin
 // --------------------------------------------------------------------------
 
 // naVerifyDeps builds Deps for a node-affinity verify test: HA pin enabled,

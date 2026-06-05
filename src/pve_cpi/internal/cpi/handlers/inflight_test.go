@@ -152,7 +152,7 @@ func TestInflightPerNodeIsolation(t *testing.T) {
 // TestInflightAcquireFailureIsRetriable verifies that an acquire failure (here:
 // ctx cancel while blocked) produces an error that, when wrapped by
 // cpierrors.Retriable — exactly as the five handler call-sites do — yields
-// OkToRetry=true. This is the H2 regression guard: the previous cpierrors.Cloud
+// OkToRetry=true. This is a regression guard: the previous cpierrors.Cloud
 // wrapper returned OkToRetry=false, meaning the Director would never re-queue.
 func TestInflightAcquireFailureIsRetriable(t *testing.T) {
 	inflightSems = &nodeInflightRegistry{m: map[string]chan struct{}{}}

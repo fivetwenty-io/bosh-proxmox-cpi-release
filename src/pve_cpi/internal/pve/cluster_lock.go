@@ -176,7 +176,7 @@ func acquireClusterLockWithClock(
 // when the lock is still live or when another stealer won the race, signalling
 // the caller to wait/retry.
 //
-// Residual steal race (H3): two stealers A,B may both read the expired comment,
+// Residual steal race: two stealers A,B may both read the expired comment,
 // both delete, and both try to recreate. One wins CreatePool; the other sees dup
 // and loops. However, A (the first creator) can then have its freshly-created
 // pool deleted by B's DeletePool (which runs before B's CreatePool), transiently
@@ -226,7 +226,7 @@ func tryStealExpired(
 			fmt.Sprintf("AcquireClusterLock: steal-recreate lock %q", pool))
 	}
 
-	// Post-steal owner verification (H3 mitigation): re-read the pool and confirm
+	// Post-steal owner verification: re-read the pool and confirm
 	// our owner token is the one persisted. If a concurrent stealer B deleted our
 	// freshly-created pool between our CreatePool and this re-read, we will see B's
 	// owner (or nothing) and correctly refuse the handle, looping back to wait/steal.

@@ -328,7 +328,7 @@ func TestBuildStemcellFilename_EmptySHA(t *testing.T) {
 // TestSanitizeStemcellPart_MultibyteUTF8_ProducesAsciiOnly verifies that
 // multi-byte UTF-8 characters (e.g., CJK, emoji, combining marks) are treated
 // as a single disallowed unit and produce exactly one "-" rather than one "-"
-// per byte. This validates the rune-iteration fix (C6).
+// per byte. This validates the rune-iteration behavior.
 func TestSanitizeStemcellPart_MultibyteUTF8_ProducesAsciiOnly(t *testing.T) {
 	t.Parallel()
 	tests := []struct {

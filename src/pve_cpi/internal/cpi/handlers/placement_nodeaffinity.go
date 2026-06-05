@@ -34,7 +34,7 @@ func naRuleNameFor(vmid int) string {
 // node), skips the DLB sentinel AZ (DLB intentionally un-pins), and logs any pin
 // failure without failing create_vm. A no-op when pinning is disabled.
 //
-// Selective propagation (C1): a TypeRetriableCloud error (lock-timeout, verify
+// Selective propagation: a TypeRetriableCloud error (lock-timeout, verify
 // failure) is returned so the director re-drives rather than silently losing the
 // AZ pin guarantee. Generic HA-API failures (HA unconfigured, rule-write hiccup)
 // are logged as warnings and do not fail create_vm, preserving the §7.21 intent.

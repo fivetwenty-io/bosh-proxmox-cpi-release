@@ -735,7 +735,7 @@ func TestHandleSetDiskMetadata_Dir_CID(t *testing.T) {
 	}
 }
 
-// TestHandleSetDiskMetadata_ExactVolidMatch — M3 fix: a diskCID "local-lvm:vm-100-disk-0"
+// TestHandleSetDiskMetadata_ExactVolidMatch — a diskCID "local-lvm:vm-100-disk-0"
 // must NOT match a VM that holds "local-lvm:vm-100-disk-0-clone" (substring match
 // would produce a false positive). Only exact volid equality or option-prefixed
 // match "local-lvm:vm-100-disk-0,..." must match.

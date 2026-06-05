@@ -215,7 +215,7 @@ func findVMsHostingDisk(ctx context.Context, deps Deps, diskCID string) ([]attac
 
 		// Use exact volid matching with option-string tolerance: a config value of
 		// "local-lvm:vm-100-disk-0,size=10G" must match diskCID "local-lvm:vm-100-disk-0"
-		// but must NOT match diskCID "local-lvm:vm-100-disk" (M3 fix).
+		// but must NOT match diskCID "local-lvm:vm-100-disk".
 		if pve.DiskOptStrContainsVolid(qemu.ParseDisks(cfg), diskCID) {
 			matches = append(matches, attachedVM{node: vmNode, vmid: vmid})
 		}

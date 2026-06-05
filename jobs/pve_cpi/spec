@@ -804,7 +804,7 @@ properties:
       open so a guard hiccup never blocks a legitimate delete. Operator note: if
       the attached VM is left with a stuck config lock, delete_disk will keep
       deferring; clear it with "qm unlock <vmid>" on that VM's node.
-    default: "off"
+    default: ""
   pve.network_resolve_retries:
     description: |
       Eventual-consistency poll budget for freshly created SDN networks. A newly

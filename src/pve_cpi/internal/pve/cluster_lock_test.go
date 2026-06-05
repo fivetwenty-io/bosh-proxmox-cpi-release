@@ -172,7 +172,7 @@ func TestAcquireClusterLock_HeldExpiredOwnerSteals(t *testing.T) {
 		t.Fatalf("pool = %q; want bosh-lock-web", h.PoolName())
 	}
 	// Steal = first create fails (dup) -> get holder -> delete -> recreate ->
-	// post-steal get confirming our owner token won (H3 mitigation).
+	// post-steal get confirming our owner token won.
 	want := []string{
 		"create:bosh-lock-web", "get:bosh-lock-web", "delete:bosh-lock-web",
 		"create:bosh-lock-web", "get:bosh-lock-web",

@@ -1164,7 +1164,7 @@ func TestNextVMID_LockNotHeldDuringAPICall(t *testing.T) {
 // TestRetryBackoff_RespectsContextCancel verifies that when the context is
 // cancelled during a backoff sleep, AllocateWithRetry returns immediately with
 // a context error rather than sleeping for the full backoff duration. This
-// validates the C10 fix to retryBackoff.
+// validates the context-cancellation behavior of retryBackoff.
 //
 // The test installs a backoff function that would sleep 10s (far longer than
 // the test timeout); the context is cancelled within 100ms. The call must
