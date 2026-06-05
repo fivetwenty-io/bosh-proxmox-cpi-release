@@ -1,16 +1,15 @@
 # Proxmox VE CPI — Cross-CPI Comparison Matrix and Improvement Analysis
 
-A comprehensive re-analysis of the Proxmox VE (PVE) BOSH CPI against six upstream
-CPI implementations, measured against the canonical BOSH CPI API v2 contract. The
-goal is to mine proven patterns from a far broader reference set than the prior
-report covered, confirm which earlier recommendations have shipped, and rank the
-capabilities still worth adding — with a PVE-specific rationale and a concrete
-build approach for each.
+A re-analysis of the Proxmox VE (PVE) BOSH CPI against six upstream CPI implementations,
+measured against the canonical BOSH CPI API v2 contract. It mines proven patterns, confirms
+which earlier recommendations have shipped, and ranks the capabilities still worth adding —
+each with a PVE-specific rationale and a concrete build approach.
 
 ## 1. Reference Set and Method
 
-Six reference CPIs were inventoried in depth (real handler source, not just READMEs),
-then compared against the current PVE CPI through six cross-cutting capability themes.
+Six reference CPIs were inventoried in depth from real handler source, not just
+READMEs, then compared against the current PVE CPI through six cross-cutting capability
+themes.
 
 | CPI | Language | API/SDK surface |
 |-----|----------|-----------------|
@@ -22,45 +21,61 @@ then compared against the current PVE CPI through six cross-cutting capability t
 | Alicloud | Go | ECS/SLB/NLB, legacy SDK + Tea OpenAPI SDK |
 | **Proxmox (PVE)** | **Go** | **`pve-apiclient-go` v3 — this repository** |
 
+The OpenStack reference ships **two** CPI implementations. `bosh_openstack_cpi/` is the
+Ruby CPI wired into the `openstack_cpi` BOSH job — the production path that operators
+deploy today. `openstack_cpi_golang/` is a parallel Go port (175 non-vendor files), a
+rewrite still in progress while the Ruby CPI continues to ship. This report's
+"OpenStack-Go" rows and citations target the Go port. By implementation language, AWS,
+vSphere, and Azure are Ruby; the OpenStack Go port, Google, and Alicloud are Go, as is
+PVE.
+
 Each reference CPI received a dedicated deep-read producing a method-by-method status
 inventory plus a standout-feature list. The PVE CPI received the same treatment, with
 explicit cross-checks of which prior-roadmap items are now implemented. Six thematic
-analyses (placement, networking, storage, stemcell/agent, resiliency/observability,
-extensibility/ops-UX) then compared the reference behaviors against the current PVE
-code and classified each capability as already-done, or as a Tier 1–4 / not-recommended
-gap. Every Tier-1 headline below was re-verified directly against PVE source.
+analyses — placement, networking, storage, stemcell/agent, resiliency/observability,
+and extensibility/ops-UX — then compared the reference behaviors against the current PVE
+code and classified each capability as already done or as a Tier 1–4 (or
+not-recommended) gap. Every Tier-1 headline below was re-verified directly against PVE
+source.
 
 ## 2. Executive Summary
 
-**Status as of this round.** Every gap §7.1–§7.35 below is now **shipped and
-source-verified**: a feature-group-by-feature-group re-read of `src/pve_cpi` confirmed each
-"Shipped." claim against the real control flow, with file-and-function citations now folded
-into each section (the "In this codebase" / "Shipped" blocks). Two things changed as a
-result of going deeper. First, the verification surfaced honest caveats the original
-DONE-prose had glossed — fail-open windows, method-class-global (not per-call) timeouts,
-text-pattern pushback fragility, post-import (not pre-commit) checksum, reactive-only orphan
-GC — now recorded as "Limits" under each feature. Second, the wider reference re-read turned
-up **ten new gaps (§7.26–§7.35)**, none of which appeared in the prior report; **all ten are now
-shipped** — they are extensions of the shipped work (enforce the invariants §7.9 records, monitor
-the resizes §7.24 sizes, make the polling §7.25 fixed adaptive, and so on). **This round went
-further:** a fresh, independent re-extraction of all six references against the now-shipped
-§7.1–§7.35 surfaced **six more genuinely new gaps (§7.36–§7.41), all since shipped**, clustered on a
-theme the prior rounds under-weighted — *cross-process and in-flight-operation safety*: an
-unguarded HA-rule read-modify-write under parallel deploys (§7.36), a racing concurrent template
-clone (§7.37), and an unguarded `delete_disk` against a locked volume (§7.38), plus three
-operability/hardening items (SDN eventual-consistency §7.39, an ephemeral ≥2×RAM invariant §7.40,
-and dispatcher log redaction §7.41). The §3 matrix gained one correction (Azure `update_disk` is a
-full method, now `Y`, with a third documented refusal — account-type conversion), and the §6
-standout list was corrected against source in several places this round: Azure's per-backend-pool
-LB/App-Gateway assignment is **restored** (it is real, in `vm_manager_network.rb`); the §7.30
-transport-tuning model is **re-attributed to Alicloud** (the OpenStack *Go* CPI parses
-`ConnectionOptions` but never applies it to an `http.Transport`); and §7.29's agent-checksum model
-is the **Ruby** OpenStack CPI, not the Go one in this reference set. (The earlier-round finding that
-process-level panic recovery (§7.4) is *not* unique to OpenStack-Go — Google has it too — still
-holds.) A new **§9** records the cross-cutting dimensions this analysis still under-covers
-(concurrency model, observability, config surface, measured performance, test strategy,
-failure-mode taxonomy). The remainder of this summary is the original framing that motivated
-§7.1–§7.25, retained for provenance.
+Every gap §7.1–§7.41 below is shipped and source-verified — §7.5 only partially, since its
+host-side ARP probe is structurally blocked on Proxmox. A feature-group-by-feature-group
+re-read of `src/pve_cpi` confirmed each "Shipped." claim against the real control flow,
+with file-and-function citations folded into the "In this codebase" and "Shipped"
+blocks. Going deeper changed two things. First, the verification surfaced honest caveats
+the original prose had glossed — fail-open windows, method-class-global (not per-call)
+timeouts, text-pattern pushback fragility, post-import (not pre-commit) checksum, and
+reactive-only orphan GC — now recorded as "Limits" under each feature. Second, the wider
+reference re-read turned up ten new gaps (§7.26–§7.35), none of which appeared in the
+prior report, all now shipped as extensions of the existing work: they enforce the
+invariants §7.9 records, monitor the resizes §7.24 sizes, and make the polling §7.25
+fixes adaptive.
+
+A deeper read of all six references against the now-shipped
+§7.1–§7.35 surfaced six more genuinely new gaps (§7.36–§7.41, all since shipped),
+clustered on a theme the prior rounds under-weighted: cross-process and
+in-flight-operation safety. They cover an unguarded HA-rule read-modify-write under
+parallel deploys (§7.36), a racing concurrent template clone (§7.37), an unguarded
+`delete_disk` against a locked volume (§7.38), and three operability and hardening items
+— SDN eventual-consistency (§7.39), an ephemeral ≥2×RAM invariant (§7.40), and
+dispatcher log redaction (§7.41).
+
+The §3 matrix gained one correction: Azure `update_disk` is a full method, now `Y`, with
+a third documented refusal (account-type conversion). The §6 standout list was corrected
+against source in several places. Azure's per-backend-pool LB and Application-Gateway
+assignment is restored — it is real, in `vm_manager_network.rb`. The §7.30
+transport-tuning model is re-attributed to Alicloud; the OpenStack Go CPI parses
+`ConnectionOptions` but never applies it to an `http.Transport`. The §7.29 agent-checksum
+model lives in the Ruby OpenStack CPI, not the Go one in this reference set. The
+earlier finding that process-level panic recovery (§7.4) is not unique to OpenStack-Go —
+Google has it too — still holds. A new §9 steps back from the method-by-method view to
+compare all seven CPIs along six cross-cutting dimensions: concurrency and cluster-config
+safety, observability, test strategy, configuration validation, a consolidated failure-mode
+taxonomy, and the performance envelope — the last being the one dimension still argued from
+mechanism rather than measured numbers. The remainder of this summary is
+the original framing that motivated §7.1–§7.25, retained for provenance.
 
 ## 3. Method Implementation Matrix
 
@@ -92,38 +107,39 @@ Measured against the CPI v2 canonical method set. `Y` = real handler logic;
 | `delete_network` | N | Y (NSX-T) | N | N | N | N | Y (SDN/bridge) |
 | `update_disk` (extension) | N | N | N | N | Y¹ | N | Y |
 
-¹ **Corrected this round.** Azure `update_disk` was previously marked `~` (partial). A
-source re-read shows a full implementation (`cloud.rb:460`, `disk_manager2.rb:49`) for
-managed disks — size grow, IOPS, and MBPS — with three deliberate, documented refusals
-(caching mode is creation-time-only, disk shrink is rejected, and account-type/tier
-conversion raises `NotSupported`, `cloud.rb:494-500`). It is a complete method with
-constraints, not a stub, so it is now `Y`.
+¹ Azure `update_disk` was previously marked `~` (partial). A source re-read shows a full
+implementation (`cloud.rb:460`, `disk_manager2.rb:49`) for managed disks — size grow,
+IOPS, and MBPS — with three deliberate, documented refusals: caching mode is
+creation-time-only, disk shrink is rejected, and account-type/tier conversion raises
+`NotSupported` (`cloud.rb:494-500`). It is a complete method with constraints, not a
+stub, so it is now `Y`.
 
-Two other re-reads were checked against source and the existing cells held: AWS
-`calculate_vm_cloud_properties` is real (`cloud_v1.rb:419`, maps `cpu`/`ram`/
-`ephemeral_disk_size` → `instance_type` + `ephemeral_disk`), so it stays `Y`; Alicloud
-`calculate_vm_cloud_properties` is genuinely an empty stub (`action/calculate_vm_properties.go`
-returns `NewVMCloudPropsFromMap(nil)`), so it stays `~ (empty)`. OpenStack-Go `get_disks` was
-confirmed a real handler (`cpi/methods/get_disks.go:26`). Google `set_disk_metadata` and
-`update_disk` were confirmed absent in source (previously inferred).
+Two other re-reads held against source. AWS `calculate_vm_cloud_properties` is real
+(`cloud_v1.rb:419`, mapping `cpu`/`ram`/`ephemeral_disk_size` → `instance_type` +
+`ephemeral_disk`), so it stays `Y`. Alicloud `calculate_vm_cloud_properties` is an empty
+stub (`action/calculate_vm_properties.go` returns `NewVMCloudPropsFromMap(nil)`), so it
+stays `~ (empty)`. OpenStack-Go `get_disks` was confirmed a real handler
+(`cpi/methods/get_disks.go:26`). Google `set_disk_metadata` and `update_disk` were
+confirmed absent in source.
 
-Takeaway, reconfirmed across six references and re-verified against source: **surface
+The takeaway, reconfirmed across six references and re-verified against source: **surface
 coverage is a settled strength.** PVE implements all 22 canonical methods with real logic
 plus the `update_disk` extension, and is one of only two CPIs (with vSphere) to implement
-network lifecycle. Every remaining improvement is depth within methods, not new method stubs.
+network lifecycle. Every remaining improvement is depth within methods, not new method
+stubs.
 
 ## 4. What the PVE CPI Already Does Well
 
-Stated explicitly so the roadmap does not regress these. Items marked **(new since
-prior report)** were recommendations in the previous roadmap that have since shipped.
+Stated explicitly so the roadmap does not regress these. Items marked **(new since prior
+report)** were recommendations in the previous roadmap that have since shipped.
 
 - **Live node scoring at `create_vm` (new).** A weighted filter-and-scorer over live
-  cluster facts (free-memory fraction, free-storage fraction, CPU headroom, inverse
-  guest density) with repeatable-random tie-break and AZ filtering — the direct
-  analogue of the vSphere placement pipeline, and richer than any cloud CPI's
-  flavor/AZ selection.
+  cluster facts — free-memory fraction, free-storage fraction, CPU headroom, and inverse
+  guest density — with repeatable-random tie-break and AZ filtering. It is the direct
+  analogue of the vSphere placement pipeline and richer than any cloud CPI's flavor/AZ
+  selection.
 
-- **Dual anti-affinity (new).** Both a soft scoring penalty and cluster-enforced PVE HA
+- **Dual anti-affinity (new).** A soft scoring penalty plus cluster-enforced PVE HA
   negative resource-affinity rules keyed on the BOSH instance group, self-cleaning on
   delete, with an optional strict mode — the analogue of vSphere DRS anti-affinity.
 
@@ -134,43 +150,43 @@ prior report)** were recommendations in the previous roadmap that have since shi
   with version, cluster-size, and shared-storage guards — a continuous-rebalance
   equivalent of vSphere DRS that no cloud CPI has, correctly delegated to the platform.
 
-- **Pre-create IP-conflict detection (new, partial coverage).** Parallel cluster scan
-  for duplicate static `ipconfig` IPs on the target bridge. (Covers CPI-managed static
-  IPs; see §6 for the DHCP/foreign-device half still open.)
+- **Pre-create IP-conflict detection (new, partial coverage).** A parallel cluster scan
+  for duplicate static `ipconfig` IPs on the target bridge. It covers CPI-managed static
+  IPs; see §6 for the DHCP and foreign-device half still open.
 
-- **Per-VM/per-NIC firewall and security groups (new).** Cluster-level firewall group
+- **Per-VM and per-NIC firewall and security groups (new).** Cluster-level firewall group
   references attached to VMs via the PVE firewall API, with per-NIC override.
 
 - **Dispatcher hook middleware (new).** A zero-cost-when-unused `Before`/`After`
-  middleware chain with a static registry and config validation — the vSphere
-  cpi_plugin analogue (currently one built-in hook: audit logging).
+  middleware chain with a static registry and config validation — the vSphere cpi_plugin
+  analogue, currently one built-in hook: audit logging.
 
-- **Full v2 contract** including `info` with `api_version=2`, `disk_hint` return on
+- **Full v2 contract**, including `info` with `api_version=2`, `disk_hint` return on
   `attach_disk`, and `network_info` return on `create_vm`.
 
-- **Three agent-delivery modes** — cloudinit/configdrive, registry, noagent — matching
-  AWS's registry-optional design and exceeding vSphere (env ISO only).
+- **Three agent-delivery modes** — cloudinit/configdrive, registry, and noagent —
+  matching AWS's registry-optional design and exceeding vSphere (env ISO only).
 
-- **Three stemcell modes** — heavy tarball, light pre-uploaded, light fetch over
-  HTTPS/S3/BOSH-blobstore/OCI — with magic-byte format detection and `os.Root`
-  extraction sandboxing; a broader fetch surface than AWS light AMIs.
+- **Three stemcell modes** — heavy tarball, light pre-uploaded, and light fetch over
+  HTTPS/S3/BOSH-blobstore/OCI — with magic-byte format detection and `os.Root` extraction
+  sandboxing; a broader fetch surface than AWS light AMIs.
 
 - **Mature, differentiated retry infrastructure.** Three distinct backoff curves
   (transient, storage-lock, combined) with exponential growth, ±30% jitter, caps, and
-  `ctx.Done()` short-circuit; VMID-conflict allocate-retry; async UPID task polling
+  `ctx.Done()` short-circuit; VMID-conflict allocate-retry; and async UPID task polling
   with retriable poll-fault handling. At parity with Azure and beyond OpenStack-Go.
 
 - **PVE-aware fault classification.** The error mapper classifies SDK 4xx/5xx, net
-  timeouts, and — uniquely — Perl `die()` strings inside UPID task bodies (storage-lock
+  timeouts, and — uniquely — Perl `die()` strings inside UPID task bodies: storage-lock
   timeout, pmxcfs race, LVM timeout, VMID conflict, clone-source-missing,
-  snapshot-blocked, volume-missing). No reference CPI is this platform-aware because
+  snapshot-blocked, and volume-missing. No reference CPI is this platform-aware because
   PVE leaks failure detail as strings in task bodies rather than HTTP codes.
 
 - **Richest error taxonomy in the set.** `TypeCloud`/`TypeRetriableCloud` plus 14
   specialized typed errors — richer than AWS, Google, or OpenStack-Go.
 
 - **`create_vm` rollback.** A rollback defer (stop + purge, idempotent on 404,
-  transient-retry-wrapped, survives caller cancel via context-without-cancel) — matching
+  transient-retry-wrapped, surviving caller cancel via context-without-cancel) — matching
   Azure parallel cleanup, vSphere delete-on-NSX-failure, and OpenStack delete-ports.
 
 - **Per-call `request_id` propagation** threaded through context into every structured
@@ -178,10 +194,10 @@ prior report)** were recommendations in the previous roadmap that have since shi
 
 - **Clone-mode intelligence.** Auto linked-vs-full clone by storage-backend capability,
   with cross-node shared-storage handling and per-disk format negotiation
-  (qcow2/raw/vmdk with block-storage auto-omit) — exceeds the reference set's clone
+  (qcow2/raw/vmdk with block-storage auto-omit) — exceeding the reference set's clone
   handling.
 
-- **Snapshot-aware disk guards.** Attach/detach/resize pre-flight checks for active
+- **Snapshot-aware disk guards.** Attach, detach, and resize pre-flight checks for active
   snapshots, which neither reference cloud CPI needs but Proxmox's snapshot model does.
 
 ## 5. Prior-Roadmap Status
@@ -207,60 +223,90 @@ The capabilities below are where the reference CPIs are genuinely ahead and the 
 transfers to a PVE primitive. They feed the gap analysis in §7.
 
 - **vSphere** — `DirectorDiskCID` encoding (`<uuid>.<base64url-json>`, the exact §7.7
-  pattern), state-free placement stickiness; on-demand DRS anti-affinity (`AntiAffinityRuleSpec`)
-  and VM-host affinity (`VmHostRuleInfo`) rule automation; storage-policy (PBM)
-  compatible-datastore discovery; **`cpi_plugins` pre/post hooks on every method with plugin
-  rollback on post-hook failure** (the model §7.19 adopted); IP-conflict pre-detection;
-  **adaptive, progress-aware task polling** — interval `= (elapsed·100/progress − elapsed)/5`
-  clamped 1–10s, so a slow clone is polled less often (the model for new gap §7.28);
-  **HA/vSAN-aware delete delay (a 15s sleep before removal to avoid quorum alarms)**;
-  primary-plus-fallback disk placement with retry on `GenericVmConfigFault` (the model for
-  new gap §7.31); multi-cluster placement with datastore fallback; a vCenter custom-field
-  created as a distributed mutex (platform-native locking).
+  pattern), state-free placement stickiness; on-demand DRS anti-affinity
+  (`AntiAffinityRuleSpec`) and VM-host affinity (`VmHostRuleInfo`) rule automation;
+  storage-policy (PBM) compatible-datastore discovery; **`cpi_plugins` pre/post hooks on
+  every method with plugin rollback on post-hook failure** (the model §7.19 adopted);
+  IP-conflict pre-detection; **adaptive, progress-aware task polling** — interval
+  `= (elapsed·100/progress − elapsed)/5` clamped 1–10s, so a slow clone is polled less
+  often (the model for §7.28); **HA/vSAN-aware delete delay** (a 15s sleep before removal
+  to avoid quorum alarms); primary-plus-fallback disk placement with retry on
+  `GenericVmConfigFault` (the model for §7.31); multi-cluster placement with datastore
+  fallback; and a vCenter custom-field created as a distributed mutex (platform-native
+  locking). Every VIM SOAP call routes through a **`RetryableStubAdapter` whose 18-entry
+  `NON_RETRYABLE_CRITERIA` table**, keyed on `(entity_class, method_name, fault_class)`
+  triples, decides retry: network errors retry up to 8× with `2^i` backoff capped at 32s,
+  while `DuplicateName`, `FileAlreadyExists`, and delete-side `FileFault` never retry —
+  a far finer-grained classifier than PVE's curve-based model. At `create_stemcell` the
+  CPI also **registers itself as a vCenter Extension** (`sddc.cpi.extension`) and stamps
+  `config.managed_by` on every CPI-managed VM and template, so vCenter Solution Manager
+  groups CPI resources by owner (`cpi_extension.rb:1-70`) — the resource-ownership model
+  behind §7.13.
 
-- **AWS** — three-way AZ consensus (volume + subnet + vm_type), but applied *piecemeal*
-  per operation (`create_disk` picks an AZ from the instance, `create_vm` re-checks via
-  `common_availability_zone`), not as a single monolithic gate; per-disk `iops`/`throughput`/
-  type and KMS encryption; **`VMCreationFailed.new(retryable)` signaling that gates fallback
-  decisions** (a bidding failure is non-retriable→fall back to on-demand, an instance failure
-  is retriable→retry) — `DiskNotAttached(retryable)` exists in the broader taxonomy but is
-  not actively raised by the AWS CPI; ELB + ALB target-group registration **at create only,
-  with no delete-side deregistration** (contrast §7.19's rollback contract);
-  `wait_until_running` is a **waiter that raises `VMCreationFailed(retryable)` on timeout**
-  (not Azure-style serial-console capture); an `AbruptlyTerminated` retry loop (up to 2×) for
-  launch races (the model for new gap §7.31); **`fast_path_delete`** that tags and returns
-  without polling for terminated state (the model for new gap §7.32); a volume-modification
-  wait loop (`ResourceWait.for_volume_modification`, the model for new gap §7.27).
+- **AWS** — three-way AZ consensus (volume + subnet + vm_type), applied piecemeal per
+  operation (`create_disk` picks an AZ from the instance, `create_vm` re-checks via
+  `common_availability_zone`) rather than as a single monolithic gate; per-disk
+  `iops`/`throughput`/type and KMS encryption;
+  **`VMCreationFailed.new(retryable)` signaling that gates fallback decisions** — a
+  bidding failure is non-retriable (fall back to on-demand), an instance failure is
+  retriable (retry); ELB and ALB target-group registration **at create only, with no
+  delete-side deregistration** (contrast §7.19's rollback contract); `wait_until_running`
+  is a **waiter that raises `VMCreationFailed(retryable)` on timeout**, not Azure-style
+  serial-console capture; an `AbruptlyTerminated` retry loop (up to 2×) for launch races
+  (the model for §7.31); **`fast_path_delete`** that tags and returns without polling for
+  terminated state (the model for §7.32); and a volume-modification wait loop
+  (`ResourceWait.for_volume_modification`, the model for §7.27). AWS also groups manual
+  networks that share a subnet into a **`NicGroup`** — one ENI per group, with VIP
+  networks referencing a group name to bind an EIP to the right device index — the
+  multi-homing model behind the deferred NIC-grouping roadmap item; and it remaps device
+  paths per instance family, exposing EBS volumes on **NVMe instance families** as
+  `/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_<volid>` rather than the `xvd*` alias.
 
 - **Azure** — managed-disk caching/tier baked into the disk CID; **Compute Gallery
   stemcell replication that is automatic at the platform layer** — the CPI calls
-  `ensure_gallery_image_in_target_location` only to *validate* replicas exist, it does not
-  orchestrate the push (the "validate, don't orchestrate" lesson §7.2 follows); the gallery
-  path also computes a streaming SHA-256 of the image, stores it as an `image_sha256` tag, and
-  hard-errors on a same-version content mismatch (`compute_gallery_manager.rb:129-169`) — a
-  version-collision guard §7.13's provenance work parallels; three-level
-  Gallery namespacing (gallery/image-definition/version) with stemcell reference-counting
-  tags for idempotent re-upload; `keep_failed_vms` forensic mode (the §7.20 model); parallel
-  rollback on create failure; telemetry + per-request-ID correlation; **native `update_disk`
-  (size grow / IOPS / MBPS) that explicitly rejects caching-mode changes, disk shrink, and
-  account-type/tier conversion as `NotSupported`** (the creation-time-invariant model behind
-  §7.26); optional Disk Encryption Set (BYOK) per managed disk; and **per-backend-pool
-  load-balancer and Application-Gateway assignment at create** (`vms/vm_manager_network.rb:91-147`
-  — `_get_load_balancers` maps each vm_type LB config to a single LB backend pool and joins it
-  to the NIC), with **no deregistration on delete** (`vm_manager.rb:288-387` deletes the NIC and
-  IPs but never detaches the pool) — the create-only LB posture §7.19's rollback contract is the
-  on-prem answer to. *(This restores a claim an earlier round withdrew for lack of a citation;
-  the logic lives in `vm_manager_network.rb`, not `cloud.rb`/`vm_manager.rb`.)*
+  `ensure_gallery_image_in_target_location` only to *validate* replicas exist, not to
+  orchestrate the push (the "validate, don't orchestrate" lesson §7.2 follows); the
+  gallery path computes a streaming SHA-256, stores it as an `image_sha256` tag, and
+  hard-errors on a same-version content mismatch (`compute_gallery_manager.rb:129-169`) —
+  a version-collision guard §7.13's provenance work parallels; three-level Gallery
+  namespacing (gallery/image-definition/version) with stemcell reference-counting tags for
+  idempotent re-upload; `keep_failed_vms` forensic mode (the §7.20 model); parallel
+  rollback on create failure; **native `update_disk` (size grow / IOPS / MBPS) that
+  explicitly rejects caching-mode changes, disk shrink, and account-type/tier conversion
+  as `NotSupported`** (the creation-time-invariant model behind §7.26); optional Disk
+  Encryption Set (BYOK) per managed disk; and **per-backend-pool load-balancer and
+  Application-Gateway assignment at create** (`vms/vm_manager_network.rb:91-147` —
+  `_get_load_balancers` maps each vm_type LB config to a single LB backend pool and joins
+  it to the NIC), with **no deregistration on delete** (`vm_manager.rb:288-387` deletes
+  the NIC and IPs but never detaches the pool) — the create-only LB posture §7.19's
+  rollback contract is the on-prem answer to. Notably, the Azure CPI **hand-rolls its REST
+  client** rather than using an SDK; it takes **OS `flock` cross-process locks** under
+  `/tmp/azure_cpi/` for availability-set, copy-stemcell, and per-gallery-image-version
+  mutations (`utils/helpers.rb:130-138,564-575`) — the only Ruby reference with explicit
+  cross-process locking, the same shape as PVE's §7.36 cluster mutex; it stamps a fresh
+  `x-ms-client-request-id` (a `SecureRandom.uuid`) on every request and logs the echoed
+  correlation IDs; and it ships **opt-in per-operation telemetry** that records operation
+  name, duration, and success to a forked handler at most once per 60s
+  (`telemetry/telemetry_manager.rb:1-103`) — the lone reference that emits metrics.
 
-- **Google** — LB target-pool/backend-service registration at create; cross-project
-  (XPN) networking; **operator-controlled local-SSD opt-in (`ephemeral_disk_type: local-ssd`)
-  plus CPU-aware custom machine types** (corrected — there is no automatic SSD auto-scaling
-  by machine series); remote-tarball SHA-1 verification before import (the verify-before-write
-  model §7.6's caveat aspires to); an operation waiter with exponential backoff capped at
-  **~782s (≈13 min: `maxTries=100`, `maxSleepExponent=3`)** — corrected from "~1100s";
-  multi-zone disk-set conflict rejection; **process-level panic recovery
-  (`main/main.go:29`, `defer logger.HandlePanic`)** — see §7.4; VM `cloud_properties` that
-  override network-level defaults (the cross-property-override model for new gap §7.34).
+- **Google** — LB target-pool/backend-service registration at create; cross-project (XPN)
+  networking; **operator-controlled local-SSD opt-in (`ephemeral_disk_type: local-ssd`)
+  plus CPU-aware custom machine types** (there is no automatic SSD auto-scaling by machine
+  series); remote-tarball SHA-1 verification before import (the verify-before-write model
+  §7.6's caveat aspires to); an operation waiter with exponential backoff capped at
+  **~782s (≈13 min: `maxTries=100`, `maxSleepExponent=3`)**; multi-zone disk-set conflict
+  rejection; **process-level panic recovery** (`main/main.go:29`,
+  `defer logger.HandlePanic`, see §7.4); and VM `cloud_properties` that override
+  network-level defaults (the cross-property-override model for §7.34). Google's
+  observability is distinctive: a **`MultiLogger` folds the full DEBUG trace into every
+  CPI response under a `log` field** (`api/multilogger.go`), so the director captures the
+  complete per-call trace with no separate aggregation, and secrets are scrubbed at the
+  dispatcher and metadata-write boundaries (`redactor/redactor.go:7-9`). Every
+  metadata/label mutation reads the current **fingerprint and resubmits it as a CAS
+  token**, so GCE rejects a stale concurrent write with a 409 (`metadata_client.go:147`)
+  — the read-before-write model behind §7.44 — and every image is created with
+  **immutable `GuestOsFeatures` (`MULTI_IP_SUBNET`, `UEFI_COMPATIBLE`, `GVNIC`)** to
+  enforce modern NIC and boot capabilities unconditionally.
 
 - **OpenStack-Go** — `allowed_address_pairs` + VRRP port check for in-deployment VIPs
   (the §7.14 model), re-applied idempotently on re-attach (a refinement §7.14 does not yet
@@ -268,27 +314,38 @@ transfers to a PVE primitive. They feed the gap analysis in §7.
   multi-AZ with per-failure next-AZ fallback (§7.10); stale Neutron-port cleanup on retry
   (a cloud-specific network-orphan pattern with no direct PVE analogue, since PVE networks
   are cluster-wide); process-level panic handler (§7.4 — *not* unique to OpenStack-Go);
-  **a single global `state_timeout`** on async operations — coarser than PVE's per-method-class
-  envelope (§7.15), which is a PVE strength to claim. *(Two earlier attributions to this CPI are
-  withdrawn after a source re-read: it does **not** implement transport/connection-pool tuning —
-  `ConnectionOptions` is parsed at `config.go:51` but is never consumed by any `http.Transport` —
-  so §7.30's model is Alicloud, not OpenStack-Go; and it injects **no** agent checksum into
-  user-data — that capability lives in the Ruby OpenStack CPI, outside this Go reference set — so
-  §7.29 is a PVE-originated mechanism.)*
+  and **a single global `state_timeout`** on async operations, coarser than PVE's
+  per-method-class envelope (§7.15) — a PVE strength to claim. Two structural traits stand
+  out as cautionary. The CPI splits its transport into a plain `ServiceClient` and a
+  `RetryableServiceClient`, but it **re-authenticates to Keystone on each service build**,
+  costing four-plus auth round-trips per `create_vm` (the cost of stateless purity §7.30
+  avoids). And it carries **six parse-but-dead config fields** (`ConnectionOptions`,
+  `DefaultVolumeType`, `WaitResourcePollInterval`, `EphemeralDisk`, `SchedulerHints`,
+  `UseNovaNetworking`) — the config-surface drift of a young Go port and the case for the
+  opt-in unknown-key rejection §7.17 ships. Two earlier attributions to this CPI are
+  withdrawn after a source re-read: it does **not** implement transport/connection-pool
+  tuning (`ConnectionOptions` is parsed at `config.go:51` but never consumed by any
+  `http.Transport`), so §7.30's model is Alicloud; and it injects **no** agent checksum
+  into user-data — that capability lives in the Ruby OpenStack CPI, outside this Go
+  reference set — so §7.29 is a PVE-originated mechanism.
 
-- **Alicloud** — **`ClientToken` that is *regenerated* on `IdempotentFailed`** (a new token
-  on collision), distinct from AWS/Azure same-token retry — the two-response idempotency model
-  feeding new gap §7.33's contrast; classic SLB + modern NLB dual integration (both registered
-  at create, both deregistered at delete) with backward-compatible structured/flat manifest
-  forms; KMS image-copy encryption; capacity-reservation tag mapping from `env.Bosh.Group`;
-  proactive ENI cleanup on delete; an `Invoker`/`Catcher` abstraction giving **per-operation
-  retry budgets** (15–60 retries × 5–15s, tuned per call) rather than a few global curves (the
-  finer-grained take on the shipped §7.25); multipart parallel image upload (`oss.Routines(5)`,
-  5 MB parts — the model for new gap §7.35); callback-based state-machine polling that embeds per-operation
-  recovery (auto-stop, cleanup) inside the poll loop; and explicit SDK transport tuning — a
-  shared `http.Transport` with `MaxIdleConns: 500` and an env-tunable `TLSHandshakeTimeout`
-  (`alicloud/common.go:99-110`, `config.go:278`) — the actual model for new gap §7.30,
-  corrected from OpenStack-Go.
+- **Alicloud** — **`ClientToken` that is *regenerated* on `IdempotentFailed`** (a new
+  token on collision, `instance_manager.go` build path), distinct from AWS/Azure
+  same-token retry — the two-response idempotency model feeding §7.33's contrast; classic
+  SLB + modern NLB dual integration (both registered at create, both deregistered at
+  delete) with backward-compatible structured and flat manifest forms; KMS image-copy
+  encryption; capacity-reservation tag mapping from `env.Bosh.Group`; proactive ENI
+  cleanup on delete; **an `Invoker`/`Catcher` abstraction giving per-operation retry
+  budgets** (15–60 retries × 5–15s, each `Catcher` matching an error-string reason,
+  `invoker.go:13-58`) rather than a few global curves — the finer-grained take on the
+  shipped §7.25; callback-based state-machine polling that embeds per-operation recovery
+  (auto-stop, cleanup) inside the poll loop; and explicit SDK transport tuning — a shared
+  `http.Transport` with `MaxIdleConns: 500` and an env-tunable `TLSHandshakeTimeout`
+  (`alicloud/common.go:99-110`, `config.go:278`), the actual model for §7.30. Image import
+  is **OSS-staged**: `CreateFromTarball` creates a private ephemeral OSS bucket,
+  multipart-uploads `root.img` in 5 MB chunks across five goroutines (`oss.Routines(5)`),
+  then calls `ImportImage` and defers deletion of both the object and the bucket — avoiding
+  a direct large-image stream to the API (the model for §7.35).
 
 ## 7. Gap Analysis
 
@@ -331,9 +388,13 @@ draining-node foot-gun directly: an operator can put a node into PVE HA maintena
 just tag it — for a kernel/PVE upgrade, and the scorer stops landing diego-cells or
 HAProxy there instead of preferring it for its transiently high free memory. The dual
 HA-state plus operator-tag path gives both an automatic and a manual lever, which matters
-in a lab where maintenance windows are frequent. **Limits.** Fail-open means a flapping HA
-API can momentarily leave a draining node eligible; the tag list is maintained separately
-from PVE HA state and has no auto-cleanup when a tag is removed.
+in a lab where maintenance windows are frequent. The asymmetry with vSphere is structural:
+vSphere DRS continuously rebalances VMs off a host entering maintenance and the CPI merely
+declares rules, whereas PVE HA rules are advisory and never re-enforced by a distributed
+scheduler (`lib/cloud/vsphere/drs_rules/drs_lock.rb`), so the CPI must do the exclusion
+itself at placement time. **Limits.** Fail-open means a flapping HA API can momentarily
+leave a draining node eligible; the tag list is maintained separately from PVE HA state
+and has no auto-cleanup when a tag is removed.
 
 #### 7.2 DONE — Multi-node template reachability (per-node stemcell replication)
 
@@ -363,9 +424,15 @@ replication and lookup agree across CPI processes. **Why it matters here.** A be
 chosen by the scorer or DLB no longer fails its clone just because the template happens to
 live on a different node; on the lab's per-node local ZFS this converts a hard clone
 failure into a local, fast clone, and on slow inter-node links a local replica cuts clone
-time substantially. **Limits.** Use is opportunistic — the CPI consumes a replica if one
-exists but does not itself create it on every node; there is no replica lifecycle
-(re-sync after a stemcell change, periodic GC) beyond the sha-tag sweep on delete.
+time substantially. The reference models split here: Azure treats replication as
+platform-driven — its Compute Gallery replicates an image definition to multiple regions on
+its own and the CPI only consumes the result (`compute_gallery_manager`) — while vSphere's
+linked clone shares VMDK blocks with the parent snapshot and consumes only delta storage.
+PVE has neither; `qm clone` is a full copy unless the template sits on shared storage, which
+is exactly why a node-local replica is the right primitive. **Limits.** Use is opportunistic
+— the CPI consumes a replica if one exists but does not itself create it on every node; there
+is no replica lifecycle (re-sync after a stemcell change, periodic GC) beyond the sha-tag
+sweep on delete.
 
 **Operator impact.** Indexing replicas by PVE guest tags rather than a CPI-side table is what
 makes this safe under parallel deploys: any CPI process can discover an existing replica purely
@@ -382,8 +449,12 @@ pool name with no node/AZ awareness, and `attach_disk` does not validate that a 
 backing storage is reachable from the VM's landed node. On node-local storage a disk
 created on node A becomes **un-attachable** once anti-affinity or DLB later places the
 VM on node B — failing late and opaquely at attach time. Every reference CPI treats
-VM-disk fault-domain co-location as a hard invariant (AWS three-way AZ consensus, Google
-rejects multi-zone disk sets, Azure migrates a regional disk into the VM's zone).
+VM-disk fault-domain co-location as a hard invariant, and each enforces it before the
+VM exists rather than discovering the conflict at attach. AWS intersects the disk, vm_type,
+and subnet AZ constraints and errors unless all are identical — there is no scorer and no
+fallback, because EBS volumes are AZ-scoped and cross-AZ attach is impossible by API.
+OpenStack's Cinder volumes are likewise zoned, so the disk AZ must match the VM AZ; Google
+rejects a multi-zone disk set outright; Azure migrates a regional disk into the VM's zone.
 
 **Build:** detect node-local backends via the existing resolver; record the disk's home
 node (carried in the CID encoding of §7.7). When `create_vm` receives existing disk CIDs
@@ -404,11 +475,13 @@ actually reach its disks. **Why it matters here.** This is the fix that makes pl
 node-local storage coexist: once anti-affinity or DLB can move a VM, a persistent disk
 created on node A would otherwise become un-attachable when the VM lands on node B, failing
 late and opaquely at attach. It closes the orphan/unreachable-disk path and matches the
-hard fault-domain invariant every cloud CPI enforces. **Limits.** Bare legacy CIDs carry no
-metadata and therefore impose no constraint (backward-compatible, but unprotected);
-backend classification is best-effort (a `/cluster/storage` fetch error fails open, dropping
-the AZ constraint); and there is no runtime check that the disk volume still physically
-exists on the chosen node.
+hard fault-domain invariant every cloud CPI enforces — PVE differs only in that shared
+storage is cluster-global, so a shared-backed disk imposes no node pin at all, while the
+local-disk path mirrors the AWS-style hard intersection rather than a soft score.
+**Limits.** Bare legacy CIDs carry no metadata and therefore impose no constraint
+(backward-compatible, but unprotected); backend classification is best-effort (a
+`/cluster/storage` fetch error fails open, dropping the AZ constraint); and there is no
+runtime check that the disk volume still physically exists on the chosen node.
 
 #### 7.4 DONE — Process-level panic recovery in the dispatch path
 
@@ -435,12 +508,12 @@ nil-deref or slice/map panic in any of the 22 handlers — config decode, ipconf
 and placement scoring all do pointer/slice/map work over untrusted PVE responses and
 `cloud_properties` — no longer kills the process and hands the director an empty stdout with
 no typed error or context; the CPI stays alive to serve the rest of the deploy.
-**Comparative note (corrected this round).** PVE is *not* the only-or-second CPI with this:
-Google also installs process-level recovery (`main/main.go:29`, `defer logger.HandlePanic`),
-and OpenStack-Go has it too. PVE's placement at the *handler* boundary is architecturally
-stronger — the process survives and the director can retry *other* methods — but the
-recovered value is returned non-retriable, so panic recovery prevents process death; it
-does not make the failed operation succeed.
+**Comparative note.** PVE is *not* the only-or-second CPI with this: Google installs
+process-level recovery in its entry point (`main/main.go:29`, `defer logger.HandlePanic`),
+and OpenStack-Go does the same in its `main.go:22`. PVE's placement at the *handler*
+boundary is architecturally stronger — the process survives and the director can retry
+*other* methods — but the recovered value is returned non-retriable, so panic recovery
+prevents process death; it does not make the failed operation succeed.
 
 #### 7.5 PARTIAL — Active IP-conflict probe (ARP / guest-agent) for DHCP and foreign devices
 
@@ -449,7 +522,11 @@ does not make the failed operation succeed.
 and does not see physical hosts, containers, or non-PVE devices. The documented CF
 NATS-churn incident was caused by exactly that uncovered half — a BOSH VM IP that also
 answered ARP from a physical device on the shared LAN. The detector covers the easy half
-and leaves the half that bit the deployment uncovered.
+and leaves the half that bit the deployment uncovered. OpenStack goes further by
+self-healing: on an IP conflict at NIC pre-create it auto-deletes any DOWN or unowned
+stale Neutron port holding that address and retries once
+(`networking/...`); Alicloud retries `InvalidPrivateIpAddress.Duplicated` up to 30 times
+on a backoff rather than failing immediately.
 
 **Build:** add an opt-in active-probe mode under the existing `ensure_no_ip_conflicts`
 flag (e.g. `ip_conflict_probe: arp`). Before boot, for each target static IP on the
@@ -467,7 +544,9 @@ NOT shipped: the CPI client is PVE-API-only and PVE exposes no arbitrary host sh
 bridge is not reachable without adding node SSH. Detecting physical/non-PVE responders
 therefore remains open; the config is an enum so an `arp` mode can be added if node SSH
 is introduced. The physical-device vector from the NATS-churn incident is separately
-mitigated by the isolated-SDN migration.
+mitigated by the isolated-SDN migration. A PVE-native analogue of OpenStack's stale-port
+self-heal — clearing a stale `ipconfig` entry from a dead VM holding the target IP before
+provisioning — is also unbuilt and would close the same class without needing node SSH.
 
 **In this codebase.** Phase 1 (`internal/cpi/handlers/create_vm_ipconflict.go`,
 `detectIPConflict`) is always-on when `ensure_no_ip_conflicts` is set: it lists cluster
@@ -512,12 +591,17 @@ empty expected digest logs an integrity-unverified warning and proceeds. **Why i
 here.** The documented Tailscale LAN-route and Cloudflare-tunnel hazards make truncated
 fetches plausible, and because the dedup fast-path keys on the post-import sha8 tag, a
 corrupt fetch would otherwise be cached and reused forever; an expected digest turns that
-silent corruption into a clean, retriable failure. **Limits (verified this round).**
-Verification is client-side and *after* download/extraction, so a deterministically corrupt
-source re-verifies to the same bad hash on retry (unlike Google's server-side
-verify-before-write); and the retriable network-mismatch path has no internal exponential
-backoff — it relies entirely on director-level retry. This is the open half that new gap
-§7.29 (boot-path agent integrity) and the verify-before-commit lesson address.
+silent corruption into a clean, retriable failure. Two references verify earlier in the
+pipeline than PVE can: Google passes `source_url` and `raw_disk_sha1` straight to the GCE
+image-import API for server-side integrity verification with no local download, and Azure
+stores each gallery image's `image_sha256` in version tags and hard-errors on a collision
+whose digests disagree rather than silently overwriting
+(`compute_gallery_manager`). **Limits (verified this round).** Verification is client-side
+and *after* download/extraction, so a deterministically corrupt source re-verifies to the
+same bad hash on retry (unlike Google's server-side verify-before-write); and the retriable
+network-mismatch path has no internal exponential backoff — it relies entirely on
+director-level retry. This is the open half that new gap §7.29 (boot-path agent integrity)
+and the verify-before-commit lesson address.
 
 ### Tier 2 — Operability
 
@@ -543,10 +627,13 @@ suffix to the bare CID behind a pipe separator — `<storage>:<volid>|<base64url
 `cloud_properties.availability_zone` is supplied. **Why it matters here.** This is the
 durable carrier the §7.3 fault-domain fix reads, and it makes re-attach deterministic — in a
 tiered cluster (ceph-nvme hot vs local-zfs bulk) a fast-pool disk can no longer silently
-relocate to a slow pool after a node failure or migration. It is the exact vSphere
-`DirectorDiskCID` (`<uuid>.<base64url-json>`) pattern. **Limits.** Legacy bare CIDs still
-parse, carry no metadata, and therefore impose no §7.3 constraint; the metadata is advisory —
-PVE API calls always use the bare volid extracted from the encoded form.
+relocate to a slow pool after a node failure or migration. The two reference encodings bracket
+PVE's: vSphere's `DirectorDiskCID` is the same `<id>.<base64url-json>` shape, while Azure
+takes the opposite tack with structured `key:value` strings (`caching:[C];disk_name:...;
+resource_group_name:[RG]`) carrying the same intent in a human-readable form. PVE follows
+vSphere because a PVE volid is opaque and a base64 suffix never collides with it. **Limits.**
+Legacy bare CIDs still parse, carry no metadata, and therefore impose no §7.3 constraint; the
+metadata is advisory — PVE API calls always use the bare volid extracted from the encoded form.
 
 **Operator impact.** The upgrade requires no disk migration: `EncodeDiskCID` returns the bare
 CID unchanged when all metadata fields are zero (`internal/pve/disk.go:127-130`), and the `|`
@@ -564,8 +651,12 @@ cloud_properties override global config. Storage resolves
 vm_type/disk_type tier between, so operators cannot express "all database VMs persist on
 the fast pool" without stamping cloud_properties on every disk in every manifest. This is
 the keystone operator-UX gap and the open prior-roadmap storage-chain item. Four of six
-reference CPIs ship the chain (vSphere PBM, OpenStack default volume type, Azure vm_type
-root/ephemeral, Google per-root/per-disk).
+reference CPIs ship the chain. AWS sets cluster-wide defaults (for example
+`aws.encrypted` and `aws.kms_key_arn`) that each resource's cloud_properties may override
+independently; Alicloud reads a per-disk `*bool` and falls back to the global flag when it
+is nil; OpenStack-Go's Go port carries the equivalent at the config level (`boot_from_volume`
+as a global with per-call effect). vSphere expresses the same intent declaratively through
+its storage policy engine (PBM).
 
 **Build:** a pure config/resolution change, no new PVE API. Generalize the existing
 storage-resolver precedence into a typed resolver over an ordered slice:
@@ -641,8 +732,10 @@ the attach call, and the create parameters are byte-identical to prior releases.
 a thin LVM or Ceph pool actually reclaims space the guest frees (without it, a thin pool fills
 permanently as files are deleted); `iothread=1` gives the disk a dedicated QEMU I/O thread,
 lifting the single-threaded bottleneck on busy DB VMs; `mbps_*`/`iops_*` cap a noisy-neighbor VM
-on a shared pool. The CID-carried encoding (`disk_performance.go` resolves at create, attach
-decodes) is the load-bearing design choice: `attach_disk` receives only `vm_cid`/`disk_cid` under
+on a shared pool — the direct PVE equivalent of AWS per-volume `iops`/`throughput`. Azure makes
+the same bet differently, folding disk `caching` into its structured CID. The CID-carried encoding
+(`disk_performance.go` resolves at create, attach decodes) is the load-bearing design choice:
+`attach_disk` receives only `vm_cid`/`disk_cid` under
 CPI v2, so options that must survive a detach/re-attach cycle have nowhere else to live but the
 disk CID metadata.
 
@@ -652,7 +745,11 @@ disk CID metadata.
 one candidate set; if that AZ is full, all in maintenance (§7.1), or yields no viable
 candidate, `create_vm` fails rather than spilling to a sibling AZ. Small on-prem clusters
 (three nodes modeled as three single-node AZs) are exactly where one AZ being full or
-drained is routine; OpenStack demonstrates shuffled multi-AZ with next-AZ retry.
+drained is routine. OpenStack accepts an `availability_zones` array, shuffles it, and tries
+each in order on failure — but it must set `ignore_server_availability_zone` because Cinder
+disk-AZ coherence cannot be guaranteed across the shuffle. AWS sits at the strict end: it
+intersects AZ constraints with no fallback at all, since cross-AZ EBS attach is impossible
+by API.
 
 **Build:** accept `cloud_properties.availability_zones` (plural) or
 `placement.az_fallback_order`; build candidate sets per AZ in operator/shuffled order,
@@ -667,7 +764,10 @@ into a one-element list, passes a plural `availability_zones` through as-is, and
 advancing to the next AZ on an empty-after-filter pass and falling back to `config.node`
 only when all AZs are exhausted. **Why it matters here.** On a three-node lab modeled as
 three single-node AZs, one AZ being full or drained (§7.1) is routine; the waterfall spills
-to a sibling AZ instead of failing the deploy, with no sequential per-AZ retry delay.
+to a sibling AZ instead of failing the deploy, with no sequential per-AZ retry delay. PVE's
+model is structurally the OpenStack one but operates over node names, and it avoids
+OpenStack's `ignore_server_availability_zone` caveat because §7.3 already pins disk-bearing
+VMs to a fault domain rather than trusting the shuffle to preserve disk-AZ coherence.
 **Limits.** The legacy singular form yields no AZ fallback (only the ultimate `config.node`
 fallback); the `config.node` fallback is silent (debug log) and steps outside the AZ
 topology; the transient-vs-permanent decision on an exhausted run is the §7.23 heuristic.
@@ -679,7 +779,12 @@ every error return is confirmed to set the retriable bit on the correct boundary
 (prior-roadmap item, still open). Mis-signaling is deploy-cost-bearing: a transient
 fault mis-classified as permanent fails a whole CF deploy; a permanent fault
 mis-classified as retriable burns the director's retry budget. Directly relevant given
-the documented NATS-churn, wedged-task, and orphan-VM fragility.
+the documented NATS-churn, wedged-task, and orphan-VM fragility. The references carry the
+retriable bit as a typed, per-raise-site decision: AWS's `VMCreationFailed(retryable: bool)`
+sets it at each raise site (true on a wait-for-running timeout, false on a bad network ID),
+and Google's `RetryableError` interface exposes `CanRetry()` on typed error structs.
+OpenStack-Go is the cautionary counter-example: its `VMCreationFailed` carries the bit but
+all other operations raise a flat `CloudError` with no retryable bit at all.
 
 **Build:** a mechanical pass over all 22 handlers ensuring every error return routes
 through the wrap functions so the classifier sets the retriable bit; add table-driven
@@ -694,10 +799,13 @@ boundary tests asserting `IsRetriable()` for representative SDK error shapes per
 **Why it matters here.** A momentary network blip on a single-node lab is retried instead of
 failing a CF deploy; a real 404 fails fast instead of burning the director's retry budget —
 the exact boundary the NATS-churn, wedged-task, and orphan-VM incidents are sensitive to.
-**Limits (verified this round).** Retryability is a single binary flag: an intra-CPI retry
-loop (`RetryOnTransient`, `AllocateWithRetry`) that exhausts its budget surfaces the *last*
-attempt's classification — which may have flipped from retriable to non-retriable — and
-there is no coordination between the CPI's own retry budget and the director's.
+Unlike OpenStack-Go, PVE classifies *every* operation through one central mapper rather than
+leaving non-create paths as untyped `CloudError`, so the retriable bit is set uniformly
+across all 22 handlers. **Limits (verified this round).** Retryability is a single binary
+flag: an intra-CPI retry loop (`RetryOnTransient`, `AllocateWithRetry`) that exhausts its
+budget surfaces the *last* attempt's classification — which may have flipped from retriable
+to non-retriable — and there is no coordination between the CPI's own retry budget and the
+director's.
 
 #### 7.12 DONE — Post-boot guest-agent / VM health verification
 
@@ -706,7 +814,10 @@ verifies the VM booted or that the QEMU/BOSH agent is reachable. The documented 
 pre-start NATS hazard (agent dead from a long synchronous apt wedging the pre-start
 canary) and the orphan-VM duplicate-IP incident are exactly the class a post-boot health
 gate would surface earlier with actionable diagnostics. AWS babysits with
-`wait_until_running`; Azure captures boot diagnostics/serial console.
+`wait_until_running`; Azure captures boot diagnostics/serial console. vSphere adds a related
+signal worth noting: its `VMPowerOnError` exposes an `unplaceable?` predicate (true for a DRS
+rule violation or generic DRS fault) so the creator can tell a wrong-placement failure from a
+transient one — a distinction PVE's health gate could eventually borrow.
 
 **Build:** after the start-task await, config-gated poll
 `nodes/{node}/qemu/{vmid}/agent/ping` until ready or deadline; on failure scrape
@@ -735,7 +846,13 @@ templates orphaned by an interrupted `create_stemcell` or for stale per-node rep
 (after §7.2). As cluster density grows — multiple directors, light + heavy + per-node
 replicas — provenance and cruft become operability problems; templates also consume the
 9000–29999 VMID range. The documented orphan-VM and wedged-task incidents show this
-cluster accumulates cruft from interrupted operations.
+cluster accumulates cruft from interrupted operations. Two references model the ends of
+this design. Azure tracks a comma-separated `stemcell_references` tag — multiple BOSH CIDs
+share one gallery image, `delete_stemcell` removes only the named reference, and the image
+is deleted only when the CSV empties (ref-counting). vSphere instead registers a vCenter
+Extension and stamps every CPI-managed VM and template with `managed_by`, so the platform's
+own UI can group and filter CPI-owned resources
+(`lib/cloud/vsphere/cpi_extension.rb:1-70`).
 
 **Build:** at template finalization, set the notes field to a JSON provenance block and
 add stable `bosh-stemcell*` tags (reusing the tag-sanitization path). In
@@ -750,12 +867,17 @@ tags: a bare `bosh-stemcell` marker plus `bosh-stemcell-name-<v>`,
 `bosh-stemcell-version-<v>`, and `director--<id>` (sanitized), alongside the existing
 `bosh-stemcell-sha-<sha8>` content tag. Both the primary template and per-node replica
 templates (§7.2) receive the same stamps. The feature is off by default; with it unset,
-template config is byte-identical to prior releases.
+template config is byte-identical to prior releases. The `bosh-stemcell` marker plus
+`director--<id>` tag give PVE the resource-ownership grouping vSphere gets from its
+managed-by extension, expressed in PVE-native tags rather than a platform extension object.
 
 `delete_stemcell` now always performs a best-effort cross-node sweep: it resolves the
 stemcell sha8 from the primary template, then deletes every template across the cluster
 carrying `bosh-stemcell-sha-<sha8>` (discovered via `/cluster/resources`), covering
-replicas created by §7.2. Errors are warned, never fatal.
+replicas created by §7.2. Errors are warned, never fatal. PVE keys this sweep on content
+sha rather than Azure's per-CID reference count: identical-content stemcells already
+collapse to one template by the sha8 tag, so the cluster never holds the duplicate
+references that Azure's CSV ref-counting is built to track.
 
 Opt-in orphan pruning is available via `pve.stemcell.prune_orphans` (with
 `pve.stemcell.prune_dry_run` for a preview pass). The prune runs as a tail of
@@ -779,7 +901,9 @@ its default anti-spoof `ipfilter` can silently drop traffic for a floated VIP th
 the NIC's primary IP — so the firewall feature itself becomes a foot-gun for the classic
 on-prem HA-LB pattern. This lab fronts CF with HAProxy and a floating frontend, which is
 precisely a VRRP/keepalived VIP case. OpenStack exposes `allowed_address_pairs` for
-exactly this.
+exactly this: it sets the pairs on the Neutron port at NIC pre-create and re-applies them
+idempotently on every re-attach, so a re-bound NIC keeps permitting its VIPs without
+operator action.
 
 **Build:** add `cloud_properties.allowed_address_pairs` (or network-level
 `vip_addresses`). After the firewall-enable step in `create_vm`, populate the per-NIC
@@ -807,7 +931,9 @@ incomplete allowlist. Two configurations are skipped with a warning instead of e
 filter that would break connectivity: a firewalled NIC using DHCP/dynamic addressing (its
 runtime IP is unknown at create time) and a firewalled NIC whose static IP does not parse.
 Malformed entries are rejected before the VM is created, so a typo fails the deploy fast
-rather than silently leaving an unprotected VIP.
+rather than silently leaving an unprotected VIP. Unlike OpenStack, which re-applies the
+pairs to the Neutron port on every re-attach, PVE writes the ipset at `create_vm` only — the
+property is a create-time NIC declaration rather than a per-attach reconciliation.
 
 Operator note for VRRP/keepalived: the PVE per-NIC `macfilter` (on by default) blocks the
 RFC-3768 virtual MAC, so run keepalived without `use_vmac` — ARP and VRRP advertisements
@@ -847,11 +973,11 @@ task-await-polls combination — the wedged-task incident — gets a single ceil
 a retriable timeout instead of a poll holding a director queue slot forever; in a
 draining-node scenario the `create_vm` timeout fires and the director retries elsewhere.
 PVE's per-method-class budget (create 30m / delete 15m / has-get 2m defaults) is
-finer-grained than OpenStack-Go's single global `state_timeout`. **Limits (verified this
-round).** The budget is method-class *global* (all `create_vm` share one timeout, no
-per-stemcell override); inner retry loops (`AllocateWithRetry`) are not deadline-aware; and
-a nil-error success is returned even if the deadline just fired — the envelope only acts on
-a non-nil error.
+finer-grained than OpenStack-Go's single global `state_timeout`, which applies one coarse
+ceiling to every operation regardless of cost. **Limits (verified this round).** The budget
+is method-class *global* (all `create_vm` share one timeout, no per-stemcell override); inner
+retry loops (`AllocateWithRetry`) are not deadline-aware; and a nil-error success is returned
+even if the deadline just fired — the envelope only acts on a non-nil error.
 
 #### 7.16 DONE — PVE pushback handling (429 / lock-storm / bounded in-flight)
 
@@ -894,8 +1020,12 @@ BOSH deploy can make the CPI itself the source of the storm — saturating worke
 `max_inflight_per_node` semaphore (`inflight.go`) lets an operator cap concurrent mutating calls
 per node so the CPI throttles itself rather than overrunning the cluster, and the 5s/60s pushback
 curve (longer than the 1s/15s transient curve) spaces retries out instead of hammering an
-already-saturated node. A limit of 0 is unlimited and byte-identical, so the throttle is purely
-additive insurance for high-fan-out deploys.
+already-saturated node. The reference CPIs read a server-directed signal PVE does not emit: Azure
+paces its async polling by the response's `Retry-After` header, and Alicloud assigns each
+operation class its own retry budget (`ServiceUnavailable`, `OperationConflict`, and
+`InternalError` each retry 60× at 5s). PVE has no equivalent header, so
+the 5s/60s curve plus the semaphore are the substitute. A limit of 0 is unlimited and
+byte-identical, so the throttle is purely additive insurance for high-fan-out deploys.
 
 #### 7.17 DONE — Fail-fast config validation (schema strictness)
 
@@ -924,9 +1054,14 @@ mid-deploy. Unknown-key checking is top-level only, matching the build scope.
 anti-affinity, DLB, hooks, SDN, firewall, registry TLS) whose contradictions previously
 surfaced only at the first PVE API call mid-deploy; failing at start-up with an
 accumulated, semicolon-delimited list of every violation (`config.go:1744-1767`) cuts the
-MTTR for a misconfigured cluster. **Limits.** Strict mode is opt-in (default off for
-backward compatibility); unknown-key detection is top-level only, because `cloud_properties`
-are intentionally free-form maps the CPI does not prescribe.
+MTTR for a misconfigured cluster. PVE's unknown-key rejection is the strictest in the
+reference set: vSphere alone ships a declarative schema (Membrane's `SchemaParser` DSL), yet
+even Membrane does not reject unknown top-level keys — it passes them through as
+`dict(String, any)` — and OpenStack-Go silently drops unrecognized keys rather than failing.
+None of the six references rejects an unknown key; PVE's opt-in strict mode does. **Limits.**
+Strict mode is opt-in (default off for backward compatibility); unknown-key detection is
+top-level only, because `cloud_properties` are intentionally free-form maps the CPI does not
+prescribe.
 
 #### 7.18 DONE — Static-IP-in-range validation and gateway/DNS propagation audit
 
@@ -956,9 +1091,12 @@ logged as a warning rather than silently accepted.
 silently non-booting VM discovered only at the canary; `validateNetworkContainment`
 (`create_vm.go:3385-3418`) turns that into an actionable pre-allocation error naming the
 network, IP, and range, and the search-domain injection closes the DNS path for agents that
-reference hosts by domain rather than bare IP. **Limits.** Containment is an `IP ∈ CIDR`
-check only — it does not confirm the netmask and gateway are mutually consistent with the
-range — and is skipped entirely when no range is declared (dynamic networks).
+reference hosts by domain rather than bare IP. AWS performs the analogous check at a coarser
+grain — its `NicGroup` validates that every NIC in a group resolves to subnets in the same
+AZ before launch — whereas PVE's containment check works per static IP against its declared
+range. **Limits.** Containment is an `IP ∈ CIDR` check only — it does not confirm the netmask
+and gateway are mutually consistent with the range — and is skipped entirely when no range is
+declared (dynamic networks).
 
 #### 7.19 DONE — External LB registration hook and expanded hook catalog with rollback contract
 
@@ -1002,10 +1140,17 @@ router instance previously meant editing HAProxy out of band; the `lb_register` 
 transparently through the Data Plane API, and the rollback contract
 (`middleware.go:62-92`) closes the orphan-VM window the audit-only framework left open by
 unwinding the VM and any LB registration (LIFO) when a post-`create_vm` hook turns success
-into failure. **Limits.** Every hook except the rollback contract is best-effort (failures
-are logged, not propagated); `external_command` is synchronous with no shell or stdin
-(quick actions only); and the catalog is static — hooks are registered from config names at
-start-up, with no dynamic discovery.
+into failure. The references span the full LB-lifecycle spectrum: AWS and Azure register at
+create but never deregister at delete; Alicloud deregisters from both SLB and NLB server
+groups on `delete_vm`; OpenStack records LBaaS pool membership as VM metadata so a later
+`delete_vm` can deregister durably even without a prior rollback; and vSphere runs
+declarative pre/post `cpi_plugins`. PVE's hook framework with its rollback contract sits
+closest to the vSphere model. **Limits.** Every hook except the rollback contract is
+best-effort (failures are logged, not propagated); `external_command` is synchronous with no
+shell or stdin (quick actions only); and the catalog is static — hooks are registered from
+config names at start-up, with no dynamic discovery. Like AWS and Azure, the `lb_register`
+hook keeps no durable record of registrations outside the rollback path, so a `delete_vm`
+that was never preceded by a rollback relies on the operator's own LB cleanup.
 
 #### 7.20 DONE — Keep-failed-VM diagnostic mode
 
@@ -1034,9 +1179,12 @@ releases.
 repeatedly are exactly the ones whose evidence the default rollback destroys; preserving the
 VM (`create_vm.go:3176-3226`) lets an operator read its serial console, `qm status`, and
 logs post-mortem, and the non-retriable error stops the director from re-creating and
-stranding a second failed VM. **Limits.** It preserves only the final post-clone attempt
-(VMID-allocation retries still clean up their throwaways), tagging is best-effort, and there
-is no automated reaper — preserved VMs accumulate until an operator deletes them.
+stranding a second failed VM. PVE matches Azure's named `keep_failed_vms` flag directly;
+Alicloud reaches the same forensic goal from the disk side with a per-disk
+`delete_with_instance: false` that retains an ephemeral volume for inspection after the VM is
+gone. **Limits.** It preserves only the final post-clone attempt (VMID-allocation retries
+still clean up their throwaways), tagging is best-effort, and there is no automated reaper —
+preserved VMs accumulate until an operator deletes them.
 
 #### 7.21 DONE — Positive node-affinity HA pin (durable AZ guarantee)
 
@@ -1080,9 +1228,12 @@ bind software to specific nodes, or a storage-tier affinity where a guest must s
 wired to its NVMe pool. The node-affinity rule (`placement_nodeaffinity.go:86-118`, written via
 PVE 9.x HA `node-affinity`) makes that AZ binding survive HA and DLB, and `pin_az_strict` lets
 the operator choose a hard guarantee (the VM stays on its node set even under total node-set
-failure) versus a preferred pin (HA may relocate off-AZ to keep the VM running). Because it
-reuses the existing HA-rule plumbing and is default-off, the guarantee is opt-in and
-byte-identical when unset.
+failure) versus a preferred pin (HA may relocate off-AZ to keep the VM running). vSphere reaches
+the same locality goal through a different door: `vm_type.disable_drs` acquires a
+`DISABLE_DRS_LOCK`, clears the cluster rule's `enabled` flag, and pins the VM to whatever host it
+booted on, complemented by explicit VM/host-affinity rules. PVE's node-affinity rule expresses
+the binding directly rather than disabling rebalancing wholesale. Because it reuses the existing
+HA-rule plumbing and is default-off, the guarantee is opt-in and byte-identical when unset.
 
 #### 7.22 DONE — Agent registry-less auto-selection and settings-completeness assertion
 
@@ -1111,7 +1262,12 @@ v1/v2 × mode test matrix.
 mis-paired mode or a missing settings field silently mis-bootstraps the agent — the same
 agent-dead / pre-start-NATS failure class documented elsewhere; auto-selection plus the
 completeness assertion (`internal/agent/settings.go:40-88`) surface that as a clean
-`create_vm` failure at create time rather than as a task-join hang. **Limits.** The MBus
+`create_vm` failure at create time rather than as a task-join hang. The references converge
+on the same registry-less default but reach it through different side-channels: AWS gates
+registry calls in its CloudV2 path on `stemcell_api_version < 2`, Google stores
+`bosh_settings` in GCE instance metadata, Alicloud writes the full settings JSON into ECS
+`UserData`, and OpenStack-Go gates registry-less behind its dual-API-version check. PVE's
+auto-selection reads the same `api_version` signal those CPIs use. **Limits.** The MBus
 assertion is non-retriable (a present blobstore with an empty mbus fails the create
 outright), and MBus derivation inspects only the blobstore endpoint host, so a blobstore
 whose credentials live elsewhere can still trip it.
@@ -1139,9 +1295,14 @@ node is rejected and all reasons are transient, an exhausted run returns `cpierr
 no node may *momentarily* satisfy all constraints even though the situation clears in
 seconds as a node frees up or a drain completes; signaling that retriable keeps the director
 backing off rather than giving up and failing the small-cluster CF deploys this project
-runs. **Limits (verified this round).** Classification is heuristic — a rejection string not
-in the whitelist is conservatively treated as permanent; there is no internal timeout, so
-retries continue for as long as the director (or the §7.15 envelope) allows.
+runs. The two AWS references that motivate this fail in the opposite direction from each
+other: a spot-bid placement that cannot be satisfied falls back to on-demand
+(`spot_ondemand_fallback`), while a mid-flight `AbruptlyTerminated` triggers a fixed
+two-attempt create retry. PVE classifies the *cause* of the empty-candidate set instead of
+counting attempts. **Limits (verified this round).** Classification is heuristic — a
+rejection string not in the whitelist is conservatively treated as permanent; there is no
+internal timeout, so retries continue for as long as the director (or the §7.15 envelope)
+allows.
 
 #### 7.24 DONE — Stemcell-driven root/ephemeral disk sizing and dedicated ephemeral pool
 
@@ -1171,9 +1332,14 @@ churn (logs, compilation scratch, blobstore spill) onto the same replicated RBD 
 with persistent I/O and amplifying write traffic ~3x across the cluster network. Pointing
 `ephemeral_storage_pool` at a local-NVMe `dir`/`lvm` storage keeps that volatile churn node-local
 and off Ceph, while the corrected delta math (reading the post-clone size from `QEMU().Config`)
-means a template that is not 5 GiB no longer gets mis-grown. **Limits.** The dedicated ephemeral
-disk is local to its node, so it is not part of any fault-domain or live-migration set — a guest
-with a local-NVMe ephemeral disk cannot be migrated off its node without dropping that disk.
+means a template that is not 5 GiB no longer gets mis-grown. The references derive ephemeral
+sizing from an abstract resource spec the operator never hand-sizes: AWS's `InstanceTypeMapper`
+returns an `ephemeral_disk: {size}` alongside the chosen instance type, and Google derives the
+local-SSD *count* from the machine type's vCPU count against GCE-mandated thresholds (for the n2
+series, 1/2/4/8/16 SSDs at 1/12/22/42/82 vCPUs). PVE takes an explicit `ephemeral_disk_size_mb`
+and pool instead. **Limits.** The dedicated ephemeral disk is local to its node, so it is not part
+of any fault-domain or live-migration set — a guest with a local-NVMe ephemeral disk cannot be
+migrated off its node without dropping that disk.
 
 #### 7.25 DONE — Configurable per-method retry/backoff policy
 
@@ -1196,9 +1362,13 @@ the shipped defaults. They drive three curves in `internal/pve/retry.go` —
 15s cap), and `PushbackBackoff` (5s/60s default) — selected by the `RetryOn*` helpers.
 **Why it matters here.** Storage-lock serialization is a measured lever in the cold-e2e and
 CF-deploy work; an operator can widen the import budget for a slow Ceph cluster, or tighten
-it for a fast lab, without recompiling. **Limits.** Config is read once at startup (no live
-re-tune); `max_attempts ≤ 0` silently reverts to the built-in default;
-curves are pure and deterministic except for seeded jitter.
+it for a fast lab, without recompiling. The references split between fixed and operator-facing
+policy: Alicloud bakes a per-error-class budget into the binary (10 retries at 15s for
+`IncorrectDiskStatus.Initializing` on disk delete, 60 at 5s for `OperationConflict`), while
+OpenStack-Go exposes the curve as a `retry_config` map the operator can tune. PVE follows the
+operator-facing model. **Limits.** Config is read once at startup (no live re-tune);
+`max_attempts ≤ 0` silently reverts to the built-in default; curves are pure and
+deterministic except for seeded jitter.
 
 ### Tier 4 — Optional / deployment-driven
 
@@ -1247,9 +1417,9 @@ metadata and merges global `disk_performance` defaults at `attach_disk` time —
 *rejected* drift. If the global config changed between create and a later re-attach, the disk
 silently came back with a different cache mode than its create-time CID records, so its
 runtime profile diverged from its recorded one. Recording an invariant is worthless if no
-code path enforces it. Azure makes this explicit: `update_disk` rejects a caching-mode change
-as `NotSupported` (caching is creation-time-only), and AWS waits out a volume modification
-before treating it as applied.
+code path enforces it. Azure makes this explicit: `update_disk` rejects a caching-mode, size-shrink,
+or storage-tier change as `NotSupported` (these are creation-time-only), and AWS waits out a
+volume modification before treating it as applied.
 
 **Shipped.** `enforceDiskPerfInvariants` (`internal/cpi/handlers/attach_disk.go`) runs in
 `HandleAttachDisk` after the §7.9 option merge and before any mutating PVE call, so a reject
@@ -1269,11 +1439,13 @@ otherwise re-attach an existing persistent disk with write-back host caching its
 never recorded, changing crash-consistency semantics under the operator's feet. The `enforce`
 default surfaces that as a non-retriable create-time failure naming the diverging keys, so the
 operator aligns config or consciously opts out via `warn`/`off` rather than discovering it after a
-power-loss event. **Limits.** Only the three structural keys (`diskPerfInvariantKeys`,
-`disk_performance.go:194`) are enforced — throttle and discard drift is deliberately allowed since
-PVE can change those on a live device — and because the §7.9 merge pins CID-recorded values, the
-only divergence that ever fires in practice is a global config newly introducing a structural
-option the disk lacked at creation.
+power-loss event. Azure encodes the same rule on the platform side — caching is part of the
+`DiskId` CID, and `update_disk` refuses to change it as `NotSupported` — so PVE's enforce-on-attach
+check is the analogue for a platform that has no such server-side guard. **Limits.** Only the three
+structural keys (`diskPerfInvariantKeys`, `disk_performance.go:194`) are enforced — throttle and
+discard drift is deliberately allowed since PVE can change those on a live device — and because the
+§7.9 merge pins CID-recorded values, the only divergence that ever fires in practice is a global
+config newly introducing a structural option the disk lacked at creation.
 
 #### 7.27 DONE — Disk-resize completion monitoring
 
@@ -1297,8 +1469,11 @@ is bounded even when the §7.15 operation-timeout envelope is disabled.
 can return OK before the new size is visible to the guest; without this wait a follow-on
 `resize_disk` or an agent that reads the old size can race the still-in-flight grow. Enabling the
 wait makes `resize_disk` return only once `QEMU().Config` reports the disk at or above target, so
-a subsequent BOSH disk operation observes a settled size. **Limits.** It is strictly best-effort
-and non-failing by design — the helper is void and on timeout merely logs a warning and returns
+a subsequent BOSH disk operation observes a settled size. AWS solves the same race on the modify
+side, polling `for_volume_modification` to a terminal state; the OpenStack-Go CPI takes the
+complementary stance of rejecting a shrink outright rather than waiting for one to converge. PVE
+grows only and waits for the grow to settle. **Limits.** It is strictly best-effort and
+non-failing by design — the helper is void and on timeout merely logs a warning and returns
 success, so a backend that genuinely never converges within `resize_convergence_timeout_sec` is
 indistinguishable from one that converged late; this guard tightens the common case but cannot
 turn a stuck backend into a hard error.
@@ -1328,12 +1503,15 @@ silently dropping the addition.
 adding to the per-node API pressure §7.16 pushback and §11 flag as the unquantified scale risk;
 the adaptive interval (`adaptiveTaskInterval`, `task.go`) stretches polling toward 10s while a
 clone is barely progressing and tightens it as the task nears completion, cutting wasted API
-round-trips on parallel deploys without lengthening tail latency. **Limits.** The benefit only
-materializes for PVE operations that actually populate the UPID `progress` field (clone,
-move-disk) — short or progress-less tasks fall back to the exact §7.25 fixed cadence — and the
-feature depends on a vendored-SDK addition (`Status.Progress` + single-shot `GetStatus`), guarded
-only by a compile-time assertion that breaks the build, rather than silently degrading, if a
-vendor refresh drops it.
+round-trips on parallel deploys without lengthening tail latency. PVE adopts the vSphere
+ETA-proportional formula directly (remaining time projected from elapsed-over-progress, divided
+by five and clamped); Azure reaches the same end by reading the server's `Retry-After` header on
+each async-operation poll. PVE computes the interval locally because the PVE API emits no such
+header. **Limits.** The benefit only materializes for PVE operations that actually populate the
+UPID `progress` field (clone, move-disk) — short or progress-less tasks fall back to the exact
+§7.25 fixed cadence — and the feature depends on a vendored-SDK addition (`Status.Progress` +
+single-shot `GetStatus`), guarded only by a compile-time assertion that breaks the build, rather
+than silently degrading, if a vendor refresh drops it.
 
 #### 7.29 DONE — Boot-path agent integrity / checksum verification
 
@@ -1342,7 +1520,7 @@ and §7.6 verifies the *stemcell* digest (post-import, per its own caveat). Neit
 that the BOSH **agent binary** inside the booted guest is the expected one — a tampered or
 partially-written agent passed both checks. The Ruby OpenStack CPI injects an expected agent
 checksum into the configdrive for boot-time self-verification (the OpenStack **Go** CPI in this
-reference set does not, so PVE's approach below is its own).
+reference set injects no agent checksum into its user-data, so PVE's approach below is its own).
 
 **Shipped.** PVE exposes a guest-agent exec API, so the CPI verifies directly rather than
 relying on an agent-side self-check. When `health_check.expected_agent_sha256` is set (and the
@@ -1362,8 +1540,12 @@ is unchanged for existing deployments.
 closes the window the §7.12 ping leaves open: an agent that answers the ping is reachable but may
 still be the wrong binary (a partial qcow2 write, a tampered template, a stemcell rebuilt with a
 different agent). A confirmed mismatch destroys the VM before BOSH hands it real work, so a
-compromised or corrupt agent never enters a deployment. The pin is a single SHA-256 string the
-operator updates whenever the expected agent changes, and it is a no-op until set.
+compromised or corrupt agent never enters a deployment. The reference set verifies integrity
+elsewhere in the pipeline: Google passes a `raw_disk_sha1` to its image-import API for server-side
+verification of the *stemcell* image, but the OpenStack-Go CPI injects no agent checksum into
+user-data at all — so PVE's control-plane exec-and-compare is its own mechanism, not a port. The
+pin is a single SHA-256 string the operator updates whenever the expected agent changes, and it is
+a no-op until set.
 
 #### 7.30 DONE — PVE API client connection-pool / keepalive tuning
 
@@ -1387,7 +1569,13 @@ idle pool each scan re-runs the full TCP+TLS handshake against the PVE API, and 
 saturated `pveproxy` then shows up as create latency rather than a clear failure. Raising
 `pve_api_max_idle_conns_per_host` lets parallel deploys reuse keep-alive connections instead of
 stampeding fresh handshakes, while the dial and handshake timeouts convert a wedged API endpoint
-into a bounded, retriable error instead of a long hang. Defaults are the SDK no-op, so a
+into a bounded, retriable error instead of a long hang. The two reference points bracket the
+design space. Alicloud is the positive model: it sets a large `MaxIdleConns` (500) plus an
+explicit `TLSHandshakeTimeout` on its transport, exactly the pooling PVE now exposes. OpenStack-Go
+is the cautionary one: it parses a `ConnectionOptions` block that is wired nowhere
+(`config.go:51`, dead), and it re-authenticates to Keystone on every service build — four-plus
+auth round-trips per `create_vm` — so its connection cost is structural rather than tunable. PVE's
+ticket reuse plus this pool sidesteps both failure modes. Defaults are the SDK no-op, so a
 single-node lab needs none of this — it is a scale-out tuning surface, not a required setting.
 
 #### 7.31 DONE — Post-selection fallback placement on transient create/start failure
@@ -1414,9 +1602,13 @@ releases). When set to a positive value (valid range 1–5; recommended 2):
   non-retriable PVE errors) fail immediately without consuming alternates.
 - At most `1 + fallback_max` total attempts are made; 0 means the feature is fully off.
 
-This is the post-selection analogue of the §7.10 pre-selection multi-AZ fallback, closing
-the gap observed in vSphere (primary-plus-fallback placement list, retries on
-`GenericVmConfigFault`) and AWS (up to two retries on `AbruptlyTerminated`).
+This is the post-selection analogue of the §7.10 pre-selection multi-AZ fallback, mirroring two
+references that retry placement after the chosen target fails: vSphere pre-computes fallback
+datastores during selection and walks to the next one on a `GenericVmConfigFault` without
+re-running its full placement pipeline, and AWS retries the create loop up to twice on
+`AbruptlyTerminated` (and falls back from spot to on-demand capacity). Alicloud takes the same
+persistence to the delete side with a 10-retry delete loop after a post-create failure. PVE walks
+its own scored candidate list, preserving every placement constraint across attempts.
 
 #### 7.32 DONE — Fast-path delete (tag-and-return without terminal-state poll)
 
@@ -1451,7 +1643,9 @@ fast-delete-specific sweep, distinct from the §7.13 orphan-GC, which keys on st
 director-scoped base volumes rather than this tag.) The fast path bypasses the §7.15
 operation-timeout envelope naturally: the handler returns before any task-poll loop begins, so
 the two are complementary fixes — bound the wait (§7.15) and skip the wait (§7.32) cover
-different operations.
+different operations. AWS pairs the same `fast_path_delete` tag-and-return behavior with eventual
+cleanup; Google exposes the equivalent as a `CPI_ASYNC_DELETE` toggle that fires the delete and
+returns without polling. PVE adds the `bosh-deleting` sweep so the skipped waits still converge.
 
 #### 7.33 DONE — Articulate the idempotency-collision model
 
@@ -1465,9 +1659,14 @@ identity is already occupied by a live VM — retrying the same VMID would loop 
 This contrasts with same-token-retry clouds: AWS `ClientToken` and Azure
 `x-ms-client-request-id` signal "this request is in flight", not "this identity is taken".
 Those clouds must retry the same token; generating a new token would create a duplicate
-resource. The classification rule is: regenerate when the collision means *taken*; retry
-the same identity when it means *in flight*. PVE's model falls firmly in the first
-category.
+resource. Even the regenerate camp splits on detail: Alicloud regenerates its `ClientToken`
+only on a specific `IdempotentFailed` response, whereas AWS and Azure retry the same token
+unconditionally. Google sits in a third position — it carries no creation token at all, using
+a metadata fingerprint as a compare-and-swap (409 on a stale fingerprint) for label and
+settings writes. The classification rule is: regenerate when the collision means *taken*;
+retry the same identity when it means *in flight*. PVE's model falls firmly in the first
+category, and PVE's API offers no server-side dedup token of its own, so the CPI must
+implement the regenerate loop itself.
 
 The §7.23 error classifier already treats "vm already exists" / HTTP 409 as a conflict
 that routes to `AllocateWithRetry`, not to a same-VMID retry path. This model is stated
@@ -1507,7 +1706,10 @@ particular instance group must land on a different Linux bridge or SDN vnet, or 
 per-NIC `firewall` flag on without re-templating the whole network. Setting `network_defaults` on
 the VM's `cloud_properties` retargets just those NICs at deploy time, with no edit to shared
 cloud-config, CPI config, or the spec/ERB. Because it is the highest-precedence layer, it is also
-the escape hatch for one-off placement onto a bridge the resolver would not otherwise pick.
+the escape hatch for one-off placement onto a bridge the resolver would not otherwise pick. Google
+establishes the same VM-props-win-over-network precedence; OpenStack-Go applies the equivalent
+ordering to security groups, resolving VM over network over global. PVE's resolver chain follows
+that established precedence.
 
 #### 7.35 DONE — Bounded-concurrency parallel stemcell replication across cluster nodes
 
@@ -1531,146 +1733,157 @@ concurrency-safe); `inflightSems.acquire` is guarded by `sync.Mutex` internally;
 allocation uses `AllocateWithRetry` (regenerates on conflict) so parallel goroutines on
 different nodes do not collide. Per-node best-effort semantics (idempotent skip, non-fatal
 failure) are preserved identically in both serial and parallel modes. `go test -race` is
-clean.
+clean. The pattern mirrors Alicloud's bounded parallel upload, which streams a stemcell image
+to its intermediate OSS bucket in 5 MB parts across five goroutines (`oss.Routines(5)`); PVE
+applies the same bounded-worker discipline at the per-node granularity its single-POST
+endpoint dictates rather than at the chunk granularity.
 
 ### Newly identified gaps (latest round)
 
-These six surfaced from a fresh, independent re-extraction of all six reference CPIs against the
-now-shipped §7.1–§7.35 work. None duplicates an existing item; each maps to a real PVE primitive
-and remains **open**. They cluster around one theme the prior rounds under-weighted — *cross-process
-and in-flight-operation safety* — which §8 names directly. They follow the same additive-optional
-convention: validate only when set, omit from VM config when empty, zero behavior change for
-existing manifests. Ordered by value, not severity.
+These six gaps did not appear in the prior report; they surfaced from a deeper read of all six
+reference CPIs against the now-shipped §7.1–§7.35 work. None duplicates an existing item; each maps
+to a real PVE primitive. They cluster around one theme the earlier rounds under-weighted —
+*cross-process and in-flight-operation safety* — which §8 names directly. Only the platforms
+that expose *non-atomic shared configuration* need an explicit cross-process lock. vSphere (DRS rules),
+Azure (availability sets and shared image galleries), and PVE (pmxcfs-replicated HA rules) all sit in
+that camp and all reach for a mutex. The four public-cloud CPIs — AWS, Google, OpenStack-Go, and
+Alicloud — do not; they lean on provider-atomic create, compare-and-swap fingerprints, or idempotency
+tokens instead. PVE resembles vSphere and Azure here, not the hyperscalers, and the gaps below reflect
+that. Each follows the same additive-optional convention: validate only when set, omit from VM config
+when empty, and change nothing for existing manifests. Ordered by value, not severity.
 
 #### 7.36 DONE — Cross-process cluster mutex for HA-rule and anti-affinity mutation
 
-*References: vSphere, Azure.* vSphere serializes every DRS-group / anti-affinity reconfiguration
-behind a platform-native distributed mutex: `DrsLock#with_drs_lock` creates a vCenter custom field
-by name and relies on vCenter raising `DuplicateName` if it already exists, polling every 0.5 s for
-up to 600 s and releasing by deleting the field (`drs_rules/drs_lock.rb:16-58`). Azure takes the
-same posture with an OS advisory `flock` on `/tmp/azure_cpi/<lock>` wrapped (EX/SH/NB) around
-availability-set get-or-create, gallery-image create/update, and user-image create
-(`helpers.rb:564-575`, `vm_manager_availability_set.rb:35,65`,
-`compute_gallery_manager.rb:149,262,270,340`). Both treat shared cluster-config edits as a critical
-section across concurrent CPI processes.
+*References: vSphere, Azure.* vSphere serializes every DRS-group and anti-affinity reconfiguration
+behind a platform-native distributed mutex. `DrsLock#with_drs_lock` creates a vCenter custom field by
+name and relies on vCenter raising `DuplicateName` if it already exists — a create-as-compare-and-swap
+on the names `drs_lock`, `host_vm_group`, and `DISABLE_DRS_LOCK` — polling every 0.5 s for up to 600 s
+and releasing by deleting the field (`drs_rules/drs_lock.rb:16-58`). Azure takes the same posture with
+an OS advisory `flock` on `/tmp/azure_cpi/<lock>` (EX, SH, or NB) around availability-set
+get-or-create, gallery-image create and update, and user-image create (`helpers.rb:564-575`,
+`vm_manager_availability_set.rb:35,65`, `compute_gallery_manager.rb:149,262,270,340`). Both treat
+shared cluster-config edits as a critical section across concurrent CPI processes.
 
 The shipped PVE HA work (§7.21 node-affinity pin, dual anti-affinity rules) mutates cluster-wide
 `/etc/pve` HA state with an unguarded read-modify-write: `placement_antiaffinity.go` lists HA rules,
 deletes the group rule, then re-registers it, and `placement_nodeaffinity.go` likewise lists then
-rewrites the pin. There is no cross-process lock anywhere on this path — the only mutexes in the
-tree (`dispatcher.mu`, `rollback.mu`, `inflightSems`) are in-process, and `max_inflight_per_node`
-(§7.16) is a per-process semaphore. Under a parallel deploy the BOSH director runs many
-`create_vm`/`delete_vm` CPI invocations as **separate processes**, each racing the same
-`bosh-aa-<group>` rule: process A reads the member set, process B reads the same stale set, both
-delete-and-recreate, and the last writer wins — silently dropping a VM from its negative-affinity
-rule. pmxcfs is a replicated filesystem with last-write-wins semantics, so this is a real data-race
-on safety-critical placement state, not a theoretical one (the lab notes already record a pmxcfs-race
-and duplicate-stemcell-template class of bug).
+rewrites the pin. No cross-process lock guards this path. The only mutexes in the tree
+(`dispatcher.mu`, `rollback.mu`, `inflightSems`) are in-process, and `max_inflight_per_node` (§7.16)
+is a per-process semaphore. Under a parallel deploy the BOSH director runs many
+`create_vm`/`delete_vm` invocations as **separate processes**, each racing the same `bosh-aa-<group>`
+rule: process A reads the member set, process B reads the same stale set, both delete and recreate, and
+the last writer wins — silently dropping a VM from its negative-affinity rule. pmxcfs is a replicated
+filesystem with last-write-wins semantics, so this is a real data race on safety-critical placement
+state, not a theoretical one. The lab notes already record a pmxcfs race and a duplicate-stemcell-template
+class of bug.
 
 **Build:** add an opt-in `pve.cluster_lock_mode` (`off` default → byte-identical; `flock` to enable).
-When enabled, wrap HA-rule and anti-affinity mutation (`ensureAntiAffinityRule`,
-`ensureNodeAffinityPin`, and their delete-side cleanup) in a cluster-wide critical section keyed on a
-stable lock name (e.g. `bosh-cpi-ha`). The natural PVE primitive is a create-or-fail sentinel under
-`/cluster`: take a config-object whose creation PVE rejects with a conflict if it already exists
-(mirroring vCenter's `DuplicateName`), poll-acquire with jittered backoff up to a bounded
-`cluster_lock_timeout_sec` (default ~60 s), and release on a `defer`. Because pmxcfs serializes config
-writes cluster-wide, an alternative is a lock file under `/etc/pve` taken via the API with a
-TTL-stamped owner token so a crashed holder self-expires. Keep the unguarded path as the default so
-existing deployments are unchanged.
+When enabled, wrap HA-rule and anti-affinity mutation (`ensureAntiAffinityRule`, `ensureNodeAffinityPin`,
+and their delete-side cleanup) in a cluster-wide critical section keyed on a stable lock name (for
+example `bosh-cpi-ha`). The natural PVE primitive is a create-or-fail sentinel under `/cluster`: take a
+config object whose creation PVE rejects with a conflict if it already exists (mirroring vCenter's
+`DuplicateName`), poll-acquire with jittered backoff up to a bounded `cluster_lock_timeout_sec`
+(default ~60 s), and release on a `defer`. Because pmxcfs serializes config writes cluster-wide, an
+alternative is a lock file under `/etc/pve` taken via the API with a TTL-stamped owner token so a
+crashed holder self-expires. Keep the unguarded path as the default so existing deployments are
+unchanged.
 
-**Shipped.** Both mechanisms landed, both opt-in and byte-identical when unset. A pool-sentinel
-cluster lock (`internal/pve/cluster_lock.go`: `AcquireClusterLock`/`Release` over POST/DELETE/GET
-`/pools`, poolid `bosh-lock-<name>`, comment `owner=<token> exp=<unix>`) wraps the per-group
-anti-affinity read-modify-write: create-or-fail is the test-and-set, a dup whose recorded expiry has
-passed is stolen (delete+recreate) with a post-steal owner re-read to refuse a displaced handle, and
-release is deferred so it fires even on a mid-RMW error. The matcher is **fail-closed** — an error
-that cannot be positively classified as duplicate is mapped to a retriable acquire failure rather
-than wrongly assumed to mean "lock held". A read-after-write **verify** re-lists the rule and asserts
-the VMID is present; an absent member returns `TypeRetriableCloud`. Both the anti-affinity and the
-node-affinity create_vm call sites now propagate that retriable class to the director (selectively —
-a generic HA-API blip stays fail-open per §7.21), so the spread/pin guarantee is re-driven rather
-than silently lost. Knobs: `pve.cluster_lock_mode` (`off`|`pool`), `pve.cluster_lock_timeout_sec`,
+**Shipped.** Both mechanisms landed, both opt-in and byte-identical when unset. A pool-sentinel cluster
+lock (`internal/pve/cluster_lock.go`: `AcquireClusterLock`/`Release` over POST/DELETE/GET `/pools`,
+poolid `bosh-lock-<name>`, comment `owner=<token> exp=<unix>`) wraps the per-group anti-affinity
+read-modify-write. Create-or-fail is the test-and-set; a duplicate whose recorded expiry has passed is
+stolen (delete then recreate) with a post-steal owner re-read that refuses a displaced handle; release
+is deferred so it fires even on a mid-RMW error. The matcher is **fail-closed** — an error that cannot
+be positively classified as a duplicate maps to a retriable acquire failure rather than a wrong
+assumption that the lock is held. A read-after-write **verify** re-lists the rule and asserts the VMID
+is present; an absent member returns `TypeRetriableCloud`. Both the anti-affinity and node-affinity
+create_vm call sites propagate that retriable class to the director — selectively, since a generic
+HA-API blip stays fail-open per §7.21 — so the spread or pin guarantee is re-driven rather than
+silently lost. Knobs: `pve.cluster_lock_mode` (`off`|`pool`), `pve.cluster_lock_timeout_sec`,
 `pve.antiaffinity_verify`. The node-affinity pin is per-VMID (no cross-group RMW), so it takes the
-verify but intentionally skips the coarse lock. *Live-validation caveat:* the exact PVE status/text
+verify but intentionally skips the coarse lock. *Live-validation caveat:* the exact PVE status and text
 for a duplicate poolid and the comment round-trip are inferred from the API shape and pmxcfs
 serialization; unit tests assert the contract against a fake `PoolService`, and a true multi-process
 race must be validated on a live cluster.
 
 #### 7.37 DONE — Adopt-and-wait on a racing concurrent template clone (clone-target-exists)
 
-*References: vSphere, Azure.* vSphere's `Stemcell#replicate` clones a per-datastore replica and, when
-a parallel CPI is already replicating the same stemcell, catches the resulting `DuplicateName` and
-converts it to *find-by-path + wait-for-snapshot* of the in-progress replica rather than erroring
-(`stemcell.rb:90-100`). Azure's `_get_user_image` takes an EX `flock` around **both** the existence
-GET and the create specifically so process 2 never VM-creates against an image process 1 is still
-building (`stemcell_manager2.rb:138-169`). Both convert a concurrent-create collision into a safe
-wait on the winner's artifact.
+*References: vSphere, Azure.* vSphere's `Stemcell#replicate` clones a per-datastore replica and, when a
+parallel CPI is already replicating the same stemcell, catches the resulting `DuplicateName`, then
+resolves the in-progress replica by `find_by_inventory_path` and blocks until its snapshot property
+appears rather than erroring (`stemcell.rb:90-100`). This is the exact adopt-and-wait model: catch the
+collision, find the winner's artifact, wait for it to become usable. Azure's `_get_user_image` takes an
+EX `flock` around **both** the existence GET and the create specifically so process 2 never VM-creates
+against an image process 1 is still building (`stemcell_manager2.rb:138-169`). Both convert a
+concurrent-create collision into a safe wait on the winner's artifact.
 
-This is distinct from the shipped §7.35 (which parallelizes one CPI's own replication loop) — §7.35
-governs intra-process concurrency, not the cross-process race. On PVE, when two independent
-`create_vm` invocations target a node lacking the stemcell replica, both consult the per-node replica
-tag (`ResolveTemplateVMIDForNode`, `template.go:441`), both find it absent, and both issue a clone for
-the same template onto the same node. The second clone hits a VMID conflict, and today the create_vm
+This is distinct from the shipped §7.35, which parallelizes one CPI's own replication loop — §7.35
+governs intra-process concurrency, not the cross-process race. On PVE, when two independent `create_vm`
+invocations target a node lacking the stemcell replica, both consult the per-node replica tag
+(`ResolveTemplateVMIDForNode`, `template.go:441`), both find it absent, and both issue a clone for the
+same template onto the same node. The second clone hits a VMID conflict, and today the create_vm
 allocation loop treats VMID conflicts as retriable jitter — it allocates a *fresh* VMID and clones
 again, producing a duplicate, half-built replica template instead of waiting for the winner. The
-orphan-template and duplicate-stemcell-template hazards in the lab notes are exactly this failure
-mode.
+orphan-template and duplicate-stemcell-template hazards in the lab notes are this failure mode exactly.
 
-**Build:** in the replica-ensure path (`ensureTemplate` / the per-node replica build consumed by the
-scorer), when a clone or template-create returns a target-exists conflict for the *replica name/tag
-we were about to create* (as opposed to an unrelated guest VMID collision), branch to adopt-and-wait:
-poll for the per-node replica tag (`bosh-stemcell-node-<node>` + `bosh-stemcell-sha-<sha8>`) to appear
-and the template to leave clone-in-progress state, bounded by `replica_adopt_timeout_sec` (default
-~300 s), then return the adopted replica. Distinguish a replica-name collision (adopt) from a guest
-VMID collision (the existing retry-jitter path) so create_vm's allocation loop is unchanged. With a
-single CPI process the conflict never fires, so behavior is byte-identical; the new code only changes
-the multi-process race outcome from "duplicate orphan template" to "wait for the winner".
+**Build:** in the replica-ensure path (`ensureTemplate` and the per-node replica build consumed by the
+scorer), when a clone or template-create returns a target-exists conflict for the *replica name or tag
+we were about to create* — as opposed to an unrelated guest VMID collision — branch to adopt-and-wait:
+poll for the per-node replica tag (`bosh-stemcell-node-<node>` plus `bosh-stemcell-sha-<sha8>`) to
+appear and the template to leave clone-in-progress state, bounded by `replica_adopt_timeout_sec`
+(default ~300 s), then return the adopted replica. Distinguish a replica-name collision (adopt) from a
+guest VMID collision (the existing retry-jitter path) so create_vm's allocation loop is unchanged. With
+a single CPI process the conflict never fires, so behavior is byte-identical; the new code only changes
+the multi-process race outcome from "duplicate orphan template" to "wait for the winner."
 
 **Shipped.** PVE allocates a fresh VMID for every clone, so a duplicate-replica collision is invisible
-at the VMID-allocation layer (two losers pick different VMIDs and both succeed) — the Azure/vSphere
-"catch DuplicateName" hook has no PVE analogue. Instead the in-flight winner is observed directly: a
-replica VM carries its identity tags (`bosh-stemcell-sha-<sha8>` + `bosh-stemcell-node-<node>`) from
-creation, but `Template` flips true only after the freeze and the guest config `lock` reads
-`clone`/`create` while the build is in flight. A new primitive `pve.AdoptReplicaTemplate`
-(`internal/pve/replica_adopt.go`) scans for that mid-build VM via `findReplicaCandidate` — which, unlike
-the settled-only `ResolveTemplateVMIDForNode`, does *not* require the `Template` flag — and polls it to a
-settled template (frozen and unlocked), bounded by `pve.replica_adopt_timeout_sec`. The scan prefers a
-settled candidate over any lower-VMID unsettled orphan, so a crashed-mid-build remnant cannot shadow a
-genuine adoptable template. The probe is wired into the per-node replica build (`replicateOneNode`,
-`create_stemcell.go`) **before** the qcow2 upload: on adoption the node skips upload + clone entirely
-(no duplicate, no orphaned upload); a winner that never settles within the bound yields a
-`TypeRetriableCloud` that the best-effort replication loop logs and skips (re-driven next deploy).
-Distinguishing a replica collision from a guest-VMID collision is structural — the adopt probe keys on
-the replica tag set, while the create_vm allocation loop's VMID-conflict jitter is untouched. The knob
-defaults to 0 (disabled): the probe call site is skipped entirely, so single-process and pre-existing
-behavior is byte-identical. The residual sub-second TOCTOU window between a not-found probe and the
-caller's own clone is shrunk but not eliminated (no cross-process lock is taken on this path; the
-optional `cluster_lock_mode=pool` primitive from §7.36 could close it but is not wired here).
+at the VMID-allocation layer — two losers pick different VMIDs and both succeed — and the
+Azure/vSphere catch-`DuplicateName` hook has no PVE analogue. Instead the in-flight winner is observed
+directly. A replica VM carries its identity tags (`bosh-stemcell-sha-<sha8>` plus
+`bosh-stemcell-node-<node>`) from creation, but `Template` flips true only after the freeze, and the
+guest config `lock` reads `clone` or `create` while the build is in flight. A new primitive
+`pve.AdoptReplicaTemplate` (`internal/pve/replica_adopt.go`) scans for that mid-build VM via
+`findReplicaCandidate` — which, unlike the settled-only `ResolveTemplateVMIDForNode`, does *not* require
+the `Template` flag — and polls it to a settled template (frozen and unlocked), bounded by
+`pve.replica_adopt_timeout_sec`. The scan prefers a settled candidate over any lower-VMID unsettled
+orphan, so a crashed-mid-build remnant cannot shadow a genuine adoptable template. The probe is wired
+into the per-node replica build (`replicateOneNode`, `create_stemcell.go`) **before** the qcow2 upload:
+on adoption the node skips upload and clone entirely (no duplicate, no orphaned upload); a winner that
+never settles within the bound yields a `TypeRetriableCloud` that the best-effort replication loop logs
+and skips (re-driven next deploy). Distinguishing a replica collision from a guest-VMID collision is
+structural — the adopt probe keys on the replica tag set, while the create_vm allocation loop's
+VMID-conflict jitter is untouched. The knob defaults to 0 (disabled): the probe call site is skipped
+entirely, so single-process and pre-existing behavior is byte-identical. The residual sub-second TOCTOU
+window between a not-found probe and the caller's own clone is shrunk but not eliminated — no
+cross-process lock is taken on this path, though the optional `cluster_lock_mode=pool` primitive from
+§7.36 could close it.
 
-*Live-validation caveat:* the `clone`/`create` lock strings and the list endpoint's per-VM `lock`/`tags`
-fields are exercised against a fake PVE client asserting the contract; a true multi-process replica
-race and a stuck-lock winner (which requires operator `qm unlock` recovery, noted in the spec) need a
-live cluster to validate.
+*Live-validation caveat:* the `clone`/`create` lock strings and the list endpoint's per-VM `lock` and
+`tags` fields are exercised against a fake PVE client asserting the contract; a true multi-process
+replica race and a stuck-lock winner (which requires operator `qm unlock` recovery, noted in the spec)
+need a live cluster to validate.
 
 #### 7.38 DONE — Pre-delete lock/status guard on `delete_disk` against in-flight volume operations
 
-*References: Google, OpenStack.* Google's disk delete refuses when `disk.Status` is neither `READY`
-nor `FAILED`, returning an error rather than racing a `CREATING`/`RESTORING` disk
+*References: Google, OpenStack.* Google's disk delete refuses when `disk.Status` is neither `READY` nor
+`FAILED`, returning an error rather than racing a `CREATING` or `RESTORING` disk
 (`google/disk/google_disk_service_delete.go:19-21`). OpenStack's `delete_disk` rejects unless the
 volume status is `available`, 404-skips an already-gone volume, then waits for terminal `deleted`
-(`delete_disk.go:42-66`). Both gate destruction on the resource being quiescent.
+(`delete_disk.go:42-66`). AWS takes the same precaution asymmetrically: `delete_ebs_volume` applies a
+linear backoff (1, 6, 11, 15, 15 s) on `VolumeInUse` to ride out post-detach consistency lag before
+freeing the volume. All three gate destruction on the resource being quiescent.
 
 PVE's `delete_disk` has no such precondition: `HandleDeleteDisk` goes straight to the `imgdel` call
 wrapped only in `RetryOnTransientOrLock` (`delete_disk.go:94`). Retry-on-lock recovers from a
 *transient* storage lock, but it does not guard against freeing a volume whose owning VM is
-mid-operation — a `qm clone`, a `qm disk move`/`storage migrate`, a backup, or a snapshot rollback
+mid-operation — a `qm clone`, a `qm disk move` or `storage migrate`, a backup, or a snapshot rollback
 that holds the VM `lock` config field. Freeing the backing image out from under such an operation can
 corrupt the in-flight task or leave storage inconsistent. PVE exposes the signal directly: the owning
 guest's config carries a `lock` field (`backup`, `clone`, `migrate`, `snapshot`, `rollback`).
 
 **Build:** add an opt-in `pve.disk_delete_state_guard` (`off` default → byte-identical; `on` to
 enable). When enabled and the volume resolves to an owning VM, read that VM's config `lock` field
-before freeing; if it is set to a destructive/in-flight value, treat it as *retriable* so the
+before freeing; if it is set to a destructive or in-flight value, treat it as *retriable* so the
 director re-drives the delete after the lock clears (mirroring §7.27's convergence posture), or
 fail-fast with a clear non-retriable error. Keep the existing 404-idempotent skip. With the guard off,
 current behavior is preserved exactly.
@@ -1679,83 +1892,89 @@ current behavior is preserved exactly.
 When enabled, `HandleDeleteDisk` runs `pve.GuardDiskDeleteState` between node resolution and the
 `imgdel` call. The critical design point: the VMID baked into a managed volid name
 (`<storage>:vm-<VMID>-disk-<N>`) is only the allocation-time placeholder this CPI assigns at
-`create_disk` — BOSH attaches the volume to a different guest without renaming it, so the guard
-resolves the *currently-attached* VM by scanning VM configs for the volid (`FindVMByDiskVolid`),
-**not** by parsing the name. It then reads that VM's `lock` config field; a destructive/in-flight
-value (`backup`, `clone`, `migrate`, `snapshot`, `rollback`, `create`) yields a `TypeRetriableCloud`
-error so the director re-drives the delete after the lock clears (mirroring §7.27's convergence
-posture). The guard is best-effort and fails open on every uncertainty: a disk attached to no VM (the
-normal pre-delete state), an attachment-resolution failure, a config-read error, or a 404 all pass
-straight through, so an enabled guard can never convert a hiccup into a delete failure. The existing
-404-idempotent skip and the `RetryOnTransientOrLock`-wrapped `imgdel` are unchanged; with the guard
-off (the default) no attachment lookup runs and behavior is byte-identical. Residual: the
-check-then-delete window is inherently best-effort (a lock taken between the guard read and the
-`imgdel` is not caught), and if the attached VM is left with a stuck config lock the delete defers
-until an operator runs `qm unlock <vmid>` — the deferral log names the VM, node, and lock.
-Live-validation caveat: exercised against fakes asserting the resolution + lock-classification
-contract; the real attached-VM-mid-operation race needs a live PVE cluster.
+`create_disk` — BOSH attaches the volume to a different guest without renaming it, so the guard resolves
+the *currently-attached* VM by scanning VM configs for the volid (`FindVMByDiskVolid`), **not** by
+parsing the name. It then reads that VM's `lock` config field; a destructive or in-flight value
+(`backup`, `clone`, `migrate`, `snapshot`, `rollback`, `create`) yields a `TypeRetriableCloud` error so
+the director re-drives the delete after the lock clears (mirroring §7.27's convergence posture). The
+guard is best-effort and fails open on every uncertainty: a disk attached to no VM (the normal
+pre-delete state), an attachment-resolution failure, a config-read error, or a 404 all pass straight
+through, so an enabled guard can never convert a hiccup into a delete failure. The existing
+404-idempotent skip and the `RetryOnTransientOrLock`-wrapped `imgdel` are unchanged; with the guard off
+(the default) no attachment lookup runs and behavior is byte-identical. Residual: the check-then-delete
+window is inherently best-effort (a lock taken between the guard read and the `imgdel` is not caught),
+and if the attached VM is left with a stuck config lock the delete defers until an operator runs
+`qm unlock <vmid>` — the deferral log names the VM, node, and lock. Live-validation caveat: exercised
+against fakes asserting the resolution and lock-classification contract; the real
+attached-VM-mid-operation race needs a live PVE cluster.
 
 #### 7.39 DONE — Eventual-consistency retry resolving a freshly-created SDN vnet/bridge
 
-*Reference: vSphere.* vSphere wraps network lookup in `find_network_retryably` — `Bosh::Retryable`
-with 62 tries (~10 min) on `NetworkNotFoundError` — explicitly to tolerate the lag between a portgroup
-being created and becoming queryable cluster-wide (`vcenter_client.rb:225-239`). The CPI assumes a
-freshly-created network is not immediately resolvable on every host and polls until it converges.
+*Reference: vSphere.* This gap has no public-cloud analogue. Cloud networks are synchronous and
+strongly consistent — a created subnet or security group is queryable everywhere the moment the API
+returns — so the cloud CPIs need no convergence wait. vSphere is the one reference that does, because a
+vCenter portgroup propagates asynchronously: `find_network_retryably` wraps network lookup in
+`Bosh::Retryable` with 62 tries (~10 min) on `NetworkNotFoundError`, explicitly to tolerate the lag
+between a portgroup being created and becoming queryable cluster-wide (`vcenter_client.rb:225-239`). The
+CPI assumes a freshly-created network is not immediately resolvable on every host and polls until it
+converges.
 
-PVE's SDN has the identical eventual-consistency property but no corresponding wait. `create_network`
-stages a zone/vnet/subnet and calls `applySDN` to push the config to the data plane
-(`create_network.go:266,378`), but returns as soon as the apply task is accepted — it does **not**
-poll for the vnet to materialize as a usable bridge on the node where the next `create_vm` lands. On
-the consume side, `create_vm` takes the bridge name purely from config/cloud_properties and writes it
+PVE's SDN has the same eventual-consistency property and no corresponding wait. `create_network` stages
+a zone, vnet, and subnet and calls `applySDN` to push the config to the data plane
+(`create_network.go:266,378`), but returns as soon as the apply task is accepted — it does **not** poll
+for the vnet to materialize as a usable bridge on the node where the next `create_vm` lands. On the
+consume side, `create_vm` takes the bridge name purely from config or cloud_properties and writes it
 into `netN=` with no existence check. SDN apply is asynchronous and per-node (`ifupdown2` reload plus
 pmxcfs propagation), so a `create_vm` immediately following a `create_network` on a different node can
 attach a NIC to a bridge that does not yet exist there — the VM boots with a dead NIC, or `qm start`
-fails, surfacing as a flaky, deploy-order-dependent failure that disappears on retry. This is exactly
-the lab reality the SDN-network gap note flags.
+fails, surfacing as a flaky, deploy-order-dependent failure that disappears on retry. This is the lab
+reality the SDN-network gap note flags.
 
 **Build:** add an opt-in `pve.network_resolve_retries` (default 0 → byte-identical) and a companion
 `network_resolve_timeout_sec`. When set, after `applySDN` succeeds in `create_network`, poll
-`/cluster/sdn` (status `available`, no `pending`) and/or `/nodes/{node}/network` until the target
-vnet/bridge is resolvable, bounded by the timeout. On the consume side, optionally gate `configureNICs`
-in `create_vm` with the same bounded retry resolving the per-NIC bridge before writing `netN=`,
-classifying a not-yet-present bridge as retriable so the director re-drives rather than booting a NIC
-into the void. With retries at 0 the apply-and-return behavior is unchanged.
+`/cluster/sdn` (status `available`, no `pending`) and/or `/nodes/{node}/network` until the target vnet
+or bridge is resolvable, bounded by the timeout. On the consume side, optionally gate `configureNICs` in
+`create_vm` with the same bounded retry resolving the per-NIC bridge before writing `netN=`, classifying
+a not-yet-present bridge as retriable so the director re-drives rather than booting a NIC into the void.
+With retries at 0 the apply-and-return behavior is unchanged.
 
 **Shipped.** Two opt-in knobs, `network_resolve_retries` (default 0 → byte-identical) and the companion
-`network_resolve_timeout_sec` (0 → 60s), gate both sides via `pve.WaitForSDNVnetConverged` and
-`pve.ResolveNodeBridgeOnNode` (`internal/pve/network_resolve.go`), each a bounded poll (retry count
-plus absolute timeout) over the shared `lockClock` seam. Produce side: after `applySDN` succeeds,
+`network_resolve_timeout_sec` (0 → 60 s), gate both sides via `pve.WaitForSDNVnetConverged` and
+`pve.ResolveNodeBridgeOnNode` (`internal/pve/network_resolve.go`), each a bounded poll (retry count plus
+absolute timeout) over the shared `lockClock` seam. On the produce side, after `applySDN` succeeds,
 `createNetworkSDN` polls the **running** (`pending=false`) cluster SDN vnet list until the new vnet is
 committed, returning a retriable error on exhaustion so the director re-drives — the vnet is left in
-place (the gate runs after the apply/rollback block, so a convergence wait never tears down a
-committed vnet). This confirms cluster **commit**, not per-node realization. Consume side:
-`configureNICs` collects every NIC bridge during the build loop and, before the single
-`UpdateQemuConfig` write, resolves each on the **target node** via `nodes.ListNetwork` — so no `netN=`
-is written for any NIC until all bridges resolve (no partial config). Only SDN-managed vnets are
-gated: a bridge that is not a known SDN vnet (external/static, e.g. `vmbr0`) passes straight through,
-and the per-node check is the authoritative realization signal. The gate is best-effort where it must
-be — an SDN-membership lookup failure fails open (never blocks a deploy on the guard's own blip),
-while a transient node-network read counts as "not yet present" and keeps polling, ultimately
-surfacing a retriable error rather than aborting. A bridge still converging past the budget yields
-`TypeRetriableCloud`, preserved through the handler `cpierrors.Wrap`. Validation rejects negative
-counts; the ERB emits each key only when set. Live multi-node SDN convergence timing remains to be
-validated against a real cluster.
+place (the gate runs after the apply/rollback block, so a convergence wait never tears down a committed
+vnet). This confirms cluster **commit**, not per-node realization. On the consume side, `configureNICs`
+collects every NIC bridge during the build loop and, before the single `UpdateQemuConfig` write,
+resolves each on the **target node** via `nodes.ListNetwork` — so no `netN=` is written for any NIC
+until all bridges resolve (no partial config). Only SDN-managed vnets are gated: a bridge that is not a
+known SDN vnet (external or static, for example `vmbr0`) passes straight through, and the per-node check
+is the authoritative realization signal. The gate is best-effort where it must be — an SDN-membership
+lookup failure fails open (never blocks a deploy on the guard's own blip), while a transient
+node-network read counts as "not yet present" and keeps polling, ultimately surfacing a retriable error
+rather than aborting. A bridge still converging past the budget yields `TypeRetriableCloud`, preserved
+through the handler `cpierrors.Wrap`. Validation rejects negative counts; the ERB emits each key only
+when set. Live multi-node SDN convergence timing remains to be validated against a real cluster.
 
 #### 7.40 DONE — Ephemeral-disk minimum-size invariant (≥ 2× RAM) on `create_vm`
 
 *Reference: OpenStack.* OpenStack's flavor resolver rejects an `instance_type` whose
 `flavor.Ephemeral > 0` but is smaller than `(RAM/1024)*2`, enforcing that the ephemeral disk has
 headroom for agent swap plus `/var/vcap/data` (`flavor_resolver.go:78-86`). The invariant encodes a
-hard truth: the BOSH agent places swap (sized to RAM) and the data partition on the ephemeral disk,
-so an ephemeral disk smaller than ~2× RAM cannot satisfy the agent's own layout.
+hard truth: the BOSH agent places swap (sized to RAM) and the data partition on the ephemeral disk, so
+an ephemeral disk smaller than ~2× RAM cannot satisfy the agent's own layout. The nearest concept among
+the other references is Azure's ephemeral-OS-disk placement, which routes the OS disk onto the
+resource/cache disk and so is constrained by that disk's capacity — a related sizing dependency, though
+not the same 2× rule.
 
-PVE's §7.24 ephemeral path (`resolveEphemeralShape`, `create_vm.go`) sizes the dedicated ephemeral
-disk straight from `ephemeral_disk_size_mb` (rounded up to GiB) and resolves the pool, but asserts
+PVE's §7.24 ephemeral path (`resolveEphemeralShape`, `create_vm.go`) sizes the dedicated ephemeral disk
+straight from `ephemeral_disk_size_mb` (rounded up to GiB) and resolves the pool, but asserts
 **nothing** about the size relative to VM RAM. An operator who configures a 2 GiB ephemeral disk on an
 8 GiB-RAM job gets a VM whose agent cannot lay down its 8 GiB swap file — the agent's ephemeral-disk
-setup fails at boot, or swap silently does not activate, producing the exact ephemeral-space boot
-failure §7.24's root-resize logic already guards against on the *root* disk but not on the *ephemeral*
-disk. This is a cheap, high-signal pre-flight invariant the shipped code omits.
+setup fails at boot, or swap silently does not activate, producing the same ephemeral-space boot failure
+§7.24's root-resize logic already guards against on the *root* disk but not on the *ephemeral* disk.
+This is a cheap, high-signal pre-flight invariant the shipped code omits.
 
 **Build:** add an opt-in `pve.ephemeral_disk_min_ratio` (default 0 → no check, byte-identical;
 conventional value 2). When set and an ephemeral disk is being created, compute the resolved ephemeral
@@ -1765,44 +1984,49 @@ naming the deficit, or warn — operator's choice via an `enforce|warn` knob mir
 `disk_perf_invariant_mode`. This reuses the §7.26 enforce/warn pattern verbatim. With the ratio at 0
 nothing changes.
 
-**Shipped.** `create_vm` gained an opt-in `pve.ephemeral_disk_min_ratio` (float, default `0` →
-no check, byte-identical) with a companion `pve.ephemeral_disk_min_mode` (`enforce` default | `warn`),
-mirroring the §7.26 `disk_perf_invariant_mode` pattern. When the ratio is set and a *dedicated*
-ephemeral disk is being provisioned (`ephemeral_disk_size_mb` > 0), `resolveEphemeralShape`'s resolved
-ephemeral GiB is checked against the VM's configured RAM as
-`ephemeral_GiB >= ratio × (memory_MiB / 1024)` — both sides in binary GiB so the comparison is
-unit-consistent with the agent's own swap-plus-`/var/vcap/data` layout, with a `1e-9` epsilon so an
-exact-boundary disk is never falsely rejected by floating-point drift. The check is wired into *both*
-shape builders (`resolveVMShape` and the placement-fallback `resolveVMShapeWithAlternates`), so the
-fallback path is gated identically. On violation, `enforce` returns a non-retriable cloud error naming
-the deficit (a configuration error, not a transient — it is never classified retriable, so the Director
-does not re-drive a deploy that can only fail again), while `warn` logs the deficit and proceeds. The
-check is skipped entirely when no dedicated ephemeral disk is requested (the agent then carves
-ephemeral space from the grown root disk, unchanged). With the ratio at `0` the create_vm path is
-byte-identical to prior releases.
+**Shipped.** `create_vm` gained an opt-in `pve.ephemeral_disk_min_ratio` (float, default `0` → no check,
+byte-identical) with a companion `pve.ephemeral_disk_min_mode` (`enforce` default | `warn`), mirroring
+the §7.26 `disk_perf_invariant_mode` pattern. When the ratio is set and a *dedicated* ephemeral disk is
+being provisioned (`ephemeral_disk_size_mb` > 0), `resolveEphemeralShape`'s resolved ephemeral GiB is
+checked against the VM's configured RAM as `ephemeral_GiB >= ratio × (memory_MiB / 1024)` — both sides
+in binary GiB so the comparison is unit-consistent with the agent's own swap-plus-`/var/vcap/data`
+layout, with a `1e-9` epsilon so an exact-boundary disk is never falsely rejected by floating-point
+drift. The check is wired into *both* shape builders (`resolveVMShape` and the placement-fallback
+`resolveVMShapeWithAlternates`), so the fallback path is gated identically. On violation, `enforce`
+returns a non-retriable cloud error naming the deficit (a configuration error, not a transient — it is
+never classified retriable, so the director does not re-drive a deploy that can only fail again), while
+`warn` logs the deficit and proceeds. The check is skipped entirely when no dedicated ephemeral disk is
+requested (the agent then carves ephemeral space from the grown root disk, unchanged). With the ratio at
+`0` the create_vm path is byte-identical to prior releases.
 
 #### 7.41 DONE — Secret redaction over the dispatcher request/response log path
 
-*References: AWS, Google.* AWS clones-and-redacts instance params and spot specs (`user_data`, access
-keys) before logging (`instance_manager.rb:36-41`, `spot_manager.rb:28`). Google wraps every
-request/response/error byte stream in `redactor.RedactSecrets` before debug logging at the dispatch
-boundary (`api/dispatcher/json.go:70,112,142,161,180`). Both treat the CPI's own structured logs as an
-untrusted sink for agent settings and credentials.
+*References: AWS, Azure, Google; contrast OpenStack-Go, Alicloud.* Redaction maturity in the reference set is
+bimodal, and it tracks team origin rather than language. The hyperscaler-maintained CPIs scrub: AWS
+clones and redacts instance params and spot specs (`user_data`, access keys) before logging through
+`Bosh::Cpi::Redactor` (`instance_manager.rb:36-41`, `spot_manager.rb:28`); Azure walks the argument
+tree against a `CREDENTIAL_KEYWORD_LIST` and suppresses `/listKeys` responses outright; Google wraps
+every request, response, and error byte stream in `redactor.RedactSecrets` — a regex over
+`account_key`, `json_key`, `password`, and `private_key` — before debug logging at the dispatch boundary
+(`api/dispatcher/json.go:70,112,142,161,180`). The two community Go ports redact **nothing**:
+OpenStack-Go has no redaction primitive anywhere, and Alicloud logs `AccessKeySecret` and the mbus
+password verbatim. PVE's 7.41 places it firmly in the mature tier with AWS, Azure, and Google rather
+than with the community ports.
 
-The PVE CPI handles the same sensitive payloads — `create_vm` receives the agent env (an mbus URL with
-embedded NATS credentials, blobstore secrets, a registry endpoint), and the configdrive/cloud-init
-user-data is assembled from it. Today the dispatcher logs only `method`, `request_id`, and
-`duration_ms` (`dispatcher.go`), not the argument tree, so nothing leaks at the default level — but
-there is **no redaction primitive anywhere in the `log`/dispatcher layer**. The CPI is therefore one
-debug-level `log` statement (or one well-meaning "log the request to triage a stuck deploy" change)
-away from writing the mbus password and blobstore credentials to a log BOSH ships to syslog and the
-director's debug bundle. This is a latent hazard, not a live leak — which is exactly when a cheap
-guardrail is worth adding ahead of need.
+The PVE CPI handles the same sensitive payloads. `create_vm` receives the agent env (an mbus URL with
+embedded NATS credentials, blobstore secrets, and a registry endpoint), and the configdrive/cloud-init
+user-data is assembled from it. Today the dispatcher logs only `method`, `request_id`, and `duration_ms`
+(`dispatcher.go`), not the argument tree, so nothing leaks at the default level — but there is **no
+redaction primitive anywhere in the `log`/dispatcher layer**. The CPI is therefore one debug-level `log`
+statement (or one well-meaning "log the request to triage a stuck deploy" change) away from writing the
+mbus password and blobstore credentials to a log BOSH ships to syslog and the director's debug bundle.
+This is a latent hazard, not a live leak — which is exactly when a cheap guardrail is worth adding ahead
+of need.
 
-**Build:** add a structured redaction helper in the `log` package and call it at the dispatcher
-boundary for any request/response payload logging, gated by an opt-in `pve.redact_logs` (default off →
-byte-identical; recommend on). The scrubber masks known-sensitive keys/paths in the CPI argument tree
-— `mbus`, `blobstore.options.secret_access_key`/`password`, `registry` credentials, and any
+**Build:** add a structured redaction helper in the `log` package and call it at the dispatcher boundary
+for any request/response payload logging, gated by an opt-in `pve.redact_logs` (default off →
+byte-identical; recommend on). The scrubber masks known-sensitive keys and paths in the CPI argument
+tree — `mbus`, `blobstore.options.secret_access_key`/`password`, `registry` credentials, and any
 `env`/`agent` settings blob — replacing values with `<redacted>` while preserving structure. No PVE
 primitive is required; this is pure log hygiene. Validate-only-when-set, omit from the ERB when empty.
 
@@ -1813,27 +2037,319 @@ goes on to use is untouched). A key is sensitive by case-insensitive substring m
 `secret`, `token`, `credential`, `mbus`, `private_key`, `access_key`, `api_key`, `authorization` —
 catching prefixed variants such as `nats_password` and `client_secret`) or by exact match on
 `user`/`username` (exact, so the diagnostic `user_data`/`user_agent` keys are not collateral-masked).
-String values are additionally URL-scrubbed: credentials in a `scheme://user:pass@host` userinfo
-segment **and** in a sensitive query parameter (`?password=`, `?access_token=` — the query vocabulary
-is built from the same fragment list) are masked, including when the URL is whitespace-prefixed or
-embedded mid-string. `RedactSecrets` is idempotent. The dispatcher (`internal/cpi/dispatcher.go`) gains
-a `WithRequestTrace(bool)` option and, when enabled, emits a debug-level `cpi request` record (the
+String values are additionally URL-scrubbed: credentials in a `scheme://user:pass@host` userinfo segment
+**and** in a sensitive query parameter (`?password=`, `?access_token=` — the query vocabulary is built
+from the same fragment list) are masked, including when the URL is whitespace-prefixed or embedded
+mid-string. `RedactSecrets` is idempotent. The dispatcher (`internal/cpi/dispatcher.go`) gains a
+`WithRequestTrace(bool)` option and, when enabled, emits a debug-level `cpi request` record (the
 redacted argument tree, before the handler runs) and a `cpi response` record (the redacted result,
 round-tripped through JSON so a typed struct normalizes to the same tree shape) — a malformed argument
-or unserializable result logs an opaque placeholder, never raw bytes. The dispatcher takes a plain
-bool, so the `log` package does not import `config` and the dispatcher gains no config dependency:
+or unserializable result logs an opaque placeholder, never raw bytes. The dispatcher takes a plain bool,
+so the `log` package does not import `config` and the dispatcher gains no config dependency:
 `cmd/cpi/main.go` translates the opt-in `pve.redact_logs` (pointer-typed `*bool`, default off) into
 `WithRequestTrace`. With the knob off, both trace helpers early-return before any allocation — logging
 is byte-identical to prior releases. Emitted from the ERB only when explicitly true.
+
+### Newly identified gaps (2026-06-05 round)
+
+These fifteen entries record capabilities the reference CPIs ship and PVE does not, drawn
+from a fresh six-CPI survey. Each is OPEN: a candidate for future work, not a commitment.
+The order follows descending PVE relevance, and each carries a one-line tier hint.
+
+#### 7.42 OPEN — Human-readable VM naming
+
+*References: vSphere, OpenStack-Go, Ruby-OpenStack.* The vSphere CPI offers an opt-in
+`enable_human_readable_name` that derives a VM name from the BOSH environment — instance
+group, deployment, and a UUID suffix, trimmed to a length limit and proportionally
+truncated, falling back to the bare UUID when metadata is absent or non-ASCII. On a PVE
+cluster the VM identity is a numeric VMID, and the operator-facing `name` field is purely
+cosmetic, so a BOSH-managed lab shows rows of indistinguishable VMIDs in the web UI.
+Setting a descriptive `name` makes the inventory legible without changing how the CPI
+addresses the VM.
+
+**Build:** read the job and deployment from the `set_vm_metadata` environment (the CPI
+already receives these) and write the QEMU `name` field through the standard config
+endpoint — `pvesh set /nodes/{node}/qemu/{vmid}/config` with `name=`. Compose the name as
+`{instance_group}-{deployment}-{short-vmid}` and sanitize it to the PVE-permitted character
+set. Gate the whole feature behind an opt-in flag so existing deployments stay
+byte-identical.
+
+**Limits.** PVE's `name` field is a DNS-style label with a restricted character set and
+length; non-conforming names must be sanitized or the call rejects them. The name is
+display-only and carries no addressing semantics, so it must never feed lookup or
+correlation logic. Tier: operability.
+
+#### 7.43 OPEN — Capability-based VM sizing (`vm_resources` / `calculate_vm_cloud_properties`)
+
+*References: AWS, Azure, OpenStack-Go, Google, Alicloud.* Five of the six reference CPIs
+implement `calculate_vm_cloud_properties`, the BOSH surface that turns an abstract
+`{cpu, ram, ephemeral_disk_size}` request into a concrete machine specification. The AWS
+mapper walks a static ordered table of roughly twenty-three instance types and returns the
+first that satisfies the request (`lib/cloud/aws/instance_type_mapper.rb:4-46`,
+`lib/cloud/aws/cloud_v1.rb:419-434`); Azure queries the live Resource SKU API, caches the
+result on disk for twenty-four hours, and selects the smallest satisfying size scored by
+series and generation (`lib/cloud/azure/vms/instance_type_mapper.rb:23-61`). This is the
+single universal feature PVE lacks: BOSH operators can express sizing in portable terms
+everywhere except here, where they must hand-author a `vm_type` per workload.
+
+**Build:** implement `calculate_vm_cloud_properties` by reading per-node capacity from
+`GET /nodes/{node}/status` (cores and memory) and producing a `cloud_properties` block with
+explicit `cpu`, `memory`, and ephemeral disk values that satisfy the requested minimum. A
+static tier table (small, medium, large) keyed off the request, resolved through the §7.8
+layered cloud-property resolver, is the lower-risk first cut; a live capacity query is the
+richer variant.
+
+**Limits.** PVE has no fixed instance-type catalog, so the CPI must synthesize the mapping
+rather than look it up. A live capacity query races against cluster scheduling and is best
+treated as advisory, not a reservation. Tier: operability.
+
+#### 7.44 OPEN — Concurrency-safe metadata and notes writes
+
+*References: Google.* The Google CPI guards every metadata and label mutation with a
+fingerprint read immediately before the write: GCE rejects the write with a 409 if a
+concurrent change moved the fingerprint, and the CPI surfaces that as a retriable failure
+rather than silently overwriting (`metadata_client.go:147`). PVE offers no such
+compare-and-swap. The CPI writes VM tags and a notes-JSON blob (provenance under §7.13,
+metadata under `set_vm_metadata`); two processes that read, modify, and write the same notes
+field concurrently will lose one of the two updates. This is a genuine data-loss race, and
+it also closes the concurrency dimension catalogued in §9.
+
+**Build:** serialize notes and tag mutations per VM. Read the current notes immediately
+before writing, merge the new keys into the parsed JSON, and write the merged result under a
+per-VM mutex; on a multi-process worker pool, back that mutex with the cross-process cluster
+lock already shipped in §7.36 (pmxcfs-backed), keyed by VMID. PVE serializes tasks per VMID,
+which narrows but does not close the read-modify-write window, so the explicit
+read-before-write merge is still required.
+
+**Limits.** PVE's task model gives no fingerprint or CAS token, so the guarantee is only as
+strong as the CPI's own locking discipline; a write that bypasses the merge path still
+clobbers. Tier: correctness.
+
+#### 7.45 OPEN — Generic allowlisted VM config passthrough
+
+*References: vSphere.* The vSphere CPI merges a global and per-`vm_type` `vmx_options` hash
+into the VM's extra-config, letting operators inject arbitrary low-level settings — for
+example `disk.enableUUID=1` for consistent volume UUIDs under multiple SCSI controllers —
+without a bespoke CPI change. PVE exposes comparable knobs (machine type, BIOS/firmware,
+NUMA topology, raw `args`), but no current path lets an operator set them per VM type.
+
+**Build:** add a `pve_config` (or equivalently named) map to `vm_type` cloud_properties and,
+at `create_vm`, apply each key through `pvesh set /nodes/{node}/qemu/{vmid}/config`.
+Constrain the accepted keys to a safe allowlist — `machine`, `bios`, `numa`, and a vetted
+subset of `args` — to keep the escape hatch from becoming a foot-gun.
+
+**Limits.** A passthrough surface is only as safe as its allowlist; an over-broad list lets
+operators write configurations the CPI cannot reason about or roll back. Raw `args` in
+particular can break migration and snapshot assumptions. Tier: deployment.
+
+#### 7.46 OPEN — CPU and RAM hotplug capability flag
+
+*References: vSphere.* The vSphere CPI wires `cpu_hot_add_enabled` and
+`memory_hot_add_enabled` from `vm_type` into the create-time config, allowing online CPU and
+memory increases without a reboot. PVE QEMU supports the same through `-hotplug cpu,memory`,
+but the CPI never sets it, so scaling a CF VM up requires a stop-and-restart.
+
+**Build:** add `cpu_hotplug` and `memory_hotplug` booleans to `vm_type` cloud_properties and,
+at `create_vm`, pass `hotplug=cpu,memory` (or the requested subset) through the standard VM
+config endpoint. No new PVE API is needed; the existing config path carries the field.
+
+**Limits.** Hotplug is a guest-cooperative operation: the guest kernel must support memory
+and CPU hot-add and online the new resources, and not every stemcell does. The flag enables
+the capability; it does not itself perform a resize. Tier: deployment.
+
+#### 7.47 OPEN — PCI passthrough and vGPU as cloud_properties
+
+*References: vSphere.* The vSphere CPI accepts `vgpus`, `pci_passthroughs`, and
+`device_groups` in `vm_type`, then iterates healthy hosts to find one carrying the requested
+device — preferring the placed host — and configures the passthrough devices after the
+clone. PVE supports PCI passthrough (`qm set {vmid} -hostpci0 {pci_id}`) and NVIDIA vGPU on
+GRID-capable cards, and publishes per-node device inventories at
+`/nodes/{node}/hardware/pci`, but the CPI exposes none of this, so GPU and accelerator
+workloads cannot be expressed in a manifest.
+
+**Build:** add `pci_passthroughs: [{address: '0000:01:00.0'}]` to `vm_type`
+cloud_properties. During placement, filter candidate nodes to those advertising the
+requested device via `/nodes/{node}/hardware/pci`; at `create_vm`, configure `hostpci0..N`
+through `pvesh set`, honoring IOMMU group constraints.
+
+**Limits.** IOMMU grouping on PVE is complex: a passed-through device may drag its whole
+group, and group membership varies by hardware and BIOS, which makes reliable node filtering
+harder than on vSphere. A passed-through device also pins the VM to a node and blocks live
+migration. Tier: deployment.
+
+#### 7.48 OPEN — Multi-reference stemcell deduplication
+
+*References: Azure.* The Azure CPI lets multiple BOSH stemcell CIDs share one gallery image
+version: a `stemcell_references` CSV tag tracks every CID, `create_stemcell` updates the tag
+rather than re-uploading when the SHA256 matches, and `delete_stemcell` removes only the one
+reference, destroying the image only when the count reaches zero
+(`lib/cloud/azure/stemcell/compute_gallery_manager.rb:76-111`, `129-138`, `171-188`). PVE
+already replicates a template per node (§7.2) but creates a second template when the same
+image is uploaded under a different CID, wasting disk.
+
+**Build:** extend the template notes-JSON of §7.13 with a `stemcell_references` CSV. On
+`create_stemcell`, if the computed SHA256 matches an existing template, append the new CID to
+the list instead of cloning a new template; on `delete_stemcell`, remove the CID and destroy
+the template only when the list is empty. The read-modify-write of that CSV must use the
+concurrency-safe path of §7.44.
+
+**Limits.** Reference counting introduces a shared mutable field across CPI processes, so it
+depends squarely on the §7.44 locking work to avoid a lost decrement that strands or
+prematurely deletes a template. Tier: operability.
+
+#### 7.49 OPEN — Disk-encryption config surface
+
+*References: AWS, Azure, Alicloud.* Three reference clouds expose at-rest encryption as a
+config surface: AWS sets cluster-wide `encrypted` and `kms_key_arn` defaults that stemcell,
+persistent-disk, and ephemeral-disk cloud_properties each override
+(`lib/cloud/aws/cloud_v1.rb` config path); Azure offers disk-encryption sets with BYOK; and
+Alicloud reads `Encrypted` as a `*bool` that inherits from a global flag. PVE has no
+encryption surface at all, which blocks compliance-driven deployments.
+
+**Build:** add a global `encrypted: true` plus per-disk `*bool` inheritance (per-disk
+overrides global, which overrides off). Map an encryption request to an operator-preconfigured
+encrypted storage pool — a ZFS dataset with native encryption or LUKS over LVM-thin —
+selected through the §7.8 storage-tier resolver. The CPI selects the pool; it does not manage
+keys.
+
+**Limits.** Encryption on PVE is a backend-storage property, not a per-volume API toggle, so
+the work reduces to pool selection and presupposes the operator has built encrypted pools and
+manages their keys outside the CPI. This overlaps the "not recommended" entry below; it is
+listed here as the bounded, delegation-style form that is defensible. Tier: deployment.
+
+#### 7.50 OPEN — Stemcell creation from URL with checksum
+
+*References: Google.* The Google CPI accepts a `source_url` plus `raw_disk_sha1` in
+`create_stemcell` and hands both to the image-import API for server-side integrity
+verification, with no local download. PVE 7.2 and later expose a download-URL storage API
+that does the same: it streams an image directly into a pool and reports a checksum.
+Publishing stemcells as HTTP artifacts rather than transferring tarballs through BOSH cuts
+create-env time on slow links.
+
+**Build:** detect a `source_url` in `create_stemcell` cloud_properties and call
+`pvesh POST /nodes/{node}/storage/{pool}/download-url` to stream the image into storage.
+Verify the SHA256 reported in the task output against the supplied checksum, failing the call
+on mismatch, and return the storage volid as the stemcell CID.
+
+**Limits.** The URL must be reachable from the PVE node, not merely from the director or the
+CPI host, which is a different network position. The download-URL API requires PVE 7.2 or
+later, so the path must fall back to the existing upload flow on older clusters. Tier:
+deployment.
+
+#### 7.51 OPEN — Per-operation timing metrics
+
+*References: Azure.* The Azure CPI ships opt-in telemetry: it forks a background process that
+reports each operation's duration and success or failure to the platform fabric. No other
+reference emits metrics, and PVE emits none, so operators have no service-level-indicator
+data on CPI operations and the observability dimension in §9 stays partly open.
+
+**Build:** wrap the dispatcher boundary — the same seam that already carries `request_id` and
+the redacted trace (§7.41) — to record wall-clock duration and outcome per RPC. Write
+the samples to a metrics file or a Prometheus pushgateway, gated behind an opt-in flag so the
+default path allocates nothing.
+
+**Limits.** PVE offers no fabric telemetry endpoint analogous to Azure's wireserver, so the
+sink must be operator-provided. A single-shot per-RPC process cannot aggregate; it can only
+emit one sample per invocation, leaving rollup to the collector. Tier: hardening.
+
+#### 7.52 OPEN — Configurable User-Agent and operator tag on PVE API calls
+
+*References: Google, Azure.* Google prepends a configurable `user_agent_prefix` to its
+`bosh-google-cpi/<version>` User-Agent for billing attribution and log filtering; Azure
+injects a fixed-by-default, operator-overridable ISV tracking GUID into every request's
+User-Agent (`BOSH-AZURE-CPI/<version> pid-<guid>`). PVE API calls from this CPI carry no
+distinguishing User-Agent, so operators cannot attribute API load or throttling to BOSH in
+PVE access logs.
+
+**Build:** set a `BOSH-PVE-CPI/<version>` User-Agent header on the pve-apiclient-go HTTP
+client through its transport wrapper, and add an optional `operator_id` config key appended to
+the header for per-operator attribution.
+
+**Limits.** PVE does not bill on API usage as the public clouds do, so the value is confined
+to audit, throttle attribution, and log filtering rather than cost accounting. Tier:
+hardening.
+
+#### 7.53 OPEN — Resource-ownership tagging
+
+*References: vSphere.* On `create_stemcell` the vSphere CPI registers a vCenter extension and
+sets `config.managed_by` on every CPI-created VM and template, so vCenter's Solution Manager
+groups all BOSH-managed resources under one owner. PVE mixes BOSH VMs and templates with
+user-created guests in the same node view, with no managed-by marker; §7.13 tags templates
+for provenance but VMs carry no general ownership signal.
+
+**Build:** tag every CPI-created VM and template with a fixed `bosh-cpi` (or
+`managed-by:bosh`) tag at create time, using PVE's native VM tags via
+`pvesh set /nodes/{node}/qemu/{vmid}/config tags=...`. Operators can then filter the UI and
+scope orphan GC by querying that tag, with no new API and a clean generalization of the §7.13
+template tagging.
+
+**Limits.** PVE tags are flat free-text labels, not a structured ownership object, so the tag
+is a convention the CPI must apply consistently rather than an enforced relationship, so a
+manually retagged VM silently breaks it. Tier: operability.
+
+#### 7.54 OPEN — Per-disk retain-on-delete (forensic ephemeral)
+
+*References: Alicloud.* The Alicloud CPI reads `delete_with_instance` as a `*bool` on
+ephemeral disks: when false, the disk survives the instance's deletion. PVE deletes every
+attached disk with the VM, so an operator who wants to preserve an ephemeral disk for
+post-mortem analysis after a failed VM has no in-band option. This complements the
+`debug.keep_failed_vms` capability of §7.20.
+
+**Build:** add a `retain_on_delete` (or `delete_with_instance: false`) `*bool` per disk. On
+`delete_vm`, detach the flagged disks before destroying the VM and leave them as unattached
+volumes in their storage pool, recording their volids so a later sweep can reclaim them.
+
+**Limits.** Retained volumes accumulate silently and become orphans unless an operator or a
+GC pass reclaims them, so the feature trades storage leakage for forensic value and needs a
+clear retention policy. Tier: deployment.
+
+#### 7.55 OPEN — Router and NAT VM support
+
+*References: AWS, Google.* The AWS CPI supports `source_dest_check: false`, which lets a VM
+forward packets not addressed to it (NAT gateways, router VMs), and `advertised_routes`, a
+list of `{table_id, destination}` pairs that the CPI upserts into route tables pointing at
+the new instance so the routing tier owns its routes declaratively. PVE has no CPI-layer
+equivalent, so routing and NAT VMs require manual configuration.
+
+**Build:** add `ip_forwarding: true`, applied post-create by updating the NIC config (for
+example clearing per-NIC firewall constraints that would drop forwarded traffic), and an
+`advertised_routes: [{vnet, destination}]` list applied through the OVN SDN — either
+`pvesh POST /cluster/sdn/vnets/{vnet}/subnets` or a direct OVN `nbctl` logical-router static
+route. The guest-OS portion of forwarding is lighter than on AWS because the Linux guest
+controls `ip_forward` itself; the CPI's role is to assist the fabric side.
+
+**Limits.** Advertised routes require an OVN SDN and SDN write permission, and PVE SDN is
+eventually consistent with an explicit apply step, so a freshly written route is not
+immediately live — the eventual-consistency caveat of the SDN work applies. Routing within
+the guest still lives in the guest OS. Tier: deployment.
+
+#### 7.56 OPEN — Per-VM `*bool` override pattern and operator retry budget
+
+*References: OpenStack-Go, AWS.* The OpenStack-Go CPI threads `*bool` cloud_properties through
+a consistent inherit-from-global-then-default chain (a nil pointer falls back to the global,
+which falls back to a hardcoded default), and the public clouds expose retry budgets as config
+— AWS requires `aws.max_retries` at validation time. PVE's retry behavior (§7.25) is partly
+in place but its budget is not operator-tunable, and the `*bool` inheritance pattern, while
+used in spots, is not stated as a uniform convention.
+
+**Build:** document and apply a single `*bool` inheritance rule across optional knobs —
+per-call overrides per-disk, which overrides `vm_type`, which overrides global, which defaults
+off — so new optional flags behave predictably and stay byte-identical when unset. Expose a
+`retry_config` block (attempt counts and backoff bounds) that the existing transient-retry and
+lock-retry paths read, defaulting to the current hardcoded values.
+
+**Limits.** A tunable retry budget can mask a persistent fault as a transient one if set too
+high, lengthening failure detection; the defaults must remain the shipped values so existing
+deployments are unaffected. Tier: hardening.
 
 ### Explicitly not recommended as core CPI work
 
 | Item | Demonstrated by | Why not |
 |------|-----------------|---------|
-| Per-disk / per-image encryption toggle | AWS, Azure, Alicloud | At-rest encryption is a PVE storage-backend property (ZFS/LUKS/Ceph), not a per-volume API. Select it via §7.8 (point a vm_type at an encrypted storage), mirroring OpenStack/Google delegation. |
-| Spot / preemptible / capacity-reservation | AWS, Google, Azure, Alicloud | Cloud-economic constructs with no PVE primitive. |
+| Per-disk / per-image encryption toggle | AWS, Azure, Alicloud | At-rest encryption is a PVE storage-backend property (ZFS/LUKS/Ceph), not a per-volume API. Select it via §7.8 (point a vm_type at an encrypted storage), mirroring OpenStack/Google delegation. The bounded, delegation-style form is tracked as §7.49. |
+| Spot / preemptible / capacity-reservation | AWS, Google, Azure, Alicloud | Cloud-economic constructs with no PVE primitive. AWS exposes `spot_bid_price` with `spot_ondemand_fallback` and an `AbruptlyTerminated` retry loop for mid-flight preemption; Google and Alicloud offer comparable preemptible types. PVE has no spot market and no eviction mechanism: HA priority levels are the nearest analogue, but actual eviction would require a separate watchdog or reaper job that no PVE primitive provides. The only portable fragment — an on-failure fallback retry loop — is already covered by post-selection fallback (§7.31), so the distinctive spot value cannot be delivered on PVE. |
 | Floating / elastic IP as a standalone primitive | AWS, OpenStack, Azure, Alicloud | No PVE elastic-IP primitive. Deliver the value via §7.14 (self-hosted VRRP VIP) and §7.19 (external hook). |
-| Routes / advertised-routes / `source_dest_check` | AWS, Google | Routing lives in the guest OS, the SDN zone (EVPN/OSPF via frr), or the fabric — not a CPI-layer route table. |
+| Routes / advertised-routes / `source_dest_check` | AWS, Google | Routing lives in the guest OS, the SDN zone (EVPN/OSPF via frr), or the fabric — not a CPI-layer route table. The bounded SDN-assist form is tracked as §7.55. |
 | Multi-region / cross-cluster stemcell manifest | AWS, Alicloud, Azure | A CPI instance targets one PVE cluster; "region" has no PVE primitive. The in-cluster analogue is §7.2. |
 | CPI-driven live-migration / rebalance loop | vSphere | Delegated to PVE DLB/CRS; a CPI is a stateless per-call process with no daemon for a control loop. |
 | `ClientToken` idempotency keys | Alicloud | VMID allocate-with-retry already gives create-once semantics on PVE's reservation model. |
@@ -1843,101 +2359,193 @@ is byte-identical to prior releases. Emitted from the ERB only when explicitly t
 ## 8. Cross-CPI Engineering Lessons
 
 These are the transferable principles behind the specific gaps — the "why," distilled from
-reading six mature CPIs against this one. They are worth keeping in view independent of any
-single feature.
+reading six mature CPIs against this one.
 
-- **Enforce creation-time invariants; do not merely record them.** Azure rejects a
-  caching-mode mutation outright. PVE records disk-performance attributes in the CID (§7.9)
-  but no path rejects drift on re-attach (§7.26). Metadata is only as good as the code that
-  checks it.
+- **A cross-process lock is required exactly when the platform exposes non-atomic shared
+  config — and PVE is in that camp.** vSphere locks DRS rule mutation through vCenter's
+  `CustomFieldsManager`, using `create`-raises-`DuplicateName` as an atomic compare-and-swap
+  (`drs_rules/drs_lock.rb:30-57`); Azure takes OS `flock` on named files under `/tmp/azure_cpi/`
+  for availability-set and gallery-image writes (`utils/helpers.rb:130-138,564-575`). The four
+  public-cloud CPIs lock nothing: AWS, Google (`metadata_client.go:147`), OpenStack-Go
+  (`loadbalancer_service.go:101`), and Alicloud lean on provider-atomic creates, fingerprint
+  CAS, or idempotency tokens. PVE's pmxcfs-replicated HA rules are non-atomic shared config, so
+  it resembles vSphere and Azure, not AWS. Its shipped cluster mutex (§7.36) is the correct
+  response; do not cargo-cult the lock-free cloud CPIs.
+
+- **Idempotency has two correct responses to a collision, and the platform-provided tier is one
+  PVE must supply itself.** Regenerate identity when the collision means "taken" (Alicloud's
+  token, PVE's VMID); retry the same identity when it means "in flight" (AWS and Azure tokens).
+  Pick by meaning, and state the rule (§7.33) — the wrong choice either loops forever or
+  duplicates the resource. Note also what PVE does not get for free: server-side dedup through
+  `ClientToken` (Alicloud, AWS, Azure), fingerprint CAS (Google), or a 409-already-exists check
+  (OpenStack-Go LB) all live in the platform. The PVE API offers none, so the CPI must
+  self-implement idempotency through CID checks and pre-flight status queries (§7.33).
+
+- **Capability-based sizing is the one universal feature PVE still lacks.** Five of six
+  references map abstract `cpu`/`ram` to a concrete instance through
+  `calculate_vm_cloud_properties`: AWS's static `InstanceTypeMapper` table, Azure's live SKU
+  query with a 24-hour on-disk cache, OpenStack-Go's flavor mapper, Google's custom-machine-type
+  URL builder, and Alicloud's mapper (vSphere alone has no equivalent). Abstract `vm_resources`
+  is a BOSH-native input; not supporting it forces operators to hand-map node specs to PVE
+  config. This is the strongest net-new candidate the comparison surfaces (§7.43).
 
 - **Error classification is a control signal, not telemetry.** AWS's
   `VMCreationFailed.new(retryable)` and its two spot-failure classes (bidding → fall back,
-  instance → retry) *drive* the fallback decision. PVE's §7.23 classifier should likewise
-  gate post-selection fallback (§7.31), not just tag the error. The retriable bit is an
-  instruction to the director, so its boundary is a correctness concern (§7.11).
+  instance → retry) *drive* the fallback decision. PVE's §7.23 classifier should likewise gate
+  post-selection fallback (§7.31), not just tag the error. The retriable bit is an instruction to
+  the director, so its boundary is a correctness concern (§7.11).
 
-- **Idempotency has two correct responses to a collision.** Regenerate identity when the
-  collision means "taken" (Alicloud's token, PVE's VMID); retry the same identity when it
-  means "in flight" (AWS/Azure tokens). Pick by meaning, and state the rule (§7.33) — the
-  wrong choice either loops forever or duplicates the resource.
+- **Enforce creation-time invariants; do not merely record them.** Azure rejects a caching-mode
+  mutation outright. PVE records disk-performance attributes in the CID (§7.9) but no path
+  rejects drift on re-attach (§7.26). Metadata is only as good as the code that checks it.
 
 - **Verify before commit beats verify after commit when the platform allows it.** Google
-  validates the image SHA server-side before the import writes it; PVE computes the hash
-  *after* import (§7.6), so a deterministically corrupt download re-verifies to the same bad
-  hash and enters the dedup cache. The same logic motivates boot-path agent integrity
-  (§7.29).
+  validates the image SHA server-side before the import writes it; PVE computes the hash *after*
+  import (§7.6), so a deterministically corrupt download re-verifies to the same bad hash and
+  enters the dedup cache. The same logic motivates boot-path agent integrity (§7.29).
 
-- **Progress-aware polling beats fixed backoff for long platform operations.** vSphere's
-  ETA-proportional interval and Alicloud's per-operation retry budgets adapt to the specific
-  operation; fixed curves (§7.25) pay a polling-storm tax exactly when load is highest
-  (§7.28).
+- **A config schema is the antidote to dead-field drift.** OpenStack-Go parses six fields it
+  never reads (ConnectionOptions, DefaultVolumeType, WaitResourcePollInterval, EphemeralDisk,
+  SchedulerHints, UseNovaNetworking), and Alicloud's surface is sparse by design; both lack a
+  declarative schema. vSphere's Membrane DSL and PVE's opt-in strict validation (§7.17) close
+  that gap — PVE's unknown-key rejection is in fact stricter than every reference, none of which
+  rejects unknown keys. The drift is the cost of validating imperatively and partially.
+
+- **Secret redaction maturity tracks team origin, not language.** The hyperscaler-maintained
+  CPIs scrub: AWS's `Bosh::Cpi::Redactor`, Azure's recursive `CREDENTIAL_KEYWORD_LIST` walk, and
+  Google's `RedactSecrets` regex. The two community Go ports scrub nothing — OpenStack-Go has no
+  redaction anywhere, and Alicloud logs its `AccessKeySecret` and mbus password verbatim. PVE's
+  §7.41 scrubbing (userinfo, presigned URLs, signature parameters) is table-stakes for a
+  production CPI, not gold-plating.
 
 - **Delegate to the platform — validate, don't orchestrate.** Azure's Compute Gallery
   replication is platform-automatic; the CPI only checks that replicas exist. PVE's §7.2
   correctly *uses* replicas opportunistically rather than driving replication itself, and DLB
-  (CRS) is delegated to PVE entirely. Do not reimplement what the platform already does; gate
-  on its result.
+  (CRS) is delegated to PVE entirely. Do not reimplement what the platform already does; gate on
+  its result.
+
+- **Progress-aware polling beats fixed backoff for long platform operations.** vSphere's
+  ETA-proportional interval and Alicloud's per-operation retry budgets adapt to the specific
+  operation; fixed curves (§7.25) pay a polling-storm tax exactly when load is highest (§7.28).
+
+- **Per-call re-authentication is the price of stateless purity — pay it deliberately.**
+  OpenStack-Go re-authenticates to Keystone on every service build, costing four or more
+  round-trips per `create_vm`. The pattern keeps each call self-contained but taxes latency under
+  load. PVE's transport tuning and ticket reuse (§7.30) is the better default: keep the connection
+  warm rather than re-prove identity per operation.
 
 - **Hooks-vs-hardcoding is a real tradeoff, and on-prem favors hooks.** AWS bakes ELB/ALB
-  registration into `create_vm` (fewer failure modes, but create-only, no deregister). PVE
-  made LB integration a post-hook with a rollback contract (§7.19) — more failure surface,
-  but the right call when the load balancer is an operator-chosen HAProxy/keepalived rather
-  than a managed cloud primitive.
+  registration into `create_vm` (fewer failure modes, but create-only, no deregister). PVE made
+  LB integration a post-hook with a rollback contract (§7.19) — more failure surface, but the
+  right call when the load balancer is an operator-chosen HAProxy/keepalived rather than a managed
+  cloud primitive.
 
-- **The wedged-wait hazard has two complementary fixes; keep both.** Bound the wait (the
-  §7.15 timeout envelope) and skip the wait (the §7.32 fast-path delete) cover different
-  operations against the same queue-slot incident class. One is not a substitute for the
-  other.
+- **The wedged-wait hazard has two complementary fixes; keep both.** Bound the wait (the §7.15
+  timeout envelope) and skip the wait (the §7.32 fast-path delete) cover different operations
+  against the same queue-slot incident class. One is not a substitute for the other.
 
 - **A coarse global bound is worth less than a per-class one.** OpenStack-Go uses a single
-  `state_timeout`; PVE's per-method-class envelope (create 30m / delete 15m / has-get 2m,
-  §7.15) is the more useful granularity — a strength to preserve, not flatten.
+  `state_timeout`; PVE's per-method-class envelope (create 30m / delete 15m / has-get 2m, §7.15)
+  is the more useful granularity — a strength to preserve, not flatten.
 
-## 9. Dimensions Still Under-Compared (what this analysis is missing)
+## 9. Cross-Cutting Dimensions
 
-The report is exhaustive on the *capability/feature* axis — every CPI method and every standout
-feature has been mapped. It is thin on several cross-cutting dimensions that determine whether the
-shipped gaps actually hold up under load. These are the honest blind spots of the current analysis,
-recorded so the next round can close them.
+The matrices above map every CPI method and standout feature. This section compares the seven CPIs along the cross-cutting dimensions that decide whether the shipped gaps hold up under load: concurrency safety, observability, test discipline, configuration validation, failure-mode coverage, and the performance envelope. Each subsection states the framing, gives a comparison table with a "PVE (this codebase)" row, and draws the one insight the data supports.
 
-- **Cross-process concurrency and cluster-config safety.** The feature-by-feature framing missed
-  two distinct multi-process races (§7.36 HA-rule read-modify-write, §7.37 racing template clone)
-  because they are not features — they are emergent properties of running N director-spawned CPI
-  processes against one pmxcfs-replicated cluster. Five of the six references ship an explicit
-  cross-process lock (vCenter custom-field, Azure `flock`); the report scatters the concern across
-  §7.16/§7.21/§7.35 instead of walking every cluster-wide mutable resource (HA rules, anti-affinity
-  rules, node-affinity pins, replica templates, VMID allocation, SDN config) and asking "what happens
-  when two CPI processes touch this at once?" A dedicated concurrency-model subsection is the missing
-  artifact.
+### 9.1 Cross-process concurrency and cluster-config safety
 
-- **Observability and operability.** There is no observability column in the matrix. The references
-  uniformly carry request-ID correlation, secret-redaction at the log boundary (AWS, Google),
-  telemetry emission (Azure), and structured retry-audit logs, yet the report never compares what
-  each CPI logs at `create_vm`, how it redacts agent credentials, whether it emits metrics, or how an
-  operator debugs a stuck deploy. The §7.41 redaction gap fell straight out of this blind spot.
+A BOSH director spawns many CPI processes concurrently, and several of them touch the same cluster-wide mutable state. The question is whether each platform forces the CPI to hold an explicit lock, or whether the platform's API makes the mutation atomic. The pattern is sharp: an explicit cross-process lock is required exactly when the platform exposes a non-atomic shared-config surface, and is unnecessary when the platform offers atomic create, compare-and-swap, or an idempotency token.
 
-- **Config-surface growth.** The optional knobs are described one feature at a time but never as a
-  whole. With ~40 additive-optional properties now accumulated, there is no enumeration of the total
-  config surface, no comparison of how each CPI structures cross-field validation, and no assessment
-  of the discoverability/maintenance cost as the surface grows — a real risk worth an explicit
-  subsection and possibly a generated config reference.
+| CPI | Explicit cross-process lock | Mechanism | Cite |
+|-----|------------------------------|-----------|------|
+| vSphere | Yes | vCenter `CustomFieldsManager` create, with `DuplicateName` used as a compare-and-swap; locks `drs_lock`, `host_vm_group`, `DISABLE_DRS_LOCK`; 600 s timeout, 0.5 s poll | `drs_rules/drs_lock.rb:30-57` |
+| Azure | Yes | OS `flock` on named files under `/tmp/azure_cpi/` for availability set, stemcell copy, and gallery image; `LOCK_EX`, with `LOCK_NB` for availability-set delete | `utils/helpers.rb:130-138,564-575` |
+| AWS | No | API issues an atomic unique ID per create; no shared mutable counter | `aws_provider.rb` |
+| Google | No | GCE metadata and label fingerprint compare-and-swap (409 on a stale fingerprint); global operation serialization | `metadata_client.go:147` |
+| OpenStack-Go | No | API state machine plus poll-until-active; 409 idempotency check on load-balancer member | `loadbalancer_service.go:101` |
+| Alicloud | No | `ClientToken` idempotency plus `Invoker.Catcher` conflict retry (`OperationConflict`, 60 attempts) | `invoker.go` |
+| PVE (this codebase) | Yes | Cross-process cluster mutex for HA-rule and anti-affinity mutation, backed by pmxcfs | §7.36 |
 
-- **Performance envelope, measured.** Adaptive polling (§7.28), transport tuning (§7.30), and
-  parallel replication (§7.35) are asserted as wins but not *measured* comparatively. There is no
-  steady-state API-call count per `create_vm`, no parallel-deploy throughput figure, and no
-  quantification of the polling-storm tax on a K-node cluster — the e2e timing data captured in the
-  project notes is not folded into this analysis.
+The two reference CPIs that lock are precisely those whose platform exposes non-atomic shared config: vSphere DRS rules and Azure availability sets and shared galleries. The four public-cloud CPIs avoid locking because their APIs guarantee atomicity through unique-ID create, fingerprint compare-and-swap, or a client-supplied idempotency token. PVE's HA rules and anti-affinity rules live in pmxcfs, a replicated configuration filesystem with no compare-and-swap primitive, so PVE belongs with vSphere and Azure, not with AWS and GCE. The cross-process mutex of §7.36 is the correct response to that platform shape, not borrowed ceremony from the lock-free cloud CPIs.
 
-- **Test strategy.** The comparison is silent on how each CPI is tested (Ruby rspec vs Go
-  table-tests vs live integration). The PVE CPI's own discipline — TDD, `-race`, adversarial review,
-  an 85%+ coverage gate — is a genuine differentiator the report never states, nor does it compare
-  how each CPI tests the hard concurrency/idempotency paths this very synthesis shows are the
-  highest-risk surface.
+### 9.2 Observability and operability
 
-- **Consolidated failure-mode taxonomy.** Errors are classified retriable/non-retriable
-  (§7.11/§7.23) but never assembled into one table mapping each failure mode (partial create,
-  orphaned resource, split-brain placement, corrupted in-flight operation) to the gap that addresses
-  it. Such a table would make the Tier-1 correctness items legible as a coherent safety story rather
-  than a list — and would have surfaced §7.36–§7.38 a round earlier.
+Operability turns on three questions: can a stuck deploy be correlated across logs by a request ID, are agent credentials and presigned URLs scrubbed before they reach the log, and does the CPI emit any metric an operator can alert on? The references split cleanly, and the split tracks team origin rather than language.
+
+| CPI | Request-ID correlation | Secret redaction | Metrics |
+|-----|------------------------|------------------|---------|
+| AWS | `options.aws.request_id` threaded to logger | `Bosh::Cpi::Redactor` over user_data and keys | None |
+| vSphere | `vcenters[0].request_id` threaded to logger | XPath over Login and password only (narrow) | None from the CPI; a vCenter extension flag exists |
+| Azure | `x-ms-client-request-id` per request (`SecureRandom.uuid`), echoed; MDC slot | `CREDENTIAL_KEYWORD_LIST` recursive walk; `/listKeys` response suppressed | Yes, opt-in telemetry: per-operation `duration_ms` and success emitted via a forked telemetry handler, at most once per 60 s |
+| Google | None (operation name serves as an implicit token) | `RedactSecrets` regex over account_key, json_key, password, private_key; `MultiLogger` buffers the full trace into every response `log` field | None |
+| OpenStack-Go | None | None anywhere | None |
+| Alicloud | None | None (logs `AccessKeySecret` and the mbus password verbatim) | None |
+| PVE (this codebase) | `request_id` in the dispatcher | Shipped §7.41 (URL userinfo, presigned signatures, sig query params) | None |
+
+Redaction maturity is bimodal. The three hyperscaler-maintained CPIs — AWS, Azure, and Google — scrub credentials at the log boundary, while the two community Go ports, OpenStack-Go and Alicloud, scrub nothing; Alicloud logs its access-key secret in clear text. The §7.41 work moves PVE into the mature tier. Request-ID correlation is likewise universal among the hyperscaler CPIs and absent from the community Go ports; PVE carries it. Only Azure emits metrics, and PVE does not yet — the one observability item still open and a candidate for future work.
+
+### 9.3 Test strategy
+
+The relevant axes are the test framework, the tiers each suite runs, and whether the fast tier requires live infrastructure. PVE's discipline on these axes is a genuine differentiator that the capability matrices never surface.
+
+| CPI | Framework | Tiers | Notable |
+|-----|-----------|-------|---------|
+| AWS | RSpec | Unit (mocked), integration (live) | `verify_partial_doubles`; Ruby-version-pin assertion |
+| vSphere | RSpec | Unit, integration (live vCenter) | ~50 feature integration specs; Timecop; stemcell reuse across the suite |
+| Azure | RSpec plus WebMock | Unit, integration (live), manual performance | Per-cloud-property spec subdirectories; request-header matchers |
+| OpenStack-Go | Ginkgo v2 plus Gomega | Unit (counterfeiter fakes), integration (httptest mock endpoints) | No live API; polling-interval package vars set to 0 in tests |
+| Google | Ginkgo plus Gomega | Unit (counterfeiter), integration (live GCP) | 1405-line `vm_test.go`; `CPI_ASYNC_DELETE` speedup |
+| Alicloud | Ginkgo v1 | Unit (in-memory mocks), integration (live) | `action/` unit tests largely commented out; 90 s hard sleep; no coverage gate |
+| PVE (this codebase) | Go `testing` plus testify | Unit, integration, e2e (live PVE) | `-race`, adversarial review, 85%+ coverage gate, TDD with deterministic polling |
+
+PVE's coverage gate, race detector, and deterministic-poll discipline exceed every reference. Only OpenStack-Go and PVE keep live infrastructure out of the fast tier — OpenStack-Go through httptest mock endpoints, PVE through fakes — which keeps the inner loop quick. Alicloud sets the floor: its unit tests are largely commented out, it sleeps 90 seconds in integration, and it ships no coverage gate. Critically, the references that test the hardest concurrency and idempotency paths least are exactly the ones (OpenStack-Go, Alicloud) with the weakest cross-process safety, while PVE's TDD discipline targets those same paths.
+
+### 9.4 Configuration surface and validation
+
+As optional knobs accumulate, the question is whether the CPI rejects misspelled or stale keys and how it expresses cross-field constraints. The references converge on imperative, partial validation; none rejects unknown keys.
+
+| CPI | Schema | Reject unknown keys | Cross-field validation |
+|-----|--------|---------------------|------------------------|
+| AWS | Imperative Ruby | No | Credential-source mutual exclusion; region xor endpoints |
+| vSphere | Membrane DSL (declarative) | No (dictionary passthrough) | Datacenter count; disk_type enum; datastore-pattern xor; NSX-T auth-mode branch |
+| Azure | Imperative | No | Zone with managed_disks; zone xor availability set; root-disk placement vs type |
+| OpenStack-Go | JSON structs | No (no `DisallowUnknownFields`) | Credential-mode xor; config_drive enum; az xor azs; six dead fields |
+| Google | Required-field check only | No | None beyond Project-required |
+| Alicloud | Minimal | No | Region and registry port only; sparse by design |
+| PVE (this codebase) | Opt-in `strict_config_validation` (§7.17) | Yes (opt-in unknown-key rejection) | Shipped cross-field rules (§7.17, §7.18) |
+
+No reference CPI rejects unknown keys, and vSphere's Membrane DSL is the only declarative schema. PVE's opt-in unknown-key rejection (§7.17) is therefore the strictest configuration validation in the set. The cost of going without a schema is visible: OpenStack-Go carries six parse-but-dead fields (`ConnectionOptions`, `DefaultVolumeType`, `WaitResourcePollInterval`, `EphemeralDisk`, `SchedulerHints`, `UseNovaNetworking`), and Alicloud's surface is sparse by necessity. A schema, declarative or opt-in strict, is the antidote to that drift.
+
+### 9.5 Consolidated failure-mode taxonomy
+
+The body classifies errors as retriable or non-retriable (§7.11, §7.23) but never assembles the failure modes into one table mapping each to the gap that addresses it. The following taxonomy makes the Tier-1 correctness work legible as a single safety story.
+
+| Failure mode | What goes wrong | PVE gap(s) that address it |
+|--------------|-----------------|----------------------------|
+| Partial create | `create_vm` fails after side effects (LB registration, tags) are applied | §7.19 dispatch rollback contract; §7.31 post-selection fallback |
+| Orphaned resource | A template or VM survives a failed or abandoned operation | §7.13 orphaned-template GC; §7.32 fast-path delete |
+| Split-brain placement | Two processes place conflicting VMs or rules against one cluster | §7.3 disk fault-domain co-location; §7.36 cross-process cluster mutex |
+| Corrupted in-flight operation | A `delete_disk` races a live volume operation | §7.38 pre-delete lock/status guard |
+| Unreachable disk | A VM lands on a node that cannot reach its disk | §7.3 VM-disk fault-domain co-location |
+| Duplicate IP | A static IP collides with a foreign device or an out-of-range address | §7.5 active IP-conflict probe; §7.18 static-IP-in-range validation |
+| Stale LB membership | A failed VM remains registered on the load balancer | §7.19 external LB hook with deregister-on-rollback |
+| Secret leak | Credentials or presigned URLs reach the logs | §7.41 dispatcher request/response redaction |
+| Racing template clone | Two processes clone the same stemcell concurrently | §7.37 adopt-and-wait on clone-target-exists |
+| Undersized ephemeral disk | Ephemeral disk smaller than swap demand | §7.40 ephemeral-disk ≥ 2× RAM invariant |
+
+### 9.6 Performance envelope
+
+The references differ in how aggressively they avoid wasted round-trips. The qualitative comparison favors adaptive and cached strategies over naive per-call work.
+
+| CPI | Polling strategy | Notable per-call overhead | Cite / §ref |
+|-----|------------------|---------------------------|-------------|
+| vSphere | Adaptive or server-directed | — | (qualitative) |
+| Azure | Server-directed (`Retry-After`) | 24 h on-disk SKU cache under `/var/vcap/.../cache` avoids repeated capability queries | (qualitative) |
+| AWS | API waiters | — | (qualitative) |
+| Google | Global operation polling | — | (qualitative) |
+| OpenStack-Go | Poll-until-active | Re-authenticates to Keystone per service build: 4+ round-trips per `create_vm` | qualitative; re-auth observed across `openstack_service.go` service builds |
+| Alicloud | Server-directed plus hard sleeps | 90 s hard sleep in tests; conflict-retry loop | `invoker.go` |
+| PVE (this codebase) | Progress-aware adaptive poll (§7.28) | Connection-pool and keepalive tuning, ticket reuse (§7.30) | §7.28, §7.30 |
+
+PVE's progress-aware adaptive poll (§7.28) and transport tuning with ticket reuse (§7.30) are the better default than OpenStack-Go's four Keystone re-authentications per `create_vm`, and they spare the cluster the polling-storm tax that fixed-interval polling imposes on a many-node cluster. One dimension remains genuinely open. The steady-state API-call count per `create_vm` and the parallel-deploy throughput on a K-node PVE cluster are still not measured here; the adaptive-poll, transport-tuning, and parallel-replication wins (§7.28, §7.30, §7.35) are argued from mechanism rather than from numbers. Folding the project's e2e timing data into a measured comparison is the one piece of this analysis that remains to be done.
 
