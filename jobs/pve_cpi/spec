@@ -758,6 +758,23 @@ properties:
       local stemcell storage on a multi-node cluster is rejected at create_stemcell
       time with a clear error directing the operator to use shared storage.
     default: false
+  pve.replica_adopt_timeout_sec:
+    description: |
+      Adopt-and-wait bound (seconds) for a racing concurrent template-replica clone.
+      When two CPI invocations independently decide a node needs a per-node stemcell
+      replica, both can pass the existence check while a winner is still building and
+      then clone, producing a duplicate half-built replica template. When > 0, the
+      replica build first probes for an in-flight winner (a VM carrying the replica
+      tags but not yet frozen / still clone-locked) and, finding one, waits up to this
+      many seconds for it to become a settled template and adopts it instead of
+      building a duplicate; a winner that never settles within the bound causes the
+      node to be skipped (best-effort, re-driven next deploy). Default 0 disables the
+      adopt path, leaving replica-build behaviour byte-identical. A conventional value
+      is 300. Operator note: if a winning clone crashed and left its guest stuck with
+      a "clone"/"create" config lock, every subsequent deploy will re-wait the full
+      timeout and skip that node (the warning names the stuck vmid and lock); clear it
+      with "qm unlock <vmid>" on the holding node so the replica can settle or rebuild.
+    default: 0
   pve.stemcell_replication_concurrency:
     description: |
       Maximum number of cluster nodes that receive a stemcell replica upload

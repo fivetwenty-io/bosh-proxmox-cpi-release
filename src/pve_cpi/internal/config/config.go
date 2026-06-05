@@ -317,6 +317,19 @@ type CPIConfig struct {
 	// validate-only-when-set; omit from ERB when false.
 	StemcellReplicateLocal bool `json:"stemcell_replicate_local,omitempty"`
 
+	// ReplicaAdoptTimeoutSec bounds the adopt-and-wait on a racing concurrent
+	// template-replica clone. When two CPI invocations independently decide a node
+	// needs a per-node stemcell replica, both can pass the settled-only existence
+	// check while a winner is still building and then clone, producing a duplicate
+	// half-built replica template. When this is > 0, the replica build first probes
+	// for an in-flight winner (a VM carrying the replica tags but not yet frozen /
+	// still clone-locked) and, finding one, waits up to this many seconds for it to
+	// become a settled template and adopts it instead of building a duplicate; a
+	// winner that never settles within the bound yields a retriable error so the
+	// director re-drives. Default 0 disables the adopt path entirely, leaving the
+	// build behaviour byte-identical. validate-only-when-set; omit from ERB when 0.
+	ReplicaAdoptTimeoutSec int `json:"replica_adopt_timeout_sec,omitempty"`
+
 	// CloneMode controls the clone type used by create_vm when cloning a
 	// stemcell template. Values: "auto" (default), "linked", "full".
 	// "auto": linked clone for snapshot-capable backends (dir, nfs, cifs,
@@ -1583,6 +1596,23 @@ func (c *CPIConfig) ClusterLockEnabled() bool {
 	return c.ClusterLockMode() == "pool"
 }
 
+// ReplicaAdoptTimeoutSecValue returns the configured adopt-and-wait timeout in
+// seconds for a racing concurrent template-replica clone. A value <= 0 (the
+// default) means the adopt path is disabled and replica builds behave
+// byte-identically. Callers gate the adopt probe on this being > 0.
+func (c *CPIConfig) ReplicaAdoptTimeoutSecValue() int {
+	if c == nil || c.ReplicaAdoptTimeoutSec <= 0 {
+		return 0
+	}
+	return c.ReplicaAdoptTimeoutSec
+}
+
+// ReplicaAdoptEnabled reports whether adopt-and-wait on a racing replica clone
+// is active (timeout > 0). Default off → byte-identical behavior.
+func (c *CPIConfig) ReplicaAdoptEnabled() bool {
+	return c.ReplicaAdoptTimeoutSecValue() > 0
+}
+
 // ClusterLockTimeoutSecValue returns the effective lock acquire timeout / TTL in
 // seconds. 0 (unset) resolves to the conventional 60s default.
 func (c *CPIConfig) ClusterLockTimeoutSecValue() int {
@@ -2186,6 +2216,14 @@ func (c *CPIConfig) validateEnumFields(errs *[]string) {
 				c.DiskPerfInvariantMode,
 			))
 		}
+	}
+
+	// ReplicaAdoptTimeoutSec: 0 disables the adopt path; negative is invalid.
+	if c.ReplicaAdoptTimeoutSec < 0 {
+		*errs = append(*errs, fmt.Sprintf(
+			"replica_adopt_timeout_sec must be >= 0 (0 disables adopt-and-wait), got %d",
+			c.ReplicaAdoptTimeoutSec,
+		))
 	}
 
 	// ClusterLock mode enum: validate only when non-empty.

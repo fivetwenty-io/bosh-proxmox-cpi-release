@@ -348,6 +348,12 @@
   repl_concurrency = p("pve.stemcell_replication_concurrency", 0).to_i
   config["stemcell_replication_concurrency"] = repl_concurrency unless repl_concurrency == 0
 
+  # Emit replica_adopt_timeout_sec only when non-zero. Zero (default) disables
+  # adopt-and-wait on a racing concurrent replica clone; omitting the key
+  # preserves that default — byte-identical to prior releases.
+  replica_adopt_timeout_sec = p("pve.replica_adopt_timeout_sec", 0).to_i
+  config["replica_adopt_timeout_sec"] = replica_adopt_timeout_sec unless replica_adopt_timeout_sec == 0
+
   # Emit health_check block only when the operator sets at least one sub-field.
   # When entirely absent, the Go nil *HealthCheckConfig means health polling is
   # off — byte-identical to prior releases. Individual sub-fields follow

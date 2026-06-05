@@ -166,6 +166,41 @@ func TestValidate_ClusterLockTimeoutNegative(t *testing.T) {
 	assertCloudError(t, err, "cluster_lock_timeout_sec must be >= 0")
 }
 
+func TestReplicaAdoptAccessors(t *testing.T) {
+	t.Parallel()
+	// Default: disabled, resolves to 0.
+	def := &config.CPIConfig{}
+	if def.ReplicaAdoptEnabled() {
+		t.Error("default replica_adopt_timeout_sec should be disabled")
+	}
+	if got := def.ReplicaAdoptTimeoutSecValue(); got != 0 {
+		t.Errorf("default timeout should resolve to 0; got %d", got)
+	}
+	// Nil receiver is defensive.
+	var nilCfg *config.CPIConfig
+	if nilCfg.ReplicaAdoptEnabled() || nilCfg.ReplicaAdoptTimeoutSecValue() != 0 {
+		t.Error("nil receiver should resolve to disabled/0")
+	}
+	// Positive value enables adopt-and-wait.
+	on := &config.CPIConfig{ReplicaAdoptTimeoutSec: 300}
+	if !on.ReplicaAdoptEnabled() {
+		t.Error("positive timeout should enable adopt-and-wait")
+	}
+	if got := on.ReplicaAdoptTimeoutSecValue(); got != 300 {
+		t.Errorf("custom timeout should be 300; got %d", got)
+	}
+}
+
+func TestValidate_ReplicaAdoptTimeoutNegative(t *testing.T) {
+	t.Parallel()
+	_, err := mustLoad(t, `{
+		"host": "h", "user": "u", "password": "p",
+		"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
+		"replica_adopt_timeout_sec": -1
+	}`)
+	assertCloudError(t, err, "replica_adopt_timeout_sec must be >= 0")
+}
+
 func TestClusterLockAccessors(t *testing.T) {
 	t.Parallel()
 	// Defaults: off, not enabled, verify off, timeout 60.

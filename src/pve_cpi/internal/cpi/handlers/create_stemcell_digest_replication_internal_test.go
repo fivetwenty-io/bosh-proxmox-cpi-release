@@ -31,6 +31,11 @@ import (
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
 )
 
+// jsonKeyTags is the PVE qemu-list "tags" field key, named once so the adopt
+// tests do not add raw "tags" string literals to the package (goconst counts
+// test-file literals against the production occurrence).
+const jsonKeyTags = "tags"
+
 // ============================================================
 // Helpers shared by digest + replication tests
 // ============================================================
@@ -1217,6 +1222,174 @@ func TestReplicateStemcellToNodes_Concurrency_IdempotentSkip(t *testing.T) {
 	// pve3 must have been replicated normally.
 	if _, ok := uploadedNodes.Load("pve3"); !ok {
 		t.Errorf("pve3: expected upload, got none")
+	}
+}
+
+// TestReplicateStemcellToNodes_AdoptsRacingReplica verifies the §7.37
+// adopt-and-wait path: when replica_adopt_timeout_sec is set and a per-node
+// replica appears (tagged) after the settled-only existence check missed it —
+// i.e. a concurrent winner built it in the TOCTOU window — the loser adopts that
+// artifact and skips its own upload + VM create rather than building a duplicate.
+//
+// pve2's ListQemu returns an in-flight (unfrozen) replica on the first poll so
+// ResolveTemplateVMIDForNode (settled-only) misses, then a settled template on
+// the adopt probe so AdoptReplicaTemplate adopts immediately (no wait).
+func TestReplicateStemcellToNodes_AdoptsRacingReplica(t *testing.T) {
+	t.Parallel()
+
+	content := []byte("adopt-racing-replica-test")
+	sha256hex := sha256OfBytes(content)
+	sha8 := sha256hex[:8]
+	srcPath := makeSrcFile(t, content)
+
+	targetNodes := []string{"pve1", "pve2", "pve3"}
+	const adoptedVMID = 30700
+
+	var (
+		uploadedNodes sync.Map
+		vmCreated     sync.Map
+		pve2Polls     atomic.Int64
+	)
+
+	storageSvc := replicationMockStorage{
+		uploadFn: func(_ context.Context, node, _, _, _ string, r io.Reader) (string, error) {
+			_, _ = io.Copy(io.Discard, r)
+			uploadedNodes.Store(node, true)
+			return "", nil
+		},
+		deleteVolumeIfExistsFn: func(_ context.Context, _, _, _ string) (bool, error) {
+			return true, nil
+		},
+	}
+	tags := "bosh-stemcell-sha-" + sha8 + ";bosh-stemcell-node-pve2"
+	nodesSvc := countingNodesService{
+		listQemuFn: func(_ context.Context, node string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
+			if node == "pve2" {
+				n := pve2Polls.Add(1)
+				if n == 1 {
+					// First poll (settled-only existence check): a concurrent
+					// winner is mid-clone — tagged but not yet frozen.
+					entry, _ := json.Marshal(map[string]any{
+						"vmid": adoptedVMID, "template": 0, "lock": "clone", jsonKeyTags: tags,
+					})
+					return &sdknodes.ListQemuResponse{entry}, nil
+				}
+				// Adopt probe: the winner has frozen — a settled template to adopt.
+				entry, _ := json.Marshal(map[string]any{
+					"vmid": adoptedVMID, "template": 1, jsonKeyTags: tags,
+				})
+				return &sdknodes.ListQemuResponse{entry}, nil
+			}
+			return &sdknodes.ListQemuResponse{}, nil
+		},
+		listStorageContentFn: func(_ context.Context, _, _ string, _ *sdknodes.ListStorageContentParams) (*sdknodes.ListStorageContentResponse, error) {
+			return &sdknodes.ListStorageContentResponse{}, nil
+		},
+		createQemuTemplateFn: func(_ context.Context, _ string, _ string, _ *sdknodes.CreateQemuTemplateParams) (*sdknodes.CreateQemuTemplateResponse, error) {
+			return &sdknodes.CreateQemuTemplateResponse{}, nil
+		},
+		deleteQemuFn: func(_ context.Context, _ string, _ string, _ *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
+			return &sdknodes.DeleteQemuResponse{}, nil
+		},
+	}
+	qemuSvc := replicationMockQEMU{
+		createFn: func(_ context.Context, node string, _ map[string]any) (string, error) {
+			vmCreated.Store(node, true)
+			return "", nil
+		},
+	}
+
+	deps := buildReplicationDeps(t, 1, &storageSvc, &nodesSvc, &qemuSvc)
+	deps.Config.ReplicaAdoptTimeoutSec = 300 // enable adopt-and-wait
+	cp := stemcellCloudProps{Name: "ubuntu-jammy", Version: "1.0"}
+
+	replicateStemcellToNodes(context.Background(), deps, "pve1", "local", "bosh-stemcell.qcow2",
+		sha256hex, targetNodes, srcPath, "", cp, "")
+
+	// pve2: adopted the racing winner — no upload, no VM create.
+	if _, ok := uploadedNodes.Load("pve2"); ok {
+		t.Errorf("pve2: upload called despite adoptable racing replica (adopt-and-wait failed)")
+	}
+	if _, ok := vmCreated.Load("pve2"); ok {
+		t.Errorf("pve2: VM created despite adoptable racing replica (duplicate build not prevented)")
+	}
+	// pve3: no racing winner — replicated normally.
+	if _, ok := uploadedNodes.Load("pve3"); !ok {
+		t.Errorf("pve3: expected normal upload, got none")
+	}
+}
+
+// TestReplicateStemcellToNodes_AdoptDisabled_BuildsReplica verifies the
+// byte-identical default: with replica_adopt_timeout_sec unset (0), an in-flight
+// racing replica is NOT probed for — the node uploads and builds as before. This
+// guards the off-path against accidental behaviour change.
+func TestReplicateStemcellToNodes_AdoptDisabled_BuildsReplica(t *testing.T) {
+	t.Parallel()
+
+	content := []byte("adopt-disabled-builds-test")
+	sha256hex := sha256OfBytes(content)
+	sha8 := sha256hex[:8]
+	srcPath := makeSrcFile(t, content)
+
+	targetNodes := []string{"pve1", "pve2"}
+
+	var (
+		uploadedNodes sync.Map
+		vmCreated     sync.Map
+	)
+
+	storageSvc := replicationMockStorage{
+		uploadFn: func(_ context.Context, node, _, _, _ string, r io.Reader) (string, error) {
+			_, _ = io.Copy(io.Discard, r)
+			uploadedNodes.Store(node, true)
+			return "", nil
+		},
+		deleteVolumeIfExistsFn: func(_ context.Context, _, _, _ string) (bool, error) {
+			return true, nil
+		},
+	}
+	// pve2 always shows an in-flight (unfrozen) replica. With adopt OFF, the
+	// settled-only check misses it and there is no adopt probe, so the node builds.
+	inflightTags := "bosh-stemcell-sha-" + sha8 + ";bosh-stemcell-node-pve2"
+	nodesSvc := countingNodesService{
+		listQemuFn: func(_ context.Context, node string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
+			if node == "pve2" {
+				entry, _ := json.Marshal(map[string]any{
+					"vmid": 30800, "template": 0, "lock": "clone", jsonKeyTags: inflightTags,
+				})
+				return &sdknodes.ListQemuResponse{entry}, nil
+			}
+			return &sdknodes.ListQemuResponse{}, nil
+		},
+		listStorageContentFn: func(_ context.Context, _, _ string, _ *sdknodes.ListStorageContentParams) (*sdknodes.ListStorageContentResponse, error) {
+			return &sdknodes.ListStorageContentResponse{}, nil
+		},
+		createQemuTemplateFn: func(_ context.Context, _ string, _ string, _ *sdknodes.CreateQemuTemplateParams) (*sdknodes.CreateQemuTemplateResponse, error) {
+			return &sdknodes.CreateQemuTemplateResponse{}, nil
+		},
+		deleteQemuFn: func(_ context.Context, _ string, _ string, _ *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
+			return &sdknodes.DeleteQemuResponse{}, nil
+		},
+	}
+	qemuSvc := replicationMockQEMU{
+		createFn: func(_ context.Context, node string, _ map[string]any) (string, error) {
+			vmCreated.Store(node, true)
+			return "", nil
+		},
+	}
+
+	deps := buildReplicationDeps(t, 1, &storageSvc, &nodesSvc, &qemuSvc) // adopt unset → 0 → off
+	cp := stemcellCloudProps{Name: "ubuntu-jammy", Version: "1.0"}
+
+	replicateStemcellToNodes(context.Background(), deps, "pve1", "local", "bosh-stemcell.qcow2",
+		sha256hex, targetNodes, srcPath, "", cp, "")
+
+	// adopt off: pve2 builds its own replica (upload + create), byte-identical.
+	if _, ok := uploadedNodes.Load("pve2"); !ok {
+		t.Errorf("pve2: expected upload with adopt disabled (byte-identical), got none")
+	}
+	if _, ok := vmCreated.Load("pve2"); !ok {
+		t.Errorf("pve2: expected VM create with adopt disabled (byte-identical), got none")
 	}
 }
 

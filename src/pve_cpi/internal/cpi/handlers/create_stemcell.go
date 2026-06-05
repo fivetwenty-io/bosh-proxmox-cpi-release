@@ -2430,6 +2430,31 @@ func replicateOneNode(
 		return
 	}
 
+	// Adopt-and-wait on a racing concurrent replica clone: another CPI process may
+	// already be building this same per-node replica (tagged but not yet frozen).
+	// Probe for that in-flight winner BEFORE uploading our own copy; on adoption we
+	// skip the upload+build entirely, avoiding a duplicate half-built replica and an
+	// orphaned qcow2. Disabled (timeout 0) → skipped, byte-identical behaviour.
+	if deps.Config != nil && deps.Config.ReplicaAdoptEnabled() {
+		adoptTimeout := time.Duration(deps.Config.ReplicaAdoptTimeoutSecValue()) * time.Second
+		adoptedVMID, adopted, adoptErr := pve.AdoptReplicaTemplate(ctx, deps.PVE, node, sha8, adoptTimeout)
+		switch {
+		case adoptErr != nil:
+			// A winner was building but did not settle within the bound. Skip this
+			// node rather than racing a duplicate build; create_stemcell replication
+			// is best-effort and the node can be re-driven on the next deploy.
+			nodeLogger.Warn("create_stemcell: replication: adopt-and-wait on racing replica timed out (skipping node)",
+				log.Err(adoptErr),
+			)
+			return
+		case adopted:
+			nodeLogger.Info("create_stemcell: replication: adopted in-flight replica from concurrent builder (skipping upload)",
+				log.Int(metadataKeyVMID, adoptedVMID),
+			)
+			return
+		}
+	}
+
 	// Upload qcow2 to this node's local storage. uploadStemcellImage opens its
 	// own file handle (openStagedFile inside), so concurrent calls for different
 	// nodes read the same source file independently without sharing an *os.File.

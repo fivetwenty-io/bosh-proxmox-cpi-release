@@ -1595,7 +1595,7 @@ for a duplicate poolid and the comment round-trip are inferred from the API shap
 serialization; unit tests assert the contract against a fake `PoolService`, and a true multi-process
 race must be validated on a live cluster.
 
-#### 7.37 OPEN — Adopt-and-wait on a racing concurrent template clone (clone-target-exists)
+#### 7.37 DONE — Adopt-and-wait on a racing concurrent template clone (clone-target-exists)
 
 *References: vSphere, Azure.* vSphere's `Stemcell#replicate` clones a per-datastore replica and, when
 a parallel CPI is already replicating the same stemcell, catches the resulting `DuplicateName` and
@@ -1624,6 +1624,32 @@ and the template to leave clone-in-progress state, bounded by `replica_adopt_tim
 VMID collision (the existing retry-jitter path) so create_vm's allocation loop is unchanged. With a
 single CPI process the conflict never fires, so behavior is byte-identical; the new code only changes
 the multi-process race outcome from "duplicate orphan template" to "wait for the winner".
+
+**Shipped.** PVE allocates a fresh VMID for every clone, so a duplicate-replica collision is invisible
+at the VMID-allocation layer (two losers pick different VMIDs and both succeed) — the Azure/vSphere
+"catch DuplicateName" hook has no PVE analogue. Instead the in-flight winner is observed directly: a
+replica VM carries its identity tags (`bosh-stemcell-sha-<sha8>` + `bosh-stemcell-node-<node>`) from
+creation, but `Template` flips true only after the freeze and the guest config `lock` reads
+`clone`/`create` while the build is in flight. A new primitive `pve.AdoptReplicaTemplate`
+(`internal/pve/replica_adopt.go`) scans for that mid-build VM via `findReplicaCandidate` — which, unlike
+the settled-only `ResolveTemplateVMIDForNode`, does *not* require the `Template` flag — and polls it to a
+settled template (frozen and unlocked), bounded by `pve.replica_adopt_timeout_sec`. The scan prefers a
+settled candidate over any lower-VMID unsettled orphan, so a crashed-mid-build remnant cannot shadow a
+genuine adoptable template. The probe is wired into the per-node replica build (`replicateOneNode`,
+`create_stemcell.go`) **before** the qcow2 upload: on adoption the node skips upload + clone entirely
+(no duplicate, no orphaned upload); a winner that never settles within the bound yields a
+`TypeRetriableCloud` that the best-effort replication loop logs and skips (re-driven next deploy).
+Distinguishing a replica collision from a guest-VMID collision is structural — the adopt probe keys on
+the replica tag set, while the create_vm allocation loop's VMID-conflict jitter is untouched. The knob
+defaults to 0 (disabled): the probe call site is skipped entirely, so single-process and pre-existing
+behavior is byte-identical. The residual sub-second TOCTOU window between a not-found probe and the
+caller's own clone is shrunk but not eliminated (no cross-process lock is taken on this path; the
+optional `cluster_lock_mode=pool` primitive from §7.36 could close it but is not wired here).
+
+*Live-validation caveat:* the `clone`/`create` lock strings and the list endpoint's per-VM `lock`/`tags`
+fields are exercised against a fake PVE client asserting the contract; a true multi-process replica
+race and a stuck-lock winner (which requires operator `qm unlock` recovery, noted in the spec) need a
+live cluster to validate.
 
 #### 7.38 OPEN — Pre-delete lock/status guard on `delete_disk` against in-flight volume operations
 
