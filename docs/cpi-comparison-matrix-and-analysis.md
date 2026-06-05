@@ -44,7 +44,7 @@ up **ten new gaps (§7.26–§7.35)**, none of which appeared in the prior repor
 shipped** — they are extensions of the shipped work (enforce the invariants §7.9 records, monitor
 the resizes §7.24 sizes, make the polling §7.25 fixed adaptive, and so on). **This round went
 further:** a fresh, independent re-extraction of all six references against the now-shipped
-§7.1–§7.35 surfaced **six more genuinely new gaps (§7.36–§7.41), all still open**, clustered on a
+§7.1–§7.35 surfaced **six more genuinely new gaps (§7.36–§7.41), all since shipped**, clustered on a
 theme the prior rounds under-weighted — *cross-process and in-flight-operation safety*: an
 unguarded HA-rule read-modify-write under parallel deploys (§7.36), a racing concurrent template
 clone (§7.37), and an unguarded `delete_disk` against a locked volume (§7.38), plus three
@@ -1233,7 +1233,8 @@ curves are pure and deterministic except for seeded jitter.
 
 These ten did not appear in the prior report. They surfaced from the deeper reference
 re-read and the source-level verification of the shipped features above, and **all ten
-(§7.26–§7.35) have since been shipped** (the still-open work this round is §7.36–§7.41, below).
+(§7.26–§7.35) have since been shipped** (the six gaps surfaced this round, §7.36–§7.41 below,
+have since been shipped as well).
 Each follows the same additive-optional convention the shipped work established: validate only
 when set, omit from VM config when empty, zero behavior change for existing manifests. They are
 ordered roughly by
