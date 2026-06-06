@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strconv"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
@@ -150,6 +151,23 @@ func fastPathDeleteVM(ctx context.Context, deps Deps, node, vmCID string, vmid i
 		return nil
 	}
 
+	// Protect attached persistent disks before the skiplock destroy. Synchronous
+	// config PUTs only — does not introduce an unbounded await. A bosh-deleting
+	// straggler reaped by sweepFastDeleteStragglers already had its foreign disks
+	// detached on this initial fast-path call, so the sweep needs no guard.
+	if protErr := detachForeignActiveDisks(ctx, deps, node, vmCID, vmid, logger); protErr != nil {
+		return protErr
+	}
+	// Same unusedN guard the sync path runs. Without it the fast-path purge would
+	// still destroy a persistent volume left in an unusedN slot — e.g. a foreign
+	// disk whose detach above demoted it to unusedN but could not sweep it
+	// because a snapshot references the volume. guardUnusedVolumes existence-
+	// probes the configured pve_disk_storage and fails closed on any volume it
+	// cannot confirm deleted.
+	if guardErr := guardUnusedVolumes(ctx, deps, node, vmCID, vmid, deps.Config.DiskStorage); guardErr != nil {
+		return guardErr
+	}
+
 	// Issue destroy with skiplock=true. Discard the UPID; no await.
 	logger.Debug("delete_vm: fast-path: issuing skiplock destroy without await")
 	purge := true
@@ -279,6 +297,13 @@ func HandleDeleteVM(deps Deps) cpi.Handler {
 			return nil, stopErr
 		} else if stopDone {
 			return nil, nil
+		}
+
+		// --- protect attached persistent disks: detach foreign-VMID volumes so
+		//     the destroy below cannot take them; refuse if a detach is not
+		//     guaranteed (fail-closed, retriable) ---
+		if protErr := detachForeignActiveDisks(ctx, deps, node, vmCID, vmid, logger); protErr != nil {
+			return nil, protErr
 		}
 
 		// --- guard: refuse to destroy if a persistent volume is still attached ---
@@ -490,6 +515,76 @@ func guardUnusedVolumes(ctx context.Context, deps Deps, node, vmCID string, vmid
 			"delete_vm: refusing to destroy VM %s -- persistent volumes still attached as unused slots: %v (call detach_disk first or verify pve_disk_storage configuration)",
 			vmCID, protected,
 		)
+	}
+	return nil
+}
+
+// detachForeignActiveDisks protects persistent disks the BOSH Director attached
+// to this VM but has not yet detached (e.g. an interrupted recreate). PVE's
+// DELETE /qemu/{vmid} with purge=true destroys EVERY disk referenced by the VM
+// config, including persistent volumes on active bus slots (scsi1, ...). Such a
+// volume is recognised by its embedded VMID label differing from the VM's own
+// VMID: create_disk allocates persistent volumes under a synthetic free VMID,
+// so a disk "zfs-1:vm-15689-disk-0" attached to VM 6031 is foreign.
+//
+// For each foreign disk on an active slot, DetachDisk fully unreferences the
+// volume (the SDK demotes the slot to unusedN and sweeps it), leaving the
+// volume intact on storage. Only after every foreign disk is detached does
+// delete_vm proceed to destroy the VM.
+//
+// Fail-closed: if a foreign disk cannot be detached, or any foreign disk still
+// remains on an active slot after the attempt, a RETRIABLE error is returned
+// and the VM is NOT destroyed — a transient PVE error never escalates to silent
+// data loss. The Director retries delete_vm; the next attempt re-detaches and
+// proceeds.
+func detachForeignActiveDisks(ctx context.Context, deps Deps, node, vmCID string, vmid int, logger *log.Logger) error {
+	cfg, cfgErr := deps.PVE.QEMU().Config(ctx, node, vmid)
+	if cfgErr != nil {
+		if pve.IsNotFound(cfgErr) {
+			return nil // VM gone — destroy path handles idempotently
+		}
+		return cpierrors.Wrap(pve.WrapError(cfgErr),
+			fmt.Sprintf("delete_vm: read config for VM %s before foreign-disk detach", vmCID))
+	}
+	foreign := pve.FindForeignActiveDisks(cfg, vmid)
+	if len(foreign) == 0 {
+		return nil
+	}
+	slots := make([]string, 0, len(foreign))
+	for slot := range foreign {
+		slots = append(slots, slot)
+	}
+	sort.Strings(slots)
+	for _, slot := range slots {
+		volid := foreign[slot]
+		logger.Warn("delete_vm: persistent disk still attached on active slot -- detaching to preserve volume before destroy",
+			log.String("slot", slot), log.String("volid", volid))
+		detachErr := pve.RetryOnTransientOrLock(ctx, logger, "delete_vm.foreign_detach", 0, func() error {
+			return deps.PVE.QEMU().DetachDisk(ctx, node, vmid, slot)
+		})
+		if detachErr != nil {
+			return cpierrors.Retriable(
+				"delete_vm: refusing to destroy VM %s -- could not detach persistent disk %s=%s to preserve it: %s (the volume would otherwise be destroyed; retry re-attempts detach)",
+				vmCID, slot, volid, detachErr.Error())
+		}
+	}
+	// Re-read config: a detach that silently no-ops (SDK regression / race) must
+	// not let the destroy take the volume while it is still on an active slot. A
+	// detach that demoted the disk to unusedN but could not sweep it (a snapshot
+	// reference blocks the sweep) is caught by the guardUnusedVolumes pass that
+	// follows this call on BOTH the sync and fast paths.
+	confirmCfg, confErr := deps.PVE.QEMU().Config(ctx, node, vmid)
+	if confErr != nil {
+		if pve.IsNotFound(confErr) {
+			return nil
+		}
+		return cpierrors.Wrap(pve.WrapError(confErr),
+			fmt.Sprintf("delete_vm: re-read config for VM %s after foreign-disk detach", vmCID))
+	}
+	if remaining := pve.FindForeignActiveDisks(confirmCfg, vmid); len(remaining) > 0 {
+		return cpierrors.Retriable(
+			"delete_vm: refusing to destroy VM %s -- persistent disks still attached after detach attempt: %v (retry)",
+			vmCID, remaining)
 	}
 	return nil
 }

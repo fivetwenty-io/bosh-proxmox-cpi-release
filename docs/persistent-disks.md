@@ -107,6 +107,38 @@ disk_pools:
     # when a disk must be pinned independently of any owner VM.
 ```
 
+## delete_vm and persistent-disk safety
+
+`delete_vm` destroys the VM and its own root and ephemeral disks. It must never
+destroy a persistent disk that the BOSH Director has not explicitly released.
+
+Persistent disks are recognised by the VMID label embedded in their PVE volid.
+`create_disk` allocates volumes under a synthetic free VMID chosen at creation
+time, so a persistent disk volid such as `zfs-1:vm-15689-disk-0` carries VMID
+15689 even while attached to VM 6031. Any active-slot disk whose embedded VMID
+differs from the owning VM's VMID is a foreign persistent disk.
+
+If a persistent disk is still attached to an active bus slot when `delete_vm`
+runs — for example, after an interrupted Director recreate that did not call
+`detach_disk` before deleting the VM — the CPI detaches it automatically. The
+volume is preserved on storage; only then is the VM destroyed.
+
+If the detach cannot complete (for example, because PVE returns a lock-timeout
+error), `delete_vm` refuses to destroy the VM and returns a retriable error.
+The Director retries; the next attempt re-detaches before proceeding. The volume
+is never lost due to a transient PVE failure.
+
+A persistent volume can also linger in an unused (`unusedN`) config slot when a
+snapshot reference blocks PVE from fully sweeping it during the detach. The CPI
+existence-probes the configured `pve_disk_storage` and refuses to destroy the VM
+while any such volume still exists. This refusal is not retriable: remove the
+snapshot (or the unused slot) before deleting the VM. An `unusedN` slot whose
+volume has already been deleted from storage does not block the destroy.
+
+**Operator note:** an interrupted `create-env` recreate sequence no longer risks
+the Director database disk. The guard runs on both the synchronous delete path
+and the fast-path (`fast_path_delete: true`) delete path.
+
 ## Known limitations
 
 - **Snapshots require the disk to be attached.** PVE does not provide a per-volume snapshot primitive; `snapshot_disk` takes a VM snapshot of the host VM. Detached-disk snapshots would require a worker-VM workaround (tracked separately).

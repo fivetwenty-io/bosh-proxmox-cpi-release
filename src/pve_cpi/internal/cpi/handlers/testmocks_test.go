@@ -65,12 +65,13 @@ var _ qemu.Service = (*mockQEMUService)(nil)
 // CreateFn defaults to ("upid-mock-create", nil) when nil so tests not
 // exercising Create pass through without configuration.
 type mockQEMUService struct {
-	createFn func(ctx context.Context, node string, params map[string]any) (string, error)
-	stopFn   func(ctx context.Context, node string, vmid int) (string, error)
-	resetFn  func(ctx context.Context, node string, vmid int) (string, error)
-	startFn  func(ctx context.Context, node string, vmid int) (string, error)
-	statusFn func(ctx context.Context, node string, vmid int) (map[string]any, error)
-	configFn func(ctx context.Context, node string, vmid int) (map[string]any, error)
+	createFn     func(ctx context.Context, node string, params map[string]any) (string, error)
+	stopFn       func(ctx context.Context, node string, vmid int) (string, error)
+	resetFn      func(ctx context.Context, node string, vmid int) (string, error)
+	startFn      func(ctx context.Context, node string, vmid int) (string, error)
+	statusFn     func(ctx context.Context, node string, vmid int) (map[string]any, error)
+	configFn     func(ctx context.Context, node string, vmid int) (map[string]any, error)
+	detachDiskFn func(ctx context.Context, node string, vmid int, slot string) error
 }
 
 func (m *mockQEMUService) Stop(ctx context.Context, node string, vmid int) (string, error) {
@@ -129,7 +130,10 @@ func (m *mockQEMUService) Template(_ context.Context, _ string, _ int) (string, 
 func (m *mockQEMUService) AttachDisk(_ context.Context, _ string, _ int, _ string, _ string, _ *qemu.AttachOpts) (string, error) {
 	panic("mockQEMUService.AttachDisk: not expected")
 }
-func (m *mockQEMUService) DetachDisk(_ context.Context, _ string, _ int, _ string) error {
+func (m *mockQEMUService) DetachDisk(ctx context.Context, node string, vmid int, slot string) error {
+	if m.detachDiskFn != nil {
+		return m.detachDiskFn(ctx, node, vmid, slot)
+	}
 	panic("mockQEMUService.DetachDisk: not expected")
 }
 func (m *mockQEMUService) ResizeDisk(_ context.Context, _ string, _ int, _ string, _ int) (string, error) {

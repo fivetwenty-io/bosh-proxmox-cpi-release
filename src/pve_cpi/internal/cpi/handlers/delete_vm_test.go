@@ -380,6 +380,98 @@ func TestHandleDeleteVM_AllowsWhenUnusedVolumeAlreadyDeleted(t *testing.T) {
 	}
 }
 
+// TestHandleDeleteVM_DetachesForeignDiskThenDestroys verifies the incident
+// scenario: a persistent disk from another VMID is still attached on an active
+// bus slot (scsi1) when delete_vm runs. The handler must detach it (preserving
+// the volume) and THEN destroy the VM, rather than letting the purge-destroy
+// take the foreign volume.
+func TestHandleDeleteVM_DetachesForeignDiskThenDestroys(t *testing.T) {
+	t.Parallel()
+
+	var detachedSlots []string
+	deleteCalled := false
+	var configCalls int
+	qemuSvc := &mockQEMUService{
+		stopFn: func(_ context.Context, _ string, _ int) (string, error) { return "", nil },
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			configCalls++
+			if configCalls == 1 {
+				// Director DB disk (vmid 15689) attached to VM 6031 as scsi1.
+				return map[string]any{
+					"virtio0": "local-lvm:vm-6031-disk-0",
+					"scsi1":   "zfs-1:vm-15689-disk-0,size=128G",
+				}, nil
+			}
+			// After detach: foreign disk fully unreferenced; no unusedN remains.
+			return map[string]any{"virtio0": "local-lvm:vm-6031-disk-0"}, nil
+		},
+		detachDiskFn: func(_ context.Context, _ string, _ int, slot string) error {
+			detachedSlots = append(detachedSlots, slot)
+			return nil
+		},
+	}
+	nodesSvc := &mockNodesService{
+		deleteQemuFn: func(_ context.Context, _ string, _ string, _ *nodes.DeleteQemuParams) (*nodes.DeleteQemuResponse, error) {
+			deleteCalled = true
+			raw := nodes.DeleteQemuResponse{}
+			return &raw, nil
+		},
+	}
+
+	h := handlers.HandleDeleteVM(testDepsFoundVMWithStorage(6031, qemuSvc, nodesSvc, &mockTasksService{}, &mockAgentService{}, &mockStorageService{}))
+	_, err := h.Handle(context.Background(), marshalArgs("6031"), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("expected detach-then-destroy to succeed, got error: %v", err)
+	}
+	if len(detachedSlots) != 1 || detachedSlots[0] != "scsi1" {
+		t.Errorf("foreign disk must be detached from scsi1; got detached slots %v", detachedSlots)
+	}
+	if !deleteCalled {
+		t.Error("DeleteQemu must be called after the foreign disk is detached")
+	}
+}
+
+// TestHandleDeleteVM_FastPath_RefusesLiveForeignUnusedDisk verifies the fast
+// path now runs the unusedN guard. A foreign persistent volume that lingers in
+// an unusedN slot (e.g. a snapshot blocked the detach sweep) and STILL EXISTS on
+// storage must block the fast-path purge-destroy.
+func TestHandleDeleteVM_FastPath_RefusesLiveForeignUnusedDisk(t *testing.T) {
+	t.Parallel()
+
+	deleteCalled := false
+	qemuSvc := &mockQEMUService{
+		stopFn: func(_ context.Context, _ string, _ int) (string, error) { return "", nil },
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			// Foreign volume (vmid 9000) parked in unused0 on pve_disk_storage.
+			return map[string]any{"unused0": "local-lvm:vm-9000-disk-0"}, nil
+		},
+	}
+	nodesSvc := &mockNodesService{
+		deleteQemuFn: func(_ context.Context, _ string, _ string, _ *nodes.DeleteQemuParams) (*nodes.DeleteQemuResponse, error) {
+			deleteCalled = true
+			raw := nodes.DeleteQemuResponse{}
+			return &raw, nil
+		},
+		updateQemuConfigFn: func(_ context.Context, _ string, _ string, _ *nodes.UpdateQemuConfigParams) error { return nil },
+	}
+	// Volume still exists -> guard must fail closed -> destroy must NOT proceed.
+	storageSvc := &mockStorageService{
+		existsFn: func(_ context.Context, _, _, _ string) (bool, error) { return true, nil },
+	}
+	deps := testDepsFoundVMWithStorage(909, qemuSvc, nodesSvc, &mockTasksService{}, &mockAgentService{}, storageSvc)
+	enabled := true
+	deps.Config.FastPathDelete = &enabled
+
+	h := handlers.HandleDeleteVM(deps)
+	_, err := h.Handle(context.Background(), marshalArgs("909"), jsonrpc.Context{})
+	if err == nil {
+		t.Fatal("fast-path: expected guard to fail closed for live foreign unused disk, got nil error")
+	}
+	if deleteCalled {
+		t.Error("fast-path: DeleteQemu must NOT be called when the unusedN guard fails closed")
+	}
+}
+
 // TestHandleDeleteVM_AllowsWhenUnusedOnDifferentStorage verifies the guard
 // fails CLOSED when an unusedN slot references a storage that does not match
 // pve_disk_storage.

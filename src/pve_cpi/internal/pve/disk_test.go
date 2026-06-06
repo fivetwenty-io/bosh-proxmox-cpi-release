@@ -773,6 +773,115 @@ func TestEncodeDiskCID_EmptyOptsIdentical(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// EmbeddedDiskVMID
+// ---------------------------------------------------------------------------
+
+func TestEmbeddedDiskVMID(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name     string
+		volid    string
+		wantVMID int
+		wantOK   bool
+	}{
+		{
+			name:     "flat lvm volid with foreign vmid",
+			volid:    "zfs-1:vm-15689-disk-0",
+			wantVMID: 15689,
+			wantOK:   true,
+		},
+		{
+			name:     "flat lvm volid no options",
+			volid:    "local-lvm:vm-100-disk-2",
+			wantVMID: 100,
+			wantOK:   true,
+		},
+		{
+			name:     "path form dir volid",
+			volid:    "dir:100/vm-100-disk-0.qcow2",
+			wantVMID: 100,
+			wantOK:   true,
+		},
+		{
+			name:     "cloudinit volid returns false",
+			volid:    "local-lvm:vm-100-cloudinit",
+			wantVMID: 0,
+			wantOK:   false,
+		},
+		{
+			name:     "none (cdrom) returns false",
+			volid:    "none",
+			wantVMID: 0,
+			wantOK:   false,
+		},
+		{
+			name:     "iso volid returns false",
+			volid:    "local:iso/x.iso",
+			wantVMID: 0,
+			wantOK:   false,
+		},
+		{
+			name:     "empty string returns false",
+			volid:    "",
+			wantVMID: 0,
+			wantOK:   false,
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			gotVMID, gotOK := pve.EmbeddedDiskVMID(tc.volid)
+			if gotOK != tc.wantOK {
+				t.Errorf("EmbeddedDiskVMID(%q): ok=%v, want %v", tc.volid, gotOK, tc.wantOK)
+			}
+			if gotVMID != tc.wantVMID {
+				t.Errorf("EmbeddedDiskVMID(%q): vmid=%d, want %d", tc.volid, gotVMID, tc.wantVMID)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// FindForeignActiveDisks
+// ---------------------------------------------------------------------------
+
+func TestFindForeignActiveDisks(t *testing.T) {
+	t.Parallel()
+
+	// ownerVMID=6031; virtio0 and scsi2 are owned disks; scsi1 is a foreign
+	// persistent disk (vmid 15689); ide2 is cloudinit (no vm-N-disk-N label,
+	// skipped); unused0 is NOT an active bus slot (skipped by ParseDisks).
+	cfg := map[string]any{
+		"virtio0": "zfs-1:vm-6031-disk-0",
+		"scsi1":   "zfs-1:vm-15689-disk-0,size=128G",
+		"scsi2":   "zfs-1:vm-6031-disk-1",
+		"ide2":    "local-lvm:vm-6031-cloudinit",
+		"unused0": "zfs-1:vm-9999-disk-0",
+	}
+
+	got := pve.FindForeignActiveDisks(cfg, 6031)
+
+	if len(got) != 1 {
+		t.Fatalf("FindForeignActiveDisks: want 1 entry, got %d: %v", len(got), got)
+	}
+	bareVolid, ok := got["scsi1"]
+	if !ok {
+		t.Fatalf("FindForeignActiveDisks: expected scsi1 in result; got %v", got)
+	}
+	const wantBare = "zfs-1:vm-15689-disk-0"
+	if bareVolid != wantBare {
+		t.Errorf("FindForeignActiveDisks scsi1: want %q, got %q", wantBare, bareVolid)
+	}
+	// Confirm unused0 NOT returned (it is not an active bus slot).
+	if _, found := got["unused0"]; found {
+		t.Error("FindForeignActiveDisks: unused0 must not appear in result (not an active bus slot)")
+	}
+}
+
+// ---------------------------------------------------------------------------
 // FindUnusedDiskEntries
 // ---------------------------------------------------------------------------
 

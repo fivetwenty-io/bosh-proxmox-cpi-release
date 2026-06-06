@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 
 	sdkcluster "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cluster"
@@ -55,6 +56,57 @@ func FindUnusedDiskEntries(cfg map[string]any) map[string]string {
 			bare = val[:comma]
 		}
 		out[key] = bare
+	}
+	return out
+}
+
+// embeddedDiskVMIDPattern extracts the VMID label from a PVE disk volid. PVE
+// names every VM-owned volume "vm-<vmid>-disk-<n>"; the <vmid> identifies the
+// VM the volume was allocated against. Matches both the flat form
+// ("storage:vm-15689-disk-0") and the path form
+// ("storage:15689/vm-15689-disk-0.qcow2").
+var embeddedDiskVMIDPattern = regexp.MustCompile(`vm-(\d+)-disk-\d+`)
+
+// EmbeddedDiskVMID returns the VMID encoded in a PVE disk volid and true when
+// the "vm-<vmid>-disk-<n>" pattern is present. Returns (0, false) for volids
+// that carry no such label: cdrom/ISO entries ("none,media=cdrom",
+// "local:iso/foo.iso"), cloudinit drives ("vm-<vmid>-cloudinit"), efidisk /
+// tpmstate volumes, or unparseable values.
+func EmbeddedDiskVMID(volid string) (int, bool) {
+	m := embeddedDiskVMIDPattern.FindStringSubmatch(volid)
+	if len(m) != 2 {
+		return 0, false
+	}
+	n, err := strconv.Atoi(m[1])
+	if err != nil || n <= 0 {
+		return 0, false
+	}
+	return n, true
+}
+
+// FindForeignActiveDisks returns every (slot -> bare volid) on an active bus
+// slot (scsi/virtio/ide/sata) of cfg whose embedded VMID label differs from
+// ownerVMID. These are persistent disks the Director attached to the VM
+// (created by create_disk under a synthetic VMID); PVE's DELETE /qemu/{vmid}
+// would destroy them with the VM. delete_vm detaches them first so the volume
+// survives.
+//
+// Slots whose volid carries no "vm-<n>-disk-<n>" label (cdrom/ISO, cloudinit)
+// are skipped — not persistent BOSH disks. Slots whose embedded VMID equals
+// ownerVMID are the VM's own root/ephemeral disks and are NOT returned (they
+// are destroyed with the VM). Returned volids are bare (option suffix stripped).
+func FindForeignActiveDisks(cfg map[string]any, ownerVMID int) map[string]string {
+	out := make(map[string]string)
+	for slot, optstr := range qemu.ParseDisks(cfg) {
+		bare := optstr
+		if comma := strings.Index(optstr, ","); comma >= 0 {
+			bare = optstr[:comma]
+		}
+		vmid, ok := EmbeddedDiskVMID(bare)
+		if !ok || vmid == ownerVMID {
+			continue
+		}
+		out[slot] = bare
 	}
 	return out
 }
