@@ -1,143 +1,244 @@
 # Architecture
 
-The BOSH PVE CPI is a Go binary that implements the BOSH CPI v2 specification for PVE 9.x. The director invokes the binary per request, exchanging JSON-RPC envelopes over stdin and stdout. Internally the code is split into layered packages; each layer has a single responsibility and a narrow interface so unit tests can replace dependencies with mocks.
+The BOSH PVE CPI is a Go binary that implements the BOSH CPI v2 specification for PVE 9.x. The director invokes the binary once per request, exchanging JSON-RPC envelopes over stdin and stdout. Internally the code splits into layered packages. Each layer has a single responsibility and a narrow interface, so unit tests replace dependencies with mocks.
+
+This document describes the structure: where code lives, how the packages depend on one another, what happens during a single request, the cross-cutting mechanisms that span packages, and how errors flow back to the director. For method signatures and per-method behavior, see [CPI Methods](cpi_methods.md).
 
 ## Source Layout
 
-Go sources live under `src/pve_cpi/` so the directory shape matches the BOSH packaging spec (`packages/pve_cpi/spec` globs `pve_cpi/...`). Concretely:
+Go sources live under `src/pve_cpi/` so the directory shape matches the BOSH packaging spec (`packages/pve_cpi/spec` globs `pve_cpi/...`):
 
-- `src/pve_cpi/cmd/cpi` — binary entry point
-- `src/pve_cpi/internal/...` — internal packages described below
-- `src/pve_cpi/go.mod`, `src/pve_cpi/go.sum`, `src/pve_cpi/vendor/`
+- `src/pve_cpi/cmd/cpi` — binary entry point.
 
-The Go module path is `github.com/fivetwenty-io/bosh-pve-cpi` and the internal package import paths (e.g. `internal/cpi/handlers`) are unchanged. References to `cmd/cpi` and `internal/...` below name Go packages, not repo-root directories.
+- `src/pve_cpi/internal/...` — internal packages described below.
 
-## Layers
+- `src/pve_cpi/go.mod`, `src/pve_cpi/go.sum`, `src/pve_cpi/vendor/` — module metadata and vendored dependencies.
 
-- `cmd/cpi`
+The Go module path is `github.com/fivetwenty-io/bosh-pve-cpi`, and the internal import paths (for example `internal/cpi/handlers`) are unchanged. References to `cmd/cpi` and `internal/...` below name Go packages, not repo-root directories.
 
-  Binary entry point. Parses CLI flags, loads config, builds dependencies, dispatches one request per line from stdin until EOF or signal.
+## Package Layers
 
-- `internal/jsonrpc`
+Packages are grouped by role, each described in one sentence.
 
-  Encodes and decodes BOSH CPI request and response envelopes. Owns the wire format.
+### Entry and transport
 
-- `internal/cpi`
+- `cmd/cpi` — binary entry point: parses CLI flags, loads config, builds dependencies, resolves configured hooks, and runs the JSON-RPC loop reading one request per line from stdin until EOF or signal.
 
-  Dispatcher and handler registry. Routes a method name to its `Handler`, translates handler errors to typed CPI error responses.
+- `internal/jsonrpc` — encodes and decodes BOSH CPI request and response envelopes, and carries the per-request `Context` type.
 
-- `internal/cpi/handlers`
+### Dispatch and handlers
 
-  One file per CPI method. Each handler decodes arguments, calls the PVE wrapper and agent strategy, then returns either a result or a typed CPI error.
+- `internal/cpi` — the dispatcher routes a method name to its `Handler`, wraps every call in panic recovery and a timeout, gates request tracing, and installs the rollback stack; it also defines the `Hook` interface used by middleware.
 
-- `internal/agent`
+- `internal/cpi/handlers` — one file per CPI method, plus cross-cutting helpers (the layered cloud-properties resolver, per-disk performance encoding, the in-flight semaphore, placement glue, storage-tier matching, stemcell provenance, and SDN wiring).
 
-  Agent bootstrap strategies. `ConfigDrive`, `RegistryAgent`, and `NoAgent` implement the `Agent` interface (`Configure` / `Remove` / `UpdateDiskHints`). `ConfigDrive` is selected by `pve.agent_mode: cloudinit` (the default); see [ConfigDrive](configdrive.md).
+- `internal/cpi/hooks` — the built-in hooks (`audit_log`, `notes_audit`, `lb_register`, `external_command`) and the `Registry` map that config validation checks names against.
 
-- `internal/pve`
+### PVE and stemcell transport
 
-  Thin wrapper over `github.com/fivetwenty-io/pve-apiclient-go/v3`. Builds the SDK client from `internal/config`, polls task UPIDs, allocates VMIDs race-safely, parses disk CIDs, and normalises SDK errors to BOSH CPI error types.
+- `internal/pve` — wraps `github.com/fivetwenty-io/pve-apiclient-go/v3`: VM, disk, network, and storage CRUD, task UPID polling, retry and backoff, pushback detection, the cluster pool lock, SDN apply, the foreign-disk guard, and SDK-error normalization.
 
-- `internal/registry`
+- `internal/pve/stemcell_fetch` — fetches a stemcell tarball (S3 or local), extracts and uploads it, and replicates the resulting template across nodes in parallel.
 
-  Minimal HTTP client for the optional BOSH registry. Used only when `agent_mode = registry`.
+### Bootstrap and side channels
 
-- `internal/config`, `internal/errors`, `internal/log`, `internal/version`
+- `internal/agent` — the `Agent` abstraction (`Configure`, `Remove`, `UpdateDiskHints`) with cloudinit, registry, noagent, and auto factories.
 
-  Shared primitives. Config parses and validates the CPI JSON document. Errors defines the BOSH CPI error taxonomy with `OkToRetry` semantics. Log wraps `log/slog` with context-carrying helpers and a test observer. Version exposes build-time identifiers populated via `-ldflags`.
+- `internal/configdrive` — builds the ISO 9660 config-drive image the cloudinit agent uses to deliver settings; see [ConfigDrive](configdrive.md).
+
+- `internal/registry` — the optional BOSH registry HTTP client, HTTPS by default, with an SSRF guard that blocks redirects and a resolved-host allowlist.
+
+- `internal/lb` — a HAProxy Data Plane API client used by the `lb_register` hook to add and remove backend servers.
+
+- `internal/exec` — a sandboxed subprocess runner (path allowlist, symlink resolution, process-group kill, environment scrub) used by the `external_command` hook.
+
+- `internal/placement` — collects per-node facts (cluster status, resources, HA tags) and scores nodes for VM placement with AZ-group anti-affinity.
+
+### Shared primitives
+
+- `internal/config` — parses and validates the CPI JSON document (vm_types, disk_types, storage_tiers, hooks, and the rest); it imports `internal/cpi/hooks` only to validate hook names against the registry.
+
+- `internal/errors` — the BOSH CPI error taxonomy (`Cloud`, `RetriableCloud`, `NotSupported`, `NotImplemented`, and the not-found variants) with `OkToRetry` semantics.
+
+- `internal/log` — a zap-backed logger with context helpers, a test observer, and the `RedactSecrets` scrubber.
+
+- `internal/version` — build-time version identifiers populated via `-ldflags`.
+
+## Dependency Tiers
+
+The internal packages form an acyclic graph. Leaf packages depend only on the standard library; each higher tier depends on lower ones, and `cmd/cpi` wires everything together at the top.
+
+One chain looks like a cycle but is not. `config` imports `cpi/hooks` (for the registry name check), `cpi/hooks` imports `cpi` (for the `Hook` interface), and `cpi` does **not** import `config`. The hook config structs live in the `hooks` package precisely to keep this a one-way chain. The build confirms it: there is no import cycle.
+
+```mermaid
+graph TD
+    subgraph T0[Tier 0 leaf]
+        errors
+        jsonrpc
+        log
+        version
+        configdrive
+    end
+    subgraph T1[Tier 1]
+        exec
+        lb
+        placement
+        registry
+    end
+    subgraph T2[Tier 2]
+        pve
+        config
+    end
+    subgraph T3[Tier 3]
+        hooks[cpi/hooks]
+        sfetch[pve/stemcell_fetch]
+    end
+    subgraph T4[Tier 4]
+        cpi
+        agent
+    end
+    subgraph T5[Tier 5]
+        handlers[cpi/handlers]
+    end
+    cmd[cmd/cpi]
+
+    exec --> log
+    lb --> errors
+    placement --> log
+    registry --> errors
+    pve --> config
+    pve --> log
+    config --> hooks
+    hooks --> cpi
+    hooks --> exec
+    hooks --> lb
+    sfetch --> pve
+    agent --> configdrive
+    agent --> registry
+    agent --> pve
+    handlers --> agent
+    handlers --> placement
+    handlers --> sfetch
+    handlers --> cpi
+    cmd --> handlers
+    cmd --> agent
+    cmd --> pve
+```
+
+The single most important non-obvious edge: `internal/pve` does not import `internal/agent`, and `internal/agent` does not import `internal/cpi`. The PVE client knows nothing about agents, and agents know nothing about dispatch.
 
 ## Request Flow
+
+A request enters as one JSON-RPC line on stdin and leaves as one line on stdout. The dispatcher is the fixed point everything routes through.
 
 ```mermaid
 graph TD
     Director -->|stdin JSON-RPC| Main[cmd/cpi/main]
     Main -->|Decode| RPC[internal/jsonrpc]
     Main -->|Handle| Dispatcher[internal/cpi.Dispatcher]
-    Dispatcher -->|Lookup| Handler[internal/cpi/handlers.Handle*]
+    Dispatcher -->|Hook chain| Hooks[internal/cpi/hooks]
+    Hooks -->|Lookup| Handler[handlers.Handle*]
+    Handler -->|Score nodes| Placement[internal/placement]
     Handler -->|VM, disk, task| PVE[internal/pve]
     Handler -->|Bootstrap| Agent[internal/agent]
-    PVE -->|HTTPS| API[PVE API]
+    PVE -->|HTTPS, retry + pushback| API[PVE API]
     Agent -.->|cloudinit| PVE
     Agent -.->|registry| Registry[internal/registry]
+    Handler -->|error| Rollback[Rollback stack LIFO]
     Handler -->|Result or Error| Dispatcher
     Dispatcher -->|Encode| RPC
     RPC -->|stdout JSON-RPC| Director
 ```
 
-## Dependency Direction
+The dispatcher decodes the envelope, looks up the handler, and runs it inside a `recover()` block under a timeout. Configured hooks wrap the handler as a chain, running before and after it without per-handler code. The handler decodes its arguments, optionally scores nodes through `internal/placement`, then drives the PVE client and the agent. Each resource the handler acquires registers a cleanup function on the rollback stack. If the handler returns a non-nil error, the dispatcher fires those cleanups in LIFO order; on success it drops them. The result or typed error is encoded back to the director.
 
-```text
-cmd/cpi
-   ↓
-internal/cpi → internal/cpi/handlers
-                       ↓
-                 internal/agent, internal/pve
-                       ↓
-internal/registry, internal/config, internal/errors, internal/log, internal/version, internal/jsonrpc
-                       ↓
-                   stdlib + SDK
-```
+## Cross-Cutting Subsystems
 
-No cycles. `internal/pve` does not import `internal/agent`; `internal/agent` does not import `internal/cpi`.
+These mechanisms span multiple packages. Operational depth lives in the linked sibling docs; what follows is architecture-level only.
+
+### Dispatcher: panic recovery, timeout, and tracing
+
+The dispatcher wraps every handler call in `recover()`. A recovered panic becomes a `RetriableCloud` error and a logged stack trace, so the director re-drives the call instead of receiving a malformed response. A configurable per-request timeout bounds each call. Request tracing is gated behind a config flag; when on, the dispatcher passes arguments and results through `RedactSecrets` before logging them. A CPI failure must never wedge the director or leak a secret into a log.
+
+### Rollback stack
+
+`WrapHandler` installs a `rollbackHolder`, a LIFO stack of cleanup functions, into the request context at registration time. After acquiring a resource (a VM, a disk, an LB backend), a handler or hook calls `RegisterRollback`. `WrapHandler` runs the stack only when the inner handler returns a non-nil error, and a `sync.Once` makes the firing idempotent. Every method gets partial-failure cleanup without per-handler boilerplate; a half-created VM does not leak.
+
+### Hooks middleware
+
+`hooks.Registry` is a `map[string]func(Deps) cpi.Hook`. Config validation rejects any configured hook name absent from the map. At startup `cmd/cpi` resolves the configured names, builds `Deps` (logger, LB client, config), and passes the constructed hooks to the dispatcher, which chains them around each handler. Four hooks ship: `audit_log` logs the call and duration, `notes_audit` writes VM notes on create, `lb_register` adds and removes HAProxy backends (with an SSRF guard and a rollback registration so deregistration fires on create failure), and `external_command` runs a sandboxed command through `internal/exec`. With no hooks configured the overhead is zero. Hook configuration properties are documented in [Configuration](configuration.md).
+
+### Placement and AZ anti-affinity
+
+`GatherNodeFacts` queries `/cluster/status`, `/cluster/resources`, and per-node storage to build each node's memory, CPU, storage, guest count, and HA tags. `ScoreNodes` computes a weighted sum (memory 1.0, storage 0.5, CPU 0.5, guest count 0.3, anti-affinity penalty 5.0×). The `create_vm` handler calls `SelectNode` and feeds the winner to every subsequent clone and attach call, then optionally writes a PVE HA node-affinity rule (`bosh-na-{vmid}`). A sentinel AZ value of `dlb` hands placement to the PVE 9.2 Dynamic Load Balancer instead; see [DLB-Aware Placement](dlb-aware-placement.md). VMs land on nodes that can host them, and anti-affinity groups spread across failure domains.
+
+### Cluster pool lock
+
+PVE resource pools double as a cluster-wide mutex: `POST /pools` is pmxcfs-serialized, so a duplicate poolid returns a 4xx, which means the lock is held. `AcquireClusterLock` creates a `bosh-lock-{key}` pool, embedding an owner UUID and an expiry in the pool comment; waiters poll and steal a lock past its expiry. The CPI uses it to serialize the read-modify-write of HA anti-affinity rules across concurrent `create_vm` processes, which would otherwise clobber one another.
+
+### Layered cloud properties and storage tiers
+
+`newLayeredResolver` reads `vm_type` and `disk_type` string selectors from the call's cloud properties into the configured profile maps, then resolves each key across the layers call → disk_type → vm_type → global config, with the call winning. `storage_tiers` adds a layer that matches against live PVE storage, and the global `DiskPerformance` config is the final fallback. Per-disk performance options (iothread, cache, discard, ssd, mbps, iops) are encoded into the disk CID string as a base64+JSON rider, so `attach_disk` decodes them and merges with global config without any out-of-band state. See [Persistent Disks](persistent-disks.md) and [Configuration](configuration.md).
+
+### Agent mode selection
+
+Four agent modes exist: `cloudinit` (the default), `registry`, `noagent`, and `auto`. The `auto` mode defers the choice to `create_vm` time, inspecting the stemcell API version (parsed by `parseAPIVersion`); it picks the registry agent when a registry endpoint is configured and falls back to cloudinit otherwise. The factory rejects `auto` directly, since auto is resolved per call rather than once at startup. The `internal/configdrive` package builds the ISO 9660 image that the cloudinit path delivers; see [ConfigDrive](configdrive.md).
+
+### Retry, pushback, and in-flight limiting
+
+`RetryOnTransient` wraps every PVE API call: exponential backoff of 1s × 1.5ⁿ with ±30% jitter, capped at 15s, up to 8 attempts. `IsPVEPushback` detects HTTP 429 and known PVE phrase patterns and injects a longer `PushbackBackoff` (5s base, 60s cap). An optional per-node in-flight semaphore (`max_inflight_per_node`) gates mutating calls before they reach PVE, reducing pushback at the source. pvedaemon recycles workers and serializes per-storage operations under burst load, making all three layers necessary; see [PVE Transient Transport Faults](pve-transient-transport.md) and [PVE Storage Locking](pve-storage-locking.md).
+
+### Task awaiting
+
+Every PVE call that returns a UPID is awaited via `AwaitTask` before the handler returns. By default the wrapper polls at a fixed 2-second interval. When adaptive polling is enabled, the interval varies between 1 and 10 seconds based on the task's reported progress, polling faster as a task nears completion. Standard calls use a 300-second deadline; stemcell upload and VM disk import use a 600-second deadline (`pve.StemcellMaxWait`) to accommodate large qcow2 files and format conversion such as qcow2 → raw on LVM storage.
+
+### Log redaction
+
+`RedactSecrets` deep-walks maps and strings before anything reaches the log. It masks map values whose key contains a sensitive fragment (password, secret, token, mbus, signature, and similar) or matches `user`/`username` exactly, URL userinfo segments (`scheme://user:pass@host`), and URL query parameters matching a sensitive fragment or the exact `sig`. The dispatcher applies it to traced arguments and results, and the same walk masks credentials embedded in URL-shaped strings. Credentials in cloud properties or registry endpoints must never appear in plaintext logs.
 
 ## Error Mapping
 
-Every SDK error flows through `internal/pve.WrapError`, which classifies HTTP 4xx as `CloudError`, HTTP 404 as a flag the caller upgrades to `VMNotFound` or `DiskNotFound`, HTTP 5xx and network timeouts as `RetriableCloudError`. The dispatcher serialises the resulting error's `Type()`, `Error()`, and `OkToRetry()` into the JSON-RPC error envelope.
-
-## Task Awaiting
-
-Every PVE API call that returns a UPID is awaited via `internal/pve.AwaitTask` before the handler returns. The wrapper polls with a default 2-second interval and a configurable deadline. Standard calls use a 300-second deadline; stemcell upload and VM disk import use a 600-second deadline (`pve.StemcellMaxWait`) to accommodate large qcow2 files and PVE format conversion (e.g., qcow2 → raw on LVM storage).
+Every SDK error flows through `internal/pve.WrapError`, which classifies HTTP 4xx as a non-retriable `CloudError` and HTTP 5xx and network timeouts as `RetriableCloudError`. A 404 returns a non-retriable `CloudError` that callers upgrade: `WrapNotFoundVM` and `WrapNotFoundDisk` turn it into `VMNotFound` or `DiskNotFound` at the call site, where the resource type is known. The dispatcher serializes the resulting error's `Type()`, `Error()`, and `OkToRetry()` into the JSON-RPC error envelope, and the director uses `OkToRetry` to decide whether to re-drive the call.
 
 ## Stemcell Model
 
-Each stemcell is backed by a single frozen PVE template VM. `create_vm` clones that template instead of running a qcow2 block-copy per VM. On linked-clone–capable storage backends this reduces VM creation from roughly four minutes to seconds.
+Each stemcell is backed by a single frozen PVE template VM. `create_vm` clones that template rather than running a qcow2 block-copy per VM. On linked-clone-capable backends this drops VM creation from roughly four minutes to seconds.
 
-### create_stemcell
+`create_stemcell` uploads the disk image (extracting a gzip+tar tarball first when needed), imports it into a new QEMU VM in the template VMID range (default `[30000, 30999]`), freezes that VM with `MakeTemplate`, and tags it with a short SHA so later calls can find it. The returned stemcell CID is `template:<vmid>`, for example `template:30042`. Template creation is idempotent: an existing template with the canonical name is reused. For multi-node clusters, `stemcell_storage` must be a shared pool reachable from every node; `create_stemcell` rejects local storage there, while single-node clusters may use it. The `stemcell_fetch` pipeline can fetch a tarball from S3 or local storage and replicate the frozen template across nodes in parallel, and templates carry provenance tags that a cross-node sweep uses to garbage-collect orphans on delete.
 
-The handler uploads the disk image (or extracts it from a gzip+tar tarball first) to the configured `stemcell_storage` pool under content type `import`. The upload volume is addressed as `<storage>:import/<filename>`.
+`create_vm` and `delete_stemcell` both dispatch on the stemcell CID format:
 
-Filename format:
-
-```
-bosh-stemcell-<sanitized-name>-<sanitized-version>-<sha8>.qcow2
-```
-
-where `sha8` is the first 8 hex characters of the SHA-256 hash of the disk image.
-
-After the upload, the handler creates a new QEMU VM in the template VMID range (`[stemcell_template_vmid_range_start, stemcell_template_vmid_range_end]`, default `[30000, 30999]`), imports the qcow2 into it, and freezes it with `MakeTemplate`. The VM is named `bosh-stemcell-<name>-<version>` and tagged with `bosh-stemcell-sha-<sha8>` for later lookup. For CPI-owned images (heavy tarball uploads and light-fetch images), the intermediate upload volume is deleted after the template is frozen; for operator-preuploaded light stemcell images the upload volume is left intact.
-
-Template creation is idempotent: if a template VM with the canonical name already exists in the template VMID range, the existing VMID is reused and the upload is skipped.
-
-The returned **stemcell CID** is:
-
-```
-template:<vmid>
+```mermaid
+flowchart TD
+    CID[stemcell_cid] --> Fmt{Format?}
+    Fmt -->|template:vmid| Clone[Clone template, fast path]
+    Fmt -->|storage:import/file| Tag[Find template by SHA tag]
+    Fmt -->|light:...| Tag
+    Tag --> Found{Match?}
+    Found -->|yes| Clone
+    Found -->|no| Slow[block-copy import, slow path]
+    Clone --> Done[VM created]
+    Slow --> Done
 ```
 
-For example: `template:30042`
+The `template:` CID takes the clone path directly. Pre-upgrade CIDs (`storage:import/...` or `light:...`) extract the SHA, look up a matching template, and clone it when found or fall back to the per-VM block-copy when not. `delete_stemcell` destroys a `template:` VM with `purge=true`, deletes an `import/` volume, treats `light:` and integer-only CIDs as no-ops, and treats an already-absent resource as success. Clone type follows `pve.clone_mode` (default `auto`): linked copy-on-write for snapshot-capable backends, full clone for thick LVM. New VMs allocate from the VMID range (default `[100, 8999]`).
 
-All three create_stemcell paths (heavy tarball, light-preuploaded, light-fetch) return a `template:` CID. The older `<storage>:import/<filename>` CID form only appears in stemcell_cid values produced before this feature was introduced.
+For method signatures, arguments, returns, and per-method error handling, see [CPI Methods](cpi_methods.md). For light-stemcell deployment modes and storage requirements, see [Light Stemcells](light-stemcells.md).
 
-### create_vm
+## See Also
 
-The handler dispatches on the stemcell CID format:
+- [CPI Methods Reference](cpi_methods.md) — per-method signatures, arguments, returns, and errors.
 
-- **`template:<vmid>`** — clones the template VM directly. This is the fast path.
-- **Pre-upgrade CID** (`<storage>:import/<file>` or `light:...`) — extracts the sha8 from the filename and searches for a matching template by PVE tag. If found, clones it (fast path). If not found, falls back to the original `import-from=` slow path (block-copy per VM).
+- [Configuration](configuration.md) — all CPI properties and defaults.
 
-Clone type follows `pve.clone_mode` (default `auto`): linked CoW for snapshot-capable backends, full clone for `lvm`-thick.
+- [ConfigDrive](configdrive.md) — agent settings delivery via the config-drive ISO.
 
-VMID allocation for the new VM uses the range `[vmid_range_start, vmid_range_end]` (default `[100, 8999]`).
+- [Networks](networks.md) — network lifecycle and cloud_properties routing.
 
-### delete_stemcell
+- [Persistent Disks](persistent-disks.md) — storage and node-selection cloud properties.
 
-The handler dispatches on the CID format:
+- [Light Stemcells](light-stemcells.md) — light-mode deployment guide.
 
-- **`template:<vmid>`** — destroys the template VM with `purge=true` (removes all associated disks). Idempotent: an already-absent VM is treated as success.
-- **`<storage>:import/<filename>`** — deletes the qcow2 volume via `DeleteVolumeIfExists`. Missing volumes are logged at WARN and treated as success.
-- **`light:...`** — no-op (operator-managed image; CPI never deletes it).
-- **Integer-only** — no-op (pre-upgrade legacy CID scrub).
+- [PVE Transient Transport Faults](pve-transient-transport.md) — pvedaemon worker recycling and retry handling.
 
-### Shared-storage requirement
-
-`stemcell_storage` must be a shared PVE storage pool accessible from every cluster node (NFS, CIFS, CephFS, GlusterFS, or any pool with `shared=1` in the PVE storage config). The CPI enforces this at `create_stemcell` time: local storage is rejected with a descriptive error when the cluster has more than one node. Single-node clusters may use local storage.
+- [PVE Storage Locking](pve-storage-locking.md) — per-storage lockfile serialization.

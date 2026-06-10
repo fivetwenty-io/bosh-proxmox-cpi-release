@@ -16,7 +16,13 @@ This CPI enables BOSH to provision and manage resources on PVE 9.x, implementing
 
 - [Configuration](configuration.md): Comprehensive guide to configuration options.
 
+- [Network Management](networks.md): SDN versus bridge routing, vnet naming, zone auto-management, and network cloud_properties.
+
+- [Persistent Disks](persistent-disks.md): Storage backend classification, the storage type matrix, and disk cloud_properties for storage and node selection.
+
 - [ConfigDrive](configdrive.md): How the CPI delivers BOSH agent settings via an OpenStack ConfigDrive ISO, plus the SCSI slot reservation map.
+
+- [Light Stemcells](light-stemcells.md): Pre-uploaded and CPI-fetch light-stemcell modes, storage requirements, and node pinning.
 
 - [Deploying a Director with `bosh create-env`](bosh-create-env.md): Step-by-step workflow to bring up a BOSH Director on PVE, including network reachability gotchas and SSH access.
 
