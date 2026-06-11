@@ -30,7 +30,9 @@ This CPI enables BOSH to provision and manage resources on PVE 9.x, implementing
 
 - [PVE API Permissions](pve-api-permissions.md): Creating the API token and a minimum-privilege `bosh@pve` user with a custom `BoshOperator` role, plus the per-method privilege inventory.
 
-- [PVE Storage Locking](pve-storage-locking.md): How PVE's per-storage lockfile serialises every storage mutation, why bursty BOSH deploys hit it, and how the CPI retries to absorb the contention.
+- [PVE Per-Storage Lockfile Behaviour](pve-storage-locking.md): How PVE's per-storage lockfile serialises every storage mutation, why bursty BOSH deploys hit it, and how the CPI retries to absorb the contention.
+
+- [DLB-Aware Placement](dlb-aware-placement.md): Opt-in integration with the PVE 9.2 Dynamic Load Balancer — node scoring, availability-zone pinning, and HA node-affinity rules.
 
 - [PVE Transient Transport Faults](pve-transient-transport.md): How pvedaemon worker recycling produces HTTP 596 and auth-ticket EOFs under burst load, and how the CPI absorbs them.
 

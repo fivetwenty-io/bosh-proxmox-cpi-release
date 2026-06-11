@@ -1,6 +1,6 @@
 # PVE Per-Storage Lockfile Behaviour
 
-This document captures how Proxmox VE serialises storage operations behind a per-storage lockfile, what failure mode it produces under bursty concurrent CPI calls, and the retry strategy this CPI uses to absorb it.
+This document covers how Proxmox VE serialises storage operations behind a per-storage lockfile, what failure mode it produces under bursty concurrent CPI calls, and the two locking mechanisms the CPI uses to absorb it.
 
 ## What PVE does
 
@@ -48,6 +48,16 @@ The task is reported as failed (not running, not retried by PVE). The CPI sees t
 
 The substring match `"can't lock file" && "got timeout"` is the canonical detector; `pve.IsStorageLockTimeout` implements it case-insensitively.
 
+### IsLVMCommandTimeout
+
+`IsStorageLockTimeout` is a superset that also catches LVM userspace tool timeouts. PVE shells out to `/sbin/lvs`, `/sbin/lvcreate`, `/sbin/lvremove`, and similar tools during `qm resize` / `qmcreate` / `qmdestroy` on LVM-thin storage. Under concurrent VG activity, any one of these tools can stall against the LVM metadata daemon, and PVE's command wrapper kills it after its internal deadline. The canonical surface is:
+
+```
+task failed: command '/sbin/lvs --separator ... /dev/data/vm-N-disk-0' failed: got timeout
+```
+
+`IsLVMCommandTimeout` matches `"failed: got timeout"` anchored to `/sbin/lv` or `/sbin/vg` in the error string to avoid false positives from unrelated command timeouts. Both lockfile and LVM surfaces are transient storage-backend contention — same seconds-scale backoff applies to both.
+
 ## When the CPI hits it
 
 A BOSH director driving a Cloud Foundry deploy can launch a dozen or more concurrent `create_vm` calls within a second of each other. Each one runs as a separate OS process (one `bosh-pve-cpi` invocation per VM), so in-process serialisation does nothing. The director's worker pool is the only knob, and it defaults wide.
@@ -68,33 +78,33 @@ Observed contention points, in deploy-time order:
 
 ## The retry strategy
 
-Per-storage lock timeouts are transient: the holder finishes in seconds-to-minutes and the lock becomes available. Cross-process distributed coordination is the larger fix; retry with backoff is the pragmatic one.
+This CPI implements storage-lock retry in `internal/pve/retry.go`:
 
-This CPI implements both pieces in `internal/pve/retry.go`:
+- `pve.IsStorageLockTimeout(err)` — substring predicate on the SDK error message; also covers `IsLVMCommandTimeout`.
 
-- `pve.IsStorageLockTimeout(err)` — substring predicate on the SDK error message.
+- `pve.StorageLockBackoff(attempt)` — exponential `2 s × 1.5^attempt` with ±30% jitter, hard-capped at 30 s.
 
-- `pve.StorageLockBackoff(attempt)` — exponential `2 s × 1.5^attempt` with ±30 % jitter, hard-capped at 30 s.
-
-- `pve.RetryOnStorageLock(ctx, logger, label, maxAttempts, op)` — invokes `op` up to `maxAttempts` times (default 10), retrying only on `IsStorageLockTimeout`. Other errors propagate immediately. Context cancellation short-circuits the sleep.
+- `pve.RetryOnTransientOrLock(ctx, logger, label, maxAttempts, op)` — invokes `op` up to `maxAttempts` times (default 10), retrying on `IsStorageLockTimeout`, `IsTransientTransport`, or `IsPVEPushback`. Other errors propagate immediately. Context cancellation short-circuits the sleep.
 
 At default settings, a worst-case all-retries run waits roughly `2 + 3 + 4.5 + 6.75 + 10.1 + 15.2 + 22.8 + 30 + 30 = 124 s` before giving up — well inside BOSH's task timeout but long enough for any reasonable lock holder to finish.
 
 ### Where the helper is wired
 
-| Surface | Operation wrapped |
-|---------|-------------------|
-| `create_vm` | initial `Create+import` (via `AllocateWithRetry` + `WithBackoffFunc`); `ResizeDisk(virtio0)` + await |
-| `create_disk` | `CreateVolume` inside the `AllocateDiskWithRetry` callback |
-| `delete_disk` | `DeleteVolume` |
-| `resize_disk` | `ResizeDisk` + await |
-| `delete_vm` | `DeleteQemu` (with `DestroyUnreferencedDisks=true`) |
-| `create_stemcell` | `Storage().Upload` + await (file handle reopened per attempt) |
-| `delete_stemcell` | `DeleteVolumeIfExists` |
-| `snapshot_disk` | `Snapshot` + await |
-| `delete_snapshot` | `DeleteSnapshot` |
-| `update_disk` | `ResizeDisk` on the resize path (cache/iothread-only changes skip storage I/O) |
-| `agent/configdrive` | `Upload` + await (file reopened per attempt), `DeleteVolume` |
+All storage-touching call sites use `RetryOnTransientOrLock`, which combines pushback, transient-transport, and storage-lock predicates. Operators will therefore see `reason=storage_lock`, `reason=transient_transport`, or `reason=pushback` in CPI logs for the same operations, depending on which condition fired.
+
+| Surface | Operation wrapped | Also retries |
+|---------|-------------------|--------------|
+| `create_vm` | initial `Create+import` (via `AllocateWithRetry`); `ResizeDisk(virtio0)` + await | transient_transport, pushback |
+| `create_disk` | `CreateVolume` inside `AllocateDiskWithRetry` callback | transient_transport, pushback |
+| `delete_disk` | `DeleteVolume` | transient_transport, pushback |
+| `resize_disk` | `ResizeDisk` + await | transient_transport, pushback |
+| `delete_vm` | `DeleteQemu` (with `DestroyUnreferencedDisks=true`) | transient_transport, pushback |
+| `create_stemcell` | `Storage().Upload` + await (file handle reopened per attempt) | transient_transport, pushback |
+| `delete_stemcell` | `DeleteVolumeIfExists` | transient_transport, pushback |
+| `snapshot_disk` | `Snapshot` + await | transient_transport, pushback |
+| `delete_snapshot` | `DeleteSnapshot` | transient_transport, pushback |
+| `update_disk` | `ResizeDisk` on the resize path (cache/iothread-only changes skip storage I/O) | transient_transport, pushback |
+| `agent/configdrive` | `Upload` + await (file reopened per attempt), `DeleteVolume` | transient_transport, pushback |
 
 `attach_disk` and `detach_disk` are not wrapped — they only mutate VM config and never touch the storage lock.
 
@@ -117,37 +127,76 @@ We observed this exact race against `vm-117-config.iso`:
 
 The fix is in the SDK and CPI: `Storage().DeleteVolumeAsync` and `Storage().DeleteVolumeIfExistsAsync` (added in `pve-apiclient-go` v3.1.6) return the imgdel UPID. The CPI's `agent/configdrive` pre-delete now awaits that UPID before uploading, so a queued imgdel can never fire mid-create. Same wiring applies to `delete_disk` and `create_disk`'s rollback paths.
 
+## Cluster Pool Advisory Lock
+
+A second locking mechanism operates at a higher level than the OS lockfile. `AcquireClusterLock` acquires a cross-process advisory mutex via PVE resource pool membership.
+
+**Mechanism:** PVE's `POST /pools` is serialised by pmxcfs and rejects a duplicate poolid with a conflict error. That create-or-fail behavior is a test-and-set: the process that creates the sentinel pool holds the lock; concurrent processes wait, or steal if the recorded expiry has passed. The sentinel poolid is named `bosh-lock-{key}` (e.g. `bosh-lock-aa-web`) to avoid colliding with operator pools.
+
+**Purpose:** Anti-affinity membership updates are serialised by `AcquireClusterLock` when `pve.cluster_lock_mode` is enabled. Without this lock, two concurrent `create_vm` calls can both read the anti-affinity group membership, both choose the same node as the least-loaded candidate, and both write membership back — a classic TOCTOU race. The cluster lock serialises the read-modify-write, ensuring each `create_vm` sees a consistent membership state.
+
+**Lock ownership:** The sentinel pool comment records the owner and expiry as `"owner=<token> exp=<unix-seconds>"`. If a CPI process crashes while holding the lock, any waiter whose recorded expiry has passed steals it via delete-and-recreate. Post-steal owner verification confirms the stealing process actually won before granting the handle.
+
+**Release:** `ClusterLockHandle.Release` deletes the sentinel pool. It is idempotent: a second call is a no-op, and a not-found pool is treated as success.
+
+**Config:** `pve.cluster_lock_mode` enables the mechanism; `pve.cluster_lock_timeout_sec` bounds total wait time. On timeout, the error is `TypeRetriableCloud` so the BOSH director re-drives the operation.
+
+For further depth on placement and anti-affinity, see [DLB-Aware Placement](dlb-aware-placement.md).
+
+### Storage-lock retry flow
+
+```mermaid
+flowchart TD
+    OP[PVE storage call] --> ERR{Error?}
+    ERR -- No --> OK[Return success]
+    ERR -- Yes --> P{IsPVEPushback?}
+    P -- Yes --> PB[PushbackBackoff\n5s base / 60s cap]
+    P -- No --> L{IsStorageLockTimeout?\nor IsLVMCommandTimeout?}
+    L -- Yes --> SB[StorageLockBackoff\n2s base / 30s cap]
+    L -- No --> T{IsTransientTransport?}
+    T -- Yes --> TB[TransientBackoff\n1s base / 15s cap]
+    T -- No --> FAIL[Propagate error]
+    PB --> SLEEP[Sleep, increment attempt]
+    SB --> SLEEP
+    TB --> SLEEP
+    SLEEP --> CHK{attempt < maxAttempts?}
+    CHK -- Yes --> OP
+    CHK -- No --> FAIL
+```
+
 ## Operator-side knobs
 
 The CPI's retry absorbs short bursts. If your deploys consistently exhaust the retry budget, the contention is structural and you have three options:
 
 1. **Throttle the director.** `director.workers` and per-instance-group `max_in_flight` cap how many `create_vm` calls run concurrently. Cutting this to half the number of vCPUs on the PVE node usually flattens the burst enough.
 
-2. **Split storages.** Putting the stemcell content on one PVE storage and the VM root disks on another removes the contention between step 1 (import) and step 3 (resize) because they grab different lockfiles. The CPI already supports this via `pve_stemcell_storage` vs `pve_vm_storage` in `vars.yml`; pointing them at different backends is the lever.
+2. **Split storages.** Putting the stemcell content on one PVE storage and the VM root disks on another removes the contention between import and resize because they grab different lockfiles. The CPI supports this via `pve_stemcell_storage` vs `pve_vm_storage` in `vars.yml`.
 
-3. **Tune retry attempts.** `VMIDAllocAttempts` in the CPI config also bounds the storage-lock retry count (default 10). Raising it lets you ride out longer lock holds at the cost of slower failure when something is genuinely stuck.
+3. **Tune retry attempts.** `pve.retry.storage_import.max_attempts` (default 10) bounds the storage-lock retry count. Raising it lets you ride out longer lock holds at the cost of slower failure when something is genuinely stuck.
 
 ## Diagnosing
 
-In the director's CPI log (`/var/vcap/sys/log/cpi/cpi.log` on the director VM):
+In the director's CPI log (`/var/vcap/sys/log/cpi/cpi.log`):
 
 ```
-pve: storage lock timeout, retrying op=create_disk attempt=1 max_attempts=10 backoff_ms=1837 error="..."
+pve: retrying after retryable fault op=create_disk reason=storage_lock attempt=1 max_attempts=10 backoff_ms=1837 error="..."
 ```
 
-Nonzero retry log lines on a deploy that ultimately succeeds: working as intended. Watch the `attempt` value — if it routinely climbs above 5, the lock holder is taking long enough that you should look at option 1 or 2 above.
+Nonzero retry log lines on a deploy that ultimately succeeds mean the mechanism is working as intended. Watch the `attempt` value — if it routinely climbs above 5, the lock holder is taking long enough that you should look at options 1 or 2 above.
 
 `attempt=10` followed by the operation failing means retries were exhausted. Look at the PVE node's `journalctl -u pvedaemon -u pveproxy` from the same window to see what was holding the lock.
 
 ## Related failure mode
 
-Per-storage lock contention is the first transient PVE failure the CPI handles; pvedaemon worker recycling is the second. The two often coexist on the same call sites and are absorbed by the same helper (`RetryOnTransientOrLock`). See [PVE Transient Transport Faults](pve-transient-transport.md) for the worker-recycle side.
+Per-storage lock contention is the first transient PVE failure the CPI handles; pvedaemon worker recycling and HTTP 429 pushback are the second. The two often coexist on the same call sites and are absorbed by the same helper (`RetryOnTransientOrLock`). See [PVE Transient Transport Faults](pve-transient-transport.md) for the worker-recycle and pushback sides.
 
 ## References
 
-- `internal/pve/retry.go` — helper implementation and backoff curve.
+- `internal/pve/retry.go` — helper implementations: `StorageLockBackoff`, `RetryOnStorageLock`, `RetryOnTransientOrLock`.
 
-- `internal/pve/error_map.go` — `IsStorageLockTimeout` predicate.
+- `internal/pve/error_map.go` — `IsStorageLockTimeout`, `IsLVMCommandTimeout` predicates.
+
+- `internal/pve/cluster_lock.go` — `AcquireClusterLock`, `ClusterLockHandle`, `ClusterLockPoolName`.
 
 - `internal/cpi/handlers/create_vm.go` — `createVMRetryBackoff` (per-error backoff routing) and `AllocateWithRetry` wiring.
 

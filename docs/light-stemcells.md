@@ -10,19 +10,23 @@ available:
    `cloud_properties.image_url`; the CPI fetches it once and caches it in PVE
    storage, deduplicating on re-deploy.
 
-Both modes produce a `light:<storage>:import/<file>` stemcell CID. The CPI treats
-light CIDs as operator-managed: `bosh delete-stemcell` returns success without
-removing the underlying qcow2 volume. To reclaim storage, use `pvesm free` or
-the PVE UI directly (see [Operator caveats](#operator-caveats)).
+Both modes build a frozen template VM and return a stemcell CID of the form
+`template:<vmid>` (e.g., `template:30042`). `bosh delete-stemcell` on a
+`template:` CID destroys that template VM and its backing volume. The legacy
+`light:` CID prefix is recognized for backward compatibility on delete only —
+current code does not produce it. See the [Architecture — Stemcell Model](architecture.md#stemcell-model)
+section for the full CID dispatch table.
 
 ## When to use
 
 - **Air-gapped lab** — upload once via `pvesm` or the PVE Upload API; reuse across
   redeploys without touching the BOSH director upload path.
+
 - **Multi-deployment infrastructure** — point multiple deployments at the same CPI-fetched
-  image from a private mirror; dedup avoids redundant downloads.
-- **Large stemcells** — avoid the director-to-CPI upload bottleneck when network
-  bandwidth between the BOSH director and the PVE storage node is a constraint.
+  image from a private mirror; the CPI reuses the cached copy.
+
+- **Large stemcells** — avoid the director-to-CPI upload bottleneck when bandwidth
+  between the director and PVE storage is limited.
 
 ## Storage requirements
 
@@ -46,16 +50,18 @@ accept qcow2 uploads and are rejected.
 
 - **Single-node** — any file-content backend is accepted. `cloud_properties.node`
   is optional.
+
 - **Multi-node + shared storage** (nfs, cifs, cephfs, glusterfs) — accepted without
   node pinning.
+
 - **Multi-node + local storage** (dir, btrfs) — `cloud_properties.node` is required.
   Without it, the CPI cannot guarantee that the uploaded image and any VM that uses it
   land on the same node.
 
 ## Mode 1: Pre-uploaded
 
-The operator uploads the qcow2 to PVE storage manually; the CPI confirms the file
-is present and returns the light CID. No bytes flow through the CPI.
+The operator uploads the qcow2 to PVE storage manually. The CPI confirms the file
+is present, builds a frozen template VM from it, and returns `template:<vmid>`.
 
 ### Operator workflow
 
@@ -95,7 +101,7 @@ is present and returns the light CID. No bytes flow through the CPI.
    ```
 
    The `bosh repack-stemcell` command can inject or replace `cloud_properties` in an
-   existing stemcell tarball when you do not want to author one from scratch.
+   existing stemcell tarball to avoid authoring one from scratch.
 
 4. Upload to the director:
 
@@ -103,12 +109,11 @@ is present and returns the light CID. No bytes flow through the CPI.
    bosh upload-stemcell <light-tarball.tgz>
    ```
 
-   The CPI validates that `image_id` resolves to a real volume on PVE and returns the
-   light CID `light:nfs-stemcells:import/bosh-stemcell-ubuntu-jammy-1.438-a1b2c3d4.qcow2`.
-   No image bytes are transferred.
+   The CPI confirms `image_id` points to a real volume on PVE, builds a frozen
+   template VM from it, and returns a `template:<vmid>` CID (e.g., `template:30042`).
 
-5. Deploy normally. `bosh deploy` passes the light CID to `create_vm`, which strips
-   the `light:` prefix and imports the image directly from PVE storage.
+5. Deploy normally. `bosh deploy` passes the `template:` CID to `create_vm`, which
+   clones the template directly.
 
 ### Error messages
 
@@ -121,9 +126,9 @@ is present and returns the light CID. No bytes flow through the CPI.
 
 ## Mode 2: CPI-assisted fetch
 
-The CPI fetches the qcow2 from a remote URL, streams it into PVE storage, and caches
-it there. Subsequent `bosh upload-stemcell` calls for the same image skip the download
-entirely.
+The CPI fetches the qcow2 from a remote URL, streams it into PVE storage, builds a
+frozen template VM from it, and returns `template:<vmid>`. Subsequent
+`bosh upload-stemcell` calls for the same image skip the download entirely.
 
 ### URL schemes
 
@@ -223,15 +228,15 @@ password: "<pass>"    # optional
 
 ### Dedup
 
-The CPI deduplicates fetched images by `(name, version, sha8)` filename pattern. When
+The CPI deduplicates fetched images using a `(name, version, sha8)` filename pattern. When
 `bosh upload-stemcell` is called a second time for the same image:
 
 1. The CPI scans PVE storage for any import volume with a matching `name`+`version` prefix.
-2. If a match is found, it returns the existing light CID without fetching the remote URL.
+2. If a match is found, it returns the existing `template:<vmid>` CID without fetching the remote URL.
 3. After the fetch, an exact SHA-256 check provides a second dedup gate.
 
-The result is that a re-deploy or second `bosh upload-stemcell` for an already-cached
-image completes in milliseconds.
+A re-deploy or second `bosh upload-stemcell` for an already-cached image completes in
+milliseconds.
 
 ### Error messages
 
@@ -243,15 +248,76 @@ image completes in milliseconds.
 | `storage %q (type=%q) is block-only` | Fetch target storage is LVM/ZFS/RBD. | Switch `stemcell_storage` to a file-content backend. |
 | `storage %q is local on a multi-node cluster` | Local storage, no node pin. | Add `cloud_properties.node`. |
 
+## Template VM lifecycle
+
+All stemcell paths (heavy, pre-uploaded, and CPI-fetch) converge on the same lifecycle:
+the CPI builds a frozen PVE template VM and returns its VMID as the stemcell CID.
+
+```mermaid
+flowchart LR
+    A[heavy tarball] --> E[ensureTemplateVM]
+    B[pre-uploaded qcow2] --> E
+    C[CPI-fetch URL] --> D[download + store qcow2] --> E
+    E --> F["template:&lt;vmid&gt;"]
+```
+
+### VMID range
+
+Template VMs are allocated from a dedicated VMID range, separate from VM and disk
+ranges, so they are easy to identify in the PVE UI. The default range is `[30000, 30999]`.
+Override with `pve.stemcell_template_vmid_range_start` and
+`pve.stemcell_template_vmid_range_end` in the CPI config.
+
+### SHA-tag deduplication and race reconciliation
+
+After uploading the qcow2, `ensureTemplateVM` tags the template VM with
+`bosh-stemcell-sha-<sha8>` where `sha8` is the first 8 hex characters of the SHA-256
+digest. On subsequent `create_stemcell` calls for the same image:
+
+1. The CPI first checks for an existing template VM carrying that SHA tag.
+2. If not found by tag, it falls back to the deterministic filename lookup.
+3. If another `create_stemcell` call raced and created a duplicate, `reconcileTemplateRace`
+   scans for duplicates, keeps the survivor, and deletes the extra template.
+
+### Pool and node pinning
+
+Two optional config keys control template VM placement:
+
+- `pve.stemcell_template_node` — pins template creation to a specific cluster node.
+  `delete_stemcell` uses the same node for the primary destroy.
+- `pve.stemcell_template_pool` — assigns template VMs to a named PVE resource pool,
+  which scopes access controls and facilitates bulk operations.
+
+### Template replication
+
+When `pve.stemcell_replicate_local` is enabled, the CPI replicates the template VM to
+all cluster nodes after creation, up to `pve.stemcell_replication_concurrency` parallel
+copies (default: serial). Individual node replication failures are logged as warnings
+and do not fail `create_stemcell`. `delete_stemcell` performs a cross-node SHA-tag sweep
+to remove all replicas regardless of whether replication was originally enabled.
+
+### Provenance and orphan pruning
+
+When `pve.stemcell.provenance` is enabled, the CPI stores a JSON provenance record in
+the template VM description and applies `bosh-stemcell-sha` and `bosh-stemcell-name`
+tags. This lets the operator audit which templates correspond to which BOSH stemcell
+uploads.
+
+`pve.stemcell.prune_orphans` (requires `pve.stemcell.director_id`) removes template
+VMs cluster-wide that carry the director's tag but are no longer tracked by the current
+director. Orphan pruning is best-effort: individual sweep failures do not fail
+`delete_stemcell`.
+
 ## Operator caveats
 
-Light stemcells are **operator-managed**. `bosh delete-stemcell` on a light CID
-returns success but does NOT remove the underlying qcow2 volume — the CPI
-recognizes the `light:` prefix and no-ops the delete with an INFO log entry.
-This keeps `bosh delete-stemcell` safe to run while leaving image lifecycle
-management entirely under operator control.
+`bosh delete-stemcell` on a `template:` CID (the current format) destroys the template
+VM and its backing disk volume via PVE purge. No manual `pvesm free` step is needed.
+Verify deletion by running `bosh stemcells` before and after; the CID disappears afterward.
 
-To free the storage when the image is no longer needed:
+**Legacy `light:` CIDs** (produced only by CPI versions predating the template-VM
+model) are treated as no-ops: `bosh delete-stemcell` on a `light:` CID logs an INFO
+entry and returns success without touching PVE. If your director still holds `light:`
+CIDs from a prior CPI version, manage those volumes manually:
 
 ```bash
 # From a PVE host shell:
@@ -289,21 +355,22 @@ pvesm free <storage>:import/<partial-filename>
 
 **CPI version downgrade after light stemcells were used**
 
-A CPI version that predates light-stemcell support cannot parse `light:` CIDs. Before
-downgrading, re-upload all light stemcells using the normal (heavy) path so the
-director holds non-light CIDs. Do not downgrade while any deployment references a
-`light:` CID.
-
-**`bosh delete-stemcell` returns success but the qcow2 is still present**
-
-This is expected behavior for light stemcell CIDs. The CPI deliberately no-ops
-the delete to preserve operator ownership of the image. Manage the image
-lifecycle via `pvesm free` or the PVE UI as described above.
+A CPI version that predates the template-VM model cannot parse `template:` CIDs. Before
+downgrading, re-upload all stemcells using the normal (heavy) path so the director holds
+the older CID format. Do not downgrade while any deployment references a `template:` CID
+produced by the current CPI.
 
 ## See also
 
+- [Architecture — Stemcell Model](architecture.md#stemcell-model) — CID dispatch table,
+  clone behavior, and the create/delete lifecycle overview.
 - [Persistent disks](persistent-disks.md) — storage backend classification and
   cloud-properties for disk pools.
 - [ConfigDrive layout](configdrive.md) — ISO delivery for agent bootstrap.
+- [Configuration reference](configuration.md) — stemcell config keys
+  (`stemcell_template_vmid_range_start/end`, `stemcell_template_node`,
+  `stemcell_template_pool`, `stemcell_replicate_local`,
+  `stemcell_replication_concurrency`, `stemcell.provenance`, `stemcell.director_id`,
+  `stemcell.prune_orphans`).
 - [BOSH light-stemcell convention](https://bosh.io/docs/stemcell/) — the equivalent
   feature in AWS, OpenStack, and GCP CPIs uses the same operator workflow.
