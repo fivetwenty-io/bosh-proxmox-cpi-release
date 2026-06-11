@@ -456,7 +456,7 @@ func HandleCreateStemcell(deps Deps) cpi.Handler {
 		// caller owns its lifetime so the upload step can reuse the same path.
 		// sha256hex is returned alongside the CID so the template tag can be set
 		// without a second file-read pass.
-		dedup, buildErr := buildAndDeduplicateStemcellCIDWithHash(
+		dedup, buildErr := buildAndDeduplicateStemcellCID(
 			ctx, deps, node, storage, imagePath, cp, deps.Logger)
 		if buildErr != nil {
 			return nil, buildErr
@@ -984,7 +984,7 @@ func resolveStemcellStorageAndNode(ctx context.Context, deps Deps) (node, storag
 	return node, storage, nil
 }
 
-// stemcellDedupResult bundles the outputs of buildAndDeduplicateStemcellCIDWithHash
+// stemcellDedupResult bundles the outputs of buildAndDeduplicateStemcellCID
 // into a single struct, keeping the return list under the 5-result linter limit.
 type stemcellDedupResult struct {
 	// CID is the stemcell content-ID (<storage>:import/<filename>).
@@ -1000,62 +1000,19 @@ type stemcellDedupResult struct {
 	SHA256Hex string
 }
 
-// buildAndDeduplicateStemcellCIDWithHash is the sha256hex-returning variant of
-// buildAndDeduplicateStemcellCID. It returns the full SHA-256 hex digest of the
-// resolved disk image so callers can pass it to ensureTemplateVM for the
-// bosh-stemcell-sha-<sha8> tag without a second file-read pass.
-//
-// All other return values and semantics are identical to buildAndDeduplicateStemcellCID.
-func buildAndDeduplicateStemcellCIDWithHash(
-	ctx context.Context,
-	deps Deps,
-	node, storage, imagePath string,
-	cp stemcellCloudProps,
-	logger *log.Logger,
-) (stemcellDedupResult, error) {
-	cid, f, src, cl, buildErr := buildAndDeduplicateStemcellCID(ctx, deps, node, storage, imagePath, cp, logger)
-	if buildErr != nil {
-		return stemcellDedupResult{Cleanup: func() {}}, buildErr
-	}
-	// Extract sha256hex: the CID encodes <storage>:import/<name>-<version>-<sha8>.qcow2.
-	// We need the full hash for ensureTemplateVM's tag. Re-derive from the resolved
-	// source file (still valid — cleanup is deferred by caller).
-	// The SHA was computed during buildAndDeduplicateStemcellCID but is not returned
-	// from that helper. Re-compute from src (single read; same cost as the original).
-	stagingDirForHash := ""
-	if src == imagePath {
-		stagingDirForHash = deps.Config.StemcellStagingDir
-	}
-	hashHex, hashErr := sha256FilePath(src, stagingDirForHash)
-	if hashErr != nil {
-		// Hash failure after CID is built means the file is gone (cleanup already
-		// ran) or a race condition. Use empty string so the template tag is skipped.
-		logger.Warn("buildAndDeduplicateStemcellCIDWithHash: re-hash failed (non-fatal; template tag will be empty)",
-			log.Err(hashErr),
-		)
-		hashHex = ""
-	}
-	return stemcellDedupResult{
-		CID:              cid,
-		Found:            f,
-		UploadSourcePath: src,
-		Cleanup:          cl,
-		SHA256Hex:        hashHex,
-	}, nil
-}
-
 // buildAndDeduplicateStemcellCID covers steps 6-10 of the eleven-step flow:
 // resolve the disk image from the tarball (or pass through a bare image),
 // compute SHA-256, build the deterministic qcow2 filename and CID, then check
 // whether that volume already exists in PVE storage.
 //
-// When found is true, stemcellCID is the existing CID and the caller must
-// return it immediately without uploading. When found is false, stemcellCID is
-// the CID to be created by uploadAndReturnCID, and uploadSourcePath points at
-// the resolved image (already extracted for tarball inputs) so the upload step
-// can reuse it without a second extraction pass.
+// When Found is true, CID is the existing CID and the caller must return it
+// immediately without uploading. When Found is false, CID is the one to be
+// created by uploadAndReturnCID, and UploadSourcePath points at the resolved
+// image (already extracted for tarball inputs) so the upload step can reuse it
+// without a second extraction pass. SHA256Hex carries the digest computed
+// during image resolution so callers never re-read the multi-GiB image.
 //
-// cleanup releases the staging tmpDir created by resolveStemcellImage (no-op
+// Cleanup releases the staging tmpDir created by resolveStemcellImage (no-op
 // for bare-image passthroughs); the caller owns its lifetime and MUST defer it.
 //
 // imagePath is the director-supplied local path. cp supplies name, version, and
@@ -1066,15 +1023,17 @@ func buildAndDeduplicateStemcellCID(
 	node, storage, imagePath string,
 	cp stemcellCloudProps,
 	logger *log.Logger,
-) (stemcellCID string, found bool, uploadSourcePath string, cleanup func(), err error) {
-	noop := func() {}
+) (stemcellDedupResult, error) {
+	fail := func(err error) (stemcellDedupResult, error) {
+		return stemcellDedupResult{Cleanup: func() {}}, err
+	}
 
 	// Step 6: Resolve disk image (extract from tarball if needed). The
 	// returned cleanup is handed back to the caller — see doc comment.
 	uploadSourcePath, cleanupExtract, detectedFormat, extractedSHA, detectErr := resolveStemcellImage(
 		imagePath, cp.DiskFormat, deps.Config.StemcellStagingDir, logger)
 	if detectErr != nil {
-		return "", false, "", noop, cpierrors.Wrap(detectErr, "create_stemcell: resolve image")
+		return fail(cpierrors.Wrap(detectErr, "create_stemcell: resolve image"))
 	}
 
 	// User-supplied disk_format wins when present; aliases like
@@ -1095,10 +1054,11 @@ func buildAndDeduplicateStemcellCID(
 	// passthrough) extractedSHA is empty and a second-pass file read is used.
 	sha256hex := extractedSHA
 	if sha256hex == "" {
-		sha256hex, err = sha256FilePath(uploadSourcePath, deps.Config.StemcellStagingDir)
-		if err != nil {
+		var hashErr error
+		sha256hex, hashErr = sha256FilePath(uploadSourcePath, deps.Config.StemcellStagingDir)
+		if hashErr != nil {
 			cleanupExtract()
-			return "", false, "", noop, cpierrors.Wrap(err, "create_stemcell: compute sha256")
+			return fail(cpierrors.Wrap(hashErr, "create_stemcell: compute sha256"))
 		}
 	}
 
@@ -1136,7 +1096,7 @@ func buildAndDeduplicateStemcellCID(
 	}
 	if verifyErr := verifyExpectedDigest(ctx, logger, cp, digestSHA256, digestPath, deps.Config.StemcellStagingDir, stemcellSourceLocal); verifyErr != nil {
 		cleanupExtract()
-		return "", false, "", noop, verifyErr
+		return fail(verifyErr)
 	}
 
 	// Steps 8-9: Build filename and CID.
@@ -1153,7 +1113,7 @@ func buildAndDeduplicateStemcellCID(
 	existing, findErr := pve.FindStemcellByFilename(ctx, deps.PVE, node, storage, qcow2Filename)
 	if findErr != nil {
 		cleanupExtract()
-		return "", false, "", noop, cpierrors.Wrap(findErr, "create_stemcell: dedup lookup")
+		return fail(cpierrors.Wrap(findErr, "create_stemcell: dedup lookup"))
 	}
 	if existing != "" {
 		logger.Info("create_stemcell: stemcell already present, returning existing CID",
@@ -1161,10 +1121,22 @@ func buildAndDeduplicateStemcellCID(
 			log.String("name", cp.Name),
 			log.String("version", cp.Version),
 		)
-		return existing, true, uploadSourcePath, cleanupExtract, nil
+		return stemcellDedupResult{
+			CID:              existing,
+			Found:            true,
+			UploadSourcePath: uploadSourcePath,
+			Cleanup:          cleanupExtract,
+			SHA256Hex:        sha256hex,
+		}, nil
 	}
 
-	return cid, false, uploadSourcePath, cleanupExtract, nil
+	return stemcellDedupResult{
+		CID:              cid,
+		Found:            false,
+		UploadSourcePath: uploadSourcePath,
+		Cleanup:          cleanupExtract,
+		SHA256Hex:        sha256hex,
+	}, nil
 }
 
 // uploadAndReturnCID covers step 11 of the eleven-step flow: upload the qcow2

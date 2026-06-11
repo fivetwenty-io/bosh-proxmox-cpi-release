@@ -48,12 +48,20 @@ func stampDeletingTag(ctx context.Context, deps Deps, node, vmCID string, vmid i
 	}
 }
 
+// sweepStragglersMaxPerSweep caps how many straggler VMs are reaped in a single
+// sweepFastDeleteStragglers call. Stragglers beyond the cap are left for the
+// next sweep (which runs on every fast-path delete_vm), so they converge
+// without blocking the current delete for more than this many sequential
+// round-trips.
+const sweepStragglersMaxPerSweep = 5
+
 // sweepFastDeleteStragglers scans the cluster for VMs carrying tagDeletingVM
 // (bosh-deleting) and re-issues a skiplock+purge destroy for each one. This
 // makes fast-path deletes self-healing: a VM whose async destroy stalled is
 // reaped by the next fast-path delete call. The sweep is:
 //   - Best-effort: all errors are logged, never propagated.
-//   - Bounded: no AwaitTaskWithLogger call; the destroy is fire-and-forget.
+//   - Bounded: processes at most sweepStragglersMaxPerSweep per call; any
+//     remainder is logged and left for the next sweep invocation.
 //   - Idempotent: a VM already gone (IsNotFound) is silently skipped.
 //
 // Call from the fast path before issuing the current delete so a straggler
@@ -81,6 +89,8 @@ func sweepFastDeleteStragglers(ctx context.Context, deps Deps, logger *log.Logge
 	purge := true
 	destroyDisks := true
 	skiplock := true
+	processed := 0
+	skipped := 0
 	for _, raw := range *resp {
 		var item clusterItem
 		if json.Unmarshal(raw, &item) != nil {
@@ -92,6 +102,11 @@ func sweepFastDeleteStragglers(ctx context.Context, deps Deps, logger *log.Logge
 		if !tagsContain(item.Tags, tagDeletingVM) {
 			continue
 		}
+		if processed >= sweepStragglersMaxPerSweep {
+			skipped++
+			continue
+		}
+		processed++
 		vmIDStr := strconv.FormatInt(item.VMID, 10)
 		sweepLogger := logger.With(
 			log.String("node", item.Node),
@@ -112,6 +127,12 @@ func sweepFastDeleteStragglers(ctx context.Context, deps Deps, logger *log.Logge
 			continue
 		}
 		sweepLogger.Info("delete_vm: straggler sweep: re-issued destroy for bosh-deleting VM")
+	}
+	if skipped > 0 {
+		logger.Info("delete_vm: straggler sweep: cap reached; remaining stragglers deferred to next sweep",
+			log.Int("processed", processed),
+			log.Int("deferred", skipped),
+		)
 	}
 }
 
@@ -377,7 +398,7 @@ func HandleDeleteVM(deps Deps) cpi.Handler {
 		// --- agent cleanup ---
 		cleanupAgentForVM(ctx, deps, node, vmid, logger)
 
-		logger.Info("delete_vm: VM deleted successfully")
+		logger.Info("delete_vm: VM deleted successfully", log.String("node", node))
 		return nil, nil
 	})
 }

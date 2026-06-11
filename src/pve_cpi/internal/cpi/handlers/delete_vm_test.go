@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -1619,6 +1620,92 @@ func TestHandleDeleteVM_FastPath_StopNotFound_EarlyReturn(t *testing.T) {
 	}
 	if !agentRemoveCalled {
 		t.Error("fast-path stop-not-found early-return: agent.Remove must be called for cleanup")
+	}
+}
+
+// TestHandleDeleteVM_FastPath_SweepCapsAtMax verifies that when there are more
+// straggler VMs than sweepStragglersMaxPerSweep, only cap-many destroys are
+// issued during the sweep and the remainder are deferred (not destroyed silently).
+// The test wires (sweepStragglersMaxPerSweep + 3) stragglers and counts how many
+// DeleteQemu calls the sweep makes; the current VM's destroy is also counted and
+// must be excluded from the straggler tally.
+func TestHandleDeleteVM_FastPath_SweepCapsAtMax(t *testing.T) {
+	t.Parallel()
+
+	const currentVMID = 800
+	const stragglersAboveCap = 3
+	const stragglerCount = 5 + stragglersAboveCap // sweepStragglersMaxPerSweep + 3
+
+	// Build cluster response: currentVMID (untagged) + stragglerCount tagged VMs.
+	var allEntries cluster.ListResourcesResponse
+	currentRaw, _ := json.Marshal(map[string]any{
+		"vmid": currentVMID,
+		"node": vmNode,
+		"type": "qemu",
+	})
+	allEntries = append(allEntries, currentRaw)
+	for i := 0; i < stragglerCount; i++ {
+		stragglerRaw, _ := json.Marshal(map[string]any{
+			"vmid": 900 + i,
+			"node": vmNode,
+			"type": "qemu",
+			"tags": "bosh-deleting",
+		})
+		allEntries = append(allEntries, stragglerRaw)
+	}
+
+	clusterSvc := &mockClusterSvc{
+		listResourcesFn: func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+			return &allEntries, nil
+		},
+	}
+
+	var sweepDestroyCalls int
+	currentDestroyCalled := false
+	qemuSvc := &mockQEMUService{
+		stopFn: func(_ context.Context, _ string, _ int) (string, error) {
+			return "", nil
+		},
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return map[string]any{}, nil
+		},
+	}
+	nodesSvc := &mockNodesService{
+		deleteQemuFn: func(_ context.Context, _ string, vmidStr string, _ *nodes.DeleteQemuParams) (*nodes.DeleteQemuResponse, error) {
+			if vmidStr == strconv.Itoa(currentVMID) {
+				currentDestroyCalled = true
+			} else {
+				sweepDestroyCalls++
+			}
+			raw := nodes.DeleteQemuResponse{}
+			return &raw, nil
+		},
+		updateQemuConfigFn: func(_ context.Context, _ string, _ string, _ *nodes.UpdateQemuConfigParams) error {
+			return nil
+		},
+	}
+	tasksSvc := &mockTasksService{}
+	agentSvc := &mockAgentService{}
+
+	deps := testDepsWithCluster(qemuSvc, nodesSvc, tasksSvc, agentSvc, &mockStorageService{}, clusterSvc)
+	enabled := true
+	deps.Config.FastPathDelete = &enabled
+
+	h := handlers.HandleDeleteVM(deps)
+	_, err := h.Handle(context.Background(), marshalArgs(strconv.Itoa(currentVMID)), jsonrpc.Context{})
+
+	if err != nil {
+		t.Fatalf("sweep cap test: unexpected error: %v", err)
+	}
+	if !currentDestroyCalled {
+		t.Error("sweep cap test: current VM destroy must be issued after sweep")
+	}
+	// Exactly sweepStragglersMaxPerSweep (5) straggler destroys must be issued;
+	// the remaining stragglersAboveCap (3) must be deferred.
+	const wantSweepDestroys = 5
+	if sweepDestroyCalls != wantSweepDestroys {
+		t.Errorf("sweep cap test: straggler destroy calls = %d; want %d (cap=%d, total=%d, deferred=%d)",
+			sweepDestroyCalls, wantSweepDestroys, wantSweepDestroys, stragglerCount, stragglersAboveCap)
 	}
 }
 

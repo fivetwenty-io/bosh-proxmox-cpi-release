@@ -237,7 +237,7 @@ type wbNoopPoolService struct{}
 
 func (n *wbNoopPoolService) AddVM(_ context.Context, _ string, _ int64) error { return nil }
 func (n *wbNoopPoolService) CreatePool(_ context.Context, _, _ string) error  { return nil }
-func (n *wbNoopPoolService) DeletePool(_ context.Context, _ string) error      { return nil }
+func (n *wbNoopPoolService) DeletePool(_ context.Context, _ string) error     { return nil }
 func (n *wbNoopPoolService) GetPoolComment(_ context.Context, _ string) (string, bool, error) {
 	return "", false, nil
 }
@@ -1137,7 +1137,7 @@ func (p *wbRecordingPoolService) AddVM(_ context.Context, poolID string, vmid in
 	return p.addErr
 }
 func (p *wbRecordingPoolService) CreatePool(_ context.Context, _, _ string) error { return nil }
-func (p *wbRecordingPoolService) DeletePool(_ context.Context, _ string) error     { return nil }
+func (p *wbRecordingPoolService) DeletePool(_ context.Context, _ string) error    { return nil }
 func (p *wbRecordingPoolService) GetPoolComment(_ context.Context, _ string) (string, bool, error) {
 	return "", false, nil
 }
@@ -1619,5 +1619,95 @@ func TestAttemptCreateTemplateVM_ReplicaProvenanceON(t *testing.T) {
 	}
 	if prov.DirectorID != directorID {
 		t.Errorf("provenance.director_id = %q; want %q", prov.DirectorID, directorID)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// buildAndDeduplicateStemcellCID signature tests (finding #1)
+// ---------------------------------------------------------------------------
+
+// TestBuildAndDeduplicateStemcellCID_ReturnsHashWithoutReread verifies that
+// buildAndDeduplicateStemcellCID returns the sha256hex it computes internally
+// so that callers (the WithHash wrapper and tests) do not need a second file
+// read. The test writes a known-content file, calls the function, and checks
+// the returned hash matches the pre-computed digest of that content.
+func TestBuildAndDeduplicateStemcellCID_ReturnsHashWithoutReread(t *testing.T) {
+	t.Parallel()
+
+	content := []byte("BARE-QCOW2-MAGIC-BYTES-FOR-HASH-TEST")
+	// Write a raw file that looks like a bare image so the function does not
+	// attempt tarball extraction — resolveStemcellImage falls through to
+	// passthrough mode when no .tgz signature is detected.
+	imgPath := makeTempImageFile(t, content)
+
+	wantHash := sha256OfBytes(content)
+	wantSHA8 := wantHash[:8]
+	// BuildStemcellFilename keeps dots in the version; "1.0" stays "1.0", not "1-0".
+	wantFilename := "bosh-stemcell-ubuntu-jammy-1.0-" + wantSHA8 + ".qcow2"
+	wantCID := "nfs:import/" + wantFilename
+
+	// buildAndDeduplicateStemcellCID calls FindStemcellByFilename which needs
+	// ListStorageContent. Return empty so the dedup check misses (no-upload path).
+	listFn := func(_ context.Context, _, _ string, _ *sdknodes.ListStorageContentParams) (*sdknodes.ListStorageContentResponse, error) {
+		empty := sdknodes.ListStorageContentResponse{}
+		return &empty, nil
+	}
+	deps := wbBuildFetchDeps(t, listFn)
+
+	cp := stemcellCloudProps{Name: "ubuntu-jammy", Version: "1.0"}
+	dedup, err := buildAndDeduplicateStemcellCID(
+		context.Background(), deps, "pve-node1", "nfs", imgPath, cp, deps.Logger)
+	if dedup.Cleanup != nil {
+		defer dedup.Cleanup()
+	}
+
+	if err != nil {
+		t.Fatalf("buildAndDeduplicateStemcellCID returned error: %v", err)
+	}
+	if dedup.Found {
+		t.Error("found must be false when storage is empty (no dedup hit)")
+	}
+	if dedup.CID != wantCID {
+		t.Errorf("cid = %q; want %q", dedup.CID, wantCID)
+	}
+	if dedup.SHA256Hex != wantHash {
+		t.Errorf("returned sha256hex = %q; want %q", dedup.SHA256Hex, wantHash)
+	}
+}
+
+// TestBuildAndDeduplicateStemcellCID_DedupHit_HashStillReturned verifies that
+// when the dedup fast-path fires (volume already present in storage), the
+// sha256hex is still populated in the return so the caller never has to
+// re-read the file.
+func TestBuildAndDeduplicateStemcellCID_DedupHit_HashStillReturned(t *testing.T) {
+	t.Parallel()
+
+	content := []byte("DEDUP-HIT-IMAGE-BYTES")
+	imgPath := makeTempImageFile(t, content)
+
+	wantHash := sha256OfBytes(content)
+	wantSHA8 := wantHash[:8]
+	// BuildStemcellFilename keeps dots in the version; "2.0" stays "2.0", not "2-0".
+	existingFilename := "bosh-stemcell-ubuntu-jammy-2.0-" + wantSHA8 + ".qcow2"
+
+	listFn := wbExistingVolumeListFn("nfs", existingFilename)
+	deps := wbBuildFetchDeps(t, listFn)
+
+	cp := stemcellCloudProps{Name: "ubuntu-jammy", Version: "2.0"}
+	dedup, err := buildAndDeduplicateStemcellCID(
+		context.Background(), deps, "pve-node1", "nfs", imgPath, cp, deps.Logger)
+	if dedup.Cleanup != nil {
+		defer dedup.Cleanup()
+	}
+
+	if err != nil {
+		t.Fatalf("buildAndDeduplicateStemcellCID returned error: %v", err)
+	}
+	if !dedup.Found {
+		t.Error("found must be true when storage already has the volume (dedup hit)")
+	}
+	// Hash must be populated even on the dedup fast path — no second read needed.
+	if dedup.SHA256Hex != wantHash {
+		t.Errorf("dedup-hit sha256hex = %q; want %q (hash must be returned without re-read)", dedup.SHA256Hex, wantHash)
 	}
 }
