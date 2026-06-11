@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -24,11 +25,23 @@ import (
 // EnvPasslist - os environment variable names forwarded to child; all others stripped.
 // Timeout     - per-call deadline; <=0 means no deadline (caller context governs).
 // Logger      - structured debug output; nil is safe (no-op).
+//
+// Allowlist entries are resolved via filepath.EvalSymlinks once, at the first
+// Run call (lazy sync.Once), and cached for the lifetime of the Runner. A
+// post-construction symlink swap therefore does not alter the effective
+// allowlist. Entries that fail to resolve at compile time are silently skipped
+// (no match possible) — same behavior as the previous per-call resolution.
 type Runner struct {
 	Allowlist   []string
 	EnvPasslist []string
 	Timeout     time.Duration
 	Logger      *log.Logger
+
+	// canonOnce guards a single call to compileAllowlist.
+	canonOnce sync.Once
+	// canonAllowlist holds the resolved real paths of Allowlist entries.
+	// Populated by compileAllowlist on first Run call; read-only afterwards.
+	canonAllowlist []string
 }
 
 // New constructs a Runner. All fields are set; none are optional here.
@@ -149,18 +162,32 @@ func (r *Runner) Run(ctx context.Context, path string, args []string, extraEnv m
 	return stdoutStr, nil
 }
 
-// isAllowlisted returns true iff realPath (already EvalSymlinks+Clean resolved)
-// matches the canonical real path of any allowlist entry.
-// Allowlist entries that cannot be resolved via EvalSymlinks are skipped
-// (they cannot match a file that actually exists).
-func (r *Runner) isAllowlisted(realPath string) bool {
+// compileAllowlist resolves every Allowlist entry via filepath.EvalSymlinks
+// and stores the canonical paths in canonAllowlist. Called exactly once via
+// canonOnce on the first Run invocation. Entries that fail EvalSymlinks are
+// omitted (they cannot match any real path — same behavior as the previous
+// per-call resolution). The result is immutable after this call returns.
+func (r *Runner) compileAllowlist() {
+	canon := make([]string, 0, len(r.Allowlist))
 	for _, a := range r.Allowlist {
 		realA, err := filepath.EvalSymlinks(a)
 		if err != nil {
-			// Allowlist entry does not exist on disk; skip rather than match.
+			// Entry does not resolve on disk; skip rather than match.
 			continue
 		}
-		if filepath.Clean(realA) == realPath {
+		canon = append(canon, filepath.Clean(realA))
+	}
+	r.canonAllowlist = canon
+}
+
+// isAllowlisted returns true iff realPath (already EvalSymlinks+Clean resolved)
+// matches the canonical real path of any allowlist entry. The allowlist is
+// compiled (EvalSymlinks resolved) exactly once on the first call and cached;
+// a post-construction symlink swap does not affect the effective allowlist.
+func (r *Runner) isAllowlisted(realPath string) bool {
+	r.canonOnce.Do(r.compileAllowlist)
+	for _, canon := range r.canonAllowlist {
+		if canon == realPath {
 			return true
 		}
 	}

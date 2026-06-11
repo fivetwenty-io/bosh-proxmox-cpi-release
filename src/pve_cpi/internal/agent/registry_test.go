@@ -22,7 +22,10 @@ func testLogger() *log.Logger {
 // newRegistryAgent builds a RegistryAgent pointed at srv.
 func newRegistryAgent(t *testing.T, srv *httptest.Server) *agent.RegistryAgent {
 	t.Helper()
-	c := registry.NewClient(srv.URL, "user", "secret")
+	c, err := registry.NewClientWithOptions(srv.URL, "user", "secret", registry.Options{AllowPrivateIP: true})
+	if err != nil {
+		t.Fatalf("NewClientWithOptions: %v", err)
+	}
 	return agent.NewRegistryAgent(c, testLogger())
 }
 

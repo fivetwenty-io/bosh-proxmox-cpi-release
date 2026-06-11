@@ -16,11 +16,16 @@ import (
 
 // newTestClient creates an httptest.Server with the given handler, registers cleanup,
 // and returns a registry.Client pointed at the server. Server is closed via t.Cleanup.
+// AllowPrivateIP is true because httptest servers listen on 127.0.0.1.
 func newTestClient(t *testing.T, handler http.HandlerFunc) *registry.Client {
 	t.Helper()
 	srv := httptest.NewServer(handler)
 	t.Cleanup(srv.Close)
-	return registry.NewClient(srv.URL, "user", "secret")
+	c, err := registry.NewClientWithOptions(srv.URL, "user", "secret", registry.Options{AllowPrivateIP: true})
+	if err != nil {
+		t.Fatalf("NewClientWithOptions: %v", err)
+	}
+	return c
 }
 
 // --------------------------------------------------------------------------
@@ -94,8 +99,11 @@ func TestPut_Non2xx(t *testing.T) {
 
 func TestPut_EmptyInstanceID(t *testing.T) {
 	t.Parallel()
-	client := registry.NewClient("http://localhost:25777", "u", "p")
-	err := client.Put(context.Background(), "", map[string]string{})
+	client, err := registry.NewClientWithOptions("http://localhost:25777", "u", "p", registry.Options{AllowPrivateIP: true})
+	if err != nil {
+		t.Fatalf("NewClientWithOptions: %v", err)
+	}
+	err = client.Put(context.Background(), "", map[string]string{})
 	if err == nil {
 		t.Fatal("expected error for empty instanceID")
 	}
@@ -174,8 +182,11 @@ func TestGet_Non2xx(t *testing.T) {
 
 func TestGet_EmptyInstanceID(t *testing.T) {
 	t.Parallel()
-	client := registry.NewClient("http://localhost:25777", "u", "p")
-	_, err := client.Get(context.Background(), "")
+	client, err := registry.NewClientWithOptions("http://localhost:25777", "u", "p", registry.Options{AllowPrivateIP: true})
+	if err != nil {
+		t.Fatalf("NewClientWithOptions: %v", err)
+	}
+	_, err = client.Get(context.Background(), "")
 	if err == nil {
 		t.Fatal("expected error for empty instanceID")
 	}
@@ -234,8 +245,11 @@ func TestDelete_500(t *testing.T) {
 
 func TestDelete_EmptyInstanceID(t *testing.T) {
 	t.Parallel()
-	client := registry.NewClient("http://localhost:25777", "u", "p")
-	err := client.Delete(context.Background(), "")
+	client, err := registry.NewClientWithOptions("http://localhost:25777", "u", "p", registry.Options{AllowPrivateIP: true})
+	if err != nil {
+		t.Fatalf("NewClientWithOptions: %v", err)
+	}
+	err = client.Delete(context.Background(), "")
 	if err == nil {
 		t.Fatal("expected error for empty instanceID")
 	}
@@ -256,7 +270,10 @@ func TestAuthHeader_Encoded(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := registry.NewClient(srv.URL, user, pass)
+	client, err := registry.NewClientWithOptions(srv.URL, user, pass, registry.Options{AllowPrivateIP: true})
+	if err != nil {
+		t.Fatalf("NewClientWithOptions: %v", err)
+	}
 	_ = client.Put(context.Background(), "1", struct{}{})
 
 	want := "Basic " + base64.StdEncoding.EncodeToString([]byte(user+":"+pass))
@@ -279,7 +296,10 @@ func TestEndpointTrimmed(t *testing.T) {
 	defer srv.Close()
 
 	// Endpoint with trailing slash — should not produce double slash in URL.
-	client := registry.NewClient(srv.URL+"/", "u", "p")
+	client, err := registry.NewClientWithOptions(srv.URL+"/", "u", "p", registry.Options{AllowPrivateIP: true})
+	if err != nil {
+		t.Fatalf("NewClientWithOptions: %v", err)
+	}
 	_ = client.Put(context.Background(), "42", struct{}{})
 
 	if strings.Contains(gotPath, "//") {
@@ -313,7 +333,10 @@ func TestContextCancellation(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 
-	client := registry.NewClient(srv.URL, "u", "p")
+	client, clientErr := registry.NewClientWithOptions(srv.URL, "u", "p", registry.Options{AllowPrivateIP: true})
+	if clientErr != nil {
+		t.Fatalf("NewClientWithOptions: %v", clientErr)
+	}
 	err := client.Put(ctx, "100", struct{}{})
 	if err == nil {
 		t.Fatal("expected error from cancelled context, got nil")

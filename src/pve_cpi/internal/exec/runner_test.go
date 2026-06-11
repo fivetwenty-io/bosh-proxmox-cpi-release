@@ -293,6 +293,112 @@ func TestNonExistentPathRejected(t *testing.T) {
 	}
 }
 
+// TestAllowlistResolvedAtConstruction verifies the symlink-resolved allowlist is
+// built on the first Run call and that a post-construction swap of an
+// allowlist-entry symlink does NOT change the effective allowlist.
+func TestAllowlistResolvedAtConstruction(t *testing.T) {
+	echoPath := "/bin/echo"
+	shPath := "/bin/sh"
+	skipIfMissing(t, echoPath, shPath)
+
+	dir := t.TempDir()
+	linkPath := dir + "/hook"
+
+	// Phase 1: symlink points to /bin/echo — allowlist contains this link.
+	if err := os.Symlink(echoPath, linkPath); err != nil {
+		t.Fatalf("os.Symlink phase1: %v", err)
+	}
+
+	r := safeexec.New([]string{linkPath}, nil, 0, nopLogger())
+
+	// First Run — triggers compileAllowlist; linkPath resolves to /bin/echo.
+	out, err := r.Run(context.Background(), echoPath, []string{"first"}, nil)
+	if err != nil {
+		t.Fatalf("phase1 Run: %v", err)
+	}
+	if !strings.Contains(out, "first") {
+		t.Errorf("phase1 unexpected output: %q", out)
+	}
+
+	// Phase 2: swap the symlink to point to /bin/sh.
+	// The Runner must NOT see the new target — cache was built above.
+	if err := os.Remove(linkPath); err != nil {
+		t.Fatalf("remove symlink: %v", err)
+	}
+	if err := os.Symlink(shPath, linkPath); err != nil {
+		t.Fatalf("os.Symlink phase2: %v", err)
+	}
+
+	// /bin/echo must still be allowed (cached as canonical real path of old link).
+	out2, err := r.Run(context.Background(), echoPath, []string{"second"}, nil)
+	if err != nil {
+		t.Fatalf("phase2 Run after swap: %v", err)
+	}
+	if !strings.Contains(out2, "second") {
+		t.Errorf("phase2 unexpected output: %q", out2)
+	}
+}
+
+// TestAllowlistSymlinkSwapDoesNotUnlock verifies the security property:
+// swapping an allowlist-entry symlink to a NEW target after construction does
+// not cause the new target to become allowlisted.
+func TestAllowlistSymlinkSwapDoesNotUnlock(t *testing.T) {
+	echoPath := "/bin/echo"
+	shPath := "/bin/sh"
+	skipIfMissing(t, echoPath, shPath)
+
+	dir := t.TempDir()
+	linkPath := dir + "/hook"
+
+	// Allowlist the link pointing to /bin/echo.
+	if err := os.Symlink(echoPath, linkPath); err != nil {
+		t.Fatalf("os.Symlink: %v", err)
+	}
+
+	r := safeexec.New([]string{linkPath}, nil, 0, nopLogger())
+
+	// Trigger compilation so the cache is built (real path = /bin/echo).
+	if _, err := r.Run(context.Background(), echoPath, []string{"prime"}, nil); err != nil {
+		t.Fatalf("prime Run: %v", err)
+	}
+
+	// Swap: link now points to /bin/sh.
+	if err := os.Remove(linkPath); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	if err := os.Symlink(shPath, linkPath); err != nil {
+		t.Fatalf("re-symlink: %v", err)
+	}
+
+	// Running /bin/sh must be rejected — its real path was never in the cached allowlist.
+	_, err := r.Run(context.Background(), shPath, nil, nil)
+	if err == nil {
+		t.Fatal("expected rejection after symlink swap, got nil")
+	}
+	if !strings.Contains(err.Error(), "not allowlisted") {
+		t.Fatalf("unexpected error text: %v", err)
+	}
+}
+
+// TestAllowlistNonResolvingEntrySkipped verifies that an allowlist entry
+// that cannot be resolved via EvalSymlinks at compile time is silently
+// skipped and does NOT match any requested path.
+func TestAllowlistNonResolvingEntrySkipped(t *testing.T) {
+	echoPath := "/bin/echo"
+	skipIfMissing(t, echoPath)
+
+	ghost := "/no/such/entry/ever"
+	// Allowlist contains only the non-resolving ghost entry; echo must be rejected.
+	r := safeexec.New([]string{ghost}, nil, 0, nopLogger())
+	_, err := r.Run(context.Background(), echoPath, []string{"hi"}, nil)
+	if err == nil {
+		t.Fatal("expected rejection: non-resolving allowlist entry must not match, got nil")
+	}
+	if !strings.Contains(err.Error(), "not allowlisted") {
+		t.Fatalf("unexpected error text: %v", err)
+	}
+}
+
 // TestTimeoutKillsProcessGroup verifies that a timed-out sleep is interrupted
 // well within the sleep duration, confirming the process-group kill path.
 // (Duplicate of TestTimeout but explicitly names the process-group intent.)

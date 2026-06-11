@@ -21,16 +21,19 @@ import (
 	"time"
 )
 
-// TestNewClient_AppliesTLSConfig verifies the default-options constructor pins
+// TestNewClientWithOptions_AppliesTLSConfig verifies the constructor pins
 // the TLS 1.2 minimum on the underlying *http.Transport.
-func TestNewClient_AppliesTLSConfig(t *testing.T) {
+func TestNewClientWithOptions_AppliesTLSConfig(t *testing.T) {
 	t.Parallel()
-	c := NewClient("https://example", "u", "p")
+	c, err := NewClientWithOptions("https://example", "u", "p", Options{AllowPrivateIP: true})
+	if err != nil {
+		t.Fatalf("NewClientWithOptions: %v", err)
+	}
 	if c == nil {
-		t.Fatal("NewClient returned nil")
+		t.Fatal("NewClientWithOptions returned nil")
 	}
 	// TLS minimum version is not observable via transport injection; private-field
-	// inspection is unavoidable here because MinVersion is set inside NewClient
+	// inspection is unavoidable here because MinVersion is set inside NewClientWithOptions
 	// before returning and no public getter exposes it.
 	tr, ok := c.http.Transport.(*http.Transport)
 	if !ok {
@@ -834,11 +837,16 @@ func TestPut_RetryExhaustion_AttemptCount(t *testing.T) {
 // returns a *Client pointed at it. The server is closed via t.Cleanup.
 // Mirrors newTestClient in the external test file but lives in the internal
 // package so tests here can access package-level vars (e.g. retryBaseDelay).
+// AllowPrivateIP is true because httptest servers listen on 127.0.0.1.
 func newInternalTestServer(t *testing.T, handler http.HandlerFunc) *Client {
 	t.Helper()
 	srv := httptest.NewServer(handler)
 	t.Cleanup(srv.Close)
-	return NewClient(srv.URL, "user", "secret")
+	c, err := NewClientWithOptions(srv.URL, "user", "secret", Options{AllowPrivateIP: true})
+	if err != nil {
+		t.Fatalf("NewClientWithOptions: %v", err)
+	}
+	return c
 }
 
 // genSelfSignedPEM produces a minimal self-signed CA certificate suitable for

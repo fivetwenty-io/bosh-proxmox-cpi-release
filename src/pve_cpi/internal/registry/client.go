@@ -221,20 +221,6 @@ func checkEndpointIPs(endpoint string, opts Options) error {
 	return nil
 }
 
-// NewClient constructs a Client for the registry at endpoint with default
-// transport options (TLS 1.2 floor, system trust pool, 30-second per-attempt
-// timeout). Trailing slashes on endpoint are trimmed.
-//
-// This is a convenience wrapper over NewClientWithOptions retained for
-// backward compatibility. It passes AllowPrivateIP: true to preserve the
-// pre-existing behavior of not performing a private-IP rejection check at
-// construction. Production code that enforces the private-IP guard must call
-// NewClientWithOptions with opts.AllowPrivateIP derived from config.
-func NewClient(endpoint, user, pass string) *Client {
-	c, _ := NewClientWithOptions(endpoint, user, pass, Options{AllowPrivateIP: true})
-	return c
-}
-
 // NewClientWithOptions constructs a Client with explicit transport options.
 //
 // Security posture:
