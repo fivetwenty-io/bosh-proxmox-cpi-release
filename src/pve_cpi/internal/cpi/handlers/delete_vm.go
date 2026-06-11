@@ -162,7 +162,7 @@ func fastPathDeleteVM(ctx context.Context, deps Deps, node, vmCID string, vmid i
 	// still destroy a persistent volume left in an unusedN slot — e.g. a foreign
 	// disk whose detach above demoted it to unusedN but could not sweep it
 	// because a snapshot references the volume. guardUnusedVolumes existence-
-	// probes the configured pve_disk_storage and fails closed on any volume it
+	// probes the configured pve.disk_storage and fails closed on any volume it
 	// cannot confirm deleted.
 	if guardErr := guardUnusedVolumes(ctx, deps, node, vmCID, vmid, deps.Config.DiskStorage); guardErr != nil {
 		return guardErr
@@ -438,7 +438,7 @@ func stopVMBeforeDelete(ctx context.Context, deps Deps, node string, vmid int, v
 // Belt-and-suspenders: we ALWAYS scan unusedN entries regardless of whether
 // diskStorage is configured. When diskStorage is known we can run an existence
 // probe and safely skip stale dangling references. When diskStorage is empty
-// (operator did not configure pve_disk_storage) we cannot probe existence --
+// (operator did not configure pve.disk_storage) we cannot probe existence --
 // we fail CLOSED to avoid silently nuking a live volume. A storage mismatch is
 // treated identically: the slot may belong to an unrecognised storage pool we
 // cannot probe, so it also fails closed.
@@ -481,7 +481,7 @@ func guardUnusedVolumes(ctx context.Context, deps Deps, node, vmCID string, vmid
 		if diskStorage == "" {
 			// No configured disk storage: cannot probe existence.
 			// Fail closed -- block destroy to avoid data loss.
-			deps.Logger.Warn("delete_vm: unused-slot present but pve_disk_storage not configured -- failing closed",
+			deps.Logger.Warn("delete_vm: unused-slot present but pve.disk_storage not configured -- failing closed",
 				log.String("slot", slot), log.String("volid", volid))
 			protected = append(protected, fmt.Sprintf("%s=%s", slot, volid))
 			continue
@@ -489,7 +489,7 @@ func guardUnusedVolumes(ctx context.Context, deps Deps, node, vmCID string, vmid
 		if storage != diskStorage {
 			// Storage doesn't match configured disk storage: we cannot
 			// probe existence on an unknown pool. Fail closed.
-			deps.Logger.Warn("delete_vm: unused-slot storage does not match pve_disk_storage -- failing closed",
+			deps.Logger.Warn("delete_vm: unused-slot storage does not match pve.disk_storage -- failing closed",
 				log.String("slot", slot), log.String("volid", volid),
 				log.String("slot_storage", storage), log.String("disk_storage", diskStorage))
 			protected = append(protected, fmt.Sprintf("%s=%s", slot, volid))
@@ -512,7 +512,7 @@ func guardUnusedVolumes(ctx context.Context, deps Deps, node, vmCID string, vmid
 	}
 	if len(protected) > 0 {
 		return cpierrors.Cloud(
-			"delete_vm: refusing to destroy VM %s -- persistent volumes still attached as unused slots: %v (call detach_disk first or verify pve_disk_storage configuration)",
+			"delete_vm: refusing to destroy VM %s -- persistent volumes still attached as unused slots: %v (call detach_disk first or verify pve.disk_storage configuration)",
 			vmCID, protected,
 		)
 	}

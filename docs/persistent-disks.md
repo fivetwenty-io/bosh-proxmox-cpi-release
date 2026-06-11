@@ -206,7 +206,7 @@ is lost due to a transient PVE failure.
 
 A persistent volume can also linger in an unused (`unusedN`) config slot when a
 snapshot reference prevents PVE from fully sweeping it during the detach. The CPI
-probes the configured `pve_disk_storage` for the volume and refuses to destroy the VM
+probes the configured `pve.disk_storage` for the volume and refuses to destroy the VM
 while any such volume still exists. This refusal is not retriable: remove the
 snapshot (or the unused slot) before deleting the VM. An `unusedN` slot whose
 volume has already been deleted from storage does not block the destroy.

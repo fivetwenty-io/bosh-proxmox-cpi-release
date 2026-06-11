@@ -33,7 +33,7 @@ var ErrDiskNotAttached = errors.New("disk not attached to vm")
 // volumes still owned by BOSH but holding such an entry will be destroyed
 // by the next DELETE /qemu/{vmid}; delete_vm therefore refuses to issue
 // the destroy when an unusedN entry references a volume on the configured
-// pve_disk_storage. (The DetachDisk SDK call cleans these up on its own;
+// pve.disk_storage. (The DetachDisk SDK call cleans these up on its own;
 // this guard catches paths where DetachDisk was bypassed or failed mid-way.)
 var unusedDiskKeyPattern = regexp.MustCompile(`^unused\d+$`)
 

@@ -287,7 +287,7 @@ func TestHandleDeleteVM_InvalidVMCID(t *testing.T) {
 
 // TestHandleDeleteVM_RefusesWhenPersistentDiskUnused verifies the guard
 // rejects destroy when an unusedN slot still references a volume on the
-// configured pve_disk_storage. The guard runs after Stop but before the
+// configured pve.disk_storage. The guard runs after Stop but before the
 // DELETE /qemu/{vmid} call, so DeleteQemu must NOT be invoked.
 func TestHandleDeleteVM_RefusesWhenPersistentDiskUnused(t *testing.T) {
 	t.Parallel()
@@ -442,7 +442,7 @@ func TestHandleDeleteVM_FastPath_RefusesLiveForeignUnusedDisk(t *testing.T) {
 	qemuSvc := &mockQEMUService{
 		stopFn: func(_ context.Context, _ string, _ int) (string, error) { return "", nil },
 		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
-			// Foreign volume (vmid 9000) parked in unused0 on pve_disk_storage.
+			// Foreign volume (vmid 9000) parked in unused0 on pve.disk_storage.
 			return map[string]any{"unused0": "local-lvm:vm-9000-disk-0"}, nil
 		},
 	}
@@ -474,7 +474,7 @@ func TestHandleDeleteVM_FastPath_RefusesLiveForeignUnusedDisk(t *testing.T) {
 
 // TestHandleDeleteVM_AllowsWhenUnusedOnDifferentStorage verifies the guard
 // fails CLOSED when an unusedN slot references a storage that does not match
-// pve_disk_storage.
+// pve.disk_storage.
 func TestHandleDeleteVM_AllowsWhenUnusedOnDifferentStorage(t *testing.T) {
 	t.Parallel()
 

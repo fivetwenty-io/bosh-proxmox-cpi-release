@@ -125,7 +125,7 @@ We observed this exact race against `vm-117-config.iso`:
 14:44:17  qmstart  failed: volume 'local:iso/vm-117-config.iso' does not exist
 ```
 
-The fix is in the SDK and CPI: `Storage().DeleteVolumeAsync` and `Storage().DeleteVolumeIfExistsAsync` (added in `pve-apiclient-go` v3.1.6) return the imgdel UPID. The CPI's `agent/configdrive` pre-delete now awaits that UPID before uploading, so a queued imgdel can never fire mid-create. Same wiring applies to `delete_disk` and `create_disk`'s rollback paths.
+The fix is in the SDK and CPI: `Storage().DeleteVolumeAsync` and `Storage().DeleteVolumeIfExistsAsync` (from `pve-apiclient-go`) return the imgdel UPID. The CPI's `agent/configdrive` pre-delete now awaits that UPID before uploading, so a queued imgdel can never fire mid-create. Same wiring applies to `delete_disk` and `create_disk`'s rollback paths.
 
 ## Cluster Pool Advisory Lock
 
