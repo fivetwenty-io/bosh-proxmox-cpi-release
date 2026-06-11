@@ -881,23 +881,14 @@ func parseCreateVMArgs(args []json.RawMessage) (*createVMParsedArgs, error) {
 	}, nil
 }
 
-// resolveVMShape derives the createVMShape from deps.Config + parsed args.
-// Returns cpierrors.CloudError if the target node cannot be determined.
+// buildVMShapeForNode constructs a createVMShape for a pre-resolved node.
+// All node selection (resolveTargetNode / resolveTargetNodeWithFallbacks) must
+// happen before calling this helper; the resulting node string is passed in.
 // vmStorageType is populated via a best-effort cluster storage list lookup;
 // on failure (PVE unavailable, ClusterStorage not wired) the field is left ""
 // so IsLinkedCloneSupported treats it as linked-capable (permissive default).
-func resolveVMShape(ctx context.Context, deps Deps, parsed *createVMParsedArgs) (*createVMShape, error) {
+func buildVMShapeForNode(ctx context.Context, deps Deps, parsed *createVMParsedArgs, node string) (*createVMShape, error) {
 	cp := parsed.cloudProps
-
-	// Anti-affinity group tag (Tier 2, scheduler-soft spreading). Only computed
-	// when anti-affinity is enabled; otherwise the scorer ignores group membership
-	// and behavior is identical to Tier 1.
-	groupTag := antiAffinityGroupTag(deps.Config, parsed.env)
-
-	node, err := resolveTargetNode(ctx, deps, cp, groupTag, parsed.diskCIDs, parsed.cloudPropsMap)
-	if err != nil {
-		return nil, err
-	}
 
 	rangeStart, maxAttempts := resolveVMIDAllocParams(deps.Config)
 	// Build a tier-resolver closure so resolveVMShapeStorage can call
@@ -985,6 +976,23 @@ func resolveVMShape(ctx context.Context, deps Deps, parsed *createVMParsedArgs) 
 	}, nil
 }
 
+// resolveVMShape derives the createVMShape from deps.Config + parsed args.
+// Returns cpierrors.CloudError if the target node cannot be determined.
+func resolveVMShape(ctx context.Context, deps Deps, parsed *createVMParsedArgs) (*createVMShape, error) {
+	cp := parsed.cloudProps
+
+	// Anti-affinity group tag (Tier 2, scheduler-soft spreading). Only computed
+	// when anti-affinity is enabled; otherwise the scorer ignores group membership
+	// and behavior is identical to Tier 1.
+	groupTag := antiAffinityGroupTag(deps.Config, parsed.env)
+
+	node, err := resolveTargetNode(ctx, deps, cp, groupTag, parsed.diskCIDs, parsed.cloudPropsMap)
+	if err != nil {
+		return nil, err
+	}
+	return buildVMShapeForNode(ctx, deps, parsed, node)
+}
+
 // resolveVMShapeWithAlternates is like resolveVMShape but additionally returns
 // the ordered list of alternate node names (from the same scored candidate pass)
 // capped at fallbackMax. Used by the post-selection fallback path when
@@ -1008,71 +1016,9 @@ func resolveVMShapeWithAlternates(
 		return nil, nil, nodeErr
 	}
 
-	rangeStart, maxAttempts := resolveVMIDAllocParams(deps.Config)
-	var tierFnForVM vmStorageTierFn
-	if deps.PVE != nil && deps.PVE.ClusterStorage() != nil {
-		lister := deps.PVE.ClusterStorage()
-		cfg := deps.Config
-		tierFnForVM = func(tier string) (string, error) {
-			return resolveStorageTier(ctx, lister, cfg, tier)
-		}
-	}
-	vmStorage, vmDiskFormat, rootDiskGiB, err := resolveVMShapeStorage(deps.Config, parsed, tierFnForVM)
+	s, err := buildVMShapeForNode(ctx, deps, parsed, winner)
 	if err != nil {
 		return nil, nil, err
-	}
-	cores, sockets, memMiB := resolveVMShapeCPUMem(cp)
-	hotplug, numaEnabled, err := resolveVMShapeHotplugNUMAWithError(deps.Config, cp, parsed.cloudPropsMap)
-	if err != nil {
-		return nil, nil, err
-	}
-	initialTags := mergeTagList(nil, buildCustomTags(cp.Tags), maxTagLength)
-	initialName := resolveVMShapeInitialName(deps.Config, parsed)
-	vmStorageType := lookupVMStorageType(ctx, deps, vmStorage)
-
-	perfR, perfRErr := newLayeredResolver(parsed.cloudPropsMap, deps.Config)
-	if perfRErr != nil {
-		return nil, nil, perfRErr
-	}
-	rawPerfOpts, perfOptsErr := resolveDiskPerfOptions(perfR, deps.Config)
-	if perfOptsErr != nil {
-		return nil, nil, perfOptsErr
-	}
-	rootDiskPerfOpts := filterDiskPerfForBus(rawPerfOpts, "virtio")
-
-	scsihwVal := "virtio-scsi-pci"
-	if resolveVirtioSCSISingle(perfR, deps.Config) {
-		scsihwVal = "virtio-scsi-single"
-	}
-
-	ephemeralDiskGiB, ephemeralStorage, err := resolveEphemeralShape(deps.Config, cp, parsed.cloudPropsMap)
-	if err != nil {
-		return nil, nil, err
-	}
-	if err := enforceEphemeralMinSize(deps.Config, deps.Logger, ephemeralDiskGiB, memMiB); err != nil {
-		return nil, nil, err
-	}
-
-	s := &createVMShape{
-		node:             winner,
-		vmStorage:        vmStorage,
-		vmStorageType:    vmStorageType,
-		vmDiskFormat:     vmDiskFormat,
-		rootDiskGiB:      rootDiskGiB,
-		cores:            cores,
-		sockets:          sockets,
-		memMiB:           memMiB,
-		hotplug:          hotplug,
-		numaEnabled:      numaEnabled,
-		initialTags:      initialTags,
-		rangeStart:       rangeStart,
-		maxAttempts:      maxAttempts,
-		initialName:      initialName,
-		cloudPropsMap:    parsed.cloudPropsMap,
-		rootDiskPerfOpts: rootDiskPerfOpts,
-		scsihw:           scsihwVal,
-		ephemeralDiskGiB: ephemeralDiskGiB,
-		ephemeralStorage: ephemeralStorage,
 	}
 	return s, alts, nil
 }
