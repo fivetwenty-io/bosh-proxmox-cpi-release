@@ -13,7 +13,9 @@ import (
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/qemu"
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/storage"
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/tasks"
+	sdkerrors "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/errors"
 
+	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
 )
 
@@ -409,6 +411,17 @@ func (q *diskFakeQEMU) Config(_ context.Context, _ string, _ int) (map[string]an
 	return q.cfg, nil
 }
 
+// diskFakeQEMUFn is a minimal qemu.Service whose Config is driven by a function
+// so tests can return per-VMID configs or errors.
+type diskFakeQEMUFn struct {
+	qemu.Service
+	fn func(node string, vmid int) (map[string]any, error)
+}
+
+func (q *diskFakeQEMUFn) Config(_ context.Context, node string, vmid int) (map[string]any, error) {
+	return q.fn(node, vmid)
+}
+
 // diskClusterResp builds a cluster.ListResourcesResponse from typed rows.
 func diskClusterResp(rows ...map[string]any) *cluster.ListResourcesResponse {
 	out := make(cluster.ListResourcesResponse, 0, len(rows))
@@ -462,6 +475,82 @@ func TestFindVMByDiskVolid_TransientThenSuccess(t *testing.T) {
 	}
 	if listCalls < 2 {
 		t.Errorf("expected at least 2 ListResources calls (1 transient + 1 success), got %d", listCalls)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// FindVMByDiskVolid — per-VM Config error discrimination
+// ---------------------------------------------------------------------------
+
+// TestFindVMByDiskVolid_TransientConfigError_ReturnsRetriable verifies that a
+// transient Config error on a VM mid-scan is returned as a retriable error, not
+// silently swallowed. If the transient VM actually holds the disk, swallowing the
+// error would produce a false "disk not attached to any VM" result.
+func TestFindVMByDiskVolid_TransientConfigError_ReturnsRetriable(t *testing.T) {
+	t.Parallel()
+	volid := "local-lvm:vm-301-disk-0"
+
+	c := &diskClusterClient{
+		clusterSvc: &diskFakeCluster{
+			listFn: func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+				return diskClusterResp(
+					map[string]any{"vmid": int64(301), "node": "pve-01"},
+				), nil
+			},
+		},
+		qemuSvc: &diskFakeQEMUFn{
+			fn: func(_ string, vmid int) (map[string]any, error) {
+				// Transient shape: "(code: 596)" is detected by IsTransientTransport.
+				return nil, errors.New("pveproxy backend gone (code: 596)")
+			},
+		},
+	}
+
+	_, _, err := pve.FindVMByDiskVolid(context.Background(), c, "pve-default", volid)
+	if err == nil {
+		t.Fatal("expected retriable error for transient Config failure; got nil")
+	}
+	if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+		t.Errorf("transient Config error must produce TypeRetriableCloud; got: %v", err)
+	}
+}
+
+// TestFindVMByDiskVolid_NotFoundConfigError_SkippedScanContinues verifies that a
+// not-found Config error (deleted/template VM) is silently skipped and the scan
+// continues to find the disk on a later VM in the list.
+func TestFindVMByDiskVolid_NotFoundConfigError_SkippedScanContinues(t *testing.T) {
+	t.Parallel()
+	volid := "local-lvm:vm-402-disk-0"
+
+	c := &diskClusterClient{
+		clusterSvc: &diskFakeCluster{
+			listFn: func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+				return diskClusterResp(
+					map[string]any{"vmid": int64(401), "node": "pve-01"}, // will 404
+					map[string]any{"vmid": int64(402), "node": "pve-01"}, // holds the disk
+				), nil
+			},
+		},
+		qemuSvc: &diskFakeQEMUFn{
+			fn: func(_ string, vmid int) (map[string]any, error) {
+				if vmid == 401 {
+					// Simulate a 404 / not-found for a deleted VM.
+					return nil, sdkerrors.ErrNotFound
+				}
+				return map[string]any{"scsi0": volid}, nil
+			},
+		},
+	}
+
+	gotVMID, gotNode, err := pve.FindVMByDiskVolid(context.Background(), c, "pve-default", volid)
+	if err != nil {
+		t.Fatalf("not-found Config error must be skipped; scan must find the disk; got: %v", err)
+	}
+	if gotVMID != 402 {
+		t.Errorf("vmid: want 402, got %d", gotVMID)
+	}
+	if gotNode != "pve-01" {
+		t.Errorf("node: want pve-01, got %s", gotNode)
 	}
 }
 

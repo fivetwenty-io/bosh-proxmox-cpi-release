@@ -65,6 +65,32 @@ const (
 	adoptNode = "pve2"
 )
 
+// adoptCtxFakeNodes is like adoptFakeNodes but passes the caller context to fn,
+// allowing tests to capture and inspect the context passed to ListQemu.
+type adoptCtxFakeNodes struct {
+	nodes.Service
+	mu          sync.Mutex
+	calls       int
+	capturedCtx context.Context
+	fn          func(call int, ctx context.Context) (*nodes.ListQemuResponse, error)
+}
+
+func (f *adoptCtxFakeNodes) ListQemu(ctx context.Context, _ string, _ *nodes.ListQemuParams) (*nodes.ListQemuResponse, error) {
+	f.mu.Lock()
+	f.calls++
+	n := f.calls
+	f.mu.Unlock()
+	return f.fn(n, ctx)
+}
+
+// adoptCtxFakeClient exposes adoptCtxFakeNodes via Nodes().
+type adoptCtxFakeClient struct {
+	Client
+	nodesvc *adoptCtxFakeNodes
+}
+
+func (c *adoptCtxFakeClient) Nodes() nodes.Service { return c.nodesvc }
+
 func adoptShaTag() string  { return "bosh-stemcell-sha-" + adoptSHA }
 func adoptNodeTag() string { return ReplicaNodeTagForNode(adoptNode) }
 
@@ -313,6 +339,51 @@ func TestAdoptReplicaTemplate_InFlightVanishes_NotAdopted(t *testing.T) {
 	}
 	if adopted || vmid != 0 {
 		t.Fatalf("vanished candidate must yield (0,false) so the caller builds: got (%d,%v)", vmid, adopted)
+	}
+}
+
+// TestAdoptReplicaTemplate_LoopContextHasDeadline verifies that findReplicaCandidate
+// calls inside the adopt-wait loop receive a context with a deadline derived from
+// the adoption timeout, so a hung ListQemu cannot stall past that deadline.
+func TestAdoptReplicaTemplate_LoopContextHasDeadline(t *testing.T) {
+	t.Parallel()
+	tags := adoptShaTag() + ";" + adoptNodeTag()
+
+	acn := &adoptCtxFakeNodes{}
+	acn.fn = func(call int, ctx context.Context) (*nodes.ListQemuResponse, error) {
+		if call >= 2 {
+			acn.mu.Lock()
+			acn.capturedCtx = ctx
+			acn.mu.Unlock()
+		}
+		if call == 1 {
+			// Initial probe: in-flight clone-locked.
+			return listFromRaw(`{"vmid":40080,"template":0,"lock":"clone","tags":"` + tags + `"}`), nil
+		}
+		// First loop iteration: settled.
+		return listFromRaw(`{"vmid":40080,"template":1,"tags":"` + tags + `"}`), nil
+	}
+	cc := &adoptCtxFakeClient{nodesvc: acn}
+
+	_, adopted, err := adoptReplicaTemplate(
+		context.Background(), cc, adoptNode, adoptSHA, 30*time.Second,
+		fixedClock(time.Unix(1000, 0), time.Second))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !adopted {
+		t.Fatal("expected adoption after lock clears")
+	}
+
+	acn.mu.Lock()
+	loopCtx := acn.capturedCtx
+	acn.mu.Unlock()
+
+	if loopCtx == nil {
+		t.Fatal("loop context was never captured — loop may not have run")
+	}
+	if _, hasDeadline := loopCtx.Deadline(); !hasDeadline {
+		t.Error("context passed to findReplicaCandidate inside the loop must have a deadline derived from the adoption timeout")
 	}
 }
 

@@ -239,6 +239,16 @@ func awaitTaskAdaptive(ctx context.Context, c Client, node, upid string, opts ..
 			if IsNotFound(err) {
 				return wrapPollError(err, upid)
 			}
+			// Mirror the non-adaptive path: route through wrapPollError to classify.
+			// Transient faults (5xx, ConnectionError, TimeoutError, net.Timeout,
+			// pushback phrases, storage-lock, pmxcfs race) remain retriable and fall
+			// through to the sleep-and-retry path. Permanent faults (4xx non-404,
+			// generic unknown) are returned immediately so they are not misclassified
+			// as a retriable poll-timeout when actx eventually fires.
+			if !IsTransientTransport(err) && !IsStorageLockTimeout(err) &&
+				!IsPmxcfsConfigMissing(err) && !IsPVEPushback(err) {
+				return wrapPollError(err, upid)
+			}
 			// Transient read fault: fall through and retry until the deadline.
 		case status == nil:
 			return cpierrors.Cloud("AwaitTask %s: nil status returned from task service", upid)

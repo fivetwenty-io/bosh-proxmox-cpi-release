@@ -159,7 +159,9 @@ func TestAwaitTask_Adaptive_TransientErrorThenSucceeds(t *testing.T) {
 		getStatusFn: func(_ context.Context, _, upid string) (*sdktasks.Status, error) {
 			calls++
 			if calls < 3 {
-				return nil, errors.New("transient read blip")
+				// Use a genuine transient shape so the loop retries it correctly.
+				// ConnectionError is matched by IsTransientTransport.
+				return nil, &sdkerrors.ConnectionError{Host: "pve1", Port: 8006, Message: "transient read blip"}
 			}
 			return &sdktasks.Status{Status: "stopped", ExitStatus: "OK", UpID: upid}, nil
 		},
@@ -214,6 +216,64 @@ func TestAwaitTask_Adaptive_ContextCancelledIsRetriable(t *testing.T) {
 	}
 	if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
 		t.Errorf("context cancellation must be retriable, got: %v", err)
+	}
+}
+
+// TestAwaitTask_Adaptive_PermanentErrorIsNonRetriable verifies that a permanent
+// 4xx-style error from GetStatus is returned immediately as non-retriable, not
+// silently retried until the adaptive deadline fires a retriable timeout.
+func TestAwaitTask_Adaptive_PermanentErrorIsNonRetriable(t *testing.T) {
+	defer pve.SetAdaptiveTaskPollForTest(true)()
+
+	calls := 0
+	// A 403-style permanent error: not transient-transport, not not-found.
+	permErr := &sdkerrors.APIError{HTTPCode: 403, Message: "permission denied", Code: 403}
+	svc := &mockTasksService{
+		getStatusFn: func(_ context.Context, _, _ string) (*sdktasks.Status, error) {
+			calls++
+			return nil, permErr
+		},
+	}
+	// WithMaxWait(1s) bounds the test even before the fix: the bug causes the loop
+	// to spin until actx fires (returning retriable timeout); the fix exits on the
+	// first call. Either way the test completes in under 2 seconds.
+	ctx := pve.WithTestBackoff(context.Background(), func(int) time.Duration { return 0 })
+	err := pve.AwaitTask(ctx, newMockClient(svc), "node1", "UPID:node1:perm",
+		pve.WithMaxWait(1*time.Second))
+	if err == nil {
+		t.Fatal("expected error for permanent GetStatus failure, got nil")
+	}
+	if cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+		t.Errorf("permanent 403 must be non-retriable; got retriable error: %v", err)
+	}
+	if calls > 2 {
+		t.Errorf("permanent error must exit immediately, not loop; got %d GetStatus calls", calls)
+	}
+}
+
+// TestAwaitTask_Adaptive_TransientErrorStillRetries verifies that a transient
+// transport error (5xx / connection) keeps the current retry-until-deadline
+// behaviour and does not short-circuit to an early return.
+func TestAwaitTask_Adaptive_TransientErrorStillRetries(t *testing.T) {
+	defer pve.SetAdaptiveTaskPollForTest(true)()
+
+	calls := 0
+	svc := &mockTasksService{
+		getStatusFn: func(_ context.Context, _, upid string) (*sdktasks.Status, error) {
+			calls++
+			if calls < 4 {
+				// Transient shape: ConnectionError is detected by IsTransientTransport.
+				return nil, &sdkerrors.ConnectionError{Host: "pve1", Port: 8006, Message: "EOF"}
+			}
+			return &sdktasks.Status{Status: "stopped", ExitStatus: "OK", UpID: upid}, nil
+		},
+	}
+	ctx := pve.WithTestBackoff(context.Background(), func(int) time.Duration { return 0 })
+	if err := pve.AwaitTask(ctx, newMockClient(svc), "node1", "UPID:node1:transient"); err != nil {
+		t.Fatalf("transient 5xx must be retried until success; got: %v", err)
+	}
+	if calls < 4 {
+		t.Errorf("expected at least 4 calls (3 transient + 1 success); got %d", calls)
 	}
 }
 

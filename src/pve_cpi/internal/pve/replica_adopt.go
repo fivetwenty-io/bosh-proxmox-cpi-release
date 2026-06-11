@@ -198,6 +198,14 @@ func adoptReplicaTemplate(
 	}
 
 	deadline := clk.now().Add(timeout)
+
+	// Derive a context whose deadline matches the adoption deadline so API calls
+	// inside findReplicaCandidate (notably ListQemu) cannot stall past it. The
+	// loop's clock-based deadline check is kept as the primary gate; this context
+	// provides a hard cap on any single API call's wall time.
+	adoptCtx, adoptCancel := context.WithDeadline(ctx, deadline)
+	defer adoptCancel()
+
 	for {
 		now := clk.now()
 		if !now.Before(deadline) {
@@ -217,7 +225,7 @@ func adoptReplicaTemplate(
 				"AdoptReplicaTemplate: interrupted waiting to adopt")
 		}
 
-		cand, found, err = findReplicaCandidate(ctx, c, node, sha8)
+		cand, found, err = findReplicaCandidate(adoptCtx, c, node, sha8)
 		if err != nil {
 			return 0, false, err
 		}

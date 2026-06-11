@@ -354,8 +354,19 @@ func FindVMByDiskVolid(ctx context.Context, c Client, fallbackNode, volid string
 		vmid := int(entry.VMID)
 		cfg, cfgErr := c.QEMU().Config(ctx, vmNode, vmid)
 		if cfgErr != nil {
-			// Skip VMs whose config cannot be fetched (templates, transient errors).
-			continue
+			// Skip only not-found-style errors: the VM was deleted or is a template
+			// whose config was concurrently removed. Any other error is potentially
+			// a transient fault on the VM that holds the disk; returning it as a
+			// retriable error lets the caller retry rather than producing a false
+			// "disk not attached to any VM" result.
+			if IsNotFound(cfgErr) {
+				continue
+			}
+			return 0, "", cpierrors.WrapAs(
+				cfgErr,
+				cpierrors.TypeRetriableCloud,
+				fmt.Sprintf("FindVMByDiskVolid: transient Config error for vm %d on node %s", vmid, vmNode),
+			)
 		}
 
 		if DiskOptStrContainsVolid(qemu.ParseDisks(cfg), volid) {
