@@ -48,7 +48,7 @@ func (s *retryBoundaryPoolService) AddVM(_ context.Context, _ string, _ int64) e
 	return s.err
 }
 func (s *retryBoundaryPoolService) CreatePool(_ context.Context, _, _ string) error { return nil }
-func (s *retryBoundaryPoolService) DeletePool(_ context.Context, _ string) error     { return nil }
+func (s *retryBoundaryPoolService) DeletePool(_ context.Context, _ string) error    { return nil }
 func (s *retryBoundaryPoolService) GetPoolComment(_ context.Context, _ string) (string, bool, error) {
 	return "", false, nil
 }

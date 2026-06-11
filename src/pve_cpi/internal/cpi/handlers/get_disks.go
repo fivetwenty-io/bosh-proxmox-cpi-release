@@ -24,10 +24,10 @@ import (
 // rather than by slot name, since the slot may vary. The system disk is always
 // the first disk on the boot bus (index 0).
 var systemDiskSlots = map[string]bool{
-	"scsi0":   true,
+	"scsi0":        true,
 	diskKeyVirtio0: true,
-	"ide0":    true,
-	"ide2":    true, // conventional cloudinit slot
+	"ide0":         true,
+	"ide2":         true, // conventional cloudinit slot
 }
 
 // HandleGetDisks returns a Handler for the BOSH CPI get_disks method.

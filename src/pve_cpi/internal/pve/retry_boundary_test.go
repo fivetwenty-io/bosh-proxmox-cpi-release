@@ -34,7 +34,7 @@ func (s *retryPoolService) AddVM(ctx context.Context, poolID string, vmid int64)
 // Cluster-lock pool methods are unused by these retry-boundary tests; provide
 // no-op stubs so retryPoolService still satisfies pve.PoolService.
 func (s *retryPoolService) CreatePool(_ context.Context, _, _ string) error { return nil }
-func (s *retryPoolService) DeletePool(_ context.Context, _ string) error     { return nil }
+func (s *retryPoolService) DeletePool(_ context.Context, _ string) error    { return nil }
 func (s *retryPoolService) GetPoolComment(_ context.Context, _ string) (string, bool, error) {
 	return "", false, nil
 }

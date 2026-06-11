@@ -75,8 +75,8 @@ func isSkippedGuestIP(ip net.IP) bool {
 // agentNetworkEntry is one interface object in the guest-agent network-get-interfaces response.
 // The PVE agent returns a list of these under a "result" envelope or directly as a JSON array.
 type agentNetworkEntry struct {
-	Name        string            `json:"name"`
-	IPAddresses []agentIPAddress  `json:"ip-addresses"`
+	Name        string           `json:"name"`
+	IPAddresses []agentIPAddress `json:"ip-addresses"`
 }
 
 // agentIPAddress is one IP address entry within an agentNetworkEntry.
@@ -367,4 +367,3 @@ func findConflictingIP(ifaces []agentNetworkEntry, targetSet map[string]string) 
 	}
 	return "", ""
 }
-

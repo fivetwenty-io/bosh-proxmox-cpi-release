@@ -1623,7 +1623,7 @@ func TestAttemptCreateTemplateVM_ReplicaProvenanceON(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// buildAndDeduplicateStemcellCID signature tests (finding #1)
+// buildAndDeduplicateStemcellCID result tests
 // ---------------------------------------------------------------------------
 
 // TestBuildAndDeduplicateStemcellCID_ReturnsHashWithoutReread verifies that

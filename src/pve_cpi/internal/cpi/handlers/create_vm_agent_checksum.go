@@ -191,9 +191,10 @@ func awaitAgentExec(
 
 // parseSha256SumMaxBytes is the maximum accepted length of sha256sum stdout.
 // sha256sum output is "<64-hex>  <path>\n"; a Linux path is at most 4096 bytes
-// (PATH_MAX). The bound is therefore 64 + 2 + 4096 + 1 = 4163, rounded up to
-// 4096 for simplicity — any legitimate output fits, and inputs beyond this
-// bound are guest-injected garbage that must be rejected without processing.
+// (PATH_MAX), so the worst legitimate case is 64 + 2 + 4096 + 1 = 4163 bytes.
+// The CPI only ever hashes agentChecksumPath (a short fixed path), so 4096 is
+// a generous bound; anything beyond it is guest-injected garbage that must be
+// rejected without processing.
 const parseSha256SumMaxBytes = 4096
 
 // parseSha256SumOutput extracts the lower-cased hex digest from sha256sum

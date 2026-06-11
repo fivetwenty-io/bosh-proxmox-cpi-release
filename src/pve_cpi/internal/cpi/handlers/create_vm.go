@@ -2209,10 +2209,12 @@ func resolveVMShapeCPUMem(cp createVMCloudProps) (cores, sockets, memMiB int) {
 	return cores, sockets, memMiB
 }
 
-// resolveVMShapeHotplugNUMA resolves hotplug + numa using
+// resolveVMShapeHotplugNUMAWithError resolves hotplug + numa using
 // cloud_properties → vm_type/disk_type profile → config → built-in default.
 // Memory hotplug needs both numa=1 and "memory" in hotplug at create time;
 // operators can override per-vm_type for stemcells that misbehave on hot-add.
+// It returns a CloudError when an unknown vm_type or disk_type selector is
+// present in cpMap.
 //
 // Hotplug precedence (pointer semantics preserved):
 //  1. cp.Hotplug != nil → use *cp.Hotplug (includes explicit "" to disable)
@@ -2223,10 +2225,6 @@ func resolveVMShapeCPUMem(cp createVMCloudProps) (cores, sockets, memMiB int) {
 //  1. cp.NUMA != nil → use *cp.NUMA (includes explicit false)
 //  2. profile layer via r.Bool("numa") (explicit false honored)
 //  3. config.NUMAValue()
-//
-// resolveVMShapeHotplugNUMAWithError is the error-returning variant used by
-// resolveVMShape and tests. It returns a CloudError when an unknown vm_type or
-// disk_type selector is present in cpMap.
 func resolveVMShapeHotplugNUMAWithError(cfg *config.CPIConfig, cp createVMCloudProps, cpMap map[string]any) (hotplug string, numaEnabled bool, err error) {
 	r, err := newLayeredResolver(cpMap, cfg)
 	if err != nil {
@@ -3422,8 +3420,11 @@ func attachEphemeralDisk(
 	return devPath, nil
 }
 
-// resolveVMNICDefaults resolves the VM-level NIC bridge and model defaults using
-// the layered resolver. Precedence for bridge:
+// resolveVMNICDefaultsWithError resolves the VM-level NIC bridge and model
+// defaults using the layered resolver. Returns a CloudError when cpMap contains
+// an unknown vm_type or disk_type selector.
+//
+// Precedence for bridge:
 //  1. cp.NetworkBridge (call struct field, non-empty wins)
 //  2. profile layers via r.String("network_bridge")
 //  3. config.NetworkBridge
@@ -3436,9 +3437,6 @@ func attachEphemeralDisk(
 //
 // Per-NIC spec.CloudProperties["bridge"] / ["model"] overrides sit above these
 // VM-level defaults and are applied in configureNICs after this call.
-//
-// resolveVMNICDefaultsWithError is the error-returning variant of resolveVMNICDefaults.
-// Returns a CloudError when cpMap contains an unknown vm_type or disk_type selector.
 func resolveVMNICDefaultsWithError(cfg *config.CPIConfig, cp createVMCloudProps, cpMap map[string]any) (bridge, model string, err error) {
 	r, err := newLayeredResolver(cpMap, cfg)
 	if err != nil {

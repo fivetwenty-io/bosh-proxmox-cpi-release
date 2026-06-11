@@ -1478,4 +1478,3 @@ func TestCreateVM_Fallback_StorageTierResolved_SuccessPath(t *testing.T) {
 		t.Errorf("create node: want pve1, got %q", createNode)
 	}
 }
-

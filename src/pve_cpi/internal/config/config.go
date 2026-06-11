@@ -3213,9 +3213,10 @@ var stemcellDirectorIDRe = regexp.MustCompile(`[A-Za-z0-9-]`)
 // read struct fields directly.
 //
 // Rules enforced when strict is on:
-//   (b) use_ha_rules=true requires anti_affinity.enabled=true.
-//   (c) network_mode=sdn requires sdn_zone != "" OR sdn_auto_manage_zone=true.
-//       network_mode=auto is exempt (auto falls back to bridge when no zone).
+//
+//	(b) use_ha_rules=true requires anti_affinity.enabled=true.
+//	(c) network_mode=sdn requires sdn_zone != "" OR sdn_auto_manage_zone=true.
+//	    network_mode=auto is exempt (auto falls back to bridge when no zone).
 //
 // Rule (d) (DLB require_shared_storage without DLB enabled) lives in
 // validateDLB so it shares placement's nil-guard and is co-located with DLB

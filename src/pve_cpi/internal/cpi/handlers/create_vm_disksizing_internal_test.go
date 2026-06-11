@@ -142,12 +142,16 @@ func (p *diskSizingPVE) Storage() sdkstorage.Service {
 	}
 	panic("diskSizingPVE.Storage: not expected")
 }
-func (p *diskSizingPVE) CloudInit() sdkcloudinit.Service           { panic("diskSizingPVE.CloudInit: not expected") }
-func (p *diskSizingPVE) Tasks() sdktasks.Service                   { panic("diskSizingPVE.Tasks: not expected") }
-func (p *diskSizingPVE) Nodes() sdknodes.Service                   { panic("diskSizingPVE.Nodes: not expected") }
-func (p *diskSizingPVE) Cluster() sdkcluster.Service               { panic("diskSizingPVE.Cluster: not expected") }
-func (p *diskSizingPVE) ClusterStorage() sdkclusterstorage.Service { panic("diskSizingPVE.ClusterStorage: not expected") }
-func (p *diskSizingPVE) Pools() pve.PoolService                    { panic("diskSizingPVE.Pools: not expected") }
+func (p *diskSizingPVE) CloudInit() sdkcloudinit.Service {
+	panic("diskSizingPVE.CloudInit: not expected")
+}
+func (p *diskSizingPVE) Tasks() sdktasks.Service     { panic("diskSizingPVE.Tasks: not expected") }
+func (p *diskSizingPVE) Nodes() sdknodes.Service     { panic("diskSizingPVE.Nodes: not expected") }
+func (p *diskSizingPVE) Cluster() sdkcluster.Service { panic("diskSizingPVE.Cluster: not expected") }
+func (p *diskSizingPVE) ClusterStorage() sdkclusterstorage.Service {
+	panic("diskSizingPVE.ClusterStorage: not expected")
+}
+func (p *diskSizingPVE) Pools() pve.PoolService { panic("diskSizingPVE.Pools: not expected") }
 
 var _ pve.Client = (*diskSizingPVE)(nil)
 
@@ -200,7 +204,7 @@ func TestReadVirtio0SizeGiB_ReturnsActualSize(t *testing.T) {
 		func(_ context.Context, _ string, _ int) (map[string]any, error) {
 			return map[string]any{
 				diskKeyVirtio0: "local-lvm:vm-100-disk-0,size=7G",
-				"net0":    "virtio=aa:bb:cc:dd:ee:ff,bridge=vmbr0",
+				"net0":         "virtio=aa:bb:cc:dd:ee:ff,bridge=vmbr0",
 			}, nil
 		},
 		nil,

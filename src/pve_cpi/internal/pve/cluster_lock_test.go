@@ -83,10 +83,10 @@ func fixedClock(start time.Time, step time.Duration) lockClock {
 
 func TestClusterLockPoolName_SanitizesAndPrefixes(t *testing.T) {
 	cases := map[string]string{
-		"web":          "bosh-lock-web",
-		"aa-web":       "bosh-lock-aa-web",
+		"web":           "bosh-lock-web",
+		"aa-web":        "bosh-lock-aa-web",
 		"cf/diego_cell": "bosh-lock-cf-diego_cell",
-		"a b.c":        "bosh-lock-a-b-c",
+		"a b.c":         "bosh-lock-a-b-c",
 	}
 	for in, want := range cases {
 		if got := ClusterLockPoolName(in); got != want {

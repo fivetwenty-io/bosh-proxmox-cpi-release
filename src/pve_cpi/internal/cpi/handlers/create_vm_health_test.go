@@ -10,9 +10,9 @@ import (
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/cpi/handlers"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
-	sdkerrors "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/errors"
 	sdknodes "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/nodes"
 	sdktasks "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/tasks"
+	sdkerrors "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/errors"
 )
 
 // --------------------------------------------------------------------------
@@ -26,13 +26,13 @@ import (
 type healthNodes struct {
 	panicNodesStub
 
-	pingFn         func(ctx context.Context, node, vmid string) (*sdknodes.CreateQemuAgentPingResponse, error)
-	statusFn       func(ctx context.Context, node, vmid string) (*sdknodes.ListQemuStatusCurrentResponse, error)
-	deleteQemuFn   func(ctx context.Context, node, vmid string, p *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error)
-	updateConfigFn func(ctx context.Context, node, vmid string, p *sdknodes.UpdateQemuConfigParams) error
-	listQemuFn     func(ctx context.Context, node string, p *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error)
-	listStorageFn  func(ctx context.Context, node string, p *sdknodes.ListStorageParams) (*sdknodes.ListStorageResponse, error)
-	agentExecFn    func(ctx context.Context, node, vmid string, p *sdknodes.CreateQemuAgentExecParams) (*sdknodes.CreateQemuAgentExecResponse, error)
+	pingFn            func(ctx context.Context, node, vmid string) (*sdknodes.CreateQemuAgentPingResponse, error)
+	statusFn          func(ctx context.Context, node, vmid string) (*sdknodes.ListQemuStatusCurrentResponse, error)
+	deleteQemuFn      func(ctx context.Context, node, vmid string, p *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error)
+	updateConfigFn    func(ctx context.Context, node, vmid string, p *sdknodes.UpdateQemuConfigParams) error
+	listQemuFn        func(ctx context.Context, node string, p *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error)
+	listStorageFn     func(ctx context.Context, node string, p *sdknodes.ListStorageParams) (*sdknodes.ListStorageResponse, error)
+	agentExecFn       func(ctx context.Context, node, vmid string, p *sdknodes.CreateQemuAgentExecParams) (*sdknodes.CreateQemuAgentExecResponse, error)
 	agentExecStatusFn func(ctx context.Context, node, vmid string, p *sdknodes.ListQemuAgentExecStatusParams) (*sdknodes.ListQemuAgentExecStatusResponse, error)
 
 	pingCalls int

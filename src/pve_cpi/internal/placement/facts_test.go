@@ -17,11 +17,11 @@ import (
 // ---------------------------------------------------------------------------
 
 type stubCluster struct {
-	statusResp    *cluster.ListStatusResponse
-	statusErr     error
-	resResp       *cluster.ListResourcesResponse
-	resErr        error
-	haStatusFn    func() (*cluster.ListHaStatusCurrentResponse, error)
+	statusResp     *cluster.ListStatusResponse
+	statusErr      error
+	resResp        *cluster.ListResourcesResponse
+	resErr         error
+	haStatusFn     func() (*cluster.ListHaStatusCurrentResponse, error)
 	haStatusCalled bool
 }
 

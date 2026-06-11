@@ -69,10 +69,10 @@ func mkCtxNoAPIVersion(requestID string) jsonrpc.Context {
 func defaultNetwork() map[string]any {
 	return map[string]any{
 		"default": map[string]any{
-			"type":    "manual",
-			"ip":      "10.0.0.5",
-			"netmask": "255.255.255.0",
-			"gateway": "10.0.0.1",
+			"type":             "manual",
+			"ip":               "10.0.0.5",
+			"netmask":          "255.255.255.0",
+			"gateway":          "10.0.0.1",
 			"cloud_properties": map[string]any{"bridge": "vmbr0"},
 		},
 	}

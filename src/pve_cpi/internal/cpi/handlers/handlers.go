@@ -27,9 +27,9 @@ type HandlerFunc = cpi.HandlerFunc
 // call inside HandleCreateStemcell's resolveFetchSource path. Set by tests only;
 // production code leaves it nil.
 type Deps struct {
-	Config        *config.CPIConfig
-	PVE           pve.Client
-	Agent         agent.Agent
+	Config *config.CPIConfig
+	PVE    pve.Client
+	Agent  agent.Agent
 	// RegistryAgent is the registry-based Agent used when agent_mode="auto" and
 	// the stemcell api_version < 2. Nil unless agent_mode=auto and registry_endpoint
 	// are both set.

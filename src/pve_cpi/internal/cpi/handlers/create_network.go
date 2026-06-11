@@ -440,8 +440,8 @@ func createNetworkSDN(
 		"reserved": []string{},
 	}
 	cloudPropsOut := map[string]any{
-		"zone":          zone,
-		"vnet":          vnet,
+		"zone":         zone,
+		"vnet":         vnet,
 		nicCPKeyBridge: vnet,
 	}
 	return []any{vnet, addrProps, cloudPropsOut}, nil
