@@ -11,9 +11,9 @@ import (
 )
 
 // TestInflightUnlimited: limit<=0 → acquire never blocks; all goroutines proceed.
+// Uses a local registry instance; does not touch the package-level inflightSems.
 func TestInflightUnlimited(t *testing.T) {
-	// Reset registry state between tests.
-	inflightSems = &nodeInflightRegistry{m: map[string]chan struct{}{}}
+	reg := &nodeInflightRegistry{m: map[string]chan struct{}{}}
 
 	const n = 20
 	var wg sync.WaitGroup
@@ -22,7 +22,7 @@ func TestInflightUnlimited(t *testing.T) {
 	for i := 0; i < n; i++ {
 		go func() {
 			defer wg.Done()
-			release, err := inflightSems.acquire(ctx, "node1", 0)
+			release, err := reg.acquire(ctx, "node1", 0)
 			if err != nil {
 				t.Errorf("unexpected error with limit=0: %v", err)
 				return
@@ -43,15 +43,16 @@ func TestInflightUnlimited(t *testing.T) {
 }
 
 // TestInflightLimitedSemaphore: limit=2 → 3rd acquire blocks until a release.
+// Uses a local registry instance; does not touch the package-level inflightSems.
 func TestInflightLimitedSemaphore(t *testing.T) {
-	inflightSems = &nodeInflightRegistry{m: map[string]chan struct{}{}}
+	reg := &nodeInflightRegistry{m: map[string]chan struct{}{}}
 
 	ctx := context.Background()
-	r1, err := inflightSems.acquire(ctx, "nodeA", 2)
+	r1, err := reg.acquire(ctx, "nodeA", 2)
 	if err != nil {
 		t.Fatalf("acquire1 unexpected error: %v", err)
 	}
-	r2, err := inflightSems.acquire(ctx, "nodeA", 2)
+	r2, err := reg.acquire(ctx, "nodeA", 2)
 	if err != nil {
 		t.Fatalf("acquire2 unexpected error: %v", err)
 	}
@@ -61,7 +62,7 @@ func TestInflightLimitedSemaphore(t *testing.T) {
 	var r3 func()
 	go func() {
 		var e error
-		r3, e = inflightSems.acquire(ctx, "nodeA", 2)
+		r3, e = reg.acquire(ctx, "nodeA", 2)
 		acquired <- e
 	}()
 
@@ -89,20 +90,28 @@ func TestInflightLimitedSemaphore(t *testing.T) {
 }
 
 // TestInflightCtxCancel: ctx cancel while blocked → acquire returns ctx.Err(), no leak.
+// Uses a local registry instance; does not touch the package-level inflightSems.
+// A ready channel replaces the prior time.Sleep to ensure the goroutine has
+// reached the blocking select before cancel fires.
 func TestInflightCtxCancel(t *testing.T) {
-	inflightSems = &nodeInflightRegistry{m: map[string]chan struct{}{}}
+	reg := &nodeInflightRegistry{m: map[string]chan struct{}{}}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	r1, _ := inflightSems.acquire(ctx, "nodeB", 1)
+	r1, _ := reg.acquire(ctx, "nodeB", 1)
 
+	ready := make(chan struct{})
 	done := make(chan error, 1)
 	go func() {
-		_, err := inflightSems.acquire(ctx, "nodeB", 1)
+		// Signal just before the blocking acquire so the test can cancel
+		// only after this goroutine is guaranteed to be waiting on the semaphore.
+		// acquire itself checks ctx.Done() in the same select, so signalling
+		// immediately before the call is the tightest safe rendezvous point.
+		close(ready)
+		_, err := reg.acquire(ctx, "nodeB", 1)
 		done <- err
 	}()
 
-	// Give goroutine time to block.
-	time.Sleep(30 * time.Millisecond)
+	<-ready
 	cancel()
 
 	select {
@@ -120,12 +129,13 @@ func TestInflightCtxCancel(t *testing.T) {
 }
 
 // TestInflightPerNodeIsolation: nodeA at limit does NOT block nodeB.
+// Uses a local registry instance; does not touch the package-level inflightSems.
 func TestInflightPerNodeIsolation(t *testing.T) {
-	inflightSems = &nodeInflightRegistry{m: map[string]chan struct{}{}}
+	reg := &nodeInflightRegistry{m: map[string]chan struct{}{}}
 
 	ctx := context.Background()
 	// Fill nodeA's slot.
-	_, err := inflightSems.acquire(ctx, "nodeA", 1)
+	_, err := reg.acquire(ctx, "nodeA", 1)
 	if err != nil {
 		t.Fatalf("acquire nodeA: %v", err)
 	}
@@ -133,7 +143,7 @@ func TestInflightPerNodeIsolation(t *testing.T) {
 	// nodeB with same limit must not block.
 	done := make(chan error, 1)
 	go func() {
-		r, e := inflightSems.acquire(ctx, "nodeB", 1)
+		r, e := reg.acquire(ctx, "nodeB", 1)
 		if r != nil {
 			r()
 		}
@@ -154,21 +164,26 @@ func TestInflightPerNodeIsolation(t *testing.T) {
 // cpierrors.Retriable — exactly as the five handler call-sites do — yields
 // OkToRetry=true. This is a regression guard: the previous cpierrors.Cloud
 // wrapper returned OkToRetry=false, meaning the Director would never re-queue.
+// Uses a local registry instance; does not touch the package-level inflightSems.
+// A ready channel replaces the prior time.Sleep to ensure the goroutine is
+// blocked on the semaphore before cancel fires.
 func TestInflightAcquireFailureIsRetriable(t *testing.T) {
-	inflightSems = &nodeInflightRegistry{m: map[string]chan struct{}{}}
+	reg := &nodeInflightRegistry{m: map[string]chan struct{}{}}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	// Fill the single slot.
-	r1, _ := inflightSems.acquire(ctx, "nodeX", 1)
+	r1, _ := reg.acquire(ctx, "nodeX", 1)
 	defer r1()
 
+	ready := make(chan struct{})
 	done := make(chan error, 1)
 	go func() {
-		_, err := inflightSems.acquire(ctx, "nodeX", 1)
+		close(ready)
+		_, err := reg.acquire(ctx, "nodeX", 1)
 		done <- err
 	}()
 
-	time.Sleep(20 * time.Millisecond)
+	<-ready
 	cancel()
 
 	var acquireErr error
@@ -188,11 +203,12 @@ func TestInflightAcquireFailureIsRetriable(t *testing.T) {
 }
 
 // TestInflightReleaseIdempotent: double-release does not panic or deadlock.
+// Uses a local registry instance; does not touch the package-level inflightSems.
 func TestInflightReleaseIdempotent(t *testing.T) {
-	inflightSems = &nodeInflightRegistry{m: map[string]chan struct{}{}}
+	reg := &nodeInflightRegistry{m: map[string]chan struct{}{}}
 
 	ctx := context.Background()
-	release, err := inflightSems.acquire(ctx, "nodeC", 2)
+	release, err := reg.acquire(ctx, "nodeC", 2)
 	if err != nil {
 		t.Fatalf("acquire: %v", err)
 	}

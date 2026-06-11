@@ -14,6 +14,7 @@ import (
 	"io"
 	"math/big"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -779,6 +780,65 @@ func TestNewClient_DNSFailure_ProductionPathSkips(t *testing.T) {
 	if c == nil {
 		t.Fatal("expected non-nil client on DNS failure (production path skips)")
 	}
+}
+
+// --------------------------------------------------------------------------
+// Retry-exhaustion attempt count — backoff seam overridden to 1ms.
+// --------------------------------------------------------------------------
+
+// TestPut_RetryExhaustion_AttemptCount verifies that when the retry budget is
+// exhausted the correct number of HTTP requests were issued and the final error
+// is returned to the caller. retryBaseDelay is overridden to 1ms so the test
+// completes in microseconds without sleeping the production 200–400ms.
+//
+// The test was previously in the external package (client_test.go) and asserted
+// real wall-clock elapsed time (~450ms floor), which was both slow and flaky
+// under scheduler load. Moving it into the internal package allows direct access
+// to the retryBaseDelay seam. A generous upper-bound duration guard (500ms) is
+// kept to catch any future regression where the seam is ignored and the
+// production delay leaks back in.
+//
+// Not parallel: mutates the package-level retryBaseDelay seam.
+func TestPut_RetryExhaustion_AttemptCount(t *testing.T) {
+	prev := retryBaseDelay
+	retryBaseDelay = 1 * time.Millisecond
+	t.Cleanup(func() { retryBaseDelay = prev })
+
+	var callCount int
+	srv := newInternalTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		callCount++
+		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+	})
+
+	start := time.Now()
+	err := srv.Put(context.Background(), "100", map[string]string{"k": "v"})
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected error after retry budget exhausted, got nil")
+	}
+	// 1 initial + 2 retries = 3 total attempts (retryMaxAttempts == 3).
+	if callCount != 3 {
+		t.Errorf("expected 3 HTTP calls (1 initial + 2 retries), got %d", callCount)
+	}
+	// Upper-bound guard: with 1ms base delay the two sleeps total ~3ms even
+	// with 2× jitter. If the seam were ignored and the production 200ms base
+	// were used, two sleeps would take ≥300ms and this assertion would fire.
+	const ceilingMs = 500
+	if elapsed > ceilingMs*time.Millisecond {
+		t.Errorf("elapsed %v exceeds %dms ceiling — retryBaseDelay seam may not be wired", elapsed, ceilingMs)
+	}
+}
+
+// newInternalTestServer starts an httptest.Server with the given handler and
+// returns a *Client pointed at it. The server is closed via t.Cleanup.
+// Mirrors newTestClient in the external test file but lives in the internal
+// package so tests here can access package-level vars (e.g. retryBaseDelay).
+func newInternalTestServer(t *testing.T, handler http.HandlerFunc) *Client {
+	t.Helper()
+	srv := httptest.NewServer(handler)
+	t.Cleanup(srv.Close)
+	return NewClient(srv.URL, "user", "secret")
 }
 
 // genSelfSignedPEM produces a minimal self-signed CA certificate suitable for

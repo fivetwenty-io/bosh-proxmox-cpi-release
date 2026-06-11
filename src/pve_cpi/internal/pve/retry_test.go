@@ -332,33 +332,34 @@ func TestBackoff_ZeroJitterNoPanic(t *testing.T) {
 // so two identical calls with the same source state return the same value.
 //
 // This test is NOT parallel because it mutates the package-level jitterSource.
-// Run all per-attempt calls before restoring to keep the window small.
+// The mutation is held across both sample calls and restored via t.Cleanup,
+// keeping the window minimal and preventing parallel readers (e.g.
+// TestBackoff_ZeroJitterNoPanic) from observing a partially-swapped state.
 func TestJitterSource_Seam(t *testing.T) {
-	// Seed a deterministic source, capture attempt-0 output, reset, capture
-	// again, and confirm both runs return the same value. Non-deterministic
-	// output (from the default source) would produce a flaky test here.
-	seed := mrand.NewPCG(42, 99)
-	seeded := mrand.New(seed)
-
+	// Install a deterministic restore once, at test start.
 	jitterMu.Lock()
 	prev := jitterSource
-	jitterSource = seeded
 	jitterMu.Unlock()
+	t.Cleanup(func() {
+		jitterMu.Lock()
+		jitterSource = prev
+		jitterMu.Unlock()
+	})
 
+	// First sample: seed a PCG source and capture the attempt-0 output.
+	seed1 := mrand.NewPCG(42, 99)
+	jitterMu.Lock()
+	jitterSource = mrand.New(seed1)
+	jitterMu.Unlock()
 	first := TransientBackoff(0)
 
-	// Re-seed to the same state and repeat.
+	// Second sample: re-seed to the identical initial state and capture again.
+	// If the seam is correctly wired both calls must return the same value.
 	seed2 := mrand.NewPCG(42, 99)
-	seeded2 := mrand.New(seed2)
 	jitterMu.Lock()
-	jitterSource = seeded2
+	jitterSource = mrand.New(seed2)
 	jitterMu.Unlock()
-
 	second := TransientBackoff(0)
-
-	jitterMu.Lock()
-	jitterSource = prev
-	jitterMu.Unlock()
 
 	if first != second {
 		t.Errorf("jitterSource seam not wired: same seed produced different outputs (%v vs %v)", first, second)

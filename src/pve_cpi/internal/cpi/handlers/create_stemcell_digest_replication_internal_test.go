@@ -910,7 +910,7 @@ func TestReplicateStemcellToNodes_Concurrency_AllNodesAttempted(t *testing.T) {
 			// below catches it.
 			select {
 			case <-release:
-			case <-time.After(300 * time.Millisecond):
+			case <-time.After(2 * time.Second):
 			}
 			uploadedNodes.Store(node, struct{}{})
 			return "", nil

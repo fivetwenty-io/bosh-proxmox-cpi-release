@@ -36,6 +36,14 @@ func captureWaitOpts(t *testing.T) *sdktasks.WaitOptions {
 // configuration the poll cadence matches the constants the CPI shipped with:
 // 2000ms interval, 10000ms max interval, 10% jitter.
 func TestTaskPollDefaults_PreserveShippedConstants(t *testing.T) {
+	// Establish the known-good baseline and restore it on exit, matching the
+	// pattern used by the three sibling tests.  Without this a prior test that
+	// mutates the process-wide atomics and fails to restore them (e.g. due to
+	// a panic) would leave stale values that cause this assertion to fail
+	// spuriously — even though the shipped defaults are correct.
+	restore := pve.SetTaskPollingForTest(2000, 10000, 10)
+	defer restore()
+
 	opts := captureWaitOpts(t)
 	if opts.IntervalMillis != 2000 {
 		t.Errorf("default IntervalMillis = %d, want 2000", opts.IntervalMillis)

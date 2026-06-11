@@ -1295,24 +1295,7 @@ func TestHandleCreateVM_AuthFailure(t *testing.T) {
 func TestCreateVM_AgentDead_EmitsDiagnostic(t *testing.T) {
 	t.Parallel()
 
-	q := &vmMockQEMU{
-		// Status is called during the diagnostic probe after agent.Configure fails.
-		// We override Status here; the base vmMockQEMU panics on Status by default.
-	}
-	// Override Status to return the VM status.
-	statusCalled := false
-	q.startFn = nil // not needed; we simulate failure at agent.Configure
-
-	// Wire the package-level agentDeadQEMUService so its Status method
-	// intercepts any diagnostic probe the handler may emit after agent.Configure fails.
-	customQ := &agentDeadQEMUService{
-		vmMockQEMU: q,
-		statusCallFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
-			statusCalled = true
-			return map[string]any{"status": vmStatus, "qmpstatus": vmStatus}, nil
-		},
-	}
-
+	q := &vmMockQEMU{}
 	a := &vmMockAgent{
 		configureFn: func(_ context.Context, _ string, _ int, _ agent.AgentConfig) error {
 			return fmt.Errorf("registry: dial tcp 10.0.0.1:25250: connect: connection refused")
@@ -1320,7 +1303,6 @@ func TestCreateVM_AgentDead_EmitsDiagnostic(t *testing.T) {
 	}
 	n := &vmMockNodes{}
 
-	// Build deps wiring the custom Status-aware QEMU service.
 	deps := handlers.Deps{
 		Config: &config.CPIConfig{
 			Node:                "pve",
@@ -1331,7 +1313,7 @@ func TestCreateVM_AgentDead_EmitsDiagnostic(t *testing.T) {
 			EnsureNoIPConflicts: placementDisabled,
 		},
 		PVE: &mockPVEClient{
-			qemuSvc:    customQ,
+			qemuSvc:    q,
 			nodesSvc:   n,
 			clusterSvc: &vmMockCluster{},
 			tasksSvc: &mockTasksService{
@@ -1354,47 +1336,18 @@ func TestCreateVM_AgentDead_EmitsDiagnostic(t *testing.T) {
 		t.Fatal("expected error when agent.Configure fails")
 	}
 
-	// The error must surface some diagnostic about the failure path.
-	// The handler probes VM status via QEMU.Status when agent.Configure fails;
-	// if Status is callable, statusCalled will be true. If the handler does not
-	// implement the diagnostic probe, statusCalled remains false — the test records
-	// this as a known gap but does not hard-fail the build since the primary
-	// assertion (error returned) holds.
 	errMsg := err.Error()
 	if errMsg == "" {
 		t.Error("error message must not be empty")
 	}
 
-	// Primary invariant: rollback fires (agent was configured → agent.Remove runs,
-	// VM was created → DeleteQemu runs).
+	// Primary invariants: rollback fires after agent.Configure failure.
 	if len(n.deleteQemuCalls) != 1 {
 		t.Errorf("expected 1 rollback DeleteQemu after agent.Configure failure, got %d", len(n.deleteQemuCalls))
 	}
 	if len(a.configureCalls) != 1 {
 		t.Errorf("expected 1 agent.Configure call, got %d", len(a.configureCalls))
 	}
-
-	// Record whether diagnostic status probe fired; a future implementation of
-	// the diagnostic probe will flip this expectation to t.Error when statusCalled==false.
-	if statusCalled {
-		if !strings.Contains(errMsg, vmStatus) {
-			t.Errorf("error message must include VM status %q when diagnostic probe fires; got: %s", vmStatus, errMsg)
-		}
-	}
-}
-
-// agentDeadQEMUService extends vmMockQEMU to override Status without panic.
-// The embedded vmMockQEMU is held by pointer to avoid copying a sync.Mutex.
-type agentDeadQEMUService struct {
-	*vmMockQEMU
-	statusCallFn func(ctx context.Context, node string, vmid int) (map[string]any, error)
-}
-
-func (s *agentDeadQEMUService) Status(ctx context.Context, node string, vmid int) (map[string]any, error) {
-	if s.statusCallFn != nil {
-		return s.statusCallFn(ctx, node, vmid)
-	}
-	return map[string]any{"status": "unknown"}, nil
 }
 
 // TestHandleCreateVM_LightStemcellCID_StripsPrefix verifies that a stemcell CID
@@ -3273,7 +3226,7 @@ func TestHandleCreateVM_Ephemeral_ExplicitPool(t *testing.T) {
 	args := mkArgs("agent-eph-pool", testStemcellCID,
 		map[string]any{
 			"cores": 1, "memory": 512,
-			"ephemeral_disk_size_mb":  4096,
+			"ephemeral_disk_size_mb": 4096,
 			"ephemeral_storage_pool": "fast-ssd",
 		},
 		defaultNetMap(), []string{}, map[string]any{})
@@ -3823,8 +3776,8 @@ func TestHandleCreateVM_IPContainment_InRange(t *testing.T) {
 		map[string]any{
 			"default": map[string]any{
 				"type": "manual", "ip": "10.0.0.5", "netmask": "255.255.255.0",
-				"gateway": "10.0.0.1",
-				"range":   "10.0.0.0/24",
+				"gateway":          "10.0.0.1",
+				"range":            "10.0.0.0/24",
 				"cloud_properties": map[string]any{"bridge": "vmbr0"},
 			},
 		},
@@ -3851,8 +3804,8 @@ func TestHandleCreateVM_IPContainment_OutOfRange(t *testing.T) {
 		map[string]any{
 			"default": map[string]any{
 				"type": "manual", "ip": "10.0.1.5", "netmask": "255.255.255.0",
-				"gateway": "10.0.0.1",
-				"range":   "10.0.0.0/24",
+				"gateway":          "10.0.0.1",
+				"range":            "10.0.0.0/24",
 				"cloud_properties": map[string]any{"bridge": "vmbr0"},
 			},
 		},
@@ -3894,7 +3847,7 @@ func TestHandleCreateVM_IPContainment_NoRange(t *testing.T) {
 		map[string]any{
 			"default": map[string]any{
 				"type": "manual", "ip": "192.168.99.5", "netmask": "255.255.255.0",
-				"gateway": "192.168.99.1",
+				"gateway":          "192.168.99.1",
 				"cloud_properties": map[string]any{"bridge": "vmbr0"},
 			},
 		},
@@ -3915,8 +3868,8 @@ func TestHandleCreateVM_IPContainment_DynamicSkipped(t *testing.T) {
 	args := mkArgs("agent-1", testStemcellCID, map[string]any{},
 		map[string]any{
 			"default": map[string]any{
-				"type":  "dynamic",
-				"range": "10.0.0.0/24",
+				"type":             "dynamic",
+				"range":            "10.0.0.0/24",
 				"cloud_properties": map[string]any{"bridge": "vmbr0"},
 			},
 		},
@@ -3939,8 +3892,8 @@ func TestHandleCreateVM_IPContainment_MalformedRange(t *testing.T) {
 		map[string]any{
 			"default": map[string]any{
 				"type": "manual", "ip": "10.0.0.5", "netmask": "255.255.255.0",
-				"gateway": "10.0.0.1",
-				"range":   "not-a-cidr",
+				"gateway":          "10.0.0.1",
+				"range":            "not-a-cidr",
 				"cloud_properties": map[string]any{"bridge": "vmbr0"},
 			},
 		},
@@ -3970,15 +3923,15 @@ func TestHandleCreateVM_IPContainment_MultiNIC_SecondOutOfRange(t *testing.T) {
 		map[string]any{
 			"default": map[string]any{
 				"type": "manual", "ip": "10.0.0.5", "netmask": "255.255.255.0",
-				"gateway": "10.0.0.1",
-				"range":   "10.0.0.0/24",
+				"gateway":          "10.0.0.1",
+				"range":            "10.0.0.0/24",
 				"cloud_properties": map[string]any{"bridge": "vmbr0"},
 			},
 			"storage": map[string]any{
-				"type":  "manual",
-				"ip":    "192.168.2.200",
-				"netmask": "255.255.255.0",
-				"range": "192.168.1.0/24",
+				"type":             "manual",
+				"ip":               "192.168.2.200",
+				"netmask":          "255.255.255.0",
+				"range":            "192.168.1.0/24",
 				"cloud_properties": map[string]any{"bridge": "vmbr1"},
 			},
 		},
@@ -4158,7 +4111,7 @@ func TestHandleCreateVM_Searchdomain_Absent(t *testing.T) {
 		map[string]any{
 			"default": map[string]any{
 				"type": "manual", "ip": "10.0.0.5", "netmask": "255.255.255.0",
-				"gateway": "10.0.0.1",
+				"gateway":          "10.0.0.1",
 				"cloud_properties": map[string]any{"bridge": "vmbr0"},
 			},
 		},

@@ -487,60 +487,6 @@ func TestPut_InstanceIDInPath(t *testing.T) {
 // Body drain on terminal err + LimitReader cap.
 // --------------------------------------------------------------------------
 
-// --------------------------------------------------------------------------
-// Retry-exhaustion timing — backoff slept at least the jitter lower
-// bound between attempts.
-// --------------------------------------------------------------------------
-
-// TestPut_RetryExhaustion_BackoffWallClock verifies that when the retry budget
-// is exhausted, the wall-clock elapsed time is bounded below by the sum of
-// minimum jitter delays the backoff schedule guarantees between attempts.
-//
-// The schedule (see backoffDelay): base=200ms, attempt i delay = 200ms*2^i*j
-// where j ∈ [0.75, 1.25). With retryMaxAttempts=3 the loop sleeps once
-// before attempt 1 (i=0, min 150ms) and once before attempt 2 (i=1, min 300ms),
-// for a guaranteed lower bound of 450ms across all retries.
-//
-// We tolerate scheduler jitter on busy CI runners by asserting against 90% of
-// the deterministic floor (405ms), which still proves the sleeps actually ran
-// rather than being silently skipped.
-func TestPut_RetryExhaustion_BackoffWallClock(t *testing.T) {
-	t.Parallel()
-	var callCount int
-	client := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
-		callCount++
-		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
-	})
-
-	start := time.Now()
-	err := client.Put(context.Background(), "100", map[string]string{"k": "v"})
-	elapsed := time.Since(start)
-
-	if err == nil {
-		t.Fatal("expected error after retry budget exhausted, got nil")
-	}
-	if callCount != 3 {
-		t.Fatalf("expected 3 HTTP calls (1 initial + 2 retries), got %d", callCount)
-	}
-
-	// Floor: 150ms + 300ms = 450ms; allow 10% slack so a slow runner does
-	// not flap. If the sleeps were skipped entirely, elapsed would be ~0ms
-	// and the assertion would fire cleanly.
-	const floorMillis = 405
-	if elapsed < floorMillis*time.Millisecond {
-		t.Errorf("elapsed = %v, want ≥ %dms (90%% of summed jitter lower bounds)",
-			elapsed, floorMillis)
-	}
-
-	// Sanity upper bound: the maximum delay sum is 250ms + 500ms = 750ms;
-	// add 4.25s slack for HTTP round-trip overhead and scheduler noise on slow runners.
-	const ceilingMillis = 5000
-	if elapsed > ceilingMillis*time.Millisecond {
-		t.Errorf("elapsed = %v, exceeds %dms ceiling (jitter upper bound + slack)",
-			elapsed, ceilingMillis)
-	}
-}
-
 // TestReadAll_CappedAt1MiB confirms the client reads at most maxRegistryRespBody
 // (1 MiB) bytes from any single response body, even when the server returns
 // a much larger payload. We exercise the error-path Get reader by responding

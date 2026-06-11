@@ -16,11 +16,19 @@ import (
 // context error wrapped as a generic (non-retriable) cloud error — exactly how
 // a real handler whose retry/poll loop observes ctx.Done() would behave when a
 // deadline fires.
+//
+// started, when non-nil, is closed as soon as the handler enters its blocking
+// select. Tests that cancel the parent context use this to confirm the handler
+// is genuinely waiting before the cancellation fires, preventing vacuous passes.
 type blockingHandler struct {
 	observed chan struct{}
+	started  chan struct{}
 }
 
 func (h blockingHandler) Handle(ctx context.Context, _ []json.RawMessage, _ jsonrpc.Context) (any, error) {
+	if h.started != nil {
+		close(h.started)
+	}
 	<-ctx.Done()
 	if h.observed != nil {
 		close(h.observed)
@@ -203,13 +211,22 @@ func TestDispatcher_NoResolver_BehaviorUnchanged(t *testing.T) {
 func TestDispatcher_MethodTimeout_ParentCancelNotTimeout(t *testing.T) {
 	t.Parallel()
 
+	started := make(chan struct{})
 	resolver := func(string) time.Duration { return time.Hour } // budget far away
 	d := cpi.NewDispatcherWithOptions(nopLogger(), cpi.WithMethodTimeouts(resolver))
-	mustRegister(t, d, "create_vm", blockingHandler{})
+	mustRegister(t, d, "create_vm", blockingHandler{started: started})
 
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Cancel only after the handler signals it has entered its blocking select.
+	// Without this handshake the goroutine could fire before d.Handle even
+	// dispatches, making the test pass vacuously (the handler never blocks).
 	go func() {
-		time.Sleep(20 * time.Millisecond)
+		select {
+		case <-started:
+		case <-time.After(5 * time.Second):
+		}
 		cancel()
 	}()
 
