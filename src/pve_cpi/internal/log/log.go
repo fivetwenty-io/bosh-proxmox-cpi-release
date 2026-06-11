@@ -57,6 +57,19 @@ func Any(key string, val any) Field { return slog.Any(key, val) }
 // Err is a convenience for slog.Any("error", err); slog has no Error field helper.
 func Err(err error) Field { return slog.Any("error", err) }
 
+// ErrScrubbed returns a Field carrying the error message under the "error" key
+// with any URL credentials scrubbed (userinfo and sensitive query parameters).
+// Use this instead of Err when the error originates from a guest-controlled or
+// PVE-returned value that may embed a token-bearing URL (e.g. a storage API
+// endpoint with a presigned query parameter). Err passes the error value directly
+// to slog, which renders it via Error() without scrubbing.
+func ErrScrubbed(err error) Field {
+	if err == nil {
+		return slog.String("error", "")
+	}
+	return slog.String("error", scrubURLString(err.Error()))
+}
+
 // NewLogger constructs a JSON-encoded, leveled Logger writing to sink.
 // level must be one of: debug, info, warn, error.
 // When sink is nil, os.Stderr is used (preserves stdout for JSON-RPC).

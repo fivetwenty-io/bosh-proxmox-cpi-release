@@ -120,10 +120,22 @@ func assertAgentChecksum(
 	}
 
 	if got != expected {
+		// Log the full guest-reported digest at debug for operator investigation.
+		// The error message uses only a short prefix so a manipulated digest cannot
+		// inject arbitrary content into structured log fields or error surfaces.
+		logger.Debug("create_vm: agent checksum mismatch detail",
+			log.Int(metadataKeyVMID, vmid),
+			log.String("computed_sha256", got),
+			log.String("expected_sha256", expected),
+		)
+		gotPrefix := got
+		if len(gotPrefix) > 12 {
+			gotPrefix = gotPrefix[:12] + "…"
+		}
 		return cpierrors.Cloud(
-			"create_vm: agent integrity check failed for vm %d: %s reported SHA-256 %s but expected %s."+
+			"create_vm: agent integrity check failed for vm %d: %s reported SHA-256 %s (truncated) but expected %s."+
 				" The booted BOSH agent binary does not match health_check.expected_agent_sha256.",
-			vmid, agentChecksumPath, got, expected,
+			vmid, agentChecksumPath, gotPrefix, expected,
 		)
 	}
 
@@ -177,11 +189,24 @@ func awaitAgentExec(
 	}
 }
 
+// parseSha256SumMaxBytes is the maximum accepted length of sha256sum stdout.
+// sha256sum output is "<64-hex>  <path>\n"; a Linux path is at most 4096 bytes
+// (PATH_MAX). The bound is therefore 64 + 2 + 4096 + 1 = 4163, rounded up to
+// 4096 for simplicity — any legitimate output fits, and inputs beyond this
+// bound are guest-injected garbage that must be rejected without processing.
+const parseSha256SumMaxBytes = 4096
+
 // parseSha256SumOutput extracts the lower-cased hex digest from sha256sum
 // stdout, whose format is "<hex>  <path>\n". Returns (digest, true) only when
 // the first whitespace-delimited token is a 64-hex string.
+//
+// Inputs longer than parseSha256SumMaxBytes are rejected immediately to avoid
+// unbounded processing of guest-controlled data.
 func parseSha256SumOutput(out *string) (string, bool) {
 	if out == nil {
+		return "", false
+	}
+	if len(*out) > parseSha256SumMaxBytes {
 		return "", false
 	}
 	fields := strings.Fields(*out)

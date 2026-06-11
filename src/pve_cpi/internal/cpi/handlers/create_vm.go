@@ -138,7 +138,7 @@ type createVMCloudProps struct {
 	// "ephemeral_storage_pool" also feeds this (resolver wins over struct field).
 	EphemeralStoragePool string `json:"ephemeral_storage_pool"`
 	NetworkBridge        string `json:"network_bridge"` // per-VM bridge override
-	NetworkModel  string `json:"network_model"`  // virtio|e1000 etc.
+	NetworkModel         string `json:"network_model"`  // virtio|e1000 etc.
 	// Hotplug overrides the CPI default for this VM (config.Hotplug).
 	// Pointer-typed so the caller can distinguish "not set" (use config
 	// default) from "set to empty string" (currently treated the same:
@@ -199,8 +199,8 @@ type createVMNetworkSpec struct {
 	Netmask         string         `json:"netmask"`
 	Gateway         string         `json:"gateway"`
 	DNS             []string       `json:"dns"`
-	Default         []string       `json:"default"`          // ["dns","gateway"]
-	Range           string         `json:"range,omitempty"`  // CIDR for static-IP containment validation
+	Default         []string       `json:"default"`         // ["dns","gateway"]
+	Range           string         `json:"range,omitempty"` // CIDR for static-IP containment validation
 	CloudProperties map[string]any `json:"cloud_properties"`
 	MAC             string         `json:"mac,omitempty"` // filled in response
 }
@@ -527,9 +527,11 @@ func createVM(
 	// -----------------------------------------------------------------------
 	// 9. PVE HA anti-affinity membership (opt-in: anti_affinity.use_ha_rules).
 	//
-	// Best-effort and non-fatal: HA being unconfigured, or any rule-write
-	// failure, is logged as a warning and never fails create_vm (scheduler-soft
-	// spreading remains in effect via the scoring done at node selection).
+	// Errors propagate: a TypeRetriableCloud error (e.g. lock-timeout) is
+	// returned so the director re-drives. A non-retriable failure (e.g. HA
+	// not configured) is also returned — callers must treat it accordingly.
+	// Scheduler-soft spreading via the node scorer remains in effect
+	// regardless.
 	// -----------------------------------------------------------------------
 	if aaErr := applyAntiAffinityMembership(ctx, deps, vmid, parsed.env, logger); aaErr != nil {
 		return nil, aaErr
@@ -541,10 +543,9 @@ func createVM(
 	// After scoring placed the VM on a node within its AZ, write a PVE HA
 	// node-affinity rule binding it to the AZ node set, so the AZ placement is
 	// durable across HA failover and DLB rebalance (scoring alone only pins at
-	// birth). Best-effort and non-fatal for generic HA failures: a failure is
-	// logged and never fails create_vm. TypeRetriableCloud (lock-timeout, verify
-	// failure) is returned so the director re-drives rather than silently losing
-	// the pin guarantee.
+	// birth). TypeRetriableCloud (lock-timeout, verify failure) is returned so
+	// the director re-drives rather than silently losing the pin guarantee.
+	// Non-retriable failures also propagate.
 	// -----------------------------------------------------------------------
 	if naErr := applyAZNodeAffinityPin(ctx, deps, vmid, parsed.cloudProps, shape.node, logger); naErr != nil {
 		return nil, naErr
@@ -601,11 +602,12 @@ func createVM(
 //     fallback loop simple; the semaphore protects per-node concurrency and is
 //     best applied to the final committed node rather than each attempt node.
 //
-//nolint:gocognit,gocritic // Fallback loop + rollback + final-side-effects; inherent complexity.
 // ptrToRefParam: retErr is a pointer to createVM's named return value so
 // rollbackOnExit and RegisterRollback can observe the final error at defer-time.
 // This is the same pattern as createVM itself; gocritic's suggestion (*error →
 // non-pointer) would break the caller's named-return observation.
+//
+//nolint:gocognit,gocritic // Fallback loop + rollback + final-side-effects; inherent complexity.
 func createVMWithFallback(
 	ctx context.Context,
 	deps Deps,
@@ -727,14 +729,14 @@ func createVMWithFallback(
 		}
 
 		// -----------------------------------------------------------------------
-		// 9. HA anti-affinity
+		// 9. HA anti-affinity — errors propagate (retriable ones re-drive).
 		// -----------------------------------------------------------------------
 		if aaErr := applyAntiAffinityMembership(ctx, deps, winningVMID, parsed.env, logger); aaErr != nil {
 			return nil, aaErr
 		}
 
 		// -----------------------------------------------------------------------
-		// 9b. AZ node-affinity HA pin
+		// 9b. AZ node-affinity HA pin — errors propagate (retriable ones re-drive).
 		// -----------------------------------------------------------------------
 		if naErr := applyAZNodeAffinityPin(ctx, deps, winningVMID, parsed.cloudProps, winShape.node, logger); naErr != nil {
 			return nil, naErr
@@ -2276,19 +2278,6 @@ func resolveVMShapeCPUMem(cp createVMCloudProps) (cores, sockets, memMiB int) {
 //  2. profile layer via r.Bool("numa") (explicit false honored)
 //  3. config.NUMAValue()
 //
-// Panics on resolver error — callers should use resolveVMShapeHotplugNUMAWithError
-// when the error must propagate. resolveVMShape uses resolveVMShapeHotplugNUMAWithError
-// directly so unknown-selector errors surface as CloudErrors.
-func resolveVMShapeHotplugNUMA(cfg *config.CPIConfig, cp createVMCloudProps, cpMap map[string]any) (hotplug string, numaEnabled bool) {
-	h, n, err := resolveVMShapeHotplugNUMAWithError(cfg, cp, cpMap)
-	if err != nil {
-		// Should not reach here: resolveVMShape validates the selector before
-		// calling this. Panic makes any regression visible immediately.
-		panic("resolveVMShapeHotplugNUMA: unexpected resolver error: " + err.Error())
-	}
-	return h, n
-}
-
 // resolveVMShapeHotplugNUMAWithError is the error-returning variant used by
 // resolveVMShape and tests. It returns a CloudError when an unknown vm_type or
 // disk_type selector is present in cpMap.
@@ -2866,7 +2855,7 @@ func handleCloneError(
 		// surface the real cause instead of "exhausted VMID allocation".
 		logger.Error("create_vm: clone source template missing, not retrying",
 			log.Int("vmid_attempted", candidate),
-			log.String("error", cerr.Error()),
+			log.ErrScrubbed(cerr),
 		)
 		cleanupVM(contextWithoutCancel(ctx), deps, node, candidate, logger)
 	case pve.IsVMIDConflict(cerr):
@@ -2882,7 +2871,7 @@ func handleCloneError(
 		// before retrying so the cluster list is clean.
 		logger.Info("create_vm: transient transport fault on clone, retrying",
 			log.Int("vmid_attempted", candidate),
-			log.String("error", cerr.Error()),
+			log.ErrScrubbed(cerr),
 		)
 		cleanupVM(contextWithoutCancel(ctx), deps, node, candidate, logger)
 	default:
@@ -3092,7 +3081,7 @@ func cloneFromTemplate(
 			// roll back a successfully cloned VM unnecessarily.
 			logger.Warn("create_vm: could not fetch cloned VM config to apply root-disk perf opts; skipping",
 				log.Int("vmid", candidate),
-				log.String("error", cfgGetErr.Error()),
+				log.ErrScrubbed(cfgGetErr),
 			)
 		} else {
 			currentVirtio0, _ := clonedCfg[diskKeyVirtio0].(string)
@@ -3156,7 +3145,7 @@ func handleCreateError(
 		// so the cluster list is clean.
 		logger.Info("create_vm: transient transport fault on create, retrying",
 			log.Int("vmid_attempted", candidate),
-			log.String("error", cerr.Error()),
+			log.ErrScrubbed(cerr),
 		)
 		cleanupVM(contextWithoutCancel(ctx), deps, node, candidate, logger)
 	}
@@ -3193,7 +3182,7 @@ func handleAwaitError(
 	if pve.IsTransientTransport(werr) {
 		logger.Info("create_vm: transient transport fault on await, retrying",
 			log.Int("vmid_attempted", candidate),
-			log.String("error", werr.Error()),
+			log.ErrScrubbed(werr),
 		)
 		// The qmcreate task itself may still be running on
 		// PVE — we only lost the await connection. Clean
@@ -3502,16 +3491,6 @@ func attachEphemeralDisk(
 // Per-NIC spec.CloudProperties["bridge"] / ["model"] overrides sit above these
 // VM-level defaults and are applied in configureNICs after this call.
 //
-// Panics on resolver error — callers requiring error propagation use
-// resolveVMNICDefaultsWithError.
-func resolveVMNICDefaults(cfg *config.CPIConfig, cp createVMCloudProps, cpMap map[string]any) (bridge, model string) {
-	b, m, err := resolveVMNICDefaultsWithError(cfg, cp, cpMap)
-	if err != nil {
-		panic("resolveVMNICDefaults: unexpected resolver error: " + err.Error())
-	}
-	return b, m
-}
-
 // resolveVMNICDefaultsWithError is the error-returning variant of resolveVMNICDefaults.
 // Returns a CloudError when cpMap contains an unknown vm_type or disk_type selector.
 func resolveVMNICDefaultsWithError(cfg *config.CPIConfig, cp createVMCloudProps, cpMap map[string]any) (bridge, model string, err error) {
@@ -4029,9 +4008,10 @@ func startVMAndReadConfig(
 // Go does not assign the named return on a panic unwind, so the *retErr guard
 // alone would miss the panic path. vmCreated and retErr are read through
 // pointers because both are still mutating when the defer is registered.
-//nolint:gocritic // retErr and vmCreated are pointers by necessity: this is a
 // deferred guard that must observe createVM's final named-return error and the
 // latest vmCreated value, both still mutating when the defer is registered.
+//
+//nolint:gocritic // retErr and vmCreated are pointers by necessity: this is a
 func rollbackOnExit(
 	ctx context.Context, deps Deps, node string, vmid int, env map[string]any,
 	logger *log.Logger, vmCreated *bool, retErr *error,
@@ -4133,7 +4113,7 @@ func cleanupVM(ctx context.Context, deps Deps, node string, vmid int, logger *lo
 		return innerErr
 	})
 	if stopErr == nil && stopUPID != "" {
-		if awaitErr := pve.AwaitTask(ctx, deps.PVE, node, stopUPID); awaitErr != nil {
+		if awaitErr := pve.AwaitTaskWithLogger(ctx, deps.PVE, node, stopUPID, logger); awaitErr != nil {
 			logger.Warn("create_vm: rollback stop task failed", log.Int(metadataKeyVMID, vmid), log.Err(awaitErr))
 		}
 	}

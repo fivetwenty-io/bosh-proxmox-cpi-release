@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
@@ -289,5 +290,61 @@ func TestLogger_AllLevelMethods(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("expected %q in output", want)
 		}
+	}
+}
+
+// TestErrScrubbed_ScrubsTokenBearingURL verifies that a token-bearing URL
+// embedded in an error message is scrubbed when logged via ErrScrubbed.
+func TestErrScrubbed_ScrubsTokenBearingURL(t *testing.T) {
+	t.Parallel()
+
+	// Simulate an error whose message embeds a presigned PVE URL with a token
+	// query parameter — the form PVE can return in error responses.
+	tokenErr := errors.New("storage request failed: https://pve.example.com:8006/api2/json/nodes/pve/storage?access_token=secret-pve-token-abc123&node=pve")
+
+	var buf bytes.Buffer
+	l := mustLogger(t, "debug", &buf)
+	l.Debug("scrub test", log.ErrScrubbed(tokenErr))
+
+	out := buf.String()
+	if strings.Contains(out, "secret-pve-token-abc123") {
+		t.Errorf("token leaked through ErrScrubbed: %s", out)
+	}
+	if !strings.Contains(out, log.RedactedPlaceholder) {
+		t.Errorf("expected %q placeholder in output: %s", log.RedactedPlaceholder, out)
+	}
+	// Non-sensitive parts of the message must survive.
+	if !strings.Contains(out, "storage request failed") {
+		t.Errorf("non-sensitive message prefix must be preserved: %s", out)
+	}
+}
+
+// TestErrScrubbed_NilError returns an empty string field without panic.
+func TestErrScrubbed_NilError(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	l := mustLogger(t, "debug", &buf)
+	l.Debug("nil err test", log.ErrScrubbed(nil))
+
+	out := buf.String()
+	if !strings.Contains(out, `"error":""`) && !strings.Contains(out, `"error": ""`) {
+		t.Errorf("nil ErrScrubbed must produce empty error field: %s", out)
+	}
+}
+
+// TestErrScrubbed_PlainErrorPassesThrough verifies a credential-free error message
+// survives ErrScrubbed unchanged.
+func TestErrScrubbed_PlainErrorPassesThrough(t *testing.T) {
+	t.Parallel()
+
+	plainErr := errors.New("connection refused")
+	var buf bytes.Buffer
+	l := mustLogger(t, "debug", &buf)
+	l.Debug("plain err test", log.ErrScrubbed(plainErr))
+
+	out := buf.String()
+	if !strings.Contains(out, "connection refused") {
+		t.Errorf("plain error message must survive ErrScrubbed: %s", out)
 	}
 }

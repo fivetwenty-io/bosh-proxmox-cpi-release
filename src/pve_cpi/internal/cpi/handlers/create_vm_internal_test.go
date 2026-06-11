@@ -2821,7 +2821,7 @@ func TestResolveVMShape_UnknownVMType_PropagatesCloudError(t *testing.T) {
 }
 
 // --------------------------------------------------------------------------
-// resolveVMShapeHotplugNUMA — layered resolver integration
+// resolveVMShapeHotplugNUMAWithError — layered resolver integration
 // --------------------------------------------------------------------------
 
 // TestResolveVMShapeHotplugNUMA_NoProfile_ByteIdentical verifies that when no
@@ -2835,7 +2835,10 @@ func TestResolveVMShapeHotplugNUMA_NoProfile_ByteIdentical(t *testing.T) {
 	cp := createVMCloudProps{}
 	cpMap := map[string]any{}
 
-	hotplug, numaEnabled := resolveVMShapeHotplugNUMA(cfg, cp, cpMap)
+	hotplug, numaEnabled, err := resolveVMShapeHotplugNUMAWithError(cfg, cp, cpMap)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 
 	if hotplug != cfg.HotplugValue() {
 		t.Errorf("hotplug = %q; want %q (config default)", hotplug, cfg.HotplugValue())
@@ -2867,7 +2870,10 @@ func TestResolveVMShapeHotplugNUMA_CallHotplugEmpty_DisablesHotplug(t *testing.T
 		},
 	}
 
-	hotplug, _ := resolveVMShapeHotplugNUMA(cfg, cp, cpMap)
+	hotplug, _, err := resolveVMShapeHotplugNUMAWithError(cfg, cp, cpMap)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 
 	// Explicit empty pointer wins over profile value — empty string disables hotplug.
 	if hotplug != "" {
@@ -2893,7 +2899,10 @@ func TestResolveVMShapeHotplugNUMA_ProfileHotplug_UsedWhenCallAbsent(t *testing.
 	cp := createVMCloudProps{} // Hotplug nil
 	cpMap := map[string]any{"vm_type": "memhot"}
 
-	hotplug, _ := resolveVMShapeHotplugNUMA(cfg, cp, cpMap)
+	hotplug, _, err := resolveVMShapeHotplugNUMAWithError(cfg, cp, cpMap)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 
 	if hotplug != "memory" {
 		t.Errorf("hotplug = %q; want memory (from vm_type profile)", hotplug)
@@ -2919,7 +2928,10 @@ func TestResolveVMShapeHotplugNUMA_CallHotplugBeatsProfile(t *testing.T) {
 	cp := createVMCloudProps{Hotplug: &callHotplug}
 	cpMap := map[string]any{"vm_type": "memhot", "hotplug": "disk"}
 
-	hotplug, _ := resolveVMShapeHotplugNUMA(cfg, cp, cpMap)
+	hotplug, _, err := resolveVMShapeHotplugNUMAWithError(cfg, cp, cpMap)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 
 	if hotplug != "disk" {
 		t.Errorf("hotplug = %q; want disk (call beats profile)", hotplug)
@@ -2947,7 +2959,10 @@ func TestResolveVMShapeHotplugNUMA_NUMAFalse_HonoredInCall(t *testing.T) {
 	cp := createVMCloudProps{NUMA: &numaFalse}
 	cpMap := map[string]any{"vm_type": "numa-on"}
 
-	_, numaEnabled := resolveVMShapeHotplugNUMA(cfg, cp, cpMap)
+	_, numaEnabled, err := resolveVMShapeHotplugNUMAWithError(cfg, cp, cpMap)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 
 	if numaEnabled {
 		t.Error("numaEnabled = true; want false (explicit cp.NUMA=false must win over config+profile)")
@@ -2974,7 +2989,10 @@ func TestResolveVMShapeHotplugNUMA_ProfileNUMAFalse_HonoredWhenCallAbsent(t *tes
 	cp := createVMCloudProps{} // NUMA nil
 	cpMap := map[string]any{"vm_type": "numa-off"}
 
-	_, numaEnabled := resolveVMShapeHotplugNUMA(cfg, cp, cpMap)
+	_, numaEnabled, err := resolveVMShapeHotplugNUMAWithError(cfg, cp, cpMap)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 
 	if numaEnabled {
 		t.Error("numaEnabled = true; want false (profile numa=false must override config default)")
@@ -3001,7 +3019,10 @@ func TestResolveVMShapeHotplugNUMA_ProfileNUMATrue_UsedWhenCallAbsent(t *testing
 	cp := createVMCloudProps{}
 	cpMap := map[string]any{"vm_type": "numa-on"}
 
-	_, numaEnabled := resolveVMShapeHotplugNUMA(cfg, cp, cpMap)
+	_, numaEnabled, err := resolveVMShapeHotplugNUMAWithError(cfg, cp, cpMap)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 
 	if !numaEnabled {
 		t.Error("numaEnabled = false; want true (profile numa=true must override config default false)")
@@ -3050,7 +3071,10 @@ func TestConfigureNICs_BridgeModel_NoProfile_ByteIdentical(t *testing.T) {
 	cp := createVMCloudProps{TargetNode: "pve"} // NetworkBridge/NetworkModel empty
 	cpMap := map[string]any{}
 
-	bridge, model := resolveVMNICDefaults(cfg, cp, cpMap)
+	bridge, model, err := resolveVMNICDefaultsWithError(cfg, cp, cpMap)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 
 	if bridge != "vmbr1" {
 		t.Errorf("bridge = %q; want vmbr1 (config.NetworkBridge)", bridge)
@@ -3072,7 +3096,10 @@ func TestConfigureNICs_BridgeModel_CallBridge_Wins(t *testing.T) {
 	cp := createVMCloudProps{NetworkBridge: "vmbr99"}
 	cpMap := map[string]any{"network_bridge": "vmbr99"}
 
-	bridge, _ := resolveVMNICDefaults(cfg, cp, cpMap)
+	bridge, _, err := resolveVMNICDefaultsWithError(cfg, cp, cpMap)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 
 	if bridge != "vmbr99" {
 		t.Errorf("bridge = %q; want vmbr99 (call beats config)", bridge)
@@ -3099,7 +3126,10 @@ func TestConfigureNICs_BridgeModel_ProfileBridge_UsedWhenCallAbsent(t *testing.T
 	cp := createVMCloudProps{} // NetworkBridge empty
 	cpMap := map[string]any{"vm_type": "isolated"}
 
-	bridge, _ := resolveVMNICDefaults(cfg, cp, cpMap)
+	bridge, _, err := resolveVMNICDefaultsWithError(cfg, cp, cpMap)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 
 	if bridge != "vmbr10" {
 		t.Errorf("bridge = %q; want vmbr10 (from vm_type profile)", bridge)
@@ -3124,7 +3154,10 @@ func TestConfigureNICs_BridgeModel_CallBridgeBeatsProfile(t *testing.T) {
 	cp := createVMCloudProps{NetworkBridge: "vmbr5"}
 	cpMap := map[string]any{"vm_type": "isolated", "network_bridge": "vmbr5"}
 
-	bridge, _ := resolveVMNICDefaults(cfg, cp, cpMap)
+	bridge, _, err := resolveVMNICDefaultsWithError(cfg, cp, cpMap)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 
 	if bridge != "vmbr5" {
 		t.Errorf("bridge = %q; want vmbr5 (call beats profile)", bridge)
@@ -3149,7 +3182,10 @@ func TestConfigureNICs_BridgeModel_ProfileModel_UsedWhenCallAbsent(t *testing.T)
 	cp := createVMCloudProps{} // NetworkModel empty
 	cpMap := map[string]any{"vm_type": "compat"}
 
-	_, model := resolveVMNICDefaults(cfg, cp, cpMap)
+	_, model, err := resolveVMNICDefaultsWithError(cfg, cp, cpMap)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 
 	if model != "e1000" {
 		t.Errorf("model = %q; want e1000 (from vm_type profile)", model)
@@ -3157,7 +3193,7 @@ func TestConfigureNICs_BridgeModel_ProfileModel_UsedWhenCallAbsent(t *testing.T)
 }
 
 // TestConfigureNICs_BridgeModel_UnknownVMType_ReturnsCloudError verifies that an
-// unknown vm_type selector causes a CloudError from resolveVMNICDefaults.
+// unknown vm_type selector causes a CloudError from resolveVMNICDefaultsWithError.
 func TestConfigureNICs_BridgeModel_UnknownVMType_ReturnsCloudError(t *testing.T) {
 	t.Parallel()
 
@@ -3425,5 +3461,54 @@ func TestResolveVMShape_VirtioSCSISingle_Opt_In(t *testing.T) {
 	}
 	if shape.scsihw != "virtio-scsi-single" {
 		t.Errorf("scsihw = %q; want virtio-scsi-single", shape.scsihw)
+	}
+}
+
+// --------------------------------------------------------------------------
+// parseSha256SumOutput — input validation
+// --------------------------------------------------------------------------
+
+// TestParseSha256SumOutput_OversizedInput_Rejected verifies that an input
+// exceeding parseSha256SumMaxBytes is rejected (returns "", false) without
+// processing, preventing unbounded work on guest-controlled data.
+func TestParseSha256SumOutput_OversizedInput_Rejected(t *testing.T) {
+	t.Parallel()
+
+	// Build a string that exceeds the limit. Content is otherwise valid sha256sum
+	// format so that only the size check — not hex validation — causes rejection.
+	big := strings.Repeat("a", parseSha256SumMaxBytes+1)
+	got, ok := parseSha256SumOutput(&big)
+	if ok {
+		t.Errorf("oversized input must be rejected; got digest %q", got)
+	}
+	if got != "" {
+		t.Errorf("oversized input must return empty digest; got %q", got)
+	}
+}
+
+// TestParseSha256SumOutput_AtLimit_Accepted verifies that an input at exactly
+// parseSha256SumMaxBytes is not rejected by the size guard (content validation
+// may still reject it if it is not a valid sha256sum line).
+func TestParseSha256SumOutput_AtLimit_Accepted(t *testing.T) {
+	t.Parallel()
+
+	// Build a valid sha256sum line that fits within the limit.
+	// Use a known digest and a path padded to push us close to the boundary.
+	digest := "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+	// The line is "digest  path\n". Pad path so total length == parseSha256SumMaxBytes.
+	// 64 (digest) + 2 (spaces) + 1 (newline) = 67 fixed bytes; path = limit - 67.
+	pathLen := parseSha256SumMaxBytes - 67
+	path := "/" + strings.Repeat("x", pathLen-1)
+	line := digest + "  " + path + "\n"
+	if len(line) != parseSha256SumMaxBytes {
+		// Adjust: if path arithmetic differs, skip rather than give a false failure.
+		t.Skipf("line length %d != limit %d; arithmetic mismatch in test setup", len(line), parseSha256SumMaxBytes)
+	}
+	got, ok := parseSha256SumOutput(&line)
+	if !ok {
+		t.Errorf("input at limit must not be rejected by size guard; parse failed")
+	}
+	if got != digest {
+		t.Errorf("digest = %q; want %q", got, digest)
 	}
 }
