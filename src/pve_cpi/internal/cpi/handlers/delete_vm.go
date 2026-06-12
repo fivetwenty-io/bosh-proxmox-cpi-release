@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+	"strings"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
 
@@ -15,6 +16,7 @@ import (
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
 	sdkcluster "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cluster"
 	sdknodes "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/nodes"
+	sdkqemu "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/qemu"
 )
 
 // tagDeletingVM is the PVE tag stamped on a VM before an async fast-path destroy.
@@ -109,7 +111,6 @@ func sweepFastDeleteStragglers(ctx context.Context, deps Deps, logger *log.Logge
 	}
 
 	purge := true
-	destroyDisks := true
 	skiplock := true
 	processed := 0
 	skipped := 0
@@ -134,6 +135,24 @@ func sweepFastDeleteStragglers(ctx context.Context, deps Deps, logger *log.Logge
 			log.String("node", item.Node),
 			log.String("vmid", vmIDStr),
 		)
+		// A straggler may carry tagRetainEphemeral: its original fast-path delete
+		// stamped bosh-deleting before the retain detach ran, so the straggler can
+		// hold an ephemeral disk in any state — still attached, or already
+		// unlinked+swept (unreferenced with a matching VMID, exactly what
+		// DestroyUnreferencedDisks=true frees). Re-run the detach to finish any
+		// pending unlink, and force the destroy flag false for retain-tagged
+		// stragglers. On detach failure, skip this straggler (left for the next
+		// sweep) rather than destroy with the volume in an unknown state.
+		destroyDisks := true
+		if tagsContain(item.Tags, tagRetainEphemeral) {
+			retained, retainErr := detachRetainedEphemeralDisk(ctx, deps, item.Node, vmIDStr, int(item.VMID), sweepLogger)
+			if retainErr != nil {
+				sweepLogger.Warn("delete_vm: straggler sweep: retain-ephemeral detach failed; deferring straggler to next sweep (non-fatal)",
+					log.Err(retainErr))
+				continue
+			}
+			destroyDisks = !retained
+		}
 		// Fire-and-forget: discard the UPID, no await.
 		_, delErr := deps.PVE.Nodes().DeleteQemu(ctx, item.Node, vmIDStr, &sdknodes.DeleteQemuParams{
 			Purge:                    &purge,
@@ -201,6 +220,14 @@ func fastPathDeleteVM(ctx context.Context, deps Deps, node, vmCID string, vmid i
 	if protErr := detachForeignActiveDisks(ctx, deps, node, vmCID, vmid, logger); protErr != nil {
 		return protErr
 	}
+	// Preserve the VM's own ephemeral disk when retain_ephemeral_on_delete is set.
+	// Returns retained=true whenever the retain tag is present (even if the disk
+	// was already unlinked on a prior attempt). The retained flag gates
+	// DestroyUnreferencedDisks below.
+	retained, retainErr := detachRetainedEphemeralDisk(ctx, deps, node, vmCID, vmid, logger)
+	if retainErr != nil {
+		return retainErr
+	}
 	// Same unusedN guard the sync path runs. Without it the fast-path purge would
 	// still destroy a persistent volume left in an unusedN slot — e.g. a foreign
 	// disk whose detach above demoted it to unusedN but could not sweep it
@@ -212,9 +239,14 @@ func fastPathDeleteVM(ctx context.Context, deps Deps, node, vmCID string, vmid i
 	}
 
 	// Issue destroy with skiplock=true. Discard the UPID; no await.
+	//
+	// DestroyUnreferencedDisks=false on the retain path: after the unlink+sweep
+	// sequence the ephemeral volume is unreferenced AND has a matching VMID.
+	// DestroyUnreferencedDisks=true would free it. Setting false preserves it.
+	// Non-retain deletes keep true (byte-identical to prior behaviour).
 	logger.Debug("delete_vm: fast-path: issuing skiplock destroy without await")
 	purge := true
-	destroyDisks := true
+	destroyDisks := !retained
 	skiplock := true
 	_, delErr := deps.PVE.Nodes().DeleteQemu(ctx, node, vmCID, &sdknodes.DeleteQemuParams{
 		Purge:                    &purge,
@@ -386,6 +418,15 @@ func HandleDeleteVM(deps Deps) cpi.Handler {
 			return nil, protErr
 		}
 
+		// --- preserve the VM's own ephemeral disk when retain_ephemeral_on_delete is set ---
+		// retained=true whenever the retain tag is present (even if a prior attempt
+		// already unlinked the disk); DestroyUnreferencedDisks must be false on that
+		// path. See function doc.
+		retained, retainErr := detachRetainedEphemeralDisk(ctx, deps, node, vmCID, vmid, logger)
+		if retainErr != nil {
+			return nil, retainErr
+		}
+
 		// --- guard: refuse to destroy if a persistent volume is still attached ---
 		if guardErr := guardUnusedVolumes(ctx, deps, node, vmCID, vmid, deps.Config.DiskStorage); guardErr != nil {
 			return nil, guardErr
@@ -416,14 +457,16 @@ func HandleDeleteVM(deps Deps) cpi.Handler {
 
 		// --- delete VM (synchronous path) ---
 		// Purge removes VMID from backup/HA/replication configs.
-		// DestroyUnreferencedDisks removes orphaned volumes from storage.
+		// DestroyUnreferencedDisks: false on the retain path (ephemeral disk is now
+		// unreferenced + own-VMID — true would destroy it); true otherwise (byte-identical
+		// to prior behaviour). See detachRetainedEphemeralDisk for the full rationale.
 		//
-		// DestroyUnreferencedDisks=true triggers pvesm free under the
-		// per-storage lockfile for every attached volume, so on bursty
-		// deploys this can surface "can't lock file ... got timeout".
-		// Retry on that signal; everything else propagates immediately.
+		// DestroyUnreferencedDisks=true triggers pvesm free under the per-storage lockfile
+		// for every attached volume, so on bursty deploys this can surface
+		// "can't lock file ... got timeout". Retry on that signal; everything else
+		// propagates immediately.
 		purge := true
-		destroyDisks := true
+		destroyDisks := !retained
 		logger.Debug("delete_vm: deleting VM")
 		var deleteResp *sdknodes.DeleteQemuResponse
 		deleteErr := pve.RetryOnTransientOrLock(ctx, logger, "delete_vm", 0, func() error {
@@ -667,6 +710,189 @@ func detachForeignActiveDisks(ctx context.Context, deps Deps, node, vmCID string
 			vmCID, remaining)
 	}
 	return nil
+}
+
+// ephemeralVolidPattern matches the volume name suffix created by attachEphemeralDisk:
+// "vm-<vmid>-ephemeral-<n>". This is distinct from "vm-<n>-disk-<n>" (persistent disks)
+// so EmbeddedDiskVMID does not match it; a dedicated check is required.
+// The pattern anchors on "vm-" + digits + "-ephemeral-" to avoid false-positives
+// on unrelated volume names.
+const ephemeralVolidInfix = "-ephemeral-"
+
+// detachRetainedEphemeralDisk checks whether the VM carries the tagRetainEphemeral
+// tag and, when it does, finds every ephemeral disk slot (volid containing
+// "vm-<vmid>-ephemeral-"), unlinks each with force=false (which demotes the disk to
+// unusedN), then sweeps each unusedN config entry to remove the config reference
+// without freeing storage.
+//
+// Returns (true, nil) whenever the tag is present — including when no active
+// ephemeral slot remains (a prior attempt may already have unlinked+swept it, leaving
+// the volume unreferenced with a matching VMID). Tag presence, not unlink success,
+// gates the destroy flag so retried deletes and the straggler sweep stay safe. The
+// caller MUST pass DestroyUnreferencedDisks=false to the subsequent DeleteQemu when
+// retained==true:
+//
+//   DestroyUnreferencedDisks=true instructs PVE to free every volume that (a) is not
+//   referenced in the config AND (b) has a VMID matching the VM being destroyed. After
+//   the unlink+sweep sequence the ephemeral volume is unreferenced (config entry gone)
+//   and has a matching VMID — so DestroyUnreferencedDisks=true would destroy it. Setting
+//   the flag to false on the retain path is the only mechanism that keeps the volume.
+//
+//   Residual: on a retain-flagged VM, ANY other unreferenced own-VMID volumes (e.g. an
+//   old orphan from a prior failed create) also survive. This is conservative by design;
+//   scripts/disk-audit can inventory them.
+//
+// Returns (false, nil) when the tag is absent (byte-identical path: no extra config read,
+// no API calls, DestroyUnreferencedDisks unchanged).
+//
+// Unlink mechanics:
+//  1. UpdateQemuUnlink(force=false) → PVE moves the slot to unusedN; storage untouched.
+//  2. Re-read VM config to find the resulting unusedN slot for this volid.
+//  3. UpdateQemuConfig(Delete: "unusedN") → removes the config reference only; storage intact.
+//  4. Caller sets DestroyUnreferencedDisks=false → DeleteQemu leaves the now-unreferenced
+//     volume alone.
+//
+//nolint:gocognit // Multi-step unlink+sweep per ephemeral slot; each step individually simple.
+func detachRetainedEphemeralDisk(
+	ctx context.Context,
+	deps Deps,
+	node, vmCID string,
+	vmid int,
+	logger *log.Logger,
+) (retained bool, err error) {
+	// --- read VM config to check for tagRetainEphemeral ---
+	vmCfg, cfgErr := deps.PVE.QEMU().Config(ctx, node, vmid)
+	if cfgErr != nil {
+		if pve.IsNotFound(cfgErr) {
+			return false, nil
+		}
+		return false, cpierrors.Wrap(pve.WrapError(cfgErr),
+			fmt.Sprintf("delete_vm: read config for VM %s to check retain-ephemeral tag", vmCID))
+	}
+
+	tagsRaw, _ := vmCfg["tags"].(string) //nolint:goconst // "tags" is a PVE config field name; jsonKeyTags is test-only
+	if !tagsContain(tagsRaw, tagRetainEphemeral) {
+		return false, nil // flag not set — byte-identical path; no API calls
+	}
+
+	// Find ephemeral disk slots: active bus slots whose bare volid contains
+	// "-ephemeral-" and whose embedded VMID matches the VM's own VMID.
+	// EmbeddedDiskVMID matches "vm-<n>-disk-<n>" only; ephemeral uses a different
+	// naming convention so a string-infix check is required.
+	ephemeralSlots := findEphemeralActiveDisks(vmCfg, vmid)
+	if len(ephemeralSlots) == 0 {
+		// Tag present but no active ephemeral slot. Either a prior delete attempt
+		// already unlinked+swept the disk (the volume now sits unreferenced with a
+		// matching VMID — exactly what DestroyUnreferencedDisks=true would free),
+		// or the VM never had an ephemeral disk. Return retained=true in both
+		// cases: tag presence, not unlink success, must gate the destroy flag, or
+		// a retried delete would destroy the volume the first attempt preserved.
+		logger.Info("delete_vm: retain_ephemeral_on_delete set, no active ephemeral slot (already detached or none); forcing DestroyUnreferencedDisks=false",
+			log.String("vmid", vmCID))
+		return true, nil
+	}
+
+	slots := make([]string, 0, len(ephemeralSlots))
+	for slot := range ephemeralSlots {
+		slots = append(slots, slot)
+	}
+	sort.Strings(slots)
+
+	for _, slot := range slots {
+		volid := ephemeralSlots[slot]
+
+		// Step 1: unlink with force=false → PVE demotes slot to unusedN, storage intact.
+		unlinkErr := pve.RetryOnTransientOrLock(ctx, logger, "delete_vm.retain_ephemeral_unlink", 0, func() error {
+			return deps.PVE.Nodes().UpdateQemuUnlink(ctx, node, vmCID, &sdknodes.UpdateQemuUnlinkParams{
+				Idlist: slot,
+			})
+		})
+		if unlinkErr != nil {
+			return false, cpierrors.Retriable(
+				"delete_vm: retain_ephemeral_on_delete: could not unlink ephemeral slot %s (volid=%s) on VM %s: %s (retry re-attempts)",
+				slot, volid, vmCID, unlinkErr.Error())
+		}
+
+		// Step 2: re-read config to find the unusedN slot the unlink created.
+		postUnlinkCfg, postErr := deps.PVE.QEMU().Config(ctx, node, vmid)
+		if postErr != nil {
+			if pve.IsNotFound(postErr) {
+				return false, nil
+			}
+			return false, cpierrors.Wrap(pve.WrapError(postErr),
+				fmt.Sprintf("delete_vm: retain_ephemeral_on_delete: re-read config after unlink for VM %s slot %s", vmCID, slot))
+		}
+
+		// Step 3: find the unusedN slot that now holds our volid and delete that
+		// config entry (UpdateQemuConfig Delete removes only the config reference;
+		// storage is left intact). After this sweep the volume is unreferenced.
+		// The caller MUST then pass DestroyUnreferencedDisks=false — see function doc.
+		unusedSlot := ""
+		for unusedKey, unusedVolid := range pve.FindUnusedDiskEntries(postUnlinkCfg) {
+			if unusedVolid == volid || strings.HasPrefix(unusedVolid, volid+",") {
+				unusedSlot = unusedKey
+				break
+			}
+		}
+
+		if unusedSlot != "" {
+			deleteKey := unusedSlot
+			sweepErr := pve.RetryOnTransientOrLock(ctx, logger, "delete_vm.retain_ephemeral_sweep", 0, func() error {
+				return deps.PVE.Nodes().UpdateQemuConfig(ctx, node, vmCID,
+					&sdknodes.UpdateQemuConfigParams{Delete: &deleteKey})
+			})
+			if sweepErr != nil {
+				return false, cpierrors.Retriable(
+					"delete_vm: retain_ephemeral_on_delete: could not sweep unusedN entry %s (volid=%s) on VM %s: %s (retry re-attempts; volume is safe)",
+					unusedSlot, volid, vmCID, sweepErr.Error())
+			}
+			logger.Warn("delete_vm: retain_ephemeral_on_delete: ephemeral disk unlinked and config ref swept; caller will set DestroyUnreferencedDisks=false to preserve volume",
+				log.String("vmid", vmCID),
+				log.String("slot", slot),
+				log.String("volid", volid),
+			)
+			retained = true
+		} else {
+			// The unusedN entry may have already been swept (SDK auto-sweep).
+			// Treat as retained: we cannot confirm the config ref is gone, so
+			// use DestroyUnreferencedDisks=false as the conservative choice.
+			logger.Warn("delete_vm: retain_ephemeral_on_delete: ephemeral disk unlinked; no unusedN entry found after unlink (may have been auto-swept); setting retained=true conservatively",
+				log.String("vmid", vmCID),
+				log.String("slot", slot),
+				log.String("volid", volid),
+			)
+			retained = true
+		}
+	}
+	return retained, nil
+}
+
+// findEphemeralActiveDisks returns every (slot -> bare volid) on an active bus slot
+// of cfg whose bare volid contains ephemeralVolidInfix AND whose embedded storage
+// VMID matches ownerVMID. Only own-VMID ephemeral volumes are returned; foreign-VMID
+// volumes are left for detachForeignActiveDisks.
+//
+// Detection uses a string-infix check on the bare volid ("vm-<vmid>-ephemeral-<n>")
+// because EmbeddedDiskVMID matches "vm-<n>-disk-<n>" only and would not match the
+// ephemeral naming convention.
+func findEphemeralActiveDisks(cfg map[string]any, ownerVMID int) map[string]string {
+	out := make(map[string]string)
+	prefix := fmt.Sprintf("vm-%d%s", ownerVMID, ephemeralVolidInfix)
+	for slot, optstr := range sdkqemu.ParseDisks(cfg) {
+		bare := optstr
+		if comma := strings.Index(optstr, ","); comma >= 0 {
+			bare = optstr[:comma]
+		}
+		// bare volid is "storage:vm-<vmid>-ephemeral-<n>"; strip storage prefix.
+		volPart := bare
+		if colon := strings.Index(bare, ":"); colon >= 0 {
+			volPart = bare[colon+1:]
+		}
+		if strings.HasPrefix(volPart, prefix) {
+			out[slot] = bare
+		}
+	}
+	return out
 }
 
 // awaitDeleteTask extracts the UPID from the DeleteQemu response and awaits the

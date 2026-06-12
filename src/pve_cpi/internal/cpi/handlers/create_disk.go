@@ -57,6 +57,14 @@ type createDiskCloudProperties struct {
 	// global > off). When nil, the global setting applies. When *false, encrypted
 	// filter is explicitly disabled even if global is true.
 	Encrypted *bool `json:"encrypted,omitempty"`
+	// RetainOnDelete opts this disk out of deletion when delete_vm is called.
+	// When *true, "retain_on_delete":"1" is encoded into DiskCIDMeta.Opts so that
+	// delete_vm (and any future GC) can read the intent from the disk CID alone,
+	// independent of the VM config. Persistent disks created by create_disk are
+	// already preserved on delete_vm by the foreign-VMID guard; this flag adds
+	// explicit provenance and audit trail so the WARN log can identify the disk as
+	// operator-retained rather than incidentally foreign. Nil → byte-identical CID.
+	RetainOnDelete *bool `json:"retain_on_delete,omitempty"`
 }
 
 // resolveStorageLayered returns the storage pool name to use for a create_disk call,
@@ -265,6 +273,15 @@ func HandleCreateDisk(deps Deps) Handler {
 		diskPerfOpts, err := resolveDiskPerfOptions(r, deps.Config)
 		if err != nil {
 			return nil, err // non-retriable CloudError: bad cache mode / negative throttle
+		}
+		// Encode retain_on_delete provenance into the disk CID opts so delete_vm
+		// can surface audit provenance in its WARN log even when the disk is
+		// foreign-guarded by the VMID guard. Nil → byte-identical (no opts key added).
+		if cloudProps.RetainOnDelete != nil && *cloudProps.RetainOnDelete {
+			if diskPerfOpts == nil {
+				diskPerfOpts = make(map[string]string)
+			}
+			diskPerfOpts[diskOptRetainOnDelete] = "1"
 		}
 
 		// Resolve encrypted flag: per-call > global > false.

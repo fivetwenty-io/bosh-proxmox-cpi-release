@@ -166,6 +166,7 @@ type mockNodesService struct {
 	panicNodesStub
 	deleteQemuFn             func(ctx context.Context, node string, vmid string, params *nodes.DeleteQemuParams) (*nodes.DeleteQemuResponse, error)
 	updateQemuConfigFn       func(ctx context.Context, node string, vmid string, params *nodes.UpdateQemuConfigParams) error
+	updateQemuUnlinkFn       func(ctx context.Context, node string, vmid string, params *nodes.UpdateQemuUnlinkParams) error
 	listStorageContentFn     func(ctx context.Context, node string, storage string, params *nodes.ListStorageContentParams) (*nodes.ListStorageContentResponse, error)
 	createQemuStatusRebootFn func(ctx context.Context, node string, vmid string, params *nodes.CreateQemuStatusRebootParams) (*nodes.CreateQemuStatusRebootResponse, error)
 	listStorageFn            func(ctx context.Context, node string, params *nodes.ListStorageParams) (*nodes.ListStorageResponse, error)
@@ -183,6 +184,13 @@ func (m *mockNodesService) UpdateQemuConfig(ctx context.Context, node string, vm
 		return m.updateQemuConfigFn(ctx, node, vmid, params)
 	}
 	panic("mockNodesService.UpdateQemuConfig: not configured")
+}
+
+func (m *mockNodesService) UpdateQemuUnlink(ctx context.Context, node string, vmid string, params *nodes.UpdateQemuUnlinkParams) error {
+	if m.updateQemuUnlinkFn != nil {
+		return m.updateQemuUnlinkFn(ctx, node, vmid, params)
+	}
+	panic("mockNodesService.UpdateQemuUnlink: not configured")
 }
 
 func (m *mockNodesService) ListStorageContent(ctx context.Context, node string, storage string, params *nodes.ListStorageContentParams) (*nodes.ListStorageContentResponse, error) {

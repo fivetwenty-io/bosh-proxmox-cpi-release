@@ -2388,7 +2388,7 @@ operator-supplied tags.
 is a convention the CPI must apply consistently rather than an enforced relationship. A
 manually retagged VM silently breaks it. Tier: operability.
 
-#### 7.54 OPEN — Per-disk retain-on-delete (forensic ephemeral)
+#### 7.54 SHIPPED — Per-disk retain-on-delete (forensic ephemeral)
 
 *References: Alicloud.* The Alicloud CPI reads `delete_with_instance` as a `*bool` on
 ephemeral disks: when false, the disk survives the instance's deletion. PVE deletes every
@@ -2396,13 +2396,55 @@ attached disk with the VM, so an operator who wants to preserve an ephemeral dis
 post-mortem analysis after a failed VM has no in-band option. This complements the
 `debug.keep_failed_vms` capability of §7.20.
 
-**Build:** add a `retain_on_delete` (or `delete_with_instance: false`) `*bool` per disk. On
-`delete_vm`, detach the flagged disks before destroying the VM and leave them as unattached
-volumes in their storage pool, recording their volids so a later sweep can reclaim them.
+**Shipped:** Two independent retention surfaces, both unset by default (byte-identical to
+prior behavior).
 
-**Limits.** Retained volumes accumulate silently and become orphans unless an operator or a
-GC pass reclaims them, so the feature trades storage leakage for forensic value and needs a
-clear retention policy. Tier: deployment.
+*Persistent-disk retain flag.* `create_disk` cloud_properties accepts `retain_on_delete:
+true` (`*bool`). When set, the string `"retain_on_delete":"1"` is encoded into
+`DiskCIDMeta.Opts` inside the disk CID. Persistent disks created by `create_disk` already
+survive `delete_vm` via the foreign-VMID guard (`detachForeignActiveDisks`): the guard
+detaches every active-slot disk whose embedded VMID differs from the VM's own VMID and
+preserves the backing volume. The `retain_on_delete` flag adds explicit provenance — it is
+readable from the disk CID alone, independent of VM config — and is available as an audit
+signal for inventory tooling (`scripts/disk-audit`).
+
+*Ephemeral-disk retain flag.* `create_vm` cloud_properties accepts
+`retain_ephemeral_on_delete: true` (`*bool`). When set, `create_vm` stamps the PVE tag
+`bosh-retain-ephemeral` on the VM. This tag survives `set_vm_metadata`'s tag RMW (the tag
+is not in `reservedBoshTagPrefixes`). On `delete_vm` — on both the fast path (skiplock
+destroy) and the slow path (stop+await+destroy) — the handler reads the VM tags; when
+`bosh-retain-ephemeral` is present it finds every ephemeral disk slot whose bare volid
+contains `vm-<vmid>-ephemeral-` (the naming convention set by `attachEphemeralDisk`), then:
+(1) calls `UpdateQemuUnlink(force=false)` on the slot, which demotes the disk to an
+`unusedN` config entry while leaving backing storage intact; (2) re-reads the VM config to
+locate the resulting `unusedN` slot; (3) calls `UpdateQemuConfig(Delete: "unusedN")` to
+remove that config reference only, without freeing storage; (4) proceeds to `DeleteQemu`
+with `purge=true, destroyUnreferencedDisks=false` — the volume is now unreferenced with a
+matching VMID, which is exactly the class `destroyUnreferencedDisks=true` would free, so
+the flag is forced false on the retain path (and only there; non-retain deletes keep
+`true`, byte-identical). The retained volid is logged at WARN for operator recovery.
+
+Tag presence — not unlink success — gates the destroy flag, which makes the path safe to
+re-enter: a retried `delete_vm` whose prior attempt already unlinked and swept the disk
+finds no active ephemeral slot but still forces `destroyUnreferencedDisks=false`. The
+fast-path straggler sweep (`sweepFastDeleteStragglers`) applies the same rule: a
+`bosh-deleting` straggler that also carries `bosh-retain-ephemeral` gets the detach re-run
+(finishing any pending unlink) and its re-issued destroy forced to
+`destroyUnreferencedDisks=false`; if the detach fails, the straggler is deferred to the
+next sweep rather than destroyed with the volume in an unknown state.
+
+`force=false` was chosen over alternatives: `force=true` physically destroys the volume
+(wrong); reassigning to another VM is out of scope. The two-step unlink+config-delete
+sequence is required because `DeleteQemu purge` destroys `unusedN` entries it finds in
+config — without the config-delete sweep, the volume would still be destroyed.
+
+*Limits.* On a retain-flagged VM, `destroyUnreferencedDisks=false` means any other
+unreferenced own-VMID volumes (for example an orphan from a prior failed create) also
+survive the delete — conservative by design. Retained volumes accumulate until operator
+prune; use `scripts/disk-audit` to inventory them. The ephemeral retain path reads the VM
+config once per `delete_vm` invocation (exits immediately when the tag is absent). The
+destroy-flag semantics are exercised against a modeled PVE in tests; live PVE validation
+is pending. Unset flags → byte-identical delete behavior. Tier: deployment.
 
 #### 7.55 OPEN — Router and NAT VM support
 

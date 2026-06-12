@@ -218,6 +218,17 @@ type createVMCloudProps struct {
 	// Overrides the global CPIConfig.Encrypted (per-call > global > off). When
 	// nil, the global setting applies. Pointer-typed; absent JSON key leaves nil.
 	Encrypted *bool `json:"encrypted,omitempty"`
+	// RetainEphemeralOnDelete opts the VM's ephemeral disk out of purge when
+	// delete_vm is called. When *true, create_vm stamps the tag tagRetainEphemeral
+	// ("bosh-retain-ephemeral") onto the VM. The tag survives set_vm_metadata's
+	// tag RMW (not in reservedBoshTagPrefixes). On delete_vm both paths check for
+	// this tag: when present, the ephemeral disk slot (volid containing
+	// "vm-<vmid>-ephemeral-") is unlinked (force=false → unusedN), the unusedN
+	// config entry is then removed without freeing storage, and the volid is WARN-
+	// logged for operator recovery. DeleteQemu proceeds after unlink and does not
+	// see any reference to the ephemeral volume, so the backing storage survives.
+	// Nil → byte-identical (no tag, no unlink, ephemeral is destroyed with the VM).
+	RetainEphemeralOnDelete *bool `json:"retain_ephemeral_on_delete,omitempty"`
 }
 
 // createVMNetworkSpec mirrors the BOSH v2 network spec shape.
@@ -954,7 +965,11 @@ func buildVMShapeForNode(ctx context.Context, deps Deps, parsed *createVMParsedA
 	// reservedBoshTagPrefixes. Operator-supplied tags are appended after.
 	// The BOSH-managed director/deployment/job triple is added later by
 	// set_vm_metadata.
-	initialTags := mergeTagList([]string{ownershipTag}, buildCustomTags(cp.Tags), maxTagLength)
+	baseRetainTags := buildCustomTags(cp.Tags)
+	if cp.RetainEphemeralOnDelete != nil && *cp.RetainEphemeralOnDelete {
+		baseRetainTags = append(baseRetainTags, tagRetainEphemeral)
+	}
+	initialTags := mergeTagList([]string{ownershipTag}, baseRetainTags, maxTagLength)
 	initialName := resolveVMShapeInitialName(deps.Config, parsed)
 
 	// Best-effort: populate vmStorageType for the clone-mode decision in
