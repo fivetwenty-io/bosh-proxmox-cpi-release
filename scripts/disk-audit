@@ -1,0 +1,951 @@
+#!/usr/bin/env python3
+"""Operator audit tool for BOSH persistent disks managed by the PVE CPI.
+
+Enumerates all persistent disk volumes in the configured disk-VMID band across
+every PVE node and classifies each one:
+
+  attached     — volume is attached to a real (non-parker) VM
+  parked       — volume is held by a parker VM (bosh-parker tag + parker VMID range);
+                 provenance columns are pulled from the <!--BOSH:{...}--> sentinel
+                 in the parker VM description
+  free-floating — volume exists in storage but no VM holds it (potential orphan)
+  unknown       — volume found in storage content but VMID cannot be determined
+                  from the volid pattern
+
+Exit codes:
+  0 — no free-floating disks (clean)
+  1 — one or more free-floating disks found (CI gate trigger)
+  2 — usage error or fatal transport failure
+
+Warnings are printed to stderr when:
+  - parked disks exist but detached_disk_strategy is not "parked"
+  - empty parker VMs are found (teardown candidates)
+
+Config file format (JSON, subset of the CPI config):
+
+  {
+    "host": "pve.example.com",          required
+    "port": 8006,                        optional, default 8006
+    "user": "root@pam",                  required
+    "api_token": "root@pam!tok=SECRET",  required if no password
+    "password": "SECRET",                required if no api_token
+    "realm": "pam",                      optional, default "pam"
+    "node": "pve1",                      optional; limits scope to one node
+    "verify_ssl": false,                 optional, default false
+    "disk_vmid_range_start": 9000,       optional, default 9000
+    "disk_vmid_range_end": 29999,        optional, default 29999
+    "parked_disk_vmid_range_start": 90000, optional, default 90000
+    "parked_disk_vmid_range_end": 90999,   optional, default 90999
+    "detached_disk_strategy": "parked"   optional, default ""
+  }
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import ssl
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from typing import Any
+
+# ---------------------------------------------------------------------------
+# Defaults mirroring CPI ApplyDefaults / pve package constants
+# ---------------------------------------------------------------------------
+
+DEFAULT_PORT = 8006
+DEFAULT_REALM = "pam"
+DEFAULT_DISK_VMID_START = 9000
+DEFAULT_DISK_VMID_END = 29999
+DEFAULT_PARKER_VMID_START = 90000
+DEFAULT_PARKER_VMID_END = 90999
+
+# volid pattern: <storage>:vm-<vmid>-disk-<n> or <storage>:vm-<vmid>-cloudinit
+# We care about vm-<vmid>-disk-<n> volumes where vmid is in the disk band.
+_DISK_VOLID_RE = re.compile(r"^[^:]+:vm-(\d+)-disk-\d+$")
+
+# Sentinel pattern — same as parker.go parkerSentinelPattern
+_SENTINEL_RE = re.compile(r"<!--BOSH:(.*?)-->", re.DOTALL)
+
+PARKER_TAG = "bosh-parker"
+
+
+# ---------------------------------------------------------------------------
+# Config loading
+# ---------------------------------------------------------------------------
+
+class AuditConfig:
+    """Resolved audit configuration with validated fields and effective defaults."""
+
+    def __init__(self, raw: dict[str, Any]) -> None:
+        host = str(raw.get("host", "") or "").strip()
+        if not host:
+            _die("config: 'host' is required")
+        self.host = host
+        self.port = int(raw.get("port", DEFAULT_PORT) or DEFAULT_PORT)
+        user = str(raw.get("user", "") or "").strip()
+        if not user:
+            _die("config: 'user' is required")
+        self.user = user
+        self.realm = str(raw.get("realm", DEFAULT_REALM) or DEFAULT_REALM).strip()
+        self.api_token = str(raw.get("api_token", "") or "").strip()
+        self.password = str(raw.get("password", "") or "").strip()
+        if not self.api_token and not self.password:
+            _die("config: one of 'api_token' or 'password' is required")
+        self.verify_ssl = bool(raw.get("verify_ssl", False))
+        # Optional node scope; empty = all nodes
+        self.node = str(raw.get("node", "") or "").strip()
+
+        # Disk band
+        self.disk_vmid_start = int(raw.get("disk_vmid_range_start", DEFAULT_DISK_VMID_START) or DEFAULT_DISK_VMID_START)
+        self.disk_vmid_end = int(raw.get("disk_vmid_range_end", DEFAULT_DISK_VMID_END) or DEFAULT_DISK_VMID_END)
+        if self.disk_vmid_start >= self.disk_vmid_end:
+            _die(
+                f"config: disk_vmid_range_start ({self.disk_vmid_start}) must be "
+                f"less than disk_vmid_range_end ({self.disk_vmid_end})"
+            )
+
+        # Parker band
+        self.parker_vmid_start = int(
+            raw.get("parked_disk_vmid_range_start", DEFAULT_PARKER_VMID_START) or DEFAULT_PARKER_VMID_START
+        )
+        self.parker_vmid_end = int(
+            raw.get("parked_disk_vmid_range_end", DEFAULT_PARKER_VMID_END) or DEFAULT_PARKER_VMID_END
+        )
+        if self.parker_vmid_start >= self.parker_vmid_end:
+            _die(
+                f"config: parked_disk_vmid_range_start ({self.parker_vmid_start}) must be "
+                f"less than parked_disk_vmid_range_end ({self.parker_vmid_end})"
+            )
+
+        self.detached_disk_strategy = str(raw.get("detached_disk_strategy", "") or "").strip().lower()
+
+    def username_with_realm(self) -> str:
+        if "@" in self.user:
+            return self.user
+        return f"{self.user}@{self.realm}"
+
+
+def load_config(path: str) -> AuditConfig:
+    """Load and validate the JSON config file."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+    except FileNotFoundError:
+        _die(f"config file not found: {path}")
+    except PermissionError as exc:
+        _die(f"cannot read config file {path}: {exc}")
+    except json.JSONDecodeError as exc:
+        _die(f"config file {path} is not valid JSON: {exc}")
+    if not isinstance(raw, dict):
+        _die(f"config file {path} must contain a JSON object")
+    return AuditConfig(raw)
+
+
+# ---------------------------------------------------------------------------
+# PVE REST API client
+# ---------------------------------------------------------------------------
+
+class PVEClient:
+    """Minimal read-only PVE REST API client. Auth: token or password-ticket."""
+
+    def __init__(self, cfg: AuditConfig) -> None:
+        self._cfg = cfg
+        self._base = f"https://{cfg.host}:{cfg.port}/api2/json"
+        if cfg.verify_ssl:
+            self._ssl = ssl.create_default_context()
+        else:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            self._ssl = ctx
+        self._ticket: str = ""  # lazy — populated on first password-auth GET
+
+    def _ensure_ticket(self) -> None:
+        if self._cfg.api_token or self._ticket:
+            return
+        body = urllib.parse.urlencode(
+            {"username": self._cfg.username_with_realm(), "password": self._cfg.password}
+        ).encode("utf-8")
+        req = urllib.request.Request(
+            f"{self._base}/access/ticket", data=body, method="POST"
+        )
+        req.add_header("Content-Type", "application/x-www-form-urlencoded")
+        try:
+            with urllib.request.urlopen(req, context=self._ssl, timeout=30) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            _die(f"PVE ticket auth failed: HTTP {exc.code} {exc.reason}")
+        except (urllib.error.URLError, OSError) as exc:
+            _die(f"PVE ticket auth failed: {exc}")
+        ticket = (payload.get("data") or {}).get("ticket")
+        if not ticket:
+            _die("PVE ticket auth returned no ticket")
+        self._ticket = ticket
+
+    def _auth_headers(self) -> dict[str, str]:
+        self._ensure_ticket()
+        if self._cfg.api_token:
+            return {"Authorization": f"PVEAPIToken={self._cfg.api_token}"}
+        return {"Cookie": f"PVEAuthCookie={self._ticket}"}
+
+    def get(self, path: str, *, allow_missing: bool = False) -> Any:
+        """GET /api2/json<path>, return parsed 'data' field.
+
+        Inputs:
+          path           — must start with '/'; caller-controlled
+          allow_missing  — return None on HTTP 404/501 instead of dying
+
+        Failure modes:
+          HTTP error     — _die() unless allow_missing and 404/501
+          network error  — _die()
+          bad JSON       — _die()
+        """
+        headers = self._auth_headers()
+        req = urllib.request.Request(f"{self._base}{path}", headers=headers, method="GET")
+        try:
+            with urllib.request.urlopen(req, context=self._ssl, timeout=30) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            if allow_missing and exc.code in (404, 501):
+                return None
+            _die(f"GET {path} failed: HTTP {exc.code} {exc.reason}")
+        except (urllib.error.URLError, OSError) as exc:
+            _die(f"GET {path} failed: {exc}")
+        except json.JSONDecodeError as exc:
+            _die(f"GET {path}: invalid JSON response: {exc}")
+        return payload.get("data")
+
+    def list_nodes(self) -> list[str]:
+        """Return all online node names visible to the authenticated principal."""
+        data = self.get("/nodes")
+        nodes: list[str] = []
+        if not isinstance(data, list):
+            return nodes
+        for entry in data:
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get("node", "")).strip()
+            status = str(entry.get("status", "")).strip()
+            if name and status == "online":
+                nodes.append(name)
+        return nodes
+
+    def cluster_resources_vms(self) -> list[dict[str, Any]]:
+        """Return all VM resources from /cluster/resources?type=vm."""
+        data = self.get("/cluster/resources?type=vm")
+        if not isinstance(data, list):
+            return []
+        return [e for e in data if isinstance(e, dict)]
+
+    def storage_content(self, node: str, storage: str) -> list[dict[str, Any]]:
+        """Return content list for node/storage (content=images).
+
+        Returns [] when the storage is inaccessible (404/501/error) rather than
+        aborting — some storages may not be mounted on every node.
+        """
+        path = (
+            f"/nodes/{urllib.parse.quote(node)}/storage/"
+            f"{urllib.parse.quote(storage)}/content?content=images"
+        )
+        data = self.get(path, allow_missing=True)
+        if not isinstance(data, list):
+            return []
+        return [e for e in data if isinstance(e, dict)]
+
+    def node_storages(self, node: str) -> list[dict[str, Any]]:
+        """Return storage entries visible on node."""
+        data = self.get(f"/nodes/{urllib.parse.quote(node)}/storage", allow_missing=True)
+        if not isinstance(data, list):
+            return []
+        return [e for e in data if isinstance(e, dict)]
+
+    def vm_config(self, node: str, vmid: int) -> "dict[str, Any] | None":
+        """Return qemu VM config dict, or None if not found."""
+        path = f"/nodes/{urllib.parse.quote(node)}/qemu/{vmid}/config"
+        data = self.get(path, allow_missing=True)
+        if not isinstance(data, dict):
+            return None
+        return data
+
+
+# ---------------------------------------------------------------------------
+# Sentinel / provenance parsing
+# ---------------------------------------------------------------------------
+
+def parse_parker_sentinel(description: str) -> dict[str, Any]:
+    """Extract the bosh_parked_disks map from a parker VM description.
+
+    Returns {} on missing or corrupt sentinel. Tolerates other BOSH keys
+    coexisting in the sentinel (set_disk_metadata uses bosh_disk_metadata).
+
+    Inputs:
+      description — raw VM description string from the PVE API
+
+    Failure modes:
+      no sentinel present       — return {}
+      sentinel JSON corrupt     — return {} (best-effort; don't abort audit)
+      bosh_parked_disks missing — return {}
+    """
+    if not description:
+        return {}
+    m = _SENTINEL_RE.search(description)
+    if not m:
+        return {}
+    try:
+        top = json.loads(m.group(1))
+    except (json.JSONDecodeError, ValueError):
+        return {}
+    if not isinstance(top, dict):
+        return {}
+    disks = top.get("bosh_parked_disks")
+    if not isinstance(disks, dict):
+        return {}
+    return disks
+
+
+# ---------------------------------------------------------------------------
+# Volid helpers
+# ---------------------------------------------------------------------------
+
+def disk_vmid_from_volid(volid: str) -> "int | None":
+    """Extract the synthetic VMID embedded in a disk volid.
+
+    Pattern: <storage>:vm-<vmid>-disk-<n>
+    Returns None when the volid does not match (not a disk volume or
+    unrecognised format).
+
+    Inputs:
+      volid — raw PVE volid string
+
+    Failure modes:
+      non-matching pattern — return None (caller classifies as 'unknown')
+    """
+    m = _DISK_VOLID_RE.match(volid)
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except ValueError:
+        return None
+
+
+def bare_volid(volid: str) -> str:
+    """Return the path component of a PVE volid, stripping the storage prefix.
+
+    PVE volids are <storage>:<path>. Returns the path segment only
+    (e.g. 'local-lvm:vm-9001-disk-0' -> 'vm-9001-disk-0'). When no colon is
+    present the input is returned unchanged.
+
+    Not used for parker provenance lookups — those keys are the full volid
+    (storage:path) as written by detach_disk via ParseEncodedDiskCID.
+    Retained as a utility for callers that need the raw path segment.
+    """
+    if ":" in volid:
+        return volid.split(":", 1)[1]
+    return volid
+
+
+def _tags_contain_parker(tags: str) -> bool:
+    """True when semicolon-separated tags include 'bosh-parker' (case-insensitive)."""
+    for t in tags.split(";"):
+        if t.strip().lower() == PARKER_TAG:
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Data model
+# ---------------------------------------------------------------------------
+
+class DiskRecord:
+    """Classification record for one persistent disk volume."""
+
+    __slots__ = (
+        "volid",
+        "storage",
+        "node",
+        "size_bytes",
+        "classification",
+        "holder_vmid",
+        "holder_node",
+        "holder_name",
+        # provenance from parker sentinel (parked only)
+        "disk_cid",
+        "source_vm_cid",
+        "parked_at",
+        "parked_node",
+        "director_id",
+    )
+
+    def __init__(self, volid: str, storage: str, node: str, size_bytes: int) -> None:
+        self.volid = volid
+        self.storage = storage
+        self.node = node
+        self.size_bytes = size_bytes
+        self.classification = "unknown"
+        self.holder_vmid: "int | None" = None
+        self.holder_node: str = ""
+        self.holder_name: str = ""
+        # provenance
+        self.disk_cid: str = ""
+        self.source_vm_cid: str = ""
+        self.parked_at: str = ""
+        self.parked_node: str = ""
+        self.director_id: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {
+            "volid": self.volid,
+            "storage": self.storage,
+            "node": self.node,
+            "size_bytes": self.size_bytes,
+            "classification": self.classification,
+        }
+        if self.holder_vmid is not None:
+            d["holder_vmid"] = self.holder_vmid
+        if self.holder_node:
+            d["holder_node"] = self.holder_node
+        if self.holder_name:
+            d["holder_name"] = self.holder_name
+        if self.disk_cid:
+            d["disk_cid"] = self.disk_cid
+        if self.source_vm_cid:
+            d["source_vm_cid"] = self.source_vm_cid
+        if self.parked_at:
+            d["parked_at"] = self.parked_at
+        if self.parked_node:
+            d["parked_node"] = self.parked_node
+        if self.director_id:
+            d["director_id"] = self.director_id
+        return d
+
+
+class ParkerRecord:
+    """Inventory record for one parker VM."""
+
+    __slots__ = ("vmid", "node", "name", "disk_count", "slot_capacity", "empty")
+
+    def __init__(self, vmid: int, node: str, name: str, disk_count: int) -> None:
+        self.vmid = vmid
+        self.node = node
+        self.name = name
+        self.disk_count = disk_count
+        self.slot_capacity = 31  # scsi0..scsi30
+        self.empty = disk_count == 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "vmid": self.vmid,
+            "node": self.node,
+            "name": self.name,
+            "disk_count": self.disk_count,
+            "slot_capacity": self.slot_capacity,
+            "empty": self.empty,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Inventory collection
+# ---------------------------------------------------------------------------
+
+# Mirrors qemu.ParseDisks in the SDK: bus families that can hold persistent
+# disk volumes. Pattern: ^(scsi|virtio|ide|sata)\d+$
+# Ranges: scsi 0-30 (parker uses scsi0..30), virtio 0-15, ide 0-3, sata 0-5.
+# efidisk0 and tpmstate0 carry boot firmware, not BOSH persistent disks, and
+# their volids never embed a disk-band VMID — they are safely skipped.
+# unusedN entries are NOT scanned here: FindVMByDiskVolid in disk.go only calls
+# qemu.ParseDisks (bus keys) when searching for a disk holder. unusedN volumes
+# are detached remnants that PVE may GC; the disk-band filter on storage content
+# already surfaces them as free-floating when no active bus slot holds them.
+_BUS_KEY_RE = re.compile(r"^(scsi|virtio|ide|sata)\d+$")
+
+
+def _parse_bus_disks(config: dict[str, Any]) -> dict[str, str]:
+    """Return {slot: raw_value} for all active bus disk keys in a VM config.
+
+    Mirrors qemu.ParseDisks in the SDK (bus pattern scsi|virtio|ide|sata + digits).
+    Raw values are kept intact (may be 'volid,opt=val,...') for volid matching.
+
+    Inputs:
+      config — raw qemu VM config dict from the PVE API
+
+    Failure modes:
+      non-dict config    — treated as empty by caller (vm_config returns None)
+      missing bus keys   — simply absent from output; not an error
+    """
+    out: dict[str, str] = {}
+    for key, val in config.items():
+        if _BUS_KEY_RE.match(key) and isinstance(val, str) and val:
+            out[key] = val
+    return out
+
+
+def _bus_disk_volid_from_slot(raw_value: str) -> str:
+    """Extract the bare volid from a PVE disk slot value.
+
+    PVE stores disk values as '<volid>[,option=value,...]'. The volid is the
+    prefix before the first comma. Returns the full string when no comma present.
+
+    Mirrors the option-string stripping in DiskOptStrContainsVolid / FindDiskIDByVolID.
+    """
+    comma = raw_value.find(",")
+    if comma >= 0:
+        return raw_value[:comma]
+    return raw_value
+
+
+def _count_bus_disks(config: dict[str, Any]) -> int:
+    """Count occupied bus disk slots in a qemu VM config dict."""
+    return len(_parse_bus_disks(config))
+
+
+def collect_inventory(client: PVEClient, cfg: AuditConfig) -> "tuple[list[DiskRecord], list[ParkerRecord]]":
+    """Collect the full disk and parker inventory from PVE.
+
+    Algorithm:
+      1. List all cluster VM resources to build vmid -> {node, name, tags}.
+      2. Determine which nodes to scan (all online, or cfg.node if set).
+      3. For each node, list storages; enumerate image content. Collect
+         all volids whose embedded disk-band VMID falls in [disk_vmid_start,
+         disk_vmid_range_end]. Deduplicate across nodes (shared storage).
+      4. Build a holder map: volid -> (holder_vmid, holder_node, holder_name,
+         holder_tags) by fetching each cluster VM's qemu config and scanning
+         scsi|virtio|ide|sata bus slots for matching volids. This mirrors
+         FindVMByDiskVolid in disk.go exactly — it is the only correct approach
+         because the embedded VMID in vm-<N>-disk-<n> is a SYNTHETIC disk-band
+         VMID (9000-29999) that no real VM or parker VM ever owns by VMID;
+         the disk is a foreign volume attached to an arbitrary holder VM.
+         O(#VMs) config fetches; acceptable for an operator audit tool.
+      5. Classify each disk volume using the holder map:
+           - holder VMID in parker band AND bosh-parker tag -> parked
+             (fetch parker sentinel for provenance; config already cached)
+           - holder found, not a parker -> attached
+           - no holder in any VM config -> free-floating
+      6. Enumerate parker VMs independently (catches empty parkers whose
+         disk_count is 0 and therefore never appear as disk holders).
+
+    Inputs:
+      client — authenticated PVE API client
+      cfg    — resolved audit config
+
+    Returns:
+      (disk_records, parker_records)
+    """
+    # ---- Step 1: cluster VM map ----
+    vm_map: dict[int, dict[str, str]] = {}
+    for entry in client.cluster_resources_vms():
+        vmid_raw = entry.get("vmid")
+        if vmid_raw is None:
+            continue
+        try:
+            vmid_int = int(vmid_raw)
+        except (TypeError, ValueError):
+            continue
+        vm_map[vmid_int] = {
+            "node": str(entry.get("node", "") or ""),
+            "name": str(entry.get("name", "") or ""),
+            "tags": str(entry.get("tags", "") or ""),
+        }
+
+    # ---- Step 2: node list ----
+    if cfg.node:
+        nodes = [cfg.node]
+    else:
+        nodes = client.list_nodes()
+        if not nodes:
+            _warn("no online nodes found; inventory may be empty")
+
+    # ---- Step 3: storage content scan ----
+    # raw_disks: list of (volid, storage_name, first_seen_node, size_bytes)
+    raw_disks: list[tuple[str, str, str, int]] = []
+    visited_volids: set[str] = set()  # deduplicate shared storage across nodes
+
+    for node in nodes:
+        storages = client.node_storages(node)
+        for st in storages:
+            storage_name = str(st.get("storage", "") or "").strip()
+            if not storage_name:
+                continue
+            content_types = str(st.get("content", "") or "")
+            if "images" not in [p.strip() for p in content_types.split(",")]:
+                continue  # skip storages that can't hold disk images
+            for item in client.storage_content(node, storage_name):
+                volid = str(item.get("volid", "") or "").strip()
+                if not volid or volid in visited_volids:
+                    continue
+                embedded_vmid = disk_vmid_from_volid(volid)
+                if embedded_vmid is None:
+                    continue
+                if not (cfg.disk_vmid_start <= embedded_vmid <= cfg.disk_vmid_end):
+                    continue
+                visited_volids.add(volid)
+                size_bytes = 0
+                try:
+                    size_bytes = int(item.get("size", 0) or 0)
+                except (TypeError, ValueError):
+                    pass
+                raw_disks.append((volid, storage_name, node, size_bytes))
+
+    # ---- Step 4: build holder map via VM config scans ----
+    # Mirrors FindVMByDiskVolid in disk.go: fetch each VM's config and scan
+    # scsi|virtio|ide|sata bus slots for the target volid.  The embedded VMID
+    # in vm-<N>-disk-<n> is a synthetic disk-band VMID; no real VM or parker
+    # ever owns it.  The disk is a foreign volume attached to an arbitrary
+    # holder VM identified only by scanning configs, not by VMID equality.
+    # O(#VMs) config fetches; acceptable for an operator audit tool.
+    #
+    # holder_map: volid -> {"vmid": int, "node": str, "name": str, "tags": str}
+    target_volids = {v for (v, _, _, _) in raw_disks}
+
+    # Cache: vmid -> config dict (or None on fetch failure).
+    # Built here; reused in step 5 for provenance and step 6 for parker counts.
+    vm_config_cache: dict[int, "dict[str, Any] | None"] = {}
+    holder_map: dict[str, dict[str, Any]] = {}
+
+    if target_volids:
+        # Only fetch VM configs when there are disk volumes to match against.
+        for vmid_int, info in vm_map.items():
+            vm_node = info["node"]
+            if not vm_node:
+                continue
+            config = client.vm_config(vm_node, vmid_int)
+            vm_config_cache[vmid_int] = config
+            if config is None:
+                continue
+            bus_disks = _parse_bus_disks(config)
+            for _slot, raw_val in bus_disks.items():
+                slot_volid = _bus_disk_volid_from_slot(raw_val)
+                if slot_volid in target_volids and slot_volid not in holder_map:
+                    holder_map[slot_volid] = {
+                        "vmid": vmid_int,
+                        "node": vm_node,
+                        "name": info["name"],
+                        "tags": info["tags"],
+                    }
+
+    # ---- Step 5: classify each disk ----
+    # provenance cache: parker vmid -> {full_volid: prov_dict}
+    parker_provenance_cache: dict[int, dict[str, Any]] = {}
+
+    disk_records: list[DiskRecord] = []
+
+    for (volid, storage, node, size_bytes) in raw_disks:
+        rec = DiskRecord(volid, storage, node, size_bytes)
+
+        holder = holder_map.get(volid)
+        if holder is None:
+            rec.classification = "free-floating"
+            disk_records.append(rec)
+            continue
+
+        holder_vmid = holder["vmid"]
+        holder_node = holder["node"]
+        holder_name = holder["name"]
+        holder_tags = holder["tags"]
+        rec.holder_vmid = holder_vmid
+        rec.holder_node = holder_node
+        rec.holder_name = holder_name
+
+        in_parker_range = cfg.parker_vmid_start <= holder_vmid <= cfg.parker_vmid_end
+        has_parker_tag = _tags_contain_parker(holder_tags)
+
+        if in_parker_range and has_parker_tag:
+            rec.classification = "parked"
+            # Provenance from the parker VM description sentinel.
+            # Config already in vm_config_cache from step 4.
+            if holder_vmid not in parker_provenance_cache:
+                pconfig = vm_config_cache.get(holder_vmid)
+                if pconfig is not None:
+                    desc = str(pconfig.get("description", "") or "")
+                    parker_provenance_cache[holder_vmid] = parse_parker_sentinel(desc)
+                else:
+                    parker_provenance_cache[holder_vmid] = {}
+            prov_map = parker_provenance_cache.get(holder_vmid, {})
+            # The sentinel map in parker.go is keyed by bareVolid (parker.go:229),
+            # where bareVolid is passed from detach_disk as bareDiskCID, which is
+            # ParseEncodedDiskCID(diskCID) — the full "storage:vm-N-disk-n" string
+            # with only the "|metadata" suffix stripped. The storage prefix is
+            # preserved. The PVE storage-content API returns the same full volid
+            # form, so look up by volid directly — not bare_volid() which would
+            # strip the storage prefix and produce a lookup miss.
+            prov = prov_map.get(volid) or {}
+            if isinstance(prov, dict):
+                rec.disk_cid = str(prov.get("disk_cid", "") or "")
+                rec.source_vm_cid = str(prov.get("source_vm_cid", "") or "")
+                rec.parked_at = str(prov.get("parked_at", "") or "")
+                rec.parked_node = str(prov.get("node", "") or "")
+                rec.director_id = str(prov.get("director_id", "") or "")
+        else:
+            rec.classification = "attached"
+
+        disk_records.append(rec)
+
+    # ---- Step 6: parker VM inventory (including empty ones) ----
+    parker_records: list[ParkerRecord] = []
+
+    for vmid_int, info in vm_map.items():
+        if not (cfg.parker_vmid_start <= vmid_int <= cfg.parker_vmid_end):
+            continue
+        if not _tags_contain_parker(info["tags"]):
+            continue
+        vm_node = info["node"]
+        # Reuse cached config from step 4; fetch only when absent (e.g. node-scoped run).
+        if vmid_int in vm_config_cache:
+            pconfig = vm_config_cache[vmid_int]
+        else:
+            pconfig = client.vm_config(vm_node, vmid_int)
+            vm_config_cache[vmid_int] = pconfig
+        disk_count = _count_bus_disks(pconfig) if pconfig else 0
+        parker_records.append(ParkerRecord(
+            vmid=vmid_int,
+            node=vm_node,
+            name=info["name"],
+            disk_count=disk_count,
+        ))
+
+    parker_records.sort(key=lambda r: r.vmid)
+    return disk_records, parker_records
+
+
+# ---------------------------------------------------------------------------
+# Output formatters
+# ---------------------------------------------------------------------------
+
+_SIZE_UNITS = [
+    (1 << 40, "TiB"),
+    (1 << 30, "GiB"),
+    (1 << 20, "MiB"),
+    (1 << 10, "KiB"),
+]
+
+
+def _human_size(size_bytes: int) -> str:
+    if size_bytes <= 0:
+        return "—"
+    for threshold, unit in _SIZE_UNITS:
+        if size_bytes >= threshold:
+            val = size_bytes / threshold
+            return f"{val:.1f} {unit}"
+    return f"{size_bytes} B"
+
+
+def _trunc(s: str, n: int) -> str:
+    """Truncate string to n chars, appending '…' when truncated."""
+    if len(s) <= n:
+        return s
+    return s[:n - 1] + "…"
+
+
+def print_human_report(
+    disk_records: list[DiskRecord],
+    parker_records: list[ParkerRecord],
+    cfg: AuditConfig,
+) -> None:
+    """Print a human-readable table report to stdout."""
+    counts: dict[str, int] = {"attached": 0, "parked": 0, "free-floating": 0, "unknown": 0}
+    for rec in disk_records:
+        counts[rec.classification] = counts.get(rec.classification, 0) + 1
+
+    total = len(disk_records)
+    print("\nBOSH Persistent Disk Audit")
+    print(f"  Host:  {cfg.host}:{cfg.port}")
+    print(f"  Disk band:   [{cfg.disk_vmid_start}, {cfg.disk_vmid_end}]")
+    print(f"  Parker band: [{cfg.parker_vmid_start}, {cfg.parker_vmid_end}]")
+    if cfg.node:
+        print(f"  Scope: node={cfg.node}")
+    print(f"  Total disk volumes: {total}")
+    print(f"    attached:      {counts['attached']}")
+    print(f"    parked:        {counts['parked']}")
+    print(f"    free-floating: {counts['free-floating']}")
+    print(f"    unknown:       {counts['unknown']}")
+    print()
+
+    # Attached
+    attached = [r for r in disk_records if r.classification == "attached"]
+    if attached:
+        print("ATTACHED DISKS")
+        print(f"  {'VOLID':<45} {'SIZE':>10}  {'HOLDER VMID':>11}  {'HOLDER NAME':<30}")
+        print(f"  {'-'*45} {'-'*10}  {'-'*11}  {'-'*30}")
+        for r in sorted(attached, key=lambda x: x.volid):
+            holder = str(r.holder_vmid) if r.holder_vmid is not None else "—"
+            print(f"  {_trunc(r.volid, 45):<45} {_human_size(r.size_bytes):>10}  {holder:>11}  {_trunc(r.holder_name, 30):<30}")
+        print()
+
+    # Parked
+    parked = [r for r in disk_records if r.classification == "parked"]
+    if parked:
+        print("PARKED DISKS")
+        print(
+            f"  {'VOLID':<45} {'SIZE':>10}  {'PARKER':>7}  "
+            f"{'DISK_CID':<32}  {'SRC_VM_CID':<20}  {'PARKED_AT':<20}  {'DIR_ID':<12}"
+        )
+        print(
+            f"  {'-'*45} {'-'*10}  {'-'*7}  "
+            f"{'-'*32}  {'-'*20}  {'-'*20}  {'-'*12}"
+        )
+        for r in sorted(parked, key=lambda x: x.volid):
+            parker_id = str(r.holder_vmid) if r.holder_vmid is not None else "—"
+            print(
+                f"  {_trunc(r.volid, 45):<45} {_human_size(r.size_bytes):>10}  {parker_id:>7}  "
+                f"{_trunc(r.disk_cid, 32):<32}  {_trunc(r.source_vm_cid, 20):<20}  "
+                f"{_trunc(r.parked_at, 20):<20}  {_trunc(r.director_id, 12):<12}"
+            )
+        print()
+
+    # Free-floating
+    floating = [r for r in disk_records if r.classification == "free-floating"]
+    if floating:
+        print("FREE-FLOATING DISKS  [WARNING: potential orphans]")
+        print(f"  {'VOLID':<55} {'SIZE':>10}  {'STORAGE':<20}  {'NODE':<15}")
+        print(f"  {'-'*55} {'-'*10}  {'-'*20}  {'-'*15}")
+        for r in sorted(floating, key=lambda x: x.volid):
+            print(f"  {_trunc(r.volid, 55):<55} {_human_size(r.size_bytes):>10}  {r.storage:<20}  {r.node:<15}")
+        print()
+
+    # Unknown
+    unknowns = [r for r in disk_records if r.classification == "unknown"]
+    if unknowns:
+        print("UNKNOWN VOLUMES  [could not determine holder]")
+        for r in sorted(unknowns, key=lambda x: x.volid):
+            print(f"  {r.volid}")
+        print()
+
+    # Parker summary
+    if parker_records:
+        print("PARKER VMs")
+        print(f"  {'VMID':>7}  {'NODE':<15}  {'NAME':<30}  {'DISKS':>5}/{31}  {'EMPTY':>5}")
+        print(f"  {'-'*7}  {'-'*15}  {'-'*30}  {'-'*8}  {'-'*5}")
+        for pr in parker_records:
+            empty_flag = "YES" if pr.empty else ""
+            print(f"  {pr.vmid:>7}  {pr.node:<15}  {_trunc(pr.name, 30):<30}  {pr.disk_count:>5}/{31}  {empty_flag:>5}")
+        print()
+    else:
+        print("PARKER VMs: none found")
+        print()
+
+
+def print_json_report(
+    disk_records: list[DiskRecord],
+    parker_records: list[ParkerRecord],
+    cfg: AuditConfig,
+) -> None:
+    """Print a JSON report to stdout."""
+    out = {
+        "host": cfg.host,
+        "port": cfg.port,
+        "disk_band": [cfg.disk_vmid_start, cfg.disk_vmid_end],
+        "parker_band": [cfg.parker_vmid_start, cfg.parker_vmid_end],
+        "summary": {
+            "total": len(disk_records),
+            "attached": sum(1 for r in disk_records if r.classification == "attached"),
+            "parked": sum(1 for r in disk_records if r.classification == "parked"),
+            "free_floating": sum(1 for r in disk_records if r.classification == "free-floating"),
+            "unknown": sum(1 for r in disk_records if r.classification == "unknown"),
+        },
+        "disks": [r.to_dict() for r in sorted(disk_records, key=lambda x: x.volid)],
+        "parkers": [pr.to_dict() for pr in parker_records],
+    }
+    print(json.dumps(out, indent=2))
+
+
+# ---------------------------------------------------------------------------
+# Warnings
+# ---------------------------------------------------------------------------
+
+def emit_warnings(
+    disk_records: list[DiskRecord],
+    parker_records: list[ParkerRecord],
+    cfg: AuditConfig,
+) -> None:
+    """Emit advisory warnings to stderr."""
+    parked_count = sum(1 for r in disk_records if r.classification == "parked")
+
+    # Warn when parked disks exist but strategy is not "parked"
+    strategy = cfg.detached_disk_strategy
+    if parked_count > 0 and strategy not in ("parked",):
+        _warn(
+            f"{parked_count} parked disk(s) found but detached_disk_strategy="
+            f"{strategy!r} (expected 'parked'). "
+            "These disks may not be managed by the parker lifecycle."
+        )
+
+    # Warn about empty parkers (teardown candidates)
+    empty_parkers = [pr for pr in parker_records if pr.empty]
+    for pr in empty_parkers:
+        _warn(
+            f"parker VM {pr.vmid} ({pr.name}) on node {pr.node} is empty "
+            "(0 disks) — teardown candidate: "
+            f"qm destroy {pr.vmid} --purge"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
+
+def _warn(msg: str) -> None:
+    print(f"WARN: {msg}", file=sys.stderr)
+
+
+def _die(msg: str) -> None:
+    print(f"ERROR: {msg}", file=sys.stderr)
+    sys.exit(2)
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main(argv: "list[str] | None" = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="disk-audit",
+        description="Audit BOSH persistent disk volumes managed by the PVE CPI.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--config",
+        required=True,
+        metavar="PATH",
+        help="Path to a CPI-config-style JSON file (host/user/api_token or password + optional ranges).",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        default=False,
+        help="Emit machine-readable JSON to stdout instead of a human table.",
+    )
+    args = parser.parse_args(argv)
+
+    cfg = load_config(args.config)
+
+    try:
+        client = PVEClient(cfg)
+        disk_records, parker_records = collect_inventory(client, cfg)
+    except SystemExit:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        _die(f"inventory collection failed: {exc}")
+
+    emit_warnings(disk_records, parker_records, cfg)
+
+    if args.json:
+        print_json_report(disk_records, parker_records, cfg)
+    else:
+        print_human_report(disk_records, parker_records, cfg)
+
+    free_floating = [r for r in disk_records if r.classification == "free-floating"]
+    if free_floating:
+        print(
+            f"EXIT 1: {len(free_floating)} free-floating disk(s) found.",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
