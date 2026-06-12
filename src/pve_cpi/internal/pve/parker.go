@@ -843,7 +843,7 @@ func ParkDisk(ctx context.Context, c Client, logger *log.Logger, node, bareVolid
 // from ParkDisk so the EnsureFreshParker overflow path stays out of the
 // idempotency pre-check.
 //
-// Capacity reuse (D-07): it lists every parker on node in ascending VMID order
+// Capacity reuse: it lists every parker on node in ascending VMID order
 // and attaches to the FIRST parker with a free slot. A fresh parker is created
 // only when all existing parkers are full (or none exist). This prevents the
 // parker-per-disk leak where each overflow disk would otherwise spawn a new

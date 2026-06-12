@@ -510,7 +510,7 @@ func TestBuildLightStemcellCID(t *testing.T) {
 	}
 }
 
-// ---- Template-stemcell CID helpers (D-01) ----
+// ---- Template-stemcell CID helpers ----
 
 // TestBuildTemplateStemcellCID verifies the canonical encoding.
 func TestBuildTemplateStemcellCID(t *testing.T) {

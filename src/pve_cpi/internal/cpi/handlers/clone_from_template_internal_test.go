@@ -587,43 +587,43 @@ func TestCloneFromTemplate_CrossNode_SharedStorage_SetsTarget(t *testing.T) {
 
 // TestCloneFromTemplate_CrossNode_LocalStorage_Error verifies that when
 // templateNode != shape.node and storage is local (non-shared) in a multi-node
-// cluster, cloneFromTemplate returns a D-06 violation error and does NOT call
+// cluster, cloneFromTemplate returns a cross-node local-storage violation error and does NOT call
 // CreateQemuClone.
 func TestCloneFromTemplate_CrossNode_LocalStorage_Error(t *testing.T) {
 	t.Parallel()
 	n := &cloneNodes{}
 	// Multi-node cluster, dir storage (local, non-shared) — template on "pve01",
-	// VM wanted on "pve02". This violates D-06.
+	// VM wanted on "pve02". This violates the cross-node local-storage constraint.
 	// shape.node = "pve02" = cloudPropsNode passed to ValidateTemplateCloneStorage.
 	// ValidateTemplateCloneStorage sees: multi-node + local + cloudPropsNode != "" → ACCEPT.
-	// Wait — D-06 rule 3 says: multi-node + local + pinned → ACCEPT, returns cloudPropsNode.
+	// Note: multi-node + local + pinned → ACCEPT, returns cloudPropsNode.
 	// But then templateNode ("pve01") != shape.node ("pve02") → we would try to set Target
 	// on local storage — PVE rejects this.
 	//
-	// The real D-06 violation is: local storage, template on node A, VM wanted on node B,
+	// The real violation is: local storage, template on node A, VM wanted on node B,
 	// they cannot match. ValidateTemplateCloneStorage with cloudPropsNode="pve02" returns
 	// success (rule 3), but templateNode != shape.node AND storage is local.
 	// In that case we must return an error — PVE cannot cross-node clone local storage.
 	//
-	// The correct D-06 enforcement: after ValidateTemplateCloneStorage, if templateNode !=
+	// The correct enforcement: after ValidateTemplateCloneStorage, if templateNode !=
 	// shape.node AND storage IsShared() == false → return error (cannot cross-node clone).
 	// This is stricter than what ValidateTemplateCloneStorage alone checks.
 	//
 	// Note: the shape.node IS set (pve02) so ValidateTemplateCloneStorage rule 3 accepts.
-	// The Target= branch then checks: shared? If not → error. This enforces D-06.
+	// The Target= branch then checks: shared? If not → error. This enforces the constraint.
 	deps := buildCloneDepsWithTopology(n, "auto", "local", "dir", 2, false)
 	shape := buildCloneShapeWithNode("local", "dir", "qcow2", "pve02")
 
 	err := cloneFromTemplate(context.Background(), deps, log.NewNopLogger(), shape, 302, "vm-302", "pve01", 6102)
 	if err == nil {
-		t.Fatal("cross-node+local: expected D-06 error, got nil")
+		t.Fatal("cross-node+local: expected cross-node local-storage error, got nil")
 	}
 	// Error must be actionable: mention local/cross-node constraint.
 	if !strings.Contains(err.Error(), "local") && !strings.Contains(err.Error(), "node") {
 		t.Errorf("cross-node+local: error lacks actionable context: %v", err)
 	}
 	if len(n.calls) != 0 {
-		t.Errorf("cross-node+local: CreateQemuClone must not be called on D-06 violation, got %d calls", len(n.calls))
+		t.Errorf("cross-node+local: CreateQemuClone must not be called on cross-node local-storage violation, got %d calls", len(n.calls))
 	}
 }
 

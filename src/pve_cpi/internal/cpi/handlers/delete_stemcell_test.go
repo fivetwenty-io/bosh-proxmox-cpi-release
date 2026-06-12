@@ -717,7 +717,7 @@ func TestDeleteStemcell_LightCID_Regression_TemplateRouteNotTriggered(t *testing
 }
 
 // ============================================================
-// Tests: sha-sweep (D-03 — always cross-node)
+// Tests: sha-sweep (always cross-node)
 // ============================================================
 
 // buildDeleteStemcellDepsWithCluster constructs Deps for sha-sweep and
@@ -920,7 +920,7 @@ func TestDeleteStemcell_ShaSwep_BestEffort(t *testing.T) {
 }
 
 // ============================================================
-// Tests: orphan prune (D-04 — opt-in director-scoped)
+// Tests: orphan prune (opt-in director-scoped)
 // ============================================================
 
 // TestDeleteStemcell_OrphanPrune_Disabled verifies no prune ListResources call

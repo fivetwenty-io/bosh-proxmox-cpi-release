@@ -362,7 +362,7 @@ func (s *wbMockStorage) DeleteVolumeIfExists(_ context.Context, _, _, _ string) 
 
 // TestHandleCreateStemcell_LightFetch_HappyPath verifies the full fetch success
 // path: mock Source returns fixed body, dedup misses (empty storage), upload
-// records the canonical filename, CID is "template:<vmid>" (D-11).
+// records the canonical filename, CID is "template:<vmid>".
 func TestHandleCreateStemcell_LightFetch_HappyPath(t *testing.T) {
 	t.Parallel()
 
@@ -410,7 +410,7 @@ func TestHandleCreateStemcell_LightFetch_HappyPath(t *testing.T) {
 	if !ok {
 		t.Fatalf("result is %T; want string", result)
 	}
-	// D-11: result is always "template:<vmid>" now.
+	// Result is always "template:<vmid>" now.
 	if !pve.IsTemplateStemcellCID(cid) {
 		t.Errorf("CID = %q; want template:<vmid> format", cid)
 	}
@@ -421,7 +421,7 @@ func TestHandleCreateStemcell_LightFetch_HappyPath(t *testing.T) {
 
 // TestHandleCreateStemcell_LightFetch_DedupBySHA verifies that when the exact
 // SHA-matched filename already exists on storage, no upload occurs and the
-// returned CID is "template:<vmid>" (template built from existing qcow2, D-11).
+// returned CID is "template:<vmid>" (template built from existing qcow2).
 func TestHandleCreateStemcell_LightFetch_DedupBySHA(t *testing.T) {
 	t.Parallel()
 
@@ -467,7 +467,7 @@ func TestHandleCreateStemcell_LightFetch_DedupBySHA(t *testing.T) {
 	if !ok {
 		t.Fatalf("result is %T; want string", result)
 	}
-	// D-11: SHA-dedup hit → build template from existing qcow2 → "template:<vmid>".
+	// SHA-dedup hit → build template from existing qcow2 → "template:<vmid>".
 	if !pve.IsTemplateStemcellCID(cid) {
 		t.Errorf("CID = %q; want template:<vmid> format", cid)
 	}
@@ -982,7 +982,7 @@ func TestEnsureTemplateVM_CpiOwnsSourceFalse_SourceNotDeleted(t *testing.T) {
 	}
 }
 
-// TestEnsureTemplateVM_DeleteFailsBestEffort_VmidStillReturned verifies the D-09
+// TestEnsureTemplateVM_DeleteFailsBestEffort_VmidStillReturned verifies the
 // best-effort deletion contract: when Storage().DeleteVolumeIfExists fails (e.g.
 // network timeout), the function logs a warning but returns the vmid without error.
 func TestEnsureTemplateVM_DeleteFailsBestEffort_VmidStillReturned(t *testing.T) {

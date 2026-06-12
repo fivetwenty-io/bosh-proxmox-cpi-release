@@ -20,7 +20,7 @@ const resourceTypeNode = "node"
 
 // vmResources maps BOSH vm_resources hint fields.
 // All values are integers: cpu in cores, ram in MiB, ephemeral_disk_size in MiB.
-// Storage, when non-empty, overrides deps.Config.VMStorage for this call only (D6-B).
+// Storage, when non-empty, overrides deps.Config.VMStorage for this call only.
 type vmResources struct {
 	CPU               int    `json:"cpu"`
 	RAM               int    `json:"ram"`
