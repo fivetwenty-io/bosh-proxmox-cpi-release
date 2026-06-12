@@ -111,6 +111,11 @@ type stemcellCloudProps struct {
 	// Node pins light-stemcell placement to a specific cluster node.
 	// Used when stemcell storage is local-dir and multi-node placement matters.
 	Node string
+	// SourceURL is a remote URL for PVE server-side download via the
+	// download-url storage API. When set, PVE streams the image directly into
+	// storage without the CPI transferring bytes. Requires PVE 7.2+.
+	// Mutually exclusive with ImageID and ImageURL.
+	SourceURL string
 
 	// ExpectedSHA256 is the expected SHA-256 hex digest from cloud_properties.sha256.
 	// When non-empty the CPI verifies the computed digest matches after
@@ -123,33 +128,48 @@ type stemcellCloudProps struct {
 	ExpectedSHA1 string
 }
 
-// validateLightMutex returns an error when both ImageID and ImageURL are set.
-// The two fields are mutually exclusive: ImageID points to an already-uploaded
-// volume; ImageURL triggers a fetch. Supplying both is an operator error.
+// validateLightMutex returns an error when more than one of ImageID, ImageURL,
+// or SourceURL are set simultaneously. Each identifies a different upload
+// mechanism; combining them is an operator error.
 func (p stemcellCloudProps) validateLightMutex() error {
-	if p.ImageID != "" && p.ImageURL != "" {
+	set := 0
+	if p.ImageID != "" {
+		set++
+	}
+	if p.ImageURL != "" {
+		set++
+	}
+	if p.SourceURL != "" {
+		set++
+	}
+	if set > 1 {
 		return cpierrors.Cloud(
-			"create_stemcell: cloud_properties.image_id and cloud_properties.image_url are mutually exclusive")
+			"create_stemcell: cloud_properties.image_id, cloud_properties.image_url, and " +
+				"cloud_properties.source_url are mutually exclusive; set at most one")
 	}
 	return nil
 }
 
 // IsLight reports whether the stemcell is a light stemcell (no local tarball
-// required). True when either ImageID or ImageURL is set.
+// required). True when ImageID, ImageURL, or SourceURL is set.
 func (p stemcellCloudProps) IsLight() bool {
-	return p.ImageID != "" || p.ImageURL != ""
+	return p.ImageID != "" || p.ImageURL != "" || p.SourceURL != ""
 }
 
 // LightMode returns the light-stemcell variant string:
-//   - "preuploaded" when ImageID is set (operator pre-placed volume)
-//   - "fetch"       when ImageURL is set (CPI fetches from remote URL)
-//   - ""            when neither is set (heavy stemcell, normal tarball upload)
+//   - "preuploaded"      when ImageID is set (operator pre-placed volume)
+//   - "fetch"            when ImageURL is set (CPI fetches from remote URL)
+//   - "server-download"  when SourceURL is set (PVE downloads server-side)
+//   - ""                 when none is set (heavy stemcell, normal tarball upload)
 func (p stemcellCloudProps) LightMode() string {
 	if p.ImageID != "" {
 		return "preuploaded"
 	}
 	if p.ImageURL != "" {
 		return "fetch"
+	}
+	if p.SourceURL != "" {
+		return "server-download"
 	}
 	return ""
 }
@@ -211,6 +231,9 @@ func parseStemcellCloudProps(cp map[string]any) stemcellCloudProps {
 	}
 	if v, ok := cp["sha1"].(string); ok {
 		p.ExpectedSHA1 = v
+	}
+	if v, ok := cp["source_url"].(string); ok {
+		p.SourceURL = v
 	}
 
 	return p
@@ -443,6 +466,8 @@ func HandleCreateStemcell(deps Deps) cpi.Handler {
 			return handleLightStemcellPreUploaded(ctx, deps, cp)
 		case "fetch":
 			return handleLightStemcellFetch(ctx, deps, cp)
+		case "server-download":
+			return handleStemcellDownloadURL(ctx, deps, cp)
 		}
 
 		// Steps 4-5: Resolve target node+storage and validate shared constraint.

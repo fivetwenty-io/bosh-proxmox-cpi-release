@@ -2305,7 +2305,7 @@ Enforcement rules:
 Residual scope: parked-disk parker-VM reuse and stemcell template replication choose their
 storage independently of the encrypted filter (out of scope for this feature).
 
-#### 7.50 OPEN — Stemcell creation from URL with checksum
+#### 7.50 SHIPPED — Stemcell creation from URL with checksum
 
 *References: Google.* The Google CPI accepts a `source_url` plus `raw_disk_sha1` in
 `create_stemcell` and hands both to the image-import API for server-side integrity
@@ -2314,15 +2314,25 @@ that does the same: it streams an image directly into a pool and reports a check
 Publishing stemcells as HTTP artifacts rather than transferring tarballs through BOSH cuts
 create-env time on slow links.
 
-**Build:** detect a `source_url` in `create_stemcell` cloud_properties and call
-`pvesh POST /nodes/{node}/storage/{pool}/download-url` to stream the image into storage.
-Verify the SHA256 reported in the task output against the supplied checksum, failing the call
-on mismatch, and return the storage volid as the stemcell CID.
+**Shipped:** `create_stemcell` cloud_properties gain `source_url` (string) and `sha256`
+(string). When `source_url` is set, `handleStemcellDownloadURL` is dispatched: the CPI
+calls `POST /nodes/{node}/storage/{storage}/download-url` via
+`Nodes().CreateStorageDownloadUrl` with `Content="import"` and the canonical qcow2
+filename derived from `name`, `version`, and `sha256`. When `sha256` is also set, the
+`Checksum` and `ChecksumAlgorithm="sha256"` params are forwarded so PVE verifies the image
+server-side; a task failure (including checksum mismatch) is returned as a non-retriable
+cloud error. The returned UPID is awaited via the existing `AwaitTask` plumbing. After
+the task succeeds the downloaded volume is located by exact filename lookup with a prefix
+scan fallback (to handle PVE filename normalization). All downstream steps — template VM
+creation via `ensureTemplateVM`, freeze, provenance notes and tags, pool assignment, and
+replica distribution — run identically to the existing upload paths; the returned CID is
+always `"template:<vmid>"`. When `source_url` is absent the existing flow is byte-identical.
 
-**Limits.** The URL must be reachable from the PVE node, not merely from the director or the
-CPI host, which is a different network position. The download-URL API requires PVE 7.2 or
-later, so the path must fall back to the existing upload flow on older clusters. Tier:
-deployment.
+**Limits.** The URL must be reachable from the PVE node, not from the CPI host; operators
+must ensure network access from the PVE node to the image host. Requires PVE 7.2+. Task
+output checksum field shape not yet verified on a live cluster; the non-retriable error is
+derived from task failure status rather than parsing a checksum field (live PVE validation
+pending). Tier: deployment.
 
 #### 7.51 SHIPPED — Per-operation timing metrics
 
