@@ -169,6 +169,15 @@ type createVMCloudProps struct {
 	// these entries are purely custom. set_vm_metadata preserves them
 	// across re-syncs.
 	Tags map[string]string `json:"tags"`
+	// PVEConfig is an optional map of PVE VM config key=value pairs applied
+	// post-clone via a single UpdateQemuConfig call. Only keys in the
+	// allowlist (machine, bios, cpu) are accepted; CPI-managed keys (cores,
+	// memory, sockets, netN, scsiN, ideN, virtioN, boot, name, tags,
+	// hotplug, numa, smbios1, agent, onboot, tablet, vmgenid, description,
+	// ostype) and "args" are rejected non-retriable. Values containing shell
+	// metacharacters (;&|$`<>) are also rejected. Nil or empty map = no API
+	// call (byte-identical to prior behavior).
+	PVEConfig map[string]string `json:"pve_config,omitempty"`
 	// AvailabilityZone restricts node-scoring to the nodes declared in
 	// config.placement.az_map[availability_zone]. When set and the AZ key
 	// is absent from the map, create_vm returns a CloudError (operator
@@ -833,6 +842,11 @@ func parseCreateVMArgs(args []json.RawMessage) (*createVMParsedArgs, error) {
 	var cloudProps createVMCloudProps
 	if err := json.Unmarshal(args[2], &cloudProps); err != nil {
 		return nil, cpierrors.Cloud("create_vm: parse cloud_properties: %s", err.Error())
+	}
+	// Validate pve_config before any VM is created. A bad key or value is a
+	// manifest error that must surface pre-clone so no orphan VM is produced.
+	if err := validatePVEConfig(cloudProps.PVEConfig); err != nil {
+		return nil, err
 	}
 
 	// Also decode into a raw map so the layered resolver can access keys not
@@ -2725,7 +2739,9 @@ func attemptCreateVM(
 			log.Int64("template_vmid", effectiveTemplateVMID),
 			log.String("template_node", effectiveTemplateNode),
 		)
-		return nil
+		// Apply operator pve_config passthrough after clone config is set.
+		// pve_config was pre-validated in parseCreateVMArgs; cleanup on API fault.
+		return applyPVEConfigWithCleanup(ctx, deps, shape.node, candidate, parsed.cloudProps.PVEConfig, logger)
 	}
 
 	// --- Old-form CID: opportunistic template lookup before import-from ---
@@ -2770,7 +2786,9 @@ func attemptCreateVM(
 				log.Int64("template_vmid", templateVMID),
 				log.String("template_node", templateNode),
 			)
-			return nil
+			// Apply operator pve_config passthrough after clone config is set.
+			// pve_config was pre-validated in parseCreateVMArgs; cleanup on API fault.
+			return applyPVEConfigWithCleanup(ctx, deps, shape.node, candidate, parsed.cloudProps.PVEConfig, logger)
 		}
 		// !found → fall through to import-from below.
 	}
@@ -2823,7 +2841,9 @@ func attemptCreateVM(
 		log.Int("vmid_attempted", candidate),
 		log.String("upid", upid),
 	)
-	return nil
+	// Apply operator pve_config passthrough after import completes.
+	// pve_config was pre-validated in parseCreateVMArgs; cleanup on API fault.
+	return applyPVEConfigWithCleanup(ctx, deps, shape.node, candidate, parsed.cloudProps.PVEConfig, logger)
 }
 
 // handleCloneError classifies a cloneFromTemplate error and logs appropriately.

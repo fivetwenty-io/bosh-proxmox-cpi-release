@@ -2151,7 +2151,7 @@ any other process can reference the template VMID.
 strong as the CPI's own locking discipline; a write that bypasses the merge path still
 clobbers. Tier: correctness.
 
-#### 7.45 OPEN — Generic allowlisted VM config passthrough
+#### 7.45 SHIPPED — Generic allowlisted VM config passthrough
 
 *References: vSphere.* The vSphere CPI merges a global and per-`vm_type` `vmx_options` hash
 into the VM's extra-config, letting operators inject arbitrary low-level settings — for
@@ -2167,6 +2167,18 @@ subset of `args` — to keep the escape hatch from becoming a foot-gun.
 **Limits.** A passthrough surface is only as safe as its allowlist; an over-broad list lets
 operators write configurations the CPI cannot reason about or roll back. Raw `args` in
 particular can break migration and snapshot assumptions. Tier: deployment.
+
+**Shipped:** `pve_config map[string]string` in `vm_type` cloud_properties applies allowlisted
+PVE keys (`machine`, `bios`, `cpu`) post-clone in one `UpdateQemuConfig` call. Validation
+runs at argument-parse time (before any VM is created): invalid input produces a non-retriable
+error with no orphan VM. CPI-managed keys (`cores`, `memory`, `sockets`, `netN`, `scsiN`,
+`ideN`, `virtioN`, `boot`, `name`, `tags`, `hotplug`, `numa`, `smbios1`, `agent`, `onboot`,
+`tablet`, `vmgenid`, `description`, `ostype`) and `args` (execution surface) are rejected at
+that point. Note: `numa` is owned by the hotplug/NUMA resolver and is therefore CPI-managed.
+Empty values and values containing shell metacharacters (`;&|$\`<>`) are also rejected
+pre-clone. If the post-clone API call fails (transient PVE fault), the candidate VM is
+destroyed before the error propagates, matching the cleanup contract of sibling error paths
+in the same function. Nil or empty map is byte-identical to prior behavior.
 
 #### 7.46 SHIPPED — CPU and RAM hotplug capability flag
 
