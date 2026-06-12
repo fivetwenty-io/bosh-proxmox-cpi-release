@@ -635,6 +635,24 @@ properties:
       CPI methods that trigger the command. Empty (default) runs it on create_vm
       and delete_vm.
     default: []
+  pve.metrics.enabled:
+    description: |
+      When true, the CPI appends one JSON-line sample per RPC to the file at
+      pve.metrics.file_path. Each line carries: ts (RFC3339Nano), method,
+      duration_ms, outcome (ok|error), and request_id. duration_ms covers
+      handler execution; post-call work by other configured hooks is not
+      included. Write failures are
+      logged at Warn level and never fail the CPI call. Default false; the
+      hook is not registered when false and adds zero dispatch-path overhead.
+    default: false
+  pve.metrics.file_path:
+    description: |
+      Absolute path of the metrics file. Required when pve.metrics.enabled is
+      true. The CPI opens, appends, and closes the file per call (atomic line
+      append, no file descriptor held between calls). The file is created if
+      absent. The containing directory must exist and be writable by the CPI
+      process.
+    default: ""
   pve.debug.keep_failed_vms:
     description: |
       Diagnostic mode. When true, a VM that fails mid-creation is NOT destroyed.

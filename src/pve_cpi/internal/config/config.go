@@ -719,6 +719,19 @@ type CPIConfig struct {
 	// distinguishable from an explicit false. Use EncryptedEnabled() for the
 	// effective bool. validate-only-when-set; omit from ERB when nil.
 	Encrypted *bool `json:"encrypted,omitempty"`
+
+	// Metrics holds the opt-in per-RPC metrics file configuration. When nil (the
+	// default), or when Enabled is false, the MetricsHook is never registered and
+	// adds no dispatch-path overhead — byte-identical to prior releases. When
+	// Enabled is true, each CPI RPC appends one JSON-line sample (ts, method,
+	// duration_ms, outcome, request_id) to FilePath. Write failures are logged at
+	// Warn level and never fail the CPI call. FilePath is required when Enabled is
+	// true; config validation fails with a clear error when absent.
+	// The config struct lives in internal/cpi/hooks (not here) to avoid the
+	// import cycle: this package already imports internal/cpi/hooks for hook-name
+	// validation, so this package must not import a type that would cause hooks to
+	// import back here. validate-only-when-set; omit from ERB when nil/disabled.
+	Metrics *hooks.MetricsConfig `json:"metrics,omitempty"`
 }
 
 // TypeProfile is a named bundle of default cloud_properties applied by the
@@ -2067,6 +2080,15 @@ func (c *CPIConfig) ExternalCommandConfig() *hooks.ExternalCommandConfig {
 	return c.ExternalCommand
 }
 
+// MetricsConfig returns the metrics hook configuration, or nil when no block
+// is set or Enabled is false.
+func (c *CPIConfig) MetricsConfig() *hooks.MetricsConfig {
+	if c == nil || c.Metrics == nil || !c.Metrics.Enabled {
+		return nil
+	}
+	return c.Metrics
+}
+
 // HealthCheckEnabled reports whether the post-create agent ping loop is active.
 // Returns false when HealthCheck is nil, Enabled is nil, or Enabled is *false.
 // Only an explicit *true returns true.
@@ -2428,6 +2450,7 @@ func (c *CPIConfig) ValidateWithLogger(logger *log.Logger) error {
 	c.validateRegistryConfig(&errs, logger)
 	c.validatePlacement(&errs)
 	c.validateHooks(&errs)
+	c.validateMetrics(&errs)
 	c.validateHealthCheck(&errs)
 	c.validateRetry(&errs)
 	c.validateOperationTimeout(&errs)
@@ -3166,6 +3189,18 @@ func (c *CPIConfig) validateExternalCommand(errs *[]string) {
 	}
 	if !inAllowlist {
 		*errs = append(*errs, fmt.Sprintf("external_command.command %q must be a member of external_command.allowlist", ec.Command))
+	}
+}
+
+// validateMetrics enforces that when metrics is present and enabled,
+// file_path is a non-empty string. When metrics is absent or disabled, this
+// is a no-op (validate-only-when-set).
+func (c *CPIConfig) validateMetrics(errs *[]string) {
+	if c.Metrics == nil || !c.Metrics.Enabled {
+		return
+	}
+	if strings.TrimSpace(c.Metrics.FilePath) == "" {
+		*errs = append(*errs, "metrics.file_path is required when metrics.enabled is true")
 	}
 }
 

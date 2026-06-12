@@ -177,6 +177,7 @@ func runWithArgs(args []string, stdin io.Reader, stdout, stderr io.Writer, opts 
 		LBRegister:      cfg.LBRegisterConfig(),
 		ExternalCommand: cfg.ExternalCommandConfig(),
 		Annotator:       handlers.NewVMAnnotator(handlers.Deps{Config: cfg, PVE: client, Logger: logger}),
+		Metrics:         cfg.MetricsConfig(),
 	}
 	var hookChain []cpi.Hook
 	for _, name := range cfg.HooksValue() {
@@ -186,6 +187,18 @@ func runWithArgs(args []string, stdin io.Reader, stdout, stderr io.Writer, opts 
 			return 1
 		}
 		hookChain = append(hookChain, ctor(hookDeps))
+	}
+	// Metrics hook is registered outside the named-hooks list: it is controlled
+	// via a dedicated pve.metrics block rather than pve.hooks, so it is always
+	// active when enabled regardless of hook ordering.
+	if cfg.MetricsConfig() != nil {
+		mh, mhErr := hooks.NewMetricsHook(hookDeps)
+		if mhErr != nil {
+			logger.Error("metrics hook init failed", log.Err(mhErr))
+			return 1
+		}
+		hookChain = append(hookChain, mh)
+		logger.Info("metrics hook enabled", log.String("path", cfg.MetricsConfig().FilePath))
 	}
 
 	// Apply the operator's task-poll cadence process-wide before serving. With

@@ -462,6 +462,17 @@
   external_command["methods"] = ec_methods unless ec_methods.nil? || ec_methods.empty?
   config["external_command"] = external_command unless external_command.empty?
 
+  # Emit metrics block only when metrics.enabled is explicitly true. Absent
+  # (default false) means the MetricsHook is never registered — byte-identical
+  # to prior releases and zero dispatch-path overhead.
+  if p("pve.metrics.enabled", false)
+    metrics = {}
+    metrics["enabled"] = true
+    metrics_path = p("pve.metrics.file_path", "")
+    metrics["file_path"] = metrics_path unless metrics_path.to_s.empty?
+    config["metrics"] = metrics
+  end
+
   # Emit debug block only when a diagnostic mode is turned on. Absent (default)
   # means the Go nil *DebugConfig leaves all diagnostic modes off —
   # byte-identical to prior releases.

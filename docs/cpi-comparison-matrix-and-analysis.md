@@ -2324,7 +2324,7 @@ CPI host, which is a different network position. The download-URL API requires P
 later, so the path must fall back to the existing upload flow on older clusters. Tier:
 deployment.
 
-#### 7.51 OPEN — Per-operation timing metrics
+#### 7.51 SHIPPED — Per-operation timing metrics
 
 *References: Azure.* The Azure CPI ships opt-in telemetry: it forks a background process that
 reports each operation's duration and success or failure to the platform fabric. No other
@@ -2339,6 +2339,8 @@ default path allocates nothing.
 **Limits.** PVE offers no fabric telemetry endpoint analogous to Azure's wireserver, so the
 sink must be operator-provided. A single-shot per-RPC process cannot aggregate; it can only
 emit one sample per invocation, leaving rollup to the collector. Tier: hardening.
+
+**Shipped:** opt-in `MetricsHook` controlled by `pve.metrics.enabled` and `pve.metrics.file_path`. When enabled, the hook appends one JSON-line sample per CPI RPC — fields `ts` (RFC3339Nano), `method`, `duration_ms`, `outcome` (ok|error), `request_id` — via open-append-close atomic writes. `duration_ms` measures handler execution; post-call work by other configured hooks is excluded. Write failures are logged at Warn level and never fail the RPC. When disabled (the default), the hook is not registered and adds zero dispatch-path overhead; config output is byte-identical.
 
 #### 7.52 SHIPPED — Configurable User-Agent and operator tag on PVE API calls
 

@@ -29,6 +29,12 @@ type Deps struct {
 	// adapter in internal/cpi/handlers that decodes the VM CID and resolves the
 	// node via the PVE API. Nil disables Notes writing (hook logs and no-ops).
 	Annotator VMAnnotator
+
+	// Metrics configures the metrics hook. Nil when the operator did not supply
+	// a metrics block or Enabled is false. MetricsConfig lives in this package
+	// (not internal/config) to avoid the import cycle: internal/config imports
+	// this package for hook-name validation.
+	Metrics *MetricsConfig
 }
 
 // LBRegisterConfig holds the HAProxy Data Plane API target for the lb_register
