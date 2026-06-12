@@ -525,6 +525,60 @@ func TestHandleCreateVM_HappyPath(t *testing.T) {
 	}
 }
 
+// TestHandleCreateVM_BoshCPITag verifies that every create_vm call stamps the
+// "bosh-cpi" ownership tag on the PVE VM regardless of cloud_properties.tags
+// content. The tag must appear in the QEMU.Create params["tags"] field.
+func TestHandleCreateVM_BoshCPITag(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name       string
+		customTags map[string]any
+	}{
+		{"no_custom_tags", map[string]any{}},
+		{"with_custom_tags", map[string]any{"tags": map[string]any{"env": "prod", "team": "platform"}}},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			q := &vmMockQEMU{}
+			n := &vmMockNodes{}
+			c := &vmMockCluster{}
+			a := &vmMockAgent{}
+			h := handlers.HandleCreateVM(buildVMDeps(q, n, c, a))
+
+			cp := map[string]any{"cores": 2, "memory": 1024}
+			for k, v := range tc.customTags {
+				cp[k] = v
+			}
+			args := mkArgs("agent-uuid-tag-test", testStemcellCID,
+				cp,
+				map[string]any{"default": map[string]any{
+					"type": "manual", "ip": "10.0.0.5",
+					"netmask": "255.255.255.0", "gateway": "10.0.0.1",
+					"dns": []string{"8.8.8.8"}, "default": []string{"dns", "gateway"},
+					"cloud_properties": map[string]any{"bridge": "vmbr0"},
+				}},
+				[]string{}, map[string]any{})
+
+			_, err := h.Handle(context.Background(), args, mkCtx("tag-test-"+tc.name))
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if len(q.createCalls) != 1 {
+				t.Fatalf("expected 1 QEMU.Create call, got %d", len(q.createCalls))
+			}
+			tagsVal, _ := q.createCalls[0].params["tags"].(string)
+			if !strings.Contains(tagsVal, "bosh-cpi") {
+				t.Errorf("create params tags = %q; must contain \"bosh-cpi\"", tagsVal)
+			}
+		})
+	}
+}
+
 // TestHandleCreateVM_VMIDAllocFail verifies cluster API failure propagates.
 func TestHandleCreateVM_VMIDAllocFail(t *testing.T) {
 	t.Parallel()

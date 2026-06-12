@@ -440,6 +440,60 @@ func TestCreateStemcell_HappyPath_NewFlow(t *testing.T) {
 	}
 }
 
+// TestCreateStemcell_BoshCPITag verifies that the "bosh-cpi" ownership tag is
+// present in the QEMU.Create params["tags"] field on every successful
+// create_stemcell call, regardless of other stemcell cloud_properties.
+func TestCreateStemcell_BoshCPITag(t *testing.T) {
+	t.Parallel()
+
+	imgPath := tempImageFile(t)
+
+	var (
+		mu         sync.Mutex
+		createTags string
+	)
+
+	q := &stemcellMockQEMU{
+		createFn: func(_ context.Context, _ string, params map[string]any) (string, error) {
+			mu.Lock()
+			if v, ok := params["tags"].(string); ok {
+				createTags = v
+			}
+			mu.Unlock()
+			return "UPID:node1:create:ok", nil
+		},
+	}
+
+	storageSvc := &stemcellMockStorage{
+		uploadFn: func(_ context.Context, _, _, _, _ string, body io.Reader) (string, error) {
+			_, _ = io.Copy(io.Discard, body)
+			return "", nil
+		},
+	}
+
+	client := buildStemcellClient(q, &stemcellMockNodes{}, &stemcellMockTasks{}, &stemcellMockCluster{})
+	client.storageSvc = storageSvc
+
+	deps := makeDeps(client)
+	h := handlers.HandleCreateStemcell(deps)
+
+	cp := map[string]any{"name": "ubuntu-jammy", "version": "1.234", "disk_format": "qcow2"}
+	args := []json.RawMessage{marshalArg(t, imgPath), marshalArg(t, cp)}
+
+	_, err := h.Handle(context.Background(), args, jsonrpc.Context{RequestID: "req-bosh-cpi-tag"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	mu.Lock()
+	tags := createTags
+	mu.Unlock()
+
+	if !strings.Contains(tags, "bosh-cpi") {
+		t.Errorf("create_stemcell QEMU.Create tags = %q; must contain \"bosh-cpi\"", tags)
+	}
+}
+
 // TestCreateStemcell_Dedup_SameFilename verifies that when the qcow2 volume
 // already exists on storage AND a matching template VM already exists,
 // Upload is not called and the handler returns the existing template CID.

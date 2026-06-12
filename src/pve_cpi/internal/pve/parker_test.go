@@ -674,6 +674,9 @@ func TestEnsureParker_CreatesWhenNoneExist(t *testing.T) {
 	if !containsTag(tagsVal, pve.ParkerTag) {
 		t.Errorf("tags %q must contain %q", tagsVal, pve.ParkerTag)
 	}
+	if !containsTag(tagsVal, pve.CpiOwnershipTag) {
+		t.Errorf("tags %q must contain CpiOwnershipTag %q", tagsVal, pve.CpiOwnershipTag)
+	}
 	nameVal, _ := createdParams["name"].(string)
 	if nameVal == "" {
 		t.Error("name must be set")

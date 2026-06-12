@@ -175,6 +175,44 @@ func TestStripReservedBoshTags_Empty(t *testing.T) {
 	}
 }
 
+// TestStripReservedBoshTags_PreservesBoshCPI verifies that the "bosh-cpi"
+// ownership marker is NOT stripped by stripReservedBoshTags. The marker must
+// survive set_vm_metadata's tag-rebuild cycle so hand-made VMs remain
+// distinguishable from CPI-managed ones.
+func TestStripReservedBoshTags_PreservesBoshCPI(t *testing.T) {
+	t.Parallel()
+	in := []string{
+		"bosh-cpi",
+		"director--abc",
+		"deployment--cf",
+		"job--worker",
+		"index--0",
+	}
+	got := stripReservedBoshTags(in)
+	want := []string{"bosh-cpi"}
+	if !slices.Equal(got, want) {
+		t.Errorf("got %v, want %v", got, want)
+	}
+}
+
+// TestMergeTagList_BoshCPIDedup verifies that mergeTagList deduplicates
+// "bosh-cpi" when passed in both existing and additions slices.
+func TestMergeTagList_BoshCPIDedup(t *testing.T) {
+	t.Parallel()
+	got := mergeTagList([]string{"bosh-cpi"}, []string{"bosh-cpi", "env--prod"}, 0)
+	// "bosh-cpi" must appear exactly once.
+	parts := strings.Split(got, ";")
+	count := 0
+	for _, p := range parts {
+		if p == "bosh-cpi" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Errorf("mergeTagList with duplicate bosh-cpi: got %q, want exactly one occurrence", got)
+	}
+}
+
 func TestSanitizeVMName(t *testing.T) {
 	t.Parallel()
 	cases := []struct {

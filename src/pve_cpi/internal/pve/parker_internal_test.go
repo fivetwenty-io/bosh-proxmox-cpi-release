@@ -182,8 +182,10 @@ func TestBuildParkerTags_NoDirectorID(t *testing.T) {
 	t.Parallel()
 	cfg := ParkerConfig{VMIDRangeStart: 90000, VMIDRangeEnd: 90999}
 	got := buildParkerTags(cfg)
-	if got != "bosh-parker" {
-		t.Errorf("want %q, got %q", "bosh-parker", got)
+	// CpiOwnershipTag is always first; ParkerTag follows.
+	want := CpiOwnershipTag + ";bosh-parker"
+	if got != want {
+		t.Errorf("want %q, got %q", want, got)
 	}
 }
 
@@ -191,7 +193,7 @@ func TestBuildParkerTags_WithDirectorID(t *testing.T) {
 	t.Parallel()
 	cfg := ParkerConfig{VMIDRangeStart: 90000, VMIDRangeEnd: 90999, DirectorID: "my-director"}
 	got := buildParkerTags(cfg)
-	want := "bosh-parker;director--my-director"
+	want := CpiOwnershipTag + ";bosh-parker;director--my-director"
 	if got != want {
 		t.Errorf("want %q, got %q", want, got)
 	}
@@ -202,7 +204,7 @@ func TestBuildParkerTags_DirectorIDWithSpecialChars(t *testing.T) {
 	// Special chars stripped by sanitizeParkerTagValue.
 	cfg := ParkerConfig{VMIDRangeStart: 90000, VMIDRangeEnd: 90999, DirectorID: "my director!"}
 	got := buildParkerTags(cfg)
-	want := "bosh-parker;director--mydirector"
+	want := CpiOwnershipTag + ";bosh-parker;director--mydirector"
 	if got != want {
 		t.Errorf("want %q, got %q", want, got)
 	}
@@ -213,7 +215,9 @@ func TestBuildParkerTags_DirectorIDBecomesEmpty(t *testing.T) {
 	// DirectorID of only special chars sanitizes to ""; director tag omitted.
 	cfg := ParkerConfig{VMIDRangeStart: 90000, VMIDRangeEnd: 90999, DirectorID: "!!!"}
 	got := buildParkerTags(cfg)
-	if got != "bosh-parker" {
-		t.Errorf("want %q (director tag omitted), got %q", "bosh-parker", got)
+	// CpiOwnershipTag still present; director tag omitted.
+	want := CpiOwnershipTag + ";bosh-parker"
+	if got != want {
+		t.Errorf("want %q (director tag omitted), got %q", want, got)
 	}
 }

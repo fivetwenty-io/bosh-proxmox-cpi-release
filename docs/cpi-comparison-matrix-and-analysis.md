@@ -2287,7 +2287,7 @@ directors share a PVE cluster. When `operator_id` is unset, the header contains 
 space — byte-identical to prior releases. Both the regular and upload request paths in the
 SDK call `applyCustomHeaders`, so one `SetHeader` call covers all API traffic.
 
-#### 7.53 OPEN — Resource-ownership tagging
+#### 7.53 SHIPPED — Resource-ownership tagging
 
 *References: vSphere.* On `create_stemcell` the vSphere CPI registers a vCenter extension and
 sets `config.managed_by` on every CPI-created VM and template, so vCenter's Solution Manager
@@ -2295,14 +2295,17 @@ groups all BOSH-managed resources under one owner. PVE mixes BOSH VMs and templa
 user-created guests in the same node view, with no managed-by marker; §7.13 tags templates
 for provenance but VMs carry no general ownership signal.
 
-**Build:** tag every CPI-created VM and template with a fixed `bosh-cpi` (or
-`managed-by:bosh`) tag at create time, using PVE's native VM tags via
-`pvesh set /nodes/{node}/qemu/{vmid}/config tags=...`. Operators can then filter the UI and
-scope orphan GC by querying that tag, with no new API and a clean generalization of the §7.13
-template tagging.
+**Shipped:** the fixed `bosh-cpi` tag is stamped on every CPI-created VM (`create_vm`) and
+stemcell template (`create_stemcell`, primary and replicas) at creation time via
+`mergeTagList`/`UpdateQemuConfig`. The constant `ownershipTag = "bosh-cpi"` lives in
+`tags.go`; it is NOT in `reservedBoshTagPrefixes`, so `set_vm_metadata` preserves it across
+every metadata update. Operators can filter the PVE UI and `disk-audit` output by this tag to
+scope views to CPI-managed guests only. No new spec key or config toggle is needed — the tag
+is always-on and additive, writing one additional semicolon-delimited token alongside any
+operator-supplied tags.
 
 **Limits.** PVE tags are flat free-text labels, not a structured ownership object, so the tag
-is a convention the CPI must apply consistently rather than an enforced relationship, so a
+is a convention the CPI must apply consistently rather than an enforced relationship. A
 manually retagged VM silently breaks it. Tier: operability.
 
 #### 7.54 OPEN — Per-disk retain-on-delete (forensic ephemeral)

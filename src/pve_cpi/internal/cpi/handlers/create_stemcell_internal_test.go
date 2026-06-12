@@ -802,8 +802,9 @@ func TestEnsureTemplateVM_CreatePath_CpiOwnsSource(t *testing.T) {
 	if !freezeCalled {
 		t.Error("Nodes.CreateQemuTemplate (MakeTemplate) was not called")
 	}
-	// Verify sha tag in create params.
-	wantTag := "bosh-stemcell-sha-" + sha8
+	// Verify ownership + sha tags in create params. ownershipTag ("bosh-cpi")
+	// is always prepended; shaTag follows.
+	wantTag := ownershipTag + ";bosh-stemcell-sha-" + sha8
 	if tag, _ := createParams["tags"].(string); tag != wantTag {
 		t.Errorf("tags = %q; want %q", tag, wantTag)
 	}
@@ -995,7 +996,8 @@ func TestEnsureTemplateVM_SHATagFormat(t *testing.T) {
 	t.Parallel()
 
 	const fullSHA = "deadbeef11223344deadbeef11223344deadbeef11223344deadbeef11223344"
-	const wantTag = "bosh-stemcell-sha-deadbeef"
+	// ownershipTag ("bosh-cpi") is always prepended; shaTag follows.
+	const wantTag = ownershipTag + ";bosh-stemcell-sha-deadbeef"
 
 	var capturedTag string
 	qemu := &wbMockQEMU{
@@ -1450,10 +1452,12 @@ func TestAttemptCreateTemplateVM_ProvenanceOFF(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// tags must be exactly shaTag — no merging, no extra tokens.
+	// tags must be exactly "bosh-cpi;<shaTag>" — ownershipTag is always
+	// prepended; no other tokens when provenance is OFF.
+	wantTagsOFF := ownershipTag + ";" + shaTag
 	gotTags, _ := got.params["tags"].(string)
-	if gotTags != shaTag {
-		t.Errorf("tags = %q; want %q (byte-identical OFF path)", gotTags, shaTag)
+	if gotTags != wantTagsOFF {
+		t.Errorf("tags = %q; want %q (byte-identical OFF path)", gotTags, wantTagsOFF)
 	}
 
 	// description must be absent when provenance is off.
@@ -1489,9 +1493,11 @@ func TestAttemptCreateTemplateVM_ProvenanceON(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// tags must contain shaTag + marker + name + version + director tokens.
+	// tags must contain ownership marker + shaTag + stemcell marker + name +
+	// version + director tokens.
 	gotTags, _ := got.params["tags"].(string)
 	for _, wantToken := range []string{
+		ownershipTag,
 		shaTag,
 		stemcellMarkerTag,
 		stemcellNameTagPrefix + sanitizeTagValue(stemcellName),
@@ -1542,7 +1548,8 @@ func TestAttemptCreateTemplateVM_ReplicaProvenanceOFF(t *testing.T) {
 	const shaTag = stemcellSHATagPrefix + sha8
 	const replicaNode = "pve-node2"
 	nodeTag := pve.ReplicaNodeTagForNode(replicaNode)
-	wantTags := shaTag + ";" + nodeTag
+	// ownershipTag ("bosh-cpi") is always first; sha and node follow.
+	wantTags := ownershipTag + ";" + shaTag + ";" + nodeTag
 
 	deps, got := buildProvDeps(t, false, "")
 	cp := stemcellCloudProps{Name: "ubuntu-jammy", Version: "1.0"}
@@ -1592,8 +1599,9 @@ func TestAttemptCreateTemplateVM_ReplicaProvenanceON(t *testing.T) {
 	}
 
 	gotTags, _ := got.params["tags"].(string)
-	// sha, node, marker, name, version, director all present.
+	// ownership, sha, node, marker, name, version, director all present.
 	for _, wantToken := range []string{
+		ownershipTag,
 		shaTag,
 		nodeTag,
 		stemcellMarkerTag,

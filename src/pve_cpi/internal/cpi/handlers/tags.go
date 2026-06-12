@@ -5,6 +5,13 @@ import (
 	"strings"
 )
 
+// ownershipTag is the fixed CPI ownership marker stamped on every VM and
+// stemcell template created by this CPI. Operators can filter by this tag in
+// the PVE UI and scripts to distinguish CPI-managed guests from hand-made
+// ones. The tag is NOT in reservedBoshTagPrefixes, so set_vm_metadata
+// preserves it across every metadata update.
+const ownershipTag = "bosh-cpi"
+
 // reservedBoshTagPrefixes are the tag key prefixes the CPI owns and rewrites
 // on every set_vm_metadata call. Entries with these prefixes are stripped
 // from a stored PVE tag list before BOSH-managed values are re-applied, so a

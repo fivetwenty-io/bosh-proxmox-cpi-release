@@ -44,6 +44,12 @@ import (
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
 )
 
+// CpiOwnershipTag is the fixed ownership marker stamped on every VM and
+// template created by this CPI. It mirrors handlers.ownershipTag ("bosh-cpi")
+// and is defined here so the pve package (which cannot import handlers) can
+// apply the same marker to parker VMs without an import cycle.
+const CpiOwnershipTag = "bosh-cpi"
+
 // ParkerTag is the PVE tag applied to every parker VM. Downstream code
 // (set_disk_metadata, snapshot_disk, delete_vm) identifies parker VMs via
 // IsParkerVM, which requires both a VMID-range check and this tag.
@@ -347,10 +353,12 @@ func parkerVMName(vmid int) string {
 }
 
 // buildParkerTags returns the semicolon-joined tag string for a new parker VM.
-// ParkerTag is always present; "director--<id>" is appended when DirectorID is
-// set and sanitizes to a non-empty value (mirrors stemcell provenance pattern).
+// CpiOwnershipTag ("bosh-cpi") is always first so operators can filter all
+// CPI-managed guests by a single tag. ParkerTag follows; "director--<id>" is
+// appended when DirectorID is set and sanitizes to a non-empty value (mirrors
+// stemcell provenance pattern).
 func buildParkerTags(cfg ParkerConfig) string {
-	tags := []string{ParkerTag}
+	tags := []string{CpiOwnershipTag, ParkerTag}
 	if cfg.DirectorID != "" {
 		if sd := sanitizeParkerTagValue(cfg.DirectorID); sd != "" {
 			tags = append(tags, "director--"+sd)

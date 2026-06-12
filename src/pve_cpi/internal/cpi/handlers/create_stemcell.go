@@ -882,10 +882,12 @@ func attemptCreateTemplateVM(
 		targetStorage, importVolid, diskFormatQCOW2, defaultStemcellDiskGiB)
 
 	// baseTags is the ordered set of identity tags that always appear in the
-	// template's tags field regardless of provenance mode. For the primary path
-	// this is [shaTag]; for replicas it also includes the per-node tag.
-	baseTags := make([]string, 0, 1+len(extraBaseTags))
-	baseTags = append(baseTags, shaTag)
+	// template's tags field regardless of provenance mode.
+	// ownershipTag ("bosh-cpi") is prepended so operators can filter PVE UI /
+	// scripts to CPI-managed templates only. For the primary path the
+	// remaining tags are [shaTag]; for replicas the per-node tag is appended.
+	baseTags := make([]string, 0, 2+len(extraBaseTags))
+	baseTags = append(baseTags, ownershipTag, shaTag)
 	baseTags = append(baseTags, extraBaseTags...)
 
 	createParams := map[string]any{

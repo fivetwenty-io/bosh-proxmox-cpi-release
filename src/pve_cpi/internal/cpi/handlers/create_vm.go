@@ -913,9 +913,13 @@ func buildVMShapeForNode(ctx context.Context, deps Deps, parsed *createVMParsedA
 		return nil, err
 	}
 
-	// Operator-supplied tags only. The BOSH-managed director/deployment/job
-	// triple is added later by set_vm_metadata.
-	initialTags := mergeTagList(nil, buildCustomTags(cp.Tags), maxTagLength)
+	// "bosh-cpi" is the fixed ownership marker stamped on every CPI-created VM.
+	// It lets operators filter PVE UI / scripts to CPI-managed guests only and
+	// is preserved across set_vm_metadata because it is not in
+	// reservedBoshTagPrefixes. Operator-supplied tags are appended after.
+	// The BOSH-managed director/deployment/job triple is added later by
+	// set_vm_metadata.
+	initialTags := mergeTagList([]string{ownershipTag}, buildCustomTags(cp.Tags), maxTagLength)
 	initialName := resolveVMShapeInitialName(deps.Config, parsed)
 
 	// Best-effort: populate vmStorageType for the clone-mode decision in
