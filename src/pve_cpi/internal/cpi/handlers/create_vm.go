@@ -2078,17 +2078,23 @@ func lookupVMStorageType(ctx context.Context, deps Deps, storageName string) str
 // transient per-storage lockfile timeouts in addition to VMID races. Each
 // lock-timeout retry waits seconds, not ms, so 10 is still bounded.
 //
-// Attempt-budget precedence (first set wins): retry.storage_import.max_attempts,
-// retry.vmid_alloc.max_attempts, vmid_alloc_attempts, then the built-in 10. The
-// create_vm allocation loop handles both storage-lock and VMID-conflict retries
-// in one budget, and the lock retries dominate (seconds vs ms), so the
-// storage_import override is consulted first.
+// Attempt-budget precedence (first set wins):
+//  1. retry.storage_lock.max_attempts  — dedicated storage-lock budget (primary)
+//  2. retry.storage_import.max_attempts — legacy fallback (pre-storage_lock deployments)
+//  3. retry.vmid_alloc.max_attempts
+//  4. vmid_alloc_attempts
+//  5. built-in default 10
+//
+// The create_vm allocation loop handles both storage-lock and VMID-conflict
+// retries in one budget; the lock retries dominate (seconds vs ms).
 func resolveVMIDAllocParams(cfg *config.CPIConfig) (rangeStart, maxAttempts int) {
 	rangeStart = cfg.VMIDRangeStart
 	if rangeStart < 100 {
 		rangeStart = pve.VMIDRangeVMStart
 	}
 	switch {
+	case cfg.RetryStorageLock().MaxAttempts > 0:
+		maxAttempts = cfg.RetryStorageLock().MaxAttempts
 	case cfg.RetryStorageImport().MaxAttempts > 0:
 		maxAttempts = cfg.RetryStorageImport().MaxAttempts
 	case cfg.RetryVMIDAlloc().MaxAttempts > 0:

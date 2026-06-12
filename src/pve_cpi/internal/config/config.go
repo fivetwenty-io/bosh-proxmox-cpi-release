@@ -801,6 +801,16 @@ type RetryConfig struct {
 	// worker-pool drain. max_attempts caps retries; 0 = class default.
 	// Defaults: max_attempts per-handler default, base_ms 5000, cap_ms 60000.
 	Pushback *RetryPolicy `json:"pushback,omitempty"`
+
+	// StorageLock governs the exponential backoff used between attempts inside
+	// RetryOnTransientOrLock / RetryOnStorageLock when PVE responds with a
+	// "got timeout waiting for worker" or "storage locked" signal. This is a
+	// shorter curve than StorageImport because it guards the inner per-operation
+	// lock, not the full import pipeline. max_attempts overrides
+	// pve.DefaultStorageLockMaxAttempts (10) when > 0; 0 defers to that constant.
+	// Defaults: max_attempts 0 (→ DefaultStorageLockMaxAttempts), base_ms 2000,
+	// cap_ms 30000, jitter_pct 30.
+	StorageLock *RetryPolicy `json:"storage_lock,omitempty"`
 }
 
 // RetryPolicy is the parameter bag shared by every retry class. Each consuming
@@ -2122,6 +2132,10 @@ const (
 
 	defaultPushbackBaseMs = 5000
 	defaultPushbackCapMs  = 60000
+
+	defaultStorageLockBaseMs    = 2000
+	defaultStorageLockCapMs     = 30000
+	defaultStorageLockJitterPct = 30 // matches StorageLockBackoff shipped curve (±30% jitter)
 )
 
 // retryPolicyOrNil returns the named sub-policy, or nil when the retry block or
@@ -2211,6 +2225,26 @@ func (c *CPIConfig) RetryPushback() EffectiveRetryPolicy {
 		out.BaseMs = resolveField(p.BaseMs, defaultPushbackBaseMs)
 		out.CapMs = resolveField(p.CapMs, defaultPushbackCapMs)
 		out.JitterPct = resolveField(p.JitterPct, 0) // not used by PushbackBackoff today
+	}
+	return out
+}
+
+// RetryStorageLock returns the resolved storage-lock backoff policy used inside
+// RetryOnTransientOrLock / RetryOnStorageLock. MaxAttempts 0 means callers
+// should fall back to pve.DefaultStorageLockMaxAttempts (the constant the CPI
+// shipped with). Defaults: base_ms 2000, cap_ms 30000, jitter_pct 30.
+func (c *CPIConfig) RetryStorageLock() EffectiveRetryPolicy {
+	p := c.retryPolicyOf(func(r *RetryConfig) *RetryPolicy { return r.StorageLock })
+	out := EffectiveRetryPolicy{
+		BaseMs:    defaultStorageLockBaseMs,
+		CapMs:     defaultStorageLockCapMs,
+		JitterPct: defaultStorageLockJitterPct,
+	}
+	if p != nil {
+		out.MaxAttempts = p.MaxAttempts // 0 → caller falls back to DefaultStorageLockMaxAttempts
+		out.BaseMs = resolveField(p.BaseMs, defaultStorageLockBaseMs)
+		out.CapMs = resolveField(p.CapMs, defaultStorageLockCapMs)
+		out.JitterPct = resolveField(p.JitterPct, defaultStorageLockJitterPct)
 	}
 	return out
 }
@@ -3225,6 +3259,7 @@ func (c *CPIConfig) validateRetry(errs *[]string) {
 	checkRaw("vmid_alloc", c.Retry.VMIDAlloc)
 	checkRaw("task_poll", c.Retry.TaskPoll)
 	checkRaw("pushback", c.Retry.Pushback)
+	checkRaw("storage_lock", c.Retry.StorageLock)
 
 	// Effective cap >= base. Only meaningful when the operator set at least one
 	// of the two fields for that class (an entirely-absent policy resolves to
@@ -3243,6 +3278,7 @@ func (c *CPIConfig) validateRetry(errs *[]string) {
 	checkEffective("vmid_alloc", c.Retry.VMIDAlloc, c.RetryVMIDAlloc())
 	checkEffective("task_poll", c.Retry.TaskPoll, c.RetryTaskPoll())
 	checkEffective("pushback", c.Retry.Pushback, c.RetryPushback())
+	checkEffective("storage_lock", c.Retry.StorageLock, c.RetryStorageLock())
 }
 
 // validateOperationTimeout rejects out-of-range per-class deadlines. Honored

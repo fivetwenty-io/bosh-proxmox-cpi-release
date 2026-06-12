@@ -237,10 +237,16 @@ func HandleCreateDisk(deps Deps) Handler {
 			maxAttempts = 5
 		}
 		// Lock retries scale with how busy the storage is, not with how many
-		// VMID collisions we can tolerate. retry.storage_import.max_attempts
-		// overrides the existing vmid_alloc_attempts, which overrides the
-		// package default.
-		lockAttempts := deps.Config.RetryStorageImport().MaxAttempts
+		// VMID collisions we can tolerate. Precedence (first > 0 wins):
+		//   1. retry.storage_lock.max_attempts  — dedicated storage-lock budget (primary)
+		//   2. retry.storage_import.max_attempts — legacy fallback preserves deployments
+		//      that set this knob before storage_lock existed
+		//   3. vmid_alloc_attempts              — legacy scalar override
+		//   4. pve.DefaultStorageLockMaxAttempts — shipped constant (10)
+		lockAttempts := deps.Config.RetryStorageLock().MaxAttempts
+		if lockAttempts <= 0 {
+			lockAttempts = deps.Config.RetryStorageImport().MaxAttempts
+		}
 		if lockAttempts <= 0 {
 			lockAttempts = deps.Config.VMIDAllocAttempts
 		}

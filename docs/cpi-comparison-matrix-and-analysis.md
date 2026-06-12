@@ -2379,7 +2379,7 @@ eventually consistent with an explicit apply step, so a freshly written route is
 immediately live — the eventual-consistency caveat of the SDN work applies. Routing within
 the guest still lives in the guest OS. Tier: deployment.
 
-#### 7.56 OPEN — Per-VM `*bool` override pattern and operator retry budget
+#### 7.56 SHIPPED — Per-VM `*bool` override pattern and operator retry budget
 
 *References: OpenStack-Go, AWS.* The OpenStack-Go CPI threads `*bool` cloud_properties through
 a consistent inherit-from-global-then-default chain (a nil pointer falls back to the global,
@@ -2397,6 +2397,19 @@ lock-retry paths read, defaulting to the current hardcoded values.
 **Limits.** A tunable retry budget can mask a persistent fault as a transient one if set too
 high, lengthening failure detection; the defaults must remain the shipped values so existing
 deployments are unaffected. Tier: hardening.
+
+**Shipped:** `StorageLock *RetryPolicy` added to `RetryConfig` as the fifth retry-policy seam
+(`json:"storage_lock,omitempty"`), alongside the existing four (StorageImport, VMIDAlloc,
+TaskPoll, Pushback). The `RetryStorageLock()` accessor returns defaults `base_ms=2000`,
+`cap_ms=30000`, `jitter_pct=30` (matches the shipped `StorageLockBackoff` curve) when the
+block is absent; `max_attempts=0` defers to `pve.DefaultStorageLockMaxAttempts` (10). The
+storage-lock backoff curve is now wired to the seam via `ConfigureStorageLockBackoff` (called
+at process startup from operator config). The `create_disk` handler's lock-attempt budget reads
+`RetryStorageLock().MaxAttempts` first, then `RetryStorageImport().MaxAttempts` (legacy
+fallback), then `VMIDAllocAttempts`, then the package constant; `create_vm` follows the same
+precedence chain. The existing four retry policies are unmodified. The `*bool` inheritance
+convention is formally documented in
+[Bool Inheritance Convention](bool-inheritance-convention.md).
 
 ### Explicitly not recommended as core CPI work
 

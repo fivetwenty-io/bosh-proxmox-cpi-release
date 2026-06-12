@@ -172,7 +172,7 @@ The CPI's retry absorbs short bursts. If your deploys consistently exhaust the r
 
 2. **Split storages.** Putting the stemcell content on one PVE storage and the VM root disks on another removes the contention between import and resize because they grab different lockfiles. The CPI supports this via `pve_stemcell_storage` vs `pve_vm_storage` in `vars.yml`.
 
-3. **Tune retry attempts.** `pve.retry.storage_import.max_attempts` (default 10) bounds the storage-lock retry count. Raising it lets you ride out longer lock holds at the cost of slower failure when something is genuinely stuck.
+3. **Tune retry attempts.** `pve.retry.storage_lock.max_attempts` (default 10) bounds the storage-lock retry count for `create_disk`. Raising it lets you ride out longer lock holds at the cost of slower failure when something is genuinely stuck. `pve.retry.storage_import.max_attempts` is honored as a legacy fallback when `storage_lock` is unset, preserving existing deployments.
 
 ## Diagnosing
 

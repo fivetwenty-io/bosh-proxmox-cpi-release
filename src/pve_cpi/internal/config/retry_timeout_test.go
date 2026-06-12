@@ -225,6 +225,152 @@ func TestValidateRetry_EffectiveCapOK_WhenBaseUnsetAndCapAboveDefault(t *testing
 	}
 }
 
+// --------------------------------------------------------------------------
+// RetryStorageLock accessor
+// --------------------------------------------------------------------------
+
+// TestRetryStorageLock_NilBlock_ReturnsDefaults verifies that an absent retry
+// block (nil) returns the documented defaults: base_ms=2000, cap_ms=30000,
+// jitter_pct=30, max_attempts=0. The defaults must match the constants the CPI
+// shipped with (pve.DefaultStorageLockMaxAttempts for the fallback budget, and
+// the StorageLockBackoff seam defaults for the curve parameters).
+func TestRetryStorageLock_NilBlock_ReturnsDefaults(t *testing.T) {
+	c := &config.CPIConfig{} // no Retry block
+	sl := c.RetryStorageLock()
+	if sl.BaseMs != 2000 {
+		t.Errorf("BaseMs = %d, want 2000", sl.BaseMs)
+	}
+	if sl.CapMs != 30000 {
+		t.Errorf("CapMs = %d, want 30000", sl.CapMs)
+	}
+	if sl.JitterPct != 30 {
+		t.Errorf("JitterPct = %d, want 30 (must match StorageLockBackoff shipped curve)", sl.JitterPct)
+	}
+	if sl.MaxAttempts != 0 {
+		t.Errorf("MaxAttempts = %d, want 0 (caller falls back to DefaultStorageLockMaxAttempts)", sl.MaxAttempts)
+	}
+}
+
+// TestRetryStorageLock_NilReceiver_DoesNotPanic ensures a nil *CPIConfig is safe.
+func TestRetryStorageLock_NilReceiver_DoesNotPanic(t *testing.T) {
+	var c *config.CPIConfig
+	_ = c.RetryStorageLock()
+}
+
+// TestRetryStorageLock_FullOverride verifies that all four fields are respected
+// when all are set.
+func TestRetryStorageLock_FullOverride(t *testing.T) {
+	c := &config.CPIConfig{
+		Retry: &config.RetryConfig{
+			StorageLock: &config.RetryPolicy{MaxAttempts: 15, BaseMs: 500, CapMs: 10000, JitterPct: 10},
+		},
+	}
+	sl := c.RetryStorageLock()
+	if sl.MaxAttempts != 15 {
+		t.Errorf("MaxAttempts = %d, want 15", sl.MaxAttempts)
+	}
+	if sl.BaseMs != 500 {
+		t.Errorf("BaseMs = %d, want 500", sl.BaseMs)
+	}
+	if sl.CapMs != 10000 {
+		t.Errorf("CapMs = %d, want 10000", sl.CapMs)
+	}
+	if sl.JitterPct != 10 {
+		t.Errorf("JitterPct = %d, want 10", sl.JitterPct)
+	}
+}
+
+// TestRetryStorageLock_PartialOverride_FillsUnsetFieldsFromDefaults verifies
+// that setting only one field leaves all other fields at their class defaults.
+func TestRetryStorageLock_PartialOverride_FillsUnsetFieldsFromDefaults(t *testing.T) {
+	c := &config.CPIConfig{
+		Retry: &config.RetryConfig{
+			StorageLock: &config.RetryPolicy{CapMs: 60000}, // only cap set
+		},
+	}
+	sl := c.RetryStorageLock()
+	if sl.BaseMs != 2000 {
+		t.Errorf("BaseMs = %d, want default 2000 when unset", sl.BaseMs)
+	}
+	if sl.CapMs != 60000 {
+		t.Errorf("CapMs = %d, want override 60000", sl.CapMs)
+	}
+	if sl.JitterPct != 30 {
+		t.Errorf("JitterPct = %d, want default 30 when unset", sl.JitterPct)
+	}
+	if sl.MaxAttempts != 0 {
+		t.Errorf("MaxAttempts = %d, want 0 (caller default) when unset", sl.MaxAttempts)
+	}
+}
+
+// TestRetryStorageLock_NilPolicy_InPresentRetryBlock confirms that a present
+// retry block with a nil StorageLock still returns all defaults.
+func TestRetryStorageLock_NilPolicy_InPresentRetryBlock(t *testing.T) {
+	c := &config.CPIConfig{
+		Retry: &config.RetryConfig{
+			StorageImport: &config.RetryPolicy{BaseMs: 1000}, // unrelated; StorageLock absent
+		},
+	}
+	sl := c.RetryStorageLock()
+	if sl.BaseMs != 2000 || sl.CapMs != 30000 || sl.JitterPct != 30 || sl.MaxAttempts != 0 {
+		t.Errorf("storage_lock defaults not returned when policy nil: %+v", sl)
+	}
+}
+
+// TestValidateRetry_StorageLock_RejectsBadValues ensures the storage_lock policy
+// is subject to the same range validation as other retry classes.
+func TestValidateRetry_StorageLock_RejectsBadValues(t *testing.T) {
+	cases := []struct {
+		name    string
+		policy  *config.RetryPolicy
+		wantSub string
+	}{
+		{"negative attempts", &config.RetryPolicy{MaxAttempts: -1}, "max_attempts must be >= 0"},
+		{"negative base_ms", &config.RetryPolicy{BaseMs: -1}, "base_ms must be >= 0"},
+		{"jitter over 100", &config.RetryPolicy{JitterPct: 101}, "jitter_pct must be 0-100"},
+		{
+			"cap below base",
+			&config.RetryPolicy{BaseMs: 5000, CapMs: 1000},
+			"effective cap_ms (1000) must be >= effective base_ms (5000)",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := baseValidCfg()
+			c.Retry = &config.RetryConfig{StorageLock: tc.policy}
+			err := c.Validate()
+			if err == nil {
+				t.Fatalf("expected validation error, got nil")
+			}
+			if !strings.Contains(err.Error(), tc.wantSub) {
+				t.Errorf("error %q does not contain %q", err.Error(), tc.wantSub)
+			}
+		})
+	}
+}
+
+// TestValidateRetry_StorageLock_AcceptsValid confirms zero and in-range values pass.
+func TestValidateRetry_StorageLock_AcceptsValid(t *testing.T) {
+	c := baseValidCfg()
+	c.Retry = &config.RetryConfig{
+		StorageLock: &config.RetryPolicy{MaxAttempts: 5, BaseMs: 1000, CapMs: 20000, JitterPct: 15},
+	}
+	if err := c.Validate(); err != nil {
+		t.Errorf("expected valid config, got %v", err)
+	}
+}
+
+// TestValidateRetry_StorageLock_ZeroIsValid confirms an all-zero policy (use all defaults) passes.
+func TestValidateRetry_StorageLock_ZeroIsValid(t *testing.T) {
+	c := baseValidCfg()
+	c.Retry = &config.RetryConfig{
+		StorageLock: &config.RetryPolicy{},
+	}
+	if err := c.Validate(); err != nil {
+		t.Errorf("expected valid config, got %v", err)
+	}
+}
+
 func TestValidateOperationTimeout_OnlyWhenEnabled(t *testing.T) {
 	// Disabled block with a wild value must NOT fail validation.
 	c := baseValidCfg()

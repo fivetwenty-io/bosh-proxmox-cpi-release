@@ -101,15 +101,18 @@ func backoffFromCtx(ctx context.Context) func(attempt int) time.Duration {
 }
 
 // StorageLockBackoff returns the sleep duration after the attempt-th
-// (0-indexed) failed lock acquisition: exponential 2s × 1.5^attempt with
-// ±30% jitter, capped at 30s. PVE serialises every per-storage operation
-// (import, resize, alloc, free, snapshot) through the same lockfile so
-// retrying immediately wins nothing — pause seconds, let the holder finish.
+// (0-indexed) failed lock acquisition: exponential base × 1.5^attempt with
+// ±jitterPct% jitter, capped at the configured ceiling. Default base 2s,
+// cap 30s, jitter ±30%. PVE serialises every per-storage operation (import,
+// resize, alloc, free, snapshot) through the same lockfile so retrying
+// immediately wins nothing — pause seconds, let the holder finish.
+//
+// The curve is configurable via ConfigureStorageLockBackoff (called once at
+// startup from operator config); tests may override via SetStorageLockBackoffForTest.
 func StorageLockBackoff(attempt int) time.Duration {
-	// maxBackoff renamed from the builtin-shadowing `cap` so go vet stops
-	// flagging this scope; jitter math reads cleaner with the explicit name.
-	const maxBackoff = 30 * time.Second
-	base := 2 * time.Second
+	baseMs, capMs, jPct := storageLockDefaults()
+	base := time.Duration(baseMs) * time.Millisecond
+	maxBackoff := time.Duration(capMs) * time.Millisecond
 	factor := 1.0
 	for i := 0; i < attempt; i++ {
 		factor *= 1.5
@@ -118,14 +121,21 @@ func StorageLockBackoff(attempt int) time.Duration {
 	if d > maxBackoff {
 		d = maxBackoff
 	}
-	// Guard against Int64N(0) which panics. With a zero/negative jitter
-	// window fall back to the deterministic base delay.
-	jitterWindow := int64(d) * 6 / 10
+	// jitterPct is in [0,100]. jitterWindow = d * 2*jPct/100 (±jPct% of d).
+	// Guard against Int64N(0) which panics.
+	if jPct < 0 {
+		jPct = 0
+	}
+	if jPct > 100 {
+		jPct = 100
+	}
+	jitterWindow := int64(d) * int64(jPct) * 2 / 100
 	var jitter time.Duration
 	if jitterWindow > 0 {
 		jitter = time.Duration(jitterInt64N(jitterWindow))
 	}
-	out := d - d*3/10 + jitter
+	// Shift the window so it is centered: subtract jPct% then add the draw.
+	out := d - time.Duration(int64(d)*int64(jPct)/100) + jitter
 	if out > maxBackoff {
 		out = maxBackoff
 	}
@@ -133,8 +143,13 @@ func StorageLockBackoff(attempt int) time.Duration {
 }
 
 // StorageLockBackoffCap returns the maximum duration that StorageLockBackoff
-// can return. Exported for tests that need to compare curve ceilings.
-func StorageLockBackoffCap() time.Duration { return 30 * time.Second }
+// can return. Reads the current process-wide cap from the storage-lock seam
+// so the operator's configured value (or the shipped 30s default) is always
+// returned.
+func StorageLockBackoffCap() time.Duration {
+	_, capMs, _ := storageLockDefaults()
+	return time.Duration(capMs) * time.Millisecond
+}
 
 // PushbackBackoffCap returns the maximum duration that PushbackBackoff can
 // return. Reads the current process-wide cap from the pushback seam so the

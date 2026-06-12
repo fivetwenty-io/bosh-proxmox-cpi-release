@@ -480,6 +480,7 @@
     "vmid_alloc"     => ["max_attempts", "base_ms", "cap_ms"],
     "task_poll"      => ["base_ms", "cap_ms", "jitter_pct"],
     "pushback"       => ["base_ms", "cap_ms"],
+    "storage_lock"   => ["max_attempts", "base_ms", "cap_ms", "jitter_pct"],
   }.each do |klass, fields|
     policy = {}
     fields.each do |f|

@@ -205,6 +205,12 @@ func runWithArgs(args []string, stdin io.Reader, stdout, stderr io.Writer, opts 
 	pb := cfg.RetryPushback()
 	pve.ConfigurePushbackBackoff(pb.BaseMs, pb.CapMs)
 
+	// Apply the operator's storage-lock backoff curve process-wide. With an
+	// unset retry.storage_lock block these resolve to the shipped defaults
+	// (2s/30s/30%), so backoff is byte-identical to prior releases.
+	sl := cfg.RetryStorageLock()
+	pve.ConfigureStorageLockBackoff(sl.BaseMs, sl.CapMs, sl.JitterPct)
+
 	dispatcherOpts := []func(*cpi.Dispatcher){cpi.WithHooks(hookChain...)}
 	// Per-method deadline envelope is opt-in. When enabled, install a resolver
 	// sized by the operator's per-class budgets so a wedged operation converts

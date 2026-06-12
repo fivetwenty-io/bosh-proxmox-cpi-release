@@ -1006,6 +1006,31 @@ properties:
       base_ms if smaller.
     default: 0
 
+  pve.retry.storage_lock.max_attempts:
+    description: |
+      Maximum attempts for the inner PVE storage-lock retry loop (the
+      "got timeout waiting for worker" / "storage locked" signal that fires
+      inside a single create_disk call). Zero (default) applies the built-in
+      budget of 10. Raise on slow Ceph or NFS where lock acquisition takes
+      longer than the default window.
+    default: 0
+  pve.retry.storage_lock.base_ms:
+    description: |
+      Base delay in milliseconds for the storage-lock exponential backoff
+      (base × 1.5^attempt). Zero (default) applies the built-in 2000 ms.
+    default: 0
+  pve.retry.storage_lock.cap_ms:
+    description: |
+      Maximum delay in milliseconds for the storage-lock backoff. Zero
+      (default) applies the built-in 30000 ms. Must be >= base_ms when both
+      are set.
+    default: 0
+  pve.retry.storage_lock.jitter_pct:
+    description: |
+      Plus/minus jitter percentage (0-100) applied to each storage-lock
+      backoff delay. Zero (default) applies the built-in 30.
+    default: 0
+
   pve.max_inflight_per_node:
     description: |
       Maximum number of concurrent mutating PVE operations (create_vm,

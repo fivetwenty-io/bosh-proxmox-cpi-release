@@ -551,6 +551,105 @@ func TestHandleCreateDisk_VMIDConflictRetry(t *testing.T) {
 	}
 }
 
+// TestHandleCreateDisk_StorageLockBudget_DefaultFallback verifies that when no
+// retry.storage_lock.max_attempts is set in config, the create_disk lock-retry
+// loop uses pve.DefaultStorageLockMaxAttempts (10) as its budget. We simulate
+// a storage-lock error on every attempt and confirm exactly 10 attempts are
+// made before the handler returns an error.
+func TestHandleCreateDisk_StorageLockBudget_DefaultFallback(t *testing.T) {
+	t.Parallel()
+	attempts := 0
+	storageSvc := &mockStorageService{
+		createVolumeFn: func(_ context.Context, _, _ string, _ int, _ string, _ int, _ string) (string, error) {
+			attempts++
+			// Return a storage-lock timeout on every attempt.
+			return "", errors.New("can't lock file 'storage' - got timeout")
+		},
+	}
+	deps := baseDepsForCreate(t, storageSvc, nil)
+	// No retry.storage_lock config set; must fall back to DefaultStorageLockMaxAttempts=10.
+	if deps.Config.Retry != nil {
+		t.Fatal("baseDepsForCreate must not set a Retry block for this test")
+	}
+
+	h := handlers.HandleCreateDisk(deps)
+	_, err := h.Handle(fastRetryCtx(context.Background()), []json.RawMessage{
+		marshal(1024),
+		marshal(map[string]string{}),
+	}, jsonrpc.Context{})
+
+	if err == nil {
+		t.Fatal("expected error after all attempts exhausted, got nil")
+	}
+	if attempts != pve.DefaultStorageLockMaxAttempts {
+		t.Errorf("expected %d attempts (DefaultStorageLockMaxAttempts), got %d",
+			pve.DefaultStorageLockMaxAttempts, attempts)
+	}
+}
+
+// TestHandleCreateDisk_StorageLockBudget_ConfigOverride verifies that setting
+// retry.storage_lock.max_attempts in config overrides the default budget.
+func TestHandleCreateDisk_StorageLockBudget_ConfigOverride(t *testing.T) {
+	t.Parallel()
+	attempts := 0
+	storageSvc := &mockStorageService{
+		createVolumeFn: func(_ context.Context, _, _ string, _ int, _ string, _ int, _ string) (string, error) {
+			attempts++
+			return "", errors.New("can't lock file 'storage' - got timeout")
+		},
+	}
+	deps := baseDepsForCreate(t, storageSvc, nil)
+	deps.Config.Retry = &config.RetryConfig{
+		StorageLock: &config.RetryPolicy{MaxAttempts: 3},
+	}
+
+	h := handlers.HandleCreateDisk(deps)
+	_, err := h.Handle(fastRetryCtx(context.Background()), []json.RawMessage{
+		marshal(1024),
+		marshal(map[string]string{}),
+	}, jsonrpc.Context{})
+
+	if err == nil {
+		t.Fatal("expected error after lock exhaustion, got nil")
+	}
+	if attempts != 3 {
+		t.Errorf("expected 3 attempts (config override), got %d", attempts)
+	}
+}
+
+// TestHandleCreateDisk_StorageLockBudget_StorageImportFallback verifies that
+// when retry.storage_lock is unset but retry.storage_import.max_attempts is
+// set, the storage_import value is used as the lock-budget fallback (preserves
+// pre-storage_lock deployments).
+func TestHandleCreateDisk_StorageLockBudget_StorageImportFallback(t *testing.T) {
+	t.Parallel()
+	attempts := 0
+	storageSvc := &mockStorageService{
+		createVolumeFn: func(_ context.Context, _, _ string, _ int, _ string, _ int, _ string) (string, error) {
+			attempts++
+			return "", errors.New("can't lock file 'storage' - got timeout")
+		},
+	}
+	deps := baseDepsForCreate(t, storageSvc, nil)
+	deps.Config.Retry = &config.RetryConfig{
+		// storage_lock unset (nil) — must fall back to storage_import.
+		StorageImport: &config.RetryPolicy{MaxAttempts: 4},
+	}
+
+	h := handlers.HandleCreateDisk(deps)
+	_, err := h.Handle(fastRetryCtx(context.Background()), []json.RawMessage{
+		marshal(1024),
+		marshal(map[string]string{}),
+	}, jsonrpc.Context{})
+
+	if err == nil {
+		t.Fatal("expected error after lock exhaustion, got nil")
+	}
+	if attempts != 4 {
+		t.Errorf("expected 4 attempts (storage_import fallback), got %d", attempts)
+	}
+}
+
 func TestHandleCreateDisk_MissingNode(t *testing.T) {
 	t.Parallel()
 	storageSvc := &mockStorageService{}
