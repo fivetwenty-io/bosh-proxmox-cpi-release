@@ -74,7 +74,7 @@ For end-to-end CPI method exercise against a live cluster, see [BOSH CPI Lifecyc
 
 ## Properties
 
-The CPI exposes 41 properties under the `pve.*`, `agent.*`, and `registry.*` namespaces. The most operator-relevant subset is summarized below; the [full property reference](docs/configuration.md) documents every field with defaults, types, and validation rules.
+The CPI exposes properties under the `pve.*`, `agent.*`, and `registry.*` namespaces. The most operator-relevant subset is summarized below; the [full property reference](docs/configuration.md) documents every field with defaults, types, and validation rules.
 
 | Property | Description | Default |
 |---|---|---|
@@ -91,7 +91,7 @@ The CPI exposes 41 properties under the `pve.*`, `agent.*`, and `registry.*` nam
 | `pve.network_mode` | Managed-network mode (`sdn`, `bridge`, `auto`) | `auto` |
 | `pve.agent_mode` | Agent bootstrap mode (`cloudinit`, `registry`, `noagent`) | `cloudinit` |
 
-The full table covers the remaining 25 properties including SDN zone management, snapshot guards, hotplug flags, reboot strategy, VMID allocation range, registry TLS pinning, and the `agent.*` mbus fallback. See the [configuration reference](docs/configuration.md).
+The full table covers the remaining properties including SDN zone management, snapshot guards, hotplug flags, reboot strategy, VMID allocation range, detached-disk lifecycle strategy, registry TLS pinning, and the `agent.*` mbus fallback. See the [configuration reference](docs/configuration.md).
 
 ## Operations
 
@@ -104,6 +104,8 @@ Specific topics:
 - [Error message hygiene](docs/operations.md#error-message-hygiene) — what surfaces in BOSH task output versus what stays in CPI logs, and the secrets-redaction contract.
 
 - [Persistent disks](docs/operations.md#persistent-disks-cloud_properties) — `disk_format` cloud-property requirements for LVM/ZFS pools (`raw`) versus directory/network-backed pools (`qcow2`).
+
+- [Persistent disk lifecycle strategy](docs/persistent-disk-strategy.md) — the free-floating and parked detachment strategies, `scripts/disk-audit`, parker VM teardown, and provenance sentinel details.
 
 - [Release workflow](docs/operations.md) — operator workflow for capturing `RELEASE_TGZ` from `scripts/create-release` and passing it via `--var release_artifact_path=...`.
 
@@ -175,12 +177,13 @@ For symptom-first triage of deployment, VM creation, disk attachment, network, a
 ## Reference
 
 - [CPI methods reference](docs/cpi_methods.md) — every BOSH CPI v2 method with args, returns, errors, and notes.
-- [Configuration reference](docs/configuration.md) — all 41 properties with defaults and validation rules.
+- [Configuration reference](docs/configuration.md) — all properties with defaults and validation rules.
 - [Network configuration](docs/networks.md) — SDN and bridge `cloud_properties` schema and manifest examples.
 - [Operations runbook](docs/operations.md) — day-2 operations and diagnostics.
 - [Troubleshooting](docs/troubleshooting.md) — symptom-first failure triage.
 - [Light stemcells](docs/light-stemcells.md) — pre-uploaded and CPI-fetch modes, storage requirements, and credentials.
 - [Persistent disks](docs/persistent-disks.md) — storage backend classification and disk-pool cloud-properties.
+- [Persistent disk lifecycle strategy](docs/persistent-disk-strategy.md) — free-floating vs. parked detachment strategies, `scripts/disk-audit`, and provenance sentinel.
 - [ConfigDrive layout](docs/configdrive.md) — ISO 9660 volume layout and SCSI slot reservation map.
 - [PVE API permissions](docs/pve-api-permissions.md) — minimum-privilege `bosh@pve` user setup and token creation.
 - [PVE settings](docs/pve-settings.md) — cluster-level settings the CPI assumes (storage content types, SDN enablement).

@@ -20,6 +20,8 @@ This CPI enables BOSH to provision and manage resources on PVE 9.x, implementing
 
 - [Persistent Disks](persistent-disks.md): Storage backend classification, the storage type matrix, and disk cloud_properties for storage and node selection.
 
+- [Persistent Disk Lifecycle Strategy](persistent-disk-strategy.md): Free-floating versus parked detachment strategies, the `scripts/disk-audit` tool, parker VM provisioning and teardown, and provenance sentinel details.
+
 - [ConfigDrive](configdrive.md): How the CPI delivers BOSH agent settings via an OpenStack ConfigDrive ISO, plus the SCSI slot reservation map.
 
 - [Light Stemcells](light-stemcells.md): Pre-uploaded and CPI-fetch light-stemcell modes, storage requirements, and node pinning.
