@@ -218,7 +218,7 @@ func HandleDetachDisk(deps Deps) Handler {
 		//    on retry the disk is free-floating so ParkDisk's idempotency check
 		//    skips the IsDiskParked scan and re-parks directly.
 		// --------------------------------------------------------------------
-		if err := parkAfterDetach(ctx, deps, diskCID, bareDiskCID, node); err != nil {
+		if err := parkAfterDetach(ctx, deps, vmCID, diskCID, bareDiskCID, node); err != nil {
 			return nil, err
 		}
 
@@ -262,7 +262,7 @@ func handleAlreadyDetachedParked(ctx context.Context, deps Deps, diskCID, bareDi
 		}
 		return resolveErr
 	}
-	if parkErr := pve.ParkDisk(ctx, deps.PVE, deps.Logger, alreadyDetachedNode, bareDiskCID, parkerCfg); parkErr != nil {
+	if parkErr := pve.ParkDisk(ctx, deps.PVE, deps.Logger, alreadyDetachedNode, bareDiskCID, parkerCfg, pve.ParkContext{DiskCID: diskCID}); parkErr != nil {
 		return cpierrors.WrapAs(parkErr, cpierrors.TypeRetriableCloud,
 			fmt.Sprintf("detach_disk: park free-floating disk %s (fail-closed)", diskCID))
 	}
@@ -320,7 +320,7 @@ func detachDiskSnapshotGuard(ctx context.Context, deps Deps, vmCID, node string,
 // strategy is not enabled. Failure is fail-closed retriable: the Director
 // retries detach_disk; on retry the disk is free-floating so ParkDisk's
 // idempotency check skips the IsDiskParked scan and re-parks directly.
-func parkAfterDetach(ctx context.Context, deps Deps, diskCID, bareDiskCID, node string) error {
+func parkAfterDetach(ctx context.Context, deps Deps, vmCID, diskCID, bareDiskCID, node string) error {
 	if !deps.Config.DetachedDiskParkedEnabled() {
 		return nil
 	}
@@ -329,7 +329,8 @@ func parkAfterDetach(ctx context.Context, deps Deps, diskCID, bareDiskCID, node 
 		VMIDRangeEnd:   deps.Config.ParkedDiskVMIDRangeEndValue(),
 		DirectorID:     deps.Config.StemcellDirectorID(),
 	}
-	if parkErr := pve.ParkDisk(ctx, deps.PVE, deps.Logger, node, bareDiskCID, parkerCfg); parkErr != nil {
+	pctx := pve.ParkContext{DiskCID: diskCID, SourceVMCID: vmCID}
+	if parkErr := pve.ParkDisk(ctx, deps.PVE, deps.Logger, node, bareDiskCID, parkerCfg, pctx); parkErr != nil {
 		return cpierrors.WrapAs(parkErr, cpierrors.TypeRetriableCloud,
 			fmt.Sprintf("detach_disk: park disk %s after detach (fail-closed: retry will re-park)", diskCID))
 	}

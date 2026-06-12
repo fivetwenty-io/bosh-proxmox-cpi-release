@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cluster"
+	sdknodes "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/nodes"
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/qemu"
 
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
@@ -123,6 +124,45 @@ func (q *parkerQEMU) ListSnapshots(_ context.Context, _ string, _ int) ([]map[st
 }
 func (q *parkerQEMU) RollbackSnapshot(_ context.Context, _ string, _ int, _ string) (string, error) {
 	panic("RollbackSnapshot not expected")
+}
+
+// ---------------------------------------------------------------------------
+// parkerNodesService — nodes.Service mock for provenance tests.
+// ---------------------------------------------------------------------------
+
+// parkerNodesService is a minimal nodes.Service that intercepts UpdateQemuConfig.
+// All other methods panic if called unexpectedly.
+type parkerNodesService struct {
+	sdknodes.Service // embed for zero-value; override only UpdateQemuConfig
+	updateFn         func(node, vmid string, params *sdknodes.UpdateQemuConfigParams) error
+}
+
+func (n *parkerNodesService) UpdateQemuConfig(_ context.Context, node, vmid string, params *sdknodes.UpdateQemuConfigParams) error {
+	if n.updateFn != nil {
+		return n.updateFn(node, vmid, params)
+	}
+	return nil
+}
+
+// parkerClientWithNodes wraps a diskClusterClient but overrides Nodes() to
+// return an injectable nodes.Service. Used by provenance tests that need to
+// intercept UpdateQemuConfig calls without affecting other parker tests.
+type parkerClientWithNodes struct {
+	pve.Client
+	nodesSvc sdknodes.Service
+}
+
+func (c *parkerClientWithNodes) Nodes() sdknodes.Service { return c.nodesSvc }
+
+// buildParkerClientWithNodes constructs a pve.Client with both QEMU+Cluster
+// services AND an injectable nodes.Service.
+func buildParkerClientWithNodes(
+	qemuSvc qemu.Service,
+	listFn func(ctx context.Context, params *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error),
+	nodesSvc sdknodes.Service,
+) pve.Client {
+	base := buildParkerClient(qemuSvc, listFn)
+	return &parkerClientWithNodes{Client: base, nodesSvc: nodesSvc}
 }
 
 // parkerFakeCluster builds cluster.ListResourcesResponse rows from typed maps.
@@ -287,7 +327,7 @@ func TestParkDisk_FullParkerCreatesSecondParker(t *testing.T) {
 		), nil
 	})
 
-	err := pve.ParkDisk(ctx, c, nopLogger(), node, bareVolid, cfg)
+	err := pve.ParkDisk(ctx, c, nopLogger(), node, bareVolid, cfg, pve.ParkContext{})
 	if err != nil {
 		t.Fatalf("ParkDisk: unexpected error: %v", err)
 	}
@@ -650,7 +690,7 @@ func TestParkDisk_AttachesToFreeSlot(t *testing.T) {
 		), nil
 	})
 
-	err := pve.ParkDisk(context.Background(), c, nopLogger(), node, bareVolid, parkerTestCfg())
+	err := pve.ParkDisk(context.Background(), c, nopLogger(), node, bareVolid, parkerTestCfg(), pve.ParkContext{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -691,7 +731,7 @@ func TestParkDisk_AlreadyParkedIsIdempotent(t *testing.T) {
 		), nil
 	})
 
-	err := pve.ParkDisk(context.Background(), c, nopLogger(), node, bareVolid, parkerTestCfg())
+	err := pve.ParkDisk(context.Background(), c, nopLogger(), node, bareVolid, parkerTestCfg(), pve.ParkContext{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -873,6 +913,632 @@ func TestFindVMByDiskVolidOrNone_RetriableConfigError_Passthrough(t *testing.T) 
 	}
 	if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
 		t.Errorf("expected TypeRetriableCloud; got: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Provenance: updateParkerProvenance / removeParkerProvenance (via ParkDisk /
+// UnparkDisk integration)
+// ---------------------------------------------------------------------------
+
+// fixedClock returns a ParkerConfig.NowFunc pinned to t.
+func fixedClock(t time.Time) func() time.Time { return func() time.Time { return t } }
+
+// TestParkDisk_ProvenanceEntryWritten verifies that parking a disk writes a
+// bosh_parked_disks entry into the parker VM description with the correct fields.
+func TestParkDisk_ProvenanceEntryWritten(t *testing.T) {
+	t.Parallel()
+	ctx := pve.WithTestBackoff(context.Background(), func(_ int) time.Duration { return 0 })
+	node := "pve1"
+	parkerVMID := 90000
+	bareVolid := "local-lvm:vm-9001-disk-0"
+	fixedTime := time.Date(2026, 6, 12, 10, 0, 0, 0, time.UTC)
+
+	cfg := pve.ParkerConfig{
+		VMIDRangeStart: 90000,
+		VMIDRangeEnd:   90999,
+		NowFunc:        fixedClock(fixedTime),
+	}
+
+	var capturedDesc string
+	nodesSvc := &parkerNodesService{
+		updateFn: func(_, _ string, params *sdknodes.UpdateQemuConfigParams) error {
+			if params.Description != nil {
+				capturedDesc = *params.Description
+			}
+			return nil
+		},
+	}
+
+	// Parker exists; disk not yet attached (idempotency check sees empty slot).
+	configCallCount := 0
+	qemuSvc := &parkerQEMU{
+		configFn: func(_ string, vmid int) (map[string]any, error) {
+			configCallCount++
+			if vmid == parkerVMID {
+				return map[string]any{"tags": "bosh-parker"}, nil
+			}
+			return map[string]any{}, nil
+		},
+	}
+
+	// First cluster scan (idempotency: disk not attached to any VM) → empty.
+	// Second scan (EnsureParker → FindParkerForNode) → has parker.
+	listCallCount := 0
+	c := buildParkerClientWithNodes(qemuSvc, func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+		listCallCount++
+		if listCallCount == 1 {
+			// IsDiskParked cluster scan: empty (disk is free-floating).
+			return parkerClusterResp(), nil
+		}
+		return parkerClusterResp(
+			map[string]any{"vmid": int64(parkerVMID), "node": node},
+		), nil
+	}, nodesSvc)
+
+	encodedCID := "local-lvm:vm-9001-disk-0|abc123"
+	sourceVMCID := "9500"
+	pctx := pve.ParkContext{DiskCID: encodedCID, SourceVMCID: sourceVMCID}
+	if err := pve.ParkDisk(ctx, c, nopLogger(), node, bareVolid, cfg, pctx); err != nil {
+		t.Fatalf("ParkDisk: unexpected error: %v", err)
+	}
+
+	if capturedDesc == "" {
+		t.Fatal("expected UpdateQemuConfig to be called with provenance description")
+	}
+
+	// Description must contain bosh_parked_disks with the expected fields.
+	if !strings.Contains(capturedDesc, "bosh_parked_disks") {
+		t.Errorf("description %q must contain bosh_parked_disks", capturedDesc)
+	}
+	// disk_cid must be the encoded CID from ParkContext, not the bare volid.
+	if !strings.Contains(capturedDesc, encodedCID) {
+		t.Errorf("description %q must contain encoded disk_cid %q", capturedDesc, encodedCID)
+	}
+	if !strings.Contains(capturedDesc, sourceVMCID) {
+		t.Errorf("description %q must contain source_vm_cid %q", capturedDesc, sourceVMCID)
+	}
+	if !strings.Contains(capturedDesc, fixedTime.Format(time.RFC3339)) {
+		t.Errorf("description %q must contain parked_at timestamp %q", capturedDesc, fixedTime.Format(time.RFC3339))
+	}
+	if !strings.Contains(capturedDesc, node) {
+		t.Errorf("description %q must contain node %q", capturedDesc, node)
+	}
+}
+
+// TestParkDisk_ProvenanceEntryWithDirectorID verifies director_id field present
+// when ParkerConfig.DirectorID is set.
+func TestParkDisk_ProvenanceEntryWithDirectorID(t *testing.T) {
+	t.Parallel()
+	ctx := pve.WithTestBackoff(context.Background(), func(_ int) time.Duration { return 0 })
+	node := "pve1"
+	parkerVMID := 90000
+	bareVolid := "local-lvm:vm-9002-disk-0"
+
+	cfg := pve.ParkerConfig{
+		VMIDRangeStart: 90000,
+		VMIDRangeEnd:   90999,
+		DirectorID:     "prod-director",
+		NowFunc:        fixedClock(time.Now().UTC()),
+	}
+
+	var capturedDesc string
+	nodesSvc := &parkerNodesService{
+		updateFn: func(_, _ string, params *sdknodes.UpdateQemuConfigParams) error {
+			if params.Description != nil {
+				capturedDesc = *params.Description
+			}
+			return nil
+		},
+	}
+
+	listCallCount := 0
+	c := buildParkerClientWithNodes(
+		&parkerQEMU{
+			configFn: func(_ string, vmid int) (map[string]any, error) {
+				if vmid == parkerVMID {
+					return map[string]any{"tags": "bosh-parker"}, nil
+				}
+				return map[string]any{}, nil
+			},
+		},
+		func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+			listCallCount++
+			if listCallCount == 1 {
+				return parkerClusterResp(), nil
+			}
+			return parkerClusterResp(map[string]any{"vmid": int64(parkerVMID), "node": node}), nil
+		},
+		nodesSvc,
+	)
+
+	if err := pve.ParkDisk(ctx, c, nopLogger(), node, bareVolid, cfg, pve.ParkContext{}); err != nil {
+		t.Fatalf("ParkDisk: %v", err)
+	}
+	if !strings.Contains(capturedDesc, "prod-director") {
+		t.Errorf("description %q must contain director_id %q", capturedDesc, "prod-director")
+	}
+}
+
+// TestParkDisk_ProvenanceNoDirectorID verifies director_id field absent when
+// ParkerConfig.DirectorID is empty.
+func TestParkDisk_ProvenanceNoDirectorID(t *testing.T) {
+	t.Parallel()
+	ctx := pve.WithTestBackoff(context.Background(), func(_ int) time.Duration { return 0 })
+	node := "pve1"
+	parkerVMID := 90000
+	bareVolid := "local-lvm:vm-9003-disk-0"
+
+	cfg := pve.ParkerConfig{
+		VMIDRangeStart: 90000,
+		VMIDRangeEnd:   90999,
+		NowFunc:        fixedClock(time.Now().UTC()),
+	}
+
+	var capturedDesc string
+	nodesSvc := &parkerNodesService{
+		updateFn: func(_, _ string, params *sdknodes.UpdateQemuConfigParams) error {
+			if params.Description != nil {
+				capturedDesc = *params.Description
+			}
+			return nil
+		},
+	}
+
+	listCallCount := 0
+	c := buildParkerClientWithNodes(
+		&parkerQEMU{
+			configFn: func(_ string, vmid int) (map[string]any, error) {
+				if vmid == parkerVMID {
+					return map[string]any{"tags": "bosh-parker"}, nil
+				}
+				return map[string]any{}, nil
+			},
+		},
+		func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+			listCallCount++
+			if listCallCount == 1 {
+				return parkerClusterResp(), nil
+			}
+			return parkerClusterResp(map[string]any{"vmid": int64(parkerVMID), "node": node}), nil
+		},
+		nodesSvc,
+	)
+
+	if err := pve.ParkDisk(ctx, c, nopLogger(), node, bareVolid, cfg, pve.ParkContext{}); err != nil {
+		t.Fatalf("ParkDisk: %v", err)
+	}
+	if strings.Contains(capturedDesc, "director_id") {
+		t.Errorf("description %q must NOT contain director_id when DirectorID is empty", capturedDesc)
+	}
+}
+
+// TestParkDisk_ProvenanceMergePreservesFirstDisk verifies that parking a second
+// disk on the same parker preserves the first disk's provenance entry.
+func TestParkDisk_ProvenanceMergePreservesFirstDisk(t *testing.T) {
+	t.Parallel()
+	ctx := pve.WithTestBackoff(context.Background(), func(_ int) time.Duration { return 0 })
+	node := "pve1"
+	parkerVMID := 90000
+	volid1 := "local-lvm:vm-9010-disk-0"
+	volid2 := "local-lvm:vm-9011-disk-0"
+
+	cfg := pve.ParkerConfig{
+		VMIDRangeStart: 90000,
+		VMIDRangeEnd:   90999,
+		NowFunc:        fixedClock(time.Now().UTC()),
+	}
+
+	// Simulate parker already holding volid1 with a provenance entry.
+	existingDesc := fmt.Sprintf(
+		`<!--BOSH:{"bosh_parked_disks":{%q:{"disk_cid":%q,"parked_at":"2026-06-01T00:00:00Z","node":"pve1"}}}-->`,
+		volid1, volid1,
+	)
+
+	var lastDesc string
+	nodesSvc := &parkerNodesService{
+		updateFn: func(_, _ string, params *sdknodes.UpdateQemuConfigParams) error {
+			if params.Description != nil {
+				lastDesc = *params.Description
+			}
+			return nil
+		},
+	}
+
+	listCallCount := 0
+	c := buildParkerClientWithNodes(
+		&parkerQEMU{
+			configFn: func(_ string, vmid int) (map[string]any, error) {
+				if vmid == parkerVMID {
+					return map[string]any{
+						"tags":        "bosh-parker",
+						"scsi0":       volid1,
+						"description": existingDesc,
+					}, nil
+				}
+				return map[string]any{}, nil
+			},
+		},
+		func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+			listCallCount++
+			if listCallCount == 1 {
+				// IsDiskParked: disk not attached.
+				return parkerClusterResp(), nil
+			}
+			return parkerClusterResp(map[string]any{"vmid": int64(parkerVMID), "node": node}), nil
+		},
+		nodesSvc,
+	)
+
+	if err := pve.ParkDisk(ctx, c, nopLogger(), node, volid2, cfg, pve.ParkContext{}); err != nil {
+		t.Fatalf("ParkDisk: %v", err)
+	}
+
+	// Both volids must appear in the written description.
+	if !strings.Contains(lastDesc, volid1) {
+		t.Errorf("merged description %q must preserve first disk entry %q", lastDesc, volid1)
+	}
+	if !strings.Contains(lastDesc, volid2) {
+		t.Errorf("merged description %q must contain new disk entry %q", lastDesc, volid2)
+	}
+}
+
+// TestUnparkDisk_ProvenanceEntryRemoved verifies that UnparkDisk removes the
+// disk's provenance entry from the sentinel.
+func TestUnparkDisk_ProvenanceEntryRemoved(t *testing.T) {
+	t.Parallel()
+	node := "pve1"
+	parkerVMID := 90000
+	bareVolid := "local-lvm:vm-9020-disk-0"
+
+	cfg := pve.ParkerConfig{
+		VMIDRangeStart: 90000,
+		VMIDRangeEnd:   90999,
+	}
+
+	existingDesc := fmt.Sprintf(
+		`<!--BOSH:{"bosh_parked_disks":{%q:{"disk_cid":%q,"parked_at":"2026-06-01T00:00:00Z","node":"pve1"}}}-->`,
+		bareVolid, bareVolid,
+	)
+
+	var capturedDesc string
+	updateCalled := false
+	nodesSvc := &parkerNodesService{
+		updateFn: func(_, _ string, params *sdknodes.UpdateQemuConfigParams) error {
+			updateCalled = true
+			if params.Description != nil {
+				capturedDesc = *params.Description
+			}
+			return nil
+		},
+	}
+
+	c := buildParkerClientWithNodes(
+		&parkerQEMU{
+			configFn: func(_ string, vmid int) (map[string]any, error) {
+				if vmid == parkerVMID {
+					return map[string]any{
+						"tags":        "bosh-parker",
+						"scsi0":       bareVolid,
+						"description": existingDesc,
+					}, nil
+				}
+				return map[string]any{}, nil
+			},
+		},
+		func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+			return parkerClusterResp(
+				map[string]any{"vmid": int64(parkerVMID), "node": node},
+			), nil
+		},
+		nodesSvc,
+	)
+
+	if err := pve.UnparkDisk(context.Background(), c, nopLogger(), bareVolid, cfg); err != nil {
+		t.Fatalf("UnparkDisk: %v", err)
+	}
+
+	if !updateCalled {
+		t.Fatal("expected UpdateQemuConfig to be called to remove provenance entry")
+	}
+	if strings.Contains(capturedDesc, bareVolid) {
+		t.Errorf("description %q must not contain removed volid %q", capturedDesc, bareVolid)
+	}
+}
+
+// TestUnparkDisk_ProvenanceAbsentEntryNoUpdate verifies that UnparkDisk does
+// not call UpdateQemuConfig when no provenance entry exists for the disk.
+func TestUnparkDisk_ProvenanceAbsentEntryNoUpdate(t *testing.T) {
+	t.Parallel()
+	node := "pve1"
+	parkerVMID := 90000
+	bareVolid := "local-lvm:vm-9021-disk-0"
+	otherVolid := "local-lvm:vm-9022-disk-0"
+
+	cfg := pve.ParkerConfig{
+		VMIDRangeStart: 90000,
+		VMIDRangeEnd:   90999,
+	}
+
+	// Parker has a provenance entry for otherVolid but NOT for bareVolid.
+	existingDesc := fmt.Sprintf(
+		`<!--BOSH:{"bosh_parked_disks":{%q:{"disk_cid":%q,"parked_at":"2026-06-01T00:00:00Z","node":"pve1"}}}-->`,
+		otherVolid, otherVolid,
+	)
+
+	var updateCalled bool
+	nodesSvc := &parkerNodesService{
+		updateFn: func(_, _ string, _ *sdknodes.UpdateQemuConfigParams) error {
+			updateCalled = true
+			return nil
+		},
+	}
+
+	c := buildParkerClientWithNodes(
+		&parkerQEMU{
+			configFn: func(_ string, vmid int) (map[string]any, error) {
+				if vmid == parkerVMID {
+					return map[string]any{
+						"tags":        "bosh-parker",
+						"scsi0":       bareVolid,
+						"description": existingDesc,
+					}, nil
+				}
+				return map[string]any{}, nil
+			},
+		},
+		func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+			return parkerClusterResp(
+				map[string]any{"vmid": int64(parkerVMID), "node": node},
+			), nil
+		},
+		nodesSvc,
+	)
+
+	if err := pve.UnparkDisk(context.Background(), c, nopLogger(), bareVolid, cfg); err != nil {
+		t.Fatalf("UnparkDisk: %v", err)
+	}
+
+	if updateCalled {
+		t.Error("UpdateQemuConfig must not be called when the volid has no provenance entry")
+	}
+}
+
+// TestParkDisk_ProvenanceWriteFailure_ParkSucceeds verifies that a failure in
+// UpdateQemuConfig during provenance writing does not cause ParkDisk to fail.
+func TestParkDisk_ProvenanceWriteFailure_ParkSucceeds(t *testing.T) {
+	t.Parallel()
+	ctx := pve.WithTestBackoff(context.Background(), func(_ int) time.Duration { return 0 })
+	node := "pve1"
+	parkerVMID := 90000
+	bareVolid := "local-lvm:vm-9030-disk-0"
+
+	cfg := pve.ParkerConfig{
+		VMIDRangeStart: 90000,
+		VMIDRangeEnd:   90999,
+		NowFunc:        fixedClock(time.Now().UTC()),
+	}
+
+	// UpdateQemuConfig always fails.
+	nodesSvc := &parkerNodesService{
+		updateFn: func(_, _ string, _ *sdknodes.UpdateQemuConfigParams) error {
+			return errors.New("pveproxy backend gone (code: 596)")
+		},
+	}
+
+	listCallCount := 0
+	c := buildParkerClientWithNodes(
+		&parkerQEMU{
+			configFn: func(_ string, vmid int) (map[string]any, error) {
+				if vmid == parkerVMID {
+					return map[string]any{"tags": "bosh-parker"}, nil
+				}
+				return map[string]any{}, nil
+			},
+		},
+		func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+			listCallCount++
+			if listCallCount == 1 {
+				return parkerClusterResp(), nil
+			}
+			return parkerClusterResp(map[string]any{"vmid": int64(parkerVMID), "node": node}), nil
+		},
+		nodesSvc,
+	)
+
+	// ParkDisk must succeed even though provenance write fails.
+	err := pve.ParkDisk(ctx, c, nopLogger(), node, bareVolid, cfg, pve.ParkContext{})
+	if err != nil {
+		t.Fatalf("ParkDisk must succeed even when provenance write fails; got: %v", err)
+	}
+}
+
+// TestParkDisk_ProvenanceNonBOSHTextPreserved verifies that non-BOSH description
+// text is preserved when provenance is written.
+func TestParkDisk_ProvenanceNonBOSHTextPreserved(t *testing.T) {
+	t.Parallel()
+	ctx := pve.WithTestBackoff(context.Background(), func(_ int) time.Duration { return 0 })
+	node := "pve1"
+	parkerVMID := 90000
+	bareVolid := "local-lvm:vm-9040-disk-0"
+	humanNote := "operator note: do not delete"
+
+	cfg := pve.ParkerConfig{
+		VMIDRangeStart: 90000,
+		VMIDRangeEnd:   90999,
+		NowFunc:        fixedClock(time.Now().UTC()),
+	}
+
+	var capturedDesc string
+	nodesSvc := &parkerNodesService{
+		updateFn: func(_, _ string, params *sdknodes.UpdateQemuConfigParams) error {
+			if params.Description != nil {
+				capturedDesc = *params.Description
+			}
+			return nil
+		},
+	}
+
+	listCallCount := 0
+	c := buildParkerClientWithNodes(
+		&parkerQEMU{
+			configFn: func(_ string, vmid int) (map[string]any, error) {
+				if vmid == parkerVMID {
+					return map[string]any{
+						"tags":        "bosh-parker",
+						"description": humanNote,
+					}, nil
+				}
+				return map[string]any{}, nil
+			},
+		},
+		func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+			listCallCount++
+			if listCallCount == 1 {
+				return parkerClusterResp(), nil
+			}
+			return parkerClusterResp(map[string]any{"vmid": int64(parkerVMID), "node": node}), nil
+		},
+		nodesSvc,
+	)
+
+	if err := pve.ParkDisk(ctx, c, nopLogger(), node, bareVolid, cfg, pve.ParkContext{}); err != nil {
+		t.Fatalf("ParkDisk: %v", err)
+	}
+
+	if !strings.Contains(capturedDesc, humanNote) {
+		t.Errorf("description %q must preserve non-BOSH text %q", capturedDesc, humanNote)
+	}
+	if !strings.Contains(capturedDesc, "bosh_parked_disks") {
+		t.Errorf("description %q must also contain bosh_parked_disks sentinel", capturedDesc)
+	}
+}
+
+// TestParkerProvenance_ForeignSentinelKeysPreservedRoundTrip seeds the parker
+// VM description with non-BOSH prose + a sentinel block that contains
+// bosh_disk_metadata and bosh_disk_tags keys (written by set_disk_metadata).
+// After parking a disk, asserts both foreign keys and the prose survive
+// byte-intact alongside bosh_parked_disks. After unparking, asserts the
+// foreign keys are still intact (bosh_parked_disks entry removed).
+func TestParkerProvenance_ForeignSentinelKeysPreservedRoundTrip(t *testing.T) {
+	t.Parallel()
+	node := "pve1"
+	parkerVMID := 90000
+	bareVolid := "local-lvm:vm-9050-disk-0"
+	humanNote := "operator note: do not delete"
+
+	// Sentinel seeded by set_disk_metadata containing two foreign keys.
+	foreignSentinel := `<!--BOSH:{"bosh_disk_metadata":{"local-lvm:vm-9099-disk-0":{"director":"prod","deployment":"cf"}},"bosh_disk_tags":{"local-lvm:vm-9099-disk-0":{"env":"prod"}}}-->`
+	seededDesc := humanNote + "\n" + foreignSentinel
+
+	cfg := pve.ParkerConfig{
+		VMIDRangeStart: 90000,
+		VMIDRangeEnd:   90999,
+		NowFunc:        fixedClock(time.Date(2026, 6, 12, 12, 0, 0, 0, time.UTC)),
+	}
+
+	// descState tracks the current description as UpdateQemuConfig writes it.
+	descState := seededDesc
+	nodesSvc := &parkerNodesService{
+		updateFn: func(_, _ string, params *sdknodes.UpdateQemuConfigParams) error {
+			if params.Description != nil {
+				descState = *params.Description
+			}
+			return nil
+		},
+	}
+
+	// configFn returns descState so the provenance read-modify-write sees the
+	// latest written description.
+	qemuSvc := &parkerQEMU{
+		configFn: func(_ string, vmid int) (map[string]any, error) {
+			if vmid == parkerVMID {
+				return map[string]any{
+					"tags":        "bosh-parker",
+					"description": descState,
+				}, nil
+			}
+			return map[string]any{}, nil
+		},
+	}
+
+	// Park phase: disk free-floating on first scan, parker found on subsequent scans.
+	listCallCount := 0
+	c := buildParkerClientWithNodes(qemuSvc, func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+		listCallCount++
+		if listCallCount == 1 {
+			return parkerClusterResp(), nil // IsDiskParked: free-floating
+		}
+		return parkerClusterResp(map[string]any{"vmid": int64(parkerVMID), "node": node}), nil
+	}, nodesSvc)
+
+	ctx := pve.WithTestBackoff(context.Background(), func(_ int) time.Duration { return 0 })
+	if err := pve.ParkDisk(ctx, c, nopLogger(), node, bareVolid, cfg, pve.ParkContext{DiskCID: bareVolid}); err != nil {
+		t.Fatalf("ParkDisk: %v", err)
+	}
+
+	afterPark := descState
+
+	// After park: prose, both foreign keys, and bosh_parked_disks must all be present.
+	if !strings.Contains(afterPark, humanNote) {
+		t.Errorf("after park: description must contain prose %q; got %q", humanNote, afterPark)
+	}
+	if !strings.Contains(afterPark, "bosh_disk_metadata") {
+		t.Errorf("after park: description must contain bosh_disk_metadata; got %q", afterPark)
+	}
+	if !strings.Contains(afterPark, "bosh_disk_tags") {
+		t.Errorf("after park: description must contain bosh_disk_tags; got %q", afterPark)
+	}
+	if !strings.Contains(afterPark, "bosh_parked_disks") {
+		t.Errorf("after park: description must contain bosh_parked_disks; got %q", afterPark)
+	}
+	if !strings.Contains(afterPark, bareVolid) {
+		t.Errorf("after park: description must contain parked volid %q; got %q", bareVolid, afterPark)
+	}
+	// Verify foreign key values survive intact.
+	if !strings.Contains(afterPark, `"director":"prod"`) {
+		t.Errorf("after park: bosh_disk_metadata value must survive intact; got %q", afterPark)
+	}
+	if !strings.Contains(afterPark, `"env":"prod"`) {
+		t.Errorf("after park: bosh_disk_tags value must survive intact; got %q", afterPark)
+	}
+
+	// Unpark phase: configure the QEMU config to show disk at scsi0 so
+	// IsDiskParked returns parked=true.
+	qemuSvc.configFn = func(_ string, vmid int) (map[string]any, error) {
+		if vmid == parkerVMID {
+			return map[string]any{
+				"tags":        "bosh-parker",
+				"scsi0":       bareVolid,
+				"description": descState,
+			}, nil
+		}
+		return map[string]any{}, nil
+	}
+	// Reset cluster list to always return parker (unpark path uses IsDiskParked
+	// which does a cluster scan).
+	c2 := buildParkerClientWithNodes(qemuSvc, func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+		return parkerClusterResp(map[string]any{"vmid": int64(parkerVMID), "node": node}), nil
+	}, nodesSvc)
+
+	if err := pve.UnparkDisk(context.Background(), c2, nopLogger(), bareVolid, cfg); err != nil {
+		t.Fatalf("UnparkDisk: %v", err)
+	}
+
+	afterUnpark := descState
+
+	// After unpark: prose and both foreign keys must survive; parked entry removed.
+	if !strings.Contains(afterUnpark, humanNote) {
+		t.Errorf("after unpark: prose %q must survive; got %q", humanNote, afterUnpark)
+	}
+	if !strings.Contains(afterUnpark, "bosh_disk_metadata") {
+		t.Errorf("after unpark: bosh_disk_metadata must survive; got %q", afterUnpark)
+	}
+	if !strings.Contains(afterUnpark, "bosh_disk_tags") {
+		t.Errorf("after unpark: bosh_disk_tags must survive; got %q", afterUnpark)
+	}
+	if strings.Contains(afterUnpark, bareVolid) {
+		t.Errorf("after unpark: parked volid %q must be removed; got %q", bareVolid, afterUnpark)
 	}
 }
 

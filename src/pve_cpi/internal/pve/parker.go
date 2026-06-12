@@ -27,11 +27,14 @@ package pve
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"regexp"
 	"strings"
+	"time"
 
+	sdknodes "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/nodes"
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/qemu"
 
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
@@ -65,6 +68,263 @@ type ParkerConfig struct {
 	// "director--<sanitized-id>" tag is added to newly created parker VMs so
 	// operators can distinguish parkers per director in multi-director clusters.
 	DirectorID string
+	// NowFunc returns the current time. Nil defaults to time.Now().UTC().
+	// Tests inject a fixed clock to assert parked_at values deterministically.
+	NowFunc func() time.Time
+}
+
+// parkerNow returns the configured clock time or time.Now().UTC() when NowFunc is nil.
+func parkerNow(cfg ParkerConfig) time.Time {
+	if cfg.NowFunc != nil {
+		return cfg.NowFunc()
+	}
+	return time.Now().UTC()
+}
+
+// ---------------------------------------------------------------------------
+// Provenance sentinel codec (local to pve package — no handlers import to avoid cycle)
+// ---------------------------------------------------------------------------
+
+// parkerSentinelPattern matches <!--BOSH:{...}--> in a VM description. Same
+// wire format as set_disk_metadata; the two codecs coexist by using distinct
+// top-level JSON keys (bosh_disk_metadata vs bosh_parked_disks).
+var parkerSentinelPattern = regexp.MustCompile(`<!--BOSH:(.*?)-->`)
+
+// ParkContext carries per-call attribution for provenance records written on
+// park. Fields are optional: zero values are omitted from the sentinel JSON.
+// DiskCID should be the encoded CID as the Director knows it (may include a
+// metadata suffix). SourceVMCID is the VM the disk was detached from.
+type ParkContext struct {
+	// DiskCID is the full disk CID passed by the Director (may include encoded
+	// metadata suffix). Stored as disk_cid in the provenance entry so disk-audit
+	// can cross-reference back to the Director's view of the disk.
+	DiskCID string
+	// SourceVMCID is the BOSH VM CID from which the disk was detached. Omitted
+	// when unknown (e.g. re-park on retry when only the bare volid is available).
+	SourceVMCID string
+}
+
+// parkerProvEntry is a single parked-disk record stored in the sentinel.
+// Optional fields are omitted when empty so the JSON stays minimal.
+type parkerProvEntry struct {
+	DiskCID     string `json:"disk_cid"`
+	SourceVMCID string `json:"source_vm_cid,omitempty"`
+	ParkedAt    string `json:"parked_at"`
+	Node        string `json:"node"`
+	DirectorID  string `json:"director_id,omitempty"`
+}
+
+// parseParkerSentinel extracts the description text outside the sentinel
+// (nonBOSH) and the current bosh_parked_disks map. Corrupted JSON → fresh
+// empty map (sentinel rebuilt from scratch; nonBOSH text preserved).
+func parseParkerSentinel(desc string) (nonBOSH string, disks map[string]parkerProvEntry, raw map[string]json.RawMessage) {
+	nonBOSH = desc
+	disks = make(map[string]parkerProvEntry)
+	raw = make(map[string]json.RawMessage)
+
+	m := parkerSentinelPattern.FindStringSubmatchIndex(desc)
+	if m == nil {
+		return
+	}
+	jsonStr := desc[m[2]:m[3]]
+	nonBOSH = strings.TrimSpace(desc[:m[0]])
+
+	// Decode all top-level keys into raw to preserve unknown keys.
+	if err := json.Unmarshal([]byte(jsonStr), &raw); err != nil {
+		// Corrupted sentinel — discard, keep nonBOSH.
+		raw = make(map[string]json.RawMessage)
+		return
+	}
+
+	// Extract our own key.
+	if rawDisks, ok := raw["bosh_parked_disks"]; ok {
+		_ = json.Unmarshal(rawDisks, &disks) // best-effort; corruption → empty map
+		delete(raw, "bosh_parked_disks")     // will be re-serialised below
+	}
+	return
+}
+
+// renderParkerSentinel builds the full description string from the nonBOSH
+// prefix, the updated bosh_parked_disks map, and the raw remainder of other
+// codec keys. When both disks and raw are empty, returns nonBOSH unchanged
+// (no sentinel block emitted — avoids writing an empty <!--BOSH:{}-->).
+func renderParkerSentinel(nonBOSH string, disks map[string]parkerProvEntry, raw map[string]json.RawMessage) (string, error) {
+	if len(disks) == 0 && len(raw) == 0 {
+		return nonBOSH, nil
+	}
+
+	// Merge: start from raw (other keys), add our key.
+	merged := make(map[string]json.RawMessage, len(raw)+1)
+	for k, v := range raw {
+		merged[k] = v
+	}
+	if len(disks) > 0 {
+		b, err := json.Marshal(disks)
+		if err != nil {
+			return "", err
+		}
+		merged["bosh_parked_disks"] = json.RawMessage(b)
+	}
+
+	sentinel, err := json.Marshal(merged)
+	if err != nil {
+		return "", err
+	}
+
+	newDesc := fmt.Sprintf("<!--BOSH:%s-->", string(sentinel))
+	if nonBOSH != "" {
+		newDesc = nonBOSH + "\n" + newDesc
+	}
+	return newDesc, nil
+}
+
+// updateParkerProvenance merges a parked-disk entry into the parker VM
+// description sentinel and writes it back via UpdateQemuConfig.
+//
+// Best-effort: any failure is logged at WARN and the function returns nil.
+// Park/unpark success is never gated on provenance writes.
+//
+// Concurrent-park lost-update is acceptable — two CPI processes racing to
+// park different disks on the same parker may each overwrite the other's
+// provenance entry. The disk itself remains correctly attached; provenance
+// is advisory metadata for disk-audit.
+func updateParkerProvenance(ctx context.Context, c Client, logger *log.Logger, node string, parkerVMID int, bareVolid string, cfg ParkerConfig, pctx ParkContext) {
+	vmidStr := fmt.Sprintf("%d", parkerVMID)
+
+	vmCfg, err := c.QEMU().Config(ctx, node, parkerVMID)
+	if err != nil {
+		if logger != nil {
+			logger.Warn("parker provenance: config fetch failed — provenance not updated",
+				log.Int("parker_vmid", parkerVMID),
+				log.String("node", node),
+				log.String("volid", bareVolid),
+				log.String("error", err.Error()),
+			)
+		}
+		return
+	}
+
+	currentDesc := ""
+	if v, ok := vmCfg["description"]; ok {
+		if s, ok2 := v.(string); ok2 {
+			currentDesc = s
+		}
+	}
+
+	nonBOSH, disks, rawOther := parseParkerSentinel(currentDesc)
+
+	// disk_cid: prefer the full encoded CID from ParkContext (as the Director
+	// knows it); fall back to bareVolid when context is absent.
+	diskCIDField := bareVolid
+	if pctx.DiskCID != "" {
+		diskCIDField = pctx.DiskCID
+	}
+	entry := parkerProvEntry{
+		DiskCID:     diskCIDField,
+		SourceVMCID: pctx.SourceVMCID,
+		ParkedAt:    parkerNow(cfg).Format(time.RFC3339),
+		Node:        node,
+		DirectorID:  cfg.DirectorID,
+	}
+	disks[bareVolid] = entry
+
+	newDesc, marshalErr := renderParkerSentinel(nonBOSH, disks, rawOther)
+	if marshalErr != nil {
+		if logger != nil {
+			logger.Warn("parker provenance: marshal failed — provenance not updated",
+				log.Int("parker_vmid", parkerVMID),
+				log.String("volid", bareVolid),
+				log.String("error", marshalErr.Error()),
+			)
+		}
+		return
+	}
+
+	nodesSvc := c.Nodes()
+	if nodesSvc == nil {
+		// No nodes service available (e.g. test stub without injection). Skip silently.
+		return
+	}
+	updateErr := nodesSvc.UpdateQemuConfig(ctx, node, vmidStr, &sdknodes.UpdateQemuConfigParams{
+		Description: &newDesc,
+	})
+	if updateErr != nil {
+		if logger != nil {
+			logger.Warn("parker provenance: UpdateQemuConfig failed — provenance not updated",
+				log.Int("parker_vmid", parkerVMID),
+				log.String("node", node),
+				log.String("volid", bareVolid),
+				log.String("error", updateErr.Error()),
+			)
+		}
+	}
+}
+
+// removeParkerProvenance removes the bareVolid entry from the parker VM
+// description sentinel. When no entry exists, no API call is made.
+//
+// Best-effort: any failure is logged at WARN and the function returns nil.
+func removeParkerProvenance(ctx context.Context, c Client, logger *log.Logger, node string, parkerVMID int, bareVolid string, _ ParkerConfig) {
+	vmidStr := fmt.Sprintf("%d", parkerVMID)
+
+	vmCfg, err := c.QEMU().Config(ctx, node, parkerVMID)
+	if err != nil {
+		if logger != nil {
+			logger.Warn("parker provenance: config fetch failed on remove — provenance not removed",
+				log.Int("parker_vmid", parkerVMID),
+				log.String("node", node),
+				log.String("volid", bareVolid),
+				log.String("error", err.Error()),
+			)
+		}
+		return
+	}
+
+	currentDesc := ""
+	if v, ok := vmCfg["description"]; ok {
+		if s, ok2 := v.(string); ok2 {
+			currentDesc = s
+		}
+	}
+
+	nonBOSH, disks, rawOther := parseParkerSentinel(currentDesc)
+
+	// Absent entry — nothing to remove; skip the API call.
+	if _, exists := disks[bareVolid]; !exists {
+		return
+	}
+	delete(disks, bareVolid)
+
+	newDesc, marshalErr := renderParkerSentinel(nonBOSH, disks, rawOther)
+	if marshalErr != nil {
+		if logger != nil {
+			logger.Warn("parker provenance: marshal failed on remove — provenance not removed",
+				log.Int("parker_vmid", parkerVMID),
+				log.String("volid", bareVolid),
+				log.String("error", marshalErr.Error()),
+			)
+		}
+		return
+	}
+
+	nodesSvc := c.Nodes()
+	if nodesSvc == nil {
+		// No nodes service available (e.g. test stub without injection). Skip silently.
+		return
+	}
+	updateErr := nodesSvc.UpdateQemuConfig(ctx, node, vmidStr, &sdknodes.UpdateQemuConfigParams{
+		Description: &newDesc,
+	})
+	if updateErr != nil {
+		if logger != nil {
+			logger.Warn("parker provenance: UpdateQemuConfig failed on remove — provenance not removed",
+				log.Int("parker_vmid", parkerVMID),
+				log.String("node", node),
+				log.String("volid", bareVolid),
+				log.String("error", updateErr.Error()),
+			)
+		}
+	}
 }
 
 // parkerTagSanitizeRe removes characters that PVE rejects in tag values.
@@ -446,6 +706,9 @@ func IsDiskParked(ctx context.Context, c Client, logger *log.Logger, bareVolid s
 // ParkDisk attaches bareVolid to a parker VM on node. It is idempotent: if the
 // disk is already parked on any parker VM the call returns nil immediately.
 //
+// pctx carries optional per-call attribution written into the provenance record.
+// Pass a zero ParkContext when the source VM or full disk CID are unavailable.
+//
 // The algorithm:
 //  1. IsDiskParked cluster-wide — already parked → nil.
 //  2. EnsureParker for node.
@@ -454,7 +717,7 @@ func IsDiskParked(ctx context.Context, c Client, logger *log.Logger, bareVolid s
 //  5. ErrNoSlots → EnsureFreshParker + retry attach once.
 //
 // All PVE mutations are wrapped with RetryOnTransientOrLock.
-func ParkDisk(ctx context.Context, c Client, logger *log.Logger, node, bareVolid string, cfg ParkerConfig) error {
+func ParkDisk(ctx context.Context, c Client, logger *log.Logger, node, bareVolid string, cfg ParkerConfig, pctx ParkContext) error {
 	if c == nil {
 		return cpierrors.Cloud("ParkDisk: client must not be nil")
 	}
@@ -474,13 +737,13 @@ func ParkDisk(ctx context.Context, c Client, logger *log.Logger, node, bareVolid
 		return nil
 	}
 
-	return parkDiskOnNode(ctx, c, logger, node, bareVolid, cfg)
+	return parkDiskOnNode(ctx, c, logger, node, bareVolid, cfg, pctx)
 }
 
 // parkDiskOnNode performs the actual attach to a parker VM on node. Separated
 // from ParkDisk so EnsureFreshParker overflow can recurse once without the
 // idempotency pre-check.
-func parkDiskOnNode(ctx context.Context, c Client, logger *log.Logger, node, bareVolid string, cfg ParkerConfig) error {
+func parkDiskOnNode(ctx context.Context, c Client, logger *log.Logger, node, bareVolid string, cfg ParkerConfig, pctx ParkContext) error {
 	parkerVMID, ensureErr := EnsureParker(ctx, c, logger, node, cfg)
 	if ensureErr != nil {
 		return cpierrors.Wrap(ensureErr, "ParkDisk: ensure parker")
@@ -488,6 +751,7 @@ func parkDiskOnNode(ctx context.Context, c Client, logger *log.Logger, node, bar
 
 	slotErr := attachToParker(ctx, c, logger, node, parkerVMID, bareVolid)
 	if slotErr == nil {
+		updateParkerProvenance(ctx, c, logger, node, parkerVMID, bareVolid, cfg, pctx)
 		return nil
 	}
 
@@ -501,6 +765,7 @@ func parkDiskOnNode(ctx context.Context, c Client, logger *log.Logger, node, bar
 		if attachErr != nil {
 			return cpierrors.Wrap(attachErr, "ParkDisk: attach to fresh parker")
 		}
+		updateParkerProvenance(ctx, c, logger, node, freshVMID, bareVolid, cfg, pctx)
 		return nil
 	}
 
@@ -574,5 +839,6 @@ func UnparkDisk(ctx context.Context, c Client, logger *log.Logger, bareVolid str
 			fmt.Sprintf("UnparkDisk: detach %q from parker vmid %d slot %s on node %s",
 				bareVolid, parkerVMID, slot, parkerNode))
 	}
+	removeParkerProvenance(ctx, c, logger, parkerNode, parkerVMID, bareVolid, cfg)
 	return nil
 }
