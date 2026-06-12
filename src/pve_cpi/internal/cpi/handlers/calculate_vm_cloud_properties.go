@@ -30,13 +30,19 @@ type vmResources struct {
 
 // vmCloudProperties is the cloud_properties map returned to the BOSH Director.
 // The Director passes this as cloud_properties in subsequent create_vm calls.
+// EphemeralDiskSizeMB echoes the requested value from vm_resources (in MiB, matching
+// the BOSH convention used throughout this codebase) under the key "ephemeral_disk_size_mb"
+// so that create_vm's createVMCloudProps.EphemeralDiskSizeMB field receives it and
+// resolveEphemeralShape creates the ephemeral disk. A zero value is omitted from JSON
+// so pre-existing serialization is unchanged when the field is absent from the request.
 type vmCloudProperties struct {
-	Cores         int    `json:"cores"`
-	Sockets       int    `json:"sockets"`
-	Memory        int    `json:"memory"`
-	VMDiskFormat  string `json:"vm_disk_format"`
-	TargetNode    string `json:"target_node"`
-	TargetStorage string `json:"target_storage"`
+	Cores               int    `json:"cores"`
+	Sockets             int    `json:"sockets"`
+	Memory              int    `json:"memory"`
+	VMDiskFormat        string `json:"vm_disk_format"`
+	TargetNode          string `json:"target_node"`
+	TargetStorage       string `json:"target_storage"`
+	EphemeralDiskSizeMB int    `json:"ephemeral_disk_size_mb,omitempty"`
 }
 
 // clusterStatusNode is the decoded shape of each node entry returned by
@@ -301,12 +307,13 @@ func HandleCalculateVMCloudProperties(deps Deps) cpi.Handler {
 		}
 
 		props := vmCloudProperties{
-			Cores:         res.CPU,
-			Sockets:       1,
-			Memory:        res.RAM,
-			VMDiskFormat:  deps.Config.VMDiskFormat,
-			TargetNode:    bestNode,
-			TargetStorage: effectiveStorage,
+			Cores:               res.CPU,
+			Sockets:             1,
+			Memory:              res.RAM,
+			VMDiskFormat:        deps.Config.VMDiskFormat,
+			TargetNode:          bestNode,
+			TargetStorage:       effectiveStorage,
+			EphemeralDiskSizeMB: res.EphemeralDiskSize,
 		}
 
 		return props, nil

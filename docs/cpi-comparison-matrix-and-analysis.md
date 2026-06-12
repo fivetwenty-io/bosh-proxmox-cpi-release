@@ -2083,7 +2083,7 @@ between creation and the director's first metadata sync. The name is display-onl
 carries no addressing semantics; no CPI lookup or correlation logic reads it. Tier:
 operability.
 
-#### 7.43 OPEN — Capability-based VM sizing (`vm_resources` / `calculate_vm_cloud_properties`)
+#### 7.43 SHIPPED — Capability-based VM sizing (`vm_resources` / `calculate_vm_cloud_properties`)
 
 *References: AWS, Azure, OpenStack-Go, Google, Alicloud.* Five of the six reference CPIs
 implement `calculate_vm_cloud_properties`, the BOSH surface that turns an abstract
@@ -2106,6 +2106,12 @@ richer variant.
 **Limits.** PVE has no fixed instance-type catalog, so the CPI must synthesize the mapping
 rather than look it up. A live capacity query races against cluster scheduling and is best
 treated as advisory, not a reservation. Tier: operability.
+
+**Shipped:** `calculate_vm_cloud_properties` now returns `ephemeral_disk_size_mb` in the
+`cloud_properties` response, closing the BOSH `vm_resources` contract. The key name matches
+`createVMCloudProps.EphemeralDiskSizeMB` in `create_vm` so that `resolveEphemeralShape`
+receives the requested minimum and creates the ephemeral disk; a zero input is omitted,
+preserving byte-identical behavior for callers that do not set the field.
 
 #### 7.44 OPEN — Concurrency-safe metadata and notes writes
 

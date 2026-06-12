@@ -675,6 +675,151 @@ func TestHandleCalculateVMCloudProperties_StorageOverride_Absent(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// §7.43 ephemeral_disk_size echo tests
+// ---------------------------------------------------------------------------
+
+// TestHandleCalculateVMCloudProperties_EphemeralDiskSizeMB_EchoedInResponse verifies
+// that a non-zero ephemeral_disk_size in vm_resources is present in the returned
+// cloud_properties under the key "ephemeral_disk_size_mb" — the key consumed by
+// create_vm's createVMCloudProps.EphemeralDiskSizeMB field and passed to
+// resolveEphemeralShape. Unit: MiB (BOSH vm_resources.ephemeral_disk_size is MB/MiB).
+func TestHandleCalculateVMCloudProperties_EphemeralDiskSizeMB_EchoedInResponse(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name              string
+		ephemeralDiskSize int
+		wantPresent       bool
+	}{
+		{name: "zero_omitted", ephemeralDiskSize: 0, wantPresent: false},
+		{name: "small_1024_MiB", ephemeralDiskSize: 1024, wantPresent: true},
+		{name: "large_102400_MiB", ephemeralDiskSize: 102400, wantPresent: true},
+	}
+
+	gib := int64(1024 * 1024 * 1024)
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			resp := cluster.ListStatusResponse{
+				nodeJSON(testNode, 8, 16*gib, 4*gib, 1),
+			}
+			svc := &mockClusterService{statusResp: &resp}
+			deps := makeCalcDeps(svc)
+			h := handlers.HandleCalculateVMCloudProperties(deps)
+
+			result, err := h.Handle(
+				context.Background(),
+				makeCalcArgs(2, 1024, tc.ephemeralDiskSize),
+				jsonrpc.Context{},
+			)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			m := decodeCloudProps(t, result)
+			raw, present := m["ephemeral_disk_size_mb"]
+
+			if tc.wantPresent {
+				if !present {
+					t.Fatalf("ephemeral_disk_size_mb missing from cloud_properties; want %d", tc.ephemeralDiskSize)
+				}
+				var got int
+				if e := json.Unmarshal(raw, &got); e != nil {
+					t.Fatalf("unmarshal ephemeral_disk_size_mb: %v", e)
+				}
+				if got != tc.ephemeralDiskSize {
+					t.Errorf("ephemeral_disk_size_mb = %d; want %d", got, tc.ephemeralDiskSize)
+				}
+			} else {
+				if present {
+					t.Errorf("ephemeral_disk_size_mb present in response with zero input; want omitted (got raw %s)", raw)
+				}
+			}
+		})
+	}
+}
+
+// TestHandleCalculateVMCloudProperties_EphemeralDiskSizeMB_ZeroOmitted verifies
+// that when ephemeral_disk_size is 0 (not provided), the field is absent from
+// the JSON response, preserving byte-identical behavior for pre-existing callers.
+func TestHandleCalculateVMCloudProperties_EphemeralDiskSizeMB_ZeroOmitted(t *testing.T) {
+	t.Parallel()
+
+	gib := int64(1024 * 1024 * 1024)
+	resp := cluster.ListStatusResponse{
+		nodeJSON(testNode, 8, 16*gib, 4*gib, 1),
+	}
+	svc := &mockClusterService{statusResp: &resp}
+	deps := makeCalcDeps(svc)
+	h := handlers.HandleCalculateVMCloudProperties(deps)
+
+	result, err := h.Handle(context.Background(), makeCalcArgs(2, 1024, 0), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	m := decodeCloudProps(t, result)
+	if _, present := m["ephemeral_disk_size_mb"]; present {
+		t.Errorf("ephemeral_disk_size_mb must be absent when input is 0; key was present in response")
+	}
+}
+
+// TestHandleCalculateVMCloudProperties_EphemeralDiskSizeMB_WireThrough verifies
+// that the JSON emitted by calculate_vm_cloud_properties is consumable by
+// create_vm's cloud_properties decode path: marshaling the response and
+// re-decoding it into the same key map that create_vm uses must yield a
+// non-zero ephemeral_disk_size_mb equal to the requested value.
+// This catches key-name mismatches between the two handlers at the wire level.
+func TestHandleCalculateVMCloudProperties_EphemeralDiskSizeMB_WireThrough(t *testing.T) {
+	t.Parallel()
+
+	const requestedMB = 10240
+
+	gib := int64(1024 * 1024 * 1024)
+	resp := cluster.ListStatusResponse{
+		nodeJSON(testNode, 8, 16*gib, 4*gib, 1),
+	}
+	svc := &mockClusterService{statusResp: &resp}
+	deps := makeCalcDeps(svc)
+	h := handlers.HandleCalculateVMCloudProperties(deps)
+
+	result, err := h.Handle(
+		context.Background(),
+		makeCalcArgs(2, 1024, requestedMB),
+		jsonrpc.Context{},
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Marshal the handler result to JSON — this is what the Director serializes
+	// and passes back as cloud_properties in the subsequent create_vm call.
+	wire, err := json.Marshal(result)
+	if err != nil {
+		t.Fatalf("marshal handler result: %v", err)
+	}
+
+	// Decode into the key map create_vm uses. The struct field consuming
+	// ephemeral_disk_size_mb is createVMCloudProps.EphemeralDiskSizeMB
+	// (unexported type). Decode into an anonymous struct mirroring just that
+	// field to verify the key name aligns at the wire level.
+	var createVMProps struct {
+		EphemeralDiskSizeMB int `json:"ephemeral_disk_size_mb"`
+	}
+	if e := json.Unmarshal(wire, &createVMProps); e != nil {
+		t.Fatalf("unmarshal into create_vm cloud_properties shape: %v", e)
+	}
+	if createVMProps.EphemeralDiskSizeMB != requestedMB {
+		t.Errorf(
+			"wire-through: create_vm would see EphemeralDiskSizeMB=%d; want %d — key mismatch between calculate and create handlers",
+			createVMProps.EphemeralDiskSizeMB, requestedMB,
+		)
+	}
+}
+
 // TestHandleCalculateVMCloudProperties_StorageFirst_StorageNoImages verifies
 // that a node whose storage is active but lacks the "images" content type
 // is excluded from selection.
