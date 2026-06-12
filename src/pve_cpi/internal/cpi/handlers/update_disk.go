@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -103,12 +104,13 @@ func HandleUpdateDisk(deps Deps) Handler {
 			// from transport/cluster-scan errors (which must propagate so the caller
 			// can detect transient failures and retry).
 			//
-			// FindVMByDiskVolid returns a plain CloudError (no cause, no retry flag)
-			// containing "not attached to any VM" when the scan completes and finds no
-			// match. Transport/cluster errors are wrapped with a cause and may carry
-			// TypeRetriableCloud. pve.IsNotFound handles SDK 404 shapes; the message
-			// check handles FindVMByDiskVolid's own sentinel text.
-			if pve.IsNotFound(vmErr) || strings.Contains(vmErr.Error(), "not attached to any VM") {
+			// FindVMByDiskVolid wraps pve.ErrDiskNotAttachedToAnyVM via fmt.Errorf when
+			// the cluster scan completes with no match. Transport/cluster errors are
+			// distinct wrapped errors without that sentinel. errors.Is traverses the
+			// chain, so both direct and double-wrapped forms are caught.
+			// pve.IsNotFound handles SDK 404 shapes for callers that surface a 404
+			// instead of ErrDiskNotAttachedToAnyVM.
+			if pve.IsNotFound(vmErr) || errors.Is(vmErr, pve.ErrDiskNotAttachedToAnyVM) {
 				return nil, cpierrors.DetachedDisk(
 					"update_disk: detached disk cannot be updated — disk %q not attached to any VM", diskCID,
 				)

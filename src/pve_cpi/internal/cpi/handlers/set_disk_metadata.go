@@ -162,6 +162,19 @@ func coerceTagMap(v any) map[string]string {
 // volid equality (with option-string tolerance via pve.DiskOptStrContainsVolid)
 // to prevent false matches on diskCIDs that are substrings of other volids.
 //
+// When the parked-disk strategy is active (ParkedStrategyActive), VMs
+// classified as parker VMs via pve.IsParkerVM are silently skipped. The
+// classification uses the vmid and tags fields already present in the
+// cluster-resources item — no additional API calls are made. A disk parked on
+// a parker VM produces 0 matches, which flows into the existing warn+nil path
+// ("disk not attached; metadata not persisted"). This is correct: metadata
+// for a parked disk is irrelevant until the disk is attached to a real VM.
+//
+// The IsParkerVM call is guarded by ParkedStrategyActive so that zero-range
+// configs (VMIDRangeStart=0, VMIDRangeEnd=0) never classify any VM as a
+// parker — IsParkerVM with a zero range would pass the range check for all
+// VMIDs ≥ 0, making the tag check the only discriminator, which is unsafe.
+//
 // Transport errors from ListResources propagate as wrapped retriable errors.
 // Per-VM Config errors are skipped only when they are not-found (the VM was
 // deleted concurrently or its config is gone); any other Config error is
@@ -184,9 +197,21 @@ func findVMsHostingDisk(ctx context.Context, deps Deps, diskCID string) ([]attac
 		return nil, cpierrors.Cloud("set_disk_metadata: nil response from cluster resources")
 	}
 
+	// Build ParkerConfig once for the scan. Only used when ParkedStrategyActive.
+	parkerActive := deps.Config != nil && deps.Config.ParkedStrategyActive()
+	var parkerCfg pve.ParkerConfig
+	if parkerActive {
+		parkerCfg = pve.ParkerConfig{
+			VMIDRangeStart: deps.Config.ParkedDiskVMIDRangeStartValue(),
+			VMIDRangeEnd:   deps.Config.ParkedDiskVMIDRangeEndValue(),
+			DirectorID:     deps.Config.StemcellDirectorID(),
+		}
+	}
+
 	type resourceEntry struct {
 		VMID int64  `json:"vmid"`
 		Node string `json:"node"`
+		Tags string `json:"tags"`
 	}
 
 	var matches []attachedVM
@@ -206,6 +231,15 @@ func findVMsHostingDisk(ctx context.Context, deps Deps, diskCID string) ([]attac
 		}
 
 		vmid := int(entry.VMID)
+
+		// Skip parker VMs: a parked disk on a parker VM should not be treated
+		// as "attached to a real VM". Uses only data from the cluster-resources
+		// item — no extra API calls. Gated on ParkedStrategyActive to prevent
+		// false positives when the parker range is unconfigured (zero range).
+		if parkerActive && pve.IsParkerVM(vmid, entry.Tags, parkerCfg) {
+			continue
+		}
+
 		cfg, cfgErr := deps.PVE.QEMU().Config(ctx, vmNode, vmid)
 		if cfgErr != nil {
 			if pve.IsNotFound(cfgErr) {

@@ -80,6 +80,26 @@ func HandleSnapshotDisk(deps Deps) Handler {
 		}
 
 		// ----------------------------------------------------------------
+		// 3a. Parker guard (opt-in, zero extra calls when strategy unset).
+		//
+		// A PVE snapshot targets the entire VM, not a single disk. Snapshotting
+		// a parker VM would entangle ALL parked disks from ALL BOSH deployments
+		// into a single snapshot — semantically wrong and potentially very large.
+		// Reject the operation with a non-retriable error so the director surfaces
+		// the condition to the operator rather than silently succeeding.
+		//
+		// The guard runs only when ParkedStrategyActive() is true; never-opted-in
+		// installations see zero added API calls and byte-identical behavior.
+		//
+		// Range check first (fast, no API): if holder VMID falls in the parker
+		// band, fetch the VM config once to confirm the bosh-parker tag before
+		// classifying. Out-of-range holders short-circuit without a Config read.
+		// ----------------------------------------------------------------
+		if err := guardSnapshotParked(ctx, deps, diskCID, vmid, node); err != nil {
+			return nil, err
+		}
+
+		// ----------------------------------------------------------------
 		// 4. Generate a unique snapshot name: bosh-<timestamp>-<hex4>.
 		// ----------------------------------------------------------------
 		snapName, err := generateSnapName()
@@ -134,6 +154,44 @@ func HandleSnapshotDisk(deps Deps) Handler {
 
 		return snapshotCID, nil
 	})
+}
+
+// guardSnapshotParked rejects a snapshot operation when the disk's holder VM is
+// a parker VM. A PVE snapshot targets the entire VM, not a single disk;
+// snapshotting a parker VM would entangle all parked disks from all BOSH
+// deployments. Returns a non-retriable Cloud error when the condition is
+// detected; nil when strategy is unset or the holder is a regular workload VM.
+//
+// Range check first (fast, no API): only when vmid falls within the parker band
+// does the helper fetch the VM config once to confirm the bosh-parker tag.
+// Out-of-range holders short-circuit with no Config read.
+func guardSnapshotParked(ctx context.Context, deps Deps, diskCID string, vmid int, node string) error {
+	if deps.Config == nil || !deps.Config.ParkedStrategyActive() {
+		return nil
+	}
+	parkerCfg := pve.ParkerConfig{
+		VMIDRangeStart: deps.Config.ParkedDiskVMIDRangeStartValue(),
+		VMIDRangeEnd:   deps.Config.ParkedDiskVMIDRangeEndValue(),
+		DirectorID:     deps.Config.StemcellDirectorID(),
+	}
+	if vmid < parkerCfg.VMIDRangeStart || vmid > parkerCfg.VMIDRangeEnd {
+		return nil
+	}
+	holderCfg, cfgErr := deps.PVE.QEMU().Config(ctx, node, vmid)
+	if cfgErr != nil {
+		return cpierrors.WrapAs(cfgErr, cpierrors.TypeRetriableCloud,
+			fmt.Sprintf("snapshot_disk: parker check: config fetch for vmid %d", vmid))
+	}
+	tags, _ := holderCfg["tags"].(string)
+	if pve.IsParkerVM(vmid, tags, parkerCfg) {
+		return cpierrors.Cloud(
+			"snapshot_disk: disk %s is held by a parker VM (vmid %d): "+
+				"disk is not attached to a workload VM (disk is parked as detached); "+
+				"snapshotting a parker VM would entangle all parked disks across deployments",
+			diskCID, vmid,
+		)
+	}
+	return nil
 }
 
 // generateSnapName returns a snapshot name of the form "bosh-<timestamp>-<hex4>".

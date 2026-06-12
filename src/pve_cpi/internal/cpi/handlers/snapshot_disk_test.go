@@ -8,6 +8,7 @@ import (
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/cpi/handlers"
+	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
 	sdkclusterapi "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cluster"
@@ -541,6 +542,230 @@ func TestHandleSnapshotDisk_LVMThin_CID(t *testing.T) {
 	sid, ok := result.(string)
 	if !ok || sid == "" {
 		t.Fatalf("LVMThin CID: result: want non-empty snapshot_cid string, got %T %v", result, result)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Parker-guard tests.
+// ---------------------------------------------------------------------------
+
+// snapDepsWithConfig constructs Deps using a caller-supplied *config.CPIConfig.
+func snapDepsWithConfig(cfg *config.CPIConfig, qemuSvc qemu.Service, clusterSvc sdkclusterapi.Service) handlers.Deps {
+	return handlers.Deps{
+		Config: cfg,
+		PVE: &mockPVEClient{
+			qemuSvc:    qemuSvc,
+			clusterSvc: clusterSvc,
+		},
+		Logger: log.NewNopLogger(),
+	}
+}
+
+// TestHandleSnapshotDisk_ParkedDisk_Rejected verifies that when the holder VM
+// is a parker VM (VMID in range, bosh-parker tag), snapshot_disk returns a
+// non-retriable CloudError and does not call Snapshot.
+func TestHandleSnapshotDisk_ParkedDisk_Rejected(t *testing.T) {
+	t.Parallel()
+
+	const parkerVMID = 90001
+	const parkerNode = testNode
+	const volid = "local-lvm:vm-9001-disk-0"
+
+	var snapshotCalled bool
+
+	qemuSvc := &snapQEMUService{
+		configFn: func(_ context.Context, _ string, vmid int) (map[string]any, error) {
+			if vmid == parkerVMID {
+				// Parker VM config: disk attached + bosh-parker tag.
+				return map[string]any{
+					"scsi5": volid,
+					"tags":  "bosh-parker",
+				}, nil
+			}
+			return map[string]any{}, nil
+		},
+		snapshotFn: func(_ context.Context, _ string, _ int, _ string, _ map[string]any) (string, error) {
+			snapshotCalled = true
+			return "", nil
+		},
+	}
+
+	clusterSvc := &snapClusterService{
+		listFn: func(_ context.Context, _ *sdkclusterapi.ListResourcesParams) (*sdkclusterapi.ListResourcesResponse, error) {
+			return clusterRespWith(parkerVMID, parkerNode), nil
+		},
+	}
+
+	cfg := &config.CPIConfig{
+		Node:                     testNode,
+		ParkedDiskVMIDRangeStart: 90000,
+		ParkedDiskVMIDRangeEnd:   90999,
+		DetachedDiskStrategy:     "parked",
+	}
+
+	h := handlers.HandleSnapshotDisk(snapDepsWithConfig(cfg, qemuSvc, clusterSvc))
+	_, err := h.Handle(context.Background(), marshalArgs(volid), jsonrpc.Context{})
+	if err == nil {
+		t.Fatal("expected non-retriable CloudError when disk is parked")
+	}
+	if !cpierrors.IsType(err, cpierrors.TypeCloud) {
+		t.Errorf("error type: want TypeCloud (non-retriable), got %T: %v", err, err)
+	}
+	if cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+		t.Errorf("error must NOT be retriable for parked-disk snapshot guard")
+	}
+	if snapshotCalled {
+		t.Error("Snapshot must not be called when disk is parked")
+	}
+}
+
+// TestHandleSnapshotDisk_ParkedStrategyActive_RealVM_Proceeds verifies that
+// when parked strategy is active but the holder is a real VM (VMID outside
+// the parker range), snapshot proceeds normally with no extra Config calls
+// beyond what FindVMByDiskVolid already makes.
+func TestHandleSnapshotDisk_ParkedStrategyActive_RealVM_Proceeds(t *testing.T) {
+	t.Parallel()
+
+	const realVMID = 200 // well outside parker range 90000–90999
+	const volid = "local-lvm:vm-9001-disk-0"
+
+	var snapshotCalled bool
+	// configFn call count: FindVMByDiskVolid reads Config for each cluster VM.
+	// The parker guard must NOT add an extra Config call when vmid is out of range.
+	var configCalls int
+
+	qemuSvc := &snapQEMUService{
+		configFn: func(_ context.Context, _ string, vmid int) (map[string]any, error) {
+			configCalls++
+			if vmid == realVMID {
+				return map[string]any{"scsi0": volid}, nil
+			}
+			return map[string]any{}, nil
+		},
+		snapshotFn: func(_ context.Context, _ string, _ int, _ string, _ map[string]any) (string, error) {
+			snapshotCalled = true
+			return "", nil
+		},
+	}
+
+	clusterSvc := &snapClusterService{
+		listFn: func(_ context.Context, _ *sdkclusterapi.ListResourcesParams) (*sdkclusterapi.ListResourcesResponse, error) {
+			return clusterRespWith(realVMID, testNode), nil
+		},
+	}
+
+	cfg := &config.CPIConfig{
+		Node:                     testNode,
+		ParkedDiskVMIDRangeStart: 90000,
+		ParkedDiskVMIDRangeEnd:   90999,
+		DetachedDiskStrategy:     "parked",
+	}
+
+	h := handlers.HandleSnapshotDisk(snapDepsWithConfig(cfg, qemuSvc, clusterSvc))
+	_, err := h.Handle(context.Background(), marshalArgs(volid), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error for real VM with parked strategy active: %v", err)
+	}
+	if !snapshotCalled {
+		t.Error("Snapshot must be called for real VM holder")
+	}
+	// Config called exactly once (FindVMByDiskVolid scans cluster VMs).
+	// Parker guard adds zero calls because vmid=200 is out of the parker range.
+	if configCalls != 1 {
+		t.Errorf("parker guard: want 1 Config call (scan only, no extra for out-of-range vmid), got %d", configCalls)
+	}
+}
+
+// TestHandleSnapshotDisk_NeverOptedIn_ZeroExtraCalls verifies that when
+// ParkedStrategyActive() is false (strategy unset, range unset), no parker
+// API calls are made and snapshot succeeds as before.
+func TestHandleSnapshotDisk_NeverOptedIn_ZeroExtraCalls(t *testing.T) {
+	t.Parallel()
+
+	const volid = "local-lvm:vm-9001-disk-0"
+
+	var configCalls int
+	var snapshotCalled bool
+
+	qemuSvc := &snapQEMUService{
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			configCalls++
+			return map[string]any{"scsi0": volid}, nil
+		},
+		snapshotFn: func(_ context.Context, _ string, _ int, _ string, _ map[string]any) (string, error) {
+			snapshotCalled = true
+			return "", nil
+		},
+	}
+
+	clusterSvc := &snapClusterService{
+		listFn: func(_ context.Context, _ *sdkclusterapi.ListResourcesParams) (*sdkclusterapi.ListResourcesResponse, error) {
+			return clusterRespWith(100, testNode), nil
+		},
+	}
+
+	// Never-opted-in: no strategy, no range.
+	cfg := &config.CPIConfig{Node: testNode}
+
+	h := handlers.HandleSnapshotDisk(snapDepsWithConfig(cfg, qemuSvc, clusterSvc))
+	_, err := h.Handle(context.Background(), marshalArgs(volid), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error for never-opted-in: %v", err)
+	}
+	if !snapshotCalled {
+		t.Error("Snapshot must be called when strategy never opted in")
+	}
+	// Only the Config read from FindVMByDiskVolid — no parker guard call.
+	if configCalls != 1 {
+		t.Errorf("never-opted-in: want exactly 1 Config call, got %d (possible extra parker call)", configCalls)
+	}
+}
+
+// TestHandleSnapshotDisk_InRangeNoParkerTag_Proceeds verifies that when the
+// holder VMID falls in the parker range but lacks the bosh-parker tag (not a
+// parker VM), the snapshot proceeds normally.
+func TestHandleSnapshotDisk_InRangeNoParkerTag_Proceeds(t *testing.T) {
+	t.Parallel()
+
+	const vmidInRange = 90050
+	const volid = "local-lvm:vm-9001-disk-0"
+
+	var snapshotCalled bool
+
+	qemuSvc := &snapQEMUService{
+		configFn: func(_ context.Context, _ string, vmid int) (map[string]any, error) {
+			if vmid == vmidInRange {
+				// In-range VM but NO bosh-parker tag.
+				return map[string]any{"scsi0": volid}, nil
+			}
+			return map[string]any{}, nil
+		},
+		snapshotFn: func(_ context.Context, _ string, _ int, _ string, _ map[string]any) (string, error) {
+			snapshotCalled = true
+			return "", nil
+		},
+	}
+
+	clusterSvc := &snapClusterService{
+		listFn: func(_ context.Context, _ *sdkclusterapi.ListResourcesParams) (*sdkclusterapi.ListResourcesResponse, error) {
+			return clusterRespWith(vmidInRange, testNode), nil
+		},
+	}
+
+	cfg := &config.CPIConfig{
+		Node:                     testNode,
+		ParkedDiskVMIDRangeStart: 90000,
+		ParkedDiskVMIDRangeEnd:   90999,
+		DetachedDiskStrategy:     "parked",
+	}
+
+	h := handlers.HandleSnapshotDisk(snapDepsWithConfig(cfg, qemuSvc, clusterSvc))
+	_, err := h.Handle(context.Background(), marshalArgs(volid), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("in-range VM without bosh-parker tag must not be blocked: %v", err)
+	}
+	if !snapshotCalled {
+		t.Error("Snapshot must be called when in-range VM is not a parker VM")
 	}
 }
 

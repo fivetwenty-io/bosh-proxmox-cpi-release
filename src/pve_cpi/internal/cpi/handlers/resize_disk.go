@@ -89,6 +89,11 @@ func HandleResizeDisk(deps Deps) Handler {
 			return nil, err
 		}
 
+		// Parker VMs are always stopped (onboot=0, never started). Resizing a
+		// disk attached to a parker VM is safe: PVE's resize API operates on
+		// the backing volume directly, with no live-disk constraint. The resize
+		// proceeds through the normal path — no parker-specific gate needed.
+
 		diskID, err := pve.ResolveDiskID(ctx, deps.PVE, node, vmid, bareDiskCID)
 		if err != nil {
 			// ResolveDiskID returns CloudError when disk not attached.

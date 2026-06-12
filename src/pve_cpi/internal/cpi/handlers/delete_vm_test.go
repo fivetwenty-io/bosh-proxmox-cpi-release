@@ -1709,6 +1709,274 @@ func TestHandleDeleteVM_FastPath_SweepCapsAtMax(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Parker VM refusal tests
+// ---------------------------------------------------------------------------
+
+// parkerDepsWithRange builds Deps with the parker VMID range [90000, 90999]
+// configured. vmid is the parker VM being targeted; configFn provides its config.
+func parkerDepsWithRange(vmid int, qemuSvc *mockQEMUService, nodesSvc *mockNodesService) handlers.Deps {
+	deps := testDepsFoundVMWithStorage(vmid, qemuSvc, nodesSvc, &mockTasksService{}, &mockAgentService{}, &mockStorageService{})
+	deps.Config.ParkedDiskVMIDRangeStart = 90000
+	deps.Config.ParkedDiskVMIDRangeEnd = 90999
+	return deps
+}
+
+// TestHandleDeleteVM_RefusesParkerVM_SlowPath verifies that when a VMID falls
+// in the configured parker range and carries the bosh-parker tag, delete_vm
+// returns a non-retriable CloudError and does not issue Stop or DeleteQemu.
+func TestHandleDeleteVM_RefusesParkerVM_SlowPath(t *testing.T) {
+	t.Parallel()
+
+	const parkerVMID = 90010
+	stopCalled := false
+	deleteCalled := false
+
+	qemuSvc := &mockQEMUService{
+		stopFn: func(_ context.Context, _ string, _ int) (string, error) {
+			stopCalled = true
+			return "", nil
+		},
+		configFn: func(_ context.Context, _ string, vmid int) (map[string]any, error) {
+			if vmid == parkerVMID {
+				return map[string]any{"tags": "bosh-parker"}, nil
+			}
+			return map[string]any{}, nil
+		},
+	}
+	nodesSvc := &mockNodesService{
+		deleteQemuFn: func(_ context.Context, _ string, _ string, _ *nodes.DeleteQemuParams) (*nodes.DeleteQemuResponse, error) {
+			deleteCalled = true
+			raw := nodes.DeleteQemuResponse{}
+			return &raw, nil
+		},
+	}
+
+	deps := parkerDepsWithRange(parkerVMID, qemuSvc, nodesSvc)
+	h := handlers.HandleDeleteVM(deps)
+	_, err := h.Handle(context.Background(), marshalArgs(strconv.Itoa(parkerVMID)), jsonrpc.Context{})
+
+	if err == nil {
+		t.Fatal("expected non-retriable CloudError for parker VM, got nil")
+	}
+	var cpiErr *cpierrors.Error
+	if !errors.As(err, &cpiErr) {
+		t.Fatalf("expected *cpierrors.Error, got %T: %v", err, err)
+	}
+	if cpiErr.OkToRetry() {
+		t.Errorf("parker refusal must be non-retriable; OkToRetry()=true")
+	}
+	if !strings.Contains(err.Error(), "parker") {
+		t.Errorf("error message must mention 'parker'; got: %q", err.Error())
+	}
+	if stopCalled {
+		t.Error("Stop must NOT be called for a parker VM")
+	}
+	if deleteCalled {
+		t.Error("DeleteQemu must NOT be called for a parker VM")
+	}
+}
+
+// TestHandleDeleteVM_RefusesParkerVM_FastPath verifies that the fast path also
+// refuses a parker VM before issuing the skiplock destroy.
+func TestHandleDeleteVM_RefusesParkerVM_FastPath(t *testing.T) {
+	t.Parallel()
+
+	const parkerVMID = 90020
+	deleteCalled := false
+
+	qemuSvc := &mockQEMUService{
+		stopFn: func(_ context.Context, _ string, _ int) (string, error) {
+			return "", nil
+		},
+		configFn: func(_ context.Context, _ string, vmid int) (map[string]any, error) {
+			if vmid == parkerVMID {
+				return map[string]any{"tags": "bosh-parker"}, nil
+			}
+			return map[string]any{}, nil
+		},
+	}
+	nodesSvc := &mockNodesService{
+		deleteQemuFn: func(_ context.Context, _ string, _ string, _ *nodes.DeleteQemuParams) (*nodes.DeleteQemuResponse, error) {
+			deleteCalled = true
+			raw := nodes.DeleteQemuResponse{}
+			return &raw, nil
+		},
+		updateQemuConfigFn: func(_ context.Context, _ string, _ string, _ *nodes.UpdateQemuConfigParams) error {
+			return nil
+		},
+	}
+
+	deps := parkerDepsWithRange(parkerVMID, qemuSvc, nodesSvc)
+	enabled := true
+	deps.Config.FastPathDelete = &enabled
+
+	h := handlers.HandleDeleteVM(deps)
+	_, err := h.Handle(context.Background(), marshalArgs(strconv.Itoa(parkerVMID)), jsonrpc.Context{})
+
+	if err == nil {
+		t.Fatal("fast-path: expected non-retriable CloudError for parker VM, got nil")
+	}
+	var cpiErr *cpierrors.Error
+	if !errors.As(err, &cpiErr) {
+		t.Fatalf("fast-path: expected *cpierrors.Error, got %T: %v", err, err)
+	}
+	if cpiErr.OkToRetry() {
+		t.Errorf("fast-path: parker refusal must be non-retriable; OkToRetry()=true")
+	}
+	if deleteCalled {
+		t.Error("fast-path: DeleteQemu must NOT be called for a parker VM")
+	}
+}
+
+// TestHandleDeleteVM_NormalVM_NoParkerCheck_WhenRangeUnset verifies that when
+// the parker range is not configured (ParkedStrategyActive=false), delete_vm
+// proceeds normally with zero extra API calls for the parker check.
+func TestHandleDeleteVM_NormalVM_NoParkerCheck_WhenRangeUnset(t *testing.T) {
+	t.Parallel()
+
+	configCalls := 0
+	deleteCalled := false
+
+	qemuSvc := &mockQEMUService{
+		stopFn: func(_ context.Context, _ string, _ int) (string, error) {
+			return "", nil
+		},
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			configCalls++
+			return map[string]any{}, nil
+		},
+	}
+	nodesSvc := &mockNodesService{
+		deleteQemuFn: func(_ context.Context, _ string, _ string, _ *nodes.DeleteQemuParams) (*nodes.DeleteQemuResponse, error) {
+			deleteCalled = true
+			raw := nodes.DeleteQemuResponse{}
+			return &raw, nil
+		},
+	}
+
+	// testDepsFoundVM uses testConfig() which has ParkedDiskVMIDRangeStart/End=0
+	// and DetachedDiskStrategy="" → ParkedStrategyActive()=false.
+	h := handlers.HandleDeleteVM(testDepsFoundVM(101, qemuSvc, nodesSvc, &mockTasksService{}, &mockAgentService{}))
+	_, err := h.Handle(context.Background(), marshalArgs("101"), jsonrpc.Context{})
+
+	if err != nil {
+		t.Fatalf("normal VM with range unset: unexpected error: %v", err)
+	}
+	if !deleteCalled {
+		t.Error("normal VM: DeleteQemu must be called")
+	}
+	// Slow path reads config in detachForeignActiveDisks (once) and
+	// guardUnusedVolumes (once), totalling 2 when no detach occurs.
+	// The parker check must add zero additional config calls when
+	// ParkedStrategyActive=false (range unset). Assert count ≤ 2.
+	if configCalls > 2 {
+		t.Errorf("range-unset: Config called %d times; expected ≤2 (no parker check overhead)", configCalls)
+	}
+}
+
+// TestHandleDeleteVM_InBandVMID_ConfigReadError_Retriable verifies that when a
+// VMID falls in the parker range and the Config read fails with a transient
+// error, delete_vm returns a retriable error and does NOT issue DeleteQemu.
+// This prevents the fast-path skiplock+purge destroy from bypassing protection=1
+// on a parker VM whose config is momentarily unreadable.
+func TestHandleDeleteVM_InBandVMID_ConfigReadError_Retriable(t *testing.T) {
+	t.Parallel()
+
+	const vmid = 90030
+	deleteCalled := false
+
+	qemuSvc := &mockQEMUService{
+		stopFn: func(_ context.Context, _ string, _ int) (string, error) {
+			return "", nil
+		},
+		configFn: func(_ context.Context, _ string, id int) (map[string]any, error) {
+			if id == vmid {
+				return nil, errors.New("pve: connection refused")
+			}
+			return map[string]any{}, nil
+		},
+	}
+	nodesSvc := &mockNodesService{
+		deleteQemuFn: func(_ context.Context, _ string, _ string, _ *nodes.DeleteQemuParams) (*nodes.DeleteQemuResponse, error) {
+			deleteCalled = true
+			raw := nodes.DeleteQemuResponse{}
+			return &raw, nil
+		},
+		updateQemuConfigFn: func(_ context.Context, _ string, _ string, _ *nodes.UpdateQemuConfigParams) error {
+			return nil
+		},
+	}
+
+	for _, fastPath := range []bool{false, true} {
+		deleteCalled = false
+		deps := parkerDepsWithRange(vmid, qemuSvc, nodesSvc)
+		if fastPath {
+			enabled := true
+			deps.Config.FastPathDelete = &enabled
+		}
+		label := "slow-path"
+		if fastPath {
+			label = "fast-path"
+		}
+
+		h := handlers.HandleDeleteVM(deps)
+		_, err := h.Handle(context.Background(), marshalArgs(strconv.Itoa(vmid)), jsonrpc.Context{})
+
+		if err == nil {
+			t.Fatalf("%s: expected retriable error for in-band VMID with config read failure, got nil", label)
+		}
+		var cpiErr *cpierrors.Error
+		if !errors.As(err, &cpiErr) {
+			t.Fatalf("%s: expected *cpierrors.Error, got %T: %v", label, err, err)
+		}
+		if !cpiErr.OkToRetry() {
+			t.Errorf("%s: in-band config-read error must be retriable; OkToRetry()=false", label)
+		}
+		if deleteCalled {
+			t.Errorf("%s: DeleteQemu must NOT be called when parker config read fails", label)
+		}
+	}
+}
+
+// TestHandleDeleteVM_VMInRange_NoParkerTag_Proceeds verifies that a VM whose
+// VMID happens to fall in the parker range but does NOT carry the bosh-parker
+// tag is not refused — it proceeds to normal deletion.
+func TestHandleDeleteVM_VMInRange_NoParkerTag_Proceeds(t *testing.T) {
+	t.Parallel()
+
+	const vmid = 90050
+	deleteCalled := false
+
+	qemuSvc := &mockQEMUService{
+		stopFn: func(_ context.Context, _ string, _ int) (string, error) {
+			return "", nil
+		},
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			// VM in parker range but NO bosh-parker tag.
+			return map[string]any{"tags": "some-other-tag"}, nil
+		},
+	}
+	nodesSvc := &mockNodesService{
+		deleteQemuFn: func(_ context.Context, _ string, _ string, _ *nodes.DeleteQemuParams) (*nodes.DeleteQemuResponse, error) {
+			deleteCalled = true
+			raw := nodes.DeleteQemuResponse{}
+			return &raw, nil
+		},
+	}
+
+	deps := parkerDepsWithRange(vmid, qemuSvc, nodesSvc)
+	h := handlers.HandleDeleteVM(deps)
+	_, err := h.Handle(context.Background(), marshalArgs(strconv.Itoa(vmid)), jsonrpc.Context{})
+
+	if err != nil {
+		t.Fatalf("VM in range without parker tag: unexpected error: %v", err)
+	}
+	if !deleteCalled {
+		t.Error("VM in range without parker tag: DeleteQemu must be called")
+	}
+}
+
 // TestHandleDeleteVM_AuthFailure verifies that a 401 Unauthorized from QEMU.Stop
 // is classified as a non-retriable Cloud error. Auth failures indicate operator
 // misconfiguration (wrong token) and must surface immediately without retry.

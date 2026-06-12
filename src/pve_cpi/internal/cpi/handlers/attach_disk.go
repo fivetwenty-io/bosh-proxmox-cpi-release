@@ -101,7 +101,26 @@ func HandleAttachDisk(deps Deps) Handler {
 		}
 
 		// --------------------------------------------------------------------
-		// 3. Snapshot pre-flight guard.
+		// 3. Unpark disk (parked strategy only).
+		//
+		// When parked strategy is active, the disk may be held on a parker VM's
+		// scsi slot. Unpark it cluster-wide before snapshot guard and slot
+		// selection so subsequent PVE calls see the disk as a free-floating
+		// volume. Not-parked → fast nil (no API calls beyond IsDiskParked
+		// cluster scan). Unpark failure → retriable error; the disk remains
+		// parked and the next BOSH retry will re-attempt here.
+		//
+		// Co-location check (local backend) is unaffected: UnparkDisk performs
+		// a DetachDisk on the parker VM but does not move the volume between
+		// nodes, so the disk node established by attachDiskResolveNode remains
+		// valid.
+		// --------------------------------------------------------------------
+		if err := unparkBeforeAttach(ctx, deps, diskCID, bareDiskCID); err != nil {
+			return nil, err
+		}
+
+		// --------------------------------------------------------------------
+		// 4. Snapshot pre-flight guard.
 		//
 		// PVE permits attaching a disk to a VM that has existing snapshots, but the
 		// newly attached disk is absent from all prior snapshots — on rollback the
@@ -591,6 +610,25 @@ func devicePathByID(diskID string) (string, error) {
 		return "", cpierrors.Cloud("attach_disk: diskID %q is not a scsi slot", diskID)
 	}
 	return fmt.Sprintf("/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_drive-scsi%d", idx), nil
+}
+
+// unparkBeforeAttach detaches the disk from its parker VM when the parked
+// strategy is active. A no-op when strategy is unset (zero extra API calls).
+// Unpark failure returns a retriable error; the disk stays parked and the
+// next BOSH retry will re-attempt here.
+func unparkBeforeAttach(ctx context.Context, deps Deps, diskCID, bareDiskCID string) error {
+	if deps.Config == nil || !deps.Config.ParkedStrategyActive() {
+		return nil
+	}
+	parkerCfg := pve.ParkerConfig{
+		VMIDRangeStart: deps.Config.ParkedDiskVMIDRangeStartValue(),
+		VMIDRangeEnd:   deps.Config.ParkedDiskVMIDRangeEndValue(),
+		DirectorID:     deps.Config.StemcellDirectorID(),
+	}
+	if unErr := pve.UnparkDisk(ctx, deps.PVE, deps.Logger, bareDiskCID, parkerCfg); unErr != nil {
+		return cpierrors.Retriable("attach_disk: unpark disk %s failed: %s", diskCID, unErr.Error())
+	}
+	return nil
 }
 
 // nextFreeSCSIIndexAtLeast returns the lowest scsi slot index >= floor that is

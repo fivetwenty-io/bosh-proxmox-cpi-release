@@ -277,6 +277,43 @@ func HandleDeleteVM(deps Deps) cpi.Handler {
 		}
 		logger.Debug("delete_vm: VM located", log.String("node", node))
 
+		// --- parker VM refusal (belt-and-braces PVE-level backstop) ---
+		// The Director should never hand a parker CID to delete_vm (parkers are
+		// internal CPI state). This guard catches misconfiguration or operator
+		// error. Classification is presence-based: range check first (zero extra
+		// API calls when not in range), then one config read to confirm the
+		// bosh-parker tag only when the VMID falls in the configured range.
+		// When the parker range is not configured (ParkedStrategyActive=false),
+		// IsParkerVM returns false with zero API calls — byte-identical behavior.
+		if deps.Config != nil && deps.Config.ParkedStrategyActive() {
+			parkerCfg := pve.ParkerConfig{
+				VMIDRangeStart: deps.Config.ParkedDiskVMIDRangeStartValue(),
+				VMIDRangeEnd:   deps.Config.ParkedDiskVMIDRangeEndValue(),
+				DirectorID:     deps.Config.StemcellDirectorID(),
+			}
+			// Range-first: only read the VM config when vmid is in the parker band.
+			if vmid >= parkerCfg.VMIDRangeStart && vmid <= parkerCfg.VMIDRangeEnd {
+				// Fail-closed: a transient config read error on an in-band VMID must
+				// NOT proceed. The fast path uses skiplock=true + purge=true, which
+				// bypasses protection=1 and destroys all parked disks. Any doubt →
+				// retriable so the Director retries when PVE recovers.
+				vmCfg, cfgErr := deps.PVE.QEMU().Config(ctx, node, vmid)
+				if cfgErr != nil {
+					if pve.IsNotFound(cfgErr) {
+						// VM gone during the read — treat as already deleted.
+						return nil, nil
+					}
+					return nil, cpierrors.Retriable(
+						"delete_vm: could not read config for in-band VMID %d to verify parker status: %s (retry when PVE recovers)",
+						vmid, cfgErr.Error())
+				}
+				tagsRaw, _ := vmCfg["tags"].(string)
+				if pve.IsParkerVM(vmid, tagsRaw, parkerCfg) {
+					return nil, cpierrors.Cloud("refusing to delete parker VM %d", vmid)
+				}
+			}
+		}
+
 		// --- per-node in-flight gate (opt-in; limit=0 → unlimited, no gating) ---
 		if deps.Config != nil {
 			inflightRelease, inflightErr := deps.Inflight.acquire(ctx, node, deps.Config.MaxInflightPerNodeLimit())

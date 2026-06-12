@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
@@ -164,7 +165,11 @@ func HandleDetachDisk(deps Deps) Handler {
 			return nil, err
 		}
 		if alreadyDetached {
-			return nil, nil
+			// Disk not on an active bus: could be a retry (disk already detached by
+			// a prior attempt) or a genuinely free-floating disk. When the parked
+			// strategy is active check whether the disk is already parked cluster-wide;
+			// if not, resolve its node and park it now so retries converge to parked state.
+			return nil, handleAlreadyDetachedParked(ctx, deps, diskCID, bareDiskCID)
 		}
 
 		// --------------------------------------------------------------------
@@ -181,34 +186,8 @@ func HandleDetachDisk(deps Deps) Handler {
 		//   Snapshots present + AllowDiskOpsWithSnapshots=true  → WARN + proceed
 		//   No snapshots                                        → proceed normally
 		// --------------------------------------------------------------------
-		if snapNames, snapErr := pve.HasSnapshots(ctx, deps.PVE, node, vmid); snapErr != nil {
-			if deps.Config.RequireSnapshotCheckPass {
-				return nil, cpierrors.Wrap(snapErr,
-					"detach_disk: snapshot pre-flight check failed and require_snapshot_check_pass is set",
-				)
-			}
-			deps.Logger.Warn("detach_disk: snapshot pre-flight check failed — proceeding (fail-open)",
-				log.String("node", node),
-				log.Int("vmid", vmid),
-				log.Err(snapErr),
-			)
-		} else if len(snapNames) > 0 {
-			if deps.Config.AllowDiskOpsWithSnapshots {
-				deps.Logger.Warn("detach_disk: proceeding despite snapshots (allow_disk_ops_with_snapshots=true)",
-					log.String("vm_cid", vmCID),
-					log.String("node", node),
-					log.String("snapshots", strings.Join(snapNames, ", ")),
-				)
-			} else {
-				return nil, cpierrors.SnapshotBlocked(
-					"detach_disk: VM %s (node %s) has %d snapshot(s) [%s] that reference disk %s."+
-						" PVE will reject detach while snapshots reference this disk."+
-						" Delete snapshot(s) [%s] first, then retry detach_disk;"+
-						" or set pve.allow_disk_ops_with_snapshots=true to bypass this guard.",
-					vmCID, node, len(snapNames), strings.Join(snapNames, ", "),
-					diskCID, strings.Join(snapNames, ", "),
-				)
-			}
+		if err := detachDiskSnapshotGuard(ctx, deps, vmCID, node, vmid, diskCID, deps.Config, deps.Logger); err != nil {
+			return nil, err
 		}
 
 		// --------------------------------------------------------------------
@@ -234,10 +213,157 @@ func HandleDetachDisk(deps Deps) Handler {
 		)
 
 		// --------------------------------------------------------------------
-		// 5. Return nil (void success).
+		// 5. Park disk when detached_disk_strategy=parked (fail-closed
+		//    retriable). A park failure causes the Director to retry detach_disk;
+		//    on retry the disk is free-floating so ParkDisk's idempotency check
+		//    skips the IsDiskParked scan and re-parks directly.
 		// --------------------------------------------------------------------
+		if err := parkAfterDetach(ctx, deps, diskCID, bareDiskCID, node); err != nil {
+			return nil, err
+		}
+
 		return nil, nil
 	})
+}
+
+// handleAlreadyDetachedParked handles the alreadyDetached=true branch of
+// HandleDetachDisk when the parked strategy is active. It checks whether the
+// free-floating disk is already parked; if not and DetachedDiskParkedEnabled is
+// set, it re-resolves the disk's node and parks it so retries converge to parked
+// state. Returns nil on idempotent success (already parked, volume gone, or
+// strategy unset).
+func handleAlreadyDetachedParked(ctx context.Context, deps Deps, diskCID, bareDiskCID string) error {
+	if !deps.Config.ParkedStrategyActive() {
+		return nil
+	}
+	parkerCfg := pve.ParkerConfig{
+		VMIDRangeStart: deps.Config.ParkedDiskVMIDRangeStartValue(),
+		VMIDRangeEnd:   deps.Config.ParkedDiskVMIDRangeEndValue(),
+		DirectorID:     deps.Config.StemcellDirectorID(),
+	}
+	_, _, _, isParked, parkedErr := pve.IsDiskParked(ctx, deps.PVE, deps.Logger, bareDiskCID, parkerCfg)
+	if parkedErr != nil {
+		return cpierrors.WrapAs(parkedErr, cpierrors.TypeRetriableCloud,
+			fmt.Sprintf("detach_disk: already-detached parker check for disk %s", diskCID))
+	}
+	if isParked {
+		// Already in parked state — idempotent success.
+		return nil
+	}
+	if !deps.Config.DetachedDiskParkedEnabled() {
+		return nil
+	}
+	// Free-floating disk + strategy=parked: re-resolve node and park.
+	alreadyDetachedNode, resolveErr := resolveNodeForDetachedDisk(ctx, deps, bareDiskCID)
+	if resolveErr != nil {
+		// Volume gone between detach and re-park attempt — idempotent success.
+		if cpierrors.IsType(resolveErr, cpierrors.TypeDiskNotFound) {
+			return nil
+		}
+		return resolveErr
+	}
+	if parkErr := pve.ParkDisk(ctx, deps.PVE, deps.Logger, alreadyDetachedNode, bareDiskCID, parkerCfg); parkErr != nil {
+		return cpierrors.WrapAs(parkErr, cpierrors.TypeRetriableCloud,
+			fmt.Sprintf("detach_disk: park free-floating disk %s (fail-closed)", diskCID))
+	}
+	return nil
+}
+
+// detachDiskSnapshotGuard runs the snapshot pre-flight check for detach_disk.
+// Returns nil when safe to proceed; returns a Cloud or wrapped error otherwise.
+//
+// Policy:
+//
+//	HasSnapshots error + cfg.RequireSnapshotCheckPass  → Wrap error (fail-closed)
+//	HasSnapshots error + !cfg.RequireSnapshotCheckPass → nil (WARN + proceed)
+//	snapshots present + !cfg.AllowDiskOpsWithSnapshots → SnapshotBlocked error
+//	snapshots present + cfg.AllowDiskOpsWithSnapshots  → nil (WARN + proceed)
+//	no snapshots                                       → nil
+func detachDiskSnapshotGuard(ctx context.Context, deps Deps, vmCID, node string, vmid int, diskCID string, cfg *config.CPIConfig, logger *log.Logger) error {
+	snapNames, snapErr := pve.HasSnapshots(ctx, deps.PVE, node, vmid)
+	if snapErr != nil {
+		if cfg.RequireSnapshotCheckPass {
+			return cpierrors.Wrap(snapErr,
+				"detach_disk: snapshot pre-flight check failed and require_snapshot_check_pass is set",
+			)
+		}
+		logger.Warn("detach_disk: snapshot pre-flight check failed — proceeding (fail-open)",
+			log.String("node", node),
+			log.Int("vmid", vmid),
+			log.Err(snapErr),
+		)
+		return nil
+	}
+	if len(snapNames) == 0 {
+		return nil
+	}
+	if cfg.AllowDiskOpsWithSnapshots {
+		logger.Warn("detach_disk: proceeding despite snapshots (allow_disk_ops_with_snapshots=true)",
+			log.String("vm_cid", vmCID),
+			log.String("node", node),
+			log.String("snapshots", strings.Join(snapNames, ", ")),
+		)
+		return nil
+	}
+	return cpierrors.SnapshotBlocked(
+		"detach_disk: VM %s (node %s) has %d snapshot(s) [%s] that reference disk %s."+
+			" PVE will reject detach while snapshots reference this disk."+
+			" Delete snapshot(s) [%s] first, then retry detach_disk;"+
+			" or set pve.allow_disk_ops_with_snapshots=true to bypass this guard.",
+		vmCID, node, len(snapNames), strings.Join(snapNames, ", "),
+		diskCID, strings.Join(snapNames, ", "),
+	)
+}
+
+// parkAfterDetach parks bareDiskCID onto a parker VM after a successful
+// DetachDisk call when detached_disk_strategy=parked. A no-op when the parked
+// strategy is not enabled. Failure is fail-closed retriable: the Director
+// retries detach_disk; on retry the disk is free-floating so ParkDisk's
+// idempotency check skips the IsDiskParked scan and re-parks directly.
+func parkAfterDetach(ctx context.Context, deps Deps, diskCID, bareDiskCID, node string) error {
+	if !deps.Config.DetachedDiskParkedEnabled() {
+		return nil
+	}
+	parkerCfg := pve.ParkerConfig{
+		VMIDRangeStart: deps.Config.ParkedDiskVMIDRangeStartValue(),
+		VMIDRangeEnd:   deps.Config.ParkedDiskVMIDRangeEndValue(),
+		DirectorID:     deps.Config.StemcellDirectorID(),
+	}
+	if parkErr := pve.ParkDisk(ctx, deps.PVE, deps.Logger, node, bareDiskCID, parkerCfg); parkErr != nil {
+		return cpierrors.WrapAs(parkErr, cpierrors.TypeRetriableCloud,
+			fmt.Sprintf("detach_disk: park disk %s after detach (fail-closed: retry will re-park)", diskCID))
+	}
+	return nil
+}
+
+// resolveNodeForDetachedDisk locates the PVE node holding bareDiskCID using the
+// storage backend. Used when the disk is free-floating (not attached to any VM)
+// and the handler needs a node to pass to ParkDisk.
+//
+// Mirrors the backend-resolution step in detachDiskResolveSlot but returns only
+// the node; caller already confirmed the disk exists (volume-not-found is
+// treated as retriable here since the just-completed detach should have left it
+// present on a node).
+func resolveNodeForDetachedDisk(ctx context.Context, deps Deps, bareDiskCID string) (string, error) {
+	storage, _, err := pve.ParseDiskCID(bareDiskCID)
+	if err != nil {
+		return "", cpierrors.DiskNotFound(bareDiskCID)
+	}
+	backend, err := backendResolverOrDefault(deps).Resolve(ctx, storage)
+	if err != nil {
+		return "", cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
+			fmt.Sprintf("detach_disk: backend resolution for free-floating disk %s", bareDiskCID))
+	}
+	node, err := backend.NodeForExisting(ctx, bareDiskCID)
+	if err != nil {
+		if pve.IsNotFound(err) {
+			// Volume disappeared between detach and park — not retriable, treat as success.
+			return "", cpierrors.DiskNotFound(bareDiskCID)
+		}
+		return "", cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
+			fmt.Sprintf("detach_disk: node lookup for free-floating disk %s", bareDiskCID))
+	}
+	return node, nil
 }
 
 // sweepUnusedDiskSlot removes a lingering unusedN config entry that still

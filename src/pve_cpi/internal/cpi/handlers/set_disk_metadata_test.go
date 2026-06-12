@@ -1121,3 +1121,208 @@ func TestHandleSetDiskMetadata_NotFoundSkippedDuringScan(t *testing.T) {
 		t.Errorf("404 during scan: persisted description missing disk_cid; got: %s", *nodesSvc.capturedDesc)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Parker exclusion tests
+// ---------------------------------------------------------------------------
+
+// clusterResourceEntry holds vmid, node, and optional tags for building
+// cluster-resource responses in parker exclusion tests.
+type clusterResourceEntry struct {
+	vmid int64
+	node string
+	tags string
+}
+
+// clusterResourcesWithTaggedVMs builds a ListResourcesResponse that includes
+// a "tags" field in each entry. Used to simulate cluster responses where
+// some VMs carry the "bosh-parker" tag.
+func clusterResourcesWithTaggedVMs(entries ...clusterResourceEntry) *sdkclusterapi.ListResourcesResponse {
+	type entry struct {
+		VMID int64  `json:"vmid"`
+		Node string `json:"node"`
+		Tags string `json:"tags,omitempty"`
+	}
+	resp := make(sdkclusterapi.ListResourcesResponse, 0, len(entries))
+	for _, e := range entries {
+		raw, _ := json.Marshal(entry{VMID: e.vmid, Node: e.node, Tags: e.tags})
+		resp = append(resp, raw)
+	}
+	return &resp
+}
+
+// makeParkedDeps builds Deps with the parked strategy active and the given
+// parker VMID range. DirectorID is left empty.
+func makeParkedDeps(client pve.Client, rangeStart, rangeEnd int) handlers.Deps {
+	return handlers.Deps{
+		Config: &config.CPIConfig{
+			VMDiskFormat:             "qcow2",
+			DetachedDiskStrategy:     "parked",
+			ParkedDiskVMIDRangeStart: rangeStart,
+			ParkedDiskVMIDRangeEnd:   rangeEnd,
+		},
+		PVE:    client,
+		Logger: log.NewNopLogger(),
+	}
+}
+
+// TestHandleSetDiskMetadata_ParkerSkipped_RealVMMatches verifies that when the
+// cluster resource list includes both a parker VM and a real VM, the parker VM
+// is skipped and metadata is persisted on the real VM only.
+func TestHandleSetDiskMetadata_ParkerSkipped_RealVMMatches(t *testing.T) {
+	t.Parallel()
+
+	const parkerVMID = int64(90001)
+	const realVMID = int64(200)
+	const parkerRangeStart = 90000
+	const parkerRangeEnd = 90999
+
+	clusterSvc := &diskMetaClusterSvc{
+		resp: clusterResourcesWithTaggedVMs(
+			clusterResourceEntry{vmid: parkerVMID, node: testNode, tags: "bosh-parker"},
+			clusterResourceEntry{vmid: realVMID, node: testNode, tags: ""},
+		),
+	}
+	nodesSvc := &diskMetaNodesMock{}
+	// Both VMs "hold" the disk in their QEMU config. The parker must be excluded
+	// so only the real VM is counted — producing exactly 1 match and triggering
+	// the metadata-persist path rather than the ambiguous-attachment error.
+	qemuCfgs := map[string]map[string]any{
+		diskKey(testNode, int(parkerVMID)): vmConfigWithDisk(testDiskCID, ""),
+		diskKey(testNode, int(realVMID)):   vmConfigWithDisk(testDiskCID, ""),
+	}
+	client := buildDiskMetaPVE(clusterSvc, qemuCfgs, nodesSvc)
+
+	h := handlers.HandleSetDiskMetadata(makeParkedDeps(client, parkerRangeStart, parkerRangeEnd))
+	_, err := h.Handle(context.Background(), makeMetaArgs(testDiskCID, map[string]any{"deployment": "cf"}), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("parker skip + real VM: unexpected error: %v", err)
+	}
+	if nodesSvc.capturedDesc == nil {
+		t.Fatal("parker skip + real VM: UpdateQemuConfig not called — metadata not persisted on real VM")
+	}
+	if !strings.Contains(*nodesSvc.capturedDesc, testDiskCID) {
+		t.Errorf("parker skip + real VM: persisted description missing disk_cid; got: %s", *nodesSvc.capturedDesc)
+	}
+}
+
+// TestHandleSetDiskMetadata_ParkedDiskOnly_WarnAndNil verifies that when the
+// only VM holding the disk is a parker VM, findVMsHostingDisk returns 0
+// matches, and the handler logs a warn and returns nil (the existing
+// "not attached" path fires unchanged).
+func TestHandleSetDiskMetadata_ParkedDiskOnly_WarnAndNil(t *testing.T) {
+	t.Parallel()
+
+	const parkerVMID = int64(90001)
+	const parkerRangeStart = 90000
+	const parkerRangeEnd = 90999
+
+	logger, logs := log.NewObservedLogger(log.LevelWarn)
+	clusterSvc := &diskMetaClusterSvc{
+		resp: clusterResourcesWithTaggedVMs(
+			clusterResourceEntry{vmid: parkerVMID, node: testNode, tags: "bosh-parker"},
+		),
+	}
+	nodesSvc := &diskMetaNodesMock{}
+	qemuCfgs := map[string]map[string]any{
+		diskKey(testNode, int(parkerVMID)): vmConfigWithDisk(testDiskCID, ""),
+	}
+	client := buildDiskMetaPVE(clusterSvc, qemuCfgs, nodesSvc)
+
+	deps := handlers.Deps{
+		Config: &config.CPIConfig{
+			VMDiskFormat:             "qcow2",
+			DetachedDiskStrategy:     "parked",
+			ParkedDiskVMIDRangeStart: parkerRangeStart,
+			ParkedDiskVMIDRangeEnd:   parkerRangeEnd,
+		},
+		PVE:    client,
+		Logger: logger,
+	}
+
+	h := handlers.HandleSetDiskMetadata(deps)
+	result, err := h.Handle(context.Background(), makeMetaArgs(testDiskCID, map[string]any{"deployment": "cf"}), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("parked-only: unexpected error: %v", err)
+	}
+	if result != nil {
+		t.Errorf("parked-only: expected nil result, got %v", result)
+	}
+	// UpdateQemuConfig must NOT be called.
+	if nodesSvc.capturedDesc != nil {
+		t.Errorf("parked-only: UpdateQemuConfig must not be called; got desc: %s", *nodesSvc.capturedDesc)
+	}
+	// Warn must be logged (existing not-attached path).
+	entries := logs.All()
+	if len(entries) == 0 {
+		t.Fatal("parked-only: expected warn log, got none")
+	}
+}
+
+// TestHandleSetDiskMetadata_ZeroConfig_ParkerTagIgnored verifies that when
+// ParkedStrategyActive is false (no strategy knobs set), a VM carrying the
+// "bosh-parker" tag is NOT skipped — the tag alone cannot classify a VM as a
+// parker without an explicit VMID range. This ensures byte-identical behavior
+// for operators who have not opted into the parked strategy.
+func TestHandleSetDiskMetadata_ZeroConfig_ParkerTagIgnored(t *testing.T) {
+	t.Parallel()
+
+	// VMID 90001 has bosh-parker tag but no strategy configured → must NOT be
+	// skipped; if it holds the disk the metadata must be persisted there.
+	const parkerTaggedVMID = int64(90001)
+
+	clusterSvc := &diskMetaClusterSvc{
+		resp: clusterResourcesWithTaggedVMs(
+			clusterResourceEntry{vmid: parkerTaggedVMID, node: testNode, tags: "bosh-parker"},
+		),
+	}
+	nodesSvc := &diskMetaNodesMock{}
+	qemuCfgs := map[string]map[string]any{
+		diskKey(testNode, int(parkerTaggedVMID)): vmConfigWithDisk(testDiskCID, ""),
+	}
+	// Zero-config Deps: no DetachedDiskStrategy, no VMID range.
+	client := buildDiskMetaPVE(clusterSvc, qemuCfgs, nodesSvc)
+	h := handlers.HandleSetDiskMetadata(makeDiskMetaDeps(client))
+
+	_, err := h.Handle(context.Background(), makeMetaArgs(testDiskCID, map[string]any{"deployment": "cf"}), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("zero-config: unexpected error: %v", err)
+	}
+	// Metadata must be persisted — the parker-tagged VM is the host, and
+	// strategy is unset so no exclusion applies.
+	if nodesSvc.capturedDesc == nil {
+		t.Fatal("zero-config: UpdateQemuConfig not called — parker-tagged VM wrongly excluded when strategy unset")
+	}
+}
+
+// TestHandleSetDiskMetadata_RangeOnlyNoTag_NotSkipped verifies that a VM
+// whose VMID falls in the parker range but does NOT carry the "bosh-parker"
+// tag is not skipped. IsParkerVM requires both range AND tag.
+func TestHandleSetDiskMetadata_RangeOnlyNoTag_NotSkipped(t *testing.T) {
+	t.Parallel()
+
+	const vmid = int64(90001) // in parker range
+	const parkerRangeStart = 90000
+	const parkerRangeEnd = 90999
+
+	clusterSvc := &diskMetaClusterSvc{
+		resp: clusterResourcesWithTaggedVMs(
+			// No "bosh-parker" tag — range match alone must not skip.
+			clusterResourceEntry{vmid: vmid, node: testNode, tags: "some-other-tag"},
+		),
+	}
+	nodesSvc := &diskMetaNodesMock{}
+	qemuCfgs := map[string]map[string]any{
+		diskKey(testNode, int(vmid)): vmConfigWithDisk(testDiskCID, ""),
+	}
+	client := buildDiskMetaPVE(clusterSvc, qemuCfgs, nodesSvc)
+
+	h := handlers.HandleSetDiskMetadata(makeParkedDeps(client, parkerRangeStart, parkerRangeEnd))
+	_, err := h.Handle(context.Background(), makeMetaArgs(testDiskCID, map[string]any{"deployment": "cf"}), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("range-only no tag: unexpected error: %v", err)
+	}
+	if nodesSvc.capturedDesc == nil {
+		t.Fatal("range-only no tag: UpdateQemuConfig not called — VM wrongly skipped despite missing bosh-parker tag")
+	}
+}

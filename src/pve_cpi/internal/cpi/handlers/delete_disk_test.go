@@ -373,6 +373,243 @@ func TestHandleDeleteDisk_Dir_CID(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Parker unpark integration tests
+//
+// These tests exercise the 3c block added to HandleDeleteDisk:
+//   - parked disk → UnparkDisk → then delete
+//   - unpark failure → retriable error, delete not called
+//   - disk present but not parked (free-floating) → direct delete
+//   - strategy unset/free → zero parker calls (byte-identical path)
+// ---------------------------------------------------------------------------
+
+// parkerDeleteClient builds a mockPVEClient wired for parker tests:
+//   - cluster scan returns parkerVMID on parkerNode (makes IsDiskParked resolve holder)
+//   - QEMU Config returns a map with the disk in scsi0 + bosh-parker tag
+//     (so IsDiskParked confirms parked=true) plus a DetachDisk stub
+//   - storage DeleteVolumeAsync controlled by storageSvc
+//
+// When parkerVMID == 0 the cluster response is empty (disk free-floating).
+func parkerDeleteClient(
+	t *testing.T,
+	storageSvc *mockStorageService,
+	parkerVMID int,
+	parkerNode string,
+	detachErr error,
+) (*mockPVEClient, *int) {
+	t.Helper()
+	var detachCalls int
+
+	qemuSvc := &mockQEMUService{
+		configFn: func(_ context.Context, _ string, vmid int) (map[string]any, error) {
+			if vmid == parkerVMID {
+				return map[string]any{
+					"tags":  "bosh-parker",
+					"scsi0": diskCID,
+				}, nil
+			}
+			return map[string]any{}, nil
+		},
+		detachDiskFn: func(_ context.Context, _ string, _ int, _ string) error {
+			detachCalls++
+			return detachErr
+		},
+	}
+
+	var clusterSvc *mockClusterSvc
+	if parkerVMID == 0 {
+		// Free-floating disk: no VM holds it.
+		clusterSvc = &mockClusterSvc{}
+	} else {
+		// Parker VM holds the disk.
+		clusterSvc = &mockClusterSvc{
+			listResourcesFn: func(_ context.Context, _ *sdkclusterapi.ListResourcesParams) (*sdkclusterapi.ListResourcesResponse, error) {
+				raw, _ := json.Marshal(map[string]any{
+					"vmid": parkerVMID,
+					"node": parkerNode,
+					"type": "qemu",
+				})
+				resp := sdkclusterapi.ListResourcesResponse{raw}
+				return &resp, nil
+			},
+		}
+	}
+
+	client := &mockPVEClient{
+		storageSvc: storageSvc,
+		qemuSvc:    qemuSvc,
+		clusterSvc: clusterSvc,
+	}
+	return client, &detachCalls
+}
+
+// parkerDepsForDelete builds Deps with ParkedDiskVMIDRangeStart/End set so
+// ParkedStrategyActive() returns true. The range covers parkerVMID 90000.
+func parkerDepsForDelete(client *mockPVEClient) handlers.Deps {
+	return handlers.Deps{
+		Config: &config.CPIConfig{
+			Node:                     testNode,
+			DiskStorage:              storageName,
+			DetachedDiskStrategy:     "parked",
+			ParkedDiskVMIDRangeStart: 90000,
+			ParkedDiskVMIDRangeEnd:   90999,
+		},
+		PVE:    client,
+		Logger: log.NewNopLogger(),
+	}
+}
+
+// TestHandleDeleteDisk_Parker_Parked_UnparksAndDeletes verifies that when the
+// disk is held by a parker VM, delete_disk detaches it from the parker then
+// deletes the volume.
+func TestHandleDeleteDisk_Parker_Parked_UnparksAndDeletes(t *testing.T) {
+	t.Parallel()
+
+	deleteCalled := false
+	storageSvc := &mockStorageService{
+		deleteVolumeFn: func(_ context.Context, _, _, _ string) error {
+			deleteCalled = true
+			return nil
+		},
+	}
+	client, detachCalls := parkerDeleteClient(t, storageSvc, 90000, testNode, nil)
+	deps := parkerDepsForDelete(client)
+
+	h := handlers.HandleDeleteDisk(deps)
+	_, err := h.Handle(context.Background(), []json.RawMessage{marshal(diskCID)}, jsonrpc.Context{})
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !deleteCalled {
+		t.Error("delete_disk: volume delete must be called after unpark")
+	}
+	if *detachCalls == 0 {
+		t.Error("delete_disk: DetachDisk (unpark) must be called for parked disk")
+	}
+}
+
+// TestHandleDeleteDisk_Parker_UnparkFail_Retriable verifies that when UnparkDisk
+// fails, delete_disk returns a retriable error and does NOT delete the volume.
+func TestHandleDeleteDisk_Parker_UnparkFail_Retriable(t *testing.T) {
+	t.Parallel()
+
+	deleteCalled := false
+	storageSvc := &mockStorageService{
+		deleteVolumeFn: func(_ context.Context, _, _, _ string) error {
+			deleteCalled = true
+			return nil
+		},
+	}
+	unparkErr := errors.New("PVE lock contention")
+	client, _ := parkerDeleteClient(t, storageSvc, 90000, testNode, unparkErr)
+	deps := parkerDepsForDelete(client)
+
+	h := handlers.HandleDeleteDisk(deps)
+	_, err := h.Handle(context.Background(), []json.RawMessage{marshal(diskCID)}, jsonrpc.Context{})
+
+	if err == nil {
+		t.Fatal("expected error when unpark fails, got nil")
+	}
+	if deleteCalled {
+		t.Error("delete_disk must NOT delete volume when unpark fails")
+	}
+}
+
+// TestHandleDeleteDisk_Parker_NotParked_DirectDelete verifies that when
+// ParkedStrategyActive() is true but the disk is free-floating (not on a parker
+// VM), delete_disk deletes the volume directly without any DetachDisk call.
+func TestHandleDeleteDisk_Parker_NotParked_DirectDelete(t *testing.T) {
+	t.Parallel()
+
+	deleteCalled := false
+	storageSvc := &mockStorageService{
+		deleteVolumeFn: func(_ context.Context, _, _, _ string) error {
+			deleteCalled = true
+			return nil
+		},
+	}
+	// parkerVMID=0 → cluster returns empty → disk not attached to any VM.
+	client, detachCalls := parkerDeleteClient(t, storageSvc, 0, "", nil)
+	deps := parkerDepsForDelete(client)
+
+	h := handlers.HandleDeleteDisk(deps)
+	_, err := h.Handle(context.Background(), []json.RawMessage{marshal(diskCID)}, jsonrpc.Context{})
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !deleteCalled {
+		t.Error("delete_disk: volume delete must be called for free-floating disk under parked strategy")
+	}
+	if *detachCalls != 0 {
+		t.Errorf("delete_disk: DetachDisk must NOT be called for free-floating disk, got %d calls", *detachCalls)
+	}
+}
+
+// TestHandleDeleteDisk_Parker_StrategyFree_NoParkerCalls verifies that when
+// neither DetachedDiskStrategy=parked nor range fields are set,
+// ParkedStrategyActive() returns false and zero parker API calls are made.
+func TestHandleDeleteDisk_Parker_StrategyFree_NoParkerCalls(t *testing.T) {
+	t.Parallel()
+
+	deleteCalled := false
+	configCalled := false
+	storageSvc := &mockStorageService{
+		deleteVolumeFn: func(_ context.Context, _, _, _ string) error {
+			deleteCalled = true
+			return nil
+		},
+	}
+
+	qemuSvc := &mockQEMUService{
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			configCalled = true
+			return map[string]any{}, nil
+		},
+	}
+	// Cluster returns a parker-range VM so that if the handler mistakenly calls
+	// IsDiskParked it would find a result — confirming the gate truly fires.
+	clusterSvc := &mockClusterSvc{
+		listResourcesFn: func(_ context.Context, _ *sdkclusterapi.ListResourcesParams) (*sdkclusterapi.ListResourcesResponse, error) {
+			raw, _ := json.Marshal(map[string]any{
+				"vmid": 90000,
+				"node": testNode,
+				"type": "qemu",
+			})
+			resp := sdkclusterapi.ListResourcesResponse{raw}
+			return &resp, nil
+		},
+	}
+	client := &mockPVEClient{
+		storageSvc: storageSvc,
+		qemuSvc:    qemuSvc,
+		clusterSvc: clusterSvc,
+	}
+	deps := handlers.Deps{
+		Config: &config.CPIConfig{
+			Node:        testNode,
+			DiskStorage: storageName,
+			// DetachedDiskStrategy unset and no range → ParkedStrategyActive()=false
+		},
+		PVE:    client,
+		Logger: log.NewNopLogger(),
+	}
+
+	h := handlers.HandleDeleteDisk(deps)
+	_, err := h.Handle(context.Background(), []json.RawMessage{marshal(diskCID)}, jsonrpc.Context{})
+
+	if err != nil {
+		t.Fatalf("unexpected error with free strategy: %v", err)
+	}
+	if !deleteCalled {
+		t.Error("delete_disk: volume delete must be called when strategy=free")
+	}
+	if configCalled {
+		t.Error("delete_disk: QEMU Config must NOT be called (zero parker calls) when strategy=free")
+	}
+}
+
 // TODO(storage-network): network-backed storage CID variants (nfs
 // "nfs-store:9001/vm-9001-disk-0.qcow2", rbd "ceph-pool:vm-9001-disk-0", cephfs
 // "cephfs-pool:vm-9001-disk-0", cifs "cifs-store:9001/vm-9001-disk-0.qcow2") are

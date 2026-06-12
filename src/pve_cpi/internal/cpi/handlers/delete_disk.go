@@ -10,6 +10,35 @@ import (
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
 )
 
+// unparkBeforeDelete checks whether bareDiskCID is held by a parker VM and, if
+// so, detaches it before the volume is deleted. A no-op when the parked
+// strategy is unset (zero extra API calls, byte-identical fast path).
+// Unpark failure returns a retriable wrapped error; the disk stays safe on the
+// parker VM and the caller can retry.
+func unparkBeforeDelete(ctx context.Context, deps Deps, diskCID, bareDiskCID string) error {
+	if deps.Config == nil || !deps.Config.ParkedStrategyActive() {
+		return nil
+	}
+	parkerCfg := pve.ParkerConfig{
+		VMIDRangeStart: deps.Config.ParkedDiskVMIDRangeStartValue(),
+		VMIDRangeEnd:   deps.Config.ParkedDiskVMIDRangeEndValue(),
+		DirectorID:     deps.Config.StemcellDirectorID(),
+	}
+	_, _, _, parked, isPErr := pve.IsDiskParked(ctx, deps.PVE, deps.Logger, bareDiskCID, parkerCfg)
+	if isPErr != nil {
+		return cpierrors.Wrap(isPErr, "delete_disk: is-parked check")
+	}
+	if parked {
+		if unparkErr := pve.UnparkDisk(ctx, deps.PVE, deps.Logger, bareDiskCID, parkerCfg); unparkErr != nil {
+			deps.Logger.Info("delete_disk: unpark failed, returning retriable error",
+				log.String("disk_cid", diskCID),
+			)
+			return cpierrors.Wrap(unparkErr, "delete_disk: unpark before delete")
+		}
+	}
+	return nil
+}
+
 // HandleDeleteDisk returns a Handler for the BOSH CPI delete_disk method.
 //
 // Arguments (positional JSON array):
@@ -93,6 +122,17 @@ func HandleDeleteDisk(deps Deps) Handler {
 				)
 				return nil, cpierrors.Wrap(guardErr, "delete_disk")
 			}
+		}
+
+		// ----------------------------------------------------------------
+		// 3c. Parker unpark. When the parked strategy is active, check
+		//     cluster-wide whether the disk is held on a parker VM and, if
+		//     so, detach it before deleting. Not-parked → fall through.
+		//     Unpark failure → retriable; the disk is still safe on the
+		//     parker VM and the caller can retry.
+		// ----------------------------------------------------------------
+		if err := unparkBeforeDelete(ctx, deps, diskCID, bareDiskCID); err != nil {
+			return nil, err
 		}
 
 		// ----------------------------------------------------------------

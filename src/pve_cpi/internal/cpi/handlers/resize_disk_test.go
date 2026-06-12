@@ -797,6 +797,118 @@ func TestHandleResizeDisk_LVMThin_CID(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Parker-allowance tests.
+// ---------------------------------------------------------------------------
+
+// TestHandleResizeDisk_ParkedDisk_Succeeds verifies that resize_disk proceeds
+// normally when the holder VM is a parker VM (VMID in range, bosh-parker tag).
+// Parker VMs are always stopped (onboot=0, never started); PVE can resize a
+// stopped VM's disk without live-disk constraints, so the resize must succeed.
+//
+// The test uses a parker VMID (90001) in the default range and confirms that:
+//  1. ResizeDisk is called with the correct delta.
+//  2. No error is returned.
+//  3. The opt-string comes from the parker VM's config (bosh-parker tag present).
+func TestHandleResizeDisk_ParkedDisk_Succeeds(t *testing.T) {
+	t.Parallel()
+
+	const parkerVMID = 90001
+	// Disk opt-string on the parker VM: volid + size + the parker slot opt-string
+	// that proves the config came from a parker VM (arbitrary extra key).
+	const volid = diskCID
+	const parkerDiskOptStr = diskCID + ",size=10G,cache=none"
+
+	var capturedDelta int
+
+	// resizeQEMUWithDisk tracks call count and adjusts responses:
+	// calls 1-2 (FindVMByDiskVolid + ResolveDiskID) return bare volid;
+	// call 3+ returns full opt-string with size= so parseDiskSizeGiB works.
+	callCount := 0
+	qemuSvc := &resizeQEMUService{
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			callCount++
+			if callCount <= 2 {
+				return map[string]any{diskSlot: volid, "tags": "bosh-parker"}, nil
+			}
+			return map[string]any{diskSlot: parkerDiskOptStr, "tags": "bosh-parker"}, nil
+		},
+		resizeDiskFn: func(_ context.Context, _ string, _ int, _ string, deltaGiB int) (string, error) {
+			capturedDelta = deltaGiB
+			return "", nil
+		},
+	}
+
+	clusterSvc := &snapClusterService{
+		listFn: func(_ context.Context, _ *sdkclusterapi.ListResourcesParams) (*sdkclusterapi.ListResourcesResponse, error) {
+			return clusterRespWith(parkerVMID, testNode), nil
+		},
+	}
+
+	cfg := &config.CPIConfig{
+		Node:                     testNode,
+		ParkedDiskVMIDRangeStart: 90000,
+		ParkedDiskVMIDRangeEnd:   90999,
+		DetachedDiskStrategy:     "parked",
+	}
+
+	h := handlers.HandleResizeDisk(handlers.Deps{
+		Config: cfg,
+		PVE: &mockPVEClient{
+			qemuSvc:    qemuSvc,
+			clusterSvc: clusterSvc,
+		},
+		Logger: log.NewNopLogger(),
+	})
+
+	// Request 15 GiB (15360 MiB); current 10 GiB on parker → delta 5 GiB.
+	_, err := h.Handle(context.Background(), marshalArgs(diskCID, 15360), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("resize of parked disk must succeed, got error: %v", err)
+	}
+	if capturedDelta != 5 {
+		t.Errorf("resize delta: want 5 GiB, got %d GiB", capturedDelta)
+	}
+}
+
+// TestHandleResizeDisk_NeverOptedIn_NormalResize verifies that with no parker
+// configuration (never opted in), resize_disk behaves identically to before:
+// the normal path runs, ResizeDisk is called with the correct delta, and no
+// parker-related code path is triggered.
+func TestHandleResizeDisk_NeverOptedIn_NormalResize(t *testing.T) {
+	t.Parallel()
+
+	var capturedDelta int
+
+	qemuSvc := resizeQEMUWithDisk(diskSlot, diskCID+",size=10G",
+		func(_ context.Context, _ string, _ int, _ string, deltaGiB int) (string, error) {
+			capturedDelta = deltaGiB
+			return "", nil
+		},
+	)
+
+	// Never-opted-in: no strategy, no range fields.
+	cfg := &config.CPIConfig{Node: testNode}
+
+	h := handlers.HandleResizeDisk(handlers.Deps{
+		Config: cfg,
+		PVE: &mockPVEClient{
+			qemuSvc:    qemuSvc,
+			clusterSvc: resizeClusterWith(100),
+		},
+		Logger: log.NewNopLogger(),
+	})
+
+	// 20 GiB request; current 10 GiB → delta 10 GiB.
+	_, err := h.Handle(context.Background(), marshalArgs(diskCID, 20480), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("never-opted-in resize: unexpected error: %v", err)
+	}
+	if capturedDelta != 10 {
+		t.Errorf("delta: want 10 GiB, got %d GiB", capturedDelta)
+	}
+}
+
 // TODO(storage-network): nfs — wired to PVE network-call boundary, stubbed pending
 // live shared-storage test infrastructure. Storage: nfs-store:9001/vm-9001-disk-0.qcow2. Re-enable when
 // integration-test harness provides a nfs pool via env.

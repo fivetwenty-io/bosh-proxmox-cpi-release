@@ -311,6 +311,38 @@ func TestHandleUpdateDisk_DetachedDisk(t *testing.T) {
 	}
 }
 
+// TestHandleUpdateDisk_DetachedDisk_SentinelWrapped — FindVMByDiskVolid returns
+// fmt.Errorf("disk %q: %w", volid, pve.ErrDiskNotAttachedToAnyVM) (the real sentinel
+// shape from a scan that found VMs but none held the disk). errors.Is detection in the
+// handler must classify this as DetachedDisk, not propagate it as a transport error.
+func TestHandleUpdateDisk_DetachedDisk_SentinelWrapped(t *testing.T) {
+	t.Parallel()
+
+	// Cluster has one VM (vmid=100) but its Config returns no slot containing diskCID.
+	// FindVMByDiskVolid iterates all VMs, finds none with the volid, and returns the
+	// wrapped ErrDiskNotAttachedToAnyVM sentinel.
+	oneVMCluster := &snapClusterService{
+		listFn: func(_ context.Context, _ *sdkclusterapi.ListResourcesParams) (*sdkclusterapi.ListResourcesResponse, error) {
+			return clusterRespWith(100, testNode), nil
+		},
+	}
+	// QEMU Config returns no matching disk slot — any key present, but not diskCID's volid.
+	qemuSvc := &updateDiskQEMUService{
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return map[string]any{"scsi0": "other-storage:vm-9999-disk-0,size=5G"}, nil
+		},
+	}
+
+	h := handlers.HandleUpdateDisk(updateDiskDeps(qemuSvc, oneVMCluster, nil))
+	_, err := h.Handle(context.Background(), marshalArgs(diskCID, map[string]any{"cache": "writeback"}), jsonrpc.Context{})
+	if err == nil {
+		t.Fatal("expected error for sentinel-wrapped detached disk")
+	}
+	if !cpierrors.IsType(err, cpierrors.TypeDetachedDisk) {
+		t.Errorf("sentinel-wrapped ErrDiskNotAttachedToAnyVM must yield DetachedDisk, got %T %v", err, err)
+	}
+}
+
 // TestHandleUpdateDisk_FindVMTransportError — FindVMByDiskVolid cluster-scan fails
 // with a transport error (connection refused). The bug was that the handler swallowed
 // this as "detached disk"; the fix propagates it as a distinct wrapped error.

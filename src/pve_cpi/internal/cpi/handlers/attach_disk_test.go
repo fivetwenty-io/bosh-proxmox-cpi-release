@@ -1455,3 +1455,289 @@ func TestHandleAttachDisk_Invariant_EnforceNoDivergence(t *testing.T) {
 		t.Errorf("AttachDisk volid: want %q, got %q", wantVolid, qemuSvc.attachLastVolid)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Parker (parked detached-disk strategy) tests.
+//
+// UnparkDisk runs between attachDiskResolveNode and the snapshot guard. The
+// tests use a configurable cluster scan to control whether the disk appears
+// parked on a parker VM.
+//
+// Test matrix:
+//   - strategy=parked, disk parked          → UnparkDisk called, normal attach proceeds
+//   - strategy=parked, disk free-floating   → UnparkDisk no-op (fast nil), attach proceeds
+//   - strategy=free (unset)                 → zero parker API calls, byte-identical
+//   - strategy=parked, unpark fails         → retriable error, AttachDisk not called
+// ---------------------------------------------------------------------------
+
+const (
+	parkerVMID  = 90000
+	parkerNode  = testNode // parker lives on the same node in these tests
+	parkerSlot  = "scsi0"
+	parkedVolid = "local-lvm:vm-9001-disk-0"
+)
+
+// parkerClusterSvc returns a mockClusterSvc whose ListResources reports
+// parkerVMID on parkerNode (for FindVMByDiskVolidOrNone) when the holderVMID
+// matches parkerVMID. Used to simulate a parked disk.
+//
+// FindVMByDiskVolid scans all VMs, fetches each VM's config looking for the
+// volid. The cluster scan lists VMs by VMID. We return one entry: the parker
+// VMID. The QEMU.Config call for that VMID must then return a config with the
+// disk and the bosh-parker tag.
+func parkerClusterSvc() *mockClusterSvc {
+	raw, _ := json.Marshal(map[string]any{
+		"vmid": parkerVMID,
+		"node": parkerNode,
+		"type": "qemu",
+	})
+	resp := sdkcluster.ListResourcesResponse{raw}
+	return &mockClusterSvc{
+		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+			return &resp, nil
+		},
+	}
+}
+
+// emptyClusterSvc returns a mockClusterSvc that lists no VMs — simulates a
+// free-floating disk (no holder found in cluster scan).
+func emptyClusterSvc() *mockClusterSvc {
+	return &mockClusterSvc{
+		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+			empty := sdkcluster.ListResourcesResponse{}
+			return &empty, nil
+		},
+	}
+}
+
+// parkedCfg returns a CPIConfig with detached_disk_strategy=parked and the
+// default parker VMID range applied (90000–90999).
+func parkedCfg() *config.CPIConfig {
+	return &config.CPIConfig{
+		Node:                     testNode,
+		VMDiskFormat:             "qcow2",
+		DetachedDiskStrategy:     "parked",
+		ParkedDiskVMIDRangeStart: 90000,
+		ParkedDiskVMIDRangeEnd:   90999,
+	}
+}
+
+// TestHandleAttachDisk_Parked_UnparksBeforeAttach verifies the primary parker
+// path: disk is parked on a parker VM → UnparkDisk detaches it from the parker
+// → normal AttachDisk call follows with disk_hints returned.
+//
+// Config call sequence driven by configCfgs:
+//
+//	Call 1: FindVMByDiskVolid — config read for parker VMID (disk present → match)
+//	Call 2: IsDiskParked — second config read for parker VMID (tags + slot lookup)
+//	Call 3: chooseSCSISlotSkippingZero — target VM config (empty → pick scsi1)
+//	Call 4: ResolveDiskID — target VM config after attach (scsi1 present)
+func TestHandleAttachDisk_Parked_UnparksBeforeAttach(t *testing.T) {
+	t.Parallel()
+
+	const bareCID = parkedVolid // "local-lvm:vm-9001-disk-0"
+
+	// Parker VM config: holds the disk at parkerSlot with bosh-parker tag.
+	parkerVMCfg := map[string]any{
+		parkerSlot: bareCID,
+		"tags":     "bosh-parker",
+		"name":     "bosh-parker-90000",
+	}
+	// Target VM config (slot selection): empty VM, pick scsi1.
+	targetVMCfgEmpty := map[string]any{}
+	// Target VM config (resolve): scsi1 holds the disk after attach.
+	targetVMCfgAttached := map[string]any{
+		"scsi1": bareCID,
+	}
+
+	qemuSvc := &attachQEMUService{
+		attachReturnDiskID: "scsi1",
+		configCfgs: []map[string]any{
+			parkerVMCfg,         // call 1: FindVMByDiskVolid config scan on parker VMID
+			parkerVMCfg,         // call 2: IsDiskParked config read (tags + slot)
+			targetVMCfgEmpty,    // call 3: chooseSCSISlotSkippingZero on target VM
+			targetVMCfgAttached, // call 4: ResolveDiskID on target VM after attach
+		},
+	}
+	ag := &captureAgent{}
+	deps := handlers.Deps{
+		Config: parkedCfg(),
+		PVE: &mockPVEClient{
+			qemuSvc:    qemuSvc,
+			clusterSvc: parkerClusterSvc(),
+		},
+		Agent:  ag,
+		Logger: log.NewNopLogger(),
+	}
+
+	h := handlers.HandleAttachDisk(deps)
+	result, err := h.Handle(context.Background(), attachArgs("100", bareCID), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("parked disk attach: unexpected error: %v", err)
+	}
+	if result == nil {
+		t.Fatal("parked disk attach: expected disk_hints result; got nil")
+	}
+
+	// UnparkDisk calls DetachDisk on the parker VM at parkerSlot.
+	if len(qemuSvc.detachCalls) != 1 || qemuSvc.detachCalls[0] != parkerSlot {
+		t.Errorf("expected DetachDisk(%q) from unpark; got %v", parkerSlot, qemuSvc.detachCalls)
+	}
+	// Normal attach must still proceed.
+	if qemuSvc.attachLastVolid != bareCID {
+		t.Errorf("AttachDisk volid: want %q, got %q", bareCID, qemuSvc.attachLastVolid)
+	}
+	if !ag.updateCalled {
+		t.Error("UpdateDiskHints must be called after successful attach")
+	}
+
+	const wantPath = "/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_drive-scsi1"
+	path := extractPath(t, result)
+	if path != wantPath {
+		t.Errorf("disk_hints.path: want %q, got %q", wantPath, path)
+	}
+}
+
+// TestHandleAttachDisk_Parked_FreeFloatingProceedsNormally verifies that when
+// strategy=parked but the disk is free-floating (no holder in cluster scan),
+// UnparkDisk returns nil immediately (no DetachDisk calls) and the normal
+// attach path proceeds.
+func TestHandleAttachDisk_Parked_FreeFloatingProceedsNormally(t *testing.T) {
+	t.Parallel()
+	const bareCID = "local-lvm:vm-9001-disk-0"
+
+	qemuSvc := &attachQEMUService{
+		attachReturnDiskID: "scsi1",
+		configCfg: map[string]any{
+			"scsi1": bareCID,
+		},
+	}
+	ag := &captureAgent{}
+	deps := handlers.Deps{
+		Config: parkedCfg(),
+		PVE: &mockPVEClient{
+			qemuSvc:    qemuSvc,
+			clusterSvc: emptyClusterSvc(), // no holder → free-floating
+		},
+		Agent:  ag,
+		Logger: log.NewNopLogger(),
+	}
+
+	h := handlers.HandleAttachDisk(deps)
+	result, err := h.Handle(context.Background(), attachArgs("100", bareCID), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("free-floating under parked strategy: unexpected error: %v", err)
+	}
+	if result == nil {
+		t.Fatal("free-floating under parked strategy: expected disk_hints; got nil")
+	}
+
+	// No unpark operation — disk was not parked.
+	if len(qemuSvc.detachCalls) != 0 {
+		t.Errorf("expected no DetachDisk calls for free-floating disk; got %v", qemuSvc.detachCalls)
+	}
+	if !ag.updateCalled {
+		t.Error("UpdateDiskHints must be called after successful attach")
+	}
+}
+
+// TestHandleAttachDisk_Parked_UnparkFailRetriable verifies that when UnparkDisk
+// returns an error (e.g. PVE transient failure), attach_disk returns a retriable
+// error and AttachDisk is not called — leaving the disk safely parked for retry.
+func TestHandleAttachDisk_Parked_UnparkFailRetriable(t *testing.T) {
+	t.Parallel()
+	const bareCID = "local-lvm:vm-9001-disk-0"
+
+	// Parker VM config returned for the IsDiskParked check; DetachDisk will fail.
+	parkerVMCfg := map[string]any{
+		parkerSlot: bareCID,
+		"tags":     "bosh-parker",
+	}
+
+	qemuSvc := &attachQEMUService{
+		attachErr: errors.New("AttachDisk must not be called on unpark failure"),
+		configCfg: parkerVMCfg,
+		// DetachDisk returns a transient error to simulate unpark failure.
+		detachErr: errors.New("PVE 500: internal error during detach"),
+	}
+	deps := handlers.Deps{
+		Config: parkedCfg(),
+		PVE: &mockPVEClient{
+			qemuSvc:    qemuSvc,
+			clusterSvc: parkerClusterSvc(),
+		},
+		Agent:  &captureAgent{},
+		Logger: log.NewNopLogger(),
+	}
+
+	h := handlers.HandleAttachDisk(deps)
+	_, err := h.Handle(context.Background(), attachArgs("100", bareCID), jsonrpc.Context{})
+	if err == nil {
+		t.Fatal("expected retriable error when unpark fails; got nil")
+	}
+
+	// Must be retriable so BOSH retries rather than orphaning the disk.
+	var cpiErr *cpierrors.Error
+	if !errors.As(err, &cpiErr) {
+		t.Fatalf("expected *cpierrors.Error, got %T: %v", err, err)
+	}
+	if !cpiErr.OkToRetry() {
+		t.Errorf("unpark failure must be retriable; OkToRetry()=false, type=%s", cpiErr.Type())
+	}
+
+	// AttachDisk must not have been called.
+	if qemuSvc.attachLastVolid != "" {
+		t.Errorf("AttachDisk must not be called when unpark fails; got volid %q", qemuSvc.attachLastVolid)
+	}
+}
+
+// TestHandleAttachDisk_StrategyFree_NoParkerCalls verifies byte-identical
+// behavior when strategy is unset (free, the default): no cluster scan and no
+// parker API calls are made. The clusterSvc is set to panic on ListResources to
+// prove it is never called.
+func TestHandleAttachDisk_StrategyFree_NoParkerCalls(t *testing.T) {
+	t.Parallel()
+	const bareCID = "local-lvm:vm-9001-disk-0"
+
+	qemuSvc := &attachQEMUService{
+		attachReturnDiskID: "scsi1",
+		configCfg: map[string]any{
+			"scsi1": bareCID,
+		},
+	}
+	ag := &captureAgent{}
+	// Cluster svc panics if called — proves no parker cluster scan happens.
+	panicCluster := &mockClusterSvc{
+		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+			panic("ListResources must not be called when strategy=free")
+		},
+	}
+	deps := handlers.Deps{
+		Config: &config.CPIConfig{
+			Node:         testNode,
+			VMDiskFormat: "qcow2",
+			// DetachedDiskStrategy unset → free (default); no range set → ParkedStrategyActive()=false
+		},
+		PVE: &mockPVEClient{
+			qemuSvc:    qemuSvc,
+			clusterSvc: panicCluster,
+		},
+		Agent:  ag,
+		Logger: log.NewNopLogger(),
+	}
+
+	h := handlers.HandleAttachDisk(deps)
+	result, err := h.Handle(context.Background(), attachArgs("100", bareCID), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("strategy=free: unexpected error: %v", err)
+	}
+	if result == nil {
+		t.Fatal("strategy=free: expected disk_hints; got nil")
+	}
+	if len(qemuSvc.detachCalls) != 0 {
+		t.Errorf("strategy=free: expected no DetachDisk calls; got %v", qemuSvc.detachCalls)
+	}
+	if !ag.updateCalled {
+		t.Error("strategy=free: UpdateDiskHints must be called after successful attach")
+	}
+}
