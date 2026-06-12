@@ -115,13 +115,29 @@ func HandleSetDiskMetadata(deps Deps) cpi.Handler {
 			return nil, nil
 
 		case 1:
-			if err := persistMetadata(ctx, deps, matches[0], bareDiskCID, metadata); err != nil {
-				return nil, err
-			}
-			if len(diskTags) > 0 {
-				if err := applyCustomTagsToVM(ctx, deps, matches[0].node, matches[0].vmid, diskTags, diskCID); err != nil {
-					return nil, err
+			// Wrap both persistMetadata and applyCustomTagsToVM under a single
+			// per-VMID cluster lock. This prevents a concurrent set_vm_metadata
+			// (or another set_disk_metadata) from interleaving its own Config
+			// read between our read and write, which would silently lose one
+			// writer's changes. Both calls share the same VMID so a single lock
+			// acquisition covers the full case-1 RMW sequence atomically.
+			//
+			// Pool service absent (nil) → retriable error so the director re-drives.
+			vmid := matches[0].vmid
+			lockOwner := fmt.Sprintf("set_disk_metadata/%d", vmid)
+			lockErr := withVMIDLock(ctx, deps.PVE.Pools(), vmid, lockOwner, deps.Logger, func() error {
+				if err := persistMetadata(ctx, deps, matches[0], bareDiskCID, metadata); err != nil {
+					return err
 				}
+				if len(diskTags) > 0 {
+					if err := applyCustomTagsToVM(ctx, deps, matches[0].node, vmid, diskTags, diskCID); err != nil {
+						return err
+					}
+				}
+				return nil
+			})
+			if lockErr != nil {
+				return nil, lockErr
 			}
 			return nil, nil
 

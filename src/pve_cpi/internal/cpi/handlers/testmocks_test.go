@@ -42,6 +42,7 @@ type mockPVEClient struct {
 	cloudInitSvc      cloudinit.Service
 	clusterSvc        cluster.Service
 	clusterStorageSvc clusterstorage.Service
+	poolsSvc          pve.PoolService
 }
 
 func (m *mockPVEClient) QEMU() qemu.Service                     { return m.qemuSvc }
@@ -51,7 +52,7 @@ func (m *mockPVEClient) Storage() storage.Service               { return m.stora
 func (m *mockPVEClient) CloudInit() cloudinit.Service           { return m.cloudInitSvc }
 func (m *mockPVEClient) Cluster() cluster.Service               { return m.clusterSvc }
 func (m *mockPVEClient) ClusterStorage() clusterstorage.Service { return m.clusterStorageSvc }
-func (m *mockPVEClient) Pools() pve.PoolService                 { return nil }
+func (m *mockPVEClient) Pools() pve.PoolService                 { return m.poolsSvc }
 
 // --------------------------------------------------------------------------
 // mockQEMUService
@@ -456,6 +457,8 @@ func testDepsFoundVM(vmid int, qemuSvc qemu.Service, nodesSvc nodes.Service, tas
 }
 
 // testDepsFoundVMWithStorage is testDepsFoundVM with an explicit storage service.
+// The pool service defaults to a no-op implementation so handler tests that do
+// not exercise lock behaviour compile and pass unchanged.
 func testDepsFoundVMWithStorage(vmid int, qemuSvc qemu.Service, nodesSvc nodes.Service, tasksSvc tasks.Service, agentSvc agent.Agent, storageSvc storage.Service) handlers.Deps {
 	if qemuSvc == nil {
 		qemuSvc = &mockQEMUService{}
@@ -468,6 +471,7 @@ func testDepsFoundVMWithStorage(vmid int, qemuSvc qemu.Service, nodesSvc nodes.S
 			tasksSvc:   tasksSvc,
 			storageSvc: storageSvc,
 			clusterSvc: defaultClusterSvc(vmid, "pve-node1"),
+			poolsSvc:   &noopPoolService{},
 		},
 		Agent:  agentSvc,
 		Logger: log.NewNopLogger(),

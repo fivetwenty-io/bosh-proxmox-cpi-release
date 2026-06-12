@@ -2113,7 +2113,7 @@ treated as advisory, not a reservation. Tier: operability.
 receives the requested minimum and creates the ephemeral disk; a zero input is omitted,
 preserving byte-identical behavior for callers that do not set the field.
 
-#### 7.44 OPEN — Concurrency-safe metadata and notes writes
+#### 7.44 SHIPPED — Concurrency-safe metadata and notes writes
 
 *References: Google.* The Google CPI guards every metadata and label mutation with a
 fingerprint read immediately before the write: GCE rejects the write with a 409 if a
@@ -2130,6 +2130,22 @@ per-VM mutex; on a multi-process worker pool, back that mutex with the cross-pro
 lock already shipped in §7.36 (pmxcfs-backed), keyed by VMID. PVE serializes tasks per VMID,
 which narrows but does not close the read-modify-write window, so the explicit
 read-before-write merge is still required.
+
+**Shipped:** `withVMIDLock` helper in `handlers/vmid_lock.go` acquires the pmxcfs-backed
+cluster lock keyed `bosh-lock-vm-<vmid>` (TTL 30s, timeout 10s) and wraps the tag and
+description read-modify-write at four call sites:
+
+- `set_vm_metadata` — tag RMW extracted into `setVMMetadataRMW`; lock failure → retriable error.
+- `set_disk_metadata` — both `persistMetadata` and `applyCustomTagsToVM` share a single lock
+  acquisition over the case-1 branch so the two writes are serialized together; lock failure → retriable error.
+- `tagFailedVM` (in `create_vm`) — lock failure → warn + proceed unlocked (best-effort: failure tag must never be silently dropped).
+- `stampDeletingTag` (in `delete_vm`) — same best-effort fallback as `tagFailedVM`.
+
+Two sites are intentionally not locked: `vm_annotator.AnnotateNotes` is a description-only
+overwrite with no merged state — a concurrent `set_vm_metadata` can transiently stomp it
+under a parallel apply, but no previously-set field is lost because the annotator carries no
+prior value to merge. Stemcell provenance is a single-shot write at template creation before
+any other process can reference the template VMID.
 
 **Limits.** PVE's task model gives no fingerprint or CAS token, so the guarantee is only as
 strong as the CPI's own locking discipline; a write that bypasses the merge path still

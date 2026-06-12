@@ -77,6 +77,11 @@ func (c *kfClient) Cluster() cluster.Service {
 	return c.cluster
 }
 
+// Pools returns nil so tagFailedVM's withVMIDLock falls back to the
+// best-effort unlocked path — acceptable for keep_failed_vms tests whose
+// focus is tag content and VM preservation, not lock ordering.
+func (c *kfClient) Pools() pve.PoolService { return nil }
+
 func kfBoolPtr(b bool) *bool { return &b }
 
 func kfEnv() map[string]any {

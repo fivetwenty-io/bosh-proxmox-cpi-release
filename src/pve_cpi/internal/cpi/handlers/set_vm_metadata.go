@@ -104,30 +104,6 @@ func HandleSetVMMetadata(deps Deps) cpi.Handler {
 		// Sorted "key: value\n" lines matching Perl reference behavior.
 		description := buildDescription(metadata)
 
-		// --- merge tags ---
-		// Read the existing tags string so operator-supplied custom tags
-		// (env--prod, owner--cpi-test, ...) survive. The director/deployment/
-		// job triple is rebuilt from metadata each call so stale values from
-		// a prior sync cannot accumulate.
-		var existingTags []string
-		if cfg, cfgErr := deps.PVE.QEMU().Config(ctx, node, vmid); cfgErr == nil {
-			if v, ok := cfg["tags"]; ok {
-				if s, ok := v.(string); ok {
-					existingTags = parseTagsField(s)
-				}
-			}
-		} else if pve.IsNotFound(cfgErr) {
-			return nil, cpierrors.VMNotFound(vmCID)
-		} else {
-			logger.Warn("set_vm_metadata: could not read current VM config; existing tags will not be preserved",
-				log.Err(cfgErr),
-			)
-		}
-
-		preserved := stripReservedBoshTags(existingTags)
-		boshEntries := buildBoshManagedTags(metadata)
-		tags := mergeTagList(preserved, boshEntries, maxTagLength)
-
 		// --- derive PVE VM name from prefix + deployment + job + index ---
 		// PVE's name field is a DNS label (alnum + "-", ≤ 63 bytes). The CPI
 		// stamps the name in "<prefix>-<deployment>-<job>-<index>" form
@@ -141,28 +117,87 @@ func HandleSetVMMetadata(deps Deps) cpi.Handler {
 			vmName = &s
 		}
 
-		logger.Debug("set_vm_metadata: updating VM config",
-			log.String("description_len", fmt.Sprintf("%d", len(description))),
-			log.String("tags", tags),
-			log.String("name", derefStr(vmName)),
-		)
-
-		// --- update VM config ---
-		updateErr := deps.PVE.Nodes().UpdateQemuConfig(ctx, node, vmCID, &sdknodes.UpdateQemuConfigParams{
-			Description: &description,
-			Tags:        &tags,
-			Name:        vmName,
+		// --- merge tags + update VM config (locked RMW) ---
+		// Concurrent Director processes may call set_vm_metadata for the same
+		// VMID at the same time (e.g. during a parallel apply). Without a lock
+		// two processes each read the existing tags, each strip-and-rebuild, and
+		// the last write silently discards the first writer's changes. The per-VMID
+		// cluster lock serializes the tag read-modify-write across processes.
+		//
+		// The description and name writes are folded inside the same locked
+		// UpdateQemuConfig call; they do not need separate RMW protection.
+		//
+		// Pool service absent (nil) → retriable error so the director re-drives.
+		lockOwner := fmt.Sprintf("set_vm_metadata/%d", vmid)
+		lockErr := withVMIDLock(ctx, deps.PVE.Pools(), vmid, lockOwner, logger, func() error {
+			return setVMMetadataRMW(ctx, deps, node, vmid, vmCID, description, metadata, vmName, logger)
 		})
-		if updateErr != nil {
-			if pve.IsNotFound(updateErr) {
-				return nil, cpierrors.VMNotFound(vmCID)
-			}
-			return nil, cpierrors.Wrap(pve.WrapError(updateErr), fmt.Sprintf("set_vm_metadata: update config for VM %s", vmCID))
+		if lockErr != nil {
+			return nil, lockErr
 		}
 
 		logger.Info("set_vm_metadata: VM metadata updated")
 		return nil, nil
 	})
+}
+
+// setVMMetadataRMW is the tag read-modify-write body executed under the per-VMID
+// cluster lock. It reads the current VM config (to preserve existing operator
+// tags), merges BOSH-managed tags from metadata, and writes description + tags +
+// name in a single UpdateQemuConfig call.
+//
+// Separated from HandleSetVMMetadata to keep cognitive complexity below the
+// lint threshold; the caller (withVMIDLock closure) provides serialization.
+func setVMMetadataRMW(
+	ctx context.Context,
+	deps Deps,
+	node string,
+	vmid int,
+	vmCID string,
+	description string,
+	metadata map[string]any,
+	vmName *string,
+	logger *log.Logger,
+) error {
+	// Read existing tags inside the lock so no concurrent writer can interleave
+	// between the read and the write.
+	var existingTags []string
+	if cfg, cfgErr := deps.PVE.QEMU().Config(ctx, node, vmid); cfgErr == nil {
+		if v, ok := cfg["tags"]; ok {
+			if s, ok := v.(string); ok {
+				existingTags = parseTagsField(s)
+			}
+		}
+	} else if pve.IsNotFound(cfgErr) {
+		return cpierrors.VMNotFound(vmCID)
+	} else {
+		logger.Warn("set_vm_metadata: could not read current VM config; existing tags will not be preserved",
+			log.Err(cfgErr),
+		)
+	}
+
+	preserved := stripReservedBoshTags(existingTags)
+	boshEntries := buildBoshManagedTags(metadata)
+	tags := mergeTagList(preserved, boshEntries, maxTagLength)
+
+	logger.Debug("set_vm_metadata: updating VM config",
+		log.String("description_len", fmt.Sprintf("%d", len(description))),
+		log.String("tags", tags),
+		log.String("name", derefStr(vmName)),
+	)
+
+	updateErr := deps.PVE.Nodes().UpdateQemuConfig(ctx, node, vmCID, &sdknodes.UpdateQemuConfigParams{
+		Description: &description,
+		Tags:        &tags,
+		Name:        vmName,
+	})
+	if updateErr != nil {
+		if pve.IsNotFound(updateErr) {
+			return cpierrors.VMNotFound(vmCID)
+		}
+		return cpierrors.Wrap(pve.WrapError(updateErr), fmt.Sprintf("set_vm_metadata: update config for VM %s", vmCID))
+	}
+	return nil
 }
 
 // buildVMName derives the PVE VM name from BOSH metadata + the operator's

@@ -3997,6 +3997,11 @@ func disposeFailedVM(ctx context.Context, deps Deps, node string, vmid int, env 
 // PVE's Tags field is full-replace, so the current tags are read and merged
 // rather than overwritten. It is best-effort: a tagging failure is logged, never
 // propagated — the create error is what matters. The VM is left running, intact.
+//
+// The tag read-modify-write runs under a per-VMID cluster lock so a concurrent
+// set_vm_metadata call cannot interleave and lose either writer's changes.
+// Lock acquisition failure is also best-effort: logged, then the RMW proceeds
+// unlocked rather than skipping the failure tag entirely.
 func tagFailedVM(ctx context.Context, deps Deps, node string, vmid int, env map[string]any, logger *log.Logger) {
 	entries := []string{"bosh-create-failed"}
 	// instanceGroupName falls back to the env.bosh.instance name on the
@@ -4010,26 +4015,45 @@ func tagFailedVM(ctx context.Context, deps Deps, node string, vmid int, env map[
 		entries = append(entries, "job--"+j)
 	}
 
-	// Preserve whatever tags the VM already carries (operator custom tags set at
-	// QEMU.Create). Best-effort read: on failure we still apply the failure tag.
-	var existing []string
-	if cfg, cfgErr := deps.PVE.QEMU().Config(ctx, node, vmid); cfgErr == nil {
-		if v, ok := cfg["tags"]; ok {
-			if s, ok := v.(string); ok {
-				existing = parseTagsField(s)
+	// tagRMW is the actual read-modify-write body. It is called under the
+	// per-VMID cluster lock when the pool service is available, or directly
+	// (best-effort, unlocked) when it is not.
+	tagRMW := func() {
+		// Preserve whatever tags the VM already carries (operator custom tags set
+		// at QEMU.Create). Best-effort read: on failure we still apply the failure tag.
+		var existing []string
+		if cfg, cfgErr := deps.PVE.QEMU().Config(ctx, node, vmid); cfgErr == nil {
+			if v, ok := cfg["tags"]; ok {
+				if s, ok := v.(string); ok {
+					existing = parseTagsField(s)
+				}
 			}
 		}
+
+		tags := mergeTagList(existing, entries, maxTagLength)
+		if err := deps.PVE.Nodes().UpdateQemuConfig(ctx, node, strconv.Itoa(vmid),
+			&sdknodes.UpdateQemuConfigParams{Tags: &tags}); err != nil {
+			logger.Warn("create_vm: keep_failed_vms tag write failed (non-fatal)",
+				log.Int(metadataKeyVMID, vmid), log.String("node", node), log.Err(err))
+			return
+		}
+		logger.Info("create_vm: VM preserved for diagnostics (debug.keep_failed_vms)",
+			log.Int(metadataKeyVMID, vmid), log.String("node", node), log.String("tags", tags))
 	}
 
-	tags := mergeTagList(existing, entries, maxTagLength)
-	if err := deps.PVE.Nodes().UpdateQemuConfig(ctx, node, strconv.Itoa(vmid),
-		&sdknodes.UpdateQemuConfigParams{Tags: &tags}); err != nil {
-		logger.Warn("create_vm: keep_failed_vms tag write failed (non-fatal)",
-			log.Int(metadataKeyVMID, vmid), log.String("node", node), log.Err(err))
-		return
+	lockOwner := fmt.Sprintf("tagFailedVM/%d", vmid)
+	lockErr := withVMIDLock(ctx, deps.PVE.Pools(), vmid, lockOwner, logger, func() error {
+		tagRMW()
+		return nil
+	})
+	if lockErr != nil {
+		// Lock unavailable (pool service nil or cluster fault): proceed unlocked
+		// so the failure tag is still written. A lost concurrent write is
+		// acceptable here; the failure tag is the critical signal.
+		logger.Warn("create_vm: tagFailedVM: could not acquire VMID lock; tagging without lock (best-effort)",
+			log.Int(metadataKeyVMID, vmid), log.Err(lockErr))
+		tagRMW()
 	}
-	logger.Info("create_vm: VM preserved for diagnostics (debug.keep_failed_vms)",
-		log.Int(metadataKeyVMID, vmid), log.String("node", node), log.String("tags", tags))
 }
 
 // preserveFailedVMError wraps the original create failure with a message naming

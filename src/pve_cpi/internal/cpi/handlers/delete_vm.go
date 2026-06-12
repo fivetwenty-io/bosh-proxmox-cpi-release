@@ -29,22 +29,44 @@ const tagDeletingVM = "bosh-deleting"
 // writes back via UpdateQemuConfig. Failures are logged but never propagated:
 // the caller treats tagging as best-effort. Existing operator tags are
 // preserved via mergeTagList.
+//
+// The tag read-modify-write runs under a per-VMID cluster lock so a concurrent
+// set_vm_metadata or set_disk_metadata call cannot interleave and overwrite the
+// bosh-deleting marker. Lock acquisition failure is best-effort: logged, then
+// the RMW proceeds unlocked so the marker is never silently dropped.
 func stampDeletingTag(ctx context.Context, deps Deps, node, vmCID string, vmid int, logger *log.Logger) {
-	// Best-effort read of existing tags. On failure existing is nil and
-	// mergeTagList still adds tagDeletingVM as the sole entry.
-	var existing []string
-	if cfg, cfgErr := deps.PVE.QEMU().Config(ctx, node, vmid); cfgErr == nil {
-		if v, ok := cfg["tags"]; ok {
-			if s, ok := v.(string); ok {
-				existing = parseTagsField(s)
+	// stampRMW is the actual read-modify-write body, called under the lock when
+	// available and directly (unlocked) when the pool service is absent.
+	stampRMW := func() {
+		// Best-effort read of existing tags. On failure existing is nil and
+		// mergeTagList still adds tagDeletingVM as the sole entry.
+		var existing []string
+		if cfg, cfgErr := deps.PVE.QEMU().Config(ctx, node, vmid); cfgErr == nil {
+			if v, ok := cfg["tags"]; ok {
+				if s, ok := v.(string); ok {
+					existing = parseTagsField(s)
+				}
 			}
 		}
+		tags := mergeTagList(existing, []string{tagDeletingVM}, maxTagLength)
+		if err := deps.PVE.Nodes().UpdateQemuConfig(ctx, node, vmCID,
+			&sdknodes.UpdateQemuConfigParams{Tags: &tags}); err != nil {
+			logger.Warn("delete_vm: fast-path tag write failed (non-fatal; destroy will proceed)",
+				log.String("vmid", vmCID), log.Err(err))
+		}
 	}
-	tags := mergeTagList(existing, []string{tagDeletingVM}, maxTagLength)
-	if err := deps.PVE.Nodes().UpdateQemuConfig(ctx, node, vmCID,
-		&sdknodes.UpdateQemuConfigParams{Tags: &tags}); err != nil {
-		logger.Warn("delete_vm: fast-path tag write failed (non-fatal; destroy will proceed)",
-			log.String("vmid", vmCID), log.Err(err))
+
+	lockOwner := fmt.Sprintf("stampDeletingTag/%d", vmid)
+	lockErr := withVMIDLock(ctx, deps.PVE.Pools(), vmid, lockOwner, logger, func() error {
+		stampRMW()
+		return nil
+	})
+	if lockErr != nil {
+		// Pool service unavailable or cluster fault: proceed unlocked so the
+		// diagnostic tag is never silently skipped.
+		logger.Warn("delete_vm: stampDeletingTag: could not acquire VMID lock; tagging without lock (best-effort)",
+			log.String("vmid", vmCID), log.Err(lockErr))
+		stampRMW()
 	}
 }
 

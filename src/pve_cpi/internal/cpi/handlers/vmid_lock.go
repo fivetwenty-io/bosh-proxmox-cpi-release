@@ -1,0 +1,76 @@
+package handlers
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
+	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
+	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
+)
+
+// vmidLockTTL is the maximum lifetime of a held per-VMID cluster lock.
+// Set to 30s — matches the StorageLock convention and is well above the
+// typical tag read-modify-write latency (~1s). A holder that crashes after
+// acquisition but before release is reclaimed after TTL expires.
+const vmidLockTTL = 30 * time.Second
+
+// vmidLockTimeout is the maximum time withVMIDLock waits to acquire the lock.
+// Set to 10s. On timeout AcquireClusterLock returns a retriable error so the
+// BOSH director re-drives the operation rather than failing the deployment.
+const vmidLockTimeout = 10 * time.Second
+
+// withVMIDLock acquires a per-VMID cross-process advisory lock backed by PVE
+// resource pools (the same pmxcfs sentinel mechanism used for anti-affinity)
+// and then calls fn under that lock. The lock is released via a deferred call
+// regardless of whether fn succeeds or fails.
+//
+// Lock key scheme: "vm-<vmid>" → ClusterLockPoolName("vm-<vmid>") →
+// "bosh-lock-vm-<vmid>". This serializes all tag/notes read-modify-write
+// operations for a given VMID across concurrent CPI process invocations.
+//
+// Failure modes:
+//   - pools == nil: returns a retriable error immediately; fn is not called.
+//   - AcquireClusterLock failure: returns the retriable error from the lock
+//     infrastructure; fn is not called.
+//   - fn returns an error: the error is returned to the caller; the lock is
+//     still released via defer.
+//   - fn succeeds: nil is returned; lock is released.
+//
+// The lock release error (if any) is logged at Warn level and not returned
+// so a deferred release failure does not mask the fn result.
+func withVMIDLock(
+	ctx context.Context,
+	pools pve.PoolService,
+	vmid int,
+	owner string,
+	logger *log.Logger,
+	fn func() error,
+) error {
+	if pools == nil {
+		return cpierrors.WrapAs(
+			cpierrors.Cloud("withVMIDLock: pool service is nil for vmid=%d", vmid),
+			cpierrors.TypeRetriableCloud,
+			fmt.Sprintf("withVMIDLock: acquire lock for vm-%d", vmid),
+		)
+	}
+
+	lockName := fmt.Sprintf("vm-%d", vmid)
+	handle, err := pve.AcquireClusterLock(ctx, pools, lockName, owner, vmidLockTTL, vmidLockTimeout)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if relErr := handle.Release(ctx); relErr != nil {
+			if logger != nil {
+				logger.Warn("withVMIDLock: release failed (non-fatal)",
+					log.Int("vmid", vmid),
+					log.Err(relErr),
+				)
+			}
+		}
+	}()
+
+	return fn()
+}

@@ -144,7 +144,7 @@ func (c *diskMetaClientMock) Tasks() tasks.Service                   { return ni
 func (c *diskMetaClientMock) Nodes() sdknodes.Service                { return c.nodesSvc }
 func (c *diskMetaClientMock) Cluster() sdkclusterapi.Service         { return c.clusterSvc }
 func (c *diskMetaClientMock) ClusterStorage() clusterstorage.Service { return nil }
-func (c *diskMetaClientMock) Pools() pve.PoolService                 { return nil }
+func (c *diskMetaClientMock) Pools() pve.PoolService                 { return &noopPoolService{} }
 
 // ---------------------------------------------------------------------------
 // helper builders
@@ -1021,7 +1021,7 @@ func (c *diskMetaFullMock) Tasks() tasks.Service                   { return nil 
 func (c *diskMetaFullMock) Nodes() sdknodes.Service                { return c.nodesSvc }
 func (c *diskMetaFullMock) Cluster() sdkclusterapi.Service         { return c.clusterSvc }
 func (c *diskMetaFullMock) ClusterStorage() clusterstorage.Service { return nil }
-func (c *diskMetaFullMock) Pools() pve.PoolService                 { return nil }
+func (c *diskMetaFullMock) Pools() pve.PoolService                 { return &noopPoolService{} }
 
 // TestHandleSetDiskMetadata_TransientConfigErrorDuringScan_Retriable verifies
 // that a transient per-VM Config fault during the attachment scan surfaces as
