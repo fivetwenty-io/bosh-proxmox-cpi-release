@@ -2206,7 +2206,7 @@ is enabled — the CPI documents this override. Unset flags (`nil`) produce outp
 byte-identical to the pre-feature behavior. No spec or ERB keys are added; these are
 `vm_type` cloud_properties only.
 
-#### 7.47 OPEN — PCI passthrough and vGPU as cloud_properties
+#### 7.47 SHIPPED — PCI passthrough and vGPU as cloud_properties
 
 *References: vSphere.* The vSphere CPI accepts `vgpus`, `pci_passthroughs`, and
 `device_groups` in `vm_type`, then iterates healthy hosts to find one carrying the requested
@@ -2216,15 +2216,28 @@ GRID-capable cards, and publishes per-node device inventories at
 `/nodes/{node}/hardware/pci`, but the CPI exposes none of this, so GPU and accelerator
 workloads cannot be expressed in a manifest.
 
-**Build:** add `pci_passthroughs: [{address: '0000:01:00.0'}]` to `vm_type`
-cloud_properties. During placement, filter candidate nodes to those advertising the
-requested device via `/nodes/{node}/hardware/pci`; at `create_vm`, configure `hostpci0..N`
-through `pvesh set`, honoring IOMMU group constraints.
+**Shipped:** `pci_passthroughs: [{address: "0000:01:00.0"}]` in `vm_type` cloud_properties
+filters placement to nodes advertising the requested PCI devices via
+`/nodes/{node}/hardware/pci`; after clone, `hostpci0..N` are set on the VM via
+`UpdateQemuConfig`; a strict single-node HA pin (`bosh-na-<vmid>`) is applied automatically
+to block live migration. Address format (DDDD:BB:SS.F) is validated pre-clone so no orphan
+VM is produced on bad input. Every node-resolution path — including the static paths that
+bypass the placement filter (`target_node`, local-disk pin, `config.node` fallback,
+placement disabled) — re-verifies the chosen node's device inventory before any clone, so a
+PCI VM is never created on a node lacking the device: device absent is a non-retriable
+error, an inventory API fault is retriable. Hardware ids reported in domain-less short form
+(`01:00.0`) are normalized before comparison. The pin is removed unconditionally on create
+rollback and on `delete_vm` (sync and fast path) — removal is not gated by
+`placement.pin_az_via_ha_rules`, since the PCI pin is written regardless of that flag.
+Empty list is byte-identical (no filter, no device check, no hostpci config, no pin).
+`placement.Request` gains `RequiredPCIAddresses` and `PCIChecker` fields; the PCI filter
+pass in `placement.Filter` is fail-safe (API error → node rejected).
 
-**Limits.** IOMMU grouping on PVE is complex: a passed-through device may drag its whole
-group, and group membership varies by hardware and BIOS, which makes reliable node filtering
-harder than on vSphere. A passed-through device also pins the VM to a node and blocks live
-migration. Tier: deployment.
+**Limits.** IOMMU group resolution is not performed by the CPI — operator responsibility to
+ensure IOMMU is enabled on the host and that the device is not shared across IOMMU groups
+unless group isolation is confirmed. Live migration is blocked by design when PCI passthrough
+is configured. Pin removal at delete/rollback adds two idempotent, not-found-tolerant HA API
+calls per VM for all deployments. Live PVE validation pending.
 
 #### 7.48 SHIPPED — Multi-reference stemcell deduplication
 

@@ -266,19 +266,24 @@ func TestCleanupVM_RemovesNodeAffinityPinWhenEnabled(t *testing.T) {
 	}
 }
 
-func TestCleanupVM_SkipsPinWhenDisabled(t *testing.T) {
+func TestCleanupVM_RemovesPinEvenWhenAZPinDisabled(t *testing.T) {
+	// The bosh-na-<vmid> rule has two writers: the AZ pin (gated by
+	// placement.pin_az_via_ha_rules) and the PCI strict pin (written whenever
+	// pci_passthroughs is set, regardless of that flag). Rollback removal is
+	// therefore unconditional — a flag-gated removal would orphan a PCI pin
+	// forever on a default (flag-off) deployment.
 	cl := newNAStub()
 	cl.rules["bosh-na-100"] = cluster.CreateHaRulesParams{Rule: "bosh-na-100"}
 	deps := Deps{
-		Config: icMinConfig(), // no Placement → pin disabled
+		Config: icMinConfig(), // no Placement → AZ pin disabled
 		PVE:    &kfClient{nodes: &kfNodes{}, qemu: &kfQEMU{}, cluster: cl},
 		Logger: log.NewNopLogger(),
 	}
 
 	cleanupVM(context.Background(), deps, "pve01", 100, log.NewNopLogger())
 
-	if _, ok := cl.rules["bosh-na-100"]; !ok {
-		t.Error("cleanupVM must not touch HA rules when pinning is disabled")
+	if _, ok := cl.rules["bosh-na-100"]; ok {
+		t.Error("cleanupVM must remove the node-affinity pin rule even when the AZ-pin flag is off")
 	}
 }
 

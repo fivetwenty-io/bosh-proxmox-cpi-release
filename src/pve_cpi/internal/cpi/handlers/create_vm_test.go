@@ -329,6 +329,26 @@ func (m *vmMockCluster) ListFirewallGroups(_ context.Context) (*sdkcluster.ListF
 	return &empty, nil
 }
 
+// HA rule/resource stubs on vmMockCluster: return not-found so
+// removeNodeAffinityPin is a safe no-op in tests that do not exercise HA
+// pinning. The not-found strings are matched by isHaNotFound.
+func (m *vmMockCluster) DeleteHaRules(_ context.Context, _ string) error {
+	return fmt.Errorf("no such rule (mock)")
+}
+func (m *vmMockCluster) DeleteHaResources(_ context.Context, _ string, _ *sdkcluster.DeleteHaResourcesParams) error {
+	return fmt.Errorf("does not exist (mock)")
+}
+func (m *vmMockCluster) CreateHaResources(_ context.Context, _ *sdkcluster.CreateHaResourcesParams) error {
+	return nil
+}
+func (m *vmMockCluster) CreateHaRules(_ context.Context, _ *sdkcluster.CreateHaRulesParams) error {
+	return nil
+}
+func (m *vmMockCluster) ListHaRules(_ context.Context, _ *sdkcluster.ListHaRulesParams) (*sdkcluster.ListHaRulesResponse, error) {
+	empty := sdkcluster.ListHaRulesResponse{}
+	return &empty, nil
+}
+
 // vmMockAgent implements agent.Agent for create_vm tests.
 type vmMockAgent struct {
 	configureFn    func(ctx context.Context, node string, vmid int, cfg agent.AgentConfig) error

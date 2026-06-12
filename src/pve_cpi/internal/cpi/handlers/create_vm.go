@@ -229,6 +229,19 @@ type createVMCloudProps struct {
 	// see any reference to the ephemeral volume, so the backing storage survives.
 	// Nil → byte-identical (no tag, no unlink, ephemeral is destroyed with the VM).
 	RetainEphemeralOnDelete *bool `json:"retain_ephemeral_on_delete,omitempty"`
+	// PCIPassthroughs lists host PCI devices to pass through to the VM.
+	// Each entry carries a PCI address (e.g. "0000:01:00.0") that must be
+	// present on the placement target node; placement filters nodes to those
+	// advertising all requested devices via /nodes/{node}/hardware/pci.
+	// After clone, hostpci0..N are set on the VM via UpdateQemuConfig.
+	// A strict single-node HA pin is applied automatically to block live
+	// migration (PCI passthrough is incompatible with migration).
+	// Operator responsibility: IOMMU group resolution is not performed by
+	// the CPI; ensure the host has IOMMU enabled and that the device is not
+	// shared across IOMMU groups unless the operator has verified group
+	// isolation. Nil or empty → byte-identical (no PCI filter, no hostpciN
+	// config, no strict pin).
+	PCIPassthroughs []PCIPassthrough `json:"pci_passthroughs,omitempty"`
 }
 
 // createVMNetworkSpec mirrors the BOSH v2 network spec shape.
@@ -591,6 +604,19 @@ func createVM(
 	}
 
 	// -----------------------------------------------------------------------
+	// 9c. PCI strict node-affinity pin (automatic when pci_passthroughs set).
+	//
+	// PCI passthrough is incompatible with live migration. When the VM has any
+	// passthrough devices, a strict single-node HA pin is applied so the HA
+	// manager cannot relocate the VM to a node that may lack the device.
+	// Empty pci_passthroughs → no-op (byte-identical). TypeRetriableCloud
+	// errors propagate; generic HA-API failures are logged as non-fatal.
+	// -----------------------------------------------------------------------
+	if pciPinErr := applyPCINodeAffinityPin(ctx, deps, vmid, shape.node, parsed.cloudProps.PCIPassthroughs, logger); pciPinErr != nil {
+		return nil, pciPinErr
+	}
+
+	// -----------------------------------------------------------------------
 	// 10. PVE Dynamic Load Balancer membership (opt-in: placement.dlb).
 	//
 	// Best-effort and non-fatal. When the VM is DLB-eligible (master flag or
@@ -782,6 +808,14 @@ func createVMWithFallback(
 		}
 
 		// -----------------------------------------------------------------------
+		// 9c. PCI strict node-affinity pin — errors propagate (retriable ones
+		// re-drive). No-op when pci_passthroughs is empty.
+		// -----------------------------------------------------------------------
+		if pciPinErr := applyPCINodeAffinityPin(ctx, deps, winningVMID, winShape.node, parsed.cloudProps.PCIPassthroughs, logger); pciPinErr != nil {
+			return nil, pciPinErr
+		}
+
+		// -----------------------------------------------------------------------
 		// 10. DLB membership
 		// -----------------------------------------------------------------------
 		if deps.Config.DLBEligibleForAZ(parsed.cloudProps.AvailabilityZone) {
@@ -863,6 +897,12 @@ func parseCreateVMArgs(args []json.RawMessage) (*createVMParsedArgs, error) {
 	// Validate pve_config before any VM is created. A bad key or value is a
 	// manifest error that must surface pre-clone so no orphan VM is produced.
 	if err := validatePVEConfig(cloudProps.PVEConfig); err != nil {
+		return nil, err
+	}
+	// Validate pci_passthroughs address format pre-clone so a malformed address
+	// never reaches the PVE API, consistent with the pve_config pre-validation
+	// pattern.
+	if err := validatePCIPassthroughs(cloudProps.PCIPassthroughs); err != nil {
 		return nil, err
 	}
 
@@ -1303,6 +1343,19 @@ func resolveTargetNodeWithRNG(
 			return localPin, nil
 		}
 
+		// Build a PCI checker when pci_passthroughs is non-empty. The checker
+		// calls ListHardwarePci per candidate node (fail-safe: API error → reject).
+		// Empty list → nil checker → PCI pass skipped (byte-identical path).
+		var pciAddrs []string
+		var pciCheckerFn func(string) (bool, error)
+		if len(cp.PCIPassthroughs) > 0 {
+			pciAddrs = make([]string, len(cp.PCIPassthroughs))
+			for i, pt := range cp.PCIPassthroughs {
+				pciAddrs[i] = pt.Address
+			}
+			pciCheckerFn = buildPCIChecker(ctx, deps.PVE.Nodes(), pciAddrs)
+		}
+
 		// AZ loop. When azOrder is empty (no AZ set at all), run a single
 		// iteration with no candidate restriction (all nodes).
 		allRejections := make(map[string]string)
@@ -1311,6 +1364,8 @@ func resolveTargetNodeWithRNG(
 			// No AZ constraint: all nodes are candidates.
 			req := placement.Request{
 				ExcludeMaintenanceNodes: excludeMaintenance,
+				RequiredPCIAddresses:    pciAddrs,
+				PCIChecker:              pciCheckerFn,
 			}
 			pass, rejections := placement.Filter(facts, req)
 			mergeRejections(allRejections, rejections)
@@ -1329,6 +1384,8 @@ func resolveTargetNodeWithRNG(
 				req := placement.Request{
 					CandidateNodes:          candidateSet,
 					ExcludeMaintenanceNodes: excludeMaintenance,
+					RequiredPCIAddresses:    pciAddrs,
+					PCIChecker:              pciCheckerFn,
 				}
 				pass, rejections := placement.Filter(facts, req)
 				mergeRejections(allRejections, rejections)
@@ -1549,11 +1606,24 @@ func resolveTargetNodeWithFallbacks(
 			return localPin, nil, nil
 		}
 
+		// Build PCI checker for fallback path (same logic as resolveTargetNodeWithRNG).
+		var pciAddrsFB []string
+		var pciCheckerFnFB func(string) (bool, error)
+		if len(cp.PCIPassthroughs) > 0 {
+			pciAddrsFB = make([]string, len(cp.PCIPassthroughs))
+			for i, pt := range cp.PCIPassthroughs {
+				pciAddrsFB[i] = pt.Address
+			}
+			pciCheckerFnFB = buildPCIChecker(ctx, deps.PVE.Nodes(), pciAddrsFB)
+		}
+
 		allRejections := make(map[string]string)
 
 		if len(azOrder) == 0 {
 			req := placement.Request{
 				ExcludeMaintenanceNodes: excludeMaintenance,
+				RequiredPCIAddresses:    pciAddrsFB,
+				PCIChecker:              pciCheckerFnFB,
 			}
 			pass, rejections := placement.Filter(facts, req)
 			mergeRejections(allRejections, rejections)
@@ -1571,6 +1641,8 @@ func resolveTargetNodeWithFallbacks(
 				req := placement.Request{
 					CandidateNodes:          candidateSet,
 					ExcludeMaintenanceNodes: excludeMaintenance,
+					RequiredPCIAddresses:    pciAddrsFB,
+					PCIChecker:              pciCheckerFnFB,
 				}
 				pass, rejections := placement.Filter(facts, req)
 				mergeRejections(allRejections, rejections)
@@ -1991,6 +2063,13 @@ func isTransientRejectionReason(reason string) bool {
 	switch reason {
 	case "node offline", "node in maintenance", "insufficient CPU", "insufficient free memory",
 		"not in candidate node set":
+		return true
+	}
+	// A failed ListHardwarePci call (pvedaemon restart, momentary node
+	// unreachability) is transient: the device may well be present, the check
+	// just could not run. "missing required PCI device" stays permanent — the
+	// node answered and the device is absent.
+	if strings.HasPrefix(reason, "PCI device check error: ") {
 		return true
 	}
 	return false
@@ -2690,6 +2769,16 @@ func attemptCreateVM(
 		candidateName = fmt.Sprintf("vm-%d", candidate)
 	}
 
+	// PCI guard: every node-resolution outcome funnels through here, including
+	// the static paths that never run the placement filter (operator
+	// target_node, local-disk pin, config.node fallback, placement disabled).
+	// Verify the chosen node before any clone/import so a missing device
+	// produces a clear pre-mutation error instead of a VM that cannot start.
+	// No-op when pci_passthroughs is absent.
+	if pciErr := verifyPCIOnNode(ctx, deps, shape.node, parsed.cloudProps.PCIPassthroughs, logger); pciErr != nil {
+		return pciErr
+	}
+
 	// --- Template-clone path ---
 	if pve.IsTemplateStemcellCID(parsed.stemcellCID) {
 		templateVMID, err := pve.ParseTemplateStemcellCID(parsed.stemcellCID)
@@ -2762,9 +2851,9 @@ func attemptCreateVM(
 			log.Int64("template_vmid", effectiveTemplateVMID),
 			log.String("template_node", effectiveTemplateNode),
 		)
-		// Apply operator pve_config passthrough after clone config is set.
-		// pve_config was pre-validated in parseCreateVMArgs; cleanup on API fault.
-		return applyPVEConfigWithCleanup(ctx, deps, shape.node, candidate, parsed.cloudProps.PVEConfig, logger)
+		// Apply post-clone config (pve_config passthrough + PCI hostpciN).
+		// Both steps are no-ops when the respective cloud_properties are absent.
+		return applyPostCloneConfig(ctx, deps, shape.node, candidate, parsed, logger)
 	}
 
 	// --- Old-form CID: opportunistic template lookup before import-from ---
@@ -2809,9 +2898,8 @@ func attemptCreateVM(
 				log.Int64("template_vmid", templateVMID),
 				log.String("template_node", templateNode),
 			)
-			// Apply operator pve_config passthrough after clone config is set.
-			// pve_config was pre-validated in parseCreateVMArgs; cleanup on API fault.
-			return applyPVEConfigWithCleanup(ctx, deps, shape.node, candidate, parsed.cloudProps.PVEConfig, logger)
+			// Apply post-clone config (pve_config passthrough + PCI hostpciN).
+			return applyPostCloneConfig(ctx, deps, shape.node, candidate, parsed, logger)
 		}
 		// !found → fall through to import-from below.
 	}
@@ -2864,9 +2952,8 @@ func attemptCreateVM(
 		log.Int("vmid_attempted", candidate),
 		log.String("upid", upid),
 	)
-	// Apply operator pve_config passthrough after import completes.
-	// pve_config was pre-validated in parseCreateVMArgs; cleanup on API fault.
-	return applyPVEConfigWithCleanup(ctx, deps, shape.node, candidate, parsed.cloudProps.PVEConfig, logger)
+	// Apply post-clone config (pve_config passthrough + PCI hostpciN).
+	return applyPostCloneConfig(ctx, deps, shape.node, candidate, parsed, logger)
 }
 
 // handleCloneError classifies a cloneFromTemplate error and logs appropriately.
@@ -4343,15 +4430,17 @@ func cleanupVM(ctx context.Context, deps Deps, node string, vmid int, logger *lo
 		}
 	}
 
-	// Remove the AZ node-affinity HA pin (bosh-na-<vmid>) and deregister its HA
+	// Remove the node-affinity HA pin (bosh-na-<vmid>) and deregister its HA
 	// resource. VM purge does not GC the cluster-level HA rule, so without this
-	// a rolled-back create that reached the pin step would leave an orphan rule
-	// referencing a destroyed VM. Gated + best-effort + idempotent.
-	if deps.Config.HANodeAffinityPinEnabled() {
-		if pinErr := removeNodeAffinityPin(ctx, deps, vmid, logger); pinErr != nil {
-			logger.Warn("create_vm: rollback node-affinity pin cleanup incomplete (non-fatal)",
-				log.Int(metadataKeyVMID, vmid), log.Err(pinErr))
-		}
+	// a rolled-back create that reached a pin step would leave an orphan rule
+	// referencing a destroyed VM. Unconditional because two writers create this
+	// rule: the AZ pin (gated by HANodeAffinityPinEnabled) and the PCI strict
+	// pin (applied whenever pci_passthroughs is set, regardless of that flag).
+	// removeNodeAffinityPin is idempotent and not-found-tolerant, so for a VM
+	// that never had a pin this is two cheap no-op HA calls. Best-effort.
+	if pinErr := removeNodeAffinityPin(ctx, deps, vmid, logger); pinErr != nil {
+		logger.Warn("create_vm: rollback node-affinity pin cleanup incomplete (non-fatal)",
+			log.Int(metadataKeyVMID, vmid), log.Err(pinErr))
 	}
 }
 

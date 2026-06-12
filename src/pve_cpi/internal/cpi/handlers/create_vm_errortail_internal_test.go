@@ -12,6 +12,7 @@ import (
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
 
+	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cluster"
 	sdknodes "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/nodes"
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/qemu"
 )
@@ -68,6 +69,10 @@ type etClient struct {
 
 func (c *etClient) QEMU() qemu.Service      { return c.qemu }
 func (c *etClient) Nodes() sdknodes.Service { return c.nodes }
+
+// Cluster returns a fresh not-found-tolerant HA stub: cleanupVM now removes the
+// node-affinity pin unconditionally, so every rollback path touches Cluster().
+func (c *etClient) Cluster() cluster.Service { return newNAStub() }
 
 type etAgent struct {
 	configureFn func(ctx context.Context, node string, vmid int, cfg agent.AgentConfig) error

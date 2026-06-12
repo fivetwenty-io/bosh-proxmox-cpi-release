@@ -120,6 +120,19 @@ type Request struct {
 	// whose NodeFacts.InMaintenance is true. Zero value (false) preserves legacy
 	// behavior: maintenance nodes pass through Filter unchanged.
 	ExcludeMaintenanceNodes bool
+
+	// RequiredPCIAddresses lists PCI device addresses (e.g. "0000:01:00.0") that
+	// the target node must expose. When non-empty, PCIChecker is called for each
+	// candidate node; nodes that return (false, nil) or (_, non-nil error) are
+	// rejected. When empty, no PCI filter is applied (byte-identical path).
+	RequiredPCIAddresses []string
+
+	// PCIChecker is a callback that reports whether the named node exposes all
+	// addresses in RequiredPCIAddresses. Filter calls it only when
+	// RequiredPCIAddresses is non-empty. A non-nil error causes the node to be
+	// rejected (fail-safe). Nil checker with non-empty RequiredPCIAddresses is a
+	// no-op: the node passes (callers that do not provide I/O skip the check).
+	PCIChecker func(node string) (bool, error)
 }
 
 // ScoredNode is a node with its computed score.
@@ -133,6 +146,8 @@ type ScoredNode struct {
 //   - Node must be in req.CandidateNodes when that slice is non-empty.
 //   - Node must have MaxCPU ≥ req.RequiredCPU when RequiredCPU > 0.
 //   - Node must have FreeMemBytes ≥ req.RequiredMemBytes when RequiredMemBytes > 0.
+//   - When req.RequiredPCIAddresses is non-empty and req.PCIChecker is set, the
+//     node must pass the PCI device check (fail-safe: error → reject).
 //
 // Each excluded node is accompanied by a human-readable rejection reason.
 // Filter returns (nil, nil) when facts is empty.
@@ -175,6 +190,18 @@ func Filter(facts []NodeFacts, req Request) (pass []NodeFacts, rejections map[st
 		if req.RequiredMemBytes > 0 && f.FreeMemBytes < req.RequiredMemBytes {
 			rejections[f.Node] = "insufficient free memory"
 			continue
+		}
+
+		if len(req.RequiredPCIAddresses) > 0 && req.PCIChecker != nil {
+			present, checkErr := req.PCIChecker(f.Node)
+			if checkErr != nil {
+				rejections[f.Node] = "PCI device check error: " + checkErr.Error()
+				continue
+			}
+			if !present {
+				rejections[f.Node] = "missing required PCI device"
+				continue
+			}
 		}
 
 		pass = append(pass, f)

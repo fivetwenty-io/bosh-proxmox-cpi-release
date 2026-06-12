@@ -238,6 +238,16 @@ func fastPathDeleteVM(ctx context.Context, deps Deps, node, vmCID string, vmid i
 		return guardErr
 	}
 
+	// Remove the node-affinity HA pin before destroy. The fast path returns
+	// before the sync path's pin cleanup, so without this a pinned VM (AZ pin or
+	// PCI strict pin) deleted via fast_path_delete would leave an orphan
+	// bosh-na-<vmid> rule forever. removeNodeAffinityPin issues two synchronous,
+	// bounded HA calls (no task await) — compatible with the fast path's
+	// bounded-time contract. Idempotent, not-found-tolerant, best-effort.
+	if pinErr := removeNodeAffinityPin(ctx, deps, vmid, logger); pinErr != nil {
+		logger.Warn("delete_vm: fast-path HA node-affinity pin cleanup incomplete (non-fatal)", log.Err(pinErr))
+	}
+
 	// Issue destroy with skiplock=true. Discard the UPID; no await.
 	//
 	// DestroyUnreferencedDisks=false on the retain path: after the unlink+sweep
@@ -445,14 +455,20 @@ func HandleDeleteVM(deps Deps) cpi.Handler {
 			}
 		}
 
-		// --- HA node-affinity pin cleanup (opt-in: placement.pin_az_via_ha_rules) ---
-		// Remove the per-VM node-affinity pin rule and deregister its HA resource.
-		// Keyed on vmid; idempotent and best-effort. Safe alongside the
-		// anti-affinity cleanup above (both tolerate a not-found HA resource).
-		if deps.Config.HANodeAffinityPinEnabled() {
-			if pinErr := removeNodeAffinityPin(ctx, deps, vmid, logger); pinErr != nil {
-				logger.Warn("delete_vm: HA node-affinity pin cleanup incomplete (non-fatal)", log.Err(pinErr))
-			}
+		// --- HA node-affinity pin cleanup ---
+		// Remove the per-VM node-affinity pin rule (bosh-na-<vmid>) and deregister
+		// its HA resource. Keyed on vmid; idempotent and best-effort. Safe
+		// alongside the anti-affinity cleanup above (both tolerate a not-found HA
+		// resource).
+		//
+		// Unconditional because two writers create this rule: the AZ pin (gated by
+		// placement.pin_az_via_ha_rules) and the PCI strict pin (applied whenever
+		// pci_passthroughs is set, regardless of that flag). delete_vm has no
+		// cloud_properties, so it cannot know which writer ran; removing
+		// unconditionally guarantees no orphan rule survives the VM. For a VM that
+		// never had a pin this is two cheap not-found no-ops.
+		if pinErr := removeNodeAffinityPin(ctx, deps, vmid, logger); pinErr != nil {
+			logger.Warn("delete_vm: HA node-affinity pin cleanup incomplete (non-fatal)", log.Err(pinErr))
 		}
 
 		// --- delete VM (synchronous path) ---

@@ -170,6 +170,7 @@ type mockNodesService struct {
 	listStorageContentFn     func(ctx context.Context, node string, storage string, params *nodes.ListStorageContentParams) (*nodes.ListStorageContentResponse, error)
 	createQemuStatusRebootFn func(ctx context.Context, node string, vmid string, params *nodes.CreateQemuStatusRebootParams) (*nodes.CreateQemuStatusRebootResponse, error)
 	listStorageFn            func(ctx context.Context, node string, params *nodes.ListStorageParams) (*nodes.ListStorageResponse, error)
+	listHardwarePciFn        func(ctx context.Context, node string, params *nodes.ListHardwarePciParams) (*nodes.ListHardwarePciResponse, error)
 }
 
 func (m *mockNodesService) DeleteQemu(ctx context.Context, node string, vmid string, params *nodes.DeleteQemuParams) (*nodes.DeleteQemuResponse, error) {
@@ -230,6 +231,15 @@ func (m *mockNodesService) ListStorage(ctx context.Context, node string, params 
 	})
 	resp := nodes.ListStorageResponse{json.RawMessage(raw)}
 	return &resp, nil
+}
+
+func (m *mockNodesService) ListHardwarePci(ctx context.Context, node string, params *nodes.ListHardwarePciParams) (*nodes.ListHardwarePciResponse, error) {
+	if m.listHardwarePciFn != nil {
+		return m.listHardwarePciFn(ctx, node, params)
+	}
+	// Default: empty PCI device list (no passthrough devices present).
+	empty := nodes.ListHardwarePciResponse{}
+	return &empty, nil
 }
 
 // --------------------------------------------------------------------------
@@ -618,6 +628,26 @@ func (m *mockSDNCluster) UpdateSdn(ctx context.Context, params *cluster.UpdateSd
 		return m.updateSdnFn(ctx, params)
 	}
 	panic("mockSDNCluster.UpdateSdn called without configuration; opt in by setting updateSdnFn")
+}
+
+// HA rule/resource stubs: return not-found so removeNodeAffinityPin is a
+// safe no-op in tests that do not exercise HA pinning. Tests that exercise
+// pinning use naClusterStub (internal package) or naStub (external package).
+func (m *mockSDNCluster) DeleteHaRules(_ context.Context, _ string) error {
+	return fmt.Errorf("no such rule (mock)")
+}
+func (m *mockSDNCluster) DeleteHaResources(_ context.Context, _ string, _ *cluster.DeleteHaResourcesParams) error {
+	return fmt.Errorf("does not exist (mock)")
+}
+func (m *mockSDNCluster) CreateHaResources(_ context.Context, _ *cluster.CreateHaResourcesParams) error {
+	return nil
+}
+func (m *mockSDNCluster) CreateHaRules(_ context.Context, _ *cluster.CreateHaRulesParams) error {
+	return nil
+}
+func (m *mockSDNCluster) ListHaRules(_ context.Context, _ *cluster.ListHaRulesParams) (*cluster.ListHaRulesResponse, error) {
+	empty := cluster.ListHaRulesResponse{}
+	return &empty, nil
 }
 
 // --------------------------------------------------------------------------
