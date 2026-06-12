@@ -27,6 +27,14 @@ import (
 // hard cloud error.
 var ErrDiskNotAttached = errors.New("disk not attached to vm")
 
+// ErrDiskNotAttachedToAnyVM is the sentinel wrapped by FindVMByDiskVolid when
+// the cluster-wide scan completes without finding any VM that holds the disk.
+// FindVMByDiskVolidOrNone detects this sentinel via errors.Is to translate the
+// not-found condition into (0, "", false, nil) rather than propagating the
+// error. Other callers that need to distinguish "missing" from "transport
+// failure" may also use errors.Is(err, ErrDiskNotAttachedToAnyVM).
+var ErrDiskNotAttachedToAnyVM = errors.New("disk not attached to any VM")
+
 // unusedDiskKeyPattern matches PVE "unusedN" config keys. PVE moves a disk
 // to such a slot when it is removed from its bus slot (e.g., scsi1) via
 // PUT config delete:scsi1, instead of fully clearing the entry. Persistent
@@ -374,9 +382,30 @@ func FindVMByDiskVolid(ctx context.Context, c Client, fallbackNode, volid string
 		}
 	}
 
-	return 0, "", cpierrors.Cloud(
-		"disk %q not attached to any VM", volid,
-	)
+	return 0, "", fmt.Errorf("disk %q: %w", volid, ErrDiskNotAttachedToAnyVM)
+}
+
+// FindVMByDiskVolidOrNone is a wrapper around FindVMByDiskVolid that maps the
+// "disk not attached to any VM" condition to (0, "", false, nil) rather than
+// returning an error. All other errors (transport failures, transient faults)
+// are passed through unchanged so callers receive retriable signals correctly.
+//
+// Detection uses errors.Is(err, ErrDiskNotAttachedToAnyVM) — the shared
+// sentinel extracted alongside ErrDiskNotAttachedToAnyVM — so there is no
+// substring matching on error messages (W2 F-14).
+//
+// Existing callers of FindVMByDiskVolid are unaffected: they still receive the
+// wrapped ErrDiskNotAttachedToAnyVM error (detectable via errors.Is) and the
+// human-readable format is preserved.
+func FindVMByDiskVolidOrNone(ctx context.Context, c Client, fallbackNode, volid string) (vmid int, node string, found bool, err error) {
+	v, n, findErr := FindVMByDiskVolid(ctx, c, fallbackNode, volid)
+	if findErr != nil {
+		if errors.Is(findErr, ErrDiskNotAttachedToAnyVM) {
+			return 0, "", false, nil
+		}
+		return 0, "", false, findErr
+	}
+	return v, n, true, nil
 }
 
 // DiskOptStrContainsVolid reports whether any entry in disks has a value that
