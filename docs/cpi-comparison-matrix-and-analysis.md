@@ -2237,7 +2237,10 @@ pass in `placement.Filter` is fail-safe (API error → node rejected).
 ensure IOMMU is enabled on the host and that the device is not shared across IOMMU groups
 unless group isolation is confirmed. Live migration is blocked by design when PCI passthrough
 is configured. Pin removal at delete/rollback adds two idempotent, not-found-tolerant HA API
-calls per VM for all deployments. Live PVE validation pending.
+calls per VM for all deployments. Live-PVE validated (2026-06-12): `/nodes/{node}/hardware/pci`
+returns full-form `DDDD:BB:SS.F` ids; PVE accepts short-form `hostpci` values and stores them
+as-is without canonicalizing, so the CPI's `0000:` normalization is required for the
+verify-against-hardware-list comparison to match.
 
 #### 7.48 SHIPPED — Multi-reference stemcell deduplication
 
@@ -2343,9 +2346,12 @@ always `"template:<vmid>"`. When `source_url` is absent the existing flow is byt
 
 **Limits.** The URL must be reachable from the PVE node, not from the CPI host; operators
 must ensure network access from the PVE node to the image host. Requires PVE 7.2+. Task
-output checksum field shape not yet verified on a live cluster; the non-retriable error is
-derived from task failure status rather than parsing a checksum field (live PVE validation
-pending). Tier: deployment.
+output exposes no checksum field (live-PVE validated 2026-06-12: storage content list and
+`GetStorageContent` return volid/format/size/path only), so deriving the non-retriable error
+from task failure status is the only option; a checksum mismatch fails the task with
+"checksum mismatch: got '<actual>' != expect '<expected>'" and leaves the partial file on
+storage, which the best-effort `import/<filename>` cleanup removes. The requested filename
+is preserved verbatim (no normalization observed). Tier: deployment.
 
 #### 7.51 SHIPPED — Per-operation timing metrics
 
@@ -2466,8 +2472,10 @@ unreferenced own-VMID volumes (for example an orphan from a prior failed create)
 survive the delete — conservative by design. Retained volumes accumulate until operator
 prune; use `scripts/disk-audit` to inventory them. The ephemeral retain path reads the VM
 config once per `delete_vm` invocation (exits immediately when the tag is absent). The
-destroy-flag semantics are exercised against a modeled PVE in tests; live PVE validation
-is pending. Unset flags → byte-identical delete behavior. Tier: deployment.
+destroy-flag semantics are live-PVE validated (2026-06-12): with `purge=1`, an unreferenced
+own-VMID volume survives `destroy-unreferenced-disks=0` and is freed by
+`destroy-unreferenced-disks=1`, exactly as the retain path assumes. Unset flags →
+byte-identical delete behavior. Tier: deployment.
 
 #### 7.55 SHIPPED — Router and NAT VM support
 
@@ -2486,7 +2494,14 @@ guard, so enabling ipfilter on non-forwarding NICs is unaffected. `advertised_ro
 `/cluster/sdn/vnets/{vnet}/subnets`, type=`subnet`) for each entry, then `applySDN` (PUT
 `/cluster/sdn`) once to commit all staged changes. On failure, any subnets created before
 the error are removed via `DeleteSdnVnetsSubnets`; if removal fails, a warning names the
-leftover subnet for operator cleanup. Both features are byte-identical when absent.
+leftover subnet for operator cleanup. A subnet that already exists is adopted (not an
+error, not rolled back); live PVE reports duplicate SDN object creation as HTTP 500 with
+"sdn <kind> object ID '<id>' already defined" rather than HTTP 409, and `isSDNConflict`
+matches both shapes. Both features are byte-identical when absent. Live-PVE validated
+(2026-06-12): subnet `type=subnet` create + `applySDN` commit verified end-to-end
+(canonical subnet id `<zone>-<network>-<mask>`), and the NIC firewall read-modify-write
+preserved model/MAC/bridge/mtu while applying `firewall=0`; a bare partial `net{i}` write
+is rejected by PVE (`net0.model: property is missing`), confirming replace-not-merge.
 
 **Limits.** `advertised_routes` targets OVN vnet subnets only — the SDK exposes no OVN
 `nbctl` static logical-router route API, so routes that do not correspond to a full subnet

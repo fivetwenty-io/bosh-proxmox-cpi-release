@@ -84,7 +84,13 @@ func isSDNNotFound(err error) bool {
 	return strings.Contains(strings.ToLower(err.Error()), "does not exist")
 }
 
-// isSDNConflict returns true when err indicates a 409 Conflict (already exists).
+// isSDNConflict returns true when err indicates the SDN object already exists.
+// PVE does not surface duplicate SDN object creation as HTTP 409: a live
+// cluster returns HTTP 500 (code 0) with the message
+// "create sdn <kind> object failed: sdn <kind> object ID '<id>' already defined"
+// (observed on PVE 9 for both vnet and subnet creates). The 409 checks are
+// kept for sentinel/forward compatibility; the message fallback mirrors
+// isSDNNotFound's handling of "does not exist".
 func isSDNConflict(err error) bool {
 	if err == nil {
 		return false
@@ -94,9 +100,12 @@ func isSDNConflict(err error) bool {
 	}
 	var apiErr *pveerr.APIError
 	if errors.As(err, &apiErr) {
-		return apiErr.Code == 409 || apiErr.HTTPCode == 409
+		if apiErr.Code == 409 || apiErr.HTTPCode == 409 {
+			return true
+		}
 	}
-	return false
+	// PVE SDN duplicate-object message (surfaced as HTTP 500, not 409).
+	return strings.Contains(strings.ToLower(err.Error()), "already defined")
 }
 
 // applySDN calls UpdateSdn (PUT /cluster/sdn) to commit staged SDN changes.
