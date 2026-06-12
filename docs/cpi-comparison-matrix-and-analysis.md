@@ -2168,12 +2168,12 @@ subset of `args` — to keep the escape hatch from becoming a foot-gun.
 operators write configurations the CPI cannot reason about or roll back. Raw `args` in
 particular can break migration and snapshot assumptions. Tier: deployment.
 
-#### 7.46 OPEN — CPU and RAM hotplug capability flag
+#### 7.46 SHIPPED — CPU and RAM hotplug capability flag
 
 *References: vSphere.* The vSphere CPI wires `cpu_hot_add_enabled` and
 `memory_hot_add_enabled` from `vm_type` into the create-time config, allowing online CPU and
 memory increases without a reboot. PVE QEMU supports the same through `-hotplug cpu,memory`,
-but the CPI never sets it, so scaling a CF VM up requires a stop-and-restart.
+but the CPI never set it, so scaling a CF VM up required a stop-and-restart.
 
 **Build:** add `cpu_hotplug` and `memory_hotplug` booleans to `vm_type` cloud_properties and,
 at `create_vm`, pass `hotplug=cpu,memory` (or the requested subset) through the standard VM
@@ -2182,6 +2182,17 @@ config endpoint. No new PVE API is needed; the existing config path carries the 
 **Limits.** Hotplug is a guest-cooperative operation: the guest kernel must support memory
 and CPU hot-add and online the new resources, and not every stemcell does. The flag enables
 the capability; it does not itself perform a resize. Tier: deployment.
+
+**Shipped:** `cpu_hotplug *bool` and `memory_hotplug *bool` in `vm_type` cloud_properties
+merge into the PVE hotplug token string at `create_vm` time via `mergeHotplugToken` in
+`create_vm_hotplug.go`. Setting `cpu_hotplug: true` ensures the `cpu` token is present;
+`cpu_hotplug: false` removes it. Setting `memory_hotplug: true` ensures the `memory` token
+and forces `numa=1` (PVE requires NUMA for memory hotplug to allocate DIMM slots);
+`memory_hotplug: false` removes the `memory` token. When `memory_hotplug: true` conflicts
+with an explicit `numa: false` in the same cloud_properties, memory hotplug wins and NUMA
+is enabled — the CPI documents this override. Unset flags (`nil`) produce output
+byte-identical to the pre-feature behavior. No spec or ERB keys are added; these are
+`vm_type` cloud_properties only.
 
 #### 7.47 OPEN — PCI passthrough and vGPU as cloud_properties
 

@@ -144,6 +144,19 @@ type createVMCloudProps struct {
 	// default) from "set to empty string" (currently treated the same:
 	// fall back to default). Use "0" to explicitly disable hotplug.
 	Hotplug *string `json:"hotplug,omitempty"`
+	// CPUHotplug controls the "cpu" token in the PVE hotplug string.
+	// true → ensure "cpu" token present; false → remove "cpu" token;
+	// nil (default) → no change, byte-identical to pre-feature behavior.
+	// Applied as a post-merge overlay after the base hotplug string is
+	// resolved via Hotplug / profile / config precedence.
+	CPUHotplug *bool `json:"cpu_hotplug,omitempty"`
+	// MemoryHotplug controls the "memory" token in the PVE hotplug string.
+	// true → ensure "memory" token present AND forces numaEnabled=true
+	// (PVE requires numa=1 for memory hotplug to allocate DIMM slots);
+	// false → remove "memory" token; nil (default) → no change.
+	// When true, overrides any explicit cp.NUMA=false — memory hotplug
+	// cannot function without NUMA enabled.
+	MemoryHotplug *bool `json:"memory_hotplug,omitempty"`
 	// NUMA overrides the CPI default (config.NUMA). PVE requires numa=1
 	// at create time for memory hotplug to allocate DIMM slots; setting
 	// false here disables NUMA for the new VM regardless of the global
@@ -2231,17 +2244,25 @@ func resolveVMShapeCPUMem(cp createVMCloudProps) (cores, sockets, memMiB int) {
 //  2. profile layer via r.String("hotplug") (disk_type then vm_type)
 //  3. config.HotplugValue()
 //
+// After the base string is resolved, token-level overrides are applied:
+//   - cp.CPUHotplug != nil → mergeHotplugToken(hotplug, "cpu", *cp.CPUHotplug)
+//   - cp.MemoryHotplug != nil → mergeHotplugToken(hotplug, "memory", *cp.MemoryHotplug)
+//
 // NUMA precedence:
 //  1. cp.NUMA != nil → use *cp.NUMA (includes explicit false)
 //  2. profile layer via r.Bool("numa") (explicit false honored)
 //  3. config.NUMAValue()
+//
+// Memory hotplug override: when cp.MemoryHotplug=true the resolved numaEnabled
+// is forced true regardless of cp.NUMA or profile settings — PVE requires
+// numa=1 for memory hotplug to allocate DIMM slots at create time.
 func resolveVMShapeHotplugNUMAWithError(cfg *config.CPIConfig, cp createVMCloudProps, cpMap map[string]any) (hotplug string, numaEnabled bool, err error) {
 	r, err := newLayeredResolver(cpMap, cfg)
 	if err != nil {
 		return "", false, err
 	}
 
-	// Hotplug: call struct pointer wins (includes explicit "").
+	// Hotplug base: call struct pointer wins (includes explicit "").
 	// The call layer IS already in r (cpMap layer 0), but cp.Hotplug is a typed
 	// struct pointer — using r.String would drop an explicit "" (empty is skipped
 	// by r.String). Keep the struct-pointer check as the authoritative call gate.
@@ -2257,12 +2278,28 @@ func resolveVMShapeHotplugNUMAWithError(cfg *config.CPIConfig, cp createVMCloudP
 		hotplug = v
 	}
 
+	// Token-level overrides: applied after the base string is resolved so they
+	// compose with profile/config values rather than replacing them wholesale.
+	if cp.CPUHotplug != nil {
+		hotplug = mergeHotplugToken(hotplug, "cpu", *cp.CPUHotplug)
+	}
+	if cp.MemoryHotplug != nil {
+		hotplug = mergeHotplugToken(hotplug, "memory", *cp.MemoryHotplug)
+	}
+
 	// NUMA: call struct pointer wins (includes explicit false).
 	numaEnabled = cfg.NUMAValue()
 	if cp.NUMA != nil {
 		numaEnabled = *cp.NUMA
 	} else if b, ok := r.Bool("numa"); ok {
 		numaEnabled = b
+	}
+
+	// memory_hotplug=true forces NUMA regardless of cp.NUMA or profile value.
+	// PVE allocates DIMM slots only when numa=1 at VM creation time; disabling
+	// NUMA would silently break memory hotplug at runtime.
+	if cp.MemoryHotplug != nil && *cp.MemoryHotplug {
+		numaEnabled = true
 	}
 
 	return hotplug, numaEnabled, nil
