@@ -2469,7 +2469,7 @@ config once per `delete_vm` invocation (exits immediately when the tag is absent
 destroy-flag semantics are exercised against a modeled PVE in tests; live PVE validation
 is pending. Unset flags → byte-identical delete behavior. Tier: deployment.
 
-#### 7.55 OPEN — Router and NAT VM support
+#### 7.55 SHIPPED — Router and NAT VM support
 
 *References: AWS, Google.* The AWS CPI supports `source_dest_check: false`, which lets a VM
 forward packets not addressed to it (NAT gateways, router VMs), and `advertised_routes`, a
@@ -2477,17 +2477,26 @@ list of `{table_id, destination}` pairs that the CPI upserts into route tables p
 the new instance so the routing tier owns its routes declaratively. PVE has no CPI-layer
 equivalent, so routing and NAT VMs require manual configuration.
 
-**Build:** add `ip_forwarding: true`, applied post-create by updating the NIC config (for
-example clearing per-NIC firewall constraints that would drop forwarded traffic), and an
-`advertised_routes: [{vnet, destination}]` list applied through the OVN SDN — either
-`pvesh POST /cluster/sdn/vnets/{vnet}/subnets` or a direct OVN `nbctl` logical-router static
-route. The guest-OS portion of forwarding is lighter than on AWS because the Linux guest
-controls `ip_forward` itself; the CPI's role is to assist the fabric side.
+**Shipped:** `ip_forwarding: true` on a NIC's `cloud_properties` causes the CPI to call
+`UpdateQemuConfig` post-create with `firewall=0` for that NIC index (implemented in
+`create_vm_firewall.go:applyIPForwarding`). The §7.14 ipfilter path (`applyVIPAllowedAddressPairs`)
+also excludes `ip_forwarding=true` NICs from ipset seeding and from the step-4 DHCP safety
+guard, so enabling ipfilter on non-forwarding NICs is unaffected. `advertised_routes:
+[{vnet, destination}]` on the VM's `cloud_properties` calls `CreateSdnVnetsSubnets` (POST
+`/cluster/sdn/vnets/{vnet}/subnets`, type=`subnet`) for each entry, then `applySDN` (PUT
+`/cluster/sdn`) once to commit all staged changes. On failure, any subnets created before
+the error are removed via `DeleteSdnVnetsSubnets`; if removal fails, a warning names the
+leftover subnet for operator cleanup. Both features are byte-identical when absent.
 
-**Limits.** Advertised routes require an OVN SDN and SDN write permission, and PVE SDN is
-eventually consistent with an explicit apply step, so a freshly written route is not
-immediately live — the eventual-consistency caveat of the SDN work applies. Routing within
-the guest still lives in the guest OS. Tier: deployment.
+**Limits.** `advertised_routes` targets OVN vnet subnets only — the SDK exposes no OVN
+`nbctl` static logical-router route API, so routes that do not correspond to a full subnet
+CIDR require out-of-band OVN commands. When the SDN zone is not OVN (e.g. vxlan/simple),
+PVE may accept the subnet create without injecting a logical-router route; this is a
+PVE-layer constraint, not a CPI defect. `ip_forwarding=true` explicitly voids per-NIC
+ipfilter protection on that NIC. Guest-OS IP forwarding (`sysctl net.ipv4.ip_forward`)
+is not managed by the CPI. `delete_vm` does not remove `advertised_routes` SDN subnets;
+an operator must clean them up manually (via `pvesh DELETE /cluster/sdn/vnets/{vnet}/subnets/{cidr}`
+followed by `pvesh PUT /cluster/sdn`) after destroying a router VM. Tier: deployment.
 
 #### 7.56 SHIPPED — Per-VM `*bool` override pattern and operator retry budget
 

@@ -123,7 +123,7 @@ func validateVIPAllowedAddressPairs(networks map[string]createVMNetworkSpec) err
 // nicIsStatic reports whether a NIC spec represents a static (manual) IP
 // assignment — type=="manual", IP non-empty, and not literally "dhcp".
 func nicIsStatic(spec createVMNetworkSpec) bool {
-	return strings.EqualFold(spec.Type, "manual") &&
+	return strings.EqualFold(spec.Type, nicTypeManual) &&
 		spec.IP != "" &&
 		!strings.EqualFold(spec.IP, "dhcp")
 }
@@ -142,12 +142,13 @@ func nicFirewallEnabled(spec createVMNetworkSpec, cfg *config.CPIConfig) bool {
 
 // nicState captures resolved per-NIC properties for a single VIP-apply pass.
 type nicState struct {
-	idx    int
-	name   string
-	spec   createVMNetworkSpec
-	fw     bool
-	static bool
-	vips   []string // normalized CIDRs; nil if none
+	idx       int
+	name      string
+	spec      createVMNetworkSpec
+	fw        bool
+	static    bool
+	vips      []string // normalized CIDRs; nil if none
+	ipForward bool     // true when cloud_properties.ip_forwarding=true
 }
 
 // applyVIPAllowedAddressPairs seeds PVE ipfilter ipsets for every firewalled NIC
@@ -196,12 +197,13 @@ func applyVIPAllowedAddressPairs(
 			return nil
 		}
 		states = append(states, nicState{
-			idx:    i,
-			name:   name,
-			spec:   spec,
-			fw:     nicFirewallEnabled(spec, deps.Config),
-			static: nicIsStatic(spec),
-			vips:   vips,
+			idx:       i,
+			name:      name,
+			spec:      spec,
+			fw:        nicFirewallEnabled(spec, deps.Config),
+			static:    nicIsStatic(spec),
+			vips:      vips,
+			ipForward: nicIPForwardingEnabled(spec.CloudProperties),
 		})
 	}
 
@@ -225,12 +227,14 @@ func applyVIPAllowedAddressPairs(
 		}
 	}
 
-	// Step 4: safety guard — skip if any firewalled NIC is DHCP/dynamic OR has
-	// an unparseable primary IP. Both cases would cause VM lockout if ipfilter
-	// were enabled: the DHCP NIC's IP is unknown, and the static NIC with a bad
-	// IP would be seeded without its required /32 entry.
+	// Step 4: safety guard — skip if any firewalled, non-ip_forwarding NIC is
+	// DHCP/dynamic OR has an unparseable primary IP. Both cases would cause VM
+	// lockout if ipfilter were enabled. ip_forwarding NICs are excluded because
+	// they will have firewall=0 applied by applyIPForwarding and are never seeded
+	// into an ipset; including them in this guard would incorrectly abort ipfilter
+	// for the remaining static NICs.
 	for i := range states {
-		if !states[i].fw {
+		if !states[i].fw || states[i].ipForward {
 			continue
 		}
 		if !states[i].static {
@@ -247,13 +251,19 @@ func applyVIPAllowedAddressPairs(
 		}
 	}
 
-	// Step 5: seed ipsets for ALL firewalled NICs.
-	// Track how many firewalled NICs were seeded; only proceed to enable ipfilter
-	// if at least one firewalled NIC exists (otherwise no ipsets were created and
-	// enabling ipfilter would have no useful effect).
+	// Step 5: seed ipsets for ALL firewalled NICs that are NOT ip_forwarding.
+	// NICs with ip_forwarding=true are router/NAT NICs: they forward packets not
+	// in their own ipset, so applying ipfilter on them would silently drop
+	// forwarded traffic. Such NICs are excluded from both ipset seeding and the
+	// fwCount that gates the ipfilter enable.
 	fwCount := 0
 	for i := range states {
 		if !states[i].fw {
+			continue
+		}
+		// Skip ip_forwarding NICs — firewall=0 will be applied by applyIPForwarding;
+		// seeding an ipset for them would conflict with that intent.
+		if states[i].ipForward {
 			continue
 		}
 		fwCount++

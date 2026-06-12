@@ -12,6 +12,7 @@ import (
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
 	sdkcluster "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cluster"
 	sdknodes "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/nodes"
+	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/qemu"
 )
 
 // fwClusterStubWithFirewall is a compile-time reminder that fwClusterStub already
@@ -142,10 +143,39 @@ func (s *fwNodesStub) CreateQemuFirewallIpset2(_ context.Context, _ string, _ st
 	return nil
 }
 
+// fwQEMUStub returns a configurable map from Config(). Used by ip_forwarding
+// tests that need specific net{N} strings to verify read-modify-write behavior.
+type fwQEMUStub struct {
+	qemu.Service
+	// configResult is returned by Config() — keys are "net0", "net1" etc.
+	configResult map[string]any
+	configErr    error
+}
+
+func (s *fwQEMUStub) Config(_ context.Context, _ string, _ int) (map[string]any, error) {
+	if s.configErr != nil {
+		return nil, s.configErr
+	}
+	if s.configResult != nil {
+		return s.configResult, nil
+	}
+	return map[string]any{}, nil
+}
+
 func fwDeps(cl *fwClusterStub, nd *fwNodesStub, cfg *config.CPIConfig) Deps {
 	return Deps{
 		Config: cfg,
-		PVE:    &icPVEClient{clusterSvc: cl, nodesSvc: nd},
+		PVE:    &icPVEClient{clusterSvc: cl, nodesSvc: nd, qemuSvc: &fwQEMUStub{}},
+		Agent:  &icAgentStub{},
+		Logger: log.NewNopLogger(),
+	}
+}
+
+// fwDepsWithConfig builds Deps with a QEMU stub that returns vmConfig from Config().
+func fwDepsWithConfig(cl *fwClusterStub, nd *fwNodesStub, cfg *config.CPIConfig, vmConfig map[string]any) Deps {
+	return Deps{
+		Config: cfg,
+		PVE:    &icPVEClient{clusterSvc: cl, nodesSvc: nd, qemuSvc: &fwQEMUStub{configResult: vmConfig}},
 		Agent:  &icAgentStub{},
 		Logger: log.NewNopLogger(),
 	}
@@ -467,5 +497,321 @@ func TestResolveEffectiveFirewall_NilConfigDefaultIsFalse(t *testing.T) {
 	}
 	if got {
 		t.Error("nil VMFirewall config must return false (zero firewall API calls)")
+	}
+}
+
+// --------------------------------------------------------------------------
+// nicIPForwardingEnabled
+// --------------------------------------------------------------------------
+
+func TestNicIPForwardingEnabled(t *testing.T) {
+	cases := []struct {
+		name string
+		cp   map[string]any
+		want bool
+	}{
+		{"nil map", nil, false},
+		{"absent key", map[string]any{}, false},
+		{"false explicit", map[string]any{"ip_forwarding": false}, false},
+		{"true", map[string]any{"ip_forwarding": true}, true},
+		{"wrong type string", map[string]any{"ip_forwarding": "true"}, false},
+		{"wrong type int", map[string]any{"ip_forwarding": 1}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := nicIPForwardingEnabled(tc.cp); got != tc.want {
+				t.Errorf("nicIPForwardingEnabled(%v) = %v; want %v", tc.cp, got, tc.want)
+			}
+		})
+	}
+}
+
+// --------------------------------------------------------------------------
+// patchNICFirewallToken
+// --------------------------------------------------------------------------
+
+func TestPatchNICFirewallToken(t *testing.T) {
+	cases := []struct {
+		name    string
+		input   string
+		enabled bool
+		want    string
+	}{
+		{
+			"strips firewall=1 and appends firewall=0",
+			"virtio=aa:bb:cc:dd:ee:ff,bridge=vmbr0,firewall=1",
+			false,
+			"virtio=aa:bb:cc:dd:ee:ff,bridge=vmbr0,firewall=0",
+		},
+		{
+			"adds firewall=0 when not present",
+			"virtio=aa:bb:cc:dd:ee:ff,bridge=vmbr0",
+			false,
+			"virtio=aa:bb:cc:dd:ee:ff,bridge=vmbr0,firewall=0",
+		},
+		{
+			"sets firewall=1",
+			"virtio=aa:bb:cc:dd:ee:ff,bridge=vmbr0",
+			true,
+			"virtio=aa:bb:cc:dd:ee:ff,bridge=vmbr0,firewall=1",
+		},
+		{
+			"replaces existing firewall=0 with firewall=1",
+			"virtio=aa:bb:cc:dd:ee:ff,bridge=vmbr0,firewall=0",
+			true,
+			"virtio=aa:bb:cc:dd:ee:ff,bridge=vmbr0,firewall=1",
+		},
+		{
+			"empty string gets firewall=0",
+			"",
+			false,
+			"firewall=0",
+		},
+		{
+			"preserves queues token",
+			"virtio=aa:bb,bridge=vmbr0,firewall=1,queues=4",
+			false,
+			"virtio=aa:bb,bridge=vmbr0,queues=4,firewall=0",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := patchNICFirewallToken(tc.input, tc.enabled)
+			if got != tc.want {
+				t.Errorf("patchNICFirewallToken(%q, %v) = %q; want %q", tc.input, tc.enabled, got, tc.want)
+			}
+		})
+	}
+}
+
+// --------------------------------------------------------------------------
+// applyIPForwarding — byte-identical when no NIC has ip_forwarding=true
+// --------------------------------------------------------------------------
+
+func TestApplyIPForwarding_NoForwardingNICsNoCalls(t *testing.T) {
+	nd := &fwNodesStub{}
+	networks := map[string]createVMNetworkSpec{
+		"default": {Type: "manual", IP: "10.0.0.1", CloudProperties: map[string]any{}},
+		"second":  {Type: "dynamic", CloudProperties: map[string]any{"ip_forwarding": false}},
+	}
+	err := applyIPForwarding(context.Background(), fwDeps(&fwClusterStub{}, nd, icMinConfig()), "pve1", 100, networks, log.NewNopLogger())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if nd.lastNet != nil {
+		t.Errorf("expected no UpdateQemuConfig call; got net=%v", nd.lastNet)
+	}
+}
+
+// --------------------------------------------------------------------------
+// applyIPForwarding — read-modify-write: preserves existing NIC tokens
+// --------------------------------------------------------------------------
+
+func TestApplyIPForwarding_SetsFirewallZeroOnForwardingNIC(t *testing.T) {
+	// Simulate PVE having assigned a MAC after VM start. The full net string
+	// including MAC and bridge must be preserved; only firewall token is changed.
+	existingNet1 := "virtio=aa:bb:cc:dd:ee:ff,bridge=vmbr0,firewall=1"
+	vmConfig := map[string]any{
+		"net0": "virtio=11:22:33:44:55:66,bridge=vmbr0",
+		"net1": existingNet1,
+	}
+	nd := &fwNodesStub{}
+	networks := map[string]createVMNetworkSpec{
+		"default": {Type: "manual", IP: "10.0.0.1", CloudProperties: map[string]any{}},
+		// "wan" sorts after "default" → net1.
+		"wan": {Type: "dynamic", CloudProperties: map[string]any{"ip_forwarding": true}},
+	}
+	err := applyIPForwarding(context.Background(),
+		fwDepsWithConfig(&fwClusterStub{}, nd, icMinConfig(), vmConfig),
+		"pve1", 200, networks, log.NewNopLogger())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// net[1] must carry the full NIC string with firewall=0 (not "firewall=0" alone).
+	if nd.lastNet == nil {
+		t.Fatal("expected UpdateQemuConfig call; got nil")
+	}
+	val, ok := nd.lastNet[1]
+	if !ok {
+		t.Fatalf("expected net[1] in UpdateQemuConfig; got %v", nd.lastNet)
+	}
+	// The patched string must contain the original MAC and bridge, and firewall=0.
+	if !strings.Contains(val, "aa:bb:cc:dd:ee:ff") {
+		t.Errorf("net[1] = %q; must preserve MAC address", val)
+	}
+	if !strings.Contains(val, "bridge=vmbr0") {
+		t.Errorf("net[1] = %q; must preserve bridge", val)
+	}
+	if !strings.Contains(val, "firewall=0") {
+		t.Errorf("net[1] = %q; must contain firewall=0", val)
+	}
+	if strings.Contains(val, "firewall=1") {
+		t.Errorf("net[1] = %q; must NOT contain firewall=1", val)
+	}
+	// net[0] (default, no ip_forwarding) must NOT be in the map.
+	if _, has := nd.lastNet[0]; has {
+		t.Errorf("net[0] must not be set; got %q", nd.lastNet[0])
+	}
+}
+
+func TestApplyIPForwarding_MultipleForwardingNICsEachGetUpdate(t *testing.T) {
+	// Both NICs have ip_forwarding=true. The stub records the LAST UpdateQemuConfig
+	// call; verify the second NIC ("wan") was written with firewall=0.
+	vmConfig := map[string]any{
+		"net0": "virtio=11:22:33:44:55:00,bridge=vmbr0,firewall=1",
+		"net1": "virtio=aa:bb:cc:dd:ee:ff,bridge=vmbr1,firewall=1",
+	}
+	nd := &fwNodesStub{}
+	networks := map[string]createVMNetworkSpec{
+		"default": {Type: "dynamic", CloudProperties: map[string]any{"ip_forwarding": true}},
+		"wan":     {Type: "dynamic", CloudProperties: map[string]any{"ip_forwarding": true}},
+	}
+	err := applyIPForwarding(context.Background(),
+		fwDepsWithConfig(&fwClusterStub{}, nd, icMinConfig(), vmConfig),
+		"pve1", 300, networks, log.NewNopLogger())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// lastNet holds the LAST UpdateQemuConfig call (for "wan" at net1).
+	if nd.lastNet == nil {
+		t.Fatal("expected UpdateQemuConfig calls; got nil")
+	}
+	val, ok := nd.lastNet[1]
+	if !ok {
+		t.Errorf("expected net[1] in last UpdateQemuConfig; got %v", nd.lastNet)
+	}
+	if !strings.Contains(val, "firewall=0") {
+		t.Errorf("net[1] = %q; must contain firewall=0", val)
+	}
+	if !strings.Contains(val, "aa:bb:cc:dd:ee:ff") {
+		t.Errorf("net[1] = %q; must preserve MAC", val)
+	}
+}
+
+func TestApplyIPForwarding_UpdateQemuConfigErrorPropagates(t *testing.T) {
+	// The fwNodesStub always succeeds for UpdateQemuConfig. Use a dedicated
+	// stub that fails so the error propagation path is exercised.
+	// Supply a non-empty net0 string so the absent-key guard does not skip.
+	failNd := &failUpdateQemuConfigStub{}
+	networks := map[string]createVMNetworkSpec{
+		"default": {Type: "dynamic", CloudProperties: map[string]any{"ip_forwarding": true}},
+	}
+	vmConfig := map[string]any{"net0": "virtio=aa:bb:cc:dd:ee:ff,bridge=vmbr0,firewall=1"}
+	deps := Deps{
+		Config: icMinConfig(),
+		PVE: &icPVEClient{
+			clusterSvc: &fwClusterStub{},
+			nodesSvc:   failNd,
+			qemuSvc:    &fwQEMUStub{configResult: vmConfig},
+		},
+		Agent:  &icAgentStub{},
+		Logger: log.NewNopLogger(),
+	}
+	err := applyIPForwarding(context.Background(), deps, "pve1", 400, networks, log.NewNopLogger())
+	if err == nil {
+		t.Fatal("expected error when UpdateQemuConfig fails")
+	}
+}
+
+func TestApplyIPForwarding_QEMUConfigReadErrorPropagates(t *testing.T) {
+	// If reading the current VM config fails, applyIPForwarding must return an error.
+	nd := &fwNodesStub{}
+	networks := map[string]createVMNetworkSpec{
+		"default": {Type: "dynamic", CloudProperties: map[string]any{"ip_forwarding": true}},
+	}
+	deps := Deps{
+		Config: icMinConfig(),
+		PVE: &icPVEClient{
+			clusterSvc: &fwClusterStub{},
+			nodesSvc:   nd,
+			qemuSvc:    &fwQEMUStub{configErr: errors.New("pve: config read failed")},
+		},
+		Agent:  &icAgentStub{},
+		Logger: log.NewNopLogger(),
+	}
+	err := applyIPForwarding(context.Background(), deps, "pve1", 401, networks, log.NewNopLogger())
+	if err == nil {
+		t.Fatal("expected error when QEMU Config() fails")
+	}
+	if nd.lastNet != nil {
+		t.Error("no UpdateQemuConfig should be called when config read fails")
+	}
+}
+
+func TestApplyIPForwarding_AbsentNICKeySkipsWithWarning(t *testing.T) {
+	// When PVE Config() returns a map that does not contain net{i} for an
+	// ip_forwarding NIC, the function must skip that NIC (warn + continue)
+	// rather than write a bare "firewall=0" that would destroy model/bridge.
+	nd := &fwNodesStub{}
+	// vmConfig deliberately omits net1 (the "wan" NIC).
+	vmConfig := map[string]any{
+		"net0": "virtio=11:22:33:44:55:66,bridge=vmbr0",
+		// net1 absent
+	}
+	networks := map[string]createVMNetworkSpec{
+		"default": {Type: "manual", IP: "10.0.0.1", CloudProperties: map[string]any{}},
+		"wan":     {Type: "dynamic", CloudProperties: map[string]any{"ip_forwarding": true}},
+	}
+	err := applyIPForwarding(context.Background(),
+		fwDepsWithConfig(&fwClusterStub{}, nd, icMinConfig(), vmConfig),
+		"pve1", 402, networks, log.NewNopLogger())
+	// Must not error — guard skips the NIC rather than failing.
+	if err != nil {
+		t.Fatalf("unexpected error when net key absent: %v", err)
+	}
+	// Must not call UpdateQemuConfig for the absent NIC.
+	if nd.lastNet != nil {
+		t.Errorf("UpdateQemuConfig must not be called when net key is absent; got net=%v", nd.lastNet)
+	}
+}
+
+// failUpdateQemuConfigStub returns an error from UpdateQemuConfig only.
+type failUpdateQemuConfigStub struct {
+	fwNodesStub
+}
+
+func (s *failUpdateQemuConfigStub) UpdateQemuConfig(_ context.Context, _ string, _ string, _ *sdknodes.UpdateQemuConfigParams) error {
+	return errors.New("pve: update config failed")
+}
+
+// --------------------------------------------------------------------------
+// ipfilter exclusion for ip_forwarding NICs (integration with applyVIPAllowedAddressPairs)
+// --------------------------------------------------------------------------
+
+func TestApplyVIPAllowedAddressPairs_IPForwardingNICExcludedFromIpfilter(t *testing.T) {
+	// NIC "default" is static with VIPs; NIC "wan" has ip_forwarding=true and no VIPs.
+	// Only "default" should have an ipset seeded. "wan" must be excluded from fwCount.
+	nd := &fwNodesStub{nodeIfaces: []string{"vmbr0"}}
+	networks := map[string]createVMNetworkSpec{
+		"default": {
+			Type: "manual", IP: "10.0.0.1", Netmask: "255.255.255.0",
+			CloudProperties: map[string]any{
+				"allowed_address_pairs": []any{"10.0.0.100"},
+			},
+		},
+		"wan": {
+			Type: "dynamic",
+			CloudProperties: map[string]any{
+				"ip_forwarding": true,
+				"firewall":      true, // firewall=true but ip_forwarding overrides
+			},
+		},
+	}
+	cfg := icMinConfig()
+	fwTrue := true
+	cfg.VMFirewall = &fwTrue
+
+	err := applyVIPAllowedAddressPairs(context.Background(), fwDeps(&fwClusterStub{}, nd, cfg), "pve1", 500, networks, log.NewNopLogger())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Only ipfilter-net0 (for "default") should exist.
+	if len(nd.ipsetCreated) != 1 || nd.ipsetCreated[0] != "ipfilter-net0" {
+		t.Errorf("ipsetCreated = %v; want [ipfilter-net0]", nd.ipsetCreated)
+	}
+	// wan (net1) must NOT have an ipset.
+	if _, has := nd.ipsetEntries["ipfilter-net1"]; has {
+		t.Errorf("ip_forwarding NIC (net1) must not have an ipset")
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"strings"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
@@ -12,6 +13,16 @@ import (
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
 	sdknodes "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/nodes"
 )
+
+// nicIPForwardingEnabled reports whether ip_forwarding=true is set in a NIC's
+// cloud_properties. Returns false for nil or absent key.
+func nicIPForwardingEnabled(cp map[string]any) bool {
+	if cp == nil {
+		return false
+	}
+	v, ok := cp["ip_forwarding"].(bool)
+	return ok && v
+}
 
 // fwGroupRuleType is the PVE firewall rule type used to reference a cluster
 // firewall group from a VM: a rule with type=group and action=<group name>.
@@ -179,4 +190,128 @@ func listFirewallGroupNames(ctx context.Context, deps Deps) (map[string]struct{}
 		}
 	}
 	return out, nil
+}
+
+// applyIPForwarding iterates the networks map and, for each NIC with
+// cloud_properties.ip_forwarding=true, sets firewall=0 on that NIC via a
+// read-modify-write: the current net{i} property string is read from PVE via
+// the QEMU Config API, the firewall token is cleared (or set to 0), and the
+// full corrected string is written back. This preserves model, bridge, MAC
+// address, and any other tokens PVE has assigned since configureNICs ran.
+//
+// When ip_forwarding=true on a NIC:
+//   - The per-NIC firewall bit is explicitly cleared (firewall=0). Any
+//     firewall=1 set by configureNICs or applyVIPAllowedAddressPairs for that
+//     NIC is overridden.
+//   - The §7.14 ipfilter is NOT applied for that NIC index. This is enforced
+//     in applyVIPAllowedAddressPairs by calling nicIPForwardingEnabled before
+//     seeding the ipset (ip_forwarding NICs are excluded from fwCount so the
+//     enable gate never fires for them alone). See create_vm_vip.go.
+//
+// PVE API errors are wrapped retriable via pve.WrapError. The caller rolls
+// back the VM on any non-nil return. No API calls are made when no NIC has
+// ip_forwarding=true (byte-identical path).
+func applyIPForwarding(
+	ctx context.Context,
+	deps Deps,
+	node string,
+	vmid int,
+	networks map[string]createVMNetworkSpec,
+	logger *log.Logger,
+) error {
+	netNames := sortedNetworkNames(networks)
+
+	// Quick-exit when no NIC needs forwarding — zero API calls (byte-identical).
+	anyForwarding := false
+	for _, name := range netNames {
+		if nicIPForwardingEnabled(networks[name].CloudProperties) {
+			anyForwarding = true
+			break
+		}
+	}
+	if !anyForwarding {
+		return nil
+	}
+
+	// Read the current VM config once for all NICs that need updating.
+	// qemu.Service.Config returns map[string]any with keys like "net0", "net1".
+	vmCfg, cfgErr := deps.PVE.QEMU().Config(ctx, node, vmid)
+	if cfgErr != nil {
+		return cpierrors.Wrap(pve.WrapError(cfgErr),
+			fmt.Sprintf("create_vm: ip_forwarding: read VM config vmid=%d", vmid))
+	}
+
+	nodeSvc := deps.PVE.Nodes()
+	vmidStr := strconv.Itoa(vmid)
+
+	for i, name := range netNames {
+		spec := networks[name]
+		if !nicIPForwardingEnabled(spec.CloudProperties) {
+			continue
+		}
+
+		// Read-modify-write: fetch the current NIC string, patch the firewall
+		// token to 0, and write the full corrected string back. This preserves
+		// model, bridge, MAC, and any other tokens PVE assigned (e.g. queues=).
+		//
+		// PVE net{N} string format: "model[=macaddr],bridge=...[,token=val,...]"
+		// Setting net{N}="firewall=0" (partial) REPLACES the entire NIC definition
+		// in PVE, destroying model/bridge/MAC — so we must write the full string.
+		netKey := fmt.Sprintf("net%d", i)
+		currentStr, ok := vmCfg[netKey].(string)
+		if !ok || currentStr == "" {
+			// PVE Config() did not return a string for this NIC index. This is
+			// unexpected (configureNICs wrote net{i} before start), but guard
+			// rather than emit a bare "firewall=0" that would destroy model/bridge.
+			// Log a warning and skip; the NIC will have whatever firewall state
+			// PVE defaults to rather than a potentially destructive partial write.
+			logger.Warn("create_vm: ip_forwarding: net config absent for NIC; firewall=0 not applied",
+				log.Int(metadataKeyVMID, vmid),
+				log.String("net", netKey),
+				log.String("network", name),
+			)
+			continue
+		}
+		patched := patchNICFirewallToken(currentStr, false)
+
+		if setErr := nodeSvc.UpdateQemuConfig(ctx, node, vmidStr, &sdknodes.UpdateQemuConfigParams{
+			Net: map[int]string{i: patched},
+		}); setErr != nil {
+			return cpierrors.Wrap(pve.WrapError(setErr),
+				fmt.Sprintf("create_vm: ip_forwarding: disable NIC firewall %s vmid=%d", netKey, vmid))
+		}
+		logger.Info("create_vm: ip_forwarding: per-NIC firewall disabled for router/NAT NIC",
+			log.Int(metadataKeyVMID, vmid),
+			log.String("net", netKey),
+			log.String("network", name),
+			log.String("net_string", patched),
+		)
+	}
+	return nil
+}
+
+// patchNICFirewallToken modifies the firewall token in a PVE NIC property
+// string. It removes any existing "firewall=N" token and, when enabled=false,
+// appends "firewall=0" explicitly. When enabled=true, "firewall=1" is appended.
+// Tokens are comma-separated. An empty input string is valid (PVE will reject
+// it with a parse error, but the caller handles that via WrapError).
+func patchNICFirewallToken(nicStr string, enabled bool) string {
+	// Split on comma, drop any "firewall=..." token, rebuild.
+	tokens := strings.Split(nicStr, ",")
+	filtered := tokens[:0]
+	for _, tok := range tokens {
+		lower := strings.ToLower(strings.TrimSpace(tok))
+		if strings.HasPrefix(lower, "firewall=") {
+			continue
+		}
+		if tok != "" {
+			filtered = append(filtered, tok)
+		}
+	}
+	fwVal := "firewall=0"
+	if enabled {
+		fwVal = "firewall=1"
+	}
+	filtered = append(filtered, fwVal)
+	return strings.Join(filtered, ",")
 }

@@ -97,6 +97,10 @@ const defaultNetworkName = "default"
 // shares the literal value but belongs to an unrelated domain.
 const nicTypeDynamic = "dynamic"
 
+// nicTypeManual is the BOSH network spec type for a statically-assigned NIC.
+// Compared case-insensitively against spec.Type throughout the handler.
+const nicTypeManual = "manual"
+
 // nicCPKeyBridge, nicCPKeyModel, and nicCPKeyFirewall are the cloud_properties
 // map keys used in both per-NIC network specs and VM-level network_defaults
 // (§7.34). Defined as constants to satisfy goconst (>3 occurrences across the
@@ -242,6 +246,17 @@ type createVMCloudProps struct {
 	// isolation. Nil or empty → byte-identical (no PCI filter, no hostpciN
 	// config, no strict pin).
 	PCIPassthroughs []PCIPassthrough `json:"pci_passthroughs,omitempty"`
+	// AdvertisedRoutes lists OVN SDN vnet subnets to create for this VM
+	// post-clone. Each entry names a vnet and a destination CIDR; the CPI
+	// calls CreateSdnVnetsSubnets then applySDN to commit the subnet to the
+	// OVN logical-router fabric. Intended for router/NAT VMs that need the
+	// fabric to know about the prefixes they forward. Nil or empty → no SDN
+	// subnet calls (byte-identical). Requires an OVN SDN zone and SDN write
+	// permissions. SDN is eventually consistent; applySDN await covers
+	// convergence. Subnets created before a rollback-triggering failure are
+	// removed on a best-effort basis; if removal fails, a warning names the
+	// leftover subnet for operator cleanup.
+	AdvertisedRoutes []AdvertisedRoute `json:"advertised_routes,omitempty"`
 }
 
 // createVMNetworkSpec mirrors the BOSH v2 network spec shape.
@@ -570,10 +585,37 @@ func createVM(
 	// applyVIPAllowedAddressPairs ensures ipfilter is never enabled unless every
 	// firewalled NIC ipset is fully seeded. Unset manifest = byte-identical (no
 	// PVE calls). Entry format errors were rejected at step 1b before VM mutation.
+	//
+	// NICs with ip_forwarding=true are excluded from ipset seeding: a router VM
+	// forwards traffic not in its own ipset, so ipfilter on those NICs would
+	// silently drop forwarded packets. applyVIPAllowedAddressPairs receives the
+	// full network map; per-NIC exclusion is enforced inside that function.
 	// -----------------------------------------------------------------------
 	if vipErr := applyVIPAllowedAddressPairs(ctx, deps, shape.node, vmid, parsed.networks, logger); vipErr != nil {
 		logger.Warn("create_vm: VIP ipfilter not fully applied (non-fatal)",
 			log.Int(metadataKeyVMID, vmid), log.Err(vipErr))
+	}
+
+	// -----------------------------------------------------------------------
+	// 8d. ip_forwarding per-NIC: for any NIC with cloud_properties.ip_forwarding=true,
+	// set firewall=0 on that NIC via UpdateQemuConfig. Router/NAT VMs need this so
+	// forwarded packets (not addressed to the NIC's own IP) are not dropped by the
+	// PVE per-NIC firewall. Nil/unset → no API calls (byte-identical).
+	// Errors propagate and trigger rollback so a half-configured router NIC is
+	// never left behind.
+	// -----------------------------------------------------------------------
+	if fwdErr := applyIPForwarding(ctx, deps, shape.node, vmid, parsed.networks, logger); fwdErr != nil {
+		return nil, fwdErr
+	}
+
+	// -----------------------------------------------------------------------
+	// 8e. Advertised routes: for each entry in cloud_properties.advertised_routes,
+	// create an SDN vnet subnet then call applySDN to commit the OVN logical-router
+	// route. Empty list → no API calls (byte-identical). Errors propagate and
+	// trigger rollback; subnets injected before a failure are removed best-effort.
+	// -----------------------------------------------------------------------
+	if routeErr := applyAdvertisedRoutes(ctx, deps, shape.node, vmid, parsed.cloudProps.AdvertisedRoutes, logger); routeErr != nil {
+		return nil, routeErr
 	}
 
 	// -----------------------------------------------------------------------
@@ -794,6 +836,20 @@ func createVMWithFallback(
 		}
 
 		// -----------------------------------------------------------------------
+		// 8d. ip_forwarding per-NIC: disable per-NIC firewall for router/NAT NICs.
+		// -----------------------------------------------------------------------
+		if fwdErr := applyIPForwarding(ctx, deps, winShape.node, winningVMID, parsed.networks, logger); fwdErr != nil {
+			return nil, fwdErr
+		}
+
+		// -----------------------------------------------------------------------
+		// 8e. Advertised routes: inject OVN SDN subnets for router VMs.
+		// -----------------------------------------------------------------------
+		if routeErr := applyAdvertisedRoutes(ctx, deps, winShape.node, winningVMID, parsed.cloudProps.AdvertisedRoutes, logger); routeErr != nil {
+			return nil, routeErr
+		}
+
+		// -----------------------------------------------------------------------
 		// 9. HA anti-affinity — errors propagate (retriable ones re-drive).
 		// -----------------------------------------------------------------------
 		if aaErr := applyAntiAffinityMembership(ctx, deps, winningVMID, parsed.env, logger); aaErr != nil {
@@ -903,6 +959,11 @@ func parseCreateVMArgs(args []json.RawMessage) (*createVMParsedArgs, error) {
 	// never reaches the PVE API, consistent with the pve_config pre-validation
 	// pattern.
 	if err := validatePCIPassthroughs(cloudProps.PCIPassthroughs); err != nil {
+		return nil, err
+	}
+	// Validate advertised_routes CIDR destinations and vnet names pre-clone so
+	// malformed entries never reach the SDN API and no orphan VM is produced.
+	if err := validateAdvertisedRoutes(cloudProps.AdvertisedRoutes); err != nil {
 		return nil, err
 	}
 
@@ -2111,7 +2172,7 @@ func collectStaticIPsForConflictCheck(parsed *createVMParsedArgs, cfg *config.CP
 	for netName := range parsed.networks {
 		spec := parsed.networks[netName]
 		switch strings.ToLower(spec.Type) {
-		case "manual":
+		case nicTypeManual:
 			if spec.IP == "" || strings.EqualFold(spec.IP, "dhcp") {
 				continue
 			}
@@ -3835,7 +3896,7 @@ func configureNICs(
 		switch strings.ToLower(spec.Type) {
 		case nicTypeDynamic, "":
 			ipconfigMap[i] = "ip=dhcp"
-		case "manual":
+		case nicTypeManual:
 			if spec.IP != "" {
 				// Warn when a static IP has no gateway — this is likely an
 				// operator oversight. The VM still deploys; routing may be
@@ -4518,7 +4579,7 @@ func validateNetworkContainment(networks map[string]createVMNetworkSpec) error {
 	names := sortedNetworkNames(networks)
 	for _, name := range names {
 		spec := networks[name]
-		if !strings.EqualFold(spec.Type, "manual") || spec.IP == "" || spec.Range == "" {
+		if !strings.EqualFold(spec.Type, nicTypeManual) || spec.IP == "" || spec.Range == "" {
 			continue
 		}
 		_, cidrNet, err := net.ParseCIDR(spec.Range)
