@@ -162,10 +162,13 @@ func coerceTagMap(v any) map[string]string {
 // volid equality (with option-string tolerance via pve.DiskOptStrContainsVolid)
 // to prevent false matches on diskCIDs that are substrings of other volids.
 //
-// Transport errors from ListResources and per-VM Config fetches propagate as
-// wrapped retriable errors. Config errors for individual VMs are only swallowed
-// when the VM is a template or in an ephemeral state (the PVE API returns a
-// non-nil error in those cases); all other Config errors propagate.
+// Transport errors from ListResources propagate as wrapped retriable errors.
+// Per-VM Config errors are skipped only when they are not-found (the VM was
+// deleted concurrently or its config is gone); any other Config error is
+// returned as TypeRetriableCloud so a transient fault mid-scan cannot produce
+// a false 0-match (silent metadata loss) or a false 1-match (masked
+// multi-attach). The scan never short-circuits on the first match: visiting
+// every VM is what makes ambiguity detection possible.
 func findVMsHostingDisk(ctx context.Context, deps Deps, diskCID string) ([]attachedVM, error) {
 	typeStr := "vm"
 	var resources *sdkcluster.ListResourcesResponse
@@ -205,12 +208,12 @@ func findVMsHostingDisk(ctx context.Context, deps Deps, diskCID string) ([]attac
 		vmid := int(entry.VMID)
 		cfg, cfgErr := deps.PVE.QEMU().Config(ctx, vmNode, vmid)
 		if cfgErr != nil {
-			// Skip VMs whose config cannot be fetched (templates, transient).
-			// These are the same conditions FindVMByDiskVolid skips; log at debug
-			// so the scan does not fail for a single inaccessible VM.
-			deps.Logger.Debug("set_disk_metadata: skipping VM config fetch error",
-				log.String("node", vmNode), log.Int("vmid", vmid), log.Err(cfgErr))
-			continue
+			if pve.IsNotFound(cfgErr) {
+				// VM deleted concurrently or config gone: cannot host the disk.
+				continue
+			}
+			return nil, cpierrors.WrapAs(cfgErr, cpierrors.TypeRetriableCloud,
+				fmt.Sprintf("set_disk_metadata: transient Config error for vm %d on node %s", vmid, vmNode))
 		}
 
 		// Use exact volid matching with option-string tolerance: a config value of

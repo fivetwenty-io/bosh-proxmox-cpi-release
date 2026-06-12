@@ -1022,3 +1022,102 @@ func (c *diskMetaFullMock) Nodes() sdknodes.Service                { return c.no
 func (c *diskMetaFullMock) Cluster() sdkclusterapi.Service         { return c.clusterSvc }
 func (c *diskMetaFullMock) ClusterStorage() clusterstorage.Service { return nil }
 func (c *diskMetaFullMock) Pools() pve.PoolService                 { return nil }
+
+// TestHandleSetDiskMetadata_TransientConfigErrorDuringScan_Retriable verifies
+// that a transient per-VM Config fault during the attachment scan surfaces as
+// a retriable error rather than being silently skipped — a skip could yield a
+// false 0-match (metadata dropped) or a false 1-match (masked multi-attach).
+func TestHandleSetDiskMetadata_TransientConfigErrorDuringScan_Retriable(t *testing.T) {
+	t.Parallel()
+
+	const faultyVM = int64(100)
+	const hostingVM = int64(200)
+	transientErr := &sdkerrors.ConnectionError{Host: "pve.test.local", Port: 8006, Message: "connection reset by peer"}
+
+	baseConfigs := map[string]map[string]any{
+		diskKey(testNode, int(hostingVM)): vmConfigWithDisk(testDiskCID, ""),
+	}
+	qemuSvc := &configFnQEMU{
+		base: &diskMetaQEMUMock{configs: baseConfigs},
+		fn: func(ctx context.Context, node string, vmid int) (map[string]any, error) {
+			if vmid == int(faultyVM) {
+				return nil, transientErr
+			}
+			return (&diskMetaQEMUMock{configs: baseConfigs}).Config(ctx, node, vmid)
+		},
+	}
+	client := &diskMetaFullMock{
+		qemuSvc:  qemuSvc,
+		nodesSvc: &diskMetaNodesMock{},
+		clusterSvc: &diskMetaClusterSvc{resp: clusterResourcesWithVMs(
+			struct {
+				vmid int64
+				node string
+			}{faultyVM, testNode},
+			struct {
+				vmid int64
+				node string
+			}{hostingVM, testNode},
+		)},
+	}
+
+	h := handlers.HandleSetDiskMetadata(makeDiskMetaDepsClient(client))
+	_, err := h.Handle(context.Background(), makeMetaArgs(testDiskCID, map[string]any{"deployment": "cf"}), jsonrpc.Context{})
+	if err == nil {
+		t.Fatal("transient config error during scan: expected error, got nil")
+	}
+	if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+		t.Errorf("transient config error during scan: want retriable-cloud, got %v", err)
+	}
+}
+
+// TestHandleSetDiskMetadata_NotFoundSkippedDuringScan verifies that a 404 from
+// one VM's Config (deleted concurrently) is skipped while the scan continues,
+// and metadata is persisted on the VM that does host the disk.
+func TestHandleSetDiskMetadata_NotFoundSkippedDuringScan(t *testing.T) {
+	t.Parallel()
+
+	const goneVM = int64(100)
+	const hostingVM = int64(200)
+	notFoundErr := &sdkerrors.APIError{HTTPCode: 404, Message: "VM not found"}
+
+	baseConfigs := map[string]map[string]any{
+		diskKey(testNode, int(hostingVM)): vmConfigWithDisk(testDiskCID, ""),
+	}
+	qemuSvc := &configFnQEMU{
+		base: &diskMetaQEMUMock{configs: baseConfigs},
+		fn: func(ctx context.Context, node string, vmid int) (map[string]any, error) {
+			if vmid == int(goneVM) {
+				return nil, notFoundErr
+			}
+			return (&diskMetaQEMUMock{configs: baseConfigs}).Config(ctx, node, vmid)
+		},
+	}
+	nodesSvc := &diskMetaNodesMock{}
+	client := &diskMetaFullMock{
+		qemuSvc:  qemuSvc,
+		nodesSvc: nodesSvc,
+		clusterSvc: &diskMetaClusterSvc{resp: clusterResourcesWithVMs(
+			struct {
+				vmid int64
+				node string
+			}{goneVM, testNode},
+			struct {
+				vmid int64
+				node string
+			}{hostingVM, testNode},
+		)},
+	}
+
+	h := handlers.HandleSetDiskMetadata(makeDiskMetaDepsClient(client))
+	_, err := h.Handle(context.Background(), makeMetaArgs(testDiskCID, map[string]any{"deployment": "cf"}), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("404 during scan: unexpected error: %v", err)
+	}
+	if nodesSvc.capturedDesc == nil {
+		t.Fatal("404 during scan: metadata not persisted on the hosting VM")
+	}
+	if !strings.Contains(*nodesSvc.capturedDesc, testDiskCID) {
+		t.Errorf("404 during scan: persisted description missing disk_cid; got: %s", *nodesSvc.capturedDesc)
+	}
+}
