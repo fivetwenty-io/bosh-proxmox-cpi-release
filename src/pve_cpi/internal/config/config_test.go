@@ -5748,3 +5748,329 @@ func TestPlacementFallbackMax_OmitWhenNil(t *testing.T) {
 		t.Errorf("nil FallbackMax should be omitted in JSON, but got: %s", raw)
 	}
 }
+
+// --------------------------------------------------------------------------
+// detached_disk_strategy + parked VMID range
+// --------------------------------------------------------------------------
+
+// TestDetachedDiskStrategy_DefaultFree confirms empty/unset strategy resolves to "free",
+// DetachedDiskParkedEnabled returns false, and ParkedStrategyActive returns false.
+func TestDetachedDiskStrategy_DefaultFree(t *testing.T) {
+	t.Parallel()
+
+	// nil receiver: safe defaults.
+	var nilCfg *config.CPIConfig
+	if nilCfg.DetachedDiskStrategyValue() != "free" {
+		t.Error("nil receiver: DetachedDiskStrategyValue() should be free")
+	}
+	if nilCfg.DetachedDiskParkedEnabled() {
+		t.Error("nil receiver: DetachedDiskParkedEnabled() should be false")
+	}
+	if nilCfg.ParkedStrategyActive() {
+		t.Error("nil receiver: ParkedStrategyActive() should be false")
+	}
+
+	// Load via JSON: unset strategy and zero ranges.
+	cfg, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br"
+	}`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := cfg.DetachedDiskStrategyValue(); got != "free" {
+		t.Errorf("DetachedDiskStrategyValue() = %q, want free", got)
+	}
+	if cfg.DetachedDiskParkedEnabled() {
+		t.Error("DetachedDiskParkedEnabled() should be false when strategy unset")
+	}
+	if cfg.ParkedStrategyActive() {
+		t.Error("ParkedStrategyActive() should be false when strategy unset and ranges zero")
+	}
+	// Parker defaults must NOT be filled when strategy != parked.
+	if cfg.ParkedDiskVMIDRangeStartValue() != 0 {
+		t.Errorf("ParkedDiskVMIDRangeStartValue() = %d, want 0 (no fill when not parked)", cfg.ParkedDiskVMIDRangeStartValue())
+	}
+	if cfg.ParkedDiskVMIDRangeEndValue() != 0 {
+		t.Errorf("ParkedDiskVMIDRangeEndValue() = %d, want 0 (no fill when not parked)", cfg.ParkedDiskVMIDRangeEndValue())
+	}
+}
+
+// TestDetachedDiskStrategy_ExplicitFreeIsNormalized confirms explicit "free" normalizes.
+func TestDetachedDiskStrategy_ExplicitFreeIsNormalized(t *testing.T) {
+	t.Parallel()
+	for _, v := range []string{"free", "FREE", " Free "} {
+		cfg := &config.CPIConfig{DetachedDiskStrategy: v}
+		if got := cfg.DetachedDiskStrategyValue(); got != "free" {
+			t.Errorf("value %q: DetachedDiskStrategyValue() = %q, want free", v, got)
+		}
+		if cfg.DetachedDiskParkedEnabled() {
+			t.Errorf("value %q: DetachedDiskParkedEnabled() should be false", v)
+		}
+	}
+}
+
+// TestDetachedDiskStrategy_ParkedOptIn confirms strategy="parked" enables parked mode
+// and ApplyDefaults fills 90000/90999 when both range fields are zero.
+func TestDetachedDiskStrategy_ParkedOptIn(t *testing.T) {
+	t.Parallel()
+	cfg, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+		"detached_disk_strategy":"parked"
+	}`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := cfg.DetachedDiskStrategyValue(); got != "parked" {
+		t.Errorf("DetachedDiskStrategyValue() = %q, want parked", got)
+	}
+	if !cfg.DetachedDiskParkedEnabled() {
+		t.Error("DetachedDiskParkedEnabled() should be true when strategy=parked")
+	}
+	if !cfg.ParkedStrategyActive() {
+		t.Error("ParkedStrategyActive() should be true when strategy=parked")
+	}
+	// ApplyDefaults must fill 90000/90999 when strategy=parked and ranges unset.
+	if got := cfg.ParkedDiskVMIDRangeStartValue(); got != 90000 {
+		t.Errorf("ParkedDiskVMIDRangeStartValue() = %d, want 90000", got)
+	}
+	if got := cfg.ParkedDiskVMIDRangeEndValue(); got != 90999 {
+		t.Errorf("ParkedDiskVMIDRangeEndValue() = %d, want 90999", got)
+	}
+}
+
+// TestDetachedDiskStrategy_ParkedMixedCase confirms case-insensitive matching.
+func TestDetachedDiskStrategy_ParkedMixedCase(t *testing.T) {
+	t.Parallel()
+	for _, v := range []string{"parked", "PARKED", " Parked "} {
+		cfg := &config.CPIConfig{DetachedDiskStrategy: v}
+		if !cfg.DetachedDiskParkedEnabled() {
+			t.Errorf("value %q: DetachedDiskParkedEnabled() should be true", v)
+		}
+		if got := cfg.DetachedDiskStrategyValue(); got != "parked" {
+			t.Errorf("value %q: DetachedDiskStrategyValue() = %q, want parked", v, got)
+		}
+	}
+}
+
+// TestValidate_DetachedDiskStrategyInvalid confirms invalid enum is rejected.
+func TestValidate_DetachedDiskStrategyInvalid(t *testing.T) {
+	t.Parallel()
+	_, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+		"detached_disk_strategy":"hold"
+	}`)
+	assertCloudError(t, err, "detached_disk_strategy must be one of free|parked")
+}
+
+// TestValidate_DetachedDiskStrategyValid confirms all valid enum values load without error.
+func TestValidate_DetachedDiskStrategyValid(t *testing.T) {
+	t.Parallel()
+	for _, v := range []string{"", "free", "parked"} {
+		t.Run(v, func(t *testing.T) {
+			t.Parallel()
+			_, err := mustLoad(t, `{
+				"host":"h","user":"u","password":"p",
+				"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+				"detached_disk_strategy":"`+v+`"
+			}`)
+			if err != nil {
+				t.Fatalf("strategy %q should be valid, got: %v", v, err)
+			}
+		})
+	}
+}
+
+// TestParkedRange_RangeInversionRejected confirms end <= start is rejected.
+func TestParkedRange_RangeInversionRejected(t *testing.T) {
+	t.Parallel()
+	cfg := &config.CPIConfig{
+		Host:                     "h",
+		User:                     "u",
+		Password:                 "p",
+		VMStorage:                "s",
+		DiskStorage:              "s",
+		NetworkBridge:            "br",
+		AgentMode:                "cloudinit",
+		VMDiskFormat:             "qcow2",
+		LogLevel:                 "info",
+		Port:                     8006,
+		VerifySSL:                boolPtr(true),
+		VMIDRangeStart:           100,
+		VMIDRangeEnd:             8999,
+		RebootMode:               "soft",
+		RebootTimeout:            60,
+		NetworkMode:              "auto",
+		SDNZoneType:              "simple",
+		DetachedDiskStrategy:     "parked",
+		ParkedDiskVMIDRangeStart: 90999,
+		ParkedDiskVMIDRangeEnd:   90000, // end < start: invalid
+	}
+	assertCloudError(t, cfg.Validate(), "parked_disk_vmid_range_end must be > parked_disk_vmid_range_start")
+}
+
+// TestParkedRange_OverlapWithDiskBand confirms overlap with disk band is rejected.
+func TestParkedRange_OverlapWithDiskBand(t *testing.T) {
+	t.Parallel()
+	cfg := &config.CPIConfig{
+		Host:                     "h",
+		User:                     "u",
+		Password:                 "p",
+		VMStorage:                "s",
+		DiskStorage:              "s",
+		NetworkBridge:            "br",
+		AgentMode:                "cloudinit",
+		VMDiskFormat:             "qcow2",
+		LogLevel:                 "info",
+		Port:                     8006,
+		VerifySSL:                boolPtr(true),
+		VMIDRangeStart:           100,
+		VMIDRangeEnd:             8999,
+		RebootMode:               "soft",
+		RebootTimeout:            60,
+		NetworkMode:              "auto",
+		SDNZoneType:              "simple",
+		DetachedDiskStrategy:     "parked",
+		ParkedDiskVMIDRangeStart: 9000, // overlaps default disk band [9000,29999]
+		ParkedDiskVMIDRangeEnd:   9999,
+	}
+	assertCloudError(t, cfg.Validate(), "parker VMID range")
+}
+
+// TestParkedRange_OverlapWithVMBand confirms overlap with VM band is rejected.
+func TestParkedRange_OverlapWithVMBand(t *testing.T) {
+	t.Parallel()
+	cfg := &config.CPIConfig{
+		Host:                     "h",
+		User:                     "u",
+		Password:                 "p",
+		VMStorage:                "s",
+		DiskStorage:              "s",
+		NetworkBridge:            "br",
+		AgentMode:                "cloudinit",
+		VMDiskFormat:             "qcow2",
+		LogLevel:                 "info",
+		Port:                     8006,
+		VerifySSL:                boolPtr(true),
+		VMIDRangeStart:           100,
+		VMIDRangeEnd:             8999,
+		RebootMode:               "soft",
+		RebootTimeout:            60,
+		NetworkMode:              "auto",
+		SDNZoneType:              "simple",
+		DetachedDiskStrategy:     "parked",
+		ParkedDiskVMIDRangeStart: 500, // overlaps VM range [100,8999]
+		ParkedDiskVMIDRangeEnd:   1000,
+	}
+	assertCloudError(t, cfg.Validate(), "parker VMID range")
+}
+
+// TestParkedRange_RangeOnlySetNoStrategyParkedStrategyActive confirms that setting
+// only the VMID range (without strategy="parked") makes ParkedStrategyActive true
+// but does NOT trigger ApplyDefaults default fill (fields were explicitly set).
+func TestParkedRange_RangeOnlySetNoStrategy(t *testing.T) {
+	t.Parallel()
+	cfg, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+		"parked_disk_vmid_range_start":90000,
+		"parked_disk_vmid_range_end":90999
+	}`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// Strategy defaults to "free" when not set.
+	if got := cfg.DetachedDiskStrategyValue(); got != "free" {
+		t.Errorf("DetachedDiskStrategyValue() = %q, want free", got)
+	}
+	if cfg.DetachedDiskParkedEnabled() {
+		t.Error("DetachedDiskParkedEnabled() should be false when strategy unset")
+	}
+	// Range-only: ParkedStrategyActive must be true.
+	if !cfg.ParkedStrategyActive() {
+		t.Error("ParkedStrategyActive() should be true when range fields are non-zero")
+	}
+	// Accessors return the explicitly set values.
+	if got := cfg.ParkedDiskVMIDRangeStartValue(); got != 90000 {
+		t.Errorf("ParkedDiskVMIDRangeStartValue() = %d, want 90000", got)
+	}
+	if got := cfg.ParkedDiskVMIDRangeEndValue(); got != 90999 {
+		t.Errorf("ParkedDiskVMIDRangeEndValue() = %d, want 90999", got)
+	}
+}
+
+// TestParkedRange_ParkedStrategyActiveVariants exercises all three triggering
+// conditions for ParkedStrategyActive individually.
+func TestParkedRange_ParkedStrategyActiveVariants(t *testing.T) {
+	t.Parallel()
+	// strategy=parked alone (range filled by ApplyDefaults).
+	if !(&config.CPIConfig{DetachedDiskStrategy: "parked"}).ParkedStrategyActive() {
+		t.Error("strategy=parked alone: ParkedStrategyActive() should be true")
+	}
+	// start-only (non-zero raw field, no strategy).
+	if !(&config.CPIConfig{ParkedDiskVMIDRangeStart: 90000}).ParkedStrategyActive() {
+		t.Error("start-only: ParkedStrategyActive() should be true")
+	}
+	// end-only (non-zero raw field, no strategy).
+	if !(&config.CPIConfig{ParkedDiskVMIDRangeEnd: 90999}).ParkedStrategyActive() {
+		t.Error("end-only: ParkedStrategyActive() should be true")
+	}
+	// never opted in: all zero.
+	if (&config.CPIConfig{}).ParkedStrategyActive() {
+		t.Error("no strategy, no range: ParkedStrategyActive() should be false")
+	}
+}
+
+// TestParkedRange_DefaultsNotFilledWhenFree confirms ApplyDefaults never fills
+// range fields when strategy != parked, preserving byte-identical output.
+func TestParkedRange_DefaultsNotFilledWhenFree(t *testing.T) {
+	t.Parallel()
+	var cfg config.CPIConfig
+	cfg.VMStorage = "s"
+	cfg.ApplyDefaults()
+
+	if cfg.ParkedDiskVMIDRangeStart != 0 {
+		t.Errorf("ParkedDiskVMIDRangeStart filled without parked strategy, got %d", cfg.ParkedDiskVMIDRangeStart)
+	}
+	if cfg.ParkedDiskVMIDRangeEnd != 0 {
+		t.Errorf("ParkedDiskVMIDRangeEnd filled without parked strategy, got %d", cfg.ParkedDiskVMIDRangeEnd)
+	}
+}
+
+// TestParkedRange_ExplicitRangeNotOverwrittenByApplyDefaults confirms that when
+// strategy=parked but the operator supplies explicit ranges, ApplyDefaults does
+// not overwrite them.
+func TestParkedRange_ExplicitRangeNotOverwrittenByApplyDefaults(t *testing.T) {
+	t.Parallel()
+	var cfg config.CPIConfig
+	cfg.VMStorage = "s"
+	cfg.DetachedDiskStrategy = "parked"
+	cfg.ParkedDiskVMIDRangeStart = 91000
+	cfg.ParkedDiskVMIDRangeEnd = 91999
+	cfg.ApplyDefaults()
+
+	if cfg.ParkedDiskVMIDRangeStart != 91000 {
+		t.Errorf("ParkedDiskVMIDRangeStart overwritten, got %d, want 91000", cfg.ParkedDiskVMIDRangeStart)
+	}
+	if cfg.ParkedDiskVMIDRangeEnd != 91999 {
+		t.Errorf("ParkedDiskVMIDRangeEnd overwritten, got %d, want 91999", cfg.ParkedDiskVMIDRangeEnd)
+	}
+}
+
+// TestParkedRange_ByteIdenticalWhenUnset confirms unset knobs produce no keys in
+// the JSON-marshaled config (omitempty contract mirrors existing disk band fields).
+func TestParkedRange_ByteIdenticalWhenUnset(t *testing.T) {
+	t.Parallel()
+	cfg := &config.CPIConfig{}
+	raw, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	for _, key := range []string{"detached_disk_strategy", "parked_disk_vmid_range_start", "parked_disk_vmid_range_end"} {
+		if strings.Contains(string(raw), key) {
+			t.Errorf("key %q should be absent from JSON when unset, got: %s", key, raw)
+		}
+	}
+}

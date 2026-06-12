@@ -805,6 +805,45 @@ properties:
       the attached VM is left with a stuck config lock, delete_disk will keep
       deferring; clear it with "qm unlock <vmid>" on that VM's node.
     default: ""
+  pve.detached_disk_strategy:
+    description: |
+      Lifecycle strategy for persistent disks in the detached state (between
+      detach_disk and the next attach_disk or delete_disk). One of:
+        ""       — same as "free" (byte-identical to prior releases, default).
+        "free"   — detached disks float as unattached volumes in their synthetic
+                   VMID container. PVE has no first-class volume object; the
+                   disk is visible only via its container VM config. Risk:
+                   administrators may mistake the container VM for an unused
+                   resource and delete it, destroying the disk with it.
+        "parked" — detached disks are attached to a dedicated parker VM
+                   (bosh-parker-<n>) in an active scsi slot (scsi0-30) with
+                   protection=1 and onboot=0. The parker VM is never started.
+                   Provides PVE-side ownership visibility and accident protection.
+                   When enabled, ApplyDefaults sets pve.parked_disk_vmid_range_start
+                   and pve.parked_disk_vmid_range_end to 90000/90999 if unset.
+                   The parker VMID band must not overlap the VM range, the
+                   persistent-disk range, or the stemcell-template range.
+    default: ""
+  pve.parked_disk_vmid_range_start:
+    description: |
+      Inclusive lower bound of the VMID range reserved for parker VMs
+      (bosh-parker-<n>). Each parker VM holds up to 31 parked disk volumes in
+      scsi0-30 slots. Meaningful only when detached_disk_strategy is "parked"
+      or when an explicit range is set to enable the hybrid parker gate
+      (ParkedStrategyActive). When unset (0) and strategy is "parked",
+      ApplyDefaults sets this to 90000. When unset and strategy is not "parked",
+      left as 0. Must not overlap the VM range, the persistent-disk range, or
+      the stemcell-template range when set.
+    default: 0
+  pve.parked_disk_vmid_range_end:
+    description: |
+      Inclusive upper bound of the VMID range for parker VMs. Must be >
+      parked_disk_vmid_range_start. When unset (0) and strategy is "parked",
+      ApplyDefaults sets this to 90999 (the companion to the default start of
+      90000). When unset and strategy is not "parked", left as 0. Must not
+      overlap the VM range, the persistent-disk range, or the stemcell-template
+      range when set.
+    default: 0
   pve.network_resolve_retries:
     description: |
       Eventual-consistency poll budget for freshly created SDN networks. A newly

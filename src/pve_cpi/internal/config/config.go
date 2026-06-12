@@ -379,6 +379,42 @@ type CPIConfig struct {
 	// ""|"off"|"on". Use DiskDeleteStateGuardEnabled() for the effective value.
 	DiskDeleteStateGuard string `json:"disk_delete_state_guard,omitempty"`
 
+	// DetachedDiskStrategy selects the lifecycle strategy for persistent disks
+	// in the detached state (i.e. after detach_disk and before the next
+	// attach_disk or delete_disk). Valid values:
+	//
+	//   ""       — same as "free" (byte-identical to prior releases)
+	//   "free"   — detached disks float as un-attached volumes on PVE storage.
+	//              PVE has no first-class volume object, so the disk is visible
+	//              only via its synthetic-VMID container VM's config. Risk:
+	//              administrators may delete the container VM thinking it is
+	//              unused. Default.
+	//   "parked" — detached disks are attached to a dedicated parker VM
+	//              (bosh-parker-<n>) in an active scsi slot (scsi0..30) with
+	//              protection=1 and onboot=0. The parker VM is never started.
+	//              Provides PVE-side ownership visibility and accident protection
+	//              at the cost of slightly higher op counts per detach/attach.
+	//
+	// Use DetachedDiskStrategyValue() for the effective normalized value.
+	// Use DetachedDiskParkedEnabled() to gate parker logic.
+	DetachedDiskStrategy string `json:"detached_disk_strategy,omitempty"`
+
+	// ParkedDiskVMIDRangeStart is the inclusive lower bound of the VMID range
+	// reserved for parker VMs (bosh-parker-<n>). Parker VMs occupy this band;
+	// each parker VM holds up to 31 parked disk volumes in scsi0..30 slots.
+	// ApplyDefaults sets to 90000 when DetachedDiskParkedEnabled() is true
+	// and both range fields are zero. When set, the band must not overlap the
+	// VM range, the persistent-disk range, or the stemcell-template range.
+	// validate-only-when-set; omit from ERB when zero.
+	ParkedDiskVMIDRangeStart int `json:"parked_disk_vmid_range_start,omitempty"`
+
+	// ParkedDiskVMIDRangeEnd is the inclusive upper bound of the VMID range for
+	// parker VMs. Must be > ParkedDiskVMIDRangeStart. ApplyDefaults sets to
+	// 90999 when DetachedDiskParkedEnabled() is true and both range fields are
+	// zero (companion to ParkedDiskVMIDRangeStart default fill). Must not overlap
+	// any other VMID band. validate-only-when-set; omit from ERB when zero.
+	ParkedDiskVMIDRangeEnd int `json:"parked_disk_vmid_range_end,omitempty"`
+
 	// NetworkResolveRetries bounds eventual-consistency polling for freshly
 	// created SDN networks. A newly applied SDN vnet is not immediately usable
 	// cluster-wide: the data-plane realization (ifupdown2 reload, pmxcfs
@@ -1305,6 +1341,14 @@ func (c *CPIConfig) ApplyDefaults() {
 	if c.StemcellTemplateVMIDRangeEnd == 0 {
 		c.StemcellTemplateVMIDRangeEnd = 30999 // pve.VMIDRangeTemplateEnd
 	}
+	// Parker VMID range: fill 90000/90999 ONLY when strategy=parked and both
+	// range fields are zero. When range-only is set (no strategy), leave them
+	// as-is so the operator's explicit values are honored and ParkedStrategyActive
+	// returns true without forcing a default fill.
+	if c.DetachedDiskParkedEnabled() && c.ParkedDiskVMIDRangeStart == 0 && c.ParkedDiskVMIDRangeEnd == 0 {
+		c.ParkedDiskVMIDRangeStart = 90000 // default parker band start
+		c.ParkedDiskVMIDRangeEnd = 90999   // default parker band end
+	}
 	if c.CloneMode == "" {
 		c.CloneMode = "auto"
 	}
@@ -1778,6 +1822,65 @@ func (c *CPIConfig) DiskDeleteStateGuardEnabled() bool {
 	return strings.ToLower(strings.TrimSpace(c.DiskDeleteStateGuard)) == "on"
 }
 
+// DetachedDiskStrategyValue returns the effective detached-disk lifecycle
+// strategy, normalized to lower case and trimmed. Empty or absent resolves to
+// "free" (byte-identical to prior releases). Valid return values: "free", "parked".
+func (c *CPIConfig) DetachedDiskStrategyValue() string {
+	if c == nil {
+		return "free"
+	}
+	v := strings.ToLower(strings.TrimSpace(c.DetachedDiskStrategy))
+	if v == "" {
+		return "free"
+	}
+	return v
+}
+
+// DetachedDiskParkedEnabled reports whether the "parked" detached-disk strategy
+// is active. Returns true only when DetachedDiskStrategyValue() == "parked".
+func (c *CPIConfig) DetachedDiskParkedEnabled() bool {
+	return c.DetachedDiskStrategyValue() == "parked"
+}
+
+// ParkedStrategyActive reports whether any parker-related behavior should be
+// applied. Returns true when any of the following is set:
+//   - DetachedDiskParkedEnabled() (strategy="parked")
+//   - ParkedDiskVMIDRangeStart != 0 (raw field — operator set an explicit range)
+//   - ParkedDiskVMIDRangeEnd != 0 (raw field — operator set an explicit range)
+//
+// The raw-field check allows an operator who sets only the VMID range (without
+// strategy) to still gate parker reads (e.g. attach_disk unpark scan) without
+// requiring them to also set strategy=parked. ApplyDefaults only fills the
+// range defaults when strategy=parked, so a non-zero raw field at call time
+// always means the operator explicitly set it.
+func (c *CPIConfig) ParkedStrategyActive() bool {
+	if c == nil {
+		return false
+	}
+	return c.DetachedDiskParkedEnabled() || c.ParkedDiskVMIDRangeStart != 0 || c.ParkedDiskVMIDRangeEnd != 0
+}
+
+// ParkedDiskVMIDRangeStartValue returns the effective parker-band lower bound.
+// Returns 0 when parked strategy is inactive and the field is unset (range-only
+// case with both fields zero is only possible when ParkedStrategyActive is false).
+// After ApplyDefaults, this always returns 90000 when strategy=parked.
+func (c *CPIConfig) ParkedDiskVMIDRangeStartValue() int {
+	if c == nil {
+		return 0
+	}
+	return c.ParkedDiskVMIDRangeStart
+}
+
+// ParkedDiskVMIDRangeEndValue returns the effective parker-band upper bound.
+// Returns 0 when parked strategy is inactive and the field is unset.
+// After ApplyDefaults, this always returns 90999 when strategy=parked.
+func (c *CPIConfig) ParkedDiskVMIDRangeEndValue() int {
+	if c == nil {
+		return 0
+	}
+	return c.ParkedDiskVMIDRangeEnd
+}
+
 // validateIPConflictProbeEnum appends an error when ip_conflict_probe is set to
 // a value other than off|agent. Empty (the default) is valid.
 func (c *CPIConfig) validateIPConflictProbeEnum(errs *[]string) {
@@ -1809,6 +1912,24 @@ func (c *CPIConfig) validateEphemeralDiskMinModeEnum(errs *[]string) {
 		*errs = append(*errs, fmt.Sprintf(
 			"ephemeral_disk_min_mode must be one of enforce|warn (or empty for default enforce), got %q",
 			c.EphemeralDiskMinMode,
+		))
+	}
+}
+
+// validateDetachedDiskStrategyEnum appends an error when detached_disk_strategy
+// is set to a value other than free|parked. Empty (the default) is valid and
+// resolves to "free".
+func (c *CPIConfig) validateDetachedDiskStrategyEnum(errs *[]string) {
+	if c.DetachedDiskStrategy == "" {
+		return
+	}
+	switch strings.ToLower(strings.TrimSpace(c.DetachedDiskStrategy)) {
+	case "free", "parked":
+		// valid
+	default:
+		*errs = append(*errs, fmt.Sprintf(
+			"detached_disk_strategy must be one of free|parked (or empty for default free), got %q",
+			c.DetachedDiskStrategy,
 		))
 	}
 }
@@ -2377,6 +2498,9 @@ func (c *CPIConfig) validateEnumFields(errs *[]string) {
 	// DiskDeleteStateGuard enum: validate only when non-empty.
 	c.validateDiskDeleteStateGuardEnum(errs)
 
+	// DetachedDiskStrategy enum: validate only when non-empty.
+	c.validateDetachedDiskStrategyEnum(errs)
+
 	// DiskPerfInvariantMode enum: validate only when non-empty.
 	if c.DiskPerfInvariantMode != "" {
 		switch strings.ToLower(strings.TrimSpace(c.DiskPerfInvariantMode)) {
@@ -2642,6 +2766,31 @@ func (c *CPIConfig) validateVMIDBands(errs *[]string) {
 		*errs = append(*errs, fmt.Sprintf(
 			"stemcell template VMID range [%d,%d] overlaps persistent disk range [%d,%d]",
 			tStart, tEnd, diskStart, diskEnd))
+	}
+
+	// Parker band validation: trigger when strategy=parked OR either range field
+	// is explicitly set (raw non-zero). Bounds-check + pairwise overlap against the
+	// effective VM, disk, and template bands.
+	parkerActive := c.ParkedDiskVMIDRangeStart != 0 || c.ParkedDiskVMIDRangeEnd != 0 || c.DetachedDiskParkedEnabled()
+	if parkerActive {
+		pStart, pEnd := c.ParkedDiskVMIDRangeStart, c.ParkedDiskVMIDRangeEnd
+		checkBounds("parked_disk_vmid_range", pStart, pEnd)
+		pOK := pStart < pEnd
+		if vmOK && pOK && rangesOverlap(c.VMIDRangeStart, c.VMIDRangeEnd, pStart, pEnd) {
+			*errs = append(*errs, fmt.Sprintf(
+				"parker VMID range [%d,%d] overlaps VM VMID range [%d,%d]",
+				pStart, pEnd, c.VMIDRangeStart, c.VMIDRangeEnd))
+		}
+		if diskOK && pOK && rangesOverlap(diskStart, diskEnd, pStart, pEnd) {
+			*errs = append(*errs, fmt.Sprintf(
+				"parker VMID range [%d,%d] overlaps persistent disk range [%d,%d]",
+				pStart, pEnd, diskStart, diskEnd))
+		}
+		if tOK && pOK && rangesOverlap(tStart, tEnd, pStart, pEnd) {
+			*errs = append(*errs, fmt.Sprintf(
+				"parker VMID range [%d,%d] overlaps stemcell template range [%d,%d]",
+				pStart, pEnd, tStart, tEnd))
+		}
 	}
 }
 
