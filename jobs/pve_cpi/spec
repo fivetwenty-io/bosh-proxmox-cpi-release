@@ -1277,3 +1277,16 @@ properties:
       template it would delete but performs no deletions. Use to audit orphan
       accumulation before enabling live pruning. Has no effect when
       prune_orphans is false. Default false.
+
+  pve.encrypted:
+    description: |
+      Global opt-in for encrypted-storage disk placement. When true,
+      create_disk and ephemeral disk creation restrict storage-tier selection
+      to tiers that have encrypted: true set in the pve.storage_tiers map.
+      A per-call cloud_properties.encrypted overrides this global value
+      (per-call > global). When false or absent (default), no encrypted filter
+      is applied and behavior is byte-identical to prior releases.
+      The CPI cannot verify that a pool is actually encrypted — marking a tier
+      encrypted is operator responsibility; a warning is logged whenever an
+      encrypted tier is selected.
+    default: ~

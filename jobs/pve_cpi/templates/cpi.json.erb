@@ -606,5 +606,10 @@
   # byte-identical to any prior release that did not configure operator_id.
   if_p("pve.operator_id") { |v| config["operator_id"] = v unless v.to_s.empty? }
 
+  # Emit encrypted only when the operator explicitly opts in. The Go config
+  # defaults to nil (no filter applied) when the key is absent, so omitting it
+  # preserves byte-identical behavior on existing deployments.
+  if_p("pve.encrypted") { |v| config["encrypted"] = v }
+
   JSON.dump(config)
 %>

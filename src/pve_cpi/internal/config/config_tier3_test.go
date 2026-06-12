@@ -259,3 +259,63 @@ func TestValidate_ExternalCommand_Valid(t *testing.T) {
 		t.Fatalf("valid external_command must pass; got %v", err)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// CPIConfig.Encrypted and EncryptedEnabled — §7.49
+// ---------------------------------------------------------------------------
+
+func TestEncryptedEnabled_Nil(t *testing.T) {
+	cfg := &config.CPIConfig{}
+	if cfg.EncryptedEnabled() {
+		t.Error("nil Encrypted must be false")
+	}
+}
+
+func TestEncryptedEnabled_False(t *testing.T) {
+	cfg := &config.CPIConfig{Encrypted: boolPtr(false)}
+	if cfg.EncryptedEnabled() {
+		t.Error("*false Encrypted must be false")
+	}
+}
+
+func TestEncryptedEnabled_True(t *testing.T) {
+	cfg := &config.CPIConfig{Encrypted: boolPtr(true)}
+	if !cfg.EncryptedEnabled() {
+		t.Error("*true Encrypted must be true")
+	}
+}
+
+func TestEncryptedEnabled_JSONRoundTrip(t *testing.T) {
+	cfg := &config.CPIConfig{}
+	if err := json.Unmarshal([]byte(`{"encrypted":true}`), cfg); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !cfg.EncryptedEnabled() {
+		t.Error("encrypted:true must decode to enabled")
+	}
+}
+
+func TestEncryptedEnabled_JSONAbsent(t *testing.T) {
+	cfg := &config.CPIConfig{}
+	if err := json.Unmarshal([]byte(`{}`), cfg); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if cfg.Encrypted != nil {
+		t.Error("absent encrypted key must leave field nil (byte-identical)")
+	}
+}
+
+// TestValidate_StorageTiers_EncryptedOnlyIsValid verifies that a tier with only
+// Encrypted set (no Types, no Shared) fails validation — at least one of
+// Types/Shared/Encrypted must be a non-encrypted selector. Per validateStorageTiers,
+// Encrypted alone is acceptable as of §7.49 (the rule is relaxed: Encrypted alone
+// is a valid predicate).
+func TestValidate_StorageTiers_EncryptedAloneIsValid(t *testing.T) {
+	cfg := tier3BaseCfg()
+	cfg.StorageTiers = map[string]config.StorageTierCriteria{
+		"enc": {Encrypted: boolPtr(true)},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("tier with only Encrypted set must be valid; got %v", err)
+	}
+}

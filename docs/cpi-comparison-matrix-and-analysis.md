@@ -2265,7 +2265,7 @@ template has passed the ref gate and been destroyed.
 `handleDeleteTemplateStemcellCID` extracted from `HandleDeleteStemcell` to keep cognitive
 complexity within the lint threshold.
 
-#### 7.49 OPEN — Disk-encryption config surface
+#### 7.49 SHIPPED — Disk-encryption config surface
 
 *References: AWS, Azure, Alicloud.* Three reference clouds expose at-rest encryption as a
 config surface: AWS sets cluster-wide `encrypted` and `kms_key_arn` defaults that stemcell,
@@ -2284,6 +2284,26 @@ keys.
 the work reduces to pool selection and presupposes the operator has built encrypted pools and
 manages their keys outside the CPI. This overlaps the "not recommended" entry below; it is
 listed here as the bounded, delegation-style form that is defensible. Tier: deployment.
+
+**Shipped:** `encrypted *bool` (per-call > global > off) restricts persistent and ephemeral
+disk placement to storage tiers marked `encrypted: true` in CPI config `storage_tiers`.
+Enforcement rules:
+
+- Explicit `storage_pool` or `ephemeral_storage_pool` with `encrypted=true` → non-retriable
+  CloudError (CPI cannot verify an arbitrary named pool is encrypted).
+- Named `storage_tier` or `ephemeral_storage_tier` not marked encrypted → non-retriable
+  CloudError (contradiction before the live storage query).
+- No tier and no pool with `encrypted=true` → auto-select: the lex-first tier in
+  `storage_tiers` with `encrypted: true` is run through the normal resolver (Types/Shared
+  predicates + live cluster query). No encrypted tier in config → non-retriable CloudError.
+- `ephemeral_storage_tier` is the cloud_properties key for ephemeral disk tier selection
+  (mirrors `storage_tier` for persistent disks).
+- A warning is logged on every encrypted-tier selection; marking a tier encrypted is operator
+  responsibility — the CPI cannot verify pool encryption.
+- `encrypted` unset at all levels → byte-identical to prior releases.
+
+Residual scope: parked-disk parker-VM reuse and stemcell template replication choose their
+storage independently of the encrypted filter (out of scope for this feature).
 
 #### 7.50 OPEN — Stemcell creation from URL with checksum
 

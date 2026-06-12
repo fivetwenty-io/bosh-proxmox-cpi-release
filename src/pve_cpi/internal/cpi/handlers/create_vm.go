@@ -212,6 +212,12 @@ type createVMCloudProps struct {
 	// Extensibility: add new NIC attributes here as PVE support grows (e.g. mtu,
 	// vlan_tag) without touching the resolver or per-NIC spec parsing.
 	NetworkDefaults map[string]any `json:"network_defaults,omitempty"`
+	// Encrypted is the per-VM opt-in for encrypted-storage placement on the
+	// ephemeral disk (§7.49). When *true, ephemeral disk storage-tier selection
+	// is restricted to tiers marked Encrypted:*true in config.StorageTiers.
+	// Overrides the global CPIConfig.Encrypted (per-call > global > off). When
+	// nil, the global setting applies. Pointer-typed; absent JSON key leaves nil.
+	Encrypted *bool `json:"encrypted,omitempty"`
 }
 
 // createVMNetworkSpec mirrors the BOSH v2 network spec shape.
@@ -927,7 +933,9 @@ func buildVMShapeForNode(ctx context.Context, deps Deps, parsed *createVMParsedA
 		lister := deps.PVE.ClusterStorage()
 		cfg := deps.Config
 		tierFnForVM = func(tier string) (string, error) {
-			return resolveStorageTier(ctx, lister, cfg, tier)
+			// VM root disk does not apply the encrypted filter (§7.49 applies to
+			// persistent and ephemeral disks only). Pass encrypted=false.
+			return resolveStorageTier(ctx, lister, cfg, tier, false)
 		}
 	}
 	vmStorage, vmDiskFormat, rootDiskGiB, err := resolveVMShapeStorage(deps.Config, parsed, tierFnForVM)
@@ -976,7 +984,7 @@ func buildVMShapeForNode(ctx context.Context, deps Deps, parsed *createVMParsedA
 		scsihwVal = "virtio-scsi-single"
 	}
 
-	ephemeralDiskGiB, ephemeralStorage, err := resolveEphemeralShape(deps.Config, cp, parsed.cloudPropsMap)
+	ephemeralDiskGiB, ephemeralStorage, err := resolveEphemeralShape(ctx, deps, cp, parsed.cloudPropsMap)
 	if err != nil {
 		return nil, err
 	}
@@ -3308,9 +3316,24 @@ func resizeRootDisk(
 // no ephemeral disk is created and the agent carves ephemeral storage from the
 // root disk (default behavior, byte-identical to pre-feature behavior).
 //
-// Storage resolution order: layered resolver "ephemeral_storage_pool" key →
-// struct field EphemeralStoragePool → cfg.VMStorage fallback.
-func resolveEphemeralShape(cfg *config.CPIConfig, cp createVMCloudProps, cpMap map[string]any) (int, string, error) {
+// When encrypted=false (unset): storage resolution order is:
+//  1. resolver "ephemeral_storage_tier" — live criteria match
+//  2. resolver "ephemeral_storage_pool" — explicit pool name
+//  3. struct field EphemeralStoragePool
+//  4. cfg.VMStorage fallback
+//
+// When encrypted=true: §7.49 enforcement applies (same rules as create_disk):
+//  - explicit ephemeral_storage_pool present → non-retriable CloudError
+//  - ephemeral_storage_tier named + not encrypted → non-retriable CloudError
+//  - neither tier nor pool → auto-select lex-first encrypted tier from config
+//  - A warning is logged on every encrypted-tier selection.
+func resolveEphemeralShape(
+	ctx context.Context,
+	deps Deps,
+	cp createVMCloudProps,
+	cpMap map[string]any,
+) (int, string, error) {
+	cfg := deps.Config
 	if cp.EphemeralDiskSizeMB <= 0 {
 		return 0, "", nil
 	}
@@ -3319,19 +3342,123 @@ func resolveEphemeralShape(cfg *config.CPIConfig, cp createVMCloudProps, cpMap m
 		return 0, "", rErr
 	}
 	gib := (cp.EphemeralDiskSizeMB + 1023) / 1024
-	stor := ""
-	if pool, ok := r.String("ephemeral_storage_pool"); ok {
-		stor = pool
-	} else if cp.EphemeralStoragePool != "" {
-		stor = cp.EphemeralStoragePool
-	} else {
-		stor = cfg.VMStorage
+
+	// Resolve encrypted flag: per-call > global > false (§7.49).
+	var encryptedCallLevel *bool
+	if v, ok := r.Bool("encrypted"); ok {
+		encryptedCallLevel = &v
+	}
+	encrypted := ResolveEncrypted(cfg.Encrypted, encryptedCallLevel)
+
+	stor, err := resolveEphemeralStorage(ctx, deps, cfg, r, cp, encrypted)
+	if err != nil {
+		return 0, "", err
 	}
 	if stor == "" {
 		return 0, "", cpierrors.Cloud(
 			"create_vm: ephemeral_disk_size_mb set but no storage pool resolved (set ephemeral_storage_pool or vm_storage)")
 	}
 	return gib, stor, nil
+}
+
+// resolveEphemeralStorage returns the storage pool name for a dedicated ephemeral disk.
+// Extracted from resolveEphemeralShape to keep that function under gocognit 40.
+//
+// When encrypted=false: standard tier→pool→struct→fallback precedence (byte-identical).
+// When encrypted=true: §7.49 rules — explicit pool is a contradiction error; named tier
+// must be marked encrypted; no tier/pool → auto-select lex-first encrypted tier.
+func resolveEphemeralStorage(
+	ctx context.Context,
+	deps Deps,
+	cfg *config.CPIConfig,
+	r *layeredResolver,
+	cp createVMCloudProps,
+	encrypted bool,
+) (string, error) {
+	lister := storageLister(nil)
+	if deps.PVE != nil {
+		lister = deps.PVE.ClusterStorage()
+	}
+	warnEncrypted := func(tier, pool string) {
+		if deps.Logger != nil {
+			deps.Logger.Warn("create_vm: selected encrypted ephemeral storage tier — CPI cannot verify pool encryption; operator responsibility",
+				log.String("tier", tier),
+				log.String("pool", pool),
+			)
+		}
+	}
+
+	if encrypted {
+		return resolveEphemeralStorageEncrypted(ctx, lister, cfg, r, cp, warnEncrypted)
+	}
+
+	// Unencrypted path: byte-identical to pre-§7.49.
+	if tier, ok := r.String("ephemeral_storage_tier"); ok {
+		if lister != nil {
+			return resolveStorageTier(ctx, lister, cfg, tier, false)
+		}
+	}
+	if pool, ok := r.String("ephemeral_storage_pool"); ok {
+		return pool, nil
+	}
+	if cp.EphemeralStoragePool != "" {
+		return cp.EphemeralStoragePool, nil
+	}
+	return cfg.VMStorage, nil
+}
+
+// resolveEphemeralStorageEncrypted handles the encrypted=true path for
+// resolveEphemeralStorage. Extracted to keep the parent under gocognit 40.
+func resolveEphemeralStorageEncrypted(
+	ctx context.Context,
+	lister storageLister,
+	cfg *config.CPIConfig,
+	r *layeredResolver,
+	cp createVMCloudProps,
+	warn func(tier, pool string),
+) (string, error) {
+	// Explicit pool → contradiction.
+	if pool, ok := r.String("ephemeral_storage_pool"); ok && pool != "" {
+		return "", cpierrors.Cloud(
+			"create_vm: encrypted=true is set but an explicit ephemeral_storage_pool is also set;" +
+				" the CPI cannot verify that a named pool is encrypted." +
+				" Use ephemeral_storage_tier with an encrypted tier instead.",
+		)
+	}
+	if cp.EphemeralStoragePool != "" {
+		return "", cpierrors.Cloud(
+			"create_vm: encrypted=true is set but ephemeral_storage_pool (struct field) is set;" +
+				" the CPI cannot verify that a named pool is encrypted." +
+				" Use ephemeral_storage_tier with an encrypted tier instead.",
+		)
+	}
+	// Named tier → resolveStorageTier enforces Encrypted:*true.
+	if tier, ok := r.String("ephemeral_storage_tier"); ok {
+		if lister == nil {
+			return "", cpierrors.Cloud(
+				"create_vm: encrypted=true with ephemeral_storage_tier %q but cluster storage API is not available",
+				tier,
+			)
+		}
+		pool, err := resolveStorageTier(ctx, lister, cfg, tier, true)
+		if err != nil {
+			return "", err
+		}
+		warn(tier, pool)
+		return pool, nil
+	}
+	// No tier, no pool → auto-select lex-first encrypted tier.
+	if lister == nil {
+		return "", cpierrors.Cloud(
+			"create_vm: encrypted=true but cluster storage API is not available for auto-tier selection",
+		)
+	}
+	pool, tier, err := resolveEncryptedPool(ctx, lister, cfg, "create_vm")
+	if err != nil {
+		return "", err
+	}
+	warn(tier, pool)
+	return pool, nil
 }
 
 // ephemeralMinSizeViolation reports a human-readable deficit string when the

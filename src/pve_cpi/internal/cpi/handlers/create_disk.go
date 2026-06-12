@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
@@ -50,6 +51,12 @@ type createDiskCloudProperties struct {
 	// the VM to that AZ, preventing cross-AZ attachment. Empty (default) imposes
 	// no AZ constraint; create_vm placement proceeds unconstrained by this disk.
 	AvailabilityZone string `json:"availability_zone,omitempty"`
+	// Encrypted is the per-call opt-in for encrypted storage placement (§7.49).
+	// When *true, storage-tier selection is restricted to tiers marked Encrypted:*true
+	// in config.StorageTiers. Overrides the global CPIConfig.Encrypted (per-call >
+	// global > off). When nil, the global setting applies. When *false, encrypted
+	// filter is explicitly disabled even if global is true.
+	Encrypted *bool `json:"encrypted,omitempty"`
 }
 
 // resolveStorageLayered returns the storage pool name to use for a create_disk call,
@@ -77,30 +84,62 @@ func resolveStorageLayered(r *layeredResolver, configDiskStorage string) (string
 }
 
 // resolveStorageForDisk resolves the target storage pool for a create_disk call.
-// Precedence order (first non-empty result wins):
 //
+// When encrypted=false (the default, unset path): byte-identical to pre-§7.49 —
+// precedence order (first non-empty wins):
 //  1. r.String("storage_pool","storage") — explicit per-call or profile override
-//  2. r.String("storage_tier") — opt-in live criteria match against cluster storages
+//  2. r.String("storage_tier") — live criteria match against cluster storages
 //  3. deps.Config.DiskStorage — global config default
 //
-// The tier path is only taken when storage_tier is set in the resolver layers and
-// deps.PVE.ClusterStorage() is non-nil. When no tier is set, no live query is
-// issued and the behavior is byte-identical to the pre-tier path.
-// All levels empty or unmatched → non-retriable CloudError.
-func resolveStorageForDisk(ctx context.Context, r *layeredResolver, deps Deps) (string, error) {
-	// Level 1: explicit pool name (highest precedence, no live query).
+// When encrypted=true: §7.49 enforcement applies at every level:
+//  1. Explicit storage_pool/storage present → non-retriable CloudError
+//     (CPI cannot verify an arbitrary named pool is encrypted).
+//  2. storage_tier named → tier must be marked Encrypted:*true in config
+//     (existing named-tier-not-encrypted error, already in resolveStorageTier).
+//  3. No tier and no pool → auto-select: lex-first tier in config with Encrypted:*true;
+//     run it through resolveStorageTier (Types/Shared predicates + live query).
+//     No encrypted tier in config → non-retriable CloudError.
+//  4. Global DiskStorage with encrypted=true and no tier path taken → same auto-select.
+//     If ClusterStorage is not wired and no tier resolves → non-retriable CloudError.
+//
+// All paths log a warning when an encrypted tier is selected (operator responsibility).
+func resolveStorageForDisk(ctx context.Context, r *layeredResolver, deps Deps, encrypted bool) (string, error) {
+	hasExplicitPool := func() bool {
+		_, found := r.String("storage_pool", "storage")
+		return found
+	}
+	hasTier := func() (string, bool) {
+		return r.String("storage_tier")
+	}
+	lister := func() storageLister {
+		if deps.PVE != nil {
+			return deps.PVE.ClusterStorage()
+		}
+		return nil
+	}
+	warnEncrypted := func(tier, pool string) {
+		if deps.Logger != nil {
+			deps.Logger.Warn("create_disk: selected encrypted storage tier — CPI cannot verify pool encryption; operator responsibility",
+				log.String("tier", tier),
+				log.String("pool", pool),
+			)
+		}
+	}
+
+	// Encrypted enforcement (§7.49).
+	if encrypted {
+		return resolveStorageForDiskEncrypted(ctx, deps.Config, lister(), warnEncrypted, hasExplicitPool, hasTier)
+	}
+
+	// Unencrypted path: byte-identical to pre-§7.49.
 	if s, found := r.String("storage_pool", "storage"); found {
 		return s, nil
 	}
-	// Level 2: storage_tier — opt-in live cluster storage query.
 	if tier, found := r.String("storage_tier"); found {
-		if deps.PVE != nil && deps.PVE.ClusterStorage() != nil {
-			return resolveStorageTier(ctx, deps.PVE.ClusterStorage(), deps.Config, tier)
+		if l := lister(); l != nil {
+			return resolveStorageTier(ctx, l, deps.Config, tier, false)
 		}
-		// ClusterStorage not wired (misconfigured test or unusual deployment):
-		// fall through to config default rather than panic.
 	}
-	// Level 3: global config default.
 	if s := strings.TrimSpace(deps.Config.DiskStorage); s != "" {
 		return s, nil
 	}
@@ -108,6 +147,53 @@ func resolveStorageForDisk(ctx context.Context, r *layeredResolver, deps Deps) (
 		"create_disk: no storage configured (disk_storage empty and neither" +
 			" cloud_properties.storage_pool nor cloud_properties.storage is set)",
 	)
+}
+
+// resolveStorageForDiskEncrypted handles the encrypted=true path for
+// resolveStorageForDisk. Extracted to keep the parent function under gocognit 40.
+func resolveStorageForDiskEncrypted(
+	ctx context.Context,
+	cfg *config.CPIConfig,
+	lister storageLister,
+	warn func(tier, pool string),
+	hasExplicitPool func() bool,
+	hasTier func() (string, bool),
+) (string, error) {
+	// Level 1: explicit pool — contradiction, CPI cannot verify.
+	if hasExplicitPool() {
+		return "", cpierrors.Cloud(
+			"create_disk: encrypted=true is set but an explicit storage_pool is also set;" +
+				" the CPI cannot verify that a named pool is encrypted." +
+				" Use storage_tier with an encrypted tier instead.",
+		)
+	}
+	// Level 2: named tier — resolveStorageTier enforces Encrypted:*true on the tier.
+	if tier, found := hasTier(); found {
+		if lister == nil {
+			return "", cpierrors.Cloud(
+				"create_disk: encrypted=true with storage_tier %q but cluster storage API is not available",
+				tier,
+			)
+		}
+		pool, err := resolveStorageTier(ctx, lister, cfg, tier, true)
+		if err != nil {
+			return "", err
+		}
+		warn(tier, pool)
+		return pool, nil
+	}
+	// Level 3 & 4: no explicit tier or pool → auto-select lex-first encrypted tier.
+	if lister == nil {
+		return "", cpierrors.Cloud(
+			"create_disk: encrypted=true but cluster storage API is not available for auto-tier selection",
+		)
+	}
+	pool, tier, err := resolveEncryptedPool(ctx, lister, cfg, "create_disk")
+	if err != nil {
+		return "", err
+	}
+	warn(tier, pool)
+	return pool, nil
 }
 
 // HandleCreateDisk returns a Handler for the BOSH CPI create_disk method.
@@ -181,7 +267,16 @@ func HandleCreateDisk(deps Deps) Handler {
 			return nil, err // non-retriable CloudError: bad cache mode / negative throttle
 		}
 
-		storage, err := resolveStorageForDisk(ctx, r, deps)
+		// Resolve encrypted flag: per-call > global > false.
+		// layeredResolver.Bool reads call/disk_type/vm_type layers; global is the
+		// CPIConfig.Encrypted field. When neither is set, encrypted=false → no filter.
+		var encryptedCallLevel *bool
+		if v, ok := r.Bool("encrypted"); ok {
+			encryptedCallLevel = &v
+		}
+		encrypted := ResolveEncrypted(deps.Config.Encrypted, encryptedCallLevel)
+
+		storage, err := resolveStorageForDisk(ctx, r, deps, encrypted)
 		if err != nil {
 			return nil, err
 		}

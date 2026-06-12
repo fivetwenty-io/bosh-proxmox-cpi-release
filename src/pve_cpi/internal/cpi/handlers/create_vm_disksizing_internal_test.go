@@ -493,7 +493,7 @@ func TestResolveEphemeralShape_Disabled_NoOp(t *testing.T) {
 	cfg := &config.CPIConfig{VMStorage: "local-lvm"}
 	cp := createVMCloudProps{EphemeralDiskSizeMB: 0}
 
-	gib, stor, err := resolveEphemeralShape(cfg, cp, map[string]any{})
+	gib, stor, err := resolveEphemeralShape(context.Background(), Deps{Config: cfg}, cp, map[string]any{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -513,7 +513,7 @@ func TestResolveEphemeralShape_ExplicitPool(t *testing.T) {
 		EphemeralStoragePool: "fast",
 	}
 
-	gib, stor, err := resolveEphemeralShape(cfg, cp, map[string]any{})
+	gib, stor, err := resolveEphemeralShape(context.Background(), Deps{Config: cfg}, cp, map[string]any{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -533,7 +533,7 @@ func TestResolveEphemeralShape_FallbackVMStorage(t *testing.T) {
 	cfg := &config.CPIConfig{VMStorage: "local-lvm"}
 	cp := createVMCloudProps{EphemeralDiskSizeMB: 4096}
 
-	gib, stor, err := resolveEphemeralShape(cfg, cp, map[string]any{})
+	gib, stor, err := resolveEphemeralShape(context.Background(), Deps{Config: cfg}, cp, map[string]any{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -553,7 +553,7 @@ func TestResolveEphemeralShape_RoundUp(t *testing.T) {
 	cfg := &config.CPIConfig{VMStorage: "local-lvm"}
 	cp := createVMCloudProps{EphemeralDiskSizeMB: 1025}
 
-	gib, _, err := resolveEphemeralShape(cfg, cp, map[string]any{})
+	gib, _, err := resolveEphemeralShape(context.Background(), Deps{Config: cfg}, cp, map[string]any{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -569,7 +569,7 @@ func TestResolveEphemeralShape_1MB(t *testing.T) {
 	cfg := &config.CPIConfig{VMStorage: "local-lvm"}
 	cp := createVMCloudProps{EphemeralDiskSizeMB: 1}
 
-	gib, _, err := resolveEphemeralShape(cfg, cp, map[string]any{})
+	gib, _, err := resolveEphemeralShape(context.Background(), Deps{Config: cfg}, cp, map[string]any{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

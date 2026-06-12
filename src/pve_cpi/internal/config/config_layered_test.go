@@ -243,7 +243,7 @@ func TestValidate_StorageTiers_NeitherTypesNorShared_Error(t *testing.T) {
 	}
 	err := cfg.Validate()
 	assertCloudError(t, err, "storage_tiers[empty-tier]")
-	assertCloudError(t, err, "must set types or shared")
+	assertCloudError(t, err, "must set at least one of types, shared, or encrypted")
 }
 
 func TestValidate_StorageTiers_UnknownType_Error(t *testing.T) {

@@ -709,6 +709,16 @@ type CPIConfig struct {
 	// Use StemcellReplicationConcurrencyValue() to obtain the effective worker count.
 	// validate-only-when-set; omit from ERB when zero (serial default).
 	StemcellReplicationConcurrency int `json:"stemcell_replication_concurrency,omitempty"`
+
+	// Encrypted is the global opt-in for encrypted-storage disk placement (§7.49).
+	// When *true, create_disk and ephemeral disk creation restrict storage-tier
+	// selection to tiers that have Encrypted:*true in config.StorageTiers. A
+	// per-call cloud_properties.encrypted overrides this global (per-call > global).
+	// When nil or *false (default), no encrypted filter is applied and behavior is
+	// byte-identical to prior releases. Pointer-typed so nil (absent from JSON) is
+	// distinguishable from an explicit false. Use EncryptedEnabled() for the
+	// effective bool. validate-only-when-set; omit from ERB when nil.
+	Encrypted *bool `json:"encrypted,omitempty"`
 }
 
 // TypeProfile is a named bundle of default cloud_properties applied by the
@@ -721,10 +731,13 @@ type TypeProfile struct {
 // StorageTierCriteria selects PVE storages by attribute. Types lists allowed
 // PVE storage type strings (lvm, lvmthin, zfspool, dir, nfs, cifs, rbd, cephfs,
 // btrfs, glusterfs, pbs). Shared requires shared (true) / local (false) / any
-// (nil). At least one of Types or Shared must be set.
+// (nil). Encrypted, when non-nil, restricts selection to tiers that match the
+// encrypted predicate (see §7.49). At least one of Types, Shared, or Encrypted
+// must be set.
 type StorageTierCriteria struct {
-	Types  []string `json:"types,omitempty"`
-	Shared *bool    `json:"shared,omitempty"`
+	Types     []string `json:"types,omitempty"`
+	Shared    *bool    `json:"shared,omitempty"`
+	Encrypted *bool    `json:"encrypted,omitempty"`
 }
 
 // DiskPerformanceDefaults holds optional global PVE per-disk performance option
@@ -2021,6 +2034,13 @@ func (c *CPIConfig) EphemeralDiskMinModeValue() string {
 // releases). *false → false; *true → true.
 func (c *CPIConfig) VMFirewallEnabled() bool {
 	return c.VMFirewall != nil && *c.VMFirewall
+}
+
+// EncryptedEnabled returns the effective global encrypted-storage preference (§7.49).
+// nil (absent from JSON) → false (byte-identical, no filter applied).
+// *false → false; *true → true.
+func (c *CPIConfig) EncryptedEnabled() bool {
+	return c.Encrypted != nil && *c.Encrypted
 }
 
 // HooksValue returns the configured hook names in order, or nil when none are
@@ -3481,9 +3501,9 @@ var knownPVEStorageTypes = map[string]struct{}{
 // what their Go types enforce, so they are not validated here.
 func (c *CPIConfig) validateStorageTiers(errs *[]string) {
 	for name, criteria := range c.StorageTiers {
-		if len(criteria.Types) == 0 && criteria.Shared == nil {
+		if len(criteria.Types) == 0 && criteria.Shared == nil && criteria.Encrypted == nil {
 			*errs = append(*errs, fmt.Sprintf(
-				"storage_tiers[%s]: must set types or shared", name,
+				"storage_tiers[%s]: must set at least one of types, shared, or encrypted", name,
 			))
 			continue
 		}
