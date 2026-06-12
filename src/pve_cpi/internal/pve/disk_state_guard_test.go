@@ -136,8 +136,8 @@ func TestGuardDiskDeleteState_AttachedDirStyleVolid_Retriable(t *testing.T) {
 
 func TestGuardDiskDeleteState_AttachedVMConfig404_Proceeds(t *testing.T) {
 	t.Parallel()
-	// FindVMByDiskVolid skips VMs whose config cannot be fetched, so a config
-	// error during resolution surfaces as "not attached" → proceed.
+	// FindVMByDiskVolid skips VMs whose config 404s (deleted concurrently), so
+	// a not-found during resolution surfaces as "not attached" → proceed.
 	c := &diskClusterClient{
 		qemuSvc: &guardFakeQEMU{err: &sdkerrors.APIError{HTTPCode: 404, Message: "VM not found"}},
 		clusterSvc: &diskFakeCluster{
@@ -151,13 +151,85 @@ func TestGuardDiskDeleteState_AttachedVMConfig404_Proceeds(t *testing.T) {
 	}
 }
 
-func TestGuardDiskDeleteState_ResolutionError_FailsOpen(t *testing.T) {
+func TestGuardDiskDeleteState_PermanentResolutionError_FailsOpen(t *testing.T) {
 	t.Parallel()
-	// Cluster listing fails: the guard is best-effort and must fail open rather
-	// than turn a guard blip into a delete failure.
+	// Cluster listing fails with a permanent (non-retriable) error: the guard is
+	// best-effort and must fail open rather than turn a permanent guard fault
+	// into a permanent delete failure.
 	c := guardClientListErr(errors.New("permission denied"))
 	if err := pve.GuardDiskDeleteState(context.Background(), c, "pve-01", guardVolid); err != nil {
-		t.Errorf("resolution error: want fail-open (nil), got %v", err)
+		t.Errorf("permanent resolution error: want fail-open (nil), got %v", err)
+	}
+}
+
+func TestGuardDiskDeleteState_TransientConfigErrorDuringScan_Retriable(t *testing.T) {
+	t.Parallel()
+	// A transient per-VM Config fault during holder resolution leaves the
+	// holder state unknown: the guard must defer the delete as retriable, not
+	// wave it through as "not attached".
+	c := &diskClusterClient{
+		qemuSvc: &guardFakeQEMU{err: &sdkerrors.APIError{HTTPCode: 500, Message: "pvedaemon worker cycling"}},
+		clusterSvc: &diskFakeCluster{
+			listFn: func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+				return diskClusterResp(map[string]any{"vmid": int64(9002), "node": "pve-01"}), nil
+			},
+		},
+	}
+	err := pve.GuardDiskDeleteState(context.Background(), c, "pve-01", guardVolid)
+	if err == nil || !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+		t.Errorf("transient config error during scan: want retriable-cloud, got %v", err)
+	}
+}
+
+// guardLockReadFailQEMU answers the first Config call (the holder scan) with a
+// config that attaches the disk, then fails every subsequent call (the lock
+// read) with lockErr.
+type guardLockReadFailQEMU struct {
+	qemu.Service
+	cfg     map[string]any
+	lockErr error
+	calls   int
+}
+
+func (q *guardLockReadFailQEMU) Config(_ context.Context, _ string, _ int) (map[string]any, error) {
+	q.calls++
+	if q.calls == 1 {
+		return q.cfg, nil
+	}
+	return nil, q.lockErr
+}
+
+// guardLockReadFailClient wires a single-VM cluster whose holder scan succeeds
+// (disk attached at scsi0) and whose subsequent lock read fails with lockErr.
+func guardLockReadFailClient(lockErr error) pve.Client {
+	return &diskClusterClient{
+		qemuSvc: &guardLockReadFailQEMU{cfg: map[string]any{"scsi0": guardVolid}, lockErr: lockErr},
+		clusterSvc: &diskFakeCluster{
+			listFn: func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+				return diskClusterResp(map[string]any{"vmid": int64(9002), "node": "pve-01"}), nil
+			},
+		},
+	}
+}
+
+func TestGuardDiskDeleteState_TransientLockReadError_Retriable(t *testing.T) {
+	t.Parallel()
+	// The holder resolved but its lock state could not be read due to a
+	// transient fault: the guard must defer the delete as retriable.
+	c := guardLockReadFailClient(&sdkerrors.TimeoutError{Operation: "qemu config", Duration: "5s"})
+	err := pve.GuardDiskDeleteState(context.Background(), c, "pve-01", guardVolid)
+	if err == nil || !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+		t.Errorf("transient lock-read error: want retriable-cloud, got %v", err)
+	}
+}
+
+func TestGuardDiskDeleteState_PermanentLockReadError_FailsOpen(t *testing.T) {
+	t.Parallel()
+	// A permanent lock-read failure (e.g. 403) keeps the guard best-effort:
+	// retrying cannot clear it, so fail open and allow the delete.
+	c := guardLockReadFailClient(&sdkerrors.APIError{HTTPCode: 403, Message: "permission denied"})
+	if err := pve.GuardDiskDeleteState(context.Background(), c, "pve-01", guardVolid); err != nil {
+		t.Errorf("permanent lock-read error: want fail-open (nil), got %v", err)
 	}
 }
 

@@ -14,15 +14,19 @@
 // guest the disk is CURRENTLY ATTACHED to. The guard finds that guest by
 // scanning VM configs for the volid (FindVMByDiskVolid), reads its config lock,
 // and asks the director to retry later when the lock indicates a destructive or
-// in-flight operation. It is opt-in (callers gate on the feature knob) and fails
-// open on any resolution uncertainty so it can never convert a guard hiccup into
-// a delete failure. A disk that is not attached to any VM — the normal state at
-// delete time, after BOSH has detached it — has no guest to interrogate and is
-// allowed straight through.
+// in-flight operation. It is opt-in (callers gate on the feature knob). When
+// resolution fails transiently (a network blip or 5xx mid-scan), the guard also
+// defers the delete as retriable — an unknown holder state is exactly the
+// condition the guard exists to protect against. Only permanent outcomes fail
+// open: a disk that is not attached to any VM — the normal state at delete
+// time, after BOSH has detached it — has no guest to interrogate and is
+// allowed straight through, as is a permanent (non-retriable) resolution
+// failure the director could never clear by retrying.
 package pve
 
 import (
 	"context"
+	"errors"
 	"strings"
 
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
@@ -50,6 +54,13 @@ func isDestructiveDiskLock(lock string) bool {
 	return ok
 }
 
+// isRetriableCPIError reports whether err carries a *cpierrors.Error anywhere
+// in its chain whose type the BOSH Director may retry (ok_to_retry).
+func isRetriableCPIError(err error) bool {
+	var ce *cpierrors.Error
+	return errors.As(err, &ce) && ce.OkToRetry()
+}
+
 // readGuestLock returns the config lock string of the guest vmid on node.
 //
 //   - (lock, false, nil) — config read succeeded; lock is "" when unlocked.
@@ -75,11 +86,14 @@ func readGuestLock(ctx context.Context, c Client, node string, vmid int) (string
 //
 // It returns a TypeRetriableCloud error when the attached guest holds a
 // destructive/in-flight lock (so the BOSH Director re-drives delete_disk after
-// the operation completes), and nil in every other case — including when the
-// disk is attached to no VM, the guest is gone, the guest is unlocked, the lock
-// is a non-destructive value, or attachment could not be resolved. The guard is
-// intentionally best-effort: it adds safety when it can conclude and never
-// blocks a delete when it cannot.
+// the operation completes), and also when holder resolution or the lock read
+// fails TRANSIENTLY — an unresolved holder state must defer the delete, not
+// wave it through. It returns nil for every permanent outcome: the disk is
+// attached to no VM, the guest is gone, the guest is unlocked, the lock is a
+// non-destructive value, or resolution failed with a non-retriable error the
+// director could never clear by retrying (the guard stays best-effort there
+// rather than converting a permanent guard fault into a permanent delete
+// failure).
 //
 // fallbackNode is the configured default node, used by FindVMByDiskVolid only
 // for cluster rows that omit the node field (rare in modern PVE).
@@ -89,18 +103,34 @@ func GuardDiskDeleteState(ctx context.Context, c Client, fallbackNode, volid str
 	}
 
 	// Resolve the VM the disk is CURRENTLY ATTACHED to by scanning VM configs
-	// for the volid. An error here means the disk is attached to no VM (the
-	// normal pre-delete state) or that resolution failed (best-effort): either
-	// way there is no in-flight guest to guard against, so allow the delete.
+	// for the volid. A retriable error means the scan hit a transient fault
+	// and the holder state is unknown — defer the delete rather than risk
+	// pulling a disk out from under an in-flight operation. A non-retriable
+	// error means the disk is attached to no VM (the normal pre-delete state)
+	// or resolution failed permanently: no in-flight guest to guard against,
+	// so allow the delete.
 	vmid, node, err := FindVMByDiskVolid(ctx, c, fallbackNode, volid)
 	if err != nil {
+		if isRetriableCPIError(err) {
+			return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
+				"delete_disk: could not resolve disk holder; deferring delete")
+		}
 		return nil
 	}
 
 	lock, gone, lockErr := readGuestLock(ctx, c, node, vmid)
-	if lockErr != nil || gone {
-		// Config read failed (fail open) or the guest vanished mid-check
-		// (idempotent): allow the delete to proceed.
+	if lockErr != nil {
+		// readGuestLock returns the raw SDK error; classify it. Transient
+		// faults defer the delete (the holder's lock state is unknown);
+		// permanent read failures keep the guard best-effort and fail open.
+		if wrapped := WrapError(lockErr); isRetriableCPIError(wrapped) {
+			return cpierrors.WrapAs(wrapped, cpierrors.TypeRetriableCloud,
+				"delete_disk: could not read holder lock state; deferring delete")
+		}
+		return nil
+	}
+	if gone {
+		// Guest vanished mid-check: delete is idempotent, allow it.
 		return nil
 	}
 

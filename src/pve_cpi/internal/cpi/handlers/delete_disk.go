@@ -80,13 +80,15 @@ func HandleDeleteDisk(deps Deps) Handler {
 		// 3b. Optional pre-delete attached-VM lock guard. When enabled, defer
 		//     the delete if the VM this volume is attached to is mid-backup/
 		//     clone/migrate/snapshot/rollback/create, so the imgdel does not
-		//     race a destructive operation. Best-effort: fails open on any
-		//     resolution uncertainty (see pve.GuardDiskDeleteState). A disk
-		//     attached to no VM passes straight through. Off → no extra calls.
+		//     race a destructive operation. Also defers (retriable) when the
+		//     holder or its lock state cannot be resolved transiently; fails
+		//     open only on permanent resolution failures (see
+		//     pve.GuardDiskDeleteState). A disk attached to no VM passes
+		//     straight through. Off → no extra calls.
 		// ----------------------------------------------------------------
 		if deps.Config.DiskDeleteStateGuardEnabled() {
 			if guardErr := pve.GuardDiskDeleteState(ctx, deps.PVE, node, bareDiskCID); guardErr != nil {
-				deps.Logger.Info("delete_disk: deferring delete, attached VM is busy",
+				deps.Logger.Info("delete_disk: deferring delete, attached VM busy or holder state unresolved",
 					log.String("disk_cid", diskCID),
 				)
 				return nil, cpierrors.Wrap(guardErr, "delete_disk")
