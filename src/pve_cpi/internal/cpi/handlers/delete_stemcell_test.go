@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"testing"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
@@ -68,11 +69,11 @@ func buildDeleteStemcellDeps(storageSvc sdkstorage.Service) handlers.Deps {
 	}
 }
 
-// buildDeleteStemcellDepsWithNodes constructs Deps for delete_stemcell tests
-// that need a customised nodes mock (e.g. template destroy path).
-func buildDeleteStemcellDepsWithNodes(nodesSvc *stemcellMockNodes, cfg *config.CPIConfig) handlers.Deps {
+// buildDeleteStemcellDepsWithQemuAndNodes constructs Deps with both a custom QEMU
+// mock (for Config reads used by the refs gate) and a custom nodes mock.
+func buildDeleteStemcellDepsWithQemuAndNodes(qemuSvc *stemcellMockQEMU, nodesSvc *stemcellMockNodes, cfg *config.CPIConfig) handlers.Deps {
 	client := &stemcellMockClient{
-		qemuSvc:    &stemcellMockQEMU{},
+		qemuSvc:    qemuSvc,
 		nodesSvc:   nodesSvc,
 		tasksSvc:   &stemcellMockTasks{},
 		clusterSvc: &stemcellMockCluster{},
@@ -85,15 +86,38 @@ func buildDeleteStemcellDepsWithNodes(nodesSvc *stemcellMockNodes, cfg *config.C
 	}
 }
 
+// stemcellRefsDesc builds a description JSON string with the given stemcell_refs
+// CSV so QEMU.Config mocks can return a realistic template description for the
+// refs-gate in delete_stemcell.
+func stemcellRefsDesc(refs ...string) map[string]any {
+	joined := strings.Join(refs, ",")
+	desc := fmt.Sprintf(`{"name":"test","version":"1.0","sha8":"ab12ef34","created":"2026-06-12T00:00:00Z","stemcell_refs":%q}`, joined)
+	return map[string]any{"description": desc}
+}
+
 // defaultTemplateDeps returns Deps configured for template CID tests.
-// nodesSvc.deleteQemuFn is wired by the caller.
+// nodesSvc.deleteQemuFn is wired by the caller. The QEMU Config mock returns
+// a description with stemcell_refs = the template CID so the refs gate allows
+// destruction (simulating a normally-created template).
 func defaultTemplateDeps(nodesSvc *stemcellMockNodes) handlers.Deps {
-	return buildDeleteStemcellDepsWithNodes(nodesSvc, &config.CPIConfig{
+	return defaultTemplateDepsForCID(nodesSvc, "template:6042")
+}
+
+// defaultTemplateDepsForCID is like defaultTemplateDeps but uses a specific CID
+// to populate the stemcell_refs in the description returned by QEMU.Config.
+func defaultTemplateDepsForCID(nodesSvc *stemcellMockNodes, cid string) handlers.Deps {
+	cfg := &config.CPIConfig{
 		Node:            vmNode,
 		StemcellStorage: "local",
 		VMStorage:       "local",
 		DiskStorage:     "local",
-	})
+	}
+	qemuSvc := &stemcellMockQEMU{
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return stemcellRefsDesc(cid), nil
+		},
+	}
+	return buildDeleteStemcellDepsWithQemuAndNodes(qemuSvc, nodesSvc, cfg)
 }
 
 // validStemcellCID returns a well-formed stemcell CID for use in tests.
@@ -541,7 +565,15 @@ func TestDeleteStemcell_TemplateCID_NodeFromStemcellTemplateNode(t *testing.T) {
 		VMStorage:            "local",
 		DiskStorage:          "local",
 	}
-	deps := buildDeleteStemcellDepsWithNodes(nodesSvc, cfg)
+	deps := buildDeleteStemcellDepsWithQemuAndNodes(
+		&stemcellMockQEMU{
+			configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+				return stemcellRefsDesc("template:7001"), nil
+			},
+		},
+		nodesSvc,
+		cfg,
+	)
 	h := handlers.HandleDeleteStemcell(deps)
 
 	args := []json.RawMessage{marshalArg(t, "template:7001")}
@@ -689,14 +721,21 @@ func TestDeleteStemcell_LightCID_Regression_TemplateRouteNotTriggered(t *testing
 // ============================================================
 
 // buildDeleteStemcellDepsWithCluster constructs Deps for sha-sweep and
-// orphan-prune tests that need a wired cluster mock.
+// orphan-prune tests that need a wired cluster mock. The QEMU Config mock
+// returns a description with stemcell_refs computed from the queried VMID, so
+// the refs gate in delete_stemcell allows destruction for any template VMID.
 func buildDeleteStemcellDepsWithCluster(
 	nodesSvc *stemcellMockNodes,
 	clusterSvc *stemcellMockCluster,
 	cfg *config.CPIConfig,
 ) handlers.Deps {
+	qemuSvc := &stemcellMockQEMU{
+		configFn: func(_ context.Context, _ string, vmid int) (map[string]any, error) {
+			return stemcellRefsDesc(fmt.Sprintf("template:%d", vmid)), nil
+		},
+	}
 	client := &stemcellMockClient{
-		qemuSvc:    &stemcellMockQEMU{},
+		qemuSvc:    qemuSvc,
 		nodesSvc:   nodesSvc,
 		tasksSvc:   &stemcellMockTasks{},
 		clusterSvc: clusterSvc,
@@ -1174,3 +1213,219 @@ var _ *sdkcluster.ListResourcesParams
 
 // Ensure sdkerrors import is used even if other test variants are skipped.
 var _ = sdkerrors.APIError{}
+
+// ============================================================
+// Tests: §7.48 stemcell reference counting (delete_stemcell)
+// ============================================================
+
+// TestDeleteStemcell_Refs_LastRef_Destroys verifies that when the deleted CID
+// is the last entry in stemcell_refs, the template is destroyed.
+func TestDeleteStemcell_Refs_LastRef_Destroys(t *testing.T) {
+	t.Parallel()
+
+	const vmid = int64(6042)
+	cid := fmt.Sprintf("template:%d", vmid)
+
+	var deleteQemuCalled bool
+	var capturedUpdateDesc string
+	nodesSvc := &stemcellMockNodes{
+		updateConfigFn: func(_ context.Context, _, _ string, params *sdknodes.UpdateQemuConfigParams) error {
+			if params != nil && params.Description != nil {
+				capturedUpdateDesc = *params.Description
+			}
+			return nil
+		},
+		deleteQemuFn: func(_ context.Context, _, _ string, _ *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
+			deleteQemuCalled = true
+			resp := sdknodes.DeleteQemuResponse(`""`)
+			return &resp, nil
+		},
+	}
+	// QEMU.Config returns a description with refs = [cid] (the only ref).
+	qemuSvc := &stemcellMockQEMU{
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return stemcellRefsDesc(cid), nil
+		},
+	}
+
+	deps := buildDeleteStemcellDepsWithQemuAndNodes(qemuSvc, nodesSvc,
+		&config.CPIConfig{Node: vmNode, StemcellStorage: "local", VMStorage: "local", DiskStorage: "local"})
+	h := handlers.HandleDeleteStemcell(deps)
+
+	args := []json.RawMessage{marshalArg(t, cid)}
+	_, err := h.Handle(context.Background(), args, jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !deleteQemuCalled {
+		t.Error("expected template to be destroyed when last ref is removed")
+	}
+	// The updated description written before destroy must have empty stemcell_refs.
+	if strings.Contains(capturedUpdateDesc, cid) {
+		t.Errorf("updated description still contains %q after last-ref removal: %s", cid, capturedUpdateDesc)
+	}
+}
+
+// TestDeleteStemcell_Refs_RefsRemain_NoDestroy verifies that when other CID refs
+// remain after removing the deleted CID, the template is NOT destroyed.
+func TestDeleteStemcell_Refs_RefsRemain_NoDestroy(t *testing.T) {
+	t.Parallel()
+
+	const vmid = int64(6042)
+	cid := fmt.Sprintf("template:%d", vmid)
+	otherCID := "template:6043"
+
+	var deleteQemuCalled bool
+	var capturedUpdateDesc string
+	nodesSvc := &stemcellMockNodes{
+		updateConfigFn: func(_ context.Context, _, _ string, params *sdknodes.UpdateQemuConfigParams) error {
+			if params != nil && params.Description != nil {
+				capturedUpdateDesc = *params.Description
+			}
+			return nil
+		},
+		deleteQemuFn: func(_ context.Context, _, _ string, _ *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
+			deleteQemuCalled = true
+			resp := sdknodes.DeleteQemuResponse(`""`)
+			return &resp, nil
+		},
+	}
+	// QEMU.Config returns a description with refs = [cid, otherCID].
+	qemuSvc := &stemcellMockQEMU{
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return stemcellRefsDesc(cid, otherCID), nil
+		},
+	}
+
+	deps := buildDeleteStemcellDepsWithQemuAndNodes(qemuSvc, nodesSvc,
+		&config.CPIConfig{Node: vmNode, StemcellStorage: "local", VMStorage: "local", DiskStorage: "local"})
+	h := handlers.HandleDeleteStemcell(deps)
+
+	args := []json.RawMessage{marshalArg(t, cid)}
+	_, err := h.Handle(context.Background(), args, jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if deleteQemuCalled {
+		t.Error("template must NOT be destroyed when refs remain after removal")
+	}
+	// Updated description must still contain otherCID.
+	if !strings.Contains(capturedUpdateDesc, otherCID) {
+		t.Errorf("updated description %q must contain remaining ref %q", capturedUpdateDesc, otherCID)
+	}
+}
+
+// TestDeleteStemcell_Refs_MissingRefs_Conservative verifies that when the
+// template description contains no parseable stemcell_refs, the template is
+// NOT destroyed (conservative rule: unknown state → do not destroy).
+func TestDeleteStemcell_Refs_MissingRefs_Conservative(t *testing.T) {
+	t.Parallel()
+
+	const vmid = int64(6042)
+	cid := fmt.Sprintf("template:%d", vmid)
+
+	var deleteQemuCalled bool
+	nodesSvc := &stemcellMockNodes{
+		deleteQemuFn: func(_ context.Context, _, _ string, _ *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
+			deleteQemuCalled = true
+			resp := sdknodes.DeleteQemuResponse(`""`)
+			return &resp, nil
+		},
+	}
+	// QEMU.Config returns a description with no JSON (pre-7.48 template).
+	qemuSvc := &stemcellMockQEMU{
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return map[string]any{"description": "director: cf\ndeployment: prod\n"}, nil
+		},
+	}
+
+	deps := buildDeleteStemcellDepsWithQemuAndNodes(qemuSvc, nodesSvc,
+		&config.CPIConfig{Node: vmNode, StemcellStorage: "local", VMStorage: "local", DiskStorage: "local"})
+	h := handlers.HandleDeleteStemcell(deps)
+
+	args := []json.RawMessage{marshalArg(t, cid)}
+	_, err := h.Handle(context.Background(), args, jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if deleteQemuCalled {
+		t.Error("template must NOT be destroyed when stemcell_refs is missing (conservative rule)")
+	}
+}
+
+// TestDeleteStemcell_Refs_EmptyRefs_Conservative verifies that when
+// stemcell_refs exists but is empty, the template is NOT destroyed.
+func TestDeleteStemcell_Refs_EmptyRefs_Conservative(t *testing.T) {
+	t.Parallel()
+
+	const vmid = int64(6042)
+	cid := fmt.Sprintf("template:%d", vmid)
+
+	var deleteQemuCalled bool
+	nodesSvc := &stemcellMockNodes{
+		deleteQemuFn: func(_ context.Context, _, _ string, _ *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
+			deleteQemuCalled = true
+			resp := sdknodes.DeleteQemuResponse(`""`)
+			return &resp, nil
+		},
+	}
+	// QEMU.Config returns valid JSON with an explicitly empty stemcell_refs.
+	qemuSvc := &stemcellMockQEMU{
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			desc := `{"name":"test","version":"1.0","sha8":"ab12ef34","created":"2026-06-12T00:00:00Z","stemcell_refs":""}`
+			return map[string]any{"description": desc}, nil
+		},
+	}
+
+	deps := buildDeleteStemcellDepsWithQemuAndNodes(qemuSvc, nodesSvc,
+		&config.CPIConfig{Node: vmNode, StemcellStorage: "local", VMStorage: "local", DiskStorage: "local"})
+	h := handlers.HandleDeleteStemcell(deps)
+
+	args := []json.RawMessage{marshalArg(t, cid)}
+	_, err := h.Handle(context.Background(), args, jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if deleteQemuCalled {
+		t.Error("template must NOT be destroyed when stemcell_refs is empty (conservative rule)")
+	}
+}
+
+// TestDeleteStemcell_Refs_Idempotent_CIDNotInRefs verifies that if the CID
+// being deleted is not in the refs list (already removed or never added), the
+// handler behaves conservatively — refs remain non-empty, no destroy.
+func TestDeleteStemcell_Refs_Idempotent_CIDNotInRefs(t *testing.T) {
+	t.Parallel()
+
+	const vmid = int64(6042)
+	cid := fmt.Sprintf("template:%d", vmid)
+	otherCID := "template:6099"
+
+	var deleteQemuCalled bool
+	nodesSvc := &stemcellMockNodes{
+		deleteQemuFn: func(_ context.Context, _, _ string, _ *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
+			deleteQemuCalled = true
+			resp := sdknodes.DeleteQemuResponse(`""`)
+			return &resp, nil
+		},
+	}
+	// QEMU.Config returns refs with only otherCID — cid is NOT present.
+	qemuSvc := &stemcellMockQEMU{
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return stemcellRefsDesc(otherCID), nil
+		},
+	}
+
+	deps := buildDeleteStemcellDepsWithQemuAndNodes(qemuSvc, nodesSvc,
+		&config.CPIConfig{Node: vmNode, StemcellStorage: "local", VMStorage: "local", DiskStorage: "local"})
+	h := handlers.HandleDeleteStemcell(deps)
+
+	args := []json.RawMessage{marshalArg(t, cid)}
+	_, err := h.Handle(context.Background(), args, jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if deleteQemuCalled {
+		t.Error("template must NOT be destroyed when CID is not in refs (other refs remain)")
+	}
+}

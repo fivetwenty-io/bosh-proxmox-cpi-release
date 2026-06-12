@@ -311,8 +311,9 @@ func (c *wbMockCluster) ListResources(_ context.Context, _ *sdkcluster.ListResou
 
 type wbMockNodes struct {
 	sdknodes.Service
-	listStorageFn func(_ context.Context, _, _ string, _ *sdknodes.ListStorageContentParams) (*sdknodes.ListStorageContentResponse, error)
-	listQemuFn    func(ctx context.Context, node string, params *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error)
+	listStorageFn    func(_ context.Context, _, _ string, _ *sdknodes.ListStorageContentParams) (*sdknodes.ListStorageContentResponse, error)
+	listQemuFn       func(ctx context.Context, node string, params *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error)
+	updateConfigFn   func(ctx context.Context, node, vmid string, params *sdknodes.UpdateQemuConfigParams) error
 }
 
 func (n *wbMockNodes) ListStorageContent(ctx context.Context, node, storage string, params *sdknodes.ListStorageContentParams) (*sdknodes.ListStorageContentResponse, error) {
@@ -330,6 +331,15 @@ func (n *wbMockNodes) ListQemu(ctx context.Context, node string, params *sdknode
 	// Default: no existing templates → ensureTemplateVM proceeds to create.
 	empty := sdknodes.ListQemuResponse{}
 	return &empty, nil
+}
+
+// UpdateQemuConfig is called by registerStemcellRef when ensureTemplateVM
+// reuses an existing template. Default is a no-op success.
+func (n *wbMockNodes) UpdateQemuConfig(ctx context.Context, node, vmid string, params *sdknodes.UpdateQemuConfigParams) error {
+	if n.updateConfigFn != nil {
+		return n.updateConfigFn(ctx, node, vmid, params)
+	}
+	return nil
 }
 
 type wbMockStorage struct {
@@ -575,10 +585,12 @@ func TestOpenStagedFile_StagingDir_NonExistentFile(t *testing.T) {
 // ============================================================
 
 // wbMockQEMU is a minimal sdkqemu.Service stub for ensureTemplateVM tests.
-// createFn controls Create; all other methods panic on accidental call.
+// createFn controls Create; configFn controls Config (used by registerStemcellRef
+// when ensureTemplateVM reuses an existing template). All other methods panic.
 type wbMockQEMU struct {
 	sdkqemu.Service
 	createFn func(ctx context.Context, node string, params map[string]any) (string, error)
+	configFn func(ctx context.Context, node string, vmid int) (map[string]any, error)
 }
 
 func (q *wbMockQEMU) Create(ctx context.Context, node string, params map[string]any) (string, error) {
@@ -587,6 +599,16 @@ func (q *wbMockQEMU) Create(ctx context.Context, node string, params map[string]
 	}
 	// Default: synchronous success, no UPID.
 	return "", nil
+}
+
+// Config returns an empty map by default so registerStemcellRef (best-effort)
+// can proceed without panicking. Tests that want specific provenance data can
+// set configFn.
+func (q *wbMockQEMU) Config(ctx context.Context, node string, vmid int) (map[string]any, error) {
+	if q.configFn != nil {
+		return q.configFn(ctx, node, vmid)
+	}
+	return map[string]any{}, nil
 }
 
 // wbMockTasks is a minimal sdktasks.Service stub for ensureTemplateVM tests.
@@ -1460,9 +1482,26 @@ func TestAttemptCreateTemplateVM_ProvenanceOFF(t *testing.T) {
 		t.Errorf("tags = %q; want %q (byte-identical OFF path)", gotTags, wantTagsOFF)
 	}
 
-	// description must be absent when provenance is off.
-	if _, hasDesc := got.params["description"]; hasDesc {
-		t.Errorf("description key must not be present when provenance is OFF; got %q", got.params["description"])
+	// When provenance is OFF, description is written as a minimal JSON object
+	// containing only stemcell_refs (for reference counting). Verify it is valid
+	// JSON and contains only the refs field — no name/version/sha8/source/director.
+	descRaw, hasDesc := got.params["description"].(string)
+	if !hasDesc || descRaw == "" {
+		t.Fatal("description must be present (minimal refs JSON) even when provenance is OFF")
+	}
+	var prov stemcellProvenance
+	if err := json.Unmarshal([]byte(descRaw), &prov); err != nil {
+		t.Fatalf("description is not valid JSON when provenance OFF: %v — raw: %q", err, descRaw)
+	}
+	if prov.StemcellRefs == "" {
+		t.Error("stemcell_refs must be non-empty in minimal description when provenance is OFF")
+	}
+	// Full provenance fields must NOT be set when provenance is OFF.
+	if prov.Name != "" {
+		t.Errorf("name must be empty in minimal description (provenance OFF); got %q", prov.Name)
+	}
+	if prov.DirectorID != "" {
+		t.Errorf("director_id must be empty in minimal description (provenance OFF); got %q", prov.DirectorID)
 	}
 }
 
@@ -1567,8 +1606,18 @@ func TestAttemptCreateTemplateVM_ReplicaProvenanceOFF(t *testing.T) {
 	if gotTags != wantTags {
 		t.Errorf("replica OFF tags = %q; want %q (byte-identical combinedTags)", gotTags, wantTags)
 	}
-	if _, hasDesc := got.params["description"]; hasDesc {
-		t.Error("description must not be present when provenance is OFF")
+	// Replica provenance OFF: description is the minimal refs JSON, same as
+	// primary provenance OFF path (stemcell_refs only, no full provenance fields).
+	descRaw, hasDesc := got.params["description"].(string)
+	if !hasDesc || descRaw == "" {
+		t.Fatal("description must be present (minimal refs JSON) even when provenance is OFF")
+	}
+	var provOFF stemcellProvenance
+	if err := json.Unmarshal([]byte(descRaw), &provOFF); err != nil {
+		t.Fatalf("description is not valid JSON when replica provenance OFF: %v — raw: %q", err, descRaw)
+	}
+	if provOFF.StemcellRefs == "" {
+		t.Error("stemcell_refs must be non-empty in replica minimal description")
 	}
 }
 

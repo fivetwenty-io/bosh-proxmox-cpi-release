@@ -70,49 +70,7 @@ func HandleDeleteStemcell(deps Deps) cpi.Handler {
 		// by create_stemcell for ensureTemplateVM.
 		// ----------------------------------------------------------------
 		if pve.IsTemplateStemcellCID(cidStr) {
-			vmid, parseErr := pve.ParseTemplateStemcellCID(cidStr)
-			if parseErr != nil {
-				return nil, cpierrors.Cloud("delete_stemcell: invalid template stemcell CID %q: %s", cidStr, parseErr.Error())
-			}
-
-			node := deps.Config.StemcellTemplateNode
-			if node == "" {
-				node = deps.Config.Node
-			}
-			if node == "" {
-				return nil, cpierrors.Cloud("delete_stemcell: config.node must not be empty")
-			}
-
-			// Resolve sha8 from the primary BEFORE destroying it; the tag is
-			// unreadable once the VM is gone.
-			sha8 := resolveStemcellSHA8FromVMID(ctx, deps, node, vmid)
-
-			// Destroy the primary template VM.
-			if err := destroyTemplateVM(ctx, deps, node, vmid, cidStr); err != nil {
-				return nil, err
-			}
-
-			// Always sweep all cluster nodes for template VMs that carry the
-			// same sha8 tag. This subsumes the old StemcellReplicateLocal-gated
-			// replica-cleanup path: replicas carry the sha tag and will be found
-			// regardless of the replication-enabled flag. Best-effort: sweep
-			// failures are logged at Warn and never fail the delete.
-			if sha8 != "" {
-				sweepStemcellByShaTag(ctx, deps, sha8, cidStr)
-			} else {
-				deps.Logger.Warn("delete_stemcell: sha8 unresolvable before primary destroy; cross-node sweep skipped",
-					log.String("stemcell_cid", cidStr),
-				)
-			}
-
-			// Opt-in orphan prune: remove all stemcell templates tagged with
-			// this director's ID that are no longer linked. Best-effort; never
-			// fails delete_stemcell.
-			if deps.Config.StemcellOrphanPruneEnabled() {
-				pruneOrphanStemcellTemplates(ctx, deps, cidStr)
-			}
-
-			return nil, nil
+			return handleDeleteTemplateStemcellCID(ctx, deps, cidStr)
 		}
 
 		// ----------------------------------------------------------------
@@ -192,6 +150,65 @@ func HandleDeleteStemcell(deps Deps) cpi.Handler {
 		)
 		return nil, nil
 	})
+}
+
+// handleDeleteTemplateStemcellCID handles the "template:<vmid>" CID path:
+// parse the VMID, resolve the sha8 tag, decrement the stemcell ref count under
+// a per-VMID cluster lock, and destroy the template (plus cross-node replicas
+// via sha-tag sweep) only when this was the last reference.
+//
+// Conservative rule: if the template's stemcell_refs field is missing,
+// unparseable, or empty, the template is NOT destroyed. This prevents premature
+// deletion of pre-7.48 templates and templates where create_stemcell crashed
+// before writing refs.
+func handleDeleteTemplateStemcellCID(ctx context.Context, deps Deps, cidStr string) (any, error) {
+	vmid, parseErr := pve.ParseTemplateStemcellCID(cidStr)
+	if parseErr != nil {
+		return nil, cpierrors.Cloud("delete_stemcell: invalid template stemcell CID %q: %s", cidStr, parseErr.Error())
+	}
+
+	node := deps.Config.StemcellTemplateNode
+	if node == "" {
+		node = deps.Config.Node
+	}
+	if node == "" {
+		return nil, cpierrors.Cloud("delete_stemcell: config.node must not be empty")
+	}
+
+	// Resolve sha8 BEFORE destroy — the tag is unreadable once the VM is gone.
+	sha8 := resolveStemcellSHA8FromVMID(ctx, deps, node, vmid)
+
+	// Decrement refs and destroy (when last ref) under one per-VMID lock:
+	// holding the lock through DeleteQemu closes the window where a concurrent
+	// registerStemcellRef could append a CID between the RMW and the destroy.
+	destroyed, refErr := gatedDeregisterAndDestroyRef(ctx, deps, deps.Logger, node, vmid, cidStr)
+	if refErr != nil {
+		return nil, cpierrors.Wrap(pve.WrapError(refErr),
+			fmt.Sprintf("delete_stemcell: deregister ref for template VM %d node %q", vmid, node))
+	}
+	if !destroyed {
+		deps.Logger.Info("delete_stemcell: refs remain or are unknown (conservative); template preserved",
+			log.String("stemcell_cid", cidStr),
+			log.Int("vmid", int(vmid)),
+		)
+		return nil, nil
+	}
+
+	// Sweep cross-node replicas by sha tag. Best-effort.
+	if sha8 != "" {
+		sweepStemcellByShaTag(ctx, deps, sha8, cidStr)
+	} else {
+		deps.Logger.Warn("delete_stemcell: sha8 unresolvable before primary destroy; cross-node sweep skipped",
+			log.String("stemcell_cid", cidStr),
+		)
+	}
+
+	// Opt-in orphan prune. Best-effort.
+	if deps.Config.StemcellOrphanPruneEnabled() {
+		pruneOrphanStemcellTemplates(ctx, deps, cidStr)
+	}
+
+	return nil, nil
 }
 
 // sweepStemcellByShaTag lists all QEMU resources cluster-wide and destroys every

@@ -2203,7 +2203,7 @@ group, and group membership varies by hardware and BIOS, which makes reliable no
 harder than on vSphere. A passed-through device also pins the VM to a node and blocks live
 migration. Tier: deployment.
 
-#### 7.48 OPEN — Multi-reference stemcell deduplication
+#### 7.48 SHIPPED — Multi-reference stemcell deduplication
 
 *References: Azure.* The Azure CPI lets multiple BOSH stemcell CIDs share one gallery image
 version: a `stemcell_references` CSV tag tracks every CID, `create_stemcell` updates the tag
@@ -2222,6 +2222,25 @@ concurrency-safe path of §7.44.
 **Limits.** Reference counting introduces a shared mutable field across CPI processes, so it
 depends squarely on the §7.44 locking work to avoid a lost decrement that strands or
 prematurely deletes a template. Tier: operability.
+
+**Shipped:** `stemcell_refs` CSV field added to `stemcellProvenance` struct in template notes
+JSON. `create_stemcell` SHA-match and name-match reuse paths append the new CID (idempotent)
+under a per-VMID cluster lock (`withVMIDLock`) via `registerStemcellRef`. New templates write
+the initial CID in `stemcell_refs` at creation time, always — regardless of
+`stemcell_provenance_enabled`. `delete_stemcell` decrements via
+`gatedDeregisterAndDestroyRef`, which holds the per-VMID cluster lock through the destroy
+itself, so a concurrent `registerStemcellRef` cannot append a CID between the last-ref
+decrement and the `DeleteQemu` call; the template is destroyed only when refs become empty.
+Missing, empty, or unparseable refs are treated conservatively (template preserved) to avoid
+premature deletion of pre-refs templates; legacy templates created before refs existed are
+therefore never destroyed by `delete_stemcell` and are reclaimed instead via the opt-in
+director-scoped orphan prune of §7.13 (they carry the `bosh-stemcell` and `director--<id>`
+tags when provenance was enabled) or audited manually with `scripts/disk-audit`. The
+cross-node SHA-tag sweep destroys replicas without consulting their own `stemcell_refs`:
+replica refs are intentionally not maintained, and the sweep runs only after the primary
+template has passed the ref gate and been destroyed.
+`handleDeleteTemplateStemcellCID` extracted from `HandleDeleteStemcell` to keep cognitive
+complexity within the lint threshold.
 
 #### 7.49 OPEN — Disk-encryption config surface
 

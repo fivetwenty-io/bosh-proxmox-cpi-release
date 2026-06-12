@@ -624,6 +624,7 @@ func ensureTemplateVM(
 				log.String("sha8", shaTag8),
 				log.Int64(metadataKeyVMID, shaVMID),
 			)
+			registerStemcellRef(ctx, deps, logger, templateNode, shaVMID)
 			return shaVMID, nil
 		}
 	}
@@ -639,6 +640,7 @@ func ensureTemplateVM(
 			log.String("name", templateName),
 			log.Int64(metadataKeyVMID, existingVMID),
 		)
+		registerStemcellRef(ctx, deps, logger, templateNode, existingVMID)
 		return existingVMID, nil
 	}
 
@@ -902,11 +904,16 @@ func attemptCreateTemplateVM(
 		"tags":          strings.Join(baseTags, ";"),
 	}
 
+	// initialCID is the BOSH stemcell CID for this template ("template:<vmid>").
+	// Written into stemcell_refs so delete_stemcell can track reference counts.
+	// Computed here where the candidate VMID is known.
+	initialCID := pve.BuildTemplateStemcellCID(int64(candidate))
+
 	if deps.Config.StemcellProvenanceEnabled() {
 		// sha8 is derived from shaTag which is always the pure
 		// "bosh-stemcell-sha-<sha8>" tag; TrimPrefix is safe here.
 		sha8 := strings.TrimPrefix(shaTag, stemcellSHATagPrefix)
-		notes, notesErr := buildStemcellProvenanceNotes(cp, sha8, source, deps.Config.StemcellDirectorID(), time.Now().UTC())
+		notes, notesErr := buildStemcellProvenanceNotes(cp, sha8, source, deps.Config.StemcellDirectorID(), time.Now().UTC(), initialCID)
 		if notesErr != nil {
 			logger.Warn("attemptCreateTemplateVM: provenance notes build failed (skipping description)",
 				log.Err(notesErr),
@@ -916,6 +923,19 @@ func attemptCreateTemplateVM(
 		}
 		provTags := buildStemcellProvenanceTags(cp, deps.Config.StemcellDirectorID())
 		createParams["tags"] = mergeTagList(baseTags, provTags, maxTagLength)
+	} else {
+		// Even when full provenance is disabled, write a minimal notes JSON that
+		// records stemcell_refs so delete_stemcell can gate template destruction on
+		// reference count. This keeps byte-identical behaviour for all existing
+		// fields while adding the new ref-tracking capability.
+		minimalNotes, notesErr := json.Marshal(stemcellProvenance{StemcellRefs: initialCID})
+		if notesErr != nil {
+			logger.Warn("attemptCreateTemplateVM: minimal refs notes build failed (skipping description)",
+				log.Err(notesErr),
+			)
+		} else {
+			createParams["description"] = string(minimalNotes)
+		}
 	}
 
 	upid, cerr := deps.PVE.QEMU().Create(ctx, node, createParams)
