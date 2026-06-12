@@ -1206,6 +1206,16 @@ properties:
       (marker, name, version, and director tags). Provenance records assist
       orphan detection and audit. Default false (no behavior change).
 
+  pve.operator_id:
+    description: |
+      Optional operator identifier appended to the User-Agent header on all PVE
+      API requests as "pid-<value>". Use this to attribute CPI traffic in PVE
+      access logs when multiple BOSH directors share a single PVE cluster.
+      When unset (the default), the User-Agent is "BOSH-PVE-CPI/<version>"
+      with no suffix. The value passes through unmodified; avoid whitespace and
+      control characters, which may be interpreted differently by PVE log parsers.
+    default: ~
+
   pve.fast_path_delete:
     description: |
       When true, delete_vm and delete_disk issue the PVE destroy call and return

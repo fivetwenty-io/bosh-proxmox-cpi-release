@@ -2262,7 +2262,7 @@ default path allocates nothing.
 sink must be operator-provided. A single-shot per-RPC process cannot aggregate; it can only
 emit one sample per invocation, leaving rollup to the collector. Tier: hardening.
 
-#### 7.52 OPEN — Configurable User-Agent and operator tag on PVE API calls
+#### 7.52 SHIPPED — Configurable User-Agent and operator tag on PVE API calls
 
 *References: Google, Azure.* Google prepends a configurable `user_agent_prefix` to its
 `bosh-google-cpi/<version>` User-Agent for billing attribution and log filtering; Azure
@@ -2278,6 +2278,14 @@ the header for per-operator attribution.
 **Limits.** PVE does not bill on API usage as the public clouds do, so the value is confined
 to audit, throttle attribution, and log filtering rather than cost accounting. Tier:
 hardening.
+
+**Shipped:** `BOSH-PVE-CPI/<version>` User-Agent is set on all PVE API calls via
+`raw.SetHeader` at client construction in `internal/pve/client.go`. The version token uses
+`version.Short()` (ldflags-settable; defaults to `dev`). The optional `pve.operator_id`
+config key appends `pid-<value>` to the header for log attribution when multiple BOSH
+directors share a PVE cluster. When `operator_id` is unset, the header contains no trailing
+space — byte-identical to prior releases. Both the regular and upload request paths in the
+SDK call `applyCustomHeaders`, so one `SetHeader` call covers all API traffic.
 
 #### 7.53 OPEN — Resource-ownership tagging
 

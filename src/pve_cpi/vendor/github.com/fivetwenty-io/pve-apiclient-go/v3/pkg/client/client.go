@@ -1,3 +1,12 @@
+// LOCAL EDIT — §7.52 User-Agent header support.
+// SetHeader and RemoveHeader were added to the Client interface and implemented
+// on *client to allow the CPI to set a custom User-Agent at construction time.
+// These methods are absent from upstream v3.2.7. After any future `go mod vendor`
+// refresh this file must be re-patched:
+//   1. Add SetHeader(key, value string) and RemoveHeader(key string) to the Client interface.
+//   2. Add the *client forwarder methods at the end of the file.
+// The raw.SetHeader call in internal/pve/client.go:NewClient depends on this extension
+// and will fail to compile if the interface is reverted, so the patch will not be silently lost.
 package client
 
 import (
@@ -66,6 +75,12 @@ type Client interface {
 	InvalidateCache(pattern string) int
 	ClearCache()
 	CacheStats() *CacheStats
+
+	// Header control — SetHeader adds key/value to every outgoing request.
+	// RemoveHeader removes a previously set header. Both are safe for
+	// concurrent use and take effect on all subsequent calls.
+	SetHeader(key, value string)
+	RemoveHeader(key string)
 }
 
 // Response represents a response from the PVE API.
@@ -384,6 +399,16 @@ func (c *client) ClearCache() {
 // CacheStats returns current cache statistics.
 func (c *client) CacheStats() *CacheStats {
 	return c.httpClient.CacheStats()
+}
+
+// SetHeader adds key/value to every outgoing request. Safe for concurrent use.
+func (c *client) SetHeader(key, value string) {
+	c.httpClient.SetHeader(key, value)
+}
+
+// RemoveHeader removes a previously set custom header. Safe for concurrent use.
+func (c *client) RemoveHeader(key string) {
+	c.httpClient.RemoveHeader(key)
 }
 
 func (c *client) call(method, path string, params map[string]interface{}) (*Response, error) {

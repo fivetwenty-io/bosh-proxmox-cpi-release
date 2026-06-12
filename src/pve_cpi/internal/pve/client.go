@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
+	"github.com/fivetwenty-io/bosh-pve-cpi/internal/version"
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cloudinit"
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cluster"
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/clusterstorage"
@@ -182,6 +183,22 @@ func isPoolNotFound(err error) bool {
 	return false
 }
 
+// buildUserAgent returns the User-Agent string for all PVE API requests.
+// Format: "BOSH-PVE-CPI/<version>" with an optional " pid-<operator_id>"
+// suffix when cfg.OperatorID is non-empty.
+//
+// version.Short() is used (not version.String()) to avoid embedding commit SHA
+// and build-date noise into the header. When OperatorID is empty the result
+// contains no trailing space — byte-identical to any prior release that did not
+// set a User-Agent.
+func buildUserAgent(cfg *config.CPIConfig) string {
+	ua := "BOSH-PVE-CPI/" + version.Short()
+	if cfg.OperatorID != "" {
+		ua += " pid-" + cfg.OperatorID
+	}
+	return ua
+}
+
 // buildTransportOpts constructs the base sdkclient.Options from cfg, setting
 // only connection, timeout, and transport-tuning fields. Auth and SSL fields
 // are filled in by NewClient after this call. Extracted as a seam for unit
@@ -300,6 +317,14 @@ func NewClient(cfg *config.CPIConfig, logger *log.Logger) (Client, error) {
 	if err != nil {
 		return nil, cpierrors.Wrap(err, "pve client init")
 	}
+	// Set User-Agent on every outgoing PVE API request. The SDK's
+	// applyCustomHeaders runs after standard headers, so SetHeader overrides
+	// the SDK default "pve-apiclient-go/1.0". Both request paths (regular and
+	// upload) call applyCustomHeaders, so a single SetHeader covers all calls.
+	// NOTE: SetHeader is a LOCAL EDIT to vendor/github.com/fivetwenty-io/
+	// pve-apiclient-go/v3/pkg/client/client.go (upstream v3.2.7 lacks it).
+	// After go mod vendor, re-apply the patch documented at the top of that file.
+	raw.SetHeader("User-Agent", buildUserAgent(cfg))
 
 	return &sdkClient{
 		qemuSvc:           qemu.New(raw),

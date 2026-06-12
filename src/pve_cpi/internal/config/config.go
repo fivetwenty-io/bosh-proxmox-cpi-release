@@ -93,6 +93,13 @@ type CPIConfig struct {
 	// RegistryCACertPEM / registry.ca_cert.
 	PVECACertPEM string `json:"pve_ca_cert,omitempty"`
 
+	// OperatorID is an optional label appended to the User-Agent header on all
+	// PVE API requests as "pid-<value>". Use it to attribute CPI traffic in PVE
+	// access logs when multiple BOSH directors share a single PVE cluster.
+	// When empty (the default), the User-Agent is "BOSH-PVE-CPI/<version>"
+	// with no suffix — byte-identical to prior releases.
+	OperatorID string `json:"operator_id,omitempty"`
+
 	// Agent
 	AgentMode    string `json:"agent_mode"`
 	VMDiskFormat string `json:"vm_disk_format,omitempty"`

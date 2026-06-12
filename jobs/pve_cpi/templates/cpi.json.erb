@@ -600,5 +600,10 @@
   # omitting it preserves byte-identical behavior on existing deployments.
   if_p("pve.fast_path_delete") { |v| config["fast_path_delete"] = v }
 
+  # Emit operator_id only when the operator sets a non-empty value. When absent
+  # the User-Agent defaults to "BOSH-PVE-CPI/<version>" with no suffix —
+  # byte-identical to any prior release that did not configure operator_id.
+  if_p("pve.operator_id") { |v| config["operator_id"] = v unless v.to_s.empty? }
+
   JSON.dump(config)
 %>
