@@ -2052,32 +2052,36 @@ is byte-identical to prior releases. Emitted from the ERB only when explicitly t
 
 ### Newly identified gaps (2026-06-05 round)
 
-These fifteen entries record capabilities the reference CPIs ship and PVE does not, drawn
-from a fresh six-CPI survey. Each is OPEN: a candidate for future work, not a commitment.
-The order follows descending PVE relevance, and each carries a one-line tier hint.
+These fifteen entries record capabilities the reference CPIs ship, drawn from a fresh
+six-CPI survey. All but 7.42 (later found already implemented) are OPEN: candidates for
+future work, not commitments. The order follows descending PVE relevance, and each
+carries a one-line tier hint.
 
-#### 7.42 OPEN — Human-readable VM naming
+#### 7.42 SHIPPED — Human-readable VM naming
 
 *References: vSphere, OpenStack-Go, Ruby-OpenStack.* The vSphere CPI offers an opt-in
 `enable_human_readable_name` that derives a VM name from the BOSH environment — instance
 group, deployment, and a UUID suffix, trimmed to a length limit and proportionally
 truncated, falling back to the bare UUID when metadata is absent or non-ASCII. On a PVE
 cluster the VM identity is a numeric VMID, and the operator-facing `name` field is purely
-cosmetic, so a BOSH-managed lab shows rows of indistinguishable VMIDs in the web UI.
-Setting a descriptive `name` makes the inventory legible without changing how the CPI
-addresses the VM.
+cosmetic, so without a descriptive `name` a BOSH-managed lab shows rows of
+indistinguishable VMIDs in the web UI.
 
-**Build:** read the job and deployment from the `set_vm_metadata` environment (the CPI
-already receives these) and write the QEMU `name` field through the standard config
-endpoint — `pvesh set /nodes/{node}/qemu/{vmid}/config` with `name=`. Compose the name as
-`{instance_group}-{deployment}-{short-vmid}` and sanitize it to the PVE-permitted character
-set. Gate the whole feature behind an opt-in flag so existing deployments stay
-byte-identical.
+**Status.** This capability predates the 2026-06-05 survey round; the original OPEN
+classification was an error. `set_vm_metadata`
+(`internal/cpi/handlers/set_vm_metadata.go`, `buildVMName`) stamps the QEMU `name` field
+as `<prefix>-<deployment>-<job>-<index>` (e.g. `cpi-cf-api-0`), where the prefix is the
+optional `pve.vm_prefix` job property; empty prefix or deployment segments are dropped.
+When job or index is missing it falls back to sanitizing the full BOSH instance name
+(`<job>/<id>`), and when no source yields a usable DNS label the existing PVE name is
+left untouched. Names are sanitized to PVE's DNS-label character set and length cap.
 
-**Limits.** PVE's `name` field is a DNS-style label with a restricted character set and
-length; non-conforming names must be sanitized or the call rejects them. The name is
-display-only and carries no addressing semantics, so it must never feed lookup or
-correlation logic. Tier: operability.
+**Deltas vs the vSphere reference.** Naming is always-on rather than gated behind an
+opt-in flag (the fallback chain makes it safe by construction), and it lands at
+`set_vm_metadata` time rather than `create_vm` time, so a VM briefly shows its bare VMID
+between creation and the director's first metadata sync. The name is display-only and
+carries no addressing semantics; no CPI lookup or correlation logic reads it. Tier:
+operability.
 
 #### 7.43 OPEN — Capability-based VM sizing (`vm_resources` / `calculate_vm_cloud_properties`)
 
