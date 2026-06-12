@@ -353,10 +353,10 @@ func TestStorageTierEncrypted_EphemeralEncryptedTierSelected(t *testing.T) {
 	cs := &multiClusterStorage{entries: encryptedCSEntries()}
 
 	cfg := &config.CPIConfig{
-		Node:          vmNode,
-		VMStorage:     "plain-pool",
-		NetworkBridge: "vmbr0",
-		AgentMode:     "noagent",
+		Node:           vmNode,
+		VMStorage:      "plain-pool",
+		NetworkBridge:  "vmbr0",
+		AgentMode:      "noagent",
 		VMIDRangeStart: 100,
 		StorageTiers: map[string]config.StorageTierCriteria{
 			"enc-tier": {Types: []string{"rbd"}, Encrypted: boolPtr(true)},
@@ -597,10 +597,10 @@ func TestStorageTierEncrypted_EphemeralExplicitPoolContradictsEncrypted(t *testi
 
 	cs := &multiClusterStorage{entries: encryptedCSEntries()}
 	cfg := &config.CPIConfig{
-		Node:          vmNode,
-		VMStorage:     "plain-pool",
-		NetworkBridge: "vmbr0",
-		AgentMode:     "noagent",
+		Node:           vmNode,
+		VMStorage:      "plain-pool",
+		NetworkBridge:  "vmbr0",
+		AgentMode:      "noagent",
 		VMIDRangeStart: 100,
 		StorageTiers: map[string]config.StorageTierCriteria{
 			"enc-tier": {Types: []string{"rbd"}, Encrypted: boolPtr(true)},
@@ -672,10 +672,10 @@ func TestStorageTierEncrypted_EphemeralAutoSelectNoTierNamed(t *testing.T) {
 
 	cs := &multiClusterStorage{entries: encryptedCSEntries()}
 	cfg := &config.CPIConfig{
-		Node:          vmNode,
-		VMStorage:     "plain-pool",
-		NetworkBridge: "vmbr0",
-		AgentMode:     "noagent",
+		Node:           vmNode,
+		VMStorage:      "plain-pool",
+		NetworkBridge:  "vmbr0",
+		AgentMode:      "noagent",
 		VMIDRangeStart: 100,
 		StorageTiers: map[string]config.StorageTierCriteria{
 			"enc-tier": {Types: []string{"rbd"}, Encrypted: boolPtr(true)},

@@ -9,8 +9,8 @@ import (
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
-	sdkcluster "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cluster"
 	sdkcloudinit "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cloudinit"
+	sdkcluster "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cluster"
 	sdkclusterstorage "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/clusterstorage"
 	sdknodes "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/nodes"
 	sdkqemu "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/qemu"
@@ -25,7 +25,7 @@ import (
 // pciNodesStub is a minimal nodes.Service stub that overrides only the methods
 // exercised by PCI passthrough helpers.
 type pciNodesStub struct {
-	sdknodes.Service // nil embed — panics on any other method call
+	sdknodes.Service   // nil embed — panics on any other method call
 	updateQemuConfigFn func(ctx context.Context, node string, vmid string, params *sdknodes.UpdateQemuConfigParams) error
 	listHardwarePciFn  func(ctx context.Context, node string, params *sdknodes.ListHardwarePciParams) (*sdknodes.ListHardwarePciResponse, error)
 }

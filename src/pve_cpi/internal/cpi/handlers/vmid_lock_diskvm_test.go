@@ -12,9 +12,9 @@ import (
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
+	sdkcloudinit "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cloudinit"
 	sdkclusterapi "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cluster"
 	sdkclusterstorage "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/clusterstorage"
-	sdkcloudinit "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cloudinit"
 	sdknodes "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/nodes"
 	sdkqemu "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/qemu"
 	sdkstorage "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/storage"
@@ -48,7 +48,7 @@ func (c *lockTestPVEClient) ClusterStorage() sdkclusterstorage.Service { return 
 // ldmQEMU is a minimal qemu.Service for lock tests; records Config calls.
 type ldmQEMU struct {
 	sdkqemu.Service
-	diskCID  string   // returned as scsi0 in Config
+	diskCID  string // returned as scsi0 in Config
 	events   *[]string
 	configFn func(ctx context.Context, node string, vmid int) (map[string]any, error)
 	stopFn   func(ctx context.Context, node string, vmid int) (string, error)

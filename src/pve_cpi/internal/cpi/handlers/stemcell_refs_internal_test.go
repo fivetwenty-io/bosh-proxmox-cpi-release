@@ -9,9 +9,9 @@ import (
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
+	sdkcloudinit "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cloudinit"
 	sdkcluster "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cluster"
 	sdkclusterstorage "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/clusterstorage"
-	sdkcloudinit "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cloudinit"
 	sdknodes "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/nodes"
 	sdkqemu "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/qemu"
 	sdkstorage "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/storage"
@@ -77,13 +77,13 @@ type refsClient struct {
 	p          *refsPoolSvc
 }
 
-func (c *refsClient) QEMU() sdkqemu.Service           { return c.q }
-func (c *refsClient) Nodes() sdknodes.Service         { return c.n }
-func (c *refsClient) Pools() pve.PoolService          { return c.p }
-func (c *refsClient) Storage() sdkstorage.Service     { return nil }
-func (c *refsClient) CloudInit() sdkcloudinit.Service  { return nil }
-func (c *refsClient) Tasks() sdktasks.Service         { return nil }
-func (c *refsClient) Cluster() sdkcluster.Service     { return nil }
+func (c *refsClient) QEMU() sdkqemu.Service                     { return c.q }
+func (c *refsClient) Nodes() sdknodes.Service                   { return c.n }
+func (c *refsClient) Pools() pve.PoolService                    { return c.p }
+func (c *refsClient) Storage() sdkstorage.Service               { return nil }
+func (c *refsClient) CloudInit() sdkcloudinit.Service           { return nil }
+func (c *refsClient) Tasks() sdktasks.Service                   { return nil }
+func (c *refsClient) Cluster() sdkcluster.Service               { return nil }
 func (c *refsClient) ClusterStorage() sdkclusterstorage.Service { return nil }
 
 // buildRefsTestDeps constructs Deps for stemcell_refs unit tests.

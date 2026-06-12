@@ -748,15 +748,15 @@ const ephemeralVolidInfix = "-ephemeral-"
 // caller MUST pass DestroyUnreferencedDisks=false to the subsequent DeleteQemu when
 // retained==true:
 //
-//   DestroyUnreferencedDisks=true instructs PVE to free every volume that (a) is not
-//   referenced in the config AND (b) has a VMID matching the VM being destroyed. After
-//   the unlink+sweep sequence the ephemeral volume is unreferenced (config entry gone)
-//   and has a matching VMID — so DestroyUnreferencedDisks=true would destroy it. Setting
-//   the flag to false on the retain path is the only mechanism that keeps the volume.
+//	DestroyUnreferencedDisks=true instructs PVE to free every volume that (a) is not
+//	referenced in the config AND (b) has a VMID matching the VM being destroyed. After
+//	the unlink+sweep sequence the ephemeral volume is unreferenced (config entry gone)
+//	and has a matching VMID — so DestroyUnreferencedDisks=true would destroy it. Setting
+//	the flag to false on the retain path is the only mechanism that keeps the volume.
 //
-//   Residual: on a retain-flagged VM, ANY other unreferenced own-VMID volumes (e.g. an
-//   old orphan from a prior failed create) also survive. This is conservative by design;
-//   scripts/disk-audit can inventory them.
+//	Residual: on a retain-flagged VM, ANY other unreferenced own-VMID volumes (e.g. an
+//	old orphan from a prior failed create) also survive. This is conservative by design;
+//	scripts/disk-audit can inventory them.
 //
 // Returns (false, nil) when the tag is absent (byte-identical path: no extra config read,
 // no API calls, DestroyUnreferencedDisks unchanged).

@@ -3486,10 +3486,10 @@ func resizeRootDisk(
 //  4. cfg.VMStorage fallback
 //
 // When encrypted=true: §7.49 enforcement applies (same rules as create_disk):
-//  - explicit ephemeral_storage_pool present → non-retriable CloudError
-//  - ephemeral_storage_tier named + not encrypted → non-retriable CloudError
-//  - neither tier nor pool → auto-select lex-first encrypted tier from config
-//  - A warning is logged on every encrypted-tier selection.
+//   - explicit ephemeral_storage_pool present → non-retriable CloudError
+//   - ephemeral_storage_tier named + not encrypted → non-retriable CloudError
+//   - neither tier nor pool → auto-select lex-first encrypted tier from config
+//   - A warning is logged on every encrypted-tier selection.
 func resolveEphemeralShape(
 	ctx context.Context,
 	deps Deps,

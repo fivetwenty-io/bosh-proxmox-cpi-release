@@ -2196,11 +2196,12 @@ func TestHandleDeleteVM_RetainEphemeral_VolumeActuallySurvives(t *testing.T) {
 // preserved.
 //
 // Two real handler invocations against shared simulated state:
-//   call 1: delete_vm(730) — retain-tagged; unlink+sweep succeed; the destroy
-//           returns a transient 500 → handler errors, VM survives as straggler.
-//   call 2: delete_vm(731) — untagged; its sweep finds straggler 730 and must
-//           destroy it with DestroyUnreferencedDisks=false; the ephemeral
-//           volume must still exist afterwards.
+//
+//	call 1: delete_vm(730) — retain-tagged; unlink+sweep succeed; the destroy
+//	        returns a transient 500 → handler errors, VM survives as straggler.
+//	call 2: delete_vm(731) — untagged; its sweep finds straggler 730 and must
+//	        destroy it with DestroyUnreferencedDisks=false; the ephemeral
+//	        volume must still exist afterwards.
 //
 //nolint:gocognit // Models config/tag/storage state across two handler calls; splitting obscures the window under test.
 func TestHandleDeleteVM_RetainEphemeral_StragglerSweepPreservesVolume(t *testing.T) {

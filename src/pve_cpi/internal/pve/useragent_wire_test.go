@@ -25,8 +25,8 @@ import (
 // from the first qualifying API request and responds with empty PVE JSON so the
 // SDK call does not error on parse.
 type pveStub struct {
-	server    *httptest.Server
-	recorded  atomic.Value // stores string
+	server   *httptest.Server
+	recorded atomic.Value // stores string
 }
 
 func newPVEStub(t *testing.T) *pveStub {

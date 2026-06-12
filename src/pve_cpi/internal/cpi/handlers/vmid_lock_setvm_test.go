@@ -278,4 +278,3 @@ func TestHandleSetVMMetadata_ExistingTagsPreservedUnderLock(t *testing.T) {
 		}
 	}
 }
-

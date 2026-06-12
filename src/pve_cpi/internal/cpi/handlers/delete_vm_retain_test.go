@@ -149,9 +149,9 @@ func TestDetachRetainedEphemeralDisk_NoFlag(t *testing.T) {
 
 	// Config has no bosh-retain-ephemeral tag.
 	cfg := map[string]any{
-		"virtio0": "zfs-1:vm-101-disk-0",
-		"scsi1":   "zfs-1:vm-101-ephemeral-0,size=10G",
-		jsonKeyTags:    "bosh-cpi", // no bosh-retain-ephemeral
+		"virtio0":   "zfs-1:vm-101-disk-0",
+		"scsi1":     "zfs-1:vm-101-ephemeral-0,size=10G",
+		jsonKeyTags: "bosh-cpi", // no bosh-retain-ephemeral
 	}
 
 	q := &retainQEMU{configs: []map[string]any{cfg}}
@@ -192,8 +192,8 @@ func TestDetachRetainedEphemeralDisk_Happy(t *testing.T) {
 	const ephemeralOptStr = "zfs-1:vm-101-ephemeral-0,size=10G"
 
 	initCfg := map[string]any{
-		"virtio0": "zfs-1:vm-101-disk-0",
-		"scsi1":   ephemeralOptStr,
+		"virtio0":   "zfs-1:vm-101-disk-0",
+		"scsi1":     ephemeralOptStr,
 		jsonKeyTags: "bosh-cpi;bosh-retain-ephemeral",
 	}
 	postUnlinkCfg := map[string]any{
@@ -239,8 +239,8 @@ func TestDetachRetainedEphemeralDisk_UnlinkFails(t *testing.T) {
 
 	const vmid = 101
 	initCfg := map[string]any{
-		"scsi1": "zfs-1:vm-101-ephemeral-0,size=10G",
-		jsonKeyTags:  "bosh-retain-ephemeral",
+		"scsi1":     "zfs-1:vm-101-ephemeral-0,size=10G",
+		jsonKeyTags: "bosh-retain-ephemeral",
 	}
 
 	q := &retainQEMU{configs: []map[string]any{initCfg}}
@@ -269,8 +269,8 @@ func TestDetachRetainedEphemeralDisk_SweepFails(t *testing.T) {
 
 	const vmid = 101
 	initCfg := map[string]any{
-		"scsi1": "zfs-1:vm-101-ephemeral-0,size=10G",
-		jsonKeyTags:  "bosh-retain-ephemeral",
+		"scsi1":     "zfs-1:vm-101-ephemeral-0,size=10G",
+		jsonKeyTags: "bosh-retain-ephemeral",
 	}
 	postUnlinkCfg := map[string]any{
 		"unused0": "zfs-1:vm-101-ephemeral-0",
@@ -303,8 +303,8 @@ func TestDetachRetainedEphemeralDisk_NoEphemeralSlot(t *testing.T) {
 
 	// Config has the tag but no scsiN containing "-ephemeral-".
 	cfg := map[string]any{
-		"virtio0": "zfs-1:vm-101-disk-0",
-		jsonKeyTags:    "bosh-retain-ephemeral",
+		"virtio0":   "zfs-1:vm-101-disk-0",
+		jsonKeyTags: "bosh-retain-ephemeral",
 	}
 
 	q := &retainQEMU{configs: []map[string]any{cfg}}
