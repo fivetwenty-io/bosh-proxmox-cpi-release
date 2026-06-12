@@ -62,13 +62,39 @@ type parkerQEMU struct {
 	attachFn func(node string, vmid int, volid, bus string, opts *qemu.AttachOpts) (string, error)
 	// detachFn intercepts DetachDisk calls.
 	detachFn func(node string, vmid int, diskID string) error
+
+	// attached records disks AttachDisk placed, keyed by vmid then slot. Config
+	// merges these into its response so the read-after-write slot-verify in
+	// attachToParker observes the disk the test's attachFn accepted. Tests that
+	// need to simulate a lost slot (concurrent park) override attachFn and write
+	// a different volid into attached themselves.
+	attached map[int]map[string]string
 }
 
 func (q *parkerQEMU) Config(_ context.Context, node string, vmid int) (map[string]any, error) {
+	var base map[string]any
 	if q.configFn != nil {
-		return q.configFn(node, vmid)
+		c, err := q.configFn(node, vmid)
+		if err != nil {
+			return nil, err
+		}
+		base = c
+	} else {
+		base = map[string]any{}
 	}
-	return map[string]any{}, nil
+	// Merge recorded attaches so verify reads see them. Copy to avoid mutating
+	// the test's static map.
+	if slots, ok := q.attached[vmid]; ok && len(slots) > 0 {
+		merged := make(map[string]any, len(base)+len(slots))
+		for k, v := range base {
+			merged[k] = v
+		}
+		for slot, volid := range slots {
+			merged[slot] = volid
+		}
+		return merged, nil
+	}
+	return base, nil
 }
 
 func (q *parkerQEMU) Create(_ context.Context, node string, params map[string]any) (string, error) {
@@ -78,7 +104,26 @@ func (q *parkerQEMU) Create(_ context.Context, node string, params map[string]an
 	return "", nil
 }
 
+func (q *parkerQEMU) recordAttach(vmid int, slot, volid string) {
+	if q.attached == nil {
+		q.attached = make(map[int]map[string]string)
+	}
+	if q.attached[vmid] == nil {
+		q.attached[vmid] = make(map[string]string)
+	}
+	q.attached[vmid][slot] = volid
+}
+
 func (q *parkerQEMU) AttachDisk(_ context.Context, node string, vmid int, volid, bus string, opts *qemu.AttachOpts) (string, error) {
+	slot := ""
+	if opts != nil {
+		slot = opts.DiskID
+	}
+	// Default state recording so the verify read sees the disk. attachFn may
+	// override the recorded value (e.g. to simulate a lost slot).
+	if slot != "" {
+		q.recordAttach(vmid, slot, volid)
+	}
 	if q.attachFn != nil {
 		return q.attachFn(node, vmid, volid, bus, opts)
 	}
@@ -259,36 +304,40 @@ func TestIsParkerVM_TagCaseInsensitive(t *testing.T) {
 // The direct chooseParkSlot tests live in parker_internal_test.go (package pve).
 // Here we test ErrNoSlots surfacing through ParkDisk.
 
-func TestParkDisk_FullParkerCreatesSecondParker(t *testing.T) {
+// fullParkerDisks returns a disk map with all 31 scsi slots occupied plus the
+// bosh-parker tag, simulating a parker that cannot accept another disk.
+func fullParkerDisks() map[string]any {
+	m := map[string]any{"tags": "bosh-parker"}
+	for i := 0; i < 31; i++ {
+		m[fmt.Sprintf("scsi%d", i)] = fmt.Sprintf("local-lvm:vm-9999-disk-%d", i)
+	}
+	return m
+}
+
+// TestParkDisk_ReusesPartialParkerNoNewParker proves the capacity-reuse fix
+// (F-W6-01): with two full parkers and one partially full parker, a new park
+// lands in the partial parker's free slot and NO new parker VM is created.
+func TestParkDisk_ReusesPartialParkerNoNewParker(t *testing.T) {
 	t.Parallel()
 	ctx := pve.WithTestBackoff(context.Background(), func(_ int) time.Duration { return 0 })
 	cfg := parkerTestCfg()
 	node := "pve1"
 	bareVolid := "local-lvm:vm-9001-disk-0"
 
-	// First parker VMID 90000 has all 31 scsi slots occupied.
-	fullDisks := map[string]any{}
-	for i := 0; i < 31; i++ {
-		fullDisks[fmt.Sprintf("scsi%d", i)] = fmt.Sprintf("local-lvm:vm-9999-disk-%d", i)
-	}
-	fullDisks["tags"] = "bosh-parker"
-
-	// Second parker VMID 90001 is empty.
-	emptyParkerCfg := map[string]any{"tags": "bosh-parker"}
+	// 90000 full, 90001 full, 90002 partial (scsi0 used, rest free).
+	partial := map[string]any{"tags": "bosh-parker", "scsi0": "local-lvm:vm-9999-disk-0"}
 
 	var createdVMIDs []int
-	var attachCalls []struct {
-		vmid int
-		slot string
-	}
+	var attachVMID int
+	var attachSlot string
 
 	qemuSvc := &parkerQEMU{
 		configFn: func(_ string, vmid int) (map[string]any, error) {
 			switch vmid {
-			case 90000:
-				return fullDisks, nil
-			case 90001:
-				return emptyParkerCfg, nil
+			case 90000, 90001:
+				return fullParkerDisks(), nil
+			case 90002:
+				return partial, nil
 			default:
 				return map[string]any{}, nil
 			}
@@ -296,50 +345,93 @@ func TestParkDisk_FullParkerCreatesSecondParker(t *testing.T) {
 		createFn: func(_ string, params map[string]any) (string, error) {
 			vmidVal, _ := params["vmid"].(int)
 			createdVMIDs = append(createdVMIDs, vmidVal)
-			return "", nil // no UPID
+			return "", nil
 		},
 		attachFn: func(_ string, vmid int, _, _ string, opts *qemu.AttachOpts) (string, error) {
-			slot := ""
+			attachVMID = vmid
 			if opts != nil {
-				slot = opts.DiskID
+				attachSlot = opts.DiskID
 			}
-			attachCalls = append(attachCalls, struct {
-				vmid int
-				slot string
-			}{vmid, slot})
 			return "", nil
 		},
 	}
 
-	// Cluster: 90000 exists on pve1 (full parker). 90001 doesn't exist yet.
-	listCallCount := 0
 	c := buildParkerClient(qemuSvc, func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
-		listCallCount++
-		// After first creation of 90001, include it.
-		if listCallCount <= 2 {
-			return parkerClusterResp(
-				map[string]any{"vmid": int64(90000), "node": node},
-			), nil
-		}
 		return parkerClusterResp(
 			map[string]any{"vmid": int64(90000), "node": node},
 			map[string]any{"vmid": int64(90001), "node": node},
+			map[string]any{"vmid": int64(90002), "node": node},
 		), nil
 	})
 
-	err := pve.ParkDisk(ctx, c, nopLogger(), node, bareVolid, cfg, pve.ParkContext{})
-	if err != nil {
+	if err := pve.ParkDisk(ctx, c, nopLogger(), node, bareVolid, cfg, pve.ParkContext{}); err != nil {
 		t.Fatalf("ParkDisk: unexpected error: %v", err)
 	}
 
-	// A second parker VM must have been created.
-	if len(createdVMIDs) == 0 {
-		t.Error("expected at least one parker VM created (fresh parker for overflow)")
+	if len(createdVMIDs) != 0 {
+		t.Errorf("no new parker must be created when a partial parker has a free slot; created %v", createdVMIDs)
+	}
+	if attachVMID != 90002 {
+		t.Errorf("disk must land in the partial parker 90002; attached to %d", attachVMID)
+	}
+	if attachSlot != "scsi1" {
+		t.Errorf("disk must take the first free slot scsi1 in the partial parker; got %q", attachSlot)
+	}
+}
+
+// TestParkDisk_AllParkersFullCreatesFreshParker proves a fresh parker IS
+// created only when every existing parker is full (F-W6-01).
+func TestParkDisk_AllParkersFullCreatesFreshParker(t *testing.T) {
+	t.Parallel()
+	ctx := pve.WithTestBackoff(context.Background(), func(_ int) time.Duration { return 0 })
+	cfg := parkerTestCfg()
+	node := "pve1"
+	bareVolid := "local-lvm:vm-9001-disk-0"
+
+	var createdVMIDs []int
+	var attachVMID int
+
+	qemuSvc := &parkerQEMU{
+		configFn: func(_ string, vmid int) (map[string]any, error) {
+			switch vmid {
+			case 90000, 90001, 90002:
+				return fullParkerDisks(), nil
+			default:
+				// Freshly created parker: empty until disks attach (Config merges
+				// recorded attaches automatically).
+				return map[string]any{"tags": "bosh-parker"}, nil
+			}
+		},
+		createFn: func(_ string, params map[string]any) (string, error) {
+			vmidVal, _ := params["vmid"].(int)
+			createdVMIDs = append(createdVMIDs, vmidVal)
+			return "", nil
+		},
+		attachFn: func(_ string, vmid int, _, _ string, _ *qemu.AttachOpts) (string, error) {
+			attachVMID = vmid
+			return "", nil
+		},
 	}
 
-	// Attach must have been called on the fresh parker.
-	if len(attachCalls) == 0 {
-		t.Error("expected at least one AttachDisk call")
+	// All three parkers exist and are full; NextVMID picks a free VMID for the
+	// fresh parker (not 90000-90002 since those are used in the cluster list).
+	c := buildParkerClient(qemuSvc, func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+		return parkerClusterResp(
+			map[string]any{"vmid": int64(90000), "node": node},
+			map[string]any{"vmid": int64(90001), "node": node},
+			map[string]any{"vmid": int64(90002), "node": node},
+		), nil
+	})
+
+	if err := pve.ParkDisk(ctx, c, nopLogger(), node, bareVolid, cfg, pve.ParkContext{}); err != nil {
+		t.Fatalf("ParkDisk: unexpected error: %v", err)
+	}
+
+	if len(createdVMIDs) != 1 {
+		t.Errorf("exactly one fresh parker must be created when all parkers are full; created %v", createdVMIDs)
+	}
+	if attachVMID == 90000 || attachVMID == 90001 || attachVMID == 90002 || attachVMID == 0 {
+		t.Errorf("disk must attach to the freshly created parker, not an existing full one; got %d", attachVMID)
 	}
 }
 
@@ -652,9 +744,166 @@ func TestEnsureParker_DirectorTagIncludedWhenSet(t *testing.T) {
 	}
 }
 
+// TestEnsureParker_CreateConflictAdoptsNoSecondParker proves the adopt-on-conflict
+// path is live (F-W6-04): when Create returns a VMID-conflict error, EnsureParker
+// re-scans and adopts the winner instead of regenerating a fresh VMID and creating
+// a duplicate parker. Exactly one Create attempt is made.
+func TestEnsureParker_CreateConflictAdoptsNoSecondParker(t *testing.T) {
+	t.Parallel()
+	node := "pve1"
+	winnerVMID := 90000
+
+	var createCalls int
+	qemuSvc := &parkerQEMU{
+		configFn: func(_ string, vmid int) (map[string]any, error) {
+			if vmid == winnerVMID {
+				return map[string]any{"tags": "bosh-parker"}, nil
+			}
+			return map[string]any{}, nil
+		},
+		createFn: func(_ string, _ map[string]any) (string, error) {
+			createCalls++
+			return "", fmt.Errorf("create VM: 500 KVM VM already exists, vmid: %d", winnerVMID) //nolint:gocritic
+		},
+	}
+
+	// First scan (EnsureParker's FindParkerForNode) → empty, so it proceeds to
+	// create. After the create conflicts, the adopt re-scan → winner present.
+	listCallCount := 0
+	c := buildParkerClient(qemuSvc, func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+		listCallCount++
+		if listCallCount == 1 {
+			return parkerClusterResp(), nil
+		}
+		return parkerClusterResp(
+			map[string]any{"vmid": int64(winnerVMID), "node": node},
+		), nil
+	})
+
+	vmid, err := pve.EnsureParker(context.Background(), c, nopLogger(), node, parkerTestCfg())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if vmid != winnerVMID {
+		t.Errorf("vmid: want %d (adopted winner), got %d", winnerVMID, vmid)
+	}
+	// A single Create attempt: AllocateWithRetry must NOT regenerate a fresh VMID
+	// on conflict (that would create a duplicate parker).
+	if createCalls != 1 {
+		t.Errorf("expected exactly 1 Create attempt (adopt on conflict, no regenerate); got %d", createCalls)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // ParkDisk
 // ---------------------------------------------------------------------------
+
+// TestParkDisk_RealVMHolderRefusesPark proves ParkDisk refuses to park a disk
+// that a real (non-parker) VM still holds (F-W6-02): no attach, no create, nil
+// returned (idempotent no-op). Guards a stale-Director-retry path that would
+// otherwise double-reference the volume.
+func TestParkDisk_RealVMHolderRefusesPark(t *testing.T) {
+	t.Parallel()
+	node := "pve1"
+	realVMID := 12345 // outside parker range 90000-90999
+	bareVolid := "local-lvm:vm-9001-disk-0"
+
+	var attachCalls, createCalls int
+	qemuSvc := &parkerQEMU{
+		configFn: func(_ string, vmid int) (map[string]any, error) {
+			if vmid == realVMID {
+				// Real VM currently holds the disk on an active bus.
+				return map[string]any{"scsi3": bareVolid}, nil
+			}
+			return map[string]any{}, nil
+		},
+		attachFn: func(_ string, _ int, _, _ string, _ *qemu.AttachOpts) (string, error) {
+			attachCalls++
+			return "", nil
+		},
+		createFn: func(_ string, _ map[string]any) (string, error) {
+			createCalls++
+			return "", nil
+		},
+	}
+	// Cluster: the real VM holds the disk; no parker exists.
+	c := buildParkerClient(qemuSvc, func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+		return parkerClusterResp(
+			map[string]any{"vmid": int64(realVMID), "node": node},
+		), nil
+	})
+
+	err := pve.ParkDisk(context.Background(), c, nopLogger(), node, bareVolid, parkerTestCfg(), pve.ParkContext{})
+	if err != nil {
+		t.Fatalf("ParkDisk: want nil (idempotent no-op), got %v", err)
+	}
+	if attachCalls != 0 {
+		t.Errorf("AttachDisk must not be called when a real VM holds the disk; got %d", attachCalls)
+	}
+	if createCalls != 0 {
+		t.Errorf("no parker must be created when a real VM holds the disk; got %d", createCalls)
+	}
+}
+
+// TestParkDisk_SlotRaceRetriesNextSlot proves the read-after-write slot verify
+// (F-W6-03): when a concurrent park wins the chosen slot (the post-attach config
+// shows a different volid there), ParkDisk retries the next free slot and the
+// disk lands successfully.
+func TestParkDisk_SlotRaceRetriesNextSlot(t *testing.T) {
+	t.Parallel()
+	ctx := pve.WithTestBackoff(context.Background(), func(_ int) time.Duration { return 0 })
+	node := "pve1"
+	parkerVMID := 90000
+	bareVolid := "local-lvm:vm-9001-disk-0"
+	otherVolid := "local-lvm:vm-9002-disk-0" // disk a racing park placed in scsi0
+
+	var attachSlots []string
+	qemuSvc := &parkerQEMU{
+		configFn: func(_ string, vmid int) (map[string]any, error) {
+			if vmid == parkerVMID {
+				// Base config: scsi0 pre-occupied by a racing park's disk, so
+				// chooseParkSlot picks scsi1 first.
+				return map[string]any{"tags": "bosh-parker", "scsi0": otherVolid}, nil
+			}
+			return map[string]any{}, nil
+		},
+	}
+	// attachFn models the slot race: the FIRST attach (scsi1) is lost to a
+	// concurrent park — overwrite the recorded slot value with otherVolid so the
+	// verify read sees the wrong volid. The retry (scsi2) keeps bareVolid (the
+	// default record) and the verify succeeds.
+	qemuSvc.attachFn = func(_ string, vmid int, _, _ string, opts *qemu.AttachOpts) (string, error) {
+		slot := ""
+		if opts != nil {
+			slot = opts.DiskID
+		}
+		attachSlots = append(attachSlots, slot)
+		if len(attachSlots) == 1 {
+			// Simulate the concurrent park winning slot scsi1.
+			qemuSvc.recordAttach(vmid, slot, otherVolid)
+		}
+		return "", nil
+	}
+	c := buildParkerClient(qemuSvc, func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+		return parkerClusterResp(
+			map[string]any{"vmid": int64(parkerVMID), "node": node},
+		), nil
+	})
+
+	err := pve.ParkDisk(ctx, c, nopLogger(), node, bareVolid, parkerTestCfg(), pve.ParkContext{})
+	if err != nil {
+		t.Fatalf("ParkDisk: unexpected error: %v", err)
+	}
+	if len(attachSlots) < 2 {
+		t.Fatalf("expected at least 2 attach attempts (first slot lost, retry next); got %v", attachSlots)
+	}
+	if attachSlots[0] != "scsi1" {
+		t.Errorf("first attach must target scsi1 (scsi0 pre-occupied); got %q", attachSlots[0])
+	}
+	if attachSlots[len(attachSlots)-1] != "scsi2" {
+		t.Errorf("retry must target the next free slot scsi2; got %q", attachSlots[len(attachSlots)-1])
+	}
+}
 
 func TestParkDisk_AttachesToFreeSlot(t *testing.T) {
 	t.Parallel()

@@ -111,8 +111,11 @@ Each parker VM is created with the following fixed properties:
 | Disk slots | `scsi0` through `scsi30` (31 slots per parker VM) |
 
 When a parker VM fills all 31 slots, the CPI creates a second parker VM in the
-same VMID band and continues attaching there. Each parker VM is node-scoped:
-one parker (or chain of parkers) per PVE cluster node.
+same VMID band and attaches subsequent disks there. Each new park reuses the
+lowest existing parker that still has a free slot before creating another
+parker, so the VMID band fills densely rather than one parker per disk. Each
+parker VM is node-scoped: one parker (or chain of parkers) per PVE cluster
+node.
 
 ### Provenance sentinel
 
@@ -323,6 +326,17 @@ When the parked range is configured, the CPI always runs unpark probes before
 setting. This means flipping the strategy back to `free` while parked disks exist
 is handled gracefully: the probes still fire, unpark the disks, and the operations
 complete.
+
+> **Warning: never remove the `parked_disk_vmid_range_start` /
+> `parked_disk_vmid_range_end` knobs while any disk remains parked.** Clearing the
+> range disables `ParkedStrategyActive()`, which turns off every unpark probe and
+> parker guard. With the guards gone the CPI will attach a still-parked volid to a
+> workload VM (double reference), snapshot the parker VM during `snapshot_disk`, and
+> delete a volume the parker still references during `delete_disk`. Before removing
+> the range knobs, run `disk-audit` and confirm it reports zero parked disks. To
+> drain parked disks first, leave the range configured and let the next
+> `attach_disk` or `delete_disk` on each disk unpark it (the "Parked to free"
+> procedure above), then remove the knobs once the audit is clean.
 
 ---
 

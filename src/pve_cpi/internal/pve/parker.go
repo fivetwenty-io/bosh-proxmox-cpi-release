@@ -21,8 +21,11 @@
 //
 // # Slot capacity
 //
-// Each parker VM holds up to 31 disks (scsi0..scsi30). When a parker is full
-// EnsureParker allocates a fresh parker VMID in the same range.
+// Each parker VM holds up to 31 disks (scsi0..scsi30). When every existing
+// parker on a node is full, a fresh parker VMID is allocated in the same range.
+// New parks always reuse the lowest existing parker that still has a free slot
+// before creating another parker, so the VMID band is not exhausted one disk
+// at a time.
 package pve
 
 import (
@@ -399,14 +402,15 @@ func chooseParkSlot(disks map[string]string) (string, error) {
 	return "", ErrNoSlots
 }
 
-// FindParkerForNode scans cluster VM resources and returns the VMID of the
-// first parker VM that exists on node with free slots (or any parker if the
-// caller will verify slots itself). It returns the first parker VMID found in
-// the range, so callers that need to find multiple parkers (e.g. for the
-// full-slot fallback) should use ListParkersForNode.
+// FindParkerForNode scans cluster VM resources and returns the LOWEST parker
+// VMID on node. It does NOT check slot capacity — the returned parker may be
+// full. Callers that need a parker with a free slot (e.g. parkDiskOnNode) must
+// use ListParkersForNode and iterate, attaching to the first parker that
+// accepts the disk. EnsureParker uses this only to detect whether any parker
+// already exists before creating one.
 //
-// Returns (vmid, true, nil) when found; (0, false, nil) when none found.
-// Returns (0, false, err) on transport failure.
+// Returns (vmid, true, nil) when at least one parker exists; (0, false, nil)
+// when none found. Returns (0, false, err) on transport failure.
 func FindParkerForNode(ctx context.Context, c Client, node string, cfg ParkerConfig) (int, bool, error) {
 	parkers, err := ListParkersForNode(ctx, c, node, cfg)
 	if err != nil {
@@ -546,8 +550,14 @@ func EnsureParker(ctx context.Context, c Client, logger *log.Logger, node string
 			}
 			return nil
 		},
-		IsVMIDConflict,
-		3,
+		// nil conflict predicate + single attempt: a VMID conflict means another
+		// CPI created a parker at this VMID. We do NOT want AllocateWithRetry to
+		// regenerate a fresh VMID (that would create a duplicate parker); instead
+		// we surface the conflict so the branch below re-scans and ADOPTS the
+		// winner (PC-4). Transient/lock errors are still retried inside the create
+		// closure via RetryOnTransientOrLock.
+		nil,
+		1,
 		WithRange(cfg.VMIDRangeStart, cfg.VMIDRangeEnd),
 		WithNoBackoff(),
 	)
@@ -618,8 +628,11 @@ func EnsureFreshParker(ctx context.Context, c Client, logger *log.Logger, node s
 			}
 			return nil
 		},
-		IsVMIDConflict,
-		3,
+		// nil conflict predicate + single attempt — see EnsureParker rationale.
+		// On conflict, re-scan and adopt the racer's parker rather than spinning
+		// up yet another duplicate.
+		nil,
+		1,
 		WithRange(cfg.VMIDRangeStart, cfg.VMIDRangeEnd),
 		WithNoBackoff(),
 	)
@@ -703,6 +716,66 @@ func IsDiskParked(ctx context.Context, c Client, logger *log.Logger, bareVolid s
 	return holderVMID, holderNode, diskID, true, nil
 }
 
+// DiskHeldByRealVM reports whether bareVolid is currently attached to a VM that
+// is NOT a parker (a workload VM, stemcell template, or any VMID outside the
+// parker range, or an in-range VMID lacking the bosh-parker tag).
+//
+// It exists because IsDiskParked collapses "held by a non-parker VM" and "not
+// held at all" into the same (false, nil) result, discarding a signal the park
+// path needs: a disk still referenced by a running VM must never be parked, or
+// PVE config would reference the same volume from two VMs (double-attach).
+//
+// Returns:
+//   - held=true, vmid>0 when a non-parker VM holds the disk.
+//   - held=false, vmid=0 when the disk is free-floating or held by a parker.
+//   - err on transport/scan failure.
+func DiskHeldByRealVM(ctx context.Context, c Client, logger *log.Logger, bareVolid string, cfg ParkerConfig) (held bool, vmid int, node string, err error) {
+	if c == nil {
+		return false, 0, "", cpierrors.Cloud("DiskHeldByRealVM: client must not be nil")
+	}
+	if bareVolid == "" {
+		return false, 0, "", cpierrors.Cloud("DiskHeldByRealVM: bareVolid must not be empty")
+	}
+
+	holderVMID, holderNode, found, scanErr := FindVMByDiskVolidOrNone(ctx, c, "", bareVolid)
+	if scanErr != nil {
+		return false, 0, "", cpierrors.Wrap(scanErr, "DiskHeldByRealVM: cluster scan")
+	}
+	if !found {
+		return false, 0, "", nil
+	}
+
+	// Out of parker range → definitely a real VM.
+	if holderVMID < cfg.VMIDRangeStart || holderVMID > cfg.VMIDRangeEnd {
+		return true, holderVMID, holderNode, nil
+	}
+
+	// In range: confirm via tag. A parker carries bosh-parker; anything else in
+	// the range is a real (mis-placed) VM.
+	vmCfg, cfgErr := c.QEMU().Config(ctx, holderNode, holderVMID)
+	if cfgErr != nil {
+		if IsNotFound(cfgErr) {
+			// VM vanished mid-scan — treat as free-floating.
+			return false, 0, "", nil
+		}
+		return false, 0, "", cpierrors.WrapAs(cfgErr, cpierrors.TypeRetriableCloud,
+			fmt.Sprintf("DiskHeldByRealVM: config fetch for vmid %d on node %s", holderVMID, holderNode))
+	}
+	tagsRaw, _ := vmCfg["tags"].(string)
+	if tagContainsParker(tagsRaw) {
+		// Held by a parker — not a real VM.
+		return false, 0, "", nil
+	}
+	if logger != nil {
+		logger.Warn("DiskHeldByRealVM: disk attached to VM in parker range without bosh-parker tag — treating as real VM",
+			log.Int("vmid", holderVMID),
+			log.String("node", holderNode),
+			log.String("volid", bareVolid),
+		)
+	}
+	return true, holderVMID, holderNode, nil
+}
+
 // ParkDisk attaches bareVolid to a parker VM on node. It is idempotent: if the
 // disk is already parked on any parker VM the call returns nil immediately.
 //
@@ -737,76 +810,195 @@ func ParkDisk(ctx context.Context, c Client, logger *log.Logger, node, bareVolid
 		return nil
 	}
 
+	// Refuse to park a disk still attached to a real (non-parker) VM. Parking it
+	// would add a second config reference to a volume a running VM owns
+	// (double-attach). This guards a stale-Director-retry path where the disk
+	// was re-attached elsewhere between the failed detach and this re-park.
+	heldByReal, realVMID, _, heldErr := DiskHeldByRealVM(ctx, c, logger, bareVolid, cfg)
+	if heldErr != nil {
+		return cpierrors.Wrap(heldErr, "ParkDisk: real-VM holder check")
+	}
+	if heldByReal {
+		if logger != nil {
+			logger.Warn("ParkDisk: disk attached to a non-parker VM — refusing to park (idempotent no-op)",
+				log.String("volid", bareVolid),
+				log.Int("holder_vmid", realVMID),
+			)
+		}
+		return nil
+	}
+
 	return parkDiskOnNode(ctx, c, logger, node, bareVolid, cfg, pctx)
 }
 
 // parkDiskOnNode performs the actual attach to a parker VM on node. Separated
-// from ParkDisk so EnsureFreshParker overflow can recurse once without the
+// from ParkDisk so the EnsureFreshParker overflow path stays out of the
 // idempotency pre-check.
+//
+// Capacity reuse (D-07): it lists every parker on node in ascending VMID order
+// and attaches to the FIRST parker with a free slot. A fresh parker is created
+// only when all existing parkers are full (or none exist). This prevents the
+// parker-per-disk leak where each overflow disk would otherwise spawn a new
+// parker VM, exhausting the VMID band.
 func parkDiskOnNode(ctx context.Context, c Client, logger *log.Logger, node, bareVolid string, cfg ParkerConfig, pctx ParkContext) error {
-	parkerVMID, ensureErr := EnsureParker(ctx, c, logger, node, cfg)
-	if ensureErr != nil {
-		return cpierrors.Wrap(ensureErr, "ParkDisk: ensure parker")
+	parkers, listErr := ListParkersForNode(ctx, c, node, cfg)
+	if listErr != nil {
+		return cpierrors.Wrap(listErr, "ParkDisk: list parkers")
 	}
 
-	slotErr := attachToParker(ctx, c, logger, node, parkerVMID, bareVolid)
-	if slotErr == nil {
+	// No parker exists yet → create the first one and attach there.
+	if len(parkers) == 0 {
+		parkerVMID, ensureErr := EnsureParker(ctx, c, logger, node, cfg)
+		if ensureErr != nil {
+			return cpierrors.Wrap(ensureErr, "ParkDisk: ensure parker")
+		}
+		if attachErr := attachToParker(ctx, c, logger, node, parkerVMID, bareVolid); attachErr != nil {
+			return cpierrors.Wrap(attachErr, "ParkDisk: attach to parker")
+		}
 		updateParkerProvenance(ctx, c, logger, node, parkerVMID, bareVolid, cfg, pctx)
 		return nil
 	}
 
-	// Full parker → create a fresh one and attach there.
-	if errors.Is(slotErr, ErrNoSlots) {
-		freshVMID, freshErr := EnsureFreshParker(ctx, c, logger, node, cfg)
-		if freshErr != nil {
-			return cpierrors.Wrap(freshErr, "ParkDisk: ensure fresh parker after ErrNoSlots")
+	// Try existing parkers in ascending VMID order. Attach to the first one
+	// with a free slot. ErrNoSlots on a parker means it is full — move to the
+	// next. Any other error is a real failure and propagates.
+	for _, parkerVMID := range parkers {
+		attachErr := attachToParker(ctx, c, logger, node, parkerVMID, bareVolid)
+		if attachErr == nil {
+			updateParkerProvenance(ctx, c, logger, node, parkerVMID, bareVolid, cfg, pctx)
+			return nil
 		}
-		attachErr := attachToParker(ctx, c, logger, node, freshVMID, bareVolid)
-		if attachErr != nil {
-			return cpierrors.Wrap(attachErr, "ParkDisk: attach to fresh parker")
+		if errors.Is(attachErr, ErrNoSlots) {
+			continue
 		}
-		updateParkerProvenance(ctx, c, logger, node, freshVMID, bareVolid, cfg, pctx)
-		return nil
+		return cpierrors.Wrap(attachErr, "ParkDisk: attach to parker")
 	}
 
-	return cpierrors.Wrap(slotErr, "ParkDisk: attach to parker")
+	// All existing parkers are full → create a fresh one and attach there.
+	freshVMID, freshErr := EnsureFreshParker(ctx, c, logger, node, cfg)
+	if freshErr != nil {
+		return cpierrors.Wrap(freshErr, "ParkDisk: ensure fresh parker after all parkers full")
+	}
+	if attachErr := attachToParker(ctx, c, logger, node, freshVMID, bareVolid); attachErr != nil {
+		return cpierrors.Wrap(attachErr, "ParkDisk: attach to fresh parker")
+	}
+	updateParkerProvenance(ctx, c, logger, node, freshVMID, bareVolid, cfg, pctx)
+	return nil
 }
 
-// attachToParker reads the current config of parkerVMID, selects the first
-// free scsiN slot, and calls AttachDisk with an explicit DiskID.
+// attachParkerVerifyRetries bounds the read-after-write slot-verify loop in
+// attachToParker. Each iteration reads config, chooses a free slot, attaches,
+// then re-reads to confirm the chosen slot holds our volid. A concurrent park
+// that won the same slot demotes our disk to unusedN; on mismatch we retry the
+// next free slot. The bound caps how many concurrent parkers we tolerate
+// stealing slots before giving up retriably.
+const attachParkerVerifyRetries = 5
+
+// attachToParker reads the current config of parkerVMID, selects the first free
+// scsiN slot, calls AttachDisk with an explicit DiskID, then re-reads the
+// config to confirm the chosen slot actually holds bareVolid.
+//
+// Slot-race verify (F-W6-03): the PVE config PUT for an explicit DiskID is
+// blind — two concurrent parks can both pick scsi0, and PVE replaces the slot
+// for the second writer while demoting the first writer's volume to unusedN
+// (silently un-parked, despite the first detach_disk already reporting
+// success). After each attach this function re-reads the parker config and
+// confirms bareVolid occupies the chosen slot. On mismatch it retries with the
+// next free slot (excluding slots already proven stolen), bounded by
+// attachParkerVerifyRetries. Exhausting free slots returns ErrNoSlots so the
+// caller falls through to a fresh parker; exhausting the retry budget returns a
+// retriable error so the Director re-drives the park.
 func attachToParker(ctx context.Context, c Client, logger *log.Logger, node string, parkerVMID int, bareVolid string) error {
-	// Fresh config read for slot selection.
-	vmCfg, cfgErr := c.QEMU().Config(ctx, node, parkerVMID)
-	if cfgErr != nil {
-		return cpierrors.WrapAs(cfgErr, cpierrors.TypeRetriableCloud,
-			fmt.Sprintf("attachToParker: config fetch for parker vmid %d", parkerVMID))
-	}
+	// Slots proven to hold someone else's volid after our attach — never retry these.
+	stolen := make(map[string]bool)
 
-	disks := qemu.ParseDisks(vmCfg)
-	slot, slotErr := chooseParkSlot(disks)
-	if slotErr != nil {
-		return slotErr // ErrNoSlots — caller decides what to do
-	}
+	for attempt := 0; attempt < attachParkerVerifyRetries; attempt++ {
+		// Fresh config read for slot selection.
+		vmCfg, cfgErr := c.QEMU().Config(ctx, node, parkerVMID)
+		if cfgErr != nil {
+			return cpierrors.WrapAs(cfgErr, cpierrors.TypeRetriableCloud,
+				fmt.Sprintf("attachToParker: config fetch for parker vmid %d", parkerVMID))
+		}
 
-	var upid string
-	var attachErr error
-	retryErr := RetryOnTransientOrLock(ctx, logger, "park_disk_attach", 0, func() error {
-		upid, attachErr = c.QEMU().AttachDisk(ctx, node, parkerVMID, bareVolid, "scsi", &qemu.AttachOpts{
-			DiskID: slot,
+		slot, slotErr := chooseParkSlotExcluding(qemu.ParseDisks(vmCfg), stolen)
+		if slotErr != nil {
+			return slotErr // ErrNoSlots — caller decides what to do
+		}
+
+		var upid string
+		var attachErr error
+		retryErr := RetryOnTransientOrLock(ctx, logger, "park_disk_attach", 0, func() error {
+			upid, attachErr = c.QEMU().AttachDisk(ctx, node, parkerVMID, bareVolid, "scsi", &qemu.AttachOpts{
+				DiskID: slot,
+			})
+			return attachErr
 		})
-		return attachErr
-	})
-	if retryErr != nil {
-		return cpierrors.WrapAs(retryErr, cpierrors.TypeRetriableCloud,
-			fmt.Sprintf("attachToParker: attach %q at slot %s on parker vmid %d", bareVolid, slot, parkerVMID))
-	}
-	if upid != "" {
-		if awaitErr := AwaitTask(ctx, c, node, upid); awaitErr != nil {
-			return cpierrors.WrapAs(awaitErr, cpierrors.TypeRetriableCloud,
-				fmt.Sprintf("attachToParker: await attach task for %q on parker vmid %d", bareVolid, parkerVMID))
+		if retryErr != nil {
+			return cpierrors.WrapAs(retryErr, cpierrors.TypeRetriableCloud,
+				fmt.Sprintf("attachToParker: attach %q at slot %s on parker vmid %d", bareVolid, slot, parkerVMID))
+		}
+		if upid != "" {
+			if awaitErr := AwaitTask(ctx, c, node, upid); awaitErr != nil {
+				return cpierrors.WrapAs(awaitErr, cpierrors.TypeRetriableCloud,
+					fmt.Sprintf("attachToParker: await attach task for %q on parker vmid %d", bareVolid, parkerVMID))
+			}
+		}
+
+		// Read-after-write: confirm our volid landed in the chosen slot.
+		verifyCfg, verifyErr := c.QEMU().Config(ctx, node, parkerVMID)
+		if verifyErr != nil {
+			return cpierrors.WrapAs(verifyErr, cpierrors.TypeRetriableCloud,
+				fmt.Sprintf("attachToParker: verify config read for parker vmid %d", parkerVMID))
+		}
+		if slotHoldsVolid(qemu.ParseDisks(verifyCfg), slot, bareVolid) {
+			return nil
+		}
+
+		// A concurrent park won this slot. Mark it stolen and retry the next free
+		// slot. Our disk was demoted to unusedN by PVE; the next attach with an
+		// explicit DiskID at a different slot re-references the same volid.
+		stolen[slot] = true
+		if logger != nil {
+			logger.Warn("attachToParker: chosen slot lost to concurrent park, retrying next slot",
+				log.Int("parker_vmid", parkerVMID),
+				log.String("slot", slot),
+				log.String("volid", bareVolid),
+			)
 		}
 	}
-	return nil
+
+	return cpierrors.Retriable(
+		"attachToParker: slot verify failed after %d attempts for %q on parker vmid %d (concurrent park contention)",
+		attachParkerVerifyRetries, bareVolid, parkerVMID,
+	)
+}
+
+// chooseParkSlotExcluding is chooseParkSlot but skips any slot in the exclude
+// set (slots proven stolen by a concurrent park). Returns ErrNoSlots when no
+// non-excluded free slot remains.
+func chooseParkSlotExcluding(disks map[string]string, exclude map[string]bool) (string, error) {
+	for i := 0; i < parkerMaxSlots; i++ {
+		slot := fmt.Sprintf("scsi%d", i)
+		if _, occupied := disks[slot]; occupied {
+			continue
+		}
+		if exclude[slot] {
+			continue
+		}
+		return slot, nil
+	}
+	return "", ErrNoSlots
+}
+
+// slotHoldsVolid reports whether the given slot in the parsed disk map holds
+// bareVolid (exact match or option-string "<volid>,..." form). PVE may append
+// ",size=..." to the value, so an exact-only check would false-negative.
+func slotHoldsVolid(disks map[string]string, slot, bareVolid string) bool {
+	v, ok := disks[slot]
+	if !ok {
+		return false
+	}
+	return v == bareVolid || strings.HasPrefix(v, bareVolid+",")
 }
 
 // UnparkDisk detaches bareVolid from its parker VM. It is idempotent: if the

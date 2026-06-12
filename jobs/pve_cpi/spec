@@ -819,7 +819,7 @@ properties:
                    (bosh-parker-<n>) in an active scsi slot (scsi0-30) with
                    protection=1 and onboot=0. The parker VM is never started.
                    Provides PVE-side ownership visibility and accident protection.
-                   When enabled, ApplyDefaults sets pve.parked_disk_vmid_range_start
+                   When enabled, the CPI defaults pve.parked_disk_vmid_range_start
                    and pve.parked_disk_vmid_range_end to 90000/90999 if unset.
                    The parker VMID band must not overlap the VM range, the
                    persistent-disk range, or the stemcell-template range.
@@ -829,17 +829,17 @@ properties:
       Inclusive lower bound of the VMID range reserved for parker VMs
       (bosh-parker-<n>). Each parker VM holds up to 31 parked disk volumes in
       scsi0-30 slots. Meaningful only when detached_disk_strategy is "parked"
-      or when an explicit range is set to enable the hybrid parker gate
-      (ParkedStrategyActive). When unset (0) and strategy is "parked",
-      ApplyDefaults sets this to 90000. When unset and strategy is not "parked",
-      left as 0. Must not overlap the VM range, the persistent-disk range, or
-      the stemcell-template range when set.
+      or when an explicit range is set to enable the hybrid parker gate, which
+      keeps unpark probes running even under the "free" strategy. When unset (0)
+      and strategy is "parked", the CPI defaults this to 90000. When unset and
+      strategy is not "parked", left as 0. Must not overlap the VM range, the
+      persistent-disk range, or the stemcell-template range when set.
     default: 0
   pve.parked_disk_vmid_range_end:
     description: |
       Inclusive upper bound of the VMID range for parker VMs. Must be >
       parked_disk_vmid_range_start. When unset (0) and strategy is "parked",
-      ApplyDefaults sets this to 90999 (the companion to the default start of
+      the CPI defaults this to 90999 (the companion to the default start of
       90000). When unset and strategy is not "parked", left as 0. Must not
       overlap the VM range, the persistent-disk range, or the stemcell-template
       range when set.

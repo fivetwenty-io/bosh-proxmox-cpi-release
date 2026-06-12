@@ -253,6 +253,22 @@ func handleAlreadyDetachedParked(ctx context.Context, deps Deps, diskCID, bareDi
 	if !deps.Config.DetachedDiskParkedEnabled() {
 		return nil
 	}
+	// Refuse to park a disk that a real (non-parker) VM holds. This path is
+	// reached on a stale-Director retry where the disk was re-attached to a
+	// different VM after the original detach; parking it would double-reference
+	// the volume. Preserve the old idempotent warn+nil semantics.
+	heldByReal, realVMID, _, heldErr := pve.DiskHeldByRealVM(ctx, deps.PVE, deps.Logger, bareDiskCID, parkerCfg)
+	if heldErr != nil {
+		return cpierrors.WrapAs(heldErr, cpierrors.TypeRetriableCloud,
+			fmt.Sprintf("detach_disk: already-detached real-VM holder check for disk %s", diskCID))
+	}
+	if heldByReal {
+		deps.Logger.Warn("detach_disk: disk attached to a non-parker VM — skipping park (idempotent)",
+			log.String("disk_cid", diskCID),
+			log.Int("holder_vmid", realVMID),
+		)
+		return nil
+	}
 	// Free-floating disk + strategy=parked: re-resolve node and park.
 	alreadyDetachedNode, resolveErr := resolveNodeForDetachedDisk(ctx, deps, bareDiskCID)
 	if resolveErr != nil {

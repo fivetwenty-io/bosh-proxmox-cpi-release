@@ -753,10 +753,19 @@ type parkerQEMUService struct {
 
 	// Parker-VM side (scoped by vmid >= parkerVMIDStart).
 	parkerVMIDStart int
-	parkerCfg       map[string]any // returned for parker-side Config calls
+	parkerCfg       map[string]any    // returned for parker-side Config calls
+	parkerAttached  map[string]string // slot→volid recorded by AttachDisk for verify reads
 	parkerCfgErr    error
 	attachDiskFn    func(ctx context.Context, node string, vmid int, vol, busType string, opts *qemu.AttachOpts) (string, error)
 	createFn        func(ctx context.Context, node string, params map[string]any) (string, error)
+
+	// Real-holder side: an optional second non-parker VM (e.g. a workload VM the
+	// disk was re-attached to on a stale-Director retry). When realHolderVMID is
+	// non-zero, Config returns realHolderCfg for that vmid, distinct from the
+	// source VM config. Used to exercise the "disk held by a real VM → refuse to
+	// park" guard.
+	realHolderVMID int
+	realHolderCfg  map[string]any
 
 	// Snapshot guard: nil → no snapshots.
 	listSnapshotsFn func(ctx context.Context, node string, vmid int) ([]map[string]any, error)
@@ -764,21 +773,65 @@ type parkerQEMUService struct {
 
 func (m *parkerQEMUService) Config(_ context.Context, _ string, vmid int) (map[string]any, error) {
 	if vmid >= m.parkerVMIDStart {
-		return m.parkerCfg, m.parkerCfgErr
+		if m.parkerCfgErr != nil {
+			return m.parkerCfg, m.parkerCfgErr
+		}
+		// Merge recorded parker attaches so the read-after-write slot verify in
+		// attachToParker observes the disk a successful AttachDisk placed.
+		if len(m.parkerAttached) > 0 {
+			merged := make(map[string]any, len(m.parkerCfg)+len(m.parkerAttached))
+			for k, v := range m.parkerCfg {
+				merged[k] = v
+			}
+			for slot, volid := range m.parkerAttached {
+				merged[slot] = volid
+			}
+			return merged, nil
+		}
+		return m.parkerCfg, nil
+	}
+	if m.realHolderVMID != 0 && vmid == m.realHolderVMID {
+		return m.realHolderCfg, nil
 	}
 	return m.sourceCfg, m.sourceErr
 }
 
-func (m *parkerQEMUService) DetachDisk(_ context.Context, _ string, _ int, _ string) error {
+func (m *parkerQEMUService) DetachDisk(_ context.Context, _ string, _ int, slot string) error {
 	m.detachCalled = true
-	return m.detachErr
+	if m.detachErr != nil {
+		return m.detachErr
+	}
+	// Reflect the detach in source config so later cluster scans (e.g. the
+	// real-VM-holder guard) no longer see the disk on the source VM.
+	if m.sourceCfg != nil && slot != "" {
+		delete(m.sourceCfg, slot)
+	}
+	return nil
 }
 
 func (m *parkerQEMUService) AttachDisk(ctx context.Context, node string, vmid int, vol, busType string, opts *qemu.AttachOpts) (string, error) {
 	if m.attachDiskFn != nil {
-		return m.attachDiskFn(ctx, node, vmid, vol, busType, opts)
+		res, err := m.attachDiskFn(ctx, node, vmid, vol, busType, opts)
+		if err != nil {
+			return res, err
+		}
+		// Record the attach for the verify read only on success.
+		if opts != nil && opts.DiskID != "" {
+			m.recordParkerAttach(opts.DiskID, vol)
+		}
+		return res, nil
+	}
+	if opts != nil && opts.DiskID != "" {
+		m.recordParkerAttach(opts.DiskID, vol)
 	}
 	return "", nil
+}
+
+func (m *parkerQEMUService) recordParkerAttach(slot, volid string) {
+	if m.parkerAttached == nil {
+		m.parkerAttached = make(map[string]string)
+	}
+	m.parkerAttached[slot] = volid
 }
 
 func (m *parkerQEMUService) Create(ctx context.Context, node string, params map[string]any) (string, error) {
@@ -1097,6 +1150,58 @@ func TestHandleDetachDisk_ParkedStrategy_RetryAlreadyParked_Nil(t *testing.T) {
 	_, err := h.Handle(context.Background(), detachArgs("100", parkedVolid), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("expected nil error for already-parked retry; got: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Already-detached on vmA, disk held by a real vmB → refuse park (F-W6-02)
+// ---------------------------------------------------------------------------
+
+// TestHandleDetachDisk_ParkedStrategy_RealVMHolder_NoPark verifies that on a
+// stale-Director-retry where detach_disk(vmA) finds the disk already detached
+// from vmA but the disk is now attached to a different real (non-parker) VM
+// vmB, the handler does NOT park the disk (which would double-reference the
+// volume) and returns nil (idempotent), making zero AttachDisk/Create calls.
+func TestHandleDetachDisk_ParkedStrategy_RealVMHolder_NoPark(t *testing.T) {
+	t.Parallel()
+	const (
+		sourceVMID  = 100
+		realVMID    = 200 // outside parker range → a real VM
+		parkedVolid = "local-lvm:vm-9001-disk-0"
+	)
+
+	qemuSvc := &parkerQEMUService{
+		sourceVMID:      sourceVMID,
+		parkerVMIDStart: 90000,
+		// vmA (source) no longer holds the disk → alreadyDetached=true.
+		sourceCfg: map[string]any{"scsi0": testDiskCID},
+		// vmB (real holder) currently holds the disk on an active bus.
+		realHolderVMID: realVMID,
+		realHolderCfg:  map[string]any{"scsi1": parkedVolid},
+		// No parker exists.
+		parkerCfg: map[string]any{},
+		attachDiskFn: func(_ context.Context, _ string, _ int, _ string, _ string, _ *qemu.AttachOpts) (string, error) {
+			return "", errors.New("AttachDisk must not be called: disk held by a real VM")
+		},
+		createFn: func(_ context.Context, _ string, _ map[string]any) (string, error) {
+			return "", errors.New("Create must not be called: disk held by a real VM")
+		},
+	}
+	// Cluster: source VM present (node resolution) AND realVMID holds the disk.
+	clusterSvc := &mockClusterSvc{
+		listResourcesFn: func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+			sourceRaw, _ := json.Marshal(map[string]any{"vmid": sourceVMID, "node": testNode, "type": "qemu"})
+			realRaw, _ := json.Marshal(map[string]any{"vmid": realVMID, "node": testNode, "type": "qemu"})
+			resp := cluster.ListResourcesResponse{sourceRaw, realRaw}
+			return &resp, nil
+		},
+	}
+
+	h := handlers.HandleDetachDisk(detachDepsParked(qemuSvc, clusterSvc))
+
+	_, err := h.Handle(context.Background(), detachArgs("100", parkedVolid), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("expected nil (idempotent no-op) when a real VM holds the disk; got: %v", err)
 	}
 }
 

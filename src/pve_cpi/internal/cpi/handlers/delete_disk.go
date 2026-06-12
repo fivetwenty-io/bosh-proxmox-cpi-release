@@ -24,17 +24,14 @@ func unparkBeforeDelete(ctx context.Context, deps Deps, diskCID, bareDiskCID str
 		VMIDRangeEnd:   deps.Config.ParkedDiskVMIDRangeEndValue(),
 		DirectorID:     deps.Config.StemcellDirectorID(),
 	}
-	_, _, _, parked, isPErr := pve.IsDiskParked(ctx, deps.PVE, deps.Logger, bareDiskCID, parkerCfg)
-	if isPErr != nil {
-		return cpierrors.Wrap(isPErr, "delete_disk: is-parked check")
-	}
-	if parked {
-		if unparkErr := pve.UnparkDisk(ctx, deps.PVE, deps.Logger, bareDiskCID, parkerCfg); unparkErr != nil {
-			deps.Logger.Info("delete_disk: unpark failed, returning retriable error",
-				log.String("disk_cid", diskCID),
-			)
-			return cpierrors.Wrap(unparkErr, "delete_disk: unpark before delete")
-		}
+	// UnparkDisk re-runs the is-parked check internally and is idempotent when
+	// the disk is not parked, so calling it directly avoids a redundant
+	// cluster scan and the TOCTOU window a separate IsDiskParked probe opens.
+	if unparkErr := pve.UnparkDisk(ctx, deps.PVE, deps.Logger, bareDiskCID, parkerCfg); unparkErr != nil {
+		deps.Logger.Info("delete_disk: unpark failed, returning retriable error",
+			log.String("disk_cid", diskCID),
+		)
+		return cpierrors.Wrap(unparkErr, "delete_disk: unpark before delete")
 	}
 	return nil
 }
