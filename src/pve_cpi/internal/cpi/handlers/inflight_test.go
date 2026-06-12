@@ -11,7 +11,7 @@ import (
 )
 
 // TestInflightUnlimited: limit<=0 → acquire never blocks; all goroutines proceed.
-// Uses a local registry instance; does not touch the package-level inflightSems.
+// Uses a local registry instance, mirroring the per-process registry main.go injects via Deps.Inflight.
 func TestInflightUnlimited(t *testing.T) {
 	reg := &nodeInflightRegistry{m: map[string]chan struct{}{}}
 
@@ -43,7 +43,7 @@ func TestInflightUnlimited(t *testing.T) {
 }
 
 // TestInflightLimitedSemaphore: limit=2 → 3rd acquire blocks until a release.
-// Uses a local registry instance; does not touch the package-level inflightSems.
+// Uses a local registry instance, mirroring the per-process registry main.go injects via Deps.Inflight.
 func TestInflightLimitedSemaphore(t *testing.T) {
 	reg := &nodeInflightRegistry{m: map[string]chan struct{}{}}
 
@@ -90,7 +90,7 @@ func TestInflightLimitedSemaphore(t *testing.T) {
 }
 
 // TestInflightCtxCancel: ctx cancel while blocked → acquire returns ctx.Err(), no leak.
-// Uses a local registry instance; does not touch the package-level inflightSems.
+// Uses a local registry instance, mirroring the per-process registry main.go injects via Deps.Inflight.
 // A ready channel replaces the prior time.Sleep to ensure the goroutine has
 // reached the blocking select before cancel fires.
 func TestInflightCtxCancel(t *testing.T) {
@@ -129,7 +129,7 @@ func TestInflightCtxCancel(t *testing.T) {
 }
 
 // TestInflightPerNodeIsolation: nodeA at limit does NOT block nodeB.
-// Uses a local registry instance; does not touch the package-level inflightSems.
+// Uses a local registry instance, mirroring the per-process registry main.go injects via Deps.Inflight.
 func TestInflightPerNodeIsolation(t *testing.T) {
 	reg := &nodeInflightRegistry{m: map[string]chan struct{}{}}
 
@@ -164,7 +164,7 @@ func TestInflightPerNodeIsolation(t *testing.T) {
 // cpierrors.Retriable — exactly as the five handler call-sites do — yields
 // OkToRetry=true. This is a regression guard: the previous cpierrors.Cloud
 // wrapper returned OkToRetry=false, meaning the Director would never re-queue.
-// Uses a local registry instance; does not touch the package-level inflightSems.
+// Uses a local registry instance, mirroring the per-process registry main.go injects via Deps.Inflight.
 // A ready channel replaces the prior time.Sleep to ensure the goroutine is
 // blocked on the semaphore before cancel fires.
 func TestInflightAcquireFailureIsRetriable(t *testing.T) {
@@ -203,7 +203,7 @@ func TestInflightAcquireFailureIsRetriable(t *testing.T) {
 }
 
 // TestInflightReleaseIdempotent: double-release does not panic or deadlock.
-// Uses a local registry instance; does not touch the package-level inflightSems.
+// Uses a local registry instance, mirroring the per-process registry main.go injects via Deps.Inflight.
 func TestInflightReleaseIdempotent(t *testing.T) {
 	reg := &nodeInflightRegistry{m: map[string]chan struct{}{}}
 
@@ -219,5 +219,31 @@ func TestInflightReleaseIdempotent(t *testing.T) {
 		}
 	}()
 	release()
+	release()
+}
+
+// TestInflightNilRegistry: a nil *nodeInflightRegistry (Deps literal without
+// Inflight) must behave as unlimited — acquire returns a no-op release and no
+// error even with a positive limit.
+func TestInflightNilRegistry(t *testing.T) {
+	var reg *nodeInflightRegistry
+	release, err := reg.acquire(context.Background(), "node1", 2)
+	if err != nil {
+		t.Fatalf("nil registry: unexpected error: %v", err)
+	}
+	if release == nil {
+		t.Fatal("nil registry: release must be non-nil")
+	}
+	release()
+	release() // double release must also be safe on the no-op path
+}
+
+// TestNewInflightRegistry: the constructor returns a usable empty registry.
+func TestNewInflightRegistry(t *testing.T) {
+	reg := NewInflightRegistry()
+	release, err := reg.acquire(context.Background(), "node1", 1)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	release()
 }

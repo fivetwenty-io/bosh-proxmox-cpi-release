@@ -479,7 +479,7 @@ func HandleCreateStemcell(deps Deps) cpi.Handler {
 		// max_inflight_per_node is set. Replication to other nodes is gated
 		// per-node inside replicateStemcellToNodes.
 		if deps.Config != nil {
-			inflightRelease, inflightErr := inflightSems.acquire(ctx, templateNode, deps.Config.MaxInflightPerNodeLimit())
+			inflightRelease, inflightErr := deps.Inflight.acquire(ctx, templateNode, deps.Config.MaxInflightPerNodeLimit())
 			if inflightErr != nil {
 				return nil, cpierrors.Retriable(
 					"create_stemcell: in-flight limit exceeded or context cancelled on node %s: %s",
@@ -2310,7 +2310,7 @@ func listClusterNodes(ctx context.Context, deps Deps) ([]string, error) {
 // Concurrency safety:
 //   - uploadStemcellImage opens its own file handle per call — no shared *os.File.
 //   - deps.Logger.With(...) returns a new zap logger; zap is concurrency-safe.
-//   - inflightSems.acquire keys by node name and uses sync.Mutex internally — safe
+//   - deps.Inflight.acquire keys by node name and uses sync.Mutex internally — safe
 //     under concurrent different-node calls from multiple goroutines.
 //   - VMID allocation uses AllocateWithRetry which regenerates on conflict — safe
 //     under concurrent cluster-wide allocation from parallel goroutines.
@@ -2443,14 +2443,14 @@ func replicateOneNode(
 	//
 	// Per-node in-flight gate wrapped in an IIFE so defer fires at the
 	// end of this node's work, avoiding the deferInLoop resource-leak pattern.
-	// inflightSems.acquire is concurrency-safe (uses sync.Mutex internally);
+	// deps.Inflight.acquire is concurrency-safe (uses sync.Mutex internally);
 	// different-node goroutines contend only on the registry mutex, not on each
 	// other's semaphore channels.
 	replicaCP := cp
 	replicaCP.Node = node
 	func() {
 		if deps.Config != nil {
-			replicaRelease, replicaInflightErr := inflightSems.acquire(ctx, node, deps.Config.MaxInflightPerNodeLimit())
+			replicaRelease, replicaInflightErr := deps.Inflight.acquire(ctx, node, deps.Config.MaxInflightPerNodeLimit())
 			if replicaInflightErr != nil {
 				nodeLogger.Warn("create_stemcell: replication: in-flight limit; skipping replica node",
 					log.String("node", node),

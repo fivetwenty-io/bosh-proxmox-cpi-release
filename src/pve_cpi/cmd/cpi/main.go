@@ -240,6 +240,7 @@ func runWithArgs(args []string, stdin io.Reader, stdout, stderr io.Writer, opts 
 		RegistryAgent: registryAgent, // nil unless agent_mode=auto and registry_endpoint set
 		Logger:        logger,
 		Resolver:      backendResolver,
+		Inflight:      handlers.NewInflightRegistry(),
 	})
 
 	maxLine := opts.MaxLineBytes

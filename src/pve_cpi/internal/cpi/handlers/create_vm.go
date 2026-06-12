@@ -361,7 +361,7 @@ func createVM(
 	// 3b. Per-node in-flight gate (opt-in; limit=0 → unlimited, no gating).
 	// -----------------------------------------------------------------------
 	if deps.Config != nil {
-		inflightRelease, inflightErr := inflightSems.acquire(ctx, shape.node, deps.Config.MaxInflightPerNodeLimit())
+		inflightRelease, inflightErr := deps.Inflight.acquire(ctx, shape.node, deps.Config.MaxInflightPerNodeLimit())
 		if inflightErr != nil {
 			return nil, cpierrors.Retriable("create_vm: in-flight limit exceeded or context cancelled on node %s: %s", shape.node, inflightErr.Error())
 		}

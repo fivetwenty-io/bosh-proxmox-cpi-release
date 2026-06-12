@@ -37,6 +37,11 @@ type Deps struct {
 	Logger        *log.Logger
 	Resolver      pve.BackendResolver
 	FetchResolver func(rawURL string) (stemcellfetch.Source, stemcellfetch.Reference, error)
+	// Inflight holds the per-node in-flight semaphores that gate mutating
+	// handlers when max_inflight_per_node is set. main.go constructs one via
+	// NewInflightRegistry so all handlers share it. Nil (e.g. in test Deps
+	// literals) behaves as unlimited: acquire is nil-receiver-safe.
+	Inflight *nodeInflightRegistry
 }
 
 // backendResolverOrDefault returns d.Resolver if non-nil; otherwise it builds a

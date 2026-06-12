@@ -279,7 +279,7 @@ func HandleDeleteVM(deps Deps) cpi.Handler {
 
 		// --- per-node in-flight gate (opt-in; limit=0 → unlimited, no gating) ---
 		if deps.Config != nil {
-			inflightRelease, inflightErr := inflightSems.acquire(ctx, node, deps.Config.MaxInflightPerNodeLimit())
+			inflightRelease, inflightErr := deps.Inflight.acquire(ctx, node, deps.Config.MaxInflightPerNodeLimit())
 			if inflightErr != nil {
 				return nil, cpierrors.Retriable("delete_vm: in-flight limit exceeded or context cancelled on node %s: %s", node, inflightErr.Error())
 			}

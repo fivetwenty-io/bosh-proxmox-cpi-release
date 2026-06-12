@@ -19,14 +19,18 @@ type nodeInflightRegistry struct {
 	m  map[string]chan struct{}
 }
 
-// inflightSems is the package-level registry shared by all handlers.
-// Exported as a variable (not a constant) so tests can reset it between runs.
-var inflightSems = &nodeInflightRegistry{m: map[string]chan struct{}{}}
+// NewInflightRegistry returns an empty per-node in-flight registry. main.go
+// constructs one and injects it via Deps.Inflight so all handlers built from
+// the same Deps share it; tests construct local instances for isolation.
+func NewInflightRegistry() *nodeInflightRegistry { //nolint:revive // unexported-return: deliberate — the type stays internal, the constructor is the only cross-package surface
+	return &nodeInflightRegistry{m: map[string]chan struct{}{}}
+}
 
 // acquire acquires one slot for node under the given limit. When limit <= 0,
 // no gating is applied: the registry is not consulted and a no-op release
 // function is returned immediately. This preserves byte-identical behavior for
-// the default unlimited configuration.
+// the default unlimited configuration. A nil receiver behaves the same as
+// limit <= 0 (unlimited), so Deps literals that omit Inflight stay safe.
 //
 // When limit > 0, a buffered channel of size limit is lazily created for node
 // on first call. Subsequent calls with a different limit for the same node reuse
@@ -45,7 +49,7 @@ var inflightSems = &nodeInflightRegistry{m: map[string]chan struct{}{}}
 func (r *nodeInflightRegistry) acquire(ctx context.Context, node string, limit int) (release func(), err error) {
 	noop := func() {}
 
-	if limit <= 0 {
+	if r == nil || limit <= 0 {
 		return noop, nil
 	}
 
