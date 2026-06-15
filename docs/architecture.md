@@ -1,6 +1,6 @@
 # Architecture
 
-The BOSH PVE CPI is a Go binary that implements the BOSH CPI v2 specification for PVE 9.x. The director invokes the binary once per request, exchanging JSON-RPC envelopes over stdin and stdout. Internally the code splits into layered packages. Each layer has a single responsibility and a narrow interface, so unit tests replace dependencies with mocks.
+The BOSH PVE CPI is a Go binary that implements the BOSH CPI v2 specification for PVE 9.x. The director invokes the binary once per request, exchanging JSON-RPC envelopes over stdin and stdout. Internally, the code splits into layered packages. Each layer has a single responsibility and a narrow interface, so unit tests replace dependencies with mocks.
 
 This document describes the structure: where code lives, how the packages depend on one another, what happens during a single request, the cross-cutting mechanisms that span packages, and how errors flow back to the director. For method signatures and per-method behavior, see [CPI Methods](cpi_methods.md).
 
@@ -18,7 +18,7 @@ The Go module path is `github.com/fivetwenty-io/bosh-pve-cpi`, and the internal 
 
 ## Package Layers
 
-Packages are grouped by role, each described in one sentence.
+Packages are grouped by role. Each is described in one sentence.
 
 ### Entry and transport
 
@@ -158,23 +158,23 @@ These mechanisms span multiple packages. Operational depth lives in the linked s
 
 ### Dispatcher: panic recovery, timeout, and tracing
 
-The dispatcher wraps every handler call in `recover()`. A recovered panic becomes a `RetriableCloud` error and a logged stack trace, so the director re-drives the call instead of receiving a malformed response. A configurable per-request timeout bounds each call. Request tracing is gated behind a config flag; when on, the dispatcher passes arguments and results through `RedactSecrets` before logging them. A CPI failure must never wedge the director or leak a secret into a log.
+The dispatcher wraps every handler call in `recover()`. A recovered panic becomes a `RetriableCloud` error and a logged stack trace, so the director re-drives the call instead of receiving a malformed response. A configurable per-request timeout bounds each call. Request tracing is gated behind a config flag; when enabled, the dispatcher passes arguments and results through `RedactSecrets` before logging them. A CPI failure must never wedge the director or leak a secret into a log.
 
 ### Rollback stack
 
-`WrapHandler` installs a `rollbackHolder`, a LIFO stack of cleanup functions, into the request context at registration time. After acquiring a resource (a VM, a disk, an LB backend), a handler or hook calls `RegisterRollback`. `WrapHandler` runs the stack only when the inner handler returns a non-nil error, and a `sync.Once` makes the firing idempotent. Every method gets partial-failure cleanup without per-handler boilerplate; a half-created VM does not leak.
+`WrapHandler` installs a `rollbackHolder` — a LIFO stack of cleanup functions — into the request context at registration time. After acquiring a resource (a VM, a disk, or an LB backend), a handler or hook calls `RegisterRollback`. `WrapHandler` runs the stack only when the inner handler returns a non-nil error, and a `sync.Once` makes the firing idempotent. Every method gets partial-failure cleanup without per-handler boilerplate; a half-created VM does not leak.
 
 ### Hooks middleware
 
-`hooks.Registry` is a `map[string]func(Deps) cpi.Hook`. Config validation rejects any configured hook name absent from the map. At startup `cmd/cpi` resolves the configured names, builds `Deps` (logger, LB client, config), and passes the constructed hooks to the dispatcher, which chains them around each handler. Four hooks ship: `audit_log` logs the call and duration, `notes_audit` writes VM notes on create, `lb_register` adds and removes HAProxy backends (with an SSRF guard and a rollback registration so deregistration fires on create failure), and `external_command` runs a sandboxed command through `internal/exec`. With no hooks configured the overhead is zero. Hook configuration properties are documented in [Configuration](configuration.md).
+`hooks.Registry` is a `map[string]func(Deps) cpi.Hook`. Config validation rejects any configured hook name absent from the map. At startup, `cmd/cpi` resolves the configured names, builds `Deps` (logger, LB client, and config), and passes the constructed hooks to the dispatcher, which chains them around each handler. Four hooks ship: `audit_log` logs the call and duration, `notes_audit` writes VM notes on create, `lb_register` adds and removes HAProxy backends (with an SSRF guard and a rollback registration so deregistration fires on create failure), and `external_command` runs a sandboxed command through `internal/exec`. With no hooks configured, the overhead is zero. Hook configuration properties are documented in [Configuration](configuration.md).
 
 ### Placement and AZ anti-affinity
 
-`GatherNodeFacts` queries `/cluster/status`, `/cluster/resources`, and per-node storage to build each node's memory, CPU, storage, guest count, and HA tags. `ScoreNodes` computes a weighted sum (memory 1.0, storage 0.5, CPU 0.5, guest count 0.3, anti-affinity penalty 5.0×). The `create_vm` handler calls `SelectNode` and feeds the winner to every subsequent clone and attach call, then optionally writes a PVE HA node-affinity rule (`bosh-na-{vmid}`). A sentinel AZ value of `dlb` hands placement to the PVE 9.2 Dynamic Load Balancer instead; see [DLB-Aware Placement](dlb-aware-placement.md). VMs land on nodes that can host them, and anti-affinity groups spread across failure domains.
+`GatherNodeFacts` queries `/cluster/status`, `/cluster/resources`, and per-node storage to build each node's memory, CPU, storage, guest count, and HA tags. `ScoreNodes` computes a weighted sum (memory 1.0, storage 0.5, CPU 0.5, guest count 0.3, anti-affinity penalty 5.0×). The `create_vm` handler calls `SelectNode`, feeds the winner to every subsequent clone and attach call, and optionally writes a PVE HA node-affinity rule (`bosh-na-{vmid}`). A sentinel AZ value of `dlb` hands placement to the PVE 9.2 Dynamic Load Balancer instead; see [DLB-Aware Placement](dlb-aware-placement.md). VMs land on nodes that can host them, and anti-affinity groups spread across failure domains.
 
 ### Cluster pool lock
 
-PVE resource pools double as a cluster-wide mutex: `POST /pools` is pmxcfs-serialized, so a duplicate poolid returns a 4xx, which means the lock is held. `AcquireClusterLock` creates a `bosh-lock-{key}` pool, embedding an owner UUID and an expiry in the pool comment; waiters poll and steal a lock past its expiry. The CPI uses it to serialize the read-modify-write of HA anti-affinity rules across concurrent `create_vm` processes, which would otherwise clobber one another.
+PVE resource pools double as a cluster-wide mutex: `POST /pools` is pmxcfs-serialized, so a duplicate poolid returns a 4xx, signaling that the lock is held. `AcquireClusterLock` creates a `bosh-lock-{key}` pool, embedding an owner UUID and an expiry in the pool comment; waiters poll and steal a lock past its expiry. The CPI uses this to serialize the read-modify-write of HA anti-affinity rules across concurrent `create_vm` processes, which would otherwise clobber one another.
 
 ### Layered cloud properties and storage tiers
 
@@ -182,29 +182,29 @@ PVE resource pools double as a cluster-wide mutex: `POST /pools` is pmxcfs-seria
 
 ### Agent mode selection
 
-Four agent modes exist: `cloudinit` (the default), `registry`, `noagent`, and `auto`. The `auto` mode defers the choice to `create_vm` time, inspecting the stemcell API version (parsed by `parseAPIVersion`); it picks the registry agent when a registry endpoint is configured and falls back to cloudinit otherwise. The factory rejects `auto` directly, since auto is resolved per call rather than once at startup. The `internal/configdrive` package builds the ISO 9660 image that the cloudinit path delivers; see [ConfigDrive](configdrive.md).
+Four agent modes exist: `cloudinit` (the default), `registry`, `noagent`, and `auto`. The `auto` mode defers the choice to `create_vm` time, inspecting the stemcell API version (parsed by `parseAPIVersion`); it picks the registry agent when a registry endpoint is configured, and falls back to cloudinit otherwise. The factory rejects `auto` directly, because auto is resolved per call rather than once at startup. The `internal/configdrive` package builds the ISO 9660 image that the cloudinit path delivers; see [ConfigDrive](configdrive.md).
 
 ### Retry, pushback, and in-flight limiting
 
-`RetryOnTransient` wraps every PVE API call: exponential backoff of 1s × 1.5ⁿ with ±30% jitter, capped at 15s, up to 8 attempts. `IsPVEPushback` detects HTTP 429 and known PVE phrase patterns and injects a longer `PushbackBackoff` (5s base, 60s cap). An optional per-node in-flight semaphore (`max_inflight_per_node`) gates mutating calls before they reach PVE, reducing pushback at the source. pvedaemon recycles workers and serializes per-storage operations under burst load, making all three layers necessary; see [PVE Transient Transport Faults](pve-transient-transport.md) and [PVE Storage Locking](pve-storage-locking.md).
+`RetryOnTransient` wraps every PVE API call: exponential backoff of 1s × 1.5ⁿ with ±30% jitter, capped at 15s, up to 8 attempts. `IsPVEPushback` detects HTTP 429 and known PVE phrase patterns and injects a longer `PushbackBackoff` (5s base, 60s cap). An optional per-node in-flight semaphore (`max_inflight_per_node`) gates mutating calls before they reach PVE, reducing pushback at the source. Because pvedaemon recycles workers and serializes per-storage operations under burst load, all three layers are necessary; see [PVE Transient Transport Faults](pve-transient-transport.md) and [PVE Storage Locking](pve-storage-locking.md).
 
 ### Task awaiting
 
-Every PVE call that returns a UPID is awaited via `AwaitTask` before the handler returns. By default the wrapper polls at a fixed 2-second interval. When adaptive polling is enabled, the interval varies between 1 and 10 seconds based on the task's reported progress, polling faster as a task nears completion. Standard calls use a 300-second deadline; stemcell upload and VM disk import use a 600-second deadline (`pve.StemcellMaxWait`) to accommodate large qcow2 files and format conversion such as qcow2 → raw on LVM storage.
+Every PVE call that returns a UPID is awaited via `AwaitTask` before the handler returns. By default, the wrapper polls at a fixed 2-second interval. When adaptive polling is enabled, the interval varies between 1 and 10 seconds based on the task's reported progress, polling faster as the task nears completion. Standard calls use a 300-second deadline; stemcell upload and VM disk import use a 600-second deadline (`pve.StemcellMaxWait`) to accommodate large qcow2 files and format conversion such as qcow2 → raw on LVM storage.
 
 ### Log redaction
 
-`RedactSecrets` deep-walks maps and strings before anything reaches the log. It masks map values whose key contains a sensitive fragment (password, secret, token, mbus, signature, and similar) or matches `user`/`username` exactly, URL userinfo segments (`scheme://user:pass@host`), and URL query parameters matching a sensitive fragment or the exact `sig`. The dispatcher applies it to traced arguments and results, and the same walk masks credentials embedded in URL-shaped strings. Credentials in cloud properties or registry endpoints must never appear in plaintext logs.
+`RedactSecrets` deep-walks maps and strings before anything reaches the log. It masks map values whose key contains a sensitive fragment (password, secret, token, mbus, signature, and similar) or matches `user`/`username` exactly, URL userinfo segments (`scheme://user:pass@host`), and URL query parameters matching a sensitive fragment or the exact token `sig`. The dispatcher applies it to traced arguments and results; the same walk masks credentials embedded in URL-shaped strings. Credentials in cloud properties or registry endpoints must never appear in plaintext logs.
 
 ## Error Mapping
 
-Every SDK error flows through `internal/pve.WrapError`, which classifies HTTP 4xx as a non-retriable `CloudError` and HTTP 5xx and network timeouts as `RetriableCloudError`. A 404 returns a non-retriable `CloudError` that callers upgrade: `WrapNotFoundVM` and `WrapNotFoundDisk` turn it into `VMNotFound` or `DiskNotFound` at the call site, where the resource type is known. The dispatcher serializes the resulting error's `Type()`, `Error()`, and `OkToRetry()` into the JSON-RPC error envelope, and the director uses `OkToRetry` to decide whether to re-drive the call.
+Every SDK error flows through `internal/pve.WrapError`, which classifies HTTP 4xx as a non-retriable `CloudError` and HTTP 5xx and network timeouts as `RetriableCloudError`. A 404 returns a non-retriable `CloudError` that callers upgrade: `WrapNotFoundVM` and `WrapNotFoundDisk` convert it to `VMNotFound` or `DiskNotFound` at the call site, where the resource type is known. The dispatcher serializes the resulting error's `Type()`, `Error()`, and `OkToRetry()` into the JSON-RPC error envelope; the director uses `OkToRetry` to decide whether to re-drive the call.
 
 ## Stemcell Model
 
-Each stemcell is backed by a single frozen PVE template VM. `create_vm` clones that template rather than running a qcow2 block-copy per VM. On linked-clone-capable backends this drops VM creation from roughly four minutes to seconds.
+Each stemcell is backed by a single frozen PVE template VM. `create_vm` clones that template rather than running a qcow2 block-copy per VM. On linked-clone-capable backends, this drops VM creation from roughly four minutes to seconds.
 
-`create_stemcell` uploads the disk image (extracting a gzip+tar tarball first when needed), imports it into a new QEMU VM in the template VMID range (default `[30000, 30999]`), freezes that VM with `MakeTemplate`, and tags it with a short SHA so later calls can find it. The returned stemcell CID is `template:<vmid>`, for example `template:30042`. Template creation is idempotent: an existing template with the canonical name is reused. For multi-node clusters, `stemcell_storage` must be a shared pool reachable from every node; `create_stemcell` rejects local storage there, while single-node clusters may use it. The `stemcell_fetch` pipeline can fetch a tarball from S3 or local storage and replicate the frozen template across nodes in parallel, and templates carry provenance tags that a cross-node sweep uses to garbage-collect orphans on delete.
+`create_stemcell` uploads the disk image (extracting a gzip+tar tarball first when needed), imports it into a new QEMU VM in the template VMID range (default `[30000, 30999]`), freezes that VM with `MakeTemplate`, and tags it with a short SHA so later calls can find it. The returned stemcell CID is `template:<vmid>` — for example, `template:30042`. Template creation is idempotent: an existing template with the canonical name is reused. For multi-node clusters, `stemcell_storage` must be a shared pool reachable from every node; `create_stemcell` rejects local storage there, while single-node clusters may use it. The `stemcell_fetch` pipeline can fetch a tarball from S3 or local storage and replicate the frozen template across nodes in parallel; templates carry provenance tags that a cross-node sweep uses to garbage-collect orphans on delete.
 
 `create_vm` and `delete_stemcell` both dispatch on the stemcell CID format:
 

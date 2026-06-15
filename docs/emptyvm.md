@@ -1,8 +1,8 @@
 # Smoke-Testing the Director with an `emptyvm` Deployment
 
-After `bosh create-env` brings up a Director (see [bosh-create-env.md](bosh-create-env.md)), the next thing to verify is that the Director itself can drive the PVE CPI end-to-end: upload a stemcell, render a cloud-config, create a VM, attach a persistent disk, and complete the agent handshake.
+After `bosh create-env` brings up a Director (see [bosh-create-env.md](bosh-create-env.md)), verify that the Director can drive the PVE CPI end-to-end: upload a stemcell, render a cloud-config, create a VM, attach a persistent disk, and complete the agent handshake.
 
-The `emptyvm` deployment is the minimum smoke test. It boots a single stemcell VM with **no jobs** — just a bare bosh-agent. If it converges, the full CPI surface (create_stemcell, create_vm, create_disk, attach_disk, agent settings delivery, network plumbing) is healthy. If it fails, the trace shows exactly which CPI method is broken.
+The `emptyvm` deployment is the minimum smoke test. It boots a single stemcell VM with no jobs — just a bare bosh-agent. If it converges, the full CPI surface (create_stemcell, create_vm, create_disk, attach_disk, agent settings delivery, network plumbing) is healthy. If it fails, the trace shows exactly which CPI method is broken.
 
 This document covers:
 
@@ -22,11 +22,11 @@ Two files in `manifests/`, both driven by `vars.yml`:
 
 ### `manifests/cloud-config.yml`
 
-Minimal cloud-config — one AZ, two `vm_types` (`default` for compilation workers, `small` for instances), one `disk_type`, one manual network on the same subnet as the Director, and a compilation pool.
+Minimal cloud-config: one AZ, two `vm_types` (`default` for compilation workers, `small` for instances), one `disk_type`, one manual network on the same subnet as the Director, and a compilation pool.
 
 Key fields:
 
-- **`azs`** — single AZ named `z1`. PVE has no real AZ concept; the label is bookkeeping only.
+- **`azs`** — single AZ named `z1`. PVE has no AZ concept; the label is bookkeeping only.
 
 - **`vm_types[*].cloud_properties`** — passed to `create_vm` as `cloud_properties`. The CPI honors `cores`, `memory` (MiB), `disk` (MiB — used for the post-clone `scsi0` resize), and `network_bridge`.
 
@@ -34,7 +34,7 @@ Key fields:
 
 - **`networks[*]`** — one `manual` subnet covering the same `192.168.1.0/24` the Director sits on. `reserved` excludes the gateway and the Director IP so the next free address goes to the smoke-test VM (typically `192.168.1.2`).
 
-- **`compilation`** — minimal one-AZ pool. Cloud-config validation requires it, even when no release will compile.
+- **`compilation`** — minimal one-AZ pool. Cloud-config validation requires it even when no release will compile.
 
 ### `manifests/emptyvm.yml`
 
@@ -68,7 +68,7 @@ update:
   serial:            true
 ```
 
-The `stemcells[*].os` value must match the stemcell uploaded in step 3 below. The defaults in `vars.yml` use `ubuntu-noble`; if you swap to `ubuntu-jammy`, edit both the URL/SHA in `vars.yml` and `os:` here.
+The `stemcells[*].os` value must match the stemcell uploaded in step 3 below. The defaults in `vars.yml` use `ubuntu-noble`. If you swap to `ubuntu-jammy`, edit both the URL and SHA in `vars.yml` and the `os:` field here.
 
 ## 2. Target the Director
 
@@ -86,7 +86,7 @@ export BOSH_CLIENT_SECRET=$(bosh int manifests/creds.yml --path /admin_password)
 bosh env
 ```
 
-`bosh env` should print the Director name and UUID. If it errors with a TLS or `connection refused`, see Troubleshooting in [bosh-create-env.md](bosh-create-env.md).
+`bosh env` should print the Director name and UUID. If it errors with a TLS error or `connection refused`, see Troubleshooting in [bosh-create-env.md](bosh-create-env.md).
 
 ## 3. Upload stemcell, cloud-config, and deploy
 
@@ -103,7 +103,7 @@ bosh update-cloud-config manifests/cloud-config.yml -l manifests/vars.yml
 bosh -d emptyvm deploy manifests/emptyvm.yml -l manifests/vars.yml
 ```
 
-Watch the task output. A clean run takes roughly one to two minutes and walks through:
+Watch the task output. A clean run takes roughly one to two minutes and proceeds through:
 
 1. `create_stemcell` — uploads the qcow2 image directly to `pve_stemcell_storage` (file-based PVE storage with `import` content enabled).
 
@@ -111,7 +111,7 @@ Watch the task output. A clean run takes roughly one to two minutes and walks th
 
 3. `create_disk` + `attach_disk` — allocates a synthetic vmid in `[9000,29999]`, creates `vm-<vmid>-disk-0` on `pve_disk_storage`, attaches it to the new VM as `scsiN`.
 
-4. Agent configuration — uploads the ConfigDrive ISO to `pve_iso_storage` (default `local`), attaches as `scsi6`, starts the VM.
+4. Agent configuration — uploads the ConfigDrive ISO to `pve_iso_storage` (default `local`), attaches as `scsi30`, starts the VM.
 
 5. Agent handshake — the bosh-agent boots from the stemcell, reads `settings.json` via the OpenStack ConfigDrive datasource, binds the mbus endpoint on `:6868`, registers with the Director.
 
@@ -125,9 +125,9 @@ bosh -d emptyvm instances --details
 bosh -d emptyvm ssh emptyvm/0 -c 'hostname; uptime; lsblk'
 ```
 
-Expected output: one running VM, agent reporting, `lsblk` showing the root disk (`/dev/sda`), the carved ephemeral partition, and the persistent disk (`/dev/sdb` or `/dev/sdc` depending on bus order).
+Expected output: one running VM with the agent reporting, `lsblk` showing the root disk (`/dev/sda`), the carved ephemeral partition, and the persistent disk (`/dev/sdb` or `/dev/sdc` depending on bus order).
 
-On the PVE host the new VM is visible with `qm list` and the persistent disk with `lvs` (lvmthin) or `zfs list` (zfspool). The VM's vmid is in the standard `[100,4999]` range; the persistent disk lives under `vm-9NNN-disk-0`.
+On the PVE host, the new VM is visible with `qm list` and the persistent disk with `lvs` (lvmthin) or `zfs list` (zfspool). The VM's vmid is in the standard `[100,4999]` range; the persistent disk lives under `vm-9NNN-disk-0`.
 
 ## 5. Teardown
 
@@ -135,11 +135,11 @@ On the PVE host the new VM is visible with `qm list` and the persistent disk wit
 bosh -d emptyvm delete-deployment
 ```
 
-This removes the VM and the persistent disk in one step. If `delete-deployment` errors with a leftover resource, see the cleanup commands in [bosh-create-env.md](bosh-create-env.md#9-tearing-down).
+This removes the VM and persistent disk in one step. If `delete-deployment` errors with a leftover resource, see the cleanup commands in [bosh-create-env.md](bosh-create-env.md#9-tearing-down).
 
 ## 6. Common pitfalls
 
-These all surfaced while bringing the CPI up against a real PVE. Each is now handled in the CPI, but the symptoms are worth recognizing.
+These all surfaced while bringing the CPI up against a real PVE cluster. Each is now handled in the CPI, but the symptoms are worth recognizing.
 
 ### Director cannot resolve `pve_host`
 
@@ -179,11 +179,11 @@ Earlier CPI builds passed the full `disk_cid` (`<storage>:<volid>`) to PVE's dis
 
 ### Agent never reports ready
 
-The bosh-agent will sit forever in two specific bad states; both produce the same outward symptom (`Waiting for the agent on VM '<vmid>' to be ready...` hangs):
+The bosh-agent will sit forever in two specific bad states, both producing the same outward symptom (`Waiting for the agent on VM '<vmid>' to be ready...` hangs):
 
-- **Ephemeral disk poll**: an agent config that names a non-existent device (e.g. `Ephemeral: "/dev/sdb"`) makes the `DevicePathResolver` poll forever. The CPI now leaves `Ephemeral` empty and lets the stemcell's `CreatePartitionIfNoEphemeralDisk=true` carve the ephemeral partition out of the root disk.
+- **Ephemeral disk poll**: an agent config that names a non-existent device (e.g., `Ephemeral: "/dev/sdb"`) makes the `DevicePathResolver` poll forever. The CPI leaves `Ephemeral` empty and lets the stemcell's `CreatePartitionIfNoEphemeralDisk=true` carve the ephemeral partition out of the root disk.
 
-- **Disk too small**: stemcell base disk is 5 GiB; the agent cannot carve a usable ephemeral partition without growing it first. The CPI now resizes `scsi0` to `cloud_properties.disk` (MiB) after clone, via a PUT on `/nodes/<node>/qemu/<vmid>/resize`.
+- **Disk too small**: the stemcell base disk is 5 GiB; the agent cannot carve a usable ephemeral partition without growing it first. The CPI resizes `scsi0` to `cloud_properties.disk` (MiB) after clone, via a PUT on `/nodes/<node>/qemu/<vmid>/resize`.
 
 ### Missing `director.cpi_job`
 
@@ -191,7 +191,7 @@ The bosh-agent will sit forever in two specific bad states; both produce the sam
 Can't find property 'director.cpi_job'
 ```
 
-Set by `manifests/cpi.yml` against `/instance_groups/name=bosh/properties/director/cpi_job: pve_cpi`. Without it, `director.yml.erb` aborts during template rendering. The ops file in this repo includes the set; if you fork it, preserve that op.
+Set by `manifests/cpi.yml` against `/instance_groups/name=bosh/properties/director/cpi_job: pve_cpi`. Without it, `director.yml.erb` aborts during template rendering. The ops file in this repo includes this op; if you fork it, preserve it.
 
 ## 7. Reference
 

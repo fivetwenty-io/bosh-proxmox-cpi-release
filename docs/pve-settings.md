@@ -1,6 +1,6 @@
 # Proxmox VE Settings Required by `bosh-pve-cpi`
 
-Prerequisites on the PVE host before `bosh create-env` succeeds. One-time per cluster. Each section gives both the UI path and an equivalent API call.
+Prerequisites on the PVE host that must be in place before `bosh create-env` succeeds. One-time per cluster. Each section gives both the UI path and an equivalent API call.
 
 Examples below assume:
 
@@ -13,7 +13,7 @@ Replace the token secret before running.
 
 ## 1. Enable Local Storage (`disable=0`)
 
-If `local` is flagged disabled in PVE, every stemcell upload fails with a storage-not-active error. Enable it.
+If `local` is disabled in PVE, every stemcell upload fails with a storage-not-active error. Enable it.
 
 UI:
 
@@ -84,9 +84,9 @@ The `content` line must include `import`.
 
 ## 3. Disable Privilege Separation on the API Token
 
-This section covers the `root@pam` quick-start token. For the recommended non-root setup — a dedicated `bosh@pve` user with a custom `BoshOperator` role — see [pve-api-permissions.md](pve-api-permissions.md). The `privsep=0` requirement applies to both paths; the trust boundary is what differs.
+This section covers the `root@pam` quick-start token. For the recommended non-root setup — a dedicated `bosh@pve` user with a custom `BoshOperator` role — see [pve-api-permissions.md](pve-api-permissions.md). The `privsep=0` requirement applies to both paths; only the trust boundary differs.
 
-PVE API tokens default to **Privilege Separation = on**. That gives the token its own (empty) ACL, distinct from the parent user — even when the parent is `root@pam`. The CPI then fails any call that needs full root authority, most visibly `--import-from=<path>` (filesystem-path arguments are user-bound, not ACL-bound).
+PVE API tokens default to **Privilege Separation = on**, giving the token its own (empty) ACL, distinct from the parent user — even when the parent is `root@pam`. The CPI then fails any call that needs full root authority, most visibly `--import-from=<path>` (filesystem-path arguments are user-bound, not ACL-bound).
 
 ### Fix A — Disable Privilege Separation (recommended)
 
@@ -145,7 +145,7 @@ curl -sk -X PUT -H "Authorization: $PVE_TOKEN" \
   https://$PVE_HOST/api2/json/access/acl
 ```
 
-This unlocks ACL-gated APIs, but **not** `--import-from=<path>`. PVE restricts arbitrary-filesystem-path arguments to the `root` user account (or a token with Privilege Separation disabled acting as root). Stemcell upload will still fail.
+This unlocks ACL-gated APIs but **not** `--import-from=<path>`. PVE restricts arbitrary-filesystem-path arguments to the `root` user account (or a token with Privilege Separation disabled acting as root). Stemcell upload will still fail.
 
 **TL;DR:** Use Fix A. Fix B alone is insufficient for stemcell import.
 
@@ -173,11 +173,68 @@ Expect:
 
 If the calls return `401`, the token secret is wrong. If any field is off, re-run the matching section above.
 
+## 4. IOMMU Enablement for PCI Passthrough
+
+**This section applies only if you use `pci_passthroughs` in `create_vm` cloud_properties.** Standard BOSH deployments that do not pass host PCI devices to VMs can skip it.
+
+PCI passthrough requires the host CPU's IOMMU (Input-Output Memory Management Unit) to be enabled. IOMMU lets the kernel isolate PCI device DMA access to the guest VM's address space. Without it, the hypervisor cannot safely expose the device to a guest.
+
+### 4a. Enable IOMMU in the kernel boot parameters
+
+Edit `/etc/default/grub` on each PVE node that will host VMs with PCI passthrough:
+
+For Intel CPUs:
+
+```
+GRUB_CMDLINE_LINUX_DEFAULT="quiet intel_iommu=on iommu=pt"
+```
+
+For AMD CPUs:
+
+```
+GRUB_CMDLINE_LINUX_DEFAULT="quiet amd_iommu=on iommu=pt"
+```
+
+The `iommu=pt` flag enables pass-through mode, avoiding IOMMU translation overhead for devices not passed to guests. Apply the change and reboot:
+
+```bash
+update-grub
+reboot
+```
+
+Verify IOMMU is active after reboot:
+
+```bash
+dmesg | grep -e DMAR -e IOMMU | head -10
+```
+
+Expect lines such as `DMAR: IOMMU enabled` (Intel) or `AMD-Vi: AMD IOMMUv2 loaded` (AMD).
+
+### 4b. Load VFIO kernel modules
+
+VFIO is the kernel framework that mediates PCI device ownership between host and guest:
+
+```bash
+# Append to /etc/modules
+echo -e "vfio\nvfio_iommu_type1\nvfio_pci\nvfio_virqfd" >> /etc/modules
+update-initramfs -u -k all
+```
+
+### 4c. Enable IOMMU in the PVE BIOS passthrough mode
+
+In the PVE web UI:
+
+1. Select the node → System → BIOS.
+
+2. Ensure **IOMMU** (also labelled **VT-d** on Intel or **AMD-Vi** on AMD) is enabled in the firmware settings. This is a firmware toggle, not an OS toggle — the kernel parameter in §4a activates the OS-side driver, but the firmware must expose the hardware capability first.
+
+> **Operator note:** PCI passthrough is incompatible with live migration. The CPI enforces this automatically: any VM created with `pci_passthroughs` receives a strict HA node-affinity pin that prevents the PVE HA manager from migrating it. IOMMU group isolation is the operator's responsibility — the CPI validates that the requested PCI address exists on the target node but does not inspect IOMMU group membership.
+
 ## Cluster topology limitations
 
 ### Single-node vs. multi-node PVE
 
-The CPI reads `config.node` for node-scoped operations (bridge create/delete, VM placement when no cloud-property override is supplied). On a single-node cluster this works transparently because there is only one node to target. On multi-node clusters, ensure `config.node` names a node that is reachable and that hosts (or will host) the resources the CPI manages.
+The CPI reads `config.node` for node-scoped operations (bridge create/delete, VM placement when no cloud-property override is supplied). On a single-node cluster this works transparently because there is only one node to target. On multi-node clusters, ensure `config.node` names a reachable node that hosts (or will host) the resources the CPI manages.
 
 VM-scan operations (e.g., `has_vm`, `get_disks`) search across all cluster nodes and do not depend on `config.node`.
 
@@ -185,7 +242,7 @@ VM-scan operations (e.g., `has_vm`, `get_disks`) search across all cluster nodes
 
 Linux bridges are per-node configuration objects. The CPI creates a bridge on the node resolved at `create_network` time (`cloud_properties.node` if supplied, otherwise `config.node`) and deletes it from `config.node` at `delete_network` time.
 
-**Operator requirement:** do not change `config.node` between `create_network` and `delete_network` for the same network CID. If `config.node` is changed in between, `delete_network` will target the wrong node and the bridge on the original node will be left behind. Clean it up manually:
+**Operator requirement:** do not change `config.node` between `create_network` and `delete_network` for the same network CID. If `config.node` changes in between, `delete_network` targets the wrong node and the bridge on the original node is left behind. Clean it up manually:
 
 ```bash
 # On the original node
@@ -201,11 +258,11 @@ This limitation does not affect the SDN path; SDN vnets are cluster-global and a
 
 ### SDN `sdn_auto_manage_zone` scope
 
-The `sdn_auto_manage_zone` CPI config flag controls whether the CPI creates or deletes SDN zones on your behalf. It does **not** invent zone names.
+The `sdn_auto_manage_zone` CPI config flag controls whether the CPI creates or deletes SDN zones on your behalf. It does **not** invent zone names or relax the requirement that the zone name be provided.
 
 | Flag value | Zone absent from PVE | Zone name not supplied by operator |
 |---|---|---|
 | `false` (default) | `create_network` returns an error | `create_network` returns an error |
 | `true` | CPI creates the zone in PVE | `create_network` returns an error — a name is still required |
 
-The operator must always supply the zone name via `cloud_properties.zone` or `config.sdn_zone`. Setting `sdn_auto_manage_zone: true` only allows the CPI to create a zone that does not yet exist in PVE, and to delete a zone that becomes empty after `delete_network`. It does not relax the requirement that the zone name be provided.
+The operator must always supply the zone name via `cloud_properties.zone` or `config.sdn_zone`. Setting `sdn_auto_manage_zone: true` only allows the CPI to create a zone that does not yet exist in PVE, and to delete a zone that becomes empty after `delete_network`.

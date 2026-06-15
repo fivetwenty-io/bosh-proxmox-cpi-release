@@ -3,7 +3,7 @@
 The BOSH PVE CPI maps BOSH persistent disks to PVE storage volumes. Each
 disk lives on a single PVE storage and attaches to one VM at a time. This
 page covers how the CPI selects the target node for each disk operation,
-which PVE storage types are supported, the cloud-properties knobs an operator
+which PVE storage types are supported, the cloud-properties an operator
 can set per disk pool, disk CID encoding, and the delete safety guard.
 
 ## Backend auto-classification
@@ -50,17 +50,42 @@ All keys are optional. Unset keys fall back to CPI defaults
 | `iops_rd`            | Integer | Read IOPS limit. Set to `0` to remove the limit.                                                                                                                                           |
 | `iops_wr`            | Integer | Write IOPS limit. Set to `0` to remove the limit.                                                                                                                                          |
 | `virtio_scsi_single` | Boolean | Enables `virtio-scsi-single` controller mode (one controller per disk). Opt-in; default uses a shared `virtio-scsi-pci` controller.                                                        |
+| `retain_on_delete`   | Boolean | When `true`, opts this disk out of deletion during `delete_disk` and `delete_vm`. The volume is preserved on storage; the CPI skips its deletion step and logs the retained volume. Default: omitted (deletion proceeds normally). |
 
 Per-disk performance settings take precedence over the global `pve.disk_performance.*` defaults
 in the CPI config. See [configuration.md](configuration.md) for the full property reference.
+
+### Retain-on-delete
+
+Setting `retain_on_delete: true` on a `create_disk` cloud_properties block encodes a retention flag into the disk CID at creation time. The flag is carried in `DiskCIDMeta.Opts` as `retain_on_delete=1` and survives `attach_disk`, `detach_disk`, and `update_disk` operations — the CID is preserved throughout the disk's lifetime.
+
+Both `delete_disk` and `delete_vm` check this flag before destroying a volume:
+
+- **`delete_disk`:** if the flag is present, the CPI skips the `DELETE /nodes/{n}/storage/{s}/content/{volume}` call and returns success without destroying the volume. The volume remains on storage.
+
+- **`delete_vm`:** persistent disks flagged `retain_on_delete` that are still attached to the VM at delete time are detached and preserved, following the same foreign-disk guard described below.
+
+Use this flag for volumes whose lifecycle the Director should not control — for example, a shared data volume or a manually managed backup disk. Volumes retained this way are invisible to subsequent BOSH deployments; coordinate their cleanup outside BOSH.
+
+Example:
+
+```yaml
+disk_pools:
+- name: retained-data
+  disk_size: 102400
+  cloud_properties:
+    storage: ceph-rbd
+    disk_format: raw
+    retain_on_delete: true
+```
 
 ## Disk delete state guard
 
 The `pve.disk_delete_state_guard` config property (default: off) blocks `delete_disk` when
 the disk's hosting VM is in a transient state (such as locked, migrating, or snapshotting). When
 enabled, `delete_disk` defers deletion and returns a retriable error; the Director retries on the
-next cycle. The guard fails open on any resolution uncertainty so that disks attached to no VM
-pass straight through without delay.
+next cycle. The guard fails open on resolution uncertainty so that disks attached to no VM
+pass through without delay.
 
 ## Node selection precedence
 
@@ -188,7 +213,7 @@ automatically when `attach_disk` runs. They also override the global
 `delete_vm` destroys the VM along with its root and ephemeral disks, but must never
 destroy a persistent disk that the BOSH Director has not explicitly released.
 
-Persistent disks are identified by the VMID label embedded in their PVE volid.
+Persistent disks are identified by the VMID embedded in their PVE volid.
 `create_disk` allocates volumes under a synthetic free VMID chosen at creation
 time, so a persistent disk volid such as `zfs-1:vm-15689-disk-0` carries VMID
 15689 even while attached to VM 6031. Any active-slot disk whose embedded VMID
@@ -197,14 +222,14 @@ differs from the owning VM's VMID is a foreign persistent disk.
 If a persistent disk is still attached to an active bus slot when `delete_vm`
 runs — for example, after an interrupted Director recreate that skipped
 `detach_disk` — the CPI detaches it automatically. The volume is preserved on
-storage; only then is the VM destroyed.
+storage before the VM is destroyed.
 
 If the detach cannot complete (for example, because PVE returns a lock-timeout
 error), `delete_vm` refuses to destroy the VM and returns a retriable error.
 The Director retries; the next attempt re-detaches before proceeding. No volume
-is lost due to a transient PVE failure.
+is lost to a transient PVE failure.
 
-A persistent volume can also linger in an unused (`unusedN`) config slot when a
+A persistent volume can also linger in an `unusedN` config slot when a
 snapshot reference prevents PVE from fully sweeping it during the detach. The CPI
 probes the configured `pve.disk_storage` for the volume and refuses to destroy the VM
 while any such volume still exists. This refusal is not retriable: remove the
@@ -217,14 +242,14 @@ and the fast-path (`fast_path_delete: true`) delete path.
 
 ## Known limitations
 
-- **Snapshots require the disk to be attached.** PVE does not provide a per-volume snapshot primitive; `snapshot_disk` takes a VM snapshot of the host VM. Detached-disk snapshots would require a worker-VM workaround (tracked separately).
+- **Snapshots require the disk to be attached.** PVE provides no per-volume snapshot primitive; `snapshot_disk` takes a VM snapshot of the host VM. Detached-disk snapshots would require a worker-VM workaround (tracked separately).
 
-- **No cross-node move.** Once a local-storage disk lives on `pve-01`, recreating its owner VM on `pve-02` is rejected by `attach_disk`. Use `pvesm move` manually, or use a shared backend.
+- **No cross-node move.** Once a local-storage disk lives on `pve-01`, recreating its owner VM on `pve-02` is rejected by `attach_disk`. Use `pvesm move` manually, or switch to a shared backend.
 
 - **`set_disk_metadata`** stashes BOSH metadata in the host VM's description (sentinel comment block). Detached disks log a warning and persist nothing.
 
 - **Shrink not supported.** PVE's resize endpoint is additive only; requesting a smaller size returns `NotSupported`. Enable `pve.resize_wait_for_convergence` to poll until the guest filesystem reports the new size after an additive resize.
 
-- **Detached disks have no PVE-side ownership protection by default.** A detached disk floats as an unattached volume inside its synthetic VMID container. PVE has no first-class volume object, so an administrator scanning for unused VMs can delete that container and destroy the disk with it. The opt-in `detached_disk_strategy: parked` mode attaches detached disks to a dedicated parker VM with `protection=1`, making ownership visible in the PVE UI and blocking accidental deletion. See [Persistent Disk Strategy](persistent-disk-strategy.md) for the full analysis and configuration details.
+- **Detached disks have no PVE-side ownership protection by default.** A detached disk floats as an unattached volume inside its synthetic VMID container. PVE has no first-class volume object, so an administrator scanning for unused VMs can delete that container and destroy the disk. The opt-in `detached_disk_strategy: parked` mode attaches detached disks to a dedicated parker VM with `protection=1`, making ownership visible in the PVE UI and blocking accidental deletion. See [Persistent Disk Strategy](persistent-disk-strategy.md) for the full analysis and configuration details.
 
 Refer to [configuration.md](configuration.md) for the full property reference.

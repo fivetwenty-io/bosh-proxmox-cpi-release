@@ -1,14 +1,14 @@
 # PVE Host Tuning for BOSH Workloads
 
-Operator-side knobs on the PVE node itself. None of these are required for the CPI to function — the defaults work for small deploys. Tune them once your BOSH director starts driving sustained concurrent CPI traffic (typical thresholds called out per section).
+Operator-side knobs on the PVE node itself. None of these is required for the CPI to function — the defaults work for small deploys. Tune them once your BOSH director starts driving sustained concurrent CPI traffic (typical thresholds called out per section).
 
 The CPI's [per-storage lock retry](pve-storage-locking.md) absorbs short bursts on its own. Host tuning matters when the contention is structural: too few API workers to accept the calls, or storage backends that serialise harder than the retry budget can ride out.
 
-Apply every change on every node in the cluster. The PVE config files under `/etc/default/` are node-local, not replicated via pmxcfs.
+Apply every change on every cluster node. The PVE config files under `/etc/default/` are node-local, not replicated via pmxcfs.
 
 ## 1. Raise `pvedaemon` Worker Count
 
-`pvedaemon` listens on `127.0.0.1:85` and handles every internal API call (`pveproxy` forwards to it, as do `qm`, `pvesm`, `pct`, and friends). With the default of 3 workers, a director worker pool of 8+ will queue calls behind the daemon under load — visible as slow `create_vm` / `create_disk` calls even when no storage lock is involved, and as HTTP 596 / auth-ticket EOFs when a worker recycles mid-burst (see [PVE Transient Transport Faults](pve-transient-transport.md)).
+`pvedaemon` listens on `127.0.0.1:85` and handles every internal API call (`pveproxy` forwards to it, as do `qm`, `pvesm`, `pct`, and friends). With the default of 3 workers, a director worker pool of 8+ queues calls behind the daemon under load — visible as slow `create_vm` / `create_disk` calls even when no storage lock is involved, and as HTTP 596 / auth-ticket EOFs when a worker recycles mid-burst (see [PVE Transient Transport Faults](pve-transient-transport.md)).
 
 Edit `/etc/default/pvedaemon`:
 
@@ -40,7 +40,7 @@ Should print the number you set.
 
 - Multiple directors against one PVE cluster: 10–16.
 
-- Cap at the node's vCPU count. Each worker is a Perl process; idle cost is small (~30 MB RSS), but a saturated worker burns a core.
+- Cap at the node's vCPU count. Each worker is a Perl process; idle cost is small (~30 MB RSS), but a saturated worker consumes a core.
 
 ## 2. Raise `pveproxy` Worker Count
 
@@ -58,7 +58,7 @@ Restart:
 systemctl restart pveproxy.service spiceproxy.service
 ```
 
-Restarting `pveproxy` drops in-flight HTTPS connections, including web UI sessions and VNC consoles. Do it during a maintenance window or accept a few seconds of UI blip; CPI calls will retry on transport errors.
+Restarting `pveproxy` drops in-flight HTTPS connections, including web UI sessions and VNC consoles. Do it during a maintenance window or accept a few seconds of UI disruption; CPI calls retry on transport errors.
 
 Verify:
 
@@ -66,11 +66,11 @@ Verify:
 ps -ef | grep '[p]veproxy worker' | wc -l
 ```
 
-**Sizing guidance:** match `pvedaemon` MAX_WORKERS. Set both together — bumping one without the other moves the bottleneck rather than removing it.
+**Sizing guidance:** match `pvedaemon` MAX_WORKERS. Set both together — bumping one without the other moves the bottleneck rather than eliminating it.
 
 ## 3. Optional: Lengthen `pveproxy` Idle Timeout
 
-Default request idle timeout on `pveproxy` is short enough that long-running task waits (stemcell import on slow storage, large persistent disk resize) occasionally surface as `Connection reset by peer` in CPI logs. The CPI retries on these, but if your logs show frequent transport-level resets:
+The default request idle timeout on `pveproxy` is short enough that long-running task waits (stemcell import on slow storage, large persistent disk resize) occasionally surface as `Connection reset by peer` in CPI logs. The CPI retries on these, but if your logs show frequent transport-level resets:
 
 Edit `/etc/default/pveproxy`:
 
@@ -80,11 +80,11 @@ TIMEOUT=1800
 
 Restart `pveproxy` as above.
 
-This is uncommon. Only set it if you see actual reset noise — over-long timeouts mask genuine hung tasks.
+This is uncommon. Set it only if you see actual reset noise — over-long timeouts mask genuine hung tasks.
 
 ## 4. Split Stemcell and VM Storages
 
-The single largest source of CPI latency under concurrent deploys is the per-storage lockfile (`/var/lock/pve-manager/pve-storage-<name>`). Stemcell import, root-disk resize, and persistent-disk allocation all contend for the same lock when they live on the same storage pool.
+The single largest source of CPI latency under concurrent deploys is the per-storage lockfile (`/var/lock/pve-manager/pve-storage-<name>`). Stemcell import, root-disk resize, and persistent-disk allocation all contend for the same lock when they share a storage pool.
 
 Put stemcells on one storage and VM root disks on another, both shared across the cluster. The CPI honours this via two distinct settings:
 
@@ -94,11 +94,11 @@ Put stemcells on one storage and VM root disks on another, both shared across th
 
 See [Configuration — Stemcell Storage](configuration.md#stemcell-storage) and [PVE Storage Locking](pve-storage-locking.md) for the full picture.
 
-This is the single highest-leverage change for any deploy larger than a few VMs. Worker tuning helps the API plane; storage splitting helps the data plane, and the data plane is usually where deploys stall.
+This is the highest-leverage change for any deploy larger than a few VMs. Worker tuning helps the API plane; storage splitting helps the data plane, and the data plane is usually where deploys stall.
 
 ## 5. Storage Backend Throughput
 
-The per-storage lock is held for the duration of the underlying I/O. A 4 GB stemcell import on a slow NFS mount holds the lock for tens of seconds; on a local NVMe or fast Ceph pool, it's gone in seconds. Two practical knobs:
+The per-storage lock is held for the duration of the underlying I/O. A 4 GB stemcell import on a slow NFS mount holds the lock for tens of seconds; on a local NVMe or fast Ceph pool, it is gone in seconds. Two practical knobs:
 
 - **Match storage type to workload.** Stemcell storage benefits most from sequential read throughput (qcow2 copy-out). VM storage benefits from random I/O for the resize and runtime. Persistent disks vary by job.
 
@@ -113,14 +113,14 @@ window (Linux defaults: `tcp_keepalive_time=7200` s before the first
 keepalive probe is sent), at which point a stateful bridge,
 conntrack entry, or upstream router may silently drop the half-open
 flow. The next packet from either side gets RST'd, the agent reconnects,
-and any RPC the director published during the gap is lost — surfacing
-as `Timed out sending '<verb>' to instance: <inst>'`.
+and any RPC the director published during the gap is lost — surfacing as
+`Timed out sending '<verb>' to instance: <inst>'`.
 
 This is a *path-level* failure, distinct from the NATS-server
 `ping_interval` (handled at the director itself via
 `manifests/bosh/nats-tuning.yml`). Tighter host-level keepalives
-ensure the TCP flow keeps reannouncing itself to anything tracking
-it, well before any reasonable idle-drop timer fires.
+keep the TCP flow reannouncing itself to anything tracking it,
+well before any reasonable idle-drop timer fires.
 
 Apply on every PVE node:
 
@@ -138,14 +138,14 @@ EOF
 sysctl --system
 ```
 
-If a Linux bridge or `iptables`/`nftables` rule on the host is doing
-conntrack on the agent → director flow, also confirm
+If a Linux bridge or `iptables`/`nftables` rule on the host is
+conntracking the agent → director flow, also confirm
 `net.netfilter.nf_conntrack_tcp_timeout_established` is well above
 the cumulative keepalive window (default 432000 s — no action needed
 unless an operator lowered it).
 
 These knobs do not affect the agent's own NATS Go client (which has
-its own application-level PING/PONG). They only keep network
+its own application-level PING/PONG). They only prevent network
 elements between the VM and the director from concluding the flow
 is dead during quiet periods.
 
@@ -159,7 +159,7 @@ ps -ef | grep -E '[p]ve(daemon|proxy) worker' | wc -l
 systemctl status pvedaemon pveproxy --no-pager | grep -E '(Active|Main PID)'
 ```
 
-Then run a BOSH deploy that previously showed contention and watch the CPI log for `pve: storage lock timeout, retrying` lines. If retry counts drop and `attempt` values stay below 3, the tuning landed. If retries are still climbing past 5, contention is structural — work on sections 4 and 5.
+Then run a BOSH deploy that previously showed contention and watch the CPI log for `pve: storage lock timeout, retrying` lines. If retry counts drop and `attempt` values stay below 3, the tuning landed. If retries still climb past 5, the contention is structural — address sections 4 and 5.
 
 After applying section 6:
 
@@ -171,11 +171,11 @@ Then run a deploy long enough to traverse a quiet phase (cf-deployment package c
 
 ## What Not to Tune
 
-- **PVE storage lock timeout.** Not user-configurable. The 30 s ceiling is baked into `PVE::Storage::Plugin::lock_storage`. Raising it would require patching Perl modules and would survive neither upgrades nor support contracts.
+- **PVE storage lock timeout.** Not user-configurable. The 30 s ceiling is baked into `PVE::Storage::Plugin::lock_storage`. Raising it requires patching Perl modules and survives neither upgrades nor support contracts.
 
 - **`pvestatd` and `pvescheduler`.** These run on fixed cadences and don't expose worker counts. They're not on the CPI's hot path.
 
-- **Kernel `vm.dirty_*` knobs.** Tempting for NFS-backed storage, but the per-storage lock serialises before the kernel sees the I/O, so these don't help BOSH-deploy contention. They do help bulk migrations and backups.
+- **Kernel `vm.dirty_*` knobs.** Tempting for NFS-backed storage, but the per-storage lock serialises before the kernel sees the I/O, so these do not help BOSH-deploy contention. They do help bulk migrations and backups.
 
 ## References
 

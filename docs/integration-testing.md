@@ -57,11 +57,11 @@ flowchart LR
 
 ### Build tools
 
-- `go` (1.21+) and `make` — required to build `bin/cpi` before Tier 1 runs
+- `go` (1.26+) and `make` — required to build `bin/cpi` before Tier 1 runs
 
 ### Manifest files (gitignored)
 
-The following files must exist and be populated before running any live tier. They are all gitignored and never committed.
+The following files must exist and be populated before running any live tier. They are gitignored and never committed.
 
 - `manifests/bosh/vars.yml`
 PVE connection details: `pve_host`, `pve_port`, `pve_user`, `pve_node`, `pve_api_token` or `pve_password`, `pve_vm_storage`, `pve_disk_storage`, `pve_stemcell_storage`, `pve_iso_storage`, `pve_network_bridge`, `pve_verify_ssl`.
@@ -74,7 +74,7 @@ CF-specific vars including `system_domain`.
 
 ### Stemcell
 
-A BOSH stemcell tarball (`.tgz`) must be available. Supply the path either in `ci/integration.yml` under `tier1.stemcell_path` or via the `STEMCELL_PATH` environment variable.
+A BOSH stemcell tarball (`.tgz`) must be available. Supply the path in `ci/integration.yml` under `tier1.stemcell_path` or via the `STEMCELL_PATH` environment variable.
 
 ### Network
 
@@ -148,7 +148,7 @@ cp ci/integration.yml.example ci/integration.yml
 
 ### How secrets work
 
-`ci/integration.yml` contains only non-secret topology knobs. Every secret (PVE API token or password, BOSH admin password, director CA certificate, CF system domain) is pulled at runtime by calling `bosh int` against the gitignored manifest files. No passwords or tokens are ever written to the config file.
+`ci/integration.yml` contains only non-secret topology knobs. Every secret (PVE API token or password, BOSH admin password, director CA certificate, and CF system domain) is pulled at runtime by calling `bosh int` against the gitignored manifest files. No passwords or tokens are written to the config file.
 
 ### Config key reference
 
@@ -227,9 +227,9 @@ Autodetect requires valid PVE credentials in `bosh_vars`. In `--dry-run` mode au
 
 ### Out-of-band PVE verification
 
-Beyond asserting on the CPI binary's JSON-RPC return values, Tier 1 independently confirms real cluster state by querying the PVE REST API directly (`scripts/_pve_verify.py`). The verifier reuses the **same host and authentication as the CPI config** — `api_token` becomes an `Authorization: PVEAPIToken=` header; a `password` config performs a `/access/ticket` login and uses the `PVEAuthCookie`. It queries list endpoints (`/cluster/sdn/vnets`, `/cluster/sdn/zones`, `/nodes/{node}/qemu`, `/nodes/{node}/network`, storage content) and tests membership, which sidesteps PVE's inconsistent 404/500 behavior on per-id GETs.
+Beyond asserting on the CPI binary's JSON-RPC return values, Tier 1 independently confirms real cluster state by querying the PVE REST API directly (`scripts/_pve_verify.py`). The verifier reuses the **same host and authentication as the CPI config** — `api_token` becomes an `Authorization: PVEAPIToken=` header; a `password` config performs a `/access/ticket` login and uses the `PVEAuthCookie`. It queries list endpoints (`/cluster/sdn/vnets`, `/cluster/sdn/zones`, `/nodes/{node}/qemu`, `/nodes/{node}/network`, and storage content) and tests membership, which sidesteps PVE's inconsistent 404/500 behavior on per-id GETs.
 
-Verified steps: `create_network` → vnet+subnet (SDN) or bridge present; `create_vm` → VM present; `create_disk` → volume present; `delete_vm` → VM gone; `delete_network` → vnet/bridge gone. A failed verification aborts the run exactly like a CPI error. `scripts/_pve_verify.py` is stdlib-only and can be run standalone for a connectivity smoke, e.g. `./scripts/_pve_verify.py --config cpi.json vnet itvnet`.
+Verified steps: `create_network` → vnet+subnet (SDN) or bridge present; `create_vm` → VM present; `create_disk` → volume present; `delete_vm` → VM gone; `delete_network` → vnet/bridge gone. A failed verification aborts the run exactly like a CPI error. `scripts/_pve_verify.py` is stdlib-only and can be run standalone for a connectivity smoke — e.g., `./scripts/_pve_verify.py --config cpi.json vnet itvnet`.
 
 ### `scripts/lifecycle` environment variables
 
@@ -283,11 +283,11 @@ Triggers automatically on every push to `main`. Runs `make check` (go vet + stat
 
 Manual trigger only. Requires the `unit` job to have passed (`passed: [unit]`). Runs `./scripts/test integration all` — the full destructive sequence.
 
-**Worker requirement:** the Concourse worker running the `integration` job must have IP reachability to the `192.168.1.0/24` lab subnet. Workers without lab network access will fail at the first PVE API call.
+**Worker requirement:** the Concourse worker running the `integration` job must have IP reachability to the `192.168.1.0/24` lab subnet. Workers without lab network access fail at the first PVE API call.
 
 ### Secrets
 
-Secrets are passed to the integration task as Concourse parameters (the `((double-paren))` syntax). These are resolved from Vault, CredHub, or a local params file at `fly sp` time.
+Secrets are passed to the integration task as Concourse parameters (the `((double-paren))` syntax) and resolved from Vault, CredHub, or a local params file at `fly sp` time.
 
 Key params used by `ci/tasks/integration.yml`:
 
@@ -301,7 +301,7 @@ Key params used by `ci/tasks/integration.yml`:
 | `BOSH_CLIENT_SECRET` | BOSH director admin password |
 | `BOSH_CA_CERT` | BOSH director CA certificate |
 
-`BOSH_VARS_YAML` and `CF_VARS_YAML` are passed as base64-encoded strings. The integration task decodes them to temporary files before calling `./scripts/test integration all`, so `bosh int` can resolve secrets in the normal way.
+`BOSH_VARS_YAML` and `CF_VARS_YAML` are passed as base64-encoded strings. The integration task decodes them to temporary files before calling `./scripts/test integration all` so that `bosh int` can resolve secrets normally.
 
 ### Task image requirements
 

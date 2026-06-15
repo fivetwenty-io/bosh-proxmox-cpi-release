@@ -1,7 +1,7 @@
 # Deploying a BOSH Director to Proxmox VE with `bosh create-env`
 
 This document describes the repeatable workflow for deploying a single-VM BOSH
-Director onto a Proxmox VE (PVE) host using this release and the upstream
+Director on a Proxmox VE (PVE) host using this release and the upstream
 [`cloudfoundry/bosh-deployment`](https://github.com/cloudfoundry/bosh-deployment)
 ops library.
 
@@ -48,7 +48,7 @@ mkdir -p ~/w/cloudfoundry
 git clone https://github.com/cloudfoundry/bosh-deployment ~/w/cloudfoundry/bosh-deployment
 ```
 
-You will pass `~/w/cloudfoundry/bosh-deployment/bosh.yml` as the base manifest.
+Pass `~/w/cloudfoundry/bosh-deployment/bosh.yml` as the base manifest.
 
 ## 4. Prepare `vars.yml`
 
@@ -85,11 +85,11 @@ Required fields:
 
 When `pve.agent_mode = cloudinit` (the default), the CPI delivers settings via an OpenStack ConfigDrive ISO attached as a CD-ROM. The OpenStack stemcells linked above support this layout natively. See [ConfigDrive](configdrive.md).
 
-Keep `vars.yml` out of git. It contains the PVE password.
+Keep `vars.yml` out of git — it contains the PVE password.
 
 ### `pve_host` must be reachable from the Director VM
 
-`pve_host` is written into the rendered `cpi.json` on the Director VM. The Director's own CPI invocations resolve and dial this address from inside that VM, not from the workstation that runs `bosh create-env`.
+`pve_host` is written into the rendered `cpi.json` on the Director VM. The Director's CPI invocations resolve and dial this address from inside that VM, not from the workstation running `bosh create-env`.
 
 Use an address the Director can resolve on its own networks:
 
@@ -99,13 +99,13 @@ Use an address the Director can resolve on its own networks:
 
 - **Bad**: a Tailscale magicDNS hostname like `pve-0.<tailnet>.ts.net`. The Director VM is not on the tailnet; DNS lookups fail with `no such host` and every CPI call from the Director (stemcell upload, VM clone, deploy) errors out before it reaches PVE.
 
-The Mac workstation may reach PVE over Tailscale fine — but `bosh create-env` runs the CPI binary *locally* on the workstation, while subsequent `bosh upload-stemcell`, `bosh deploy`, etc. run the CPI on the Director. They share the same `cpi.json`, so the address must work for both. The LAN IP is the safe default.
+The Mac workstation may reach PVE over Tailscale fine — but `bosh create-env` runs the CPI binary locally on the workstation, while subsequent `bosh upload-stemcell`, `bosh deploy`, and related commands run the CPI on the Director. Both share the same `cpi.json`, so the address must work for both. The LAN IP is the safe default.
 
 ### Authentication
 
 See [pve-api-permissions.md](pve-api-permissions.md) for token creation and the minimum-privilege `bosh@pve` user setup.
 
-The ops file in `manifests/cpi.yml` wires both `pve_password` and `pve_api_token` into the CPI job. Both vars must exist in `vars.yml` so the BOSH var interpolator can resolve them, but only one should hold a real value — leave the other as an empty string. The CPI's Go config validates this XOR at startup (`one of password or api_token is required`; `password and api_token are mutually exclusive`).
+The ops file in `manifests/cpi.yml` wires both `pve_password` and `pve_api_token` into the CPI job. Both vars must exist in `vars.yml` so the BOSH var interpolator can resolve them, but only one should hold a real value — leave the other as an empty string. The CPI validates this XOR at startup (`one of password or api_token is required`; `password and api_token are mutually exclusive`).
 
 Password auth (default):
 
@@ -123,7 +123,7 @@ pve_password:  ""
 pve_api_token: root@pam!tokenid=00000000-0000-0000-0000-000000000000
 ```
 
-Use an API token for any non-interactive automation — it can be scoped and revoked independently of the root password.
+Use an API token for non-interactive automation — it can be scoped and revoked independently of the root password.
 
 ## 5. Run `bosh create-env`
 
@@ -137,11 +137,11 @@ bosh create-env ~/w/cloudfoundry/bosh-deployment/bosh.yml \
   -l manifests/vars.yml
 ```
 
-`scripts/bosh create-env` wraps this exact invocation (with the full ops layering) — prefer it over the raw command above.
+`scripts/bosh create-env` wraps this exact invocation with full ops layering — prefer it over the raw command above.
 
-The `bosh-release.yml` ops file pins the `cloudfoundry/bosh` release to **282.1.13**, overriding whatever version the local `bosh-deployment` checkout ships. Bump the `version`/`url`/`sha1` fields together to move to a newer release.
+The `bosh-release.yml` ops file pins the `cloudfoundry/bosh` release to **282.1.13**, overriding whatever version the local `bosh-deployment` checkout ships. Bump `version`, `url`, and `sha1` together to move to a newer release.
 
-The `jumpbox-user.yml` ops file (optional but recommended) adds a `jumpbox` user with a generated SSH keypair stored in `creds.yml`. Without it, the Director VM has no operator-accessible login — BOSH stemcells ship with root SSH disabled and the bosh-agent resets the `vcap` password on every boot, so direct SSH after deploy is impossible without this ops file.
+The `jumpbox-user.yml` ops file (optional but recommended) adds a `jumpbox` user with a generated SSH keypair stored in `creds.yml`. Without it, the Director VM has no operator-accessible login — BOSH stemcells ship with root SSH disabled, and the bosh-agent resets the `vcap` password on every boot, making direct SSH impossible.
 
 What each flag does:
 
@@ -165,7 +165,7 @@ What each flag does:
 
   Supplies the variables consumed by the ops file.
 
-The first run takes several minutes: upload stemcell template, clone to a VM, attach persistent disk, install Director jobs, mbus handshake.
+The first run takes several minutes: it uploads the stemcell template, clones it to a VM, attaches the persistent disk, installs Director jobs, and completes the mbus handshake.
 
 ## 6. Point the CLI at the new Director
 
@@ -183,7 +183,7 @@ export BOSH_CLIENT_SECRET=$(bosh int manifests/creds.yml --path /admin_password)
 bosh env
 ```
 
-Stash the environment block in a sourceable file for repeat use:
+Stash the environment block in a sourceable file for repeated use:
 
 ```bash
 cat > ~/.bosh-pve.env <<EOF
@@ -196,7 +196,7 @@ EOF
 
 ## 7. SSH into the Director VM
 
-If you deployed with `jumpbox-user.yml` (step 5), pull the private key out of `creds.yml` and connect:
+If you deployed with `jumpbox-user.yml` (step 5), pull the private key from `creds.yml` and connect:
 
 ```bash
 bosh int manifests/creds.yml --path /jumpbox_ssh/private_key > /tmp/jumpbox.key
@@ -214,7 +214,7 @@ sudo cat /var/vcap/sys/log/director/director.log    # Director-side CPI calls
 sudo cat /var/vcap/jobs/pve_cpi/config/cpi.json     # rendered CPI config
 ```
 
-If `bosh ssh` is needed later (against an instance the Director deployed, not the Director itself), it works once the Director is healthy:
+To SSH into an instance the Director deployed (not the Director itself), use `bosh ssh` once the Director is healthy:
 
 ```bash
 bosh -d <deployment> ssh <instance>/<index>
@@ -222,7 +222,7 @@ bosh -d <deployment> ssh <instance>/<index>
 
 ## 8. Updating the Director
 
-To redeploy after changing the release, ops file, or vars:
+To redeploy after changing the release, ops file, or vars, run:
 
 ```bash
 make release VERSION=0.1.0            # rebuild if release code changed
@@ -233,9 +233,9 @@ bosh create-env ~/w/cloudfoundry/bosh-deployment/bosh.yml \
   -l manifests/vars.yml
 ```
 
-`bosh create-env` is idempotent: it reads `state.json`, diffs the manifest, and applies the delta. Keep `state.json` and `creds.yml` together — losing either forces a clean redeploy.
+`bosh create-env` is idempotent: it reads `state.json`, diffs the manifest, and applies the delta. Keep `state.json` and `creds.yml` together — losing either forces a full redeploy.
 
-When the only change is the rendered CPI config (for example, after editing `pve_host` or rebuilding the release tarball), `create-env` still drains and recreates the Director VM. It is *not* a hot in-place reload of `cpi.json` — expect a brief downtime even on "config-only" updates.
+When the only change is the rendered CPI config — for example, after editing `pve_host` or rebuilding the release tarball — `create-env` still drains and recreates the Director VM. It does not hot-reload `cpi.json` in place; expect brief downtime even on config-only updates.
 
 ## 9. Tearing down
 
@@ -247,9 +247,9 @@ bosh delete-env ~/w/bosh-deployment/bosh.yml \
   -l manifests/vars.yml
 ```
 
-This destroys the Director VM, its persistent disk, and the stemcell template on PVE.
+This destroys the Director VM, its persistent disk, and the stemcell template.
 
-If `delete-env` fails partway, residual PVE resources may need manual cleanup before retrying. Run on the PVE host:
+If `delete-env` fails partway, residual PVE resources may need manual cleanup before retrying. On the PVE host, run:
 
 ```bash
 # Replace 105 with the current_vm_cid from state.json, 9000 with the
@@ -260,7 +260,7 @@ lvremove -f <disk_storage>/vm-9000-disk-0 2>/dev/null
 rm -f /var/lib/vz/template/iso/vm-105-config.iso
 ```
 
-`qm destroy --purge` removes the VM and every disk listed in its config — including `unusedN` slots. Persistent disks live under a synthetic vmid (9000-29999); if they were never attached to the deleted VM (or were properly cleared via the SDK's two-PUT `DetachDisk`) they survive. Bare orphans on storage that no VM ever referenced must be removed explicitly with `lvremove` / `zfs destroy`.
+`qm destroy --purge` removes the VM and every disk listed in its config, including `unusedN` slots. Persistent disks live under a synthetic vmid (9000-29999); if they were never attached to the deleted VM, or were properly cleared via the SDK's two-PUT `DetachDisk`, they survive. Bare orphans on storage that no VM ever referenced must be removed explicitly with `lvremove` or `zfs destroy`.
 
 ## 10. Files in this workflow
 
@@ -284,7 +284,7 @@ Add `manifests/vars.yml`, `manifests/state.json`, `manifests/creds.yml`, and `bo
 
 - **PVE returns 401 / token errors**
 
-  Verify `pve_user` includes the realm suffix (`root@pam`) and that the password or token is correct. Set exactly one of `pve_password` or `pve_api_token` in `vars.yml`; leave the other as `""`. See [Authentication](#authentication).
+  Verify `pve_user` includes the realm suffix (`root@pam`) and that the password or token is correct. Set exactly one of `pve_password` or `pve_api_token` in `vars.yml` and leave the other as `""`. See [Authentication](#authentication).
 
 - **`create-env` fails with `Expected to find variables: pve_api_token` (or `pve_password`)**
 
@@ -292,7 +292,7 @@ Add `manifests/vars.yml`, `manifests/state.json`, `manifests/creds.yml`, and `bo
 
 - **VM provisions but agent never reports**
 
-  Most often a network problem: the Director VM cannot reach the mbus endpoint at `((internal_ip)):6868`. Confirm the bridge, gateway, and DNS in `vars.yml` match the PVE network.
+  This is most often a network problem: the Director VM cannot reach the mbus endpoint at `((internal_ip)):6868`. Confirm the bridge, gateway, and DNS in `vars.yml` match the PVE network.
 
 - **Stemcell upload is slow or times out**
 
@@ -300,7 +300,7 @@ Add `manifests/vars.yml`, `manifests/state.json`, `manifests/creds.yml`, and `bo
 
 - **Need a fresh state**
 
-  Delete `manifests/state.json` and `manifests/creds.yml` and rerun `create-env`. The previous Director VM, if still present, must be removed from PVE manually first (see [Tearing down](#9-tearing-down) for the cleanup commands, including the synthetic-vmid persistent disk).
+  Delete `manifests/state.json` and `manifests/creds.yml`, then rerun `create-env`. If the previous Director VM still exists, remove it from PVE manually first (see [Tearing down](#9-tearing-down) for the cleanup commands, including the synthetic-vmid persistent disk).
 
 - **`Image is not in qcow2 format` during create_stemcell**
 
@@ -308,7 +308,7 @@ Add `manifests/vars.yml`, `manifests/state.json`, `manifests/creds.yml`, and `bo
 
 - **`parameter 'storage' not allowed for linked clones`**
 
-  Triggered when `pve_vm_storage` differs from the stemcell template's storage and `full_clone` is unset. The CPI now forces `full_clone=true` whenever `vm_storage` is set, but stale ops files that override this may still trip the error.
+  Triggered when `pve_vm_storage` differs from the stemcell template's storage and `full_clone` is unset. The CPI forces `full_clone=true` whenever `vm_storage` is set, but stale ops files that override this may still trigger the error.
 
 - **`can't upload to storage type 'lvmthin'` on ConfigDrive ISO**
 
@@ -320,7 +320,7 @@ Add `manifests/vars.yml`, `manifests/state.json`, `manifests/creds.yml`, and `bo
 
 - **`Logical Volume "vm-NNNN-disk-0" already exists in volume group`**
 
-  Orphan persistent disk from a prior failed run. The CPI now scans the disk storage for existing `vm-9NNN-disk-N` volumes when allocating a synthetic VMID, but stale orphans created before this fix may need manual removal:
+  Orphan persistent disk from a prior failed run. The CPI scans the disk storage for existing `vm-9NNN-disk-N` volumes when allocating a synthetic VMID, but stale orphans created before this fix may need manual removal:
 
   ```bash
   ssh root@<pve> 'lvremove -f <storage>/vm-9000-disk-0'
@@ -342,13 +342,13 @@ Add `manifests/vars.yml`, `manifests/state.json`, `manifests/creds.yml`, and `bo
 
   Re-deploying the Director destroyed its previous persistent disk. Root cause: PVE's `PUT /qemu/{vmid}/config` with `delete: scsiN` demotes the disk to an `unusedN` slot rather than fully clearing it. A subsequent `DELETE /qemu/{vmid}` then destroys every disk still referenced in the VM config — `unusedN` included — silently nuking the volume.
 
-  Fixed in two layers:
+  The fix has two layers:
 
   - **SDK (`pve-apiclient-go` ≥ v3.1.2)**: `qemu.DetachDisk` issues a second `delete: unusedN` PUT after the bus-slot detach so the volume is no longer reachable from the VM config.
 
   - **CPI `delete_vm` guard**: before issuing the destroy, the CPI reads the VM config and refuses to proceed if any `unusedN` entry references a volume on `pve_disk_storage`. This catches future SDK regressions or any bypass path.
 
-  Rebuild the release and re-vendor the SDK if seen on an old build. If the LV is already gone, recover by wiping `manifests/state.json` + `manifests/creds.yml` and re-running `create-env` (a fresh director with a fresh persistent disk), or by manually re-creating the LV with `pvesm alloc <storage> <vmid> <name> <size>M --format raw` if the director identity must be preserved.
+  Rebuild the release and re-vendor the SDK if seen on an old build. If the LV is already gone, recover by deleting `manifests/state.json` and `manifests/creds.yml` and rerunning `create-env` (a fresh Director with a fresh persistent disk), or by manually re-creating the LV with `pvesm alloc <storage> <vmid> <name> <size>M --format raw` if the Director identity must be preserved.
 
 ## 12. Reference
 

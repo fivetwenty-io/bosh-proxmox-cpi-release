@@ -1,10 +1,10 @@
 # Network Management
 
-This CPI supports two network backends for BOSH managed networks: PVE SDN vnets and Linux bridges. When a BOSH cloud-config marks a network as `managed: true`, the Director calls `create_network` to provision the resource and `delete_network` to remove it. All other networks (pre-configured bridges, static VLANs) use `managed: false`; the CPI never calls their lifecycle handlers.
+This CPI supports two network backends for BOSH managed networks: PVE SDN vnets and Linux bridges. When a BOSH cloud-config marks a network as `managed: true`, the Director calls `create_network` to provision the resource and `delete_network` to remove it. All other networks — pre-configured bridges and static VLANs — use `managed: false`; the CPI never calls their lifecycle handlers.
 
 ## SDN vs Bridge Routing
 
-The handler selects a backend based on three inputs: the `network_mode` config property, the `zone` field in `cloud_properties`, and the CPI config `sdn_zone`. The routing logic runs in this order:
+The handler selects a backend based on three inputs: the `network_mode` config property, the `zone` field in `cloud_properties`, and the `sdn_zone` CPI config property. The routing logic runs in this order:
 
 1. If `network_mode` is `"sdn"` → SDN path (unconditional; error if zone unresolvable).
 
@@ -29,15 +29,15 @@ The handler selects a backend based on three inputs: the `network_mode` config p
 
 > **Note:** `config.sdn_zone` is loaded into the same `zone` variable as `cloud_properties.zone` before routing runs; the table reflects the effective per-path outcome.
 
-For `delete_network`, the handler probes the SDN backend first (GET vnet by name). If the vnet exists, it takes the SDN delete path. If PVE reports the vnet absent (`ErrSDNNotFound`), it falls back to the bridge delete path. Any other probe error is returned to the Director.
+For `delete_network`, the handler probes the SDN backend first (GET vnet by name). If the vnet exists, it takes the SDN delete path. If PVE reports the vnet absent (`ErrSDNNotFound`), it falls back to the bridge delete path. Any other probe error is returned to the Director unchanged.
 
 ### SDN Eventual Consistency
 
-After `UpdateSdn` commits the SDN configuration, data-plane realization is asynchronous: each node must propagate the change before VMs can attach to the new vnet. When `pve.network_resolve_retries` is greater than zero, `create_network` polls the running cluster SDN config until the new vnet converges before returning success. The absolute time bound is `pve.network_resolve_timeout_sec` (default 60 s when retries are enabled; 0 = 60 s). When polling times out, the error is retriable and the Director re-drives.
+After `UpdateSdn` commits the SDN configuration, data-plane realization is asynchronous: each node must propagate the change before VMs can attach to the new vnet. When `pve.network_resolve_retries` is greater than zero, `create_network` polls the running cluster SDN config until the new vnet converges, then returns success. The absolute time bound is `pve.network_resolve_timeout_sec` (default 60 s when retries are enabled; 0 = 60 s). When polling times out, the error is retriable and the Director re-drives.
 
-By default `network_resolve_retries` is 0 (polling disabled); behavior is byte-identical to prior releases. External or static bridges such as `vmbr0` are never gated by this poll.
+By default, `network_resolve_retries` is 0 (polling disabled); behavior is byte-identical to prior releases. External or static bridges such as `vmbr0` are never gated by this poll.
 
-For async zone types (vlan, vxlan, evpn), `UpdateSdn` may return a UPID. The CPI awaits the UPID task to completion before the convergence poll begins, so subsequent `ListSdnVnets` calls observe committed state.
+For async zone types (vlan, vxlan, evpn), `UpdateSdn` may return a UPID. The CPI awaits the UPID task before the convergence poll begins, so subsequent `ListSdnVnets` calls observe committed state.
 
 ## cloud_properties schema
 
@@ -57,11 +57,11 @@ PVE enforces a strict naming constraint on vnet identifiers: a vnet name must be
 
 ## Zone auto-management
 
-By default (`sdn_auto_manage_zone: false`), the CPI manages only vnets and subnets within an existing zone. The operator creates and deletes zones through the PVE UI or API. The CPI returns an error if `create_network` is called with a zone that does not exist in PVE.
+By default (`sdn_auto_manage_zone: false`), the CPI manages only vnets and subnets within an existing zone. The operator creates and deletes zones through the PVE UI or API. If `create_network` is called with a zone that does not exist in PVE, the CPI returns an error.
 
-When `sdn_auto_manage_zone: true`, the CPI may create and delete zones autonomously:
+When `sdn_auto_manage_zone: true`, the CPI creates and deletes zones autonomously:
 
-**Auto-create:** If the zone named in `cloud_properties.zone` or `config.sdn_zone` does not exist in PVE at `create_network` time, the CPI creates it using the zone type from `cloud_properties.zone_type` or `config.sdn_zone_type` (default `simple`). A name must always be supplied; the CPI never invents zone names.
+**Auto-create:** If the zone named in `cloud_properties.zone` or `config.sdn_zone` does not exist in PVE at `create_network` time, the CPI creates it using the zone type from `cloud_properties.zone_type` or `config.sdn_zone_type` (default `simple`). A name must always be supplied — the CPI never invents zone names.
 
 **Auto-delete:** At `delete_network` time, the CPI removes the parent zone only when **all three** conditions hold:
 
@@ -71,15 +71,15 @@ When `sdn_auto_manage_zone: true`, the CPI may create and delete zones autonomou
 
 3. The zone has zero remaining vnets after the vnet is removed (confirmed by listing vnets filtered by zone before deleting).
 
-If any condition fails, the zone is left in place. A list failure during the zone-empty check skips deletion rather than returning an error. Zone name comparison is case-insensitive.
+If any condition fails, the zone is left in place. A list failure during the zone-empty check skips deletion instead of returning an error. Zone name comparison is case-insensitive.
 
-**PVE constraint:** The SDN zone create API (`POST /cluster/sdn/zones`) does not accept description, notes, or comment fields. CPI-owned zones are not annotated in PVE; tracking which zones belong to the CPI is done through the stateless config rule (condition 2 above).
+**PVE constraint:** The SDN zone create API (`POST /cluster/sdn/zones`) does not accept description, notes, or comment fields. CPI-owned zones are not annotated in PVE; which zones belong to the CPI is tracked through the stateless config rule (condition 2 above).
 
 ### Rollback on partial create
 
-If zone create, vnet create, or subnet create succeeds but `UpdateSdn` fails, the CPI rolls back in reverse order: subnet → vnet → zone. Each rollback step is guarded: only resources created during the current call are removed; pre-existing resources are never touched. All rollback operations run on a context detached from the caller's cancellation so cleanup runs even if the caller aborts.
+If zone create, vnet create, or subnet create succeeds but `UpdateSdn` fails, the CPI rolls back in reverse order: subnet → vnet → zone. Each rollback step is guarded: only resources created during the current call are removed; pre-existing resources are never touched. All rollback operations run on a context detached from the caller's cancellation, so cleanup runs even if the caller aborts.
 
-A rollback itself calls `applySDN` to commit the staged deletions, because every SDN mutation must be followed by `UpdateSdn` or it remains pending in the PVE config directory. If the rollback apply also fails, the warning is logged and the original error is returned. The `delete_network` path expects all three layers to be fully applied; a partially-applied state is cleaned up on the next `create_network` retry.
+The rollback itself calls `applySDN` to commit the staged deletions, because every SDN mutation must be followed by `UpdateSdn` or it remains pending in the PVE config directory. If the rollback apply also fails, the warning is logged and the original error is returned. The `delete_network` path expects all three layers to be fully applied; a partially applied state is cleaned up on the next `create_network` retry.
 
 ## Manifest examples
 
@@ -122,7 +122,7 @@ networks:
 
 The CPI will:
 
-1. Check whether zone `boshzone` exists; create it (type `simple`) if absent.
+1. Check whether zone `boshzone` exists and create it (type `simple`) if absent.
 
 2. Create vnet `boshvn` in zone `boshzone` (idempotent on conflict).
 
@@ -176,7 +176,7 @@ The CPI will:
 
 ## create_network
 
-The routing and provisioning sequence is visualized below. Phase labels correspond to the prose in [SDN vs Bridge Routing](#sdn-vs-bridge-routing) and [Zone auto-management](#zone-auto-management) above.
+The routing and provisioning sequence is shown below. Phase labels correspond to the prose in [SDN vs Bridge Routing](#sdn-vs-bridge-routing) and [Zone auto-management](#zone-auto-management) above.
 
 ### Routing diagram
 
@@ -209,25 +209,15 @@ flowchart TD
 
 ## delete_network
 
-PVE requires subnets to be deleted before the parent vnet can be deleted. The CPI deletes all subnets for the vnet first, then deletes the vnet, then calls `UpdateSdn` (awaiting the UPID for async zone types), then conditionally removes the parent zone subject to the three-condition guard described in [Zone auto-management](#zone-auto-management).
+PVE requires subnets to be deleted before the parent vnet can be deleted. The CPI deletes all subnets for the vnet first, then the vnet, then calls `UpdateSdn` (awaiting the UPID for async zone types), then conditionally removes the parent zone subject to the three-condition guard described in [Zone auto-management](#zone-auto-management).
 
-Every `ErrSDNNotFound` response during deletion is swallowed so the function is idempotent across repeated or concurrent invocations.
+Every `ErrSDNNotFound` response during deletion is swallowed, making the function idempotent across repeated or concurrent invocations.
 
 ## Isolated test network (SDN)
 
-For deploy testing — especially CloudFoundry, where dozens of VMs are placed at
-once — never share an L2 segment with unmanaged devices. If the deployment
-subnet overlaps a physical office or lab LAN, an address BOSH assigns to a VM
-can collide with a device already using it; two MACs then answer ARP, the
-Director's ARP cache flaps, mbus packets are misdelivered, and agents loop
-`connection reset by peer` → reconnect, failing random instances with
-`Timed out sending 'get_state'`. See
-[Troubleshooting — duplicate IP on a shared LAN](troubleshooting.md#agent-never-comes-up).
+For deploy testing — especially CloudFoundry, where dozens of VMs are placed at once — never share an L2 segment with unmanaged devices. If the deployment subnet overlaps a physical office or lab LAN, an address BOSH assigns to a VM can collide with a device already using it. Two MACs then answer ARP, the Director's ARP cache flaps, mbus packets are misdelivered, and agents loop `connection reset by peer` → reconnect, failing random instances with `Timed out sending 'get_state'`. See [Troubleshooting — duplicate IP on a shared LAN](troubleshooting.md#agent-never-comes-up).
 
-This repo ships a turnkey isolated network as a PVE SDN **simple** zone + vnet +
-subnet on a private `172.x` range. Selecting it moves both the Director and the
-deployment onto a network BOSH fully owns, so no foreign device can claim an
-address.
+This repo ships a turnkey isolated network as a PVE SDN **simple** zone + vnet + subnet on a private `172.x` range. Selecting it moves both the Director and the deployment onto a network BOSH fully owns, so no foreign device can claim an address.
 
 ```bash
 # 1. Create the SDN zone + vnet + subnet + host-firewall allowance (idempotent).
@@ -245,63 +235,68 @@ BOSH_PVE_ENV=cpitest ./scripts/bosh net-status
 BOSH_PVE_ENV=cpitest ./scripts/bosh net-down   # after delete-env + cf teardown
 ```
 
-`net-up` creates a simple zone (a plain local bridge — an isolated L2 segment
-plus a gateway), one vnet whose name becomes the Linux bridge VMs attach to, and
-a subnet with `snat` enabled so VMs reach the internet via the PVE host's uplink
-while staying off the shared LAN. It commits with `pvesh set /cluster/sdn` and is
-idempotent.
+`net-up` creates a simple zone (a plain local bridge — an isolated L2 segment plus a gateway), one vnet whose name becomes the Linux bridge VMs attach to, and a subnet with `snat` enabled so VMs reach the internet via the PVE host's uplink while staying off the shared LAN. It commits with `pvesh set /cluster/sdn` and is idempotent.
 
 ### Host firewall: API access from the isolated subnet
 
-When `pve-firewall` is enabled, the host's INPUT policy DROPs new VM→host
-connections unless explicitly allowed, and the PVE API (`8006`) is further gated
-to a "management" source set. A Director on the shared LAN was implicitly inside
-that management range; once it moves to the isolated subnet it is not, so the
-**in-VM CPI** (which runs on the Director, unlike `create-env`'s CPI, which runs
-locally) can no longer reach `https://<pve_host>:8006`. Every `create_vm` then
-fails with `cluster.ListResources ... dial tcp <pve_host>:8006: connect:
-connection timed out`. `net-up` closes this gap automatically: it adds two
-idempotent rules to `/etc/pve/nodes/<node>/host.fw` permitting the configured
-subnet to reach `8006` (and ICMP), then reloads the firewall. `net-down` removes
-them; `net-status` prints them.
+When `pve-firewall` is enabled, the host's INPUT policy DROPs new VM→host connections unless explicitly allowed, and the PVE API (`8006`) is further gated to a "management" source set. A Director on the shared LAN was implicitly inside that management range; once it moves to the isolated subnet it is not, so the **in-VM CPI** (which runs on the Director, unlike `create-env`'s CPI, which runs locally) can no longer reach `https://<pve_host>:8006`. Every `create_vm` then fails with `cluster.ListResources ... dial tcp <pve_host>:8006: connect: connection timed out`. `net-up` closes this gap automatically: it adds two idempotent rules to `/etc/pve/nodes/<node>/host.fw` permitting the configured subnet to reach `8006` (and ICMP), then reloads the firewall. `net-down` removes them; `net-status` prints them.
 
 ### Operator reachability to the relocated Director
 
-The Director's API/CredHub/UAA listen on its `internal_ip`. After relocation
-that IP lives on the isolated subnet, which is only present on the PVE host —
-the workstation running `bosh`/`./scripts/cf` needs a route to it. If the
-workstation reaches the lab over Tailscale, advertise the subnet from the PVE
-node (`tailscale set --advertise-routes=...,172.31.0.0/24`) and approve it in the
-tailnet admin console; `create-env`'s local CPI still reaches the PVE API over
-the workstation's existing path. Without a route, `alias-env`/`deploy` time out
-against the new Director IP even though the Director itself is healthy.
+The Director's API, CredHub, and UAA listen on its `internal_ip`. After relocation, that IP lives on the isolated subnet, which is only present on the PVE host — the workstation running `bosh` or `./scripts/cf` needs a route to it. If the workstation reaches the lab over Tailscale, advertise the subnet from the PVE node (`tailscale set --advertise-routes=...,172.31.0.0/24`) and approve it in the tailnet admin console; `create-env`'s local CPI still reaches the PVE API over the workstation's existing path. Without a route, `alias-env` and `deploy` time out against the new Director IP even though the Director itself is healthy.
 
 ### Relocating the Director rotates IP-pinned certificates
 
-Moving the Director changes `internal_ip`, and several generated leaf
-certificates embed it in their SAN/CN: `mbus_bootstrap_ssl`, `director_ssl`,
-`nats_server_tls`, `blobstore_server_tls`, `credhub_tls`, `uaa_ssl`, and
-`uaa_service_provider_ssl`. The BOSH CLI only generates a variable when it is
-**absent** from the vars-store, so a plain `create-env` reuses the stale certs
-and the agent bootstrap fails with `x509: certificate is valid for <old-ip>, not
-<new-ip>`. Remove just those seven leaf entries from
-`manifests/bosh/creds.yml` (keep every `*_ca`, encryption key, and password) and
-re-run `create-env`; the CLI regenerates them for the new IP, re-signed by the
-unchanged CAs, so the trust chain and the bosh database (releases, stemcells,
-CredHub data) are preserved.
+Moving the Director changes `internal_ip`, and several generated leaf certificates embed it in their SAN/CN: `mbus_bootstrap_ssl`, `director_ssl`, `nats_server_tls`, `blobstore_server_tls`, `credhub_tls`, `uaa_ssl`, and `uaa_service_provider_ssl`. The BOSH CLI only generates a variable when it is **absent** from the vars-store, so a plain `create-env` reuses the stale certs and the agent bootstrap fails with `x509: certificate is valid for <old-ip>, not <new-ip>`. Remove those seven leaf entries from `manifests/bosh/creds.yml` (keep every `*_ca`, encryption key, and password) and rerun `create-env`; the CLI regenerates them for the new IP, re-signed by the unchanged CAs, so the trust chain and the bosh database (releases, stemcells, CredHub data) are preserved.
 
-Everything is operator-configurable in a single file —
-[`manifests/envs/cpitest/vars.yml`](../manifests/envs/cpitest/vars.yml) — which
-defines the vnet name, zone, CIDR, gateway, reserved bands, and static IPs. The
-same `vars.yml` drives both the SDN objects (`net-up`) and the BOSH manifests
-(Director network + CF cloud-config), so they always agree. To run a different
-layout, copy `manifests/envs/cpitest/` to `manifests/envs/<name>/`, edit the
-copy, and drive it with `BOSH_PVE_ENV=<name>`. Keep these invariants:
-`pve_network_bridge` == `cpitest_sdn_vnet`, `internal_cidr` ==
-`cpitest_sdn_subnet`, `internal_gw` == `cpitest_sdn_gateway`, and every
-reserved/static/host IP inside `internal_cidr`. Proxmox limits zone and vnet
-names to 8 characters; vnet names must be 1–8 lowercase alphanumeric characters. See
-[`manifests/envs/cpitest/README.md`](../manifests/envs/cpitest/README.md).
+Everything is operator-configurable in a single file — [`manifests/envs/cpitest/vars.yml`](../manifests/envs/cpitest/vars.yml) — which defines the vnet name, zone, CIDR, gateway, reserved bands, and static IPs. The same `vars.yml` drives both the SDN objects (`net-up`) and the BOSH manifests (Director network + CF cloud-config), so they always agree. To run a different layout, copy `manifests/envs/cpitest/` to `manifests/envs/<name>/`, edit the copy, and drive it with `BOSH_PVE_ENV=<name>`. Keep these invariants: `pve_network_bridge` == `cpitest_sdn_vnet`, `internal_cidr` == `cpitest_sdn_subnet`, `internal_gw` == `cpitest_sdn_gateway`, and every reserved, static, and host IP inside `internal_cidr`. Proxmox limits zone and vnet names to 8 characters; vnet names must be 1–8 lowercase alphanumeric characters. See [`manifests/envs/cpitest/README.md`](../manifests/envs/cpitest/README.md).
+
+## Router and NAT VMs
+
+VMs that forward traffic between networks — routers, NAT gateways, and software load balancers — require two additional `create_vm` `cloud_properties` settings. Both are set at the VM level, not per-network.
+
+### Per-NIC `ip_forwarding`
+
+Setting `ip_forwarding: true` in a NIC's `cloud_properties` disables the PVE per-NIC firewall for that interface. A router VM must pass packets between its NICs; the PVE NIC-level firewall would otherwise drop forwarded frames even when the VM-level firewall and IP forwarding are enabled in the guest kernel.
+
+
+Effect: the CPI sets `firewall=0` on the matching PVE NIC config entry after clone. NICs with `ip_forwarding: true` are also excluded from the ipset seeding that drives VIP allowed-address-pairs, so no additional ipset rules are needed for the router NIC.
+
+Example NIC entry in a BOSH network spec:
+
+```yaml
+networks:
+- name: external
+  type: manual
+  cloud_properties:
+    vnet: extvn
+    ip_forwarding: true   # disable NIC firewall for this interface
+- name: internal
+  type: manual
+  cloud_properties:
+    vnet: intvn
+```
+
+### VM-level `advertised_routes`
+
+`advertised_routes` is a list of OVN SDN subnet entries the CPI creates in the fabric when the VM is provisioned. Each entry names a PVE vnet and a CIDR the VM will forward. The CPI calls `POST /cluster/sdn/vnets/{vnet}/subnets` for each entry and then commits the change with `PUT /cluster/sdn`.
+
+```yaml
+cloud_properties:
+  advertised_routes:
+  - vnet: intvn
+    destination: 10.64.0.0/16
+  - vnet: dmzvn
+    destination: 172.18.0.0/24
+```
+
+**OVN requirement:** `advertised_routes` injects routes into the OVN logical-router fabric. It requires a PVE SDN zone of type `evpn` or `vxlan` backed by OVN. For non-OVN zone types (simple, vlan), PVE may accept the subnet create request, but no logical-router route is injected; the CPI logs a warning and continues. Verify the zone type before relying on this feature for actual packet forwarding.
+
+**SDN permissions:** the API token must hold `SDN.Allocate` on `/sdn`. See [PVE API permissions](pve-api-permissions.md#2-privileges-the-cpi-actually-uses).
+
+**Rollback:** if `applySDN` fails after some subnets were created, the CPI removes the already-created subnets on a best-effort basis and returns an error. Any subnet the rollback cannot remove is logged by name for operator cleanup.
+
+For the full `create_vm` cloud_properties schema — including `pci_passthroughs`, `retain_ephemeral_on_delete`, hotplug, and NIC-level VIP settings — see [CPI Methods — create_vm](cpi_methods.md#create_vm).
 
 ## Cross-references
 

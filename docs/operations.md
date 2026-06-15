@@ -82,7 +82,7 @@ The `ok_to_retry` field tells the Director whether to re-queue the entire CPI ca
 
 ### Log level
 
-`pve.log_level` is config-only — there is no runtime environment variable override. Valid values are `debug`, `info`, `warn`, and `error`; the default is `info`. Log output is JSON-formatted (slog) and each entry carries the `request_id` and `method` from the active RPC context.
+`pve.log_level` is config-only — no runtime environment variable override exists. Valid values are `debug`, `info`, `warn`, and `error`; the default is `info`. Log output is JSON-formatted (slog); each entry carries the `request_id` and `method` from the active RPC context.
 
 To enable verbose logging, set the level in your deployment manifest and redeploy:
 
@@ -444,7 +444,7 @@ See [PVE Storage Locking](pve-storage-locking.md) for full lock mechanics.
 
 ## Filing a bug report
 
-Collect all of the following before opening an issue.
+Collect the following before opening an issue.
 
 ### Version information
 
@@ -455,7 +455,7 @@ Collect all of the following before opening an issue.
 
 # pve-apiclient-go version — in the release source
 grep pve-apiclient-go /path/to/bosh-pve-cpi-release/src/pve_cpi/go.mod
-# Current release: v3.1.7
+# Current release: v3.2.7
 
 # PVE version — on the PVE host
 pveversion -v
@@ -656,7 +656,7 @@ qm status <vmid>   # should return "no such guest"
 
 ### Policy
 
-Error messages returned to the BOSH Director in the JSON-RPC response envelope must not contain secrets. Secrets include passwords, API tokens, NATS mbus URLs that embed credentials (`nats://user:pass@host:port`), and blobstore credential maps. Filesystem paths and PVE storage names may appear in error messages — they are operational identifiers, not credentials — but full absolute paths should be trimmed to the basename or replaced with a logical identifier when they add no diagnostic value.
+Error messages returned to the BOSH Director in the JSON-RPC response envelope must not contain secrets. Secrets include passwords, API tokens, NATS mbus URLs that embed credentials (`nats://user:pass@host:port`), and blobstore credential maps. Filesystem paths and PVE storage names may appear in error messages — they are operational identifiers, not credentials — but trim full absolute paths to the basename or replace them with a logical identifier when they add no diagnostic value.
 
 ### Mechanism
 
@@ -737,3 +737,134 @@ disk_types:
 ```
 
 See [Configuration — Storage properties](configuration.md) for the full set of `cloud_properties` fields and their defaults.
+
+---
+
+## Parked Disk Strategy
+
+When `detached_disk_strategy: parked` is enabled, the CPI holds detached disks on dedicated parker VMs rather than leaving them as free-floating storage volumes. Parker VMs carry the `bosh-parker` tag and occupy VMIDs in the range **90000–90999**. Each parker can hold up to 31 disks across its SCSI slots. See [Persistent Disk Lifecycle Strategy](persistent-disk-strategy.md) for the full mechanics and trade-off discussion.
+
+### Auditing parked disks with `scripts/disk-audit`
+
+`scripts/disk-audit` is a Python 3 operator tool that queries the PVE API directly and classifies every persistent disk volume in the disk-band (default 9000–29999) across all nodes. Run it from the repo root or any host with PVE API access.
+
+**Setup — create a config file with PVE credentials:**
+
+```json
+{
+  "host": "pve.example.com",
+  "user": "root@pam",
+  "api_token": "root@pam!bosh-cpi=<token-secret>",
+  "verify_ssl": false
+}
+```
+
+**Run a human-readable audit:**
+
+```bash
+python3 scripts/disk-audit --config /path/to/audit-config.json
+```
+
+**Run a machine-readable audit (JSON output):**
+
+```bash
+python3 scripts/disk-audit --config /path/to/audit-config.json --json
+```
+
+**Exit codes:**
+
+| Code | Meaning |
+|---|---|
+| `0` | No free-floating disks — clean |
+| `1` | One or more free-floating disks found — investigate before deleting |
+| `2` | Usage error or fatal transport failure |
+
+**Disk classifications in the report:**
+
+| Classification | Meaning |
+|---|---|
+| `attached` | Volume held by a real (non-parker) VM on an active bus slot |
+| `parked` | Volume held by a parker VM (tag `bosh-parker`, VMID 90000–90999); provenance pulled from parker VM description |
+| `free-floating` | Volume in storage but no VM holds it — potential orphan; triggers exit 1 |
+| `unknown` | Volume found in storage but VMID cannot be determined from the volid pattern |
+
+The script prints warnings to stderr when:
+
+- Parked disks exist but `detached_disk_strategy` in the config file is not `"parked"`.
+
+- Empty parker VMs are found (0 disks held). Each empty parker is a teardown candidate.
+
+### Recovering empty parker VMs
+
+The script prints a `qm destroy` command for each empty parker VM. Verify before running:
+
+```bash
+# Confirm the parker holds no disks
+qm config <parker-vmid> | grep -E '^(scsi|virtio|ide|sata)'
+# Proceed only when the above is empty
+qm destroy <parker-vmid> --purge 1
+```
+
+A parker VM that still holds disks must not be destroyed — doing so deletes those disks permanently. If the parked disk is no longer needed, delete it via BOSH (`bosh delete-disk <cid>`) first.
+
+### Recovering free-floating disks
+
+A `free-floating` disk exists in storage with no VM holding it. Before taking action:
+
+1. Cross-reference the BOSH Director database — `bosh disks --orphaned` lists Director-tracked disks with no current deployment.
+
+2. If the Director tracks the disk, it is a normal detached disk in the `free` strategy (or a parked disk whose parker VM was destroyed). Reattach via a `bosh deploy` or delete via `bosh delete-disk`.
+
+3. If the Director does not track the disk and no deployment references it, it is a true orphan. Remove it using the same steps as [Cleaning up orphaned disks](#cleaning-up-orphaned-disks).
+
+---
+
+## Per-RPC Metrics
+
+The CPI can append one JSON-lines record per CPI RPC to a file; it is disabled by default. Enable it in your deployment manifest:
+
+```yaml
+properties:
+  pve:
+    metrics:
+      enabled: true
+      file_path: /var/vcap/sys/log/bosh/cpi/pve-metrics.jsonl
+```
+
+Set `pve.metrics.enabled: true` and `pve.metrics.file_path` to an absolute path writable by the CPI process. See [Configuration — Per-RPC Metrics](configuration.md#per-rpc-metrics) for the full property reference.
+
+### Record format
+
+Each line is a self-contained JSON object:
+
+```json
+{"ts":"2026-06-15T12:00:00.123456789Z","method":"create_vm","duration_ms":1423.7,"outcome":"ok","request_id":"req-abc123"}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `ts` | RFC3339Nano UTC string | Timestamp of the call completion |
+| `method` | string | CPI method name (for example, `create_vm`, `attach_disk`) |
+| `duration_ms` | float | Wall-clock duration of the CPI call in milliseconds |
+| `outcome` | string | `"ok"` when the call succeeded; `"error"` when it returned an error |
+| `request_id` | string | BOSH Director request ID from the JSON-RPC context |
+
+Write failures are non-fatal — the CPI logs a warning and completes the RPC normally. The file is opened, written, and closed once per call; no file descriptor is held across calls.
+
+### Querying the metrics file
+
+```bash
+# Method latency summary (requires jq)
+jq -r '[.method, (.duration_ms | tostring)] | join("\t")' \
+  /var/vcap/sys/log/bosh/cpi/pve-metrics.jsonl \
+  | sort | awk '{sum[$1]+=$2; n[$1]++} END{for(m in sum) printf "%-30s avg=%.1f ms  calls=%d\n", m, sum[m]/n[m], n[m]}' \
+  | sort -k1
+
+# All errors in the last 100 calls
+tail -100 /var/vcap/sys/log/bosh/cpi/pve-metrics.jsonl \
+  | jq 'select(.outcome == "error")'
+
+# p99 latency for create_vm
+grep '"method":"create_vm"' /var/vcap/sys/log/bosh/cpi/pve-metrics.jsonl \
+  | jq -r '.duration_ms' | sort -n | awk 'END{print NR"th percentile:", $0}'
+```

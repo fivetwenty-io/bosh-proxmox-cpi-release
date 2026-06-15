@@ -15,9 +15,9 @@ The `bosh-pve-cpi` release is deliberately **not** compiled by default: create-e
 runs the CPI binary on the **local host** (the `cloud_provider` driver), not on the
 director VM, so a Linux-compiled CPI cannot execute on a non-Linux workstation
 (`cannot execute binary file`). The CPI compiles locally for the create-env host's
-OS/arch in ~30s and is cached by bosh-init. Set `COMPILE_RELEASES_WITH_CPI=1` to
+OS/arch in ~30 s and is cached by bosh-init. Set `COMPILE_RELEASES_WITH_CPI=1` to
 also pin a compiled CPI — valid **only** when create-env runs on the same OS/arch
-as the compilation stemcell (e.g. a Linux CI host).
+as the compilation stemcell (e.g., a Linux CI host).
 
 ## How it works
 
@@ -122,14 +122,14 @@ or a read-only path; presigned URLs are not generated.
 ## Operational notes
 
 - **Single-flight.** The pipeline uses one shared deployment name
-  (`compile-pve-cpi-releases`); do not run two `compile-releases` concurrently.
+  (`compile-pve-cpi-releases`); do not run two `compile-releases` instances concurrently.
   A leftover deployment from a crashed run is overwritten cleanly by the next run.
 - **A failed run leaves no active cache.** The ops file is written only after all
   exports succeed, so a partial run cannot be picked up by create-env (it may
   leave one orphan tarball in the store, which the next run overwrites by name).
-- **Don't delete the store while a director is live.** With `file` storage,
+- **Do not delete the store while a director is live.** With `file` storage,
   create-env *and* delete-env reference the `file://` tarballs. create-env/teardown
-  now verify the tarballs exist and fall back to source if they are gone, but
+  verify the tarballs exist and fall back to source if they are gone, but
   keeping `compiled_releases/` intact for a director's lifetime avoids the
   source-fallback round trip.
 - **`/tmp` space.** `export-release` writes each tarball to a temp dir under
@@ -141,8 +141,8 @@ or a read-only path; presigned URLs are not generated.
 A compiled tarball is valid **only** for the exact stemcell it was built against.
 The stemcell is encoded in the tarball filename and recorded as a `# stemcell:`
 marker in the generated ops file. If you bump `stemcell_url` in `vars.yml`,
-re-run `compile-releases`; until you do, create-env detects the mismatch and
-compiles from source rather than deploying a cache that cannot match.
+re-run `compile-releases`. Until you do, create-env detects the mismatch and
+compiles from source rather than using a cache that cannot match.
 
 ## Scope
 

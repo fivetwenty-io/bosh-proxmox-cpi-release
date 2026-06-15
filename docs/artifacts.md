@@ -2,7 +2,7 @@
 
 `./scripts/artifacts` stands up a small `cpi-artifacts` VM running
 [RustFS](https://rustfs.com) — an Apache-2.0, S3-compatible, single-binary
-object store — on the active env's isolated SDN network, parallel to the
+object store — on the active env's isolated SDN network, alongside the
 create-env BOSH director. Once it is online, the compiled-release pipelines and
 the director use it as a local S3 endpoint on the same network, instead of a
 remote store or the local `file://` cache.
@@ -13,7 +13,7 @@ every other script behaves exactly as it did before.
 ## Why
 
 The director fetches compiled release tarballs by URL during `create-env` and
-during CF deploys. A blobstore on the director's own SDN network keeps that
+CF deploys. A blobstore on the director's own SDN network keeps that
 traffic local and removes the dependency on a remote S3 bucket, while still
 exercising the same S3 code paths the CPI and BOSH use in production.
 
@@ -36,7 +36,7 @@ flowchart LR
   `pve_node`, `pve_vm_storage`, and an `pve_api_token` or `pve_password`).
 - Root SSH to the PVE host (the same channel `net-up` uses) and a route from
   your host to the SDN subnet (for example, an approved Tailscale subnet route
-  for `172.31.0.0/24`) so the operator host can SSH the guest and reach `:9000`.
+  for `172.31.0.0/24`) so the operator host can SSH into the guest and reach `:9000`.
 - The `aws` CLI on `PATH` for the bucket subcommands (`status`, `list-buckets`,
   `create-bucket`, `delete-bucket`). `bootstrap` itself creates buckets on the
   guest, so it does not need `aws` locally.
@@ -79,16 +79,16 @@ default.
 | RustFS URL | `ARTIFACTS_RUSTFS_URL` | `artifacts_rustfs_url` | musl zip for the version |
 | Cloud image URL | `ARTIFACTS_IMAGE_URL` | `artifacts_image_url` | Ubuntu 24.04 noble |
 
-Credentials follow a both-or-generate rule: a key pair is honored only when
+Credentials follow a both-or-generate rule: a key pair is used only when
 both the access key and the secret key are set; otherwise a fresh hex pair is
 generated. RustFS beta's secret-key rotation is destructive, so a re-run never
-re-seeds the credentials of a VM that already has a state file — to rotate, run
+re-seeds the credentials of a VM that already has a state file. To rotate, run
 `teardown` then `bootstrap`.
 
 ### State and secrets
 
 `bootstrap` writes `manifests/envs/<env>/artifacts-state.json` (the VMID,
-endpoint, credentials, and bucket list) and a dedicated SSH keypair at
+endpoint, credentials, and bucket list) and a dedicated SSH key pair at
 `manifests/envs/<env>/artifacts_ssh`. Both are git-ignored because the state
 file carries the generated secret key. The git-tracked `artifacts.yml` is the
 secret-free knob surface.
@@ -106,7 +106,7 @@ An explicit `COMPILED_RELEASES_STORE` or `COMPILED_RELEASES_S3_ENDPOINT` always
 wins, and an unselected env never engages the artifacts VM.
 
 `scripts/e2e` accepts `--with-artifacts`, which runs `artifacts bootstrap`
-before the director so the compile and precompile steps land in RustFS; without
+before the director so the compile and precompile steps land in RustFS. Without
 the flag, e2e is unchanged. `scripts/test` prints a one-line note when the
 active env's artifacts VM is online (its `bosh` and `cf` tiers then route
 through the same gate); the CPI lifecycle tiers do not use the blobstore.
@@ -130,7 +130,7 @@ BOSH_PVE_ENV=cpitest ./scripts/artifacts teardown --yes
 
 - RustFS is pinned to a single-node beta; treat the store as lab-only.
 - TLS defaults to disabled because the SDN is private and SNAT-only; every
-  consumer would otherwise have to trust the self-signed CA. Set
+  consumer would otherwise need to trust the self-signed CA. Set
   `ARTIFACTS_TLS_MODE=self-signed` to enable HTTPS (clients then use
   `--no-verify-ssl`).
 - The VM is a plain Ubuntu cloud image, not a BOSH stemcell, so the bosh-agent

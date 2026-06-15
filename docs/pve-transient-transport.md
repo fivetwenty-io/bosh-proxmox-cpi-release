@@ -1,10 +1,10 @@
 # PVE Transient Transport Faults
 
-This document covers how the CPI absorbs pvedaemon worker recycling, pveproxy backend stalls, HTTP 429 pushback, and the auth-ticket EOF that follows. Related: [PVE Storage Locking](pve-storage-locking.md) covers the per-storage lockfile class.
+This document covers how the CPI absorbs pvedaemon worker recycling, pveproxy backend stalls, HTTP 429 pushback, and the auth-ticket EOF that follows. [PVE Storage Locking](pve-storage-locking.md) covers the per-storage lockfile class.
 
 ## What PVE does
 
-`pvedaemon` runs a fixed pool of HTTP workers (default 3) behind `pveproxy`. Each worker has a built-in **per-worker request quota** plus a soft memory limit; when either is hit, the worker exits cleanly and the parent respawns a fresh one. Every in-flight TCP connection to the exiting worker is dropped without an HTTP response.
+`pvedaemon` runs a fixed pool of HTTP workers (default 3) behind `pveproxy`. Each worker has a built-in **per-worker request quota** plus a soft memory limit; when either is hit, the worker exits cleanly and the parent respawns a fresh one. Every in-flight TCP connection to the exiting worker is dropped with no HTTP response.
 
 The shape pveproxy returns to the client depends on where the worker died:
 
@@ -36,7 +36,7 @@ The substring detector `pve.IsTransientTransport` covers all three (plus generic
 
 ## When the CPI hits it
 
-A BOSH director driving a Cloud Foundry deploy launches a dozen or more concurrent `create_vm` calls within a second. With 3 pvedaemon workers, the ratio of in-flight requests to workers is ~10:1, so a worker recycle during the burst window is statistically guaranteed — once every few hundred requests in the field.
+A BOSH director driving a Cloud Foundry deploy launches a dozen or more concurrent `create_vm` calls within a second. With 3 pvedaemon workers, the in-flight-to-worker ratio is ~10:1, so a worker recycle during the burst window is statistically guaranteed — once every few hundred requests in the field.
 
 Observed at Task 343 (cf deploy retry):
 
@@ -50,7 +50,7 @@ Two in-flight `create_vm` POSTs riding worker 1072563 died at exactly that times
 
 ## The retry strategy
 
-The CPI absorbs the recycle window with a predicate, exponential backoff, and a bounded attempt count. Worker restart is sub-second, so the transient backoff curve is tighter than the storage-lock one: `1s × 1.5^attempt`, ±30% jitter, capped at 15s, default 8 attempts.
+The CPI absorbs the recycle window with a predicate, exponential backoff, and a bounded attempt count. Worker restart is sub-second, so the transient backoff curve is tighter than the storage-lock curve: `1s × 1.5^attempt`, ±30% jitter, capped at 15s, default 8 attempts.
 
 `RetryOnTransient` retries on **two** predicates:
 
@@ -71,7 +71,7 @@ Implementation lives in `internal/pve/retry.go`:
 
 ### HTTP 429 / PVE Pushback
 
-PVE returns HTTP 429 when the node's task queue is full or resource contention is detected. Plain-text task-body errors also carry pushback signals via a conservative phrase set:
+PVE returns HTTP 429 when the node's task queue is full or resource contention is detected. Plain-text task-body errors also carry pushback signals through a conservative phrase set:
 
 - `"too many requests"`
 - `"worker busy"`
@@ -80,7 +80,7 @@ PVE returns HTTP 429 when the node's task queue is full or resource contention i
 - `"lock-acquire timeout"`
 - `"got timeout"`
 
-The `IsPVEPushback` predicate matches HTTP 429 responses first (via `*sdkerrors.APIError.HTTPCode == 429`), then the phrase set case-insensitively. When it fires, the CPI applies `PushbackBackoff` with base=5s, cap=60s — longer than `StorageLockBackoff` (2s/30s) because worker-pool saturation takes longer to drain than a single per-storage lock hold.
+The `IsPVEPushback` predicate matches HTTP 429 responses first (via `*sdkerrors.APIError.HTTPCode == 429`), then the phrase set case-insensitively. When it fires, the CPI applies `PushbackBackoff` with base=5s, cap=60s — longer than `StorageLockBackoff` (2s/30s) because worker-pool saturation takes longer to drain than a single per-storage lock hold does.
 
 Operator knobs: `pve.retry.pushback.base_ms` and `pve.retry.pushback.cap_ms` in the BOSH manifest control the backoff bounds. `ConfigurePushbackBackoff` reads these at startup and stores them process-wide.
 
@@ -88,7 +88,7 @@ Operator knobs: `pve.retry.pushback.base_ms` and `pve.retry.pushback.cap_ms` in 
 
 ### max_inflight_per_node semaphore
 
-An additional concurrency gate operates above the retry layer. When `pve.max_inflight_per_node` is set to a positive integer, the CPI acquires a per-node counting semaphore slot before issuing any mutating API call on that node. The semaphore is backed by a buffered channel (`nodeInflightRegistry` in `internal/cpi/handlers/inflight.go`) keyed by PVE node name. This caps the burst rate to PVE — reducing both worker-recycle and pushback frequency at the source rather than absorbing them with retries.
+An additional concurrency gate operates above the retry layer. When `pve.max_inflight_per_node` is set to a positive integer, the CPI acquires a per-node counting semaphore slot before issuing any mutating API call on that node. The semaphore is backed by a buffered channel (`nodeInflightRegistry` in `internal/cpi/handlers/inflight.go`) keyed by PVE node name. This caps the burst rate to PVE — reducing worker-recycle and pushback frequency at the source rather than absorbing them with retries.
 
 ### Retry decision flow
 
@@ -153,7 +153,7 @@ Worker-cycle events should be visible at exactly the failed timestamps in the CP
 
 ## Operator-side knobs
 
-The CPI's retry absorbs typical recycle windows. If retries routinely climb past attempt 4, the worker pool is undersized for your deploy concurrency:
+The CPI's retry absorbs typical recycle windows. If retries routinely climb past attempt 4, the worker pool is undersized for the deploy concurrency:
 
 1. **Raise pvedaemon worker count.** Edit `/etc/default/pvedaemon`:
 
@@ -167,7 +167,7 @@ The CPI's retry absorbs typical recycle windows. If retries routinely climb past
 
 3. **Cap per-node concurrency.** Set `pve.max_inflight_per_node` in the BOSH manifest to a value at or below your pvedaemon worker count. This prevents burst saturation at the source.
 
-4. **Tune pushback backoff.** `pve.retry.pushback.base_ms` and `pve.retry.pushback.cap_ms` adjust how aggressively the CPI backs off under HTTP 429. Higher values reduce retry storms; lower values recover faster when the pushback is short-lived.
+4. **Tune pushback backoff.** `pve.retry.pushback.base_ms` and `pve.retry.pushback.cap_ms` adjust how aggressively the CPI backs off under HTTP 429. Higher values reduce retry storms; lower values recover faster when pushback is short-lived.
 
 5. **Throttle the director.** Lower `director.workers` or per-instance-group `max_in_flight`. Cheapest if you cannot edit the PVE node, and also helps with storage-lock contention.
 

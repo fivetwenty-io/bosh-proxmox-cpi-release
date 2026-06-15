@@ -2,7 +2,7 @@
 
 Optional boolean knobs in this CPI follow a five-level inheritance chain. Every
 level that is absent or `nil` falls through to the next; the chain ends at a
-hardcoded default (almost always `false`). The result is **byte-identical
+hard-coded default (almost always `false`). The result is **byte-identical
 behavior** when no level is set — no migration required.
 
 ## The Five Levels
@@ -15,7 +15,7 @@ behavior** when no level is set — no migration required.
 | 4 | Global `CPIConfig` field | `*bool` |
 | 5 | Hardcoded default | `bool` constant (typically `false`) |
 
-Level 1 is the per-call override. Levels 2 and 3 are the `vm_type` / `disk_type`
+Level 1 is the per-call override. Levels 2 and 3 are the `vm_type`/`disk_type`
 profile layers managed by `layeredResolver`. Level 4 is a `*bool` field on
 `CPIConfig`; a `nil` pointer here distinguishes "not configured" from an explicit
 `false`. Level 5 is the constant the CPI shipped with before the feature existed.
@@ -28,7 +28,7 @@ profile layers managed by `layeredResolver`. Level 4 is a `*bool` field on
 `internal/cpi/handlers/cloudprops_resolver.go` walks the three
 cloud-properties layers (call → disk_type profile → vm_type profile) in
 precedence order, coercing each value to `bool` via `coerceBool` (accepts
-`bool`, `float64` `1`/`0`, `int` `1`/`0`, case-insensitive string
+`bool`, `float64` `1`/`0`, `int` `1`/`0`, and case-insensitive string
 `"true"`/`"false"`/`"1"`/`"0"`). The first parseable value wins; explicit
 `false` is distinguished from absent. If no layer yields a parseable value,
 `Bool` returns `(false, false)`.
@@ -76,9 +76,9 @@ The disk-performance resolver in
 
 ## Byte-Identical Guarantee
 
-When all five levels are `nil` / absent / unset, the effective value equals
+When all five levels are `nil`, absent, or unset, the effective value equals
 the Level 5 constant. No behavior change occurs relative to any prior release
-that did not have the feature. This property holds because:
+that lacked the feature. This property holds because:
 
 - `*bool` fields on `CPIConfig` have `omitempty` JSON tags, so they are never
   written to the ERB output unless explicitly set.
@@ -87,8 +87,7 @@ that did not have the feature. This property holds because:
 - Accessor methods such as `VMFirewallEnabled()` return `false` for both a `nil`
   pointer and a `*false` pointer.
 
-A deployment that adds no new spec properties gets exactly the behavior it had
-before the feature was merged.
+A deployment that adds no new spec properties gets exactly the behavior it had before the feature was merged.
 
 ## Adding a New Optional Bool
 
@@ -109,8 +108,7 @@ before the feature was merged.
   TLS field), not `false`. The five-level chain still applies; Level 5 is `true`.
 - `PlacementConfig.ExcludeMaintenanceNodes` defaults to `true` for the same
   reason (protective default).
-- `PlacementConfig.PinAZStrict` defaults to `true` when `PinAZViaHARules` is
-  enabled.
+- `PlacementConfig.PinAZStrict` defaults to `true` when `PinAZViaHARules` is enabled.
 
 These fields use accessor methods that encode the Level 5 constant explicitly
 rather than relying on the Go zero value.

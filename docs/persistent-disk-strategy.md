@@ -19,8 +19,8 @@ Proxmox VE has no first-class volume object. AWS EBS, OpenStack Cinder, and
 vSphere VMDK descriptors each provide a native volume entity that exists
 independently of any virtual machine. PVE does not: a storage volume's only
 identity is the string `<storage>:<name>` (for example, `local-lvm:vm-9003-disk-0`).
-There is no volume metadata API, no volume tag API, and no ownership field in
-the storage layer. A volume that is not attached to a VM config slot exists
+PVE provides no volume metadata API, no volume tag API, and no ownership field in
+the storage layer. A volume not attached to a VM config slot exists
 as bytes on the backing storage with no record of who created it, what
 it is for, or whether it is safe to delete.
 
@@ -112,8 +112,8 @@ Each parker VM is created with the following fixed properties:
 
 When a parker VM fills all 31 slots, the CPI creates a second parker VM in the
 same VMID band and attaches subsequent disks there. Each new park reuses the
-lowest existing parker that still has a free slot before creating another
-parker, so the VMID band fills densely rather than one parker per disk. Each
+lowest existing parker that still has a free slot before creating another,
+so the VMID band fills densely rather than one parker per disk. Each
 parker VM is node-scoped: one parker (or chain of parkers) per PVE cluster
 node.
 
@@ -137,7 +137,7 @@ Fields:
 | `director_id` | Optional BOSH director identifier from `pve.stemcell.director_id`. |
 
 Provenance writes are best-effort: a failure logs a warning but does not block
-the park itself. Because PVE has no atomic read-modify-write on VM descriptions,
+the park. Because PVE has no atomic read-modify-write on VM descriptions,
 two concurrent park operations targeting the same parker VM may overwrite each
 other's provenance entry. The disk remains correctly attached in its `scsiN`
 slot; only the advisory provenance record may be incomplete.
@@ -219,11 +219,13 @@ The CPI never auto-destroys parker VMs. To remove a parker manually:
 
 1. Run `scripts/disk-audit` and confirm the parker carries zero disks (`parked`
    count = 0 for that parker VMID).
+
 2. Remove the `protection=1` flag: `qm set <vmid> --protection 0`, or via the
    PVE API `PUT /nodes/<node>/qemu/<vmid>/config` with `{"protection":0}`.
+
 3. Destroy the VM: `qm destroy <vmid> --purge`.
 
-Do not skip step 1. Destroying a parker that still holds disks will delete all
+Do not skip step 1. Destroying a parker that still holds disks deletes all
 volumes in its `scsiN` slots.
 
 ---
@@ -309,22 +311,22 @@ Keep `free` (the default) when:
 ### Migrating between strategies
 
 **Free to parked:** existing detached disks remain free-floating. New `detach_disk`
-calls park their disk immediately. When the Director next calls `attach_disk` or
+calls park immediately. When the Director next calls `attach_disk` or
 `delete_disk` for a free-floating disk, the unpark check finds the disk is not
 parked and the operation proceeds normally. The two states coexist transparently;
 `disk-audit` reports them separately.
 
 **Parked to free:** existing parked disks self-heal on the next `attach_disk` or
-`delete_disk`. `UnparkDisk` is called before each operation and detaches the disk
-from its parker VM. Once detached it becomes free-floating. No bulk migration step
+`delete_disk`. `UnparkDisk` runs before each operation and detaches the disk
+from its parker VM. Once detached, it becomes free-floating. No bulk migration step
 is required. Parker VMs that become empty remain in PVE; remove them manually
 following the teardown procedure above.
 
 **Mixed state is safe.** `ParkedStrategyActive()` controls whether unpark probes run.
 When the parked range is configured, the CPI always runs unpark probes before
 `attach_disk` and `delete_disk`, regardless of the current `detached_disk_strategy`
-setting. This means flipping the strategy back to `free` while parked disks exist
-is handled gracefully: the probes still fire, unpark the disks, and the operations
+setting. Flipping the strategy back to `free` while parked disks exist is therefore
+handled gracefully: the probes still fire, unpark the disks, and the operations
 complete.
 
 > **Warning: never remove the `parked_disk_vmid_range_start` /
@@ -347,8 +349,8 @@ complete.
 When a disk is parked, the CPI writes a provenance entry into the parker VM's
 PVE description field using the `<!--BOSH:{...}-->` sentinel format. The entry
 is keyed by the bare `<storage>:<volid>` string and records the full Director
-disk CID, the source VM CID, a timestamp, the node name, and optionally the
-director ID.
+disk CID, the source VM CID, a timestamp, the node name, and the director ID
+(optional).
 
 The sentinel format is shared with `set_disk_metadata` (which uses
 `bosh_disk_metadata`) and `bosh_parked_disks` as distinct top-level JSON keys.
@@ -382,7 +384,7 @@ empty, which is the expected state after a full strategy migration.
 ## Residual risk
 
 The parked strategy has not been validated against a live Proxmox VE cluster.
-The implementation is code-complete and unit-tested. Before enabling it in
+The implementation is code-complete and unit-tested. Before enabling in
 production:
 
 - Run `scripts/disk-audit` after a `detach_disk` cycle to confirm that parker

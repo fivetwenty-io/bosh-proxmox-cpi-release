@@ -1,6 +1,6 @@
 # Configuration
 
-The CPI reads configuration from a BOSH deployment manifest. The job template renders the manifest properties into a JSON document that the binary reads with the `--config` flag. All properties correspond to fields in `jobs/pve_cpi/spec`.
+The CPI reads configuration from a BOSH deployment manifest. The job template renders the manifest properties into a JSON document the binary reads with the `--config` flag. All properties correspond to fields in `jobs/pve_cpi/spec`.
 
 | Property | Description | Default | Required |
 |---|---|---|---|
@@ -24,7 +24,7 @@ The CPI reads configuration from a BOSH deployment manifest. The job template re
 | `pve.ca_cert` | Optional PEM-encoded CA certificate bundle for verifying the Proxmox VE API TLS certificate. When empty (default), the system trust pool is used — behavior is byte-identical to prior releases. When set, the PEM is parsed and the resulting cert pool is used for PVE API HTTPS verification. Ignored when `verify_ssl` is `false`. Symmetric to `registry.ca_cert`. | `""` | no |
 | `pve.agent_mode` | Agent bootstrap mode. `cloudinit` — cloud-init bootstrap (default). `registry` — BOSH registry at `registry.endpoint`. `noagent` — no agent bootstrap. `auto` — selects `cloudinit` when the stemcell's `api_version` is ≥ 2, falls back to `registry` for v1 stemcells (requires `registry.endpoint`). | `cloudinit` | no |
 | `pve.vm_disk_format` | Disk image format (`qcow2`, `raw`, `vmdk`) | `qcow2` | no |
-| `pve.hotplug` | PVE hotplug flags applied to every new VM. Comma-separated subset of `network,disk,cpu,memory,usb,cloudinit`, or `0` to disable hotplug entirely. Per-VM override via `cloud_properties.hotplug`. | `network,disk,cpu,memory` | no |
+| `pve.hotplug` | PVE hotplug flags applied to every new VM. Comma-separated subset of `network,disk,cpu,memory,usb,cloudinit`, or `0` to disable hotplug entirely. Per-VM override via `cloud_properties.hotplug`. Fine-grained toggles `cpu_hotplug` and `memory_hotplug` are `create_vm` cloud properties documented in [CPI Methods](cpi_methods.md). | `network,disk,cpu,memory` | no |
 | `pve.numa` | Enable NUMA (`numa=1`) on every new VM. Required at create time for live memory hotplug to allocate DIMM slots; without it, memory hot-add silently no-ops. Per-VM override via `cloud_properties.numa`. | `true` | no |
 | `pve.reboot_mode` | `reboot_vm` strategy: `soft` (graceful ACPI reboot, hard-reset fallback) or `hard` (immediate reset). | `soft` | no |
 | `pve.reboot_timeout` | Seconds to wait for graceful shutdown before hard-reset fallback (soft mode only). Range 1–3600. | `60` | no |
@@ -55,9 +55,9 @@ The CPI reads configuration from a BOSH deployment manifest. The job template re
 
 ## Stemcell Storage
 
-`stemcell_storage` must be a **file-based** PVE storage pool. The CPI uploads the qcow2 image via the PVE upload API, which only accepts file-based storages (`dir`, `nfs`, `cifs`, `glusterfs`, `cephfs`). Block-based storages (`lvm`, `lvmthin`, `zfspool`, `rbd`) reject uploads with `can't upload to storage type '<type>'` and are unusable for stemcells regardless of cluster topology.
+`stemcell_storage` must be a **file-based** PVE storage pool. The CPI uploads the qcow2 image via the PVE upload API, which accepts only file-based storages (`dir`, `nfs`, `cifs`, `glusterfs`, `cephfs`). Block-based storages (`lvm`, `lvmthin`, `zfspool`, `rbd`) reject uploads with `can't upload to storage type '<type>'` and are unusable for stemcells regardless of cluster topology.
 
-For multi-node clusters, `stemcell_storage` must additionally be shared. The `create_stemcell` call enforces this: if the storage is local-only and the cluster has more than one node, the call fails immediately with a descriptive error. Single-node clusters may use local file-based storage (e.g. the default `local` dir at `/var/lib/vz`); the shared check is skipped when the cluster reports exactly one node.
+For multi-node clusters, `stemcell_storage` must also be shared. The `create_stemcell` call enforces this: if the storage is local-only and the cluster has more than one node, the call fails immediately with a descriptive error. Single-node clusters may use local file-based storage (e.g. the default `local` dir at `/var/lib/vz`); the shared check is skipped when the cluster reports exactly one node.
 
 Recommended shared backends: NFS, CIFS, CephFS, GlusterFS, or any other PVE storage type configured with `shared=1` in `/etc/pve/storage.cfg`.
 
@@ -67,7 +67,7 @@ The storage pool must have the `import` content type enabled. See [Proxmox VE Se
 
 `create_stemcell` builds one frozen PVE template VM per stemcell and returns a `template:<vmid>` CID. `create_vm` then clones that template instead of running a full qcow2 block-copy per VM. On linked-clone–capable storage backends this reduces VM creation time from roughly four minutes to seconds.
 
-The five properties in the table above (`clone_mode`, `stemcell_template_vmid_range_start`, `stemcell_template_vmid_range_end`, `stemcell_template_pool`, `stemcell_template_node`) are all optional. Zero configuration is required; the defaults produce the correct behavior for most deployments.
+The five properties in the table above (`clone_mode`, `stemcell_template_vmid_range_start`, `stemcell_template_vmid_range_end`, `stemcell_template_pool`, `stemcell_template_node`) are all optional; the defaults produce the correct behavior for most deployments.
 
 ### Clone type by storage backend
 
@@ -81,7 +81,7 @@ Set `clone_mode: full` to force full clones everywhere, or `clone_mode: linked` 
 
 ### VMID ranges
 
-The CPI allocates three classes of VMID from disjoint, contiguous bands. Each band is operator-configurable; all default to clean, non-overlapping ranges:
+The CPI allocates three classes of VMID from disjoint, contiguous bands. Each band is operator-configurable and defaults to a clean, non-overlapping range:
 
 | Class | Default range | Count | Config keys |
 | --- | --- | --- | --- |
@@ -89,7 +89,7 @@ The CPI allocates three classes of VMID from disjoint, contiguous bands. Each ba
 | Persistent disks | `[9000, 29999]` | 21,000 | `disk_vmid_range_start`, `disk_vmid_range_end` |
 | Stemcell templates | `[30000, 30999]` | 1,000 | `stemcell_template_vmid_range_start`, `stemcell_template_vmid_range_end` |
 
-The disk band is sized at roughly 2× the VM ceiling so a foundation never exhausts persistent-disk identifiers before VMs. The template band is small because the live count of stemcell templates (one per stemcell name/version tuple) is tens, not thousands.
+The disk band is sized at roughly 2× the VM ceiling so a foundation never exhausts persistent-disk identifiers before VMs. The template band is small because the live count of stemcell templates (one per stemcell name/version tuple) is in the tens, not thousands.
 
 Override example (the full default layout, written out):
 
@@ -103,39 +103,39 @@ pve:
   stemcell_template_vmid_range_end: 30999
 ```
 
-The three ranges must not overlap one another. The validator cross-checks all pairs at CPI startup and rejects overlapping configurations. There is no hard ceiling on the VM range — it may grow as large as you like, provided you relocate the disk and template bands so nothing collides.
+The three ranges must not overlap. The validator cross-checks all pairs at CPI startup and rejects overlapping configurations. There is no hard ceiling on the VM range — it may grow as large as needed, provided you relocate the disk and template bands so nothing collides.
 
 ### Cross-node and multi-node considerations
 
 Template VMs are created on `stemcell_template_node` (or `pve.node` if unset). For shared storage backends (NFS, CIFS, CephFS, GlusterFS, RBD), any cluster node can clone the template — no additional configuration is needed.
 
-For local storage backends (`dir`, `zfspool`, `lvmthin`, `lvm`) on multi-node clusters, the template and the VM being cloned must be on the same node. Options:
+For local storage backends (`dir`, `zfspool`, `lvmthin`, `lvm`) on multi-node clusters, the template and the VM being cloned must reside on the same node. Options:
 
 - Pin `stemcell_template_node` and set `cloud_properties.target_node` in your BOSH VM types to the same node.
 
 - Use shared storage for `stemcell_storage` (recommended for production multi-node clusters).
 
-The CPI does not auto-migrate templates between nodes. If a clone lands on the wrong node, the workaround is to manually live-migrate the resulting VM in the PVE UI after `create_vm` completes.
+The CPI does not auto-migrate templates between nodes. If a clone lands on the wrong node, manually live-migrate the resulting VM in the PVE UI after `create_vm` completes.
 
 ### Back-compatibility
 
-Stemcells uploaded before this feature was introduced continue to work without operator action. When `create_vm` receives a pre-upgrade CID (a `<storage>:import/<file>` or `light:...` form), it looks for a matching template by content hash. If a template is found the fast clone path runs; if not the original slow `import-from=` path runs. No re-upload is required.
+Stemcells uploaded before this feature was introduced continue to work without operator action. When `create_vm` receives a pre-upgrade CID (a `<storage>:import/<file>` or `light:...` form), it looks for a matching template by content hash. If a template is found, the fast clone path runs; if not, the original slow `import-from=` path runs. No re-upload is required.
 
 ## Authentication
 
-Exactly one of `pve.password` or `pve.api_token` must be set. API tokens are preferred for production deployments; they support per-token revocation and per-token privilege separation in PVE 9.
+Exactly one of `pve.password` or `pve.api_token` must be set. API tokens are preferred for production deployments; they support per-token revocation and privilege separation in PVE 9.
 
 See [pve-api-permissions.md](pve-api-permissions.md) for token creation and the minimum-privilege `bosh@pve` user setup.
 
 ## SDN Network Management
 
-When the Director's cloud-config marks a network as `managed: true`, the CPI calls `create_network` and `delete_network` to provision and remove the network resource. The CPI supports two backends: PVE SDN vnets and Linux bridges on a node.
+When the Director's cloud-config marks a network as `managed: true`, the CPI calls `create_network` and `delete_network` to provision and remove the network resource. The CPI supports two backends: PVE SDN vnets and Linux bridges.
 
 ### Prerequisites — SDN Mode
 
-1. PVE SDN must be enabled at the datacenter level. The **Datacenter > SDN** menu appears in PVE 7.2+ and requires `libpve-network-perl` installed on all cluster nodes.
+1. PVE SDN must be enabled at the datacenter level. The **Datacenter > SDN** menu appears in PVE 7.2+ and requires `libpve-network-perl` on all cluster nodes.
 
-2. At least one SDN zone must exist before `create_network` is called, unless `sdn_auto_manage_zone: true` is set to let the CPI create it. The zone name must match `cloud_properties.zone` or `pve.sdn_zone`.
+2. At least one SDN zone must exist before `create_network` is called, unless `sdn_auto_manage_zone: true` lets the CPI create it. The zone name must match `cloud_properties.zone` or `pve.sdn_zone`.
 
 3. The PVE API token or user must hold the `SDN.Allocate` privilege on `/sdn`.
 
@@ -199,21 +199,21 @@ networks:
 
 - Most deployments pre-configure networks and do not set `managed: true`. The `create_network` and `delete_network` handlers run only when the Director's cloud-config marks a network as managed.
 
-- `pve.network_bridge` remains required for `create_vm` NIC attachment regardless of `network_mode`. It is the default bridge VMs attach to at boot.
+- `pve.network_bridge` is required for `create_vm` NIC attachment regardless of `network_mode`. It is the default bridge VMs attach to at boot.
 
-- SDN changes are staged by the PVE API and committed by the CPI via a `PUT /cluster/sdn` apply call after each create or delete operation. This is PVE's two-phase commit model. On error, the CPI issues a rollback to clear any staged-but-unapplied changes.
+- SDN changes are staged by the PVE API and committed by the CPI via a `PUT /cluster/sdn` apply call after each create or delete operation. This is PVE's two-phase commit model. On error, the CPI issues a rollback to clear staged-but-unapplied changes.
 
 - Zone auto-deletion (`sdn_auto_manage_zone: true`) is opt-in and disabled by default. When enabled, `delete_network` removes the zone only when all three conditions hold: `sdn_auto_manage_zone` is `true`, the zone name does not match `pve.sdn_zone` (the operator-pinned default zone is never auto-deleted), and the zone has zero remaining vnets after the vnet is removed. Leave `sdn_auto_manage_zone: false` unless the CPI should own the full zone lifecycle.
 
 ## MBus Fallback
 
-When `agent.mbus` is empty but a blobstore endpoint is configured, the CPI derives `nats://<blobstore-host>:4222` from the blobstore host and uses it as the agent's NATS URL. Explicit `agent.mbus` values always win. Loopback hosts (`127.0.0.1`, `localhost`, `::1`, `0.0.0.0`) are rejected — the MBus stays empty so the misconfiguration fails loudly instead of being silently misrouted to a non-routable URL.
+When `agent.mbus` is empty but a blobstore endpoint is configured, the CPI derives `nats://<blobstore-host>:4222` from the blobstore host and uses it as the agent's NATS URL. Explicit `agent.mbus` values always win. Loopback hosts (`127.0.0.1`, `localhost`, `::1`, `0.0.0.0`) are rejected — the MBus stays empty so the misconfiguration fails loudly instead of routing silently to a non-routable URL.
 
 This matches the typical BOSH topology where NATS and the DAV blobstore are colocated on the Director (or on the `create-env` machine during initial bootstrap, when the Director does not yet exist to advertise an MBus URL).
 
 ## Placement
 
-The placement engine scores cluster nodes at `create_vm` time using live resource metrics. When `placement.enabled` is `false`, the CPI falls back to `pve.node` (static single-node behavior). An explicit `cloud_properties.target_node` always overrides the scorer.
+The placement engine scores cluster nodes at `create_vm` time using live resource metrics. When `placement.enabled` is `false`, the CPI falls back to `pve.node` (static single-node behavior). An explicit `cloud_properties.target_node` always overrides placement scoring.
 
 | Property | Type | Default | Description |
 |---|---|---|---|
@@ -242,7 +242,7 @@ The placement engine scores cluster nodes at `create_vm` time using live resourc
 
 ## Hooks
 
-Hooks are built-in middleware that fire around CPI method calls. List enabled hooks by name in `pve.hooks`; an unknown name fails startup. Zero overhead when `pve.hooks` is empty.
+Hooks are built-in middleware that fire around CPI method calls. List enabled hooks by name in `pve.hooks`; an unknown name fails startup. When `pve.hooks` is empty, there is no overhead.
 
 | Property | Type | Default | Description |
 |---|---|---|---|
@@ -259,7 +259,7 @@ Writes the BOSH deploy identity into the PVE VM Notes after `create_vm`. No conf
 
 ### lb_register
 
-Registers and deregisters the VM in an HAProxy backend via the Data Plane API on `create_vm` and `delete_vm`. Registration is best-effort: a Data Plane API failure is logged and never fails the CPI call.
+Registers and deregisters the VM in an HAProxy backend via the Data Plane API on `create_vm` and `delete_vm`. Registration is best-effort: a Data Plane API failure is logged and does not fail the CPI call.
 
 | Property | Type | Default | Description |
 |---|---|---|---|
@@ -274,7 +274,7 @@ Registers and deregisters the VM in an HAProxy backend via the Data Plane API on
 
 ### external_command
 
-Runs an allowlisted host command on selected CPI methods. The command runs without a shell, with a scrubbed environment, and with a timeout.
+Runs an allowlisted host command on selected CPI methods. The command runs without a shell, with a scrubbed environment and a timeout.
 
 | Property | Type | Default | Description |
 |---|---|---|---|
@@ -287,7 +287,7 @@ Runs an allowlisted host command on selected CPI methods. The command runs witho
 
 ## Disk Performance
 
-Global disk performance defaults apply to every disk the CPI creates. Per-disk `cloud_properties` override these globals; `pve.disk_types` profiles sit between the two.
+Global disk performance defaults apply to every disk the CPI creates. Per-disk `cloud_properties` override these globals; `pve.disk_types` profiles sit between them.
 
 ```mermaid
 graph TD
@@ -315,7 +315,7 @@ Per-call always wins. Global config is the lowest-precedence layer.
 
 ## Layered Cloud-Property Profiles
 
-Operator-named profiles define reusable cloud_properties templates. A VM selects a `vm_type` profile via `cloud_properties.vm_type`; a disk selects a `disk_type` profile via `cloud_properties.disk_type`. Resolution order (highest to lowest precedence):
+Operator-named profiles define reusable `cloud_properties` templates. A VM selects a `vm_type` profile via `cloud_properties.vm_type`; a disk selects a `disk_type` profile via `cloud_properties.disk_type`. Resolution order (highest to lowest precedence):
 
 1. Per-call `cloud_properties`
 
@@ -338,7 +338,7 @@ graph TD
 |---|---|---|---|
 | `pve.vm_types` | Map | `{}` | Named VM-type profiles. Each key is a profile name; each value has a `cloud_properties` object with defaults for that profile. Selected via `cloud_properties.vm_type`. |
 | `pve.disk_types` | Map | `{}` | Named disk-type profiles. Each key is a profile name; each value has a `cloud_properties` object. Selected via `cloud_properties.disk_type`. Disk-type profiles take precedence over `vm_type` profiles when both define the same attribute. |
-| `pve.storage_tiers` | Map | `{}` | Named storage tiers. Each key is a tier label; each value has `types` (list of PVE storage types) and `shared` (bool). The CPI selects the first live cluster storage matching the criteria. Selected via `cloud_properties.storage_tier`. |
+| `pve.storage_tiers` | Map | `{}` | Named storage tiers. Each key is a tier label; each value has `types` (list of PVE storage types), `shared` (*bool), and `encrypted` (*bool). The CPI selects the first live cluster storage matching all specified criteria. Selected via `cloud_properties.storage_tier`. See [Encrypted Storage](#encrypted-storage) for the `encrypted` field. |
 | `pve.security_groups` | List | `[]` | Global default list of PVE firewall group names applied to every VM that does not carry a per-call or per-profile `security_groups` override. Each entry must be a group name that already exists in the PVE firewall configuration. |
 
 ## Stemcell Management
@@ -360,7 +360,7 @@ Stemcell CIDs take the form `template:<vmid>` (e.g. `template:30042`). All uploa
 
 ## Health Check
 
-When enabled, `create_vm` polls the QEMU guest agent after the VM starts, waiting for a ping response before returning. Boot failures surface earlier, and diagnostics are folded into the timeout error.
+When enabled, `create_vm` polls the QEMU guest agent after the VM starts, waiting for a ping response before returning. Boot failures surface earlier and diagnostics are folded into the timeout error.
 
 | Property | Type | Default | Description |
 |---|---|---|---|
@@ -371,7 +371,7 @@ When enabled, `create_vm` polls the QEMU guest agent after the VM starts, waitin
 
 ## Retry Tuning
 
-Exponential-backoff parameters for storage imports, VMID allocation, task polling, and HTTP 429 pushback. All properties default to `0`, applying the built-in value described in each row. Override only when the built-in values are unsuitable for your cluster's latency profile.
+Exponential-backoff parameters for storage imports, VMID allocation, task polling, and HTTP 429 pushback. All properties default to `0`, applying the built-in value described in each row. Override only when the built-in values do not suit your cluster's latency profile.
 
 | Property | Type | Default | Description |
 |---|---|---|---|
@@ -394,7 +394,7 @@ Exponential-backoff parameters for storage imports, VMID allocation, task pollin
 
 ## Operation Timeouts
 
-Opt-in per-method deadline envelopes. When enabled, each CPI method runs under a context deadline. A wedged retry/poll combination converts to a retriable timeout the Director can act on, rather than holding a queue slot indefinitely.
+Opt-in per-method deadline envelopes. When enabled, each CPI method runs under a context deadline. A wedged retry/poll combination converts to a retriable timeout the Director can act on, rather than holding a queue slot forever.
 
 | Property | Type | Default | Description |
 |---|---|---|---|
@@ -406,7 +406,7 @@ Opt-in per-method deadline envelopes. When enabled, each CPI method runs under a
 
 ## Transport Timeouts
 
-Fine-grained HTTP transport timeouts for the stemcell-fetch client and the PVE API client. All default to `0` (built-in defaults apply). Override when the CPI host has unusual network latency to PVE or artifact mirrors.
+Fine-grained HTTP transport timeouts for the stemcell-fetch client and the PVE API client. All default to `0` (built-in defaults apply). Override when the CPI host has unusual network latency to PVE or to artifact mirrors.
 
 | Property | Type | Default | Description |
 |---|---|---|---|
@@ -431,7 +431,7 @@ The CPI can check for duplicate IP addresses before provisioning a VM. The stati
 
 ## Cluster Locking
 
-Anti-affinity rule updates require a read-modify-write on a shared PVE HA rule. Without a lock, two concurrent `create_vm` calls for the same instance group can silently drop a member. The cluster lock serializes this operation.
+Anti-affinity rule updates require a read-modify-write on a shared PVE HA rule. Without a lock, two concurrent `create_vm` calls for the same instance group can silently drop a member. The cluster lock serializes these operations.
 
 | Property | Type | Default | Description |
 |---|---|---|---|
@@ -449,7 +449,7 @@ After `UpdateSdn`, data-plane realization (ifupdown2 reload, pmxcfs propagation)
 
 ## Disk Deletion Guard
 
-These properties govern defensive behavior during disk resize and deletion, and control the lifecycle of detached disks. See [Persistent Disk Strategy](persistent-disk-strategy.md) for a detailed analysis of the detached-disk ownership problem and the parked strategy trade-offs.
+These properties govern defensive behavior during disk resize and deletion and control the lifecycle of detached disks. See [Persistent Disk Strategy](persistent-disk-strategy.md) for a detailed analysis of the detached-disk ownership problem and the parked strategy trade-offs.
 
 | Property | Type | Default | Description |
 |---|---|---|---|
@@ -462,6 +462,45 @@ These properties govern defensive behavior during disk resize and deletion, and 
 | `pve.resize_wait_for_convergence` | Boolean | `false` | When `true`, `resize_disk` polls the VM config after the PVE resize task completes until the reported disk size matches the requested size. Corrects size-metadata lag on asynchronous backends (Ceph RBD, LVM-thin). Poll is best-effort: if size has not converged within `resize_convergence_timeout_sec`, a warning is logged and `resize_disk` returns success. |
 | `pve.resize_convergence_timeout_sec` | Integer | `0` (→ 120 s) | Bounds the `resize_wait_for_convergence` poll, in seconds. Independent of the `operation_timeout` envelope. `0` applies the built-in 120 s. Only meaningful when `resize_wait_for_convergence` is `true`. |
 
+## Encrypted Storage
+
+The CPI can restrict disk placement to storage tiers the operator has marked as encrypted. Encryption is performed by PVE (or the underlying storage backend, such as ZFS native encryption or LUKS on LVM). The CPI only filters; it cannot verify that a pool is actually encrypted — marking a tier `encrypted: true` is the operator's responsibility, and a warning is logged whenever an encrypted tier is selected.
+
+Resolution order for the `encrypted` flag (highest to lowest precedence):
+
+1. Per-call `cloud_properties.encrypted`
+
+2. Global `pve.encrypted`
+
+| Property | Type | Default | Description |
+|---|---|---|---|
+| `pve.encrypted` | Boolean | `false` | Global opt-in for encrypted-storage disk placement. When `true`, `create_disk` and ephemeral disk creation restrict storage-tier selection to tiers that have `encrypted: true` in `pve.storage_tiers`. A per-call `cloud_properties.encrypted` overrides this global. When `false` or absent (default), no encrypted filter is applied. |
+
+### storage_tiers encrypted field
+
+Each entry in `pve.storage_tiers` accepts an `encrypted` field:
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `types` | List | `[]` | Allowed PVE storage type strings (e.g. `lvmthin`, `zfspool`, `rbd`). |
+| `shared` | Boolean | unset | Requires shared (`true`) or local (`false`) storage. Unset accepts any. |
+| `encrypted` | Boolean | unset | When `true`, only storages the operator has designated as encrypted satisfy this tier. When `false`, only non-encrypted storages match. Unset accepts any. At least one of `types`, `shared`, or `encrypted` must be present in each tier entry. |
+
+Example:
+
+```yaml
+pve:
+  storage_tiers:
+    fast:
+      types: [lvmthin, zfspool]
+      shared: true
+    fast-encrypted:
+      types: [zfspool]
+      shared: true
+      encrypted: true
+  encrypted: false  # per-call cloud_properties.encrypted=true selects fast-encrypted
+```
+
 ## Debug and Observability
 
 | Property | Type | Default | Description |
@@ -470,6 +509,40 @@ These properties govern defensive behavior during disk resize and deletion, and 
 | `pve.task_poll_adaptive` | Boolean | `false` | When `true`, PVE task polling derives its interval from the task's reported progress (clamped 1–10 seconds) for long operations such as clone and move-disk, instead of the fixed task-poll cadence. Tasks reporting no progress fall back to the fixed cadence. Reduces poll pressure early in a long operation and tightens polling as it nears completion. |
 | `pve.redact_logs` | Boolean | `false` | When `true`, emits a debug-level trace of each call's request arguments and result, with credentials masked. The NATS mbus URL's embedded credentials, blobstore `secret_access_key`/`password`, registry credentials, and any other sensitive-named key are replaced with `<redacted>` while the structure is preserved. When `false` (default), no payload trace is emitted. |
 | `pve.strict_config_validation` | Boolean | `false` | When `true`, the CPI fails at startup on unknown top-level config keys and these cross-field contradictions: `use_ha_rules` without `anti_affinity.enabled`; `network_mode: sdn` without `sdn_zone` or `sdn_auto_manage_zone`; and `dlb.require_shared_storage` while DLB is disabled. When `false` (default), unknown keys are logged as warnings. |
+
+## Per-RPC Metrics
+
+The CPI can write one JSON-line sample per CPI call to a file on the CPI host. This is distinct from the `audit_log` hook: `audit_log` writes to the structured log stream, while metrics writes a separate machine-readable file suited for ingestion by external tooling. When disabled (the default), the MetricsHook is never registered and adds no dispatch-path overhead.
+
+| Property | Type | Default | Description |
+|---|---|---|---|
+| `pve.metrics.enabled` | Boolean | `false` | When `true`, appends one JSON-line sample per CPI call to `metrics.file_path`. When `false` (default), no file is written and no overhead is added. |
+| `pve.metrics.file_path` | String | `""` | Absolute path of the metrics file on the CPI host. The CPI opens, appends, and closes the file per call (atomic line append). Write failures are logged at `warn` level and never fail the CPI call. Required when `metrics.enabled` is `true`; config validation fails with a clear error when absent. |
+
+Each line written to the file is a JSON object with the following fields:
+
+| Field | Type | Description |
+|---|---|---|
+| `ts` | String | Call start timestamp in RFC3339Nano format (UTC). |
+| `method` | String | CPI method name (e.g. `create_vm`, `delete_disk`). |
+| `duration_ms` | Float | Elapsed time in milliseconds from call start to method return. |
+| `outcome` | String | `ok` when the method returned no error; `error` when it returned an error. |
+| `request_id` | String | BOSH request ID from the JSON-RPC envelope. |
+
+Example entry:
+
+```json
+{"ts":"2026-06-15T12:00:00.123456789Z","method":"create_vm","duration_ms":4231.5,"outcome":"ok","request_id":"abc-123"}
+```
+
+Example configuration:
+
+```yaml
+pve:
+  metrics:
+    enabled: true
+    file_path: /var/vcap/sys/log/pve_cpi/metrics.jsonl
+```
 
 ## Registry
 
@@ -500,7 +573,7 @@ properties:
     log_level: info
 ```
 
-`nfs-shared` is a PVE NFS storage pool with the `import` content type enabled and `shared=1`. Both `vm_storage` and `stemcell_storage` must be accessible from all cluster nodes in a multi-node cluster.
+`nfs-shared` is a PVE NFS storage pool with the `import` content type enabled and `shared=1`. Both `vm_storage` and `stemcell_storage` must be accessible from all cluster nodes in a multi-node deployment.
 
 ## Custom Tags
 
@@ -532,7 +605,7 @@ Notes:
 
 - Tags are sanitized: a key like `bad key` becomes `bad-key`, a value like `with spaces` becomes `with-spaces`.
 
-- The combined tag string is capped at 255 bytes; entries past the cap are dropped at a `;` boundary so partial entries are never emitted.
+- The combined tag string is capped at 255 bytes; entries past the cap are dropped at a `;` boundary, so partial entries are never emitted.
 
 - The CPI reserves three tag-key prefixes: `director--`, `deployment--`, and `job--`. These are rebuilt from BOSH-supplied metadata on every `set_vm_metadata` call. Custom tags survive those re-syncs.
 

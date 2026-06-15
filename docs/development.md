@@ -1,6 +1,6 @@
 # Development Guide
 
-This guide outlines the steps to build, test, and contribute to the BOSH PVE CPI Go codebase.
+This guide covers building, testing, and contributing to the BOSH PVE CPI Go codebase.
 
 ## Prerequisites
 
@@ -16,9 +16,9 @@ cd bosh-pve-cpi
 cd src/pve_cpi && go mod download
 ```
 
-Go sources live under `src/pve_cpi/` so the layout matches the BOSH release packaging. The repository already vendors its dependencies; `go build -mod=vendor` works offline.
+Go sources live under `src/pve_cpi/` so the layout matches the BOSH release packaging. The repository vendors its dependencies; `go build -mod=vendor` works offline.
 
-The Makefile re-roots every `go` invocation into `src/pve_cpi/` for you — prefer the `make` targets below.
+The Makefile re-roots every `go` invocation into `src/pve_cpi/` — prefer the `make` targets below.
 
 ## Make Targets
 
@@ -43,7 +43,7 @@ The Makefile re-roots every `go` invocation into `src/pve_cpi/` for you — pref
 cd src/pve_cpi && go test -run TestHandleCreateVM ./internal/cpi/handlers
 ```
 
-Use `-race` and `-count=1` to disable the test cache and surface data races:
+Use `-race` and `-count=1` to disable the test cache and surface data races.
 
 ```bash
 cd src/pve_cpi && go test -race -count=1 ./internal/pve
@@ -71,7 +71,7 @@ bosh create-release --version=X.Y.Z --tarball=releases/pve-cpi-X.Y.Z.tgz
 
 ## Logging
 
-The binary writes JSON logs to stderr. The log level is set by the `pve.log_level` config property (`debug`, `info`, `warn`, `error`). Per request, log records include `request_id` and `method` attributes extracted from the request context.
+The binary writes JSON logs to stderr. The log level is controlled by the `pve.log_level` config property (`debug`, `info`, `warn`, `error`). Each log record includes `request_id` and `method` attributes extracted from the request context.
 
 The BOSH job template wires stdout to the JSON-RPC channel and stderr to `/var/vcap/sys/log/bosh/cpi/pve.log` via the standard BOSH log redirection.
 
@@ -83,4 +83,4 @@ To verify the CPI against a live PVE instance:
 
 2. Write a `cpi.json` config matching the schema in `docs/configuration.md`.
 
-3. Use the BOSH CPI test framework (https://github.com/cloudfoundry/bosh-cpi-certification) or hand-craft JSON-RPC requests piped via stdin.
+3. Use the BOSH CPI test framework (https://github.com/cloudfoundry/bosh-cpi-certification) or hand-craft JSON-RPC requests piped to stdin.

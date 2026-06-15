@@ -8,7 +8,7 @@ The CPI communicates over JSON-RPC on stdin/stdout. Each invocation handles one 
 
 ## BOSH CPI v2 Differences from v1
 
-The following changes apply when using CPI v2 (i.e., when the stemcell's `api_version` field is 2):
+These changes apply when using CPI v2 (i.e., when the stemcell's `api_version` field is 2):
 
 - `configure_networks` is removed. Networks are configured only at `create_vm` time.
 
@@ -34,7 +34,7 @@ The following changes apply when using CPI v2 (i.e., when the stemcell's `api_ve
 
 **Notes:** The Director calls `info` first to determine the CPI's API version and supported stemcell formats. This CPI always returns `api_version: 2`.
 
-The CPI advertises `openstack-qcow2` and `openstack-raw` because OpenStack qcow2/raw stemcells are byte-compatible with what PVE imports via `qm importdisk` — PVE treats the format name opaquely, and only the on-disk image bytes matter. Operators running existing `bosh-openstack-kvm-*` stemcells can upload them directly without conversion. The `pve-*` and `general-*` aliases remain accepted for forward compatibility.
+The CPI advertises `openstack-qcow2` and `openstack-raw` because OpenStack qcow2/raw stemcells are byte-compatible with what PVE imports via `qm importdisk` — PVE treats the format name opaquely; only the on-disk image bytes matter. Operators running existing `bosh-openstack-kvm-*` stemcells can upload them directly without conversion. The `pve-*` and `general-*` aliases remain accepted for forward compatibility.
 
 ---
 
@@ -59,13 +59,25 @@ The CPI advertises `openstack-qcow2` and `openstack-raw` because OpenStack qcow2
 bosh-stemcell-<name>-<version>-<sha8>.qcow2
 ```
 
-After upload, the CPI creates a frozen PVE template VM from the qcow2 in the template VMID range and tags it with `bosh-stemcell-sha-<sha8>`. For CPI-owned images (heavy and light-fetch), the CPI deletes the intermediate upload volume after freezing the template. For operator-preuploaded light stemcell images, the upload volume is kept.
+After upload, the CPI creates a frozen PVE template VM from the qcow2 in the template VMID range and tags it with `bosh-stemcell-sha-<sha8>`. For CPI-owned images (heavy and light-fetch), the CPI deletes the intermediate upload volume after freezing the template. For operator-preuploaded light stemcell images, the upload volume is preserved.
 
 Template creation is idempotent: if a template VM named `bosh-stemcell-<name>-<version>` already exists, its VMID is reused.
 
 The returned `stemcell_cid` is `template:<vmid>` (e.g. `template:6042`), identifying the frozen template VM.
 
 `cloud_properties` must include `name` and `version`; both are required to build the deterministic template name. `stemcell_storage` must be a shared storage pool accessible from all cluster nodes.
+
+**Light stemcell cloud_properties:**
+
+The following `cloud_properties` keys select the image source. They are mutually exclusive — set at most one:
+
+| Key | Type | Description |
+|---|---|---|
+| `image_id` | String | Pre-uploaded volume CID in PVE (`<storage>:import/<file>`). The operator has already placed the image in PVE storage. The CPI does not fetch or verify the image bytes; the volume is used directly. |
+| `image_url` | String | Remote URL (https, s3, bosh+blobstore, oci) from which the CPI fetches the image on the Director host and then uploads to PVE. Optional `image_url_auth` provides per-stemcell credentials. |
+| `source_url` | String | Remote URL that PVE downloads server-side (requires PVE 7.2+). The CPI issues a single `POST /nodes/{node}/storage/{storage}/download-url` request; PVE streams the bytes directly without the CPI buffering them locally. When `sha256` is also set, the CPI forwards the checksum to PVE, which verifies it server-side and fails the task on a mismatch; when `sha256` is absent, no checksum is sent and the CPI logs a weak-identity warning. Use this to avoid routing large image bytes through the Director host. |
+
+When none of these keys is set, `create_stemcell` uploads the local tarball extracted from `image_path` (the standard heavy-stemcell path).
 
 ---
 
@@ -88,7 +100,7 @@ The returned `stemcell_cid` is `template:<vmid>` (e.g. `template:6042`), identif
 - `light:...` — no-op (operator-managed image; the CPI never deletes it).
 - Integer-only CIDs — no-op (pre-upgrade legacy scrub).
 
-Running VMs have no dependency on the template after cloning, so the template can be deleted at any time without affecting running VMs.
+Running VMs have no dependency on the template after cloning, so the template can be deleted at any time without affecting them.
 
 ---
 
@@ -114,12 +126,12 @@ Running VMs have no dependency on the template after cloning, so the template ca
 - `Bosh::Clouds::VMCreationFailed` if VM creation fails (CPI must clean up partial resources)
 - `Bosh::Clouds::CloudError` on PVE API failure
 
-**Notes:** Creates a new VM by cloning a stemcell template. The `stemcell_cid` drives dispatch:
+**Notes:** Creates a VM by cloning a stemcell template. The `stemcell_cid` drives dispatch:
 
 - **`template:<vmid>`** — clones the identified template VM directly. On linked-clone-capable storage backends (`dir`, `nfs`, `cifs`, `zfspool`, `lvmthin`, `rbd`, `cephfs`), this is a copy-on-write clone that completes in seconds. On `lvm`-thick storage a full clone is performed. Clone type is controlled by `pve.clone_mode` (default `auto`).
 - **Pre-upgrade CID** (`<storage>:import/<file>` or `light:...`) — the CPI extracts the sha8 from the filename and searches for a matching template by PVE tag. If a template is found, it clones it (fast path). If not, it falls back to the original `import-from=` block-copy (slow path, roughly four minutes for a typical stemcell). Re-upload is not required for pre-upgrade stemcells.
 
-A VMID is allocated from `[vmid_range_start, vmid_range_end]` (default: `[100, 8999]`). After the clone task completes, the CPI configures NICs, attaches any pre-existing persistent disks, writes agent settings, and starts the VM. The returned `networks_with_mac` hash augments the input networks map with MAC addresses assigned by PVE.
+A VMID is allocated from `[vmid_range_start, vmid_range_end]` (default: `[100, 8999]`). After the clone task completes, the CPI configures NICs, attaches any pre-existing persistent disks, writes agent settings, and starts the VM. The returned `networks_with_mac` hash augments the input networks map with MAC addresses PVE assigned.
 
 `cloud_properties.tags` (map of `key: value`) is applied to the PVE tags field on the new VM as sanitized `<key>--<value>` entries. The BOSH-managed `director--`, `deployment--`, and `job--` triple is not known at create time and is added later by `set_vm_metadata`. See [Custom Tags](configuration.md#custom-tags).
 
@@ -127,9 +139,34 @@ A VMID is allocated from `[vmid_range_start, vmid_range_end]` (default: `[100, 8
 
 **VIP and firewall:** `cloud_properties.allowed_address_pairs` (list of IP strings) seeds PVE `ipfilter-netN` ipsets with the VM's primary IP and the listed VIPs across all firewalled NICs. This enables VIP/VRRP use cases. Requires `pve.vm_firewall` to be enabled.
 
+**PCI passthrough:** `cloud_properties.pci_passthroughs` (list of objects) passes host PCI devices through to the VM:
+
+- Each object has a single field: `address` (String) — the PCI device address in `DDDD:BB:SS.F` format (e.g. `"0000:01:00.0"`), matching the address the PVE node's hardware PCI list reports.
+- The CPI validates all addresses before creating any VM resource. An invalid or empty address is a non-retriable error.
+- At placement time, the CPI restricts candidate nodes to those that expose all requested addresses via `/nodes/{node}/hardware/pci`.
+- A strict single-node HA pin (`bosh-na-<vmid>`) is applied automatically to prevent live migration, which is incompatible with PCI passthrough. This pin is applied regardless of whether `pve.placement.pin_az_via_ha_rules` is set.
+- The host must have IOMMU enabled. IOMMU group isolation is the operator's responsibility; the CPI does not validate group boundaries.
+
+**Router/NAT VMs:** Two `cloud_properties` fields support VMs that forward traffic between networks:
+
+- `cloud_properties.advertised_routes` (list of objects) — OVN SDN subnets to register for this VM. Each object has:
+  - `vnet` (String) — the PVE SDN vnet name (1–8 lowercase alphanumeric characters, e.g. `"vnet01"`)
+  - `destination` (String) — the CIDR that should be routed via this VM's interface (e.g. `"10.64.0.0/16"`)
+
+  The CPI creates each subnet via `POST /cluster/sdn/vnets/{vnet}/subnets` and calls `PUT /cluster/sdn` to commit the change to the OVN logical-router fabric. Subnets that already exist are accepted without error (idempotent). On rollback, the CPI removes created subnets on a best-effort basis and logs any it could not remove for operator cleanup. Requires an OVN SDN zone and SDN write permissions.
+
+- `networks.<name>.cloud_properties.ip_forwarding` (Boolean, default `false`) — set on individual NIC entries in the `networks` map. When `true`, the CPI disables the PVE firewall flag on that NIC and excludes the NIC from `ipfilter-netN` ipset seeding. Use on router/NAT-facing NICs that must forward packets across network boundaries without per-packet IP filtering.
+
+**Ephemeral disk retention:** `cloud_properties.retain_ephemeral_on_delete` (Boolean, default `false`) — when `true`, the CPI stamps the tag `bosh-retain-ephemeral` on the VM at create time. On `delete_vm`, this tag suppresses destruction of the ephemeral disk: the disk slot is unlinked from the VM config (moved to `unusedN` then removed without freeing storage), and the backing volume survives. The WARN log names the volume for operator recovery. When `nil` or `false`, the ephemeral disk is destroyed with the VM. See [delete_vm](#delete_vm) for the interaction with this tag.
+
+**Hotplug:** Two cloud_properties keys fine-tune the PVE hotplug token string after the base value is resolved from `cloud_properties.hotplug`, vm_type profile, and `pve.hotplug` config:
+
+- `cloud_properties.cpu_hotplug` (Boolean, optional) — `true` ensures the `"cpu"` token is present; `false` removes it; absent leaves the resolved string unchanged.
+- `cloud_properties.memory_hotplug` (Boolean, optional) — `true` ensures the `"memory"` token is present and forces `numa=1` (PVE requires NUMA enabled to allocate DIMM slots for memory hotplug). `false` removes the `"memory"` token. `true` overrides an explicit `cloud_properties.numa: false`.
+
 **Lifecycle hooks:** After VM creation, lifecycle hooks fire in order (`notes_audit`, `lb_register`, `external_command`, `audit_log`). On failure, the `lb_register` hook deregisters the VM from the load balancer as part of the rollback chain. Hook configuration is documented in [configuration.md](configuration.md).
 
-**Health gate:** When `pve.health_check.enabled` is `true`, `create_vm` polls for an agent response before returning. The poll timeout is controlled by `pve.health_check.timeout_sec`. If the agent does not respond in time, the VM is destroyed via the standard rollback path.
+**Health gate:** When `pve.health_check.enabled` is `true`, `create_vm` polls for an agent response before returning. `pve.health_check.timeout_sec` controls the poll timeout. If the agent does not respond in time, the VM is destroyed via the standard rollback path.
 
 **Placement:** The CPI selects a node using AZ map, anti-affinity scoring, DLB integration, and post-selection fallback. When `pve.placement.pin_az_via_ha_rules` is enabled, a PVE HA node-affinity rule (`bosh-na-{vmid}`) pins the VM to its AZ node set, surviving DLB rebalance and HA failover. See [dlb-aware-placement.md](dlb-aware-placement.md) and [configuration.md](configuration.md) for tuning options.
 
@@ -154,7 +191,9 @@ A VMID is allocated from `[vmid_range_start, vmid_range_end]` (default: `[100, 8
 - **Sync path** (default): issues `DeleteQemu` and awaits the returned UPID task to completion before returning. The Director never observes a still-pending volume on the storage backend.
 - **Fast path** (`pve.fast_path_delete=true`): issues stop and destroy fire-and-forget, discards the UPID, and returns immediately. Eventual consistency — `has_vm` may briefly still see the VM while PVE's async destroy runs. The `bosh-deleting` tag marks such VMs; `sweepFastDeleteStragglers` reaps stalled fast-path destroys on the next `delete_vm` call.
 
-Both paths protect persistent disks before destroying the VM. `detachForeignActiveDisks` detects disks whose volume ID belongs to a different VMID (foreign disks), detaches them from the VM config, and preserves them. Destroy is blocked (fail-closed, retriable) if a detach cannot be confirmed. `guardUnusedVolumes` then checks the `unusedN` slots and refuses to proceed if a persistent volume cannot be confirmed absent from storage. If the VM does not exist, the call succeeds without error.
+Both paths protect persistent disks before destroying the VM. `detachForeignActiveDisks` detects disks whose volume ID belongs to a different VMID (foreign disks), detaches them from the VM config, and preserves them. Destroy is blocked (fail-closed, retriable) if a detach cannot be confirmed. `guardUnusedVolumes` then checks the `unusedN` slots and refuses to proceed if a persistent volume cannot be confirmed absent from storage. If the VM does not exist, the call returns success.
+
+**Ephemeral disk retention:** When the VM carries the `bosh-retain-ephemeral` tag (set by `cloud_properties.retain_ephemeral_on_delete: true` at `create_vm` time), `delete_vm` unlinks the ephemeral disk slot from the VM config without freeing storage, then proceeds to destroy the VM. The ephemeral volume survives and is logged at WARN level for operator recovery. Without this tag, the ephemeral disk is destroyed with the VM.
 
 ```mermaid
 flowchart TD
@@ -205,7 +244,7 @@ flowchart TD
 
 **Notes:** Reboots the VM using the strategy set by `pve.reboot_mode` (default `soft`).
 
-- **soft** (default): sends a graceful ACPI reboot via the PVE API and waits up to `pve.reboot_timeout` seconds (default 60) for the guest to respond. If the guest does not shut down in time, or the reboot call fails for any reason other than a 404, the CPI automatically falls back to a hard reset. A 404 response raises `Bosh::Clouds::CloudError`.
+- **soft** (default): sends a graceful ACPI reboot via the PVE API and waits up to `pve.reboot_timeout` seconds (default 60) for the guest to respond. If the guest does not shut down in time, or the reboot call fails for any reason other than a 404, the CPI falls back to a hard reset. A 404 response raises `Bosh::Clouds::CloudError`.
 - **hard**: issues an immediate hard reset (power cycle) with no grace period. This was the only behavior before the `reboot_mode` option was introduced.
 
 If the VM is stopped when `reboot_vm` is called, the CPI starts it so the VM ends up running, matching the BOSH expectation. The BOSH wire contract is unchanged: `reboot_vm` accepts only `vm_cid`.
@@ -227,7 +266,7 @@ If the VM is stopped when `reboot_vm` is called, the CPI starts it so the VM end
 
 **Notes:** Stores metadata as PVE VM tags and/or description. The Director passes standard keys such as `director`, `deployment`, `instance_group`, `job`, `id`, `name`, `index`, and `created_at`. Do not override or filter these.
 
-The handler reads the VM's existing PVE tags, strips entries with the reserved prefixes `director--`, `deployment--`, and `job--`, rebuilds the triple from the incoming metadata, and merges the result with any operator-supplied custom tags already on the VM. Custom tags from `create_vm` therefore survive Director re-syncs without manual reconciliation. An `index--<value>` tag is also emitted alongside the `director--`, `deployment--`, and `job--` entries. Tag values are truncated so the joined PVE tags string does not exceed 255 characters.
+The handler reads the VM's existing PVE tags, strips entries with the reserved prefixes `director--`, `deployment--`, and `job--`, rebuilds the triple from the incoming metadata, and merges the result with any operator-supplied custom tags already on the VM. Custom tags from `create_vm` therefore survive Director re-syncs without manual reconciliation. An `index--<value>` tag is also emitted alongside the `director--`, `deployment--`, and `job--` entries. Tag values are truncated so the joined PVE tags string stays within 255 characters.
 
 As a side effect, `set_vm_metadata` renames the PVE VM display name to `<vm_prefix>-<deployment>-<job>-<index>` (e.g., `cpi-cf-api-0`). When `pve.vm_prefix` is empty, the prefix segment is omitted. This makes BOSH instances filterable by name in the PVE UI. The rename happens on every `set_vm_metadata` call; the name written at `create_vm` time (`vm-<vmid>`) is overwritten.
 
@@ -249,7 +288,7 @@ As a side effect, `set_vm_metadata` renames the PVE VM display name to `<vm_pref
 
 **Errors:** `Bosh::Clouds::NotSupported` when no node satisfies the request. The message names the requested cpu/ram and storage, and lists CPU/RAM-qualifying nodes that failed the storage check.
 
-**Notes:** Selects a node storage-first: only nodes where the effective storage is active and `images`-capable are considered; among those, the node with the most free RAM wins. This prevents placing a VM on a node where the storage is unavailable, which previously failed later in `create_vm` with an opaque PVE error. Returns the minimum PVE cloud_properties (cores, sockets, memory, target node, target storage) that satisfy the requested size. May oversize. Used by the BOSH CLI `interpolate` and `env` commands.
+**Notes:** Selects a node storage-first: only nodes where the effective storage is active and `images`-capable are considered; among those, the node with the most free RAM wins. This prevents placing a VM on a node where the storage is unavailable, which previously failed later in `create_vm` with an opaque PVE error. Returns the minimum PVE `cloud_properties` (cores, sockets, memory, target node, target storage) satisfying the requested size. May oversize. Used by the BOSH CLI `interpolate` and `env` commands.
 
 ---
 
@@ -273,6 +312,8 @@ As a side effect, `set_vm_metadata` renames the PVE VM display name to `<vm_pref
 
 `cloud_properties.tags` (map of `key: value`) is applied to the PVE tags field on the VM identified by `vm_cid`. PVE has no native disk-volume tag field — tags ride on the hosting VM. When `vm_cid` is empty (Director is creating an unattached disk), the tags are deferred and applied on the next `set_disk_metadata` call. See [Custom Tags](configuration.md#custom-tags).
 
+`cloud_properties.retain_on_delete` (Boolean, optional) — when `true`, the CPI encodes `retain_on_delete=1` into the disk CID metadata. On `delete_vm`, this flag causes the disk to appear in WARN logs as operator-retained rather than incidentally foreign. Persistent disks are already protected by the foreign-VMID guard; this field adds an explicit audit trail. The encoded intent is carried in the disk CID and is readable without querying PVE VM config.
+
 ---
 
 ### `delete_disk`
@@ -287,7 +328,9 @@ As a side effect, `set_vm_metadata` renames the PVE VM display name to `<vm_pref
 
 **Errors:** `Bosh::Clouds::CloudError` if deletion is not certain (to prevent orphaned disks)
 
-**Notes:** The disk must be detached before deletion. The Director ensures `detach_disk` is called first.
+**Notes:** The disk must be detached before deletion. The Director calls `detach_disk` first.
+
+**Parked disk strategy:** When `pve.detached_disk_strategy: parked` is configured, detached disks are held on dedicated parker VMs (VMID range 90000–90999 by default) rather than left free-floating. When `delete_disk` is called, the CPI first unparks the disk from its parker VM before deleting the volume. Unpark failure returns a retriable error; the disk remains safely on the parker VM and the next Director retry re-attempts the unpark. When the strategy is not active, `delete_disk` proceeds directly to volume deletion with no extra API calls.
 
 ---
 
@@ -311,7 +354,7 @@ The disk CID may carry an optional encoded metadata suffix (see [Disk CID Encodi
 
 - For block-backed storage backends (lvmthin, zfspool), PVE may return HTTP 500 with a message such as "Failed to find logical volume". The CPI treats this as `false` via `ExistsTolerant`, giving operators on these backends a clean `has_disk=false` rather than a retriable error when a disk has been deleted.
 
-- For local storage backends, the CPI scans all cluster nodes via `NodeForExisting` to locate the owning node before querying storage content. When no node holds the volume, the scan returns `false` without error.
+- For local storage backends, the CPI scans all cluster nodes via `NodeForExisting` to locate the owning node before querying storage content. When no node holds the volume, the scan returns `false`.
 
 ---
 
@@ -328,7 +371,9 @@ The disk CID may carry an optional encoded metadata suffix (see [Disk CID Encodi
 
 **Errors:** `Bosh::Clouds::CloudError` on PVE API failure
 
-**Notes:** Attaches the disk to the VM's PVE config and awaits the PVE task. Returns the kernel device path assigned to the disk. This is a v2 change: v1 returned void and updated the registry instead. A snapshot pre-flight guard runs first: if the VM has snapshots, attach is rejected with an actionable error, because a disk attached after a snapshot is invisible to that snapshot on rollback. Set `pve.allow_disk_ops_with_snapshots` to bypass. See [Snapshot guard on disk operations](#snapshot-guard-on-disk-operations) for details.
+**Notes:** Attaches the disk to the VM's PVE config and awaits the PVE task. Returns the kernel device path assigned to the disk. This is a v2 change: v1 returned void and updated the registry instead. A snapshot pre-flight guard runs first: if the VM has snapshots, attach is rejected with an actionable error, because a disk attached after a snapshot is invisible to that snapshot on rollback. Set `pve.allow_disk_ops_with_snapshots` to bypass. See [Snapshot guard on disk operations](#snapshot-guard-on-disk-operations).
+
+**Parked disk strategy:** When `pve.detached_disk_strategy: parked` is configured, `attach_disk` runs an unpark step before the snapshot guard and slot selection. The CPI detaches the disk from its parker VM, making the volume free-floating so the normal attach path can proceed. Unpark failure returns a retriable error; the disk remains safely parked and the Director retries. When the strategy is not active, no extra API calls are made.
 
 ---
 
@@ -345,7 +390,9 @@ The disk CID may carry an optional encoded metadata suffix (see [Disk CID Encodi
 
 **Errors:** `Bosh::Clouds::CloudError` on PVE API failure
 
-**Notes:** Removes the disk from the VM's PVE config and awaits the PVE task. With `api_version: 2` stemcells, the Director notifies the agent of the detach directly; the CPI does not touch the registry. A snapshot pre-flight guard runs first: if the VM has snapshots that reference the disk, detach is rejected with an actionable error naming the blocking snapshots (PVE would otherwise reject it with a raw message). Set `pve.allow_disk_ops_with_snapshots` to bypass. See [Snapshot guard on disk operations](#snapshot-guard-on-disk-operations) for details.
+**Notes:** Removes the disk from the VM's PVE config and awaits the PVE task. With `api_version: 2` stemcells, the Director notifies the agent of the detach directly; the CPI does not touch the registry. A snapshot pre-flight guard runs first: if the VM has snapshots that reference the disk, detach is rejected with an actionable error naming the blocking snapshots (PVE would otherwise reject it with a raw message). Set `pve.allow_disk_ops_with_snapshots` to bypass. See [Snapshot guard on disk operations](#snapshot-guard-on-disk-operations).
+
+**Parked disk strategy:** When `pve.detached_disk_strategy: parked` is configured, `detach_disk` parks the disk on a dedicated parker VM after the physical detach completes. A park failure returns a retriable error; the disk remains free-floating and the Director retries. On retry, if the disk is already parked, the handler returns success without making further API calls (idempotent). If the disk arrives at `detach_disk` already in the detached state (a retry scenario), the CPI checks whether it is already parked and re-parks it if not. Parker VMs use VMIDs in the range configured by `pve.parked_disk_vmid_range_start` and `pve.parked_disk_vmid_range_end` (default 90000–90999). See [persistent-disks.md](persistent-disks.md) for the full parked disk lifecycle.
 
 ---
 
@@ -363,7 +410,7 @@ The disk CID may carry an optional encoded metadata suffix (see [Disk CID Encodi
 
 **Notes:** Used by cloudcheck to reconcile disk attachment state.
 
-The following slots are always excluded from results: `scsi0` (SCSI root disk), `virtio0` (virtio root disk), `ide0`, and `ide2`. Disks whose PVE option string contains `media=cdrom` are also excluded regardless of slot. Returned CIDs are bare volids (`<storage>:<volume>`) without option strings.
+The following slots are always excluded from results: `scsi0` (SCSI root disk), `virtio0` (virtio root disk), `ide0`, and `ide2`. Disks whose PVE option string contains `media=cdrom` are excluded regardless of slot. Returned CIDs are bare volids (`<storage>:<volume>`) without option strings.
 
 The CPI locates the VM via a cluster scan (`FindVMNodeViaCluster`) before fetching its config, so the result is authoritative after an HA failover.
 
@@ -382,7 +429,7 @@ The CPI locates the VM via a cluster scan (`FindVMNodeViaCluster`) before fetchi
 
 **Errors:** `Bosh::Clouds::CloudError` on PVE API failure
 
-**Notes:** PVE has no per-disk snapshot primitive. The CPI locates the VM currently hosting the disk and creates a VM-level snapshot on it, so all disks on that VM are included. The returned `snapshot_cid` has the form `<vmid>:<snap_name>`, where `vmid` is the ID of the hosting VM at snapshot time — not the disk CID. Example: `100:bosh-1718000000-ab12ef34`. The snap name is generated as `bosh-<unix_timestamp>-<8hex>`.
+**Notes:** PVE has no per-disk snapshot primitive. The CPI locates the VM currently hosting the disk and creates a VM-level snapshot on it, so all disks on that VM are included. The returned `snapshot_cid` has the form `<vmid>:<snap_name>`, where `vmid` is the ID of the hosting VM at snapshot time — not the disk CID. Example: `100:bosh-1718000000-ab12ef34`. The snap name is `bosh-<unix_timestamp>-<8hex>`.
 
 The disk must be attached to exactly one VM at call time. Calling `snapshot_disk` on an unattached disk returns a `CloudError`.
 
@@ -416,7 +463,7 @@ flowchart LR
 
 **Notes:** Deletes the VM snapshot named in `snapshot_cid`. The format is `<vmid>:<snap_name>` (matching the value returned by `snapshot_disk`). The CPI locates the VM via a cluster scan before issuing the delete, so the call works after an HA failover.
 
-Idempotent: a missing snapshot (HTTP 404) or a missing VM returns success, matching BOSH Director expectations for delete operations, which may be retried after partial failures.
+Idempotent: a missing snapshot (HTTP 404) or a missing VM returns success, matching BOSH Director expectations for delete operations that may be retried after partial failures.
 
 PVE deletes snapshots asynchronously. After the delete call returns, the CPI waits up to 120 seconds for the snapshot to disappear (`WaitForSnapshotAbsent`) before returning success. This prevents spurious snapshot-guard failures on immediately subsequent `detach_disk` calls, which reject operations when live snapshots exist.
 
@@ -438,7 +485,7 @@ PVE deletes snapshots asynchronously. After the delete call returns, the CPI wai
 - `Bosh::Clouds::NotSupported` when `new_size` is less than the current disk size (shrink rejected; Director falls back to create-new + copy-data)
 - `Bosh::Clouds::CloudError` on PVE API failure
 
-**Notes:** The Director calls this only when `director.enable_cpi_resize_disk: true`. The disk must be attached to a VM at call time; the handler uses `FindVMByDiskVolid` to locate the hosting VM and determine the current disk size before issuing the resize. If the disk is not attached, the call errors. A snapshot pre-flight guard runs first: if the VM has snapshots, resize is rejected with an actionable error. PVE cannot resize disks on LVM-thin or ZFS storage while snapshots exist; on qcow2/raw the resize would succeed but leave snapshot data inconsistent. Set `pve.allow_disk_ops_with_snapshots` to bypass. See [Snapshot guard on disk operations](#snapshot-guard-on-disk-operations) for details.
+**Notes:** The Director calls this only when `director.enable_cpi_resize_disk: true`. The disk must be attached to a VM at call time; the handler uses `FindVMByDiskVolid` to locate the hosting VM and determine the current disk size before issuing the resize. If the disk is not attached, the call errors. A snapshot pre-flight guard runs first: if the VM has snapshots, resize is rejected with an actionable error. PVE cannot resize disks on LVM-thin or ZFS storage while snapshots exist; on qcow2/raw the resize would succeed but leave snapshot data inconsistent. Set `pve.allow_disk_ops_with_snapshots` to bypass. See [Snapshot guard on disk operations](#snapshot-guard-on-disk-operations).
 
 ---
 
@@ -450,7 +497,7 @@ Two settings tune the behavior:
 
 - `pve.allow_disk_ops_with_snapshots` (default `false`) — when `true`, the guard is bypassed and the operation proceeds despite snapshots. For emergency recovery only; snapshot state becomes inconsistent afterward.
 
-- `pve.require_snapshot_check_pass` (default `false`) — controls what happens when the snapshot check itself cannot reach PVE. Default is fail-open: log a warning and proceed. Set `true` to fail-closed: abort the operation if the snapshot list cannot be fetched.
+- `pve.require_snapshot_check_pass` (default `false`) — controls behavior when the snapshot check itself cannot reach PVE. Default is fail-open: log a warning and proceed. Set `true` to fail-closed: abort the operation if the snapshot list cannot be fetched.
 
 ---
 
@@ -467,7 +514,7 @@ Two settings tune the behavior:
 
 **Errors:** `Bosh::Clouds::CloudError` on PVE API failure
 
-**Notes:** PVE has no native disk metadata. The CPI stashes metadata as a JSON block in the description of the VM that currently has the disk attached. If the disk is detached at call time, the CPI logs a warning and returns success without storing the metadata.
+**Notes:** PVE has no native disk metadata. The CPI stashes metadata as a JSON block in the description of the VM currently holding the disk. If the disk is detached at call time, the CPI logs a warning and returns success without storing the metadata.
 
 The metadata is stored using a sentinel comment embedded in the VM description:
 
@@ -477,7 +524,7 @@ The metadata is stored using a sentinel comment embedded in the VM description:
 
 Any non-BOSH content in the VM description before the sentinel is preserved. The sentinel payload distinguishes `bosh_disk_metadata` (regular key-value metadata) from `bosh_disk_tags` (operator tag entries stored under `bosh_disk_tags[<disk_cid>]`).
 
-If the same disk volume is found attached to two or more VMs, the call returns a `CloudError` with the message "ambiguous disk attachment". The CPI scans all cluster VMs to locate the hosting VM; if no VM holds the disk, the call returns success with a warning log.
+If the same disk volume is found attached to two or more VMs, the call returns a `CloudError` with the message "ambiguous disk attachment". The CPI scans all cluster VMs to locate the hosting VM; if no VM holds the disk, the call returns success with a warning.
 
 If `metadata` contains a `tags` sub-object (map of `key: value`), the entries are extracted from the regular `bosh_disk_metadata` payload, written to the hosting VM's PVE tags field as sanitized `<key>--<value>` entries, and recorded separately in the description sentinel under `bosh_disk_tags[<disk_cid>]`. Existing tag entries whose key prefix collides with a new tag are replaced; other entries are preserved. See [Custom Tags](configuration.md#custom-tags).
 
@@ -506,13 +553,13 @@ If `metadata` contains a `tags` sub-object (map of `key: value`), the entries ar
 
 **Errors:** `Bosh::Clouds::CloudError` on PVE API failure
 
-**Notes:** Not part of the canonical BOSH CPI v2 specification. Provides full PVE disk option updates beyond what `resize_disk` covers. If `size` is provided, the same shrink-rejection rule as `resize_disk` applies.
+**Notes:** Not part of the canonical BOSH CPI v2 specification. Provides full PVE disk option updates beyond what `resize_disk` covers. When `size` is provided, the same shrink-rejection rule as `resize_disk` applies.
 
 ---
 
 ## Network
 
-The CPI implements `create_network` and `delete_network` for BOSH managed networks. Two paths are available: **SDN** (PVE SDN vnets via the cluster API) and **bridge** (Linux bridges via the nodes API). The active path is selected by `network_mode` in config and by the `cloud_properties` keys in the network spec. Most deployments pre-configure networks in PVE and never call these methods; they are invoked only when the BOSH cloud-config marks a network as `managed: true`.
+The CPI implements `create_network` and `delete_network` for BOSH managed networks. Two paths are available: **SDN** (PVE SDN vnets via the cluster API) and **bridge** (Linux bridges via the nodes API). The active path is selected by `network_mode` in config and by the `cloud_properties` keys in the network spec. Most deployments pre-configure networks in PVE and never call these methods; they run only when the BOSH cloud-config marks a network as `managed: true`.
 
 For the full `cloud_properties` schema, zone/vnet/subnet semantics, naming rules, and worked manifest examples, see [Network configuration](networks.md).
 
@@ -544,7 +591,7 @@ For the full `cloud_properties` schema, zone/vnet/subnet semantics, naming rules
 | `address_properties` | `{range, gateway, reserved: []}` | `{range, gateway, reserved: []}` |
 | `cloud_properties_out` | `{zone, vnet, bridge: <vnet>}` | `{bridge, node}` |
 
-Note: on the SDN path `bridge` equals `vnet` because PVE realizes a simple-zone vnet as a Linux bridge with the same name. The `bridge` key in `cloud_properties_out` is present so `create_vm` NIC attachment works without additional config.
+Note: on the SDN path `bridge` equals `vnet` because PVE realizes a simple-zone vnet as a Linux bridge with the same name. The `bridge` key in `cloud_properties_out` is present so `create_vm` NIC attachment works without additional configuration.
 
 **Path selection:**
 
@@ -565,7 +612,7 @@ The handler picks a path from `pve.network_mode` (default `"auto"`):
 5. Call `UpdateSdn` to commit staged SDN changes to the data plane.
 6. Return `[vnet, {range, gateway, reserved:[]}, {zone, vnet, bridge: vnet}]`.
 
-On apply failure, the handler makes best-effort rollback (delete subnet, vnet, and zone if created in this call) before returning the error.
+On apply failure, the handler attempts best-effort rollback (delete subnet, vnet, and zone if created in this call) before returning the error.
 
 **Behavior — bridge path:**
 
@@ -623,7 +670,7 @@ When `pve.sdn_auto_manage_zone=true`, the CPI creates the SDN zone if it does no
 2. Call `UpdateNetwork(config.node)` to reload.
 3. Return `null`.
 
-The bridge path uses `pve.node` from config. Per-bridge node assignment is not stored between `create_network` and `delete_network` calls; if `pve.node` is unset, `delete_network` returns a `CloudError` rather than silently succeeding with the bridge still present.
+The bridge path uses `pve.node` from config. Per-bridge node assignment is not stored between `create_network` and `delete_network` calls; if `pve.node` is unset, `delete_network` returns a `CloudError` rather than succeeding silently with the bridge still present.
 
 **Idempotency:**
 
@@ -637,7 +684,7 @@ The CPI deletes the parent SDN zone during `delete_network` only when all of the
 2. The zone name does not equal `pve.sdn_zone` (the configured default zone is never auto-deleted).
 3. After the vnet is removed, `ListSdnVnets` filtered by zone returns zero remaining vnets.
 
-If `ListSdnVnets` fails, the zone is left intact rather than risking deletion of a zone that may still contain vnets.
+If `ListSdnVnets` fails, the zone is left intact to avoid deleting a zone that may still contain vnets.
 
 Residual risk: with `sdn_auto_manage_zone=true`, any zone supplied via `cloud_properties.zone` that differs from `pve.sdn_zone` will be deleted when emptied. Operators who share a zone across deployments must either set `pve.sdn_zone` to pin it or leave `sdn_auto_manage_zone=false` (the default).
 

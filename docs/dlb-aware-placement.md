@@ -16,7 +16,7 @@ PVE 9.2 introduced a Cluster Resource Scheduler (CRS) dynamic mode that, when en
 
 CRS/DLB acts **only on HA-managed guests** — an ordinary VM not registered as a PVE HA resource is invisible to the DLB.
 
-This CPI feature bridges the gap. When enabled, the CPI registers newly created BOSH VMs as PVE HA resources with `auto-rebalance=1` and `state=started`, making them eligible for DLB placement and ongoing rebalancing. The feature is **off by default**; explicit operator opt-in is required.
+This CPI feature bridges the gap. When enabled, the CPI registers newly created BOSH VMs as PVE HA resources with `auto-rebalance=1` and `state=started`, making them eligible for DLB placement and ongoing rebalancing. The feature is **off by default** and requires explicit operator opt-in.
 
 For the broader placement architecture, see [Architecture — Placement and AZ anti-affinity](architecture.md#placement-and-az-anti-affinity).
 
@@ -28,7 +28,7 @@ For the broader placement architecture, see [Architecture — Placement and AZ a
 
 Setting `pve.placement.dlb.enabled: true` in the BOSH job properties marks **every VM** created by this CPI instance for DLB registration.
 
-This flag works **alongside** your existing availability zone topology. VMs that belong to a configured AZ (via `pve.placement.az_map`) are still initially placed within that AZ's candidate node set; DLB then rebalances them within those allowed nodes afterward. The master flag does not require collapsing or removing your AZ configuration.
+This flag works **alongside** your existing availability zone topology. VMs that belong to a configured AZ (via `pve.placement.az_map`) are still initially placed within that AZ's candidate node set; DLB then rebalances them within those allowed nodes. The master flag does not require collapsing or removing your AZ configuration.
 
 ### Sentinel Availability Zone — `pve.placement.dlb.az_name`
 
@@ -118,6 +118,7 @@ pvesh set /cluster/options \
 
 - The original HA-managed guest and the Director-spawned replacement can conflict on IP, VMID, or agent credentials, leaving orphaned HA resources that block future operations.
 
+
 The CPI cannot detect the resurrector's state — this is the operator's responsibility. Disable the resurrector via:
 
 ```yaml
@@ -133,9 +134,9 @@ bosh update-resurrection off
 
 ### Shared Storage Required
 
-Live migration — the mechanism the DLB uses to rebalance VMs — requires the VM's root disk to reside on storage that is accessible from all cluster nodes (rbd, nfs, cifs, glusterfs, or cephfs).
+Live migration — the mechanism DLB uses to rebalance VMs — requires the VM's root disk to reside on storage accessible from all cluster nodes (rbd, nfs, cifs, glusterfs, or cephfs).
 
-VMs on node-local storage (dir, lvm, lvmthin, zfspool) cannot be live-migrated. With `pve.placement.dlb.require_shared_storage: true` (the default), the CPI checks both the VM root pool (`pve.vm_storage`) and the persistent disk pool (`pve.disk_storage`); if either is node-local, the CPI silently skips DLB registration for that VM, logging a debug entry. This prevents PVE from attempting an impossible migration.
+VMs on node-local storage (dir, lvm, lvmthin, zfspool) cannot be live-migrated. With `pve.placement.dlb.require_shared_storage: true` (the default), the CPI checks both the VM root pool (`pve.vm_storage`) and the persistent disk pool (`pve.disk_storage`); if either is node-local, the CPI silently skips DLB registration for that VM and logs a debug entry. This prevents PVE from attempting an impossible migration.
 
 If the storage type cannot be determined from the PVE API at create time, the CPI fails open (proceeds with registration) and logs a debug entry.
 
@@ -153,11 +154,11 @@ When PVE live-migrates a VM, the guest retains its IP address and MAC. Your netw
 
 ### Director and Bootstrap VMs Must Not Be DLB-Managed
 
-The BOSH Director VM (created via `bosh create-env`) must never be registered with DLB or PVE HA. If the Director is live-migrated mid-deploy, in-flight CPI RPC connections are dropped and the deployment fails. The standard approach is to use a separate `cpi.json` for the `create-env` step that does not include any `placement.dlb` properties — the Go config accessor returns safe OFF defaults when the `placement.dlb` block is absent.
+The BOSH Director VM (created via `bosh create-env`) must never be registered with DLB or PVE HA. If the Director is live-migrated mid-deploy, in-flight CPI RPC connections are dropped and the deployment fails. Use a separate `cpi.json` for the `create-env` step that omits any `placement.dlb` properties — the Go config accessor returns safe OFF defaults when the `placement.dlb` block is absent.
 
 ### Large VMs and Migration Pause
 
-VMs with a large working set of dirty memory pages incur a significant migration pause. During that pause the guest is suspended briefly. If the pause exceeds the BOSH agent heartbeat timeout, the Director may declare the VM unhealthy and trigger recovery. Size VMs appropriately and, for latency-sensitive workloads, consider excluding them from DLB by not using the DLB sentinel AZ and leaving `dlb.enabled: false`.
+VMs with a large working set of dirty memory pages incur a significant migration pause during which the guest is suspended briefly. If the pause exceeds the BOSH agent heartbeat timeout, the Director may declare the VM unhealthy and trigger recovery. Size VMs appropriately and, for latency-sensitive workloads, exclude them from DLB by not using the DLB sentinel AZ and leaving `dlb.enabled: false`.
 
 ---
 
@@ -237,7 +238,7 @@ The lock is keyed per instance group (`bosh-lock-<group>`), so different instanc
 
 ### Normal AZ Topology with Master Flag
 
-When `pve.placement.dlb.enabled: true` and the VM belongs to a configured AZ (via `pve.placement.az_map`), the CPI still restricts initial placement to that AZ's candidate node set. The node scorer runs normally within that set. After the VM is created, DLB is permitted to rebalance it, but only within nodes that PVE HA considers valid — effectively the same node set that the AZ map defines.
+When `pve.placement.dlb.enabled: true` and the VM belongs to a configured AZ (via `pve.placement.az_map`), the CPI still restricts initial placement to that AZ's candidate node set. The node scorer runs normally within that set. After the VM is created, DLB may rebalance it, but only within nodes that PVE HA considers valid — effectively the same node set the AZ map defines.
 
 ### Sentinel AZ
 
@@ -247,7 +248,8 @@ When a VM's `availability_zone` matches the sentinel name and the sentinel name 
 
 The CPI's existing anti-affinity feature (`pve.placement.anti_affinity.*`) spreads same-instance-group VMs across nodes using PVE HA negative-affinity rules. DLB may override that spreading under load: CRS/DLB sees resource pressure and migrates a VM onto a node that already hosts a sibling, because the DLB's balancing objective can conflict with anti-affinity constraints.
 
-To reduce this divergence, use `pve.placement.anti_affinity.use_ha_rules: true` alongside DLB. This encodes anti-affinity as PVE-level negative HA resource-affinity rules, giving the scheduler a formal constraint rather than only a scored preference. Optionally set `pve.placement.anti_affinity.strict: true` to make those rules hard constraints. **Warning:** strict mode on a cluster with two or three nodes can prevent PVE from evacuating a faulting node when no compliant destination exists. Only use strict mode on clusters large enough to always have a node that satisfies every active constraint simultaneously.
+
+To reduce this divergence, use `pve.placement.anti_affinity.use_ha_rules: true` alongside DLB. This encodes anti-affinity as PVE-level negative HA resource-affinity rules, giving the scheduler a formal constraint rather than only a scored preference. Optionally set `pve.placement.anti_affinity.strict: true` to make those rules hard constraints. **Warning:** strict mode on a cluster with two or three nodes can prevent PVE from evacuating a faulting node when no compliant destination exists. Use strict mode only on clusters large enough to always have a node that satisfies every active constraint simultaneously.
 
 ---
 
@@ -259,7 +261,7 @@ On `delete_vm`, the CPI removes the VM from all associated PVE HA rules:
 
 - `removeAntiAffinityMembership` removes the VM from `bosh-aa-<group>` rules (runs when `anti_affinity.use_ha_rules` is enabled **or** `placement.dlb` is configured — master flag or non-empty sentinel name).
 
-Both cleanups are best-effort and never block VM deletion.
+Both cleanups are best-effort and do not block VM deletion.
 
 ---
 
@@ -269,7 +271,7 @@ On a **single-node cluster**, the CPI detects that there is only one node, logs 
 
 On a **PVE version older than 9.2**, the CPI parses the node version string, logs a debug entry, and skips DLB registration. VM creation proceeds normally. HA affinity rules (anti-affinity via `use_ha_rules`) continue to work on older PVE versions; only the DLB-specific `auto-rebalance` registration is skipped.
 
-In both cases the feature is silently inert. Operators can enable the DLB properties in their manifests and deploy to mixed-version or single-node clusters without errors; the DLB path does nothing until the prerequisites are met.
+In both cases the feature is silently inert. Operators can enable DLB properties in their manifests and deploy to mixed-version or single-node clusters without errors; the DLB path does nothing until the prerequisites are met.
 
 ---
 

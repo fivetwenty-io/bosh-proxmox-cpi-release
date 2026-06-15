@@ -6,6 +6,7 @@ available:
 
 1. **Pre-uploaded** — operator places a qcow2 on PVE storage out-of-band and
    references it via `cloud_properties.image_id`.
+
 2. **CPI-assisted fetch** — operator references a remote URL via
    `cloud_properties.image_url`; the CPI fetches it once and caches it in PVE
    storage, deduplicating on re-deploy.
@@ -19,7 +20,7 @@ section for the full CID dispatch table.
 
 ## When to use
 
-- **Air-gapped lab** — upload once via `pvesm` or the PVE Upload API; reuse across
+- **Air-gapped lab** — upload once via `pvesm` or the PVE Upload API and reuse across
   redeploys without touching the BOSH director upload path.
 
 - **Multi-deployment infrastructure** — point multiple deployments at the same CPI-fetched
@@ -65,7 +66,7 @@ is present, builds a frozen template VM from it, and returns `template:<vmid>`.
 
 ### Operator workflow
 
-1. Upload the qcow2 to the target PVE storage. Two paths are available:
+1. Upload the qcow2 to the target PVE storage. Two paths exist:
 
    ```bash
    # From a PVE host shell:
@@ -101,7 +102,7 @@ is present, builds a frozen template VM from it, and returns `template:<vmid>`.
    ```
 
    The `bosh repack-stemcell` command can inject or replace `cloud_properties` in an
-   existing stemcell tarball to avoid authoring one from scratch.
+   existing stemcell tarball, avoiding the need to author one from scratch.
 
 4. Upload to the director:
 
@@ -229,13 +230,13 @@ password: "<pass>"    # optional
 ### Dedup
 
 The CPI deduplicates fetched images using a `(name, version, sha8)` filename pattern. When
-`bosh upload-stemcell` is called a second time for the same image:
+`bosh upload-stemcell` is called again for the same image:
 
 1. The CPI scans PVE storage for any import volume with a matching `name`+`version` prefix.
 2. If a match is found, it returns the existing `template:<vmid>` CID without fetching the remote URL.
 3. After the fetch, an exact SHA-256 check provides a second dedup gate.
 
-A re-deploy or second `bosh upload-stemcell` for an already-cached image completes in
+A re-deploy or repeat `bosh upload-stemcell` for an already-cached image completes in
 milliseconds.
 
 ### Error messages
@@ -250,7 +251,7 @@ milliseconds.
 
 ## Template VM lifecycle
 
-All stemcell paths (heavy, pre-uploaded, and CPI-fetch) converge on the same lifecycle:
+All stemcell paths — heavy, pre-uploaded, and CPI-fetch — converge on the same lifecycle:
 the CPI builds a frozen PVE template VM and returns its VMID as the stemcell CID.
 
 ```mermaid
@@ -283,10 +284,11 @@ digest. On subsequent `create_stemcell` calls for the same image:
 
 Two optional config keys control template VM placement:
 
-- `pve.stemcell_template_node` — pins template creation to a specific cluster node.
+- `pve.stemcell_template_node` — pins template creation to a specific cluster node;
   `delete_stemcell` uses the same node for the primary destroy.
+
 - `pve.stemcell_template_pool` — assigns template VMs to a named PVE resource pool,
-  which scopes access controls and facilitates bulk operations.
+  which scopes access controls and enables bulk operations.
 
 ### Template replication
 
@@ -294,7 +296,7 @@ When `pve.stemcell_replicate_local` is enabled, the CPI replicates the template 
 all cluster nodes after creation, up to `pve.stemcell_replication_concurrency` parallel
 copies (default: serial). Individual node replication failures are logged as warnings
 and do not fail `create_stemcell`. `delete_stemcell` performs a cross-node SHA-tag sweep
-to remove all replicas regardless of whether replication was originally enabled.
+to remove all replicas regardless of whether replication was enabled originally.
 
 ### Provenance and orphan pruning
 
@@ -310,13 +312,13 @@ director. Orphan pruning is best-effort: individual sweep failures do not fail
 
 ## Operator caveats
 
-`bosh delete-stemcell` on a `template:` CID (the current format) destroys the template
+`bosh delete-stemcell` on a `template:` CID destroys the template
 VM and its backing disk volume via PVE purge. No manual `pvesm free` step is needed.
 Verify deletion by running `bosh stemcells` before and after; the CID disappears afterward.
 
 **Legacy `light:` CIDs** (produced only by CPI versions predating the template-VM
 model) are treated as no-ops: `bosh delete-stemcell` on a `light:` CID logs an INFO
-entry and returns success without touching PVE. If your director still holds `light:`
+entry and returns success without touching PVE. If the director still holds `light:`
 CIDs from a prior CPI version, manage those volumes manually:
 
 ```bash
@@ -357,8 +359,7 @@ pvesm free <storage>:import/<partial-filename>
 
 A CPI version that predates the template-VM model cannot parse `template:` CIDs. Before
 downgrading, re-upload all stemcells using the normal (heavy) path so the director holds
-the older CID format. Do not downgrade while any deployment references a `template:` CID
-produced by the current CPI.
+the older CID format. Do not downgrade while any deployment still references a `template:` CID.
 
 ## See also
 

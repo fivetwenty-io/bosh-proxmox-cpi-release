@@ -1,16 +1,16 @@
 # BOSH CPI Certification
 
-Two paths exist for certifying this CPI release against the BOSH CPI v2 contract:
+Two paths exist for certifying this CPI release against the BOSH CPI v2 contract.
 
-1. **Local lifecycle harness** — `scripts/lifecycle` in this repo. Exercises the 14 canonical lifecycle methods end-to-end against a live PVE cluster in a few minutes. No Concourse, no terraform, no full BOSH director. **Recommended for day-to-day development and pre-merge validation.**
-2. **Upstream Concourse pipeline** — [`cloudfoundry/bosh-cpi-certification`](https://github.com/cloudfoundry/bosh-cpi-certification). Runs the full BOSH Acceptance Test (BAT) suite + director-upgrade test in CI. **Required before publishing a release tarball for downstream consumers.** No `pve/` directory exists upstream yet; adding one is future work (see [Upstream Path](#upstream-path) below).
+1. **Local lifecycle harness** — `scripts/lifecycle` in this repo. Exercises the 14 canonical lifecycle methods end-to-end against a live PVE cluster in a few minutes. No Concourse, no terraform, and no full BOSH director required. **Recommended for day-to-day development and pre-merge validation.**
+2. **Upstream Concourse pipeline** — [`cloudfoundry/bosh-cpi-certification`](https://github.com/cloudfoundry/bosh-cpi-certification). Runs the full BOSH Acceptance Test (BAT) suite and the director-upgrade test in CI. **Required before publishing a release tarball for downstream consumers.** No `pve/` directory exists upstream yet; adding one is future work (see [Upstream Path](#upstream-path) below).
 
 ## Local Lifecycle Harness
 
 ### Prerequisites
 
 - A reachable PVE 9.x cluster
-- A PVE API token or root credentials with permission to create/destroy VMs, disks, and snapshots on the target node
+- A PVE API token or root credentials with permission to create and destroy VMs, disks, and snapshots on the target node
 - A BOSH stemcell tarball (`.tgz`) compatible with the PVE CPI — typically `bosh-stemcell-*-pve-ubuntu-jammy-go_agent.tgz` or a generic `qcow2` stemcell
 - `jq` installed locally
 - This repo built: `make bin/cpi`
@@ -97,7 +97,7 @@ flowchart LR
 
 ### Failure Handling
 
-The script uses an `EXIT` trap that tears down resources in LIFO order on any failure. If the run aborts after `create_vm` succeeds but before `delete_vm`, the trap still runs `delete_vm` (and any earlier resources). Cleanup is best-effort: leaked resources are logged but do not change exit status.
+The script uses an `EXIT` trap that tears down resources in LIFO order on any failure. If the run aborts after `create_vm` succeeds but before `delete_vm`, the trap still runs `delete_vm` (and cleans up any earlier resources). Cleanup is best-effort: leaked resources are logged but do not change exit status.
 
 To inspect a failure in detail:
 
@@ -109,7 +109,7 @@ Each step prints `==> <method>` before invocation; the failing step is the last 
 
 ### Cluster Topology Behavior
 
-Read-path handlers — `has_vm`, `reboot_vm`, `set_vm_metadata`, `get_disks`, `delete_vm`, and `delete_snapshot` — locate VMs via a `/cluster/resources` scan rather than a single-node query. This means they find the correct node after a PVE HA failover without any operator intervention or CPI reconfiguration.
+Read-path handlers — `has_vm`, `reboot_vm`, `set_vm_metadata`, `get_disks`, `delete_vm`, and `delete_snapshot` — locate VMs via a `/cluster/resources` scan rather than a single-node query. They find the correct node after a PVE HA failover without operator intervention or CPI reconfiguration.
 
 `delete_network` has a per-path difference:
 
@@ -129,7 +129,7 @@ echo '{"method":"info","arguments":[],"context":{"request_id":"r1"},"api_version
 
 ## Upstream Path
 
-The [`cloudfoundry/bosh-cpi-certification`](https://github.com/cloudfoundry/bosh-cpi-certification) repository is a Concourse-pipeline framework — not a local test runner. It expects a full BOSH director, terraform-provisioned infrastructure, and a published CPI release tarball.
+The [`cloudfoundry/bosh-cpi-certification`](https://github.com/cloudfoundry/bosh-cpi-certification) repository is a Concourse pipeline framework, not a local test runner. It expects a full BOSH director, terraform-provisioned infrastructure, and a published CPI release tarball.
 
 ### Current Status
 
@@ -137,7 +137,7 @@ No `pve/` directory exists upstream. The repo ships `aws/`, `azure/`, `gcp/`, `v
 
 ### What Would Be Needed
 
-To wire PVE into the upstream certification suite, contribute a `pve/` directory to `cloudfoundry/bosh-cpi-certification`:
+To wire PVE into the upstream certification suite, contribute a `pve/` directory to `cloudfoundry/bosh-cpi-certification`.
 
 ```text
 pve/
@@ -152,7 +152,7 @@ pve/
 └── pipeline.yml                   # Concourse pipeline definition
 ```
 
-Reference: copy the `aws/` layout as a starting template, then substitute:
+Reference: copy the `aws/` layout as a starting template and substitute:
 
 - `INFRASTRUCTURE: aws` → `INFRASTRUCTURE: pve` in pipeline params
 - `BAT_INFRASTRUCTURE: aws` → `BAT_INFRASTRUCTURE: pve`
@@ -166,4 +166,4 @@ Reference: copy the `aws/` layout as a starting template, then substitute:
 3. A Concourse instance with the credentials and resource workers to run the pipeline
 4. PR template additions to BATs ([cloudfoundry/bosh-acceptance-tests](https://github.com/cloudfoundry/bosh-acceptance-tests/tree/master/templates)) so the BAT manifest template lives upstream
 
-This is a release-time concern, not a development-time one. The local lifecycle harness covers the same CPI-method surface area in seconds and is sufficient for everything short of cutting a tagged release.
+This is a release-time concern, not a development-time one. The local lifecycle harness covers the same CPI-method surface area and is sufficient for everything short of cutting a tagged release.

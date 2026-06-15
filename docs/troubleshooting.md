@@ -6,7 +6,7 @@ This is a symptom-first triage runbook. Start from the failure you see, follow t
 
 The CPI surfaces two error types in BOSH task output:
 
-- **`Bosh::Clouds::CloudError`** (`ok_to_retry: false`) — terminal failure. The director will not retry. Operator action required.
+- **`Bosh::Clouds::CloudError`** (`ok_to_retry: false`) — terminal failure; the Director will not retry. Operator action required.
 
 - **`Bosh::Clouds::RetriableCloudError`** (`ok_to_retry: true`) — transient fault. The director auto-retries the CPI call. If it exhausts retries, the error escalates to the task log as a permanent failure.
 
@@ -25,7 +25,7 @@ For instructions on accessing the CPI log file on the Director VM, see the [Oper
 
 **Symptom**
 
-A failed call wrapped by the CPI, where the text after the `PVE API error:` prefix is the message PVE returned and will vary by PVE version:
+A failed call wrapped by the CPI. The text after the `PVE API error:` prefix is the message PVE returned and varies by PVE version:
 
 ```text
 PVE API error: <PVE 401 authentication message>
@@ -57,7 +57,7 @@ Set `privsep=0` on the token in the PVE web UI or via `pveum token modify`. Ensu
 
 **Symptom**
 
-A failed call wrapped by the CPI, where the text after the `PVE API error:` prefix is the permission message PVE returned for the denied path:
+A failed call wrapped by the CPI. The text after the `PVE API error:` prefix is the permission message PVE returned for the denied path:
 
 ```text
 PVE API error: <PVE 403 permission message>
@@ -104,12 +104,12 @@ Add the missing values to your deployment manifest under `properties.pve.*` and 
 **Symptom**
 
 ```text
-config validation failed: agent_mode must be one of cloudinit|registry|noagent, got "X"
+config validation failed: agent_mode must be one of cloudinit|registry|noagent|auto, got "X"
 ```
 
 **Fix**
 
-Set `pve.agent_mode` to `cloudinit`, `registry`, or `noagent`. The default is `cloudinit`.
+Set `pve.agent_mode` to `cloudinit`, `registry`, `noagent`, or `auto`. The default is `cloudinit`. The `auto` value selects the agent mode at runtime based on the stemcell API version.
 
 ### VMID range too low
 
@@ -604,7 +604,7 @@ If an isolated network is not an option, reserve every colliding address in the 
 
 ## Storage lock contention and transient transport faults
 
-These two failure classes are handled by CPI retry logic and are usually absorbed without operator action.
+CPI retry logic handles these two failure classes and usually absorbs them without operator action.
 
 ### Storage lock timeout
 
@@ -666,7 +666,7 @@ or a PVE task that does not complete within the CPI's deadline.
 
 **Behavior**
 
-The standard CPI task deadline is 300 seconds. Stemcell import and VM disk import use a 600-second deadline. These are not operator-configurable.
+The inner per-call PVE task poll uses fixed deadlines: 300 seconds for standard operations and 600 seconds for stemcell and VM disk import. These inner deadlines are not operator-configurable. The outer per-method deadline envelope is configurable via `pve.operation_timeout.*`. When `pve.operation_timeout.enabled` is `true`, each CPI method runs under a context deadline sized by its class (`create_sec`, `delete_sec`, `query_sec`, or `default_sec`). See [Operation Timeouts](configuration.md#operation-timeouts) for the full property reference.
 
 **Diagnosis**
 

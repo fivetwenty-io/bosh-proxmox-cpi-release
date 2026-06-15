@@ -1,6 +1,6 @@
 # CF Lab Runbook
 
-Operating notes for the cf-deployment lab that sits on top of this CPI.
+Operating notes for the cf-deployment lab running on this CPI.
 
 ## Topology
 
@@ -17,15 +17,15 @@ through the same chain.
 ## NATS-storm remediation bundle
 
 cf-deployment on this director suffered from a recreate-loop pattern: a
-single flapping job on the api VM (policy-server-asg-syncer or routing-api)
+single flapping job on the api VM (`policy-server-asg-syncer` or `routing-api`)
 would convince the health-monitor scan-and-fix plugin that the instance was
 dead, HM would request a recreate, the recreate would drain nginx on
 `api:9024` for up to 30 seconds, gorouter would prune the api route on the
 first dial failure and serve `no_endpoints` (503/502) to cf-cli, and
-route_registrar would re-register ~10 seconds later — only to repeat the
+`route_registrar` would re-register ~10 seconds later — only to repeat the
 cycle a few minutes later when the next flap came.
 
-The remediation has two halves: stop the false-positive recreates, then
+The remediation has two halves: stop the false-positive recreates, and then
 absorb the residual once-per-deploy drain at the gorouter.
 
 ### Stop the churn (director side)
@@ -76,7 +76,7 @@ integration harness asserts on this.
 ## Deploy hang: mbus auth-reload RPC loss (root cause)
 
 Separate from the recreate-loop above, deploys would intermittently fail
-two ways from one cause — proven 2026-05-29 by packet capture plus the
+two ways from one cause — proven 2026-05-29 by packet capture and the
 director's own NATS log:
 
 - transient `Timed out sending 'get_state' to instance: <name>` errors, and
@@ -86,11 +86,11 @@ director's own NATS log:
 Mechanism: `bosh-nats-sync` regenerates `/var/vcap/data/nats/auth.json`
 every `poll_user_sync` seconds and SIGHUPs nats-server when the managed-VM
 set changes (log: `Reloaded: authorization users`). `nats.cfg` uses
-`verify_and_map: true`, so each agent is a cert-mapped NATS user from that
-file; on reload nats-server RSTs the agents whose entry changed. The agent
+`verify_and_map: true`, so each agent is a cert-mapped NATS user in that
+file; on reload, nats-server RSTs the agents whose entry changed. The agent
 reconnects ~2 s later (new source port), but core NATS does not buffer for
 an absent subscriber, so any in-flight RPC is lost. A one-shot `get_state`
-lost in the gap times out at 45 s (retryable). A long-running pre-stop /
+lost in the gap times out at 45 s (retryable). A long-running pre-stop or
 drain `get_task` *poll* lost in the gap never recovers — the director waits
 forever. During a deploy the VM set churns nearly every poll, so reloads
 fire ~once a minute; on an idle director nothing changes and connections
@@ -100,13 +100,13 @@ Remediation:
 
 - `poll_user_sync: 120` (in `nats-tuning.yml`) cuts reload frequency ~2×.
 - `scripts/cf` wraps `bosh deploy` in a stall-watchdog: if the deploy emits
-  no progress for `SCRIPTS_CF_DEPLOY_STALL_S` (default 900 s) it
+  no progress for `SCRIPTS_CF_DEPLOY_STALL_S` (default 900 s), it
   `bosh cancel-task`s the wedged task so the retry loop converges instead of
   hanging forever. This is the load-bearing fix — frequency tuning only
-  lowers probability, it cannot eliminate the reconnect gap (the
-  reload-drops-connections behaviour is upstream; `write_deadline` is not
+  lowers probability; it cannot eliminate the reconnect gap (the
+  reload-drops-connections behavior is upstream; `write_deadline` is not
   exposed and is not the lever). `--skip-drain` does not help: the hang is
-  at pre-stop, also a long-running run_script.
+  at pre-stop, also a long-running `run_script`.
 
 To inspect: the wedged VM has no QGA, but the director VM does — reach it
 via `ssh root@<pve_host> qm guest exec <director_vmid> -- grep 'Reloaded'
@@ -118,7 +118,7 @@ reason from the director's plaintext nats.log, not the wire.
 
 - `empty_pool_timeout: 5s` adds up to 5 s tail latency during a *real* CC
   outage. Callers with short timeouts (3 s `curl`, aggressive health
-  probes) will see slow failures instead of fast `no_endpoints`. There is
+  probes) see slow failures instead of fast `no_endpoints`. There is
   no stock knob to distinguish "transient drain" from "real outage".
 
 - Disabling the HM resurrector lab-wide means a genuine hardware fault
@@ -128,16 +128,15 @@ reason from the director's plaintext nats.log, not the wire.
 - The 120 s `bosh-nats-sync` `poll_user_sync` cadence means a brand-new
   agent waits up to 120 s for its CN to land in `auth.json` before its
   first NATS connection. That stays inside BOSH's create-vm agent-wait
-  timeout, so onboarding still completes; do not raise it so far that the
+  timeout, so onboarding still completes. Do not raise it so far that the
   "creating missing vms" phase times out.
 
 ## Rollback
 
-Each ops file is independently removable. To revert a single change drop
-its `-o` flag from `scripts/bosh` or `scripts/cf` and redeploy. The
-director-side knobs (HM, NATS) take effect on the next `bosh create-env`;
-the cf-side knobs take effect on the next `cf` deploy of the affected
-instance group.
+Each ops file is independently removable. To revert a single change, drop
+its `-o` flag from `scripts/bosh` or `scripts/cf` and redeploy. Director-side
+knobs (HM, NATS) take effect on the next `bosh create-env`; cf-side knobs
+take effect on the next `cf` deploy of the affected instance group.
 
 ## Operator commands
 
@@ -162,8 +161,8 @@ instance group.
 
 ## Provenance
 
-Recreate-loop remediation bundle landed 2026-05-27. The mbus auth-reload
+The recreate-loop remediation bundle landed 2026-05-27. The mbus auth-reload
 RPC-loss root cause was proven and remediated 2026-05-29 (`poll_user_sync`
 120 s + the `scripts/cf` stall-watchdog). Each ops file's header documents
-the specific behaviour it changes; together they form the lab's operating
+the specific behavior it changes; together they form the lab's operating
 profile for cf-deployment on this director.

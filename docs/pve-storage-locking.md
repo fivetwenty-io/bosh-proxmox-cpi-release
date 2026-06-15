@@ -1,6 +1,6 @@
-# PVE Per-Storage Lockfile Behaviour
+# PVE Per-Storage Lockfile Behavior
 
-This document covers how Proxmox VE serialises storage operations behind a per-storage lockfile, what failure mode it produces under bursty concurrent CPI calls, and the two locking mechanisms the CPI uses to absorb it.
+This document covers how Proxmox VE serialises storage operations behind a per-storage lockfile, what failure mode that produces under bursty concurrent CPI calls, and the two locking mechanisms the CPI uses to absorb it.
 
 ## What PVE does
 
@@ -10,7 +10,7 @@ PVE protects every mutation against a single storage pool with an exclusive lock
 /var/lock/pve-manager/pve-storage-<storage-name>
 ```
 
-The lock is acquired by `pvesm` (the storage manager) and by the QEMU helpers (`qm`, `qemu-img`) whenever they need to allocate, free, resize, snapshot, or import a volume on that storage. Any other caller racing for the same lock waits up to the storage timeout (default ~30 s) and then fails the task.
+The lock is acquired by `pvesm` (the storage manager) and the QEMU helpers (`qm`, `qemu-img`) whenever they need to allocate, free, resize, snapshot, or import a volume on that storage. Any other caller racing for the same lock waits up to the storage timeout (default ~30 s) and then fails the task.
 
 There is one lockfile per storage. Operations against different storages do not contend with each other.
 
@@ -60,7 +60,7 @@ task failed: command '/sbin/lvs --separator ... /dev/data/vm-N-disk-0' failed: g
 
 ## When the CPI hits it
 
-A BOSH director driving a Cloud Foundry deploy can launch a dozen or more concurrent `create_vm` calls within a second of each other. Each one runs as a separate OS process (one `bosh-pve-cpi` invocation per VM), so in-process serialisation does nothing. The director's worker pool is the only knob, and it defaults wide.
+A BOSH director driving a Cloud Foundry deploy can launch a dozen or more concurrent `create_vm` calls within a second of each other. Each runs as a separate OS process (one `bosh-pve-cpi` invocation per VM), so in-process serialisation does nothing. The director's worker pool is the only knob, and it defaults wide.
 
 Observed contention points, in deploy-time order:
 
@@ -86,7 +86,7 @@ This CPI implements storage-lock retry in `internal/pve/retry.go`:
 
 - `pve.RetryOnTransientOrLock(ctx, logger, label, maxAttempts, op)` — invokes `op` up to `maxAttempts` times (default 10), retrying on `IsStorageLockTimeout`, `IsTransientTransport`, or `IsPVEPushback`. Other errors propagate immediately. Context cancellation short-circuits the sleep.
 
-At default settings, a worst-case all-retries run waits roughly `2 + 3 + 4.5 + 6.75 + 10.1 + 15.2 + 22.8 + 30 + 30 = 124 s` before giving up — well inside BOSH's task timeout but long enough for any reasonable lock holder to finish.
+At default settings, a worst-case run exhausting all retries waits roughly `2 + 3 + 4.5 + 6.75 + 10.1 + 15.2 + 22.8 + 30 + 30 = 124 s` before giving up — well inside BOSH's task timeout but long enough for any reasonable lock holder to finish.
 
 ### Where the helper is wired
 
@@ -131,13 +131,13 @@ The fix is in the SDK and CPI: `Storage().DeleteVolumeAsync` and `Storage().Dele
 
 A second locking mechanism operates at a higher level than the OS lockfile. `AcquireClusterLock` acquires a cross-process advisory mutex via PVE resource pool membership.
 
-**Mechanism:** PVE's `POST /pools` is serialised by pmxcfs and rejects a duplicate poolid with a conflict error. That create-or-fail behavior is a test-and-set: the process that creates the sentinel pool holds the lock; concurrent processes wait, or steal if the recorded expiry has passed. The sentinel poolid is named `bosh-lock-{key}` (e.g. `bosh-lock-aa-web`) to avoid colliding with operator pools.
+**Mechanism:** PVE's `POST /pools` is serialised by pmxcfs and rejects a duplicate poolid with a conflict error. That create-or-fail behavior is a test-and-set: the process that creates the sentinel pool holds the lock; concurrent processes wait, or steal if the recorded expiry has passed. The sentinel poolid is named `bosh-lock-{key}` (e.g., `bosh-lock-aa-web`) to avoid colliding with operator pools.
 
-**Purpose:** Anti-affinity membership updates are serialised by `AcquireClusterLock` when `pve.cluster_lock_mode` is enabled. Without this lock, two concurrent `create_vm` calls can both read the anti-affinity group membership, both choose the same node as the least-loaded candidate, and both write membership back — a classic TOCTOU race. The cluster lock serialises the read-modify-write, ensuring each `create_vm` sees a consistent membership state.
+**Purpose:** Anti-affinity membership updates are serialised by `AcquireClusterLock` when `pve.cluster_lock_mode` is enabled. Without this lock, two concurrent `create_vm` calls can both read the anti-affinity group membership, both choose the same node as the least-loaded candidate, and both write membership back — a classic TOCTOU race. The cluster lock serialises the read-modify-write so each `create_vm` sees a consistent membership state.
 
 **Lock ownership:** The sentinel pool comment records the owner and expiry as `"owner=<token> exp=<unix-seconds>"`. If a CPI process crashes while holding the lock, any waiter whose recorded expiry has passed steals it via delete-and-recreate. Post-steal owner verification confirms the stealing process actually won before granting the handle.
 
-**Release:** `ClusterLockHandle.Release` deletes the sentinel pool. It is idempotent: a second call is a no-op, and a not-found pool is treated as success.
+**Release:** `ClusterLockHandle.Release` deletes the sentinel pool. The call is idempotent: a second call is a no-op, and a not-found pool is treated as success.
 
 **Config:** `pve.cluster_lock_mode` enables the mechanism; `pve.cluster_lock_timeout_sec` bounds total wait time. On timeout, the error is `TypeRetriableCloud` so the BOSH director re-drives the operation.
 
@@ -166,11 +166,11 @@ flowchart TD
 
 ## Operator-side knobs
 
-The CPI's retry absorbs short bursts. If your deploys consistently exhaust the retry budget, the contention is structural and you have three options:
+The CPI's retry absorbs short bursts. If deploys consistently exhaust the retry budget, the contention is structural. Three options:
 
-1. **Throttle the director.** `director.workers` and per-instance-group `max_in_flight` cap how many `create_vm` calls run concurrently. Cutting this to half the number of vCPUs on the PVE node usually flattens the burst enough.
+1. **Throttle the director.** `director.workers` and per-instance-group `max_in_flight` cap concurrent `create_vm` calls. Cutting this to half the PVE node's vCPU count usually flattens the burst enough.
 
-2. **Split storages.** Putting the stemcell content on one PVE storage and the VM root disks on another removes the contention between import and resize because they grab different lockfiles. The CPI supports this via `pve_stemcell_storage` vs `pve_vm_storage` in `vars.yml`.
+2. **Split storages.** Putting stemcells on one PVE storage and VM root disks on another removes contention between import and resize, because they grab different lockfiles. The CPI supports this via `pve_stemcell_storage` vs `pve_vm_storage` in `vars.yml`.
 
 3. **Tune retry attempts.** `pve.retry.storage_lock.max_attempts` (default 10) bounds the storage-lock retry count for `create_disk`. Raising it lets you ride out longer lock holds at the cost of slower failure when something is genuinely stuck. `pve.retry.storage_import.max_attempts` is honored as a legacy fallback when `storage_lock` is unset, preserving existing deployments.
 
@@ -182,13 +182,13 @@ In the director's CPI log (`/var/vcap/sys/log/cpi/cpi.log`):
 pve: retrying after retryable fault op=create_disk reason=storage_lock attempt=1 max_attempts=10 backoff_ms=1837 error="..."
 ```
 
-Nonzero retry log lines on a deploy that ultimately succeeds mean the mechanism is working as intended. Watch the `attempt` value — if it routinely climbs above 5, the lock holder is taking long enough that you should look at options 1 or 2 above.
+Nonzero retry log lines on a deploy that ultimately succeeds mean the mechanism is working as intended. Watch the `attempt` value — if it routinely climbs above 5, the lock holder is taking long enough that options 1 or 2 above warrant attention.
 
 `attempt=10` followed by the operation failing means retries were exhausted. Look at the PVE node's `journalctl -u pvedaemon -u pveproxy` from the same window to see what was holding the lock.
 
 ## Related failure mode
 
-Per-storage lock contention is the first transient PVE failure the CPI handles; pvedaemon worker recycling and HTTP 429 pushback are the second. The two often coexist on the same call sites and are absorbed by the same helper (`RetryOnTransientOrLock`). See [PVE Transient Transport Faults](pve-transient-transport.md) for the worker-recycle and pushback sides.
+Per-storage lock contention is the first transient PVE failure the CPI handles; pvedaemon worker recycling and HTTP 429 pushback are the second. The two often coexist on the same call sites, absorbed by the same helper (`RetryOnTransientOrLock`). See [PVE Transient Transport Faults](pve-transient-transport.md) for the worker-recycle and pushback sides.
 
 ## References
 

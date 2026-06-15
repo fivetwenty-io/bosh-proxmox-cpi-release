@@ -1,10 +1,10 @@
 # BOSH PVE CPI Documentation
 
-Welcome to the documentation for the BOSH PVE CPI, a Cloud Provider Interface (CPI) for managing virtual machines on PVE infrastructure within the BOSH ecosystem.
+Documentation for the BOSH PVE CPI — a Cloud Provider Interface (CPI) for managing virtual machines on PVE infrastructure within the BOSH ecosystem.
 
 ## Overview
 
-This CPI enables BOSH to provision and manage resources on PVE 9.x, implementing the BOSH CPI v2 specification with full support for all required methods. The binary is written in Go and consumes the `github.com/fivetwenty-io/pve-apiclient-go/v3` SDK.
+This CPI enables BOSH to provision and manage resources on PVE 9.x. It implements the BOSH CPI v2 specification with full support for all required methods. The binary is written in Go and consumes the `github.com/fivetwenty-io/pve-apiclient-go/v3` SDK.
 
 ## Table of Contents
 

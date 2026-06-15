@@ -2,7 +2,7 @@
 
 Go implementation of the BOSH Cloud Provider Interface (CPI) v2 for Proxmox VE 9.x.
 
-The CPI provisions VMs, persistent disks, networks, snapshots, and stemcells on a PVE cluster on behalf of a BOSH Director. It speaks the BOSH JSON-RPC envelope over stdin/stdout, supports three agent bootstrap modes (`cloudinit`, `registry`, `noagent`), and ships as a single static Go binary packaged into a BOSH release.
+The CPI provisions VMs, persistent disks, networks, snapshots, and stemcells on a PVE cluster on behalf of a BOSH Director. It speaks the BOSH JSON-RPC envelope over stdin/stdout, supports three agent bootstrap modes (`cloudinit`, `registry`, and `noagent`), and ships as a single static Go binary packaged into a BOSH release.
 
 - BOSH CPI v2 compliant (`api_version: 2`)
 - PVE SDN vnet lifecycle plus Linux bridge fallback for managed networks
@@ -12,7 +12,7 @@ The CPI provisions VMs, persistent disks, networks, snapshots, and stemcells on 
 
 ## Quickstart
 
-The path below takes a fresh checkout through to a deployed Director on a PVE cluster.
+The steps below take a fresh checkout through to a deployed Director on a PVE cluster.
 
 ### 1. Clone the repository
 
@@ -33,7 +33,7 @@ For a versioned final release use `make release VERSION=1.0.0`. Both targets wri
 
 ### 3. Configure your deployment variables
 
-Copy the example and fill in PVE host, credentials, storage pool names, and network bridge:
+Copy the example and fill in the PVE host, credentials, storage pool names, and network bridge:
 
 ```bash
 cp manifests/bosh/vars.yml.example manifests/bosh/vars.yml
@@ -44,7 +44,7 @@ $EDITOR manifests/bosh/vars.yml
 
 ### 4. Deploy the Director
 
-The deployment composes the upstream [bosh-deployment](https://github.com/cloudfoundry/bosh-deployment) `bosh.yml` base manifest with this repository's `manifests/bosh/cpi.yml` ops file:
+The deployment composes the upstream [bosh-deployment](https://github.com/cloudfoundry/bosh-deployment) `bosh.yml` base manifest with this repo's `manifests/bosh/cpi.yml` ops file:
 
 ```bash
 export BOSH_DEPLOYMENT_DIR=~/w/cloudfoundry/bosh-deployment   # path to a bosh-deployment checkout
@@ -70,11 +70,11 @@ bosh -e <alias> env
 bosh -e <alias> task --recent=1 --debug
 ```
 
-For end-to-end CPI method exercise against a live cluster, see [BOSH CPI Lifecycle Tests](#bosh-cpi-lifecycle-tests) below.
+For end-to-end CPI method exercise against a live cluster, see [BOSH CPI Lifecycle Tests](#bosh-cpi-lifecycle-tests).
 
 ## Properties
 
-The CPI exposes properties under the `pve.*`, `agent.*`, and `registry.*` namespaces. The most operator-relevant subset is summarized below; the [full property reference](docs/configuration.md) documents every field with defaults, types, and validation rules.
+The CPI exposes properties under the `pve.*`, `agent.*`, and `registry.*` namespaces. The most operator-relevant subset is below; the [full property reference](docs/configuration.md) documents every field with defaults, types, and validation rules.
 
 | Property | Description | Default |
 |---|---|---|
@@ -91,11 +91,11 @@ The CPI exposes properties under the `pve.*`, `agent.*`, and `registry.*` namesp
 | `pve.network_mode` | Managed-network mode (`sdn`, `bridge`, `auto`) | `auto` |
 | `pve.agent_mode` | Agent bootstrap mode (`cloudinit`, `registry`, `noagent`) | `cloudinit` |
 
-The full table covers the remaining properties including SDN zone management, snapshot guards, hotplug flags, reboot strategy, VMID allocation range, detached-disk lifecycle strategy, registry TLS pinning, and the `agent.*` mbus fallback. See the [configuration reference](docs/configuration.md).
+The full table covers the remaining properties, including SDN zone management, snapshot guards, hotplug flags, reboot strategy, VMID allocation range, detached-disk lifecycle strategy, registry TLS pinning, and the `agent.*` mbus fallback. See the [configuration reference](docs/configuration.md).
 
 ## Operations
 
-Day-2 operations, log locations, error triage, ConfigDrive ISO storage hardening, persistent-disk guidance, and orphan-resource cleanup live in the [operations runbook](docs/operations.md). Symptom-first failure triage lives in the [troubleshooting guide](docs/troubleshooting.md).
+Day-2 operations, log locations, error triage, ConfigDrive ISO storage hardening, persistent-disk guidance, and orphan-resource cleanup are in the [operations runbook](docs/operations.md). Symptom-first failure triage is in the [troubleshooting guide](docs/troubleshooting.md).
 
 Specific topics:
 
@@ -119,10 +119,10 @@ See [Network configuration](docs/networks.md) for the full `cloud_properties` sc
 
 ### Requirements
 
-- Go 1.26 or higher (BOSH packaging compiles against the `golang-1.26` blob)
-- `golangci-lint` (`make lint` falls back to `go run` at a pinned version when not installed)
-- `staticcheck` (optional, `make staticcheck` skips with a notice when missing)
-- `govulncheck` and `gosec` (optional, `make security`)
+- Go 1.26 or higher (BOSH packaging compiles against the `golang-1.26` blob).
+- `golangci-lint` (`make lint` falls back to `go run` at a pinned version when not installed).
+- `staticcheck` (optional; `make staticcheck` skips with a notice when missing).
+- `govulncheck` and `gosec` (optional; `make security`).
 
 ### Make targets
 
@@ -144,13 +144,13 @@ See [Network configuration](docs/networks.md) for the full `cloud_properties` sc
 | `make release-clean` | Remove `bin/`, coverage artifacts, and release tarballs |
 | `make download-blobs` | Download and register the Go toolchain blob (`golang-1.26`) |
 
-`make release-build` and `make release` are intentionally distinct. `release-build` is the Go-binary-only path for local iteration. `make release` (and `make dev-release`) call `scripts/create-release` to assemble the BOSH release tarball under `dev_releases/` or `releases/`. They never produce a loose tarball at the repo root.
+`make release-build` and `make release` are intentionally distinct. `release-build` is the Go-binary-only path for local iteration. `make release` (and `make dev-release`) call `scripts/create-release` to assemble the BOSH release tarball under `dev_releases/` or `releases/` and never produce a loose tarball at the repo root.
 
 ### CI gating
 
-CI runs `make check` on every push. The composite target gates `vet`, `staticcheck`, `lint`, `coverage-check`, and `test`, in that order, fast-fail. `COVERAGE_THRESHOLD` is currently `75` and rises to `85` once the test additions land.
+CI runs `make check` on every push. The composite target gates `vet`, `staticcheck`, `lint`, `coverage-check`, and `test` in that order, fast-fail. `COVERAGE_THRESHOLD` is `80`.
 
-Go sources live under `src/pve_cpi/`. Direct `go test` and `go build` invocations must run from there; the `make` targets re-root for you.
+Go sources live under `src/pve_cpi/`. Direct `go test` and `go build` invocations must run from there; the `make` targets re-root automatically.
 
 See [Development guide](docs/development.md) for the source layout, testing strategy, mock conventions, and stem-cell test fixtures.
 

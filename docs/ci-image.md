@@ -6,14 +6,14 @@ The integration task defined in `ci/tasks/integration.yml` requires a Docker ima
 
 ## Why a custom image is required
 
-The `bosh/bosh-cli` image ships only the BOSH CLI and its runtime dependencies. The integration task runs `./scripts/test integration all`, which calls `scripts/bosh`, `scripts/cf`, `scripts/lifecycle`, and several Python helper scripts. Those scripts require:
+The `bosh/bosh-cli` image ships only the BOSH CLI and its runtime dependencies. The integration task runs `./scripts/test integration all`, which calls `scripts/bosh`, `scripts/cf`, `scripts/lifecycle`, and several Python helper scripts, which require:
 
 - **cf** — not present in `bosh/bosh-cli`
 - **credhub** — not present in `bosh/bosh-cli`
 - **uv** — not present in any standard BOSH image; required to execute PEP 723 inline-dependency scripts (`#!/usr/bin/env -S uv run --script`)
 - **go** and **make** — to compile `bin/cpi` before the lifecycle tier runs
 
-A custom image that bundles all of these tools is required before the integration job will succeed.
+A custom image that bundles all of these tools is required for the integration job to succeed.
 
 ---
 
@@ -25,7 +25,7 @@ A custom image that bundles all of these tools is required before the integratio
 | `cf` | 8.0.0 | https://github.com/cloudfoundry/cli/releases |
 | `credhub` | 2.9.0 | https://github.com/cloudfoundry-incubator/credhub-cli/releases |
 | `uv` | 0.4.0 | https://github.com/astral-sh/uv/releases (or `curl -LsSf https://astral.sh/uv/install.sh`) |
-| `go` | 1.25.3 | https://go.dev/dl/ (must match `src/pve_cpi/go.mod`) |
+| `go` | 1.26.3 | https://go.dev/dl/ (must match `src/pve_cpi/go.mod`) |
 | `make` | 4.3 | System package (`apt-get install make`) |
 | `jq` | 1.6 | System package (`apt-get install jq`) |
 | `curl` | 7.88 | System package (`apt-get install curl`) |
@@ -40,12 +40,12 @@ The Python scripts use only the standard library. `uv` manages the Python runtim
 
 ## Example Dockerfile
 
-This multi-stage Dockerfile pins every binary version so CI runs are reproducible. Adjust version numbers when upgrading.
+This multi-stage Dockerfile pins every binary version so CI runs are reproducible. Adjust version numbers on upgrade.
 
 ```dockerfile
 # syntax=docker/dockerfile:1
 
-ARG GO_VERSION=1.25.3
+ARG GO_VERSION=1.26.3
 ARG BOSH_CLI_VERSION=7.9.6
 ARG CF_CLI_VERSION=8.9.0
 ARG CREDHUB_CLI_VERSION=2.9.45
@@ -124,7 +124,7 @@ Build and push the image:
 
 ```
 docker build \
-  --build-arg GO_VERSION=1.25.3 \
+  --build-arg GO_VERSION=1.26.3 \
   --build-arg BOSH_CLI_VERSION=7.9.6 \
   --build-arg CF_CLI_VERSION=8.9.0 \
   --build-arg CREDHUB_CLI_VERSION=2.9.45 \
@@ -137,11 +137,12 @@ docker push registry.example.com/bosh-pve-cpi-ci:latest
 
 Store the Dockerfile at `ci/Dockerfile` in the repository so version bumps are tracked in git.
 
+
 ---
 
 ## Pipeline integration
 
-Replace the `image_resource` stanza in `ci/tasks/integration.yml` once the custom image is built and pushed:
+Replace the `image_resource` stanza in `ci/tasks/integration.yml` after the custom image is built and pushed:
 
 ```yaml
 image_resource:
@@ -158,11 +159,13 @@ The `registry-image` resource type is preferred over `docker-image` for new pipe
 
 If the registry is private, add the credentials to your Concourse secrets store and reference them with `((double-paren))` interpolation as shown above.
 
+
 ---
 
 ## Verification
 
-After building the image, run the following one-liner to confirm every required tool is present and meets the minimum version:
+After building the image, run the following one-liner to confirm every required tool is present and meets the minimum version.
+
 
 ```
 docker run --rm registry.example.com/bosh-pve-cpi-ci:latest \
@@ -176,8 +179,8 @@ BOSH CLI version 7.9.6-...
 cf version 8.9.0+...
 credhub 2.9.45
 uv 0.4.30 (...)
-go version go1.25.3 linux/amd64
+go version go1.26.3 linux/amd64
 GNU Make 4.3
 ```
 
-If any command fails, check that the corresponding `COPY --from=downloader` line in the Dockerfile completed successfully. Rebuild with `--no-cache` if a download was silently skipped due to a layer cache hit on a changed URL.
+If any command fails, check that the corresponding `COPY --from=downloader` line in the Dockerfile completed successfully. Rebuild with `--no-cache` if a download was silently skipped because of a layer cache hit on a changed URL.
