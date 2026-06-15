@@ -9,7 +9,9 @@ import (
 )
 
 // infoResult is the fixed payload returned by the info CPI method.
-// api_version=2 is required for BOSH Director CPI v2 routing.
+// api_version=3 enables CPI v3 routing: the director passes an optional env
+// argument to create_stemcell (env.tags are merged into the template tags and
+// provenance notes). All other methods are version-agnostic.
 // stemcell_formats lists every image format accepted by create_stemcell.
 type infoResult struct {
 	APIVersion      int      `json:"api_version"`
@@ -18,7 +20,7 @@ type infoResult struct {
 
 // HandleInfo returns a Handler that responds to the BOSH CPI "info" method.
 // The response is fully static: no PVE SDK calls are made. The Director uses
-// this to confirm api_version=2 support and to discover acceptable stemcell
+// this to confirm api_version=3 support and to discover acceptable stemcell
 // image formats before uploading a stemcell.
 //
 // Arguments: none (the BOSH spec defines an empty argument list for info).
@@ -26,7 +28,7 @@ type infoResult struct {
 // Errors: none (cannot fail).
 func HandleInfo(_ Deps) cpi.Handler {
 	result := infoResult{
-		APIVersion: 2,
+		APIVersion: 3,
 		StemcellFormats: []string{
 			"openstack-qcow2",
 			"openstack-raw",

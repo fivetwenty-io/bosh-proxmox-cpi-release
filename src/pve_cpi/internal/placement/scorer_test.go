@@ -169,6 +169,101 @@ func TestFilter_OnlineAndMaintenanceBothRejected(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// Filter — storage-capacity hard filter tests (§7.58)
+// ---------------------------------------------------------------------------
+
+// TestFilter_StorageFilter_RejectsWhenInsufficient verifies that a node with
+// FreeStorageBytes < RequiredStorageBytes is rejected with "insufficient free
+// storage" when TotalStorageBytes > 0 (facts available).
+func TestFilter_StorageFilter_RejectsWhenInsufficient(t *testing.T) {
+	t.Parallel()
+	facts := []placement.NodeFacts{
+		{Node: "low", Online: true, TotalStorageBytes: 100 * gib, FreeStorageBytes: 1 * gib},
+		{Node: "high", Online: true, TotalStorageBytes: 100 * gib, FreeStorageBytes: 50 * gib},
+	}
+	req := placement.Request{RequiredStorageBytes: 10 * gib}
+	pass, rej := placement.Filter(facts, req)
+	if len(pass) != 1 || pass[0].Node != "high" {
+		t.Errorf("expected only high; got %v", nodeNames(pass))
+	}
+	if rej["low"] != "insufficient free storage" {
+		t.Errorf("low rejection = %q; want %q", rej["low"], "insufficient free storage")
+	}
+}
+
+// TestFilter_StorageFilter_PassesWhenSufficient verifies that a node with
+// FreeStorageBytes >= RequiredStorageBytes passes the filter.
+func TestFilter_StorageFilter_PassesWhenSufficient(t *testing.T) {
+	t.Parallel()
+	facts := []placement.NodeFacts{
+		{Node: "ok", Online: true, TotalStorageBytes: 100 * gib, FreeStorageBytes: 50 * gib},
+	}
+	req := placement.Request{RequiredStorageBytes: 10 * gib}
+	pass, rej := placement.Filter(facts, req)
+	if len(pass) != 1 || pass[0].Node != "ok" {
+		t.Errorf("expected ok to pass; got %v", nodeNames(pass))
+	}
+	if len(rej) != 0 {
+		t.Errorf("expected no rejections; got %v", rej)
+	}
+}
+
+// TestFilter_StorageFilter_ExactlyEqual passes when free == required.
+func TestFilter_StorageFilter_ExactlyEqual(t *testing.T) {
+	t.Parallel()
+	facts := []placement.NodeFacts{
+		{Node: "exact", Online: true, TotalStorageBytes: 100 * gib, FreeStorageBytes: 10 * gib},
+	}
+	req := placement.Request{RequiredStorageBytes: 10 * gib}
+	pass, rej := placement.Filter(facts, req)
+	if len(pass) != 1 || pass[0].Node != "exact" {
+		t.Errorf("expected exact to pass (free == required); got %v", nodeNames(pass))
+	}
+	if len(rej) != 0 {
+		t.Errorf("expected no rejections; got %v", rej)
+	}
+}
+
+// TestFilter_StorageFilter_FailOpenWhenNoFacts verifies the fail-open behavior:
+// when TotalStorageBytes == 0 (storage facts unavailable), the node is NOT
+// rejected regardless of RequiredStorageBytes. This matches the soft-axis skip
+// semantics in Score (zero TotalStorageBytes disables the Storage axis).
+func TestFilter_StorageFilter_FailOpenWhenNoFacts(t *testing.T) {
+	t.Parallel()
+	facts := []placement.NodeFacts{
+		// TotalStorageBytes=0 means ListStorage failed or no matching pool.
+		{Node: "nofacts", Online: true, TotalStorageBytes: 0, FreeStorageBytes: 0},
+	}
+	req := placement.Request{RequiredStorageBytes: 100 * gib}
+	pass, rej := placement.Filter(facts, req)
+	if len(pass) != 1 || pass[0].Node != "nofacts" {
+		t.Errorf("expected nofacts to pass (fail-open on missing facts); got %v", nodeNames(pass))
+	}
+	if len(rej) != 0 {
+		t.Errorf("expected no rejections for fail-open path; got %v", rej)
+	}
+}
+
+// TestFilter_StorageFilter_ZeroRequired_NoFilter verifies that
+// RequiredStorageBytes == 0 disables the storage filter entirely —
+// byte-identical behavior to pre-feature releases.
+func TestFilter_StorageFilter_ZeroRequired_NoFilter(t *testing.T) {
+	t.Parallel()
+	facts := []placement.NodeFacts{
+		// Only 1 GiB free — would fail any positive required value.
+		{Node: "almost-full", Online: true, TotalStorageBytes: 100 * gib, FreeStorageBytes: 1 * gib},
+	}
+	req := placement.Request{RequiredStorageBytes: 0}
+	pass, rej := placement.Filter(facts, req)
+	if len(pass) != 1 || pass[0].Node != "almost-full" {
+		t.Errorf("expected almost-full to pass (RequiredStorageBytes==0 means no filter); got %v", nodeNames(pass))
+	}
+	if len(rej) != 0 {
+		t.Errorf("expected no rejections when RequiredStorageBytes==0; got %v", rej)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Score tests
 // ---------------------------------------------------------------------------
 

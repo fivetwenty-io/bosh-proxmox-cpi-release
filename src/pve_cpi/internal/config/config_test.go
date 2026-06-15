@@ -6074,3 +6074,109 @@ func TestParkedRange_ByteIdenticalWhenUnset(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// §7.58 storage headroom placement knob tests
+// ---------------------------------------------------------------------------
+
+// TestReserveStorageHeadroom_DefaultOff verifies the gate is off by default:
+// nil Placement, nil field, absent from JSON all return false.
+func TestReserveStorageHeadroom_DefaultOff(t *testing.T) {
+	t.Parallel()
+	cases := []*config.CPIConfig{
+		{},                                     // nil Placement
+		{Placement: &config.PlacementConfig{}}, // nil ReserveStorageHeadroom
+	}
+	for i, cfg := range cases {
+		if cfg.ReserveStorageHeadroomEnabled() {
+			t.Errorf("case %d: ReserveStorageHeadroomEnabled() = true; want false (default off)", i)
+		}
+	}
+}
+
+// TestReserveStorageHeadroom_ExplicitTrue verifies *true enables the gate.
+func TestReserveStorageHeadroom_ExplicitTrue(t *testing.T) {
+	t.Parallel()
+	enabled := true
+	cfg := &config.CPIConfig{
+		Placement: &config.PlacementConfig{ReserveStorageHeadroom: &enabled},
+	}
+	if !cfg.ReserveStorageHeadroomEnabled() {
+		t.Error("ReserveStorageHeadroomEnabled() = false; want true for explicit *true")
+	}
+}
+
+// TestReserveStorageHeadroom_JSONRoundTrip verifies the knob survives JSON
+// marshal/unmarshal (same round-trip test pattern as sibling placement knobs).
+func TestReserveStorageHeadroom_JSONRoundTrip(t *testing.T) {
+	t.Parallel()
+	cfg, err := mustLoad(t, `{
+		"host": "h", "user": "u", "password": "p",
+		"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
+		"placement": {"reserve_storage_headroom": true, "storage_headroom_mb": 2048}
+	}`)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if !cfg.ReserveStorageHeadroomEnabled() {
+		t.Error("after JSON round-trip: ReserveStorageHeadroomEnabled() = false; want true")
+	}
+	if got := cfg.StorageHeadroomMBValue(); got != 2048 {
+		t.Errorf("StorageHeadroomMBValue() = %d; want 2048", got)
+	}
+}
+
+// TestStorageHeadroomMB_DefaultIs1GiB verifies the 1 GiB floor when the field
+// is unset, matching vSphere DISK_HEADROOM.
+func TestStorageHeadroomMB_DefaultIs1GiB(t *testing.T) {
+	t.Parallel()
+	cases := []*config.CPIConfig{
+		{},                                     // nil Placement
+		{Placement: &config.PlacementConfig{}}, // nil StorageHeadroomMB
+	}
+	for i, cfg := range cases {
+		if got := cfg.StorageHeadroomMBValue(); got != 1024 {
+			t.Errorf("case %d: StorageHeadroomMBValue() = %d; want 1024 (1 GiB default)", i, got)
+		}
+	}
+}
+
+// TestStorageHeadroomMB_ExplicitValue verifies a non-default value round-trips.
+func TestStorageHeadroomMB_ExplicitValue(t *testing.T) {
+	t.Parallel()
+	v := 512
+	cfg := &config.CPIConfig{
+		Placement: &config.PlacementConfig{StorageHeadroomMB: &v},
+	}
+	if got := cfg.StorageHeadroomMBValue(); got != 512 {
+		t.Errorf("StorageHeadroomMBValue() = %d; want 512", got)
+	}
+}
+
+// TestStorageHeadroomMB_NegativeRejected verifies that negative values are
+// rejected at Validate time.
+func TestStorageHeadroomMB_NegativeRejected(t *testing.T) {
+	t.Parallel()
+	_, err := mustLoad(t, `{
+		"host": "h", "user": "u", "password": "p",
+		"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
+		"placement": {"storage_headroom_mb": -1}
+	}`)
+	assertCloudError(t, err, "placement.storage_headroom_mb must be >= 0")
+}
+
+// TestStorageHeadroom_ByteIdenticalWhenUnset verifies that the new knobs are
+// absent from the JSON-marshaled config when unset (omitempty contract).
+func TestStorageHeadroom_ByteIdenticalWhenUnset(t *testing.T) {
+	t.Parallel()
+	cfg := &config.CPIConfig{}
+	raw, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	for _, key := range []string{"reserve_storage_headroom", "storage_headroom_mb"} {
+		if strings.Contains(string(raw), key) {
+			t.Errorf("key %q should be absent from JSON when unset; got: %s", key, raw)
+		}
+	}
+}

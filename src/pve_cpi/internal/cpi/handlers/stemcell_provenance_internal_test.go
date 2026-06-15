@@ -142,7 +142,7 @@ func TestBuildStemcellProvenanceNotes_FullFields(t *testing.T) {
 	}
 	now := time.Date(2026, 6, 3, 12, 0, 0, 0, time.UTC)
 
-	notes, err := buildStemcellProvenanceNotes(cp, "ab12ef34", "https://example.com/stemcell.tgz", "director-xyz", now, "")
+	notes, err := buildStemcellProvenanceNotes(cp, "ab12ef34", "https://example.com/stemcell.tgz", "director-xyz", now, "", nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -194,7 +194,7 @@ func TestBuildStemcellProvenanceNotes_OmitemptyFields(t *testing.T) {
 	}
 	now := time.Date(2026, 6, 3, 0, 0, 0, 0, time.UTC)
 
-	notes, err := buildStemcellProvenanceNotes(cp, "", "", "", now, "")
+	notes, err := buildStemcellProvenanceNotes(cp, "", "", "", now, "", nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -226,7 +226,7 @@ func TestBuildStemcellProvenanceNotes_CreatedIsUTC(t *testing.T) {
 	loc, _ := time.LoadLocation("America/New_York")
 	now := time.Date(2026, 6, 3, 8, 0, 0, 0, loc) // 08:00 ET = 12:00 UTC
 
-	notes, err := buildStemcellProvenanceNotes(cp, "", "", "", now, "")
+	notes, err := buildStemcellProvenanceNotes(cp, "", "", "", now, "", nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -363,7 +363,7 @@ func TestBuildStemcellProvenanceNotes_StemcellRefsIncluded(t *testing.T) {
 	cp := stemcellCloudProps{Name: "bosh-ubuntu-noble", Version: "1.0"}
 	now := time.Date(2026, 6, 12, 0, 0, 0, 0, time.UTC)
 
-	notes, err := buildStemcellProvenanceNotes(cp, "ab12ef34", "", "", now, "template:6042")
+	notes, err := buildStemcellProvenanceNotes(cp, "ab12ef34", "", "", now, "template:6042", nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -390,7 +390,7 @@ func TestBuildStemcellProvenanceNotes_StemcellRefsOmittedWhenEmpty(t *testing.T)
 	cp := stemcellCloudProps{Name: "bosh-ubuntu-noble", Version: "1.0"}
 	now := time.Date(2026, 6, 12, 0, 0, 0, 0, time.UTC)
 
-	notes, err := buildStemcellProvenanceNotes(cp, "ab12ef34", "", "", now, "")
+	notes, err := buildStemcellProvenanceNotes(cp, "ab12ef34", "", "", now, "", nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -460,4 +460,68 @@ func TestParseStemcellProvenanceFromDescription(t *testing.T) {
 			t.Errorf("StemcellRefs = %q, want empty string", prov.StemcellRefs)
 		}
 	})
+}
+
+// TestBuildStemcellProvenanceNotes_DirectorTagsPresent verifies that when
+// directorTags is non-empty, director_tags appears in the JSON output and
+// its key/value pairs round-trip correctly.
+func TestBuildStemcellProvenanceNotes_DirectorTagsPresent(t *testing.T) {
+	t.Parallel()
+
+	cp := stemcellCloudProps{Name: "bosh-ubuntu-noble", Version: "1.0"}
+	now := time.Date(2026, 6, 15, 0, 0, 0, 0, time.UTC)
+	directorTags := map[string]string{"env": "prod", "team": "platform"}
+
+	notes, err := buildStemcellProvenanceNotes(cp, "ab12ef34", "", "", now, "", directorTags)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var m map[string]any
+	if err := json.Unmarshal([]byte(notes), &m); err != nil {
+		t.Fatalf("unmarshal failed: %v", err)
+	}
+
+	rawTags, ok := m["director_tags"]
+	if !ok {
+		t.Fatal("director_tags key absent from JSON when directorTags is non-empty")
+	}
+	tagsMap, ok := rawTags.(map[string]any)
+	if !ok {
+		t.Fatalf("director_tags is not a JSON object; got %T", rawTags)
+	}
+	for k, want := range directorTags {
+		got, ok := tagsMap[k]
+		if !ok {
+			t.Errorf("director_tags[%q] missing", k)
+			continue
+		}
+		if got != want {
+			t.Errorf("director_tags[%q] = %v; want %q", k, got, want)
+		}
+	}
+}
+
+// TestBuildStemcellProvenanceNotes_DirectorTagsAbsent verifies that when
+// directorTags is nil, director_tags is omitted (omitempty) and notes output
+// is byte-identical to the pre-v3 format.
+func TestBuildStemcellProvenanceNotes_DirectorTagsAbsent(t *testing.T) {
+	t.Parallel()
+
+	cp := stemcellCloudProps{Name: "bosh-ubuntu-noble", Version: "1.0"}
+	now := time.Date(2026, 6, 15, 0, 0, 0, 0, time.UTC)
+
+	notes, err := buildStemcellProvenanceNotes(cp, "ab12ef34", "", "", now, "", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var m map[string]any
+	if err := json.Unmarshal([]byte(notes), &m); err != nil {
+		t.Fatalf("unmarshal failed: %v", err)
+	}
+
+	if _, ok := m["director_tags"]; ok {
+		t.Error("director_tags must be omitted when directorTags is nil (omitempty)")
+	}
 }

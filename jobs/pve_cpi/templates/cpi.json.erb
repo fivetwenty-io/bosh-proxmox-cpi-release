@@ -327,6 +327,16 @@
   v = p("pve.placement.fallback_max", 0).to_i
   placement["fallback_max"] = v unless v == 0
 
+  # placement.reserve_storage_headroom: emit only when true (default false).
+  # Omitting preserves the Go nil *bool -> false -> filter-off path, byte-identical.
+  if p("pve.placement.reserve_storage_headroom", false)
+    placement["reserve_storage_headroom"] = true
+    # placement.storage_headroom_mb: emit only when > 0 (default 0 → 1 GiB floor
+    # applied by the Go accessor; omitting the key preserves that behavior).
+    headroom_mb = p("pve.placement.storage_headroom_mb", 0).to_i
+    placement["storage_headroom_mb"] = headroom_mb unless headroom_mb == 0
+  end
+
   config["placement"] = placement unless placement.empty?
 
   # Emit vm_firewall only when explicitly true. The Go accessor defaults

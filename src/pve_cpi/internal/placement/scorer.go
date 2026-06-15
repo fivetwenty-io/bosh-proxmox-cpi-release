@@ -107,6 +107,16 @@ type Request struct {
 	// filter beyond what the scorer naturally penalizes.
 	RequiredMemBytes int64
 
+	// RequiredStorageBytes is the minimum free storage in bytes on the target VM
+	// storage pool. Zero means no storage filter (byte-identical to prior releases).
+	// When > 0 and the node has storage facts (TotalStorageBytes > 0), Filter
+	// rejects any node whose FreeStorageBytes < RequiredStorageBytes with reason
+	// "insufficient free storage". When TotalStorageBytes == 0 (storage facts
+	// unavailable), the node passes — fail-open matches the soft-axis skip
+	// semantics in Score. Set by create_vm only when
+	// placement.reserve_storage_headroom is enabled; default 0.
+	RequiredStorageBytes int64
+
 	// CandidateNodes restricts scoring to the named nodes when non-empty.
 	// An empty slice means all online nodes are candidates.
 	CandidateNodes []string
@@ -146,6 +156,10 @@ type ScoredNode struct {
 //   - Node must be in req.CandidateNodes when that slice is non-empty.
 //   - Node must have MaxCPU ≥ req.RequiredCPU when RequiredCPU > 0.
 //   - Node must have FreeMemBytes ≥ req.RequiredMemBytes when RequiredMemBytes > 0.
+//   - Node must have FreeStorageBytes ≥ req.RequiredStorageBytes when
+//     RequiredStorageBytes > 0 AND TotalStorageBytes > 0. When TotalStorageBytes == 0
+//     (storage facts unavailable), the node passes — fail-open matches the soft-axis
+//     skip semantics in Score.
 //   - When req.RequiredPCIAddresses is non-empty and req.PCIChecker is set, the
 //     node must pass the PCI device check (fail-safe: error → reject).
 //
@@ -189,6 +203,15 @@ func Filter(facts []NodeFacts, req Request) (pass []NodeFacts, rejections map[st
 
 		if req.RequiredMemBytes > 0 && f.FreeMemBytes < req.RequiredMemBytes {
 			rejections[f.Node] = "insufficient free memory"
+			continue
+		}
+
+		// Storage capacity hard filter. Fail-open when TotalStorageBytes == 0:
+		// storage facts are unavailable for this node (ListStorage error or no
+		// matching pool), so we do not penalize it — the soft scorer already
+		// skips the Storage axis under the same condition.
+		if req.RequiredStorageBytes > 0 && f.TotalStorageBytes > 0 && f.FreeStorageBytes < req.RequiredStorageBytes {
+			rejections[f.Node] = "insufficient free storage"
 			continue
 		}
 

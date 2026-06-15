@@ -20,15 +20,16 @@ const (
 // description/notes field so operators and automated tooling can inspect
 // origin metadata without querying PVE tags.
 type stemcellProvenance struct {
-	Name         string `json:"name"`
-	Version      string `json:"version"`
-	OSType       string `json:"os_type,omitempty"`
-	DiskFormat   string `json:"disk_format,omitempty"`
-	SHA8         string `json:"sha8"`
-	Source       string `json:"source,omitempty"`
-	DirectorID   string `json:"director_id,omitempty"`
-	Created      string `json:"created"`
-	StemcellRefs string `json:"stemcell_refs,omitempty"`
+	Name         string            `json:"name"`
+	Version      string            `json:"version"`
+	OSType       string            `json:"os_type,omitempty"`
+	DiskFormat   string            `json:"disk_format,omitempty"`
+	SHA8         string            `json:"sha8"`
+	Source       string            `json:"source,omitempty"`
+	DirectorID   string            `json:"director_id,omitempty"`
+	Created      string            `json:"created"`
+	StemcellRefs string            `json:"stemcell_refs,omitempty"`
+	DirectorTags map[string]string `json:"director_tags,omitempty"`
 }
 
 // ParseStemcellRefs splits a comma-separated stemcell-refs CSV into a slice of
@@ -98,10 +99,13 @@ func buildStemcellProvenanceTags(cp stemcellCloudProps, directorID string) []str
 //     When non-empty it is recorded as the first entry in stemcell_refs so that
 //     delete_stemcell can track reference counts. When empty, stemcell_refs is
 //     omitted (omitempty).
+//   - directorTags: key/value tags supplied via the CPI v3 env argument; recorded
+//     as director_tags in the JSON. nil/empty is omitted (omitempty). When empty,
+//     notes output is byte-identical to the pre-v3 format.
 //
 // Returns the JSON bytes as a string and any marshaling error. The function
 // never returns an empty string on success; Created is always present.
-func buildStemcellProvenanceNotes(cp stemcellCloudProps, sha8, source, directorID string, now time.Time, initialCID string) (string, error) {
+func buildStemcellProvenanceNotes(cp stemcellCloudProps, sha8, source, directorID string, now time.Time, initialCID string, directorTags map[string]string) (string, error) {
 	p := stemcellProvenance{
 		Name:       cp.Name,
 		Version:    cp.Version,
@@ -114,6 +118,9 @@ func buildStemcellProvenanceNotes(cp stemcellCloudProps, sha8, source, directorI
 	}
 	if initialCID != "" {
 		p.StemcellRefs = initialCID
+	}
+	if len(directorTags) > 0 {
+		p.DirectorTags = directorTags
 	}
 	b, err := json.Marshal(p)
 	if err != nil {

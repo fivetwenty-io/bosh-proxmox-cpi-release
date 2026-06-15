@@ -1768,3 +1768,270 @@ func TestBuildAndDeduplicateStemcellCID_DedupHit_HashStillReturned(t *testing.T)
 		t.Errorf("dedup-hit sha256hex = %q; want %q (hash must be returned without re-read)", dedup.SHA256Hex, wantHash)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// CPI v3 env.tags tests
+// ---------------------------------------------------------------------------
+
+// TestAttemptCreateTemplateVM_DirectorTags_MergedIntoTags verifies that when
+// cp.DirectorTags is non-empty, the sanitized "key-value" tokens appear in the
+// createParams["tags"] field alongside the base tags (ownershipTag + shaTag),
+// and provenance is disabled (byte-identical base path plus director tokens).
+func TestAttemptCreateTemplateVM_DirectorTags_MergedIntoTags(t *testing.T) {
+	t.Parallel()
+
+	const sha8 = "deadbeef"
+	const shaTag = stemcellSHATagPrefix + sha8
+
+	deps, got := buildProvDeps(t, false, "")
+	cp := stemcellCloudProps{
+		Name:    "ubuntu-jammy",
+		Version: "1.0",
+		DirectorTags: map[string]string{
+			"env":  "production",
+			"team": "platform",
+		},
+	}
+
+	err := attemptCreateTemplateVM(
+		context.Background(), deps, deps.Logger,
+		"pve-node1", 30001,
+		"bosh-stemcell-ubuntu-jammy-1-0", "nfs:import/test.qcow2", shaTag, "nfs",
+		cp, "/tmp/test.qcow2", nil,
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	gotTags, _ := got.params["tags"].(string)
+
+	// Base tokens must be present.
+	for _, want := range []string{ownershipTag, shaTag} {
+		if !strings.Contains(gotTags, want) {
+			t.Errorf("tags %q missing base token %q", gotTags, want)
+		}
+	}
+
+	// Director tag tokens must be present. Token format is "key-value"
+	// (sanitized key + "-" + sanitized value).
+	for k, v := range cp.DirectorTags {
+		token := sanitizeTagValue(k) + "-" + sanitizeTagValue(v)
+		if !strings.Contains(gotTags, token) {
+			t.Errorf("tags %q missing director tag token %q (from key=%q val=%q)", gotTags, token, k, v)
+		}
+	}
+}
+
+// TestAttemptCreateTemplateVM_DirectorTags_Absent_ByteIdentical verifies that
+// when cp.DirectorTags is nil, the tags field is byte-identical to a call
+// without env (no extra tokens appended).
+func TestAttemptCreateTemplateVM_DirectorTags_Absent_ByteIdentical(t *testing.T) {
+	t.Parallel()
+
+	const sha8 = "deadbeef"
+	const shaTag = stemcellSHATagPrefix + sha8
+	wantTags := ownershipTag + ";" + shaTag
+
+	deps, got := buildProvDeps(t, false, "")
+	cp := stemcellCloudProps{
+		Name:         "ubuntu-jammy",
+		Version:      "1.0",
+		DirectorTags: nil, // absent — must be byte-identical to pre-v3 path
+	}
+
+	err := attemptCreateTemplateVM(
+		context.Background(), deps, deps.Logger,
+		"pve-node1", 30001,
+		"bosh-stemcell-ubuntu-jammy-1-0", "nfs:import/test.qcow2", shaTag, "nfs",
+		cp, "/tmp/test.qcow2", nil,
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	gotTags, _ := got.params["tags"].(string)
+	if gotTags != wantTags {
+		t.Errorf("tags = %q; want %q (must be byte-identical when DirectorTags nil)", gotTags, wantTags)
+	}
+}
+
+// TestAttemptCreateTemplateVM_DirectorTags_InvalidValue_Skipped verifies that
+// a director tag whose key or value sanitizes to "" is silently dropped
+// (neither a token nor an error is produced).
+func TestAttemptCreateTemplateVM_DirectorTags_InvalidValue_Skipped(t *testing.T) {
+	t.Parallel()
+
+	const sha8 = "deadbeef"
+	const shaTag = stemcellSHATagPrefix + sha8
+
+	deps, got := buildProvDeps(t, false, "")
+	cp := stemcellCloudProps{
+		Name:    "ubuntu-jammy",
+		Version: "1.0",
+		DirectorTags: map[string]string{
+			"env":   "prod",        // valid — must appear
+			"...":   "invalid-key", // key sanitizes to "" → drop
+			"valid": "...",         // value sanitizes to "" → drop
+		},
+	}
+
+	err := attemptCreateTemplateVM(
+		context.Background(), deps, deps.Logger,
+		"pve-node1", 30001,
+		"bosh-stemcell-ubuntu-jammy-1-0", "nfs:import/test.qcow2", shaTag, "nfs",
+		cp, "/tmp/test.qcow2", nil,
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	gotTags, _ := got.params["tags"].(string)
+
+	// The valid pair "env=prod" must appear.
+	if !strings.Contains(gotTags, "env-prod") {
+		t.Errorf("tags %q missing valid director tag token %q", gotTags, "env-prod")
+	}
+
+	// The invalid pairs must NOT produce tokens. Checking that "invalid-key" and
+	// "---" are not present as tag tokens (they would appear as "---invalid-key"
+	// or "valid---" if the drop logic is missing).
+	if strings.Contains(gotTags, "invalid-key") {
+		t.Errorf("tags %q must not contain token for all-punctuation key", gotTags)
+	}
+}
+
+// TestHandleCreateStemcell_EnvTags_MergedIntoTemplate verifies the end-to-end
+// 3-arg create_stemcell path: env.tags passed as args[2] reach the PVE
+// QEMU.Create call's tags param. Uses the fetch-path via FetchResolver seam
+// (no real file needed) with a single-node NFS storage mock.
+func TestHandleCreateStemcell_EnvTags_MergedIntoTemplate(t *testing.T) {
+	t.Parallel()
+
+	body := []byte("FAKE STEMCELL ENV TAGS TEST")
+	sum := sha256.Sum256(body)
+	sha256hex := hex.EncodeToString(sum[:])
+	sha8 := sha256hex[:8]
+
+	var capturedTags string
+	deps := wbBuildFetchDeps(t, wbEmptyNodeListFn())
+	deps.FetchResolver = func(rawURL string) (stemcellfetch.Source, stemcellfetch.Reference, error) {
+		return &mockSource{body: body, contentLength: int64(len(body))},
+			stemcellfetch.Reference{Scheme: "https", URL: rawURL},
+			nil
+	}
+	deps.PVE.(*wbTemplateMockClient).qemuSvc = &wbMockQEMU{
+		createFn: func(_ context.Context, _ string, params map[string]any) (string, error) {
+			capturedTags, _ = params["tags"].(string)
+			return "", nil
+		},
+	}
+	deps.PVE.(*wbTemplateMockClient).storageSvc = &wbTemplateStorage{
+		wbMockStorage: wbMockStorage{
+			uploadFn: func(_ context.Context, _, _, _, _ string, body io.Reader) (string, error) {
+				_, _ = io.Copy(io.Discard, body)
+				return "", nil
+			},
+		},
+	}
+
+	h := HandleCreateStemcell(deps)
+	cp := map[string]any{
+		"name":      "ubuntu-jammy",
+		"version":   "1.438",
+		"image_url": "https://example.com/ubuntu-jammy.qcow2",
+	}
+	env := map[string]any{
+		"tags": map[string]any{
+			"env":  "staging",
+			"team": "ops",
+		},
+	}
+	args := []json.RawMessage{
+		mustMarshal(t, "/dev/null"),
+		mustMarshal(t, cp),
+		mustMarshal(t, env),
+	}
+
+	result, err := h.Handle(context.Background(), args, jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	cid, ok := result.(string)
+	if !ok {
+		t.Fatalf("result is %T; want string", result)
+	}
+	if !pve.IsTemplateStemcellCID(cid) {
+		t.Errorf("CID = %q; want template:<vmid> format", cid)
+	}
+
+	// sha8 token from the sha tag must be present (base identity).
+	wantSHAToken := "bosh-stemcell-sha-" + sha8
+	if !strings.Contains(capturedTags, wantSHAToken) {
+		t.Errorf("tags %q missing sha token %q", capturedTags, wantSHAToken)
+	}
+
+	// Director tag tokens: "env-staging" and "team-ops".
+	for _, token := range []string{"env-staging", "team-ops"} {
+		if !strings.Contains(capturedTags, token) {
+			t.Errorf("tags %q missing director tag token %q from env.tags", capturedTags, token)
+		}
+	}
+}
+
+// TestHandleCreateStemcell_NoEnvArg_ByteIdentical verifies the 2-arg call
+// (no env) produces the same tags as before (byte-identical base path).
+func TestHandleCreateStemcell_NoEnvArg_ByteIdentical(t *testing.T) {
+	t.Parallel()
+
+	body := []byte("FAKE STEMCELL NO ENV ARG")
+	var capturedTags string
+
+	deps := wbBuildFetchDeps(t, wbEmptyNodeListFn())
+	deps.FetchResolver = func(rawURL string) (stemcellfetch.Source, stemcellfetch.Reference, error) {
+		return &mockSource{body: body, contentLength: int64(len(body))},
+			stemcellfetch.Reference{Scheme: "https", URL: rawURL},
+			nil
+	}
+	deps.PVE.(*wbTemplateMockClient).qemuSvc = &wbMockQEMU{
+		createFn: func(_ context.Context, _ string, params map[string]any) (string, error) {
+			capturedTags, _ = params["tags"].(string)
+			return "", nil
+		},
+	}
+	deps.PVE.(*wbTemplateMockClient).storageSvc = &wbTemplateStorage{
+		wbMockStorage: wbMockStorage{
+			uploadFn: func(_ context.Context, _, _, _, _ string, body io.Reader) (string, error) {
+				_, _ = io.Copy(io.Discard, body)
+				return "", nil
+			},
+		},
+	}
+
+	h := HandleCreateStemcell(deps)
+	cp := map[string]any{
+		"name":      "ubuntu-jammy",
+		"version":   "1.438",
+		"image_url": "https://example.com/ubuntu-jammy.qcow2",
+	}
+	// Only 2 args — no env.
+	args := []json.RawMessage{
+		mustMarshal(t, "/dev/null"),
+		mustMarshal(t, cp),
+	}
+
+	_, err := h.Handle(context.Background(), args, jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Tags must NOT contain any director-tag tokens (no "env-" or "team-" prefix).
+	for _, unexpected := range []string{"env-", "team-"} {
+		if strings.Contains(capturedTags, unexpected) {
+			t.Errorf("2-arg call: tags %q must not contain director-tag token %q", capturedTags, unexpected)
+		}
+	}
+	// Base tokens must be present.
+	if !strings.Contains(capturedTags, ownershipTag) {
+		t.Errorf("tags %q missing ownershipTag %q", capturedTags, ownershipTag)
+	}
+}

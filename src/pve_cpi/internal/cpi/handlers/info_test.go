@@ -11,7 +11,7 @@ import (
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
 )
 
-func TestHandleInfo_ReturnsAPIVersion2(t *testing.T) {
+func TestHandleInfo_ReturnsAPIVersion3(t *testing.T) {
 	t.Parallel()
 
 	deps := handlers.Deps{Logger: log.NewNopLogger()}
@@ -36,13 +36,13 @@ func TestHandleInfo_ReturnsAPIVersion2(t *testing.T) {
 		t.Fatalf("HandleInfo: cannot unmarshal result map: %v", err)
 	}
 
-	// api_version must be 2.
+	// api_version must be 3 (CPI v3: adds optional env arg on create_stemcell).
 	var apiVersion int
 	if err := json.Unmarshal(m["api_version"], &apiVersion); err != nil {
 		t.Fatalf("api_version field missing or invalid: %v", err)
 	}
-	if apiVersion != 2 {
-		t.Errorf("api_version = %d; want 2", apiVersion)
+	if apiVersion != 3 {
+		t.Errorf("api_version = %d; want 3", apiVersion)
 	}
 
 	// stemcell_formats must be a non-empty list containing the expected entries.

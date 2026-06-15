@@ -987,6 +987,37 @@ type PlacementConfig struct {
 	// (IsCloneSourceMissing, any non-transient error) surface immediately without
 	// consuming alternates. Use PlacementFallbackMaxValue() for the effective int.
 	FallbackMax *int `json:"fallback_max,omitempty"`
+
+	// ReserveStorageHeadroom enables the storage-capacity hard placement filter
+	// (§7.58). Default false (nil or absent → false). When true, create_vm
+	// computes a RequiredStorageBytes floor for each placement.Request:
+	//
+	//   floor = rootDiskBytes + ephemeralDiskBytes (when on the same pool) +
+	//           headroomBytes
+	//
+	// where headroomBytes = StorageHeadroomMB (MiB→bytes) plus VM RAM
+	// (MiB→bytes) as a swap reservation when a dedicated ephemeral disk is
+	// present (mirroring vSphere's max-swapfile term). When StorageHeadroomMB is
+	// unset, 1 GiB is used as the floor margin (matches vSphere DISK_HEADROOM).
+	//
+	// Only storage counts that land on the VM storage pool (deps.Config.VMStorage)
+	// are included; if the ephemeral disk resolves to a different pool those bytes
+	// are excluded from the filter. The filter is fail-open: when a node's storage
+	// facts are unavailable (TotalStorageBytes == 0), that node is NOT rejected.
+	//
+	// Default false (opt-in): when nil or absent, RequiredStorageBytes stays 0 and
+	// placement is byte-identical to prior releases. Use
+	// ReserveStorageHeadroomEnabled() for the effective bool.
+	ReserveStorageHeadroom *bool `json:"reserve_storage_headroom,omitempty"`
+
+	// StorageHeadroomMB is the extra margin in MiB added on top of the computed
+	// disk footprint when ReserveStorageHeadroom is true. Acts as the vSphere
+	// DISK_HEADROOM equivalent: an absolute safety buffer beyond the raw disk
+	// sizes. When 0 (nil or absent), defaults to 1024 MiB (1 GiB). Negative
+	// values are rejected by Validate. Only meaningful when
+	// ReserveStorageHeadroom is true. Use StorageHeadroomMBValue() for the
+	// effective int (always ≥ 0 when valid).
+	StorageHeadroomMB *int `json:"storage_headroom_mb,omitempty"`
 }
 
 // AntiAffinityConfig holds the Tier-2 same-group spreading knobs.
@@ -1588,6 +1619,29 @@ func (c *CPIConfig) PlacementFallbackMaxValue() int {
 		return 0
 	}
 	return *c.Placement.FallbackMax
+}
+
+// ReserveStorageHeadroomEnabled reports whether the storage-capacity hard
+// placement filter is active. Default false (opt-in): nil Placement block,
+// nil ReserveStorageHeadroom field, or explicit *false all return false.
+// Only an explicit *true returns true.
+func (c *CPIConfig) ReserveStorageHeadroomEnabled() bool {
+	if c == nil || c.Placement == nil || c.Placement.ReserveStorageHeadroom == nil {
+		return false
+	}
+	return *c.Placement.ReserveStorageHeadroom
+}
+
+// StorageHeadroomMBValue returns the configured extra storage-headroom margin
+// in MiB. When StorageHeadroomMB is nil or 0, returns 1024 (1 GiB — matches
+// vSphere DISK_HEADROOM default). Only meaningful when
+// ReserveStorageHeadroomEnabled() is true.
+func (c *CPIConfig) StorageHeadroomMBValue() int {
+	const defaultHeadroomMiB = 1024 // 1 GiB, mirrors vSphere DISK_HEADROOM
+	if c == nil || c.Placement == nil || c.Placement.StorageHeadroomMB == nil || *c.Placement.StorageHeadroomMB == 0 {
+		return defaultHeadroomMiB
+	}
+	return *c.Placement.StorageHeadroomMB
 }
 
 // AZCandidates returns the node list for az and true when az is a known key in
@@ -3093,6 +3147,12 @@ func (c *CPIConfig) validatePlacement(errs *[]string) {
 				"placement.fallback_max must be <= %d, got %d", placementFallbackMaxCap, v,
 			))
 		}
+	}
+	// StorageHeadroomMB: must be >= 0 when set.
+	if c.Placement.StorageHeadroomMB != nil && *c.Placement.StorageHeadroomMB < 0 {
+		*errs = append(*errs, fmt.Sprintf(
+			"placement.storage_headroom_mb must be >= 0, got %d", *c.Placement.StorageHeadroomMB,
+		))
 	}
 }
 

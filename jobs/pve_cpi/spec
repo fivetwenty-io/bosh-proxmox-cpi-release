@@ -777,6 +777,29 @@ properties:
       without consuming alternates. Valid range: 0 (off) to 5. Recommended
       operational value: 2.
     default: 0
+  pve.placement.reserve_storage_headroom:
+    description: |
+      Enables the storage-capacity hard placement filter. When true, create_vm
+      computes a minimum free-storage requirement for each candidate node and
+      rejects nodes whose target storage pool does not have enough free bytes to
+      hold the VM's disks plus a headroom margin. The filter is fail-open: nodes
+      whose storage facts are unavailable (ListStorage API error or no matching
+      pool) are never rejected — they pass and may be picked by the scorer.
+      The filter is applied only to the VM storage pool (pve.vm_storage); disks
+      that resolve to a different pool (e.g. a separately configured ephemeral
+      pool) are excluded from the count. A capacity shortfall is treated as a
+      permanent, non-retriable placement failure. Default false (opt-in);
+      placement is byte-identical to prior releases when unset or false.
+    default: false
+  pve.placement.storage_headroom_mb:
+    description: |
+      Extra storage margin in MiB added on top of the VM's raw disk footprint when
+      placement.reserve_storage_headroom is true. Mirrors vSphere's DISK_HEADROOM
+      constant: an absolute safety buffer so the placement filter accounts for
+      filesystem overhead and thin-provisioning slack. When 0 (default), a 1 GiB
+      floor is used. Negative values are rejected at startup. Only meaningful when
+      placement.reserve_storage_headroom is true.
+    default: 0
   pve.stemcell_replicate_local:
     description: |
       When true, create_stemcell uploads the stemcell qcow2 independently to every

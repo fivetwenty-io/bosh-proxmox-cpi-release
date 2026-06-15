@@ -1219,7 +1219,7 @@ func resolveTargetNode(ctx context.Context, deps Deps, cp createVMCloudProps, gr
 // for per-call placement weight overrides and AZ resolution via vm_type profiles.
 // Pass nil to skip resolver-based overrides (existing behavior preserved byte-identically).
 //
-//nolint:gocognit // Multi-AZ loop + maintenance + retryability; inherent complexity.
+//nolint:gocognit,gocyclo // Multi-AZ loop + maintenance + retryability; inherent complexity.
 func resolveTargetNodeWithRNG(
 	ctx context.Context,
 	deps Deps,
@@ -1417,6 +1417,22 @@ func resolveTargetNodeWithRNG(
 			pciCheckerFn = buildPCIChecker(ctx, deps.PVE.Nodes(), pciAddrs)
 		}
 
+		// Compute the storage-capacity hard filter floor when the feature is enabled.
+		// requiredStorageBytes is 0 (no filter) when the gate is off — byte-identical.
+		//
+		// The placement facts measure deps.Config.VMStorage only. Root disk always
+		// lands on VMStorage. Ephemeral disk may land on a different pool (when
+		// cp.EphemeralStoragePool is set to a different name); in that case its bytes
+		// are excluded from the filter so we do not reject nodes based on a pool the
+		// facts did not measure. The resolver-layer ephemeral pool override is not
+		// consulted here because it requires a live PVE API call (storage-tier
+		// resolution) that is unavailable at this scope; the struct field
+		// (cp.EphemeralStoragePool) provides the best static approximation.
+		var requiredStorageBytes int64
+		if deps.Config.ReserveStorageHeadroomEnabled() {
+			requiredStorageBytes = computeRequiredStorageBytes(deps.Config, cp, storageName)
+		}
+
 		// AZ loop. When azOrder is empty (no AZ set at all), run a single
 		// iteration with no candidate restriction (all nodes).
 		allRejections := make(map[string]string)
@@ -1427,6 +1443,7 @@ func resolveTargetNodeWithRNG(
 				ExcludeMaintenanceNodes: excludeMaintenance,
 				RequiredPCIAddresses:    pciAddrs,
 				PCIChecker:              pciCheckerFn,
+				RequiredStorageBytes:    requiredStorageBytes,
 			}
 			pass, rejections := placement.Filter(facts, req)
 			mergeRejections(allRejections, rejections)
@@ -1447,6 +1464,7 @@ func resolveTargetNodeWithRNG(
 					ExcludeMaintenanceNodes: excludeMaintenance,
 					RequiredPCIAddresses:    pciAddrs,
 					PCIChecker:              pciCheckerFn,
+					RequiredStorageBytes:    requiredStorageBytes,
 				}
 				pass, rejections := placement.Filter(facts, req)
 				mergeRejections(allRejections, rejections)
@@ -1519,7 +1537,7 @@ func resolveTargetNodeWithRNG(
 // list starting at rank 2. All alternates passed the same Filter constraints
 // (same AZ, same maintenance/CPU/mem filter) as the winner.
 //
-//nolint:gocognit // Mirrors resolveTargetNodeWithRNG complexity; inherent multi-AZ loop.
+//nolint:gocognit,gocyclo // Mirrors resolveTargetNodeWithRNG complexity; inherent multi-AZ loop.
 func resolveTargetNodeWithFallbacks(
 	ctx context.Context,
 	deps Deps,
@@ -1678,6 +1696,12 @@ func resolveTargetNodeWithFallbacks(
 			pciCheckerFnFB = buildPCIChecker(ctx, deps.PVE.Nodes(), pciAddrsFB)
 		}
 
+		// Storage-capacity hard filter (same computation as non-fallback path; 0 when gate off).
+		var requiredStorageBytesFB int64
+		if deps.Config.ReserveStorageHeadroomEnabled() {
+			requiredStorageBytesFB = computeRequiredStorageBytes(deps.Config, cp, storageName)
+		}
+
 		allRejections := make(map[string]string)
 
 		if len(azOrder) == 0 {
@@ -1685,6 +1709,7 @@ func resolveTargetNodeWithFallbacks(
 				ExcludeMaintenanceNodes: excludeMaintenance,
 				RequiredPCIAddresses:    pciAddrsFB,
 				PCIChecker:              pciCheckerFnFB,
+				RequiredStorageBytes:    requiredStorageBytesFB,
 			}
 			pass, rejections := placement.Filter(facts, req)
 			mergeRejections(allRejections, rejections)
@@ -1704,6 +1729,7 @@ func resolveTargetNodeWithFallbacks(
 					ExcludeMaintenanceNodes: excludeMaintenance,
 					RequiredPCIAddresses:    pciAddrsFB,
 					PCIChecker:              pciCheckerFnFB,
+					RequiredStorageBytes:    requiredStorageBytesFB,
 				}
 				pass, rejections := placement.Filter(facts, req)
 				mergeRejections(allRejections, rejections)
@@ -2124,6 +2150,12 @@ func isTransientRejectionReason(reason string) bool {
 	switch reason {
 	case "node offline", "node in maintenance", "insufficient CPU", "insufficient free memory",
 		"not in candidate node set":
+		// "insufficient free storage" is intentionally absent: a storage-capacity
+		// shortfall is a hard permanent constraint (the node does not have enough
+		// free space for the VM's disks plus headroom) and will not clear without
+		// operator action (freeing space or moving data). Map it to non-retriable
+		// so the Director surfaces the error immediately instead of retrying
+		// indefinitely against the same over-committed node.
 		return true
 	}
 	// A failed ListHardwarePci call (pvedaemon restart, momentary node
@@ -2147,6 +2179,88 @@ func formatRejections(rejections map[string]string) string {
 	}
 	sort.Strings(parts)
 	return strings.Join(parts, "; ")
+}
+
+// computeRequiredStorageBytes returns the minimum free-storage floor in bytes
+// for placement.Request.RequiredStorageBytes when the storage-headroom gate is
+// enabled. Returns 0 if disabled (gate-off callers must not call this).
+//
+// Formula (all quantities in bytes):
+//
+//	floor = rootDiskBytes + ephemeralDiskBytes + headroomBytes
+//
+// where:
+//   - rootDiskBytes     = rootDiskGiB (GiB→bytes); rootDiskGiB is the effective
+//     root disk size derived from cloud_properties exactly as resolveVMShapeStorage
+//     does it — max(defaultStemcellDiskGiB, ceil(requestedMiB/1024)).
+//   - ephemeralDiskBytes = ephemeral GiB×GiB→bytes, included ONLY when the
+//     ephemeral disk resolves to the same storage pool as vmStorage (i.e.
+//     cp.EphemeralStoragePool is "" or equals storageName). If the ephemeral disk
+//     is on a different pool, those bytes are excluded so the filter is not applied
+//     to a pool whose facts were not gathered.
+//   - headroomBytes = cfg.StorageHeadroomMBValue() (MiB→bytes) +
+//     memSwapBytes, where memSwapBytes = memMiB×MiB→bytes when a dedicated
+//     ephemeral disk is present (mirroring vSphere's max-swapfile term: ESXi
+//     reserves VM-RAM bytes for the host swap file; PVE/QEMU has no host
+//     swapfile, so we include it only when the ephemeral disk is present as
+//     a worst-case in-guest swap reservation that competes for the same pool).
+//     memSwapBytes is 0 when no dedicated ephemeral disk is requested.
+//
+// storageName is the pool the placement facts measured (always deps.Config.VMStorage).
+func computeRequiredStorageBytes(cfg *config.CPIConfig, cp createVMCloudProps, storageName string) int64 {
+	const (
+		mibBytes = int64(1024 * 1024)
+		gibBytes = int64(1024 * 1024 * 1024)
+	)
+
+	// Effective root disk size: mirrors resolveVMShapeStorage logic.
+	rootDiskGiB := int64(defaultStemcellDiskGiB)
+	requestedMiB := 0
+	if cp.RootDiskSize > 0 {
+		requestedMiB = cp.RootDiskSize
+	} else if cp.Disk > 0 {
+		requestedMiB = cp.Disk
+	}
+	if requestedMiB > 0 {
+		gib := int64((requestedMiB + 1023) / 1024)
+		if gib > rootDiskGiB {
+			rootDiskGiB = gib
+		}
+	}
+	rootDiskBytes := rootDiskGiB * gibBytes
+
+	// Ephemeral disk size: only counted when it lands on the same storage pool.
+	// cp.EphemeralStoragePool=="" means the ephemeral disk defaults to vmStorage.
+	// When it is explicitly set to a different pool, the facts do not cover that
+	// pool and we exclude those bytes to avoid incorrect rejections.
+	ephemeralGiB := int64(0)
+	ephemeralOnVMStorage := cp.EphemeralStoragePool == "" || cp.EphemeralStoragePool == storageName
+	if cp.EphemeralDiskSizeMB > 0 && ephemeralOnVMStorage {
+		ephemeralGiB = int64((cp.EphemeralDiskSizeMB + 1023) / 1024)
+	}
+	ephemeralDiskBytes := ephemeralGiB * gibBytes
+
+	// Headroom: configured margin + VM RAM as in-guest swap reservation.
+	// The swap term mirrors vSphere's DISK_HEADROOM logic (max swapfile ≈ VM RAM).
+	// Include only when a dedicated ephemeral disk is present (the swap file
+	// resides on the ephemeral disk; without a dedicated ephemeral disk the
+	// agent carves swap from the root disk, which is already counted above).
+	headroomMiB := int64(cfg.StorageHeadroomMBValue())
+	headroomBytes := headroomMiB * mibBytes
+
+	if cp.EphemeralDiskSizeMB > 0 && ephemeralOnVMStorage {
+		// Include VM RAM as worst-case swap reservation (vSphere max-swapfile term).
+		memMiB := int64(cp.Memory)
+		if cp.RAM > 0 {
+			memMiB = int64(cp.RAM)
+		}
+		if memMiB < 0 {
+			memMiB = 0
+		}
+		headroomBytes += memMiB * mibBytes
+	}
+
+	return rootDiskBytes + ephemeralDiskBytes + headroomBytes
 }
 
 // collectStaticIPsForConflictCheck extracts the bare IP addresses from the

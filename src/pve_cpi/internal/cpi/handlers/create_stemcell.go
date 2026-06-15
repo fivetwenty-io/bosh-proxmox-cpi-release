@@ -126,6 +126,12 @@ type stemcellCloudProps struct {
 	// ExpectedSHA1 is the expected SHA-1 hex digest from cloud_properties.sha1.
 	// Compared only when ExpectedSHA256 is empty. Empty means no SHA-1 check.
 	ExpectedSHA1 string
+
+	// DirectorTags holds per-stemcell tags supplied by the BOSH Director via the
+	// optional env argument on create_stemcell (CPI v3 contract). It is populated
+	// by HandleCreateStemcell from env["tags"], NOT from cloud_properties.
+	// nil/empty means no director-supplied tags.
+	DirectorTags map[string]string
 }
 
 // validateLightMutex returns an error when more than one of ImageID, ImageURL,
@@ -331,6 +337,10 @@ func validateStemcellImagePath(imagePath string) error {
 //
 //	[0] image_path      string — absolute local path to stemcell disk image (or tarball).
 //	[1] cloud_properties object — stemcell.MF cloud_properties section (may be omitted).
+//	[2] env             object — optional CPI v3 argument; env["tags"] (map[string]string)
+//	                    carries director-supplied tags merged into the template's PVE tags
+//	                    and provenance notes. Absent/null/non-object env is ignored
+//	                    (2-arg calls are byte-identical to today's behavior).
 //
 // Returns: stemcell_cid string — "template:<vmid>" (e.g. "template:6042").
 // The VMID identifies the frozen PVE template VM that backs this stemcell.
@@ -378,7 +388,7 @@ func validateStemcellImagePath(imagePath string) error {
 //   - Image extraction or SHA-256 failure.
 //   - qcow2 upload failure.
 //
-// nolint:gocognit // Orchestration shell: light-vs-heavy dispatch then heavy-path phases (resolveStemcellStorageAndNode, buildAndDeduplicateStemcellCID, uploadAndReturnCID). Phase logic lives in extracted helpers.
+// nolint:gocognit,gocyclo // Orchestration shell: light-vs-heavy dispatch then heavy-path phases (resolveStemcellStorageAndNode, buildAndDeduplicateStemcellCID, uploadAndReturnCID). Phase logic lives in extracted helpers. CPI v3 env-arg parsing adds one branch to the already-high count.
 func HandleCreateStemcell(deps Deps) cpi.Handler {
 	return cpi.HandlerFunc(func(ctx context.Context, args []json.RawMessage, _ jsonrpc.Context) (any, error) {
 		// ----------------------------------------------------------------
@@ -409,6 +419,35 @@ func HandleCreateStemcell(deps Deps) cpi.Handler {
 		cp := parseStemcellCloudProps(cloudProps)
 		if err := cp.validateLightMutex(); err != nil {
 			return nil, err
+		}
+
+		// ----------------------------------------------------------------
+		// Step 2b: Parse arg 2 — env (optional, CPI v3).
+		// env["tags"] carries director-supplied key/value pairs to stamp on the
+		// stemcell template. Absent/null/non-object env is tolerated (ignored).
+		// Non-string tag values are silently skipped; only string→string pairs
+		// are retained. When env is absent this block is a no-op and cp is
+		// byte-identical to a 2-arg call.
+		// ----------------------------------------------------------------
+		if len(args) >= 3 && args[2] != nil {
+			var envMap map[string]any
+			if jsonErr := json.Unmarshal(args[2], &envMap); jsonErr == nil && envMap != nil {
+				if rawTags, ok := envMap["tags"]; ok && rawTags != nil {
+					if tagsMap, ok := rawTags.(map[string]any); ok {
+						directorTags := make(map[string]string, len(tagsMap))
+						for k, v := range tagsMap {
+							if sv, ok := v.(string); ok {
+								directorTags[k] = sv
+							}
+						}
+						if len(directorTags) > 0 {
+							cp.DirectorTags = directorTags
+						}
+					}
+				}
+			}
+			// Non-object env (e.g. null, string, number) is silently ignored so
+			// old directors passing unexpected types cannot break create_stemcell.
 		}
 
 		// ----------------------------------------------------------------
@@ -934,11 +973,25 @@ func attemptCreateTemplateVM(
 	// Computed here where the candidate VMID is known.
 	initialCID := pve.BuildTemplateStemcellCID(int64(candidate))
 
+	// director tag tokens: sanitize key and value; build "key-value" tokens;
+	// drop any token where either side sanitizes to "".
+	var directorTagTokens []string
+	if len(cp.DirectorTags) > 0 {
+		for k, v := range cp.DirectorTags {
+			sk := sanitizeTagValue(k)
+			sv := sanitizeTagValue(v)
+			if sk == "" || sv == "" {
+				continue
+			}
+			directorTagTokens = append(directorTagTokens, sk+"-"+sv)
+		}
+	}
+
 	if deps.Config.StemcellProvenanceEnabled() {
 		// sha8 is derived from shaTag which is always the pure
 		// "bosh-stemcell-sha-<sha8>" tag; TrimPrefix is safe here.
 		sha8 := strings.TrimPrefix(shaTag, stemcellSHATagPrefix)
-		notes, notesErr := buildStemcellProvenanceNotes(cp, sha8, source, deps.Config.StemcellDirectorID(), time.Now().UTC(), initialCID)
+		notes, notesErr := buildStemcellProvenanceNotes(cp, sha8, source, deps.Config.StemcellDirectorID(), time.Now().UTC(), initialCID, cp.DirectorTags)
 		if notesErr != nil {
 			logger.Warn("attemptCreateTemplateVM: provenance notes build failed (skipping description)",
 				log.Err(notesErr),
@@ -947,7 +1000,8 @@ func attemptCreateTemplateVM(
 			createParams["description"] = notes
 		}
 		provTags := buildStemcellProvenanceTags(cp, deps.Config.StemcellDirectorID())
-		createParams["tags"] = mergeTagList(baseTags, provTags, maxTagLength)
+		allTags := mergeTagList(baseTags, provTags, 0)
+		createParams["tags"] = mergeTagList(strings.Split(allTags, ";"), directorTagTokens, maxTagLength)
 	} else {
 		// Even when full provenance is disabled, write a minimal notes JSON that
 		// records stemcell_refs so delete_stemcell can gate template destruction on
@@ -960,6 +1014,11 @@ func attemptCreateTemplateVM(
 			)
 		} else {
 			createParams["description"] = string(minimalNotes)
+		}
+		// Merge director tag tokens into base tags regardless of provenance mode.
+		if len(directorTagTokens) > 0 {
+			existingTagStr, _ := createParams["tags"].(string)
+			createParams["tags"] = mergeTagList(strings.Split(existingTagStr, ";"), directorTagTokens, maxTagLength)
 		}
 	}
 
