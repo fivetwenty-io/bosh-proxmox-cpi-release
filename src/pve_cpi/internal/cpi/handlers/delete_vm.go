@@ -185,7 +185,9 @@ func sweepFastDeleteStragglers(ctx context.Context, deps Deps, logger *log.Logge
 //     awaiting the returned task UPID.
 //  5. Returns immediately — no unbounded get_task poll on any task.
 //
-// skiplock=true requires root@pam or a token with Sys.Modify privilege.
+// skiplock=true is restricted to the root@pam user; PVE rejects it for any
+// other user regardless of granted privileges, so the CPI must authenticate
+// as root@pam (or a root@pam-owned token) to clear locked VMs here.
 // Eventual consistency: has_vm may briefly still see this VM after return.
 func fastPathDeleteVM(ctx context.Context, deps Deps, node, vmCID string, vmid int, logger *log.Logger) error {
 	// Reap any straggler fast-path VMs cluster-wide before issuing our own
@@ -397,8 +399,9 @@ func HandleDeleteVM(deps Deps) cpi.Handler {
 		// still running or holds a config lock. The destroy call itself is NOT
 		// awaited — the UPID is discarded and the handler returns immediately.
 		//
-		// skiplock=true requires root@pam or a PVEAdmin-role token. Operators who
-		// use a least-privilege token without Sys.Modify may need to grant it.
+		// skiplock=true is restricted to the root@pam user — PVE rejects it for
+		// any other user regardless of role or privilege, so no ACL grant on a
+		// least-privilege token can enable it; run the CPI as root@pam to use it.
 		//
 		// Eventual consistency: a subsequent has_vm call may briefly still see the
 		// VM while PVE's async destroy runs. The bosh-deleting tag marks VMs whose
