@@ -242,7 +242,8 @@ func ParseFingerprint(fingerprint string) ([]byte, error) {
 	return bytes, nil
 }
 
-// CompareFingerprintscleaning compares two fingerprint strings for equality.
+// CompareFingerprints compares two fingerprint strings for equality after
+// normalization.
 func CompareFingerprints(fp1, fp2 string) bool {
 	return NormalizeFingerprint(fp1) == NormalizeFingerprint(fp2)
 }

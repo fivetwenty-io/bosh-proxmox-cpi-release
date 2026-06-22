@@ -1230,7 +1230,9 @@ func (s *service) CreateAplinfo(ctx context.Context, node string, params *Create
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateAplinfo: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateAplinfo: decode params: %w", err)
 		}
@@ -1314,7 +1316,9 @@ func (s *service) ListAptChangelog(ctx context.Context, node string, params *Lis
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListAptChangelog: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListAptChangelog: decode params: %w", err)
 		}
@@ -1409,7 +1413,9 @@ func (s *service) CreateAptRepositories(ctx context.Context, node string, params
 		if err != nil {
 			return fmt.Errorf("nodes.CreateAptRepositories: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("nodes.CreateAptRepositories: decode params: %w", err)
 		}
@@ -1445,7 +1451,9 @@ func (s *service) UpdateAptRepositories(ctx context.Context, node string, params
 		if err != nil {
 			return fmt.Errorf("nodes.UpdateAptRepositories: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("nodes.UpdateAptRepositories: decode params: %w", err)
 		}
@@ -1517,7 +1525,9 @@ func (s *service) CreateAptUpdate(ctx context.Context, node string, params *Crea
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateAptUpdate: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateAptUpdate: decode params: %w", err)
 		}
@@ -1665,7 +1675,9 @@ func (s *service) ListCapabilitiesQemuCpu(ctx context.Context, node string, para
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListCapabilitiesQemuCpu: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListCapabilitiesQemuCpu: decode params: %w", err)
 		}
@@ -1716,7 +1728,9 @@ func (s *service) ListCapabilitiesQemuCpuFlags(ctx context.Context, node string,
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListCapabilitiesQemuCpuFlags: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListCapabilitiesQemuCpuFlags: decode params: %w", err)
 		}
@@ -1765,7 +1779,9 @@ func (s *service) ListCapabilitiesQemuMachines(ctx context.Context, node string,
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListCapabilitiesQemuMachines: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListCapabilitiesQemuMachines: decode params: %w", err)
 		}
@@ -1981,7 +1997,9 @@ func (s *service) ListCephCfgValue(ctx context.Context, node string, params *Lis
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListCephCfgValue: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListCephCfgValue: decode params: %w", err)
 		}
@@ -2039,7 +2057,9 @@ func (s *service) ListCephCmdSafety(ctx context.Context, node string, params *Li
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListCephCmdSafety: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListCephCmdSafety: decode params: %w", err)
 		}
@@ -2155,7 +2175,9 @@ func (s *service) DeleteCephFs(ctx context.Context, node string, name string, pa
 		if err != nil {
 			return nil, fmt.Errorf("nodes.DeleteCephFs: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.DeleteCephFs: decode params: %w", err)
 		}
@@ -2206,7 +2228,9 @@ func (s *service) CreateCephFs(ctx context.Context, node string, name string, pa
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateCephFs: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateCephFs: decode params: %w", err)
 		}
@@ -2262,7 +2286,9 @@ func (s *service) CreateCephInit(ctx context.Context, node string, params *Creat
 		if err != nil {
 			return fmt.Errorf("nodes.CreateCephInit: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("nodes.CreateCephInit: decode params: %w", err)
 		}
@@ -2301,7 +2327,9 @@ func (s *service) ListCephLog(ctx context.Context, node string, params *ListCeph
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListCephLog: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListCephLog: decode params: %w", err)
 		}
@@ -2416,7 +2444,9 @@ func (s *service) CreateCephMds(ctx context.Context, node string, name string, p
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateCephMds: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateCephMds: decode params: %w", err)
 		}
@@ -2630,7 +2660,9 @@ func (s *service) CreateCephMon(ctx context.Context, node string, monid string, 
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateCephMon: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateCephMon: decode params: %w", err)
 		}
@@ -2730,7 +2762,9 @@ func (s *service) CreateCephOsd(ctx context.Context, node string, params *Create
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateCephOsd: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateCephOsd: decode params: %w", err)
 		}
@@ -2779,7 +2813,9 @@ func (s *service) DeleteCephOsd(ctx context.Context, node string, osdid string, 
 		if err != nil {
 			return nil, fmt.Errorf("nodes.DeleteCephOsd: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.DeleteCephOsd: decode params: %w", err)
 		}
@@ -2892,7 +2928,9 @@ func (s *service) ListCephOsdLvInfo(ctx context.Context, node string, osdid stri
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListCephOsdLvInfo: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListCephOsdLvInfo: decode params: %w", err)
 		}
@@ -2992,7 +3030,9 @@ func (s *service) CreateCephOsdScrub(ctx context.Context, node string, osdid str
 		if err != nil {
 			return fmt.Errorf("nodes.CreateCephOsdScrub: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("nodes.CreateCephOsdScrub: decode params: %w", err)
 		}
@@ -3084,7 +3124,9 @@ func (s *service) CreateCephPool(ctx context.Context, node string, params *Creat
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateCephPool: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateCephPool: decode params: %w", err)
 		}
@@ -3137,7 +3179,9 @@ func (s *service) DeleteCephPool(ctx context.Context, node string, name string, 
 		if err != nil {
 			return nil, fmt.Errorf("nodes.DeleteCephPool: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.DeleteCephPool: decode params: %w", err)
 		}
@@ -3235,7 +3279,9 @@ func (s *service) UpdateCephPool(ctx context.Context, node string, name string, 
 		if err != nil {
 			return nil, fmt.Errorf("nodes.UpdateCephPool: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.UpdateCephPool: decode params: %w", err)
 		}
@@ -3333,7 +3379,9 @@ func (s *service) ListCephPoolStatus(ctx context.Context, node string, name stri
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListCephPoolStatus: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListCephPoolStatus: decode params: %w", err)
 		}
@@ -3381,7 +3429,9 @@ func (s *service) CreateCephRestart(ctx context.Context, node string, params *Cr
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateCephRestart: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateCephRestart: decode params: %w", err)
 		}
@@ -3463,7 +3513,9 @@ func (s *service) CreateCephStart(ctx context.Context, node string, params *Crea
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateCephStart: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateCephStart: decode params: %w", err)
 		}
@@ -3545,7 +3597,9 @@ func (s *service) CreateCephStop(ctx context.Context, node string, params *Creat
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateCephStop: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateCephStop: decode params: %w", err)
 		}
@@ -3693,7 +3747,9 @@ func (s *service) CreateCertificatesAcmeCertificate(ctx context.Context, node st
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateCertificatesAcmeCertificate: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateCertificatesAcmeCertificate: decode params: %w", err)
 		}
@@ -3742,7 +3798,9 @@ func (s *service) UpdateCertificatesAcmeCertificate(ctx context.Context, node st
 		if err != nil {
 			return nil, fmt.Errorf("nodes.UpdateCertificatesAcmeCertificate: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.UpdateCertificatesAcmeCertificate: decode params: %w", err)
 		}
@@ -3788,7 +3846,9 @@ func (s *service) DeleteCertificatesCustom(ctx context.Context, node string, par
 		if err != nil {
 			return fmt.Errorf("nodes.DeleteCertificatesCustom: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("nodes.DeleteCertificatesCustom: decode params: %w", err)
 		}
@@ -3851,7 +3911,9 @@ func (s *service) CreateCertificatesCustom(ctx context.Context, node string, par
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateCertificatesCustom: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateCertificatesCustom: decode params: %w", err)
 		}
@@ -3949,7 +4011,9 @@ func (s *service) ListConfig(ctx context.Context, node string, params *ListConfi
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListConfig: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListConfig: decode params: %w", err)
 		}
@@ -4048,7 +4112,9 @@ func (s *service) UpdateConfig(ctx context.Context, node string, params *UpdateC
 		if err != nil {
 			return fmt.Errorf("nodes.UpdateConfig: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("nodes.UpdateConfig: decode params: %w", err)
 		}
@@ -4157,7 +4223,9 @@ func (s *service) CreateDisksDirectory(ctx context.Context, node string, params 
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateDisksDirectory: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateDisksDirectory: decode params: %w", err)
 		}
@@ -4208,7 +4276,9 @@ func (s *service) DeleteDisksDirectory(ctx context.Context, node string, name st
 		if err != nil {
 			return nil, fmt.Errorf("nodes.DeleteDisksDirectory: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.DeleteDisksDirectory: decode params: %w", err)
 		}
@@ -4259,7 +4329,9 @@ func (s *service) CreateDisksInitgpt(ctx context.Context, node string, params *C
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateDisksInitgpt: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateDisksInitgpt: decode params: %w", err)
 		}
@@ -4312,7 +4384,9 @@ func (s *service) ListDisksList(ctx context.Context, node string, params *ListDi
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListDisksList: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListDisksList: decode params: %w", err)
 		}
@@ -4400,7 +4474,9 @@ func (s *service) CreateDisksLvm(ctx context.Context, node string, params *Creat
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateDisksLvm: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateDisksLvm: decode params: %w", err)
 		}
@@ -4451,7 +4527,9 @@ func (s *service) DeleteDisksLvm(ctx context.Context, node string, name string, 
 		if err != nil {
 			return nil, fmt.Errorf("nodes.DeleteDisksLvm: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.DeleteDisksLvm: decode params: %w", err)
 		}
@@ -4537,7 +4615,9 @@ func (s *service) CreateDisksLvmthin(ctx context.Context, node string, params *C
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateDisksLvmthin: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateDisksLvmthin: decode params: %w", err)
 		}
@@ -4590,7 +4670,9 @@ func (s *service) DeleteDisksLvmthin(ctx context.Context, node string, name stri
 		if err != nil {
 			return nil, fmt.Errorf("nodes.DeleteDisksLvmthin: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.DeleteDisksLvmthin: decode params: %w", err)
 		}
@@ -4646,7 +4728,9 @@ func (s *service) ListDisksSmart(ctx context.Context, node string, params *ListD
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListDisksSmart: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListDisksSmart: decode params: %w", err)
 		}
@@ -4694,7 +4778,9 @@ func (s *service) UpdateDisksWipedisk(ctx context.Context, node string, params *
 		if err != nil {
 			return nil, fmt.Errorf("nodes.UpdateDisksWipedisk: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.UpdateDisksWipedisk: decode params: %w", err)
 		}
@@ -4787,7 +4873,9 @@ func (s *service) CreateDisksZfs(ctx context.Context, node string, params *Creat
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateDisksZfs: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateDisksZfs: decode params: %w", err)
 		}
@@ -4838,7 +4926,9 @@ func (s *service) DeleteDisksZfs(ctx context.Context, node string, name string, 
 		if err != nil {
 			return nil, fmt.Errorf("nodes.DeleteDisksZfs: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.DeleteDisksZfs: decode params: %w", err)
 		}
@@ -4978,7 +5068,9 @@ func (s *service) UpdateDns(ctx context.Context, node string, params *UpdateDnsP
 		if err != nil {
 			return fmt.Errorf("nodes.UpdateDns: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("nodes.UpdateDns: decode params: %w", err)
 		}
@@ -5015,7 +5107,9 @@ func (s *service) CreateExecute(ctx context.Context, node string, params *Create
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateExecute: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateExecute: decode params: %w", err)
 		}
@@ -5101,7 +5195,9 @@ func (s *service) ListFirewallLog(ctx context.Context, node string, params *List
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListFirewallLog: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListFirewallLog: decode params: %w", err)
 		}
@@ -5258,7 +5354,9 @@ func (s *service) UpdateFirewallOptions(ctx context.Context, node string, params
 		if err != nil {
 			return fmt.Errorf("nodes.UpdateFirewallOptions: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("nodes.UpdateFirewallOptions: decode params: %w", err)
 		}
@@ -5353,7 +5451,9 @@ func (s *service) CreateFirewallRules(ctx context.Context, node string, params *
 		if err != nil {
 			return fmt.Errorf("nodes.CreateFirewallRules: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("nodes.CreateFirewallRules: decode params: %w", err)
 		}
@@ -5387,7 +5487,9 @@ func (s *service) DeleteFirewallRules(ctx context.Context, node string, pos stri
 		if err != nil {
 			return fmt.Errorf("nodes.DeleteFirewallRules: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("nodes.DeleteFirewallRules: decode params: %w", err)
 		}
@@ -5514,7 +5616,9 @@ func (s *service) UpdateFirewallRules(ctx context.Context, node string, pos stri
 		if err != nil {
 			return fmt.Errorf("nodes.UpdateFirewallRules: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("nodes.UpdateFirewallRules: decode params: %w", err)
 		}
@@ -5586,7 +5690,9 @@ func (s *service) ListHardwarePci(ctx context.Context, node string, params *List
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListHardwarePci: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListHardwarePci: decode params: %w", err)
 		}
@@ -5770,7 +5876,9 @@ func (s *service) CreateHosts(ctx context.Context, node string, params *CreateHo
 		if err != nil {
 			return fmt.Errorf("nodes.CreateHosts: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("nodes.CreateHosts: decode params: %w", err)
 		}
@@ -5815,7 +5923,9 @@ func (s *service) ListJournal(ctx context.Context, node string, params *ListJour
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListJournal: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListJournal: decode params: %w", err)
 		}
@@ -6074,7 +6184,9 @@ func (s *service) CreateLxc(ctx context.Context, node string, params *CreateLxcP
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateLxc: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateLxc: decode params: %w", err)
 		}
@@ -6127,7 +6239,9 @@ func (s *service) DeleteLxc(ctx context.Context, node string, vmid string, param
 		if err != nil {
 			return nil, fmt.Errorf("nodes.DeleteLxc: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.DeleteLxc: decode params: %w", err)
 		}
@@ -6225,7 +6339,9 @@ func (s *service) CreateLxcClone(ctx context.Context, node string, vmid string, 
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateLxcClone: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateLxcClone: decode params: %w", err)
 		}
@@ -6345,7 +6461,9 @@ func (s *service) ListLxcConfig(ctx context.Context, node string, vmid string, p
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListLxcConfig: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListLxcConfig: decode params: %w", err)
 		}
@@ -6547,7 +6665,9 @@ func (s *service) UpdateLxcConfig(ctx context.Context, node string, vmid string,
 		if err != nil {
 			return fmt.Errorf("nodes.UpdateLxcConfig: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("nodes.UpdateLxcConfig: decode params: %w", err)
 		}
@@ -6588,7 +6708,9 @@ func (s *service) ListLxcFeature(ctx context.Context, node string, vmid string, 
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListLxcFeature: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListLxcFeature: decode params: %w", err)
 		}
@@ -6702,7 +6824,9 @@ func (s *service) CreateLxcFirewallAliases(ctx context.Context, node string, vmi
 		if err != nil {
 			return fmt.Errorf("nodes.CreateLxcFirewallAliases: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("nodes.CreateLxcFirewallAliases: decode params: %w", err)
 		}
@@ -6736,7 +6860,9 @@ func (s *service) DeleteLxcFirewallAliases(ctx context.Context, node string, vmi
 		if err != nil {
 			return fmt.Errorf("nodes.DeleteLxcFirewallAliases: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("nodes.DeleteLxcFirewallAliases: decode params: %w", err)
 		}
@@ -6808,7 +6934,9 @@ func (s *service) UpdateLxcFirewallAliases(ctx context.Context, node string, vmi
 		if err != nil {
 			return fmt.Errorf("nodes.UpdateLxcFirewallAliases: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("nodes.UpdateLxcFirewallAliases: decode params: %w", err)
 		}
@@ -6880,7 +7008,9 @@ func (s *service) CreateLxcFirewallIpset(ctx context.Context, node string, vmid 
 		if err != nil {
 			return fmt.Errorf("nodes.CreateLxcFirewallIpset: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("nodes.CreateLxcFirewallIpset: decode params: %w", err)
 		}
@@ -6914,7 +7044,9 @@ func (s *service) DeleteLxcFirewallIpset(ctx context.Context, node string, vmid 
 		if err != nil {
 			return fmt.Errorf("nodes.DeleteLxcFirewallIpset: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("nodes.DeleteLxcFirewallIpset: decode params: %w", err)
 		}
@@ -6983,7 +7115,9 @@ func (s *service) CreateLxcFirewallIpset2(ctx context.Context, node string, vmid
 		if err != nil {
 			return fmt.Errorf("nodes.CreateLxcFirewallIpset2: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("nodes.CreateLxcFirewallIpset2: decode params: %w", err)
 		}
@@ -7017,7 +7151,9 @@ func (s *service) DeleteLxcFirewallIpset2(ctx context.Context, node string, vmid
 		if err != nil {
 			return fmt.Errorf("nodes.DeleteLxcFirewallIpset2: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("nodes.DeleteLxcFirewallIpset2: decode params: %w", err)
 		}
@@ -7086,7 +7222,9 @@ func (s *service) UpdateLxcFirewallIpset(ctx context.Context, node string, vmid 
 		if err != nil {
 			return fmt.Errorf("nodes.UpdateLxcFirewallIpset: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("nodes.UpdateLxcFirewallIpset: decode params: %w", err)
 		}
@@ -7127,7 +7265,9 @@ func (s *service) ListLxcFirewallLog(ctx context.Context, node string, vmid stri
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListLxcFirewallLog: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListLxcFirewallLog: decode params: %w", err)
 		}
@@ -7248,7 +7388,9 @@ func (s *service) UpdateLxcFirewallOptions(ctx context.Context, node string, vmi
 		if err != nil {
 			return fmt.Errorf("nodes.UpdateLxcFirewallOptions: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("nodes.UpdateLxcFirewallOptions: decode params: %w", err)
 		}
@@ -7285,7 +7427,9 @@ func (s *service) ListLxcFirewallRefs(ctx context.Context, node string, vmid str
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListLxcFirewallRefs: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListLxcFirewallRefs: decode params: %w", err)
 		}
@@ -7392,7 +7536,9 @@ func (s *service) CreateLxcFirewallRules(ctx context.Context, node string, vmid 
 		if err != nil {
 			return fmt.Errorf("nodes.CreateLxcFirewallRules: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("nodes.CreateLxcFirewallRules: decode params: %w", err)
 		}
@@ -7426,7 +7572,9 @@ func (s *service) DeleteLxcFirewallRules(ctx context.Context, node string, vmid 
 		if err != nil {
 			return fmt.Errorf("nodes.DeleteLxcFirewallRules: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("nodes.DeleteLxcFirewallRules: decode params: %w", err)
 		}
@@ -7553,7 +7701,9 @@ func (s *service) UpdateLxcFirewallRules(ctx context.Context, node string, vmid 
 		if err != nil {
 			return fmt.Errorf("nodes.UpdateLxcFirewallRules: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("nodes.UpdateLxcFirewallRules: decode params: %w", err)
 		}
@@ -7632,7 +7782,9 @@ func (s *service) ListLxcMigrate(ctx context.Context, node string, vmid string, 
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListLxcMigrate: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListLxcMigrate: decode params: %w", err)
 		}
@@ -7690,7 +7842,9 @@ func (s *service) CreateLxcMigrate(ctx context.Context, node string, vmid string
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateLxcMigrate: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateLxcMigrate: decode params: %w", err)
 		}
@@ -7753,7 +7907,9 @@ func (s *service) CreateLxcMoveVolume(ctx context.Context, node string, vmid str
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateLxcMoveVolume: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateLxcMoveVolume: decode params: %w", err)
 		}
@@ -7804,7 +7960,9 @@ func (s *service) CreateLxcMtunnel(ctx context.Context, node string, vmid string
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateLxcMtunnel: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateLxcMtunnel: decode params: %w", err)
 		}
@@ -7858,7 +8016,9 @@ func (s *service) ListLxcMtunnelwebsocket(ctx context.Context, node string, vmid
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListLxcMtunnelwebsocket: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListLxcMtunnelwebsocket: decode params: %w", err)
 		}
@@ -7955,7 +8115,9 @@ func (s *service) CreateLxcRemoteMigrate(ctx context.Context, node string, vmid 
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateLxcRemoteMigrate: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateLxcRemoteMigrate: decode params: %w", err)
 		}
@@ -8008,7 +8170,9 @@ func (s *service) UpdateLxcResize(ctx context.Context, node string, vmid string,
 		if err != nil {
 			return nil, fmt.Errorf("nodes.UpdateLxcResize: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.UpdateLxcResize: decode params: %w", err)
 		}
@@ -8063,7 +8227,9 @@ func (s *service) ListLxcRrd(ctx context.Context, node string, vmid string, para
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListLxcRrd: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListLxcRrd: decode params: %w", err)
 		}
@@ -8113,7 +8279,9 @@ func (s *service) ListLxcRrddata(ctx context.Context, node string, vmid string, 
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListLxcRrddata: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListLxcRrddata: decode params: %w", err)
 		}
@@ -8197,7 +8365,9 @@ func (s *service) CreateLxcSnapshot(ctx context.Context, node string, vmid strin
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateLxcSnapshot: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateLxcSnapshot: decode params: %w", err)
 		}
@@ -8246,7 +8416,9 @@ func (s *service) DeleteLxcSnapshot(ctx context.Context, node string, vmid strin
 		if err != nil {
 			return nil, fmt.Errorf("nodes.DeleteLxcSnapshot: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.DeleteLxcSnapshot: decode params: %w", err)
 		}
@@ -8358,7 +8530,9 @@ func (s *service) UpdateLxcSnapshotConfig(ctx context.Context, node string, vmid
 		if err != nil {
 			return fmt.Errorf("nodes.UpdateLxcSnapshotConfig: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("nodes.UpdateLxcSnapshotConfig: decode params: %w", err)
 		}
@@ -8395,7 +8569,9 @@ func (s *service) CreateLxcSnapshotRollback(ctx context.Context, node string, vm
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateLxcSnapshotRollback: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateLxcSnapshotRollback: decode params: %w", err)
 		}
@@ -8444,7 +8620,9 @@ func (s *service) CreateLxcSpiceproxy(ctx context.Context, node string, vmid str
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateLxcSpiceproxy: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateLxcSpiceproxy: decode params: %w", err)
 		}
@@ -8607,7 +8785,9 @@ func (s *service) CreateLxcStatusReboot(ctx context.Context, node string, vmid s
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateLxcStatusReboot: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateLxcStatusReboot: decode params: %w", err)
 		}
@@ -8691,7 +8871,9 @@ func (s *service) CreateLxcStatusShutdown(ctx context.Context, node string, vmid
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateLxcStatusShutdown: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateLxcStatusShutdown: decode params: %w", err)
 		}
@@ -8742,7 +8924,9 @@ func (s *service) CreateLxcStatusStart(ctx context.Context, node string, vmid st
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateLxcStatusStart: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateLxcStatusStart: decode params: %w", err)
 		}
@@ -8793,7 +8977,9 @@ func (s *service) CreateLxcStatusStop(ctx context.Context, node string, vmid str
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateLxcStatusStop: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateLxcStatusStop: decode params: %w", err)
 		}
@@ -8930,7 +9116,9 @@ func (s *service) CreateLxcVncproxy(ctx context.Context, node string, vmid strin
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateLxcVncproxy: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateLxcVncproxy: decode params: %w", err)
 		}
@@ -8983,7 +9171,9 @@ func (s *service) ListLxcVncwebsocket(ctx context.Context, node string, vmid str
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListLxcVncwebsocket: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListLxcVncwebsocket: decode params: %w", err)
 		}
@@ -9039,7 +9229,9 @@ func (s *service) CreateMigrateall(ctx context.Context, node string, params *Cre
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateMigrateall: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateMigrateall: decode params: %w", err)
 		}
@@ -9139,7 +9331,9 @@ func (s *service) ListNetwork(ctx context.Context, node string, params *ListNetw
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListNetwork: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListNetwork: decode params: %w", err)
 		}
@@ -9239,7 +9433,9 @@ func (s *service) CreateNetwork(ctx context.Context, node string, params *Create
 		if err != nil {
 			return fmt.Errorf("nodes.CreateNetwork: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("nodes.CreateNetwork: decode params: %w", err)
 		}
@@ -9276,7 +9472,9 @@ func (s *service) UpdateNetwork(ctx context.Context, node string, params *Update
 		if err != nil {
 			return nil, fmt.Errorf("nodes.UpdateNetwork: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.UpdateNetwork: decode params: %w", err)
 		}
@@ -9429,7 +9627,9 @@ func (s *service) UpdateNetwork2(ctx context.Context, node string, iface string,
 		if err != nil {
 			return fmt.Errorf("nodes.UpdateNetwork2: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("nodes.UpdateNetwork2: decode params: %w", err)
 		}
@@ -9466,7 +9666,9 @@ func (s *service) ListQemu(ctx context.Context, node string, params *ListQemuPar
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListQemu: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListQemu: decode params: %w", err)
 		}
@@ -9939,7 +10141,9 @@ func (s *service) CreateQemu(ctx context.Context, node string, params *CreateQem
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateQemu: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateQemu: decode params: %w", err)
 		}
@@ -9992,7 +10196,9 @@ func (s *service) DeleteQemu(ctx context.Context, node string, vmid string, para
 		if err != nil {
 			return nil, fmt.Errorf("nodes.DeleteQemu: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.DeleteQemu: decode params: %w", err)
 		}
@@ -10107,7 +10313,9 @@ func (s *service) CreateQemuAgent(ctx context.Context, node string, vmid string,
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateQemuAgent: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateQemuAgent: decode params: %w", err)
 		}
@@ -10161,7 +10369,9 @@ func (s *service) CreateQemuAgentExec(ctx context.Context, node string, vmid str
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateQemuAgentExec: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateQemuAgentExec: decode params: %w", err)
 		}
@@ -10224,7 +10434,9 @@ func (s *service) ListQemuAgentExecStatus(ctx context.Context, node string, vmid
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListQemuAgentExecStatus: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListQemuAgentExecStatus: decode params: %w", err)
 		}
@@ -10283,7 +10495,9 @@ func (s *service) ListQemuAgentFileRead(ctx context.Context, node string, vmid s
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListQemuAgentFileRead: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListQemuAgentFileRead: decode params: %w", err)
 		}
@@ -10332,7 +10546,9 @@ func (s *service) CreateQemuAgentFileWrite(ctx context.Context, node string, vmi
 		if err != nil {
 			return fmt.Errorf("nodes.CreateQemuAgentFileWrite: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("nodes.CreateQemuAgentFileWrite: decode params: %w", err)
 		}
@@ -10901,7 +11117,9 @@ func (s *service) CreateQemuAgentSetUserPassword(ctx context.Context, node strin
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateQemuAgentSetUserPassword: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateQemuAgentSetUserPassword: decode params: %w", err)
 		}
@@ -11100,7 +11318,9 @@ func (s *service) CreateQemuClone(ctx context.Context, node string, vmid string,
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateQemuClone: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateQemuClone: decode params: %w", err)
 		}
@@ -11200,7 +11420,9 @@ func (s *service) ListQemuCloudinitDump(ctx context.Context, node string, vmid s
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListQemuCloudinitDump: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListQemuCloudinitDump: decode params: %w", err)
 		}
@@ -11430,7 +11652,9 @@ func (s *service) ListQemuConfig(ctx context.Context, node string, vmid string, 
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListQemuConfig: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListQemuConfig: decode params: %w", err)
 		}
@@ -11894,7 +12118,9 @@ func (s *service) CreateQemuConfig(ctx context.Context, node string, vmid string
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateQemuConfig: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateQemuConfig: decode params: %w", err)
 		}
@@ -12352,7 +12578,9 @@ func (s *service) UpdateQemuConfig(ctx context.Context, node string, vmid string
 		if err != nil {
 			return fmt.Errorf("nodes.UpdateQemuConfig: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("nodes.UpdateQemuConfig: decode params: %w", err)
 		}
@@ -12386,7 +12614,9 @@ func (s *service) CreateQemuDbusVmstate(ctx context.Context, node string, vmid s
 		if err != nil {
 			return fmt.Errorf("nodes.CreateQemuDbusVmstate: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("nodes.CreateQemuDbusVmstate: decode params: %w", err)
 		}
@@ -12428,7 +12658,9 @@ func (s *service) ListQemuFeature(ctx context.Context, node string, vmid string,
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListQemuFeature: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListQemuFeature: decode params: %w", err)
 		}
@@ -12542,7 +12774,9 @@ func (s *service) CreateQemuFirewallAliases(ctx context.Context, node string, vm
 		if err != nil {
 			return fmt.Errorf("nodes.CreateQemuFirewallAliases: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("nodes.CreateQemuFirewallAliases: decode params: %w", err)
 		}
@@ -12576,7 +12810,9 @@ func (s *service) DeleteQemuFirewallAliases(ctx context.Context, node string, vm
 		if err != nil {
 			return fmt.Errorf("nodes.DeleteQemuFirewallAliases: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("nodes.DeleteQemuFirewallAliases: decode params: %w", err)
 		}
@@ -12648,7 +12884,9 @@ func (s *service) UpdateQemuFirewallAliases(ctx context.Context, node string, vm
 		if err != nil {
 			return fmt.Errorf("nodes.UpdateQemuFirewallAliases: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("nodes.UpdateQemuFirewallAliases: decode params: %w", err)
 		}
@@ -12720,7 +12958,9 @@ func (s *service) CreateQemuFirewallIpset(ctx context.Context, node string, vmid
 		if err != nil {
 			return fmt.Errorf("nodes.CreateQemuFirewallIpset: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("nodes.CreateQemuFirewallIpset: decode params: %w", err)
 		}
@@ -12754,7 +12994,9 @@ func (s *service) DeleteQemuFirewallIpset(ctx context.Context, node string, vmid
 		if err != nil {
 			return fmt.Errorf("nodes.DeleteQemuFirewallIpset: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("nodes.DeleteQemuFirewallIpset: decode params: %w", err)
 		}
@@ -12823,7 +13065,9 @@ func (s *service) CreateQemuFirewallIpset2(ctx context.Context, node string, vmi
 		if err != nil {
 			return fmt.Errorf("nodes.CreateQemuFirewallIpset2: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("nodes.CreateQemuFirewallIpset2: decode params: %w", err)
 		}
@@ -12857,7 +13101,9 @@ func (s *service) DeleteQemuFirewallIpset2(ctx context.Context, node string, vmi
 		if err != nil {
 			return fmt.Errorf("nodes.DeleteQemuFirewallIpset2: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("nodes.DeleteQemuFirewallIpset2: decode params: %w", err)
 		}
@@ -12926,7 +13172,9 @@ func (s *service) UpdateQemuFirewallIpset(ctx context.Context, node string, vmid
 		if err != nil {
 			return fmt.Errorf("nodes.UpdateQemuFirewallIpset: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("nodes.UpdateQemuFirewallIpset: decode params: %w", err)
 		}
@@ -12967,7 +13215,9 @@ func (s *service) ListQemuFirewallLog(ctx context.Context, node string, vmid str
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListQemuFirewallLog: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListQemuFirewallLog: decode params: %w", err)
 		}
@@ -13088,7 +13338,9 @@ func (s *service) UpdateQemuFirewallOptions(ctx context.Context, node string, vm
 		if err != nil {
 			return fmt.Errorf("nodes.UpdateQemuFirewallOptions: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("nodes.UpdateQemuFirewallOptions: decode params: %w", err)
 		}
@@ -13125,7 +13377,9 @@ func (s *service) ListQemuFirewallRefs(ctx context.Context, node string, vmid st
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListQemuFirewallRefs: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListQemuFirewallRefs: decode params: %w", err)
 		}
@@ -13232,7 +13486,9 @@ func (s *service) CreateQemuFirewallRules(ctx context.Context, node string, vmid
 		if err != nil {
 			return fmt.Errorf("nodes.CreateQemuFirewallRules: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("nodes.CreateQemuFirewallRules: decode params: %w", err)
 		}
@@ -13266,7 +13522,9 @@ func (s *service) DeleteQemuFirewallRules(ctx context.Context, node string, vmid
 		if err != nil {
 			return fmt.Errorf("nodes.DeleteQemuFirewallRules: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("nodes.DeleteQemuFirewallRules: decode params: %w", err)
 		}
@@ -13393,7 +13651,9 @@ func (s *service) UpdateQemuFirewallRules(ctx context.Context, node string, vmid
 		if err != nil {
 			return fmt.Errorf("nodes.UpdateQemuFirewallRules: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("nodes.UpdateQemuFirewallRules: decode params: %w", err)
 		}
@@ -13449,7 +13709,9 @@ func (s *service) ListQemuMigrate(ctx context.Context, node string, vmid string,
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListQemuMigrate: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListQemuMigrate: decode params: %w", err)
 		}
@@ -13513,7 +13775,9 @@ func (s *service) CreateQemuMigrate(ctx context.Context, node string, vmid strin
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateQemuMigrate: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateQemuMigrate: decode params: %w", err)
 		}
@@ -13562,7 +13826,9 @@ func (s *service) CreateQemuMonitor(ctx context.Context, node string, vmid strin
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateQemuMonitor: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateQemuMonitor: decode params: %w", err)
 		}
@@ -13627,7 +13893,9 @@ func (s *service) CreateQemuMoveDisk(ctx context.Context, node string, vmid stri
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateQemuMoveDisk: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateQemuMoveDisk: decode params: %w", err)
 		}
@@ -13678,7 +13946,9 @@ func (s *service) CreateQemuMtunnel(ctx context.Context, node string, vmid strin
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateQemuMtunnel: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateQemuMtunnel: decode params: %w", err)
 		}
@@ -13732,7 +14002,9 @@ func (s *service) ListQemuMtunnelwebsocket(ctx context.Context, node string, vmi
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListQemuMtunnelwebsocket: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListQemuMtunnelwebsocket: decode params: %w", err)
 		}
@@ -13825,7 +14097,9 @@ func (s *service) CreateQemuRemoteMigrate(ctx context.Context, node string, vmid
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateQemuRemoteMigrate: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateQemuRemoteMigrate: decode params: %w", err)
 		}
@@ -13880,7 +14154,9 @@ func (s *service) UpdateQemuResize(ctx context.Context, node string, vmid string
 		if err != nil {
 			return nil, fmt.Errorf("nodes.UpdateQemuResize: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.UpdateQemuResize: decode params: %w", err)
 		}
@@ -13935,7 +14211,9 @@ func (s *service) ListQemuRrd(ctx context.Context, node string, vmid string, par
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListQemuRrd: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListQemuRrd: decode params: %w", err)
 		}
@@ -13985,7 +14263,9 @@ func (s *service) ListQemuRrddata(ctx context.Context, node string, vmid string,
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListQemuRrddata: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListQemuRrddata: decode params: %w", err)
 		}
@@ -14033,7 +14313,9 @@ func (s *service) UpdateQemuSendkey(ctx context.Context, node string, vmid strin
 		if err != nil {
 			return fmt.Errorf("nodes.UpdateQemuSendkey: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("nodes.UpdateQemuSendkey: decode params: %w", err)
 		}
@@ -14107,7 +14389,9 @@ func (s *service) CreateQemuSnapshot(ctx context.Context, node string, vmid stri
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateQemuSnapshot: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateQemuSnapshot: decode params: %w", err)
 		}
@@ -14156,7 +14440,9 @@ func (s *service) DeleteQemuSnapshot(ctx context.Context, node string, vmid stri
 		if err != nil {
 			return nil, fmt.Errorf("nodes.DeleteQemuSnapshot: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.DeleteQemuSnapshot: decode params: %w", err)
 		}
@@ -14268,7 +14554,9 @@ func (s *service) UpdateQemuSnapshotConfig(ctx context.Context, node string, vmi
 		if err != nil {
 			return fmt.Errorf("nodes.UpdateQemuSnapshotConfig: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("nodes.UpdateQemuSnapshotConfig: decode params: %w", err)
 		}
@@ -14305,7 +14593,9 @@ func (s *service) CreateQemuSnapshotRollback(ctx context.Context, node string, v
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateQemuSnapshotRollback: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateQemuSnapshotRollback: decode params: %w", err)
 		}
@@ -14354,7 +14644,9 @@ func (s *service) CreateQemuSpiceproxy(ctx context.Context, node string, vmid st
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateQemuSpiceproxy: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateQemuSpiceproxy: decode params: %w", err)
 		}
@@ -14533,7 +14825,9 @@ func (s *service) CreateQemuStatusReboot(ctx context.Context, node string, vmid 
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateQemuStatusReboot: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateQemuStatusReboot: decode params: %w", err)
 		}
@@ -14582,7 +14876,9 @@ func (s *service) CreateQemuStatusReset(ctx context.Context, node string, vmid s
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateQemuStatusReset: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateQemuStatusReset: decode params: %w", err)
 		}
@@ -14632,7 +14928,9 @@ func (s *service) CreateQemuStatusResume(ctx context.Context, node string, vmid 
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateQemuStatusResume: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateQemuStatusResume: decode params: %w", err)
 		}
@@ -14687,7 +14985,9 @@ func (s *service) CreateQemuStatusShutdown(ctx context.Context, node string, vmi
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateQemuStatusShutdown: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateQemuStatusShutdown: decode params: %w", err)
 		}
@@ -14756,7 +15056,9 @@ func (s *service) CreateQemuStatusStart(ctx context.Context, node string, vmid s
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateQemuStatusStart: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateQemuStatusStart: decode params: %w", err)
 		}
@@ -14813,7 +15115,9 @@ func (s *service) CreateQemuStatusStop(ctx context.Context, node string, vmid st
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateQemuStatusStop: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateQemuStatusStop: decode params: %w", err)
 		}
@@ -14866,7 +15170,9 @@ func (s *service) CreateQemuStatusSuspend(ctx context.Context, node string, vmid
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateQemuStatusSuspend: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateQemuStatusSuspend: decode params: %w", err)
 		}
@@ -14915,7 +15221,9 @@ func (s *service) CreateQemuTemplate(ctx context.Context, node string, vmid stri
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateQemuTemplate: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateQemuTemplate: decode params: %w", err)
 		}
@@ -14964,7 +15272,9 @@ func (s *service) CreateQemuTermproxy(ctx context.Context, node string, vmid str
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateQemuTermproxy: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateQemuTermproxy: decode params: %w", err)
 		}
@@ -15012,7 +15322,9 @@ func (s *service) UpdateQemuUnlink(ctx context.Context, node string, vmid string
 		if err != nil {
 			return fmt.Errorf("nodes.UpdateQemuUnlink: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("nodes.UpdateQemuUnlink: decode params: %w", err)
 		}
@@ -15051,7 +15363,9 @@ func (s *service) CreateQemuVncproxy(ctx context.Context, node string, vmid stri
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateQemuVncproxy: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateQemuVncproxy: decode params: %w", err)
 		}
@@ -15104,7 +15418,9 @@ func (s *service) ListQemuVncwebsocket(ctx context.Context, node string, vmid st
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListQemuVncwebsocket: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListQemuVncwebsocket: decode params: %w", err)
 		}
@@ -15152,7 +15468,9 @@ func (s *service) ListQueryOciRepoTags(ctx context.Context, node string, params 
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListQueryOciRepoTags: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListQueryOciRepoTags: decode params: %w", err)
 		}
@@ -15207,7 +15525,9 @@ func (s *service) ListQueryUrlMetadata(ctx context.Context, node string, params 
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListQueryUrlMetadata: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListQueryUrlMetadata: decode params: %w", err)
 		}
@@ -15255,7 +15575,9 @@ func (s *service) ListReplication(ctx context.Context, node string, params *List
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListReplication: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListReplication: decode params: %w", err)
 		}
@@ -15337,7 +15659,9 @@ func (s *service) ListReplicationLog(ctx context.Context, node string, id string
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListReplicationLog: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListReplicationLog: decode params: %w", err)
 		}
@@ -15491,7 +15815,9 @@ func (s *service) ListRrd(ctx context.Context, node string, params *ListRrdParam
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListRrd: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListRrd: decode params: %w", err)
 		}
@@ -15541,7 +15867,9 @@ func (s *service) ListRrddata(ctx context.Context, node string, params *ListRrdd
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListRrddata: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListRrddata: decode params: %w", err)
 		}
@@ -15629,7 +15957,9 @@ func (s *service) ListScanCifs(ctx context.Context, node string, params *ListSca
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListScanCifs: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListScanCifs: decode params: %w", err)
 		}
@@ -15678,7 +16008,9 @@ func (s *service) ListScanIscsi(ctx context.Context, node string, params *ListSc
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListScanIscsi: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListScanIscsi: decode params: %w", err)
 		}
@@ -15759,7 +16091,9 @@ func (s *service) ListScanLvmthin(ctx context.Context, node string, params *List
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListScanLvmthin: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListScanLvmthin: decode params: %w", err)
 		}
@@ -15808,7 +16142,9 @@ func (s *service) ListScanNfs(ctx context.Context, node string, params *ListScan
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListScanNfs: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListScanNfs: decode params: %w", err)
 		}
@@ -15865,7 +16201,9 @@ func (s *service) ListScanPbs(ctx context.Context, node string, params *ListScan
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListScanPbs: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListScanPbs: decode params: %w", err)
 		}
@@ -16590,7 +16928,9 @@ func (s *service) CreateSpiceshell(ctx context.Context, node string, params *Cre
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateSpiceshell: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateSpiceshell: decode params: %w", err)
 		}
@@ -16643,7 +16983,9 @@ func (s *service) CreateStartall(ctx context.Context, node string, params *Creat
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateStartall: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateStartall: decode params: %w", err)
 		}
@@ -16735,7 +17077,9 @@ func (s *service) CreateStatus(ctx context.Context, node string, params *CreateS
 		if err != nil {
 			return fmt.Errorf("nodes.CreateStatus: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("nodes.CreateStatus: decode params: %w", err)
 		}
@@ -16778,7 +17122,9 @@ func (s *service) CreateStopall(ctx context.Context, node string, params *Create
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateStopall: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateStopall: decode params: %w", err)
 		}
@@ -16835,7 +17181,9 @@ func (s *service) ListStorage(ctx context.Context, node string, params *ListStor
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListStorage: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListStorage: decode params: %w", err)
 		}
@@ -16919,7 +17267,9 @@ func (s *service) ListStorageContent(ctx context.Context, node string, storage s
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListStorageContent: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListStorageContent: decode params: %w", err)
 		}
@@ -16974,7 +17324,9 @@ func (s *service) CreateStorageContent(ctx context.Context, node string, storage
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateStorageContent: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateStorageContent: decode params: %w", err)
 		}
@@ -17023,7 +17375,9 @@ func (s *service) DeleteStorageContent(ctx context.Context, node string, storage
 		if err != nil {
 			return nil, fmt.Errorf("nodes.DeleteStorageContent: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.DeleteStorageContent: decode params: %w", err)
 		}
@@ -17119,7 +17473,9 @@ func (s *service) CreateStorageContent2(ctx context.Context, node string, storag
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateStorageContent2: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateStorageContent2: decode params: %w", err)
 		}
@@ -17167,7 +17523,9 @@ func (s *service) UpdateStorageContent(ctx context.Context, node string, storage
 		if err != nil {
 			return fmt.Errorf("nodes.UpdateStorageContent: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("nodes.UpdateStorageContent: decode params: %w", err)
 		}
@@ -17216,7 +17574,9 @@ func (s *service) CreateStorageDownloadUrl(ctx context.Context, node string, sto
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateStorageDownloadUrl: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateStorageDownloadUrl: decode params: %w", err)
 		}
@@ -17269,7 +17629,9 @@ func (s *service) ListStorageFileRestoreDownload(ctx context.Context, node strin
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListStorageFileRestoreDownload: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListStorageFileRestoreDownload: decode params: %w", err)
 		}
@@ -17320,7 +17682,9 @@ func (s *service) ListStorageFileRestoreList(ctx context.Context, node string, s
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListStorageFileRestoreList: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListStorageFileRestoreList: decode params: %w", err)
 		}
@@ -17419,7 +17783,9 @@ func (s *service) ListStorageImportMetadata(ctx context.Context, node string, st
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListStorageImportMetadata: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListStorageImportMetadata: decode params: %w", err)
 		}
@@ -17469,7 +17835,9 @@ func (s *service) CreateStorageOciRegistryPull(ctx context.Context, node string,
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateStorageOciRegistryPull: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateStorageOciRegistryPull: decode params: %w", err)
 		}
@@ -17522,7 +17890,9 @@ func (s *service) DeleteStoragePrunebackups(ctx context.Context, node string, st
 		if err != nil {
 			return nil, fmt.Errorf("nodes.DeleteStoragePrunebackups: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.DeleteStoragePrunebackups: decode params: %w", err)
 		}
@@ -17575,7 +17945,9 @@ func (s *service) ListStoragePrunebackups(ctx context.Context, node string, stor
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListStoragePrunebackups: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListStoragePrunebackups: decode params: %w", err)
 		}
@@ -17630,7 +18002,9 @@ func (s *service) ListStorageRrd(ctx context.Context, node string, storage strin
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListStorageRrd: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListStorageRrd: decode params: %w", err)
 		}
@@ -17680,7 +18054,9 @@ func (s *service) ListStorageRrddata(ctx context.Context, node string, storage s
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListStorageRrddata: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListStorageRrddata: decode params: %w", err)
 		}
@@ -17786,7 +18162,9 @@ func (s *service) CreateStorageUpload(ctx context.Context, node string, storage 
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateStorageUpload: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateStorageUpload: decode params: %w", err)
 		}
@@ -17907,7 +18285,9 @@ func (s *service) CreateSubscription(ctx context.Context, node string, params *C
 		if err != nil {
 			return fmt.Errorf("nodes.CreateSubscription: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("nodes.CreateSubscription: decode params: %w", err)
 		}
@@ -17941,7 +18321,9 @@ func (s *service) UpdateSubscription(ctx context.Context, node string, params *U
 		if err != nil {
 			return fmt.Errorf("nodes.UpdateSubscription: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("nodes.UpdateSubscription: decode params: %w", err)
 		}
@@ -17980,7 +18362,9 @@ func (s *service) CreateSuspendall(ctx context.Context, node string, params *Cre
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateSuspendall: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateSuspendall: decode params: %w", err)
 		}
@@ -18035,7 +18419,9 @@ func (s *service) ListSyslog(ctx context.Context, node string, params *ListSyslo
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListSyslog: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListSyslog: decode params: %w", err)
 		}
@@ -18102,7 +18488,9 @@ func (s *service) ListTasks(ctx context.Context, node string, params *ListTasksP
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListTasks: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListTasks: decode params: %w", err)
 		}
@@ -18206,7 +18594,9 @@ func (s *service) ListTasksLog(ctx context.Context, node string, upid string, pa
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListTasksLog: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListTasksLog: decode params: %w", err)
 		}
@@ -18300,7 +18690,9 @@ func (s *service) CreateTermproxy(ctx context.Context, node string, params *Crea
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateTermproxy: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateTermproxy: decode params: %w", err)
 		}
@@ -18385,7 +18777,9 @@ func (s *service) UpdateTime(ctx context.Context, node string, params *UpdateTim
 		if err != nil {
 			return fmt.Errorf("nodes.UpdateTime: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("nodes.UpdateTime: decode params: %w", err)
 		}
@@ -18469,7 +18863,9 @@ func (s *service) CreateVncshell(ctx context.Context, node string, params *Creat
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateVncshell: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateVncshell: decode params: %w", err)
 		}
@@ -18522,7 +18918,9 @@ func (s *service) ListVncwebsocket(ctx context.Context, node string, params *Lis
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListVncwebsocket: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListVncwebsocket: decode params: %w", err)
 		}
@@ -18632,7 +19030,9 @@ func (s *service) CreateVzdump(ctx context.Context, node string, params *CreateV
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateVzdump: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.CreateVzdump: decode params: %w", err)
 		}
@@ -18744,7 +19144,9 @@ func (s *service) ListVzdumpDefaults(ctx context.Context, node string, params *L
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListVzdumpDefaults: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListVzdumpDefaults: decode params: %w", err)
 		}
@@ -18792,7 +19194,9 @@ func (s *service) ListVzdumpExtractconfig(ctx context.Context, node string, para
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListVzdumpExtractconfig: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("nodes.ListVzdumpExtractconfig: decode params: %w", err)
 		}

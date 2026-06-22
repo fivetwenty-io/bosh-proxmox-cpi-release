@@ -1,6 +1,7 @@
 package http
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"reflect"
@@ -13,6 +14,8 @@ import (
 // encoding rules:
 //
 //   - bool            → "1" / "0"
+//   - json.Number     → its exact source text (no float rounding/exponent)
+//   - float64/float32 → decimal notation, never scientific (e.g. 1048576 not 1.048576e+06)
 //   - []T (any slice) → repeated key entries, one per element (each element
 //     recursively encoded via encodeSingleValue)
 //   - map[string]any  → Proxmox comma-separated key=value string
@@ -39,15 +42,9 @@ func addEncodedParam(dst url.Values, key string, val interface{}) {
 		return
 	}
 
-	// Dereference pointer via reflection; omit nil pointers.
-	refVal := reflect.ValueOf(val)
-	for refVal.Kind() == reflect.Pointer {
-		if refVal.IsNil() {
-			return
-		}
-
-		refVal = refVal.Elem()
-		val = refVal.Interface()
+	val, refVal, ok := derefNonNil(val)
+	if !ok {
+		return // nil pointer: key omitted
 	}
 
 	// Dispatch on concrete type first (fast path for common cases).
@@ -58,6 +55,13 @@ func addEncodedParam(dst url.Values, key string, val interface{}) {
 		} else {
 			dst.Add(key, "0")
 		}
+
+		return
+
+	case json.Number, float64, float32:
+		// Decimal digits only: PVE rejects scientific notation, so 1048576
+		// must stay "1048576", never "1.048576e+06" (see encodeSingleValue).
+		dst.Add(key, encodeSingleValue(val))
 
 		return
 
@@ -89,16 +93,38 @@ func addEncodedParam(dst url.Values, key string, val interface{}) {
 
 	// Slice handling via reflection (covers []string, []int, []any, etc.).
 	if refVal.Kind() == reflect.Slice {
-		for i := range refVal.Len() {
-			elem := refVal.Index(i).Interface()
-			dst.Add(key, encodeSingleValue(elem))
-		}
+		addSliceParam(dst, key, refVal)
 
 		return
 	}
 
 	// Default: Sprintf.
 	dst.Add(key, fmt.Sprintf("%v", val))
+}
+
+// addSliceParam adds one repeated entry per slice element, each stringified via
+// encodeSingleValue (covers []string, []int, []any, etc.).
+func addSliceParam(dst url.Values, key string, refVal reflect.Value) {
+	for i := range refVal.Len() {
+		dst.Add(key, encodeSingleValue(refVal.Index(i).Interface()))
+	}
+}
+
+// derefNonNil unwraps pointer chains to the underlying value. The bool is false
+// when a nil pointer is encountered (the caller should omit the key); otherwise
+// it returns the dereferenced value and its reflect.Value.
+func derefNonNil(val interface{}) (interface{}, reflect.Value, bool) {
+	refVal := reflect.ValueOf(val)
+	for refVal.Kind() == reflect.Pointer {
+		if refVal.IsNil() {
+			return nil, refVal, false
+		}
+
+		refVal = refVal.Elem()
+		val = refVal.Interface()
+	}
+
+	return val, refVal, true
 }
 
 // encodeSingleValue converts a single non-slice, non-map value to a string.
@@ -115,6 +141,15 @@ func encodeSingleValue(val interface{}) string {
 		}
 
 		return "0"
+
+	case json.Number:
+		return typedVal.String()
+
+	case float64:
+		return strconv.FormatFloat(typedVal, 'f', -1, 64)
+
+	case float32:
+		return strconv.FormatFloat(float64(typedVal), 'f', -1, 32)
 
 	case time.Time:
 		return strconv.FormatInt(typedVal.Unix(), 10)

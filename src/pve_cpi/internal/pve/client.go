@@ -321,9 +321,8 @@ func NewClient(cfg *config.CPIConfig, logger *log.Logger) (Client, error) {
 	// applyCustomHeaders runs after standard headers, so SetHeader overrides
 	// the SDK default "pve-apiclient-go/1.0". Both request paths (regular and
 	// upload) call applyCustomHeaders, so a single SetHeader covers all calls.
-	// NOTE: SetHeader is a LOCAL EDIT to vendor/github.com/fivetwenty-io/
-	// pve-apiclient-go/v3/pkg/client/client.go (upstream v3.2.7 lacks it).
-	// After go mod vendor, re-apply the patch documented at the top of that file.
+	// SetHeader is part of the public client.Client interface as of upstream
+	// v3.2.10, so no vendor patch is required.
 	raw.SetHeader("User-Agent", buildUserAgent(cfg))
 
 	return &sdkClient{

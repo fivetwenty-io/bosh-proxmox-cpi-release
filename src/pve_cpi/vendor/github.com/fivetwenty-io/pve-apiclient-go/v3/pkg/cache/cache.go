@@ -88,6 +88,7 @@ type Cache struct {
 	size        int64
 	mu          sync.RWMutex
 	stopCleanup chan struct{}
+	stopOnce    sync.Once
 
 	// Metrics
 	hits      int64
@@ -261,9 +262,11 @@ type CacheStats struct {
 	Entries   int64
 }
 
-// Close stops background cleanup.
+// Close stops background cleanup. It is safe to call more than once.
 func (c *Cache) Close() {
-	close(c.stopCleanup)
+	c.stopOnce.Do(func() {
+		close(c.stopCleanup)
+	})
 }
 
 // Private methods

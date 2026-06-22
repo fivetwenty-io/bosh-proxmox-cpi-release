@@ -29,6 +29,7 @@ func (b PVEBool) MarshalJSON() ([]byte, error) {
 	if b {
 		return []byte("true"), nil
 	}
+
 	return []byte("false"), nil
 }
 
@@ -49,29 +50,40 @@ func (b *PVEBool) UnmarshalJSON(data []byte) error {
 	// JSON boolean.
 	if bytes.Equal(data, []byte("true")) {
 		*b = true
+
 		return nil
 	}
+
 	if bytes.Equal(data, []byte("false")) {
 		*b = false
+
 		return nil
 	}
 
 	// JSON string: decode then interpret the inner token.
 	if data[0] == '"' {
 		var s string
-		if err := json.Unmarshal(data, &s); err != nil {
+
+		err := json.Unmarshal(data, &s)
+		if err != nil {
 			return fmt.Errorf("pve bool: decode string: %w", err)
 		}
+
 		*b = PVEBool(parseLooseBool(s))
+
 		return nil
 	}
 
 	// JSON number: 0 is false, anything else is true.
 	var n float64
-	if err := json.Unmarshal(data, &n); err != nil {
+
+	err := json.Unmarshal(data, &n)
+	if err != nil {
 		return fmt.Errorf("pve bool: unsupported JSON value %s: %w", string(data), err)
 	}
+
 	*b = PVEBool(n != 0)
+
 	return nil
 }
 
@@ -85,9 +97,11 @@ func parseLooseBool(s string) bool {
 	case "1", "true", "yes", "on":
 		return true
 	default:
-		if n, err := strconv.ParseFloat(trimmed, 64); err == nil {
+		n, err := strconv.ParseFloat(trimmed, floatBitSize)
+		if err == nil {
 			return n != 0
 		}
+
 		return true
 	}
 }
@@ -96,21 +110,26 @@ func parseLooseBool(s string) bool {
 // letters without pulling in strings/unicode for this hot, tiny path.
 func trimASCIISpaceLower(s string) string {
 	start := 0
+
 	end := len(s)
 	for start < end && isASCIISpace(s[start]) {
 		start++
 	}
+
 	for end > start && isASCIISpace(s[end-1]) {
 		end--
 	}
+
 	out := make([]byte, end-start)
 	for i := start; i < end; i++ {
 		c := s[i]
 		if c >= 'A' && c <= 'Z' {
 			c += 'a' - 'A'
 		}
+
 		out[i-start] = c
 	}
+
 	return string(out)
 }
 

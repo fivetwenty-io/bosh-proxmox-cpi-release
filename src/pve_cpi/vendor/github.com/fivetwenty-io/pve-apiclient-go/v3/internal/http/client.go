@@ -152,9 +152,11 @@ func createHTTPTransport(options *Options) *http.Transport {
 		if options.DialTimeoutSec > 0 {
 			dialer.Timeout = time.Duration(options.DialTimeoutSec) * time.Second
 		}
+
 		if options.TCPKeepAliveSec > 0 {
 			dialer.KeepAlive = time.Duration(options.TCPKeepAliveSec) * time.Second
 		}
+
 		t.DialContext = dialer.DialContext
 	}
 
@@ -556,6 +558,22 @@ func (c *Client) Logout() error {
 	return nil
 }
 
+// Close releases resources held by the client: it stops the response-cache
+// cleanup goroutine (if caching is enabled) and closes idle HTTP connections.
+// It is safe to call Close more than once. After Close the client should not
+// be used for further requests.
+func (c *Client) Close() error {
+	if c.cache != nil {
+		c.cache.Close()
+	}
+
+	if c.httpClient != nil {
+		c.httpClient.CloseIdleConnections()
+	}
+
+	return nil
+}
+
 // InvalidateCache removes cache entries matching the given pattern.
 // Pattern supports wildcard (*) at the end, e.g., "/nodes/*" invalidates all node paths.
 // Returns the number of entries invalidated.
@@ -927,6 +945,16 @@ func (c *Client) handleAuthenticationRetry(req *http.Request, resp *http.Respons
 		return resp, nil
 	}
 
+	// Static-credential authenticators (API tokens, or the invalid
+	// authenticator standing in for a misconfiguration) cannot obtain fresh
+	// credentials. A 401 means the credentials themselves are rejected, so
+	// retrying would replay the same value and 401 again — and routing through
+	// Refresh() would mask the real 401 behind a synthetic re-auth error.
+	// Surface the original 401 response to the caller untouched.
+	if !canReauthenticate(c.authenticator) {
+		return resp, nil
+	}
+
 	// Close the response body
 	_ = resp.Body.Close()
 
@@ -957,6 +985,16 @@ func (c *Client) handleAuthenticationRetry(req *http.Request, resp *http.Respons
 
 	// Retry the request exactly once with refreshed credentials.
 	return next(req)
+}
+
+// canReauthenticate reports whether the authenticator can obtain fresh
+// credentials after a 401. Ticket authentication can re-login; static API
+// tokens and the invalid (misconfigured) authenticator cannot, so retrying a
+// 401 with them only replays rejected credentials.
+func canReauthenticate(a auth.Authenticator) bool {
+	_, ok := a.(*auth.TicketAuthenticator)
+
+	return ok
 }
 
 // forceReauthenticate re-establishes credentials after a 401. For ticket-based

@@ -120,9 +120,19 @@ func (c *Client) logRequest(req *http.Request, msg string, extra map[string]inte
 	c.logger.Info(msg, fields)
 }
 
-func (c *Client) fireHook(ev *Event) {
-	for _, h := range c.hooks {
-		// hooks are best-effort and should not panic or block
-		func(h Hook) { defer func() { _ = recover() }(); h(ev) }(h)
+func (c *Client) fireHook(event *Event) {
+	for _, hook := range c.hooks {
+		// Hooks are best-effort and must not panic or block. Recover so one
+		// misbehaving hook cannot crash the request path, but surface the panic
+		// at Warn instead of swallowing it silently.
+		func(hook Hook) {
+			defer func() {
+				if r := recover(); r != nil && c.logger != nil {
+					c.logger.Warn("log hook panicked", map[string]interface{}{"panic": r})
+				}
+			}()
+
+			hook(event)
+		}(hook)
 	}
 }

@@ -75,7 +75,9 @@ func (s *service) ListStorage(ctx context.Context, params *ListStorageParams) (*
 		if err != nil {
 			return nil, fmt.Errorf("clusterstorage.ListStorage: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("clusterstorage.ListStorage: decode params: %w", err)
 		}
@@ -251,7 +253,9 @@ func (s *service) CreateStorage(ctx context.Context, params *CreateStorageParams
 		if err != nil {
 			return nil, fmt.Errorf("clusterstorage.CreateStorage: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("clusterstorage.CreateStorage: decode params: %w", err)
 		}
@@ -455,7 +459,9 @@ func (s *service) UpdateStorage(ctx context.Context, storage string, params *Upd
 		if err != nil {
 			return nil, fmt.Errorf("clusterstorage.UpdateStorage: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("clusterstorage.UpdateStorage: decode params: %w", err)
 		}

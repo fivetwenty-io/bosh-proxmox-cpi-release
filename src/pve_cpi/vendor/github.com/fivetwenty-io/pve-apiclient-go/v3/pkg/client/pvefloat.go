@@ -8,6 +8,10 @@ import (
 	"strconv"
 )
 
+// floatBitSize is the bit size passed to strconv float routines: PVE numeric
+// fields are 64-bit floats.
+const floatBitSize = 64
+
 // PVEFloat is a floating-point number that tolerates the JSON encodings the
 // Proxmox VE API uses for numeric values. As with booleans, the Perl-based API
 // is inconsistent about how it renders numbers in responses: a value documented
@@ -30,7 +34,8 @@ func (f PVEFloat) MarshalJSON() ([]byte, error) {
 	if math.IsNaN(v) || math.IsInf(v, 0) {
 		return []byte("0"), nil
 	}
-	return strconv.AppendFloat(nil, v, 'g', -1, 64), nil
+
+	return strconv.AppendFloat(nil, v, 'g', -1, floatBitSize), nil
 }
 
 // UnmarshalJSON accepts the numeric and string encodings PVE emits.
@@ -47,19 +52,27 @@ func (f *PVEFloat) UnmarshalJSON(data []byte) error {
 	// JSON string: decode then parse the inner token.
 	if data[0] == '"' {
 		var s string
-		if err := json.Unmarshal(data, &s); err != nil {
+
+		err := json.Unmarshal(data, &s)
+		if err != nil {
 			return fmt.Errorf("pve float: decode string: %w", err)
 		}
+
 		*f = PVEFloat(parseLooseFloat(s))
+
 		return nil
 	}
 
 	// JSON number.
 	var n float64
-	if err := json.Unmarshal(data, &n); err != nil {
+
+	err := json.Unmarshal(data, &n)
+	if err != nil {
 		return fmt.Errorf("pve float: unsupported JSON value %s: %w", string(data), err)
 	}
+
 	*f = PVEFloat(n)
+
 	return nil
 }
 
@@ -70,8 +83,11 @@ func parseLooseFloat(s string) float64 {
 	if trimmed == "" {
 		return 0
 	}
-	if n, err := strconv.ParseFloat(trimmed, 64); err == nil {
+
+	n, err := strconv.ParseFloat(trimmed, floatBitSize)
+	if err == nil {
 		return n
 	}
+
 	return 0
 }

@@ -236,7 +236,7 @@ func PromptPassword(prompt string) (string, error) {
 	// Read password without echo. Convert to int explicitly: on Windows
 	// syscall.Stdin is a syscall.Handle (uintptr), not an int, so the bare
 	// value fails to cross-compile for windows/*.
-	password, err := term.ReadPassword(int(syscall.Stdin))
+	password, err := term.ReadPassword(int(syscall.Stdin)) //nolint:unconvert // syscall.Stdin is uintptr (syscall.Handle) on Windows; the int conversion is required to cross-compile for windows/*.
 
 	_, _ = fmt.Fprintln(os.Stderr) // Print newline after password input
 

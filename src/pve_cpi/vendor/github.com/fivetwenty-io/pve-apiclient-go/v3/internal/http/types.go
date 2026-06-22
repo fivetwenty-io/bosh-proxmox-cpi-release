@@ -30,13 +30,27 @@ const (
 	redactParamPassword = "password"
 )
 
-// SSLVerifyMode defines how SSL certificates should be verified.
+// SSLVerifyMode selects whether server certificates are verified.
+//
+// Only two effective behaviors exist: SSLVerifyNone disables verification
+// (InsecureSkipVerify), and every other mode performs Go's full standard-library
+// verification — chain validation AND hostname matching. SSLVerifyPeer,
+// SSLVerifyHost, and SSLVerifyFull are therefore equivalent today; they all
+// deliver full verification and differ only in name. The finer-grained modes
+// are retained for API compatibility but do not relax verification: there is no
+// "verify chain but skip hostname" path, by design (it would be the weaker,
+// surprising option). For certificate-pinning instead of CA verification, use
+// the fingerprint options (CachedFingerprints / VerifyFingerprintCallback).
 type SSLVerifyMode int
 
 const (
+	// SSLVerifyNone disables certificate verification (InsecureSkipVerify).
 	SSLVerifyNone SSLVerifyMode = iota
+	// SSLVerifyPeer performs full chain + hostname verification.
 	SSLVerifyPeer
+	// SSLVerifyHost performs full chain + hostname verification (same as Peer/Full).
 	SSLVerifyHost
+	// SSLVerifyFull performs full chain + hostname verification.
 	SSLVerifyFull
 )
 

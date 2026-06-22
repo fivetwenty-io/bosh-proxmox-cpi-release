@@ -1,12 +1,3 @@
-// LOCAL EDIT — §7.52 User-Agent header support.
-// SetHeader and RemoveHeader were added to the Client interface and implemented
-// on *client to allow the CPI to set a custom User-Agent at construction time.
-// These methods are absent from upstream v3.2.7. After any future `go mod vendor`
-// refresh this file must be re-patched:
-//   1. Add SetHeader(key, value string) and RemoveHeader(key string) to the Client interface.
-//   2. Add the *client forwarder methods at the end of the file.
-// The raw.SetHeader call in internal/pve/client.go:NewClient depends on this extension
-// and will fail to compile if the interface is reverted, so the patch will not be silently lost.
 package client
 
 import (
@@ -76,11 +67,16 @@ type Client interface {
 	ClearCache()
 	CacheStats() *CacheStats
 
-	// Header control — SetHeader adds key/value to every outgoing request.
+	// Header control. SetHeader adds key/value to every outgoing request;
 	// RemoveHeader removes a previously set header. Both are safe for
-	// concurrent use and take effect on all subsequent calls.
+	// concurrent use. Useful for setting a custom User-Agent at construction
+	// time, among other things.
 	SetHeader(key, value string)
 	RemoveHeader(key string)
+
+	// Lifecycle. Close releases background resources (response-cache cleanup
+	// goroutine and idle HTTP connections). Safe to call more than once.
+	Close() error
 }
 
 // Response represents a response from the PVE API.
@@ -106,6 +102,7 @@ type HTTPClient interface {
 	InvalidateCache(pattern string) int
 	ClearCache()
 	CacheStats() *CacheStats
+	Close() error
 }
 
 // Re-export logging types for the public API.
@@ -411,6 +408,18 @@ func (c *client) RemoveHeader(key string) {
 	c.httpClient.RemoveHeader(key)
 }
 
+// Close releases background resources held by the client (the response-cache
+// cleanup goroutine and idle HTTP connections). It is safe to call more than
+// once. After Close the client should not be used for further requests.
+func (c *client) Close() error {
+	err := c.httpClient.Close()
+	if err != nil {
+		return fmt.Errorf("closing client: %w", err)
+	}
+
+	return nil
+}
+
 func (c *client) call(method, path string, params map[string]interface{}) (*Response, error) {
 	// Make the HTTP request
 	resp, err := c.httpClient.Do(method, path, params)
@@ -500,6 +509,17 @@ func (a *internalHTTPAdapter) ClearCache() {
 func (a *internalHTTPAdapter) CacheStats() *CacheStats {
 	if a.inner != nil {
 		return a.inner.CacheStats()
+	}
+
+	return nil
+}
+
+func (a *internalHTTPAdapter) Close() error {
+	if a.inner != nil {
+		err := a.inner.Close()
+		if err != nil {
+			return fmt.Errorf("closing internal HTTP client: %w", err)
+		}
 	}
 
 	return nil

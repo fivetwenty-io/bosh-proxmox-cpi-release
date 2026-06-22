@@ -1,6 +1,6 @@
 module github.com/fivetwenty-io/bosh-pve-cpi
 
-go 1.26.3
+go 1.26.4
 
 require (
 	github.com/aws/aws-sdk-go-v2 v1.41.7
@@ -8,7 +8,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.17
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.101.0
 	github.com/diskfs/go-diskfs v1.9.3
-	github.com/fivetwenty-io/pve-apiclient-go/v3 v3.2.7
+	github.com/fivetwenty-io/pve-apiclient-go/v3 v3.2.10
 	github.com/google/go-containerregistry v0.21.6
 	golang.org/x/sync v0.20.0
 )

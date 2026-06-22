@@ -77,7 +77,9 @@ func (s *service) DeletePools(ctx context.Context, params *DeletePoolsParams) er
 		if err != nil {
 			return fmt.Errorf("pools.DeletePools: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("pools.DeletePools: decode params: %w", err)
 		}
@@ -114,7 +116,9 @@ func (s *service) ListPools(ctx context.Context, params *ListPoolsParams) (*List
 		if err != nil {
 			return nil, fmt.Errorf("pools.ListPools: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("pools.ListPools: decode params: %w", err)
 		}
@@ -160,7 +164,9 @@ func (s *service) CreatePools(ctx context.Context, params *CreatePoolsParams) er
 		if err != nil {
 			return fmt.Errorf("pools.CreatePools: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("pools.CreatePools: decode params: %w", err)
 		}
@@ -202,7 +208,9 @@ func (s *service) UpdatePools(ctx context.Context, params *UpdatePoolsParams) er
 		if err != nil {
 			return fmt.Errorf("pools.UpdatePools: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("pools.UpdatePools: decode params: %w", err)
 		}
@@ -259,7 +267,9 @@ func (s *service) GetPools(ctx context.Context, poolid string, params *GetPoolsP
 		if err != nil {
 			return nil, fmt.Errorf("pools.GetPools: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("pools.GetPools: decode params: %w", err)
 		}
@@ -311,7 +321,9 @@ func (s *service) UpdatePools2(ctx context.Context, poolid string, params *Updat
 		if err != nil {
 			return fmt.Errorf("pools.UpdatePools2: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("pools.UpdatePools2: decode params: %w", err)
 		}

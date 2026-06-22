@@ -74,16 +74,20 @@ func New(c client.Client) Service { return &service{c: c} }
 // fields; a still-running task is returned with a nil error (not errTaskInProgress).
 func (s *service) GetStatus(ctx context.Context, node, upid string) (*Status, error) {
 	path := fmt.Sprintf("/nodes/%s/tasks/%s/status", node, upid)
+
 	data, err := s.c.GetCtx(ctx, path, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get task status: %w", err)
 	}
+
 	taskData, ok := data.(map[string]interface{})
 	if !ok {
 		return nil, errUnexpectedTaskStatusFormat
 	}
+
 	status, _ := taskData["status"].(string)
 	exitStatus, _ := taskData["exitstatus"].(string)
+
 	return &Status{
 		Status:     status,
 		ExitStatus: exitStatus,

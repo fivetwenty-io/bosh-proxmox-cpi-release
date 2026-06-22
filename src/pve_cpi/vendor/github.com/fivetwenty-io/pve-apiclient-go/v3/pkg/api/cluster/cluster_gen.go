@@ -946,7 +946,9 @@ func (s *service) CreateAcmeAccount(ctx context.Context, params *CreateAcmeAccou
 		if err != nil {
 			return nil, fmt.Errorf("cluster.CreateAcmeAccount: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("cluster.CreateAcmeAccount: decode params: %w", err)
 		}
@@ -1066,7 +1068,9 @@ func (s *service) UpdateAcmeAccount(ctx context.Context, name string, params *Up
 		if err != nil {
 			return nil, fmt.Errorf("cluster.UpdateAcmeAccount: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("cluster.UpdateAcmeAccount: decode params: %w", err)
 		}
@@ -1190,7 +1194,9 @@ func (s *service) ListAcmeMeta(ctx context.Context, params *ListAcmeMetaParams) 
 		if err != nil {
 			return nil, fmt.Errorf("cluster.ListAcmeMeta: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("cluster.ListAcmeMeta: decode params: %w", err)
 		}
@@ -1238,7 +1244,9 @@ func (s *service) ListAcmePlugins(ctx context.Context, params *ListAcmePluginsPa
 		if err != nil {
 			return nil, fmt.Errorf("cluster.ListAcmePlugins: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("cluster.ListAcmePlugins: decode params: %w", err)
 		}
@@ -1296,7 +1304,9 @@ func (s *service) CreateAcmePlugins(ctx context.Context, params *CreateAcmePlugi
 		if err != nil {
 			return fmt.Errorf("cluster.CreateAcmePlugins: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.CreateAcmePlugins: decode params: %w", err)
 		}
@@ -1409,7 +1419,9 @@ func (s *service) UpdateAcmePlugins(ctx context.Context, id string, params *Upda
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateAcmePlugins: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateAcmePlugins: decode params: %w", err)
 		}
@@ -1446,7 +1458,9 @@ func (s *service) ListAcmeTos(ctx context.Context, params *ListAcmeTosParams) (*
 		if err != nil {
 			return nil, fmt.Errorf("cluster.ListAcmeTos: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("cluster.ListAcmeTos: decode params: %w", err)
 		}
@@ -1599,7 +1613,9 @@ func (s *service) CreateBackup(ctx context.Context, params *CreateBackupParams) 
 		if err != nil {
 			return fmt.Errorf("cluster.CreateBackup: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.CreateBackup: decode params: %w", err)
 		}
@@ -1898,7 +1914,9 @@ func (s *service) UpdateBackup(ctx context.Context, id string, params *UpdateBac
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateBackup: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateBackup: decode params: %w", err)
 		}
@@ -2045,7 +2063,9 @@ func (s *service) CreateBulkActionGuestMigrate(ctx context.Context, params *Crea
 		if err != nil {
 			return nil, fmt.Errorf("cluster.CreateBulkActionGuestMigrate: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("cluster.CreateBulkActionGuestMigrate: decode params: %w", err)
 		}
@@ -2102,7 +2122,9 @@ func (s *service) CreateBulkActionGuestShutdown(ctx context.Context, params *Cre
 		if err != nil {
 			return nil, fmt.Errorf("cluster.CreateBulkActionGuestShutdown: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("cluster.CreateBulkActionGuestShutdown: decode params: %w", err)
 		}
@@ -2157,7 +2179,9 @@ func (s *service) CreateBulkActionGuestStart(ctx context.Context, params *Create
 		if err != nil {
 			return nil, fmt.Errorf("cluster.CreateBulkActionGuestStart: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("cluster.CreateBulkActionGuestStart: decode params: %w", err)
 		}
@@ -2214,7 +2238,9 @@ func (s *service) CreateBulkActionGuestSuspend(ctx context.Context, params *Crea
 		if err != nil {
 			return nil, fmt.Errorf("cluster.CreateBulkActionGuestSuspend: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("cluster.CreateBulkActionGuestSuspend: decode params: %w", err)
 		}
@@ -2349,7 +2375,9 @@ func (s *service) UpdateCephFlags(ctx context.Context, params *UpdateCephFlagsPa
 		if err != nil {
 			return nil, fmt.Errorf("cluster.UpdateCephFlags: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("cluster.UpdateCephFlags: decode params: %w", err)
 		}
@@ -2428,7 +2456,9 @@ func (s *service) UpdateCephFlags2(ctx context.Context, flag string, params *Upd
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateCephFlags2: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateCephFlags2: decode params: %w", err)
 		}
@@ -2476,7 +2506,9 @@ func (s *service) ListCephMetadata(ctx context.Context, params *ListCephMetadata
 		if err != nil {
 			return nil, fmt.Errorf("cluster.ListCephMetadata: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("cluster.ListCephMetadata: decode params: %w", err)
 		}
@@ -2636,7 +2668,9 @@ func (s *service) CreateConfig(ctx context.Context, params *CreateConfigParams) 
 		if err != nil {
 			return nil, fmt.Errorf("cluster.CreateConfig: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("cluster.CreateConfig: decode params: %w", err)
 		}
@@ -2724,7 +2758,9 @@ func (s *service) ListConfigJoin(ctx context.Context, params *ListConfigJoinPara
 		if err != nil {
 			return nil, fmt.Errorf("cluster.ListConfigJoin: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("cluster.ListConfigJoin: decode params: %w", err)
 		}
@@ -2822,7 +2858,9 @@ func (s *service) CreateConfigJoin(ctx context.Context, params *CreateConfigJoin
 		if err != nil {
 			return nil, fmt.Errorf("cluster.CreateConfigJoin: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("cluster.CreateConfigJoin: decode params: %w", err)
 		}
@@ -2974,7 +3012,9 @@ func (s *service) CreateConfigNodes(ctx context.Context, node string, params *Cr
 		if err != nil {
 			return nil, fmt.Errorf("cluster.CreateConfigNodes: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("cluster.CreateConfigNodes: decode params: %w", err)
 		}
@@ -3154,7 +3194,9 @@ func (s *service) CreateFirewallAliases(ctx context.Context, params *CreateFirew
 		if err != nil {
 			return fmt.Errorf("cluster.CreateFirewallAliases: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.CreateFirewallAliases: decode params: %w", err)
 		}
@@ -3188,7 +3230,9 @@ func (s *service) DeleteFirewallAliases(ctx context.Context, name string, params
 		if err != nil {
 			return fmt.Errorf("cluster.DeleteFirewallAliases: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.DeleteFirewallAliases: decode params: %w", err)
 		}
@@ -3260,7 +3304,9 @@ func (s *service) UpdateFirewallAliases(ctx context.Context, name string, params
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateFirewallAliases: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateFirewallAliases: decode params: %w", err)
 		}
@@ -3332,7 +3378,9 @@ func (s *service) CreateFirewallGroups(ctx context.Context, params *CreateFirewa
 		if err != nil {
 			return fmt.Errorf("cluster.CreateFirewallGroups: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.CreateFirewallGroups: decode params: %w", err)
 		}
@@ -3445,7 +3493,9 @@ func (s *service) CreateFirewallGroups2(ctx context.Context, group string, param
 		if err != nil {
 			return fmt.Errorf("cluster.CreateFirewallGroups2: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.CreateFirewallGroups2: decode params: %w", err)
 		}
@@ -3479,7 +3529,9 @@ func (s *service) DeleteFirewallGroups2(ctx context.Context, group string, pos s
 		if err != nil {
 			return fmt.Errorf("cluster.DeleteFirewallGroups2: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.DeleteFirewallGroups2: decode params: %w", err)
 		}
@@ -3606,7 +3658,9 @@ func (s *service) UpdateFirewallGroups(ctx context.Context, group string, pos st
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateFirewallGroups: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateFirewallGroups: decode params: %w", err)
 		}
@@ -3678,7 +3732,9 @@ func (s *service) CreateFirewallIpset(ctx context.Context, params *CreateFirewal
 		if err != nil {
 			return fmt.Errorf("cluster.CreateFirewallIpset: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.CreateFirewallIpset: decode params: %w", err)
 		}
@@ -3712,7 +3768,9 @@ func (s *service) DeleteFirewallIpset(ctx context.Context, name string, params *
 		if err != nil {
 			return fmt.Errorf("cluster.DeleteFirewallIpset: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.DeleteFirewallIpset: decode params: %w", err)
 		}
@@ -3781,7 +3839,9 @@ func (s *service) CreateFirewallIpset2(ctx context.Context, name string, params 
 		if err != nil {
 			return fmt.Errorf("cluster.CreateFirewallIpset2: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.CreateFirewallIpset2: decode params: %w", err)
 		}
@@ -3815,7 +3875,9 @@ func (s *service) DeleteFirewallIpset2(ctx context.Context, name string, cidr st
 		if err != nil {
 			return fmt.Errorf("cluster.DeleteFirewallIpset2: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.DeleteFirewallIpset2: decode params: %w", err)
 		}
@@ -3884,7 +3946,9 @@ func (s *service) UpdateFirewallIpset(ctx context.Context, name string, cidr str
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateFirewallIpset: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateFirewallIpset: decode params: %w", err)
 		}
@@ -4010,7 +4074,9 @@ func (s *service) UpdateFirewallOptions(ctx context.Context, params *UpdateFirew
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateFirewallOptions: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateFirewallOptions: decode params: %w", err)
 		}
@@ -4047,7 +4113,9 @@ func (s *service) ListFirewallRefs(ctx context.Context, params *ListFirewallRefs
 		if err != nil {
 			return nil, fmt.Errorf("cluster.ListFirewallRefs: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("cluster.ListFirewallRefs: decode params: %w", err)
 		}
@@ -4154,7 +4222,9 @@ func (s *service) CreateFirewallRules(ctx context.Context, params *CreateFirewal
 		if err != nil {
 			return fmt.Errorf("cluster.CreateFirewallRules: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.CreateFirewallRules: decode params: %w", err)
 		}
@@ -4188,7 +4258,9 @@ func (s *service) DeleteFirewallRules(ctx context.Context, pos string, params *D
 		if err != nil {
 			return fmt.Errorf("cluster.DeleteFirewallRules: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.DeleteFirewallRules: decode params: %w", err)
 		}
@@ -4315,7 +4387,9 @@ func (s *service) UpdateFirewallRules(ctx context.Context, pos string, params *U
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateFirewallRules: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateFirewallRules: decode params: %w", err)
 		}
@@ -4425,7 +4499,9 @@ func (s *service) CreateHaGroups(ctx context.Context, params *CreateHaGroupsPara
 		if err != nil {
 			return fmt.Errorf("cluster.CreateHaGroups: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.CreateHaGroups: decode params: %w", err)
 		}
@@ -4520,7 +4596,9 @@ func (s *service) UpdateHaGroups(ctx context.Context, group string, params *Upda
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateHaGroups: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateHaGroups: decode params: %w", err)
 		}
@@ -4557,7 +4635,9 @@ func (s *service) ListHaResources(ctx context.Context, params *ListHaResourcesPa
 		if err != nil {
 			return nil, fmt.Errorf("cluster.ListHaResources: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("cluster.ListHaResources: decode params: %w", err)
 		}
@@ -4619,7 +4699,9 @@ func (s *service) CreateHaResources(ctx context.Context, params *CreateHaResourc
 		if err != nil {
 			return fmt.Errorf("cluster.CreateHaResources: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.CreateHaResources: decode params: %w", err)
 		}
@@ -4653,7 +4735,9 @@ func (s *service) DeleteHaResources(ctx context.Context, sid string, params *Del
 		if err != nil {
 			return fmt.Errorf("cluster.DeleteHaResources: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.DeleteHaResources: decode params: %w", err)
 		}
@@ -4756,7 +4840,9 @@ func (s *service) UpdateHaResources(ctx context.Context, sid string, params *Upd
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateHaResources: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateHaResources: decode params: %w", err)
 		}
@@ -4802,7 +4888,9 @@ func (s *service) CreateHaResourcesMigrate(ctx context.Context, sid string, para
 		if err != nil {
 			return nil, fmt.Errorf("cluster.CreateHaResourcesMigrate: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("cluster.CreateHaResourcesMigrate: decode params: %w", err)
 		}
@@ -4859,7 +4947,9 @@ func (s *service) CreateHaResourcesRelocate(ctx context.Context, sid string, par
 		if err != nil {
 			return nil, fmt.Errorf("cluster.CreateHaResourcesRelocate: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("cluster.CreateHaResourcesRelocate: decode params: %w", err)
 		}
@@ -4909,7 +4999,9 @@ func (s *service) ListHaRules(ctx context.Context, params *ListHaRulesParams) (*
 		if err != nil {
 			return nil, fmt.Errorf("cluster.ListHaRules: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("cluster.ListHaRules: decode params: %w", err)
 		}
@@ -4969,7 +5061,9 @@ func (s *service) CreateHaRules(ctx context.Context, params *CreateHaRulesParams
 		if err != nil {
 			return fmt.Errorf("cluster.CreateHaRules: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.CreateHaRules: decode params: %w", err)
 		}
@@ -5074,7 +5168,9 @@ func (s *service) UpdateHaRules(ctx context.Context, rule string, params *Update
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateHaRules: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateHaRules: decode params: %w", err)
 		}
@@ -5192,7 +5288,9 @@ func (s *service) CreateHaStatusDisarmHa(ctx context.Context, params *CreateHaSt
 		if err != nil {
 			return fmt.Errorf("cluster.CreateHaStatusDisarmHa: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.CreateHaStatusDisarmHa: decode params: %w", err)
 		}
@@ -5388,7 +5486,9 @@ func (s *service) CreateJobsRealmSync(ctx context.Context, id string, params *Cr
 		if err != nil {
 			return fmt.Errorf("cluster.CreateJobsRealmSync: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.CreateJobsRealmSync: decode params: %w", err)
 		}
@@ -5434,7 +5534,9 @@ func (s *service) UpdateJobsRealmSync(ctx context.Context, id string, params *Up
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateJobsRealmSync: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateJobsRealmSync: decode params: %w", err)
 		}
@@ -5475,7 +5577,9 @@ func (s *service) ListJobsScheduleAnalyze(ctx context.Context, params *ListJobsS
 		if err != nil {
 			return nil, fmt.Errorf("cluster.ListJobsScheduleAnalyze: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("cluster.ListJobsScheduleAnalyze: decode params: %w", err)
 		}
@@ -5524,7 +5628,9 @@ func (s *service) ListLog(ctx context.Context, params *ListLogParams) (*ListLogR
 		if err != nil {
 			return nil, fmt.Errorf("cluster.ListLog: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("cluster.ListLog: decode params: %w", err)
 		}
@@ -5606,7 +5712,9 @@ func (s *service) ListMappingDir(ctx context.Context, params *ListMappingDirPara
 		if err != nil {
 			return nil, fmt.Errorf("cluster.ListMappingDir: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("cluster.ListMappingDir: decode params: %w", err)
 		}
@@ -5656,7 +5764,9 @@ func (s *service) CreateMappingDir(ctx context.Context, params *CreateMappingDir
 		if err != nil {
 			return fmt.Errorf("cluster.CreateMappingDir: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.CreateMappingDir: decode params: %w", err)
 		}
@@ -5747,7 +5857,9 @@ func (s *service) UpdateMappingDir(ctx context.Context, id string, params *Updat
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateMappingDir: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateMappingDir: decode params: %w", err)
 		}
@@ -5784,7 +5896,9 @@ func (s *service) ListMappingPci(ctx context.Context, params *ListMappingPciPara
 		if err != nil {
 			return nil, fmt.Errorf("cluster.ListMappingPci: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("cluster.ListMappingPci: decode params: %w", err)
 		}
@@ -5838,7 +5952,9 @@ func (s *service) CreateMappingPci(ctx context.Context, params *CreateMappingPci
 		if err != nil {
 			return fmt.Errorf("cluster.CreateMappingPci: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.CreateMappingPci: decode params: %w", err)
 		}
@@ -5933,7 +6049,9 @@ func (s *service) UpdateMappingPci(ctx context.Context, id string, params *Updat
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateMappingPci: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateMappingPci: decode params: %w", err)
 		}
@@ -5970,7 +6088,9 @@ func (s *service) ListMappingUsb(ctx context.Context, params *ListMappingUsbPara
 		if err != nil {
 			return nil, fmt.Errorf("cluster.ListMappingUsb: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("cluster.ListMappingUsb: decode params: %w", err)
 		}
@@ -6020,7 +6140,9 @@ func (s *service) CreateMappingUsb(ctx context.Context, params *CreateMappingUsb
 		if err != nil {
 			return fmt.Errorf("cluster.CreateMappingUsb: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.CreateMappingUsb: decode params: %w", err)
 		}
@@ -6111,7 +6233,9 @@ func (s *service) UpdateMappingUsb(ctx context.Context, id string, params *Updat
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateMappingUsb: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateMappingUsb: decode params: %w", err)
 		}
@@ -6190,7 +6314,9 @@ func (s *service) ListMetricsExport(ctx context.Context, params *ListMetricsExpo
 		if err != nil {
 			return nil, fmt.Errorf("cluster.ListMetricsExport: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("cluster.ListMetricsExport: decode params: %w", err)
 		}
@@ -6362,7 +6488,9 @@ func (s *service) CreateMetricsServer(ctx context.Context, id string, params *Cr
 		if err != nil {
 			return fmt.Errorf("cluster.CreateMetricsServer: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.CreateMetricsServer: decode params: %w", err)
 		}
@@ -6441,7 +6569,9 @@ func (s *service) UpdateMetricsServer(ctx context.Context, id string, params *Up
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateMetricsServer: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateMetricsServer: decode params: %w", err)
 		}
@@ -6478,7 +6608,9 @@ func (s *service) ListNextid(ctx context.Context, params *ListNextidParams) (*Li
 		if err != nil {
 			return nil, fmt.Errorf("cluster.ListNextid: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("cluster.ListNextid: decode params: %w", err)
 		}
@@ -6631,7 +6763,9 @@ func (s *service) CreateNotificationsEndpointsGotify(ctx context.Context, params
 		if err != nil {
 			return fmt.Errorf("cluster.CreateNotificationsEndpointsGotify: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.CreateNotificationsEndpointsGotify: decode params: %w", err)
 		}
@@ -6736,7 +6870,9 @@ func (s *service) UpdateNotificationsEndpointsGotify(ctx context.Context, name s
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateNotificationsEndpointsGotify: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateNotificationsEndpointsGotify: decode params: %w", err)
 		}
@@ -6815,7 +6951,9 @@ func (s *service) CreateNotificationsEndpointsSendmail(ctx context.Context, para
 		if err != nil {
 			return fmt.Errorf("cluster.CreateNotificationsEndpointsSendmail: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.CreateNotificationsEndpointsSendmail: decode params: %w", err)
 		}
@@ -6930,7 +7068,9 @@ func (s *service) UpdateNotificationsEndpointsSendmail(ctx context.Context, name
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateNotificationsEndpointsSendmail: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateNotificationsEndpointsSendmail: decode params: %w", err)
 		}
@@ -7019,7 +7159,9 @@ func (s *service) CreateNotificationsEndpointsSmtp(ctx context.Context, params *
 		if err != nil {
 			return fmt.Errorf("cluster.CreateNotificationsEndpointsSmtp: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.CreateNotificationsEndpointsSmtp: decode params: %w", err)
 		}
@@ -7152,7 +7294,9 @@ func (s *service) UpdateNotificationsEndpointsSmtp(ctx context.Context, name str
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateNotificationsEndpointsSmtp: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateNotificationsEndpointsSmtp: decode params: %w", err)
 		}
@@ -7233,7 +7377,9 @@ func (s *service) CreateNotificationsEndpointsWebhook(ctx context.Context, param
 		if err != nil {
 			return fmt.Errorf("cluster.CreateNotificationsEndpointsWebhook: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.CreateNotificationsEndpointsWebhook: decode params: %w", err)
 		}
@@ -7352,7 +7498,9 @@ func (s *service) UpdateNotificationsEndpointsWebhook(ctx context.Context, name 
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateNotificationsEndpointsWebhook: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateNotificationsEndpointsWebhook: decode params: %w", err)
 		}
@@ -7501,7 +7649,9 @@ func (s *service) CreateNotificationsMatchers(ctx context.Context, params *Creat
 		if err != nil {
 			return fmt.Errorf("cluster.CreateNotificationsMatchers: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.CreateNotificationsMatchers: decode params: %w", err)
 		}
@@ -7624,7 +7774,9 @@ func (s *service) UpdateNotificationsMatchers(ctx context.Context, name string, 
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateNotificationsMatchers: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateNotificationsMatchers: decode params: %w", err)
 		}
@@ -7790,7 +7942,9 @@ func (s *service) UpdateOptions(ctx context.Context, params *UpdateOptionsParams
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateOptions: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateOptions: decode params: %w", err)
 		}
@@ -7862,7 +8016,9 @@ func (s *service) ListQemuCpuFlags(ctx context.Context, params *ListQemuCpuFlags
 		if err != nil {
 			return nil, fmt.Errorf("cluster.ListQemuCpuFlags: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("cluster.ListQemuCpuFlags: decode params: %w", err)
 		}
@@ -7955,7 +8111,9 @@ func (s *service) CreateQemuCustomCpuModels(ctx context.Context, params *CreateQ
 		if err != nil {
 			return fmt.Errorf("cluster.CreateQemuCustomCpuModels: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.CreateQemuCustomCpuModels: decode params: %w", err)
 		}
@@ -8074,7 +8232,9 @@ func (s *service) UpdateQemuCustomCpuModels(ctx context.Context, cputype string,
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateQemuCustomCpuModels: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateQemuCustomCpuModels: decode params: %w", err)
 		}
@@ -8157,7 +8317,9 @@ func (s *service) CreateReplication(ctx context.Context, params *CreateReplicati
 		if err != nil {
 			return fmt.Errorf("cluster.CreateReplication: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.CreateReplication: decode params: %w", err)
 		}
@@ -8193,7 +8355,9 @@ func (s *service) DeleteReplication(ctx context.Context, id string, params *Dele
 		if err != nil {
 			return fmt.Errorf("cluster.DeleteReplication: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.DeleteReplication: decode params: %w", err)
 		}
@@ -8298,7 +8462,9 @@ func (s *service) UpdateReplication(ctx context.Context, id string, params *Upda
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateReplication: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateReplication: decode params: %w", err)
 		}
@@ -8335,7 +8501,9 @@ func (s *service) ListResources(ctx context.Context, params *ListResourcesParams
 		if err != nil {
 			return nil, fmt.Errorf("cluster.ListResources: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("cluster.ListResources: decode params: %w", err)
 		}
@@ -8419,7 +8587,9 @@ func (s *service) UpdateSdn(ctx context.Context, params *UpdateSdnParams) (*Upda
 		if err != nil {
 			return nil, fmt.Errorf("cluster.UpdateSdn: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("cluster.UpdateSdn: decode params: %w", err)
 		}
@@ -8472,7 +8642,9 @@ func (s *service) ListSdnControllers(ctx context.Context, params *ListSdnControl
 		if err != nil {
 			return nil, fmt.Errorf("cluster.ListSdnControllers: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("cluster.ListSdnControllers: decode params: %w", err)
 		}
@@ -8554,7 +8726,9 @@ func (s *service) CreateSdnControllers(ctx context.Context, params *CreateSdnCon
 		if err != nil {
 			return fmt.Errorf("cluster.CreateSdnControllers: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.CreateSdnControllers: decode params: %w", err)
 		}
@@ -8588,7 +8762,9 @@ func (s *service) DeleteSdnControllers(ctx context.Context, controller string, p
 		if err != nil {
 			return fmt.Errorf("cluster.DeleteSdnControllers: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.DeleteSdnControllers: decode params: %w", err)
 		}
@@ -8627,7 +8803,9 @@ func (s *service) GetSdnControllers(ctx context.Context, controller string, para
 		if err != nil {
 			return nil, fmt.Errorf("cluster.GetSdnControllers: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("cluster.GetSdnControllers: decode params: %w", err)
 		}
@@ -8709,7 +8887,9 @@ func (s *service) UpdateSdnControllers(ctx context.Context, controller string, p
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateSdnControllers: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateSdnControllers: decode params: %w", err)
 		}
@@ -8746,7 +8926,9 @@ func (s *service) ListSdnDns(ctx context.Context, params *ListSdnDnsParams) (*Li
 		if err != nil {
 			return nil, fmt.Errorf("cluster.ListSdnDns: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("cluster.ListSdnDns: decode params: %w", err)
 		}
@@ -8803,7 +8985,9 @@ func (s *service) CreateSdnDns(ctx context.Context, params *CreateSdnDnsParams) 
 		if err != nil {
 			return fmt.Errorf("cluster.CreateSdnDns: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.CreateSdnDns: decode params: %w", err)
 		}
@@ -8837,7 +9021,9 @@ func (s *service) DeleteSdnDns(ctx context.Context, dns string, params *DeleteSd
 		if err != nil {
 			return fmt.Errorf("cluster.DeleteSdnDns: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.DeleteSdnDns: decode params: %w", err)
 		}
@@ -8914,7 +9100,9 @@ func (s *service) UpdateSdnDns(ctx context.Context, dns string, params *UpdateSd
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateSdnDns: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateSdnDns: decode params: %w", err)
 		}
@@ -8956,7 +9144,9 @@ func (s *service) ListSdnDryRun(ctx context.Context, params *ListSdnDryRunParams
 		if err != nil {
 			return nil, fmt.Errorf("cluster.ListSdnDryRun: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("cluster.ListSdnDryRun: decode params: %w", err)
 		}
@@ -9042,7 +9232,9 @@ func (s *service) ListSdnFabricsAll(ctx context.Context, params *ListSdnFabricsA
 		if err != nil {
 			return nil, fmt.Errorf("cluster.ListSdnFabricsAll: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("cluster.ListSdnFabricsAll: decode params: %w", err)
 		}
@@ -9092,7 +9284,9 @@ func (s *service) ListSdnFabricsFabric(ctx context.Context, params *ListSdnFabri
 		if err != nil {
 			return nil, fmt.Errorf("cluster.ListSdnFabricsFabric: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("cluster.ListSdnFabricsFabric: decode params: %w", err)
 		}
@@ -9159,7 +9353,9 @@ func (s *service) CreateSdnFabricsFabric(ctx context.Context, params *CreateSdnF
 		if err != nil {
 			return fmt.Errorf("cluster.CreateSdnFabricsFabric: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.CreateSdnFabricsFabric: decode params: %w", err)
 		}
@@ -9287,7 +9483,9 @@ func (s *service) UpdateSdnFabricsFabric(ctx context.Context, id string, params 
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateSdnFabricsFabric: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateSdnFabricsFabric: decode params: %w", err)
 		}
@@ -9326,7 +9524,9 @@ func (s *service) ListSdnFabricsNode(ctx context.Context, params *ListSdnFabrics
 		if err != nil {
 			return nil, fmt.Errorf("cluster.ListSdnFabricsNode: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("cluster.ListSdnFabricsNode: decode params: %w", err)
 		}
@@ -9377,7 +9577,9 @@ func (s *service) GetSdnFabricsNode(ctx context.Context, fabricId string, params
 		if err != nil {
 			return nil, fmt.Errorf("cluster.GetSdnFabricsNode: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("cluster.GetSdnFabricsNode: decode params: %w", err)
 		}
@@ -9443,7 +9645,9 @@ func (s *service) CreateSdnFabricsNode(ctx context.Context, fabricId string, par
 		if err != nil {
 			return fmt.Errorf("cluster.CreateSdnFabricsNode: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.CreateSdnFabricsNode: decode params: %w", err)
 		}
@@ -9547,7 +9751,9 @@ func (s *service) UpdateSdnFabricsNode(ctx context.Context, fabricId string, nod
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateSdnFabricsNode: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateSdnFabricsNode: decode params: %w", err)
 		}
@@ -9584,7 +9790,9 @@ func (s *service) ListSdnIpams(ctx context.Context, params *ListSdnIpamsParams) 
 		if err != nil {
 			return nil, fmt.Errorf("cluster.ListSdnIpams: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("cluster.ListSdnIpams: decode params: %w", err)
 		}
@@ -9639,7 +9847,9 @@ func (s *service) CreateSdnIpams(ctx context.Context, params *CreateSdnIpamsPara
 		if err != nil {
 			return fmt.Errorf("cluster.CreateSdnIpams: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.CreateSdnIpams: decode params: %w", err)
 		}
@@ -9673,7 +9883,9 @@ func (s *service) DeleteSdnIpams(ctx context.Context, ipam string, params *Delet
 		if err != nil {
 			return fmt.Errorf("cluster.DeleteSdnIpams: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.DeleteSdnIpams: decode params: %w", err)
 		}
@@ -9749,7 +9961,9 @@ func (s *service) UpdateSdnIpams(ctx context.Context, ipam string, params *Updat
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateSdnIpams: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateSdnIpams: decode params: %w", err)
 		}
@@ -9818,7 +10032,9 @@ func (s *service) DeleteSdnLock(ctx context.Context, params *DeleteSdnLockParams
 		if err != nil {
 			return fmt.Errorf("cluster.DeleteSdnLock: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.DeleteSdnLock: decode params: %w", err)
 		}
@@ -9855,7 +10071,9 @@ func (s *service) CreateSdnLock(ctx context.Context, params *CreateSdnLockParams
 		if err != nil {
 			return nil, fmt.Errorf("cluster.CreateSdnLock: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("cluster.CreateSdnLock: decode params: %w", err)
 		}
@@ -9908,7 +10126,9 @@ func (s *service) ListSdnPrefixLists(ctx context.Context, params *ListSdnPrefixL
 		if err != nil {
 			return nil, fmt.Errorf("cluster.ListSdnPrefixLists: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("cluster.ListSdnPrefixLists: decode params: %w", err)
 		}
@@ -9959,7 +10179,9 @@ func (s *service) CreateSdnPrefixLists(ctx context.Context, params *CreateSdnPre
 		if err != nil {
 			return fmt.Errorf("cluster.CreateSdnPrefixLists: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.CreateSdnPrefixLists: decode params: %w", err)
 		}
@@ -9993,7 +10215,9 @@ func (s *service) DeleteSdnPrefixLists(ctx context.Context, id string, params *D
 		if err != nil {
 			return fmt.Errorf("cluster.DeleteSdnPrefixLists: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.DeleteSdnPrefixLists: decode params: %w", err)
 		}
@@ -10064,7 +10288,9 @@ func (s *service) UpdateSdnPrefixLists(ctx context.Context, id string, params *U
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateSdnPrefixLists: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateSdnPrefixLists: decode params: %w", err)
 		}
@@ -10136,7 +10362,9 @@ func (s *service) CreateSdnPrefixListsEntries(ctx context.Context, id string, pa
 		if err != nil {
 			return fmt.Errorf("cluster.CreateSdnPrefixListsEntries: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.CreateSdnPrefixListsEntries: decode params: %w", err)
 		}
@@ -10170,7 +10398,9 @@ func (s *service) DeleteSdnPrefixListsEntries(ctx context.Context, id string, ur
 		if err != nil {
 			return fmt.Errorf("cluster.DeleteSdnPrefixListsEntries: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.DeleteSdnPrefixListsEntries: decode params: %w", err)
 		}
@@ -10245,7 +10475,9 @@ func (s *service) UpdateSdnPrefixListsEntries(ctx context.Context, id string, ur
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateSdnPrefixListsEntries: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateSdnPrefixListsEntries: decode params: %w", err)
 		}
@@ -10281,7 +10513,9 @@ func (s *service) CreateSdnRollback(ctx context.Context, params *CreateSdnRollba
 		if err != nil {
 			return fmt.Errorf("cluster.CreateSdnRollback: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.CreateSdnRollback: decode params: %w", err)
 		}
@@ -10318,7 +10552,9 @@ func (s *service) ListSdnRouteMaps(ctx context.Context, params *ListSdnRouteMaps
 		if err != nil {
 			return nil, fmt.Errorf("cluster.ListSdnRouteMaps: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("cluster.ListSdnRouteMaps: decode params: %w", err)
 		}
@@ -10369,7 +10605,9 @@ func (s *service) ListSdnRouteMapsEntries(ctx context.Context, params *ListSdnRo
 		if err != nil {
 			return nil, fmt.Errorf("cluster.ListSdnRouteMapsEntries: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("cluster.ListSdnRouteMapsEntries: decode params: %w", err)
 		}
@@ -10428,7 +10666,9 @@ func (s *service) CreateSdnRouteMapsEntries(ctx context.Context, params *CreateS
 		if err != nil {
 			return fmt.Errorf("cluster.CreateSdnRouteMapsEntries: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.CreateSdnRouteMapsEntries: decode params: %w", err)
 		}
@@ -10467,7 +10707,9 @@ func (s *service) GetSdnRouteMapsEntries(ctx context.Context, routeMapId string,
 		if err != nil {
 			return nil, fmt.Errorf("cluster.GetSdnRouteMapsEntries: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("cluster.GetSdnRouteMapsEntries: decode params: %w", err)
 		}
@@ -10513,7 +10755,9 @@ func (s *service) DeleteSdnRouteMapsEntriesEntry(ctx context.Context, routeMapId
 		if err != nil {
 			return fmt.Errorf("cluster.DeleteSdnRouteMapsEntriesEntry: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.DeleteSdnRouteMapsEntriesEntry: decode params: %w", err)
 		}
@@ -10603,7 +10847,9 @@ func (s *service) UpdateSdnRouteMapsEntriesEntry(ctx context.Context, routeMapId
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateSdnRouteMapsEntriesEntry: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateSdnRouteMapsEntriesEntry: decode params: %w", err)
 		}
@@ -10642,7 +10888,9 @@ func (s *service) ListSdnVnets(ctx context.Context, params *ListSdnVnetsParams) 
 		if err != nil {
 			return nil, fmt.Errorf("cluster.ListSdnVnets: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("cluster.ListSdnVnets: decode params: %w", err)
 		}
@@ -10702,7 +10950,9 @@ func (s *service) CreateSdnVnets(ctx context.Context, params *CreateSdnVnetsPara
 		if err != nil {
 			return fmt.Errorf("cluster.CreateSdnVnets: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.CreateSdnVnets: decode params: %w", err)
 		}
@@ -10736,7 +10986,9 @@ func (s *service) DeleteSdnVnets(ctx context.Context, vnet string, params *Delet
 		if err != nil {
 			return fmt.Errorf("cluster.DeleteSdnVnets: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.DeleteSdnVnets: decode params: %w", err)
 		}
@@ -10775,7 +11027,9 @@ func (s *service) GetSdnVnets(ctx context.Context, vnet string, params *GetSdnVn
 		if err != nil {
 			return nil, fmt.Errorf("cluster.GetSdnVnets: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("cluster.GetSdnVnets: decode params: %w", err)
 		}
@@ -10835,7 +11089,9 @@ func (s *service) UpdateSdnVnets(ctx context.Context, vnet string, params *Updat
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateSdnVnets: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateSdnVnets: decode params: %w", err)
 		}
@@ -10949,7 +11205,9 @@ func (s *service) UpdateSdnVnetsFirewallOptions(ctx context.Context, vnet string
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateSdnVnetsFirewallOptions: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateSdnVnetsFirewallOptions: decode params: %w", err)
 		}
@@ -11044,7 +11302,9 @@ func (s *service) CreateSdnVnetsFirewallRules(ctx context.Context, vnet string, 
 		if err != nil {
 			return fmt.Errorf("cluster.CreateSdnVnetsFirewallRules: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.CreateSdnVnetsFirewallRules: decode params: %w", err)
 		}
@@ -11078,7 +11338,9 @@ func (s *service) DeleteSdnVnetsFirewallRules(ctx context.Context, vnet string, 
 		if err != nil {
 			return fmt.Errorf("cluster.DeleteSdnVnetsFirewallRules: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.DeleteSdnVnetsFirewallRules: decode params: %w", err)
 		}
@@ -11205,7 +11467,9 @@ func (s *service) UpdateSdnVnetsFirewallRules(ctx context.Context, vnet string, 
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateSdnVnetsFirewallRules: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateSdnVnetsFirewallRules: decode params: %w", err)
 		}
@@ -11243,7 +11507,9 @@ func (s *service) DeleteSdnVnetsIps(ctx context.Context, vnet string, params *De
 		if err != nil {
 			return fmt.Errorf("cluster.DeleteSdnVnetsIps: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.DeleteSdnVnetsIps: decode params: %w", err)
 		}
@@ -11281,7 +11547,9 @@ func (s *service) CreateSdnVnetsIps(ctx context.Context, vnet string, params *Cr
 		if err != nil {
 			return fmt.Errorf("cluster.CreateSdnVnetsIps: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.CreateSdnVnetsIps: decode params: %w", err)
 		}
@@ -11321,7 +11589,9 @@ func (s *service) UpdateSdnVnetsIps(ctx context.Context, vnet string, params *Up
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateSdnVnetsIps: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateSdnVnetsIps: decode params: %w", err)
 		}
@@ -11360,7 +11630,9 @@ func (s *service) ListSdnVnetsSubnets(ctx context.Context, vnet string, params *
 		if err != nil {
 			return nil, fmt.Errorf("cluster.ListSdnVnetsSubnets: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("cluster.ListSdnVnetsSubnets: decode params: %w", err)
 		}
@@ -11419,7 +11691,9 @@ func (s *service) CreateSdnVnetsSubnets(ctx context.Context, vnet string, params
 		if err != nil {
 			return fmt.Errorf("cluster.CreateSdnVnetsSubnets: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.CreateSdnVnetsSubnets: decode params: %w", err)
 		}
@@ -11453,7 +11727,9 @@ func (s *service) DeleteSdnVnetsSubnets(ctx context.Context, vnet string, subnet
 		if err != nil {
 			return fmt.Errorf("cluster.DeleteSdnVnetsSubnets: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.DeleteSdnVnetsSubnets: decode params: %w", err)
 		}
@@ -11492,7 +11768,9 @@ func (s *service) GetSdnVnetsSubnets(ctx context.Context, vnet string, subnet st
 		if err != nil {
 			return nil, fmt.Errorf("cluster.GetSdnVnetsSubnets: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("cluster.GetSdnVnetsSubnets: decode params: %w", err)
 		}
@@ -11552,7 +11830,9 @@ func (s *service) UpdateSdnVnetsSubnets(ctx context.Context, vnet string, subnet
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateSdnVnetsSubnets: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateSdnVnetsSubnets: decode params: %w", err)
 		}
@@ -11593,7 +11873,9 @@ func (s *service) ListSdnZones(ctx context.Context, params *ListSdnZonesParams) 
 		if err != nil {
 			return nil, fmt.Errorf("cluster.ListSdnZones: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("cluster.ListSdnZones: decode params: %w", err)
 		}
@@ -11693,7 +11975,9 @@ func (s *service) CreateSdnZones(ctx context.Context, params *CreateSdnZonesPara
 		if err != nil {
 			return fmt.Errorf("cluster.CreateSdnZones: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.CreateSdnZones: decode params: %w", err)
 		}
@@ -11727,7 +12011,9 @@ func (s *service) DeleteSdnZones(ctx context.Context, zone string, params *Delet
 		if err != nil {
 			return fmt.Errorf("cluster.DeleteSdnZones: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.DeleteSdnZones: decode params: %w", err)
 		}
@@ -11766,7 +12052,9 @@ func (s *service) GetSdnZones(ctx context.Context, zone string, params *GetSdnZo
 		if err != nil {
 			return nil, fmt.Errorf("cluster.GetSdnZones: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return nil, fmt.Errorf("cluster.GetSdnZones: decode params: %w", err)
 		}
@@ -11866,7 +12154,9 @@ func (s *service) UpdateSdnZones(ctx context.Context, zone string, params *Updat
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateSdnZones: marshal params: %w", err)
 		}
-		err = json.Unmarshal(raw, &body)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
 		if err != nil {
 			return fmt.Errorf("cluster.UpdateSdnZones: decode params: %w", err)
 		}
