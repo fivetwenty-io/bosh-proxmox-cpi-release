@@ -30,11 +30,5 @@ func (a *NoAgent) Remove(_ context.Context, node string, vmid int) error {
 	return nil
 }
 
-// UpdateDiskHints is a no-op. NoAgent does not maintain a disk hint registry.
-func (a *NoAgent) UpdateDiskHints(_ context.Context, vmid int, disks []DiskHint) error {
-	a.logger.Debug("noagent: UpdateDiskHints skipped", log.Int("vmid", vmid), log.Int("disks", len(disks)))
-	return nil
-}
-
 // compile-time interface guard
 var _ Agent = (*NoAgent)(nil)

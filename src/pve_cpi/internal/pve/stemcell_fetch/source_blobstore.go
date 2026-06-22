@@ -70,8 +70,8 @@ func (blobstoreCredentials) Kind() string { return credKindBlobstore }
 // SECURITY: when endpoint scheme is http (not https), Basic-auth credentials
 // are transmitted in plaintext. A structured WARN log cannot be emitted here
 // because blobstoreSource carries no logger field. Wire a logger into
-// blobstoreSource and emit the warning (mirroring config.emitRegistryInsecureWarning)
-// before accepting the http endpoint.
+// blobstoreSource and emit a structured WARN before accepting the http
+// endpoint.
 func parseBlobstoreAuth(raw json.RawMessage) (blobstoreCredentials, error) {
 	var c blobstoreCredentials
 	if err := json.Unmarshal(raw, &c); err != nil {

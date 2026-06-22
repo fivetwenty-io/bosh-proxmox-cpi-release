@@ -166,7 +166,7 @@ report)** were recommendations in the previous roadmap that have since shipped.
 - **Full v2 contract**, including `info` with `api_version=2`, `disk_hint` return on
   `attach_disk`, and `network_info` return on `create_vm`.
 
-- **Three agent-delivery modes** — cloudinit/configdrive, registry, and noagent —
+- **Two agent-delivery modes** — cloudinit/configdrive and noagent —
   matching AWS's registry-optional design and exceeding vSphere (env ISO only).
 
 - **Three stemcell modes** — heavy tarball, light pre-uploaded, and light fetch over
@@ -1143,7 +1143,7 @@ byte-identical, so the throttle is purely additive insurance for high-fan-out de
 of unknown keys, contradictory combinations, or out-of-range values. A typo'd
 `storage_pool` or invalid `network_mode` surfaces only mid-deploy at the first PVE API
 call. The CPI now has many interacting optional blocks (placement, anti-affinity, DLB,
-hooks, SDN, firewall, registry TLS) with cross-field constraints enforced ad hoc.
+hooks, SDN, firewall) with cross-field constraints enforced ad hoc.
 
 **Build:** add a `Validate()` phase after `ApplyDefaults`: reject unknown top-level keys,
 enforce enums, enforce documented cross-field rules (HA anti-affinity requires
@@ -1161,7 +1161,7 @@ names the offending key or combination so the failure is actionable at start-up 
 mid-deploy. Unknown-key checking is top-level only, matching the build scope.
 
 **Why it matters here.** The CPI now has many interacting optional blocks (placement,
-anti-affinity, DLB, hooks, SDN, firewall, registry TLS) whose contradictions previously
+anti-affinity, DLB, hooks, SDN, firewall) whose contradictions previously
 surfaced only at the first PVE API call mid-deploy; failing at start-up with an
 accumulated, semicolon-delimited list of every violation (`config.go:1744-1767`) cuts the
 MTTR for a misconfigured cluster. PVE's unknown-key rejection is the strictest in the
@@ -1370,17 +1370,14 @@ deployments, a mis-paired mode or a missing field silently mis-bootstraps — th
 agent-dead/pre-start-NATS failure class already documented.
 
 **Shipped.** A new `agent_mode: auto` reads the stemcell `api_version` from the create_vm
-request context (previously discarded) and selects registry-less configdrive for v2+ and
-registry for v1. At boot the configdrive agent is always built, and a registry agent is
-built too when `registry_endpoint` is set; a v1 stemcell with no registry agent fails
-early with a clear error rather than mis-bootstrapping. A missing `api_version` fails open
-to configdrive, the modern default. The api_version parse accepts float, integer, and
-numeric-string forms so a v1 stemcell is never silently misread. A settings-completeness
-assertion now guards the registry-less path: a configdrive boot with an empty mbus or
-agent_id, or no networks, fails `create_vm` immediately instead of booting a
-half-configured agent. The registry and noagent paths are unchanged, and the explicit
-`cloudinit`, `registry`, and `noagent` modes keep their existing behavior. Covered by a
-v1/v2 × mode test matrix.
+request context (previously discarded) and selects configdrive for v2+ stemcells; a
+missing `api_version` also fails open to configdrive, the modern default. The api_version
+parse accepts float, integer, and numeric-string forms so a stemcell version is never
+silently misread. A settings-completeness assertion guards the configdrive path: a boot
+with an empty mbus or agent_id, or no networks, fails `create_vm` immediately instead of
+booting a half-configured agent. The `noagent` mode is unchanged, and the explicit
+`cloudinit` and `noagent` modes keep their existing behavior. Registry mode has since been
+removed; `auto` always selects configdrive. Covered by a v1/v2 × mode test matrix.
 
 **Why it matters here.** With configdrive now the default for every deployment, a
 mis-paired mode or a missing settings field silently mis-bootstraps the agent — the same
@@ -2122,7 +2119,7 @@ password verbatim. PVE's 7.41 places it firmly in the mature tier with AWS, Azur
 than with the community ports.
 
 The PVE CPI handles the same sensitive payloads. `create_vm` receives the agent env (an mbus URL with
-embedded NATS credentials, blobstore secrets, and a registry endpoint), and the configdrive/cloud-init
+embedded NATS credentials and blobstore secrets), and the configdrive/cloud-init
 user-data is assembled from it. Today the dispatcher logs only `method`, `request_id`, and `duration_ms`
 (`dispatcher.go`), not the argument tree, so nothing leaks at the default level — but there is **no
 redaction primitive anywhere in the `log`/dispatcher layer**. The CPI is therefore one debug-level `log`
@@ -2134,7 +2131,7 @@ of need.
 **Build:** add a structured redaction helper in the `log` package and call it at the dispatcher boundary
 for any request/response payload logging, gated by an opt-in `pve.redact_logs` (default off →
 byte-identical; recommend on). The scrubber masks known-sensitive keys and paths in the CPI argument
-tree — `mbus`, `blobstore.options.secret_access_key`/`password`, `registry` credentials, and any
+tree — `mbus`, `blobstore.options.secret_access_key`/`password`, and any
 `env`/`agent` settings blob — replacing values with `<redacted>` while preserving structure. No PVE
 primitive is required; this is pure log hygiene. Validate-only-when-set, omit from the ERB when empty.
 

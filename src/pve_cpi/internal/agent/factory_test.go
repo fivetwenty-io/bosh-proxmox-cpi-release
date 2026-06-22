@@ -56,22 +56,6 @@ func TestNewAgent_Cloudinit_ReturnsConfigDrive(t *testing.T) {
 	}
 }
 
-func TestNewAgent_Registry(t *testing.T) {
-	t.Parallel()
-	cfg := minimalCfg("registry")
-	cfg.RegistryEndpoint = "http://registry.example.com:25777"
-	cfg.RegistryUser = "admin"
-	cfg.RegistryPassword = "regpass"
-
-	a, err := NewAgent(cfg, nil, log.NewNopLogger())
-	if err != nil {
-		t.Fatalf("NewAgent(registry): unexpected error: %v", err)
-	}
-	if _, ok := a.(*RegistryAgent); !ok {
-		t.Fatalf("NewAgent(registry): expected *RegistryAgent, got %T", a)
-	}
-}
-
 func TestNewAgent_NoAgent(t *testing.T) {
 	t.Parallel()
 	cfg := minimalCfg("noagent")
@@ -95,16 +79,6 @@ func TestNewAgent_UnknownMode(t *testing.T) {
 	}
 	if !cpierrors.IsType(err, cpierrors.TypeNotSupported) {
 		t.Fatalf("NewAgent(bogus): expected NotSupported error type, got %T: %v", err, err)
-	}
-}
-
-func TestNewAgent_RegistryEndpointMissing(t *testing.T) {
-	t.Parallel()
-	cfg := minimalCfg("registry")
-
-	_, err := NewAgent(cfg, nil, log.NewNopLogger())
-	if err == nil {
-		t.Fatal("NewAgent(registry, no endpoint): expected error, got nil")
 	}
 }
 

@@ -8,7 +8,6 @@ import (
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/agent"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
 
@@ -82,9 +81,6 @@ func (a *etAgent) Configure(ctx context.Context, node string, vmid int, cfg agen
 	return a.configureFn(ctx, node, vmid, cfg)
 }
 func (a *etAgent) Remove(_ context.Context, _ string, _ int) error { return nil }
-func (a *etAgent) UpdateDiskHints(_ context.Context, _ int, _ []agent.DiskHint) error {
-	return nil
-}
 
 func etConfig() *config.CPIConfig {
 	c := &config.CPIConfig{}
@@ -286,10 +282,6 @@ func configureAgentParsed() *createVMParsedArgs {
 	}
 }
 
-// emptyJRCtx is a zero-value jsonrpc.Context used where the context carries no
-// stemcell api_version (the existing configureAgent unit tests predate auto-mode).
-var emptyJRCtx = jsonrpc.Context{}
-
 // TestConfigureAgent_Success verifies the happy path forwards a populated
 // AgentConfig and returns nil.
 func TestConfigureAgent_Success(t *testing.T) {
@@ -301,7 +293,7 @@ func TestConfigureAgent_Success(t *testing.T) {
 	})
 	shape := &createVMShape{node: "node1"}
 
-	err := configureAgent(context.Background(), deps, log.NewNopLogger(), configureAgentParsed(), shape, 300, "vm-300", "", emptyJRCtx)
+	err := configureAgent(context.Background(), deps, log.NewNopLogger(), configureAgentParsed(), shape, 300, "vm-300", "")
 	if err != nil {
 		t.Fatalf("configureAgent returned error: %v", err)
 	}
@@ -325,7 +317,7 @@ func TestConfigureAgent_Error(t *testing.T) {
 	})
 	shape := &createVMShape{node: "node1"}
 
-	err := configureAgent(context.Background(), deps, log.NewNopLogger(), configureAgentParsed(), shape, 301, "vm-301", "", emptyJRCtx)
+	err := configureAgent(context.Background(), deps, log.NewNopLogger(), configureAgentParsed(), shape, 301, "vm-301", "")
 	if err == nil {
 		t.Fatal("expected error from agent.Configure failure, got nil")
 	}
@@ -351,7 +343,7 @@ func TestConfigureAgent_MBusAndBlobstoreFallback(t *testing.T) {
 	}
 	shape := &createVMShape{node: "node1"}
 
-	err := configureAgent(context.Background(), deps, log.NewNopLogger(), configureAgentParsed(), shape, 302, "vm-302", "", emptyJRCtx)
+	err := configureAgent(context.Background(), deps, log.NewNopLogger(), configureAgentParsed(), shape, 302, "vm-302", "")
 	if err != nil {
 		t.Fatalf("configureAgent returned error: %v", err)
 	}

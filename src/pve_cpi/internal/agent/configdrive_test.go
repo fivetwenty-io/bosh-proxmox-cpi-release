@@ -361,14 +361,6 @@ func TestConfigDrive_Remove_404IsSuccess(t *testing.T) {
 	}
 }
 
-func TestConfigDrive_UpdateDiskHints_NoOp(t *testing.T) {
-	t.Parallel()
-	a := newISOAgent(nil, nil)
-	if err := a.UpdateDiskHints(context.Background(), 200, []DiskHint{{DiskCID: "x", DevicePath: "/dev/sdc"}}); err != nil {
-		t.Fatalf("UpdateDiskHints: %v", err)
-	}
-}
-
 func TestConfigDrive_Configure_AttachFailureCleansUpUploadedISO(t *testing.T) {
 	t.Parallel()
 

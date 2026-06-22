@@ -7,6 +7,6 @@
 // log and continue rather than fail the CPI action.
 //
 // HAProxyRegistrar implements LBRegistrar against the HAProxy DPA v3 runtime
-// API (no reload required). It mirrors the TLS, redirect, and private-IP
-// security posture of internal/registry.
+// API (no reload required). It enforces TLS, redirect, and private-IP guards
+// on the configured endpoint.
 package lb

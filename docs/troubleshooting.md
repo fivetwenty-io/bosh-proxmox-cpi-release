@@ -104,12 +104,30 @@ Add the missing values to your deployment manifest under `properties.pve.*` and 
 **Symptom**
 
 ```text
-config validation failed: agent_mode must be one of cloudinit|registry|noagent|auto, got "X"
+config validation failed: agent_mode must be one of cloudinit|noagent|auto, got "X"
 ```
 
 **Fix**
 
-Set `pve.agent_mode` to `cloudinit`, `registry`, `noagent`, or `auto`. The default is `cloudinit`. The `auto` value selects the agent mode at runtime based on the stemcell API version.
+Set `pve.agent_mode` to `cloudinit`, `noagent`, or `auto`. The default is `cloudinit`. The `auto` value selects configdrive bootstrap for all stemcells.
+
+### agent_mode: registry or registry.* keys rejected
+
+**Symptom**
+
+```text
+config validation failed: agent_mode "registry" is no longer supported (the BOSH registry was deprecated upstream); set agent_mode to "cloudinit"
+```
+
+or, for a leftover `registry.*` property (rendered as a `registry_*` config key):
+
+```text
+config validation failed: config key "registry_endpoint" is no longer supported (the BOSH registry was removed)
+```
+
+**Fix**
+
+The BOSH registry agent mode has been removed in line with the upstream BOSH deprecation. Remove `pve.agent_mode: registry` and all `registry.*` properties from the CPI config. Set `pve.agent_mode: cloudinit` (or omit it — `cloudinit` is the default). See [Configuration](configuration.md#removed-bosh-registry).
 
 ### VMID range too low
 
@@ -122,18 +140,6 @@ config validation failed: vmid_range_start must be ≥100
 **Fix**
 
 Set `pve.vmid_range_start` to 100 or higher in your manifest.
-
-### Registry endpoint missing
-
-**Symptom**
-
-```text
-config validation failed: registry_endpoint is required when agent_mode=registry
-```
-
-**Fix**
-
-Set `registry.endpoint`, `registry.user`, and `registry.password` in your manifest when using `agent_mode: registry`. See [Configuration](configuration.md).
 
 ### Unknown field in config
 
@@ -168,22 +174,6 @@ or a similar `os.Root` path-escape error referencing the configured `stemcell_st
 **Fix**
 
 Set `pve.stemcell_staging_dir` to a directory that is a parent of all paths the director supplies (typically the BOSH blob store temp directory), or remove the property to revert to unrestricted path access. See [Configuration](configuration.md).
-
-### Registry host rejected by allow-list
-
-**Symptom**
-
-```text
-registry: host "<host>" not in allowed_hosts list
-```
-
-**Diagnosis**
-
-`registry.allowed_hosts` is set and the registry endpoint host does not match any listed pattern.
-
-**Fix**
-
-Add the registry hostname to `registry.allowed_hosts`, or remove the property to disable allow-list filtering. Each entry is either an exact hostname (e.g. `registry.example.com`) or a single-level wildcard prefix (e.g. `*.example.com`). See [Configuration](configuration.md).
 
 ### PVE CA certificate parse failure
 

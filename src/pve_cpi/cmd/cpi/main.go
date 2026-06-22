@@ -145,18 +145,6 @@ func runWithArgs(args []string, stdin io.Reader, stdout, stderr io.Writer, opts 
 		return 1
 	}
 
-	// When agent_mode="auto" and registry_endpoint is set, also build the
-	// optional secondary registry agent for per-call v1 stemcell selection.
-	// Nil when absent — configureAgent nil-guards before use.
-	var registryAgent agent.Agent
-	if cfg.AgentMode == "auto" && cfg.RegistryEndpoint != "" {
-		registryAgent, err = agent.NewRegistryAgentIfConfigured(cfg, logger)
-		if err != nil {
-			logger.Error("registry agent init failed", log.Err(err))
-			return 1
-		}
-	}
-
 	// Root context cancelled on SIGINT/SIGTERM. defer cancel() fires when
 	// runWithArgs returns, deregistering the signal handler and releasing
 	// resources even though main calls os.Exit — the exit is deferred until
@@ -253,13 +241,12 @@ func runWithArgs(args []string, stdin io.Reader, stdout, stderr io.Writer, opts 
 	}
 	d := cpi.NewDispatcherWithOptions(logger, dispatcherOpts...)
 	handlers.RegisterAll(d, handlers.Deps{
-		Config:        cfg,
-		PVE:           client,
-		Agent:         bootAgent,
-		RegistryAgent: registryAgent, // nil unless agent_mode=auto and registry_endpoint set
-		Logger:        logger,
-		Resolver:      backendResolver,
-		Inflight:      handlers.NewInflightRegistry(),
+		Config:   cfg,
+		PVE:      client,
+		Agent:    bootAgent,
+		Logger:   logger,
+		Resolver: backendResolver,
+		Inflight: handlers.NewInflightRegistry(),
 	})
 
 	maxLine := opts.MaxLineBytes

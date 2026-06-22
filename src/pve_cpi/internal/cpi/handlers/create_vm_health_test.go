@@ -120,6 +120,7 @@ func buildHealthDeps(n *healthNodes, hcfg *config.HealthCheckConfig) handlers.De
 			VMStorage:      storageName,
 			NetworkBridge:  "vmbr0",
 			VMIDRangeStart: 100,
+			AgentMBus:      "nats://mbus.test:4222",
 			// Placement disabled — tests focus on health-gate behavior, not scoring.
 			Placement: &config.PlacementConfig{Enabled: placementDisabled},
 			// IP-conflict check disabled (cluster ListResources returns empty).

@@ -45,7 +45,7 @@ The `agent.mbus` value shown is the `bosh-deployment` default for create-env boo
 | `pve.stemcell_storage` | No | File-backed pool for stemcell qcow2 images; falls back to `vm_storage` when unset |
 | `pve.iso_storage` | Yes | File-backed storage pool (`iso` content enabled) for ConfigDrive ISOs; block storages are rejected |
 | `pve.network_bridge` | No | Default bridge for NICs that set no `bridge` cloud property; defaults to `vmbr0` |
-| `pve.agent_mode` | No | Bootstrap mode: `cloudinit`, `registry`, `noagent`, or `auto`; defaults to `cloudinit` |
+| `pve.agent_mode` | No | Bootstrap mode: `cloudinit`, `noagent`, or `auto`; defaults to `cloudinit`. `auto` always selects ConfigDrive regardless of stemcell API version. |
 
 ## Stemcell
 

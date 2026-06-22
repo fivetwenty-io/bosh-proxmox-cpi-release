@@ -382,10 +382,6 @@ func (m *vmMockAgent) Remove(ctx context.Context, node string, vmid int) error {
 	}
 	return nil
 }
-func (m *vmMockAgent) UpdateDiskHints(_ context.Context, _ int, _ []agent.DiskHint) error {
-	return nil
-}
-
 // --------------------------------------------------------------------------
 // Helpers
 // --------------------------------------------------------------------------
@@ -401,6 +397,10 @@ func buildVMDeps(q *vmMockQEMU, n *vmMockNodes, c *vmMockCluster, a *vmMockAgent
 			VMStorage:      storageName,
 			NetworkBridge:  "vmbr0",
 			VMIDRangeStart: 100,
+			// AgentMBus is required by the registry-less completeness assertion
+			// for all non-noagent modes. Tests that exercise the mbus-empty error
+			// path build their own config without this field.
+			AgentMBus: "nats://mbus.test:4222",
 			// Placement disabled so pre-placement tests keep their existing
 			// behavior: node is taken directly from Config.Node ("pve").
 			Placement: &config.PlacementConfig{Enabled: placementDisabled},
@@ -1383,6 +1383,7 @@ func TestCreateVM_AgentDead_EmitsDiagnostic(t *testing.T) {
 			VMStorage:           storageName,
 			NetworkBridge:       "vmbr0",
 			VMIDRangeStart:      100,
+			AgentMBus:           "nats://mbus.test:4222",
 			Placement:           &config.PlacementConfig{Enabled: placementDisabled},
 			EnsureNoIPConflicts: placementDisabled,
 		},
@@ -1481,6 +1482,7 @@ func buildVMDepsForTemplate(q *vmMockQEMU, n *vmMockNodes, c *vmMockCluster, a *
 			VMStorage:           storageName,
 			NetworkBridge:       "vmbr0",
 			VMIDRangeStart:      100,
+			AgentMBus:           "nats://mbus.test:4222",
 			Placement:           &config.PlacementConfig{Enabled: placementDisabled},
 			EnsureNoIPConflicts: placementDisabled,
 		},
@@ -1513,6 +1515,7 @@ func buildVMDepsForTemplateCrossNode(q *vmMockQEMU, n *vmMockNodes, a *vmMockAge
 			VMStorage:            storageName,
 			NetworkBridge:        "vmbr0",
 			VMIDRangeStart:       100,
+			AgentMBus:            "nats://mbus.test:4222",
 			StemcellTemplateNode: "pve-tmpl",
 			Placement:            &config.PlacementConfig{Enabled: placementDisabled},
 			EnsureNoIPConflicts:  placementDisabled,
@@ -1829,6 +1832,7 @@ func buildVMDepsForOldCIDLookup(q *vmMockQEMU, n *vmMockNodes, a *vmMockAgent) h
 			VMStorage:           storageName,
 			NetworkBridge:       "vmbr0",
 			VMIDRangeStart:      100,
+			AgentMBus:           "nats://mbus.test:4222",
 			Placement:           &config.PlacementConfig{Enabled: placementDisabled},
 			EnsureNoIPConflicts: placementDisabled,
 		},
@@ -2120,6 +2124,7 @@ func buildVMDepsPlacement(
 		VMStorage:      storageName,
 		NetworkBridge:  "vmbr0",
 		VMIDRangeStart: 100,
+		AgentMBus:      "nats://mbus.test:4222",
 		// Placement enabled explicitly; IP-conflict guard enabled.
 	}
 	if extraCfg != nil {
@@ -2830,6 +2835,7 @@ func buildVMDepsWithVMTypes(q *vmMockQEMU, n *vmMockNodes, c *vmMockCluster, a *
 			VMStorage:           storageName,
 			NetworkBridge:       "vmbr0",
 			VMIDRangeStart:      100,
+			AgentMBus:           "nats://mbus.test:4222",
 			Placement:           &config.PlacementConfig{Enabled: placementDisabled},
 			EnsureNoIPConflicts: placementDisabled,
 			VMTypes:             vmTypes,
@@ -3128,6 +3134,7 @@ func buildVMDepsFirewall(q *vmMockQEMU, n *vmMockNodes, c *vmMockCluster, a *vmM
 			VMStorage:           storageName,
 			NetworkBridge:       "vmbr0",
 			VMIDRangeStart:      100,
+			AgentMBus:           "nats://mbus.test:4222",
 			Placement:           &config.PlacementConfig{Enabled: placementDisabled},
 			EnsureNoIPConflicts: placementDisabled,
 			VMTypes:             opts.vmTypes,

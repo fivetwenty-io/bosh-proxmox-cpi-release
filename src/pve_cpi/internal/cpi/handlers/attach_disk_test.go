@@ -129,26 +129,15 @@ func (m *attachQEMUService) RollbackSnapshot(_ context.Context, _ string, _ int,
 var _ qemu.Service = (*attachQEMUService)(nil)
 
 // ---------------------------------------------------------------------------
-// captureAgent: records UpdateDiskHints calls for assertion.
+// captureAgent: a minimal agent.Agent stub for attach_disk tests.
 // ---------------------------------------------------------------------------
 
-type captureAgent struct {
-	updateCalled bool
-	updateVMID   int
-	updateHints  []agent.DiskHint
-	updateErr    error
-}
+type captureAgent struct{}
 
 func (a *captureAgent) Configure(_ context.Context, _ string, _ int, _ agent.AgentConfig) error {
 	return nil
 }
 func (a *captureAgent) Remove(_ context.Context, _ string, _ int) error { return nil }
-func (a *captureAgent) UpdateDiskHints(_ context.Context, vmid int, disks []agent.DiskHint) error {
-	a.updateCalled = true
-	a.updateVMID = vmid
-	a.updateHints = disks
-	return a.updateErr
-}
 
 var _ agent.Agent = (*captureAgent)(nil)
 
@@ -207,7 +196,6 @@ func extractPath(t *testing.T, result any) string {
 //   - AttachDisk returns diskID "scsi2"
 //   - Config returns config confirming scsi2 → volid
 //   - disk_hints {"path": "/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_drive-scsi2"} returned
-//   - UpdateDiskHints called with correct vmid and device_path
 func TestHandleAttachDisk_Happy(t *testing.T) {
 	t.Parallel()
 	const (
@@ -238,22 +226,6 @@ func TestHandleAttachDisk_Happy(t *testing.T) {
 	path := extractPath(t, result)
 	if path != wantPath {
 		t.Errorf("disk_hints.path: want %q, got %q", wantPath, path)
-	}
-
-	if !ag.updateCalled {
-		t.Error("UpdateDiskHints not called")
-	}
-	if ag.updateVMID != 100 {
-		t.Errorf("UpdateDiskHints vmid: want 100, got %d", ag.updateVMID)
-	}
-	if len(ag.updateHints) != 1 {
-		t.Fatalf("UpdateDiskHints hints len: want 1, got %d", len(ag.updateHints))
-	}
-	if ag.updateHints[0].DevicePath != wantPath {
-		t.Errorf("UpdateDiskHints device_path: want %q, got %q", wantPath, ag.updateHints[0].DevicePath)
-	}
-	if ag.updateHints[0].DiskCID != diskCID {
-		t.Errorf("UpdateDiskHints disk_cid: want %q, got %q", diskCID, ag.updateHints[0].DiskCID)
 	}
 }
 
@@ -316,24 +288,6 @@ func TestHandleAttachDisk_AttachFail(t *testing.T) {
 	_, err := h.Handle(context.Background(), attachArgs("100", "local-lvm:vol"), jsonrpc.Context{})
 	if err == nil {
 		t.Fatal("expected error")
-	}
-}
-
-// TestHandleAttachDisk_UpdateDiskHintsFail verifies that UpdateDiskHints failure
-// propagates (not silently dropped).
-func TestHandleAttachDisk_UpdateDiskHintsFail(t *testing.T) {
-	t.Parallel()
-	const volid = "vm-9001-disk-0"
-	qemuSvc := &attachQEMUService{
-		attachReturnDiskID: diskSlot,
-		configCfg:          map[string]any{diskSlot: volid},
-	}
-	ag := &captureAgent{updateErr: errors.New("registry unavailable")}
-	h := handlers.HandleAttachDisk(attachDeps(qemuSvc, ag))
-
-	_, err := h.Handle(context.Background(), attachArgs("100", "local-lvm:"+volid), jsonrpc.Context{})
-	if err == nil {
-		t.Fatal("expected error when UpdateDiskHints fails")
 	}
 }
 
@@ -688,10 +642,8 @@ func TestHandleAttachDisk_GuardBlocksWhenSnapshotsPresent(t *testing.T) {
 	if !strings.Contains(msg, "allow_disk_ops_with_snapshots") {
 		t.Errorf("error message must contain remediation hint 'allow_disk_ops_with_snapshots'; got: %s", msg)
 	}
-	if ag.updateCalled {
-		t.Error("UpdateDiskHints must not be called when guard blocks")
-	}
 }
+
 
 // TestHandleAttachDisk_GuardProceedsWhenNoSnapshots verifies the happy path
 // when the VM has no real snapshots: AttachDisk is called and disk_hints returned.
@@ -710,9 +662,6 @@ func TestHandleAttachDisk_GuardProceedsWhenNoSnapshots(t *testing.T) {
 	}
 	if result == nil {
 		t.Fatal("expected disk_hints result; got nil")
-	}
-	if !ag.updateCalled {
-		t.Error("UpdateDiskHints should be called on success")
 	}
 }
 
@@ -735,9 +684,6 @@ func TestHandleAttachDisk_GuardCheckErrorFailOpen(t *testing.T) {
 	}
 	if result == nil {
 		t.Fatal("expected disk_hints result on fail-open; got nil")
-	}
-	if !ag.updateCalled {
-		t.Error("UpdateDiskHints should be called on fail-open proceed")
 	}
 }
 
@@ -763,9 +709,6 @@ func TestHandleAttachDisk_GuardCheckErrorFailClosed(t *testing.T) {
 	if !strings.Contains(err.Error(), "require_snapshot_check_pass") {
 		t.Errorf("error must mention require_snapshot_check_pass; got: %v", err)
 	}
-	if ag.updateCalled {
-		t.Error("UpdateDiskHints must not be called when guard fails closed")
-	}
 }
 
 // TestHandleAttachDisk_GuardAllowOverrideProceeds verifies that when snapshots
@@ -786,9 +729,6 @@ func TestHandleAttachDisk_GuardAllowOverrideProceeds(t *testing.T) {
 	}
 	if result == nil {
 		t.Fatal("expected disk_hints result with allow override; got nil")
-	}
-	if !ag.updateCalled {
-		t.Error("UpdateDiskHints should be called when override allows proceed")
 	}
 }
 
@@ -953,9 +893,6 @@ func TestHandleAttachDisk_LVM_CID(t *testing.T) {
 	if result == nil {
 		t.Fatal("LVM CID: expected disk_hints; got nil")
 	}
-	if !ag.updateCalled {
-		t.Error("LVM CID: UpdateDiskHints not called")
-	}
 	_ = volid // CID exercises ParseDiskCID; volid is the opaque volume segment
 }
 
@@ -977,9 +914,6 @@ func TestHandleAttachDisk_ZFSPool_CID(t *testing.T) {
 	}
 	if result == nil {
 		t.Fatal("ZFSPool CID: expected disk_hints; got nil")
-	}
-	if !ag.updateCalled {
-		t.Error("ZFSPool CID: UpdateDiskHints not called")
 	}
 }
 
@@ -1004,9 +938,6 @@ func TestHandleAttachDisk_Dir_CID(t *testing.T) {
 	if result == nil {
 		t.Fatal("Dir CID: expected disk_hints; got nil")
 	}
-	if !ag.updateCalled {
-		t.Error("Dir CID: UpdateDiskHints not called")
-	}
 }
 
 // TestHandleAttachDisk_LVMThin_CID verifies that an LVMThin bare-volname CID
@@ -1027,9 +958,6 @@ func TestHandleAttachDisk_LVMThin_CID(t *testing.T) {
 	}
 	if result == nil {
 		t.Fatal("LVMThin CID: expected disk_hints; got nil")
-	}
-	if !ag.updateCalled {
-		t.Error("LVMThin CID: UpdateDiskHints not called")
 	}
 }
 
@@ -1587,10 +1515,6 @@ func TestHandleAttachDisk_Parked_UnparksBeforeAttach(t *testing.T) {
 	if qemuSvc.attachLastVolid != bareCID {
 		t.Errorf("AttachDisk volid: want %q, got %q", bareCID, qemuSvc.attachLastVolid)
 	}
-	if !ag.updateCalled {
-		t.Error("UpdateDiskHints must be called after successful attach")
-	}
-
 	const wantPath = "/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_drive-scsi1"
 	path := extractPath(t, result)
 	if path != wantPath {
@@ -1635,9 +1559,6 @@ func TestHandleAttachDisk_Parked_FreeFloatingProceedsNormally(t *testing.T) {
 	// No unpark operation — disk was not parked.
 	if len(qemuSvc.detachCalls) != 0 {
 		t.Errorf("expected no DetachDisk calls for free-floating disk; got %v", qemuSvc.detachCalls)
-	}
-	if !ag.updateCalled {
-		t.Error("UpdateDiskHints must be called after successful attach")
 	}
 }
 
@@ -1736,8 +1657,5 @@ func TestHandleAttachDisk_StrategyFree_NoParkerCalls(t *testing.T) {
 	}
 	if len(qemuSvc.detachCalls) != 0 {
 		t.Errorf("strategy=free: expected no DetachDisk calls; got %v", qemuSvc.detachCalls)
-	}
-	if !ag.updateCalled {
-		t.Error("strategy=free: UpdateDiskHints must be called after successful attach")
 	}
 }

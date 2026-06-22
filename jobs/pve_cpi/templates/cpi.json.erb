@@ -46,7 +46,7 @@
   # Emit stemcell-fetch transport timeouts only when the operator sets them.
   # When absent or 0 (the default), the key is omitted so the Go config
   # zero-value (0) reaches ApplyDefaults and the built-in defaults apply
-  # (30s/15s/120s/90s). Mirrors the registry_ca_cert / verify_ssl pattern.
+  # (30s/15s/120s/90s). Mirrors the pve_ca_cert / verify_ssl omit-when-zero pattern.
   {
     "stemcell_fetch_dial_timeout_sec"            => "pve.stemcell_fetch_dial_timeout_sec",
     "stemcell_fetch_tls_handshake_timeout_sec"   => "pve.stemcell_fetch_tls_handshake_timeout_sec",
@@ -90,25 +90,6 @@
   if_p("agent.mbus") { |v| config["agent_mbus"] = v }
   if_p("agent.blobstore") { |v| config["agent_blobstore"] = v }
 
-  if p("pve.agent_mode") == "registry"
-    config["registry_endpoint"]        = p("registry.endpoint")
-    config["registry_user"]            = p("registry.user")
-    config["registry_password"]        = p("registry.password")
-    config["registry_allow_insecure"]  = p("registry.allow_insecure", false)
-    config["registry_ca_cert"]         = p("registry.ca_cert", "")
-    # Emit registry_allowed_hosts only when the operator supplies a non-empty list.
-    # When absent or empty (the default), the key is omitted so the Go config
-    # zero-value ([]) is preserved and no behavior change occurs.
-    registry_allowed_hosts = p("registry.allowed_hosts", [])
-    config["registry_allowed_hosts"] = registry_allowed_hosts unless registry_allowed_hosts.nil? || registry_allowed_hosts.empty?
-    # Emit registry_allow_private_ip only when explicitly set to true. When
-    # absent or false (the default), the key is omitted so the Go config
-    # zero-value (nil *bool → false → guard active) is preserved. This mirrors
-    # the registry.ca_cert / registry.allow_insecure omit-when-empty pattern.
-    if p("registry.allow_private_ip", false)
-      config["registry_allow_private_ip"] = true
-    end
-  end
   # Emit disk_vmid_range_start only when the operator sets a non-zero value.
   # When absent or 0 (the default), the key is omitted so ApplyDefaults sets
   # the default disk band start (9000).

@@ -3,28 +3,18 @@ package agent
 import "context"
 
 // Agent abstracts the agent bootstrap strategy.
-// Implementations: ConfigDrive, RegistryAgent, NoAgent.
+// Implementations: ConfigDrive, NoAgent.
 type Agent interface {
-	// Configure writes agent settings to the VM (ConfigDrive ISO or
-	// registry). Called by create_vm AFTER VM is created but BEFORE it
-	// is started.
+	// Configure writes agent settings to the VM (ConfigDrive ISO).
+	// Called by create_vm AFTER VM is created but BEFORE it is started.
 	Configure(ctx context.Context, node string, vmid int, cfg AgentConfig) error
 
 	// Remove cleans up agent-side artifacts on VM deletion (or on
 	// create_vm rollback).
-	//   - ConfigDrive:   deletes the ConfigDrive ISO volume from the
-	//                    storage pool (404-tolerant).
-	//   - RegistryAgent: deletes the /instances/{vmid} registry entry.
-	//   - NoAgent:       no-op.
+	//   - ConfigDrive: deletes the ConfigDrive ISO volume from the
+	//                  storage pool (404-tolerant).
+	//   - NoAgent:     no-op.
 	Remove(ctx context.Context, node string, vmid int) error
-
-	// UpdateDiskHints updates the persistent disk mapping.
-	//   - RegistryAgent: GET current settings, patch disks.persistent,
-	//                    PUT back.
-	//   - All other implementations: no-op (BOSH v2 passes disk hints to
-	//     the agent via attach_disk return values, no persisted record
-	//     to patch).
-	UpdateDiskHints(ctx context.Context, vmid int, disks []DiskHint) error
 }
 
 // AgentConfig is the complete agent bootstrap payload.
@@ -83,8 +73,3 @@ type BlobstoreSpec struct {
 	Options  map[string]any `json:"options"`
 }
 
-// DiskHint is a single persistent disk mapping entry.
-type DiskHint struct {
-	DiskCID    string // "storage:volume"
-	DevicePath string // "/dev/sdb", "/dev/sdc", etc.
-}

@@ -7,7 +7,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/agent"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
@@ -49,9 +48,7 @@ type diskHints struct {
 //     confirm the attachment and get the canonical slot name.
 //  5. Derive device path from diskID as a PVE-stable by-id symlink:
 //     "/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_drive-scsi<N>".
-//  6. Call agent.UpdateDiskHints so registry-mode agents receive the updated
-//     persistent disk mapping. No-op for cloudinit and noagent modes.
-//  7. Return disk_hints{"path": devicePath}.
+//  6. Return disk_hints{"path": devicePath}.
 //
 // Device path convention:
 //
@@ -244,15 +241,6 @@ func HandleAttachDisk(deps Deps) Handler {
 		// --------------------------------------------------------------------
 		devicePath, err := attachDiskConfirmAndPath(ctx, deps, vmCID, node, vmid, bareDiskCID, diskID, deps.Logger)
 		if err != nil {
-			return nil, err
-		}
-
-		// --------------------------------------------------------------------
-		// 8. Update agent disk hints (no-op for cloudinit/noagent modes).
-		// --------------------------------------------------------------------
-		if err := attachDiskUpdateHints(ctx, deps, vmCID, diskCID, vmid, []agent.DiskHint{
-			{DiskCID: diskCID, DevicePath: devicePath},
-		}, deps.Logger); err != nil {
 			return nil, err
 		}
 
@@ -524,19 +512,6 @@ func attachDiskConfirmAndPath(ctx context.Context, deps Deps, vmCID, node string
 	}
 
 	return devicePath, nil
-}
-
-// attachDiskUpdateHints calls agent.UpdateDiskHints and wraps any error with
-// context. No-op for cloudinit and noagent modes (the Agent implementation
-// itself is a no-op for those modes).
-//
-// Failures:
-//   - agent.UpdateDiskHints error → Wrap error
-func attachDiskUpdateHints(ctx context.Context, deps Deps, vmCID, diskCID string, vmid int, hints []agent.DiskHint, _ *log.Logger) error {
-	if err := deps.Agent.UpdateDiskHints(ctx, vmid, hints); err != nil {
-		return cpierrors.Wrap(err, fmt.Sprintf("attach_disk: UpdateDiskHints failed for VM %s disk %s", vmCID, diskCID))
-	}
-	return nil
 }
 
 // chooseSCSISlotSkippingZero returns the diskID the persistent disk should be

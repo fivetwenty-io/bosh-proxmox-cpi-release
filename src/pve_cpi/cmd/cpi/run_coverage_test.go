@@ -703,11 +703,11 @@ func TestRunWithArgs_AutoMode_NoRegistry_Starts(t *testing.T) {
 	}
 }
 
-// TestRunWithArgs_AutoMode_WithRegistry_Starts exercises agent_mode=auto with a
-// registry_endpoint set. Both the primary configdrive agent and the secondary
-// registry agent must build without error. Expects exit 0 and a well-formed
-// JSONRPC response.
-func TestRunWithArgs_AutoMode_WithRegistry_Starts(t *testing.T) {
+// TestRunWithArgs_RegistryKeys_Rejected verifies that legacy registry_* config
+// keys are rejected at config load with a clear migration error. The BOSH
+// registry was deprecated upstream and removed from this CPI; configs carrying
+// registry_* keys must fail fast (exit 1) rather than silently start.
+func TestRunWithArgs_RegistryKeys_Rejected(t *testing.T) {
 	t.Parallel()
 
 	cfgJSON := `{
@@ -735,7 +735,7 @@ func TestRunWithArgs_AutoMode_WithRegistry_Starts(t *testing.T) {
 	nilFactory := func(_ *config.CPIConfig, _ *log.Logger) (pve.Client, error) {
 		return nilPVEClient{}, nil
 	}
-	req := `{"method":"info","arguments":[],"context":{"request_id":"auto-withreg-1"},"api_version":2}` + "\n"
+	req := `{"method":"info","arguments":[],"context":{"request_id":"reg-reject-1"},"api_version":2}` + "\n"
 	var stdout, stderr bytes.Buffer
 	code := runWithArgs(
 		[]string{"--config", cfgFile},
@@ -743,19 +743,11 @@ func TestRunWithArgs_AutoMode_WithRegistry_Starts(t *testing.T) {
 		&stdout, &stderr,
 		runOptions{ClientFactory: nilFactory},
 	)
-	if code != 0 {
-		t.Errorf("expected exit code 0 for auto mode + registry, got %d; stderr=%q", code, stderr.String())
+	if code != 1 {
+		t.Errorf("expected exit code 1 for registry_* keys, got %d; stderr=%q", code, stderr.String())
 	}
-	out := strings.TrimSpace(stdout.String())
-	if out == "" {
-		t.Fatal("expected JSONRPC response on stdout, got empty buffer")
-	}
-	var resp jsonrpc.Response
-	if err := json.Unmarshal([]byte(out), &resp); err != nil {
-		t.Fatalf("unmarshal response: %v\nraw: %s", err, out)
-	}
-	if resp.Result == nil && resp.Error == nil {
-		t.Fatal("JSONRPC response has both nil result and nil error")
+	if !strings.Contains(stderr.String(), "no longer supported") {
+		t.Errorf("expected migration error on stderr, got %q", stderr.String())
 	}
 }
 

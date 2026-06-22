@@ -358,10 +358,6 @@ func (m *mockAgentService) Remove(ctx context.Context, node string, vmid int) er
 	return nil // default: no-op success
 }
 
-func (m *mockAgentService) UpdateDiskHints(_ context.Context, _ int, _ []agent.DiskHint) error {
-	panic("mockAgentService.UpdateDiskHints: not expected in these tests")
-}
-
 // --------------------------------------------------------------------------
 // helpers
 // --------------------------------------------------------------------------

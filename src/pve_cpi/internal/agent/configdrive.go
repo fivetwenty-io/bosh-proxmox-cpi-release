@@ -208,12 +208,6 @@ func (a *ConfigDrive) Remove(ctx context.Context, node string, vmid int) error {
 	return nil
 }
 
-// UpdateDiskHints is a no-op: BOSH v2 passes disk hints via attach_disk
-// return values; ConfigDrive does not maintain a registry record to patch.
-func (a *ConfigDrive) UpdateDiskHints(_ context.Context, _ int, _ []DiskHint) error {
-	return nil
-}
-
 func (a *ConfigDrive) uploadISO(ctx context.Context, node, localPath, filename string) error {
 	// Upload returns a UPID (async storage task). The file is not yet
 	// visible to subsequent calls (e.g. attaching as a CD-ROM) until the

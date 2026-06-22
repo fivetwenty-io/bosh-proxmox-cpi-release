@@ -21,8 +21,8 @@ The CPI reads configuration from a BOSH deployment manifest. The job template re
 | `pve.sdn_zone_type` | Zone type the CPI uses when creating a zone (`simple`, `vlan`, `qinq`, `vxlan`, `evpn`). Only relevant when `sdn_auto_manage_zone` is `true`. | `simple` | no |
 | `pve.sdn_auto_manage_zone` | When `true`, the CPI may create SDN zones on `create_network` and delete them on `delete_network` when all safety conditions are met. See [Network configuration](networks.md). | `false` | no |
 | `pve.verify_ssl` | Verify the PVE API TLS certificate | `true` | no |
-| `pve.ca_cert` | Optional PEM-encoded CA certificate bundle for verifying the Proxmox VE API TLS certificate. When empty (default), the system trust pool is used — behavior is byte-identical to prior releases. When set, the PEM is parsed and the resulting cert pool is used for PVE API HTTPS verification. Ignored when `verify_ssl` is `false`. Symmetric to `registry.ca_cert`. | `""` | no |
-| `pve.agent_mode` | Agent bootstrap mode. `cloudinit` — cloud-init bootstrap (default). `registry` — BOSH registry at `registry.endpoint`. `noagent` — no agent bootstrap. `auto` — selects `cloudinit` when the stemcell's `api_version` is ≥ 2, falls back to `registry` for v1 stemcells (requires `registry.endpoint`). | `cloudinit` | no |
+| `pve.ca_cert` | Optional PEM-encoded CA certificate bundle for verifying the Proxmox VE API TLS certificate. When empty (default), the system trust pool is used — behavior is byte-identical to prior releases. When set, the PEM is parsed and the resulting cert pool is used for PVE API HTTPS verification. Ignored when `verify_ssl` is `false`. | `""` | no |
+| `pve.agent_mode` | Agent bootstrap mode. `cloudinit` — cloud-init bootstrap (default). `noagent` — no agent bootstrap. `auto` — always selects configdrive (registry-less) bootstrap for all stemcells. | `cloudinit` | no |
 | `pve.vm_disk_format` | Disk image format (`qcow2`, `raw`, `vmdk`) | `qcow2` | no |
 | `pve.hotplug` | PVE hotplug flags applied to every new VM. Comma-separated subset of `network,disk,cpu,memory,usb,cloudinit`, or `0` to disable hotplug entirely. Per-VM override via `cloud_properties.hotplug`. Fine-grained toggles `cpu_hotplug` and `memory_hotplug` are `create_vm` cloud properties documented in [CPI Methods](cpi_methods.md). | `network,disk,cpu,memory` | no |
 | `pve.numa` | Enable NUMA (`numa=1`) on every new VM. Required at create time for live memory hotplug to allocate DIMM slots; without it, memory hot-add silently no-ops. Per-VM override via `cloud_properties.numa`. | `true` | no |
@@ -46,12 +46,6 @@ The CPI reads configuration from a BOSH deployment manifest. The job template re
 | `pve.fetch_credential_defaults` | Ordered list of URL-prefix-to-auth mappings used when fetching a light stemcell whose `cloud_properties.image_url` carries no per-stemcell `image_url_auth`. The entry with the longest matching `url_prefix` wins. Each entry requires a `url_prefix` string and an `auth` object with a required `type` field; supported types are `basic`, `bearer`, `s3`, `oci`, and `blobstore`. When unset or empty, light-stemcell fetches without per-stemcell credentials are unauthenticated. See [Light stemcells](light-stemcells.md) for full auth-object schemas. | `[]` | no |
 | `agent.mbus` | URL the BOSH agent should bind/listen on inside the VM. Required for `bosh create-env`: bosh-init does not pass it via the per-call env argument, only via CPI config. When empty, the CPI derives `nats://<blobstore-host>:4222` from the blobstore endpoint if one is configured (loopback hosts rejected). | `""` | yes for `create-env` |
 | `agent.blobstore` | Optional default blobstore settings for the agent's `settings.json` (mirrors `agent.blobstore` in `bosh.yml`). | `{}` | no |
-| `registry.endpoint` | BOSH registry URL. Must use `https://` unless `registry.allow_insecure` is `true`. | `""` | yes when `agent_mode = registry` |
-| `registry.user` | Registry HTTP basic-auth username | `""` | yes when `agent_mode = registry` |
-| `registry.password` | Registry HTTP basic-auth password | `""` | yes when `agent_mode = registry` |
-| `registry.allow_insecure` | When `true`, permits a plaintext `http://` registry endpoint. Default `false` rejects any non-`https` scheme so registry credentials never travel in cleartext. Set `true` only for lab and test deployments. | `false` | no |
-| `registry.ca_cert` | Optional PEM-encoded CA certificate (or chain) appended to the host system trust pool when verifying the registry's TLS certificate. Use when the registry presents a certificate signed by a private CA. Empty means use the system pool unmodified. | `""` | no |
-| `registry.allowed_hosts` | Optional list of host patterns that restrict the registry HTTP client to only contact matching hosts. Each entry is an exact host (e.g. `registry.example.com`) or a single-level wildcard prefix (e.g. `*.example.com`). When non-empty, the client rejects any request whose resolved host does not match at least one entry. Empty (default) disables allow-list filtering; the configuredHost invariant and disabled redirects still apply regardless. Defense-in-depth against SSRF via host mutation. | `[]` | no |
 
 ## Stemcell Storage
 
@@ -507,7 +501,7 @@ pve:
 |---|---|---|---|
 | `pve.debug.keep_failed_vms` | Boolean | `false` | When `true`, a VM that fails mid-creation is not destroyed. Instead it is tagged `bosh-create-failed` (plus deployment/job derived from the BOSH env) and `create_vm` returns an error naming the VMID and node, leaving the VM intact for post-mortem. This deliberately breaks the no-orphan guarantee — for debugging only. |
 | `pve.task_poll_adaptive` | Boolean | `false` | When `true`, PVE task polling derives its interval from the task's reported progress (clamped 1–10 seconds) for long operations such as clone and move-disk, instead of the fixed task-poll cadence. Tasks reporting no progress fall back to the fixed cadence. Reduces poll pressure early in a long operation and tightens polling as it nears completion. |
-| `pve.redact_logs` | Boolean | `false` | When `true`, emits a debug-level trace of each call's request arguments and result, with credentials masked. The NATS mbus URL's embedded credentials, blobstore `secret_access_key`/`password`, registry credentials, and any other sensitive-named key are replaced with `<redacted>` while the structure is preserved. When `false` (default), no payload trace is emitted. |
+| `pve.redact_logs` | Boolean | `false` | When `true`, emits a debug-level trace of each call's request arguments and result, with credentials masked. The NATS mbus URL's embedded credentials, blobstore `secret_access_key`/`password`, and any other sensitive-named key are replaced with `<redacted>` while the structure is preserved. When `false` (default), no payload trace is emitted. |
 | `pve.strict_config_validation` | Boolean | `false` | When `true`, the CPI fails at startup on unknown top-level config keys and these cross-field contradictions: `use_ha_rules` without `anti_affinity.enabled`; `network_mode: sdn` without `sdn_zone` or `sdn_auto_manage_zone`; and `dlb.require_shared_storage` while DLB is disabled. When `false` (default), unknown keys are logged as warnings. |
 
 ## Per-RPC Metrics
@@ -544,13 +538,11 @@ pve:
     file_path: /var/vcap/sys/log/pve_cpi/metrics.jsonl
 ```
 
-## Registry
+## Removed: BOSH Registry
 
-The registry client activates when `agent_mode` is `registry`. Properties `registry.endpoint`, `registry.user`, `registry.password`, `registry.allow_insecure`, `registry.ca_cert`, and `registry.allowed_hosts` appear in the main property table above.
+The BOSH registry agent mode has been removed. Setting `pve.agent_mode: registry` or including any `registry.*` key in the CPI config now produces a config validation error at startup. This matches the upstream BOSH deprecation of the registry component.
 
-| Property | Type | Default | Description |
-|---|---|---|---|
-| `registry.allow_private_ip` | Boolean | `false` | When `true`, disables the private/loopback IP rejection guard on the registry endpoint. Default `false`: the registry client rejects endpoints whose resolved IP is private (RFC 1918: 10/8, 172.16/12, 192.168/16), loopback (127/8, ::1), link-local (169.254/16, fe80::/10), or unspecified. Set `true` only for lab or test deployments where the registry is intentionally on a private network. |
+If your manifest uses `agent_mode: registry` or any `registry.*` properties, remove them and set `pve.agent_mode: cloudinit` (or omit `agent_mode` — `cloudinit` is the default).
 
 ## Example
 

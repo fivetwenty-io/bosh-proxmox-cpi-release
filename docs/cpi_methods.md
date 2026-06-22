@@ -16,7 +16,7 @@ These changes apply when using CPI v2 (i.e., when the stemcell's `api_version` f
 
 - `attach_disk` returns disk hints (e.g., `{"path": "/dev/sdd"}`) instead of void.
 
-- Registry is optional. When a stemcell has `api_version: 2`, the CPI injects agent settings into the VM's cloud-init metadata at `create_vm` time. The agent reads from the IaaS metadata service and falls back to the registry only if configured.
+- Agent settings are injected into the VM's ConfigDrive at `create_vm` time. With `api_version: 2` stemcells, the agent reads from the IaaS metadata service directly; no registry is involved.
 
 ---
 
@@ -390,7 +390,7 @@ The disk CID may carry an optional encoded metadata suffix (see [Disk CID Encodi
 
 **Errors:** `Bosh::Clouds::CloudError` on PVE API failure
 
-**Notes:** Removes the disk from the VM's PVE config and awaits the PVE task. With `api_version: 2` stemcells, the Director notifies the agent of the detach directly; the CPI does not touch the registry. A snapshot pre-flight guard runs first: if the VM has snapshots that reference the disk, detach is rejected with an actionable error naming the blocking snapshots (PVE would otherwise reject it with a raw message). Set `pve.allow_disk_ops_with_snapshots` to bypass. See [Snapshot guard on disk operations](#snapshot-guard-on-disk-operations).
+**Notes:** Removes the disk from the VM's PVE config and awaits the PVE task. The Director notifies the agent of the detach directly; the CPI makes no additional calls after the PVE task completes. A snapshot pre-flight guard runs first: if the VM has snapshots that reference the disk, detach is rejected with an actionable error naming the blocking snapshots (PVE would otherwise reject it with a raw message). Set `pve.allow_disk_ops_with_snapshots` to bypass. See [Snapshot guard on disk operations](#snapshot-guard-on-disk-operations).
 
 **Parked disk strategy:** When `pve.detached_disk_strategy: parked` is configured, `detach_disk` parks the disk on a dedicated parker VM after the physical detach completes. A park failure returns a retriable error; the disk remains free-floating and the Director retries. On retry, if the disk is already parked, the handler returns success without making further API calls (idempotent). If the disk arrives at `detach_disk` already in the detached state (a retry scenario), the CPI checks whether it is already parked and re-parks it if not. Parker VMs use VMIDs in the range configured by `pve.parked_disk_vmid_range_start` and `pve.parked_disk_vmid_range_end` (default 90000–90999). See [persistent-disks.md](persistent-disks.md) for the full parked disk lifecycle.
 
@@ -704,7 +704,7 @@ Residual risk: with `sdn_auto_manage_zone=true`, any zone supplied via `cloud_pr
 | 2 | `create_stemcell` | Stemcell | stemcell\_cid | No change |
 | 3 | `delete_stemcell` | Stemcell | null | No change |
 | 4 | `create_vm` | VM | [vm\_cid, networks] | Returns array (was bare string) |
-| 5 | `delete_vm` | VM | null | Registry skip in v2 |
+| 5 | `delete_vm` | VM | null | No registry in v2 |
 | 6 | `has_vm` | VM | Boolean | No change |
 | 7 | `reboot_vm` | VM | null | No change |
 | 8 | `set_vm_metadata` | VM | null | No change |
@@ -713,7 +713,7 @@ Residual risk: with `sdn_auto_manage_zone=true`, any zone supplied via `cloud_pr
 | 11 | `delete_disk` | Disk | null | No change |
 | 12 | `has_disk` | Disk | Boolean | No change |
 | 13 | `attach_disk` | Disk | disk\_hints Hash | Returns hints (was void) |
-| 14 | `detach_disk` | Disk | null | Registry skip in v2 |
+| 14 | `detach_disk` | Disk | null | No registry in v2 |
 | 15 | `get_disks` | Disk | Array of String | No change |
 | 16 | `snapshot_disk` | Disk | snapshot\_cid | No change |
 | 17 | `delete_snapshot` | Disk | null | No change |

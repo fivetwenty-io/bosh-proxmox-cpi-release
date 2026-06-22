@@ -42,11 +42,9 @@ Packages are grouped by role. Each is described in one sentence.
 
 ### Bootstrap and side channels
 
-- `internal/agent` — the `Agent` abstraction (`Configure`, `Remove`, `UpdateDiskHints`) with cloudinit, registry, noagent, and auto factories.
+- `internal/agent` — the `Agent` abstraction (`Configure`, `Remove`, `UpdateDiskHints`) with cloudinit, noagent, and auto factories.
 
 - `internal/configdrive` — builds the ISO 9660 config-drive image the cloudinit agent uses to deliver settings; see [ConfigDrive](configdrive.md).
-
-- `internal/registry` — the optional BOSH registry HTTP client, HTTPS by default, with an SSRF guard that blocks redirects and a resolved-host allowlist.
 
 - `internal/lb` — a HAProxy Data Plane API client used by the `lb_register` hook to add and remove backend servers.
 
@@ -83,7 +81,6 @@ graph TD
         exec
         lb
         placement
-        registry
     end
     subgraph T2[Tier 2]
         pve
@@ -105,7 +102,6 @@ graph TD
     exec --> log
     lb --> errors
     placement --> log
-    registry --> errors
     pve --> config
     pve --> log
     config --> hooks
@@ -114,7 +110,6 @@ graph TD
     hooks --> lb
     sfetch --> pve
     agent --> configdrive
-    agent --> registry
     agent --> pve
     handlers --> agent
     handlers --> placement
@@ -143,7 +138,6 @@ graph TD
     Handler -->|Bootstrap| Agent[internal/agent]
     PVE -->|HTTPS, retry + pushback| API[PVE API]
     Agent -.->|cloudinit| PVE
-    Agent -.->|registry| Registry[internal/registry]
     Handler -->|error| Rollback[Rollback stack LIFO]
     Handler -->|Result or Error| Dispatcher
     Dispatcher -->|Encode| RPC
@@ -182,7 +176,7 @@ PVE resource pools double as a cluster-wide mutex: `POST /pools` is pmxcfs-seria
 
 ### Agent mode selection
 
-Four agent modes exist: `cloudinit` (the default), `registry`, `noagent`, and `auto`. The `auto` mode defers the choice to `create_vm` time, inspecting the stemcell API version (parsed by `parseAPIVersion`); it picks the registry agent when a registry endpoint is configured, and falls back to cloudinit otherwise. The factory rejects `auto` directly, because auto is resolved per call rather than once at startup. The `internal/configdrive` package builds the ISO 9660 image that the cloudinit path delivers; see [ConfigDrive](configdrive.md).
+Three agent modes exist: `cloudinit` (the default), `noagent`, and `auto`. The `auto` mode always selects configdrive bootstrap — it is equivalent to `cloudinit` for all stemcells. The factory resolves `auto` per call rather than once at startup. The `internal/configdrive` package builds the ISO 9660 image the cloudinit path delivers; see [ConfigDrive](configdrive.md).
 
 ### Retry, pushback, and in-flight limiting
 
@@ -194,7 +188,7 @@ Every PVE call that returns a UPID is awaited via `AwaitTask` before the handler
 
 ### Log redaction
 
-`RedactSecrets` deep-walks maps and strings before anything reaches the log. It masks map values whose key contains a sensitive fragment (password, secret, token, mbus, signature, and similar) or matches `user`/`username` exactly, URL userinfo segments (`scheme://user:pass@host`), and URL query parameters matching a sensitive fragment or the exact token `sig`. The dispatcher applies it to traced arguments and results; the same walk masks credentials embedded in URL-shaped strings. Credentials in cloud properties or registry endpoints must never appear in plaintext logs.
+`RedactSecrets` deep-walks maps and strings before anything reaches the log. It masks map values whose key contains a sensitive fragment (password, secret, token, mbus, signature, and similar) or matches `user`/`username` exactly, URL userinfo segments (`scheme://user:pass@host`), and URL query parameters matching a sensitive fragment or the exact token `sig`. The dispatcher applies it to traced arguments and results; the same walk masks credentials embedded in URL-shaped strings. Credentials in cloud properties must never appear in plaintext logs.
 
 ## Error Mapping
 

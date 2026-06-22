@@ -11,7 +11,6 @@ import (
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/agent"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
 	sdkcloudinit "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cloudinit"
@@ -922,7 +921,7 @@ func testConfigureAgentEphemeralPath(t *testing.T, inputPath, wantEphemeral stri
 	}
 	shape := &createVMShape{node: "pve"}
 
-	err := configureAgent(context.Background(), deps, log.NewNopLogger(), parsed, shape, 200, "vm-200", inputPath, jsonrpc.Context{})
+	err := configureAgent(context.Background(), deps, log.NewNopLogger(), parsed, shape, 200, "vm-200", inputPath)
 	if err != nil {
 		t.Fatalf("configureAgent returned error: %v", err)
 	}
@@ -940,8 +939,5 @@ func (a *dsEphemeralAgent) Configure(ctx context.Context, node string, vmid int,
 	return a.configureFn(ctx, node, vmid, cfg)
 }
 func (a *dsEphemeralAgent) Remove(_ context.Context, _ string, _ int) error { return nil }
-func (a *dsEphemeralAgent) UpdateDiskHints(_ context.Context, _ int, _ []agent.DiskHint) error {
-	return nil
-}
 
 var _ agent.Agent = (*dsEphemeralAgent)(nil)

@@ -98,19 +98,16 @@ properties:
       API TLS certificate. When empty (default), the system trust pool is used
       unmodified — behavior is byte-identical to prior releases. When set, the
       PEM is parsed and the resulting cert pool replaces the system pool for PVE
-      API HTTPS verification. Ignored when verify_ssl is false. Symmetric to
-      registry.ca_cert.
+      API HTTPS verification. Ignored when verify_ssl is false.
     default: ""
   pve.agent_mode:
     description: |
-      Agent bootstrap mode. Valid values: cloudinit, registry, noagent, auto.
-      "cloudinit" — uses cloud-init (default).
-      "registry" — uses BOSH registry at registry.endpoint.
+      Agent bootstrap mode. Valid values: cloudinit, noagent, auto.
+      "cloudinit" — uses cloud-init configdrive (default).
       "noagent" — no agent bootstrap; assumes DNS/manual setup.
-      "auto" — selects registry-less mode (configdrive) for stemcell api_version >= 2,
-               falls back to registry for v1 stemcells. Requires registry_endpoint to be
-               set for v1 stemcell compatibility. Omitted from rendered cpi.json when
-               default "cloudinit" is used.
+      "auto" — selects configdrive (cloudinit) for all stemcells. Equivalent
+               to cloudinit; retained for manifest compatibility.
+               Omitted from rendered cpi.json when default "cloudinit" is used.
     default: "cloudinit"
   pve.vm_disk_format:
     description: "Disk format: qcow2, raw, vmdk"
@@ -266,29 +263,6 @@ properties:
   agent.blobstore:
     description: "Optional default blobstore for settings.json (agent.blobstore in bosh.yml)"
     default: {}
-  registry.endpoint:
-    description: "BOSH registry endpoint (required if agent_mode=registry)"
-    default: ""
-  registry.user:
-    description: "Registry user"
-    default: ""
-  registry.password:
-    description: "Registry password"
-    default: ""
-  registry.allow_insecure:
-    description: |
-      When true, permits a plaintext http:// registry endpoint. Default false:
-      Validate rejects any non-https scheme so registry credentials never travel
-      in cleartext. Set to true only for lab/test deployments; production
-      deployments must use https with verified certificates.
-    default: false
-  registry.ca_cert:
-    description: |
-      Optional PEM-encoded CA certificate (or chain) appended to the host's
-      system trust pool when verifying the registry's TLS certificate. Use when
-      the registry presents a certificate signed by a private CA the host trust
-      store does not already include. Empty means use the system pool unmodified.
-    default: ""
   pve.stemcell_staging_dir:
     description: |
       Optional. When set, restricts stemcell file reads/writes to this directory
@@ -364,25 +338,6 @@ properties:
       detect silently-dropped connections on stateful firewalls between the CPI
       host and the PVE API endpoint. Must be >= 0.
     default: 0
-  registry.allowed_hosts:
-    description: |
-      Optional. If non-empty, restricts the registry HTTP client to only
-      contact hosts matching one of these patterns. Each entry is either an
-      exact host (e.g. "registry.example.com") or a wildcard prefix
-      (e.g. "*.example.com"). Defense-in-depth against SSRF via host mutation.
-      Empty (default) disables host-allow-list filtering; the configuredHost
-      invariant and disabled redirects still apply regardless.
-    default: []
-  registry.allow_private_ip:
-    description: |
-      When true, disables the private/loopback IP rejection guard on the
-      registry endpoint. Default false: the registry client rejects endpoints
-      whose resolved IP is private (RFC1918: 10/8, 172.16/12, 192.168/16),
-      loopback (127/8, ::1), link-local (169.254/16, fe80::/10), or unspecified.
-      Set to true only for lab/test deployments where the registry is
-      intentionally on a private network. Production deployments must leave
-      this unset or false and use a publicly routable registry address.
-    default: false
   pve.ensure_no_ip_conflicts:
     description: |
       When true (default), create_vm checks that no existing VM on the candidate
@@ -463,8 +418,8 @@ properties:
     description: |
       When true, the CPI emits a debug-level trace of each call's request
       arguments and result with credentials masked — the mbus URL's embedded
-      NATS credentials, blobstore secret_access_key/password, registry
-      credentials, and any other sensitive-named key are replaced with
+      NATS credentials, blobstore secret_access_key/password, and any other
+      sensitive-named key are replaced with
       <redacted> while the structure is preserved. When false (default), no
       payload trace is emitted and logging is identical to prior releases.
       Recommended on so an operator raising the log level to triage a deploy

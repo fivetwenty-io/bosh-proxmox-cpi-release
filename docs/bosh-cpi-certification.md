@@ -39,7 +39,7 @@ Create a CPI config file (e.g. `~/.bosh-pve-cpi/cpi.json`):
 
 Notes:
 
-- `agent_mode: noagent` is recommended for lifecycle tests — the harness validates CPI plumbing, not agent bootstrap. Set `cloudinit` or `registry` to exercise the full agent handoff.
+- `agent_mode: noagent` is recommended for lifecycle tests — the harness validates CPI plumbing, not agent bootstrap. Set `cloudinit` to exercise the full agent handoff.
 - `vmid_range_start: 9000` (or any value above your production VMID range) avoids conflicts with real workloads.
 - Use an API token rather than a password — it appears in PVE audit logs as a distinct identity and can be revoked independently.
 

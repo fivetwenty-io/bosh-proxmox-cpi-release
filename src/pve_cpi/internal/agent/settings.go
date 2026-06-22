@@ -11,9 +11,9 @@ func vmNameDefault(vmid int) string { return fmt.Sprintf("vm-%d", vmid) }
 func vmidString(vmid int) string    { return strconv.Itoa(vmid) }
 
 // settingsJSON is the BOSH agent settings.json payload. ConfigDrive writes
-// it as raw bytes at /ec2/latest/user-data; RegistryAgent PUTs it to the
-// /instances/{vmid} record. The struct shape and tag set are part of the
-// BOSH agent contract — all fields must be present even when zero-valued.
+// it as raw bytes at /ec2/latest/user-data. The struct shape and tag set
+// are part of the BOSH agent contract — all fields must be present even
+// when zero-valued.
 type settingsJSON struct {
 	AgentID   string                 `json:"agent_id"`
 	VM        VMSpec                 `json:"vm"`

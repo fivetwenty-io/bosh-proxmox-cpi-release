@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -89,8 +88,7 @@ type CPIConfig struct {
 	// Use when the PVE host presents a certificate signed by a private CA that
 	// the host trust store does not already include. When empty (the default),
 	// TLS verification uses the system trust pool — behavior is byte-identical to
-	// prior releases. Ignored when VerifySSL is false. Symmetric to
-	// RegistryCACertPEM / registry.ca_cert.
+	// prior releases. Ignored when VerifySSL is false.
 	PVECACertPEM string `json:"pve_ca_cert,omitempty"`
 
 	// OperatorID is an optional label appended to the User-Agent header on all
@@ -176,45 +174,6 @@ type CPIConfig struct {
 	// resolves to 120 seconds. Negative values are rejected at validation. Use
 	// ResizeConvergenceTimeoutSecValue().
 	ResizeConvergenceTimeoutSec int `json:"resize_convergence_timeout_sec,omitempty"`
-
-	// Registry (required only when agent_mode == "registry")
-	RegistryEndpoint string `json:"registry_endpoint,omitempty"`
-	RegistryUser     string `json:"registry_user,omitempty"`
-	RegistryPassword string `json:"registry_password,omitempty"`
-
-	// RegistryAllowInsecure relaxes the default https:// requirement on the
-	// registry endpoint. When false (default), Validate rejects any non-https
-	// scheme so credentials are never transmitted in cleartext. When true and
-	// the endpoint is http://, Validate emits a single warning log and proceeds.
-	RegistryAllowInsecure bool `json:"registry_allow_insecure,omitempty"`
-
-	// RegistryCACertPEM is an optional PEM-encoded CA certificate (or chain)
-	// appended to the host's system trust pool when building the registry
-	// HTTP client. Use when the registry presents a certificate signed by a
-	// private CA the host trust store does not already include. Ignored when
-	// empty (system trust pool used unmodified).
-	RegistryCACertPEM string `json:"registry_ca_cert,omitempty"`
-
-	// RegistryAllowedHosts is an optional list of host patterns that restrict
-	// which hosts the registry HTTP client is permitted to contact. Each entry
-	// is either an exact host (e.g. "registry.example.com") or a wildcard
-	// prefix pattern (e.g. "*.example.com"). When non-empty, the registry
-	// client rejects any request whose resolved host does not match at least
-	// one entry. Empty (default) disables host-allow-list filtering; the
-	// configuredHost invariant and disabled redirects still apply regardless.
-	// Defense-in-depth against SSRF via host mutation.
-	RegistryAllowedHosts []string `json:"registry_allowed_hosts,omitempty" yaml:"registry_allowed_hosts,omitempty"`
-
-	// RegistryAllowPrivateIP disables the private/loopback IP rejection guard
-	// on the registry endpoint when true. Default nil (treated as false): the
-	// registry client rejects endpoints whose IP address is private (RFC1918),
-	// loopback (127/8, ::1), link-local (169.254/16, fe80::/10), or unspecified
-	// (0.0.0.0, ::). Set to true only for lab/test deployments where the
-	// registry is intentionally on a private network (e.g. 192.168.x.x).
-	// Pointer-typed so nil (field absent from JSON) is distinguishable from an
-	// explicit false. Use RegistryAllowPrivateIPValue() to obtain the
-	// effective bool. Validate-only-when-set; omit from ERB output when nil.
-	RegistryAllowPrivateIP *bool `json:"registry_allow_private_ip,omitempty"`
 
 	// AgentMBus is the URL the BOSH agent should bind/listen on inside the VM
 	// (e.g. https://mbus:pw@0.0.0.0:6868). Sourced from
@@ -1246,14 +1205,20 @@ func warnUnknownFields(raw []byte) {
 }
 
 // validateStrictUnknownKeys appends an error to errs for each unknown
-// top-level key found in raw, but only when strict config validation is
-// enabled. When strict is off this is a no-op so behavior is byte-identical.
+// top-level key found in raw. Keys with the prefix "registry_" are always
+// rejected with a migration error (the BOSH registry was removed), regardless
+// of strict mode. Other unknown keys produce an error only when
+// strict_config_validation is enabled.
 func (c *CPIConfig) validateStrictUnknownKeys(raw []byte, errs *[]string) {
-	if !c.StrictConfigValidationEnabled() {
-		return
-	}
+	strict := c.StrictConfigValidationEnabled()
 	for _, k := range unknownConfigKeys(raw) {
-		*errs = append(*errs, fmt.Sprintf("unknown config key %q (strict_config_validation=true)", k))
+		if strings.HasPrefix(k, "registry_") {
+			*errs = append(*errs, fmt.Sprintf("config key %q is no longer supported (the BOSH registry was removed)", k))
+			continue
+		}
+		if strict {
+			*errs = append(*errs, fmt.Sprintf("unknown config key %q (strict_config_validation=true)", k))
+		}
 	}
 }
 
@@ -1515,17 +1480,6 @@ func (c *CPIConfig) NUMAValue() bool {
 		return true
 	}
 	return *c.NUMA
-}
-
-// RegistryAllowPrivateIPValue returns the effective allow-private-IP toggle.
-// nil (field absent from JSON) → false (guard active, private IPs rejected).
-// *true  → true (guard disabled, private IPs permitted — lab/test only).
-// *false → false (guard active, identical to nil but explicit).
-func (c *CPIConfig) RegistryAllowPrivateIPValue() bool {
-	if c.RegistryAllowPrivateIP == nil {
-		return false
-	}
-	return *c.RegistryAllowPrivateIP
 }
 
 // PlacementEnabled returns the effective placement-scoring toggle.
@@ -2483,25 +2437,20 @@ func (c *CPIConfig) StemcellReplicationConcurrencyValue() int {
 
 // Validate checks all required fields and enum constraints.
 // Returns a CloudError whose message lists every violation, separated by "; ".
-//
-// Validate may emit warning log entries (registry_allow_insecure and
-// registry_allow_private_ip opt-in paths). Warnings are written to a
-// stderr-backed slog logger; callers who need to capture them for assertions
-// should use ValidateWithLogger instead.
 func (c *CPIConfig) Validate() error {
 	return c.ValidateWithLogger(nil)
 }
 
-// ValidateWithLogger is identical to Validate, but routes any warning entries
-// to logger instead of the default stderr fallback. A nil logger uses the
-// default fallback (matching the legacy Validate behavior).
-func (c *CPIConfig) ValidateWithLogger(logger *log.Logger) error {
+// ValidateWithLogger is identical to Validate, but accepts a logger parameter
+// for any warning entries. A nil logger uses the default stderr fallback.
+// The logger parameter is retained for API compatibility; no registry warnings
+// are emitted since the registry was removed.
+func (c *CPIConfig) ValidateWithLogger(_ *log.Logger) error {
 	var errs []string
 	c.validateRequiredFields(&errs)
 	c.validateAuth(&errs)
 	c.validateEnumFields(&errs)
 	c.validateRanges(&errs)
-	c.validateRegistryConfig(&errs, logger)
 	c.validatePlacement(&errs)
 	c.validateHooks(&errs)
 	c.validateMetrics(&errs)
@@ -2557,11 +2506,13 @@ func (c *CPIConfig) validateAuth(errs *[]string) {
 func (c *CPIConfig) validateEnumFields(errs *[]string) {
 	// AgentMode enum.
 	switch c.AgentMode {
-	case "cloudinit", "registry", "noagent", "auto":
+	case "cloudinit", "noagent", "auto":
 		// valid
+	case "registry":
+		*errs = append(*errs, `agent_mode "registry" is no longer supported (the BOSH registry was deprecated upstream); set agent_mode to "cloudinit"`)
 	default:
 		*errs = append(*errs, fmt.Sprintf(
-			"agent_mode must be one of cloudinit|registry|noagent|auto, got %q", c.AgentMode,
+			"agent_mode must be one of cloudinit|noagent|auto, got %q", c.AgentMode,
 		))
 	}
 
@@ -2951,140 +2902,6 @@ func (c *CPIConfig) appendStemcellFetchTimeoutErrors(errs *[]string) {
 	check("stemcell_fetch_tls_handshake_timeout_sec", c.StemcellFetchTLSHandshakeTimeoutSec)
 	check("stemcell_fetch_response_header_timeout_sec", c.StemcellFetchResponseHeaderTimeoutSec)
 	check("stemcell_fetch_idle_conn_timeout_sec", c.StemcellFetchIdleConnTimeoutSec)
-}
-
-// validateRegistryConfig appends errors for registry-related constraints when
-// agent_mode=registry. Checks endpoint presence, user presence, password presence,
-// scheme guard (https required unless registry_allow_insecure=true), and
-// registry_allowed_hosts format (host patterns only, no scheme or path).
-func (c *CPIConfig) validateRegistryConfig(errs *[]string, logger *log.Logger) {
-	if c.AgentMode != "registry" {
-		return
-	}
-
-	if c.RegistryEndpoint == "" {
-		*errs = append(*errs, "registry_endpoint is required when agent_mode=registry")
-	}
-	if c.RegistryUser == "" {
-		*errs = append(*errs, "registry_user is required when agent_mode=registry")
-	}
-	if c.RegistryPassword == "" {
-		*errs = append(*errs, "registry_password is required when agent_mode=registry")
-	}
-
-	// Scheme guard: refuse plaintext http:// (or any non-https scheme) unless
-	// the operator has explicitly set registry_allow_insecure=true. Credentials
-	// flow over this connection on every settings PUT/GET; default-deny matches
-	// the verify_ssl=true default for the PVE connection.
-	if c.RegistryEndpoint != "" {
-		if msg := c.validateRegistryScheme(logger); msg != "" {
-			*errs = append(*errs, msg)
-		}
-	}
-
-	// registry_allow_private_ip opt-in warning: when the operator has explicitly
-	// enabled the override, emit a single warning so the choice is visible in
-	// logs. Nil and explicit false are silent (guard active is the safe default).
-	if c.RegistryAllowPrivateIP != nil && *c.RegistryAllowPrivateIP {
-		emitRegistryPrivateIPWarning(logger, c.RegistryEndpoint)
-	}
-
-	// registry_allowed_hosts: each entry must be a non-empty string with no
-	// scheme or path component (host patterns only).
-	for i, h := range c.RegistryAllowedHosts {
-		if h == "" {
-			*errs = append(*errs, fmt.Sprintf("registry_allowed_hosts[%d] must not be empty", i))
-			continue
-		}
-		if strings.Contains(h, "://") {
-			*errs = append(*errs, fmt.Sprintf(
-				"registry_allowed_hosts[%d] %q must be a host pattern (no scheme; use e.g. \"host.example.com\" or \"*.example.com\")", i, h,
-			))
-			continue
-		}
-		if strings.Contains(h, "/") {
-			*errs = append(*errs, fmt.Sprintf(
-				"registry_allowed_hosts[%d] %q must be a host pattern (no path component)", i, h,
-			))
-		}
-	}
-}
-
-// validateRegistryScheme parses RegistryEndpoint and applies the scheme guard.
-// Returns an empty string on success, or a violation message suitable for
-// appending to the validation error list. When the opt-in flag is set and the
-// scheme is http://, a single warning is emitted to logger (or to a stderr
-// fallback when logger is nil).
-func (c *CPIConfig) validateRegistryScheme(logger *log.Logger) string {
-	u, err := url.Parse(c.RegistryEndpoint)
-	if err != nil {
-		return fmt.Sprintf("registry_endpoint %q is not a valid URL: %s", c.RegistryEndpoint, err.Error())
-	}
-	scheme := strings.ToLower(u.Scheme)
-	if scheme == "" {
-		return fmt.Sprintf(
-			"registry_endpoint %q is missing a scheme; expected https:// (or http:// with registry_allow_insecure=true)",
-			c.RegistryEndpoint,
-		)
-	}
-	if scheme == "https" {
-		return ""
-	}
-	if !c.RegistryAllowInsecure {
-		return fmt.Sprintf(
-			"registry_endpoint scheme must be https (got %q); set registry_allow_insecure=true to permit plaintext",
-			scheme,
-		)
-	}
-	// Opt-in to insecure transport: only http:// is supported as the cleartext
-	// alternative. Anything else (e.g. ftp, gopher) is rejected outright.
-	if scheme != "http" {
-		return fmt.Sprintf(
-			"registry_endpoint scheme %q is not supported even with registry_allow_insecure=true (use https:// or http://)",
-			scheme,
-		)
-	}
-	emitRegistryInsecureWarning(logger, c.RegistryEndpoint)
-	return ""
-}
-
-// emitRegistryInsecureWarning logs the opt-in plaintext warning to logger.
-// When logger is nil it builds a stderr-backed warn-level logger (matching the
-// pattern used by warnUnknownFields) so the warning surfaces even when Validate
-// is invoked before the application logger is constructed.
-func emitRegistryInsecureWarning(logger *log.Logger, endpoint string) {
-	target := logger
-	if target == nil {
-		fallback, err := log.NewLogger("warn", os.Stderr)
-		if err != nil {
-			return
-		}
-		target = fallback
-	}
-	target.Warn(
-		"registry_allow_insecure=true; transmitting credentials over cleartext http",
-		log.String("endpoint", redactEndpoint(endpoint)),
-	)
-}
-
-// emitRegistryPrivateIPWarning logs the allow-private-ip opt-in warning to
-// logger. When logger is nil it builds a stderr-backed warn-level logger
-// (matching the pattern used by emitRegistryInsecureWarning) so the warning
-// surfaces even when Validate is invoked before the application logger is
-// constructed.
-func emitRegistryPrivateIPWarning(logger *log.Logger, endpoint string) {
-	target := logger
-	if target == nil {
-		fallback, err := log.NewLogger("warn", os.Stderr)
-		if err != nil {
-			return
-		}
-		target = fallback
-	}
-	target.Warn(
-		"registry_allow_private_ip=true; private/loopback IP check disabled for registry endpoint",
-		log.String("endpoint", redactEndpoint(endpoint)),
-	)
 }
 
 // validatePlacement validates the optional Placement block. Skipped entirely
@@ -3611,18 +3428,4 @@ func (c *CPIConfig) validateStorageTiers(errs *[]string) {
 			}
 		}
 	}
-}
-
-// redactEndpoint strips userinfo from a URL so the endpoint can be logged
-// without leaking embedded credentials. A parse failure returns the original
-// string unchanged so the operator still sees something useful in logs.
-func redactEndpoint(endpoint string) string {
-	u, err := url.Parse(endpoint)
-	if err != nil {
-		return endpoint
-	}
-	if u.User != nil {
-		u.User = url.UserPassword("REDACTED", "REDACTED")
-	}
-	return u.String()
 }

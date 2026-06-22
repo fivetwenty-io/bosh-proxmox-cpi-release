@@ -2,7 +2,7 @@
 
 Go implementation of the BOSH Cloud Provider Interface (CPI) v2 for Proxmox VE 9.x.
 
-The CPI provisions VMs, persistent disks, networks, snapshots, and stemcells on a PVE cluster on behalf of a BOSH Director. It speaks the BOSH JSON-RPC envelope over stdin/stdout, supports three agent bootstrap modes (`cloudinit`, `registry`, and `noagent`), and ships as a single static Go binary packaged into a BOSH release.
+The CPI provisions VMs, persistent disks, networks, snapshots, and stemcells on a PVE cluster on behalf of a BOSH Director. It speaks the BOSH JSON-RPC envelope over stdin/stdout, supports three agent bootstrap modes (`cloudinit`, `noagent`, and `auto`), and ships as a single static Go binary packaged into a BOSH release.
 
 - BOSH CPI v2 compliant (`api_version: 2`)
 - PVE SDN vnet lifecycle plus Linux bridge fallback for managed networks
@@ -74,7 +74,7 @@ For end-to-end CPI method exercise against a live cluster, see [BOSH CPI Lifecyc
 
 ## Properties
 
-The CPI exposes properties under the `pve.*`, `agent.*`, and `registry.*` namespaces. The most operator-relevant subset is below; the [full property reference](docs/configuration.md) documents every field with defaults, types, and validation rules.
+The CPI exposes properties under the `pve.*` and `agent.*` namespaces. The most operator-relevant subset is below; the [full property reference](docs/configuration.md) documents every field with defaults, types, and validation rules.
 
 | Property | Description | Default |
 |---|---|---|
@@ -89,9 +89,9 @@ The CPI exposes properties under the `pve.*`, `agent.*`, and `registry.*` namesp
 | `pve.iso_storage` | Storage pool for per-VM ConfigDrive ISOs | `local` |
 | `pve.network_bridge` | Default Linux bridge for VM NICs | `vmbr0` |
 | `pve.network_mode` | Managed-network mode (`sdn`, `bridge`, `auto`) | `auto` |
-| `pve.agent_mode` | Agent bootstrap mode (`cloudinit`, `registry`, `noagent`) | `cloudinit` |
+| `pve.agent_mode` | Agent bootstrap mode (`cloudinit`, `noagent`, `auto`) | `cloudinit` |
 
-The full table covers the remaining properties, including SDN zone management, snapshot guards, hotplug flags, reboot strategy, VMID allocation range, detached-disk lifecycle strategy, registry TLS pinning, and the `agent.*` mbus fallback. See the [configuration reference](docs/configuration.md).
+The full table covers the remaining properties, including SDN zone management, snapshot guards, hotplug flags, reboot strategy, VMID allocation range, detached-disk lifecycle strategy, and the `agent.*` mbus fallback. See the [configuration reference](docs/configuration.md).
 
 ## Operations
 
@@ -172,7 +172,7 @@ For symptom-first triage of deployment, VM creation, disk attachment, network, a
 
 - VM creation hangs at agent settle — check [CPI logs](docs/operations.md#cpi-logs) for the import task UPID and the post-import NIC/disk attach sequence.
 - Disk attach rejected with snapshot guard — review [snapshot guard on disk operations](docs/cpi_methods.md#snapshot-guard-on-disk-operations).
-- Registry endpoint rejected at startup — `registry.endpoint` must be `https://` unless `registry.allow_insecure: true` is set explicitly.
+
 
 ## Reference
 

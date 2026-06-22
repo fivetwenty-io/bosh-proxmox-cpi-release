@@ -19,7 +19,6 @@ import (
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
 )
 
 // --------------------------------------------------------------------------
@@ -606,56 +605,6 @@ func TestValidate_AuthBoth(t *testing.T) {
 }
 
 // --------------------------------------------------------------------------
-// TestValidate_RegistryRequiresFields
-// --------------------------------------------------------------------------
-
-func TestValidate_RegistryRequiresFields(t *testing.T) {
-	t.Parallel()
-	cases := []struct {
-		name    string
-		json    string
-		wantMsg string
-	}{
-		{
-			name: "missing endpoint",
-			json: `{
-				"host":"h","user":"u","password":"p",
-				"vm_storage":"s","disk_storage":"s","network_bridge":"br",
-				"agent_mode":"registry",
-				"registry_user":"ru","registry_password":"rp"
-			}`,
-			wantMsg: "registry_endpoint is required",
-		},
-		{
-			name: "missing registry_user",
-			json: `{
-				"host":"h","user":"u","password":"p",
-				"vm_storage":"s","disk_storage":"s","network_bridge":"br",
-				"agent_mode":"registry",
-				"registry_endpoint":"http://r:25777","registry_password":"rp"
-			}`,
-			wantMsg: "registry_user is required",
-		},
-		{
-			name: "missing registry_password",
-			json: `{
-				"host":"h","user":"u","password":"p",
-				"vm_storage":"s","disk_storage":"s","network_bridge":"br",
-				"agent_mode":"registry",
-				"registry_endpoint":"http://r:25777","registry_user":"ru"
-			}`,
-			wantMsg: "registry_password is required",
-		},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			_, err := mustLoad(t, tc.json)
-			assertCloudError(t, err, tc.wantMsg)
-		})
-	}
-}
-
-// --------------------------------------------------------------------------
 // TestApplyDefaults_AllFields
 // --------------------------------------------------------------------------
 
@@ -1104,28 +1053,6 @@ func TestValidate_RebootTimeoutTooLarge(t *testing.T) {
 }
 
 // --------------------------------------------------------------------------
-// TestLoad_RegistryMode_Valid
-// --------------------------------------------------------------------------
-
-func TestLoad_RegistryMode_Valid(t *testing.T) {
-	t.Parallel()
-	cfg, err := mustLoad(t, `{
-		"host":"h","user":"u","password":"p",
-		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
-		"agent_mode":"registry",
-		"registry_endpoint":"https://registry:25777",
-		"registry_user":"admin",
-		"registry_password":"secret"
-	}`)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if cfg.RegistryEndpoint != "https://registry:25777" {
-		t.Errorf("RegistryEndpoint = %q", cfg.RegistryEndpoint)
-	}
-}
-
-// --------------------------------------------------------------------------
 // TestApplyDefaults_VMIDRangeEnd
 // --------------------------------------------------------------------------
 
@@ -1544,32 +1471,139 @@ func TestLoad_SnapshotGuardBools(t *testing.T) {
 }
 
 // --------------------------------------------------------------------------
-// Registry scheme guard
+// Registry migration errors
 // --------------------------------------------------------------------------
 
-// registryBaseCfg returns a CPIConfig with all required non-registry fields
-// populated and AgentMode=registry. Caller sets RegistryEndpoint per test.
-func registryBaseCfg() *config.CPIConfig {
+// validBaseCfg returns a fully populated CPIConfig using cloudinit mode.
+// Tests that previously used validBaseCfg() now call this helper.
+func validBaseCfg() *config.CPIConfig {
 	return &config.CPIConfig{
-		Host:             "h",
-		User:             "u",
-		Password:         "p",
-		VMStorage:        "s",
-		DiskStorage:      "s",
-		NetworkBridge:    "br",
-		Port:             8006,
-		VerifySSL:        boolPtr(true),
-		AgentMode:        "registry",
-		VMDiskFormat:     "qcow2",
-		LogLevel:         "info",
-		VMIDRangeStart:   100,
-		VMIDRangeEnd:     5999,
-		RebootMode:       "soft",
-		RebootTimeout:    60,
-		NetworkMode:      "auto",
-		SDNZoneType:      "simple",
-		RegistryUser:     "ru",
-		RegistryPassword: "rp",
+		Host:           "h",
+		User:           "u",
+		Password:       "p",
+		VMStorage:      "s",
+		DiskStorage:    "s",
+		NetworkBridge:  "br",
+		Port:           8006,
+		VerifySSL:      boolPtr(true),
+		AgentMode:      "cloudinit",
+		VMDiskFormat:   "qcow2",
+		LogLevel:       "info",
+		VMIDRangeStart: 100,
+		VMIDRangeEnd:   5999,
+		RebootMode:     "soft",
+		RebootTimeout:  60,
+		NetworkMode:    "auto",
+		SDNZoneType:    "simple",
+	}
+}
+
+// TestValidate_AgentModeRegistry_MigrationError verifies that agent_mode="registry"
+// returns a descriptive migration error telling the operator to use "cloudinit".
+func TestValidate_AgentModeRegistry_MigrationError(t *testing.T) {
+	t.Parallel()
+	cfg := validBaseCfg()
+	cfg.AgentMode = "registry"
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected migration error for agent_mode=registry, got nil")
+	}
+	if !strings.Contains(err.Error(), "no longer supported") {
+		t.Errorf("error %q must mention 'no longer supported'", err.Error())
+	}
+	if !strings.Contains(err.Error(), "cloudinit") {
+		t.Errorf("error %q must suggest 'cloudinit' as replacement", err.Error())
+	}
+}
+
+// TestLoad_AgentModeRegistry_MigrationError verifies Load() surfaces the
+// migration error when the config JSON specifies agent_mode="registry".
+func TestLoad_AgentModeRegistry_MigrationError(t *testing.T) {
+	t.Parallel()
+	_, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+		"agent_mode":"registry"
+	}`)
+	if err == nil {
+		t.Fatal("expected migration error, got nil")
+	}
+	if !strings.Contains(err.Error(), "no longer supported") {
+		t.Errorf("error %q must mention 'no longer supported'", err.Error())
+	}
+}
+
+// TestLoad_RegistryUnknownKey_MigrationError verifies that a registry_* key in
+// the config JSON produces a migration error unconditionally (strict_config_validation
+// OFF by default).
+func TestLoad_RegistryUnknownKey_MigrationError(t *testing.T) {
+	t.Parallel()
+	_, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+		"agent_mode":"cloudinit",
+		"registry_endpoint":"https://registry.example.com:25777"
+	}`)
+	if err == nil {
+		t.Fatal("expected migration error for registry_endpoint, got nil")
+	}
+	if !strings.Contains(err.Error(), "registry_endpoint") {
+		t.Errorf("error %q must name the removed key", err.Error())
+	}
+	if !strings.Contains(err.Error(), "no longer supported") {
+		t.Errorf("error %q must mention 'no longer supported'", err.Error())
+	}
+}
+
+// TestLoad_RegistryUnknownKey_MigrationError_StrictOn verifies the same
+// migration error also fires when strict_config_validation=true.
+func TestLoad_RegistryUnknownKey_MigrationError_StrictOn(t *testing.T) {
+	t.Parallel()
+	_, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+		"agent_mode":"cloudinit",
+		"strict_config_validation":true,
+		"registry_user":"ru"
+	}`)
+	if err == nil {
+		t.Fatal("expected migration error for registry_user, got nil")
+	}
+	if !strings.Contains(err.Error(), "registry_user") {
+		t.Errorf("error %q must name the removed key", err.Error())
+	}
+	if !strings.Contains(err.Error(), "no longer supported") {
+		t.Errorf("error %q must mention 'no longer supported'", err.Error())
+	}
+}
+
+// TestValidate_AgentModeCloudinit_Valid confirms cloudinit is still valid.
+func TestValidate_AgentModeCloudinit_Valid(t *testing.T) {
+	t.Parallel()
+	cfg := validBaseCfg()
+	cfg.AgentMode = "cloudinit"
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("expected nil for agent_mode=cloudinit, got %v", err)
+	}
+}
+
+// TestValidate_AgentModeNoagent_Valid confirms noagent is still valid.
+func TestValidate_AgentModeNoagent_Valid(t *testing.T) {
+	t.Parallel()
+	cfg := validBaseCfg()
+	cfg.AgentMode = "noagent"
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("expected nil for agent_mode=noagent, got %v", err)
+	}
+}
+
+// TestValidate_AgentModeAuto_Valid2 confirms auto is still valid.
+func TestValidate_AgentModeAuto_Valid2(t *testing.T) {
+	t.Parallel()
+	cfg := validBaseCfg()
+	cfg.AgentMode = "auto"
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("expected nil for agent_mode=auto, got %v", err)
 	}
 }
 
@@ -1659,123 +1693,6 @@ func TestApplyDefaults_BothCredentialsTokenWins(t *testing.T) {
 	}
 	if cfg.Password != "" {
 		t.Errorf("Password = %q, want empty (cleared when api_token also present)", cfg.Password)
-	}
-}
-
-func TestValidate_RegistryHTTPRejected(t *testing.T) {
-	t.Parallel()
-	cfg := registryBaseCfg()
-	cfg.RegistryEndpoint = "http://registry.example.com:25777"
-	// RegistryAllowInsecure left false (default).
-	err := cfg.Validate()
-	if err == nil {
-		t.Fatal("expected validation error, got nil")
-	}
-	if !strings.Contains(err.Error(), "registry_allow_insecure") {
-		t.Errorf("error %q must mention registry_allow_insecure for operator clarity", err.Error())
-	}
-	if !strings.Contains(err.Error(), "https") {
-		t.Errorf("error %q should name the required scheme (https)", err.Error())
-	}
-}
-
-func TestValidate_RegistryHTTPAllowedWithOptIn(t *testing.T) {
-	t.Parallel()
-	cfg := registryBaseCfg()
-	cfg.RegistryEndpoint = "http://registry.example.com:25777"
-	cfg.RegistryAllowInsecure = true
-
-	logger, obs := log.NewObservedLogger(log.LevelWarn)
-	if err := cfg.ValidateWithLogger(logger); err != nil {
-		t.Fatalf("expected nil error with opt-in true, got %v", err)
-	}
-
-	// Exactly one warn entry mentioning the opt-in flag must be emitted.
-	entries := obs.All()
-	if len(entries) == 0 {
-		t.Fatal("expected at least one warn log entry, got none")
-	}
-	found := false
-	for _, e := range entries {
-		if strings.Contains(e.Message, "registry_allow_insecure=true") &&
-			strings.Contains(e.Message, "cleartext") {
-			found = true
-			// Endpoint attribute must be present and must not leak userinfo.
-			ep, ok := e.Attrs["endpoint"]
-			if !ok {
-				t.Errorf("warn entry missing 'endpoint' attribute: %+v", e)
-			}
-			if epStr, _ := ep.(string); !strings.Contains(epStr, "registry.example.com") {
-				t.Errorf("endpoint attr %q lost host", epStr)
-			}
-		}
-	}
-	if !found {
-		t.Errorf("no warn entry matched the expected message; entries=%+v", entries)
-	}
-}
-
-func TestValidate_RegistryHTTPSAccepted(t *testing.T) {
-	t.Parallel()
-	cfg := registryBaseCfg()
-	cfg.RegistryEndpoint = "https://registry.example.com:25777"
-
-	if err := cfg.Validate(); err != nil {
-		t.Fatalf("expected nil error for https endpoint, got %v", err)
-	}
-}
-
-func TestValidate_NonRegistryModeIgnoresInsecureFlag(t *testing.T) {
-	t.Parallel()
-	cfg := registryBaseCfg()
-	cfg.AgentMode = "cloudinit"
-	// Registry endpoint left set with http:// — must be ignored entirely because
-	// the scheme guard only fires in registry mode.
-	cfg.RegistryEndpoint = "http://registry.example.com:25777"
-	cfg.RegistryAllowInsecure = false
-
-	if err := cfg.Validate(); err != nil {
-		t.Fatalf("expected nil error in cloudinit mode despite http registry endpoint, got %v", err)
-	}
-}
-
-func TestValidate_RegistryRejectsUnknownSchemeEvenWithOptIn(t *testing.T) {
-	t.Parallel()
-	cfg := registryBaseCfg()
-	cfg.RegistryEndpoint = "ftp://registry.example.com"
-	cfg.RegistryAllowInsecure = true
-
-	err := cfg.Validate()
-	if err == nil {
-		t.Fatal("expected rejection for ftp scheme even with opt-in, got nil")
-	}
-	if !strings.Contains(err.Error(), "not supported") {
-		t.Errorf("error %q should explain unsupported scheme", err.Error())
-	}
-}
-
-func TestValidate_RegistryRejectsMissingScheme(t *testing.T) {
-	t.Parallel()
-	cfg := registryBaseCfg()
-	cfg.RegistryEndpoint = "registry.example.com:25777"
-
-	err := cfg.Validate()
-	if err == nil {
-		t.Fatal("expected rejection for scheme-less endpoint, got nil")
-	}
-	if !strings.Contains(err.Error(), "scheme") {
-		t.Errorf("error %q should mention missing scheme", err.Error())
-	}
-}
-
-func TestValidateWithLogger_NilLoggerStillSucceedsOnHTTPSPath(t *testing.T) {
-	t.Parallel()
-	// Regression: ValidateWithLogger(nil) must behave identically to Validate()
-	// for the https success path (no warning to emit, so no logger needed).
-	cfg := registryBaseCfg()
-	cfg.RegistryEndpoint = "https://registry.example.com:25777"
-	if err := cfg.ValidateWithLogger(nil); err != nil {
-		t.Fatalf("expected nil error, got %v", err)
 	}
 }
 
@@ -2117,156 +2034,6 @@ func TestValidate_PVECACertPEM_IgnoredWhenVerifySSLFalse(t *testing.T) {
 	}`)
 	if err != nil {
 		t.Fatalf("malformed pve_ca_cert with verify_ssl=false: expected no error, got: %v", err)
-	}
-}
-
-// --------------------------------------------------------------------------
-// RegistryAllowPrivateIP field: accessor, JSON decode, validation warning.
-// --------------------------------------------------------------------------
-
-// TestRegistryAllowPrivateIPValue_Nil verifies nil pointer → false (guard active).
-func TestRegistryAllowPrivateIPValue_Nil(t *testing.T) {
-	t.Parallel()
-	var cfg config.CPIConfig
-	if cfg.RegistryAllowPrivateIPValue() {
-		t.Error("RegistryAllowPrivateIPValue() = true on nil pointer, want false")
-	}
-}
-
-// TestRegistryAllowPrivateIPValue_True verifies *true → true (guard disabled).
-func TestRegistryAllowPrivateIPValue_True(t *testing.T) {
-	t.Parallel()
-	cfg := &config.CPIConfig{RegistryAllowPrivateIP: boolPtr(true)}
-	if !cfg.RegistryAllowPrivateIPValue() {
-		t.Error("RegistryAllowPrivateIPValue() = false for *true, want true")
-	}
-}
-
-// TestRegistryAllowPrivateIPValue_False verifies *false → false (explicit; same as nil).
-func TestRegistryAllowPrivateIPValue_False(t *testing.T) {
-	t.Parallel()
-	cfg := &config.CPIConfig{RegistryAllowPrivateIP: boolPtr(false)}
-	if cfg.RegistryAllowPrivateIPValue() {
-		t.Error("RegistryAllowPrivateIPValue() = true for *false, want false")
-	}
-}
-
-// TestValidate_RegistryAllowPrivateIP_Unset verifies that omitting
-// registry_allow_private_ip from JSON leaves the pointer nil, passes
-// validation without error, and RegistryAllowPrivateIPValue() returns false.
-func TestValidate_RegistryAllowPrivateIP_Unset(t *testing.T) {
-	t.Parallel()
-	cfg, err := mustLoad(t, `{
-		"host":"h","user":"u","password":"p",
-		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
-		"agent_mode":"registry",
-		"registry_endpoint":"https://registry.example.com:25777",
-		"registry_user":"ru","registry_password":"rp"
-	}`)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if cfg.RegistryAllowPrivateIP != nil {
-		t.Errorf("RegistryAllowPrivateIP = %v, want nil (field absent from JSON)", cfg.RegistryAllowPrivateIP)
-	}
-	if cfg.RegistryAllowPrivateIPValue() {
-		t.Error("RegistryAllowPrivateIPValue() = true when field absent, want false")
-	}
-}
-
-// TestValidate_RegistryAllowPrivateIP_True verifies that registry_allow_private_ip=true
-// is accepted, the pointer is non-nil and true, and a warning log entry is emitted.
-func TestValidate_RegistryAllowPrivateIP_True(t *testing.T) {
-	t.Parallel()
-	cfg := registryBaseCfg()
-	cfg.RegistryEndpoint = "https://registry.example.com:25777"
-	cfg.RegistryAllowPrivateIP = boolPtr(true)
-
-	logger, obs := log.NewObservedLogger(log.LevelWarn)
-	if err := cfg.ValidateWithLogger(logger); err != nil {
-		t.Fatalf("expected nil error with allow_private_ip=true, got %v", err)
-	}
-
-	// Exactly one warn entry must be emitted mentioning the opt-in flag.
-	entries := obs.All()
-	found := false
-	for _, e := range entries {
-		if strings.Contains(e.Message, "registry_allow_private_ip=true") {
-			found = true
-			ep, ok := e.Attrs["endpoint"]
-			if !ok {
-				t.Errorf("warn entry missing 'endpoint' attribute: %+v", e)
-			}
-			if epStr, _ := ep.(string); !strings.Contains(epStr, "registry.example.com") {
-				t.Errorf("endpoint attr %q lost host", epStr)
-			}
-		}
-	}
-	if !found {
-		t.Errorf("no warn entry matched registry_allow_private_ip=true; entries=%+v", entries)
-	}
-}
-
-// TestValidate_RegistryAllowPrivateIP_False verifies that registry_allow_private_ip=false
-// is accepted and no warning is emitted (same effective behavior as nil).
-func TestValidate_RegistryAllowPrivateIP_False(t *testing.T) {
-	t.Parallel()
-	cfg := registryBaseCfg()
-	cfg.RegistryEndpoint = "https://registry.example.com:25777"
-	cfg.RegistryAllowPrivateIP = boolPtr(false)
-
-	logger, obs := log.NewObservedLogger(log.LevelWarn)
-	if err := cfg.ValidateWithLogger(logger); err != nil {
-		t.Fatalf("expected nil error with allow_private_ip=false, got %v", err)
-	}
-
-	// Explicit false must not emit the warning (guard is active, no operator action needed).
-	for _, e := range obs.All() {
-		if strings.Contains(e.Message, "registry_allow_private_ip") {
-			t.Errorf("unexpected warn entry for explicit false: %+v", e)
-		}
-	}
-}
-
-// TestValidate_RegistryAllowPrivateIP_NonRegistryModeIgnored verifies that the
-// allow_private_ip field is not evaluated when agent_mode != registry (the entire
-// validateRegistryConfig guard fires only in registry mode).
-func TestValidate_RegistryAllowPrivateIP_NonRegistryModeIgnored(t *testing.T) {
-	t.Parallel()
-	cfg, err := mustLoad(t, `{
-		"host":"h","user":"u","password":"p",
-		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
-		"agent_mode":"cloudinit",
-		"registry_allow_private_ip":true
-	}`)
-	if err != nil {
-		t.Fatalf("unexpected error in cloudinit mode with registry_allow_private_ip=true: %v", err)
-	}
-	if !cfg.RegistryAllowPrivateIPValue() {
-		t.Error("RegistryAllowPrivateIPValue() = false but JSON set it to true")
-	}
-}
-
-// TestLoad_RegistryAllowPrivateIP_JSONRoundTrip verifies the field decodes
-// correctly from JSON when present.
-func TestLoad_RegistryAllowPrivateIP_JSONRoundTrip(t *testing.T) {
-	t.Parallel()
-	cfg, err := mustLoad(t, `{
-		"host":"h","user":"u","password":"p",
-		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
-		"agent_mode":"registry",
-		"registry_endpoint":"https://registry.example.com:25777",
-		"registry_user":"ru","registry_password":"rp",
-		"registry_allow_private_ip":true
-	}`)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if cfg.RegistryAllowPrivateIP == nil {
-		t.Fatal("RegistryAllowPrivateIP = nil, want *true")
-	}
-	if !*cfg.RegistryAllowPrivateIP {
-		t.Error("*RegistryAllowPrivateIP = false, want true")
 	}
 }
 
@@ -4930,7 +4697,7 @@ func TestRetryPushback_JSONMarshal_SetIncluded(t *testing.T) {
 
 func TestValidate_RetryPushback_NegativeBaseMs(t *testing.T) {
 	t.Parallel()
-	c := registryBaseCfg()
+	c := validBaseCfg()
 	c.Retry = &config.RetryConfig{
 		Pushback: &config.RetryPolicy{BaseMs: -1},
 	}
@@ -4945,7 +4712,7 @@ func TestValidate_RetryPushback_NegativeBaseMs(t *testing.T) {
 
 func TestValidate_RetryPushback_NegativeCapMs(t *testing.T) {
 	t.Parallel()
-	c := registryBaseCfg()
+	c := validBaseCfg()
 	c.Retry = &config.RetryConfig{
 		Pushback: &config.RetryPolicy{CapMs: -1},
 	}
@@ -4960,7 +4727,7 @@ func TestValidate_RetryPushback_NegativeCapMs(t *testing.T) {
 
 func TestValidate_RetryPushback_CapLtBase(t *testing.T) {
 	t.Parallel()
-	c := registryBaseCfg()
+	c := validBaseCfg()
 	c.Retry = &config.RetryConfig{
 		Pushback: &config.RetryPolicy{BaseMs: 10000, CapMs: 5000},
 	}
@@ -4975,8 +4742,7 @@ func TestValidate_RetryPushback_CapLtBase(t *testing.T) {
 
 func TestValidate_RetryPushback_CapEqualsBase_Valid(t *testing.T) {
 	t.Parallel()
-	c := registryBaseCfg()
-	c.RegistryEndpoint = "https://registry.example.com:25777"
+	c := validBaseCfg()
 	c.Retry = &config.RetryConfig{
 		Pushback: &config.RetryPolicy{BaseMs: 5000, CapMs: 5000},
 	}
@@ -4987,7 +4753,7 @@ func TestValidate_RetryPushback_CapEqualsBase_Valid(t *testing.T) {
 
 func TestValidate_RetryPushback_NegativeMaxAttempts(t *testing.T) {
 	t.Parallel()
-	c := registryBaseCfg()
+	c := validBaseCfg()
 	c.Retry = &config.RetryConfig{
 		Pushback: &config.RetryPolicy{MaxAttempts: -1},
 	}
@@ -5059,7 +4825,7 @@ func TestMaxInflightPerNode_OmitWhenZero(t *testing.T) {
 // TestValidate_MaxInflightPerNode_NegativeRejected confirms negative values fail validation.
 func TestValidate_MaxInflightPerNode_NegativeRejected(t *testing.T) {
 	t.Parallel()
-	c := registryBaseCfg()
+	c := validBaseCfg()
 	c.MaxInflightPerNode = -1
 	err := c.Validate()
 	if err == nil {
@@ -5073,8 +4839,7 @@ func TestValidate_MaxInflightPerNode_NegativeRejected(t *testing.T) {
 // TestValidate_MaxInflightPerNode_ZeroValid confirms zero (unlimited) passes validation.
 func TestValidate_MaxInflightPerNode_ZeroValid(t *testing.T) {
 	t.Parallel()
-	c := registryBaseCfg()
-	c.RegistryEndpoint = "https://registry.example.com"
+	c := validBaseCfg()
 	c.MaxInflightPerNode = 0
 	if err := c.Validate(); err != nil {
 		t.Errorf("expected no error for zero max_inflight_per_node, got: %v", err)
@@ -5084,8 +4849,7 @@ func TestValidate_MaxInflightPerNode_ZeroValid(t *testing.T) {
 // TestValidate_MaxInflightPerNode_PositiveValid confirms a positive value passes.
 func TestValidate_MaxInflightPerNode_PositiveValid(t *testing.T) {
 	t.Parallel()
-	c := registryBaseCfg()
-	c.RegistryEndpoint = "https://registry.example.com"
+	c := validBaseCfg()
 	c.MaxInflightPerNode = 4
 	if err := c.Validate(); err != nil {
 		t.Errorf("expected no error for max_inflight_per_node=4, got: %v", err)
@@ -5545,8 +5309,7 @@ func TestStemcellReplicationConcurrencyValue_PositivePassThrough(t *testing.T) {
 // TestValidate_StemcellReplicationConcurrency_NegativeRejected confirms negative fails.
 func TestValidate_StemcellReplicationConcurrency_NegativeRejected(t *testing.T) {
 	t.Parallel()
-	c := registryBaseCfg()
-	c.RegistryEndpoint = "https://registry.example.com"
+	c := validBaseCfg()
 	c.StemcellReplicationConcurrency = -1
 	err := c.Validate()
 	if err == nil {
@@ -5560,8 +5323,7 @@ func TestValidate_StemcellReplicationConcurrency_NegativeRejected(t *testing.T) 
 // TestValidate_StemcellReplicationConcurrency_TooHighRejected confirms > 64 fails.
 func TestValidate_StemcellReplicationConcurrency_TooHighRejected(t *testing.T) {
 	t.Parallel()
-	c := registryBaseCfg()
-	c.RegistryEndpoint = "https://registry.example.com"
+	c := validBaseCfg()
 	c.StemcellReplicationConcurrency = 65
 	err := c.Validate()
 	if err == nil {
@@ -5575,8 +5337,7 @@ func TestValidate_StemcellReplicationConcurrency_TooHighRejected(t *testing.T) {
 // TestValidate_StemcellReplicationConcurrency_ZeroValid confirms 0 passes (serial default).
 func TestValidate_StemcellReplicationConcurrency_ZeroValid(t *testing.T) {
 	t.Parallel()
-	c := registryBaseCfg()
-	c.RegistryEndpoint = "https://registry.example.com"
+	c := validBaseCfg()
 	c.StemcellReplicationConcurrency = 0
 	if err := c.Validate(); err != nil {
 		t.Errorf("expected no error for stemcell_replication_concurrency=0, got: %v", err)
@@ -5586,8 +5347,7 @@ func TestValidate_StemcellReplicationConcurrency_ZeroValid(t *testing.T) {
 // TestValidate_StemcellReplicationConcurrency_64Valid confirms 64 passes (max allowed).
 func TestValidate_StemcellReplicationConcurrency_64Valid(t *testing.T) {
 	t.Parallel()
-	c := registryBaseCfg()
-	c.RegistryEndpoint = "https://registry.example.com"
+	c := validBaseCfg()
 	c.StemcellReplicationConcurrency = 64
 	if err := c.Validate(); err != nil {
 		t.Errorf("expected no error for stemcell_replication_concurrency=64, got: %v", err)

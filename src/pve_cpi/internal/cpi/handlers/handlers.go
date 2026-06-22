@@ -30,11 +30,11 @@ type Deps struct {
 	Config *config.CPIConfig
 	PVE    pve.Client
 	Agent  agent.Agent
-	// RegistryAgent is the registry-based Agent used when agent_mode="auto" and
-	// the stemcell api_version < 2. Nil unless agent_mode=auto and registry_endpoint
-	// are both set.
-	RegistryAgent agent.Agent
-	Logger        *log.Logger
+	Logger *log.Logger
+	// Resolver maps a storage name to a persistent-disk Backend (shared or
+	// local). Production wiring (main.go) constructs it from a
+	// StorageInfoCache; tests may leave it nil to get the static
+	// "shared on Config.Node" default via the backendResolverOrDefault helper.
 	Resolver      pve.BackendResolver
 	FetchResolver func(rawURL string) (stemcellfetch.Source, stemcellfetch.Reference, error)
 	// Inflight holds the per-node in-flight semaphores that gate mutating

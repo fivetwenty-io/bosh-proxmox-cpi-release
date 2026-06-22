@@ -2,7 +2,6 @@ package handlers_test
 
 import (
 	"context"
-	"encoding/json"
 	"testing"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
@@ -16,14 +15,17 @@ import (
 // --------------------------------------------------------------------------
 
 // buildAutoModeDeps constructs Deps with the given agent_mode, AgentMBus, and
-// optional RegistryAgent. Uses the minimal PVE mocks from buildVMDeps that
-// succeed for the full create_vm path so agent selection and completeness
-// assertions are the only failure modes under test.
+// primary agent. Uses the minimal PVE mocks from buildVMDeps that succeed for
+// the full create_vm path so agent selection and completeness assertions are
+// the only failure modes under test.
+//
+// The registryAgent parameter is ignored — registry mode is removed. It is
+// kept in the signature for callers that have not yet been updated; pass nil.
 func buildAutoModeDeps(
 	agentMode string,
 	agentMBus string,
 	primaryAgent *vmMockAgent,
-	registryAgent *vmMockAgent,
+	_ *vmMockAgent, // was registryAgent; registry mode removed
 ) handlers.Deps {
 	d := buildVMDeps(&vmMockQEMU{}, &vmMockNodes{}, &vmMockCluster{}, primaryAgent)
 	d.Config = &config.CPIConfig{
@@ -38,9 +40,6 @@ func buildAutoModeDeps(
 		EnsureNoIPConflicts: placementDisabled,
 	}
 	d.Agent = primaryAgent
-	if registryAgent != nil {
-		d.RegistryAgent = registryAgent
-	}
 	d.Logger = log.NewNopLogger()
 	return d
 }
@@ -82,8 +81,8 @@ func defaultNetwork() map[string]any {
 // selectAgentForCall — 7 matrix cases exercised via HandleCreateVM
 // --------------------------------------------------------------------------
 
-// TestAutoMode_V2Stemcell_NilReg verifies that auto mode with api_version=2 and
-// no RegistryAgent uses the primary (configdrive) agent without error.
+// TestAutoMode_V2Stemcell_NilReg verifies that auto mode with api_version=2
+// uses the configdrive agent without error.
 func TestAutoMode_V2Stemcell_NilReg(t *testing.T) {
 	t.Parallel()
 	primary := &vmMockAgent{}
@@ -100,75 +99,21 @@ func TestAutoMode_V2Stemcell_NilReg(t *testing.T) {
 	}
 }
 
-// TestAutoMode_V2Stemcell_RegPresent verifies that api_version=2 selects the
-// primary configdrive agent even when RegistryAgent is wired in.
-func TestAutoMode_V2Stemcell_RegPresent(t *testing.T) {
+// TestAutoMode_V1Stemcell_UsesConfigDrive verifies that api_version=1 in auto
+// mode selects the primary configdrive agent (registry path removed).
+func TestAutoMode_V1Stemcell_UsesConfigDrive(t *testing.T) {
 	t.Parallel()
 	primary := &vmMockAgent{}
-	reg := &vmMockAgent{}
-	h := handlers.HandleCreateVM(buildAutoModeDeps("auto", "nats://10.0.0.1:4222", primary, reg))
-
-	_, err := h.Handle(context.Background(),
-		mkArgs("ag-2", testStemcellCID, map[string]any{}, defaultNetwork(), []string{}, map[string]any{}),
-		mkCtxWithAPIVersion("av2-reg", 2.0))
-	if err != nil {
-		t.Fatalf("expected no error, got: %v", err)
-	}
-	if len(primary.configureCalls) != 1 {
-		t.Errorf("primary.configureCalls: want 1, got %d", len(primary.configureCalls))
-	}
-	if len(reg.configureCalls) != 0 {
-		t.Errorf("registry agent must NOT be called for v2 stemcell, got %d calls", len(reg.configureCalls))
-	}
-}
-
-// TestAutoMode_V1Stemcell_RegPresent verifies that api_version=1 selects the
-// RegistryAgent when one is wired in.
-func TestAutoMode_V1Stemcell_RegPresent(t *testing.T) {
-	t.Parallel()
-	primary := &vmMockAgent{}
-	reg := &vmMockAgent{}
-	h := handlers.HandleCreateVM(buildAutoModeDeps("auto", "nats://10.0.0.1:4222", primary, reg))
+	h := handlers.HandleCreateVM(buildAutoModeDeps("auto", "nats://10.0.0.1:4222", primary, nil))
 
 	_, err := h.Handle(context.Background(),
 		mkArgs("ag-3", testStemcellCID, map[string]any{}, defaultNetwork(), []string{}, map[string]any{}),
-		mkCtxWithAPIVersion("av1-reg", 1.0))
+		mkCtxWithAPIVersion("av1-configdrive", 1.0))
 	if err != nil {
-		t.Fatalf("expected no error, got: %v", err)
+		t.Fatalf("expected no error for v1 stemcell (configdrive path), got: %v", err)
 	}
-	if len(reg.configureCalls) != 1 {
-		t.Errorf("reg.configureCalls: want 1, got %d", len(reg.configureCalls))
-	}
-	if len(primary.configureCalls) != 0 {
-		t.Errorf("primary agent must NOT be called for v1 stemcell, got %d calls", len(primary.configureCalls))
-	}
-}
-
-// TestAutoMode_V1Stemcell_NilReg verifies that api_version=1 with no RegistryAgent
-// returns a Cloud error before VM creation (createCalls==0, no orphan). The pre-flight
-// check in createVM fires before QEMU.Create, so the QEMU mock from buildAutoModeDeps
-// records zero creates.
-func TestAutoMode_V1Stemcell_NilReg(t *testing.T) {
-	t.Parallel()
-	primary := &vmMockAgent{}
-	q := &vmMockQEMU{}
-	d := buildAutoModeDeps("auto", "nats://10.0.0.1:4222", primary, nil)
-	// Swap in an observable QEMU mock to assert createCalls==0.
-	pveClient := d.PVE.(*mockPVEClient)
-	pveClient.qemuSvc = q
-	h := handlers.HandleCreateVM(d)
-
-	_, err := h.Handle(context.Background(),
-		mkArgs("ag-4", testStemcellCID, map[string]any{}, defaultNetwork(), []string{}, map[string]any{}),
-		mkCtxWithAPIVersion("av1-nilreg", 1.0))
-	if err == nil {
-		t.Fatal("expected Cloud error for v1 stemcell without registry_endpoint")
-	}
-	if !isCloudError(err) {
-		t.Errorf("expected Cloud error, got: %v", err)
-	}
-	if len(q.createCalls) != 0 {
-		t.Errorf("createCalls must be 0 (pre-VM error), got %d", len(q.createCalls))
+	if len(primary.configureCalls) != 1 {
+		t.Errorf("primary.configureCalls: want 1, got %d", len(primary.configureCalls))
 	}
 }
 
@@ -280,25 +225,6 @@ func TestCompletenessAssertion_EmptyNetworks(t *testing.T) {
 	}
 }
 
-// TestCompletenessAssertion_RegistryNoAssert verifies that agent_mode=registry with
-// an empty mbus does NOT trigger the completeness assertion (registry manages its own).
-func TestCompletenessAssertion_RegistryNoAssert(t *testing.T) {
-	t.Parallel()
-	primary := &vmMockAgent{}
-	// AgentMBus intentionally empty — must not error for registry mode.
-	h := handlers.HandleCreateVM(buildAutoModeDeps("registry", "", primary, nil))
-
-	_, err := h.Handle(context.Background(),
-		mkArgs("ag-reg-noassert", testStemcellCID, map[string]any{}, defaultNetwork(), []string{}, map[string]any{}),
-		mkCtxNoAPIVersion("reg-noassert"))
-	if err != nil {
-		t.Fatalf("registry mode must not trigger completeness assertion, got: %v", err)
-	}
-	if len(primary.configureCalls) != 1 {
-		t.Errorf("registry Configure must be called once, got %d", len(primary.configureCalls))
-	}
-}
-
 // TestCompletenessAssertion_NoagentNoAssert verifies that agent_mode=noagent with
 // an empty mbus does NOT trigger the completeness assertion (noagent skips Configure).
 func TestCompletenessAssertion_NoagentNoAssert(t *testing.T) {
@@ -335,56 +261,3 @@ func TestCompletenessAssertion_HappyPath(t *testing.T) {
 	}
 }
 
-// --------------------------------------------------------------------------
-// Extra coverage: explicit registry mode + non-float64 api_version coercion
-// --------------------------------------------------------------------------
-
-// TestAutoMode_ExplicitRegistry_Unchanged verifies that explicit
-// agent_mode=registry uses deps.Agent (the boot registry singleton) and skips
-// the registry-less completeness assertion even with an empty mbus.
-func TestAutoMode_ExplicitRegistry_Unchanged(t *testing.T) {
-	t.Parallel()
-	primary := &vmMockAgent{}
-	h := handlers.HandleCreateVM(buildAutoModeDeps("registry", "", primary, nil)) // empty mbus must NOT trip assertion
-
-	_, err := h.Handle(context.Background(),
-		mkArgs("ag-explicit-reg", testStemcellCID, map[string]any{}, defaultNetwork(), []string{}, map[string]any{}),
-		mkCtxWithAPIVersion("explicit-reg", 2.0))
-	if err != nil {
-		t.Fatalf("expected no error for explicit registry (no completeness assertion), got: %v", err)
-	}
-	if len(primary.configureCalls) != 1 {
-		t.Errorf("primary.configureCalls: want 1, got %d", len(primary.configureCalls))
-	}
-}
-
-// TestAutoMode_V1Stemcell_JSONNumber verifies that a v1 api_version delivered as
-// json.Number (not float64) is still coerced and routed to the RegistryAgent —
-// guarding against a silent fail-open to configdrive if the JSON decoder ever
-// switches to UseNumber.
-func TestAutoMode_V1Stemcell_JSONNumber(t *testing.T) {
-	t.Parallel()
-	primary := &vmMockAgent{}
-	reg := &vmMockAgent{}
-	d := buildAutoModeDeps("auto", "nats://10.0.0.1:4222", primary, reg)
-	h := handlers.HandleCreateVM(d)
-
-	jrCtx := jsonrpc.Context{
-		RequestID: "av1-jsonnum",
-		VM: map[string]any{
-			"stemcell": map[string]any{"api_version": json.Number("1")},
-		},
-	}
-	_, err := h.Handle(context.Background(),
-		mkArgs("ag-jsonnum", testStemcellCID, map[string]any{}, defaultNetwork(), []string{}, map[string]any{}),
-		jrCtx)
-	if err != nil {
-		t.Fatalf("expected no error, got: %v", err)
-	}
-	if len(reg.configureCalls) != 1 {
-		t.Errorf("json.Number v1 must route to RegistryAgent: reg.configureCalls want 1, got %d", len(reg.configureCalls))
-	}
-	if len(primary.configureCalls) != 0 {
-		t.Errorf("primary must NOT be called for json.Number v1, got %d", len(primary.configureCalls))
-	}
-}

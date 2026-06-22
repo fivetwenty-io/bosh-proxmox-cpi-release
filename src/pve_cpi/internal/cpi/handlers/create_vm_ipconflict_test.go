@@ -355,9 +355,6 @@ func (a *icAgentStub) Configure(_ context.Context, _ string, _ int, _ agent.Agen
 	return nil
 }
 func (a *icAgentStub) Remove(_ context.Context, _ string, _ int) error { return nil }
-func (a *icAgentStub) UpdateDiskHints(_ context.Context, _ int, _ []agent.DiskHint) error {
-	return nil
-}
 
 // icMinConfig returns a minimal *config.CPIConfig for internal tests.
 func icMinConfig() *config.CPIConfig {

@@ -97,7 +97,7 @@ A deployment that adds no new spec properties gets exactly the behavior it had b
    `cfg.FooEnabled()` when `r.Bool` returns `ok=false`.
 4. Add the spec key with `default: ~` (nil BOSH default) so the ERB emits the
    field only when explicitly set.
-5. In the ERB, emit the key only when non-nil (mirrors `registry_allow_private_ip`
+5. In the ERB, emit the key only when non-nil (mirrors `pve.verify_ssl`
    and `vm_firewall` patterns).
 6. Write a test asserting that a `CPIConfig{}` with no fields set produces the
    same behavior as before the feature existed.

@@ -53,7 +53,7 @@ To view without credentials:
 
 ```bash
 sudo cat /var/vcap/jobs/pve_cpi/config/cpi.json \
-  | jq 'del(.password, .api_token, .registry_password)'
+  | jq 'del(.password, .api_token)'
 ```
 
 ### Reading a CPI request/response
@@ -99,8 +99,8 @@ properties:
 | Mode | Mechanism | When to use |
 |---|---|---|
 | `cloudinit` (default) | Builds an ISO 9660 ConfigDrive labeled `config-2`, uploads to `iso_storage`, attaches on `scsi30` | All standard deploys |
-| `registry` | POSTs settings to a BOSH registry endpoint | Legacy environments with an existing registry |
 | `noagent` | Skips agent delivery | Specialised workloads that do not run the BOSH agent |
+| `auto` | Always selects ConfigDrive/cloudinit regardless of stemcell API version | Manifests that want explicit future-proof mode selection |
 
 For `cloudinit`, the ISO path on PVE storage is `<iso_storage>:iso/vm-<vmid>-config.iso`. `iso_storage` must be a file-based storage type (`dir`, `nfs`, or `cifs`) — block-based types (`lvm`, `lvmthin`, `zfspool`) cannot accept ISO uploads. The default value is `local`.
 
@@ -577,7 +577,7 @@ pvesh get /nodes/<node>/tasks/<upid>/log > pve-task-<upid>.log
 
 ```bash
 sudo cat /var/vcap/jobs/pve_cpi/config/cpi.json \
-  | jq 'del(.password, .api_token, .registry_password)' \
+  | jq 'del(.password, .api_token)' \
   > cpi-config-redacted.json
 ```
 

@@ -39,27 +39,6 @@ func TestRemove_NoOp(t *testing.T) {
 	}
 }
 
-func TestUpdateDiskHints_NoOp(t *testing.T) {
-	t.Parallel()
-	a := NewNoAgent(log.NewNopLogger())
-
-	if err := a.UpdateDiskHints(context.Background(), 101, nil); err != nil {
-		t.Fatalf("UpdateDiskHints(nil): expected nil error, got %v", err)
-	}
-
-	if err := a.UpdateDiskHints(context.Background(), 101, []DiskHint{}); err != nil {
-		t.Fatalf("UpdateDiskHints(empty): expected nil error, got %v", err)
-	}
-
-	hints := []DiskHint{
-		{DiskCID: "local-lvm:vm-101-disk-0", DevicePath: "/dev/sdb"},
-		{DiskCID: "local-lvm:vm-101-disk-1", DevicePath: "/dev/sdc"},
-	}
-	if err := a.UpdateDiskHints(context.Background(), 101, hints); err != nil {
-		t.Fatalf("UpdateDiskHints(hints): expected nil error, got %v", err)
-	}
-}
-
 func TestSatisfiesInterface(t *testing.T) {
 	t.Parallel()
 	var iface Agent = NewNoAgent(log.NewNopLogger())
@@ -102,21 +81,3 @@ func TestLogsAtDebug_Remove(t *testing.T) {
 	}
 }
 
-func TestLogsAtDebug_UpdateDiskHints(t *testing.T) {
-	t.Parallel()
-	logger, logs := newObservedLogger()
-	a := NewNoAgent(logger)
-
-	hints := []DiskHint{{DiskCID: "local:disk-0", DevicePath: "/dev/sdb"}}
-	if err := a.UpdateDiskHints(context.Background(), 42, hints); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	entries := logs.All()
-	if len(entries) == 0 {
-		t.Fatal("UpdateDiskHints: expected at least one log entry, got none")
-	}
-	if entries[0].Level != log.LevelDebug {
-		t.Fatalf("UpdateDiskHints: expected Debug level, got %v", entries[0].Level)
-	}
-}

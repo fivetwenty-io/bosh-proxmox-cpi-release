@@ -354,8 +354,8 @@ type createVMShape struct {
 // Rollback: if any step after VM creation fails, the VM is stopped (best-effort)
 // and destroyed (purge=true) before the error is returned.
 func HandleCreateVM(deps Deps) cpi.Handler {
-	return cpi.HandlerFunc(func(ctx context.Context, args []json.RawMessage, jrCtx jsonrpc.Context) (any, error) {
-		return createVM(ctx, deps, args, jrCtx)
+	return cpi.HandlerFunc(func(ctx context.Context, args []json.RawMessage, _ jsonrpc.Context) (any, error) {
+		return createVM(ctx, deps, args)
 	})
 }
 
@@ -364,7 +364,6 @@ func createVM(
 	ctx context.Context,
 	deps Deps,
 	args []json.RawMessage,
-	jrCtx jsonrpc.Context,
 ) (result any, retErr error) {
 	logger := deps.Logger
 
@@ -388,16 +387,6 @@ func createVM(
 	}
 
 	// -----------------------------------------------------------------------
-	// 1c. Pre-flight agent-mode selection. For agent_mode=auto with a v1 stemcell
-	// and no registry endpoint configured, fail immediately before any VM is
-	// created so there is no orphan to clean up. The full per-call selection runs
-	// again inside configureAgent; this check is purely pre-creation guard.
-	// -----------------------------------------------------------------------
-	if _, _, selErr := selectAgentForCall(deps, jrCtx); selErr != nil {
-		return nil, selErr
-	}
-
-	// -----------------------------------------------------------------------
 	// 2–3. Resolve node and VM-shape parameters.
 	// -----------------------------------------------------------------------
 
@@ -412,7 +401,7 @@ func createVM(
 	}
 
 	if fallbackMax > 0 {
-		return createVMWithFallback(ctx, deps, logger, parsed, jrCtx, fallbackMax, &retErr)
+		return createVMWithFallback(ctx, deps, logger, parsed, fallbackMax, &retErr)
 	}
 
 	// -----------------------------------------------------------------------
@@ -526,7 +515,7 @@ func createVM(
 	// -----------------------------------------------------------------------
 	// 7. Build AgentConfig and call agent.Configure
 	// -----------------------------------------------------------------------
-	if err := configureAgent(ctx, deps, logger, parsed, shape, vmid, vmName, ephemeralDevPath, jrCtx); err != nil {
+	if err := configureAgent(ctx, deps, logger, parsed, shape, vmid, vmName, ephemeralDevPath); err != nil {
 		return nil, err
 	}
 
@@ -720,7 +709,6 @@ func createVMWithFallback(
 	deps Deps,
 	logger *log.Logger,
 	parsed *createVMParsedArgs,
-	jrCtx jsonrpc.Context,
 	fallbackMax int,
 	retErr *error, //nolint:gocritic // ptrToRefParam: same named-return pointer pattern as createVM
 ) (any, error) {
@@ -739,7 +727,7 @@ func createVMWithFallback(
 		isLast := attemptIdx == len(candidates)-1
 
 		vmid, responseNetworks, allocErr, startErr, otherErr := buildAndStartVMAttempt(
-			ctx, deps, logger, parsed, shape, candidateNode, jrCtx)
+			ctx, deps, logger, parsed, shape, candidateNode)
 
 		// Determine whether to fall back or commit.
 		var attemptErr error
@@ -2693,7 +2681,6 @@ func buildAndStartVMAttempt(
 	parsed *createVMParsedArgs,
 	shape *createVMShape,
 	candidateNode string,
-	jrCtx jsonrpc.Context,
 ) (vmid int, responseNetworks map[string]createVMNetworkSpec, allocErr error, startErr error, otherErr error) {
 	// Use a node-overridden copy so we never mutate the caller's shape.
 	nodeShape := *shape
@@ -2731,7 +2718,7 @@ func buildAndStartVMAttempt(
 		return vmid, nil, nil, nil, err
 	}
 
-	if err := configureAgent(ctx, deps, logger, parsed, &nodeShape, vmid, vmName, ephemeralDevPath, jrCtx); err != nil {
+	if err := configureAgent(ctx, deps, logger, parsed, &nodeShape, vmid, vmName, ephemeralDevPath); err != nil {
 		return vmid, nil, nil, nil, err
 	}
 
@@ -4165,89 +4152,10 @@ func attachPersistentDisks(
 	return nil
 }
 
-// selectAgentForCall chooses which agent.Agent to call for this create_vm
-// invocation and whether the call is registry-less (configdrive path).
-//
-// Routing rules:
-//
-//   - mode != "auto" → always use deps.Agent; registryLess = (mode=="cloudinit").
-//   - mode == "auto", api_version >= 2 (or absent — fail-open) → deps.Agent (configdrive), registryLess=true.
-//   - mode == "auto", api_version < 2, deps.RegistryAgent != nil → deps.RegistryAgent, registryLess=false.
-//   - mode == "auto", api_version < 2, deps.RegistryAgent == nil → Cloud error (no orphan).
-//
-// api_version is read from jrCtx.VM["stemcell"]["api_version"] (float64) first,
-// then jrCtx.Stemcell["api_version"] as fallback. Nil or missing → treated as absent.
-// parseAPIVersion coerces a stemcell api_version from the decoded JSON-RPC
-// context into a float64. The standard library decoder yields float64 for JSON
-// numbers, but this also accepts json.Number, integer types, and numeric
-// strings so a v1 stemcell is never silently misread as registry-less when the
-// decoder configuration changes (e.g. UseNumber). Returns ok=false when the
-// value is absent or not numeric.
-func parseAPIVersion(v any) (float64, bool) {
-	switch n := v.(type) {
-	case float64:
-		return n, true
-	case float32:
-		return float64(n), true
-	case json.Number:
-		f, err := n.Float64()
-		if err != nil {
-			return 0, false
-		}
-		return f, true
-	case int:
-		return float64(n), true
-	case int64:
-		return float64(n), true
-	case string:
-		f, err := strconv.ParseFloat(n, 64)
-		if err != nil {
-			return 0, false
-		}
-		return f, true
-	default:
-		return 0, false
-	}
-}
-
-func selectAgentForCall(deps Deps, jrCtx jsonrpc.Context) (chosen agent.Agent, registryLess bool, err error) {
-	mode := deps.Config.AgentMode
-	if mode != "auto" {
-		return deps.Agent, mode == "cloudinit", nil
-	}
-
-	// Extract api_version: check VM["stemcell"]["api_version"] first, then Stemcell["api_version"].
-	var apiVersion float64
-	var apiVersionPresent bool
-	if vmMap := jrCtx.VM; vmMap != nil {
-		if sc, ok := vmMap["stemcell"].(map[string]any); ok {
-			apiVersion, apiVersionPresent = parseAPIVersion(sc["api_version"])
-		}
-	}
-	if !apiVersionPresent {
-		if sc := jrCtx.Stemcell; sc != nil {
-			apiVersion, apiVersionPresent = parseAPIVersion(sc["api_version"])
-		}
-	}
-
-	// Absent api_version → fail-open to configdrive.
-	if !apiVersionPresent || apiVersion >= 2 {
-		return deps.Agent, true, nil
-	}
-
-	// api_version < 2: registry path.
-	if deps.RegistryAgent == nil {
-		return nil, false, cpierrors.Cloud(
-			"create_vm: agent_mode=auto with v1 stemcell (api_version=%.0f) requires registry_endpoint configured",
-			apiVersion,
-		)
-	}
-	return deps.RegistryAgent, false, nil
-}
 
 // assertRegistryLessCompleteness verifies that all fields required for a
 // configdrive (registry-less) agent boot are non-empty. Called only on the
-// configdrive path; registry and noagent skip this assertion entirely.
+// configdrive path; noagent skips this assertion entirely.
 //
 // Returns a Cloud error naming the first missing field. A well-configured
 // deploy never hits this — it surfaces already-failing misconfigurations early
@@ -4269,8 +4177,8 @@ func assertRegistryLessCompleteness(agentCfg agent.AgentConfig) error {
 }
 
 // configureAgent builds the agent.AgentConfig and calls the chosen agent's Configure.
-// When agent_mode="auto", the agent is selected per stemcell api_version from jrCtx.
-// For configdrive (registry-less) paths a completeness assertion fires before Configure.
+// For configdrive paths a completeness assertion fires before Configure. noagent
+// returns immediately with no action.
 // ephemeralDevPath is the by-id device path for a dedicated ephemeral disk created in
 // step 6.5; empty string = no dedicated disk (agent carves ephemeral from root, default).
 func configureAgent(
@@ -4282,19 +4190,15 @@ func configureAgent(
 	vmid int,
 	vmName string,
 	ephemeralDevPath string,
-	jrCtx jsonrpc.Context,
 ) error {
-	chosenAgent, registryLess, err := selectAgentForCall(deps, jrCtx)
-	if err != nil {
-		return err
-	}
-
 	// noagent: nothing to configure.
 	if deps.Config.AgentMode == "noagent" {
 		return nil
 	}
-	// When auto selected registry path, chosen != deps.Agent — honor it.
-	// When mode is "noagent" the switch above already returned.
+
+	// All non-noagent modes (cloudinit, auto) use the configdrive agent.
+	// auto always selects configdrive.
+	chosenAgent := deps.Agent
 
 	agentNetworks := buildAgentNetworks(parsed.networks)
 	mbus, blobstore := extractMBusAndBlobstore(parsed.env)
@@ -4352,13 +4256,11 @@ func configureAgent(
 		},
 	}
 
-	// Completeness assertion: configdrive (registry-less) path only. Registry
-	// manages its own settings; noagent is intentionally empty. This converts
-	// a guaranteed silent mis-bootstrap into an early Cloud error.
-	if registryLess {
-		if assertErr := assertRegistryLessCompleteness(agentCfg); assertErr != nil {
-			return assertErr
-		}
+	// Completeness assertion fires on every non-noagent path (configdrive /
+	// auto modes all use configdrive). noagent returned early above. This
+	// converts a guaranteed silent mis-bootstrap into an early Cloud error.
+	if assertErr := assertRegistryLessCompleteness(agentCfg); assertErr != nil {
+		return assertErr
 	}
 
 	if err := chosenAgent.Configure(ctx, shape.node, vmid, agentCfg); err != nil {

@@ -43,6 +43,7 @@ func buildFallbackDeps(
 		VMStorage:      storageName,
 		NetworkBridge:  "vmbr0",
 		VMIDRangeStart: 100,
+		AgentMBus:      "nats://mbus.test:4222",
 		Placement: &config.PlacementConfig{
 			FallbackMax: fallbackMaxPtr(fallbackMax),
 		},
@@ -784,6 +785,7 @@ func TestCreateVM_Fallback_WithClusterStorage_Success(t *testing.T) {
 		VMStorage:      storageName,
 		NetworkBridge:  "vmbr0",
 		VMIDRangeStart: 100,
+		AgentMBus:      "nats://mbus.test:4222",
 		Placement: &config.PlacementConfig{
 			FallbackMax: &fm,
 		},
@@ -966,6 +968,7 @@ func TestCreateVM_Fallback_FirewallEnabled_SuccessPath(t *testing.T) {
 		VMStorage:      storageName,
 		NetworkBridge:  "vmbr0",
 		VMIDRangeStart: 100,
+		AgentMBus:      "nats://mbus.test:4222",
 		// VMFirewall=true → resolveEffectiveFirewall returns true → enableVMFirewall called.
 		VMFirewall: &fw,
 		Placement: &config.PlacementConfig{
@@ -1042,6 +1045,7 @@ func TestCreateVM_Fallback_DLBEnabled_SuccessPath(t *testing.T) {
 		VMStorage:      storageName,
 		NetworkBridge:  "vmbr0",
 		VMIDRangeStart: 100,
+		AgentMBus:      "nats://mbus.test:4222",
 		Placement: &config.PlacementConfig{
 			FallbackMax: &fm,
 			// DLBExplicitlyEnabled() returns true → DLBEligibleForAZ("") returns true.
@@ -1113,6 +1117,7 @@ func TestCreateVM_Fallback_VirtioSCSISingle_SuccessPath(t *testing.T) {
 		VMStorage:      storageName,
 		NetworkBridge:  "vmbr0",
 		VMIDRangeStart: 100,
+		AgentMBus:      "nats://mbus.test:4222",
 		DiskPerformance: &config.DiskPerformanceDefaults{
 			VirtioSCSISingle: &vss,
 		},
@@ -1190,6 +1195,7 @@ func TestCreateVM_Fallback_AntiAffinity_SuccessPath(t *testing.T) {
 		VMStorage:      storageName,
 		NetworkBridge:  "vmbr0",
 		VMIDRangeStart: 100,
+		AgentMBus:      "nats://mbus.test:4222",
 		Placement: &config.PlacementConfig{
 			FallbackMax: &fm,
 			AntiAffinity: &config.AntiAffinityConfig{
@@ -1342,6 +1348,7 @@ func TestCreateVM_Fallback_HealthGateEnabled_SuccessPath(t *testing.T) {
 		VMStorage:      storageName,
 		NetworkBridge:  "vmbr0",
 		VMIDRangeStart: 100,
+		AgentMBus:      "nats://mbus.test:4222",
 		Placement: &config.PlacementConfig{
 			FallbackMax: &fm,
 		},
@@ -1422,6 +1429,7 @@ func TestCreateVM_Fallback_StorageTierResolved_SuccessPath(t *testing.T) {
 		VMStorage:      storageName,
 		NetworkBridge:  "vmbr0",
 		VMIDRangeStart: 100,
+		AgentMBus:      "nats://mbus.test:4222",
 		// StorageTiers declared: "fast" matches lvm+shared storage.
 		StorageTiers: map[string]config.StorageTierCriteria{
 			"fast": {Types: []string{"lvm"}, Shared: &shared},
