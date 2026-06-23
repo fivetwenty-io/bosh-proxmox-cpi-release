@@ -1361,34 +1361,31 @@ HA-rule plumbing and is default-off, the guarantee is opt-in and byte-identical 
 
 #### 7.22 SHIPPED — Agent registry-less auto-selection and settings-completeness assertion
 
-*References: AWS, OpenStack-Go, Google, Alicloud.* All three agent modes ship and exceed
-vSphere, but mode selection is config-driven, not auto-negotiated from the stemcell's
-advertised `api_version` (the reference Go CPIs gate registry-less on
-`stemcell_api_version ≥ 2`), and there is no assertion that a v2 stemcell's configdrive
-payload carries every setting the agent needs. With configdrive now the default for all
-deployments, a mis-paired mode or a missing field silently mis-bootstraps — the same
-agent-dead/pre-start-NATS failure class already documented.
+*References: AWS, OpenStack-Go, Google, Alicloud.* The agent modes ship and exceed vSphere,
+but historically nothing asserted that a configdrive payload carried every setting the agent
+needs. With configdrive the default for every deployment, a missing field silently
+mis-bootstraps — the same agent-dead / pre-start-NATS failure class already documented.
 
-**Shipped.** A new `agent_mode: auto` reads the stemcell `api_version` from the create_vm
-request context (previously discarded) and selects configdrive for v2+ stemcells; a
-missing `api_version` also fails open to configdrive, the modern default. The api_version
-parse accepts float, integer, and numeric-string forms so a stemcell version is never
-silently misread. A settings-completeness assertion guards the configdrive path: a boot
-with an empty mbus or agent_id, or no networks, fails `create_vm` immediately instead of
-booting a half-configured agent. The `noagent` mode is unchanged, and the explicit
-`cloudinit` and `noagent` modes keep their existing behavior. Registry mode has since been
-removed; `auto` always selects configdrive. Covered by a v1/v2 × mode test matrix.
+**Shipped.** `agent_mode` is `cloudinit | noagent | auto`. `auto` is now a configdrive alias:
+the registry it once fell back to for v1 stemcells has been removed (see the registry-deprecation
+lesson below), so every non-`noagent` mode reaches the same registry-less configdrive path and
+the stemcell `api_version` no longer changes agent selection. The live guarantee is a
+settings-completeness assertion on the configdrive path: a boot with an empty mbus or agent_id,
+or no networks, fails `create_vm` immediately instead of booting a half-configured agent.
+`noagent` is unchanged. Covered by a mode × api_version test matrix that asserts api_version
+never alters the registry-less outcome.
 
-**Why it matters here.** With configdrive now the default for every deployment, a
-mis-paired mode or a missing settings field silently mis-bootstraps the agent — the same
-agent-dead / pre-start-NATS failure class documented elsewhere; auto-selection plus the
-completeness assertion (`internal/agent/settings.go:40-88`) surface that as a clean
-`create_vm` failure at create time rather than as a task-join hang. The references converge
+**Why it matters here.** With configdrive the default for every deployment, a missing
+settings field silently mis-bootstraps the agent — the same agent-dead / pre-start-NATS
+failure class documented elsewhere; the completeness assertion
+(`internal/agent/settings.go:40-88`) surfaces that as a clean `create_vm` failure at create
+time rather than as a task-join hang. The references converge
 on the same registry-less default but reach it through different side-channels: AWS gates
 registry calls in its CloudV2 path on `stemcell_api_version < 2`, Google stores
 `bosh_settings` in GCE instance metadata, Alicloud writes the full settings JSON into ECS
-`UserData`, and OpenStack-Go gates registry-less behind its dual-API-version check. PVE's
-auto-selection reads the same `api_version` signal those CPIs use. AWS enriches the agent
+`UserData`, and OpenStack-Go gates registry-less behind its dual-API-version check. PVE now
+provides only the registry-less path, so unlike those CPIs it has no `api_version` gate left
+to read — the signal is vestigial in the VM path. AWS enriches the agent
 network spec beyond the IP: after ENI creation, `NicGroup#assign_mac_address` distributes the
 hardware MAC to every network in the group, and `AgentSettings#agent_network_spec` includes
 `settings['mac'] = net.mac` when the network responds to `:mac` (`nic_group.rb:43-46`,
@@ -2920,6 +2917,22 @@ reading six mature CPIs against this one.
   long-lived ambient credentials through scoped short-lived tokens to per-call re-auth; each
   position carries a different blast radius on credential compromise and a different latency cost.
   Choosing deliberately — rather than inheriting the SDK default — is the lesson.
+
+- **The BOSH registry was always a fallback; upstream deprecation confirms the configdrive
+  default, and carrying the dead side-channel is a liability.** Every reference CPI had already
+  made the registry-less path primary and gated the registry on `stemcell_api_version < 2`: AWS
+  in its CloudV2 path, OpenStack-Go behind its dual-API-version check, Google through GCE
+  instance metadata, and Alicloud through ECS `UserData`. The registry only ever served v1
+  stemcells, and v1 stemcells are gone in practice. With BOSH core deprecating the registry
+  upstream, a CPI that still carries a registry agent mode is maintaining an HTTP client, a
+  config surface, and a code path that no supported deployment exercises — pure attack surface
+  and drift risk for zero reachable behavior. PVE removed the registry mode entirely rather than
+  leaving it as a parse-but-dead option (the dead-field drift this analysis warns against in the
+  config-schema lesson): `agent_mode` is now `cloudinit | noagent | auto`, `auto` always selects
+  configdrive, and a legacy `agent_mode: registry` or any `registry_*` config key fails config
+  validation with a migration message regardless of strict mode (§7.22). The lesson is that a
+  deprecated compatibility path is not free to keep — remove it with a fail-fast migration error
+  rather than carry an unreachable branch indefinitely.
 
 ## Cross-Cutting Dimensions
 
