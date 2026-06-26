@@ -8,7 +8,7 @@ The reference documentation in the [parent directory](../index.md) describes the
 
 This document goes the other way. It treats the implementation as a working prototype and re-derives the architecture from fundamentals — problem first, principle next, feature last. It answers "why is it built this way, and why is that the right way?" Where the reference docs name functions and fields, here we name only capabilities and the reasoning behind them. The audience is anyone with a semi-technical background: an architect, an engineering manager, a new team member. No prior knowledge of BOSH, Proxmox VE, or Go is assumed.
 
-Every chapter states the first principle it derives from, carries diagrams that advance the story, and ends by linking back to the reference docs for readers who want to drill into the mechanism.
+Each chapter opens with the first principle it derives from and carries diagrams that advance the story. At the end, it links back to the reference docs for anyone who wants the mechanism.
 
 ## The arc
 

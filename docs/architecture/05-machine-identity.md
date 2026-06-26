@@ -25,11 +25,11 @@ flowchart LR
 
 *The ConfigDrive as a sealed envelope. The CPI fills it, seals it, and hands it to the VM; the guest's stock datasource opens it on first boot.*
 
-This is where the OpenStack lineage earns its keep. The ConfigDrive layout the CPI writes is the OpenStack config-drive format, the same one a long line of OpenStack guests already understand. That is not an accident of convenience. It is why the CPI advertises OpenStack stemcell formats in the very first `info` call from Chapter 3 — so that existing, unmodified OpenStack stemcells run on PVE unchanged. The CPI did not invent a bootstrap protocol and ask the world to adopt it. It reused one that stemcells already speak.
+The OpenStack lineage earns its keep here. The ConfigDrive layout the CPI writes is the OpenStack config-drive format, the same one a long line of OpenStack guests already understand. That is not an accident of convenience. It is why the CPI advertises OpenStack stemcell formats in the very first `info` call from Chapter 3 — so that existing, unmodified OpenStack stemcells run on PVE unchanged. The CPI did not invent a bootstrap protocol and ask the world to adopt it. It reused one that stemcells already speak.
 
 ## Where the envelope sits
 
-A VM has a fixed number of SCSI slots, and the CPI treats them as a deliberate map rather than a free-for-all. The system disk takes the first slot. A run of slots is reserved for the persistent data disks a VM may carry. A slot is left as deliberate headroom. And one slot near the top of the range — SCSI slot 30 — is reserved permanently for the ConfigDrive. Because that reservation must stay intact, the CPI caps how many persistent disks a single VM may hold; pack too many in and they would collide with the very envelope that carries the machine's identity. The cap is not a limitation so much as the price of keeping the delivery slot sacred.
+A VM has a fixed number of SCSI slots, and the CPI treats them as a deliberate map rather than a free-for-all. The system disk takes the first slot, then a run of slots for persistent data disks, one kept as deliberate headroom. SCSI slot 30, near the top of the range, is reserved permanently for the ConfigDrive. Because that reservation must stay intact, the CPI caps how many persistent disks a single VM may hold; pack too many in and they would collide with the very envelope that carries the machine's identity. The cap is not a limitation so much as the price of keeping the delivery slot sacred.
 
 ## Modes, and one that is gone
 
@@ -74,7 +74,7 @@ sequenceDiagram
 
 ## The gotcha that justifies the seams
 
-It is worth seeing one failure to understand why the boot path is shaped the way it is. The agent will hang forever — not error, just wait — if its settings name an ephemeral device that does not exist, or if the system disk is too small to carve the ephemeral partition the settings describe. A bad boot here is silent and permanent, the worst kind.
+One failure shows why the boot path is shaped the way it is. The agent will hang forever — not error, just wait — if its settings name an ephemeral device that does not exist, or if the system disk is too small to carve the ephemeral partition the settings describe. A bad boot here is silent and permanent, the worst kind.
 
 So the CPI declines to over-specify. It leaves the ephemeral layout for the stemcell to carve for itself rather than naming a device that might not be there, and it resizes the system disk after cloning so there is room to carve. The lesson generalizes: when the consequence of a wrong instruction is an unrecoverable hang, the safe move is to say less and let the guest, which can see its own hardware, fill in the rest. The seam between what the CPI dictates and what the guest decides is drawn exactly where a mistake would be fatal.
 

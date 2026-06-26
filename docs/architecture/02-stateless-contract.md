@@ -26,7 +26,7 @@ This is why the cloud ID matters so much later. It is the only thing the CPI get
 
 The Director is allowed to re-drive a call after a partial failure. It may have lost the network mid-response, or crashed and restarted, or simply be reconciling its records against reality. From the CPI's side, that means any request might be a repeat of one that already partly or fully succeeded. A binary that assumed every call was the first time would corrupt state on the second.
 
-So every method is built to converge, not to assume a clean slate. Deleting a resource that is already gone is success, not an error — the world is already in the state the Director wanted. Creating a resource that already exists reuses it rather than making a duplicate. A create that fails partway cleans up the fragments it left behind, so the next attempt starts clean. The CPI's job is not "do this once"; it is "make the world match this request, however many times the request arrives."
+So every method is built to converge, not to assume a clean slate. Deleting a resource that is already gone is success, not an error — the world is already in the state the Director wanted. If a resource already exists, creation reuses it rather than making a duplicate. A partial create cleans up its fragments so the next attempt starts clean. The CPI's job is not "do this once"; it is "make the world match this request, however many times the request arrives."
 
 ## Read-back, because the Director needs to reconcile
 
@@ -36,7 +36,7 @@ If the Director holds the state and the CPI reads reality, the two can drift —
 
 Now the chain reaches its sharpest consequence. Since the Director re-drives calls, every failure the CPI returns must answer one question, and only one: should the Director try again?
 
-A transient hiccup — a busy hypervisor, a momentary timeout, a storage lock held by someone else — deserves another attempt; the world might be fine a second later. A structural fault — a malformed argument, a request to shrink a disk in a way the platform cannot do — deserves to stop and surface, because retrying it only wastes time and hides the real problem. So the CPI tags every error with a retriability signal, and the Director reads that tag to decide between re-queueing the call and giving up loudly.
+A transient hiccup — a busy hypervisor, a momentary timeout, a storage lock held by someone else — deserves another attempt; the world might be fine a second later. Structural faults are different: a malformed argument or a request the platform fundamentally cannot fulfill should stop and surface, not be retried. Retrying only wastes time and hides the real cause. So the CPI tags every error with a retriability signal, and the Director reads that tag to decide between re-queueing the call and giving up loudly.
 
 ```mermaid
 flowchart LR

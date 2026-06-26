@@ -38,17 +38,17 @@ flowchart TD
 
 *Dispatch on cloud-ID shape. A modern stemcell takes the fast clone path; a legacy one opportunistically upgrades to it when a matching template is found, and only block-copies when none exists.*
 
-The effect is that the optimization is backward-compatible by construction. A legacy stemcell does not have to be re-uploaded to benefit; the first time the CPI sees its fingerprint match a template already present, it quietly takes the fast path. Old deployments get faster on their own.
+The optimization is backward-compatible by construction. A legacy stemcell does not have to be re-uploaded to benefit; the first time the CPI sees its fingerprint match a template already present, it quietly takes the fast path. Old deployments get faster on their own.
 
 ## The template is a build-time artifact, nothing more
 
-Once a VM is cloned, it carries its own copy of what it needs and has no further dependency on the template — even on copy-on-write storage, the relationship is at the block layer, invisible to the running guest's lifecycle as the Director sees it. A template can therefore be deleted at any time without disturbing the VMs it produced. This is what lets the CPI treat templates as pure build-time scaffolding: useful while we stamp out machines, disposable afterward, never load-bearing for anything already running.
+Once a VM is cloned, it carries its own copy of what it needs and has no further dependency on the template — even on copy-on-write storage, the relationship is at the block layer, invisible to the running guest's lifecycle as the Director sees it. A template can therefore be deleted at any time without disturbing the VMs it produced. Templates are pure build-time scaffolding: useful while we stamp out machines, disposable afterward, never load-bearing for anything already running.
 
 ## Living across many nodes
 
 A single mold on a single node only helps machines born on that node. A real cluster has several, and a clone can only be made on a node that can see the template. So on a multi-node cluster the template must live on shared, file-based storage — block storage cannot accept the image upload in the first place, and local storage would strand the mold on one node. Single-node clusters relax this, since there is nowhere else for a workload to land.
 
-Two optional features extend the mold across the cluster. The CPI can replicate the frozen template to every node in parallel, so every node can clone locally at full speed. And the same content fingerprint that dedupes imports also drives cleanup: provenance tags let a delete sweep the cluster and remove every copy of a retired template, including replicas on nodes the original create never touched. Identity by content pays off again — the fingerprint we used to avoid importing twice is the fingerprint we use to find every copy when it is time to let go.
+The CPI can optionally replicate the frozen template to every node in parallel, so every node can clone locally at full speed. The same content fingerprint that dedupes imports also drives cleanup: provenance tags let a delete sweep the cluster and remove every copy of a retired template, including replicas on nodes the original create never touched. Identity by content pays off again — the fingerprint we used to avoid importing twice is the fingerprint we use to find every copy when it is time to let go.
 
 ## Where this leads
 

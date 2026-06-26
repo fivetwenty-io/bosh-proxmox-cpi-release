@@ -12,7 +12,7 @@ So the single doorway every request walks through — the dispatcher introduced 
 
 ## A transaction with no native rollback
 
-Creating a VM is not one operation. It is a sequence: allocate an identifier, clone the template, configure the network interfaces, resize the system disk, attach the ConfigDrive, start the machine. PVE offers no rollback for that sequence. A failure at the fifth step leaves a half-built VM occupying an identifier and consuming storage, with no corresponding record on the Director's side. That is a leak, and leaks compound. They deplete the VM identifier range, they litter storage with disks and ConfigDrive images, they confuse later orphan scans, and they tempt a retrying Director to pile a second mess on top of the first.
+Creating a VM is not one operation. It is a sequence: allocate an identifier, clone the template, configure the network interfaces, resize the system disk, attach the ConfigDrive, start the machine. PVE offers no rollback for that sequence. A failure at the fifth step leaves a half-built VM occupying an identifier and consuming storage, with no corresponding record on the Director's side. That is a leak, and leaks compound. They deplete the VM identifier range, litter storage with disks and ConfigDrive images, confuse later orphan scans, and tempt a retrying Director to pile a second mess on top of the first.
 
 The answer is to compose atomicity out of steps that are not themselves atomic. As each resource is acquired, the handler registers an undo action onto a stack. If the call succeeds, the stack is discarded. If any step fails, the stack fires in reverse — last acquired, first released — so a half-created VM does not leak.
 

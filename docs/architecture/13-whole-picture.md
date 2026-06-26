@@ -37,7 +37,7 @@ Extension points assume hostility — no shell, allowlists, scrubbed environment
 
 ## The architecture that emerges
 
-Here is the part worth dwelling on. None of these principles began as "let us build a layered architecture." The layering is a *consequence*. When every fact must live in a durable carrier, when cross-cutting safety must apply uniformly, and when the platform-specific work must stay quarantined from the platform-agnostic work, a particular shape falls out almost on its own.
+None of these principles began as "let us build a layered architecture." The layering is a *consequence*. When every fact must live in a durable carrier, when cross-cutting safety must apply uniformly, and when the platform-specific work must stay quarantined from the platform-agnostic work, a particular shape falls out almost on its own.
 
 ```mermaid
 flowchart TD
@@ -53,7 +53,7 @@ flowchart TD
 ```
 *The layered shape is an effect, not a premise: cross-cutting safety collects at one doorway, handlers stay single-purpose, the invented primitives sit above a hardened client, and the platform-specific knowledge is confined to the bottom edge.*
 
-Three things about this shape are worth saying plainly. First, the doorway is the only place that knows about everything; every request walks through it and leaves wearing the same safety equipment, so no single handler has to remember to be safe. Second, the layers form a strict one-way dependency — the part that talks to PVE knows nothing about how machines are bootstrapped, and the bootstrap logic knows nothing about how requests are dispatched. That quarantine is what keeps the platform-specific blast radius small and the whole thing testable. Third, the resilience and safety machinery is not sprinkled through the handlers; it is concentrated at the edges — the doorway above and the hardened client below — so the business of each method stays small and legible.
+Three things about this shape stand out. First, the doorway is the only place that knows about everything; every request walks through it and leaves wearing the same safety equipment, so no single handler has to remember to be safe. Second, the layers form a strict one-way dependency — the part that talks to PVE knows nothing about how machines are bootstrapped, and the bootstrap logic knows nothing about how requests are dispatched. That quarantine is what keeps the platform-specific blast radius small and the whole thing testable. Third, the resilience and safety machinery is not sprinkled through the handlers; it is concentrated at the edges — the doorway above and the hardened client below — so the business of each method stays small and legible.
 
 That is the payoff of deriving an architecture from principles rather than drawing boxes first. The boxes we would have drawn are the boxes we end up with, but now we know *why* each one exists and what would break if we moved a responsibility across a line.
 

@@ -77,7 +77,7 @@ flowchart LR
 ```
 *When balance is a continuous problem, the CPI hands placement back to a component that never sleeps.*
 
-Delegation is powerful and costly, because it imports the delegate's entire constraint set. Live migration cannot move a local-disk VM, so shared storage becomes mandatory. The migrating VM must keep its address, so cluster-global networking becomes mandatory. BOSH's own resurrector must be turned off, or two independent systems will each try to restart a stopped VM and produce duplicates. And the Director itself must never be balanced mid-deploy, or it would drop the very CPI calls in flight. Because those preconditions are real, this delegation is opt-in and fails inert: absent its prerequisites, it simply does nothing. The escape hatch above all of this is unchanged — name an explicit target node and scoring steps aside entirely.
+Delegation is powerful and costly, because it imports the delegate's entire constraint set. Live migration cannot move a local-disk VM, so shared storage is required. The migrating VM must keep its address across nodes, which means cluster-global networking too. BOSH's own resurrector must be turned off, or two independent systems will each try to restart a stopped VM and produce duplicates. And the Director itself must never be balanced mid-deploy, or it would drop the very CPI calls in flight. Because those preconditions are real, this delegation is opt-in and fails inert: absent its prerequisites, it simply does nothing. The escape hatch above all of this is unchanged — name an explicit target node and scoring steps aside entirely.
 
 ## Where this leads
 

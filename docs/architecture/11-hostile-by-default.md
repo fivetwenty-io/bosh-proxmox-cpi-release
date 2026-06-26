@@ -31,7 +31,7 @@ The credential itself is an API token, not a password, because a token can be re
 
 Secrets pass through the CPI constantly. The message-bus URL embeds a username and password. Blobstore credentials, API tokens, and raw error bodies from PVE all flow through arguments and responses. Logs, meanwhile, are a *lower* trust tier than the credential store: they are written to disk, shipped to aggregators, retained for months, and pasted into support tickets. A credential that reaches a log has, for all practical purposes, escaped its vault.
 
-So nothing reaches a log unscrubbed. A deep, structure-preserving scrub walks every argument and result before it is traced — masking values whose keys name something sensitive, masking the userinfo in a URL, masking signature-bearing query parameters — and leaves the *shape* intact so the log stays diagnostic even with the secrets replaced by redaction markers. The redactor's coverage is not theoretical; it is the accumulated product of real leak post-mortems, each of which taught it one more place a secret hides.
+So nothing reaches a log unscrubbed. A deep, structure-preserving scrub walks every argument and result before it is traced — masking sensitive-keyed values, URL userinfo, and signature-bearing query parameters — and leaves the *shape* intact so the log stays diagnostic even with the secrets replaced by redaction markers. The redactor's coverage is not theoretical; it is the accumulated product of real leak post-mortems, each of which taught it one more place a secret hides.
 
 ```mermaid
 flowchart TD
@@ -42,7 +42,7 @@ flowchart TD
 ```
 *Two trust tiers, two messages: the Director and the durable log get an operator-safe projection, while the full secret-bearing detail stays in the lowest-reach debug sink or never materializes at all.*
 
-The same two-tier discipline governs error messages at the RPC boundary. An error carries an operator-safe message that the Director sees, while the full underlying detail — the URL, the response body, the credential hints — is preserved only for the local debug log. A PVE authentication failure returns a clean "authentication failed for node X" to the Director; the raw failure with all its sensitive context stays in the lowest-reach sink. Crucially, this split never loses the retriability classification from [Chapter 10](10-safety.md): the operator-safe projection still tells the Director whether to try again. Operational identifiers — paths, storage names, VM identifiers — are deliberately *not* redacted, because they aid diagnosis and are not secrets.
+The same two-tier discipline governs error messages at the RPC boundary. An error carries an operator-safe message that the Director sees, while the full underlying detail — the URL, the response body, the credential hints — is preserved only for the local debug log. A PVE authentication failure returns a clean "authentication failed for node X" to the Director; the raw failure with all its sensitive context stays in the lowest-reach sink. This split never loses the retriability classification from [Chapter 10](10-safety.md): the operator-safe projection still tells the Director whether to try again. Operational identifiers — paths, storage names, VM identifiers — are deliberately *not* redacted, because they aid diagnosis and are not secrets.
 
 ## Extension points that assume hostility
 

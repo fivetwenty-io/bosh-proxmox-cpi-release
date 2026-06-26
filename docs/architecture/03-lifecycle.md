@@ -8,7 +8,7 @@ The previous chapter established the constraint that shapes everything: the bina
 
 ## One VM's life, told as a chain
 
-There is a canonical order in which these methods fire, and it reads like a biography. It is worth holding the whole chain in mind at once, because every later chapter is a deep dive into one link of it.
+There is a canonical order in which these methods fire, and it reads like a biography. Hold the whole chain in mind — every later chapter is a deep dive into one link of it.
 
 ```mermaid
 flowchart LR
@@ -33,7 +33,7 @@ The chain begins with a question, not an action. **Capability is discovered, not
 
 ## The conceptual groups
 
-Twenty-one methods is a lot to hold as a flat list, so think of them in five families, each answering a different question.
+Twenty-one methods is unwieldy as a flat list — think of them in five families, each answering a different question.
 
 - **Stemcell management**
   Turn a golden OS image into a reusable, frozen template, and later remove it. This is "prepare the mold," and Chapter 4 is entirely about why it exists.
