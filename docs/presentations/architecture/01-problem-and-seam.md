@@ -17,7 +17,7 @@ class: visual-right
 
 <div class="visual-copy">
 
-## What BOSH is, and the line it refuses to cross
+## What BOSH is, and the line it is designed not to cross
 
 - Provision, deploy, watch, heal — any cloud
 - The Director: generic intent only
@@ -105,4 +105,3 @@ class: visual-right
 - We will advertise `openstack-qcow2`/`openstack-raw` stemcell formats, so operators can upload existing bosh-openstack-kvm stemcells with no conversion — PVE treats the format name opaquely; only the image bytes matter.
 - Certification scope is a decision to make deliberately: the local lifecycle harness will cover the full method surface, sufficient for everything short of cutting a tagged release; upstream BAT is a release-time concern.
 -->
-

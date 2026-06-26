@@ -2,7 +2,7 @@
 
 A team decides to run their platform on Proxmox VE. They already use BOSH to deploy and manage that platform — it knows how to roll out a release, monitor every VM, replace a failed instance, and resize a disk without losing data. Then someone asks the obvious question: how does BOSH, which was built without any knowledge of Proxmox, learn to drive it? BOSH already has the answer, and it is a deliberate one. The system is built around clear, versioned contracts, and one of them exists precisely to make infrastructure pluggable: the Cloud Provider Interface, or CPI. Adding a new platform is not a matter of forking BOSH or teaching its core a new API — it is a matter of writing to a contract BOSH already defines for exactly this purpose. That contract — where a general orchestrator meets a specific platform it has never heard of — is the seam this document exists to explore.
 
-## What BOSH is, and the line it refuses to cross
+## What BOSH is, & the line designed not to cross
 
 BOSH is a release-engineering and lifecycle system. We hand it a packaged release and a description of the deployment we want, and it does the unglamorous, relentless work of getting there and staying there: provision the machines, lay down the software, watch for drift, and heal what breaks. It runs the same way whether the underlying infrastructure is AWS, Azure, Google Cloud, vSphere, OpenStack, or Proxmox VE.
 

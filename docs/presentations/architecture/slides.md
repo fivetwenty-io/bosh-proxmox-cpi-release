@@ -24,7 +24,7 @@ layout: cover
 ## An Architecture, From First Principles
 
 <div class="pt-8 opacity-80">
-Wayne E. Seguin · FiveTwenty Inc.
+Presented by Wayne E. Seguin, FiveTwenty Inc.
 </div>
 
 ---
@@ -40,13 +40,13 @@ class: agenda
 
 **I — Foundations**
 
-1 · The Problem and the Seam  
+1 · The Problem and the Seam
 2 · One Constraint, Many Consequences
 
 **II — Building a Machine**
 
-3 · The Lifecycle of a Machine  
-4 · The Stemcell as a Mold  
+3 · The Lifecycle of a Machine
+4 · The Stemcell as a Mold
 5 · Giving a Machine Its Identity
 
 </div>
@@ -55,15 +55,15 @@ class: agenda
 
 **III — Cloud Primitives PVE Lacks**
 
-6 · Manufacturing a Scheduler  
-7 · Portable Networks  
+6 · Manufacturing a Scheduler
+7 · Portable Networks
 8 · Inventing the Durable Volume
 
 **IV — Living in Production**
 
-9 · Absorbing the Storm  
-10 · Never Wedge, Never Leak, Never Lose  
-11 · Hostile by Default  
+9 · Absorbing the Storm
+10 · Never Wedge, Never Leak, Never Lose
+11 · Hostile by Default
 12 · Operating the Thing
 
 **Closing**
