@@ -68,3 +68,9 @@ docs/presentations/**/dist/
 docs/presentations/**/node_modules/
 docs/presentations/**/*.pdf
 docs/presentations/**/.slidev/
+bun.lock
+
+# Architecture HTML build (generated from docs/architecture/*.md)
+docs/architecture/index.html
+docs/architecture/node_modules/
+node_modules

@@ -277,6 +277,18 @@ slides-architecture-build: ## Build the architecture deck to a static SPA (docs/
 	@cd $(SLIDES_ARCH_DIR) && bunx @slidev/cli build slides.md --out $(SLIDES_ARCH_DIST)
 	@echo "$(GREEN)✓ $(SLIDES_ARCH_DIR)/$(SLIDES_ARCH_DIST) built$(RESET)"
 
+##@ Documentation
+
+# Architecture narrative (Markdown) → single readable index.html with rendered
+# Mermaid diagrams. markdown-it is fetched via bun install — bun only, never npm/npx.
+DOCS_ARCH_DIR := docs/architecture
+
+.PHONY: docs-architecture-html
+docs-architecture-html: ## Compile docs/architecture/*.md into a single docs/architecture/index.html
+	@echo "$(GREEN)Building architecture HTML...$(RESET)"
+	@cd $(DOCS_ARCH_DIR) && bun install --silent && bun build-index.mjs
+	@echo "$(GREEN)✓ $(DOCS_ARCH_DIR)/index.html built$(RESET)"
+
 ##@ Cleanup
 
 .PHONY: clean
@@ -286,4 +298,5 @@ clean: release-clean ## Remove coverage files, bin/, and stray release artifacts
 .PHONY: help build install tidy test coverage coverage-html coverage-check fmt vet lint \
         staticcheck check govulncheck gosec trivy security download-blobs upload-blobs sync-blobs \
         release-build dev-release release release-clean release-hygiene bosh-clean \
-        slides-architecture slides-architecture-export slides-architecture-build clean
+        slides-architecture slides-architecture-export slides-architecture-build \
+        docs-architecture-html clean
