@@ -253,6 +253,30 @@ bosh-clean: ## Remove local BOSH release artifacts (.dev_builds, .final_builds, 
 	@rm -rf .dev_builds .final_builds dev_releases
 	@echo "$(YELLOW)note: blobs/ cache left in place; remove manually if desired$(RESET)"
 
+##@ Presentations
+
+# Slidev deck source (Markdown). bunx @slidev/cli is fetched on demand — bun only, never npm/npx.
+SLIDES_ARCH_DIR  := docs/presentations/architecture
+SLIDES_ARCH_PDF  := architecture.pdf
+SLIDES_ARCH_DIST := dist
+
+.PHONY: slides-architecture
+slides-architecture: ## Launch the architecture Slidev deck in the live presenter (bunx @slidev/cli)
+	@echo "$(GREEN)Starting architecture slides presenter...$(RESET)"
+	@cd $(SLIDES_ARCH_DIR) && bunx @slidev/cli slides.md
+
+.PHONY: slides-architecture-export
+slides-architecture-export: ## Export the architecture deck to a PDF (docs/presentations/architecture/architecture.pdf)
+	@echo "$(GREEN)Exporting architecture deck to PDF...$(RESET)"
+	@cd $(SLIDES_ARCH_DIR) && bunx @slidev/cli export slides.md --output $(SLIDES_ARCH_PDF)
+	@echo "$(GREEN)✓ $(SLIDES_ARCH_DIR)/$(SLIDES_ARCH_PDF) written$(RESET)"
+
+.PHONY: slides-architecture-build
+slides-architecture-build: ## Build the architecture deck to a static SPA (docs/presentations/architecture/dist)
+	@echo "$(GREEN)Building architecture deck (static SPA)...$(RESET)"
+	@cd $(SLIDES_ARCH_DIR) && bunx @slidev/cli build slides.md --out $(SLIDES_ARCH_DIST)
+	@echo "$(GREEN)✓ $(SLIDES_ARCH_DIR)/$(SLIDES_ARCH_DIST) built$(RESET)"
+
 ##@ Cleanup
 
 .PHONY: clean
@@ -261,4 +285,5 @@ clean: release-clean ## Remove coverage files, bin/, and stray release artifacts
 
 .PHONY: help build install tidy test coverage coverage-html coverage-check fmt vet lint \
         staticcheck check govulncheck gosec trivy security download-blobs upload-blobs sync-blobs \
-        release-build dev-release release release-clean release-hygiene bosh-clean clean
+        release-build dev-release release release-clean release-hygiene bosh-clean \
+        slides-architecture slides-architecture-export slides-architecture-build clean

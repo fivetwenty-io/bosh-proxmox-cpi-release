@@ -62,3 +62,9 @@ ci/cpi-config.json
 
 # e2e runner results (timing, results.json, junit.xml)
 .e2e-results/
+
+# Slidev presentation build artifacts
+docs/presentations/**/dist/
+docs/presentations/**/node_modules/
+docs/presentations/**/*.pdf
+docs/presentations/**/.slidev/

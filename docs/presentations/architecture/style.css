@@ -1,0 +1,163 @@
+/* ============================================================
+   Architecture deck — global styles (auto-loaded by Slidev)
+   Goals: Nunito-friendly rhythm, diagrams that never overflow,
+   bullet slides that use the whole canvas instead of crowding
+   the top-left corner.
+   ============================================================ */
+
+/* --- Bullet / content slides ---------------------------------
+   Center the content block vertically so a short list of cues
+   uses the slide instead of clinging to the top. Give the text
+   real size and line spacing so it reads from the back row. */
+.slidev-layout.default {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  padding-top: 2.5rem;
+  padding-bottom: 2.5rem;
+}
+
+.slidev-layout.default h1,
+.slidev-layout.default h2 {
+  margin-bottom: 1.1rem;
+}
+
+.slidev-layout.default ul {
+  font-size: 1.45rem;
+  line-height: 1.42;
+}
+
+.slidev-layout.default ul li {
+  margin-bottom: 0.48em;
+}
+
+.slidev-layout.default ul li:last-child {
+  margin-bottom: 0;
+}
+
+/* Captions sitting under a diagram stay smaller and tighter so
+   the diagram remains the focus. */
+.slidev-layout .mermaid + ul,
+.slidev-layout .mermaid + p {
+  font-size: 1.08rem;
+  line-height: 1.35;
+  margin-top: 0.9rem;
+}
+
+.slidev-layout .mermaid + ul li {
+  margin-bottom: 0.35em;
+}
+
+/* --- Diagrams ------------------------------------------------
+   Scale any Mermaid diagram down to fit inside the slide while
+   preserving its aspect ratio, so wide (LR) and tall (TB)
+   flowcharts both stay on-canvas. */
+.slidev-layout .mermaid {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  margin: 0 auto;
+  width: 100%;
+}
+
+.slidev-layout .mermaid svg {
+  max-width: 100%;
+  max-height: 60vh;
+  width: auto;
+  height: auto;
+}
+
+/* Mermaid-heavy slides need a top-led layout. Centering a tall
+   sequence diagram makes the title disappear before the diagram
+   itself appears to overflow. */
+.slidev-layout.default:has(.mermaid) {
+  justify-content: flex-start;
+  padding-top: 2rem;
+  padding-bottom: 1.8rem;
+}
+
+.slidev-layout.default:has(.mermaid) h2 {
+  margin-bottom: 0.75rem;
+}
+
+.slidev-layout.default:has(.mermaid) .mermaid svg {
+  max-height: 52vh;
+}
+
+.slidev-layout.default:has(.mermaid) ul {
+  font-size: 1.08rem;
+  line-height: 1.32;
+}
+
+/* The agenda is a map of the talk, not a script. Keep the whole arc
+   visible in the first viewport. */
+.slidev-layout.agenda {
+  justify-content: flex-start;
+}
+
+.slidev-layout.agenda h1 {
+  margin-bottom: 1.4rem;
+}
+
+.agenda-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 3.25rem;
+  font-size: 1.18rem;
+  line-height: 1.38;
+}
+
+.agenda-grid strong {
+  display: block;
+  margin: 0 0 0.45rem;
+  font-size: 1rem;
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+
+.agenda-grid p {
+  margin: 0 0 1.05rem;
+}
+
+/* Visual companion slides: keep the spoken cues readable while a
+   quiet metaphor panel carries the right half of the canvas. */
+.slidev-layout.visual-right {
+  display: grid;
+  grid-template-columns: minmax(0, 1.02fr) minmax(0, 0.98fr);
+  gap: 2.5rem;
+  align-items: center;
+  justify-content: initial;
+}
+
+.slidev-layout.visual-right h2 {
+  margin-bottom: 1rem;
+}
+
+.slidev-layout.visual-right ul {
+  font-size: 1.25rem;
+  line-height: 1.38;
+}
+
+.visual-copy {
+  min-width: 0;
+}
+
+.visual-img {
+  display: block;
+  width: 100%;
+  max-height: 27rem;
+  aspect-ratio: 16 / 9;
+  object-fit: contain;
+  border-radius: 8px;
+}
+
+/* Section divider slides: let the first-principle line breathe. */
+.slidev-layout.section h1 {
+  margin-bottom: 0.75rem;
+}
+
+.slidev-layout.section em {
+  display: inline-block;
+  margin-top: 1rem;
+  opacity: 0.85;
+}
