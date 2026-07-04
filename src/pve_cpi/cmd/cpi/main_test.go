@@ -9,6 +9,8 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"go.opentelemetry.io/otel/trace/noop"
+
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cloudinit"
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cluster"
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/clusterstorage"
@@ -100,7 +102,7 @@ func TestRunCPI_EOF(t *testing.T) {
 	var w bytes.Buffer
 
 	d := cpi.NewDispatcher(logger)
-	err := runCPI(context.Background(), r, &w, d, logger, defaultMaxLineBytes)
+	err := runCPI(context.Background(), r, &w, d, logger, defaultMaxLineBytes, nil)
 	if err != nil {
 		t.Fatalf("expected nil error on EOF, got: %v", err)
 	}
@@ -117,7 +119,7 @@ func TestRunCPI_SingleRequest(t *testing.T) {
 	var w bytes.Buffer
 
 	d := cpi.NewDispatcher(logger)
-	err := runCPI(context.Background(), r, &w, d, logger, defaultMaxLineBytes)
+	err := runCPI(context.Background(), r, &w, d, logger, defaultMaxLineBytes, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -145,7 +147,7 @@ func TestRunCPI_MalformedJSON(t *testing.T) {
 	var w bytes.Buffer
 
 	d := cpi.NewDispatcher(logger)
-	err := runCPI(context.Background(), r, &w, d, logger, defaultMaxLineBytes)
+	err := runCPI(context.Background(), r, &w, d, logger, defaultMaxLineBytes, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -192,7 +194,7 @@ func TestRunCPI_TwoRequests(t *testing.T) {
 	var w bytes.Buffer
 
 	d := cpi.NewDispatcher(logger)
-	err := runCPI(context.Background(), r, &w, d, logger, defaultMaxLineBytes)
+	err := runCPI(context.Background(), r, &w, d, logger, defaultMaxLineBytes, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -260,7 +262,7 @@ func TestRunCPI_DispatchesRequest(t *testing.T) {
 	var w bytes.Buffer
 
 	d := cpi.NewDispatcher(logger)
-	if err := runCPI(context.Background(), r, &w, d, logger, defaultMaxLineBytes); err != nil {
+	if err := runCPI(context.Background(), r, &w, d, logger, defaultMaxLineBytes, nil); err != nil {
 		t.Fatalf("runCPI returned unexpected error: %v", err)
 	}
 
@@ -328,7 +330,8 @@ func TestDispatchOne_WriteResponsePanic_EmitsCloudError(t *testing.T) {
 	sink := &panicOnFirstWrite{}
 	bw := bufio.NewWriter(sink)
 
-	err := dispatchOne(context.Background(), bw, sink, d, req, logger)
+	_, span := noop.NewTracerProvider().Tracer("test").Start(context.Background(), "info")
+	err := dispatchOne(context.Background(), bw, sink, d, req, logger, span)
 
 	// dispatchOne must not propagate the panic, and must return nil (write of the
 	// CloudError succeeded — the second write path no longer panics).

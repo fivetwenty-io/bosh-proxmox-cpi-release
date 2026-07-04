@@ -25,6 +25,11 @@ import (
 	"syscall"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+	tracenoop "go.opentelemetry.io/otel/trace/noop"
+
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/agent"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/cpi"
@@ -33,6 +38,7 @@ import (
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
+	"github.com/fivetwenty-io/bosh-pve-cpi/internal/otel"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/version"
 )
@@ -45,6 +51,20 @@ const exitSignaled = 130
 // treats that as a decode error, writes a CloudError, and continues.
 const defaultMaxLineBytes = 64 * 1024 * 1024
 
+// defaultOTelShutdownTimeoutMs bounds the OTel shutdown flush when
+// cfg.OTel.ExportTimeoutMs is unset (0). It is only ever reached when tracing
+// is disabled, in which case the shutdown func is a no-op that ignores the
+// deadline entirely — this value exists purely so the shutdown context always
+// carries a real deadline rather than an implicit zero-duration one.
+const defaultOTelShutdownTimeoutMs = 5000
+
+// fallbackTracerName identifies the no-op tracer runCPI builds when called
+// with a nil tracer. Production startup (runWithArgs) always supplies the
+// non-nil tracer returned by otel.Setup (real or its own no-op), so this path
+// is only reached by test call sites that pass nil to exercise runCPI/
+// dispatchOne without constructing a tracer.
+const fallbackTracerName = "github.com/fivetwenty-io/bosh-pve-cpi/cmd/cpi"
+
 func main() {
 	os.Exit(run())
 }
@@ -52,10 +72,22 @@ func main() {
 // runOptions holds optional overrides for runWithArgs. The zero value is valid
 // and selects production defaults for every field.
 type runOptions struct {
-	// ClientFactory constructs the PVE client from a loaded config. When nil,
-	// runWithArgs uses pve.NewClient. Tests inject a factory that returns a
-	// nilPVEClient to exercise the pve.NewClient error path without a live PVE.
-	ClientFactory func(cfg *config.CPIConfig, logger *log.Logger) (pve.Client, error)
+	// ClientFactory constructs the PVE client from a loaded config and the
+	// tracer resolved via TracerFactory. When nil, runWithArgs uses
+	// pve.NewClientWithTracer. Tests inject a factory that returns a
+	// nilPVEClient to exercise the pve.NewClientWithTracer error path without
+	// a live PVE. tracer is never nil in production (otel.Setup always
+	// returns a real-or-no-op trace.Tracer); a no-op tracer decorates PVE
+	// service calls with zero added overhead, identical to the pre-tracing
+	// behavior.
+	ClientFactory func(cfg *config.CPIConfig, logger *log.Logger, tracer trace.Tracer) (pve.Client, error)
+
+	// TracerFactory constructs the OTel tracer and its bounded shutdown func.
+	// When nil, runWithArgs uses otel.Setup. Tests inject a factory backed by
+	// an in-memory tracetest exporter to assert exported root spans and
+	// log/trace correlation without a network collector, or to force a
+	// shutdown error to prove it never changes the process exit code.
+	TracerFactory func(ctx context.Context, cfg config.OTelConfig, logger *log.Logger) (trace.Tracer, func(context.Context) error, error)
 
 	// MaxLineBytes overrides the per-request line size cap passed to runCPI.
 	// Zero selects defaultMaxLineBytes (64 MiB). Tests set a small value (e.g.
@@ -121,11 +153,57 @@ func runWithArgs(args []string, stdin io.Reader, stdout, stderr io.Writer, opts 
 		return 1
 	}
 
+	// Root context cancelled on SIGINT/SIGTERM. defer cancel() fires when
+	// runWithArgs returns, deregistering the signal handler and releasing
+	// resources even though main calls os.Exit — the exit is deferred until
+	// after run() returns. Built before tracer setup because otel.Setup dials
+	// the exporter's HTTP client against this ctx when tracing is enabled.
+	rootCtx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+
+	tracerFactory := opts.TracerFactory
+	if tracerFactory == nil {
+		tracerFactory = otel.Setup
+	}
+	tracer, otelShutdown, err := tracerFactory(rootCtx, cfg.OTel, logger)
+	if err != nil {
+		logger.Error("otel tracer init failed", log.Err(err))
+		return 1
+	}
+	// Bounded shutdown flush covers every exit path downstream of this point:
+	// client init failure, agent init failure, hook errors, runCPI's error
+	// return, and the normal EOF return. The deadline's parent is
+	// context.Background() rather than rootCtx: by the time this defer runs,
+	// rootCtx may already be cancelled (e.g. by the same SIGTERM that ended
+	// the request loop), which would leave zero budget to flush buffered
+	// spans. A flush/export failure is logged at Warn and never changes the
+	// process's exit code: the flush deadline is bounded, and an export
+	// failure must never fail a CPI action.
+	defer func() {
+		timeoutMs := cfg.OTel.ExportTimeoutMs
+		if timeoutMs <= 0 {
+			timeoutMs = defaultOTelShutdownTimeoutMs
+		}
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), time.Duration(timeoutMs)*time.Millisecond)
+		defer shutdownCancel()
+		if shutdownErr := otelShutdown(shutdownCtx); shutdownErr != nil {
+			logger.Warn("otel shutdown/flush failed", log.ErrScrubbed(shutdownErr))
+		}
+	}()
+
 	clientFactory := opts.ClientFactory
 	if clientFactory == nil {
-		clientFactory = pve.NewClient
+		clientFactory = pve.NewClientWithTracer
 	}
-	client, err := clientFactory(cfg, logger)
+	// With tracing disabled, hand the client a nil tracer rather than the
+	// no-op one: NewClientWithTracer skips the decorator layer entirely on
+	// nil, so a tracing-off deployment routes PVE calls through the exact
+	// same code path as before tracing existed.
+	clientTracer := tracer
+	if !cfg.OTelEnabled() {
+		clientTracer = nil
+	}
+	client, err := clientFactory(cfg, logger, clientTracer)
 	if err != nil {
 		logger.Error("pve client init failed", log.Err(err))
 		return 1
@@ -144,13 +222,6 @@ func runWithArgs(args []string, stdin io.Reader, stdout, stderr io.Writer, opts 
 		logger.Error("agent init failed", log.Err(err))
 		return 1
 	}
-
-	// Root context cancelled on SIGINT/SIGTERM. defer cancel() fires when
-	// runWithArgs returns, deregistering the signal handler and releasing
-	// resources even though main calls os.Exit — the exit is deferred until
-	// after run() returns.
-	rootCtx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer cancel()
 
 	// 60s TTL keeps the /storage index fresh enough to catch operator-driven
 	// storage.cfg edits between deploys while shielding a busy create_disk
@@ -254,7 +325,7 @@ func runWithArgs(args []string, stdin io.Reader, stdout, stderr io.Writer, opts 
 		maxLine = defaultMaxLineBytes
 	}
 
-	runErr := runCPI(rootCtx, stdin, stdout, d, logger, maxLine)
+	runErr := runCPI(rootCtx, stdin, stdout, d, logger, maxLine, tracer)
 	if runErr != nil {
 		if errors.Is(runErr, errSignaled) {
 			return exitSignaled
@@ -283,6 +354,10 @@ var errSignaled = errors.New("cpi: terminated by signal")
 //   - w: JSON-RPC response stream (typically os.Stdout); wrapped in bufio.Writer and flushed after each response.
 //   - d: dispatcher with handlers pre-registered.
 //   - logger: structured logger; all output goes to the sink configured in NewLogger (stderr).
+//   - tracer: starts one root span per CPI action, named after req.Method. A
+//     nil tracer (test call sites only; production always passes the
+//     non-nil tracer otel.Setup returns) falls back to a local no-op tracer
+//     so runCPI never dereferences a nil interface value.
 //
 // Return values:
 //   - nil on clean EOF.
@@ -298,7 +373,11 @@ func runCPI(
 	d *cpi.Dispatcher,
 	logger *log.Logger,
 	maxLineBytes int,
+	tracer trace.Tracer,
 ) error {
+	if tracer == nil {
+		tracer = tracenoop.NewTracerProvider().Tracer(fallbackTracerName)
+	}
 	bw := bufio.NewWriter(w)
 
 	// Scan line-by-line so a malformed line never corrupts the decoder state
@@ -350,13 +429,24 @@ func runCPI(
 			continue
 		}
 
+		// Root span for this CPI action, named after the JSON-RPC method (e.g.
+		// "create_vm"), carrying a request_id attribute. Started before
+		// log.WithContext so the per-request logger's trace_id/span_id
+		// extraction (log.go WithContext) sees a span-carrying ctx — building
+		// the logger before the span exists would silently drop trace
+		// correlation from every handler log line.
+		reqCtx, span := tracer.Start(ctx, req.Method, trace.WithAttributes(
+			attribute.String("request_id", req.Context.RequestID),
+		))
+
 		// Build a per-request context carrying request_id and method for structured logging.
-		reqCtx := log.WithRequestID(ctx, req.Context.RequestID)
+		reqCtx = log.WithRequestID(reqCtx, req.Context.RequestID)
 		reqCtx = log.WithMethod(reqCtx, req.Method)
 		reqLogger := logger.WithContext(reqCtx)
 		reqCtx = log.IntoContext(reqCtx, reqLogger)
 
-		// dispatchOne handles the request and writes the response to bw.
+		// dispatchOne handles the request, ends the root span (before any
+		// response bytes reach stdout), and writes the response to bw.
 		// A deferred recover here is a backstop for panics that occur outside the
 		// dispatcher's own recover (e.g., in writeResponse or helper code called
 		// before d.Handle). The dispatcher already recovers handler panics; this
@@ -364,7 +454,7 @@ func runCPI(
 		// w is passed alongside bw so the backstop can write a clean CloudError
 		// to a fresh bufio.Writer if bw's internal state was corrupted by a panic
 		// mid-flush.
-		if loopErr := dispatchOne(reqCtx, bw, w, d, req, logger); loopErr != nil {
+		if loopErr := dispatchOne(reqCtx, bw, w, d, req, logger, span); loopErr != nil {
 			return loopErr
 		}
 
@@ -415,11 +505,45 @@ func writeErrorResponse(bw *bufio.Writer, e *cpierrors.Error) error {
 	return bw.Flush()
 }
 
-// dispatchOne dispatches req through d, writes the response to bw, and returns
-// any write error. It also catches panics that occur outside the dispatcher's
-// own recover (e.g., in writeResponse) and converts them to a non-retriable
-// CloudError. When a panic occurs mid-write, bw may have partial buffered bytes
-// in an indeterminate state; the backstop discards those bytes by resetting bw
+// endRootSpanErr finishes span, marking it Error (RecordError + SetStatus)
+// when err is non-nil, then ends it. Ending an already-ended span is a
+// documented no-op in the OTel SDK (recordingSpan.End checks isRecording
+// before doing any work), so callers may safely invoke this more than once
+// for the same span — the second call neither re-exports nor overwrites the
+// status recorded by the first.
+// Error text is scrubbed before it leaves the process: response errors can
+// echo PVE-returned values embedding token-bearing URLs, and the span
+// exporter must apply the same scrubbing the logs do.
+func endRootSpanErr(span trace.Span, err error) {
+	if err != nil {
+		msg := log.ScrubMessage(err.Error())
+		span.RecordError(errors.New(msg))
+		span.SetStatus(codes.Error, msg)
+	}
+	span.End()
+}
+
+// endRootSpan finishes the CPI action's root span (started in runCPI) based
+// on the dispatcher's response. cpi.Dispatcher.Handle already converts a
+// recovered handler panic into resp.Error before returning, so this single
+// check covers both "handler error" and "handler panic" per the tracing
+// acceptance criteria. Must be called before any response bytes reach
+// stdout — callers call it immediately after d.Handle returns, ahead of
+// writeResponse.
+func endRootSpan(span trace.Span, resp *jsonrpc.Response) {
+	var err error
+	if resp != nil && resp.Error != nil {
+		err = fmt.Errorf("%s: %s", resp.Error.Type, resp.Error.Message)
+	}
+	endRootSpanErr(span, err)
+}
+
+// dispatchOne dispatches req through d, ends span before any response bytes
+// reach stdout, writes the response to bw, and returns any write error. It
+// also catches panics that occur outside the dispatcher's own recover (e.g.,
+// in writeResponse) and converts them to a non-retriable CloudError. When a
+// panic occurs mid-write, bw may have partial buffered bytes in an
+// indeterminate state; the backstop discards those bytes by resetting bw
 // against w (the underlying writer) before writing the CloudError, ensuring a
 // clean JSON-RPC response reaches the Director rather than a partial + error
 // concatenation.
@@ -430,6 +554,7 @@ func dispatchOne(
 	d *cpi.Dispatcher,
 	req *jsonrpc.Request,
 	logger *log.Logger,
+	span trace.Span,
 ) (retErr error) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -444,6 +569,14 @@ func dispatchOne(
 				"panic in %s [request_id=%s]: %v",
 				req.Method, req.Context.RequestID, r,
 			)
+			// This panic occurs after the normal-path d.Handle/endRootSpan call
+			// below (a panic inside d.Handle itself is already recovered by the
+			// dispatcher's own defer, never reaching here), so span is normally
+			// already ended with the correct status; endRootSpanErr's second call
+			// is a documented no-op in that case. If a panic instead occurs before
+			// d.Handle completes (e.g. a bug in ctx/req handling ahead of it), this
+			// is the span's only chance to record the error before it ends.
+			endRootSpanErr(span, cpiErr)
 			// Reset bw against the underlying writer to discard any bytes that were
 			// buffered before the panic. Without this, a partial response followed by
 			// the CloudError would produce a malformed concatenated output.
@@ -455,6 +588,7 @@ func dispatchOne(
 	}()
 
 	resp := d.Handle(ctx, req)
+	endRootSpan(span, resp)
 	if writeErr := writeResponse(bw, resp); writeErr != nil {
 		return fmt.Errorf("cpi: write response: %w", writeErr)
 	}

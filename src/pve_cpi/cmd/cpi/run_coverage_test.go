@@ -25,6 +25,8 @@ import (
 	"sync"
 	"testing"
 
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/cpi"
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
@@ -48,7 +50,7 @@ func TestRunCPI_BlankLinesSkipped(t *testing.T) {
 	var w bytes.Buffer
 
 	d := cpi.NewDispatcher(logger)
-	if err := runCPI(context.Background(), r, &w, d, logger, defaultMaxLineBytes); err != nil {
+	if err := runCPI(context.Background(), r, &w, d, logger, defaultMaxLineBytes, nil); err != nil {
 		t.Fatalf("runCPI returned unexpected error: %v", err)
 	}
 
@@ -77,7 +79,7 @@ func TestRunCPI_MissingMethodField(t *testing.T) {
 	var w bytes.Buffer
 
 	d := cpi.NewDispatcher(logger)
-	if err := runCPI(context.Background(), r, &w, d, logger, defaultMaxLineBytes); err != nil {
+	if err := runCPI(context.Background(), r, &w, d, logger, defaultMaxLineBytes, nil); err != nil {
 		t.Fatalf("runCPI returned unexpected error: %v", err)
 	}
 
@@ -131,7 +133,7 @@ func TestRunCPI_ContextCancelledBetweenRequests(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		runErr = runCPI(ctx, pr, &w, d, logger, defaultMaxLineBytes)
+		runErr = runCPI(ctx, pr, &w, d, logger, defaultMaxLineBytes, nil)
 	}()
 
 	_, _ = fmt.Fprintln(pw, strings.TrimRight(validRequest("info"), "\n"))
@@ -167,7 +169,7 @@ func TestRunCPI_WriteResponseSuccessPath(t *testing.T) {
 	r := strings.NewReader(req)
 	var w bytes.Buffer
 
-	if err := runCPI(context.Background(), r, &w, d, logger, defaultMaxLineBytes); err != nil {
+	if err := runCPI(context.Background(), r, &w, d, logger, defaultMaxLineBytes, nil); err != nil {
 		t.Fatalf("runCPI returned unexpected error: %v", err)
 	}
 
@@ -223,7 +225,7 @@ func TestRunCPI_WriteResponseFailure(t *testing.T) {
 	// Fail after 0 bytes so bufio.Writer flush triggers the error.
 	w := &failWriter{threshold: 0}
 
-	err := runCPI(context.Background(), r, w, d, logger, defaultMaxLineBytes)
+	err := runCPI(context.Background(), r, w, d, logger, defaultMaxLineBytes, nil)
 	if err == nil {
 		t.Fatal("expected error from write failure, got nil")
 	}
@@ -250,7 +252,7 @@ func TestRunCPI_ErrTooLong(t *testing.T) {
 	var w bytes.Buffer
 	d := cpi.NewDispatcher(logger)
 
-	runErr := runCPI(context.Background(), r, &w, d, logger, smallCap)
+	runErr := runCPI(context.Background(), r, &w, d, logger, smallCap, nil)
 
 	// runCPI should return nil after ErrTooLong (scanner is not reusable).
 	if runErr != nil {
@@ -586,7 +588,7 @@ func TestRunWithArgs_ClientFactoryError(t *testing.T) {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
-	failFactory := func(_ *config.CPIConfig, _ *log.Logger) (pve.Client, error) {
+	failFactory := func(_ *config.CPIConfig, _ *log.Logger, _ trace.Tracer) (pve.Client, error) {
 		return nil, errFactoryFail
 	}
 	var stdout, stderr bytes.Buffer
@@ -624,7 +626,7 @@ func TestRunWithArgs_ClientFactorySuccess(t *testing.T) {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
-	nilFactory := func(_ *config.CPIConfig, _ *log.Logger) (pve.Client, error) {
+	nilFactory := func(_ *config.CPIConfig, _ *log.Logger, _ trace.Tracer) (pve.Client, error) {
 		return nilPVEClient{}, nil
 	}
 	req := `{"method":"info","arguments":[],"context":{"request_id":"factory-test-1"},"api_version":2}` + "\n"
@@ -676,7 +678,7 @@ func TestRunWithArgs_AutoMode_NoRegistry_Starts(t *testing.T) {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
-	nilFactory := func(_ *config.CPIConfig, _ *log.Logger) (pve.Client, error) {
+	nilFactory := func(_ *config.CPIConfig, _ *log.Logger, _ trace.Tracer) (pve.Client, error) {
 		return nilPVEClient{}, nil
 	}
 	req := `{"method":"info","arguments":[],"context":{"request_id":"auto-noreg-1"},"api_version":2}` + "\n"
@@ -732,7 +734,7 @@ func TestRunWithArgs_RegistryKeys_Rejected(t *testing.T) {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
-	nilFactory := func(_ *config.CPIConfig, _ *log.Logger) (pve.Client, error) {
+	nilFactory := func(_ *config.CPIConfig, _ *log.Logger, _ trace.Tracer) (pve.Client, error) {
 		return nilPVEClient{}, nil
 	}
 	req := `{"method":"info","arguments":[],"context":{"request_id":"reg-reject-1"},"api_version":2}` + "\n"
@@ -775,7 +777,7 @@ func TestRunWithArgs_AgentInitError(t *testing.T) {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
-	nilFactory := func(_ *config.CPIConfig, _ *log.Logger) (pve.Client, error) {
+	nilFactory := func(_ *config.CPIConfig, _ *log.Logger, _ trace.Tracer) (pve.Client, error) {
 		return nilPVEClient{}, nil
 	}
 	var stdout, stderr bytes.Buffer
