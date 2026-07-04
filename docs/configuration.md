@@ -538,6 +538,32 @@ pve:
     file_path: /var/vcap/sys/log/pve_cpi/metrics.jsonl
 ```
 
+## OTel Tracing
+
+Distributed tracing is opt-in and off by default. When `pve.otel.enabled` is `false` (the default), no tracer provider is built, no network connection is opened, and PVE API calls bypass the tracing layer entirely. When enabled, the CPI emits one root span per CPI action plus child spans for the PVE API calls it makes, exported via OTLP http/protobuf to an external collector. Spans are buffered in-process and flushed once at process exit, bounded by `pve.otel.export_timeout_ms`; if the collector is unreachable or slow, export failure is logged at `warn` level and never fails a CPI action. Tracing never writes to stdout — stdout remains the JSON-RPC channel exclusively — and when enabled, structured log lines gain `trace_id`/`span_id` fields for correlation with the emitted spans.
+
+| Property | Type | Default | Description |
+|---|---|---|---|
+| `pve.otel.enabled` | Boolean | `false` | When `true`, the CPI emits OpenTelemetry traces for each RPC and the PVE API calls it makes, exported via OTLP http/protobuf to `pve.otel.exporter_endpoint`. Default `false`; when `false` no tracer provider is built, no network connection is opened, and PVE API calls bypass the tracing layer entirely. |
+| `pve.otel.exporter_endpoint` | String | `""` | Base URL of the OTLP http/protobuf collector endpoint (host:port or full URL). Required when `pve.otel.enabled` is `true`; ignored otherwise. |
+| `pve.otel.insecure` | Boolean | `false` | When `true`, the OTLP exporter connects over plain HTTP instead of TLS. Default `false` (TLS). Only relevant when `pve.otel.enabled` is `true`. |
+| `pve.otel.service_name` | String | `"bosh-pve-cpi"` | Value of the `service.name` resource attribute attached to every emitted span, identifying this CPI instance to the tracing backend. |
+| `pve.otel.sample_ratio` | Float | `1.0` | Fraction of traces sampled: greater than `0.0`, up to `1.0` (all). Values outside that range fail at template render time; to emit no traces, leave `pve.otel.enabled` `false`. Only relevant when `pve.otel.enabled` is `true`. |
+| `pve.otel.export_timeout_ms` | Integer | `5000` | Upper bound, in milliseconds, on how long span export is allowed to block during process shutdown. Export failures after this deadline are logged at `Warn` level and never fail the CPI action. A value of `0` is treated as unset and yields the `5000` default; negative values fail validation at CPI startup. Only relevant when `pve.otel.enabled` is `true`. |
+
+Example configuration:
+
+```yaml
+properties:
+  pve:
+    otel:
+      enabled: true
+      exporter_endpoint: "otel-collector.example.internal:4318"
+      service_name: "bosh-pve-cpi"
+      sample_ratio: 1.0
+      export_timeout_ms: 5000
+```
+
 ## Removed: BOSH Registry
 
 The BOSH registry agent mode has been removed. Setting `pve.agent_mode: registry` or including any `registry.*` key in the CPI config now produces a config validation error at startup. This matches the upstream BOSH deprecation of the registry component.
