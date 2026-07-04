@@ -25,7 +25,7 @@ Both paths produce a usable token. The minimum-privilege path is recommended eve
 
 ## 2. Privileges the CPI actually uses
 
-Derived from the API endpoint inventory under `src/pve_cpi/internal/cpi/handlers/` and the auth-header construction in `src/pve_cpi/internal/pve/client.go`. Each row lists a PVE 9.1 privilege, the ACL path on which it must be granted, and the CPI methods that drive it.
+Derived from the API endpoint inventory under `src/pve_cpi/internal/cpi/handlers/` and the auth-header construction in `src/pve_cpi/internal/pve/client.go`. Each row lists a PVE 9.1 privilege, the ACL path on which it must be granted, and the CPI methods that drive it. Table verified against the PVE API schema (`apidoc.json`) as of commit `cfd1b12`.
 
 | Privilege | ACL path | CPI methods (handler file) |
 |---|---|---|
@@ -43,7 +43,10 @@ Derived from the API endpoint inventory under `src/pve_cpi/internal/cpi/handlers
 | `Datastore.AllocateTemplate` | `stemcell_storage`, `iso_storage` | `create_stemcell.go` (`POST .../upload` with `content=import`), ConfigDrive ISO upload (`content=iso`) |
 | `Datastore.Audit` | same four storage paths | `create_stemcell.go`, `get_disks.go`, `has_disk.go` (list/check volume) |
 | `SDN.Allocate` | `/sdn` | `create_network.go`, `delete_network.go`, `create_vm.go` (`advertised_routes` subnet injection) — required when `network_mode: sdn` or `advertised_routes` is used |
-| `Sys.Console` | `/` | HA-rule writes — `POST`/`DELETE /cluster/ha/resources`, `POST`/`DELETE /cluster/ha/rules` driven by `placement.pin_az_via_ha_rules` and `anti_affinity.use_ha_rules` — see note below |
+| `Sys.Console` | `/` | HA-rule writes — `POST`/`DELETE /cluster/ha/resources`, `POST`/`DELETE /cluster/ha/rules` driven by `placement.pin_az_via_ha_rules`, `anti_affinity.use_ha_rules`, and DLB (`placement.dlb` configured) — see note below |
+| `Pool.Allocate` | `/pool/<poolid>` | `cluster_lock.go` (`POST`/`DELETE /pools` — create/delete sentinel pools `bosh-lock-*` when `cluster_lock_mode: pool`), `create_stemcell.go` (`PUT /pools/{poolid}` via `AddVM` — assign the template VM to `pve.stemcell_template_pool` when set) — opt-in, only when one of these two features is enabled |
+| `Pool.Audit` | `/pool/<poolid>` | `GetPoolComment` (`GET /pools`/`GET /pools/{poolid}`) — pool-existence and comment reads backing the same two opt-in features above |
+| `Sys.Modify` | `/` | `placement_dlb.go` (`PUT /cluster/options` setting `crs=ha=dynamic,...`) — opt-in, only when `placement.dlb.manage_cluster_crs: true`; when false (default) the CPI only reads `/cluster/options` (`Sys.Audit`, already granted) and logs a warning instead of writing |
 
 **`SDN.Allocate` note:** only required when the CPI manages SDN objects. Deployments that use pre-existing bridges or that never call `create_network`/`delete_network` and set no `advertised_routes` do not need this privilege. Grant it on `/sdn`:
 
@@ -56,7 +59,11 @@ curl -sk -X PUT -H "Authorization: $PVE_TOKEN" \
   https://$PVE_HOST/api2/json/access/acl
 ```
 
-**`Sys.Console` note:** PVE checks `Sys.Console` on `/` for HA resource and rule writes — `POST`/`DELETE /cluster/ha/resources` and `POST`/`DELETE /cluster/ha/rules` (the matching `GET` reads check `Sys.Audit`, already granted on `/`). These endpoints are called only when `placement.pin_az_via_ha_rules: true` or `anti_affinity.use_ha_rules: true`; a deployment that leaves both off needs neither `Sys.Console` nor the HA-read grant. The privilege names are taken from the PVE API schema (`apidoc.json`: HA writes → `["perm", "/", ["Sys.Console"]]`, HA reads → `["perm", "/", ["Sys.Audit"]]`).
+**`Sys.Console` note:** PVE checks `Sys.Console` on `/` for HA resource and rule writes — `POST`/`DELETE /cluster/ha/resources` and `POST`/`DELETE /cluster/ha/rules` (the matching `GET` reads check `Sys.Audit`, already granted on `/`). These endpoints are called when `placement.pin_az_via_ha_rules: true`, `anti_affinity.use_ha_rules: true`, or DLB is configured (`placement.dlb` present with `enabled: true` or an `az_name` sentinel in use — `delete_vm.go` gates its HA cleanup path on `AntiAffinityUseHaRulesEnabled() || DLBConfigured()`); a deployment that leaves all three off needs neither `Sys.Console` nor the HA-read grant. The privilege names are taken from the PVE API schema (`apidoc.json`: HA writes → `["perm", "/", ["Sys.Console"]]`, HA reads → `["perm", "/", ["Sys.Audit"]]`).
+
+**`Pool.Allocate`/`Pool.Audit` note:** these privileges gate the PVE resource-pool API and are only needed when `cluster_lock_mode: pool` (cross-process advisory locking via sentinel pools) or `stemcell_template_pool` (template-VM pool assignment) is set — a deployment that uses neither leaves pools untouched and needs no pool ACL at all. `PUT /pools/{poolid}` (`AddVM`, used by `create_stemcell.go`) additionally requires whatever permission-modification right governs the object being added to the pool; for VM members this is covered by `VM.Allocate` on `/vms`, already granted in §3 below, so no extra grant is needed beyond `Pool.Allocate` itself.
+
+**`Sys.Modify` note:** required only when `placement.dlb.manage_cluster_crs: true` — the CPI then writes the cluster-wide CRS (Cluster Resource Scheduler) setting via `PUT /cluster/options` so PVE actively load-balances HA-managed VMs. The default (`manage_cluster_crs` unset or `false`) never writes this endpoint; the CPI only reads it (`Sys.Audit`, already granted on `/`) to warn when `crs` is not set to `ha=dynamic,...`.
 
 **`delete_vm` and `skiplock`:** `delete_vm` issues `DELETE /nodes/{n}/qemu/{vmid}` with `skiplock=true` so a locked or still-running VM is destroyed without a separate unlock step. The endpoint itself checks `VM.Allocate` on `/vms/{vmid}` (already granted), but `skiplock` is **not** governed by any privilege: PVE restricts the flag to the literal `root@pam` user and rejects it for every other user regardless of role or ACL. To let `delete_vm` clear locked VMs, authenticate the CPI as `root@pam` (or an API token owned by `root@pam` with privilege separation disabled). A least-privilege `bosh@pve` user cannot be granted `skiplock` through any role; without it, `delete_vm` still succeeds on unlocked, stopped VMs but fails on locked ones.
 
@@ -104,7 +111,7 @@ UI:
 
 2. Name: `BoshOperator`.
 
-3. Privileges: select `VM.Allocate`, `VM.Audit`, `VM.Config.Disk`, `VM.Config.Network`, `VM.Config.Options`, `VM.Config.Cloudinit`, `VM.PowerMgmt`, `VM.Snapshot`, `Datastore.Allocate`, `Datastore.AllocateSpace`, `Datastore.AllocateTemplate`, `Datastore.Audit`, `SDN.Allocate` (if using SDN features), and `Sys.Console` (if using HA placement features).
+3. Privileges: select `VM.Allocate`, `VM.Audit`, `VM.Config.Disk`, `VM.Config.Network`, `VM.Config.Options`, `VM.Config.Cloudinit`, `VM.PowerMgmt`, `VM.Snapshot`, `Datastore.Allocate`, `Datastore.AllocateSpace`, `Datastore.AllocateTemplate`, `Datastore.Audit`, `SDN.Allocate` (if using SDN features), `Sys.Console` (if using HA placement features or DLB), `Pool.Allocate` and `Pool.Audit` (if using `cluster_lock_mode: pool` or `stemcell_template_pool`), and `Sys.Modify` (if using `placement.dlb.manage_cluster_crs`).
 
 4. Create.
 
@@ -114,15 +121,15 @@ API:
 # Base role — VM, disk, and storage operations.
 curl -sk -X POST -H "Authorization: $PVE_TOKEN" \
   --data-urlencode 'roleid=BoshOperator' \
-  --data-urlencode 'privs=VM.Allocate,VM.Audit,VM.Config.Disk,VM.Config.Network,VM.Config.Options,VM.Config.Cloudinit,VM.PowerMgmt,VM.Snapshot,Datastore.Allocate,Datastore.AllocateSpace,Datastore.AllocateTemplate,Datastore.Audit,SDN.Allocate,Sys.Console' \
+  --data-urlencode 'privs=VM.Allocate,VM.Audit,VM.Config.Disk,VM.Config.Network,VM.Config.Options,VM.Config.Cloudinit,VM.PowerMgmt,VM.Snapshot,Datastore.Allocate,Datastore.AllocateSpace,Datastore.AllocateTemplate,Datastore.Audit,SDN.Allocate,Sys.Console,Pool.Allocate,Pool.Audit,Sys.Modify' \
   https://$PVE_HOST/api2/json/access/roles
 ```
 
-If your deployment does not use SDN features (`network_mode: bridge` only, no `advertised_routes`) or HA placement features (`pin_az_via_ha_rules: false`, `use_ha_rules: false`), you may omit `SDN.Allocate` and `Sys.Console`, respectively. The minimum required set for a bridge-only deployment without HA placement is `VM.*,Datastore.*` as listed in the privilege table above. Note that `delete_vm`'s `skiplock` flag is separate from this role: it is gated on the `root@pam` user, not on any privilege (see the `delete_vm` note above), so granting `BoshOperator` does not enable it.
+If your deployment does not use SDN features (`network_mode: bridge` only, no `advertised_routes`), HA placement features or DLB (`pin_az_via_ha_rules: false`, `use_ha_rules: false`, no `placement.dlb`), resource pools (`cluster_lock_mode: pool` unset, `stemcell_template_pool` unset), or CPI-managed cluster CRS (`placement.dlb.manage_cluster_crs: false`/unset), you may omit `SDN.Allocate`, `Sys.Console`, `Pool.Allocate`/`Pool.Audit`, and `Sys.Modify`, respectively. The minimum required set for a bridge-only deployment without HA placement, DLB, or pools is `VM.*,Datastore.*` as listed in the privilege table above. Note that `delete_vm`'s `skiplock` flag is separate from this role: it is gated on the `root@pam` user, not on any privilege (see the `delete_vm` note above), so granting `BoshOperator` does not enable it.
 
 ### 3c. Grant ACLs
 
-Four ACL grants are needed: cluster-wide audit, VM operations, and one storage grant per configured pool.
+Four ACL grants are always needed — cluster-wide audit, VM operations, and one storage grant per configured storage pool — plus two conditional grants (root-path, resource pool) that apply only when the corresponding opt-in feature is used.
 
 UI (repeat for each row below):
 
@@ -141,13 +148,14 @@ UI (repeat for each row below):
 | Path | Role | Notes |
 |---|---|---|
 | `/` | `PVEAuditor` | Built-in role; grants `Sys.Audit` cluster-wide |
-| `/` | `BoshOperator` | Required for `Sys.Console` (HA-rule management) — only if using HA placement features |
+| `/` | `BoshOperator` | Required for `Sys.Console` (HA-rule management) — only if using HA placement features or DLB; also required for `Sys.Modify` (`PUT /cluster/options`) — only if `placement.dlb.manage_cluster_crs: true` |
 | `/vms` | `BoshOperator` | All VM and disk mutation |
 | `/sdn` | `BoshOperator` | Required for `SDN.Allocate` — only when `network_mode: sdn` or `advertised_routes` is used |
 | `/storage/<vm_storage>` | `BoshOperator` | From `pve.vm_storage` |
 | `/storage/<disk_storage>` | `BoshOperator` | From `pve.disk_storage` |
 | `/storage/<stemcell_storage>` | `BoshOperator` | From `pve.stemcell_storage` (defaults to `vm_storage`) |
 | `/storage/<iso_storage>` | `BoshOperator` | From `pve.iso_storage` (defaults to `local`) |
+| `/pool/<poolid>` | `BoshOperator` | Required for `Pool.Allocate`/`Pool.Audit` — only when `cluster_lock_mode: pool` or `stemcell_template_pool` is set |
 
 API:
 
@@ -160,9 +168,11 @@ curl -sk -X PUT -H "Authorization: $PVE_TOKEN" \
   -d 'propagate=1' \
   https://$PVE_HOST/api2/json/access/acl
 
-# Root-path BoshOperator for Sys.Console (HA-rule management).
-# Omit if HA placement features are not used. (skiplock delete_vm is
-# gated on the root@pam user, not on this role — see the delete_vm note.)
+# Root-path BoshOperator for Sys.Console (HA-rule management) and
+# Sys.Modify (PUT /cluster/options for DLB's manage_cluster_crs).
+# Omit if HA placement features, DLB, and manage_cluster_crs are all
+# unused. (skiplock delete_vm is gated on the root@pam user, not on
+# this role — see the delete_vm note.)
 curl -sk -X PUT -H "Authorization: $PVE_TOKEN" \
   --data-urlencode 'path=/' \
   --data-urlencode 'users=bosh@pve' \
@@ -195,6 +205,15 @@ for s in local-lvm local-lvm nfs-shared local; do
     -d 'propagate=1' \
     https://$PVE_HOST/api2/json/access/acl
 done
+
+# Resource pool — required for Pool.Allocate/Pool.Audit.
+# Omit if cluster_lock_mode: pool and stemcell_template_pool are both unused.
+curl -sk -X PUT -H "Authorization: $PVE_TOKEN" \
+  --data-urlencode 'path=/pool/<poolid>' \
+  --data-urlencode 'users=bosh@pve' \
+  --data-urlencode 'roles=BoshOperator' \
+  -d 'propagate=1' \
+  https://$PVE_HOST/api2/json/access/acl
 ```
 
 Substitute your own pool names. Duplicates (`local-lvm` listed twice when `vm_storage` and `disk_storage` share a pool) are idempotent.
