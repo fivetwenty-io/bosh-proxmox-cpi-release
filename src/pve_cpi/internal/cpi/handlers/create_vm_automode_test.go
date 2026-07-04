@@ -260,4 +260,3 @@ func TestCompletenessAssertion_HappyPath(t *testing.T) {
 		t.Errorf("configureCalls: want 1, got %d", len(primary.configureCalls))
 	}
 }
-

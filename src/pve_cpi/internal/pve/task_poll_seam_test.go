@@ -91,6 +91,52 @@ func TestConfigureTaskPolling_PartialKeepsDefaults(t *testing.T) {
 	}
 }
 
+// TestConfigureAdaptiveTaskPoll_TogglesAwaitTaskRouting verifies that
+// ConfigureAdaptiveTaskPoll(true) routes AwaitTask through the adaptive
+// GetStatus loop (not the SDK's fixed-interval Wait), and that
+// ConfigureAdaptiveTaskPoll(false) restores the prior fixed-interval routing.
+// Process-wide state, so restore via SetAdaptiveTaskPollForTest like every
+// other test in this file that touches package atomics.
+func TestConfigureAdaptiveTaskPoll_TogglesAwaitTaskRouting(t *testing.T) {
+	restore := pve.SetAdaptiveTaskPollForTest(false) // known baseline
+	defer restore()
+
+	pve.ConfigureAdaptiveTaskPoll(true)
+	waitCalled := false
+	getStatusCalled := false
+	svc := &mockTasksService{
+		waitFn: func(_ context.Context, _, upid string, _ *sdktasks.WaitOptions) (*sdktasks.Status, error) {
+			waitCalled = true
+			return &sdktasks.Status{Status: "stopped", ExitStatus: "OK", UpID: upid}, nil
+		},
+		getStatusFn: func(_ context.Context, _, upid string) (*sdktasks.Status, error) {
+			getStatusCalled = true
+			return &sdktasks.Status{Status: "stopped", ExitStatus: "OK", UpID: upid}, nil
+		},
+	}
+	if err := pve.AwaitTask(context.Background(), newMockClient(svc), "node1", "UPID:node1:abc"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if waitCalled {
+		t.Error("ConfigureAdaptiveTaskPoll(true): SDK Wait must NOT be called")
+	}
+	if !getStatusCalled {
+		t.Error("ConfigureAdaptiveTaskPoll(true): GetStatus must be called (adaptive loop)")
+	}
+
+	pve.ConfigureAdaptiveTaskPoll(false)
+	waitCalled, getStatusCalled = false, false
+	if err := pve.AwaitTask(context.Background(), newMockClient(svc), "node1", "UPID:node1:abc"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !waitCalled {
+		t.Error("ConfigureAdaptiveTaskPoll(false): SDK Wait must be called (fixed-interval routing restored)")
+	}
+	if getStatusCalled {
+		t.Error("ConfigureAdaptiveTaskPoll(false): GetStatus must NOT be called")
+	}
+}
+
 // TestConfigureTaskPolling_MaxClampedToInterval verifies the max interval is
 // clamped up to the base interval so the SDK never sees max < base.
 func TestConfigureTaskPolling_MaxClampedToInterval(t *testing.T) {

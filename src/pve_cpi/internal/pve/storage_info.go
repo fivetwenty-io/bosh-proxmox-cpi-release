@@ -15,6 +15,7 @@ import (
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/clusterstorage"
 
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
+	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
 )
 
 // StorageInfo is the CPI-facing view of a PVE storage entry.
@@ -41,8 +42,9 @@ func (s StorageInfo) IsShared() bool {
 }
 
 // StorageLister is the slice of the PVE SDK we depend on to classify storages.
-// Implemented in production by *clusterstorage.service from the pve-apiclient-go
-// SDK; tests can substitute a fake.
+// In production it is satisfied by clusterstorage.Service from the
+// pve-apiclient-go SDK (see ClusterStorageAsLister, which adapts one to the
+// other); tests can substitute a fake.
 type StorageLister interface {
 	ListStorage(ctx context.Context, params *clusterstorage.ListStorageParams) (*clusterstorage.ListStorageResponse, error)
 }
@@ -290,9 +292,17 @@ func (c *StorageInfoCache) refresh(ctx context.Context) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.entries = make(map[string]storageInfoEntry, len(*resp))
-	for _, raw := range *resp {
+	for i, raw := range *resp {
 		info, perr := parseStorageEntry(raw)
 		if perr != nil {
+			// Skip malformed entries: one bad element must not fail the whole
+			// scan (see the package doc). Logged at Debug so schema drift in a
+			// genuinely malformed PVE response leaves a diagnostic trail
+			// instead of silently degrading to "storage absent from index".
+			log.FromContext(ctx).Debug("storage_info: skipping malformed /storage entry",
+				log.Int("index", i),
+				log.Err(perr),
+			)
 			continue
 		}
 		c.entries[info.Name] = storageInfoEntry{info: info, exp: deadline}

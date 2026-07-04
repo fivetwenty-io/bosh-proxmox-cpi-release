@@ -797,6 +797,113 @@ func TestEnsureParker_CreateConflictAdoptsNoSecondParker(t *testing.T) {
 	}
 }
 
+// TestEnsureParker_InvalidRange_ReturnsLoudError proves EnsureParker still
+// fails loudly on an invalid ParkerConfig VMID range after the shared
+// createParkerVM extraction (the validation guard moved into the helper but
+// must remain reachable for EnsureParker's own callers).
+func TestEnsureParker_InvalidRange_ReturnsLoudError(t *testing.T) {
+	t.Parallel()
+	node := "pve1"
+	var createCalls int
+	qemuSvc := &parkerQEMU{
+		createFn: func(_ string, _ map[string]any) (string, error) {
+			createCalls++
+			return "", nil
+		},
+	}
+	c := buildParkerClient(qemuSvc, func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+		return parkerClusterResp(), nil
+	})
+
+	_, err := pve.EnsureParker(context.Background(), c, nopLogger(), node, pve.ParkerConfig{})
+	if err == nil {
+		t.Fatal("expected loud error for invalid (zero-value) ParkerConfig VMID range")
+	}
+	if createCalls != 0 {
+		t.Errorf("Create must not be called when the VMID range is invalid; got %d calls", createCalls)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// EnsureFreshParker
+// ---------------------------------------------------------------------------
+
+// TestEnsureFreshParker_InvalidRange_ReturnsLoudError proves the C1 fix:
+// EnsureFreshParker must reject a zero-value ParkerConfig VMID range instead
+// of silently allocating in the general VM range via WithRange's
+// silent-ignore-invalid-values fallback.
+func TestEnsureFreshParker_InvalidRange_ReturnsLoudError(t *testing.T) {
+	t.Parallel()
+	node := "pve1"
+	var createCalls int
+	qemuSvc := &parkerQEMU{
+		createFn: func(_ string, _ map[string]any) (string, error) {
+			createCalls++
+			return "", nil
+		},
+	}
+	c := buildParkerClient(qemuSvc, func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+		return parkerClusterResp(), nil
+	})
+
+	_, err := pve.EnsureFreshParker(context.Background(), c, nopLogger(), node, pve.ParkerConfig{})
+	if err == nil {
+		t.Fatal("expected loud error for invalid (zero-value) ParkerConfig VMID range")
+	}
+	if createCalls != 0 {
+		t.Errorf("Create must not be called when the VMID range is invalid; got %d calls", createCalls)
+	}
+}
+
+// TestEnsureFreshParker_EndBeforeStart_ReturnsLoudError covers the
+// VMIDRangeEnd<=VMIDRangeStart half of the guard (not just the zero-value case).
+func TestEnsureFreshParker_EndBeforeStart_ReturnsLoudError(t *testing.T) {
+	t.Parallel()
+	node := "pve1"
+	c := buildParkerClient(&parkerQEMU{}, func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+		return parkerClusterResp(), nil
+	})
+
+	cfg := pve.ParkerConfig{VMIDRangeStart: 90999, VMIDRangeEnd: 90000}
+	_, err := pve.EnsureFreshParker(context.Background(), c, nopLogger(), node, cfg)
+	if err == nil {
+		t.Fatal("expected loud error when VMIDRangeEnd <= VMIDRangeStart")
+	}
+}
+
+// TestEnsureFreshParker_CreatesNewParker proves the happy path directly
+// (previously only exercised indirectly via TestParkDisk_AllParkersFullCreatesFreshParker).
+func TestEnsureFreshParker_CreatesNewParker(t *testing.T) {
+	t.Parallel()
+	node := "pve1"
+	var createdParams map[string]any
+
+	qemuSvc := &parkerQEMU{
+		createFn: func(_ string, params map[string]any) (string, error) {
+			createdParams = params
+			return "", nil
+		},
+	}
+	c := buildParkerClient(qemuSvc, func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+		return parkerClusterResp(), nil // always empty for allocation purposes
+	})
+
+	vmid, err := pve.EnsureFreshParker(context.Background(), c, nopLogger(), node, parkerTestCfg())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if vmid < 90000 || vmid > 90999 {
+		t.Errorf("vmid %d outside parker range [90000,90999]", vmid)
+	}
+	if createdParams == nil {
+		t.Fatal("Create was not called")
+	}
+	tagsVal, _ := createdParams["tags"].(string)
+	if !containsTag(tagsVal, pve.ParkerTag) {
+		t.Errorf("tags %q must contain %q", tagsVal, pve.ParkerTag)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // ParkDisk
 // ---------------------------------------------------------------------------
@@ -845,6 +952,100 @@ func TestParkDisk_RealVMHolderRefusesPark(t *testing.T) {
 	}
 	if createCalls != 0 {
 		t.Errorf("no parker must be created when a real VM holds the disk; got %d", createCalls)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// DiskHeldByRealVM — direct coverage of the two branches that are only
+// exercised indirectly by ParkDisk tests today.
+// ---------------------------------------------------------------------------
+
+// TestDiskHeldByRealVM_VanishedMidScan_TreatedAsFreeFloating covers
+// parker.go's IsNotFound(cfgErr) branch: the cluster-wide disk scan
+// (FindVMByDiskVolid) finds the disk attached to an in-range VMID on its
+// first config read, but DiskHeldByRealVM's own follow-up config read (to
+// confirm the bosh-parker tag) 404s because the VM was deleted concurrently
+// between the two reads. Must be treated as free-floating, not an error.
+func TestDiskHeldByRealVM_VanishedMidScan_TreatedAsFreeFloating(t *testing.T) {
+	t.Parallel()
+	node := "pve1"
+	holderVMID := 90000 // in parker range 90000-90999
+	bareVolid := "local-lvm:vm-9001-disk-0"
+
+	var configCalls int
+	qemuSvc := &parkerQEMU{
+		configFn: func(_ string, vmid int) (map[string]any, error) {
+			if vmid != holderVMID {
+				return map[string]any{}, nil
+			}
+			configCalls++
+			if configCalls == 1 {
+				// First read: FindVMByDiskVolid's cluster-wide scan sees the disk
+				// attached and returns this VMID as the holder.
+				return map[string]any{"scsi0": bareVolid}, nil
+			}
+			// Second read: DiskHeldByRealVM's own tag-confirmation fetch — the VM
+			// vanished between the scan and this read.
+			return nil, makeAPIErr(404, "no such VM")
+		},
+	}
+	c := buildParkerClient(qemuSvc, func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+		return parkerClusterResp(
+			map[string]any{"vmid": int64(holderVMID), "node": node},
+		), nil
+	})
+
+	held, vmid, _, err := pve.DiskHeldByRealVM(context.Background(), c, nopLogger(), bareVolid, parkerTestCfg())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if held {
+		t.Errorf("expected held=false when the holder VM vanished mid-scan; got held=true vmid=%d", vmid)
+	}
+	if vmid != 0 {
+		t.Errorf("expected vmid=0 for the vanished-VM case, got %d", vmid)
+	}
+	if configCalls < 2 {
+		t.Fatalf("test setup error: expected at least 2 config reads for vmid %d, got %d", holderVMID, configCalls)
+	}
+}
+
+// TestDiskHeldByRealVM_InRangeNoTag_TreatedAsRealVM covers parker.go's
+// in-range-VMID-without-bosh-parker-tag branch: a VMID inside the parker
+// range that never got the bosh-parker tag (e.g. a mis-numbered workload VM)
+// must be treated as a real VM holder, not a parker.
+func TestDiskHeldByRealVM_InRangeNoTag_TreatedAsRealVM(t *testing.T) {
+	t.Parallel()
+	node := "pve1"
+	holderVMID := 90000 // in parker range but lacks bosh-parker tag
+	bareVolid := "local-lvm:vm-9001-disk-0"
+
+	qemuSvc := &parkerQEMU{
+		configFn: func(_ string, vmid int) (map[string]any, error) {
+			if vmid == holderVMID {
+				return map[string]any{"tags": "some-other-tag", "scsi0": bareVolid}, nil
+			}
+			return map[string]any{}, nil
+		},
+	}
+	c := buildParkerClient(qemuSvc, func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+		return parkerClusterResp(
+			map[string]any{"vmid": int64(holderVMID), "node": node},
+		), nil
+	})
+
+	held, vmid, gotNode, err := pve.DiskHeldByRealVM(context.Background(), c, nopLogger(), bareVolid, parkerTestCfg())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !held {
+		t.Fatal("expected held=true: in-range VMID without bosh-parker tag must be treated as a real VM")
+	}
+	if vmid != holderVMID {
+		t.Errorf("vmid: want %d, got %d", holderVMID, vmid)
+	}
+	if gotNode != node {
+		t.Errorf("node: want %q, got %q", node, gotNode)
 	}
 }
 

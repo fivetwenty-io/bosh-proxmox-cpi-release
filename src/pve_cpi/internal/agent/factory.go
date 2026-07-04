@@ -60,4 +60,3 @@ func NewAgent(cfg *config.CPIConfig, pveClient pve.Client, logger *log.Logger) (
 		)
 	}
 }
-

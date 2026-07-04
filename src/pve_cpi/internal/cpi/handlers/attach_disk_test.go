@@ -644,7 +644,6 @@ func TestHandleAttachDisk_GuardBlocksWhenSnapshotsPresent(t *testing.T) {
 	}
 }
 
-
 // TestHandleAttachDisk_GuardProceedsWhenNoSnapshots verifies the happy path
 // when the VM has no real snapshots: AttachDisk is called and disk_hints returned.
 func TestHandleAttachDisk_GuardProceedsWhenNoSnapshots(t *testing.T) {

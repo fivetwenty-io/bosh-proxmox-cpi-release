@@ -80,4 +80,3 @@ func TestLogsAtDebug_Remove(t *testing.T) {
 		t.Fatalf("Remove: expected Debug level, got %v", entries[0].Level)
 	}
 }
-

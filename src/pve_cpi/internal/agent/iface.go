@@ -72,4 +72,3 @@ type BlobstoreSpec struct {
 	Provider string         `json:"provider"`
 	Options  map[string]any `json:"options"`
 }
-

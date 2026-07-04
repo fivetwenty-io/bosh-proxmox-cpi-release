@@ -483,7 +483,13 @@ func ListParkersForNode(ctx context.Context, c Client, node string, cfg ParkerCo
 	return result, nil
 }
 
-// EnsureParker returns a parker VMID for node, creating one if none exists.
+// createParkerVM allocates a VMID in cfg's parker range and creates a fresh
+// parker VM there, retrying past VMID conflicts by re-scanning and adopting
+// whichever parker won the race. It is shared by EnsureParker (called after
+// its existing-parker short-circuit) and EnsureFreshParker (called directly,
+// since its whole contract is "always allocate a NEW parker" — it must never
+// short-circuit on an existing one).
+//
 // The parker VM is created with:
 //   - name: "bosh-parker-<vmid>"
 //   - onboot: 0 (never auto-started)
@@ -494,32 +500,18 @@ func ListParkersForNode(ctx context.Context, c Client, node string, cfg ParkerCo
 //   - cores: 1
 //   - no NIC, no disk
 //
-// If VMID allocation races with another CPI process (IsVMIDConflict), the
-// function re-scans and adopts the winner.
+// opLabel identifies the caller in RetryOnTransientOrLock's log lines and in
+// wrapped error messages (e.g. "ensure_parker_create", "ensure_fresh_parker_create").
 //
-// Returns the parker VMID on success.
-func EnsureParker(ctx context.Context, c Client, logger *log.Logger, node string, cfg ParkerConfig) (int, error) {
-	if c == nil {
-		return 0, cpierrors.Cloud("EnsureParker: client must not be nil")
-	}
-	if node == "" {
-		return 0, cpierrors.Cloud("EnsureParker: node must not be empty")
-	}
+// Validates cfg's VMID range before allocating: an invalid range (start<=0 or
+// end<=start) fails loudly here rather than letting WithRange silently ignore
+// it and AllocateWithRetry fall back to the general VM range [100,8999].
+func createParkerVM(ctx context.Context, c Client, logger *log.Logger, node string, cfg ParkerConfig, opLabel string) (int, error) {
 	if cfg.VMIDRangeStart <= 0 || cfg.VMIDRangeEnd <= cfg.VMIDRangeStart {
-		return 0, cpierrors.Cloud("EnsureParker: invalid VMID range [%d, %d]",
-			cfg.VMIDRangeStart, cfg.VMIDRangeEnd)
+		return 0, cpierrors.Cloud("%s: invalid VMID range [%d, %d]",
+			opLabel, cfg.VMIDRangeStart, cfg.VMIDRangeEnd)
 	}
 
-	// Check for existing parker first.
-	existing, found, err := FindParkerForNode(ctx, c, node, cfg)
-	if err != nil {
-		return 0, err
-	}
-	if found {
-		return existing, nil
-	}
-
-	// Allocate a VMID in the parker range and create the VM.
 	tags := buildParkerTags(cfg)
 	protection := 1
 	onboot := 0
@@ -543,7 +535,7 @@ func EnsureParker(ctx context.Context, c Client, logger *log.Logger, node string
 			}
 			var upid string
 			var innerErr error
-			retryErr := RetryOnTransientOrLock(ctx, logger, "ensure_parker_create", 0, func() error {
+			retryErr := RetryOnTransientOrLock(ctx, logger, opLabel, 0, func() error {
 				upid, innerErr = c.QEMU().Create(ctx, node, params)
 				return innerErr
 			})
@@ -553,7 +545,7 @@ func EnsureParker(ctx context.Context, c Client, logger *log.Logger, node string
 			if upid != "" {
 				if awaitErr := AwaitTask(ctx, c, node, upid); awaitErr != nil {
 					return cpierrors.WrapAs(awaitErr, cpierrors.TypeRetriableCloud,
-						fmt.Sprintf("EnsureParker: await create task for vmid %d", vmid))
+						fmt.Sprintf("%s: await create task for vmid %d", opLabel, vmid))
 				}
 			}
 			return nil
@@ -572,24 +564,50 @@ func EnsureParker(ctx context.Context, c Client, logger *log.Logger, node string
 	if createErr != nil {
 		// Create-conflict path: another CPI won the race. Re-find and adopt.
 		if IsVMIDConflict(createErr) {
-			winner, found2, findErr := FindParkerForNode(ctx, c, node, cfg)
+			winner, found, findErr := FindParkerForNode(ctx, c, node, cfg)
 			if findErr != nil {
 				return 0, findErr
 			}
-			if found2 {
+			if found {
 				return winner, nil
 			}
-			return 0, cpierrors.Retriable("EnsureParker: VMID conflict but no parker found after re-scan on node %q", node)
+			return 0, cpierrors.Retriable("%s: VMID conflict but no parker found after re-scan on node %q", opLabel, node)
 		}
-		return 0, cpierrors.Wrap(createErr, "EnsureParker: create parker VM")
+		return 0, cpierrors.Wrap(createErr, fmt.Sprintf("%s: create parker VM", opLabel))
 	}
 	return vmid, nil
 }
 
+// EnsureParker returns a parker VMID for node, creating one if none exists.
+// See createParkerVM for the VM's creation parameters and conflict-adoption
+// behavior.
+//
+// Returns the parker VMID on success.
+func EnsureParker(ctx context.Context, c Client, logger *log.Logger, node string, cfg ParkerConfig) (int, error) {
+	if c == nil {
+		return 0, cpierrors.Cloud("EnsureParker: client must not be nil")
+	}
+	if node == "" {
+		return 0, cpierrors.Cloud("EnsureParker: node must not be empty")
+	}
+
+	// Check for existing parker first.
+	existing, found, err := FindParkerForNode(ctx, c, node, cfg)
+	if err != nil {
+		return 0, err
+	}
+	if found {
+		return existing, nil
+	}
+
+	return createParkerVM(ctx, c, logger, node, cfg, "ensure_parker_create")
+}
+
 // EnsureFreshParker is like EnsureParker but specifically allocates a new
 // parker VM distinct from any existing parkers (used when all existing parkers
-// are full). It allocates the next free VMID in the range not already used by
-// an existing parker.
+// are full). It intentionally skips the existing-parker short-circuit — the
+// range-validation guard and create/allocate/await logic live in the shared
+// createParkerVM helper.
 func EnsureFreshParker(ctx context.Context, c Client, logger *log.Logger, node string, cfg ParkerConfig) (int, error) {
 	if c == nil {
 		return 0, cpierrors.Cloud("EnsureFreshParker: client must not be nil")
@@ -598,66 +616,7 @@ func EnsureFreshParker(ctx context.Context, c Client, logger *log.Logger, node s
 		return 0, cpierrors.Cloud("EnsureFreshParker: node must not be empty")
 	}
 
-	tags := buildParkerTags(cfg)
-	protection := 1
-	onboot := 0
-	memory := 16
-	cores := 1
-	scsihw := "virtio-scsi-pci"
-
-	vmid, createErr := AllocateWithRetry(
-		ctx,
-		c,
-		func(vmid int) error {
-			params := map[string]any{
-				"vmid":       vmid,
-				"name":       parkerVMName(vmid),
-				"tags":       tags,
-				"protection": protection,
-				"onboot":     onboot,
-				"memory":     memory,
-				"cores":      cores,
-				"scsihw":     scsihw,
-			}
-			var upid string
-			var innerErr error
-			retryErr := RetryOnTransientOrLock(ctx, logger, "ensure_fresh_parker_create", 0, func() error {
-				upid, innerErr = c.QEMU().Create(ctx, node, params)
-				return innerErr
-			})
-			if retryErr != nil {
-				return retryErr
-			}
-			if upid != "" {
-				if awaitErr := AwaitTask(ctx, c, node, upid); awaitErr != nil {
-					return cpierrors.WrapAs(awaitErr, cpierrors.TypeRetriableCloud,
-						fmt.Sprintf("EnsureFreshParker: await create task for vmid %d", vmid))
-				}
-			}
-			return nil
-		},
-		// nil conflict predicate + single attempt — see EnsureParker rationale.
-		// On conflict, re-scan and adopt the racer's parker rather than spinning
-		// up yet another duplicate.
-		nil,
-		1,
-		WithRange(cfg.VMIDRangeStart, cfg.VMIDRangeEnd),
-		WithNoBackoff(),
-	)
-	if createErr != nil {
-		if IsVMIDConflict(createErr) {
-			winner, found, findErr := FindParkerForNode(ctx, c, node, cfg)
-			if findErr != nil {
-				return 0, findErr
-			}
-			if found {
-				return winner, nil
-			}
-			return 0, cpierrors.Retriable("EnsureFreshParker: VMID conflict but no parker found after re-scan on node %q", node)
-		}
-		return 0, cpierrors.Wrap(createErr, "EnsureFreshParker: create fresh parker VM")
-	}
-	return vmid, nil
+	return createParkerVM(ctx, c, logger, node, cfg, "ensure_fresh_parker_create")
 }
 
 // IsDiskParked reports whether bareVolid is currently held on a parker VM.

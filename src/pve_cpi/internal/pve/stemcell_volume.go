@@ -8,6 +8,8 @@ import (
 	"strings"
 
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/nodes"
+
+	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
 )
 
 // maxStemcellFilenameLen caps the total length of a generated stemcell filename
@@ -267,10 +269,19 @@ func FindStemcellByFilename(ctx context.Context, client Client, node, storage, q
 	}
 
 	want := ":import/" + qcow2Filename
-	for _, raw := range *resp {
+	for i, raw := range *resp {
 		var item storageContentItem
 		if jsonErr := json.Unmarshal(raw, &item); jsonErr != nil {
-			// Skip malformed entries.
+			// Skip malformed entries: one bad element must not fail the whole
+			// scan. Logged at Debug so schema drift in a genuinely malformed
+			// PVE response leaves a diagnostic trail instead of silently
+			// reporting "stemcell not found" a layer up.
+			log.FromContext(ctx).Debug("stemcell_volume: skipping malformed storage content entry",
+				log.String("node", node),
+				log.String("storage", storage),
+				log.Int("index", i),
+				log.Err(jsonErr),
+			)
 			continue
 		}
 		if strings.HasSuffix(item.VolID, want) {

@@ -1,11 +1,19 @@
 package pve_test
 
 import (
+	"context"
 	"errors"
 	"net"
 	"strconv"
 	"testing"
 
+	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cloudinit"
+	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cluster"
+	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/clusterstorage"
+	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/nodes"
+	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/qemu"
+	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/storage"
+	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/tasks"
 	sdkerrors "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/errors"
 
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
@@ -919,5 +927,103 @@ func TestIsBaseVolumeInUse_WrappedCPIError(t *testing.T) {
 	wrapped := cpierrors.Wrap(inner, "PVE error: "+inner.Error())
 	if !pve.IsBaseVolumeInUse(wrapped) {
 		t.Errorf("CPI-wrapped base-volume-in-use message should classify correctly; err=%v", wrapped)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ExistsTolerant — folds the lvmthin/zfspool "500 with CLI text" quirk into a
+// clean not-found so the local-backend cluster scan and idempotent delete
+// paths see uniform existence semantics regardless of storage backend.
+// ---------------------------------------------------------------------------
+
+// existsTolerantStorageService is a minimal storage.Service fake exposing
+// only Exists; any other call is unused by ExistsTolerant and panics via the
+// embedded nil interface if invoked.
+type existsTolerantStorageService struct {
+	storage.Service
+	existsFn func(ctx context.Context, node, storageName, volume string) (bool, error)
+}
+
+func (s *existsTolerantStorageService) Exists(ctx context.Context, node, storageName, volume string) (bool, error) {
+	return s.existsFn(ctx, node, storageName, volume)
+}
+
+// existsTolerantMockClient is a minimal pve.Client fake for ExistsTolerant
+// tests. Only Storage() is used; all other accessors return nil.
+type existsTolerantMockClient struct {
+	storageSvc storage.Service
+}
+
+func (c *existsTolerantMockClient) QEMU() qemu.Service                     { return nil }
+func (c *existsTolerantMockClient) Storage() storage.Service               { return c.storageSvc }
+func (c *existsTolerantMockClient) CloudInit() cloudinit.Service           { return nil }
+func (c *existsTolerantMockClient) Tasks() tasks.Service                   { return nil }
+func (c *existsTolerantMockClient) Nodes() nodes.Service                   { return nil }
+func (c *existsTolerantMockClient) Cluster() cluster.Service               { return nil }
+func (c *existsTolerantMockClient) ClusterStorage() clusterstorage.Service { return nil }
+func (c *existsTolerantMockClient) Pools() pve.PoolService                 { return nil }
+
+var _ pve.Client = (*existsTolerantMockClient)(nil)
+
+func existsTolerantClient(fn func(ctx context.Context, node, storageName, volume string) (bool, error)) pve.Client {
+	return &existsTolerantMockClient{storageSvc: &existsTolerantStorageService{existsFn: fn}}
+}
+
+func TestExistsTolerant_PassesThroughSuccess(t *testing.T) {
+	t.Parallel()
+	c := existsTolerantClient(func(_ context.Context, _, _, _ string) (bool, error) {
+		return true, nil
+	})
+	exists, err := pve.ExistsTolerant(context.Background(), c, "pve-01", "local-lvm", "vm-100-disk-0")
+	if err != nil {
+		t.Fatalf("ExistsTolerant: %v", err)
+	}
+	if !exists {
+		t.Fatalf("exists=false, want true")
+	}
+}
+
+func TestExistsTolerant_FoldsLVMThinMissing(t *testing.T) {
+	t.Parallel()
+	rawErr := errors.New(`can't get size of '/dev/data/vm-100-disk-0': Failed to find logical volume "data/vm-100-disk-0"`)
+	c := existsTolerantClient(func(_ context.Context, _, _, _ string) (bool, error) {
+		return false, rawErr
+	})
+	exists, err := pve.ExistsTolerant(context.Background(), c, "pve-01", "data", "vm-100-disk-0")
+	if err != nil {
+		t.Fatalf("expected lvmthin missing-volume error to fold to (false, nil); got err=%v", err)
+	}
+	if exists {
+		t.Fatalf("exists=true, want false")
+	}
+}
+
+func TestExistsTolerant_FoldsZFSPoolMissing(t *testing.T) {
+	t.Parallel()
+	rawErr := errors.New("zfs error: dataset does not exist")
+	c := existsTolerantClient(func(_ context.Context, _, _, _ string) (bool, error) {
+		return false, rawErr
+	})
+	exists, err := pve.ExistsTolerant(context.Background(), c, "pve-01", "rpool", "vm-200-disk-0")
+	if err != nil {
+		t.Fatalf("expected zfspool missing-dataset error to fold to (false, nil); got err=%v", err)
+	}
+	if exists {
+		t.Fatalf("exists=true, want false")
+	}
+}
+
+func TestExistsTolerant_PropagatesOtherErrors(t *testing.T) {
+	t.Parallel()
+	rawErr := errors.New("upstream gateway timed out")
+	c := existsTolerantClient(func(_ context.Context, _, _, _ string) (bool, error) {
+		return false, rawErr
+	})
+	_, err := pve.ExistsTolerant(context.Background(), c, "pve-01", "data", "vm-300-disk-0")
+	if err == nil {
+		t.Fatalf("expected genuine (non-missing-shaped) error to propagate, got nil")
+	}
+	if !errors.Is(err, rawErr) {
+		t.Fatalf("propagated error does not chain to the original; err=%v", err)
 	}
 }

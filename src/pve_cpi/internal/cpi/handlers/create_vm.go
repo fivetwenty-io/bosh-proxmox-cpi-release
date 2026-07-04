@@ -3815,18 +3815,36 @@ func attachEphemeralDisk(
 				vmid, shape.ephemeralDiskGiB, shape.ephemeralStorage))
 	}
 
+	// Rollback uses DeleteVolumeAsync + AwaitTaskWithLogger, matching
+	// rollbackCreatedVolume in create_disk.go: the SDK's DeleteVolume doc warns
+	// that a caller re-uploading to the same name must await the imgdel task,
+	// otherwise a queued delete can run later and silently remove the reused
+	// volume. Errors are logged, never propagated — this is best-effort cleanup
+	// of an already-failed create_vm attempt.
 	cleanupVol := func() {
 		rollbackCtx := contextWithoutCancel(ctx)
 		stor, _, _ := pve.ParseDiskCID(createdVolid)
 		if stor == "" {
 			stor = shape.ephemeralStorage
 		}
-		if delErr := deps.PVE.Storage().DeleteVolume(rollbackCtx, shape.node, stor, createdVolid); delErr != nil {
+		upid, delErr := deps.PVE.Storage().DeleteVolumeAsync(rollbackCtx, shape.node, stor, createdVolid)
+		if delErr != nil {
 			logger.Warn("create_vm: ephemeral volume orphan cleanup failed",
 				log.Int(metadataKeyVMID, vmid),
 				log.String("volid", createdVolid),
 				log.Err(delErr),
 			)
+			return
+		}
+		if upid != "" {
+			if werr := pve.AwaitTaskWithLogger(rollbackCtx, deps.PVE, shape.node, upid, logger); werr != nil {
+				logger.Warn("create_vm: ephemeral volume orphan cleanup await failed",
+					log.Int(metadataKeyVMID, vmid),
+					log.String("volid", createdVolid),
+					log.String("upid", upid),
+					log.Err(werr),
+				)
+			}
 		}
 	}
 
@@ -4151,7 +4169,6 @@ func attachPersistentDisks(
 	}
 	return nil
 }
-
 
 // assertRegistryLessCompleteness verifies that all fields required for a
 // configdrive (registry-less) agent boot are non-empty. Called only on the

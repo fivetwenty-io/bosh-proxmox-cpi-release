@@ -12,7 +12,6 @@ package pve
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 
 	sdkcluster "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cluster"
 
@@ -189,7 +188,14 @@ func (l *localBackend) candidateNodes(ctx context.Context) ([]string, error) {
 	}
 
 	if len(out) == 0 {
-		return nil, fmt.Errorf("backend(local): cluster scan returned zero candidate nodes")
+		// Every /cluster/resources row failed to parse into {node,name} (or the
+		// index was empty) — an invisible-cluster condition, not a permanent
+		// misconfiguration. Retriable, matching the classification convention
+		// every other error return in this file follows (see the sibling
+		// candidateNodes error two lines above), so the Director re-drives the
+		// action once cluster visibility recovers instead of treating an
+		// unparseable snapshot as a hard failure.
+		return nil, cpierrors.Retriable("backend(local): cluster scan returned zero candidate nodes")
 	}
 	return out, nil
 }

@@ -92,10 +92,10 @@ func (q *diskSizingQEMU) RollbackSnapshot(_ context.Context, _ string, _ int, _ 
 
 var _ sdkqemu.Service = (*diskSizingQEMU)(nil)
 
-// diskSizingStorage implements sdkstorage.Service with configurable CreateVolume + DeleteVolume.
+// diskSizingStorage implements sdkstorage.Service with configurable CreateVolume + DeleteVolumeAsync.
 type diskSizingStorage struct {
-	createVolumeFn func(ctx context.Context, node, storage string, sizeGiB int, format string, vmid int, name string) (string, error)
-	deleteVolumeFn func(ctx context.Context, node, storage, volume string) error
+	createVolumeFn      func(ctx context.Context, node, storage string, sizeGiB int, format string, vmid int, name string) (string, error)
+	deleteVolumeAsyncFn func(ctx context.Context, node, storage, volume string) (string, error)
 }
 
 func (s *diskSizingStorage) CreateVolume(ctx context.Context, node, storage string, sizeGiB int, format string, vmid int, name string) (string, error) {
@@ -104,14 +104,18 @@ func (s *diskSizingStorage) CreateVolume(ctx context.Context, node, storage stri
 	}
 	return fmt.Sprintf("%s:vm-%d-%s", storage, vmid, name), nil
 }
-func (s *diskSizingStorage) DeleteVolume(ctx context.Context, node, storage, volume string) error {
-	if s.deleteVolumeFn != nil {
-		return s.deleteVolumeFn(ctx, node, storage, volume)
-	}
-	return nil
+
+// DeleteVolume is not expected to be called by attachEphemeralDisk's rollback
+// path: cleanup must use the async+await variant (see cleanupVol in
+// create_vm.go) so a queued imgdel task cannot race a same-name re-upload.
+func (s *diskSizingStorage) DeleteVolume(_ context.Context, _, _, _ string) error {
+	panic("diskSizingStorage.DeleteVolume: not expected; rollback must use DeleteVolumeAsync")
 }
-func (s *diskSizingStorage) DeleteVolumeAsync(_ context.Context, _, _, _ string) (string, error) {
-	panic("diskSizingStorage.DeleteVolumeAsync: not expected")
+func (s *diskSizingStorage) DeleteVolumeAsync(ctx context.Context, node, storage, volume string) (string, error) {
+	if s.deleteVolumeAsyncFn != nil {
+		return s.deleteVolumeAsyncFn(ctx, node, storage, volume)
+	}
+	return "", nil
 }
 func (s *diskSizingStorage) DeleteVolumeIfExists(_ context.Context, _, _, _ string) (bool, error) {
 	panic("diskSizingStorage.DeleteVolumeIfExists: not expected")
@@ -128,10 +132,30 @@ func (s *diskSizingStorage) Upload(_ context.Context, _, _, _, _ string, _ io.Re
 
 var _ sdkstorage.Service = (*diskSizingStorage)(nil)
 
-// diskSizingPVE implements pve.Client; QEMU() and optionally Storage() are live.
+// diskSizingTasks implements sdktasks.Service with configurable Wait, used to
+// verify attachEphemeralDisk's rollback awaits the DeleteVolumeAsync UPID
+// (pve.AwaitTaskWithLogger → Tasks().Wait) rather than discarding it. Absent a
+// waitFn, Wait reports the task as immediately successful so tests that do not
+// care about await behavior are unaffected.
+type diskSizingTasks struct {
+	sdktasks.Service
+	waitFn func(ctx context.Context, node, upid string, opts *sdktasks.WaitOptions) (*sdktasks.Status, error)
+}
+
+func (t *diskSizingTasks) Wait(ctx context.Context, node, upid string, opts *sdktasks.WaitOptions) (*sdktasks.Status, error) {
+	if t.waitFn != nil {
+		return t.waitFn(ctx, node, upid, opts)
+	}
+	return &sdktasks.Status{Status: "stopped", ExitStatus: "OK", UpID: upid}, nil
+}
+
+var _ sdktasks.Service = (*diskSizingTasks)(nil)
+
+// diskSizingPVE implements pve.Client; QEMU() and optionally Storage()/Tasks() are live.
 type diskSizingPVE struct {
 	qemu    sdkqemu.Service
 	storage sdkstorage.Service
+	tasks   sdktasks.Service
 }
 
 func (p *diskSizingPVE) QEMU() sdkqemu.Service { return p.qemu }
@@ -144,7 +168,12 @@ func (p *diskSizingPVE) Storage() sdkstorage.Service {
 func (p *diskSizingPVE) CloudInit() sdkcloudinit.Service {
 	panic("diskSizingPVE.CloudInit: not expected")
 }
-func (p *diskSizingPVE) Tasks() sdktasks.Service     { panic("diskSizingPVE.Tasks: not expected") }
+func (p *diskSizingPVE) Tasks() sdktasks.Service {
+	if p.tasks != nil {
+		return p.tasks
+	}
+	return &diskSizingTasks{}
+}
 func (p *diskSizingPVE) Nodes() sdknodes.Service     { panic("diskSizingPVE.Nodes: not expected") }
 func (p *diskSizingPVE) Cluster() sdkcluster.Service { panic("diskSizingPVE.Cluster: not expected") }
 func (p *diskSizingPVE) ClusterStorage() sdkclusterstorage.Service {
@@ -705,7 +734,7 @@ func TestAttachEphemeralDisk_NextFreeSlot(t *testing.T) {
 }
 
 // TestAttachEphemeralDisk_CreateFail_NoOrphan verifies that when CreateVolume
-// fails, no DeleteVolume call is made (nothing was created to clean up).
+// fails, no DeleteVolumeAsync call is made (nothing was created to clean up).
 func TestAttachEphemeralDisk_CreateFail_NoOrphan(t *testing.T) {
 	t.Parallel()
 
@@ -714,9 +743,9 @@ func TestAttachEphemeralDisk_CreateFail_NoOrphan(t *testing.T) {
 		createVolumeFn: func(_ context.Context, _, _ string, _ int, _ string, _ int, _ string) (string, error) {
 			return "", errors.New("storage pool not found")
 		},
-		deleteVolumeFn: func(_ context.Context, _, _, _ string) error {
+		deleteVolumeAsyncFn: func(_ context.Context, _, _, _ string) (string, error) {
 			deleteCalled = true
-			return nil
+			return "", nil
 		},
 	}
 	deps := buildEphemeralDeps(nil, nil, stor)
@@ -731,13 +760,14 @@ func TestAttachEphemeralDisk_CreateFail_NoOrphan(t *testing.T) {
 		t.Fatal("expected error from CreateVolume failure, got nil")
 	}
 	if deleteCalled {
-		t.Error("DeleteVolume called after CreateVolume failure — no volume exists to delete")
+		t.Error("DeleteVolumeAsync called after CreateVolume failure — no volume exists to delete")
 	}
 }
 
 // TestAttachEphemeralDisk_AttachFail_OrphanCleanup verifies that when
-// AttachDisk fails after CreateVolume succeeds, DeleteVolume is called with
-// the created volid.
+// AttachDisk fails after CreateVolume succeeds, DeleteVolumeAsync is called
+// with the created volid (not the synchronous DeleteVolume — see
+// diskSizingStorage.DeleteVolume, which panics if invoked).
 func TestAttachEphemeralDisk_AttachFail_OrphanCleanup(t *testing.T) {
 	t.Parallel()
 
@@ -747,9 +777,9 @@ func TestAttachEphemeralDisk_AttachFail_OrphanCleanup(t *testing.T) {
 		createVolumeFn: func(_ context.Context, _, _ string, _ int, _ string, _ int, _ string) (string, error) {
 			return volid, nil
 		},
-		deleteVolumeFn: func(_ context.Context, _, _, volume string) error {
+		deleteVolumeAsyncFn: func(_ context.Context, _, _, volume string) (string, error) {
 			deletedVolid = volume
-			return nil
+			return "", nil
 		},
 	}
 	deps := buildEphemeralDeps(
@@ -773,15 +803,127 @@ func TestAttachEphemeralDisk_AttachFail_OrphanCleanup(t *testing.T) {
 		t.Fatal("expected error from AttachDisk failure, got nil")
 	}
 	if deletedVolid == "" {
-		t.Error("DeleteVolume not called after AttachDisk failure — orphan volume would be left behind")
+		t.Error("DeleteVolumeAsync not called after AttachDisk failure — orphan volume would be left behind")
 	}
 	if deletedVolid != volid {
-		t.Errorf("DeleteVolume called with volid=%q; want %q", deletedVolid, volid)
+		t.Errorf("DeleteVolumeAsync called with volid=%q; want %q", deletedVolid, volid)
+	}
+}
+
+// TestAttachEphemeralDisk_OrphanCleanup_AwaitsDeleteUPID verifies that when
+// DeleteVolumeAsync returns a non-empty UPID, cleanupVol awaits it via
+// pve.AwaitTaskWithLogger (Tasks().Wait) instead of discarding it — the fix
+// for the SDK's documented same-name re-upload race (M1).
+func TestAttachEphemeralDisk_OrphanCleanup_AwaitsDeleteUPID(t *testing.T) {
+	t.Parallel()
+
+	const volid = "local-lvm:vm-101-ephemeral-0"
+	const upid = "UPID:pve:00001234:imgdel:local-lvm:vm-101-ephemeral-0:root@pam:"
+	var waitedUPID string
+	var waitedNode string
+	stor := &diskSizingStorage{
+		createVolumeFn: func(_ context.Context, _, _ string, _ int, _ string, _ int, _ string) (string, error) {
+			return volid, nil
+		},
+		deleteVolumeAsyncFn: func(_ context.Context, _, _, _ string) (string, error) {
+			return upid, nil
+		},
+	}
+	deps := Deps{
+		Config: &config.CPIConfig{VMStorage: "local-lvm"},
+		PVE: &diskSizingPVE{
+			qemu: &diskSizingQEMU{
+				configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+					return map[string]any{}, nil
+				},
+				attachDiskFn: func(_ context.Context, _ string, _ int, _, _ string, _ *sdkqemu.AttachOpts) (string, error) {
+					return "", errors.New("disk attach failed")
+				},
+			},
+			storage: stor,
+			tasks: &diskSizingTasks{
+				waitFn: func(_ context.Context, node, gotUPID string, _ *sdktasks.WaitOptions) (*sdktasks.Status, error) {
+					waitedNode = node
+					waitedUPID = gotUPID
+					return &sdktasks.Status{Status: "stopped", ExitStatus: "OK", UpID: gotUPID}, nil
+				},
+			},
+		},
+		Logger: log.NewNopLogger(),
+	}
+	shape := &createVMShape{
+		node:             "pve",
+		ephemeralDiskGiB: 4,
+		ephemeralStorage: "local-lvm",
+		vmDiskFormat:     "qcow2",
+	}
+
+	_, err := attachEphemeralDisk(context.Background(), deps, log.NewNopLogger(), shape, 101)
+	if err == nil {
+		t.Fatal("expected error from AttachDisk failure, got nil")
+	}
+	if waitedUPID != upid {
+		t.Errorf("Tasks().Wait upid = %q; want %q (imgdel UPID must be awaited, not discarded)", waitedUPID, upid)
+	}
+	if waitedNode != "pve" {
+		t.Errorf("Tasks().Wait node = %q; want %q", waitedNode, "pve")
+	}
+}
+
+// TestAttachEphemeralDisk_OrphanCleanup_AwaitFailureLoggedNotFatal verifies
+// that a failure awaiting the DeleteVolumeAsync UPID is logged (best-effort
+// cleanup) and does not replace or suppress the original AttachDisk error.
+func TestAttachEphemeralDisk_OrphanCleanup_AwaitFailureLoggedNotFatal(t *testing.T) {
+	t.Parallel()
+
+	const volid = "local-lvm:vm-101-ephemeral-0"
+	const upid = "UPID:pve:00001234:imgdel:local-lvm:vm-101-ephemeral-0:root@pam:"
+	stor := &diskSizingStorage{
+		createVolumeFn: func(_ context.Context, _, _ string, _ int, _ string, _ int, _ string) (string, error) {
+			return volid, nil
+		},
+		deleteVolumeAsyncFn: func(_ context.Context, _, _, _ string) (string, error) {
+			return upid, nil
+		},
+	}
+	deps := Deps{
+		Config: &config.CPIConfig{VMStorage: "local-lvm"},
+		PVE: &diskSizingPVE{
+			qemu: &diskSizingQEMU{
+				configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+					return map[string]any{}, nil
+				},
+				attachDiskFn: func(_ context.Context, _ string, _ int, _, _ string, _ *sdkqemu.AttachOpts) (string, error) {
+					return "", errors.New("disk attach failed")
+				},
+			},
+			storage: stor,
+			tasks: &diskSizingTasks{
+				waitFn: func(_ context.Context, _, _ string, _ *sdktasks.WaitOptions) (*sdktasks.Status, error) {
+					return nil, errors.New("task poll transport error")
+				},
+			},
+		},
+		Logger: log.NewNopLogger(),
+	}
+	shape := &createVMShape{
+		node:             "pve",
+		ephemeralDiskGiB: 4,
+		ephemeralStorage: "local-lvm",
+		vmDiskFormat:     "qcow2",
+	}
+
+	_, err := attachEphemeralDisk(context.Background(), deps, log.NewNopLogger(), shape, 101)
+	if err == nil {
+		t.Fatal("expected error from AttachDisk failure, got nil")
+	}
+	if !strings.Contains(err.Error(), "disk attach failed") {
+		t.Errorf("expected original AttachDisk error to surface, got: %v", err)
 	}
 }
 
 // TestAttachEphemeralDisk_ConfigReadFail_OrphanCleanup verifies that when
-// Config read fails after CreateVolume succeeds, DeleteVolume is called.
+// Config read fails after CreateVolume succeeds, DeleteVolumeAsync is called.
 func TestAttachEphemeralDisk_ConfigReadFail_OrphanCleanup(t *testing.T) {
 	t.Parallel()
 
@@ -791,9 +933,9 @@ func TestAttachEphemeralDisk_ConfigReadFail_OrphanCleanup(t *testing.T) {
 		createVolumeFn: func(_ context.Context, _, _ string, _ int, _ string, _ int, _ string) (string, error) {
 			return volid, nil
 		},
-		deleteVolumeFn: func(_ context.Context, _, _, _ string) error {
+		deleteVolumeAsyncFn: func(_ context.Context, _, _, _ string) (string, error) {
 			deleteCalled = true
-			return nil
+			return "", nil
 		},
 	}
 	deps := buildEphemeralDeps(
@@ -815,12 +957,13 @@ func TestAttachEphemeralDisk_ConfigReadFail_OrphanCleanup(t *testing.T) {
 		t.Fatal("expected error from Config failure, got nil")
 	}
 	if !deleteCalled {
-		t.Error("DeleteVolume not called after Config read failure — orphan volume would be left behind")
+		t.Error("DeleteVolumeAsync not called after Config read failure — orphan volume would be left behind")
 	}
 }
 
 // TestAttachEphemeralDisk_ScsiSlotExhausted verifies that when all scsi slots
-// scsi1..28 are occupied, a CloudError is returned and DeleteVolume is called.
+// scsi1..28 are occupied, a CloudError is returned and DeleteVolumeAsync is
+// called.
 func TestAttachEphemeralDisk_ScsiSlotExhausted(t *testing.T) {
 	t.Parallel()
 
@@ -830,9 +973,9 @@ func TestAttachEphemeralDisk_ScsiSlotExhausted(t *testing.T) {
 		createVolumeFn: func(_ context.Context, _, _ string, _ int, _ string, _ int, _ string) (string, error) {
 			return volid, nil
 		},
-		deleteVolumeFn: func(_ context.Context, _, _, _ string) error {
+		deleteVolumeAsyncFn: func(_ context.Context, _, _, _ string) (string, error) {
 			deleteCalled = true
-			return nil
+			return "", nil
 		},
 	}
 
@@ -866,7 +1009,7 @@ func TestAttachEphemeralDisk_ScsiSlotExhausted(t *testing.T) {
 		t.Errorf("error missing 'no free scsi slot': %v", err)
 	}
 	if !deleteCalled {
-		t.Error("DeleteVolume not called after slot exhaustion — orphan volume would be left behind")
+		t.Error("DeleteVolumeAsync not called after slot exhaustion — orphan volume would be left behind")
 	}
 }
 

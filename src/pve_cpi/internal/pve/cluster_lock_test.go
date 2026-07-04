@@ -2,6 +2,7 @@ package pve
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -21,7 +22,14 @@ type fakeLockPools struct {
 	createN  int
 	deleteN  int
 	getN     int
-	createFn func(id, comment string) error // optional override
+	createFn func(id, comment string) error // optional override; may mutate f.pools directly to simulate a concurrent stealer
+	deleteFn func(id string) error          // optional override; non-nil error short-circuits the default delete
+	// getFn, when set, is consulted on every GetPoolComment call. When override is
+	// true its (comment, found, err) triple is returned as-is instead of the
+	// default map lookup, letting a test script per-call-count behavior (e.g. the
+	// steal's initial read succeeds but the post-steal verify read fails/shows a
+	// different owner).
+	getFn func(id string) (comment string, found bool, err error, override bool)
 }
 
 func newFakeLockPools() *fakeLockPools {
@@ -52,6 +60,11 @@ func (f *fakeLockPools) DeletePool(_ context.Context, poolID string) error {
 	defer f.mu.Unlock()
 	f.deleteN++
 	f.calls = append(f.calls, "delete:"+poolID)
+	if f.deleteFn != nil {
+		if err := f.deleteFn(poolID); err != nil {
+			return err
+		}
+	}
 	if _, ok := f.pools[poolID]; !ok {
 		return fmt.Errorf("pool '%s' does not exist", poolID)
 	}
@@ -64,6 +77,11 @@ func (f *fakeLockPools) GetPoolComment(_ context.Context, poolID string) (string
 	defer f.mu.Unlock()
 	f.getN++
 	f.calls = append(f.calls, "get:"+poolID)
+	if f.getFn != nil {
+		if comment, found, err, override := f.getFn(poolID); override {
+			return comment, found, err
+		}
+	}
 	c, ok := f.pools[poolID]
 	return c, ok, nil
 }
@@ -238,5 +256,179 @@ func TestDecodeLockExpiry(t *testing.T) {
 	}
 	if _, ok := decodeLockExpiry("owner=me"); ok {
 		t.Error("comment without exp= should not parse")
+	}
+}
+
+// The following tests exercise tryStealExpired directly (it is unexported, and
+// this test file is in package pve) so each of the five documented steal-race
+// branches can be driven precisely without relying on the wrapping acquire
+// loop's retry/backoff timing.
+
+func TestTryStealExpired_PoolVanishedBeforeRead(t *testing.T) {
+	// Branch: the sentinel pool is gone by the time tryStealExpired reads it
+	// (another process already released/stole it). No delete/recreate should be
+	// attempted; the caller must retry the top-level create instead.
+	f := newFakeLockPools()
+	clk := fixedClock(time.Unix(1000, 0), time.Second)
+	h, err := tryStealExpired(context.Background(), f, "bosh-lock-web", "me", 60*time.Second, clk)
+	if err != nil {
+		t.Fatalf("expected no error when pool vanished before read, got %v", err)
+	}
+	if h != nil {
+		t.Fatal("expected nil handle when pool vanished before the steal read")
+	}
+	if f.deleteN != 0 || f.createN != 0 {
+		t.Errorf("no delete/create should occur once GetPoolComment reports absent; delete=%d create=%d",
+			f.deleteN, f.createN)
+	}
+	if f.getN != 1 {
+		t.Errorf("expected exactly one GetPoolComment call; got %d", f.getN)
+	}
+}
+
+func TestTryStealExpired_DeleteNonNotFoundErrorRetriable(t *testing.T) {
+	// Branch: DeletePool fails during the steal with an error that is NOT a
+	// not-found (e.g. a transport/pmxcfs fault). This must propagate as a
+	// retriable error, not be treated as "someone else already deleted it".
+	f := newFakeLockPools()
+	f.pools["bosh-lock-web"] = encodeLockComment("dead-owner", time.Unix(500, 0)) // expired at now=1000
+	f.deleteFn = func(_ string) error { return fmt.Errorf("500 pmxcfs temporarily unavailable") }
+
+	clk := fixedClock(time.Unix(1000, 0), time.Second)
+	h, err := tryStealExpired(context.Background(), f, "bosh-lock-web", "me", 60*time.Second, clk)
+	if h != nil {
+		t.Fatal("expected nil handle on steal-delete failure")
+	}
+	if err == nil {
+		t.Fatal("expected an error when steal-delete fails with a non-not-found error")
+	}
+	if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+		t.Errorf("steal-delete failure must be retriable; got %v", err)
+	}
+	if !strings.Contains(err.Error(), "steal-delete") {
+		t.Errorf("error should identify the steal-delete step; got %v", err)
+	}
+	if f.createN != 0 {
+		t.Errorf("recreate must not be attempted after a delete failure; createN=%d", f.createN)
+	}
+}
+
+func TestTryStealExpired_RecreateLosesToConcurrentStealer(t *testing.T) {
+	// Branch: our steal-delete succeeds, but the recreate CreatePool loses to a
+	// concurrent stealer B who recreated the pool first (isPoolAlreadyExists).
+	// This must signal loop-back (nil, nil), never a false-positive handle.
+	f := newFakeLockPools()
+	f.pools["bosh-lock-web"] = encodeLockComment("dead-owner", time.Unix(500, 0))
+	f.createFn = func(id, _ string) error {
+		// Simulate stealer B winning the recreate race between our DeletePool and
+		// our CreatePool: B's entry appears in the pool map first, so the fake's
+		// normal duplicate check (which runs after this hook) will reject us.
+		f.pools[id] = encodeLockComment("stealer-b", time.Unix(999999, 0))
+		return nil
+	}
+
+	clk := fixedClock(time.Unix(1000, 0), time.Second)
+	h, err := tryStealExpired(context.Background(), f, "bosh-lock-web", "me", 60*time.Second, clk)
+	if err != nil {
+		t.Fatalf("losing the recreate race must signal loop/retry, not an error: %v", err)
+	}
+	if h != nil {
+		t.Fatal("expected nil handle when a concurrent stealer wins the recreate")
+	}
+	if got := f.pools["bosh-lock-web"]; !strings.Contains(got, "owner=stealer-b") {
+		t.Errorf("stealer B's comment should remain after we lose the race; got %q", got)
+	}
+}
+
+func TestTryStealExpired_VerifyReadErrorRetriable(t *testing.T) {
+	// Branch: the post-steal verification GetPoolComment call itself errors
+	// (transport fault after a successful recreate). This must propagate as a
+	// retriable error rather than either a false handle or a silent loop.
+	f := newFakeLockPools()
+	f.pools["bosh-lock-web"] = encodeLockComment("dead-owner", time.Unix(500, 0))
+	getCalls := 0
+	f.getFn = func(_ string) (string, bool, error, bool) {
+		getCalls++
+		if getCalls == 2 {
+			// Second GetPoolComment call is the post-steal verify read.
+			return "", false, fmt.Errorf("500 pmxcfs read timeout"), true
+		}
+		return "", false, nil, false // first call: fall through to normal map lookup
+	}
+
+	clk := fixedClock(time.Unix(1000, 0), time.Second)
+	h, err := tryStealExpired(context.Background(), f, "bosh-lock-web", "me", 60*time.Second, clk)
+	if h != nil {
+		t.Fatal("expected nil handle when the post-steal verify read errors")
+	}
+	if err == nil {
+		t.Fatal("expected an error when the post-steal verify read fails")
+	}
+	if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+		t.Errorf("verify-read failure must be retriable; got %v", err)
+	}
+	if !strings.Contains(err.Error(), "verify") {
+		t.Errorf("error should identify the verify step; got %v", err)
+	}
+}
+
+func TestTryStealExpired_VerifyShowsDifferentOwnerDisplaced(t *testing.T) {
+	// Branch: the recreate succeeds, but the post-steal verify re-read shows a
+	// DIFFERENT owner's comment — the exact residual race the doc comment on
+	// tryStealExpired calls the correctness backstop. We must yield the handle
+	// and signal loop/retry (nil, nil), never return a handle for an owner token
+	// that is not actually persisted.
+	f := newFakeLockPools()
+	f.pools["bosh-lock-web"] = encodeLockComment("dead-owner", time.Unix(500, 0))
+	getCalls := 0
+	f.getFn = func(_ string) (string, bool, error, bool) {
+		getCalls++
+		if getCalls == 2 {
+			return encodeLockComment("stealer-b", time.Unix(999999, 0)), true, nil, true
+		}
+		return "", false, nil, false
+	}
+
+	clk := fixedClock(time.Unix(1000, 0), time.Second)
+	h, err := tryStealExpired(context.Background(), f, "bosh-lock-web", "me", 60*time.Second, clk)
+	if err != nil {
+		t.Fatalf("displacement by a concurrent stealer must signal loop/retry, not an error: %v", err)
+	}
+	if h != nil {
+		t.Fatal("expected nil handle when the verify read shows a different owner (displaced)")
+	}
+}
+
+func TestDefaultLockClock_NowReflectsWallClock(t *testing.T) {
+	clk := defaultLockClock()
+	before := time.Now().Add(-time.Second)
+	got := clk.now()
+	after := time.Now().Add(time.Second)
+	if got.Before(before) || got.After(after) {
+		t.Errorf("defaultLockClock().now() = %v; want within [%v,%v]", got, before, after)
+	}
+}
+
+func TestDefaultLockClock_SleepReturnsAfterDuration(t *testing.T) {
+	clk := defaultLockClock()
+	start := time.Now()
+	if err := clk.sleep(context.Background(), 10*time.Millisecond); err != nil {
+		t.Fatalf("sleep: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed < 10*time.Millisecond {
+		t.Errorf("sleep returned before its duration elapsed: %v", elapsed)
+	}
+}
+
+func TestDefaultLockClock_SleepReturnsContextErrOnCancellation(t *testing.T) {
+	clk := defaultLockClock()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := clk.sleep(ctx, time.Second)
+	if err == nil {
+		t.Fatal("expected sleep to return an error for an already-cancelled context")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("expected context.Canceled; got %v", err)
 	}
 }

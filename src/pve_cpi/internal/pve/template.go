@@ -11,6 +11,7 @@ import (
 	sdknodes "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/nodes"
 
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
+	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
 )
 
 // qemuListItem is the per-VM element returned by GET /nodes/{node}/qemu.
@@ -246,10 +247,17 @@ func FindTemplateByName(ctx context.Context, c Client, node, name string) (vmid 
 	}
 
 	var bestVMID int64
-	for _, raw := range *resp {
+	for i, raw := range *resp {
 		var item qemuListItem
 		if jsonErr := json.Unmarshal(raw, &item); jsonErr != nil {
-			// Malformed element — skip; do not fail the whole scan.
+			// Malformed element — skip; do not fail the whole scan. Logged at
+			// Debug so schema drift leaves a diagnostic trail instead of
+			// silently reporting "template not found" a layer up.
+			log.FromContext(ctx).Debug("template: skipping malformed qemu list entry",
+				log.String("node", node),
+				log.Int("index", i),
+				log.Err(jsonErr),
+			)
 			continue
 		}
 		// Only match confirmed templates.
@@ -370,10 +378,17 @@ func FindTemplateBySHATag(ctx context.Context, c Client, node, sha8 string) (vmi
 	}
 
 	var bestVMID int64
-	for _, raw := range *resp {
+	for i, raw := range *resp {
 		var item qemuListItem
 		if jsonErr := json.Unmarshal(raw, &item); jsonErr != nil {
-			// Malformed element — skip.
+			// Malformed element — skip. Logged at Debug so schema drift
+			// leaves a diagnostic trail instead of silently reporting
+			// "template not found" a layer up.
+			log.FromContext(ctx).Debug("template: skipping malformed qemu list entry",
+				log.String("node", node),
+				log.Int("index", i),
+				log.Err(jsonErr),
+			)
 			continue
 		}
 		// Only match confirmed templates.
@@ -465,9 +480,17 @@ func ResolveTemplateVMIDForNode(ctx context.Context, c Client, node, sha8 string
 	}
 
 	var bestVMID int64
-	for _, raw := range *resp {
+	for i, raw := range *resp {
 		var item qemuListItem
 		if jsonErr := json.Unmarshal(raw, &item); jsonErr != nil {
+			// Malformed element — skip; do not fail the whole scan. Logged at
+			// Debug so schema drift leaves a diagnostic trail instead of
+			// silently reporting "template not found" a layer up.
+			log.FromContext(ctx).Debug("template: skipping malformed qemu list entry",
+				log.String("node", node),
+				log.Int("index", i),
+				log.Err(jsonErr),
+			)
 			continue
 		}
 		if item.Template == nil || !*item.Template {

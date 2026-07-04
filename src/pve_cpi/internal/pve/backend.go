@@ -11,7 +11,7 @@ package pve
 
 import (
 	"context"
-	"fmt"
+	"strconv"
 	"strings"
 
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
@@ -93,11 +93,24 @@ func (r *resolver) Resolve(ctx context.Context, storage string) (Backend, error)
 			}
 			return newLocalBackend(r.client, info, r.defaultNode), nil
 		}
-		// Lookup failure: fall through to default local backend with a
-		// fabricated StorageInfo. The local backend's NodeForCreate refuses
-		// to make decisions without one of (vmHint, cloudPropNode, defaultNode),
+		// StorageInfoCache.Get returns a non-nil error for two very different
+		// conditions: the storage genuinely absent from the PVE index (a plain
+		// error, not classified through cpierrors), or a transient lister
+		// failure that refresh() has already wrapped through WrapError and
+		// classified as retriable. Only the former is safe to silently mask as
+		// "storage: local, unclassified" — masking the latter would silently
+		// flip a shared storage's placement algorithm to local's vmHint-first
+		// ordering on a condition the Director could clear by retrying.
+		if isRetriableCPIError(err) {
+			return nil, cpierrors.Wrap(err, "backend: storage classification lookup")
+		}
+		// Non-retriable lookup failure (storage genuinely absent from the
+		// index): fall through to default local backend with a fabricated
+		// StorageInfo. The local backend's NodeForCreate refuses to make
+		// decisions without one of (vmHint, cloudPropNode, defaultNode),
 		// which keeps the safe-default behavior described in the plan.
-		_ = err // err deliberately discarded: cache miss falls through to default backend resolution; high-frequency path, no log to avoid noise.
+		// High-frequency path; resolver has no logger field so no Debug log
+		// is emitted here (see NewBackendResolver).
 	}
 
 	// No cache configured or storage not found: treat as local. Tests that
@@ -186,14 +199,17 @@ func formatNodeResolveError(kind BackendKind, op string, vmHint, cloudPropNode, 
 	)
 }
 
-// asInt parses s as a positive int VMID. Returns (0, false) on any failure.
+// asInt parses s as a positive int VMID. Returns (0, false) on any failure,
+// including trailing garbage after the digits (e.g. "100abc", "100 200") —
+// strconv.Atoi requires the entire string to be consumed, unlike fmt.Sscanf's
+// %d verb which silently ignores anything after the matched digits.
 // Used by backends that accept a vmHint string from BOSH disk_cid arguments.
 func asInt(s string) (int, bool) {
 	if s == "" {
 		return 0, false
 	}
-	var n int
-	if _, err := fmt.Sscanf(s, "%d", &n); err != nil || n <= 0 {
+	n, err := strconv.Atoi(s)
+	if err != nil || n <= 0 {
 		return 0, false
 	}
 	return n, true

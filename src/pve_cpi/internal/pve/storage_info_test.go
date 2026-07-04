@@ -10,6 +10,9 @@ import (
 	"time"
 
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/clusterstorage"
+	sdkerrors "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/errors"
+
+	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 )
 
 type fakeLister struct {
@@ -285,6 +288,39 @@ func TestBackendResolver_PicksLocalForLVMThin(t *testing.T) {
 	}
 }
 
+// TestBackendResolver_TransientListerError_PropagatesRetriable confirms that
+// a transient StorageInfoCache.Get failure (refresh's lister call hit a
+// connection blip, e.g. pvedaemon worker recycling mid-refresh) is propagated
+// as a retriable error rather than being silently folded into the "storage:
+// local, unclassified" safe-default fallback. Falling through here would
+// change a shared storage's placement algorithm (cloud_properties.node ->
+// vmHint -> default) to local's (vmHint -> cloud_properties.node -> default)
+// on a condition the Director could clear by retrying, instead of a bounded
+// retry via RetriableCloudError.
+func TestBackendResolver_TransientListerError_PropagatesRetriable(t *testing.T) {
+	t.Parallel()
+	lister := &fakeLister{err: &sdkerrors.ConnectionError{
+		Host:    "pve.example",
+		Port:    8006,
+		Message: "transient blip",
+	}}
+	cache := NewStorageInfoCache(lister, time.Minute)
+	r := NewBackendResolver(nil, cache, "pve-default")
+
+	_, err := r.Resolve(context.Background(), "ceph")
+	if err == nil {
+		t.Fatalf("expected retriable error propagated from Resolve, got nil")
+	}
+
+	var ce *cpierrors.Error
+	if !errors.As(err, &ce) {
+		t.Fatalf("error does not carry cpierrors classification (type=%T): %v", err, err)
+	}
+	if !ce.OkToRetry() {
+		t.Fatalf("expected OkToRetry()=true for transient lister failure; err=%v", err)
+	}
+}
+
 func TestStaticResolver_AlwaysShared(t *testing.T) {
 	t.Parallel()
 	r := NewStaticBackendResolver(nil, "pve-x")
@@ -302,6 +338,59 @@ func TestStaticResolver_AlwaysShared(t *testing.T) {
 	if got != "pve-x" {
 		t.Fatalf("NodeForExisting=%q, want pve-x", got)
 	}
+}
+
+// TestStaticBackend_NodeForCreate_DispatcherPaths covers staticBackend's
+// NodeForCreate dispatch: cloudPropNode takes priority over defaultNode,
+// defaultNode is used as fallback, and an error surfaces when neither is set.
+// vmHint is intentionally ignored by the static backend (unlike shared/local),
+// so it is passed a non-empty value throughout to confirm it has no effect.
+func TestStaticBackend_NodeForCreate_DispatcherPaths(t *testing.T) {
+	t.Parallel()
+
+	t.Run("prefers cloudPropNode over defaultNode", func(t *testing.T) {
+		t.Parallel()
+		r := NewStaticBackendResolver(nil, "pve-default")
+		b, err := r.Resolve(context.Background(), "anything")
+		if err != nil {
+			t.Fatalf("Resolve: %v", err)
+		}
+		got, err := b.NodeForCreate(context.Background(), "100", "pve-explicit")
+		if err != nil {
+			t.Fatalf("NodeForCreate: %v", err)
+		}
+		if got != "pve-explicit" {
+			t.Fatalf("got %q, want pve-explicit", got)
+		}
+	})
+
+	t.Run("falls back to defaultNode", func(t *testing.T) {
+		t.Parallel()
+		r := NewStaticBackendResolver(nil, "pve-default")
+		b, err := r.Resolve(context.Background(), "anything")
+		if err != nil {
+			t.Fatalf("Resolve: %v", err)
+		}
+		got, err := b.NodeForCreate(context.Background(), "100", "")
+		if err != nil {
+			t.Fatalf("NodeForCreate: %v", err)
+		}
+		if got != "pve-default" {
+			t.Fatalf("got %q, want pve-default", got)
+		}
+	})
+
+	t.Run("errors when nothing resolves", func(t *testing.T) {
+		t.Parallel()
+		r := NewStaticBackendResolver(nil, "")
+		b, err := r.Resolve(context.Background(), "anything")
+		if err != nil {
+			t.Fatalf("Resolve: %v", err)
+		}
+		if _, err := b.NodeForCreate(context.Background(), "100", ""); err == nil {
+			t.Fatalf("expected error when neither cloudPropNode nor defaultNode set")
+		}
+	})
 }
 
 // atomicLister is a StorageLister that counts calls with an atomic counter so
@@ -388,5 +477,68 @@ func TestStorageInfoCache_ConcurrentGetCoalesces(t *testing.T) {
 	got := lister.calls.Load()
 	if got != 1 {
 		t.Errorf("expected exactly 1 ListStorage call for %d concurrent misses, got %d (TOCTOU double-refresh race)", goroutines, got)
+	}
+}
+
+// fakeClusterStorageService implements clusterstorage.Service with a
+// configurable ListStorage; every other method panics if called, since
+// ClusterStorageAsLister only needs ListStorage.
+type fakeClusterStorageService struct {
+	clusterstorage.Service
+	listFn func(ctx context.Context, params *clusterstorage.ListStorageParams) (*clusterstorage.ListStorageResponse, error)
+}
+
+func (f *fakeClusterStorageService) ListStorage(ctx context.Context, params *clusterstorage.ListStorageParams) (*clusterstorage.ListStorageResponse, error) {
+	return f.listFn(ctx, params)
+}
+
+// TestClusterStorageAsLister_DelegatesToService verifies the adapter passes
+// ctx/params through to the wrapped clusterstorage.Service and returns its
+// response unmodified.
+func TestClusterStorageAsLister_DelegatesToService(t *testing.T) {
+	t.Parallel()
+
+	want := clusterstorage.ListStorageResponse{json.RawMessage(`{"storage":"local-lvm","type":"lvmthin"}`)}
+	var gotParams *clusterstorage.ListStorageParams
+	svc := &fakeClusterStorageService{
+		listFn: func(_ context.Context, params *clusterstorage.ListStorageParams) (*clusterstorage.ListStorageResponse, error) {
+			gotParams = params
+			return &want, nil
+		},
+	}
+
+	lister := ClusterStorageAsLister(svc)
+	callParams := &clusterstorage.ListStorageParams{}
+	resp, err := lister.ListStorage(context.Background(), callParams)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp != &want {
+		t.Errorf("ListStorage response = %v, want the exact pointer returned by the wrapped service", resp)
+	}
+	if gotParams != callParams {
+		t.Error("params passed to the wrapped service must be the exact pointer given to lister.ListStorage")
+	}
+}
+
+// TestClusterStorageAsLister_PropagatesError verifies the adapter does not
+// swallow an error from the wrapped service.
+func TestClusterStorageAsLister_PropagatesError(t *testing.T) {
+	t.Parallel()
+
+	wantErr := errors.New("cluster storage list failed")
+	svc := &fakeClusterStorageService{
+		listFn: func(context.Context, *clusterstorage.ListStorageParams) (*clusterstorage.ListStorageResponse, error) {
+			return nil, wantErr
+		},
+	}
+
+	lister := ClusterStorageAsLister(svc)
+	resp, err := lister.ListStorage(context.Background(), &clusterstorage.ListStorageParams{})
+	if !errors.Is(err, wantErr) {
+		t.Errorf("ListStorage error = %v, want %v", err, wantErr)
+	}
+	if resp != nil {
+		t.Errorf("ListStorage response = %v, want nil on error", resp)
 	}
 }

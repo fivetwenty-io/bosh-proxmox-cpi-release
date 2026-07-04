@@ -236,6 +236,48 @@ func TestFindReplicaCandidate_EmptySHANoError(t *testing.T) {
 	}
 }
 
+// ---- AdoptReplicaTemplate (exported wrapper) ----
+
+// TestAdoptReplicaTemplate_ExportedWrapper_NoCandidate_NotAdopted exercises
+// the exported AdoptReplicaTemplate entry point (adoptReplicaTemplate wrapped
+// with defaultLockClock()) rather than the unexported clock-injectable form
+// every other test in this file uses. The no-candidate path returns
+// immediately without sleeping, so the real clock is safe to use here.
+func TestAdoptReplicaTemplate_ExportedWrapper_NoCandidate_NotAdopted(t *testing.T) {
+	t.Parallel()
+	c, _ := adoptClient(func(int) (*nodes.ListQemuResponse, error) {
+		return listFromRaw(), nil // empty list: no winner
+	})
+	vmid, adopted, err := AdoptReplicaTemplate(context.Background(), c, adoptNode, adoptSHA, 30*time.Second)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if adopted || vmid != 0 {
+		t.Fatalf("no candidate must yield (0,false): got (%d,%v)", vmid, adopted)
+	}
+}
+
+// TestAdoptReplicaTemplate_ExportedWrapper_SettledImmediately_Adopts exercises
+// the exported wrapper's settled-on-first-probe path, which also returns
+// without sleeping and is safe against the real clock.
+func TestAdoptReplicaTemplate_ExportedWrapper_SettledImmediately_Adopts(t *testing.T) {
+	t.Parallel()
+	tags := adoptShaTag() + ";" + adoptNodeTag()
+	c, n := adoptClient(func(int) (*nodes.ListQemuResponse, error) {
+		return listFromRaw(`{"vmid":40091,"template":1,"tags":"` + tags + `"}`), nil
+	})
+	vmid, adopted, err := AdoptReplicaTemplate(context.Background(), c, adoptNode, adoptSHA, 30*time.Second)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !adopted || vmid != 40091 {
+		t.Fatalf("must adopt the settled replica: got (%d,%v)", vmid, adopted)
+	}
+	if n.callCount() != 1 {
+		t.Errorf("ListQemu calls = %d; want 1 (single probe, no wait loop for a settled candidate)", n.callCount())
+	}
+}
+
 // ---- AdoptReplicaTemplate ----
 
 func TestAdoptReplicaTemplate_NoCandidate_NotAdopted(t *testing.T) {

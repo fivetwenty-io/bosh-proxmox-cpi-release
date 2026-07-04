@@ -38,7 +38,9 @@ func (s *sharedBackend) NodeForCreate(ctx context.Context, vmHint, cloudPropNode
 		return cloudPropNode, nil
 	}
 	if vmid, ok := asInt(vmHint); ok {
-		if node, found, err := nodeFromCluster(ctx, s.client, vmid); err == nil && found && node != "" {
+		if node, found, err := nodeFromCluster(ctx, s.client, vmid); err != nil {
+			return "", cpierrors.Wrap(err, "backend(shared): lookup vmHint node")
+		} else if found && node != "" {
 			return node, nil
 		}
 	}
@@ -50,7 +52,9 @@ func (s *sharedBackend) NodeForCreate(ctx context.Context, vmHint, cloudPropNode
 
 // NodeForExisting locates the node for an existing volume on shared storage.
 // Storage is cluster-visible, so any node works — we prefer defaultNode and
-// fall back to nodes restriction in StorageInfo.
+// fall back to nodes restriction in StorageInfo. ctx and volume are
+// intentionally unused: unlike localBackend, no cluster scan is needed here
+// since a shared volume is reachable from every node.
 func (s *sharedBackend) NodeForExisting(_ context.Context, _ string) (string, error) {
 	if s.defaultNode != "" {
 		return s.defaultNode, nil

@@ -354,3 +354,75 @@ func TestLocalBackend_NodeForExisting_RestrictedNodes_SkipsClusterScan(t *testin
 		t.Fatalf("got %q, want pve-03", got)
 	}
 }
+
+// TestCandidateNodes_AllRowsFailToParse_ReturnsRetriable confirms that when
+// every /cluster/resources row fails to unmarshal into {node,name} (leaving
+// zero candidates with no defaultNode/restricted-nodes fallback), the error
+// carries the package's retriable classification rather than a bare
+// *errors.errorString — an unparseable snapshot is a visibility problem the
+// Director can retry past, not a permanent misconfiguration.
+func TestCandidateNodes_AllRowsFailToParse_ReturnsRetriable(t *testing.T) {
+	t.Parallel()
+	c := &backendTestClient{
+		clusterSvc: &fakeCluster{
+			listFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+				return clusterResp(
+					map[string]any{"node": 12345}, // wrong type: "node" must be a JSON string
+					map[string]any{"node": true},  // wrong type: same
+				), nil
+			},
+		},
+	}
+	b := newLocalBackend(c, StorageInfo{Name: "local-zfs", Type: "zfspool"}, "")
+	_, err := b.NodeForExisting(context.Background(), "vm-100-disk-0")
+	if err == nil {
+		t.Fatalf("expected error when every candidate row fails to parse")
+	}
+
+	var ce *cpierrors.Error
+	if !errors.As(err, &ce) {
+		t.Fatalf("error does not carry cpierrors classification (type=%T): %v", err, err)
+	}
+	if !ce.OkToRetry() {
+		t.Fatalf("expected OkToRetry()=true for zero-candidate-nodes condition; err=%v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// asInt
+// ---------------------------------------------------------------------------
+
+// TestAsInt covers the full validation matrix for the vmHint parser,
+// including strconv.Atoi's full-string-consumption guarantee that fmt.Sscanf
+// silently lacked (trailing garbage and embedded whitespace must be rejected,
+// not truncated to the leading digits).
+func TestAsInt(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name   string
+		in     string
+		wantN  int
+		wantOK bool
+	}{
+		{"valid", "100", 100, true},
+		{"empty", "", 0, false},
+		{"negative", "-5", 0, false},
+		{"zero", "0", 0, false},
+		{"trailing garbage", "100abc", 0, false},
+		{"embedded space", "100 200", 0, false},
+		{"leading space", " 100", 0, false},
+		{"non-numeric", "abc", 0, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			n, ok := asInt(c.in)
+			if ok != c.wantOK {
+				t.Fatalf("asInt(%q) ok=%v, want %v (n=%d)", c.in, ok, c.wantOK, n)
+			}
+			if ok && n != c.wantN {
+				t.Fatalf("asInt(%q) n=%d, want %d", c.in, n, c.wantN)
+			}
+		})
+	}
+}
