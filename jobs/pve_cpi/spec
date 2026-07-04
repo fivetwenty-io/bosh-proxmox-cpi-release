@@ -608,6 +608,44 @@ properties:
       absent. The containing directory must exist and be writable by the CPI
       process.
     default: ""
+  pve.otel.enabled:
+    description: |
+      When true, the CPI emits OpenTelemetry traces for each RPC and the PVE
+      API calls it makes, exported via OTLP http/protobuf to
+      pve.otel.exporter_endpoint. Default false; when false no tracer
+      provider is built, no network connection is opened, and PVE API calls
+      bypass the tracing layer entirely.
+    default: false
+  pve.otel.exporter_endpoint:
+    description: |
+      Base URL of the OTLP http/protobuf collector endpoint (host:port or
+      full URL). Required when pve.otel.enabled is true; ignored otherwise.
+    default: ""
+  pve.otel.insecure:
+    description: |
+      When true, the OTLP exporter connects over plain HTTP instead of TLS.
+      Default false (TLS). Only relevant when pve.otel.enabled is true.
+    default: false
+  pve.otel.service_name:
+    description: |
+      Value of the service.name resource attribute attached to every emitted
+      span, identifying this CPI instance to the tracing backend.
+    default: "bosh-pve-cpi"
+  pve.otel.sample_ratio:
+    description: |
+      Fraction of traces sampled: greater than 0.0, up to 1.0 (all).
+      Rendering fails on values outside that range; to emit no traces,
+      leave pve.otel.enabled false. Only relevant when pve.otel.enabled
+      is true.
+    default: 1.0
+  pve.otel.export_timeout_ms:
+    description: |
+      Upper bound, in milliseconds, on how long span export is allowed to
+      block during process shutdown. Export failures after this deadline are
+      logged at Warn level and never fail the CPI action. A value of 0 is
+      treated as unset and yields the 5000 default; negative values fail
+      validation at CPI startup. Only relevant when pve.otel.enabled is true.
+    default: 5000
   pve.debug.keep_failed_vms:
     description: |
       Diagnostic mode. When true, a VM that fails mid-creation is NOT destroyed.

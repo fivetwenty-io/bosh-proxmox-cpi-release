@@ -523,6 +523,30 @@
     config["operation_timeout"] = operation_timeout
   end
 
+  # Emit otel block only when tracing is explicitly enabled. Absent (default
+  # false) means the Go zero-value OTelConfig disables tracing entirely --
+  # byte-identical to prior releases and zero dispatch-path overhead. Once
+  # enabled, exporter_endpoint is always emitted (required, no default worth
+  # hiding); the remaining sub-keys are omit-when-default so an untouched
+  # knob keeps the Go accessor's shipped default.
+  if p("pve.otel.enabled", false)
+    otel = { "enabled" => true }
+    otel["exporter_endpoint"] = p("pve.otel.exporter_endpoint", "")
+    otel_insecure = p("pve.otel.insecure", false)
+    otel["insecure"] = true if otel_insecure
+    otel_service_name = p("pve.otel.service_name", "bosh-pve-cpi")
+    otel["service_name"] = otel_service_name unless otel_service_name == "bosh-pve-cpi"
+    otel_sample_ratio = p("pve.otel.sample_ratio", 1.0).to_f
+    if otel_sample_ratio <= 0.0 || otel_sample_ratio > 1.0
+      raise "pve.otel.sample_ratio must be greater than 0.0 and at most 1.0 " \
+            "(got #{otel_sample_ratio}); to emit no traces, leave pve.otel.enabled false"
+    end
+    otel["sample_ratio"] = otel_sample_ratio unless otel_sample_ratio == 1.0
+    otel_export_timeout_ms = p("pve.otel.export_timeout_ms", 5000).to_i
+    otel["export_timeout_ms"] = otel_export_timeout_ms unless otel_export_timeout_ms == 5000
+    config["otel"] = otel
+  end
+
   # Emit vm_types only when the operator defines at least one profile. When
   # absent or empty (the default {}), the key is omitted so the Go config
   # zero-value (nil map) is preserved and behavior is unchanged.

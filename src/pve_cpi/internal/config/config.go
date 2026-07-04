@@ -691,6 +691,16 @@ type CPIConfig struct {
 	// validation, so this package must not import a type that would cause hooks to
 	// import back here. validate-only-when-set; omit from ERB when nil/disabled.
 	Metrics *hooks.MetricsConfig `json:"metrics,omitempty"`
+
+	// OTel holds the opt-in OpenTelemetry tracing configuration. Value-typed
+	// (not pointer) because OTel.Enabled's default is false: a zero-value block
+	// is unambiguous with "tracing off", so there is no nil-vs-explicit-false
+	// case to disambiguate (unlike blocks such as Placement whose default is
+	// true). Zero value emits zero exporter setup, zero network activity, and
+	// zero validation errors — byte-identical to prior releases.
+	// validate-only-when-set; omit from ERB when disabled. Use OTelEnabled()
+	// for the effective bool.
+	OTel OTelConfig `json:"otel"`
 }
 
 // TypeProfile is a named bundle of default cloud_properties applied by the
@@ -844,6 +854,48 @@ type OperationTimeoutConfig struct {
 	// attach/detach/resize/snapshot_disk, set_*_metadata, update_disk). Zero
 	// maps to 600 s.
 	DefaultSec int `json:"default_sec,omitempty"`
+}
+
+// OTelConfig holds the opt-in OpenTelemetry tracing configuration. All fields
+// are honored only when Enabled is true (validate-only-when-set); a zero-value
+// block is equivalent to tracing off and adds zero overhead — no exporter is
+// constructed and no network dial is attempted. The exporter wire protocol is
+// fixed to OTLP http/protobuf; there is no protocol knob (grpc support is a
+// documented future upgrade, not a runtime choice).
+type OTelConfig struct {
+	// Enabled turns on tracing. Default false. Plain bool (not pointer)
+	// because the default IS false, so there is no unset-vs-explicit-false
+	// ambiguity to resolve (unlike fields whose default is true, e.g.
+	// PlacementConfig.Enabled).
+	Enabled bool `json:"enabled,omitempty"`
+
+	// ExporterEndpoint is the OTLP http/protobuf collector endpoint
+	// (host:port or full URL). Required when Enabled is true. No default is
+	// applied — there is no sane collector address to assume.
+	ExporterEndpoint string `json:"exporter_endpoint,omitempty"`
+
+	// Insecure disables TLS on the exporter connection. Default false
+	// (TLS on).
+	Insecure bool `json:"insecure,omitempty"`
+
+	// ServiceName is the OTel resource service.name attribute. Empty means
+	// "use default"; ApplyDefaults fills "bosh-pve-cpi" when Enabled is true
+	// and this field is empty. An explicit non-empty override is preserved.
+	ServiceName string `json:"service_name,omitempty"`
+
+	// SampleRatio is the trace sampling ratio, valid range [0.0, 1.0]. Zero
+	// means "use default" (mirrors the repo's existing float64-field
+	// convention, e.g. EphemeralDiskMinRatio: zero is indistinguishable from
+	// unset, so an explicit sample ratio of exactly 0.0 — "sample nothing" —
+	// is not an expressible configuration). ApplyDefaults fills 1.0 when
+	// Enabled is true and this field is zero.
+	SampleRatio float64 `json:"sample_ratio,omitempty"`
+
+	// ExportTimeoutMs bounds the force-flush deadline applied to the OTel
+	// TracerProvider Shutdown call on every CPI process exit path. Zero
+	// means "use default"; ApplyDefaults fills 5000 when Enabled is true and
+	// this field is zero.
+	ExportTimeoutMs int `json:"export_timeout_ms,omitempty"`
 }
 
 // PlacementConfig holds all availability-aware node-selection knobs.
@@ -1398,6 +1450,7 @@ func (c *CPIConfig) ApplyDefaults() {
 		c.SDNZoneType = "simple"
 	}
 	c.applyPlacementDefaults()
+	c.applyOTelDefaults()
 	// Authentication precedence: when both password and api_token are present
 	// (e.g. a kit renders a placeholder password alongside a real api_token
 	// because credhub entombment rejects empty values), the api_token wins —
@@ -1442,6 +1495,24 @@ func (c *CPIConfig) applyPlacementDefaults() {
 	}
 	if c.Placement.Weights.GuestCount == 0 {
 		c.Placement.Weights.GuestCount = 0.3
+	}
+}
+
+// applyOTelDefaults fills zero-value OTel fields when tracing is enabled. A
+// no-op when Enabled is false, so the (default) disabled block is never
+// touched and stays byte-identical to a fresh zero value.
+func (c *CPIConfig) applyOTelDefaults() {
+	if !c.OTel.Enabled {
+		return
+	}
+	if c.OTel.ServiceName == "" {
+		c.OTel.ServiceName = "bosh-pve-cpi"
+	}
+	if c.OTel.SampleRatio == 0 {
+		c.OTel.SampleRatio = 1.0
+	}
+	if c.OTel.ExportTimeoutMs == 0 {
+		c.OTel.ExportTimeoutMs = 5000
 	}
 }
 
@@ -2309,6 +2380,16 @@ func (c *CPIConfig) OperationTimeoutEnabled() bool {
 	return *c.OperationTimeout.Enabled
 }
 
+// OTelEnabled reports whether OTel tracing is turned on. A nil receiver
+// returns false (matches the nil-safe accessor convention used throughout
+// this package).
+func (c *CPIConfig) OTelEnabled() bool {
+	if c == nil {
+		return false
+	}
+	return c.OTel.Enabled
+}
+
 // Operation-timeout class defaults in seconds. Generous so the envelope only
 // fires on a genuinely wedged operation, never on a slow-but-progressing one.
 const (
@@ -2457,6 +2538,7 @@ func (c *CPIConfig) ValidateWithLogger(_ *log.Logger) error {
 	c.validateHealthCheck(&errs)
 	c.validateRetry(&errs)
 	c.validateOperationTimeout(&errs)
+	c.validateOTel(&errs)
 	c.validateStorageTiers(&errs)
 	c.validateDiskPerformance(&errs)
 	c.validateStemcell(&errs)
@@ -3233,6 +3315,32 @@ func (c *CPIConfig) validateOperationTimeout(errs *[]string) {
 	checkSec("delete_sec", ot.DeleteSec)
 	checkSec("query_sec", ot.QuerySec)
 	checkSec("default_sec", ot.DefaultSec)
+}
+
+// validateOTel appends errors for the OTel tracing block. Runs only when
+// Enabled is true (validate-only-when-set) — a disabled/absent block never
+// produces a validation error, preserving zero-behavior-change-when-unset.
+func (c *CPIConfig) validateOTel(errs *[]string) {
+	if !c.OTel.Enabled {
+		return
+	}
+	if c.OTel.ExporterEndpoint == "" {
+		*errs = append(*errs, "otel.exporter_endpoint is required when otel.enabled is true")
+	}
+	if c.OTel.SampleRatio < 0 || c.OTel.SampleRatio > 1 {
+		*errs = append(*errs, fmt.Sprintf(
+			"otel.sample_ratio must be 0.0-1.0, got %v", c.OTel.SampleRatio))
+	}
+	if c.OTel.ExportTimeoutMs <= 0 {
+		*errs = append(*errs, fmt.Sprintf(
+			"otel.export_timeout_ms must be > 0, got %d", c.OTel.ExportTimeoutMs))
+	}
+	// ApplyDefaults fills ServiceName from empty when Enabled is true, so this
+	// only fires for a caller that invokes Validate directly (bypassing
+	// ApplyDefaults) with an explicit blank override.
+	if c.OTel.ServiceName == "" {
+		*errs = append(*errs, "otel.service_name must not be empty when otel.enabled is true")
+	}
 }
 
 // knownDiskCacheModes is the set of PVE per-disk cache mode strings accepted in
