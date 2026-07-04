@@ -32,6 +32,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"strconv"
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -82,77 +83,77 @@ func (t *tracedQEMUService) Create(ctx context.Context, node string, params map[
 
 func (t *tracedQEMUService) Config(ctx context.Context, node string, vmid int) (cfg map[string]interface{}, err error) {
 	ctx, span := t.tracer.Start(ctx, "pve.qemu.config", trace.WithAttributes(
-		attribute.String("pve.node", node), attribute.Int("pve.vmid", vmid)))
+		attribute.String("pve.node", node), attribute.String("pve.vmid", strconv.Itoa(vmid))))
 	defer func() { finishSpan(span, err) }()
 	return t.Service.Config(ctx, node, vmid)
 }
 
 func (t *tracedQEMUService) Status(ctx context.Context, node string, vmid int) (status map[string]interface{}, err error) {
 	ctx, span := t.tracer.Start(ctx, "pve.qemu.status", trace.WithAttributes(
-		attribute.String("pve.node", node), attribute.Int("pve.vmid", vmid)))
+		attribute.String("pve.node", node), attribute.String("pve.vmid", strconv.Itoa(vmid))))
 	defer func() { finishSpan(span, err) }()
 	return t.Service.Status(ctx, node, vmid)
 }
 
 func (t *tracedQEMUService) Start(ctx context.Context, node string, vmid int) (upid string, err error) {
 	ctx, span := t.tracer.Start(ctx, "pve.qemu.start", trace.WithAttributes(
-		attribute.String("pve.node", node), attribute.Int("pve.vmid", vmid)))
+		attribute.String("pve.node", node), attribute.String("pve.vmid", strconv.Itoa(vmid))))
 	defer func() { finishSpan(span, err) }()
 	return t.Service.Start(ctx, node, vmid)
 }
 
 func (t *tracedQEMUService) Stop(ctx context.Context, node string, vmid int) (upid string, err error) {
 	ctx, span := t.tracer.Start(ctx, "pve.qemu.stop", trace.WithAttributes(
-		attribute.String("pve.node", node), attribute.Int("pve.vmid", vmid)))
+		attribute.String("pve.node", node), attribute.String("pve.vmid", strconv.Itoa(vmid))))
 	defer func() { finishSpan(span, err) }()
 	return t.Service.Stop(ctx, node, vmid)
 }
 
 func (t *tracedQEMUService) Reset(ctx context.Context, node string, vmid int) (upid string, err error) {
 	ctx, span := t.tracer.Start(ctx, "pve.qemu.reset", trace.WithAttributes(
-		attribute.String("pve.node", node), attribute.Int("pve.vmid", vmid)))
+		attribute.String("pve.node", node), attribute.String("pve.vmid", strconv.Itoa(vmid))))
 	defer func() { finishSpan(span, err) }()
 	return t.Service.Reset(ctx, node, vmid)
 }
 
 func (t *tracedQEMUService) AttachDisk(ctx context.Context, node string, vmid int, volid string, bus string, opts *qemu.AttachOpts) (diskID string, err error) {
 	ctx, span := t.tracer.Start(ctx, "pve.qemu.attach_disk", trace.WithAttributes(
-		attribute.String("pve.node", node), attribute.Int("pve.vmid", vmid)))
+		attribute.String("pve.node", node), attribute.String("pve.vmid", strconv.Itoa(vmid))))
 	defer func() { finishSpan(span, err) }()
 	return t.Service.AttachDisk(ctx, node, vmid, volid, bus, opts)
 }
 
 func (t *tracedQEMUService) DetachDisk(ctx context.Context, node string, vmid int, diskID string) (err error) {
 	ctx, span := t.tracer.Start(ctx, "pve.qemu.detach_disk", trace.WithAttributes(
-		attribute.String("pve.node", node), attribute.Int("pve.vmid", vmid)))
+		attribute.String("pve.node", node), attribute.String("pve.vmid", strconv.Itoa(vmid))))
 	defer func() { finishSpan(span, err) }()
 	return t.Service.DetachDisk(ctx, node, vmid, diskID)
 }
 
 func (t *tracedQEMUService) ResizeDisk(ctx context.Context, node string, vmid int, diskID string, sizeGiB int) (upid string, err error) {
 	ctx, span := t.tracer.Start(ctx, "pve.qemu.resize_disk", trace.WithAttributes(
-		attribute.String("pve.node", node), attribute.Int("pve.vmid", vmid)))
+		attribute.String("pve.node", node), attribute.String("pve.vmid", strconv.Itoa(vmid))))
 	defer func() { finishSpan(span, err) }()
 	return t.Service.ResizeDisk(ctx, node, vmid, diskID, sizeGiB)
 }
 
 func (t *tracedQEMUService) Snapshot(ctx context.Context, node string, vmid int, name string, opts map[string]interface{}) (upid string, err error) {
 	ctx, span := t.tracer.Start(ctx, "pve.qemu.snapshot", trace.WithAttributes(
-		attribute.String("pve.node", node), attribute.Int("pve.vmid", vmid)))
+		attribute.String("pve.node", node), attribute.String("pve.vmid", strconv.Itoa(vmid))))
 	defer func() { finishSpan(span, err) }()
 	return t.Service.Snapshot(ctx, node, vmid, name, opts)
 }
 
 func (t *tracedQEMUService) DeleteSnapshot(ctx context.Context, node string, vmid int, name string) (err error) {
 	ctx, span := t.tracer.Start(ctx, "pve.qemu.delete_snapshot", trace.WithAttributes(
-		attribute.String("pve.node", node), attribute.Int("pve.vmid", vmid)))
+		attribute.String("pve.node", node), attribute.String("pve.vmid", strconv.Itoa(vmid))))
 	defer func() { finishSpan(span, err) }()
 	return t.Service.DeleteSnapshot(ctx, node, vmid, name)
 }
 
 func (t *tracedQEMUService) ListSnapshots(ctx context.Context, node string, vmid int) (snaps []map[string]interface{}, err error) {
 	ctx, span := t.tracer.Start(ctx, "pve.qemu.list_snapshots", trace.WithAttributes(
-		attribute.String("pve.node", node), attribute.Int("pve.vmid", vmid)))
+		attribute.String("pve.node", node), attribute.String("pve.vmid", strconv.Itoa(vmid))))
 	defer func() { finishSpan(span, err) }()
 	return t.Service.ListSnapshots(ctx, node, vmid)
 }
@@ -169,7 +170,7 @@ type tracedStorageService struct {
 
 func (t *tracedStorageService) CreateVolume(ctx context.Context, node, storageName string, sizeGiB int, format string, vmid int, name string) (volid string, err error) {
 	ctx, span := t.tracer.Start(ctx, "pve.storage.create_volume", trace.WithAttributes(
-		attribute.String("pve.node", node), attribute.String("pve.storage", storageName), attribute.Int("pve.vmid", vmid)))
+		attribute.String("pve.node", node), attribute.String("pve.storage", storageName), attribute.String("pve.vmid", strconv.Itoa(vmid))))
 	defer func() { finishSpan(span, err) }()
 	return t.Service.CreateVolume(ctx, node, storageName, sizeGiB, format, vmid, name)
 }
@@ -617,7 +618,7 @@ type tracedPoolService struct {
 
 func (t *tracedPoolService) AddVM(ctx context.Context, poolID string, vmid int64) (err error) {
 	ctx, span := t.tracer.Start(ctx, "pve.pools.add_vm", trace.WithAttributes(
-		attribute.String("pve.pool_id", poolID), attribute.Int64("pve.vmid", vmid)))
+		attribute.String("pve.pool_id", poolID), attribute.String("pve.vmid", strconv.FormatInt(vmid, 10))))
 	defer func() { finishSpan(span, err) }()
 	return t.PoolService.AddVM(ctx, poolID, vmid)
 }

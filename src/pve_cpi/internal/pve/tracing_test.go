@@ -51,79 +51,7 @@ func newTestTracer(t *testing.T) (trace.Tracer, *tracetest.InMemoryExporter) {
 	return tp.Tracer("pve-tracing-test"), exporter
 }
 
-// fakeQEMUService implements qemu.Service for tests. Only Config and Clone
-// are wired (Config is overridden by tracedQEMUService, Clone is not); every
-// other method panics if called, since no test here should reach them.
-type fakeQEMUService struct {
-	configFn func(ctx context.Context, node string, vmid int) (map[string]interface{}, error)
-	cloneFn  func(ctx context.Context, node string, vmid int, params map[string]interface{}) (string, error)
-}
-
-func (f *fakeQEMUService) Create(context.Context, string, map[string]interface{}) (string, error) {
-	panic("fakeQEMUService: Create unexpected call")
-}
-
-func (f *fakeQEMUService) Config(ctx context.Context, node string, vmid int) (map[string]interface{}, error) {
-	if f.configFn != nil {
-		return f.configFn(ctx, node, vmid)
-	}
-	panic("fakeQEMUService: Config not wired")
-}
-
-func (f *fakeQEMUService) Status(context.Context, string, int) (map[string]interface{}, error) {
-	panic("fakeQEMUService: Status unexpected call")
-}
-
-func (f *fakeQEMUService) Start(context.Context, string, int) (string, error) {
-	panic("fakeQEMUService: Start unexpected call")
-}
-
-func (f *fakeQEMUService) Stop(context.Context, string, int) (string, error) {
-	panic("fakeQEMUService: Stop unexpected call")
-}
-
-func (f *fakeQEMUService) Reset(context.Context, string, int) (string, error) {
-	panic("fakeQEMUService: Reset unexpected call")
-}
-
-func (f *fakeQEMUService) Clone(ctx context.Context, node string, vmid int, params map[string]interface{}) (string, error) {
-	if f.cloneFn != nil {
-		return f.cloneFn(ctx, node, vmid, params)
-	}
-	panic("fakeQEMUService: Clone not wired")
-}
-
-func (f *fakeQEMUService) Template(context.Context, string, int) (string, error) {
-	panic("fakeQEMUService: Template unexpected call")
-}
-
-func (f *fakeQEMUService) AttachDisk(context.Context, string, int, string, string, *qemu.AttachOpts) (string, error) {
-	panic("fakeQEMUService: AttachDisk unexpected call")
-}
-
-func (f *fakeQEMUService) DetachDisk(context.Context, string, int, string) error {
-	panic("fakeQEMUService: DetachDisk unexpected call")
-}
-
-func (f *fakeQEMUService) ResizeDisk(context.Context, string, int, string, int) (string, error) {
-	panic("fakeQEMUService: ResizeDisk unexpected call")
-}
-
-func (f *fakeQEMUService) Snapshot(context.Context, string, int, string, map[string]interface{}) (string, error) {
-	panic("fakeQEMUService: Snapshot unexpected call")
-}
-
-func (f *fakeQEMUService) DeleteSnapshot(context.Context, string, int, string) error {
-	panic("fakeQEMUService: DeleteSnapshot unexpected call")
-}
-
-func (f *fakeQEMUService) ListSnapshots(context.Context, string, int) ([]map[string]interface{}, error) {
-	panic("fakeQEMUService: ListSnapshots unexpected call")
-}
-
-func (f *fakeQEMUService) RollbackSnapshot(context.Context, string, int, string) (string, error) {
-	panic("fakeQEMUService: RollbackSnapshot unexpected call")
-}
+// fakeQEMUService lives in fakes_qemu_test.go.
 
 // --------------------------------------------------------------------------
 // (a) overridden method success: exactly one span, correct name, ctx
@@ -182,7 +110,7 @@ func TestTracedQEMUService_Config_Success_OneSpanParentedAndOK(t *testing.T) {
 		case "pve.node":
 			sawNode = kv.Value.AsString() == "pve1"
 		case "pve.vmid":
-			sawVMID = kv.Value.AsInt64() == 42
+			sawVMID = kv.Value.AsString() == "42"
 		}
 	}
 	if !sawNode {
@@ -391,34 +319,12 @@ func TestNewClientWithTracer_NonNilTracer_StoresDecoratedServices(t *testing.T) 
 // --------------------------------------------------------------------------
 // Coverage for the local-var-indirection call surface (SDN + HA on
 // Cluster(), firewall on Nodes()) that a plain `.Cluster().X(` grep
-// undercounts. fakeClusterService/fakeNodesService embed the
-// real generated interface (nil) and override only the single method each
-// test needs — the same embedding idiom tracedClusterService/tracedNodesService
-// themselves use, so no 60+-method hand-written stub is required.
+// undercounts. fakeClusterService (fakes_cluster_test.go) and
+// fakeNodesService (fakes_nodes_test.go) embed the real generated interface
+// (nil) and override only the single method each test needs — the same
+// embedding idiom tracedClusterService/tracedNodesService themselves use, so
+// no 60+-method hand-written stub is required.
 // --------------------------------------------------------------------------
-
-type fakeClusterService struct {
-	cluster.Service
-	createSdnZonesFn func(ctx context.Context, params *cluster.CreateSdnZonesParams) error
-	deleteHaRulesFn  func(ctx context.Context, rule string) error
-}
-
-func (f *fakeClusterService) CreateSdnZones(ctx context.Context, params *cluster.CreateSdnZonesParams) error {
-	return f.createSdnZonesFn(ctx, params)
-}
-
-func (f *fakeClusterService) DeleteHaRules(ctx context.Context, rule string) error {
-	return f.deleteHaRulesFn(ctx, rule)
-}
-
-type fakeNodesService struct {
-	nodes.Service
-	createQemuFirewallRulesFn func(ctx context.Context, node, vmid string, params *nodes.CreateQemuFirewallRulesParams) error
-}
-
-func (f *fakeNodesService) CreateQemuFirewallRules(ctx context.Context, node string, vmid string, params *nodes.CreateQemuFirewallRulesParams) error {
-	return f.createQemuFirewallRulesFn(ctx, node, vmid, params)
-}
 
 // TestTracedClusterService_SDN_CreateSdnZones_Traced covers the SDN call
 // surface (reached in production only via `svc := c.Cluster()` /
@@ -577,6 +483,40 @@ func TestTracedClusterStorageService_ListStorage_Traced(t *testing.T) {
 	}
 	if spans[0].Status.Code == codes.Error {
 		t.Fatalf("success span carries Error status: %v", spans[0].Status)
+	}
+}
+
+func TestTracedClusterStorageService_ListStorage_Error(t *testing.T) {
+	t.Parallel()
+	tracer, exporter := newTestTracer(t)
+
+	wantErr := errors.New("list storage failed: connection refused")
+	traced := &tracedClusterStorageService{
+		Service: &tracingStubClusterStorageService{listErr: wantErr},
+		tracer:  tracer,
+	}
+
+	if _, err := traced.ListStorage(context.Background(), nil); !errors.Is(err, wantErr) {
+		t.Fatalf("ListStorage returned err=%v, want %v", err, wantErr)
+	}
+
+	spans := exporter.GetSpans()
+	if len(spans) != 1 {
+		t.Fatalf("got %d exported spans, want 1", len(spans))
+	}
+	span := spans[0]
+	if span.Name != "pve.clusterstorage.list_storage" {
+		t.Fatalf("span name = %q, want pve.clusterstorage.list_storage", span.Name)
+	}
+	if span.Status.Code != codes.Error {
+		t.Fatalf("span status code = %v, want Error", span.Status.Code)
+	}
+	wantDescription := log.ScrubMessage(wantErr.Error())
+	if span.Status.Description != wantDescription {
+		t.Errorf("span status description = %q, want %q", span.Status.Description, wantDescription)
+	}
+	if len(span.Events) == 0 {
+		t.Fatal("expected span.RecordError to add an exception event, got none")
 	}
 }
 
