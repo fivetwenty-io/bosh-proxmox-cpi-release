@@ -76,6 +76,28 @@ func ErrScrubbed(err error) Field {
 // level must be one of: debug, info, warn, error.
 // When sink is nil, os.Stderr is used (preserves stdout for JSON-RPC).
 func NewLogger(level string, sink io.Writer) (*Logger, error) {
+	return NewLoggerWithHandlers(level, sink)
+}
+
+// NewLoggerWithHandlers constructs a JSON-encoded, leveled Logger writing to
+// sink, additionally fanning every log record out to each handler in extra.
+// level and sink behave exactly as in NewLogger (nil sink defaults to
+// os.Stderr). With zero extra handlers, this returns a Logger backed
+// directly by the sink's JSON handler (no wrapping), so NewLogger's output is
+// byte-identical to before extra handlers existed.
+//
+// The configured level governs every destination: a record below level never
+// reaches the sink or any extra handler, so a secondary destination sees the
+// same records the sink does (an extra handler may still impose a stricter
+// filter of its own via Enabled, but never a looser one).
+//
+// Each extra handler is isolated from the others and from the sink: a panic
+// or an error returned by any extra handler's Enabled or Handle call is
+// swallowed and never propagates to the caller, and never prevents the sink
+// (or any other extra handler) from receiving the record. This package never
+// imports an OTel package itself; callers construct OTel-backed slog.Handler
+// values (e.g. via otelslog) and pass them in as extra.
+func NewLoggerWithHandlers(level string, sink io.Writer, extra ...slog.Handler) (*Logger, error) {
 	lvl, err := parseLevel(level)
 	if err != nil {
 		return nil, err
@@ -83,8 +105,102 @@ func NewLogger(level string, sink io.Writer) (*Logger, error) {
 	if sink == nil {
 		sink = os.Stderr
 	}
-	h := slog.NewJSONHandler(sink, &slog.HandlerOptions{Level: lvl})
+	sinkHandler := slog.NewJSONHandler(sink, &slog.HandlerOptions{Level: lvl})
+	var h slog.Handler = sinkHandler
+	if len(extra) > 0 {
+		h = &multiHandler{sink: sinkHandler, extras: extra, level: lvl}
+	}
 	return &Logger{Logger: slog.New(h), ctx: context.Background()}, nil
+}
+
+// multiHandler implements slog.Handler by fanning each record out to a
+// canonical sink handler plus zero or more extra handlers. The sink is
+// authoritative: its Enabled/Handle results and errors behave exactly as if
+// it were used alone. Extra handlers are best-effort — used to bridge
+// records to secondary destinations (e.g. an OTel logs handler) without
+// letting that destination's failures affect the primary sink.
+type multiHandler struct {
+	sink   slog.Handler
+	extras []slog.Handler
+	level  slog.Level
+}
+
+// Enabled reports whether any destination is enabled for level. The
+// configured level is a floor for every destination — a record below it is
+// dropped outright, so an extra handler whose own Enabled is permissive
+// (OTel bridge handlers report enabled at all levels) cannot receive records
+// the sink's level setting suppresses. Handle re-checks each handler's
+// Enabled before dispatching, so a handler with a stricter filter still does
+// not receive the record.
+func (m *multiHandler) Enabled(ctx context.Context, level slog.Level) bool {
+	if level < m.level {
+		return false
+	}
+	if m.sink.Enabled(ctx, level) {
+		return true
+	}
+	for _, e := range m.extras {
+		if e.Enabled(ctx, level) {
+			return true
+		}
+	}
+	return false
+}
+
+// Handle dispatches r to the sink handler and to every extra handler that
+// reports itself enabled for r's level. Only the sink handler's error is
+// returned to the caller; an extra handler's error or panic is swallowed
+// (fail-open) so a broken secondary destination never blocks or corrupts the
+// canonical log stream. Each handler receives its own clone of r since
+// slog.Handler implementations may retain or mutate the record they're
+// given.
+func (m *multiHandler) Handle(ctx context.Context, r slog.Record) error {
+	if r.Level < m.level {
+		return nil
+	}
+	var sinkErr error
+	if m.sink.Enabled(ctx, r.Level) {
+		sinkErr = m.sink.Handle(ctx, r.Clone())
+	}
+	for _, e := range m.extras {
+		dispatchToExtraHandler(ctx, e, r)
+	}
+	return sinkErr
+}
+
+// dispatchToExtraHandler calls h.Enabled/Handle for r, recovering from any
+// panic and discarding any returned error. This is the sole point where an
+// extra handler's failure is contained; callers of multiHandler.Handle never
+// see it.
+func dispatchToExtraHandler(ctx context.Context, h slog.Handler, r slog.Record) {
+	defer func() {
+		_ = recover()
+	}()
+	if !h.Enabled(ctx, r.Level) {
+		return
+	}
+	_ = h.Handle(ctx, r.Clone())
+}
+
+// WithAttrs returns a new multiHandler with attrs applied to the sink and to
+// every extra handler, so attributes attached via Logger.With reach all
+// destinations rather than only the sink.
+func (m *multiHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	newExtras := make([]slog.Handler, len(m.extras))
+	for i, e := range m.extras {
+		newExtras[i] = e.WithAttrs(attrs)
+	}
+	return &multiHandler{sink: m.sink.WithAttrs(attrs), extras: newExtras, level: m.level}
+}
+
+// WithGroup returns a new multiHandler with the group applied to the sink
+// and to every extra handler, mirroring WithAttrs.
+func (m *multiHandler) WithGroup(name string) slog.Handler {
+	newExtras := make([]slog.Handler, len(m.extras))
+	for i, e := range m.extras {
+		newExtras[i] = e.WithGroup(name)
+	}
+	return &multiHandler{sink: m.sink.WithGroup(name), extras: newExtras, level: m.level}
 }
 
 // NewNopLogger returns a Logger that discards all output.

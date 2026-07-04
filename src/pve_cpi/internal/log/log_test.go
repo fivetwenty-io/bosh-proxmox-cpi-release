@@ -5,11 +5,35 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"strings"
 	"testing"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
 )
+
+// recordingHandler is a minimal slog.Handler that records every record it
+// receives (by rendered message) for assertions. It optionally panics or
+// returns an error from Handle to exercise multiHandler's fail-open
+// isolation of extra handlers.
+type recordingHandler struct {
+	records    []slog.Record
+	panicOnLog bool
+	errOnLog   error
+}
+
+func (h *recordingHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *recordingHandler) Handle(_ context.Context, r slog.Record) error {
+	if h.panicOnLog {
+		panic("recordingHandler: simulated panic")
+	}
+	h.records = append(h.records, r)
+	return h.errOnLog
+}
+
+func (h *recordingHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *recordingHandler) WithGroup(string) slog.Handler      { return h }
 
 // mustLogger creates a logger at the given level writing to buf. Fatal on error.
 func mustLogger(t *testing.T, level string, buf *bytes.Buffer) *log.Logger {
@@ -383,5 +407,205 @@ func TestErrScrubbed_PlainErrorPassesThrough(t *testing.T) {
 	out := buf.String()
 	if !strings.Contains(out, "connection refused") {
 		t.Errorf("plain error message must survive ErrScrubbed: %s", out)
+	}
+}
+
+// TestNewLoggerWithHandlers_ZeroExtrasIdenticalToNewLogger verifies that
+// NewLoggerWithHandlers with no extra handlers produces byte-identical
+// output to NewLogger for the same sequence of log calls (regression:
+// the zero-extras path must not gain multiHandler wrapping overhead
+// or behavior differences).
+func TestNewLoggerWithHandlers_ZeroExtrasIdenticalToNewLogger(t *testing.T) {
+	t.Parallel()
+
+	var bufA, bufB bytes.Buffer
+	la, err := log.NewLogger("debug", &bufA)
+	if err != nil {
+		t.Fatalf("NewLogger: %v", err)
+	}
+	lb, err := log.NewLoggerWithHandlers("debug", &bufB)
+	if err != nil {
+		t.Fatalf("NewLoggerWithHandlers: %v", err)
+	}
+
+	la.Info("identical output check", log.String("k", "v"), log.Int("n", 42))
+	lb.Info("identical output check", log.String("k", "v"), log.Int("n", 42))
+
+	// Compare structurally, not byte-for-byte on the raw string: the two
+	// calls happen microseconds apart, so the JSON handler's "time" field
+	// legitimately differs between runs. Every other field must match
+	// exactly (same keys, same values, same shape).
+	normA := normalizeTimeField(t, bufA.String())
+	normB := normalizeTimeField(t, bufB.String())
+	if normA != normB {
+		t.Fatalf("NewLoggerWithHandlers(zero extras) output diverges from NewLogger (time field excluded):\nNewLogger:            %q\nNewLoggerWithHandlers: %q", normA, normB)
+	}
+}
+
+// normalizeTimeField parses a single JSON log line and returns it re-marshaled
+// with the "time" field removed, so callers can compare log lines for
+// structural equality while ignoring the timestamp, which legitimately
+// differs between two separate log calls.
+func normalizeTimeField(t *testing.T, line string) string {
+	t.Helper()
+	var m map[string]any
+	if err := json.Unmarshal([]byte(strings.TrimSpace(line)), &m); err != nil {
+		t.Fatalf("line is not valid JSON: %v\nline: %s", err, line)
+	}
+	delete(m, "time")
+	normalized, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("failed to re-marshal normalized line: %v", err)
+	}
+	return string(normalized)
+}
+
+// TestNewLoggerWithHandlers_ExtraHandlerReceivesRecord verifies an extra
+// handler passed to NewLoggerWithHandlers receives every record alongside
+// the sink.
+func TestNewLoggerWithHandlers_ExtraHandlerReceivesRecord(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	extra := &recordingHandler{}
+	l, err := log.NewLoggerWithHandlers("debug", &buf, extra)
+	if err != nil {
+		t.Fatalf("NewLoggerWithHandlers: %v", err)
+	}
+
+	l.Info("fan out check", log.String("k", "v"))
+
+	if !strings.Contains(buf.String(), "fan out check") {
+		t.Fatalf("expected sink to receive record, got: %s", buf.String())
+	}
+	if len(extra.records) != 1 {
+		t.Fatalf("expected extra handler to receive 1 record, got %d", len(extra.records))
+	}
+	if extra.records[0].Message != "fan out check" {
+		t.Fatalf("extra handler record message mismatch: %q", extra.records[0].Message)
+	}
+}
+
+// TestNewLoggerWithHandlers_ExtraHandlerPanicDoesNotPropagate verifies a
+// panicking extra handler does not crash the caller and the sink still
+// receives the log line (fail-open).
+func TestNewLoggerWithHandlers_ExtraHandlerPanicDoesNotPropagate(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	extra := &recordingHandler{panicOnLog: true}
+	l, err := log.NewLoggerWithHandlers("debug", &buf, extra)
+	if err != nil {
+		t.Fatalf("NewLoggerWithHandlers: %v", err)
+	}
+
+	l.Info("panic isolation check")
+
+	if !strings.Contains(buf.String(), "panic isolation check") {
+		t.Fatalf("expected sink to still receive record despite extra handler panic, got: %s", buf.String())
+	}
+}
+
+// TestNewLoggerWithHandlers_ExtraHandlerErrorDoesNotPropagate verifies an
+// extra handler returning an error does not surface to the caller — Logger's
+// level methods have no error return, so this asserts no panic occurs and
+// the sink output is unaffected.
+func TestNewLoggerWithHandlers_ExtraHandlerErrorDoesNotPropagate(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	extra := &recordingHandler{errOnLog: errors.New("extra handler write failed")}
+	l, err := log.NewLoggerWithHandlers("debug", &buf, extra)
+	if err != nil {
+		t.Fatalf("NewLoggerWithHandlers: %v", err)
+	}
+
+	l.Info("error isolation check")
+
+	if !strings.Contains(buf.String(), "error isolation check") {
+		t.Fatalf("expected sink to receive record despite extra handler error, got: %s", buf.String())
+	}
+	if len(extra.records) != 1 {
+		t.Fatalf("expected extra handler to still record the call despite its own error return, got %d", len(extra.records))
+	}
+}
+
+// TestNewLoggerWithHandlers_ScrubbedFieldReachesBothHandlers verifies
+// log.ErrScrubbed's scrubbing happens at the call
+// site before the record reaches any handler, so both the sink and an extra
+// handler see the already-scrubbed value — neither handler needs its own
+// scrubbing logic, and the raw secret never reaches either.
+func TestNewLoggerWithHandlers_ScrubbedFieldReachesBothHandlers(t *testing.T) {
+	t.Parallel()
+
+	tokenErr := errors.New("storage request failed: https://pve.example.com:8006/api2/json/nodes/pve/storage?access_token=secret-pve-token-abc123&node=pve")
+
+	var buf bytes.Buffer
+	extra := &recordingHandler{}
+	l, err := log.NewLoggerWithHandlers("debug", &buf, extra)
+	if err != nil {
+		t.Fatalf("NewLoggerWithHandlers: %v", err)
+	}
+
+	l.Error("scrub fanout test", log.ErrScrubbed(tokenErr))
+
+	sinkOut := buf.String()
+	if strings.Contains(sinkOut, "secret-pve-token-abc123") {
+		t.Errorf("token leaked to sink handler: %s", sinkOut)
+	}
+	if !strings.Contains(sinkOut, log.RedactedPlaceholder) {
+		t.Errorf("expected %q placeholder in sink output: %s", log.RedactedPlaceholder, sinkOut)
+	}
+
+	if len(extra.records) != 1 {
+		t.Fatalf("expected extra handler to receive 1 record, got %d", len(extra.records))
+	}
+	var extraErrVal string
+	extra.records[0].Attrs(func(a slog.Attr) bool {
+		if a.Key == "error" {
+			extraErrVal = a.Value.String()
+		}
+		return true
+	})
+	if strings.Contains(extraErrVal, "secret-pve-token-abc123") {
+		t.Errorf("token leaked to extra handler: %s", extraErrVal)
+	}
+	if !strings.Contains(extraErrVal, log.RedactedPlaceholder) {
+		t.Errorf("expected %q placeholder in extra handler's error field: %s", log.RedactedPlaceholder, extraErrVal)
+	}
+}
+
+// A record below the configured level must reach no destination: the level
+// is a floor for the sink and every extra handler alike, even when the extra
+// handler's own Enabled is unconditionally permissive (the shape of an OTel
+// bridge handler, which reports enabled at every level). A record at or
+// above the level reaches both.
+func TestNewLoggerWithHandlers_ExtraRespectsConfiguredLevel(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	extra := &recordingHandler{}
+	l, err := log.NewLoggerWithHandlers("info", &buf, extra)
+	if err != nil {
+		t.Fatalf("NewLoggerWithHandlers: %v", err)
+	}
+
+	l.Debug("below configured level")
+	if buf.Len() != 0 {
+		t.Errorf("sink received a debug record at level info: %s", buf.String())
+	}
+	if len(extra.records) != 0 {
+		t.Fatalf("extra handler received %d record(s) below the configured level, want 0", len(extra.records))
+	}
+
+	l.Info("at configured level")
+	if buf.Len() == 0 {
+		t.Error("sink did not receive an info record at level info")
+	}
+	if len(extra.records) != 1 {
+		t.Fatalf("extra handler received %d record(s) at the configured level, want 1", len(extra.records))
+	}
+	if got := extra.records[0].Message; got != "at configured level" {
+		t.Errorf("extra handler record message = %q, want %q", got, "at configured level")
 	}
 }
