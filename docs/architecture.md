@@ -58,7 +58,9 @@ Packages are grouped by role. Each is described in one sentence.
 
 - `internal/errors` — the BOSH CPI error taxonomy (`Cloud`, `RetriableCloud`, `NotSupported`, `NotImplemented`, and the not-found variants) with `OkToRetry` semantics.
 
-- `internal/log` — a zap-backed logger with context helpers, a test observer, and the `RedactSecrets` scrubber.
+- `internal/log` — an slog-backed logger with context helpers (request ID, method, and OTel trace/span correlation), a test observer, and the `RedactSecrets` scrubber.
+
+- `internal/otel` — builds the opt-in OpenTelemetry tracer: OTLP http/protobuf exporter, batching span processor, ratio sampler, and a bounded-timeout shutdown hook; disabled configuration yields a no-op tracer with no network activity.
 
 - `internal/version` — build-time version identifiers populated via `-ldflags`.
 
@@ -152,7 +154,7 @@ These mechanisms span multiple packages. Operational depth lives in the linked s
 
 ### Dispatcher: panic recovery, timeout, and tracing
 
-The dispatcher wraps every handler call in `recover()`. A recovered panic becomes a `RetriableCloud` error and a logged stack trace, so the director re-drives the call instead of receiving a malformed response. A configurable per-request timeout bounds each call. Request tracing is gated behind a config flag; when enabled, the dispatcher passes arguments and results through `RedactSecrets` before logging them. A CPI failure must never wedge the director or leak a secret into a log.
+The dispatcher wraps every handler call in `recover()`. A recovered panic becomes a `RetriableCloud` error and a logged stack trace, so the director re-drives the call instead of receiving a malformed response. A configurable per-request timeout bounds each call. Request tracing is gated behind a config flag; when enabled, the dispatcher passes arguments and results through `RedactSecrets` before logging them. Separately, opt-in OpenTelemetry tracing (`pve.otel.*`, see [Configuration](configuration.md)) opens one root span per CPI action and a child span per PVE API call, with span-recorded error text passing through the same URL-credential scrubbing as the logs; spans never touch stdout, and export failure never fails an action. A CPI failure must never wedge the director or leak a secret into a log — or into a span.
 
 ### Rollback stack
 

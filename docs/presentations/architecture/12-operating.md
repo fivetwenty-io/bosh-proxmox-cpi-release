@@ -59,6 +59,28 @@ class: visual-right
 
 ---
 
+## Own the configuration the CPI trusts
+
+```mermaid
+flowchart LR
+    M["operator manifest"] --> D["Director renders +<br/>resolves secrets"]
+    D --> F["config file<br/>(ground truth)"]
+    F --> V["validate whole structure<br/>before dialing PVE"]
+```
+
+- Rendered config is a contract, not a template: validate whole structure, connect after
+- API token beats password when both set; at least one credential required
+- Credential scoped to exactly what handlers call — no more
+
+<!--
+- The rendered config file will be the second ground-truth artifact: the Director interpolates the manifest, resolves secrets from the credential store, and writes one file the binary reads every invocation.
+- On load the CPI will apply defaults, validate the whole structure, and accumulate every error before opening a single connection to PVE — malformed input fails at the door, not twelve minutes into a deploy.
+- API token will win over password when both are supplied — revocable and scoped on its own, no ticket to expire mid-deploy; at least one of the two is required, a config with neither is rejected at load.
+- What the token can do is exactly what the handlers call, and no more: see the [PVE API permissions](../pve-api-permissions.md) reference and [Chapter 11](11-hostile-by-default.md) for why the set is derived from the call graph.
+-->
+
+---
+
 ## Make ownership legible
 
 ```mermaid
@@ -103,6 +125,31 @@ class: visual-right
 - Duplicate-IP is the showcase: an agent connects, runs ~15s, RSTs, reconnects, repeats — while NATS, the firewall, and the VM all measure healthy — caused by a second L2 device answering ARP for a BOSH-assigned address.
 - We prove the cause before prescribing: tcpdump the bridge, any IP with two distinct `is-at` answers is the duplicate; the genuine VM's virtio ARP frame is 28 bytes, a physical device's is padded to 46.
 - Fix the class, not the instance: own the whole range on an isolated SDN vnet (cpitest0) so no foreign device can claim an address; the cloud-config reserved-list workaround needs a re-scan on every LAN change.
+-->
+
+---
+
+## Trace the request across the seams
+
+```mermaid
+flowchart LR
+    Dir["Director"] --> Root["root span<br/>per CPI action"]
+    Root --> C1["PVE call"]
+    Root --> C2["PVE call"]
+    Root --> C3["PVE call"]
+```
+
+- Opt-in, inert by default: not enabled, no tracer, no network cost
+- One root span per action, one child span per PVE call — logs carry the same ids
+- Buffered in-process, flushed once at a bounded exit deadline; export failure is a warning, never a failed action
+- Never touches stdout — that channel carries the JSON-RPC reply alone
+
+<!--
+- Tracing will be opt-in: unless it is explicitly enabled and given an exporter endpoint, there is no tracer, no network dial, zero per-call cost.
+- One root span will open per CPI action; every PVE call underneath becomes a timed child span, and log lines will carry the same trace_id/span_id whenever a span is active.
+- Spans will buffer in-process and flush once under a bounded timeout at exit — a slow collector cannot stall an action mid-flight.
+- Export failure will degrade to a warning in our own logs, never a failed CPI action — a diagnostic must never invent a new failure mode; nothing about tracing will touch stdout, which stays the JSON-RPC reply alone.
+- The enable switch, endpoint, sample ratio, and flush deadline live in the [configuration reference](../configuration.md), every one defaulting to inert.
 -->
 
 ---
