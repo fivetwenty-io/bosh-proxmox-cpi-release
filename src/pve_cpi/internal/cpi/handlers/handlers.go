@@ -1,6 +1,8 @@
 package handlers
 
 import (
+	"context"
+
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/agent"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/cpi"
@@ -42,6 +44,23 @@ type Deps struct {
 	// NewInflightRegistry so all handlers share it. Nil (e.g. in test Deps
 	// literals) behaves as unlimited: acquire is nil-receiver-safe.
 	Inflight *nodeInflightRegistry
+}
+
+// Log returns the per-request, span-correlated logger stored in ctx (attached
+// by cmd/cpi's runCPI via log.IntoContext, carrying request_id/method/
+// trace_id/span_id fields) when present, else falls back to d.Logger.
+//
+// A handler unit test that builds ctx via context.Background() and a Deps
+// literal that sets Logger gets d.Logger unchanged (no correlation
+// fields), so no test setup needs a ctx-stored logger. If d.Logger is
+// also nil (a Deps literal that omits it entirely), Log falls back to a nop
+// logger rather than panicking on a nil *log.Logger receiver.
+func (d Deps) Log(ctx context.Context) *log.Logger {
+	fallback := d.Logger
+	if fallback == nil {
+		fallback = log.NewNopLogger()
+	}
+	return log.FromContextOr(ctx, fallback)
 }
 
 // backendResolverOrDefault returns d.Resolver if non-nil; otherwise it builds a

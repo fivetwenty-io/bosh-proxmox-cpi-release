@@ -134,12 +134,10 @@ func applySDN(ctx context.Context, deps Deps, clusterSvc sdkcluster.Service, opC
 	if upidErr != nil {
 		// Response body is not a recognizable UPID shape — log and continue.
 		// The HTTP 200 confirms the apply was accepted; this is informational.
-		if deps.Logger != nil {
-			deps.Logger.Warn(
-				fmt.Sprintf("%s: apply SDN returned unrecognized body; task completion unconfirmed", opCtx),
-				log.String("body", string(*resp)),
-			)
-		}
+		deps.Log(ctx).Warn(
+			fmt.Sprintf("%s: apply SDN returned unrecognized body; task completion unconfirmed", opCtx),
+			log.String("body", string(*resp)),
+		)
 		return nil
 	}
 	if upid == "" {
@@ -153,14 +151,12 @@ func applySDN(ctx context.Context, deps Deps, clusterSvc sdkcluster.Service, opC
 		node = parts[1]
 	}
 	if node == "" {
-		if deps.Logger != nil {
-			deps.Logger.Warn(
-				fmt.Sprintf("%s: apply SDN returned UPID but cannot determine node; task completion unconfirmed", opCtx),
-				log.String("upid", upid),
-			)
-		}
+		deps.Log(ctx).Warn(
+			fmt.Sprintf("%s: apply SDN returned UPID but cannot determine node; task completion unconfirmed", opCtx),
+			log.String("upid", upid),
+		)
 		return nil
 	}
 
-	return pve.AwaitTaskWithLogger(ctx, deps.PVE, node, upid, deps.Logger)
+	return pve.AwaitTaskWithLogger(ctx, deps.PVE, node, upid, deps.Log(ctx))
 }

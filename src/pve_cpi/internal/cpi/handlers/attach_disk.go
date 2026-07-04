@@ -131,7 +131,7 @@ func HandleAttachDisk(deps Deps) Handler {
 		//   Snapshots present + AllowDiskOpsWithSnapshots=true  → WARN + proceed
 		//   No snapshots                                        → proceed normally
 		// --------------------------------------------------------------------
-		if err := attachDiskSnapshotGuard(ctx, deps, vmCID, node, vmid, deps.Config, deps.Logger); err != nil {
+		if err := attachDiskSnapshotGuard(ctx, deps, vmCID, node, vmid, deps.Config, deps.Log(ctx)); err != nil {
 			return nil, err
 		}
 
@@ -210,7 +210,7 @@ func HandleAttachDisk(deps Deps) Handler {
 		// 5b. Enforce creation-time disk-performance invariants (§7.26), before
 		// any mutating PVE call so an enforce-mode reject leaves no orphan.
 		// --------------------------------------------------------------------
-		if err := enforceDiskPerfInvariants(deps.Config, deps.Logger, vmCID, diskCID, meta, effectiveOpts); err != nil {
+		if err := enforceDiskPerfInvariants(deps.Config, deps.Log(ctx), vmCID, diskCID, meta, effectiveOpts); err != nil {
 			return nil, err
 		}
 
@@ -221,7 +221,7 @@ func HandleAttachDisk(deps Deps) Handler {
 		}
 
 		var diskID string
-		err = pve.RetryOnTransient(ctx, deps.Logger, "attach_disk", 0, func() error {
+		err = pve.RetryOnTransient(ctx, deps.Log(ctx), "attach_disk", 0, func() error {
 			var attachErr error
 			diskID, attachErr = deps.PVE.QEMU().AttachDisk(ctx, node, vmid, volidArg, bus, &qemu.AttachOpts{
 				DiskID: desiredDiskID,
@@ -239,12 +239,12 @@ func HandleAttachDisk(deps Deps) Handler {
 		// --------------------------------------------------------------------
 		// 6+7. Confirm attachment (resolve diskID) and derive device path.
 		// --------------------------------------------------------------------
-		devicePath, err := attachDiskConfirmAndPath(ctx, deps, vmCID, node, vmid, bareDiskCID, diskID, deps.Logger)
+		devicePath, err := attachDiskConfirmAndPath(ctx, deps, vmCID, node, vmid, bareDiskCID, diskID, deps.Log(ctx))
 		if err != nil {
 			return nil, err
 		}
 
-		deps.Logger.Info("attach_disk",
+		deps.Log(ctx).Info("attach_disk",
 			log.String("vm_cid", vmCID),
 			log.String("disk_cid", diskCID),
 			log.String("disk_id", diskID),
@@ -548,7 +548,7 @@ func chooseSCSISlotSkippingZero(
 		// Legacy scsi0 attachment from a prior CPI version. Detach so the
 		// reattach below lands on scsi1+. DetachDisk also sweeps the
 		// resulting unusedN entry, leaving the config clean.
-		deps.Logger.Warn("attach_disk: migrating legacy scsi0 attachment to scsi1+",
+		deps.Log(ctx).Warn("attach_disk: migrating legacy scsi0 attachment to scsi1+",
 			log.Int("vmid", vmid),
 			log.String("volid", volid),
 		)
@@ -600,7 +600,7 @@ func unparkBeforeAttach(ctx context.Context, deps Deps, diskCID, bareDiskCID str
 		VMIDRangeEnd:   deps.Config.ParkedDiskVMIDRangeEndValue(),
 		DirectorID:     deps.Config.StemcellDirectorID(),
 	}
-	if unErr := pve.UnparkDisk(ctx, deps.PVE, deps.Logger, bareDiskCID, parkerCfg); unErr != nil {
+	if unErr := pve.UnparkDisk(ctx, deps.PVE, deps.Log(ctx), bareDiskCID, parkerCfg); unErr != nil {
 		return cpierrors.Retriable("attach_disk: unpark disk %s failed: %s", diskCID, unErr.Error())
 	}
 	return nil

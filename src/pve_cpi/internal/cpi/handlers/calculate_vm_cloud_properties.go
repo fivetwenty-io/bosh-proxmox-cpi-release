@@ -142,7 +142,7 @@ func candidateNodesForCloudProps(
 		var item clusterStatusNode
 		if parseErr := json.Unmarshal(raw, &item); parseErr != nil {
 			// Skip items whose schema is incompatible (e.g., quorum-info entries).
-			deps.Logger.Debug("calculate_vm_cloud_properties: skip item",
+			deps.Log(ctx).Debug("calculate_vm_cloud_properties: skip item",
 				log.Int("idx", i),
 				log.Err(parseErr),
 			)
@@ -160,7 +160,7 @@ func candidateNodesForCloudProps(
 			Storage: &effectiveStorage,
 		})
 		if storErr != nil {
-			deps.Logger.Warn(
+			deps.Log(ctx).Warn(
 				"calculate_vm_cloud_properties: ListStorage failed — excluding node",
 				log.String("node", item.Name),
 				log.String("storage", effectiveStorage),
@@ -175,7 +175,7 @@ func candidateNodesForCloudProps(
 			continue // fail-safe: never pick node with unknown storage status
 		}
 		if !nodeHasStorage(storageResp, effectiveStorage) {
-			deps.Logger.Warn(
+			deps.Log(ctx).Warn(
 				fmt.Sprintf(
 					"calculate_vm_cloud_properties: storage %q not active/images-capable on node %q — excluding from candidates",
 					effectiveStorage, item.Name,
@@ -280,7 +280,7 @@ func HandleCalculateVMCloudProperties(deps Deps) cpi.Handler {
 		effectiveStorage := deps.Config.VMStorage
 		if res.Storage != "" {
 			effectiveStorage = res.Storage
-			deps.Logger.Debug(
+			deps.Log(ctx).Debug(
 				"calculate_vm_cloud_properties: using per-request storage override",
 				log.String("storage", effectiveStorage),
 				log.String("config_default", deps.Config.VMStorage),

@@ -59,8 +59,7 @@ func HandleRebootVM(deps Deps) cpi.Handler {
 			return nil, cpierrors.Cloud("reboot_vm: vm_cid %q must be a positive integer", vmCID)
 		}
 
-		logger := deps.Logger.With(
-			log.String("method", "reboot_vm"),
+		logger := deps.Log(ctx).With(
 			log.String("vm_cid", vmCID),
 			log.Int("vmid", vmid),
 		)

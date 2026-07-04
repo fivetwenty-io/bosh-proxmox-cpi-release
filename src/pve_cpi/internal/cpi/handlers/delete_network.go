@@ -168,7 +168,7 @@ func maybeDeleteOrphanedZone(ctx context.Context, deps Deps, zone string) error 
 	if listErr != nil {
 		// Cannot confirm zone is empty — do not delete. This is the
 		// safe default; the operator can clean up manually if needed.
-		deps.Logger.Warn("delete_network: zone teardown skipped — could not list vnets",
+		deps.Log(ctx).Warn("delete_network: zone teardown skipped — could not list vnets",
 			log.String("zone", zone),
 			log.Err(listErr))
 		return nil

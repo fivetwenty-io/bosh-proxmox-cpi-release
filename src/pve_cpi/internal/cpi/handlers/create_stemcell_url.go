@@ -63,7 +63,7 @@ func handleStemcellDownloadURL(
 	// and no sha256 produce the same filename and will share the same import volume
 	// (first-writer wins). Warn so operators are aware of the weak identity.
 	if cp.ExpectedSHA256 == "" {
-		deps.Logger.Warn("create_stemcell: server-download: sha256 not set; "+
+		deps.Log(ctx).Warn("create_stemcell: server-download: sha256 not set; "+
 			"filename identity is weak (name+version only) — strongly recommend "+
 			"setting cloud_properties.sha256 alongside source_url",
 			log.String("source_url", cp.SourceURL),
@@ -73,7 +73,7 @@ func handleStemcellDownloadURL(
 	}
 	qcow2Filename := pve.BuildStemcellFilename(cp.Name, cp.Version, cp.ExpectedSHA256)
 
-	deps.Logger.Info("create_stemcell: server-side download requested",
+	deps.Log(ctx).Info("create_stemcell: server-side download requested",
 		log.String("source_url", cp.SourceURL),
 		log.String("node", node),
 		log.String("storage", storage),
@@ -87,7 +87,7 @@ func handleStemcellDownloadURL(
 		return nil, cpierrors.Wrap(findErr, "create_stemcell: server-download dedup lookup")
 	}
 	if existingVol != "" {
-		deps.Logger.Info("create_stemcell: server-download — volume already present, skipping download",
+		deps.Log(ctx).Info("create_stemcell: server-download — volume already present, skipping download",
 			log.String("volid", existingVol),
 		)
 		vmid, tmplErr := ensureTemplateVM(ctx, deps, templateNode, storage, qcow2Filename, cp.ExpectedSHA256, false, cp, cp.SourceURL)
@@ -130,7 +130,7 @@ func handleStemcellDownloadURL(
 				"create_stemcell: server-download: cannot parse task UPID from response: %s", upidErr.Error())
 		}
 		if upid != "" {
-			awaitErr := pve.AwaitTaskWithLogger(ctx, deps.PVE, node, upid, deps.Logger,
+			awaitErr := pve.AwaitTaskWithLogger(ctx, deps.PVE, node, upid, deps.Log(ctx),
 				pve.WithMaxWait(pve.StemcellMaxWait))
 			if awaitErr != nil {
 				// Task failure includes checksum mismatch reported by PVE.
@@ -144,7 +144,7 @@ func handleStemcellDownloadURL(
 				// the delete result so the cleanup never masks the original error.
 				volumePath := "import/" + qcow2Filename
 				if _, delErr := deps.PVE.Storage().DeleteVolumeIfExists(ctx, node, storage, volumePath); delErr != nil {
-					deps.Logger.Warn("create_stemcell: server-download: best-effort cleanup of partial volume failed (non-fatal)",
+					deps.Log(ctx).Warn("create_stemcell: server-download: best-effort cleanup of partial volume failed (non-fatal)",
 						log.String("volume", volumePath),
 						log.Err(delErr),
 					)
@@ -156,7 +156,7 @@ func handleStemcellDownloadURL(
 		}
 	}
 
-	deps.Logger.Info("create_stemcell: server-side download complete",
+	deps.Log(ctx).Info("create_stemcell: server-side download complete",
 		log.String("node", node),
 		log.String("storage", storage),
 		log.String("filename", qcow2Filename),
@@ -192,7 +192,7 @@ func handleStemcellDownloadURL(
 			"create_stemcell: server-download: cannot extract filename from volid %q", downloadedVol)
 	}
 
-	deps.Logger.Info("create_stemcell: server-download volume confirmed",
+	deps.Log(ctx).Info("create_stemcell: server-download volume confirmed",
 		log.String("volid", downloadedVol),
 		log.String("actual_filename", actualFilename),
 	)
@@ -208,7 +208,7 @@ func handleStemcellDownloadURL(
 	}
 
 	templateCID := pve.BuildTemplateStemcellCID(vmid)
-	deps.Logger.Info("create_stemcell: server-download stemcell ready",
+	deps.Log(ctx).Info("create_stemcell: server-download stemcell ready",
 		log.String("source_url", cp.SourceURL),
 		log.String("cid", templateCID),
 	)

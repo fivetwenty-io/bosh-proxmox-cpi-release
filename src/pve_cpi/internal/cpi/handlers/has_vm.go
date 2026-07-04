@@ -52,7 +52,7 @@ func HandleHasVM(deps Deps) cpi.Handler {
 			return nil, cpierrors.Cloud("has_vm: vm_cid %q must be a positive integer", vmCID)
 		}
 
-		logger := deps.Logger.With(log.String("method", "has_vm"), log.String("vm_cid", vmCID), log.Int("vmid", vmid))
+		logger := deps.Log(ctx).With(log.String("vm_cid", vmCID), log.Int("vmid", vmid))
 
 		// --- locate VM via cluster scan ---
 		// Queries /cluster/resources so the node returned is authoritative even

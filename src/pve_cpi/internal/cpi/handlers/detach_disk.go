@@ -51,7 +51,7 @@ func detachDiskResolveSlot(
 	if err != nil {
 		if pve.IsNotFound(err) {
 			// Volume gone — disk already detached from its perspective; idempotent.
-			deps.Logger.Warn("detach_disk: volume not found on any node, treating as already detached",
+			deps.Log(ctx).Warn("detach_disk: volume not found on any node, treating as already detached",
 				log.String("vm_cid", vmCID),
 				log.String("disk_cid", diskCID),
 			)
@@ -81,7 +81,7 @@ func detachDiskResolveSlot(
 				return "", "", false, sweepErr
 			}
 			if !swept {
-				deps.Logger.Warn("detach_disk: disk not attached to VM; skipping",
+				deps.Log(ctx).Warn("detach_disk: disk not attached to VM; skipping",
 					log.String("vm_cid", vmCID),
 					log.String("disk_cid", diskCID),
 					log.Err(err),
@@ -186,7 +186,7 @@ func HandleDetachDisk(deps Deps) Handler {
 		//   Snapshots present + AllowDiskOpsWithSnapshots=true  → WARN + proceed
 		//   No snapshots                                        → proceed normally
 		// --------------------------------------------------------------------
-		if err := detachDiskSnapshotGuard(ctx, deps, vmCID, node, vmid, diskCID, deps.Config, deps.Logger); err != nil {
+		if err := detachDiskSnapshotGuard(ctx, deps, vmCID, node, vmid, diskCID, deps.Config, deps.Log(ctx)); err != nil {
 			return nil, err
 		}
 
@@ -196,7 +196,7 @@ func HandleDetachDisk(deps Deps) Handler {
 		// SDK ≥ v3.1.2 sweeps any unusedN slot PVE auto-creates on detach,
 		// so the disk is fully removed from the VM config and survives a
 		// subsequent delete_vm DELETE. No additional cleanup required here.
-		if err := pve.RetryOnTransient(ctx, deps.Logger, "detach_disk", 0, func() error {
+		if err := pve.RetryOnTransient(ctx, deps.Log(ctx), "detach_disk", 0, func() error {
 			return deps.PVE.QEMU().DetachDisk(ctx, node, vmid, diskID)
 		}); err != nil {
 			wrapped := pve.WrapError(err)
@@ -206,7 +206,7 @@ func HandleDetachDisk(deps Deps) Handler {
 			return nil, cpierrors.Wrap(wrapped, fmt.Sprintf("detach_disk: DetachDisk failed for VM %s disk %s (diskID=%s)", vmCID, diskCID, diskID))
 		}
 
-		deps.Logger.Info("detach_disk",
+		deps.Log(ctx).Info("detach_disk",
 			log.String("vm_cid", vmCID),
 			log.String("disk_cid", diskCID),
 			log.String("disk_id", diskID),
@@ -241,7 +241,7 @@ func handleAlreadyDetachedParked(ctx context.Context, deps Deps, diskCID, bareDi
 		VMIDRangeEnd:   deps.Config.ParkedDiskVMIDRangeEndValue(),
 		DirectorID:     deps.Config.StemcellDirectorID(),
 	}
-	_, _, _, isParked, parkedErr := pve.IsDiskParked(ctx, deps.PVE, deps.Logger, bareDiskCID, parkerCfg)
+	_, _, _, isParked, parkedErr := pve.IsDiskParked(ctx, deps.PVE, deps.Log(ctx), bareDiskCID, parkerCfg)
 	if parkedErr != nil {
 		return cpierrors.WrapAs(parkedErr, cpierrors.TypeRetriableCloud,
 			fmt.Sprintf("detach_disk: already-detached parker check for disk %s", diskCID))
@@ -257,13 +257,13 @@ func handleAlreadyDetachedParked(ctx context.Context, deps Deps, diskCID, bareDi
 	// reached on a stale-Director retry where the disk was re-attached to a
 	// different VM after the original detach; parking it would double-reference
 	// the volume. Preserve the old idempotent warn+nil semantics.
-	heldByReal, realVMID, _, heldErr := pve.DiskHeldByRealVM(ctx, deps.PVE, deps.Logger, bareDiskCID, parkerCfg)
+	heldByReal, realVMID, _, heldErr := pve.DiskHeldByRealVM(ctx, deps.PVE, deps.Log(ctx), bareDiskCID, parkerCfg)
 	if heldErr != nil {
 		return cpierrors.WrapAs(heldErr, cpierrors.TypeRetriableCloud,
 			fmt.Sprintf("detach_disk: already-detached real-VM holder check for disk %s", diskCID))
 	}
 	if heldByReal {
-		deps.Logger.Warn("detach_disk: disk attached to a non-parker VM — skipping park (idempotent)",
+		deps.Log(ctx).Warn("detach_disk: disk attached to a non-parker VM — skipping park (idempotent)",
 			log.String("disk_cid", diskCID),
 			log.Int("holder_vmid", realVMID),
 		)
@@ -278,7 +278,7 @@ func handleAlreadyDetachedParked(ctx context.Context, deps Deps, diskCID, bareDi
 		}
 		return resolveErr
 	}
-	if parkErr := pve.ParkDisk(ctx, deps.PVE, deps.Logger, alreadyDetachedNode, bareDiskCID, parkerCfg, pve.ParkContext{DiskCID: diskCID}); parkErr != nil {
+	if parkErr := pve.ParkDisk(ctx, deps.PVE, deps.Log(ctx), alreadyDetachedNode, bareDiskCID, parkerCfg, pve.ParkContext{DiskCID: diskCID}); parkErr != nil {
 		return cpierrors.WrapAs(parkErr, cpierrors.TypeRetriableCloud,
 			fmt.Sprintf("detach_disk: park free-floating disk %s (fail-closed)", diskCID))
 	}
@@ -346,7 +346,7 @@ func parkAfterDetach(ctx context.Context, deps Deps, vmCID, diskCID, bareDiskCID
 		DirectorID:     deps.Config.StemcellDirectorID(),
 	}
 	pctx := pve.ParkContext{DiskCID: diskCID, SourceVMCID: vmCID}
-	if parkErr := pve.ParkDisk(ctx, deps.PVE, deps.Logger, node, bareDiskCID, parkerCfg, pctx); parkErr != nil {
+	if parkErr := pve.ParkDisk(ctx, deps.PVE, deps.Log(ctx), node, bareDiskCID, parkerCfg, pctx); parkErr != nil {
 		return cpierrors.WrapAs(parkErr, cpierrors.TypeRetriableCloud,
 			fmt.Sprintf("detach_disk: park disk %s after detach (fail-closed: retry will re-park)", diskCID))
 	}
@@ -408,7 +408,7 @@ func sweepUnusedDiskSlot(
 		if volid != diskCID {
 			continue
 		}
-		if sweepErr := pve.RetryOnTransient(ctx, deps.Logger, "detach_disk.sweep", 0, func() error {
+		if sweepErr := pve.RetryOnTransient(ctx, deps.Log(ctx), "detach_disk.sweep", 0, func() error {
 			return deps.PVE.QEMU().DetachDisk(ctx, node, vmid, slot)
 		}); sweepErr != nil {
 			if pve.IsNotFound(sweepErr) {
@@ -416,7 +416,7 @@ func sweepUnusedDiskSlot(
 			}
 			return false, cpierrors.Wrap(pve.WrapError(sweepErr), fmt.Sprintf("detach_disk: remove lingering unused slot %s for disk %s on VM %s", slot, diskCID, vmCID))
 		}
-		deps.Logger.Info("detach_disk: removed lingering unused disk slot",
+		deps.Log(ctx).Info("detach_disk: removed lingering unused disk slot",
 			log.String("vm_cid", vmCID),
 			log.String("slot", slot),
 			log.String("disk_cid", diskCID),

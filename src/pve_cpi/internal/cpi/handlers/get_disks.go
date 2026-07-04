@@ -86,7 +86,7 @@ func HandleGetDisks(deps Deps) Handler {
 			return nil, cpierrors.VMNotFound(vmCID)
 		}
 
-		deps.Logger.Debug("get_disks: VM located via cluster scan",
+		deps.Log(ctx).Debug("get_disks: VM located via cluster scan",
 			log.String("vm_cid", vmCID),
 			log.String("node", node),
 		)
@@ -121,7 +121,7 @@ func HandleGetDisks(deps Deps) Handler {
 			// Extract bare volid: the portion before the first comma.
 			bareVolid := bareVolidFromOptStr(optStr)
 			if bareVolid == "" {
-				deps.Logger.Warn("get_disks: skipping disk with empty volid",
+				deps.Log(ctx).Warn("get_disks: skipping disk with empty volid",
 					log.String("vm_cid", vmCID),
 					log.String("disk_slot", diskSlot),
 					log.String("opt_str", optStr),
@@ -132,7 +132,7 @@ func HandleGetDisks(deps Deps) Handler {
 			diskCIDs = append(diskCIDs, bareVolid)
 		}
 
-		deps.Logger.Info("get_disks",
+		deps.Log(ctx).Info("get_disks",
 			log.String("vm_cid", vmCID),
 			log.Int("disk_count", len(diskCIDs)),
 		)

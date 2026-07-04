@@ -319,12 +319,12 @@ func createNetworkSDN(
 		if createdZone {
 			rollbackCtx := contextWithoutCancel(ctx)
 			if delErr := clusterSvc.DeleteSdnZones(rollbackCtx, zone, nil); delErr != nil {
-				deps.Logger.Warn("create_network: rollback delete zone failed", log.Err(delErr))
+				deps.Log(rollbackCtx).Warn("create_network: rollback delete zone failed", log.Err(delErr))
 			}
 			// Apply rollback so the staged zone deletion is committed.
 			if applyErr := applySDN(rollbackCtx, deps, clusterSvc,
 				"create_network: rollback zone after vnet-create failure"); applyErr != nil {
-				deps.Logger.Warn(
+				deps.Log(rollbackCtx).Warn(
 					"create_network: rollback apply failed after zone delete",
 					log.Err(applyErr),
 				)
@@ -351,19 +351,19 @@ func createNetworkSDN(
 			rollbackCtx := contextWithoutCancel(ctx)
 			if vnetCreated {
 				if delErr := clusterSvc.DeleteSdnVnets(rollbackCtx, vnet, nil); delErr != nil {
-					deps.Logger.Warn("create_network: rollback delete vnet failed", log.Err(delErr))
+					deps.Log(rollbackCtx).Warn("create_network: rollback delete vnet failed", log.Err(delErr))
 				}
 			}
 			if createdZone {
 				if delErr := clusterSvc.DeleteSdnZones(rollbackCtx, zone, nil); delErr != nil {
-					deps.Logger.Warn("create_network: rollback delete zone failed", log.Err(delErr))
+					deps.Log(rollbackCtx).Warn("create_network: rollback delete zone failed", log.Err(delErr))
 				}
 			}
 			if vnetCreated || createdZone {
 				// Apply to commit the staged rollback deletions.
 				if applyErr := applySDN(rollbackCtx, deps, clusterSvc,
 					"create_network: rollback after subnet-create failure"); applyErr != nil {
-					deps.Logger.Warn(
+					deps.Log(rollbackCtx).Warn(
 						"create_network: rollback apply failed after subnet-create failure",
 						log.Err(applyErr),
 					)
@@ -385,17 +385,17 @@ func createNetworkSDN(
 		func() {
 			if subnetCreated {
 				if delErr := clusterSvc.DeleteSdnVnetsSubnets(rollbackCtx, vnet, spec.Range, nil); delErr != nil {
-					deps.Logger.Warn("create_network: rollback delete subnet failed", log.Err(delErr))
+					deps.Log(rollbackCtx).Warn("create_network: rollback delete subnet failed", log.Err(delErr))
 				}
 			}
 			if vnetCreated {
 				if delErr := clusterSvc.DeleteSdnVnets(rollbackCtx, vnet, nil); delErr != nil {
-					deps.Logger.Warn("create_network: rollback delete vnet failed", log.Err(delErr))
+					deps.Log(rollbackCtx).Warn("create_network: rollback delete vnet failed", log.Err(delErr))
 				}
 			}
 			if createdZone {
 				if delErr := clusterSvc.DeleteSdnZones(rollbackCtx, zone, nil); delErr != nil {
-					deps.Logger.Warn("create_network: rollback delete zone failed", log.Err(delErr))
+					deps.Log(rollbackCtx).Warn("create_network: rollback delete zone failed", log.Err(delErr))
 				}
 			}
 			// Apply to commit the staged rollback deletions. Every SDN mutation
@@ -403,7 +403,7 @@ func createNetworkSDN(
 			if subnetCreated || vnetCreated || createdZone {
 				if rb2Err := applySDN(rollbackCtx, deps, clusterSvc,
 					"create_network: rollback after apply failure"); rb2Err != nil {
-					deps.Logger.Warn(
+					deps.Log(rollbackCtx).Warn(
 						"create_network: rollback apply failed after main apply failure",
 						log.Err(rb2Err),
 					)

@@ -103,7 +103,7 @@ func detectIPConflict(
 	// Phase 1: list all VM resources from the cluster.
 	typeStr := "vm"
 	var resources *sdkcluster.ListResourcesResponse
-	listErr := pve.RetryOnTransient(ctx, deps.Logger, "detect_ip_conflict_list_resources", 0, func() error {
+	listErr := pve.RetryOnTransient(ctx, deps.Log(ctx), "detect_ip_conflict_list_resources", 0, func() error {
 		var inner error
 		resources, inner = deps.PVE.Cluster().ListResources(ctx, &sdkcluster.ListResourcesParams{Type: &typeStr})
 		return inner
@@ -192,7 +192,7 @@ func detectIPConflict(
 			if cfgErr != nil {
 				// Skip VMs whose config cannot be fetched (templates, ephemeral).
 				// This mirrors the skip policy in findVMsHostingDisk.
-				deps.Logger.Debug(
+				deps.Log(scanCtx).Debug(
 					"detect_ip_conflict: skipping VM config fetch error",
 					log.String("node", entry.Node),
 					log.Int("vmid", vmid),

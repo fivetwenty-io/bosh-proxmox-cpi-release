@@ -120,7 +120,7 @@ func HandleSnapshotDisk(deps Deps) Handler {
 		// operations on zfs/lvm/btrfs storages take the per-storage lock,
 		// so retry the submit+await pair on IsStorageLockTimeout.
 		// ----------------------------------------------------------------
-		serr := pve.RetryOnTransientOrLock(ctx, deps.Logger, "snapshot_disk", 0, func() error {
+		serr := pve.RetryOnTransientOrLock(ctx, deps.Log(ctx), "snapshot_disk", 0, func() error {
 			upid, e := deps.PVE.QEMU().Snapshot(ctx, node, vmid, snapName, snapOpts)
 			if e != nil {
 				return e
@@ -128,10 +128,10 @@ func HandleSnapshotDisk(deps Deps) Handler {
 			if upid == "" {
 				return nil
 			}
-			return pve.AwaitTaskWithLogger(ctx, deps.PVE, node, upid, deps.Logger)
+			return pve.AwaitTaskWithLogger(ctx, deps.PVE, node, upid, deps.Log(ctx))
 		})
 		if serr != nil {
-			deps.Logger.Error("snapshot_disk: Snapshot failed",
+			deps.Log(ctx).Error("snapshot_disk: Snapshot failed",
 				log.String("disk_cid", diskCID),
 				log.Int("vmid", vmid),
 				log.String("snap_name", snapName),
@@ -145,7 +145,7 @@ func HandleSnapshotDisk(deps Deps) Handler {
 		// ----------------------------------------------------------------
 		snapshotCID := pve.FormatSnapshotCID(strconv.Itoa(vmid), snapName)
 
-		deps.Logger.Info("snapshot_disk",
+		deps.Log(ctx).Info("snapshot_disk",
 			log.String("disk_cid", diskCID),
 			log.Int("vmid", vmid),
 			log.String("snap_name", snapName),

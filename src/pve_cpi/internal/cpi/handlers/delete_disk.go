@@ -27,8 +27,8 @@ func unparkBeforeDelete(ctx context.Context, deps Deps, diskCID, bareDiskCID str
 	// UnparkDisk re-runs the is-parked check internally and is idempotent when
 	// the disk is not parked, so calling it directly avoids a redundant
 	// cluster scan and the TOCTOU window a separate IsDiskParked probe opens.
-	if unparkErr := pve.UnparkDisk(ctx, deps.PVE, deps.Logger, bareDiskCID, parkerCfg); unparkErr != nil {
-		deps.Logger.Info("delete_disk: unpark failed, returning retriable error",
+	if unparkErr := pve.UnparkDisk(ctx, deps.PVE, deps.Log(ctx), bareDiskCID, parkerCfg); unparkErr != nil {
+		deps.Log(ctx).Info("delete_disk: unpark failed, returning retriable error",
 			log.String("disk_cid", diskCID),
 		)
 		return cpierrors.Wrap(unparkErr, "delete_disk: unpark before delete")
@@ -94,7 +94,7 @@ func HandleDeleteDisk(deps Deps) Handler {
 		node, err := backend.NodeForExisting(ctx, bareDiskCID)
 		if err != nil {
 			if pve.IsNotFound(err) {
-				deps.Logger.Info("delete_disk: volume not found on any node, treating as already-deleted",
+				deps.Log(ctx).Info("delete_disk: volume not found on any node, treating as already-deleted",
 					log.String("disk_cid", diskCID),
 				)
 				return nil, nil
@@ -114,7 +114,7 @@ func HandleDeleteDisk(deps Deps) Handler {
 		// ----------------------------------------------------------------
 		if deps.Config.DiskDeleteStateGuardEnabled() {
 			if guardErr := pve.GuardDiskDeleteState(ctx, deps.PVE, node, bareDiskCID); guardErr != nil {
-				deps.Logger.Info("delete_disk: deferring delete, attached VM busy or holder state unresolved",
+				deps.Log(ctx).Info("delete_disk: deferring delete, attached VM busy or holder state unresolved",
 					log.String("disk_cid", diskCID),
 				)
 				return nil, cpierrors.Wrap(guardErr, "delete_disk")
@@ -147,7 +147,7 @@ func HandleDeleteDisk(deps Deps) Handler {
 		// returned imgdel UPID so a queued imgdel under storage-lock contention
 		// cannot fire after delete_disk has already returned success.
 		// ----------------------------------------------------------------
-		delErr := pve.RetryOnTransientOrLock(ctx, deps.Logger, "delete_disk", 0, func() error {
+		delErr := pve.RetryOnTransientOrLock(ctx, deps.Log(ctx), "delete_disk", 0, func() error {
 			upid, err := deps.PVE.Storage().DeleteVolumeAsync(ctx, node, storage, bareDiskCID)
 			if err != nil {
 				return err
@@ -159,14 +159,14 @@ func HandleDeleteDisk(deps Deps) Handler {
 			if upid == "" {
 				return nil
 			}
-			return pve.AwaitTaskWithLogger(ctx, deps.PVE, node, upid, deps.Logger)
+			return pve.AwaitTaskWithLogger(ctx, deps.PVE, node, upid, deps.Log(ctx))
 		})
 		if err := delErr; err != nil {
 			// Check whether the error is a not-found variant. The SDK
 			// DeleteVolume already swallows 404 internally, but if a
 			// non-SDK not-found surfaces we still treat it as success.
 			if pve.IsNotFound(err) {
-				deps.Logger.Info("delete_disk: disk already absent, skipping",
+				deps.Log(ctx).Info("delete_disk: disk already absent, skipping",
 					log.String("disk_cid", diskCID),
 				)
 				return nil, nil
@@ -174,7 +174,7 @@ func HandleDeleteDisk(deps Deps) Handler {
 			return nil, cpierrors.Wrap(err, "delete_disk: DeleteVolume failed for "+diskCID+" on node "+node)
 		}
 
-		deps.Logger.Info("delete_disk", log.String("disk_cid", diskCID), log.String("node", node))
+		deps.Log(ctx).Info("delete_disk", log.String("disk_cid", diskCID), log.String("node", node))
 		return nil, nil
 	})
 }

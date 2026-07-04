@@ -521,7 +521,7 @@ func HandleCreateStemcell(deps Deps) cpi.Handler {
 		// sha256hex is returned alongside the CID so the template tag can be set
 		// without a second file-read pass.
 		dedup, buildErr := buildAndDeduplicateStemcellCID(
-			ctx, deps, node, storage, imagePath, cp, deps.Logger)
+			ctx, deps, node, storage, imagePath, cp, deps.Log(ctx))
 		if buildErr != nil {
 			return nil, buildErr
 		}
@@ -567,7 +567,7 @@ func HandleCreateStemcell(deps Deps) cpi.Handler {
 			if deps.Config.StemcellReplicateLocal && sha256hex != "" {
 				clusterNodes, listErr := listClusterNodes(ctx, deps)
 				if listErr != nil {
-					deps.Logger.Warn("create_stemcell: replication (dedup): cannot list cluster nodes (skipping)",
+					deps.Log(ctx).Warn("create_stemcell: replication (dedup): cannot list cluster nodes (skipping)",
 						log.Err(listErr),
 					)
 				} else if len(clusterNodes) > 1 {
@@ -585,7 +585,7 @@ func HandleCreateStemcell(deps Deps) cpi.Handler {
 
 		// Step 11: Upload qcow2 to storage. uploadSourcePath is reused so the
 		// tarball case extracts only once.
-		if _, uploadErr := uploadAndReturnCID(ctx, deps, node, storage, imagePath, uploadSourcePath, cp, stemcellCID, deps.Logger); uploadErr != nil {
+		if _, uploadErr := uploadAndReturnCID(ctx, deps, node, storage, imagePath, uploadSourcePath, cp, stemcellCID, deps.Log(ctx)); uploadErr != nil {
 			return nil, uploadErr
 		}
 
@@ -604,7 +604,7 @@ func HandleCreateStemcell(deps Deps) cpi.Handler {
 		if deps.Config.StemcellReplicateLocal {
 			clusterNodes, listErr := listClusterNodes(ctx, deps)
 			if listErr != nil {
-				deps.Logger.Warn("create_stemcell: replication: cannot list cluster nodes (skipping replication)",
+				deps.Log(ctx).Warn("create_stemcell: replication: cannot list cluster nodes (skipping replication)",
 					log.Err(listErr),
 				)
 			} else if len(clusterNodes) > 1 {
@@ -663,7 +663,7 @@ func ensureTemplateVM(
 	cp stemcellCloudProps,
 	source string,
 ) (vmid int64, err error) {
-	logger := deps.Logger
+	logger := deps.Log(ctx)
 
 	// Step 1: Build deterministic template name (idempotency key).
 	templateName := pve.BuildTemplateName(cp.Name, cp.Version)
@@ -1377,7 +1377,7 @@ func handleLightStemcellPreUploaded(
 	}
 
 	templateCID := pve.BuildTemplateStemcellCID(vmid)
-	deps.Logger.Info("create_stemcell: light stemcell (pre-uploaded) template ready",
+	deps.Log(ctx).Info("create_stemcell: light stemcell (pre-uploaded) template ready",
 		log.String("image_id", imageID),
 		log.String("storage", storage),
 		log.String("node", node),
@@ -1440,7 +1440,7 @@ func handleLightStemcellFetch(
 		return nil, cpierrors.Cloud("create_stemcell: resolve credentials: %s", credErr.Error())
 	}
 	if creds.Kind() == "none" {
-		deps.Logger.Warn("create_stemcell: fetching stemcell without credentials",
+		deps.Log(ctx).Warn("create_stemcell: fetching stemcell without credentials",
 			log.String("image_url", cp.ImageURL),
 		)
 	}
@@ -1482,7 +1482,7 @@ func handleLightStemcellFetch(
 		if strings.HasPrefix(existingVol, storage+":") {
 			extractedName := fetchExtractFilename(existingVol)
 			if extractedName != "" {
-				deps.Logger.Info("create_stemcell: light fetch — existing stemcell found by prefix, building template",
+				deps.Log(ctx).Info("create_stemcell: light fetch — existing stemcell found by prefix, building template",
 					log.String("volid", existingVol),
 				)
 				// sha256hex unknown (prefix-dedup, no download); pass "" for tag (non-fatal).
@@ -1545,7 +1545,7 @@ func handleLightStemcellFetch(
 		return nil, cpierrors.Wrap(syncErr, "create_stemcell: sync fetch temp file")
 	}
 
-	deps.Logger.Info("create_stemcell: light fetch streamed to temp file",
+	deps.Log(ctx).Info("create_stemcell: light fetch streamed to temp file",
 		log.Int64("bytes_written", written),
 		log.Int64("content_length", contentLength),
 		log.String("sha256", sha256hex),
@@ -1553,7 +1553,7 @@ func handleLightStemcellFetch(
 
 	// Verify expected digest when supplied in cloud_properties.
 	// Light-fetch path: source is network (retriable on mismatch).
-	if verifyErr := verifyExpectedDigest(ctx, deps.Logger, cp, sha256hex, tmpPath, "", stemcellSourceNetwork); verifyErr != nil {
+	if verifyErr := verifyExpectedDigest(ctx, deps.Log(ctx), cp, sha256hex, tmpPath, "", stemcellSourceNetwork); verifyErr != nil {
 		return nil, verifyErr
 	}
 
@@ -1570,7 +1570,7 @@ func handleLightStemcellFetch(
 	}
 
 	if existingVol != "" {
-		deps.Logger.Info("create_stemcell: light fetch — SHA-matched existing stemcell, building template",
+		deps.Log(ctx).Info("create_stemcell: light fetch — SHA-matched existing stemcell, building template",
 			log.String("volid", existingVol),
 		)
 		// SHA-dedup: qcow2 already on storage. Build/reuse template.
@@ -1601,7 +1601,7 @@ func handleLightStemcellFetch(
 	}
 
 	templateCID := pve.BuildTemplateStemcellCID(fetchVMID)
-	deps.Logger.Info("create_stemcell: light stemcell (fetched) template ready",
+	deps.Log(ctx).Info("create_stemcell: light stemcell (fetched) template ready",
 		log.String("image_url", cp.ImageURL),
 		log.String("source_scheme", ref.Scheme),
 		log.String("creds_kind", creds.Kind()),
@@ -1752,7 +1752,7 @@ func validateStemcellStorageShared(ctx context.Context, deps Deps, storage strin
 	backend, resolveErr := backendResolverOrDefault(deps).Resolve(ctx, storage)
 	if resolveErr != nil {
 		// Cannot classify storage. Warn and continue — safe for single-node.
-		deps.Logger.Warn("create_stemcell: cannot resolve storage backend; skipping shared-storage check",
+		deps.Log(ctx).Warn("create_stemcell: cannot resolve storage backend; skipping shared-storage check",
 			log.String("storage", storage),
 			log.Err(resolveErr),
 		)
@@ -1767,7 +1767,7 @@ func validateStemcellStorageShared(ctx context.Context, deps Deps, storage strin
 	// Storage is local. Check cluster size to decide whether to reject.
 	clusterSize, sizeErr := clusterNodeCount(ctx, deps)
 	if sizeErr != nil {
-		deps.Logger.Warn("create_stemcell: cannot determine cluster node count; skipping shared-storage check",
+		deps.Log(ctx).Warn("create_stemcell: cannot determine cluster node count; skipping shared-storage check",
 			log.String("storage", storage),
 			log.Err(sizeErr),
 		)
@@ -2220,7 +2220,7 @@ func uploadStemcellImage(
 	// 0"). Our outer RetryOnTransientOrLock reopens the file each iteration
 	// so transient failures retry with a fresh stream.
 	uploadCtx := sdkclient.WithRetries(ctx, 0)
-	rerr := pve.RetryOnTransientOrLock(ctx, deps.Logger, "create_stemcell_upload", 0, func() error {
+	rerr := pve.RetryOnTransientOrLock(ctx, deps.Log(ctx), "create_stemcell_upload", 0, func() error {
 		f, openErr := openStagedFile(stagingDir, imagePath)
 		if openErr != nil {
 			return cpierrors.Cloud("uploadStemcellImage: open %s: %s", imagePath, openErr.Error())
@@ -2234,7 +2234,7 @@ func uploadStemcellImage(
 		if upid == "" {
 			return nil
 		}
-		return pve.AwaitTaskWithLogger(ctx, deps.PVE, node, upid, deps.Logger,
+		return pve.AwaitTaskWithLogger(ctx, deps.PVE, node, upid, deps.Log(ctx),
 			pve.WithMaxWait(pve.StemcellMaxWait))
 	})
 	if rerr != nil {
@@ -2415,7 +2415,7 @@ func listClusterNodes(ctx context.Context, deps Deps) ([]string, error) {
 //
 // Concurrency safety:
 //   - uploadStemcellImage opens its own file handle per call — no shared *os.File.
-//   - deps.Logger.With(...) returns a new zap logger; zap is concurrency-safe.
+//   - deps.Log(ctx).With(...) returns a new zap logger; zap is concurrency-safe.
 //   - deps.Inflight.acquire keys by node name and uses sync.Mutex internally — safe
 //     under concurrent different-node calls from multiple goroutines.
 //   - VMID allocation uses AllocateWithRetry which regenerates on conflict — safe
@@ -2434,7 +2434,7 @@ func replicateStemcellToNodes(
 	if len(sha8) > 8 {
 		sha8 = sha8[:8]
 	}
-	logger := deps.Logger
+	logger := deps.Log(ctx)
 
 	// Determine worker pool size. 0 or absent resolves to 1 (serial).
 	workerLimit := 1
@@ -2604,7 +2604,7 @@ func ensureReplicaTemplateVM(
 	if len(sha8) > 8 {
 		sha8 = sha8[:8]
 	}
-	logger := deps.Logger
+	logger := deps.Log(ctx)
 
 	// Build deterministic template name (same as primary, differentiator is tag).
 	templateName := pve.BuildTemplateName(cp.Name, cp.Version)

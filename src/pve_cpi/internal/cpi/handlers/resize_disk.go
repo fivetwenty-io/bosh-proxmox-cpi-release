@@ -123,14 +123,14 @@ func HandleResizeDisk(deps Deps) Handler {
 					snapErr.Error(),
 				)
 			}
-			deps.Logger.Warn("resize_disk: snapshot pre-flight check failed — proceeding (fail-open)",
+			deps.Log(ctx).Warn("resize_disk: snapshot pre-flight check failed — proceeding (fail-open)",
 				log.String("node", node),
 				log.Int("vmid", vmid),
 				log.Err(snapErr),
 			)
 		} else if len(snapNames) > 0 {
 			if deps.Config.AllowDiskOpsWithSnapshots {
-				deps.Logger.Warn("resize_disk: proceeding despite snapshots (allow_disk_ops_with_snapshots=true)",
+				deps.Log(ctx).Warn("resize_disk: proceeding despite snapshots (allow_disk_ops_with_snapshots=true)",
 					log.Int("vmid", vmid),
 					log.String("node", node),
 					log.String("snapshots", strings.Join(snapNames, ", ")),
@@ -185,7 +185,7 @@ func HandleResizeDisk(deps Deps) Handler {
 		}
 
 		if deltaGiB == 0 {
-			deps.Logger.Info("resize_disk: no-op, disk already at or above requested size",
+			deps.Log(ctx).Info("resize_disk: no-op, disk already at or above requested size",
 				log.String("disk_cid", diskCID),
 				log.Int("current_gib", currentGiB),
 				log.Int("new_size_mb", newSizeMB),
@@ -199,7 +199,7 @@ func HandleResizeDisk(deps Deps) Handler {
 		// task can fail with "can't lock file ... got timeout". Retry the
 		// submit+await pair on that signal; non-lock errors propagate.
 		// ----------------------------------------------------------------
-		rerr := pve.RetryOnTransientOrLock(ctx, deps.Logger, "resize_disk", 0, func() error {
+		rerr := pve.RetryOnTransientOrLock(ctx, deps.Log(ctx), "resize_disk", 0, func() error {
 			upid, e := deps.PVE.QEMU().ResizeDisk(ctx, node, vmid, diskID, deltaGiB)
 			if e != nil {
 				return e
@@ -207,7 +207,7 @@ func HandleResizeDisk(deps Deps) Handler {
 			if upid == "" {
 				return nil
 			}
-			return pve.AwaitTaskWithLogger(ctx, deps.PVE, node, upid, deps.Logger)
+			return pve.AwaitTaskWithLogger(ctx, deps.PVE, node, upid, deps.Log(ctx))
 		})
 		if rerr != nil {
 			return nil, cpierrors.Wrap(pve.WrapError(rerr), fmt.Sprintf("resize_disk: ResizeDisk failed for VM %d disk %s (+%dG)", vmid, diskCID, deltaGiB))
@@ -223,7 +223,7 @@ func HandleResizeDisk(deps Deps) Handler {
 			waitForResizeConvergence(ctx, deps, node, vmid, diskID, currentGiB+deltaGiB, timeout)
 		}
 
-		deps.Logger.Info("resize_disk",
+		deps.Log(ctx).Info("resize_disk",
 			log.String("disk_cid", diskCID),
 			log.Int("vmid", vmid),
 			log.String("disk_id", diskID),
@@ -262,7 +262,7 @@ func waitForResizeConvergence(
 	for {
 		cfg, err := deps.PVE.QEMU().Config(cctx, node, vmid)
 		if err != nil {
-			deps.Logger.Debug("resize_disk: convergence poll config read failed — retrying",
+			deps.Log(cctx).Debug("resize_disk: convergence poll config read failed — retrying",
 				log.Int("vmid", vmid),
 				log.String("disk_id", diskID),
 				log.Err(err),
@@ -273,14 +273,14 @@ func waitForResizeConvergence(
 			case perr != nil:
 				// Unparseable size= keeps polling until the bound; log so a
 				// permanently-malformed value is visible rather than silent.
-				deps.Logger.Debug("resize_disk: convergence poll could not parse disk size — retrying",
+				deps.Log(cctx).Debug("resize_disk: convergence poll could not parse disk size — retrying",
 					log.Int("vmid", vmid),
 					log.String("disk_id", diskID),
 					log.String("disk_opt", optStr),
 					log.Err(perr),
 				)
 			case gib >= targetGiB:
-				deps.Logger.Info("resize_disk: size converged",
+				deps.Log(cctx).Info("resize_disk: size converged",
 					log.Int("vmid", vmid),
 					log.String("disk_id", diskID),
 					log.Int("reported_gib", gib),
@@ -292,7 +292,7 @@ func waitForResizeConvergence(
 
 		select {
 		case <-cctx.Done():
-			deps.Logger.Warn("resize_disk: disk size did not converge within budget — proceeding (best-effort)",
+			deps.Log(cctx).Warn("resize_disk: disk size did not converge within budget — proceeding (best-effort)",
 				log.Int("vmid", vmid),
 				log.String("disk_id", diskID),
 				log.Int("target_gib", targetGiB),

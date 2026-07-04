@@ -163,6 +163,13 @@ func (d *Dispatcher) Register(method string, h Handler) error {
 //     context and request_id, log the stack trace at error level.
 //
 // Every dispatch is logged at Info level with method, request_id, and duration_ms.
+//
+// Every log line below also carries trace_id/span_id (via requestFields,
+// which appends log.SpanFields(ctx)) when ctx carries a valid OTel span —
+// e.g. the root span cmd/cpi's runCPI starts before calling Handle. d.logger
+// is the fixed process-startup logger (not derived from ctx via WithContext),
+// so appending SpanFields never duplicates the method/request_id fields each
+// line already attaches explicitly.
 func (d *Dispatcher) Handle(ctx context.Context, req *jsonrpc.Request) (resp *jsonrpc.Response) {
 	start := time.Now()
 
@@ -184,12 +191,10 @@ func (d *Dispatcher) Handle(ctx context.Context, req *jsonrpc.Request) (resp *js
 	defer func() {
 		if r := recover(); r != nil {
 			stack := debug.Stack()
-			d.logger.Error("handler panic recovered",
-				log.String("method", method),
-				log.String("request_id", requestID),
+			d.logger.Error("handler panic recovered", requestFields(ctx, method, requestID,
 				log.Any("panic", r),
 				log.String("stack", string(stack)),
-			)
+			)...)
 			resp = errorResponse(cpierrors.Cloud("panic in %s [request_id=%s]: %v", method, requestID, r))
 		}
 	}()
@@ -206,12 +211,10 @@ func (d *Dispatcher) Handle(ctx context.Context, req *jsonrpc.Request) (resp *js
 	// for a non-canonical name (impossible via Register but defensive), the
 	// Director never receives a response for it.
 	if _, allowed := d.allowedNames[req.Method]; !allowed {
-		d.logger.Info("dispatch",
-			log.String("method", req.Method),
-			log.String("request_id", req.Context.RequestID),
+		d.logger.Info("dispatch", requestFields(ctx, req.Method, req.Context.RequestID,
 			log.Float64("duration_ms", float64(time.Since(start).Microseconds())/1000.0),
 			log.String("outcome", "method_not_found"),
-		)
+		)...)
 		return errorResponse(cpierrors.Cloud("method not found: %s", req.Method))
 	}
 
@@ -219,12 +222,10 @@ func (d *Dispatcher) Handle(ctx context.Context, req *jsonrpc.Request) (resp *js
 	h, ok := d.handlers[req.Method]
 	d.mu.RUnlock()
 	if !ok {
-		d.logger.Info("dispatch",
-			log.String("method", req.Method),
-			log.String("request_id", req.Context.RequestID),
+		d.logger.Info("dispatch", requestFields(ctx, req.Method, req.Context.RequestID,
 			log.Float64("duration_ms", float64(time.Since(start).Microseconds())/1000.0),
 			log.String("outcome", "unknown_method"),
-		)
+		)...)
 		return errorResponse(cpierrors.Cloud("unknown method: %s", req.Method))
 	}
 
@@ -243,7 +244,7 @@ func (d *Dispatcher) Handle(ctx context.Context, req *jsonrpc.Request) (resp *js
 		}
 	}
 
-	d.traceRequest(req.Method, requestID, req.Arguments)
+	d.traceRequest(ctx, req.Method, requestID, req.Arguments)
 
 	result, err := h.Handle(callCtx, req.Arguments, req.Context)
 
@@ -259,13 +260,11 @@ func (d *Dispatcher) Handle(ctx context.Context, req *jsonrpc.Request) (resp *js
 	// cause was shutdown, so we additionally require the parent to be live.
 	if err != nil && budget > 0 && callCtx.Err() == context.DeadlineExceeded && ctx.Err() == nil {
 		durationMS := float64(time.Since(start).Microseconds()) / 1000.0
-		d.logger.Info("dispatch",
-			log.String("method", req.Method),
-			log.String("request_id", req.Context.RequestID),
+		d.logger.Info("dispatch", requestFields(ctx, req.Method, req.Context.RequestID,
 			log.Float64("duration_ms", durationMS),
 			log.String("outcome", "timeout"),
 			log.Err(err),
-		)
+		)...)
 		return dispatchError(cpierrors.Retriable(
 			"operation %s exceeded its %s deadline [request_id=%s]; aborted and may be retried",
 			req.Method, budget, requestID))
@@ -274,13 +273,11 @@ func (d *Dispatcher) Handle(ctx context.Context, req *jsonrpc.Request) (resp *js
 	durationMS := float64(time.Since(start).Microseconds()) / 1000.0
 	if err != nil {
 		outcome := "error"
-		d.logger.Info("dispatch",
-			log.String("method", req.Method),
-			log.String("request_id", req.Context.RequestID),
+		d.logger.Info("dispatch", requestFields(ctx, req.Method, req.Context.RequestID,
 			log.Float64("duration_ms", durationMS),
 			log.String("outcome", outcome),
 			log.Err(err),
-		)
+		)...)
 		return dispatchError(err)
 	}
 
@@ -288,24 +285,20 @@ func (d *Dispatcher) Handle(ctx context.Context, req *jsonrpc.Request) (resp *js
 	// a CloudError rather than a silent null or a panic.
 	raw, marshalErr := json.Marshal(result)
 	if marshalErr != nil {
-		d.logger.Info("dispatch",
-			log.String("method", req.Method),
-			log.String("request_id", req.Context.RequestID),
+		d.logger.Info("dispatch", requestFields(ctx, req.Method, req.Context.RequestID,
 			log.Float64("duration_ms", durationMS),
 			log.String("outcome", "marshal_error"),
 			log.Err(marshalErr),
-		)
+		)...)
 		return errorResponse(cpierrors.Cloud("result marshal failed: %s", marshalErr.Error()))
 	}
 
-	d.traceResponse(req.Method, requestID, result)
+	d.traceResponse(ctx, req.Method, requestID, result)
 
-	d.logger.Info("dispatch",
-		log.String("method", req.Method),
-		log.String("request_id", req.Context.RequestID),
+	d.logger.Info("dispatch", requestFields(ctx, req.Method, req.Context.RequestID,
 		log.Float64("duration_ms", durationMS),
 		log.String("outcome", "ok"),
-	)
+	)...)
 
 	return &jsonrpc.Response{
 		Result: json.RawMessage(raw),
@@ -404,6 +397,19 @@ func NewMethodTimeoutResolver(create, del, query, def time.Duration) func(string
 // internal helpers
 // --------------------------------------------------------------------------
 
+// requestFields builds the field list for one dispatcher log line: method and
+// request_id (explicit, always present), trace_id/span_id from ctx when a
+// valid OTel span is attached (via log.SpanFields — nil/empty when tracing is
+// inactive, so byte-identical output to prior releases in that case), then
+// any call-specific extra fields (duration_ms, outcome, error, ...).
+func requestFields(ctx context.Context, method, requestID string, extra ...log.Field) []log.Field {
+	fields := make([]log.Field, 0, 4+len(extra))
+	fields = append(fields, log.String("method", method), log.String("request_id", requestID))
+	fields = append(fields, log.SpanFields(ctx)...)
+	fields = append(fields, extra...)
+	return fields
+}
+
 // traceRequest emits a debug-level, credential-masked trace of a request's
 // argument tree. It is a no-op unless the request trace is enabled, so a
 // dispatcher without WithRequestTrace produces byte-identical log output. Each
@@ -411,7 +417,7 @@ func NewMethodTimeoutResolver(create, del, query, def time.Duration) func(string
 // log.RedactSecrets; an argument that fails to decode is logged as an opaque
 // placeholder rather than its raw bytes, so a malformed payload can never leak
 // an unredacted credential.
-func (d *Dispatcher) traceRequest(method, requestID string, args []json.RawMessage) {
+func (d *Dispatcher) traceRequest(ctx context.Context, method, requestID string, args []json.RawMessage) {
 	if !d.requestTrace {
 		return
 	}
@@ -424,11 +430,9 @@ func (d *Dispatcher) traceRequest(method, requestID string, args []json.RawMessa
 		}
 		redacted[i] = log.RedactSecrets(tree)
 	}
-	d.logger.Debug("cpi request",
-		log.String("method", method),
-		log.String("request_id", requestID),
+	d.logger.Debug("cpi request", requestFields(ctx, method, requestID,
 		log.Any("arguments", redacted),
-	)
+	)...)
 }
 
 // traceResponse emits a debug-level, credential-masked trace of a handler's
@@ -436,7 +440,7 @@ func (d *Dispatcher) traceRequest(method, requestID string, args []json.RawMessa
 // result is round-tripped through JSON so that a typed struct is normalized to
 // the same generic tree shape RedactSecrets operates on; a result that fails to
 // marshal is logged as an opaque placeholder.
-func (d *Dispatcher) traceResponse(method, requestID string, result any) {
+func (d *Dispatcher) traceResponse(ctx context.Context, method, requestID string, result any) {
 	if !d.requestTrace {
 		return
 	}
@@ -446,11 +450,9 @@ func (d *Dispatcher) traceResponse(method, requestID string, result any) {
 	} else if err := json.Unmarshal(raw, &tree); err != nil {
 		tree = "<unparsable result>"
 	}
-	d.logger.Debug("cpi response",
-		log.String("method", method),
-		log.String("request_id", requestID),
+	d.logger.Debug("cpi response", requestFields(ctx, method, requestID,
 		log.Any("result", log.RedactSecrets(tree)),
-	)
+	)...)
 }
 
 // dispatchError converts any error returned by a handler to a *jsonrpc.Response.

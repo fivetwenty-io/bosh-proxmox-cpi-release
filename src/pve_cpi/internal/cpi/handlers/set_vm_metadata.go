@@ -81,8 +81,7 @@ func HandleSetVMMetadata(deps Deps) cpi.Handler {
 			}
 		}
 
-		logger := deps.Logger.With(
-			log.String("method", "set_vm_metadata"),
+		logger := deps.Log(ctx).With(
 			log.String("vm_cid", vmCID),
 			log.Int("vmid", vmid),
 		)

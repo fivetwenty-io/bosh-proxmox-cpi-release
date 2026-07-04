@@ -365,7 +365,7 @@ func createVM(
 	deps Deps,
 	args []json.RawMessage,
 ) (result any, retErr error) {
-	logger := deps.Logger
+	logger := deps.Log(ctx)
 
 	// -----------------------------------------------------------------------
 	// 1. Parse + validate arguments
@@ -1092,7 +1092,7 @@ func buildVMShapeForNode(ctx context.Context, deps Deps, parsed *createVMParsedA
 	if err != nil {
 		return nil, err
 	}
-	if err := enforceEphemeralMinSize(deps.Config, deps.Logger, ephemeralDiskGiB, memMiB); err != nil {
+	if err := enforceEphemeralMinSize(deps.Config, deps.Log(ctx), ephemeralDiskGiB, memMiB); err != nil {
 		return nil, err
 	}
 
@@ -1217,13 +1217,11 @@ func resolveTargetNodeWithRNG(
 	rng *rand.Rand,
 	cloudPropsMap map[string]any,
 ) (string, error) {
-	// Nil-guard the logger: internal unit tests that call resolveVMShape directly
-	// may leave deps.Logger unset. Use a nop logger in that case so logging calls
-	// are safe without requiring all callers to set a logger.
-	logger := deps.Logger
-	if logger == nil {
-		logger = log.NewNopLogger()
-	}
+	// deps.Log(ctx) is nil-Logger-safe (falls back to a nop logger) and, when
+	// ctx carries the per-request span-correlated logger, returns that one
+	// instead of deps.Logger — internal unit tests that call resolveVMShape
+	// directly with a bare ctx and no Deps.Logger still get a safe no-op.
+	logger := deps.Log(ctx)
 
 	// Derive hard fault-domain constraints from persistent disk CIDs before any
 	// placement decision. Bare legacy CIDs (no metadata) impose no constraint.
@@ -1536,10 +1534,10 @@ func resolveTargetNodeWithFallbacks(
 	cloudPropsMap map[string]any,
 	fallbackMax int,
 ) (winner string, alternates []string, err error) {
-	logger := deps.Logger
-	if logger == nil {
-		logger = log.NewNopLogger()
-	}
+	// deps.Log(ctx) is nil-Logger-safe and prefers ctx's per-request
+	// span-correlated logger over deps.Logger when present (see
+	// resolveTargetNodeWithRNG above for the full rationale).
+	logger := deps.Log(ctx)
 
 	diskConstraints, dcErr := deriveDiskFaultConstraints(ctx, deps, diskCIDs)
 	if dcErr != nil {
@@ -3644,12 +3642,10 @@ func resolveEphemeralStorage(
 		lister = deps.PVE.ClusterStorage()
 	}
 	warnEncrypted := func(tier, pool string) {
-		if deps.Logger != nil {
-			deps.Logger.Warn("create_vm: selected encrypted ephemeral storage tier — CPI cannot verify pool encryption; operator responsibility",
-				log.String("tier", tier),
-				log.String("pool", pool),
-			)
-		}
+		deps.Log(ctx).Warn("create_vm: selected encrypted ephemeral storage tier — CPI cannot verify pool encryption; operator responsibility",
+			log.String("tier", tier),
+			log.String("pool", pool),
+		)
 	}
 
 	if encrypted {

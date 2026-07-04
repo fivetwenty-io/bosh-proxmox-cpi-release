@@ -69,7 +69,7 @@ func HandleHasDisk(deps Deps) Handler {
 		node, err := backend.NodeForExisting(ctx, bareDiskCID)
 		if err != nil {
 			if pve.IsNotFound(err) {
-				deps.Logger.Debug("has_disk: backend reports volume not present on any node",
+				deps.Log(ctx).Debug("has_disk: backend reports volume not present on any node",
 					log.String("disk_cid", diskCID),
 				)
 				return false, nil
@@ -90,7 +90,7 @@ func HandleHasDisk(deps Deps) Handler {
 			// Belt-and-braces: any not-found classification surfacing through
 			// a non-Exists path still resolves to false.
 			if pve.IsVolumeMissing(err) {
-				deps.Logger.Debug("has_disk: not found via error path, returning false",
+				deps.Log(ctx).Debug("has_disk: not found via error path, returning false",
 					log.String("disk_cid", diskCID),
 				)
 				return false, nil
@@ -98,7 +98,7 @@ func HandleHasDisk(deps Deps) Handler {
 			return nil, cpierrors.Wrap(err, "has_disk: Exists check failed for "+diskCID+" on node "+node)
 		}
 
-		deps.Logger.Debug("has_disk", log.String("disk_cid", diskCID), log.Bool("exists", exists))
+		deps.Log(ctx).Debug("has_disk", log.String("disk_cid", diskCID), log.Bool("exists", exists))
 		return exists, nil
 	})
 }

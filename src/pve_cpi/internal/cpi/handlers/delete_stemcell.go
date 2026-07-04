@@ -81,7 +81,7 @@ func HandleDeleteStemcell(deps Deps) cpi.Handler {
 		// tooling (pvesm free) when ready.
 		// ----------------------------------------------------------------
 		if pve.IsLightStemcellCID(cidStr) {
-			deps.Logger.Info("delete_stemcell: light stemcell CID, skipping delete (operator-managed)",
+			deps.Log(ctx).Info("delete_stemcell: light stemcell CID, skipping delete (operator-managed)",
 				log.String("stemcell_cid", cidStr),
 			)
 			return nil, nil
@@ -96,7 +96,7 @@ func HandleDeleteStemcell(deps Deps) cpi.Handler {
 		// qcow2 file must be cleaned up out-of-band on the PVE host.
 		// ----------------------------------------------------------------
 		if pve.IsLegacyIntegerStemcellCID(cidStr) {
-			deps.Logger.Warn("delete_stemcell: legacy integer CID accepted as no-op (re-upload to regenerate)",
+			deps.Log(ctx).Warn("delete_stemcell: legacy integer CID accepted as no-op (re-upload to regenerate)",
 				log.String("stemcell_cid", cidStr),
 			)
 			return nil, nil
@@ -115,7 +115,7 @@ func HandleDeleteStemcell(deps Deps) cpi.Handler {
 			return nil, cpierrors.Cloud("delete_stemcell: config.node must not be empty")
 		}
 
-		deps.Logger.Info("delete_stemcell: deleting stemcell volume",
+		deps.Log(ctx).Info("delete_stemcell: deleting stemcell volume",
 			log.String("stemcell_cid", cidStr),
 			log.String("node", node),
 			log.String("storage", storage),
@@ -127,7 +127,7 @@ func HandleDeleteStemcell(deps Deps) cpi.Handler {
 		// Volume notes (set by create_stemcell) are removed transitively.
 		// ----------------------------------------------------------------
 		var qcow2Existed bool
-		qcow2Err := pve.RetryOnTransientOrLock(ctx, deps.Logger, "delete_stemcell", 0, func() error {
+		qcow2Err := pve.RetryOnTransientOrLock(ctx, deps.Log(ctx), "delete_stemcell", 0, func() error {
 			var innerErr error
 			qcow2Existed, innerErr = deps.PVE.Storage().DeleteVolumeIfExists(ctx, node, storage, volumePath)
 			return innerErr
@@ -138,13 +138,13 @@ func HandleDeleteStemcell(deps Deps) cpi.Handler {
 				volumePath, storage, node, qcow2Err.Error())
 		}
 		if !qcow2Existed {
-			deps.Logger.Warn("delete_stemcell: qcow2 volume not found (already deleted or never existed)",
+			deps.Log(ctx).Warn("delete_stemcell: qcow2 volume not found (already deleted or never existed)",
 				log.String("volume", volumePath),
 				log.String("storage", storage),
 			)
 		}
 
-		deps.Logger.Info("delete_stemcell: stemcell volume deleted",
+		deps.Log(ctx).Info("delete_stemcell: stemcell volume deleted",
 			log.String("stemcell_cid", cidStr),
 			log.Bool("qcow2_existed", qcow2Existed),
 		)
@@ -181,13 +181,13 @@ func handleDeleteTemplateStemcellCID(ctx context.Context, deps Deps, cidStr stri
 	// Decrement refs and destroy (when last ref) under one per-VMID lock:
 	// holding the lock through DeleteQemu closes the window where a concurrent
 	// registerStemcellRef could append a CID between the RMW and the destroy.
-	destroyed, refErr := gatedDeregisterAndDestroyRef(ctx, deps, deps.Logger, node, vmid, cidStr)
+	destroyed, refErr := gatedDeregisterAndDestroyRef(ctx, deps, deps.Log(ctx), node, vmid, cidStr)
 	if refErr != nil {
 		return nil, cpierrors.Wrap(pve.WrapError(refErr),
 			fmt.Sprintf("delete_stemcell: deregister ref for template VM %d node %q", vmid, node))
 	}
 	if !destroyed {
-		deps.Logger.Info("delete_stemcell: refs remain or are unknown (conservative); template preserved",
+		deps.Log(ctx).Info("delete_stemcell: refs remain or are unknown (conservative); template preserved",
 			log.String("stemcell_cid", cidStr),
 			log.Int("vmid", int(vmid)),
 		)
@@ -198,7 +198,7 @@ func handleDeleteTemplateStemcellCID(ctx context.Context, deps Deps, cidStr stri
 	if sha8 != "" {
 		sweepStemcellByShaTag(ctx, deps, sha8, cidStr)
 	} else {
-		deps.Logger.Warn("delete_stemcell: sha8 unresolvable before primary destroy; cross-node sweep skipped",
+		deps.Log(ctx).Warn("delete_stemcell: sha8 unresolvable before primary destroy; cross-node sweep skipped",
 			log.String("stemcell_cid", cidStr),
 		)
 	}
@@ -217,8 +217,8 @@ func handleDeleteTemplateStemcellCID(ctx context.Context, deps Deps, cidStr stri
 // normal and treated as success. All failures are logged at Warn; the function
 // never returns an error. cidStr is used for log context only.
 func sweepStemcellByShaTag(ctx context.Context, deps Deps, sha8, cidStr string) {
-	logger := deps.Logger.With(
-		log.String("method", "delete_stemcell.sha_sweep"),
+	logger := deps.Log(ctx).With(
+		log.String("operation", "delete_stemcell.sha_sweep"),
 		log.String("stemcell_cid", cidStr),
 		log.String("sha8", sha8),
 	)
@@ -282,8 +282,8 @@ func sweepStemcellByShaTag(ctx context.Context, deps Deps, sha8, cidStr string) 
 func pruneOrphanStemcellTemplates(ctx context.Context, deps Deps, cidStr string) {
 	dryRun := deps.Config.StemcellOrphanPruneDryRun()
 	dir := deps.Config.StemcellDirectorID()
-	logger := deps.Logger.With(
-		log.String("method", "delete_stemcell.orphan_prune"),
+	logger := deps.Log(ctx).With(
+		log.String("operation", "delete_stemcell.orphan_prune"),
 		log.String("stemcell_cid", cidStr),
 		log.Bool("dry_run", dryRun),
 	)
@@ -402,8 +402,7 @@ func resolveStemcellSHA8FromVMID(ctx context.Context, deps Deps, node string, vm
 // success. Any other error is returned as a cloud error.
 func destroyTemplateVM(ctx context.Context, deps Deps, node string, vmid int64, cidStr string) error {
 	vmCIDStr := strconv.FormatInt(vmid, 10)
-	logger := deps.Logger.With(
-		log.String("method", "delete_stemcell"),
+	logger := deps.Log(ctx).With(
 		log.String("stemcell_cid", cidStr),
 		log.String("node", node),
 		log.Int("vmid", int(vmid)),

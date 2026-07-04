@@ -183,7 +183,7 @@ func HandleUpdateDisk(deps Deps) Handler {
 			return nil, cpierrors.Wrap(pve.WrapError(err), fmt.Sprintf("update_disk: update disk options for %s on VM %d", diskCID, vmid))
 		}
 
-		deps.Logger.Info("update_disk",
+		deps.Log(ctx).Info("update_disk",
 			log.String("disk_cid", diskCID),
 			log.Int("vmid", vmid),
 			log.String("disk_id", diskID),
@@ -237,7 +237,7 @@ func resizeDiskInternal(
 	// Wrap submit+await in RetryOnTransientOrLock: PVE holds a per-storage
 	// lockfile during resize; concurrent resizes fail with "can't lock file
 	// ... got timeout". Retry the full submit+await pair on that signal.
-	rerr := pve.RetryOnTransientOrLock(ctx, deps.Logger, "update_disk_resize", 0, func() error {
+	rerr := pve.RetryOnTransientOrLock(ctx, deps.Log(ctx), "update_disk_resize", 0, func() error {
 		upid, e := deps.PVE.QEMU().ResizeDisk(ctx, node, vmid, diskID, deltaGiB)
 		if e != nil {
 			return e
@@ -245,7 +245,7 @@ func resizeDiskInternal(
 		if upid == "" {
 			return nil
 		}
-		return pve.AwaitTaskWithLogger(ctx, deps.PVE, node, upid, deps.Logger)
+		return pve.AwaitTaskWithLogger(ctx, deps.PVE, node, upid, deps.Log(ctx))
 	})
 	if rerr != nil {
 		return cpierrors.Wrap(pve.WrapError(rerr), fmt.Sprintf("update_disk: ResizeDisk failed for %s (+%dG)", diskCID, deltaGiB))

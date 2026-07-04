@@ -173,7 +173,7 @@ func probeGuestAgentIPConflict(
 	// Phase 1: list all running VM resources from the cluster.
 	typeStr := "vm"
 	var resources *sdkcluster.ListResourcesResponse
-	listErr := pve.RetryOnTransient(ctx, deps.Logger, "probe_agent_ip_list_resources", 0, func() error {
+	listErr := pve.RetryOnTransient(ctx, logger, "probe_agent_ip_list_resources", 0, func() error {
 		var inner error
 		resources, inner = deps.PVE.Cluster().ListResources(ctx, &sdkcluster.ListResourcesParams{Type: &typeStr})
 		return inner

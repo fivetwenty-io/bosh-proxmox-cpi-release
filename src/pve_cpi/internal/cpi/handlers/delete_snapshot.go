@@ -68,14 +68,14 @@ func HandleDeleteSnapshot(deps Deps) Handler {
 		}
 		if !found || node == "" {
 			// VM absent -> snapshot is necessarily absent. Idempotent success.
-			deps.Logger.Info("delete_snapshot: VM not found in cluster -- snapshot already absent",
+			deps.Log(ctx).Info("delete_snapshot: VM not found in cluster -- snapshot already absent",
 				log.String("snapshot_cid", snapshotCID),
 				log.Int("vmid", vmid),
 			)
 			return nil, nil
 		}
 
-		deps.Logger.Debug("delete_snapshot: VM located via cluster scan",
+		deps.Log(ctx).Debug("delete_snapshot: VM located via cluster scan",
 			log.String("snapshot_cid", snapshotCID),
 			log.Int("vmid", vmid),
 			log.String("node", node),
@@ -84,12 +84,12 @@ func HandleDeleteSnapshot(deps Deps) Handler {
 		// ----------------------------------------------------------------
 		// 4. Delete snapshot via SDK. 404 -> idempotent success.
 		// ----------------------------------------------------------------
-		delErr := pve.RetryOnTransientOrLock(ctx, deps.Logger, "delete_snapshot", 0, func() error {
+		delErr := pve.RetryOnTransientOrLock(ctx, deps.Log(ctx), "delete_snapshot", 0, func() error {
 			return deps.PVE.QEMU().DeleteSnapshot(ctx, node, vmid, snapName)
 		})
 		if err := delErr; err != nil {
 			if pve.IsNotFound(err) {
-				deps.Logger.Info("delete_snapshot: snapshot already absent, skipping",
+				deps.Log(ctx).Info("delete_snapshot: snapshot already absent, skipping",
 					log.String("snapshot_cid", snapshotCID),
 					log.Int("vmid", vmid),
 					log.String("snap_name", snapName),
@@ -110,7 +110,7 @@ func HandleDeleteSnapshot(deps Deps) Handler {
 			return nil, cpierrors.Wrap(waitErr, "delete_snapshot: waiting for snapshot "+snapName+" removal on VM "+vmCID)
 		}
 
-		deps.Logger.Info("delete_snapshot",
+		deps.Log(ctx).Info("delete_snapshot",
 			log.String("snapshot_cid", snapshotCID),
 			log.Int("vmid", vmid),
 			log.String("snap_name", snapName),

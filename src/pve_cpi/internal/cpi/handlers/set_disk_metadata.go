@@ -110,7 +110,7 @@ func HandleSetDiskMetadata(deps Deps) cpi.Handler {
 
 		switch len(matches) {
 		case 0:
-			deps.Logger.Warn("set_disk_metadata: disk not attached; metadata not persisted",
+			deps.Log(ctx).Warn("set_disk_metadata: disk not attached; metadata not persisted",
 				log.String("disk_cid", diskCID))
 			return nil, nil
 
@@ -125,7 +125,7 @@ func HandleSetDiskMetadata(deps Deps) cpi.Handler {
 			// Pool service absent (nil) → retriable error so the director re-drives.
 			vmid := matches[0].vmid
 			lockOwner := fmt.Sprintf("set_disk_metadata/%d", vmid)
-			lockErr := withVMIDLock(ctx, deps.PVE.Pools(), vmid, lockOwner, deps.Logger, func() error {
+			lockErr := withVMIDLock(ctx, deps.PVE.Pools(), vmid, lockOwner, deps.Log(ctx), func() error {
 				if err := persistMetadata(ctx, deps, matches[0], bareDiskCID, metadata); err != nil {
 					return err
 				}
@@ -201,7 +201,7 @@ func coerceTagMap(v any) map[string]string {
 func findVMsHostingDisk(ctx context.Context, deps Deps, diskCID string) ([]attachedVM, error) {
 	typeStr := "vm"
 	var resources *sdkcluster.ListResourcesResponse
-	listErr := pve.RetryOnTransient(ctx, deps.Logger, "set_disk_metadata_list_resources", 0, func() error {
+	listErr := pve.RetryOnTransient(ctx, deps.Log(ctx), "set_disk_metadata_list_resources", 0, func() error {
 		var inner error
 		resources, inner = deps.PVE.Cluster().ListResources(ctx, &sdkcluster.ListResourcesParams{Type: &typeStr})
 		return inner

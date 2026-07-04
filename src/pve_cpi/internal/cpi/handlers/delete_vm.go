@@ -321,7 +321,7 @@ func HandleDeleteVM(deps Deps) cpi.Handler {
 			return nil, cpierrors.Cloud("delete_vm: vm_cid %q must be a positive integer", vmCID)
 		}
 
-		logger := deps.Logger.With(log.String("method", "delete_vm"), log.String("vm_cid", vmCID), log.Int("vmid", vmid))
+		logger := deps.Log(ctx).With(log.String("vm_cid", vmCID), log.Int("vmid", vmid))
 
 		// --- locate VM via cluster scan ---
 		// Queries /cluster/resources for the authoritative node, correct even
@@ -616,14 +616,14 @@ func guardUnusedVolumes(ctx context.Context, deps Deps, node, vmCID string, vmid
 		storage, _, parseErr := pve.ParseDiskCID(volid)
 		if parseErr != nil {
 			// Unparseable volid -- skip; can't determine storage.
-			deps.Logger.Warn("delete_vm: unused-slot has unparseable volid -- skipping",
+			deps.Log(ctx).Warn("delete_vm: unused-slot has unparseable volid -- skipping",
 				log.String("slot", slot), log.String("volid", volid))
 			continue
 		}
 		if diskStorage == "" {
 			// No configured disk storage: cannot probe existence.
 			// Fail closed -- block destroy to avoid data loss.
-			deps.Logger.Warn("delete_vm: unused-slot present but pve.disk_storage not configured -- failing closed",
+			deps.Log(ctx).Warn("delete_vm: unused-slot present but pve.disk_storage not configured -- failing closed",
 				log.String("slot", slot), log.String("volid", volid))
 			protected = append(protected, fmt.Sprintf("%s=%s", slot, volid))
 			continue
@@ -631,7 +631,7 @@ func guardUnusedVolumes(ctx context.Context, deps Deps, node, vmCID string, vmid
 		if storage != diskStorage {
 			// Storage doesn't match configured disk storage: we cannot
 			// probe existence on an unknown pool. Fail closed.
-			deps.Logger.Warn("delete_vm: unused-slot storage does not match pve.disk_storage -- failing closed",
+			deps.Log(ctx).Warn("delete_vm: unused-slot storage does not match pve.disk_storage -- failing closed",
 				log.String("slot", slot), log.String("volid", volid),
 				log.String("slot_storage", storage), log.String("disk_storage", diskStorage))
 			protected = append(protected, fmt.Sprintf("%s=%s", slot, volid))
@@ -643,10 +643,10 @@ func guardUnusedVolumes(ctx context.Context, deps Deps, node, vmCID string, vmid
 		// slot pointing at a deleted volume does not wedge delete_vm.
 		exists, existErr := pve.ExistsTolerant(ctx, deps.PVE, node, diskStorage, volid)
 		if existErr != nil {
-			deps.Logger.Warn("delete_vm: unused-slot volume existence probe failed -- treating slot as present (fail-closed)",
+			deps.Log(ctx).Warn("delete_vm: unused-slot volume existence probe failed -- treating slot as present (fail-closed)",
 				log.String("slot", slot), log.String("volid", volid), log.Err(existErr))
 		} else if !exists {
-			deps.Logger.Info("delete_vm: ignoring stale unused slot -- volume already deleted",
+			deps.Log(ctx).Info("delete_vm: ignoring stale unused slot -- volume already deleted",
 				log.String("slot", slot), log.String("volid", volid))
 			continue
 		}

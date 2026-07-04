@@ -126,12 +126,10 @@ func resolveStorageForDisk(ctx context.Context, r *layeredResolver, deps Deps, e
 		return nil
 	}
 	warnEncrypted := func(tier, pool string) {
-		if deps.Logger != nil {
-			deps.Logger.Warn("create_disk: selected encrypted storage tier — CPI cannot verify pool encryption; operator responsibility",
-				log.String("tier", tier),
-				log.String("pool", pool),
-			)
-		}
+		deps.Log(ctx).Warn("create_disk: selected encrypted storage tier — CPI cannot verify pool encryption; operator responsibility",
+			log.String("tier", tier),
+			log.String("pool", pool),
+		)
 	}
 
 	// Encrypted enforcement (§7.49).
@@ -401,10 +399,10 @@ func HandleCreateDisk(deps Deps) Handler {
 			if success {
 				return
 			}
-			rollbackCreatedVolume(ctx, deps, node, storage, canonicalVolID, deps.Logger)
+			rollbackCreatedVolume(ctx, deps, node, storage, canonicalVolID, deps.Log(ctx))
 		}()
 
-		deps.Logger.Info("create_disk",
+		deps.Log(ctx).Info("create_disk",
 			log.String("disk_cid", diskCID),
 			log.Int("size_mb", sizeMB),
 			log.Int("size_gib", sizeGiB),
@@ -419,7 +417,7 @@ func HandleCreateDisk(deps Deps) Handler {
 		// can't attribute them yet — set_disk_metadata picks them up later.
 		if len(cloudProps.Tags) > 0 {
 			if vmCID == "" {
-				deps.Logger.Warn(
+				deps.Log(ctx).Warn(
 					"create_disk: tags supplied but disk has no attached VM; tags deferred until set_disk_metadata is called",
 					log.String("disk_cid", diskCID),
 				)
@@ -428,14 +426,14 @@ func HandleCreateDisk(deps Deps) Handler {
 					// Tagging is best-effort metadata; do not fail volume
 					// creation when only the tag write fails. The next
 					// set_disk_metadata call will re-apply.
-					deps.Logger.Warn("create_disk: failed to apply tags to attached VM",
+					deps.Log(ctx).Warn("create_disk: failed to apply tags to attached VM",
 						log.String("disk_cid", diskCID),
 						log.String("vm_cid", vmCID),
 						log.Err(applyErr),
 					)
 				}
 			} else {
-				deps.Logger.Warn(
+				deps.Log(ctx).Warn(
 					"create_disk: tags supplied but vm_cid is not a valid integer; tags deferred",
 					log.String("disk_cid", diskCID),
 					log.String("vm_cid", vmCID),
@@ -486,7 +484,7 @@ func attemptCreateVolume(
 			candidateCanonical := fmt.Sprintf("%s:%s", storage, volName)
 
 			var v string
-			cerr := pve.RetryOnTransientOrLock(ctx, deps.Logger, "create_disk", lockAttempts, func() error {
+			cerr := pve.RetryOnTransientOrLock(ctx, deps.Log(ctx), "create_disk", lockAttempts, func() error {
 				var innerErr error
 				v, innerErr = deps.PVE.Storage().CreateVolume(
 					ctx, node, storage, sizeGiB, formatArg, candidate, volName,
@@ -498,7 +496,7 @@ func attemptCreateVolume(
 					// Pure conflict (volume name already taken at storage
 					// level). No partial commit possible; let the helper
 					// pick a new VMID.
-					deps.Logger.Info("create_disk: vmid conflict, retrying",
+					deps.Log(ctx).Info("create_disk: vmid conflict, retrying",
 						log.Int("vmid_attempted", candidate),
 						log.String("storage", storage),
 					)
@@ -514,24 +512,24 @@ func attemptCreateVolume(
 					upid, delErr := deps.PVE.Storage().DeleteVolumeAsync(rollbackCtx, node, storage, candidateCanonical)
 					switch {
 					case delErr != nil:
-						deps.Logger.Warn("create_disk: orphan volume cleanup after CreateVolume error failed",
+						deps.Log(rollbackCtx).Warn("create_disk: orphan volume cleanup after CreateVolume error failed",
 							log.String("volid", candidateCanonical),
 							log.Err(delErr),
 						)
 					case upid != "":
-						if werr := pve.AwaitTaskWithLogger(rollbackCtx, deps.PVE, node, upid, deps.Logger); werr != nil {
-							deps.Logger.Warn("create_disk: orphan volume cleanup await failed",
+						if werr := pve.AwaitTaskWithLogger(rollbackCtx, deps.PVE, node, upid, deps.Log(rollbackCtx)); werr != nil {
+							deps.Log(rollbackCtx).Warn("create_disk: orphan volume cleanup await failed",
 								log.String("volid", candidateCanonical),
 								log.String("upid", upid),
 								log.Err(werr),
 							)
 						} else {
-							deps.Logger.Info("create_disk: removed orphan volume after CreateVolume error",
+							deps.Log(rollbackCtx).Info("create_disk: removed orphan volume after CreateVolume error",
 								log.String("volid", candidateCanonical),
 							)
 						}
 					default:
-						deps.Logger.Info("create_disk: removed orphan volume after CreateVolume error",
+						deps.Log(rollbackCtx).Info("create_disk: removed orphan volume after CreateVolume error",
 							log.String("volid", candidateCanonical),
 						)
 					}
