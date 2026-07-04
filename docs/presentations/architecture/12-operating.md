@@ -141,14 +141,19 @@ flowchart LR
 
 - Opt-in, inert by default: not enabled, no tracer, no network cost
 - One root span per action, one child span per PVE call — logs carry the same ids
-- Buffered in-process, flushed once at a bounded exit deadline; export failure is a warning, never a failed action
-- Never touches stdout — that channel carries the JSON-RPC reply alone
+- Logs (beta) and metrics are separate signals: log records mirror to the collector while stderr stays untouched; one histogram, `cpi.action.duration`, by method + outcome
+- Panics writing the response get their own span, `cpi.response_write_failure`, since the root span already closed
+- Each signal opts in independently; one protocol setting picks HTTP or gRPC for all three
+- Fail-open, stdout-clean: export failure is a warning, never a failed action — stdout stays the JSON-RPC reply alone
 
 <!--
 - Tracing will be opt-in: unless it is explicitly enabled and given an exporter endpoint, there is no tracer, no network dial, zero per-call cost.
 - One root span will open per CPI action; every PVE call underneath becomes a timed child span, and log lines will carry the same trace_id/span_id whenever a span is active.
-- Spans will buffer in-process and flush once under a bounded timeout at exit — a slow collector cannot stall an action mid-flight.
-- Export failure will degrade to a warning in our own logs, never a failed CPI action — a diagnostic must never invent a new failure mode; nothing about tracing will touch stdout, which stays the JSON-RPC reply alone.
+- Spans will buffer in-process and flush once under a bounded timeout at exit — a slow collector cannot stall an action mid-flight; export failure degrades to a warning in our own logs, never a failed CPI action.
+- Logs will be a second signal: the same structured stderr lines also flow to the collector, stderr itself untouched, with whatever trace/span was open carried along — beta, because the upstream logs SDK has not reached 1.0.
+- Metrics will be the third signal: exactly one instrument, a `cpi.action.duration` millisecond histogram tagged by CPI method and success/error outcome, delta rather than cumulative because a one-shot process has no running series — no per-PVE-call metrics.
+- `cpi.response_write_failure` will be a fresh span opened from the response-write panic-recovery path, since the root span has usually already closed by then and appending to it is a no-op.
+- Nothing about any of the three signals will touch stdout, which stays the JSON-RPC reply alone; each signal opts in on its own, and one protocol setting redirects traces, logs, and metrics together between OTLP/HTTP and OTLP/gRPC.
 - The enable switch, endpoint, sample ratio, and flush deadline live in the [configuration reference](../configuration.md), every one defaulting to inert.
 -->
 
