@@ -7,15 +7,18 @@
 // zero added overhead.
 //
 // When enabled, the pipeline is:
-//   - otlptracehttp exporter (OTLP http/protobuf; the only supported wire
-//     protocol, no protocol knob) pointed at cfg.ExporterEndpoint
+//   - an OTLP exporter pointed at cfg.ExporterEndpoint, using otlptracehttp
+//     (OTLP http/protobuf) unless cfg.Protocol is exactly "grpc", in which
+//     case otlptracegrpc is used instead
 //   - sdktrace.TracerProvider with a BatchSpanProcessor wrapping that
 //     exporter, sampling via ParentBased(TraceIDRatioBased(cfg.SampleRatio))
 //   - a Resource carrying service.name = cfg.ServiceName
 //
 // SDK-internal errors (failed exports, malformed responses, etc.) are routed
-// through otel.SetErrorHandler to logger.Warn so they land in the CPI's
-// existing structured stderr stream and never touch stdout (stdout is
+// through the package-wide shared error handler (see setErrorHandlerOnce in
+// metrics.go, installed at most once regardless of which of Setup/
+// SetupMetrics/SetupLogs runs first) to logger.Warn so they land in the
+// CPI's existing structured stderr stream and never touch stdout (stdout is
 // reserved for the CPI JSON-RPC response and --version output) and never
 // abort a CPI action.
 //
@@ -34,7 +37,8 @@ import (
 	"net/url"
 	"strings"
 
-	otelapi "go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
@@ -73,9 +77,18 @@ func noopShutdown(context.Context) error { return nil }
 //
 // cfg.Enabled == true additionally requires cfg.ExporterEndpoint to be
 // non-empty (an empty endpoint would otherwise silently fall back to the
-// otlptracehttp default of "localhost:4318", masking an operator
+// exporter's built-in default endpoint, masking an operator
 // misconfiguration) and ctx to be non-nil (used to build the exporter's
-// HTTP client).
+// client).
+//
+// cfg.Protocol selects the OTLP wire protocol: exactly "grpc" builds an
+// otlptracegrpc exporter, any other value (including "", "http", or an
+// unrecognized string) builds the otlptracehttp exporter. Rejecting an
+// invalid cfg.Protocol value is config-validation's job (internal/config);
+// Setup treats anything that is not literally "grpc" as "http" so that a
+// config which somehow reaches Setup without having been validated (e.g. a
+// caller building OTelConfig directly, bypassing config.Validate) still
+// gets a working, previously-supported pipeline instead of an error.
 func Setup(ctx context.Context, cfg config.OTelConfig, logger *log.Logger) (trace.Tracer, func(context.Context) error, error) {
 	if logger == nil {
 		logger = log.NewNopLogger()
@@ -92,54 +105,129 @@ func Setup(ctx context.Context, cfg config.OTelConfig, logger *log.Logger) (trac
 		return nil, nil, errors.New("otel: exporter_endpoint must not be empty when tracing is enabled")
 	}
 
-	exporterOpts, err := exporterOptionsFor(cfg)
-	if err != nil {
-		return nil, nil, err
+	var exporter *otlptrace.Exporter
+	var err error
+
+	if isGRPCProtocol(cfg) {
+		var grpcOpts []otlptracegrpc.Option
+		grpcOpts, err = grpcExporterOptionsFor(cfg)
+		if err != nil {
+			return nil, nil, err
+		}
+		exporter, err = otlptracegrpc.New(ctx, grpcOpts...)
+		if err != nil {
+			return nil, nil, fmt.Errorf("otel: failed to build otlptracegrpc exporter: %w", err)
+		}
+	} else {
+		var httpOpts []otlptracehttp.Option
+		httpOpts, err = exporterOptionsFor(cfg)
+		if err != nil {
+			return nil, nil, err
+		}
+		exporter, err = otlptracehttp.New(ctx, httpOpts...)
+		if err != nil {
+			return nil, nil, fmt.Errorf("otel: failed to build otlptracehttp exporter: %w", err)
+		}
 	}
 
-	exporter, err := otlptracehttp.New(ctx, exporterOpts...)
-	if err != nil {
-		return nil, nil, fmt.Errorf("otel: failed to build otlptracehttp exporter: %w", err)
-	}
-
-	otelapi.SetErrorHandler(otelapi.ErrorHandlerFunc(func(handlerErr error) {
-		logger.Warn("otel internal error", log.ErrScrubbed(handlerErr))
-	}))
+	setErrorHandlerOnce(logger)
 
 	tracer, shutdown := newTracerAndShutdown(exporter, cfg, logger)
 	return tracer, shutdown, nil
 }
 
-// exporterOptionsFor translates cfg into otlptracehttp options, normalizing
-// cfg.ExporterEndpoint per the two forms documented on
-// pve.otel.exporter_endpoint (jobs/pve_cpi/spec): "host:port or full URL".
+// protocolGRPC is the only cfg.Protocol value that selects the OTLP/gRPC
+// exporters; every other value selects OTLP/HTTP. schemeHTTP and schemeHTTPS
+// are the only URL schemes accepted in the full-URL endpoint form, shared by
+// the trace, logs, and metrics option builders.
+const (
+	protocolGRPC = "grpc"
+	schemeHTTP   = "http"
+	schemeHTTPS  = "https"
+)
+
+// isGRPCProtocol reports whether cfg selects the OTLP gRPC wire protocol.
+// Only the exact string "grpc" selects gRPC; every other value (including
+// "", "http", and any unrecognized string) selects http. Rejecting an
+// unrecognized cfg.Protocol value is config-validation's job
+// (internal/config); this function only decides which already-supported
+// exporter to build, so it treats an unvalidated/unrecognized value the same
+// as the documented default.
+func isGRPCProtocol(cfg config.OTelConfig) bool {
+	return cfg.Protocol == protocolGRPC
+}
+
+// endpointForm classifies cfg.ExporterEndpoint per the two forms documented
+// on pve.otel.exporter_endpoint (jobs/pve_cpi/spec): "host:port or full
+// URL". It is shared by exporterOptionsFor (http) and grpcExporterOptionsFor
+// (grpc) below, since both wire protocols accept the same endpoint syntax
+// and must reject the same malformed inputs identically.
 //
 //   - If the endpoint contains a "://" scheme separator, it is treated as a
 //     full URL: the scheme (which must be http or https) determines
 //     transport security and cfg.Insecure is ignored, since the scheme
-//     already states the operator's intent unambiguously.
+//     already states the operator's intent unambiguously. isURL is true.
 //   - Otherwise the endpoint is treated as a bare "host:port" pair and
-//     cfg.Insecure selects http (true) vs https (false, the default).
-func exporterOptionsFor(cfg config.OTelConfig) ([]otlptracehttp.Option, error) {
-	endpoint := strings.TrimSpace(cfg.ExporterEndpoint)
+//     cfg.Insecure selects insecure (true) vs secure/TLS (false, the
+//     default). isURL is false.
+func endpointForm(cfg config.OTelConfig) (isURL bool, endpoint string, err error) {
+	endpoint = strings.TrimSpace(cfg.ExporterEndpoint)
 
-	if strings.Contains(endpoint, "://") {
-		parsed, err := url.Parse(endpoint)
-		if err != nil {
-			return nil, fmt.Errorf("otel: invalid exporter_endpoint URL %q: %w", cfg.ExporterEndpoint, err)
-		}
-		if parsed.Scheme != "http" && parsed.Scheme != "https" {
-			return nil, fmt.Errorf("otel: exporter_endpoint URL %q must use http or https scheme, got %q", cfg.ExporterEndpoint, parsed.Scheme)
-		}
-		if parsed.Host == "" {
-			return nil, fmt.Errorf("otel: exporter_endpoint URL %q is missing a host", cfg.ExporterEndpoint)
-		}
+	if !strings.Contains(endpoint, "://") {
+		return false, endpoint, nil
+	}
+
+	parsed, err := url.Parse(endpoint)
+	if err != nil {
+		return false, "", fmt.Errorf("otel: invalid exporter_endpoint URL %q: %w", cfg.ExporterEndpoint, err)
+	}
+	if parsed.Scheme != schemeHTTP && parsed.Scheme != schemeHTTPS {
+		return false, "", fmt.Errorf("otel: exporter_endpoint URL %q must use http or https scheme, got %q", cfg.ExporterEndpoint, parsed.Scheme)
+	}
+	if parsed.Host == "" {
+		return false, "", fmt.Errorf("otel: exporter_endpoint URL %q is missing a host", cfg.ExporterEndpoint)
+	}
+	return true, endpoint, nil
+}
+
+// exporterOptionsFor translates cfg into otlptracehttp options. See
+// endpointForm for the endpoint-syntax rules shared with the grpc path.
+func exporterOptionsFor(cfg config.OTelConfig) ([]otlptracehttp.Option, error) {
+	isURL, endpoint, err := endpointForm(cfg)
+	if err != nil {
+		return nil, err
+	}
+	if isURL {
 		return []otlptracehttp.Option{otlptracehttp.WithEndpointURL(endpoint)}, nil
 	}
 
 	opts := []otlptracehttp.Option{otlptracehttp.WithEndpoint(endpoint)}
 	if cfg.Insecure {
 		opts = append(opts, otlptracehttp.WithInsecure())
+	}
+	return opts, nil
+}
+
+// grpcExporterOptionsFor translates cfg into otlptracegrpc options, the
+// gRPC-protocol counterpart to exporterOptionsFor. It always sets an
+// explicit endpoint option derived from cfg (WithEndpointURL or
+// WithEndpoint) rather than leaving the endpoint unset, so the exporter
+// never falls back to reading the ambient OTEL_EXPORTER_OTLP_ENDPOINT /
+// OTEL_EXPORTER_OTLP_TRACES_ENDPOINT environment variables: cfg is the CPI's
+// sole source of truth for where spans go. See endpointForm for the
+// endpoint-syntax rules shared with the http path.
+func grpcExporterOptionsFor(cfg config.OTelConfig) ([]otlptracegrpc.Option, error) {
+	isURL, endpoint, err := endpointForm(cfg)
+	if err != nil {
+		return nil, err
+	}
+	if isURL {
+		return []otlptracegrpc.Option{otlptracegrpc.WithEndpointURL(endpoint)}, nil
+	}
+
+	opts := []otlptracegrpc.Option{otlptracegrpc.WithEndpoint(endpoint)}
+	if cfg.Insecure {
+		opts = append(opts, otlptracegrpc.WithInsecure())
 	}
 	return opts, nil
 }
