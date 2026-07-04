@@ -385,6 +385,7 @@ func TestConfigDrive_Remove_InvalidInputs(t *testing.T) {
 	t.Parallel()
 	a := newISOAgent(nil, nil)
 
+	//lint:ignore SA1012 intentionally passing nil ctx to exercise nil-context validation
 	if err := a.Remove(nil, "pve1", 200); err == nil { //nolint:staticcheck // SA1012: intentionally passing nil ctx to exercise nil-context validation
 		t.Error("expected error for nil ctx")
 	}
@@ -492,6 +493,7 @@ func TestConfigDrive_Configure_InvalidInputs(t *testing.T) {
 	t.Parallel()
 	a := newISOAgent(nil, nil)
 
+	//lint:ignore SA1012 intentionally passing nil ctx to exercise nil-context validation
 	if err := a.Configure(nil, "pve1", 200, baseISOConfig()); err == nil { //nolint:staticcheck // SA1012: intentionally passing nil ctx to exercise nil-context validation
 		t.Error("expected error for nil ctx")
 	}

@@ -207,6 +207,7 @@ func TestCreateSDNZone_NilCtx(t *testing.T) {
 	t.Parallel()
 	c := newSDNClient(&sdnFakeCluster{})
 	//nolint:staticcheck // SA1012: nil ctx is exactly what we want to reject.
+	//lint:ignore SA1012 nil ctx is exactly what we want to reject
 	err := pve.CreateSDNZone(nil, c, pve.SDNZoneParams{Zone: "z", Type: "simple"})
 	if err == nil {
 		t.Fatal("expected error for nil ctx")

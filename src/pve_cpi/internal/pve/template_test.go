@@ -197,6 +197,7 @@ func TestCloneQemuVM_NilContext(t *testing.T) {
 	t.Parallel()
 	c := newTemplateClient(&templateNodesService{})
 	//nolint:staticcheck // intentional nil ctx for validation test
+	//lint:ignore SA1012 intentional nil ctx for validation test
 	_, err := pve.CloneQemuVM(nil, c, "pve1", 6042, &sdknodes.CreateQemuCloneParams{Newid: 7001})
 	if err == nil {
 		t.Fatal("CloneQemuVM: expected error for nil ctx")
@@ -320,6 +321,7 @@ func TestMakeTemplate_NilContext(t *testing.T) {
 	t.Parallel()
 	c := newTemplateClient(&templateNodesService{})
 	//nolint:staticcheck // intentional nil ctx for validation test
+	//lint:ignore SA1012 intentional nil ctx for validation test
 	_, err := pve.MakeTemplate(nil, c, "pve1", 6042)
 	if err == nil {
 		t.Fatal("MakeTemplate: expected error for nil ctx")
@@ -602,6 +604,7 @@ func TestFindTemplateByName_NilContext(t *testing.T) {
 	t.Parallel()
 	c := newFindTemplateClient(nil)
 	//nolint:staticcheck // intentional nil ctx for validation test
+	//lint:ignore SA1012 intentional nil ctx for validation test
 	_, _, err := pve.FindTemplateByName(nil, c, "pve1", "bosh-stemcell-ubuntu-jammy-1.234")
 	if err == nil {
 		t.Fatal("FindTemplateByName: expected error for nil ctx")
@@ -830,6 +833,7 @@ func TestFindTemplateBySHATag_NilContext(t *testing.T) {
 	t.Parallel()
 	c := newFindTemplateClient(nil)
 	//nolint:staticcheck // intentional nil ctx for validation test
+	//lint:ignore SA1012 intentional nil ctx for validation test
 	_, _, err := pve.FindTemplateBySHATag(nil, c, "pve1", "ab12cd34")
 	if err == nil {
 		t.Fatal("FindTemplateBySHATag: expected error for nil ctx")

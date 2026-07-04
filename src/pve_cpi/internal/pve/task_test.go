@@ -574,6 +574,7 @@ func TestAwaitTask_NilContext(t *testing.T) {
 	t.Parallel()
 	svc := &mockTasksService{}
 	//nolint:staticcheck // intentional nil ctx for validation test
+	//lint:ignore SA1012 intentional nil ctx for validation test
 	err := pve.AwaitTask(nil, newMockClient(svc), "node1", "UPID:node1:abc")
 	if err == nil {
 		t.Fatal("expected error for nil context, got nil")
