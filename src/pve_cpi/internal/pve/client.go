@@ -21,6 +21,7 @@ import (
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/tasks"
 	sdkclient "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/client"
 	sdkerrors "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/errors"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
@@ -238,7 +239,27 @@ func buildTransportOpts(cfg *config.CPIConfig) sdkclient.Options {
 // NewClient constructs a Client from CPIConfig.
 // Selects auth: APIToken if non-empty else User+Password+Realm.
 // Honors VerifySSL (false = skip TLS verify).
+//
+// Services are unwrapped raw SDK bindings — no tracing. Use
+// NewClientWithTracer to get one child span per PVE service call.
 func NewClient(cfg *config.CPIConfig, logger *log.Logger) (Client, error) {
+	return newClient(cfg, logger, nil)
+}
+
+// NewClientWithTracer constructs a Client identically to NewClient, additionally
+// decorating each PVE service call site actually used by CPI code (see
+// tracing.go) with a child span started from tracer when tracer is non-nil.
+// A nil tracer behaves exactly like NewClient: raw, undecorated services,
+// zero added overhead. This is the same single construction choke point as
+// NewClient — only the values stored in the returned Client's service fields
+// differ (raw vs. tracing-decorated).
+func NewClientWithTracer(cfg *config.CPIConfig, logger *log.Logger, tracer trace.Tracer) (Client, error) {
+	return newClient(cfg, logger, tracer)
+}
+
+// newClient is the shared construction path for NewClient and
+// NewClientWithTracer. tracer == nil means "no tracing" (used by NewClient).
+func newClient(cfg *config.CPIConfig, logger *log.Logger, tracer trace.Tracer) (Client, error) {
 	if cfg == nil {
 		return nil, cpierrors.Cloud("pve client init: cfg must not be nil")
 	}
@@ -325,14 +346,36 @@ func NewClient(cfg *config.CPIConfig, logger *log.Logger) (Client, error) {
 	// v3.2.10, so no vendor patch is required.
 	raw.SetHeader("User-Agent", buildUserAgent(cfg))
 
+	qemuSvc := qemu.New(raw)
+	storageSvc := storage.New(raw)
+	tasksSvc := tasks.New(raw)
+	nodesSvc := nodes.New(raw)
+	clusterSvc := cluster.New(raw)
+	clusterStorageSvc := clusterstorage.New(raw)
+	var poolsSvc PoolService = &sdkPoolService{svc: pools.New(raw)}
+	// cloudInitSvc is never decorated: the call-surface audit (see tracing.go)
+	// found zero production call sites for Client.CloudInit(), so there is no
+	// span-worthy call path to instrument.
+	cloudInitSvc := cloudinit.New(raw)
+
+	if tracer != nil {
+		qemuSvc = &tracedQEMUService{Service: qemuSvc, tracer: tracer}
+		storageSvc = &tracedStorageService{Service: storageSvc, tracer: tracer}
+		tasksSvc = &tracedTasksService{Service: tasksSvc, tracer: tracer}
+		nodesSvc = &tracedNodesService{Service: nodesSvc, tracer: tracer}
+		clusterSvc = &tracedClusterService{Service: clusterSvc, tracer: tracer}
+		clusterStorageSvc = &tracedClusterStorageService{Service: clusterStorageSvc, tracer: tracer}
+		poolsSvc = &tracedPoolService{PoolService: poolsSvc, tracer: tracer}
+	}
+
 	return &sdkClient{
-		qemuSvc:           qemu.New(raw),
-		storageSvc:        storage.New(raw),
-		cloudInitSvc:      cloudinit.New(raw),
-		tasksSvc:          tasks.New(raw),
-		nodesSvc:          nodes.New(raw),
-		clusterSvc:        cluster.New(raw),
-		clusterStorageSvc: clusterstorage.New(raw),
-		poolsSvc:          &sdkPoolService{svc: pools.New(raw)},
+		qemuSvc:           qemuSvc,
+		storageSvc:        storageSvc,
+		cloudInitSvc:      cloudInitSvc,
+		tasksSvc:          tasksSvc,
+		nodesSvc:          nodesSvc,
+		clusterSvc:        clusterSvc,
+		clusterStorageSvc: clusterStorageSvc,
+		poolsSvc:          poolsSvc,
 	}, nil
 }
