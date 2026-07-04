@@ -100,7 +100,7 @@ When none of these keys is set, `create_stemcell` uploads the local tarball extr
 - `light:...` — no-op (operator-managed image; the CPI never deletes it).
 - Integer-only CIDs — no-op (pre-upgrade legacy scrub).
 
-Running VMs have no dependency on the template after cloning, so the template can be deleted at any time without affecting them.
+From the Director's perspective a running VM has no lifecycle dependency on the template it was cloned from, so deleting the stemcell never disturbs deployed VMs. The block-level relationship depends on the clone type: a full clone is an independent byte copy, while a linked clone — the default on copy-on-write backends — shares the template's read-only base image and stays bound to it for as long as it lives. That dependency is safe by construction. PVE's storage layer refuses to remove a base volume while any linked clone still references it, and `delete_stemcell` destroys a `template:` VM only when it is the last stemcell reference (tracked in the template's `stemcell_refs`), preserving it otherwise. A base can therefore never be pulled out from under a VM that still needs it.
 
 ---
 

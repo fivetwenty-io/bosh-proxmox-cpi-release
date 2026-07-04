@@ -42,7 +42,7 @@ The optimization is backward-compatible by construction. A legacy stemcell does 
 
 ## The template is a build-time artifact, nothing more
 
-Once a VM is cloned, it carries its own copy of what it needs and has no further dependency on the template — even on copy-on-write storage, the relationship is at the block layer, invisible to the running guest's lifecycle as the Director sees it. A template can therefore be deleted at any time without disturbing the VMs it produced. Templates are pure build-time scaffolding: useful while we stamp out machines, disposable afterward, never load-bearing for anything already running.
+Once a VM is cloned, the Director sees no further dependency between it and the template: the clone has its own cloud ID, its own lifecycle, and nothing in BOSH's model ties the two together. Underneath, the block-level story depends on the clone type. A full clone is a real byte copy — genuinely independent, and the template can be deleted freely. A linked clone, the default on copy-on-write storage, shares the template's read-only base image and stays bound to it at the block layer for as long as it lives. That dependency is real, but it is never a hazard, because we never let a base be deleted while it still has children: PVE's storage layer refuses to remove a base volume that a linked clone still references, and our own delete path destroys a template only once its last stemcell reference is gone. So the framing holds with one honest qualification — a template is build-time scaffolding, disposable the moment nothing is cloned from it, and the system guarantees we cannot pull it out from under a VM that still needs it.
 
 ## Living across many nodes
 
