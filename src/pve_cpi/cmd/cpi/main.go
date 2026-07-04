@@ -19,6 +19,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/signal"
 	"runtime/debug"
@@ -27,6 +28,8 @@ import (
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/metric"
+	metricnoop "go.opentelemetry.io/otel/metric/noop"
 	"go.opentelemetry.io/otel/trace"
 	tracenoop "go.opentelemetry.io/otel/trace/noop"
 
@@ -52,10 +55,10 @@ const exitSignaled = 130
 const defaultMaxLineBytes = 64 * 1024 * 1024
 
 // defaultOTelShutdownTimeoutMs bounds the OTel shutdown flush when
-// cfg.OTel.ExportTimeoutMs is unset (0). It is only ever reached when tracing
-// is disabled, in which case the shutdown func is a no-op that ignores the
-// deadline entirely — this value exists purely so the shutdown context always
-// carries a real deadline rather than an implicit zero-duration one.
+// cfg.OTel.ExportTimeoutMs is unset (0). Config defaulting fills 5000 only
+// when tracing is enabled, so this fallback is reached when tracing is off —
+// including logs-only or metrics-only deployments, whose exporter flush is
+// then bounded by the same 5000ms the traces default would give.
 const defaultOTelShutdownTimeoutMs = 5000
 
 // fallbackTracerName identifies the no-op tracer runCPI builds when called
@@ -64,6 +67,142 @@ const defaultOTelShutdownTimeoutMs = 5000
 // is only reached by test call sites that pass nil to exercise runCPI/
 // dispatchOne without constructing a tracer.
 const fallbackTracerName = "github.com/fivetwenty-io/bosh-pve-cpi/cmd/cpi"
+
+// fallbackMeterName identifies the no-op Meter runWithArgs falls back to when
+// the metrics-setup factory (production: otel.SetupMetrics) returns an
+// error. It mirrors fallbackTracerName's convention and role: a Meter is
+// still handed to the rest of startup so nothing downstream has to nil-check
+// it, but every instrument it creates is a cheap no-op (fail-open).
+const fallbackMeterName = "github.com/fivetwenty-io/bosh-pve-cpi/cmd/cpi"
+
+// noopSignalShutdown is used in place of a logs/metrics shutdown func when
+// the corresponding setup factory returned a nil shutdown (defensive) or
+// when its setup failed and the signal is treated as disabled for the rest
+// of the process. It performs no work and never returns an error.
+func noopSignalShutdown(context.Context) error { return nil }
+
+// setupOTelLogsAndMetrics builds the opt-in logs and metrics pipelines.
+// Setup errors for both are fail-open (unlike the tracer's hard-fail in
+// runWithArgs, which predates these signals): a broken pve.otel.logs.* or
+// pve.otel.metrics.* configuration must not brick an otherwise-healthy CPI
+// invocation, since each signal is independently opt-in. A setup failure is
+// logged at Warn and the affected signal is treated as disabled for the
+// rest of the process (nil handler / no-op Meter, no-op shutdown).
+//
+// The returned logger is the process logger to use from here on: when the
+// logs pipeline is up it is rebuilt via log.NewLoggerWithHandlers so every
+// subsequent log call fans out to the OTel bridge; otherwise it is the
+// logger passed in. The returned shutdown funcs are never nil.
+func setupOTelLogsAndMetrics(
+	ctx context.Context,
+	cfg *config.CPIConfig,
+	stderr io.Writer,
+	logger *log.Logger,
+	opts runOptions,
+) (*log.Logger, metric.Meter, func(context.Context) error, func(context.Context) error) {
+	loggerFactory := opts.LoggerProviderFactory
+	if loggerFactory == nil {
+		loggerFactory = otel.SetupLogs
+	}
+	logsHandler, logsShutdown, logsErr := loggerFactory(ctx, cfg.OTel, logger)
+	if logsErr != nil {
+		logger.Warn("otel logs init failed", log.Err(logsErr))
+		logsHandler, logsShutdown = nil, nil
+	}
+	if logsShutdown == nil {
+		logsShutdown = noopSignalShutdown
+	}
+	// A non-nil handler means logs are enabled and the pipeline was built
+	// successfully: rebuild the process logger so every subsequent log call
+	// fans out to the OTel bridge. cfg.LogLevel already parsed successfully
+	// in runWithArgs's log.NewLogger call, so NewLoggerWithHandlers
+	// re-parsing the same string cannot fail in practice; the error branch
+	// is defensive only.
+	if logsHandler != nil {
+		if rebuilt, buildErr := log.NewLoggerWithHandlers(cfg.LogLevel, stderr, logsHandler); buildErr != nil {
+			logger.Warn("otel logs: rebuilding logger with OTel handler failed", log.Err(buildErr))
+		} else {
+			logger = rebuilt
+		}
+	}
+
+	meterFactory := opts.MeterProviderFactory
+	if meterFactory == nil {
+		meterFactory = otel.SetupMetrics
+	}
+	meter, metricsShutdown, metricsErr := meterFactory(ctx, cfg.OTel, logger)
+	if metricsErr != nil {
+		logger.Warn("otel metrics init failed", log.Err(metricsErr))
+		meter, metricsShutdown = metricnoop.NewMeterProvider().Meter(fallbackMeterName), nil
+	}
+	if metricsShutdown == nil {
+		metricsShutdown = noopSignalShutdown
+	}
+
+	return logger, meter, logsShutdown, metricsShutdown
+}
+
+// otelActionDurationMetricName is the sole OTel metrics instrument this CPI
+// creates: a histogram of one dispatched CPI action's wall-clock
+// duration, in milliseconds. No per-PVE-call metrics exist by design — spans
+// already cover that at finer granularity.
+const otelActionDurationMetricName = "cpi.action.duration"
+
+// otelActionDurationStartKey is the unexported context key under which
+// otelActionDurationHook.Before stashes the call start time for After to
+// read, mirroring hooks.MetricsHook's identical pattern
+// (internal/cpi/hooks/metrics.go) so a single hook instance stays safe for
+// concurrent dispatch.
+type otelActionDurationStartKey struct{}
+
+// otelActionDurationHook records the cpi.action.duration histogram once per
+// dispatched CPI action. cpi.Dispatcher.Register wraps every registered
+// handler in the configured hook chain (see cpi.WrapHandler), so Before/After
+// bracket the same handler invocation the root span in runCPI covers,
+// letting this hook measure "one dispatched action" without runCPI/
+// dispatchOne needing any awareness of metrics. Outcome is classified as
+// "success" (handler returned a nil error) or "error" (non-nil error),
+// mirroring endRootSpan's binary success/error classification.
+// It is registered only when pve.otel.metrics.enabled is true; when
+// disabled, no histogram is created and this hook is never added to the
+// dispatcher's hook chain (see runWithArgs), so a metrics-disabled
+// deployment pays zero per-call overhead from this hook.
+type otelActionDurationHook struct {
+	histogram metric.Float64Histogram
+}
+
+// Before records the call start time in the returned context.
+func (h *otelActionDurationHook) Before(ctx context.Context, _ string, _ []json.RawMessage, _ jsonrpc.Context) context.Context {
+	return context.WithValue(ctx, otelActionDurationStartKey{}, time.Now())
+}
+
+// After records one cpi.action.duration observation carrying cpi.method and
+// outcome attributes. The result and error are returned unchanged — this
+// hook only observes, per the cpi.Hook contract's "built-in hooks observe
+// only" convention.
+func (h *otelActionDurationHook) After(ctx context.Context, method string, result any, err error) (any, error) {
+	start, ok := ctx.Value(otelActionDurationStartKey{}).(time.Time)
+	if !ok {
+		// Defensive: WrapHandler always threads Before's returned ctx straight
+		// into the handler and back into After, so this branch is unreachable
+		// in production. Skipping the recording (rather than recording a bogus
+		// zero-duration observation) keeps this hook fail-open like every
+		// other OTel signal in this package.
+		return result, err
+	}
+	outcome := "success"
+	if err != nil {
+		outcome = "error"
+	}
+	durationMS := float64(time.Since(start).Microseconds()) / 1000.0
+	h.histogram.Record(ctx, durationMS, metric.WithAttributes(
+		attribute.String("cpi.method", method),
+		attribute.String("outcome", outcome),
+	))
+	return result, err
+}
+
+var _ cpi.Hook = (*otelActionDurationHook)(nil)
 
 func main() {
 	os.Exit(run())
@@ -88,6 +227,27 @@ type runOptions struct {
 	// log/trace correlation without a network collector, or to force a
 	// shutdown error to prove it never changes the process exit code.
 	TracerFactory func(ctx context.Context, cfg config.OTelConfig, logger *log.Logger) (trace.Tracer, func(context.Context) error, error)
+
+	// LoggerProviderFactory constructs the OTel logs bridge slog.Handler and
+	// its bounded shutdown func, mirroring TracerFactory's injection seam.
+	// When nil, runWithArgs uses otel.SetupLogs. A nil returned handler (the
+	// disabled-path default, and the fail-open outcome of a setup error) means
+	// the process logger keeps its pre-OTel handler unmodified. Tests inject a
+	// factory returning a spy slog.Handler to assert the process logger fans
+	// records out to it once logs are enabled, or one that returns an error to
+	// prove a logs-setup failure never fails the CPI (the signal is simply
+	// treated as disabled and startup continues).
+	LoggerProviderFactory func(ctx context.Context, cfg config.OTelConfig, logger *log.Logger) (slog.Handler, func(context.Context) error, error)
+
+	// MeterProviderFactory constructs the OTel Meter used to create the
+	// cpi.action.duration histogram, and its bounded shutdown func, mirroring
+	// TracerFactory's injection seam. When nil, runWithArgs uses
+	// otel.SetupMetrics. Tests inject a factory backed by an in-memory metric
+	// reader to assert the histogram records the correct method/outcome
+	// attributes, or one that returns an error to prove a metrics-setup
+	// failure never fails the CPI (fail-open: metrics are treated as disabled
+	// and startup continues with a no-op Meter).
+	MeterProviderFactory func(ctx context.Context, cfg config.OTelConfig, logger *log.Logger) (metric.Meter, func(context.Context) error, error)
 
 	// MaxLineBytes overrides the per-request line size cap passed to runCPI.
 	// Zero selects defaultMaxLineBytes (64 MiB). Tests set a small value (e.g.
@@ -170,15 +330,21 @@ func runWithArgs(args []string, stdin io.Reader, stdout, stderr io.Writer, opts 
 		logger.Error("otel tracer init failed", log.Err(err))
 		return 1
 	}
+
+	logger, meter, logsShutdown, metricsShutdown := setupOTelLogsAndMetrics(rootCtx, cfg, stderr, logger, opts)
+
 	// Bounded shutdown flush covers every exit path downstream of this point:
 	// client init failure, agent init failure, hook errors, runCPI's error
-	// return, and the normal EOF return. The deadline's parent is
+	// return, and the normal EOF return. Each signal's shutdown gets its own
+	// freshly bounded deadline (rather than sharing one context/deadline
+	// across all three) so a slow or hung collector on one signal cannot
+	// starve the flush budget of another. The deadline's parent is
 	// context.Background() rather than rootCtx: by the time this defer runs,
 	// rootCtx may already be cancelled (e.g. by the same SIGTERM that ended
 	// the request loop), which would leave zero budget to flush buffered
-	// spans. A flush/export failure is logged at Warn and never changes the
-	// process's exit code: the flush deadline is bounded, and an export
-	// failure must never fail a CPI action.
+	// spans/logs/metrics. A flush/export failure is logged at Warn and never
+	// changes the process's exit code: every deadline is bounded, and an
+	// export failure must never fail a CPI action.
 	defer func() {
 		timeoutMs := cfg.OTel.ExportTimeoutMs
 		if timeoutMs <= 0 {
@@ -188,6 +354,18 @@ func runWithArgs(args []string, stdin io.Reader, stdout, stderr io.Writer, opts 
 		defer shutdownCancel()
 		if shutdownErr := otelShutdown(shutdownCtx); shutdownErr != nil {
 			logger.Warn("otel shutdown/flush failed", log.ErrScrubbed(shutdownErr))
+		}
+
+		logsShutdownCtx, logsShutdownCancel := context.WithTimeout(context.Background(), time.Duration(timeoutMs)*time.Millisecond)
+		defer logsShutdownCancel()
+		if shutdownErr := logsShutdown(logsShutdownCtx); shutdownErr != nil {
+			logger.Warn("otel logs shutdown/flush failed", log.ErrScrubbed(shutdownErr))
+		}
+
+		metricsShutdownCtx, metricsShutdownCancel := context.WithTimeout(context.Background(), time.Duration(timeoutMs)*time.Millisecond)
+		defer metricsShutdownCancel()
+		if shutdownErr := metricsShutdown(metricsShutdownCtx); shutdownErr != nil {
+			logger.Warn("otel metrics shutdown/flush failed", log.ErrScrubbed(shutdownErr))
 		}
 	}()
 
@@ -258,6 +436,24 @@ func runWithArgs(args []string, stdin io.Reader, stdout, stderr io.Writer, opts 
 		}
 		hookChain = append(hookChain, mh)
 		logger.Info("metrics hook enabled", log.String("path", cfg.MetricsConfig().FilePath))
+	}
+	// OTel action-duration metric (cpi.action.duration) is opt-in per
+	// pve.otel.metrics.enabled, independent of the file-based metrics hook
+	// above. Off (the default): no histogram is created and no
+	// hook is added, so a metrics-disabled deployment pays zero per-call
+	// overhead beyond this one bool check.
+	if cfg.OTelMetricsEnabled() {
+		histogram, histErr := meter.Float64Histogram(
+			otelActionDurationMetricName,
+			metric.WithUnit("ms"),
+			metric.WithDescription("Duration of one dispatched CPI action, in milliseconds."),
+		)
+		if histErr != nil {
+			logger.Warn("otel metrics: cpi.action.duration histogram init failed", log.Err(histErr))
+		} else {
+			hookChain = append(hookChain, &otelActionDurationHook{histogram: histogram})
+			logger.Info("otel metrics: cpi.action.duration histogram enabled")
+		}
 	}
 
 	// Apply the operator's task-poll cadence process-wide before serving. With
@@ -454,7 +650,7 @@ func runCPI(
 		// w is passed alongside bw so the backstop can write a clean CloudError
 		// to a fresh bufio.Writer if bw's internal state was corrupted by a panic
 		// mid-flush.
-		if loopErr := dispatchOne(reqCtx, bw, w, d, req, logger, span); loopErr != nil {
+		if loopErr := dispatchOne(reqCtx, bw, w, d, req, logger, span, tracer); loopErr != nil {
 			return loopErr
 		}
 
@@ -547,6 +743,11 @@ func endRootSpan(span trace.Span, resp *jsonrpc.Response) {
 // against w (the underlying writer) before writing the CloudError, ensuring a
 // clean JSON-RPC response reaches the Director rather than a partial + error
 // concatenation.
+//
+// tracer is used only by the recover block below to emit a fresh
+// cpi.response_write_failure span: span (the request's root span) is already
+// ended by endRootSpan (below, before writeResponse runs) whenever the panic
+// originates in writeResponse, so mutating span further is a documented no-op.
 func dispatchOne(
 	ctx context.Context,
 	bw *bufio.Writer,
@@ -555,6 +756,7 @@ func dispatchOne(
 	req *jsonrpc.Request,
 	logger *log.Logger,
 	span trace.Span,
+	tracer trace.Tracer,
 ) (retErr error) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -577,6 +779,10 @@ func dispatchOne(
 			// d.Handle completes (e.g. a bug in ctx/req handling ahead of it), this
 			// is the span's only chance to record the error before it ends.
 			endRootSpanErr(span, cpiErr)
+			// span is normally already ended (see above), so the write failure
+			// itself would otherwise leave zero trace of the failure: emit a fresh
+			// span dedicated to it.
+			recordResponseWriteFailureSpan(ctx, tracer, logger, req, cpiErr)
 			// Reset bw against the underlying writer to discard any bytes that were
 			// buffered before the panic. Without this, a partial response followed by
 			// the CloudError would produce a malformed concatenated output.
@@ -593,4 +799,46 @@ func dispatchOne(
 		return fmt.Errorf("cpi: write response: %w", writeErr)
 	}
 	return nil
+}
+
+// recordResponseWriteFailureSpan starts and immediately ends a fresh
+// "cpi.response_write_failure" span carrying Error status, a
+// log.ScrubMessage-scrubbed status/error message, and request_id/cpi.method
+// attributes matching the root span's own attribute conventions. It exists
+// because by the time dispatchOne's recover block runs for a writeResponse
+// panic, the request's root span has normally already been ended by
+// endRootSpan (called before writeResponse) — RecordError/SetStatus on an
+// already-ended span are documented no-ops (see endRootSpanErr) — so a fresh
+// span is the only way the write failure reaches the exported trace.
+//
+// This is best-effort telemetry emitted from inside an already-recovering
+// panic path: it must never itself panic or otherwise alter the CloudError
+// response dispatchOne's caller writes to stdout, so any panic here is
+// recovered and logged rather than propagated.
+func recordResponseWriteFailureSpan(
+	ctx context.Context,
+	tracer trace.Tracer,
+	logger *log.Logger,
+	req *jsonrpc.Request,
+	panicErr error,
+) {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Warn("cpi.response_write_failure span emission panicked",
+				log.String("request_id", req.Context.RequestID),
+				log.Any("panic", r),
+			)
+		}
+	}()
+	if tracer == nil {
+		return
+	}
+	msg := log.ScrubMessage(panicErr.Error())
+	_, failSpan := tracer.Start(ctx, "cpi.response_write_failure", trace.WithAttributes(
+		attribute.String("request_id", req.Context.RequestID),
+		attribute.String("cpi.method", req.Method),
+	))
+	failSpan.RecordError(errors.New(msg))
+	failSpan.SetStatus(codes.Error, msg)
+	failSpan.End()
 }

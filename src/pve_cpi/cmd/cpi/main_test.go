@@ -9,7 +9,8 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"go.opentelemetry.io/otel/trace/noop"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cloudinit"
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cluster"
@@ -330,8 +331,9 @@ func TestDispatchOne_WriteResponsePanic_EmitsCloudError(t *testing.T) {
 	sink := &panicOnFirstWrite{}
 	bw := bufio.NewWriter(sink)
 
-	_, span := noop.NewTracerProvider().Tracer("test").Start(context.Background(), "info")
-	err := dispatchOne(context.Background(), bw, sink, d, req, logger, span)
+	tracer, exporter := newSyncTracer()
+	_, span := tracer.Start(context.Background(), "info")
+	err := dispatchOne(context.Background(), bw, sink, d, req, logger, span, tracer)
 
 	// dispatchOne must not propagate the panic, and must return nil (write of the
 	// CloudError succeeded — the second write path no longer panics).
@@ -363,5 +365,45 @@ func TestDispatchOne_WriteResponsePanic_EmitsCloudError(t *testing.T) {
 	}
 	if !strings.Contains(resp.Error.Message, "backstop-req-006") {
 		t.Errorf("error message %q missing request_id", resp.Error.Message)
+	}
+
+	// The request's root span ("info") is already ended (with its own status,
+	// via endRootSpan) by the time writeResponse panics, so a fresh
+	// cpi.response_write_failure span is the only telemetry that can surface
+	// this failure.
+	spans := exporter.GetSpans()
+	var failSpan *tracetest.SpanStub
+	for i := range spans {
+		if spans[i].Name == "cpi.response_write_failure" {
+			failSpan = &spans[i]
+			break
+		}
+	}
+	if failSpan == nil {
+		t.Fatalf("no span named %q among exported spans: %+v", "cpi.response_write_failure", spans)
+	}
+	if failSpan.Status.Code != codes.Error {
+		t.Errorf("write-failure span status = %v, want codes.Error", failSpan.Status.Code)
+	}
+	if !strings.Contains(failSpan.Status.Description, "backstop-req-006") {
+		t.Errorf("write-failure span status description %q missing request_id", failSpan.Status.Description)
+	}
+	if reqID, ok := requestIDAttr(*failSpan); !ok || reqID != "backstop-req-006" {
+		t.Errorf("write-failure span request_id attribute = %q (present=%v), want %q", reqID, ok, "backstop-req-006")
+	}
+	var methodAttr string
+	var methodOK bool
+	for _, kv := range failSpan.Attributes {
+		if string(kv.Key) == "cpi.method" {
+			methodAttr = kv.Value.AsString()
+			methodOK = true
+			break
+		}
+	}
+	if !methodOK || methodAttr != "info" {
+		t.Errorf("write-failure span cpi.method attribute = %q (present=%v), want %q", methodAttr, methodOK, "info")
+	}
+	if len(failSpan.Events) == 0 || !strings.Contains(failSpan.Events[0].Name, "exception") {
+		t.Errorf("write-failure span missing recorded error event: %+v", failSpan.Events)
 	}
 }
