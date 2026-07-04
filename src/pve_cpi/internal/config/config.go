@@ -856,12 +856,14 @@ type OperationTimeoutConfig struct {
 	DefaultSec int `json:"default_sec,omitempty"`
 }
 
-// OTelConfig holds the opt-in OpenTelemetry tracing configuration. All fields
-// are honored only when Enabled is true (validate-only-when-set); a zero-value
-// block is equivalent to tracing off and adds zero overhead — no exporter is
-// constructed and no network dial is attempted. The exporter wire protocol is
-// fixed to OTLP http/protobuf; there is no protocol knob (grpc support is a
-// documented future upgrade, not a runtime choice).
+// OTelConfig holds the opt-in OpenTelemetry configuration for the traces,
+// logs, and metrics signals. Trace fields are honored only when Enabled is
+// true; logs/metrics fields are honored only when LogsEnabled/MetricsEnabled
+// are true respectively (validate-only-when-set, independent per signal). A
+// zero-value block is equivalent to all signals off and adds zero overhead —
+// no exporter is constructed and no network dial is attempted. Protocol
+// selects OTLP http/protobuf or OTLP gRPC uniformly across whichever signals
+// are enabled.
 type OTelConfig struct {
 	// Enabled turns on tracing. Default false. Plain bool (not pointer)
 	// because the default IS false, so there is no unset-vs-explicit-false
@@ -896,6 +898,31 @@ type OTelConfig struct {
 	// means "use default"; ApplyDefaults fills 5000 when Enabled is true and
 	// this field is zero.
 	ExportTimeoutMs int `json:"export_timeout_ms,omitempty"`
+
+	// Protocol selects the OTLP exporter wire protocol ("http" or "grpc"),
+	// applied uniformly to whichever signals (traces/logs/metrics) are
+	// enabled. Empty means "use default"; ApplyDefaults fills "http" when
+	// any signal is enabled and this field is empty.
+	Protocol string `json:"protocol,omitempty"`
+
+	// LogsEnabled turns on the OTel logs signal. Default false. Independent
+	// of Enabled (traces) — a deployment may export logs without traces.
+	LogsEnabled bool `json:"logs_enabled,omitempty"`
+
+	// MetricsEnabled turns on the OTel metrics signal. Default false.
+	// Independent of Enabled (traces) and LogsEnabled.
+	MetricsEnabled bool `json:"metrics_enabled,omitempty"`
+
+	// LogsExporterEndpoint is the OTLP collector endpoint for the logs
+	// signal. Empty means "use default"; ApplyDefaults fills it from
+	// ExporterEndpoint when LogsEnabled is true and this field is empty.
+	LogsExporterEndpoint string `json:"logs_exporter_endpoint,omitempty"`
+
+	// MetricsExporterEndpoint is the OTLP collector endpoint for the
+	// metrics signal. Empty means "use default"; ApplyDefaults fills it
+	// from ExporterEndpoint when MetricsEnabled is true and this field is
+	// empty.
+	MetricsExporterEndpoint string `json:"metrics_exporter_endpoint,omitempty"`
 }
 
 // PlacementConfig holds all availability-aware node-selection knobs.
@@ -1498,21 +1525,31 @@ func (c *CPIConfig) applyPlacementDefaults() {
 	}
 }
 
-// applyOTelDefaults fills zero-value OTel fields when tracing is enabled. A
-// no-op when Enabled is false, so the (default) disabled block is never
-// touched and stays byte-identical to a fresh zero value.
+// applyOTelDefaults fills zero-value OTel fields when the relevant signal is
+// enabled. A no-op for a field group whose signal is disabled, so a fully
+// disabled block (all three signals false) is never touched and stays
+// byte-identical to a fresh zero value.
 func (c *CPIConfig) applyOTelDefaults() {
-	if !c.OTel.Enabled {
-		return
+	anyEnabled := c.OTel.Enabled || c.OTel.LogsEnabled || c.OTel.MetricsEnabled
+	if anyEnabled && c.OTel.Protocol == "" {
+		c.OTel.Protocol = "http"
 	}
-	if c.OTel.ServiceName == "" {
-		c.OTel.ServiceName = "bosh-pve-cpi"
+	if c.OTel.Enabled {
+		if c.OTel.ServiceName == "" {
+			c.OTel.ServiceName = "bosh-pve-cpi"
+		}
+		if c.OTel.SampleRatio == 0 {
+			c.OTel.SampleRatio = 1.0
+		}
+		if c.OTel.ExportTimeoutMs == 0 {
+			c.OTel.ExportTimeoutMs = 5000
+		}
 	}
-	if c.OTel.SampleRatio == 0 {
-		c.OTel.SampleRatio = 1.0
+	if c.OTel.LogsEnabled && c.OTel.LogsExporterEndpoint == "" {
+		c.OTel.LogsExporterEndpoint = c.OTel.ExporterEndpoint
 	}
-	if c.OTel.ExportTimeoutMs == 0 {
-		c.OTel.ExportTimeoutMs = 5000
+	if c.OTel.MetricsEnabled && c.OTel.MetricsExporterEndpoint == "" {
+		c.OTel.MetricsExporterEndpoint = c.OTel.ExporterEndpoint
 	}
 }
 
@@ -2388,6 +2425,26 @@ func (c *CPIConfig) OTelEnabled() bool {
 		return false
 	}
 	return c.OTel.Enabled
+}
+
+// OTelLogsEnabled reports whether the OTel logs signal is turned on. A nil
+// receiver returns false (matches the nil-safe accessor convention used
+// throughout this package).
+func (c *CPIConfig) OTelLogsEnabled() bool {
+	if c == nil {
+		return false
+	}
+	return c.OTel.LogsEnabled
+}
+
+// OTelMetricsEnabled reports whether the OTel metrics signal is turned on. A
+// nil receiver returns false (matches the nil-safe accessor convention used
+// throughout this package).
+func (c *CPIConfig) OTelMetricsEnabled() bool {
+	if c == nil {
+		return false
+	}
+	return c.OTel.MetricsEnabled
 }
 
 // Operation-timeout class defaults in seconds. Generous so the envelope only
@@ -3317,29 +3374,48 @@ func (c *CPIConfig) validateOperationTimeout(errs *[]string) {
 	checkSec("default_sec", ot.DefaultSec)
 }
 
-// validateOTel appends errors for the OTel tracing block. Runs only when
-// Enabled is true (validate-only-when-set) — a disabled/absent block never
-// produces a validation error, preserving zero-behavior-change-when-unset.
+// validateOTel appends errors for the OTel block. Trace-specific checks run
+// only when Enabled is true; logs/metrics checks run only when their signal
+// is enabled (validate-only-when-set, independent per signal) — a fully
+// disabled block never produces a validation error, preserving
+// zero-behavior-change-when-unset.
 func (c *CPIConfig) validateOTel(errs *[]string) {
-	if !c.OTel.Enabled {
-		return
-	}
-	if c.OTel.ExporterEndpoint == "" {
-		*errs = append(*errs, "otel.exporter_endpoint is required when otel.enabled is true")
-	}
-	if c.OTel.SampleRatio < 0 || c.OTel.SampleRatio > 1 {
+	// Protocol is required only for the logs/metrics signals: they are new
+	// this pass and have no pre-existing callers, so requiring it is safe.
+	// Trace-only (Enabled) callers that invoke Validate directly without
+	// ApplyDefaults predate Protocol and must keep validating exactly as
+	// before (preserve-existing-behavior-unchanged); the normal
+	// ApplyDefaults-then-Validate flow always fills Protocol="http" for a
+	// trace-enabled config before Validate ever sees it.
+	if (c.OTel.LogsEnabled || c.OTel.MetricsEnabled) &&
+		c.OTel.Protocol != "http" && c.OTel.Protocol != "grpc" {
 		*errs = append(*errs, fmt.Sprintf(
-			"otel.sample_ratio must be 0.0-1.0, got %v", c.OTel.SampleRatio))
+			"otel.protocol must be \"http\" or \"grpc\", got %q", c.OTel.Protocol))
 	}
-	if c.OTel.ExportTimeoutMs <= 0 {
-		*errs = append(*errs, fmt.Sprintf(
-			"otel.export_timeout_ms must be > 0, got %d", c.OTel.ExportTimeoutMs))
+	if c.OTel.Enabled {
+		if c.OTel.ExporterEndpoint == "" {
+			*errs = append(*errs, "otel.exporter_endpoint is required when otel.enabled is true")
+		}
+		if c.OTel.SampleRatio < 0 || c.OTel.SampleRatio > 1 {
+			*errs = append(*errs, fmt.Sprintf(
+				"otel.sample_ratio must be 0.0-1.0, got %v", c.OTel.SampleRatio))
+		}
+		if c.OTel.ExportTimeoutMs <= 0 {
+			*errs = append(*errs, fmt.Sprintf(
+				"otel.export_timeout_ms must be > 0, got %d", c.OTel.ExportTimeoutMs))
+		}
+		// ApplyDefaults fills ServiceName from empty when Enabled is true, so
+		// this only fires for a caller that invokes Validate directly
+		// (bypassing ApplyDefaults) with an explicit blank override.
+		if c.OTel.ServiceName == "" {
+			*errs = append(*errs, "otel.service_name must not be empty when otel.enabled is true")
+		}
 	}
-	// ApplyDefaults fills ServiceName from empty when Enabled is true, so this
-	// only fires for a caller that invokes Validate directly (bypassing
-	// ApplyDefaults) with an explicit blank override.
-	if c.OTel.ServiceName == "" {
-		*errs = append(*errs, "otel.service_name must not be empty when otel.enabled is true")
+	if c.OTel.LogsEnabled && c.OTel.LogsExporterEndpoint == "" {
+		*errs = append(*errs, "otel.logs_exporter_endpoint is required when otel.logs_enabled is true")
+	}
+	if c.OTel.MetricsEnabled && c.OTel.MetricsExporterEndpoint == "" {
+		*errs = append(*errs, "otel.metrics_exporter_endpoint is required when otel.metrics_enabled is true")
 	}
 }
 

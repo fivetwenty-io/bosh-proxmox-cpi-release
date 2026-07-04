@@ -5940,3 +5940,196 @@ func TestStorageHeadroom_ByteIdenticalWhenUnset(t *testing.T) {
 		}
 	}
 }
+
+// --------------------------------------------------------------------------
+// OTelConfig: logs/metrics signal extension (Protocol, LogsEnabled,
+// MetricsEnabled, LogsExporterEndpoint, MetricsExporterEndpoint).
+// --------------------------------------------------------------------------
+
+func TestOTelSignals_ZeroValue_ByteIdenticalToToday(t *testing.T) {
+	t.Parallel()
+	c := baseValidCfg()
+	if err := c.Validate(); err != nil {
+		t.Fatalf("zero-value OTel signals produced a validation error: %v", err)
+	}
+	if c.OTel != (config.OTelConfig{}) {
+		t.Errorf("ApplyDefaults mutated a fully disabled OTel block: got %+v, want zero value", c.OTel)
+	}
+}
+
+func TestOTelSignals_DefaultProtocolHTTP(t *testing.T) {
+	t.Parallel()
+	c := baseValidCfg()
+	c.OTel = config.OTelConfig{LogsEnabled: true, LogsExporterEndpoint: "collector:4318"}
+	c.ApplyDefaults()
+	if c.OTel.Protocol != "http" {
+		t.Errorf("Protocol = %q, want default %q", c.OTel.Protocol, "http")
+	}
+	if err := c.Validate(); err != nil {
+		t.Errorf("expected valid config after defaulting, got %v", err)
+	}
+}
+
+func TestOTelSignals_GRPCProtocolValid(t *testing.T) {
+	t.Parallel()
+	c := baseValidCfg()
+	c.OTel = config.OTelConfig{
+		LogsEnabled:          true,
+		Protocol:             "grpc",
+		LogsExporterEndpoint: "collector:4317",
+	}
+	c.ApplyDefaults()
+	if c.OTel.Protocol != "grpc" {
+		t.Errorf("Protocol overwritten by ApplyDefaults: got %q, want %q", c.OTel.Protocol, "grpc")
+	}
+	if err := c.Validate(); err != nil {
+		t.Errorf("expected valid grpc config, got %v", err)
+	}
+}
+
+func TestOTelSignals_InvalidProtocolRejected(t *testing.T) {
+	t.Parallel()
+	c := baseValidCfg()
+	c.OTel = config.OTelConfig{
+		MetricsEnabled:          true,
+		Protocol:                "quic",
+		MetricsExporterEndpoint: "collector:4318",
+	}
+	err := c.Validate()
+	if err == nil {
+		t.Fatal("expected a validation error for protocol \"quic\", got nil")
+	}
+	if !strings.Contains(err.Error(), `otel.protocol must be "http" or "grpc", got "quic"`) {
+		t.Errorf("error %q does not mention the protocol violation", err.Error())
+	}
+}
+
+func TestOTelSignals_LogsEndpointInheritsShared(t *testing.T) {
+	t.Parallel()
+	c := baseValidCfg()
+	c.OTel = config.OTelConfig{
+		LogsEnabled:      true,
+		ExporterEndpoint: "shared-collector:4318",
+		// LogsExporterEndpoint left empty.
+	}
+	c.ApplyDefaults()
+	if c.OTel.LogsExporterEndpoint != "shared-collector:4318" {
+		t.Errorf("LogsExporterEndpoint = %q, want inherited %q",
+			c.OTel.LogsExporterEndpoint, "shared-collector:4318")
+	}
+	if err := c.Validate(); err != nil {
+		t.Errorf("expected valid config after inheriting shared endpoint, got %v", err)
+	}
+}
+
+func TestOTelSignals_LogsEndpointExplicitOverride(t *testing.T) {
+	t.Parallel()
+	c := baseValidCfg()
+	c.OTel = config.OTelConfig{
+		LogsEnabled:          true,
+		ExporterEndpoint:     "shared-collector:4318",
+		LogsExporterEndpoint: "logs-only-collector:4318",
+	}
+	c.ApplyDefaults()
+	if c.OTel.LogsExporterEndpoint != "logs-only-collector:4318" {
+		t.Errorf("LogsExporterEndpoint override overwritten: got %q, want %q",
+			c.OTel.LogsExporterEndpoint, "logs-only-collector:4318")
+	}
+}
+
+func TestOTelSignals_MetricsEnabledIndependentOfTracesDisabled(t *testing.T) {
+	t.Parallel()
+	c := baseValidCfg()
+	c.OTel = config.OTelConfig{
+		MetricsEnabled:   true,
+		ExporterEndpoint: "shared-collector:4318",
+		// Enabled (traces) left false.
+	}
+	c.ApplyDefaults()
+	if c.OTel.Enabled {
+		t.Fatalf("Enabled should remain false, ApplyDefaults must not couple metrics to traces")
+	}
+	if c.OTel.MetricsExporterEndpoint != "shared-collector:4318" {
+		t.Errorf("MetricsExporterEndpoint = %q, want inherited %q",
+			c.OTel.MetricsExporterEndpoint, "shared-collector:4318")
+	}
+	if err := c.Validate(); err != nil {
+		t.Errorf("expected valid metrics-only config with traces disabled, got %v", err)
+	}
+	// Trace-only validations (exporter_endpoint/sample_ratio/export_timeout_ms/
+	// service_name required) must not fire when Enabled is false.
+	if c.OTel.ServiceName != "" {
+		t.Errorf("ApplyDefaults filled ServiceName despite Enabled=false: got %q", c.OTel.ServiceName)
+	}
+}
+
+func TestOTelSignals_LogsEnabled_EmptyEndpointAfterDefaulting_Errors(t *testing.T) {
+	t.Parallel()
+	c := baseValidCfg()
+	// Neither ExporterEndpoint nor LogsExporterEndpoint set: defaulting has
+	// nothing to inherit from, so validation must reject the empty endpoint.
+	c.OTel = config.OTelConfig{LogsEnabled: true}
+	c.ApplyDefaults()
+	err := c.Validate()
+	if err == nil || !strings.Contains(err.Error(), "otel.logs_exporter_endpoint is required") {
+		t.Fatalf("expected logs_exporter_endpoint error, got %v", err)
+	}
+}
+
+func TestOTelSignals_MetricsEnabled_EmptyEndpointAfterDefaulting_Errors(t *testing.T) {
+	t.Parallel()
+	c := baseValidCfg()
+	c.OTel = config.OTelConfig{MetricsEnabled: true}
+	c.ApplyDefaults()
+	err := c.Validate()
+	if err == nil || !strings.Contains(err.Error(), "otel.metrics_exporter_endpoint is required") {
+		t.Fatalf("expected metrics_exporter_endpoint error, got %v", err)
+	}
+}
+
+func TestOTelSignals_AllThreeIndependentlyEnabled_SharedEndpointInherited(t *testing.T) {
+	t.Parallel()
+	c := baseValidCfg()
+	c.OTel = config.OTelConfig{
+		Enabled:          true,
+		LogsEnabled:      true,
+		MetricsEnabled:   true,
+		ExporterEndpoint: "shared-collector:4318",
+	}
+	c.ApplyDefaults()
+	if c.OTel.LogsExporterEndpoint != "shared-collector:4318" {
+		t.Errorf("LogsExporterEndpoint not inherited: got %q", c.OTel.LogsExporterEndpoint)
+	}
+	if c.OTel.MetricsExporterEndpoint != "shared-collector:4318" {
+		t.Errorf("MetricsExporterEndpoint not inherited: got %q", c.OTel.MetricsExporterEndpoint)
+	}
+	if err := c.Validate(); err != nil {
+		t.Errorf("expected valid all-signals config, got %v", err)
+	}
+}
+
+func TestOTelLogsEnabled_Accessor(t *testing.T) {
+	t.Parallel()
+	c := baseValidCfg()
+	c.OTel.LogsEnabled = true
+	if !c.OTelLogsEnabled() {
+		t.Errorf("OTelLogsEnabled() = false, want true")
+	}
+	var nilC *config.CPIConfig
+	if nilC.OTelLogsEnabled() {
+		t.Errorf("OTelLogsEnabled() on nil receiver = true, want false")
+	}
+}
+
+func TestOTelMetricsEnabled_Accessor(t *testing.T) {
+	t.Parallel()
+	c := baseValidCfg()
+	c.OTel.MetricsEnabled = true
+	if !c.OTelMetricsEnabled() {
+		t.Errorf("OTelMetricsEnabled() = false, want true")
+	}
+	var nilC *config.CPIConfig
+	if nilC.OTelMetricsEnabled() {
+		t.Errorf("OTelMetricsEnabled() on nil receiver = true, want false")
+	}
+}

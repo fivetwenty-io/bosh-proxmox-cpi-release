@@ -523,14 +523,23 @@
     config["operation_timeout"] = operation_timeout
   end
 
-  # Emit otel block only when tracing is explicitly enabled. Absent (default
-  # false) means the Go zero-value OTelConfig disables tracing entirely --
-  # byte-identical to prior releases and zero dispatch-path overhead. Once
-  # enabled, exporter_endpoint is always emitted (required, no default worth
-  # hiding); the remaining sub-keys are omit-when-default so an untouched
-  # knob keeps the Go accessor's shipped default.
-  if p("pve.otel.enabled", false)
-    otel = { "enabled" => true }
+  # Emit otel block when any of the three signals (traces, logs, metrics) is
+  # explicitly enabled. Absent (all three default false) means the Go
+  # zero-value OTelConfig disables every signal -- byte-identical to prior
+  # releases and zero dispatch-path overhead. Each signal's own sub-keys are
+  # omit-when-default so an untouched knob keeps the Go accessor's shipped
+  # default; "enabled" flags are omitted (not just false) when off, matching
+  # Go's `omitempty` zero value.
+  otel_traces_enabled = p("pve.otel.enabled", false)
+  otel_logs_enabled = p("pve.otel.logs.enabled", false)
+  otel_metrics_enabled = p("pve.otel.metrics.enabled", false)
+  if otel_traces_enabled || otel_logs_enabled || otel_metrics_enabled
+    otel = {}
+    otel["enabled"] = true if otel_traces_enabled
+
+    # exporter_endpoint is always emitted (required for traces, and the
+    # shared fallback for logs/metrics per-signal endpoints) when any signal
+    # is on; the remaining trace sub-keys are omit-when-default.
     otel["exporter_endpoint"] = p("pve.otel.exporter_endpoint", "")
     otel_insecure = p("pve.otel.insecure", false)
     otel["insecure"] = true if otel_insecure
@@ -544,6 +553,35 @@
     otel["sample_ratio"] = otel_sample_ratio unless otel_sample_ratio == 1.0
     otel_export_timeout_ms = p("pve.otel.export_timeout_ms", 5000).to_i
     otel["export_timeout_ms"] = otel_export_timeout_ms unless otel_export_timeout_ms == 5000
+
+    # protocol applies uniformly to whichever signals are enabled above.
+    otel_protocol = p("pve.otel.protocol", "http")
+    unless %w[http grpc].include?(otel_protocol)
+      raise "pve.otel.protocol must be \"http\" or \"grpc\" (got #{otel_protocol.inspect})"
+    end
+    otel["protocol"] = otel_protocol unless otel_protocol == "http"
+
+    # logs signal: independent of traces. exporter_endpoint falls
+    # back to the shared pve.otel.exporter_endpoint when left empty; render
+    # fails if both are empty while the signal is enabled.
+    otel["logs_enabled"] = true if otel_logs_enabled
+    otel_logs_endpoint = p("pve.otel.logs.exporter_endpoint", "")
+    otel["logs_exporter_endpoint"] = otel_logs_endpoint unless otel_logs_endpoint.empty?
+    if otel_logs_enabled && otel_logs_endpoint.empty? && p("pve.otel.exporter_endpoint", "").empty?
+      raise "pve.otel.logs.exporter_endpoint (or pve.otel.exporter_endpoint) is " \
+            "required when pve.otel.logs.enabled is true"
+    end
+
+    # metrics signal: independent of traces, same fallback/raise
+    # pattern as logs above.
+    otel["metrics_enabled"] = true if otel_metrics_enabled
+    otel_metrics_endpoint = p("pve.otel.metrics.exporter_endpoint", "")
+    otel["metrics_exporter_endpoint"] = otel_metrics_endpoint unless otel_metrics_endpoint.empty?
+    if otel_metrics_enabled && otel_metrics_endpoint.empty? && p("pve.otel.exporter_endpoint", "").empty?
+      raise "pve.otel.metrics.exporter_endpoint (or pve.otel.exporter_endpoint) is " \
+            "required when pve.otel.metrics.enabled is true"
+    end
+
     config["otel"] = otel
   end
 

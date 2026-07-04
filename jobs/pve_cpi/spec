@@ -611,25 +611,29 @@ properties:
   pve.otel.enabled:
     description: |
       When true, the CPI emits OpenTelemetry traces for each RPC and the PVE
-      API calls it makes, exported via OTLP http/protobuf to
+      API calls it makes, exported via OTLP (see pve.otel.protocol) to
       pve.otel.exporter_endpoint. Default false; when false no tracer
       provider is built, no network connection is opened, and PVE API calls
       bypass the tracing layer entirely.
     default: false
   pve.otel.exporter_endpoint:
     description: |
-      Base URL of the OTLP http/protobuf collector endpoint (host:port or
-      full URL). Required when pve.otel.enabled is true; ignored otherwise.
+      Base URL of the OTLP collector endpoint (host:port or full URL) used
+      for traces. Required when pve.otel.enabled is true. Also serves as the
+      fallback endpoint for the logs and metrics signals when their own
+      endpoint properties are left empty.
     default: ""
   pve.otel.insecure:
     description: |
-      When true, the OTLP exporter connects over plain HTTP instead of TLS.
-      Default false (TLS). Only relevant when pve.otel.enabled is true.
+      When true, the OTLP exporters connect over plain HTTP/gRPC instead of
+      TLS. Default false (TLS). Applies to every enabled signal (traces,
+      logs, and metrics).
     default: false
   pve.otel.service_name:
     description: |
       Value of the service.name resource attribute attached to every emitted
-      span, identifying this CPI instance to the tracing backend.
+      span, log record, and metric, identifying this CPI instance to the
+      observability backend.
     default: "bosh-pve-cpi"
   pve.otel.sample_ratio:
     description: |
@@ -640,12 +644,59 @@ properties:
     default: 1.0
   pve.otel.export_timeout_ms:
     description: |
-      Upper bound, in milliseconds, on how long span export is allowed to
-      block during process shutdown. Export failures after this deadline are
-      logged at Warn level and never fail the CPI action. A value of 0 is
-      treated as unset and yields the 5000 default; negative values fail
-      validation at CPI startup. Only relevant when pve.otel.enabled is true.
+      Upper bound, in milliseconds, on how long telemetry export is allowed
+      to block during process shutdown; each enabled signal's final flush
+      (traces, logs, metrics) gets its own deadline of this length. Export
+      failures after the deadline are logged at Warn level and never fail
+      the CPI action. A value of 0 is treated as unset and yields the 5000
+      default; negative values fail validation at CPI startup when tracing
+      is enabled.
     default: 5000
+  pve.otel.protocol:
+    description: |
+      OTLP wire protocol used by the exporter for every enabled signal
+      (traces, logs, metrics): "http" for OTLP/HTTP protobuf (collector's
+      conventional port 4318) or "grpc" for OTLP/gRPC (conventional port
+      4317). One protocol applies uniformly across whichever signals are
+      enabled; there is no per-signal override. Rendering fails on any
+      other value. Only relevant when pve.otel.enabled, pve.otel.logs.enabled,
+      or pve.otel.metrics.enabled is true.
+    default: "http"
+  pve.otel.logs.enabled:
+    description: |
+      When true, the CPI exports its structured stderr logs as OpenTelemetry
+      log records via OTLP to pve.otel.logs.exporter_endpoint (or, if that is
+      empty, pve.otel.exporter_endpoint). Independent of pve.otel.enabled:
+      logs can be exported with tracing off. Default false; when false no
+      log exporter is built, no network connection is opened for logs, and
+      export failures never fail a CPI call (fail-open).
+    default: false
+  pve.otel.logs.exporter_endpoint:
+    description: |
+      OTLP collector endpoint for the logs signal. When
+      pve.otel.logs.enabled is true and this is left empty, it defaults to
+      pve.otel.exporter_endpoint. Rendering fails if both are empty while
+      pve.otel.logs.enabled is true. Ignored when pve.otel.logs.enabled is
+      false.
+    default: ""
+  pve.otel.metrics.enabled:
+    description: |
+      When true, the CPI records a cpi.action.duration histogram (per
+      dispatched CPI method, tagged with outcome) and exports it via OTLP
+      to pve.otel.metrics.exporter_endpoint (or, if that is empty,
+      pve.otel.exporter_endpoint). Independent of pve.otel.enabled: metrics
+      can be exported with tracing off. Default false; when false no
+      metrics provider is built, no network connection is opened for
+      metrics, and export failures never fail a CPI call (fail-open).
+    default: false
+  pve.otel.metrics.exporter_endpoint:
+    description: |
+      OTLP collector endpoint for the metrics signal. When
+      pve.otel.metrics.enabled is true and this is left empty, it defaults
+      to pve.otel.exporter_endpoint. Rendering fails if both are empty
+      while pve.otel.metrics.enabled is true. Ignored when
+      pve.otel.metrics.enabled is false.
+    default: ""
   pve.debug.keep_failed_vms:
     description: |
       Diagnostic mode. When true, a VM that fails mid-creation is NOT destroyed.
