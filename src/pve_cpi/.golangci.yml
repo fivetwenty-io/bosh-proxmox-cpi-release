@@ -28,6 +28,7 @@ linters:
     - unused
     # Extended gate — R1 CAT-2..14
     - errorlint
+    - forbidigo
     - gocritic
     - noctx
     - revive
@@ -43,6 +44,28 @@ linters:
     - unparam
 
   settings:
+    forbidigo:
+      # Match method calls on arbitrary receivers (deps.PVE.Storage().X), not
+      # just package-qualified identifiers. NB: patterns are matched against
+      # the expression with intermediate call parens stripped —
+      # deps.PVE.Tasks().GetStatus is matched as deps.PVE.Tasks.GetStatus —
+      # so patterns must never include literal \(\).
+      analyze-types: true
+      forbid:
+        # PVE's DELETE queues an async imgdel task; the sync DeleteVolume /
+        # DeleteVolumeIfExists variants discard the UPID, so a queued imgdel
+        # can destroy a subsequently-recreated volume of the same name. Sync
+        # DeleteVolumeIfExists remains allowed only where no same-name reuse
+        # follows; plain DeleteVolume has no safe first-party use.
+        - pattern: '\.DeleteVolume$'
+          msg: "sync DeleteVolume discards the imgdel UPID; use DeleteVolumeAsync + pve.AwaitTaskWithLogger"
+        # Task awaiting is policy (adaptive poll, log streaming, timeout
+        # classification) owned by internal/pve; handlers must not hand-roll
+        # polling against the raw tasks service. Allowed inside internal/pve
+        # via the path exclusion below.
+        - pattern: '\.Tasks\b'
+          msg: "await tasks via pve.AwaitTask / pve.AwaitTaskWithLogger, not raw Tasks() polling"
+
     gocyclo:
       min-complexity: 40
 
@@ -153,6 +176,16 @@ linters:
         text: "Error return value of `(fmt\\.Fprintf|fmt\\.Fprintln)` is not checked"
         linters:
           - errcheck
+      # internal/pve owns task-await policy (AwaitTask, adaptive poll); the
+      # raw Tasks() service is its implementation surface, not a bypass.
+      - path: "internal/pve/"
+        text: "await tasks via pve.AwaitTask"
+        linters:
+          - forbidigo
+      # Test fakes implement and directly exercise the forbidden sync methods.
+      - path: "_test\\.go$"
+        linters:
+          - forbidigo
       # Test files: a number of linter classes generate noise without surfacing
       # real defects in test code. Tests are allowed to panic on bad inputs,
       # repeat domain literals for table-driven cases, shadow imported package
