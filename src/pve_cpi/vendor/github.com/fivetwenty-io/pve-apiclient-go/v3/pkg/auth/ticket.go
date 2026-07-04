@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -14,6 +15,21 @@ import (
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/internal/constants"
 	apierrors "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/errors"
 )
+
+// maxErrorBodySnippet bounds how much of a non-2xx response body is read for
+// error reporting. Error bodies from PVE are small JSON objects; the bound
+// exists to protect against a misbehaving reverse proxy returning an
+// oversized (or unbounded/streaming) HTML error page.
+const maxErrorBodySnippet = 4096
+
+// readBoundedBody reads up to maxErrorBodySnippet bytes from r. It is used
+// only for building diagnostic error messages from non-2xx responses, never
+// for decoding a successful response body.
+func readBoundedBody(r io.Reader) []byte {
+	body, _ := io.ReadAll(io.LimitReader(r, maxErrorBodySnippet))
+
+	return body
+}
 
 var (
 	ErrAuthenticationFailedNoTicket = errors.New("authentication failed: no ticket received")
@@ -216,7 +232,12 @@ func (ta *TicketAuthenticator) RefreshForce() error {
 	return ErrAuthenticationFailedNoTicket
 }
 
-// Logout performs logout operations.
+// Logout invalidates the ticket on the server and clears local authentication
+// state. The local ticket is cleared only when the server confirms the
+// logout with a 2xx response. On any other status (a permission error, a
+// server error, or a proxy returning an HTML error page) the local ticket is
+// left untouched and an error carrying the HTTP status and a bounded body
+// snippet is returned, so the caller can inspect the failure and retry.
 func (ta *TicketAuthenticator) Logout() error {
 	ta.mu.RLock()
 	hasTicket := ta.ticket != nil
@@ -245,6 +266,14 @@ func (ta *TicketAuthenticator) Logout() error {
 	defer func() {
 		_ = resp.Body.Close()
 	}()
+
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		body := readBoundedBody(resp.Body)
+
+		return fmt.Errorf(
+			"logout failed with status %d: %w", resp.StatusCode, apierrors.ParseAPIError(resp.StatusCode, body),
+		)
+	}
 
 	ta.mu.Lock()
 	ta.ticket = nil
@@ -296,6 +325,21 @@ func (ta *TicketAuthenticator) CompleteTFA(challenge *TFAChallenge, response *TF
 		_ = resp.Body.Close()
 	}()
 
+	// Gate on status before decoding: a non-2xx response (e.g. a reverse
+	// proxy returning an HTML 502/503 page) is not guaranteed to be the JSON
+	// TFA envelope, so build the error directly from a bounded body snippet
+	// instead of attempting to decode it.
+	if resp.StatusCode != http.StatusOK {
+		body := readBoundedBody(resp.Body)
+
+		return &AuthResult{
+			Success: false,
+			Error: fmt.Errorf(
+				"TFA request failed with status %d: %w", resp.StatusCode, apierrors.ParseAPIError(resp.StatusCode, body),
+			),
+		}, nil
+	}
+
 	tfaResp, err := ta.parseTFAResponse(resp)
 	if err != nil {
 		return nil, err
@@ -341,6 +385,8 @@ func (ta *TicketAuthenticator) sendTFARequest(req *http.Request) (*http.Response
 	return resp, nil
 }
 
+// parseTFAResponse decodes the TFA JSON envelope. Callers must only invoke
+// this for a 2xx response; CompleteTFA gates on status before calling it.
 func (ta *TicketAuthenticator) parseTFAResponse(resp *http.Response) (*tfaResponse, error) {
 	var tfaResp tfaResponse
 
@@ -466,23 +512,43 @@ func (ta *TicketAuthenticator) sendLoginRequest(req *http.Request) (*http.Respon
 	return resp, nil
 }
 
+// loginResponse is the JSON envelope PVE returns from POST /access/ticket,
+// covering both a successful login and a TFA challenge.
+type loginResponse struct {
+	Data struct {
+		Ticket              string                 `json:"ticket"`
+		CSRFPreventionToken string                 `json:"CSRFPreventionToken"`
+		Username            string                 `json:"username"`
+		Cap                 map[string]interface{} `json:"cap"`
+		// TFA fields
+		NeedTFA   bool     `json:"NeedTFA,omitempty"`
+		Ticket2   string   `json:"ticket2,omitempty"`
+		Challenge string   `json:"challenge,omitempty"`
+		TFATypes  []string `json:"tfa-types,omitempty"`
+	} `json:"data"`
+	Success int               `json:"success,omitempty"`
+	Message string            `json:"message,omitempty"`
+	Errors  map[string]string `json:"errors,omitempty"`
+}
+
+// processLoginResponse decodes the login JSON envelope. It gates on the HTTP
+// status before decoding: a non-2xx response (e.g. a reverse proxy returning
+// an HTML 502/503 page) is not guaranteed to be the JSON login envelope, so
+// the error is built directly from a bounded body snippet instead of
+// attempting — and failing — to decode it as JSON.
 func (ta *TicketAuthenticator) processLoginResponse(resp *http.Response) (*AuthResult, error) {
-	var response struct {
-		Data struct {
-			Ticket              string                 `json:"ticket"`
-			CSRFPreventionToken string                 `json:"CSRFPreventionToken"`
-			Username            string                 `json:"username"`
-			Cap                 map[string]interface{} `json:"cap"`
-			// TFA fields
-			NeedTFA   bool     `json:"NeedTFA,omitempty"`
-			Ticket2   string   `json:"ticket2,omitempty"`
-			Challenge string   `json:"challenge,omitempty"`
-			TFATypes  []string `json:"tfa-types,omitempty"`
-		} `json:"data"`
-		Success int               `json:"success,omitempty"`
-		Message string            `json:"message,omitempty"`
-		Errors  map[string]string `json:"errors,omitempty"`
+	if resp.StatusCode != http.StatusOK {
+		body := readBoundedBody(resp.Body)
+
+		return &AuthResult{
+			Success: false,
+			Error: fmt.Errorf(
+				"login failed with status %d: %w", resp.StatusCode, apierrors.ParseAPIError(resp.StatusCode, body),
+			),
+		}, nil
 	}
+
+	var response loginResponse
 
 	decoder := json.NewDecoder(resp.Body)
 
@@ -491,13 +557,12 @@ func (ta *TicketAuthenticator) processLoginResponse(resp *http.Response) (*AuthR
 		return nil, fmt.Errorf("failed to parse login response: %w", err)
 	}
 
-	if resp.StatusCode != http.StatusOK {
-		return &AuthResult{
-			Success: false,
-			Error:   apierrors.ParseAPIError(resp.StatusCode, []byte(response.Message)),
-		}, nil
-	}
+	return buildLoginResult(&response), nil
+}
 
+// buildLoginResult classifies a decoded 2xx login response into a TFA
+// challenge, a successful ticket, or a no-ticket failure.
+func buildLoginResult(response *loginResponse) *AuthResult {
 	if response.Data.NeedTFA || response.Data.Ticket2 != "" {
 		return &AuthResult{
 			Success: false,
@@ -506,7 +571,7 @@ func (ta *TicketAuthenticator) processLoginResponse(resp *http.Response) (*AuthR
 				Challenge: response.Data.Challenge,
 				Types:     response.Data.TFATypes,
 			},
-		}, nil
+		}
 	}
 
 	if response.Data.Ticket != "" {
@@ -520,11 +585,11 @@ func (ta *TicketAuthenticator) processLoginResponse(resp *http.Response) (*AuthR
 				Username:   response.Data.Username,
 				ValidUntil: validUntil,
 			},
-		}, nil
+		}
 	}
 
 	return &AuthResult{
 		Success: false,
 		Error:   ErrLoginFailedNoTicket,
-	}, nil
+	}
 }

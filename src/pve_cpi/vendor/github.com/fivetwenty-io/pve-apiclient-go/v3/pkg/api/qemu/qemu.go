@@ -1,3 +1,17 @@
+// Package qemu is a hand-written convenience layer over a focused subset of
+// the PVE /nodes/{node}/qemu endpoints (create, config, status, lifecycle,
+// clone, disk attach/detach/resize, snapshots). It trades the generated
+// packages' full parameter and response typing for a smaller, opinionated
+// surface built around map[string]interface{}.
+//
+// The complete typed API for QEMU VMs — every parameter, every response
+// field, every endpoint under /nodes/{node}/qemu — lives in the generated
+// package github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/nodes. Prefer
+// this package for common lifecycle operations (create, start, stop, clone,
+// snapshot) where the narrower surface reads more directly; reach for
+// pkg/api/nodes when you need a parameter or response field this package
+// does not expose, or when you want compile-time-checked request/response
+// types.
 package qemu
 
 import (

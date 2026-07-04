@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	issl "github.com/fivetwenty-io/pve-apiclient-go/v3/internal/ssl"
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/cache"
 )
 
@@ -74,6 +75,7 @@ type Options struct {
 	APIToken     string
 	APITokenName string
 	Ticket       string
+	CSRFToken    string
 	AutoLogin    bool
 
 	SSLOptions *SSLOptions
@@ -100,6 +102,18 @@ type Options struct {
 	ManualVerification          bool
 	RegisterFingerprintCallback func(string)
 	VerifyFingerprintCallback   func(*x509.Certificate) bool
+	// ManualVerifyCallback is consulted for a certificate whose fingerprint is
+	// not already trusted (via CachedFingerprints or FingerprintCachePath),
+	// receiving the fingerprint, certificate, and host; return true to trust
+	// it. Opt-in; nil (default) rejects unknown certificates when manual
+	// verification is otherwise enabled.
+	ManualVerifyCallback func(issl.ManualVerificationRequest) bool
+	// FingerprintCachePath, when non-empty, enables persistent Trust-On-First-Use
+	// certificate pinning: fingerprints already trusted for Host/Port are loaded
+	// from this file at construction, and any fingerprint accepted via
+	// ManualVerifyCallback is written back to it. Opt-in; "" (default) keeps
+	// fingerprint trust memory-only for the process lifetime.
+	FingerprintCachePath string
 }
 
 // BaseURL returns the base URL for API requests.

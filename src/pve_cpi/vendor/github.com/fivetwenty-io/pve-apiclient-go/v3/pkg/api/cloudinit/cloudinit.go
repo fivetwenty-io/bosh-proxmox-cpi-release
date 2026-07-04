@@ -1,3 +1,19 @@
+// Package cloudinit is a hand-written convenience layer for building and
+// attaching PVE cloud-init configuration to QEMU VMs: ipconfigN string
+// construction from NIC specs (including a tolerant CPI-style network spec
+// parser), and user-data/network-data snippet upload with cicustom wiring.
+// There is no equivalent generated helper for building these strings —
+// pkg/api/nodes exposes the raw cloudinit config/dump endpoints under
+// /nodes/{node}/qemu/{vmid}/cloudinit and the config endpoint used to set
+// ipconfigN/cicustom directly, but building the ipconfig value and
+// coordinating the snippet upload is left to the caller.
+//
+// Use this package to construct ipconfigN values and attach user-data (and
+// optionally network-data) snippets without hand-rolling the PVE string
+// format or the two-step upload-then-set-config sequence; reach for
+// github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/nodes directly when
+// you need to read back the current cloud-init config/dump or set fields
+// this package does not cover.
 package cloudinit
 
 import (

@@ -4,9 +4,9 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strings"
-	"syscall"
 
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/internal/constants"
 	"golang.org/x/term"
@@ -229,29 +229,52 @@ func (h *AutoTFAHandler) HandleTFAChallenge(challenge *TFAChallenge) (*TFARespon
 	return nil, fmt.Errorf("%w: %v", ErrNoTFAResponseConfigured, challenge.Types)
 }
 
-// PromptPassword prompts for a password without echoing to terminal.
-func PromptPassword(prompt string) (string, error) {
+// promptPasswordFrom reads a password prompted with prompt, echo-suppressed
+// when passwordFile is a real terminal. When it is not a terminal (e.g. piped
+// input, or a test double) it falls back to reading one newline-terminated
+// line, since term.ReadPassword's raw-mode echo suppression only works
+// against an actual terminal device.
+func promptPasswordFrom(passwordFile *os.File, prompt string) (string, error) {
 	_, _ = fmt.Fprint(os.Stderr, prompt)
 
-	// Read password without echo. Convert to int explicitly: on Windows
-	// syscall.Stdin is a syscall.Handle (uintptr), not an int, so the bare
-	// value fails to cross-compile for windows/*.
-	password, err := term.ReadPassword(int(syscall.Stdin)) //nolint:unconvert // syscall.Stdin is uintptr (syscall.Handle) on Windows; the int conversion is required to cross-compile for windows/*.
+	fd := int(passwordFile.Fd())
 
-	_, _ = fmt.Fprintln(os.Stderr) // Print newline after password input
+	if term.IsTerminal(fd) {
+		password, err := term.ReadPassword(fd)
 
-	if err != nil {
+		_, _ = fmt.Fprintln(os.Stderr) // Print newline after password input
+
+		if err != nil {
+			return "", fmt.Errorf("failed to read password: %w", err)
+		}
+
+		return string(password), nil
+	}
+
+	reader := bufio.NewReader(passwordFile)
+
+	line, err := reader.ReadString('\n')
+
+	_, _ = fmt.Fprintln(os.Stderr)
+
+	if err != nil && !errors.Is(err, io.EOF) {
 		return "", fmt.Errorf("failed to read password: %w", err)
 	}
 
-	return string(password), nil
+	return strings.TrimSpace(line), nil
 }
 
-// PromptUsername prompts for a username.
-func PromptUsername(prompt string) (string, error) {
+// PromptPassword prompts for a password without echoing to terminal.
+func PromptPassword(prompt string) (string, error) {
+	return promptPasswordFrom(os.Stdin, prompt)
+}
+
+// promptUsernameFrom reads one newline-terminated line from r and returns it
+// trimmed of surrounding whitespace.
+func promptUsernameFrom(r io.Reader, prompt string) (string, error) {
 	_, _ = fmt.Fprint(os.Stderr, prompt)
 
-	reader := bufio.NewReader(os.Stdin)
+	reader := bufio.NewReader(r)
 
 	username, err := reader.ReadString('\n')
 	if err != nil {
@@ -261,14 +284,21 @@ func PromptUsername(prompt string) (string, error) {
 	return strings.TrimSpace(username), nil
 }
 
-// PromptCredentials prompts for username and password.
-func PromptCredentials() (*Credentials, error) {
-	username, err := PromptUsername("Username: ")
+// PromptUsername prompts for a username.
+func PromptUsername(prompt string) (string, error) {
+	return promptUsernameFrom(os.Stdin, prompt)
+}
+
+// promptCredentialsFrom prompts for a username via usernameReader and a
+// password via passwordReader, splitting a "user@realm" username into its
+// parts (defaulting to realm "pam" when no realm is present).
+func promptCredentialsFrom(usernameReader io.Reader, passwordReader *os.File) (*Credentials, error) {
+	username, err := promptUsernameFrom(usernameReader, "Username: ")
 	if err != nil {
 		return nil, err
 	}
 
-	password, err := PromptPassword("Password: ")
+	password, err := promptPasswordFrom(passwordReader, "Password: ")
 	if err != nil {
 		return nil, err
 	}
@@ -286,4 +316,9 @@ func PromptCredentials() (*Credentials, error) {
 		Password: password,
 		Realm:    realm,
 	}, nil
+}
+
+// PromptCredentials prompts for username and password.
+func PromptCredentials() (*Credentials, error) {
+	return promptCredentialsFrom(os.Stdin, os.Stdin)
 }

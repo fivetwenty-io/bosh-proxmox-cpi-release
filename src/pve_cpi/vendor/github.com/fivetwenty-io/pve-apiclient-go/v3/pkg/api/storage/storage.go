@@ -1,3 +1,22 @@
+// Package storage is a hand-written convenience layer over a focused subset
+// of the PVE /nodes/{node}/storage/{storage} content endpoints: volume
+// create/delete (sync and async, with idempotent "if exists" variants),
+// existence checks, and file upload. It trades the generated package's full
+// parameter and response typing for a smaller, opinionated surface, and
+// documents PVE's asynchronous-delete (imgdel) semantics that are easy to
+// get wrong by hand.
+//
+// The complete typed API for node-level storage content — every parameter,
+// every response field, every endpoint under /nodes/{node}/storage — lives
+// in the generated package
+// github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/nodes. Cluster-wide
+// storage configuration (as opposed to per-node content) lives in
+// github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/clusterstorage.
+// Prefer this package for common volume lifecycle and upload operations,
+// especially where the DeleteVolume*Async imgdel-await guidance matters;
+// reach for pkg/api/nodes when you need a parameter or response field this
+// package does not expose, or when you want compile-time-checked
+// request/response types.
 package storage
 
 import (

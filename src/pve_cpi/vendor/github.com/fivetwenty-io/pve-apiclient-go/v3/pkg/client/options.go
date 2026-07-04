@@ -89,6 +89,19 @@ type Options struct {
 	ManualVerification          bool                         // Enable manual certificate verification
 	RegisterFingerprintCallback func(string)                 // Callback for registering new fingerprints
 	VerifyFingerprintCallback   func(*x509.Certificate) bool // Callback for verifying certificates
+	// ManualVerifyCallback, when set, is consulted for a certificate whose
+	// fingerprint is not already trusted, receiving the fingerprint,
+	// certificate, and host. Return true to trust it for this client's
+	// lifetime (and persist it when FingerprintCachePath is set). Opt-in;
+	// nil (default) rejects unknown certificates when manual verification is
+	// otherwise enabled.
+	ManualVerifyCallback func(FingerprintVerificationRequest) bool
+	// FingerprintCachePath, when non-empty, enables persistent Trust-On-First-Use
+	// certificate pinning: fingerprints already trusted for Host/Port are
+	// loaded from this file at construction, and any fingerprint accepted via
+	// ManualVerifyCallback is written back to it. Opt-in; "" (default) keeps
+	// fingerprint trust memory-only for the process lifetime.
+	FingerprintCachePath string
 
 	// HTTP Client
 	Timeout   time.Duration // Request timeout (default: 30s)
@@ -108,6 +121,22 @@ type Options struct {
 	// Misc
 	CookieName   string // Name of the authentication cookie (default: "PVEAuthCookie")
 	PVENewFormat bool   // Use new PVE format for certain operations
+}
+
+// FingerprintVerificationRequest carries the details of a certificate whose
+// fingerprint is not already trusted (via CachedFingerprints or
+// FingerprintCachePath), passed to Options.ManualVerifyCallback so it can
+// render an accept/reject decision (e.g. an interactive prompt or an
+// operator-facing UI).
+type FingerprintVerificationRequest struct {
+	// Fingerprint is the normalized (colon-separated, uppercase) SHA256
+	// fingerprint of the presented certificate.
+	Fingerprint string
+	// Certificate is the presented certificate; callers may inspect
+	// Certificate.Subject, Issuer, NotBefore/NotAfter, etc.
+	Certificate *x509.Certificate
+	// Host is the server host the certificate was presented for.
+	Host string
 }
 
 // SSLOptions contains SSL/TLS specific configuration.

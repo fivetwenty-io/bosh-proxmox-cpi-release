@@ -310,6 +310,70 @@ func (fc *FingerprintCache) CleanupExpired() error {
 	return nil
 }
 
+// NewVerifierWithCache builds a FingerprintVerifier that implements
+// Trust-On-First-Use (TOFU) against this cache for host/port: it is
+// pre-seeded with every fingerprint already marked trusted for host, and
+// (when decide is non-nil) wired for manual verification so that any
+// fingerprint the caller accepts is written back into the cache — keyed
+// by host/port so future connections and GetByHost/Save see it too.
+//
+// decide is invoked (via the verifier's manual verify callback) for
+// certificates whose fingerprint is not yet cached; return true to trust
+// and persist it, false to reject it for this verifier's lifetime. If
+// decide is nil, unknown certificates are rejected and recorded via
+// GetLastUnknownFingerprint, but nothing is persisted — the caller can
+// still inspect the cache and verifier directly to build its own
+// out-of-band approval flow.
+//
+// Persistence uses this cache's configured filename and autoSave
+// setting (see NewFingerprintCache/SetAutoSave); if persisting fails,
+// the certificate is still trusted in-memory for this verifier, and the
+// persistence error is discarded (best-effort, mirroring Add's
+// autoSave behavior).
+func (fc *FingerprintCache) NewVerifierWithCache(
+	host string, port int, decide func(ManualVerificationRequest) bool,
+) *FingerprintVerifier {
+	verifier := NewFingerprintVerifier()
+
+	for _, entry := range fc.GetByHost(host) {
+		if entry.Trusted {
+			verifier.AddTrustedFingerprint(entry.Fingerprint)
+		}
+	}
+
+	verifier.SetManualVerification(true)
+
+	if decide == nil {
+		return verifier
+	}
+
+	verifier.SetManualVerifyCallback(func(request ManualVerificationRequest) bool {
+		if !decide(request) {
+			return false
+		}
+
+		entry := FingerprintEntry{
+			Fingerprint: request.Fingerprint,
+			Host:        host,
+			Port:        port,
+			Trusted:     true,
+		}
+
+		if request.Certificate != nil {
+			entry.Subject = request.Certificate.Subject.String()
+			entry.Issuer = request.Certificate.Issuer.String()
+			entry.NotBefore = request.Certificate.NotBefore
+			entry.NotAfter = request.Certificate.NotAfter
+		}
+
+		_ = fc.Add(entry) // best-effort persist; certificate is already trusted in-memory
+
+		return true
+	})
+
+	return verifier
+}
+
 func (fc *FingerprintCache) saveUnlocked() error {
 	if fc.filename == "" {
 		return nil

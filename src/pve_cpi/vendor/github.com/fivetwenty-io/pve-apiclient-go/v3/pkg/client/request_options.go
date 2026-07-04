@@ -15,7 +15,7 @@ func WithRetryDelay(ctx context.Context, d time.Duration) context.Context {
 	return pvehttp.WithRetryDelay(ctx, d)
 }
 
-// WithLogging toggles request logging for this client (no-op logger currently) in the context.
+// WithLogging toggles request logging on or off for this request via the context.
 func WithLogging(ctx context.Context, enabled bool) context.Context {
 	return pvehttp.WithLogging(ctx, enabled)
 }

@@ -3,11 +3,13 @@ package http
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
 	"net"
 	"net/http"
 	"net/url"
@@ -211,26 +213,72 @@ func configureClientCertificates(tlsConfig *tls.Config, sslOptions *SSLOptions) 
 }
 
 func configureFingerprintVerification(tlsConfig *tls.Config, options *Options) {
-	if len(options.CachedFingerprints) > 0 || options.ManualVerification || options.VerifyFingerprintCallback != nil {
-		tlsConfig.InsecureSkipVerify = true
-
-		fingerprintVerifier := issl.NewFingerprintVerifier()
-		seedTrustedFingerprints(fingerprintVerifier, options.CachedFingerprints)
-		configureVerifierCallbacks(fingerprintVerifier, options)
-
-		tlsConfig.VerifyPeerCertificate = func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
-			if len(rawCerts) == 0 {
-				return issl.ErrNoCertificatesProvided
-			}
-
-			cert, err := x509.ParseCertificate(rawCerts[0])
-			if err != nil {
-				return fmt.Errorf("failed to parse certificate: %w", err)
-			}
-
-			return fingerprintVerifier.VerifyCertificate(cert)
-		}
+	if !fingerprintVerificationEnabled(options) {
+		return
 	}
+
+	tlsConfig.InsecureSkipVerify = true
+	// TLS session resumption skips VerifyPeerCertificate on the resumed
+	// handshake, which would let a previously-pinned-then-revoked certificate
+	// (or a session ticket obtained before pinning was configured) bypass the
+	// fingerprint check below. Disable resumption so every connection is
+	// re-verified against the pin.
+	tlsConfig.SessionTicketsDisabled = true
+
+	fingerprintVerifier := buildFingerprintVerifier(options)
+
+	tlsConfig.VerifyPeerCertificate = func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+		if len(rawCerts) == 0 {
+			return issl.ErrNoCertificatesProvided
+		}
+
+		cert, err := x509.ParseCertificate(rawCerts[0])
+		if err != nil {
+			return fmt.Errorf("failed to parse certificate: %w", err)
+		}
+
+		return fingerprintVerifier.VerifyCertificateForHost(cert, options.Host)
+	}
+}
+
+// fingerprintVerificationEnabled reports whether any fingerprint-pinning knob
+// is in use, in which case standard certificate-chain verification is
+// replaced by fingerprint pinning (InsecureSkipVerify + VerifyPeerCertificate).
+func fingerprintVerificationEnabled(options *Options) bool {
+	return len(options.CachedFingerprints) > 0 ||
+		options.ManualVerification ||
+		options.VerifyFingerprintCallback != nil ||
+		options.ManualVerifyCallback != nil ||
+		options.FingerprintCachePath != ""
+}
+
+// buildFingerprintVerifier constructs the certificate-fingerprint verifier
+// used for pinning. When FingerprintCachePath is set, trust is persisted
+// across process restarts via a Trust-On-First-Use cache keyed by Host/Port
+// (see issl.FingerprintCache.NewVerifierWithCache); any fingerprint accepted
+// through ManualVerifyCallback is written back to that cache. Otherwise the
+// verifier is memory-only for this client's lifetime.
+func buildFingerprintVerifier(options *Options) *issl.FingerprintVerifier {
+	var verifier *issl.FingerprintVerifier
+
+	if options.FingerprintCachePath != "" {
+		fpCache := issl.NewFingerprintCache(options.FingerprintCachePath)
+
+		// A missing or corrupt cache file must not block client construction;
+		// Load leaves fpCache with whatever entries it managed to decode (empty
+		// on failure), so verification falls back to treating every fingerprint
+		// as unknown rather than failing startup.
+		_ = fpCache.Load()
+
+		verifier = fpCache.NewVerifierWithCache(options.Host, options.Port, options.ManualVerifyCallback)
+	} else {
+		verifier = issl.NewFingerprintVerifier()
+	}
+
+	seedTrustedFingerprints(verifier, options.CachedFingerprints)
+	configureVerifierCallbacks(verifier, options)
+
+	return verifier
 }
 
 func seedTrustedFingerprints(verifier *issl.FingerprintVerifier, cachedFingerprints map[string]bool) {
@@ -248,7 +296,14 @@ func seedTrustedFingerprints(verifier *issl.FingerprintVerifier, cachedFingerpri
 }
 
 func configureVerifierCallbacks(verifier *issl.FingerprintVerifier, options *Options) {
-	verifier.SetManualVerification(options.ManualVerification)
+	// NewVerifierWithCache already enables manual verification when
+	// FingerprintCachePath is set; only ever turn it on here, never back off,
+	// so that path is not silently undone. Configuring ManualVerifyCallback
+	// without also setting ManualVerification implies manual mode: a caller
+	// supplying a decision callback clearly wants it consulted.
+	if options.ManualVerification || options.FingerprintCachePath != "" || options.ManualVerifyCallback != nil {
+		verifier.SetManualVerification(true)
+	}
 
 	if options.RegisterFingerprintCallback != nil {
 		verifier.SetRegisterCallback(options.RegisterFingerprintCallback)
@@ -256,6 +311,13 @@ func configureVerifierCallbacks(verifier *issl.FingerprintVerifier, options *Opt
 
 	if options.VerifyFingerprintCallback != nil {
 		verifier.SetVerifyCallback(options.VerifyFingerprintCallback)
+	}
+
+	// NewVerifierWithCache already wires ManualVerifyCallback (so accepted
+	// fingerprints persist to the cache); for the memory-only path it must be
+	// wired here instead.
+	if options.FingerprintCachePath == "" && options.ManualVerifyCallback != nil {
+		verifier.SetManualVerifyCallback(options.ManualVerifyCallback)
 	}
 }
 
@@ -291,10 +353,12 @@ func createAuthenticator(options *Options, httpClient *http.Client) auth.Authent
 		// A pre-existing ticket was supplied without a token or username. Build a
 		// ticket authenticator seeded with it so requests are authenticated and
 		// the ticket can later be updated via SetTicket / renewed if it ages out.
+		// options.CSRFToken (when supplied alongside the ticket) is carried from
+		// construction rather than requiring a post-hoc UpdateCSRFToken call.
 		return auth.NewTicketAuthenticatorFromTicket(
 			options.BaseURL(),
 			options.Ticket,
-			"",
+			options.CSRFToken,
 			options.Username,
 			nil,
 			httpClient,
@@ -492,6 +556,29 @@ func (c *Client) RemoveHeader(key string) {
 func (c *Client) SetTimeout(timeout time.Duration) {
 	c.timeout = timeout
 	c.httpClient.Timeout = timeout
+}
+
+// SetKeepAlive updates the number of idle keep-alive connections retained by
+// the live transport (MaxIdleConns, and MaxIdleConnsPerHost when no explicit
+// MaxIdleConnsPerHost override was configured), taking effect for subsequent
+// requests without reconstructing the client. It is a no-op if the transport
+// is not the *http.Transport this client constructs (never true in practice:
+// NewClient always builds one via createHTTPTransport).
+func (c *Client) SetKeepAlive(connections int) {
+	if c.options != nil {
+		c.options.KeepAlive = connections
+	}
+
+	t, ok := c.httpClient.Transport.(*http.Transport)
+	if !ok {
+		return
+	}
+
+	t.MaxIdleConns = connections
+
+	if c.options == nil || c.options.MaxIdleConnsPerHost <= 0 {
+		t.MaxIdleConnsPerHost = connections
+	}
 }
 
 // SetMaxRetries sets the maximum number of retries.
@@ -1030,6 +1117,21 @@ type cachedResponse struct {
 	Body       []byte
 }
 
+// CacheSize implements cache.Sizer so the cache charges this entry its actual
+// body and header footprint instead of JSON-encoding the whole value (which
+// would base64-inflate Body) just to measure it.
+func (r *cachedResponse) CacheSize() int64 {
+	size := int64(len(r.Body))
+	for key, values := range r.Headers {
+		size += int64(len(key))
+		for _, value := range values {
+			size += int64(len(value))
+		}
+	}
+
+	return size
+}
+
 func (c *Client) cachingMiddleware(req *http.Request, next Handler) (*http.Response, error) {
 	// Only cache GET requests
 	if req.Method != http.MethodGet || c.cache == nil {
@@ -1208,7 +1310,7 @@ func (c *Client) retryMiddleware(req *http.Request, next Handler) (*http.Respons
 
 	for attempt := 0; ; attempt++ {
 		if attempt > 0 {
-			time.Sleep(delay * time.Duration(attempt))
+			time.Sleep(applyRetryJitter(delay * time.Duration(attempt)))
 
 			rewindErr := rewindRequestBody(req, getBody)
 			if rewindErr != nil {
@@ -1252,6 +1354,38 @@ func (c *Client) retryMiddleware(req *http.Request, next Handler) (*http.Respons
 		// parseResponse can surface the appropriate error.
 		return resp, nil
 	}
+}
+
+// retryJitterPercent bounds the +/- random jitter applied to retry backoff
+// delays (see applyRetryJitter), mirroring the poll-interval jitter approach
+// in pkg/api/tasks.
+const retryJitterPercent = 20
+
+// applyRetryJitter randomizes a backoff delay by up to +/- retryJitterPercent%
+// so concurrent clients retrying the same transient failure do not all wake
+// up and retry in lockstep. It returns the unmodified delay if it is zero or
+// negative, or if the random source is unavailable.
+func applyRetryJitter(delay time.Duration) time.Duration {
+	if delay <= 0 {
+		return delay
+	}
+
+	delta := int64(delay) * retryJitterPercent / constants.JitterPercentage
+	if delta == 0 {
+		return delay
+	}
+
+	offset, err := rand.Int(rand.Reader, big.NewInt(2*delta+1))
+	if err != nil {
+		return delay
+	}
+
+	adjusted := int64(delay) + offset.Int64() - delta
+	if adjusted < 1 {
+		adjusted = 1
+	}
+
+	return time.Duration(adjusted)
 }
 
 // resolveRetryPolicy returns the effective retry count, delay, and force-retry

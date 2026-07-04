@@ -1,3 +1,19 @@
+// Package tasks is a hand-written convenience layer over the PVE
+// /nodes/{node}/tasks/{upid}/status endpoint, providing UPID parsing and a
+// blocking Wait helper (with optional exponential backoff and jitter) on top
+// of a single-shot GetStatus read. It trades the generated package's full
+// parameter and response typing for a purpose-built polling loop that most
+// callers awaiting an async PVE task (VM clone, storage delete, backup, …)
+// would otherwise have to write themselves.
+//
+// The complete typed API for task status and logs — every parameter, every
+// response field, every endpoint under /nodes/{node}/tasks — lives in the
+// generated package
+// github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/nodes. Prefer this
+// package whenever you have a UPID from another call (qemu, lxc, storage,
+// …) and need to wait for it to finish; reach for pkg/api/nodes when you
+// need task log entries, listing, or other fields this package does not
+// expose.
 package tasks
 
 import (

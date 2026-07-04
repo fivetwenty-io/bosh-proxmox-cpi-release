@@ -8,6 +8,7 @@ import (
 	"time"
 
 	pvehttp "github.com/fivetwenty-io/pve-apiclient-go/v3/internal/http"
+	issl "github.com/fivetwenty-io/pve-apiclient-go/v3/internal/ssl"
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/auth"
 	pmetrics "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/metrics"
 )
@@ -97,6 +98,8 @@ type HTTPClient interface {
 	Do(method, path string, params map[string]interface{}) (*Response, error)
 	DoCtx(ctx context.Context, method, path string, params map[string]interface{}) (*Response, error)
 	UploadCtx(ctx context.Context, path string, fields map[string]string, fileField, filename string, file io.Reader) (*Response, error)
+	SetTimeout(timeout time.Duration)
+	SetKeepAlive(connections int)
 	SetHeader(key, value string)
 	RemoveHeader(key string)
 	InvalidateCache(pattern string) int
@@ -334,14 +337,20 @@ func (c *client) UpdateCSRFToken(token string) {
 	}
 }
 
-// SetTimeout sets the request timeout.
+// SetTimeout sets the request timeout, applying it to the live HTTP client
+// (both the request deadline and the underlying transport) so it takes
+// effect for subsequent requests without reconstructing the client.
 func (c *client) SetTimeout(timeout time.Duration) {
 	c.options.Timeout = timeout
+	c.httpClient.SetTimeout(timeout)
 }
 
-// SetKeepAlive sets the number of keep-alive connections.
+// SetKeepAlive sets the number of keep-alive connections, applying it to the
+// live transport so it takes effect for subsequent requests without
+// reconstructing the client.
 func (c *client) SetKeepAlive(connections int) {
 	c.options.KeepAlive = connections
+	c.httpClient.SetKeepAlive(connections)
 }
 
 // SetLogger installs a structured logger for HTTP requests.
@@ -480,6 +489,18 @@ func (a *internalHTTPAdapter) UploadCtx(ctx context.Context, path string, fields
 
 	return &Response{Data: r.Data, Errors: r.Errors, Code: r.Code}, nil
 }
+func (a *internalHTTPAdapter) SetTimeout(timeout time.Duration) {
+	if a.inner != nil {
+		a.inner.SetTimeout(timeout)
+	}
+}
+
+func (a *internalHTTPAdapter) SetKeepAlive(connections int) {
+	if a.inner != nil {
+		a.inner.SetKeepAlive(connections)
+	}
+}
+
 func (a *internalHTTPAdapter) SetHeader(key, value string) {
 	if a.inner != nil {
 		a.inner.SetHeader(key, value)
@@ -539,6 +560,19 @@ func internalHTTPNew(opts *Options) (*pvehttp.Client, error) {
 		}
 	}
 
+	var manualVerifyCallback func(issl.ManualVerificationRequest) bool
+
+	if opts.ManualVerifyCallback != nil {
+		cb := opts.ManualVerifyCallback
+		manualVerifyCallback = func(req issl.ManualVerificationRequest) bool {
+			return cb(FingerprintVerificationRequest{
+				Fingerprint: req.Fingerprint,
+				Certificate: req.Certificate,
+				Host:        req.Host,
+			})
+		}
+	}
+
 	iopts := &pvehttp.Options{
 		Host:                        opts.Host,
 		Port:                        opts.Port,
@@ -546,7 +580,9 @@ func internalHTTPNew(opts *Options) (*pvehttp.Client, error) {
 		Username:                    opts.Username,
 		Password:                    opts.Password,
 		APIToken:                    opts.APIToken,
+		APITokenName:                opts.APITokenName,
 		Ticket:                      opts.Ticket,
+		CSRFToken:                   opts.CSRFToken,
 		AutoLogin:                   opts.AutoLogin,
 		SSLOptions:                  ssl,
 		Timeout:                     opts.Timeout,
@@ -563,6 +599,8 @@ func internalHTTPNew(opts *Options) (*pvehttp.Client, error) {
 		ManualVerification:          opts.ManualVerification,
 		RegisterFingerprintCallback: opts.RegisterFingerprintCallback,
 		VerifyFingerprintCallback:   opts.VerifyFingerprintCallback,
+		ManualVerifyCallback:        manualVerifyCallback,
+		FingerprintCachePath:        opts.FingerprintCachePath,
 	}
 
 	c, err := pvehttp.NewClient(iopts)

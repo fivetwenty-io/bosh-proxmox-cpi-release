@@ -21,29 +21,60 @@ var (
 	ErrInvalidFingerprintLength         = errors.New("invalid fingerprint length")
 )
 
+// ManualVerificationRequest carries the details a manual verification
+// callback needs to render an accept/reject decision for an unknown
+// certificate (e.g. an interactive prompt or an operator-facing UI).
+type ManualVerificationRequest struct {
+	// Fingerprint is the normalized (colon-separated, uppercase) SHA256
+	// fingerprint of the presented certificate.
+	Fingerprint string
+	// Certificate is the presented certificate; callers may inspect
+	// Certificate.Subject, Issuer, NotBefore/NotAfter, etc.
+	Certificate *x509.Certificate
+	// Host is the server host the certificate was presented for, or ""
+	// if the caller did not supply host context (see VerifyCertificate
+	// vs. VerifyCertificateForHost).
+	Host string
+}
+
 // FingerprintVerifier handles certificate fingerprint verification.
 type FingerprintVerifier struct {
-	mu                 sync.RWMutex
-	cache              map[string]bool
-	lastUnknown        string
-	manualVerification bool
-	registerCallback   func(string)
-	verifyCallback     func(*x509.Certificate) bool
+	mu                   sync.RWMutex
+	cache                map[string]bool
+	lastUnknown          string
+	manualVerification   bool
+	registerCallback     func(string)
+	verifyCallback       func(*x509.Certificate) bool
+	manualVerifyCallback func(ManualVerificationRequest) bool
 }
 
 // NewFingerprintVerifier creates a new fingerprint verifier.
 func NewFingerprintVerifier() *FingerprintVerifier {
 	return &FingerprintVerifier{
-		mu:                 sync.RWMutex{},
-		cache:              make(map[string]bool),
-		lastUnknown:        "",
-		manualVerification: false,
-		registerCallback:   nil,
-		verifyCallback:     nil,
+		mu:                   sync.RWMutex{},
+		cache:                make(map[string]bool),
+		lastUnknown:          "",
+		manualVerification:   false,
+		registerCallback:     nil,
+		verifyCallback:       nil,
+		manualVerifyCallback: nil,
 	}
 }
 
 // SetManualVerification enables or disables manual verification mode.
+//
+// When enabled and no generic verify callback (SetVerifyCallback) is
+// configured, an unknown certificate is resolved via the manual verify
+// callback (SetManualVerifyCallback) if one is set: the callback is
+// invoked with the certificate's fingerprint, the certificate itself,
+// and (if known) the host, and its accept/reject decision is honored.
+// Accepted fingerprints are cached as trusted for the lifetime of this
+// verifier. If manual verification is enabled but no manual verify
+// callback is set, unknown certificates are rejected with
+// ErrUnknownCertificateFingerprint and recorded as the last unknown
+// fingerprint (see GetLastUnknownFingerprint), so a caller can retrieve
+// it and decide out-of-band (e.g. prompt separately, then call
+// AddTrustedFingerprint and retry).
 func (fv *FingerprintVerifier) SetManualVerification(enabled bool) {
 	fv.mu.Lock()
 	defer fv.mu.Unlock()
@@ -59,7 +90,9 @@ func (fv *FingerprintVerifier) SetRegisterCallback(callback func(string)) {
 	fv.registerCallback = callback
 }
 
-// SetVerifyCallback sets the callback for verifying certificates.
+// SetVerifyCallback sets the callback for verifying certificates. When
+// set, it takes priority over manual verification: it is consulted for
+// every unknown certificate regardless of SetManualVerification.
 func (fv *FingerprintVerifier) SetVerifyCallback(callback func(*x509.Certificate) bool) {
 	fv.mu.Lock()
 	defer fv.mu.Unlock()
@@ -67,8 +100,31 @@ func (fv *FingerprintVerifier) SetVerifyCallback(callback func(*x509.Certificate
 	fv.verifyCallback = callback
 }
 
+// SetManualVerifyCallback sets the callback consulted for unknown
+// certificates when manual verification mode is enabled (see
+// SetManualVerification) and no generic verify callback is configured.
+// The callback receives the fingerprint, certificate, and host (host is
+// "" unless the caller used VerifyCertificateForHost) and returns true
+// to trust the certificate for the remainder of this verifier's
+// lifetime, or false to reject it.
+func (fv *FingerprintVerifier) SetManualVerifyCallback(callback func(ManualVerificationRequest) bool) {
+	fv.mu.Lock()
+	defer fv.mu.Unlock()
+
+	fv.manualVerifyCallback = callback
+}
+
 // VerifyCertificate verifies a certificate against known fingerprints.
+// It is equivalent to VerifyCertificateForHost(cert, "").
 func (fv *FingerprintVerifier) VerifyCertificate(cert *x509.Certificate) error {
+	return fv.VerifyCertificateForHost(cert, "")
+}
+
+// VerifyCertificateForHost verifies a certificate against known
+// fingerprints, threading host through to any manual verify callback so
+// it can be surfaced to the user (e.g. "unknown certificate for
+// pve.example.com"). host may be "" if unknown.
+func (fv *FingerprintVerifier) VerifyCertificateForHost(cert *x509.Certificate, host string) error {
 	if cert == nil {
 		return ErrCertificateNil
 	}
@@ -81,40 +137,21 @@ func (fv *FingerprintVerifier) VerifyCertificate(cert *x509.Certificate) error {
 
 	// Check if fingerprint is in cache
 	if trusted, exists := fv.cache[fingerprint]; exists {
-		if trusted {
-			return nil
-		}
-
-		return fmt.Errorf("%w: %s", ErrCertificateFingerprintNotTrusted, fingerprint)
+		return fv.verifyCachedLocked(fingerprint, trusted)
 	}
 
-	// Store as last unknown
-	fv.lastUnknown = fingerprint
-
-	// If we have a verify callback, use it
+	// A generic verify callback takes priority over manual mode.
 	if fv.verifyCallback != nil {
-		if fv.verifyCallback(cert) {
-			fv.cache[fingerprint] = true
-			if fv.registerCallback != nil {
-				fv.registerCallback(fingerprint)
-			}
-
-			return nil
-		}
-
-		fv.cache[fingerprint] = false
-
-		return fmt.Errorf("%w for fingerprint %s", ErrCertificateVerificationFailed, fingerprint)
+		return fv.verifyWithCallbackLocked(cert, fingerprint)
 	}
 
-	// If manual verification is enabled, prompt user
 	if fv.manualVerification {
-		// In a real implementation, this would interact with the user
-		// For now, we'll reject unknown certificates
-		return fmt.Errorf("%w: %s", ErrUnknownCertificateFingerprint, fingerprint)
+		return fv.verifyManualLocked(cert, fingerprint, host)
 	}
 
 	// No verification method available, reject
+	fv.lastUnknown = fingerprint
+
 	return fmt.Errorf("%w: %s", ErrCannotVerifyFingerprint, fingerprint)
 }
 
@@ -148,7 +185,11 @@ func (fv *FingerprintVerifier) RemoveTrustedFingerprint(fingerprint string) {
 	delete(fv.cache, normalized)
 }
 
-// GetLastUnknownFingerprint returns the last unknown fingerprint encountered.
+// GetLastUnknownFingerprint returns the most recent fingerprint that was
+// not already trusted, i.e. one that was rejected outright, rejected by
+// a verify callback, or rejected/unresolved by manual verification. It
+// is safe to call concurrently with VerifyCertificate. It returns "" if
+// every certificate seen so far was already trusted.
 func (fv *FingerprintVerifier) GetLastUnknownFingerprint() string {
 	fv.mu.RLock()
 	defer fv.mu.RUnlock()
@@ -178,6 +219,73 @@ func (fv *FingerprintVerifier) ClearCache() {
 
 	fv.cache = make(map[string]bool)
 	fv.lastUnknown = ""
+}
+
+// verifyCachedLocked resolves a fingerprint that already has a cached
+// trust decision. Caller must hold fv.mu.
+func (fv *FingerprintVerifier) verifyCachedLocked(fingerprint string, trusted bool) error {
+	if trusted {
+		return nil
+	}
+
+	fv.lastUnknown = fingerprint
+
+	return fmt.Errorf("%w: %s", ErrCertificateFingerprintNotTrusted, fingerprint)
+}
+
+// verifyWithCallbackLocked resolves an unknown fingerprint using the
+// generic verify callback. Caller must hold fv.mu.
+func (fv *FingerprintVerifier) verifyWithCallbackLocked(cert *x509.Certificate, fingerprint string) error {
+	if fv.verifyCallback(cert) {
+		fv.trustLocked(fingerprint)
+
+		return nil
+	}
+
+	fv.cache[fingerprint] = false
+	fv.lastUnknown = fingerprint
+
+	return fmt.Errorf("%w for fingerprint %s", ErrCertificateVerificationFailed, fingerprint)
+}
+
+// verifyManualLocked resolves an unknown fingerprint under manual
+// verification mode. If no manual verify callback is configured, the
+// fingerprint is rejected and recorded so GetLastUnknownFingerprint
+// gives the caller a reliable way to retrieve it and decide
+// out-of-band. Caller must hold fv.mu.
+func (fv *FingerprintVerifier) verifyManualLocked(cert *x509.Certificate, fingerprint, host string) error {
+	if fv.manualVerifyCallback == nil {
+		fv.lastUnknown = fingerprint
+
+		return fmt.Errorf("%w: %s", ErrUnknownCertificateFingerprint, fingerprint)
+	}
+
+	request := ManualVerificationRequest{
+		Fingerprint: fingerprint,
+		Certificate: cert,
+		Host:        host,
+	}
+
+	if fv.manualVerifyCallback(request) {
+		fv.trustLocked(fingerprint)
+
+		return nil
+	}
+
+	fv.cache[fingerprint] = false
+	fv.lastUnknown = fingerprint
+
+	return fmt.Errorf("%w: %s", ErrUnknownCertificateFingerprint, fingerprint)
+}
+
+// trustLocked marks fingerprint as trusted and fires the register
+// callback, if configured. Caller must hold fv.mu.
+func (fv *FingerprintVerifier) trustLocked(fingerprint string) {
+	fv.cache[fingerprint] = true
+
+	if fv.registerCallback != nil {
+		fv.registerCallback(fingerprint)
+	}
 }
 
 // CalculateFingerprint calculates the SHA256 fingerprint of a certificate.
