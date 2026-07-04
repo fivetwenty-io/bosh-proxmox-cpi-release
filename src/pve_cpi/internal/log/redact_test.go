@@ -306,3 +306,26 @@ func TestRedactSecrets_Scalars(t *testing.T) {
 		t.Errorf("nil altered: %v", got)
 	}
 }
+
+// TestScrubMessage verifies the free-text scrub used by non-ErrScrubbed
+// external sinks (span status/events): credential-bearing URLs are masked,
+// credential-free text passes through byte-identical.
+func TestScrubMessage(t *testing.T) {
+	t.Parallel()
+
+	in := "GET https://bosh:s3cretpw@blob.lab.internal/img?X-Amz-Signature=deadbeef1234 returned 403"
+	out := log.ScrubMessage(in)
+	for _, secret := range []string{"s3cretpw", "deadbeef1234"} {
+		if strings.Contains(out, secret) {
+			t.Errorf("ScrubMessage leaks credential %q: %q", secret, out)
+		}
+	}
+	if !strings.Contains(out, log.RedactedPlaceholder) {
+		t.Errorf("ScrubMessage output missing %q marker: %q", log.RedactedPlaceholder, out)
+	}
+
+	plain := "task UPID:pve1:0000ABCD timed out after 30s"
+	if got := log.ScrubMessage(plain); got != plain {
+		t.Errorf("credential-free text altered: %q -> %q", plain, got)
+	}
+}

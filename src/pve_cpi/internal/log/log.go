@@ -6,6 +6,8 @@ import (
 	"io"
 	"log/slog"
 	"os"
+
+	"go.opentelemetry.io/otel/trace"
 )
 
 // ctxKey is an unexported type for context keys in this package.
@@ -117,22 +119,45 @@ func WithMethod(ctx context.Context, method string) context.Context {
 	return context.WithValue(ctx, ctxKeyMethod, method)
 }
 
+// SpanFields returns trace_id/span_id fields extracted from an OTel span in
+// ctx, or nil when ctx carries no span or an invalid SpanContext (zero fields
+// added, zero behavior change when tracing is inactive). WithContext uses this
+// internally; it is also exported for callers that build their own field list
+// explicitly rather than deriving a whole *Logger from ctx — e.g.
+// cpi.Dispatcher's per-request log lines, which already attach their own
+// method/request_id fields and must not gain a second copy of those two keys
+// by going through WithContext/FromContext.
+func SpanFields(ctx context.Context) []Field {
+	if sc := trace.SpanContextFromContext(ctx); sc.IsValid() {
+		return []Field{
+			String("trace_id", sc.TraceID().String()),
+			String("span_id", sc.SpanID().String()),
+		}
+	}
+	return nil
+}
+
 // WithContext returns a new Logger that:
 //   - stores ctx so Debug/Info/Warn/Error pass it to slog.LogAttrs (enabling
 //     trace/span propagation in slog handlers that inspect the context), and
 //   - extracts request_id and method from ctx and attaches them as log fields
-//     when present.
+//     when present, and
+//   - extracts trace_id/span_id from an OTel span in ctx (via the stable
+//     go.opentelemetry.io/otel/trace API) and attaches them as log fields
+//     when the span context is valid; a ctx with no span, or an invalid/zero
+//     SpanContext, adds nothing (zero behavior change when tracing inactive).
 //
 // Existing callers that discard the returned Logger are unaffected: the stored
 // context only influences log calls made on the returned instance.
 func (l *Logger) WithContext(ctx context.Context) *Logger {
-	fields := make([]Field, 0, 2)
+	fields := make([]Field, 0, 4)
 	if reqID, ok := ctx.Value(ctxKeyRequestID).(string); ok && reqID != "" {
 		fields = append(fields, String("request_id", reqID))
 	}
 	if method, ok := ctx.Value(ctxKeyMethod).(string); ok && method != "" {
 		fields = append(fields, String("method", method))
 	}
+	fields = append(fields, SpanFields(ctx)...)
 	var next *Logger
 	if len(fields) == 0 {
 		next = &Logger{Logger: l.Logger, ctx: ctx}
@@ -169,6 +194,22 @@ func FromContext(ctx context.Context) *Logger {
 		return l
 	}
 	return NewNopLogger()
+}
+
+// FromContextOr returns the Logger stored in ctx by IntoContext, or fallback
+// when ctx carries none. Unlike FromContext — which falls back to a silent
+// NewNopLogger, a contract several internal/pve call sites rely on to mean
+// "no per-request logger in scope, log nothing" — FromContextOr lets the
+// caller name an explicit, non-nop fallback (e.g. a handler's startup-time
+// Deps.Logger) so a log call is never silently swallowed just because ctx
+// happens to lack the per-request logger (e.g. a handler unit test that
+// builds ctx via context.Background()). Callers must pass a non-nil
+// fallback; the only production caller (handlers.Deps.Log) guarantees this.
+func FromContextOr(ctx context.Context, fallback *Logger) *Logger {
+	if l, ok := ctx.Value(ctxKeyLogger).(*Logger); ok && l != nil {
+		return l
+	}
+	return fallback
 }
 
 // IntoContext stores l in ctx and returns the updated context.

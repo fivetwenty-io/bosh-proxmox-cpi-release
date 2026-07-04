@@ -140,3 +140,13 @@ func scrubURLString(s string) string {
 	s = sensitiveQueryParam.ReplaceAllString(s, "${1}"+RedactedPlaceholder)
 	return s
 }
+
+// ScrubMessage returns s with URL-embedded credentials masked (userinfo and
+// sensitive query parameters), leaving credential-free text unchanged. Use it
+// when a string derived from a guest-controlled or PVE-returned value (an
+// error message, a span status) leaves the process by a path that does not go
+// through ErrScrubbed — every external sink must apply the same scrubbing the
+// logs do.
+func ScrubMessage(s string) string {
+	return scrubURLString(s)
+}

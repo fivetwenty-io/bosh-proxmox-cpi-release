@@ -243,6 +243,43 @@ func TestWithFields(t *testing.T) {
 	}
 }
 
+// TestFromContextOr_CtxLoggerPresent verifies FromContextOr returns the
+// ctx-stored logger, not fallback, when ctx carries one.
+func TestFromContextOr_CtxLoggerPresent(t *testing.T) {
+	t.Parallel()
+	var ctxBuf, fallbackBuf bytes.Buffer
+	ctxLogger := mustLogger(t, "info", &ctxBuf)
+	fallbackLogger := mustLogger(t, "info", &fallbackBuf)
+
+	ctx := log.IntoContext(context.Background(), ctxLogger)
+	got := log.FromContextOr(ctx, fallbackLogger)
+	got.Info("routed message")
+
+	if !strings.Contains(ctxBuf.String(), "routed message") {
+		t.Errorf("expected message routed to ctx-stored logger, got ctxBuf=%q", ctxBuf.String())
+	}
+	if strings.Contains(fallbackBuf.String(), "routed message") {
+		t.Errorf("message unexpectedly routed to fallback logger, got fallbackBuf=%q", fallbackBuf.String())
+	}
+}
+
+// TestFromContextOr_NoCtxLogger_UsesFallback verifies FromContextOr returns
+// fallback (not a silent nop) when ctx carries no logger — the behavior that
+// distinguishes it from FromContext, whose contract is "always nop when
+// absent".
+func TestFromContextOr_NoCtxLogger_UsesFallback(t *testing.T) {
+	t.Parallel()
+	var fallbackBuf bytes.Buffer
+	fallbackLogger := mustLogger(t, "info", &fallbackBuf)
+
+	got := log.FromContextOr(context.Background(), fallbackLogger)
+	got.Info("fallback message")
+
+	if !strings.Contains(fallbackBuf.String(), "fallback message") {
+		t.Errorf("expected message routed to fallback logger, got fallbackBuf=%q", fallbackBuf.String())
+	}
+}
+
 // TestWithFields_Empty verifies that WithFields with no args returns a valid logger.
 func TestWithFields_Empty(t *testing.T) {
 	t.Parallel()
