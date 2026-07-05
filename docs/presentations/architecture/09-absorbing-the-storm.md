@@ -55,11 +55,11 @@ flowchart LR
 - Per-node in-flight limit: the only preventive layer
 
 <!--
-- We propose three failure classes, three backoff curves matched to drain time — pushback widest (5s base / 60s cap), storage lock middle (2s / 30s), transient transport tightest (1s / 15s).
+- Three failure classes, three backoff curves matched to drain time — pushback widest (5s base / 60s cap), storage lock middle (2s / 30s), transient transport tightest (1s / 15s).
 - Why not one curve: worker-pool saturation drains slower than a single per-storage lock hold, which drains slower than a sub-second worker restart — one curve would over- or under-wait.
-- Jitter will be ±30%: a dozen CPI processes that failed in the same instant must not all retry in the same instant.
-- Predicate order matters: "got timeout" appears in both lock and pushback strings, so we will check pushback first and let it win the longer curve. RetryOnTransientOrLock will layer all three predicates.
-- max_inflight_per_node will be the only preventive layer — a per-node semaphore that caps the burst at the source instead of absorbing it after the fault.
+- Jitter is ±30%: a dozen CPI processes that failed in the same instant must not all retry in the same instant.
+- Predicate order matters: "got timeout" appears in both lock and pushback strings, so we check pushback first and let it win the longer curve. RetryOnTransientOrLock layers all three predicates.
+- max_inflight_per_node is the only preventive layer — a per-node semaphore that caps the burst at the source instead of absorbing it after the fault.
 -->
 
 ---
@@ -70,7 +70,7 @@ class: visual-right
 
 ## Waiting for the work to actually finish
 
-- Every PVE task will be awaited before the handler returns
+- Every PVE task is awaited before the handler returns
 - Deadline → retriable timeout, not a wedged loop
 - Adaptive poll: interval paces with task progress
 - Worst legal output: a typed, retriable error
@@ -80,11 +80,11 @@ class: visual-right
 <img class="visual-img" src="./assets/images/optimized/storm-buffer.png" alt="Request storm buffered into controlled output" />
 
 <!--
-- Decision: every PVE task will be awaited before the handler returns — no fire-and-forget, because an async storage task can land after we have moved on.
+- Decision: every PVE task is awaited before the handler returns — no fire-and-forget, because an async storage task can land after we have moved on.
 - The race that justifies it: DELETE queues an imgdel under the same lockfile; under contention it can fire after a same-name upload won the lock, deleting the fresh volume. Real case: vm-117-config.iso vanished mid-start.
-- Fix: we will await the imgdel UPID before uploading — DeleteVolumeIfExistsAsync returns it; same wiring on delete_disk and create_disk rollback.
-- Streaming-upload subtlety: a retry must reopen the file from disk — the body is a single-use io.Reader, so os.Open will live inside the retry callback.
-- A deadline will become a typed, retriable TimeoutError, not a wedged loop; worst-case full retry exhaustion is ~124s, well inside BOSH's task timeout.
+- Fix: we await the imgdel UPID before uploading — DeleteVolumeIfExistsAsync returns it; same wiring on delete_disk and create_disk rollback.
+- Streaming-upload subtlety: a retry must reopen the file from disk — the body is a single-use io.Reader, so os.Open lives inside the retry callback.
+- A deadline becomes a typed, retriable TimeoutError, not a wedged loop; worst-case full retry exhaustion is ~124s, well inside BOSH's task timeout.
 -->
 
 ---
