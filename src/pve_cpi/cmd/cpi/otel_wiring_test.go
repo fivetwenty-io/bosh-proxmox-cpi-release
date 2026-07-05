@@ -501,10 +501,11 @@ func newManualMeter() (metric.Meter, *sdkmetric.ManualReader) {
 }
 
 // findHistogramDataPoints locates the metricdata.Histogram[float64] data
-// points for the metric named name within rm, failing the test if a metric
-// by that name exists but is not a float64 histogram.
-func findHistogramDataPoints(t *testing.T, rm metricdata.ResourceMetrics, name string) []metricdata.HistogramDataPoint[float64] {
+// points for the action-duration metric within rm, failing the test if the
+// metric exists but is not a float64 histogram.
+func findHistogramDataPoints(t *testing.T, rm metricdata.ResourceMetrics) []metricdata.HistogramDataPoint[float64] {
 	t.Helper()
+	name := otelActionDurationMetricName
 	for _, sm := range rm.ScopeMetrics {
 		for _, m := range sm.Metrics {
 			if m.Name != name {
@@ -562,7 +563,7 @@ func TestOTelWiring_MetricsEnabled_RecordsDurationForSuccessAndError(t *testing.
 	if err := reader.Collect(context.Background(), &rm); err != nil {
 		t.Fatalf("reader.Collect: %v", err)
 	}
-	points := findHistogramDataPoints(t, rm, otelActionDurationMetricName)
+	points := findHistogramDataPoints(t, rm)
 	if len(points) != 2 {
 		t.Fatalf("expected 2 %s data points (one per dispatched action), got %d: %+v", otelActionDurationMetricName, len(points), points)
 	}
@@ -629,7 +630,7 @@ func TestOTelWiring_MetricsEnabled_RecordsMarshalError(t *testing.T) {
 	if err := reader.Collect(context.Background(), &rm); err != nil {
 		t.Fatalf("reader.Collect: %v", err)
 	}
-	points := findHistogramDataPoints(t, rm, otelActionDurationMetricName)
+	points := findHistogramDataPoints(t, rm)
 	if len(points) != 1 {
 		t.Fatalf("expected 1 %s data point, got %d: %+v", otelActionDurationMetricName, len(points), points)
 	}
@@ -675,7 +676,7 @@ func TestOTelWiring_MetricsDisabledByConfig_NoHistogramRecorded(t *testing.T) {
 	if err := reader.Collect(context.Background(), &rm); err != nil {
 		t.Fatalf("reader.Collect: %v", err)
 	}
-	if points := findHistogramDataPoints(t, rm, otelActionDurationMetricName); len(points) != 0 {
+	if points := findHistogramDataPoints(t, rm); len(points) != 0 {
 		t.Fatalf("expected zero %s data points with pve.otel.metrics.enabled=false, got %d: %+v", otelActionDurationMetricName, len(points), points)
 	}
 }
@@ -968,7 +969,7 @@ func TestOTelWiring_StdoutPurity_MetricsEnabledVsOff(t *testing.T) {
 	if err := reader.Collect(context.Background(), &rm); err != nil {
 		t.Fatalf("reader.Collect: %v", err)
 	}
-	if points := findHistogramDataPoints(t, rm, otelActionDurationMetricName); len(points) == 0 {
+	if points := findHistogramDataPoints(t, rm); len(points) == 0 {
 		t.Fatal("test setup broken: expected at least one cpi.action.duration data point in the metrics-on run, got 0")
 	}
 }
