@@ -56,6 +56,24 @@ type Dispatcher struct {
 	// dispatcher decoupled from the config package; main wires it from
 	// pve.redact_logs via WithRequestTrace.
 	requestTrace bool
+	// durationRecorder, when non-nil, is invoked exactly once per dispatched
+	// request with the request's ctx, method, final outcome, and elapsed
+	// duration in milliseconds. "Final" means after every reclassification
+	// Handle itself performs on the outcome a handler (and its hooks)
+	// originally returned — in particular the per-method timeout rewrite
+	// (still recorded with the same outcome the wrapped handler observed, not
+	// a distinct "timeout" value) and a result that fails json.Marshal
+	// (recorded as "marshal_error", a case no hook running inside the handler
+	// call can ever observe). The ctx passed is always Handle's own request
+	// ctx (never callCtx, the possibly-timeout-wrapped context passed to the
+	// handler) so a recorder reading span/exemplar data from it is unaffected
+	// by the per-method deadline envelope; a ctx already canceled or expired
+	// by the time a branch records (e.g. the timeout and marshal_error
+	// branches) is expected and fine, since the recorder only reads from it,
+	// never dials out. nil (the default) means Handle makes no extra call, so
+	// an unconfigured dispatcher pays zero overhead. Populated via
+	// WithDurationRecorder.
+	durationRecorder func(ctx context.Context, method, outcome string, durationMs float64)
 }
 
 // NewDispatcher returns a Dispatcher with all 22 CPI methods pre-registered as
@@ -128,6 +146,33 @@ func WithMethodTimeouts(resolver func(method string) time.Duration) func(*Dispat
 func WithRequestTrace(enabled bool) func(*Dispatcher) {
 	return func(d *Dispatcher) {
 		d.requestTrace = enabled
+	}
+}
+
+// WithDurationRecorder returns an option that installs a callback Handle calls
+// exactly once per dispatched request, after the request's final outcome is
+// known, with the request's ctx, the method, the outcome, and elapsed
+// duration in milliseconds. This is the sole seam by which a metrics backend
+// observes per-action duration — no hook can substitute for it, because a
+// hook's After runs inside the wrapped handler call, before Handle's own
+// post-handler steps (the timeout rewrite and the json.Marshal of the result)
+// have run, and so a hook can never see a marshal failure and would
+// misreport a since-rewritten timeout as the handler's original (pre-rewrite)
+// outcome. ctx is always Handle's own request ctx, letting a recorder read
+// span/exemplar data from it (e.g. to correlate the metric point with the
+// root span); it may already be canceled or expired at some call sites
+// (timeout, marshal_error) — that is expected, since the recorder is expected
+// only to read from ctx, never to dial out with it. The recorder is a plain
+// func rather than an OTel type so the dispatcher stays decoupled from the
+// metrics package. The default (no option, or an explicit nil recorder) means
+// Handle performs no extra call — byte-identical to prior releases. The
+// recorder must not block or fail the dispatched action: it runs inline on
+// the dispatch path, so a slow or panicking recorder would itself delay or
+// crash request handling; callers are responsible for making their callback
+// fast and panic-free.
+func WithDurationRecorder(recorder func(ctx context.Context, method, outcome string, durationMs float64)) func(*Dispatcher) {
+	return func(d *Dispatcher) {
+		d.durationRecorder = recorder
 	}
 }
 
@@ -265,6 +310,12 @@ func (d *Dispatcher) Handle(ctx context.Context, req *jsonrpc.Request) (resp *js
 			log.String("outcome", "timeout"),
 			log.Err(err),
 		)...)
+		// Recorded as "error", not "timeout": this mirrors what the wrapped
+		// handler's hooks already observed inside h.Handle above (the
+		// handler's own non-nil error), before this rewrite ran. The duration
+		// metric's outcome vocabulary is success/error/marshal_error only;
+		// the "timeout" string is a dispatch-log-only distinction.
+		d.recordDuration(ctx, req.Method, "error", durationMS)
 		return dispatchError(cpierrors.Retriable(
 			"operation %s exceeded its %s deadline [request_id=%s]; aborted and may be retried",
 			req.Method, budget, requestID))
@@ -278,6 +329,7 @@ func (d *Dispatcher) Handle(ctx context.Context, req *jsonrpc.Request) (resp *js
 			log.String("outcome", outcome),
 			log.Err(err),
 		)...)
+		d.recordDuration(ctx, req.Method, outcome, durationMS)
 		return dispatchError(err)
 	}
 
@@ -290,6 +342,7 @@ func (d *Dispatcher) Handle(ctx context.Context, req *jsonrpc.Request) (resp *js
 			log.String("outcome", "marshal_error"),
 			log.Err(marshalErr),
 		)...)
+		d.recordDuration(ctx, req.Method, "marshal_error", durationMS)
 		return errorResponse(cpierrors.Cloud("result marshal failed: %s", marshalErr.Error()))
 	}
 
@@ -299,6 +352,7 @@ func (d *Dispatcher) Handle(ctx context.Context, req *jsonrpc.Request) (resp *js
 		log.Float64("duration_ms", durationMS),
 		log.String("outcome", "ok"),
 	)...)
+	d.recordDuration(ctx, req.Method, "success", durationMS)
 
 	return &jsonrpc.Response{
 		Result: json.RawMessage(raw),
@@ -453,6 +507,17 @@ func (d *Dispatcher) traceResponse(ctx context.Context, method, requestID string
 	d.logger.Debug("cpi response", requestFields(ctx, method, requestID,
 		log.Any("result", log.RedactSecrets(tree)),
 	)...)
+}
+
+// recordDuration calls d.durationRecorder when one is installed, centralizing
+// the nil-guard so every Handle call site is a single line. ctx is always the
+// caller's request ctx (see WithDurationRecorder). A dispatcher built without
+// WithDurationRecorder (the default) makes this a no-op check with no further
+// cost.
+func (d *Dispatcher) recordDuration(ctx context.Context, method, outcome string, durationMS float64) {
+	if d.durationRecorder != nil {
+		d.durationRecorder(ctx, method, outcome, durationMS)
+	}
 }
 
 // dispatchError converts any error returned by a handler to a *jsonrpc.Response.

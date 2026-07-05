@@ -148,61 +148,33 @@ func setupOTelLogsAndMetrics(
 // already cover that at finer granularity.
 const otelActionDurationMetricName = "cpi.action.duration"
 
-// otelActionDurationStartKey is the unexported context key under which
-// otelActionDurationHook.Before stashes the call start time for After to
-// read, mirroring hooks.MetricsHook's identical pattern
-// (internal/cpi/hooks/metrics.go) so a single hook instance stays safe for
-// concurrent dispatch.
-type otelActionDurationStartKey struct{}
-
-// otelActionDurationHook records the cpi.action.duration histogram once per
-// dispatched CPI action. cpi.Dispatcher.Register wraps every registered
-// handler in the configured hook chain (see cpi.WrapHandler), so Before/After
-// bracket the same handler invocation the root span in runCPI covers,
-// letting this hook measure "one dispatched action" without runCPI/
-// dispatchOne needing any awareness of metrics. Outcome is classified as
-// "success" (handler returned a nil error) or "error" (non-nil error),
-// mirroring endRootSpan's binary success/error classification.
-// It is registered only when pve.otel.metrics.enabled is true; when
-// disabled, no histogram is created and this hook is never added to the
-// dispatcher's hook chain (see runWithArgs), so a metrics-disabled
-// deployment pays zero per-call overhead from this hook.
-type otelActionDurationHook struct {
-	histogram metric.Float64Histogram
-}
-
-// Before records the call start time in the returned context.
-func (h *otelActionDurationHook) Before(ctx context.Context, _ string, _ []json.RawMessage, _ jsonrpc.Context) context.Context {
-	return context.WithValue(ctx, otelActionDurationStartKey{}, time.Now())
-}
-
-// After records one cpi.action.duration observation carrying cpi.method and
-// outcome attributes. The result and error are returned unchanged — this
-// hook only observes, per the cpi.Hook contract's "built-in hooks observe
-// only" convention.
-func (h *otelActionDurationHook) After(ctx context.Context, method string, result any, err error) (any, error) {
-	start, ok := ctx.Value(otelActionDurationStartKey{}).(time.Time)
-	if !ok {
-		// Defensive: WrapHandler always threads Before's returned ctx straight
-		// into the handler and back into After, so this branch is unreachable
-		// in production. Skipping the recording (rather than recording a bogus
-		// zero-duration observation) keeps this hook fail-open like every
-		// other OTel signal in this package.
-		return result, err
+// newOTelDurationRecorder adapts histogram into a cpi.WithDurationRecorder
+// callback. Unlike the hook this replaced, the callback performs no outcome
+// classification itself: cpi.Dispatcher.Handle already computes the final
+// outcome ("success", "error", or "marshal_error" — the last reachable only
+// once a handler's result fails json.Marshal, a step that runs after the
+// wrapped handler and its hooks have already returned, so no hook could ever
+// see it) and calls this exactly once per dispatched request, after every
+// reclassification Handle itself performs (including the per-method timeout
+// rewrite, which Handle still records here as "error" — the same value the
+// wrapped handler's hooks observed before Handle turned it into a retriable
+// timeout response). ctx is Handle's own request ctx (its own span, if any,
+// used for exemplar correlation only — this call never dials out with it),
+// mirroring how the hook this replaced recorded against the handler's ctx; it
+// may already be canceled by the time some outcomes are recorded (timeout,
+// marshal_error), which is expected and harmless for a Record call. It is
+// installed only when pve.otel.metrics.enabled is true; when disabled, no
+// histogram is created and no recorder is passed to the dispatcher (see
+// runWithArgs), so a metrics-disabled deployment pays zero per-call overhead
+// from this callback.
+func newOTelDurationRecorder(histogram metric.Float64Histogram) func(ctx context.Context, method, outcome string, durationMs float64) {
+	return func(ctx context.Context, method, outcome string, durationMs float64) {
+		histogram.Record(ctx, durationMs, metric.WithAttributes(
+			attribute.String("cpi.method", method),
+			attribute.String("outcome", outcome),
+		))
 	}
-	outcome := "success"
-	if err != nil {
-		outcome = "error"
-	}
-	durationMS := float64(time.Since(start).Microseconds()) / 1000.0
-	h.histogram.Record(ctx, durationMS, metric.WithAttributes(
-		attribute.String("cpi.method", method),
-		attribute.String("outcome", outcome),
-	))
-	return result, err
 }
-
-var _ cpi.Hook = (*otelActionDurationHook)(nil)
 
 func main() {
 	os.Exit(run())
@@ -439,9 +411,14 @@ func runWithArgs(args []string, stdin io.Reader, stdout, stderr io.Writer, opts 
 	}
 	// OTel action-duration metric (cpi.action.duration) is opt-in per
 	// pve.otel.metrics.enabled, independent of the file-based metrics hook
-	// above. Off (the default): no histogram is created and no
-	// hook is added, so a metrics-disabled deployment pays zero per-call
-	// overhead beyond this one bool check.
+	// above. Off (the default): no histogram is created and no recorder is
+	// installed, so a metrics-disabled deployment pays zero per-call overhead
+	// beyond this one bool check. Wired into the dispatcher via
+	// WithDurationRecorder (below, with dispatcherOpts) rather than the hook
+	// chain: a hook's After runs inside the wrapped handler call, before
+	// Handle's own post-handler steps (the timeout rewrite and the
+	// json.Marshal of the result), so it can never observe a marshal failure.
+	var otelDurationRecorder func(ctx context.Context, method, outcome string, durationMs float64)
 	if cfg.OTelMetricsEnabled() {
 		histogram, histErr := meter.Float64Histogram(
 			otelActionDurationMetricName,
@@ -451,7 +428,7 @@ func runWithArgs(args []string, stdin io.Reader, stdout, stderr io.Writer, opts 
 		if histErr != nil {
 			logger.Warn("otel metrics: cpi.action.duration histogram init failed", log.Err(histErr))
 		} else {
-			hookChain = append(hookChain, &otelActionDurationHook{histogram: histogram})
+			otelDurationRecorder = newOTelDurationRecorder(histogram)
 			logger.Info("otel metrics: cpi.action.duration histogram enabled")
 		}
 	}
@@ -480,6 +457,9 @@ func runWithArgs(args []string, stdin io.Reader, stdout, stderr io.Writer, opts 
 	pve.ConfigureStorageLockBackoff(sl.BaseMs, sl.CapMs, sl.JitterPct)
 
 	dispatcherOpts := []func(*cpi.Dispatcher){cpi.WithHooks(hookChain...)}
+	if otelDurationRecorder != nil {
+		dispatcherOpts = append(dispatcherOpts, cpi.WithDurationRecorder(otelDurationRecorder))
+	}
 	// Per-method deadline envelope is opt-in. When enabled, install a resolver
 	// sized by the operator's per-class budgets so a wedged operation converts
 	// into a retriable timeout instead of holding a Director queue slot forever.

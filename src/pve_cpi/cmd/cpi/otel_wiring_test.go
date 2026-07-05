@@ -590,6 +590,57 @@ func TestOTelWiring_MetricsEnabled_RecordsDurationForSuccessAndError(t *testing.
 	}
 }
 
+// TestOTelWiring_MetricsEnabled_RecordsMarshalError verifies the fix this file
+// exists to guard: a handler that returns a nil error but a result
+// json.Marshal rejects must be recorded on the exported cpi.action.duration
+// histogram with outcome "marshal_error", not "success" — the outcome a hook
+// wrapping the handler call would have recorded, since the marshal step runs
+// after the wrapped handler (and any hooks) already returned. This exercises
+// newOTelDurationRecorder wired the same way runWithArgs wires it (same
+// histogram, same instrument name/unit/description/attribute keys), but
+// drives the dispatcher directly with a custom handler: runWithArgs itself
+// offers no seam to inject a non-marshalable production handler.
+func TestOTelWiring_MetricsEnabled_RecordsMarshalError(t *testing.T) {
+	t.Parallel()
+
+	meter, reader := newManualMeter()
+	histogram, err := meter.Float64Histogram(
+		otelActionDurationMetricName,
+		metric.WithUnit("ms"),
+		metric.WithDescription("Duration of one dispatched CPI action, in milliseconds."),
+	)
+	if err != nil {
+		t.Fatalf("Float64Histogram: %v", err)
+	}
+
+	d := cpi.NewDispatcherWithOptions(log.NewNopLogger(), cpi.WithDurationRecorder(newOTelDurationRecorder(histogram)))
+	if regErr := d.Register("info", cpi.HandlerFunc(func(_ context.Context, _ []json.RawMessage, _ jsonrpc.Context) (any, error) {
+		return make(chan int), nil // not JSON-serialisable
+	})); regErr != nil {
+		t.Fatalf("Register: %v", regErr)
+	}
+
+	resp := d.Handle(context.Background(), &jsonrpc.Request{Method: "info", Context: jsonrpc.Context{RequestID: "marshal-error-test"}})
+	if resp.Error == nil {
+		t.Fatal("expected CloudError for non-marshalable result, got success")
+	}
+
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("reader.Collect: %v", err)
+	}
+	points := findHistogramDataPoints(t, rm, otelActionDurationMetricName)
+	if len(points) != 1 {
+		t.Fatalf("expected 1 %s data point, got %d: %+v", otelActionDurationMetricName, len(points), points)
+	}
+	if method, ok := histogramAttr(points[0], "cpi.method"); !ok || method != "info" {
+		t.Errorf("cpi.method = %q (ok=%v), want %q", method, ok, "info")
+	}
+	if outcome, ok := histogramAttr(points[0], "outcome"); !ok || outcome != "marshal_error" {
+		t.Errorf("outcome = %q (ok=%v), want %q", outcome, ok, "marshal_error")
+	}
+}
+
 // TestOTelWiring_MetricsDisabledByConfig_NoHistogramRecorded verifies that
 // pve.otel.metrics.enabled=false (the default) prevents the
 // cpi.action.duration histogram from ever being created or recorded, even
