@@ -6004,6 +6004,41 @@ func TestOTelSignals_InvalidProtocolRejected(t *testing.T) {
 	}
 }
 
+func TestOTelSignals_TraceOnlyInvalidProtocolRejected(t *testing.T) {
+	t.Parallel()
+	c := baseValidCfg()
+	c.OTel = config.OTelConfig{
+		Enabled:          true,
+		Protocol:         "thrift",
+		ExporterEndpoint: "collector:4318",
+	}
+	err := c.Validate()
+	if err == nil {
+		t.Fatal("expected a validation error for trace-only protocol \"thrift\", got nil")
+	}
+	if !strings.Contains(err.Error(), `otel.protocol must be "http" or "grpc", got "thrift"`) {
+		t.Errorf("error %q does not mention the protocol violation", err.Error())
+	}
+}
+
+func TestOTelSignals_TraceOnlyEmptyProtocolValidWithoutDefaults(t *testing.T) {
+	t.Parallel()
+	// Direct-Validate callers that predate Protocol pass empty; only the
+	// ApplyDefaults flow fills "http". Empty must stay accepted for a
+	// trace-only config so those callers keep validating as before.
+	c := baseValidCfg()
+	c.OTel = config.OTelConfig{
+		Enabled:          true,
+		ExporterEndpoint: "collector:4318",
+		ServiceName:      "pve_cpi",
+		SampleRatio:      1.0,
+		ExportTimeoutMs:  5000,
+	}
+	if err := c.Validate(); err != nil {
+		t.Errorf("trace-only config with empty protocol failed validation: %v", err)
+	}
+}
+
 func TestOTelSignals_LogsEndpointInheritsShared(t *testing.T) {
 	t.Parallel()
 	c := baseValidCfg()

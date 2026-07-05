@@ -3380,17 +3380,21 @@ func (c *CPIConfig) validateOperationTimeout(errs *[]string) {
 // disabled block never produces a validation error, preserving
 // zero-behavior-change-when-unset.
 func (c *CPIConfig) validateOTel(errs *[]string) {
-	// Protocol is required only for the logs/metrics signals: they are new
-	// this pass and have no pre-existing callers, so requiring it is safe.
-	// Trace-only (Enabled) callers that invoke Validate directly without
-	// ApplyDefaults predate Protocol and must keep validating exactly as
-	// before (preserve-existing-behavior-unchanged); the normal
-	// ApplyDefaults-then-Validate flow always fills Protocol="http" for a
-	// trace-enabled config before Validate ever sees it.
-	if (c.OTel.LogsEnabled || c.OTel.MetricsEnabled) &&
-		c.OTel.Protocol != "http" && c.OTel.Protocol != "grpc" {
-		*errs = append(*errs, fmt.Sprintf(
-			"otel.protocol must be \"http\" or \"grpc\", got %q", c.OTel.Protocol))
+	// Protocol must be a known value whenever any signal is enabled. The
+	// logs/metrics signals also reject empty: they have no callers that
+	// predate Protocol, so requiring it is safe. Trace-only (Enabled)
+	// callers that invoke Validate directly without ApplyDefaults predate
+	// Protocol and may still pass empty (the normal ApplyDefaults-then-
+	// Validate flow fills "http" before Validate ever sees it) — but a
+	// non-empty unknown value is a misconfiguration for every signal and
+	// must fail fast rather than silently selecting the http exporter.
+	if c.OTel.Protocol != "http" && c.OTel.Protocol != "grpc" {
+		switch {
+		case c.OTel.LogsEnabled || c.OTel.MetricsEnabled,
+			c.OTel.Enabled && c.OTel.Protocol != "":
+			*errs = append(*errs, fmt.Sprintf(
+				"otel.protocol must be \"http\" or \"grpc\", got %q", c.OTel.Protocol))
+		}
 	}
 	if c.OTel.Enabled {
 		if c.OTel.ExporterEndpoint == "" {
