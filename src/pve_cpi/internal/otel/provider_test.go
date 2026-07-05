@@ -3,7 +3,9 @@ package otel
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -94,7 +96,6 @@ func (preservingExporter) Shutdown(context.Context) error { return nil }
 
 func TestEnabledPipeline_ExportsSpanAfterShutdown(t *testing.T) {
 	exporter := preservingExporter{tracetest.NewInMemoryExporter()}
-	logger := log.NewNopLogger()
 	cfg := config.OTelConfig{
 		Enabled:         true,
 		ServiceName:     "pve-cpi-test",
@@ -102,7 +103,7 @@ func TestEnabledPipeline_ExportsSpanAfterShutdown(t *testing.T) {
 		ExportTimeoutMs: 5000,
 	}
 
-	tracer, shutdown := newTracerAndShutdown(exporter, cfg, logger)
+	tracer, shutdown := newTracerAndShutdown(exporter, cfg)
 
 	_, span := tracer.Start(context.Background(), "test-span")
 	span.End()
@@ -122,7 +123,6 @@ func TestEnabledPipeline_ExportsSpanAfterShutdown(t *testing.T) {
 
 func TestEnabledPipeline_SampleRatioZero_DropsSpans(t *testing.T) {
 	exporter := preservingExporter{tracetest.NewInMemoryExporter()}
-	logger := log.NewNopLogger()
 	cfg := config.OTelConfig{
 		Enabled:         true,
 		ServiceName:     "pve-cpi-test",
@@ -130,7 +130,7 @@ func TestEnabledPipeline_SampleRatioZero_DropsSpans(t *testing.T) {
 		ExportTimeoutMs: 5000,
 	}
 
-	tracer, shutdown := newTracerAndShutdown(exporter, cfg, logger)
+	tracer, shutdown := newTracerAndShutdown(exporter, cfg)
 
 	// A span started with no parent context and a zero sample ratio is
 	// dropped by the root TraceIDRatioBased{0} sampler wrapped in
@@ -149,7 +149,6 @@ func TestEnabledPipeline_SampleRatioZero_DropsSpans(t *testing.T) {
 
 func TestEnabledPipeline_SampleRatioOne_KeepsSpans(t *testing.T) {
 	exporter := preservingExporter{tracetest.NewInMemoryExporter()}
-	logger := log.NewNopLogger()
 	cfg := config.OTelConfig{
 		Enabled:         true,
 		ServiceName:     "pve-cpi-test",
@@ -157,7 +156,7 @@ func TestEnabledPipeline_SampleRatioOne_KeepsSpans(t *testing.T) {
 		ExportTimeoutMs: 5000,
 	}
 
-	tracer, shutdown := newTracerAndShutdown(exporter, cfg, logger)
+	tracer, shutdown := newTracerAndShutdown(exporter, cfg)
 
 	_, span := tracer.Start(context.Background(), "kept-span")
 	span.End()
@@ -168,6 +167,48 @@ func TestEnabledPipeline_SampleRatioOne_KeepsSpans(t *testing.T) {
 
 	if got := len(exporter.GetSpans()); got != 1 {
 		t.Fatalf("got %d exported spans with sample_ratio=1, want 1", got)
+	}
+}
+
+// --------------------------------------------------------------------------
+// Shutdown-failure logging ownership: the shutdown func returned by Setup
+// must not itself Warn-log a shutdown/flush failure. cmd/cpi/main.go's
+// composed defer is the sole owner of that Warn (it holds the bounded
+// timeout context the failure is reported against); logging it a second
+// time here would duplicate the message on every failed shutdown.
+// --------------------------------------------------------------------------
+
+// TestSetup_ShutdownFailure_NotLoggedByShutdownFunc pins that Setup's
+// shutdown func performs no logging of its own: it forces a real,
+// non-simulated shutdown error (an already-canceled context, which
+// sdktrace.TracerProvider.Shutdown detects before running any span
+// processor and returns as ctx.Err() — confirmed against the vendored SDK,
+// not merely assumed) and asserts the observed logger recorded zero
+// entries, proving the failure path is silent at this layer.
+func TestSetup_ShutdownFailure_NotLoggedByShutdownFunc(t *testing.T) {
+	logger, observer := log.NewObservedLogger(log.LevelWarn)
+	cfg := config.OTelConfig{
+		Enabled:          true,
+		ExporterEndpoint: "otel-collector.example.internal:4318",
+		ServiceName:      "svc",
+		SampleRatio:      1.0,
+		ExportTimeoutMs:  5000,
+	}
+
+	_, shutdown, err := Setup(context.Background(), cfg, logger)
+	if err != nil {
+		t.Fatalf("Setup returned error: %v", err)
+	}
+
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if err := shutdown(canceledCtx); err == nil {
+		t.Fatal("expected shutdown to return an error for an already-canceled context")
+	}
+
+	if entries := observer.All(); len(entries) != 0 {
+		t.Fatalf("shutdown func logged %d entries on failure, want 0 (caller owns shutdown-failure logging): %+v", len(entries), entries)
 	}
 }
 
@@ -310,6 +351,114 @@ func TestSetup_Enabled_ErrorHandlerRoutesToLogger(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("expected a Warn entry carrying the otel error, got entries: %+v", entries)
+	}
+}
+
+// --------------------------------------------------------------------------
+// normalizeEndpoint: the single shared endpoint classifier/validator behind
+// every trace/logs/metrics x http/grpc option builder in this package.
+// Exercised once here across all three field names, rather than duplicated
+// per-signal, since the five call sites delegate to this exact function.
+// --------------------------------------------------------------------------
+
+func TestNormalizeEndpoint(t *testing.T) {
+	const (
+		fieldTrace   = "exporter_endpoint"
+		fieldLogs    = "logs_exporter_endpoint"
+		fieldMetrics = "metrics_exporter_endpoint"
+	)
+
+	cases := []struct {
+		name       string
+		raw        string
+		wantIsURL  bool
+		wantEndp   string
+		wantErrFmt string // %s is substituted with the field name; "" means no error expected
+	}{
+		{
+			name:      "bare_host_port",
+			raw:       "otel-collector.example.internal:4318",
+			wantIsURL: false,
+			wantEndp:  "otel-collector.example.internal:4318",
+		},
+		{
+			name:      "full_http_url",
+			raw:       "http://otel-collector.example.internal:4318",
+			wantIsURL: true,
+			wantEndp:  "http://otel-collector.example.internal:4318",
+		},
+		{
+			name:      "full_https_url",
+			raw:       "https://otel-collector.example.internal:4318",
+			wantIsURL: true,
+			wantEndp:  "https://otel-collector.example.internal:4318",
+		},
+		{
+			name:       "bad_scheme",
+			raw:        "grpc://collector.example.internal:4317",
+			wantErrFmt: `otel: %s URL "grpc://collector.example.internal:4317" must use http or https scheme, got "grpc"`,
+		},
+		{
+			name:       "missing_host",
+			raw:        "http://",
+			wantErrFmt: `otel: %s URL "http://" is missing a host`,
+		},
+		{
+			name:       "unparseable_url",
+			raw:        "http://[::1",
+			wantErrFmt: `otel: %s URL "http://[::1" is invalid`,
+		},
+		{
+			name:      "leading_trailing_whitespace_host_port",
+			raw:       "  otel-collector.example.internal:4318  ",
+			wantIsURL: false,
+			wantEndp:  "otel-collector.example.internal:4318",
+		},
+		{
+			name:      "leading_trailing_whitespace_url",
+			raw:       "  https://otel-collector.example.internal:4318  ",
+			wantIsURL: true,
+			wantEndp:  "https://otel-collector.example.internal:4318",
+		},
+	}
+
+	for _, tc := range cases {
+		for _, field := range []string{fieldTrace, fieldLogs, fieldMetrics} {
+			t.Run(tc.name+"/"+field, func(t *testing.T) {
+				isURL, endpoint, err := normalizeEndpoint(field, tc.raw)
+
+				if tc.wantErrFmt == "" {
+					if err != nil {
+						t.Fatalf("normalizeEndpoint(%q, %q) returned unexpected error: %v", field, tc.raw, err)
+					}
+					if isURL != tc.wantIsURL {
+						t.Errorf("normalizeEndpoint(%q, %q) isURL = %v, want %v", field, tc.raw, isURL, tc.wantIsURL)
+					}
+					if endpoint != tc.wantEndp {
+						t.Errorf("normalizeEndpoint(%q, %q) endpoint = %q, want %q", field, tc.raw, endpoint, tc.wantEndp)
+					}
+					return
+				}
+
+				if err == nil {
+					t.Fatalf("normalizeEndpoint(%q, %q) expected error, got nil", field, tc.raw)
+				}
+				// The "unparseable_url" case wraps url.Parse's own error via
+				// %w, whose exact text is a Go stdlib implementation detail;
+				// check only the fixed prefix/suffix this package controls.
+				if tc.name == "unparseable_url" {
+					wantPrefix := fmt.Sprintf("otel: invalid %s URL %q:", field, tc.raw)
+					if !strings.HasPrefix(err.Error(), wantPrefix) {
+						t.Errorf("normalizeEndpoint(%q, %q) error = %q, want prefix %q", field, tc.raw, err.Error(), wantPrefix)
+					}
+					return
+				}
+				wantErr := fmt.Sprintf(tc.wantErrFmt, field)
+				if err.Error() != wantErr {
+					t.Errorf("normalizeEndpoint(%q, %q) error = %q, want %q", field, tc.raw, err.Error(), wantErr)
+				}
+			})
+		}
 	}
 }
 

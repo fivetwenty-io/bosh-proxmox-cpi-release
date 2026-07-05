@@ -176,6 +176,46 @@ func TestSetupMetrics_Enabled_UnreachableEndpoint_NonBlocking(t *testing.T) {
 }
 
 // --------------------------------------------------------------------------
+// Shutdown-failure logging ownership: see the equivalent trace-provider test
+// (TestSetup_ShutdownFailure_NotLoggedByShutdownFunc) for the rationale —
+// cmd/cpi/main.go's composed defer is the sole owner of the shutdown/flush
+// failure Warn across all three signals.
+// --------------------------------------------------------------------------
+
+// TestSetupMetrics_ShutdownFailure_NotLoggedByShutdownFunc pins that
+// SetupMetrics's shutdown func performs no logging of its own: it forces a
+// real shutdown error via an already-canceled context
+// (sdkmetric.PeriodicReader.Shutdown's internal collect propagates
+// ctx.Err(), confirmed against the vendored SDK) and asserts the observed
+// logger recorded zero entries.
+func TestSetupMetrics_ShutdownFailure_NotLoggedByShutdownFunc(t *testing.T) {
+	logger, observer := log.NewObservedLogger(log.LevelWarn)
+	cfg := config.OTelConfig{
+		MetricsEnabled:          true,
+		MetricsExporterEndpoint: "otel-collector.example.internal:4318",
+		Insecure:                true,
+		ServiceName:             "svc",
+		Protocol:                "http",
+	}
+
+	_, shutdown, err := SetupMetrics(context.Background(), cfg, logger)
+	if err != nil {
+		t.Fatalf("SetupMetrics returned error: %v", err)
+	}
+
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if err := shutdown(canceledCtx); err == nil {
+		t.Fatal("expected shutdown to return an error for an already-canceled context")
+	}
+
+	if entries := observer.All(); len(entries) != 0 {
+		t.Fatalf("shutdown func logged %d entries on failure, want 0 (caller owns shutdown-failure logging): %+v", len(entries), entries)
+	}
+}
+
+// --------------------------------------------------------------------------
 // Protocol selection: cfg.Protocol picks otlpmetrichttp vs otlpmetricgrpc.
 // --------------------------------------------------------------------------
 

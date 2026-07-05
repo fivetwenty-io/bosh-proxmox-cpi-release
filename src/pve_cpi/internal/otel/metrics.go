@@ -29,7 +29,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net/url"
 	"strings"
 	"sync"
 
@@ -72,23 +71,6 @@ func setErrorHandlerOnce(logger *log.Logger) {
 			logger.Warn("otel internal error", log.ErrScrubbed(handlerErr))
 		}))
 	})
-}
-
-// validateHTTPEndpointURL validates that endpoint is a well-formed http(s)
-// URL with a host, mirroring the trace provider's exporterOptionsFor
-// URL-form validation (provider.go).
-func validateHTTPEndpointURL(endpoint string) error {
-	parsed, err := url.Parse(endpoint)
-	if err != nil {
-		return fmt.Errorf("otel: invalid metrics_exporter_endpoint URL %q: %w", endpoint, err)
-	}
-	if parsed.Scheme != schemeHTTP && parsed.Scheme != schemeHTTPS {
-		return fmt.Errorf("otel: metrics_exporter_endpoint URL %q must use http or https scheme, got %q", endpoint, parsed.Scheme)
-	}
-	if parsed.Host == "" {
-		return fmt.Errorf("otel: metrics_exporter_endpoint URL %q is missing a host", endpoint)
-	}
-	return nil
 }
 
 // meterName identifies this instrumentation library to the metrics backend,
@@ -148,7 +130,7 @@ func SetupMetrics(ctx context.Context, cfg config.OTelConfig, logger *log.Logger
 
 	setErrorHandlerOnce(logger)
 
-	meter, shutdown := newMeterAndShutdown(exporter, cfg, logger)
+	meter, shutdown := newMeterAndShutdown(exporter, cfg)
 	return meter, shutdown, nil
 }
 
@@ -183,19 +165,19 @@ func newMetricExporter(ctx context.Context, cfg config.OTelConfig) (sdkmetric.Ex
 }
 
 // metricHTTPOptionsFor translates cfg into otlpmetrichttp options, mirroring
-// exporterOptionsFor's endpoint-form handling (bare host:port vs full URL)
-// and always applying the DELTA temporality selector. The endpoint
-// option is always derived from cfg.MetricsExporterEndpoint — never left
-// unset — so the exporter never falls back to reading ambient
+// exporterOptionsFor's endpoint-form handling (see normalizeEndpoint,
+// provider.go) and always applying the DELTA temporality selector. The
+// endpoint option is always derived from cfg.MetricsExporterEndpoint —
+// never left unset — so the exporter never falls back to reading ambient
 // OTEL_EXPORTER_OTLP_* env vars.
 func metricHTTPOptionsFor(cfg config.OTelConfig) ([]otlpmetrichttp.Option, error) {
-	endpoint := strings.TrimSpace(cfg.MetricsExporterEndpoint)
+	isURL, endpoint, err := normalizeEndpoint("metrics_exporter_endpoint", cfg.MetricsExporterEndpoint)
+	if err != nil {
+		return nil, err
+	}
 
 	var endpointOpt otlpmetrichttp.Option
-	if strings.Contains(endpoint, "://") {
-		if err := validateHTTPEndpointURL(endpoint); err != nil {
-			return nil, err
-		}
+	if isURL {
 		endpointOpt = otlpmetrichttp.WithEndpointURL(endpoint)
 	} else {
 		endpointOpt = otlpmetrichttp.WithEndpoint(endpoint)
@@ -205,7 +187,7 @@ func metricHTTPOptionsFor(cfg config.OTelConfig) ([]otlpmetrichttp.Option, error
 		endpointOpt,
 		otlpmetrichttp.WithTemporalitySelector(deltaTemporalitySelector),
 	}
-	if !strings.Contains(endpoint, "://") && cfg.Insecure {
+	if !isURL && cfg.Insecure {
 		opts = append(opts, otlpmetrichttp.WithInsecure())
 	}
 	return opts, nil
@@ -217,13 +199,13 @@ func metricHTTPOptionsFor(cfg config.OTelConfig) ([]otlpmetrichttp.Option, error
 // from cfg.MetricsExporterEndpoint for the same ambient-env-var-avoidance
 // reason as the http path.
 func metricGRPCOptionsFor(cfg config.OTelConfig) ([]otlpmetricgrpc.Option, error) {
-	endpoint := strings.TrimSpace(cfg.MetricsExporterEndpoint)
+	isURL, endpoint, err := normalizeEndpoint("metrics_exporter_endpoint", cfg.MetricsExporterEndpoint)
+	if err != nil {
+		return nil, err
+	}
 
 	var endpointOpt otlpmetricgrpc.Option
-	if strings.Contains(endpoint, "://") {
-		if err := validateHTTPEndpointURL(endpoint); err != nil {
-			return nil, err
-		}
+	if isURL {
 		endpointOpt = otlpmetricgrpc.WithEndpointURL(endpoint)
 	} else {
 		endpointOpt = otlpmetricgrpc.WithEndpoint(endpoint)
@@ -233,7 +215,7 @@ func metricGRPCOptionsFor(cfg config.OTelConfig) ([]otlpmetricgrpc.Option, error
 		endpointOpt,
 		otlpmetricgrpc.WithTemporalitySelector(deltaTemporalitySelector),
 	}
-	if !strings.Contains(endpoint, "://") && cfg.Insecure {
+	if !isURL && cfg.Insecure {
 		opts = append(opts, otlpmetricgrpc.WithInsecure())
 	}
 	return opts, nil
@@ -244,7 +226,13 @@ func metricGRPCOptionsFor(cfg config.OTelConfig) ([]otlpmetricgrpc.Option, error
 // SetupMetrics so tests can exercise the PeriodicReader/temporality/resource
 // wiring with an in-memory exporter instead of a real
 // otlpmetrichttp/otlpmetricgrpc/network exporter.
-func newMeterAndShutdown(exporter sdkmetric.Exporter, cfg config.OTelConfig, logger *log.Logger) (metric.Meter, func(context.Context) error) {
+//
+// The returned shutdown func does not log a shutdown/flush failure itself:
+// the caller composing this func with the trace and logs shutdown funcs
+// (cmd/cpi/main.go) owns the single Warn for all three signals. Callers
+// invoking this func directly (e.g. tests) must inspect the returned error
+// themselves.
+func newMeterAndShutdown(exporter sdkmetric.Exporter, cfg config.OTelConfig) (metric.Meter, func(context.Context) error) {
 	serviceName := cfg.ServiceName
 	if serviceName == "" {
 		serviceName = defaultServiceName
@@ -261,11 +249,7 @@ func newMeterAndShutdown(exporter sdkmetric.Exporter, cfg config.OTelConfig, log
 	meter := provider.Meter(meterName)
 
 	shutdown := func(shutdownCtx context.Context) error {
-		if err := provider.Shutdown(shutdownCtx); err != nil {
-			logger.Warn("otel metrics shutdown/export failed", log.ErrScrubbed(err))
-			return err
-		}
-		return nil
+		return provider.Shutdown(shutdownCtx)
 	}
 
 	return meter, shutdown

@@ -121,6 +121,46 @@ func TestSetupLogs_Enabled_UnknownProtocol_TreatedAsHTTP(t *testing.T) {
 }
 
 // --------------------------------------------------------------------------
+// Shutdown-failure logging ownership: see the equivalent trace-provider test
+// (TestSetup_ShutdownFailure_NotLoggedByShutdownFunc) for the rationale —
+// cmd/cpi/main.go's composed defer is the sole owner of the shutdown/flush
+// failure Warn across all three signals.
+// --------------------------------------------------------------------------
+
+// TestSetupLogs_ShutdownFailure_NotLoggedByShutdownFunc pins that SetupLogs's
+// shutdown func performs no logging of its own: it forces a real shutdown
+// error via an already-canceled context (sdklog.BatchProcessor.Shutdown
+// selects on ctx.Done() before the poll goroutine can signal completion,
+// confirmed against the vendored SDK) and asserts the observed logger
+// recorded zero entries.
+func TestSetupLogs_ShutdownFailure_NotLoggedByShutdownFunc(t *testing.T) {
+	logger, observer := log.NewObservedLogger(log.LevelWarn)
+	cfg := config.OTelConfig{
+		LogsEnabled:          true,
+		Protocol:             "http",
+		LogsExporterEndpoint: "otel-collector.example.internal:4318",
+		Insecure:             true,
+		ServiceName:          "svc",
+	}
+
+	_, shutdown, err := SetupLogs(context.Background(), cfg, logger)
+	if err != nil {
+		t.Fatalf("SetupLogs returned error: %v", err)
+	}
+
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if err := shutdown(canceledCtx); err == nil {
+		t.Fatal("expected shutdown to return an error for an already-canceled context")
+	}
+
+	if entries := observer.All(); len(entries) != 0 {
+		t.Fatalf("shutdown func logged %d entries on failure, want 0 (caller owns shutdown-failure logging): %+v", len(entries), entries)
+	}
+}
+
+// --------------------------------------------------------------------------
 // Input validation.
 // --------------------------------------------------------------------------
 

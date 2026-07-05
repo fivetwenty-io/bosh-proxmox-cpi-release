@@ -16,7 +16,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net/url"
 	"strings"
 
 	"go.opentelemetry.io/contrib/bridges/otelslog"
@@ -69,7 +68,7 @@ func SetupLogs(ctx context.Context, cfg config.OTelConfig, logger *log.Logger) (
 
 	setErrorHandlerOnce(logger)
 
-	handler, shutdown := newLogsHandlerAndShutdown(exporter, cfg, logger)
+	handler, shutdown := newLogsHandlerAndShutdown(exporter, cfg)
 	return handler, shutdown, nil
 }
 
@@ -101,27 +100,17 @@ func newLogsExporter(ctx context.Context, cfg config.OTelConfig) (sdklog.Exporte
 	return exporter, nil
 }
 
-// httpLogsExporterOptionsFor translates cfg into otlploghttp options,
-// normalizing cfg.LogsExporterEndpoint per the same two accepted forms as
-// exporterOptionsFor (trace): a full URL (scheme determines transport
-// security, cfg.Insecure ignored) or a bare "host:port" pair (cfg.Insecure
-// selects http vs https). The endpoint is always passed explicitly — never
-// left for the exporter to pick up from ambient OTEL_EXPORTER_OTLP_* env
-// vars.
+// httpLogsExporterOptionsFor translates cfg into otlploghttp options. See
+// normalizeEndpoint (provider.go) for the endpoint-syntax rules shared with
+// every other signal/protocol option builder in this package. The endpoint
+// is always passed explicitly — never left for the exporter to pick up from
+// ambient OTEL_EXPORTER_OTLP_* env vars.
 func httpLogsExporterOptionsFor(cfg config.OTelConfig) ([]otlploghttp.Option, error) {
-	endpoint := strings.TrimSpace(cfg.LogsExporterEndpoint)
-
-	if strings.Contains(endpoint, "://") {
-		parsed, err := url.Parse(endpoint)
-		if err != nil {
-			return nil, fmt.Errorf("otel: invalid logs_exporter_endpoint URL %q: %w", cfg.LogsExporterEndpoint, err)
-		}
-		if parsed.Scheme != schemeHTTP && parsed.Scheme != schemeHTTPS {
-			return nil, fmt.Errorf("otel: logs_exporter_endpoint URL %q must use http or https scheme, got %q", cfg.LogsExporterEndpoint, parsed.Scheme)
-		}
-		if parsed.Host == "" {
-			return nil, fmt.Errorf("otel: logs_exporter_endpoint URL %q is missing a host", cfg.LogsExporterEndpoint)
-		}
+	isURL, endpoint, err := normalizeEndpoint("logs_exporter_endpoint", cfg.LogsExporterEndpoint)
+	if err != nil {
+		return nil, err
+	}
+	if isURL {
 		return []otlploghttp.Option{otlploghttp.WithEndpointURL(endpoint)}, nil
 	}
 
@@ -135,19 +124,11 @@ func httpLogsExporterOptionsFor(cfg config.OTelConfig) ([]otlploghttp.Option, er
 // grpcLogsExporterOptionsFor translates cfg into otlploggrpc options. Same
 // endpoint-normalization rules as httpLogsExporterOptionsFor.
 func grpcLogsExporterOptionsFor(cfg config.OTelConfig) ([]otlploggrpc.Option, error) {
-	endpoint := strings.TrimSpace(cfg.LogsExporterEndpoint)
-
-	if strings.Contains(endpoint, "://") {
-		parsed, err := url.Parse(endpoint)
-		if err != nil {
-			return nil, fmt.Errorf("otel: invalid logs_exporter_endpoint URL %q: %w", cfg.LogsExporterEndpoint, err)
-		}
-		if parsed.Scheme != schemeHTTP && parsed.Scheme != schemeHTTPS {
-			return nil, fmt.Errorf("otel: logs_exporter_endpoint URL %q must use http or https scheme, got %q", cfg.LogsExporterEndpoint, parsed.Scheme)
-		}
-		if parsed.Host == "" {
-			return nil, fmt.Errorf("otel: logs_exporter_endpoint URL %q is missing a host", cfg.LogsExporterEndpoint)
-		}
+	isURL, endpoint, err := normalizeEndpoint("logs_exporter_endpoint", cfg.LogsExporterEndpoint)
+	if err != nil {
+		return nil, err
+	}
+	if isURL {
 		return []otlploggrpc.Option{otlploggrpc.WithEndpointURL(endpoint)}, nil
 	}
 
@@ -163,7 +144,13 @@ func grpcLogsExporterOptionsFor(cfg config.OTelConfig) ([]otlploggrpc.Option, er
 // func. Split out from SetupLogs so tests can exercise the batch
 // processor/resource wiring with an in-memory/fake exporter instead of a
 // real otlploghttp/otlploggrpc/network exporter.
-func newLogsHandlerAndShutdown(exporter sdklog.Exporter, cfg config.OTelConfig, logger *log.Logger) (slog.Handler, func(context.Context) error) {
+//
+// The returned shutdown func does not log a shutdown/flush failure itself:
+// the caller composing this func with the trace and metrics shutdown funcs
+// (cmd/cpi/main.go) owns the single Warn for all three signals. Callers
+// invoking this func directly (e.g. tests) must inspect the returned error
+// themselves.
+func newLogsHandlerAndShutdown(exporter sdklog.Exporter, cfg config.OTelConfig) (slog.Handler, func(context.Context) error) {
 	serviceName := cfg.ServiceName
 	if serviceName == "" {
 		serviceName = defaultServiceName
@@ -180,11 +167,7 @@ func newLogsHandlerAndShutdown(exporter sdklog.Exporter, cfg config.OTelConfig, 
 	handler := otelslog.NewHandler(tracerName, otelslog.WithLoggerProvider(provider))
 
 	shutdown := func(shutdownCtx context.Context) error {
-		if err := provider.Shutdown(shutdownCtx); err != nil {
-			logger.Warn("otel logs shutdown/export failed", log.ErrScrubbed(err))
-			return err
-		}
-		return nil
+		return provider.Shutdown(shutdownCtx)
 	}
 
 	return handler, shutdown

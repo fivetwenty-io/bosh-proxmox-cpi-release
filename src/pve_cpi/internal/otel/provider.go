@@ -132,7 +132,7 @@ func Setup(ctx context.Context, cfg config.OTelConfig, logger *log.Logger) (trac
 
 	setErrorHandlerOnce(logger)
 
-	tracer, shutdown := newTracerAndShutdown(exporter, cfg, logger)
+	tracer, shutdown := newTracerAndShutdown(exporter, cfg)
 	return tracer, shutdown, nil
 }
 
@@ -157,21 +157,34 @@ func isGRPCProtocol(cfg config.OTelConfig) bool {
 	return cfg.Protocol == protocolGRPC
 }
 
-// endpointForm classifies cfg.ExporterEndpoint per the two forms documented
-// on pve.otel.exporter_endpoint (jobs/pve_cpi/spec): "host:port or full
-// URL". It is shared by exporterOptionsFor (http) and grpcExporterOptionsFor
-// (grpc) below, since both wire protocols accept the same endpoint syntax
-// and must reject the same malformed inputs identically.
+// normalizeEndpoint classifies and validates raw per the two forms
+// documented on pve.otel.exporter_endpoint (jobs/pve_cpi/spec): "host:port
+// or full URL". It is the single shared implementation behind every
+// endpoint-option builder in this package — the trace, logs, and metrics
+// http/grpc option builders below — since all three signals and both wire
+// protocols accept the same endpoint syntax and must classify and reject
+// malformed input identically.
 //
-//   - If the endpoint contains a "://" scheme separator, it is treated as a
-//     full URL: the scheme (which must be http or https) determines
-//     transport security and cfg.Insecure is ignored, since the scheme
-//     already states the operator's intent unambiguously. isURL is true.
-//   - Otherwise the endpoint is treated as a bare "host:port" pair and
-//     cfg.Insecure selects insecure (true) vs secure/TLS (false, the
-//     default). isURL is false.
-func endpointForm(cfg config.OTelConfig) (isURL bool, endpoint string, err error) {
-	endpoint = strings.TrimSpace(cfg.ExporterEndpoint)
+//   - If raw (after trimming surrounding whitespace) contains a "://"
+//     scheme separator, it is treated as a full URL: the scheme (which must
+//     be http or https) determines transport security and the caller's
+//     cfg.Insecure is ignored, since the scheme already states the
+//     operator's intent unambiguously. isURL is true and endpoint is the
+//     trimmed URL string, suitable for a *WithEndpointURL option.
+//   - Otherwise raw is treated as a bare "host:port" pair; isURL is false
+//     and endpoint is the trimmed host:port string, suitable for a
+//     *WithEndpoint option. The caller's cfg.Insecure then selects insecure
+//     (true) vs secure/TLS (false, the default).
+//
+// fieldName names the pve.otel.* spec property being validated (e.g.
+// "exporter_endpoint", "logs_exporter_endpoint", "metrics_exporter_endpoint")
+// and is substituted into every returned error message so the message names
+// the property whose value was rejected. The rejected-value text embedded in
+// an error is always the original, untrimmed raw argument (not the trimmed
+// endpoint), so an operator sees exactly what they configured, including any
+// stray surrounding whitespace that may itself be the problem.
+func normalizeEndpoint(fieldName, raw string) (isURL bool, endpoint string, err error) {
+	endpoint = strings.TrimSpace(raw)
 
 	if !strings.Contains(endpoint, "://") {
 		return false, endpoint, nil
@@ -179,21 +192,22 @@ func endpointForm(cfg config.OTelConfig) (isURL bool, endpoint string, err error
 
 	parsed, err := url.Parse(endpoint)
 	if err != nil {
-		return false, "", fmt.Errorf("otel: invalid exporter_endpoint URL %q: %w", cfg.ExporterEndpoint, err)
+		return false, "", fmt.Errorf("otel: invalid %s URL %q: %w", fieldName, raw, err)
 	}
 	if parsed.Scheme != schemeHTTP && parsed.Scheme != schemeHTTPS {
-		return false, "", fmt.Errorf("otel: exporter_endpoint URL %q must use http or https scheme, got %q", cfg.ExporterEndpoint, parsed.Scheme)
+		return false, "", fmt.Errorf("otel: %s URL %q must use http or https scheme, got %q", fieldName, raw, parsed.Scheme)
 	}
 	if parsed.Host == "" {
-		return false, "", fmt.Errorf("otel: exporter_endpoint URL %q is missing a host", cfg.ExporterEndpoint)
+		return false, "", fmt.Errorf("otel: %s URL %q is missing a host", fieldName, raw)
 	}
 	return true, endpoint, nil
 }
 
 // exporterOptionsFor translates cfg into otlptracehttp options. See
-// endpointForm for the endpoint-syntax rules shared with the grpc path.
+// normalizeEndpoint for the endpoint-syntax rules shared with every other
+// signal/protocol option builder in this package.
 func exporterOptionsFor(cfg config.OTelConfig) ([]otlptracehttp.Option, error) {
-	isURL, endpoint, err := endpointForm(cfg)
+	isURL, endpoint, err := normalizeEndpoint("exporter_endpoint", cfg.ExporterEndpoint)
 	if err != nil {
 		return nil, err
 	}
@@ -214,10 +228,10 @@ func exporterOptionsFor(cfg config.OTelConfig) ([]otlptracehttp.Option, error) {
 // WithEndpoint) rather than leaving the endpoint unset, so the exporter
 // never falls back to reading the ambient OTEL_EXPORTER_OTLP_ENDPOINT /
 // OTEL_EXPORTER_OTLP_TRACES_ENDPOINT environment variables: cfg is the CPI's
-// sole source of truth for where spans go. See endpointForm for the
+// sole source of truth for where spans go. See normalizeEndpoint for the
 // endpoint-syntax rules shared with the http path.
 func grpcExporterOptionsFor(cfg config.OTelConfig) ([]otlptracegrpc.Option, error) {
-	isURL, endpoint, err := endpointForm(cfg)
+	isURL, endpoint, err := normalizeEndpoint("exporter_endpoint", cfg.ExporterEndpoint)
 	if err != nil {
 		return nil, err
 	}
@@ -237,7 +251,14 @@ func grpcExporterOptionsFor(cfg config.OTelConfig) ([]otlptracegrpc.Option, erro
 // so tests can exercise the BatchSpanProcessor/sampler/resource wiring with
 // an in-memory exporter (sdktrace/tracetest) instead of a real
 // otlptracehttp/network exporter.
-func newTracerAndShutdown(exporter sdktrace.SpanExporter, cfg config.OTelConfig, logger *log.Logger) (trace.Tracer, func(context.Context) error) {
+//
+// The returned shutdown func does not log a shutdown/flush failure itself:
+// the caller composing this func with the logs and metrics shutdown funcs
+// (cmd/cpi/main.go) owns the single Warn for all three signals, since it
+// already holds the bounded-timeout context the failure is reported
+// against. Callers invoking this func directly (e.g. tests) must inspect
+// the returned error themselves.
+func newTracerAndShutdown(exporter sdktrace.SpanExporter, cfg config.OTelConfig) (trace.Tracer, func(context.Context) error) {
 	serviceName := cfg.ServiceName
 	if serviceName == "" {
 		serviceName = defaultServiceName
@@ -255,11 +276,7 @@ func newTracerAndShutdown(exporter sdktrace.SpanExporter, cfg config.OTelConfig,
 	tracer := provider.Tracer(tracerName)
 
 	shutdown := func(shutdownCtx context.Context) error {
-		if err := provider.Shutdown(shutdownCtx); err != nil {
-			logger.Warn("otel shutdown/export failed", log.ErrScrubbed(err))
-			return err
-		}
-		return nil
+		return provider.Shutdown(shutdownCtx)
 	}
 
 	return tracer, shutdown
