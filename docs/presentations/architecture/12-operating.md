@@ -151,7 +151,7 @@ flowchart LR
 - One root span will open per CPI action; every PVE call underneath becomes a timed child span, and log lines will carry the same trace_id/span_id whenever a span is active.
 - Spans will buffer in-process and flush once under a bounded timeout at exit — a slow collector cannot stall an action mid-flight; export failure degrades to a warning in our own logs, never a failed CPI action.
 - Logs will be a second signal: the same structured stderr lines also flow to the collector, stderr itself untouched, with whatever trace/span was open carried along — beta, because the upstream logs SDK has not reached 1.0.
-- Metrics will be the third signal: exactly one instrument, a `cpi.action.duration` millisecond histogram tagged by CPI method and success/error outcome, delta rather than cumulative because a one-shot process has no running series — no per-PVE-call metrics.
+- Metrics will be the third signal: exactly one instrument, a `cpi.action.duration` millisecond histogram tagged by CPI method and final outcome (`success`, `error`, or `marshal_error`), delta rather than cumulative because a one-shot process has no running series — no per-PVE-call metrics.
 - `cpi.response_write_failure` will be a fresh span opened from the response-write panic-recovery path, since the root span has usually already closed by then and appending to it is a no-op.
 - Nothing about any of the three signals will touch stdout, which stays the JSON-RPC reply alone; each signal opts in on its own, and one protocol setting redirects traces, logs, and metrics together between OTLP/HTTP and OTLP/gRPC.
 - The enable switch, endpoint, sample ratio, and flush deadline live in the [configuration reference](../configuration.md), every one defaulting to inert.

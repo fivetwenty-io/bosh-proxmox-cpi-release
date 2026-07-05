@@ -564,7 +564,7 @@ The upstream OpenTelemetry Go logs SDK is still pre-1.0 (a `0.x` release), unlik
 
 ### Metrics
 
-When `pve.otel.metrics.enabled` is `true`, the CPI records one histogram, `cpi.action.duration` (in milliseconds), for every dispatched CPI action, tagged with `cpi.method` and `outcome` attributes, exported via OTLP to `pve.otel.metrics.exporter_endpoint` (or, if that is left empty, `pve.otel.exporter_endpoint`). This signal is independent of tracing — metrics can be exported with `pve.otel.enabled` false.
+When `pve.otel.metrics.enabled` is `true`, the CPI records one histogram, `cpi.action.duration` (in milliseconds), for every dispatched CPI action, tagged with `cpi.method` and `outcome` (`success`, `error`, or `marshal_error`) attributes, exported via OTLP to `pve.otel.metrics.exporter_endpoint` (or, if that is left empty, `pve.otel.exporter_endpoint`). This signal is independent of tracing — metrics can be exported with `pve.otel.enabled` false.
 
 | Property | Type | Default | Description |
 |---|---|---|---|
