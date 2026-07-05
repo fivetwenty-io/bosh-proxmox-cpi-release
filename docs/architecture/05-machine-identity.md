@@ -4,7 +4,7 @@ A fresh clone boots into a strange situation. It has an operating system and a B
 
 So identity has to arrive another way: handed to the machine from outside, in a form the machine already knows how to read, before any network conversation begins.
 
-*The first principle of this chapter: a cloned VM is anonymous until it is handed its identity, so deliver that identity out-of-band as a read-only ConfigDrive the guest's stock datasource already understands — no in-guest scripting, no SSH, no registry — reusing the OpenStack ecosystem rather than inventing a bootstrap.*
+*The first principle of this chapter: a cloned VM is anonymous until it is handed its identity. So deliver that identity out-of-band, as a read-only ConfigDrive the guest's stock datasource already understands — no in-guest scripting, no SSH, no registry. Reuse the OpenStack ecosystem rather than inventing a bootstrap.*
 
 ## The envelope, not the conversation
 
@@ -29,7 +29,7 @@ The OpenStack lineage earns its keep here. The ConfigDrive layout the CPI writes
 
 ## Where the envelope sits
 
-A VM has a fixed number of SCSI slots, and the CPI treats them as a deliberate map rather than a free-for-all. The system disk takes the first slot, then a run of slots for persistent data disks, one kept as deliberate headroom. SCSI slot 30, near the top of the range, is reserved permanently for the ConfigDrive. Because that reservation must stay intact, the CPI caps how many persistent disks a single VM may hold; pack too many in and they would collide with the very envelope that carries the machine's identity. The cap is not a limitation so much as the price of keeping the delivery slot sacred.
+A VM has a fixed number of SCSI slots, and the CPI treats them as a deliberate map rather than a free-for-all. The system disk takes the first slot, then a run of slots for persistent data disks, one kept as deliberate headroom. SCSI slot 30, near the top of the range, is reserved permanently for the ConfigDrive. Because that reservation must stay intact, the CPI caps how many persistent disks a single VM may hold. Pack too many in and they would collide with the very envelope that carries the machine's identity. The cap is not a limitation so much as the price of keeping the delivery slot sacred.
 
 ## Modes, and one that is gone
 
@@ -39,12 +39,12 @@ How identity gets delivered is selectable, but the choices are deliberately few.
   The default, and the only real bootstrap path. Settings are delivered by the ConfigDrive described above.
 
 - **noagent**
-  No bootstrap at all. This exists to test the CPI's own plumbing — cloning, wiring, attaching, starting — without involving an agent — exactly what we want when debugging the infrastructure layer in isolation.
+  No bootstrap at all. This exists to test the CPI's own plumbing — cloning, wiring, attaching, starting — without involving an agent. Exactly what we want when debugging the infrastructure layer in isolation.
 
 - **auto**
   Resolves on each call but always lands on the ConfigDrive, so in practice it behaves like cloudinit for every stemcell.
 
-One mode used to exist and now does not. The BOSH registry — a separate service the agent once contacted to fetch its settings — has been removed entirely. Asking for registry mode, or supplying any registry setting, now fails configuration validation outright. This tracks upstream BOSH, which has deprecated the registry, and it makes the model cleaner: the agent reads its settings directly from the metadata on the ConfigDrive, with no intermediary service to stand up, secure, or keep alive. One fewer moving part, one fewer thing to fail.
+One mode used to exist and now does not. The BOSH registry — a separate service the agent once contacted to fetch its settings — has been removed entirely. Asking for registry mode, or supplying any registry setting, now fails configuration validation outright. This tracks upstream BOSH, which has deprecated the registry, and it makes the model cleaner. The agent reads its settings directly from the metadata on the ConfigDrive, with no intermediary service to stand up, secure, or keep alive. One fewer moving part, one fewer thing to fail.
 
 ## The handshake
 
@@ -74,9 +74,9 @@ sequenceDiagram
 
 ## The gotcha that justifies the seams
 
-One failure shows why the boot path is shaped the way it is. The agent will hang forever — not error, just wait — if its settings name an ephemeral device that does not exist, or if the system disk is too small to carve the ephemeral partition the settings describe. A bad boot here is silent and permanent, the worst kind.
+One failure shows why the boot path is shaped the way it is. The agent will hang forever — not error, just wait. It happens if the settings name an ephemeral device that does not exist, or if the system disk is too small to carve the ephemeral partition the settings describe. A bad boot here is silent and permanent, the worst kind.
 
-So the CPI declines to over-specify. It leaves the ephemeral layout for the stemcell to carve for itself rather than naming a device that might not be there, and it resizes the system disk after cloning so there is room to carve. The lesson generalizes: when the consequence of a wrong instruction is an unrecoverable hang, the safe move is to say less and let the guest, which can see its own hardware, fill in the rest. The seam between what the CPI dictates and what the guest decides is drawn exactly where a mistake would be fatal.
+So the CPI declines to over-specify. It leaves the ephemeral layout for the stemcell to carve for itself rather than naming a device that might not be there. And it resizes the system disk after cloning, so there is room to carve. The lesson generalizes. When a wrong instruction means an unrecoverable hang, the safe move is to say less — and let the guest, which can see its own hardware, fill in the rest. The seam between what the CPI dictates and what the guest decides is drawn exactly where a mistake would be fatal.
 
 ## Where this leads
 

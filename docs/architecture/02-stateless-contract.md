@@ -12,7 +12,7 @@ One request goes in on standard input. One response comes out on standard output
 
 Each call is one self-contained JSON-RPC envelope: a method name, its arguments, a little context, and the contract version. The Director sends exactly one, the CPI answers with exactly one, logs go to a separate diagnostic stream, and then the process is gone. There is no long-running service, no open connection, no session. The next request starts a fresh process that remembers nothing about the last.
 
-*The first principle of this chapter: the binary is invoked once per request and may be retried — therefore it must be stateless, idempotent, and honest about whether a failure is worth trying again.*
+*The first principle of this chapter: the binary is invoked once per request, and it may be retried. So it must be stateless. It must be idempotent. And it must be honest about whether a failure is worth trying again.*
 
 That one sentence is the seed. The rest of the chapter is just watching it grow.
 
@@ -30,7 +30,7 @@ So every method is built to converge, not to assume a clean slate. Deleting a re
 
 ## Read-back, because the Director needs to reconcile
 
-If the Director holds the state and the CPI reads reality, the two can drift — a VM the Director thinks exists may have been destroyed out of band; a disk it forgot may still be sitting on a node. To close that gap, the contract includes pure read-back methods that ask reality a yes-or-no question: does this VM exist, does this disk exist, what disks are attached here? BOSH's reconciliation machinery uses these to detect orphaned and missing resources and bring its records back in line with the truth. Because the CPI keeps no state, these read-backs are how BOSH audits its own bookkeeping against the platform.
+If the Director holds the state and the CPI reads reality, the two can drift. A VM the Director thinks exists may have been destroyed out of band; a disk it forgot may still be sitting on a node. To close that gap, the contract includes pure read-back methods that ask reality a yes-or-no question: does this VM exist, does this disk exist, what disks are attached here? BOSH's reconciliation machinery uses these to detect orphaned and missing resources and bring its records back in line with the truth. Because the CPI keeps no state, these read-backs are how BOSH audits its own bookkeeping against the platform.
 
 ## The error model, because the Director must decide whether to retry
 
@@ -63,7 +63,7 @@ This is the CPI's honesty contract, and it has a deliberate bias. The system nev
 
 ## The single doorway
 
-Twenty-odd methods all need the same care: decode the envelope, survive a panic, respect a time limit, trace the call with secrets redacted, and clean up partial work if something fails. Rather than scatter that machinery across every handler, the CPI routes every request through one chokepoint — a dispatcher that is the single doorway into the binary. Each request walks through the same door, gets the same safety equipment strapped on, does its one specific job, and leaves cleaned up whether it succeeded or not. Panic recovery, the per-request timeout, redacted tracing, and partial-failure rollback all live at that door, so every method inherits them uniformly and none of them has to reimplement caution.
+Twenty-odd methods all need the same care: decode the envelope, survive a panic, respect a time limit, trace the call with secrets redacted, and clean up partial work if something fails. Rather than scatter that machinery across every handler, the CPI routes every request through one chokepoint — a dispatcher that is the single doorway into the binary. Each request walks through the same door, gets the same safety equipment strapped on, does its one specific job, and leaves cleaned up whether it succeeded or not. Panic recovery, the per-request timeout, redacted tracing, and partial-failure rollback all live at that door. Every method inherits them uniformly, and none of them has to reimplement caution.
 
 We will name these guards properly when production load and safety get their own chapters in Part IV. For now, the picture to keep is the doorway: uniform safety equipment, applied once, to everything.
 
@@ -83,7 +83,7 @@ sequenceDiagram
 
 ## Where this leads
 
-The contract and its consequences are now in place: one line in, one line out, stateless, idempotent, honest about retrying, and funneled through a single guarded door. That is the frame. With it established, we can stop talking about the binary in the abstract and follow one machine all the way through its life — birth, identity, disks, and death — as the Director sequences the primitive vocabulary the CPI provides. That story begins in [Chapter 3](03-lifecycle.md).
+The contract and its consequences are now in place: one line in, one line out, stateless, idempotent, honest about retrying, and funneled through a single guarded door. That is the frame. With it established, we can stop talking about the binary in the abstract and follow one machine all the way through its life — birth, identity, disks, and death. The Director sequences that life out of the primitive vocabulary the CPI provides, and the story begins in [Chapter 3](03-lifecycle.md).
 
 ## Grounding in the implementation
 

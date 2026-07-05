@@ -2,9 +2,9 @@
 
 A running deploy looks like chaos: dozens of machines appearing, disks attaching, networks wiring up, all at once. Underneath, it is something far simpler. The Director never issues a single "build me this deployment" command. It issues a long sequence of small, individually retriable steps, each one a named method on the CPI, and it sequences them itself. To understand the CPI is to watch one machine walk through that sequence from first breath to teardown.
 
-The previous chapter established the constraint that shapes everything: the binary is invoked once per request and may be retried, so it must be stateless, idempotent, and honest about retriability. This chapter follows the consequence. If the CPI holds no memory between calls, then the *Director* must hold the plan, and the CPI must offer it a vocabulary of primitives small enough to retry and complete enough to compose.
+The previous chapter established the constraint that shapes everything: the binary is invoked once per request and may be retried. So it must be stateless, idempotent, and honest about retriability. This chapter follows the consequence. If the CPI holds no memory between calls, then the *Director* must hold the plan. The CPI's job is to offer it a vocabulary of primitives — small enough to retry, complete enough to compose.
 
-*The first principle of this chapter: a deploy is the composition of independent, individually retriable resource lifecycles, and the CPI is the primitive vocabulary the Director sequences.*
+*The first principle of this chapter: a deploy is the composition of independent, individually retriable resource lifecycles. The CPI is the primitive vocabulary the Director sequences.*
 
 ## One VM's life, told as a chain
 
@@ -39,10 +39,10 @@ Twenty-one methods is unwieldy as a flat list — think of them in five families
   Turn a golden OS image into a reusable, frozen template, and later remove it. This is "prepare the mold," and Chapter 4 is entirely about why it exists.
 
 - **VM lifecycle**
-  Create, delete, reboot, check for, and label a machine. `create_vm` is the keystone of the whole CPI: it clones the template, allocates a VMID from the 100–8999 band, wires the network, attaches any disks the VM should own, writes the boot settings, and starts the machine.
+  Create, delete, reboot, check for, and label a machine. `create_vm` is the keystone of the whole CPI. It clones the template, allocates a VMID from the 100–8999 band, wires the network, attaches any disks the VM should own, writes the boot settings, and starts the machine.
 
 - **Disk lifecycle**
-  Create, delete, attach, detach, resize, snapshot, and tag persistent disks, which live in their own 9000–29999 band, plus a PVE-specific extension for updating a disk's performance contract in place.
+  Create, delete, attach, detach, resize, snapshot, and tag persistent disks, which live in their own 9000–29999 band. Plus a PVE-specific extension for updating a disk's performance contract in place.
 
 - **Reconciliation**
   `has_vm`, `has_disk`, and `get_disks` exist purely so the Director can compare its records against reality. Because the CPI keeps no database, the Director needs read-back primitives to detect an orphaned or missing resource and heal its own state. These are the methods BOSH's cloudcheck leans on.
@@ -65,7 +65,7 @@ stateDiagram-v2
 
 ## Why compute and data are kept apart
 
-Notice that the disk lifecycle is a separate family from the VM lifecycle, with its own identity band and its own create, attach, and delete verbs. This separation is deliberate, and it is the entire reason persistent disks exist. A VM is disposable. The Director may delete and recreate it during an upgrade, a stemcell roll, or a recovery. The data on a persistent disk must survive that churn untouched. So the disk has a life of its own: created before the VM that will use it, attached when needed, detached and re-attached to a fresh VM during a recreate, and deleted only when the deployment truly no longer wants the data. **Data survives compute** — that sentence is the whole justification for two lifecycles instead of one.
+Notice that the disk lifecycle is a separate family from the VM lifecycle, with its own identity band and its own create, attach, and delete verbs. This separation is deliberate, and it is the entire reason persistent disks exist. A VM is disposable. The Director may delete and recreate it during an upgrade, a stemcell roll, or a recovery. The data on a persistent disk must survive that churn untouched. So the disk has a life of its own. Created before the VM that will use it. Attached when needed. Detached and re-attached to a fresh VM during a recreate. Deleted only when the deployment truly no longer wants the data. **Data survives compute** — that sentence is the whole justification for two lifecycles instead of one.
 
 ## The quiet trick underneath
 
