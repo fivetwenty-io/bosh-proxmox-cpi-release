@@ -1885,7 +1885,7 @@ func buildAZOrder(cp createVMCloudProps, cfg *config.CPIConfig, rng *rand.Rand, 
 
 	if cfg.AZShuffleEnabled() && len(order) > 1 {
 		if rng == nil {
-			rng = rand.New(rand.NewSource(time.Now().UnixNano())) //nolint:gosec // shuffle; non-cryptographic
+			rng = rand.New(rand.NewSource(time.Now().UnixNano())) // #nosec G404 -- shuffle; non-cryptographic
 		}
 		rng.Shuffle(len(order), func(i, j int) { order[i], order[j] = order[j], order[i] })
 	}

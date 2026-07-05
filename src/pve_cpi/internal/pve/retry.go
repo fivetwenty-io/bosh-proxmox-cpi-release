@@ -22,7 +22,7 @@ var jitterMu sync.Mutex
 // The default is a package-level Rand seeded from the global source so
 // behavior is identical to the prior direct mrand.Int64N calls. Tests in
 // package pve may swap this directly under jitterMu for deterministic output.
-var jitterSource = mrand.New(mrand.NewPCG(mrand.Uint64(), mrand.Uint64())) //nolint:gosec // backoff jitter; non-cryptographic
+var jitterSource = mrand.New(mrand.NewPCG(mrand.Uint64(), mrand.Uint64())) // #nosec G404 -- backoff jitter; non-cryptographic
 
 // jitterInt64N returns a non-negative random int64 in [0, n) using the
 // package-level jitterSource, holding jitterMu for the duration.

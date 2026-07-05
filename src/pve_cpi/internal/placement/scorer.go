@@ -347,7 +347,7 @@ func Pick(ranked []ScoredNode, rng *rand.Rand) string {
 
 	// Break tie with rng.
 	if rng == nil {
-		rng = rand.New(rand.NewSource(0)) //nolint:gosec // non-crypto random for tie-break
+		rng = rand.New(rand.NewSource(0)) // #nosec G404 -- non-crypto random for tie-break
 	}
 	return tied[rng.Intn(len(tied))]
 }

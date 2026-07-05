@@ -4,7 +4,7 @@ import (
 	"archive/tar"
 	"compress/gzip"
 	"context"
-	cryptosha1 "crypto/sha1" //nolint:gosec // SHA-1 used only for operator-supplied expected-digest comparison, not for security
+	cryptosha1 "crypto/sha1" // #nosec G505 -- SHA-1 used only for operator-supplied expected-digest comparison, not for security
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -2357,7 +2357,7 @@ func sha1FilePath(path, stagingDir string) (string, error) {
 		return "", cpierrors.Cloud("sha1FilePath: open %s: %s", path, err.Error())
 	}
 	defer func() { _ = f.Close() }()
-	h := cryptosha1.New()
+	h := cryptosha1.New() // #nosec G401 -- SHA-1 for operator-supplied expected-digest comparison only, not for security
 	if _, err := io.Copy(h, f); err != nil {
 		return "", cpierrors.Cloud("sha1FilePath: read %s: %s", path, err.Error())
 	}

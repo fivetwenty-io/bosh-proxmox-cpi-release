@@ -119,7 +119,7 @@ func (h *MetricsHook) After(ctx context.Context, method string, result any, err 
 	}
 
 	// Open, write line, close — one syscall-group per call for atomic append.
-	f, openErr := os.OpenFile(h.filePath, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o644) //nolint:gosec // path is operator-configured, not user-supplied
+	f, openErr := os.OpenFile(h.filePath, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o644) // #nosec G302 -- 0644 so operators can read the metrics file; path is operator-configured, not user-supplied
 	if openErr != nil {
 		h.logger.Warn("metrics hook: open failed", log.String("path", h.filePath), log.Err(openErr))
 		return result, err

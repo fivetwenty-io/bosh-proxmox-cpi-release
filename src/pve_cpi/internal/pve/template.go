@@ -94,7 +94,7 @@ func dnsSafeStemcellPart(s string) string {
 	prevDash := false
 	for _, r := range s {
 		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
-			buf = append(buf, byte(r))
+			buf = append(buf, byte(r)) // #nosec G115 -- r is range-checked to a-z/0-9 above, always fits in a byte
 			prevDash = false
 		} else if !prevDash {
 			buf = append(buf, '-')

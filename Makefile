@@ -1,5 +1,6 @@
 # Colors
 GREEN  := \033[1;32m
+RED    := \033[1;31m
 YELLOW := \033[1;33m
 BLUE   := \033[1;34m
 CYAN   := \033[1;36m
@@ -161,7 +162,7 @@ check: vet staticcheck lint coverage-check test ## Run vet, staticcheck, lint, c
 govulncheck: ## Run govulncheck for dependency vulnerabilities
 	@echo "$(GREEN)Running govulncheck...$(RESET)"
 	@if command -v govulncheck >/dev/null 2>&1; then \
-		cd $(SRC_ROOT) && govulncheck ./...; \
+		(cd $(SRC_ROOT) && govulncheck ./...) || { echo "$(RED)✗ govulncheck found vulnerabilities$(RESET)"; exit 1; }; \
 		echo "$(GREEN)✓ govulncheck passed$(RESET)"; \
 	else \
 		echo "$(YELLOW)govulncheck not installed — skipping. Install: go install golang.org/x/vuln/cmd/govulncheck@latest$(RESET)"; \
@@ -171,7 +172,7 @@ govulncheck: ## Run govulncheck for dependency vulnerabilities
 gosec: ## Run gosec security scanner
 	@echo "$(GREEN)Running gosec...$(RESET)"
 	@if command -v gosec >/dev/null 2>&1; then \
-		cd $(SRC_ROOT) && gosec -quiet -fmt text ./...; \
+		(cd $(SRC_ROOT) && gosec -quiet -fmt text ./...) || { echo "$(RED)✗ gosec found issues$(RESET)"; exit 1; }; \
 		echo "$(GREEN)✓ gosec passed$(RESET)"; \
 	else \
 		echo "$(YELLOW)gosec not installed — skipping. Install: go install github.com/securego/gosec/v2/cmd/gosec@latest$(RESET)"; \
@@ -180,8 +181,12 @@ gosec: ## Run gosec security scanner
 .PHONY: trivy
 trivy: ## Run trivy filesystem scan for HIGH/CRITICAL CVEs (skips gracefully if trivy is not installed)
 	@echo "$(GREEN)Running trivy fs scan...$(RESET)"
-	@command -v trivy >/dev/null 2>&1 && trivy fs --severity HIGH,CRITICAL --exit-code 1 . || echo "$(YELLOW)trivy not installed — skipping. Install: https://trivy.dev/latest/getting-started/installation/$(RESET)"
-	@command -v trivy >/dev/null 2>&1 && echo "$(GREEN)✓ trivy passed$(RESET)" || true
+	@if command -v trivy >/dev/null 2>&1; then \
+		trivy fs --severity HIGH,CRITICAL --exit-code 1 . || { echo "$(RED)✗ trivy found HIGH/CRITICAL CVEs$(RESET)"; exit 1; }; \
+		echo "$(GREEN)✓ trivy passed$(RESET)"; \
+	else \
+		echo "$(YELLOW)trivy not installed — skipping. Install: https://trivy.dev/latest/getting-started/installation/$(RESET)"; \
+	fi
 
 .PHONY: security
 security: govulncheck gosec trivy ## Run all security scans (govulncheck, gosec, trivy)

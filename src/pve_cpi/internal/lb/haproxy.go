@@ -203,7 +203,7 @@ func ssrfDialContext(base *net.Dialer, res resolverFunc) func(ctx context.Contex
 func NewHAProxyRegistrar(cfg HAProxyConfig) (*HAProxyRegistrar, error) {
 	tlsCfg := &tls.Config{
 		MinVersion:         tls.VersionTLS12,
-		InsecureSkipVerify: cfg.InsecureSkipVerify, //nolint:gosec // operator opt-in for lab
+		InsecureSkipVerify: cfg.InsecureSkipVerify, // #nosec G402 -- operator opt-in for lab
 	}
 
 	if cfg.CACertPEM != "" {
