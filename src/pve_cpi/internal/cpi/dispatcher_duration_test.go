@@ -181,6 +181,66 @@ func TestDispatcher_DurationRecorder_Timeout(t *testing.T) {
 }
 
 // --------------------------------------------------------------------------
+// TestDispatcher_DurationRecorder_HandlerPanic
+// --------------------------------------------------------------------------
+
+// TestDispatcher_DurationRecorder_HandlerPanic verifies a recovered handler
+// panic calls the recorder exactly once with outcome "error" — the same
+// classification the Director sees in the error response and the root span
+// records. Before this, a panicking handler produced an error response with no
+// histogram sample at all.
+func TestDispatcher_DurationRecorder_HandlerPanic(t *testing.T) {
+	t.Parallel()
+	spy := &durationSpy{}
+	d := cpi.NewDispatcherWithOptions(nopLogger(), cpi.WithDurationRecorder(spy.record))
+	mustRegister(t, d, "reboot_vm", cpi.HandlerFunc(func(_ context.Context, _ []json.RawMessage, _ jsonrpc.Context) (any, error) {
+		panic("boom")
+	}))
+
+	resp := d.Handle(context.Background(), makeReq("reboot_vm"))
+	if resp.Error == nil {
+		t.Fatal("expected CloudError from recovered panic, got success")
+	}
+
+	calls := spy.snapshot()
+	if len(calls) != 1 {
+		t.Fatalf("recorder called %d times, want 1: %+v", len(calls), calls)
+	}
+	if calls[0].method != "reboot_vm" {
+		t.Errorf("method = %q, want %q", calls[0].method, "reboot_vm")
+	}
+	if calls[0].outcome != "error" {
+		t.Errorf("outcome = %q, want %q", calls[0].outcome, "error")
+	}
+}
+
+// --------------------------------------------------------------------------
+// TestDispatcher_DurationRecorder_NotCalledBeforeHandler
+// --------------------------------------------------------------------------
+
+// TestDispatcher_DurationRecorder_NotCalledBeforeHandler verifies the recorder
+// stays silent for requests rejected before any handler runs: a nil request
+// and a non-canonical method name. These produce error responses but no
+// histogram sample — the metric measures CPI action executions, not dispatch
+// rejections.
+func TestDispatcher_DurationRecorder_NotCalledBeforeHandler(t *testing.T) {
+	t.Parallel()
+	spy := &durationSpy{}
+	d := cpi.NewDispatcherWithOptions(nopLogger(), cpi.WithDurationRecorder(spy.record))
+
+	if resp := d.Handle(context.Background(), nil); resp.Error == nil {
+		t.Error("nil request: expected error response, got success")
+	}
+	if resp := d.Handle(context.Background(), makeReq("not_a_cpi_method")); resp.Error == nil {
+		t.Error("non-canonical method: expected error response, got success")
+	}
+
+	if calls := spy.snapshot(); len(calls) != 0 {
+		t.Fatalf("recorder called %d times on pre-handler rejections, want 0: %+v", len(calls), calls)
+	}
+}
+
+// --------------------------------------------------------------------------
 // TestDispatcher_NilDurationRecorder_NoPanic
 // --------------------------------------------------------------------------
 

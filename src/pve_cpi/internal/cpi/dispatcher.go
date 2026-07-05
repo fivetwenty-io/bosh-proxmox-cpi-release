@@ -64,7 +64,11 @@ type Dispatcher struct {
 	// (still recorded with the same outcome the wrapped handler observed, not
 	// a distinct "timeout" value) and a result that fails json.Marshal
 	// (recorded as "marshal_error", a case no hook running inside the handler
-	// call can ever observe). The ctx passed is always Handle's own request
+	// call can ever observe), plus a recovered handler panic (recorded as
+	// "error", matching the error response the Director receives). Requests
+	// rejected before a handler runs — nil request, non-canonical or
+	// unregistered method — are never recorded. The ctx passed is always
+	// Handle's own request
 	// ctx (never callCtx, the possibly-timeout-wrapped context passed to the
 	// handler) so a recorder reading span/exemplar data from it is unaffected
 	// by the per-method deadline envelope; a ctx already canceled or expired
@@ -241,6 +245,10 @@ func (d *Dispatcher) Handle(ctx context.Context, req *jsonrpc.Request) (resp *js
 				log.String("stack", string(stack)),
 			)...)
 			resp = errorResponse(cpierrors.Cloud("panic in %s [request_id=%s]: %v", method, requestID, r))
+			// The Director receives an error response for this request, and the
+			// root span records it as a failure; record the histogram the same
+			// way so a panicking handler cannot make the two disagree.
+			d.recordDuration(ctx, method, "error", float64(time.Since(start).Microseconds())/1000.0)
 		}
 	}()
 

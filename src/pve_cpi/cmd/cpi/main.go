@@ -158,7 +158,9 @@ const otelActionDurationMetricName = "cpi.action.duration"
 // reclassification Handle itself performs (including the per-method timeout
 // rewrite, which Handle still records here as "error" — the same value the
 // wrapped handler's hooks observed before Handle turned it into a retriable
-// timeout response). ctx is Handle's own request ctx (its own span, if any,
+// timeout response — and a recovered handler panic, likewise recorded as
+// "error" to match the error response the Director receives). ctx is
+// Handle's own request ctx (its own span, if any,
 // used for exemplar correlation only — this call never dials out with it),
 // mirroring how the hook this replaced recorded against the handler's ctx; it
 // may already be canceled by the time some outcomes are recorded (timeout,
