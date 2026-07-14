@@ -178,11 +178,18 @@ gosec: ## Run gosec security scanner
 		echo "$(YELLOW)gosec not installed — skipping. Install: go install github.com/securego/gosec/v2/cmd/gosec@latest$(RESET)"; \
 	fi
 
+# Gitignored local lab state that intentionally holds credentials (guarded by
+# .gitignore and the manifest script checks, not by rotation); the secret
+# scanner must not fail the build on it.
+TRIVY_SKIP := --skip-files manifests/bosh/creds.yml \
+	--skip-files manifests/envs/cpitest/artifacts_ssh \
+	--skip-dirs .e2e-results
+
 .PHONY: trivy
 trivy: ## Run trivy filesystem scan for HIGH/CRITICAL CVEs (skips gracefully if trivy is not installed)
 	@echo "$(GREEN)Running trivy fs scan...$(RESET)"
 	@if command -v trivy >/dev/null 2>&1; then \
-		trivy fs --severity HIGH,CRITICAL --exit-code 1 . || { echo "$(RED)✗ trivy found HIGH/CRITICAL CVEs$(RESET)"; exit 1; }; \
+		trivy fs --severity HIGH,CRITICAL --exit-code 1 $(TRIVY_SKIP) . || { echo "$(RED)✗ trivy found HIGH/CRITICAL CVEs$(RESET)"; exit 1; }; \
 		echo "$(GREEN)✓ trivy passed$(RESET)"; \
 	else \
 		echo "$(YELLOW)trivy not installed — skipping. Install: https://trivy.dev/latest/getting-started/installation/$(RESET)"; \
