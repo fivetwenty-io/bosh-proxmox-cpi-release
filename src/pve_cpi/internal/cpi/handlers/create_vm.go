@@ -666,6 +666,19 @@ func createVM(
 	}
 
 	// -----------------------------------------------------------------------
+	// 10b. Config-drive ISO migration-safety check. Runs whenever this VM was
+	// (or was eligible to be) HA-registered by any path above — DLB, AZ
+	// node-affinity pin, or anti-affinity HA rules: a non-shared iso_storage
+	// pool means the scsi30 CD-ROM cannot follow the VM across live migration
+	// or HA recovery, silently defeating all three features. Warns by default;
+	// escalates to a CloudError (failing create_vm, triggering rollback) when
+	// require_shared_iso_for_ha is true.
+	// -----------------------------------------------------------------------
+	if isoErr := checkISOStorageForHA(ctx, deps, vmid, parsed.cloudProps, shape.node, parsed.env, logger); isoErr != nil {
+		return nil, isoErr
+	}
+
+	// -----------------------------------------------------------------------
 	// 11. Post-create health gate (opt-in: health_check.enabled).
 	//
 	// When enabled, poll the QEMU guest agent until it answers or the deadline
@@ -869,6 +882,14 @@ func createVMWithFallback(
 				logger.Warn("create_vm: DLB membership not fully applied (non-fatal)",
 					log.Int(metadataKeyVMID, winningVMID), log.Err(dlbErr))
 			}
+		}
+
+		// -----------------------------------------------------------------------
+		// 10b. Config-drive ISO migration-safety check — see the step-10b comment
+		// in createVM for the full rationale.
+		// -----------------------------------------------------------------------
+		if isoErr := checkISOStorageForHA(ctx, deps, winningVMID, parsed.cloudProps, winShape.node, parsed.env, logger); isoErr != nil {
+			return nil, isoErr
 		}
 
 		// -----------------------------------------------------------------------

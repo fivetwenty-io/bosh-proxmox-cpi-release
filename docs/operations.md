@@ -642,6 +642,10 @@ iso_storage=local; ConfigDrive ISOs are readable by anyone with access to the PV
 
 Treat this warning as a deploy-time signal to move to a dedicated pool. The warning fires once per CPI process, not once per VM.
 
+### Migration and HA availability, not only credential exposure
+
+The `local` default has a second consequence beyond credential exposure: the ISO stays attached to the VM's CD-ROM slot for the VM's whole life, and PVE refuses to live-migrate — or HA-recover on another node — a VM whose CD-ROM volume sits on non-shared storage. If any of `pve.placement.dlb`, `pve.placement.pin_az_via_ha_rules`, or `pve.placement.anti_affinity.use_ha_rules` is enabled, `create_vm` separately logs a warning naming the non-shared `iso_storage` pool and the triggering feature, and `pve.require_shared_iso_for_ha: true` escalates that warning to a `create_vm` error. See [ConfigDrive — Migration and HA interaction](configdrive.md#migration-and-ha-interaction) for the full detail.
+
 ### Recommended configuration
 
 Dedicate a separate PVE storage pool for ConfigDrive ISOs and grant access only to the PVE user account the CPI authenticates as. Suitable pool types are `dir`, `nfs`, and `cifs` — ISO uploads require a file-based pool.

@@ -599,3 +599,55 @@ func TestDLBMembership_SharedRootAndDisk_Registers(t *testing.T) {
 		t.Fatalf("shared root+disk: expected 1 CreateHaResources call, got %d", len(clusterSvc.createHACalls))
 	}
 }
+
+// TestDLBMembership_LocalISOStorage_RequireSharedTrue_Skips verifies the
+// shared-storage guard also checks the resolved ConfigDrive ISO pool: a VM
+// with a shared root pool and shared disk pool but a node-local iso_storage
+// pool must NOT be DLB-registered, since the scsi30 CD-ROM cannot follow the
+// VM across live migration.
+func TestDLBMembership_LocalISOStorage_RequireSharedTrue_Skips(t *testing.T) {
+	clusterSvc := &dlbClusterStub{}
+	nodesSvc := &dlbNodesStub{} // 9.2, multi-node
+	storageSvc := &dlbMultiStorageStub{entries: map[string]dlbStorageEntry{
+		"shared-root": {storageType: "rbd", shared: true},
+		"shared-data": {storageType: "nfs", shared: true},
+		"local":       {storageType: "dir", shared: false},
+	}}
+	cfg := dlbConfigWithDLB(false, true) // require_shared_storage=true
+	cfg.VMStorage = "shared-root"
+	cfg.DiskStorage = "shared-data"
+	cfg.ISOStorage = "local"
+
+	deps := dlbDeps(clusterSvc, nodesSvc, storageSvc, cfg)
+	if err := ensureDLBMembership(context.Background(), deps, 106, "dlb", log.NewNopLogger()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(clusterSvc.createHACalls) != 0 {
+		t.Errorf("local iso_storage: CreateHaResources must not be called, got %d", len(clusterSvc.createHACalls))
+	}
+}
+
+// TestDLBMembership_SharedRootDiskAndISO_Registers verifies that when the
+// root pool, persistent disk pool, AND ConfigDrive ISO pool are all shared,
+// DLB registration proceeds.
+func TestDLBMembership_SharedRootDiskAndISO_Registers(t *testing.T) {
+	clusterSvc := &dlbClusterStub{}
+	nodesSvc := &dlbNodesStub{}
+	storageSvc := &dlbMultiStorageStub{entries: map[string]dlbStorageEntry{
+		"shared-root": {storageType: "rbd", shared: true},
+		"shared-data": {storageType: "nfs", shared: true},
+		"shared-iso":  {storageType: "nfs", shared: true},
+	}}
+	cfg := dlbConfigWithDLB(false, true)
+	cfg.VMStorage = "shared-root"
+	cfg.DiskStorage = "shared-data"
+	cfg.ISOStorage = "shared-iso"
+
+	deps := dlbDeps(clusterSvc, nodesSvc, storageSvc, cfg)
+	if err := ensureDLBMembership(context.Background(), deps, 107, "dlb", log.NewNopLogger()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(clusterSvc.createHACalls) != 1 {
+		t.Fatalf("shared root+disk+iso: expected 1 CreateHaResources call, got %d", len(clusterSvc.createHACalls))
+	}
+}

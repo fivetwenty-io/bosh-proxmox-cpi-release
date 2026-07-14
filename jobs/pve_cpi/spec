@@ -54,8 +54,44 @@ properties:
     description: |
       Storage pool (dir/nfs/cifs with `iso` content enabled) used to hold the
       per-VM ConfigDrive ISO. Block storages (lvm/lvmthin/zfspool) cannot
-      hold ISO files.
+      hold ISO files. The ISO is attached as a CD-ROM on scsi30 for the VM's
+      whole life, not only at boot: PVE refuses to live-migrate a VM whose
+      CD-ROM volume sits on non-shared storage, and HA recovery on another
+      node fails at start because the ISO file does not exist there. This
+      silently defeats placement.dlb, placement.pin_az_via_ha_rules, and
+      placement.anti_affinity.use_ha_rules. Use a shared pool (rbd, nfs, cifs,
+      glusterfs, cephfs) whenever any of those features is active; see
+      pve.require_shared_iso_for_ha and pve.iso_storage_follow_vm_storage.
     default: "local"
+  pve.require_shared_iso_for_ha:
+    description: |
+      When true, escalates the config-drive ISO migration-safety warning to a
+      non-retriable error that fails create_vm. The warning (and, when this is
+      true, the error) fires whenever create_vm registers the VM under any
+      HA-driven feature (placement.dlb, placement.pin_az_via_ha_rules, or
+      placement.anti_affinity.use_ha_rules) while pve.iso_storage resolves to
+      a storage pool that /storage does not report as shared. Default false:
+      the hazard is only logged (see docs/configdrive.md), never blocks
+      create_vm.
+    default: false
+  pve.iso_storage_follow_vm_storage:
+    description: |
+      When true, resolves the ConfigDrive ISO pool to pve.vm_storage instead
+      of the pve.iso_storage default, provided vm_storage advertises PVE
+      content type `iso` and is shared. Evaluated once at CPI process
+      startup, before pve.iso_storage is otherwise applied. Because BOSH
+      renders the "local" spec default for iso_storage whether or not the
+      operator set it in the manifest, the CPI cannot distinguish "unset"
+      from "explicitly local" — this flag therefore treats iso_storage
+      resolving to the literal value "local" as the "unset" signal. An
+      operator who deliberately sets iso_storage: local while also enabling
+      this flag gets vm_storage-following behavior instead of a literal local
+      pool; set iso_storage to any other value to pin a literal pool this
+      flag will never override. When vm_storage lacks `iso` content, is not
+      shared, or cannot be resolved, the CPI falls back to iso_storage
+      unchanged and logs a warning (fail-open). Default false: iso_storage
+      behavior is unchanged.
+    default: false
   pve.network_bridge:
     description: "Default network bridge"
     default: "vmbr0"

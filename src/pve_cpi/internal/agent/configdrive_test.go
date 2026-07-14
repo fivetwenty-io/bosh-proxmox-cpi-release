@@ -116,11 +116,17 @@ type fakePVEClient struct {
 	pve.Client // embed nil — panics on unexpected methods
 	storageSvc *fakeStorageSvc
 	nodesSvc   *fakeNodesSvc
+	// clusterStorageSvc backs ClusterStorage(); nil (the zero value) matches
+	// prior behavior for tests that never exercise it (e.g. ResolveISOStorage
+	// tests wire a fakeClusterStorageSvc explicitly).
+	clusterStorageSvc sdkclusterstorage.Service
 }
 
-func (f *fakePVEClient) Storage() sdkstorage.Service               { return f.storageSvc }
-func (f *fakePVEClient) Nodes() sdknodes.Service                   { return f.nodesSvc }
-func (f *fakePVEClient) ClusterStorage() sdkclusterstorage.Service { return nil }
+func (f *fakePVEClient) Storage() sdkstorage.Service { return f.storageSvc }
+func (f *fakePVEClient) Nodes() sdknodes.Service     { return f.nodesSvc }
+func (f *fakePVEClient) ClusterStorage() sdkclusterstorage.Service {
+	return f.clusterStorageSvc
+}
 
 // newISOAgent builds a ConfigDrive backed by the provided fake services.
 // If storageSvc or nodesSvc is nil, a no-op default is used.

@@ -78,7 +78,8 @@ VMs in `z1` are scored and placed on `pve01` or `pve02`. VMs in `dlb-zone` are p
 | `pve.placement.dlb.enabled` | bool | `false` | Master flag — register all VMs for DLB. Works alongside AZ topology. |
 | `pve.placement.dlb.az_name` | string | `"dlb"` | Sentinel AZ name. A VM with this AZ value is DLB-delegated even when `dlb.enabled` is false. Set to `""` to disable the sentinel. |
 | `pve.placement.dlb.manage_cluster_crs` | bool | `false` | When true, the CPI writes the cluster CRS setting automatically. When false (default), the CPI reads and warns. See [Required Cluster Setup](#required-cluster-setup). |
-| `pve.placement.dlb.require_shared_storage` | bool | `true` | When true (default), VMs on local storage are silently skipped for DLB registration. Set false only when all VMs are guaranteed to use shared storage. |
+| `pve.placement.dlb.require_shared_storage` | bool | `true` | When true (default), VMs on local storage — root pool, disk pool, or ConfigDrive ISO pool — are silently skipped for DLB registration. Set false only when all VMs are guaranteed to use shared storage. |
+| `pve.require_shared_iso_for_ha` | bool | `false` | When true, escalates the config-drive ISO migration-safety warning (see [Shared Storage Required](#shared-storage-required)) to a create_vm error instead of only logging it. |
 | `pve.placement.anti_affinity.use_ha_rules` | bool | `false` | When true, the CPI encodes anti-affinity as PVE HA negative resource-affinity rules (`bosh-aa-<group>`), giving the scheduler a formal constraint rather than only a scored preference. |
 | `pve.placement.anti_affinity.strict` | bool | `false` | When true, PVE HA negative-affinity rules are set to strict (hard) mode. See [Anti-Affinity Interaction](#interaction-with-placement-scorer-and-anti-affinity). |
 | `pve.placement.anti_affinity.verify` | bool | `false` | When true, the CPI performs a read-after-write check after updating the HA anti-affinity rule membership (via `verifyAntiAffinityMember`). A verify failure surfaces as a retriable error so the director re-drives. |
@@ -134,11 +135,21 @@ bosh update-resurrection off
 
 ### Shared Storage Required
 
-Live migration — the mechanism DLB uses to rebalance VMs — requires the VM's root disk to reside on storage accessible from all cluster nodes (rbd, nfs, cifs, glusterfs, or cephfs).
+Live migration — the mechanism DLB uses to rebalance VMs, and the mechanism PVE HA uses to recover a VM on another node — requires every volume attached to the VM to reside on storage accessible from all cluster nodes (rbd, nfs, cifs, glusterfs, or cephfs). That includes the VM root disk, any persistent disks, **and** the ConfigDrive ISO CD-ROM attached at `scsi30` (see [ConfigDrive](configdrive.md)): the ISO lives for the VM's whole life, not only at boot, so a node-local ISO pool blocks migration exactly like a node-local disk pool does.
 
-VMs on node-local storage (dir, lvm, lvmthin, zfspool) cannot be live-migrated. With `pve.placement.dlb.require_shared_storage: true` (the default), the CPI checks both the VM root pool (`pve.vm_storage`) and the persistent disk pool (`pve.disk_storage`); if either is node-local, the CPI silently skips DLB registration for that VM and logs a debug entry. This prevents PVE from attempting an impossible migration.
+VMs on node-local storage (dir, lvm, lvmthin, zfspool) cannot be live-migrated. With `pve.placement.dlb.require_shared_storage: true` (the default), the CPI checks the VM root pool (`pve.vm_storage`), the persistent disk pool (`pve.disk_storage`), **and** the ConfigDrive ISO pool (`pve.iso_storage`); if any of the three is node-local, the CPI silently skips DLB registration for that VM and logs a debug entry. This prevents PVE from attempting an impossible migration.
 
 If the storage type cannot be determined from the PVE API at create time, the CPI fails open (proceeds with registration) and logs a debug entry.
+
+#### ISO pool hazard applies beyond DLB too
+
+The DLB shared-storage guard above only governs `placement.dlb` registration. `placement.pin_az_via_ha_rules` and `placement.anti_affinity.use_ha_rules` also register the VM as a PVE HA resource, and neither has its own shared-storage guard: create_vm instead runs a migration-safety check whenever **any** of the three HA-driven features (DLB, AZ node-affinity pin, or anti-affinity HA rules) is active for a VM. If `pve.iso_storage` resolves to a pool `/storage` does not report as shared, the CPI logs a warning naming the pool and the triggering feature(s):
+
+```
+create_vm: live migration and HA recovery of this VM will fail: config-drive ISO on non-shared storage
+```
+
+Set `pve.require_shared_iso_for_ha: true` to escalate that warning to a `create_vm` error instead — the deploy then fails fast rather than silently shipping a VM that cannot migrate or fail over. See [ConfigDrive — migration and HA interaction](configdrive.md#migration-and-ha-interaction) and `pve.iso_storage_follow_vm_storage` in [Configuration](configuration.md) for a way to point the ISO pool at an already-shared `pve.vm_storage` without a separate manifest edit.
 
 ### Multi-Node Cluster Required
 

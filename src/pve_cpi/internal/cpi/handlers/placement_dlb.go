@@ -30,8 +30,8 @@ const crsModeDynamic = "dynamic"
 //     older → log debug and return nil (skip).
 //  2. Cluster has >= 2 nodes (ListConfigNodes); single-node = DLB is inert.
 //  3. Shared-storage guard when DLBRequireSharedStorage() == true: if the VM
-//     storage pool is local → skip registration. If undeterminable → proceed
-//     (fail-open) with a debug log.
+//     storage pool, disk pool, or ConfigDrive ISO pool is local → skip
+//     registration. If undeterminable → proceed (fail-open) with a debug log.
 //  4. Register: CreateHaResources with State=started and AutoRebalance=true.
 //     If already registered → UpdateHaResources to ensure the flags are set.
 //  5. CRS: when DLBManageClusterCRS() == true, ensure the cluster crs option is
@@ -83,13 +83,16 @@ func ensureDLBMembership(ctx context.Context, deps Deps, vmid int, az string, lo
 		return nil
 	}
 
-	// Guard 3: shared-storage requirement. A VM whose root pool OR persistent
-	// disk pool resides on node-local storage cannot be live-migrated, so either
-	// being local disqualifies it from DLB registration. Check both distinct,
-	// non-empty pools; undeterminable shared-ness is fail-open (proceed).
+	// Guard 3: shared-storage requirement. A VM whose root pool, persistent
+	// disk pool, OR config-drive ISO pool resides on node-local storage cannot
+	// be live-migrated (the ISO pool holds the scsi30 CD-ROM that lives for the
+	// VM's whole life, not only at boot — see the ISOStorage field doc in
+	// internal/config/config.go), so any one of them being local disqualifies
+	// the VM from DLB registration. Check all distinct, non-empty pools;
+	// undeterminable shared-ness is fail-open (proceed).
 	if deps.Config != nil && deps.Config.DLBRequireSharedStorage() {
 		checked := map[string]struct{}{}
-		for _, stg := range []string{deps.Config.VMStorage, deps.Config.DiskStorage} {
+		for _, stg := range []string{deps.Config.VMStorage, deps.Config.DiskStorage, deps.Config.ISOStorage} {
 			if stg == "" {
 				continue
 			}

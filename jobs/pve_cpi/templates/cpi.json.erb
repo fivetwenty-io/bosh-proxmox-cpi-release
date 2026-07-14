@@ -692,5 +692,18 @@
   # preserves byte-identical behavior on existing deployments.
   if_p("pve.encrypted") { |v| config["encrypted"] = v }
 
+  # Emit require_shared_iso_for_ha only when explicitly true. The Go accessor
+  # defaults nil *bool -> false (warn-only); omitting the key preserves that.
+  if p("pve.require_shared_iso_for_ha", false)
+    config["require_shared_iso_for_ha"] = true
+  end
+
+  # Emit iso_storage_follow_vm_storage only when explicitly true. The Go
+  # accessor defaults nil *bool -> false (disabled, iso_storage unchanged);
+  # omitting the key preserves that default.
+  if p("pve.iso_storage_follow_vm_storage", false)
+    config["iso_storage_follow_vm_storage"] = true
+  end
+
   JSON.dump(config)
 %>

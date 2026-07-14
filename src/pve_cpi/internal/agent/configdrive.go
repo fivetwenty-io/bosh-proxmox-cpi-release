@@ -112,7 +112,7 @@ func (a *ConfigDrive) Configure(ctx context.Context, node string, vmid int, cfg 
 	// Warn once per process when iso_storage resolves to "local". Local storage
 	// ISOs are readable by anyone with access to the PVE node-local storage pool,
 	// which is not appropriate for multi-tenant environments.
-	if a.storage == "local" {
+	if a.storage == isoStorageSpecDefault {
 		localISOStorageWarnOnce.Do(func() {
 			a.logger.Warn("iso_storage=local; ConfigDrive ISOs are readable by anyone with access to the PVE node-local storage. Recommend dedicated pool. See docs/operations.md ISO storage section.")
 		})

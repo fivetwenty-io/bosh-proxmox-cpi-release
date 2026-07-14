@@ -50,7 +50,43 @@ type CPIConfig struct {
 	// i.e. dir/nfs/cifs) used to hold the per-VM ConfigDrive ISO that
 	// boots the BOSH agent. Block storages (lvm/lvmthin/zfspool) cannot
 	// hold ISO files. Defaults to "local".
+	//
+	// The ConfigDrive ISO is attached as a CD-ROM on scsi30 for the VM's whole
+	// life (see internal/agent/configdrive.go), not only at boot. PVE refuses
+	// to live-migrate a VM whose CD-ROM volume sits on non-shared storage, and
+	// HA recovery on another node fails at start because the ISO file does not
+	// exist there — silently defeating placement.dlb, pin_az_via_ha_rules, and
+	// anti_affinity.use_ha_rules. Use a shared pool (rbd, nfs, cifs, glusterfs,
+	// cephfs) whenever any of those HA-driven features is active. See
+	// RequireSharedISOForHA and ISOStorageFollowVMStorage.
 	ISOStorage string `json:"iso_storage,omitempty"`
+
+	// RequireSharedISOForHA escalates the config-drive ISO migration-safety
+	// Warn (emitted by create_vm whenever the VM is HA-registered under DLB,
+	// AZ node-affinity pinning, or anti-affinity HA rules while ISOStorage is
+	// not a shared pool) to a non-retriable CloudError, failing create_vm
+	// instead of only warning. Default false (nil → warn-only, byte-identical
+	// to prior releases). Use RequireSharedISOForHAEnabled() for the effective
+	// bool.
+	RequireSharedISOForHA *bool `json:"require_shared_iso_for_ha,omitempty"`
+
+	// ISOStorageFollowVMStorage, when true, resolves the ConfigDrive ISO pool
+	// to VMStorage instead of the ISOStorage default, provided VMStorage
+	// advertises PVE content type `iso` and is shared. This is evaluated once
+	// at CPI process startup (see agent.ResolveISOStorage), before any create_vm
+	// call, because BOSH renders the "local" spec default for iso_storage into
+	// the config JSON whether or not the operator set it explicitly — the CPI
+	// cannot distinguish "unset" from "explicitly local" any other way. As a
+	// result this flag treats ISOStorage=="local" (the literal spec default) as
+	// the "unset" sentinel: an operator who explicitly types iso_storage: local
+	// while also enabling this flag gets VMStorage-following behavior instead
+	// of a literal local pool. Set iso_storage to any other value to pin a
+	// literal pool that this flag will never override. When VMStorage lacks
+	// `iso` content, is not shared, or cannot be resolved, the CPI falls back
+	// to ISOStorage unchanged and logs a Warn (fail-open). Default false (nil →
+	// disabled, byte-identical to prior releases). Use
+	// ISOStorageFollowVMStorageEnabled() for the effective bool.
+	ISOStorageFollowVMStorage *bool `json:"iso_storage_follow_vm_storage,omitempty"`
 
 	// Network
 	NetworkBridge string `json:"network_bridge"`
@@ -2213,6 +2249,22 @@ func (c *CPIConfig) VMFirewallEnabled() bool {
 // *false → false; *true → true.
 func (c *CPIConfig) EncryptedEnabled() bool {
 	return c.Encrypted != nil && *c.Encrypted
+}
+
+// RequireSharedISOForHAEnabled returns the effective require_shared_iso_for_ha
+// setting. nil (field absent from JSON) → false (warn-only, byte-identical to
+// prior releases). *false → false; *true → true (escalates the config-drive
+// ISO migration-safety Warn to a CloudError). See the ISOStorage field doc.
+func (c *CPIConfig) RequireSharedISOForHAEnabled() bool {
+	return c != nil && c.RequireSharedISOForHA != nil && *c.RequireSharedISOForHA
+}
+
+// ISOStorageFollowVMStorageEnabled returns the effective
+// iso_storage_follow_vm_storage setting. nil (field absent from JSON) → false
+// (disabled, byte-identical to prior releases). *false → false; *true → true.
+// See the ISOStorageFollowVMStorage field doc for the resolution algorithm.
+func (c *CPIConfig) ISOStorageFollowVMStorageEnabled() bool {
+	return c != nil && c.ISOStorageFollowVMStorage != nil && *c.ISOStorageFollowVMStorage
 }
 
 // HooksValue returns the configured hook names in order, or nil when none are
