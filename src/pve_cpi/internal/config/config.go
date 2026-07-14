@@ -447,15 +447,23 @@ type CPIConfig struct {
 	// NetworkResolveRetries bounds eventual-consistency polling for freshly
 	// created SDN networks. A newly applied SDN vnet is not immediately usable
 	// cluster-wide: the data-plane realization (ifupdown2 reload, pmxcfs
-	// propagation) is asynchronous and per-node. When > 0, create_network polls
-	// the running cluster SDN config until the new vnet converges, and create_vm
-	// confirms each SDN-managed NIC bridge is present on the target node before
-	// attaching, classifying a not-yet-present bridge as retriable so the BOSH
-	// Director re-drives rather than booting a NIC into a bridge that does not yet
-	// exist. When 0 (default) neither poll runs and behavior is byte-identical to
-	// prior releases; external/static bridges (e.g. vmbr0) are never gated.
-	// Validate >= 0 when set. Use NetworkResolveRetriesValue()/NetworkResolveEnabled().
-	NetworkResolveRetries int `json:"network_resolve_retries,omitempty"`
+	// propagation) is asynchronous and per-node — SDN state propagates over
+	// inter-node SSH, so one broken node leaves changes silently pending
+	// cluster-wide while the apply task still reports success. When > 0,
+	// create_network polls the running cluster SDN config until the new vnet
+	// converges, and create_vm confirms each SDN-managed NIC bridge is present
+	// on the target node before attaching, classifying a not-yet-present bridge
+	// as retriable so the BOSH Director re-drives rather than booting a NIC into
+	// a bridge that does not yet exist. Both gates are scoped to SDN vnets only
+	// (external/static bridges such as vmbr0 are never gated) and fail open on
+	// SDN-membership lookup errors, so the worst case of leaving this enabled is
+	// a bounded retriable delay, never a false block on a legitimate bridge.
+	// *int (not int) because, as of Phase 1, this must distinguish "left unset"
+	// (nil → defaults to 30, ~30s at the 1s poll cadence — enabled by default)
+	// from "explicitly set to 0" (disables both gates, restoring the
+	// pre-Phase-1 behavior). Validate >= 0 when set. Use
+	// NetworkResolveRetriesValue()/NetworkResolveEnabled().
+	NetworkResolveRetries *int `json:"network_resolve_retries,omitempty"`
 
 	// NetworkResolveTimeoutSec is the companion absolute bound on the SDN
 	// eventual-consistency poll described on NetworkResolveRetries: the poll stops
@@ -2198,12 +2206,20 @@ func (c *CPIConfig) validateDiskDeleteStateGuardEnum(errs *[]string) {
 }
 
 // NetworkResolveRetriesValue returns the configured SDN eventual-consistency
-// poll retry count. nil receiver or a non-positive value → 0 (gate disabled).
+// poll retry count. Default 30 (as of Phase 1): a nil receiver or a nil field
+// (the property left entirely unset) resolves to 30. An explicit 0 disables
+// both gates (returns 0), restoring the pre-Phase-1 behavior. A negative
+// explicit value also resolves to 0 defensively (config validation rejects
+// negative values at load time, so this is a belt-and-suspenders guard for
+// manually constructed CPIConfig values in tests).
 func (c *CPIConfig) NetworkResolveRetriesValue() int {
-	if c == nil || c.NetworkResolveRetries <= 0 {
+	if c == nil || c.NetworkResolveRetries == nil {
+		return 30
+	}
+	if *c.NetworkResolveRetries < 0 {
 		return 0
 	}
-	return c.NetworkResolveRetries
+	return *c.NetworkResolveRetries
 }
 
 // NetworkResolveEnabled reports whether the SDN convergence gates run.
@@ -2875,11 +2891,12 @@ func (c *CPIConfig) validateEnumFields(errs *[]string) {
 		))
 	}
 
-	// NetworkResolveRetries: 0 disables the SDN convergence gates; negative is invalid.
-	if c.NetworkResolveRetries < 0 {
+	// NetworkResolveRetries: unset resolves to the Phase 1 default (30); an
+	// explicit 0 disables the SDN convergence gates; negative is invalid.
+	if c.NetworkResolveRetries != nil && *c.NetworkResolveRetries < 0 {
 		*errs = append(*errs, fmt.Sprintf(
 			"network_resolve_retries must be >= 0 (0 disables SDN convergence polling), got %d",
-			c.NetworkResolveRetries,
+			*c.NetworkResolveRetries,
 		))
 	}
 

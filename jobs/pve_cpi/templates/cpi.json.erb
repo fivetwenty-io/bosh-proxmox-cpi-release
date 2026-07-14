@@ -394,16 +394,24 @@
   v = p("pve.parked_disk_vmid_range_end", 0).to_i
   config["parked_disk_vmid_range_end"] = v unless v == 0
 
-  # Emit the SDN eventual-consistency poll knobs only when retries is non-zero.
-  # Zero (default) disables both the create_network convergence poll and the
-  # create_vm bridge gate; omitting the keys keeps both byte-identical to prior
-  # releases. The timeout companion is emitted only when the gate is active.
-  network_resolve_retries = p("pve.network_resolve_retries", 0).to_i
-  unless network_resolve_retries == 0
-    config["network_resolve_retries"] = network_resolve_retries
-    network_resolve_timeout_sec = p("pve.network_resolve_timeout_sec", 0).to_i
-    config["network_resolve_timeout_sec"] = network_resolve_timeout_sec unless network_resolve_timeout_sec == 0
-  end
+  # Emit network_resolve_retries only when the operator explicitly sets it
+  # (including an explicit 0). pve.network_resolve_retries intentionally
+  # carries NO spec default (see jobs/pve_cpi/spec), so if_p fires only when
+  # the property is present in the manifest -- an absent key here reaches the
+  # Go accessor as a nil field, which defaults to 30 (both the create_network
+  # convergence poll and the create_vm bridge gate ACTIVE) as of Phase 1. An
+  # explicit 0 emits "0", disabling both gates and restoring the pre-Phase-1
+  # behavior; any other explicit value overrides the retry budget. This is the
+  # same "no spec default + if_p" idiom used elsewhere for properties that
+  # must distinguish "operator never set this" from "operator set it to the
+  # value that happens to equal Go's zero value".
+  if_p("pve.network_resolve_retries") { |v| config["network_resolve_retries"] = v.to_i }
+
+  # network_resolve_timeout_sec keeps its own, unrelated default: 0 (or unset)
+  # resolves to a built-in 60s in the Go accessor regardless of the retries
+  # flip above, so its emission stays the simple omit-when-zero pattern.
+  network_resolve_timeout_sec = p("pve.network_resolve_timeout_sec", 0).to_i
+  config["network_resolve_timeout_sec"] = network_resolve_timeout_sec unless network_resolve_timeout_sec == 0
 
   # Emit the ephemeral-disk minimum-size invariant knobs only when the ratio is
   # non-zero. Zero (default) disables the check; omitting the key keeps create_vm

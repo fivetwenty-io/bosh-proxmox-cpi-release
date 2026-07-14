@@ -22,6 +22,12 @@ func sdnNotFound() error {
 	return pveerr.ErrNotFound
 }
 
+// netResolveRetries is a local *int helper for NetworkResolveRetries
+// assignments — as of Phase 1 that field is *int so an unset property (nil,
+// which now defaults to 30) can be distinguished from an explicit 0 (see
+// config.CPIConfig.NetworkResolveRetries).
+func netResolveRetries(n int) *int { return &n }
+
 // testSDNDeps returns Deps wired with clusterSvc and a minimal config.
 func testSDNDeps(clusterSvc sdkcluster.Service, networkMode, sdnZone string, autoManage bool) handlers.Deps {
 	cfg := testConfig()
@@ -551,7 +557,7 @@ func TestHandleCreateNetwork_SDN_ConvergenceGate_Converges(t *testing.T) {
 	}
 
 	deps := testSDNDeps(clusterSvc, "sdn", "", false)
-	deps.Config.NetworkResolveRetries = 3
+	deps.Config.NetworkResolveRetries = netResolveRetries(3)
 	spec := map[string]any{
 		"type":             "manual",
 		"cloud_properties": map[string]any{"zone": "boshzone", "vnet": "boshvnet"},
@@ -591,7 +597,7 @@ func TestHandleCreateNetwork_SDN_ConvergenceGate_Retriable(t *testing.T) {
 	}
 
 	deps := testSDNDeps(clusterSvc, "sdn", "", false)
-	deps.Config.NetworkResolveRetries = 1 // one retry → at most one ~1s sleep
+	deps.Config.NetworkResolveRetries = netResolveRetries(1) // one retry → at most one ~1s sleep
 	spec := map[string]any{
 		"type":             "manual",
 		"cloud_properties": map[string]any{"zone": "boshzone", "vnet": "boshvnet"},

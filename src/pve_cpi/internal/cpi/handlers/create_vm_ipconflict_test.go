@@ -356,22 +356,29 @@ func (a *icAgentStub) Configure(_ context.Context, _ string, _ int, _ agent.Agen
 }
 func (a *icAgentStub) Remove(_ context.Context, _ string, _ int) error { return nil }
 
-// icMinConfig returns a minimal *config.CPIConfig for internal tests.
+// icMinConfig returns a minimal *config.CPIConfig for internal tests. Network
+// resolve retries are explicitly disabled (0) here: as of Phase 1 that field
+// defaults to 30 (enabled) when left nil, and the great majority of tests
+// sharing this minimal baseline predate and are unrelated to the SDN
+// eventual-consistency gate — tests that specifically exercise it (see
+// create_vm_netresolve_internal_test.go) override this field explicitly.
 func icMinConfig() *config.CPIConfig {
 	v := false
+	noNetResolve := 0
 	return &config.CPIConfig{
-		Host:           "pve.test.local",
-		Port:           8006,
-		User:           "root",
-		APIToken:       "test-token",
-		Node:           "pve-node1",
-		VMStorage:      "local-lvm",
-		DiskStorage:    "local-lvm",
-		NetworkBridge:  "vmbr0",
-		AgentMode:      "noagent",
-		VMDiskFormat:   "qcow2",
-		VerifySSL:      &v,
-		VMIDRangeStart: 100,
+		Host:                  "pve.test.local",
+		Port:                  8006,
+		User:                  "root",
+		APIToken:              "test-token",
+		Node:                  "pve-node1",
+		VMStorage:             "local-lvm",
+		DiskStorage:           "local-lvm",
+		NetworkBridge:         "vmbr0",
+		AgentMode:             "noagent",
+		VMDiskFormat:          "qcow2",
+		VerifySSL:             &v,
+		VMIDRangeStart:        100,
+		NetworkResolveRetries: &noNetResolve,
 	}
 }
 

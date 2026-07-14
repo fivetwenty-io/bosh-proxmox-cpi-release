@@ -605,6 +605,10 @@ func TestStorageTierEncrypted_EphemeralExplicitPoolContradictsEncrypted(t *testi
 		StorageTiers: map[string]config.StorageTierCriteria{
 			"enc-tier": {Types: []string{"rbd"}, Encrypted: boolPtr(true)},
 		},
+		// Explicitly disabled: as of Phase 1 this defaults to 30 (enabled)
+		// when nil, and this test doesn't wire SDN vnet/node-network fakes
+		// for the gate to poll against.
+		NetworkResolveRetries: new(int),
 	}
 
 	qemuSvc := &vmMockQEMU{
@@ -680,6 +684,10 @@ func TestStorageTierEncrypted_EphemeralAutoSelectNoTierNamed(t *testing.T) {
 		StorageTiers: map[string]config.StorageTierCriteria{
 			"enc-tier": {Types: []string{"rbd"}, Encrypted: boolPtr(true)},
 		},
+		// Explicitly disabled: as of Phase 1 this defaults to 30 (enabled)
+		// when nil, and this test doesn't wire SDN vnet/node-network fakes
+		// for the gate to poll against.
+		NetworkResolveRetries: new(int),
 	}
 
 	var capturedStorages []string

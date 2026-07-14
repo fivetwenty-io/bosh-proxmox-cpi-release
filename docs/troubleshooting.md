@@ -548,6 +548,63 @@ pvesh get /nodes/<node>/network | jq '.[] | select(.type == "bridge")'
 
 `pve.network_bridge` must match an existing Linux bridge on the PVE node. The bridge must be UP. Create it in the PVE web UI under Node → Network if absent. See [Configuration](configuration.md).
 
+### vnet bridge missing on some nodes / SDN state stuck pending
+
+**Symptom**
+
+`create_vm` fails with a retriable error naming a bridge and a node:
+
+```text
+create_vm: resolve bridge "boshvnet" on node "pve03": SDN bridge "boshvnet" is not yet present
+on node "pve03" within the retry/timeout budget
+```
+
+or `create_network` fails with:
+
+```text
+create_network: SDN vnet "boshvnet" has not converged into running config within the retry/timeout budget
+```
+
+The Director retries and the error persists past the retry/timeout budget (default 30 retries at ~1 s each, as of Phase 1) rather than clearing after a few seconds.
+
+**Diagnosis**
+
+SDN state propagates from the node that ran `UpdateSdn` to every other cluster node over inter-node SSH (root-to-root, keyed by the pmxcfs cluster trust). If that SSH path is broken to one node, the commit succeeds locally but never reaches that node — `create_network` reports success while the vnet stays permanently unrealized there, and every `create_vm` that lands a NIC on it fails this gate. This is node-trust breakage, not a CPI or PVE API fault; the CPI's own polling cannot fix it, only surface it.
+
+On the node named in the error:
+
+```bash
+ip -d link show boshvnet
+```
+
+Absent or down means the interface was never realized on this node. Compare against a node where it works.
+
+```bash
+pvesh get /cluster/sdn | jq '.[] | select(.pending == true)'
+```
+
+A non-empty result naming the same vnet/zone confirms the SDN configuration is stuck in the pending (not-yet-applied) state cluster-wide or on specific nodes.
+
+Verify root SSH trust between the node that committed the change and the node where the bridge is missing:
+
+```bash
+ssh root@<other-node> hostname
+```
+
+An interactive password prompt, a host-key mismatch, or a connection refusal — rather than an immediate, unattended success — is the signature of broken cluster SSH trust.
+
+**Fix**
+
+Repair root SSH trust between the affected nodes (regenerate/re-distribute `/etc/pve/priv/authorized_keys` via the PVE cluster join process, or manually reinstate the missing key), then re-apply the pending SDN configuration:
+
+```bash
+pvesh set /cluster/sdn
+```
+
+Once the vnet is confirmed present (`ip -d link show <vnet>` on every node, `pending` clears in `pvesh get /cluster/sdn`), retry the failed `create_vm`/`create_network` call — the Director re-drives automatically since the error is retriable, or trigger a fresh deploy attempt.
+
+If this happens repeatedly across a cluster, treat it as a standing infrastructure issue (node join/rejoin, certificate rotation, or a firewall change breaking inter-node SSH) rather than a one-off — the CPI's `pve.network_resolve_retries` gate (see [Configuration — SDN network management](configuration.md#sdn-network-management)) only bounds how long a *transient* propagation delay is tolerated before failing loudly; it cannot resolve a persistently broken trust relationship.
+
 ### SDN zone or vnet not found
 
 **Symptom**

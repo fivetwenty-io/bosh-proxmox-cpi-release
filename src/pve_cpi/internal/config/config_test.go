@@ -237,26 +237,37 @@ func TestValidate_DiskDeleteStateGuardInvalid(t *testing.T) {
 	assertCloudError(t, err, "disk_delete_state_guard must be one of off|on")
 }
 
+// TestNetworkResolveAccessors verifies the Phase 1 default flip:
+// NetworkResolveRetries left entirely unset (nil, the shape an empty-manifest
+// property materializes as) now defaults to 30 (gate enabled); only an
+// explicit 0 disables it. NetworkResolveTimeoutSec is unaffected by the
+// flip — 0/unset still resolves to the built-in 60s default, same as before.
 func TestNetworkResolveAccessors(t *testing.T) {
 	t.Parallel()
-	// Default (zero) → gate disabled, timeout resolves to 60.
+	// Default (nil, unset) → gate ENABLED with 30 retries (Phase 1), timeout resolves to 60.
 	def := &config.CPIConfig{}
-	if def.NetworkResolveEnabled() || def.NetworkResolveRetriesValue() != 0 {
-		t.Errorf("default should be disabled with 0 retries; got enabled=%v retries=%d",
+	if !def.NetworkResolveEnabled() || def.NetworkResolveRetriesValue() != 30 {
+		t.Errorf("unset should default to enabled with 30 retries; got enabled=%v retries=%d",
 			def.NetworkResolveEnabled(), def.NetworkResolveRetriesValue())
 	}
 	if got := def.NetworkResolveTimeoutSecValue(); got != 60 {
 		t.Errorf("default timeout should resolve to 60; got %d", got)
 	}
+	// Explicit 0 disables the gate — the Phase 1 opt-out.
+	off := &config.CPIConfig{NetworkResolveRetries: intPtr(0)}
+	if off.NetworkResolveEnabled() || off.NetworkResolveRetriesValue() != 0 {
+		t.Errorf("explicit 0 should disable; got enabled=%v retries=%d",
+			off.NetworkResolveEnabled(), off.NetworkResolveRetriesValue())
+	}
 	// Negative is clamped to disabled/default by the accessors (validation
 	// rejects it separately).
-	neg := &config.CPIConfig{NetworkResolveRetries: -1, NetworkResolveTimeoutSec: -5}
+	neg := &config.CPIConfig{NetworkResolveRetries: intPtr(-1), NetworkResolveTimeoutSec: -5}
 	if neg.NetworkResolveEnabled() || neg.NetworkResolveTimeoutSecValue() != 60 {
 		t.Errorf("negative values should resolve to disabled/default; got enabled=%v timeout=%d",
 			neg.NetworkResolveEnabled(), neg.NetworkResolveTimeoutSecValue())
 	}
 	// Enabled with custom timeout.
-	on := &config.CPIConfig{NetworkResolveRetries: 5, NetworkResolveTimeoutSec: 120}
+	on := &config.CPIConfig{NetworkResolveRetries: intPtr(5), NetworkResolveTimeoutSec: 120}
 	if !on.NetworkResolveEnabled() || on.NetworkResolveRetriesValue() != 5 {
 		t.Errorf("retries=5 should enable; got enabled=%v retries=%d",
 			on.NetworkResolveEnabled(), on.NetworkResolveRetriesValue())
@@ -264,10 +275,11 @@ func TestNetworkResolveAccessors(t *testing.T) {
 	if got := on.NetworkResolveTimeoutSecValue(); got != 120 {
 		t.Errorf("custom timeout should be 120; got %d", got)
 	}
-	// Nil receiver is defensive.
+	// Nil receiver defaults the same way an empty/unset config does (Phase 1: enabled, 30 retries).
 	var nilCfg *config.CPIConfig
-	if nilCfg.NetworkResolveEnabled() || nilCfg.NetworkResolveTimeoutSecValue() != 60 {
-		t.Error("nil receiver should be disabled with default timeout")
+	if !nilCfg.NetworkResolveEnabled() || nilCfg.NetworkResolveRetriesValue() != 30 || nilCfg.NetworkResolveTimeoutSecValue() != 60 {
+		t.Errorf("nil receiver should default to enabled with 30 retries and 60s timeout; got enabled=%v retries=%d timeout=%d",
+			nilCfg.NetworkResolveEnabled(), nilCfg.NetworkResolveRetriesValue(), nilCfg.NetworkResolveTimeoutSecValue())
 	}
 }
 

@@ -1028,21 +1028,33 @@ properties:
     default: 0
   pve.network_resolve_retries:
     description: |
-      Eventual-consistency poll budget for freshly created SDN networks. A newly
-      applied SDN vnet is not immediately usable cluster-wide: the data-plane
-      realization (ifupdown2 reload, pmxcfs propagation) is asynchronous and
-      per-node, so a create_vm that immediately follows a create_network on a
-      different node can attach a NIC to a bridge that does not yet exist there.
-      When > 0, create_network polls the running cluster SDN config until the new
-      vnet converges, and create_vm confirms each SDN-managed NIC bridge is present
-      on the target node before writing the NIC config — a not-yet-present bridge
-      is treated as a retriable error so the BOSH Director re-drives rather than
-      booting a NIC into a bridge that does not exist. Only SDN-managed vnets are
-      gated; external or static Linux bridges (e.g. vmbr0) always pass straight
-      through. Both polls are bounded by network_resolve_timeout_sec. Default 0
-      disables the gates, leaving create_network and create_vm byte-identical to
-      prior releases. A conventional value is 60.
-    default: 0
+      Eventual-consistency poll budget for freshly created SDN networks. SDN
+      state propagates over inter-node SSH, so one broken node can leave a
+      newly applied SDN vnet silently pending cluster-wide while the apply
+      task still reports success — the data-plane realization (ifupdown2
+      reload, pmxcfs propagation) is asynchronous and per-node, so a create_vm
+      that immediately follows a create_network on a different node can
+      attach a NIC to a bridge that does not yet exist there. When > 0 (the
+      default, as of Phase 1: 30, roughly 30 seconds at the 1-second poll
+      cadence), create_network polls the running cluster SDN config until the
+      new vnet converges, and create_vm confirms each SDN-managed NIC bridge
+      is present on the target node before writing the NIC config — a
+      not-yet-present bridge is treated as a retriable error so the BOSH
+      Director re-drives rather than booting a NIC into a bridge that does
+      not exist, converting the silent race into an actionable, retriable
+      failure. Only SDN-managed vnets are gated; external or static Linux
+      bridges (e.g. vmbr0) always pass straight through untouched, and SDN-
+      membership lookup failures fail the gate open (never block a legitimate
+      deploy on the guard's own lookup blip) — so the worst case of the
+      default is a bounded retriable delay, never a false block. Both polls
+      are bounded by network_resolve_timeout_sec. Set explicitly to 0 to
+      disable both gates and restore the pre-Phase-1 behavior (create_network
+      and create_vm byte-identical to releases before this default changed).
+      Set to any other positive value to override the retry budget. This
+      property has no default in this spec (see the CPI's own accessor for
+      why: an unset property must be distinguishable from an explicit 0 to
+      support the disable case) — omitting it from the manifest is exactly
+      equivalent to leaving it unset, which resolves to 30.
   pve.network_resolve_timeout_sec:
     description: |
       Absolute time bound (seconds) on the SDN eventual-consistency poll described

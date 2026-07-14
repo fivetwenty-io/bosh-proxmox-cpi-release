@@ -126,6 +126,10 @@ func buildHealthDeps(n *healthNodes, hcfg *config.HealthCheckConfig) handlers.De
 			// IP-conflict check disabled (cluster ListResources returns empty).
 			EnsureNoIPConflicts: placementDisabled,
 			HealthCheck:         hcfg,
+			// Explicitly disabled: as of Phase 1 this defaults to 30 (enabled)
+			// when nil, and these health-gate tests don't wire SDN vnet/
+			// node-network fakes for the gate to poll against.
+			NetworkResolveRetries: new(int),
 		},
 		PVE: &mockPVEClient{
 			qemuSvc:    &vmMockQEMU{},

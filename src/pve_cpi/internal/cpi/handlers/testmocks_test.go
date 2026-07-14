@@ -408,21 +408,27 @@ func testConfig() *config.CPIConfig {
 }
 
 // testConfigWith returns a minimal CPIConfig with the given options applied.
-// Without options it is equivalent to testConfig().
+// Without options it is equivalent to testConfig(). NetworkResolveRetries is
+// explicitly disabled (0): as of Phase 1 that field defaults to 30 (enabled)
+// when left nil, and the great majority of tests sharing this minimal
+// baseline predate and are unrelated to the SDN eventual-consistency gate —
+// tests that specifically exercise it override this field explicitly via a
+// testConfigOption or by mutating the returned config directly.
 func testConfigWith(opts ...testConfigOption) *config.CPIConfig {
 	c := &config.CPIConfig{
-		Host:           "pve.test.local",
-		Port:           8006,
-		User:           "root",
-		APIToken:       "test-token",
-		Node:           "pve-node1",
-		VMStorage:      "local-lvm",
-		DiskStorage:    "local-lvm",
-		NetworkBridge:  "vmbr0",
-		AgentMode:      "noagent",
-		VMDiskFormat:   "qcow2",
-		VerifySSL:      boolPtr(false),
-		VMIDRangeStart: 100,
+		Host:                  "pve.test.local",
+		Port:                  8006,
+		User:                  "root",
+		APIToken:              "test-token",
+		Node:                  "pve-node1",
+		VMStorage:             "local-lvm",
+		DiskStorage:           "local-lvm",
+		NetworkBridge:         "vmbr0",
+		AgentMode:             "noagent",
+		VMDiskFormat:          "qcow2",
+		VerifySSL:             boolPtr(false),
+		VMIDRangeStart:        100,
+		NetworkResolveRetries: new(int),
 	}
 	for _, o := range opts {
 		o(c)

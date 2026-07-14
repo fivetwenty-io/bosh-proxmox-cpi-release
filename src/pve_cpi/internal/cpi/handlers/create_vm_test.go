@@ -283,6 +283,7 @@ type vmMockCluster struct {
 	listStatusFn          func(ctx context.Context) (*sdkcluster.ListStatusResponse, error)
 	listFirewallGroupsFn  func() (*sdkcluster.ListFirewallGroupsResponse, error)
 	listFirewallOptionsFn func(ctx context.Context) (*sdkcluster.ListFirewallOptionsResponse, error)
+	listSdnVnetsFn        func(ctx context.Context, params *sdkcluster.ListSdnVnetsParams) (*sdkcluster.ListSdnVnetsResponse, error)
 	// listFirewallOptionsCalls counts ListFirewallOptions invocations, for
 	// asserting the §1.4 master-switch probe's once-per-process semantics.
 	listFirewallOptionsCalls int
@@ -308,6 +309,22 @@ func (m *vmMockCluster) ListFirewallOptions(ctx context.Context) (*sdkcluster.Li
 	}
 	enabled := int64(1)
 	return &sdkcluster.ListFirewallOptionsResponse{Enable: &enabled}, nil
+}
+
+// ListSdnVnets defaults to an empty vnet list, so the §1.6 SDN eventual-
+// consistency gate (internal/pve/network_resolve.go, active by default as of
+// Phase 1) classifies every test bridge as "not SDN-managed" and passes
+// straight through with zero polling — matching this suite's pre-Phase-1,
+// gate-off behavior for tests that don't specifically exercise SDN vnets.
+// Tests that need a bridge recognized as an SDN vnet wire listSdnVnetsFn
+// explicitly (see create_vm_netresolve_internal_test.go's dedicated fakes for
+// the gate's own positive-path tests).
+func (m *vmMockCluster) ListSdnVnets(ctx context.Context, params *sdkcluster.ListSdnVnetsParams) (*sdkcluster.ListSdnVnetsResponse, error) {
+	if m.listSdnVnetsFn != nil {
+		return m.listSdnVnetsFn(ctx, params)
+	}
+	resp := sdkcluster.ListSdnVnetsResponse{}
+	return &resp, nil
 }
 
 func (m *vmMockCluster) ListStatus(ctx context.Context) (*sdkcluster.ListStatusResponse, error) {
@@ -1560,9 +1577,23 @@ func buildVMDepsForTemplateCrossNode(q *vmMockQEMU, n *vmMockNodes, a *vmMockAge
 }
 
 // withConfigNodes wraps a vmMockCluster so ListConfigNodes returns nodeCount
-// single-node entries. Returns the wrapped cluster.Service.
+// single-node entries. Returns the wrapped cluster.Service. mockClusterSvc
+// embeds mockSDNCluster, whose SDN methods panic when unconfigured (by
+// design, for create_network_test.go's own SDN-focused tests); this wrapper
+// also supplies a safe empty-list default for ListSdnVnets so the §1.6
+// network-resolve gate (active by default as of Phase 1, incidentally
+// reachable from any create_vm test with a NIC) classifies every test bridge
+// as "not SDN-managed" and passes straight through, matching this suite's
+// pre-Phase-1, gate-off behavior for create_vm tests that don't specifically
+// exercise SDN vnets.
 func withConfigNodes(c *vmMockCluster, nodeCount int) *mockClusterSvc {
 	return &mockClusterSvc{
+		mockSDNCluster: mockSDNCluster{
+			listSdnVnetsFn: func(_ context.Context, _ *sdkcluster.ListSdnVnetsParams) (*sdkcluster.ListSdnVnetsResponse, error) {
+				resp := sdkcluster.ListSdnVnetsResponse{}
+				return &resp, nil
+			},
+		},
 		listConfigNodesFn: func(_ context.Context) (*sdkcluster.ListConfigNodesResponse, error) {
 			resp := make(sdkcluster.ListConfigNodesResponse, nodeCount)
 			for i := 0; i < nodeCount; i++ {
@@ -3159,6 +3190,10 @@ func buildVMDepsFirewall(q *vmMockQEMU, n *vmMockNodes, c *vmMockCluster, a *vmM
 			VMTypes:             opts.vmTypes,
 			SecurityGroups:      opts.securityGroups,
 			VMFirewall:          opts.vmFirewall,
+			// Explicitly disabled: as of Phase 1 this defaults to 30 (enabled)
+			// when nil, and these firewall-focused tests don't wire SDN vnet/
+			// node-network fakes for the gate to poll against.
+			NetworkResolveRetries: new(int),
 		},
 		PVE: &mockPVEClient{
 			qemuSvc:    q,
