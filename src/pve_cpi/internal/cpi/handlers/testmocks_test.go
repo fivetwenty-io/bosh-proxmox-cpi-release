@@ -598,11 +598,25 @@ func (m *mockSDNCluster) GetSdnZones(ctx context.Context, zone string, params *c
 	panic("mockSDNCluster.GetSdnZones called without configuration; opt in by setting getSdnZonesFn")
 }
 
+// ListSdnZones is the one mockSDNCluster method that does NOT panic when
+// unconfigured (every other method here does, by design — see the comment
+// above CreateSdnVnets). As of §1.7, pve.NextVNI unconditionally lists SDN
+// zones to exclude zone-level control VNIs (e.g. an EVPN zone's vrf-vxlan)
+// from allocation, so this call is now incidentally reachable from any
+// create_network test that exercises auto-tag allocation (vxlan/evpn zones
+// with no explicit cloud_properties.vnet_tag) -- most of which have nothing
+// to do with zone listing and never configured listSdnZonesFn. Defaulting to
+// an empty zone list here is safe and semantically correct: it means "no
+// zone-level VNIs to exclude", which is exactly the pre-§1.7 behavior. Tests
+// that specifically need to verify zone-level VNI exclusion wire
+// listSdnZonesFn explicitly (see create_network_vxlan_test.go); the
+// dedicated exclusion-logic tests live in internal/pve/vni_test.go.
 func (m *mockSDNCluster) ListSdnZones(ctx context.Context, params *cluster.ListSdnZonesParams) (*cluster.ListSdnZonesResponse, error) {
 	if m.listSdnZonesFn != nil {
 		return m.listSdnZonesFn(ctx, params)
 	}
-	panic("mockSDNCluster.ListSdnZones called without configuration; opt in by setting listSdnZonesFn")
+	empty := cluster.ListSdnZonesResponse{}
+	return &empty, nil
 }
 
 func (m *mockSDNCluster) CreateSdnVnetsSubnets(ctx context.Context, vnet string, params *cluster.CreateSdnVnetsSubnetsParams) error {

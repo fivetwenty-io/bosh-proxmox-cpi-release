@@ -526,6 +526,13 @@ func TestCreateNetwork_VNIExhaustion_ActionableError(t *testing.T) {
 			}
 			return &rows, nil
 		},
+		// This test is specifically about vnet-tag exhaustion; the §1.7
+		// zone-level exclusion check (NextVNI now also calls ListSdnZones)
+		// contributes nothing extra here, so return an empty zone list.
+		listSdnZonesFn: func(_ context.Context, _ *sdkcluster.ListSdnZonesParams) (*sdkcluster.ListSdnZonesResponse, error) {
+			empty := sdkcluster.ListSdnZonesResponse{}
+			return &empty, nil
+		},
 	}
 
 	spec := map[string]any{

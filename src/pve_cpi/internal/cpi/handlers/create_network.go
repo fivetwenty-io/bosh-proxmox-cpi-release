@@ -366,7 +366,7 @@ func resolveVnetTag(ctx context.Context, deps Deps, zoneType string, explicitTag
 			end = vlanMaxTag
 		}
 	}
-	return pve.NextVNI(ctx, deps.PVE, start, end)
+	return pve.NextVNI(ctx, deps.PVE, start, end, deps.Log(ctx))
 }
 
 // createVnetIdempotent probes PVE for an existing vnet and creates it when
