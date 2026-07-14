@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cloudinit"
@@ -1025,5 +1026,137 @@ func TestExistsTolerant_PropagatesOtherErrors(t *testing.T) {
 	}
 	if !errors.Is(err, rawErr) {
 		t.Fatalf("propagated error does not chain to the original; err=%v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// IsVMConfigLocked / VMConfigLockType / WrapVMConfigLocked
+// ---------------------------------------------------------------------------
+
+func TestIsVMConfigLocked_Nil(t *testing.T) {
+	t.Parallel()
+	if pve.IsVMConfigLocked(nil) {
+		t.Error("nil error should not be VM-config-locked")
+	}
+}
+
+// source: PVE pve-manager PVE/AbstractConfig.pm check_lock ("VM is locked ($lock)").
+func TestIsVMConfigLocked_PositiveCases(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name     string
+		msg      string
+		wantType string
+	}{
+		{"bare clone", "VM is locked (clone)", "clone"},
+		{"bare create", "VM is locked (create)", "create"},
+		{"bare backup", "VM is locked (backup)", "backup"},
+		{"bare migrate", "VM is locked (migrate)", "migrate"},
+		{"bare snapshot", "VM is locked (snapshot)", "snapshot"},
+		{"bare rollback", "VM is locked (rollback)", "rollback"},
+		{"wrapped by destroy handler", "500 unable to destroy VM 106: VM is locked (clone)", "clone"},
+		{"vmid repeated before is locked", "unable to stop VM 106 - VM 106 is locked (backup)", "backup"},
+		{"mixed case", "Vm Is Locked (Clone)", "Clone"},
+		{"api-error prefixed", "PVE API error: 500 Internal Server Error: VM is locked (create)", "create"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			err := errors.New(tc.msg)
+			if !pve.IsVMConfigLocked(err) {
+				t.Errorf("IsVMConfigLocked(%q) = false, want true", tc.msg)
+			}
+			if got := pve.VMConfigLockType(err); got != tc.wantType {
+				t.Errorf("VMConfigLockType(%q) = %q, want %q", tc.msg, got, tc.wantType)
+			}
+		})
+	}
+}
+
+// Negatives: storage-lockfile and other unrelated PVE messages must NOT match
+// the guest-config-lock pattern — the two conditions require different
+// recovery and must never be conflated.
+func TestIsVMConfigLocked_NegativeCases(t *testing.T) {
+	t.Parallel()
+	cases := []string{
+		"task failed: unable to create VM 131 - cannot import from 'local:import/foo.qcow2' - can't lock file '/var/lock/pve-manager/pve-storage-data' - got timeout",
+		"command '/sbin/lvs --separator : --noheadings --units b --unbuffered --nosuffix --options lv_size /dev/data/vm-112-disk-0' failed: got timeout",
+		"can't lock file '/var/lock/qemu-server/lock-106.conf' - got timeout",
+		"VM 131 already exists",
+		"too many requests",
+		"unable to acquire lock",
+		"Configuration file 'nodes/pve/qemu-server/114.conf' does not exist",
+		"",
+	}
+	for _, msg := range cases {
+		t.Run(msg, func(t *testing.T) {
+			t.Parallel()
+			err := errors.New(msg)
+			if msg == "" {
+				err = nil
+			}
+			if pve.IsVMConfigLocked(err) {
+				t.Errorf("IsVMConfigLocked(%q) = true, want false", msg)
+			}
+			if got := pve.VMConfigLockType(err); got != "" {
+				t.Errorf("VMConfigLockType(%q) = %q, want \"\"", msg, got)
+			}
+		})
+	}
+}
+
+func TestIsVMConfigLocked_DoesNotOverlapStorageLockTimeout(t *testing.T) {
+	t.Parallel()
+	lockfileErr := errors.New("can't lock file '/var/lock/pve-manager/pve-storage-data' - got timeout")
+	if pve.IsVMConfigLocked(lockfileErr) {
+		t.Error("storage-lockfile message must not match IsVMConfigLocked")
+	}
+	configLockErr := errors.New("VM is locked (clone)")
+	if pve.IsStorageLockTimeout(configLockErr) {
+		t.Error("guest-config-lock message must not match IsStorageLockTimeout")
+	}
+}
+
+func TestVMConfigLockType_Nil(t *testing.T) {
+	t.Parallel()
+	if got := pve.VMConfigLockType(nil); got != "" {
+		t.Errorf("VMConfigLockType(nil) = %q, want \"\"", got)
+	}
+}
+
+func TestWrapVMConfigLocked_Nil(t *testing.T) {
+	t.Parallel()
+	if err := pve.WrapVMConfigLocked(nil, 106, "pve01"); err != nil {
+		t.Errorf("WrapVMConfigLocked(nil) = %v, want nil", err)
+	}
+}
+
+func TestWrapVMConfigLocked_NonLockError_FallsBackToWrapError(t *testing.T) {
+	t.Parallel()
+	orig := errors.New("VM 131 already exists")
+	err := pve.WrapVMConfigLocked(orig, 131, "pve01")
+	if pve.IsVMConfigLocked(err) {
+		t.Fatalf("non-lock error should not be classified as VM-config-locked: %v", err)
+	}
+	if !strings.Contains(err.Error(), "already exists") {
+		t.Errorf("expected original message preserved, got: %v", err)
+	}
+}
+
+func TestWrapVMConfigLocked_LockedError_RetriableAndActionable(t *testing.T) {
+	t.Parallel()
+	orig := errors.New("500 unable to destroy VM 106: VM is locked (clone)")
+	err := pve.WrapVMConfigLocked(orig, 106, "pve01")
+	if err == nil {
+		t.Fatal("expected non-nil error")
+	}
+	if !cpiErrIsRetriable(t, err) {
+		t.Errorf("WrapVMConfigLocked must produce a retriable error, got: %v", err)
+	}
+	msg := err.Error()
+	for _, want := range []string{"106", "pve01", "clone", "qm unlock"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("error message %q missing expected substring %q", msg, want)
+		}
 	}
 }

@@ -763,7 +763,7 @@ func createVMWithFallback(
 		if attemptErr != nil {
 			// Clean up this attempt's partial VM (if any was created).
 			if vmid != 0 {
-				cleanupVM(contextWithoutCancel(ctx), deps, candidateNode, vmid, logger)
+				cleanupVM(contextWithoutCancel(ctx), deps, candidateNode, vmid, nil, logger)
 			}
 
 			if !shouldFallback || isLast {
@@ -3174,7 +3174,7 @@ func handleCloneError(
 			log.Int("vmid_attempted", candidate),
 			log.ErrScrubbed(cerr),
 		)
-		cleanupVM(contextWithoutCancel(ctx), deps, node, candidate, logger)
+		cleanupVM(contextWithoutCancel(ctx), deps, node, candidate, nil, logger)
 	case pve.IsVMIDConflict(cerr):
 		logger.Info("create_vm: vmid conflict on clone, retrying",
 			log.Int("vmid_attempted", candidate),
@@ -3190,12 +3190,12 @@ func handleCloneError(
 			log.Int("vmid_attempted", candidate),
 			log.ErrScrubbed(cerr),
 		)
-		cleanupVM(contextWithoutCancel(ctx), deps, node, candidate, logger)
+		cleanupVM(contextWithoutCancel(ctx), deps, node, candidate, nil, logger)
 	default:
 		// Non-retryable error (e.g. local-storage cross-node violation,
 		// template not found, or other PVE fatal). Clean up any partial VM
 		// state and propagate — AllocateWithRetry will not retry.
-		cleanupVM(contextWithoutCancel(ctx), deps, node, candidate, logger)
+		cleanupVM(contextWithoutCancel(ctx), deps, node, candidate, nil, logger)
 	}
 	return cerr
 }
@@ -3464,7 +3464,7 @@ func handleCreateError(
 			log.Int("vmid_attempted", candidate),
 			log.ErrScrubbed(cerr),
 		)
-		cleanupVM(contextWithoutCancel(ctx), deps, node, candidate, logger)
+		cleanupVM(contextWithoutCancel(ctx), deps, node, candidate, nil, logger)
 	}
 	return cerr
 }
@@ -3493,7 +3493,7 @@ func handleAwaitError(
 		// PVE rolled back its own qmcreate task — but the
 		// VMID may still be registered with the partial
 		// state. Clean up before the next attempt.
-		cleanupVM(contextWithoutCancel(ctx), deps, node, candidate, logger)
+		cleanupVM(contextWithoutCancel(ctx), deps, node, candidate, nil, logger)
 		return werr
 	}
 	if pve.IsTransientTransport(werr) {
@@ -3504,14 +3504,14 @@ func handleAwaitError(
 		// The qmcreate task itself may still be running on
 		// PVE — we only lost the await connection. Clean
 		// up the VMID so a fresh attempt has a clean slate.
-		cleanupVM(contextWithoutCancel(ctx), deps, node, candidate, logger)
+		cleanupVM(contextWithoutCancel(ctx), deps, node, candidate, nil, logger)
 		return werr
 	}
 	// Non-conflict failure after Create succeeded: the VM may
 	// have been partially registered. Roll back this attempt
 	// before propagating so the next retry (which won't run)
 	// or the caller sees a clean slate.
-	cleanupVM(contextWithoutCancel(ctx), deps, node, candidate, logger)
+	cleanupVM(contextWithoutCancel(ctx), deps, node, candidate, nil, logger)
 	return werr
 }
 
@@ -4430,7 +4430,7 @@ func rollbackOnExit(
 			*retErr = preserveFailedVMError(*retErr, vmid, node)
 			return
 		}
-		cleanupVM(contextWithoutCancel(ctx), deps, node, vmid, logger)
+		cleanupVM(contextWithoutCancel(ctx), deps, node, vmid, nil, logger)
 	}
 }
 
@@ -4442,7 +4442,7 @@ func disposeFailedVM(ctx context.Context, deps Deps, node string, vmid int, env 
 		tagFailedVM(ctx, deps, node, vmid, env, logger)
 		return
 	}
-	cleanupVM(ctx, deps, node, vmid, logger)
+	cleanupVM(ctx, deps, node, vmid, env, logger)
 }
 
 // tagFailedVM marks a VM that failed mid-creation with "bosh-create-failed"
@@ -4524,9 +4524,19 @@ func preserveFailedVMError(orig error, vmid int, node string) error {
 // --------------------------------------------------------------------------
 // cleanupVM attempts to stop and purge a created VM on error. All errors are
 // logged but suppressed so the original error propagates unmodified.
+//
+// env carries the BOSH deploy identity (deployment/job) used to tag the VM
+// "bosh-create-failed" when the purge cannot complete because the guest
+// config is locked (see the locked-delete branch below) — best-effort and
+// fail-open: env is nil for callers that clean up an intermediate placement-
+// fallback or VMID-retry candidate (a VM that was never the final outcome and
+// has no deploy identity to tag with), in which case tagging is skipped, but
+// the skiplock recovery attempt and the actionable log message still run
+// regardless of env.
 // --------------------------------------------------------------------------
-func cleanupVM(ctx context.Context, deps Deps, node string, vmid int, logger *log.Logger) {
+func cleanupVM(ctx context.Context, deps Deps, node string, vmid int, env map[string]any, logger *log.Logger) {
 	logger.Warn("create_vm: rolling back, destroying created VM", log.Int(metadataKeyVMID, vmid))
+	vmCID := strconv.Itoa(vmid)
 
 	// Stop (best-effort; VM may not have started yet). Wrap in RetryOnTransient
 	// so a pvedaemon worker-recycle during rollback doesn't bubble out — this
@@ -4538,6 +4548,16 @@ func cleanupVM(ctx context.Context, deps Deps, node string, vmid int, logger *lo
 		stopUPID, innerErr = deps.PVE.QEMU().Stop(ctx, node, vmid)
 		return innerErr
 	})
+	// A killed worker or node reboot mid-clone/mid-create can leave the guest
+	// config carrying an in-flight lock (lock: clone|create|...), which PVE
+	// rejects even a Stop against. Retry once with skiplock=true when the CPI
+	// is authenticated as root@pam (the only identity PVE honors skiplock
+	// for); otherwise this is a no-op and stopErr is left as the lock
+	// rejection, which is fine — Stop is best-effort and the purge below is
+	// where the orphan actually matters.
+	if stopErr != nil && pve.IsVMConfigLocked(stopErr) {
+		stopUPID, stopErr = retryStopWithSkiplock(ctx, deps, node, vmCID, vmid, stopErr, logger)
+	}
 	if stopErr == nil && stopUPID != "" {
 		if awaitErr := pve.AwaitTaskWithLogger(ctx, deps.PVE, node, stopUPID, logger); awaitErr != nil {
 			logger.Warn("create_vm: rollback stop task failed", log.Int(metadataKeyVMID, vmid), log.Err(awaitErr))
@@ -4547,14 +4567,30 @@ func cleanupVM(ctx context.Context, deps Deps, node string, vmid int, logger *lo
 	// Purge the VM
 	purge := true
 	destroyUnref := true
-	delResp, delErr := deps.PVE.Nodes().DeleteQemu(ctx, node, strconv.Itoa(vmid), &sdknodes.DeleteQemuParams{
+	delResp, delErr := deps.PVE.Nodes().DeleteQemu(ctx, node, vmCID, &sdknodes.DeleteQemuParams{
 		Purge:                    &purge,
 		DestroyUnreferencedDisks: &destroyUnref,
 	})
+	if delErr != nil && pve.IsVMConfigLocked(delErr) {
+		delResp, delErr = retryDestroyWithSkiplock(ctx, deps, node, vmCID, vmid, purge, destroyUnref, delErr, logger)
+	}
 	if delErr != nil {
-		if pve.IsNotFound(delErr) || pve.IsPmxcfsConfigMissing(delErr) {
+		switch {
+		case pve.IsNotFound(delErr) || pve.IsPmxcfsConfigMissing(delErr):
 			logger.Info("create_vm: rollback delete -- VM already gone (idempotent)", log.Int(metadataKeyVMID, vmid))
-		} else {
+		case pve.IsVMConfigLocked(delErr):
+			// Skiplock retry above either was not attempted (identity is not
+			// root@pam) or was attempted and still failed: the VM is orphaned,
+			// locked, and not destroyed. Surface the actionable recovery
+			// command and tag it (when a deploy identity is available) so
+			// keep_failed_vms tooling and operators can find it — this VM was
+			// never meant to be preserved, but ended up stuck, so visibility
+			// matters regardless of the keep_failed_vms setting.
+			logUnresolvedVMLock(logger, "create_vm: rollback delete failed", vmid, node, delErr)
+			if env != nil {
+				tagFailedVM(ctx, deps, node, vmid, env, logger)
+			}
+		default:
 			logger.Error("create_vm: rollback delete failed", log.Int(metadataKeyVMID, vmid), log.Err(delErr))
 		}
 	} else {

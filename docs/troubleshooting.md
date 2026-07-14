@@ -303,6 +303,48 @@ pvesh get /cluster/resources --type vm | jq '.[] | select(.tags == null) | {vmid
 
 See the [Operations Runbook](operations.md) for orphan cleanup procedures. The CPI runs `cleanupVM` (stop + delete) automatically before retrying, but cleanup can itself fail and leave a leaked VMID requiring `qm destroy`.
 
+### VM is locked
+
+**Symptom**
+
+`delete_vm` (or a `create_vm` rollback) fails repeatedly against the same VMID with a message naming a lock type and a recovery command:
+
+```text
+PVE VM 106 on node "pve01" is locked (clone); recover with `qm unlock 106` on node "pve01", then retry: ...
+```
+
+Because this error is retriable, the BOSH Director keeps re-driving the same failing call — `bosh task <id> --debug` shows the identical error repeating across retries without ever succeeding.
+
+**Diagnosis**
+
+A worker process (`pvedaemon` or a `qm` child) was killed, or the PVE node rebooted, while a `clone`, `create`, `backup`, `migrate`, `snapshot`, or `rollback` task was in flight against the VM. PVE writes the operation's name into the guest config's `lock:` attribute before starting the task and only clears it on that task's normal completion; a task that dies mid-flight leaves the lock behind permanently. Every subsequent stop/destroy call against that VMID is rejected by PVE's own guest-config lock check until the lock is cleared — PVE's HTTP API has no unlock endpoint, so nothing the CPI does over the API can clear it unilaterally.
+
+Confirm the lock directly:
+
+```bash
+qm config <vmid> | grep ^lock:
+```
+
+**Fix**
+
+The CPI attempts an automatic recovery first: if it is authenticated as the `root@pam` superuser — either directly with `pve.user: root`, `pve.realm: pam` (or `pve.user: root@pam`) and a password, or via an API token issued to the `root@pam` user (`pve.api_token: root@pam!<token-id>=<secret>`) — it retries the failing stop/destroy call once with PVE's `skiplock` parameter, which bypasses the guest-config lock check. PVE honors `skiplock` **only** for `root@pam`; it rejects the parameter for every other identity, including a least-privilege token issued to any other user, regardless of the ACL roles or privileges granted to that user. When the CPI is *not* authenticated as `root@pam`, or the `skiplock` retry itself fails, the error above is the final, actionable outcome and manual recovery is required:
+
+```bash
+qm unlock <vmid>
+```
+
+Run this on the PVE node that hosts the VM (the node named in the error message). Once unlocked, the BOSH Director's next retry of `delete_vm` (or the original `create_vm`, if the lock was hit during a rollback) succeeds normally — no CPI restart or manifest change is needed.
+
+**Interaction with `debug.keep_failed_vms` and the `bosh-create-failed` tag**
+
+When a `create_vm` rollback (`cleanupVM`) hits this condition and cannot clear the lock (not `root@pam`, or the `skiplock` retry also failed), the VM is left running and orphaned — it was never meant to be preserved, but ended up stuck regardless of the `pve.debug.keep_failed_vms` setting (see [CPI Methods — `create_vm`](cpi_methods.md#create_vm) for that flag's normal, opt-in preserve-for-inspection behavior). The CPI tags it `bosh-create-failed` on a best-effort basis (when the failing rollback has a BOSH deploy identity to tag with) so an operator can find it the same way:
+
+```bash
+pvesh get /cluster/resources --type vm | jq '.[] | select(.tags != null and (.tags | contains("bosh-create-failed"))) | {vmid:.vmid, node:.node, tags:.tags}'
+```
+
+A VM found this way needs the same `qm unlock <vmid>` fix before it can be destroyed or adopted.
+
 ### Every create_vm times out reaching the PVE API
 
 **Symptom**

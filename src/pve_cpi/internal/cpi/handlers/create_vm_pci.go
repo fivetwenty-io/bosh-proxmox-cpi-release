@@ -205,7 +205,7 @@ func applyPCIPassthroughWithCleanup(
 	logger *log.Logger,
 ) error {
 	if err := applyPCIPassthrough(ctx, deps, node, candidate, pts, logger); err != nil {
-		cleanupVM(contextWithoutCancel(ctx), deps, node, candidate, logger)
+		cleanupVM(contextWithoutCancel(ctx), deps, node, candidate, nil, logger)
 		return err
 	}
 	return nil

@@ -501,6 +501,17 @@ func HandleDeleteVM(deps Deps) cpi.Handler {
 			})
 			return innerErr
 		})
+		// A killed worker or node reboot mid-clone/mid-create can leave the
+		// guest config carrying an in-flight lock (lock: clone|create|...),
+		// which PVE rejects the destroy against — without this, the Director
+		// would retry delete_vm forever against a VM that can never come
+		// unstuck on its own. Retry once with skiplock=true when the CPI is
+		// authenticated as root@pam (the only identity PVE honors skiplock
+		// for); when it is not, retryDestroyWithSkiplock returns deleteErr
+		// unretried and the IsVMConfigLocked branch below still fires.
+		if deleteErr != nil && pve.IsVMConfigLocked(deleteErr) {
+			deleteResp, deleteErr = retryDestroyWithSkiplock(ctx, deps, node, vmCID, vmid, purge, destroyDisks, deleteErr, logger)
+		}
 		if deleteErr != nil {
 			if pve.IsNotFound(deleteErr) {
 				logger.Info("delete_vm: VM not found during delete -- already deleted, returning success")
@@ -511,6 +522,14 @@ func HandleDeleteVM(deps Deps) cpi.Handler {
 				}
 				cleanupAdvertisedRoutes(ctx, deps, vmid, vmTags, logger)
 				return nil, nil
+			}
+			if pve.IsVMConfigLocked(deleteErr) {
+				// Still locked after any skiplock attempt: surface an
+				// actionable, retriable error naming the lock type and the
+				// `qm unlock <vmid>` recovery command, instead of a generic
+				// 5xx the Director would retry forever with no diagnostic value.
+				logUnresolvedVMLock(logger, "delete_vm: delete failed", vmid, node, deleteErr)
+				return nil, pve.WrapVMConfigLocked(deleteErr, vmid, node)
 			}
 			return nil, cpierrors.Wrap(pve.WrapError(deleteErr), fmt.Sprintf("delete_vm: delete VM %s", vmCID))
 		}

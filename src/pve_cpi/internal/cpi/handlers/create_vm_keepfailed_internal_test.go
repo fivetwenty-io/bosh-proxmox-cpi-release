@@ -256,7 +256,7 @@ func TestCleanupVM_RemovesNodeAffinityPinWhenEnabled(t *testing.T) {
 		Logger: log.NewNopLogger(),
 	}
 
-	cleanupVM(context.Background(), deps, "pve01", 100, log.NewNopLogger())
+	cleanupVM(context.Background(), deps, "pve01", 100, nil, log.NewNopLogger())
 
 	if _, ok := cl.rules["bosh-na-100"]; ok {
 		t.Error("cleanupVM must remove the node-affinity pin rule on rollback")
@@ -280,7 +280,7 @@ func TestCleanupVM_RemovesPinEvenWhenAZPinDisabled(t *testing.T) {
 		Logger: log.NewNopLogger(),
 	}
 
-	cleanupVM(context.Background(), deps, "pve01", 100, log.NewNopLogger())
+	cleanupVM(context.Background(), deps, "pve01", 100, nil, log.NewNopLogger())
 
 	if _, ok := cl.rules["bosh-na-100"]; ok {
 		t.Error("cleanupVM must remove the node-affinity pin rule even when the AZ-pin flag is off")

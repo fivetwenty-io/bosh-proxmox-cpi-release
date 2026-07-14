@@ -526,7 +526,7 @@ func TestCleanupVM_RemovesNodeAffinityPin_WithoutPinFlag(t *testing.T) {
 		Logger: log.NewNopLogger(),
 	}
 
-	cleanupVM(context.Background(), deps, "pve1", 4242, deps.Logger)
+	cleanupVM(context.Background(), deps, "pve1", 4242, nil, deps.Logger)
 
 	if _, ok := cl.rules["bosh-na-4242"]; ok {
 		t.Error("cleanupVM must delete the bosh-na-<vmid> HA rule even with the AZ-pin flag off")

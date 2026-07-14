@@ -4,7 +4,9 @@ package pve
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
+	"regexp"
 	"strings"
 
 	sdkerrors "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/errors"
@@ -434,6 +436,88 @@ func IsPmxcfsConfigMissing(err error) bool {
 	return (strings.Contains(msg, "Configuration file ") &&
 		strings.Contains(msg, "does not exist")) ||
 		strings.Contains(msg, "unable to find configuration file")
+}
+
+// vmConfigLockPattern matches PVE's guest-config lock rejection. PVE's
+// PVE::AbstractConfig::check_lock dies with "VM is locked ($lock)\n" whenever
+// a mutating call (stop, destroy, migrate, resize, ...) reaches a guest whose
+// config carries an in-flight lock — clone, create, backup, migrate,
+// snapshot, rollback, or suspended. API wrappers commonly prepend context
+// ("unable to destroy VM 106: VM is locked (clone)") and some call sites
+// repeat the vmid immediately before "is locked" ("VM 106 is locked
+// (clone)"); the pattern is unanchored (so it matches regardless of prefix
+// text) and tolerates an optional numeric vmid in that position.
+//
+// Distinct from the storage-lockfile phrase "can't lock file ... got timeout"
+// (see IsStorageLockTimeout): that names a filesystem lockfile PATH, this
+// names a guest-config lock TYPE in parentheses with no lockfile path present
+// — the two patterns never match the same string.
+var vmConfigLockPattern = regexp.MustCompile(`(?i)vm\s*(?:\d+\s*)?is locked\s*\(([^)]*)\)`)
+
+// IsVMConfigLocked reports whether err signals that PVE rejected an operation
+// because the target guest's config carries an in-flight lock (see
+// vmConfigLockPattern). This is a guest-CONFIG lock (the "lock" attribute
+// PVE writes into <vmid>.conf during clone/create/backup/migrate/snapshot/
+// rollback), not the storage-backend lockfile contention IsStorageLockTimeout
+// detects — the two conditions require different recovery (`qm unlock
+// <vmid>` for this one; nothing operator-actionable for the storage case,
+// which simply clears once the contending task finishes).
+//
+// nil → false.
+func IsVMConfigLocked(err error) bool {
+	if err == nil {
+		return false
+	}
+	return vmConfigLockPattern.MatchString(err.Error())
+}
+
+// VMConfigLockType extracts the lock type named in a "VM is locked (<type>)"
+// error — e.g. "clone", "create", "backup", "migrate" — for use in operator-
+// facing diagnostics. Returns "" when err does not match IsVMConfigLocked or
+// the parenthetical is empty.
+//
+// nil → "".
+func VMConfigLockType(err error) string {
+	if err == nil {
+		return ""
+	}
+	m := vmConfigLockPattern.FindStringSubmatch(err.Error())
+	if len(m) < 2 {
+		return ""
+	}
+	return strings.TrimSpace(m[1])
+}
+
+// WrapVMConfigLocked upgrades a PVE guest-config-lock rejection (see
+// IsVMConfigLocked) into a retriable error whose message names the lock type
+// and the operator recovery command. PVE's HTTP API exposes no unlock
+// endpoint — the only ways to clear a stuck guest-config lock are `qm unlock
+// <vmid>` run on the node hosting the guest, or a skiplock=true retry, which
+// PVE honors only for the root@pam superuser (see IsRootPamIdentity). This
+// wrap is deliberately identity-agnostic: callers that CAN retry with
+// skiplock should attempt that BEFORE calling this, reserving
+// WrapVMConfigLocked for the final, unresolved failure surfaced to the BOSH
+// Director — so the Director's error output actionably names the fix instead
+// of repeating a generic 5xx message forever.
+//
+// vmid and node are caller-supplied context (not parsed from err, which may
+// or may not embed them) so the recovery command is always concrete. Non-lock
+// errors pass through WrapError unchanged. nil → nil.
+func WrapVMConfigLocked(err error, vmid int, node string) error {
+	if err == nil {
+		return nil
+	}
+	if !IsVMConfigLocked(err) {
+		return WrapError(err)
+	}
+	lockType := VMConfigLockType(err)
+	if lockType == "" {
+		lockType = "unknown"
+	}
+	return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
+		fmt.Sprintf(
+			"PVE VM %d on node %q is locked (%s); recover with `qm unlock %d` on node %q, then retry: %s",
+			vmid, node, lockType, vmid, node, err.Error()))
 }
 
 // IsPVEPushback reports whether err signals PVE server-side rate-limiting or

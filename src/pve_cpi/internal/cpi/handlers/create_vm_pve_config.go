@@ -113,7 +113,7 @@ func applyPVEConfigWithCleanup(
 	logger *log.Logger,
 ) error {
 	if err := applyPVEConfigPassthrough(ctx, deps, node, candidate, cfg, logger); err != nil {
-		cleanupVM(contextWithoutCancel(ctx), deps, node, candidate, logger)
+		cleanupVM(contextWithoutCancel(ctx), deps, node, candidate, nil, logger)
 		return err
 	}
 	return nil
