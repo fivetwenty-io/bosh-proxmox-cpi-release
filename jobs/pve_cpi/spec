@@ -62,33 +62,75 @@ properties:
   pve.network_mode:
     description: |
       Selects create_network/delete_network behavior.
-      "sdn" — PVE SDN vnet lifecycle (cluster SDN must be enabled).
-      "bridge" — Linux bridge lifecycle via the nodes API.
-      "auto" — use SDN when cloud_properties.zone or pve.sdn_zone is set;
-               fall back to bridge otherwise.
-    default: "auto"
+      "sdn" — PVE SDN vnet lifecycle (cluster SDN must be enabled). The
+               default: CPI-created networks are SDN vnets that span every
+               cluster node.
+      "bridge" — Linux bridge lifecycle via the nodes API (opt-in; bridges
+               are per-node and do not follow VMs across migration).
+      "auto" — legacy heuristic retained for compatibility: use SDN when
+               cloud_properties.zone or pve.sdn_zone is set; fall back to
+               bridge otherwise. Deployments that relied on the old
+               auto-to-bridge fallback without naming a zone must now set
+               network_mode: "auto" (or "bridge") explicitly.
+    default: "sdn"
   pve.sdn_zone:
     description: |
       Default PVE SDN zone name for vnet creation. Used when
-      cloud_properties.zone is absent. When empty and network_mode requires
-      SDN, the zone must be supplied per-call in cloud_properties.
+      cloud_properties.zone is absent. When empty with auto-manage enabled,
+      the CPI uses the turnkey zone "bosh"; when empty with auto-manage
+      disabled, the zone must be supplied per-call in cloud_properties.
     default: ""
   pve.sdn_zone_type:
     description: |
       PVE zone type the CPI uses when it creates a zone (requires
-      sdn_auto_manage_zone: true). One of: simple, vlan, qinq, vxlan, evpn.
-      "simple" is appropriate for single-node labs; multi-node overlays
-      require vxlan or evpn.
-    default: "simple"
+      sdn_auto_manage_zone). One of: simple, vlan, qinq, vxlan, evpn.
+      The default "vxlan" builds a cluster-wide L2 overlay — peers are
+      auto-derived from the online cluster nodes (override with
+      pve.sdn_vxlan_peers) and each vnet gets a VNI from the
+      sdn_vni_range band. "simple" remains an opt-in for single-node or
+      deliberately node-local networks (its bridges do not span nodes).
+      "evpn" is never CPI-created: pre-create the zone and its BGP
+      controller in PVE, and the CPI manages only vnets and subnets
+      inside it.
+    default: "vxlan"
   pve.sdn_auto_manage_zone:
     description: |
-      When true, create_network creates the SDN zone (type sdn_zone_type)
-      if it does not already exist, and delete_network deletes the zone when
-      ALL three conditions hold: (1) sdn_auto_manage_zone is true, (2) the
-      zone name does not equal pve.sdn_zone (the operator-pinned zone is never
-      auto-deleted), and (3) the zone has zero remaining vnets after the vnet
-      delete. Default false — operator manages zones; CPI manages only vnets.
-    default: false
+      When true, create_network creates the SDN zone (type sdn_zone_type,
+      name pve.sdn_zone or the turnkey default "bosh") if it does not
+      already exist, and delete_network deletes the zone when ALL of the
+      following hold: (1) sdn_auto_manage_zone is true, (2) the zone name
+      does not equal pve.sdn_zone (the operator-pinned zone is never
+      auto-deleted), (3) the zone is not an EVPN zone (operator-owned
+      fabric, never CPI-deleted), and (4) the zone has zero remaining
+      vnets after the vnet delete. Set false to keep zones operator-owned;
+      the CPI then manages only vnets and subnets.
+    default: true
+  pve.sdn_vxlan_peers:
+    description: |
+      Optional list of VXLAN peer IPs used when the CPI creates a vxlan
+      zone. Empty (the default) derives the peer list from the online
+      cluster nodes (/cluster/status). Set it when tunnel traffic must
+      ride a dedicated underlay network whose addresses differ from the
+      management IPs.
+    default: []
+  pve.sdn_vni_range_start:
+    description: |
+      Start of the band from which the CPI auto-allocates VXLAN Network
+      Identifiers (vnet tags) for tagged zone types. 0 uses the default
+      band 5000-5999. Per-network override via cloud_properties.vnet_tag.
+    default: 0
+  pve.sdn_vni_range_end:
+    description: |
+      End of the VNI auto-allocation band. 0 uses the default band
+      5000-5999.
+    default: 0
+  pve.sdn_zone_mtu:
+    description: |
+      Optional MTU override for CPI-created SDN zones. 0 (the default)
+      lets PVE derive the vnet MTU from the underlay (e.g. 1450 on a 1500
+      underlay for vxlan). Set for unusual underlays (e.g. 8950 on a
+      9000-MTU jumbo underlay).
+    default: 0
   pve.verify_ssl:
     description: "Verify TLS certificate"
     default: true

@@ -31,6 +31,23 @@
     "fetch_credential_defaults" => p("pve.fetch_credential_defaults", []),
   }
 
+  # SDN overlay knobs follow the additive omit-when-empty idiom: emit only
+  # when the operator supplies a non-default value so the Go config
+  # zero-values keep their documented defaults. sdn_auto_manage_zone above
+  # stays ALWAYS-emitted — an explicit false must reach the *bool field to
+  # defeat the turnkey default.
+  sdn_vxlan_peers = p("pve.sdn_vxlan_peers", [])
+  config["sdn_vxlan_peers"] = sdn_vxlan_peers unless sdn_vxlan_peers.empty?
+
+  sdn_vni_range_start = p("pve.sdn_vni_range_start", 0)
+  config["sdn_vni_range_start"] = sdn_vni_range_start unless sdn_vni_range_start.to_i.zero?
+
+  sdn_vni_range_end = p("pve.sdn_vni_range_end", 0)
+  config["sdn_vni_range_end"] = sdn_vni_range_end unless sdn_vni_range_end.to_i.zero?
+
+  sdn_zone_mtu = p("pve.sdn_zone_mtu", 0)
+  config["sdn_zone_mtu"] = sdn_zone_mtu unless sdn_zone_mtu.to_i.zero?
+
   # Emit pve_ca_cert only when the operator supplies a non-empty value. When
   # absent or empty (the default), the key is omitted so the Go config
   # zero-value ("") is preserved and TLS behavior is unchanged (system trust pool).
