@@ -16,10 +16,14 @@ The CPI reads configuration from a BOSH deployment manifest. The job template re
 | `pve.stemcell_storage` | Storage pool for stemcell qcow2 images. Must be a file-based PVE storage (`dir`, `nfs`, `cifs`, `glusterfs`, `cephfs`) — block-based storages (`lvm`, `lvmthin`, `zfspool`, `rbd`) cannot accept qcow2 uploads. Must also be shared across cluster nodes when the cluster has more than one node. Defaults to `vm_storage`; in that case `vm_storage` must satisfy the same constraints. | `""` (falls back to `vm_storage`) | no |
 | `pve.iso_storage` | Storage pool (`dir`, `nfs`, or `cifs` with `iso` content enabled) used for per-VM ConfigDrive ISOs in `cloudinit` agent mode. Block storages (`lvm`, `lvmthin`, `zfspool`) cannot hold ISO files. The default `local` value places ISOs on node-local storage and is readable by any user with PVE node access — see [ConfigDrive ISO storage](operations.md#configdrive-iso-storage) for the dedicated-pool recommendation. | `local` | no |
 | `pve.network_bridge` | Default Linux bridge for `create_vm` NIC attachment. Required regardless of `network_mode`. | `vmbr0` | no |
-| `pve.network_mode` | Network creation mode for managed networks. `sdn` — PVE SDN vnet lifecycle. `bridge` — Linux bridge lifecycle. `auto` — SDN when `cloud_properties.zone` or `pve.sdn_zone` is set; bridge otherwise. See [Network configuration](networks.md). | `auto` | no |
-| `pve.sdn_zone` | Default PVE SDN zone for vnet placement. When empty, the zone must be supplied per-call in `cloud_properties.zone`. See [Network configuration](networks.md). | `""` | no |
-| `pve.sdn_zone_type` | Zone type the CPI uses when creating a zone (`simple`, `vlan`, `qinq`, `vxlan`, `evpn`). Only relevant when `sdn_auto_manage_zone` is `true`. | `simple` | no |
-| `pve.sdn_auto_manage_zone` | When `true`, the CPI may create SDN zones on `create_network` and delete them on `delete_network` when all safety conditions are met. See [Network configuration](networks.md). | `false` | no |
+| `pve.network_mode` | Network creation mode for managed networks. `sdn` (default) — PVE SDN vnet lifecycle. `bridge` — Linux bridge lifecycle (opt-in, single-node). `auto` — legacy heuristic (opt-in): SDN when `cloud_properties.zone` or `pve.sdn_zone` is set; bridge otherwise. See [Network configuration](networks.md). | `sdn` | no |
+| `pve.sdn_zone` | Default PVE SDN zone for vnet placement. When empty and `sdn_auto_manage_zone` is on, the CPI uses the turnkey zone `bosh`, creating it on demand. See [Network configuration](networks.md). | `""` (→ turnkey zone `bosh`) | no |
+| `pve.sdn_zone_type` | Zone type the CPI uses when creating a zone. `vxlan` (default) — cluster-wide L2 overlay with peers derived from the online cluster nodes. `simple` — isolated per-node bridge (opt-in, single-node). `vlan`/`qinq` — tagged segments on an existing bridge (opt-in). `evpn` — never CPI-created; the operator pre-creates the zone and its controller and the CPI manages only vnets and subnets inside it. Only relevant when `sdn_auto_manage_zone` is `true`. | `vxlan` | no |
+| `pve.sdn_auto_manage_zone` | When `true` (default), the CPI may create SDN zones on `create_network` and delete them on `delete_network` when all safety conditions are met (EVPN zones are never created or deleted). Set `false` to keep zones operator-owned. See [Network configuration](networks.md). | `true` | no |
+| `pve.sdn_vxlan_peers` | Explicit VXLAN peer IPs for CPI-created vxlan zones. When empty (default), peers are derived from the online cluster nodes via `GET /cluster/status`. Set when tunnel traffic must ride a dedicated underlay whose addresses differ from the management IPs. | `[]` | no |
+| `pve.sdn_vni_range_start` | First tag of the VNI/VLAN auto-allocation band for vnets in tag-carrying zones (`vxlan`, `evpn`, `vlan`, `qinq`). `0` applies the built-in `5000`. Per-network override via `cloud_properties.vnet_tag`. | `0` (→ `5000`) | no |
+| `pve.sdn_vni_range_end` | Inclusive upper bound of the VNI/VLAN auto-allocation band. `0` applies the built-in `5999`. Must be ≥ `sdn_vni_range_start`; vlan/qinq allocation additionally caps at 4094. | `0` (→ `5999`) | no |
+| `pve.sdn_zone_mtu` | Explicit MTU for CPI-created SDN zones. `0` (default) lets PVE derive it from the underlay (1500 → 1450 for vxlan). Set only for unusual underlays, e.g. jumbo frames. Valid range 576–65520 when set. | `0` (→ PVE-derived) | no |
 | `pve.verify_ssl` | Verify the PVE API TLS certificate | `true` | no |
 | `pve.ca_cert` | Optional PEM-encoded CA certificate bundle for verifying the Proxmox VE API TLS certificate. When empty (default), the system trust pool is used — behavior is byte-identical to prior releases. When set, the PEM is parsed and the resulting cert pool is used for PVE API HTTPS verification. Ignored when `verify_ssl` is `false`. | `""` | no |
 | `pve.agent_mode` | Agent bootstrap mode. `cloudinit` — cloud-init bootstrap (default). `noagent` — no agent bootstrap. `auto` — always selects configdrive (registry-less) bootstrap for all stemcells. | `cloudinit` | no |
@@ -125,15 +129,17 @@ See [pve-api-permissions.md](pve-api-permissions.md) for token creation and the 
 
 When the Director's cloud-config marks a network as `managed: true`, the CPI calls `create_network` and `delete_network` to provision and remove the network resource. The CPI supports two backends: PVE SDN vnets and Linux bridges.
 
-### Prerequisites — SDN Mode
+### Prerequisites — SDN Mode (the default)
 
 1. PVE SDN must be enabled at the datacenter level. The **Datacenter > SDN** menu appears in PVE 7.2+ and requires `libpve-network-perl` on all cluster nodes.
 
-2. At least one SDN zone must exist before `create_network` is called, unless `sdn_auto_manage_zone: true` lets the CPI create it. The zone name must match `cloud_properties.zone` or `pve.sdn_zone`.
+2. The PVE API token or user must hold the `SDN.Allocate` privilege on `/sdn`. This is required by default now that SDN is the default network mode; only a `network_mode: bridge` opt-out avoids it.
 
-3. The PVE API token or user must hold the `SDN.Allocate` privilege on `/sdn`.
+3. A pre-existing SDN zone is required only when `sdn_auto_manage_zone: false` (the CPI never creates zones then) or when `sdn_zone_type: evpn` (EVPN zones and their controllers are always operator-created). With defaults, the CPI creates the turnkey vxlan zone `bosh` on demand.
 
-### Manifest Example — SDN Mode
+### Manifest Example — Turnkey VXLAN (the default)
+
+Nothing SDN-specific to configure — the defaults create the vxlan zone `bosh` with peers derived from the online cluster nodes:
 
 ```yaml
 properties:
@@ -145,10 +151,6 @@ properties:
     vm_storage: local-lvm
     disk_storage: local-lvm
     network_bridge: vmbr0
-    network_mode: sdn
-    sdn_zone: boshzone
-    sdn_zone_type: simple
-    sdn_auto_manage_zone: false
 ```
 
 Cloud-config managed network:
@@ -159,14 +161,30 @@ networks:
   type: manual
   managed: true
   cloud_properties:
-    zone: boshzone
     vnet: boshvn
   subnets:
   - range: 10.200.0.0/24
     gateway: 10.200.0.1
 ```
 
-### Manifest Example — Bridge Mode
+### Manifest Example — Simple Zone (opt-in)
+
+For a single node or a deliberately node-local segment:
+
+```yaml
+properties:
+  pve:
+    # ...connection basics as above...
+    network_mode: sdn
+    sdn_zone: boshzone
+    sdn_zone_type: simple
+```
+
+The vnet becomes an isolated per-node bridge; deployments spanning nodes need the vxlan default instead.
+
+### Manifest Example — Bridge Mode (opt-in)
+
+The legacy non-SDN path, retained for single-node setups without `libpve-network-perl`:
 
 ```yaml
 properties:
@@ -197,7 +215,7 @@ networks:
 
 - SDN changes are staged by the PVE API and committed by the CPI via a `PUT /cluster/sdn` apply call after each create or delete operation. This is PVE's two-phase commit model. On error, the CPI issues a rollback to clear staged-but-unapplied changes.
 
-- Zone auto-deletion (`sdn_auto_manage_zone: true`) is opt-in and disabled by default. When enabled, `delete_network` removes the zone only when all three conditions hold: `sdn_auto_manage_zone` is `true`, the zone name does not match `pve.sdn_zone` (the operator-pinned default zone is never auto-deleted), and the zone has zero remaining vnets after the vnet is removed. Leave `sdn_auto_manage_zone: false` unless the CPI should own the full zone lifecycle.
+- Zone auto-management (`sdn_auto_manage_zone`) is on by default. `delete_network` removes the zone only when all four conditions hold: `sdn_auto_manage_zone` is `true`, the zone name does not match `pve.sdn_zone` (the operator-pinned default zone is never auto-deleted), the zone is not an EVPN zone (operator-owned fabric, never CPI-deleted), and the zone has zero remaining vnets after the vnet is removed. Set `sdn_auto_manage_zone: false` when the operator should own the full zone lifecycle.
 
 ## MBus Fallback
 

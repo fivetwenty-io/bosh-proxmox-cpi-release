@@ -1,16 +1,16 @@
 # Network Management
 
-This CPI supports two network backends for BOSH managed networks: PVE SDN vnets and Linux bridges. When a BOSH cloud-config marks a network as `managed: true`, the Director calls `create_network` to provision the resource and `delete_network` to remove it. All other networks — pre-configured bridges and static VLANs — use `managed: false`; the CPI never calls their lifecycle handlers.
+This CPI supports two network backends for BOSH managed networks: PVE SDN vnets (the default) and Linux bridges (opt-in). When a BOSH cloud-config marks a network as `managed: true`, the Director calls `create_network` to provision the resource and `delete_network` to remove it. All other networks — pre-configured bridges and static VLANs — use `managed: false`; the CPI never calls their lifecycle handlers.
 
 ## SDN vs Bridge Routing
 
 The handler selects a backend based on three inputs: the `network_mode` config property, the `zone` field in `cloud_properties`, and the `sdn_zone` CPI config property. The routing logic runs in this order:
 
-1. If `network_mode` is `"sdn"` → SDN path (unconditional; error if zone unresolvable).
+1. If `network_mode` is `"sdn"` (the default) → SDN path. When no zone is named anywhere and `sdn_auto_manage_zone` is enabled (its default), the CPI uses the turnkey zone `bosh`; with auto-manage disabled an unresolvable zone is an error.
 
-2. If `network_mode` is `"bridge"` → bridge path (unconditional; error if bridge unresolvable).
+2. If `network_mode` is `"bridge"` (opt-in) → bridge path (unconditional; error if bridge unresolvable).
 
-3. If `network_mode` is `"auto"` (the default):
+3. If `network_mode` is `"auto"` (opt-in; the legacy heuristic retained for compatibility):
    - If `cloud_properties.zone` is set OR `config.sdn_zone` is set OR `cloud_properties.vnet` is set → SDN path.
    - Otherwise → bridge path (requires `cloud_properties.bridge` or `config.network_bridge`).
 
@@ -20,12 +20,12 @@ The handler selects a backend based on three inputs: the `network_mode` config p
 
 | `network_mode` | `cloud_properties.zone` | `config.sdn_zone` | `cloud_properties.bridge` / `config.network_bridge` | Outcome |
 |---|---|---|---|---|
-| `sdn` | any | any | any | SDN path |
-| `bridge` | any | any | any | Bridge path |
-| `auto` | set | any | any | SDN path |
-| `auto` | empty | set | any | SDN path |
-| `auto` | empty | empty | set | Bridge path |
-| `auto` | empty | empty | empty | Error: no routing info |
+| `sdn` (default) | any | any | any | SDN path (turnkey zone `bosh` when no zone named and auto-manage on) |
+| `bridge` (opt-in) | any | any | any | Bridge path |
+| `auto` (opt-in) | set | any | any | SDN path |
+| `auto` (opt-in) | empty | set | any | SDN path |
+| `auto` (opt-in) | empty | empty | set | Bridge path |
+| `auto` (opt-in) | empty | empty | empty | Error: no routing info |
 
 > **Note:** `config.sdn_zone` is loaded into the same `zone` variable as `cloud_properties.zone` before routing runs; the table reflects the effective per-path outcome.
 
@@ -37,7 +37,7 @@ After `UpdateSdn` commits the SDN configuration, data-plane realization is async
 
 By default, `network_resolve_retries` is 0 (polling disabled); behavior is byte-identical to prior releases. External or static bridges such as `vmbr0` are never gated by this poll.
 
-For async zone types (vlan, vxlan, evpn), `UpdateSdn` may return a UPID. The CPI awaits the UPID task before the convergence poll begins, so subsequent `ListSdnVnets` calls observe committed state.
+For async zone types (vlan, vxlan, evpn), `UpdateSdn` may return a UPID. The CPI awaits the UPID task before the convergence poll begins, so subsequent `ListSdnVnets` calls observe committed state. With the vxlan default this UPID-await path is the normal path, not the exception.
 
 ## cloud_properties schema
 
@@ -45,9 +45,10 @@ These keys are read from the per-network `cloud_properties` block in the BOSH cl
 
 | Key | Type | Required | Meaning |
 |---|---|---|---|
-| `zone` | string | SDN path only, when `config.sdn_zone` is empty | PVE SDN zone name. Takes precedence over `config.sdn_zone`. |
-| `zone_type` | string | no | Zone type to use when the CPI creates the zone (requires `sdn_auto_manage_zone: true`). One of: `simple`, `vlan`, `qinq`, `vxlan`, `evpn`. Falls back to `config.sdn_zone_type` (default `simple`). For async zone types (vlan, vxlan, evpn), `UpdateSdn` is asynchronous; the CPI awaits the UPID task before polling SDN convergence. |
+| `zone` | string | no (turnkey zone `bosh` when omitted with auto-manage on) | PVE SDN zone name. Takes precedence over `config.sdn_zone`. Required only when `sdn_auto_manage_zone` is disabled. |
+| `zone_type` | string | no | Zone type to use when the CPI creates the zone (requires `sdn_auto_manage_zone`). One of: `simple`, `vlan`, `qinq`, `vxlan`, `evpn`. Falls back to `config.sdn_zone_type` (default `vxlan`). When the zone already exists, its actual PVE type governs vnet tagging regardless of this value. `evpn` zones must pre-exist — the CPI never creates them (see [EVPN zones](#zone-auto-management)). |
 | `vnet` | string | SDN path | PVE SDN vnet name. Must be 1–8 lowercase alphanumeric characters (regex `[a-z0-9]{1,8}`). Leading digits are allowed. |
+| `vnet_tag` | int | no | Explicit vnet tag (VNI for vxlan/evpn, VLAN ID for vlan/qinq; 1–16777215, capped at 4094 for vlan/qinq). When omitted on a tagged zone type, the CPI auto-allocates from the `sdn_vni_range` band (default 5000–5999). Invalid on `simple` zones. |
 | `bridge` | string | Bridge path only, when `config.network_bridge` is empty | Linux bridge interface name on the target node (e.g. `vmbr1`). |
 | `node` | string | Bridge path only, when `config.node` is empty | PVE node where the bridge is created or deleted. |
 
@@ -57,23 +58,37 @@ PVE enforces a strict naming constraint on vnet identifiers: a vnet name must be
 
 ## Zone auto-management
 
-By default (`sdn_auto_manage_zone: false`), the CPI manages only vnets and subnets within an existing zone. The operator creates and deletes zones through the PVE UI or API. If `create_network` is called with a zone that does not exist in PVE, the CPI returns an error.
+By default (`sdn_auto_manage_zone: true`), the CPI owns the zone lifecycle: `create_network` creates the zone when it is absent and `delete_network` removes it when its last vnet goes. Setting `sdn_auto_manage_zone: false` keeps zones operator-owned — the CPI manages only vnets and subnets within an existing zone, and `create_network` against a missing zone returns an error directing the operator to create it.
 
-When `sdn_auto_manage_zone: true`, the CPI creates and deletes zones autonomously:
+**Auto-create:** If the zone named in `cloud_properties.zone` or `config.sdn_zone` does not exist in PVE at `create_network` time, the CPI creates it using the zone type from `cloud_properties.zone_type` or `config.sdn_zone_type` (default `vxlan`). When no zone is named anywhere, the CPI uses the fixed turnkey name `bosh` — beyond that single well-known default it never invents zone names, so repeat deployments converge on one CPI-owned zone. A vxlan zone is created with its peer list and optional MTU (see [VXLAN overlay defaults](#vxlan-overlay-defaults-peers-vnis-and-mtu)); a vlan zone is created with `config.network_bridge` as its underlay bridge.
 
-**Auto-create:** If the zone named in `cloud_properties.zone` or `config.sdn_zone` does not exist in PVE at `create_network` time, the CPI creates it using the zone type from `cloud_properties.zone_type` or `config.sdn_zone_type` (default `simple`). A name must always be supplied — the CPI never invents zone names.
+**Auto-delete:** At `delete_network` time, the CPI removes the parent zone only when **all four** conditions hold:
 
-**Auto-delete:** At `delete_network` time, the CPI removes the parent zone only when **all three** conditions hold:
+1. `sdn_auto_manage_zone` is enabled.
 
-1. `sdn_auto_manage_zone` is `true`.
+2. The zone name does not match `config.sdn_zone` (the operator-pinned zone is never auto-deleted; it may be shared across multiple managed networks). The turnkey zone `bosh` is deliberately not pinned — the CPI created it, so removing it when empty is correct turnkey hygiene.
 
-2. The zone name does not match `config.sdn_zone` (the operator-pinned zone is never auto-deleted; it may be shared across multiple managed networks).
+3. The zone is not an EVPN zone (see below).
 
-3. The zone has zero remaining vnets after the vnet is removed (confirmed by listing vnets filtered by zone before deleting).
+4. The zone has zero remaining vnets after the vnet is removed (confirmed by listing vnets filtered by zone before deleting).
 
-If any condition fails, the zone is left in place. A list failure during the zone-empty check skips deletion instead of returning an error. Zone name comparison is case-insensitive.
+If any condition fails, the zone is left in place. A list failure during the zone-empty check — or a failure to read the zone type — skips deletion instead of returning an error. Zone name comparison is case-insensitive.
+
+**EVPN zones:** the CPI never creates or deletes EVPN zones. An EVPN fabric — the zone, its BGP controller, route reflectors, and exit nodes — is operator infrastructure. `create_network` against an absent EVPN zone fails fast with instructions to create the zone and controller in PVE (Datacenter → SDN); once the zone exists, the CPI manages vnets and subnets inside it exactly as for any other zone type.
 
 **PVE constraint:** The SDN zone create API (`POST /cluster/sdn/zones`) does not accept description, notes, or comment fields. CPI-owned zones are not annotated in PVE; which zones belong to the CPI is tracked through the stateless config rule (condition 2 above).
+
+## VXLAN overlay defaults: peers, VNIs, and MTU
+
+The vxlan default builds a cluster-wide L2 overlay with three knobs, all optional:
+
+**Peers.** A vxlan zone needs the list of node IPs that terminate its tunnels. The CPI derives it from the online cluster nodes (`GET /cluster/status`) at zone-create time; `pve.sdn_vxlan_peers` overrides the derivation when tunnel traffic must ride a dedicated underlay network whose addresses differ from the management IPs. Zero derivable peers is a hard error — PVE would accept the zone, but no tunnel would ever come up. A node that is offline at zone-create time is omitted; re-apply the zone with explicit peers (or recreate the network) once it returns.
+
+**VNIs.** Every vnet in a vxlan or evpn zone carries a VXLAN Network Identifier, and every vnet in a vlan or qinq zone carries a VLAN ID — PVE requires the tag; it is the segment identity on the wire. The CPI auto-allocates from the `pve.sdn_vni_range_start`/`_end` band (default 5000–5999, random entry point, collision-checked against all existing vnets including pending ones). `cloud_properties.vnet_tag` pins an explicit value per network. vlan/qinq tags cap at 4094; the CPI clamps the band and rejects explicit values above the cap before calling PVE.
+
+**MTU.** VXLAN encapsulation spends roughly 50 bytes per frame on outer headers (EVPN pays the same tax). PVE derives the vnet MTU from the underlay automatically — a 1500-byte underlay yields 1450-byte vnets — and the CPI hands every virtio NIC attached to an SDN vnet `mtu=1`, which means "inherit the bridge MTU", so guests never emit an oversized frame. `pve.sdn_zone_mtu` overrides the derivation for unusual underlays; leave it unset otherwise. Jumbo frames work the same way: a 9000-byte underlay on every node's physical path yields 8950-byte overlay MTU (set `sdn_zone_mtu: 8950` explicitly if PVE cannot derive it). Mixed underlay MTUs across nodes are the failure mode to avoid — the overlay MTU must fit the smallest underlay everywhere. The failure signature and probe commands are in [Troubleshooting — SDN MTU](troubleshooting.md#small-packets-pass-large-packets-hang-sdn-mtu).
+
+Firewall prerequisite: VXLAN tunnels run node-to-node over UDP 4789; EVPN additionally needs TCP 179 (BGP) between nodes and controllers. See [Operations — SDN VXLAN operations](operations.md#sdn-vxlan-operations).
 
 ### Rollback on partial create
 
@@ -83,9 +98,9 @@ The rollback itself calls `applySDN` to commit the staged deletions, because eve
 
 ## Manifest examples
 
-### Example 1 — SDN with managed zone
+### Example 1 — Turnkey VXLAN (the default)
 
-The CPI manages the zone lifecycle. The zone `boshzone` is created on first `create_network` call and deleted when the last vnet in it is removed.
+Nothing to opt into: with defaults, the CPI builds a cluster-wide vxlan overlay on the first `create_network` call and tears it down when the last vnet is removed. Only the connection basics appear in the manifest.
 
 BOSH manifest CPI properties:
 
@@ -99,10 +114,6 @@ properties:
     vm_storage: local-lvm
     disk_storage: local-lvm
     network_bridge: vmbr0
-    network_mode: sdn
-    sdn_zone: boshzone
-    sdn_zone_type: simple
-    sdn_auto_manage_zone: true
 ```
 
 Cloud-config managed network:
@@ -116,25 +127,39 @@ networks:
   - range: 10.200.0.0/24
     gateway: 10.200.0.1
     cloud_properties:
-      zone: boshzone
       vnet: boshvn
 ```
 
 The CPI will:
 
-1. Check whether zone `boshzone` exists and create it (type `simple`) if absent.
+1. Check whether the turnkey zone `bosh` exists and create it (type `vxlan`) if absent, with peers derived from the online cluster nodes and MTU derived by PVE from the underlay.
 
-2. Create vnet `boshvn` in zone `boshzone` (idempotent on conflict).
+2. Create vnet `boshvn` in zone `bosh` (idempotent on conflict), with a VNI auto-allocated from the 5000–5999 band.
 
 3. Create subnet `10.200.0.0/24` with gateway `10.200.0.1` on the vnet.
 
-4. Apply the SDN configuration (`PUT /cluster/sdn`).
+4. Apply the SDN configuration (`PUT /cluster/sdn`) and await the returned task to completion — vxlan zones apply asynchronously.
 
-5. Return network CID `boshvn`, address properties, and `cloud_properties` containing `zone`, `vnet`, and `bridge` (all set to `boshvn`, since PVE simple-zone vnets are realized as a Linux bridge of the same name).
+5. Return network CID `boshvn`, address properties, and `cloud_properties` containing `zone`, `vnet`, and `bridge` (`vnet` and `bridge` both `boshvn`, since PVE realizes every vnet as a Linux bridge of the same name on each node, for all zone types).
 
-### Example 2 — Bridge fallback
+### Example 1b — Simple zone (opt-in)
 
-No SDN required. The CPI creates a Linux bridge on the target node.
+For a single node — or a deliberately node-local segment — opt into a simple zone. The vnet becomes an isolated per-node bridge with no cross-node reach; do not use this for deployments that span nodes.
+
+```yaml
+properties:
+  pve:
+    # ...connection basics as above...
+    network_mode: sdn
+    sdn_zone: boshzone
+    sdn_zone_type: simple
+```
+
+The sequence is the same, minus the vxlan specifics: the zone is created as type `simple`, the vnet carries no tag, and the apply is synchronous.
+
+### Example 2 — Bridge (opt-in)
+
+The legacy path, retained as an explicit opt-in: no SDN required, and the CPI creates a Linux bridge on the target node. The bridge exists only on that node, so this suits single-node setups only. Set `network_mode: bridge` (or `auto` with a per-network `bridge` cloud property and no zone/vnet).
 
 BOSH manifest CPI properties:
 
@@ -183,16 +208,16 @@ The routing and provisioning sequence is shown below. Phase labels correspond to
 ```mermaid
 flowchart TD
     A([create_network called]) --> B{network_mode?}
-    B -->|sdn| C[SDN path]
-    B -->|bridge| D[Bridge path]
-    B -->|auto| E{zone or sdn_zone set?}
+    B -->|sdn — the default| C[SDN path]
+    B -->|bridge — opt-in| D[Bridge path]
+    B -->|auto — opt-in heuristic| E{zone or sdn_zone set?}
     E -->|yes| C
     E -->|no| F{vnet set?}
     F -->|yes| C
     F -->|no| G{bridge set?}
     G -->|yes| D
     G -->|no| H([CloudError: no routing info])
-    C --> I[Phase 1: resolve/create zone]
+    C --> I[Phase 1: resolve/create zone<br/>turnkey zone bosh, type vxlan, when none named]
     I --> J[Phase 2: create vnet — idempotent]
     J --> K[Phase 3: create subnet if range present]
     K --> L[Phase 4: UpdateSdn / await UPID]
@@ -209,7 +234,7 @@ flowchart TD
 
 ## delete_network
 
-PVE requires subnets to be deleted before the parent vnet can be deleted. The CPI deletes all subnets for the vnet first, then the vnet, then calls `UpdateSdn` (awaiting the UPID for async zone types), then conditionally removes the parent zone subject to the three-condition guard described in [Zone auto-management](#zone-auto-management).
+PVE requires subnets to be deleted before the parent vnet can be deleted. The CPI deletes all subnets for the vnet first, then the vnet, then calls `UpdateSdn` (awaiting the UPID for async zone types), then conditionally removes the parent zone subject to the four-condition guard described in [Zone auto-management](#zone-auto-management).
 
 Every `ErrSDNNotFound` response during deletion is swallowed, making the function idempotent across repeated or concurrent invocations.
 
@@ -218,6 +243,14 @@ Every `ErrSDNNotFound` response during deletion is swallowed, making the functio
 For deploy testing — especially CloudFoundry, where dozens of VMs are placed at once — never share an L2 segment with unmanaged devices. If the deployment subnet overlaps a physical office or lab LAN, an address BOSH assigns to a VM can collide with a device already using it. Two MACs then answer ARP, the Director's ARP cache flaps, mbus packets are misdelivered, and agents loop `connection reset by peer` → reconnect, failing random instances with `Timed out sending 'get_state'`. See [Troubleshooting — duplicate IP on a shared LAN](troubleshooting.md#agent-never-comes-up).
 
 This repo ships a turnkey isolated network as a PVE SDN **simple** zone + vnet + subnet on a private `172.x` range. Selecting it moves both the Director and the deployment onto a network BOSH fully owns, so no foreign device can claim an address.
+
+The simple zone here is a deliberate opt-in: this lab runs on a single PVE node, where an isolated per-node bridge with SNAT is exactly the right shape, and the CPI's default vxlan overlay would add encapsulation for no reach benefit. On a multi-node cluster the default already gives us the isolated segment — cluster-wide — with nothing to configure:
+
+```yaml
+# Multi-node equivalent: omit zone/zone_type entirely; the CPI creates the
+# turnkey vxlan zone "bosh" and the vnet spans every node.
+cloud_properties: { vnet: cpitest0 }
+```
 
 ```bash
 # 1. Create the SDN zone + vnet + subnet + host-firewall allowance (idempotent).

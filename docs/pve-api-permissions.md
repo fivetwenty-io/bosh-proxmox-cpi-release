@@ -17,7 +17,7 @@ The `PVE_TOKEN` here is an admin token used **only for the one-time setup**. The
 
 | Path | User | Token | Blast radius | When to use |
 |---|---|---|---|---|
-| Minimum privilege (recommended) | `bosh@pve` (custom role `BoshOperator`) | `bosh@pve!<id>`, `privsep=0` | Bounded by `BoshOperator` ACL on `/`, `/vms`, and the configured storage paths | Production, shared clusters, any deployment that outlives the lab |
+| Minimum privilege (recommended) | `bosh@pve` (custom role `BoshOperator`) | `bosh@pve!<id>`, `privsep=0` | Bounded by `BoshOperator` ACL on `/`, `/vms`, `/sdn`, and the configured storage paths | Production, shared clusters, any deployment that outlives the lab |
 | Quick-start | `root@pam` | `root@pam!<id>`, `privsep=0` | Full datacenter administrator | Throwaway lab where the BOSH director already shares trust boundary with the cluster |
 
 Both paths produce a usable token. The minimum-privilege path is recommended everywhere except short-lived labs because the `root@pam` token with `privsep=0` is equivalent to handing the BOSH director full datacenter administration. The quick-start path is documented in [pve-settings.md §3](pve-settings.md#3-disable-privilege-separation-on-the-api-token).
@@ -29,7 +29,7 @@ Derived from the API endpoint inventory under `src/pve_cpi/internal/cpi/handlers
 
 | Privilege | ACL path | CPI methods (handler file) |
 |---|---|---|
-| `Sys.Audit` | `/` | All `info`, `has_vm`, `has_disk`, task polling, `GET /cluster/status`, `/cluster/resources`, `/cluster/storage`, `/cluster/config/nodes`, `/nodes` (most handlers); HA-rule reads (`GET /cluster/ha/rules`, `/cluster/ha/resources`) when HA placement is enabled |
+| `Sys.Audit` | `/` | All `info`, `has_vm`, `has_disk`, task polling, `GET /cluster/status` (also feeds VXLAN peer derivation for CPI-created zones), `/cluster/resources`, `/cluster/storage`, `/cluster/config/nodes`, `/nodes` (most handlers); HA-rule reads (`GET /cluster/ha/rules`, `/cluster/ha/resources`) when HA placement is enabled |
 | `VM.Allocate` | `/vms` | `create_vm.go`, `delete_vm.go` (`POST /nodes/{n}/qemu`, `DELETE /nodes/{n}/qemu/{vmid}`) |
 | `VM.Audit` | `/vms` | `has_vm.go`, `get_disks.go`, `has_disk.go`, `reboot_vm.go` (`GET /nodes/{n}/qemu/{vmid}/status/current` power-state pre-check), every config-read path (`GET /nodes/{n}/qemu/{vmid}/config`) |
 | `VM.Config.Disk` | `/vms` | `attach_disk.go`, `detach_disk.go`, `update_disk.go`, `resize_disk.go`, `create_disk.go`, `delete_disk.go` |
@@ -42,13 +42,13 @@ Derived from the API endpoint inventory under `src/pve_cpi/internal/cpi/handlers
 | `Datastore.AllocateSpace` | same four storage paths | `create_disk.go`, `create_vm.go` (`import-from=<storage>:import/...` disk allocation) |
 | `Datastore.AllocateTemplate` | `stemcell_storage`, `iso_storage` | `create_stemcell.go` (`POST .../upload` with `content=import`), ConfigDrive ISO upload (`content=iso`) |
 | `Datastore.Audit` | same four storage paths | `create_stemcell.go`, `get_disks.go`, `has_disk.go` (list/check volume) |
-| `SDN.Allocate` | `/sdn` | `create_network.go`, `delete_network.go`, `create_vm.go` (`advertised_routes` subnet injection) — required when `network_mode: sdn` or `advertised_routes` is used |
+| `SDN.Allocate` | `/sdn` | `create_network.go`, `delete_network.go` (zone create/delete check it on `/sdn/zones` and `/sdn/zones/{zone}`, covered by a propagated `/sdn` grant), `create_vm.go` (`advertised_routes` subnet injection) — required by default (`network_mode: sdn`); only a `network_mode: bridge` opt-out avoids it |
 | `Sys.Console` | `/` | HA-rule writes — `POST`/`DELETE /cluster/ha/resources`, `POST`/`DELETE /cluster/ha/rules` driven by `placement.pin_az_via_ha_rules`, `anti_affinity.use_ha_rules`, and DLB (`placement.dlb` configured) — see note below |
 | `Pool.Allocate` | `/pool/<poolid>` | `cluster_lock.go` (`POST`/`DELETE /pools` — create/delete sentinel pools `bosh-lock-*` when `cluster_lock_mode: pool`), `create_stemcell.go` (`PUT /pools/{poolid}` via `AddVM` — assign the template VM to `pve.stemcell_template_pool` when set) — opt-in, only when one of these two features is enabled |
 | `Pool.Audit` | `/pool/<poolid>` | `GetPoolComment` (`GET /pools`/`GET /pools/{poolid}`) — pool-existence and comment reads backing the same two opt-in features above |
 | `Sys.Modify` | `/` | `placement_dlb.go` (`PUT /cluster/options` setting `crs=ha=dynamic,...`) — opt-in, only when `placement.dlb.manage_cluster_crs: true`; when false (default) the CPI only reads `/cluster/options` (`Sys.Audit`, already granted) and logs a warning instead of writing |
 
-**`SDN.Allocate` note:** only required when the CPI manages SDN objects. Deployments that use pre-existing bridges or that never call `create_network`/`delete_network` and set no `advertised_routes` do not need this privilege. Grant it on `/sdn`:
+**`SDN.Allocate` note:** required by default — SDN is the default network mode, and with defaults the CPI creates and deletes the turnkey vxlan zone, its vnets, and subnets, all gated on `SDN.Allocate` (the zone endpoints check it on `/sdn/zones` and `/sdn/zones/{zone}`, which a propagated `/sdn` grant covers). Only deployments that opt out with `network_mode: bridge`, never mark a network `managed: true`, and set no `advertised_routes` can omit this privilege. Grant it on `/sdn`:
 
 ```bash
 curl -sk -X PUT -H "Authorization: $PVE_TOKEN" \
@@ -111,7 +111,7 @@ UI:
 
 2. Name: `BoshOperator`.
 
-3. Privileges: select `VM.Allocate`, `VM.Audit`, `VM.Config.Disk`, `VM.Config.Network`, `VM.Config.Options`, `VM.Config.Cloudinit`, `VM.PowerMgmt`, `VM.Snapshot`, `Datastore.Allocate`, `Datastore.AllocateSpace`, `Datastore.AllocateTemplate`, `Datastore.Audit`, `SDN.Allocate` (if using SDN features), `Sys.Console` (if using HA placement features or DLB), `Pool.Allocate` and `Pool.Audit` (if using `cluster_lock_mode: pool` or `stemcell_template_pool`), and `Sys.Modify` (if using `placement.dlb.manage_cluster_crs`).
+3. Privileges: select `VM.Allocate`, `VM.Audit`, `VM.Config.Disk`, `VM.Config.Network`, `VM.Config.Options`, `VM.Config.Cloudinit`, `VM.PowerMgmt`, `VM.Snapshot`, `Datastore.Allocate`, `Datastore.AllocateSpace`, `Datastore.AllocateTemplate`, `Datastore.Audit`, `SDN.Allocate` (required by default; omit only for a `network_mode: bridge` opt-out), `Sys.Console` (if using HA placement features or DLB), `Pool.Allocate` and `Pool.Audit` (if using `cluster_lock_mode: pool` or `stemcell_template_pool`), and `Sys.Modify` (if using `placement.dlb.manage_cluster_crs`).
 
 4. Create.
 
@@ -125,11 +125,11 @@ curl -sk -X POST -H "Authorization: $PVE_TOKEN" \
   https://$PVE_HOST/api2/json/access/roles
 ```
 
-If your deployment does not use SDN features (`network_mode: bridge` only, no `advertised_routes`), HA placement features or DLB (`pin_az_via_ha_rules: false`, `use_ha_rules: false`, no `placement.dlb`), resource pools (`cluster_lock_mode: pool` unset, `stemcell_template_pool` unset), or CPI-managed cluster CRS (`placement.dlb.manage_cluster_crs: false`/unset), you may omit `SDN.Allocate`, `Sys.Console`, `Pool.Allocate`/`Pool.Audit`, and `Sys.Modify`, respectively. The minimum required set for a bridge-only deployment without HA placement, DLB, or pools is `VM.*,Datastore.*` as listed in the privilege table above. Note that `delete_vm`'s `skiplock` flag is separate from this role: it is gated on the `root@pam` user, not on any privilege (see the `delete_vm` note above), so granting `BoshOperator` does not enable it.
+`SDN.Allocate` belongs in the default grant — SDN is the default network mode. If your deployment explicitly opts out with `network_mode: bridge` (and no `advertised_routes`), does not use HA placement features or DLB (`pin_az_via_ha_rules: false`, `use_ha_rules: false`, no `placement.dlb`), resource pools (`cluster_lock_mode: pool` unset, `stemcell_template_pool` unset), or CPI-managed cluster CRS (`placement.dlb.manage_cluster_crs: false`/unset), you may omit `SDN.Allocate`, `Sys.Console`, `Pool.Allocate`/`Pool.Audit`, and `Sys.Modify`, respectively. The minimum set for that documented bridge-only opt-out without HA placement, DLB, or pools is `VM.*,Datastore.*` as listed in the privilege table above. Note that `delete_vm`'s `skiplock` flag is separate from this role: it is gated on the `root@pam` user, not on any privilege (see the `delete_vm` note above), so granting `BoshOperator` does not enable it.
 
 ### 3c. Grant ACLs
 
-Four ACL grants are always needed — cluster-wide audit, VM operations, and one storage grant per configured storage pool — plus two conditional grants (root-path, resource pool) that apply only when the corresponding opt-in feature is used.
+Five ACL grants are needed with defaults — cluster-wide audit, VM operations, SDN, and one storage grant per configured storage pool — plus two conditional grants (root-path, resource pool) that apply only when the corresponding opt-in feature is used. The SDN grant drops out only for a `network_mode: bridge` opt-out.
 
 UI (repeat for each row below):
 
@@ -150,7 +150,7 @@ UI (repeat for each row below):
 | `/` | `PVEAuditor` | Built-in role; grants `Sys.Audit` cluster-wide |
 | `/` | `BoshOperator` | Required for `Sys.Console` (HA-rule management) — only if using HA placement features or DLB; also required for `Sys.Modify` (`PUT /cluster/options`) — only if `placement.dlb.manage_cluster_crs: true` |
 | `/vms` | `BoshOperator` | All VM and disk mutation |
-| `/sdn` | `BoshOperator` | Required for `SDN.Allocate` — only when `network_mode: sdn` or `advertised_routes` is used |
+| `/sdn` | `BoshOperator` | Required for `SDN.Allocate` — needed by default (`network_mode: sdn`); omit only for a `network_mode: bridge` opt-out with no `advertised_routes` |
 | `/storage/<vm_storage>` | `BoshOperator` | From `pve.vm_storage` |
 | `/storage/<disk_storage>` | `BoshOperator` | From `pve.disk_storage` |
 | `/storage/<stemcell_storage>` | `BoshOperator` | From `pve.stemcell_storage` (defaults to `vm_storage`) |
@@ -188,7 +188,8 @@ curl -sk -X PUT -H "Authorization: $PVE_TOKEN" \
   -d 'propagate=1' \
   https://$PVE_HOST/api2/json/access/acl
 
-# SDN — required for network_mode: sdn and advertised_routes.
+# SDN — required by default (network_mode: sdn); omit only for a
+# network_mode: bridge opt-out with no advertised_routes.
 curl -sk -X PUT -H "Authorization: $PVE_TOKEN" \
   --data-urlencode 'path=/sdn' \
   --data-urlencode 'users=bosh@pve' \
