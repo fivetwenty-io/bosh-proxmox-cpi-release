@@ -510,7 +510,7 @@ pvesh get /nodes/<node>/network | jq '.[] | select(.type == "bridge")'
 
 **Symptom**
 
-PVE returns 404 or "Zone not found" when the CPI attempts to create a network.
+PVE returns 404 or "Zone not found" when the CPI attempts to create a network, or the CPI's own error says the zone does not exist.
 
 **Diagnosis**
 
@@ -521,7 +521,75 @@ pvesh get /cluster/sdn/vnets
 
 **Fix**
 
-When using `pve.network_mode: sdn`, the SDN zone referenced by `pve.sdn_zone` must exist before deployment. Create it in the PVE web UI or enable `pve.sdn_auto_manage_zone: true` to let the CPI manage it. Ensure `libpve-network-perl` is installed on all cluster nodes and the token has `SDN.Allocate` on `/sdn`. See [Configuration — SDN network management](configuration.md#sdn-network-management) and [create_network](cpi_methods.md#create_network).
+With defaults the CPI creates zones itself (the turnkey vxlan zone `bosh` when no zone is named), so this error means one of three things:
+
+1. Zone auto-management was disabled (`pve.sdn_auto_manage_zone: false`) and the zone named by `pve.sdn_zone` or `cloud_properties.zone` was never created. Create it in the PVE web UI, or re-enable auto-management.
+
+2. `sdn_zone_type: evpn` is in use and the EVPN zone is missing. The CPI never creates EVPN zones — the operator creates the zone and its controller (BGP peering, route reflectors) in PVE first; the CPI then manages only vnets and subnets inside it.
+
+3. SDN itself is unavailable: `libpve-network-perl` is not installed on every cluster node, or the token lacks `SDN.Allocate` on `/sdn` — required by default now that SDN is the default network mode.
+
+See [Configuration — SDN network management](configuration.md#sdn-network-management) and [create_network](cpi_methods.md#create_network).
+
+### Small packets pass, large packets hang (SDN MTU)
+
+**Symptom**
+
+SSH connects and pings succeed, but bulk transfers stall: `bosh ssh` works while `bosh scp` hangs, agents connect to NATS but blobstore downloads time out, HTTP requests hang after the headers. Cross-node only; same-node VM pairs are unaffected.
+
+This is the PMTUD-blackhole signature of an MTU mismatch on a VXLAN overlay: small frames fit inside the encapsulated path, large frames are dropped silently instead of returning "fragmentation needed".
+
+**Diagnosis**
+
+From a guest, probe the path MTU with the don't-fragment bit. On a healthy 1500-byte underlay the overlay MTU is 1450, so the largest passing ICMP payload is 1422 (1450 − 28):
+
+```bash
+ping -M do -s 1422 <peer-vm-ip>   # must pass
+ping -M do -s 1472 <peer-vm-ip>   # must fail cleanly with "message too long"
+```
+
+A hang (not a clean failure) on the second probe, or a failure on the first, confirms the blackhole. Then compare bridge and guest MTUs on both nodes:
+
+```bash
+ip -d link show <vnet>            # on each PVE node — expect 1450
+ip link show eth0                 # in each guest — must match the vnet MTU
+```
+
+**Fix**
+
+VXLAN encapsulation spends roughly 50 bytes per frame, so the overlay MTU must be the smallest underlay MTU minus that tax — everywhere. The usual causes:
+
+1. Mixed underlay MTUs across nodes: one node's physical path runs 1500 while another runs 9000, or a switch in between clamps lower. The overlay must fit the smallest underlay on every node-to-node path.
+
+2. A manual MTU override: `pve.sdn_zone_mtu` (or a hand-edited zone) set higher than the underlay affords. Unset it and let PVE derive the value, or set it to smallest-underlay − 50.
+
+3. A guest that does not inherit the bridge MTU: the CPI sets `mtu=1` on virtio NICs so guests inherit automatically, but non-virtio NIC models and hand-configured guests keep 1500. Use virtio NICs or set the guest interface MTU to match the vnet.
+
+4. A middlebox dropping fragments or ICMP "fragmentation needed" between nodes, which turns a recoverable mismatch into a silent blackhole.
+
+See [Networks — VXLAN overlay defaults](networks.md#vxlan-overlay-defaults-peers-vnis-and-mtu) for the MTU model and [Operations — SDN VXLAN operations](operations.md#sdn-vxlan-operations) for the verification commands.
+
+### Cross-node VM traffic dead, same-node fine (VXLAN)
+
+**Symptom**
+
+Two VMs on the same PVE node communicate normally over a CPI-created vnet; the same pair split across nodes cannot pass any traffic at all — not even ARP or small pings (which distinguishes this from the MTU entry above, where small packets pass).
+
+**Diagnosis**
+
+VXLAN tunnels run node-to-node over UDP 4789. Verify the port is open between all cluster nodes (or all addresses listed in `pve.sdn_vxlan_peers`):
+
+```bash
+# On a PVE node — is anything arriving from the peer?
+tcpdump -ni <underlay-iface> udp port 4789
+
+# Are the peers configured on the zone?
+pvesh get /cluster/sdn/zones --pending 1
+```
+
+**Fix**
+
+Open UDP 4789 between all cluster nodes in every firewall on the path (PVE host firewall, switch ACLs, external firewalls). If the zone's peer list is stale — for example a node was offline when the CPI created the zone — set `pve.sdn_vxlan_peers` explicitly and recreate the network, or edit the zone's peer list in PVE and re-apply. See [Operations — SDN VXLAN operations](operations.md#sdn-vxlan-operations).
 
 ## Agent never comes up
 

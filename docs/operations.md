@@ -185,10 +185,46 @@ The default `MAX_WORKERS` is 3 for both daemons. For Cloud Foundry-class deploys
 ip link show vmbr0                               # bridge exists and is UP
 pvesh get /nodes/<node>/network                  # PVE-side network config
 
-# SDN (when using network_mode: sdn)
+# SDN (the default network mode)
 pvesh get /cluster/sdn/vnets
 pvesh get /cluster/sdn/zones
 ```
+
+### SDN VXLAN operations
+
+With the vxlan default, the CPI creates the turnkey zone `bosh` on first `create_network` and every vnet inside it is a cluster-wide overlay segment. The commands below inspect and verify that fabric.
+
+```bash
+# Zone and vnet state, including pending (staged, unapplied) changes.
+pvesh get /cluster/sdn/zones --pending 1
+pvesh get /cluster/sdn/vnets --pending 1
+pvesh get /cluster/sdn/vnets/<vnet>/subnets
+
+# Commit staged SDN changes by hand (the CPI does this itself and awaits
+# the task; manual apply is for recovering from an interrupted operator edit).
+pvesh set /cluster/sdn
+
+# Per-node realization: every vnet becomes a same-named bridge on each node.
+ip -d link show <vnet>          # shows the bridge and its derived MTU
+bridge fdb show | grep 4789     # VXLAN forwarding entries toward peer nodes
+```
+
+Firewall prerequisites between all cluster nodes (and any dedicated underlay interfaces named in `pve.sdn_vxlan_peers`):
+
+- UDP 4789 node-to-node — the VXLAN tunnel itself. Blocked 4789 leaves same-node VM traffic working and cross-node traffic dead; see [Troubleshooting — cross-node VXLAN](troubleshooting.md#cross-node-vm-traffic-dead-same-node-fine-vxlan).
+
+- TCP 179 (BGP) — only for opt-in EVPN zones, between nodes and their route reflectors/controllers. The EVPN controller and its peering are operator infrastructure; the CPI never creates them. See the PVE SDN documentation for route-reflector topology.
+
+MTU verification — the overlay MTU must be the underlay MTU minus roughly 50 bytes of VXLAN encapsulation (PVE derives 1450 from a 1500 underlay automatically, and the CPI hands each virtio NIC `mtu=1` so guests inherit it):
+
+```bash
+ip -d link show <vnet>                 # expect 1450 on a 1500 underlay
+# From a guest: largest non-fragmenting payload on a 1450 path is 1422.
+ping -M do -s 1422 <peer-vm-ip>        # must pass
+ping -M do -s 1472 <peer-vm-ip>        # must fail with "message too long"
+```
+
+If small packets pass and large packets hang instead of failing cleanly, see [Troubleshooting — SDN MTU](troubleshooting.md#small-packets-pass-large-packets-hang-sdn-mtu).
 
 ---
 
