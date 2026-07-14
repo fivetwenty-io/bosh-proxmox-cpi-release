@@ -348,8 +348,8 @@ Per-call always wins. Global config is the lowest-precedence layer.
 |---|---|---|---|
 | `pve.disk_performance.iothread` | Boolean | `true` | Enables the PVE `iothread` option on every disk. Reduces contention on the QEMU main loop. Applicable to `virtio-scsi-single` and `virtio-blk` buses; ignored on `ide`/`sata`. Overridden per disk by `cloud_properties.iothread`. Default `true` (earlier releases left it unset/off); set `false` to restore the off default. Create/attach-time bake only — see the note below the table. |
 | `pve.disk_performance.cache` | String | unset | Default PVE disk cache mode. Valid values: `none`, `writethrough`, `writeback`, `unsafe`, `directsync`. `writeback` suits most workloads; `none` is required for data safety on Ceph/RBD. |
-| `pve.disk_performance.discard` | Boolean | unset | Passes `discard=on` to every disk, enabling TRIM/UNMAP passthrough. Effective only on thin-provisioned backends (`lvmthin`, `zfspool`, `rbd`). |
-| `pve.disk_performance.ssd` | Boolean | unset | Marks every disk as SSD-backed (`rotation=0` in the guest). Signals to the guest OS that the device is solid-state. |
+| `pve.disk_performance.discard` | Tri-state (`true`\|`false`\|unset) | unset (→ auto) | Passes `discard=on` to a disk, enabling TRIM/UNMAP passthrough. `true`/`false` force the value on or off regardless of storage backend. Unset (default) auto-resolves per disk from the actual resolved storage pool's TRIM capability — see [Discard/SSD auto-resolution](#discardssd-auto-resolution) below. Overridden per disk by `cloud_properties.discard` (same three states). |
+| `pve.disk_performance.ssd` | Tri-state (`true`\|`false`\|unset) | unset (→ auto) | Marks a disk as SSD-backed (`rotation=0` in the guest). Same three states and the same TRIM-capability auto-resolution as `discard` — see [Discard/SSD auto-resolution](#discardssd-auto-resolution) below. Only ever reaches a disk on the `scsi` bus; the virtio-blk bus filter drops it from the VM root disk unconditionally. Overridden per disk by `cloud_properties.ssd`. |
 | `pve.disk_performance.mbps_rd` | Float | unset | Default read throughput cap in MB/s. `0` or unset means no cap. Fractional values accepted (e.g. `100.5`). |
 | `pve.disk_performance.mbps_wr` | Float | unset | Default write throughput cap in MB/s. `0` or unset means no cap. |
 | `pve.disk_performance.iops_rd` | Integer | unset | Default read IOPS cap. `0` or unset means no cap. |
@@ -358,6 +358,25 @@ Per-call always wins. Global config is the lowest-precedence layer.
 | `pve.disk_perf_invariant_mode` | String | `""` (→ `enforce`) | Controls enforcement of creation-time disk-performance invariants at `attach_disk` time. When global config introduces a structural option (`cache`, `iothread`, `ssd`) not present when the disk was created, the recorded options diverge from the runtime profile. `enforce` — reject the attach with a non-retriable error. `warn` — log the divergence and proceed. `off` — skip the check. Throttle options (`mbps_*`, `iops_*`) and `discard` are never enforced. |
 
 **Default flip and existing disks:** `iothread` and `virtio_scsi_single` now default to `true`; both are baked in only at create time (`create_vm`, `create_disk`) or on the next `attach_disk`, never rewritten retroactively into an existing VM's live config or an existing disk CID's recorded structural options. A disk created before this flip that recorded at least one structural option (e.g. an explicit `cache` setting) will hit `pve.disk_perf_invariant_mode` on its next `attach_disk` if the newly-resolved `iothread` default diverges from its creation-time record — this is the same drift-governance mechanism that already applies to any other `disk_performance` configuration change, not new behavior introduced by this flip. A disk created with zero recorded structural options is unaffected by the invariant check (nothing to compare against) and simply picks up the new default on its next attach, matching how an unconfigured disk has always picked up whatever the current global defaults are.
+
+### Discard/SSD auto-resolution
+
+Copy-on-write and thin-provisioned storage backends only reclaim guest-deleted blocks when the guest issues TRIM/discard and the storage layer passes it through. Without `discard=on`, a thin pool grows monotonically as data is written and deleted, even though the guest filesystem shows the space as free. `pve.disk_performance.discard` and `.ssd` default to "auto" (unset) specifically so this reclamation happens automatically wherever it is actually effective, without forcing it onto backends where it does nothing.
+
+Auto-resolution runs once per disk, at the point its PVE volid options are baked — `create_disk` (persistent disks), `create_vm` (the root disk), and `attach_disk` (re-resolving the global-default layer on every attach). It classifies the disk's **actual resolved storage pool**, not a config guess:
+
+| Storage pool type | Disk format | `discard` auto-resolves | `ssd` auto-resolves |
+|---|---|---|---|
+| `lvmthin`, `zfspool`, `rbd` | any (format is irrelevant — no file format on block-native pools) | `on` | `1` |
+| `dir`, `nfs`, `cifs` (file-backed) | `qcow2` | `on` | `1` |
+| `dir`, `nfs`, `cifs` (file-backed) | `raw` | omitted | omitted |
+| `lvm` (thick), `cephfs`, `glusterfs`, `pbs`, any unrecognized type | any | omitted | omitted |
+
+`ssd`'s auto-resolved value is further filtered by bus: even when auto-resolution says "1", the pre-existing virtio-blk bus filter strips `ssd` from the VM root disk unconditionally, because `ssd` is only meaningful on the `scsi` bus PVE persistent disks use.
+
+An explicit `true` or `false` at any layer — `cloud_properties.discard`/`.ssd` (including a `disk_type`/`vm_type` profile), or this global default — always wins over auto-resolution, exactly as an explicit value wins over any other default in this CPI. Setting `true` forces the option on a backend where auto-resolution would have omitted it (PVE decides whether to accept or reject that); setting `false` suppresses it everywhere, including on a TRIM-capable pool.
+
+`ssd` participates in `pve.disk_perf_invariant_mode` exactly like `cache` and `iothread`: a disk created before auto-resolution existed (or before it was requested) that later re-resolves `ssd=1` on re-attach is a structural divergence from its creation-time record, governed by the invariant mode setting. `discard` is deliberately **not** invariant-tracked — like before auto-resolution existed, PVE can toggle discard on a live device without a structural reconfiguration, so a discard divergence is silently applied rather than rejected or warned about.
 
 ## Layered Cloud-Property Profiles
 

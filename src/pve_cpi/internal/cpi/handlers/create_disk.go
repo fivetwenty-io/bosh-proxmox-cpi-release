@@ -268,20 +268,6 @@ func HandleCreateDisk(deps Deps) Handler {
 			return nil, err
 		}
 
-		diskPerfOpts, err := resolveDiskPerfOptions(r, deps.Config)
-		if err != nil {
-			return nil, err // non-retriable CloudError: bad cache mode / negative throttle
-		}
-		// Encode retain_on_delete provenance into the disk CID opts so delete_vm
-		// can surface audit provenance in its WARN log even when the disk is
-		// foreign-guarded by the VMID guard. Nil → byte-identical (no opts key added).
-		if cloudProps.RetainOnDelete != nil && *cloudProps.RetainOnDelete {
-			if diskPerfOpts == nil {
-				diskPerfOpts = make(map[string]string)
-			}
-			diskPerfOpts[diskOptRetainOnDelete] = "1"
-		}
-
 		// Resolve encrypted flag: per-call > global > false.
 		// layeredResolver.Bool reads call/disk_type/vm_type layers; global is the
 		// CPIConfig.Encrypted field. When neither is set, encrypted=false → no filter.
@@ -307,6 +293,33 @@ func HandleCreateDisk(deps Deps) Handler {
 			if format == "" {
 				format = diskFormatQCOW2
 			}
+		}
+
+		// Disk-performance options are resolved after storage+format so the
+		// discard/ssd auto-resolution (see resolveDiskPerfOptions) can classify
+		// the resolved pool's TRIM capability. The storage-type lookup only
+		// runs when discard/ssd auto-resolution would actually consult it
+		// (needsDiskPerfStorageTypeLookup) — an operator who explicitly sets
+		// both discard and ssd never pays for the extra API round trip.
+		// Best-effort: a failed/unavailable lookup yields "" and
+		// pve.IsTrimCapable("", ...) fails open to false — no discard/ssd
+		// bake, never an error.
+		var storageType string
+		if needsDiskPerfStorageTypeLookup(r, deps.Config) {
+			storageType = lookupVMStorageType(ctx, deps, storage)
+		}
+		diskPerfOpts, err := resolveDiskPerfOptions(r, deps.Config, storageType, format)
+		if err != nil {
+			return nil, err // non-retriable CloudError: bad cache mode / negative throttle
+		}
+		// Encode retain_on_delete provenance into the disk CID opts so delete_vm
+		// can surface audit provenance in its WARN log even when the disk is
+		// foreign-guarded by the VMID guard. Nil → byte-identical (no opts key added).
+		if cloudProps.RetainOnDelete != nil && *cloudProps.RetainOnDelete {
+			if diskPerfOpts == nil {
+				diskPerfOpts = make(map[string]string)
+			}
+			diskPerfOpts[diskOptRetainOnDelete] = "1"
 		}
 
 		backend, err := backendResolverOrDefault(deps).Resolve(ctx, storage)

@@ -6,6 +6,7 @@ import (
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
+	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
 )
 
 // resolveDiskPerfOptions resolves PVE per-disk performance options from the
@@ -13,29 +14,47 @@ import (
 // cfg.DiskPerformance global defaults. Returns a PVE option map (key→value
 // string) containing only options that were set. Non-retriable CloudError on
 // invalid value (bad cache mode, negative throttle). Empty resolver + nil/empty
-// config → empty map, EXCEPT iothread — see below.
+// config → empty map, EXCEPT iothread/discard/ssd — see below.
+//
+// storageType and format describe the pool and disk-image format the option
+// map is being resolved for; they drive the discard/ssd auto-resolution and
+// are otherwise unused. Pass "" for either when unknown (auto-resolution then
+// fails open to "not TRIM-capable" — see pve.IsTrimCapable).
 //
 // Mapping:
 //
-//	iothread bool → "1"/omit. Default TRUE (Phase 2): a dedicated I/O thread
-//	                per disk relieves QEMU main-loop contention on multi-disk
-//	                VMs and is the modern PVE creation default; this default
-//	                applies only when neither the layered resolver
-//	                (cloud_properties.iothread, including a vm_type/disk_type
-//	                profile) nor cfg.DiskPerformance.Iothread set an explicit
-//	                value — an explicit false at either layer still disables
-//	                it. This is a create/attach-time bake only: existing disk
-//	                CIDs and already-created VMs are unaffected (see
-//	                disk_perf_invariant_mode for re-attach drift handling).
-//	ssd      bool → "1"/omit. Default false (unchanged).
-//	discard  bool → "on"/omit (true) / omit (false or absent). Default false
-//	                (unchanged).
+//	iothread bool  → "1"/omit. Default TRUE: a dedicated I/O thread per disk
+//	                 relieves QEMU main-loop contention on multi-disk VMs and
+//	                 is the modern PVE creation default; this default applies
+//	                 only when neither the layered resolver
+//	                 (cloud_properties.iothread, including a vm_type/disk_type
+//	                 profile) nor cfg.DiskPerformance.Iothread set an explicit
+//	                 value — an explicit false at either layer still disables
+//	                 it. This is a create/attach-time bake only: existing disk
+//	                 CIDs and already-created VMs are unaffected (see
+//	                 disk_perf_invariant_mode for re-attach drift handling).
+//	discard  bool  → "on"/omit. Default AUTO: "on" when
+//	                 pve.IsTrimCapable(storageType, format) reports the target
+//	                 pool passes TRIM through to the guest (lvmthin, zfspool,
+//	                 rbd, or qcow2 on a file-backed pool) — enabling discard
+//	                 there lets the guest reclaim space it deletes, so a thin
+//	                 pool does not grow monotonically. Omitted on backends
+//	                 where TRIM does not reclaim space (thick lvm, cephfs,
+//	                 glusterfs, unknown). An explicit true/false at the
+//	                 resolver or config layer always wins over the computed
+//	                 auto value, exactly as it would over any other default.
+//	ssd      bool  → "1"/omit. Default AUTO, same TRIM-capability computation
+//	                 as discard (SSD emulation pairs naturally with a
+//	                 thin/TRIM-capable pool). The pre-existing virtio-blk bus
+//	                 filter (filterDiskPerfForBus) still strips ssd from the
+//	                 VM root disk regardless of how it resolved — ssd only
+//	                 ever reaches a disk on the scsi bus.
 //	cache    string (validated) → opts["cache"]=mode / omit when empty
 //	mbps_rd  float → strconv.FormatFloat(v,'g',-1,64) / omit when 0; <0 → error
 //	mbps_wr  same pattern
 //	iops_rd  int → strconv.Itoa(v) / omit when 0; <0 → error
 //	iops_wr  same pattern
-func resolveDiskPerfOptions(r *layeredResolver, cfg *config.CPIConfig) (map[string]string, error) {
+func resolveDiskPerfOptions(r *layeredResolver, cfg *config.CPIConfig, storageType, format string) (map[string]string, error) {
 	opts := make(map[string]string)
 
 	var dp *config.DiskPerformanceDefaults
@@ -44,15 +63,16 @@ func resolveDiskPerfOptions(r *layeredResolver, cfg *config.CPIConfig) (map[stri
 	}
 
 	// Boolean toggles: emit only when effective value is true. false/absent → omit.
-	// iothread's built-in default is true (Phase 2 default flip); ssd/discard
-	// stay false — see resolveDiskPerfOptions doc for the full rationale.
+	// iothread's built-in default is true; discard/ssd default to the
+	// TRIM-capability auto-resolution — see resolveDiskPerfOptions doc.
+	autoTrim := pve.IsTrimCapable(storageType, format)
 	if resolveDiskPerfBool(r, diskOptIothread, diskPerfCfgBool(dp, func(d *config.DiskPerformanceDefaults) *bool { return d.Iothread }), true) {
 		opts[diskOptIothread] = "1"
 	}
-	if resolveDiskPerfBool(r, diskOptSSD, diskPerfCfgBool(dp, func(d *config.DiskPerformanceDefaults) *bool { return d.SSD }), false) {
+	if resolveDiskPerfBool(r, diskOptSSD, diskPerfCfgBool(dp, func(d *config.DiskPerformanceDefaults) *bool { return d.SSD }), autoTrim) {
 		opts[diskOptSSD] = "1"
 	}
-	if resolveDiskPerfBool(r, "discard", diskPerfCfgBool(dp, func(d *config.DiskPerformanceDefaults) *bool { return d.Discard }), false) {
+	if resolveDiskPerfBool(r, "discard", diskPerfCfgBool(dp, func(d *config.DiskPerformanceDefaults) *bool { return d.Discard }), autoTrim) {
 		opts["discard"] = "on"
 	}
 
@@ -110,11 +130,11 @@ func diskPerfCfgInt(dp *config.DiskPerformanceDefaults, get func(*config.DiskPer
 
 // resolveDiskPerfBool returns the effective bool: resolver value wins (explicit
 // false counts), else the config pointer (explicit false also counts), else
-// defaultVal. defaultVal lets callers give a specific option (iothread) a
-// true built-in default while others (ssd, discard) keep false — both an
-// explicit resolver-level and an explicit config-level false still disable
-// the option regardless of defaultVal, since either non-absent source is
-// checked before defaultVal is ever consulted.
+// defaultVal. defaultVal lets each option have its own built-in default
+// (a static true for iothread; a per-disk computed value for ssd/discard's
+// TRIM-capability auto-resolution) — either an explicit resolver-level or an
+// explicit config-level value always wins over defaultVal, since both
+// non-absent sources are checked before defaultVal is ever consulted.
 func resolveDiskPerfBool(r *layeredResolver, key string, cfgVal *bool, defaultVal bool) bool {
 	if v, found := r.Bool(key); found {
 		return v
@@ -123,6 +143,39 @@ func resolveDiskPerfBool(r *layeredResolver, key string, cfgVal *bool, defaultVa
 		return *cfgVal
 	}
 	return defaultVal
+}
+
+// diskPerfBoolExplicit reports whether key has an explicit value at the
+// resolver layer (call/disk_type/vm_type) or the config layer — i.e. whether
+// resolveDiskPerfBool would return that explicit value rather than falling
+// through to its defaultVal.
+func diskPerfBoolExplicit(r *layeredResolver, key string, cfgVal *bool) bool {
+	if _, found := r.Bool(key); found {
+		return true
+	}
+	return cfgVal != nil
+}
+
+// needsDiskPerfStorageTypeLookup reports whether resolving disk-performance
+// options for cfg/r would actually consult the storage type — i.e. whether
+// discard or ssd (or both) lack an explicit value at every layer and would
+// therefore fall through to the TRIM-capability auto-resolution.
+//
+// Callers (create_disk, attach_disk) use this to skip an otherwise-needless
+// live storage-type lookup when the operator has explicitly configured both
+// discard and ssd (globally, per vm_type/disk_type profile, or per call) —
+// auto-resolution never runs in that case, so the pool's actual TRIM
+// capability is irrelevant and querying it wastes an API round trip.
+// create_vm does not need this: it already resolves the storage type
+// unconditionally for the clone-mode decision.
+func needsDiskPerfStorageTypeLookup(r *layeredResolver, cfg *config.CPIConfig) bool {
+	var dp *config.DiskPerformanceDefaults
+	if cfg != nil {
+		dp = cfg.DiskPerformance
+	}
+	discardExplicit := diskPerfBoolExplicit(r, "discard", diskPerfCfgBool(dp, func(d *config.DiskPerformanceDefaults) *bool { return d.Discard }))
+	ssdExplicit := diskPerfBoolExplicit(r, diskOptSSD, diskPerfCfgBool(dp, func(d *config.DiskPerformanceDefaults) *bool { return d.SSD }))
+	return !discardExplicit || !ssdExplicit
 }
 
 // resolveDiskPerfFloatOpt resolves a float throttle and, when > 0, writes it to
@@ -183,7 +236,7 @@ func filterDiskPerfForBus(opts map[string]string, bus string) map[string]string 
 }
 
 // resolveVirtioSCSISingle reports whether the VM should use virtio-scsi-single
-// (default as of Phase 2 — see below). Precedence:
+// (the current default — see below). Precedence:
 //
 //  1. resolver Bool "virtio_scsi_single" (if found) — explicit call value wins,
 //     including an explicit false from cloud_properties or a vm_type/disk_type
@@ -192,11 +245,11 @@ func filterDiskPerfForBus(opts map[string]string, bus string) map[string]string 
 //     an explicit *false here also disables the built-in default below.
 //  3. true — the built-in default. VirtIO SCSI single gives each disk its own
 //     dedicated controller (required for per-disk iothread on the scsi bus,
-//     whose default also flipped to true in the same change) instead of
-//     serializing every disk behind one shared virtio-scsi-pci controller.
-//     This is create-time only: an existing VM's controller is never changed
-//     retroactively. Set virtio_scsi_single: false (globally or per-call) to
-//     restore the pre-Phase-2 virtio-scsi-pci default.
+//     whose default also defaults to true) instead of serializing every disk
+//     behind one shared virtio-scsi-pci controller. This is create-time only:
+//     an existing VM's controller is never changed retroactively. Set
+//     virtio_scsi_single: false (globally or per-call) to restore the earlier
+//     virtio-scsi-pci default.
 func resolveVirtioSCSISingle(r *layeredResolver, cfg *config.CPIConfig) bool {
 	if v, found := r.Bool("virtio_scsi_single"); found {
 		return v

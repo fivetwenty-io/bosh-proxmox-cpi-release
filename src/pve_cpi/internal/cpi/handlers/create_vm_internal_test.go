@@ -3486,6 +3486,71 @@ func TestResolveVMShape_SSD_DroppedByVirtioBusFilter(t *testing.T) {
 	}
 }
 
+// TestResolveVMShape_DiscardAuto_TrimCapableStorage_BakesDiscardNotSSD
+// verifies the root-disk auto-resolution: on a TRIM-capable vmStorage type
+// (lvmthin), discard auto-bakes into rootDiskPerfOpts, but ssd — even though
+// it also auto-resolves true — is dropped by the pre-existing virtio bus
+// filter, since the root disk is always virtio-blk regardless of
+// virtio_scsi_single.
+func TestResolveVMShape_DiscardAuto_TrimCapableStorage_BakesDiscardNotSSD(t *testing.T) {
+	t.Parallel()
+
+	deps := Deps{
+		Config: &config.CPIConfig{
+			Node:           "pve",
+			VMStorage:      "local-lvm",
+			VMIDRangeStart: 100,
+		},
+		PVE: &shapeTestPVEClient{
+			clusterStorageSvc: &shapeTestClusterStorage{
+				entries: []map[string]any{
+					{"storage": "local-lvm", "type": "lvmthin"},
+				},
+			},
+		},
+	}
+
+	shape, err := resolveVMShape(context.Background(), deps, minimalParsedArgs("test-storage"))
+	if err != nil {
+		t.Fatalf("resolveVMShape error: %v", err)
+	}
+	if shape.rootDiskPerfOpts["discard"] != "on" {
+		t.Errorf("rootDiskPerfOpts[discard] = %q; want on (lvmthin is TRIM-capable)", shape.rootDiskPerfOpts["discard"])
+	}
+	if _, present := shape.rootDiskPerfOpts["ssd"]; present {
+		t.Error("rootDiskPerfOpts must not contain ssd — virtio bus filter drops it regardless of auto-resolution")
+	}
+}
+
+// TestResolveVMShape_DiscardAuto_NonTrimStorage_NothingBaked verifies that
+// discard stays unbaked on a non-TRIM-capable vmStorage type (thick lvm).
+func TestResolveVMShape_DiscardAuto_NonTrimStorage_NothingBaked(t *testing.T) {
+	t.Parallel()
+
+	deps := Deps{
+		Config: &config.CPIConfig{
+			Node:           "pve",
+			VMStorage:      "local-lvm",
+			VMIDRangeStart: 100,
+		},
+		PVE: &shapeTestPVEClient{
+			clusterStorageSvc: &shapeTestClusterStorage{
+				entries: []map[string]any{
+					{"storage": "local-lvm", "type": "lvm"},
+				},
+			},
+		},
+	}
+
+	shape, err := resolveVMShape(context.Background(), deps, minimalParsedArgs("test-storage"))
+	if err != nil {
+		t.Fatalf("resolveVMShape error: %v", err)
+	}
+	if _, present := shape.rootDiskPerfOpts["discard"]; present {
+		t.Errorf("rootDiskPerfOpts must not contain discard on thick lvm, got %v", shape.rootDiskPerfOpts)
+	}
+}
+
 // TestResolveVMShape_VirtioSCSISingle_Opt_In verifies that
 // virtio_scsi_single:true sets scsihw=="virtio-scsi-single".
 func TestResolveVMShape_VirtioSCSISingle_Opt_In(t *testing.T) {

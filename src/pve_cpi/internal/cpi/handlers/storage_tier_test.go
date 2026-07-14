@@ -343,7 +343,13 @@ func TestStorageTier_ExplicitPoolWinsNoLiveQuery(t *testing.T) {
 	h := handlers.HandleCreateDisk(deps)
 	_, err := h.Handle(context.Background(), []json.RawMessage{
 		marshal(1024),
-		marshal(map[string]string{"storage_pool": "explicit-pool", "storage_tier": "shared"}),
+		// discard/ssd explicitly disabled so the disk-performance
+		// auto-resolution (which independently needs a live storage-type
+		// lookup when either is left unset — see
+		// needsDiskPerfStorageTypeLookup) does not introduce an unrelated
+		// ListStorage call, keeping this test isolated to storage_tier
+		// resolution behavior alone.
+		marshal(map[string]any{"storage_pool": "explicit-pool", "storage_tier": "shared", "discard": false, "ssd": false}),
 	}, jsonrpc.Context{})
 
 	if err != nil {
@@ -378,7 +384,11 @@ func TestStorageTier_NoKey_NoLiveQuery(t *testing.T) {
 	h := handlers.HandleCreateDisk(deps)
 	_, err := h.Handle(context.Background(), []json.RawMessage{
 		marshal(1024),
-		marshal(map[string]string{}), // no storage_tier key
+		// discard/ssd explicitly disabled so the disk-performance
+		// auto-resolution does not introduce an unrelated ListStorage call
+		// of its own — see the comment in
+		// TestStorageTier_ExplicitPoolWinsNoLiveQuery.
+		marshal(map[string]any{"discard": false, "ssd": false}), // no storage_tier key
 	}, jsonrpc.Context{})
 
 	if err != nil {

@@ -25,37 +25,37 @@ func buildResolver(t *testing.T, cp map[string]any) *layeredResolver {
 // ----------------------------------------------------------------
 
 // TestResolveDiskPerfOptions_EmptyResolverNilConfig_IothreadDefaultsOn
-// verifies the Phase 2 default flip: with everything else absent, iothread
+// verifies the default flip: with everything else absent, iothread
 // resolves to "1" because its built-in Level-5 default is now true. This
 // replaces the pre-Phase-2 "expected empty map" assertion.
 func TestResolveDiskPerfOptions_EmptyResolverNilConfig_IothreadDefaultsOn(t *testing.T) {
 	r := buildResolver(t, nil)
-	opts, err := resolveDiskPerfOptions(r, nil)
+	opts, err := resolveDiskPerfOptions(r, nil, "", "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if len(opts) != 1 || opts["iothread"] != "1" {
-		t.Errorf("expected map[iothread:1] (Phase 2 default), got %v", opts)
+		t.Errorf("expected map[iothread:1] (the current default), got %v", opts)
 	}
 }
 
 func TestResolveDiskPerfOptions_EmptyResolverEmptyConfig_IothreadDefaultsOn(t *testing.T) {
 	r := buildResolver(t, map[string]any{})
-	opts, err := resolveDiskPerfOptions(r, &config.CPIConfig{})
+	opts, err := resolveDiskPerfOptions(r, &config.CPIConfig{}, "", "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if len(opts) != 1 || opts["iothread"] != "1" {
-		t.Errorf("expected map[iothread:1] (Phase 2 default), got %v", opts)
+		t.Errorf("expected map[iothread:1] (the current default), got %v", opts)
 	}
 }
 
 // TestResolveDiskPerfOptions_ExplicitIothreadFalse_TrulyEmpty verifies that an
 // explicit call-level iothread:false still yields a fully empty map — the
-// Phase 2 default flip does not remove the ability to opt all the way out.
+// default flip does not remove the ability to opt all the way out.
 func TestResolveDiskPerfOptions_ExplicitIothreadFalse_TrulyEmpty(t *testing.T) {
 	r := buildResolver(t, map[string]any{"iothread": false})
-	opts, err := resolveDiskPerfOptions(r, nil)
+	opts, err := resolveDiskPerfOptions(r, nil, "", "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -69,7 +69,7 @@ func TestResolveDiskPerfOptions_ExplicitIothreadFalse_TrulyEmpty(t *testing.T) {
 func TestResolveDiskPerfOptions_ExplicitIothreadFalse_GlobalConfig(t *testing.T) {
 	r := buildResolver(t, map[string]any{})
 	cfg := &config.CPIConfig{DiskPerformance: &config.DiskPerformanceDefaults{Iothread: boolPtr(false)}}
-	opts, err := resolveDiskPerfOptions(r, cfg)
+	opts, err := resolveDiskPerfOptions(r, cfg, "", "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -88,7 +88,7 @@ func TestResolveDiskPerfOptions_AllCallCloudProps(t *testing.T) {
 		"iops_wr":  1000,
 	}
 	r := buildResolver(t, cp)
-	opts, err := resolveDiskPerfOptions(r, &config.CPIConfig{})
+	opts, err := resolveDiskPerfOptions(r, &config.CPIConfig{}, "", "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -114,7 +114,7 @@ func TestResolveDiskPerfOptions_AllCallCloudProps(t *testing.T) {
 func TestResolveDiskPerfOptions_IothreadFalseOmitted(t *testing.T) {
 	cp := map[string]any{"iothread": false}
 	r := buildResolver(t, cp)
-	opts, err := resolveDiskPerfOptions(r, &config.CPIConfig{})
+	opts, err := resolveDiskPerfOptions(r, &config.CPIConfig{}, "", "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -131,7 +131,7 @@ func TestResolveDiskPerfOptions_GlobalConfigDefault(t *testing.T) {
 			Iothread: boolPtr(true),
 		},
 	}
-	opts, err := resolveDiskPerfOptions(r, cfg)
+	opts, err := resolveDiskPerfOptions(r, cfg, "", "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -149,7 +149,7 @@ func TestResolveDiskPerfOptions_CallOverridesGlobal(t *testing.T) {
 			Iothread: boolPtr(true),
 		},
 	}
-	opts, err := resolveDiskPerfOptions(r, cfg)
+	opts, err := resolveDiskPerfOptions(r, cfg, "", "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -161,7 +161,7 @@ func TestResolveDiskPerfOptions_CallOverridesGlobal(t *testing.T) {
 func TestResolveDiskPerfOptions_CacheBogusError(t *testing.T) {
 	cp := map[string]any{"cache": "bogus"}
 	r := buildResolver(t, cp)
-	_, err := resolveDiskPerfOptions(r, &config.CPIConfig{})
+	_, err := resolveDiskPerfOptions(r, &config.CPIConfig{}, "", "")
 	if err == nil {
 		t.Fatal("expected error for bogus cache mode, got nil")
 	}
@@ -170,7 +170,7 @@ func TestResolveDiskPerfOptions_CacheBogusError(t *testing.T) {
 func TestResolveDiskPerfOptions_MbpsRdNegativeError(t *testing.T) {
 	cp := map[string]any{"mbps_rd": -1.0}
 	r := buildResolver(t, cp)
-	_, err := resolveDiskPerfOptions(r, &config.CPIConfig{})
+	_, err := resolveDiskPerfOptions(r, &config.CPIConfig{}, "", "")
 	if err == nil {
 		t.Fatal("expected error for negative mbps_rd, got nil")
 	}
@@ -179,7 +179,7 @@ func TestResolveDiskPerfOptions_MbpsRdNegativeError(t *testing.T) {
 func TestResolveDiskPerfOptions_IopsRdNegativeError(t *testing.T) {
 	cp := map[string]any{"iops_rd": -1}
 	r := buildResolver(t, cp)
-	_, err := resolveDiskPerfOptions(r, &config.CPIConfig{})
+	_, err := resolveDiskPerfOptions(r, &config.CPIConfig{}, "", "")
 	if err == nil {
 		t.Fatal("expected error for negative iops_rd, got nil")
 	}
@@ -188,7 +188,7 @@ func TestResolveDiskPerfOptions_IopsRdNegativeError(t *testing.T) {
 func TestResolveDiskPerfOptions_MbpsWrZeroOmitted(t *testing.T) {
 	cp := map[string]any{"mbps_wr": 0.0}
 	r := buildResolver(t, cp)
-	opts, err := resolveDiskPerfOptions(r, &config.CPIConfig{})
+	opts, err := resolveDiskPerfOptions(r, &config.CPIConfig{}, "", "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -200,12 +200,221 @@ func TestResolveDiskPerfOptions_MbpsWrZeroOmitted(t *testing.T) {
 func TestResolveDiskPerfOptions_IopsWrZeroOmitted(t *testing.T) {
 	cp := map[string]any{"iops_wr": 0}
 	r := buildResolver(t, cp)
-	opts, err := resolveDiskPerfOptions(r, &config.CPIConfig{})
+	opts, err := resolveDiskPerfOptions(r, &config.CPIConfig{}, "", "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if _, present := opts["iops_wr"]; present {
 		t.Errorf("iops_wr=0 should be omitted, got opts=%v", opts)
+	}
+}
+
+// ----------------------------------------------------------------
+// resolveDiskPerfOptions: discard/ssd auto-resolution (TRIM capability)
+// ----------------------------------------------------------------
+
+// TestResolveDiskPerfOptions_Auto_TrimCapableStorage_BothOn verifies that
+// with discard/ssd left unset everywhere, a TRIM-capable storage type (e.g.
+// lvmthin) auto-resolves both to on.
+func TestResolveDiskPerfOptions_Auto_TrimCapableStorage_BothOn(t *testing.T) {
+	t.Parallel()
+	r := buildResolver(t, map[string]any{})
+	opts, err := resolveDiskPerfOptions(r, &config.CPIConfig{}, "lvmthin", diskFormatRaw)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if opts["discard"] != "on" {
+		t.Errorf("discard = %q; want on (lvmthin is TRIM-capable)", opts["discard"])
+	}
+	if opts["ssd"] != "1" {
+		t.Errorf("ssd = %q; want 1 (lvmthin is TRIM-capable)", opts["ssd"])
+	}
+}
+
+// TestResolveDiskPerfOptions_Auto_QCOW2OnFileBacked_BothOn verifies the
+// second TRIM-capable shape: a file-backed pool (dir/nfs/cifs) with a qcow2
+// disk image.
+func TestResolveDiskPerfOptions_Auto_QCOW2OnFileBacked_BothOn(t *testing.T) {
+	t.Parallel()
+	r := buildResolver(t, map[string]any{})
+	opts, err := resolveDiskPerfOptions(r, &config.CPIConfig{}, "nfs", "qcow2")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if opts["discard"] != "on" {
+		t.Errorf("discard = %q; want on (qcow2 on nfs is TRIM-capable)", opts["discard"])
+	}
+	if opts["ssd"] != "1" {
+		t.Errorf("ssd = %q; want 1 (qcow2 on nfs is TRIM-capable)", opts["ssd"])
+	}
+}
+
+// TestResolveDiskPerfOptions_Auto_NonTrimStorage_NothingBaked verifies that
+// discard/ssd stay omitted on backends where TRIM does not reclaim space:
+// thick lvm, and raw format on a file-backed pool.
+func TestResolveDiskPerfOptions_Auto_NonTrimStorage_NothingBaked(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name        string
+		storageType string
+		format      string
+	}{
+		{"thick_lvm", "lvm", diskFormatRaw},
+		{"raw_on_file_backed", "dir", diskFormatRaw},
+		{"cephfs", "cephfs", "qcow2"},
+		{"unknown_backend", "made-up", "qcow2"},
+		{"unresolved_type", "", "qcow2"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			r := buildResolver(t, map[string]any{})
+			opts, err := resolveDiskPerfOptions(r, &config.CPIConfig{}, tc.storageType, tc.format)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if _, present := opts["discard"]; present {
+				t.Errorf("discard must be omitted for storageType=%q format=%q, got opts=%v", tc.storageType, tc.format, opts)
+			}
+			if _, present := opts["ssd"]; present {
+				t.Errorf("ssd must be omitted for storageType=%q format=%q, got opts=%v", tc.storageType, tc.format, opts)
+			}
+		})
+	}
+}
+
+// TestResolveDiskPerfOptions_Auto_CallExplicitTrue_OverridesNonTrim verifies
+// that an explicit call-level discard:true/ssd:true forces the options on
+// even on a non-TRIM-capable backend (PVE itself is left to accept or reject
+// the value — the CPI does not second-guess an explicit operator choice).
+func TestResolveDiskPerfOptions_Auto_CallExplicitTrue_OverridesNonTrim(t *testing.T) {
+	t.Parallel()
+	r := buildResolver(t, map[string]any{"discard": true, "ssd": true})
+	opts, err := resolveDiskPerfOptions(r, &config.CPIConfig{}, "lvm", diskFormatRaw)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if opts["discard"] != "on" {
+		t.Errorf("discard = %q; want on (explicit true forces it on thick lvm)", opts["discard"])
+	}
+	if opts["ssd"] != "1" {
+		t.Errorf("ssd = %q; want 1 (explicit true forces it on thick lvm)", opts["ssd"])
+	}
+}
+
+// TestResolveDiskPerfOptions_Auto_CallExplicitFalse_OverridesTrimCapable
+// verifies that an explicit call-level discard:false/ssd:false suppresses
+// both even on a TRIM-capable backend.
+func TestResolveDiskPerfOptions_Auto_CallExplicitFalse_OverridesTrimCapable(t *testing.T) {
+	t.Parallel()
+	r := buildResolver(t, map[string]any{"discard": false, "ssd": false})
+	opts, err := resolveDiskPerfOptions(r, &config.CPIConfig{}, "lvmthin", diskFormatRaw)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, present := opts["discard"]; present {
+		t.Errorf("discard must be omitted with explicit false, got opts=%v", opts)
+	}
+	if _, present := opts["ssd"]; present {
+		t.Errorf("ssd must be omitted with explicit false, got opts=%v", opts)
+	}
+}
+
+// TestResolveDiskPerfOptions_Auto_GlobalConfigExplicit_OverridesAuto verifies
+// that the global config layer's explicit discard/ssd values also win over
+// the TRIM-capability auto default, both directions.
+func TestResolveDiskPerfOptions_Auto_GlobalConfigExplicit_OverridesAuto(t *testing.T) {
+	t.Parallel()
+
+	t.Run("config_false_beats_trim_capable", func(t *testing.T) {
+		t.Parallel()
+		r := buildResolver(t, map[string]any{})
+		cfg := &config.CPIConfig{DiskPerformance: &config.DiskPerformanceDefaults{
+			Discard: boolPtr(false), SSD: boolPtr(false),
+		}}
+		opts, err := resolveDiskPerfOptions(r, cfg, "zfspool", diskFormatRaw)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		// iothread is not under test here and defaults on independently;
+		// only discard/ssd must be absent.
+		if _, present := opts["discard"]; present {
+			t.Errorf("discard must be absent with explicit global false, got opts=%v", opts)
+		}
+		if _, present := opts["ssd"]; present {
+			t.Errorf("ssd must be absent with explicit global false, got opts=%v", opts)
+		}
+	})
+
+	t.Run("config_true_beats_non_trim", func(t *testing.T) {
+		t.Parallel()
+		r := buildResolver(t, map[string]any{})
+		cfg := &config.CPIConfig{DiskPerformance: &config.DiskPerformanceDefaults{
+			Discard: boolPtr(true), SSD: boolPtr(true),
+		}}
+		opts, err := resolveDiskPerfOptions(r, cfg, "lvm", diskFormatRaw)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if opts["discard"] != "on" || opts["ssd"] != "1" {
+			t.Errorf("expected discard=on, ssd=1 with explicit global true, got opts=%v", opts)
+		}
+	})
+
+	t.Run("call_beats_config", func(t *testing.T) {
+		t.Parallel()
+		// call discard:true must win over config Discard:false, even on a
+		// non-TRIM backend — call layer is always highest precedence.
+		r := buildResolver(t, map[string]any{"discard": true})
+		cfg := &config.CPIConfig{DiskPerformance: &config.DiskPerformanceDefaults{Discard: boolPtr(false)}}
+		opts, err := resolveDiskPerfOptions(r, cfg, "lvm", diskFormatRaw)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if opts["discard"] != "on" {
+			t.Errorf("discard = %q; want on (call layer beats config layer)", opts["discard"])
+		}
+	})
+}
+
+// ----------------------------------------------------------------
+// needsDiskPerfStorageTypeLookup
+// ----------------------------------------------------------------
+
+func TestNeedsDiskPerfStorageTypeLookup_NeitherSet_True(t *testing.T) {
+	t.Parallel()
+	r := buildResolver(t, map[string]any{})
+	if !needsDiskPerfStorageTypeLookup(r, &config.CPIConfig{}) {
+		t.Error("expected true: discard and ssd both unset, auto-resolution needs the lookup")
+	}
+}
+
+func TestNeedsDiskPerfStorageTypeLookup_BothExplicitAtCall_False(t *testing.T) {
+	t.Parallel()
+	r := buildResolver(t, map[string]any{"discard": false, "ssd": true})
+	if needsDiskPerfStorageTypeLookup(r, &config.CPIConfig{}) {
+		t.Error("expected false: both discard and ssd explicit at the call layer, no lookup needed")
+	}
+}
+
+func TestNeedsDiskPerfStorageTypeLookup_BothExplicitAtConfig_False(t *testing.T) {
+	t.Parallel()
+	r := buildResolver(t, map[string]any{})
+	cfg := &config.CPIConfig{DiskPerformance: &config.DiskPerformanceDefaults{
+		Discard: boolPtr(true), SSD: boolPtr(false),
+	}}
+	if needsDiskPerfStorageTypeLookup(r, cfg) {
+		t.Error("expected false: both discard and ssd explicit at the config layer, no lookup needed")
+	}
+}
+
+func TestNeedsDiskPerfStorageTypeLookup_OnlyOneExplicit_True(t *testing.T) {
+	t.Parallel()
+	// discard explicit, ssd left unset — the lookup is still needed for ssd's
+	// own auto-resolution.
+	r := buildResolver(t, map[string]any{"discard": true})
+	if !needsDiskPerfStorageTypeLookup(r, &config.CPIConfig{}) {
+		t.Error("expected true: ssd is still unset and needs auto-resolution")
 	}
 }
 
@@ -302,18 +511,18 @@ func TestResolveVirtioSCSISingle_ConfigTrueEmptyCall(t *testing.T) {
 	}
 }
 
-// TestResolveVirtioSCSISingle_NeitherSetDefaultsTrue verifies the Phase 2
+// TestResolveVirtioSCSISingle_NeitherSetDefaultsTrue verifies the current
 // default flip: with neither the layered resolver nor global config setting
 // virtio_scsi_single, the built-in Level-5 default is now true.
 func TestResolveVirtioSCSISingle_NeitherSetDefaultsTrue(t *testing.T) {
 	r := buildResolver(t, map[string]any{})
 	if !resolveVirtioSCSISingle(r, &config.CPIConfig{}) {
-		t.Error("expected true (Phase 2 default) when neither call nor config sets virtio_scsi_single")
+		t.Error("expected true (the current default) when neither call nor config sets virtio_scsi_single")
 	}
 }
 
 // TestResolveVirtioSCSISingle_CallFalse_OptsOut verifies an explicit
-// call-level false still fully disables the Phase 2 default.
+// call-level false still fully disables the default.
 func TestResolveVirtioSCSISingle_CallFalse_OptsOut(t *testing.T) {
 	cp := map[string]any{"virtio_scsi_single": false}
 	r := buildResolver(t, cp)
@@ -323,7 +532,7 @@ func TestResolveVirtioSCSISingle_CallFalse_OptsOut(t *testing.T) {
 }
 
 // TestResolveVirtioSCSISingle_ConfigFalse_OptsOut verifies an explicit
-// global config false still fully disables the Phase 2 default.
+// global config false still fully disables the default.
 func TestResolveVirtioSCSISingle_ConfigFalse_OptsOut(t *testing.T) {
 	r := buildResolver(t, map[string]any{})
 	cfg := &config.CPIConfig{DiskPerformance: &config.DiskPerformanceDefaults{VirtioSCSISingle: boolPtr(false)}}

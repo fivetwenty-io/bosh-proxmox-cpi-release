@@ -66,8 +66,8 @@ if v, ok := r.Bool("iothread"); ok {
         opts["iothread"] = "1"
     }
 }
-// Level 5 (implicit): absent → iothread's hardcoded default (true, as of
-// see the exception note below); other keys typically default false.
+// Level 5 (implicit): absent → iothread's hardcoded default (true — see the
+// exception note below); most other keys default false.
 ```
 
 The disk-performance resolver in
@@ -76,13 +76,21 @@ The disk-performance resolver in
 `discard`. `resolveDiskPerfBool` takes an explicit `defaultVal` parameter so
 Level 5 can differ per key rather than being a single package-wide constant.
 
-**Exception: `iothread` and `virtio_scsi_single`.** These two knobs'
-Level 5 default flipped from `false` to `true` — the only two boolean knobs in
-the CPI where Level 5 is not `false`. `ssd`, `discard`, and every other
-optional bool knob still follow the general `false` convention above. See
+**Exception: `iothread` and `virtio_scsi_single` default to `true`.** These
+two knobs' Level 5 default is a static `true` rather than `false`. See
 [Configuration — Disk Performance](configuration.md#disk-performance) for the
-full rationale and the drift-governance behavior for disks created before the
-flip.
+full rationale and the drift-governance behavior for disks created before
+that default changed.
+
+**Exception: `discard` and `ssd` have a *computed* Level 5, not a constant.**
+Rather than a fixed `true` or `false`, their Level 5 default is
+`pve.IsTrimCapable(storageType, format)` — the disk's actual resolved storage
+pool's TRIM capability, evaluated once per disk at bake time. An explicit
+value at any of Levels 1–4 still wins over this computed default exactly as
+it would over a constant one; only the *fallback itself* differs from the
+rest of this convention. See [Configuration — Discard/SSD
+auto-resolution](configuration.md#discardssd-auto-resolution) for the full
+TRIM-capability matrix.
 
 ## Byte-Identical Guarantee
 

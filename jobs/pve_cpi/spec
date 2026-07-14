@@ -1473,18 +1473,51 @@ properties:
 
   pve.disk_performance.discard:
     description: |
-      When true, passes discard=on to every disk created by this CPI, enabling
-      TRIM/UNMAP passthrough to the underlying storage. Effective only on
-      thin-provisioned backends (lvmthin, zfspool, rbd). Overridden per disk by
-      cloud_properties.discard. When unset (default), the key is omitted and PVE
-      uses its own default.
+      Tri-state (true|false|unset, default unset = auto). Controls discard=on
+      (TRIM/UNMAP passthrough to the underlying storage) on every disk created
+      by this CPI. Overridden per disk by cloud_properties.discard, which
+      accepts the same three states.
+
+      unset (auto, the default) — discard is resolved per disk at bake time
+      (create_disk/create_vm/attach_disk) based on the disk's actual resolved
+      storage pool: "on" when the pool is TRIM-capable — lvmthin, zfspool,
+      rbd (any format), or a file-backed pool (dir/nfs/cifs) with a qcow2
+      disk image — and omitted otherwise (thick lvm, cephfs, glusterfs, or
+      any other backend where TRIM does not reclaim space). This matters
+      because guest-deleted blocks are never reclaimed without discard on a
+      thin pool, so an unmanaged thin pool grows monotonically until full.
+      true  — forces discard=on regardless of the resolved pool's TRIM
+              capability; PVE is left to accept or reject the value.
+      false — always omits the key, restoring the pre-auto behavior (PVE
+              uses its own default) on every disk, TRIM-capable or not.
+
+      An explicit true/false at any layer (cloud_properties, disk_type/
+      vm_type profile, or this global default) always wins over auto
+      resolution. The resolved value is baked at create/attach time only;
+      existing disks and VMs are never rewritten, and a disk whose recorded
+      creation-time value diverges from a later re-resolution follows the
+      normal cloud_properties/pve_config precedence — discard itself is not
+      governed by disk_perf_invariant_mode (see that property; it never was,
+      even before auto-resolution — discard can change on a live device
+      without a structural reconfiguration).
 
   pve.disk_performance.ssd:
     description: |
-      When true, marks every disk created by this CPI as an SSD-backed device,
-      enabling rotation=0 in the guest. Signals to the guest OS that the device
-      is solid-state. Overridden per disk by cloud_properties.ssd. When unset
-      (default), the key is omitted and PVE uses its own default.
+      Tri-state (true|false|unset, default unset = auto), same auto
+      resolution as pve.disk_performance.discard — see that property for the
+      full TRIM-capability matrix and precedence rules. When true (explicit or
+      auto-resolved), marks the disk as SSD-backed (rotation=0 in the guest).
+      Overridden per disk by cloud_properties.ssd, which accepts the same
+      three states.
+
+      ssd only ever reaches a disk on the scsi bus: the pre-existing
+      virtio-blk bus filter drops it from the VM root disk unconditionally,
+      regardless of how the value resolved (explicit or auto). Unlike
+      discard, ssd IS governed by disk_perf_invariant_mode on re-attach — a
+      disk whose creation-time record diverges from a later resolution
+      (e.g. a legacy disk created before auto-resolution existed, now
+      auto-resolving ssd=1 on a TRIM-capable pool) is caught by that guard
+      exactly as any other structural option divergence is.
 
   pve.disk_performance.mbps_rd:
     description: |

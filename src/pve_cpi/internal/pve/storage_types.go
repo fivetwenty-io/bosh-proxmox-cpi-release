@@ -5,6 +5,7 @@ package pve
 
 // Storage type identifiers (Proxmox storage plugin names).
 const (
+	StorageTypeDir       = "dir"
 	StorageTypeLVM       = "lvm"
 	StorageTypeLVMThin   = "lvmthin"
 	StorageTypeRBD       = "rbd"

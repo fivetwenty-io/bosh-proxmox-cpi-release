@@ -835,11 +835,20 @@ rather than a late PVE rejection. Every option is opt-in: with none set, the enc
 the attach call, and the create parameters are byte-identical to prior releases.
 
 **Default update.** `iothread` and `virtio_scsi_single` now default to `true` (both were
-unset/off, i.e. `virtio-scsi-pci` with no iothread, at initial ship); `cache`, `discard`,
-`ssd`, and the throttle options remain unset by default. Set either flipped default to
-`false` (globally or per disk/VM) to restore the originally-shipped behavior described
-above. See [Configuration — Disk Performance](configuration.md#disk-performance) for the
-current defaults and the drift-governance note for pre-flip disk CIDs.
+unset/off, i.e. `virtio-scsi-pci` with no iothread, at initial ship); `cache` and the
+throttle options remain unset by default. Set either flipped default to `false` (globally
+or per disk/VM) to restore the originally-shipped behavior described above. See
+[Configuration — Disk Performance](configuration.md#disk-performance) for the current
+defaults and the drift-governance note for pre-flip disk CIDs.
+
+**Discard/SSD auto-resolution update.** `discard` and `ssd` no longer stay unset by
+default either — both now default to "auto": resolved per disk from the disk's actual
+storage pool's TRIM capability (`lvmthin`/`zfspool`/`rbd`, or `qcow2` on a file-backed
+pool) rather than a fixed on/off constant, so a thin pool automatically reclaims
+guest-deleted blocks wherever TRIM is actually effective, without the operator having to
+know each pool's backend type. An explicit `true`/`false` at any layer still wins over the
+computed default. See [Configuration — Discard/SSD
+auto-resolution](configuration.md#discardssd-auto-resolution) for the full matrix.
 
 **Benefit.** Each knob maps to a concrete Proxmox storage win: `discard=on` issues TRIM/UNMAP so
 a thin LVM or Ceph pool actually reclaims space the guest frees (without it, a thin pool fills

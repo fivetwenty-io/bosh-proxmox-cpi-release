@@ -3845,8 +3845,9 @@ func TestCreateVM_ClonePath_NoPerfOpts_Phase2Defaults(t *testing.T) {
 }
 
 // TestCreateVM_ClonePath_ExplicitOptOut_RestoresPreFlipShape verifies that
-// explicitly disabling both flipped Phase 2 defaults restores the exact
-// pre-Phase-2 UpdateQemuConfig shape: nil Scsihw, empty Virtio map.
+// explicitly disabling every option that now defaults on (iothread,
+// virtio_scsi_single, and discard/ssd auto-resolution) restores the earlier
+// UpdateQemuConfig shape: nil Scsihw, empty Virtio map.
 func TestCreateVM_ClonePath_ExplicitOptOut_RestoresPreFlipShape(t *testing.T) {
 	t.Parallel()
 
@@ -3869,6 +3870,11 @@ func TestCreateVM_ClonePath_ExplicitOptOut_RestoresPreFlipShape(t *testing.T) {
 			"memory":             512,
 			"iothread":           false,
 			"virtio_scsi_single": false,
+			// buildVMDepsForTemplate wires a "dir" storage type, which is
+			// TRIM-capable at the default qcow2 format — discard/ssd must be
+			// explicitly disabled too for this test's "everything off" shape.
+			"discard": false,
+			"ssd":     false,
 		},
 		map[string]any{"default": map[string]any{"type": "dynamic", "cloud_properties": map[string]any{}}},
 		[]string{}, map[string]any{})
@@ -3974,8 +3980,12 @@ func TestCreateVM_ClonePath_OnlyScsihwSwitch_NoVirtio0Key(t *testing.T) {
 			"memory":             512,
 			"virtio_scsi_single": true,
 			// Explicit opt-out isolates this test's focus (the scsihw switch
-			// alone) from the Phase 2 iothread default.
+			// alone) from the iothread default and from discard/ssd
+			// auto-resolution (buildVMDepsForTemplate wires a "dir" storage
+			// type, which is TRIM-capable at the default qcow2 format).
 			"iothread": false,
+			"discard":  false,
+			"ssd":      false,
 		},
 		map[string]any{"default": map[string]any{"type": "dynamic", "cloud_properties": map[string]any{}}},
 		[]string{}, map[string]any{})

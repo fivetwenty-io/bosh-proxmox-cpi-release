@@ -1129,7 +1129,7 @@ func buildVMShapeForNode(ctx context.Context, deps Deps, parsed *createVMParsedA
 	if perfRErr != nil {
 		return nil, perfRErr
 	}
-	rawPerfOpts, perfOptsErr := resolveDiskPerfOptions(perfR, deps.Config)
+	rawPerfOpts, perfOptsErr := resolveDiskPerfOptions(perfR, deps.Config, vmStorageType, vmDiskFormat)
 	if perfOptsErr != nil {
 		return nil, perfOptsErr
 	}

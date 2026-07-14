@@ -192,11 +192,7 @@ func HandleAttachDisk(deps Deps) Handler {
 		// passed to AttachDisk. When no options are present the call is
 		// byte-identical to the pre-feature behavior.
 		// --------------------------------------------------------------------
-		globalR, gerr := newLayeredResolver(nil, deps.Config)
-		if gerr != nil {
-			return nil, gerr
-		}
-		globalOpts, gerr := resolveDiskPerfOptions(globalR, deps.Config)
+		globalOpts, gerr := attachDiskGlobalPerfOpts(ctx, deps, bareDiskCID)
 		if gerr != nil {
 			return nil, gerr
 		}
@@ -256,6 +252,41 @@ func HandleAttachDisk(deps Deps) Handler {
 		// --------------------------------------------------------------------
 		return diskHints{Path: devicePath}, nil
 	})
+}
+
+// attachDiskGlobalPerfOpts resolves the global (no call-level cloud_properties)
+// disk-performance options for the disk identified by bareDiskCID, extracted
+// from HandleAttachDisk to keep that function's cognitive complexity under
+// the project threshold.
+//
+// discard/ssd auto-resolution needs the target pool's storage type and
+// disk-image format (see resolveDiskPerfOptions). The pool name comes from
+// the disk CID itself; the format is not recorded anywhere for an existing
+// disk (DiskCIDMeta carries no format field), so this uses the CPI's
+// configured default format as the best available signal — the same
+// fallback create_disk applies when no per-call format is given. The
+// storage-type lookup only runs when auto-resolution would actually consult
+// it (needsDiskPerfStorageTypeLookup) — an operator who explicitly
+// configures both discard and ssd never pays for the extra API round trip
+// on every attach_disk call. A failed/unresolvable lookup fails open to ""
+// (not TRIM-capable), matching resolveDiskPerfOptions's documented
+// fail-open contract — never an error from this function on that account.
+func attachDiskGlobalPerfOpts(ctx context.Context, deps Deps, bareDiskCID string) (map[string]string, error) {
+	globalR, gerr := newLayeredResolver(nil, deps.Config)
+	if gerr != nil {
+		return nil, gerr
+	}
+	var storageType string
+	if needsDiskPerfStorageTypeLookup(globalR, deps.Config) {
+		if storageName, _, parseErr := pve.ParseDiskCID(bareDiskCID); parseErr == nil {
+			storageType = lookupVMStorageType(ctx, deps, storageName)
+		}
+	}
+	format := diskFormatQCOW2
+	if deps.Config != nil && deps.Config.VMDiskFormat != "" {
+		format = deps.Config.VMDiskFormat
+	}
+	return resolveDiskPerfOptions(globalR, deps.Config, storageType, format)
 }
 
 // enforceDiskPerfInvariants applies the §7.26 creation-time disk-performance

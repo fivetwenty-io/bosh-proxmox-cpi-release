@@ -818,7 +818,13 @@ type StorageTierCriteria struct {
 // DiskPerformanceDefaults holds optional global PVE per-disk performance option
 // defaults applied when a create_disk/create_vm cloud_properties (or vm_type/
 // disk_type profile) does not set the corresponding option. All fields optional;
-// a nil block (default) emits nothing and preserves byte-identical behavior.
+// a nil block (default) preserves each field's own built-in default when the
+// resolver and this block both leave it unset — see
+// internal/cpi/handlers/disk_performance.go for the effective defaults:
+// Iothread and VirtioSCSISingle default true; Discard and SSD default to a
+// computed per-disk TRIM-capability auto-resolution (see pve.IsTrimCapable),
+// not a fixed constant; every other field defaults to its Go zero value
+// (unset/no limit).
 type DiskPerformanceDefaults struct {
 	Iothread         *bool    `json:"iothread,omitempty"`
 	Cache            string   `json:"cache,omitempty"`
