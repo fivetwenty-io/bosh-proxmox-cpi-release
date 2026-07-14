@@ -1370,7 +1370,16 @@ type templateGapPVE struct {
 	storage *templateGapClusterStorageSvc
 }
 
-func (p *templateGapPVE) QEMU() sdkqemu.Service           { panic("not needed") }
+// QEMU returns a benign stub whose Config call returns an empty map (no
+// virtio0 entry) rather than panicking: cloneFromTemplate's §1.3
+// resolveTemplateDiskStorage reads the template's config to detect a
+// linked-clone storage-placement mismatch before every clone attempt, so
+// QEMU() is now reachable on every template-clone path, not only paths that
+// exercise VM lifecycle calls. An empty config makes template storage
+// resolution "undeterminable", which fails open to this test's pre-existing
+// (vm_storage-keyed) expectations — the test asserts on clone-error handling
+// and ListQemu, not on clone-mode selection.
+func (p *templateGapPVE) QEMU() sdkqemu.Service           { return &etQEMU{} }
 func (p *templateGapPVE) Nodes() sdknodes.Service         { return p.nodes }
 func (p *templateGapPVE) Tasks() sdktasks.Service         { panic("not needed") }
 func (p *templateGapPVE) Storage() sdkstorage.Service     { panic("not needed") }

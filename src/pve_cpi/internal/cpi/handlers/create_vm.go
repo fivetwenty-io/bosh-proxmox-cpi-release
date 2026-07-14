@@ -2398,6 +2398,45 @@ func lookupVMStorageType(ctx context.Context, deps Deps, storageName string) str
 	return ""
 }
 
+// resolveTemplateDiskStorage reads templateVMID's config on templateNode and
+// returns the PVE storage pool name its root disk resides on. create_stemcell
+// always places a template's system disk on virtio0 (see create_stemcell.go),
+// so that is the only bus checked here.
+//
+// A linked clone's overlay volume always lands on the SAME storage pool as
+// its base (PVE does not honor the Storage/Format params on a linked clone),
+// so cloneFromTemplate needs the template's actual pool — not vm_storage — to
+// decide whether clone_mode=linked would silently misplace the disk.
+//
+// Any failure to determine the pool (config read error, missing/unparseable
+// virtio0 entry) returns ("", non-nil err). Callers MUST treat a non-nil err
+// as "undeterminable" and fail open to the pre-existing (vm_storage-keyed)
+// behavior with a Warn — the template's storage is cluster state the CPI
+// does not control, and a transient read hiccup here must never hard-fail
+// create_vm.
+func resolveTemplateDiskStorage(ctx context.Context, deps Deps, templateNode string, templateVMID int64) (storage string, err error) {
+	if deps.PVE == nil || deps.PVE.QEMU() == nil {
+		return "", fmt.Errorf("PVE QEMU service unavailable")
+	}
+	cfg, cfgErr := deps.PVE.QEMU().Config(ctx, templateNode, int(templateVMID))
+	if cfgErr != nil {
+		return "", fmt.Errorf("read template %d config on node %q: %w", templateVMID, templateNode, cfgErr)
+	}
+	v0, ok := cfg[diskKeyVirtio0].(string)
+	if !ok || v0 == "" {
+		return "", fmt.Errorf("template %d config on node %q has no %s entry", templateVMID, templateNode, diskKeyVirtio0)
+	}
+	bare := v0
+	if comma := strings.Index(bare, ","); comma >= 0 {
+		bare = bare[:comma]
+	}
+	storage, _, parseErr := pve.ParseDiskCID(bare)
+	if parseErr != nil {
+		return "", fmt.Errorf("parse template %d virtio0 volid %q: %w", templateVMID, bare, parseErr)
+	}
+	return storage, nil
+}
+
 // resolveVMIDAllocParams returns the VMID range start and per-create allocation
 // retry budget. maxAttempts defaults to 10 so a parallel CF deploy (many
 // simultaneous stemcell imports against the same PVE storage) can survive
@@ -3201,16 +3240,29 @@ func handleCloneError(
 }
 
 // cloneFromTemplate clones templateVMID (on templateNode) into the candidate
-// VMID, selecting linked vs full clone per clone_mode config and the storage
-// backend capability reported by IsLinkedCloneSupported. It also enforces the
-// cross-node placement policy via ValidateTemplateCloneStorage and sets
-// params.Target when the template node differs from the desired VM node and
-// the storage is confirmed shared.
+// VMID, selecting linked vs full clone per clone_mode config, the storage
+// backend capability reported by IsLinkedCloneSupported, and — because a
+// linked clone's overlay volume always lands on the template's OWN storage
+// pool, never on vm_storage — whether vm_storage actually matches the
+// template's pool. It also enforces the cross-node placement policy via
+// ValidateTemplateCloneStorage and sets params.Target when the template node
+// differs from the desired VM node and the storage is confirmed shared.
 //
 // Clone-mode selection:
-//   - "linked" — forced linked; error if storage does not support it.
+//   - "linked" — forced linked; error if the template's storage does not
+//     support linked clones, OR if vm_storage differs from the template's
+//     storage (a linked clone there would silently misplace the disk).
 //   - "full"   — forced full; Storage and Format are set on params.
-//   - "auto"/"" — linked when supported, full otherwise.
+//   - "auto"/"" — linked when the template's storage supports it AND
+//     vm_storage matches the template's storage; full otherwise (including
+//     when vm_storage differs from the template's storage — auto downgrades
+//     rather than misplacing the disk).
+//
+// The template's own storage pool is resolved once via
+// resolveTemplateDiskStorage. When it cannot be determined (config read
+// error, missing/unparseable virtio0), every check below fails open to the
+// pre-1.3 behavior — keyed on vm_storage's own capability only, exactly as
+// before — with a Warn, never a hard failure on missing facts.
 //
 // Storage and Format are only set on full-clone params (SDK requirement).
 // Target is set only for cross-node clones on shared storage. Cross-node
@@ -3235,12 +3287,53 @@ func cloneFromTemplate(
 		return err
 	}
 
+	templateStorage, templateStorageErr := resolveTemplateDiskStorage(ctx, deps, templateNode, templateVMID)
+	templateStorageKnown := templateStorageErr == nil
+	if !templateStorageKnown {
+		logger.Warn("create_vm: could not determine template's storage pool; "+
+			"clone_mode placement checks fall back to vm_storage's own capability only",
+			log.Int64("template_vmid", templateVMID),
+			log.String("template_node", templateNode),
+			log.Err(templateStorageErr),
+		)
+	}
+	// A linked clone's overlay always lands on templateStorage, never on
+	// vm_storage, so any mismatch between the two is a real misplacement risk
+	// — but only when templateStorage is actually known.
+	storageMismatch := templateStorageKnown && templateStorage != shape.vmStorage
+
 	linkedOK := pve.IsLinkedCloneSupported(shape.vmStorageType)
 
 	var full *bool
 	switch mode {
 	case "linked":
-		if !linkedOK {
+		switch {
+		case storageMismatch:
+			return cpierrors.Cloud(
+				"create_vm: clone_mode=linked but vm_storage %q differs from the template's storage %q; "+
+					"linked clones always land on the template's storage pool, so this would silently place "+
+					"the root disk on %q instead of the configured vm_storage — set clone_mode: auto or "+
+					"clone_mode: full, or align pve.stemcell_storage/pve.vm_storage (or cloud_properties.storage) "+
+					"to the same pool as the template",
+				shape.vmStorage, templateStorage, templateStorage,
+			)
+		case templateStorageKnown:
+			// Same pool as the template: the capability that matters is the
+			// template's own storage type (identical pool to vm_storage here,
+			// so this is also vm_storage's type — but resolved directly from
+			// the template for clarity and to avoid relying on that equality).
+			templateStorageType := lookupVMStorageType(ctx, deps, templateStorage)
+			if !pve.IsLinkedCloneSupported(templateStorageType) {
+				return cpierrors.Cloud(
+					"create_vm: clone_mode=linked but the template's storage %q (type %q) does not support"+
+						" linked clones; use clone_mode=auto or clone_mode=full, or switch to a"+
+						" snapshot-capable storage backend",
+					templateStorage, templateStorageType,
+				)
+			}
+		case !linkedOK:
+			// Template storage undeterminable: fail open to the pre-1.3
+			// vm_storage-keyed capability check.
 			return cpierrors.Cloud(
 				"create_vm: clone_mode=linked but storage %q (type %q) does not support linked clones;"+
 					" use clone_mode=auto or clone_mode=full, or switch to a snapshot-capable storage backend",
@@ -3252,14 +3345,38 @@ func cloneFromTemplate(
 		t := true
 		full = &t
 	default: // "auto"
-		if !linkedOK {
+		switch {
+		case storageMismatch:
 			t := true
 			full = &t
-		} else if shape.vmStorageType == "" {
-			// Storage type lookup failed or returned empty; IsLinkedCloneSupported
-			// treats unknown type as linked-capable (permissive default). Log at
-			// debug so a PVE rejection of a linked clone is diagnosable even when
-			// the storage type could not be determined at clone time.
+			logger.Info("create_vm: clone_mode=auto: downgrading linked clone to full clone because"+
+				" vm_storage differs from the template's storage",
+				log.String("vm_storage", shape.vmStorage),
+				log.String("template_storage", templateStorage),
+			)
+		case templateStorageKnown:
+			// Same pool as the template: key the capability check off the
+			// template's own storage type, freshly resolved — mirrors the
+			// forced-linked branch above and avoids relying on shape.vmStorageType
+			// (populated once at VM-shape build time) staying in sync with the
+			// template's pool.
+			templateStorageType := lookupVMStorageType(ctx, deps, templateStorage)
+			if !pve.IsLinkedCloneSupported(templateStorageType) {
+				t := true
+				full = &t
+			}
+			// Otherwise full remains nil → linked clone.
+		case !linkedOK:
+			// Template storage undeterminable: fail open to the pre-1.3
+			// vm_storage-keyed capability check.
+			t := true
+			full = &t
+		case shape.vmStorageType == "":
+			// Template storage undeterminable AND vm_storage's own type lookup
+			// failed or returned empty; IsLinkedCloneSupported treats unknown type
+			// as linked-capable (permissive default). Log at debug so a PVE
+			// rejection of a linked clone is diagnosable even when the storage
+			// type could not be determined at clone time.
 			logger.Debug("create_vm: clone_mode=auto: storage type unknown, assuming linked-clone support",
 				log.String("vm_storage", shape.vmStorage),
 			)

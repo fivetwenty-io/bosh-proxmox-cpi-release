@@ -279,11 +279,20 @@ properties:
   pve.clone_mode:
     description: |
       Controls the clone type used when create_vm clones a stemcell template.
-      "auto" (default when unset): linked clone for snapshot-capable backends
-      (dir, nfs, cifs, zfspool, lvmthin, rbd, cephfs); full clone for lvm-thick
-      (linked clone not supported on lvm-thick). "linked": force linked clone;
-      returns an error if the backing storage is lvm-thick. "full": force full
-      clone on all backends. One of auto|linked|full.
+      A linked clone's overlay volume always lands on the TEMPLATE's own
+      storage pool (PVE does not honor a Storage override on linked clones) —
+      never on vm_storage; only a full clone can be placed on vm_storage.
+      "auto" (default when unset): linked clone when the template's storage
+      supports it (all backends except lvm-thick) AND vm_storage is the same
+      pool as the template's storage (stemcell_storage); full clone otherwise,
+      including whenever vm_storage differs from the template's storage, so
+      the root disk always lands where vm_storage points rather than silently
+      landing on stemcell_storage. "linked": force linked clone; returns an
+      error if the template's storage does not support linked clones (e.g.
+      lvm-thick), or if vm_storage differs from the template's storage (which
+      would silently misplace the disk) — set clone_mode to auto or full, or
+      align stemcell_storage/vm_storage, to resolve. "full": force full clone
+      on all backends. One of auto|linked|full.
     default: ""
   pve.allow_disk_ops_with_snapshots:
     description: |
