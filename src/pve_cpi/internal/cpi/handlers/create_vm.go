@@ -3982,6 +3982,12 @@ func configureNICs(
 		return nil, err
 	}
 
+	// SDN vnets run at a reduced MTU (VXLAN encapsulation spends ~50 bytes;
+	// PVE derives e.g. 1450 on a 1500 underlay). NICs attached to a vnet get
+	// mtu=1 — "inherit the bridge MTU" — so the guest never emits an
+	// oversized frame. One vnet listing per create_vm call, fail-open.
+	vnetNames := sdnVnetNameSet(ctx, deps, logger, len(netNames))
+
 	// Build net map[int]string and ipconfig map[int]string for UpdateQemuConfigParams
 	netMap := make(map[int]string, len(netNames))
 	ipconfigMap := make(map[int]string, len(netNames))
@@ -4002,6 +4008,10 @@ func configureNICs(
 		netMap[i] = fmt.Sprintf("%s,bridge=%s", model, bridge)
 		if nicFirewall {
 			netMap[i] += ",firewall=1"
+		}
+		// mtu=1 is a virtio-only option (PVE rejects it on e1000/rtl8139).
+		if _, isVnet := vnetNames[bridge]; isVnet && strings.HasPrefix(model, "virtio") {
+			netMap[i] += ",mtu=1"
 		}
 		if bridge != "" {
 			bridgeSet[bridge] = struct{}{}
@@ -4068,6 +4078,32 @@ func configureNICs(
 	}
 
 	return netNames, nil
+}
+
+// sdnVnetNameSet returns the set of SDN vnet names currently defined
+// (pending included) so configureNICs can hand vnet-attached virtio NICs
+// mtu=1 (inherit the bridge MTU). Deliberately FAIL-OPEN: any listing
+// failure returns an empty set and the VM creates without the mtu option —
+// a guest at the underlay MTU on an external bridge is unaffected, and a
+// guest on a vnet degrades to the pre-existing behavior rather than
+// blocking create_vm. Skipped entirely (nil, no API call) unless the CPI is
+// in an SDN-capable mode ("sdn"/"auto") and the VM has NICs.
+func sdnVnetNameSet(ctx context.Context, deps Deps, logger *log.Logger, nicCount int) map[string]struct{} {
+	mode := deps.Config.NetworkMode
+	if nicCount == 0 || (mode != "sdn" && mode != "auto") {
+		return nil
+	}
+	vnets, err := pve.ListSDNVnets(ctx, deps.PVE)
+	if err != nil {
+		logger.Debug("create_vm: SDN vnet listing failed; NICs get no mtu inheritance",
+			log.Err(err))
+		return nil
+	}
+	set := make(map[string]struct{}, len(vnets))
+	for _, v := range vnets {
+		set[v.Vnet] = struct{}{}
+	}
+	return set
 }
 
 // resolveNICAttributes computes the effective bridge, model, and per-NIC
