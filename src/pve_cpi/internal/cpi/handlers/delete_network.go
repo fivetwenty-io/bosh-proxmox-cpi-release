@@ -157,7 +157,7 @@ func deleteNetworkSDN(ctx context.Context, deps Deps, vnet, zone string) error {
 // the CPI cannot confirm is empty".
 func maybeDeleteOrphanedZone(ctx context.Context, deps Deps, zone string) error {
 	cfg := deps.Config
-	if zone == "" || !cfg.SDNAutoManageZone {
+	if zone == "" || !cfg.SDNAutoManageZoneEnabled() {
 		return nil
 	}
 	if cfg.SDNZone != "" && strings.EqualFold(zone, cfg.SDNZone) {

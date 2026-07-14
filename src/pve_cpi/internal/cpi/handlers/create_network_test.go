@@ -28,7 +28,7 @@ func testSDNDeps(clusterSvc sdkcluster.Service, networkMode, sdnZone string, aut
 	cfg.NetworkMode = networkMode
 	cfg.SDNZone = sdnZone
 	cfg.SDNZoneType = "simple"
-	cfg.SDNAutoManageZone = autoManage
+	cfg.SDNAutoManageZone = &autoManage
 	return handlers.Deps{
 		Config: cfg,
 		PVE: &mockPVEClient{
@@ -1145,7 +1145,7 @@ func testSDNDepsWithProfiles(
 	cfg.NetworkMode = networkMode
 	cfg.SDNZone = sdnZone
 	cfg.SDNZoneType = "simple"
-	cfg.SDNAutoManageZone = false
+	cfg.SDNAutoManageZone = boolPtr(false)
 	cfg.VMTypes = vmTypes
 	return handlers.Deps{
 		Config: cfg,

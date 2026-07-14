@@ -299,7 +299,7 @@ func createNetworkSDN(
 	createdZone, err := resolveOrCreateSDNZone(ctx, deps, clusterSvc, sdnZoneArgs{
 		zone:              zone,
 		zoneType:          zoneType,
-		sdnAutoManageZone: cfg.SDNAutoManageZone,
+		sdnAutoManageZone: cfg.SDNAutoManageZoneEnabled(),
 	})
 	if err != nil {
 		return nil, err
@@ -467,7 +467,7 @@ func validateCreateNetworkSDNPreflight(cfg *config.CPIConfig, cp map[string]any,
 	}
 
 	if zone == "" {
-		if !cfg.SDNAutoManageZone {
+		if !cfg.SDNAutoManageZoneEnabled() {
 			return "", cpierrors.Cloud(
 				"create_network: SDN zone is required — set cloud_properties.zone, config sdn_zone, " +
 					"or enable sdn_auto_manage_zone",

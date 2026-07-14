@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -58,26 +59,49 @@ type CPIConfig struct {
 	// "sdn" — PVE SDN vnet lifecycle (requires SDN enabled on the cluster).
 	// "bridge" — Linux bridge lifecycle via nodes API.
 	// "auto" — use SDN if cloud_properties.zone or config SDNZone is set;
-	//           fall back to bridge otherwise.
-	// Defaults to "auto".
+	//           fall back to bridge otherwise (legacy heuristic, opt-in).
+	// Defaults to "sdn".
 	NetworkMode string `json:"network_mode,omitempty"`
 
 	// SDNZone is the default PVE SDN zone name for vnet creation. Operators may
-	// override per-call via cloud_properties.zone. When empty and NetworkMode
-	// requires SDN, the zone must be supplied in cloud_properties.
+	// override per-call via cloud_properties.zone. When empty and auto-manage is
+	// enabled, the CPI uses the turnkey zone name "bosh"; when empty and
+	// auto-manage is disabled, the zone must be supplied in cloud_properties.
 	SDNZone string `json:"sdn_zone,omitempty"`
 
 	// SDNZoneType is the PVE zone type used when the CPI creates the zone itself
 	// (auto-manage enabled and zone absent). Valid values: simple, vlan, qinq,
-	// vxlan, evpn. Defaults to "simple".
+	// vxlan, evpn. Defaults to "vxlan" — the only turnkey type whose vnets span
+	// every cluster node. "evpn" is never auto-created: the operator must
+	// pre-create the zone and its BGP controller; the CPI then manages only
+	// vnets and subnets inside it.
 	SDNZoneType string `json:"sdn_zone_type,omitempty"`
 
 	// SDNAutoManageZone controls whether the CPI may create and delete the zone.
-	// When true, create_network creates the zone (type SDNZoneType) if absent,
-	// and delete_network deletes the zone if: it is not pinned by SDNZone, and
-	// it has no remaining vnets. Default false (operator manages zones; CPI
-	// manages only vnets).
-	SDNAutoManageZone bool `json:"sdn_auto_manage_zone,omitempty"`
+	// When enabled, create_network creates the zone (type SDNZoneType) if absent,
+	// and delete_network deletes the zone if: it is not pinned by SDNZone, it is
+	// not an EVPN zone, and it has no remaining vnets. Pointer so JSON omission
+	// (nil) is distinguishable from explicit false; use SDNAutoManageZoneEnabled()
+	// for the effective bool. Defaults to true (turnkey zone ownership).
+	SDNAutoManageZone *bool `json:"sdn_auto_manage_zone,omitempty"`
+
+	// SDNVxlanPeers is an optional explicit list of VXLAN peer IPs used when the
+	// CPI creates a vxlan zone. Empty (the default) derives the peer list from
+	// the cluster membership (/cluster/status node IPs). Set it when tunnel
+	// traffic must ride a dedicated underlay network whose addresses differ from
+	// the management IPs.
+	SDNVxlanPeers []string `json:"sdn_vxlan_peers,omitempty"`
+
+	// SDNVNIRangeStart/End bound the band from which the CPI auto-allocates
+	// VXLAN Network Identifiers (vnet tags) for zone types that require one
+	// (vlan, qinq, vxlan, evpn). 0 defaults to 5000/5999. Per-network override
+	// via cloud_properties.vnet_tag.
+	SDNVNIRangeStart int `json:"sdn_vni_range_start,omitempty"`
+	SDNVNIRangeEnd   int `json:"sdn_vni_range_end,omitempty"`
+
+	// SDNZoneMTU overrides the MTU on CPI-created zones. Unset (nil) lets PVE
+	// derive it from the underlay (e.g. 1450 on a 1500 underlay for vxlan).
+	SDNZoneMTU *int64 `json:"sdn_zone_mtu,omitempty"`
 
 	// TLS — pointer so JSON omission (nil) is distinguishable from explicit false.
 	// Use VerifySSLValue() to obtain the effective bool.
@@ -1374,6 +1398,17 @@ func (c *CPIConfig) VerifySSLValue() bool {
 	return *c.VerifySSL
 }
 
+// SDNAutoManageZoneEnabled returns the effective zone auto-management bool.
+// nil (field absent from JSON) → true (turnkey by default).
+// *false → false (operator explicitly owns zones).
+// *true  → true.
+func (c *CPIConfig) SDNAutoManageZoneEnabled() bool {
+	if c.SDNAutoManageZone == nil {
+		return true
+	}
+	return *c.SDNAutoManageZone
+}
+
 // ApplyDefaults sets zero-value optional fields to their documented defaults.
 // Callers must invoke this before Validate when constructing a CPIConfig manually.
 func (c *CPIConfig) ApplyDefaults() {
@@ -1471,10 +1506,18 @@ func (c *CPIConfig) ApplyDefaults() {
 		c.CloneMode = "auto"
 	}
 	if c.NetworkMode == "" {
-		c.NetworkMode = "auto"
+		c.NetworkMode = "sdn"
 	}
 	if c.SDNZoneType == "" {
-		c.SDNZoneType = "simple"
+		c.SDNZoneType = "vxlan"
+	}
+	// VNI auto-allocation band. Filled unconditionally (unlike the parker band)
+	// because the band is always meaningful once a tagged zone type is in play.
+	if c.SDNVNIRangeStart == 0 {
+		c.SDNVNIRangeStart = 5000
+	}
+	if c.SDNVNIRangeEnd == 0 {
+		c.SDNVNIRangeEnd = 5999
 	}
 	c.applyPlacementDefaults()
 	c.applyOTelDefaults()
@@ -2588,6 +2631,7 @@ func (c *CPIConfig) ValidateWithLogger(_ *log.Logger) error {
 	c.validateRequiredFields(&errs)
 	c.validateAuth(&errs)
 	c.validateEnumFields(&errs)
+	c.validateSDNFields(&errs)
 	c.validateRanges(&errs)
 	c.validatePlacement(&errs)
 	c.validateHooks(&errs)
@@ -2838,6 +2882,37 @@ func (c *CPIConfig) validateEnumFields(errs *[]string) {
 		if !pool.AppendCertsFromPEM([]byte(c.PVECACertPEM)) {
 			*errs = append(*errs, "pve_ca_cert: no valid PEM certificates parsed from value")
 		}
+	}
+}
+
+// validateSDNFields appends an error for each malformed SDN overlay field:
+// VXLAN peer IPs, the VNI auto-allocation band, and the zone MTU override.
+func (c *CPIConfig) validateSDNFields(errs *[]string) {
+	// VXLAN peer IPs — each entry must parse as an IP address.
+	for _, peer := range c.SDNVxlanPeers {
+		if net.ParseIP(peer) == nil {
+			*errs = append(*errs, fmt.Sprintf(
+				"sdn_vxlan_peers entry %q is not a valid IP address", peer,
+			))
+		}
+	}
+
+	// VNI band — full 24-bit VNI space; the vlan/qinq 4094 cap is enforced at
+	// allocation time where the effective zone type is known.
+	if c.SDNVNIRangeStart != 0 || c.SDNVNIRangeEnd != 0 {
+		if c.SDNVNIRangeStart < 1 || c.SDNVNIRangeEnd > 16777215 || c.SDNVNIRangeStart > c.SDNVNIRangeEnd {
+			*errs = append(*errs, fmt.Sprintf(
+				"sdn_vni_range must satisfy 1 <= start <= end <= 16777215, got %d..%d",
+				c.SDNVNIRangeStart, c.SDNVNIRangeEnd,
+			))
+		}
+	}
+
+	// Zone MTU — sane Ethernet/jumbo bounds when set.
+	if c.SDNZoneMTU != nil && (*c.SDNZoneMTU < 576 || *c.SDNZoneMTU > 65520) {
+		*errs = append(*errs, fmt.Sprintf(
+			"sdn_zone_mtu must be within 576..65520, got %d", *c.SDNZoneMTU,
+		))
 	}
 }
 
@@ -3565,7 +3640,7 @@ func (c *CPIConfig) strictCheckSDNZone(errs *[]string) {
 	if c.NetworkMode != "sdn" {
 		return
 	}
-	if c.SDNZone != "" || c.SDNAutoManageZone {
+	if c.SDNZone != "" || c.SDNAutoManageZoneEnabled() {
 		return
 	}
 	*errs = append(*errs, "network_mode=sdn requires sdn_zone or sdn_auto_manage_zone=true (strict_config_validation=true)")

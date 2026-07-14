@@ -29,7 +29,7 @@ func testDeleteDeps(clusterSvc sdkcluster.Service, autoManage bool, sdnZone stri
 	cfg := testConfig()
 	cfg.NetworkMode = "auto"
 	cfg.SDNZone = sdnZone
-	cfg.SDNAutoManageZone = autoManage
+	cfg.SDNAutoManageZone = &autoManage
 	return handlers.Deps{
 		Config: cfg,
 		PVE: &mockPVEClient{

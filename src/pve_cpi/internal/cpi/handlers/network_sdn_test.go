@@ -84,6 +84,9 @@ func TestApplySDN_HappyPath(t *testing.T) {
 
 	cfg := testConfig()
 	cfg.NetworkMode = "auto"
+	// Zone teardown is out of scope here — pin auto-manage off so the
+	// UPID path is the only SDN surface exercised.
+	cfg.SDNAutoManageZone = boolPtr(false)
 	// Node matches the node field in the UPID.
 	cfg.Node = "pve-node1"
 
@@ -138,6 +141,9 @@ func TestApplySDN_MalformedUPID(t *testing.T) {
 
 	cfg := testConfig()
 	cfg.NetworkMode = "auto"
+	// Zone teardown is out of scope here — pin auto-manage off so the
+	// UPID path is the only SDN surface exercised.
+	cfg.SDNAutoManageZone = boolPtr(false)
 	// Empty node: applySDN cannot fall back to config.Node either.
 	cfg.Node = ""
 

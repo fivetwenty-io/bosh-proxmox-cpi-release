@@ -1221,36 +1221,195 @@ func TestApplyDefaults_SnapshotGuardBools(t *testing.T) {
 // --------------------------------------------------------------------------
 
 // --------------------------------------------------------------------------
-// TestApplyDefaults_NetworkMode_DefaultsToAuto
+// TestApplyDefaults_NetworkMode_DefaultsToSDN
 // --------------------------------------------------------------------------
 
-// TestApplyDefaults_NetworkMode_DefaultsToAuto verifies that a zero-value
-// CPIConfig gets NetworkMode="auto" after ApplyDefaults.
-func TestApplyDefaults_NetworkMode_DefaultsToAuto(t *testing.T) {
+// TestApplyDefaults_NetworkMode_DefaultsToSDN verifies that a zero-value
+// CPIConfig gets NetworkMode="sdn" after ApplyDefaults.
+func TestApplyDefaults_NetworkMode_DefaultsToSDN(t *testing.T) {
 	t.Parallel()
 	var cfg config.CPIConfig
 	cfg.VMStorage = "vm-store"
 	cfg.ApplyDefaults()
 
-	if cfg.NetworkMode != "auto" {
-		t.Errorf("NetworkMode = %q, want %q", cfg.NetworkMode, "auto")
+	if cfg.NetworkMode != "sdn" {
+		t.Errorf("NetworkMode = %q, want %q", cfg.NetworkMode, "sdn")
 	}
 }
 
 // --------------------------------------------------------------------------
-// TestApplyDefaults_SDNZoneType_DefaultsToSimple
+// TestApplyDefaults_SDNZoneType_DefaultsToVxlan
 // --------------------------------------------------------------------------
 
-// TestApplyDefaults_SDNZoneType_DefaultsToSimple verifies that a zero-value
-// CPIConfig gets SDNZoneType="simple" after ApplyDefaults.
-func TestApplyDefaults_SDNZoneType_DefaultsToSimple(t *testing.T) {
+// TestApplyDefaults_SDNZoneType_DefaultsToVxlan verifies that a zero-value
+// CPIConfig gets SDNZoneType="vxlan" after ApplyDefaults.
+func TestApplyDefaults_SDNZoneType_DefaultsToVxlan(t *testing.T) {
 	t.Parallel()
 	var cfg config.CPIConfig
 	cfg.VMStorage = "vm-store"
 	cfg.ApplyDefaults()
 
-	if cfg.SDNZoneType != "simple" {
-		t.Errorf("SDNZoneType = %q, want %q", cfg.SDNZoneType, "simple")
+	if cfg.SDNZoneType != "vxlan" {
+		t.Errorf("SDNZoneType = %q, want %q", cfg.SDNZoneType, "vxlan")
+	}
+}
+
+// --------------------------------------------------------------------------
+// TestApplyDefaults_VNIRange_DefaultsTo5000Band
+// --------------------------------------------------------------------------
+
+// TestApplyDefaults_VNIRange_DefaultsTo5000Band verifies that a zero-value
+// CPIConfig gets the 5000-5999 VNI auto-allocation band after ApplyDefaults.
+func TestApplyDefaults_VNIRange_DefaultsTo5000Band(t *testing.T) {
+	t.Parallel()
+	var cfg config.CPIConfig
+	cfg.VMStorage = "vm-store"
+	cfg.ApplyDefaults()
+
+	if cfg.SDNVNIRangeStart != 5000 || cfg.SDNVNIRangeEnd != 5999 {
+		t.Errorf("VNI range = %d..%d, want 5000..5999", cfg.SDNVNIRangeStart, cfg.SDNVNIRangeEnd)
+	}
+}
+
+// --------------------------------------------------------------------------
+// TestSDNAutoManageZoneEnabled
+// --------------------------------------------------------------------------
+
+// TestSDNAutoManageZoneEnabled verifies the three-state pointer semantics:
+// nil → true (turnkey default), explicit false → false, explicit true → true.
+func TestSDNAutoManageZoneEnabled(t *testing.T) {
+	t.Parallel()
+	var cfg config.CPIConfig
+	if !cfg.SDNAutoManageZoneEnabled() {
+		t.Error("nil SDNAutoManageZone: Enabled() = false, want true")
+	}
+	cfg.SDNAutoManageZone = boolPtr(false)
+	if cfg.SDNAutoManageZoneEnabled() {
+		t.Error("explicit false: Enabled() = true, want false")
+	}
+	cfg.SDNAutoManageZone = boolPtr(true)
+	if !cfg.SDNAutoManageZoneEnabled() {
+		t.Error("explicit true: Enabled() = false, want true")
+	}
+}
+
+// --------------------------------------------------------------------------
+// TestLoad_SDNAutoManageZone_ExplicitFalse_Preserved
+// --------------------------------------------------------------------------
+
+// TestLoad_SDNAutoManageZone_ExplicitFalse_Preserved verifies that an explicit
+// JSON false survives Load and defeats the turnkey default.
+func TestLoad_SDNAutoManageZone_ExplicitFalse_Preserved(t *testing.T) {
+	t.Parallel()
+	cfg, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+		"sdn_zone":"opzone",
+		"sdn_auto_manage_zone":false
+	}`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.SDNAutoManageZoneEnabled() {
+		t.Error("explicit false in JSON: Enabled() = true, want false")
+	}
+}
+
+// --------------------------------------------------------------------------
+// TestValidate_SDNVxlanPeers
+// --------------------------------------------------------------------------
+
+func TestValidate_SDNVxlanPeers(t *testing.T) {
+	t.Parallel()
+	t.Run("valid IPs accepted", func(t *testing.T) {
+		t.Parallel()
+		_, err := mustLoad(t, `{
+			"host":"h","user":"u","password":"p",
+			"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+			"sdn_vxlan_peers":["192.168.1.10","fd00::1"]
+		}`)
+		if err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+	t.Run("hostname rejected", func(t *testing.T) {
+		t.Parallel()
+		_, err := mustLoad(t, `{
+			"host":"h","user":"u","password":"p",
+			"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+			"sdn_vxlan_peers":["pve1.lab"]
+		}`)
+		assertCloudError(t, err, "not a valid IP address")
+	})
+}
+
+// --------------------------------------------------------------------------
+// TestValidate_SDNVNIRange
+// --------------------------------------------------------------------------
+
+func TestValidate_SDNVNIRange(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name    string
+		json    string
+		wantErr string
+	}{
+		{"explicit valid band", `"sdn_vni_range_start":7000,"sdn_vni_range_end":7099`, ""},
+		{"end below start", `"sdn_vni_range_start":6000,"sdn_vni_range_end":5000`, "sdn_vni_range must satisfy"},
+		{"end above 24-bit max", `"sdn_vni_range_start":5000,"sdn_vni_range_end":16777216`, "sdn_vni_range must satisfy"},
+		{"negative start", `"sdn_vni_range_start":-1,"sdn_vni_range_end":100`, "sdn_vni_range must satisfy"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := mustLoad(t, `{
+				"host":"h","user":"u","password":"p",
+				"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+				`+tc.json+`
+			}`)
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Errorf("unexpected error: %v", err)
+				}
+				return
+			}
+			assertCloudError(t, err, tc.wantErr)
+		})
+	}
+}
+
+// --------------------------------------------------------------------------
+// TestValidate_SDNZoneMTU
+// --------------------------------------------------------------------------
+
+func TestValidate_SDNZoneMTU(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name    string
+		json    string
+		wantErr string
+	}{
+		{"typical vxlan mtu", `"sdn_zone_mtu":1450`, ""},
+		{"jumbo overlay", `"sdn_zone_mtu":8950`, ""},
+		{"too small", `"sdn_zone_mtu":100`, "sdn_zone_mtu must be within"},
+		{"too large", `"sdn_zone_mtu":70000`, "sdn_zone_mtu must be within"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := mustLoad(t, `{
+				"host":"h","user":"u","password":"p",
+				"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+				`+tc.json+`
+			}`)
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Errorf("unexpected error: %v", err)
+				}
+				return
+			}
+			assertCloudError(t, err, tc.wantErr)
+		})
 	}
 }
 
@@ -1348,8 +1507,8 @@ func TestLoad_NetworkFields_RoundTrip(t *testing.T) {
 	if cfg.SDNZoneType != "vxlan" {
 		t.Errorf("SDNZoneType = %q, want %q", cfg.SDNZoneType, "vxlan")
 	}
-	if !cfg.SDNAutoManageZone {
-		t.Error("SDNAutoManageZone = false, want true")
+	if !cfg.SDNAutoManageZoneEnabled() {
+		t.Error("SDNAutoManageZoneEnabled() = false, want true")
 	}
 }
 
@@ -1383,9 +1542,9 @@ func TestLoad_UnknownFields_LogsWarn_StillLoads(t *testing.T) {
 	}
 }
 
-// TestLoad_NetworkMode_Omitted_GetsAuto confirms that omitting network_mode
-// from JSON results in NetworkMode="auto" after Load applies defaults.
-func TestLoad_NetworkMode_Omitted_GetsAuto(t *testing.T) {
+// TestLoad_NetworkMode_Omitted_GetsSDN confirms that omitting network_mode
+// from JSON results in NetworkMode="sdn" after Load applies defaults.
+func TestLoad_NetworkMode_Omitted_GetsSDN(t *testing.T) {
 	t.Parallel()
 	cfg, err := mustLoad(t, `{
 		"host":"h","user":"u","password":"p",
@@ -1394,8 +1553,8 @@ func TestLoad_NetworkMode_Omitted_GetsAuto(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if cfg.NetworkMode != "auto" {
-		t.Errorf("NetworkMode = %q, want %q (default when omitted)", cfg.NetworkMode, "auto")
+	if cfg.NetworkMode != "sdn" {
+		t.Errorf("NetworkMode = %q, want %q (default when omitted)", cfg.NetworkMode, "sdn")
 	}
 }
 
