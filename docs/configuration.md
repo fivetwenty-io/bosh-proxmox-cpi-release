@@ -406,6 +406,8 @@ graph TD
 | `pve.storage_tiers` | Map | `{}` | Named storage tiers. Each key is a tier label; each value has `types` (list of PVE storage types), `shared` (*bool), and `encrypted` (*bool). The CPI selects the first live cluster storage matching all specified criteria. Selected via `cloud_properties.storage_tier`. See [Encrypted Storage](#encrypted-storage) for the `encrypted` field. |
 | `pve.security_groups` | List | `[]` | Global default list of PVE firewall group names applied to every VM that does not carry a per-call or per-profile `security_groups` override. Each entry must be a group name that already exists in the PVE firewall configuration. Rules attached from these groups are unenforced unless the PVE **datacenter firewall master switch** is also on — see [Firewall](#firewall). |
 
+**Give every `vm_type` explicit sizing.** When no layer sets `cores`/`cpu`, `sockets`, or `memory`/`ram`, the CPI falls back to `cores: 1`, `sockets: 1`, `memory: 512` MiB — a size that starves the BOSH agent and job processes on anything but the most trivial workload. This fallback exists so `create_vm` never fails outright on a missing size, not as a usable default. Give every `vm_type` at least 2 cores: set `cores`/`cpu` and `memory` explicitly in every `vm_type` profile (and in any `compilation` VM definition, which resolves through the same profile layering), rather than relying on the built-in fallback.
+
 ## Stemcell Management
 
 Controls stemcell template replication, provenance recording, orphan pruning, and fast-path delete.
