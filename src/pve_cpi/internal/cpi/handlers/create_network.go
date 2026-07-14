@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"time"
 
+	"strings"
+
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/cpi"
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
@@ -25,6 +27,26 @@ import (
 // switch and as a PVE node API Type string; keeping them named avoids the goconst
 // threshold while making the distinct semantics explicit.
 const networkModeBridge = "bridge"
+
+// defaultSDNZoneName is the turnkey zone the CPI creates when the SDN path is
+// active, sdn_auto_manage_zone is enabled, and neither cloud_properties.zone
+// nor config sdn_zone names one. A fixed name keeps repeat deployments
+// converging on a single CPI-owned zone instead of inventing one per network.
+const defaultSDNZoneName = "bosh"
+
+// PVE SDN zone plugin types. vlan/qinq/vxlan/evpn vnets carry a tag (VLAN ID
+// or VNI); simple-zone vnets are untagged per-node bridges.
+const (
+	zoneTypeSimple = "simple"
+	zoneTypeVlan   = "vlan"
+	zoneTypeQinq   = "qinq"
+	zoneTypeVxlan  = "vxlan"
+	zoneTypeEvpn   = "evpn"
+)
+
+// vlanMaxTag is the 12-bit VLAN ID ceiling that caps vnet tags in vlan and
+// qinq zones; vxlan/evpn VNIs may use the full 24-bit space.
+const vlanMaxTag = 4094
 
 // HandleCreateNetwork returns a Handler that implements the BOSH create_network method.
 //
@@ -104,6 +126,13 @@ func createNetwork(ctx context.Context, deps Deps, args []json.RawMessage) (any,
 	}
 
 	if useSDN {
+		// Turnkey zone name: when the SDN path is active with auto-manage
+		// enabled and no zone was named anywhere, the CPI owns a fixed zone.
+		// Explicit network_mode=auto with no zone never reaches here (the
+		// switch above already routed it to the bridge path).
+		if zone == "" && cfg.SDNAutoManageZoneEnabled() {
+			zone = defaultSDNZoneName
+		}
 		return createNetworkSDN(ctx, deps, spec, zone, vnet)
 	}
 
@@ -125,9 +154,14 @@ type sdnZoneArgs struct {
 }
 
 // sdnVnetArgs carries all parameters needed by createVnetIdempotent.
+// zoneType is the EFFECTIVE zone type (from PVE when the zone pre-exists,
+// else the configured type) — it decides whether the vnet needs a tag.
+// explicitTag is cloud_properties.vnet_tag (0 = auto-allocate when needed).
 type sdnVnetArgs struct {
-	vnet string
-	zone string
+	vnet        string
+	zone        string
+	zoneType    string
+	explicitTag int
 }
 
 // sdnSubnetArgs carries all parameters needed by createSubnetIdempotent.
@@ -147,45 +181,192 @@ type sdnApplyArgs struct {
 // return value is true only when THIS call created the zone; callers must
 // delete it on rollback when true. Original-call errors are wrapped through
 // pve.WrapError so transient classes keep their Retriable type.
+//
+// The string return is the EFFECTIVE zone type: when the zone pre-exists in
+// PVE its actual plugin type governs downstream vnet tagging (an operator's
+// vxlan zone must get tagged vnets even if the CPI config still says simple);
+// when this call creates the zone the configured type is authoritative. EVPN
+// zones are never auto-created — an EVPN fabric (controller, BGP peers) is
+// operator infrastructure, so an absent EVPN zone fails fast regardless of
+// sdnAutoManageZone.
 func resolveOrCreateSDNZone(
 	ctx context.Context,
-	_ Deps,
+	deps Deps,
 	clusterSvc sdkcluster.Service,
 	args sdnZoneArgs,
-) (zoneCreated bool, err error) {
-	_, zoneGetErr := clusterSvc.GetSdnZones(ctx, args.zone, nil)
+) (effectiveZoneType string, zoneCreated bool, err error) {
+	zoneType := args.zoneType
+	if zoneType == "" {
+		zoneType = zoneTypeVxlan
+	}
+
+	resp, zoneGetErr := clusterSvc.GetSdnZones(ctx, args.zone, nil)
 	if zoneGetErr == nil {
-		// Zone already exists — nothing to create.
-		return false, nil
+		// Zone already exists — nothing to create. Prefer the actual type from
+		// PVE; fall back to the configured type on a sparse response.
+		if resp != nil {
+			var z struct {
+				Type string `json:"type"`
+			}
+			if jsonErr := json.Unmarshal(*resp, &z); jsonErr == nil && z.Type != "" {
+				zoneType = z.Type
+			}
+		}
+		return zoneType, false, nil
 	}
 	if !isSDNNotFound(zoneGetErr) {
-		return false, cpierrors.Wrap(
+		return "", false, cpierrors.Wrap(
 			pve.WrapError(zoneGetErr),
 			fmt.Sprintf("create_network: get SDN zone %q", args.zone),
 		)
 	}
 	// Zone does not exist in PVE.
+	if zoneType == zoneTypeEvpn {
+		return "", false, cpierrors.Cloud(
+			"create_network: EVPN zone %q not found — the CPI never creates EVPN zones. "+
+				"Create the zone and its BGP controller in PVE (Datacenter → SDN) first; "+
+				"the CPI then manages only vnets and subnets inside it",
+			args.zone,
+		)
+	}
 	if !args.sdnAutoManageZone {
-		return false, cpierrors.Cloud(
+		return "", false, cpierrors.Cloud(
 			"create_network: SDN zone %q not found and sdn_auto_manage_zone is false — "+
 				"create the zone in PVE or enable sdn_auto_manage_zone",
 			args.zone,
 		)
 	}
-	zoneType := args.zoneType
-	if zoneType == "" {
-		zoneType = "simple"
+	params, paramsErr := buildZoneCreateParams(ctx, deps, args.zone, zoneType)
+	if paramsErr != nil {
+		return "", false, paramsErr
 	}
-	if err := clusterSvc.CreateSdnZones(ctx, &sdkcluster.CreateSdnZonesParams{
-		Zone: args.zone,
-		Type: zoneType,
-	}); err != nil {
-		return false, cpierrors.Wrap(
+	if err := clusterSvc.CreateSdnZones(ctx, params); err != nil {
+		return "", false, cpierrors.Wrap(
 			pve.WrapError(err),
 			fmt.Sprintf("create_network: create SDN zone %q", args.zone),
 		)
 	}
-	return true, nil
+	return zoneType, true, nil
+}
+
+// buildZoneCreateParams assembles the POST /cluster/sdn/zones payload for a
+// CPI-created zone. vxlan zones need a peer list — explicit sdn_vxlan_peers
+// when set, else the online cluster node IPs; zero derivable peers is a hard
+// error because PVE would accept the zone but no tunnel would ever come up.
+// vlan zones need the underlay bridge (PVE rejects vlan zones without one).
+// The optional sdn_zone_mtu override applies to every type; when unset PVE
+// derives the vnet MTU from the underlay (e.g. 1450 on a 1500 underlay).
+func buildZoneCreateParams(
+	ctx context.Context,
+	deps Deps,
+	zone string,
+	zoneType string,
+) (*sdkcluster.CreateSdnZonesParams, error) {
+	cfg := deps.Config
+	params := &sdkcluster.CreateSdnZonesParams{
+		Zone: zone,
+		Type: zoneType,
+	}
+	if cfg.SDNZoneMTU != nil {
+		mtu := *cfg.SDNZoneMTU
+		params.Mtu = &mtu
+	}
+	switch zoneType {
+	case zoneTypeVxlan:
+		peers := cfg.SDNVxlanPeers
+		if len(peers) == 0 {
+			derived, peersErr := pve.ClusterNodePeerIPs(ctx, deps.PVE)
+			if peersErr != nil {
+				return nil, cpierrors.Wrap(peersErr,
+					fmt.Sprintf("create_network: derive VXLAN peers for zone %q", zone))
+			}
+			peers = derived
+		}
+		if len(peers) == 0 {
+			return nil, cpierrors.Cloud(
+				"create_network: cannot create VXLAN zone %q — no peer IPs derivable from "+
+					"/cluster/status and sdn_vxlan_peers is empty; set pve.sdn_vxlan_peers explicitly",
+				zone,
+			)
+		}
+		// The API contract is a comma-separated peer list (the PVE UI shows
+		// space-separated, but the schema says comma).
+		joined := strings.Join(peers, ",")
+		params.Peers = &joined
+	case zoneTypeVlan:
+		if cfg.NetworkBridge == "" {
+			return nil, cpierrors.Cloud(
+				"create_network: cannot create vlan zone %q — PVE requires an underlay bridge; "+
+					"set pve.network_bridge",
+				zone,
+			)
+		}
+		bridge := cfg.NetworkBridge
+		params.Bridge = &bridge
+	}
+	return params, nil
+}
+
+// zoneTypeRequiresTag reports whether vnets in the given zone type carry a
+// tag (VLAN ID for vlan/qinq, VNI for vxlan/evpn). Simple-zone vnets are
+// untagged per-node bridges.
+func zoneTypeRequiresTag(zoneType string) bool {
+	switch zoneType {
+	case zoneTypeVlan, zoneTypeQinq, zoneTypeVxlan, zoneTypeEvpn:
+		return true
+	default:
+		return false
+	}
+}
+
+// resolveVnetTag returns the tag to bake into a NEW vnet: the explicit
+// cloud_properties.vnet_tag when set, else an auto-allocated VNI from the
+// configured band. Called only after the vnet-existence probe reports absent,
+// so retries and pre-existing vnets never burn VNIs. vlan/qinq zones cap tags
+// at 4094 (12-bit VLAN ID); an explicit tag on an untagged zone type is a
+// config contradiction and errors rather than being silently dropped.
+func resolveVnetTag(ctx context.Context, deps Deps, zoneType string, explicitTag int) (int, error) {
+	if !zoneTypeRequiresTag(zoneType) {
+		if explicitTag != 0 {
+			return 0, cpierrors.Cloud(
+				"create_network: cloud_properties.vnet_tag is only valid for vlan|qinq|vxlan|evpn zones; "+
+					"the target zone is type %q",
+				zoneType,
+			)
+		}
+		return 0, nil
+	}
+	capped := zoneType == zoneTypeVlan || zoneType == zoneTypeQinq
+	if explicitTag != 0 {
+		if capped && explicitTag > vlanMaxTag {
+			return 0, cpierrors.Cloud(
+				"create_network: cloud_properties.vnet_tag %d exceeds the %s-zone maximum %d",
+				explicitTag, zoneType, vlanMaxTag,
+			)
+		}
+		return explicitTag, nil
+	}
+	cfg := deps.Config
+	start, end := cfg.SDNVNIRangeStart, cfg.SDNVNIRangeEnd
+	if start == 0 {
+		start = 5000
+	}
+	if end == 0 {
+		end = 5999
+	}
+	if capped {
+		if start > vlanMaxTag {
+			return 0, cpierrors.Cloud(
+				"create_network: sdn_vni_range_start %d exceeds the %s-zone tag maximum %d — "+
+					"set sdn_vni_range within 1..%d or supply cloud_properties.vnet_tag",
+				start, zoneType, vlanMaxTag, vlanMaxTag,
+			)
+		}
+		if end > vlanMaxTag {
+			end = vlanMaxTag
+		}
+	}
+	return pve.NextVNI(ctx, deps.PVE, start, end)
 }
 
 // createVnetIdempotent probes PVE for an existing vnet and creates it when
@@ -193,9 +374,14 @@ func resolveOrCreateSDNZone(
 // treated as idempotent success; the bool is false in that case so rollback
 // does not delete a vnet this call did not own. The bool return is true only
 // when THIS call created the vnet; callers must delete it on rollback.
+//
+// Tagged zone types (vlan/qinq/vxlan/evpn) get a vnet tag: the explicit
+// cloud_properties.vnet_tag when supplied, else an auto-allocated VNI. Tag
+// resolution runs strictly after the existence probe so pre-existing vnets
+// and director retries never consume VNIs from the band.
 func createVnetIdempotent(
 	ctx context.Context,
-	_ Deps,
+	deps Deps,
 	clusterSvc sdkcluster.Service,
 	args sdnVnetArgs,
 ) (vnetCreated bool, err error) {
@@ -211,10 +397,19 @@ func createVnetIdempotent(
 		)
 	}
 	// Vnet does not exist — create it.
-	if createErr := clusterSvc.CreateSdnVnets(ctx, &sdkcluster.CreateSdnVnetsParams{
+	tag, tagErr := resolveVnetTag(ctx, deps, args.zoneType, args.explicitTag)
+	if tagErr != nil {
+		return false, tagErr
+	}
+	createParams := &sdkcluster.CreateSdnVnetsParams{
 		Vnet: args.vnet,
 		Zone: args.zone,
-	}); createErr != nil {
+	}
+	if tag != 0 {
+		tag64 := int64(tag)
+		createParams.Tag = &tag64
+	}
+	if createErr := clusterSvc.CreateSdnVnets(ctx, createParams); createErr != nil {
 		// 409 conflict = already exists from a concurrent call; treat as idempotent.
 		if isSDNConflict(createErr) {
 			return false, nil
@@ -290,13 +485,15 @@ func createNetworkSDN(
 	cp := spec.CloudProperties
 	clusterSvc := deps.PVE.Cluster()
 
-	zoneType, err := validateCreateNetworkSDNPreflight(cfg, cp, zone, vnet)
+	zoneType, explicitTag, err := validateCreateNetworkSDNPreflight(cfg, cp, zone, vnet)
 	if err != nil {
 		return nil, err
 	}
 
-	// Phase 1: verify zone exists in PVE; create it when sdn_auto_manage_zone is enabled.
-	createdZone, err := resolveOrCreateSDNZone(ctx, deps, clusterSvc, sdnZoneArgs{
+	// Phase 1: verify zone exists in PVE; create it when sdn_auto_manage_zone is
+	// enabled. The effective zone type comes back from PVE when the zone
+	// pre-exists so vnet tagging matches reality, not just config.
+	effectiveZoneType, createdZone, err := resolveOrCreateSDNZone(ctx, deps, clusterSvc, sdnZoneArgs{
 		zone:              zone,
 		zoneType:          zoneType,
 		sdnAutoManageZone: cfg.SDNAutoManageZoneEnabled(),
@@ -309,8 +506,10 @@ func createNetworkSDN(
 	// created the vnet between our GetSdnVnets probe and our CreateSdnVnets call;
 	// the 409 conflict path inside createVnetIdempotent handles that race.
 	vnetCreated, vnetCreateErr := createVnetIdempotent(ctx, deps, clusterSvc, sdnVnetArgs{
-		vnet: vnet,
-		zone: zone,
+		vnet:        vnet,
+		zone:        zone,
+		zoneType:    effectiveZoneType,
+		explicitTag: explicitTag,
 	})
 	if vnetCreateErr != nil {
 		// Best-effort rollback of zone we created this call. Use a context
@@ -432,8 +631,8 @@ func createNetworkSDN(
 	}
 
 	// Build BOSH 3-element response.
-	// Bridge name == vnet name: PVE simple zone realizes the vnet as a
-	// Linux bridge named identically to the vnet.
+	// Bridge name == vnet name: PVE realizes every SDN vnet as a per-node
+	// Linux bridge named after the vnet, for all zone types.
 	addrProps := map[string]any{
 		"range":    spec.Range,
 		"gateway":  spec.Gateway,
@@ -450,32 +649,30 @@ func createNetworkSDN(
 // validateCreateNetworkSDNPreflight performs the pre-PVE-call validation for
 // the SDN create_network path:
 //   - vnet name is required + matches the PVE vnet name grammar.
-//   - zone must be supplied (cloud_properties.zone or config.sdn_zone). When
-//     sdn_auto_manage_zone is true the CPI will create the zone if absent, but
-//     it does NOT invent a zone name; the operator must still supply one.
+//   - zone must be resolvable. With sdn_auto_manage_zone enabled the routing
+//     layer already filled the turnkey default ("bosh"), so an empty zone here
+//     means auto-manage is off and the operator must name one.
+//   - cloud_properties.vnet_tag, when set, must be a valid 24-bit VNI. The
+//     vlan/qinq 4094 cap is enforced later where the effective zone type is
+//     known.
 //
-// Returns the resolved zone type used for auto-create. Resolution order:
-// resolver (call CP → disk_type profile → vm_type profile) → config.SDNZoneType.
-func validateCreateNetworkSDNPreflight(cfg *config.CPIConfig, cp map[string]any, zone, vnet string) (string, error) {
+// Returns the resolved zone type used for auto-create (resolution order:
+// resolver call CP → disk_type profile → vm_type profile → config.SDNZoneType)
+// and the explicit vnet tag (0 = unset).
+func validateCreateNetworkSDNPreflight(cfg *config.CPIConfig, cp map[string]any, zone, vnet string) (string, int, error) {
 	if vnet == "" {
-		return "", cpierrors.Cloud(
+		return "", 0, cpierrors.Cloud(
 			"create_network: cloud_properties.vnet is required for the SDN path",
 		)
 	}
 	if err := validateVnetName(vnet); err != nil {
-		return "", err
+		return "", 0, err
 	}
 
 	if zone == "" {
-		if !cfg.SDNAutoManageZoneEnabled() {
-			return "", cpierrors.Cloud(
-				"create_network: SDN zone is required — set cloud_properties.zone, config sdn_zone, " +
-					"or enable sdn_auto_manage_zone",
-			)
-		}
-		return "", cpierrors.Cloud(
-			"create_network: cloud_properties.zone is required when sdn_auto_manage_zone is true " +
-				"and no sdn_zone is configured in the CPI config",
+		return "", 0, cpierrors.Cloud(
+			"create_network: SDN zone is required — set cloud_properties.zone, config sdn_zone, " +
+				"or enable sdn_auto_manage_zone",
 		)
 	}
 
@@ -489,7 +686,7 @@ func validateCreateNetworkSDNPreflight(cfg *config.CPIConfig, cp map[string]any,
 	if rErr != nil {
 		// Resolver error here means an unknown vm_type/disk_type in the call CP.
 		// Return it as-is — it is already a CloudError.
-		return "", rErr
+		return "", 0, rErr
 	}
 	var zoneType string
 	if v, ok := r.String("zone_type"); ok {
@@ -497,7 +694,16 @@ func validateCreateNetworkSDNPreflight(cfg *config.CPIConfig, cp map[string]any,
 	} else {
 		zoneType = cfg.SDNZoneType
 	}
-	return zoneType, nil
+	var vnetTag int
+	if v, ok := r.Int("vnet_tag"); ok {
+		if v < 1 || v > 16777215 {
+			return "", 0, cpierrors.Cloud(
+				"create_network: cloud_properties.vnet_tag must be within 1..16777215, got %d", v,
+			)
+		}
+		vnetTag = v
+	}
+	return zoneType, vnetTag, nil
 }
 
 // createNetworkBridge implements the Linux bridge creation flow via the nodes API.

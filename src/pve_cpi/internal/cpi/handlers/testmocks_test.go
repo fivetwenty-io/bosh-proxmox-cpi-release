@@ -532,6 +532,7 @@ type mockSDNCluster struct {
 	deleteSdnVnetsSubnetsFn func(ctx context.Context, vnet string, subnet string, params *cluster.DeleteSdnVnetsSubnetsParams) error
 	listSdnVnetsSubnetsFn   func(ctx context.Context, vnet string, params *cluster.ListSdnVnetsSubnetsParams) (*cluster.ListSdnVnetsSubnetsResponse, error)
 	updateSdnFn             func(ctx context.Context, params *cluster.UpdateSdnParams) (*cluster.UpdateSdnResponse, error)
+	listStatusFn            func(ctx context.Context) (*cluster.ListStatusResponse, error)
 }
 
 // compile-time interface check.
@@ -624,6 +625,13 @@ func (m *mockSDNCluster) UpdateSdn(ctx context.Context, params *cluster.UpdateSd
 		return m.updateSdnFn(ctx, params)
 	}
 	panic("mockSDNCluster.UpdateSdn called without configuration; opt in by setting updateSdnFn")
+}
+
+func (m *mockSDNCluster) ListStatus(ctx context.Context) (*cluster.ListStatusResponse, error) {
+	if m.listStatusFn != nil {
+		return m.listStatusFn(ctx)
+	}
+	panic("mockSDNCluster.ListStatus called without configuration; opt in by setting listStatusFn")
 }
 
 // HA rule/resource stubs: return not-found so removeNodeAffinityPin is a
