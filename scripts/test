@@ -237,15 +237,17 @@ def tier_lifecycle(cfg: dict, cpi_config_path: str, keep: bool) -> int:
     # Network-test passes. tier1.network_test.modes selects which create_network/
     # delete_network paths to exercise, each as one extra lifecycle pass with
     # out-of-band PVE verification. Kept independent of disk_storage_pools (no
-    # cross product). Accepts an explicit list (e.g. [sdn, bridge]) or the string
-    # `auto` to detect at run time which modes the PVE host supports (sdn when
-    # SDN is installed with a usable zone; bridge when the configured iface is
-    # free). Empty/absent -> no extra passes (backward compatible).
+    # cross product). Accepts an explicit list drawn from [sdn, sdn-simple,
+    # bridge] (sdn exercises the vxlan default; sdn-simple is the simple-zone
+    # opt-in) or the string `auto` to detect at run time which modes the PVE
+    # host supports (up to three passes: sdn + sdn-simple when SDN is installed
+    # with a usable zone; bridge when the configured iface is free).
+    # Empty/absent -> no extra passes (backward compatible).
     raw_modes = cfg.get("tier1", {}).get("network_test", {}).get("modes", []) or []
     net_passes: list[dict] = []
     if raw_modes == "auto" or raw_modes == ["auto"]:
         if _dry_run:
-            print("==> tier 1: would autodetect network modes (sdn if available, bridge if iface free)")
+            print("==> tier 1: would autodetect network modes (sdn/sdn-simple if available, bridge if iface free)")
         else:
             try:
                 net_passes = _integration.detect_network_modes(cfg)
@@ -255,11 +257,27 @@ def tier_lifecycle(cfg: dict, cpi_config_path: str, keep: bool) -> int:
             detected = [p["mode"] for p in net_passes]
             print(f"==> tier 1: autodetected network modes: {detected or '(none)'}")
     else:
-        net_passes = [{"mode": str(m), "env": {}, "cpi": {}} for m in raw_modes]
+        allowed = {"sdn", "sdn-simple", "bridge"}
+        for m in raw_modes:
+            mode_name = str(m)
+            if mode_name not in allowed:
+                print(
+                    f"tier 1: network_test.modes entry {mode_name!r} invalid "
+                    f"(allowed: sdn, sdn-simple, bridge, or the string auto)",
+                    file=sys.stderr,
+                )
+                return 1
+            # sdn-simple = the sdn pass with an explicit simple-zone opt-in.
+            env_extra = {"SDN_ZONE_TYPE": "simple"} if mode_name == "sdn-simple" else {}
+            cpi_extra = {"sdn_zone_type": "simple"} if mode_name == "sdn-simple" else {}
+            net_passes.append({"mode": mode_name, "env": env_extra, "cpi": cpi_extra})
 
     for p in net_passes:
         mode = p["mode"]
-        print(f"==> tier 1: lifecycle pass (NETWORK_TEST_MODE={mode})")
+        # NETWORK_TEST_MODE knows two backends; sdn-simple is the sdn backend
+        # with a zone_type override carried in env/cpi.
+        lifecycle_mode = "sdn" if mode.startswith("sdn") else mode
+        print(f"==> tier 1: lifecycle pass (mode={mode}, NETWORK_TEST_MODE={lifecycle_mode})")
         # Some passes (auto sdn) need CPI-config overrides for zone management;
         # write a dedicated config for those, otherwise reuse the default.
         cpi_overrides = p.get("cpi") or {}
@@ -273,6 +291,7 @@ def tier_lifecycle(cfg: dict, cpi_config_path: str, keep: bool) -> int:
                 tmp_cfg,
                 dry_run=False,
                 sdn_zone=cpi_overrides.get("sdn_zone"),
+                sdn_zone_type=cpi_overrides.get("sdn_zone_type"),
                 sdn_auto_manage_zone=cpi_overrides.get("sdn_auto_manage_zone"),
             )
             pass_cpi_path = tmp_cfg
@@ -280,7 +299,7 @@ def tier_lifecycle(cfg: dict, cpi_config_path: str, keep: bool) -> int:
             mode_env = {
                 **t1_env,
                 "CPI_CONFIG": pass_cpi_path,
-                "NETWORK_TEST_MODE": mode,
+                "NETWORK_TEST_MODE": lifecycle_mode,
                 **(p.get("env") or {}),
             }
             rc = run(["./scripts/lifecycle"], env=mode_env, cwd=REPO_ROOT)

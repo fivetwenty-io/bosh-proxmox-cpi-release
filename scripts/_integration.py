@@ -149,6 +149,7 @@ def build_cpi_config(
     dry_run: bool = False,
     disk_storage_override: "str | None" = None,
     sdn_zone: "str | None" = None,
+    sdn_zone_type: "str | None" = None,
     sdn_auto_manage_zone: "bool | None" = None,
     allow_disk_ops_with_snapshots: "bool | None" = None,
 ) -> dict:
@@ -253,6 +254,8 @@ def build_cpi_config(
     # Omitted by default so non-network runs keep the existing config shape.
     if sdn_zone is not None:
         cpi_cfg["sdn_zone"] = sdn_zone
+    if sdn_zone_type is not None:
+        cpi_cfg["sdn_zone_type"] = sdn_zone_type
     if sdn_auto_manage_zone is not None:
         cpi_cfg["sdn_auto_manage_zone"] = sdn_auto_manage_zone
 
@@ -271,6 +274,7 @@ def write_cpi_config(
     *,
     disk_storage_override: "str | None" = None,
     sdn_zone: "str | None" = None,
+    sdn_zone_type: "str | None" = None,
     sdn_auto_manage_zone: "bool | None" = None,
     allow_disk_ops_with_snapshots: "bool | None" = None,
 ) -> str:
@@ -301,6 +305,7 @@ def write_cpi_config(
         dry_run=dry_run,
         disk_storage_override=disk_storage_override,
         sdn_zone=sdn_zone,
+        sdn_zone_type=sdn_zone_type,
         sdn_auto_manage_zone=sdn_auto_manage_zone,
         allow_disk_ops_with_snapshots=allow_disk_ops_with_snapshots,
     )
@@ -530,10 +535,12 @@ def select_network_modes(
     Pure function (no I/O) so it is unit-testable. Returns a list of pass
     descriptors, each a dict with:
 
-        mode  — "sdn" or "bridge" (value for NETWORK_TEST_MODE)
+        mode  — "sdn", "sdn-simple", or "bridge" (pass label; NETWORK_TEST_MODE
+                is "sdn" for both sdn variants — scripts/test maps it)
         env   — extra env vars to inject for that pass (e.g. SDN_ZONE)
-        cpi   — CPI-config overrides for that pass (sdn_zone / sdn_auto_manage_zone);
-                empty dict means reuse the default synthesized CPI config
+        cpi   — CPI-config overrides for that pass (sdn_zone / sdn_zone_type /
+                sdn_auto_manage_zone); empty dict means reuse the default
+                synthesized CPI config
 
     Policy ("both whenever possible"):
       - bridge: always runnable on any node, so included whenever a target iface
@@ -546,6 +553,10 @@ def select_network_modes(
           * no configured zone but zones exist -> adopt the first (same pin);
           * configured zone that is absent -> create+teardown it (auto-manage ON,
             sdn_zone left unset so the teardown pin-rule does not block deletion).
+            This runs twice: once with no zone_type anywhere, exercising the
+            CPI's vxlan default end-to-end, and once as an explicit simple-zone
+            opt-in ("sdn-simple"). A host without vxlan support classifies the
+            first pass as SKIP inside scripts/lifecycle.
         When SDN is installed but no zone is resolvable, sdn is skipped.
     """
     passes: "list[dict]" = []
@@ -572,10 +583,17 @@ def select_network_modes(
                 })
             elif zone_cfg:
                 # Configured zone is absent — create and tear it down ourselves.
+                # First the vxlan default (SDN_ZONE_TYPE deliberately empty so
+                # nothing overrides the CPI default), then the simple opt-in.
                 passes.append({
                     "mode": "sdn",
-                    "env": {"SDN_ZONE": zone_cfg},
+                    "env": {"SDN_ZONE": zone_cfg, "SDN_ZONE_TYPE": ""},
                     "cpi": {"sdn_auto_manage_zone": True},
+                })
+                passes.append({
+                    "mode": "sdn-simple",
+                    "env": {"SDN_ZONE": zone_cfg, "SDN_ZONE_TYPE": "simple"},
+                    "cpi": {"sdn_zone_type": "simple", "sdn_auto_manage_zone": True},
                 })
             # else: no zone configured and none exist -> cannot run sdn; skip.
 
@@ -719,7 +737,7 @@ def tier1_env(cfg: dict, cpi_config_path: "str | Path", dry_run: bool = False) -
         env_out.update(
             {
                 "SDN_ZONE": str(sdn.get("zone", "")),
-                "SDN_ZONE_TYPE": str(sdn.get("zone_type", "simple")),
+                "SDN_ZONE_TYPE": str(sdn.get("zone_type", "")),
                 "SDN_VNET": str(sdn.get("vnet", "")),
                 "SDN_RANGE": str(sdn.get("range", "")),
                 "SDN_GATEWAY": str(sdn.get("gateway", "")),

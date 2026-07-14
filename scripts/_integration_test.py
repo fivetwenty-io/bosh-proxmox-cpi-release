@@ -263,10 +263,34 @@ class TestSelectNetworkModes(unittest.TestCase):
         passes = self._call(
             sdn_installed=True, existing_zones=["other"], sdn_cfg={**self.SDN, "zone": "it"}
         )
-        p = passes[0]
-        self.assertEqual(p["env"], {"SDN_ZONE": "it"})
-        # Create path: auto-manage ON, sdn_zone left unset so teardown isn't pinned.
-        self.assertEqual(p["cpi"], {"sdn_auto_manage_zone": True})
+        # Create path runs twice: vxlan default first, then the simple opt-in.
+        self.assertEqual(self._modes(passes), ["sdn", "sdn-simple"])
+        vxlan = passes[0]
+        # SDN_ZONE_TYPE pinned empty so nothing overrides the CPI's vxlan default;
+        # auto-manage ON, sdn_zone left unset so teardown isn't pinned.
+        self.assertEqual(vxlan["env"], {"SDN_ZONE": "it", "SDN_ZONE_TYPE": ""})
+        self.assertEqual(vxlan["cpi"], {"sdn_auto_manage_zone": True})
+
+    def test_sdn_simple_optin_pass_shape(self) -> None:
+        passes = self._call(
+            sdn_installed=True, existing_zones=[], sdn_cfg={**self.SDN, "zone": "it"}
+        )
+        simple = passes[1]
+        self.assertEqual(simple["mode"], "sdn-simple")
+        self.assertEqual(simple["env"], {"SDN_ZONE": "it", "SDN_ZONE_TYPE": "simple"})
+        self.assertEqual(
+            simple["cpi"], {"sdn_zone_type": "simple", "sdn_auto_manage_zone": True}
+        )
+
+    def test_sdn_reuse_emits_single_pass_no_zone_type(self) -> None:
+        # Pre-existing zone: one pass only; the zone's actual type governs, so
+        # no zone_type override may be injected.
+        passes = self._call(
+            sdn_installed=True, existing_zones=["it"], sdn_cfg={**self.SDN, "zone": "it"}
+        )
+        self.assertEqual(self._modes(passes), ["sdn"])
+        self.assertNotIn("sdn_zone_type", passes[0]["cpi"])
+        self.assertNotIn("SDN_ZONE_TYPE", passes[0]["env"])
 
     def test_sdn_skipped_when_no_zone_and_none_exist(self) -> None:
         passes = self._call(

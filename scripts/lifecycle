@@ -67,7 +67,8 @@ Network-test environment (exercises create_network / delete_network):
     NETWORK_TEST_MODE  off | sdn | bridge          (default: off)
     SDN_ZONE           SDN zone name               (mode=sdn; must pre-exist
                        unless the CPI config enables sdn_auto_manage_zone)
-    SDN_ZONE_TYPE      zone type for auto-create    (default: simple)
+    SDN_ZONE_TYPE      zone type for auto-create    (default: empty — omit
+                       from cloud_properties so the CPI default, vxlan, governs)
     SDN_VNET           vnet name, 1-8 [a-z0-9]      (mode=sdn, required)
     SDN_RANGE          CIDR for the SDN subnet      (mode=sdn)
     SDN_GATEWAY        gateway for the SDN subnet   (mode=sdn)
@@ -142,7 +143,7 @@ NETWORK_TEST_MODE = env("NETWORK_TEST_MODE", "off").strip().lower()
 if NETWORK_TEST_MODE not in ("off", "sdn", "bridge"):
     sys.exit(f"NETWORK_TEST_MODE must be off|sdn|bridge, got {NETWORK_TEST_MODE!r}")
 SDN_ZONE = env("SDN_ZONE", "")
-SDN_ZONE_TYPE = env("SDN_ZONE_TYPE", "simple")
+SDN_ZONE_TYPE = env("SDN_ZONE_TYPE", "")
 SDN_VNET = env("SDN_VNET", "")
 SDN_RANGE = env("SDN_RANGE", "")
 SDN_GATEWAY = env("SDN_GATEWAY", "")
@@ -165,6 +166,14 @@ if not NETWORK_BRIDGE:
         NETWORK_BRIDGE = json.load(f).get("network_bridge", "vmbr0")
 
 _SDN_VNET_RE = re.compile(r'^[a-z0-9]{1,8}$')
+
+# create_network failures naming an unsupported/unknown zone type are an
+# environment limitation (old PVE release, missing SDN plugin), not a CPI
+# defect — the network pass classifies them as SKIP instead of failing.
+_UNSUPPORTED_ZONE_RE = re.compile(
+    r"(?i)(?:unsupported|unknown|invalid)[^\n]{0,60}(?:zone[ _-]?type|type[^\n]{0,20}zone)"
+    r"|zone[ _-]?type[^\n]{0,60}(?:unsupported|unknown|not supported|invalid)"
+)
 
 
 def validate_sdn_vnet(name: str) -> None:
@@ -315,7 +324,10 @@ def call(method: str, args: list[Any], config_path: str = "") -> Any:
     if resp.get("error") is not None:
         print(f"call {method} failed:", file=sys.stderr)
         print(json.dumps(resp["error"], indent=2), file=sys.stderr)
-        raise RuntimeError(f"{method} failed")
+        err_msg = ""
+        if isinstance(resp["error"], dict):
+            err_msg = str(resp["error"].get("message", "")).strip()
+        raise RuntimeError(f"{method} failed: {err_msg}" if err_msg else f"{method} failed")
 
     return resp.get("result")
 
@@ -339,19 +351,20 @@ def build_network_spec() -> dict[str, Any]:
     """Build the create_network network_spec for the active NETWORK_TEST_MODE.
 
     SDN mode supplies cloud_properties.zone+vnet (routes the handler to the SDN
-    path). Bridge mode supplies cloud_properties.bridge and lets the handler
-    default the target node to config.node.
+    path). zone_type is included only when SDN_ZONE_TYPE is set; omitted, the
+    CPI's default zone type (vxlan) governs. Bridge mode supplies
+    cloud_properties.bridge and lets the handler default the target node to
+    config.node.
     """
     if NETWORK_TEST_MODE == "sdn":
+        cloud_props: dict[str, Any] = {"zone": SDN_ZONE, "vnet": SDN_VNET}
+        if SDN_ZONE_TYPE:
+            cloud_props["zone_type"] = SDN_ZONE_TYPE
         return {
             "type": "manual",
             "range": SDN_RANGE,
             "gateway": SDN_GATEWAY,
-            "cloud_properties": {
-                "zone": SDN_ZONE,
-                "zone_type": SDN_ZONE_TYPE,
-                "vnet": SDN_VNET,
-            },
+            "cloud_properties": cloud_props,
         }
     return {
         "type": "manual",
@@ -423,7 +436,20 @@ def main() -> int:
 
         if NETWORK_TEST_MODE != "off":
             step(f"2a. create_network (mode={NETWORK_TEST_MODE})")
-            net_res = call("create_network", [build_network_spec()])
+            try:
+                net_res = call("create_network", [build_network_spec()])
+            except RuntimeError as net_exc:
+                # A PVE host that lacks the requested zone type (e.g. an older
+                # release without vxlan support) is an environment limitation,
+                # not a CPI defect — classify as a skip. Everything else stays
+                # fatal.
+                if _UNSUPPORTED_ZONE_RE.search(str(net_exc)):
+                    print()
+                    print(f"==> SKIP: PVE host does not support the requested zone type ({net_exc})")
+                    print()
+                    cleanup()
+                    return 0
+                raise
             state["network_cid"] = net_res[0]
             net_cloud_props = net_res[2] if len(net_res) > 2 else {}
             print(f"network_cid={state['network_cid']}")
