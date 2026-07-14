@@ -1058,7 +1058,20 @@ func buildVMShapeForNode(ctx context.Context, deps Deps, parsed *createVMParsedA
 	if cp.RetainEphemeralOnDelete != nil && *cp.RetainEphemeralOnDelete {
 		baseRetainTags = append(baseRetainTags, tagRetainEphemeral)
 	}
+	// Advertised-route provenance: one advrt-<vnet>-<hash8> tag per route so
+	// delete_vm can remove the matching SDN subnets (refcounted across VMs).
+	// Baked into the initial tag set — zero extra API calls, and the tags die
+	// with the VM on create rollback.
+	advrtTags := advertisedRouteTags(cp.AdvertisedRoutes)
+	baseRetainTags = append(baseRetainTags, advrtTags...)
 	initialTags := mergeTagList([]string{ownershipTag}, baseRetainTags, maxTagLength)
+	for _, tag := range advrtTags {
+		if !strings.Contains(initialTags, tag) {
+			deps.Log(ctx).Warn("create_vm: advertised-route provenance tag dropped by tag-length cap — "+
+				"that route loses automatic cleanup on delete_vm",
+				log.String("tag", tag))
+		}
+	}
 	initialName := resolveVMShapeInitialName(deps.Config, parsed)
 
 	// Best-effort: populate vmStorageType for the clone-mode decision in
@@ -3095,7 +3108,7 @@ func attemptCreateVM(
 		createParams["sockets"] = shape.sockets
 	}
 	if shape.initialTags != "" {
-		createParams["tags"] = shape.initialTags
+		createParams[jsonKeyTags] = shape.initialTags
 	}
 
 	upid, cerr := deps.PVE.QEMU().Create(ctx, shape.node, createParams)
@@ -4441,7 +4454,7 @@ func tagFailedVM(ctx context.Context, deps Deps, node string, vmid int, env map[
 		// at QEMU.Create). Best-effort read: on failure we still apply the failure tag.
 		var existing []string
 		if cfg, cfgErr := deps.PVE.QEMU().Config(ctx, node, vmid); cfgErr == nil {
-			if v, ok := cfg["tags"]; ok {
+			if v, ok := cfg[jsonKeyTags]; ok {
 				if s, ok := v.(string); ok {
 					existing = parseTagsField(s)
 				}
@@ -4456,7 +4469,7 @@ func tagFailedVM(ctx context.Context, deps Deps, node string, vmid int, env map[
 			return
 		}
 		logger.Info("create_vm: VM preserved for diagnostics (debug.keep_failed_vms)",
-			log.Int(metadataKeyVMID, vmid), log.String("node", node), log.String("tags", tags))
+			log.Int(metadataKeyVMID, vmid), log.String("node", node), log.String(jsonKeyTags, tags))
 	}
 
 	lockOwner := fmt.Sprintf("tagFailedVM/%d", vmid)

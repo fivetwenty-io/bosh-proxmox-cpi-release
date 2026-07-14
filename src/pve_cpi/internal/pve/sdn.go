@@ -451,6 +451,7 @@ type SDNSubnet struct {
 	Zone    string          `json:"zone,omitempty"`
 	Gateway string          `json:"gateway,omitempty"`
 	Type    string          `json:"type,omitempty"`
+	Cidr    string          `json:"cidr,omitempty"`
 	Raw     json.RawMessage `json:"-"`
 }
 

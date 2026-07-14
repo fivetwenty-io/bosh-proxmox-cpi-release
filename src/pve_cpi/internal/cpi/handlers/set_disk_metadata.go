@@ -97,9 +97,9 @@ func HandleSetDiskMetadata(deps Deps) cpi.Handler {
 		// Accept map[string]string and map[string]any (BOSH JSON deserialises
 		// nested objects as map[string]any).
 		var diskTags map[string]string
-		if raw, ok := metadata["tags"]; ok {
+		if raw, ok := metadata[jsonKeyTags]; ok {
 			diskTags = coerceTagMap(raw)
-			delete(metadata, "tags")
+			delete(metadata, jsonKeyTags)
 		}
 
 		// --- scan VMs for disk ---
@@ -150,7 +150,7 @@ func HandleSetDiskMetadata(deps Deps) cpi.Handler {
 	})
 }
 
-// coerceTagMap accepts an arbitrary JSON value supplied under metadata["tags"]
+// coerceTagMap accepts an arbitrary JSON value supplied under metadata[jsonKeyTags]
 // and returns it as map[string]string. Non-string values are stringified via
 // fmt.Sprint to keep the path forgiving for callers that supply numeric tag
 // values. Returns nil if the input is not a JSON object.
@@ -370,7 +370,7 @@ func applyCustomTagsToVM(ctx context.Context, deps Deps, node string, vmid int, 
 	}
 
 	var existing []string
-	if v, ok := cfg["tags"]; ok {
+	if v, ok := cfg[jsonKeyTags]; ok {
 		if s, ok := v.(string); ok {
 			for _, e := range parseTagsField(s) {
 				skip := false

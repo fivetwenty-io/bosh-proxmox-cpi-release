@@ -290,11 +290,13 @@ cloud_properties:
     destination: 172.18.0.0/24
 ```
 
-**OVN requirement:** `advertised_routes` injects routes into the OVN logical-router fabric. It requires a PVE SDN zone of type `evpn` or `vxlan` backed by OVN. For non-OVN zone types (simple, vlan), PVE may accept the subnet create request, but no logical-router route is injected; the CPI logs a warning and continues. Verify the zone type before relying on this feature for actual packet forwarding.
+**EVPN requirement:** `advertised_routes` injects routes into the FRR-managed logical-router fabric. It requires a PVE SDN zone of type `evpn` — the only zone type with a routing control plane. For every other zone type (simple, vlan, qinq, vxlan), PVE may accept the subnet create request, but no logical-router route is injected; the CPI logs a warning and continues. Verify the zone type before relying on this feature for actual packet forwarding.
 
 **SDN permissions:** the API token must hold `SDN.Allocate` on `/sdn`. See [PVE API permissions](pve-api-permissions.md#2-privileges-the-cpi-actually-uses).
 
 **Rollback:** if `applySDN` fails after some subnets were created, the CPI removes the already-created subnets on a best-effort basis and returns an error. Any subnet the rollback cannot remove is logged by name for operator cleanup.
+
+**Cleanup on `delete_vm`:** each advertised route stamps a provenance tag (`advrt-<vnet>-<hash>`) on the VM at create time. When the VM is deleted, the CPI removes each recorded subnet from its vnet — unless another live VM carries the same tag (paired routers share routes; the last one out cleans up). The cleanup is entirely fail-open: any error leaves the subnet in place with a warning naming it, and never fails the delete. Subnets left behind by CPI versions predating this cleanup (or by a logged fail-open skip) are removed manually with `pvesh delete /cluster/sdn/vnets/<vnet>/subnets/<subnet-id>` followed by `pvesh set /cluster/sdn`.
 
 For the full `create_vm` cloud_properties schema — including `pci_passthroughs`, `retain_ephemeral_on_delete`, hotplug, and NIC-level VIP settings — see [CPI Methods — create_vm](cpi_methods.md#create_vm).
 

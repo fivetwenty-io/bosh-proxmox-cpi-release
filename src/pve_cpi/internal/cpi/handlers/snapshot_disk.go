@@ -182,7 +182,7 @@ func guardSnapshotParked(ctx context.Context, deps Deps, diskCID string, vmid in
 		return cpierrors.WrapAs(cfgErr, cpierrors.TypeRetriableCloud,
 			fmt.Sprintf("snapshot_disk: parker check: config fetch for vmid %d", vmid))
 	}
-	tags, _ := holderCfg["tags"].(string)
+	tags, _ := holderCfg[jsonKeyTags].(string)
 	if pve.IsParkerVM(vmid, tags, parkerCfg) {
 		return cpierrors.Cloud(
 			"snapshot_disk: disk %s is held by a parker VM (vmid %d): "+

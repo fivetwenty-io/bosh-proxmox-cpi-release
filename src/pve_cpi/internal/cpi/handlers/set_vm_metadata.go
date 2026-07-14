@@ -162,7 +162,7 @@ func setVMMetadataRMW(
 	// between the read and the write.
 	var existingTags []string
 	if cfg, cfgErr := deps.PVE.QEMU().Config(ctx, node, vmid); cfgErr == nil {
-		if v, ok := cfg["tags"]; ok {
+		if v, ok := cfg[jsonKeyTags]; ok {
 			if s, ok := v.(string); ok {
 				existingTags = parseTagsField(s)
 			}
@@ -181,7 +181,7 @@ func setVMMetadataRMW(
 
 	logger.Debug("set_vm_metadata: updating VM config",
 		log.String("description_len", fmt.Sprintf("%d", len(description))),
-		log.String("tags", tags),
+		log.String(jsonKeyTags, tags),
 		log.String("name", derefStr(vmName)),
 	)
 

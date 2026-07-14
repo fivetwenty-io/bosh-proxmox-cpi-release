@@ -31,11 +31,6 @@ import (
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
 )
 
-// jsonKeyTags is the PVE qemu-list "tags" field key, named once so the adopt
-// tests do not add raw "tags" string literals to the package (goconst counts
-// test-file literals against the production occurrence).
-const jsonKeyTags = "tags"
-
 // ============================================================
 // Helpers shared by digest + replication tests
 // ============================================================

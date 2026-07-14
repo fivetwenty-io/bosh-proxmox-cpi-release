@@ -444,8 +444,18 @@ func FindDiskIDByVolID(disks map[string]string, volid string) (string, bool) {
 // Exported so handlers can verify co-location (e.g., attach_disk under the
 // local backend) without going through the full disk-scan in FindVMByDiskVolid.
 func FindVMNodeViaCluster(ctx context.Context, c Client, vmid int) (string, bool, error) {
+	node, _, found, err := FindVMViaCluster(ctx, c, vmid)
+	return node, found, err
+}
+
+// FindVMViaCluster is FindVMNodeViaCluster plus the VM's tag string from the
+// same single /cluster/resources scan — zero extra API calls. Callers that
+// need provenance tags at delete time (advertised-route cleanup) use this
+// variant; the tag string is PVE's semicolon-separated encoding, "" when the
+// VM has no tags or the row omits the field.
+func FindVMViaCluster(ctx context.Context, c Client, vmid int) (node, tags string, found bool, err error) {
 	if c == nil || vmid <= 0 {
-		return "", false, nil
+		return "", "", false, nil
 	}
 	typ := "vm"
 	var resp *sdkcluster.ListResourcesResponse
@@ -455,22 +465,23 @@ func FindVMNodeViaCluster(ctx context.Context, c Client, vmid int) (string, bool
 		return inner
 	})
 	if listErr != nil {
-		return "", false, cpierrors.Wrap(listErr, "findVMNodeViaCluster: list cluster vms")
+		return "", "", false, cpierrors.Wrap(listErr, "findVMNodeViaCluster: list cluster vms")
 	}
 	if resp == nil {
-		return "", false, nil
+		return "", "", false, nil
 	}
 	for _, raw := range *resp {
 		var entry struct {
 			VMID int64  `json:"vmid"`
 			Node string `json:"node"`
+			Tags string `json:"tags"`
 		}
 		if jsonErr := json.Unmarshal(raw, &entry); jsonErr != nil {
 			continue
 		}
 		if int(entry.VMID) == vmid && entry.Node != "" {
-			return entry.Node, true, nil
+			return entry.Node, entry.Tags, true, nil
 		}
 	}
-	return "", false, nil
+	return "", "", false, nil
 }

@@ -44,7 +44,7 @@ func stampDeletingTag(ctx context.Context, deps Deps, node, vmCID string, vmid i
 		// mergeTagList still adds tagDeletingVM as the sole entry.
 		var existing []string
 		if cfg, cfgErr := deps.PVE.QEMU().Config(ctx, node, vmid); cfgErr == nil {
-			if v, ok := cfg["tags"]; ok {
+			if v, ok := cfg[jsonKeyTags]; ok {
 				if s, ok := v.(string); ok {
 					existing = parseTagsField(s)
 				}
@@ -119,7 +119,7 @@ func sweepFastDeleteStragglers(ctx context.Context, deps Deps, logger *log.Logge
 		if json.Unmarshal(raw, &item) != nil {
 			continue
 		}
-		if item.Type != "qemu" || item.VMID == 0 || item.Node == "" {
+		if item.Type != resourceTypeQemu || item.VMID == 0 || item.Node == "" {
 			continue
 		}
 		if !tagsContain(item.Tags, tagDeletingVM) {
@@ -329,7 +329,7 @@ func HandleDeleteVM(deps Deps) cpi.Handler {
 		// already gone, so clean up agent state and return success.
 		// Transport error -> propagate.
 		logger.Debug("delete_vm: locating VM via cluster scan")
-		node, found, lookupErr := pve.FindVMNodeViaCluster(ctx, deps.PVE, vmid)
+		node, vmTags, found, lookupErr := pve.FindVMViaCluster(ctx, deps.PVE, vmid)
 		if lookupErr != nil {
 			return nil, cpierrors.Wrap(pve.WrapError(lookupErr), fmt.Sprintf("delete_vm: locate VM %s", vmCID))
 		}
@@ -373,7 +373,7 @@ func HandleDeleteVM(deps Deps) cpi.Handler {
 						"delete_vm: could not read config for in-band VMID %d to verify parker status: %s (retry when PVE recovers)",
 						vmid, cfgErr.Error())
 				}
-				tagsRaw, _ := vmCfg["tags"].(string)
+				tagsRaw, _ := vmCfg[jsonKeyTags].(string)
 				if pve.IsParkerVM(vmid, tagsRaw, parkerCfg) {
 					return nil, cpierrors.Cloud("refusing to delete parker VM %d", vmid)
 				}
@@ -414,13 +414,18 @@ func HandleDeleteVM(deps Deps) cpi.Handler {
 		// no poll loop runs; the handler returns as soon as the destroy API call
 		// returns (which itself is bounded by the HTTP transport timeout).
 		if deps.Config.FastPathDeleteEnabled() {
-			return nil, fastPathDeleteVM(ctx, deps, node, vmCID, vmid, logger)
+			if fpErr := fastPathDeleteVM(ctx, deps, node, vmCID, vmid, logger); fpErr != nil {
+				return nil, fpErr
+			}
+			cleanupAdvertisedRoutes(ctx, deps, vmid, vmTags, logger)
+			return nil, nil
 		}
 
 		// --- stop VM (synchronous path) ---
 		if stopDone, stopErr := stopVMBeforeDelete(ctx, deps, node, vmid, vmCID, logger); stopErr != nil {
 			return nil, stopErr
 		} else if stopDone {
+			cleanupAdvertisedRoutes(ctx, deps, vmid, vmTags, logger)
 			return nil, nil
 		}
 
@@ -504,6 +509,7 @@ func HandleDeleteVM(deps Deps) cpi.Handler {
 				if agentErr := deps.Agent.Remove(ctx, node, vmid); agentErr != nil {
 					logger.Warn("delete_vm: agent.Remove failed after idempotent delete", log.Err(agentErr))
 				}
+				cleanupAdvertisedRoutes(ctx, deps, vmid, vmTags, logger)
 				return nil, nil
 			}
 			return nil, cpierrors.Wrap(pve.WrapError(deleteErr), fmt.Sprintf("delete_vm: delete VM %s", vmCID))
@@ -518,6 +524,10 @@ func HandleDeleteVM(deps Deps) cpi.Handler {
 
 		// --- agent cleanup ---
 		cleanupAgentForVM(ctx, deps, node, vmid, logger)
+
+		// --- advertised-route SDN subnet cleanup (provenance-tagged, refcounted,
+		//     entirely fail-open — see delete_vm_routes.go) ---
+		cleanupAdvertisedRoutes(ctx, deps, vmid, vmTags, logger)
 
 		logger.Info("delete_vm: VM deleted successfully", log.String("node", node))
 		return nil, nil
@@ -789,7 +799,7 @@ func detachRetainedEphemeralDisk(
 			fmt.Sprintf("delete_vm: read config for VM %s to check retain-ephemeral tag", vmCID))
 	}
 
-	tagsRaw, _ := vmCfg["tags"].(string) //nolint:goconst // "tags" is a PVE config field name; jsonKeyTags is test-only
+	tagsRaw, _ := vmCfg[jsonKeyTags].(string) //nolint:goconst // "tags" is a PVE config field name; jsonKeyTags is test-only
 	if !tagsContain(tagsRaw, tagRetainEphemeral) {
 		return false, nil // flag not set — byte-identical path; no API calls
 	}

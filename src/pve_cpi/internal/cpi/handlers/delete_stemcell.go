@@ -252,7 +252,7 @@ func sweepStemcellByShaTag(ctx context.Context, deps Deps, sha8, cidStr string) 
 		if json.Unmarshal(raw, &item) != nil {
 			continue
 		}
-		if item.Type != "qemu" || item.VMID == 0 {
+		if item.Type != resourceTypeQemu || item.VMID == 0 {
 			continue
 		}
 		if item.Template == nil || *item.Template != 1 {
@@ -323,7 +323,7 @@ func pruneOrphanStemcellTemplates(ctx context.Context, deps Deps, cidStr string)
 		if json.Unmarshal(raw, &item) != nil {
 			continue
 		}
-		if item.Type != "qemu" || item.VMID == 0 {
+		if item.Type != resourceTypeQemu || item.VMID == 0 {
 			continue
 		}
 		if item.Template == nil || *item.Template != 1 {

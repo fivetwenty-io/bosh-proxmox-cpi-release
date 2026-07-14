@@ -2625,16 +2625,27 @@ matches both shapes. Both features are byte-identical when absent. Live-PVE vali
 (canonical subnet id `<zone>-<network>-<mask>`), and the NIC firewall read-modify-write
 preserved model/MAC/bridge/mtu while applying `firewall=0`; a bare partial `net{i}` write
 is rejected by PVE (`net0.model: property is missing`), confirming replace-not-merge.
+`delete_vm` removes the subnets its VM's `advertised_routes` created: create_vm stamps one
+`advrt-<vnet>-<hash8>` provenance tag per route (first 8 hex of FNV-1a-64 over
+`<vnet>/<cidr>`; tags survive `set_vm_metadata`'s read-modify-write, and the hash encoding
+fits the PVE tag charset, which forbids raw CIDRs), and delete_vm refcounts each tag
+against all other VMs in one `ListResources` scan — a route shared with a live VM is
+retained; a solely-owned route's subnet is matched by recomputing the hash over each
+existing subnet's CIDR (lossless for IPv4 and IPv6) and deleted, with one `applySDN`
+commit. The cleanup is entirely fail-open: any error warns and never blocks the delete.
 
-**Limits.** `advertised_routes` targets OVN vnet subnets only — the SDK exposes no OVN
-`nbctl` static logical-router route API, so routes that do not correspond to a full subnet
-CIDR require out-of-band OVN commands. When the SDN zone is not OVN (e.g. vxlan/simple),
-PVE may accept the subnet create without injecting a logical-router route; this is a
-PVE-layer constraint, not a CPI defect. `ip_forwarding=true` explicitly voids per-NIC
-ipfilter protection on that NIC. Guest-OS IP forwarding (`sysctl net.ipv4.ip_forward`)
-is not managed by the CPI. `delete_vm` does not remove `advertised_routes` SDN subnets;
-an operator must clean them up manually (via `pvesh DELETE /cluster/sdn/vnets/{vnet}/subnets/{cidr}`
-followed by `pvesh PUT /cluster/sdn`) after destroying a router VM.
+**Limits.** `advertised_routes` targets EVPN vnet subnets only — EVPN is the sole
+FRR/OVN-backed zone type, and the SDK exposes no static logical-router route API, so
+routes that do not correspond to a full subnet CIDR require out-of-band commands. When
+the SDN zone is not EVPN (simple, vlan, qinq, vxlan), PVE may accept the subnet create
+without injecting a logical-router route; this is a PVE-layer constraint, not a CPI
+defect. `ip_forwarding=true` explicitly voids per-NIC ipfilter protection on that NIC.
+Guest-OS IP forwarding (`sysctl net.ipv4.ip_forward`) is not managed by the CPI.
+Concurrent deletes of two route-sharing VMs can each observe the other alive and both
+skip cleanup — a logged, fail-open subnet leak (never a wrong delete); leftovers are
+removed manually (`pvesh delete /cluster/sdn/vnets/{vnet}/subnets/{id}` then
+`pvesh set /cluster/sdn`), the same procedure as for subnets created by CPI versions
+predating the cleanup.
 
 #### 7.56 SHIPPED — Per-VM `*bool` override pattern and operator retry budget
 

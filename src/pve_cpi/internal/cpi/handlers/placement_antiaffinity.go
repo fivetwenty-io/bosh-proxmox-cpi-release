@@ -355,7 +355,7 @@ func collectGroupMemberSids(ctx context.Context, deps Deps, groupTag string) (ma
 		if json.Unmarshal(raw, &ri) != nil {
 			continue
 		}
-		if ri.Type != "qemu" || ri.Vmid == 0 {
+		if ri.Type != resourceTypeQemu || ri.Vmid == 0 {
 			continue
 		}
 		if tagsContain(ri.Tags, groupTag) {

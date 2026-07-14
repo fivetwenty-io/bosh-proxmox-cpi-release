@@ -18,6 +18,14 @@ const ownershipTag = "bosh-cpi"
 // stale director/deployment/job triple cannot accumulate.
 var reservedBoshTagPrefixes = []string{"director--", "deployment--", "job--", "index--"}
 
+// jsonKeyTags is the PVE "tags" field key in qemu config/create payloads and
+// cluster-resource rows, named once so the literal stays under the goconst
+// occurrence cap.
+const jsonKeyTags = "tags"
+
+// resourceTypeQemu is the /cluster/resources row type for QEMU guests.
+const resourceTypeQemu = "qemu"
+
 // sanitizeTagValue replaces any byte outside [A-Za-z0-9-] with "-" so the
 // result is a valid PVE tag value. Leading/trailing "-" are trimmed.
 func sanitizeTagValue(s string) string {

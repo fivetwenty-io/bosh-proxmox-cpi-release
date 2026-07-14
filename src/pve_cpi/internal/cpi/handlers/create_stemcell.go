@@ -129,7 +129,7 @@ type stemcellCloudProps struct {
 
 	// DirectorTags holds per-stemcell tags supplied by the BOSH Director via the
 	// optional env argument on create_stemcell (CPI v3 contract). It is populated
-	// by HandleCreateStemcell from env["tags"], NOT from cloud_properties.
+	// by HandleCreateStemcell from env[jsonKeyTags], NOT from cloud_properties.
 	// nil/empty means no director-supplied tags.
 	DirectorTags map[string]string
 }
@@ -337,7 +337,7 @@ func validateStemcellImagePath(imagePath string) error {
 //
 //	[0] image_path      string — absolute local path to stemcell disk image (or tarball).
 //	[1] cloud_properties object — stemcell.MF cloud_properties section (may be omitted).
-//	[2] env             object — optional CPI v3 argument; env["tags"] (map[string]string)
+//	[2] env             object — optional CPI v3 argument; env[jsonKeyTags] (map[string]string)
 //	                    carries director-supplied tags merged into the template's PVE tags
 //	                    and provenance notes. Absent/null/non-object env is ignored
 //	                    (2-arg calls are byte-identical to today's behavior).
@@ -423,7 +423,7 @@ func HandleCreateStemcell(deps Deps) cpi.Handler {
 
 		// ----------------------------------------------------------------
 		// Step 2b: Parse arg 2 — env (optional, CPI v3).
-		// env["tags"] carries director-supplied key/value pairs to stamp on the
+		// env[jsonKeyTags] carries director-supplied key/value pairs to stamp on the
 		// stemcell template. Absent/null/non-object env is tolerated (ignored).
 		// Non-string tag values are silently skipped; only string→string pairs
 		// are retained. When env is absent this block is a no-op and cp is
@@ -432,7 +432,7 @@ func HandleCreateStemcell(deps Deps) cpi.Handler {
 		if len(args) >= 3 && args[2] != nil {
 			var envMap map[string]any
 			if jsonErr := json.Unmarshal(args[2], &envMap); jsonErr == nil && envMap != nil {
-				if rawTags, ok := envMap["tags"]; ok && rawTags != nil {
+				if rawTags, ok := envMap[jsonKeyTags]; ok && rawTags != nil {
 					if tagsMap, ok := rawTags.(map[string]any); ok {
 						directorTags := make(map[string]string, len(tagsMap))
 						for k, v := range tagsMap {
@@ -965,7 +965,7 @@ func attemptCreateTemplateVM(
 		"boot":          "order=" + diskKeyVirtio0,
 		"agent":         "enabled=0",
 		"onboot":        0,
-		"tags":          strings.Join(baseTags, ";"),
+		jsonKeyTags:          strings.Join(baseTags, ";"),
 	}
 
 	// initialCID is the BOSH stemcell CID for this template ("template:<vmid>").
@@ -1001,7 +1001,7 @@ func attemptCreateTemplateVM(
 		}
 		provTags := buildStemcellProvenanceTags(cp, deps.Config.StemcellDirectorID())
 		allTags := mergeTagList(baseTags, provTags, 0)
-		createParams["tags"] = mergeTagList(strings.Split(allTags, ";"), directorTagTokens, maxTagLength)
+		createParams[jsonKeyTags] = mergeTagList(strings.Split(allTags, ";"), directorTagTokens, maxTagLength)
 	} else {
 		// Even when full provenance is disabled, write a minimal notes JSON that
 		// records stemcell_refs so delete_stemcell can gate template destruction on
@@ -1017,8 +1017,8 @@ func attemptCreateTemplateVM(
 		}
 		// Merge director tag tokens into base tags regardless of provenance mode.
 		if len(directorTagTokens) > 0 {
-			existingTagStr, _ := createParams["tags"].(string)
-			createParams["tags"] = mergeTagList(strings.Split(existingTagStr, ";"), directorTagTokens, maxTagLength)
+			existingTagStr, _ := createParams[jsonKeyTags].(string)
+			createParams[jsonKeyTags] = mergeTagList(strings.Split(existingTagStr, ";"), directorTagTokens, maxTagLength)
 		}
 	}
 
