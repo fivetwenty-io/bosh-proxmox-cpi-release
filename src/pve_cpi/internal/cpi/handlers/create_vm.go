@@ -3318,6 +3318,11 @@ func attemptCreateVM(
 		"agent":         "enabled=1",
 		"hotplug":       shape.hotplug,
 		"onboot":        0,
+		// Every BOSH VM is headless: the emulated USB tablet exists only to
+		// smooth mouse tracking for an interactive VNC/SPICE console and costs
+		// 2-3% CPU at scale for no benefit on a VM nobody looks at. No
+		// cloud_properties override — this is unconditional on every VM.
+		"tablet": 0,
 	}
 	applyOptionalCreateParams(createParams, shape)
 
@@ -3651,15 +3656,24 @@ func cloneFromTemplate(
 	// agent channel disabled, so `qm guest exec`/QGA cannot reach the guest —
 	// which removes the only out-of-band path to a VM whose bosh-agent has
 	// wedged (the import-from path sets agent=enabled=1 at create time).
+	//
+	// Also disable the emulated USB tablet. The stemcell template carries no
+	// explicit "tablet" key, so PVE's on-by-default applies to both the
+	// template and the clone it produces; every BOSH VM is headless, so the
+	// tablet device is pure overhead (2-3% CPU at scale) with nothing to
+	// benefit from it. No cloud_properties override — unconditional on every
+	// cloned VM, matching the import path.
 	memStr := strconv.Itoa(shape.memMiB)
 	cores64 := int64(shape.cores)
 	sockets64 := int64(shape.sockets)
 	agentEnabled := "enabled=1"
+	tabletOff := false
 	resourceParams := &sdknodes.UpdateQemuConfigParams{
 		Memory:  &memStr,
 		Cores:   &cores64,
 		Sockets: &sockets64,
 		Agent:   &agentEnabled,
+		Tablet:  &tabletOff,
 	}
 	// Apply scsihw override only when switched away from the historic default.
 	// Emitting "virtio-scsi-pci" explicitly would be byte-identical in effect but

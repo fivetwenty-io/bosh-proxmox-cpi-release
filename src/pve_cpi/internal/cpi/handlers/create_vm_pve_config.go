@@ -42,6 +42,10 @@ var pveConfigAllowlist = map[string]struct{}{
 // decisions. A blocklisted key produces a more specific error message than an
 // unlisted key, but both are rejected.
 //
+// "tablet" is written unconditionally to 0 on every VM (no cloud_properties
+// knob) on both the import and clone paths — a pve_config passthrough could
+// only ever fight that write, never meaningfully change it.
+//
 // Index-based keys are represented as prefixes (net, scsi, ide, virtio) and
 // matched by prefix in validatePVEConfigKey.
 var pveConfigBlocklist = map[string]struct{}{
