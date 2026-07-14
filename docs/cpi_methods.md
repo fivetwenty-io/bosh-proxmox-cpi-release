@@ -149,11 +149,11 @@ A VMID is allocated from `[vmid_range_start, vmid_range_end]` (default: `[100, 8
 
 **Router/NAT VMs:** Two `cloud_properties` fields support VMs that forward traffic between networks:
 
-- `cloud_properties.advertised_routes` (list of objects) — OVN SDN subnets to register for this VM. Each object has:
+- `cloud_properties.advertised_routes` (list of objects) — SDN subnets to register for this VM. Each object has:
   - `vnet` (String) — the PVE SDN vnet name (1–8 lowercase alphanumeric characters, e.g. `"vnet01"`)
   - `destination` (String) — the CIDR that should be routed via this VM's interface (e.g. `"10.64.0.0/16"`)
 
-  The CPI creates each subnet via `POST /cluster/sdn/vnets/{vnet}/subnets` and calls `PUT /cluster/sdn` to commit the change to the OVN logical-router fabric. Subnets that already exist are accepted without error (idempotent). On rollback, the CPI removes created subnets on a best-effort basis and logs any it could not remove for operator cleanup. Requires an OVN SDN zone and SDN write permissions.
+  The CPI creates each subnet via `POST /cluster/sdn/vnets/{vnet}/subnets` and calls `PUT /cluster/sdn` to commit the change to the FRR-managed logical-router fabric. Subnets that already exist are accepted without error (idempotent). On rollback, the CPI removes created subnets on a best-effort basis and logs any it could not remove for operator cleanup. Requires an EVPN SDN zone — the only zone type with a routing control plane; on any other zone type PVE may accept the subnet but injects no route, so the CPI warns and continues — and SDN write permissions. Each route also stamps a provenance tag (`advrt-<vnet>-<hash>`) on the VM so `delete_vm` can remove the recorded subnets (refcounted against other live VMs carrying the same tag, entirely fail-open). See [Networks — advertised_routes](networks.md#vm-level-advertised_routes).
 
 - `networks.<name>.cloud_properties.ip_forwarding` (Boolean, default `false`) — set on individual NIC entries in the `networks` map. When `true`, the CPI disables the PVE firewall flag on that NIC and excludes the NIC from `ipfilter-netN` ipset seeding. Use on router/NAT-facing NICs that must forward packets across network boundaries without per-packet IP filtering.
 
@@ -577,8 +577,9 @@ For the full `cloud_properties` schema, zone/vnet/subnet semantics, naming rules
   - `gateway` (String): gateway IP — optional
   - `netmask_bits` (Integer): prefix length — optional
   - `cloud_properties` (Hash): PVE-specific keys:
-    - `zone` (String): PVE SDN zone name; overrides `pve.sdn_zone` config
-    - `zone_type` (String): zone type used when the CPI creates the zone (`simple` | `vlan` | `qinq` | `vxlan` | `evpn`); overrides `pve.sdn_zone_type` config
+    - `zone` (String): PVE SDN zone name; overrides `pve.sdn_zone` config. When both are empty and zone auto-management is on (the default), the turnkey zone `bosh` is used
+    - `zone_type` (String): zone type used when the CPI creates the zone (`simple` | `vlan` | `qinq` | `vxlan` | `evpn`); overrides `pve.sdn_zone_type` config (default `vxlan`). A pre-existing zone's actual PVE type governs regardless of this value; `evpn` zones are never CPI-created
+    - `vnet_tag` (Integer): explicit VNI/VLAN tag for the vnet (1–16777215; 1–4094 for `vlan`/`qinq`); when absent, tag-carrying zone types auto-allocate from the `pve.sdn_vni_range_start`/`_end` band (default 5000–5999)
     - `vnet` (String): PVE vnet name — max 8 chars, `[a-z0-9]`; required for the SDN path
     - `bridge` (String): Linux bridge interface name, e.g. `"vmbr1"`; required for the bridge path when `pve.network_bridge` is not set
     - `node` (String): PVE node name for bridge operations; falls back to `pve.node` config
@@ -591,25 +592,25 @@ For the full `cloud_properties` schema, zone/vnet/subnet semantics, naming rules
 | `address_properties` | `{range, gateway, reserved: []}` | `{range, gateway, reserved: []}` |
 | `cloud_properties_out` | `{zone, vnet, bridge: <vnet>}` | `{bridge, node}` |
 
-Note: on the SDN path `bridge` equals `vnet` because PVE realizes a simple-zone vnet as a Linux bridge with the same name. The `bridge` key in `cloud_properties_out` is present so `create_vm` NIC attachment works without additional configuration.
+Note: on the SDN path `bridge` equals `vnet` because PVE realizes every vnet — whatever the zone type — as a Linux bridge with the same name on each node. The `bridge` key in `cloud_properties_out` is present so `create_vm` NIC attachment works without additional configuration.
 
 **Path selection:**
 
-The handler picks a path from `pve.network_mode` (default `"auto"`):
+The handler picks a path from `pve.network_mode` (default `"sdn"`):
 
 | `network_mode` | Path taken |
 |---|---|
-| `"sdn"` | Always SDN |
-| `"bridge"` | Always bridge |
-| `"auto"` | SDN when `cloud_properties.zone` or `cloud_properties.vnet` is set, or `pve.sdn_zone` is configured; bridge otherwise |
+| `"sdn"` (default) | Always SDN |
+| `"bridge"` (opt-in) | Always bridge |
+| `"auto"` (opt-in, legacy heuristic) | SDN when `cloud_properties.zone` or `cloud_properties.vnet` is set, or `pve.sdn_zone` is configured; bridge otherwise |
 
 **Behavior — SDN path:**
 
-1. Resolve zone: `cloud_properties.zone` → `pve.sdn_zone` → error if neither is set.
-2. Probe `GetSdnZones` for the zone. If absent and `pve.sdn_auto_manage_zone=true`, create the zone using the resolved `zone_type`. If absent and `sdn_auto_manage_zone=false`, return a `CloudError`.
-3. Probe `GetSdnVnets` for the vnet. If absent, call `CreateSdnVnets`. A 409 conflict (concurrent create) is treated as success.
+1. Resolve zone: `cloud_properties.zone` → `pve.sdn_zone` → the turnkey zone `bosh` when auto-management is on (the default); an error only when no zone is named and auto-management is off.
+2. Probe `GetSdnZones` for the zone. If present, its actual PVE type governs vnet tagging. If absent and the resolved type is `evpn`, fail fast — the operator must create the EVPN zone and its controller. Otherwise, if `pve.sdn_auto_manage_zone` is on (the default), create the zone using the resolved `zone_type` — for `vxlan`, with peers from `pve.sdn_vxlan_peers` or derived from the online cluster nodes, and `pve.sdn_zone_mtu` when set. If absent and auto-management is off, return a `CloudError`.
+3. Probe `GetSdnVnets` for the vnet. If absent, resolve the tag (explicit `vnet_tag`, else auto-allocated VNI for tag-carrying zone types) and call `CreateSdnVnets`. A 409 conflict (concurrent create) is treated as success. Pre-existing vnets never consume a VNI.
 4. If `network_spec.range` is set, call `CreateSdnVnetsSubnets` with the CIDR and gateway. A 409 conflict is treated as success.
-5. Call `UpdateSdn` to commit staged SDN changes to the data plane.
+5. Call `UpdateSdn` to commit staged SDN changes to the data plane, awaiting the returned task for async zone types (`vlan`/`vxlan`/`qinq`/`evpn` — with the vxlan default this await is the normal path).
 6. Return `[vnet, {range, gateway, reserved:[]}, {zone, vnet, bridge: vnet}]`.
 
 On apply failure, the handler attempts best-effort rollback (delete subnet, vnet, and zone if created in this call) before returning the error.
@@ -626,13 +627,16 @@ On apply failure, the handler attempts best-effort rollback (delete subnet, vnet
 - SDN path: `GetSdnVnets` is probed before each create. Re-calling with the same `vnet` and `zone` returns the same result without error.
 - Bridge path: a 409 response from `CreateNetwork` is treated as success. `UpdateNetwork` is always called.
 
-**Zone lifecycle (SDN path, `sdn_auto_manage_zone=true`):**
+**Zone lifecycle (SDN path):**
 
-When `pve.sdn_auto_manage_zone=true`, the CPI creates the SDN zone if it does not exist. The CPI does not track zone ownership between calls; instead it applies a stateless safety rule on deletion (see `delete_network` below). `create_network` is safe to retry regardless of zone state.
+Zone auto-management is on by default (`pve.sdn_auto_manage_zone`, default `true`): the CPI creates the SDN zone if it does not exist — EVPN zones excepted, which are always operator-created. The CPI does not track zone ownership between calls; instead it applies a stateless safety rule on deletion (see `delete_network` below). `create_network` is safe to retry regardless of zone state.
 
 **Errors:**
 
 - `CloudError`: zone not found and `sdn_auto_manage_zone=false`
+- `CloudError`: zone absent and the resolved zone type is `evpn` (never CPI-created)
+- `CloudError`: a `vxlan` zone create with zero derivable peers (set `pve.sdn_vxlan_peers`)
+- `CloudError`: VNI band exhausted, or an explicit `vnet_tag` out of range for the zone type
 - `CloudError`: `cloud_properties.vnet` missing or invalid (>8 chars, non-`[a-z0-9]` characters) on the SDN path
 - `CloudError`: neither `cloud_properties.zone`/`pve.sdn_zone` nor `cloud_properties.bridge`/`pve.network_bridge` is set and path cannot be determined
 - `CloudError`: target node not set for bridge path
@@ -680,13 +684,14 @@ Both paths are no-ops when the resource is already absent. `delete_network` can 
 
 The CPI deletes the parent SDN zone during `delete_network` only when all of the following conditions hold:
 
-1. `pve.sdn_auto_manage_zone=true` (explicit opt-in; default `false`).
-2. The zone name does not equal `pve.sdn_zone` (the configured default zone is never auto-deleted).
-3. After the vnet is removed, `ListSdnVnets` filtered by zone returns zero remaining vnets.
+1. `pve.sdn_auto_manage_zone` is enabled (the default).
+2. The zone name does not equal `pve.sdn_zone` (the configured default zone is never auto-deleted). The turnkey zone `bosh` is deliberately not pinned — the CPI created it, so removing it with its last vnet is correct turnkey hygiene.
+3. The zone is not an EVPN zone (operator-owned fabric, never CPI-deleted).
+4. After the vnet is removed, `ListSdnVnets` filtered by zone returns zero remaining vnets.
 
-If `ListSdnVnets` fails, the zone is left intact to avoid deleting a zone that may still contain vnets.
+If `ListSdnVnets` or the zone-type read fails, the zone is left intact to avoid deleting a zone the CPI cannot confirm is empty and CPI-deletable.
 
-Residual risk: with `sdn_auto_manage_zone=true`, any zone supplied via `cloud_properties.zone` that differs from `pve.sdn_zone` will be deleted when emptied. Operators who share a zone across deployments must either set `pve.sdn_zone` to pin it or leave `sdn_auto_manage_zone=false` (the default).
+Residual risk: with auto-management on, any non-EVPN zone supplied via `cloud_properties.zone` that differs from `pve.sdn_zone` will be deleted when emptied. Operators who share a zone across deployments must either set `pve.sdn_zone` to pin it or set `sdn_auto_manage_zone: false`.
 
 **Errors:**
 

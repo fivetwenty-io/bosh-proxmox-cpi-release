@@ -312,7 +312,7 @@ networks:
 
 ### VM-level `advertised_routes`
 
-`advertised_routes` is a list of OVN SDN subnet entries the CPI creates in the fabric when the VM is provisioned. Each entry names a PVE vnet and a CIDR the VM will forward. The CPI calls `POST /cluster/sdn/vnets/{vnet}/subnets` for each entry and then commits the change with `PUT /cluster/sdn`.
+`advertised_routes` is a list of SDN subnet entries the CPI creates in the fabric when the VM is provisioned. Each entry names a PVE vnet and a CIDR the VM will forward. The CPI calls `POST /cluster/sdn/vnets/{vnet}/subnets` for each entry and then commits the change with `PUT /cluster/sdn`.
 
 ```yaml
 cloud_properties:
