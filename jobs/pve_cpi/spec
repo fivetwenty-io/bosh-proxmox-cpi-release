@@ -587,7 +587,13 @@ properties:
       alone does not activate packet filtering — PVE also requires the VM-level
       firewall to be enabled. The security_groups VM cloud_property enables both
       the group rules and the VM-level firewall. Default false (no behavior
-      change).
+      change). PVE also requires the cluster-wide datacenter firewall master
+      switch (Datacenter > Firewall > Options > Enable) to be on before any of
+      this is actually enforced; create_vm probes that switch once per process
+      whenever this flag (or security_groups, or allowed_address_pairs) is in
+      play and warns if it is off. Enabling the master switch activates
+      cluster-wide host-level enforcement — see docs/configuration.md for the
+      anti-lockout prerequisites before turning it on.
     default: false
   pve.hooks:
     description: |
@@ -1324,7 +1330,12 @@ properties:
       VM that does not carry a per-call or per-profile security_groups override.
       Each entry must be a group name that already exists in the PVE firewall
       configuration. When empty (default []), no global firewall groups are
-      applied and behavior is unchanged from prior releases.
+      applied and behavior is unchanged from prior releases. As with
+      pve.vm_firewall, the attached group rules are unenforced unless the PVE
+      datacenter firewall master switch (Datacenter > Firewall > Options >
+      Enable) is also on; create_vm warns once per process when it detects the
+      switch is off. See docs/configuration.md for the anti-lockout
+      prerequisites before enabling the master switch.
     default: []
 
   pve.disk_performance.iothread:

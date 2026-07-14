@@ -265,7 +265,7 @@ Hooks are built-in middleware that fire around CPI method calls. List enabled ho
 | Property | Type | Default | Description |
 |---|---|---|---|
 | `pve.hooks` | List | `[]` | Ordered list of hook names to activate. Built-in names: `audit_log`, `notes_audit`, `lb_register`, `external_command`. |
-| `pve.vm_firewall` | Boolean | `false` | Applies `firewall=1` to every NIC of newly created VMs. Per-NIC `cloud_properties.firewall` overrides this global default. Enabling the NIC flag alone does not activate packet filtering — the VM-level firewall must also be enabled (done automatically when `security_groups` is set). |
+| `pve.vm_firewall` | Boolean | `false` | Applies `firewall=1` to every NIC of newly created VMs. Per-NIC `cloud_properties.firewall` overrides this global default. Enabling the NIC flag alone does not activate packet filtering — the VM-level firewall must also be enabled (done automatically when `security_groups` is set). None of this is enforced unless the PVE **datacenter firewall master switch** is also on — see [Firewall](#firewall). |
 
 ### audit_log
 
@@ -302,6 +302,22 @@ Runs an allowlisted host command on selected CPI methods. The command runs witho
 | `pve.external_command.env_passlist` | List | `[]` | Names of environment variables passed through from the CPI process to the child. Everything else is scrubbed. |
 | `pve.external_command.timeout_ms` | Integer | `0` (→ 30 s) | Per-invocation timeout. The child process is killed when the deadline passes. |
 | `pve.external_command.methods` | List | `[]` | CPI methods that trigger the command. Empty runs it on `create_vm` and `delete_vm`. |
+
+## Firewall
+
+PVE enforces firewall rules at three levels — datacenter, host, VM — and a packet is filtered only when all three levels between it and its destination allow it. This CPI programs the VM level: `pve.vm_firewall` and per-NIC `cloud_properties.firewall` set the per-NIC flag, `pve.security_groups` / per-call `cloud_properties.security_groups` attach firewall groups and enable the VM-level firewall, and `cloud_properties.allowed_address_pairs` (see [CPI Methods — `create_vm`](cpi_methods.md#create_vm)) seeds `ipfilter-netN` ipsets for VIP/VRRP use cases. All of these API calls succeed independent of the datacenter-level switch below — the CPI has no way to detect from a single VM's perspective whether its own rules are actually being enforced cluster-wide.
+
+### The datacenter firewall master switch defaults off
+
+PVE ships with the datacenter firewall master switch (`Datacenter > Firewall > Options > Enable`) **disabled**. With it off, every VM-level rule this CPI programs is inert: `security_groups`, `allowed_address_pairs`, and the per-NIC `firewall=1` flag all succeed at the API level but filter zero packets. Whenever `create_vm` is asked to configure any of these features, it probes `GET /cluster/firewall/options` once per CPI process and logs a Warn if the master switch is off, naming the gap and the fix. The probe requires `Sys.Audit`; on a token that lacks it (or any other probe failure) the CPI logs that enforcement status could not be verified and proceeds — the probe is diagnostic only and never blocks or fails `create_vm`.
+
+### Enabling it is a cluster-wide, anti-lockout-sensitive change
+
+Enabling the master switch activates **host-level** firewall enforcement across every node in the cluster, not just VM-level enforcement for CPI-managed guests — a change with a real lockout risk if the host-level ruleset does not already permit essential traffic. Before enabling it:
+
+- Ensure a management allow rule exists for the source addresses/networks used to reach the PVE API and SSH (typically the same management network referenced in [PVE API Permissions](pve-api-permissions.md)).
+- Ensure explicit allowances exist for cluster and storage traffic already in use, for example: Ceph (public/cluster network ports, when using `rbd`/`cephfs` storage), VXLAN UDP 4789 (when using the default `sdn_zone_type: vxlan`; see [Network configuration](networks.md)), and BGP TCP 179 (when using an EVPN zone with a BGP controller).
+- Test the change on a single node or a maintenance window first where practical; a misconfigured host-level ruleset can cut off the very management access needed to fix it.
 
 ## Disk Performance
 
@@ -357,7 +373,7 @@ graph TD
 | `pve.vm_types` | Map | `{}` | Named VM-type profiles. Each key is a profile name; each value has a `cloud_properties` object with defaults for that profile. Selected via `cloud_properties.vm_type`. |
 | `pve.disk_types` | Map | `{}` | Named disk-type profiles. Each key is a profile name; each value has a `cloud_properties` object. Selected via `cloud_properties.disk_type`. Disk-type profiles take precedence over `vm_type` profiles when both define the same attribute. |
 | `pve.storage_tiers` | Map | `{}` | Named storage tiers. Each key is a tier label; each value has `types` (list of PVE storage types), `shared` (*bool), and `encrypted` (*bool). The CPI selects the first live cluster storage matching all specified criteria. Selected via `cloud_properties.storage_tier`. See [Encrypted Storage](#encrypted-storage) for the `encrypted` field. |
-| `pve.security_groups` | List | `[]` | Global default list of PVE firewall group names applied to every VM that does not carry a per-call or per-profile `security_groups` override. Each entry must be a group name that already exists in the PVE firewall configuration. |
+| `pve.security_groups` | List | `[]` | Global default list of PVE firewall group names applied to every VM that does not carry a per-call or per-profile `security_groups` override. Each entry must be a group name that already exists in the PVE firewall configuration. Rules attached from these groups are unenforced unless the PVE **datacenter firewall master switch** is also on — see [Firewall](#firewall). |
 
 ## Stemcell Management
 

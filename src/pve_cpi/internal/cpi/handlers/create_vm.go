@@ -551,19 +551,26 @@ func createVM(
 	if groupErr != nil {
 		return nil, groupErr
 	}
+	firewallEnabled, fwFlagErr := resolveEffectiveFirewall(parsed.cloudPropsMap, deps.Config)
+	if fwFlagErr != nil {
+		return nil, fwFlagErr
+	}
+	// One-time datacenter firewall master-switch probe (§1.4): whenever this VM
+	// requests any firewall-affecting feature, verify — once per process — that
+	// the cluster-wide master switch is actually enabled, since every API call
+	// below succeeds regardless of it and a disabled master switch means none of
+	// the rules programmed here filter any traffic. Best-effort and fail-open;
+	// never blocks or fails create_vm. See probeFirewallMasterSwitch.
+	if firewallFeatureInPlay(effectiveGroups, firewallEnabled, parsed.networks) {
+		probeFirewallMasterSwitch(ctx, deps, logger)
+	}
 	if len(effectiveGroups) > 0 {
 		if fwErr := applySecurityGroups(ctx, deps, shape.node, vmid, effectiveGroups, logger); fwErr != nil {
 			return nil, fwErr
 		}
-	} else {
-		firewallEnabled, fwFlagErr := resolveEffectiveFirewall(parsed.cloudPropsMap, deps.Config)
-		if fwFlagErr != nil {
-			return nil, fwFlagErr
-		}
-		if firewallEnabled {
-			if fwErr := enableVMFirewall(ctx, deps, shape.node, vmid, logger); fwErr != nil {
-				return nil, fwErr
-			}
+	} else if firewallEnabled {
+		if fwErr := enableVMFirewall(ctx, deps, shape.node, vmid, logger); fwErr != nil {
+			return nil, fwErr
 		}
 	}
 
@@ -814,19 +821,22 @@ func createVMWithFallback(
 		if groupErr != nil {
 			return nil, groupErr
 		}
+		firewallEnabled, fwFlagErr := resolveEffectiveFirewall(parsed.cloudPropsMap, deps.Config)
+		if fwFlagErr != nil {
+			return nil, fwFlagErr
+		}
+		// One-time datacenter firewall master-switch probe (§1.4) — see the
+		// step-8b comment in createVM for the full rationale.
+		if firewallFeatureInPlay(effectiveGroups, firewallEnabled, parsed.networks) {
+			probeFirewallMasterSwitch(ctx, deps, logger)
+		}
 		if len(effectiveGroups) > 0 {
 			if fwErr := applySecurityGroups(ctx, deps, winShape.node, winningVMID, effectiveGroups, logger); fwErr != nil {
 				return nil, fwErr
 			}
-		} else {
-			firewallEnabled, fwFlagErr := resolveEffectiveFirewall(parsed.cloudPropsMap, deps.Config)
-			if fwFlagErr != nil {
-				return nil, fwFlagErr
-			}
-			if firewallEnabled {
-				if fwErr := enableVMFirewall(ctx, deps, winShape.node, winningVMID, logger); fwErr != nil {
-					return nil, fwErr
-				}
+		} else if firewallEnabled {
+			if fwErr := enableVMFirewall(ctx, deps, winShape.node, winningVMID, logger); fwErr != nil {
+				return nil, fwErr
 			}
 		}
 

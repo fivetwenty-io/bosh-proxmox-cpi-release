@@ -279,9 +279,13 @@ func (m *vmMockNodes) UpdateQemuFirewallOptions(_ context.Context, _ string, _ s
 type vmMockCluster struct {
 	sdkcluster.Service // embed nil — panics on unmocked calls
 
-	listResourcesFn      func(ctx context.Context, params *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error)
-	listStatusFn         func(ctx context.Context) (*sdkcluster.ListStatusResponse, error)
-	listFirewallGroupsFn func() (*sdkcluster.ListFirewallGroupsResponse, error)
+	listResourcesFn       func(ctx context.Context, params *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error)
+	listStatusFn          func(ctx context.Context) (*sdkcluster.ListStatusResponse, error)
+	listFirewallGroupsFn  func() (*sdkcluster.ListFirewallGroupsResponse, error)
+	listFirewallOptionsFn func(ctx context.Context) (*sdkcluster.ListFirewallOptionsResponse, error)
+	// listFirewallOptionsCalls counts ListFirewallOptions invocations, for
+	// asserting the §1.4 master-switch probe's once-per-process semantics.
+	listFirewallOptionsCalls int
 }
 
 func (m *vmMockCluster) ListResources(ctx context.Context, params *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
@@ -290,6 +294,20 @@ func (m *vmMockCluster) ListResources(ctx context.Context, params *sdkcluster.Li
 	}
 	resp := sdkcluster.ListResourcesResponse{}
 	return &resp, nil
+}
+
+// ListFirewallOptions defaults to reporting the datacenter firewall master
+// switch as enabled, so the §1.4 probe (create_vm_firewall_masterswitch.go)
+// never logs a Warn for tests that don't specifically exercise it. Tests that
+// need the switch reported as disabled, or the probe call to fail, wire
+// listFirewallOptionsFn explicitly.
+func (m *vmMockCluster) ListFirewallOptions(ctx context.Context) (*sdkcluster.ListFirewallOptionsResponse, error) {
+	m.listFirewallOptionsCalls++
+	if m.listFirewallOptionsFn != nil {
+		return m.listFirewallOptionsFn(ctx)
+	}
+	enabled := int64(1)
+	return &sdkcluster.ListFirewallOptionsResponse{Enable: &enabled}, nil
 }
 
 func (m *vmMockCluster) ListStatus(ctx context.Context) (*sdkcluster.ListStatusResponse, error) {
