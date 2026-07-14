@@ -37,9 +37,10 @@ import (
 // is wrapped and returned to the caller.
 //
 // Zone auto-delete: only when ALL of the following hold:
-//  1. config.SDNAutoManageZone == true
+//  1. config.SDNAutoManageZone is enabled
 //  2. zone != config.SDNZone (the pinned zone is never deleted by the CPI)
-//  3. ListSDNVnets filtered by zone returns 0 remaining vnets
+//  3. the zone is not an EVPN zone (operator-owned fabric, never CPI-deleted)
+//  4. ListSDNVnets filtered by zone returns 0 remaining vnets
 func HandleDeleteNetwork(deps Deps) cpi.Handler {
 	return cpi.HandlerFunc(func(ctx context.Context, args []json.RawMessage, _ jsonrpc.Context) (any, error) {
 		return nil, deleteNetwork(ctx, deps, args)
@@ -148,19 +149,40 @@ func deleteNetworkSDN(ctx context.Context, deps Deps, vnet, zone string) error {
 
 // maybeDeleteOrphanedZone deletes zone iff:
 //  1. zone is non-empty,
-//  2. config.SDNAutoManageZone is true,
-//  3. zone is not the operator-pinned config.SDNZone, and
-//  4. no remaining vnets reference zone.
+//  2. config.SDNAutoManageZone is enabled,
+//  3. zone is not the operator-pinned config.SDNZone,
+//  4. zone is not an EVPN zone (EVPN fabric — controller, BGP peers — is
+//     operator infrastructure the CPI never creates, so it never deletes), and
+//  5. no remaining vnets reference zone.
 //
-// Any failure to enumerate vnets is non-fatal: the function returns nil
-// without deleting the zone, preserving the invariant "never delete a zone
-// the CPI cannot confirm is empty".
+// Any failure to enumerate vnets or to read the zone type is non-fatal: the
+// function returns nil without deleting, preserving the invariant "never
+// delete a zone the CPI cannot confirm is empty and CPI-deletable". The
+// turnkey zone ("bosh") is deliberately NOT pinned — the CPI created it, so
+// removing it when its last vnet goes is correct turnkey hygiene.
 func maybeDeleteOrphanedZone(ctx context.Context, deps Deps, zone string) error {
 	cfg := deps.Config
 	if zone == "" || !cfg.SDNAutoManageZoneEnabled() {
 		return nil
 	}
 	if cfg.SDNZone != "" && strings.EqualFold(zone, cfg.SDNZone) {
+		return nil
+	}
+
+	zoneInfo, zoneErr := pve.GetSDNZone(ctx, deps.PVE, zone)
+	switch {
+	case errors.Is(zoneErr, pve.ErrSDNNotFound):
+		// Zone already gone — nothing to tear down.
+		return nil
+	case zoneErr != nil:
+		// Cannot confirm the zone type — fail closed against deletion.
+		deps.Log(ctx).Warn("delete_network: zone teardown skipped — could not read zone type",
+			log.String("zone", zone),
+			log.Err(zoneErr))
+		return nil
+	case zoneInfo != nil && strings.EqualFold(zoneInfo.Type, "evpn"):
+		deps.Log(ctx).Debug("delete_network: zone retained — EVPN zones are operator-owned",
+			log.String("zone", zone))
 		return nil
 	}
 

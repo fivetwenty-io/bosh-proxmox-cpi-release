@@ -211,6 +211,10 @@ func TestHandleDeleteNetwork_SDN_ZoneDeletedWhenOwnedAndEmpty(t *testing.T) {
 		getSdnVnetsFn: func(_ context.Context, _ string, _ *sdkcluster.GetSdnVnetsParams) (*sdkcluster.GetSdnVnetsResponse, error) {
 			return rawVnet("autozone"), nil
 		},
+		getSdnZonesFn: func(_ context.Context, _ string, _ *sdkcluster.GetSdnZonesParams) (*sdkcluster.GetSdnZonesResponse, error) {
+			raw := sdkcluster.GetSdnZonesResponse(`{"zone":"autozone","type":"vxlan"}`)
+			return &raw, nil
+		},
 		listSdnVnetsSubnetsFn: func(_ context.Context, _ string, _ *sdkcluster.ListSdnVnetsSubnetsParams) (*sdkcluster.ListSdnVnetsSubnetsResponse, error) {
 			empty := sdkcluster.ListSdnVnetsSubnetsResponse{}
 			return &empty, nil
@@ -264,6 +268,10 @@ func TestHandleDeleteNetwork_SDN_ZoneKeptWhenRemainingVnets(t *testing.T) {
 		getSdnVnetsFn: func(_ context.Context, _ string, _ *sdkcluster.GetSdnVnetsParams) (*sdkcluster.GetSdnVnetsResponse, error) {
 			return rawVnet("autozone"), nil
 		},
+		getSdnZonesFn: func(_ context.Context, _ string, _ *sdkcluster.GetSdnZonesParams) (*sdkcluster.GetSdnZonesResponse, error) {
+			raw := sdkcluster.GetSdnZonesResponse(`{"zone":"autozone","type":"vxlan"}`)
+			return &raw, nil
+		},
 		listSdnVnetsSubnetsFn: func(_ context.Context, _ string, _ *sdkcluster.ListSdnVnetsSubnetsParams) (*sdkcluster.ListSdnVnetsSubnetsResponse, error) {
 			empty := sdkcluster.ListSdnVnetsSubnetsResponse{}
 			return &empty, nil
@@ -289,6 +297,84 @@ func TestHandleDeleteNetwork_SDN_ZoneKeptWhenRemainingVnets(t *testing.T) {
 	}
 	if len(deleteZoneCalls) != 0 {
 		t.Errorf("zone must NOT be deleted when remaining vnets exist in zone; got %d call(s)", len(deleteZoneCalls))
+	}
+}
+
+// -- DN-06b: EVPN zone never deleted, even when empty --
+
+func TestHandleDeleteNetwork_SDN_EVPNZoneNeverDeleted(t *testing.T) {
+	t.Parallel()
+
+	var deleteZoneCalls int
+
+	clusterSvc := &mockSDNCluster{
+		getSdnVnetsFn: func(_ context.Context, _ string, _ *sdkcluster.GetSdnVnetsParams) (*sdkcluster.GetSdnVnetsResponse, error) {
+			return rawVnet("evpnz"), nil
+		},
+		getSdnZonesFn: func(_ context.Context, _ string, _ *sdkcluster.GetSdnZonesParams) (*sdkcluster.GetSdnZonesResponse, error) {
+			raw := sdkcluster.GetSdnZonesResponse(`{"zone":"evpnz","type":"evpn"}`)
+			return &raw, nil
+		},
+		listSdnVnetsSubnetsFn: func(_ context.Context, _ string, _ *sdkcluster.ListSdnVnetsSubnetsParams) (*sdkcluster.ListSdnVnetsSubnetsResponse, error) {
+			empty := sdkcluster.ListSdnVnetsSubnetsResponse{}
+			return &empty, nil
+		},
+		deleteSdnZonesFn: func(_ context.Context, _ string, _ *sdkcluster.DeleteSdnZonesParams) error {
+			deleteZoneCalls++
+			return nil
+		},
+		deleteSdnVnetsFn: func(_ context.Context, _ string, _ *sdkcluster.DeleteSdnVnetsParams) error {
+			return nil
+		},
+		updateSdnFn: func(_ context.Context, _ *sdkcluster.UpdateSdnParams) (*sdkcluster.UpdateSdnResponse, error) {
+			return nil, nil
+		},
+	}
+	// auto-manage on, zone unpinned, zero remaining vnets — every non-EVPN
+	// condition for teardown holds, yet the EVPN guard must retain the zone
+	// (before the vnet-emptiness scan: listSdnVnetsFn deliberately nil).
+	if err := invokeDeleteNetwork(t, testDeleteDeps(clusterSvc, true, ""), "net01"); err != nil {
+		t.Fatalf("unexpected: %v", err)
+	}
+	if deleteZoneCalls != 0 {
+		t.Errorf("EVPN zone must never be deleted; got %d call(s)", deleteZoneCalls)
+	}
+}
+
+// -- DN-06c: zone-type lookup failure fails closed against deletion --
+
+func TestHandleDeleteNetwork_SDN_ZoneTypeLookupError_NotDeleted(t *testing.T) {
+	t.Parallel()
+
+	var deleteZoneCalls int
+
+	clusterSvc := &mockSDNCluster{
+		getSdnVnetsFn: func(_ context.Context, _ string, _ *sdkcluster.GetSdnVnetsParams) (*sdkcluster.GetSdnVnetsResponse, error) {
+			return rawVnet("autozone"), nil
+		},
+		getSdnZonesFn: func(_ context.Context, _ string, _ *sdkcluster.GetSdnZonesParams) (*sdkcluster.GetSdnZonesResponse, error) {
+			return nil, errors.New("pvedaemon hiccup")
+		},
+		listSdnVnetsSubnetsFn: func(_ context.Context, _ string, _ *sdkcluster.ListSdnVnetsSubnetsParams) (*sdkcluster.ListSdnVnetsSubnetsResponse, error) {
+			empty := sdkcluster.ListSdnVnetsSubnetsResponse{}
+			return &empty, nil
+		},
+		deleteSdnZonesFn: func(_ context.Context, _ string, _ *sdkcluster.DeleteSdnZonesParams) error {
+			deleteZoneCalls++
+			return nil
+		},
+		deleteSdnVnetsFn: func(_ context.Context, _ string, _ *sdkcluster.DeleteSdnVnetsParams) error {
+			return nil
+		},
+		updateSdnFn: func(_ context.Context, _ *sdkcluster.UpdateSdnParams) (*sdkcluster.UpdateSdnResponse, error) {
+			return nil, nil
+		},
+	}
+	if err := invokeDeleteNetwork(t, testDeleteDeps(clusterSvc, true, ""), "net01"); err != nil {
+		t.Fatalf("type-lookup failure must not fail the delete: %v", err)
+	}
+	if deleteZoneCalls != 0 {
+		t.Errorf("zone must not be deleted when its type cannot be confirmed; got %d call(s)", deleteZoneCalls)
 	}
 }
 
@@ -629,9 +715,10 @@ func TestDeleteNetwork_NotFound_Idempotent(t *testing.T) {
 // Table-driven test for the zone auto-delete guards in
 // maybeDeleteOrphanedZone. The zone must only be deleted when ALL of the
 // following hold:
-//  1. config.SDNAutoManageZone == true
+//  1. config.SDNAutoManageZone is enabled
 //  2. zone observed on vnet != config.SDNZone (the pinned zone is preserved)
-//  3. no remaining vnets reference the zone
+//  3. the zone is not an EVPN zone (covered by the dedicated EVPN test)
+//  4. no remaining vnets reference the zone
 //
 // Each row asserts whether DeleteSdnZones was called.
 
@@ -698,6 +785,11 @@ func TestDeleteNetwork_ZoneAutoDelete_OnlyWhenAllConditionsHold(t *testing.T) {
 				getSdnVnetsFn: func(_ context.Context, _ string, _ *sdkcluster.GetSdnVnetsParams) (*sdkcluster.GetSdnVnetsResponse, error) {
 					raw, _ := json.Marshal(map[string]any{"vnet": "net01", "zone": r.observedZone})
 					out := sdkcluster.GetSdnVnetsResponse(raw)
+					return &out, nil
+				},
+				getSdnZonesFn: func(_ context.Context, zone string, _ *sdkcluster.GetSdnZonesParams) (*sdkcluster.GetSdnZonesResponse, error) {
+					raw, _ := json.Marshal(map[string]any{"zone": zone, "type": "vxlan"})
+					out := sdkcluster.GetSdnZonesResponse(raw)
 					return &out, nil
 				},
 				listSdnVnetsSubnetsFn: func(_ context.Context, _ string, _ *sdkcluster.ListSdnVnetsSubnetsParams) (*sdkcluster.ListSdnVnetsSubnetsResponse, error) {
