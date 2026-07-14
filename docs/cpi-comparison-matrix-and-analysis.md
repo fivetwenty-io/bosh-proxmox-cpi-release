@@ -122,7 +122,7 @@ stays `~ (empty)`. OpenStack-Go `get_disks` was confirmed a real handler
 confirmed absent in source.
 
 The takeaway, reconfirmed across six references and re-verified against source: **surface
-coverage is a settled strength.** PVE implements all 22 canonical methods with real logic
+coverage is a settled strength.** PVE implements all 21 canonical methods with real logic
 plus the `update_disk` extension, and is one of only two CPIs (with vSphere) to implement
 network lifecycle. Every remaining improvement is depth within methods, not new method
 stubs.
