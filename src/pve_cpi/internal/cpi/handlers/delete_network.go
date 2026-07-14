@@ -138,7 +138,7 @@ func deleteNetworkSDN(ctx context.Context, deps Deps, vnet, zone string) error {
 		return aErr
 	}
 
-	// 4. Conditional zone teardown. Three guards must all hold; any failure
+	// 4. Conditional zone teardown. Four guards must all hold; any failure
 	//    leaves the zone in place rather than risk deleting a zone that is
 	//    still in use by another vnet or pinned by configuration.
 	if err := maybeDeleteOrphanedZone(ctx, deps, zone); err != nil {

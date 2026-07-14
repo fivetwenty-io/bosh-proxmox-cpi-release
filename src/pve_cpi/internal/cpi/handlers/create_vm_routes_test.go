@@ -32,6 +32,14 @@ type routeClusterStub struct {
 	// updateSdnCalls counts applySDN calls.
 	updateSdnCalls int
 
+	// Zone-type check lookups. An unmapped vnet or zone returns an error so
+	// the check exercises its fail-open path — existing tests that don't set
+	// these maps stay valid without stubbing SDN topology.
+	vnetZones    map[string]string // vnet -> zone name
+	zoneTypes    map[string]string // zone -> zone type
+	getVnetCalls int
+	getZoneCalls int
+
 	// inject errors
 	createErr    error
 	createErrAt  int // -1 = all calls fail; ≥0 = fail at that index
@@ -63,6 +71,26 @@ func (s *routeClusterStub) CreateSdnVnetsSubnets(_ context.Context, vnet string,
 func (s *routeClusterStub) DeleteSdnVnetsSubnets(_ context.Context, vnet, subnet string, _ *sdkcluster.DeleteSdnVnetsSubnetsParams) error {
 	s.deleteCalls = append(s.deleteCalls, routeDeleteCall{vnet: vnet, subnet: subnet})
 	return s.deleteErr
+}
+
+func (s *routeClusterStub) GetSdnVnets(_ context.Context, vnet string, _ *sdkcluster.GetSdnVnetsParams) (*sdkcluster.GetSdnVnetsResponse, error) {
+	s.getVnetCalls++
+	zone, ok := s.vnetZones[vnet]
+	if !ok {
+		return nil, errors.New("stub: vnet lookup unavailable")
+	}
+	raw := sdkcluster.GetSdnVnetsResponse(fmt.Appendf(nil, `{"vnet":%q,"zone":%q}`, vnet, zone))
+	return &raw, nil
+}
+
+func (s *routeClusterStub) GetSdnZones(_ context.Context, zone string, _ *sdkcluster.GetSdnZonesParams) (*sdkcluster.GetSdnZonesResponse, error) {
+	s.getZoneCalls++
+	zoneType, ok := s.zoneTypes[zone]
+	if !ok {
+		return nil, errors.New("stub: zone lookup unavailable")
+	}
+	raw := sdkcluster.GetSdnZonesResponse(fmt.Appendf(nil, `{"zone":%q,"type":%q}`, zone, zoneType))
+	return &raw, nil
 }
 
 func (s *routeClusterStub) UpdateSdn(_ context.Context, _ *sdkcluster.UpdateSdnParams) (*sdkcluster.UpdateSdnResponse, error) {
@@ -325,6 +353,107 @@ func TestApplyAdvertisedRoutes_AlreadyExistsIsIdempotent(t *testing.T) {
 	// Pre-existing subnets must NOT be rolled back (we did not create them).
 	if len(cl.deleteCalls) != 0 {
 		t.Errorf("must not delete pre-existing subnets; got %v", cl.deleteCalls)
+	}
+}
+
+// --------------------------------------------------------------------------
+// applyAdvertisedRoutes — non-EVPN zone-type warning (fail-open check)
+// --------------------------------------------------------------------------
+
+func routeWarnEntries(obs *log.Observer) []log.Entry {
+	var warns []log.Entry
+	for _, e := range obs.All() {
+		if e.Level == log.LevelWarn {
+			warns = append(warns, e)
+		}
+	}
+	return warns
+}
+
+func TestApplyAdvertisedRoutes_WarnsOnNonEVPNZone(t *testing.T) {
+	cl := &routeClusterStub{
+		vnetZones: map[string]string{"vnet1": "bosh"},
+		zoneTypes: map[string]string{"bosh": "vxlan"},
+	}
+	logger, obs := log.NewObservedLogger(log.LevelDebug)
+	routes := []AdvertisedRoute{{VNet: "vnet1", Destination: "10.64.0.0/16"}}
+	if err := applyAdvertisedRoutes(context.Background(), routeDeps(cl), "pve1", 300, routes, logger); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	warns := routeWarnEntries(obs)
+	if len(warns) != 1 {
+		t.Fatalf("expected exactly 1 warning for a vxlan zone; got %d: %+v", len(warns), warns)
+	}
+	if !strings.Contains(warns[0].Message, "no routing control plane") {
+		t.Errorf("warning message %q should name the missing routing control plane", warns[0].Message)
+	}
+	if warns[0].Attrs["zone_type"] != "vxlan" {
+		t.Errorf("warning should carry zone_type=vxlan; got attrs %+v", warns[0].Attrs)
+	}
+
+	// The warning must not block injection: subnet created + SDN applied.
+	if len(cl.createCalls) != 1 || cl.updateSdnCalls != 1 {
+		t.Errorf("injection must proceed despite warning; create=%v applySDN=%d",
+			cl.createCalls, cl.updateSdnCalls)
+	}
+}
+
+func TestApplyAdvertisedRoutes_NoWarnOnEVPNZone(t *testing.T) {
+	cl := &routeClusterStub{
+		vnetZones: map[string]string{"vnet1": "fabric1"},
+		zoneTypes: map[string]string{"fabric1": "evpn"},
+	}
+	logger, obs := log.NewObservedLogger(log.LevelDebug)
+	routes := []AdvertisedRoute{{VNet: "vnet1", Destination: "10.64.0.0/16"}}
+	if err := applyAdvertisedRoutes(context.Background(), routeDeps(cl), "pve1", 301, routes, logger); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if warns := routeWarnEntries(obs); len(warns) != 0 {
+		t.Errorf("no warning expected for an evpn zone; got %+v", warns)
+	}
+	if len(cl.createCalls) != 1 || cl.updateSdnCalls != 1 {
+		t.Errorf("expected normal injection; create=%v applySDN=%d", cl.createCalls, cl.updateSdnCalls)
+	}
+}
+
+func TestApplyAdvertisedRoutes_ZoneCheckFailsOpenOnLookupError(t *testing.T) {
+	// No vnetZones/zoneTypes maps: both lookups error. The check must skip
+	// silently (Debug only) and injection must proceed.
+	cl := &routeClusterStub{}
+	logger, obs := log.NewObservedLogger(log.LevelDebug)
+	routes := []AdvertisedRoute{{VNet: "vnet1", Destination: "10.64.0.0/16"}}
+	if err := applyAdvertisedRoutes(context.Background(), routeDeps(cl), "pve1", 302, routes, logger); err != nil {
+		t.Fatalf("lookup failure must not block create_vm: %v", err)
+	}
+	if warns := routeWarnEntries(obs); len(warns) != 0 {
+		t.Errorf("lookup failure must not produce a warning; got %+v", warns)
+	}
+	if len(cl.createCalls) != 1 || cl.updateSdnCalls != 1 {
+		t.Errorf("injection must proceed on lookup failure; create=%v applySDN=%d",
+			cl.createCalls, cl.updateSdnCalls)
+	}
+}
+
+func TestApplyAdvertisedRoutes_ZoneCheckDedupesVnets(t *testing.T) {
+	// Two routes on the same vnet: one lookup, one warning.
+	cl := &routeClusterStub{
+		vnetZones: map[string]string{"vnet1": "bosh"},
+		zoneTypes: map[string]string{"bosh": "simple"},
+	}
+	logger, obs := log.NewObservedLogger(log.LevelDebug)
+	routes := []AdvertisedRoute{
+		{VNet: "vnet1", Destination: "10.64.0.0/16"},
+		{VNet: "vnet1", Destination: "10.65.0.0/16"},
+	}
+	if err := applyAdvertisedRoutes(context.Background(), routeDeps(cl), "pve1", 303, routes, logger); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cl.getVnetCalls != 1 {
+		t.Errorf("expected 1 vnet lookup for deduped vnet; got %d", cl.getVnetCalls)
+	}
+	if warns := routeWarnEntries(obs); len(warns) != 1 {
+		t.Errorf("expected 1 warning for deduped vnet; got %d: %+v", len(warns), warns)
 	}
 }
 

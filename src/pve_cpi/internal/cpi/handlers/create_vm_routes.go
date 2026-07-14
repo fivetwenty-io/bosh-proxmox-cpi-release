@@ -12,21 +12,21 @@ import (
 	sdkcluster "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cluster"
 )
 
-// AdvertisedRoute describes a single OVN SDN subnet entry to create for a
+// AdvertisedRoute describes a single SDN subnet entry to create for a
 // router or NAT VM. The CPI calls POST /cluster/sdn/vnets/{VNet}/subnets with
 // Destination as the subnet CIDR, then calls applySDN (PUT /cluster/sdn) to
-// commit the OVN logical-router fabric change.
+// commit the change to the FRR-managed logical-router fabric.
 //
 // Destination maps to the CreateSdnVnetsSubnetsParams.Subnet field (the PVE
 // SDN subnet object identifier, which is the CIDR string). Type is always
-// "subnet" (PVE requirement for OVN L3 zones).
+// "subnet" (PVE requirement).
 //
-// Limitation: this path targets OVN vnet subnets only. Static OVN
-// logical-router routes that do not map to a full subnet CIDR are not
-// supported because the PVE SDK exposes no OVN nbctl route API; those require
-// out-of-band OVN commands. When the SDN zone is not OVN (e.g. vxlan/simple),
-// PVE may accept the subnet create but the route is not injected into a
-// logical router — the CPI logs a warning and continues (fail-open).
+// Limitation: route injection only reaches a routing control plane in an
+// EVPN zone — the sole zone type with one (FRR/BGP). Static logical-router
+// routes that do not map to a full subnet CIDR are not supported. When the
+// vnet's zone is not EVPN (e.g. vxlan/simple), PVE may accept the subnet
+// create but no route is injected — the CPI logs a warning and continues
+// (fail-open) rather than reporting success it cannot deliver.
 type AdvertisedRoute struct {
 	// VNet is the PVE SDN vnet name (1–8 lowercase alphanumeric characters).
 	VNet string `json:"vnet"`
@@ -35,10 +35,15 @@ type AdvertisedRoute struct {
 	Destination string `json:"destination"`
 }
 
-// sdnSubnetType is the PVE subnet type required for OVN L3 zone route
-// injection. PVE validates this field server-side; passing any other value
-// results in a 400 error.
+// sdnSubnetType is the PVE subnet type required for SDN subnet creation.
+// PVE validates this field server-side; passing any other value results in
+// a 400 error.
 const sdnSubnetType = "subnet"
+
+// evpnZoneType is the only SDN zone type with a routing control plane
+// (FRR/BGP); advertised routes injected into any other zone type never
+// reach a router. Matches the delete_network EVPN guard spelling.
+const evpnZoneType = "evpn"
 
 // validateAdvertisedRoutes checks all entries in routes for a non-empty vnet
 // name and a well-formed CIDR destination. Returns a non-retriable CloudError
@@ -75,10 +80,15 @@ func validateCIDR(s string) error {
 	return nil
 }
 
-// applyAdvertisedRoutes injects an OVN SDN subnet for each entry in routes and
-// calls applySDN once after all subnets are created to commit the changes to
-// the OVN fabric. Returns nil immediately when routes is empty (byte-identical
-// path: no API calls made).
+// applyAdvertisedRoutes injects an SDN subnet for each entry in routes and
+// calls applySDN once after all subnets are created to commit the changes.
+// Returns nil immediately when routes is empty (byte-identical path: no API
+// calls made).
+//
+// Before injecting, each distinct vnet's zone type is checked: a non-EVPN
+// zone gets a Warn — PVE accepts the subnet there, but no route reaches a
+// routing control plane. The check is fail-open (lookup errors are logged at
+// Debug and skipped) and never blocks injection.
 //
 // Failure contract:
 //   - If CreateSdnVnetsSubnets or applySDN returns an error, all subnets that
@@ -100,6 +110,8 @@ func applyAdvertisedRoutes(
 	if len(routes) == 0 {
 		return nil
 	}
+
+	warnNonEVPNRouteZones(ctx, deps, vmid, routes, logger)
 
 	clusterSvc := deps.PVE.Cluster()
 
@@ -170,6 +182,58 @@ func applyAdvertisedRoutes(
 		)
 	}
 	return nil
+}
+
+// warnNonEVPNRouteZones resolves each distinct vnet in routes to its zone and
+// the zone to its type, then warns when the type is not EVPN — the only zone
+// type where an advertised route reaches a routing control plane. Entirely
+// fail-open: a vnet or zone lookup error is logged at Debug and skipped, so
+// this check can never block or fail create_vm.
+func warnNonEVPNRouteZones(
+	ctx context.Context,
+	deps Deps,
+	vmid int,
+	routes []AdvertisedRoute,
+	logger *log.Logger,
+) {
+	if logger == nil {
+		return
+	}
+	seen := make(map[string]bool, len(routes))
+	for _, r := range routes {
+		if seen[r.VNet] {
+			continue
+		}
+		seen[r.VNet] = true
+
+		vnetInfo, err := pve.GetSDNVnet(ctx, deps.PVE, r.VNet)
+		if err != nil || vnetInfo == nil || vnetInfo.Zone == "" {
+			logger.Debug("create_vm: advertised_routes: zone-type check skipped — could not resolve vnet's zone",
+				log.Int(metadataKeyVMID, vmid),
+				log.String("vnet", r.VNet),
+				log.Err(err),
+			)
+			continue
+		}
+		zoneInfo, err := pve.GetSDNZone(ctx, deps.PVE, vnetInfo.Zone)
+		if err != nil || zoneInfo == nil {
+			logger.Debug("create_vm: advertised_routes: zone-type check skipped — could not read zone type",
+				log.Int(metadataKeyVMID, vmid),
+				log.String("vnet", r.VNet),
+				log.String("zone", vnetInfo.Zone),
+				log.Err(err),
+			)
+			continue
+		}
+		if !strings.EqualFold(zoneInfo.Type, evpnZoneType) {
+			logger.Warn("create_vm: advertised_routes: zone has no routing control plane — subnet accepted but no route is injected; use an evpn zone for real forwarding",
+				log.Int(metadataKeyVMID, vmid),
+				log.String("vnet", r.VNet),
+				log.String("zone", vnetInfo.Zone),
+				log.String("zone_type", zoneInfo.Type),
+			)
+		}
+	}
 }
 
 // createSDNSubnet posts a single subnet to the named vnet. Extracted so tests

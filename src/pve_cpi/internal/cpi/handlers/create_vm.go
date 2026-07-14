@@ -246,13 +246,15 @@ type createVMCloudProps struct {
 	// isolation. Nil or empty → byte-identical (no PCI filter, no hostpciN
 	// config, no strict pin).
 	PCIPassthroughs []PCIPassthrough `json:"pci_passthroughs,omitempty"`
-	// AdvertisedRoutes lists OVN SDN vnet subnets to create for this VM
+	// AdvertisedRoutes lists SDN vnet subnets to create for this VM
 	// post-clone. Each entry names a vnet and a destination CIDR; the CPI
 	// calls CreateSdnVnetsSubnets then applySDN to commit the subnet to the
-	// OVN logical-router fabric. Intended for router/NAT VMs that need the
-	// fabric to know about the prefixes they forward. Nil or empty → no SDN
-	// subnet calls (byte-identical). Requires an OVN SDN zone and SDN write
-	// permissions. SDN is eventually consistent; applySDN await covers
+	// FRR-managed logical-router fabric. Intended for router/NAT VMs that
+	// need the fabric to know about the prefixes they forward. Nil or empty
+	// → no SDN subnet calls (byte-identical). Route injection requires an
+	// EVPN zone (a non-EVPN zone accepts the subnet but injects no route —
+	// the CPI warns and continues) and SDN write permissions. SDN is
+	// eventually consistent; applySDN await covers
 	// convergence. Subnets created before a rollback-triggering failure are
 	// removed on a best-effort basis; if removal fails, a warning names the
 	// leftover subnet for operator cleanup.
