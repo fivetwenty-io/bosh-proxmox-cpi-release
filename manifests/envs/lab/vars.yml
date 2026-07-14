@@ -12,7 +12,9 @@
 # Transport: lab REUSES the cpitest SDN vnet `cpitest0` rather than creating
 # its own. `scripts/bosh net-up` is therefore NOT a lab operation (no SDN
 # block below, so net-* refuses BOSH_PVE_ENV=lab by design); bring cpitest0 up
-# once with BOSH_PVE_ENV=cpitest ./scripts/bosh net-up.
+# once with BOSH_PVE_ENV=cpitest ./scripts/bosh net-up. cpitest0 lives in a
+# simple zone — a DELIBERATE single-node opt-in (see the cpitest header); the
+# CPI's own default is a cluster-wide vxlan zone.
 #
 #   OPERATIONAL CAVEAT: cpitest0's SDN subnet/gateway is 172.31.0.0/24 →
 #   172.31.0.1. A lab guest on 172.16.0.0/18 points its default route at

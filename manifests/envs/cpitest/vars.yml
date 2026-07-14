@@ -50,6 +50,12 @@ haproxy_private_ip:  172.31.0.50
 # internet (apt, bosh.io, DNS) via the PVE host's uplink while staying off the
 # shared LAN. Zone name max 8 chars; vnet name max 8 chars, starts with a
 # letter.
+#
+# The simple zone here is a DELIBERATE single-node opt-in: this lab runs on
+# one PVE node, where an isolated per-node bridge with SNAT is exactly the
+# right shape. The CPI's own default is a vxlan zone (cluster-wide overlay,
+# turnkey zone "bosh") — on a multi-node cluster, omit zone/zone_type and the
+# default already provides the isolated segment on every node.
 cpitest_sdn_zone:       cpitest
 cpitest_sdn_zone_type:  simple
 cpitest_sdn_vnet:       cpitest0
