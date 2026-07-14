@@ -128,6 +128,7 @@ func TestClusterNodePeerIPs_NilArgs(t *testing.T) {
 	if _, err := pve.ClusterNodePeerIPs(context.Background(), nil); err == nil {
 		t.Error("nil client: expected error")
 	}
+	//lint:ignore SA1012 deliberate nil-ctx contract check
 	//nolint:staticcheck // deliberate nil-ctx contract check
 	if _, err := pve.ClusterNodePeerIPs(nil, newPeersClient()); err == nil {
 		t.Error("nil ctx: expected error")

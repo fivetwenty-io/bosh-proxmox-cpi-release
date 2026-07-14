@@ -146,7 +146,7 @@ lint: ## Run golangci-lint (binary if installed, else go run @pinned version)
 staticcheck: ## Run staticcheck (skip with notice if not installed)
 	@echo "$(GREEN)Running staticcheck...$(RESET)"
 	@if command -v staticcheck >/dev/null 2>&1; then \
-		cd $(SRC_ROOT) && staticcheck ./...; \
+		(cd $(SRC_ROOT) && staticcheck ./...) || exit 1; \
 		echo "$(GREEN)✓ Staticcheck passed$(RESET)"; \
 	else \
 		echo "$(YELLOW)staticcheck not installed — skipping. Install: go install honnef.co/go/tools/cmd/staticcheck@latest$(RESET)"; \

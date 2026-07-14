@@ -121,6 +121,7 @@ func TestNextVNI_NilArgs(t *testing.T) {
 	if _, err := pve.NextVNI(context.Background(), nil, 5000, 5999); err == nil {
 		t.Error("nil client: expected error")
 	}
+	//lint:ignore SA1012 deliberate nil-ctx contract check
 	//nolint:staticcheck // deliberate nil-ctx contract check
 	if _, err := pve.NextVNI(nil, newVNIClient(), 5000, 5999); err == nil {
 		t.Error("nil ctx: expected error")
