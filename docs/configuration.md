@@ -258,6 +258,15 @@ The placement engine scores cluster nodes at `create_vm` time using live resourc
 | `pve.antiaffinity_verify` | Boolean | `false` | After recreating an anti-affinity rule, re-lists HA rules and asserts the target VM is present. Surfaces concurrent-writer drops as a retriable error. |
 | `pve.max_inflight_per_node` | Integer | `0` | Maximum concurrent mutating operations (`create_vm`, `delete_vm`, `create_disk`, `attach_disk`, `create_stemcell`) against a single node. `0` = unlimited. |
 
+## Storage Capacity
+
+Independent of the `placement.reserve_storage_headroom` fixed-byte filter above, `pve.storage.max_utilization_pct` adds a proportional utilization ceiling that gates `create_vm` placement, `create_disk`, `resize_disk`, and (warn-only) `snapshot_disk`. See [Operations — Storage capacity](operations.md#storage-capacity-utilization-bands-and-the-cpi-ceiling-gate) for the CoW-degradation and Ceph-watermark rationale, and [DLB-Aware Placement](dlb-aware-placement.md#storage-utilization-ceiling-gate) for how it fits into the placement flow.
+
+| Property | Type | Default | Description |
+|---|---|---|---|
+| `pve.storage.max_utilization_pct` | Integer | `0` | Ceiling on projected storage-pool utilization (0-100). `0` disables the gate (byte-identical to prior releases). When set, gates four evaluation points: `create_vm` placement (reject/warn a candidate node whose pool would exceed the ceiling after the VM's disk footprint), `create_disk` (checked before allocation), `resize_disk` (checked before the resize call), and `snapshot_disk` (always warn-only, regardless of `max_utilization_mode` — snapshot growth is unbounded and cannot be estimated ahead of time). Fails open with a logged warning when storage facts cannot be determined. Recommended operational value: `80`. |
+| `pve.storage.max_utilization_mode` | String | `"enforce"` | Enforcement mode when `max_utilization_pct` is exceeded. `enforce` = `create_vm` rejects the candidate node; `create_disk`/`resize_disk` return a retriable cloud error (capacity can be freed, so the director should re-drive). `warn` = the same facts are logged and the operation proceeds unblocked. Ignored by `snapshot_disk`, which is always warn-only. Only meaningful when `max_utilization_pct` is `> 0`. |
+
 ## Hooks
 
 Hooks are built-in middleware that fire around CPI method calls. List enabled hooks by name in `pve.hooks`; an unknown name fails startup. When `pve.hooks` is empty, there is no overhead.

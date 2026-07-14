@@ -372,6 +372,13 @@ type CPIConfig struct {
 	// = use default; explicit value overrides.
 	Placement *PlacementConfig `json:"placement,omitempty"`
 
+	// Storage is an optional nested block controlling storage-pool capacity
+	// guards that apply across create_vm placement, create_disk, resize_disk,
+	// and snapshot_disk — not only create_vm placement, hence its own top-level
+	// block rather than living under Placement. When nil (field absent from
+	// JSON), all storage-capacity behavior is byte-identical to prior releases.
+	Storage *StorageConfig `json:"storage,omitempty"`
+
 	// EnsureNoIPConflicts, when true (default), causes create_vm to verify that
 	// no existing VM on the candidate node already holds the same static IP before
 	// provisioning. Prevents duplicate-IP collisions on static networks. Set
@@ -1129,6 +1136,69 @@ type PlacementConfig struct {
 	StorageHeadroomMB *int `json:"storage_headroom_mb,omitempty"`
 }
 
+// StorageConfig holds storage-pool capacity guard knobs that apply across
+// create_vm placement, create_disk, resize_disk, and snapshot_disk.
+//
+// Motivation: copy-on-write pools (qcow2/thin-LVM/ZFS) degrade progressively
+// as they fill — noticeably from roughly 50% utilization, badly by roughly
+// 80%, and a pool that fills completely can take days to recover. Ceph
+// separately enforces nearfull/backfill-full/full watermarks at 85/90/95% by
+// default; a CPI-side ceiling set below those watermarks (e.g. 80%) gives an
+// early, CPI-level signal before Ceph's own thresholds engage, which matters
+// most on small clusters where Ceph's defaults leave little headroom. This is
+// independent of, and composes with, the absolute-bytes headroom filter
+// (Placement.ReserveStorageHeadroom): the pct ceiling is a proportional
+// early-warning band, the headroom filter is a fixed-margin floor.
+type StorageConfig struct {
+	// MaxUtilizationPct is the ceiling on projected storage-pool utilization,
+	// as a percentage of pool capacity (0-100). Zero (nil or absent) disables
+	// the gate entirely — byte-identical to prior releases. When positive,
+	// four evaluation points check pool utilization AFTER accounting for the
+	// operation's disk footprint:
+	//
+	//   - create_vm placement: candidate nodes whose target vm_storage pool
+	//     would exceed the ceiling after adding the VM's disk footprint are
+	//     rejected from placement (enforce mode) or logged (warn mode).
+	//   - create_disk: the resolved disk pool is checked before allocation.
+	//   - resize_disk: the resize delta is checked before the resize call.
+	//   - snapshot_disk: Warn-only regardless of MaxUtilizationMode — snapshot
+	//     growth is unbounded and cannot be estimated ahead of time, so this
+	//     evaluation point only warns when the pool is ALREADY above the
+	//     ceiling; it never blocks a snapshot.
+	//
+	// Computation reuses the storage status the CPI already fetches
+	// (used/total bytes from GET /nodes/<node>/storage). When storage facts
+	// cannot be determined (API error, pool not found, or pool inactive), the
+	// gate fails open (proceeds) and logs a Warn — consistent with the
+	// existing absolute-bytes headroom filter's fail-open behavior.
+	//
+	// Recommended operational value: 80 (stays below Ceph's 85% nearfull
+	// watermark with margin, and sits at the edge of the CoW "badly degraded"
+	// band). Validate rejects values outside [0, 100]. Use
+	// MaxUtilizationPctValue() for the effective int.
+	MaxUtilizationPct *int `json:"max_utilization_pct,omitempty"`
+
+	// MaxUtilizationMode selects the enforcement behavior when
+	// MaxUtilizationPct is exceeded. Only consulted when MaxUtilizationPct >
+	// 0. Enum: ""|"enforce"|"warn"; empty resolves to "enforce".
+	//
+	//   enforce (default) — create_vm placement rejects the candidate node;
+	//                        create_disk and resize_disk return a RETRIABLE
+	//                        CloudError naming the pool, current projected
+	//                        pct, and the ceiling (capacity can be freed, so
+	//                        the director should re-drive rather than wedge
+	//                        on a permanent error).
+	//   warn              — the same facts are logged at Warn and the
+	//                        operation proceeds unblocked.
+	//
+	// snapshot_disk ignores this setting: it is always Warn-only, regardless
+	// of MaxUtilizationMode, because snapshot growth cannot be estimated and
+	// blocking snapshots on a capacity guess would be unsound.
+	//
+	// Use MaxUtilizationEnforce() for the effective bool.
+	MaxUtilizationMode string `json:"max_utilization_mode,omitempty"`
+}
+
 // AntiAffinityConfig holds the Tier-2 same-group spreading knobs.
 // Both fields are pointer-typed so nil and explicit false are both "off",
 // and an absent sub-key defers to the documented default.
@@ -1796,6 +1866,31 @@ func (c *CPIConfig) StorageHeadroomMBValue() int {
 	return *c.Placement.StorageHeadroomMB
 }
 
+// MaxUtilizationPctValue returns the effective storage-pool utilization
+// ceiling percentage. Zero (nil Storage block, nil field, or an explicit 0)
+// means the gate is disabled — the byte-identical, zero-behavior-change
+// default. A positive return activates the four evaluation points documented
+// on StorageConfig.MaxUtilizationPct.
+func (c *CPIConfig) MaxUtilizationPctValue() int {
+	if c == nil || c.Storage == nil || c.Storage.MaxUtilizationPct == nil {
+		return 0
+	}
+	return *c.Storage.MaxUtilizationPct
+}
+
+// MaxUtilizationEnforce reports whether a storage-utilization-ceiling
+// violation should be enforced (reject/error) rather than only logged. The
+// mode is normalized case-insensitively; empty or unrecognized values resolve
+// to true (enforce is the default). Only meaningful when
+// MaxUtilizationPctValue() > 0; callers must check that first. Ignored
+// entirely by snapshot_disk, which is always Warn-only regardless of mode.
+func (c *CPIConfig) MaxUtilizationEnforce() bool {
+	if c == nil || c.Storage == nil {
+		return true
+	}
+	return strings.ToLower(strings.TrimSpace(c.Storage.MaxUtilizationMode)) != enumValueWarn
+}
+
 // AZCandidates returns the node list for az and true when az is a known key in
 // Placement.AZMap. Returns nil, false when: Placement is nil, AZMap is empty,
 // or az is not in the map. Callers treat (nil, false) as "all online nodes".
@@ -2061,6 +2156,10 @@ func (c *CPIConfig) ActiveIPProbeEnabled() bool {
 
 // enumValueOff is the shared "off" literal used by the opt-in enum knobs.
 const enumValueOff = "off"
+
+// enumValueWarn is the shared "warn" literal used by the enforce/warn enum
+// knobs (e.g. storage.max_utilization_mode).
+const enumValueWarn = "warn"
 
 // DiskDeleteStateGuardEnabled reports whether delete_disk should check the
 // owning VM's lock state before deleting. Default true (as of Phase 1): nil
@@ -2710,6 +2809,7 @@ func (c *CPIConfig) ValidateWithLogger(_ *log.Logger) error {
 	c.validateSDNFields(&errs)
 	c.validateRanges(&errs)
 	c.validatePlacement(&errs)
+	c.validateStorage(&errs)
 	c.validateHooks(&errs)
 	c.validateMetrics(&errs)
 	c.validateHealthCheck(&errs)
@@ -3282,6 +3382,37 @@ func (c *CPIConfig) validateHANodeAffinityPin(errs *[]string) {
 			*errs = append(*errs, fmt.Sprintf(
 				"placement.pin_az_via_ha_rules is incompatible with the DLB sentinel AZ %q in az_map; "+
 					"DLB intentionally un-pins guests", sentinel))
+		}
+	}
+}
+
+// validateStorage validates the optional Storage block. A nil block is valid
+// (gate disabled, zero behavior change). MaxUtilizationPct must fall in
+// [0, 100] when set; MaxUtilizationMode must be enforce|warn when non-empty,
+// validated regardless of whether MaxUtilizationPct is currently positive so
+// a typo is caught at startup even if the operator has not yet raised the
+// ceiling above 0.
+func (c *CPIConfig) validateStorage(errs *[]string) {
+	if c.Storage == nil {
+		return
+	}
+	if c.Storage.MaxUtilizationPct != nil {
+		pct := *c.Storage.MaxUtilizationPct
+		if pct < 0 || pct > 100 {
+			*errs = append(*errs, fmt.Sprintf(
+				"storage.max_utilization_pct must be between 0 and 100, got %d", pct,
+			))
+		}
+	}
+	if c.Storage.MaxUtilizationMode != "" {
+		switch strings.ToLower(strings.TrimSpace(c.Storage.MaxUtilizationMode)) {
+		case "enforce", enumValueWarn:
+			// valid
+		default:
+			*errs = append(*errs, fmt.Sprintf(
+				"storage.max_utilization_mode must be one of enforce|warn (or empty for default enforce), got %q",
+				c.Storage.MaxUtilizationMode,
+			))
 		}
 	}
 }

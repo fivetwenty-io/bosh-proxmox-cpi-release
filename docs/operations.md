@@ -136,6 +136,59 @@ pvesm list <storage> --content import           # stemcell qcow2 import files
 
 See [PVE Storage Locking](pve-storage-locking.md) for lock mechanics and the retry strategy.
 
+### Storage capacity: utilization bands and the CPI ceiling gate
+
+`pvesm status` (above) reports raw free/used bytes per pool. Those numbers alone do not say when a pool is becoming risky — that depends on the storage backend's behavior as it fills, and on any external watermarks (like Ceph's) already in play on the same pool.
+
+**Copy-on-write pools degrade progressively as they fill.** qcow2, thin-provisioned LVM, and ZFS all allocate space on write rather than up front, and their allocation/fragmentation cost grows with occupancy:
+
+- Below roughly 50% utilization: normal.
+
+- From roughly 50%: allocation and fragmentation overhead becomes noticeable — new writes and snapshot operations get measurably slower.
+
+- By roughly 80%: degradation is severe — thin-provisioning metadata operations, snapshot merges, and qcow2 cluster allocation all compete for shrinking contiguous free space.
+
+- At 100% (pool full): the backend stops accepting writes. Guests on that pool see I/O errors or hang. Recovery — freeing enough contiguous space for the backend to resume normal allocation — can take **days**, not minutes, especially on ZFS and thin-LVM where reclaiming space from deleted blocks is itself a background process.
+
+**Ceph enforces its own watermarks on top of this.** A Ceph-backed pool (rbd) separately applies OSD-level watermarks, by default:
+
+- `nearfull` at 85% — Ceph logs a cluster health warning; still accepts writes.
+
+- `backfill-full` at 90% — Ceph refuses new backfill/rebalance operations on the affected OSDs.
+
+- `full` at 95% — Ceph refuses new writes cluster-wide on the affected pool.
+
+Ceph's defaults leave comparatively little headroom between "healthy" and "writes refused" — a few percentage points of overshoot on a large cluster can be observed and absorbed, but the same overshoot on a small cluster (few OSDs, little averaging) can jump past a watermark in a single large `create_vm` or `create_disk` burst. A stricter CPI-side ceiling (e.g. 70-75%) is sensible on small clusters for exactly this reason.
+
+**The CPI ceiling gate (`pve.storage.max_utilization_pct`) is a proportional early-warning band that sits below both of the above.** Set it below the CoW "badly degraded" band and below Ceph's `nearfull` watermark — the recommended operational value is 80 — so the CPI's own placement, disk-creation, and resize logic reacts before either failure mode engages, rather than after. It checks the SAME storage status `pvesm status` reports (used/total bytes) at four points:
+
+- **create_vm placement** — a candidate node is rejected (enforce) or logged (warn) when its `vm_storage` pool would cross the ceiling after adding the new VM's disk footprint.
+
+- **create_disk** — the resolved disk pool is checked before allocation.
+
+- **resize_disk** — the resize delta is checked before the resize call.
+
+- **snapshot_disk** — Warn-only regardless of mode: snapshot growth is unbounded (a snapshot's actual disk cost depends on how much the guest subsequently writes, which cannot be known ahead of time), so this only warns when the pool is already above the ceiling; it never blocks a snapshot.
+
+**This gate composes with, and is independent of, the absolute-bytes headroom filter** (`pve.placement.reserve_storage_headroom` / `pve.placement.storage_headroom_mb`, create_vm placement only). The two answer different questions and can both be active on the same deployment:
+
+- The headroom filter asks: "does this node have at least `disk footprint + fixed margin` bytes free, right now?" — a fixed-byte floor, useful regardless of how large the pool is.
+
+- The utilization-pct gate asks: "would this operation push the pool's fill fraction past a proportional ceiling?" — scales with pool size and tracks the degradation bands and Ceph watermarks above, which are themselves proportional.
+
+A large pool can pass the headroom filter (plenty of bytes free) while still crossing an 80% utilization ceiling; a small pool near its ceiling might fail the headroom filter first. Running both catches both cases.
+
+Diagnostics:
+
+```bash
+pvesm status                       # current used/avail/total per pool — same data the gate reads
+journalctl -u pvedaemon --since "1 hour ago" | grep "utilization ceiling"
+                                    # CPI Warn/error entries name the pool, node, projected
+                                    # percentage, and configured ceiling
+```
+
+See [Configuration Reference](configuration.md) for the `pve.storage.*` property table and [DLB-Aware Placement](dlb-aware-placement.md) for how this gate interacts with placement scoring and the absolute headroom filter.
+
 ### Task logs
 
 ```bash

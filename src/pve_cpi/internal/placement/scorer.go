@@ -117,6 +117,26 @@ type Request struct {
 	// placement.reserve_storage_headroom is enabled; default 0.
 	RequiredStorageBytes int64
 
+	// MaxUtilizationPct is the ceiling (0-100) on projected utilization of the
+	// target VM storage pool after adding PlannedAddBytes. Zero means no
+	// utilization filter (byte-identical to prior releases). When > 0 and the
+	// node has storage facts (TotalStorageBytes > 0), Filter rejects any node
+	// whose (TotalStorageBytes-FreeStorageBytes+PlannedAddBytes) /
+	// TotalStorageBytes × 100 exceeds MaxUtilizationPct, with reason "storage
+	// utilization ceiling exceeded". When TotalStorageBytes == 0 (storage
+	// facts unavailable), the node passes — fail-open, matching
+	// RequiredStorageBytes. Callers populate this only in "enforce" mode for
+	// storage.max_utilization_pct; "warn" mode leaves this 0 and performs its
+	// own advisory check against the chosen node after Filter/Score run, since
+	// warn mode must never remove a node from the candidate set.
+	MaxUtilizationPct int
+
+	// PlannedAddBytes is the disk footprint (bytes) this create_vm call is
+	// about to add to the target VM storage pool — the same pool
+	// RequiredStorageBytes/TotalStorageBytes/FreeStorageBytes describe. Only
+	// consulted when MaxUtilizationPct > 0.
+	PlannedAddBytes int64
+
 	// CandidateNodes restricts scoring to the named nodes when non-empty.
 	// An empty slice means all online nodes are candidates.
 	CandidateNodes []string
@@ -160,6 +180,10 @@ type ScoredNode struct {
 //     RequiredStorageBytes > 0 AND TotalStorageBytes > 0. When TotalStorageBytes == 0
 //     (storage facts unavailable), the node passes — fail-open matches the soft-axis
 //     skip semantics in Score.
+//   - Node's projected utilization ((TotalStorageBytes-FreeStorageBytes+PlannedAddBytes)
+//     / TotalStorageBytes × 100) must be ≤ req.MaxUtilizationPct when MaxUtilizationPct
+//     > 0 AND TotalStorageBytes > 0. Fail-open on TotalStorageBytes == 0, same as
+//     RequiredStorageBytes above.
 //   - When req.RequiredPCIAddresses is non-empty and req.PCIChecker is set, the
 //     node must pass the PCI device check (fail-safe: error → reject).
 //
@@ -215,6 +239,15 @@ func Filter(facts []NodeFacts, req Request) (pass []NodeFacts, rejections map[st
 			continue
 		}
 
+		// Utilization-ceiling hard filter (storage.max_utilization_pct,
+		// enforce mode only — see MaxUtilizationPct doc). Fail-open when
+		// TotalStorageBytes == 0, matching the RequiredStorageBytes fail-open
+		// semantics above.
+		if exceedsUtilizationCeiling(f, req) {
+			rejections[f.Node] = "storage utilization ceiling exceeded"
+			continue
+		}
+
 		if len(req.RequiredPCIAddresses) > 0 && req.PCIChecker != nil {
 			present, checkErr := req.PCIChecker(f.Node)
 			if checkErr != nil {
@@ -234,6 +267,25 @@ func Filter(facts []NodeFacts, req Request) (pass []NodeFacts, rejections map[st
 		rejections = nil
 	}
 	return pass, rejections
+}
+
+// exceedsUtilizationCeiling reports whether f's projected utilization —
+// (TotalStorageBytes-FreeStorageBytes+PlannedAddBytes)/TotalStorageBytes×100
+// — exceeds req.MaxUtilizationPct. Always false when the gate is off
+// (MaxUtilizationPct <= 0) or storage facts are unavailable
+// (TotalStorageBytes <= 0, fail-open, matching the RequiredStorageBytes
+// fail-open semantics in Filter). Extracted from Filter to keep its
+// cognitive complexity within the project threshold.
+func exceedsUtilizationCeiling(f NodeFacts, req Request) bool {
+	if req.MaxUtilizationPct <= 0 || f.TotalStorageBytes <= 0 {
+		return false
+	}
+	used := f.TotalStorageBytes - f.FreeStorageBytes
+	if used < 0 {
+		used = 0
+	}
+	projectedPct := float64(used+req.PlannedAddBytes) / float64(f.TotalStorageBytes) * 100
+	return projectedPct > float64(req.MaxUtilizationPct)
 }
 
 // Score computes a weighted score for each fact in facts using w.

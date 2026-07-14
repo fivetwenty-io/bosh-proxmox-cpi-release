@@ -71,9 +71,10 @@ func HandleResizeDisk(deps Deps) Handler {
 		}
 
 		// ----------------------------------------------------------------
-		// 2. Parse disk_cid → volid.
+		// 2. Parse disk_cid → storage + volid.
 		// ----------------------------------------------------------------
-		if _, _, err := pve.ParseDiskCID(bareDiskCID); err != nil {
+		storageName, _, parseErr2 := pve.ParseDiskCID(bareDiskCID)
+		if parseErr2 != nil {
 			return nil, cpierrors.DiskNotFound(diskCID)
 		}
 
@@ -191,6 +192,18 @@ func HandleResizeDisk(deps Deps) Handler {
 				log.Int("new_size_mb", newSizeMB),
 			)
 			return nil, nil
+		}
+
+		// ----------------------------------------------------------------
+		// 7a. Storage-utilization gate (pve.storage.max_utilization_pct).
+		// No-op when the ceiling is unset (0, the default). addBytes is only
+		// the positive delta being ADDED to the pool by this resize, not the
+		// disk's resulting total size.
+		// ----------------------------------------------------------------
+		if gateErr := checkMaxUtilizationGate(
+			ctx, deps, node, storageName, int64(deltaGiB)*storageUtilBytesPerGiB, "resize_disk",
+		); gateErr != nil {
+			return nil, gateErr
 		}
 
 		// ----------------------------------------------------------------

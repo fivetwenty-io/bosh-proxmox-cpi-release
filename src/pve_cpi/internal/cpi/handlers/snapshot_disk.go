@@ -61,7 +61,8 @@ func HandleSnapshotDisk(deps Deps) Handler {
 		// ----------------------------------------------------------------
 		// 2. Parse disk_cid → storage + volid components.
 		// ----------------------------------------------------------------
-		if _, _, err := pve.ParseDiskCID(bareDiskCID); err != nil {
+		storageName, _, parseErr := pve.ParseDiskCID(bareDiskCID)
+		if parseErr != nil {
 			return nil, cpierrors.DiskNotFound(diskCID)
 		}
 
@@ -98,6 +99,15 @@ func HandleSnapshotDisk(deps Deps) Handler {
 		if err := guardSnapshotParked(ctx, deps, diskCID, vmid, node); err != nil {
 			return nil, err
 		}
+
+		// ----------------------------------------------------------------
+		// 3b. Storage-utilization gate (pve.storage.max_utilization_pct):
+		// Warn-only regardless of storage.max_utilization_mode. Snapshot
+		// growth is unbounded and cannot be estimated ahead of time, so this
+		// only warns when the pool is ALREADY above the ceiling; it never
+		// blocks the snapshot. No-op when the ceiling is unset (0, default).
+		// ----------------------------------------------------------------
+		warnIfStorageAboveCeiling(ctx, deps, node, storageName)
 
 		// ----------------------------------------------------------------
 		// 4. Generate a unique snapshot name: bosh-<timestamp>-<hex4>.

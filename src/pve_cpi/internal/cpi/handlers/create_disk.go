@@ -326,6 +326,16 @@ func HandleCreateDisk(deps Deps) Handler {
 			sizeGiB = 1
 		}
 
+		// ----------------------------------------------------------------
+		// 3a. Storage-utilization gate (pve.storage.max_utilization_pct).
+		// No-op when the ceiling is unset (0, the default). addBytes is the
+		// new disk's own size — the bytes this call is about to ADD to the
+		// pool, not the pool's current or resulting total.
+		// ----------------------------------------------------------------
+		if gateErr := checkMaxUtilizationGate(ctx, deps, node, storage, int64(sizeGiB)*storageUtilBytesPerGiB, "create_disk"); gateErr != nil {
+			return nil, gateErr
+		}
+
 		// Block storages (lvm/lvmthin/zfspool) reject qcow2 and only accept
 		// raw. The CPI's default disk_format is qcow2 which works for file
 		// storages (dir/nfs/cifs). Only pass the explicit format to CreateVolume

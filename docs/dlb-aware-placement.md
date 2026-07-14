@@ -198,6 +198,14 @@ flowchart TD
 
 ---
 
+## Storage-Utilization Ceiling Gate
+
+`pve.storage.max_utilization_pct` (default 0, disabled) adds a proportional utilization ceiling to the node-scoring flow above, on top of the fixed-byte `placement.reserve_storage_headroom` filter. When set, it is evaluated as part of the same `Filter` step shown in the diagram (step G): a candidate node whose `vm_storage` pool would cross the ceiling after adding the new VM's disk footprint is rejected in enforce mode (`pve.storage.max_utilization_mode: enforce`, the default) or logged in warn mode (`warn`) without affecting the winner.
+
+The same `pve.storage.max_utilization_pct` ceiling also gates `create_disk`, `resize_disk`, and (Warn-only) `snapshot_disk`, outside the placement flow described in this document. See [Operations — Storage capacity](operations.md#storage-capacity-utilization-bands-and-the-cpi-ceiling-gate) for the CoW-degradation and Ceph-watermark rationale behind the recommended ceiling value, and [Configuration Reference](configuration.md) for the full property table.
+
+---
+
 ## HA Node-Affinity Pin
 
 When `pve.placement.pin_az_via_ha_rules` is enabled, `create_vm` calls `applyAZNodeAffinityPin` after the winning node is selected. This step creates a PVE HA rule named `bosh-na-{vmid}` with:

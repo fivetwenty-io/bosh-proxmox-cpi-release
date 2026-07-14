@@ -948,6 +948,56 @@ properties:
       floor is used. Negative values are rejected at startup. Only meaningful when
       placement.reserve_storage_headroom is true.
     default: 0
+  pve.storage.max_utilization_pct:
+    description: |
+      Ceiling on projected storage-pool utilization, as a percentage of pool
+      capacity (0-100). Default 0 (disabled): behavior is byte-identical to
+      prior releases. When set > 0, four evaluation points check the target
+      pool's utilization AFTER accounting for the operation's disk footprint:
+        - create_vm placement: a candidate node whose vm_storage pool would
+          exceed the ceiling after adding the VM's disk footprint is rejected
+          from placement (enforce mode) or logged (warn mode).
+        - create_disk: the resolved disk pool is checked before allocation.
+        - resize_disk: the resize delta is checked before the resize call.
+        - snapshot_disk: Warn-only regardless of storage.max_utilization_mode
+          — snapshot growth is unbounded and cannot be estimated ahead of
+          time, so this evaluation point only warns when the pool is already
+          above the ceiling; it never blocks a snapshot.
+      Computation reuses the storage status the CPI already fetches (used/total
+      bytes from the node storage API); when storage facts cannot be determined
+      (API error, pool not found, or pool inactive) the gate fails open
+      (proceeds) and logs a warning, matching placement.reserve_storage_headroom's
+      fail-open behavior. This gate is independent of, and composes with,
+      placement.reserve_storage_headroom: the pct ceiling is a proportional
+      early-warning band, the headroom filter is a fixed-byte-margin floor;
+      both can be active together.
+
+      Why this matters: copy-on-write pools (qcow2, thin-LVM, ZFS) degrade
+      progressively as they fill — noticeably from roughly 50% utilization,
+      badly by roughly 80%, and a pool that fills completely can take days to
+      recover. Ceph separately enforces nearfull/backfill-full/full watermarks
+      at 85/90/95% by default; a ceiling set below those watermarks gives an
+      earlier, CPI-level signal before Ceph's own thresholds engage, which
+      matters most on small clusters where Ceph's default watermarks leave
+      little headroom above them — a stricter ceiling (e.g. 70-75) is sensible
+      there. Recommended operational value: 80.
+    default: 0
+  pve.storage.max_utilization_mode:
+    description: |
+      Enforcement mode when placement.storage.max_utilization_pct is exceeded.
+      Only consulted when max_utilization_pct is > 0. One of "enforce"
+      (default) or "warn":
+        - enforce: create_vm placement rejects the candidate node; create_disk
+          and resize_disk return a RETRIABLE cloud error naming the pool, the
+          current projected percentage, and the ceiling — capacity can be
+          freed, so the director should re-drive rather than treat this as a
+          permanent, non-retriable failure.
+        - warn: the same facts are logged at Warn and the operation proceeds
+          unblocked.
+      snapshot_disk ignores this setting: it is always Warn-only regardless of
+      max_utilization_mode, since snapshot growth cannot be estimated and
+      blocking snapshots on a capacity guess would be unsound.
+    default: "enforce"
   pve.stemcell_replicate_local:
     description: |
       When true, create_stemcell uploads the stemcell qcow2 independently to every

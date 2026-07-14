@@ -264,6 +264,115 @@ func TestFilter_StorageFilter_ZeroRequired_NoFilter(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// MaxUtilizationPct / PlannedAddBytes (storage.max_utilization_pct) tests
+// ---------------------------------------------------------------------------
+
+// TestFilter_UtilizationCeiling_RejectsWhenProjectedOverCeiling verifies a
+// node is rejected when (used+PlannedAddBytes)/total×100 exceeds
+// MaxUtilizationPct, and that a node whose projected utilization stays at or
+// under the ceiling passes.
+func TestFilter_UtilizationCeiling_RejectsWhenProjectedOverCeiling(t *testing.T) {
+	t.Parallel()
+	facts := []placement.NodeFacts{
+		// used=85GiB of 100GiB (85%); +10GiB add -> 95% > 90% ceiling -> reject.
+		{Node: "over", Online: true, TotalStorageBytes: 100 * gib, FreeStorageBytes: 15 * gib},
+		// used=50GiB of 100GiB (50%); +10GiB add -> 60% <= 90% ceiling -> pass.
+		{Node: "under", Online: true, TotalStorageBytes: 100 * gib, FreeStorageBytes: 50 * gib},
+	}
+	req := placement.Request{MaxUtilizationPct: 90, PlannedAddBytes: 10 * gib}
+	pass, rej := placement.Filter(facts, req)
+	if len(pass) != 1 || pass[0].Node != "under" {
+		t.Errorf("expected only under to pass; got %v", nodeNames(pass))
+	}
+	if rej["over"] != "storage utilization ceiling exceeded" {
+		t.Errorf("over rejection = %q; want %q", rej["over"], "storage utilization ceiling exceeded")
+	}
+}
+
+// TestFilter_UtilizationCeiling_ExactlyAtCeiling_Passes verifies the boundary:
+// a projected utilization exactly equal to the ceiling passes (only strictly
+// greater-than is rejected).
+func TestFilter_UtilizationCeiling_ExactlyAtCeiling_Passes(t *testing.T) {
+	t.Parallel()
+	facts := []placement.NodeFacts{
+		// used=80GiB of 100GiB; +10GiB add -> exactly 90%.
+		{Node: "exact", Online: true, TotalStorageBytes: 100 * gib, FreeStorageBytes: 20 * gib},
+	}
+	req := placement.Request{MaxUtilizationPct: 90, PlannedAddBytes: 10 * gib}
+	pass, rej := placement.Filter(facts, req)
+	if len(pass) != 1 || pass[0].Node != "exact" {
+		t.Errorf("expected exact to pass (projected == ceiling); got %v", nodeNames(pass))
+	}
+	if len(rej) != 0 {
+		t.Errorf("expected no rejections; got %v", rej)
+	}
+}
+
+// TestFilter_UtilizationCeiling_FailOpenWhenNoFacts verifies fail-open: when
+// TotalStorageBytes == 0 (storage facts unavailable), the node is NOT
+// rejected regardless of MaxUtilizationPct, matching the RequiredStorageBytes
+// fail-open behavior.
+func TestFilter_UtilizationCeiling_FailOpenWhenNoFacts(t *testing.T) {
+	t.Parallel()
+	facts := []placement.NodeFacts{
+		{Node: "nofacts", Online: true, TotalStorageBytes: 0, FreeStorageBytes: 0},
+	}
+	req := placement.Request{MaxUtilizationPct: 1, PlannedAddBytes: 1}
+	pass, rej := placement.Filter(facts, req)
+	if len(pass) != 1 || pass[0].Node != "nofacts" {
+		t.Errorf("expected nofacts to pass (fail-open on missing facts); got %v", nodeNames(pass))
+	}
+	if len(rej) != 0 {
+		t.Errorf("expected no rejections for fail-open path; got %v", rej)
+	}
+}
+
+// TestFilter_UtilizationCeiling_ZeroCeiling_NoFilter verifies
+// MaxUtilizationPct == 0 disables the gate entirely — byte-identical to the
+// gate being absent, even on a nearly-full pool.
+func TestFilter_UtilizationCeiling_ZeroCeiling_NoFilter(t *testing.T) {
+	t.Parallel()
+	facts := []placement.NodeFacts{
+		{Node: "almost-full", Online: true, TotalStorageBytes: 100 * gib, FreeStorageBytes: 1 * gib},
+	}
+	req := placement.Request{MaxUtilizationPct: 0, PlannedAddBytes: 50 * gib}
+	pass, rej := placement.Filter(facts, req)
+	if len(pass) != 1 || pass[0].Node != "almost-full" {
+		t.Errorf("expected almost-full to pass (MaxUtilizationPct==0 means no filter); got %v", nodeNames(pass))
+	}
+	if len(rej) != 0 {
+		t.Errorf("expected no rejections when MaxUtilizationPct==0; got %v", rej)
+	}
+}
+
+// TestFilter_UtilizationCeiling_ComposesWithHeadroomFilter verifies both
+// gates can independently reject the same node when both are configured: a
+// node with enough free bytes to satisfy RequiredStorageBytes can still be
+// rejected by the pct ceiling, and vice versa is exercised by the "over" case
+// in TestFilter_UtilizationCeiling_RejectsWhenProjectedOverCeiling.
+func TestFilter_UtilizationCeiling_ComposesWithHeadroomFilter(t *testing.T) {
+	t.Parallel()
+	facts := []placement.NodeFacts{
+		// 20GiB free easily satisfies a 10GiB RequiredStorageBytes floor, but
+		// used=80GiB of 100GiB (80%); +10GiB add -> 90% > 50% ceiling -> reject
+		// on the utilization gate despite passing the headroom gate.
+		{Node: "n1", Online: true, TotalStorageBytes: 100 * gib, FreeStorageBytes: 20 * gib},
+	}
+	req := placement.Request{
+		RequiredStorageBytes: 10 * gib,
+		MaxUtilizationPct:    50,
+		PlannedAddBytes:      10 * gib,
+	}
+	pass, rej := placement.Filter(facts, req)
+	if len(pass) != 0 {
+		t.Errorf("expected n1 to be rejected by the utilization ceiling; got pass=%v", nodeNames(pass))
+	}
+	if rej["n1"] != "storage utilization ceiling exceeded" {
+		t.Errorf("n1 rejection = %q; want %q", rej["n1"], "storage utilization ceiling exceeded")
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Score tests
 // ---------------------------------------------------------------------------
 

@@ -337,6 +337,20 @@
 
   config["placement"] = placement unless placement.empty?
 
+  # Emit the storage block only when the operator sets a positive utilization
+  # ceiling. Zero (default) means the Go nil *int -> 0 -> gate-off accessor
+  # preserves byte-identical behavior, so the block is omitted entirely.
+  storage = {}
+  max_util_pct = p("pve.storage.max_utilization_pct", 0).to_i
+  if max_util_pct > 0
+    storage["max_utilization_pct"] = max_util_pct
+    # storage.max_utilization_mode: emit only when the operator overrides the
+    # default "enforce". Omitting preserves the Go accessor's enforce default.
+    max_util_mode = p("pve.storage.max_utilization_mode", "enforce")
+    storage["max_utilization_mode"] = max_util_mode unless max_util_mode == "enforce"
+  end
+  config["storage"] = storage unless storage.empty?
+
   # Emit vm_firewall only when explicitly true. The Go accessor defaults
   # nil *bool -> false (no behavior change); omitting the key preserves that.
   if p("pve.vm_firewall", false)

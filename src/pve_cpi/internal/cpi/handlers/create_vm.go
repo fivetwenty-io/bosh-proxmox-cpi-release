@@ -1465,6 +1465,10 @@ func resolveTargetNodeWithRNG(
 			requiredStorageBytes = computeRequiredStorageBytes(deps.Config, cp, storageName)
 		}
 
+		// Storage-utilization ceiling gate (storage.max_utilization_pct). See
+		// utilizationGateForRequest doc for the enforce/warn split.
+		utilCeilingPct, utilAddBytes, warnUtilChosen := utilizationGateForRequest(deps.Config, cp, storageName, facts, logger)
+
 		// AZ loop. When azOrder is empty (no AZ set at all), run a single
 		// iteration with no candidate restriction (all nodes).
 		allRejections := make(map[string]string)
@@ -1476,11 +1480,14 @@ func resolveTargetNodeWithRNG(
 				RequiredPCIAddresses:    pciAddrs,
 				PCIChecker:              pciCheckerFn,
 				RequiredStorageBytes:    requiredStorageBytes,
+				MaxUtilizationPct:       utilCeilingPct,
+				PlannedAddBytes:         utilAddBytes,
 			}
 			pass, rejections := placement.Filter(facts, req)
 			mergeRejections(allRejections, rejections)
 			logFilterRejections(logger, rejections, "")
 			if chosen := scoreAndPick(pass, weights, logger, ""); chosen != "" {
+				warnUtilChosen(chosen)
 				return chosen, nil
 			}
 		} else {
@@ -1497,12 +1504,15 @@ func resolveTargetNodeWithRNG(
 					RequiredPCIAddresses:    pciAddrs,
 					PCIChecker:              pciCheckerFn,
 					RequiredStorageBytes:    requiredStorageBytes,
+					MaxUtilizationPct:       utilCeilingPct,
+					PlannedAddBytes:         utilAddBytes,
 				}
 				pass, rejections := placement.Filter(facts, req)
 				mergeRejections(allRejections, rejections)
 				logFilterRejections(logger, rejections, az)
 
 				if chosen := scoreAndPick(pass, weights, logger, az); chosen != "" {
+					warnUtilChosen(chosen)
 					return chosen, nil
 				}
 				logger.Debug("create_vm: placement: AZ exhausted, trying next",
@@ -1734,6 +1744,9 @@ func resolveTargetNodeWithFallbacks(
 			requiredStorageBytesFB = computeRequiredStorageBytes(deps.Config, cp, storageName)
 		}
 
+		// Storage-utilization ceiling gate (same computation as non-fallback path).
+		utilCeilingPctFB, utilAddBytesFB, warnUtilChosenFB := utilizationGateForRequest(deps.Config, cp, storageName, facts, logger)
+
 		allRejections := make(map[string]string)
 
 		if len(azOrder) == 0 {
@@ -1742,11 +1755,14 @@ func resolveTargetNodeWithFallbacks(
 				RequiredPCIAddresses:    pciAddrsFB,
 				PCIChecker:              pciCheckerFnFB,
 				RequiredStorageBytes:    requiredStorageBytesFB,
+				MaxUtilizationPct:       utilCeilingPctFB,
+				PlannedAddBytes:         utilAddBytesFB,
 			}
 			pass, rejections := placement.Filter(facts, req)
 			mergeRejections(allRejections, rejections)
 			logFilterRejections(logger, rejections, "")
 			if chosen, ranked := scoreAndPickWithRanked(pass, weights, logger, ""); chosen != "" {
+				warnUtilChosenFB(chosen)
 				alts := buildAlternates(chosen, ranked, fallbackMax)
 				return chosen, alts, nil
 			}
@@ -1762,11 +1778,14 @@ func resolveTargetNodeWithFallbacks(
 					RequiredPCIAddresses:    pciAddrsFB,
 					PCIChecker:              pciCheckerFnFB,
 					RequiredStorageBytes:    requiredStorageBytesFB,
+					MaxUtilizationPct:       utilCeilingPctFB,
+					PlannedAddBytes:         utilAddBytesFB,
 				}
 				pass, rejections := placement.Filter(facts, req)
 				mergeRejections(allRejections, rejections)
 				logFilterRejections(logger, rejections, az)
 				if chosen, ranked := scoreAndPickWithRanked(pass, weights, logger, az); chosen != "" {
+					warnUtilChosenFB(chosen)
 					alts := buildAlternates(chosen, ranked, fallbackMax)
 					return chosen, alts, nil
 				}
@@ -2181,13 +2200,22 @@ func classifyFilterResult(rejections map[string]string) (retriable bool) {
 func isTransientRejectionReason(reason string) bool {
 	switch reason {
 	case "node offline", "node in maintenance", "insufficient CPU", "insufficient free memory",
-		"not in candidate node set":
+		"not in candidate node set", "storage utilization ceiling exceeded":
 		// "insufficient free storage" is intentionally absent: a storage-capacity
 		// shortfall is a hard permanent constraint (the node does not have enough
 		// free space for the VM's disks plus headroom) and will not clear without
 		// operator action (freeing space or moving data). Map it to non-retriable
 		// so the Director surfaces the error immediately instead of retrying
 		// indefinitely against the same over-committed node.
+		//
+		// "storage utilization ceiling exceeded" is deliberately the OPPOSITE
+		// classification: the ceiling gate (storage.max_utilization_pct) is a
+		// proportional early-warning band, not a hard-out-of-space condition —
+		// capacity can plausibly free up (a neighboring delete, a completed
+		// migration) well before the pool is actually full. Enforce-mode
+		// violations must be RETRIABLE so the director re-drives rather than
+		// treating a recoverable capacity pressure signal as a permanent
+		// failure.
 		return true
 	}
 	// A failed ListHardwarePci call (pvedaemon restart, momentary node
@@ -2240,10 +2268,51 @@ func formatRejections(rejections map[string]string) string {
 //
 // storageName is the pool the placement facts measured (always deps.Config.VMStorage).
 func computeRequiredStorageBytes(cfg *config.CPIConfig, cp createVMCloudProps, storageName string) int64 {
-	const (
-		mibBytes = int64(1024 * 1024)
-		gibBytes = int64(1024 * 1024 * 1024)
-	)
+	const mibBytes = int64(1024 * 1024)
+
+	footprintBytes := computeDiskFootprintBytes(cp, storageName)
+	ephemeralOnVMStorage := cp.EphemeralStoragePool == "" || cp.EphemeralStoragePool == storageName
+
+	// Headroom: configured margin + VM RAM as in-guest swap reservation.
+	// The swap term mirrors vSphere's DISK_HEADROOM logic (max swapfile ≈ VM RAM).
+	// Include only when a dedicated ephemeral disk is present (the swap file
+	// resides on the ephemeral disk; without a dedicated ephemeral disk the
+	// agent carves swap from the root disk, which is already counted above).
+	headroomMiB := int64(cfg.StorageHeadroomMBValue())
+	headroomBytes := headroomMiB * mibBytes
+
+	if cp.EphemeralDiskSizeMB > 0 && ephemeralOnVMStorage {
+		// Include VM RAM as worst-case swap reservation (vSphere max-swapfile term).
+		memMiB := int64(cp.Memory)
+		if cp.RAM > 0 {
+			memMiB = int64(cp.RAM)
+		}
+		if memMiB < 0 {
+			memMiB = 0
+		}
+		headroomBytes += memMiB * mibBytes
+	}
+
+	return footprintBytes + headroomBytes
+}
+
+// computeDiskFootprintBytes returns the raw disk footprint in bytes — root
+// disk plus ephemeral disk (when it lands on storageName) — with NO headroom
+// margin. This is the quantity storage.max_utilization_pct evaluates the pool
+// against; computeRequiredStorageBytes adds a headroom margin on top of this
+// same footprint for the separate placement.reserve_storage_headroom gate.
+//
+//   - rootDiskBytes = rootDiskGiB (GiB→bytes); rootDiskGiB is the effective
+//     root disk size derived from cloud_properties exactly as
+//     resolveVMShapeStorage does it — max(defaultStemcellDiskGiB,
+//     ceil(requestedMiB/1024)).
+//   - ephemeralDiskBytes = ephemeral GiB×GiB→bytes, included ONLY when the
+//     ephemeral disk resolves to the same storage pool as storageName (i.e.
+//     cp.EphemeralStoragePool is "" or equals storageName). If the ephemeral
+//     disk is on a different pool, those bytes are excluded so the gate is
+//     not applied to a pool whose facts were not gathered.
+func computeDiskFootprintBytes(cp createVMCloudProps, storageName string) int64 {
+	const gibBytes = int64(1024 * 1024 * 1024)
 
 	// Effective root disk size: mirrors resolveVMShapeStorage logic.
 	rootDiskGiB := int64(defaultStemcellDiskGiB)
@@ -2272,27 +2341,71 @@ func computeRequiredStorageBytes(cfg *config.CPIConfig, cp createVMCloudProps, s
 	}
 	ephemeralDiskBytes := ephemeralGiB * gibBytes
 
-	// Headroom: configured margin + VM RAM as in-guest swap reservation.
-	// The swap term mirrors vSphere's DISK_HEADROOM logic (max swapfile ≈ VM RAM).
-	// Include only when a dedicated ephemeral disk is present (the swap file
-	// resides on the ephemeral disk; without a dedicated ephemeral disk the
-	// agent carves swap from the root disk, which is already counted above).
-	headroomMiB := int64(cfg.StorageHeadroomMBValue())
-	headroomBytes := headroomMiB * mibBytes
+	return rootDiskBytes + ephemeralDiskBytes
+}
 
-	if cp.EphemeralDiskSizeMB > 0 && ephemeralOnVMStorage {
-		// Include VM RAM as worst-case swap reservation (vSphere max-swapfile term).
-		memMiB := int64(cp.Memory)
-		if cp.RAM > 0 {
-			memMiB = int64(cp.RAM)
-		}
-		if memMiB < 0 {
-			memMiB = 0
-		}
-		headroomBytes += memMiB * mibBytes
+// utilizationGateForRequest returns the placement.Request fields that enforce
+// storage.max_utilization_pct, plus a closure to run after the winning node
+// is chosen.
+//
+// In enforce mode (the default) the returned ceilingPct/addBytes populate
+// placement.Request.MaxUtilizationPct/PlannedAddBytes, so Filter hard-rejects
+// any candidate node that would breach the ceiling; the returned closure is
+// then a no-op, since a violation on the chosen node is impossible to observe
+// (Filter already excluded it).
+//
+// In warn mode the hard-filter fields are left zero — scoring and candidate
+// selection are byte-identical to the gate being disabled — and the returned
+// closure instead checks the ultimately chosen node against the same ceiling
+// and logs a Warn if it would be breached, without blocking placement.
+//
+// Disabled (storage.max_utilization_pct unset or 0) returns zero fields and a
+// no-op closure — zero added cost, zero behavior change.
+func utilizationGateForRequest(
+	cfg *config.CPIConfig, cp createVMCloudProps, storageName string, facts []placement.NodeFacts, logger *log.Logger,
+) (ceilingPct int, addBytes int64, warnChosen func(node string)) {
+	noop := func(string) {}
+	ceiling := cfg.MaxUtilizationPctValue()
+	if ceiling <= 0 {
+		return 0, 0, noop
 	}
+	footprint := computeDiskFootprintBytes(cp, storageName)
+	if cfg.MaxUtilizationEnforce() {
+		return ceiling, footprint, noop
+	}
+	return 0, 0, func(node string) {
+		warnIfNodeUtilizationExceeds(facts, node, ceiling, footprint, logger)
+	}
+}
 
-	return rootDiskBytes + ephemeralDiskBytes + headroomBytes
+// warnIfNodeUtilizationExceeds implements the warn-mode half of the
+// create_vm storage.max_utilization_pct gate: it looks up node's already-
+// gathered storage facts and logs a Warn if placing addBytes there would push
+// projected utilization past ceilingPct. A no-op when node's facts are
+// missing or report no storage capacity (fail-open, consistent with the
+// enforce-mode Filter path's fail-open on TotalStorageBytes == 0).
+func warnIfNodeUtilizationExceeds(facts []placement.NodeFacts, node string, ceilingPct int, addBytes int64, logger *log.Logger) {
+	for _, f := range facts {
+		if f.Node != node {
+			continue
+		}
+		if f.TotalStorageBytes <= 0 {
+			return
+		}
+		used := f.TotalStorageBytes - f.FreeStorageBytes
+		if used < 0 {
+			used = 0
+		}
+		pct := float64(used+addBytes) / float64(f.TotalStorageBytes) * 100
+		if pct > float64(ceilingPct) {
+			logger.Warn("create_vm: chosen node's storage pool projected utilization exceeds ceiling (warn mode; proceeding)",
+				log.String("node", node),
+				log.Float64("projected_pct", pct),
+				log.Int("ceiling_pct", ceilingPct),
+			)
+		}
+		return
+	}
 }
 
 // collectStaticIPsForConflictCheck extracts the bare IP addresses from the
