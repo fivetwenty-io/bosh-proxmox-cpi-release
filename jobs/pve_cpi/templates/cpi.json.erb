@@ -60,6 +60,15 @@
   stemcell_staging_dir = p("pve.stemcell_staging_dir", "")
   config["stemcell_staging_dir"] = stemcell_staging_dir unless stemcell_staging_dir.to_s.empty?
 
+  # Emit cpu_type only when the operator supplies a non-empty value. When
+  # absent or empty (the default), the key is omitted so the Go config
+  # zero-value ("") is preserved: create_vm writes no "cpu" key at all and PVE
+  # falls back to its own kvm64 default — byte-identical to prior releases.
+  # Per-VM cloud_properties.cpu_type (resolved via the layered vm_type/
+  # disk_type resolver) takes precedence over this global default.
+  cpu_type = p("pve.cpu_type", "")
+  config["cpu_type"] = cpu_type unless cpu_type.to_s.empty?
+
   # Emit stemcell-fetch transport timeouts only when the operator sets them.
   # When absent or 0 (the default), the key is omitted so the Go config
   # zero-value (0) reaches ApplyDefaults and the built-in defaults apply

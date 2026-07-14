@@ -164,6 +164,17 @@ func applyPVEConfigPassthrough(
 			params.Bios = &val
 		case pveConfigKeyCPU:
 			params.Cpu = &val
+			// pve_config.cpu is the raw escape hatch and always wins as the
+			// final write (this call runs after the create/clone step that
+			// applies pve.cpu_type / cloud_properties.cpu_type). Point the
+			// operator at the first-class knob in case the raw passthrough
+			// was only used because cpu_type was not yet known to exist.
+			logger.Info(
+				"create_vm: pve_config.cpu is set; note pve.cpu_type / cloud_properties.cpu_type "+
+					"exist as the first-class knob for the emulated CPU type and take effect before "+
+					"this raw override is applied",
+				log.Int(metadataKeyVMID, vmid),
+			)
 		}
 	}
 

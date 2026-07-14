@@ -333,6 +333,14 @@ type createVMShape struct {
 	// ephemeralStorage is the PVE storage pool for the ephemeral disk.
 	// Only meaningful when ephemeralDiskGiB > 0.
 	ephemeralStorage string
+	// cpuType is the resolved emulated CPU type/model to write on the new VM
+	// (e.g. "x86-64-v2-AES"). Resolved once via resolveVMShapeCPUType:
+	// cloud_properties.cpu_type (call/disk_type/vm_type layered resolver) >
+	// pve.cpu_type global default > "" (no cpu key written at all — the
+	// zero-behavior-change default). Both import-path (createParams) and
+	// clone-path (UpdateQemuConfig) use this value; cloud_properties.pve_config.cpu
+	// is a separate, later write that always wins as the final override.
+	cpuType string
 }
 
 // HandleCreateVM returns a cpi.Handler that implements the BOSH CPI create_vm method.
@@ -1134,6 +1142,8 @@ func buildVMShapeForNode(ctx context.Context, deps Deps, parsed *createVMParsedA
 		scsihwVal = "virtio-scsi-single"
 	}
 
+	cpuTypeVal := resolveVMShapeCPUType(perfR, deps.Config)
+
 	ephemeralDiskGiB, ephemeralStorage, err := resolveEphemeralShape(ctx, deps, cp, parsed.cloudPropsMap)
 	if err != nil {
 		return nil, err
@@ -1162,6 +1172,7 @@ func buildVMShapeForNode(ctx context.Context, deps Deps, parsed *createVMParsedA
 		scsihw:           scsihwVal,
 		ephemeralDiskGiB: ephemeralDiskGiB,
 		ephemeralStorage: ephemeralStorage,
+		cpuType:          cpuTypeVal,
 	}, nil
 }
 
@@ -2707,6 +2718,28 @@ func resolveVMShapeCPUMem(cp createVMCloudProps) (cores, sockets, memMiB int) {
 	return cores, sockets, memMiB
 }
 
+// resolveVMShapeCPUType resolves the emulated CPU type/model to write on the
+// new VM's PVE "cpu" config key. Precedence (highest wins):
+//
+//  1. cloud_properties.cpu_type — resolved through the layered resolver, so a
+//     per-call value wins over a disk_type profile value, which wins over a
+//     vm_type profile value (the resolver's normal precedence order).
+//  2. config.CPUTypeValue() — the pve.cpu_type global default.
+//  3. "" — no "cpu" key is ever written; PVE falls back to its own default
+//     (kvm64). This is the zero-behavior-change path when neither is set.
+//
+// cloud_properties.pve_config.cpu is a distinct, later mechanism (applied via
+// applyPVEConfigPassthrough after this value is already written) and is not
+// consulted here — it always wins as the final write when set, by virtue of
+// running last in the create_vm sequence, not by any precedence logic in this
+// function.
+func resolveVMShapeCPUType(r *layeredResolver, cfg *config.CPIConfig) string {
+	if v, found := r.String("cpu_type"); found {
+		return v
+	}
+	return cfg.CPUTypeValue()
+}
+
 // resolveVMShapeHotplugNUMAWithError resolves hotplug + numa using
 // cloud_properties → vm_type/disk_type profile → config → built-in default.
 // Memory hotplug needs both numa=1 and "memory" in hotplug at create time;
@@ -3286,15 +3319,7 @@ func attemptCreateVM(
 		"hotplug":       shape.hotplug,
 		"onboot":        0,
 	}
-	if shape.numaEnabled {
-		createParams["numa"] = 1
-	}
-	if shape.sockets > 1 {
-		createParams["sockets"] = shape.sockets
-	}
-	if shape.initialTags != "" {
-		createParams[jsonKeyTags] = shape.initialTags
-	}
+	applyOptionalCreateParams(createParams, shape)
 
 	upid, cerr := deps.PVE.QEMU().Create(ctx, shape.node, createParams)
 	if cerr != nil {
@@ -3312,6 +3337,28 @@ func attemptCreateVM(
 	)
 	// Apply post-clone config (pve_config passthrough + PCI hostpciN).
 	return applyPostCloneConfig(ctx, deps, shape.node, candidate, parsed, logger)
+}
+
+// applyOptionalCreateParams adds the import-path createParams keys that are
+// only emitted when their resolved shape value is non-default: numa, sockets
+// (only when > 1, matching the historic single-socket-is-implicit default),
+// initial tags, and cpu (cloud_properties.cpu_type / pve.cpu_type — absent
+// means PVE keeps its own kvm64 default, byte-identical to prior releases).
+// Extracted from attemptCreateVM to keep that function's cognitive complexity
+// under the project threshold.
+func applyOptionalCreateParams(createParams map[string]any, shape *createVMShape) {
+	if shape.numaEnabled {
+		createParams["numa"] = 1
+	}
+	if shape.sockets > 1 {
+		createParams["sockets"] = shape.sockets
+	}
+	if shape.initialTags != "" {
+		createParams[jsonKeyTags] = shape.initialTags
+	}
+	if shape.cpuType != "" {
+		createParams[pveConfigKeyCPU] = shape.cpuType
+	}
 }
 
 // handleCloneError classifies a cloneFromTemplate error and logs appropriately.
@@ -3620,6 +3667,16 @@ func cloneFromTemplate(
 	if shape.scsihw != "virtio-scsi-pci" {
 		scsiVal := shape.scsihw
 		resourceParams.Scsihw = &scsiVal
+	}
+	// Apply cpu type only when resolved (cloud_properties.cpu_type or the
+	// global pve.cpu_type default); absent means PVE keeps its own kvm64
+	// default on the cloned VM — byte-identical to prior releases. The
+	// clone inherits the template's "cpu" value (templates carry no explicit
+	// cpu setting either), so this is the same "unset means unset" contract
+	// as the import path.
+	if shape.cpuType != "" {
+		cpuVal := shape.cpuType
+		resourceParams.Cpu = &cpuVal
 	}
 	// Apply root-disk performance options to virtio0 when any are set.
 	// The clone inherits the template's virtio0 string; we append our opts to it.

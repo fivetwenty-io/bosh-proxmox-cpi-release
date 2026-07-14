@@ -190,6 +190,35 @@ properties:
   pve.vm_disk_format:
     description: "Disk format: qcow2, raw, vmdk"
     default: "qcow2"
+  pve.cpu_type:
+    description: |
+      Emulated CPU type/model written to every new VM's PVE "cpu" config key
+      (e.g. "x86-64-v2-AES", "host", "Skylake-Server-noTSX-IBRS"). Default ""
+      (empty): the CPI writes no cpu key at all, so PVE falls back to its own
+      default — kvm64, which lacks AES-NI. BOSH workloads are TLS-heavy, so
+      staying on kvm64 is a fleet-wide performance tax; setting this to a
+      model with AES-NI removes it.
+
+      Precedence (highest wins): cloud_properties.cpu_type (per-instance-group,
+      resolved through the same call/disk_type/vm_type layered resolver as
+      other create_vm knobs) > this global default > absent (no cpu key
+      written, current behavior). cloud_properties.pve_config.cpu is a
+      separate raw escape hatch applied after VM creation in the same
+      create_vm call — when both this and pve_config.cpu are set,
+      pve_config.cpu wins as the final write (the CPI logs an Info line
+      pointing at this knob when pve_config.cpu is used).
+
+      Recommended value: "x86-64-v2-AES" for a single-CPU-generation cluster
+      (broad enough to be portable, includes AES-NI), or the cluster's lowest-
+      common-denominator named CPU model (e.g. the oldest node's generation)
+      for a mixed-hardware cluster, so every VM can live-migrate to every
+      node. Avoid "host": it exposes the exact physical CPU's full feature
+      set, which crashes on migration to a node with a different CPU
+      generation — a real risk in any cluster where live migration is
+      possible, not only DLB/HA-managed deployments. PVE validates the model
+      name itself; the CPI passes the value through verbatim with no
+      additional validation.
+    default: ""
   pve.log_level:
     description: "Log level"
     default: "info"

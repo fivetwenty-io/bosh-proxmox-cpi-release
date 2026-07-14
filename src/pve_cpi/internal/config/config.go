@@ -163,6 +163,21 @@ type CPIConfig struct {
 	VMDiskFormat string `json:"vm_disk_format,omitempty"`
 	LogLevel     string `json:"log_level,omitempty"`
 
+	// CPUType is the emulated CPU type/model PVE writes to the new VM's
+	// "cpu" config key (e.g. "x86-64-v2-AES", "host"). Empty (the default)
+	// means the CPI writes no cpu key at all — PVE falls back to its own
+	// default (kvm64, which lacks AES-NI). Per-VM
+	// cloud_properties.cpu_type — resolved through the same
+	// call/disk_type/vm_type layered resolver as other create_vm knobs —
+	// takes precedence over this global default when both are set.
+	// cloud_properties.pve_config.cpu is a separate raw escape hatch applied
+	// after this value in the create_vm sequence, so it always wins as the
+	// final write when both are set. Use CPUTypeValue() for the effective,
+	// whitespace-trimmed string. Validate-only-when-set (PVE validates the
+	// model name itself; the CPI passes the value through verbatim); omit
+	// from ERB when empty.
+	CPUType string `json:"cpu_type,omitempty"`
+
 	// Hotplug is the PVE `hotplug` flag baked into every new VM. Comma-list of
 	// "network,disk,cpu,memory,usb,cloudinit"; "0" disables hotplug entirely.
 	// Defaults to "network,disk,cpu,memory" so memory + CPU can be resized
@@ -1739,6 +1754,17 @@ func (c *CPIConfig) HotplugValue() string {
 		return "network,disk,cpu,memory"
 	}
 	return *c.Hotplug
+}
+
+// CPUTypeValue returns the effective global CPU type/model, trimmed of
+// surrounding whitespace. Empty ("") means no cpu key is written by default
+// (the CPI's zero-behavior-change default) — callers only emit a "cpu" key
+// when this (or the higher-precedence cloud_properties.cpu_type) is non-empty.
+func (c *CPIConfig) CPUTypeValue() string {
+	if c == nil {
+		return ""
+	}
+	return strings.TrimSpace(c.CPUType)
 }
 
 // NUMAValue returns the effective NUMA toggle, defaulting to true (memory
