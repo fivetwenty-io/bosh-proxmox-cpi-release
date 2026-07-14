@@ -31,8 +31,9 @@ func naRuleNameFor(vmid int) string {
 // HA pin when enabled. It derives the AZ the VM was actually placed in from the
 // chosen node (so it works for both the singular availability_zone and the
 // plural availability_zones forms — the scorer picks one AZ but returns only the
-// node), skips the DLB sentinel AZ (DLB intentionally un-pins), and logs any pin
-// failure without failing create_vm. A no-op when pinning is disabled.
+// node), skips the DLB sentinel AZ (DLB intentionally un-pins), warns when a
+// strict pin targets a single-node AZ (see warnSingleNodeAZPin), and logs any
+// pin failure without failing create_vm. A no-op when pinning is disabled.
 //
 // Selective propagation: a TypeRetriableCloud error (lock-timeout, verify
 // failure) is returned so the director re-drives rather than silently losing the
@@ -56,7 +57,9 @@ func applyAZNodeAffinityPin(ctx context.Context, deps Deps, vmid int, cp createV
 	if !ok {
 		return nil
 	}
-	if pinErr := ensureNodeAffinityPin(ctx, deps, vmid, azNodes, deps.Config.PinAZStrict(), logger); pinErr != nil {
+	strict := deps.Config.PinAZStrict()
+	warnSingleNodeAZPin(az, azNodes, strict, logger)
+	if pinErr := ensureNodeAffinityPin(ctx, deps, vmid, azNodes, strict, logger); pinErr != nil {
 		if cpierrors.IsType(pinErr, cpierrors.TypeRetriableCloud) {
 			// Lock-timeout or verify-failure: propagate so the director re-drives.
 			return pinErr
@@ -86,6 +89,35 @@ func pinAZForNode(cp createVMCloudProps, cfg *config.CPIConfig, node string) str
 		}
 	}
 	return ""
+}
+
+// warnSingleNodeAZPin logs a Warn when a strict node-affinity pin binds the VM
+// to an AZ node set of exactly one node. Two hazards follow from this
+// configuration: (1) if that single node goes down, PVE HA has no other node
+// in the AZ to fail over to, so the VM cannot restart until the node returns;
+// (2) draining that node for maintenance (reboot, upgrade) has nowhere legal
+// to place the VM, which can wedge the maintenance operation. Both hazards are
+// specific to strict pins — a non-strict (preferred) pin lets HA relocate
+// off-AZ instead of being stuck. Deduplicates/trims azNodes the same way
+// ensureNodeAffinityPin does, so a config with blank or repeated entries is
+// judged on its effective node count, not its raw slice length. A no-op when
+// strict is false or the effective node count is not exactly one.
+func warnSingleNodeAZPin(az string, azNodes []string, strict bool, logger *log.Logger) {
+	if !strict {
+		return
+	}
+	nodesCSV := sortedNodesCSV(azNodes)
+	if nodesCSV == "" {
+		return
+	}
+	nodes := strings.Split(nodesCSV, ",")
+	if len(nodes) != 1 {
+		return
+	}
+	logger.Warn("create_vm: strict AZ node-affinity pin targets a single-node AZ; "+
+		"no failover target if the node goes down, and node maintenance can wedge the VM "+
+		"(map the AZ to >= 2 nodes to avoid this hazard)",
+		log.String("az", az), log.String("node", nodes[0]))
 }
 
 // ensureNodeAffinityPin writes a PVE HA node-affinity rule binding the VM to the

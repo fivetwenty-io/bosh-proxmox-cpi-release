@@ -84,7 +84,7 @@ VMs in `z1` are scored and placed on `pve01` or `pve02`. VMs in `dlb-zone` are p
 | `pve.placement.anti_affinity.strict` | bool | `false` | When true, PVE HA negative-affinity rules are set to strict (hard) mode. See [Anti-Affinity Interaction](#interaction-with-placement-scorer-and-anti-affinity). |
 | `pve.placement.anti_affinity.verify` | bool | `false` | When true, the CPI performs a read-after-write check after updating the HA anti-affinity rule membership (via `verifyAntiAffinityMember`). A verify failure surfaces as a retriable error so the director re-drives. |
 | `pve.placement.pin_az_via_ha_rules` | bool | `false` | When true, the CPI creates a `bosh-na-{vmid}` HA node-affinity rule after placement to durably bind the VM to its AZ node set. See [HA Node-Affinity Pin](#ha-node-affinity-pin). |
-| `pve.placement.pin_az_strict` | bool | `true` | When true, the node-affinity pin is a hard constraint (PVE will not migrate the VM off the AZ node set even on total node-set failure). When false, the pin is preferred. |
+| `pve.placement.pin_az_strict` | bool | `true` | When true, the node-affinity pin is a hard constraint (PVE will not migrate the VM off the AZ node set even on total node-set failure). When false, the pin is preferred. See [Strict Pin Hazards](#strict-pin-hazards-single-node-az) for the single-node-AZ caveat. |
 
 ---
 
@@ -217,6 +217,26 @@ The pin ensures that PVE HA failover and DLB rebalance keep the VM within its AZ
 **Rollback:** `delete_vm` cleanup calls `removeNodeAffinityPin`, which deletes the `bosh-na-{vmid}` rule and deregisters the HA resource. The cleanup is best-effort and idempotent — a missing rule or resource is a no-op.
 
 **Cluster lock:** The node-affinity pin does **not** acquire the cluster pool lock (`AcquireClusterLock`). The rule is keyed on `vmid` (not a shared group), so the only contention is a `create_vm` retry of the same VMID, which is already serialized by the VMID allocation model.
+
+### Strict Pin Hazards: Single-Node AZ
+
+`pve.placement.pin_az_strict` defaults `true`. This default is deliberate — BOSH treats availability-zone placement as a contract the CPI must honor, not a hint the scheduler may override — and it stays `true` by default. It carries two operational hazards when an AZ in `pve.placement.az_map` resolves to exactly one node:
+
+1. **No failover target.** If that single node goes down, PVE HA has no other in-AZ node to relocate the VM to. A strict pin forbids moving the VM off its AZ node set even to a healthy node elsewhere in the cluster, so the VM stays down until the original node recovers.
+
+2. **Maintenance can wedge.** Draining that node for planned maintenance (reboot, PVE upgrade) requires evacuating every guest pinned to it. A strict single-node-AZ pin has nowhere legal to go, which can block the drain until the operator either changes the rule or accepts downtime for that VM.
+
+Both hazards vanish once the AZ maps to two or more nodes: HA then has an in-AZ node to fail over to or drain onto, so the strict guarantee (VM never leaves its AZ) holds without blocking recovery or maintenance. **Map every AZ used with `pin_az_strict: true` to at least two nodes.**
+
+To make a single-node-AZ pin visible rather than a silent trap, `create_vm` logs a `Warn` at pin time whenever a strict node-affinity pin resolves to exactly one node, naming the AZ and the node:
+
+```
+create_vm: strict AZ node-affinity pin targets a single-node AZ; no failover
+target if the node goes down, and node maintenance can wedge the VM (map the
+AZ to >= 2 nodes to avoid this hazard)  az=z1 node=pve01
+```
+
+The warning does not fail `create_vm` — the VM is still created and pinned as configured. It is diagnostic only, for an operator scanning logs to catch a topology that will not fail over or drain cleanly before an incident forces the issue. The warning only fires for strict pins (`pin_az_strict: true`); a non-strict (preferred) pin on a single-node AZ has no failover hazard to warn about, since HA is free to relocate the VM off-AZ on failure.
 
 ---
 

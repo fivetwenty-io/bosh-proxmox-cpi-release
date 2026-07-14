@@ -899,6 +899,17 @@ properties:
       its AZ node set even if every AZ node is down (durability of locality over
       availability). Set false for a preferred pin that lets HA relocate off-AZ on
       total AZ failure. Ignored when pin_az_via_ha_rules is false.
+
+      This default is deliberate — BOSH AZ placement is a contract, not a hint —
+      but it carries two operational hazards on an AZ mapped to a single node:
+      (1) if that node goes down, the VM cannot restart anywhere else, since HA
+      has no other in-AZ node to fail over to; (2) draining that node for
+      maintenance (reboot, upgrade) has nowhere legal to place the VM, which can
+      wedge the maintenance operation. Both hazards disappear once the AZ maps to
+      two or more nodes, since HA then has an in-AZ fallback target. Map every
+      strict AZ to >= 2 nodes. create_vm logs a Warn at pin time whenever a
+      strict pin targets a single-node AZ, naming the AZ and node, so this
+      condition is visible rather than silent.
     default: true
   pve.placement.fallback_max:
     description: |

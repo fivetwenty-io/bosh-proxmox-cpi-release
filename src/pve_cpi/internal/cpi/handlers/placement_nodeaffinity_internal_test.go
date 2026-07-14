@@ -1,8 +1,10 @@
 package handlers
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
@@ -183,6 +185,103 @@ func TestPinAZForNode_SingularAndPlural(t *testing.T) {
 	// Node not in any requested AZ (e.g. config.node fallback) → "".
 	if got := pinAZForNode(createVMCloudProps{AvailabilityZone: "z1"}, cfg, "pve09"); got != "" {
 		t.Errorf("non-member node: pinAZForNode = %q; want empty", got)
+	}
+}
+
+// warnLogger builds a *log.Logger backed by buf at "warn" level, so Warn calls
+// are captured and Debug/Info noise is not, keeping assertions focused.
+func warnLogger(t *testing.T, buf *bytes.Buffer) *log.Logger {
+	t.Helper()
+	logger, err := log.NewLogger("warn", buf)
+	if err != nil {
+		t.Fatalf("NewLogger: %v", err)
+	}
+	return logger
+}
+
+func TestWarnSingleNodeAZPin_SingleNodeStrict_Warns(t *testing.T) {
+	var buf bytes.Buffer
+	warnSingleNodeAZPin("z1", []string{"pve01"}, true, warnLogger(t, &buf))
+	out := buf.String()
+	if !strings.Contains(out, "single-node AZ") {
+		t.Errorf("expected single-node-AZ warning, got %q", out)
+	}
+	if !strings.Contains(out, "z1") || !strings.Contains(out, "pve01") {
+		t.Errorf("expected warning to name AZ z1 and node pve01, got %q", out)
+	}
+}
+
+func TestWarnSingleNodeAZPin_MultiNode_NoWarn(t *testing.T) {
+	var buf bytes.Buffer
+	warnSingleNodeAZPin("z1", []string{"pve01", "pve02"}, true, warnLogger(t, &buf))
+	if out := buf.String(); out != "" {
+		t.Errorf("multi-node AZ must not warn, got %q", out)
+	}
+}
+
+func TestWarnSingleNodeAZPin_NonStrict_NoWarn(t *testing.T) {
+	var buf bytes.Buffer
+	// Single-node AZ, but the pin is preferred (non-strict): HA can relocate
+	// off-AZ on failure, so the hazard this warning describes does not apply.
+	warnSingleNodeAZPin("z1", []string{"pve01"}, false, warnLogger(t, &buf))
+	if out := buf.String(); out != "" {
+		t.Errorf("non-strict pin must not warn, got %q", out)
+	}
+}
+
+func TestWarnSingleNodeAZPin_DedupCollapsesToSingleNode(t *testing.T) {
+	var buf bytes.Buffer
+	// Blank and duplicate entries collapse to one effective node; the hazard
+	// still applies and must be reported on the effective, not raw, count.
+	warnSingleNodeAZPin("z1", []string{"pve01", "", "pve01", "  "}, true, warnLogger(t, &buf))
+	if out := buf.String(); !strings.Contains(out, "single-node AZ") {
+		t.Errorf("expected single-node-AZ warning after dedup, got %q", out)
+	}
+}
+
+func TestWarnSingleNodeAZPin_EmptyNodesNoOp(t *testing.T) {
+	var buf bytes.Buffer
+	warnSingleNodeAZPin("z1", []string{"", "  "}, true, warnLogger(t, &buf))
+	if out := buf.String(); out != "" {
+		t.Errorf("empty AZ node set must not warn (nothing will be pinned), got %q", out)
+	}
+}
+
+func TestApplyAZNodeAffinityPin_SingleNodeAZ_WarnsEndToEnd(t *testing.T) {
+	var buf bytes.Buffer
+	stub := newNAStub()
+	deps := Deps{
+		Config: naPinConfig(map[string][]string{"z1": {"pve01"}}),
+		PVE:    &icPVEClient{clusterSvc: stub},
+		Agent:  &icAgentStub{},
+		Logger: log.NewNopLogger(),
+	}
+	logger := warnLogger(t, &buf)
+	if err := applyAZNodeAffinityPin(context.Background(), deps, 100,
+		createVMCloudProps{AvailabilityZone: "z1"}, "pve01", logger); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if out := buf.String(); !strings.Contains(out, "single-node AZ") {
+		t.Errorf("expected single-node-AZ warning through applyAZNodeAffinityPin, got %q", out)
+	}
+}
+
+func TestApplyAZNodeAffinityPin_MultiNodeAZ_NoSingleNodeWarn(t *testing.T) {
+	var buf bytes.Buffer
+	stub := newNAStub()
+	deps := Deps{
+		Config: naPinConfig(map[string][]string{"z1": {"pve01", "pve02"}}),
+		PVE:    &icPVEClient{clusterSvc: stub},
+		Agent:  &icAgentStub{},
+		Logger: log.NewNopLogger(),
+	}
+	logger := warnLogger(t, &buf)
+	if err := applyAZNodeAffinityPin(context.Background(), deps, 100,
+		createVMCloudProps{AvailabilityZone: "z1"}, "pve01", logger); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if out := buf.String(); strings.Contains(out, "single-node AZ") {
+		t.Errorf("multi-node AZ must not emit the single-node-AZ warning, got %q", out)
 	}
 }
 
