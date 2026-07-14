@@ -395,13 +395,16 @@ type CPIConfig struct {
 	IPConflictProbe string `json:"ip_conflict_probe,omitempty"`
 
 	// DiskDeleteStateGuard selects whether delete_disk first checks the lock
-	// state of the VM that owns the target volume. When empty or "off" (default),
-	// no owner lookup runs and behavior is byte-identical to prior releases. When
-	// "on", delete_disk resolves the owning guest (from the managed volid) and,
-	// if that guest holds a destructive/in-flight lock (backup, clone, migrate,
-	// snapshot, rollback, create), defers the delete with a retriable error so
-	// the BOSH Director re-drives it after the operation completes. The guard is
-	// best-effort and fails open on any resolution uncertainty. Enum:
+	// state of the VM that owns the target volume. When empty or "on" (default,
+	// as of Phase 1), delete_disk resolves the owning guest (from the managed
+	// volid) and, if that guest holds a destructive/in-flight lock (backup,
+	// clone, migrate, snapshot, rollback, create), defers the delete with a
+	// retriable error so the BOSH Director re-drives it after the operation
+	// completes — this closes the race window against nightly vzdump/PBS backups
+	// and other in-flight operations. Set "off" to restore the pre-Phase-1
+	// behavior (no owner lookup). The guard is best-effort and fails open on any
+	// resolution uncertainty, so the worst case of leaving it on its new default
+	// is a delayed delete during a backup window, never a hard failure. Enum:
 	// ""|"off"|"on". Use DiskDeleteStateGuardEnabled() for the effective value.
 	DiskDeleteStateGuard string `json:"disk_delete_state_guard,omitempty"`
 
@@ -2052,12 +2055,17 @@ func (c *CPIConfig) ActiveIPProbeEnabled() bool {
 const enumValueOff = "off"
 
 // DiskDeleteStateGuardEnabled reports whether delete_disk should check the
-// owning VM's lock state before deleting. Empty or "off" (default) → false.
+// owning VM's lock state before deleting. Default true (as of Phase 1): nil
+// config, empty string, or "on" all resolve to enabled. Only an explicit
+// "off" disables the lookup and restores the pre-Phase-1 byte-identical
+// behavior. Any other value is rejected at config validation time
+// (validateDiskDeleteStateGuardEnum), so by the time this accessor runs in
+// production the field is guaranteed to be one of ""|"off"|"on".
 func (c *CPIConfig) DiskDeleteStateGuardEnabled() bool {
 	if c == nil {
-		return false
+		return true
 	}
-	return strings.ToLower(strings.TrimSpace(c.DiskDeleteStateGuard)) == "on"
+	return strings.ToLower(strings.TrimSpace(c.DiskDeleteStateGuard)) != enumValueOff
 }
 
 // DetachedDiskStrategyValue returns the effective detached-disk lifecycle

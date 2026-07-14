@@ -14,8 +14,11 @@
 // guest the disk is CURRENTLY ATTACHED to. The guard finds that guest by
 // scanning VM configs for the volid (FindVMByDiskVolid), reads its config lock,
 // and asks the director to retry later when the lock indicates a destructive or
-// in-flight operation. It is opt-in (callers gate on the feature knob). When
-// resolution fails transiently (a network blip or 5xx mid-scan), the guard also
+// in-flight operation. Callers gate on the feature knob (config.CPIConfig.
+// DiskDeleteStateGuardEnabled), which defaults to enabled as of Phase 1 — set
+// pve.disk_delete_state_guard: "off" to opt out and restore the pre-Phase-1
+// no-lookup behavior. When resolution fails transiently (a network blip or
+// 5xx mid-scan), the guard also
 // defers the delete as retriable — an unknown holder state is exactly the
 // condition the guard exists to protect against. Only permanent outcomes fail
 // open: a disk that is not attached to any VM — the normal state at delete

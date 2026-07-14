@@ -591,6 +591,11 @@ func TestHandleDeleteDisk_Parker_StrategyFree_NoParkerCalls(t *testing.T) {
 			Node:        testNode,
 			DiskStorage: storageName,
 			// DetachedDiskStrategy unset and no range → ParkedStrategyActive()=false
+			// disk_delete_state_guard explicitly off: this test isolates the
+			// parker-gate's own QEMU Config() call count from the (Phase 1
+			// default-on) owner-lock guard, which would otherwise also call
+			// QEMU Config() and confound the assertion below.
+			DiskDeleteStateGuard: "off",
 		},
 		PVE:    client,
 		Logger: log.NewNopLogger(),
@@ -638,6 +643,11 @@ func TestHandleDeleteDisk_NoClusterCallExpected(t *testing.T) {
 		Config: &config.CPIConfig{
 			Node:        testNode,
 			DiskStorage: storageName,
+			// disk_delete_state_guard explicitly off: this test's assertion is
+			// about NextDiskVMID-style cluster calls, not the (Phase 1
+			// default-on) owner-lock guard, which also calls the cluster
+			// service (FindVMByDiskVolid) and would otherwise confound it.
+			DiskDeleteStateGuard: "off",
 		},
 		PVE:    client,
 		Logger: log.NewNopLogger(),
@@ -660,14 +670,19 @@ func TestHandleDeleteDisk_NoClusterCallExpected(t *testing.T) {
 // disk_delete_state_guard tests
 // ---------------------------------------------------------------------------
 
+// guardDeleteAttachedVMID is the VMID every guardDeleteClient test call
+// attaches the target disk to. It deliberately differs from the disk-name
+// placeholder VMID (9001, embedded in diskCID) to prove the guard resolves
+// the CURRENT attachment by config scan, not by the name-embedded VMID.
+const guardDeleteAttachedVMID = 9002
+
 // guardDeleteClient wires storage + qemu(config) + cluster services so the
-// owner-lock guard can resolve the VM the disk is ATTACHED to and read its lock.
-// The disk-name VMID (9001 in diskCID) is only a placeholder; the disk is
-// attached to attachedVMID, whose config carries diskCID at scsi0 plus lock.
-// attachedLock is the config "lock" value; attachedNode is where the cluster
-// scan places that VM.
+// owner-lock guard can resolve the VM the disk is ATTACHED to and read its
+// lock. The disk-name VMID (9001 in diskCID) is only a placeholder; the disk
+// is attached to guardDeleteAttachedVMID on testNode, whose config carries
+// diskCID at scsi0 plus lock. attachedLock is the config "lock" value.
 func guardDeleteClient(
-	t *testing.T, storageSvc *mockStorageService, attachedVMID int, attachedNode, attachedLock string,
+	t *testing.T, storageSvc *mockStorageService, attachedLock string,
 ) (*mockPVEClient, *int, *int) {
 	t.Helper()
 	var configReads, listCalls int
@@ -686,7 +701,7 @@ func guardDeleteClient(
 		clusterSvc: &mockClusterSvc{
 			listResourcesFn: func(_ context.Context, _ *sdkclusterapi.ListResourcesParams) (*sdkclusterapi.ListResourcesResponse, error) {
 				listCalls++
-				return attachDiskVMOnNode(attachedVMID, attachedNode), nil
+				return attachDiskVMOnNode(guardDeleteAttachedVMID, testNode), nil
 			},
 		},
 	}, &configReads, &listCalls
@@ -717,7 +732,7 @@ func TestHandleDeleteDisk_Guard_OwnerLocked_Retriable(t *testing.T) {
 		},
 	}
 	// Disk attached to VM 9002 (≠ placeholder name VMID 9001), mid-migrate.
-	client, _, _ := guardDeleteClient(t, storageSvc, 9002, testNode, "migrate")
+	client, _, _ := guardDeleteClient(t, storageSvc, "migrate")
 	deps := guardDepsForDelete(client)
 
 	h := handlers.HandleDeleteDisk(deps)
@@ -734,6 +749,53 @@ func TestHandleDeleteDisk_Guard_OwnerLocked_Retriable(t *testing.T) {
 	}
 }
 
+// TestHandleDeleteDisk_Guard_DefaultUnset_OwnerLocked_Retriable proves the
+// Phase 1 default-materialization contract at the full handler level: with
+// disk_delete_state_guard entirely ABSENT from config (the shape an
+// empty/unset manifest property materializes as — Config.DiskDeleteStateGuard
+// is the Go zero value ""), the guard is ACTIVE by default. A locked owning
+// VM must defer the delete with a retriable error exactly as it would with an
+// explicit "on", proving the empty-manifest default is "guard active" end to
+// end, not only at the bare accessor level (see TestDiskDeleteStateGuardAccessor
+// in the config package for that unit-level check).
+func TestHandleDeleteDisk_Guard_DefaultUnset_OwnerLocked_Retriable(t *testing.T) {
+	t.Parallel()
+	deleteCalled := false
+	storageSvc := &mockStorageService{
+		deleteVolumeFn: func(_ context.Context, _, _, _ string) error {
+			deleteCalled = true
+			return nil
+		},
+	}
+	client, configReads, listCalls := guardDeleteClient(t, storageSvc, "migrate")
+	deps := handlers.Deps{
+		Config: &config.CPIConfig{
+			Node:        testNode,
+			DiskStorage: storageName,
+			// DiskDeleteStateGuard intentionally left unset (empty-manifest
+			// shape) — this is the property under test.
+		},
+		PVE:    client,
+		Logger: log.NewNopLogger(),
+	}
+
+	h := handlers.HandleDeleteDisk(deps)
+	_, err := h.Handle(context.Background(), []json.RawMessage{marshal(diskCID)}, jsonrpc.Context{})
+
+	if err == nil {
+		t.Fatal("empty-manifest config: expected retriable error when the attached VM is locked, got nil")
+	}
+	if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+		t.Errorf("empty-manifest config: expected retriable-cloud error, got %v", err)
+	}
+	if deleteCalled {
+		t.Error("empty-manifest config: delete_disk must NOT delete the volume while the attached VM is locked (guard must default to active)")
+	}
+	if *configReads == 0 || *listCalls == 0 {
+		t.Errorf("empty-manifest config: guard must have performed the owner lookup (config=%d, list=%d)", *configReads, *listCalls)
+	}
+}
+
 // TestHandleDeleteDisk_Guard_OwnerUnlocked_Deletes: guard on, the attached VM
 // has no lock → guard passes and the volume is deleted normally.
 func TestHandleDeleteDisk_Guard_OwnerUnlocked_Deletes(t *testing.T) {
@@ -745,7 +807,7 @@ func TestHandleDeleteDisk_Guard_OwnerUnlocked_Deletes(t *testing.T) {
 			return nil
 		},
 	}
-	client, configReads, _ := guardDeleteClient(t, storageSvc, 9002, testNode, "")
+	client, configReads, _ := guardDeleteClient(t, storageSvc, "")
 	deps := guardDepsForDelete(client)
 
 	h := handlers.HandleDeleteDisk(deps)
@@ -763,8 +825,12 @@ func TestHandleDeleteDisk_Guard_OwnerUnlocked_Deletes(t *testing.T) {
 }
 
 // TestHandleDeleteDisk_Guard_Off_NoOwnerLookup proves the guard is byte-identical
-// when disabled: with no DiskDeleteStateGuard set, neither the cluster scan nor
-// the config read runs, and the delete proceeds.
+// to the pre-Phase-1 default when explicitly disabled: with
+// disk_delete_state_guard: "off", neither the cluster scan nor the config
+// read runs, and the delete proceeds. (As of Phase 1, an UNSET property now
+// defaults to "on" — see TestHandleDeleteDisk_Guard_OwnerLocked_Retriable and
+// friends for that default-enabled behavior; this test covers the explicit
+// opt-out.)
 func TestHandleDeleteDisk_Guard_Off_NoOwnerLookup(t *testing.T) {
 	t.Parallel()
 	deleteCalled := false
@@ -774,13 +840,13 @@ func TestHandleDeleteDisk_Guard_Off_NoOwnerLookup(t *testing.T) {
 			return nil
 		},
 	}
-	// The attached VM would be locked, but the guard is OFF → it must not look.
-	client, configReads, listCalls := guardDeleteClient(t, storageSvc, 9002, testNode, "migrate")
+	// The attached VM would be locked, but the guard is explicitly OFF → it must not look.
+	client, configReads, listCalls := guardDeleteClient(t, storageSvc, "migrate")
 	deps := handlers.Deps{
 		Config: &config.CPIConfig{
-			Node:        testNode,
-			DiskStorage: storageName,
-			// DiskDeleteStateGuard unset → off.
+			Node:                 testNode,
+			DiskStorage:          storageName,
+			DiskDeleteStateGuard: "off",
 		},
 		PVE:    client,
 		Logger: log.NewNopLogger(),

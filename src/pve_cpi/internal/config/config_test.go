@@ -200,13 +200,17 @@ func TestValidate_ReplicaAdoptTimeoutNegative(t *testing.T) {
 	assertCloudError(t, err, "replica_adopt_timeout_sec must be >= 0")
 }
 
+// TestDiskDeleteStateGuardAccessor verifies the Phase 1 default flip: an
+// absent/empty property (the shape an unset manifest field materializes as)
+// now enables the guard, matching the property's new documented default
+// ("on"). Only an explicit "off" disables it.
 func TestDiskDeleteStateGuardAccessor(t *testing.T) {
 	t.Parallel()
-	// Default (empty) → disabled, byte-identical behavior.
-	if (&config.CPIConfig{}).DiskDeleteStateGuardEnabled() {
-		t.Error("empty disk_delete_state_guard should be disabled")
+	// Default (empty) → enabled (Phase 1 flip; was disabled before).
+	if !(&config.CPIConfig{}).DiskDeleteStateGuardEnabled() {
+		t.Error("empty disk_delete_state_guard should default to enabled (Phase 1)")
 	}
-	// Explicit "off" → disabled.
+	// Explicit "off" → disabled (the opt-out).
 	if (&config.CPIConfig{DiskDeleteStateGuard: "off"}).DiskDeleteStateGuardEnabled() {
 		t.Error(`"off" should be disabled`)
 	}
@@ -216,10 +220,10 @@ func TestDiskDeleteStateGuardAccessor(t *testing.T) {
 			t.Errorf("%q should enable the guard", v)
 		}
 	}
-	// Nil receiver is defensive.
+	// Nil receiver defaults to enabled too, for the same reason empty does.
 	var nilCfg *config.CPIConfig
-	if nilCfg.DiskDeleteStateGuardEnabled() {
-		t.Error("nil receiver should be disabled")
+	if !nilCfg.DiskDeleteStateGuardEnabled() {
+		t.Error("nil receiver should default to enabled (Phase 1)")
 	}
 }
 

@@ -967,21 +967,25 @@ properties:
   pve.disk_delete_state_guard:
     description: |
       Whether delete_disk first checks the lock state of the VM the target disk
-      is attached to before deleting it. One of "off" (default) or "on". When
-      "off", no attachment lookup runs and delete_disk behaviour is
-      byte-identical to prior releases. When "on", delete_disk scans the cluster
-      for the VM whose config currently references the volume (the VMID baked
-      into the volume name is only an allocation placeholder, so the attached VM
-      is resolved by config, not by name) and, if that VM holds a destructive or
+      is attached to before deleting it. One of "off" or "on" (default, as of
+      Phase 1). When "on" (default), delete_disk scans the cluster for the VM
+      whose config currently references the volume (the VMID baked into the
+      volume name is only an allocation placeholder, so the attached VM is
+      resolved by config, not by name) and, if that VM holds a destructive or
       in-flight config lock (backup, clone, migrate, snapshot, rollback, or
       create), defers the delete with a retriable error so the BOSH Director
       re-drives it once the operation completes — closing the window in which an
-      imgdel could race a backup or migration of the same disk. The guard is
-      best-effort: a disk attached to no VM (the normal pre-delete state) is
-      allowed straight through, and any attachment-resolution uncertainty fails
-      open so a guard hiccup never blocks a legitimate delete. Operator note: if
-      the attached VM is left with a stuck config lock, delete_disk will keep
-      deferring; clear it with "qm unlock <vmid>" on that VM's node.
+      imgdel could otherwise race a nightly vzdump/PBS backup, a clone, or a
+      migration of the same disk. The guard is best-effort: a disk attached to
+      no VM (the normal pre-delete state) is allowed straight through, and any
+      attachment-resolution uncertainty fails open so a guard hiccup never
+      blocks a legitimate delete — the worst case of leaving this on its
+      default is a delayed delete during a backup window, never a hard
+      failure. Set "off" to restore the pre-Phase-1 behaviour (no attachment
+      lookup, byte-identical to releases before this default changed).
+      Operator note: if the attached VM is left with a stuck config lock,
+      delete_disk will keep deferring; clear it with "qm unlock <vmid>" on
+      that VM's node.
     default: ""
   pve.detached_disk_strategy:
     description: |

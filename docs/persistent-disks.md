@@ -81,11 +81,13 @@ disk_pools:
 
 ## Disk delete state guard
 
-The `pve.disk_delete_state_guard` config property (default: off) blocks `delete_disk` when
-the disk's hosting VM is in a transient state (such as locked, migrating, or snapshotting). When
-enabled, `delete_disk` defers deletion and returns a retriable error; the Director retries on the
-next cycle. The guard fails open on resolution uncertainty so that disks attached to no VM
-pass through without delay.
+The `pve.disk_delete_state_guard` config property (default: on, as of Phase 1) blocks `delete_disk`
+when the disk's hosting VM is in a transient state (such as locked, migrating, or snapshotting) —
+closing the race window against nightly vzdump/PBS backups and other in-flight operations. With
+the guard active, `delete_disk` defers deletion and returns a retriable error; the Director retries
+on the next cycle. The guard fails open on resolution uncertainty so that disks attached to no VM
+pass through without delay. Set `pve.disk_delete_state_guard: "off"` to restore the pre-Phase-1
+behavior (no attachment lookup).
 
 ## Node selection precedence
 
