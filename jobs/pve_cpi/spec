@@ -1057,8 +1057,7 @@ properties:
   pve.disk_delete_state_guard:
     description: |
       Whether delete_disk first checks the lock state of the VM the target disk
-      is attached to before deleting it. One of "off" or "on" (default, as of
-      Phase 1). When "on" (default), delete_disk scans the cluster for the VM
+      is attached to before deleting it. One of "off" or "on" (the default). When "on" (default), delete_disk scans the cluster for the VM
       whose config currently references the volume (the VMID baked into the
       volume name is only an allocation placeholder, so the attached VM is
       resolved by config, not by name) and, if that VM holds a destructive or
@@ -1071,7 +1070,7 @@ properties:
       attachment-resolution uncertainty fails open so a guard hiccup never
       blocks a legitimate delete — the worst case of leaving this on its
       default is a delayed delete during a backup window, never a hard
-      failure. Set "off" to restore the pre-Phase-1 behaviour (no attachment
+      failure. Set "off" to restore the earlier unguarded behaviour (no attachment
       lookup, byte-identical to releases before this default changed).
       Operator note: if the attached VM is left with a stuck config lock,
       delete_disk will keep deferring; clear it with "qm unlock <vmid>" on
@@ -1125,7 +1124,7 @@ properties:
       reload, pmxcfs propagation) is asynchronous and per-node, so a create_vm
       that immediately follows a create_network on a different node can
       attach a NIC to a bridge that does not yet exist there. When > 0 (the
-      default, as of Phase 1: 30, roughly 30 seconds at the 1-second poll
+      default: 30, roughly 30 seconds at the 1-second poll
       cadence), create_network polls the running cluster SDN config until the
       new vnet converges, and create_vm confirms each SDN-managed NIC bridge
       is present on the target node before writing the NIC config — a
@@ -1138,7 +1137,7 @@ properties:
       deploy on the guard's own lookup blip) — so the worst case of the
       default is a bounded retriable delay, never a false block. Both polls
       are bounded by network_resolve_timeout_sec. Set explicitly to 0 to
-      disable both gates and restore the pre-Phase-1 behavior (create_network
+      disable both gates and restore the earlier ungated behavior (create_network
       and create_vm byte-identical to releases before this default changed).
       Set to any other positive value to override the retry budget. This
       property has no default in this spec (see the CPI's own accessor for
@@ -1449,8 +1448,20 @@ properties:
       When true, enables the PVE iothread option on every disk created by this
       CPI. One I/O thread per disk reduces contention on the QEMU main loop.
       Applicable to virtio-scsi-single and virtio-blk buses; ignored on ide/sata
-      buses by PVE. Overridden per disk by cloud_properties.iothread. When unset
-      (default), the key is omitted and PVE uses its own default.
+      buses by PVE. Overridden per disk by cloud_properties.iothread.
+
+      Default true: a dedicated I/O thread per disk relieves
+      QEMU main-loop contention on multi-disk BOSH VMs and matches the modern
+      PVE creation default; leaving iothread off serializes every disk's I/O
+      behind the shared main loop. Set false (globally or per disk via
+      cloud_properties.iothread) to restore the earlier off-by-default behavior. This is
+      a create/attach-time bake only: existing VMs and previously baked disk
+      CIDs are unaffected — the recorded structural options on an existing
+      disk CID are never silently rewritten to the new default; a disk whose
+      creation-time record diverges from the newly-resolved default at the
+      next attach is instead governed by disk_perf_invariant_mode (reject in
+      enforce mode, warn in warn mode, ignore in off mode), same as any other
+      disk_performance configuration change.
 
   pve.disk_performance.cache:
     description: |
@@ -1508,8 +1519,18 @@ properties:
       When true, sets the SCSI controller to virtio-scsi-single mode for every
       VM created by this CPI, giving each disk its own dedicated virtio-scsi
       controller. Required to use iothread per disk on virtio-scsi. Overridden
-      per VM by cloud_properties.virtio_scsi_single. When unset (default), the
-      key is omitted and PVE uses its own default.
+      per VM by cloud_properties.virtio_scsi_single.
+
+      Default true: a dedicated controller per disk avoids
+      serializing every persistent disk behind one shared virtio-scsi-pci
+      controller, and matches the modern PVE creation default. Set false
+      (globally or per VM via cloud_properties.virtio_scsi_single) to restore
+      the earlier virtio-scsi-pci default. Create-time only: an existing
+      VM's controller is never changed retroactively — this only affects new
+      VMs created after the default takes effect. The root disk itself stays
+      on the virtio-blk bus regardless of this setting; moving the root disk
+      onto the SCSI bus is a separate, opt-in change tracked independently of
+      this property.
 
   pve.stemcell.provenance:
     description: |

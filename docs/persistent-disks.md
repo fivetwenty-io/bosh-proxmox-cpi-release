@@ -41,7 +41,7 @@ All keys are optional. Unset keys fall back to CPI defaults
 | `storage`            | String  | Overrides the global `disk_storage` for this pool.                                                                                                                                         |
 | `disk_format`        | String  | PVE disk format: `qcow2` (file storages) or `raw` (required for `lvm`/`lvmthin`/`zfspool`).                                                                                               |
 | `node`               | String  | Pins disks to a specific PVE node. Required when no `vm_cid` hint is available and the disk pool maps to a local-backend storage. Ignored by shared backends.                              |
-| `iothread`           | Boolean | Enables a dedicated I/O thread for the disk controller. Improves throughput on multi-core VMs.                                                                                             |
+| `iothread`           | Boolean | Enables a dedicated I/O thread for the disk controller. Improves throughput on multi-core VMs. Overrides `pve.disk_performance.iothread`, which defaults to `true` — set `false` here to opt this disk out of the global default. |
 | `cache`              | String  | PVE cache mode for the disk. Accepted values: `none`, `writethrough`, `writeback`, `unsafe`, `directsync`. Omit to use PVE's default.                                                      |
 | `discard`            | Boolean | Passes discard/TRIM commands through to the backing storage. Reclaims space on thin-provisioned volumes.                                                                                   |
 | `ssd`                | Boolean | Marks the disk as an SSD for guest OS detection. Not applicable to `virtio-blk` buses.                                                                                                    |
@@ -49,7 +49,7 @@ All keys are optional. Unset keys fall back to CPI defaults
 | `mbps_wr`            | Integer | Write throughput cap in MB/s. Set to `0` to remove the limit.                                                                                                                              |
 | `iops_rd`            | Integer | Read IOPS limit. Set to `0` to remove the limit.                                                                                                                                           |
 | `iops_wr`            | Integer | Write IOPS limit. Set to `0` to remove the limit.                                                                                                                                          |
-| `virtio_scsi_single` | Boolean | Enables `virtio-scsi-single` controller mode (one controller per disk). Opt-in; default uses a shared `virtio-scsi-pci` controller.                                                        |
+| `virtio_scsi_single` | Boolean | Enables `virtio-scsi-single` controller mode (one controller per disk). Overrides `pve.disk_performance.virtio_scsi_single`, which defaults to `true` (a shared `virtio-scsi-pci` controller was the earlier default) — set `false` here to opt this VM out of the global default. |
 | `retain_on_delete`   | Boolean | When `true`, opts this disk out of deletion during `delete_disk` and `delete_vm`. The volume is preserved on storage; the CPI skips its deletion step and logs the retained volume. Default: omitted (deletion proceeds normally). |
 
 Per-disk performance settings take precedence over the global `pve.disk_performance.*` defaults
@@ -81,12 +81,12 @@ disk_pools:
 
 ## Disk delete state guard
 
-The `pve.disk_delete_state_guard` config property (default: on, as of Phase 1) blocks `delete_disk`
+The `pve.disk_delete_state_guard` config property (default: on) blocks `delete_disk`
 when the disk's hosting VM is in a transient state (such as locked, migrating, or snapshotting) —
 closing the race window against nightly vzdump/PBS backups and other in-flight operations. With
 the guard active, `delete_disk` defers deletion and returns a retriable error; the Director retries
 on the next cycle. The guard fails open on resolution uncertainty so that disks attached to no VM
-pass through without delay. Set `pve.disk_delete_state_guard: "off"` to restore the pre-Phase-1
+pass through without delay. Set `pve.disk_delete_state_guard: "off"` to restore the earlier unguarded
 behavior (no attachment lookup).
 
 ## Node selection precedence

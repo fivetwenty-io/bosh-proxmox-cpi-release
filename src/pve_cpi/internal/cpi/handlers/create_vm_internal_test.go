@@ -3344,7 +3344,12 @@ func TestResolveCloneMode_UnknownVMType_ReturnsCloudError(t *testing.T) {
 // TestResolveVMShape_NoPerfOpts_ByteIdentical verifies that when no perf opts
 // and no virtio_scsi_single are set, the shape carries empty rootDiskPerfOpts
 // and scsihw=="virtio-scsi-pci" (byte-identical to pre-feature behaviour).
-func TestResolveVMShape_NoPerfOpts_ByteIdentical(t *testing.T) {
+// TestResolveVMShape_NoPerfOpts_Phase2Defaults verifies the Phase 2 default
+// shape when nothing is set anywhere: rootDiskPerfOpts carries iothread=1
+// (its built-in default) and scsihw resolves to virtio-scsi-single (its
+// built-in default) — replacing the pre-Phase-2 fully-empty/virtio-scsi-pci
+// assertions this test used to make.
+func TestResolveVMShape_NoPerfOpts_Phase2Defaults(t *testing.T) {
 	t.Parallel()
 
 	deps := Deps{
@@ -3362,11 +3367,46 @@ func TestResolveVMShape_NoPerfOpts_ByteIdentical(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolveVMShape error: %v", err)
 	}
+	if len(shape.rootDiskPerfOpts) != 1 || shape.rootDiskPerfOpts["iothread"] != "1" {
+		t.Errorf("rootDiskPerfOpts = %v; want map[iothread:1] (Phase 2 default)", shape.rootDiskPerfOpts)
+	}
+	if shape.scsihw != "virtio-scsi-single" {
+		t.Errorf("scsihw = %q; want virtio-scsi-single (Phase 2 default)", shape.scsihw)
+	}
+}
+
+// TestResolveVMShape_ExplicitOptOut_RestoresPreDefaultShape verifies that
+// explicitly disabling both flipped knobs restores the pre-Phase-2 shape:
+// empty rootDiskPerfOpts and virtio-scsi-pci.
+func TestResolveVMShape_ExplicitOptOut_RestoresPreDefaultShape(t *testing.T) {
+	t.Parallel()
+
+	deps := Deps{
+		Config: &config.CPIConfig{
+			Node:           "pve",
+			VMStorage:      "local-lvm",
+			VMIDRangeStart: 100,
+		},
+		PVE: &shapeTestPVEClient{
+			clusterStorageSvc: nil,
+		},
+	}
+
+	parsed := minimalParsedArgs("test-storage")
+	parsed.cloudPropsMap = map[string]any{
+		"iothread":           false,
+		"virtio_scsi_single": false,
+	}
+
+	shape, err := resolveVMShape(context.Background(), deps, parsed)
+	if err != nil {
+		t.Fatalf("resolveVMShape error: %v", err)
+	}
 	if len(shape.rootDiskPerfOpts) != 0 {
-		t.Errorf("rootDiskPerfOpts = %v; want empty map (no perf opts set)", shape.rootDiskPerfOpts)
+		t.Errorf("rootDiskPerfOpts = %v; want empty map with explicit opt-out", shape.rootDiskPerfOpts)
 	}
 	if shape.scsihw != "virtio-scsi-pci" {
-		t.Errorf("scsihw = %q; want virtio-scsi-pci (default, no opt-in)", shape.scsihw)
+		t.Errorf("scsihw = %q; want virtio-scsi-pci with explicit opt-out", shape.scsihw)
 	}
 }
 
@@ -3390,6 +3430,9 @@ func TestResolveVMShape_PerfOpts_IOThreadCache(t *testing.T) {
 	parsed.cloudPropsMap = map[string]any{
 		"iothread": true,
 		"cache":    "writeback",
+		// Explicit opt-out isolates this test's focus (iothread+cache
+		// resolution) from the Phase 2 virtio_scsi_single default.
+		"virtio_scsi_single": false,
 	}
 
 	shape, err := resolveVMShape(context.Background(), deps, parsed)
@@ -3402,9 +3445,9 @@ func TestResolveVMShape_PerfOpts_IOThreadCache(t *testing.T) {
 	if shape.rootDiskPerfOpts["cache"] != "writeback" {
 		t.Errorf("rootDiskPerfOpts[cache] = %q; want writeback", shape.rootDiskPerfOpts["cache"])
 	}
-	// ssd absent — virtio bus drops it; no virtio_scsi_single opt-in.
+	// ssd absent — virtio bus drops it; virtio_scsi_single explicitly opted out above.
 	if shape.scsihw != "virtio-scsi-pci" {
-		t.Errorf("scsihw = %q; want virtio-scsi-pci (no virtio_scsi_single)", shape.scsihw)
+		t.Errorf("scsihw = %q; want virtio-scsi-pci (explicit virtio_scsi_single:false)", shape.scsihw)
 	}
 }
 

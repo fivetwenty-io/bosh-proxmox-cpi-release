@@ -565,7 +565,7 @@ or `create_network` fails with:
 create_network: SDN vnet "boshvnet" has not converged into running config within the retry/timeout budget
 ```
 
-The Director retries and the error persists past the retry/timeout budget (default 30 retries at ~1 s each, as of Phase 1) rather than clearing after a few seconds.
+The Director retries and the error persists past the retry/timeout budget (default 30 retries at ~1 s each) rather than clearing after a few seconds.
 
 **Diagnosis**
 

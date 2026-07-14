@@ -3622,10 +3622,11 @@ func TestCreateVM_UnknownVMTypeInCloudProps_ReturnsCloudError(t *testing.T) {
 // Root-disk performance options: import path
 // --------------------------------------------------------------------------
 
-// TestCreateVM_ImportPath_NoPerfOpts_ByteIdentical verifies that when no perf
-// opts and no virtio_scsi_single are set, createParams virtio0 and scsihw are
-// byte-identical to the pre-feature values.
-func TestCreateVM_ImportPath_NoPerfOpts_ByteIdentical(t *testing.T) {
+// TestCreateVM_ImportPath_NoPerfOpts_Phase2Defaults verifies that when no
+// perf opts and no virtio_scsi_single are set, createParams virtio0 carries
+// the Phase 2 default iothread=1, and scsihw resolves to the Phase 2 default
+// virtio-scsi-single. Replaces the pre-Phase-2 "byte-identical" assertions.
+func TestCreateVM_ImportPath_NoPerfOpts_Phase2Defaults(t *testing.T) {
 	t.Parallel()
 	q := &vmMockQEMU{}
 	n := &vmMockNodes{}
@@ -3646,17 +3647,64 @@ func TestCreateVM_ImportPath_NoPerfOpts_ByteIdentical(t *testing.T) {
 	}
 	p := q.createCalls[0].params
 
-	// scsihw must be exactly "virtio-scsi-pci" — the historic default.
-	if scsihw, _ := p["scsihw"].(string); scsihw != "virtio-scsi-pci" {
-		t.Errorf("scsihw = %q; want virtio-scsi-pci (byte-identical default)", scsihw)
+	// scsihw defaults to "virtio-scsi-single" as of Phase 2.
+	if scsihw, _ := p["scsihw"].(string); scsihw != "virtio-scsi-single" {
+		t.Errorf("scsihw = %q; want virtio-scsi-single (Phase 2 default)", scsihw)
 	}
 
-	// virtio0 must contain format= and import-from= but no extra comma-separated
-	// perf options (no cache=, iothread=, ssd=, etc).
+	// virtio0 must contain format=, import-from=, and iothread=1 (Phase 2
+	// default), but no other comma-separated perf options (no cache=, ssd=,
+	// discard=).
+	virtio0, _ := p["virtio0"].(string)
+	for _, forbidden := range []string{"cache=", "ssd=", "discard="} {
+		if strings.Contains(virtio0, forbidden) {
+			t.Errorf("virtio0 %q must not contain %q when no perf opts set", virtio0, forbidden)
+		}
+	}
+	if !strings.Contains(virtio0, "iothread=1") {
+		t.Errorf("virtio0 %q must contain iothread=1 (Phase 2 default)", virtio0)
+	}
+	if !strings.Contains(virtio0, "import-from=") {
+		t.Errorf("virtio0 %q must contain import-from=", virtio0)
+	}
+}
+
+// TestCreateVM_ImportPath_ExplicitOptOut_RestoresPreFlipShape verifies that
+// explicitly disabling both flipped Phase 2 defaults (iothread,
+// virtio_scsi_single) restores the exact pre-Phase-2 createParams shape.
+func TestCreateVM_ImportPath_ExplicitOptOut_RestoresPreFlipShape(t *testing.T) {
+	t.Parallel()
+	q := &vmMockQEMU{}
+	n := &vmMockNodes{}
+	c := &vmMockCluster{}
+	a := &vmMockAgent{}
+	h := handlers.HandleCreateVM(buildVMDeps(q, n, c, a))
+
+	args := mkArgs("agent-optout", testStemcellCID,
+		map[string]any{
+			"cores":              1,
+			"memory":             512,
+			"iothread":           false,
+			"virtio_scsi_single": false,
+		},
+		defaultNetMap(), []string{}, map[string]any{})
+
+	if _, err := h.Handle(context.Background(), args, mkCtx("optout")); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(q.createCalls) != 1 {
+		t.Fatalf("expected 1 Create call, got %d", len(q.createCalls))
+	}
+	p := q.createCalls[0].params
+
+	if scsihw, _ := p["scsihw"].(string); scsihw != "virtio-scsi-pci" {
+		t.Errorf("scsihw = %q; want virtio-scsi-pci with explicit opt-out", scsihw)
+	}
 	virtio0, _ := p["virtio0"].(string)
 	for _, forbidden := range []string{"cache=", "iothread=", "ssd=", "discard="} {
 		if strings.Contains(virtio0, forbidden) {
-			t.Errorf("virtio0 %q must not contain %q when no perf opts set", virtio0, forbidden)
+			t.Errorf("virtio0 %q must not contain %q with explicit opt-out", virtio0, forbidden)
 		}
 	}
 	if !strings.Contains(virtio0, "import-from=") {
@@ -3682,6 +3730,9 @@ func TestCreateVM_ImportPath_PerfOpts_AppliedToVirtio0(t *testing.T) {
 			"iothread": true,
 			"cache":    "writeback",
 			"ssd":      true, // virtio bus must drop this
+			// Explicit opt-out isolates this test's focus (iothread/cache/ssd
+			// resolution) from the Phase 2 virtio_scsi_single default.
+			"virtio_scsi_single": false,
 		},
 		defaultNetMap(), []string{}, map[string]any{})
 
@@ -3704,9 +3755,9 @@ func TestCreateVM_ImportPath_PerfOpts_AppliedToVirtio0(t *testing.T) {
 	if strings.Contains(virtio0, "ssd=") {
 		t.Errorf("virtio0 %q must NOT contain ssd= (virtio bus drops it)", virtio0)
 	}
-	// scsihw: no virtio_scsi_single opt-in → stays "virtio-scsi-pci".
+	// scsihw: virtio_scsi_single explicitly opted out above → stays "virtio-scsi-pci".
 	if scsihw, _ := p["scsihw"].(string); scsihw != "virtio-scsi-pci" {
-		t.Errorf("scsihw = %q; want virtio-scsi-pci", scsihw)
+		t.Errorf("scsihw = %q; want virtio-scsi-pci (explicit virtio_scsi_single:false)", scsihw)
 	}
 }
 
@@ -3745,10 +3796,12 @@ func TestCreateVM_ImportPath_VirtioSCSISingle_SetsCorrectScsihw(t *testing.T) {
 // Root-disk performance options: clone path
 // --------------------------------------------------------------------------
 
-// TestCreateVM_ClonePath_NoPerfOpts_NoExtraKeys verifies that the post-clone
-// UpdateQemuConfig params do NOT carry scsihw or virtio keys when no perf opts
-// and no virtio_scsi_single are set (byte-identical to pre-feature behaviour).
-func TestCreateVM_ClonePath_NoPerfOpts_NoExtraKeys(t *testing.T) {
+// TestCreateVM_ClonePath_NoPerfOpts_Phase2Defaults verifies that the
+// post-clone UpdateQemuConfig params carry the Phase 2 defaults when no perf
+// opts and no virtio_scsi_single are set: Scsihw="virtio-scsi-single" and
+// Virtio[0] containing iothread=1. Replaces the pre-Phase-2
+// "byte-identical/no extra keys" assertions.
+func TestCreateVM_ClonePath_NoPerfOpts_Phase2Defaults(t *testing.T) {
 	t.Parallel()
 
 	n := &vmMockNodes{
@@ -3778,11 +3831,61 @@ func TestCreateVM_ClonePath_NoPerfOpts_NoExtraKeys(t *testing.T) {
 		t.Fatalf("expected >=1 UpdateQemuConfig calls, got %d", len(n.updateConfigCalls))
 	}
 	resourceCall := n.updateConfigCalls[0]
+	if resourceCall.params.Scsihw == nil || *resourceCall.params.Scsihw != "virtio-scsi-single" {
+		got := "<nil>"
+		if resourceCall.params.Scsihw != nil {
+			got = *resourceCall.params.Scsihw
+		}
+		t.Errorf("Scsihw = %q; want virtio-scsi-single (Phase 2 default)", got)
+	}
+	virtio0, ok := resourceCall.params.Virtio[0]
+	if !ok || !strings.Contains(virtio0, "iothread=1") {
+		t.Errorf("Virtio[0] = %q, present=%v; want iothread=1 present (Phase 2 default)", virtio0, ok)
+	}
+}
+
+// TestCreateVM_ClonePath_ExplicitOptOut_RestoresPreFlipShape verifies that
+// explicitly disabling both flipped Phase 2 defaults restores the exact
+// pre-Phase-2 UpdateQemuConfig shape: nil Scsihw, empty Virtio map.
+func TestCreateVM_ClonePath_ExplicitOptOut_RestoresPreFlipShape(t *testing.T) {
+	t.Parallel()
+
+	n := &vmMockNodes{
+		createQemuCloneFn: func(_ context.Context, _, _ string, _ *sdknodes.CreateQemuCloneParams) (*sdknodes.CreateQemuCloneResponse, error) {
+			raw := sdknodes.CreateQemuCloneResponse{}
+			_ = json.Unmarshal([]byte(`"UPID:pve:0000900A:00000001:clone:ok"`), &raw)
+			return &raw, nil
+		},
+	}
+	q := &vmMockQEMU{}
+	a := &vmMockAgent{}
+
+	deps := buildVMDepsForTemplate(q, n, &vmMockCluster{}, a)
+	h := handlers.HandleCreateVM(deps)
+
+	args := mkArgs("agent-clone-optout", testTemplateCID,
+		map[string]any{
+			"cores":              1,
+			"memory":             512,
+			"iothread":           false,
+			"virtio_scsi_single": false,
+		},
+		map[string]any{"default": map[string]any{"type": "dynamic", "cloud_properties": map[string]any{}}},
+		[]string{}, map[string]any{})
+
+	if _, err := h.Handle(context.Background(), args, mkCtx("clone-optout")); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(n.updateConfigCalls) < 1 {
+		t.Fatalf("expected >=1 UpdateQemuConfig calls, got %d", len(n.updateConfigCalls))
+	}
+	resourceCall := n.updateConfigCalls[0]
 	if resourceCall.params.Scsihw != nil {
-		t.Errorf("Scsihw must be nil in UpdateQemuConfig params when not switching (byte-identical)")
+		t.Errorf("Scsihw must be nil in UpdateQemuConfig params with explicit opt-out, got %q", *resourceCall.params.Scsihw)
 	}
 	if len(resourceCall.params.Virtio) != 0 {
-		t.Errorf("Virtio map must be empty when no perf opts set, got %v", resourceCall.params.Virtio)
+		t.Errorf("Virtio map must be empty with explicit opt-out, got %v", resourceCall.params.Virtio)
 	}
 }
 
@@ -3870,6 +3973,9 @@ func TestCreateVM_ClonePath_OnlyScsihwSwitch_NoVirtio0Key(t *testing.T) {
 			"cores":              1,
 			"memory":             512,
 			"virtio_scsi_single": true,
+			// Explicit opt-out isolates this test's focus (the scsihw switch
+			// alone) from the Phase 2 iothread default.
+			"iothread": false,
 		},
 		map[string]any{"default": map[string]any{"type": "dynamic", "cloud_properties": map[string]any{}}},
 		[]string{}, map[string]any{})

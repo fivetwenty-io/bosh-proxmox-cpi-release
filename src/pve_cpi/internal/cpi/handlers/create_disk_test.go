@@ -1215,14 +1215,14 @@ func TestHandleCreateDisk_PerfOpts_InCIDMeta(t *testing.T) {
 // TestHandleCreateDisk_NoPerfOpts_ByteIdenticalCID verifies that when no perf
 // options are supplied, the returned disk CID is byte-identical to one produced
 // without any Opts field — preserving backward compatibility.
-func TestHandleCreateDisk_NoPerfOpts_ByteIdenticalCID(t *testing.T) {
+// TestHandleCreateDisk_NoPerfOpts_Phase2DefaultBakesIothread verifies that a
+// create_disk call with no explicit perf opts bakes the Phase 2 default
+// (iothread=1) into the disk CID's recorded Opts — replacing the pre-Phase-2
+// "byte-identical, no options" assertion.
+func TestHandleCreateDisk_NoPerfOpts_Phase2DefaultBakesIothread(t *testing.T) {
 	t.Parallel()
-	var capturedVMID int
-	var capturedStorage string
 	storageSvc := &mockStorageService{
 		createVolumeFn: func(_ context.Context, _, storage string, _ int, _ string, vmid int, _ string) (string, error) {
-			capturedVMID = vmid
-			capturedStorage = storage
 			return fmt.Sprintf("%s:vm-%d-disk-0", storage, vmid), nil
 		},
 	}
@@ -1242,6 +1242,49 @@ func TestHandleCreateDisk_NoPerfOpts_ByteIdenticalCID(t *testing.T) {
 		t.Fatalf("expected non-empty string result, got %T %v", result, result)
 	}
 
+	_, meta, parseErr := pve.ParseEncodedDiskCID(diskCID)
+	if parseErr != nil {
+		t.Fatalf("ParseEncodedDiskCID(%q): %v", diskCID, parseErr)
+	}
+	if meta == nil || len(meta.Opts) != 1 || meta.Opts["iothread"] != "1" {
+		got := any(nil)
+		if meta != nil {
+			got = meta.Opts
+		}
+		t.Errorf("meta.Opts = %v; want map[iothread:1] (Phase 2 default)", got)
+	}
+}
+
+// TestHandleCreateDisk_ExplicitOptOut_ByteIdenticalCID verifies that an
+// explicit cloud_properties.iothread:false restores the exact pre-Phase-2
+// bare CID shape (no recorded Opts at all).
+func TestHandleCreateDisk_ExplicitOptOut_ByteIdenticalCID(t *testing.T) {
+	t.Parallel()
+	var capturedVMID int
+	var capturedStorage string
+	storageSvc := &mockStorageService{
+		createVolumeFn: func(_ context.Context, _, storage string, _ int, _ string, vmid int, _ string) (string, error) {
+			capturedVMID = vmid
+			capturedStorage = storage
+			return fmt.Sprintf("%s:vm-%d-disk-0", storage, vmid), nil
+		},
+	}
+	deps := baseDepsForCreate(t, storageSvc, nil)
+
+	h := handlers.HandleCreateDisk(deps)
+	result, err := h.Handle(context.Background(), []json.RawMessage{
+		marshal(1024),
+		marshal(map[string]any{"iothread": false}),
+	}, jsonrpc.Context{})
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	diskCID, ok := result.(string)
+	if !ok || diskCID == "" {
+		t.Fatalf("expected non-empty string result, got %T %v", result, result)
+	}
+
 	// Construct the expected CID as EncodeDiskCID would without Opts.
 	bareCID := fmt.Sprintf("%s:vm-%d-disk-0", capturedStorage, capturedVMID)
 	expectedCID := pve.EncodeDiskCID(bareCID, &pve.DiskCIDMeta{
@@ -1249,16 +1292,16 @@ func TestHandleCreateDisk_NoPerfOpts_ByteIdenticalCID(t *testing.T) {
 		Node: deps.Config.Node,
 	})
 	if diskCID != expectedCID {
-		t.Errorf("no-perf-opts CID not byte-identical to pre-change form:\n  got  = %q\n  want = %q", diskCID, expectedCID)
+		t.Errorf("explicit-opt-out CID not byte-identical to pre-Phase-2 form:\n  got  = %q\n  want = %q", diskCID, expectedCID)
 	}
 
 	_, meta, parseErr := pve.ParseEncodedDiskCID(diskCID)
 	if parseErr != nil {
 		t.Fatalf("ParseEncodedDiskCID(%q): %v", diskCID, parseErr)
 	}
-	// meta.Opts must be nil or empty when no options were set.
+	// meta.Opts must be nil or empty with the default explicitly disabled.
 	if meta != nil && len(meta.Opts) != 0 {
-		t.Errorf("meta.Opts = %v; want nil/empty when no perf options set", meta.Opts)
+		t.Errorf("meta.Opts = %v; want nil/empty with explicit iothread:false", meta.Opts)
 	}
 }
 

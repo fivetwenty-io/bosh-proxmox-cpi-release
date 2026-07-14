@@ -24,25 +24,57 @@ func buildResolver(t *testing.T, cp map[string]any) *layeredResolver {
 // resolveDiskPerfOptions
 // ----------------------------------------------------------------
 
-func TestResolveDiskPerfOptions_EmptyResolverNilConfig(t *testing.T) {
+// TestResolveDiskPerfOptions_EmptyResolverNilConfig_IothreadDefaultsOn
+// verifies the Phase 2 default flip: with everything else absent, iothread
+// resolves to "1" because its built-in Level-5 default is now true. This
+// replaces the pre-Phase-2 "expected empty map" assertion.
+func TestResolveDiskPerfOptions_EmptyResolverNilConfig_IothreadDefaultsOn(t *testing.T) {
 	r := buildResolver(t, nil)
 	opts, err := resolveDiskPerfOptions(r, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(opts) != 0 {
-		t.Errorf("expected empty map, got %v", opts)
+	if len(opts) != 1 || opts["iothread"] != "1" {
+		t.Errorf("expected map[iothread:1] (Phase 2 default), got %v", opts)
 	}
 }
 
-func TestResolveDiskPerfOptions_EmptyResolverEmptyConfig(t *testing.T) {
+func TestResolveDiskPerfOptions_EmptyResolverEmptyConfig_IothreadDefaultsOn(t *testing.T) {
 	r := buildResolver(t, map[string]any{})
 	opts, err := resolveDiskPerfOptions(r, &config.CPIConfig{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+	if len(opts) != 1 || opts["iothread"] != "1" {
+		t.Errorf("expected map[iothread:1] (Phase 2 default), got %v", opts)
+	}
+}
+
+// TestResolveDiskPerfOptions_ExplicitIothreadFalse_TrulyEmpty verifies that an
+// explicit call-level iothread:false still yields a fully empty map — the
+// Phase 2 default flip does not remove the ability to opt all the way out.
+func TestResolveDiskPerfOptions_ExplicitIothreadFalse_TrulyEmpty(t *testing.T) {
+	r := buildResolver(t, map[string]any{"iothread": false})
+	opts, err := resolveDiskPerfOptions(r, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if len(opts) != 0 {
-		t.Errorf("expected empty map, got %v", opts)
+		t.Errorf("expected empty map with explicit iothread:false, got %v", opts)
+	}
+}
+
+// TestResolveDiskPerfOptions_ExplicitIothreadFalse_GlobalConfig verifies a
+// global config Iothread=false also fully disables the default.
+func TestResolveDiskPerfOptions_ExplicitIothreadFalse_GlobalConfig(t *testing.T) {
+	r := buildResolver(t, map[string]any{})
+	cfg := &config.CPIConfig{DiskPerformance: &config.DiskPerformanceDefaults{Iothread: boolPtr(false)}}
+	opts, err := resolveDiskPerfOptions(r, cfg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(opts) != 0 {
+		t.Errorf("expected empty map with global Iothread=false, got %v", opts)
 	}
 }
 
@@ -270,10 +302,33 @@ func TestResolveVirtioSCSISingle_ConfigTrueEmptyCall(t *testing.T) {
 	}
 }
 
-func TestResolveVirtioSCSISingle_NeitherSetFalse(t *testing.T) {
+// TestResolveVirtioSCSISingle_NeitherSetDefaultsTrue verifies the Phase 2
+// default flip: with neither the layered resolver nor global config setting
+// virtio_scsi_single, the built-in Level-5 default is now true.
+func TestResolveVirtioSCSISingle_NeitherSetDefaultsTrue(t *testing.T) {
 	r := buildResolver(t, map[string]any{})
+	if !resolveVirtioSCSISingle(r, &config.CPIConfig{}) {
+		t.Error("expected true (Phase 2 default) when neither call nor config sets virtio_scsi_single")
+	}
+}
+
+// TestResolveVirtioSCSISingle_CallFalse_OptsOut verifies an explicit
+// call-level false still fully disables the Phase 2 default.
+func TestResolveVirtioSCSISingle_CallFalse_OptsOut(t *testing.T) {
+	cp := map[string]any{"virtio_scsi_single": false}
+	r := buildResolver(t, cp)
 	if resolveVirtioSCSISingle(r, &config.CPIConfig{}) {
-		t.Error("expected false when neither call nor config sets virtio_scsi_single")
+		t.Error("expected false with explicit call-level virtio_scsi_single:false")
+	}
+}
+
+// TestResolveVirtioSCSISingle_ConfigFalse_OptsOut verifies an explicit
+// global config false still fully disables the Phase 2 default.
+func TestResolveVirtioSCSISingle_ConfigFalse_OptsOut(t *testing.T) {
+	r := buildResolver(t, map[string]any{})
+	cfg := &config.CPIConfig{DiskPerformance: &config.DiskPerformanceDefaults{VirtioSCSISingle: boolPtr(false)}}
+	if resolveVirtioSCSISingle(r, cfg) {
+		t.Error("expected false with explicit global config virtio_scsi_single:false")
 	}
 }
 

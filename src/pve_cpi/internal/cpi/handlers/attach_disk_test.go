@@ -1174,7 +1174,11 @@ func TestHandleAttachDisk_PerfOpts_MetaOptsApplied(t *testing.T) {
 // TestHandleAttachDisk_PerfOpts_BareNoOptions verifies byte-identical behavior:
 // when the CID has no meta opts and config has nil DiskPerformance, AttachDisk
 // receives the bareDiskCID with no option suffix.
-func TestHandleAttachDisk_PerfOpts_BareNoOptions(t *testing.T) {
+// TestHandleAttachDisk_PerfOpts_NoConfigPhase2DefaultApplied verifies that
+// with a bare no-opts CID and no global DiskPerformance block, the volid
+// passed to AttachDisk still picks up the Phase 2 iothread=1 default —
+// replacing the pre-Phase-2 "byte-identical to bareCID" assertion.
+func TestHandleAttachDisk_PerfOpts_NoConfigPhase2DefaultApplied(t *testing.T) {
 	t.Parallel()
 	const bareCID = "local-lvm:vm-9001-disk-0"
 
@@ -1187,7 +1191,7 @@ func TestHandleAttachDisk_PerfOpts_BareNoOptions(t *testing.T) {
 	cfg := &config.CPIConfig{
 		Node:            testNode,
 		VMDiskFormat:    "qcow2",
-		DiskPerformance: nil, // no global defaults
+		DiskPerformance: nil, // no global block at all — the built-in default still applies
 	}
 	h := handlers.HandleAttachDisk(attachDepsPerf(qemuSvc, &captureAgent{}, cfg))
 
@@ -1196,9 +1200,39 @@ func TestHandleAttachDisk_PerfOpts_BareNoOptions(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// No options → volid must be byte-identical to bareCID.
+	wantVolid := bareCID + ",iothread=1"
+	if qemuSvc.attachLastVolid != wantVolid {
+		t.Errorf("AttachDisk volid: want %q (Phase 2 default), got %q", wantVolid, qemuSvc.attachLastVolid)
+	}
+}
+
+// TestHandleAttachDisk_PerfOpts_ExplicitOptOut_BareNoOptions verifies that an
+// explicit global Iothread=false restores the pre-Phase-2 byte-identical
+// bare-CID attach shape.
+func TestHandleAttachDisk_PerfOpts_ExplicitOptOut_BareNoOptions(t *testing.T) {
+	t.Parallel()
+	const bareCID = "local-lvm:vm-9001-disk-0"
+
+	qemuSvc := &attachQEMUService{
+		attachReturnDiskID: "scsi1",
+		configCfg: map[string]any{
+			"scsi1": bareCID,
+		},
+	}
+	cfg := &config.CPIConfig{
+		Node:            testNode,
+		VMDiskFormat:    "qcow2",
+		DiskPerformance: &config.DiskPerformanceDefaults{Iothread: boolPtr(false)},
+	}
+	h := handlers.HandleAttachDisk(attachDepsPerf(qemuSvc, &captureAgent{}, cfg))
+
+	_, err := h.Handle(context.Background(), attachArgs("100", bareCID), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
 	if qemuSvc.attachLastVolid != bareCID {
-		t.Errorf("AttachDisk volid: want bare %q (no options), got %q", bareCID, qemuSvc.attachLastVolid)
+		t.Errorf("AttachDisk volid: want bare %q with explicit opt-out, got %q", bareCID, qemuSvc.attachLastVolid)
 	}
 }
 
@@ -1256,6 +1290,11 @@ func TestHandleAttachDisk_PerfOpts_PerDiskWinsOverGlobal(t *testing.T) {
 		VMDiskFormat: "qcow2",
 		DiskPerformance: &config.DiskPerformanceDefaults{
 			Cache: "none", // global default — must be overridden by meta
+			// Explicit opt-out isolates this test's focus (cache precedence)
+			// from the Phase 2 iothread default, which would otherwise be
+			// absent from the disk's recorded (pre-flip-style) meta and trip
+			// the disk-perf-invariant guard as an unrelated divergence.
+			Iothread: boolPtr(false),
 		},
 	}
 	h := handlers.HandleAttachDisk(attachDepsPerf(qemuSvc, &captureAgent{}, cfg))
@@ -1369,7 +1408,14 @@ func TestHandleAttachDisk_Invariant_EnforceNoDivergence(t *testing.T) {
 		Node:                  testNode,
 		VMDiskFormat:          "qcow2",
 		DiskPerfInvariantMode: "enforce",
-		DiskPerformance:       &config.DiskPerformanceDefaults{Cache: "writethrough"}, // overridden by meta
+		DiskPerformance: &config.DiskPerformanceDefaults{
+			Cache: "writethrough", // overridden by meta
+			// Explicit opt-out keeps this a true no-divergence regression
+			// guard: the disk's recorded meta has no iothread key, so the
+			// Phase 2 default (true) would otherwise introduce a real
+			// divergence unrelated to the cache-precedence case under test.
+			Iothread: boolPtr(false),
+		},
 	}
 
 	h := handlers.HandleAttachDisk(attachDepsPerf(qemuSvc, &captureAgent{}, cfg))
@@ -1446,6 +1492,11 @@ func parkedCfg() *config.CPIConfig {
 		DetachedDiskStrategy:     "parked",
 		ParkedDiskVMIDRangeStart: 90000,
 		ParkedDiskVMIDRangeEnd:   90999,
+		// Explicit opt-out keeps this test group's focus on parker mechanics
+		// (detach-then-attach flow) rather than the Phase 2 iothread default,
+		// which several of these tests would otherwise pick up as an
+		// unrelated volid suffix on every bare-CID assertion.
+		DiskPerformance: &config.DiskPerformanceDefaults{Iothread: boolPtr(false)},
 	}
 }
 

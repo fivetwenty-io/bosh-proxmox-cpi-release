@@ -66,13 +66,23 @@ if v, ok := r.Bool("iothread"); ok {
         opts["iothread"] = "1"
     }
 }
-// Level 5 (implicit): absent → omit → PVE default (disabled).
+// Level 5 (implicit): absent → iothread's hardcoded default (true, as of
+// see the exception note below); other keys typically default false.
 ```
 
 The disk-performance resolver in
 `internal/cpi/handlers/disk_performance.go` (`resolveDiskPerfOptions`,
 `resolveDiskPerfBool`) implements this pattern for `iothread`, `ssd`, and
-`discard`.
+`discard`. `resolveDiskPerfBool` takes an explicit `defaultVal` parameter so
+Level 5 can differ per key rather than being a single package-wide constant.
+
+**Exception: `iothread` and `virtio_scsi_single`.** These two knobs'
+Level 5 default flipped from `false` to `true` — the only two boolean knobs in
+the CPI where Level 5 is not `false`. `ssd`, `discard`, and every other
+optional bool knob still follow the general `false` convention above. See
+[Configuration — Disk Performance](configuration.md#disk-performance) for the
+full rationale and the drift-governance behavior for disks created before the
+flip.
 
 ## Byte-Identical Guarantee
 

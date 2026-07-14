@@ -13,13 +13,23 @@ import (
 // cfg.DiskPerformance global defaults. Returns a PVE option map (key→value
 // string) containing only options that were set. Non-retriable CloudError on
 // invalid value (bad cache mode, negative throttle). Empty resolver + nil/empty
-// config → empty map (byte-identical: caller emits nothing).
+// config → empty map, EXCEPT iothread — see below.
 //
 // Mapping:
 //
-//	iothread bool → "1"/omit (false or absent → omit; we never emit "0")
-//	ssd      bool → "1"/omit
-//	discard  bool → "on"/omit (true) / omit (false or absent)
+//	iothread bool → "1"/omit. Default TRUE (Phase 2): a dedicated I/O thread
+//	                per disk relieves QEMU main-loop contention on multi-disk
+//	                VMs and is the modern PVE creation default; this default
+//	                applies only when neither the layered resolver
+//	                (cloud_properties.iothread, including a vm_type/disk_type
+//	                profile) nor cfg.DiskPerformance.Iothread set an explicit
+//	                value — an explicit false at either layer still disables
+//	                it. This is a create/attach-time bake only: existing disk
+//	                CIDs and already-created VMs are unaffected (see
+//	                disk_perf_invariant_mode for re-attach drift handling).
+//	ssd      bool → "1"/omit. Default false (unchanged).
+//	discard  bool → "on"/omit (true) / omit (false or absent). Default false
+//	                (unchanged).
 //	cache    string (validated) → opts["cache"]=mode / omit when empty
 //	mbps_rd  float → strconv.FormatFloat(v,'g',-1,64) / omit when 0; <0 → error
 //	mbps_wr  same pattern
@@ -34,13 +44,15 @@ func resolveDiskPerfOptions(r *layeredResolver, cfg *config.CPIConfig) (map[stri
 	}
 
 	// Boolean toggles: emit only when effective value is true. false/absent → omit.
-	if resolveDiskPerfBool(r, diskOptIothread, diskPerfCfgBool(dp, func(d *config.DiskPerformanceDefaults) *bool { return d.Iothread })) {
+	// iothread's built-in default is true (Phase 2 default flip); ssd/discard
+	// stay false — see resolveDiskPerfOptions doc for the full rationale.
+	if resolveDiskPerfBool(r, diskOptIothread, diskPerfCfgBool(dp, func(d *config.DiskPerformanceDefaults) *bool { return d.Iothread }), true) {
 		opts[diskOptIothread] = "1"
 	}
-	if resolveDiskPerfBool(r, diskOptSSD, diskPerfCfgBool(dp, func(d *config.DiskPerformanceDefaults) *bool { return d.SSD })) {
+	if resolveDiskPerfBool(r, diskOptSSD, diskPerfCfgBool(dp, func(d *config.DiskPerformanceDefaults) *bool { return d.SSD }), false) {
 		opts[diskOptSSD] = "1"
 	}
-	if resolveDiskPerfBool(r, "discard", diskPerfCfgBool(dp, func(d *config.DiskPerformanceDefaults) *bool { return d.Discard })) {
+	if resolveDiskPerfBool(r, "discard", diskPerfCfgBool(dp, func(d *config.DiskPerformanceDefaults) *bool { return d.Discard }), false) {
 		opts["discard"] = "on"
 	}
 
@@ -97,15 +109,20 @@ func diskPerfCfgInt(dp *config.DiskPerformanceDefaults, get func(*config.DiskPer
 }
 
 // resolveDiskPerfBool returns the effective bool: resolver value wins (explicit
-// false counts), else the config pointer, else false.
-func resolveDiskPerfBool(r *layeredResolver, key string, cfgVal *bool) bool {
+// false counts), else the config pointer (explicit false also counts), else
+// defaultVal. defaultVal lets callers give a specific option (iothread) a
+// true built-in default while others (ssd, discard) keep false — both an
+// explicit resolver-level and an explicit config-level false still disable
+// the option regardless of defaultVal, since either non-absent source is
+// checked before defaultVal is ever consulted.
+func resolveDiskPerfBool(r *layeredResolver, key string, cfgVal *bool, defaultVal bool) bool {
 	if v, found := r.Bool(key); found {
 		return v
 	}
 	if cfgVal != nil {
 		return *cfgVal
 	}
-	return false
+	return defaultVal
 }
 
 // resolveDiskPerfFloatOpt resolves a float throttle and, when > 0, writes it to
@@ -166,11 +183,20 @@ func filterDiskPerfForBus(opts map[string]string, bus string) map[string]string 
 }
 
 // resolveVirtioSCSISingle reports whether the VM should use virtio-scsi-single
-// (opt-in). Precedence:
+// (default as of Phase 2 — see below). Precedence:
 //
-//  1. resolver Bool "virtio_scsi_single" (if found) — explicit call value wins
-//  2. cfg.DiskPerformance.VirtioSCSISingle (if non-nil) — global config default
-//  3. false
+//  1. resolver Bool "virtio_scsi_single" (if found) — explicit call value wins,
+//     including an explicit false from cloud_properties or a vm_type/disk_type
+//     profile (disables the default).
+//  2. cfg.DiskPerformance.VirtioSCSISingle (if non-nil) — global config default;
+//     an explicit *false here also disables the built-in default below.
+//  3. true — the built-in default. VirtIO SCSI single gives each disk its own
+//     dedicated controller (required for per-disk iothread on the scsi bus,
+//     whose default also flipped to true in the same change) instead of
+//     serializing every disk behind one shared virtio-scsi-pci controller.
+//     This is create-time only: an existing VM's controller is never changed
+//     retroactively. Set virtio_scsi_single: false (globally or per-call) to
+//     restore the pre-Phase-2 virtio-scsi-pci default.
 func resolveVirtioSCSISingle(r *layeredResolver, cfg *config.CPIConfig) bool {
 	if v, found := r.Bool("virtio_scsi_single"); found {
 		return v
@@ -178,7 +204,7 @@ func resolveVirtioSCSISingle(r *layeredResolver, cfg *config.CPIConfig) bool {
 	if cfg != nil && cfg.DiskPerformance != nil && cfg.DiskPerformance.VirtioSCSISingle != nil {
 		return *cfg.DiskPerformance.VirtioSCSISingle
 	}
-	return false
+	return true
 }
 
 // diskPerfInvariantKeys are the structural per-disk performance options whose

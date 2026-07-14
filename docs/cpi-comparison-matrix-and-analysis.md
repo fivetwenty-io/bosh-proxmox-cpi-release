@@ -834,6 +834,13 @@ are validated at config-load and call time, surfacing a non-retriable error on b
 rather than a late PVE rejection. Every option is opt-in: with none set, the encoded CID,
 the attach call, and the create parameters are byte-identical to prior releases.
 
+**Default update.** `iothread` and `virtio_scsi_single` now default to `true` (both were
+unset/off, i.e. `virtio-scsi-pci` with no iothread, at initial ship); `cache`, `discard`,
+`ssd`, and the throttle options remain unset by default. Set either flipped default to
+`false` (globally or per disk/VM) to restore the originally-shipped behavior described
+above. See [Configuration — Disk Performance](configuration.md#disk-performance) for the
+current defaults and the drift-governance note for pre-flip disk CIDs.
+
 **Benefit.** Each knob maps to a concrete Proxmox storage win: `discard=on` issues TRIM/UNMAP so
 a thin LVM or Ceph pool actually reclaims space the guest frees (without it, a thin pool fills
 permanently as files are deleted); `iothread=1` gives the disk a dedicated QEMU I/O thread,
