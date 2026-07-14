@@ -249,6 +249,105 @@ func TestRetryOnTransientOrLock_NonRetryablePropagates(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Quorum-loss retry-curve routing (IsClusterNotQuorate)
+// ---------------------------------------------------------------------------
+
+// TestRetryOnTransientOrLock_QuorumIsRetried proves a "not quorate" error is
+// retried by RetryOnTransientOrLock rather than propagated immediately.
+func TestRetryOnTransientOrLock_QuorumIsRetried(t *testing.T) {
+	t.Parallel()
+	ctx := WithTestBackoff(context.Background(), func(int) time.Duration { return 0 })
+	calls := 0
+	quorumErr := errors.New("error writing config, cfs-lock failed - not quorate")
+	err := RetryOnTransientOrLock(ctx, nil, "test", 4, func() error {
+		calls++
+		if calls < 3 {
+			return quorumErr
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if calls != 3 {
+		t.Fatalf("expected 3 calls, got %d", calls)
+	}
+}
+
+// TestRetryOnStorageLock_QuorumIsRetried proves RetryOnStorageLock — the
+// dedicated storage-lock curve helper — also retries quorum-loss errors, not
+// only lockfile timeouts, since both share the same curve.
+func TestRetryOnStorageLock_QuorumIsRetried(t *testing.T) {
+	t.Parallel()
+	ctx := WithTestBackoff(context.Background(), func(int) time.Duration { return 0 })
+	calls := 0
+	quorumErr := errors.New("cluster not ready - no quorum on node pve02")
+	err := RetryOnStorageLock(ctx, nil, "test", 4, func() error {
+		calls++
+		if calls < 3 {
+			return quorumErr
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if calls != 3 {
+		t.Fatalf("expected 3 calls, got %d", calls)
+	}
+}
+
+// TestRetryOrLockCurve_QuorumUsesStorageLockCurveNotTransient is the
+// retry-curve routing test the acceptance criteria calls for: it proves a
+// quorum error selects the storage-lock backoff curve (2s→30s, 10 attempts)
+// rather than the shorter transient-transport curve (1s→15s, 8 attempts) —
+// critical because a quorum 5xx also satisfies IsTransientTransport, so
+// without explicit routing it would silently fall through to the wrong,
+// too-short curve. At a high attempt count both curves are fully capped:
+// StorageLockBackoff caps at 30s (band ~20-30s, see
+// TestStorageLockBackoff_GrowsAndCaps) while TransientBackoff caps at 15s
+// (band ~10.5-15s, see TestTransientBackoff_GrowsAndCaps) — landing above the
+// transient cap proves the longer curve was actually selected, not merely
+// labeled.
+func TestRetryOrLockCurve_QuorumUsesStorageLockCurveNotTransient(t *testing.T) {
+	t.Parallel()
+	d, reason := retryOrLockCurve(false, false, true, 20)
+	if reason != "cluster_not_quorate" {
+		t.Errorf("reason = %q; want %q", reason, "cluster_not_quorate")
+	}
+	if d <= 15*time.Second {
+		t.Errorf("quorum backoff %v landed at/under the transient-curve cap (15s); "+
+			"must use the longer storage-lock curve instead", d)
+	}
+	if d > 30*time.Second {
+		t.Errorf("quorum backoff %v exceeds the storage-lock curve cap (30s)", d)
+	}
+}
+
+// TestRetryOrLockCurve_PushbackPriorityOverQuorum verifies pushback (the most
+// conservative signal — worker-pool exhaustion) still wins the curve
+// selection even when a quorum condition is also flagged for the same error.
+func TestRetryOrLockCurve_PushbackPriorityOverQuorum(t *testing.T) {
+	t.Parallel()
+	_, reason := retryOrLockCurve(true, false, true, 0)
+	if reason != "pushback" {
+		t.Errorf("reason = %q; want %q (pushback must win over quorum)", reason, "pushback")
+	}
+}
+
+// TestRetryOrLockCurve_QuorumReasonDistinctFromLock verifies the log-line
+// reason label distinguishes quorum loss from plain storage-lock contention
+// even though both ride the identical StorageLockBackoff curve — operators
+// scanning retry logs should be able to tell the two conditions apart.
+func TestRetryOrLockCurve_QuorumReasonDistinctFromLock(t *testing.T) {
+	t.Parallel()
+	_, reason := retryOrLockCurve(false, true, true, 0)
+	if reason != "cluster_not_quorate" {
+		t.Errorf("reason = %q; want %q when both isLock and isQuorum are true", reason, "cluster_not_quorate")
+	}
+}
+
 func TestTransientBackoff_GrowsAndCaps(t *testing.T) {
 	t.Parallel()
 	d0 := TransientBackoff(0)

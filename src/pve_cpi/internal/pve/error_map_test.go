@@ -747,6 +747,92 @@ func TestWrapError_StorageLockTimeout_IsRetriable(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// IsClusterNotQuorate
+// ---------------------------------------------------------------------------
+
+func TestIsClusterNotQuorate_Nil(t *testing.T) {
+	t.Parallel()
+	if pve.IsClusterNotQuorate(nil) {
+		t.Error("nil error should not be cluster-not-quorate")
+	}
+}
+
+// source: PVE pmxcfs (cfs-lock write path) — observed message shape.
+func TestIsClusterNotQuorate_Table(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		msg  string
+		want bool
+	}{
+		{"not_quorate_phrase", "error writing config, cfs-lock failed - not quorate", true},
+		{"not_quorate_mixed_case", "Error Writing Config, Cfs-Lock Failed - Not Quorate", true},
+		{"no_quorum_phrase", "cluster not ready - no quorum on node pve02", true},
+		{"no_quorum_mixed_case", "Cluster Not Ready - No Quorum On Node Pve02", true},
+		{"5xx_wrapping_not_quorate", "task failed: unable to update VM 100 config: not quorate", true},
+		{"unrelated_message", "VM 131 already exists", false},
+		{"unrelated_lock_timeout", "can't lock file '/var/lock/pve-manager/pve-storage-data' - got timeout", false},
+		{"partial_word_quorum_only", "quorum device configured", false},
+		{"empty_string", "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := pve.IsClusterNotQuorate(errors.New(tc.msg))
+			if got != tc.want {
+				t.Errorf("IsClusterNotQuorate(%q) = %v; want %v", tc.msg, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestWrapError_ClusterNotQuorate_PlainText_IsRetriableWithHint(t *testing.T) {
+	t.Parallel()
+	err := errors.New("task failed: unable to update VM 100 config: cfs-lock failed - not quorate")
+	wrapped := pve.WrapError(err)
+	if wrapped == nil {
+		t.Fatal("WrapError returned nil")
+	}
+	if !cpiErrIsRetriable(t, wrapped) {
+		t.Errorf("cluster-not-quorate should map to RetriableCloudError; got %T %v", wrapped, wrapped)
+	}
+	msg := wrapped.Error()
+	if !strings.Contains(msg, "cluster has lost quorum") {
+		t.Errorf("expected operator hint 'cluster has lost quorum' in message, got %q", msg)
+	}
+	if !strings.Contains(msg, "pvecm status") {
+		t.Errorf("expected operator hint to name `pvecm status`, got %q", msg)
+	}
+	if !strings.Contains(msg, "not quorate") {
+		t.Errorf("expected original PVE message preserved, got %q", msg)
+	}
+}
+
+// TestWrapError_ClusterNotQuorate_5xxAPIError_IsRetriableWithHint verifies the
+// quorum-specific check runs BEFORE the generic 5xx APIError branch, so a
+// quorum error that PVE happens to wrap in a 5xx HTTP response still gets the
+// operator-actionable hint instead of the anonymous "PVE server error"
+// message.
+func TestWrapError_ClusterNotQuorate_5xxAPIError_IsRetriableWithHint(t *testing.T) {
+	t.Parallel()
+	err := makeAPIErr(500, "cfs-lock failed - not quorate")
+	wrapped := pve.WrapError(err)
+	if wrapped == nil {
+		t.Fatal("WrapError returned nil")
+	}
+	if !cpiErrIsRetriable(t, wrapped) {
+		t.Errorf("quorum 5xx should map to RetriableCloudError; got %T %v", wrapped, wrapped)
+	}
+	msg := wrapped.Error()
+	if !strings.Contains(msg, "cluster has lost quorum") {
+		t.Errorf("expected quorum-specific hint on a 5xx-wrapped quorum error, got %q", msg)
+	}
+	if strings.Contains(msg, "PVE server error") {
+		t.Errorf("quorum error must not fall through to the generic 5xx message, got %q", msg)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // IsSnapshotBlocked
 // ---------------------------------------------------------------------------
 

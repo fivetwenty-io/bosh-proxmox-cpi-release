@@ -811,6 +811,48 @@ Both errors indicate a `pvedaemon` worker was recycled mid-request. The CPI retr
 
 If these appear frequently, raise `MAX_WORKERS` in `/etc/default/pvedaemon` and `/etc/default/pveproxy`. See [PVE Transient Transport](pve-transient-transport.md) and [PVE Host Tuning](pve-host-tuning.md).
 
+## Cluster not quorate
+
+**Symptom**
+
+Every GET-style read (`qm status`, `qm config`, `pvesh get ...`) keeps working normally, but every mutating call — `create_vm`, `create_disk`, `attach_disk`, `resize_disk`, `delete_vm`, and any other operation that writes to a VM or storage config — fails with a 5xx error containing one of two phrases:
+
+```text
+error writing config, cfs-lock failed - not quorate
+```
+
+or
+
+```text
+no quorum
+```
+
+**Cause**
+
+PVE's cluster filesystem (`/etc/pve`, backed by pmxcfs) requires a quorate corosync cluster — a strict majority of configured nodes reachable and agreeing on cluster state — before it will accept writes. When quorum is lost, `/etc/pve` becomes read-only cluster-wide. Two causes account for nearly all occurrences:
+
+- **Node loss below majority** — enough nodes are powered off, rebooting, or network-partitioned that the surviving set no longer has more than half the configured votes. A 3-node cluster loses quorum the moment 2 nodes are unreachable; a 5-node cluster tolerates 2 node losses but not 3.
+
+- **Corosync network trouble** — the corosync ring network (a separate link from the PVE management network on well-configured clusters, but sometimes shared) is dropping packets, partitioned, or saturated, so nodes that are otherwise up cannot agree on membership.
+
+**Diagnosis**
+
+Run on any reachable node — quorum status is cluster-wide, so any node's view is representative:
+
+```bash
+pvecm status
+```
+
+Look at the `Quorate` line (`Yes`/`No`) and the `Votequorum information` block: `Expected votes`, `Highest expected`, and `Total votes` show how many nodes the cluster currently sees versus how many it needs. `pvecm nodes` lists each node's corosync membership state individually, which helps distinguish "one node is down" from "the ring network is flapping and nodes are dropping in and out."
+
+**Behavior**
+
+The CPI classifies this condition as retriable and injects an operator hint into the error message (`` cluster has lost quorum; mutations are blocked until quorum returns — check `pvecm status` ``) so the raw 5xx is not left anonymous in task output. Because quorum loss is a minutes-scale condition — waiting for a node to reboot or a network partition to heal takes far longer than a worker-pool hiccup — the CPI retries it on the storage-lock backoff curve (2 seconds → 30 seconds, 10 attempts, ±30% jitter) rather than the shorter transient-transport curve (1 second → 15 seconds, 8 attempts) used for ordinary 5xx errors. If quorum returns within that window, the retry succeeds transparently and the BOSH task shows no visible interruption beyond the added latency; if quorum does not return in time, the error escalates to the task log as a `RetriableCloudError` and the BOSH Director's own re-drive logic takes over on the next deploy or task retry.
+
+**Fix**
+
+Restore quorum: bring the missing node(s) back online, or resolve the corosync network partition. No CPI-side action is needed or possible — the CPI cannot restore cluster membership; it can only wait for `/etc/pve` to become writable again. Once `pvecm status` reports `Quorate: Yes`, mutating operations resume automatically on the next CPI retry.
+
 ## Task timeouts
 
 **Symptom**

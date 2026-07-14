@@ -60,6 +60,22 @@ func WrapError(err error) error {
 		return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, "network timeout: "+err.Error())
 	}
 
+	// Cluster quorum loss: /etc/pve becomes read-only cluster-wide and every
+	// mutating call fails, while read-only GETs keep succeeding. PVE surfaces
+	// this as either a 5xx APIError or plain task-body text, so this check
+	// runs before the generic APIError branch below — otherwise a quorum 5xx
+	// would fall into the generic "PVE server error" message and lose the
+	// operator-actionable hint. Retriable: quorum loss is a minutes-scale
+	// condition (node loss below majority, corosync partition) that clears
+	// once the cluster reforms a majority, so callers should route this onto
+	// the storage-lock retry curve (2s→30s, 10 attempts) rather than the
+	// shorter transport curve (1s→15s, 8 attempts) — see IsClusterNotQuorate's
+	// use in RetryOnTransientOrLock and RetryOnStorageLock (retry.go).
+	if IsClusterNotQuorate(err) {
+		return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
+			"cluster has lost quorum; mutations are blocked until quorum returns — check `pvecm status`: "+err.Error())
+	}
+
 	// SDK APIError: check HTTP code for 404 vs 5xx vs 429 vs other 4xx.
 	var apiErr *sdkerrors.APIError
 	if errors.As(err, &apiErr) {
@@ -352,6 +368,32 @@ func IsLVMCommandTimeout(err error) bool {
 	// "command X failed: got timeout" surfaces. /sbin/lv* and /sbin/vg*
 	// cover the LVM2 user-space binaries PVE shells out to.
 	return strings.Contains(msg, "/sbin/lv") || strings.Contains(msg, "/sbin/vg")
+}
+
+// IsClusterNotQuorate reports whether err signals that the PVE cluster has
+// lost quorum. Below-majority node loss (or a corosync network partition)
+// makes /etc/pve (the pmxcfs cluster filesystem) read-only cluster-wide:
+// every mutating call fails while read-only GETs continue to succeed. PVE
+// surfaces this as a 5xx APIError or as plain task-body text, matched
+// case-insensitively for either phrase:
+//
+//   - "not quorate" — e.g. "error writing config, cfs-lock failed - not quorate"
+//   - "no quorum"   — corosync/pmxcfs's own wording on some surfaces
+//
+// This is a MINUTES-scale condition, not a seconds-scale worker hiccup —
+// unlike a plain 5xx, retries should use the storage-lock curve (2s→30s, 10
+// attempts) rather than the shorter transport curve (1s→15s, 8 attempts).
+// See WrapError (which injects an operator-actionable hint into the wrapped
+// message) and RetryOnTransientOrLock / RetryOnStorageLock (which route
+// retries onto the storage-lock curve) in this package.
+//
+// nil → false.
+func IsClusterNotQuorate(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "not quorate") || strings.Contains(msg, "no quorum")
 }
 
 // IsSnapshotBlocked reports whether err signals that a PVE disk operation was

@@ -194,14 +194,20 @@ func PushbackBackoff(attempt int) time.Duration {
 	return out
 }
 
-// RetryOnStorageLock invokes op up to maxAttempts times, retrying only when
-// the returned error is a PVE per-storage lockfile timeout
-// (IsStorageLockTimeout). Other errors (or success) return immediately.
+// RetryOnStorageLock invokes op up to maxAttempts times, retrying when the
+// returned error is a PVE per-storage lockfile timeout (IsStorageLockTimeout)
+// OR a cluster quorum-loss condition (IsClusterNotQuorate). Other errors (or
+// success) return immediately.
 //
 // Used to absorb contention against /var/lock/pve-manager/pve-storage-<name>
 // from parallel qmcreate / qm resize / qm set / pvesm alloc / pvesm free
-// operations during bursts of concurrent CPI calls. Backoff is the package's
-// StorageLockBackoff curve. ctx cancellation short-circuits the sleep.
+// operations during bursts of concurrent CPI calls, and to pace retries
+// through a below-majority quorum loss on the same seconds-scale curve
+// (quorum loss is minutes-scale, not seconds, but a single retry attempt
+// costs nothing extra and the curve's 30s cap × 10 attempts gives roughly
+// enough total wall time to span a brief partition without requiring a
+// dedicated third curve). Backoff is the package's StorageLockBackoff curve.
+// ctx cancellation short-circuits the sleep.
 //
 // label is an opaque tag used in the retry-log line (e.g. "create_disk",
 // "configdrive_upload") so operators can see which surface is contending.
@@ -224,7 +230,9 @@ func RetryOnStorageLock(
 		if err == nil {
 			return nil
 		}
-		if !IsStorageLockTimeout(err) {
+		isLock := IsStorageLockTimeout(err)
+		isQuorum := IsClusterNotQuorate(err)
+		if !isLock && !isQuorum {
 			return err
 		}
 		lastErr = err
@@ -236,7 +244,11 @@ func RetryOnStorageLock(
 			d = override(attempt)
 		}
 		if logger != nil {
-			logger.Info("pve: storage lock timeout, retrying",
+			logMsg := "pve: storage lock timeout, retrying"
+			if isQuorum {
+				logMsg = "pve: cluster not quorate, retrying"
+			}
+			logger.Info(logMsg,
 				log.String("op", label),
 				log.Int("attempt", attempt+1),
 				log.Int("max_attempts", maxAttempts),
@@ -322,12 +334,19 @@ func RetryOnTransient(
 
 // retryOrLockCurve selects the backoff curve and reason label for a
 // RetryOnTransientOrLock retry iteration. Pushback takes priority (longest
-// curve) because worker-pool saturation is the most conservative condition;
-// within non-pushback errors, storage-lock dominates transient transport.
-func retryOrLockCurve(isPushback, isLock bool, attempt int) (d time.Duration, reason string) {
+// curve) because worker-pool saturation is the most conservative condition.
+// Quorum loss and storage-lock contention share the StorageLockBackoff curve
+// (2s→30s) — both are "wait for someone else to finish/recover" conditions on
+// a similar timescale, distinct from the shorter transient-transport curve
+// used as the default fallback. isQuorum is checked before isLock only to
+// give the log line an accurate reason label; the curve is identical either
+// way.
+func retryOrLockCurve(isPushback, isLock, isQuorum bool, attempt int) (d time.Duration, reason string) {
 	switch {
 	case isPushback:
 		return PushbackBackoff(attempt), "pushback"
+	case isQuorum:
+		return StorageLockBackoff(attempt), "cluster_not_quorate"
 	case isLock:
 		return StorageLockBackoff(attempt), "storage_lock"
 	default:
@@ -337,18 +356,27 @@ func retryOrLockCurve(isPushback, isLock bool, attempt int) (d time.Duration, re
 
 // RetryOnTransientOrLock invokes op up to maxAttempts times, retrying when the
 // returned error is a per-storage lockfile timeout (IsStorageLockTimeout), a
-// transient transport-layer fault (IsTransientTransport), or a PVE rate-limit /
-// worker-pool exhaustion signal (IsPVEPushback). Backoff curve priority:
-// pushback (PushbackBackoff) > storage lock (StorageLockBackoff) > transient
-// (TransientBackoff). Pushback is the most conservative because worker-pool
-// saturation takes the longest to drain.
+// cluster quorum-loss condition (IsClusterNotQuorate), a transient transport-
+// layer fault (IsTransientTransport), or a PVE rate-limit / worker-pool
+// exhaustion signal (IsPVEPushback). Backoff curve priority: pushback
+// (PushbackBackoff) > quorum loss / storage lock (StorageLockBackoff) >
+// transient (TransientBackoff). Pushback is the most conservative because
+// worker-pool saturation takes the longest to drain.
 //
-// Use for storage-touching SDK calls that may collide on any of the three
+// Quorum loss rides the storage-lock curve rather than the transient curve
+// deliberately: a quorum 5xx also satisfies IsTransientTransport (it is a
+// plain 5xx at the transport level), so without this explicit routing it
+// would fall through to the shorter TransientBackoff curve (1s→15s, 8
+// attempts) — mismatched to a minutes-scale condition (node loss below
+// majority, corosync partition) that the seconds-scale worker-cycling curve
+// was never tuned for.
+//
+// Use for storage-touching SDK calls that may collide on any of these
 // conditions. Backoff continues from a single attempt counter across all
 // failure modes.
 //
 // maxAttempts ≤ 0 falls back to DefaultStorageLockMaxAttempts (the longer of
-// the non-pushback budgets — the helper subsumes all three failure modes).
+// the non-pushback budgets — the helper subsumes all failure modes).
 func RetryOnTransientOrLock(
 	ctx context.Context,
 	logger *log.Logger,
@@ -367,15 +395,16 @@ func RetryOnTransientOrLock(
 		}
 		isPushback := IsPVEPushback(err)
 		isLock := IsStorageLockTimeout(err)
+		isQuorum := IsClusterNotQuorate(err)
 		isTransient := IsTransientTransport(err)
-		if !isPushback && !isLock && !isTransient {
+		if !isPushback && !isLock && !isQuorum && !isTransient {
 			return err
 		}
 		lastErr = err
 		if attempt == maxAttempts-1 {
 			break
 		}
-		d, reason := retryOrLockCurve(isPushback, isLock, attempt)
+		d, reason := retryOrLockCurve(isPushback, isLock, isQuorum, attempt)
 		if override := backoffFromCtx(ctx); override != nil {
 			d = override(attempt)
 		}
