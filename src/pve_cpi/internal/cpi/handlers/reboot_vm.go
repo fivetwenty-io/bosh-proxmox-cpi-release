@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"strings"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
 
@@ -148,11 +149,24 @@ func rebootVMHardReset(ctx context.Context, deps Deps, logger *log.Logger, node 
 	return nil, nil
 }
 
+// vmAlreadyRunning reports whether a start rejection says the VM is already
+// running — PVE's qmstart (call and task result alike) fails with
+// "VM <vmid> already running". On the reboot start-a-stopped-VM path this is
+// the desired end state, not a fault: the status probe can transiently read
+// "stopped" right after a graceful reboot task completes (the old QEMU
+// process is gone, the new one not yet registered), and the start the CPI
+// then issues loses the race to the reboot's own start.
+func vmAlreadyRunning(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "already running")
+}
+
 // rebootVMHandleStopped starts a stopped VM instead of rebooting it.
 //
 // Inputs: ctx, deps, logger, node, vmid, vmCID — all validated by the caller.
 // Failure modes:
 //   - 404 → VMNotFound.
+//   - start rejected or start task failed with "already running" → success
+//     (the VM is in the state reboot_vm exists to produce; see vmAlreadyRunning).
 //   - other → CloudError via WrapError.
 //   - await fails → wrapped CloudError.
 //   - empty UPID → synchronous start, no await needed.
@@ -168,10 +182,18 @@ func rebootVMHandleStopped(ctx context.Context, deps Deps, logger *log.Logger, n
 		if pve.IsNotFound(startErr) {
 			return nil, cpierrors.VMNotFound(vmCID)
 		}
+		if vmAlreadyRunning(startErr) {
+			logger.Info("reboot_vm: start raced a concurrent boot; VM already running — success")
+			return nil, nil
+		}
 		return nil, cpierrors.Wrap(pve.WrapError(startErr), fmt.Sprintf("reboot_vm: start stopped VM %s", vmCID))
 	}
 	if startUPID != "" {
 		if awaitErr := pve.AwaitTaskWithLogger(ctx, deps.PVE, node, startUPID, logger); awaitErr != nil {
+			if vmAlreadyRunning(awaitErr) {
+				logger.Info("reboot_vm: start task raced a concurrent boot; VM already running — success")
+				return nil, nil
+			}
 			return nil, cpierrors.Wrap(pve.WrapError(awaitErr), fmt.Sprintf("reboot_vm: await start task for VM %s", vmCID))
 		}
 	}

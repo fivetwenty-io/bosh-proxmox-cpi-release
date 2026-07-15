@@ -371,6 +371,64 @@ func TestHandleRebootVM_StoppedStartError(t *testing.T) {
 }
 
 // --------------------------------------------------------------------------
+// f2. Stopped→start races a concurrent boot: "already running" is success.
+// The status probe can transiently read "stopped" right after a graceful
+// reboot task completes; the start the CPI then issues loses the race to the
+// reboot's own start and must not surface an error.
+// --------------------------------------------------------------------------
+
+func TestHandleRebootVM_StoppedStartAlreadyRunning_CallRejected(t *testing.T) {
+	t.Parallel()
+
+	qemuSvc := &mockQEMUService{
+		statusFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return map[string]any{"status": "stopped"}, nil
+		},
+		startFn: func(_ context.Context, _ string, _ int) (string, error) {
+			return "", errors.New("500 VM 101 already running")
+		},
+	}
+
+	h := handlers.HandleRebootVM(testDepsReboot(qemuSvc, nil, nil, "soft"))
+	result, err := h.Handle(context.Background(), marshalArgs("101"), jsonrpc.Context{})
+
+	if err != nil {
+		t.Fatalf("already-running start rejection must be success, got: %v", err)
+	}
+	if result != nil {
+		t.Errorf("expected nil result, got %v", result)
+	}
+}
+
+func TestHandleRebootVM_StoppedStartAlreadyRunning_TaskFailed(t *testing.T) {
+	t.Parallel()
+
+	qemuSvc := &mockQEMUService{
+		statusFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return map[string]any{"status": "stopped"}, nil
+		},
+		startFn: func(_ context.Context, _ string, _ int) (string, error) {
+			return "UPID:node:start-task", nil
+		},
+	}
+	tasksSvc := &mockTasksService{
+		waitFn: func(_ context.Context, _, _ string, _ *tasks.WaitOptions) (*tasks.Status, error) {
+			return nil, errors.New("PVE error: task failed: VM 101 already running")
+		},
+	}
+
+	h := handlers.HandleRebootVM(testDepsReboot(qemuSvc, nil, tasksSvc, "soft"))
+	result, err := h.Handle(context.Background(), marshalArgs("101"), jsonrpc.Context{})
+
+	if err != nil {
+		t.Fatalf("already-running start task must be success, got: %v", err)
+	}
+	if result != nil {
+		t.Errorf("expected nil result, got %v", result)
+	}
+}
+
+// --------------------------------------------------------------------------
 // g. Status 404 → VMNotFound.
 // --------------------------------------------------------------------------
 
