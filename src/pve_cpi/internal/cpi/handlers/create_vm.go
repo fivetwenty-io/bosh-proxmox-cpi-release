@@ -2762,15 +2762,16 @@ func resolveVMShapeStorage(cfg *config.CPIConfig, parsed *createVMParsedArgs, ti
 // resolveVMShapeCPUMem returns cores, sockets, and memory (MiB) honoring two
 // cloud_properties conventions: vSphere-style (cpu = total vCPU count) and
 // PVE-native (cores/sockets explicit). Explicit cores/sockets win when present;
-// otherwise cp.CPU becomes cores with a single socket. Defaults are 1 vCPU and
-// 512 MiB.
+// otherwise cp.CPU becomes cores with a single socket. Defaults are 2 vCPUs
+// (PVE guidance: never single-thread a guest, however light the workload) and
+// 512 MiB. An explicit cores/cpu value of 1 is honored as given.
 func resolveVMShapeCPUMem(cp createVMCloudProps) (cores, sockets, memMiB int) {
 	cores = cp.Cores
 	if cores <= 0 && cp.CPU > 0 {
 		cores = cp.CPU
 	}
 	if cores <= 0 {
-		cores = 1
+		cores = 2
 	}
 	sockets = cp.Sockets
 	if sockets <= 0 {
@@ -2792,9 +2793,13 @@ func resolveVMShapeCPUMem(cp createVMCloudProps) (cores, sockets, memMiB int) {
 //  1. cloud_properties.cpu_type — resolved through the layered resolver, so a
 //     per-call value wins over a disk_type profile value, which wins over a
 //     vm_type profile value (the resolver's normal precedence order).
-//  2. config.CPUTypeValue() — the pve.cpu_type global default.
-//  3. "" — no "cpu" key is ever written; PVE falls back to its own default
-//     (kvm64). This is the zero-behavior-change path when neither is set.
+//  2. config.CPUTypeValue() — the pve.cpu_type global value, which
+//     ApplyDefaults fills with config.DefaultCPUType (x86-64-v2-AES) when the
+//     operator leaves it unset.
+//
+// At either layer the config.CPUTypePVEDefault sentinel ("pve-default")
+// resolves to "": no "cpu" key is written and PVE falls back to its own API
+// default (kvm64). This is the escape hatch back to pre-default behavior.
 //
 // cloud_properties.pve_config.cpu is a distinct, later mechanism (applied via
 // applyPVEConfigPassthrough after this value is already written) and is not
@@ -2803,6 +2808,9 @@ func resolveVMShapeCPUMem(cp createVMCloudProps) (cores, sockets, memMiB int) {
 // function.
 func resolveVMShapeCPUType(r *layeredResolver, cfg *config.CPIConfig) string {
 	if v, found := r.String("cpu_type"); found {
+		if strings.TrimSpace(v) == config.CPUTypePVEDefault {
+			return ""
+		}
 		return v
 	}
 	return cfg.CPUTypeValue()
@@ -3423,8 +3431,9 @@ func attemptCreateVM(
 // applyOptionalCreateParams adds the import-path createParams keys that are
 // only emitted when their resolved shape value is non-default: numa, sockets
 // (only when > 1, matching the historic single-socket-is-implicit default),
-// initial tags, cpu (cloud_properties.cpu_type / pve.cpu_type — absent means
-// PVE keeps its own kvm64 default, byte-identical to prior releases), and
+// initial tags, cpu (cloud_properties.cpu_type / pve.cpu_type — defaulted to
+// x86-64-v2-AES by ApplyDefaults; empty only via the "pve-default" sentinel,
+// which means PVE keeps its own kvm64 default), and
 // pool (pve.vm_pool — absent means no pool assignment, byte-identical to
 // every release before that property existed).
 // Extracted from attemptCreateVM to keep that function's cognitive complexity
@@ -3861,11 +3870,12 @@ func cloneFromTemplate(
 		resourceParams.Scsihw = &scsiVal
 	}
 	// Apply cpu type only when resolved (cloud_properties.cpu_type or the
-	// global pve.cpu_type default); absent means PVE keeps its own kvm64
-	// default on the cloned VM — byte-identical to prior releases. The
-	// clone inherits the template's "cpu" value (templates carry no explicit
-	// cpu setting either), so this is the same "unset means unset" contract
-	// as the import path.
+	// global pve.cpu_type value, which ApplyDefaults fills with
+	// x86-64-v2-AES); empty only via the "pve-default" sentinel, in which
+	// case PVE keeps its own kvm64 default on the cloned VM. The clone
+	// inherits the template's "cpu" value (templates carry no explicit cpu
+	// setting either), so the sentinel path is the same "unset means unset"
+	// contract as the import path.
 	if shape.cpuType != "" {
 		cpuVal := shape.cpuType
 		resourceParams.Cpu = &cpuVal

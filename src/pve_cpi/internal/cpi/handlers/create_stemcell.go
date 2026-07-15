@@ -971,8 +971,13 @@ func attemptCreateTemplateVM(
 		rootKey:         rootDiskVal,
 		"boot":          "order=" + rootKey,
 		"agent":         "enabled=0",
-		"onboot":        0,
-		jsonKeyTags:     strings.Join(baseTags, ";"),
+		// tablet=0 on the template itself: create_vm's clone patch already
+		// forces it on every CPI-created clone, but a template carrying the
+		// PVE default (tablet on) would leak it into any clone an operator
+		// makes by hand from a CPI-managed template.
+		"tablet":    0,
+		"onboot":    0,
+		jsonKeyTags: strings.Join(baseTags, ";"),
 	}
 
 	// initialCID is the BOSH stemcell CID for this template ("template:<vmid>").

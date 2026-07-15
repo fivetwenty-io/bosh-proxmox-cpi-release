@@ -2553,6 +2553,30 @@ func minimalParsedArgsWithCP(stemcellStorage string, cpMap map[string]any) *crea
 	return p
 }
 
+// TestResolveVMShapeCPUMem_Defaults verifies the built-in shape defaults:
+// two cores (PVE guidance — never single-thread a guest), one socket, and
+// 512 MiB, with explicit values (including cores: 1) honored as given.
+func TestResolveVMShapeCPUMem_Defaults(t *testing.T) {
+	t.Parallel()
+
+	cores, sockets, memMiB := resolveVMShapeCPUMem(createVMCloudProps{})
+	if cores != 2 || sockets != 1 || memMiB != 512 {
+		t.Errorf("defaults = (%d cores, %d sockets, %d MiB); want (2, 1, 512)", cores, sockets, memMiB)
+	}
+
+	// Explicit single core is honored — the 2-core default only fills absence.
+	cores, _, _ = resolveVMShapeCPUMem(createVMCloudProps{Cores: 1})
+	if cores != 1 {
+		t.Errorf("explicit cores=1 resolved to %d; want 1", cores)
+	}
+
+	// vSphere-style cpu convention still maps to cores.
+	cores, sockets, _ = resolveVMShapeCPUMem(createVMCloudProps{CPU: 4})
+	if cores != 4 || sockets != 1 {
+		t.Errorf("cpu=4 resolved to (%d cores, %d sockets); want (4, 1)", cores, sockets)
+	}
+}
+
 // TestResolveVMShapeStorage_NoProfile_UsesConfigVMStorage verifies byte-identical
 // behavior when no vm_type profile or storage_pool override is present: vmStorage
 // equals config.VMStorage.

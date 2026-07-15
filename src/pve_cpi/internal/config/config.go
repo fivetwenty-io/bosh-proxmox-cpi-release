@@ -164,18 +164,20 @@ type CPIConfig struct {
 	LogLevel     string `json:"log_level,omitempty"`
 
 	// CPUType is the emulated CPU type/model PVE writes to the new VM's
-	// "cpu" config key (e.g. "x86-64-v2-AES", "host"). Empty (the default)
-	// means the CPI writes no cpu key at all — PVE falls back to its own
-	// default (kvm64, which lacks AES-NI). Per-VM
+	// "cpu" config key (e.g. "x86-64-v2-AES", "host"). Empty is filled by
+	// ApplyDefaults with DefaultCPUType ("x86-64-v2-AES" — PVE's own create-
+	// wizard default since 8.0; the API-level fallback kvm64 lacks AES-NI,
+	// a fleet-wide tax on TLS-heavy BOSH workloads). The sentinel value
+	// CPUTypePVEDefault ("pve-default") restores the legacy behavior: the
+	// CPI writes no cpu key at all and PVE falls back to kvm64. Per-VM
 	// cloud_properties.cpu_type — resolved through the same
 	// call/disk_type/vm_type layered resolver as other create_vm knobs —
 	// takes precedence over this global default when both are set.
 	// cloud_properties.pve_config.cpu is a separate raw escape hatch applied
 	// after this value in the create_vm sequence, so it always wins as the
 	// final write when both are set. Use CPUTypeValue() for the effective,
-	// whitespace-trimmed string. Validate-only-when-set (PVE validates the
-	// model name itself; the CPI passes the value through verbatim); omit
-	// from ERB when empty.
+	// whitespace-trimmed, sentinel-resolved string. PVE validates the model
+	// name itself; the CPI passes the value through verbatim.
 	CPUType string `json:"cpu_type,omitempty"`
 
 	// Hotplug is the PVE `hotplug` flag baked into every new VM. Comma-list of
@@ -1588,6 +1590,18 @@ func (c *CPIConfig) validateStrictUnknownKeys(raw []byte, errs *[]string) {
 // unbounded io.ReadAll allocation.
 const MaxConfigBytes = 1 << 20
 
+// DefaultCPUType is the CPU model ApplyDefaults writes into CPUType when the
+// operator leaves pve.cpu_type unset. x86-64-v2-AES is PVE's own create-wizard
+// default since 8.0: broad enough to live-migrate across CPU generations from
+// roughly 2010 onward, and it keeps AES-NI (which the API-level kvm64 fallback
+// strips).
+const DefaultCPUType = "x86-64-v2-AES"
+
+// CPUTypePVEDefault is the sentinel operators set (globally via pve.cpu_type
+// or per instance group via cloud_properties.cpu_type) to make the CPI write
+// no "cpu" key at all, so PVE falls back to its own API default (kvm64).
+const CPUTypePVEDefault = "pve-default"
+
 // Load decodes CPIConfig from r, applies defaults, then validates.
 // Unknown JSON fields are logged at Warn level and ignored to preserve
 // forward-compatibility with future BOSH director versions.
@@ -1719,6 +1733,9 @@ func (c *CPIConfig) ApplyDefaults() {
 	if c.NUMA == nil {
 		t := true
 		c.NUMA = &t
+	}
+	if strings.TrimSpace(c.CPUType) == "" {
+		c.CPUType = DefaultCPUType
 	}
 	if c.CreateEnvDeployment == "" {
 		c.CreateEnvDeployment = "create-env"
@@ -1883,14 +1900,21 @@ func (c *CPIConfig) HotplugValue() string {
 }
 
 // CPUTypeValue returns the effective global CPU type/model, trimmed of
-// surrounding whitespace. Empty ("") means no cpu key is written by default
-// (the CPI's zero-behavior-change default) — callers only emit a "cpu" key
-// when this (or the higher-precedence cloud_properties.cpu_type) is non-empty.
+// surrounding whitespace. The CPUTypePVEDefault sentinel resolves to "" —
+// callers only emit a "cpu" key when the result is non-empty, so the sentinel
+// means "write no cpu key; let PVE fall back to its kvm64 API default". On a
+// config that went through ApplyDefaults an empty CPUType has already been
+// filled with DefaultCPUType; "" here only survives for nil or never-defaulted
+// configs.
 func (c *CPIConfig) CPUTypeValue() string {
 	if c == nil {
 		return ""
 	}
-	return strings.TrimSpace(c.CPUType)
+	v := strings.TrimSpace(c.CPUType)
+	if v == CPUTypePVEDefault {
+		return ""
+	}
+	return v
 }
 
 // NUMAValue returns the effective NUMA toggle, defaulting to true (memory

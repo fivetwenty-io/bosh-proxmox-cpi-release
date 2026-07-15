@@ -10,8 +10,9 @@ import (
 // pve.cpu_type tests
 // ---------------------------------------------------------------------------
 
-// TestCPUTypeValue_DefaultEmpty verifies the gate is disabled (empty string)
-// by default: nil receiver and zero-value config both resolve to "".
+// TestCPUTypeValue_DefaultEmpty verifies nil receiver and never-defaulted
+// zero-value config both resolve to "" (ApplyDefaults is what fills the
+// x86-64-v2-AES default; these configs never went through it).
 func TestCPUTypeValue_DefaultEmpty(t *testing.T) {
 	t.Parallel()
 	var nilCfg *config.CPIConfig
@@ -20,6 +21,16 @@ func TestCPUTypeValue_DefaultEmpty(t *testing.T) {
 	}
 	if got := (&config.CPIConfig{}).CPUTypeValue(); got != "" {
 		t.Errorf("zero-value config: CPUTypeValue() = %q; want \"\"", got)
+	}
+}
+
+// TestCPUTypeValue_PVEDefaultSentinel verifies the "pve-default" sentinel
+// resolves to "" so callers write no cpu key and PVE keeps its kvm64 default.
+func TestCPUTypeValue_PVEDefaultSentinel(t *testing.T) {
+	t.Parallel()
+	cfg := &config.CPIConfig{CPUType: "  " + config.CPUTypePVEDefault + "  "}
+	if got := cfg.CPUTypeValue(); got != "" {
+		t.Errorf("sentinel: CPUTypeValue() = %q; want \"\"", got)
 	}
 }
 
@@ -57,10 +68,10 @@ func TestCPUType_JSONRoundTrip(t *testing.T) {
 	}
 }
 
-// TestCPUType_AbsentFromJSON_NoErrorNoBehaviorChange verifies a manifest that
-// never sets cpu_type loads without error and resolves to disabled — the
-// additive, zero-behavior-change contract.
-func TestCPUType_AbsentFromJSON_NoErrorNoBehaviorChange(t *testing.T) {
+// TestCPUType_AbsentFromJSON_DefaultsToV2AES verifies a manifest that never
+// sets cpu_type loads without error and resolves to the built-in
+// x86-64-v2-AES default (PVE's own create-wizard default; keeps AES-NI).
+func TestCPUType_AbsentFromJSON_DefaultsToV2AES(t *testing.T) {
 	t.Parallel()
 	cfg, err := mustLoad(t, `{
 		"host": "h", "user": "u", "password": "p",
@@ -69,7 +80,25 @@ func TestCPUType_AbsentFromJSON_NoErrorNoBehaviorChange(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load returned unexpected error: %v", err)
 	}
+	if got := cfg.CPUTypeValue(); got != config.DefaultCPUType {
+		t.Errorf("CPUTypeValue() = %q; want %q when cpu_type is absent from the manifest", got, config.DefaultCPUType)
+	}
+}
+
+// TestCPUType_SentinelFromJSON_WritesNoCPUKey verifies the "pve-default"
+// sentinel survives Load/ApplyDefaults and resolves to "" (legacy behavior:
+// no cpu key written, PVE falls back to kvm64).
+func TestCPUType_SentinelFromJSON_WritesNoCPUKey(t *testing.T) {
+	t.Parallel()
+	cfg, err := mustLoad(t, `{
+		"host": "h", "user": "u", "password": "p",
+		"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
+		"cpu_type": "pve-default"
+	}`)
+	if err != nil {
+		t.Fatalf("Load returned unexpected error: %v", err)
+	}
 	if got := cfg.CPUTypeValue(); got != "" {
-		t.Errorf("CPUTypeValue() = %q; want \"\" when cpu_type is absent from the manifest", got)
+		t.Errorf("CPUTypeValue() = %q; want \"\" for the pve-default sentinel", got)
 	}
 }

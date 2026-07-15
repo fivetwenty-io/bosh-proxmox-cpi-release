@@ -26,15 +26,31 @@ Property names and defaults are cross-referenced to [Configuration reference](co
 
 **Best practice.** The default `kvm64` CPU model lacks AES-NI, taxing every TLS handshake a BOSH workload makes; pinning `host` exposes the exact physical feature set and crashes on migration to a differently generationed node.
 
-**CPI behavior.** `pve.cpu_type` sets the `cpu` model on every VM when configured; `cloud_properties.cpu_type` overrides it per instance group. It is empty by default — an unset value writes no `cpu` key at all, so a new deployment gets PVE's own `kvm64` default unless the operator names a model.
+**CPI behavior.** `pve.cpu_type` defaults to `x86-64-v2-AES` — the same model PVE's own creation wizard has defaulted to since 8.0: a named baseline broad enough to live-migrate across CPU generations from roughly 2010 onward, and it keeps AES-NI. `cloud_properties.cpu_type` overrides it per instance group. The sentinel value `pve-default` (at either layer) writes no `cpu` key at all, restoring PVE's API-level `kvm64` fallback for clusters that need it.
 
-**Status.** Configurable — recommended: `x86-64-v2-AES` for a single-CPU-generation cluster, or the cluster's lowest-common-denominator named model for a mixed one. Avoid `host` wherever live migration is possible.
+**Status.** Meets — for hardware older than the `x86-64-v2-AES` baseline, set the cluster's lowest-common-denominator named model instead. Avoid `host` wherever live migration is possible.
+
+**A minimum of two cores per VM.**
+
+**Best practice.** A single-vCPU guest serializes every kernel thread, interrupt handler, and application thread behind one thread of execution; two cores is the sensible floor for any VM regardless of how light its workload is.
+
+**CPI behavior.** When neither `cloud_properties.cores` nor the vSphere-style `cloud_properties.cpu` names a vCPU count, the CPI defaults to 2 cores. An explicit `cores: 1` is honored as given — the floor fills absence, it does not override intent.
+
+**Status.** Meets.
+
+**Machine type left to PVE.**
+
+**Best practice.** PVE's default `i440fx` machine type is the right answer for Linux server guests; `q35` matters when a guest needs PCIe passthrough (`hostpciN` with `pcie=1`) or other PCIe-native topology.
+
+**CPI behavior.** The CPI never writes a `machine` key — VMs get PVE's `i440fx` default. Operators who pass through PCIe devices can set `cloud_properties.pve_config.machine` (allowlisted) to `q35` on the affected instance groups.
+
+**Status.** Configurable — set `pve_config.machine: q35` only alongside PCIe passthrough; otherwise leave unset.
 
 **Tablet disabled on headless VMs.**
 
 **Best practice.** The emulated USB tablet exists to reconcile absolute mouse coordinates for a graphical console session; a BOSH VM never has one, and the device costs roughly 2-3% CPU per VM at scale for nothing.
 
-**CPI behavior.** The CPI writes `tablet: 0` unconditionally on every VM it creates, on both the import and clone paths. There is no opt-out knob — every BOSH VM is headless by construction, so there is nothing to reconcile.
+**CPI behavior.** The CPI writes `tablet: 0` unconditionally on every VM it creates, on both the import and clone paths, and on the stemcell templates it builds (so even a hand-made clone from a CPI template inherits tablet-off). There is no opt-out knob — every BOSH VM is headless by construction, so there is nothing to reconcile.
 
 **Status.** Exceeds — PVE's own default leaves the tablet on; the CPI turns it off unconditionally rather than leaving that tax to the operator to discover.
 

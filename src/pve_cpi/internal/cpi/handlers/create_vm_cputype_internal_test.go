@@ -11,12 +11,32 @@ import (
 // ---------------------------------------------------------------------------
 
 // TestResolveVMShapeCPUType_NeitherSet_Empty verifies absent everywhere
-// resolves to "" — the zero-behavior-change default (no "cpu" key written).
+// resolves to "" on a never-defaulted config (production configs pass through
+// ApplyDefaults, which fills CPUType with config.DefaultCPUType first).
 func TestResolveVMShapeCPUType_NeitherSet_Empty(t *testing.T) {
 	t.Parallel()
 	r := buildResolver(t, map[string]any{})
 	if got := resolveVMShapeCPUType(r, &config.CPIConfig{}); got != "" {
 		t.Errorf("resolveVMShapeCPUType() = %q; want \"\" when unset everywhere", got)
+	}
+}
+
+// TestResolveVMShapeCPUType_SentinelSuppressesCPUKey verifies the
+// "pve-default" sentinel resolves to "" at both layers: as the global config
+// value, and as a cloud_properties value overriding a real global default.
+func TestResolveVMShapeCPUType_SentinelSuppressesCPUKey(t *testing.T) {
+	t.Parallel()
+	// Global sentinel → "".
+	r1 := buildResolver(t, map[string]any{})
+	cfg := &config.CPIConfig{CPUType: config.CPUTypePVEDefault}
+	if got := resolveVMShapeCPUType(r1, cfg); got != "" {
+		t.Errorf("resolveVMShapeCPUType() = %q; want \"\" for global sentinel", got)
+	}
+	// Cloud-properties sentinel beats a real global value → "".
+	r2 := buildResolver(t, map[string]any{"cpu_type": " " + config.CPUTypePVEDefault + " "})
+	cfgReal := &config.CPIConfig{CPUType: "x86-64-v2-AES"}
+	if got := resolveVMShapeCPUType(r2, cfgReal); got != "" {
+		t.Errorf("resolveVMShapeCPUType() = %q; want \"\" for cloud_properties sentinel", got)
 	}
 }
 
