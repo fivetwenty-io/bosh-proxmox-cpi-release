@@ -464,3 +464,56 @@ func TestJitterSource_Seam(t *testing.T) {
 		t.Errorf("jitterSource seam not wired: same seed produced different outputs (%v vs %v)", first, second)
 	}
 }
+
+func TestRetryOnTransientOrUnplugBusy_RetriesBusyThenSucceeds(t *testing.T) {
+	t.Parallel()
+	ctx := WithTestBackoff(context.Background(), func(int) time.Duration { return 0 })
+	busy := errors.New("API request failed: parameter error: Parameter verification failed. (code: 0, errors: scsi1: hotplug problem - error on hot-unplugging device 'virtioscsi1' - still busy in guest?)")
+	calls := 0
+	err := RetryOnTransientOrUnplugBusy(ctx, nil, "test", 4, func() error {
+		calls++
+		if calls < 3 {
+			return busy
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if calls != 3 {
+		t.Fatalf("expected 3 calls, got %d", calls)
+	}
+}
+
+func TestRetryOnTransientOrUnplugBusy_ExhaustsBusyBudget(t *testing.T) {
+	t.Parallel()
+	ctx := WithTestBackoff(context.Background(), func(int) time.Duration { return 0 })
+	busy := errors.New("scsi1: hotplug problem - error on hot-unplugging device 'virtioscsi1' - still busy in guest?")
+	calls := 0
+	err := RetryOnTransientOrUnplugBusy(ctx, nil, "test", 2, func() error {
+		calls++
+		return busy
+	})
+	if !errors.Is(err, busy) {
+		t.Fatalf("expected exhausted error to be the busy error, got %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("expected 2 calls (max), got %d", calls)
+	}
+}
+
+func TestRetryOnTransientOrUnplugBusy_NonRetryablePropagates(t *testing.T) {
+	t.Parallel()
+	perm := errors.New("Parameter verification failed. (code: 0, errors: scsi1: invalid format)")
+	calls := 0
+	err := RetryOnTransientOrUnplugBusy(context.Background(), nil, "test", 5, func() error {
+		calls++
+		return perm
+	})
+	if !errors.Is(err, perm) {
+		t.Fatalf("expected permanent error back, got %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("expected exactly 1 call, got %d", calls)
+	}
+}

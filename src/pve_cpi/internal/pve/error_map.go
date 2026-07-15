@@ -314,6 +314,27 @@ func IsTransientTransport(err error) bool {
 	return false
 }
 
+// IsHotUnplugBusy reports whether err is PVE's hot-unplug rejection for a
+// disk the guest has not yet released:
+//
+//	scsi1: hotplug problem - error on hot-unplugging device 'virtioscsi1' - still busy in guest?
+//
+// PVE surfaces it inside a parameter-verification failure (HTTP 400), which
+// the transport classifiers treat as permanent — but the condition is a
+// settling window, not a verdict: QEMU can keep the drive busy for a few
+// seconds after a snapshot or an I/O burst, and the same unplug succeeds on
+// retry. A disk the guest genuinely holds (still mounted) keeps failing and
+// surfaces after the bounded retry budget.
+//
+// nil → false.
+func IsHotUnplugBusy(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "hotplug problem") && strings.Contains(msg, "busy in guest")
+}
+
 // IsStorageLockTimeout reports whether err signals a transient PVE storage-
 // backend stall. Two shapes are covered, both surfaced inside qmtask output:
 //

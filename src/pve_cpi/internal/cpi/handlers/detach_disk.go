@@ -196,7 +196,7 @@ func HandleDetachDisk(deps Deps) Handler {
 		// SDK ≥ v3.1.2 sweeps any unusedN slot PVE auto-creates on detach,
 		// so the disk is fully removed from the VM config and survives a
 		// subsequent delete_vm DELETE. No additional cleanup required here.
-		if err := pve.RetryOnTransient(ctx, deps.Log(ctx), "detach_disk", 0, func() error {
+		if err := pve.RetryOnTransientOrUnplugBusy(ctx, deps.Log(ctx), "detach_disk", 0, func() error {
 			return deps.PVE.QEMU().DetachDisk(ctx, node, vmid, diskID)
 		}); err != nil {
 			wrapped := pve.WrapError(err)

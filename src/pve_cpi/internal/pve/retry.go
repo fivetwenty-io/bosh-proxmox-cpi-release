@@ -426,3 +426,71 @@ func RetryOnTransientOrLock(
 	}
 	return lastErr
 }
+
+// RetryOnTransientOrUnplugBusy invokes op like RetryOnTransient — retrying
+// transport faults (IsTransientTransport) and pushback (IsPVEPushback) — and
+// additionally retries PVE's hot-unplug "still busy in guest" rejection
+// (IsHotUnplugBusy) on the same TransientBackoff curve. QEMU can hold a drive
+// busy for a few seconds after a snapshot or an I/O burst; the settle window
+// fits comfortably inside the transient budget (~30s across
+// DefaultTransientMaxAttempts), while a disk the guest genuinely holds keeps
+// failing and surfaces after the bound.
+//
+// Use for hot-unplug config edits (detach_disk); other callers have no
+// hot-unplug surface and should stay on RetryOnTransient.
+//
+// maxAttempts ≤ 0 falls back to DefaultTransientMaxAttempts.
+func RetryOnTransientOrUnplugBusy(
+	ctx context.Context,
+	logger *log.Logger,
+	label string,
+	maxAttempts int,
+	op func() error,
+) error {
+	if maxAttempts <= 0 {
+		maxAttempts = DefaultTransientMaxAttempts
+	}
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		err := op()
+		if err == nil {
+			return nil
+		}
+		isPushback := IsPVEPushback(err)
+		isBusy := IsHotUnplugBusy(err)
+		if !isPushback && !isBusy && !IsTransientTransport(err) {
+			return err
+		}
+		lastErr = err
+		if attempt == maxAttempts-1 {
+			break
+		}
+		d := TransientBackoff(attempt)
+		reason := "transient_transport"
+		if isPushback {
+			d = PushbackBackoff(attempt)
+			reason = "pve_pushback"
+		} else if isBusy {
+			reason = "hot_unplug_busy"
+		}
+		if override := backoffFromCtx(ctx); override != nil {
+			d = override(attempt)
+		}
+		if logger != nil {
+			logger.Info("pve: retrying after retryable fault",
+				log.String("op", label),
+				log.String("reason", reason),
+				log.Int("attempt", attempt+1),
+				log.Int("max_attempts", maxAttempts),
+				log.Int("backoff_ms", int(d/time.Millisecond)),
+				log.String("error", err.Error()),
+			)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(d):
+		}
+	}
+	return lastErr
+}

@@ -1246,3 +1246,27 @@ func TestWrapVMConfigLocked_LockedError_RetriableAndActionable(t *testing.T) {
 		}
 	}
 }
+
+func TestIsHotUnplugBusy(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"real PVE message", errors.New("API request failed: parameter error: Parameter verification failed. (code: 0, errors: scsi1: hotplug problem - error on hot-unplugging device 'virtioscsi1' - still busy in guest?)"), true},
+		{"mixed case", errors.New("SCSI2: Hotplug Problem - error on hot-unplugging device 'virtioscsi2' - Still Busy In Guest?"), true},
+		{"hotplug without busy", errors.New("scsi1: hotplug problem - unsupported configuration"), false},
+		{"busy without hotplug", errors.New("device busy in guest"), false},
+		{"unrelated", errors.New("connection refused"), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := pve.IsHotUnplugBusy(tc.err); got != tc.want {
+				t.Errorf("IsHotUnplugBusy(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
