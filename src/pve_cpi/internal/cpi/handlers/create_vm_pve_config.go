@@ -23,6 +23,11 @@ const pveConfigKeyCPU = "cpu"
 // multiple times across allowlist, switch, and test code).
 const pveConfigKeyMachine = "machine"
 
+// pveConfigKeySerial0 is the PVE VM config key for the first serial device.
+// Defined as a constant so the allowlist entry and the default-write call
+// sites in create_vm.go share one literal.
+const pveConfigKeySerial0 = "serial0"
+
 // pveConfigAllowlist is the set of PVE VM config keys an operator may supply
 // via cloud_properties.pve_config. Keys here are safe to pass through because
 // the CPI does not own them and they do not affect disk/network slot layout.
@@ -30,10 +35,18 @@ const pveConfigKeyMachine = "machine"
 // "numa" is intentionally excluded: the memory_hotplug resolver sets numa=1
 // when memory hotplug is enabled, so operator passthrough would conflict with
 // CPI-managed state. "args" is excluded as an execution surface.
+//
+// "serial0" is allowlisted (not CPI-managed like "tablet") because the CPI's
+// own default write (socket, see create_vm.go) is a reasonable starting
+// point, not the only correct value — an operator redirecting the console to
+// a host device path, or disabling it, is a legitimate override, and the
+// pve_config passthrough already runs after the default write and so wins as
+// the final value.
 var pveConfigAllowlist = map[string]struct{}{
 	pveConfigKeyMachine: {},
 	"bios":              {},
 	pveConfigKeyCPU:     {},
+	pveConfigKeySerial0: {},
 }
 
 // pveConfigBlocklist is the set of PVE VM config keys the CPI manages
@@ -179,6 +192,11 @@ func applyPVEConfigPassthrough(
 					"this raw override is applied",
 				log.Int(metadataKeyVMID, vmid),
 			)
+		case pveConfigKeySerial0:
+			// This call runs after both create paths' default serial0=socket
+			// write (import-path createParams, clone-path resourceParams), so
+			// the operator's value always wins as the final write.
+			params.Serial = map[int]string{0: val}
 		}
 	}
 
@@ -219,7 +237,7 @@ func validatePVEConfigKey(k string) error {
 	// Allowlist check — anything not explicitly allowed is rejected.
 	if _, ok := pveConfigAllowlist[k]; !ok {
 		return cpierrors.Cloud(
-			"create_vm: pve_config key %q is not in the allowed key set (machine, bios, cpu); "+
+			"create_vm: pve_config key %q is not in the allowed key set (machine, bios, cpu, serial0); "+
 				"remove it from cloud_properties.pve_config or request the key be added to the allowlist",
 			k,
 		)

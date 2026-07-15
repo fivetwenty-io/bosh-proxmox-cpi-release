@@ -168,6 +168,8 @@ A VMID is allocated from `[vmid_range_start, vmid_range_end]` (default: `[100, 8
 
 **Hardware defaults:** Every VM is created with `tablet=0`, disabling the emulated USB tablet. The tablet exists to smooth mouse tracking in an interactive VNC/SPICE console; a BOSH-provisioned VM is headless by construction, so the device is pure overhead — 2-3% CPU at scale for no benefit. There is no `cloud_properties` override, and `cloud_properties.pve_config.tablet` is rejected for the same reason: the CPI manages this key directly and a passthrough could only ever fight its own write.
 
+Every VM is also created with `serial0=socket`, adding a virtual serial console. BOSH stemcells log the agent's console output there, so a serial device is what makes a wedged agent debuggable via `qm terminal` — without one, that output has nowhere to go. Unlike `tablet`, `serial0` is allowlisted for `cloud_properties.pve_config.serial0` (e.g. to redirect to a host device path); the passthrough call runs after the default write, so an operator-supplied value always wins as the final one.
+
 **Lifecycle hooks:** After VM creation, lifecycle hooks fire in order (`notes_audit`, `lb_register`, `external_command`, `audit_log`). On failure, the `lb_register` hook deregisters the VM from the load balancer as part of the rollback chain. Hook configuration is documented in [configuration.md](configuration.md).
 
 **Health gate:** When `pve.health_check.enabled` is `true`, `create_vm` polls for an agent response before returning. `pve.health_check.timeout_sec` controls the poll timeout. If the agent does not respond in time, the VM is destroyed via the standard rollback path.

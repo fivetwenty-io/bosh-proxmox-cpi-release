@@ -2302,7 +2302,7 @@ operators write configurations the CPI cannot reason about or roll back. Raw `ar
 particular can break migration and snapshot assumptions.
 
 **Shipped:** `pve_config map[string]string` in `vm_type` cloud_properties applies allowlisted
-PVE keys (`machine`, `bios`, `cpu`) post-clone in one `UpdateQemuConfig` call. Validation
+PVE keys (`machine`, `bios`, `cpu`, `serial0`) post-clone in one `UpdateQemuConfig` call. Validation
 runs at argument-parse time (before any VM is created): invalid input produces a non-retriable
 error with no orphan VM. CPI-managed keys (`cores`, `memory`, `sockets`, `netN`, `scsiN`,
 `ideN`, `virtioN`, `boot`, `name`, `tags`, `hotplug`, `numa`, `smbios1`, `agent`, `onboot`,
@@ -2312,6 +2312,13 @@ Empty values and values containing shell metacharacters (`;&|$\`<>`) are also re
 pre-clone. If the post-clone API call fails (transient PVE fault), the candidate VM is
 destroyed before the error propagates, matching the cleanup contract of sibling error paths
 in the same function. Nil or empty map is byte-identical to prior behavior.
+
+**Serial console default.** Every VM now also gets `serial0=socket` unconditionally on both
+create paths — PVE has no serial device by default, and BOSH stemcells log the agent's console
+output there, so its absence left a wedged agent with no console to inspect via `qm terminal`.
+Unlike `tablet` (CPI-managed, rejected from `pve_config`), `serial0` is allowlisted: the
+passthrough call runs after the default write, so an operator override (e.g. redirecting to a
+host device) always wins as the final value.
 
 #### 7.46 SHIPPED — CPU and RAM hotplug capability flag
 

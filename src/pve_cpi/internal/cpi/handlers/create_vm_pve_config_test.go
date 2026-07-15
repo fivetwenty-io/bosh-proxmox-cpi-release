@@ -59,11 +59,11 @@ func TestPVEConfig_ValidateEmptyNoError(t *testing.T) {
 	}
 }
 
-// TestPVEConfig_ValidateAllowlistedKeysPass verifies that all three allowlisted
+// TestPVEConfig_ValidateAllowlistedKeysPass verifies that all four allowlisted
 // keys with valid values pass pre-clone validation.
 func TestPVEConfig_ValidateAllowlistedKeysPass(t *testing.T) {
 	t.Parallel()
-	err := validatePVEConfig(map[string]string{"machine": "q35", "bios": "ovmf", "cpu": "host"})
+	err := validatePVEConfig(map[string]string{"machine": "q35", "bios": "ovmf", "cpu": "host", "serial0": "/dev/ttyS0"})
 	if err != nil {
 		t.Fatalf("unexpected error for valid keys: %v", err)
 	}
@@ -260,6 +260,34 @@ func TestPVEConfig_MultipleValidKeysSingleCall(t *testing.T) {
 	}
 	if got.Cpu == nil || *got.Cpu != "host" {
 		t.Errorf("Cpu: got %v, want %q", got.Cpu, "host")
+	}
+}
+
+// TestPVEConfig_Serial0OverrideAppliesAsFinalWrite verifies that
+// pve_config.serial0 is accepted by the allowlist and mapped onto the
+// UpdateQemuConfig Serial[0] index — the same call that runs after both
+// create paths' default serial0=socket write, so it is the final value
+// applied.
+func TestPVEConfig_Serial0OverrideAppliesAsFinalWrite(t *testing.T) {
+	t.Parallel()
+
+	ns := &pveConfigNodesStub{}
+	deps := newPVEConfigDeps(ns)
+
+	err := applyPVEConfigPassthrough(context.Background(), deps, "node1", 106,
+		map[string]string{"serial0": "/dev/ttyS0"}, log.NewNopLogger())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(ns.calls) != 1 {
+		t.Fatalf("expected exactly 1 UpdateQemuConfig call, got %d", len(ns.calls))
+	}
+	got := ns.calls[0]
+	if got.Serial == nil {
+		t.Fatal("Serial map is nil; want index 0 set")
+	}
+	if v := got.Serial[0]; v != "/dev/ttyS0" {
+		t.Errorf("Serial[0]: got %q, want %q", v, "/dev/ttyS0")
 	}
 }
 

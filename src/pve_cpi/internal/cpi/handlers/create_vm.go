@@ -3384,6 +3384,14 @@ func attemptCreateVM(
 		// 2-3% CPU at scale for no benefit on a VM nobody looks at. No
 		// cloud_properties override — this is unconditional on every VM.
 		"tablet": 0,
+		// Stemcells log the BOSH agent's console output to the serial console;
+		// without a serial0 device that output has nowhere to go, which is a
+		// direct hit to wedged-agent debuggability. "socket" is PVE's standard
+		// virtual-console form for cloud-image guests (readable via `qm
+		// terminal`). No cloud_properties knob for the default itself, but
+		// cloud_properties.pve_config.serial0 (allowlisted) overrides it —
+		// e.g. to redirect to a host device instead.
+		pveConfigKeySerial0: "socket",
 	}
 	applyOptionalCreateParams(createParams, shape)
 
@@ -3804,6 +3812,13 @@ func cloneFromTemplate(
 	// tablet device is pure overhead (2-3% CPU at scale) with nothing to
 	// benefit from it. No cloud_properties override — unconditional on every
 	// cloned VM, matching the import path.
+	//
+	// Also add the serial0 console device. The template carries no explicit
+	// "serial0" key either (PVE's default is no serial device at all), so the
+	// clone inherits none and every cloned VM needs it added explicitly, same
+	// as agent/tablet above — matching the import path's default write. A
+	// pve_config.serial0 override (applied later, post-clone) still wins as
+	// the final value.
 	memStr := strconv.Itoa(shape.memMiB)
 	cores64 := int64(shape.cores)
 	sockets64 := int64(shape.sockets)
@@ -3815,6 +3830,7 @@ func cloneFromTemplate(
 		Sockets: &sockets64,
 		Agent:   &agentEnabled,
 		Tablet:  &tabletOff,
+		Serial:  map[int]string{0: "socket"},
 	}
 	// Apply scsihw override only when switched away from the historic default.
 	// Emitting "virtio-scsi-pci" explicitly would be byte-identical in effect but
