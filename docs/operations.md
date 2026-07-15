@@ -281,6 +281,26 @@ ping -M do -s 1472 <peer-vm-ip>        # must fail with "message too long"
 
 If small packets pass and large packets hang instead of failing cleanly, see [Troubleshooting — SDN MTU](troubleshooting.md#small-packets-pass-large-packets-hang-sdn-mtu).
 
+Throughput between nodes, once ICMP and MTU both check out:
+
+```bash
+# On the receiving node:
+iperf3 -s
+
+# On the sending node:
+iperf3 -c <receiving-node-ip> -t 10
+```
+
+A large gap between this cross-node figure and a same-node `iperf3` run (VM-to-VM on one node, no VXLAN encapsulation) points at the underlay link or its MTU rather than at SDN itself.
+
+### Backups (PBS) interplay
+
+Several CPI operations power-cycle a guest: `delete_vm`, a hard reboot (`pve.reboot_mode: hard`, or the soft-reboot fallback to it), and any Director recreate — including a stemcell update, which the Director always implements as delete-then-create rather than an in-place change. Each of these restarts the guest's QEMU process. Proxmox Backup Server's incremental backups depend on a dirty-bitmap tracked inside that running QEMU process, so a power cycle always drops it — the next PBS backup after one re-reads the full disk instead of only the blocks that changed, regardless of how small the actual change was.
+
+Schedule PBS backup windows after a deploy has settled, not during one: a deploy that recreates several instances forces a full re-read for each instance that lands mid-window, inflating both the backup's duration and the read load the backend storage sees. The PBS task log makes the shift visible directly — `dirty-bitmap status: created new` in a guest's backup task log means that run was a full re-read; `dirty-bitmap status: OK` means it stayed incremental.
+
+On a shared cluster where PBS also backs up hand-provisioned VMs alongside CPI-managed ones, the CPI's own provenance markers make backup-job selection precise: every CPI-managed VM carries the `director--` tag (see [Post-deploy verification](#post-deploy-verification) for the `pvesh` filter), and CPI-managed VMs occupy dedicated VMID bands — `100`–`8999` for VMs, `30000`–`30999` for stemcell templates — that a PBS backup job's VMID-range selector can target directly. See [Configuration — VMID ranges](configuration.md#vmid-ranges) for the full band table.
+
 ---
 
 ## Health checks
