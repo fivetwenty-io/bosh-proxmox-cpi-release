@@ -1551,6 +1551,19 @@ def main(argv: list[str]) -> None:
         sys.exit(2)
 
     os.chdir(REPO_ROOT)
+
+    # Director-facing bosh calls must carry their own credentials: the CLI
+    # stores none for the 'pve' alias (scripts/bosh alias-env drops any
+    # stale entry, and env-based logins persist nothing), so a bare
+    # `bosh -e pve` request reaches the Director unauthenticated and gets
+    # 401. Merge the admin client credentials from creds.yml into the
+    # process environment once; every subprocess inherits them. Values
+    # already present in the caller's environment win.
+    if BOSH_CREDS.exists() and "BOSH_CLIENT" not in os.environ:
+        denv = _load_bosh_module().director_env()
+        for key in ("BOSH_ENVIRONMENT", "BOSH_CLIENT", "BOSH_CLIENT_SECRET", "BOSH_CA_CERT"):
+            os.environ.setdefault(key, denv[key])
+
     handler(extra)
 
 
