@@ -46,6 +46,14 @@ export GOMODCACHE="${BOSH_COMPILE_TARGET}/.gomodcache"
 # Force vendor mode globally so no stray `go` sub-invocation hits the network.
 export GOFLAGS="-mod=vendor"
 
+# Pin the build to the packaged toolchain. Without this, a go.mod `go`
+# directive newer than the blob makes `go build` try to DOWNLOAD the newer
+# toolchain from the module proxy — a network fetch that hermetic compile VMs
+# must never attempt (and which fails there anyway: no HOME, no proxy access).
+# With `local`, the same mismatch fails immediately with a clear
+# "go.mod requires go >= X" error, and the fix is to bump the golang blob.
+export GOTOOLCHAIN=local
+
 # Target platform selection.
 #
 # Inside a real BOSH compilation VM the host is always linux/amd64 and the
