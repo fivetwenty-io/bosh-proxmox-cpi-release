@@ -180,6 +180,7 @@ For symptom-first triage of deployment, VM creation, disk attachment, network, a
 - [Configuration reference](docs/configuration.md) — all properties with defaults and validation rules.
 - [Network configuration](docs/networks.md) — SDN and bridge `cloud_properties` schema and manifest examples.
 - [Operations runbook](docs/operations.md) — day-2 operations and diagnostics.
+- [Best practices](docs/best-practices.md) — PVE and BOSH best practices, and how the CPI meets, exceeds, or makes each one configurable.
 - [Troubleshooting](docs/troubleshooting.md) — symptom-first failure triage.
 - [Light stemcells](docs/light-stemcells.md) — pre-uploaded and CPI-fetch modes, storage requirements, and credentials.
 - [Persistent disks](docs/persistent-disks.md) — storage backend classification and disk-pool cloud-properties.
