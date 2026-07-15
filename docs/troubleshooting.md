@@ -662,7 +662,7 @@ VXLAN encapsulation spends roughly 50 bytes per frame, so the overlay MTU must b
 
 2. A manual MTU override: `pve.sdn_zone_mtu` (or a hand-edited zone) set higher than the underlay affords. Unset it and let PVE derive the value, or set it to smallest-underlay − 50.
 
-3. A guest that does not inherit the bridge MTU: the CPI sets `mtu=1` on virtio NICs so guests inherit automatically, but non-virtio NIC models and hand-configured guests keep 1500. Use virtio NICs or set the guest interface MTU to match the vnet.
+3. A guest that does not inherit the bridge MTU: the CPI sets `mtu=1` on virtio NICs so guests inherit automatically, but non-virtio NIC models and hand-configured guests keep 1500. Use virtio NICs or set the guest interface MTU to match the vnet. `create_vm` logs a Warn at create time naming the NIC, model, and vnet whenever `cloud_properties.network_model` (or a `network_defaults`/`disk_type`/`vm_type` profile) overrides the virtio default on an SDN vnet — check the create_vm log for `non-virtio NIC model on an SDN vnet` if this is a newly deployed VM rather than a pre-existing one.
 
 4. A middlebox dropping fragments or ICMP "fragmentation needed" between nodes, which turns a recoverable mismatch into a silent blackhole.
 

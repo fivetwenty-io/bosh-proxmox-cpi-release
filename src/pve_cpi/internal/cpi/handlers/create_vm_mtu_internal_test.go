@@ -4,6 +4,7 @@
 package handlers
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"strings"
@@ -28,7 +29,7 @@ func mtuParsed(bridge, model string) *createVMParsedArgs {
 
 func TestConfigureNICs_MTU_VnetVirtio_Inherits(t *testing.T) {
 	cfg := icMinConfig()
-	cfg.NetworkMode = "sdn"
+	cfg.NetworkMode = networkModeSDN
 	cl := &fwClusterStub{sdnVnets: []string{"boshvnet"}}
 	nd := &fwNodesStub{}
 	deps := fwDeps(cl, nd, cfg)
@@ -47,7 +48,7 @@ func TestConfigureNICs_MTU_VnetVirtio_Inherits(t *testing.T) {
 
 func TestConfigureNICs_MTU_ExternalBridge_Absent(t *testing.T) {
 	cfg := icMinConfig()
-	cfg.NetworkMode = "sdn"
+	cfg.NetworkMode = networkModeSDN
 	cl := &fwClusterStub{sdnVnets: []string{"boshvnet"}}
 	nd := &fwNodesStub{}
 	deps := fwDeps(cl, nd, cfg)
@@ -63,7 +64,7 @@ func TestConfigureNICs_MTU_ExternalBridge_Absent(t *testing.T) {
 
 func TestConfigureNICs_MTU_VnetE1000_Absent(t *testing.T) {
 	cfg := icMinConfig()
-	cfg.NetworkMode = "sdn"
+	cfg.NetworkMode = networkModeSDN
 	cl := &fwClusterStub{sdnVnets: []string{"boshvnet"}}
 	nd := &fwNodesStub{}
 	deps := fwDeps(cl, nd, cfg)
@@ -77,9 +78,90 @@ func TestConfigureNICs_MTU_VnetE1000_Absent(t *testing.T) {
 	}
 }
 
+// TestConfigureNICs_MTU_VnetE1000_WarnsAboutMTU verifies that a non-virtio
+// NIC model on an SDN vnet logs a Warn naming the NIC (network name), model,
+// and vnet — the guest will not auto-track the vnet's MTU, the root cause of
+// the "small packets pass, large packets hang" trap.
+func TestConfigureNICs_MTU_VnetE1000_WarnsAboutMTU(t *testing.T) {
+	cfg := icMinConfig()
+	cfg.NetworkMode = networkModeSDN
+	cl := &fwClusterStub{sdnVnets: []string{"boshvnet"}}
+	nd := &fwNodesStub{}
+	deps := fwDeps(cl, nd, cfg)
+	shape := &createVMShape{node: "pve1"}
+
+	var buf bytes.Buffer
+	logger, lerr := log.NewLogger("info", &buf)
+	if lerr != nil {
+		t.Fatalf("NewLogger: %v", lerr)
+	}
+
+	if _, err := configureNICs(context.Background(), deps, logger, mtuParsed("boshvnet", "e1000"), shape, 100); err != nil {
+		t.Fatalf("configureNICs: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "non-virtio NIC model on an SDN vnet") {
+		t.Errorf("expected MTU-mismatch warning, got log output: %s", out)
+	}
+	for _, want := range []string{"\"default\"", "\"e1000\"", "\"boshvnet\""} {
+		if !strings.Contains(out, want) {
+			t.Errorf("warning missing expected field %s; got: %s", want, out)
+		}
+	}
+}
+
+// TestConfigureNICs_MTU_VnetVirtio_NoWarn verifies the default virtio model
+// on an SDN vnet — the normal, MTU-inheriting case — logs no MTU warning.
+func TestConfigureNICs_MTU_VnetVirtio_NoWarn(t *testing.T) {
+	cfg := icMinConfig()
+	cfg.NetworkMode = networkModeSDN
+	cl := &fwClusterStub{sdnVnets: []string{"boshvnet"}}
+	nd := &fwNodesStub{}
+	deps := fwDeps(cl, nd, cfg)
+	shape := &createVMShape{node: "pve1"}
+
+	var buf bytes.Buffer
+	logger, lerr := log.NewLogger("info", &buf)
+	if lerr != nil {
+		t.Fatalf("NewLogger: %v", lerr)
+	}
+
+	if _, err := configureNICs(context.Background(), deps, logger, mtuParsed("boshvnet", ""), shape, 100); err != nil {
+		t.Fatalf("configureNICs: %v", err)
+	}
+	if strings.Contains(buf.String(), "non-virtio NIC model on an SDN vnet") {
+		t.Errorf("virtio-on-vnet must not warn; got log output: %s", buf.String())
+	}
+}
+
+// TestConfigureNICs_MTU_ExternalBridge_E1000_NoWarn verifies that a
+// non-virtio model on a plain (non-SDN) bridge — where MTU inheritance was
+// never applicable in the first place — logs no MTU warning either.
+func TestConfigureNICs_MTU_ExternalBridge_E1000_NoWarn(t *testing.T) {
+	cfg := icMinConfig()
+	cfg.NetworkMode = networkModeSDN
+	cl := &fwClusterStub{sdnVnets: []string{"boshvnet"}}
+	nd := &fwNodesStub{}
+	deps := fwDeps(cl, nd, cfg)
+	shape := &createVMShape{node: "pve1"}
+
+	var buf bytes.Buffer
+	logger, lerr := log.NewLogger("info", &buf)
+	if lerr != nil {
+		t.Fatalf("NewLogger: %v", lerr)
+	}
+
+	if _, err := configureNICs(context.Background(), deps, logger, mtuParsed("vmbr0", "e1000"), shape, 100); err != nil {
+		t.Fatalf("configureNICs: %v", err)
+	}
+	if strings.Contains(buf.String(), "non-virtio NIC model on an SDN vnet") {
+		t.Errorf("e1000-on-plain-bridge must not warn; got log output: %s", buf.String())
+	}
+}
+
 func TestConfigureNICs_MTU_ListError_FailOpen(t *testing.T) {
 	cfg := icMinConfig()
-	cfg.NetworkMode = "sdn"
+	cfg.NetworkMode = networkModeSDN
 	cl := &fwClusterStub{sdnVnetsErr: errors.New("pvedaemon hiccup")}
 	nd := &fwNodesStub{}
 	deps := fwDeps(cl, nd, cfg)

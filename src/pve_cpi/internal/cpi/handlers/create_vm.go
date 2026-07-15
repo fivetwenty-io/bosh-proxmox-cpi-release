@@ -4551,8 +4551,23 @@ func configureNICs(
 			netMap[i] += ",firewall=1"
 		}
 		// mtu=1 is a virtio-only option (PVE rejects it on e1000/rtl8139).
-		if _, isVnet := vnetNames[bridge]; isVnet && strings.HasPrefix(model, "virtio") {
+		_, isVnet := vnetNames[bridge]
+		switch {
+		case isVnet && strings.HasPrefix(model, "virtio"):
 			netMap[i] += ",mtu=1"
+		case isVnet:
+			// Non-virtio model on an SDN vnet: the guest cannot inherit the
+			// vnet's (typically reduced, VXLAN-encapsulated) MTU the way a
+			// virtio NIC does, and stays at the PVE default of 1500. That
+			// mismatch is the "small packets pass, large packets hang"
+			// blackhole — see docs/troubleshooting.md's "Small packets pass,
+			// large packets hang (SDN MTU)" entry. Warn at create time rather
+			// than leaving the operator to discover it via a hung transfer.
+			logger.Warn("create_vm: non-virtio NIC model on an SDN vnet will not auto-track the vnet MTU",
+				log.String("network", name),
+				log.String("model", model),
+				log.String("vnet", bridge),
+			)
 		}
 		if bridge != "" {
 			bridgeSet[bridge] = struct{}{}
@@ -4631,7 +4646,7 @@ func configureNICs(
 // in an SDN-capable mode ("sdn"/"auto") and the VM has NICs.
 func sdnVnetNameSet(ctx context.Context, deps Deps, logger *log.Logger, nicCount int) map[string]struct{} {
 	mode := deps.Config.NetworkMode
-	if nicCount == 0 || (mode != "sdn" && mode != "auto") {
+	if nicCount == 0 || (mode != networkModeSDN && mode != "auto") {
 		return nil
 	}
 	vnets, err := pve.ListSDNVnets(ctx, deps.PVE)
