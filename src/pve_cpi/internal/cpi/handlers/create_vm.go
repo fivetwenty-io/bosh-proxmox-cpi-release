@@ -5080,10 +5080,11 @@ func cleanupVM(ctx context.Context, deps Deps, node string, vmid int, env map[st
 	// A killed worker or node reboot mid-clone/mid-create can leave the guest
 	// config carrying an in-flight lock (lock: clone|create|...), which PVE
 	// rejects even a Stop against. Retry once with skiplock=true when the CPI
-	// is authenticated as root@pam (the only identity PVE honors skiplock
-	// for); otherwise this is a no-op and stopErr is left as the lock
-	// rejection, which is fine — Stop is best-effort and the purge below is
-	// where the orphan actually matters.
+	// is authenticated as root@pam via password (the only identity PVE
+	// honors skiplock for — not even an API token owned by root@pam
+	// qualifies, see pve.IsRootPamIdentity); otherwise this is a no-op and
+	// stopErr is left as the lock rejection, which is fine — Stop is
+	// best-effort and the purge below is where the orphan actually matters.
 	if stopErr != nil && pve.IsVMConfigLocked(stopErr) {
 		stopUPID, stopErr = retryStopWithSkiplock(ctx, deps, node, vmCID, vmid, stopErr, logger)
 	}

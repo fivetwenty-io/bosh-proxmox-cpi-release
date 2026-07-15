@@ -50,6 +50,12 @@ func TestIsRootPamIdentity_PasswordAuth(t *testing.T) {
 	}
 }
 
+// TestIsRootPamIdentity_TokenAuth verifies that EVERY API-token identity
+// resolves to false, including one owned by root@pam — PVE never honors
+// skiplock for a token request regardless of the owning user (see
+// rootPamIdentity's doc comment). The varied shapes below are retained as
+// explicit regression coverage for that specific case, not because the
+// implementation still branches on them.
 func TestIsRootPamIdentity_TokenAuth(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
@@ -57,7 +63,7 @@ func TestIsRootPamIdentity_TokenAuth(t *testing.T) {
 		apiToken string
 		want     bool
 	}{
-		{"root@pam token", "root@pam!bosh-token=1234-5678-uuid", true},
+		{"root@pam-owned token", "root@pam!bosh-token=1234-5678-uuid", false},
 		{"non-root user token", "bosh@pve!bosh-token=1234-5678-uuid", false},
 		{"admin@pam token (not root)", "admin@pam!tok=uuid", false},
 		{"malformed token, no bang separator", "root@pam-no-bang-here", false},
@@ -80,13 +86,17 @@ func TestIsRootPamIdentity_TokenTakesPrecedenceOverPassword(t *testing.T) {
 	// simultaneously in production, but IsRootPamIdentity itself must still
 	// resolve deterministically (token-first) rather than panic or pick
 	// inconsistently, mirroring newClient's own hasToken-first precedence.
+	// The password fields here (User=root, Realm=pam) would resolve true on
+	// their own — proving the token branch short-circuits before ever
+	// consulting them, not merely that this particular token happens to
+	// resolve false.
 	cfg := &config.CPIConfig{
-		APIToken: "root@pam!tok=uuid",
-		User:     "someoneelse",
-		Realm:    "pve",
+		APIToken: "someoneelse@pve!tok=uuid",
+		User:     "root",
+		Realm:    "pam",
 		Password: "secret",
 	}
-	if !pve.IsRootPamIdentity(cfg) {
-		t.Error("token identity should take precedence and resolve to root@pam")
+	if pve.IsRootPamIdentity(cfg) {
+		t.Error("token identity must take precedence over password fields and resolve to false (tokens never qualify)")
 	}
 }

@@ -1,12 +1,13 @@
-// Shared root@pam-only skiplock recovery for VMs stuck under a PVE
+// Shared root@pam-password-only skiplock recovery for VMs stuck under a PVE
 // guest-config lock (lock: clone|create|backup|migrate|snapshot|rollback).
 // PVE's HTTP API has no unlock endpoint; the only in-process recovery is a
 // skiplock=true retry, which PVE honors only for the root@pam superuser
-// (PVE::API2::Qemu rejects it for every other identity regardless of granted
-// privileges). Used by cleanupVM (create_vm.go rollback) and the delete_vm.go
-// synchronous destroy path — both call into these helpers so the retry
-// behavior, logging, and operator-facing recovery message stay identical
-// across both call sites.
+// authenticated via password (PVE::API2::Qemu rejects it for every other
+// identity regardless of granted privileges — including an API token owned
+// by root@pam; see pve.IsRootPamIdentity's doc comment for why). Used by
+// cleanupVM (create_vm.go rollback) and the delete_vm.go synchronous destroy
+// path — both call into these helpers so the retry behavior, logging, and
+// operator-facing recovery message stay identical across both call sites.
 package handlers
 
 import (
@@ -20,10 +21,13 @@ import (
 
 // retryDestroyWithSkiplock retries a lock-rejected DeleteQemu with
 // skiplock=true, but only when the CPI's configured PVE identity is
-// root@pam (pve.IsRootPamIdentity). When identity is not root@pam, origErr is
-// returned unretried so the caller's pve.IsVMConfigLocked check still fires
-// against the SAME error and drives its actionable-error / tagging path —
-// no PVE call is made for an identity that PVE would reject anyway.
+// root@pam authenticated via password (pve.IsRootPamIdentity). Any other
+// identity — including an API token owned by root@pam — never qualifies, so
+// origErr is returned unretried: PVE would reject skiplock=true for that
+// identity anyway, and attempting it would only add a guaranteed-to-fail API
+// call and a confusing log line. The caller's pve.IsVMConfigLocked check
+// still fires against the SAME unretried error and drives its
+// actionable-error / tagging path.
 func retryDestroyWithSkiplock(
 	ctx context.Context, deps Deps, node, vmCID string, vmid int,
 	purge, destroyUnref bool, origErr error, logger *log.Logger,
@@ -47,7 +51,8 @@ func retryDestroyWithSkiplock(
 // retry goes through the raw nodes endpoint (POST
 // /nodes/{node}/qemu/{vmid}/status/stop), which does expose Skiplock. Returns
 // the UPID (empty string for a synchronous completion) on success, or
-// origErr unretried when identity is not root@pam.
+// origErr unretried when identity does not qualify (not root@pam via
+// password — see retryDestroyWithSkiplock and pve.IsRootPamIdentity).
 func retryStopWithSkiplock(
 	ctx context.Context, deps Deps, node, vmCID string, vmid int, origErr error, logger *log.Logger,
 ) (string, error) {

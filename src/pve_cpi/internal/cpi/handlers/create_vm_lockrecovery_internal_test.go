@@ -149,6 +149,16 @@ func lrTokenConfig() *config.CPIConfig {
 	return &config.CPIConfig{APIToken: "bosh@pve!bosh-token=uuid"}
 }
 
+// lrRootPamTokenConfig returns a CPIConfig authenticated via an API token
+// OWNED by root@pam (pve.IsRootPamIdentity == false, same as any other
+// token): PVE never honors skiplock for a token identity regardless of the
+// owning user -- a token's authenticated identity always carries a
+// "!<token-id>" suffix, which never equals the bare "root@pam" PVE's check
+// requires (see pve.IsRootPamIdentity's doc comment).
+func lrRootPamTokenConfig() *config.CPIConfig {
+	return &config.CPIConfig{APIToken: "root@pam!bosh-cpi=uuid"}
+}
+
 func lrEnv() map[string]any {
 	return map[string]any{"bosh": map[string]any{
 		"group":  "dir-cf-router",
@@ -209,6 +219,31 @@ func TestCleanupVM_DeleteLocked_NonRootPam_NoSkiplockRetry_TagsFailedVM(t *testi
 	}
 }
 
+// TestCleanupVM_DeleteLocked_RootPamOwnedToken_NoSkiplockRetry_TagsFailedVM
+// verifies the corrected behavior: an API token OWNED by root@pam still does
+// not qualify for the skiplock retry -- PVE rejects skiplock for any token
+// identity regardless of the owning user, so the original lock error must
+// surface unretried, identically to any other non-qualifying identity.
+func TestCleanupVM_DeleteLocked_RootPamOwnedToken_NoSkiplockRetry_TagsFailedVM(t *testing.T) {
+	nodes := &lrNodesStub{
+		deleteErrs: []error{errors.New(lockedCloneMsg)},
+	}
+	q := &lrQEMUStub{}
+	deps := Deps{Config: lrRootPamTokenConfig(), PVE: &lrClient{nodes: nodes, qemu: q}, Logger: log.NewNopLogger()}
+
+	cleanupVM(context.Background(), deps, "pve01", 100, lrEnv(), log.NewNopLogger())
+
+	if len(nodes.deleteCalls) != 1 {
+		t.Fatalf("root@pam-owned token: expected exactly 1 DeleteQemu call (no skiplock retry), got %d", len(nodes.deleteCalls))
+	}
+	if nodes.deleteCalls[0].Skiplock != nil && *nodes.deleteCalls[0].Skiplock {
+		t.Error("the single DeleteQemu call must not carry skiplock=true for a root@pam-owned token identity")
+	}
+	if nodes.updateCalls != 1 {
+		t.Fatalf("VM remains locked and orphaned: expected 1 bosh-create-failed tag write, got %d", nodes.updateCalls)
+	}
+}
+
 func TestCleanupVM_DeleteLocked_NonRootPam_NilEnv_TaggingSkipped(t *testing.T) {
 	nodes := &lrNodesStub{
 		deleteErrs: []error{errors.New(lockedCloneMsg)},
@@ -262,5 +297,24 @@ func TestCleanupVM_StopLocked_NonRootPam_NoSkiplockRetry(t *testing.T) {
 
 	if len(nodes.stopCalls) != 0 {
 		t.Errorf("non-root@pam identity: CreateQemuStatusStop must never be called, got %d calls", len(nodes.stopCalls))
+	}
+}
+
+// TestCleanupVM_StopLocked_RootPamOwnedToken_NoSkiplockRetry is the Stop-path
+// counterpart of TestCleanupVM_DeleteLocked_RootPamOwnedToken_NoSkiplockRetry_TagsFailedVM:
+// a root@pam-owned token still does not qualify for the skiplock stop retry.
+func TestCleanupVM_StopLocked_RootPamOwnedToken_NoSkiplockRetry(t *testing.T) {
+	nodes := &lrNodesStub{}
+	q := &lrQEMUStub{stopErr: errors.New(lockedCloneMsg)}
+	deps := Deps{Config: lrRootPamTokenConfig(), PVE: &lrClient{nodes: nodes, qemu: q}, Logger: log.NewNopLogger()}
+
+	// Purge succeeds unconditionally (no lock) so this test isolates the Stop
+	// skiplock behavior from the Delete path.
+	nodes.deleteErrs = []error{nil}
+
+	cleanupVM(context.Background(), deps, "pve01", 100, nil, log.NewNopLogger())
+
+	if len(nodes.stopCalls) != 0 {
+		t.Errorf("root@pam-owned token: CreateQemuStatusStop must never be called, got %d calls", len(nodes.stopCalls))
 	}
 }

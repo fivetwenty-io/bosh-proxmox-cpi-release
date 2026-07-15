@@ -78,6 +78,55 @@ func TestHandleDeleteVM_LockedDestroy_RootPam_RetriesWithSkiplockAndSucceeds(t *
 	}
 }
 
+// TestHandleDeleteVM_LockedDestroy_RootPamOwnedToken_ReturnsActionableRetriableError
+// verifies the corrected behavior: an API token OWNED by root@pam still does
+// not qualify for the skiplock retry -- PVE rejects skiplock for any token
+// identity regardless of the owning user, so the original lock error
+// surfaces unretried, identically to any other non-qualifying identity.
+func TestHandleDeleteVM_LockedDestroy_RootPamOwnedToken_ReturnsActionableRetriableError(t *testing.T) {
+	t.Parallel()
+
+	var deleteCalls []*nodes.DeleteQemuParams
+	qemuSvc := &mockQEMUService{
+		stopFn: func(_ context.Context, _ string, _ int) (string, error) {
+			return "", nil
+		},
+		configFn: noLockGuestConfig,
+	}
+	nodesSvc := &mockNodesService{
+		deleteQemuFn: func(_ context.Context, _ string, _ string, params *nodes.DeleteQemuParams) (*nodes.DeleteQemuResponse, error) {
+			deleteCalls = append(deleteCalls, params)
+			return nil, errors.New(lockedCloneDestroyMsg)
+		},
+	}
+	tasksSvc := &mockTasksService{}
+	agentSvc := &mockAgentService{}
+
+	deps := testDepsFoundVM(100, qemuSvc, nodesSvc, tasksSvc, agentSvc)
+	deps.Config.APIToken = "root@pam!bosh-cpi=uuid"
+
+	h := handlers.HandleDeleteVM(deps)
+	_, err := h.Handle(context.Background(), marshalArgs("100"), jsonrpc.Context{})
+
+	if err == nil {
+		t.Fatal("expected an error when the guest config stays locked under a root@pam-owned token identity")
+	}
+	if len(deleteCalls) != 1 {
+		t.Fatalf("root@pam-owned token: expected exactly 1 DeleteQemu call (no skiplock retry), got %d", len(deleteCalls))
+	}
+	if deleteCalls[0].Skiplock != nil && *deleteCalls[0].Skiplock {
+		t.Error("the single DeleteQemu call must not carry skiplock=true for a root@pam-owned token identity")
+	}
+
+	var ce *cpierrors.Error
+	if !errors.As(err, &ce) {
+		t.Fatalf("expected a *cpierrors.Error, got %T: %v", err, err)
+	}
+	if !ce.OkToRetry() {
+		t.Errorf("locked-VM error must be retriable (director should re-drive after `qm unlock`), got: %v", err)
+	}
+}
+
 func TestHandleDeleteVM_LockedDestroy_NonRootPam_ReturnsActionableRetriableError(t *testing.T) {
 	t.Parallel()
 
