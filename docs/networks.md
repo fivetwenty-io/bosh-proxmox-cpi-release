@@ -136,7 +136,7 @@ The CPI will:
 
 1. Check whether the turnkey zone `bosh` exists and create it (type `vxlan`) if absent, with peers derived from the online cluster nodes and MTU derived by PVE from the underlay.
 
-2. Create vnet `boshvn` in zone `bosh` (idempotent on conflict), with a VNI auto-allocated from the 5000–5999 band.
+2. Create vnet `boshvn` in zone `bosh` (idempotent on conflict), with a VNI auto-allocated from the 5000–5999 band. A newly created vnet gets the alias `bosh-boshvn` — visible in the PVE UI's SDN vnet list — marking it as CPI-owned; unlike the zone-level constraint above, vnets do accept an alias, so this is the one place in the SDN hierarchy where CPI ownership is visible in the UI. A pre-existing vnet the CPI adopts (idempotent path) keeps whatever alias it already had; the CPI never overwrites it.
 
 3. Create subnet `10.200.0.0/24` with gateway `10.200.0.1` on the vnet.
 

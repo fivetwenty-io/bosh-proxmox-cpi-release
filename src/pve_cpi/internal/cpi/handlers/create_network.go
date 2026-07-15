@@ -28,6 +28,13 @@ import (
 // threshold while making the distinct semantics explicit.
 const networkModeBridge = "bridge"
 
+// networkModeSDN is the config.NetworkMode value that forces (or, for "auto",
+// participates in resolving) the SDN path. Defined as a constant alongside
+// networkModeBridge for the same reason: the literal "sdn" recurs across the
+// mode switch and SDN-capability checks (e.g. sdnVnetNameSet in create_vm.go)
+// often enough to cross the goconst threshold.
+const networkModeSDN = "sdn"
+
 // defaultSDNZoneName is the turnkey zone the CPI creates when the SDN path is
 // active, sdn_auto_manage_zone is enabled, and neither cloud_properties.zone
 // nor config sdn_zone names one. A fixed name keeps repeat deployments
@@ -116,7 +123,7 @@ func createNetwork(ctx context.Context, deps Deps, args []json.RawMessage) (any,
 
 	useSDN := false
 	switch cfg.NetworkMode {
-	case "sdn":
+	case networkModeSDN:
 		useSDN = true
 	case networkModeBridge:
 		useSDN = false
@@ -409,6 +416,11 @@ func createVnetIdempotent(
 		tag64 := int64(tag)
 		createParams.Tag = &tag64
 	}
+	// Stamp CPI ownership on newly created vnets only — an adopted (already
+	// existing) vnet returns above at the GetSdnVnets probe and never reaches
+	// this point, so its alias (operator-set or otherwise) is left untouched.
+	alias := vnetAlias(args.vnet)
+	createParams.Alias = &alias
 	if createErr := clusterSvc.CreateSdnVnets(ctx, createParams); createErr != nil {
 		// 409 conflict = already exists from a concurrent call; treat as idempotent.
 		if isSDNConflict(createErr) {
@@ -417,6 +429,36 @@ func createVnetIdempotent(
 		return false, createErr
 	}
 	return true, nil
+}
+
+// vnetAliasPrefix marks a vnet as CPI-owned in the PVE UI (visible in the SDN
+// vnet list's Alias column, unlike a tag or PVE object comment — vnets have
+// no comment/description field at all, unlike zones). Matches this
+// codebase's other "bosh-" prefixed identity markers (bosh-lock-, bosh-cpi,
+// bosh-stemcell-sha-, …); a literal colon ("bosh:") is not usable here — PVE
+// validates the alias against the pattern `[()\-_.\w\s]{0,256}`, which does
+// not include ':'.
+const vnetAliasPrefix = "bosh-"
+
+// pveAliasMaxLen is PVE's own maxLength constraint on the vnet alias field
+// (POST /cluster/sdn/vnets "alias", per the PVE API schema).
+const pveAliasMaxLen = 256
+
+// vnetAlias renders the CPI-ownership alias for a newly created vnet: the
+// BOSH network's only available identifying context at create_network time
+// is the vnet's own PVE identifier — the BOSH CPI v2 create_network call
+// carries no separate network-name argument (network_spec has no name
+// field; the Director keeps that association on its own side). vnetName is
+// already validated to 1-8 lowercase alphanumeric characters by
+// validateVnetName, comfortably under pveAliasMaxLen even with the prefix,
+// but the result is still defensively truncated in case that constraint
+// ever loosens.
+func vnetAlias(vnetName string) string {
+	alias := vnetAliasPrefix + vnetName
+	if len(alias) > pveAliasMaxLen {
+		alias = alias[:pveAliasMaxLen]
+	}
+	return alias
 }
 
 // createSubnetIdempotent creates the subnet on the named vnet. A 409 conflict

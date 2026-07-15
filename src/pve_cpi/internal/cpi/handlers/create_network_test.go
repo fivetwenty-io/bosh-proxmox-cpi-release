@@ -23,8 +23,8 @@ func sdnNotFound() error {
 }
 
 // netResolveRetries is a local *int helper for NetworkResolveRetries
-// assignments — as of Phase 1 that field is *int so an unset property (nil,
-// which now defaults to 30) can be distinguished from an explicit 0 (see
+// assignments — the field is *int so an unset property (nil, which defaults
+// to 30) can be distinguished from an explicit 0 (see
 // config.CPIConfig.NetworkResolveRetries).
 func netResolveRetries(n int) *int { return &n }
 
@@ -238,6 +238,92 @@ func TestHandleCreateNetwork_SDN_IdempotentVnetExists(t *testing.T) {
 	arr := result.([]any)
 	if arr[0] != "myvnet" {
 		t.Errorf("network_cid: got %v", arr[0])
+	}
+}
+
+// TestHandleCreateNetwork_SDN_VnetAliasStampedOnCreate verifies that a newly
+// created vnet's CreateSdnVnets call carries the "bosh-<vnet>" ownership
+// alias.
+func TestHandleCreateNetwork_SDN_VnetAliasStampedOnCreate(t *testing.T) {
+	t.Parallel()
+
+	var createdAlias *string
+
+	clusterSvc := &mockSDNCluster{
+		getSdnZonesFn: func(_ context.Context, _ string, _ *sdkcluster.GetSdnZonesParams) (*sdkcluster.GetSdnZonesResponse, error) {
+			raw := sdkcluster.GetSdnZonesResponse(`{"zone":"z"}`)
+			return &raw, nil
+		},
+		getSdnVnetsFn: func(_ context.Context, _ string, _ *sdkcluster.GetSdnVnetsParams) (*sdkcluster.GetSdnVnetsResponse, error) {
+			return nil, sdnNotFound() // vnet absent — create path
+		},
+		createSdnVnetsFn: func(_ context.Context, params *sdkcluster.CreateSdnVnetsParams) error {
+			createdAlias = params.Alias
+			return nil
+		},
+		updateSdnFn: func(_ context.Context, _ *sdkcluster.UpdateSdnParams) (*sdkcluster.UpdateSdnResponse, error) {
+			return nil, nil
+		},
+	}
+
+	spec := map[string]any{
+		"type": "manual",
+		"cloud_properties": map[string]any{
+			"zone": "z",
+			"vnet": "boshvnet",
+		},
+	}
+	if _, err := invokeCreateNetwork(t, testSDNDeps(clusterSvc, "sdn", "", false), spec); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if createdAlias == nil {
+		t.Fatal("CreateSdnVnetsParams.Alias is nil; want \"bosh-boshvnet\"")
+	}
+	if *createdAlias != "bosh-boshvnet" {
+		t.Errorf("CreateSdnVnetsParams.Alias = %q; want %q", *createdAlias, "bosh-boshvnet")
+	}
+}
+
+// TestHandleCreateNetwork_SDN_AdoptedVnet_AliasUntouched verifies that the
+// idempotent-adopt path (vnet already exists) never calls CreateSdnVnets at
+// all — so a pre-existing vnet's alias (operator-set or otherwise) is left
+// completely untouched, not merely unset.
+func TestHandleCreateNetwork_SDN_AdoptedVnet_AliasUntouched(t *testing.T) {
+	t.Parallel()
+
+	var createCalled bool
+
+	clusterSvc := &mockSDNCluster{
+		getSdnZonesFn: func(_ context.Context, _ string, _ *sdkcluster.GetSdnZonesParams) (*sdkcluster.GetSdnZonesResponse, error) {
+			raw := sdkcluster.GetSdnZonesResponse(`{"zone":"z"}`)
+			return &raw, nil
+		},
+		getSdnVnetsFn: func(_ context.Context, _ string, _ *sdkcluster.GetSdnVnetsParams) (*sdkcluster.GetSdnVnetsResponse, error) {
+			// Vnet already exists, with an operator-set alias.
+			raw := sdkcluster.GetSdnVnetsResponse(`{"vnet":"myvnet","zone":"z","alias":"operator-owned"}`)
+			return &raw, nil
+		},
+		createSdnVnetsFn: func(_ context.Context, _ *sdkcluster.CreateSdnVnetsParams) error {
+			createCalled = true
+			return nil
+		},
+		updateSdnFn: func(_ context.Context, _ *sdkcluster.UpdateSdnParams) (*sdkcluster.UpdateSdnResponse, error) {
+			return nil, nil
+		},
+	}
+
+	spec := map[string]any{
+		"type": "manual",
+		"cloud_properties": map[string]any{
+			"zone": "z",
+			"vnet": "myvnet",
+		},
+	}
+	if _, err := invokeCreateNetwork(t, testSDNDeps(clusterSvc, "sdn", "", false), spec); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if createCalled {
+		t.Error("CreateSdnVnets must not be called for an already-existing (adopted) vnet — its alias must not be touched")
 	}
 }
 
