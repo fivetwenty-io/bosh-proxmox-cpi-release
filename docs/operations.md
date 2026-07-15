@@ -142,6 +142,8 @@ See [PVE Storage Locking](pve-storage-locking.md) for lock mechanics and the ret
 
 **Copy-on-write pools degrade progressively as they fill.** qcow2, thin-provisioned LVM, and ZFS all allocate space on write rather than up front, and their allocation/fragmentation cost grows with occupancy:
 
+That "allocate on write" behavior for ZFS assumes the pool's `sparse` flag is on — PVE's own zfspool storage default is `sparse` unset (thick): every zvol the CPI creates there reserves its full requested size immediately, the same as a thick LVM pool, not on demand. A pool that looks thin by nominal capacity can already be fully committed by reservation alone, which throws off the utilization-pct headroom math below. The CPI logs this once per pool per process (Info level, naming the pool) the first time `create_disk` resolves a thick-provisioning zfspool while it already has the storage type in hand — see `pvesm status <storage>` (or check `sparse` in `/etc/pve/storage.cfg`) to confirm a given pool's actual posture, and the pool's zfspool config to switch it to `sparse: 1` if thin provisioning is what you want.
+
 - Below roughly 50% utilization: normal.
 
 - From roughly 50%: allocation and fragmentation overhead becomes noticeable — new writes and snapshot operations get measurably slower.

@@ -263,7 +263,7 @@ The placement engine scores cluster nodes at `create_vm` time using live resourc
 
 ## Storage Capacity
 
-Independent of the `placement.reserve_storage_headroom` fixed-byte filter above, `pve.storage.max_utilization_pct` adds a proportional utilization ceiling that gates `create_vm` placement, `create_disk`, `resize_disk`, and (warn-only) `snapshot_disk`. See [Operations — Storage capacity](operations.md#storage-capacity-utilization-bands-and-the-cpi-ceiling-gate) for the CoW-degradation and Ceph-watermark rationale, and [DLB-Aware Placement](dlb-aware-placement.md#storage-utilization-ceiling-gate) for how it fits into the placement flow.
+Independent of the `placement.reserve_storage_headroom` fixed-byte filter above, `pve.storage.max_utilization_pct` adds a proportional utilization ceiling that gates `create_vm` placement, `create_disk`, `resize_disk`, and (warn-only) `snapshot_disk`. See [Operations — Storage capacity](operations.md#storage-capacity-utilization-bands-and-the-cpi-ceiling-gate) for the CoW-degradation and Ceph-watermark rationale, and [DLB-Aware Placement](dlb-aware-placement.md#storage-utilization-ceiling-gate) for how it fits into the placement flow. That same Operations section also covers a zfspool-specific caveat for this headroom math: PVE's zfspool default is thick provisioning (every zvol reserves its full size up front), not the thin/on-demand allocation the CoW-degradation model above otherwise assumes for ZFS.
 
 | Property | Type | Default | Description |
 |---|---|---|---|

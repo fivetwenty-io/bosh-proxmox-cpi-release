@@ -308,6 +308,19 @@ func HandleCreateDisk(deps Deps) Handler {
 		if needsDiskPerfStorageTypeLookup(r, deps.Config) {
 			storageType = lookupVMStorageType(ctx, deps, storage)
 		}
+
+		// Diagnostic only, never mutates storage config, never fails this
+		// call: warns (once per pool per process) when storage resolves to a
+		// thick-provisioning zfspool. Strictly gated on storageType above —
+		// it re-queries ListStorage for the "sparse" flag only when the type
+		// is already resolved to "zfspool", and at most once per pool. An
+		// operator with both discard and ssd explicit (storageType stays ""
+		// — see needsDiskPerfStorageTypeLookup) does not pay for or receive
+		// this diagnostic; that tradeoff preserves the "no live lookup when
+		// opted out" contract discard/ssd auto-resolution already
+		// established. See warnIfZFSThickProvisioned.
+		warnIfZFSThickProvisioned(ctx, deps, storage, storageType)
+
 		diskPerfOpts, err := resolveDiskPerfOptions(r, deps.Config, storageType, format)
 		if err != nil {
 			return nil, err // non-retriable CloudError: bad cache mode / negative throttle
