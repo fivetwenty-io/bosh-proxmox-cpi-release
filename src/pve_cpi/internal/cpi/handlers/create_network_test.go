@@ -503,6 +503,144 @@ func TestHandleCreateNetwork_Bridge_HappyPath(t *testing.T) {
 	}
 }
 
+// -- Routing: mode sets the default, explicit spec intent overrides --
+
+// An unambiguous bridge request (cloud_properties.bridge, no zone, no vnet)
+// takes the bridge path even under network_mode=sdn — the default mode. Any
+// SDN API call panics (unconfigured mockSDNCluster), so passing proves the
+// SDN path was never entered.
+func TestHandleCreateNetwork_SDNMode_ExplicitBridgeTakesBridgePath(t *testing.T) {
+	t.Parallel()
+
+	var createNetIfaces []string
+	nodesSvc := &mockBridgeNodes{
+		createNetworkFn: func(_ context.Context, _ string, params *sdknodes.CreateNetworkParams) error {
+			createNetIfaces = append(createNetIfaces, params.Iface)
+			return nil
+		},
+	}
+
+	autoManage := true
+	cfg := testConfig()
+	cfg.NetworkMode = "sdn"
+	cfg.NetworkBridge = "vmbr0"
+	cfg.SDNAutoManageZone = &autoManage
+	deps := handlers.Deps{
+		Config: cfg,
+		PVE: &mockPVEClient{
+			clusterSvc: &mockSDNCluster{},
+			nodesSvc:   nodesSvc,
+		},
+		Logger: log.NewNopLogger(),
+	}
+
+	spec := map[string]any{
+		"type": "manual",
+		"cloud_properties": map[string]any{
+			"bridge": "vmbr9",
+		},
+	}
+	result, err := invokeCreateNetwork(t, deps, spec)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(createNetIfaces) != 1 || createNetIfaces[0] != "vmbr9" {
+		t.Fatalf("CreateNetwork ifaces: want [vmbr9], got %v", createNetIfaces)
+	}
+	arr := result.([]any)
+	if arr[0] != "vmbr9" {
+		t.Errorf("network_cid: got %v, want vmbr9", arr[0])
+	}
+}
+
+// A spec naming both a bridge and a vnet is an SDN request — the vnet wins
+// under network_mode=sdn. The bridge nodes API must not be touched (panic
+// stub), and the vnet is created in the turnkey flow's resolved zone.
+func TestHandleCreateNetwork_SDNMode_BridgeWithVnetStaysSDN(t *testing.T) {
+	t.Parallel()
+
+	var createdVnets []string
+	clusterSvc := &mockSDNCluster{
+		getSdnZonesFn: func(_ context.Context, _ string, _ *sdkcluster.GetSdnZonesParams) (*sdkcluster.GetSdnZonesResponse, error) {
+			raw := sdkcluster.GetSdnZonesResponse(`{"zone":"boshzone","type":"simple"}`)
+			return &raw, nil
+		},
+		getSdnVnetsFn: func(_ context.Context, _ string, _ *sdkcluster.GetSdnVnetsParams) (*sdkcluster.GetSdnVnetsResponse, error) {
+			return nil, sdnNotFound()
+		},
+		createSdnVnetsFn: func(_ context.Context, params *sdkcluster.CreateSdnVnetsParams) error {
+			createdVnets = append(createdVnets, params.Vnet)
+			return nil
+		},
+		updateSdnFn: func(_ context.Context, _ *sdkcluster.UpdateSdnParams) (*sdkcluster.UpdateSdnResponse, error) {
+			return nil, nil
+		},
+	}
+
+	spec := map[string]any{
+		"type": "manual",
+		"cloud_properties": map[string]any{
+			"zone":   "boshzone",
+			"vnet":   "boshvnet",
+			"bridge": "vmbr9",
+		},
+	}
+	result, err := invokeCreateNetwork(t, testSDNDeps(clusterSvc, "sdn", "", false), spec)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(createdVnets) != 1 || createdVnets[0] != "boshvnet" {
+		t.Fatalf("CreateSdnVnets: want [boshvnet], got %v", createdVnets)
+	}
+	arr := result.([]any)
+	if arr[0] != "boshvnet" {
+		t.Errorf("network_cid: got %v, want boshvnet", arr[0])
+	}
+}
+
+// An explicit zone+vnet takes the SDN path even under network_mode=bridge —
+// the mirror of the explicit-bridge carve-out above.
+func TestHandleCreateNetwork_BridgeMode_ExplicitVnetTakesSDNPath(t *testing.T) {
+	t.Parallel()
+
+	var createdVnets []string
+	clusterSvc := &mockSDNCluster{
+		getSdnZonesFn: func(_ context.Context, _ string, _ *sdkcluster.GetSdnZonesParams) (*sdkcluster.GetSdnZonesResponse, error) {
+			raw := sdkcluster.GetSdnZonesResponse(`{"zone":"boshzone","type":"simple"}`)
+			return &raw, nil
+		},
+		getSdnVnetsFn: func(_ context.Context, _ string, _ *sdkcluster.GetSdnVnetsParams) (*sdkcluster.GetSdnVnetsResponse, error) {
+			return nil, sdnNotFound()
+		},
+		createSdnVnetsFn: func(_ context.Context, params *sdkcluster.CreateSdnVnetsParams) error {
+			createdVnets = append(createdVnets, params.Vnet)
+			return nil
+		},
+		updateSdnFn: func(_ context.Context, _ *sdkcluster.UpdateSdnParams) (*sdkcluster.UpdateSdnResponse, error) {
+			return nil, nil
+		},
+	}
+
+	spec := map[string]any{
+		"type": "manual",
+		"cloud_properties": map[string]any{
+			"zone": "boshzone",
+			"vnet": "boshvnet",
+		},
+	}
+	result, err := invokeCreateNetwork(t, testSDNDeps(clusterSvc, "bridge", "", false), spec)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(createdVnets) != 1 || createdVnets[0] != "boshvnet" {
+		t.Fatalf("CreateSdnVnets: want [boshvnet], got %v", createdVnets)
+	}
+	arr := result.([]any)
+	if arr[0] != "boshvnet" {
+		t.Errorf("network_cid: got %v, want boshvnet", arr[0])
+	}
+}
+
 // -- CN-08: Missing args --
 
 func TestHandleCreateNetwork_MissingArg(t *testing.T) {

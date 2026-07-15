@@ -602,12 +602,12 @@ Note: on the SDN path `bridge` equals `vnet` because PVE realizes every vnet —
 
 **Path selection:**
 
-The handler picks a path from `pve.network_mode` (default `"sdn"`):
+The handler picks a path from `pve.network_mode` (default `"sdn"`). The mode sets the default; an unambiguous request in the network spec overrides it, so one CPI config can serve SDN and bridge networks side by side:
 
 | `network_mode` | Path taken |
 |---|---|
-| `"sdn"` (default) | Always SDN |
-| `"bridge"` (opt-in) | Always bridge |
+| `"sdn"` (default) | SDN — except when `cloud_properties` names a `bridge` and neither a `zone` nor a `vnet`, which is an explicit bridge request and takes the bridge path |
+| `"bridge"` (opt-in) | Bridge — except when `cloud_properties` names a `zone` or a `vnet`, which is an explicit SDN request and takes the SDN path |
 | `"auto"` (opt-in, legacy heuristic) | SDN when `cloud_properties.zone` or `cloud_properties.vnet` is set, or `pve.sdn_zone` is configured; bridge otherwise |
 
 **Behavior — SDN path:**

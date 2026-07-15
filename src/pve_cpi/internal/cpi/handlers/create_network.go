@@ -70,10 +70,14 @@ const vlanMaxTag = 4094
 //
 //	[network_cid, address_properties, cloud_properties_out]
 //
-// Routing:
-//   - SDN path: cloud_properties.zone set, OR config.SDNZone set, OR NetworkMode=="sdn".
-//   - Bridge path: NetworkMode=="bridge", OR only bridge/NetworkBridge available.
-//   - Auto (default): SDN when a zone is resolvable; bridge fallback otherwise.
+// Routing — the mode sets the default path; an unambiguous call/profile-level
+// request overrides it:
+//   - NetworkMode=="sdn" (default): SDN, unless cloud_properties names a bridge
+//     and neither a zone nor a vnet (explicit bridge request → bridge path).
+//   - NetworkMode=="bridge": bridge, unless cloud_properties names a zone or a
+//     vnet (explicit SDN request → SDN path).
+//   - "auto" (legacy heuristic): SDN when a zone is resolvable (call, profile,
+//     or config sdn_zone) or a vnet is named; bridge fallback otherwise.
 //   - No routing info → cpierrors.Cloud.
 func HandleCreateNetwork(deps Deps) cpi.Handler {
 	return cpi.HandlerFunc(func(ctx context.Context, args []json.RawMessage, _ jsonrpc.Context) (any, error) {
@@ -101,11 +105,16 @@ func createNetwork(ctx context.Context, deps Deps, args []json.RawMessage) (any,
 		return nil, rErr
 	}
 
-	// Determine path using layered resolution with config fallbacks.
-	var zone string
+	// Determine path using layered resolution with config fallbacks. specZone
+	// and specBridge carry only call/profile-level values (no config fallback):
+	// routing distinguishes what the caller asked for from what config would
+	// default, so a mode default never overrides an unambiguous request.
+	var specZone string
 	if v, ok := r.String("zone"); ok {
-		zone = v
-	} else {
+		specZone = v
+	}
+	zone := specZone
+	if zone == "" {
 		zone = cfg.SDNZone
 	}
 
@@ -114,19 +123,28 @@ func createNetwork(ctx context.Context, deps Deps, args []json.RawMessage) (any,
 		vnet = v
 	}
 
-	var bridge string
+	var specBridge string
 	if v, ok := r.String(nicCPKeyBridge); ok {
-		bridge = v
-	} else if cfg.NetworkBridge != "" {
+		specBridge = v
+	}
+	bridge := specBridge
+	if bridge == "" && cfg.NetworkBridge != "" {
 		bridge = cfg.NetworkBridge
 	}
 
 	useSDN := false
 	switch cfg.NetworkMode {
 	case networkModeSDN:
-		useSDN = true
+		// SDN by default; an unambiguous bridge request — cloud_properties
+		// (or profile) names a bridge and neither a zone nor a vnet — still
+		// takes the bridge path. The mode governs what an unspecified network
+		// defaults to; it does not override explicit intent, so one CPI config
+		// can serve SDN and bridge networks side by side.
+		useSDN = specBridge == "" || specZone != "" || vnet != ""
 	case networkModeBridge:
-		useSDN = false
+		// Bridge by default; an explicit zone or vnet is an unambiguous SDN
+		// request and takes the SDN path.
+		useSDN = specZone != "" || vnet != ""
 	default: // "auto"
 		// Use SDN when a zone is resolvable or vnet name is explicitly provided.
 		useSDN = zone != "" || vnet != ""

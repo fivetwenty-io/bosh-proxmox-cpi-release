@@ -4,11 +4,11 @@ This CPI supports two network backends for BOSH managed networks: PVE SDN vnets 
 
 ## SDN vs Bridge Routing
 
-The handler selects a backend based on three inputs: the `network_mode` config property, the `zone` field in `cloud_properties`, and the `sdn_zone` CPI config property. The routing logic runs in this order:
+The handler selects a backend based on three inputs: the `network_mode` config property, the `zone`/`vnet`/`bridge` fields in `cloud_properties`, and the `sdn_zone` CPI config property. The mode sets the default path; an unambiguous request in the network spec overrides it, so one CPI config can serve SDN and bridge networks side by side. The routing logic runs in this order:
 
-1. If `network_mode` is `"sdn"` (the default) → SDN path. When no zone is named anywhere and `sdn_auto_manage_zone` is enabled (its default), the CPI uses the turnkey zone `bosh`; with auto-manage disabled an unresolvable zone is an error.
+1. If `network_mode` is `"sdn"` (the default) → SDN path, unless `cloud_properties` names a `bridge` and neither a `zone` nor a `vnet` — an explicit bridge request, which takes the bridge path. On the SDN path, when no zone is named anywhere and `sdn_auto_manage_zone` is enabled (its default), the CPI uses the turnkey zone `bosh`; with auto-manage disabled an unresolvable zone is an error.
 
-2. If `network_mode` is `"bridge"` (opt-in) → bridge path (unconditional; error if bridge unresolvable).
+2. If `network_mode` is `"bridge"` (opt-in) → bridge path (error if bridge unresolvable), unless `cloud_properties` names a `zone` or a `vnet` — an explicit SDN request, which takes the SDN path.
 
 3. If `network_mode` is `"auto"` (opt-in; the legacy heuristic retained for compatibility):
    - If `cloud_properties.zone` is set OR `config.sdn_zone` is set OR `cloud_properties.vnet` is set → SDN path.
@@ -18,16 +18,19 @@ The handler selects a backend based on three inputs: the `network_mode` config p
 
 ### Routing decision table
 
-| `network_mode` | `cloud_properties.zone` | `config.sdn_zone` | `cloud_properties.bridge` / `config.network_bridge` | Outcome |
+| `network_mode` | `cloud_properties.zone` / `.vnet` | `config.sdn_zone` | `cloud_properties.bridge` | Outcome |
 |---|---|---|---|---|
-| `sdn` (default) | any | any | any | SDN path (turnkey zone `bosh` when no zone named and auto-manage on) |
-| `bridge` (opt-in) | any | any | any | Bridge path |
-| `auto` (opt-in) | set | any | any | SDN path |
-| `auto` (opt-in) | empty | set | any | SDN path |
-| `auto` (opt-in) | empty | empty | set | Bridge path |
-| `auto` (opt-in) | empty | empty | empty | Error: no routing info |
+| `sdn` (default) | any set | any | any | SDN path |
+| `sdn` (default) | both empty | any | empty | SDN path (turnkey zone `bosh` when no zone named and auto-manage on) |
+| `sdn` (default) | both empty | any | set | Bridge path (explicit bridge request) |
+| `bridge` (opt-in) | any set | any | any | SDN path (explicit SDN request) |
+| `bridge` (opt-in) | both empty | any | any | Bridge path (falls back to `config.network_bridge` when unset) |
+| `auto` (opt-in) | any set | any | any | SDN path |
+| `auto` (opt-in) | both empty | set | any | SDN path |
+| `auto` (opt-in) | both empty | empty | set (or `config.network_bridge`) | Bridge path |
+| `auto` (opt-in) | both empty | empty | empty | Error: no routing info |
 
-> **Note:** `config.sdn_zone` is loaded into the same `zone` variable as `cloud_properties.zone` before routing runs; the table reflects the effective per-path outcome.
+> **Note:** only call- and profile-level values steer the explicit-request overrides; `config.sdn_zone` and `config.network_bridge` are defaults, not intent, and never flip the path away from the mode's default. Under `auto`, `config.sdn_zone` still routes to SDN — the legacy heuristic is preserved unchanged.
 
 For `delete_network`, the handler probes the SDN backend first (GET vnet by name). If the vnet exists, it takes the SDN delete path. If PVE reports the vnet absent (`ErrSDNNotFound`), it falls back to the bridge delete path. Any other probe error is returned to the Director unchanged.
 
@@ -169,7 +172,7 @@ The sequence is the same, minus the vxlan specifics: the zone is created as type
 
 ### Example 2 — Bridge (opt-in)
 
-The legacy path, retained as an explicit opt-in: no SDN required, and the CPI creates a Linux bridge on the target node. The bridge exists only on that node, so this suits single-node setups only. Set `network_mode: bridge` (or `auto` with a per-network `bridge` cloud property and no zone/vnet).
+The legacy path, retained as an explicit opt-in: no SDN required, and the CPI creates a Linux bridge on the target node. The bridge exists only on that node, so this suits single-node setups only. Set `network_mode: bridge`, or leave the default mode in place and give the managed network a `bridge` cloud property with no zone/vnet — an explicit bridge request takes the bridge path under any mode.
 
 BOSH manifest CPI properties:
 
@@ -218,8 +221,12 @@ The routing and provisioning sequence is shown below. Phase labels correspond to
 ```mermaid
 flowchart TD
     A([create_network called]) --> B{network_mode?}
-    B -->|sdn — the default| C[SDN path]
-    B -->|bridge — opt-in| D[Bridge path]
+    B -->|sdn — the default| B1{spec bridge set,<br/>zone+vnet empty?}
+    B1 -->|no| C[SDN path]
+    B1 -->|yes — explicit bridge request| D[Bridge path]
+    B -->|bridge — opt-in| B2{spec zone or vnet set?}
+    B2 -->|no| D
+    B2 -->|yes — explicit SDN request| C
     B -->|auto — opt-in heuristic| E{zone or sdn_zone set?}
     E -->|yes| C
     E -->|no| F{vnet set?}

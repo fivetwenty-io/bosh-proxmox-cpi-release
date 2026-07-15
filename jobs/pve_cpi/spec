@@ -97,7 +97,11 @@ properties:
     default: "vmbr0"
   pve.network_mode:
     description: |
-      Selects create_network/delete_network behavior.
+      Selects the default create_network/delete_network path. The mode
+      governs networks whose spec does not say otherwise; an unambiguous
+      network spec overrides it (cloud_properties naming only a bridge
+      takes the bridge path under "sdn"; naming a zone or vnet takes the
+      SDN path under "bridge").
       "sdn" — PVE SDN vnet lifecycle (cluster SDN must be enabled). The
                default: CPI-created networks are SDN vnets that span every
                cluster node.
@@ -106,8 +110,9 @@ properties:
       "auto" — legacy heuristic retained for compatibility: use SDN when
                cloud_properties.zone or pve.sdn_zone is set; fall back to
                bridge otherwise. Deployments that relied on the old
-               auto-to-bridge fallback without naming a zone must now set
-               network_mode: "auto" (or "bridge") explicitly.
+               auto-to-bridge fallback without naming a zone can also give
+               each bridge network an explicit cloud_properties.bridge and
+               keep the default mode.
     default: "sdn"
   pve.sdn_zone:
     description: |
