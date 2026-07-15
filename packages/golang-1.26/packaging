@@ -5,15 +5,15 @@
 # source as Makefile GO_BLOB_SHA.
 set -euo pipefail
 
-BLOB="golang-1.26/go1.26.3.linux-amd64.tar.gz"
+BLOB="golang-1.26/go1.26.5.linux-amd64.tar.gz"
 
 # ---------------------------------------------------------------------------
 # SHA256 verification
-# Canonical digest: Makefile GO_BLOB_SHA (go1.26.3.linux-amd64.tar.gz from
+# Canonical digest: Makefile GO_BLOB_SHA (go1.26.5.linux-amd64.tar.gz from
 # https://dl.google.com/go/).  Pinned here so the packaging script is
 # self-contained and verifiable without the Makefile.
 # ---------------------------------------------------------------------------
-EXPECTED_SHA256="2b2cfc7148493da5e73981bffbf3353af381d5f93e789c82c79aff64962eb556"
+EXPECTED_SHA256="5c2c3b16caefa1d968a94c1daca04a7ca301a496d9b086e17ad77bb81393f053"
 
 echo "==> Verifying Go toolchain tarball SHA256"
 ACTUAL_SHA256="$(sha256sum "${BLOB}" | awk '{print $1}')"

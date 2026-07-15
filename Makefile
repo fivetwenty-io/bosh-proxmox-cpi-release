@@ -39,11 +39,11 @@ GO_SOURCES := $(shell find $(SRC_ROOT) -type f -name '*.go' -not -path '*/vendor
 
 # BOSH release blob config
 BLOBS_DIR    := blobs
-GO_BLOB_VER  := 1.26.3
+GO_BLOB_VER  := 1.26.5
 GO_BLOB_NAME := go$(GO_BLOB_VER).linux-amd64.tar.gz
 GO_BLOB_KEY  := golang-1.26/$(GO_BLOB_NAME)
 GO_BLOB_URL  := https://dl.google.com/go/$(GO_BLOB_NAME)
-GO_BLOB_SHA  := 2b2cfc7148493da5e73981bffbf3353af381d5f93e789c82c79aff64962eb556
+GO_BLOB_SHA  := 5c2c3b16caefa1d968a94c1daca04a7ca301a496d9b086e17ad77bb81393f053
 
 ##@ General
 
