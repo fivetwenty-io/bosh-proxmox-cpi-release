@@ -850,6 +850,18 @@ know each pool's backend type. An explicit `true`/`false` at any layer still win
 computed default. See [Configuration — Discard/SSD
 auto-resolution](configuration.md#discardssd-auto-resolution) for the full matrix.
 
+**Root disk bus update.** The root disk itself can now move off virtio-blk: `pve.root_disk_bus`
+(default `virtio`, unchanged) accepts `scsi`, which creates the root disk on `scsi0` under
+the same virtio-scsi controller persistent disks already use — unlocking the discard/ssd
+auto-resolution above on the root disk itself, previously unavailable on virtio-blk. `scsi0`
+has always been reserved (persistent-disk allocation starts at `scsi1`), so there is no slot
+collision either way. The one real constraint is the clone path: `create_vm`'s dominant path
+clones a pre-built stemcell template, and a clone inherits its source's exact disk layout, so
+a template built before this setting was enabled still carries a virtio0 root — `create_vm`
+detects that mismatch and fails fast with an actionable error rather than silently cloning
+the wrong bus. See [Configuration — `pve.root_disk_bus`](configuration.md) for the full
+clone-path detail.
+
 **Benefit.** Each knob maps to a concrete Proxmox storage win: `discard=on` issues TRIM/UNMAP so
 a thin LVM or Ceph pool actually reclaims space the guest frees (without it, a thin pool fills
 permanently as files are deleted); `iothread=1` gives the disk a dedicated QEMU I/O thread,

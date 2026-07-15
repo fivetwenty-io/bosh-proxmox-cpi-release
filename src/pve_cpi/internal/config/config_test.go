@@ -165,6 +165,16 @@ func TestValidate_ClusterLockTimeoutNegative(t *testing.T) {
 	assertCloudError(t, err, "cluster_lock_timeout_sec must be >= 0")
 }
 
+func TestValidate_RootDiskBusInvalid(t *testing.T) {
+	t.Parallel()
+	_, err := mustLoad(t, `{
+		"host": "h", "user": "u", "password": "p",
+		"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
+		"root_disk_bus": "ide"
+	}`)
+	assertCloudError(t, err, "root_disk_bus must be one of")
+}
+
 func TestReplicaAdoptAccessors(t *testing.T) {
 	t.Parallel()
 	// Default: disabled, resolves to 0.
@@ -384,6 +394,76 @@ func TestClusterLockModeValid(t *testing.T) {
 		if got := cfg.ClusterLockMode(); got != mode {
 			t.Errorf("ClusterLockMode(): got %q, want %q", got, mode)
 		}
+	}
+}
+
+func TestRootDiskBusValid(t *testing.T) {
+	t.Parallel()
+	for _, bus := range []string{"virtio", "scsi"} {
+		cfg, err := mustLoad(t, `{
+			"host": "h", "user": "u", "password": "p",
+			"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
+			"root_disk_bus": "`+bus+`"
+		}`)
+		if err != nil {
+			t.Fatalf("bus %q should be valid, got: %v", bus, err)
+		}
+		if got := cfg.RootDiskBusValue(); got != bus {
+			t.Errorf("RootDiskBusValue(): got %q, want %q", got, bus)
+		}
+	}
+}
+
+// TestRootDiskBusValue_UnsetDefaultsToVirtio verifies that an absent
+// root_disk_bus (empty JSON key, matching every deployment before this
+// property existed) resolves to "virtio" — the byte-identical default.
+func TestRootDiskBusValue_UnsetDefaultsToVirtio(t *testing.T) {
+	t.Parallel()
+	cfg, err := mustLoad(t, `{
+		"host": "h", "user": "u", "password": "p",
+		"vm_storage": "s", "disk_storage": "s", "network_bridge": "br"
+	}`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := cfg.RootDiskBusValue(); got != "virtio" {
+		t.Errorf("RootDiskBusValue() with unset root_disk_bus: got %q, want %q", got, "virtio")
+	}
+	if cfg.RootDiskUsesSCSI() {
+		t.Error("RootDiskUsesSCSI() should be false when root_disk_bus is unset")
+	}
+}
+
+// TestRootDiskBusValue_NilConfig verifies the nil-receiver accessor path
+// resolves to "virtio" rather than panicking.
+func TestRootDiskBusValue_NilConfig(t *testing.T) {
+	t.Parallel()
+	var cfg *config.CPIConfig
+	if got := cfg.RootDiskBusValue(); got != "virtio" {
+		t.Errorf("RootDiskBusValue() on nil config: got %q, want %q", got, "virtio")
+	}
+	if cfg.RootDiskUsesSCSI() {
+		t.Error("RootDiskUsesSCSI() on nil config should be false")
+	}
+}
+
+// TestRootDiskBusValue_CaseInsensitiveAndTrimmed verifies normalization
+// matches the pattern used by ClusterLockMode/DiskPerfInvariantMode.
+func TestRootDiskBusValue_CaseInsensitiveAndTrimmed(t *testing.T) {
+	t.Parallel()
+	cfg, err := mustLoad(t, `{
+		"host": "h", "user": "u", "password": "p",
+		"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
+		"root_disk_bus": "  SCSI  "
+	}`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := cfg.RootDiskBusValue(); got != "scsi" {
+		t.Errorf("RootDiskBusValue(): got %q, want %q", got, "scsi")
+	}
+	if !cfg.RootDiskUsesSCSI() {
+		t.Error("RootDiskUsesSCSI() should be true for '  SCSI  '")
 	}
 }
 

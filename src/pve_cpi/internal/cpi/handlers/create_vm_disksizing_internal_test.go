@@ -220,12 +220,12 @@ func buildEphemeralDeps(
 }
 
 // --------------------------------------------------------------------------
-// readVirtio0SizeGiB tests
+// readRootDiskSizeGiB tests
 // --------------------------------------------------------------------------
 
-// TestReadVirtio0SizeGiB_ReturnsActualSize verifies the happy path: virtio0
+// TestReadRootDiskSizeGiB_ReturnsActualSize verifies the happy path: virtio0
 // present with a parseable size= directive returns the correct GiB value.
-func TestReadVirtio0SizeGiB_ReturnsActualSize(t *testing.T) {
+func TestReadRootDiskSizeGiB_ReturnsActualSize(t *testing.T) {
 	t.Parallel()
 
 	deps := buildDiskSizingDeps(
@@ -238,18 +238,18 @@ func TestReadVirtio0SizeGiB_ReturnsActualSize(t *testing.T) {
 		nil,
 	)
 
-	got, err := readVirtio0SizeGiB(context.Background(), deps, "pve", 100)
+	got, err := readRootDiskSizeGiB(context.Background(), deps, "pve", 100, diskKeyVirtio0)
 	if err != nil {
-		t.Fatalf("readVirtio0SizeGiB unexpected error: %v", err)
+		t.Fatalf("readRootDiskSizeGiB unexpected error: %v", err)
 	}
 	if got != 7 {
-		t.Errorf("readVirtio0SizeGiB = %d; want 7", got)
+		t.Errorf("readRootDiskSizeGiB = %d; want 7", got)
 	}
 }
 
-// TestReadVirtio0SizeGiB_MissingKey_Fallback verifies that a config map without
+// TestReadRootDiskSizeGiB_MissingKey_Fallback verifies that a config map without
 // a virtio0 key returns defaultStemcellDiskGiB (5).
-func TestReadVirtio0SizeGiB_MissingKey_Fallback(t *testing.T) {
+func TestReadRootDiskSizeGiB_MissingKey_Fallback(t *testing.T) {
 	t.Parallel()
 
 	deps := buildDiskSizingDeps(
@@ -261,20 +261,20 @@ func TestReadVirtio0SizeGiB_MissingKey_Fallback(t *testing.T) {
 		nil,
 	)
 
-	got, err := readVirtio0SizeGiB(context.Background(), deps, "pve", 100)
+	got, err := readRootDiskSizeGiB(context.Background(), deps, "pve", 100, diskKeyVirtio0)
 	if err != nil {
-		t.Fatalf("readVirtio0SizeGiB unexpected error: %v", err)
+		t.Fatalf("readRootDiskSizeGiB unexpected error: %v", err)
 	}
 	if got != defaultStemcellDiskGiB {
-		t.Errorf("readVirtio0SizeGiB (missing key) = %d; want %d (defaultStemcellDiskGiB)", got, defaultStemcellDiskGiB)
+		t.Errorf("readRootDiskSizeGiB (missing key) = %d; want %d (defaultStemcellDiskGiB)", got, defaultStemcellDiskGiB)
 	}
 }
 
-// TestReadVirtio0SizeGiB_ConfigError_Propagates verifies that a Config call
+// TestReadRootDiskSizeGiB_ConfigError_Propagates verifies that a Config call
 // returning an error is propagated (NOT swallowed as a fallback to 5). A
 // transient read failure on a non-5-GiB template would otherwise fabricate the
 // wrong resize delta; the caller surfaces this as a retriable error instead.
-func TestReadVirtio0SizeGiB_ConfigError_Propagates(t *testing.T) {
+func TestReadRootDiskSizeGiB_ConfigError_Propagates(t *testing.T) {
 	t.Parallel()
 
 	deps := buildDiskSizingDeps(
@@ -284,15 +284,15 @@ func TestReadVirtio0SizeGiB_ConfigError_Propagates(t *testing.T) {
 		nil,
 	)
 
-	_, err := readVirtio0SizeGiB(context.Background(), deps, "pve", 100)
+	_, err := readRootDiskSizeGiB(context.Background(), deps, "pve", 100, diskKeyVirtio0)
 	if err == nil {
-		t.Fatal("readVirtio0SizeGiB (config error): expected error, got nil")
+		t.Fatal("readRootDiskSizeGiB (config error): expected error, got nil")
 	}
 }
 
-// TestReadVirtio0SizeGiB_ParseError_Fallback verifies that an unparseable
+// TestReadRootDiskSizeGiB_ParseError_Fallback verifies that an unparseable
 // virtio0 option string causes fallback to defaultStemcellDiskGiB.
-func TestReadVirtio0SizeGiB_ParseError_Fallback(t *testing.T) {
+func TestReadRootDiskSizeGiB_ParseError_Fallback(t *testing.T) {
 	t.Parallel()
 
 	deps := buildDiskSizingDeps(
@@ -304,12 +304,12 @@ func TestReadVirtio0SizeGiB_ParseError_Fallback(t *testing.T) {
 		nil,
 	)
 
-	got, err := readVirtio0SizeGiB(context.Background(), deps, "pve", 100)
+	got, err := readRootDiskSizeGiB(context.Background(), deps, "pve", 100, diskKeyVirtio0)
 	if err != nil {
-		t.Fatalf("readVirtio0SizeGiB unexpected error: %v", err)
+		t.Fatalf("readRootDiskSizeGiB unexpected error: %v", err)
 	}
 	if got != defaultStemcellDiskGiB {
-		t.Errorf("readVirtio0SizeGiB (parse error) = %d; want %d (defaultStemcellDiskGiB)", got, defaultStemcellDiskGiB)
+		t.Errorf("readRootDiskSizeGiB (parse error) = %d; want %d (defaultStemcellDiskGiB)", got, defaultStemcellDiskGiB)
 	}
 }
 
@@ -360,6 +360,7 @@ func TestResizeRootDisk_GrowCorrectDelta(t *testing.T) {
 		node:        "pve",
 		rootDiskGiB: 10,
 		maxAttempts: 1,
+		rootDiskKey: diskKeyVirtio0,
 	}
 
 	err := resizeRootDisk(context.Background(), deps, log.NewNopLogger(), shape, 100)
@@ -386,6 +387,7 @@ func TestResizeRootDisk_GrowTemplate3G(t *testing.T) {
 		node:        "pve",
 		rootDiskGiB: 10,
 		maxAttempts: 1,
+		rootDiskKey: diskKeyVirtio0,
 	}
 
 	err := resizeRootDisk(context.Background(), deps, log.NewNopLogger(), shape, 100)
@@ -411,6 +413,7 @@ func TestResizeRootDisk_NoOp_Equal(t *testing.T) {
 		node:        "pve",
 		rootDiskGiB: 10,
 		maxAttempts: 1,
+		rootDiskKey: diskKeyVirtio0,
 	}
 
 	err := resizeRootDisk(context.Background(), deps, log.NewNopLogger(), shape, 100)
@@ -433,6 +436,7 @@ func TestResizeRootDisk_ShrinkReject(t *testing.T) {
 		node:        "pve",
 		rootDiskGiB: 5,
 		maxAttempts: 1,
+		rootDiskKey: diskKeyVirtio0,
 	}
 
 	err := resizeRootDisk(context.Background(), deps, log.NewNopLogger(), shape, 100)

@@ -38,8 +38,13 @@ type AgentConfig struct {
 // identifying the system, ephemeral, and persistent disk bus indices by their
 // virtio slot numbers (as strings) so the BOSH agent can locate each device.
 type DisksSpec struct {
-	// System is the bus index (string) of the root disk; the stemcell's
-	// agent.json DevicePathResolutionType=virtio resolves "0" to /dev/vda.
+	// System is the device-path hint for the root disk. The CPI always writes
+	// the literal "/dev/sda" (see create_vm.go's agentCfg construction): the
+	// agent's mappedDevicePathResolver strips the "/dev/sd" prefix and probes
+	// "/dev/xvd", "/dev/vd", "/dev/sd" in turn, so the same literal resolves
+	// correctly to /dev/vda under the default virtio0 root disk and to
+	// /dev/sda itself under pve.root_disk_bus=scsi (where no virtio disk
+	// exists at all).
 	System string `json:"system"`
 	// Ephemeral is the bus index (string) of the ephemeral disk, or empty
 	// when no dedicated ephemeral disk is attached (the agent then carves

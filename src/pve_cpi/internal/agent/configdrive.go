@@ -26,8 +26,12 @@ var localISOStorageWarnOnce sync.Once
 // the slot index does not need to match a path the agent expects. PVE
 // exposes scsi0–scsi30 (31 slots total). Reservation map:
 //
-//	virtio0         system disk (stemcell-imported root).
-//	scsi0           unused (kept free for clarity; AttachDisk starts at scsi1).
+//	virtio0 (default) or scsi0 (pve.root_disk_bus=scsi)
+//	                system disk (stemcell-imported root; see create_vm's
+//	                rootDiskKey). scsi0 is reserved for the root disk either
+//	                way — AttachDisk always starts its free-slot search at
+//	                scsi1, so persistent-disk allocation is identical
+//	                regardless of which bus the root disk is on.
 //	scsi1..scsi28   ephemeral + persistent disks (create_vm + attach_disk).
 //	scsi29          reserved headroom (unused; leaves space for future use).
 //	scsi30          ConfigDrive CD-ROM (this constant).

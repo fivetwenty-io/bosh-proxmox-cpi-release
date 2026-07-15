@@ -447,6 +447,43 @@ func TestHandleAttachDisk_FreshVMSkipsSCSI0(t *testing.T) {
 	}
 }
 
+// TestHandleAttachDisk_RootDiskBusSCSI_StillSkipsSCSI0 verifies that when the
+// root disk itself occupies scsi0 (pve.root_disk_bus=scsi), a new persistent
+// disk still lands at scsi1 — nextFreeSCSIIndexAtLeast always starts its scan
+// at 1 regardless of what (if anything) occupies scsi0, so root_disk_bus=scsi
+// introduces no persistent-disk slot collision.
+func TestHandleAttachDisk_RootDiskBusSCSI_StillSkipsSCSI0(t *testing.T) {
+	t.Parallel()
+	const volid = "vm-9001-disk-0"
+	qemuSvc := &attachQEMUService{
+		attachReturnDiskID: "scsi1",
+		// scsi0 holds the ROOT disk's own (unrelated) volid — root_disk_bus=scsi.
+		// First Config call (slot selection): scsi0 occupied, no scsi1 yet.
+		// Second Config call (resolve): the new attachment landed at scsi1.
+		configCfg: map[string]any{
+			"scsi0": "data:vm-100-disk-0",
+			"scsi1": "data:" + volid,
+		},
+	}
+	ag := &captureAgent{}
+	h := handlers.HandleAttachDisk(attachDeps(qemuSvc, ag))
+
+	result, err := h.Handle(context.Background(), attachArgs("100", "data:"+volid), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(qemuSvc.detachCalls) != 0 {
+		t.Errorf("scsi0 holds the root disk's own volid, not the attaching disk's — "+
+			"no legacy-migration detach should fire, got %v", qemuSvc.detachCalls)
+	}
+
+	const wantPath = "/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_drive-scsi1"
+	path := extractPath(t, result)
+	if path != wantPath {
+		t.Errorf("disk_hints.path: want %q, got %q", wantPath, path)
+	}
+}
+
 // TestHandleAttachDisk_LegacySCSI0Migration verifies the migration path:
 // when a disk is already attached at scsi0 (from a prior CPI version that
 // allowed it), attach_disk detaches scsi0 and reattaches at scsi1+.

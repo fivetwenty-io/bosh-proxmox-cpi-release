@@ -157,6 +157,13 @@
   clone_mode = p("pve.clone_mode", "")
   config["clone_mode"] = clone_mode unless clone_mode.to_s.empty?
 
+  # Emit root_disk_bus only when the operator supplies a non-empty value. The Go
+  # config accessor (RootDiskBusValue) defaults empty string to "virtio" — the
+  # key is omitted for the byte-identical default. Emit only when the operator
+  # opts into "scsi".
+  root_disk_bus = p("pve.root_disk_bus", "")
+  config["root_disk_bus"] = root_disk_bus unless root_disk_bus.to_s.empty?
+
   # Emit ensure_no_ip_conflicts only when explicitly set to false. The Go config
   # accessor defaults nil *bool -> true (protective); omitting the key preserves
   # that default. Emit only when the operator explicitly disables the guard.

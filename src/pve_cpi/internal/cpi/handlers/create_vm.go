@@ -111,9 +111,37 @@ const (
 	nicCPKeyFirewall = "firewall"
 )
 
-// diskKeyVirtio0 is the PVE VM config key for the primary root disk.
-// Used across create_vm, create_stemcell, and get_disks to avoid repeated literals.
+// diskKeyVirtio0 is the PVE VM config key for the primary root disk under the
+// default pve.root_disk_bus (unset/"virtio"). Used across create_vm,
+// create_stemcell, and get_disks to avoid repeated literals.
 const diskKeyVirtio0 = "virtio0"
+
+// diskKeyScsi0 is the PVE VM config key for the primary root disk when
+// pve.root_disk_bus is set to "scsi". See rootDiskKey.
+const diskKeyScsi0 = "scsi0"
+
+// rootDiskKey returns the PVE VM config key the root (system) disk is
+// created under: "virtio0" (default) or "scsi0" when
+// cfg.RootDiskUsesSCSI() is true. Both create_vm and create_stemcell use
+// this so a template's root disk always lands under the same key a
+// subsequent create_vm clone of it expects.
+func rootDiskKey(cfg *config.CPIConfig) string {
+	if cfg.RootDiskUsesSCSI() {
+		return diskKeyScsi0
+	}
+	return diskKeyVirtio0
+}
+
+// rootDiskBusName returns the filterDiskPerfForBus bus label matching
+// rootDiskKey: "virtio" (drops "ssd" — virtio-blk has no rotation-rate flag)
+// or "scsi" (keeps "ssd", enabling discard/ssd auto-resolution on a root
+// disk that lives on the same virtio-scsi controller as persistent disks).
+func rootDiskBusName(cfg *config.CPIConfig) string {
+	if cfg.RootDiskUsesSCSI() {
+		return "scsi"
+	}
+	return "virtio"
+}
 
 // createVMCloudProps holds the fields we care about from Args[2].
 type createVMCloudProps struct {
@@ -318,10 +346,17 @@ type createVMShape struct {
 	// via the layered resolver (vm_type profile may override config.CloneMode).
 	cloudPropsMap map[string]any
 	// rootDiskPerfOpts holds the resolved PVE per-disk performance options for
-	// the root disk (virtio0). Derived once in resolveVMShape via
-	// resolveDiskPerfOptions + filterDiskPerfForBus("virtio"). Empty map when no
-	// options are set (byte-identical path: nothing appended to virtio0 string).
+	// the root disk (rootDiskKey). Derived once in resolveVMShape via
+	// resolveDiskPerfOptions + filterDiskPerfForBus(rootDiskBusName(cfg)). Empty
+	// map when no options are set (byte-identical path: nothing appended to the
+	// root disk string).
 	rootDiskPerfOpts map[string]string
+	// rootDiskKey is the PVE VM config key the root disk is created under:
+	// "virtio0" (default) or "scsi0" (pve.root_disk_bus=scsi). Resolved once via
+	// the package-level rootDiskKey(cfg) function. Both import-path
+	// (createParams) and clone-path (template-inherited key, verified against
+	// this value) use it.
+	rootDiskKey string
 	// scsihw is the resolved SCSI controller model. Defaults to "virtio-scsi-pci";
 	// set to "virtio-scsi-single" only when virtio_scsi_single is opted in via
 	// the layered resolver. Both import-path (createParams) and clone-path
@@ -1025,11 +1060,16 @@ func parseCreateVMArgs(args []json.RawMessage) (*createVMParsedArgs, error) {
 	}
 
 	// Disk slot layout:
-	//   virtio0       system disk (stemcell-imported root; see create flow below).
+	//   virtio0 (default) or scsi0 (pve.root_disk_bus=scsi)
+	//                 system disk (stemcell-imported root; see create flow below,
+	//                 and rootDiskKey for bus selection).
 	//   scsi1..scsi28 persistent disks at create_vm time + dynamic attach_disk.
 	//   scsi30        ConfigDrive CD-ROM (see agent.configDriveSlot); scsi29 headroom.
-	// scsi0 is intentionally left unused so AttachDisk's free-slot search
-	// (which starts at scsi1) and the agent's expectations stay simple.
+	// scsi0 is always reserved for the root disk (used or not): AttachDisk's
+	// free-slot search starts at scsi1 unconditionally, so persistent-disk slot
+	// allocation is identical regardless of which bus the root disk is on —
+	// there is no slot collision to manage when root_disk_bus=scsi puts the
+	// root disk on the slot persistent disks already skip.
 	const maxPersistentDisksAtCreate = 28
 	if len(diskCIDs) > maxPersistentDisksAtCreate {
 		return nil, cpierrors.Cloud(
@@ -1120,7 +1160,11 @@ func buildVMShapeForNode(ctx context.Context, deps Deps, parsed *createVMParsedA
 	// IsLinkedCloneSupported treats as linked-capable (permissive).
 	vmStorageType := lookupVMStorageType(ctx, deps, vmStorage)
 
-	// Resolve per-disk performance options for the root disk (virtio0).
+	// rootDiskKeyVal is the PVE VM config key the root disk lands on: virtio0
+	// (default) or scsi0 (pve.root_disk_bus=scsi).
+	rootDiskKeyVal := rootDiskKey(deps.Config)
+
+	// Resolve per-disk performance options for the root disk.
 	// newLayeredResolver is cheap (no I/O); building a dedicated resolver here
 	// avoids threading it through resolveVMShapeStorage's signature.
 	// On error (invalid cloud_property value) we propagate a CloudError
@@ -1133,9 +1177,13 @@ func buildVMShapeForNode(ctx context.Context, deps Deps, parsed *createVMParsedA
 	if perfOptsErr != nil {
 		return nil, perfOptsErr
 	}
-	// virtio0 is a virtio-blk device: the "ssd" flag is invalid on that bus.
+	// virtio0 is a virtio-blk device: the "ssd" flag is invalid on that bus, so
 	// filterDiskPerfForBus("virtio") removes it while keeping iothread/cache/etc.
-	rootDiskPerfOpts := filterDiskPerfForBus(rawPerfOpts, "virtio")
+	// A scsi0 root disk (pve.root_disk_bus=scsi) lives on the same virtio-scsi
+	// controller persistent disks use, so filterDiskPerfForBus("scsi") keeps ssd
+	// too — composing correctly with the discard/ssd TRIM-capability auto-
+	// resolution in resolveDiskPerfOptions.
+	rootDiskPerfOpts := filterDiskPerfForBus(rawPerfOpts, rootDiskBusName(deps.Config))
 
 	scsihwVal := "virtio-scsi-pci"
 	if resolveVirtioSCSISingle(perfR, deps.Config) {
@@ -1169,6 +1217,7 @@ func buildVMShapeForNode(ctx context.Context, deps Deps, parsed *createVMParsedA
 		initialName:      initialName,
 		cloudPropsMap:    parsed.cloudPropsMap,
 		rootDiskPerfOpts: rootDiskPerfOpts,
+		rootDiskKey:      rootDiskKeyVal,
 		scsihw:           scsihwVal,
 		ephemeralDiskGiB: ephemeralDiskGiB,
 		ephemeralStorage: ephemeralStorage,
@@ -2533,9 +2582,15 @@ func lookupVMStorageType(ctx context.Context, deps Deps, storageName string) str
 }
 
 // resolveTemplateDiskStorage reads templateVMID's config on templateNode and
-// returns the PVE storage pool name its root disk resides on. create_stemcell
-// always places a template's system disk on virtio0 (see create_stemcell.go),
-// so that is the only bus checked here.
+// returns the PVE storage pool name its root disk resides on, plus the PVE
+// config key ("virtio0" or "scsi0") that root disk actually lives under.
+// create_stemcell writes the template's root disk under rootDiskKey(cfg) as
+// resolved AT TEMPLATE CREATION TIME (see create_stemcell.go); since templates
+// are reused by content-hash tag match across an arbitrary span of time, a
+// template built before a pve.root_disk_bus change can carry the other key —
+// this function auto-detects whichever key is actually present rather than
+// assuming the CPI's current setting, so cloneFromTemplate can compare the
+// two and fail fast on a mismatch instead of silently cloning the wrong bus.
 //
 // A linked clone's overlay volume always lands on the SAME storage pool as
 // its base (PVE does not honor the Storage/Format params on a linked clone),
@@ -2543,22 +2598,28 @@ func lookupVMStorageType(ctx context.Context, deps Deps, storageName string) str
 // decide whether clone_mode=linked would silently misplace the disk.
 //
 // Any failure to determine the pool (config read error, missing/unparseable
-// virtio0 entry) returns ("", non-nil err). Callers MUST treat a non-nil err
-// as "undeterminable" and fail open to the pre-existing (vm_storage-keyed)
-// behavior with a Warn — the template's storage is cluster state the CPI
-// does not control, and a transient read hiccup here must never hard-fail
-// create_vm.
-func resolveTemplateDiskStorage(ctx context.Context, deps Deps, templateNode string, templateVMID int64) (storage string, err error) {
+// root disk entry) returns ("", "", non-nil err). Callers MUST treat a
+// non-nil err as "undeterminable" and fail open to the pre-existing
+// (vm_storage-keyed) behavior with a Warn — the template's storage is cluster
+// state the CPI does not control, and a transient read hiccup here must never
+// hard-fail create_vm.
+func resolveTemplateDiskStorage(ctx context.Context, deps Deps, templateNode string, templateVMID int64) (storage, rootKey string, err error) {
 	if deps.PVE == nil || deps.PVE.QEMU() == nil {
-		return "", fmt.Errorf("PVE QEMU service unavailable")
+		return "", "", fmt.Errorf("PVE QEMU service unavailable")
 	}
 	cfg, cfgErr := deps.PVE.QEMU().Config(ctx, templateNode, int(templateVMID))
 	if cfgErr != nil {
-		return "", fmt.Errorf("read template %d config on node %q: %w", templateVMID, templateNode, cfgErr)
+		return "", "", fmt.Errorf("read template %d config on node %q: %w", templateVMID, templateNode, cfgErr)
 	}
-	v0, ok := cfg[diskKeyVirtio0].(string)
+	rootKey = diskKeyVirtio0
+	v0, ok := cfg[rootKey].(string)
 	if !ok || v0 == "" {
-		return "", fmt.Errorf("template %d config on node %q has no %s entry", templateVMID, templateNode, diskKeyVirtio0)
+		rootKey = diskKeyScsi0
+		v0, ok = cfg[rootKey].(string)
+	}
+	if !ok || v0 == "" {
+		return "", "", fmt.Errorf("template %d config on node %q has neither a %s nor a %s entry",
+			templateVMID, templateNode, diskKeyVirtio0, diskKeyScsi0)
 	}
 	bare := v0
 	if comma := strings.Index(bare, ","); comma >= 0 {
@@ -2566,9 +2627,9 @@ func resolveTemplateDiskStorage(ctx context.Context, deps Deps, templateNode str
 	}
 	storage, _, parseErr := pve.ParseDiskCID(bare)
 	if parseErr != nil {
-		return "", fmt.Errorf("parse template %d virtio0 volid %q: %w", templateVMID, bare, parseErr)
+		return "", "", fmt.Errorf("parse template %d %s volid %q: %w", templateVMID, rootKey, bare, parseErr)
 	}
-	return storage, nil
+	return storage, rootKey, nil
 }
 
 // resolveVMIDAllocParams returns the VMID range start and per-create allocation
@@ -3296,28 +3357,28 @@ func attemptCreateVM(
 	}
 
 	// --- Import-from path (old-form CID: light: or plain <storage>:import/<file>) ---
-	virtio0Val := fmt.Sprintf("%s:0,import-from=%s,format=%s,size=%dG",
+	rootDiskVal := fmt.Sprintf("%s:0,import-from=%s,format=%s,size=%dG",
 		shape.vmStorage, parsed.rawCID, shape.vmDiskFormat, shape.rootDiskGiB)
 	// Append resolved per-disk performance options (iothread, cache, etc.) when
-	// any are set. buildDiskOptStr treats the whole virtio0Val string as the bare
+	// any are set. buildDiskOptStr treats the whole rootDiskVal string as the bare
 	// volid prefix and appends ",key=value" pairs in deterministic alpha order.
 	// When rootDiskPerfOpts is empty the value is unchanged (byte-identical path).
 	if len(shape.rootDiskPerfOpts) > 0 {
-		virtio0Val = buildDiskOptStr(virtio0Val, shape.rootDiskPerfOpts)
+		rootDiskVal = buildDiskOptStr(rootDiskVal, shape.rootDiskPerfOpts)
 	}
 
 	createParams := map[string]any{
-		metadataKeyVMID: candidate,
-		metadataKeyName: candidateName,
-		"memory":        shape.memMiB,
-		"cores":         shape.cores,
-		"ostype":        osTypeLinux26,
-		"scsihw":        shape.scsihw,
-		diskKeyVirtio0:  virtio0Val,
-		"boot":          "order=" + diskKeyVirtio0,
-		"agent":         "enabled=1",
-		"hotplug":       shape.hotplug,
-		"onboot":        0,
+		metadataKeyVMID:   candidate,
+		metadataKeyName:   candidateName,
+		"memory":          shape.memMiB,
+		"cores":           shape.cores,
+		"ostype":          osTypeLinux26,
+		"scsihw":          shape.scsihw,
+		shape.rootDiskKey: rootDiskVal,
+		"boot":            "order=" + shape.rootDiskKey,
+		"agent":           "enabled=1",
+		"hotplug":         shape.hotplug,
+		"onboot":          0,
 		// Every BOSH VM is headless: the emulated USB tablet exists only to
 		// smooth mouse tracking for an interactive VNC/SPICE console and costs
 		// 2-3% CPU at scale for no benefit on a VM nobody looks at. No
@@ -3445,6 +3506,159 @@ func handleCloneError(
 //
 // The returned upid identifies the async PVE clone task; the caller must await
 // it. An empty upid means PVE completed synchronously.
+
+// resolveCloneFullFlag decides linked vs full clone from clone_mode plus the
+// template/vm_storage placement facts already gathered by cloneFromTemplate.
+// Extracted from cloneFromTemplate to keep its cognitive complexity under the
+// project threshold; behavior is unchanged from the inline version.
+//
+// Returns (nil, nil) for a linked clone, (&true, nil) for a full clone, or a
+// non-nil error when clone_mode=linked cannot be honored (see the inline
+// cases below for the specific rejection reasons).
+func resolveCloneFullFlag(
+	ctx context.Context,
+	deps Deps,
+	logger *log.Logger,
+	shape *createVMShape,
+	mode string,
+	templateStorage string,
+	templateStorageKnown bool,
+	storageMismatch bool,
+) (*bool, error) {
+	linkedOK := pve.IsLinkedCloneSupported(shape.vmStorageType)
+
+	switch mode {
+	case "linked":
+		switch {
+		case storageMismatch:
+			return nil, cpierrors.Cloud(
+				"create_vm: clone_mode=linked but vm_storage %q differs from the template's storage %q; "+
+					"linked clones always land on the template's storage pool, so this would silently place "+
+					"the root disk on %q instead of the configured vm_storage — set clone_mode: auto or "+
+					"clone_mode: full, or align pve.stemcell_storage/pve.vm_storage (or cloud_properties.storage) "+
+					"to the same pool as the template",
+				shape.vmStorage, templateStorage, templateStorage,
+			)
+		case templateStorageKnown:
+			// Same pool as the template: the capability that matters is the
+			// template's own storage type (identical pool to vm_storage here,
+			// so this is also vm_storage's type — but resolved directly from
+			// the template for clarity and to avoid relying on that equality).
+			templateStorageType := lookupVMStorageType(ctx, deps, templateStorage)
+			if !pve.IsLinkedCloneSupported(templateStorageType) {
+				return nil, cpierrors.Cloud(
+					"create_vm: clone_mode=linked but the template's storage %q (type %q) does not support"+
+						" linked clones; use clone_mode=auto or clone_mode=full, or switch to a"+
+						" snapshot-capable storage backend",
+					templateStorage, templateStorageType,
+				)
+			}
+		case !linkedOK:
+			// Template storage undeterminable: fail open to the pre-1.3
+			// vm_storage-keyed capability check.
+			return nil, cpierrors.Cloud(
+				"create_vm: clone_mode=linked but storage %q (type %q) does not support linked clones;"+
+					" use clone_mode=auto or clone_mode=full, or switch to a snapshot-capable storage backend",
+				shape.vmStorage, shape.vmStorageType,
+			)
+		}
+		// nil → linked clone.
+		return nil, nil
+	case "full":
+		t := true
+		return &t, nil
+	default: // "auto"
+		switch {
+		case storageMismatch:
+			t := true
+			logger.Info("create_vm: clone_mode=auto: downgrading linked clone to full clone because"+
+				" vm_storage differs from the template's storage",
+				log.String("vm_storage", shape.vmStorage),
+				log.String("template_storage", templateStorage),
+			)
+			return &t, nil
+		case templateStorageKnown:
+			// Same pool as the template: key the capability check off the
+			// template's own storage type, freshly resolved — mirrors the
+			// forced-linked branch above and avoids relying on shape.vmStorageType
+			// (populated once at VM-shape build time) staying in sync with the
+			// template's pool.
+			templateStorageType := lookupVMStorageType(ctx, deps, templateStorage)
+			if !pve.IsLinkedCloneSupported(templateStorageType) {
+				t := true
+				return &t, nil
+			}
+			// Otherwise nil → linked clone.
+			return nil, nil
+		case !linkedOK:
+			// Template storage undeterminable: fail open to the pre-1.3
+			// vm_storage-keyed capability check.
+			t := true
+			return &t, nil
+		case shape.vmStorageType == "":
+			// Template storage undeterminable AND vm_storage's own type lookup
+			// failed or returned empty; IsLinkedCloneSupported treats unknown type
+			// as linked-capable (permissive default). Log at debug so a PVE
+			// rejection of a linked clone is diagnosable even when the storage
+			// type could not be determined at clone time.
+			logger.Debug("create_vm: clone_mode=auto: storage type unknown, assuming linked-clone support",
+				log.String("vm_storage", shape.vmStorage),
+			)
+		}
+		// Otherwise nil → linked clone.
+		return nil, nil
+	}
+}
+
+// checkRootDiskBusMatch enforces the root_disk_bus=scsi clone-path guard,
+// extracted from cloneFromTemplate to keep its cognitive complexity under the
+// project threshold. See the doc comment inline below for rationale.
+func checkRootDiskBusMatch(
+	shape *createVMShape,
+	templateVMID int64,
+	templateStorageKnown bool,
+	templateStorageErr error,
+	templateRootKey string,
+) error {
+	// root_disk_bus=scsi requires the source template's root disk to already
+	// be on scsi0 — a clone inherits its source's exact disk-key layout, so
+	// there is no way to move it post-clone without a config PUT PVE treats as
+	// a disk swap (unsupported here). Templates are built once and reused by
+	// content-hash tag match, so a template built before this setting was
+	// enabled (or under a different setting) would silently clone a
+	// virtio0-bus root while every payload elsewhere in this VM claims scsi.
+	// Fail fast, before any PVE mutation, rather than produce that split-brain
+	// VM. Only checked when scsi is the resolved setting: the default
+	// (virtio) path stays fail-open on an undeterminable template exactly as
+	// before, so unset/virtio payloads and behavior are byte-identical —
+	// every template that exists before this property was introduced is
+	// virtio0, so the mismatch branch is unreachable on the default path
+	// today. Under root_disk_bus=scsi an undeterminable template also fails
+	// fast (rather than falling open, as the storage-pool check does)
+	// because there is no safe way to verify the bus without the read that
+	// just failed.
+	if shape.rootDiskKey != diskKeyScsi0 {
+		return nil
+	}
+	if !templateStorageKnown {
+		return cpierrors.Cloud(
+			"create_vm: root_disk_bus=scsi requires verifying stemcell template %d's root disk bus before "+
+				"cloning, but its config could not be read (%s); retry, or set pve.root_disk_bus back to "+
+				"virtio for this deployment",
+			templateVMID, templateStorageErr.Error(),
+		)
+	}
+	if templateRootKey != diskKeyScsi0 {
+		return cpierrors.Cloud(
+			"create_vm: root_disk_bus=scsi requires stemcell template %d to have a scsi0 root disk, "+
+				"but it was built with a %s root disk (predates this setting, or was built while it was "+
+				"unset/virtio); re-run create_stemcell for this stemcell to rebuild its template on the "+
+				"scsi bus, or set pve.root_disk_bus back to virtio for this deployment",
+			templateVMID, templateRootKey,
+		)
+	}
+	return nil
+}
 func cloneFromTemplate(
 	ctx context.Context,
 	deps Deps,
@@ -3462,7 +3676,7 @@ func cloneFromTemplate(
 		return err
 	}
 
-	templateStorage, templateStorageErr := resolveTemplateDiskStorage(ctx, deps, templateNode, templateVMID)
+	templateStorage, templateRootKey, templateStorageErr := resolveTemplateDiskStorage(ctx, deps, templateNode, templateVMID)
 	templateStorageKnown := templateStorageErr == nil
 	if !templateStorageKnown {
 		logger.Warn("create_vm: could not determine template's storage pool; "+
@@ -3477,86 +3691,13 @@ func cloneFromTemplate(
 	// — but only when templateStorage is actually known.
 	storageMismatch := templateStorageKnown && templateStorage != shape.vmStorage
 
-	linkedOK := pve.IsLinkedCloneSupported(shape.vmStorageType)
+	if busErr := checkRootDiskBusMatch(shape, templateVMID, templateStorageKnown, templateStorageErr, templateRootKey); busErr != nil {
+		return busErr
+	}
 
-	var full *bool
-	switch mode {
-	case "linked":
-		switch {
-		case storageMismatch:
-			return cpierrors.Cloud(
-				"create_vm: clone_mode=linked but vm_storage %q differs from the template's storage %q; "+
-					"linked clones always land on the template's storage pool, so this would silently place "+
-					"the root disk on %q instead of the configured vm_storage — set clone_mode: auto or "+
-					"clone_mode: full, or align pve.stemcell_storage/pve.vm_storage (or cloud_properties.storage) "+
-					"to the same pool as the template",
-				shape.vmStorage, templateStorage, templateStorage,
-			)
-		case templateStorageKnown:
-			// Same pool as the template: the capability that matters is the
-			// template's own storage type (identical pool to vm_storage here,
-			// so this is also vm_storage's type — but resolved directly from
-			// the template for clarity and to avoid relying on that equality).
-			templateStorageType := lookupVMStorageType(ctx, deps, templateStorage)
-			if !pve.IsLinkedCloneSupported(templateStorageType) {
-				return cpierrors.Cloud(
-					"create_vm: clone_mode=linked but the template's storage %q (type %q) does not support"+
-						" linked clones; use clone_mode=auto or clone_mode=full, or switch to a"+
-						" snapshot-capable storage backend",
-					templateStorage, templateStorageType,
-				)
-			}
-		case !linkedOK:
-			// Template storage undeterminable: fail open to the pre-1.3
-			// vm_storage-keyed capability check.
-			return cpierrors.Cloud(
-				"create_vm: clone_mode=linked but storage %q (type %q) does not support linked clones;"+
-					" use clone_mode=auto or clone_mode=full, or switch to a snapshot-capable storage backend",
-				shape.vmStorage, shape.vmStorageType,
-			)
-		}
-		// full remains nil → linked clone.
-	case "full":
-		t := true
-		full = &t
-	default: // "auto"
-		switch {
-		case storageMismatch:
-			t := true
-			full = &t
-			logger.Info("create_vm: clone_mode=auto: downgrading linked clone to full clone because"+
-				" vm_storage differs from the template's storage",
-				log.String("vm_storage", shape.vmStorage),
-				log.String("template_storage", templateStorage),
-			)
-		case templateStorageKnown:
-			// Same pool as the template: key the capability check off the
-			// template's own storage type, freshly resolved — mirrors the
-			// forced-linked branch above and avoids relying on shape.vmStorageType
-			// (populated once at VM-shape build time) staying in sync with the
-			// template's pool.
-			templateStorageType := lookupVMStorageType(ctx, deps, templateStorage)
-			if !pve.IsLinkedCloneSupported(templateStorageType) {
-				t := true
-				full = &t
-			}
-			// Otherwise full remains nil → linked clone.
-		case !linkedOK:
-			// Template storage undeterminable: fail open to the pre-1.3
-			// vm_storage-keyed capability check.
-			t := true
-			full = &t
-		case shape.vmStorageType == "":
-			// Template storage undeterminable AND vm_storage's own type lookup
-			// failed or returned empty; IsLinkedCloneSupported treats unknown type
-			// as linked-capable (permissive default). Log at debug so a PVE
-			// rejection of a linked clone is diagnosable even when the storage
-			// type could not be determined at clone time.
-			logger.Debug("create_vm: clone_mode=auto: storage type unknown, assuming linked-clone support",
-				log.String("vm_storage", shape.vmStorage),
-			)
-		}
-		// Otherwise full remains nil → linked clone.
+	full, fullErr := resolveCloneFullFlag(ctx, deps, logger, shape, mode, templateStorage, templateStorageKnown, storageMismatch)
+	if fullErr != nil {
+		return fullErr
 	}
 
 	newid := int64(candidate)
@@ -3692,16 +3833,19 @@ func cloneFromTemplate(
 		cpuVal := shape.cpuType
 		resourceParams.Cpu = &cpuVal
 	}
-	// Apply root-disk performance options to virtio0 when any are set.
-	// The clone inherits the template's virtio0 string; we append our opts to it.
-	// When rootDiskPerfOpts is empty nothing is emitted (byte-identical path).
+	// Apply root-disk performance options to shape.rootDiskKey when any are set.
+	// The clone inherits the template's root disk string under that same key
+	// (verified against templateRootKey before cloning started — see the
+	// root_disk_bus=scsi guard above); we append our opts to it. When
+	// rootDiskPerfOpts is empty nothing is emitted (byte-identical path).
 	if len(shape.rootDiskPerfOpts) > 0 {
-		// PVE's config PUT requires the full "volid,opts" value for virtio0 — an
-		// options-only delta (",cache=writeback") is rejected as a bad volid. The
-		// clone inherited the template's virtio0 string, so fetch the cloned VM's
-		// current value, strip any existing options, and re-append our resolved
-		// opts. A Config read failure is non-fatal: the VM is already cloned and
-		// functional, so we log and skip rather than roll back over a tuning patch.
+		// PVE's config PUT requires the full "volid,opts" value for the root
+		// disk key — an options-only delta (",cache=writeback") is rejected as a
+		// bad volid. The clone inherited the template's root disk string, so
+		// fetch the cloned VM's current value, strip any existing options, and
+		// re-append our resolved opts. A Config read failure is non-fatal: the
+		// VM is already cloned and functional, so we log and skip rather than
+		// roll back over a tuning patch.
 		clonedCfg, cfgGetErr := deps.PVE.QEMU().Config(ctx, shape.node, candidate)
 		if cfgGetErr != nil {
 			// Non-fatal best-effort: log and skip the perf-opts patch. The VM is
@@ -3712,19 +3856,29 @@ func cloneFromTemplate(
 				log.ErrScrubbed(cfgGetErr),
 			)
 		} else {
-			currentVirtio0, _ := clonedCfg[diskKeyVirtio0].(string)
-			if currentVirtio0 == "" {
-				// Fallback: use storage:index bare form that PVE recognises.
-				currentVirtio0 = shape.vmStorage + ":vm-" + strconv.Itoa(candidate) + "-disk-0"
+			currentRootDiskVal, _ := clonedCfg[shape.rootDiskKey].(string)
+			if currentRootDiskVal == "" {
+				// Fallback: use storage:index bare form that PVE recognises. The
+				// "vm-<id>-disk-0" naming convention is bus-agnostic (PVE names the
+				// underlying volume the same way regardless of which controller
+				// key it is attached under).
+				currentRootDiskVal = shape.vmStorage + ":vm-" + strconv.Itoa(candidate) + "-disk-0"
 			}
 			// splitDiskOptStr extracts the bare volid (stripping any existing opts)
 			// so we can re-append fresh opts cleanly without duplicates.
-			bareVolid, _ := splitDiskOptStr(currentVirtio0)
-			patchedVirtio0 := buildDiskOptStr(bareVolid, shape.rootDiskPerfOpts)
-			if resourceParams.Virtio == nil {
-				resourceParams.Virtio = make(map[int]string)
+			bareVolid, _ := splitDiskOptStr(currentRootDiskVal)
+			patchedRootDiskVal := buildDiskOptStr(bareVolid, shape.rootDiskPerfOpts)
+			if shape.rootDiskKey == diskKeyScsi0 {
+				if resourceParams.Scsi == nil {
+					resourceParams.Scsi = make(map[int]string)
+				}
+				resourceParams.Scsi[0] = patchedRootDiskVal
+			} else {
+				if resourceParams.Virtio == nil {
+					resourceParams.Virtio = make(map[int]string)
+				}
+				resourceParams.Virtio[0] = patchedRootDiskVal
 			}
-			resourceParams.Virtio[0] = patchedVirtio0
 		}
 	}
 	if cfgErr := deps.PVE.Nodes().UpdateQemuConfig(ctx, shape.node, strconv.Itoa(candidate), resourceParams); cfgErr != nil {
@@ -3826,7 +3980,8 @@ func handleAwaitError(
 	return werr
 }
 
-// readVirtio0SizeGiB reads the virtio0 disk size from the VM config.
+// readRootDiskSizeGiB reads the root disk size from the VM config at rootKey
+// ("virtio0" or "scsi0" per pve.root_disk_bus).
 //
 // A failed Config call is propagated (not swallowed): on a non-5-GiB template a
 // transient read failure would otherwise fabricate base=5 and grow by the wrong
@@ -3835,14 +3990,14 @@ func handleAwaitError(
 // caller wraps this through pve.WrapError so a transient surfaces as retriable.
 //
 // Falls back to defaultStemcellDiskGiB only when the config is readable but
-// virtio0 is absent or unparseable — there is no transient ambiguity there and
+// rootKey is absent or unparseable — there is no transient ambiguity there and
 // 5 GiB is the safe BOSH-stemcell baseline.
-func readVirtio0SizeGiB(ctx context.Context, deps Deps, node string, vmid int) (int, error) {
+func readRootDiskSizeGiB(ctx context.Context, deps Deps, node string, vmid int, rootKey string) (int, error) {
 	cfg, err := deps.PVE.QEMU().Config(ctx, node, vmid)
 	if err != nil {
 		return 0, err
 	}
-	v0, ok := cfg[diskKeyVirtio0].(string)
+	v0, ok := cfg[rootKey].(string)
 	if !ok || v0 == "" {
 		return defaultStemcellDiskGiB, nil
 	}
@@ -3853,10 +4008,11 @@ func readVirtio0SizeGiB(ctx context.Context, deps Deps, node string, vmid int) (
 	return gib, nil
 }
 
-// resizeRootDisk grows virtio0 by the delta between shape.rootDiskGiB and the
-// actual template size read from the VM config after creation. It is a no-op
-// when the requested size equals the template size, and returns a Cloud error
-// when the requested size is smaller (shrink not supported).
+// resizeRootDisk grows the root disk (shape.rootDiskKey) by the delta between
+// shape.rootDiskGiB and the actual template size read from the VM config
+// after creation. It is a no-op when the requested size equals the template
+// size, and returns a Cloud error when the requested size is smaller (shrink
+// not supported).
 //
 // PVE silently ignores the `size=<N>G` directive on the import-from
 // scsi/virtio param when the source image is smaller than N — the new
@@ -3872,7 +4028,7 @@ func resizeRootDisk(
 	shape *createVMShape,
 	vmid int,
 ) error {
-	actualTemplateGiB, sizeErr := readVirtio0SizeGiB(ctx, deps, shape.node, vmid)
+	actualTemplateGiB, sizeErr := readRootDiskSizeGiB(ctx, deps, shape.node, vmid, shape.rootDiskKey)
 	if sizeErr != nil {
 		return cpierrors.Wrap(pve.WrapError(sizeErr),
 			fmt.Sprintf("create_vm: read template disk size for resize vmid=%d", vmid))
@@ -3893,8 +4049,8 @@ func resizeRootDisk(
 	// and other resizes and surfaces as "can't lock file ... got timeout"
 	// in the task log. Retry the whole submit+await with seconds-scale
 	// backoff against the lock holder finishing.
-	rerr := pve.RetryOnTransientOrLock(ctx, logger, "resize_virtio0", shape.maxAttempts, func() error {
-		upid, e := deps.PVE.QEMU().ResizeDisk(ctx, shape.node, vmid, diskKeyVirtio0, growGiB)
+	rerr := pve.RetryOnTransientOrLock(ctx, logger, "resize_root_disk", shape.maxAttempts, func() error {
+		upid, e := deps.PVE.QEMU().ResizeDisk(ctx, shape.node, vmid, shape.rootDiskKey, growGiB)
 		if e != nil {
 			return e
 		}
@@ -3910,10 +4066,11 @@ func resizeRootDisk(
 		// — director re-issues create_vm with a fresh VMID instead of
 		// failing the deploy.
 		return cpierrors.Wrap(pve.WrapError(rerr),
-			fmt.Sprintf("create_vm: resize virtio0 vmid=%d +%dG", vmid, growGiB))
+			fmt.Sprintf("create_vm: resize root disk (%s) vmid=%d +%dG", shape.rootDiskKey, vmid, growGiB))
 	}
-	logger.Info("create_vm: grew virtio0",
+	logger.Info("create_vm: grew root disk",
 		log.Int(metadataKeyVMID, vmid),
+		log.String("root_disk_key", shape.rootDiskKey),
 		log.Int("delta_gib", growGiB),
 		log.Int("final_gib", shape.rootDiskGiB),
 	)
@@ -4630,8 +4787,17 @@ func configureAgent(
 		Disks: agent.DisksSpec{
 			// "/dev/sda" is the *form* the agent's mappedDevicePathResolver
 			// expects: it strips the "/dev/sd" prefix and tries "/dev/xvd",
-			// "/dev/vd", "/dev/sd" in turn, so a virtio0 root disk is found
-			// as /dev/vda even though our PVE config never exposes /dev/sda.
+			// "/dev/vd", "/dev/sd" in turn. Under the default virtio0 root
+			// disk this lands on /dev/vda (found second) even though our PVE
+			// config never exposes /dev/sda. Under pve.root_disk_bus=scsi the
+			// root disk IS scsi0 — no virtio disk exists at all, so /dev/vd
+			// probes fail and the resolver falls through to /dev/sda, which
+			// is the actual root device (scsi0 is always the lowest-numbered
+			// scsi slot, so the kernel assigns it letter "a" — the same
+			// invariant persistent-disk resolution already depends on via
+			// chooseSCSISlotSkippingZero reserving scsi0). This literal is
+			// unchanged and correct for both bus choices; no root_disk_bus
+			// branching is needed here.
 			// A numeric index like "0" would route to idDevicePathResolver,
 			// which globs /dev/disk/by-id/*0 — that file does not exist
 			// unless we also set a matching `serial=` on the PVE disk.

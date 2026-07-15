@@ -199,7 +199,7 @@ func TestResizeRootDisk_NoGrowth(t *testing.T) {
 		},
 	}}
 	deps := Deps{Config: etConfig(), PVE: client, Logger: log.NewNopLogger()}
-	shape := &createVMShape{node: "node1", rootDiskGiB: defaultStemcellDiskGiB, maxAttempts: 1}
+	shape := &createVMShape{node: "node1", rootDiskGiB: defaultStemcellDiskGiB, maxAttempts: 1, rootDiskKey: diskKeyVirtio0}
 
 	if err := resizeRootDisk(context.Background(), deps, log.NewNopLogger(), shape, 200); err != nil {
 		t.Fatalf("resizeRootDisk returned error on no-growth path: %v", err)
@@ -226,7 +226,7 @@ func TestResizeRootDisk_SubmitSuccessEmptyUPID(t *testing.T) {
 		},
 	}}
 	deps := Deps{Config: etConfig(), PVE: client, Logger: log.NewNopLogger()}
-	shape := &createVMShape{node: "node1", rootDiskGiB: 10, maxAttempts: 1}
+	shape := &createVMShape{node: "node1", rootDiskGiB: 10, maxAttempts: 1, rootDiskKey: diskKeyVirtio0}
 
 	if err := resizeRootDisk(context.Background(), deps, log.NewNopLogger(), shape, 201); err != nil {
 		t.Fatalf("resizeRootDisk returned error on submit-success path: %v", err)
@@ -243,13 +243,13 @@ func TestResizeRootDisk_SubmitError(t *testing.T) {
 		},
 	}}
 	deps := Deps{Config: etConfig(), PVE: client, Logger: log.NewNopLogger()}
-	shape := &createVMShape{node: "node1", rootDiskGiB: 12, maxAttempts: 1}
+	shape := &createVMShape{node: "node1", rootDiskGiB: 12, maxAttempts: 1, rootDiskKey: diskKeyVirtio0}
 
 	err := resizeRootDisk(context.Background(), deps, log.NewNopLogger(), shape, 202)
 	if err == nil {
 		t.Fatal("expected error from ResizeDisk failure, got nil")
 	}
-	if !strings.Contains(err.Error(), "resize virtio0") {
+	if !strings.Contains(err.Error(), "resize root disk (virtio0)") {
 		t.Errorf("error missing wrap context: %v", err)
 	}
 }

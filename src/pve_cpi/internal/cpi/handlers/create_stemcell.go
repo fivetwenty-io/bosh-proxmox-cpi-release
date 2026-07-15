@@ -909,7 +909,8 @@ func deleteTemplateVM(ctx context.Context, deps Deps, node string, vmid int64, l
 //   - No NIC (net0 absent) — templates carry only the root disk.
 //   - No QEMU guest agent — agent=0 (template is frozen; agent not needed).
 //   - onboot=0 — templates must not auto-start.
-//   - virtio0: import-from= with format=qcow2 and size=5G default.
+//   - Root disk key virtio0 (default) or scsi0 (pve.root_disk_bus=scsi): import-from=
+//     with format=qcow2 and size=5G default.
 //   - Tags: "bosh-stemcell-sha-<sha8>" for content-based template dedup lookup.
 //
 // shaTag must be the pure "bosh-stemcell-sha-<sha8>" tag for the primary path.
@@ -936,15 +937,21 @@ func attemptCreateTemplateVM(
 	source string,
 	extraBaseTags []string,
 ) error {
-	// virtio0: allocate the template's root disk on targetStorage (the VM/images
-	// storage). PVE requires the "<storage>:<size>" form — a bare "0" is parsed
-	// as a volume ID and rejected ("unable to parse volume ID '0'"). targetStorage
-	// MUST support the "images" content type and is intentionally distinct from
-	// the import-from source (importVolid lives on StemcellStorage, which only
-	// needs "import"); no single PVE storage need support both — mirrors the
-	// create_vm import-from path. size=5G matches defaultStemcellDiskGiB; PVE
-	// will not shrink below the imported image's actual size.
-	virtio0Val := fmt.Sprintf("%s:0,import-from=%s,format=%s,size=%dG",
+	// Root disk: allocate the template's root disk on targetStorage (the
+	// VM/images storage), under the same PVE config key create_vm's rootDiskKey
+	// resolves to for the current pve.root_disk_bus (virtio0 by default, scsi0
+	// when set to "scsi") — a clone of this template inherits whichever key it
+	// is created under, and create_vm's clone path verifies the two match
+	// before cloning. PVE requires the "<storage>:<size>" form — a bare "0" is
+	// parsed as a volume ID and rejected ("unable to parse volume ID '0'").
+	// targetStorage MUST support the "images" content type and is intentionally
+	// distinct from the import-from source (importVolid lives on
+	// StemcellStorage, which only needs "import"); no single PVE storage need
+	// support both — mirrors the create_vm import-from path. size=5G matches
+	// defaultStemcellDiskGiB; PVE will not shrink below the imported image's
+	// actual size.
+	rootKey := rootDiskKey(deps.Config)
+	rootDiskVal := fmt.Sprintf("%s:0,import-from=%s,format=%s,size=%dG",
 		targetStorage, importVolid, diskFormatQCOW2, defaultStemcellDiskGiB)
 
 	// baseTags is the ordered set of identity tags that always appear in the
@@ -961,11 +968,11 @@ func attemptCreateTemplateVM(
 		metadataKeyName: templateName,
 		"ostype":        osTypeLinux26,
 		"scsihw":        "virtio-scsi-pci",
-		diskKeyVirtio0:  virtio0Val,
-		"boot":          "order=" + diskKeyVirtio0,
+		rootKey:         rootDiskVal,
+		"boot":          "order=" + rootKey,
 		"agent":         "enabled=0",
 		"onboot":        0,
-		jsonKeyTags:          strings.Join(baseTags, ";"),
+		jsonKeyTags:     strings.Join(baseTags, ";"),
 	}
 
 	// initialCID is the BOSH stemcell CID for this template ("template:<vmid>").

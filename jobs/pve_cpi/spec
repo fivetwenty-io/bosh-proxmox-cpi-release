@@ -323,6 +323,35 @@ properties:
       align stemcell_storage/vm_storage, to resolve. "full": force full clone
       on all backends. One of auto|linked|full.
     default: ""
+  pve.root_disk_bus:
+    description: |
+      Selects the PVE bus the root (system) disk is created on. "virtio"
+      (default when empty): root disk lands on virtio0 — byte-identical to
+      every release before this property existed. "scsi": root disk lands on
+      scsi0, under the same virtio-scsi controller persistent disks already
+      use, which unlocks TRIM (discard) and ssd auto-resolution on the root
+      disk itself (disk_performance.discard/.ssd auto-resolution is otherwise
+      unavailable on virtio-blk).
+
+      Persistent-disk slot allocation is unaffected either way: scsi0 has
+      always been reserved for the root disk and attach_disk has always
+      started its free-slot search at scsi1, so there is no slot collision to
+      manage when the root disk moves onto the scsi bus.
+
+      Clone-path requirement: create_vm's dominant path clones a pre-built
+      stemcell template (every "template:<vmid>" stemcell CID), and a clone
+      inherits its source template's exact disk layout. Templates are built
+      once by create_stemcell and reused by content-hash tag match, so
+      flipping this setting does not retroactively rebuild existing
+      templates. create_vm compares the resolved bus against the matched
+      template's actual root disk key before cloning and fails with a clear,
+      non-retriable error naming the conflict on a mismatch, rather than
+      silently producing a root disk on the wrong bus. After changing this
+      value, re-run create_stemcell for affected stemcells so new templates
+      are built on the matching bus.
+
+      One of virtio|scsi.
+    default: ""
   pve.allow_disk_ops_with_snapshots:
     description: |
       When true, bypasses the snapshot pre-flight guard in attach_disk, detach_disk,

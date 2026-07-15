@@ -137,6 +137,8 @@ A VMID is allocated from `[vmid_range_start, vmid_range_end]` (default: `[100, 8
 
 **Disk sizing:** `cloud_properties.root_disk_size` (Integer, GB) sets an explicit root disk size at clone time. `cloud_properties.ephemeral_disk_size_mb` (Integer, MB) attaches a dedicated ephemeral disk in addition to the root disk. When `ephemeral_disk_size_mb` is omitted, the BOSH agent carves ephemeral space from the root disk at boot. Both fields are optional.
 
+**Root disk bus:** `pve.root_disk_bus` (global config, no `cloud_properties` override) selects `virtio0` (default) or `scsi0` for the root disk. See [Configuration — `pve.root_disk_bus`](configuration.md) for the TRIM/`ssd` benefit and the clone-path bus-match requirement.
+
 **VIP and firewall:** `cloud_properties.allowed_address_pairs` (list of IP strings) seeds PVE `ipfilter-netN` ipsets with the VM's primary IP and the listed VIPs across all firewalled NICs. This enables VIP/VRRP use cases. Requires `pve.vm_firewall` to be enabled. Like every other VM-level firewall feature, the seeded ipsets are unenforced unless the PVE datacenter firewall master switch is also on — see [Configuration — Firewall](configuration.md#firewall) for the prerequisite and the anti-lockout caveat for enabling it.
 
 **PCI passthrough:** `cloud_properties.pci_passthroughs` (list of objects) passes host PCI devices through to the VM:

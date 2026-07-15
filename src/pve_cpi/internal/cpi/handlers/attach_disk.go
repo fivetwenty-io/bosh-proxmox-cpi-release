@@ -52,8 +52,9 @@ type diskHints struct {
 //
 // Device path convention:
 //
-//	virtio0 → /dev/vda  (system disk imported from the stemcell — not a persistent disk)
-//	scsi<N> → /dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_drive-scsi<N>
+//	virtio0 → /dev/vda  (default root disk bus — not a persistent disk)
+//	scsi0   → /dev/sda  (root disk under pve.root_disk_bus=scsi — not a persistent disk)
+//	scsi<N> (N>=1) → /dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_drive-scsi<N>
 //
 // We DO NOT return a "/dev/sd<X>" hint. BOSH agent's
 // mappedDevicePathResolver probes prefixes in the order
@@ -67,9 +68,10 @@ type diskHints struct {
 //
 // Bus selection: "scsi" is always used for persistent disks regardless of
 // VMDiskFormat. The scsi bus matches the virtio-scsi-single controller that
-// create_vm configures. The system disk lives on virtio0 because the BOSH
-// openstack-kvm stemcell's agent.json sets DevicePathResolutionType=virtio
-// (resolves /dev/disk/by-id/virtio-* for the root device).
+// create_vm configures. The system disk lives on virtio0 by default; setting
+// pve.root_disk_bus=scsi moves it to scsi0 instead — the resolver's probe
+// order (see the System field comment in create_vm.go's agentCfg
+// construction) finds it correctly either way with no agent-config change.
 func HandleAttachDisk(deps Deps) Handler {
 	return HandlerFunc(func(ctx context.Context, args []json.RawMessage, _ jsonrpc.Context) (any, error) {
 		// --------------------------------------------------------------------
@@ -155,13 +157,18 @@ func HandleAttachDisk(deps Deps) Handler {
 		//
 		//   The resolver strips the "/dev/sd" prefix and probes "/dev/xvd",
 		//   "/dev/vd", "/dev/sd" in turn (see create_vm.go agent-Disks.System
-		//   note). With a virtio0 root disk, /dev/vda exists, so the resolver
-		//   returns /dev/vda for any "/dev/sda" hint — including the persistent
-		//   disk hint. The agent then runs persistent-disk partitioning against
-		//   the root disk and fails with:
+		//   note). With the default virtio0 root disk, /dev/vda exists, so the
+		//   resolver returns /dev/vda for any "/dev/sda" hint — including the
+		//   persistent disk hint. The agent then runs persistent-disk
+		//   partitioning against the root disk and fails with:
 		//
 		//     "Persistent disks with many partitions are not supported.
 		//      Expected 1, got 4."
+		//
+		//   Under pve.root_disk_bus=scsi, scsi0 IS the root disk (not merely a
+		//   collision risk with it) — reserving scsi0 here is what makes root
+		//   and persistent disks distinguishable at all in that mode, since
+		//   there is no virtio disk to fall through to.
 		//
 		// Reserving scsi0 forces persistent disks to scsi1+ (/dev/sdb+); the
 		// resolver finds no /dev/vdb, falls through to /dev/sdb, and operates

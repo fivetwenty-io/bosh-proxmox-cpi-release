@@ -860,6 +860,61 @@ func TestEnsureTemplateVM_CreatePath_CpiOwnsSource(t *testing.T) {
 	}
 }
 
+// TestEnsureTemplateVM_RootDiskBusSCSI_UsesScsi0 verifies that
+// pve.root_disk_bus=scsi is honored at template-creation time: the template's
+// root disk lands on scsi0 (not virtio0) and the boot order matches, so a
+// subsequent create_vm clone of this template passes create_vm's
+// root_disk_bus=scsi bus-match guard instead of failing fast on a mismatch.
+func TestEnsureTemplateVM_RootDiskBusSCSI_UsesScsi0(t *testing.T) {
+	t.Parallel()
+
+	const sha256hex = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
+	const sha8 = "abcdef12"
+	const storage = "nfs"
+	const qcow2Filename = "bosh-stemcell-ubuntu-jammy-1.0-" + sha8 + ".qcow2"
+
+	var createParams map[string]any
+
+	qemu := &wbMockQEMU{
+		createFn: func(_ context.Context, _ string, params map[string]any) (string, error) {
+			createParams = params
+			return "", nil
+		},
+	}
+	nodes := &wbTemplateNodes{
+		listQemuFn: listQemuEmpty(),
+		createQemuTemplateFn: func(_ context.Context, _, _ string, _ *sdknodes.CreateQemuTemplateParams) (*sdknodes.CreateQemuTemplateResponse, error) {
+			raw := sdknodes.CreateQemuTemplateResponse(`""`)
+			return &raw, nil
+		},
+	}
+	tasks := &wbMockTasks{}
+	stor := &wbTemplateStorage{}
+
+	deps := buildEnsureTemplateDeps(qemu, nodes, tasks, stor)
+	deps.Config.VMStorage = "images-pool"
+	deps.Config.RootDiskBus = "scsi"
+	deps.PVE.(*wbTemplateMockClient).clusterSvc = &wbClusterForAlloc{
+		listResourcesFn: listClusterResourcesEmpty(),
+	}
+
+	cp := stemcellCloudProps{Name: "ubuntu-jammy", Version: "1.0"}
+	_, err := ensureTemplateVM(context.Background(), deps, "pve-node1", storage, qcow2Filename, sha256hex, true, cp, "/tmp/test.qcow2")
+	if err != nil {
+		t.Fatalf("ensureTemplateVM returned error: %v", err)
+	}
+
+	if _, present := createParams["scsi0"]; !present {
+		t.Error("createParams must carry a \"scsi0\" key when root_disk_bus=scsi")
+	}
+	if _, present := createParams["virtio0"]; present {
+		t.Error("createParams must not carry a \"virtio0\" key when root_disk_bus=scsi")
+	}
+	if boot, _ := createParams["boot"].(string); boot != "order=scsi0" {
+		t.Errorf("createParams[\"boot\"] = %q; want \"order=scsi0\"", boot)
+	}
+}
+
 // TestEnsureTemplateVM_Idempotent_ExistingTemplate verifies that when
 // FindTemplateByName finds an existing template, the existing VMID is returned
 // immediately without creating a new VM or deleting the source qcow2.

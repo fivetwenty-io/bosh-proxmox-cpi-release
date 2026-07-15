@@ -380,6 +380,28 @@ type CPIConfig struct {
 	// ApplyDefaults treats empty string as "auto". omit from ERB when empty.
 	CloneMode string `json:"clone_mode,omitempty"`
 
+	// RootDiskBus selects the PVE bus the root (system) disk is created on.
+	// "virtio" (default when empty): root disk lands on virtio0 — byte-identical
+	// to every release before this property existed. "scsi": root disk lands on
+	// scsi0 under the same virtio-scsi controller as persistent disks, which
+	// unlocks TRIM (discard) and ssd auto-resolution on the root disk itself —
+	// both are unavailable on virtio-blk. Use RootDiskBusValue()/RootDiskUsesSCSI();
+	// empty maps to "virtio", never mutated by ApplyDefaults. validate-only-when-set;
+	// omit from ERB when empty.
+	//
+	// The clone path (the dominant path — every VM created from a
+	// "template:<vmid>" stemcell CID clones a pre-built template) requires the
+	// source template to carry a root disk on the same bus this resolves to.
+	// A stemcell template is built once and reused by sha8-tag content match;
+	// flipping this setting does not retroactively rebuild existing templates.
+	// create_vm detects a bus mismatch between the resolved setting and the
+	// template's actual root disk key and fails fast with a non-retriable error
+	// naming the conflict, rather than silently producing a virtio root under a
+	// "scsi" setting (or vice versa). Re-run create_stemcell for the affected
+	// stemcell(s) after changing this value so new templates are built on the
+	// matching bus. See docs/configuration.md.
+	RootDiskBus string `json:"root_disk_bus,omitempty"`
+
 	// Placement is an optional nested block that controls availability-aware
 	// node selection and anti-affinity at create_vm time. When nil (field absent
 	// from JSON), all placement behavior defaults to safe defaults via accessors.
@@ -417,13 +439,13 @@ type CPIConfig struct {
 	IPConflictProbe string `json:"ip_conflict_probe,omitempty"`
 
 	// DiskDeleteStateGuard selects whether delete_disk first checks the lock
-	// state of the VM that owns the target volume. When empty or "on" (default,
-	// as of Phase 1), delete_disk resolves the owning guest (from the managed
+	// state of the VM that owns the target volume. When empty or "on" (the
+	// default), delete_disk resolves the owning guest (from the managed
 	// volid) and, if that guest holds a destructive/in-flight lock (backup,
 	// clone, migrate, snapshot, rollback, create), defers the delete with a
 	// retriable error so the BOSH Director re-drives it after the operation
 	// completes — this closes the race window against nightly vzdump/PBS backups
-	// and other in-flight operations. Set "off" to restore the pre-Phase-1
+	// and other in-flight operations. Set "off" to restore the earlier unguarded
 	// behavior (no owner lookup). The guard is best-effort and fails open on any
 	// resolution uncertainty, so the worst case of leaving it on its new default
 	// is a delayed delete during a backup window, never a hard failure. Enum:
@@ -480,10 +502,10 @@ type CPIConfig struct {
 	// (external/static bridges such as vmbr0 are never gated) and fail open on
 	// SDN-membership lookup errors, so the worst case of leaving this enabled is
 	// a bounded retriable delay, never a false block on a legitimate bridge.
-	// *int (not int) because, as of Phase 1, this must distinguish "left unset"
+	// *int (not int) because this must distinguish "left unset"
 	// (nil → defaults to 30, ~30s at the 1s poll cadence — enabled by default)
 	// from "explicitly set to 0" (disables both gates, restoring the
-	// pre-Phase-1 behavior). Validate >= 0 when set. Use
+	// earlier ungated behavior). Validate >= 0 when set. Use
 	// NetworkResolveRetriesValue()/NetworkResolveEnabled().
 	NetworkResolveRetries *int `json:"network_resolve_retries,omitempty"`
 
@@ -2077,6 +2099,32 @@ func (c *CPIConfig) ClusterLockEnabled() bool {
 	return c.ClusterLockMode() == "pool"
 }
 
+// diskBusVirtio and diskBusSCSI are the two valid pve.root_disk_bus values.
+const (
+	diskBusVirtio = "virtio"
+	diskBusSCSI   = "scsi"
+)
+
+// RootDiskBusValue returns the normalized root-disk bus: "virtio" (default)
+// or "scsi". Empty/absent maps to "virtio" — byte-identical to every release
+// before this property existed.
+func (c *CPIConfig) RootDiskBusValue() string {
+	if c == nil {
+		return diskBusVirtio
+	}
+	v := strings.ToLower(strings.TrimSpace(c.RootDiskBus))
+	if v == "" {
+		return diskBusVirtio
+	}
+	return v
+}
+
+// RootDiskUsesSCSI reports whether the root disk is created on scsi0 instead
+// of virtio0 (RootDiskBusValue() == "scsi").
+func (c *CPIConfig) RootDiskUsesSCSI() bool {
+	return c.RootDiskBusValue() == diskBusSCSI
+}
+
 // ReplicaAdoptTimeoutSecValue returns the configured adopt-and-wait timeout in
 // seconds for a racing concurrent template-replica clone. A value <= 0 (the
 // default) means the adopt path is disabled and replica builds behave
@@ -2194,9 +2242,9 @@ const enumValueOff = "off"
 const enumValueWarn = "warn"
 
 // DiskDeleteStateGuardEnabled reports whether delete_disk should check the
-// owning VM's lock state before deleting. Default true (as of Phase 1): nil
+// owning VM's lock state before deleting. Default true: nil
 // config, empty string, or "on" all resolve to enabled. Only an explicit
-// "off" disables the lookup and restores the pre-Phase-1 byte-identical
+// "off" disables the lookup and restores the earlier byte-identical
 // behavior. Any other value is rejected at config validation time
 // (validateDiskDeleteStateGuardEnum), so by the time this accessor runs in
 // production the field is guaranteed to be one of ""|"off"|"on".
@@ -2319,6 +2367,25 @@ func (c *CPIConfig) validateDetachedDiskStrategyEnum(errs *[]string) {
 	}
 }
 
+// validateRootDiskBusEnum appends an error when root_disk_bus is set to a
+// value other than virtio|scsi. Empty (the default) is valid and resolves to
+// "virtio". Extracted from validateEnumFields to keep its cognitive
+// complexity under the project threshold.
+func (c *CPIConfig) validateRootDiskBusEnum(errs *[]string) {
+	if c.RootDiskBus == "" {
+		return
+	}
+	switch strings.ToLower(strings.TrimSpace(c.RootDiskBus)) {
+	case diskBusVirtio, diskBusSCSI:
+		// valid
+	default:
+		*errs = append(*errs, fmt.Sprintf(
+			"root_disk_bus must be one of virtio|scsi (or empty for default virtio), got %q",
+			c.RootDiskBus,
+		))
+	}
+}
+
 // validateDiskDeleteStateGuardEnum appends an error when disk_delete_state_guard
 // is set to a value other than off|on. Empty (the default) is valid.
 func (c *CPIConfig) validateDiskDeleteStateGuardEnum(errs *[]string) {
@@ -2337,9 +2404,9 @@ func (c *CPIConfig) validateDiskDeleteStateGuardEnum(errs *[]string) {
 }
 
 // NetworkResolveRetriesValue returns the configured SDN eventual-consistency
-// poll retry count. Default 30 (as of Phase 1): a nil receiver or a nil field
+// poll retry count. Default 30: a nil receiver or a nil field
 // (the property left entirely unset) resolves to 30. An explicit 0 disables
-// both gates (returns 0), restoring the pre-Phase-1 behavior. A negative
+// both gates (returns 0), restoring the earlier ungated behavior. A negative
 // explicit value also resolves to 0 defensively (config validation rejects
 // negative values at load time, so this is a belt-and-suspenders guard for
 // manually constructed CPIConfig values in tests).
@@ -3015,6 +3082,9 @@ func (c *CPIConfig) validateEnumFields(errs *[]string) {
 		}
 	}
 
+	// RootDiskBus enum: validate only when non-empty.
+	c.validateRootDiskBusEnum(errs)
+
 	// ClusterLockTimeoutSec: 0 resolves to the 60s default; negative is invalid.
 	if c.ClusterLockTimeoutSec < 0 {
 		*errs = append(*errs, fmt.Sprintf(
@@ -3023,7 +3093,7 @@ func (c *CPIConfig) validateEnumFields(errs *[]string) {
 		))
 	}
 
-	// NetworkResolveRetries: unset resolves to the Phase 1 default (30); an
+	// NetworkResolveRetries: unset resolves to the default (30); an
 	// explicit 0 disables the SDN convergence gates; negative is invalid.
 	if c.NetworkResolveRetries != nil && *c.NetworkResolveRetries < 0 {
 		*errs = append(*errs, fmt.Sprintf(
