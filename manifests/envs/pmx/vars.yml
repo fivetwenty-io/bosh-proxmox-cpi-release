@@ -23,7 +23,11 @@
 # egress the nested host's own tailscale0 and be dropped; the outer host
 # therefore SNATs tailnet-sourced traffic entering the vnet:
 #   iptables -t nat -A POSTROUTING -s 100.64.0.0/10 -o pmx \
-#     -j SNAT --to-source 10.253.0.1   # runtime rule on the outer pve host
+#     -j SNAT --to-source 10.253.0.1
+# Persisted on the outer host (sm-0) as idempotent post-up/post-down hooks
+# in the vmbr1 stanza of /etc/network/interfaces, alongside the other
+# manually managed SNAT rules there — it survives reboots and ifreload. If
+# the rule ever goes missing, re-check that stanza before re-adding by hand.
 #
 # Keep these invariants consistent (mirrors the cpitest/lab headers):
 #   1. pve_network_bridge MUST be the bridge VMs attach to on the nested
