@@ -1,0 +1,74 @@
+---
+# ============================================================================
+# Env bundle: pmx — nested PVE lab (lab-pmx) on the outer SDN vnet `pmx`.
+#
+# Single source of truth for the pmx env's network. Layered after
+# manifests/bosh/vars.yml (and manifests/cf/vars.yml) by scripts/bosh and
+# scripts/cf, so these keys win. The target PVE is the NESTED cluster running
+# inside outer VM 108 ("lab-pmx", API 10.253.0.10:8006, node name lab-pmx);
+# VMs created there attach to the nested host's vmbr0, which bridges onto the
+# outer SDN vnet `pmx` (simple zone `labs`, subnet 10.253.0.0/16, gateway
+# 10.253.0.1, SNAT on the outer host). BOSH owns the 10.253.16.0/20 block of
+# that /16; the nested host itself sits at 10.253.0.10 in the mgmt /24.
+#
+# Transport: no SDN objects are created for this env (no *_sdn_* keys below,
+# so `scripts/bosh net-*` refuses BOSH_PVE_ENV=pmx by design) — the outer
+# vnet already provides the isolated segment, gateway, and SNAT. The CPI's
+# own SDN behavior is still exercised INSIDE the nested cluster by the tier-1
+# network-handler matrix (ci/integration.yml network_test).
+#
+# Reachability from a workstation: the tailnet's `pve` subnet router
+# advertises 10.253.0.0/16. Its tailscaled runs NoSNAT, and the nested host
+# is itself a tailnet node, so return traffic to raw tailnet addresses would
+# egress the nested host's own tailscale0 and be dropped; the outer host
+# therefore SNATs tailnet-sourced traffic entering the vnet:
+#   iptables -t nat -A POSTROUTING -s 100.64.0.0/10 -o pmx \
+#     -j SNAT --to-source 10.253.0.1   # runtime rule on the outer pve host
+#
+# Keep these invariants consistent (mirrors the cpitest/lab headers):
+#   1. pve_network_bridge MUST be the bridge VMs attach to on the nested
+#      host (vmbr0).
+#   2. internal_cidr MUST contain internal_ip, haproxy_private_ip, and every
+#      pmx_reserved / pmx_static entry, and MUST match the wire subnet
+#      (the outer vnet's 10.253.0.0/16) so guests compute the right netmask.
+#   3. internal_gw MUST be the subnet's gateway (outer vnet gateway).
+#
+# system_domain override: *.cf.10-253-16-50.sslip.io resolves to the HAProxy
+# static IP (10.253.16.50) from anywhere, so the smoke tests need neither a
+# Cloudflare tunnel nor local DNS — the workstation reaches HAProxy directly
+# over the routed /16. cf ssh (port 2222) likewise connects straight to the
+# resolved IP with no proxy in the path.
+#
+# Usage:
+#   BOSH_PVE_ENV=pmx ./scripts/bosh create-env
+#   BOSH_PVE_ENV=pmx ./scripts/cf deploy
+#   ./scripts/e2e all --env pmx
+#
+# Tracked in git (force-added past the global vars.yml ignore) because it is
+# pure network configuration. KEEP IT SECRET-FREE — credentials belong in
+# manifests/bosh/vars.yml (gitignored), not here.
+# ============================================================================
+
+# --- Director + deployment network (overrides manifests/bosh/vars.yml) -----
+internal_cidr:       10.253.0.0/16
+internal_gw:         10.253.0.1
+internal_ip:         10.253.16.10
+pve_network_bridge:  vmbr0
+# HAProxy entry point (CF). The sslip.io system domain resolves here.
+haproxy_private_ip:  10.253.16.50
+
+# --- CF system domain (overrides manifests/cf/vars.yml) --------------------
+system_domain:       cf.10-253-16-50.sslip.io
+
+# --- Cloud-config IPAM bands (consumed by cf-cloud-config.yml + cc-reserved.yml)
+# Must lie inside internal_cidr. BOSH VMs are confined to the 10.253.16.0/20
+# block: reserve everything below it (mgmt /24 with the nested host at
+# 10.253.0.10, plus unused space) together with the block's own infra band
+# (gateway-analog slots + the Director at 10.253.16.10), and everything from
+# the top-of-subnet router band upward. HAProxy (10.253.16.50) sits in the
+# static slot; CF VMs and emptyvm take the dynamic middle (.16.20-.16.199).
+pmx_reserved:
+- 10.253.0.1-10.253.16.19
+- 10.253.16.200-10.253.255.254
+pmx_static:
+- 10.253.16.50

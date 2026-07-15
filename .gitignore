@@ -38,8 +38,10 @@ dev_releases/
 bosh-pve-cpi-*.tgz
 tmp/
 creds.yml
+creds.yml.*
 vars.yml
 state.json
+state.json.*
 
 # Compiled-release pipeline (scripts/bosh compile-releases): large tarballs and
 # the environment-specific generated ops file pinning them.
