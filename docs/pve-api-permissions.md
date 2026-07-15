@@ -247,6 +247,8 @@ curl -sk -X POST -H "Authorization: $PVE_TOKEN" \
 
 The response body contains `data.value` — that is the one-time secret. The full token credential is `PVEAPIToken=bosh@pve!bosh-cpi=<secret>`.
 
+Issue one token per consuming integration — a dedicated token id (`bosh-cpi` above) for this CPI, a separate one for any other BOSH director, script, or service that talks to the same PVE cluster, even when they share the `bosh@pve` user. PVE tokens revoke independently by token id: deleting `bosh@pve!bosh-cpi` invalidates only that one consumer, leaving every other token issued under `bosh@pve` untouched. A token shared across integrations turns a routine rotation (compromised credential, departing operator, scheduled renewal) into a coordinated outage across every consumer of that one credential, and forces a full audit of every place the shared secret might have leaked instead of a single, known blast radius.
+
 ### 3e. Why `privsep=0` is safe here
 
 PVE API tokens default to **Privilege Separation = on**. With `privsep=1`, the token has its own empty ACL distinct from the parent user; you must then repeat every grant from §3c as an **API Token Permission** instead of a User Permission. That works, but doubles the number of ACL entries to maintain.
