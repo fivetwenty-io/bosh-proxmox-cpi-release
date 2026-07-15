@@ -158,7 +158,7 @@ Property names and defaults are cross-referenced to [Configuration reference](co
 
 **Best practice.** Streaming a stemcell image through the CPI process (download, then re-upload to PVE) doubles the transfer and adds a failure mode the platform's own download path does not have.
 
-**CPI behavior.** When `cloud_properties.source_url` is set, `create_stemcell` uses PVE's `download-url` storage API so PVE streams the image directly into storage rather than through the CPI process, and verifies the result against `cloud_properties.sha256` (or SHA-1 as a fallback) when supplied.
+**CPI behavior.** When `cloud_properties.source_url` is set, `create_stemcell` uses PVE's `download-url` storage API so PVE streams the image directly into storage rather than through the CPI process, and verifies the result against `cloud_properties.sha256` when supplied; when it is absent, the CPI warns that the image identity is weak rather than verifying against a lesser digest.
 
 **Status.** Meets.
 
@@ -176,7 +176,7 @@ Property names and defaults are cross-referenced to [Configuration reference](co
 
 **Best practice.** An IDE CD-ROM device cannot be swapped while the guest is running without a guest-side rescan, and IDE itself is a legacy bus with no place in a virtio-first VM.
 
-**CPI behavior.** The BOSH agent's settings ISO always attaches as `media=cdrom` on `scsi30` — reserved by convention specifically so it never collides with the persistent-disk slot range (`scsi1`-`scsi29`) or the root disk slot. No IDE device is ever configured by the CPI.
+**CPI behavior.** The BOSH agent's settings ISO always attaches as `media=cdrom` on `scsi30` — reserved by convention specifically so it never collides with the persistent-disk slot range (`scsi1`-`scsi28`, with `scsi29` held as headroom) or the root disk slot. No IDE device is ever configured by the CPI.
 
 **Status.** Meets.
 
@@ -448,7 +448,7 @@ Property names and defaults are cross-referenced to [Configuration reference](co
 
 **Best practice.** A CPI that logs its own request/response traffic risks leaking API tokens, passwords, or presigned URL signatures into a log file an operator did not expect to be sensitive.
 
-**CPI behavior.** Every log sink runs through a shared redaction layer that scrubs credentials before a line is emitted — including presigned-URL signature query parameters and the trailing segment of a `user@realm` identity string.
+**CPI behavior.** Every log sink runs through a shared redaction layer that scrubs credentials before a line is emitted — including presigned-URL signature query parameters and the userinfo segment of any URL (`scheme://user:pass@host`, masked through the last `@` so passwords containing `@` are covered in full).
 
 **Status.** Meets.
 
