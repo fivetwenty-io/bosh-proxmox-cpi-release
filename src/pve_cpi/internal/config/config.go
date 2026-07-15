@@ -1472,6 +1472,78 @@ func unknownConfigKeys(raw []byte) []string {
 	return unknown
 }
 
+// rootPamIdentityLiteral is the exact user@realm string PVE requires for the
+// skiplock parameter fast_path_delete's destroy calls rely on to reclaim
+// locked/running VMs (see internal/cpi/handlers/delete_vm.go and
+// vm_lock_recovery.go). Duplicated from internal/pve/identity.go's
+// rootPamIdentity rather than imported: internal/pve already imports
+// internal/config, so the reverse import would cycle.
+const rootPamIdentityLiteral = "root@pam"
+
+// warnFastPathDeleteNonRootIdentity logs a one-shot Warn at config load time
+// when fast_path_delete is enabled and the configured PVE identity is not
+// exactly the root@pam superuser authenticated via password — the only
+// identity PVE honors the skiplock parameter for. Uses the same ad-hoc
+// stderr-logger pattern as warnUnknownFields (config load happens before the
+// application logger exists, since the logger's own level comes from this
+// same config), except the sink is an explicit parameter so tests can
+// capture output; production passes os.Stderr (see Load).
+//
+// API-token authentication ALWAYS warns, even when the token is owned by
+// root@pam (e.g. "root@pam!bosh-cpi"): PVE's skiplock check compares the
+// full authenticated-user identity, which for a token request always carries
+// the "!<token-id>" suffix and therefore never equals the literal "root@pam"
+// PVE requires. This does not reuse pve.IsRootPamIdentity — importing it
+// would cycle (see rootPamIdentityLiteral above).
+//
+// Warn, never error: an operator may know something this check cannot see
+// (e.g. a proxied auth layer that ultimately reaches PVE as root@pam).
+// fast_path_delete stays enabled either way; a wrong prediction here costs
+// nothing beyond a needless log line, while a correct one saves a confusing
+// PVE-side rejection discovered only at delete time.
+func warnFastPathDeleteNonRootIdentity(cfg *CPIConfig, out io.Writer) {
+	if !cfg.FastPathDeleteEnabled() {
+		return
+	}
+
+	var identity string
+	switch {
+	case cfg.APIToken != "":
+		// Log only the "<user>@<realm>!<token-id>" portion — never the
+		// "=<uuid>" secret suffix.
+		idPart, _, _ := strings.Cut(cfg.APIToken, "=")
+		identity = idPart
+	case cfg.Password != "":
+		identity = cfg.User
+		if !strings.Contains(identity, "@") {
+			realm := cfg.Realm
+			if realm == "" {
+				realm = "pam"
+			}
+			identity += "@" + realm
+		}
+		if identity == rootPamIdentityLiteral {
+			return
+		}
+	default:
+		// Neither auth method configured: validateAuth (elsewhere in this
+		// same load) already accumulates a hard error for this case: nothing
+		// this diagnostic can usefully add.
+		return
+	}
+
+	logger, err := log.NewLogger("warn", out)
+	if err != nil {
+		return
+	}
+	logger.Warn("config: fast_path_delete is enabled but the configured PVE identity is not the root@pam superuser; "+
+		"PVE only honors the skiplock parameter fast_path_delete's destroy calls rely on for that exact identity — "+
+		"delete_vm/delete_disk will fall back to PVE's own rejection when a locked or still-running VM needs skiplock "+
+		"to be destroyed under this identity",
+		log.String("identity", identity),
+	)
+}
+
 // warnUnknownFields decodes raw into a flat map, finds keys absent from
 // knownConfigFields, and emits a single Warn entry listing them.
 // Uses a stderr logger so the warning surfaces even before the application
@@ -1545,6 +1617,7 @@ func Load(r io.Reader) (*CPIConfig, error) {
 	// operator sees all violations in one shot.
 	var strictErrs []string
 	cfg.validateStrictUnknownKeys(raw, &strictErrs)
+	warnFastPathDeleteNonRootIdentity(&cfg, os.Stderr)
 	if err := cfg.ValidateWithLogger(nil); err != nil {
 		if len(strictErrs) == 0 {
 			return nil, err

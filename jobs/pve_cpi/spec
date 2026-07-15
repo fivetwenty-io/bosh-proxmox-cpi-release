@@ -1681,6 +1681,19 @@ properties:
       briefly still see the resource until PVE's async destroy completes.
       Default false (synchronous, fully-consistent behavior unchanged).
 
+      The fast-path destroy issues DeleteQemu with skiplock=true so a locked
+      or still-running VM is destroyed without a separate unlock/stop step
+      first. PVE honors skiplock=true only for the literal root@pam
+      superuser (password auth) — not for any API token, including one
+      owned by root@pam, and not for any other authenticated identity
+      regardless of granted privileges or role. Enabling fast_path_delete
+      under any other identity means the skiplock destroy call falls back to
+      PVE's own rejection whenever it actually hits a locked or running VM;
+      the CPI logs a startup Warn naming the configured identity when this
+      combination is detected, but does not block config load over it — the
+      operator may know the identity ultimately resolves to root@pam
+      through a proxy layer this check cannot see.
+
   pve.stemcell.director_id:
     description: |
       Identity string for the owning BOSH Director, stamped into the provenance

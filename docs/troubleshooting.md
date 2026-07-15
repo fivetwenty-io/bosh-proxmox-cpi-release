@@ -335,6 +335,8 @@ qm unlock <vmid>
 
 Run this on the PVE node that hosts the VM (the node named in the error message). Once unlocked, the BOSH Director's next retry of `delete_vm` (or the original `create_vm`, if the lock was hit during a rollback) succeeds normally — no CPI restart or manifest change is needed.
 
+**`pve.fast_path_delete` and this same `skiplock` dependency:** `fast_path_delete`'s destroy calls also rely on `skiplock=true` to reclaim a locked or still-running VM without a separate unlock/stop step. If `fast_path_delete: true` is set under an identity `skiplock` is not honored for, the CPI logs a startup Warn naming the configured identity (see [Configuration Reference](configuration.md) for `pve.fast_path_delete`); check the CPI process log for that Warn before assuming a manual `qm unlock` is the only path forward.
+
 **Interaction with `debug.keep_failed_vms` and the `bosh-create-failed` tag**
 
 When a `create_vm` rollback (`cleanupVM`) hits this condition and cannot clear the lock (not `root@pam`, or the `skiplock` retry also failed), the VM is left running and orphaned — it was never meant to be preserved, but ended up stuck regardless of the `pve.debug.keep_failed_vms` setting (see [CPI Methods — `create_vm`](cpi_methods.md#create_vm) for that flag's normal, opt-in preserve-for-inspection behavior). The CPI tags it `bosh-create-failed` on a best-effort basis (when the failing rollback has a BOSH deploy identity to tag with) so an operator can find it the same way:
