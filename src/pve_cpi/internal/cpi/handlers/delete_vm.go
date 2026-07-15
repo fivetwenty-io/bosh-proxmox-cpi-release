@@ -153,7 +153,9 @@ func sweepFastDeleteStragglers(ctx context.Context, deps Deps, logger *log.Logge
 			}
 			destroyDisks = !retained
 		}
-		// Fire-and-forget: discard the UPID, no await.
+		// Fire-and-forget: discard the UPID, no await. Purge's pool-membership
+		// interplay: see the synchronous-path DeleteQemu comment in
+		// HandleDeleteVM.
 		_, delErr := deps.PVE.Nodes().DeleteQemu(ctx, item.Node, vmIDStr, &sdknodes.DeleteQemuParams{
 			Purge:                    &purge,
 			DestroyUnreferencedDisks: &destroyDisks,
@@ -251,6 +253,8 @@ func fastPathDeleteVM(ctx context.Context, deps Deps, node, vmCID string, vmid i
 	}
 
 	// Issue destroy with skiplock=true. Discard the UPID; no await.
+	// Purge's pool-membership interplay: see the synchronous-path DeleteQemu
+	// comment in HandleDeleteVM.
 	//
 	// DestroyUnreferencedDisks=false on the retain path: after the unlink+sweep
 	// sequence the ephemeral volume is unreferenced AND has a matching VMID.
@@ -480,7 +484,17 @@ func HandleDeleteVM(deps Deps) cpi.Handler {
 		}
 
 		// --- delete VM (synchronous path) ---
-		// Purge removes VMID from backup/HA/replication configs.
+		// Purge removes VMID from backup/HA/replication configs (per PVE's own
+		// API description). Resource-pool membership (pve.vm_pool,
+		// stemcell_template_pool) is not explicitly documented as part of what
+		// purge cleans up — the delete endpoint's own description separately
+		// says it "Removes any VM specific permissions [ACLs] and firewall
+		// rules", which is a related but distinct PVE construct from pool
+		// membership. A stale pool-membership entry for a deleted VMID (if PVE
+		// leaves one) carries no capability risk — there is no VM behind that
+		// VMID to act on — but this is not verified against a live cluster;
+		// do not depend on the pool member list shrinking immediately after
+		// delete_vm without checking your PVE version.
 		// DestroyUnreferencedDisks: false on the retain path (ephemeral disk is now
 		// unreferenced + own-VMID — true would destroy it); true otherwise (byte-identical
 		// to prior behaviour). See detachRetainedEphemeralDisk for the full rationale.

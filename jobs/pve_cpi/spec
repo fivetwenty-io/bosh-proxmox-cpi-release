@@ -295,6 +295,38 @@ properties:
       validates pool existence at assignment time; an invalid pool name causes
       create_stemcell to return an error. No effect when absent.
     default: ""
+  pve.vm_pool:
+    description: |
+      Optional PVE resource pool name assigned to every VM create_vm
+      provisions, on both the import path and the clone path (both PVE's
+      create and clone endpoints accept "pool" directly). When empty
+      (default), no pool is assigned — byte-identical to every release
+      before this property existed.
+
+      Setting this lets an operator scope the CPI's VM.* ACL grants to
+      /pool/<name> instead of cluster-wide /vms, shrinking the blast radius
+      of a compromised CPI token on a shared cluster: PVE's create and clone
+      endpoints accept "VM.Allocate on /vms/{vmid}" OR "VM.Allocate on
+      /pool/{pool}" when a pool is supplied, and existing-VM operations
+      (config, power, disk, etc.) resolve permissions on /vms/{vmid}
+      inclusive of any ACL granted on a pool the VM belongs to (PVE's
+      resource-pool permission propagation) — so a token granted only on
+      /pool/<name> can fully manage every VM this CPI creates once vm_pool
+      is set. See docs/pve-api-permissions.md for the reduced ACL table and
+      one gap the pool scoping does not close (cloning still requires
+      VM.Clone on the *template's* own vmid/pool, which is not automatically
+      covered).
+
+      The pool itself is NOT created by the CPI — unlike the cluster-lock
+      sentinel pools or stemcell_template_pool, which the CPI creates
+      on demand. Create the pool once as part of cluster setup before
+      deploying with this set; PVE rejects create_vm with a pool-not-found
+      error otherwise.
+
+      Must not equal stemcell_template_pool, and must not start with
+      "bosh-lock-" (reserved for the cluster-lock sentinel pool namespace,
+      see pve.cluster_lock_mode) — both are rejected at config load.
+    default: ""
   pve.stemcell_template_node:
     description: |
       Optional PVE node on which template VMs are created. When empty (default),

@@ -467,6 +467,75 @@ func TestRootDiskBusValue_CaseInsensitiveAndTrimmed(t *testing.T) {
 	}
 }
 
+// ----------------------------------------------------------------
+// vm_pool
+// ----------------------------------------------------------------
+
+func TestValidate_VMPoolUnset_NoError(t *testing.T) {
+	t.Parallel()
+	cfg, err := mustLoad(t, `{
+		"host": "h", "user": "u", "password": "p",
+		"vm_storage": "s", "disk_storage": "s", "network_bridge": "br"
+	}`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.VMPool != "" {
+		t.Errorf("VMPool = %q; want empty", cfg.VMPool)
+	}
+}
+
+func TestValidate_VMPoolDistinct_Accepted(t *testing.T) {
+	t.Parallel()
+	cfg, err := mustLoad(t, `{
+		"host": "h", "user": "u", "password": "p",
+		"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
+		"vm_pool": "bosh-vms",
+		"stemcell_template_pool": "bosh-templates"
+	}`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.VMPool != "bosh-vms" {
+		t.Errorf("VMPool = %q; want %q", cfg.VMPool, "bosh-vms")
+	}
+}
+
+func TestValidate_VMPoolEqualsStemcellTemplatePool_Rejected(t *testing.T) {
+	t.Parallel()
+	_, err := mustLoad(t, `{
+		"host": "h", "user": "u", "password": "p",
+		"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
+		"vm_pool": "shared-pool",
+		"stemcell_template_pool": "shared-pool"
+	}`)
+	assertCloudError(t, err, "vm_pool must not equal stemcell_template_pool")
+}
+
+func TestValidate_VMPoolStemcellTemplatePoolUnset_NoCollision(t *testing.T) {
+	// vm_pool alone (no stemcell_template_pool set) must not trip the
+	// collision check — both empty-vs-nonempty comparisons are moot.
+	t.Parallel()
+	_, err := mustLoad(t, `{
+		"host": "h", "user": "u", "password": "p",
+		"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
+		"vm_pool": "bosh-vms"
+	}`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestValidate_VMPoolClusterLockPrefix_Rejected(t *testing.T) {
+	t.Parallel()
+	_, err := mustLoad(t, `{
+		"host": "h", "user": "u", "password": "p",
+		"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
+		"vm_pool": "bosh-lock-aa-web"
+	}`)
+	assertCloudError(t, err, `vm_pool must not start with "bosh-lock-"`)
+}
+
 func TestValidate_DiskPerfInvariantModeValid(t *testing.T) {
 	t.Parallel()
 	for _, mode := range []string{"enforce", "warn", "off"} {

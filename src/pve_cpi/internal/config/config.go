@@ -335,6 +335,25 @@ type CPIConfig struct {
 	// pool existence at assignment time.
 	StemcellTemplatePool string `json:"stemcell_template_pool,omitempty"`
 
+	// VMPool is an optional PVE resource pool name assigned to every VM
+	// create_vm provisions, on both the import path (CreateQemuParams.Pool)
+	// and the clone path (CreateQemuCloneParams.Pool). Empty (default) means
+	// no pool assignment — byte-identical to every release before this
+	// property existed. Setting it lets an operator scope the CPI's VM.*
+	// ACL grants to /pool/<name> instead of cluster-wide /vms, shrinking the
+	// blast radius of a compromised CPI token on a shared cluster — see
+	// docs/pve-api-permissions.md for the reduced ACL table. The pool itself
+	// is NOT created by the CPI (unlike the cluster-lock sentinel pools or
+	// StemcellTemplatePool's own on-demand creation); it must already exist
+	// before create_vm is called, or PVE rejects the create/clone with a
+	// pool-not-found error.
+	//
+	// validate-only-when-set: must not equal StemcellTemplatePool and must
+	// not carry the cluster-lock sentinel namespace prefix ("bosh-lock-") —
+	// see validateVMPool. Any other non-empty string is accepted; PVE
+	// validates pool existence itself at create/clone time.
+	VMPool string `json:"vm_pool,omitempty"`
+
 	// StemcellTemplateNode is the PVE node on which template VMs are created.
 	// Empty (default) falls back to Node at the callsite. Useful when
 	// stemcell_storage is on shared storage but template creation should be
@@ -2924,6 +2943,7 @@ func (c *CPIConfig) ValidateWithLogger(_ *log.Logger) error {
 	c.validateStorageTiers(&errs)
 	c.validateDiskPerformance(&errs)
 	c.validateStemcell(&errs)
+	c.validateVMPool(&errs)
 	// Cross-field strict checks. No raw bytes needed; struct fields are read
 	// directly. Appended after all other validators so existing error order is
 	// preserved and strict errors group at the end.
@@ -3938,6 +3958,43 @@ func (c *CPIConfig) validateStemcell(errs *[]string) {
 // stemcellDirectorIDRe matches any string that contains at least one
 // alphanumeric character or hyphen. Used by validateStemcell.
 var stemcellDirectorIDRe = regexp.MustCompile(`[A-Za-z0-9-]`)
+
+// clusterLockPoolPrefix mirrors internal/pve's own clusterLockPoolPrefix
+// constant (see internal/pve/cluster_lock.go). internal/pve imports this
+// config package, so the reverse import needed to reference that constant
+// directly would create a cycle; the literal is duplicated here instead,
+// with both copies documented as namespacing the same reserved space.
+const clusterLockPoolPrefix = "bosh-lock-"
+
+// validateVMPool rejects a VMPool value that collides with a pool namespace
+// the CPI itself already owns:
+//   - StemcellTemplatePool: assigning template VMs and regular VMs to the
+//     same pool would let a create_vm-scoped ACL also touch stemcell
+//     templates (and vice versa), defeating the point of a dedicated pool.
+//   - The cluster-lock sentinel namespace ("bosh-lock-" prefix, see
+//     internal/pve/cluster_lock.go): a VM pool inside that namespace could
+//     collide with a dynamically-named sentinel pool the CPI creates and
+//     deletes on demand for anti-affinity locking, corrupting the mutex.
+//
+// Skipped entirely when VMPool is empty (validate-only-when-set).
+func (c *CPIConfig) validateVMPool(errs *[]string) {
+	if c.VMPool == "" {
+		return
+	}
+	if c.VMPool == c.StemcellTemplatePool {
+		*errs = append(*errs, fmt.Sprintf(
+			"vm_pool must not equal stemcell_template_pool (both %q); use a distinct pool for VMs so their "+
+				"ACL scope does not also cover stemcell templates",
+			c.VMPool,
+		))
+	}
+	if strings.HasPrefix(c.VMPool, clusterLockPoolPrefix) {
+		*errs = append(*errs, fmt.Sprintf(
+			"vm_pool must not start with %q (reserved for cluster-lock sentinel pools), got %q",
+			clusterLockPoolPrefix, c.VMPool,
+		))
+	}
+}
 
 // validateStrictCrossFields checks cross-field consistency rules that are
 // advisory (no-op) when strict_config_validation is off, and hard errors when

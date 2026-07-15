@@ -145,6 +145,12 @@
   stemcell_template_pool = p("pve.stemcell_template_pool", "")
   config["stemcell_template_pool"] = stemcell_template_pool unless stemcell_template_pool.to_s.empty?
 
+  # Emit vm_pool only when the operator supplies a non-empty value. When
+  # absent or empty (the default), the key is omitted and create_vm assigns
+  # no pool — byte-identical to every release before this property existed.
+  vm_pool = p("pve.vm_pool", "")
+  config["vm_pool"] = vm_pool unless vm_pool.to_s.empty?
+
   # Emit stemcell_template_node only when the operator supplies a non-empty value.
   # When absent or empty (the default), the key is omitted and the CPI falls back
   # to pve.node at call time.

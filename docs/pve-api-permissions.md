@@ -44,7 +44,7 @@ Derived from the API endpoint inventory under `src/pve_cpi/internal/cpi/handlers
 | `Datastore.Audit` | same four storage paths | `create_stemcell.go`, `get_disks.go`, `has_disk.go` (list/check volume) |
 | `SDN.Allocate` | `/sdn` | `create_network.go`, `delete_network.go` (zone create/delete check it on `/sdn/zones` and `/sdn/zones/{zone}`, covered by a propagated `/sdn` grant), `create_vm.go` (`advertised_routes` subnet injection) — required by default (`network_mode: sdn`); only a `network_mode: bridge` opt-out avoids it |
 | `Sys.Console` | `/` | HA-rule writes — `POST`/`DELETE /cluster/ha/resources`, `POST`/`DELETE /cluster/ha/rules` driven by `placement.pin_az_via_ha_rules`, `anti_affinity.use_ha_rules`, and DLB (`placement.dlb` configured) — see note below |
-| `Pool.Allocate` | `/pool/<poolid>` | `cluster_lock.go` (`POST`/`DELETE /pools` — create/delete sentinel pools `bosh-lock-*` when `cluster_lock_mode: pool`), `create_stemcell.go` (`PUT /pools/{poolid}` via `AddVM` — assign the template VM to `pve.stemcell_template_pool` when set) — opt-in, only when one of these two features is enabled |
+| `Pool.Allocate` | `/pool/<poolid>` | `cluster_lock.go` (`POST`/`DELETE /pools` — create/delete sentinel pools `bosh-lock-*` when `cluster_lock_mode: pool`), `create_stemcell.go` (`PUT /pools/{poolid}` via `AddVM` — assign the template VM to `pve.stemcell_template_pool` when set) — opt-in, only when one of these two features is enabled. `pve.vm_pool` does **not** need this privilege: it assigns membership via the `pool` parameter on the create/clone request itself, checked as `VM.Allocate` on `/pool/{pool}` (see §7), not via a separate `PUT /pools` call |
 | `Pool.Audit` | `/pool/<poolid>` | `GetPoolComment` (`GET /pools`/`GET /pools/{poolid}`) — pool-existence and comment reads backing the same two opt-in features above |
 | `Sys.Modify` | `/` | `placement_dlb.go` (`PUT /cluster/options` setting `crs=ha=dynamic,...`) — opt-in, only when `placement.dlb.manage_cluster_crs: true`; when false (default) the CPI only reads `/cluster/options` (`Sys.Audit`, already granted) and logs a warning instead of writing |
 
@@ -328,3 +328,63 @@ The CPI uploads stemcells as qcow2 files and references them via the **volume fo
 The "Fix B is insufficient" warning in [pve-settings.md §3](pve-settings.md#fix-b--grant-acl-partial-not-sufficient-alone) applies only to the **path form** `import-from=/absolute/filesystem/path`, which PVE restricts to the `root` Unix account regardless of API privileges. The CPI never uses the path form, so the minimum-privilege setup in this doc does not hit that restriction.
 
 In short: a `bosh@pve` token with `privsep=0` and the §3 ACLs can upload stemcells and clone from them without `root@pam`.
+
+## 7. Shared-cluster variant: scoping VM mutation to a resource pool
+
+Every grant in §3 that lands on `/vms` is cluster-wide: on a cluster that also runs VMs the CPI does not manage, a `bosh@pve` token with those ACLs can mutate every guest, not only the ones it created. `pve.vm_pool` (see [Configuration](configuration.md)) closes that gap by assigning every CPI-created VM to a dedicated resource pool at create/clone time, so the six `/vms`-scoped privileges below can be granted on `/pool/<bosh-pool>` instead.
+
+### How the scoping works
+
+Confirmed against the PVE API schema (`apidoc.json`), not merely inferred:
+
+- **Create** (`POST /nodes/{node}/qemu`) checks `VM.Allocate` on `/vms/{vmid}` **or** on `/pool/{pool}` when the request supplies a `pool` parameter. `pve.vm_pool` makes the CPI's create calls always supply that parameter, so a token with `VM.Allocate` granted only on `/pool/<bosh-pool>` can create new VMs into that pool.
+- **Clone** (`POST /nodes/{node}/qemu/{vmid}/clone`) checks the same `VM.Allocate` on `/vms/{newid}` **or** `/pool/{pool}` for the *new* VMID, plus `VM.Clone` on `/vms/{vmid}` for the **template's** own VMID — see the gap below.
+- **Every other VM operation** (`config` read/write, `status/*` power management, disk attach/detach, snapshots, etc.) checks its privilege on `/vms/{vmid}` for the *existing* VM. PVE's resource-pool permission model (documented in the PVE Administration Guide's Permission Management chapter) additionally honors any ACL granted on `/pool/{poolid}` for VMs that are members of that pool — so once a VM is a `<bosh-pool>` member (which it is, from the moment `create_vm` created it with `pool=<bosh-pool>`), a `/pool/<bosh-pool>`-scoped grant covers every subsequent operation on it too.
+
+### The gap: cloning still needs template access
+
+The clone endpoint's `VM.Clone` check runs against the **template's own VMID**, not the new VM's. A template is a member of `pve.stemcell_template_pool` (if set) or no pool at all — never `pve.vm_pool`, and the two are rejected as equal at config load specifically so they cannot be conflated. A `bosh@pve` token scoped only to `/pool/<bosh-pool>` cannot clone from a template it has no grant on.
+
+Two ways to close this, pick one:
+
+- Grant `VM.Clone` (bundled in `BoshOperator`) on `/pool/<stemcell-template-pool>` too, if `stemcell_template_pool` is set — a second, narrower pool-scoped grant, still far short of cluster-wide `/vms`.
+- Grant `VM.Clone` on `/vms` specifically (leaving the other five VM.\* privileges pool-scoped) — templates are CPI-owned infrastructure, not guest VMs, so a `VM.Clone`-only cluster-wide grant is a much smaller blast radius than the full `/vms` grant in §3.
+
+The reduced-ACL table below assumes `stemcell_template_pool` is set and takes the first option.
+
+### Reduced ACL table
+
+Replaces the `/vms` row from §3c's table; every other row (root-path, SDN, storage, and the `/pool/<poolid>` row already present for `cluster_lock_mode: pool`/`stemcell_template_pool`) is unchanged.
+
+| Path | Role | Notes |
+|---|---|---|
+| `/pool/<bosh-pool>` | `BoshOperator` | Replaces `/vms`. Covers `VM.Allocate` (create/clone into the pool) and every other VM.\* privilege for VMs that are members of `<bosh-pool>` — i.e. every VM this CPI creates once `pve.vm_pool: <bosh-pool>` is set |
+| `/pool/<stemcell-template-pool>` | `BoshOperator` | Additional grant closing the cloning gap above — required whenever `stemcell_template_pool` is set alongside `vm_pool`. Omit and grant `VM.Clone` on `/vms` instead if you took the second option above |
+
+Prerequisite: `<bosh-pool>` must exist before the first `create_vm` call — the CPI does not create it (unlike the cluster-lock sentinel pools or `stemcell_template_pool`, both of which the CPI creates on demand). Create it once with an admin token:
+
+```bash
+curl -sk -X POST -H "Authorization: $PVE_TOKEN" \
+  --data-urlencode 'poolid=<bosh-pool>' \
+  --data-urlencode 'comment=BOSH CPI managed VMs' \
+  https://$PVE_HOST/api2/json/pools
+```
+
+Then grant the ACL:
+
+```bash
+curl -sk -X PUT -H "Authorization: $PVE_TOKEN" \
+  --data-urlencode 'path=/pool/<bosh-pool>' \
+  --data-urlencode 'users=bosh@pve' \
+  --data-urlencode 'roles=BoshOperator' \
+  -d 'propagate=1' \
+  https://$PVE_HOST/api2/json/access/acl
+```
+
+### Caveats
+
+- **Existing VMs are not retroactively covered.** `pve.vm_pool` only stamps pool membership on VMs `create_vm` provisions *after* the setting takes effect. A VM created before enabling it is not a pool member, and a token scoped only to `/pool/<bosh-pool>` cannot manage it — either leave `/vms` granted alongside the pool scope until every pre-existing VM is replaced, or manually add old VMIDs to the pool as a one-time migration step.
+- **Changing `vm_pool` does not move existing members.** A VM stays in the pool it was created under even if the config value later changes; re-pointing `pve.vm_pool` at a new pool only affects VMs created afterward.
+- **`delete_vm`'s `skiplock` behavior is unaffected either way** — it remains gated on the `root@pam` user regardless of pool scoping (see the `delete_vm` note in §2).
+- **Verify before relying on this in production.** The create/clone pool-fallback is directly confirmed against the PVE API schema; the propagation to config/status/disk/snapshot operations is PVE's documented general pool-permission behavior but was not exercised against a live cluster as part of this change. Run the §5 smoke test against a `bosh@pve` token scoped *only* to the reduced ACL table above (temporarily drop the `/vms` grant) before committing to it, and re-run it after any PVE upgrade.
+- **Pool membership on delete.** `DELETE /nodes/{node}/qemu/{vmid}?purge=1`'s own API description covers cleanup of backup/replication/HA job references and VM-specific permissions; it does not explicitly document resource-pool membership cleanup. A deleted VM's stale pool membership entry (if one persists) carries no capability risk — there is no VM behind that VMID to act on — but do not rely on it disappearing from `pvesh get /pools/<bosh-pool>` output without checking your PVE version.

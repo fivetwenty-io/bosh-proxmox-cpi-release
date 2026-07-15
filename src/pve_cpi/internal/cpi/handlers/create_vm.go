@@ -376,6 +376,12 @@ type createVMShape struct {
 	// clone-path (UpdateQemuConfig) use this value; cloud_properties.pve_config.cpu
 	// is a separate, later write that always wins as the final override.
 	cpuType string
+	// vmPool is the PVE resource pool name assigned to this VM at create/clone
+	// time (pve.vm_pool). Empty (default) means no pool assignment — no
+	// "pool" key or field is ever set. No cloud_properties override; this is
+	// a global-only knob (unlike cpuType, which has a per-call layer) since
+	// its purpose is a fleet-wide ACL boundary, not per-instance-group tuning.
+	vmPool string
 }
 
 // HandleCreateVM returns a cpi.Handler that implements the BOSH CPI create_vm method.
@@ -1222,6 +1228,7 @@ func buildVMShapeForNode(ctx context.Context, deps Deps, parsed *createVMParsedA
 		ephemeralDiskGiB: ephemeralDiskGiB,
 		ephemeralStorage: ephemeralStorage,
 		cpuType:          cpuTypeVal,
+		vmPool:           deps.Config.VMPool,
 	}, nil
 }
 
@@ -3416,8 +3423,10 @@ func attemptCreateVM(
 // applyOptionalCreateParams adds the import-path createParams keys that are
 // only emitted when their resolved shape value is non-default: numa, sockets
 // (only when > 1, matching the historic single-socket-is-implicit default),
-// initial tags, and cpu (cloud_properties.cpu_type / pve.cpu_type — absent
-// means PVE keeps its own kvm64 default, byte-identical to prior releases).
+// initial tags, cpu (cloud_properties.cpu_type / pve.cpu_type — absent means
+// PVE keeps its own kvm64 default, byte-identical to prior releases), and
+// pool (pve.vm_pool — absent means no pool assignment, byte-identical to
+// every release before that property existed).
 // Extracted from attemptCreateVM to keep that function's cognitive complexity
 // under the project threshold.
 func applyOptionalCreateParams(createParams map[string]any, shape *createVMShape) {
@@ -3432,6 +3441,9 @@ func applyOptionalCreateParams(createParams map[string]any, shape *createVMShape
 	}
 	if shape.cpuType != "" {
 		createParams[pveConfigKeyCPU] = shape.cpuType
+	}
+	if shape.vmPool != "" {
+		createParams["pool"] = shape.vmPool
 	}
 }
 
@@ -3721,6 +3733,15 @@ func cloneFromTemplate(
 	if full != nil && *full {
 		params.Storage = &shape.vmStorage
 		params.Format = &shape.vmDiskFormat
+	}
+
+	// Assign the clone to pve.vm_pool when set — mirrors the import path's
+	// "pool" createParams key. Absent (empty) means no pool assignment,
+	// byte-identical to every release before this property existed. The
+	// pool must already exist; PVE rejects the clone otherwise.
+	if shape.vmPool != "" {
+		poolVal := shape.vmPool
+		params.Pool = &poolVal
 	}
 
 	// Cross-node Target= enforcement.
