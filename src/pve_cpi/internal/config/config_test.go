@@ -4402,6 +4402,73 @@ func TestValidate_DiskPerformance_InvalidCache(t *testing.T) {
 	assertCloudError(t, err, "disk_performance.cache")
 }
 
+// TestValidate_DiskPerformance_ValidAio confirms accepted aio mode values.
+func TestValidate_DiskPerformance_ValidAio(t *testing.T) {
+	t.Parallel()
+	for _, mode := range []string{"native", "io_uring", "threads"} {
+		t.Run(mode, func(t *testing.T) {
+			cfg, err := mustLoad(t, `{
+				"host":"h","user":"u","password":"p",
+				"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+				"disk_performance":{"aio":"`+mode+`"}
+			}`)
+			if err != nil {
+				t.Errorf("aio=%q: unexpected error: %v", mode, err)
+			}
+			if cfg.DiskPerformance == nil || cfg.DiskPerformance.AIO != mode {
+				t.Errorf("aio=%q: DiskPerformance.AIO = %v; want %q", mode, cfg.DiskPerformance, mode)
+			}
+		})
+	}
+}
+
+// TestValidate_DiskPerformance_InvalidAio confirms an unknown aio string is rejected.
+func TestValidate_DiskPerformance_InvalidAio(t *testing.T) {
+	t.Parallel()
+	_, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+		"disk_performance":{"aio":"bogus"}
+	}`)
+	assertCloudError(t, err, "disk_performance.aio")
+}
+
+// TestValidate_DiskPerformance_AioUnsetOmitted confirms an absent aio field
+// leaves DiskPerformance.AIO as the empty string (byte-identical: no key is
+// ever baked when unset at every layer).
+func TestValidate_DiskPerformance_AioUnsetOmitted(t *testing.T) {
+	t.Parallel()
+	cfg, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+		"disk_performance":{"cache":"writeback"}
+	}`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.DiskPerformance == nil || cfg.DiskPerformance.AIO != "" {
+		t.Errorf("DiskPerformance.AIO = %v; want empty string", cfg.DiskPerformance)
+	}
+}
+
+// TestIsKnownDiskAioMode_Table exercises the exported validator directly.
+func TestIsKnownDiskAioMode_Table(t *testing.T) {
+	t.Parallel()
+	cases := map[string]bool{
+		"":         true,
+		"native":   true,
+		"io_uring": true,
+		"threads":  true,
+		"bogus":    false,
+		"NATIVE":   false, // case-sensitive, matches IsKnownDiskCacheMode's contract
+	}
+	for mode, want := range cases {
+		if got := config.IsKnownDiskAioMode(mode); got != want {
+			t.Errorf("IsKnownDiskAioMode(%q) = %v; want %v", mode, got, want)
+		}
+	}
+}
+
 // TestValidate_DiskPerformance_NegativeMBpsRd confirms mbps_rd < 0 is rejected.
 func TestValidate_DiskPerformance_NegativeMBpsRd(t *testing.T) {
 	t.Parallel()

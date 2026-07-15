@@ -1211,11 +1211,11 @@ func TestHandleAttachDisk_PerfOpts_MetaOptsApplied(t *testing.T) {
 // TestHandleAttachDisk_PerfOpts_BareNoOptions verifies byte-identical behavior:
 // when the CID has no meta opts and config has nil DiskPerformance, AttachDisk
 // receives the bareDiskCID with no option suffix.
-// TestHandleAttachDisk_PerfOpts_NoConfigPhase2DefaultApplied verifies that
+// TestHandleAttachDisk_PerfOpts_NoConfigCurrentDefaultApplied verifies that
 // with a bare no-opts CID and no global DiskPerformance block, the volid
 // passed to AttachDisk still picks up the Phase 2 iothread=1 default —
 // replacing the pre-Phase-2 "byte-identical to bareCID" assertion.
-func TestHandleAttachDisk_PerfOpts_NoConfigPhase2DefaultApplied(t *testing.T) {
+func TestHandleAttachDisk_PerfOpts_NoConfigCurrentDefaultApplied(t *testing.T) {
 	t.Parallel()
 	const bareCID = "local-lvm:vm-9001-disk-0"
 

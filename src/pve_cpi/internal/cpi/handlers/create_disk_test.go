@@ -1215,11 +1215,11 @@ func TestHandleCreateDisk_PerfOpts_InCIDMeta(t *testing.T) {
 // TestHandleCreateDisk_NoPerfOpts_ByteIdenticalCID verifies that when no perf
 // options are supplied, the returned disk CID is byte-identical to one produced
 // without any Opts field — preserving backward compatibility.
-// TestHandleCreateDisk_NoPerfOpts_Phase2DefaultBakesIothread verifies that a
+// TestHandleCreateDisk_NoPerfOpts_CurrentDefaultBakesIothread verifies that a
 // create_disk call with no explicit perf opts bakes the Phase 2 default
 // (iothread=1) into the disk CID's recorded Opts — replacing the pre-Phase-2
 // "byte-identical, no options" assertion.
-func TestHandleCreateDisk_NoPerfOpts_Phase2DefaultBakesIothread(t *testing.T) {
+func TestHandleCreateDisk_NoPerfOpts_CurrentDefaultBakesIothread(t *testing.T) {
 	t.Parallel()
 	storageSvc := &mockStorageService{
 		createVolumeFn: func(_ context.Context, _, storage string, _ int, _ string, vmid int, _ string) (string, error) {
@@ -1335,5 +1335,79 @@ func TestHandleCreateDisk_BadCacheMode_CloudError(t *testing.T) {
 	}
 	if cpiErr.OkToRetry() {
 		t.Error("bad cache mode error must not be retriable")
+	}
+}
+
+// TestHandleCreateDisk_Aio_InCIDMeta verifies that cloud_properties.aio is
+// resolved and baked into the returned disk CID's recorded Opts, alongside
+// the existing per-disk performance options.
+func TestHandleCreateDisk_Aio_InCIDMeta(t *testing.T) {
+	t.Parallel()
+	storageSvc := &mockStorageService{
+		createVolumeFn: func(_ context.Context, _, storage string, _ int, _ string, vmid int, _ string) (string, error) {
+			return fmt.Sprintf("%s:vm-%d-disk-0", storage, vmid), nil
+		},
+	}
+	deps := baseDepsForCreate(t, storageSvc, nil)
+
+	h := handlers.HandleCreateDisk(deps)
+	result, err := h.Handle(context.Background(), []json.RawMessage{
+		marshal(1024),
+		marshal(map[string]any{
+			"storage_pool": storageName,
+			"aio":          "native",
+			"cache":        "none",
+		}),
+	}, jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	diskCID, ok := result.(string)
+	if !ok || diskCID == "" {
+		t.Fatalf("expected non-empty string result, got %T %v", result, result)
+	}
+
+	_, meta, parseErr := pve.ParseEncodedDiskCID(diskCID)
+	if parseErr != nil {
+		t.Fatalf("ParseEncodedDiskCID(%q): %v", diskCID, parseErr)
+	}
+	if meta == nil {
+		t.Fatal("meta is nil; aio option not encoded into disk CID")
+	}
+	if got := meta.Opts["aio"]; got != "native" {
+		t.Errorf("meta.Opts[\"aio\"] = %q; want %q", got, "native")
+	}
+}
+
+// TestHandleCreateDisk_BadAioMode_CloudError verifies that an invalid aio
+// value in cloud_properties causes a non-retriable CloudError before any PVE
+// call is made, matching the existing cache validation behavior.
+func TestHandleCreateDisk_BadAioMode_CloudError(t *testing.T) {
+	t.Parallel()
+	storageSvc := &mockStorageService{
+		createVolumeFn: func(_ context.Context, _, _ string, _ int, _ string, _ int, _ string) (string, error) {
+			t.Error("CreateVolume must not be called when perf option validation fails")
+			return "", nil
+		},
+	}
+	deps := baseDepsForCreate(t, storageSvc, nil)
+
+	h := handlers.HandleCreateDisk(deps)
+	_, err := h.Handle(context.Background(), []json.RawMessage{
+		marshal(1024),
+		marshal(map[string]any{
+			"aio": "bogus",
+		}),
+	}, jsonrpc.Context{})
+
+	if err == nil {
+		t.Fatal("expected CloudError for invalid aio mode, got nil")
+	}
+	var cpiErr *cpierrors.Error
+	if !errors.As(err, &cpiErr) {
+		t.Fatalf("expected *cpierrors.Error, got %T: %v", err, err)
+	}
+	if cpiErr.OkToRetry() {
+		t.Error("bad aio mode error must not be retriable")
 	}
 }

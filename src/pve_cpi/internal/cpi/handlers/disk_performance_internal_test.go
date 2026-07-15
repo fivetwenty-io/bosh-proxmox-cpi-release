@@ -578,3 +578,110 @@ func TestValidateDiskPerfCache_BogusError(t *testing.T) {
 		t.Error("bogus mode should return error, got nil")
 	}
 }
+
+// ----------------------------------------------------------------
+// validateDiskPerfAio
+// ----------------------------------------------------------------
+
+func TestValidateDiskPerfAio_EmptyOK(t *testing.T) {
+	if err := validateDiskPerfAio(""); err != nil {
+		t.Errorf("empty mode should be valid, got %v", err)
+	}
+}
+
+func TestValidateDiskPerfAio_ValidModes(t *testing.T) {
+	for _, mode := range []string{"native", "io_uring", "threads"} {
+		if err := validateDiskPerfAio(mode); err != nil {
+			t.Errorf("mode %q should be valid, got %v", mode, err)
+		}
+	}
+}
+
+func TestValidateDiskPerfAio_BogusError(t *testing.T) {
+	if err := validateDiskPerfAio("bogus"); err == nil {
+		t.Error("bogus mode should return error, got nil")
+	}
+}
+
+// ----------------------------------------------------------------
+// resolveDiskPerfOptions: aio
+// ----------------------------------------------------------------
+
+// TestResolveDiskPerfOptions_Aio_UnsetOmitted verifies that with aio unset at
+// every layer, opts carries no "aio" key — byte-identical to before this
+// option existed (only the pre-existing iothread default-true entry remains).
+func TestResolveDiskPerfOptions_Aio_UnsetOmitted(t *testing.T) {
+	r := buildResolver(t, nil)
+	opts, err := resolveDiskPerfOptions(r, nil, "", "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, present := opts["aio"]; present {
+		t.Errorf("aio should be omitted when unset at every layer, got opts=%v", opts)
+	}
+	if len(opts) != 1 || opts["iothread"] != "1" {
+		t.Errorf("expected map[iothread:1] only, got %v", opts)
+	}
+}
+
+// TestResolveDiskPerfOptions_Aio_GlobalConfig_SetsKey verifies the global
+// disk_performance.aio default is baked into opts when nothing overrides it
+// at the call layer.
+func TestResolveDiskPerfOptions_Aio_GlobalConfig_SetsKey(t *testing.T) {
+	r := buildResolver(t, nil)
+	cfg := &config.CPIConfig{
+		DiskPerformance: &config.DiskPerformanceDefaults{AIO: "native"},
+	}
+	opts, err := resolveDiskPerfOptions(r, cfg, "", "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if opts["aio"] != "native" {
+		t.Errorf("aio = %q; want %q", opts["aio"], "native")
+	}
+}
+
+// TestResolveDiskPerfOptions_Aio_CallOverridesGlobal verifies call-level
+// cloud_properties.aio wins over the global disk_performance.aio default,
+// matching the layered resolver's precedence for every other disk_performance
+// option.
+func TestResolveDiskPerfOptions_Aio_CallOverridesGlobal(t *testing.T) {
+	cp := map[string]any{"aio": "threads"}
+	r := buildResolver(t, cp)
+	cfg := &config.CPIConfig{
+		DiskPerformance: &config.DiskPerformanceDefaults{AIO: "native"},
+	}
+	opts, err := resolveDiskPerfOptions(r, cfg, "", "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if opts["aio"] != "threads" {
+		t.Errorf("call aio=threads should beat config aio=native; got opts[aio]=%q", opts["aio"])
+	}
+}
+
+// TestResolveDiskPerfOptions_Aio_BogusError verifies an invalid aio value at
+// the call layer produces a non-retriable error rather than being silently
+// baked into the volid.
+func TestResolveDiskPerfOptions_Aio_BogusError(t *testing.T) {
+	cp := map[string]any{"aio": "bogus"}
+	r := buildResolver(t, cp)
+	_, err := resolveDiskPerfOptions(r, &config.CPIConfig{}, "", "")
+	if err == nil {
+		t.Fatal("expected error for bogus aio mode, got nil")
+	}
+}
+
+// TestResolveDiskPerfOptions_Aio_BogusGlobalConfigError verifies an invalid
+// aio value at the global config layer also produces an error (not just a
+// call-level bogus value).
+func TestResolveDiskPerfOptions_Aio_BogusGlobalConfigError(t *testing.T) {
+	r := buildResolver(t, nil)
+	cfg := &config.CPIConfig{
+		DiskPerformance: &config.DiskPerformanceDefaults{AIO: "bogus"},
+	}
+	_, err := resolveDiskPerfOptions(r, cfg, "", "")
+	if err == nil {
+		t.Fatal("expected error for bogus global aio mode, got nil")
+	}
+}

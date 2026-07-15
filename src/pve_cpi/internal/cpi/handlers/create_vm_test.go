@@ -3622,11 +3622,11 @@ func TestCreateVM_UnknownVMTypeInCloudProps_ReturnsCloudError(t *testing.T) {
 // Root-disk performance options: import path
 // --------------------------------------------------------------------------
 
-// TestCreateVM_ImportPath_NoPerfOpts_Phase2Defaults verifies that when no
+// TestCreateVM_ImportPath_NoPerfOpts_CurrentDefaults verifies that when no
 // perf opts and no virtio_scsi_single are set, createParams virtio0 carries
 // the Phase 2 default iothread=1, and scsihw resolves to the Phase 2 default
 // virtio-scsi-single. Replaces the pre-Phase-2 "byte-identical" assertions.
-func TestCreateVM_ImportPath_NoPerfOpts_Phase2Defaults(t *testing.T) {
+func TestCreateVM_ImportPath_NoPerfOpts_CurrentDefaults(t *testing.T) {
 	t.Parallel()
 	q := &vmMockQEMU{}
 	n := &vmMockNodes{}
@@ -3796,12 +3796,12 @@ func TestCreateVM_ImportPath_VirtioSCSISingle_SetsCorrectScsihw(t *testing.T) {
 // Root-disk performance options: clone path
 // --------------------------------------------------------------------------
 
-// TestCreateVM_ClonePath_NoPerfOpts_Phase2Defaults verifies that the
+// TestCreateVM_ClonePath_NoPerfOpts_CurrentDefaults verifies that the
 // post-clone UpdateQemuConfig params carry the Phase 2 defaults when no perf
 // opts and no virtio_scsi_single are set: Scsihw="virtio-scsi-single" and
 // Virtio[0] containing iothread=1. Replaces the pre-Phase-2
 // "byte-identical/no extra keys" assertions.
-func TestCreateVM_ClonePath_NoPerfOpts_Phase2Defaults(t *testing.T) {
+func TestCreateVM_ClonePath_NoPerfOpts_CurrentDefaults(t *testing.T) {
 	t.Parallel()
 
 	n := &vmMockNodes{

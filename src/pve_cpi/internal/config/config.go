@@ -857,6 +857,12 @@ type DiskPerformanceDefaults struct {
 	IOPSRd           *int     `json:"iops_rd,omitempty"`
 	IOPSWr           *int     `json:"iops_wr,omitempty"`
 	VirtioSCSISingle *bool    `json:"virtio_scsi_single,omitempty"`
+	// AIO selects the PVE AsyncIO backend for every disk created by this CPI:
+	// "native", "io_uring", or "threads". Empty (default) omits the key and
+	// leaves PVE's own default in effect. Overridden per disk by
+	// cloud_properties.aio. Structural (invariant-tracked on re-attach, same
+	// as cache/iothread/ssd) — see diskPerfInvariantKeys.
+	AIO string `json:"aio,omitempty"`
 }
 
 // StemcellProvenanceConfig holds optional stemcell provenance tracking and
@@ -3831,12 +3837,34 @@ func IsKnownDiskCacheMode(mode string) bool {
 	return ok
 }
 
+// knownDiskAioModes is the set of PVE per-disk AsyncIO backend strings
+// accepted in DiskPerformanceDefaults.AIO. Mirrors PVE's own qm.conf
+// asyncio enum; an empty string means "no override" and is valid.
+var knownDiskAioModes = map[string]struct{}{
+	"native":   {},
+	"io_uring": {},
+	"threads":  {},
+}
+
+// IsKnownDiskAioMode reports whether mode is a PVE per-disk AsyncIO backend
+// the CPI accepts. An empty string ("no override") is reported as valid.
+// Exported so the handlers package can validate call-time aio values against
+// the single authoritative set without duplicating the literals.
+func IsKnownDiskAioMode(mode string) bool {
+	if mode == "" {
+		return true
+	}
+	_, ok := knownDiskAioModes[mode]
+	return ok
+}
+
 // validateDiskPerformance validates the optional DiskPerformance block.
 // Skipped entirely when DiskPerformance is nil (validate-only-when-set).
 // Rules enforced when the block is present:
 //   - Cache non-empty and not in {none,writethrough,writeback,unsafe,directsync} → error.
 //   - MBpsRd/MBpsWr non-nil and < 0 → error.
 //   - IOPSRd/IOPSWr non-nil and < 0 → error.
+//   - AIO non-empty and not in {native,io_uring,threads} → error.
 //
 // Boolean fields (Iothread, Discard, SSD, VirtioSCSISingle) are *bool with no
 // further constraints; any non-nil *bool is valid.
@@ -3872,6 +3900,14 @@ func (c *CPIConfig) validateDiskPerformance(errs *[]string) {
 		*errs = append(*errs, fmt.Sprintf(
 			"disk_performance.iops_wr must be >= 0, got %d", *dp.IOPSWr,
 		))
+	}
+	if dp.AIO != "" {
+		if _, ok := knownDiskAioModes[dp.AIO]; !ok {
+			*errs = append(*errs, fmt.Sprintf(
+				"disk_performance.aio must be one of native|io_uring|threads, got %q",
+				dp.AIO,
+			))
+		}
 	}
 }
 

@@ -1576,6 +1576,29 @@ properties:
       cloud_properties.iops_wr. When unset (default), the key is omitted and PVE
       imposes no IOPS limit.
 
+  pve.disk_performance.aio:
+    description: |
+      Default PVE AsyncIO backend applied to every disk created by this CPI.
+      Valid values: native, io_uring, threads. Overridden per disk by
+      cloud_properties.aio. When unset (default), the key is omitted and PVE
+      uses its own default (io_uring on modern PVE hosts).
+
+      io_uring is PVE's modern default and generally the best choice on a
+      current kernel. native (Linux AIO, kernel io_submit) pairs with
+      cache=none on block-backed storage (lvmthin, zfspool, rbd, lvm) for the
+      lowest-overhead path to raw/thin-provisioned block devices — the classic
+      "aio=native + cache=none" combination for high-IOPS workloads on
+      block-native pools. threads uses a userspace thread pool and is the
+      safest fallback for file-backed storage (dir, nfs, cifs) or older
+      kernels where io_uring is unavailable or unstable.
+
+      Structural option: baked into the disk's PVE volid options at create
+      time (create_disk, create_vm's root disk) and governed by
+      disk_perf_invariant_mode on re-attach, same as cache/iothread/ssd — a
+      disk whose creation-time record diverges from a later re-resolution is
+      caught by that guard (reject in enforce mode, warn in warn mode, ignore
+      in off mode).
+
   pve.disk_performance.virtio_scsi_single:
     description: |
       When true, sets the SCSI controller to virtio-scsi-single mode for every

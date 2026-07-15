@@ -862,6 +862,14 @@ detects that mismatch and fails fast with an actionable error rather than silent
 the wrong bus. See [Configuration — `pve.root_disk_bus`](configuration.md) for the full
 clone-path detail.
 
+**AIO backend option.** A ninth per-disk knob, `aio` (`native`\|`io_uring`\|`threads`), joins the
+original eight through the same layered resolver and volid-option baking. Unset (default) omits
+the key and PVE applies its own default; `io_uring` is PVE's own modern default, `native` pairs
+with `cache=none` on block-backed pools for the lowest-overhead path to raw/thin-provisioned
+devices, and `threads` is the safe fallback for file-backed storage or older kernels. Structural
+like `cache`/`iothread`/`ssd`: baked at create time and governed by `disk_perf_invariant_mode`
+on re-attach.
+
 **Benefit.** Each knob maps to a concrete Proxmox storage win: `discard=on` issues TRIM/UNMAP so
 a thin LVM or Ceph pool actually reclaims space the guest frees (without it, a thin pool fills
 permanently as files are deleted); `iothread=1` gives the disk a dedicated QEMU I/O thread,

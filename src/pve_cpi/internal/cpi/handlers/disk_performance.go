@@ -50,6 +50,10 @@ import (
 //	                 VM root disk regardless of how it resolved — ssd only
 //	                 ever reaches a disk on the scsi bus.
 //	cache    string (validated) → opts["cache"]=mode / omit when empty
+//	aio      string (validated) → opts["aio"]=mode / omit when empty. One of
+//	                 native|io_uring|threads. Structural (invariant-tracked
+//	                 on re-attach, same as cache/iothread/ssd — see
+//	                 diskPerfInvariantKeys).
 //	mbps_rd  float → strconv.FormatFloat(v,'g',-1,64) / omit when 0; <0 → error
 //	mbps_wr  same pattern
 //	iops_rd  int → strconv.Itoa(v) / omit when 0; <0 → error
@@ -86,6 +90,20 @@ func resolveDiskPerfOptions(r *layeredResolver, cfg *config.CPIConfig, storageTy
 	}
 	if cacheMode != "" {
 		opts[diskOptCache] = cacheMode
+	}
+
+	// aio: validated string, same pattern as cache. resolver value wins; else
+	// config default. Empty (unset at both layers) omits the key and PVE
+	// applies its own default.
+	aioMode, aioOK := r.String(diskOptAio)
+	if !aioOK && dp != nil {
+		aioMode = dp.AIO
+	}
+	if err := validateDiskPerfAio(aioMode); err != nil {
+		return nil, err
+	}
+	if aioMode != "" {
+		opts[diskOptAio] = aioMode
 	}
 
 	// Throttles: emit only when > 0; < 0 → error.
@@ -270,7 +288,10 @@ func resolveVirtioSCSISingle(r *layeredResolver, cfg *config.CPIConfig) bool {
 //	           in-flight write semantics (Azure treats caching as immutable).
 //	iothread — dedicated I/O thread; toggling requires controller reconfiguration.
 //	ssd      — SSD emulation flag; affects guest discard/trim behavior.
-var diskPerfInvariantKeys = []string{diskOptCache, diskOptIothread, diskOptSSD}
+//	aio      — AsyncIO backend; QEMU binds the backend at device attach, so
+//	           changing it on a live device requires detach/reattach, same as
+//	           cache and iothread.
+var diskPerfInvariantKeys = []string{diskOptCache, diskOptIothread, diskOptSSD, diskOptAio}
 
 // diskPerfInvariantViolations compares the creation-time disk-performance
 // options recorded in the disk CID against the effective options that would be
@@ -320,6 +341,20 @@ func validateDiskPerfCache(mode string) error {
 	}
 	return cpierrors.Cloud(
 		"disk_performance: cache must be one of none|writethrough|writeback|unsafe|directsync, got %q",
+		mode,
+	)
+}
+
+// validateDiskPerfAio returns a non-retriable CloudError if mode is non-empty
+// and not a known PVE AsyncIO backend. Empty string is valid (means "no
+// override"). Delegates to config.IsKnownDiskAioMode so the accepted set
+// lives in one place.
+func validateDiskPerfAio(mode string) error {
+	if config.IsKnownDiskAioMode(mode) {
+		return nil
+	}
+	return cpierrors.Cloud(
+		"disk_performance: aio must be one of native|io_uring|threads, got %q",
 		mode,
 	)
 }

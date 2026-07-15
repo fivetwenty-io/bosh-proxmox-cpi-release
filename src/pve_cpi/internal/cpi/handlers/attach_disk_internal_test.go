@@ -17,8 +17,8 @@ const cmNone = "none"
 // TestDiskPerfInvariantViolations covers the pure invariant-divergence detector
 // used by §7.26 enforcement. Absence of an option is treated as a value: an
 // option present at attach but absent at creation (or vice versa, or changed)
-// is a divergence for the structural keys {cache,iothread,ssd}; throttle knobs
-// and discard are never invariants.
+// is a divergence for the structural keys {cache,iothread,ssd,aio}; throttle
+// knobs and discard are never invariants.
 func TestDiskPerfInvariantViolations(t *testing.T) {
 	t.Parallel()
 
@@ -55,6 +55,22 @@ func TestDiskPerfInvariantViolations(t *testing.T) {
 			effective: map[string]string{"cache": cmNone, "ssd": "1"},
 			wantViolations: []string{
 				"ssd: created with (unset), attach would apply \"1\"",
+			},
+		},
+		{
+			name:      "aio introduced → aio violation",
+			creation:  map[string]string{"cache": cmNone},
+			effective: map[string]string{"cache": cmNone, "aio": "native"},
+			wantViolations: []string{
+				"aio: created with (unset), attach would apply \"native\"",
+			},
+		},
+		{
+			name:      "changed aio value → aio violation",
+			creation:  map[string]string{"aio": "native"},
+			effective: map[string]string{"aio": "io_uring"},
+			wantViolations: []string{
+				"aio: created with \"native\", attach would apply \"io_uring\"",
 			},
 		},
 		{

@@ -22,6 +22,8 @@ const (
 	diskOptIothread = "iothread"
 	// diskOptSSD is the PVE per-disk SSD-emulation toggle option key.
 	diskOptSSD = "ssd"
+	// diskOptAio is the PVE per-disk AsyncIO backend option key.
+	diskOptAio = "aio"
 	// diskOptRetainOnDelete is the CID opts key that flags a disk as operator-retained.
 	// Written by create_disk when cloud_properties.retain_on_delete: true; read by
 	// delete_vm to emit audit provenance in the WARN log for the foreign-disk guard path.

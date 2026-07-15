@@ -3344,12 +3344,12 @@ func TestResolveCloneMode_UnknownVMType_ReturnsCloudError(t *testing.T) {
 // TestResolveVMShape_NoPerfOpts_ByteIdentical verifies that when no perf opts
 // and no virtio_scsi_single are set, the shape carries empty rootDiskPerfOpts
 // and scsihw=="virtio-scsi-pci" (byte-identical to pre-feature behaviour).
-// TestResolveVMShape_NoPerfOpts_Phase2Defaults verifies the Phase 2 default
+// TestResolveVMShape_NoPerfOpts_CurrentDefaults verifies the Phase 2 default
 // shape when nothing is set anywhere: rootDiskPerfOpts carries iothread=1
 // (its built-in default) and scsihw resolves to virtio-scsi-single (its
 // built-in default) — replacing the pre-Phase-2 fully-empty/virtio-scsi-pci
 // assertions this test used to make.
-func TestResolveVMShape_NoPerfOpts_Phase2Defaults(t *testing.T) {
+func TestResolveVMShape_NoPerfOpts_CurrentDefaults(t *testing.T) {
 	t.Parallel()
 
 	deps := Deps{

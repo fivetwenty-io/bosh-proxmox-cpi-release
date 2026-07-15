@@ -671,7 +671,7 @@
   # zero-value (nil *DiskPerformanceDefaults) is preserved — byte-identical to
   # prior releases. Each key follows its own omit-when-default contract:
   #   iothread/discard/ssd/virtio_scsi_single  bool  — omit when nil/unset
-  #   cache                                    string — omit when empty
+  #   cache/aio                                string — omit when empty
   #   mbps_rd/mbps_wr                          float  — omit when 0 or unset
   #   iops_rd/iops_wr                          int    — omit when 0 or unset
   disk_performance = {}
@@ -689,6 +689,8 @@
   # String: emit only when non-empty.
   dp_cache = p("pve.disk_performance.cache", "")
   disk_performance["cache"] = dp_cache unless dp_cache.to_s.empty?
+  dp_aio = p("pve.disk_performance.aio", "")
+  disk_performance["aio"] = dp_aio unless dp_aio.to_s.empty?
 
   # Floats: emit only when non-zero (zero means "no cap", same as omitted).
   dp_mbps_rd = p("pve.disk_performance.mbps_rd", 0.0).to_f
