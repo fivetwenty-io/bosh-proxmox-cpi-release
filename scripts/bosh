@@ -77,9 +77,20 @@ import _hostfw
 import _compiled
 import _lightstemcell
 import _artifacts
+import _checkouts
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-BOSH_DEPLOYMENT_DIR = Path(os.environ.get("BOSH_DEPLOYMENT_DIR", Path.home() / "w/cloudfoundry/bosh-deployment"))
+
+
+def bosh_deployment_dir() -> Path:
+    """The bosh-deployment checkout: $BOSH_DEPLOYMENT_DIR or a .deps/ clone.
+
+    Resolved lazily (only create-env/teardown need it) so read-only
+    subcommands never touch the network. See scripts/_checkouts.py.
+    """
+    return _checkouts.checkout_dir("bosh-deployment")
+
+
 MANIFESTS = REPO_ROOT / "manifests"
 BOSH_DIR = MANIFESTS / "bosh"
 VARS = BOSH_DIR / "vars.yml"
@@ -93,11 +104,6 @@ OS_CONF_OPS = BOSH_DIR / "os-conf.yml"
 NATS_TUNING_OPS = BOSH_DIR / "nats-tuning.yml"
 HM_TUNING_OPS = BOSH_DIR / "hm-tuning.yml"
 DIRECTOR_TUNING_OPS = BOSH_DIR / "director-tuning.yml"
-# Reliable key-based SSH access to the director (os-conf user_add; no apt).
-# The director VM is created with the PVE QGA channel disabled, so
-# `qm guest exec` is unavailable — SSH via the jumpbox user is the only
-# dependable shell.  jumpbox_ssh already lives in creds.yml (vars-store).
-JUMPBOX_OPS = BOSH_DEPLOYMENT_DIR / "jumpbox-user.yml"
 CLOUD_CONFIG = BOSH_DIR / "cloud-config.yml"
 EMPTYVM = BOSH_DIR / "emptyvm.yml"
 PVE_GUEST_AGENT_RC = MANIFESTS / "runtime-configs" / "pve-guest-agent.yml"
@@ -312,20 +318,25 @@ def _light_stemcell_create_env_vars() -> list[str]:
 def cmd_create_env(args: list[str]) -> int:
     release = cpi_release_path()
     light_vars = _light_stemcell_create_env_vars()
+    bd = bosh_deployment_dir()
     return run(
         "bosh", "create-env",
-        str(BOSH_DEPLOYMENT_DIR / "bosh.yml"),
+        str(bd / "bosh.yml"),
         "-n",
         "-o", str(BOSH_RELEASE_OPS),
         "-o", str(CPI_OPS),
         *compiled_ops_layer(),
-        "-o", str(BOSH_DEPLOYMENT_DIR / "uaa.yml"),
-        "-o", str(BOSH_DEPLOYMENT_DIR / "credhub.yml"),
+        "-o", str(bd / "uaa.yml"),
+        "-o", str(bd / "credhub.yml"),
         "-o", str(OS_CONF_OPS),
         "-o", str(NATS_TUNING_OPS),
         "-o", str(HM_TUNING_OPS),
         "-o", str(DIRECTOR_TUNING_OPS),
-        "-o", str(JUMPBOX_OPS),
+        # Reliable key-based SSH access to the director (os-conf user_add; no
+        # apt). The director VM is created with the PVE QGA channel disabled,
+        # so `qm guest exec` is unavailable — SSH via the jumpbox user is the
+        # only dependable shell. jumpbox_ssh lives in creds.yml (vars-store).
+        "-o", str(bd / "jumpbox-user.yml"),
         *env_network_ops(),
         "-l", str(VARS),
         *env_vars_layer(),
@@ -426,20 +437,21 @@ def cmd_teardown(args: list[str]) -> int:
     # failure this prevents.
     _delete_all_deployments()
     release = cpi_release_path()
+    bd = bosh_deployment_dir()
     rc = run(
         "bosh", "delete-env",
-        str(BOSH_DEPLOYMENT_DIR / "bosh.yml"),
+        str(bd / "bosh.yml"),
         "-n",
         "-o", str(BOSH_RELEASE_OPS),
         "-o", str(CPI_OPS),
         *compiled_ops_layer(),
-        "-o", str(BOSH_DEPLOYMENT_DIR / "uaa.yml"),
-        "-o", str(BOSH_DEPLOYMENT_DIR / "credhub.yml"),
+        "-o", str(bd / "uaa.yml"),
+        "-o", str(bd / "credhub.yml"),
         "-o", str(OS_CONF_OPS),
         "-o", str(NATS_TUNING_OPS),
         "-o", str(HM_TUNING_OPS),
         "-o", str(DIRECTOR_TUNING_OPS),
-        "-o", str(JUMPBOX_OPS),
+        "-o", str(bd / "jumpbox-user.yml"),
         *env_network_ops(),
         "-l", str(VARS),
         *env_vars_layer(),

@@ -47,7 +47,9 @@ $EDITOR manifests/bosh/vars.yml
 The deployment composes the upstream [bosh-deployment](https://github.com/cloudfoundry/bosh-deployment) `bosh.yml` base manifest with this repo's `manifests/bosh/cpi.yml` ops file:
 
 ```bash
-export BOSH_DEPLOYMENT_DIR=~/w/cloudfoundry/bosh-deployment   # path to a bosh-deployment checkout
+# Optional: point at your own bosh-deployment checkout. When unset, the
+# scripts maintain a shallow upstream clone under .deps/ automatically.
+export BOSH_DEPLOYMENT_DIR=~/w/cloudfoundry/bosh-deployment
 
 bosh create-env $BOSH_DEPLOYMENT_DIR/bosh.yml \
   --state manifests/bosh/state.json \

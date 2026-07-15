@@ -58,10 +58,25 @@ import _compiled  # noqa: E402
 import _cfcompile  # noqa: E402
 import _lightstemcell  # noqa: E402
 import _artifacts  # noqa: E402
+import _checkouts  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-CF_DEPLOYMENT = Path(os.environ.get("CF_DEPLOYMENT", Path.home() / "w/cloudfoundry/cf-deployment"))
-BOSH_DEPLOYMENT = Path(os.environ.get("BOSH_DEPLOYMENT", Path.home() / "w/cloudfoundry/bosh-deployment"))
+
+
+def cf_deployment_dir() -> Path:
+    """The cf-deployment checkout: $CF_DEPLOYMENT or a .deps/ clone.
+
+    Resolved lazily so subcommands that never read cf-deployment manifests
+    stay off the network. See scripts/_checkouts.py.
+    """
+    return _checkouts.checkout_dir("cf-deployment")
+
+
+def bosh_deployment_dir() -> Path:
+    """The bosh-deployment checkout: $BOSH_DEPLOYMENT_DIR or a .deps/ clone."""
+    return _checkouts.checkout_dir("bosh-deployment")
+
+
 ENV = os.environ.get("BOSH_ENV", "pve")
 DEPLOYMENT = os.environ.get("BOSH_DEPLOYMENT_NAME", "cf")
 # CF system database. "postgres" (default) layers operations/use-postgres.yml:
@@ -111,7 +126,7 @@ def cmd_runtime_config(_extra: list[str]) -> None:
     banner("DNS runtime-config")
     run(
         "bosh", "-e", ENV, "-n", "update-runtime-config",
-        str(BOSH_DEPLOYMENT / "runtime-configs/dns.yml"),
+        str(bosh_deployment_dir() / "runtime-configs/dns.yml"),
         "--name", "dns",
     )
 
@@ -872,15 +887,16 @@ def cmd_bosh_deploy(extra: list[str]) -> None:
     preflight_s = int(os.environ.get("SCRIPTS_CF_AGENT_WAIT", "600") or "600")
     if preflight_s > 0:
         wait_agents_responsive(preflight_s)
+    cfd = cf_deployment_dir()
     deploy_cmd = [
         "bosh", "-e", ENV, "-n", "-d", DEPLOYMENT, "deploy",
-        str(CF_DEPLOYMENT / "cf-deployment.yml"),
+        str(cfd / "cf-deployment.yml"),
         # use-haproxy.yml adds the haproxy instance group + its source release
         # stanza. CF release SOURCING is decided by _cf_release_ops() from the
         # precompiled-for-this-stemcell set, which replaces cf-deployment's
         # use-compiled-releases.yml (that targets a different stemcell version).
         # Layered after use-haproxy.yml so the compiled haproxy pin wins.
-        "-o", str(CF_DEPLOYMENT / "operations/use-haproxy.yml"),
+        "-o", str(cfd / "operations/use-haproxy.yml"),
         # CF system database (CF_DATABASE): postgres (default) drops pxc/Galera
         # for one internal postgres node; layered before the release-sourcing
         # and resize ops that reference the database instance group.
@@ -891,7 +907,7 @@ def cmd_bosh_deploy(extra: list[str]) -> None:
         # ~90s (HTTP retries against CC during ccdb churn) which made
         # the api VM look unhealthy to HM and triggered recreate loops.
         # The lab has no use for dynamic ASG sync.
-        "-o", str(CF_DEPLOYMENT / "operations/disable-dynamic-asgs.yml"),
+        "-o", str(cfd / "operations/disable-dynamic-asgs.yml"),
         "-o", "manifests/cf/ops-serialize-deploy.yml",
         "-o", "manifests/cf/ops-resize-cf.yml",
         # Lab-local NATS-storm remediation. See header comments in each
@@ -1124,7 +1140,7 @@ def _cf_db_ops() -> list[str]:
         the compiled release set and the deployed release set always match.
     """
     if CF_DATABASE in ("postgres", "pg"):
-        return ["-o", str(CF_DEPLOYMENT / "operations/use-postgres.yml")]
+        return ["-o", str(cf_deployment_dir() / "operations/use-postgres.yml")]
     return []
 
 
@@ -1137,8 +1153,9 @@ def _cf_source_releases() -> "list[dict]":
     by index via `bosh int` so no YAML library is needed; stops at the first
     absent index. Returns normalized {name, version, url, sha1} targets.
     """
-    base = str(CF_DEPLOYMENT / "cf-deployment.yml")
-    ophap = str(CF_DEPLOYMENT / "operations/use-haproxy.yml")
+    cfd = cf_deployment_dir()
+    base = str(cfd / "cf-deployment.yml")
+    ophap = str(cfd / "operations/use-haproxy.yml")
     # Match the deploy's database choice so the compiled set tracks the deployed
     # set (e.g. postgres in, pxc out under CF_DATABASE=postgres).
     db_ops = _cf_db_ops()
@@ -1436,7 +1453,7 @@ def _cf_release_ops() -> list[str]:
             f"(one-time; cf-deployment's use-compiled-releases.yml targets a different version), "
             f"or set CF_REQUIRE_PRECOMPILE=0 to fall back to use-compiled-releases.yml."
         )
-    ucr = CF_DEPLOYMENT / "operations/use-compiled-releases.yml"
+    ucr = cf_deployment_dir() / "operations/use-compiled-releases.yml"
     print(
         f"    CF_REQUIRE_PRECOMPILE=0: precompile {state} for {want}; "
         f"falling back to {ucr.name} (targets a different stemcell — BOSH may recompile mismatches)"

@@ -72,6 +72,7 @@ SCRIPTS_DIR = REPO_ROOT / "scripts"
 # shared with scripts/test. Reused here so config parsing lives in one place.
 sys.path.insert(0, str(SCRIPTS_DIR))
 import _integration  # noqa: E402
+import _checkouts  # noqa: E402
 
 BOSH = str(SCRIPTS_DIR / "bosh")
 CF = str(SCRIPTS_DIR / "cf")
@@ -642,23 +643,35 @@ class E2E:
             )
             ok = ok and vp
 
-        # External checkouts (warn-only; bootstrap will hard-fail if truly absent).
+        # External checkouts. Resolved through scripts/_checkouts.py: an env
+        # override must exist; otherwise a shallow upstream clone under .deps/
+        # is created/refreshed here so the bootstrap steps find it in place.
+        wanted = []
         if need_director:
-            bd = Path(os.environ.get("BOSH_DEPLOYMENT_DIR",
-                                     os.path.expanduser("~/w/cloudfoundry/bosh-deployment")))
-            self.rep.record(
-                "checkout:bosh-deployment",
-                PASS if bd.exists() else SKIP, 0.0,
-                str(bd) if bd.exists() else f"absent: {bd} (set BOSH_DEPLOYMENT_DIR)",
-            )
+            wanted.append("bosh-deployment")
         if need_cf:
-            cd = Path(os.environ.get("CF_DEPLOYMENT",
-                                     os.path.expanduser("~/w/cloudfoundry/cf-deployment")))
-            self.rep.record(
-                "checkout:cf-deployment",
-                PASS if cd.exists() else SKIP, 0.0,
-                str(cd) if cd.exists() else f"absent: {cd} (set CF_DEPLOYMENT)",
-            )
+            wanted.append("cf-deployment")
+        for name in wanted:
+            if self.args.dry_run:
+                env_var, _ = _checkouts.UPSTREAMS[name]
+                override = os.environ.get(env_var, "").strip()
+                where = override or str(_checkouts.DEPS_DIR / name)
+                self.rep.record(
+                    f"checkout:{name}", PASS, 0.0,
+                    f"{where} (dry-run: clone/refresh skipped)",
+                )
+                continue
+            t0 = time.monotonic()
+            try:
+                path = _checkouts.checkout_dir(name)
+                self.rep.record(
+                    f"checkout:{name}", PASS, time.monotonic() - t0, str(path),
+                )
+            except SystemExit as exc:
+                self.rep.record(
+                    f"checkout:{name}", FAIL, time.monotonic() - t0, str(exc),
+                )
+                ok = False
         return ok
 
     # -- build ------------------------------------------------------------- #
