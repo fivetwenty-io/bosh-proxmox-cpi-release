@@ -185,12 +185,14 @@ def _env_vars_layer() -> list[str]:
     return ["-l", str(layer)]
 
 
-def _bosh_var(json_path: str) -> str:
+def _bosh_var(json_path: str, fallback: Path | None = None) -> str:
     """Read a var, preferring the active env's vars.yml over the base vars.
 
     The active env (BOSH_PVE_ENV) may override Director-network vars such as
     internal_ip; resolving them env-first keeps credhub/login pointed at the
     Director's real address when it has been moved onto an isolated network.
+    The fallback file defaults to manifests/bosh/vars.yml; pass one for vars
+    whose base value lives elsewhere (e.g. system_domain in the CF vars).
     """
     env_name = active_env()
     if env_name:
@@ -202,7 +204,7 @@ def _bosh_var(json_path: str) -> str:
             )
             if res.returncode == 0 and res.stdout.strip():
                 return res.stdout.strip()
-    return capture("bosh", "int", str(BOSH_VARS), f"--path={json_path}")
+    return capture("bosh", "int", str(fallback or BOSH_VARS), f"--path={json_path}")
 
 
 def cmd_cloud_config(_extra: list[str]) -> None:
@@ -984,7 +986,11 @@ def cmd_bosh_deploy(extra: list[str]) -> None:
 
 
 def system_domain() -> str:
-    return capture("bosh", "int", "manifests/cf/vars.yml", "--path=/system_domain")
+    # Env-first: the deploy layers the active env's vars.yml last, so an env
+    # that overrides system_domain (e.g. pmx's sslip.io domain pointing at
+    # its own HAProxy) serves THAT domain — cf api/login must follow it, not
+    # the base CF default.
+    return _bosh_var("/system_domain", fallback=REPO_ROOT / "manifests" / "cf" / "vars.yml")
 
 
 def credhub_env() -> dict[str, str]:
