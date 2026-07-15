@@ -471,6 +471,14 @@ def cmd_alias_env(args: list[str]) -> int:
         sys.exit(f"creds.yml missing at {CREDS} — run 'scripts/bosh create-env' first")
     director_ip = internal_ip()
     ca = bosh_int(CREDS, "/director_ssl/ca")
+    # Drop any existing 'pve' alias first. A stale entry from a previous
+    # environment carries that director's stored credentials, and the CLI
+    # replays them against the new director's UAA during alias-env — the
+    # resulting 401 masks a perfectly healthy director.
+    subprocess.run(
+        ["bosh", "unalias-env", "pve"],
+        cwd=REPO_ROOT, capture_output=True,
+    )
     proc = subprocess.run(
         ["bosh", "alias-env", "pve", "-e", director_ip, "--ca-cert", ca, *args],
         cwd=REPO_ROOT,
