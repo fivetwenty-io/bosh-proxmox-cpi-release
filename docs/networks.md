@@ -39,6 +39,12 @@ After `UpdateSdn` commits the SDN configuration, data-plane realization is async
 
 For async zone types (vlan, vxlan, evpn), `UpdateSdn` may return a UPID. The CPI awaits the UPID task before the convergence poll begins, so subsequent `ListSdnVnets` calls observe committed state. With the vxlan default this UPID-await path is the normal path, not the exception.
 
+### DHCP on managed networks
+
+The subnet the CPI creates on an SDN vnet carries no DHCP configuration by construction — `create_network` sets only the subnet's CIDR and gateway, never a DHCP range or DNS server. This is deliberate: BOSH manifests declare networks as `type: manual` with an explicit static IP per instance, and the Director delivers that IP to the guest through the config drive rather than through a network-level DHCP exchange. A dynamic (DHCP) BOSH network works too, but IP pre-assignment checks such as `pve.ensure_no_ip_conflicts` are not meaningful there and should be disabled.
+
+Enabling DHCP on a CPI-managed subnet is an operator action outside the CPI: PVE SDN's built-in DHCP support requires `dnsmasq` installed and running on every node the zone spans, not only the node handling the API call — a node missing `dnsmasq` silently fails to serve leases to guests that land there. IPAM reservations made through PVE's DHCP take effect only after the guest reboots and re-requests a lease; a running guest keeps whatever address it already holds.
+
 ## cloud_properties schema
 
 These keys are read from the per-network `cloud_properties` block in the BOSH cloud-config.
@@ -76,6 +82,8 @@ If any condition fails, the zone is left in place. A list failure during the zon
 
 **EVPN zones:** the CPI never creates or deletes EVPN zones. An EVPN fabric — the zone, its BGP controller, route reflectors, and exit nodes — is operator infrastructure. `create_network` against an absent EVPN zone fails fast with instructions to create the zone and controller in PVE (Datacenter → SDN); once the zone exists, the CPI manages vnets and subnets inside it exactly as for any other zone type.
 
+We recommend PVE 9.2 or later for EVPN zones: FRR, the routing daemon EVPN's control plane depends on, ships preinstalled from PVE 9 onward, while PVE 8 requires installing it by hand before an EVPN zone can come up. The CPI itself does not version-gate EVPN — it issues the same SDN API calls regardless of PVE version — so an EVPN zone on an older cluster without FRR installed fails at the PVE layer, not inside the CPI.
+
 **PVE constraint:** The SDN zone create API (`POST /cluster/sdn/zones`) does not accept description, notes, or comment fields. CPI-owned zones are not annotated in PVE; which zones belong to the CPI is tracked through the stateless config rule (condition 2 above).
 
 ## VXLAN overlay defaults: peers, VNIs, and MTU
@@ -88,7 +96,7 @@ The vxlan default builds a cluster-wide L2 overlay with three knobs, all optiona
 
 VNIs are fabric-global: a vnet tag and an EVPN zone's control VNI (`vrf-vxlan`) share one identifier space, and PVE does not reject the collision — it silently cross-talks or blackholes traffic on the affected VRF. The CPI excludes zone-level control VNIs from auto-allocation, but the exclusion is fail-open (a zone-listing failure logs one warning and allocation proceeds on vnet tags alone), so keep operator-managed control VNIs outside `sdn_vni_range` by convention — values below 5000 (e.g. 4999) stay clear of the default band.
 
-**MTU.** VXLAN encapsulation spends roughly 50 bytes per frame on outer headers (EVPN pays the same tax). PVE derives the vnet MTU from the underlay automatically — a 1500-byte underlay yields 1450-byte vnets — and the CPI hands every virtio NIC attached to an SDN vnet `mtu=1`, which means "inherit the bridge MTU", so guests never emit an oversized frame. `pve.sdn_zone_mtu` overrides the derivation for unusual underlays; leave it unset otherwise. Jumbo frames work the same way: a 9000-byte underlay on every node's physical path yields 8950-byte overlay MTU (set `sdn_zone_mtu: 8950` explicitly if PVE cannot derive it). Mixed underlay MTUs across nodes are the failure mode to avoid — the overlay MTU must fit the smallest underlay everywhere. The failure signature and probe commands are in [Troubleshooting — SDN MTU](troubleshooting.md#small-packets-pass-large-packets-hang-sdn-mtu).
+**MTU.** VXLAN encapsulation spends roughly 50 bytes per frame on outer headers (EVPN pays the same tax). PVE derives the vnet MTU from the underlay automatically — a 1500-byte underlay yields 1450-byte vnets — and the CPI hands every virtio NIC attached to an SDN vnet `mtu=1`, which means "inherit the bridge MTU", so guests never emit an oversized frame. `pve.sdn_zone_mtu` overrides the derivation for unusual underlays; leave it unset otherwise. Jumbo frames work the same way: a 9000-byte underlay on every node's physical path yields 8950-byte overlay MTU (set `sdn_zone_mtu: 8950` explicitly if PVE cannot derive it). On an IPv6 underlay, set `sdn_zone_mtu: 1430` by hand — PVE's automatic 1450 derivation assumes IPv4 encapsulation overhead, and an IPv6 outer header costs 20 bytes more, so the automatic figure over-estimates the usable overlay MTU. Mixed underlay MTUs across nodes are the failure mode to avoid — the overlay MTU must fit the smallest underlay everywhere. The failure signature and probe commands are in [Troubleshooting — SDN MTU](troubleshooting.md#small-packets-pass-large-packets-hang-sdn-mtu).
 
 Firewall prerequisite: VXLAN tunnels run node-to-node over UDP 4789; EVPN additionally needs TCP 179 (BGP) between nodes and controllers. See [Operations — SDN VXLAN operations](operations.md#sdn-vxlan-operations).
 
