@@ -60,6 +60,21 @@ func detachDiskResolveSlot(
 		return "", "", false, cpierrors.Wrap(err, "detach_disk: node lookup failed")
 	}
 
+	// The VM-config operations that follow (ResolveDiskID's config read,
+	// the detach PUT, the unusedN sweep) must target the node that RUNS
+	// the VM. For shared backends NodeForExisting returns the configured
+	// default node — a storage routing hint, not the VM's location; on a
+	// multi-node cluster a config read there 404s and would be silently
+	// misread as "disk not attached" (idempotent success). The cluster
+	// scan is authoritative. A VM absent from the scan keeps the
+	// backend-derived node: the config read then 404s and the existing
+	// VM-gone → already-detached semantics apply.
+	if vmNode, found, lookupErr := pve.FindVMNodeViaCluster(ctx, deps.PVE, vmid); lookupErr != nil {
+		return "", "", false, cpierrors.Wrap(lookupErr, fmt.Sprintf("detach_disk: lookup VM %s node failed", vmCID))
+	} else if backend.Kind() != pve.BackendLocal && found && vmNode != "" {
+		node = vmNode
+	}
+
 	// Resolve the active bus slot for diskCID in the VM config.
 	diskID, err = pve.ResolveDiskID(ctx, deps.PVE, node, vmid, diskCID)
 	if err != nil {

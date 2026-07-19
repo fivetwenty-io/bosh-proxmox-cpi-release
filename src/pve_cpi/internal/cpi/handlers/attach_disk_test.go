@@ -1699,10 +1699,12 @@ func TestHandleAttachDisk_Parked_UnparkFailRetriable(t *testing.T) {
 	}
 }
 
-// TestHandleAttachDisk_StrategyFree_NoParkerCalls verifies byte-identical
-// behavior when strategy is unset (free, the default): no cluster scan and no
-// parker API calls are made. The clusterSvc is set to panic on ListResources to
-// prove it is never called.
+// TestHandleAttachDisk_StrategyFree_NoParkerCalls verifies parker-free
+// behavior when strategy is unset (free, the default): no parker API calls
+// (unpark DetachDisk) are made. The VM-node lookup makes exactly ONE
+// ListResources call (attachDiskResolveNode locating the VM's owning node —
+// required on multi-node clusters); anything beyond that would indicate a
+// parker cluster scan and fails the test.
 func TestHandleAttachDisk_StrategyFree_NoParkerCalls(t *testing.T) {
 	t.Parallel()
 	const bareCID = "local-lvm:vm-9001-disk-0"
@@ -1714,10 +1716,13 @@ func TestHandleAttachDisk_StrategyFree_NoParkerCalls(t *testing.T) {
 		},
 	}
 	ag := &captureAgent{}
-	// Cluster svc panics if called — proves no parker cluster scan happens.
-	panicCluster := &mockClusterSvc{
+	listCalls := 0
+	countingCluster := &mockClusterSvc{
 		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
-			panic("ListResources must not be called when strategy=free")
+			listCalls++
+			entry, _ := json.Marshal(map[string]any{"vmid": 100, "node": testNode})
+			resp := sdkcluster.ListResourcesResponse{entry}
+			return &resp, nil
 		},
 	}
 	deps := handlers.Deps{
@@ -1728,7 +1733,7 @@ func TestHandleAttachDisk_StrategyFree_NoParkerCalls(t *testing.T) {
 		},
 		PVE: &mockPVEClient{
 			qemuSvc:    qemuSvc,
-			clusterSvc: panicCluster,
+			clusterSvc: countingCluster,
 		},
 		Agent:  ag,
 		Logger: log.NewNopLogger(),
@@ -1744,5 +1749,8 @@ func TestHandleAttachDisk_StrategyFree_NoParkerCalls(t *testing.T) {
 	}
 	if len(qemuSvc.detachCalls) != 0 {
 		t.Errorf("strategy=free: expected no DetachDisk calls; got %v", qemuSvc.detachCalls)
+	}
+	if listCalls > 1 {
+		t.Errorf("strategy=free: expected at most 1 ListResources call (VM-node lookup); got %d — extra calls indicate a parker cluster scan", listCalls)
 	}
 }

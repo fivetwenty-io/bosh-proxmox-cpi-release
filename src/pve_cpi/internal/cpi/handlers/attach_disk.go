@@ -434,20 +434,36 @@ func attachDiskResolveNode(ctx context.Context, deps Deps, vmCID, diskCID string
 		return "", 0, cpierrors.Wrap(err, "attach_disk: node lookup failed")
 	}
 
-	// For local backends, the disk and VM MUST live on the same node — the
-	// SDK call would otherwise PUT a config update on a node that cannot
-	// see the volume, producing a confusing storage error. Verify
-	// co-location explicitly and surface a clear message when violated.
+	// The QEMU config operations that follow (snapshot guard, slot
+	// selection, the attach PUT) must target the node that RUNS the VM —
+	// PVE serves /nodes/<n>/qemu/<vmid>/config only from the owning node.
+	// For shared backends NodeForExisting returns the configured default
+	// node, which is a storage routing hint, not the VM's location: on a
+	// multi-node cluster the VM may live elsewhere ("Configuration file
+	// ... does not exist"). The cluster scan is authoritative; use it.
+	//
+	// For local backends the disk and VM MUST additionally live on the
+	// same node — the SDK call would otherwise PUT a config update on a
+	// node that cannot see the volume, producing a confusing storage
+	// error. Verify co-location explicitly and surface a clear message
+	// when violated.
+	vmNode, found, lookupErr := pve.FindVMNodeViaCluster(ctx, deps.PVE, vmid)
+	if lookupErr != nil {
+		return "", 0, cpierrors.Wrap(lookupErr, fmt.Sprintf("attach_disk: lookup VM %s node failed", vmCID))
+	}
 	if backend.Kind() == pve.BackendLocal {
-		if vmNode, found, lookupErr := pve.FindVMNodeViaCluster(ctx, deps.PVE, vmid); lookupErr != nil {
-			return "", 0, cpierrors.Wrap(lookupErr, fmt.Sprintf("attach_disk: lookup VM %s node failed", vmCID))
-		} else if found && vmNode != "" && vmNode != node {
+		if found && vmNode != "" && vmNode != node {
 			return "", 0, cpierrors.Cloud(
 				"attach_disk: local-backend disk %s lives on node %s but VM %s runs on node %s — local-storage disks cannot cross nodes",
 				diskCID, node, vmCID, vmNode,
 			)
 		}
+	} else if found && vmNode != "" {
+		node = vmNode
 	}
+	// VM absent from /cluster/resources: keep the backend-derived node so
+	// the subsequent config fetch surfaces PVE's own not-found error with
+	// unchanged semantics (rather than guessing here).
 
 	return node, vmid, nil
 }
