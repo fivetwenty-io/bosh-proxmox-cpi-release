@@ -1270,3 +1270,38 @@ func TestIsHotUnplugBusy(t *testing.T) {
 		})
 	}
 }
+
+// source: qemu-server PVE::API2::Qemu destroy_vm ("VM $vmid is running - destroy failed").
+func TestIsVMRunningDestroyFailure(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		msg  string
+		want bool
+	}{
+		{"bare with vmid", "VM 7801 is running - destroy failed", true},
+		{"bare without vmid", "VM is running - destroy failed", true},
+		{"api wrapped", `API request failed: VM 7801 is running - destroy failed`, true},
+		{"http context wrapped", `nodes.DeleteQemu: failed to execute DELETE request to "/nodes/lab-pve-cpi-2/qemu/7801" with context: API request failed: VM 7801 is running - destroy failed`, true},
+		{"mixed case", "vm 12 IS RUNNING - Destroy Failed", true},
+		{"running but not destroy", "VM 7801 is running", false},
+		{"config locked is distinct", "VM is locked (clone)", false},
+		{"unrelated", "storage 'nfs-images' is not online", false},
+		{"empty", "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := pve.IsVMRunningDestroyFailure(errors.New(tc.msg)); got != tc.want {
+				t.Errorf("IsVMRunningDestroyFailure(%q) = %v, want %v", tc.msg, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestIsVMRunningDestroyFailure_Nil(t *testing.T) {
+	t.Parallel()
+	if pve.IsVMRunningDestroyFailure(nil) {
+		t.Error("nil error should not match")
+	}
+}

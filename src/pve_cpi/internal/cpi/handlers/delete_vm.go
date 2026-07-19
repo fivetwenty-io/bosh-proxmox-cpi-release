@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
 
@@ -201,8 +202,30 @@ func fastPathDeleteVM(ctx context.Context, deps Deps, node, vmCID string, vmid i
 	// Stamp diagnostic tag — fail-open.
 	stampDeletingTag(ctx, deps, node, vmCID, vmid, logger)
 
+	// Deregister HA state BEFORE the stop. While a VM is HA-managed, a
+	// status/stop call is redirected to a CRM request whose task completes on
+	// acceptance, not when the VM halts — and the destroy below cannot remove
+	// a running VM (skiplock only skips config locks). Deregistering first
+	// restores plain qmstop semantics. Both calls are synchronous and bounded
+	// (no task await) — compatible with the fast path's bounded-time contract.
+	// Idempotent, not-found-tolerant, best-effort.
+	if deps.Config.AntiAffinityUseHaRulesEnabled() || deps.Config.DLBConfigured() {
+		if aaErr := removeAntiAffinityMembership(ctx, deps, vmid, logger); aaErr != nil {
+			logger.Warn("delete_vm: fast-path HA anti-affinity/DLB cleanup incomplete (non-fatal)", log.Err(aaErr))
+		}
+	}
+	// Remove the node-affinity HA pin as well. The fast path returns before
+	// the sync path's pin cleanup, so without this a pinned VM (AZ pin or PCI
+	// strict pin) deleted via fast_path_delete would leave an orphan
+	// bosh-na-<vmid> rule forever.
+	if pinErr := removeNodeAffinityPin(ctx, deps, vmid, logger); pinErr != nil {
+		logger.Warn("delete_vm: fast-path HA node-affinity pin cleanup incomplete (non-fatal)", log.Err(pinErr))
+	}
+
 	// Fire-and-forget stop. The UPID is discarded; no await. PVE may not finish
-	// the stop before destroy arrives; skiplock=true on DeleteQemu handles that.
+	// the stop before destroy arrives; the destroy task can still fail on a
+	// running VM, in which case the bosh-deleting stamp above queues this VM for
+	// sweepFastDeleteStragglers to reap on a later fast-path delete.
 	logger.Debug("delete_vm: fast-path: issuing stop fire-and-forget")
 	_, stopErr := deps.PVE.QEMU().Stop(ctx, node, vmid)
 	if stopErr != nil && !pve.IsNotFound(stopErr) {
@@ -244,17 +267,9 @@ func fastPathDeleteVM(ctx context.Context, deps Deps, node, vmCID string, vmid i
 		return guardErr
 	}
 
-	// Remove the node-affinity HA pin before destroy. The fast path returns
-	// before the sync path's pin cleanup, so without this a pinned VM (AZ pin or
-	// PCI strict pin) deleted via fast_path_delete would leave an orphan
-	// bosh-na-<vmid> rule forever. removeNodeAffinityPin issues two synchronous,
-	// bounded HA calls (no task await) — compatible with the fast path's
-	// bounded-time contract. Idempotent, not-found-tolerant, best-effort.
-	if pinErr := removeNodeAffinityPin(ctx, deps, vmid, logger); pinErr != nil {
-		logger.Warn("delete_vm: fast-path HA node-affinity pin cleanup incomplete (non-fatal)", log.Err(pinErr))
-	}
-
 	// Issue destroy with skiplock=true. Discard the UPID; no await.
+	// HA pin and anti-affinity/DLB deregistration already ran before the stop
+	// above (see the CRM-interference comment there).
 	// Purge's pool-membership interplay: see the synchronous-path DeleteQemu
 	// comment in HandleDeleteVM.
 	//
@@ -429,6 +444,41 @@ func HandleDeleteVM(deps Deps) cpi.Handler {
 			return nil, nil
 		}
 
+		// --- HA anti-affinity / DLB cleanup (opt-in: anti_affinity.use_ha_rules or placement.dlb) ---
+		// Remove the VM from any CPI-managed negative-affinity rule and
+		// deregister its HA resource BEFORE stopping it. Order matters: while a
+		// VM is HA-managed, a status/stop call is redirected to a CRM request
+		// whose task completes when the request is accepted — not when the VM
+		// actually halts — so a stop-then-deregister sequence races the LRM and
+		// the subsequent destroy fails with "VM is running". Deregistering
+		// first restores plain qmstop semantics for the stop below. Also covers
+		// DLB-only VMs: removeAntiAffinityMembership purges the HA resource and
+		// prunes any associated rules; for a DLB-only VM with no affinity rule
+		// it simply deregisters the HA resource. Keyed on vmid (the group name
+		// is unavailable at delete time). Best-effort: HA failures are logged
+		// and never block VM deletion.
+		if deps.Config.AntiAffinityUseHaRulesEnabled() || deps.Config.DLBConfigured() {
+			if aaErr := removeAntiAffinityMembership(ctx, deps, vmid, logger); aaErr != nil {
+				logger.Warn("delete_vm: HA anti-affinity/DLB cleanup incomplete (non-fatal)", log.Err(aaErr))
+			}
+		}
+
+		// --- HA node-affinity pin cleanup ---
+		// Remove the per-VM node-affinity pin rule (bosh-na-<vmid>) and deregister
+		// its HA resource. Keyed on vmid; idempotent and best-effort. Safe
+		// alongside the anti-affinity cleanup above (both tolerate a not-found HA
+		// resource). Runs before the stop for the same CRM-interference reason.
+		//
+		// Unconditional because two writers create this rule: the AZ pin (gated by
+		// placement.pin_az_via_ha_rules) and the PCI strict pin (applied whenever
+		// pci_passthroughs is set, regardless of that flag). delete_vm has no
+		// cloud_properties, so it cannot know which writer ran; removing
+		// unconditionally guarantees no orphan rule survives the VM. For a VM that
+		// never had a pin this is two cheap not-found no-ops.
+		if pinErr := removeNodeAffinityPin(ctx, deps, vmid, logger); pinErr != nil {
+			logger.Warn("delete_vm: HA node-affinity pin cleanup incomplete (non-fatal)", log.Err(pinErr))
+		}
+
 		// --- stop VM (synchronous path) ---
 		if stopDone, stopErr := stopVMBeforeDelete(ctx, deps, node, vmid, vmCID, logger); stopErr != nil {
 			return nil, stopErr
@@ -458,35 +508,6 @@ func HandleDeleteVM(deps Deps) cpi.Handler {
 			return nil, guardErr
 		}
 
-		// --- HA anti-affinity / DLB cleanup (opt-in: anti_affinity.use_ha_rules or placement.dlb) ---
-		// Remove the VM from any CPI-managed negative-affinity rule and
-		// deregister its HA resource before destroying it. Also covers DLB-only
-		// VMs: removeAntiAffinityMembership purges the HA resource and prunes any
-		// associated rules; for a DLB-only VM with no affinity rule it simply
-		// deregisters the HA resource. Keyed on vmid (the group name is unavailable
-		// at delete time). Best-effort: HA failures are logged and never block VM deletion.
-		if deps.Config.AntiAffinityUseHaRulesEnabled() || deps.Config.DLBConfigured() {
-			if aaErr := removeAntiAffinityMembership(ctx, deps, vmid, logger); aaErr != nil {
-				logger.Warn("delete_vm: HA anti-affinity/DLB cleanup incomplete (non-fatal)", log.Err(aaErr))
-			}
-		}
-
-		// --- HA node-affinity pin cleanup ---
-		// Remove the per-VM node-affinity pin rule (bosh-na-<vmid>) and deregister
-		// its HA resource. Keyed on vmid; idempotent and best-effort. Safe
-		// alongside the anti-affinity cleanup above (both tolerate a not-found HA
-		// resource).
-		//
-		// Unconditional because two writers create this rule: the AZ pin (gated by
-		// placement.pin_az_via_ha_rules) and the PCI strict pin (applied whenever
-		// pci_passthroughs is set, regardless of that flag). delete_vm has no
-		// cloud_properties, so it cannot know which writer ran; removing
-		// unconditionally guarantees no orphan rule survives the VM. For a VM that
-		// never had a pin this is two cheap not-found no-ops.
-		if pinErr := removeNodeAffinityPin(ctx, deps, vmid, logger); pinErr != nil {
-			logger.Warn("delete_vm: HA node-affinity pin cleanup incomplete (non-fatal)", log.Err(pinErr))
-		}
-
 		// --- delete VM (synchronous path) ---
 		// Purge removes VMID from backup/HA/replication configs (per PVE's own
 		// API description). Resource-pool membership (pve.vm_pool,
@@ -511,14 +532,31 @@ func HandleDeleteVM(deps Deps) cpi.Handler {
 		destroyDisks := !retained
 		logger.Debug("delete_vm: deleting VM")
 		var deleteResp *sdknodes.DeleteQemuResponse
-		deleteErr := pve.RetryOnTransientOrLock(ctx, logger, "delete_vm", 0, func() error {
-			var innerErr error
-			deleteResp, innerErr = deps.PVE.Nodes().DeleteQemu(ctx, node, vmCID, &sdknodes.DeleteQemuParams{
-				Purge:                    &purge,
-				DestroyUnreferencedDisks: &destroyDisks,
+		attemptDestroy := func() error {
+			return pve.RetryOnTransientOrLock(ctx, logger, "delete_vm", 0, func() error {
+				var innerErr error
+				deleteResp, innerErr = deps.PVE.Nodes().DeleteQemu(ctx, node, vmCID, &sdknodes.DeleteQemuParams{
+					Purge:                    &purge,
+					DestroyUnreferencedDisks: &destroyDisks,
+				})
+				return innerErr
 			})
-			return innerErr
-		})
+		}
+		deleteErr := attemptDestroy()
+		// PVE refuses to destroy a running VM ("VM <id> is running - destroy
+		// failed") and skiplock does not help. The stop above completed its
+		// task, but a stop accepted while the VM was still HA-managed (the CRM
+		// files the request and the task ends before the LRM halts the guest)
+		// can leave the VM briefly running. Wait until it actually reports
+		// stopped, then destroy once more. Observed live on a DLB-registered
+		// compilation VM.
+		if deleteErr != nil && pve.IsVMRunningDestroyFailure(deleteErr) {
+			logger.Info("delete_vm: VM still running after stop task — waiting for it to halt before destroy retry")
+			if waitErr := waitForVMStopped(ctx, deps, node, vmid, vmCID, logger); waitErr != nil {
+				return nil, waitErr
+			}
+			deleteErr = attemptDestroy()
+		}
 		// A killed worker or node reboot mid-clone/mid-create can leave the
 		// guest config carrying an in-flight lock (lock: clone|create|...),
 		// which PVE rejects the destroy against — without this, the Director
@@ -611,7 +649,45 @@ func stopVMBeforeDelete(ctx context.Context, deps Deps, node string, vmid int, v
 				fmt.Sprintf("delete_vm: await stop task for VM %s", vmCID))
 		}
 	}
+
 	return false, nil
+}
+
+// waitForVMStopped polls the VM's current status until it reports "stopped"
+// (or the VM disappears, which the destroy retry handles idempotently). Only
+// called on the "VM is running - destroy failed" path — the common case never
+// issues a status read. Bounded by deleteStopWaitBudget; polls every
+// deleteStopPollInterval. On budget exhaustion returns a retriable error —
+// delete_vm is idempotent, so the Director can safely retry once the VM
+// settles.
+func waitForVMStopped(ctx context.Context, deps Deps, node string, vmid int, vmCID string, logger *log.Logger) error {
+	deadline := time.Now().Add(deleteStopWaitBudget())
+	for {
+		st, statusErr := deps.PVE.QEMU().Status(ctx, node, vmid)
+		if statusErr != nil {
+			if pve.IsNotFound(statusErr) {
+				// VM gone — nothing left to wait for.
+				return nil
+			}
+			return cpierrors.Wrap(pve.WrapError(statusErr),
+				fmt.Sprintf("delete_vm: status VM %s while waiting for stop", vmCID))
+		}
+		state, _ := st["status"].(string)
+		if state == "stopped" {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return cpierrors.Retriable(
+				"delete_vm: VM %s still %q after stop task completed (waited %s); retry when it settles",
+				vmCID, state, deleteStopWaitBudget())
+		}
+		logger.Debug("delete_vm: waiting for VM to stop", log.String("state", state))
+		select {
+		case <-ctx.Done():
+			return cpierrors.Retriable("delete_vm: context cancelled while waiting for VM %s to stop", vmCID)
+		case <-time.After(deleteStopPollInterval()):
+		}
+	}
 }
 
 // guardUnusedVolumes reads the VM config and refuses to destroy if any unusedN

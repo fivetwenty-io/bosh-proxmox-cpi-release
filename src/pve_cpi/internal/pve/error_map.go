@@ -534,6 +534,29 @@ func IsVMConfigLocked(err error) bool {
 	return vmConfigLockPattern.MatchString(err.Error())
 }
 
+// vmRunningDestroyPattern matches PVE's refusal to destroy a running guest.
+// PVE::API2::Qemu::destroy_vm dies with "VM $vmid is running - destroy failed"
+// (qemu-server) when the guest process is still alive; API wrappers prepend
+// request context, so the pattern is unanchored. The vmid is optional for the
+// same reason as vmConfigLockPattern.
+var vmRunningDestroyPattern = regexp.MustCompile(`(?i)vm\s*(?:\d+\s*)?is running\s*-\s*destroy failed`)
+
+// IsVMRunningDestroyFailure reports whether err signals that PVE rejected a
+// destroy because the guest is still running. Seen when a stop was accepted
+// while the VM was HA-managed: the stop task completes when the CRM files the
+// request, not when the LRM halts the guest, so a destroy issued right after
+// the task races the actual shutdown. Recovery is to wait for the guest to
+// report "stopped" and reissue the destroy (skiplock does NOT bypass this —
+// it only skips config-lock checks).
+//
+// nil → false.
+func IsVMRunningDestroyFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	return vmRunningDestroyPattern.MatchString(err.Error())
+}
+
 // VMConfigLockType extracts the lock type named in a "VM is locked (<type>)"
 // error — e.g. "clone", "create", "backup", "migrate" — for use in operator-
 // facing diagnostics. Returns "" when err does not match IsVMConfigLocked or
