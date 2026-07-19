@@ -20,6 +20,10 @@ func newSharedBackend(c Client, info StorageInfo, defaultNode string) Backend {
 	return &sharedBackend{client: c, info: info, defaultNode: defaultNode}
 }
 
+// StorageInfo exposes the classification this backend was built from
+// (StorageInfoProvider capability — see BackendStorageInfo).
+func (s *sharedBackend) StorageInfo() StorageInfo { return s.info }
+
 // Kind reports BackendShared — a cluster-visible storage pool where any node may host the VM.
 func (s *sharedBackend) Kind() BackendKind { return BackendShared }
 

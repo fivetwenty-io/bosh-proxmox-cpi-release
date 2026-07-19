@@ -373,6 +373,29 @@ func HandleCreateDisk(deps Deps) Handler {
 			formatArg = format
 		}
 
+		// File-based storages (dir/nfs/cifs/glusterfs/btrfs) require the
+		// volume name to carry a format extension and reject bare names with
+		// "unable to parse volume filename"; block storages take bare names
+		// only. The storage type comes from the perf-options lookup when it
+		// ran, else from the backend's cached classification — never a second
+		// live /storage query (preserving the no-lookup contract when the
+		// operator opted out of auto-resolution). When file-based, append the
+		// extension and pin the format param so the two always agree. An
+		// unknown type ("") keeps the bare name — unchanged behavior on block
+		// storages.
+		if storageType == "" {
+			if info, ok := pve.BackendStorageInfo(backend); ok {
+				storageType = info.Type
+			}
+		}
+		volExt := ""
+		if pve.StorageUsesFileVolumes(storageType) {
+			if formatArg == "" {
+				formatArg = format
+			}
+			volExt = "." + formatArg
+		}
+
 		// VMID-collision attempts: retry.vmid_alloc.max_attempts overrides the
 		// existing vmid_alloc_attempts, which overrides the built-in default 5.
 		maxAttempts := deps.Config.RetryVMIDAlloc().MaxAttempts
@@ -420,7 +443,7 @@ func HandleCreateDisk(deps Deps) Handler {
 		// callback removes any partially-committed volume before propagating.
 		// ----------------------------------------------------------------
 		namingVMID, diskCID, canonicalVolID, err := attemptCreateVolume(
-			ctx, deps, node, storage, sizeGiB, formatArg, lockAttempts, maxAttempts,
+			ctx, deps, node, storage, sizeGiB, formatArg, volExt, lockAttempts, maxAttempts,
 			cloudProps.AvailabilityZone, diskPerfOpts,
 		)
 		if err != nil {
@@ -496,6 +519,12 @@ func HandleCreateDisk(deps Deps) Handler {
 // empty map is encoded as-is; omitempty on DiskCIDMeta.Opts keeps the CID
 // byte-identical to pre-performance-options releases when no options are set.
 //
+// volExt is the filename extension (".qcow2", ".raw"; leading dot included)
+// required by dir-style storages, or "" for block storages. When set, the
+// canonical volid takes the dir-plugin path form
+// "<storage>:<vmid>/vm-<vmid>-disk-0<ext>" so rollback targets the volid PVE
+// actually allocated.
+//
 // Returns:
 //   - namingVMID: the VMID allocated by AllocateDiskWithRetry (for logging)
 //   - diskCID: the volid to use as the BOSH disk CID; equals the PVE-returned
@@ -507,7 +536,7 @@ func attemptCreateVolume(
 	deps Deps,
 	node, storage string,
 	sizeGiB int,
-	formatArg string,
+	formatArg, volExt string,
 	lockAttempts, maxAttempts int,
 	az string,
 	diskPerfOpts map[string]string,
@@ -516,8 +545,13 @@ func attemptCreateVolume(
 
 	namingVMID, err = pve.AllocateDiskWithRetry(ctx, deps.PVE, node, storage,
 		func(candidate int) error {
-			volName := fmt.Sprintf("vm-%d-disk-0", candidate)
+			volName := fmt.Sprintf("vm-%d-disk-0%s", candidate, volExt)
 			candidateCanonical := fmt.Sprintf("%s:%s", storage, volName)
+			if volExt != "" {
+				// Dir-style plugins store the volume under a per-VMID
+				// directory and the volid carries that path.
+				candidateCanonical = fmt.Sprintf("%s:%d/%s", storage, candidate, volName)
+			}
 
 			var v string
 			cerr := pve.RetryOnTransientOrLock(ctx, deps.Log(ctx), "create_disk", lockAttempts, func() error {

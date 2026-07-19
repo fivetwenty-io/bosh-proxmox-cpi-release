@@ -35,6 +35,12 @@ func newLocalBackend(c Client, info StorageInfo, defaultNode string) Backend {
 // Kind reports BackendLocal — node-pinned storage where the volume's host node determines VM placement.
 func (l *localBackend) Kind() BackendKind { return BackendLocal }
 
+// StorageInfo exposes the classification this backend was built from
+// (StorageInfoProvider capability — see BackendStorageInfo). A cache-miss
+// fallback backend carries a fabricated StorageInfo with an empty Type;
+// callers treat that as "type unknown".
+func (l *localBackend) StorageInfo() StorageInfo { return l.info }
+
 // NodeForCreate picks the node for a new local-storage volume. Order:
 //
 //  1. vmHint → owning VM's current node (co-location is mandatory for local).

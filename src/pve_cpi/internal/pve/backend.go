@@ -57,6 +57,28 @@ type BackendResolver interface {
 	Resolve(ctx context.Context, storage string) (Backend, error)
 }
 
+// StorageInfoProvider is an optional capability of a Backend: implementations
+// built from a StorageInfoCache lookup (shared/local production backends)
+// expose the classified StorageInfo they were constructed with. Kept out of
+// the Backend interface so test fakes and the static fallback need not
+// implement it.
+type StorageInfoProvider interface {
+	StorageInfo() StorageInfo
+}
+
+// BackendStorageInfo returns the StorageInfo a backend was classified with,
+// when the backend carries one. The static test/fallback backend and fakes
+// return (zero, false); callers must treat that as "type unknown", not as a
+// classification. This gives handlers cached access to the storage type
+// (e.g. create_disk's file-vs-block volume-naming decision) without a second
+// live /storage lookup.
+func BackendStorageInfo(b Backend) (StorageInfo, bool) {
+	if p, ok := b.(StorageInfoProvider); ok {
+		return p.StorageInfo(), true
+	}
+	return StorageInfo{}, false
+}
+
 // resolver is the production BackendResolver. It consults StorageInfoCache to
 // classify the storage, then constructs either a SharedBackend or LocalBackend.
 type resolver struct {

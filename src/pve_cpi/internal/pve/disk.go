@@ -454,7 +454,10 @@ func FindVMNodeViaCluster(ctx context.Context, c Client, vmid int) (string, bool
 // variant; the tag string is PVE's semicolon-separated encoding, "" when the
 // VM has no tags or the row omits the field.
 func FindVMViaCluster(ctx context.Context, c Client, vmid int) (node, tags string, found bool, err error) {
-	if c == nil || vmid <= 0 {
+	// A nil Cluster service is the expected case in unit-test mocks that
+	// don't wire one (mirrors lookupVMStorageType's ClusterStorage guard):
+	// report not-found so callers keep their fallback behavior.
+	if c == nil || c.Cluster() == nil || vmid <= 0 {
 		return "", "", false, nil
 	}
 	typ := "vm"
