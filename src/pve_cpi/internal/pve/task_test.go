@@ -290,6 +290,46 @@ func TestAwaitTask_Success(t *testing.T) {
 	}
 }
 
+func TestAwaitTask_PollsNodeEmbeddedInUPID(t *testing.T) {
+	t.Parallel()
+	// pveproxy may run a proxied request on the node handling the API
+	// connection instead of the node addressed in the URL (seen with storage
+	// uploads to a shared storage in a multi-node cluster), so the UPID's
+	// embedded node — not the caller's — must be used for status polling:
+	// the status endpoint rejects a UPID whose node differs from the URL's.
+	var polledNode string
+	svc := &mockTasksService{
+		waitFn: func(_ context.Context, node, upid string, _ *sdktasks.WaitOptions) (*sdktasks.Status, error) {
+			polledNode = node
+			return &sdktasks.Status{Status: "stopped", ExitStatus: "OK", UpID: upid}, nil
+		},
+	}
+	upid := "UPID:node0:000671CC:00AA0359:6A5C1330:imgcopy::user@pve!t:"
+	if err := pve.AwaitTask(context.Background(), newMockClient(svc), "node2", upid); err != nil {
+		t.Fatalf("expected nil error, got: %v", err)
+	}
+	if polledNode != "node0" {
+		t.Fatalf("expected poll against UPID-embedded node %q, got %q", "node0", polledNode)
+	}
+}
+
+func TestAwaitTask_KeepsCallerNodeWhenUPIDUnparseable(t *testing.T) {
+	t.Parallel()
+	var polledNode string
+	svc := &mockTasksService{
+		waitFn: func(_ context.Context, node, upid string, _ *sdktasks.WaitOptions) (*sdktasks.Status, error) {
+			polledNode = node
+			return &sdktasks.Status{Status: "stopped", ExitStatus: "OK", UpID: upid}, nil
+		},
+	}
+	if err := pve.AwaitTask(context.Background(), newMockClient(svc), "node2", "not-a-upid"); err != nil {
+		t.Fatalf("expected nil error, got: %v", err)
+	}
+	if polledNode != "node2" {
+		t.Fatalf("expected caller node %q preserved, got %q", "node2", polledNode)
+	}
+}
+
 func TestAwaitTask_EmptyExitStatusReturnsRetriableError(t *testing.T) {
 	t.Parallel()
 	// Empty exit status means the SDK's TimeoutSeconds elapsed before PVE wrote

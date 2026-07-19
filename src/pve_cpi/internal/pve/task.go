@@ -4,6 +4,7 @@ package pve
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
@@ -89,6 +90,17 @@ func AwaitTask(ctx context.Context, c Client, node, upid string, opts ...AwaitOp
 	}
 	if upid == "" {
 		return cpierrors.Cloud("AwaitTask: upid must not be empty")
+	}
+
+	// pveproxy may execute a proxied request on the node handling the API
+	// connection rather than the node addressed in the URL (observed with
+	// storage uploads to a shared storage in a multi-node cluster: POST to
+	// /nodes/B/storage/X/upload over a connection to node A runs on A and
+	// returns "UPID:A:..."). The task status endpoint rejects a UPID whose
+	// embedded node differs from the URL's node segment ("upid: no such
+	// task"), so the UPID's own node is authoritative for polling.
+	if n := nodeFromUPID(upid); n != "" && n != node {
+		node = n
 	}
 
 	// §7.28: when progress-aware adaptive polling is enabled, run the CPI-owned
@@ -278,6 +290,17 @@ func awaitTaskAdaptive(ctx context.Context, c Client, node, upid string, opts ..
 		case <-time.After(d):
 		}
 	}
+}
+
+// nodeFromUPID extracts the node name embedded in a PVE UPID
+// ("UPID:<node>:<pid_hex>:..."). Returns "" when the string does not carry
+// a parseable node segment.
+func nodeFromUPID(upid string) string {
+	parts := strings.Split(upid, ":")
+	if len(parts) < 3 || parts[0] != "UPID" {
+		return ""
+	}
+	return parts[1]
 }
 
 // taskStatusStopped is the PVE task status string for a finished task.
