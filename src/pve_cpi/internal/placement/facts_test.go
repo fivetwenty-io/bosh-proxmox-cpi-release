@@ -95,6 +95,26 @@ func resourceQEMU(node, name, tags string) json.RawMessage {
 	return raw
 }
 
+// resourceQEMUWithMem builds a qemu cluster/resources entry carrying an
+// explicit maxmem (bytes) and an optional status (e.g. "stopped"). status is
+// omitted from the JSON entirely when empty; it is included only to
+// demonstrate that GatherNodeFacts sums maxmem regardless of the guest's run
+// state — the code has no field for status and does not filter on it.
+func resourceQEMUWithMem(node, name, tags string, maxmem int64, status string) json.RawMessage {
+	m := map[string]any{
+		"type":   "qemu",
+		"node":   node,
+		"name":   name,
+		"tags":   tags,
+		"maxmem": maxmem,
+	}
+	if status != "" {
+		m["status"] = status
+	}
+	raw, _ := json.Marshal(m)
+	return raw
+}
+
 func nopLogger() *log.Logger { return log.NewNopLogger() }
 
 // ---------------------------------------------------------------------------
@@ -210,6 +230,113 @@ func TestGatherNodeFacts_GuestCountFromResources(t *testing.T) {
 				t.Errorf("pve2 GuestCount = %d; want 1", f.GuestCount)
 			}
 		}
+	}
+}
+
+func TestGatherNodeFacts_CommittedMemBytes_SumsGuestMaxmemIncludingStopped(t *testing.T) {
+	t.Parallel()
+	resp := cluster.ListStatusResponse{
+		statusNode("pve1", 8, 32*gib, 4*gib, 1, 0),
+	}
+	resResp := cluster.ListResourcesResponse{
+		resourceQEMUWithMem("pve1", "vm-100", "", 4*gib, "running"),
+		// Stopped guests still reserve their configured RAM once BOSH starts
+		// them, so a stopped guest's maxmem must count toward the node's
+		// committed memory exactly like a running guest's.
+		resourceQEMUWithMem("pve1", "vm-101", "", 8*gib, "stopped"),
+	}
+	cl := &stubCluster{statusResp: &resp, resResp: &resResp}
+	ns := &stubNodes{}
+
+	facts, err := placement.GatherNodeFacts(context.Background(), cl, ns, nopLogger(), placement.GatherOptions{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(facts) != 1 {
+		t.Fatalf("expected 1 fact; got %d", len(facts))
+	}
+	if want := 12 * gib; facts[0].CommittedMemBytes != want {
+		t.Errorf("CommittedMemBytes = %d; want %d (stopped guest must count)", facts[0].CommittedMemBytes, want)
+	}
+}
+
+func TestGatherNodeFacts_CommittedMemBytes_SummedPerNode(t *testing.T) {
+	t.Parallel()
+	resp := cluster.ListStatusResponse{
+		statusNode("pve1", 8, 32*gib, 4*gib, 1, 0),
+		statusNode("pve2", 8, 32*gib, 4*gib, 1, 0),
+	}
+	resResp := cluster.ListResourcesResponse{
+		resourceQEMUWithMem("pve1", "vm-100", "", 2*gib, ""),
+		resourceQEMUWithMem("pve1", "vm-101", "", 3*gib, ""),
+		resourceQEMUWithMem("pve2", "vm-200", "", 10*gib, ""),
+	}
+	cl := &stubCluster{statusResp: &resp, resResp: &resResp}
+	ns := &stubNodes{}
+
+	facts, err := placement.GatherNodeFacts(context.Background(), cl, ns, nopLogger(), placement.GatherOptions{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	for _, f := range facts {
+		switch f.Node {
+		case "pve1":
+			if want := 5 * gib; f.CommittedMemBytes != want {
+				t.Errorf("pve1 CommittedMemBytes = %d; want %d", f.CommittedMemBytes, want)
+			}
+		case "pve2":
+			if want := 10 * gib; f.CommittedMemBytes != want {
+				t.Errorf("pve2 CommittedMemBytes = %d; want %d", f.CommittedMemBytes, want)
+			}
+		}
+	}
+}
+
+func TestGatherNodeFacts_CommittedMemBytes_MissingMaxmemToleratedAsZero(t *testing.T) {
+	t.Parallel()
+	resp := cluster.ListStatusResponse{
+		statusNode("pve1", 8, 32*gib, 4*gib, 1, 0),
+	}
+	resResp := cluster.ListResourcesResponse{
+		// resourceQEMU (pre-existing helper) omits maxmem entirely — decodes
+		// to the Go zero value (0) and must not abort or skip the guest.
+		resourceQEMU("pve1", "vm-100", ""),
+		resourceQEMUWithMem("pve1", "vm-101", "", 6*gib, ""),
+	}
+	cl := &stubCluster{statusResp: &resp, resResp: &resResp}
+	ns := &stubNodes{}
+
+	facts, err := placement.GatherNodeFacts(context.Background(), cl, ns, nopLogger(), placement.GatherOptions{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(facts) != 1 {
+		t.Fatalf("expected 1 fact; got %d", len(facts))
+	}
+	if want := 6 * gib; facts[0].CommittedMemBytes != want {
+		t.Errorf("CommittedMemBytes = %d; want %d (missing maxmem must count as 0, not break)",
+			facts[0].CommittedMemBytes, want)
+	}
+	if facts[0].GuestCount != 2 {
+		t.Errorf("GuestCount = %d; want 2 (guest with missing maxmem still counts toward GuestCount)",
+			facts[0].GuestCount)
+	}
+}
+
+func TestGatherNodeFacts_CommittedMemBytes_ListResourcesError_ZeroFailOpen(t *testing.T) {
+	t.Parallel()
+	resp := cluster.ListStatusResponse{
+		statusNode("pve1", 8, 32*gib, 4*gib, 1, 0),
+	}
+	cl := &stubCluster{statusResp: &resp, resErr: errors.New("api timeout")}
+	ns := &stubNodes{}
+
+	facts, err := placement.GatherNodeFacts(context.Background(), cl, ns, nopLogger(), placement.GatherOptions{})
+	if err != nil {
+		t.Fatalf("expected no error despite ListResources failure; got: %v", err)
+	}
+	if facts[0].CommittedMemBytes != 0 {
+		t.Errorf("CommittedMemBytes should be 0 when ListResources fails; got %d", facts[0].CommittedMemBytes)
 	}
 }
 

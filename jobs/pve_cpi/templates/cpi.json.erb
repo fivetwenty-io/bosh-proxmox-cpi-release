@@ -238,6 +238,12 @@
   placement_enabled = p("pve.placement.enabled", true)
   placement["enabled"] = placement_enabled unless placement_enabled
 
+  # placement.memory_signal: emit only when the operator overrides the
+  # default "reserved". Omitting the key lets the Go accessor's default
+  # (reserved) apply, byte-identical to leaving the property unset.
+  memory_signal = p("pve.placement.memory_signal", "reserved")
+  placement["memory_signal"] = memory_signal unless memory_signal == "reserved"
+
   # placement.az_map: emit only when the operator supplies a non-empty hash.
   az_map = p("pve.placement.az_map", {})
   placement["az_map"] = az_map unless az_map.nil? || az_map.empty?

@@ -663,6 +663,156 @@ func TestScore_MemOnlyEquivalence(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// MemorySignal tests
+// ---------------------------------------------------------------------------
+
+// TestScore_MemorySignalUnset_DefaultsToLegacyResident asserts the backward-
+// compatibility guarantee the reserved-memory feature depends on: the zero
+// value of Weights.MemorySignal ("") must produce byte-identical scores to
+// explicit MemorySignalResident, so every pre-existing caller that builds a
+// Weights literal without knowing about MemorySignal keeps today's exact
+// numbers. The "reserved" default lives at the config layer (which always
+// sets this field explicitly), not in the package's zero value.
+func TestScore_MemorySignalUnset_DefaultsToLegacyResident(t *testing.T) {
+	t.Parallel()
+	facts := []placement.NodeFacts{
+		{Node: "pve1", Online: true, FreeMemBytes: 12 * gib, TotalMemBytes: 16 * gib, CommittedMemBytes: 14 * gib},
+		{Node: "pve2", Online: true, FreeMemBytes: 4 * gib, TotalMemBytes: 16 * gib, CommittedMemBytes: 1 * gib},
+	}
+	unset := placement.Score(facts, placement.Weights{Mem: 1.0}, nil)
+	resident := placement.Score(facts, placement.Weights{Mem: 1.0, MemorySignal: placement.MemorySignalResident}, nil)
+	if len(unset) != len(resident) {
+		t.Fatalf("length mismatch: unset=%d resident=%d", len(unset), len(resident))
+	}
+	for i := range unset {
+		if unset[i] != resident[i] {
+			t.Errorf("unset MemorySignal diverges from explicit resident at index %d: %+v vs %+v",
+				i, unset[i], resident[i])
+		}
+	}
+}
+
+// TestScore_MemorySignalResident_IgnoresCommittedMemBytes confirms resident
+// mode ranks purely by FreeMemBytes/TotalMemBytes (today's formula) and never
+// consults CommittedMemBytes, even when CommittedMemBytes would flip the
+// ranking under reserved mode.
+func TestScore_MemorySignalResident_IgnoresCommittedMemBytes(t *testing.T) {
+	t.Parallel()
+	facts := []placement.NodeFacts{
+		// High resident-free but heavily committed — would lose under reserved mode.
+		{Node: "pve1", Online: true, FreeMemBytes: 12 * gib, TotalMemBytes: 16 * gib, CommittedMemBytes: 14 * gib},
+		// Low resident-free but lightly committed — would win under reserved mode.
+		{Node: "pve2", Online: true, FreeMemBytes: 4 * gib, TotalMemBytes: 16 * gib, CommittedMemBytes: 1 * gib},
+	}
+	w := placement.Weights{Mem: 1.0, MemorySignal: placement.MemorySignalResident}
+	scored := placement.Score(facts, w, nil)
+	if scored[0].Node != "pve1" {
+		t.Errorf("resident mode should rank by FreeMemBytes only; expected pve1 first, got %s", scored[0].Node)
+	}
+	legacyScored := placement.Score(facts, placement.Weights{Mem: 1.0}, nil)
+	for i := range scored {
+		if scored[i] != legacyScored[i] {
+			t.Errorf("resident mode diverges from legacy unset mode at index %d: %+v vs %+v",
+				i, scored[i], legacyScored[i])
+		}
+	}
+}
+
+// TestScore_MemorySignalReserved_FlipsRankingVsResident uses the identical
+// facts from TestScore_MemorySignalResident_IgnoresCommittedMemBytes to prove
+// reserved mode ranks by committed headroom, not resident free memory —
+// the two modes genuinely diverge on facts engineered to disagree.
+func TestScore_MemorySignalReserved_FlipsRankingVsResident(t *testing.T) {
+	t.Parallel()
+	facts := []placement.NodeFacts{
+		{Node: "pve1", Online: true, FreeMemBytes: 12 * gib, TotalMemBytes: 16 * gib, CommittedMemBytes: 14 * gib},
+		{Node: "pve2", Online: true, FreeMemBytes: 4 * gib, TotalMemBytes: 16 * gib, CommittedMemBytes: 1 * gib},
+	}
+	w := placement.Weights{Mem: 1.0, MemorySignal: placement.MemorySignalReserved}
+	scored := placement.Score(facts, w, nil)
+	if scored[0].Node != "pve2" {
+		t.Errorf("reserved mode should rank by committed headroom; expected pve2 first, got %s", scored[0].Node)
+	}
+}
+
+// TestScore_MemorySignalReserved_ClampsOvercommitToZero verifies an
+// overcommitted node (CommittedMemBytes > TotalMemBytes — e.g. facts
+// gathered mid-migration, or thin-provisioned memory) clamps its Mem-axis
+// contribution to exactly 0 rather than going negative, which would
+// otherwise let a single overcommitted node's Mem axis invert the sign of
+// the whole weighted sum for any other positively-weighted axis.
+func TestScore_MemorySignalReserved_ClampsOvercommitToZero(t *testing.T) {
+	t.Parallel()
+	w := placement.Weights{Mem: 1.0, MemorySignal: placement.MemorySignalReserved}
+	facts := []placement.NodeFacts{
+		{Node: "overcommitted", Online: true, TotalMemBytes: 16 * gib, CommittedMemBytes: 20 * gib},
+		{Node: "healthy", Online: true, TotalMemBytes: 16 * gib, CommittedMemBytes: 4 * gib},
+	}
+	scored := placement.Score(facts, w, nil)
+	if scored[0].Node != "healthy" {
+		t.Errorf("healthy should outrank overcommitted; got %s first", scored[0].Node)
+	}
+	var overcommittedScore float64
+	for _, s := range scored {
+		if s.Node == "overcommitted" {
+			overcommittedScore = s.Score
+		}
+	}
+	if overcommittedScore != 0 {
+		t.Errorf("overcommitted score = %v; want 0 (clamped; Mem is the only weighted axis)", overcommittedScore)
+	}
+}
+
+// TestScore_MemorySignalReserved_SequentialCreatesFanOut is the regression
+// test for the bug this feature fixes: under the legacy resident-memory
+// signal, a sequence of freshly-booted VMs touches only a fraction of its
+// reserved RAM, so FreeMemBytes barely moves between creates and the
+// deterministic scorer keeps picking the same node for the whole sequence.
+// Reserved mode fixes this because each create raises the winner's
+// CommittedMemBytes by the full reservation immediately (no dependency on the
+// guest actually touching that memory), so the *next* pick's score for that
+// node visibly drops. This simulates 9 sequential single-VM creates across 3
+// identical, initially-empty nodes and asserts they fan out evenly (3 apiece)
+// rather than stacking on one node.
+func TestScore_MemorySignalReserved_SequentialCreatesFanOut(t *testing.T) {
+	t.Parallel()
+	const totalMemBytes = 32 * gib
+	const perCreateReservation = 2 * gib
+	const numNodes = 3
+	const numCreates = 9 // 3 full rounds across 3 equal nodes
+
+	w := placement.Weights{Mem: 1.0, MemorySignal: placement.MemorySignalReserved}
+	committed := map[string]int64{"pve1": 0, "pve2": 0, "pve3": 0}
+	picks := make(map[string]int, numNodes)
+
+	for i := 0; i < numCreates; i++ {
+		facts := []placement.NodeFacts{
+			{Node: "pve1", Online: true, TotalMemBytes: totalMemBytes, CommittedMemBytes: committed["pve1"]},
+			{Node: "pve2", Online: true, TotalMemBytes: totalMemBytes, CommittedMemBytes: committed["pve2"]},
+			{Node: "pve3", Online: true, TotalMemBytes: totalMemBytes, CommittedMemBytes: committed["pve3"]},
+		}
+		scored := placement.Score(facts, w, nil)
+		winner := placement.Pick(scored, nil)
+		if winner == "" {
+			t.Fatalf("create %d: Pick returned empty string", i)
+		}
+		picks[winner]++
+		// Simulate the create landing on winner: its reservation grows by one
+		// guest's worth of committed memory immediately, dropping its score
+		// for the next iteration — this is the mechanism under test.
+		committed[winner] += perCreateReservation
+	}
+
+	for _, node := range []string{"pve1", "pve2", "pve3"} {
+		want := numCreates / numNodes
+		if picks[node] != want {
+			t.Errorf("picks[%s] = %d; want %d (even fan-out across %d equal nodes)",
+				node, picks[node], want, numNodes)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
 

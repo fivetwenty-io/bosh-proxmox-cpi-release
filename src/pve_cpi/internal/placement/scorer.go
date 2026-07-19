@@ -36,7 +36,41 @@ type Weights struct {
 	// on a node. The penalty is subtracted: −AntiAffinity × avoidCount.
 	// Default 5.0.
 	AntiAffinity float64
+
+	// MemorySignal selects which memory fact backs the Mem axis:
+	//
+	//   MemorySignalReserved ("reserved") — the Mem axis uses
+	//     reservedFree = (TotalMemBytes − CommittedMemBytes) / TotalMemBytes,
+	//     clamped to [0,1] (an overcommitted node scores 0 on this axis rather
+	//     than going negative). CommittedMemBytes sums every resident guest's
+	//     configured (maxmem) memory regardless of run state, so the axis
+	//     tracks reservations rather than actual host memory in use. This
+	//     matters for sequential creates of freshly-booted VMs, which touch
+	//     only a fraction of their reserved RAM: the resident-memory signal
+	//     barely moves between creates and the deterministic scorer keeps
+	//     picking the same node, while the reserved signal drops by a full
+	//     guest's reservation on every create and fans placements out.
+	//
+	//   Anything else (including the zero value "") — legacy resident-memory
+	//     signal: (FreeMemBytes / TotalMemBytes), no clamping. Byte-identical
+	//     to pre-feature releases. Zero value intentionally means "legacy" (not
+	//     "reserved") so existing callers that build a Weights literal without
+	//     setting this field keep today's exact scores; the "reserved" default
+	//     for new deployments is applied at the config layer (see
+	//     config.CPIConfig.MemorySignalValue), which explicitly sets this field
+	//     when constructing Weights for create_vm.
+	MemorySignal string
 }
+
+// Memory-signal mode constants for Weights.MemorySignal. Exported so callers
+// (config accessors, handlers) can reference them instead of duplicating the
+// string literals.
+const (
+	// MemorySignalReserved selects the reserved/committed-memory Mem axis.
+	MemorySignalReserved = "reserved"
+	// MemorySignalResident selects the legacy resident-memory Mem axis.
+	MemorySignalResident = "resident"
+)
 
 // DefaultWeights returns the production weight defaults.
 func DefaultWeights() Weights {
@@ -67,10 +101,21 @@ type NodeFacts struct {
 	InMaintenance bool
 
 	// FreeMemBytes is current free memory in bytes (Maxmem - Mem from cluster status).
+	// Backs the Mem axis when Weights.MemorySignal is MemorySignalResident (or unset).
 	FreeMemBytes int64
 
-	// TotalMemBytes is total memory in bytes (Maxmem). Zero disables the Mem axis.
+	// TotalMemBytes is total memory in bytes (Maxmem). Zero disables the Mem axis
+	// under either memory signal.
 	TotalMemBytes int64
+
+	// CommittedMemBytes is the sum of configured (maxmem) memory across every
+	// QEMU guest resident on this node, regardless of run state — a stopped
+	// guest still reserves its configured RAM once BOSH starts it, so stopped
+	// guests are included. Populated from cluster/resources by GatherNodeFacts;
+	// zero when ListResources failed (non-fatal, same fail-open as GuestCount)
+	// or when the node genuinely hosts no guests. Backs the Mem axis when
+	// Weights.MemorySignal is MemorySignalReserved.
+	CommittedMemBytes int64
 
 	// FreeStorageBytes is available bytes on the target storage pool. Zero when
 	// ListStorage failed or the node has no matching storage; disables Storage axis.
@@ -320,7 +365,7 @@ func Score(facts []NodeFacts, w Weights, avoidNodes map[string]int) []ScoredNode
 // The formula is a normalized weighted sum. Each axis is a fraction in [0, 1]
 // (or 0 when the denominator is zero). The anti-affinity penalty is unbounded negative.
 //
-//	score = w.Mem * (freeMemBytes / totalMemBytes)
+//	score = w.Mem * memFraction   (see memAxisFraction for the two MemorySignal modes)
 //	      + w.Storage * (freeStorageBytes / totalStorageBytes)   [when totalStorageBytes > 0]
 //	      + w.CPU * headroomFraction                             [when maxCPU > 0]
 //	      + w.GuestCount * (1 / (1 + guestCount))
@@ -330,7 +375,7 @@ func computeScore(f NodeFacts, w Weights, avoidNodes map[string]int) float64 {
 
 	// Memory axis.
 	if w.Mem > 0 && f.TotalMemBytes > 0 {
-		score += w.Mem * (float64(f.FreeMemBytes) / float64(f.TotalMemBytes))
+		score += w.Mem * memAxisFraction(f, w)
 	}
 
 	// Storage axis.
@@ -367,6 +412,30 @@ func computeScore(f NodeFacts, w Weights, avoidNodes map[string]int) float64 {
 	}
 
 	return score
+}
+
+// memAxisFraction returns the [0,1] fraction that backs the Mem axis for f
+// under w.MemorySignal. Callers must already have checked f.TotalMemBytes > 0.
+//
+//   - MemorySignalReserved: reservedFree = (TotalMemBytes − CommittedMemBytes)
+//     / TotalMemBytes, clamped to [0,1]. An overcommitted node (CommittedMemBytes
+//     > TotalMemBytes, e.g. thin-provisioned memory or facts gathered mid-migration)
+//     clamps to 0 rather than going negative and inverting the scorer.
+//   - any other value (including the zero value ""): legacy resident-memory
+//     fraction (FreeMemBytes / TotalMemBytes), unclamped — byte-identical to
+//     pre-feature releases.
+func memAxisFraction(f NodeFacts, w Weights) float64 {
+	if w.MemorySignal != MemorySignalReserved {
+		return float64(f.FreeMemBytes) / float64(f.TotalMemBytes)
+	}
+	reservedFree := float64(f.TotalMemBytes-f.CommittedMemBytes) / float64(f.TotalMemBytes)
+	if reservedFree < 0 {
+		reservedFree = 0
+	}
+	if reservedFree > 1 {
+		reservedFree = 1
+	}
+	return reservedFree
 }
 
 // Pick selects the best-scoring node from ranked, breaking any tie among the

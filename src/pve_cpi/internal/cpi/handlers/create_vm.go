@@ -1434,10 +1434,11 @@ func resolveTargetNodeWithRNG(
 
 		w := deps.Config.EffectiveWeights()
 		weights := placement.Weights{
-			Mem:        w.Mem,
-			Storage:    w.Storage,
-			CPU:        w.CPU,
-			GuestCount: w.GuestCount,
+			Mem:          w.Mem,
+			Storage:      w.Storage,
+			CPU:          w.CPU,
+			GuestCount:   w.GuestCount,
+			MemorySignal: deps.Config.MemorySignalValue(),
 		}
 		// Per-call cloud_properties weight overrides (opt-in, no global mutation).
 		// Only axes with an explicit value in the resolver override the config axis;
@@ -1733,10 +1734,11 @@ func resolveTargetNodeWithFallbacks(
 
 		w := deps.Config.EffectiveWeights()
 		weights := placement.Weights{
-			Mem:        w.Mem,
-			Storage:    w.Storage,
-			CPU:        w.CPU,
-			GuestCount: w.GuestCount,
+			Mem:          w.Mem,
+			Storage:      w.Storage,
+			CPU:          w.CPU,
+			GuestCount:   w.GuestCount,
+			MemorySignal: deps.Config.MemorySignalValue(),
 		}
 		if cpResolver != nil {
 			if f, found := cpResolver.Float("placement_weight_mem"); found {

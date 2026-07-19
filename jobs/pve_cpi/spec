@@ -619,6 +619,22 @@ properties:
       Protective default: true. Set to false to opt out of scoring and
       preserve legacy single-node behavior.
     default: true
+  pve.placement.memory_signal:
+    description: |
+      Selects which live memory signal the placement scorer's Mem axis uses
+      to rank candidate nodes: "reserved" (default) sums each resident QEMU
+      guest's configured memory (maxmem) on a node, regardless of run state,
+      and scores free capacity as (node total memory − that sum) / node
+      total memory. This tracks memory reservations rather than actual host
+      memory in use, so a sequence of freshly-booted BOSH VMs — which touch
+      only a fraction of their reserved RAM — still visibly lowers a node's
+      score on every create, causing sequential creates to fan out across
+      equal nodes instead of stacking on whichever node's resident-memory
+      usage happens to lag behind. "resident" restores the legacy signal:
+      free memory = node total memory − memory currently resident in the
+      host (Maxmem − Mem from PVE cluster status). Any other value, or a
+      typo, falls back to "reserved" rather than blocking the deploy.
+    default: reserved
   pve.placement.weights.mem:
     description: |
       Weight applied to the free-memory headroom axis in the node scorer.

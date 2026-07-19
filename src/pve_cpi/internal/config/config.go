@@ -1204,6 +1204,38 @@ type PlacementConfig struct {
 	// ReserveStorageHeadroom is true. Use StorageHeadroomMBValue() for the
 	// effective int (always ≥ 0 when valid).
 	StorageHeadroomMB *int `json:"storage_headroom_mb,omitempty"`
+
+	// MemorySignal selects which live memory signal the placement scorer's Mem
+	// axis uses to rank candidate nodes:
+	//
+	//   "reserved" (default) — the Mem axis uses reservedFree =
+	//     (TotalMemBytes − CommittedMemBytes) / TotalMemBytes, clamped to
+	//     [0,1]. CommittedMemBytes sums each resident QEMU guest's configured
+	//     memory (maxmem), regardless of run state, on the node. This tracks
+	//     memory reservations rather than actual host memory in use: a
+	//     sequence of freshly-booted BOSH VMs touches only a fraction of its
+	//     reserved RAM, so the legacy resident-memory signal barely moves
+	//     during a sequential deploy and the deterministic scorer keeps
+	//     picking the same node. The reserved signal drops by a full guest's
+	//     reservation on every create, so sequential creates fan out across
+	//     equal nodes instead of stacking on one.
+	//
+	//   "resident" — legacy signal: freeMemBytes = Maxmem − Mem from PVE
+	//     cluster status (actual host memory currently in use), no clamping.
+	//     Byte-identical to pre-feature releases; opt out to this value only
+	//     if the reserved signal misbehaves for a workload that deliberately
+	//     overcommits guest memory (e.g. ballooning tuned to reclaim idle RAM
+	//     aggressively, where committed memory persistently overstates real
+	//     pressure).
+	//
+	// Comparison is case-insensitive with surrounding whitespace trimmed.
+	// Empty (default), or any value other than "reserved"/"resident",
+	// resolves to "reserved" — this is a fail-open fallback, not a validation
+	// error, so a typo never blocks a deploy; it silently keeps the
+	// protective new default instead of falling back to the vulnerable
+	// legacy behavior. Use MemorySignalValue() for the effective, normalized
+	// value.
+	MemorySignal string `json:"memory_signal,omitempty"`
 }
 
 // StorageConfig holds storage-pool capacity guard knobs that apply across
@@ -2042,6 +2074,25 @@ func (c *CPIConfig) StorageHeadroomMBValue() int {
 	return *c.Placement.StorageHeadroomMB
 }
 
+// MemorySignalValue returns the effective placement memory signal:
+// "reserved" (the placement.MemorySignalReserved constant) or "resident"
+// (placement.MemorySignalResident). Defaults to "reserved" when Placement is
+// nil, MemorySignal is empty, or MemorySignal (after case-insensitive,
+// whitespace-trimmed comparison) is neither "reserved" nor "resident" — an
+// unrecognized value silently falls back to the protective default rather
+// than erroring, so a config typo never blocks a deploy. Callers copy this
+// string directly into placement.Weights.MemorySignal when building the
+// scorer's weights (the same pattern used for EffectiveWeights()).
+func (c *CPIConfig) MemorySignalValue() string {
+	if c == nil || c.Placement == nil {
+		return memorySignalReserved
+	}
+	if strings.ToLower(strings.TrimSpace(c.Placement.MemorySignal)) == memorySignalResident {
+		return memorySignalResident
+	}
+	return memorySignalReserved
+}
+
 // MaxUtilizationPctValue returns the effective storage-pool utilization
 // ceiling percentage. Zero (nil Storage block, nil field, or an explicit 0)
 // means the gate is disabled — the byte-identical, zero-behavior-change
@@ -2362,6 +2413,19 @@ const enumValueOff = "off"
 // enumValueWarn is the shared "warn" literal used by the enforce/warn enum
 // knobs (e.g. storage.max_utilization_mode).
 const enumValueWarn = "warn"
+
+// memorySignalReserved and memorySignalResident are the two valid values for
+// placement.memory_signal. They intentionally match the string values of
+// placement.MemorySignalReserved and placement.MemorySignalResident without
+// importing that package (internal/config avoids importing sibling internal
+// packages beyond internal/cpi/hooks to keep the dependency graph acyclic;
+// see internal/cpi/hooks/deps.go). MemorySignalValue() copies whichever of
+// these two literals it resolves to directly into placement.Weights.MemorySignal
+// at the handler layer, where the two packages actually meet.
+const (
+	memorySignalReserved = "reserved"
+	memorySignalResident = "resident"
+)
 
 // DiskDeleteStateGuardEnabled reports whether delete_disk should check the
 // owning VM's lock state before deleting. Default true: nil
