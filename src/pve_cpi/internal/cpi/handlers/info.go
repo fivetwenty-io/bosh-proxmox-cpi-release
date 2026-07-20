@@ -27,8 +27,14 @@ type infoResult struct {
 // Returns: infoResult — api_version + stemcell_formats.
 // Errors: none (cannot fail).
 func HandleInfo(_ Deps) cpi.Handler {
+	// api_version 2: directors below 283 do not recognize v3 and fall back
+	// to the v1 response contract, mis-parsing create_vm's [cid, networks]
+	// array into an empty vm_cid (observed on director 282.0.9: every
+	// post-create call fails "vm_cid must not be empty"). v3's only extra
+	// (env tags on create_stemcell) is not worth losing 282 compatibility;
+	// bump back to 3 when the fleet reaches director >= 283.
 	result := infoResult{
-		APIVersion: 3,
+		APIVersion: 2,
 		StemcellFormats: []string{
 			"openstack-qcow2",
 			"openstack-raw",
