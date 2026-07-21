@@ -548,9 +548,27 @@ Property names and defaults are cross-referenced to [Configuration reference](co
 
 **Best practice.** A PVE VM can be a member of exactly one resource pool at a time; configuring the CPI to assign the same VM into two conflicting pool roles is a misconfiguration that should be caught before it ever reaches PVE.
 
-**CPI behavior.** `pve.vm_pool` is validated at config load to differ from both `pve.stemcell_template_pool` and the reserved `bosh-lock-*` sentinel-pool namespace, so a manifest cannot configure a VM for two conflicting pool memberships.
+**CPI behavior.** `pve.vm_pool` is validated at config load to differ from both `pve.stemcell_template_pool` and the reserved `bosh-lock-*` sentinel-pool namespace, so a manifest cannot configure a VM for two conflicting pool memberships. Both properties default to a distinct, non-empty pool name (`bosh` for VMs, `bosh-templates` for stemcell templates) that the CPI creates on demand, so this separation holds even for a manifest that sets neither property explicitly.
 
 **Status.** Meets.
+
+**Resource pool layout: segregated defaults, create-if-missing, and opt-in reaping.**
+
+**Best practice.** Grouping workload VMs and stemcell templates under the same resource pool defeats the pool as an ACL boundary — a grant scoped to that pool for VM operations would also reach the shared templates every deployment clones from. A pool layout should keep the two separate by default and give an operator a low-effort way to scope pools further per deployment or per business unit without hand-editing every manifest.
+
+**CPI behavior.** `pve.vm_pool` (default `bosh`) and `pve.stemcell_template_pool` (default `bosh-templates`) are separate, create-if-missing pools: the CPI creates whichever one it needs the first time it is needed, tagging it with a `managed by bosh-pve-cpi` provenance comment, so no operator setup step is required before the first deploy. `pve.vm_pool_template` renders a per-deployment or per-business-unit pool name from `{prefix}`, `{director}`, `{deployment}`, and `{instance_group}` when neither a call-level nor a `vm_type` `cloud_properties.pool` override is set, letting an operator running several deployments (or several teams, "blocs") against one PVE cluster get a distinct pool per deployment without setting `cloud_properties.pool` in every manifest. Recommended: leave the two defaults as-is unless a shared-cluster ACL design calls for narrower scoping (see [PVE API permissions — shared-cluster variant](pve-api-permissions.md#7-shared-cluster-variant-scoping-vm-mutation-to-a-resource-pool)), and reach for `pve.vm_pool_template` before hand-rolling a per-deployment `cloud_properties.pool` in every vm_type.
+
+**Status.** Meets, Configurable for the template layer and the opt-in reaper.
+
+**Opt-in empty-pool reaping trade-off.**
+
+**Best practice.** Pools created for short-lived or scaled-down deployments can accumulate indefinitely once their last VM is destroyed; automatically deleting them needs to weigh the operator's PVE UI tidiness against the risk of ever touching a pool it did not create.
+
+**CPI behavior.** `pve.pool_reap_empty` (default `false`) trades pool tidiness for one extra `delete_vm`-time lookup: when enabled, `delete_vm` confirms the pool carries the CPI's own provenance comment, then attempts the delete and relies on PVE itself to refuse it if the pool is not actually empty — a not-empty or already-gone refusal is tolerated as an expected race rather than an error. Leaving it `false` is the safer default for a cluster where pools are also managed by other tooling; enable it on a cluster where every `managed by bosh-pve-cpi` pool is understood to be CPI-owned end to end.
+
+**Status.** Configurable — recommended on any cluster where CPI-managed pools would otherwise accumulate unbounded.
+
+**Migration note.** `pve.vm_pool` and `pve.stemcell_template_pool` used to default to no pool assignment at all; they now default to `bosh` and `bosh-templates` respectively, created on demand. A deployment upgrading without touching either property starts assigning VMs and templates into these auto-created pools and needs `Pool.Allocate` on the CPI's PVE token (see [PVE API permissions](pve-api-permissions.md)) — `Permissions.Modify` is not required, and `Pool.Audit` is a separate, opt-in requirement of `pool_reap_empty`/`cluster_lock_mode: pool`, not of this default path. Set `pve.vm_pool: ""` and/or `pve.stemcell_template_pool: ""` explicitly to keep the previous no-pool behavior. See [Configuration — Migration / Upgrade Notes](configuration.md#migration--upgrade-notes) for the full detail.
 
 **Node-scoped API semantics.**
 

@@ -44,8 +44,8 @@ Derived from the API endpoint inventory under `src/pve_cpi/internal/cpi/handlers
 | `Datastore.Audit` | same four storage paths | `create_stemcell.go`, `get_disks.go`, `has_disk.go` (list/check volume) |
 | `SDN.Allocate` | `/sdn` | `create_network.go`, `delete_network.go` (zone create/delete check it on `/sdn/zones` and `/sdn/zones/{zone}`, covered by a propagated `/sdn` grant), `create_vm.go` (`advertised_routes` subnet injection) — required by default (`network_mode: sdn`); only a `network_mode: bridge` opt-out avoids it |
 | `Sys.Console` | `/` | HA-rule writes — `POST`/`DELETE /cluster/ha/resources`, `POST`/`DELETE /cluster/ha/rules` driven by `placement.pin_az_via_ha_rules`, `anti_affinity.use_ha_rules`, and DLB (`placement.dlb` configured) — see note below |
-| `Pool.Allocate` | `/pool/<poolid>` | `cluster_lock.go` (`POST`/`DELETE /pools` — create/delete sentinel pools `bosh-lock-*` when `cluster_lock_mode: pool`), `create_stemcell.go` (`PUT /pools/{poolid}` via `AddVM` — assign the template VM to `pve.stemcell_template_pool` when set) — opt-in, only when one of these two features is enabled. `pve.vm_pool` does **not** need this privilege: it assigns membership via the `pool` parameter on the create/clone request itself, checked as `VM.Allocate` on `/pool/{pool}` (see §7), not via a separate `PUT /pools` call |
-| `Pool.Audit` | `/pool/<poolid>` | `GetPoolComment` (`GET /pools`/`GET /pools/{poolid}`) — pool-existence and comment reads backing the same two opt-in features above |
+| `Pool.Allocate` | `/pool/<poolid>` | `pool.go`'s `EnsurePoolExists` (`POST /pools`) — create-if-missing for the resolved `pve.vm_pool` pool (default `bosh`) at `create_vm` time and for `pve.stemcell_template_pool` (default `bosh-templates`) at `create_stemcell` time; `cluster_lock.go` (`POST`/`DELETE /pools` — create/delete sentinel pools `bosh-lock-*` when `cluster_lock_mode: pool`); `delete_vm.go`'s opt-in empty-pool reaper (`DELETE /pools/{poolid}`, only when `pve.pool_reap_empty: true`). Required by default now that `vm_pool` and `stemcell_template_pool` both default to a non-empty, create-if-missing pool name; set both to `""` and leave `cluster_lock_mode`/`pool_reap_empty` unused to avoid needing it. This privilege alone is sufficient — no `Permissions.Modify` grant is needed; see the note below |
+| `Pool.Audit` | `/pool/<poolid>` | `GetPoolComment` (`GET /pools`/`GET /pools/{poolid}`) — read by `cluster_lock.go` (`cluster_lock_mode: pool`) to check a lock pool's owner/expiry when stealing or verifying a held lock, and by `delete_vm.go`'s opt-in empty-pool reaper (`pve.pool_reap_empty: true`) to check a pool's provenance comment before deleting it. Opt-in only, unlike `Pool.Allocate` above — the default create-if-missing path (`EnsurePoolExists`) never reads pool state; it calls only `POST /pools` and tolerates the "already exists" error as its idempotency check |
 | `Sys.Modify` | `/` | `placement_dlb.go` (`PUT /cluster/options` setting `crs=ha=dynamic,...`) — opt-in, only when `placement.dlb.manage_cluster_crs: true`; when false (default) the CPI only reads `/cluster/options` (`Sys.Audit`, already granted) and logs a warning instead of writing |
 
 **`SDN.Allocate` note:** required by default — SDN is the default network mode, and with defaults the CPI creates and deletes the turnkey vxlan zone, its vnets, and subnets, all gated on `SDN.Allocate` (the zone endpoints check it on `/sdn/zones` and `/sdn/zones/{zone}`, which a propagated `/sdn` grant covers). Only deployments that opt out with `network_mode: bridge`, never mark a network `managed: true`, and set no `advertised_routes` can omit this privilege. Grant it on `/sdn`:
@@ -61,7 +61,9 @@ curl -sk -X PUT -H "Authorization: $PVE_TOKEN" \
 
 **`Sys.Console` note:** PVE checks `Sys.Console` on `/` for HA resource and rule writes — `POST`/`DELETE /cluster/ha/resources` and `POST`/`DELETE /cluster/ha/rules` (the matching `GET` reads check `Sys.Audit`, already granted on `/`). These endpoints are called when `placement.pin_az_via_ha_rules: true`, `anti_affinity.use_ha_rules: true`, or DLB is configured (`placement.dlb` present with `enabled: true` or an `az_name` sentinel in use — `delete_vm.go` gates its HA cleanup path on `AntiAffinityUseHaRulesEnabled() || DLBConfigured()`); a deployment that leaves all three off needs neither `Sys.Console` nor the HA-read grant. The privilege names are taken from the PVE API schema (`apidoc.json`: HA writes → `["perm", "/", ["Sys.Console"]]`, HA reads → `["perm", "/", ["Sys.Audit"]]`).
 
-**`Pool.Allocate`/`Pool.Audit` note:** these privileges gate the PVE resource-pool API and are only needed when `cluster_lock_mode: pool` (cross-process advisory locking via sentinel pools) or `stemcell_template_pool` (template-VM pool assignment) is set — a deployment that uses neither leaves pools untouched and needs no pool ACL at all. `PUT /pools/{poolid}` (`AddVM`, used by `create_stemcell.go`) additionally requires whatever permission-modification right governs the object being added to the pool; for VM members this is covered by `VM.Allocate` on `/vms`, already granted in §3 below, so no extra grant is needed beyond `Pool.Allocate` itself.
+**`Pool.Allocate` note:** this privilege gates pool creation and deletion via `POST`/`DELETE /pools`. It is needed by default, because `pve.vm_pool` (default `bosh`) and `pve.stemcell_template_pool` (default `bosh-templates`) are both create-if-missing: the CPI creates the resolved pool the first time it is needed, tagging it with a `managed by bosh-pve-cpi` provenance comment. A deployment that sets both `vm_pool: ""` and `stemcell_template_pool: ""`, and does not use `cluster_lock_mode: pool` or `pool_reap_empty`, needs no `Pool.Allocate` grant at all. `PUT /pools/{poolid}` (`AddVM`, used by `create_stemcell.go` to assign the template VM) additionally requires whatever permission-modification right governs the object being added to the pool; for VM members this is covered by `VM.Allocate` on `/vms`, already granted in §3 below, so no extra grant is needed beyond `Pool.Allocate` itself. **`Permissions.Modify` is not required** for any part of the CPI's pool lifecycle (create, assign, or delete) — verified against a live PVE 9.2.4 cluster with a token restricted to exactly the privileges in this table (no `Permissions.Modify`): pool creation, one-shot pool assignment on VM create, and the empty-pool reaper's delete all succeeded. PVE surfaces pool-create, pool-move, and non-empty pool-delete conflicts as HTTP 500 with descriptive text rather than the 409/404 a REST client might expect for those conditions — the CPI recognizes them by matching known substrings in the error text (`already exists`, `belongs already to pool`, `is not empty`, `does not exist`) rather than by status code.
+
+**`Pool.Audit` note:** opt-in only, unlike `Pool.Allocate` — needed when `pve.pool_reap_empty: true` (the reaper's `GetPoolComment` check before deleting an empty pool) or `cluster_lock_mode: pool` (`cluster_lock.go` reading a lock pool's owner/expiry when stealing or verifying a hold). The default create-if-missing path never calls `GetPoolComment`: `EnsurePoolExists` is `POST /pools` only, treating PVE's "already exists" error as the desired end state rather than reading pool state first.
 
 **`Sys.Modify` note:** required only when `placement.dlb.manage_cluster_crs: true` — the CPI then writes the cluster-wide CRS (Cluster Resource Scheduler) setting via `PUT /cluster/options` so PVE actively load-balances HA-managed VMs. The default (`manage_cluster_crs` unset or `false`) never writes this endpoint; the CPI only reads it (`Sys.Audit`, already granted on `/`) to warn when `crs` is not set to `ha=dynamic,...`.
 
@@ -111,7 +113,7 @@ UI:
 
 2. Name: `BoshOperator`.
 
-3. Privileges: select `VM.Allocate`, `VM.Audit`, `VM.Config.Disk`, `VM.Config.Network`, `VM.Config.Options`, `VM.Config.Cloudinit`, `VM.PowerMgmt`, `VM.Snapshot`, `Datastore.Allocate`, `Datastore.AllocateSpace`, `Datastore.AllocateTemplate`, `Datastore.Audit`, `SDN.Allocate` (required by default; omit only for a `network_mode: bridge` opt-out), `Sys.Console` (if using HA placement features or DLB), `Pool.Allocate` and `Pool.Audit` (if using `cluster_lock_mode: pool` or `stemcell_template_pool`), and `Sys.Modify` (if using `placement.dlb.manage_cluster_crs`).
+3. Privileges: select `VM.Allocate`, `VM.Audit`, `VM.Config.Disk`, `VM.Config.Network`, `VM.Config.Options`, `VM.Config.Cloudinit`, `VM.PowerMgmt`, `VM.Snapshot`, `Datastore.Allocate`, `Datastore.AllocateSpace`, `Datastore.AllocateTemplate`, `Datastore.Audit`, `SDN.Allocate` (required by default; omit only for a `network_mode: bridge` opt-out), `Sys.Console` (if using HA placement features or DLB), `Pool.Allocate` (required by default — `vm_pool` and `stemcell_template_pool` both default to a create-if-missing pool name; omit only when both are set to `""`), `Pool.Audit` (only if using `cluster_lock_mode: pool` or `pool_reap_empty`), and `Sys.Modify` (if using `placement.dlb.manage_cluster_crs`).
 
 4. Create.
 
@@ -125,11 +127,11 @@ curl -sk -X POST -H "Authorization: $PVE_TOKEN" \
   https://$PVE_HOST/api2/json/access/roles
 ```
 
-`SDN.Allocate` belongs in the default grant — SDN is the default network mode. A deployment that explicitly opts out with `network_mode: bridge` (and no `advertised_routes`), does not use HA placement features or DLB (`pin_az_via_ha_rules: false`, `use_ha_rules: false`, no `placement.dlb`), resource pools (`cluster_lock_mode: pool` unset, `stemcell_template_pool` unset), or CPI-managed cluster CRS (`placement.dlb.manage_cluster_crs: false`/unset) may omit `SDN.Allocate`, `Sys.Console`, `Pool.Allocate`/`Pool.Audit`, and `Sys.Modify`, respectively. The minimum set for that documented bridge-only opt-out without HA placement, DLB, or pools is `VM.*,Datastore.*` as listed in the privilege table above. Note that `delete_vm`'s `skiplock` flag is separate from this role: it is gated on the `root@pam` user, not on any privilege (see the `delete_vm` note above), so granting `BoshOperator` does not enable it.
+`SDN.Allocate` belongs in the default grant — SDN is the default network mode. `Pool.Allocate` also belongs in the default grant — `pve.vm_pool` (default `bosh`) and `pve.stemcell_template_pool` (default `bosh-templates`) are both create-if-missing. `Pool.Audit`, like `Sys.Console` and `Sys.Modify`, is opt-in only. A deployment that explicitly opts out with `network_mode: bridge` (and no `advertised_routes`), does not use HA placement features or DLB (`pin_az_via_ha_rules: false`, `use_ha_rules: false`, no `placement.dlb`), the resource-pool lock or reaper (`cluster_lock_mode: pool` unset, `pool_reap_empty` unset), or CPI-managed cluster CRS (`placement.dlb.manage_cluster_crs: false`/unset) may omit `SDN.Allocate`, `Sys.Console`, `Pool.Audit`, and `Sys.Modify`, respectively. `Pool.Allocate` itself drops out only when both `vm_pool` and `stemcell_template_pool` are set to `""`. The minimum set for that documented bridge-only, pool-less opt-out without HA placement or DLB is `VM.*,Datastore.*` as listed in the privilege table above. Note that `delete_vm`'s `skiplock` flag is separate from this role: it is gated on the `root@pam` user, not on any privilege (see the `delete_vm` note above), so granting `BoshOperator` does not enable it.
 
 ### 3c. Grant ACLs
 
-Five ACL grants are needed with defaults — cluster-wide audit, VM operations, SDN, and one storage grant per configured storage pool — plus two conditional grants (root-path, resource pool) that apply only when the corresponding opt-in feature is used. The SDN grant drops out only for a `network_mode: bridge` opt-out.
+Six ACL grants are needed with defaults — cluster-wide audit, VM operations, SDN, one storage grant per configured storage pool, and the resource-pool grant (needed by default now that `vm_pool` and `stemcell_template_pool` both create their pool on demand) — plus one conditional grant (root-path) that applies only when HA placement, DLB, or CPI-managed cluster CRS is used. The SDN grant drops out only for a `network_mode: bridge` opt-out; the resource-pool grant drops out only when both `vm_pool` and `stemcell_template_pool` are set to `""` and `cluster_lock_mode: pool`/`pool_reap_empty` are unused.
 
 UI (repeat for each row below):
 
@@ -155,7 +157,7 @@ UI (repeat for each row below):
 | `/storage/<disk_storage>` | `BoshOperator` | From `pve.disk_storage` |
 | `/storage/<stemcell_storage>` | `BoshOperator` | From `pve.stemcell_storage` (defaults to `vm_storage`) |
 | `/storage/<iso_storage>` | `BoshOperator` | From `pve.iso_storage` (defaults to `local`) |
-| `/pool/<poolid>` | `BoshOperator` | Required for `Pool.Allocate`/`Pool.Audit` — only when `cluster_lock_mode: pool` or `stemcell_template_pool` is set |
+| `/pool/<poolid>` | `BoshOperator` | Required for `Pool.Allocate` by default — needed for the `vm_pool` (`bosh`) and `stemcell_template_pool` (`bosh-templates`) create-if-missing pools; omit only when both are set to `""`. `Pool.Audit` is bundled in the same grant but only actually used when `cluster_lock_mode: pool` or `pool_reap_empty` is set |
 
 API:
 
@@ -207,8 +209,12 @@ for s in local-lvm local-lvm nfs-shared local; do
     https://$PVE_HOST/api2/json/access/acl
 done
 
-# Resource pool — required for Pool.Allocate/Pool.Audit.
-# Omit if cluster_lock_mode: pool and stemcell_template_pool are both unused.
+# Resource pool — required for Pool.Allocate by default: vm_pool (bosh) and
+# stemcell_template_pool (bosh-templates) both create their pool on demand.
+# Pool.Audit, bundled in the same role, is only actually used when
+# cluster_lock_mode: pool or pool_reap_empty is set. Omit the whole grant
+# only if vm_pool: "" and stemcell_template_pool: "" are both set and
+# cluster_lock_mode: pool / pool_reap_empty are unused.
 curl -sk -X PUT -H "Authorization: $PVE_TOKEN" \
   --data-urlencode 'path=/pool/<poolid>' \
   --data-urlencode 'users=bosh@pve' \
@@ -356,14 +362,14 @@ The reduced-ACL table below assumes `stemcell_template_pool` is set and takes th
 
 ### Reduced ACL table
 
-Replaces the `/vms` row from §3c's table; every other row (root-path, SDN, storage, and the `/pool/<poolid>` row already present for `cluster_lock_mode: pool`/`stemcell_template_pool`) is unchanged.
+Replaces the `/vms` row from §3c's table; every other row (root-path, SDN, storage) is unchanged.
 
 | Path | Role | Notes |
 |---|---|---|
-| `/pool/<bosh-pool>` | `BoshOperator` | Replaces `/vms`. Covers `VM.Allocate` (create/clone into the pool) and every other VM.\* privilege for VMs that are members of `<bosh-pool>` — i.e. every VM this CPI creates once `pve.vm_pool: <bosh-pool>` is set |
+| `/pool/<bosh-pool>` | `BoshOperator` | Replaces `/vms`. Covers `VM.Allocate` (create/clone into the pool), `Pool.Allocate` (create-if-missing for `<bosh-pool>` itself — the CPI creates it on demand if it does not already exist; `Permissions.Modify` is not needed, see §2), and every other VM.\* privilege for VMs that are members of `<bosh-pool>` — i.e. every VM this CPI creates once `pve.vm_pool: <bosh-pool>` is set |
 | `/pool/<stemcell-template-pool>` | `BoshOperator` | Additional grant closing the cloning gap above — required whenever `stemcell_template_pool` is set alongside `vm_pool`. Omit and grant `VM.Clone` on `/vms` instead if you took the second option above |
 
-Prerequisite: `<bosh-pool>` must exist before the first `create_vm` call — the CPI does not create it (unlike the cluster-lock sentinel pools or `stemcell_template_pool`, both of which the CPI creates on demand). Create it once with an admin token:
+No prerequisite pool-creation step is required: `pve.vm_pool` is create-if-missing, so the CPI creates `<bosh-pool>` itself the first time `create_vm` needs it, provided the token holds `Pool.Allocate` on `/pool/<bosh-pool>` per the table above. To pre-create the pool anyway — for example to set a custom comment before the first deploy — use an admin token:
 
 ```bash
 curl -sk -X POST -H "Authorization: $PVE_TOKEN" \

@@ -44,8 +44,10 @@ The CPI reads configuration from a BOSH deployment manifest. The job template re
 | `pve.root_disk_bus` | PVE bus the root (system) disk is created on. `virtio` (default when empty): root disk lands on `virtio0` — byte-identical to every release before this property existed. `scsi`: root disk lands on `scsi0`, on the same virtio-scsi controller persistent disks already use, unlocking TRIM (`discard`) and `ssd` auto-resolution on the root disk itself (both unavailable on virtio-blk). Persistent-disk slot allocation is unaffected either way — `scsi0` has always been reserved for the root disk and `attach_disk`'s free-slot search has always started at `scsi1`, so there is no slot collision to manage. **Clone-path requirement:** `create_vm`'s dominant path clones a pre-built stemcell template (every `template:<vmid>` CID), and a clone inherits its source's exact disk layout. Templates are built once by `create_stemcell` and reused by content-hash tag match, so flipping this setting does not retroactively rebuild existing templates — `create_vm` compares the resolved bus against the matched template's actual root disk key before cloning and fails with a clear, non-retriable error on a mismatch rather than silently producing a root disk on the wrong bus. Re-run `create_stemcell` for affected stemcells after changing this value so new templates are built on the matching bus. One of `virtio`\|`scsi`. | `""` (→ `virtio`) | no |
 | `pve.stemcell_template_vmid_range_start` | Starting VMID for stemcell template VM allocation — a dedicated band above the persistent-disk range. When unset (`0`), defaults to `30000`. Must not overlap the VM range or the persistent-disk range `9000–29999`. | `0` (→ `30000`) | no |
 | `pve.stemcell_template_vmid_range_end` | Inclusive upper bound of the template VMID range. When unset (`0`), defaults to `30999`. Must be greater than `stemcell_template_vmid_range_start`. Must not overlap the persistent-disk range. | `0` (→ `30999`) | no |
-| `pve.stemcell_template_pool` | Optional PVE resource pool to assign to newly created template VMs. When empty (default), templates are not assigned to any pool. An invalid pool name causes `create_stemcell` to return an error. | `""` | no |
-| `pve.vm_pool` | Optional PVE resource pool assigned to every VM `create_vm` provisions, on both the import path and the clone path (PVE's create and clone endpoints both accept `pool` directly). When empty (default), no pool is assigned — byte-identical to every release before this property existed. Lets an operator scope the CPI's VM.\* ACL grants to `/pool/<name>` instead of cluster-wide `/vms`, shrinking the blast radius of a compromised CPI token on a shared cluster — see [PVE API permissions — shared-cluster variant](pve-api-permissions.md#7-shared-cluster-variant-scoping-vm-mutation-to-a-resource-pool) for the reduced ACL table and its one gap (cloning still needs `VM.Clone` on the template's own vmid/pool). The pool itself is not created by the CPI; it must already exist before `create_vm` runs. Must not equal `stemcell_template_pool`, and must not start with `bosh-lock-` (reserved for the cluster-lock sentinel pool namespace) — both are rejected at config load. | `""` | no |
+| `pve.stemcell_template_pool` | PVE resource pool assigned to newly created template VMs. The CPI creates this pool if it does not already exist, tagging it with a `managed by bosh-pve-cpi` provenance comment, before the first template VM is assigned to it. Set explicitly to `""` to opt out entirely — no pool assignment and no pool creation. Must not equal `pve.vm_pool` (validated at config load — pools are the ACL boundary between workload VMs and shared stemcell templates), and must not start with `bosh-lock-` (reserved cluster-lock namespace). Must be a flat PVE poolid (no `/`). See [Resource Pools](#resource-pools) below. | `bosh-templates` | no |
+| `pve.vm_pool` | PVE resource pool assigned to every VM `create_vm` provisions, on both the import path and the clone path (PVE's create and clone endpoints both accept `pool` directly). The CPI creates the resolved pool if it does not already exist, tagging it with a `managed by bosh-pve-cpi` provenance comment. Resolution precedence (highest wins, first non-empty selected): call-level `cloud_properties.pool` > `vm_type` profile `cloud_properties.pool` > `pve.vm_pool_template` (rendered) > this global value. Set explicitly to `""` to opt this layer out — a higher-precedence layer still applies if set, and when every layer resolves empty no pool is assigned, byte-identical to every release before this property existed. Lets an operator scope the CPI's VM.\* ACL grants to `/pool/<name>` instead of cluster-wide `/vms`, shrinking the blast radius of a compromised CPI token on a shared cluster — see [PVE API permissions — shared-cluster variant](pve-api-permissions.md#7-shared-cluster-variant-scoping-vm-mutation-to-a-resource-pool) for the reduced ACL table and its one gap (cloning still needs `VM.Clone` on the template's own vmid/pool). Must not equal `stemcell_template_pool`, and must not start with `bosh-lock-` (reserved for the cluster-lock sentinel pool namespace) — both are rejected at config load. Must be a flat PVE poolid (no `/`). See [Resource Pools](#resource-pools) below. | `bosh` | no |
+| `pve.vm_pool_template` | Optional director-level pool-name template rendered at `create_vm` time when neither the call-level nor the `vm_type`-level `cloud_properties.pool` is set (precedence position above the `pve.vm_pool` global default). Supports four variables: `{prefix}` (`pve.vm_prefix`), `{director}`, `{deployment}`, and `{instance_group}`; any other `{...}` token is rejected at config load. The rendered name is sanitized (repeated separators collapsed to one, leading/trailing `-` trimmed); a render that collapses to `""` falls through to `pve.vm_pool`. Must not contain `/` — flat names only, the CPI never creates nested pools. Empty (default) disables this layer entirely. See [Resource Pools](#resource-pools) below. | `""` | no |
+| `pve.pool_reap_empty` | When `true`, `delete_vm` deletes a CPI-managed pool (tagged with the `managed by bosh-pve-cpi` provenance comment) once the destroyed VM's pool membership, captured before destroy, is reported empty by PVE. An operator-created pool without that provenance comment is never reaped, and a pool that is still non-empty or already gone (a race with another creator) is tolerated silently — never failing `delete_vm`. Only the main `delete_vm` path reaps; the fast-path delete does not. Requires the CPI's PVE token to hold `Pool.Allocate` and `Pool.Audit` on the pool being reaped — `Pool.Audit` backs the pre-delete provenance-comment read, `Pool.Allocate` the delete itself. Default `false`: empty pools accumulate and are left for the operator to manage. See [Resource Pools](#resource-pools) below. | `false` | no |
 | `pve.stemcell_template_node` | Optional PVE node on which template VMs are created. When empty (default), falls back to `pve.node`. When using local `stemcell_storage`, this must equal the node where that storage is mounted; pointing to a different node with local storage causes the template import to fail because the uploaded qcow2 is not visible from the other node. | `""` | no |
 | `pve.vm_prefix` | Optional prefix prepended to every CPI-provisioned VM's PVE name. With `cpi`, names take the form `cpi-<deployment>-<job>-<index>`. Empty means the prefix is omitted. The prefix is cluster-wide — every VM created by this CPI deployment carries it. | `""` | no |
 | `pve.create_env_deployment` | Synthetic deployment name used for VMs created by `bosh create-env`. bosh-init does not pass a deployment in env, so a stable placeholder is required for the `<deployment>` segment of the VM name. | `create-env` | no |
@@ -127,6 +129,50 @@ The CPI does not auto-migrate templates between nodes. If a clone lands on the w
 ### Back-compatibility
 
 Stemcells uploaded before this feature was introduced continue to work without operator action. When `create_vm` receives a pre-upgrade CID (a `<storage>:import/<file>` or `light:...` form), it looks for a matching template by content hash. If a template is found, the fast clone path runs; if not, the original slow `import-from=` path runs. No re-upload is required.
+
+## Resource Pools
+
+PVE resource pools group VMs (and, separately, stemcell templates) under a named identifier that can anchor ACL grants — see [PVE API permissions — shared-cluster variant](pve-api-permissions.md#7-shared-cluster-variant-scoping-vm-mutation-to-a-resource-pool). Two independent pools exist: `pve.vm_pool` for workload VMs and `pve.stemcell_template_pool` for stemcell templates. They must always differ — pools are the CPI's ACL boundary, and sharing one pool would let a `create_vm`-scoped grant also touch stemcell templates.
+
+### VM pool resolution
+
+`create_vm` resolves the pool for every VM it provisions, on both the import path and the clone path, from the first non-empty candidate in this list, highest precedence first:
+
+| Precedence | Source | Notes |
+|---|---|---|
+| 1 | call-level `cloud_properties.pool` | Set per instance group via a BOSH resource pool or vm_extension; the Director merges this into the call's cloud properties before the CPI sees them. |
+| 2 | `vm_type` profile `cloud_properties.pool` | From `pve.vm_types`, selected via `cloud_properties.vm_type`. A `disk_type` profile's `pool` key has no vote here — pool assignment is a VM-level concept, not a disk-level one. |
+| 3 | `pve.vm_pool_template` (rendered) | Director-level template; see below. |
+| 4 | `pve.vm_pool` | Global default, `bosh`. |
+
+When every layer resolves to an empty string — including an explicit `pve.vm_pool: ""` with no template or per-call override in play — no pool is assigned, identical to every release before this feature existed.
+
+### Pool-name template
+
+`pve.vm_pool_template` renders a pool name from four variables, used only when neither the call-level nor the `vm_type`-level layer sets `pool`:
+
+| Variable | Value |
+|---|---|
+| `{prefix}` | `pve.vm_prefix` |
+| `{director}` | The BOSH director name, derived from `env.bosh.group`. Empty when it cannot be derived, for example on a `create-env` path. |
+| `{deployment}` | The BOSH deployment name. Falls back to `pve.create_env_deployment` for `create-env`. |
+| `{instance_group}` | The instance group (job) name. |
+
+Any other `{...}` token in the template is rejected at config load. After substitution, repeated `-` separators collapse to one and leading/trailing `-` is trimmed; a render that collapses to `""` (every variable resolving empty, for example) falls through to the `pve.vm_pool` global default rather than producing an empty or malformed pool id.
+
+### Create-if-missing and provenance
+
+Both `pve.vm_pool` and `pve.stemcell_template_pool` are create-if-missing: the CPI creates the resolved pool the first time a VM or template needs it, tagging it with the comment `managed by bosh-pve-cpi` (plus ` (director <name>)` when the director name is derivable). Two CPI processes racing to create the same pool are both satisfied — PVE serializes pool creation, and the CPI treats a duplicate-create response as success.
+
+A pool that already exists when the CPI first resolves it — whether operator-created or left over from a previous run — is used as-is; the create-if-missing call no-ops on the already-exists response and never rewrites an existing pool's comment.
+
+### Flat names only
+
+A resolved pool name — from a call-level override, a `vm_type` profile, or a rendered template — must not contain `/`. Every resolved name is validated against the flat PVE poolid charset (letters, digits, `.`, `_`, `-`) and checked against the reserved `bosh-lock-` cluster-lock namespace (see [Cluster pool lock](architecture.md#cluster-pool-lock)). The CPI never creates a nested pool.
+
+### Opt-in empty-pool reaping
+
+`pve.pool_reap_empty` (default `false`) lets `delete_vm` clean up a pool once it becomes empty. Before destroying the VM, the CPI records its pool membership; after the destroy completes, the CPI checks whether that pool carries the `managed by bosh-pve-cpi` provenance comment and, if so, attempts to delete it. A pool that is still non-empty, already gone, or missing the provenance comment is left alone — the reaper only ever removes pools it created, and race conditions with another creator are tolerated silently. Only the primary `delete_vm` path reaps; the fast-path delete (`pve.fast_path_delete`) does not.
 
 ## Authentication
 
@@ -683,6 +729,16 @@ The example above enables all three signals over OTLP/HTTP and lets logs and met
 The BOSH registry agent mode has been removed. Setting `pve.agent_mode: registry` or including any `registry.*` key in the CPI config now produces a config validation error at startup. This matches the upstream BOSH deprecation of the registry component.
 
 If your manifest uses `agent_mode: registry` or any `registry.*` properties, remove them and set `pve.agent_mode: cloudinit` (or omit `agent_mode` — `cloudinit` is the default).
+
+## Migration / Upgrade Notes
+
+**`pve.vm_pool` default changed from unassigned to `"bosh"`.** Before this release, an unset `pve.vm_pool` meant no pool assignment at all. It now defaults to `"bosh"`, and the CPI creates that pool automatically the first time it is needed. A deployment that upgrades and changes nothing now gets every new VM assigned into an auto-created `bosh` pool. To keep the old no-pool behavior, set `pve.vm_pool: ""` explicitly.
+
+**New ACL requirement for the default path.** Because the default `bosh` pool is now created on demand, the CPI's PVE token needs `Pool.Allocate` in addition to the privileges documented in [PVE API permissions](pve-api-permissions.md), unless `pve.vm_pool` is explicitly set to `""`. `Permissions.Modify` is not required — verified against a live PVE 9.2.4 cluster. `Pool.Audit` is a separate, opt-in requirement of `pve.pool_reap_empty` and `pve.cluster_lock_mode: pool`, not of the default create-if-missing path.
+
+**`pve.stemcell_template_pool` now defaults to `"bosh-templates"`.** Previously unset (no pool assignment); it now also creates that pool on demand. Set it to `""` explicitly to restore the previous no-pool behavior.
+
+**No other behavior changed.** VMs and templates created before this upgrade keep whatever pool membership (or lack of it) they already had; the CPI never retroactively moves an existing VM or template into a new pool.
 
 ## Example
 
