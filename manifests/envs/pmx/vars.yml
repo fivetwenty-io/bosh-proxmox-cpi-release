@@ -5,7 +5,7 @@
 # Single source of truth for the pmx env's network. Layered after
 # manifests/bosh/vars.yml (and manifests/cf/vars.yml) by scripts/bosh and
 # scripts/cf, so these keys win. The target PVE is the NESTED cluster running
-# inside outer VM 108 ("lab-pmx", API 10.253.0.10:8006, node name lab-pmx);
+# inside outer VM 108 ("lab-pmx", API 10.253.0.10:8006, node name lab-pmx-0);
 # VMs created there attach to the nested host's vmbr0, which bridges onto the
 # outer SDN vnet `pmx` (simple zone `labs`, subnet 10.253.0.0/16, gateway
 # 10.253.0.1, SNAT on the outer host). BOSH owns the 10.253.16.0/20 block of
