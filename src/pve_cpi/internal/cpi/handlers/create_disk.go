@@ -202,6 +202,39 @@ func resolveStorageForDiskEncrypted(
 	return pool, nil
 }
 
+// createDiskAttemptBudgets resolves the two retry budgets create_disk uses.
+//
+// VMID-collision attempts: retry.vmid_alloc.max_attempts overrides the
+// existing vmid_alloc_attempts, which overrides the built-in default 5.
+//
+// Lock retries scale with how busy the storage is, not with how many VMID
+// collisions we can tolerate. Precedence (first > 0 wins):
+//  1. retry.storage_lock.max_attempts — dedicated storage-lock budget (primary)
+//  2. retry.storage_import.max_attempts — legacy fallback preserves deployments
+//     that set this knob before storage_lock existed
+//  3. vmid_alloc_attempts — legacy scalar override
+//  4. pve.DefaultStorageLockMaxAttempts — shipped constant (10)
+func createDiskAttemptBudgets(deps Deps) (maxAttempts, lockAttempts int) {
+	maxAttempts = deps.Config.RetryVMIDAlloc().MaxAttempts
+	if maxAttempts <= 0 {
+		maxAttempts = deps.Config.VMIDAllocAttempts
+	}
+	if maxAttempts <= 0 {
+		maxAttempts = 5
+	}
+	lockAttempts = deps.Config.RetryStorageLock().MaxAttempts
+	if lockAttempts <= 0 {
+		lockAttempts = deps.Config.RetryStorageImport().MaxAttempts
+	}
+	if lockAttempts <= 0 {
+		lockAttempts = deps.Config.VMIDAllocAttempts
+	}
+	if lockAttempts <= 0 {
+		lockAttempts = pve.DefaultStorageLockMaxAttempts
+	}
+	return maxAttempts, lockAttempts
+}
+
 // HandleCreateDisk returns a Handler for the BOSH CPI create_disk method.
 //
 // Arguments (positional JSON array):
@@ -396,32 +429,7 @@ func HandleCreateDisk(deps Deps) Handler {
 			volExt = "." + formatArg
 		}
 
-		// VMID-collision attempts: retry.vmid_alloc.max_attempts overrides the
-		// existing vmid_alloc_attempts, which overrides the built-in default 5.
-		maxAttempts := deps.Config.RetryVMIDAlloc().MaxAttempts
-		if maxAttempts <= 0 {
-			maxAttempts = deps.Config.VMIDAllocAttempts
-		}
-		if maxAttempts <= 0 {
-			maxAttempts = 5
-		}
-		// Lock retries scale with how busy the storage is, not with how many
-		// VMID collisions we can tolerate. Precedence (first > 0 wins):
-		//   1. retry.storage_lock.max_attempts  — dedicated storage-lock budget (primary)
-		//   2. retry.storage_import.max_attempts — legacy fallback preserves deployments
-		//      that set this knob before storage_lock existed
-		//   3. vmid_alloc_attempts              — legacy scalar override
-		//   4. pve.DefaultStorageLockMaxAttempts — shipped constant (10)
-		lockAttempts := deps.Config.RetryStorageLock().MaxAttempts
-		if lockAttempts <= 0 {
-			lockAttempts = deps.Config.RetryStorageImport().MaxAttempts
-		}
-		if lockAttempts <= 0 {
-			lockAttempts = deps.Config.VMIDAllocAttempts
-		}
-		if lockAttempts <= 0 {
-			lockAttempts = pve.DefaultStorageLockMaxAttempts
-		}
+		maxAttempts, lockAttempts := createDiskAttemptBudgets(deps)
 
 		// ----------------------------------------------------------------
 		// 4. Per-node in-flight gate (opt-in; limit=0 → unlimited, no gating).

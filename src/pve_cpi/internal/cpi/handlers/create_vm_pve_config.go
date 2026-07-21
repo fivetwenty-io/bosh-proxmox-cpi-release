@@ -67,7 +67,7 @@ var pveConfigBlocklist = map[string]struct{}{
 	"sockets":       {},
 	"boot":          {},
 	metadataKeyName: {},
-	jsonKeyTags:          {},
+	jsonKeyTags:     {},
 	"hotplug":       {},
 	"numa":          {},
 	"smbios1":       {},

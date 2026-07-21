@@ -100,12 +100,12 @@ func resourceQEMU(node, name, tags string) json.RawMessage {
 // omitted from the JSON entirely when empty; it is included only to
 // demonstrate that GatherNodeFacts sums maxmem regardless of the guest's run
 // state — the code has no field for status and does not filter on it.
-func resourceQEMUWithMem(node, name, tags string, maxmem int64, status string) json.RawMessage {
+func resourceQEMUWithMem(node, name string, maxmem int64, status string) json.RawMessage {
 	m := map[string]any{
 		"type":   "qemu",
 		"node":   node,
 		"name":   name,
-		"tags":   tags,
+		"tags":   "",
 		"maxmem": maxmem,
 	}
 	if status != "" {
@@ -239,11 +239,11 @@ func TestGatherNodeFacts_CommittedMemBytes_SumsGuestMaxmemIncludingStopped(t *te
 		statusNode("pve1", 8, 32*gib, 4*gib, 1, 0),
 	}
 	resResp := cluster.ListResourcesResponse{
-		resourceQEMUWithMem("pve1", "vm-100", "", 4*gib, "running"),
+		resourceQEMUWithMem("pve1", "vm-100", 4*gib, "running"),
 		// Stopped guests still reserve their configured RAM once BOSH starts
 		// them, so a stopped guest's maxmem must count toward the node's
 		// committed memory exactly like a running guest's.
-		resourceQEMUWithMem("pve1", "vm-101", "", 8*gib, "stopped"),
+		resourceQEMUWithMem("pve1", "vm-101", 8*gib, "stopped"),
 	}
 	cl := &stubCluster{statusResp: &resp, resResp: &resResp}
 	ns := &stubNodes{}
@@ -267,9 +267,9 @@ func TestGatherNodeFacts_CommittedMemBytes_SummedPerNode(t *testing.T) {
 		statusNode("pve2", 8, 32*gib, 4*gib, 1, 0),
 	}
 	resResp := cluster.ListResourcesResponse{
-		resourceQEMUWithMem("pve1", "vm-100", "", 2*gib, ""),
-		resourceQEMUWithMem("pve1", "vm-101", "", 3*gib, ""),
-		resourceQEMUWithMem("pve2", "vm-200", "", 10*gib, ""),
+		resourceQEMUWithMem("pve1", "vm-100", 2*gib, ""),
+		resourceQEMUWithMem("pve1", "vm-101", 3*gib, ""),
+		resourceQEMUWithMem("pve2", "vm-200", 10*gib, ""),
 	}
 	cl := &stubCluster{statusResp: &resp, resResp: &resResp}
 	ns := &stubNodes{}
@@ -301,7 +301,7 @@ func TestGatherNodeFacts_CommittedMemBytes_MissingMaxmemToleratedAsZero(t *testi
 		// resourceQEMU (pre-existing helper) omits maxmem entirely — decodes
 		// to the Go zero value (0) and must not abort or skip the guest.
 		resourceQEMU("pve1", "vm-100", ""),
-		resourceQEMUWithMem("pve1", "vm-101", "", 6*gib, ""),
+		resourceQEMUWithMem("pve1", "vm-101", 6*gib, ""),
 	}
 	cl := &stubCluster{statusResp: &resp, resResp: &resResp}
 	ns := &stubNodes{}

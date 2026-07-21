@@ -48,11 +48,11 @@ func newPeersClient(rows ...json.RawMessage) *mockClient {
 func TestClusterNodePeerIPs_FiltersAndSorts(t *testing.T) {
 	t.Parallel()
 	c := newPeersClient(
-		statusRow("cluster", "lab", "", 1),               // non-node row excluded
-		statusRow("node", "pve3", "192.168.1.30", 1),     // included
-		statusRow("node", "pve1", "192.168.1.10", 1),     // included; sorts first
-		statusRow("node", "pve2", "192.168.1.20", 0),     // offline excluded
-		statusRow("node", "pve4", "", 1),                 // missing ip excluded
+		statusRow("cluster", "lab", "", 1),           // non-node row excluded
+		statusRow("node", "pve3", "192.168.1.30", 1), // included
+		statusRow("node", "pve1", "192.168.1.10", 1), // included; sorts first
+		statusRow("node", "pve2", "192.168.1.20", 0), // offline excluded
+		statusRow("node", "pve4", "", 1),             // missing ip excluded
 	)
 
 	peers, err := pve.ClusterNodePeerIPs(context.Background(), c)
