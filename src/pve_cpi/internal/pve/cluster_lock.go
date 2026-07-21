@@ -309,9 +309,11 @@ func decodeLockExpiry(comment string) (time.Time, bool) {
 // Primary check: SDK sentinel ErrConflict (HTTP 409), which PVE uses for
 // duplicate resource creation. Secondary: the string "already exists" /
 // "already defined" covers versions that return non-409 text errors for dups.
-// LIVE-VALIDATION CAVEAT: exact PVE HTTP code for duplicate poolid is inferred
-// (409 is the standard conflict code; PVE pool creation may also use 500 with
-// a text body — test against a live cluster and add to secondary if needed).
+// LIVE-VALIDATION CONFIRMED (PVE 9.2.4, R4 P1): duplicate poolid always
+// returns HTTP 500 + text "... already exists", never 409 — the 409 sentinel
+// branch above never fires against real PVE and is kept as belt-and-suspenders
+// for any future/other version that does use 409; the substring branch below
+// is the reliable primary path.
 func isPoolAlreadyExists(err error) bool {
 	if err == nil {
 		return false

@@ -1204,11 +1204,19 @@ func TestStemcellCloudProps_validateLightMutex_Direct(t *testing.T) {
 // ensureTemplateVM pool-assignment tests
 // ============================================================
 
-// wbRecordingPoolService records AddVM calls for assertion.
+// wbRecordingPoolService records AddVM and CreatePool calls for assertion.
 // Replaces wbNoopPoolService in tests that exercise pool assignment.
 type wbRecordingPoolService struct {
 	calls  []wbPoolCall
 	addErr error // when non-nil, returned from every AddVM call
+
+	createCalls []wbPoolCreateCall
+	createErr   error // when non-nil, returned from every CreatePool call
+
+	// callOrder records "create" / "assign" in the order the pool service
+	// methods were invoked, so ordering (EnsurePoolExists before
+	// AssignVMToPool) can be asserted without relying on call counts alone.
+	callOrder []string
 }
 
 type wbPoolCall struct {
@@ -1216,12 +1224,22 @@ type wbPoolCall struct {
 	vmid   int64
 }
 
+type wbPoolCreateCall struct {
+	poolID  string
+	comment string
+}
+
 func (p *wbRecordingPoolService) AddVM(_ context.Context, poolID string, vmid int64) error {
 	p.calls = append(p.calls, wbPoolCall{poolID: poolID, vmid: vmid})
+	p.callOrder = append(p.callOrder, "assign")
 	return p.addErr
 }
-func (p *wbRecordingPoolService) CreatePool(_ context.Context, _, _ string) error { return nil }
-func (p *wbRecordingPoolService) DeletePool(_ context.Context, _ string) error    { return nil }
+func (p *wbRecordingPoolService) CreatePool(_ context.Context, poolID, comment string) error {
+	p.createCalls = append(p.createCalls, wbPoolCreateCall{poolID: poolID, comment: comment})
+	p.callOrder = append(p.callOrder, "create")
+	return p.createErr
+}
+func (p *wbRecordingPoolService) DeletePool(_ context.Context, _ string) error { return nil }
 func (p *wbRecordingPoolService) GetPoolComment(_ context.Context, _ string) (string, bool, error) {
 	return "", false, nil
 }
@@ -1346,6 +1364,118 @@ func TestEnsureTemplateVM_PoolAssignmentError_ReturnsError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "bosh-stemcells") {
 		t.Errorf("error %q does not mention pool name", err.Error())
+	}
+}
+
+// TestEnsureTemplateVM_PoolCreatedIfMissing verifies that when
+// StemcellTemplatePool is set, ensureTemplateVM creates the pool
+// (pve.EnsurePoolExists → CreatePool) before assigning the template VM to it
+// (pve.AssignVMToPool → AddVM), in that order.
+func TestEnsureTemplateVM_PoolCreatedIfMissing(t *testing.T) {
+	t.Parallel()
+
+	pool := &wbRecordingPoolService{}
+	nodes := &wbTemplateNodes{listQemuFn: listQemuEmpty()}
+	deps := buildEnsureTemplateDepsWithPool(
+		&wbMockQEMU{}, nodes, &wbMockTasks{}, &wbTemplateStorage{},
+		pool, "bosh-templates",
+	)
+	deps.PVE.(*wbTemplateMockClient).clusterSvc = &wbClusterForAlloc{
+		listResourcesFn: listClusterResourcesEmpty(),
+	}
+
+	cp := stemcellCloudProps{Name: "ubuntu-jammy", Version: "10.0"}
+	vmid, err := ensureTemplateVM(context.Background(), deps, "pve-node1", "nfs", "jammy2.qcow2",
+		"aabbccddee112233aabbccddee112233aabbccddee112233aabbccddee112233", false, cp, "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(pool.createCalls) != 1 {
+		t.Fatalf("CreatePool called %d times; want 1", len(pool.createCalls))
+	}
+	if pool.createCalls[0].poolID != "bosh-templates" {
+		t.Errorf("CreatePool poolID = %q; want %q", pool.createCalls[0].poolID, "bosh-templates")
+	}
+	if pool.createCalls[0].comment != pve.PoolProvenanceComment {
+		t.Errorf("CreatePool comment = %q; want %q", pool.createCalls[0].comment, pve.PoolProvenanceComment)
+	}
+
+	if len(pool.calls) != 1 {
+		t.Fatalf("AddVM called %d times; want 1", len(pool.calls))
+	}
+	if pool.calls[0].poolID != "bosh-templates" || pool.calls[0].vmid != vmid {
+		t.Errorf("AddVM call = %+v; want poolID=bosh-templates vmid=%d", pool.calls[0], vmid)
+	}
+
+	if len(pool.callOrder) != 2 || pool.callOrder[0] != "create" || pool.callOrder[1] != "assign" {
+		t.Errorf("call order = %v; want [create assign] (EnsurePoolExists before AssignVMToPool)", pool.callOrder)
+	}
+}
+
+// TestEnsureTemplateVM_PoolDuplicateTolerated verifies that a live PVE
+// "already exists" 500+text response from CreatePool is tolerated (the pool
+// existing is the desired end state) and ensureTemplateVM proceeds to
+// AssignVMToPool without error.
+func TestEnsureTemplateVM_PoolDuplicateTolerated(t *testing.T) {
+	t.Parallel()
+
+	pool := &wbRecordingPoolService{
+		createErr: errors.New("create pool failed: pool 'bosh-templates' already exists\n"), //nolint:revive // verbatim live PVE error text incl. trailing newline
+	}
+	nodes := &wbTemplateNodes{listQemuFn: listQemuEmpty()}
+	deps := buildEnsureTemplateDepsWithPool(
+		&wbMockQEMU{}, nodes, &wbMockTasks{}, &wbTemplateStorage{},
+		pool, "bosh-templates",
+	)
+	deps.PVE.(*wbTemplateMockClient).clusterSvc = &wbClusterForAlloc{
+		listResourcesFn: listClusterResourcesEmpty(),
+	}
+
+	cp := stemcellCloudProps{Name: "ubuntu-jammy", Version: "11.0"}
+	vmid, err := ensureTemplateVM(context.Background(), deps, "pve-node1", "nfs", "jammy3.qcow2",
+		"aabbccddee112233aabbccddee112233aabbccddee112233aabbccddee112233", false, cp, "")
+	if err != nil {
+		t.Fatalf("unexpected error (duplicate-pool CreatePool error must be tolerated): %v", err)
+	}
+	if len(pool.createCalls) != 1 {
+		t.Fatalf("CreatePool called %d times; want 1", len(pool.createCalls))
+	}
+	if len(pool.calls) != 1 || pool.calls[0].vmid != vmid {
+		t.Fatalf("AddVM call = %+v; want one call for vmid=%d", pool.calls, vmid)
+	}
+}
+
+// TestEnsureTemplateVM_AssignStillFatal verifies the pre-existing fatal-on-error
+// contract for AssignVMToPool is unchanged by the new EnsurePoolExists step:
+// a CreatePool success followed by an AddVM failure still fails create_stemcell.
+func TestEnsureTemplateVM_AssignStillFatal(t *testing.T) {
+	t.Parallel()
+
+	pool := &wbRecordingPoolService{
+		addErr: errors.New("PVE: resource pool 'bosh-templates' not found"),
+	}
+	nodes := &wbTemplateNodes{listQemuFn: listQemuEmpty()}
+	deps := buildEnsureTemplateDepsWithPool(
+		&wbMockQEMU{}, nodes, &wbMockTasks{}, &wbTemplateStorage{},
+		pool, "bosh-templates",
+	)
+	deps.PVE.(*wbTemplateMockClient).clusterSvc = &wbClusterForAlloc{
+		listResourcesFn: listClusterResourcesEmpty(),
+	}
+
+	cp := stemcellCloudProps{Name: "ubuntu-jammy", Version: "12.0"}
+	_, err := ensureTemplateVM(context.Background(), deps, "pve-node1", "nfs", "jammy4.qcow2",
+		"aabbccddee112233aabbccddee112233aabbccddee112233aabbccddee112233", false, cp, "")
+	if err == nil {
+		t.Fatal("expected error when AddVM fails after a successful CreatePool; got nil")
+	}
+	if !strings.Contains(err.Error(), "bosh-templates") {
+		t.Errorf("error %q does not mention pool name", err.Error())
+	}
+	if len(pool.createCalls) != 1 {
+		t.Errorf("CreatePool called %d times; want 1 (EnsurePoolExists still runs before the fatal assign failure)",
+			len(pool.createCalls))
 	}
 }
 

@@ -188,6 +188,13 @@ func sweepFastDeleteStragglers(ctx context.Context, deps Deps, logger *log.Logge
 //     awaiting the returned task UPID.
 //  5. Returns immediately — no unbounded get_task poll on any task.
 //
+// The fast path intentionally does NOT run the pve.pool_reap_empty reaper: it
+// is the bounded-time, "known-simple" path and the reaper needs a pre-destroy
+// pool lookup plus a post-destroy task await, neither of which fit its
+// fire-and-forget contract. An empty pool left behind by a fast-path delete
+// is still reaped the next time a sync-path delete_vm empties it, or by an
+// operator running `pvesh delete /pools/<id>` directly.
+//
 // skiplock=true is restricted to the root@pam superuser authenticated via
 // password; PVE rejects it for any other identity regardless of granted
 // privileges — including an API token owned by root@pam (see
@@ -508,6 +515,13 @@ func HandleDeleteVM(deps Deps) cpi.Handler {
 			return nil, guardErr
 		}
 
+		// --- opt-in empty-pool reaper: capture membership BEFORE destroy ---
+		// The /cluster/resources row for this vmid (and therefore its pool
+		// membership) disappears once the VM is destroyed, and delete_vm has
+		// no env.bosh to re-derive a pool name from -- so the lookup must run
+		// here, before the destroy call below.
+		reapPool := capturePoolForReap(ctx, deps, vmid, logger)
+
 		// --- delete VM (synchronous path) ---
 		// Purge removes VMID from backup/HA/replication configs (per PVE's own
 		// API description). Resource-pool membership (pve.vm_pool,
@@ -596,6 +610,11 @@ func HandleDeleteVM(deps Deps) cpi.Handler {
 		if awaitErr := awaitDeleteTask(ctx, deps, node, vmCID, deleteResp, logger); awaitErr != nil {
 			return nil, awaitErr
 		}
+
+		// --- opt-in empty-pool reaper: run AFTER the destroy has completed so
+		//     PVE has already dropped this VM's pool membership. Never fails
+		//     delete_vm -- every branch is logged and swallowed.
+		reapEmptyPoolIfManaged(ctx, deps, reapPool, logger)
 
 		// --- agent cleanup ---
 		cleanupAgentForVM(ctx, deps, node, vmid, logger)
@@ -1076,5 +1095,90 @@ func cleanupAgentForVM(ctx context.Context, deps Deps, node string, vmid int, lo
 	logger.Debug("delete_vm: calling agent.Remove")
 	if agentErr := deps.Agent.Remove(ctx, node, vmid); agentErr != nil {
 		logger.Warn("delete_vm: agent.Remove returned error (VM already destroyed)", log.Err(agentErr))
+	}
+}
+
+// capturePoolForReap returns the VM's current pool membership for the
+// post-destroy reaper, or "" when the reaper is disabled or the lookup fails.
+// Only runs when the operator opted in (pve.pool_reap_empty); best-effort: a
+// lookup error just means the reaper no-ops after destroy.
+func capturePoolForReap(ctx context.Context, deps Deps, vmid int, logger *log.Logger) string {
+	if deps.Config == nil || !deps.Config.PoolReapEmpty {
+		return ""
+	}
+	reapPool, _, poolErr := pve.FindVMPoolViaCluster(ctx, deps.PVE, vmid)
+	if poolErr != nil {
+		logger.Debug("delete_vm: pre-destroy pool lookup failed (non-fatal; reaper will no-op)", log.Err(poolErr))
+		return ""
+	}
+	return reapPool
+}
+
+// reapEmptyPoolIfManaged deletes poolID when it is empty AND was created by
+// this CPI (provenance comment prefix pve.PoolProvenanceComment), tolerating
+// the two live PVE races this can hit. It is the opt-in delete_vm reaper for
+// pve.pool_reap_empty and is called ONLY from the synchronous (non-fast-path)
+// delete after the destroy task has been awaited, so PVE has already dropped
+// the destroyed VM's pool membership by the time GetPoolComment/DeletePool run.
+//
+// No-ops (zero PVE calls) when:
+//   - the reaper is disabled (deps.Config == nil or !PoolReapEmpty), or
+//   - poolID == "" (the VM was not in any pool, or the pre-destroy lookup
+//     failed and the caller already reset reapPool to ""), or
+//   - deps.PVE.Pools() is nil (test fixtures / wiring gaps that never
+//     configured a pool service).
+//
+// Otherwise:
+//  1. GetPoolComment(poolID): a lookup error or a not-found pool both return
+//     immediately (logged at debug) -- nothing to reap.
+//  2. Comment prefix check: a pool whose comment does not start with
+//     pve.PoolProvenanceComment is an operator's own pool and is NEVER
+//     deleted by the CPI, regardless of emptiness.
+//  3. DeletePool(poolID):
+//     - nil error: the pool was empty and CPI-managed -- reaped, logged Info.
+//     - pve.IsPoolNotEmpty / pve.IsPoolNotFound: PVE returns HTTP 500 + text
+//     for both (never 404 -- IsPoolNotFound is the substring classifier,
+//     not the generic 404-based IsNotFound), covering the two expected
+//     races: another VM joined the pool between destroy and this call, or
+//     a concurrent delete_vm/operator action already removed the pool.
+//     Both are tolerated at debug -- not a failure.
+//     - any other error: logged at Warn. Every branch is non-fatal: the
+//     reaper must never fail delete_vm, which has already destroyed the VM
+//     by the time this runs.
+func reapEmptyPoolIfManaged(ctx context.Context, deps Deps, poolID string, logger *log.Logger) {
+	if deps.Config == nil || !deps.Config.PoolReapEmpty || poolID == "" {
+		return
+	}
+	if deps.PVE == nil || deps.PVE.Pools() == nil {
+		return
+	}
+
+	comment, found, err := deps.PVE.Pools().GetPoolComment(ctx, poolID)
+	if err != nil {
+		logger.Debug("delete_vm: reaper: GetPoolComment failed (non-fatal; not reaping)",
+			log.String("pool", poolID), log.Err(err))
+		return
+	}
+	if !found {
+		logger.Debug("delete_vm: reaper: pool already gone before reap attempt",
+			log.String("pool", poolID))
+		return
+	}
+	if !strings.HasPrefix(comment, pve.PoolProvenanceComment) {
+		logger.Debug("delete_vm: reaper: pool not CPI-managed, not reaping",
+			log.String("pool", poolID), log.String("comment", comment))
+		return
+	}
+
+	deleteErr := deps.PVE.Pools().DeletePool(ctx, poolID)
+	switch {
+	case deleteErr == nil:
+		logger.Info("delete_vm: reaper: reaped empty pool", log.String("pool", poolID))
+	case pve.IsPoolNotEmpty(deleteErr) || pve.IsPoolNotFound(deleteErr):
+		logger.Debug("delete_vm: reaper: pool not reaped -- still has members or already gone (race); tolerated",
+			log.String("pool", poolID), log.Err(deleteErr))
+	default:
+		logger.Warn("delete_vm: reaper: empty-pool reap failed (non-fatal)",
+			log.String("pool", poolID), log.Err(deleteErr))
 	}
 }

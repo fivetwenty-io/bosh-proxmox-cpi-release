@@ -633,12 +633,15 @@ func HandleCreateStemcell(deps Deps) cpi.Handler {
 //     no agent, onboot=0; tag "bosh-stemcell-sha-<sha8>" where sha8 = first 8 chars
 //     of sha256hex; await UPID with StemcellMaxWait.
 //  5. MakeTemplate → freeze VM; await UPID if non-empty.
-//  6. Pool assignment (D config): if deps.Config.StemcellTemplatePool != "", assign
-//     the frozen template VM to that PVE resource pool via AssignVMToPool.
-//     Pool assignment failure is fatal — the operator explicitly requested the pool
-//     and a missing pool means a misconfiguration that must be visible immediately.
-//     The template VMID is still usable if the caller handles the error separately,
-//     but this function returns the error so the operator sees it right away.
+//  6. Pool assignment (D config): if deps.Config.StemcellTemplatePool != "", the pool
+//     is now create-if-missing (pve.EnsurePoolExists, with a "managed by bosh-pve-cpi"
+//     provenance comment — director is not derivable here, so the comment carries no
+//     director suffix) before the frozen template VM is assigned to it via
+//     AssignVMToPool. Both the ensure and the assign are fatal on error — the operator
+//     explicitly requested the pool and a create/assign failure means a
+//     misconfiguration that must be visible immediately. The template VMID is still
+//     usable if the caller handles the error separately, but this function returns the
+//     error so the operator sees it right away.
 //  7. Source retention: if cpiOwnsSource, delete the raw qcow2 at
 //     <storage>:import/<qcow2Filename> via Storage().DeleteVolumeIfExists. Delete
 //     failure is logged as a warning and is not fatal — CID is returned regardless.
@@ -651,7 +654,8 @@ func HandleCreateStemcell(deps Deps) cpi.Handler {
 //   - AllocateWithRetry exhausted → error returned.
 //   - QEMU.Create failure → error returned (cleanup attempted inside AllocateWithRetry retry).
 //   - MakeTemplate failure → error returned (template not safe to use; source NOT deleted).
-//   - AssignVMToPool failure (when StemcellTemplatePool != "") → error returned (fatal misconfiguration).
+//   - EnsurePoolExists or AssignVMToPool failure (when StemcellTemplatePool != "") →
+//     error returned (fatal misconfiguration).
 //   - qcow2 delete failure (cpiOwnsSource=true) → warning logged, vmid still returned.
 //
 //nolint:gocognit // Multi-step allocation+freeze+cleanup; phases are load-bearing and cannot be further decomposed without losing clarity.
@@ -792,19 +796,34 @@ func ensureTemplateVM(
 		}
 	}
 
-	// Step 6: Pool assignment — assign the frozen template to the configured
-	// PVE resource pool when StemcellTemplatePool is set. Pool assignment uses
-	// PUT /pools/{poolid} with vms=[vmid] via pve.AssignVMToPool.
+	// Step 6: Pool assignment — create-if-missing the configured PVE resource
+	// pool, then assign the frozen template to it, when StemcellTemplatePool is
+	// set. The pool is no longer assign-only: pve.EnsurePoolExists creates it
+	// with a "managed by bosh-pve-cpi" provenance comment (create_stemcell has
+	// no env.bosh, so the director is not derivable — the comment carries no
+	// director suffix here, unlike create_vm's per-director comment) and
+	// tolerates the pool already existing (idempotent). AssignVMToPool remains
+	// the assignment mechanism afterward: PVE has no create+assign-in-one-call
+	// for an EXISTING template VM — the one-shot `pool=` create param only
+	// applies at qemu-create, and the template VM already exists by this point
+	// (it was created and frozen above). Assignment uses PUT /pools/{poolid}
+	// with vms=[vmid] via pve.AssignVMToPool.
 	//
-	// Failure is fatal: the operator explicitly named a pool; a missing pool or
-	// auth failure indicates misconfiguration that must surface immediately rather
-	// than leaving a template silently outside the expected pool. The template VM
-	// was already frozen and is usable, but returning an error ensures the CPI
-	// reports a clear failure so the operator can fix the config and retry (the
-	// idempotency check in step 2 will reuse the existing template on the next call).
-	// Skipped when we lost the race: the survivor was already pool-assigned by
-	// the call that created it, and our template is being deleted.
+	// Both EnsurePoolExists and AssignVMToPool failures are fatal: the operator
+	// explicitly named a pool; a create/assign failure indicates misconfiguration
+	// that must surface immediately rather than leaving a template silently
+	// outside the expected pool. The template VM was already frozen and is
+	// usable, but returning an error ensures the CPI reports a clear failure so
+	// the operator can fix the config and retry (the idempotency check in step 2
+	// will reuse the existing template on the next call).
+	// Skipped when we lost the race: the survivor was already pool-ensured and
+	// assigned by the call that created it, and our template is being deleted.
 	if !lostRace && deps.Config.StemcellTemplatePool != "" {
+		if ensureErr := pve.EnsurePoolExists(ctx, deps.PVE, deps.Config.StemcellTemplatePool,
+			pve.PoolProvenance("")); ensureErr != nil {
+			return 0, fmt.Errorf("ensureTemplateVM: ensure pool %q exists for template vmid=%d: %w",
+				deps.Config.StemcellTemplatePool, allocatedVMID, ensureErr)
+		}
 		if poolErr := pve.AssignVMToPool(ctx, deps.PVE, deps.Config.StemcellTemplatePool, allocatedVMID); poolErr != nil {
 			return 0, fmt.Errorf("ensureTemplateVM: assign template vmid=%d to pool %q: %w",
 				allocatedVMID, deps.Config.StemcellTemplatePool, poolErr)

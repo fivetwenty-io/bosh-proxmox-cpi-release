@@ -297,18 +297,38 @@ properties:
     default: 0
   pve.stemcell_template_pool:
     description: |
-      Optional PVE resource pool name to assign to newly created template VMs.
-      When empty (default), templates are not assigned to any pool. The PVE API
-      validates pool existence at assignment time; an invalid pool name causes
-      create_stemcell to return an error. No effect when absent.
-    default: ""
+      PVE resource pool name assigned to newly created template VMs. The CPI
+      creates this pool if it does not already exist, tagging it with a
+      "managed by bosh-pve-cpi" provenance comment, before the first
+      template VM is assigned to it. Default "bosh-templates"
+      (create-if-missing); set explicitly to "" to opt out entirely — no
+      pool assignment and no pool creation.
+
+      Must not equal pve.vm_pool (validated at config load): pools are the
+      CPI's ACL boundary, and sharing one pool would let a create_vm-scoped
+      ACL also touch stemcell templates. Must not start with "bosh-lock-"
+      (reserved for the cluster-lock sentinel pool namespace, see
+      pve.cluster_lock_mode) and must be a flat PVE poolid (no "/"); the CPI
+      never creates nested pools.
+    default: "bosh-templates"
   pve.vm_pool:
     description: |
-      Optional PVE resource pool name assigned to every VM create_vm
-      provisions, on both the import path and the clone path (both PVE's
-      create and clone endpoints accept "pool" directly). When empty
-      (default), no pool is assigned — byte-identical to every release
-      before this property existed.
+      PVE resource pool name assigned to every VM create_vm provisions, on
+      both the import path and the clone path (both PVE's create and clone
+      endpoints accept "pool" directly). The CPI creates the resolved pool
+      if it does not already exist, tagging it with a "managed by
+      bosh-pve-cpi" provenance comment, before the first VM lands in it.
+      Default "bosh" (create-if-missing); set explicitly to "" to opt this
+      global layer out entirely — a higher-precedence layer still
+      applies if set, and when every layer resolves empty no pool is
+      assigned, byte-identical to every release before this property
+      existed.
+
+      Resolution precedence (highest wins, first non-empty selected):
+      call-level cloud_properties.pool > vm_type profile cloud_properties.pool
+      > pve.vm_pool_template (rendered) > this global value. See
+      pve.vm_pool_template below for the template layer's four supported
+      variables.
 
       Setting this lets an operator scope the CPI's VM.* ACL grants to
       /pool/<name> instead of cluster-wide /vms, shrinking the blast radius
@@ -324,16 +344,40 @@ properties:
       VM.Clone on the *template's* own vmid/pool, which is not automatically
       covered).
 
-      The pool itself is NOT created by the CPI — unlike the cluster-lock
-      sentinel pools or stemcell_template_pool, which the CPI creates
-      on demand. Create the pool once as part of cluster setup before
-      deploying with this set; PVE rejects create_vm with a pool-not-found
-      error otherwise.
-
       Must not equal stemcell_template_pool, and must not start with
       "bosh-lock-" (reserved for the cluster-lock sentinel pool namespace,
-      see pve.cluster_lock_mode) — both are rejected at config load.
+      see pve.cluster_lock_mode) — both are rejected at config load. Must be
+      a flat PVE poolid (no "/"); the CPI never creates nested pools.
+    default: "bosh"
+  pve.vm_pool_template:
+    description: |
+      Optional director-level pool-name template rendered at create_vm time
+      when neither the call-level nor the vm_type-level cloud_properties.pool
+      is set (precedence position 3, above the pve.vm_pool global default;
+      see pve.vm_pool for the full pipeline). Supports four variables:
+      "{prefix}" (pve.vm_prefix), "{director}", "{deployment}", and
+      "{instance_group}"; any other "{...}" token is rejected at config
+      load. The rendered name is sanitized (repeated separators collapsed to
+      one, leading/trailing "-" trimmed); a render that collapses to ""
+      falls through to pve.vm_pool. Must not contain "/" (flat names only —
+      the CPI never creates nested pools); the same PVE poolid charset rules
+      that apply to vm_pool also apply to the rendered result. Empty
+      (default) disables this layer entirely, so resolution falls straight
+      from call/vm_type to pve.vm_pool.
     default: ""
+  pve.pool_reap_empty:
+    description: |
+      When true, delete_vm deletes a CPI-managed pool (tagged with the
+      "managed by bosh-pve-cpi" provenance comment) once the destroyed VM's
+      pool membership, captured before destroy, is reported empty by PVE.
+      An operator-created pool without that provenance comment is never
+      reaped, and a pool that is still non-empty or already gone (a race
+      with another creator) is tolerated silently, never failing delete_vm.
+      Only the main delete_vm path reaps; the fast-path delete does not.
+      Requires the CPI's PVE token to hold Pool.Allocate on the pool being
+      reaped. Default false: empty pools accumulate and are left for the
+      operator to manage.
+    default: false
   pve.stemcell_template_node:
     description: |
       Optional PVE node on which template VMs are created. When empty (default),

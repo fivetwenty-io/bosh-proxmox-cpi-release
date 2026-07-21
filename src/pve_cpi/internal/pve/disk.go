@@ -488,3 +488,53 @@ func FindVMViaCluster(ctx context.Context, c Client, vmid int) (node, tags strin
 	}
 	return "", "", false, nil
 }
+
+// FindVMPoolViaCluster returns the resource-pool membership of vmid from the
+// same /cluster/resources?type=vm scan FindVMViaCluster performs, decoding
+// the row's "pool" field instead of node/tags. PVE only populates "pool" on a
+// resource-list row for a VM that is a member of a pool; a VM outside any
+// pool omits the field entirely, so an empty string is a normal, expected
+// result (not an error).
+//
+// Returns (poolID, true, nil) when the vmid row is found (poolID is "" when
+// the row has no pool membership), ("", false, nil) when the vmid is not
+// present in the cluster scan (already deleted or never existed), and
+// ("", false, err) on transport failure.
+//
+// Kept as a dedicated function -- rather than folding into FindVMViaCluster --
+// so that function's signature and every existing caller stay untouched; this
+// extra field decode only runs when a caller (the delete_vm reaper) opts in.
+func FindVMPoolViaCluster(ctx context.Context, c Client, vmid int) (pool string, found bool, err error) {
+	// A nil Cluster service is the expected case in unit-test mocks that
+	// don't wire one: report not-found so callers keep their fallback
+	// (reaper simply no-ops).
+	if c == nil || c.Cluster() == nil || vmid <= 0 {
+		return "", false, nil
+	}
+	typ := "vm"
+	var resp *sdkcluster.ListResourcesResponse
+	listErr := RetryOnTransient(ctx, nil, "find_vm_pool_via_cluster_list", 0, func() error {
+		var inner error
+		resp, inner = c.Cluster().ListResources(ctx, &sdkcluster.ListResourcesParams{Type: &typ})
+		return inner
+	})
+	if listErr != nil {
+		return "", false, cpierrors.Wrap(listErr, "findVMPoolViaCluster: list cluster vms")
+	}
+	if resp == nil {
+		return "", false, nil
+	}
+	for _, raw := range *resp {
+		var entry struct {
+			VMID int64  `json:"vmid"`
+			Pool string `json:"pool"`
+		}
+		if jsonErr := json.Unmarshal(raw, &entry); jsonErr != nil {
+			continue
+		}
+		if int(entry.VMID) == vmid {
+			return entry.Pool, true, nil
+		}
+	}
+	return "", false, nil
+}

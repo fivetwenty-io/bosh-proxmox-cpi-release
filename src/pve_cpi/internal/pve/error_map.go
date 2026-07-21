@@ -606,6 +606,64 @@ func WrapVMConfigLocked(err error, vmid int, node string) error {
 			vmid, node, lockType, vmid, node, err.Error()))
 }
 
+// IsPoolNotEmpty reports whether err signals that PVE refused to delete a
+// resource pool because it still has member VMs/containers. Live shape
+// (PVE 9.2.4, always HTTP 500 + text, never 409/404):
+//
+//	pool 'bosh' is not empty (contains VM 99098)
+//
+// Matched with a "pool" adjacency guard (both substrings must be present) so
+// an unrelated "is not empty" message from another PVE subsystem is not
+// misclassified. delete_vm's empty-pool reaper treats this as a benign race
+// (a VM landed in the pool between the emptiness check and the delete) and
+// simply skips the reap rather than failing the destroy.
+//
+// nil → false.
+func IsPoolNotEmpty(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "pool") && strings.Contains(msg, "is not empty")
+}
+
+// IsPoolMoveConflict reports whether err signals that PVE refused to add a VM
+// to a resource pool because it already belongs to a different pool and the
+// request did not set allow-move. Live shape (PVE 9.2.4, HTTP 500 + text):
+//
+//	VM 99098 belongs already to pool 'p4' and 'allow-move' is not set
+//
+// nil → false.
+func IsPoolMoveConflict(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "belongs already to pool")
+}
+
+// IsPoolNotFound reports whether err signals that a referenced resource pool
+// does not exist. Live shape (PVE 9.2.4, HTTP 500 + text, never 404):
+//
+//	delete pool failed: pool 'x' does not exist
+//
+// This is deliberately distinct from the generic 404-based IsNotFound: PVE
+// pool errors are always surfaced as 500 with a text body, so IsNotFound
+// never matches them. Callers needing an already-gone signal for a pool
+// (e.g. the delete_vm empty-pool reaper's tolerate-already-deleted branch)
+// must use this classifier instead. Matched with a "pool" adjacency guard so
+// an unrelated "does not exist" message (e.g. "storage does not exist") is
+// not misclassified.
+//
+// nil → false.
+func IsPoolNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "pool") && strings.Contains(msg, "does not exist")
+}
+
 // IsPVEPushback reports whether err signals PVE server-side rate-limiting or
 // worker-pool exhaustion. Two signal surfaces are covered:
 //

@@ -1,0 +1,170 @@
+package pve_test
+
+import (
+	"context"
+	"errors"
+	"testing"
+
+	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cloudinit"
+	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cluster"
+	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/clusterstorage"
+	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/nodes"
+	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/qemu"
+	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/storage"
+	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/tasks"
+
+	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
+)
+
+// ---------------------------------------------------------------------------
+// fakes
+// ---------------------------------------------------------------------------
+
+// fakePoolServiceForEnsure implements pve.PoolService, wiring only CreatePool
+// (the only method EnsurePoolExists calls); every other method panics on an
+// unexpected call so a test that never exercises them stays honest about it.
+type fakePoolServiceForEnsure struct {
+	createPoolFn func(ctx context.Context, poolID, comment string) error
+	createCalls  int
+	lastPoolID   string
+	lastComment  string
+}
+
+func (f *fakePoolServiceForEnsure) AddVM(_ context.Context, _ string, _ int64) error {
+	panic("fakePoolServiceForEnsure: AddVM unexpected call")
+}
+
+func (f *fakePoolServiceForEnsure) CreatePool(ctx context.Context, poolID, comment string) error {
+	f.createCalls++
+	f.lastPoolID = poolID
+	f.lastComment = comment
+	if f.createPoolFn != nil {
+		return f.createPoolFn(ctx, poolID, comment)
+	}
+	return nil
+}
+
+func (f *fakePoolServiceForEnsure) DeletePool(_ context.Context, _ string) error {
+	panic("fakePoolServiceForEnsure: DeletePool unexpected call")
+}
+
+func (f *fakePoolServiceForEnsure) GetPoolComment(_ context.Context, _ string) (string, bool, error) {
+	panic("fakePoolServiceForEnsure: GetPoolComment unexpected call")
+}
+
+var _ pve.PoolService = (*fakePoolServiceForEnsure)(nil)
+
+// fakeEnsureClient implements pve.Client, exposing only a configurable Pools()
+// return value. The other service accessors are never called by
+// EnsurePoolExists and return nil.
+type fakeEnsureClient struct {
+	pools pve.PoolService
+}
+
+func (c *fakeEnsureClient) QEMU() qemu.Service                     { return nil }
+func (c *fakeEnsureClient) Storage() storage.Service               { return nil }
+func (c *fakeEnsureClient) CloudInit() cloudinit.Service           { return nil }
+func (c *fakeEnsureClient) Tasks() tasks.Service                   { return nil }
+func (c *fakeEnsureClient) Nodes() nodes.Service                   { return nil }
+func (c *fakeEnsureClient) Cluster() cluster.Service               { return nil }
+func (c *fakeEnsureClient) ClusterStorage() clusterstorage.Service { return nil }
+func (c *fakeEnsureClient) Pools() pve.PoolService                 { return c.pools }
+
+var _ pve.Client = (*fakeEnsureClient)(nil)
+
+// ---------------------------------------------------------------------------
+// EnsurePoolExists
+// ---------------------------------------------------------------------------
+
+func TestEnsurePoolExists_CreatesWhenAbsent(t *testing.T) {
+	t.Parallel()
+
+	fp := &fakePoolServiceForEnsure{
+		createPoolFn: func(_ context.Context, _, _ string) error { return nil },
+	}
+	client := &fakeEnsureClient{pools: fp}
+
+	err := pve.EnsurePoolExists(context.Background(), client, "bosh", pve.PoolProvenanceComment)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if fp.createCalls != 1 {
+		t.Fatalf("CreatePool calls = %d; want 1", fp.createCalls)
+	}
+	if fp.lastPoolID != "bosh" {
+		t.Errorf("CreatePool poolID = %q; want %q", fp.lastPoolID, "bosh")
+	}
+	if fp.lastComment != pve.PoolProvenanceComment {
+		t.Errorf("CreatePool comment = %q; want %q", fp.lastComment, pve.PoolProvenanceComment)
+	}
+}
+
+func TestEnsurePoolExists_ToleratesDuplicate500(t *testing.T) {
+	t.Parallel()
+
+	// Live PVE 9.2.4 shape: HTTP 500 wrapping perl die() text, never 409.
+	dupErr := errors.New("create pool failed: pool 'bosh' already exists\n") //nolint:revive // verbatim live PVE error text incl. trailing newline
+	fp := &fakePoolServiceForEnsure{
+		createPoolFn: func(_ context.Context, _, _ string) error { return dupErr },
+	}
+	client := &fakeEnsureClient{pools: fp}
+
+	err := pve.EnsurePoolExists(context.Background(), client, "bosh", "")
+	if err != nil {
+		t.Fatalf("duplicate-pool creation should be tolerated as success; got %v", err)
+	}
+	if fp.createCalls != 1 {
+		t.Fatalf("CreatePool calls = %d; want 1", fp.createCalls)
+	}
+}
+
+func TestEnsurePoolExists_PropagatesOtherError(t *testing.T) {
+	t.Parallel()
+
+	permErr := makeAPIErr(403, "permission denied - insufficient privileges")
+	fp := &fakePoolServiceForEnsure{
+		createPoolFn: func(_ context.Context, _, _ string) error { return permErr },
+	}
+	client := &fakeEnsureClient{pools: fp}
+
+	err := pve.EnsurePoolExists(context.Background(), client, "bosh", "")
+	if err == nil {
+		t.Fatal("expected error to propagate; got nil")
+	}
+}
+
+func TestEnsurePoolExists_NilPoolService(t *testing.T) {
+	t.Parallel()
+
+	client := &fakeEnsureClient{pools: nil}
+
+	err := pve.EnsurePoolExists(context.Background(), client, "bosh", "")
+	if err == nil {
+		t.Fatal("expected error for a client with no pool service; got nil (and no panic, which is the point)")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// PoolProvenance
+// ---------------------------------------------------------------------------
+
+func TestPoolProvenance_WithAndWithoutDirector(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name     string
+		director string
+		want     string
+	}{
+		{"no director", "", pve.PoolProvenanceComment},
+		{"with director", "bosh-lite", pve.PoolProvenanceComment + " (director bosh-lite)"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := pve.PoolProvenance(tc.director); got != tc.want {
+				t.Errorf("PoolProvenance(%q) = %q; want %q", tc.director, got, tc.want)
+			}
+		})
+	}
+}

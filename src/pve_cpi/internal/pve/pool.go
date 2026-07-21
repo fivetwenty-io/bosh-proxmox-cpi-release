@@ -1,0 +1,75 @@
+// Resource pool provisioning helpers shared by create_vm and create_stemcell:
+// idempotent create-if-missing plus a standard provenance comment marking
+// pools the CPI created (vs. an operator's pre-existing pool), so the
+// delete_vm reaper can tell the two apart before ever deleting a pool.
+package pve
+
+import (
+	"context"
+
+	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
+)
+
+// PoolProvenanceComment is the comment the CPI writes on every resource pool
+// it creates. delete_vm's opt-in empty-pool reaper (see
+// reapEmptyPoolIfManaged in internal/cpi/handlers/delete_vm.go) checks a
+// pool's comment for this prefix before ever deleting it, so an operator's
+// pre-existing pool is never touched.
+const PoolProvenanceComment = "managed by bosh-pve-cpi"
+
+// PoolProvenance builds the comment recorded on a CPI-created pool. When
+// director is non-empty, it is appended in a parenthetical so multiple BOSH
+// directors sharing one PVE cluster can be told apart in the PVE UI/API; an
+// empty director yields the bare PoolProvenanceComment.
+func PoolProvenance(director string) string {
+	if director == "" {
+		return PoolProvenanceComment
+	}
+	return PoolProvenanceComment + " (director " + director + ")"
+}
+
+// EnsurePoolExists creates the PVE resource pool poolID with comment if it
+// does not already exist, tolerating a concurrent/prior creation of the same
+// pool. It is the single create-if-missing entry point used by both the
+// create_vm resolved-pool path and the create_stemcell template-pool path.
+//
+// Inputs: ctx must be non-nil; c must be non-nil and its Pools() must return
+// a non-nil PoolService (several call/test paths construct a Client without
+// a pool service — see the nil-Pools guard below); poolID must be non-empty.
+// comment may be empty (sent to PVE as-is by PoolService.CreatePool).
+//
+// Failure modes:
+//   - ctx == nil, c == nil, or poolID == "": non-retriable CloudError, no PVE
+//     call attempted.
+//   - c.Pools() == nil: non-retriable CloudError naming the missing service,
+//     no PVE call attempted (defends test/wiring gaps rather than panicking
+//     on a nil-interface method call).
+//   - CreatePool succeeds (err == nil): pool now exists, return nil.
+//   - CreatePool fails with the live PVE "pool already exists" 500+text shape
+//     (isPoolAlreadyExists, cluster_lock.go): treated as success — the pool
+//     existing is the desired end state, whether this call or a concurrent
+//     one created it.
+//   - Any other CreatePool error (auth failure, malformed poolID, quota,
+//     transient transport fault, ...): wrapped via WrapError and returned so
+//     callers see the correct retriable/non-retriable classification.
+func EnsurePoolExists(ctx context.Context, c Client, poolID, comment string) error {
+	if ctx == nil {
+		return cpierrors.Cloud("EnsurePoolExists: ctx must not be nil")
+	}
+	if c == nil {
+		return cpierrors.Cloud("EnsurePoolExists: PVE client must not be nil")
+	}
+	if poolID == "" {
+		return cpierrors.Cloud("EnsurePoolExists: poolID must not be empty")
+	}
+	pools := c.Pools()
+	if pools == nil {
+		return cpierrors.Cloud("EnsurePoolExists: PVE client has no pool service")
+	}
+
+	err := pools.CreatePool(ctx, poolID, comment)
+	if err == nil || isPoolAlreadyExists(err) {
+		return nil
+	}
+	return cpierrors.Wrap(WrapError(err), "EnsurePoolExists: create pool "+poolID)
+}

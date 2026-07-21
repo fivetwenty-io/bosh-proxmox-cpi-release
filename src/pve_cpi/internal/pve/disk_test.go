@@ -1080,3 +1080,95 @@ func TestFindUnusedDiskEntries(t *testing.T) {
 		})
 	}
 }
+
+// ---------------------------------------------------------------------------
+// FindVMPoolViaCluster
+// ---------------------------------------------------------------------------
+
+// TestFindVMPoolViaCluster_ReturnsPool verifies the member, non-member, and
+// absent-vmid cases from a single /cluster/resources scan.
+func TestFindVMPoolViaCluster_ReturnsPool(t *testing.T) {
+	t.Parallel()
+
+	c := &diskClusterClient{
+		clusterSvc: &diskFakeCluster{
+			listFn: func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+				return diskClusterResp(
+					map[string]any{"vmid": int64(101), "node": "pve-01", "pool": "bosh"},
+					map[string]any{"vmid": int64(102), "node": "pve-01"}, // no pool field
+				), nil
+			},
+		},
+	}
+
+	pool, found, err := pve.FindVMPoolViaCluster(context.Background(), c, 101)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !found {
+		t.Fatal("expected found=true for a row present in the scan")
+	}
+	if pool != "bosh" {
+		t.Errorf("pool: want %q, got %q", "bosh", pool)
+	}
+
+	// Row present but without a pool field: found=true, pool="".
+	pool, found, err = pve.FindVMPoolViaCluster(context.Background(), c, 102)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !found {
+		t.Fatal("expected found=true for a row present without pool membership")
+	}
+	if pool != "" {
+		t.Errorf("pool: want empty string for non-member VM, got %q", pool)
+	}
+
+	// vmid absent from the scan entirely: found=false, pool="".
+	pool, found, err = pve.FindVMPoolViaCluster(context.Background(), c, 999)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if found {
+		t.Fatal("expected found=false for a vmid absent from the scan")
+	}
+	if pool != "" {
+		t.Errorf("pool: want empty string when not found, got %q", pool)
+	}
+}
+
+// TestFindVMPoolViaCluster_NilClusterService verifies the nil-Cluster-service
+// guard (unit-test mocks that don't wire a cluster service) reports
+// not-found rather than panicking.
+func TestFindVMPoolViaCluster_NilClusterService(t *testing.T) {
+	t.Parallel()
+	c := &diskClusterClient{clusterSvc: nil}
+	pool, found, err := pve.FindVMPoolViaCluster(context.Background(), c, 101)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if found || pool != "" {
+		t.Errorf("expected (\"\", false, nil) with nil cluster service, got (%q, %v, %v)", pool, found, err)
+	}
+}
+
+// TestFindVMPoolViaCluster_TransportError verifies a permanent ListResources
+// failure propagates as an error rather than being swallowed into a false
+// not-found.
+func TestFindVMPoolViaCluster_TransportError(t *testing.T) {
+	t.Parallel()
+	c := &diskClusterClient{
+		clusterSvc: &diskFakeCluster{
+			listFn: func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+				return nil, errors.New("boom: permanent failure")
+			},
+		},
+	}
+	_, found, err := pve.FindVMPoolViaCluster(context.Background(), c, 101)
+	if err == nil {
+		t.Fatal("expected error on transport failure")
+	}
+	if found {
+		t.Error("expected found=false on error")
+	}
+}

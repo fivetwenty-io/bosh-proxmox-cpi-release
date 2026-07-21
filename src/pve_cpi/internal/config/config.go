@@ -331,30 +331,66 @@ type CPIConfig struct {
 	// validate-only-when-set; omit from ERB when zero.
 	StemcellTemplateVMIDRangeEnd int `json:"stemcell_template_vmid_range_end,omitempty"`
 
-	// StemcellTemplatePool is an optional PVE resource pool name to assign
+	// StemcellTemplatePool is an optional PVE resource pool name assigned to
 	// newly created template VMs. Empty (default) means no pool assignment.
-	// validate-only-when-set: any non-empty string is accepted; PVE validates
-	// pool existence at assignment time.
+	// Create-if-missing: the CPI creates the pool before the first template
+	// VM is assigned to it, tagging it with a "managed by bosh-pve-cpi"
+	// provenance comment (see VMPool doc for the shared rationale and the
+	// distinct-from-VMPool ACL boundary this preserves).
+	// validate-only-when-set: must not equal VMPool (see validateVMPool),
+	// must not contain '/', must match the PVE poolid charset, and must not
+	// carry the cluster-lock sentinel namespace prefix ("bosh-lock-") — see
+	// validateStemcellTemplatePool. Any other non-empty string is accepted.
 	StemcellTemplatePool string `json:"stemcell_template_pool,omitempty"`
 
 	// VMPool is an optional PVE resource pool name assigned to every VM
 	// create_vm provisions, on both the import path (CreateQemuParams.Pool)
-	// and the clone path (CreateQemuCloneParams.Pool). Empty (default) means
-	// no pool assignment — byte-identical to every release before this
-	// property existed. Setting it lets an operator scope the CPI's VM.*
-	// ACL grants to /pool/<name> instead of cluster-wide /vms, shrinking the
-	// blast radius of a compromised CPI token on a shared cluster — see
-	// docs/pve-api-permissions.md for the reduced ACL table. The pool itself
-	// is NOT created by the CPI (unlike the cluster-lock sentinel pools or
-	// StemcellTemplatePool's own on-demand creation); it must already exist
-	// before create_vm is called, or PVE rejects the create/clone with a
-	// pool-not-found error.
+	// and the clone path (CreateQemuCloneParams.Pool), and is subject to the
+	// call > vm_type > vm_pool_template > global precedence pipeline (see
+	// resolvePoolName in internal/cpi/handlers). Empty (default) means no
+	// pool assignment — byte-identical to every release before this property
+	// existed. Setting it lets an operator scope the CPI's VM.* ACL grants to
+	// /pool/<name> instead of cluster-wide /vms, shrinking the blast radius
+	// of a compromised CPI token on a shared cluster — see
+	// docs/pve-api-permissions.md for the reduced ACL table.
 	//
-	// validate-only-when-set: must not equal StemcellTemplatePool and must
-	// not carry the cluster-lock sentinel namespace prefix ("bosh-lock-") —
-	// see validateVMPool. Any other non-empty string is accepted; PVE
-	// validates pool existence itself at create/clone time.
+	// Both VMPool and StemcellTemplatePool are now create-if-missing: the CPI
+	// creates the resolved pool before the first VM or template lands in it,
+	// tagging it with a "managed by bosh-pve-cpi" provenance comment. Their
+	// spec/ERB defaults are distinct ("bosh" and "bosh-templates"
+	// respectively) so the ACL boundary between workload VMs and shared
+	// stemcell templates holds even for an operator who sets nothing;
+	// setting either to "" explicitly opts that pool back out (no
+	// assignment, no auto-creation).
+	//
+	// validate-only-when-set: must not equal StemcellTemplatePool, must not
+	// contain '/', must match the PVE poolid charset, and must not carry the
+	// cluster-lock sentinel namespace prefix ("bosh-lock-") — see
+	// validateVMPool. Any other non-empty string is accepted.
 	VMPool string `json:"vm_pool,omitempty"`
+
+	// VMPoolTemplate is a director-level pool-name template rendered at
+	// create_vm time when neither the call-level nor the vm_type-level
+	// cloud_properties.pool is set (precedence position 3, above the global
+	// VMPool default). Supported variables: "{prefix}" (VMPrefix),
+	// "{director}", "{deployment}", and "{instance_group}"; any other
+	// "{...}" token is a validation error. The rendered name is sanitized
+	// (repeated separators collapsed, leading/trailing '-' trimmed) and must
+	// still pass the same flat-name and charset rules as VMPool; a render
+	// that collapses to "" falls through to the global VMPool default.
+	// Empty (default) disables this layer entirely.
+	// validate-only-when-set; omit from ERB when empty.
+	VMPoolTemplate string `json:"vm_pool_template,omitempty"`
+
+	// PoolReapEmpty opts in to an empty-pool reaper at delete_vm: when the
+	// destroyed VM's pool membership (captured before destroy) is a
+	// CPI-managed pool (provenance comment "managed by bosh-pve-cpi") that
+	// PVE reports empty after the destroy, the CPI deletes it. An
+	// operator-created pool without the provenance comment is never reaped.
+	// Default false — pools accumulate and are left for the operator to
+	// manage. No validation; any bool value is accepted.
+	// omit from ERB when false.
+	PoolReapEmpty bool `json:"pool_reap_empty,omitempty"`
 
 	// StemcellTemplateNode is the PVE node on which template VMs are created.
 	// Empty (default) falls back to Node at the callsite. Useful when
@@ -3105,6 +3141,8 @@ func (c *CPIConfig) ValidateWithLogger(_ *log.Logger) error {
 	c.validateDiskPerformance(&errs)
 	c.validateStemcell(&errs)
 	c.validateVMPool(&errs)
+	c.validateStemcellTemplatePool(&errs)
+	c.validateVMPoolTemplate(&errs)
 	// Cross-field strict checks. No raw bytes needed; struct fields are read
 	// directly. Appended after all other validators so existing error order is
 	// preserved and strict errors group at the end.
@@ -4127,11 +4165,43 @@ var stemcellDirectorIDRe = regexp.MustCompile(`[A-Za-z0-9-]`)
 // with both copies documented as namespacing the same reserved space.
 const clusterLockPoolPrefix = "bosh-lock-"
 
+// poolIDCharsetRe matches the PVE poolid charset: letters, digits, '.', '_',
+// '-'. Used to validate VMPool, StemcellTemplatePool, and (token-substituted)
+// VMPoolTemplate — the CPI never fabricates a name PVE itself would reject.
+var poolIDCharsetRe = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
+
+// validateFlatPoolName appends at most one error when name (the configured
+// value of the given field, e.g. "vm_pool") is not flat (contains '/') or
+// does not match the PVE poolid charset. A '/' already fails the charset
+// check too, so the slash case is checked first to avoid a redundant second
+// error for the same string. Shared by validateVMPool and
+// validateStemcellTemplatePool so both fields report identically worded
+// errors; callers own their own field-specific checks (equality,
+// bosh-lock- prefix).
+func validateFlatPoolName(field, name string, errs *[]string) {
+	switch {
+	case strings.Contains(name, "/"):
+		*errs = append(*errs, fmt.Sprintf(
+			"%s must not contain '/' (got %q); the CPI only manages flat pool names, not nested ids",
+			field, name,
+		))
+	case !poolIDCharsetRe.MatchString(name):
+		*errs = append(*errs, fmt.Sprintf(
+			"%s contains characters invalid for a PVE poolid (allowed: letters, digits, '.', '_', '-'), got %q",
+			field, name,
+		))
+	}
+}
+
 // validateVMPool rejects a VMPool value that collides with a pool namespace
-// the CPI itself already owns:
+// the CPI itself already owns, or that cannot be a valid flat PVE poolid:
 //   - StemcellTemplatePool: assigning template VMs and regular VMs to the
 //     same pool would let a create_vm-scoped ACL also touch stemcell
 //     templates (and vice versa), defeating the point of a dedicated pool.
+//     This equality check lives solely here — validateStemcellTemplatePool
+//     does not repeat it — so the collision is reported exactly once.
+//   - A '/' or a poolid-charset violation: the CPI only creates and assigns
+//     flat pools (see resolvePoolName in internal/cpi/handlers).
 //   - The cluster-lock sentinel namespace ("bosh-lock-" prefix, see
 //     internal/pve/cluster_lock.go): a VM pool inside that namespace could
 //     collide with a dynamically-named sentinel pool the CPI creates and
@@ -4149,11 +4219,76 @@ func (c *CPIConfig) validateVMPool(errs *[]string) {
 			c.VMPool,
 		))
 	}
+	validateFlatPoolName("vm_pool", c.VMPool, errs)
 	if strings.HasPrefix(c.VMPool, clusterLockPoolPrefix) {
 		*errs = append(*errs, fmt.Sprintf(
 			"vm_pool must not start with %q (reserved for cluster-lock sentinel pools), got %q",
 			clusterLockPoolPrefix, c.VMPool,
 		))
+	}
+}
+
+// validateStemcellTemplatePool rejects a StemcellTemplatePool value that
+// cannot be a valid flat PVE poolid, or that collides with the cluster-lock
+// sentinel namespace. It deliberately does NOT check equality against
+// VMPool — that rule lives solely in validateVMPool (see its doc comment) —
+// so a vm_pool/stemcell_template_pool collision is reported exactly once
+// regardless of which field a config sets first.
+//
+// Skipped entirely when StemcellTemplatePool is empty (validate-only-when-set).
+func (c *CPIConfig) validateStemcellTemplatePool(errs *[]string) {
+	if c.StemcellTemplatePool == "" {
+		return
+	}
+	validateFlatPoolName("stemcell_template_pool", c.StemcellTemplatePool, errs)
+	if strings.HasPrefix(c.StemcellTemplatePool, clusterLockPoolPrefix) {
+		*errs = append(*errs, fmt.Sprintf(
+			"stemcell_template_pool must not start with %q (reserved for cluster-lock sentinel pools), got %q",
+			clusterLockPoolPrefix, c.StemcellTemplatePool,
+		))
+	}
+}
+
+// poolTemplateTokenRe matches every "{...}" token in a VMPoolTemplate string
+// so validateVMPoolTemplate can check each one against the allowed variable
+// set.
+var poolTemplateTokenRe = regexp.MustCompile(`\{[^{}]*\}`)
+
+// allowedPoolTemplateTokens is the set of "{...}" variables resolvePoolName's
+// renderPoolTemplate (internal/cpi/handlers/pool_resolver.go) knows how to
+// substitute. Keep in sync with that function's substitution list.
+var allowedPoolTemplateTokens = map[string]bool{
+	"{prefix}":         true,
+	"{director}":       true,
+	"{deployment}":     true,
+	"{instance_group}": true,
+}
+
+// validateVMPoolTemplate rejects a VMPoolTemplate containing an unrecognized
+// "{...}" token, or a literal '/'. A template that renders a '/' can only
+// ever produce a nested pool id, which the CPI refuses to create — flat
+// names only, mirroring the VMPool and StemcellTemplatePool rules.
+//
+// Skipped entirely when VMPoolTemplate is empty (validate-only-when-set).
+func (c *CPIConfig) validateVMPoolTemplate(errs *[]string) {
+	if c.VMPoolTemplate == "" {
+		return
+	}
+	if strings.Contains(c.VMPoolTemplate, "/") {
+		*errs = append(*errs, fmt.Sprintf(
+			"vm_pool_template must not contain '/' (got %q); a rendered '/' can only produce a nested pool id, "+
+				"which the CPI refuses to create",
+			c.VMPoolTemplate,
+		))
+	}
+	for _, tok := range poolTemplateTokenRe.FindAllString(c.VMPoolTemplate, -1) {
+		if !allowedPoolTemplateTokens[tok] {
+			*errs = append(*errs, fmt.Sprintf(
+				"vm_pool_template contains unknown variable %q in %q; allowed variables are "+
+					"{prefix}, {director}, {deployment}, {instance_group}",
+				tok, c.VMPoolTemplate,
+			))
+		}
 	}
 }
 

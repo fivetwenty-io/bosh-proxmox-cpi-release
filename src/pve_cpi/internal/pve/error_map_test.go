@@ -1305,3 +1305,98 @@ func TestIsVMRunningDestroyFailure_Nil(t *testing.T) {
 		t.Error("nil error should not match")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// IsPoolNotEmpty / IsPoolMoveConflict / IsPoolNotFound
+// ---------------------------------------------------------------------------
+
+func TestIsPoolNotEmpty_LiveText(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		msg  string
+		want bool
+	}{
+		{"live text", "pool 'bosh' is not empty (contains VM 99098)", true},
+		{"mixed case", "Pool 'bosh' Is Not Empty (contains VM 99098)", true},
+		{"missing pool word", "resource is not empty", false},
+		{"unrelated", "storage 'nfs-images' is not online", false},
+		{"empty", "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			err := makeAPIErr(500, tc.msg)
+			if got := pve.IsPoolNotEmpty(err); got != tc.want {
+				t.Errorf("IsPoolNotEmpty(%q) = %v, want %v", tc.msg, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestIsPoolNotEmpty_Nil(t *testing.T) {
+	t.Parallel()
+	if pve.IsPoolNotEmpty(nil) {
+		t.Error("nil error should not match")
+	}
+}
+
+func TestIsPoolMoveConflict_LiveText(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		msg  string
+		want bool
+	}{
+		{"live text", "VM 99098 belongs already to pool 'p4' and 'allow-move' is not set", true},
+		{"mixed case", "vm 99098 Belongs Already To Pool 'p4'", true},
+		{"unrelated error", "storage 'nfs-images' is not online", false},
+		{"empty", "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			err := makeAPIErr(500, tc.msg)
+			if got := pve.IsPoolMoveConflict(err); got != tc.want {
+				t.Errorf("IsPoolMoveConflict(%q) = %v, want %v", tc.msg, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestIsPoolMoveConflict_Nil(t *testing.T) {
+	t.Parallel()
+	if pve.IsPoolMoveConflict(nil) {
+		t.Error("nil error should not match")
+	}
+}
+
+func TestIsPoolNotFound_LiveText(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		msg  string
+		want bool
+	}{
+		{"live text", "delete pool failed: pool 'x' does not exist", true},
+		{"mixed case", "Delete Pool Failed: Pool 'x' Does Not Exist", true},
+		{"unrelated no pool word", "storage does not exist", false},
+		{"empty", "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			err := makeAPIErr(500, tc.msg)
+			if got := pve.IsPoolNotFound(err); got != tc.want {
+				t.Errorf("IsPoolNotFound(%q) = %v, want %v", tc.msg, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestIsPoolNotFound_Nil(t *testing.T) {
+	t.Parallel()
+	if pve.IsPoolNotFound(nil) {
+		t.Error("nil error should not match")
+	}
+}

@@ -143,15 +143,29 @@
   config["stemcell_template_vmid_range_end"] = v unless v == 0
 
   # Emit stemcell_template_pool only when the operator supplies a non-empty value.
-  # When absent or empty (the default), the key is omitted and no pool is assigned.
-  stemcell_template_pool = p("pve.stemcell_template_pool", "")
+  # Default "bosh-templates" (create-if-missing); an explicit "" still omits the
+  # key here so the Go zero-value opts the pool back out.
+  stemcell_template_pool = p("pve.stemcell_template_pool", "bosh-templates")
   config["stemcell_template_pool"] = stemcell_template_pool unless stemcell_template_pool.to_s.empty?
 
-  # Emit vm_pool only when the operator supplies a non-empty value. When
-  # absent or empty (the default), the key is omitted and create_vm assigns
-  # no pool — byte-identical to every release before this property existed.
-  vm_pool = p("pve.vm_pool", "")
+  # Emit vm_pool only when the operator supplies a non-empty value. Default
+  # "bosh" (create-if-missing); an explicit "" still omits the key here so the
+  # Go zero-value opts this global layer back out (a higher-precedence layer
+  # still applies if set; no pool is assigned only when every layer is empty).
+  vm_pool = p("pve.vm_pool", "bosh")
   config["vm_pool"] = vm_pool unless vm_pool.to_s.empty?
+
+  # Emit vm_pool_template only when the operator supplies a non-empty value.
+  # When absent or empty (the default), the key is omitted and the template
+  # layer is disabled — resolution falls straight to call/vm_type/vm_pool.
+  vm_pool_template = p("pve.vm_pool_template", "")
+  config["vm_pool_template"] = vm_pool_template unless vm_pool_template.to_s.empty?
+
+  # Emit pool_reap_empty only when the operator opts in. The Go config
+  # defaults to no reaping (pools accumulate) when the key is omitted.
+  if p("pve.pool_reap_empty", false)
+    config["pool_reap_empty"] = true
+  end
 
   # Emit stemcell_template_node only when the operator supplies a non-empty value.
   # When absent or empty (the default), the key is omitted and the CPI falls back

@@ -376,12 +376,26 @@ type createVMShape struct {
 	// clone-path (UpdateQemuConfig) use this value; cloud_properties.pve_config.cpu
 	// is a separate, later write that always wins as the final override.
 	cpuType string
-	// vmPool is the PVE resource pool name assigned to this VM at create/clone
-	// time (pve.vm_pool). Empty (default) means no pool assignment — no
-	// "pool" key or field is ever set. No cloud_properties override; this is
-	// a global-only knob (unlike cpuType, which has a per-call layer) since
-	// its purpose is a fleet-wide ACL boundary, not per-instance-group tuning.
+	// vmPool is the resolved PVE resource pool name assigned to this VM at
+	// create/clone time. Resolved once in buildVMShapeForNode via
+	// resolvePoolName, applying the full precedence pipeline (plan §0/D-04):
+	//
+	//  1. call-level cloud_properties.pool (highest)
+	//  2. vm_type profile cloud_properties.pool
+	//  3. pve.vm_pool_template rendered with {prefix}/{director}/{deployment}/
+	//     {instance_group}
+	//  4. pve.vm_pool (global default)
+	//
+	// Empty (every layer empty) means no pool assignment — no "pool" key or
+	// field is ever set, byte-identical to every release before this
+	// property existed. The resolved pool is create-if-missing (see
+	// ensureResolvedPool) before either create path consumes it.
 	vmPool string
+	// vmPoolComment is the provenance comment recorded on vmPool when it is
+	// created by ensureResolvedPool (pve.PoolProvenance, optionally suffixed
+	// with the director name extracted from env.bosh.group). Empty whenever
+	// vmPool is empty — no pool is created, so no comment is needed.
+	vmPoolComment string
 }
 
 // HandleCreateVM returns a cpi.Handler that implements the BOSH CPI create_vm method.
@@ -1206,6 +1220,33 @@ func buildVMShapeForNode(ctx context.Context, deps Deps, parsed *createVMParsedA
 		return nil, err
 	}
 
+	// Resolve the PVE resource pool this VM is assigned to (plan §0/D-04:
+	// call > vm_type > vm_pool_template > global vm_pool). newPoolResolver
+	// deliberately excludes the disk_type layer perfR (above) includes — a
+	// disk_type profile's cloud_properties.pool must never outrank vm_type.
+	poolR, poolRErr := newPoolResolver(parsed.cloudPropsMap, deps.Config)
+	if poolRErr != nil {
+		return nil, poolRErr
+	}
+	resolvedPool, poolErr := resolvePoolName(deps.Config, poolR, parsed.env)
+	if poolErr != nil {
+		return nil, poolErr
+	}
+	var vmPoolComment string
+	if resolvedPool != "" {
+		// Mirror renderPoolTemplate's own job/deployment derivation
+		// (cloudprops instanceGroupName + extractDeploymentFromEnv, falling
+		// back to Config.CreateEnvDeployment) so the director extracted here
+		// is consistent with whatever produced a template-rendered pool name.
+		job := instanceGroupName(parsed.env)
+		deployment := extractDeploymentFromEnv(parsed.env, job)
+		if deployment == "" {
+			deployment = deps.Config.CreateEnvDeployment
+		}
+		director := extractDirectorFromEnv(parsed.env, deployment, job)
+		vmPoolComment = pve.PoolProvenance(director)
+	}
+
 	return &createVMShape{
 		node:             node,
 		vmStorage:        vmStorage,
@@ -1228,7 +1269,8 @@ func buildVMShapeForNode(ctx context.Context, deps Deps, parsed *createVMParsedA
 		ephemeralDiskGiB: ephemeralDiskGiB,
 		ephemeralStorage: ephemeralStorage,
 		cpuType:          cpuTypeVal,
-		vmPool:           deps.Config.VMPool,
+		vmPool:           resolvedPool,
+		vmPoolComment:    vmPoolComment,
 	}, nil
 }
 
@@ -3410,6 +3452,12 @@ func attemptCreateVM(
 		// e.g. to redirect to a host device instead.
 		pveConfigKeySerial0: "socket",
 	}
+	// The resolved pool (if any) must exist before it is handed to QEMU.Create
+	// as the "pool" param below (applyOptionalCreateParams) — PVE rejects a
+	// create referencing a non-existent pool. No-op when shape.vmPool == "".
+	if err := ensureResolvedPool(ctx, deps, shape, logger); err != nil {
+		return err
+	}
 	applyOptionalCreateParams(createParams, shape)
 
 	upid, cerr := deps.PVE.QEMU().Create(ctx, shape.node, createParams)
@@ -3456,6 +3504,25 @@ func applyOptionalCreateParams(createParams map[string]any, shape *createVMShape
 	if shape.vmPool != "" {
 		createParams["pool"] = shape.vmPool
 	}
+}
+
+// ensureResolvedPool creates shape.vmPool (create-if-missing, tolerating a
+// concurrent/prior creation) before either create path assigns the VM to it.
+// No-ops — no PVE call at all — when shape.vmPool == "" (every resolver layer
+// resolved empty, byte-identical to pre-feature behavior). shape.vmPoolComment
+// is only ever non-empty when shape.vmPool is also non-empty (both set
+// together in buildVMShapeForNode), so it needs no separate emptiness check.
+func ensureResolvedPool(ctx context.Context, deps Deps, shape *createVMShape, logger *log.Logger) error {
+	if shape.vmPool == "" {
+		return nil
+	}
+	if err := pve.EnsurePoolExists(ctx, deps.PVE, shape.vmPool, shape.vmPoolComment); err != nil {
+		return err
+	}
+	logger.Debug("create_vm: resolved pool ensured",
+		log.String("pool", shape.vmPool),
+	)
+	return nil
 }
 
 // handleCloneError classifies a cloneFromTemplate error and logs appropriately.
@@ -3746,10 +3813,16 @@ func cloneFromTemplate(
 		params.Format = &shape.vmDiskFormat
 	}
 
-	// Assign the clone to pve.vm_pool when set — mirrors the import path's
-	// "pool" createParams key. Absent (empty) means no pool assignment,
-	// byte-identical to every release before this property existed. The
-	// pool must already exist; PVE rejects the clone otherwise.
+	// The resolved pool (if any) must exist before the clone request
+	// references it below — PVE rejects a clone targeting a non-existent
+	// pool. No-op when shape.vmPool == "".
+	if err := ensureResolvedPool(ctx, deps, shape, logger); err != nil {
+		return err
+	}
+	// Assign the clone to the resolved pool when set — mirrors the import
+	// path's "pool" createParams key. Absent (empty) means no pool
+	// assignment, byte-identical to every release before this property
+	// existed.
 	if shape.vmPool != "" {
 		poolVal := shape.vmPool
 		params.Pool = &poolVal

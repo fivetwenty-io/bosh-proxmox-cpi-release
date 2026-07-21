@@ -536,6 +536,212 @@ func TestValidate_VMPoolClusterLockPrefix_Rejected(t *testing.T) {
 	assertCloudError(t, err, `vm_pool must not start with "bosh-lock-"`)
 }
 
+// TestValidateVMPool_EqualsStemcellTemplatePool_StillRejected re-covers the
+// vm_pool/stemcell_template_pool ACL-boundary collision rule from the pool
+// resource-pools feature's own perspective: the two now-distinct defaults
+// ("bosh" and "bosh-templates") must NOT trip the equality check, but an
+// operator who sets both to the same non-default value still must.
+func TestValidateVMPool_EqualsStemcellTemplatePool_StillRejected(t *testing.T) {
+	t.Parallel()
+	t.Run("same_value_rejected", func(t *testing.T) {
+		t.Parallel()
+		_, err := mustLoad(t, `{
+			"host": "h", "user": "u", "password": "p",
+			"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
+			"vm_pool": "bosh",
+			"stemcell_template_pool": "bosh"
+		}`)
+		assertCloudError(t, err, "vm_pool must not equal stemcell_template_pool")
+	})
+	t.Run("distinct_defaults_accepted", func(t *testing.T) {
+		t.Parallel()
+		cfg, err := mustLoad(t, `{
+			"host": "h", "user": "u", "password": "p",
+			"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
+			"vm_pool": "bosh",
+			"stemcell_template_pool": "bosh-templates"
+		}`)
+		if err != nil {
+			t.Fatalf("unexpected error for distinct default pool names: %v", err)
+		}
+		if cfg.VMPool != "bosh" {
+			t.Errorf("VMPool = %q, want %q", cfg.VMPool, "bosh")
+		}
+		if cfg.StemcellTemplatePool != "bosh-templates" {
+			t.Errorf("StemcellTemplatePool = %q, want %q", cfg.StemcellTemplatePool, "bosh-templates")
+		}
+	})
+}
+
+func TestValidateVMPool_BoshLockPrefixRejected(t *testing.T) {
+	t.Parallel()
+	_, err := mustLoad(t, `{
+		"host": "h", "user": "u", "password": "p",
+		"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
+		"vm_pool": "bosh-lock-x"
+	}`)
+	assertCloudError(t, err, `vm_pool must not start with "bosh-lock-"`)
+}
+
+func TestValidateVMPool_SlashRejected(t *testing.T) {
+	t.Parallel()
+	_, err := mustLoad(t, `{
+		"host": "h", "user": "u", "password": "p",
+		"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
+		"vm_pool": "bosh/cf"
+	}`)
+	assertCloudError(t, err, "vm_pool must not contain '/'")
+}
+
+func TestValidateVMPool_CharsetRejected(t *testing.T) {
+	t.Parallel()
+	_, err := mustLoad(t, `{
+		"host": "h", "user": "u", "password": "p",
+		"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
+		"vm_pool": "bosh pool!"
+	}`)
+	assertCloudError(t, err, "vm_pool contains characters invalid for a PVE poolid")
+}
+
+func TestValidateStemcellTemplatePool_SlashRejected(t *testing.T) {
+	t.Parallel()
+	_, err := mustLoad(t, `{
+		"host": "h", "user": "u", "password": "p",
+		"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
+		"stemcell_template_pool": "bosh/templates"
+	}`)
+	assertCloudError(t, err, "stemcell_template_pool must not contain '/'")
+}
+
+func TestValidateStemcellTemplatePool_CharsetRejected(t *testing.T) {
+	t.Parallel()
+	_, err := mustLoad(t, `{
+		"host": "h", "user": "u", "password": "p",
+		"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
+		"stemcell_template_pool": "bosh templates!"
+	}`)
+	assertCloudError(t, err, "stemcell_template_pool contains characters invalid for a PVE poolid")
+}
+
+func TestValidateStemcellTemplatePool_BoshLockPrefixRejected(t *testing.T) {
+	t.Parallel()
+	_, err := mustLoad(t, `{
+		"host": "h", "user": "u", "password": "p",
+		"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
+		"stemcell_template_pool": "bosh-lock-templates"
+	}`)
+	assertCloudError(t, err, `stemcell_template_pool must not start with "bosh-lock-"`)
+}
+
+// TestValidateStemcellTemplatePool_NoEqualityCheck verifies
+// validateStemcellTemplatePool does NOT itself repeat the vm_pool equality
+// rule (it lives solely in validateVMPool); the combined collision error must
+// still be emitted exactly once by ValidateWithLogger.
+func TestValidateStemcellTemplatePool_NoEqualityCheck(t *testing.T) {
+	t.Parallel()
+	_, err := mustLoad(t, `{
+		"host": "h", "user": "u", "password": "p",
+		"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
+		"vm_pool": "shared",
+		"stemcell_template_pool": "shared"
+	}`)
+	if err == nil {
+		t.Fatal("expected collision error")
+	}
+	count := strings.Count(err.Error(), "must not equal stemcell_template_pool")
+	if count != 1 {
+		t.Errorf("expected exactly one equality-collision error, got %d in: %v", count, err)
+	}
+}
+
+func TestValidateVMPoolTemplate_UnknownToken(t *testing.T) {
+	t.Parallel()
+	_, err := mustLoad(t, `{
+		"host": "h", "user": "u", "password": "p",
+		"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
+		"vm_pool_template": "{team}-{deployment}"
+	}`)
+	assertCloudError(t, err, `vm_pool_template contains unknown variable "{team}"`)
+}
+
+func TestValidateVMPoolTemplate_SlashRejected(t *testing.T) {
+	t.Parallel()
+	_, err := mustLoad(t, `{
+		"host": "h", "user": "u", "password": "p",
+		"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
+		"vm_pool_template": "{prefix}/{deployment}"
+	}`)
+	assertCloudError(t, err, "vm_pool_template must not contain '/'")
+}
+
+func TestValidateVMPoolTemplate_KnownTokens_OK(t *testing.T) {
+	t.Parallel()
+	cfg, err := mustLoad(t, `{
+		"host": "h", "user": "u", "password": "p",
+		"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
+		"vm_pool_template": "{prefix}-{director}-{deployment}-{instance_group}"
+	}`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := "{prefix}-{director}-{deployment}-{instance_group}"
+	if cfg.VMPoolTemplate != want {
+		t.Errorf("VMPoolTemplate = %q, want %q", cfg.VMPoolTemplate, want)
+	}
+}
+
+func TestValidateVMPoolTemplate_UnsetNoError(t *testing.T) {
+	t.Parallel()
+	cfg, err := mustLoad(t, `{
+		"host": "h", "user": "u", "password": "p",
+		"vm_storage": "s", "disk_storage": "s", "network_bridge": "br"
+	}`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.VMPoolTemplate != "" {
+		t.Errorf("VMPoolTemplate = %q; want empty", cfg.VMPoolTemplate)
+	}
+}
+
+// TestConfig_NewFields_ParsedFromJSON round-trips vm_pool_template and
+// pool_reap_empty through Load.
+func TestConfig_NewFields_ParsedFromJSON(t *testing.T) {
+	t.Parallel()
+	cfg, err := mustLoad(t, `{
+		"host": "h", "user": "u", "password": "p",
+		"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
+		"vm_pool_template": "{prefix}-{deployment}",
+		"pool_reap_empty": true
+	}`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.VMPoolTemplate != "{prefix}-{deployment}" {
+		t.Errorf("VMPoolTemplate = %q, want %q", cfg.VMPoolTemplate, "{prefix}-{deployment}")
+	}
+	if !cfg.PoolReapEmpty {
+		t.Error("PoolReapEmpty = false, want true")
+	}
+}
+
+func TestConfig_NewFields_AbsentDefaultsToZeroValue(t *testing.T) {
+	t.Parallel()
+	cfg, err := mustLoad(t, `{
+		"host": "h", "user": "u", "password": "p",
+		"vm_storage": "s", "disk_storage": "s", "network_bridge": "br"
+	}`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.VMPoolTemplate != "" {
+		t.Errorf("VMPoolTemplate = %q, want empty (default)", cfg.VMPoolTemplate)
+	}
+	if cfg.PoolReapEmpty {
+		t.Error("PoolReapEmpty = true, want false (default)")
+	}
+}
+
 func TestValidate_DiskPerfInvariantModeValid(t *testing.T) {
 	t.Parallel()
 	for _, mode := range []string{"enforce", "warn", "off"} {
