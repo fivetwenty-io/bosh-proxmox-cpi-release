@@ -48,7 +48,10 @@ type diskHints struct {
 //     confirm the attachment and get the canonical slot name.
 //  5. Derive device path from diskID as a PVE-stable by-id symlink:
 //     "/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_drive-scsi<N>".
-//  6. Return disk_hints{"path": devicePath}.
+//  6. Record the verbatim disk_cid against the bare volid on the VM's
+//     description sentinel (best-effort; see pve.UpdateAttachedDiskCID) so a
+//     later get_disks call can return the exact CID the Director stored.
+//  7. Return disk_hints{"path": devicePath}.
 //
 // Device path convention:
 //
@@ -257,6 +260,15 @@ func HandleAttachDisk(deps Deps) Handler {
 			log.String("disk_id", diskID),
 			log.String("device_path", devicePath),
 		)
+
+		// --------------------------------------------------------------------
+		// 8. Record the Director's verbatim disk_cid against the bare volid on
+		//    the VM's description sentinel, so a later get_disks call can
+		//    return this exact string instead of the bare volid — cloudcheck
+		//    membership fidelity (see pve.UpdateAttachedDiskCID doc comment).
+		//    Best-effort: never fails the attach.
+		// --------------------------------------------------------------------
+		pve.UpdateAttachedDiskCID(ctx, deps.PVE, deps.Log(ctx), node, vmid, bareDiskCID, diskCID)
 
 		// --------------------------------------------------------------------
 		// 9. Return disk_hints (v2 spec: object with "path" key).

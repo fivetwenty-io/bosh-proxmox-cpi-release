@@ -128,7 +128,9 @@ func detachDiskResolveSlot(
 //  4. Call qemu.DetachDisk with the resolved diskID. The SDK issues a synchronous
 //     PUT /nodes/{node}/qemu/{vmid}/config with {delete: diskID}. No UPID is returned
 //     and no AwaitTask is required.
-//  5. Return nil (void success).
+//  5. Remove the recorded disk_cid entry from the VM's description sentinel
+//     (best-effort; see pve.RemoveAttachedDiskCID), mirroring attach_disk's write.
+//  6. Return nil (void success).
 //
 // Idempotency: if the disk is not attached to the VM at step 2, the handler returns
 // nil without calling DetachDisk. This matches the Perl CPI's "warn + return 1"
@@ -230,6 +232,13 @@ func HandleDetachDisk(deps Deps) Handler {
 			log.String("disk_cid", diskCID),
 			log.String("disk_id", diskID),
 		)
+
+		// --------------------------------------------------------------------
+		// 4b. Remove the recorded disk_cid entry from the VM's description
+		//     sentinel (mirror of attach_disk's UpdateAttachedDiskCID write).
+		//     Best-effort: never fails the detach.
+		// --------------------------------------------------------------------
+		pve.RemoveAttachedDiskCID(ctx, deps.PVE, deps.Log(ctx), node, vmid, bareDiskCID)
 
 		// --------------------------------------------------------------------
 		// 5. Park disk when detached_disk_strategy=parked (fail-closed

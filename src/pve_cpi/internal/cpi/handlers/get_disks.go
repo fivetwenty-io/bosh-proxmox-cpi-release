@@ -47,7 +47,9 @@ var systemDiskSlots = map[string]bool{
 //  5. Filter out system disks (scsi0/virtio0) and cloudinit drives (ide2 or
 //     any disk whose option string contains "media=cdrom").
 //  6. For each remaining disk, extract the bare volid (the part before the first
-//     comma in the option string) and format it as a disk_cid.
+//     comma in the option string). Return the recorded disk_cid from the VM's
+//     description sentinel (pve.GetAttachedDiskCIDs) when attach_disk recorded
+//     one for this volid; otherwise fall back to the bare volid.
 //  7. Return the list. An empty list is a valid response when no persistent disks
 //     are attached.
 //
@@ -108,9 +110,21 @@ func HandleGetDisks(deps Deps) Handler {
 
 		// ----------------------------------------------------------------
 		// 4. Parse disk entries from config and filter to persistent disks.
+		//
+		// CID fidelity: the Director compares its stored disk_cid strings
+		// against this list on cloudcheck (bosh.io get_disks contract). A
+		// bare volid is not always what the Director stored — attach_disk
+		// may have received an opaque envelope CID (metadata that cannot be
+		// reconstructed from PVE state) — so recordedCIDs, read from the VM's
+		// description sentinel, supplies the exact string when attach_disk
+		// recorded one. Absent entry (disk attached by a pre-envelope CPI
+		// release, or the sentinel write failed) falls back to the bare
+		// volid, matching pre-feature behavior.
 		// ----------------------------------------------------------------
 		allDisks := qemu.ParseDisks(cfg)
+		recordedCIDs := pve.GetAttachedDiskCIDs(pve.DescriptionFromConfig(cfg))
 		diskCIDs := make([]string, 0, len(allDisks))
+		recordedCount, fallbackCount := 0, 0
 
 		for diskSlot, optStr := range allDisks {
 			// Skip system disk slots by name.
@@ -133,8 +147,20 @@ func HandleGetDisks(deps Deps) Handler {
 				continue
 			}
 
-			diskCIDs = append(diskCIDs, bareVolid)
+			if recordedCID, ok := recordedCIDs[bareVolid]; ok && recordedCID != "" {
+				diskCIDs = append(diskCIDs, recordedCID)
+				recordedCount++
+			} else {
+				diskCIDs = append(diskCIDs, bareVolid)
+				fallbackCount++
+			}
 		}
+
+		deps.Log(ctx).Debug("get_disks: CID resolution",
+			log.String("vm_cid", vmCID),
+			log.Int("recorded_cid_count", recordedCount),
+			log.Int("bare_volid_fallback_count", fallbackCount),
+		)
 
 		deps.Log(ctx).Info("get_disks",
 			log.String("vm_cid", vmCID),

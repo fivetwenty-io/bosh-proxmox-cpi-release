@@ -93,11 +93,12 @@ func parkerNow(cfg ParkerConfig) time.Time {
 // ---------------------------------------------------------------------------
 // Provenance sentinel codec (local to pve package — no handlers import to avoid cycle)
 // ---------------------------------------------------------------------------
-
-// parkerSentinelPattern matches <!--BOSH:{...}--> in a VM description. Same
-// wire format as set_disk_metadata; the two codecs coexist by using distinct
-// top-level JSON keys (bosh_disk_metadata vs bosh_parked_disks).
-var parkerSentinelPattern = regexp.MustCompile(`<!--BOSH:(.*?)-->`)
+//
+// parseParkerSentinel/renderParkerSentinel are the bosh_parked_disks-specific
+// wrapper around the shared parseSentinel/renderSentinel codec in sentinel.go
+// (also used by the bosh_attached_disks codec in attached_disks.go). Same
+// wire format as set_disk_metadata's independent codec; all these codecs
+// coexist on one VM description by using distinct top-level JSON keys.
 
 // ParkContext carries per-call attribution for provenance records written on
 // park. Fields are optional: zero values are omitted from the sentinel JSON.
@@ -127,23 +128,8 @@ type parkerProvEntry struct {
 // (nonBOSH) and the current bosh_parked_disks map. Corrupted JSON → fresh
 // empty map (sentinel rebuilt from scratch; nonBOSH text preserved).
 func parseParkerSentinel(desc string) (nonBOSH string, disks map[string]parkerProvEntry, raw map[string]json.RawMessage) {
-	nonBOSH = desc
+	nonBOSH, raw = parseSentinel(desc)
 	disks = make(map[string]parkerProvEntry)
-	raw = make(map[string]json.RawMessage)
-
-	m := parkerSentinelPattern.FindStringSubmatchIndex(desc)
-	if m == nil {
-		return
-	}
-	jsonStr := desc[m[2]:m[3]]
-	nonBOSH = strings.TrimSpace(desc[:m[0]])
-
-	// Decode all top-level keys into raw to preserve unknown keys.
-	if err := json.Unmarshal([]byte(jsonStr), &raw); err != nil {
-		// Corrupted sentinel — discard, keep nonBOSH.
-		raw = make(map[string]json.RawMessage)
-		return
-	}
 
 	// Extract our own key.
 	if rawDisks, ok := raw["bosh_parked_disks"]; ok {
@@ -175,16 +161,7 @@ func renderParkerSentinel(nonBOSH string, disks map[string]parkerProvEntry, raw 
 		merged["bosh_parked_disks"] = json.RawMessage(b)
 	}
 
-	sentinel, err := json.Marshal(merged)
-	if err != nil {
-		return "", err
-	}
-
-	newDesc := fmt.Sprintf("<!--BOSH:%s-->", string(sentinel))
-	if nonBOSH != "" {
-		newDesc = nonBOSH + "\n" + newDesc
-	}
-	return newDesc, nil
+	return renderSentinel(nonBOSH, merged)
 }
 
 // updateParkerProvenance merges a parked-disk entry into the parker VM
@@ -213,12 +190,7 @@ func updateParkerProvenance(ctx context.Context, c Client, logger *log.Logger, n
 		return
 	}
 
-	currentDesc := ""
-	if v, ok := vmCfg["description"]; ok {
-		if s, ok2 := v.(string); ok2 {
-			currentDesc = s
-		}
-	}
+	currentDesc := DescriptionFromConfig(vmCfg)
 
 	nonBOSH, disks, rawOther := parseParkerSentinel(currentDesc)
 
@@ -289,12 +261,7 @@ func removeParkerProvenance(ctx context.Context, c Client, logger *log.Logger, n
 		return
 	}
 
-	currentDesc := ""
-	if v, ok := vmCfg["description"]; ok {
-		if s, ok2 := v.(string); ok2 {
-			currentDesc = s
-		}
-	}
+	currentDesc := DescriptionFromConfig(vmCfg)
 
 	nonBOSH, disks, rawOther := parseParkerSentinel(currentDesc)
 
