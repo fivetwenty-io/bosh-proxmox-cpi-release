@@ -12,7 +12,7 @@ import (
 
 // TestCPUTypeValue_DefaultEmpty verifies nil receiver and never-defaulted
 // zero-value config both resolve to "" (ApplyDefaults is what fills the
-// x86-64-v2-AES default; these configs never went through it).
+// "host" default; these configs never went through it).
 func TestCPUTypeValue_DefaultEmpty(t *testing.T) {
 	t.Parallel()
 	var nilCfg *config.CPIConfig
@@ -68,10 +68,11 @@ func TestCPUType_JSONRoundTrip(t *testing.T) {
 	}
 }
 
-// TestCPUType_AbsentFromJSON_DefaultsToV2AES verifies a manifest that never
-// sets cpu_type loads without error and resolves to the built-in
-// x86-64-v2-AES default (PVE's own create-wizard default; keeps AES-NI).
-func TestCPUType_AbsentFromJSON_DefaultsToV2AES(t *testing.T) {
+// TestCPUType_AbsentFromJSON_DefaultsToHost verifies a manifest that never
+// sets cpu_type loads without error and resolves to the built-in "host"
+// default (maximum guest performance; heterogeneous clusters that need live
+// migration across CPU generations override with e.g. x86-64-v2-AES).
+func TestCPUType_AbsentFromJSON_DefaultsToHost(t *testing.T) {
 	t.Parallel()
 	cfg, err := mustLoad(t, `{
 		"host": "h", "user": "u", "password": "p",
@@ -80,8 +81,11 @@ func TestCPUType_AbsentFromJSON_DefaultsToV2AES(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load returned unexpected error: %v", err)
 	}
-	if got := cfg.CPUTypeValue(); got != config.DefaultCPUType {
-		t.Errorf("CPUTypeValue() = %q; want %q when cpu_type is absent from the manifest", got, config.DefaultCPUType)
+	if got := cfg.CPUTypeValue(); got != "host" {
+		t.Errorf("CPUTypeValue() = %q; want \"host\" when cpu_type is absent from the manifest", got)
+	}
+	if config.DefaultCPUType != "host" {
+		t.Errorf("DefaultCPUType = %q; want \"host\"", config.DefaultCPUType)
 	}
 }
 

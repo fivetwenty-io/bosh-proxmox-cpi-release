@@ -24,11 +24,11 @@ Property names and defaults are cross-referenced to [Configuration reference](co
 
 **CPU model guidance.**
 
-**Best practice.** The default `kvm64` CPU model lacks AES-NI, taxing every TLS handshake a BOSH workload makes; pinning `host` exposes the exact physical feature set and crashes on migration to a differently generationed node.
+**Best practice.** On a homogeneous cluster, `host` is the best-performing model: the guest sees the physical CPU's full feature set with no emulation mask. On clusters mixing CPU generations, a `host`-typed guest can crash when live-migrated to a differently-generationed node, so a portable named model is required there; the API-level `kvm64` fallback is the worst of both worlds (lacks AES-NI, taxing every TLS handshake a BOSH workload makes).
 
-**CPI behavior.** `pve.cpu_type` defaults to `x86-64-v2-AES` — the same model PVE's own creation wizard has defaulted to since 8.0: a named baseline broad enough to live-migrate across CPU generations from roughly 2010 onward, and it keeps AES-NI. `cloud_properties.cpu_type` overrides it per instance group. The sentinel value `pve-default` (at either layer) writes no `cpu` key at all, restoring PVE's API-level `kvm64` fallback for clusters that need it.
+**CPI behavior.** `pve.cpu_type` defaults to `host`. `cloud_properties.cpu_type` overrides it per instance group. On mixed-generation clusters that rely on live migration, set `x86-64-v2-AES` (PVE's own creation-wizard default since 8.0 — keeps AES-NI, live-migrates across CPU generations from roughly 2010 onward) or, for older hardware, the cluster's lowest-common-denominator named model. The sentinel value `pve-default` (at either layer) writes no `cpu` key at all, restoring PVE's API-level `kvm64` fallback for clusters that need it.
 
-**Status.** Meets — for hardware older than the `x86-64-v2-AES` baseline, set the cluster's lowest-common-denominator named model instead. Avoid `host` wherever live migration is possible.
+**Status.** Meets — homogeneous clusters get maximum performance by default. Mixed-generation clusters must override with a portable named model wherever live migration is possible.
 
 **A minimum of two cores per VM.**
 

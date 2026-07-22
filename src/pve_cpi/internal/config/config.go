@@ -164,10 +164,11 @@ type CPIConfig struct {
 	LogLevel     string `json:"log_level,omitempty"`
 
 	// CPUType is the emulated CPU type/model PVE writes to the new VM's
-	// "cpu" config key (e.g. "x86-64-v2-AES", "host"). Empty is filled by
-	// ApplyDefaults with DefaultCPUType ("x86-64-v2-AES" — PVE's own create-
-	// wizard default since 8.0; the API-level fallback kvm64 lacks AES-NI,
-	// a fleet-wide tax on TLS-heavy BOSH workloads). The sentinel value
+	// "cpu" config key (e.g. "host", "x86-64-v2-AES"). Empty is filled by
+	// ApplyDefaults with DefaultCPUType ("host" — full physical CPU feature
+	// set, maximum guest performance; clusters mixing CPU generations that
+	// need live migration should set a portable model such as
+	// "x86-64-v2-AES" instead). The sentinel value
 	// CPUTypePVEDefault ("pve-default") restores the legacy behavior: the
 	// CPI writes no cpu key at all and PVE falls back to kvm64. Per-VM
 	// cloud_properties.cpu_type — resolved through the same
@@ -1669,11 +1670,13 @@ func (c *CPIConfig) validateStrictUnknownKeys(raw []byte, errs *[]string) {
 const MaxConfigBytes = 1 << 20
 
 // DefaultCPUType is the CPU model ApplyDefaults writes into CPUType when the
-// operator leaves pve.cpu_type unset. x86-64-v2-AES is PVE's own create-wizard
-// default since 8.0: broad enough to live-migrate across CPU generations from
-// roughly 2010 onward, and it keeps AES-NI (which the API-level kvm64 fallback
-// strips).
-const DefaultCPUType = "x86-64-v2-AES"
+// operator leaves pve.cpu_type unset. "host" passes the physical CPU's full
+// feature set through to the guest — the best-performing choice, and safe on
+// the homogeneous clusters typical of BOSH deployments. Clusters that mix CPU
+// generations and rely on live migration should override with a portable
+// model such as "x86-64-v2-AES" (PVE's own create-wizard default), since a
+// host-typed guest can crash when migrated to a node with a different CPU.
+const DefaultCPUType = "host"
 
 // CPUTypePVEDefault is the sentinel operators set (globally via pve.cpu_type
 // or per instance group via cloud_properties.cpu_type) to make the CPI write

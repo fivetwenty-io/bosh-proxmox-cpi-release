@@ -692,6 +692,38 @@ pvesh get /cluster/sdn/zones --pending 1
 
 Open UDP 4789 between all cluster nodes in every firewall on the path (PVE host firewall, switch ACLs, external firewalls). If the zone's peer list is stale — for example a node was offline when the CPI created the zone — set `pve.sdn_vxlan_peers` explicitly and recreate the network, or edit the zone's peer list in PVE and re-apply. See [Operations — SDN VXLAN operations](operations.md#sdn-vxlan-operations).
 
+## Live migration failures
+
+### Migration fails or guest crashes after migration (cpu_type host)
+
+**Symptom**
+
+Live migration of a BOSH-created VM aborts with a CPU-feature error, or the guest kernel panics or applications SIGILL shortly after landing on the target node.
+
+**Diagnosis**
+
+The CPI defaults `pve.cpu_type` to `host`, which exposes the source node's exact physical CPU feature set to the guest. Migrating such a guest to a node with a different CPU generation hands it a CPU whose features no longer match what the kernel probed at boot. Confirm the VM's model and compare the two nodes:
+
+```bash
+qm config <vmid> | grep '^cpu'
+# On each node:
+lscpu | head -20
+```
+
+`cpu: host` combined with differing CPU models on source and target confirms the cause.
+
+**Fix**
+
+On clusters that mix CPU generations and rely on live migration, set a portable named model and recreate the affected VMs:
+
+```yaml
+properties:
+  pve:
+    cpu_type: x86-64-v2-AES
+```
+
+Per instance group, `cloud_properties.cpu_type` overrides the global value. The change applies on VM recreation (`bosh deploy --recreate`), not in place. For hardware older than the `x86-64-v2-AES` baseline, use the cluster's lowest-common-denominator named model. See [Configuration](configuration.md) for the full `pve.cpu_type` reference.
+
 ## Agent never comes up
 
 **Symptom**

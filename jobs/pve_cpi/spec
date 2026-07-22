@@ -198,32 +198,35 @@ properties:
   pve.cpu_type:
     description: |
       Emulated CPU type/model written to every new VM's PVE "cpu" config key
-      (e.g. "x86-64-v2-AES", "host", "Skylake-Server-noTSX-IBRS"). Default
-      "" (empty) resolves to "x86-64-v2-AES" — PVE's own create-wizard
-      default since 8.0. It keeps AES-NI (the API-level kvm64 fallback
-      strips it, a fleet-wide performance tax on TLS-heavy BOSH workloads)
-      and is a named baseline broad enough to live-migrate across CPU
-      generations from roughly 2010 onward. Set the sentinel "pve-default"
+      (e.g. "host", "x86-64-v2-AES", "Skylake-Server-noTSX-IBRS"). Default
+      "" (empty) resolves to "host": the guest sees the physical CPU's full
+      feature set, the best-performing choice, and safe on the homogeneous
+      clusters typical of BOSH deployments. Set the sentinel "pve-default"
       to restore the legacy behavior: the CPI writes no cpu key at all and
       PVE falls back to kvm64.
+
+      WARNING — heterogeneous clusters: a "host"-typed guest can crash when
+      live-migrated to a node with a different CPU generation. If your
+      cluster mixes CPU models and relies on live migration (HA, DLB,
+      maintenance evacuations), override this with a portable named model.
+      "x86-64-v2-AES" (PVE's own create-wizard default since 8.0) keeps
+      AES-NI and live-migrates across CPU generations from roughly 2010
+      onward; for hardware older than that baseline, use the cluster's
+      lowest-common-denominator named model.
 
       Precedence (highest wins): cloud_properties.cpu_type (per-instance-group,
       resolved through the same call/disk_type/vm_type layered resolver as
       other create_vm knobs; the "pve-default" sentinel works there too) >
-      this global value > built-in default "x86-64-v2-AES".
+      this global value > built-in default "host".
       cloud_properties.pve_config.cpu is a separate raw escape hatch applied
       after VM creation in the same create_vm call — when both this and
       pve_config.cpu are set, pve_config.cpu wins as the final write (the
       CPI logs an Info line pointing at this knob when pve_config.cpu is
       used).
 
-      For a mixed-hardware cluster older than the x86-64-v2-AES baseline,
-      set the cluster's lowest-common-denominator named CPU model (e.g. the
-      oldest node's generation) so every VM can live-migrate to every node.
-      Avoid "host": it exposes the exact physical CPU's full feature set,
-      which crashes on migration to a node with a different CPU generation —
-      a real risk in any cluster where live migration is possible, not only
-      DLB/HA-managed deployments. PVE validates the model name itself; the
+      Existing VMs keep their CPU type until recreated; a changed value (or
+      this release's new default) applies on the next VM creation, e.g.
+      "bosh deploy --recreate". PVE validates the model name itself; the
       CPI passes the value through verbatim with no additional validation.
     default: ""
   pve.log_level:

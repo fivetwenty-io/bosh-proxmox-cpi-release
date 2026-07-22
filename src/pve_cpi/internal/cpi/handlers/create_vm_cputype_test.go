@@ -43,7 +43,7 @@ func TestCreateVM_ImportPath_CPUType_Sentinel_NoCPUKey(t *testing.T) {
 	}
 }
 
-func TestCreateVM_ImportPath_CPUType_DefaultedConfig_WritesV2AES(t *testing.T) {
+func TestCreateVM_ImportPath_CPUType_DefaultedConfig_WritesHost(t *testing.T) {
 	t.Parallel()
 	q := &vmMockQEMU{}
 	n := &vmMockNodes{}
@@ -51,7 +51,7 @@ func TestCreateVM_ImportPath_CPUType_DefaultedConfig_WritesV2AES(t *testing.T) {
 	a := &vmMockAgent{}
 	deps := buildVMDeps(q, n, c, a)
 	// Production configs always pass through ApplyDefaults, which fills the
-	// empty CPUType with DefaultCPUType (x86-64-v2-AES).
+	// empty CPUType with DefaultCPUType ("host").
 	deps.Config.ApplyDefaults()
 	h := handlers.HandleCreateVM(deps)
 
@@ -119,7 +119,7 @@ func TestCreateVM_ImportPath_CPUType_GlobalConfig_SetsCPUKey(t *testing.T) {
 	}
 	p := q.createCalls[0].params
 	if cpu, _ := p["cpu"].(string); cpu != "x86-64-v2-AES" {
-		t.Errorf("createParams[\"cpu\"] = %q; want x86-64-v2-AES (global default)", cpu)
+		t.Errorf("createParams[\"cpu\"] = %q; want x86-64-v2-AES (explicit global value)", cpu)
 	}
 }
 
@@ -130,7 +130,7 @@ func TestCreateVM_ImportPath_CPUType_CloudProperties_OverridesGlobal(t *testing.
 	c := &vmMockCluster{}
 	a := &vmMockAgent{}
 	deps := buildVMDeps(q, n, c, a)
-	deps.Config.CPUType = "x86-64-v2-AES" // global default; must lose to per-call value
+	deps.Config.CPUType = "x86-64-v2-AES" // explicit global value; must lose to per-call value
 	h := handlers.HandleCreateVM(deps)
 
 	args := mkArgs("agent-cputype-override", testStemcellCID,
@@ -187,7 +187,7 @@ func TestCreateVM_ClonePath_CPUType_Sentinel_NilCpu(t *testing.T) {
 	}
 }
 
-func TestCreateVM_ClonePath_CPUType_DefaultedConfig_WritesV2AES(t *testing.T) {
+func TestCreateVM_ClonePath_CPUType_DefaultedConfig_WritesHost(t *testing.T) {
 	t.Parallel()
 	n := &vmMockNodes{
 		createQemuCloneFn: func(_ context.Context, _, _ string, _ *sdknodes.CreateQemuCloneParams) (*sdknodes.CreateQemuCloneResponse, error) {
@@ -200,7 +200,7 @@ func TestCreateVM_ClonePath_CPUType_DefaultedConfig_WritesV2AES(t *testing.T) {
 	a := &vmMockAgent{}
 	deps := buildVMDepsForTemplate(q, n, &vmMockCluster{}, a)
 	// Production configs always pass through ApplyDefaults, which fills the
-	// empty CPUType with DefaultCPUType (x86-64-v2-AES).
+	// empty CPUType with DefaultCPUType ("host").
 	deps.Config.ApplyDefaults()
 	h := handlers.HandleCreateVM(deps)
 
@@ -249,7 +249,7 @@ func TestCreateVM_ClonePath_CPUType_GlobalConfig_SetsCpuField(t *testing.T) {
 		if resourceCall.params.Cpu != nil {
 			got = *resourceCall.params.Cpu
 		}
-		t.Errorf("Cpu = %q; want x86-64-v2-AES (global default)", got)
+		t.Errorf("Cpu = %q; want x86-64-v2-AES (explicit global value)", got)
 	}
 }
 

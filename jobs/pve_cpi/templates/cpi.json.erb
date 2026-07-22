@@ -62,8 +62,9 @@
 
   # Emit cpu_type only when the operator supplies a non-empty value. When
   # absent or empty (the default), the key is omitted and the Go config's
-  # ApplyDefaults fills it with "x86-64-v2-AES" (PVE's own create-wizard
-  # default; keeps AES-NI, live-migration-safe across generations). The
+  # ApplyDefaults fills it with "host" (full physical CPU feature set;
+  # heterogeneous clusters needing live migration should set a portable
+  # model such as "x86-64-v2-AES" instead). The
   # sentinel "pve-default" passes through and makes create_vm write no "cpu"
   # key at all, so PVE falls back to its kvm64 API default (legacy behavior).
   # Per-VM cloud_properties.cpu_type (resolved via the layered vm_type/

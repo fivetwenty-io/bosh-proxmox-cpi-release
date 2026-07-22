@@ -369,7 +369,7 @@ type createVMShape struct {
 	// Only meaningful when ephemeralDiskGiB > 0.
 	ephemeralStorage string
 	// cpuType is the resolved emulated CPU type/model to write on the new VM
-	// (e.g. "x86-64-v2-AES"). Resolved once via resolveVMShapeCPUType:
+	// (e.g. "host"). Resolved once via resolveVMShapeCPUType:
 	// cloud_properties.cpu_type (call/disk_type/vm_type layered resolver) >
 	// pve.cpu_type global default > "" (no cpu key written at all — the
 	// zero-behavior-change default). Both import-path (createParams) and
@@ -2843,7 +2843,7 @@ func resolveVMShapeCPUMem(cp createVMCloudProps) (cores, sockets, memMiB int) {
 //     per-call value wins over a disk_type profile value, which wins over a
 //     vm_type profile value (the resolver's normal precedence order).
 //  2. config.CPUTypeValue() — the pve.cpu_type global value, which
-//     ApplyDefaults fills with config.DefaultCPUType (x86-64-v2-AES) when the
+//     ApplyDefaults fills with config.DefaultCPUType ("host") when the
 //     operator leaves it unset.
 //
 // At either layer the config.CPUTypePVEDefault sentinel ("pve-default")
@@ -3498,7 +3498,7 @@ func attemptCreateVM(
 // only emitted when their resolved shape value is non-default: numa, sockets
 // (only when > 1, matching the historic single-socket-is-implicit default),
 // initial tags, cpu (cloud_properties.cpu_type / pve.cpu_type — defaulted to
-// x86-64-v2-AES by ApplyDefaults; empty only via the "pve-default" sentinel,
+// "host" by ApplyDefaults; empty only via the "pve-default" sentinel,
 // which means PVE keeps its own kvm64 default), and
 // pool (pve.vm_pool — absent means no pool assignment, byte-identical to
 // every release before that property existed).
@@ -3962,7 +3962,7 @@ func cloneFromTemplate(
 	}
 	// Apply cpu type only when resolved (cloud_properties.cpu_type or the
 	// global pve.cpu_type value, which ApplyDefaults fills with
-	// x86-64-v2-AES); empty only via the "pve-default" sentinel, in which
+	// "host"); empty only via the "pve-default" sentinel, in which
 	// case PVE keeps its own kvm64 default on the cloned VM. The clone
 	// inherits the template's "cpu" value (templates carry no explicit cpu
 	// setting either), so the sentinel path is the same "unset means unset"

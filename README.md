@@ -90,6 +90,7 @@ The CPI exposes properties under the `pve.*` and `agent.*` namespaces. The most 
 | `pve.stemcell_storage` | Shared file-based storage for qcow2 stemcells | falls back to `vm_storage` |
 | `pve.iso_storage` | Storage pool for per-VM ConfigDrive ISOs | `local` |
 | `pve.network_bridge` | Default Linux bridge for VM NICs | `vmbr0` |
+| `pve.cpu_type` | Emulated CPU model (`host` = full physical feature set; set `x86-64-v2-AES` on mixed-CPU clusters that live-migrate) | `host` |
 | `pve.network_mode` | Managed-network mode (`sdn`, `bridge`, `auto`) | `auto` |
 | `pve.agent_mode` | Agent bootstrap mode (`cloudinit`, `noagent`, `auto`) | `cloudinit` |
 
