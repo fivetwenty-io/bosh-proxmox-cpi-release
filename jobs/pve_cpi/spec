@@ -229,6 +229,29 @@ properties:
       "bosh deploy --recreate". PVE validates the model name itself; the
       CPI passes the value through verbatim with no additional validation.
     default: ""
+  pve.balloon:
+    description: |
+      Memory-balloon setting written to every new VM's PVE "balloon" config
+      key. Default "" (empty) resolves to "0": the balloon device is
+      disabled. BOSH sizes VMs deterministically from the manifest and the
+      agent plans job memory against that size, so PVE's default
+      auto-ballooning — which reclaims guest memory beneath those
+      assumptions — invites OOM kills that look like application failures.
+
+      Set a positive integer (MiB) to enable PVE auto-ballooning with that
+      floor; the CPI fails fast when the value exceeds the VM's memory. Set
+      the sentinel "pve-default" to write no balloon key at all, restoring
+      PVE's own default (device enabled, balloon = memory) for clusters
+      that deliberately overcommit memory.
+
+      Precedence (highest wins): cloud_properties.balloon
+      (per-instance-group, resolved through the same call/disk_type/vm_type
+      layered resolver as other create_vm knobs; the "pve-default" sentinel
+      works there too) > this global value > built-in default "0".
+      cloud_properties.pve_config.balloon is rejected — this knob is the
+      supported surface. Applies on VM creation; existing VMs keep their
+      balloon setting until recreated.
+    default: ""
   pve.log_level:
     description: "Log level"
     default: "info"

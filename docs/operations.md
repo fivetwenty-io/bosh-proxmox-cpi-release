@@ -293,6 +293,19 @@ iperf3 -c <receiving-node-ip> -t 10
 
 A large gap between this cross-node figure and a same-node `iperf3` run (VM-to-VM on one node, no VXLAN encapsulation) points at the underlay link or its MTU rather than at SDN itself.
 
+### Memory ballooning
+
+The CPI writes `balloon: 0` on every VM and template it creates, so the balloon device is disabled by default — BOSH sizes VMs deterministically, and auto-ballooning would reclaim guest memory beneath the Director's assumptions. Verify on any CPI-created VM:
+
+```bash
+qm config <vmid> | grep '^balloon'
+# balloon: 0
+```
+
+To enable auto-ballooning fleet-wide, set `pve.balloon` to a MiB floor; per instance group, set `cloud_properties.balloon`. The sentinel `pve-default` restores PVE's own default (device enabled, balloon = memory). Changes apply on VM recreation, not in place.
+
+Before enabling, review the cluster's overcommit posture: auto-ballooning only relieves pressure when host memory is actually oversubscribed, and a ballooned guest whose BOSH jobs were sized to the manifest's full `memory` value can OOM under reclaim. If ballooning is enabled anywhere, also check KSM (`ksmtuned`) settings — both mechanisms trade guest performance for host headroom, and stacking them multiplies the reclaim pressure.
+
 ### Backups (PBS) interplay
 
 Several CPI operations power-cycle a guest: `delete_vm`, a hard reboot (`pve.reboot_mode: hard`, or the soft-reboot fallback to it), and any Director recreate — including a stemcell update, which the Director always implements as delete-then-create rather than an in-place change. Each of these restarts the guest's QEMU process. Proxmox Backup Server's incremental backups depend on a dirty-bitmap tracked inside that running QEMU process, so a power cycle always drops it — the next PBS backup after one re-reads the full disk instead of only the blocks that changed, regardless of how small the actual change was.

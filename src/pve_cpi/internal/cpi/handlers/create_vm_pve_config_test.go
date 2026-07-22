@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
@@ -70,11 +71,28 @@ func TestPVEConfig_ValidateAllowlistedKeysPass(t *testing.T) {
 }
 
 // TestPVEConfig_ValidateUnlistedKeyRejected verifies that a key not in the
-// allowlist ("balloon") is rejected by validatePVEConfig (pre-clone, no orphan).
+// allowlist ("vga") is rejected by validatePVEConfig (pre-clone, no orphan).
 func TestPVEConfig_ValidateUnlistedKeyRejected(t *testing.T) {
 	t.Parallel()
-	if err := validatePVEConfig(map[string]string{"balloon": "512"}); err == nil {
-		t.Fatal("expected error for unlisted key 'balloon', got nil")
+	if err := validatePVEConfig(map[string]string{"vga": "std"}); err == nil {
+		t.Fatal("expected error for unlisted key 'vga', got nil")
+	}
+}
+
+// TestPVEConfig_ValidateBalloonRejected_PointsAtKnob verifies that "balloon"
+// (CPI-managed since the ballooning knob shipped) is rejected pre-clone with
+// a message redirecting the operator to pve.balloon / cloud_properties.balloon.
+func TestPVEConfig_ValidateBalloonRejected_PointsAtKnob(t *testing.T) {
+	t.Parallel()
+	err := validatePVEConfig(map[string]string{"balloon": "512"})
+	if err == nil {
+		t.Fatal("expected error for CPI-managed key 'balloon', got nil")
+	}
+	if !strings.Contains(err.Error(), "managed by the CPI") {
+		t.Errorf("error %q should identify balloon as CPI-managed", err)
+	}
+	if !strings.Contains(err.Error(), "pve.balloon") || !strings.Contains(err.Error(), "cloud_properties.balloon") {
+		t.Errorf("error %q should redirect to pve.balloon / cloud_properties.balloon", err)
 	}
 }
 

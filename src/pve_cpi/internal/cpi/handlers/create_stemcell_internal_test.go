@@ -938,6 +938,11 @@ func TestEnsureTemplateVM_CreatePath_CpiOwnsSource(t *testing.T) {
 	if tablet, present := createParams["tablet"].(int); !present || tablet != 0 {
 		t.Errorf("tablet = %v (present=%v); want explicit 0", createParams["tablet"], present)
 	}
+	// Verify balloon=0 on the template so hand-made clones from CPI templates
+	// inherit ballooning-off (CPI-created clones are also patched in create_vm).
+	if balloon, present := createParams["balloon"].(int); !present || balloon != 0 {
+		t.Errorf("balloon = %v (present=%v); want explicit 0", createParams["balloon"], present)
+	}
 	// Verify source qcow2 deleted (cpiOwnsSource=true). DeleteVolumeIfExists
 	// takes the storage pool and the volume PATH ("import/<file>") as SEPARATE
 	// args — same contract as delete_stemcell. The volume arg must NOT carry a

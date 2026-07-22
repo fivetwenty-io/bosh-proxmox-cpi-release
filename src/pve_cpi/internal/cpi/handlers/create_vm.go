@@ -371,11 +371,21 @@ type createVMShape struct {
 	// cpuType is the resolved emulated CPU type/model to write on the new VM
 	// (e.g. "host"). Resolved once via resolveVMShapeCPUType:
 	// cloud_properties.cpu_type (call/disk_type/vm_type layered resolver) >
-	// pve.cpu_type global default > "" (no cpu key written at all — the
-	// zero-behavior-change default). Both import-path (createParams) and
-	// clone-path (UpdateQemuConfig) use this value; cloud_properties.pve_config.cpu
-	// is a separate, later write that always wins as the final override.
+	// pve.cpu_type global value (ApplyDefaults fills "host") > "" (no cpu key
+	// written at all — only reachable via the "pve-default" sentinel). Both
+	// import-path (createParams) and clone-path (UpdateQemuConfig) use this
+	// value; cloud_properties.pve_config.cpu is a separate, later write that
+	// always wins as the final override.
 	cpuType string
+	// balloonMiB is the resolved PVE "balloon" value for the new VM. Resolved
+	// once via resolveVMShapeBalloon: cloud_properties.balloon (call/disk_type/
+	// vm_type layered resolver) > pve.balloon global value (default "0" —
+	// ballooning disabled). Nil means write no balloon key at all (the
+	// "pve-default" sentinel — PVE keeps its own default: device enabled,
+	// balloon = memory). Both import-path (createParams) and clone-path
+	// (UpdateQemuConfig) use this value. Validated ≤ memMiB in
+	// buildVMShapeForNode (fail-fast, before any PVE API call).
+	balloonMiB *int
 	// vmPool is the resolved PVE resource pool name assigned to this VM at
 	// create/clone time. Resolved once in buildVMShapeForNode via
 	// resolvePoolName, applying the full precedence pipeline (plan §0/D-04):
@@ -1216,6 +1226,27 @@ func buildVMShapeForNode(ctx context.Context, deps Deps, parsed *createVMParsedA
 
 	cpuTypeVal := resolveVMShapeCPUType(perfR, deps.Config)
 
+	balloonStr, balloonErr := resolveVMShapeBalloon(perfR, deps.Config)
+	if balloonErr != nil {
+		return nil, balloonErr
+	}
+	var balloonMiB *int
+	if balloonStr != "" {
+		n, convErr := strconv.Atoi(balloonStr)
+		if convErr != nil {
+			return nil, cpierrors.Cloud(
+				"create_vm: balloon value %q is not an integer (MiB)", balloonStr,
+			)
+		}
+		if n > memMiB {
+			return nil, cpierrors.Cloud(
+				"create_vm: balloon %d MiB exceeds VM memory %d MiB — set cloud_properties.balloon (or pve.balloon) to at most the VM's memory",
+				n, memMiB,
+			)
+		}
+		balloonMiB = &n
+	}
+
 	ephemeralDiskGiB, ephemeralStorage, err := resolveEphemeralShape(ctx, deps, cp, parsed.cloudPropsMap)
 	if err != nil {
 		return nil, err
@@ -1273,6 +1304,7 @@ func buildVMShapeForNode(ctx context.Context, deps Deps, parsed *createVMParsedA
 		ephemeralDiskGiB: ephemeralDiskGiB,
 		ephemeralStorage: ephemeralStorage,
 		cpuType:          cpuTypeVal,
+		balloonMiB:       balloonMiB,
 		vmPool:           resolvedPool,
 		vmPoolComment:    vmPoolComment,
 	}, nil
@@ -2865,6 +2897,57 @@ func resolveVMShapeCPUType(r *layeredResolver, cfg *config.CPIConfig) string {
 	return cfg.CPUTypeValue()
 }
 
+// resolveVMShapeBalloon resolves the PVE "balloon" value to write on the new
+// VM. Precedence (highest wins):
+//
+//  1. cloud_properties.balloon — resolved through the layered resolver
+//     (call > disk_type profile > vm_type profile). Both JSON-number and
+//     string forms are accepted; the config.BalloonPVEDefault sentinel
+//     ("pve-default") resolves to "".
+//  2. config.BalloonValue() — the pve.balloon global value, which defaults
+//     to "0" (balloon device disabled) even on never-defaulted configs.
+//
+// The returned string is "" (write no balloon key; PVE keeps its own default
+// of device-enabled with balloon = memory) or a non-negative decimal MiB
+// value ("0" disables the device). A present but non-numeric, non-sentinel
+// value is a fail-fast error — surfaced before any PVE API call.
+//
+// The resolver walks raw layers itself rather than using r.String/r.Int:
+// either single-typed accessor would let a value of the other type in a
+// higher-precedence layer be shadowed by a lower layer.
+func resolveVMShapeBalloon(r *layeredResolver, cfg *config.CPIConfig) (string, error) {
+	for _, layer := range r.layers {
+		v, present := layer[pveConfigKeyBalloon]
+		if !present {
+			continue
+		}
+		if s, isStr := v.(string); isStr {
+			trimmed := strings.TrimSpace(s)
+			if trimmed == "" {
+				continue
+			}
+			if trimmed == config.BalloonPVEDefault {
+				return "", nil
+			}
+			if n, err := strconv.Atoi(trimmed); err == nil && n >= 0 {
+				return strconv.Itoa(n), nil
+			}
+			return "", cpierrors.Cloud(
+				"create_vm: cloud_properties.balloon must be a non-negative integer (MiB) or %q, got %q",
+				config.BalloonPVEDefault, s,
+			)
+		}
+		if n, ok := coerceInt(v); ok && n >= 0 {
+			return strconv.Itoa(n), nil
+		}
+		return "", cpierrors.Cloud(
+			"create_vm: cloud_properties.balloon must be a non-negative integer (MiB) or %q, got %v",
+			config.BalloonPVEDefault, v,
+		)
+	}
+	return cfg.BalloonValue(), nil
+}
+
 // resolveVMShapeHotplugNUMAWithError resolves hotplug + numa using
 // cloud_properties → vm_type/disk_type profile → config → built-in default.
 // Memory hotplug needs both numa=1 and "memory" in hotplug at create time;
@@ -3517,6 +3600,13 @@ func applyOptionalCreateParams(createParams map[string]any, shape *createVMShape
 	if shape.cpuType != "" {
 		createParams[pveConfigKeyCPU] = shape.cpuType
 	}
+	// Balloon: written on every VM unless the "pve-default" sentinel resolved
+	// to nil (write nothing; PVE keeps its own device-enabled default). The
+	// default resolution is 0 — ballooning disabled — because BOSH sizes VMs
+	// deterministically from the manifest.
+	if shape.balloonMiB != nil {
+		createParams[pveConfigKeyBalloon] = *shape.balloonMiB
+	}
 	if shape.vmPool != "" {
 		createParams["pool"] = shape.vmPool
 	}
@@ -3970,6 +4060,13 @@ func cloneFromTemplate(
 	if shape.cpuType != "" {
 		cpuVal := shape.cpuType
 		resourceParams.Cpu = &cpuVal
+	}
+	// Apply balloon unless the "pve-default" sentinel resolved to nil (write
+	// nothing; the clone keeps PVE's own device-enabled default). The default
+	// resolution is 0 — ballooning disabled — matching the import path.
+	if shape.balloonMiB != nil {
+		balloonVal := int64(*shape.balloonMiB)
+		resourceParams.Balloon = &balloonVal
 	}
 	// Apply root-disk performance options to shape.rootDiskKey when any are set.
 	// The clone inherits the template's root disk string under that same key

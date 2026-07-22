@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/cpi/hooks"
@@ -180,6 +181,21 @@ type CPIConfig struct {
 	// whitespace-trimmed, sentinel-resolved string. PVE validates the model
 	// name itself; the CPI passes the value through verbatim.
 	CPUType string `json:"cpu_type,omitempty"`
+
+	// Balloon controls the PVE "balloon" config key written to every new VM.
+	// Empty is filled by ApplyDefaults with DefaultBalloon ("0" — balloon
+	// device disabled): BOSH sizes VMs deterministically from the manifest,
+	// and auto-ballooning reclaims guest memory beneath the Director's
+	// assumptions. A positive integer (MiB) enables PVE auto-ballooning with
+	// that floor; the CPI fails fast when it exceeds the VM's memory. The
+	// sentinel BalloonPVEDefault ("pve-default") makes the CPI write no
+	// balloon key at all, restoring PVE's own default (device enabled,
+	// balloon = memory). Per-VM cloud_properties.balloon — resolved through
+	// the same call/disk_type/vm_type layered resolver as other create_vm
+	// knobs — takes precedence over this global value; the sentinel works at
+	// either layer. Use BalloonValue() for the effective, whitespace-trimmed,
+	// sentinel-resolved string.
+	Balloon string `json:"balloon,omitempty"`
 
 	// Hotplug is the PVE `hotplug` flag baked into every new VM. Comma-list of
 	// "network,disk,cpu,memory,usb,cloudinit"; "0" disables hotplug entirely.
@@ -1683,6 +1699,19 @@ const DefaultCPUType = "host"
 // no "cpu" key at all, so PVE falls back to its own API default (kvm64).
 const CPUTypePVEDefault = "pve-default"
 
+// DefaultBalloon is the balloon value ApplyDefaults writes into Balloon when
+// the operator leaves pve.balloon unset. "0" disables the balloon device:
+// BOSH sizes VMs deterministically from the manifest, and PVE's default
+// auto-ballooning would reclaim guest memory beneath the Director's
+// assumptions.
+const DefaultBalloon = "0"
+
+// BalloonPVEDefault is the sentinel operators set (globally via pve.balloon
+// or per instance group via cloud_properties.balloon) to make the CPI write
+// no "balloon" key at all, so PVE keeps its own default (balloon device
+// enabled, balloon = memory).
+const BalloonPVEDefault = "pve-default"
+
 // Load decodes CPIConfig from r, applies defaults, then validates.
 // Unknown JSON fields are logged at Warn level and ignored to preserve
 // forward-compatibility with future BOSH director versions.
@@ -1817,6 +1846,9 @@ func (c *CPIConfig) ApplyDefaults() {
 	}
 	if strings.TrimSpace(c.CPUType) == "" {
 		c.CPUType = DefaultCPUType
+	}
+	if strings.TrimSpace(c.Balloon) == "" {
+		c.Balloon = DefaultBalloon
 	}
 	if c.CreateEnvDeployment == "" {
 		c.CreateEnvDeployment = "create-env"
@@ -1993,6 +2025,27 @@ func (c *CPIConfig) CPUTypeValue() string {
 	}
 	v := strings.TrimSpace(c.CPUType)
 	if v == CPUTypePVEDefault {
+		return ""
+	}
+	return v
+}
+
+// BalloonValue returns the effective global balloon setting, trimmed of
+// surrounding whitespace. Empty (nil receiver or never-defaulted config)
+// resolves to "0" — ballooning disabled — so the default holds even for
+// configs that never went through ApplyDefaults. The BalloonPVEDefault
+// sentinel resolves to "": callers only emit a "balloon" key when the result
+// is non-empty, so the sentinel means "write no balloon key; let PVE keep its
+// own default" (device enabled, balloon = memory).
+func (c *CPIConfig) BalloonValue() string {
+	if c == nil {
+		return DefaultBalloon
+	}
+	v := strings.TrimSpace(c.Balloon)
+	if v == "" {
+		return DefaultBalloon
+	}
+	if v == BalloonPVEDefault {
 		return ""
 	}
 	return v
@@ -2551,6 +2604,22 @@ func (c *CPIConfig) ParkedDiskVMIDRangeEndValue() int {
 
 // validateIPConflictProbeEnum appends an error when ip_conflict_probe is set to
 // a value other than off|agent. Empty (the default) is valid.
+// validateBalloon rejects a non-empty Balloon that is neither the pve-default
+// sentinel nor a non-negative integer (MiB). Empty is valid — ApplyDefaults
+// fills it with DefaultBalloon ("0").
+func (c *CPIConfig) validateBalloon(errs *[]string) {
+	v := strings.TrimSpace(c.Balloon)
+	if v == "" || v == BalloonPVEDefault {
+		return
+	}
+	if n, err := strconv.Atoi(v); err != nil || n < 0 {
+		*errs = append(*errs, fmt.Sprintf(
+			"balloon must be a non-negative integer (MiB) or %q, got %q",
+			BalloonPVEDefault, c.Balloon,
+		))
+	}
+}
+
 func (c *CPIConfig) validateIPConflictProbeEnum(errs *[]string) {
 	if c.IPConflictProbe == "" {
 		return
@@ -3276,6 +3345,9 @@ func (c *CPIConfig) validateEnumFields(errs *[]string) {
 			))
 		}
 	}
+
+	// Balloon: validate only when non-empty.
+	c.validateBalloon(errs)
 
 	// IPConflictProbe enum: validate only when non-empty.
 	c.validateIPConflictProbeEnum(errs)

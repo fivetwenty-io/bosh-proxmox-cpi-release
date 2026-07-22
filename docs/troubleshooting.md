@@ -692,6 +692,31 @@ pvesh get /cluster/sdn/zones --pending 1
 
 Open UDP 4789 between all cluster nodes in every firewall on the path (PVE host firewall, switch ACLs, external firewalls). If the zone's peer list is stale — for example a node was offline when the CPI created the zone — set `pve.sdn_vxlan_peers` explicitly and recreate the network, or edit the zone's peer list in PVE and re-apply. See [Operations — SDN VXLAN operations](operations.md#sdn-vxlan-operations).
 
+## Memory pressure and ballooning
+
+### VM memory shrinks below manifest size or jobs OOM unexpectedly
+
+**Symptom**
+
+`free` inside a BOSH VM reports less memory than the manifest's `memory` value, or jobs sized to the manifest OOM under host memory pressure while `qm config` shows the expected memory.
+
+**Diagnosis**
+
+Check whether ballooning is active on the VM:
+
+```bash
+qm config <vmid> | grep '^balloon'
+# balloon: 0        → device disabled (the CPI default); ballooning is not the cause
+# balloon: <MiB>    → auto-ballooning enabled with that floor
+# (no balloon line) → PVE default: device enabled, target = memory
+```
+
+The CPI writes `balloon: 0` by default, so a non-zero or absent value means some layer set `pve.balloon`, `cloud_properties.balloon`, or the `pve-default` sentinel.
+
+**Fix**
+
+Remove the enabling value (or set `pve.balloon: "0"` explicitly) and recreate the affected VMs — the setting applies on VM creation, not in place. If ballooning is intentional, size job memory expectations to the balloon floor rather than the manifest `memory` value. See [Configuration](configuration.md) for the full `pve.balloon` reference.
+
 ## Live migration failures
 
 ### Migration fails or guest crashes after migration (cpu_type host)

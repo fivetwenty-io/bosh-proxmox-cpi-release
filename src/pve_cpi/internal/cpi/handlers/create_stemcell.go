@@ -1010,9 +1010,14 @@ func attemptCreateTemplateVM(
 		// forces it on every CPI-created clone, but a template carrying the
 		// PVE default (tablet on) would leak it into any clone an operator
 		// makes by hand from a CPI-managed template.
-		"tablet":    0,
-		"onboot":    0,
-		jsonKeyTags: strings.Join(baseTags, ";"),
+		"tablet": 0,
+		// balloon=0 on the template itself for the same reason as tablet:
+		// create_vm patches every CPI-created clone, but a template carrying
+		// PVE's default (balloon device enabled) would leak it into any clone
+		// an operator makes by hand from a CPI-managed template.
+		pveConfigKeyBalloon: 0,
+		"onboot":            0,
+		jsonKeyTags:         strings.Join(baseTags, ";"),
 	}
 
 	// initialCID is the BOSH stemcell CID for this template ("template:<vmid>").

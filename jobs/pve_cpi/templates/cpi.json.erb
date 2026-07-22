@@ -72,6 +72,17 @@
   cpu_type = p("pve.cpu_type", "")
   config["cpu_type"] = cpu_type unless cpu_type.to_s.empty?
 
+  # Emit balloon only when the operator supplies a non-empty value. When
+  # absent or empty (the default), the key is omitted and the Go config's
+  # ApplyDefaults fills it with "0" (balloon device disabled — BOSH sizes
+  # VMs deterministically, so auto-ballooning would reclaim guest memory
+  # beneath the Director's assumptions). A positive MiB value enables PVE
+  # auto-ballooning with that floor; the sentinel "pve-default" makes
+  # create_vm write no "balloon" key at all, restoring PVE's own default.
+  # Per-VM cloud_properties.balloon takes precedence over this global value.
+  balloon = p("pve.balloon", "")
+  config["balloon"] = balloon.to_s unless balloon.to_s.empty?
+
   # Emit stemcell-fetch transport timeouts only when the operator sets them.
   # When absent or 0 (the default), the key is omitted so the Go config
   # zero-value (0) reaches ApplyDefaults and the built-in defaults apply

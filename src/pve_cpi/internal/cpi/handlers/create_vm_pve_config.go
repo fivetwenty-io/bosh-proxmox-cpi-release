@@ -18,6 +18,11 @@ import (
 // hotplug token logic and elsewhere in the package).
 const pveConfigKeyCPU = "cpu"
 
+// pveConfigKeyBalloon is the PVE VM config key for the memory balloon device.
+// Defined as a constant to satisfy goconst (the literal "balloon" appears in
+// the blocklist, hints, resolver, and both write paths).
+const pveConfigKeyBalloon = "balloon"
+
 // pveConfigKeyMachine is the PVE VM config key for the QEMU machine type.
 // Defined as a constant to satisfy goconst (the literal "machine" appears
 // multiple times across allowlist, switch, and test code).
@@ -62,27 +67,35 @@ var pveConfigAllowlist = map[string]struct{}{
 // Index-based keys are represented as prefixes (net, scsi, ide, virtio) and
 // matched by prefix in validatePVEConfigKey.
 var pveConfigBlocklist = map[string]struct{}{
-	"cores":         {},
-	"memory":        {},
-	"sockets":       {},
-	"boot":          {},
-	metadataKeyName: {},
-	jsonKeyTags:     {},
-	"hotplug":       {},
-	"numa":          {},
-	"smbios1":       {},
-	"agent":         {},
-	"onboot":        {},
-	"tablet":        {},
-	"vmgenid":       {},
-	"description":   {},
-	"ostype":        {},
-	"args":          {},
+	"cores":             {},
+	"memory":            {},
+	"sockets":           {},
+	"boot":              {},
+	metadataKeyName:     {},
+	jsonKeyTags:         {},
+	"hotplug":           {},
+	"numa":              {},
+	pveConfigKeyBalloon: {},
+	"smbios1":           {},
+	"agent":             {},
+	"onboot":            {},
+	"tablet":            {},
+	"vmgenid":           {},
+	"description":       {},
+	"ostype":            {},
+	"args":              {},
 }
 
 // pveConfigBlocklistPrefixes matches indexed PVE keys (net0..net9,
 // scsi0..scsi30, ide0..ide3, virtio0..virtio15).
 var pveConfigBlocklistPrefixes = []string{"net", "scsi", "ide", "virtio"}
+
+// pveConfigBlocklistHints maps blocklisted keys that have a dedicated CPI
+// knob to the redirect appended to their rejection message. Keys listed here
+// must also be present in pveConfigBlocklist.
+var pveConfigBlocklistHints = map[string]string{
+	pveConfigKeyBalloon: "use pve.balloon or cloud_properties.balloon instead",
+}
 
 // pveConfigMetacharPattern holds the shell metacharacters rejected in
 // pve_config values. Values travel via the PVE REST API (not a shell), but
@@ -216,7 +229,15 @@ func applyPVEConfigPassthrough(
 // validatePVEConfigKey returns a non-retriable CloudError when k is
 // blocklisted (CPI-managed) or not in the allowlist (unknown/unsupported).
 func validatePVEConfigKey(k string) error {
-	// Exact blocklist check first — gives a more specific message.
+	// Exact blocklist check first — gives a more specific message. Keys with
+	// a dedicated CPI knob carry a redirect hint so operators land on the
+	// supported surface instead of the raw passthrough.
+	if hint, hasHint := pveConfigBlocklistHints[k]; hasHint {
+		return cpierrors.Cloud(
+			"create_vm: pve_config key %q is managed by the CPI and cannot be set via pve_config; %s",
+			k, hint,
+		)
+	}
 	if _, blocked := pveConfigBlocklist[k]; blocked {
 		return cpierrors.Cloud(
 			"create_vm: pve_config key %q is managed by the CPI and cannot be set via pve_config; "+

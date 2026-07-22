@@ -91,6 +91,7 @@ The CPI exposes properties under the `pve.*` and `agent.*` namespaces. The most 
 | `pve.iso_storage` | Storage pool for per-VM ConfigDrive ISOs | `local` |
 | `pve.network_bridge` | Default Linux bridge for VM NICs | `vmbr0` |
 | `pve.cpu_type` | Emulated CPU model (`host` = full physical feature set; set `x86-64-v2-AES` on mixed-CPU clusters that live-migrate) | `host` |
+| `pve.balloon` | Memory ballooning (`"0"` disables the balloon device; a MiB floor enables auto-ballooning; `pve-default` restores PVE's default) | `"0"` |
 | `pve.network_mode` | Managed-network mode (`sdn`, `bridge`, `auto`) | `auto` |
 | `pve.agent_mode` | Agent bootstrap mode (`cloudinit`, `noagent`, `auto`) | `cloudinit` |
 
