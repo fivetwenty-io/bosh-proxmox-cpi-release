@@ -111,13 +111,20 @@ or unattachable disk.
 
 ## Disk CID encoding
 
-Disk CIDs produced by `create_disk` use the format:
+Disk CIDs produced by `create_disk` use the `pvd-` envelope format:
 
 ```
-<storage>:<volume>[|<base64url-JSON>]
+pvd-<base64url(JSON payload)>
 ```
 
-The optional `|` suffix encodes a `DiskCIDMeta` struct with the following fields:
+The payload is a JSON object with two fields:
+
+| Field | Description                                                                            |
+| ----- | -------------------------------------------------------------------------------------- |
+| `v`   | The exact PVE volid (`<storage>:<volume>`) — what every PVE storage API call receives. |
+| `m`   | Optional `DiskCIDMeta` placement metadata; omitted when all fields are zero-valued.    |
+
+`DiskCIDMeta` carries:
 
 | Field  | Description                                                                               |
 | ------ | ----------------------------------------------------------------------------------------- |
@@ -126,22 +133,38 @@ The optional `|` suffix encodes a `DiskCIDMeta` struct with the following fields
 | `az`   | Availability-zone label at create time. Empty when no AZ was resolved.                   |
 | `opts` | Per-disk performance settings map (iothread, cache, discard, ssd, mbps_rd, etc.).        |
 
-The suffix uses RFC 4648 §5 base64url encoding with no padding. The CPI
-strips this suffix before any PVE API call; the bare `<storage>:<volume>` string is what PVE
-storage APIs expect.
+The envelope uses RFC 4648 §5 base64url encoding with no padding, so an emitted
+CID contains only `[A-Za-z0-9_-]`. That charset is the point: PVE's own volids
+are REST-hostile as Director-visible identifiers. A path-form volid
+(`local:9001/vm-9001-disk-0.qcow2`) embeds `/`, which 404s the Director's
+`/disks/<cid>/attachments` route, and the earlier `|` metadata separator was
+mangled by `bosh` CLI argument passthrough — together they made
+`bosh attach-disk` unusable. The CPI decodes the envelope back to the exact
+bare volid before any PVE API call.
 
-Example annotated CID:
+Example CID for `local-lvm:vm-300-disk-0` with an `iothread` option:
 
 ```
-local-lvm:vm-300-disk-0|eyJwb29sIjoibG9jYWwtbHZtIiwib3B0cyI6eyJpb3RocmVhZCI6InRydWUifX0
+pvd-eyJ2IjoibG9jYWwtbHZtOnZtLTMwMC1kaXNrLTAiLCJtIjp7InBvb2wiOiJsb2NhbC1sdm0iLCJvcHRzIjp7ImlvdGhyZWFkIjoidHJ1ZSJ9fX0
 ```
 
 `attach_disk` decodes the `opts` map and merges it with the global `pve.disk_performance.*`
 config; per-disk values win over global defaults.
 
-When all `DiskCIDMeta` fields are zero-valued, `create_disk` returns the bare CID unchanged,
-preserving backward compatibility with deployments that do not use performance options or AZ
-placement.
+Two legacy formats from earlier releases decode forever, because the Director
+replays stored CIDs indefinitely: the bare volid (`<storage>:<volume>`) and the
+pipe-annotated form (`<storage>:<volume>|<base64url-JSON DiskCIDMeta>`). A PVE
+storage whose name literally starts with `pvd-` still parses correctly — its
+bare CID contains `:`, which can never appear in a valid base64url payload, so
+the decoder falls back to the legacy paths.
+
+`create_disk` logs a warning when an emitted CID exceeds 255 characters:
+MySQL-backed Directors store `disk_cid` in a `VARCHAR(255)` column, and the
+envelope can cross that bound when long storage names combine with many
+per-disk performance options.
+
+`get_disks` intentionally keeps returning bare volids, matching what PVE
+reports and what earlier releases returned.
 
 ## Worked examples
 

@@ -184,7 +184,7 @@ Destroying a VM needs no membership cleanup: PVE removes a destroyed VM's pool m
 
 ### Layered cloud properties and storage tiers
 
-`newLayeredResolver` reads `vm_type` and `disk_type` string selectors from the call's cloud properties into the configured profile maps, then resolves each key across the layers call → disk_type → vm_type → global config, with the call winning. `storage_tiers` adds a layer that matches against live PVE storage, and the global `DiskPerformance` config is the final fallback. Per-disk performance options (iothread, cache, discard, ssd, mbps, iops) are encoded into the disk CID string as a base64+JSON rider, so `attach_disk` decodes them and merges with global config without any out-of-band state. See [Persistent Disks](persistent-disks.md) and [Configuration](configuration.md).
+`newLayeredResolver` reads `vm_type` and `disk_type` string selectors from the call's cloud properties into the configured profile maps, then resolves each key across the layers call → disk_type → vm_type → global config, with the call winning. `storage_tiers` adds a layer that matches against live PVE storage, and the global `DiskPerformance` config is the final fallback. Per-disk performance options (iothread, cache, discard, ssd, mbps, iops) are carried in the disk CID's `pvd-` envelope payload (base64url-encoded JSON), so `attach_disk` decodes them and merges with global config without any out-of-band state. See [Persistent Disks](persistent-disks.md) and [Configuration](configuration.md).
 
 ### Agent mode selection
 

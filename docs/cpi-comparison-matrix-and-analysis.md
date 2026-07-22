@@ -725,11 +725,13 @@ delete path already tolerates `light:`-prefixed and bare CIDs). `create_disk` re
 pool + home node; `attach_disk` and scoring read it. Ship this before §7.3, which
 depends on it.
 
-**Shipped.** `EncodeDiskCID` (`internal/pve/disk.go:127-138`) appends a base64url-JSON
-suffix to the bare CID behind a pipe separator — `<storage>:<volid>|<base64url>` — carrying
-`{Pool, Node, AZ, Opts}` (`DiskCIDMeta`, `disk.go:86-107`). `create_disk` writes it
-(`create_disk.go:451-456`); `attach_disk`, `update_disk`, and placement decode via
-`ParseEncodedDiskCID`. Pool is always recorded, Node for local backends, AZ when
+**Shipped.** `EncodeDiskCID` (`internal/pve/disk.go`) wraps the bare volid and
+`{Pool, Node, AZ, Opts}` (`DiskCIDMeta`) in a REST-path-safe envelope —
+`pvd-<base64url(JSON{"v","m"})>`, charset `[A-Za-z0-9_-]` only, since raw volids
+embed `/` on file storage and the earlier pipe separator broke `bosh attach-disk`.
+`create_disk` writes it; `attach_disk`, `update_disk`, and placement decode via
+`ParseEncodedDiskCID`, which also decodes the legacy bare and pipe-annotated
+forms forever. Pool is always recorded, Node for local backends, AZ when
 `cloud_properties.availability_zone` is supplied. **Why it matters here.** This is the
 durable carrier the §7.3 fault-domain fix reads, and it makes re-attach deterministic — in a
 tiered cluster (ceph-nvme hot vs local-zfs bulk) a fast-pool disk can no longer silently

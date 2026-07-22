@@ -81,9 +81,9 @@ flowchart LR
 
 <!--
 - Decision: identity will live in the CID because the CPI is stateless — no in-process disk index; the Director carries the encoded record and re-presents it each call.
-- Format will be storage:volume plus an optional |base64url-JSON suffix (RFC 4648 §5, no padding) holding pool, node, AZ, and per-disk perf opts.
-- We will strip the encoded suffix before every PVE call — storage APIs only understand the bare storage:volume string.
-- When all meta fields are zero-valued we will emit the bare CID unchanged — backward compatible with deployments not using perf or AZ placement.
+- Format will be a pvd- envelope — base64url JSON (RFC 4648 §5, no padding) wrapping the storage:volume volid plus pool, node, AZ, and per-disk perf opts — so the Director-visible CID never carries REST-hostile characters.
+- We will decode the envelope back to the bare volid before every PVE call — storage APIs only understand the bare storage:volume string.
+- When all meta fields are zero-valued we will omit the metadata from the envelope payload.
 - Persistent disks will get their own VMID band (9000–29999 default) so the synthetic container VMID can't collide with workload VMs.
 - Lifecycle ops will split on the storage lock: create_disk/delete_disk will take the PVE per-storage lockfile and get exponential-backoff retry (10 attempts, ~124s worst case); attach/detach will be pure config PUTs and never contend.
 -->

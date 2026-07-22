@@ -416,7 +416,7 @@ The disk CID may carry an optional encoded metadata suffix (see [Disk CID Encodi
 
 **Notes:** Used by cloudcheck to reconcile disk attachment state.
 
-The following slots are always excluded from results: `scsi0` (SCSI root disk), `virtio0` (virtio root disk), `ide0`, and `ide2`. Disks whose PVE option string contains `media=cdrom` are excluded regardless of slot. Returned CIDs are bare volids (`<storage>:<volume>`) without option strings.
+The following slots are always excluded from results: `scsi0` (SCSI root disk), `virtio0` (virtio root disk), `ide0`, and `ide2`. Disks whose PVE option string contains `media=cdrom` are excluded regardless of slot. Returned CIDs are intentionally bare volids (`<storage>:<volume>`) without option strings — matching what PVE reports, not the `pvd-` envelope form `create_disk` returns.
 
 The CPI locates the VM via a cluster scan (`FindVMNodeViaCluster`) before fetching its config, so the result is authoritative after an HA failover.
 
