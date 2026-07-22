@@ -64,7 +64,11 @@ type attachedVM struct {
 //   - SDK API errors → CloudError wrapping the SDK error.
 //   - Ambiguous attachment → CloudError.
 func HandleSetDiskMetadata(deps Deps) cpi.Handler {
-	return cpi.HandlerFunc(func(ctx context.Context, args []json.RawMessage, _ jsonrpc.Context) (any, error) {
+	return cpi.HandlerFunc(func(ctx context.Context, args []json.RawMessage, reqCtx jsonrpc.Context) (any, error) {
+		deps, err := deps.WithRequestOverrides(ctx, reqCtx)
+		if err != nil {
+			return nil, err
+		}
 		// --- decode args ---
 		if len(args) < 2 {
 			return nil, cpierrors.Cloud(

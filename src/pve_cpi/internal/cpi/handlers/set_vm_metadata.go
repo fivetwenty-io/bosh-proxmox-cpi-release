@@ -52,7 +52,11 @@ const maxTagLength = 255
 // Empty metadata is valid; description and tags will be empty strings.
 // Returns nil result on success.
 func HandleSetVMMetadata(deps Deps) cpi.Handler {
-	return cpi.HandlerFunc(func(ctx context.Context, args []json.RawMessage, _ jsonrpc.Context) (any, error) {
+	return cpi.HandlerFunc(func(ctx context.Context, args []json.RawMessage, reqCtx jsonrpc.Context) (any, error) {
+		deps, err := deps.WithRequestOverrides(ctx, reqCtx)
+		if err != nil {
+			return nil, err
+		}
 		// --- argument extraction ---
 		if len(args) < 1 {
 			return nil, cpierrors.Cloud("set_vm_metadata: missing required argument vm_cid")

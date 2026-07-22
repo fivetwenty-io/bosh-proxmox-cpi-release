@@ -328,7 +328,11 @@ func fastPathDeleteVM(ctx context.Context, deps Deps, node, vmCID string, vmid i
 //
 //nolint:gocognit // Orchestration shell: locate+stop+guard+delete+await+agent-cleanup. Steps are individually simple; combined complexity is inherent to the idempotent delete contract.
 func HandleDeleteVM(deps Deps) cpi.Handler {
-	return cpi.HandlerFunc(func(ctx context.Context, args []json.RawMessage, _ jsonrpc.Context) (any, error) {
+	return cpi.HandlerFunc(func(ctx context.Context, args []json.RawMessage, reqCtx jsonrpc.Context) (any, error) {
+		deps, err := deps.WithRequestOverrides(ctx, reqCtx)
+		if err != nil {
+			return nil, err
+		}
 		// --- argument extraction ---
 		if len(args) < 1 {
 			return nil, cpierrors.Cloud("delete_vm: missing required argument vm_cid")

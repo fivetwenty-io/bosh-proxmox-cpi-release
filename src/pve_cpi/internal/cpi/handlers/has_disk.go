@@ -26,7 +26,11 @@ import (
 // Node selection: deps.Config.Node is used as the target node. Shared storage
 // volumes are cluster-visible; local storage volumes require the correct node.
 func HandleHasDisk(deps Deps) Handler {
-	return HandlerFunc(func(ctx context.Context, args []json.RawMessage, _ jsonrpc.Context) (any, error) {
+	return HandlerFunc(func(ctx context.Context, args []json.RawMessage, reqCtx jsonrpc.Context) (any, error) {
+		deps, err := deps.WithRequestOverrides(ctx, reqCtx)
+		if err != nil {
+			return nil, err
+		}
 		// ----------------------------------------------------------------
 		// 1. Unmarshal and validate arguments.
 		// ----------------------------------------------------------------

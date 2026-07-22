@@ -52,7 +52,11 @@ func unparkBeforeDelete(ctx context.Context, deps Deps, diskCID, bareDiskCID str
 // from the node that hosts them. Operators using local storage must ensure the
 // configured node matches the volume's location.
 func HandleDeleteDisk(deps Deps) Handler {
-	return HandlerFunc(func(ctx context.Context, args []json.RawMessage, _ jsonrpc.Context) (any, error) {
+	return HandlerFunc(func(ctx context.Context, args []json.RawMessage, reqCtx jsonrpc.Context) (any, error) {
+		deps, err := deps.WithRequestOverrides(ctx, reqCtx)
+		if err != nil {
+			return nil, err
+		}
 		// ----------------------------------------------------------------
 		// 1. Unmarshal and validate arguments.
 		// ----------------------------------------------------------------

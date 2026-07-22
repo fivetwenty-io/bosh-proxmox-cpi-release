@@ -73,7 +73,11 @@ type diskHints struct {
 // order (see the System field comment in create_vm.go's agentCfg
 // construction) finds it correctly either way with no agent-config change.
 func HandleAttachDisk(deps Deps) Handler {
-	return HandlerFunc(func(ctx context.Context, args []json.RawMessage, _ jsonrpc.Context) (any, error) {
+	return HandlerFunc(func(ctx context.Context, args []json.RawMessage, reqCtx jsonrpc.Context) (any, error) {
+		deps, err := deps.WithRequestOverrides(ctx, reqCtx)
+		if err != nil {
+			return nil, err
+		}
 		// --------------------------------------------------------------------
 		// 1. Unmarshal and validate arguments.
 		// --------------------------------------------------------------------

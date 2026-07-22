@@ -253,7 +253,11 @@ func createDiskAttemptBudgets(deps Deps) (maxAttempts, lockAttempts int) {
 // local storage must ensure vm_cid and the new disk share the same node.
 // nolint:gocognit // Orchestration shell: parse args, attemptCreateVolume retry loop, deferred rollbackCreatedVolume. The retry+rollback wiring lives in extracted helpers; the closure carries the orchestration glue.
 func HandleCreateDisk(deps Deps) Handler {
-	return HandlerFunc(func(ctx context.Context, args []json.RawMessage, _ jsonrpc.Context) (any, error) {
+	return HandlerFunc(func(ctx context.Context, args []json.RawMessage, reqCtx jsonrpc.Context) (any, error) {
+		deps, err := deps.WithRequestOverrides(ctx, reqCtx)
+		if err != nil {
+			return nil, err
+		}
 		// ----------------------------------------------------------------
 		// 1. Unmarshal and validate arguments.
 		// ----------------------------------------------------------------

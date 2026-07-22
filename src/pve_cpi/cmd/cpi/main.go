@@ -497,13 +497,29 @@ func runWithArgs(args []string, stdin io.Reader, stdout, stderr io.Writer, opts 
 		logger.Info("redacted request/response trace enabled")
 	}
 	d := cpi.NewDispatcherWithOptions(logger, dispatcherOpts...)
+
+	// Per-request pve_* context config overrides (BOSH cpi-config multi-CPI
+	// support — see internal/cpi/handlers/context_override.go). The
+	// ClientFactory closure reuses the exact clientFactory/clientTracer pair
+	// already resolved above for the job-level client, so an overridden
+	// request's PVE client is decorated identically (tracing on/off,
+	// injected test factory) to the job-level one — only cfg and logger vary
+	// per call.
+	overrideRuntime := &handlers.RequestOverrideRuntime{
+		ClientFactory: func(effCfg *config.CPIConfig, effLogger *log.Logger) (pve.Client, error) {
+			return clientFactory(effCfg, effLogger, clientTracer)
+		},
+		Logger: logger,
+	}
+
 	handlers.RegisterAll(d, handlers.Deps{
-		Config:   cfg,
-		PVE:      client,
-		Agent:    bootAgent,
-		Logger:   logger,
-		Resolver: backendResolver,
-		Inflight: handlers.NewInflightRegistry(),
+		Config:    cfg,
+		PVE:       client,
+		Agent:     bootAgent,
+		Logger:    logger,
+		Resolver:  backendResolver,
+		Inflight:  handlers.NewInflightRegistry(),
+		Overrides: overrideRuntime,
 	})
 
 	maxLine := opts.MaxLineBytes

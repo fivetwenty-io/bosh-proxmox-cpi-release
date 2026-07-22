@@ -80,7 +80,11 @@ const vlanMaxTag = 4094
 //     or config sdn_zone) or a vnet is named; bridge fallback otherwise.
 //   - No routing info → cpierrors.Cloud.
 func HandleCreateNetwork(deps Deps) cpi.Handler {
-	return cpi.HandlerFunc(func(ctx context.Context, args []json.RawMessage, _ jsonrpc.Context) (any, error) {
+	return cpi.HandlerFunc(func(ctx context.Context, args []json.RawMessage, reqCtx jsonrpc.Context) (any, error) {
+		deps, err := deps.WithRequestOverrides(ctx, reqCtx)
+		if err != nil {
+			return nil, err
+		}
 		return createNetwork(ctx, deps, args)
 	})
 }

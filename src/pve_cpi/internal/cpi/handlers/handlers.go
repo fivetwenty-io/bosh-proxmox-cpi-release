@@ -44,6 +44,14 @@ type Deps struct {
 	// NewInflightRegistry so all handlers share it. Nil (e.g. in test Deps
 	// literals) behaves as unlimited: acquire is nil-receiver-safe.
 	Inflight *nodeInflightRegistry
+	// Overrides enables per-request pve_* context config overrides (BOSH
+	// cpi-config multi-cluster support — see context_override.go). Every
+	// handler's top-level wrapper calls Deps.WithRequestOverrides, which is a
+	// no-op returning Deps unchanged whenever Overrides is nil (the zero
+	// value; every existing handler-unit-test Deps literal leaves this
+	// unset), so this field is opt-in and does not change behavior for any
+	// deployment or test that does not wire it.
+	Overrides *RequestOverrideRuntime
 }
 
 // Log returns the per-request, span-correlated logger stored in ctx (attached

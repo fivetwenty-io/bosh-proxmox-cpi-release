@@ -124,6 +124,154 @@ func TestDecode_NilReader(t *testing.T) {
 	}
 }
 
+// -----------------------------------------------------------------------
+// Context.Extra capture (context config overrides — see
+// config.ApplyContextOverrides and handlers.Deps.WithRequestOverrides)
+// -----------------------------------------------------------------------
+
+// TestContext_UnmarshalJSON_ExtraCapturesArbitraryPVEKeys is a decode
+// round-trip test: a context object carrying pve_* keys BOSH's cpi-config
+// feature merges in for a multi-cluster CPI entry must have those keys
+// land in Context.Extra with their original JSON-decoded types preserved
+// (string stays string, number decodes float64, bool stays bool), while the
+// known typed fields (director_uuid, request_id) still decode exactly as
+// before Extra capture existed.
+func TestContext_UnmarshalJSON_ExtraCapturesArbitraryPVEKeys(t *testing.T) {
+	t.Parallel()
+	input := `{
+		"director_uuid": "550e8400-e29b-41d4-a716-446655440000",
+		"request_id": "cpi-abc123",
+		"pve_host": "10.255.0.10",
+		"pve_port": 8006,
+		"pve_verify_ssl": false,
+		"pve_vm_storage": "az2-vms"
+	}`
+
+	var ctx Context
+	if err := json.Unmarshal([]byte(input), &ctx); err != nil {
+		t.Fatalf("Unmarshal: unexpected error: %v", err)
+	}
+
+	if ctx.DirectorUUID != "550e8400-e29b-41d4-a716-446655440000" {
+		t.Errorf("DirectorUUID = %q, want the known UUID", ctx.DirectorUUID)
+	}
+	if ctx.RequestID != "cpi-abc123" {
+		t.Errorf("RequestID = %q, want cpi-abc123", ctx.RequestID)
+	}
+
+	if got, want := len(ctx.Extra), 4; got != want {
+		t.Fatalf("len(Extra) = %d, want %d (Extra=%#v)", got, want, ctx.Extra)
+	}
+	if host, ok := ctx.Extra["pve_host"].(string); !ok || host != "10.255.0.10" {
+		t.Errorf("Extra[pve_host] = %#v, want string \"10.255.0.10\"", ctx.Extra["pve_host"])
+	}
+	// JSON numbers decode as float64 into map[string]any, matching every
+	// other any-typed JSON decode in this codebase (see e.g.
+	// TestDecode_Valid's api_version assertion above).
+	if port, ok := ctx.Extra["pve_port"].(float64); !ok || port != 8006 {
+		t.Errorf("Extra[pve_port] = %#v, want float64(8006)", ctx.Extra["pve_port"])
+	}
+	if verifySSL, ok := ctx.Extra["pve_verify_ssl"].(bool); !ok || verifySSL != false {
+		t.Errorf("Extra[pve_verify_ssl] = %#v, want bool(false)", ctx.Extra["pve_verify_ssl"])
+	}
+	if storage, ok := ctx.Extra["pve_vm_storage"].(string); !ok || storage != "az2-vms" {
+		t.Errorf("Extra[pve_vm_storage] = %#v, want string \"az2-vms\"", ctx.Extra["pve_vm_storage"])
+	}
+
+	// director_uuid/request_id must NOT also leak into Extra.
+	if _, ok := ctx.Extra["director_uuid"]; ok {
+		t.Error("Extra must not contain the known field \"director_uuid\"")
+	}
+	if _, ok := ctx.Extra["request_id"]; ok {
+		t.Error("Extra must not contain the known field \"request_id\"")
+	}
+}
+
+// TestContext_UnmarshalJSON_NoExtraKeysLeavesExtraNil confirms a context
+// object carrying only the known fields (the overwhelming common case —
+// single-CPI deployments never populate cpi-config properties) decodes with
+// a nil Extra map, so config.ApplyContextOverrides' len(extra)==0 fast path
+// (and every len(reqCtx.Extra)==0 check in handlers.Deps.WithRequestOverrides)
+// is reached without any extra allocation.
+func TestContext_UnmarshalJSON_NoExtraKeysLeavesExtraNil(t *testing.T) {
+	t.Parallel()
+	var ctx Context
+	if err := json.Unmarshal([]byte(`{"director_uuid":"x","request_id":"y"}`), &ctx); err != nil {
+		t.Fatalf("Unmarshal: unexpected error: %v", err)
+	}
+	if ctx.Extra != nil {
+		t.Errorf("Extra = %#v, want nil", ctx.Extra)
+	}
+}
+
+// TestContext_UnmarshalJSON_VMStemcellStillDecodeAsKnownFields guards against
+// a regression where VM/Stemcell would be double-captured into Extra instead
+// of (or in addition to) their typed fields.
+func TestContext_UnmarshalJSON_VMStemcellStillDecodeAsKnownFields(t *testing.T) {
+	t.Parallel()
+	input := `{"vm":{"stemcell":{"api_version":2}},"stemcell":{"foo":"bar"},"pve_node":"pve02"}`
+	var ctx Context
+	if err := json.Unmarshal([]byte(input), &ctx); err != nil {
+		t.Fatalf("Unmarshal: unexpected error: %v", err)
+	}
+	if ctx.VM == nil {
+		t.Fatal("VM should decode into the typed VM field")
+	}
+	if ctx.Stemcell == nil {
+		t.Fatal("Stemcell should decode into the typed Stemcell field")
+	}
+	if _, ok := ctx.Extra["vm"]; ok {
+		t.Error("Extra must not contain the known field \"vm\"")
+	}
+	if _, ok := ctx.Extra["stemcell"]; ok {
+		t.Error("Extra must not contain the known field \"stemcell\"")
+	}
+	if node, ok := ctx.Extra["pve_node"].(string); !ok || node != "pve02" {
+		t.Errorf("Extra[pve_node] = %#v, want string \"pve02\"", ctx.Extra["pve_node"])
+	}
+}
+
+// TestContext_UnmarshalJSON_Null confirms a null context (context field
+// entirely absent, or explicitly null) decodes to a zero Context without error.
+func TestContext_UnmarshalJSON_Null(t *testing.T) {
+	t.Parallel()
+	var ctx Context
+	if err := json.Unmarshal([]byte(`null`), &ctx); err != nil {
+		t.Fatalf("Unmarshal(null): unexpected error: %v", err)
+	}
+	if ctx.Extra != nil || ctx.DirectorUUID != "" || ctx.RequestID != "" {
+		t.Errorf("Unmarshal(null) should leave a zero Context, got %#v", ctx)
+	}
+}
+
+// TestRequest_Decode_CapturesContextExtra is an end-to-end round trip through
+// the Request envelope (the actual production decode path in cmd/cpi's
+// decodeRequest / jsonrpc.Decode), confirming context.Extra survives nested
+// inside a full Request decode, not only a standalone Context decode.
+func TestRequest_Decode_CapturesContextExtra(t *testing.T) {
+	t.Parallel()
+	input := `{
+		"method": "create_stemcell",
+		"arguments": ["/tmp/image.tgz", {}],
+		"context": {
+			"director_uuid": "d1",
+			"request_id": "r1",
+			"pve_host": "10.255.0.10",
+			"pve_api_token": "root@pam!cpi=deadbeef"
+		}
+	}`
+	req, err := Decode(strings.NewReader(input))
+	if err != nil {
+		t.Fatalf("Decode: unexpected error: %v", err)
+	}
+	if req.Context.Extra["pve_host"] != "10.255.0.10" {
+		t.Errorf("Context.Extra[pve_host] = %#v, want \"10.255.0.10\"", req.Context.Extra["pve_host"])
+	}
+	if req.Context.Extra["pve_api_token"] != "root@pam!cpi=deadbeef" {
+		t.Errorf("Context.Extra[pve_api_token] = %#v, want the token string", req.Context.Extra["pve_api_token"])
+	}
+}
+
 func TestDecode_EmptyMethod(t *testing.T) {
 	t.Parallel()
 	input := `{"method":"","arguments":[],"context":{}}`

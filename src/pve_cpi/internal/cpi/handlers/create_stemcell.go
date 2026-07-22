@@ -13,6 +13,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -390,7 +391,11 @@ func validateStemcellImagePath(imagePath string) error {
 //
 // nolint:gocognit,gocyclo // Orchestration shell: light-vs-heavy dispatch then heavy-path phases (resolveStemcellStorageAndNode, buildAndDeduplicateStemcellCID, uploadAndReturnCID). Phase logic lives in extracted helpers. CPI v3 env-arg parsing adds one branch to the already-high count.
 func HandleCreateStemcell(deps Deps) cpi.Handler {
-	return cpi.HandlerFunc(func(ctx context.Context, args []json.RawMessage, _ jsonrpc.Context) (any, error) {
+	return cpi.HandlerFunc(func(ctx context.Context, args []json.RawMessage, reqCtx jsonrpc.Context) (any, error) {
+		deps, err := deps.WithRequestOverrides(ctx, reqCtx)
+		if err != nil {
+			return nil, err
+		}
 		// ----------------------------------------------------------------
 		// Step 1a: Parse arg 0 — image_path string (always required)
 		// ----------------------------------------------------------------
@@ -2500,8 +2505,41 @@ func replicateStemcellToNodes(
 		sem <- struct{}{}
 
 		go func() {
+			// H2 (A13 review): this is the only `go func` in non-test CPI
+			// code. Every other request path is protected by the dispatcher's
+			// own recover (internal/cpi/dispatcher.go's Handle) and the
+			// runCPI loop backstop (cmd/cpi/main.go's dispatchOne) — neither
+			// covers a panic in a CHILD goroutine, which propagates past both
+			// and crashes the entire process: stderr gets a stack trace,
+			// stdout (the JSON-RPC response stream) gets nothing, and the
+			// Director sees "unexpected end of input" for whatever request
+			// happened to be in flight when this goroutine's stack unwound —
+			// not necessarily this create_stemcell call itself. Recovering
+			// here degrades a replica-node panic to a logged error, matching
+			// replicateOneNode's own documented contract ("best-effort,
+			// logged as warnings, never returned as errors") instead of
+			// silently violating it by taking the whole process down.
+			//
+			// Defer registration order matters here: Go runs deferred calls
+			// LIFO, so the recover MUST be registered LAST (after wg.Done and
+			// the sem release below) so it fires FIRST during unwind — its
+			// nodeLogger.Error call fully completes before wg.Done() signals
+			// this goroutine as finished. Registering it first (so it runs
+			// LAST) would let wg.Wait() in the caller return while the
+			// recovered panic's log write is still in flight, racing any
+			// caller code that reads/inspects shared state right after
+			// replicateStemcellToNodes returns.
 			defer wg.Done()
 			defer func() { <-sem }() // release slot when node work is done
+			defer func() {
+				if r := recover(); r != nil {
+					nodeLogger.Error(
+						"create_stemcell: replica-node worker panicked (recovered) — this node's replica was not completed; re-run create_stemcell to retry it",
+						log.Any("panic", r),
+						log.String("stack", string(debug.Stack())),
+					)
+				}
+			}()
 
 			replicateOneNode(ctx, deps, nodeLogger, node, storage,
 				qcow2Filename, sha256hex, sha8, uploadSourcePath, uploadStagingDir, cp, source)

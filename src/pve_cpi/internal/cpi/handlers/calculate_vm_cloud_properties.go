@@ -260,7 +260,11 @@ func pickBestNode(candidates []cloudPropsCandidate) string {
 //   - cluster.ListStatus API error → retriable CloudError (5xx/conn) or non-retriable (4xx).
 //   - No qualifying node → NotSupported.
 func HandleCalculateVMCloudProperties(deps Deps) cpi.Handler {
-	return cpi.HandlerFunc(func(ctx context.Context, args []json.RawMessage, _ jsonrpc.Context) (any, error) {
+	return cpi.HandlerFunc(func(ctx context.Context, args []json.RawMessage, reqCtx jsonrpc.Context) (any, error) {
+		deps, err := deps.WithRequestOverrides(ctx, reqCtx)
+		if err != nil {
+			return nil, err
+		}
 		// Decode input.
 		if len(args) == 0 {
 			return nil, cpierrors.Cloud("calculate_vm_cloud_properties: missing required argument vm_resources")

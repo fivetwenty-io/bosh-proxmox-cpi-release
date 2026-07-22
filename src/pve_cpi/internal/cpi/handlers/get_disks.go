@@ -54,7 +54,11 @@ var systemDiskSlots = map[string]bool{
 // VMNotFound: if the cluster scan does not find the VMID, or the Config API
 // returns a 404, the handler returns a VMNotFound error.
 func HandleGetDisks(deps Deps) Handler {
-	return HandlerFunc(func(ctx context.Context, args []json.RawMessage, _ jsonrpc.Context) (any, error) {
+	return HandlerFunc(func(ctx context.Context, args []json.RawMessage, reqCtx jsonrpc.Context) (any, error) {
+		deps, err := deps.WithRequestOverrides(ctx, reqCtx)
+		if err != nil {
+			return nil, err
+		}
 		// ----------------------------------------------------------------
 		// 1. Unmarshal and validate arguments.
 		// ----------------------------------------------------------------

@@ -1411,3 +1411,177 @@ func TestStemcellReplicationConcurrencyValue(t *testing.T) {
 		}
 	})
 }
+
+// ============================================================
+// H2 (A13 review) — a panic in a single replica-node worker goroutine must
+// be recovered, logged, and treated as that node's (best-effort) failure —
+// NOT propagate out of the goroutine, which would crash the whole CPI
+// process (stdout gets nothing, the Director sees "unexpected end of
+// input") regardless of which request happened to be executing at the time.
+// ============================================================
+
+// TestReplicateStemcellToNodes_PanicRecovered injects a panic into one
+// replica node's upload call and asserts:
+//  1. replicateStemcellToNodes itself returns normally (does not propagate
+//     the panic) — if the fix regresses, this test's own process crashes
+//     rather than reporting a controlled failure, since an unrecovered
+//     panic in ANY goroutine terminates the whole program.
+//  2. The panicking node's replica did not complete (no VM create/freeze
+//     call reached for it).
+//  3. The OTHER (non-panicking) replica node still completes fully —
+//     matching replicateOneNode's documented best-effort contract: one
+//     node's failure must not abort replication to the rest.
+//  4. The panic is logged at Error with the recovered value visible in the
+//     log output, so the condition is diagnosable rather than silent.
+func TestReplicateStemcellToNodes_PanicRecovered(t *testing.T) {
+	t.Parallel()
+
+	content := []byte("panic-recovery-test-content")
+	sha256hex := sha256OfBytes(content)
+	tmpDir := t.TempDir()
+	srcPath := fmt.Sprintf("%s/source.qcow2", tmpDir)
+	if err := os.WriteFile(srcPath, content, 0o644); err != nil {
+		t.Fatalf("write src: %v", err)
+	}
+
+	var mu sync.Mutex
+	uploadedNodes := make(map[string]int)
+	frozenNodes := make(map[string]int)
+
+	const panicNode = "pve2"
+	const panicMsg = "injected test panic: simulated corrupt upload state"
+
+	nodesSvc := &countingNodesService{
+		listQemuFn: func(_ context.Context, _ string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
+			empty := sdknodes.ListQemuResponse{}
+			return &empty, nil
+		},
+		listStorageContentFn: func(_ context.Context, _, _ string, _ *sdknodes.ListStorageContentParams) (*sdknodes.ListStorageContentResponse, error) {
+			empty := sdknodes.ListStorageContentResponse{}
+			return &empty, nil
+		},
+		createQemuTemplateFn: func(_ context.Context, node, _ string, _ *sdknodes.CreateQemuTemplateParams) (*sdknodes.CreateQemuTemplateResponse, error) {
+			mu.Lock()
+			frozenNodes[node]++
+			mu.Unlock()
+			resp := sdknodes.CreateQemuTemplateResponse{}
+			return &resp, nil
+		},
+		deleteQemuFn: func(_ context.Context, _ string, _ string, _ *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
+			resp := sdknodes.DeleteQemuResponse{}
+			return &resp, nil
+		},
+	}
+
+	qemuSvc := &replicationMockQEMU{
+		createFn: func(_ context.Context, _ string, _ map[string]any) (string, error) {
+			return "", nil // synchronous create
+		},
+	}
+
+	storageSvc := &replicationMockStorage{
+		uploadFn: func(_ context.Context, node, _, _, _ string, _ io.Reader) (string, error) {
+			if node == panicNode {
+				panic(panicMsg)
+			}
+			mu.Lock()
+			uploadedNodes[node]++
+			mu.Unlock()
+			return "", nil
+		},
+		deleteVolumeIfExistsFn: func(_ context.Context, _, _, _ string) (bool, error) {
+			return true, nil
+		},
+	}
+
+	tasksSvc := &replicationMockTasks{}
+
+	clusterSvc := &countingClusterService{
+		listConfigNodesFn: func(_ context.Context) (*sdkcluster.ListConfigNodesResponse, error) {
+			node2Raw, _ := json.Marshal(map[string]any{"name": "pve2"})
+			node3Raw, _ := json.Marshal(map[string]any{"name": "pve3"})
+			resp := sdkcluster.ListConfigNodesResponse{node2Raw, node3Raw}
+			return &resp, nil
+		},
+	}
+
+	cfg := &config.CPIConfig{
+		Node:                           "pve1",
+		VMStorage:                      "local",
+		StemcellReplicateLocal:         true,
+		StemcellTemplateVMIDRangeStart: 30000,
+		StemcellTemplateVMIDRangeEnd:   30999,
+		// Serial (default) — deterministic ordering makes this test's
+		// assertions unambiguous; the fix's correctness (per-goroutine
+		// recover) does not depend on concurrency level.
+	}
+
+	var logBuf bytes.Buffer
+	logger, logErr := log.NewLogger("debug", &logBuf)
+	if logErr != nil {
+		t.Fatalf("log.NewLogger: %v", logErr)
+	}
+	mockClient := &digestReplicationMockClient{
+		clusterSvc: clusterSvc,
+		nodesSvc:   nodesSvc,
+		qemuSvc:    qemuSvc,
+		storageSvc: storageSvc,
+		tasksSvc:   tasksSvc,
+	}
+	deps := Deps{
+		Config: cfg,
+		PVE:    mockClient,
+		Logger: logger,
+	}
+
+	cp := stemcellCloudProps{Name: "ubuntu-jammy", Version: "1.0"}
+	clusterNodes := []string{"pve1", "pve2", "pve3"}
+
+	// The call under test. If the H2 fix regresses (recover() removed), the
+	// panic in pve2's uploadFn propagates out of its worker goroutine
+	// unrecovered and crashes this entire test binary — there is no way for
+	// a plain t.Errorf to observe that outcome after the fact, which is
+	// exactly why this test's mere ability to reach the assertions below is
+	// itself part of the regression guard.
+	replicateStemcellToNodes(context.Background(), deps, "pve1", "local", "bosh-stemcell.qcow2",
+		sha256hex, clusterNodes, srcPath, "", cp, "")
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	// pve1 is primary — never a replica target.
+	if uploadedNodes["pve1"] != 0 {
+		t.Errorf("primary node pve1 should not receive replica upload, got %d", uploadedNodes["pve1"])
+	}
+
+	// pve2 panicked before recording its upload or reaching freeze — its
+	// replica must NOT have completed.
+	if uploadedNodes[panicNode] != 0 {
+		t.Errorf("panicking node %s: expected 0 recorded uploads (panic occurs before recording), got %d", panicNode, uploadedNodes[panicNode])
+	}
+	if frozenNodes[panicNode] != 0 {
+		t.Errorf("panicking node %s: expected 0 MakeTemplate calls, got %d", panicNode, frozenNodes[panicNode])
+	}
+
+	// pve3 must still complete fully — one node's panic must not abort
+	// replication to the rest (best-effort contract).
+	if uploadedNodes["pve3"] != 1 {
+		t.Errorf("non-panicking node pve3: expected 1 upload, got %d", uploadedNodes["pve3"])
+	}
+	if frozenNodes["pve3"] != 1 {
+		t.Errorf("non-panicking node pve3: expected 1 MakeTemplate call, got %d", frozenNodes["pve3"])
+	}
+
+	// The panic must be logged (at Error), naming both the node and the
+	// recovered panic value, so the condition is diagnosable.
+	logOutput := logBuf.String()
+	if !strings.Contains(logOutput, "panicked") {
+		t.Errorf("log output should mention the panic was recovered; got: %s", logOutput)
+	}
+	if !strings.Contains(logOutput, panicMsg) {
+		t.Errorf("log output should include the recovered panic value %q; got: %s", panicMsg, logOutput)
+	}
+	if !strings.Contains(logOutput, panicNode) {
+		t.Errorf("log output should name the panicking replica node %q; got: %s", panicNode, logOutput)
+	}
+}

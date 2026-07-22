@@ -42,7 +42,11 @@ import (
 //  3. the zone is not an EVPN zone (operator-owned fabric, never CPI-deleted)
 //  4. ListSDNVnets filtered by zone returns 0 remaining vnets
 func HandleDeleteNetwork(deps Deps) cpi.Handler {
-	return cpi.HandlerFunc(func(ctx context.Context, args []json.RawMessage, _ jsonrpc.Context) (any, error) {
+	return cpi.HandlerFunc(func(ctx context.Context, args []json.RawMessage, reqCtx jsonrpc.Context) (any, error) {
+		deps, err := deps.WithRequestOverrides(ctx, reqCtx)
+		if err != nil {
+			return nil, err
+		}
 		return nil, deleteNetwork(ctx, deps, args)
 	})
 }

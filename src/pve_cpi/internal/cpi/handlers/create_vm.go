@@ -419,7 +419,11 @@ type createVMShape struct {
 // Rollback: if any step after VM creation fails, the VM is stopped (best-effort)
 // and destroyed (purge=true) before the error is returned.
 func HandleCreateVM(deps Deps) cpi.Handler {
-	return cpi.HandlerFunc(func(ctx context.Context, args []json.RawMessage, _ jsonrpc.Context) (any, error) {
+	return cpi.HandlerFunc(func(ctx context.Context, args []json.RawMessage, reqCtx jsonrpc.Context) (any, error) {
+		deps, err := deps.WithRequestOverrides(ctx, reqCtx)
+		if err != nil {
+			return nil, err
+		}
 		return createVM(ctx, deps, args)
 	})
 }

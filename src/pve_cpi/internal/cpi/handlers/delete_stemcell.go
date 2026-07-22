@@ -47,7 +47,11 @@ import (
 //   - config.Node is empty (for volume and template paths).
 //   - PVE API failure other than not-found.
 func HandleDeleteStemcell(deps Deps) cpi.Handler {
-	return cpi.HandlerFunc(func(ctx context.Context, args []json.RawMessage, _ jsonrpc.Context) (any, error) {
+	return cpi.HandlerFunc(func(ctx context.Context, args []json.RawMessage, reqCtx jsonrpc.Context) (any, error) {
+		deps, err := deps.WithRequestOverrides(ctx, reqCtx)
+		if err != nil {
+			return nil, err
+		}
 		// ----------------------------------------------------------------
 		// Arg 0: stemcell_cid
 		// ----------------------------------------------------------------

@@ -43,9 +43,91 @@ type Context struct {
 	// Stemcell carries optional stemcell-level hints.
 	Stemcell map[string]any `json:"stemcell,omitempty"`
 
-	// Extra holds any unrecognised context keys for forward compatibility.
-	// Fields stored here are not round-tripped through JSON (tag "-").
+	// Extra holds any unrecognised context keys for forward compatibility —
+	// notably the pve_* connection/routing overrides BOSH's cpi-config
+	// feature merges into context.properties for a director entry that
+	// targets a non-default PVE cluster (see config.ApplyContextOverrides
+	// and handlers.Deps.WithRequestOverrides). Populated by Context's custom
+	// UnmarshalJSON (below); tag "-" only prevents the standard encoding/json
+	// machinery from separately trying to (un)marshal a field named "Extra"
+	// literally — UnmarshalJSON fills it directly from the raw object.
 	Extra map[string]any `json:"-"`
+}
+
+// knownContextFields lists the Context JSON keys decoded into typed fields
+// above. UnmarshalJSON (below) routes every OTHER top-level key of the
+// context object into Extra instead of silently discarding it.
+var knownContextFields = map[string]struct{}{
+	"director_uuid": {},
+	"request_id":    {},
+	"vm":            {},
+	"stemcell":      {},
+}
+
+// UnmarshalJSON decodes a Context, populating the typed fields exactly as
+// plain struct-tag decoding would, and additionally capturing every
+// top-level JSON key NOT in knownContextFields into Extra as a generic
+// decoded value (string, float64, bool, map[string]any, []any, or nil —
+// standard encoding/json-into-any shapes).
+//
+// This exists because a Context previously silently discarded any context
+// key it did not itself declare (e.g. the director_uuid/request_id/vm/
+// stemcell above) — including the pve_* per-request routing properties
+// BOSH's cpi-config feature merges into context.properties when a director
+// runs multiple named CPI entries against distinct PVE clusters, all backed
+// by this one CPI binary. Without Extra capture those keys never reach
+// config.ApplyContextOverrides, and every dispatched request silently runs
+// against whichever cluster this process happened to be launched with.
+//
+// Failure modes:
+//   - data is not a JSON object (or is malformed JSON) → wrapped decode error.
+//   - A known field's value has the wrong JSON type (e.g. "vm" is a string,
+//     not an object) → wrapped decode error, matching plain struct decoding.
+//   - An extra key's raw value itself is malformed JSON → that single key is
+//     skipped from Extra rather than failing the whole Context decode; this
+//     can only happen if the outer json.Unmarshal already partially decoded
+//     the object into map[string]json.RawMessage, which by construction only
+//     contains syntactically valid JSON fragments, so this branch is
+//     defensive and not expected to be reachable in practice.
+//
+// data may be nil or the literal "null"; both decode to a zero Context.
+func (c *Context) UnmarshalJSON(data []byte) error {
+	// contextAlias has the same fields/tags as Context but not Context's own
+	// UnmarshalJSON, so decoding into it uses plain reflection-based decoding
+	// (avoiding infinite recursion) while still filling DirectorUUID/
+	// RequestID/VM/Stemcell exactly as before this method existed.
+	type contextAlias Context
+	var a contextAlias
+	if err := json.Unmarshal(data, &a); err != nil {
+		return fmt.Errorf("jsonrpc: decode context: %w", err)
+	}
+	*c = Context(a)
+	c.Extra = nil
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		// data was valid JSON (the decode above succeeded) but not an object
+		// (e.g. context: null decodes raw as a nil map with no error, but
+		// context: "oops" would fail here); mirror the same error the typed
+		// decode above would already have produced for a non-object context.
+		return fmt.Errorf("jsonrpc: decode context: %w", err)
+	}
+	for key, val := range raw {
+		if _, known := knownContextFields[key]; known {
+			continue
+		}
+		var decoded any
+		if err := json.Unmarshal(val, &decoded); err != nil {
+			// Defensive only — see doc comment. Skip rather than fail the
+			// whole Context decode over one unparsable extra key.
+			continue
+		}
+		if c.Extra == nil {
+			c.Extra = make(map[string]any, len(raw))
+		}
+		c.Extra[key] = decoded
+	}
+	return nil
 }
 
 // -----------------------------------------------------------------------

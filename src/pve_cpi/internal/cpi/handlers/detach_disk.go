@@ -137,7 +137,11 @@ func detachDiskResolveSlot(
 //
 // The disk volume is NOT deleted from storage; that is handled by delete_disk.
 func HandleDetachDisk(deps Deps) Handler {
-	return HandlerFunc(func(ctx context.Context, args []json.RawMessage, _ jsonrpc.Context) (any, error) {
+	return HandlerFunc(func(ctx context.Context, args []json.RawMessage, reqCtx jsonrpc.Context) (any, error) {
+		deps, err := deps.WithRequestOverrides(ctx, reqCtx)
+		if err != nil {
+			return nil, err
+		}
 		// --------------------------------------------------------------------
 		// 1. Unmarshal and validate arguments.
 		// --------------------------------------------------------------------
