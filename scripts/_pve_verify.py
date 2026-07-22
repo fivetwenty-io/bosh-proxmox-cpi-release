@@ -38,6 +38,7 @@ import json
 import re
 import ssl
 import sys
+import zlib
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -49,16 +50,24 @@ class PVEVerifyError(RuntimeError):
     """Raised on transport, auth, or assertion failure (not on a clean absent)."""
 
 
+# Decompression cap for pvz- envelopes, mirroring maxDiskCIDEnvelopeBytes in
+# internal/pve/disk.go: real envelopes are a few hundred bytes; the cap stops
+# a hostile CID from decompression-bombing the verifier.
+_MAX_ENVELOPE_BYTES = 64 * 1024
+
+
 def _bare_disk_cid(disk_cid: str) -> str:
     """Decode a disk CID to its bare '<storage>:<volid>' form.
 
     Mirrors the Go codec's decode order (internal/pve/disk.go):
 
     1. 'pvd-<base64url(json)>' envelope — the bare volid is the payload's "v".
-    2. On envelope decode failure, fall back to the legacy paths only when the
-       CID contains ':' (a PVE storage literally named 'pvd-*'); otherwise the
-       CID was meant to be an envelope and its corruption raises.
-    3. Legacy: strip an optional '|<base64url-metadata>' suffix.
+    2. 'pvz-<base64url(gzip(json))>' compressed envelope (opt-in
+       disk_cid_compression) — same payload, gzip container, size-capped.
+    3. On envelope decode failure, fall back to the legacy paths only when the
+       CID contains ':' (a PVE storage literally named 'pvd-*'/'pvz-*');
+       otherwise the CID was meant to be an envelope and its corruption raises.
+    4. Legacy: strip an optional '|<base64url-metadata>' suffix.
     """
     if disk_cid.startswith("pvd-"):
         payload = disk_cid[len("pvd-"):]
@@ -79,6 +88,31 @@ def _bare_disk_cid(disk_cid: str) -> str:
                     f"disk_cid {disk_cid!r}: invalid pvd envelope: {exc}"
                 ) from exc
             # Legacy CID on a 'pvd-*'-named storage — fall through.
+    if disk_cid.startswith("pvz-"):
+        payload = disk_cid[len("pvz-"):]
+        try:
+            if not re.fullmatch(r"[A-Za-z0-9_-]+", payload):
+                raise ValueError("payload is not unpadded base64url")
+            raw = base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4))
+            # wbits=16+MAX_WBITS accepts only the gzip container, matching
+            # Go's gzip.NewReader. max_length caps the inflation; a stream
+            # that fills the cap without reaching EOF is over the limit.
+            decomp = zlib.decompressobj(16 + zlib.MAX_WBITS)
+            data = decomp.decompress(raw, _MAX_ENVELOPE_BYTES + 1)
+            if len(data) > _MAX_ENVELOPE_BYTES or not decomp.eof:
+                raise ValueError("decompressed envelope exceeds size cap")
+            if decomp.unused_data:
+                raise ValueError("trailing bytes after gzip stream")
+            volid = json.loads(data)["v"]
+            if not isinstance(volid, str) or not volid:
+                raise ValueError("envelope volid is empty")
+            return volid
+        except (ValueError, KeyError, TypeError, zlib.error) as exc:
+            if ":" not in disk_cid:
+                raise PVEVerifyError(
+                    f"disk_cid {disk_cid!r}: invalid pvz envelope: {exc}"
+                ) from exc
+            # Legacy CID on a 'pvz-*'-named storage — fall through.
     return disk_cid.split("|", 1)[0]
 
 

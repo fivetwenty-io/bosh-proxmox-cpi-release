@@ -19,6 +19,7 @@ Run:
 from __future__ import annotations
 
 import base64
+import gzip
 import http.client
 import io
 import json
@@ -562,6 +563,102 @@ class TestVolumeExists(unittest.TestCase):
         v = self._verifier()
         with self._urlopen_with([{"volid": "pvd-foo:vm-100-disk-0"}]):
             self.assertTrue(v.volume_exists("pvd-foo:vm-100-disk-0"))
+
+    @staticmethod
+    def _pvz_cid(volid: str, meta: dict | None = None) -> str:
+        """Build a pvz- compressed envelope CID the way the Go codec does:
+        base64url(gzip(json)), no padding."""
+        payload: dict = {"v": volid}
+        if meta:
+            payload["m"] = meta
+        raw = json.dumps(payload, separators=(",", ":")).encode()
+        return "pvz-" + base64.urlsafe_b64encode(gzip.compress(raw, 9, mtime=0)).decode().rstrip("=")
+
+    def test_pvz_envelope_matches_bare_volid(self) -> None:
+        """A pvz- compressed envelope CID (opt-in disk_cid_compression) must
+        match the bare volid PVE reports."""
+        v = self._verifier()
+        cid = self._pvz_cid("data:vm-9897-disk-0", {"pool": "data", "node": "pve"})
+        with self._urlopen_with([{"volid": "data:vm-9897-disk-0"}]):
+            self.assertTrue(v.volume_exists(cid))
+
+    def test_pvz_envelope_no_meta(self) -> None:
+        v = self._verifier()
+        cid = self._pvz_cid("local-lvm:vm-101-disk-0")
+        with self._urlopen_with([{"volid": "local-lvm:vm-101-disk-0"}]):
+            self.assertTrue(v.volume_exists(cid))
+
+    def test_pvz_envelope_path_form_volid(self) -> None:
+        v = self._verifier()
+        cid = self._pvz_cid("local:9001/vm-9001-disk-0.qcow2", {"pool": "local"})
+        with self._urlopen_with([{"volid": "local:9001/vm-9001-disk-0.qcow2"}]):
+            self.assertTrue(v.volume_exists(cid))
+
+    def test_pvz_envelope_not_found(self) -> None:
+        v = self._verifier()
+        cid = self._pvz_cid("data:vm-9897-disk-0")
+        with self._urlopen_with([{"volid": "data:vm-200-disk-0"}]):
+            self.assertFalse(v.volume_exists(cid))
+
+    def test_pvz_go_encoder_fixture(self) -> None:
+        """Frozen fixture emitted by the Go encoder (EncodeDiskCIDCompressed):
+        pins cross-implementation decode of the compressed wire format."""
+        v = self._verifier()
+        cid = (
+            "pvz-H4sIAAAAAAAC_2yOQWrEMAxF7_LXVquZWbT4MsWxDTGpI1c2SZmQuxcnBLqY5RPvfbRhgYWPZSQdAs1LjtRS1Jt9"
+            "ML8vmR7MFFKdiN9-vKx3GGTYDUXk-3UJg1lChEVRCVTyL3Um_oCBe8LCPUmdn6iPSWm173nnx96smlocnJ9gEFL1TgMs"
+            "ZIZBklK_Dvxk5uuw6v9DGzW6rvQ38nAFtztffPgn13qa-77_BQAA__-aFK-nCAEAAA"
+        )
+        with self._urlopen_with([{"volid": "ceph-rbd-nvme-tier1:300/vm-300-disk-0.qcow2"}]):
+            self.assertTrue(v.volume_exists(cid))
+
+    def test_pvz_standard_alphabet_payload_raises(self) -> None:
+        """Charset parity with Go's RawURLEncoding: '+', '/', '=' must raise."""
+        v = self._verifier()
+        with self.assertRaises(PVEVerifyError):
+            v.volume_exists("pvz-ab+cd")
+        with self.assertRaises(PVEVerifyError):
+            v.volume_exists("pvz-abcd=")
+
+    def test_pvz_malformed_payload_raises(self) -> None:
+        v = self._verifier()
+        with self.assertRaises(PVEVerifyError):
+            v.volume_exists("pvz-!!!notbase64")
+
+    def test_pvz_not_gzip_raises(self) -> None:
+        """Valid base64url whose bytes are not a gzip stream must raise."""
+        v = self._verifier()
+        payload = base64.urlsafe_b64encode(b"plainbytesnotgzip").decode().rstrip("=")
+        with self.assertRaises(PVEVerifyError):
+            v.volume_exists("pvz-" + payload)
+
+    def test_pvz_bad_json_raises(self) -> None:
+        v = self._verifier()
+        payload = base64.urlsafe_b64encode(gzip.compress(b"notjson", 9, mtime=0)).decode().rstrip("=")
+        with self.assertRaises(PVEVerifyError):
+            v.volume_exists("pvz-" + payload)
+
+    def test_pvz_empty_volid_raises(self) -> None:
+        v = self._verifier()
+        raw = json.dumps({"m": {"pool": "data"}}, separators=(",", ":")).encode()
+        payload = base64.urlsafe_b64encode(gzip.compress(raw, 9, mtime=0)).decode().rstrip("=")
+        with self.assertRaises(PVEVerifyError):
+            v.volume_exists("pvz-" + payload)
+
+    def test_pvz_decompression_bomb_raises(self) -> None:
+        """A short payload that inflates past the size cap must raise, matching
+        the Go decoder's 64 KiB guard."""
+        v = self._verifier()
+        payload = base64.urlsafe_b64encode(gzip.compress(b"0" * (10 << 20), 9, mtime=0)).decode().rstrip("=")
+        with self.assertRaises(PVEVerifyError):
+            v.volume_exists("pvz-" + payload)
+
+    def test_pvz_named_storage_falls_back_to_legacy(self) -> None:
+        """A PVE storage literally named 'pvz-*' must fall back to the legacy
+        paths, mirroring the pvd- rule."""
+        v = self._verifier()
+        with self._urlopen_with([{"volid": "pvz-foo:vm-100-disk-0"}]):
+            self.assertTrue(v.volume_exists("pvz-foo:vm-100-disk-0"))
 
     def test_auth_401_raises(self) -> None:
         v = self._verifier()
