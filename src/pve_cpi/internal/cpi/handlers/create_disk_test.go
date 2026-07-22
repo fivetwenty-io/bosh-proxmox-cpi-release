@@ -1,10 +1,12 @@
 package handlers_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
 	sdkcluster "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cluster"
@@ -1414,5 +1416,80 @@ func TestHandleCreateDisk_BadAioMode_CloudError(t *testing.T) {
 	}
 	if cpiErr.OkToRetry() {
 		t.Error("bad aio mode error must not be retriable")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Emitted CID length warning
+// ---------------------------------------------------------------------------
+
+// TestHandleCreateDisk_WarnsWhenCIDExceeds255 verifies that create_disk logs a
+// warning when the emitted pvd envelope CID is longer than 255 characters —
+// MySQL-backed Directors store disk_cid in a VARCHAR(255) column.
+func TestHandleCreateDisk_WarnsWhenCIDExceeds255(t *testing.T) {
+	t.Parallel()
+	longStorage := strings.Repeat("s", 220)
+	storageSvc := &mockStorageService{
+		createVolumeFn: func(_ context.Context, _, storage string, _ int, _ string, vmid int, _ string) (string, error) {
+			return fmt.Sprintf("%s:vm-%d-disk-0", storage, vmid), nil
+		},
+	}
+	deps := baseDepsForCreate(t, storageSvc, nil)
+	deps.Config.DiskStorage = longStorage
+
+	var buf bytes.Buffer
+	logger, lerr := log.NewLogger("info", &buf)
+	if lerr != nil {
+		t.Fatalf("NewLogger: %v", lerr)
+	}
+	deps.Logger = logger
+
+	h := handlers.HandleCreateDisk(deps)
+	result, err := h.Handle(context.Background(), []json.RawMessage{
+		marshal(1024),
+		marshal(map[string]string{}),
+	}, jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	diskCID, ok := result.(string)
+	if !ok {
+		t.Fatalf("expected string result, got %T", result)
+	}
+	if len(diskCID) <= 255 {
+		t.Fatalf("test setup: expected emitted CID > 255 chars, got %d", len(diskCID))
+	}
+	if !strings.Contains(buf.String(), "disk CID exceeds 255 characters") {
+		t.Errorf("expected length warning in logs, got: %s", buf.String())
+	}
+}
+
+// TestHandleCreateDisk_NoLengthWarnForTypicalCID proves the warning stays
+// silent for a common-case CID.
+func TestHandleCreateDisk_NoLengthWarnForTypicalCID(t *testing.T) {
+	t.Parallel()
+	storageSvc := &mockStorageService{
+		createVolumeFn: func(_ context.Context, _, storage string, _ int, _ string, vmid int, _ string) (string, error) {
+			return fmt.Sprintf("%s:vm-%d-disk-0", storage, vmid), nil
+		},
+	}
+	deps := baseDepsForCreate(t, storageSvc, nil)
+
+	var buf bytes.Buffer
+	logger, lerr := log.NewLogger("info", &buf)
+	if lerr != nil {
+		t.Fatalf("NewLogger: %v", lerr)
+	}
+	deps.Logger = logger
+
+	h := handlers.HandleCreateDisk(deps)
+	if _, err := h.Handle(context.Background(), []json.RawMessage{
+		marshal(1024),
+		marshal(map[string]string{}),
+	}, jsonrpc.Context{}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if strings.Contains(buf.String(), "disk CID exceeds 255 characters") {
+		t.Errorf("unexpected length warning for typical CID: %s", buf.String())
 	}
 }

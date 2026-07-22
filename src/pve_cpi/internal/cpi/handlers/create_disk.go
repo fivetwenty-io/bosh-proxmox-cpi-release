@@ -482,6 +482,16 @@ func HandleCreateDisk(deps Deps) Handler {
 			log.Int("naming_vmid", namingVMID),
 		)
 
+		// MySQL-backed Directors store disk_cid in a VARCHAR(255) column
+		// (Postgres uses TEXT). The envelope only exceeds that bound when long
+		// storage names combine with many per-disk performance options.
+		if len(diskCID) > 255 {
+			deps.Log(ctx).Warn("create_disk: emitted disk CID exceeds 255 characters; MySQL-backed Directors may truncate or reject it",
+				log.Int("cid_length", len(diskCID)),
+				log.Int("perf_opt_count", len(diskPerfOpts)),
+			)
+		}
+
 		// Apply operator-supplied tags to the attached VM, if any. PVE has
 		// no native disk-volume tag field, so disk tags can only ride on the
 		// hosting VM. When create_disk is called without a vm_cid hint we
