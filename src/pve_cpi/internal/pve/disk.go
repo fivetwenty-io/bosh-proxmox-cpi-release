@@ -167,47 +167,72 @@ type DiskCIDMeta struct {
 }
 
 // diskCIDSep is the delimiter between the bare PVE volid and the optional
-// base64url-encoded metadata suffix. PVE volids are always "<storage>:<name>"
-// where name is "vm-<int>-disk-<int>" or a path — neither form ever contains
-// a pipe character, so "|" is safe as an unambiguous separator.
+// base64url-encoded metadata suffix in the LEGACY disk CID format. Releases
+// before the pvd- envelope emitted "<storage>:<volid>[|<base64url>]"; the
+// Director replays stored CIDs indefinitely, so ParseEncodedDiskCID keeps
+// decoding this form forever. New CIDs are never emitted with it.
 const diskCIDSep = "|"
 
-// EncodeDiskCID appends a base64url-JSON metadata suffix to a bare disk CID.
+// diskCIDPrefix marks the envelope disk CID format. Everything after the
+// prefix is base64url (RFC 4648 §5, no padding), so an emitted CID uses only
+// [A-Za-z0-9_-] — safe in a URI path segment (the Director's
+// /disks/<cid>/attachments route) and in bosh CLI argument passthrough,
+// unlike the raw PVE volid whose path form embeds "/" and whose legacy
+// metadata rider used "|".
+const diskCIDPrefix = "pvd-"
+
+// diskCIDEnvelope is the JSON payload behind diskCIDPrefix. V carries the
+// exact PVE volid ("storage:volume"); M carries optional placement metadata.
+type diskCIDEnvelope struct {
+	V string       `json:"v"`
+	M *DiskCIDMeta `json:"m,omitempty"`
+}
+
+// EncodeDiskCID wraps a bare disk CID (a PVE volid) and optional metadata in
+// the pvd- envelope:
 //
-// If meta is nil or all fields are zero-valued the bare CID is returned
-// unchanged, preserving backward compatibility with consumers that store the
-// string directly.
+//	pvd-<base64url(json({"v":"<storage>:<volume>","m":{...}}))>
 //
-// The encoded form is:
-//
-//	<bare-cid>|<base64url(json(meta))>
-//
-// where base64url uses standard RFC 4648 §5 encoding with no padding (URL-safe
-// alphabet, no '=' padding characters).
+// The CID is always wrapped, even when meta is nil or all-zero: path-form
+// volids ("storage:100/vm-100-disk-0.qcow2") embed "/", which 404s the
+// Director's /disks/<cid>/attachments route and breaks bosh CLI argument
+// handling, so the bare form must never escape as a Director-visible CID.
+// A nil or all-zero meta is omitted from the payload.
 func EncodeDiskCID(bareCID string, meta *DiskCIDMeta) string {
-	if meta == nil || (meta.Pool == "" && meta.Node == "" && meta.AZ == "" && len(meta.Opts) == 0) {
-		return bareCID
+	env := diskCIDEnvelope{V: bareCID}
+	if meta != nil && (meta.Pool != "" || meta.Node != "" || meta.AZ != "" || len(meta.Opts) > 0) {
+		env.M = meta
 	}
-	b, err := json.Marshal(meta)
+	b, err := json.Marshal(env)
 	if err != nil {
 		// json.Marshal on a plain struct never returns an error; guard anyway
 		// to satisfy the contract that EncodeDiskCID never panics.
 		return bareCID
 	}
-	return bareCID + diskCIDSep + base64.RawURLEncoding.EncodeToString(b)
+	return diskCIDPrefix + base64.RawURLEncoding.EncodeToString(b)
 }
 
-// ParseEncodedDiskCID splits an optionally-annotated disk CID into its bare
-// volid component and the optional DiskCIDMeta.
+// ParseEncodedDiskCID decodes a disk CID into its bare volid component and the
+// optional DiskCIDMeta.
 //
 // Accepted forms:
+//   - "pvd-<base64url>"            — envelope CID (current emitted format)
 //   - "<storage>:<volid>"          — bare legacy CID; returns meta=nil, err=nil
-//   - "<storage>:<volid>|<base64>" — annotated CID; decodes suffix into meta
+//   - "<storage>:<volid>|<base64>" — legacy annotated CID; decodes suffix into meta
+//
+// Discrimination is unambiguous: a legacy CID's bare part always contains ":",
+// which is outside the base64url alphabet, so it can never decode as a valid
+// envelope. A PVE storage literally named "pvd-…" therefore falls through to
+// the legacy paths when envelope decode fails and the CID contains ":". A CID
+// with the prefix, no ":", and an undecodable payload was meant to be an
+// envelope — its corruption surfaces as an error.
 //
 // Returns an error when:
 //   - cid is empty
-//   - the "|" separator is present but the suffix is empty, not valid base64url,
-//     or not valid JSON for DiskCIDMeta
+//   - an envelope payload (no ":" anywhere) is empty, not valid base64url, not
+//     valid JSON, or has an empty "v" field
+//   - the legacy "|" separator is present but the suffix is empty, not valid
+//     base64url, or not valid JSON for DiskCIDMeta
 //
 // ParseDiskCID may be called on the returned bareCID without modification; it
 // is guaranteed to be a valid "storage:volume" string when the original CID was
@@ -216,6 +241,18 @@ func EncodeDiskCID(bareCID string, meta *DiskCIDMeta) string {
 func ParseEncodedDiskCID(cid string) (bareCID string, meta *DiskCIDMeta, err error) {
 	if cid == "" {
 		return "", nil, cpierrors.Cloud("disk CID must not be empty")
+	}
+	if strings.HasPrefix(cid, diskCIDPrefix) {
+		bare, m, envErr := parseDiskCIDEnvelope(cid)
+		if envErr == nil {
+			return bare, m, nil
+		}
+		if !strings.Contains(cid, ":") {
+			return "", nil, envErr
+		}
+		// Prefix matched but the payload cannot be an envelope (":" is not in
+		// the base64url alphabet): this is a legacy CID on a storage whose
+		// name happens to start with "pvd-". Fall through to the legacy paths.
 	}
 	idx := strings.Index(cid, diskCIDSep)
 	if idx < 0 {
@@ -236,6 +273,28 @@ func ParseEncodedDiskCID(cid string) (bareCID string, meta *DiskCIDMeta, err err
 		return "", nil, cpierrors.Cloud("invalid disk CID %q: suffix JSON decode failed: %v", cid, jsonErr)
 	}
 	return bareCID, &m, nil
+}
+
+// parseDiskCIDEnvelope decodes the payload after diskCIDPrefix. Split out of
+// ParseEncodedDiskCID so the caller can decide whether a decode failure is
+// terminal (no ":" in the CID) or grounds for legacy fallback.
+func parseDiskCIDEnvelope(cid string) (string, *DiskCIDMeta, error) {
+	payload := cid[len(diskCIDPrefix):]
+	if payload == "" {
+		return "", nil, cpierrors.Cloud("invalid disk CID %q: envelope payload is empty", cid)
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(payload)
+	if err != nil {
+		return "", nil, cpierrors.Cloud("invalid disk CID %q: envelope payload is not valid base64url: %v", cid, err)
+	}
+	var env diskCIDEnvelope
+	if err := json.Unmarshal(raw, &env); err != nil {
+		return "", nil, cpierrors.Cloud("invalid disk CID %q: envelope JSON decode failed: %v", cid, err)
+	}
+	if env.V == "" {
+		return "", nil, cpierrors.Cloud("invalid disk CID %q: envelope volid is empty", cid)
+	}
+	return env.V, env.M, nil
 }
 
 // ParseSnapshotCID splits a snapshot CID of the form "<vm_cid>:<snap_name>" on the

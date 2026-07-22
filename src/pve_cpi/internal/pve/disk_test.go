@@ -2,8 +2,10 @@ package pve_test
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cloudinit"
@@ -560,9 +562,22 @@ func TestFindVMByDiskVolid_NotFoundConfigError_SkippedScanContinues(t *testing.T
 
 func TestEncodeDiskCID_NilMeta(t *testing.T) {
 	t.Parallel()
+	// Even without meta the CID is wrapped: path-form bare volids contain "/"
+	// which breaks the Director's /disks/<cid>/attachments route.
 	bare := "local-lvm:vm-100-disk-0"
-	if got := pve.EncodeDiskCID(bare, nil); got != bare {
-		t.Errorf("nil meta: want %q unchanged, got %q", bare, got)
+	got := pve.EncodeDiskCID(bare, nil)
+	if got == bare {
+		t.Fatalf("nil meta: want wrapped CID, got bare %q", got)
+	}
+	gotBase, gotMeta, err := pve.ParseEncodedDiskCID(got)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	if gotBase != bare {
+		t.Errorf("base: want %q, got %q", bare, gotBase)
+	}
+	if gotMeta != nil {
+		t.Errorf("meta: want nil, got %+v", gotMeta)
 	}
 }
 
@@ -570,8 +585,19 @@ func TestEncodeDiskCID_ZeroMeta(t *testing.T) {
 	t.Parallel()
 	bare := "local-lvm:vm-100-disk-0"
 	meta := &pve.DiskCIDMeta{}
-	if got := pve.EncodeDiskCID(bare, meta); got != bare {
-		t.Errorf("zero meta: want %q unchanged, got %q", bare, got)
+	got := pve.EncodeDiskCID(bare, meta)
+	if got == bare {
+		t.Fatalf("zero meta: want wrapped CID, got bare %q", got)
+	}
+	gotBase, gotMeta, err := pve.ParseEncodedDiskCID(got)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	if gotBase != bare {
+		t.Errorf("base: want %q, got %q", bare, gotBase)
+	}
+	if gotMeta != nil {
+		t.Errorf("meta: want nil (all-zero meta is omitted), got %+v", gotMeta)
 	}
 }
 
@@ -708,6 +734,163 @@ func TestParseEncodedDiskCID_BaseStillParseable(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// pvd- envelope format (REST-path-safe CIDs)
+// ---------------------------------------------------------------------------
+
+// TestEncodeDiskCID_CharsetSafe verifies the emitted CID uses only characters
+// safe in a URI path segment and in bosh CLI argument passthrough: no ":",
+// "/", "|", "+", or "=" may appear, even for path-form volids with full
+// per-disk performance options.
+func TestEncodeDiskCID_CharsetSafe(t *testing.T) {
+	t.Parallel()
+	bare := "nfs-slow:9001/vm-9001-disk-0.qcow2"
+	meta := &pve.DiskCIDMeta{
+		Pool: "nfs-slow",
+		Node: "pve1",
+		AZ:   "z1",
+		Opts: map[string]string{
+			"iothread": "1",
+			"cache":    "writeback",
+			"discard":  "on",
+			"ssd":      "1",
+			"mbps_rd":  "100",
+			"mbps_wr":  "100",
+			"iops_rd":  "5000",
+			"iops_wr":  "5000",
+		},
+	}
+	got := pve.EncodeDiskCID(bare, meta)
+	if !strings.HasPrefix(got, "pvd-") {
+		t.Fatalf("want pvd- prefix, got %q", got)
+	}
+	if strings.ContainsAny(got, ":/|+=") {
+		t.Errorf("emitted CID contains REST-hostile characters: %q", got)
+	}
+}
+
+// TestEncodeParseDiskCID_PathFormRoundTrip covers file/qcow storage where the
+// PVE volid embeds "/" and "." — the exact shape that 404s the Director's
+// /disks/<cid>/attachments route when emitted raw.
+func TestEncodeParseDiskCID_PathFormRoundTrip(t *testing.T) {
+	t.Parallel()
+	bare := "local:9001/vm-9001-disk-0.qcow2"
+	meta := &pve.DiskCIDMeta{Pool: "local", Node: "pve2"}
+	encoded := pve.EncodeDiskCID(bare, meta)
+
+	gotBase, gotMeta, err := pve.ParseEncodedDiskCID(encoded)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	if gotBase != bare {
+		t.Errorf("base: want %q, got %q", bare, gotBase)
+	}
+	if gotMeta == nil || gotMeta.Pool != "local" || gotMeta.Node != "pve2" {
+		t.Errorf("meta: want Pool=local Node=pve2, got %+v", gotMeta)
+	}
+}
+
+// TestParseEncodedDiskCID_LegacyPipeSuffix pins the wire format emitted by
+// releases before the pvd- envelope: the Director replays stored CIDs
+// indefinitely, so this literal form must decode forever.
+func TestParseEncodedDiskCID_LegacyPipeSuffix(t *testing.T) {
+	t.Parallel()
+	suffix := base64.RawURLEncoding.EncodeToString(
+		[]byte(`{"pool":"data","node":"pve1","az":"z1"}`),
+	)
+	cid := "data:vm-9897-disk-0|" + suffix
+
+	gotBase, gotMeta, err := pve.ParseEncodedDiskCID(cid)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	if gotBase != "data:vm-9897-disk-0" {
+		t.Errorf("base: want %q, got %q", "data:vm-9897-disk-0", gotBase)
+	}
+	if gotMeta == nil || gotMeta.Pool != "data" || gotMeta.Node != "pve1" || gotMeta.AZ != "z1" {
+		t.Errorf("meta: want pool=data node=pve1 az=z1, got %+v", gotMeta)
+	}
+}
+
+// TestParseEncodedDiskCID_PvdNamedStorageFallsBack covers a PVE storage
+// literally named with a "pvd-" prefix: its bare CID starts with "pvd-" but
+// contains ":" (outside the base64url alphabet), so envelope decode fails and
+// the parser must fall back to the legacy paths instead of erroring.
+func TestParseEncodedDiskCID_PvdNamedStorageFallsBack(t *testing.T) {
+	t.Parallel()
+	cid := "pvd-foo:vm-100-disk-0"
+	gotBase, gotMeta, err := pve.ParseEncodedDiskCID(cid)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	if gotBase != cid {
+		t.Errorf("base: want %q, got %q", cid, gotBase)
+	}
+	if gotMeta != nil {
+		t.Errorf("meta: want nil, got %+v", gotMeta)
+	}
+}
+
+func TestParseEncodedDiskCID_PvdEmptyPayload(t *testing.T) {
+	t.Parallel()
+	if _, _, err := pve.ParseEncodedDiskCID("pvd-"); err == nil {
+		t.Fatal("expected error for empty pvd payload")
+	}
+}
+
+func TestParseEncodedDiskCID_PvdBadBase64(t *testing.T) {
+	t.Parallel()
+	// No colon anywhere, so no legacy fallback applies: the CID was meant to
+	// be a pvd envelope and its corruption must surface as an error.
+	if _, _, err := pve.ParseEncodedDiskCID("pvd-!!!notbase64"); err == nil {
+		t.Fatal("expected error for malformed pvd base64 payload")
+	}
+}
+
+func TestParseEncodedDiskCID_PvdBadJSON(t *testing.T) {
+	t.Parallel()
+	cid := "pvd-" + base64.RawURLEncoding.EncodeToString([]byte("notjson"))
+	if _, _, err := pve.ParseEncodedDiskCID(cid); err == nil {
+		t.Fatal("expected error for pvd payload that is not JSON")
+	}
+}
+
+func TestParseEncodedDiskCID_PvdEmptyVolid(t *testing.T) {
+	t.Parallel()
+	cid := "pvd-" + base64.RawURLEncoding.EncodeToString([]byte(`{"m":{"pool":"data"}}`))
+	if _, _, err := pve.ParseEncodedDiskCID(cid); err == nil {
+		t.Fatal("expected error for pvd envelope with empty volid")
+	}
+}
+
+func TestParseEncodedDiskCID_PvdNullMeta(t *testing.T) {
+	t.Parallel()
+	cid := "pvd-" + base64.RawURLEncoding.EncodeToString([]byte(`{"v":"data:vm-1-disk-0","m":null}`))
+	gotBase, gotMeta, err := pve.ParseEncodedDiskCID(cid)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	if gotBase != "data:vm-1-disk-0" {
+		t.Errorf("base: want %q, got %q", "data:vm-1-disk-0", gotBase)
+	}
+	if gotMeta != nil {
+		t.Errorf("meta: want nil, got %+v", gotMeta)
+	}
+}
+
+// TestEncodeDiskCID_TypicalLength keeps the common-case CID comfortably under
+// MySQL-backed Directors' 255-char disk_cid column.
+func TestEncodeDiskCID_TypicalLength(t *testing.T) {
+	t.Parallel()
+	got := pve.EncodeDiskCID(
+		"local-lvm:vm-90001-disk-0",
+		&pve.DiskCIDMeta{Pool: "local-lvm", Node: "lab-pmx-0", AZ: "z1"},
+	)
+	if len(got) > 255 {
+		t.Errorf("typical CID length %d exceeds 255: %q", len(got), got)
+	}
+}
+
 // Table-driven tests cover all call-site wrapping patterns: ParseEncodedDiskCID
 // strips the suffix, then ParseDiskCID on the base yields the same storage/volume
 // as parsing the bare CID directly. This verifies that the 10 call site wrappers
@@ -820,16 +1003,16 @@ func TestEncodeParseDiskCID_OptsRoundTrip(t *testing.T) {
 
 // TestEncodeDiskCID_NilOptsIdentical proves that nil Opts produces a CID
 // byte-identical to encoding the same meta without Opts (omitempty guarantee).
-// Also verifies the zero-meta short-circuit still applies when all fields are
-// zero-valued including Opts.
+// Also verifies the zero-meta case omits the meta payload entirely, matching
+// a nil-meta encode byte for byte.
 func TestEncodeDiskCID_NilOptsIdentical(t *testing.T) {
 	t.Parallel()
 	bare := "local-lvm:vm-100-disk-0"
 
-	// Zero meta with nil Opts — must return bare unchanged.
+	// Zero meta with nil Opts — meta is omitted; identical to nil-meta encode.
 	metaNilOpts := &pve.DiskCIDMeta{}
-	if got := pve.EncodeDiskCID(bare, metaNilOpts); got != bare {
-		t.Errorf("zero meta + nil Opts: want bare %q, got %q", bare, got)
+	if got := pve.EncodeDiskCID(bare, metaNilOpts); got != pve.EncodeDiskCID(bare, nil) {
+		t.Errorf("zero meta + nil Opts: want nil-meta encoding, got %q", got)
 	}
 
 	// Non-zero meta: encoding with explicit nil Opts must equal encoding
@@ -847,10 +1030,10 @@ func TestEncodeDiskCID_EmptyOptsIdentical(t *testing.T) {
 	t.Parallel()
 	bare := "local-lvm:vm-100-disk-0"
 
-	// Zero meta + empty map must return bare unchanged (zero-meta guard).
+	// Zero meta + empty map — meta is omitted; identical to nil-meta encode.
 	metaEmptyOpts := &pve.DiskCIDMeta{Opts: map[string]string{}}
-	if got := pve.EncodeDiskCID(bare, metaEmptyOpts); got != bare {
-		t.Errorf("zero meta + empty Opts: want bare %q, got %q", bare, got)
+	if got := pve.EncodeDiskCID(bare, metaEmptyOpts); got != pve.EncodeDiskCID(bare, nil) {
+		t.Errorf("zero meta + empty Opts: want nil-meta encoding, got %q", got)
 	}
 
 	// Non-zero meta + empty map must equal non-zero meta + nil Opts.

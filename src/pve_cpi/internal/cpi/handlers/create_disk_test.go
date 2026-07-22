@@ -465,14 +465,19 @@ func TestHandleCreateDisk_DiskCIDNotDoublePrefixed(t *testing.T) {
 	}
 	// The disk VMID is allocated from the synthetic disk range [9000,29999]
 	// with a randomized scan start, so the exact ID is non-deterministic.
-	// The regression invariant is structural: a single "data:" prefix and
-	// the canonical "vm-<vmid>-disk-0" volid shape. A double-prefixed CID
-	// ("data:data:vm-...") fails the Sscanf literal-prefix match.
+	// The regression invariant is structural: after unwrapping the pvd
+	// envelope, a single "data:" prefix and the canonical "vm-<vmid>-disk-0"
+	// volid shape. A double-prefixed bare CID ("data:data:vm-...") fails the
+	// Sscanf literal-prefix match.
+	bareCID, _, perr := pve.ParseEncodedDiskCID(diskCID)
+	if perr != nil {
+		t.Fatalf("ParseEncodedDiskCID(%q): %v", diskCID, perr)
+	}
 	var vmid int
-	if n, serr := fmt.Sscanf(diskCID, "data:vm-%d-disk-0", &vmid); serr != nil || n != 1 {
-		t.Errorf("disk_cid = %q, want form data:vm-<vmid>-disk-0 (single prefix, no double-prefix bug)", diskCID)
+	if n, serr := fmt.Sscanf(bareCID, "data:vm-%d-disk-0", &vmid); serr != nil || n != 1 {
+		t.Errorf("bare disk_cid = %q, want form data:vm-<vmid>-disk-0 (single prefix, no double-prefix bug)", bareCID)
 	} else if vmid < 9000 || vmid > 29999 {
-		t.Errorf("disk_cid = %q, vmid %d outside disk range [9000,29999]", diskCID, vmid)
+		t.Errorf("bare disk_cid = %q, vmid %d outside disk range [9000,29999]", bareCID, vmid)
 	}
 }
 
