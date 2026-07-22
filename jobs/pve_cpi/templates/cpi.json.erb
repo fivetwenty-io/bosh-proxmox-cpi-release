@@ -440,6 +440,12 @@
   detached_disk_strategy = p("pve.detached_disk_strategy", "")
   config["detached_disk_strategy"] = detached_disk_strategy unless detached_disk_strategy.to_s.empty?
 
+  # Emit disk_cid_compression only when enabled. An absent key keeps the Go
+  # zero value (false), byte-identical to prior releases.
+  if p("pve.disk_cid_compression", false)
+    config["disk_cid_compression"] = true
+  end
+
   # Emit parked_disk_vmid_range_start only when non-zero. Zero (default) means
   # the field is unset; when strategy="parked" ApplyDefaults fills in 90000.
   # Omitting when zero ensures the Go zero-value reaches ApplyDefaults unchanged.

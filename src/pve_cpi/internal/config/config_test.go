@@ -6211,6 +6211,35 @@ func TestDetachedDiskStrategy_ParkedMixedCase(t *testing.T) {
 	}
 }
 
+// TestDiskCIDCompression_ParseAndDefault confirms the opt-in flag defaults to
+// false (the key is omitted from the ERB template when unset) and parses from
+// the cpi.json key emitted when the operator enables it.
+func TestDiskCIDCompression_ParseAndDefault(t *testing.T) {
+	t.Parallel()
+	cfg, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br"
+	}`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.DiskCIDCompression {
+		t.Error("DiskCIDCompression should default to false")
+	}
+
+	cfg, err = mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+		"disk_cid_compression":true
+	}`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !cfg.DiskCIDCompression {
+		t.Error("DiskCIDCompression should parse true from disk_cid_compression")
+	}
+}
+
 // TestValidate_DetachedDiskStrategyInvalid confirms invalid enum is rejected.
 func TestValidate_DetachedDiskStrategyInvalid(t *testing.T) {
 	t.Parallel()

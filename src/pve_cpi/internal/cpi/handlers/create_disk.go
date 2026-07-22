@@ -656,12 +656,21 @@ func attemptCreateVolume(
 	// node is the PVE node that holds the volume (meaningful for local-backend
 	// deployments). AZ is set from cloud_properties.availability_zone when
 	// provided; otherwise left empty so the CID is backward-compatible.
-	diskCID = pve.EncodeDiskCID(diskCID, &pve.DiskCIDMeta{
+	meta := &pve.DiskCIDMeta{
 		Pool: storage,
 		Node: node,
 		AZ:   az,
 		Opts: diskPerfOpts,
-	})
+	}
+	// With disk_cid_compression enabled, a CID whose pvd- form would overflow
+	// MySQL-backed Directors' varchar(255) disk_cid column is emitted as a
+	// pvz- gzip envelope instead; CIDs that fit are unaffected. Decode accepts
+	// both forms unconditionally, so the flag is safe to toggle at any time.
+	if deps.Config.DiskCIDCompression {
+		diskCID = pve.EncodeDiskCIDCompressed(diskCID, meta)
+	} else {
+		diskCID = pve.EncodeDiskCID(diskCID, meta)
+	}
 	return namingVMID, diskCID, canonicalVolID, nil
 }
 

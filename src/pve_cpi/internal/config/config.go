@@ -529,6 +529,16 @@ type CPIConfig struct {
 	// Use DetachedDiskParkedEnabled() to gate parker logic.
 	DetachedDiskStrategy string `json:"detached_disk_strategy,omitempty"`
 
+	// DiskCIDCompression opts create_disk into the pvz- compressed disk CID
+	// format for CIDs whose standard pvd- envelope would exceed 255 characters
+	// (the varchar(255) disk_cid column of MySQL-backed Directors). CIDs that
+	// fit are emitted as pvd- unchanged, and decode accepts every format
+	// regardless of this flag, so it can be toggled at any time. Default false:
+	// PostgreSQL-backed Directors store CIDs as unbounded text and gain nothing
+	// from compression. No validation needed (any bool is valid); omit from ERB
+	// when false.
+	DiskCIDCompression bool `json:"disk_cid_compression,omitempty"`
+
 	// ParkedDiskVMIDRangeStart is the inclusive lower bound of the VMID range
 	// reserved for parker VMs (bosh-parker-<n>). Parker VMs occupy this band;
 	// each parker VM holds up to 31 parked disk volumes in scsi0..30 slots.

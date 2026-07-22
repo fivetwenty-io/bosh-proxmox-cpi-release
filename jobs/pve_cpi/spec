@@ -1223,6 +1223,17 @@ properties:
                    The parker VMID band must not overlap the VM range, the
                    persistent-disk range, or the stemcell-template range.
     default: ""
+  pve.disk_cid_compression:
+    description: |
+      Opt-in: when true, a disk CID whose standard pvd- envelope would exceed
+      255 characters is emitted as pvz-<base64url(gzip(json))> instead, so it
+      fits the varchar(255) disk_cid column of MySQL-backed Directors (and the
+      dynamic_disks table on all database backends). CIDs that fit 255
+      characters are unaffected, and the CPI decodes every previously emitted
+      format regardless of this setting, so the flag can be toggled at any
+      time without migrating existing disks. Leave false on PostgreSQL-backed
+      Directors, whose classic disk tables store CIDs as unbounded text.
+    default: false
   pve.parked_disk_vmid_range_start:
     description: |
       Inclusive lower bound of the VMID range reserved for parker VMs
