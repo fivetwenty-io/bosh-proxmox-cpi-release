@@ -8,8 +8,10 @@
 # inside outer VM 108 ("lab-pmx", API 10.253.0.10:8006, node name lab-pmx-0);
 # VMs created there attach to the nested host's vmbr0, which bridges onto the
 # outer SDN vnet `pmx` (simple zone `labs`, subnet 10.253.0.0/16, gateway
-# 10.253.0.1, SNAT on the outer host). BOSH owns the 10.253.16.0/20 block of
-# that /16; the nested host itself sits at 10.253.0.10 in the mgmt /24.
+# 10.253.0.1, SNAT on the outer host). BOSH owns the 10.253.32.0/20 block of
+# that /16 (10.253.16.0/20 belongs to the nested cluster's own OCFP SDN vnet
+# `ocfp`, whose connected routes on the nested host would otherwise black-hole
+# host-originated replies to vmbr0 guests in that range); the nested host itself sits at 10.253.0.10 in the mgmt /24.
 #
 # Transport: no SDN objects are created for this env (no *_sdn_* keys below,
 # so `scripts/bosh net-*` refuses BOSH_PVE_ENV=pmx by design) — the outer
@@ -37,8 +39,8 @@
 #      (the outer vnet's 10.253.0.0/16) so guests compute the right netmask.
 #   3. internal_gw MUST be the subnet's gateway (outer vnet gateway).
 #
-# system_domain override: *.cf.10-253-16-50.sslip.io resolves to the HAProxy
-# static IP (10.253.16.50) from anywhere, so the smoke tests need neither a
+# system_domain override: *.cf.10-253-32-50.sslip.io resolves to the HAProxy
+# static IP (10.253.32.50) from anywhere, so the smoke tests need neither a
 # Cloudflare tunnel nor local DNS — the workstation reaches HAProxy directly
 # over the routed /16. cf ssh (port 2222) likewise connects straight to the
 # resolved IP with no proxy in the path.
@@ -56,23 +58,23 @@
 # --- Director + deployment network (overrides manifests/bosh/vars.yml) -----
 internal_cidr:       10.253.0.0/16
 internal_gw:         10.253.0.1
-internal_ip:         10.253.16.10
+internal_ip:         10.253.32.10
 pve_network_bridge:  vmbr0
 # HAProxy entry point (CF). The sslip.io system domain resolves here.
-haproxy_private_ip:  10.253.16.50
+haproxy_private_ip:  10.253.32.50
 
 # --- CF system domain (overrides manifests/cf/vars.yml) --------------------
-system_domain:       cf.10-253-16-50.sslip.io
+system_domain:       cf.10-253-32-50.sslip.io
 
 # --- Cloud-config IPAM bands (consumed by cf-cloud-config.yml + cc-reserved.yml)
-# Must lie inside internal_cidr. BOSH VMs are confined to the 10.253.16.0/20
+# Must lie inside internal_cidr. BOSH VMs are confined to the 10.253.32.0/20
 # block: reserve everything below it (mgmt /24 with the nested host at
 # 10.253.0.10, plus unused space) together with the block's own infra band
-# (gateway-analog slots + the Director at 10.253.16.10), and everything from
-# the top-of-subnet router band upward. HAProxy (10.253.16.50) sits in the
-# static slot; CF VMs and emptyvm take the dynamic middle (.16.20-.16.199).
+# (gateway-analog slots + the Director at 10.253.32.10), and everything from
+# the top-of-subnet router band upward. HAProxy (10.253.32.50) sits in the
+# static slot; CF VMs and emptyvm take the dynamic middle (.32.20-.32.199).
 pmx_reserved:
-- 10.253.0.1-10.253.16.19
-- 10.253.16.200-10.253.255.254
+- 10.253.0.1-10.253.32.19
+- 10.253.32.200-10.253.255.254
 pmx_static:
-- 10.253.16.50
+- 10.253.32.50

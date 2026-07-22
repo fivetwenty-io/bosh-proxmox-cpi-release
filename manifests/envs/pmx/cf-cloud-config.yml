@@ -4,7 +4,7 @@
 #
 # Auto-layered by `scripts/cf cloud-config` (and the full `deploy`) when
 # BOSH_PVE_ENV=pmx. Replaces the default subnet with the nested-lab network
-# (10.253.0.0/16 on the nested host's vmbr0, BOSH block 10.253.16.0/20). All
+# (10.253.0.0/16 on the nested host's vmbr0, BOSH block 10.253.32.0/20). All
 # values are pulled from manifests/envs/pmx/vars.yml so a single edit there
 # re-shapes both the Director network and this cloud-config in lockstep.
 #

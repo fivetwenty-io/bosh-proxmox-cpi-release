@@ -3,7 +3,7 @@
 # create-env). Widens the bosh cloud-config's default-network reserved band to
 # the same infra band CF uses (pmx_reserved), so a VM placed on the bosh
 # cloud-config — emptyvm in particular — lands in the dynamic middle
-# (10.253.16.20+) instead of a low infra slot the env keeps for the gateway,
+# (10.253.32.20+) instead of a low infra slot the env keeps for the gateway,
 # the nested host, and the Director (orphan-vm-duplicate-ip-after-delete-env).
 #
 # pmx_reserved (manifests/envs/pmx/vars.yml) is the single source of truth
