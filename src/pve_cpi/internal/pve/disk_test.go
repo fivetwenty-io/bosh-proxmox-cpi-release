@@ -1,6 +1,8 @@
 package pve_test
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -888,6 +890,255 @@ func TestEncodeDiskCID_TypicalLength(t *testing.T) {
 	)
 	if len(got) > 255 {
 		t.Errorf("typical CID length %d exceeds 255: %q", len(got), got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// pvz- compressed envelope (opt-in disk_cid_compression)
+
+// bigDiskCIDMeta returns a meta whose pvd- encoding exceeds 255 characters:
+// the shape that motivates the compressed format on MySQL-backed Directors.
+func bigDiskCIDMeta() (string, *pve.DiskCIDMeta) {
+	bare := "ceph-rbd-nvme-tier1:300/vm-300-disk-0.qcow2"
+	return bare, &pve.DiskCIDMeta{
+		Pool: "ceph-rbd-nvme-tier1",
+		Node: "prod-pmx-node-07",
+		AZ:   "az-rack-2",
+		Opts: map[string]string{
+			"iothread": "1",
+			"cache":    "writeback",
+			"discard":  "on",
+			"ssd":      "1",
+			"mbps_rd":  "120",
+			"mbps_wr":  "120",
+			"iops_rd":  "8000",
+			"iops_wr":  "8000",
+		},
+	}
+}
+
+// gzipPayload gzips data and returns the "pvz-" CID form, for building decode
+// fixtures without going through the production encoder.
+func gzipPayload(t *testing.T, data []byte) string {
+	t.Helper()
+	var buf bytes.Buffer
+	gw, err := gzip.NewWriterLevel(&buf, gzip.BestCompression)
+	if err != nil {
+		t.Fatalf("gzip writer: %v", err)
+	}
+	if _, err := gw.Write(data); err != nil {
+		t.Fatalf("gzip write: %v", err)
+	}
+	if err := gw.Close(); err != nil {
+		t.Fatalf("gzip close: %v", err)
+	}
+	return "pvz-" + base64.RawURLEncoding.EncodeToString(buf.Bytes())
+}
+
+// TestEncodeDiskCIDCompressed_SmallStaysPvd: compression must be conditional.
+// A CID whose pvd- form fits in 255 characters is emitted uncompressed so the
+// common case stays byte-identical to EncodeDiskCID and operator-inspectable.
+func TestEncodeDiskCIDCompressed_SmallStaysPvd(t *testing.T) {
+	t.Parallel()
+	bare := "local-lvm:vm-90001-disk-0"
+	meta := &pve.DiskCIDMeta{Pool: "local-lvm", Node: "lab-pmx-0", AZ: "z1"}
+	got := pve.EncodeDiskCIDCompressed(bare, meta)
+	want := pve.EncodeDiskCID(bare, meta)
+	if got != want {
+		t.Errorf("small CID must match EncodeDiskCID output: got %q want %q", got, want)
+	}
+}
+
+// TestEncodeDiskCIDCompressed_LargeEmitsPvz: when the pvd- form exceeds 255
+// characters the encoder switches to the gzip envelope, the result fits the
+// MySQL varchar(255) disk_cid column, and it round-trips bare CID and meta.
+func TestEncodeDiskCIDCompressed_LargeEmitsPvz(t *testing.T) {
+	t.Parallel()
+	bare, meta := bigDiskCIDMeta()
+	if plain := pve.EncodeDiskCID(bare, meta); len(plain) <= 255 {
+		t.Fatalf("test premise broken: pvd form is %d chars, need >255", len(plain))
+	}
+	got := pve.EncodeDiskCIDCompressed(bare, meta)
+	if !strings.HasPrefix(got, "pvz-") {
+		t.Fatalf("want pvz- prefix, got %q", got)
+	}
+	if len(got) > 255 {
+		t.Errorf("compressed CID length %d exceeds 255: %q", len(got), got)
+	}
+	gotBare, gotMeta, err := pve.ParseEncodedDiskCID(got)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	if gotBare != bare {
+		t.Errorf("base: want %q, got %q", bare, gotBare)
+	}
+	if gotMeta == nil || gotMeta.Pool != meta.Pool || gotMeta.Node != meta.Node || gotMeta.AZ != meta.AZ {
+		t.Fatalf("meta: want %+v, got %+v", meta, gotMeta)
+	}
+	if len(gotMeta.Opts) != len(meta.Opts) {
+		t.Fatalf("opts: want %d entries, got %+v", len(meta.Opts), gotMeta.Opts)
+	}
+	for k, v := range meta.Opts {
+		if gotMeta.Opts[k] != v {
+			t.Errorf("opts[%q]: want %q, got %q", k, v, gotMeta.Opts[k])
+		}
+	}
+}
+
+// TestEncodeDiskCIDCompressed_CharsetSafe: the pvz- form must honor the same
+// charset guarantee as pvd- — no ":", "/", "|", "+", or "=".
+func TestEncodeDiskCIDCompressed_CharsetSafe(t *testing.T) {
+	t.Parallel()
+	bare, meta := bigDiskCIDMeta()
+	got := pve.EncodeDiskCIDCompressed(bare, meta)
+	if strings.ContainsAny(got, ":/|+=") {
+		t.Errorf("emitted CID contains REST-hostile characters: %q", got)
+	}
+}
+
+// TestEncodeDiskCIDCompressed_ThresholdBoundary walks storage-name lengths to
+// find the largest pvd- form at or under 255 chars and the smallest over it,
+// then asserts the encoder switches format exactly there.
+func TestEncodeDiskCIDCompressed_ThresholdBoundary(t *testing.T) {
+	t.Parallel()
+	build := func(n int) (string, *pve.DiskCIDMeta) {
+		storage := strings.Repeat("s", n)
+		return storage + ":vm-1-disk-0", &pve.DiskCIDMeta{Pool: storage}
+	}
+	lastFit, firstOver := -1, -1
+	for n := 1; n <= 400; n++ {
+		bare, meta := build(n)
+		l := len(pve.EncodeDiskCID(bare, meta))
+		if l <= 255 {
+			lastFit = n
+		} else if firstOver == -1 {
+			firstOver = n
+			break
+		}
+	}
+	if lastFit == -1 || firstOver == -1 {
+		t.Fatalf("could not bracket the 255 boundary (lastFit=%d firstOver=%d)", lastFit, firstOver)
+	}
+
+	bare, meta := build(lastFit)
+	if got := pve.EncodeDiskCIDCompressed(bare, meta); !strings.HasPrefix(got, "pvd-") {
+		t.Errorf("pvd form of %d chars fits; want pvd- output, got %q", len(pve.EncodeDiskCID(bare, meta)), got)
+	}
+	bare, meta = build(firstOver)
+	if got := pve.EncodeDiskCIDCompressed(bare, meta); !strings.HasPrefix(got, "pvz-") {
+		t.Errorf("pvd form of %d chars is over the limit; want pvz- output, got %q", len(pve.EncodeDiskCID(bare, meta)), got)
+	}
+}
+
+// TestEncodeDiskCIDCompressed_IncompressiblePrefersPlain: gzip inflates
+// high-entropy payloads. When the compressed form would be no shorter than the
+// plain form, the encoder must keep the plain pvd- CID (both are over the
+// limit; the warn fires either way, and the shorter, inspectable form wins).
+func TestEncodeDiskCIDCompressed_IncompressiblePrefersPlain(t *testing.T) {
+	t.Parallel()
+	// Fixed high-entropy strings (base64 of random bytes, generated once).
+	storage := "Zq3xK9mWp2Lr8vTn5cYd1Bf7Hs4Ej6Ug0QaXwOiNkMzRlPyAoJhFbCtDeSvGxIu" +
+		"VrEw2nT8mK5pL3qZ9dX7cB1fY4hS6jE0gU5aQ8wO2iN4kM6zR1lP3yA7oJ9hF2bC"
+	bare := storage + ":vm-1-disk-0"
+	meta := &pve.DiskCIDMeta{Pool: storage, Opts: map[string]string{
+		"a": "Xk2mZ9qW", "b": "Tn5cYd1B", "c": "Hs4Ej6Ug", "d": "QaXwOiNk",
+	}}
+	plain := pve.EncodeDiskCID(bare, meta)
+	if len(plain) <= 255 {
+		t.Fatalf("test premise broken: pvd form is %d chars, need >255", len(plain))
+	}
+	got := pve.EncodeDiskCIDCompressed(bare, meta)
+	if len(got) > len(plain) {
+		t.Errorf("encoder emitted a longer CID than the plain form: %d > %d", len(got), len(plain))
+	}
+	if strings.HasPrefix(got, "pvz-") && len(got) >= len(plain) {
+		t.Errorf("pvz form not shorter than pvd (%d vs %d); plain must win", len(got), len(plain))
+	}
+}
+
+// TestParseEncodedDiskCID_PvzFrozenFixture pins the compressed wire format:
+// this literal was generated by an independent gzip implementation (Python,
+// mtime=0) and must decode forever, regardless of how Go's gzip encoder output
+// evolves across versions.
+func TestParseEncodedDiskCID_PvzFrozenFixture(t *testing.T) {
+	t.Parallel()
+	const fixture = "pvz-H4sIAAAAAAAC_6tWKlOyUsrJT07M0c0py7Uqy9U1NjDQTcksztY1UNJRylWyqlYqyM_PQValVFsLABA25Zc4AAAA"
+	gotBare, gotMeta, err := pve.ParseEncodedDiskCID(fixture)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	if gotBare != "local-lvm:vm-300-disk-0" {
+		t.Errorf("base: want %q, got %q", "local-lvm:vm-300-disk-0", gotBare)
+	}
+	if gotMeta == nil || gotMeta.Pool != "local-lvm" {
+		t.Errorf("meta: want Pool=local-lvm, got %+v", gotMeta)
+	}
+}
+
+// TestParseEncodedDiskCID_PvzNamedStorageFallsBack mirrors the pvd- rule: a
+// PVE storage literally named "pvz-…" produces a bare CID containing ":",
+// which can never be base64url, so the parser falls back to the legacy paths.
+func TestParseEncodedDiskCID_PvzNamedStorageFallsBack(t *testing.T) {
+	t.Parallel()
+	cid := "pvz-foo:vm-100-disk-0"
+	gotBare, gotMeta, err := pve.ParseEncodedDiskCID(cid)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	if gotBare != cid {
+		t.Errorf("base: want %q, got %q", cid, gotBare)
+	}
+	if gotMeta != nil {
+		t.Errorf("meta: want nil, got %+v", gotMeta)
+	}
+}
+
+func TestParseEncodedDiskCID_PvzEmptyPayload(t *testing.T) {
+	t.Parallel()
+	if _, _, err := pve.ParseEncodedDiskCID("pvz-"); err == nil {
+		t.Fatal("expected error for empty pvz payload")
+	}
+}
+
+func TestParseEncodedDiskCID_PvzBadBase64(t *testing.T) {
+	t.Parallel()
+	if _, _, err := pve.ParseEncodedDiskCID("pvz-!!!notbase64"); err == nil {
+		t.Fatal("expected error for malformed pvz base64 payload")
+	}
+}
+
+func TestParseEncodedDiskCID_PvzNotGzip(t *testing.T) {
+	t.Parallel()
+	cid := "pvz-" + base64.RawURLEncoding.EncodeToString([]byte("plainbytesnotgzip"))
+	if _, _, err := pve.ParseEncodedDiskCID(cid); err == nil {
+		t.Fatal("expected error for pvz payload that is not a gzip stream")
+	}
+}
+
+func TestParseEncodedDiskCID_PvzBadJSONInsideGzip(t *testing.T) {
+	t.Parallel()
+	cid := gzipPayload(t, []byte("notjson"))
+	if _, _, err := pve.ParseEncodedDiskCID(cid); err == nil {
+		t.Fatal("expected error for pvz payload whose gzip content is not JSON")
+	}
+}
+
+func TestParseEncodedDiskCID_PvzEmptyVolid(t *testing.T) {
+	t.Parallel()
+	cid := gzipPayload(t, []byte(`{"m":{"pool":"data"}}`))
+	if _, _, err := pve.ParseEncodedDiskCID(cid); err == nil {
+		t.Fatal("expected error for pvz envelope with empty volid")
+	}
+}
+
+// TestParseEncodedDiskCID_PvzDecompressionBombRejected: a hostile CID that
+// gzips megabytes of data into a short payload must be rejected by the
+// decompression size cap, not expanded in memory.
+func TestParseEncodedDiskCID_PvzDecompressionBombRejected(t *testing.T) {
+	t.Parallel()
+	cid := gzipPayload(t, bytes.Repeat([]byte("0"), 10<<20))
+	if _, _, err := pve.ParseEncodedDiskCID(cid); err == nil {
+		t.Fatal("expected error for oversized decompressed envelope")
 	}
 }
 

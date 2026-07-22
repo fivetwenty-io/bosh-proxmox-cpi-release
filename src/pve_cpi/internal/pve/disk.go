@@ -3,11 +3,14 @@
 package pve
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"regexp"
 	"strconv"
 	"strings"
@@ -181,6 +184,27 @@ const diskCIDSep = "|"
 // metadata rider used "|".
 const diskCIDPrefix = "pvd-"
 
+// diskCIDCompressedPrefix marks the gzip-compressed envelope disk CID format.
+// The payload is base64url(gzip(json)) with the same JSON envelope and charset
+// guarantee as diskCIDPrefix. Emitted only by EncodeDiskCIDCompressed (behind
+// the opt-in disk_cid_compression config property) and only when the plain
+// pvd- form would exceed diskCIDLengthTarget; decoded unconditionally and
+// forever by ParseEncodedDiskCID, because the Director replays stored CIDs
+// indefinitely.
+const diskCIDCompressedPrefix = "pvz-"
+
+// diskCIDLengthTarget is the longest disk CID guaranteed to fit every BOSH
+// Director database backend: MySQL (and the newer dynamic_disks table on all
+// backends) stores disk_cid in a varchar(255) column. PostgreSQL's classic
+// disk tables use unbounded text and do not need the compressed format —
+// which is why compression is opt-in rather than automatic.
+const diskCIDLengthTarget = 255
+
+// maxDiskCIDEnvelopeBytes caps the decompressed size of a pvz- envelope so a
+// hostile CID cannot decompression-bomb the CPI process. Real envelopes are a
+// few hundred bytes; 64 KiB is orders of magnitude of headroom.
+const maxDiskCIDEnvelopeBytes = 64 << 10
+
 // diskCIDEnvelope is the JSON payload behind diskCIDPrefix. V carries the
 // exact PVE volid ("storage:volume"); M carries optional placement metadata.
 type diskCIDEnvelope struct {
@@ -199,11 +223,7 @@ type diskCIDEnvelope struct {
 // handling, so the bare form must never escape as a Director-visible CID.
 // A nil or all-zero meta is omitted from the payload.
 func EncodeDiskCID(bareCID string, meta *DiskCIDMeta) string {
-	env := diskCIDEnvelope{V: bareCID}
-	if meta != nil && (meta.Pool != "" || meta.Node != "" || meta.AZ != "" || len(meta.Opts) > 0) {
-		env.M = meta
-	}
-	b, err := json.Marshal(env)
+	b, err := marshalDiskCIDEnvelope(bareCID, meta)
 	if err != nil {
 		// json.Marshal on a plain struct never returns an error; guard anyway
 		// to satisfy the contract that EncodeDiskCID never panics.
@@ -212,25 +232,81 @@ func EncodeDiskCID(bareCID string, meta *DiskCIDMeta) string {
 	return diskCIDPrefix + base64.RawURLEncoding.EncodeToString(b)
 }
 
+// marshalDiskCIDEnvelope builds the JSON envelope payload shared by the plain
+// (pvd-) and compressed (pvz-) encoders. A nil or all-zero meta is omitted.
+func marshalDiskCIDEnvelope(bareCID string, meta *DiskCIDMeta) ([]byte, error) {
+	env := diskCIDEnvelope{V: bareCID}
+	if meta != nil && (meta.Pool != "" || meta.Node != "" || meta.AZ != "" || len(meta.Opts) > 0) {
+		env.M = meta
+	}
+	return json.Marshal(env)
+}
+
+// EncodeDiskCIDCompressed is the encoder behind the opt-in
+// disk_cid_compression config property. It emits the same pvd- envelope as
+// EncodeDiskCID whenever that form fits diskCIDLengthTarget — the common case
+// stays byte-identical and operator-inspectable — and switches to
+//
+//	pvz-<base64url(gzip(json({"v":…,"m":{…}})))>
+//
+// only when the plain form would overflow a varchar(255) disk_cid column.
+// gzip (RFC 1952) is used over raw deflate for stock-tool inspectability
+// (base64url decode | gunzip) and its CRC32 integrity check. If the payload is
+// so incompressible that gzip does not shorten it, the plain form is returned
+// (both overflow; the create_disk length warning fires either way, and the
+// shorter, inspectable form wins).
+func EncodeDiskCIDCompressed(bareCID string, meta *DiskCIDMeta) string {
+	b, err := marshalDiskCIDEnvelope(bareCID, meta)
+	if err != nil {
+		// Unreachable in practice (see EncodeDiskCID); keep the never-panic
+		// contract.
+		return bareCID
+	}
+	plain := diskCIDPrefix + base64.RawURLEncoding.EncodeToString(b)
+	if len(plain) <= diskCIDLengthTarget {
+		return plain
+	}
+	var buf bytes.Buffer
+	gw, err := gzip.NewWriterLevel(&buf, gzip.BestCompression)
+	if err != nil {
+		return plain
+	}
+	if _, err := gw.Write(b); err != nil {
+		return plain
+	}
+	if err := gw.Close(); err != nil {
+		return plain
+	}
+	compressed := diskCIDCompressedPrefix + base64.RawURLEncoding.EncodeToString(buf.Bytes())
+	if len(compressed) < len(plain) {
+		return compressed
+	}
+	return plain
+}
+
 // ParseEncodedDiskCID decodes a disk CID into its bare volid component and the
 // optional DiskCIDMeta.
 //
 // Accepted forms:
-//   - "pvd-<base64url>"            — envelope CID (current emitted format)
+//   - "pvd-<base64url>"            — envelope CID (default emitted format)
+//   - "pvz-<base64url>"            — gzip-compressed envelope CID (emitted only
+//     under the opt-in disk_cid_compression property; decoded unconditionally)
 //   - "<storage>:<volid>"          — bare legacy CID; returns meta=nil, err=nil
 //   - "<storage>:<volid>|<base64>" — legacy annotated CID; decodes suffix into meta
 //
 // Discrimination is unambiguous: a legacy CID's bare part always contains ":",
 // which is outside the base64url alphabet, so it can never decode as a valid
-// envelope. A PVE storage literally named "pvd-…" therefore falls through to
-// the legacy paths when envelope decode fails and the CID contains ":". A CID
-// with the prefix, no ":", and an undecodable payload was meant to be an
-// envelope — its corruption surfaces as an error.
+// envelope. A PVE storage literally named "pvd-…" or "pvz-…" therefore falls
+// through to the legacy paths when envelope decode fails and the CID contains
+// ":". A CID with either prefix, no ":", and an undecodable payload was meant
+// to be an envelope — its corruption surfaces as an error.
 //
 // Returns an error when:
 //   - cid is empty
 //   - an envelope payload (no ":" anywhere) is empty, not valid base64url, not
 //     valid JSON, or has an empty "v" field
+//   - a pvz- payload (no ":" anywhere) is not a valid gzip stream or its
+//     decompressed size exceeds maxDiskCIDEnvelopeBytes
 //   - the legacy "|" separator is present but the suffix is empty, not valid
 //     base64url, or not valid JSON for DiskCIDMeta
 //
@@ -253,6 +329,17 @@ func ParseEncodedDiskCID(cid string) (bareCID string, meta *DiskCIDMeta, err err
 		// Prefix matched but the payload cannot be an envelope (":" is not in
 		// the base64url alphabet): this is a legacy CID on a storage whose
 		// name happens to start with "pvd-". Fall through to the legacy paths.
+	}
+	if strings.HasPrefix(cid, diskCIDCompressedPrefix) {
+		bare, m, envErr := parseCompressedDiskCIDEnvelope(cid)
+		if envErr == nil {
+			return bare, m, nil
+		}
+		if !strings.Contains(cid, ":") {
+			return "", nil, envErr
+		}
+		// Same fallback rule as pvd-: a storage literally named "pvz-…"
+		// produces a legacy CID containing ":". Fall through.
 	}
 	idx := strings.Index(cid, diskCIDSep)
 	if idx < 0 {
@@ -287,6 +374,44 @@ func parseDiskCIDEnvelope(cid string) (string, *DiskCIDMeta, error) {
 	if err != nil {
 		return "", nil, cpierrors.Cloud("invalid disk CID %q: envelope payload is not valid base64url: %v", cid, err)
 	}
+	return unmarshalDiskCIDEnvelope(cid, raw)
+}
+
+// parseCompressedDiskCIDEnvelope decodes the payload after
+// diskCIDCompressedPrefix: base64url, then a size-capped gzip decompression,
+// then the shared JSON envelope validation. Split out for the same
+// fallback-decision reason as parseDiskCIDEnvelope.
+func parseCompressedDiskCIDEnvelope(cid string) (string, *DiskCIDMeta, error) {
+	payload := cid[len(diskCIDCompressedPrefix):]
+	if payload == "" {
+		return "", nil, cpierrors.Cloud("invalid disk CID %q: compressed envelope payload is empty", cid)
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(payload)
+	if err != nil {
+		return "", nil, cpierrors.Cloud("invalid disk CID %q: compressed envelope payload is not valid base64url: %v", cid, err)
+	}
+	gr, err := gzip.NewReader(bytes.NewReader(raw))
+	if err != nil {
+		return "", nil, cpierrors.Cloud("invalid disk CID %q: compressed envelope is not a gzip stream: %v", cid, err)
+	}
+	// Read one byte past the cap so an over-limit envelope is detectable, and
+	// close before the length check so the reader is always released.
+	decompressed, readErr := io.ReadAll(io.LimitReader(gr, maxDiskCIDEnvelopeBytes+1))
+	if cerr := gr.Close(); readErr == nil && cerr != nil {
+		readErr = cerr
+	}
+	if readErr != nil {
+		return "", nil, cpierrors.Cloud("invalid disk CID %q: compressed envelope decompression failed: %v", cid, readErr)
+	}
+	if len(decompressed) > maxDiskCIDEnvelopeBytes {
+		return "", nil, cpierrors.Cloud("invalid disk CID %q: compressed envelope exceeds %d decompressed bytes", cid, maxDiskCIDEnvelopeBytes)
+	}
+	return unmarshalDiskCIDEnvelope(cid, decompressed)
+}
+
+// unmarshalDiskCIDEnvelope is the shared JSON tail of the pvd- and pvz-
+// decoders: parse the envelope and require a non-empty volid.
+func unmarshalDiskCIDEnvelope(cid string, raw []byte) (string, *DiskCIDMeta, error) {
 	var env diskCIDEnvelope
 	if err := json.Unmarshal(raw, &env); err != nil {
 		return "", nil, cpierrors.Cloud("invalid disk CID %q: envelope JSON decode failed: %v", cid, err)
