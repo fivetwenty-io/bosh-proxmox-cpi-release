@@ -293,6 +293,40 @@ iperf3 -c <receiving-node-ip> -t 10
 
 A large gap between this cross-node figure and a same-node `iperf3` run (VM-to-VM on one node, no VXLAN encapsulation) points at the underlay link or its MTU rather than at SDN itself.
 
+### SDN VLAN operations
+
+With `sdn_zone_type: vlan`, each managed network becomes one vnet carrying one 802.1Q VLAN ID, realized as a per-node bridge over the underlay named in `pve.network_bridge`. The tag lives on the vnet — VMs attach by bridge name alone — so VLAN membership audits reduce to one command.
+
+Pre-flight, before the first VLAN deploy — unlike VXLAN, the VLAN path depends on physical-fabric configuration the CPI cannot create or verify:
+
+```bash
+# 1. The underlay bridge exists on EVERY node and is VLAN-aware.
+grep -A3 "iface vmbr0" /etc/network/interfaces
+# expect: bridge-vlan-aware yes
+#         bridge-vids 2-4094        (or at least the VLAN IDs in use)
+
+# 2. The switch ports feeding each node's underlay uplink trunk the VLANs
+#    in use (802.1Q trunk mode; check the switch, not the node).
+```
+
+Verification after `create_network`:
+
+```bash
+# Zone carries the underlay bridge; each vnet carries its VLAN ID as "tag".
+pvesh get /cluster/sdn/zones --pending 1
+pvesh get /cluster/sdn/vnets --pending 1
+
+# Per-node realization: the vnet is a bridge named after itself.
+ip -d link show <vnet>
+
+# Tagged frames actually leave the node (run while pinging from a VM on the vnet):
+tcpdump -ni <underlay-uplink> -e vlan <id>
+```
+
+A vnet whose traffic dies at the node boundary while same-node VM-to-VM traffic works is almost always a switch trunk or `bridge-vlan-aware` gap — see [Troubleshooting — VLAN vnet](troubleshooting.md#vm-on-a-vlan-vnet-has-no-connectivity).
+
+VLAN ID hygiene: explicit `cloud_properties.vnet_tag` values are the recommended path (IDs come from the fabric's VLAN plan); the auto-allocation band for vlan zones defaults to 2000–2999 and must stay within the 4094 cap. Reserve the band in the fabric's VLAN plan if auto-allocation is used at all.
+
 ### Memory ballooning
 
 The CPI writes `balloon: 0` on every VM and template it creates, so the balloon device is disabled by default — BOSH sizes VMs deterministically, and auto-ballooning would reclaim guest memory beneath the Director's assumptions. Verify on any CPI-created VM:

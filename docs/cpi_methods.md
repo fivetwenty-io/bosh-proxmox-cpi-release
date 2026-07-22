@@ -587,7 +587,7 @@ For the full `cloud_properties` schema, zone/vnet/subnet semantics, naming rules
   - `cloud_properties` (Hash): PVE-specific keys:
     - `zone` (String): PVE SDN zone name; overrides `pve.sdn_zone` config. When both are empty and zone auto-management is on (the default), the turnkey zone `bosh` is used
     - `zone_type` (String): zone type used when the CPI creates the zone (`simple` | `vlan` | `qinq` | `vxlan` | `evpn`); overrides `pve.sdn_zone_type` config (default `vxlan`). A pre-existing zone's actual PVE type governs regardless of this value; `evpn` zones are never CPI-created
-    - `vnet_tag` (Integer): explicit VNI/VLAN tag for the vnet (1–16777215; 1–4094 for `vlan`/`qinq`); when absent, tag-carrying zone types auto-allocate from the `pve.sdn_vni_range_start`/`_end` band (default 5000–5999)
+    - `vnet_tag` (Integer): explicit VNI/VLAN tag for the vnet (1–16777215; 1–4094 for `vlan`/`qinq`, where the tag is the 802.1Q VLAN ID of the physical fabric); when absent, tag-carrying zone types auto-allocate from the `pve.sdn_vni_range_start`/`_end` band (default 5000–5999, or 2000–2999 for `vlan`/`qinq` zone types). For VLAN networks an explicit tag is the recommended path — VLAN IDs usually come from the network team, not an allocator
     - `vnet` (String): PVE vnet name — max 8 chars, `[a-z0-9]`; required for the SDN path
     - `bridge` (String): Linux bridge interface name, e.g. `"vmbr1"`; required for the bridge path when `pve.network_bridge` is not set
     - `node` (String): PVE node name for bridge operations; falls back to `pve.node` config

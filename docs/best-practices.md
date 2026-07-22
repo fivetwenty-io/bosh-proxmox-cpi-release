@@ -282,7 +282,7 @@ Property names and defaults are cross-referenced to [Configuration reference](co
 
 **Best practice.** A vlan-aware trunk bridge, with the guest itself expected to tag its own frames, is a common anti-pattern that pushes VLAN correctness into every guest instead of the platform.
 
-**CPI behavior.** The CPI's only path to VLAN segmentation is a PVE SDN zone of type `vlan`, where each vnet maps to one discrete VLAN ID under `sdn_zone_type: vlan`. The bridge-mode path (`network_mode: bridge`) attaches to a plain Linux bridge by name and carries no VLAN-tagging concept of its own — there is no vlan-aware-bridge option to misuse.
+**CPI behavior.** The CPI's only path to VLAN segmentation is a PVE SDN zone of type `vlan`, where each vnet maps to one discrete VLAN ID (vnet-per-VLAN). Under `sdn_zone_type: vlan` the CPI creates the zone turnkey with `pve.network_bridge` as underlay, tags each vnet with `cloud_properties.vnet_tag` (the 802.1Q VLAN ID, capped at 4094; the auto-allocation band defaults to 2000–2999 for vlan zones), and VMs join by bridge selection alone — no `tag=` ever appears in a NIC config. The bridge-mode path (`network_mode: bridge`) attaches to a plain Linux bridge by name and carries no VLAN-tagging concept of its own — there is no vlan-aware-bridge option to misuse.
 
 **Status.** Meets.
 

@@ -1901,6 +1901,15 @@ func (c *CPIConfig) ApplyDefaults() {
 	}
 	// VNI auto-allocation band. Filled unconditionally (unlike the parker band)
 	// because the band is always meaningful once a tagged zone type is in play.
+	// For 802.1Q-capped zone types (vlan, qinq) the default band must sit
+	// inside the 4094 VLAN ID cap — the VXLAN-oriented 5000..5999 default
+	// would make every auto-allocated tag fail at create_network time. An
+	// operator-set band always wins (and is cap-validated in
+	// validateSDNFields).
+	if c.SDNVNIRangeStart == 0 && c.SDNVNIRangeEnd == 0 && sdnZoneTypeIsVLANCapped(c.SDNZoneType) {
+		c.SDNVNIRangeStart = 2000
+		c.SDNVNIRangeEnd = 2999
+	}
 	if c.SDNVNIRangeStart == 0 {
 		c.SDNVNIRangeStart = 5000
 	}
@@ -3495,6 +3504,17 @@ func (c *CPIConfig) validateSDNFields(errs *[]string) {
 				c.SDNVNIRangeStart, c.SDNVNIRangeEnd,
 			))
 		}
+		// For 802.1Q-capped zone types the whole band must sit inside the
+		// 4094 VLAN ID cap — fail at Load time rather than on the first
+		// auto-allocated tag inside create_network. The allocation-time clamp
+		// stays as backstop for pre-existing zones whose effective type
+		// differs from the configured one.
+		if sdnZoneTypeIsVLANCapped(c.SDNZoneType) && c.SDNVNIRangeEnd > 4094 {
+			*errs = append(*errs, fmt.Sprintf(
+				"sdn_vni_range %d..%d exceeds the 4094 VLAN ID cap for sdn_zone_type %q",
+				c.SDNVNIRangeStart, c.SDNVNIRangeEnd, c.SDNZoneType,
+			))
+		}
 	}
 
 	// Zone MTU — sane Ethernet/jumbo bounds when set.
@@ -3503,6 +3523,13 @@ func (c *CPIConfig) validateSDNFields(errs *[]string) {
 			"sdn_zone_mtu must be within 576..65520, got %d", *c.SDNZoneMTU,
 		))
 	}
+}
+
+// sdnZoneTypeIsVLANCapped reports whether the zone type carries 802.1Q VLAN
+// IDs as vnet tags, capping them at 4094 (vlan, qinq). Untagged (simple) and
+// 24-bit-VNI types (vxlan, evpn) are not capped.
+func sdnZoneTypeIsVLANCapped(zoneType string) bool {
+	return zoneType == "vlan" || zoneType == "qinq"
 }
 
 // rangesOverlap reports whether [s1,e1] and [s2,e2] overlap (inclusive on both ends).

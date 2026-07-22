@@ -692,6 +692,36 @@ pvesh get /cluster/sdn/zones --pending 1
 
 Open UDP 4789 between all cluster nodes in every firewall on the path (PVE host firewall, switch ACLs, external firewalls). If the zone's peer list is stale — for example a node was offline when the CPI created the zone — set `pve.sdn_vxlan_peers` explicitly and recreate the network, or edit the zone's peer list in PVE and re-apply. See [Operations — SDN VXLAN operations](operations.md#sdn-vxlan-operations).
 
+### VM on a VLAN vnet has no connectivity
+
+**Symptom**
+
+A VM attached to a VLAN vnet (`bridge: vlan59`-style, zone type `vlan`) cannot reach its gateway or peers on other nodes. Same-node VM-to-VM traffic on the vnet may still work — the tag never has to leave the node in that case.
+
+**Diagnosis**
+
+Work outward from the vnet, in this order — the CPI configures only the first item; the rest is fabric:
+
+```bash
+# 1. The vnet exists, carries the expected VLAN ID, and is applied (not pending).
+pvesh get /cluster/sdn/vnets --pending 1
+
+# 2. The zone's underlay bridge is VLAN-aware on the VM's node.
+grep -A3 "iface vmbr0" /etc/network/interfaces
+# expect: bridge-vlan-aware yes, and bridge-vids covering the VLAN ID
+
+# 3. Tagged frames reach the physical uplink (run while pinging from the VM).
+tcpdump -ni <underlay-uplink> -e vlan <id>
+
+# 4. The switch port trunks the VLAN (check the switch config, not the node).
+```
+
+Also confirm the VLAN ID matches the fabric's plan — a vnet tagged with an auto-allocated ID (band 2000–2999) only works if the fabric trunks that range; explicit `cloud_properties.vnet_tag` values from the network team's VLAN plan are the recommended path.
+
+**Fix**
+
+Fix the first failing layer: apply pending SDN changes (`pvesh set /cluster/sdn`), set `bridge-vlan-aware yes` plus a covering `bridge-vids` on the underlay bridge of every node and reload networking, or trunk the VLAN on the switch ports. If the tag itself is wrong, recreate the network with the correct `vnet_tag`. See [Operations — SDN VLAN operations](operations.md#sdn-vlan-operations) for the pre-flight checklist.
+
 ## Memory pressure and ballooning
 
 ### VM memory shrinks below manifest size or jobs OOM unexpectedly

@@ -128,8 +128,15 @@ properties:
       The default "vxlan" builds a cluster-wide L2 overlay — peers are
       auto-derived from the online cluster nodes (override with
       pve.sdn_vxlan_peers) and each vnet gets a VNI from the
-      sdn_vni_range band. "simple" remains an opt-in for single-node or
+      sdn_vni_range band. "vlan" maps each managed network onto an 802.1Q
+      VLAN of the physical fabric: the zone is created with
+      pve.network_bridge as its underlay (the bridge must exist on every
+      node, VLAN-aware, with trunked switch ports), each vnet carries the
+      VLAN ID as its tag (cloud_properties.vnet_tag, capped at 4094), and
+      VMs join by bridge selection alone — no VLAN tag ever appears in a
+      VM's NIC config. "simple" remains an opt-in for single-node or
       deliberately node-local networks (its bridges do not span nodes).
+      "qinq" zones must pre-exist (the CPI does not auto-create them).
       "evpn" is never CPI-created: pre-create the zone and its BGP
       controller in PVE, and the CPI manages only vnets and subnets
       inside it.
@@ -156,14 +163,17 @@ properties:
     default: []
   pve.sdn_vni_range_start:
     description: |
-      Start of the band from which the CPI auto-allocates VXLAN Network
-      Identifiers (vnet tags) for tagged zone types. 0 uses the default
-      band 5000-5999. Per-network override via cloud_properties.vnet_tag.
+      Start of the band from which the CPI auto-allocates vnet tags (VNIs
+      for vxlan/evpn, 802.1Q VLAN IDs for vlan/qinq) for tagged zone
+      types. 0 uses the default band: 5000-5999, or 2000-2999 when
+      sdn_zone_type is vlan or qinq (the band must fit the 4094 VLAN ID
+      cap; an explicit band beyond it fails validation). Per-network
+      override via cloud_properties.vnet_tag.
     default: 0
   pve.sdn_vni_range_end:
     description: |
-      End of the VNI auto-allocation band. 0 uses the default band
-      5000-5999.
+      End of the tag auto-allocation band. 0 uses the default band
+      (5000-5999, or 2000-2999 for vlan/qinq zone types).
     default: 0
   pve.sdn_zone_mtu:
     description: |

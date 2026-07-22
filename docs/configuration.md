@@ -23,8 +23,8 @@ The CPI reads configuration from a BOSH deployment manifest. The job template re
 | `pve.sdn_zone_type` | Zone type the CPI uses when creating a zone. `vxlan` (default) — cluster-wide L2 overlay with peers derived from the online cluster nodes. `simple` — isolated per-node bridge (opt-in, single-node). `vlan`/`qinq` — tagged segments on an existing bridge (opt-in). `evpn` — never CPI-created; the operator pre-creates the zone and its controller and the CPI manages only vnets and subnets inside it. Only relevant when `sdn_auto_manage_zone` is `true`. | `vxlan` | no |
 | `pve.sdn_auto_manage_zone` | When `true` (default), the CPI may create SDN zones on `create_network` and delete them on `delete_network` when all safety conditions are met (EVPN zones are never created or deleted). Set `false` to keep zones operator-owned. See [Network configuration](networks.md). | `true` | no |
 | `pve.sdn_vxlan_peers` | Explicit VXLAN peer IPs for CPI-created vxlan zones. When empty (default), peers are derived from the online cluster nodes via `GET /cluster/status`. Set when tunnel traffic must ride a dedicated underlay whose addresses differ from the management IPs. | `[]` | no |
-| `pve.sdn_vni_range_start` | First tag of the VNI/VLAN auto-allocation band for vnets in tag-carrying zones (`vxlan`, `evpn`, `vlan`, `qinq`). `0` applies the built-in `5000`. Per-network override via `cloud_properties.vnet_tag`. | `0` (→ `5000`) | no |
-| `pve.sdn_vni_range_end` | Inclusive upper bound of the VNI/VLAN auto-allocation band. `0` applies the built-in `5999`. Must be ≥ `sdn_vni_range_start`; vlan/qinq allocation additionally caps at 4094. | `0` (→ `5999`) | no |
+| `pve.sdn_vni_range_start` | First tag of the VNI/VLAN auto-allocation band for vnets in tag-carrying zones (`vxlan`, `evpn`, `vlan`, `qinq`). `0` applies the built-in default: `5000`, or `2000` when `sdn_zone_type` is `vlan`/`qinq` (the band must fit the 4094 VLAN ID cap). Per-network override via `cloud_properties.vnet_tag`. | `0` (→ `5000`, vlan/qinq `2000`) | no |
+| `pve.sdn_vni_range_end` | Inclusive upper bound of the VNI/VLAN auto-allocation band. `0` applies the built-in default: `5999`, or `2999` for `vlan`/`qinq` zone types. Must be ≥ `sdn_vni_range_start`; for `vlan`/`qinq` an explicit band ending above 4094 fails validation at load time. | `0` (→ `5999`, vlan/qinq `2999`) | no |
 | `pve.sdn_zone_mtu` | Explicit MTU for CPI-created SDN zones. `0` (default) lets PVE derive it from the underlay (1500 → 1450 for vxlan). Set only for unusual underlays, e.g. jumbo frames. Valid range 576–65520 when set. | `0` (→ PVE-derived) | no |
 | `pve.verify_ssl` | Verify the PVE API TLS certificate | `true` | no |
 | `pve.ca_cert` | Optional PEM-encoded CA certificate bundle for verifying the Proxmox VE API TLS certificate. When empty (default), the system trust pool is used — behavior is byte-identical to prior releases. When set, the PEM is parsed and the resulting cert pool is used for PVE API HTTPS verification. Ignored when `verify_ssl` is `false`. | `""` | no |
@@ -237,6 +237,35 @@ properties:
 ```
 
 The vnet becomes an isolated per-node bridge; deployments spanning nodes need the vxlan default instead.
+
+### Manifest Example — VLAN (vnet-per-VLAN)
+
+For clusters segmented by 802.1Q VLANs in the physical fabric. The VLAN tag lives on the SDN vnet — VMs join by bridge selection alone:
+
+```yaml
+properties:
+  pve:
+    # ...connection basics as above...
+    network_bridge: vmbr0     # VLAN-aware underlay bridge on every node
+    sdn_zone_type: vlan
+```
+
+Cloud-config managed network, one per VLAN:
+
+```yaml
+networks:
+- name: vlan59-net
+  type: manual
+  managed: true
+  subnets:
+  - range: 10.59.0.0/24
+    gateway: 10.59.0.1
+    cloud_properties:
+      vnet: vlan59
+      vnet_tag: 59           # the 802.1Q VLAN ID (≤ 4094)
+```
+
+The CPI creates the vlan zone with `network_bridge` as underlay, the vnet with tag 59, and returns `bridge: vlan59` for VM attachment. Pre-created vnets work without `managed: true` — point `cloud_properties.bridge` at the vnet name. See [Networks — Example 3](networks.md#example-3--vlan-vnet-per-vlan) for the full walkthrough and [Operations — SDN VLAN operations](operations.md#sdn-vlan-operations) for fabric prerequisites.
 
 ### Manifest Example — Bridge Mode (opt-in)
 

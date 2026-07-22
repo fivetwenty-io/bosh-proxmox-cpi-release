@@ -57,7 +57,7 @@ These keys are read from the per-network `cloud_properties` block in the BOSH cl
 | `zone` | string | no (turnkey zone `bosh` when omitted with auto-manage on) | PVE SDN zone name. Takes precedence over `config.sdn_zone`. Required only when `sdn_auto_manage_zone` is disabled. |
 | `zone_type` | string | no | Zone type to use when the CPI creates the zone (requires `sdn_auto_manage_zone`). One of: `simple`, `vlan`, `qinq`, `vxlan`, `evpn`. Falls back to `config.sdn_zone_type` (default `vxlan`). When the zone already exists, its actual PVE type governs vnet tagging regardless of this value. `evpn` zones must pre-exist — the CPI never creates them (see [EVPN zones](#zone-auto-management)). |
 | `vnet` | string | SDN path | PVE SDN vnet name. Must be 1–8 lowercase alphanumeric characters (regex `[a-z0-9]{1,8}`). Leading digits are allowed. |
-| `vnet_tag` | int | no | Explicit vnet tag (VNI for vxlan/evpn, VLAN ID for vlan/qinq; 1–16777215, capped at 4094 for vlan/qinq). When omitted on a tagged zone type, the CPI auto-allocates from the `sdn_vni_range` band (default 5000–5999). Invalid on `simple` zones. |
+| `vnet_tag` | int | no | Explicit vnet tag (VNI for vxlan/evpn, VLAN ID for vlan/qinq; 1–16777215, capped at 4094 for vlan/qinq). When omitted on a tagged zone type, the CPI auto-allocates from the `sdn_vni_range` band — default 5000–5999, or 2000–2999 when `sdn_zone_type` is `vlan`/`qinq` (the band must fit the 4094 cap). Invalid on `simple` zones. |
 | `bridge` | string | Bridge path only, when `config.network_bridge` is empty | Linux bridge interface name on the target node (e.g. `vmbr1`). |
 | `node` | string | Bridge path only, when `config.node` is empty | PVE node where the bridge is created or deleted. |
 
@@ -211,6 +211,47 @@ The CPI will:
 2. Call `PUT /nodes/pve1/network` to reload the node network config.
 
 3. Return network CID `vmbr1`, address properties, and `cloud_properties` containing `bridge` and `node`.
+
+### Example 3 — VLAN (vnet-per-VLAN)
+
+For clusters whose segmentation lives in the physical fabric, a vlan zone maps each BOSH network onto an 802.1Q VLAN. The tag lives on the SDN vnet, never in any VM's NIC config: VMs join a VLAN purely by bridge selection, because PVE realizes each vnet as a per-node bridge named after the vnet. One vnet per VLAN keeps membership visible and auditable in one place (`pvesh get /cluster/sdn/vnets`).
+
+Prerequisites outside the CPI: the underlay bridge (`pve.network_bridge`) must exist on every node with `bridge-vlan-aware yes`, and the physical switch ports must trunk the VLANs in use — see [Operations — SDN VLAN operations](operations.md#sdn-vlan-operations).
+
+BOSH manifest CPI properties:
+
+```yaml
+properties:
+  pve:
+    # ...connection basics as above...
+    network_bridge: vmbr0     # VLAN-aware underlay bridge, present on every node
+    sdn_zone_type: vlan
+```
+
+Cloud-config managed network — one per VLAN, with `vnet_tag` carrying the VLAN ID assigned by the network team:
+
+```yaml
+networks:
+- name: vlan59-net
+  type: manual
+  managed: true
+  subnets:
+  - range: 10.59.0.0/24
+    gateway: 10.59.0.1
+    cloud_properties:
+      vnet: vlan59
+      vnet_tag: 59
+```
+
+The CPI will:
+
+1. Check whether the turnkey zone `bosh` exists and create it (type `vlan`) if absent, with `pve.network_bridge` as the underlay bridge. An empty `network_bridge` is a fail-fast error naming the property.
+
+2. Create vnet `vlan59` in zone `bosh` with tag 59 — the 802.1Q VLAN ID (idempotent on conflict; a pre-existing vnet is adopted). Tags above 4094 are rejected. When `vnet_tag` is omitted, a tag is auto-allocated from the `sdn_vni_range` band — which defaults to 2000–2999 for vlan zones (the VXLAN-oriented 5000–5999 default exceeds the 4094 cap) — but an explicit `vnet_tag` is the recommended path, since VLAN IDs usually come from the network fabric, not from an allocator.
+
+3. Create the subnet, apply the SDN configuration, and return `cloud_properties` with `bridge: vlan59` — VMs attach to the VLAN by that bridge name alone, with no `tag=` in any NIC config.
+
+Pre-created vnets work the same way with zero CPI involvement: build the vlan zone and vnets in PVE by hand (or in the automation of your choice), skip `managed: true`, and point each subnet's `cloud_properties.bridge` at the vnet name (e.g. `bridge: vlan59`). The CPI validates the bridge exists on the placement node before writing any NIC config.
 
 ## create_network
 
