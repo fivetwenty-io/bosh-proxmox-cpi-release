@@ -1326,3 +1326,72 @@ func TestHandleSetDiskMetadata_RangeOnlyNoTag_NotSkipped(t *testing.T) {
 		t.Fatal("range-only no tag: UpdateQemuConfig not called — VM wrongly skipped despite missing bosh-parker tag")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Foreign sentinel key preservation: the description sentinel is shared with
+// other codecs (bosh_attached_disks from attach_disk, bosh_parked_disks).
+// Both description writers in this handler must pass unknown top-level keys
+// through untouched — dropping bosh_attached_disks makes a later get_disks
+// fall back to bare volids and every envelope-CID disk scans as missing.
+// ---------------------------------------------------------------------------
+
+func TestHandleSetDiskMetadata_PreservesForeignSentinelKeys(t *testing.T) {
+	t.Parallel()
+
+	existingDesc := `<!--BOSH:{"bosh_attached_disks":{"local-lvm:vm-100-disk-0":"pvd-recordedCID"}}-->`
+	nodesSvc := &diskMetaNodesMock{}
+	clusterSvc := &diskMetaClusterSvc{resp: clusterResourcesWithVM(testVMID, testNode)}
+	pve := buildDiskMetaPVE(clusterSvc, map[string]map[string]any{
+		diskKey(testNode, int(testVMID)): vmConfigWithDisk(testDiskCID, existingDesc),
+	}, nodesSvc)
+
+	h := handlers.HandleSetDiskMetadata(makeDiskMetaDeps(pve))
+	meta := map[string]any{"deployment": "cf", "instance_id": "vm-abc123"}
+	if _, err := h.Handle(context.Background(), makeMetaArgs(testDiskCID, meta), jsonrpc.Context{}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if nodesSvc.capturedDesc == nil {
+		t.Fatal("UpdateQemuConfig not called — capturedDesc is nil")
+	}
+	desc := *nodesSvc.capturedDesc
+	if !strings.Contains(desc, `"bosh_attached_disks"`) || !strings.Contains(desc, "pvd-recordedCID") {
+		t.Errorf("metadata write dropped foreign sentinel key bosh_attached_disks; got: %s", desc)
+	}
+	if !strings.Contains(desc, `"bosh_disk_metadata"`) {
+		t.Errorf("description missing bosh_disk_metadata after write; got: %s", desc)
+	}
+}
+
+func TestHandleSetDiskMetadata_TagsPathPreservesForeignSentinelKeys(t *testing.T) {
+	t.Parallel()
+
+	existingDesc := `<!--BOSH:{"bosh_attached_disks":{"local-lvm:vm-100-disk-0":"pvd-recordedCID"}}-->`
+	nodesSvc := &diskMetaNodesMock{}
+	clusterSvc := &diskMetaClusterSvc{resp: clusterResourcesWithVM(testVMID, testNode)}
+	cfg := vmConfigWithDisk(testDiskCID, existingDesc)
+	cfg["tags"] = "env--prod"
+	pve := buildDiskMetaPVE(clusterSvc, map[string]map[string]any{
+		diskKey(testNode, int(testVMID)): cfg,
+	}, nodesSvc)
+
+	h := handlers.HandleSetDiskMetadata(makeDiskMetaDeps(pve))
+	meta := map[string]any{
+		"deployment": "cf",
+		"tags":       map[string]any{"tier": "bronze"},
+	}
+	if _, err := h.Handle(context.Background(), makeMetaArgs(testDiskCID, meta), jsonrpc.Context{}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if nodesSvc.capturedDesc == nil {
+		t.Fatal("UpdateQemuConfig not called — capturedDesc is nil")
+	}
+	desc := *nodesSvc.capturedDesc
+	if !strings.Contains(desc, `"bosh_attached_disks"`) || !strings.Contains(desc, "pvd-recordedCID") {
+		t.Errorf("tags write dropped foreign sentinel key bosh_attached_disks; got: %s", desc)
+	}
+	if !strings.Contains(desc, `"bosh_disk_tags"`) {
+		t.Errorf("description missing bosh_disk_tags after write; got: %s", desc)
+	}
+}

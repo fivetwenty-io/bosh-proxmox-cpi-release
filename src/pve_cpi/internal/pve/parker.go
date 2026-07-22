@@ -95,7 +95,7 @@ func parkerNow(cfg ParkerConfig) time.Time {
 // ---------------------------------------------------------------------------
 //
 // parseParkerSentinel/renderParkerSentinel are the bosh_parked_disks-specific
-// wrapper around the shared parseSentinel/renderSentinel codec in sentinel.go
+// wrapper around the shared ParseSentinel/RenderSentinel codec in sentinel.go
 // (also used by the bosh_attached_disks codec in attached_disks.go). Same
 // wire format as set_disk_metadata's independent codec; all these codecs
 // coexist on one VM description by using distinct top-level JSON keys.
@@ -128,7 +128,7 @@ type parkerProvEntry struct {
 // (nonBOSH) and the current bosh_parked_disks map. Corrupted JSON → fresh
 // empty map (sentinel rebuilt from scratch; nonBOSH text preserved).
 func parseParkerSentinel(desc string) (nonBOSH string, disks map[string]parkerProvEntry, raw map[string]json.RawMessage) {
-	nonBOSH, raw = parseSentinel(desc)
+	nonBOSH, raw = ParseSentinel(desc)
 	disks = make(map[string]parkerProvEntry)
 
 	// Extract our own key.
@@ -161,7 +161,7 @@ func renderParkerSentinel(nonBOSH string, disks map[string]parkerProvEntry, raw 
 		merged["bosh_parked_disks"] = json.RawMessage(b)
 	}
 
-	return renderSentinel(nonBOSH, merged)
+	return RenderSentinel(nonBOSH, merged)
 }
 
 // updateParkerProvenance merges a parked-disk entry into the parker VM

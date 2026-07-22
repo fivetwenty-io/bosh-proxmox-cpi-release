@@ -13,18 +13,18 @@ import (
 	"strings"
 )
 
-// sentinelPattern matches <!--BOSH:{...}--> in a VM description. Same wire
-// format as the independent codec in handlers.set_disk_metadata (which
-// cannot import this package — see CpiOwnershipTag's doc comment); the two
-// implementations parse identical syntax so their sentinel blocks coexist on
-// one VM description via distinct top-level JSON keys.
+// sentinelPattern matches <!--BOSH:{...}--> in a VM description. ParseSentinel
+// and RenderSentinel are exported because the handlers package's description
+// writers (set_disk_metadata, set_vm_metadata) share the same wire format and
+// must pass foreign top-level keys through untouched — every sentinel block on
+// a VM description coexists via distinct top-level JSON keys.
 var sentinelPattern = regexp.MustCompile(`<!--BOSH:(.*?)-->`)
 
-// parseSentinel extracts the description text outside the sentinel (nonBOSH)
+// ParseSentinel extracts the description text outside the sentinel (nonBOSH)
 // and the full top-level key map (raw) from desc. Corrupted sentinel JSON ->
 // empty raw map (sentinel rebuilt from scratch on next write; nonBOSH text is
 // still preserved since it is captured before the JSON decode is attempted).
-func parseSentinel(desc string) (nonBOSH string, raw map[string]json.RawMessage) {
+func ParseSentinel(desc string) (nonBOSH string, raw map[string]json.RawMessage) {
 	nonBOSH = desc
 	raw = make(map[string]json.RawMessage)
 
@@ -42,10 +42,10 @@ func parseSentinel(desc string) (nonBOSH string, raw map[string]json.RawMessage)
 	return
 }
 
-// renderSentinel builds the full description string from the nonBOSH prefix
+// RenderSentinel builds the full description string from the nonBOSH prefix
 // and the merged top-level key map. Returns nonBOSH unchanged (no sentinel
 // block emitted) when raw is empty — avoids writing an empty <!--BOSH:{}-->.
-func renderSentinel(nonBOSH string, raw map[string]json.RawMessage) (string, error) {
+func RenderSentinel(nonBOSH string, raw map[string]json.RawMessage) (string, error) {
 	if len(raw) == 0 {
 		return nonBOSH, nil
 	}

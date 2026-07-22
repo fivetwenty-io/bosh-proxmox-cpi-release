@@ -739,3 +739,46 @@ func TestHandleSetVMMetadata_DescriptionSorted(t *testing.T) {
 		t.Errorf("description keys not sorted: a=%d m=%d z=%d in %q", posA, posM, posZ, gotDescription)
 	}
 }
+
+// TestHandleSetVMMetadata_PreservesSentinelBlock: set_vm_metadata rebuilds the
+// description text wholesale from BOSH metadata, but the same description field
+// carries the shared <!--BOSH:{...}--> sentinel (bosh_attached_disks from
+// attach_disk, bosh_disk_metadata from set_disk_metadata). A metadata refresh
+// on a VM with attached disks must carry the sentinel forward — dropping it
+// makes a later get_disks fall back to bare volids and cloudcheck reports
+// every envelope-CID disk missing.
+func TestHandleSetVMMetadata_PreservesSentinelBlock(t *testing.T) {
+	t.Parallel()
+
+	existingDesc := "deployment: old\n<!--BOSH:{\"bosh_attached_disks\":{\"local-lvm:vm-101-disk-0\":\"pvd-recordedCID\"},\"bosh_disk_metadata\":{\"local-lvm:vm-101-disk-0\":{\"deployment\":\"cf\"}}}-->"
+	qemuSvc := &mockQEMUService{
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return map[string]any{"description": existingDesc, "tags": "env--prod"}, nil
+		},
+	}
+
+	var gotDescription string
+	nodesSvc := &mockNodesService{
+		updateQemuConfigFn: func(_ context.Context, _ string, _ string, params *nodes.UpdateQemuConfigParams) error {
+			if params.Description != nil {
+				gotDescription = *params.Description
+			}
+			return nil
+		},
+	}
+
+	h := handlers.HandleSetVMMetadata(testDepsFoundVM(101, qemuSvc, nodesSvc, nil, &mockAgentService{}))
+	metadata := map[string]any{"deployment": "cf", "job": "web"}
+	if _, err := h.Handle(context.Background(), marshalArgs("101", metadata), jsonrpc.Context{}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if !strings.Contains(gotDescription, "deployment: cf") {
+		t.Errorf("description missing refreshed metadata text; got:\n%s", gotDescription)
+	}
+	for _, want := range []string{`"bosh_attached_disks"`, "pvd-recordedCID", `"bosh_disk_metadata"`} {
+		if !strings.Contains(gotDescription, want) {
+			t.Errorf("metadata refresh dropped sentinel content %s; got:\n%s", want, gotDescription)
+		}
+	}
+}

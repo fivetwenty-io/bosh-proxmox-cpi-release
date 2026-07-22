@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"regexp"
 	"strings"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
@@ -19,15 +18,14 @@ import (
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/qemu"
 )
 
-// boshSentinelPattern matches the BOSH disk-metadata sentinel comment block inside a
-// VM description: <!--BOSH:{...}--> where {...} is the JSON payload.
-var boshSentinelPattern = regexp.MustCompile(`<!--BOSH:(.*?)-->`)
-
-// boshDescriptionPayload is the JSON structure stashed inside the sentinel comment.
-type boshDescriptionPayload struct {
-	BoshDiskMetadata map[string]map[string]any    `json:"bosh_disk_metadata"`
-	BoshDiskTags     map[string]map[string]string `json:"bosh_disk_tags,omitempty"`
-}
+// Top-level sentinel JSON keys owned by this handler inside the shared
+// <!--BOSH:{...}--> description block (codec: pve.ParseSentinel /
+// pve.RenderSentinel). Other keys in the same block (bosh_attached_disks,
+// bosh_parked_disks) belong to other writers and pass through raw.
+const (
+	sentinelKeyDiskMetadata = "bosh_disk_metadata"
+	sentinelKeyDiskTags     = "bosh_disk_tags"
+)
 
 // attachedVM records the node+vmid pair that hosts a disk.
 type attachedVM struct {
@@ -297,33 +295,27 @@ func persistMetadata(ctx context.Context, deps Deps, vm attachedVM, diskCID stri
 		}
 	}
 
-	// Parse existing sentinel block.
-	var payload boshDescriptionPayload
-	payload.BoshDiskMetadata = make(map[string]map[string]any)
+	// Parse the shared sentinel block, touching only this handler's key.
+	// Foreign top-level keys (bosh_attached_disks from attach_disk,
+	// bosh_parked_disks) pass through raw — dropping them makes a later
+	// get_disks fall back to bare volids.
+	nonBoshDesc, raw := pve.ParseSentinel(currentDesc)
 
-	nonBoshDesc := currentDesc
-	if m := boshSentinelPattern.FindStringSubmatchIndex(currentDesc); m != nil {
-		jsonStr := currentDesc[m[2]:m[3]]
-		if parseErr := json.Unmarshal([]byte(jsonStr), &payload); parseErr != nil {
-			// Corrupted sentinel — start fresh but preserve non-bosh text.
-			payload.BoshDiskMetadata = make(map[string]map[string]any)
-		}
-		// Non-bosh content is everything before the sentinel.
-		nonBoshDesc = strings.TrimSpace(currentDesc[:m[0]])
+	diskMeta := make(map[string]map[string]any)
+	if b, ok := raw[sentinelKeyDiskMetadata]; ok {
+		_ = json.Unmarshal(b, &diskMeta) // corrupted key → rebuilt from scratch
 	}
+	diskMeta[diskCID] = metadata
 
-	// Merge metadata for this disk CID.
-	payload.BoshDiskMetadata[diskCID] = metadata
-
-	// Serialise updated sentinel.
-	sentinelJSON, err := json.Marshal(payload)
+	metaJSON, err := json.Marshal(diskMeta)
 	if err != nil {
 		return cpierrors.Cloud("set_disk_metadata: marshal metadata payload: %s", err.Error())
 	}
+	raw[sentinelKeyDiskMetadata] = json.RawMessage(metaJSON)
 
-	newDesc := fmt.Sprintf("<!--BOSH:%s-->", string(sentinelJSON))
-	if nonBoshDesc != "" {
-		newDesc = nonBoshDesc + "\n" + newDesc
+	newDesc, err := pve.RenderSentinel(nonBoshDesc, raw)
+	if err != nil {
+		return cpierrors.Cloud("set_disk_metadata: render description sentinel: %s", err.Error())
 	}
 
 	// Write back via nodes.UpdateQemuConfig (description field).
@@ -400,34 +392,29 @@ func applyCustomTagsToVM(ctx context.Context, deps Deps, node string, vmid int, 
 		}
 	}
 
-	var payload boshDescriptionPayload
-	payload.BoshDiskMetadata = make(map[string]map[string]any)
+	// Same shared-sentinel discipline as persistMetadata: touch only the
+	// bosh_disk_tags key, pass every other top-level key through raw.
+	nonBoshDesc, raw := pve.ParseSentinel(currentDesc)
 
-	nonBoshDesc := currentDesc
-	if m := boshSentinelPattern.FindStringSubmatchIndex(currentDesc); m != nil {
-		jsonStr := currentDesc[m[2]:m[3]]
-		if parseErr := json.Unmarshal([]byte(jsonStr), &payload); parseErr != nil {
-			payload.BoshDiskMetadata = make(map[string]map[string]any)
-			payload.BoshDiskTags = nil
-		}
-		nonBoshDesc = strings.TrimSpace(currentDesc[:m[0]])
-	}
-	if payload.BoshDiskTags == nil {
-		payload.BoshDiskTags = make(map[string]map[string]string)
+	diskTags := make(map[string]map[string]string)
+	if b, ok := raw[sentinelKeyDiskTags]; ok {
+		_ = json.Unmarshal(b, &diskTags) // corrupted key → rebuilt from scratch
 	}
 	tagCopy := make(map[string]string, len(tags))
 	for k, v := range tags {
 		tagCopy[k] = v
 	}
-	payload.BoshDiskTags[diskCID] = tagCopy
+	diskTags[diskCID] = tagCopy
 
-	sentinelJSON, err := json.Marshal(payload)
+	tagsJSON, err := json.Marshal(diskTags)
 	if err != nil {
 		return cpierrors.Cloud("set_disk_metadata: marshal tag payload: %s", err.Error())
 	}
-	newDesc := fmt.Sprintf("<!--BOSH:%s-->", string(sentinelJSON))
-	if nonBoshDesc != "" {
-		newDesc = nonBoshDesc + "\n" + newDesc
+	raw[sentinelKeyDiskTags] = json.RawMessage(tagsJSON)
+
+	newDesc, err := pve.RenderSentinel(nonBoshDesc, raw)
+	if err != nil {
+		return cpierrors.Cloud("set_disk_metadata: render description sentinel: %s", err.Error())
 	}
 
 	vmidStr := fmt.Sprintf("%d", vmid)

@@ -163,20 +163,42 @@ func setVMMetadataRMW(
 	logger *log.Logger,
 ) error {
 	// Read existing tags inside the lock so no concurrent writer can interleave
-	// between the read and the write.
+	// between the read and the write. The same read supplies the current
+	// description so its shared <!--BOSH:{...}--> sentinel block
+	// (bosh_attached_disks from attach_disk, bosh_disk_metadata from
+	// set_disk_metadata) is carried onto the rebuilt description — this
+	// handler regenerates the human-readable text wholesale, and dropping
+	// the sentinel would make a later get_disks fall back to bare volids.
 	var existingTags []string
+	var existingDesc string
 	if cfg, cfgErr := deps.PVE.QEMU().Config(ctx, node, vmid); cfgErr == nil {
 		if v, ok := cfg[jsonKeyTags]; ok {
 			if s, ok := v.(string); ok {
 				existingTags = parseTagsField(s)
 			}
 		}
+		if v, ok := cfg["description"]; ok {
+			if s, ok := v.(string); ok {
+				existingDesc = s
+			}
+		}
 	} else if pve.IsNotFound(cfgErr) {
 		return cpierrors.VMNotFound(vmCID)
 	} else {
-		logger.Warn("set_vm_metadata: could not read current VM config; existing tags will not be preserved",
+		logger.Warn("set_vm_metadata: could not read current VM config; existing tags and description sentinel will not be preserved",
 			log.Err(cfgErr),
 		)
+	}
+
+	if _, raw := pve.ParseSentinel(existingDesc); len(raw) > 0 {
+		merged, renderErr := pve.RenderSentinel(strings.TrimSpace(description), raw)
+		if renderErr != nil {
+			logger.Warn("set_vm_metadata: could not re-render description sentinel; sentinel not preserved",
+				log.Err(renderErr),
+			)
+		} else {
+			description = merged
+		}
 	}
 
 	preserved := stripReservedBoshTags(existingTags)

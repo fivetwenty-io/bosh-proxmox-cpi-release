@@ -32,7 +32,7 @@ const attachedDisksSentinelKey = "bosh_attached_disks"
 // rebuilt from scratch on next write; nonBOSH text and unrelated keys are
 // preserved either way).
 func parseAttachedDisksSentinel(desc string) (nonBOSH string, disks map[string]string, raw map[string]json.RawMessage) {
-	nonBOSH, raw = parseSentinel(desc)
+	nonBOSH, raw = ParseSentinel(desc)
 	disks = make(map[string]string)
 
 	if rawDisks, ok := raw[attachedDisksSentinelKey]; ok {
@@ -66,7 +66,7 @@ func renderAttachedDisksSentinel(nonBOSH string, disks map[string]string, raw ma
 		merged[attachedDisksSentinelKey] = json.RawMessage(b)
 	}
 
-	return renderSentinel(nonBOSH, merged)
+	return RenderSentinel(nonBOSH, merged)
 }
 
 // GetAttachedDiskCIDs parses a workload VM's description and returns its
