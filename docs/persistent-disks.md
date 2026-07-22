@@ -203,9 +203,14 @@ payload="${cid#pvz-}"
 python3 -c "import sys,base64,gzip; p=sys.argv[1]; print(gzip.decompress(base64.urlsafe_b64decode(p + '=' * (-len(p) % 4))).decode())" "$payload"
 ```
 
-`get_disks` intentionally returns bare volids, matching what PVE's config scan
-reports. It has never returned the annotated form — metadata exists only in
-CIDs minted by `create_disk` — and that asymmetry is unchanged by the envelope.
+`get_disks` returns the Director's verbatim disk CID whenever `attach_disk`
+recorded one: the attach handler stores the CID it received against the bare
+volid in the VM's description sentinel, and `get_disks` looks each attached
+volid up there before answering. Cloudcheck compares its stored `disk_cid`
+strings against this list, and an envelope CID embeds creation-time metadata
+that cannot be reconstructed from PVE state — without the recording, every
+envelope-CID disk would scan as missing. Disks attached by earlier releases
+(or whose best-effort sentinel write failed) fall back to the bare volid.
 
 ## Worked examples
 
