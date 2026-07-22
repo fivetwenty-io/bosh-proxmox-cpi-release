@@ -449,6 +449,216 @@ func TestNextDiskVMID_IgnoresNonDiskVolumes(t *testing.T) {
 	}
 }
 
+// A frozen stemcell template's disks are renamed by PVE to "base-<vmid>-disk-N"
+// (see MakeTemplate). NextDiskVMID's storage scan must recognize this form too,
+// not just "vm-<vmid>-disk-N" — otherwise a template VMID would be invisible to
+// the disk-range scan and could be handed out again for a persistent disk.
+func TestNextDiskVMID_UnionsBaseTemplateVolumes(t *testing.T) {
+	t.Parallel()
+	c := newVMIDClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+		return buildResources(), nil
+	})
+	c.nodesSvc = &stubNodesService{
+		listStorageContentFn: func(_ context.Context, _, _ string, _ *sdknodes.ListStorageContentParams) (*sdknodes.ListStorageContentResponse, error) {
+			return buildStorageContent("data:base-9500-disk-0.qcow2"), nil
+		},
+	}
+
+	id, err := pve.NextDiskVMID(context.Background(), c, "pve", "data")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if id == 9500 {
+		t.Fatal("returned 9500 despite base-9500-disk-0.qcow2 template volume on storage; not counted as used")
+	}
+	if id < pve.VMIDRangeDiskStart || id > pve.VMIDRangeDiskEnd {
+		t.Errorf("disk VMID %d outside [%d,%d]", id, pve.VMIDRangeDiskStart, pve.VMIDRangeDiskEnd)
+	}
+}
+
+// TestNextVMID_WithStorageScan_UnionsVMVolumes verifies WithStorageScan makes
+// NextVMID (the general VM range) see "vm-<vmid>-disk-N" volumes on shared
+// storage, exactly as NextDiskVMID already does for the disk range.
+func TestNextVMID_WithStorageScan_UnionsVMVolumes(t *testing.T) {
+	t.Parallel()
+	c := newVMIDClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+		// This cluster's own VM list has nothing at 200 — only the OTHER
+		// cluster's VM on shared storage occupies it.
+		return buildResources(), nil
+	})
+	c.nodesSvc = &stubNodesService{
+		listStorageContentFn: func(_ context.Context, node, storage string, _ *sdknodes.ListStorageContentParams) (*sdknodes.ListStorageContentResponse, error) {
+			if node != "pve-a" || storage != "nfs-images" {
+				t.Errorf("unexpected node/storage: %q/%q", node, storage)
+			}
+			return buildStorageContent("nfs-images:vm-200-disk-0.qcow2"), nil
+		},
+	}
+
+	id, err := pve.NextVMID(context.Background(), c, pve.WithRange(200, 210), pve.WithStorageScan("pve-a", "nfs-images"))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if id == 200 {
+		t.Fatal("returned 200 despite vm-200-disk-0.qcow2 owned by another cluster on shared storage")
+	}
+	if id < 200 || id > 210 {
+		t.Errorf("VMID %d outside range [200,210]", id)
+	}
+}
+
+// TestNextVMID_WithStorageScan_UnionsBaseTemplateVolumes verifies the
+// storage scan also protects against colliding with a frozen stemcell
+// template ("base-<vmid>-disk-N") that a peer cluster owns on shared storage.
+func TestNextVMID_WithStorageScan_UnionsBaseTemplateVolumes(t *testing.T) {
+	t.Parallel()
+	c := newVMIDClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+		return buildResources(), nil
+	})
+	c.nodesSvc = &stubNodesService{
+		listStorageContentFn: func(_ context.Context, _, _ string, _ *sdknodes.ListStorageContentParams) (*sdknodes.ListStorageContentResponse, error) {
+			return buildStorageContent("nfs-images:base-205-disk-0.qcow2"), nil
+		},
+	}
+
+	id, err := pve.NextVMID(context.Background(), c, pve.WithRange(200, 210), pve.WithStorageScan("pve-a", "nfs-images"))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if id == 205 {
+		t.Fatal("returned 205 despite base-205-disk-0.qcow2 template owned by another cluster on shared storage")
+	}
+	if id < 200 || id > 210 {
+		t.Errorf("VMID %d outside range [200,210]", id)
+	}
+}
+
+// TestNextVMID_WithStorageScan_EmptyArgsSkipsScan asserts that WithStorageScan
+// is a complete no-op — ListStorageContent is never called — when either
+// argument is empty. This is the behavior guard: every caller that does not
+// opt in (including every pre-existing NextVMID call site) must see
+// byte-identical behavior to before this option existed.
+func TestNextVMID_WithStorageScan_EmptyArgsSkipsScan(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name    string
+		node    string
+		storage string
+	}{
+		{name: "both empty", node: "", storage: ""},
+		{name: "node only", node: "pve-a", storage: ""},
+		{name: "storage only", node: "", storage: "nfs-images"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			c := newVMIDClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+				return buildResources(), nil
+			})
+			called := false
+			c.nodesSvc = &stubNodesService{
+				listStorageContentFn: func(_ context.Context, _, _ string, _ *sdknodes.ListStorageContentParams) (*sdknodes.ListStorageContentResponse, error) {
+					called = true
+					return buildStorageContent(), nil
+				},
+			}
+
+			_, err := pve.NextVMID(context.Background(), c, pve.WithStorageScan(tc.node, tc.storage))
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if called {
+				t.Error("ListStorageContent invoked despite an empty WithStorageScan argument")
+			}
+		})
+	}
+}
+
+// TestNextVMID_WithStorageScan_NotSuppliedSkipsScan is the same behavior
+// guard for callers that don't apply the option at all (the overwhelming
+// majority of NextVMID call sites, pre- and post-change).
+func TestNextVMID_WithStorageScan_NotSuppliedSkipsScan(t *testing.T) {
+	t.Parallel()
+	c := newVMIDClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+		return buildResources(), nil
+	})
+	called := false
+	c.nodesSvc = &stubNodesService{
+		listStorageContentFn: func(_ context.Context, _, _ string, _ *sdknodes.ListStorageContentParams) (*sdknodes.ListStorageContentResponse, error) {
+			called = true
+			return buildStorageContent(), nil
+		},
+	}
+
+	_, err := pve.NextVMID(context.Background(), c)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if called {
+		t.Error("ListStorageContent invoked despite WithStorageScan not being supplied")
+	}
+}
+
+// TestNextVMID_WithStorageScan_APIFailurePropagates verifies a storage-scan
+// API failure fails the allocation rather than silently proceeding blind to
+// shared-storage content (matches NextDiskVMID's existing contract).
+func TestNextVMID_WithStorageScan_APIFailurePropagates(t *testing.T) {
+	t.Parallel()
+	c := newVMIDClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+		return buildResources(), nil
+	})
+	c.nodesSvc = &stubNodesService{
+		listStorageContentFn: func(_ context.Context, _, _ string, _ *sdknodes.ListStorageContentParams) (*sdknodes.ListStorageContentResponse, error) {
+			return nil, errors.New("storage content: connection refused")
+		},
+	}
+
+	_, err := pve.NextVMID(context.Background(), c, pve.WithStorageScan("pve-a", "nfs-images"))
+	if err == nil {
+		t.Fatal("expected error when storage-content scan fails, got nil")
+	}
+}
+
+// TestNextVMID_WithStorageScan_IgnoresNonMatchingVolumes exercises the
+// widened volumeVMIDRegexp: ISO/backup/snippet volumes and anchoring edge
+// cases must never contribute a VMID to the used-set, for both the vm- and
+// base- forms.
+func TestNextVMID_WithStorageScan_IgnoresNonMatchingVolumes(t *testing.T) {
+	t.Parallel()
+	c := newVMIDClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+		return buildResources(), nil
+	})
+	c.nodesSvc = &stubNodesService{
+		listStorageContentFn: func(_ context.Context, _, _ string, _ *sdknodes.ListStorageContentParams) (*sdknodes.ListStorageContentResponse, error) {
+			return buildStorageContent(
+				"local:iso/vm-200-config.iso",        // ISO — no "-disk-N" segment
+				"backups:backup/vzdump-qemu-201.tar", // backup — different naming entirely
+				"snippets:snippets/base-202-hook.pl", // snippet — no "-disk-N" segment
+				"data:notvm-203-disk-0.qcow2",        // anchoring: "vm-" not preceded by "^"/"/"/":"
+				"data:notbase-204-disk-0.qcow2",      // anchoring: "base-" not preceded by "^"/"/"/":"
+				"data:vm-205-disk-0-old.qcow2.bak",   // trailing garbage after the disk-N segment
+				"data:vm-206-disk-0",                 // real match, no extension
+				"data:base-207-disk-0.qcow2",         // real match, base- form
+			), nil
+		},
+	}
+
+	id, err := pve.NextVMID(context.Background(), c, pve.WithRange(200, 210), pve.WithStorageScan("pve-a", "data"))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if id == 206 || id == 207 {
+		t.Errorf("returned VMID %d, but 206 (vm-) and 207 (base-) are genuine matches and must be used", id)
+	}
+	// 200-205 must all remain allocatable: none of those volumes are genuine
+	// vm-N-disk-N / base-N-disk-N matches.
+	if id < 200 || id > 210 {
+		t.Errorf("VMID %d outside range [200,210]", id)
+	}
+}
+
 func TestAllocateWithRetry_Success(t *testing.T) {
 	t.Parallel()
 	c := newVMIDClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {

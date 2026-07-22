@@ -3087,6 +3087,15 @@ func buildAndStartVMAttempt(
 // allocateVM runs AllocateWithRetry: picks a free VMID, calls QEMU.Create,
 // awaits the import task. On conflict or transient errors it retries up to
 // shape.maxAttempts times. Returns the winning vmid.
+//
+// pve.WithStorageScan(shape.node, shape.vmStorage) is always passed: shape.node
+// and shape.vmStorage are resolved (in buildVMShapeForNode / resolveTargetNode)
+// from the EFFECTIVE per-request CPI config — i.e. already reflect any
+// per-request pve_node/pve_vm_storage context override — so the storage scan
+// targets the cluster this specific request is landing the VM on, which
+// matters when that cluster shares its VM/images storage with another BOSH
+// AZ's cluster (see pve.WithStorageScan's doc comment for the co-mingling
+// risk this closes).
 func allocateVM(
 	ctx context.Context,
 	deps Deps,
@@ -3112,6 +3121,7 @@ func allocateVM(
 		isRetryable,
 		shape.maxAttempts,
 		pve.WithRange(shape.rangeStart, deps.Config.VMIDRangeEnd),
+		pve.WithStorageScan(shape.node, shape.vmStorage),
 		pve.WithBackoffFunc(newCreateVMRetryBackoff(
 			deps.Config.RetryStorageImport(), deps.Config.RetryVMIDAlloc())),
 	)
@@ -3151,6 +3161,7 @@ func allocateVMForFallback(
 		isRetryable,
 		shape.maxAttempts,
 		pve.WithRange(shape.rangeStart, deps.Config.VMIDRangeEnd),
+		pve.WithStorageScan(shape.node, shape.vmStorage),
 		pve.WithBackoffFunc(newCreateVMRetryBackoff(
 			deps.Config.RetryStorageImport(), deps.Config.RetryVMIDAlloc())),
 	)

@@ -476,6 +476,92 @@ func TestHandleCreateStemcell_LightFetch_DedupBySHA(t *testing.T) {
 	}
 }
 
+// TestHandleCreateStemcell_LightFetch_SkipsVMIDOwnedByStorageContent verifies
+// ensureTemplateVM's pve.WithStorageScan wiring: a template VMID with no
+// entry in ListQemu (simulating a template owned by a DIFFERENT PVE cluster
+// sharing the same VM/images storage) must still be skipped because a volume
+// named "base-<vmid>-disk-0" for it (PVE's frozen-template naming) is visible
+// on the resolved templateNode + deps.Config.VMStorage. Without the
+// storage-scan wiring at ensureTemplateVM's AllocateWithRetry call this test
+// would flake toward allocating the peer-owned VMID.
+func TestHandleCreateStemcell_LightFetch_SkipsVMIDOwnedByStorageContent(t *testing.T) {
+	t.Parallel()
+
+	body := []byte("FAKE STEMCELL QCOW2 BYTES FOR STORAGE SCAN")
+
+	// Within wbBuildFetchDeps' StemcellTemplateVMIDRangeStart/End [30000,30999],
+	// exclusively occupied on shared storage — invisible to ListQemu (this
+	// cluster's own view) but present as a base- template volume.
+	peerOwnedVMID := 30500
+
+	nodeListFn := func(_ context.Context, _, storage string, _ *sdknodes.ListStorageContentParams) (*sdknodes.ListStorageContentResponse, error) {
+		if storage != "nfs" {
+			t.Errorf("unexpected storage-scan storage: %q", storage)
+		}
+		// No ":import/<prefix>" match here — fetchFindByPrefix's dedup check
+		// ignores this entry and proceeds to upload+create, same as
+		// wbEmptyNodeListFn. The peer-owned base- volume is what the new
+		// storage scan (not the dedup check) must react to.
+		raw, _ := json.Marshal(map[string]string{
+			"volid": fmt.Sprintf("nfs:base-%d-disk-0.qcow2", peerOwnedVMID),
+		})
+		resp := sdknodes.ListStorageContentResponse{raw}
+		return &resp, nil
+	}
+
+	var uploadedFilename string
+	deps := wbBuildFetchDeps(t, nodeListFn)
+	deps.FetchResolver = func(rawURL string) (stemcellfetch.Source, stemcellfetch.Reference, error) {
+		return &mockSource{body: body, contentLength: int64(len(body))},
+			stemcellfetch.Reference{Scheme: "https", URL: rawURL},
+			nil
+	}
+	deps.PVE.(*wbTemplateMockClient).storageSvc = &wbTemplateStorage{
+		wbMockStorage: wbMockStorage{
+			uploadFn: func(_ context.Context, _, _, _, filename string, body io.Reader) (string, error) {
+				_, _ = io.Copy(io.Discard, body)
+				uploadedFilename = filename
+				return "", nil
+			},
+		},
+	}
+
+	h := HandleCreateStemcell(deps)
+	cp := map[string]any{
+		"name":      "ubuntu-jammy",
+		"version":   "1.500",
+		"image_url": "https://example.com/ubuntu-jammy.qcow2",
+	}
+	args := []json.RawMessage{
+		mustMarshal(t, "/dev/null"),
+		mustMarshal(t, cp),
+	}
+
+	result, err := h.Handle(context.Background(), args, jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	cid, ok := result.(string)
+	if !ok {
+		t.Fatalf("result is %T; want string", result)
+	}
+	if !pve.IsTemplateStemcellCID(cid) {
+		t.Fatalf("CID = %q; want template:<vmid> format", cid)
+	}
+	vmid, parseErr := pve.ParseTemplateStemcellCID(cid)
+	if parseErr != nil {
+		t.Fatalf("ParseTemplateStemcellCID(%q): %v", cid, parseErr)
+	}
+	if uploadedFilename == "" {
+		t.Fatal("expected upload to occur (no SHA/import dedup hit configured)")
+	}
+	if int(vmid) == peerOwnedVMID {
+		t.Errorf("allocated template VMID %d collides with peer-cluster volume base-%d-disk-0 on shared storage — "+
+			"storage-scan wiring at ensureTemplateVM's AllocateWithRetry call did not take effect",
+			vmid, peerOwnedVMID)
+	}
+}
+
 // mustMarshal marshals v to JSON and fatals on error. White-box test helper.
 func mustMarshal(t *testing.T, v any) json.RawMessage {
 	t.Helper()

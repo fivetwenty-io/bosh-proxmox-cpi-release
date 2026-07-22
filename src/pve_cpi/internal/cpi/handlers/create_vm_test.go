@@ -172,6 +172,12 @@ type vmMockNodes struct {
 	// scoring via GatherNodeFacts). When nil, returns an empty active storage
 	// response so placement scoring degrades gracefully (storage axis = 0).
 	listStorageFn func(ctx context.Context, node string, params *sdknodes.ListStorageParams) (*sdknodes.ListStorageResponse, error)
+	// listStorageContentFn, when non-nil, is called by ListStorageContent
+	// (invoked by allocateVM's pve.WithStorageScan wiring — see NextVMID).
+	// When nil, returns an empty content response so the storage scan degrades
+	// gracefully (no extra VMIDs unioned in) — tests not exercising the
+	// shared-storage VMID collision path need no configuration.
+	listStorageContentFn func(ctx context.Context, node, storage string, params *sdknodes.ListStorageContentParams) (*sdknodes.ListStorageContentResponse, error)
 }
 
 type vmCreateQemuCloneCall struct {
@@ -235,6 +241,18 @@ func (m *vmMockNodes) ListStorage(ctx context.Context, node string, params *sdkn
 		return m.listStorageFn(ctx, node, params)
 	}
 	empty := sdknodes.ListStorageResponse{}
+	return &empty, nil
+}
+
+// ListStorageContent returns an empty response when listStorageContentFn is
+// nil, so pve.WithStorageScan's storage-content scan sees no volumes and
+// contributes nothing to allocateVM's used-VMID set. Tests exercising the
+// shared-storage collision path set listStorageContentFn explicitly.
+func (m *vmMockNodes) ListStorageContent(ctx context.Context, node, storage string, params *sdknodes.ListStorageContentParams) (*sdknodes.ListStorageContentResponse, error) {
+	if m.listStorageContentFn != nil {
+		return m.listStorageContentFn(ctx, node, storage, params)
+	}
+	empty := sdknodes.ListStorageContentResponse{}
 	return &empty, nil
 }
 
@@ -578,6 +596,71 @@ func TestHandleCreateVM_HappyPath(t *testing.T) {
 	var mac string
 	if err := json.Unmarshal(defNet["mac"], &mac); err != nil || mac != "aa:bb:cc:dd:ee:ff" {
 		t.Errorf("network MAC: want aa:bb:cc:dd:ee:ff, got %q (err=%v)", mac, err)
+	}
+}
+
+// TestHandleCreateVM_SkipsVMIDOwnedByStorageContent verifies allocateVM's
+// pve.WithStorageScan wiring: a VMID with no entry in this cluster's own
+// ListResources (simulating a VM owned by a DIFFERENT PVE cluster sharing the
+// same VM/images storage) must still be skipped because a volume named
+// "vm-<vmid>-disk-0" for it is visible on the resolved node+storage.
+// Without the storage-scan wiring at create_vm.go's allocateVM call site this
+// test would flake toward returning the "peer-owned" VMID (its only
+// obstruction being the storage scan, not the cluster list).
+func TestHandleCreateVM_SkipsVMIDOwnedByStorageContent(t *testing.T) {
+	t.Parallel()
+	q := &vmMockQEMU{}
+	c := &vmMockCluster{} // ListResources default: empty — cluster-only view sees VMID 100 as free.
+	a := &vmMockAgent{}
+
+	// buildVMDeps resolves node="pve" and storage=storageName ("local-lvm"),
+	// so the storage scan targets exactly the volid below.
+	peerOwnedVMID := 100
+	n := &vmMockNodes{
+		listStorageContentFn: func(_ context.Context, node, storage string, _ *sdknodes.ListStorageContentParams) (*sdknodes.ListStorageContentResponse, error) {
+			if node != "pve" || storage != storageName {
+				t.Errorf("unexpected storage-scan node/storage: %q/%q", node, storage)
+			}
+			volid := fmt.Sprintf("%s:vm-%d-disk-0", storageName, peerOwnedVMID)
+			raw, _ := json.Marshal(map[string]string{"volid": volid})
+			resp := sdknodes.ListStorageContentResponse{raw}
+			return &resp, nil
+		},
+	}
+
+	h := handlers.HandleCreateVM(buildVMDeps(q, n, c, a))
+
+	args := mkArgs("agent-storage-scan-1", testStemcellCID,
+		map[string]any{"cores": 2, "memory": 1024},
+		map[string]any{"default": map[string]any{
+			"type": "manual", "ip": "10.0.0.5",
+			"netmask": "255.255.255.0", "gateway": "10.0.0.1",
+			"dns": []string{"8.8.8.8"}, "default": []string{"dns", "gateway"},
+			"cloud_properties": map[string]any{"bridge": "vmbr0"},
+		}},
+		[]string{}, map[string]any{})
+
+	result, err := h.Handle(context.Background(), args, mkCtx("storage-scan-1"))
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	tuple, ok := result.([]any)
+	if !ok || len(tuple) != 2 {
+		t.Fatalf("expected []any{vmCID, networks} len 2, got %T", result)
+	}
+	vmCID, ok := tuple[0].(string)
+	if !ok || vmCID == "" {
+		t.Fatalf("vm_cid must be non-empty string, got %v", tuple[0])
+	}
+	vmidInt, parseErr := strconv.Atoi(vmCID)
+	if parseErr != nil || vmidInt < 100 {
+		t.Fatalf("vm_cid %q must be numeric VMID >= 100", vmCID)
+	}
+	if vmidInt == peerOwnedVMID {
+		t.Errorf("allocated VMID %d collides with peer-cluster volume vm-%d-disk-0 on shared storage — "+
+			"storage-scan wiring at allocateVM's AllocateWithRetry call did not take effect",
+			vmidInt, peerOwnedVMID)
 	}
 }
 

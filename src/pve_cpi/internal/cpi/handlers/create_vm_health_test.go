@@ -26,14 +26,18 @@ import (
 type healthNodes struct {
 	panicNodesStub
 
-	pingFn            func(ctx context.Context, node, vmid string) (*sdknodes.CreateQemuAgentPingResponse, error)
-	statusFn          func(ctx context.Context, node, vmid string) (*sdknodes.ListQemuStatusCurrentResponse, error)
-	deleteQemuFn      func(ctx context.Context, node, vmid string, p *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error)
-	updateConfigFn    func(ctx context.Context, node, vmid string, p *sdknodes.UpdateQemuConfigParams) error
-	listQemuFn        func(ctx context.Context, node string, p *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error)
-	listStorageFn     func(ctx context.Context, node string, p *sdknodes.ListStorageParams) (*sdknodes.ListStorageResponse, error)
-	agentExecFn       func(ctx context.Context, node, vmid string, p *sdknodes.CreateQemuAgentExecParams) (*sdknodes.CreateQemuAgentExecResponse, error)
-	agentExecStatusFn func(ctx context.Context, node, vmid string, p *sdknodes.ListQemuAgentExecStatusParams) (*sdknodes.ListQemuAgentExecStatusResponse, error)
+	pingFn         func(ctx context.Context, node, vmid string) (*sdknodes.CreateQemuAgentPingResponse, error)
+	statusFn       func(ctx context.Context, node, vmid string) (*sdknodes.ListQemuStatusCurrentResponse, error)
+	deleteQemuFn   func(ctx context.Context, node, vmid string, p *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error)
+	updateConfigFn func(ctx context.Context, node, vmid string, p *sdknodes.UpdateQemuConfigParams) error
+	listQemuFn     func(ctx context.Context, node string, p *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error)
+	listStorageFn  func(ctx context.Context, node string, p *sdknodes.ListStorageParams) (*sdknodes.ListStorageResponse, error)
+	// listStorageContentFn, when non-nil, is called by ListStorageContent
+	// (invoked by allocateVM's pve.WithStorageScan wiring). Nil → empty
+	// response, so health-gate tests need no configuration for it.
+	listStorageContentFn func(ctx context.Context, node, storage string, p *sdknodes.ListStorageContentParams) (*sdknodes.ListStorageContentResponse, error)
+	agentExecFn          func(ctx context.Context, node, vmid string, p *sdknodes.CreateQemuAgentExecParams) (*sdknodes.CreateQemuAgentExecResponse, error)
+	agentExecStatusFn    func(ctx context.Context, node, vmid string, p *sdknodes.ListQemuAgentExecStatusParams) (*sdknodes.ListQemuAgentExecStatusResponse, error)
 
 	pingCalls int
 	execCalls int
@@ -97,6 +101,14 @@ func (h *healthNodes) ListStorage(ctx context.Context, node string, p *sdknodes.
 		return h.listStorageFn(ctx, node, p)
 	}
 	empty := sdknodes.ListStorageResponse{}
+	return &empty, nil
+}
+
+func (h *healthNodes) ListStorageContent(ctx context.Context, node, storage string, p *sdknodes.ListStorageContentParams) (*sdknodes.ListStorageContentResponse, error) {
+	if h.listStorageContentFn != nil {
+		return h.listStorageContentFn(ctx, node, storage, p)
+	}
+	empty := sdknodes.ListStorageContentResponse{}
 	return &empty, nil
 }
 

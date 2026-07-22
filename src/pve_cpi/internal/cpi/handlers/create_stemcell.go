@@ -733,6 +733,16 @@ func ensureTemplateVM(
 	rangeStart := deps.Config.StemcellTemplateVMIDRangeStart
 	rangeEnd := deps.Config.StemcellTemplateVMIDRangeEnd
 
+	// pve.WithStorageScan(templateNode, deps.Config.VMStorage): the template's
+	// disk lands on deps.Config.VMStorage (targetStorage below, passed to
+	// attemptCreateTemplateVM as "vm/images" storage — importVolid/storage is
+	// only the import SOURCE and is intentionally not scanned here), and
+	// deps.Config already reflects the effective per-request config (any
+	// pve_node/pve_vm_storage context override applied by
+	// Deps.WithRequestOverrides before this handler ran). Scanning it closes the
+	// same shared-storage co-mingling gap as create_vm's allocateVM: without it,
+	// a template VMID could collide with a VM or template another AZ's cluster
+	// already owns on the same shared storage.
 	allocatedRaw, allocErr := pve.AllocateWithRetry(ctx, deps.PVE,
 		func(candidate int) error {
 			return attemptCreateTemplateVM(ctx, deps, logger, templateNode, candidate, templateName, importVolid, shaTag, deps.Config.VMStorage, cp, source, nil)
@@ -740,6 +750,7 @@ func ensureTemplateVM(
 		isRetryable,
 		0, // use AllocateWithRetry default (3 attempts)
 		pve.WithRange(rangeStart, rangeEnd),
+		pve.WithStorageScan(templateNode, deps.Config.VMStorage),
 	)
 	if allocErr != nil {
 		return 0, fmt.Errorf("ensureTemplateVM: allocate+create template VM: %w", allocErr)

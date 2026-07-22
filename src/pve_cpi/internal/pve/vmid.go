@@ -49,6 +49,12 @@ type allocOpts struct {
 	// the caller can apply a longer backoff for, e.g., storage lock
 	// timeouts vs. VMID conflicts.
 	backoffFn func(err error, attempt int) time.Duration
+	// storageScanNode and storageScanStorage, when both non-empty, make
+	// NextVMID union a storage-content scan (listStorageVMIDs) into its
+	// used-set, exactly as NextDiskVMID already does for the disk range.
+	// Set via WithStorageScan. Left empty ("", "") the option is a no-op.
+	storageScanNode    string
+	storageScanStorage string
 }
 
 // AllocOption is a functional option for NextVMID and the retry helpers.
@@ -82,6 +88,34 @@ func WithNoBackoff() AllocOption {
 func WithBackoffFunc(fn func(err error, attempt int) time.Duration) AllocOption {
 	return func(o *allocOpts) {
 		o.backoffFn = fn
+	}
+}
+
+// WithStorageScan makes NextVMID also union VMIDs extracted from volume
+// names ("vm-<vmid>-disk-N" and "base-<vmid>-disk-N", the latter covering
+// frozen stemcell templates) found on node/storage into its used-set —
+// the same storage-content scan NextDiskVMID already performs for the disk
+// range (see listStorageVMIDs).
+//
+// This closes a gap that matters once two or more BOSH-Proxmox AZs
+// (separate PVE clusters, each with its own cluster-resources view) share
+// one storage backend (same storage ID, same NFS/dir export): the
+// cluster-resources list NextVMID otherwise relies on only ever reflects
+// VMs known to THIS cluster, so a VMID already holding files under
+// images/<vmid>/ on the shared storage — because the OTHER cluster owns
+// that VM or template — is invisible without this scan. Allocating it
+// again would co-mingle the new VM's disk files with the existing owner's
+// and risks cross-cluster disk deletion on cleanup.
+//
+// Both node and storage must be non-empty for the scan to activate. Either
+// left empty (the zero value) makes this option a complete no-op — NextVMID
+// behavior is then byte-identical to a call with no WithStorageScan at all,
+// which keeps every existing caller (and every test that doesn't opt in)
+// unaffected.
+func WithStorageScan(node, storage string) AllocOption {
+	return func(o *allocOpts) {
+		o.storageScanNode = node
+		o.storageScanStorage = storage
 	}
 }
 
@@ -224,10 +258,20 @@ func nextVMIDInRange(used map[int]struct{}, start, end int) (int, error) {
 // scan+select, which is microsecond-range work. Cross-process races are handled
 // at the caller layer via retry-on-conflict.
 //
+// When WithStorageScan(node, storage) is supplied (both non-empty), the
+// storage's volume content is ALSO scanned and unioned into the used-set —
+// see WithStorageScan for why this matters on storage shared across PVE
+// clusters. Fetched outside the mutex for the same reason as the cluster
+// list. Omitted (or either argument empty), behavior is unchanged from
+// before this option existed.
+//
 // Inputs and failure modes:
 //   - ctx nil → returns *cpierrors.Error before any SDK call.
 //   - c nil → returns *cpierrors.Error before any SDK call.
-//   - SDK failure → returns *cpierrors.Error wrapping the SDK error.
+//   - SDK failure (cluster list) → returns *cpierrors.Error wrapping the SDK error.
+//   - Storage-scan failure (when WithStorageScan is set) → returns
+//     *cpierrors.Error wrapping the SDK error; the allocation fails rather
+//     than proceeding blind to shared-storage content.
 //   - Range exhausted → returns *cpierrors.Error "no free VMID in range".
 func NextVMID(ctx context.Context, c Client, opts ...AllocOption) (int, error) {
 	if ctx == nil {
@@ -252,6 +296,16 @@ func NextVMID(ctx context.Context, c Client, opts ...AllocOption) (int, error) {
 		return 0, err
 	}
 
+	if ao.storageScanNode != "" && ao.storageScanStorage != "" {
+		storageUsed, sErr := listStorageVMIDs(ctx, c, ao.storageScanNode, ao.storageScanStorage)
+		if sErr != nil {
+			return 0, sErr
+		}
+		for id := range storageUsed {
+			used[id] = struct{}{}
+		}
+	}
+
 	// Lock only for the pure in-memory scan so two goroutines with identical
 	// "used" snapshots cannot return the same VMID. The randomised start in
 	// nextVMIDInRange further scatters concurrent allocations.
@@ -267,7 +321,8 @@ func NextVMID(ctx context.Context, c Client, opts ...AllocOption) (int, error) {
 // QEMU VMs (for snapshotting support).
 //
 // node and storage may be empty: when set, the function ALSO unions VMIDs
-// extracted from volume names ("vm-<vmid>-disk-N") on that storage into the
+// extracted from volume names ("vm-<vmid>-disk-N" or "base-<vmid>-disk-N",
+// the latter matching frozen stemcell templates) on that storage into the
 // "used" set. This is critical for synthetic VMIDs because the cluster VM
 // list does NOT include orphaned persistent disks — without the storage
 // scan, a stale "vm-9000-disk-0" left behind on storage would be invisible
@@ -315,15 +370,19 @@ func NextDiskVMID(ctx context.Context, c Client, node, storage string, opts ...A
 	return nextVMIDInRange(used, ao.rangeStart, ao.rangeEnd)
 }
 
-// volumeVMIDRegexp matches PVE volume names of the form "vm-NNN-disk-N",
-// extracting the VMID. Anchored on each side so we don't accidentally match
-// substrings.
-var volumeVMIDRegexp = regexp.MustCompile(`(?:^|[/:])vm-(\d+)-disk-\d+(?:\.\w+)?$`)
+// volumeVMIDRegexp matches PVE volume names of the form "vm-NNN-disk-N"
+// (a regular VM/disk volume) or "base-NNN-disk-N" (the frozen-template
+// naming PVE gives a VM's disks once it becomes a template — see
+// create_stemcell's MakeTemplate), extracting the VMID from either form.
+// Anchored on each side so we don't accidentally match substrings.
+var volumeVMIDRegexp = regexp.MustCompile(`(?:^|[/:])(?:vm|base)-(\d+)-disk-\d+(?:\.\w+)?$`)
 
 // listStorageVMIDs returns the set of VMIDs that have at least one volume
-// named "vm-{vmid}-disk-{N}" on the given storage. Non-VM-disk volumes
-// (ISOs, backups, snippets) are skipped because they don't follow the
-// vm-N-disk-N naming convention.
+// named "vm-{vmid}-disk-{N}" or "base-{vmid}-disk-{N}" on the given storage.
+// The base- form is how PVE renames a VM's disk files once MakeTemplate
+// freezes it, so this scan sees frozen stemcell templates as well as
+// ordinary VM/disk volumes. Non-VM-disk volumes (ISOs, backups, snippets)
+// are skipped because they don't follow either naming convention.
 //
 // On API error returns a wrapped *cpierrors.Error. An empty content list
 // is not an error — returns an empty map.
