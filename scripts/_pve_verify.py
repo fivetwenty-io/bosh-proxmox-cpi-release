@@ -263,8 +263,12 @@ class PVEVerifier:
         return False
 
     def bridge_exists(self, iface: str) -> bool:
+        # type=any_bridge is required to see realized SDN vnet bridges: PVE
+        # 9.2's plain node-network listing returns only /etc/network/interfaces
+        # entries, and vnets live in interfaces.d/sdn.
         node = self._require_node()
-        for e in self._as_list(self._get(f"/nodes/{urllib.parse.quote(node)}/network")):
+        path = f"/nodes/{urllib.parse.quote(node)}/network?type=any_bridge"
+        for e in self._as_list(self._get(path)):
             if e.get("iface") == iface:
                 return True
         return False

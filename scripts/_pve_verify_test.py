@@ -459,6 +459,26 @@ class TestBridgeExists(unittest.TestCase):
             v.bridge_exists("vmbr0")
         self.assertIn("node", str(ctx.exception).lower())
 
+    def test_queries_with_any_bridge_filter(self) -> None:
+        # PVE 9.2's plain node-network listing omits SDN vnet interfaces; they
+        # appear only under type=any_bridge. The query must carry that filter
+        # or a realized vnet bridge is never seen.
+        v = self._verifier()
+        seen_urls: list = []
+
+        def fake_urlopen(req, *args, **kwargs):
+            seen_urls.append(req.full_url)
+            if "type=any_bridge" in req.full_url:
+                return _make_response({"data": [
+                    {"iface": "vmbr0", "type": "bridge"},
+                    {"iface": "itvnet", "type": "vnet"},
+                ]})
+            return _make_response({"data": [{"iface": "vmbr0", "type": "bridge"}]})
+
+        with unittest.mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            self.assertTrue(v.bridge_exists("itvnet"))
+        self.assertTrue(any("type=any_bridge" in u for u in seen_urls))
+
 
 # ---------------------------------------------------------------------------
 # volume_exists

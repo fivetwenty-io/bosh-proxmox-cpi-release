@@ -205,7 +205,17 @@ func bridgeIsSDNVnet(ctx context.Context, c Client, bridge string) (bool, error)
 // an error) so the bounded poll keeps retrying through a transient blip in the
 // very convergence window it is waiting on, rather than aborting the deploy.
 func nodeHasBridge(ctx context.Context, nodesSvc sdknodes.Service, node, bridge string) bool {
-	resp, err := nodesSvc.ListNetwork(ctx, node, nil)
+	// PVE 9.2's plain GET /nodes/<node>/network lists only
+	// /etc/network/interfaces entries — realized SDN vnet bridges (which live
+	// in interfaces.d/sdn) appear ONLY under type=any_bridge. Without the
+	// filter a live bridge is never observed and the gate always exhausts its
+	// budget. Releases that reject the filter value fall back to the plain
+	// listing, which on those releases includes SDN vnets.
+	anyBridge := "any_bridge"
+	resp, err := nodesSvc.ListNetwork(ctx, node, &sdknodes.ListNetworkParams{Type: &anyBridge})
+	if err != nil || resp == nil {
+		resp, err = nodesSvc.ListNetwork(ctx, node, nil)
+	}
 	if err != nil || resp == nil {
 		return false
 	}

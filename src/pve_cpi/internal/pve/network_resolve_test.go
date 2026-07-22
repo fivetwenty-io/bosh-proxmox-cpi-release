@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -269,13 +270,74 @@ func TestResolveNodeBridgeOnNode_NodeNetworkError_KeepsPolling(t *testing.T) {
 	if err == nil || !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
 		t.Errorf("node-network error: want retriable-cloud after budget, got %v", err)
 	}
-	if fn.calls != 2 { // 1 initial + 1 retry, both errored
-		t.Errorf("want 2 node-network polls, got %d", fn.calls)
+	if fn.calls != 4 { // 2 polls (1 initial + 1 retry) × (any_bridge attempt + plain-listing fallback), all errored
+		t.Errorf("want 4 node-network calls, got %d", fn.calls)
 	}
 }
 
 func TestResolveNodeBridgeOnNode_NilClient_NoOp(t *testing.T) {
 	if err := ResolveNodeBridgeOnNode(context.Background(), nil, "pve1", "v1", 5, time.Minute); err != nil {
 		t.Errorf("nil client: want nil, got %v", err)
+	}
+}
+
+// nrParamsFakeNodes is nrFakeNodes with the ListNetworkParams surfaced, so a
+// test can model PVE 9.2 semantics where the plain node-network listing omits
+// SDN vnet interfaces and only type=any_bridge includes them.
+type nrParamsFakeNodes struct {
+	sdknodes.Service
+	calls   int
+	listNet func(call int, params *sdknodes.ListNetworkParams) (*sdknodes.ListNetworkResponse, error)
+}
+
+func (f *nrParamsFakeNodes) ListNetwork(
+	_ context.Context, _ string, params *sdknodes.ListNetworkParams,
+) (*sdknodes.ListNetworkResponse, error) {
+	f.calls++
+	return f.listNet(f.calls, params)
+}
+
+// TestResolveNodeBridgeOnNode_PVE9ListingNeedsAnyBridgeFilter: on PVE 9.2 the
+// plain GET /nodes/<node>/network response contains only /etc/network/interfaces
+// entries — realized SDN vnet bridges appear ONLY when type=any_bridge is
+// passed. The realization poll must use that filter, or a live bridge is never
+// observed and every SDN create_vm exhausts the retry budget.
+func TestResolveNodeBridgeOnNode_PVE9ListingNeedsAnyBridgeFilter(t *testing.T) {
+	fc := &nrFakeCluster{listVnet: func(int, *sdkcluster.ListSdnVnetsParams) (*sdkcluster.ListSdnVnetsResponse, error) {
+		return vnetsResp("v1"), nil
+	}}
+	fn := &nrParamsFakeNodes{listNet: func(_ int, params *sdknodes.ListNetworkParams) (*sdknodes.ListNetworkResponse, error) {
+		if params != nil && params.Type != nil && *params.Type == "any_bridge" {
+			resp := sdknodes.ListNetworkResponse{
+				json.RawMessage(`{"iface":"vmbr0","type":"bridge"}`),
+				json.RawMessage(`{"iface":"v1","type":"vnet"}`),
+			}
+			return &resp, nil
+		}
+		return ifacesResp("vmbr0"), nil // plain listing: SDN vnet absent
+	}}
+	c := &nrFakeClient{cluster: fc, nodes: fn}
+	if err := resolveNodeBridgeOnNode(context.Background(), c, "pve1", "v1", 3, time.Minute, noStepClock()); err != nil {
+		t.Errorf("realized bridge visible only via any_bridge filter: want nil, got %v", err)
+	}
+}
+
+// TestResolveNodeBridgeOnNode_AnyBridgeFilterRejected_FallsBack: a PVE release
+// that rejects the type=any_bridge filter value must not wedge the gate — the
+// poll falls back to the plain listing, which on such releases includes SDN
+// vnet interfaces.
+func TestResolveNodeBridgeOnNode_AnyBridgeFilterRejected_FallsBack(t *testing.T) {
+	fc := &nrFakeCluster{listVnet: func(int, *sdkcluster.ListSdnVnetsParams) (*sdkcluster.ListSdnVnetsResponse, error) {
+		return vnetsResp("v1"), nil
+	}}
+	fn := &nrParamsFakeNodes{listNet: func(_ int, params *sdknodes.ListNetworkParams) (*sdknodes.ListNetworkResponse, error) {
+		if params != nil && params.Type != nil {
+			return nil, fmt.Errorf("400 Parameter verification failed (type)")
+		}
+		return ifacesResp("vmbr0", "v1"), nil
+	}}
+	c := &nrFakeClient{cluster: fc, nodes: fn}
+	if err := resolveNodeBridgeOnNode(context.Background(), c, "pve1", "v1", 3, time.Minute, noStepClock()); err != nil {
+		t.Errorf("filter rejected: want fallback success, got %v", err)
 	}
 }
