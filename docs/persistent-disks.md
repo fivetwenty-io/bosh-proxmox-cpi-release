@@ -163,8 +163,9 @@ MySQL-backed Directors store `disk_cid` in a `VARCHAR(255)` column, and the
 envelope can cross that bound when long storage names combine with many
 per-disk performance options.
 
-`get_disks` intentionally keeps returning bare volids, matching what PVE
-reports and what earlier releases returned.
+`get_disks` intentionally returns bare volids, matching what PVE's config scan
+reports. It has never returned the annotated form — metadata exists only in
+CIDs minted by `create_disk` — and that asymmetry is unchanged by the envelope.
 
 ## Worked examples
 

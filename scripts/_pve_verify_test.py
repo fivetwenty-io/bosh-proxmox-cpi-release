@@ -539,6 +539,15 @@ class TestVolumeExists(unittest.TestCase):
         with self._urlopen_with([{"volid": "data:vm-200-disk-0"}]):
             self.assertFalse(v.volume_exists(cid))
 
+    def test_pvd_standard_alphabet_payload_raises(self) -> None:
+        """Go's RawURLEncoding rejects '+', '/', and '='; the Python decoder
+        must fail identically instead of silently tolerating them."""
+        v = self._verifier()
+        with self.assertRaises(PVEVerifyError):
+            v.volume_exists("pvd-ab+cd")
+        with self.assertRaises(PVEVerifyError):
+            v.volume_exists("pvd-abcd=")
+
     def test_pvd_malformed_payload_raises(self) -> None:
         """A pvd- CID with an undecodable payload and no ':' anywhere was meant
         to be an envelope; its corruption must raise, mirroring the Go codec."""

@@ -2127,10 +2127,11 @@ func deriveDiskFaultConstraints(ctx context.Context, deps Deps, diskCIDs []strin
 		}
 		_, meta, err := pve.ParseEncodedDiskCID(cid)
 		if err != nil || meta == nil {
-			// Bare legacy CID or parse failure: impose no constraint.
-			// Parse errors on bare CIDs are not possible (ParseEncodedDiskCID
-			// returns err only when "|" present but suffix malformed); the
-			// caller already validated CIDs at parse time.
+			// Meta-less CID (envelope without metadata, bare legacy) or parse
+			// failure (malformed envelope or legacy suffix): impose no
+			// constraint. Failing open is safe — the Director replays CIDs the
+			// CPI emitted, so a malformed CID here is effectively impossible,
+			// and the caller already validated CIDs at parse time.
 			continue
 		}
 

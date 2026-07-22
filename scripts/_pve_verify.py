@@ -35,6 +35,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import re
 import ssl
 import sys
 import urllib.error
@@ -62,6 +63,11 @@ def _bare_disk_cid(disk_cid: str) -> str:
     if disk_cid.startswith("pvd-"):
         payload = disk_cid[len("pvd-"):]
         try:
+            # Pre-validate the charset: Go's RawURLEncoding strictly rejects
+            # '+', '/', and '=' while Python's urlsafe_b64decode silently
+            # tolerates them — enforce parity so both sides fail the same way.
+            if not re.fullmatch(r"[A-Za-z0-9_-]+", payload):
+                raise ValueError("payload is not unpadded base64url")
             raw = base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4))
             volid = json.loads(raw)["v"]
             if not isinstance(volid, str) or not volid:
