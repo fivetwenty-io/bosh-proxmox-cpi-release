@@ -33,6 +33,7 @@ Exit 0 when the resource exists, 1 when absent, 2 on usage/transport error.
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import ssl
 import sys
@@ -45,6 +46,34 @@ from typing import Any
 
 class PVEVerifyError(RuntimeError):
     """Raised on transport, auth, or assertion failure (not on a clean absent)."""
+
+
+def _bare_disk_cid(disk_cid: str) -> str:
+    """Decode a disk CID to its bare '<storage>:<volid>' form.
+
+    Mirrors the Go codec's decode order (internal/pve/disk.go):
+
+    1. 'pvd-<base64url(json)>' envelope — the bare volid is the payload's "v".
+    2. On envelope decode failure, fall back to the legacy paths only when the
+       CID contains ':' (a PVE storage literally named 'pvd-*'); otherwise the
+       CID was meant to be an envelope and its corruption raises.
+    3. Legacy: strip an optional '|<base64url-metadata>' suffix.
+    """
+    if disk_cid.startswith("pvd-"):
+        payload = disk_cid[len("pvd-"):]
+        try:
+            raw = base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4))
+            volid = json.loads(raw)["v"]
+            if not isinstance(volid, str) or not volid:
+                raise ValueError("envelope volid is empty")
+            return volid
+        except (ValueError, KeyError, TypeError) as exc:
+            if ":" not in disk_cid:
+                raise PVEVerifyError(
+                    f"disk_cid {disk_cid!r}: invalid pvd envelope: {exc}"
+                ) from exc
+            # Legacy CID on a 'pvd-*'-named storage — fall through.
+    return disk_cid.split("|", 1)[0]
 
 
 class PVEVerifier:
@@ -211,13 +240,15 @@ class PVEVerifier:
     def volume_exists(self, disk_cid: str) -> bool:
         """True when a storage volume with volid == the bare disk_cid exists.
 
-        A CPI disk CID may carry a '|<base64url-metadata>' suffix appended by the
-        disk-CID codec (EncodeDiskCID); PVE's storage content listing reports only
-        the bare '<storage>:<volid>'. Strip the suffix at the first '|' before
-        matching so annotated CIDs verify against the un-annotated PVE volid.
+        The CPI emits pvd- envelope CIDs ('pvd-<base64url(json)>' with the bare
+        volid in the payload's "v" field); older releases emitted the bare
+        '<storage>:<volid>' with an optional '|<base64url-metadata>' suffix.
+        PVE's storage content listing reports only the bare volid, so decode the
+        CID to its bare form (mirroring the Go codec's decode order in
+        internal/pve/disk.go) before matching.
         """
         node = self._require_node()
-        bare_cid = disk_cid.split("|", 1)[0]
+        bare_cid = _bare_disk_cid(disk_cid)
         if ":" not in bare_cid:
             raise PVEVerifyError(f"disk_cid {disk_cid!r} is not '<storage>:<volid>'")
         storage = bare_cid.split(":", 1)[0]
