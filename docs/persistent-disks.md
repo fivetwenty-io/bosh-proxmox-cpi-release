@@ -163,6 +163,46 @@ MySQL-backed Directors store `disk_cid` in a `VARCHAR(255)` column, and the
 envelope can cross that bound when long storage names combine with many
 per-disk performance options.
 
+### Compressed CIDs (`pvz-`, opt-in)
+
+Setting `pve.disk_cid_compression: true` opts `create_disk` into a compressed
+variant for exactly the over-limit case above. When the standard `pvd-` form
+would exceed 255 characters, the CID is emitted as:
+
+```
+pvz-<base64url(gzip(JSON payload))>
+```
+
+The JSON payload, the charset guarantee, and the decode rules are identical to
+`pvd-`; only the container changes. CIDs that fit 255 characters are emitted as
+`pvd-` unchanged, byte-identical to the flag-off encoding, so enabling the flag
+never alters the common case. If gzip cannot shorten an unusually high-entropy
+payload, the plain form is kept (both overflow; the length warning fires either
+way).
+
+The flag exists for MySQL-backed Directors, whose `disk_cid` column is a hard
+`VARCHAR(255)` (strict mode rejects longer values; legacy non-strict mode
+silently truncates them). PostgreSQL-backed Directors store CIDs in unbounded
+`text` columns and gain nothing from compression — leave the flag off there.
+(The one PostgreSQL exception is the newer `dynamic_disks` Director table,
+which is `varchar(255)` on every backend.)
+
+The CPI decodes `pvz-` unconditionally and forever, regardless of the flag —
+like every format it has ever emitted — so the flag can be enabled or disabled
+at any time without migrating existing disks. A storage literally named
+`pvz-…` falls back to the legacy paths by the same `:`-based rule as `pvd-`,
+and a hostile CID cannot decompression-bomb the CPI: inflation is capped at
+64 KiB.
+
+To inspect a compressed CID by hand (restores the base64 padding, then
+un-gzips the payload):
+
+```sh
+cid="pvz-H4sIAAAAAAAC_..."           # the emitted CID
+payload="${cid#pvz-}"
+python3 -c "import sys,base64,gzip; p=sys.argv[1]; print(gzip.decompress(base64.urlsafe_b64decode(p + '=' * (-len(p) % 4))).decode())" "$payload"
+```
+
 `get_disks` intentionally returns bare volids, matching what PVE's config scan
 reports. It has never returned the annotated form — metadata exists only in
 CIDs minted by `create_disk` — and that asymmetry is unchanged by the envelope.

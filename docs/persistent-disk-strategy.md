@@ -25,7 +25,8 @@ as bytes on the backing storage with no record of who created it, what
 it is for, or whether it is safe to delete.
 
 The CPI works around this by embedding volume identity and placement metadata
-into the disk CID (the `pvd-` envelope described in
+into the disk CID (the `pvd-` envelope — or its opt-in compressed `pvz-`
+variant — described in
 [Persistent disks — Disk CID encoding](persistent-disks.md#disk-cid-encoding)).
 That encoding is opaque to PVE; the cluster still presents the volume as a raw
 storage object. When a disk is detached and waiting for its next owner, any
@@ -130,7 +131,7 @@ Fields:
 
 | Field | Description |
 | --- | --- |
-| `disk_cid` | Full encoded disk CID as the Director knows it, in whichever format was current when the disk was parked (`pvd-` envelope, or a legacy bare/pipe-annotated form). |
+| `disk_cid` | Full encoded disk CID as the Director knows it, in whichever format was current when the disk was parked (`pvd-` envelope, its compressed `pvz-` variant, or a legacy bare/pipe-annotated form). |
 | `source_vm_cid` | VMID of the VM the disk was detached from. |
 | `parked_at` | RFC 3339 timestamp of the park operation. |
 | `node` | PVE cluster node the disk lives on. |
