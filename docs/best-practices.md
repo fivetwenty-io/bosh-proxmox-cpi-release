@@ -74,7 +74,7 @@ Property names and defaults are cross-referenced to [Configuration reference](co
 
 **Best practice.** BOSH sizes VMs deterministically from the manifest and the agent plans job memory against that size, so auto-ballooning — which reclaims guest memory beneath those assumptions — invites OOM kills that look like application failures. Disable the balloon device unless the cluster deliberately overcommits memory.
 
-**CPI behavior.** The CPI writes `balloon: 0` on every VM and template it creates, disabling the balloon device. `pve.balloon` (globally) or `cloud_properties.balloon` (per instance group) accepts a positive MiB floor to enable PVE auto-ballooning, and the sentinel `pve-default` writes no `balloon` key at all, restoring PVE's own default (device enabled, balloon = memory) for clusters that want it.
+**CPI behavior.** The CPI writes `balloon: 0` on every VM and template it creates, disabling the balloon device. `pve.balloon` (globally) or `cloud_properties.balloon` (per instance group) accepts a positive MiB floor to enable PVE auto-ballooning, and the sentinel `pve-default` leaves no `balloon` key on the VM — clearing the template-inherited value on clones — restoring PVE's own default (device enabled, balloon = memory) for clusters that want it.
 
 **Status.** Meets.
 

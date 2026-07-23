@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"math/rand"
 	mrand "math/rand/v2"
 	"net"
@@ -380,11 +381,11 @@ type createVMShape struct {
 	// balloonMiB is the resolved PVE "balloon" value for the new VM. Resolved
 	// once via resolveVMShapeBalloon: cloud_properties.balloon (call/disk_type/
 	// vm_type layered resolver) > pve.balloon global value (default "0" —
-	// ballooning disabled). Nil means write no balloon key at all (the
-	// "pve-default" sentinel — PVE keeps its own default: device enabled,
-	// balloon = memory). Both import-path (createParams) and clone-path
-	// (UpdateQemuConfig) use this value. Validated ≤ memMiB in
-	// buildVMShapeForNode (fail-fast, before any PVE API call).
+	// ballooning disabled). Nil is the "pve-default" sentinel — PVE keeps its
+	// own default (device enabled, balloon = memory): the import path writes
+	// no balloon key, and the clone path actively DELETEs the key the clone
+	// inherited from the template (which carries balloon=0). Validated
+	// ≤ memMiB in buildVMShapeForNode (fail-fast, before any PVE API call).
 	balloonMiB *int
 	// vmPool is the resolved PVE resource pool name assigned to this VM at
 	// create/clone time. Resolved once in buildVMShapeForNode via
@@ -2897,6 +2898,30 @@ func resolveVMShapeCPUType(r *layeredResolver, cfg *config.CPIConfig) string {
 	return cfg.CPUTypeValue()
 }
 
+// applyCloneBalloon applies the resolved balloon value to a clone's resource
+// UpdateQemuConfig params; the default resolution is 0 — ballooning disabled —
+// matching the import path. The "pve-default" sentinel (nil) must actively
+// DELETE the key rather than write nothing: the stemcell template carries
+// balloon=0 (create_stemcell bakes it in, so hand-made clones inherit
+// ballooning-off) and PVE's clone copies the full source config, so an
+// untouched clone would inherit balloon=0 — silently identical to the
+// disabled default instead of PVE's own device-enabled default the sentinel
+// promises. Deleting the inherited key restores true PVE behavior (device
+// enabled, balloon = memory). This differs from the cpu sentinel only because
+// templates carry no explicit cpu key — there is nothing to clear there.
+func applyCloneBalloon(resourceParams *sdknodes.UpdateQemuConfigParams, balloonMiB *int) {
+	if balloonMiB != nil {
+		balloonVal := int64(*balloonMiB)
+		resourceParams.Balloon = &balloonVal
+		return
+	}
+	del := pveConfigKeyBalloon
+	if resourceParams.Delete != nil && *resourceParams.Delete != "" {
+		del = *resourceParams.Delete + "," + pveConfigKeyBalloon
+	}
+	resourceParams.Delete = &del
+}
+
 // resolveVMShapeBalloon resolves the PVE "balloon" value to write on the new
 // VM. Precedence (highest wins):
 //
@@ -2935,6 +2960,14 @@ func resolveVMShapeBalloon(r *layeredResolver, cfg *config.CPIConfig) (string, e
 			return "", cpierrors.Cloud(
 				"create_vm: cloud_properties.balloon must be a non-negative integer (MiB) or %q, got %q",
 				config.BalloonPVEDefault, s,
+			)
+		}
+		// Reject fractional JSON numbers explicitly — coerceInt would
+		// silently truncate them, while the string branch above rejects the
+		// same value; both forms must behave identically.
+		if f, isFloat := v.(float64); isFloat && f != math.Trunc(f) {
+			return "", cpierrors.Cloud(
+				"create_vm: cloud_properties.balloon must be a whole number of MiB, got %v", v,
 			)
 		}
 		if n, ok := coerceInt(v); ok && n >= 0 {
@@ -4061,13 +4094,7 @@ func cloneFromTemplate(
 		cpuVal := shape.cpuType
 		resourceParams.Cpu = &cpuVal
 	}
-	// Apply balloon unless the "pve-default" sentinel resolved to nil (write
-	// nothing; the clone keeps PVE's own device-enabled default). The default
-	// resolution is 0 — ballooning disabled — matching the import path.
-	if shape.balloonMiB != nil {
-		balloonVal := int64(*shape.balloonMiB)
-		resourceParams.Balloon = &balloonVal
-	}
+	applyCloneBalloon(resourceParams, shape.balloonMiB)
 	// Apply root-disk performance options to shape.rootDiskKey when any are set.
 	// The clone inherits the template's root disk string under that same key
 	// (verified against templateRootKey before cloning started — see the

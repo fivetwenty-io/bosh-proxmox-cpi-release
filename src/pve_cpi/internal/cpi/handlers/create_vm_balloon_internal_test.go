@@ -147,7 +147,7 @@ func TestResolveVMShapeBalloon_VMTypeProfileAppliesBelowCallLevel(t *testing.T) 
 // knob (fail fast, before any PVE API call).
 func TestResolveVMShapeBalloon_InvalidValue_Errors(t *testing.T) {
 	t.Parallel()
-	for _, bad := range []any{"lots", "-5", float64(-1), true} {
+	for _, bad := range []any{"lots", "-5", float64(-1), true, float64(512.7)} {
 		r := buildResolver(t, map[string]any{"balloon": bad})
 		if _, err := resolveVMShapeBalloon(r, &config.CPIConfig{}); err == nil {
 			t.Errorf("balloon=%v: resolveVMShapeBalloon() succeeded; want error", bad)

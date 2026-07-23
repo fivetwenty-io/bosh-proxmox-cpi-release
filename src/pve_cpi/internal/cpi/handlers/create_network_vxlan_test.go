@@ -433,7 +433,11 @@ func TestCreateNetwork_VnetTagOutOfRange_RejectedPrePVE(t *testing.T) {
 	}
 }
 
-// -- vlan zone with the default 5000+ band: actionable error --
+// -- live vlan zone with an over-cap band: actionable error (backstop) --
+//
+// The config-level validation only sees the CONFIGURED zone type (vxlan
+// here), so an explicit 5000+ band passes Load; the allocation-time check is
+// the backstop when the live zone's effective type turns out to be vlan.
 
 func TestCreateNetwork_VlanBandAbove4094_Rejected(t *testing.T) {
 	t.Parallel()
@@ -455,12 +459,65 @@ func TestCreateNetwork_VlanBandAbove4094_Rejected(t *testing.T) {
 			"vnet": "boshvnet",
 		},
 	}
-	_, err := invokeCreateNetwork(t, vxlanTestDeps(clusterSvc, nil), spec)
+	deps := vxlanTestDeps(clusterSvc, func(cfg *config.CPIConfig) {
+		cfg.SDNVNIRangeStart = 5000
+		cfg.SDNVNIRangeEnd = 5999
+	})
+	_, err := invokeCreateNetwork(t, deps, spec)
 	if err == nil {
 		t.Fatal("expected vlan band error, got nil")
 	}
 	if !strings.Contains(err.Error(), "4094") {
 		t.Errorf("error %q must state the vlan tag maximum 4094", err.Error())
+	}
+}
+
+// -- never-defaulted config + live vlan zone: fallback band is vlan-safe --
+
+func TestCreateNetwork_VlanBareConfig_FallbackBandVlanSafe(t *testing.T) {
+	t.Parallel()
+
+	var vnetParams *sdkcluster.CreateSdnVnetsParams
+
+	clusterSvc := &mockSDNCluster{
+		getSdnZonesFn: func(_ context.Context, _ string, _ *sdkcluster.GetSdnZonesParams) (*sdkcluster.GetSdnZonesResponse, error) {
+			raw := sdkcluster.GetSdnZonesResponse(`{"zone":"vlanz","type":"vlan"}`)
+			return &raw, nil
+		},
+		getSdnVnetsFn: func(_ context.Context, _ string, _ *sdkcluster.GetSdnVnetsParams) (*sdkcluster.GetSdnVnetsResponse, error) {
+			return nil, sdnNotFound()
+		},
+		listSdnVnetsFn: emptyVnetList,
+		listSdnZonesFn: func(_ context.Context, _ *sdkcluster.ListSdnZonesParams) (*sdkcluster.ListSdnZonesResponse, error) {
+			empty := sdkcluster.ListSdnZonesResponse{}
+			return &empty, nil
+		},
+		createSdnVnetsFn: func(_ context.Context, params *sdkcluster.CreateSdnVnetsParams) error {
+			vnetParams = params
+			return nil
+		},
+		updateSdnFn: func(_ context.Context, _ *sdkcluster.UpdateSdnParams) (*sdkcluster.UpdateSdnResponse, error) {
+			return nil, nil
+		},
+	}
+
+	spec := map[string]any{
+		"type": "manual",
+		"cloud_properties": map[string]any{
+			"zone": "vlanz",
+			"vnet": "boshvnet",
+		},
+	}
+	// No ApplyDefaults, band fields zero: the handler-level fallback must
+	// pick a vlan-safe band, mirroring the config-level default.
+	if _, err := invokeCreateNetwork(t, vxlanTestDeps(clusterSvc, nil), spec); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if vnetParams == nil {
+		t.Fatal("CreateSdnVnets was not called")
+	}
+	if vnetParams.Tag == nil || *vnetParams.Tag < 2000 || *vnetParams.Tag > 2999 {
+		t.Errorf("vnet tag: got %v, want fallback allocation within [2000,2999]", vnetParams.Tag)
 	}
 }
 

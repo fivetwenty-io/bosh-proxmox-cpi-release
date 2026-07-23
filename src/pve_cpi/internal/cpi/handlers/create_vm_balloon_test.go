@@ -3,6 +3,7 @@ package handlers_test
 import (
 	"context"
 	"encoding/json"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -93,6 +94,29 @@ func TestCreateVM_ImportPath_Balloon_Sentinel_OmitsKey(t *testing.T) {
 	p := q.createCalls[0].params
 	if v, present := p["balloon"]; present {
 		t.Errorf("createParams must carry no \"balloon\" key for the pve-default sentinel (PVE keeps its own default); got %v", v)
+	}
+}
+
+func TestCreateVM_ImportPath_Balloon_EqualsMemory_Allowed(t *testing.T) {
+	t.Parallel()
+	q := &vmMockQEMU{}
+	n := &vmMockNodes{}
+	c := &vmMockCluster{}
+	a := &vmMockAgent{}
+	h := handlers.HandleCreateVM(buildVMDeps(q, n, c, a))
+
+	args := mkArgs("agent-balloon-import-eq", testStemcellCID,
+		map[string]any{"cores": 1, "memory": 512, "balloon": 512},
+		defaultNetMap(), []string{}, map[string]any{})
+
+	if _, err := h.Handle(context.Background(), args, mkCtx("balloon-import-eq")); err != nil {
+		t.Fatalf("unexpected error for balloon == memory (the inclusive boundary): %v", err)
+	}
+	if len(q.createCalls) != 1 {
+		t.Fatalf("expected 1 Create call, got %d", len(q.createCalls))
+	}
+	if iv, _ := q.createCalls[0].params["balloon"].(int); iv != 512 {
+		t.Errorf("createParams[\"balloon\"] = %v; want 512", q.createCalls[0].params["balloon"])
 	}
 }
 
@@ -199,7 +223,7 @@ func TestCreateVM_ClonePath_Balloon_GlobalValue_Written(t *testing.T) {
 		if c.params.Balloon == nil || *c.params.Balloon != 256 {
 			got := "nil"
 			if c.params.Balloon != nil {
-				got = string(rune(*c.params.Balloon))
+				got = strconv.FormatInt(*c.params.Balloon, 10)
 			}
 			t.Errorf("params.Balloon = %s; want 256 (global pve.balloon)", got)
 		}
@@ -240,6 +264,17 @@ func TestCreateVM_ClonePath_Balloon_Sentinel_OmitsField(t *testing.T) {
 		found = true
 		if c.params.Balloon != nil {
 			t.Errorf("params.Balloon = %v; want nil for the pve-default sentinel (no balloon key written)", *c.params.Balloon)
+		}
+		// Writing nothing is not enough on the clone path: the stemcell
+		// template carries balloon=0 and PVE's clone copies the full source
+		// config, so the sentinel must actively DELETE the inherited key to
+		// restore PVE's own default (device enabled, balloon = memory).
+		if c.params.Delete == nil || !strings.Contains(*c.params.Delete, "balloon") {
+			got := "nil"
+			if c.params.Delete != nil {
+				got = *c.params.Delete
+			}
+			t.Errorf("params.Delete = %s; want it to contain \"balloon\" (sentinel must clear the template-inherited balloon=0)", got)
 		}
 	}
 	if !found {

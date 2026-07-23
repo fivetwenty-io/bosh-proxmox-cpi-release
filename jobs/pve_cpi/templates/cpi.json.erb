@@ -78,7 +78,8 @@
   # VMs deterministically, so auto-ballooning would reclaim guest memory
   # beneath the Director's assumptions). A positive MiB value enables PVE
   # auto-ballooning with that floor; the sentinel "pve-default" makes
-  # create_vm write no "balloon" key at all, restoring PVE's own default.
+  # create_vm leave no "balloon" key on the VM (clones clear the inherited
+  # template value), restoring PVE's own default.
   # Per-VM cloud_properties.balloon takes precedence over this global value.
   balloon = p("pve.balloon", "")
   config["balloon"] = balloon.to_s unless balloon.to_s.empty?

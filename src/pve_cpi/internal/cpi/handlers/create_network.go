@@ -377,6 +377,14 @@ func resolveVnetTag(ctx context.Context, deps Deps, zoneType string, explicitTag
 	}
 	cfg := deps.Config
 	start, end := cfg.SDNVNIRangeStart, cfg.SDNVNIRangeEnd
+	// Zero-band fallback mirrors ApplyDefaults' zone-type-aware defaults
+	// (unreachable in production, where configs always pass through
+	// ApplyDefaults; kept consistent for defense-in-depth). The capped branch
+	// keys off the EFFECTIVE zone type here, which can differ from the
+	// configured one for pre-existing zones.
+	if start == 0 && end == 0 && capped {
+		start, end = 2000, 2999
+	}
 	if start == 0 {
 		start = 5000
 	}

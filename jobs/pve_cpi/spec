@@ -250,7 +250,8 @@ properties:
 
       Set a positive integer (MiB) to enable PVE auto-ballooning with that
       floor; the CPI fails fast when the value exceeds the VM's memory. Set
-      the sentinel "pve-default" to write no balloon key at all, restoring
+      the sentinel "pve-default" to leave no balloon key on the VM — on
+      clones the CPI clears the template-inherited value — restoring
       PVE's own default (device enabled, balloon = memory) for clusters
       that deliberately overcommit memory.
 

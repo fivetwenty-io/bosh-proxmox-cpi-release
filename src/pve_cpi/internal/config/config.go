@@ -108,10 +108,12 @@ type CPIConfig struct {
 
 	// SDNZoneType is the PVE zone type used when the CPI creates the zone itself
 	// (auto-manage enabled and zone absent). Valid values: simple, vlan, qinq,
-	// vxlan, evpn. Defaults to "vxlan" — the only turnkey type whose vnets span
-	// every cluster node. "evpn" is never auto-created: the operator must
-	// pre-create the zone and its BGP controller; the CPI then manages only
-	// vnets and subnets inside it.
+	// vxlan, evpn. Defaults to "vxlan" — a cluster-wide overlay with no fabric
+	// prerequisites. "vlan" is also turnkey (created with NetworkBridge as the
+	// underlay; its vnets span nodes once the fabric trunks the VLANs).
+	// "qinq" is never auto-created (pre-existing zones only). "evpn" is never
+	// auto-created: the operator must pre-create the zone and its BGP
+	// controller; the CPI then manages only vnets and subnets inside it.
 	SDNZoneType string `json:"sdn_zone_type,omitempty"`
 
 	// SDNAutoManageZone controls whether the CPI may create and delete the zone.
@@ -130,8 +132,10 @@ type CPIConfig struct {
 	SDNVxlanPeers []string `json:"sdn_vxlan_peers,omitempty"`
 
 	// SDNVNIRangeStart/End bound the band from which the CPI auto-allocates
-	// VXLAN Network Identifiers (vnet tags) for zone types that require one
-	// (vlan, qinq, vxlan, evpn). 0 defaults to 5000/5999. Per-network override
+	// vnet tags (VNIs for vxlan/evpn, 802.1Q VLAN IDs for vlan/qinq) for zone
+	// types that require one. 0 defaults to 5000/5999 — or 2000/2999 when
+	// SDNZoneType is vlan/qinq, keeping the band inside the 4094 VLAN ID cap
+	// (an explicit band beyond the cap fails validation). Per-network override
 	// via cloud_properties.vnet_tag.
 	SDNVNIRangeStart int `json:"sdn_vni_range_start,omitempty"`
 	SDNVNIRangeEnd   int `json:"sdn_vni_range_end,omitempty"`
@@ -1707,9 +1711,10 @@ const CPUTypePVEDefault = "pve-default"
 const DefaultBalloon = "0"
 
 // BalloonPVEDefault is the sentinel operators set (globally via pve.balloon
-// or per instance group via cloud_properties.balloon) to make the CPI write
-// no "balloon" key at all, so PVE keeps its own default (balloon device
-// enabled, balloon = memory).
+// or per instance group via cloud_properties.balloon) to leave no "balloon"
+// key on the VM, so PVE keeps its own default (balloon device enabled,
+// balloon = memory). The import path writes nothing; the clone path actively
+// deletes the balloon=0 the clone inherits from the stemcell template.
 const BalloonPVEDefault = "pve-default"
 
 // Load decodes CPIConfig from r, applies defaults, then validates.
@@ -3508,8 +3513,12 @@ func (c *CPIConfig) validateSDNFields(errs *[]string) {
 		// 4094 VLAN ID cap — fail at Load time rather than on the first
 		// auto-allocated tag inside create_network. The allocation-time clamp
 		// stays as backstop for pre-existing zones whose effective type
-		// differs from the configured one.
-		if sdnZoneTypeIsVLANCapped(c.SDNZoneType) && c.SDNVNIRangeEnd > 4094 {
+		// differs from the configured one. Only enforced when the SDN path is
+		// reachable (mode sdn/auto), mirroring the zone-type enum validation:
+		// under network_mode bridge, sdn_zone_type is inert and stale SDN
+		// fields left over from a migrated config must not reject the load.
+		sdnReachable := c.NetworkMode == "sdn" || c.NetworkMode == "auto"
+		if sdnReachable && sdnZoneTypeIsVLANCapped(c.SDNZoneType) && c.SDNVNIRangeEnd > 4094 {
 			*errs = append(*errs, fmt.Sprintf(
 				"sdn_vni_range %d..%d exceeds the 4094 VLAN ID cap for sdn_zone_type %q",
 				c.SDNVNIRangeStart, c.SDNVNIRangeEnd, c.SDNZoneType,

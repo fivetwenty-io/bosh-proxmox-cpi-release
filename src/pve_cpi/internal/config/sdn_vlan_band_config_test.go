@@ -77,6 +77,73 @@ func TestSDNVNIBand_VlanZoneType_BandOutsideCap_Rejected(t *testing.T) {
 	}
 }
 
+// TestSDNVNIBand_VlanZoneType_SingleFieldBand_FailsLoudly verifies an
+// operator setting only ONE of the band fields on a vlan zone gets a clear
+// load-time error, not a silently mixed band: start-only pairs with the
+// 5999 default end (over the cap); end-only pairs with the 5000 default
+// start (start > end).
+func TestSDNVNIBand_VlanZoneType_SingleFieldBand_FailsLoudly(t *testing.T) {
+	t.Parallel()
+	// start-only: end fills to 5999 → 4094-cap violation.
+	_, err := mustLoad(t, `{
+		"host": "h", "user": "u", "password": "p",
+		"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
+		"sdn_zone_type": "vlan",
+		"sdn_vni_range_start": 100
+	}`)
+	if err == nil {
+		t.Error("start-only band on a vlan zone: Load succeeded; want 4094-cap error")
+	} else if !strings.Contains(err.Error(), "4094") {
+		t.Errorf("start-only band: error %q does not mention the 4094 cap", err)
+	}
+	// end-only: start fills to 5000 → start > end bounds violation.
+	_, err = mustLoad(t, `{
+		"host": "h", "user": "u", "password": "p",
+		"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
+		"sdn_zone_type": "vlan",
+		"sdn_vni_range_end": 3000
+	}`)
+	if err == nil {
+		t.Error("end-only band on a vlan zone: Load succeeded; want bounds error")
+	} else if !strings.Contains(err.Error(), "sdn_vni_range") {
+		t.Errorf("end-only band: error %q does not name sdn_vni_range", err)
+	}
+}
+
+// TestSDNVNIBand_BridgeMode_CapNotEnforced verifies the 4094-cap check does
+// not fire under network_mode bridge, where the SDN path is unreachable and
+// sdn_zone_type is inert (mirroring the zone-type enum validation, which is
+// also skipped in bridge mode). Guards against rejecting configs migrated
+// from SDN that kept stale sdn_* fields.
+func TestSDNVNIBand_BridgeMode_CapNotEnforced(t *testing.T) {
+	t.Parallel()
+	_, err := mustLoad(t, `{
+		"host": "h", "user": "u", "password": "p",
+		"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
+		"network_mode": "bridge",
+		"sdn_zone_type": "vlan",
+		"sdn_vni_range_start": 5000, "sdn_vni_range_end": 5999
+	}`)
+	if err != nil {
+		t.Errorf("bridge mode with stale vlan sdn fields: Load returned error: %v", err)
+	}
+}
+
+// TestSDNVNIBand_VlanZoneType_BandEndAtCap_Accepted verifies the boundary:
+// an explicit band ending exactly at 4094 is valid for vlan zones.
+func TestSDNVNIBand_VlanZoneType_BandEndAtCap_Accepted(t *testing.T) {
+	t.Parallel()
+	_, err := mustLoad(t, `{
+		"host": "h", "user": "u", "password": "p",
+		"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
+		"sdn_zone_type": "vlan",
+		"sdn_vni_range_start": 4000, "sdn_vni_range_end": 4094
+	}`)
+	if err != nil {
+		t.Errorf("vlan band ending exactly at 4094: Load returned error: %v", err)
+	}
+}
+
 // TestSDNVNIBand_VxlanZoneType_HighBandAccepted verifies the same high band
 // stays valid for vxlan zones (24-bit VNI space).
 func TestSDNVNIBand_VxlanZoneType_HighBandAccepted(t *testing.T) {
