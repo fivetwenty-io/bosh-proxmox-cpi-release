@@ -85,8 +85,3 @@ sequenceDiagram
 
 The contract and its consequences are now in place: one line in, one line out, stateless, idempotent, honest about retrying, and funneled through a single guarded door. That is the frame. With it established, we can stop talking about the binary in the abstract and follow one machine all the way through its life — birth, identity, disks, and death. The Director sequences that life out of the primitive vocabulary the CPI provides, and the story begins in [Chapter 3](03-lifecycle.md).
 
-## Grounding in the implementation
-
-- [CPI methods](../cpi_methods.md)
-- [Architecture overview](../architecture.md)
-- [BOSH CPI certification](../bosh-cpi-certification.md)

@@ -83,8 +83,3 @@ Delegation is powerful and costly, because it imports the delegate's entire cons
 
 A VM placed on the right node, in the right fault domain, pinned so it stays there, still needs one more thing before it is useful: a network identity that survives wherever it lands. And here the same locality question returns in a new form — a node-local network cannot follow a roaming VM any more than a node-local disk can. That is the subject of [Chapter 7](07-portable-networks.md).
 
-## Grounding in the implementation
-
-- [DLB-aware placement](../dlb-aware-placement.md)
-- [Configuration reference](../configuration.md)
-- [Architecture overview](../architecture.md)

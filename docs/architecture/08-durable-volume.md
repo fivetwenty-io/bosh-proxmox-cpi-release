@@ -87,8 +87,3 @@ Above that sits a layered resolver, so operators express intent at its natural a
 
 The machine, its network, and its durable data are all designed now — every primitive PVE lacks, manufactured from first principles. But a clean design on a quiet cluster is not the same as a design that survives production. In production a dozen deploys hit a hypervisor built for a handful, and the lockfiles start to creak. Surviving that storm is the opening of [Chapter 9](09-absorbing-the-storm.md) and Part IV.
 
-## Grounding in the implementation
-
-- [Persistent disks](../persistent-disks.md)
-- [Persistent disk strategy](../persistent-disk-strategy.md)
-- [Configuration reference](../configuration.md)

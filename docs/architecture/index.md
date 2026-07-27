@@ -1,14 +1,10 @@
 # The BOSH PVE CPI — An Architecture, From First Principles
 
-This is the architecture of the BOSH PVE CPI told as a story. It starts from the problem the component exists to solve and derives every feature from a stated principle, so that by the end the whole design feels inevitable rather than assembled. We can read it front to back like a short book, or present it top to bottom in a meeting — the chapters are ordered so that each one earns the next.
+## What this is
 
-## What this is, and how it differs from the other docs
+This document derives the architecture from fundamentals — problem first, principle next, feature last. It answers "why is it built this way, and why is that the right way?" Here we name capabilities and the reasoning behind them. The audience is anyone with a semi-technical background: an architect, an engineering manager, a new team member. No prior knowledge of BOSH, Proxmox VE, or Go is assumed.
 
-The reference documentation in the [parent directory](../index.md) describes the finished implementation from the bottom up: what each method does, what each setting controls, how each subsystem behaves. It answers "how does it work?"
-
-This document goes the other way. It treats the implementation as a working prototype and re-derives the architecture from fundamentals — problem first, principle next, feature last. It answers "why is it built this way, and why is that the right way?" Where the reference docs name functions and fields, here we name only capabilities and the reasoning behind them. The audience is anyone with a semi-technical background: an architect, an engineering manager, a new team member. No prior knowledge of BOSH, Proxmox VE, or Go is assumed.
-
-Each chapter opens with the first principle it derives from and carries diagrams that advance the story. At the end, it links back to the reference docs for anyone who wants the mechanism.
+Each chapter opens with the first principle it derives from and carries diagrams that advance the story.
 
 ## The arc
 
@@ -63,7 +59,7 @@ Designing the component so the person debugging it at three in the morning can f
 - **[Chapter 13 — The Whole Picture](13-whole-picture.md)**
 The recurring principles seen together, the layered architecture that emerges from them rather than being imposed, and an honest map of where the walls are.
 
-## Presenting this in a meeting
+## Audience and Use
 
 The chapters are sized and ordered for a top-to-bottom walkthrough. A few ways to use them:
 
@@ -76,6 +72,3 @@ Chapter 1, the first principle line at the top of Chapters 2 through 12, and Cha
 - **Topic deep-dive**
 Jump to a single Part — placement, networking, storage, resilience, safety — using the part headings above. Each chapter is self-contained enough to stand alone, and links forward and back where context helps.
 
-## Grounding in the implementation
-
-For mechanism-level detail behind any chapter, the reference documentation lives one level up at [the documentation index](../index.md).

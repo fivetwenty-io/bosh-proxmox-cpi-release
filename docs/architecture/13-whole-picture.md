@@ -79,10 +79,3 @@ The storage lock timeout is baked into PVE and is not a knob. When contention is
 ## The one-sentence version
 
 Strip away the twelve chapters and what remains fits in three strokes. BOSH refuses to learn any platform. PVE refuses to be a cloud. The CPI is the small, stateless, honest factory standing on the seam between them, manufacturing on demand and at speed every cloud primitive neither side will provide. Everything in this document is a consequence of taking that one job seriously. The clone that turns minutes into seconds. The scheduler built from a live read. The volume invented from a string. The storm absorbed. The secret never leaked.
-
-## Grounding in the implementation
-
-- [Architecture overview](../architecture.md)
-- [CPI methods](../cpi_methods.md)
-- [Configuration](../configuration.md)
-- [Documentation index](../index.md)

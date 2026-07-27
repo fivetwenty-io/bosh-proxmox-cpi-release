@@ -82,8 +82,3 @@ So the CPI declines to over-specify. It leaves the ephemeral layout for the stem
 
 One machine now lives. It came off the mold in seconds, opened its envelope, and reported for duty. But a deployment is not one machine — it is many, and the question of *where each one lands* is its own design problem. PVE offers no scheduler to answer it. Part III turns to the cloud primitives the CPI has to manufacture from scratch, beginning with placement. See [Chapter 6](06-scheduler.md).
 
-## Grounding in the implementation
-
-- [ConfigDrive](../configdrive.md) — the ISO layout, the SCSI slot map, and why earlier delivery modes were dropped.
-- [CPI method reference](../cpi_methods.md) — `create_vm` and the boot path it drives.
-- [Configuration](../configuration.md) — agent modes and the removal of registry support.

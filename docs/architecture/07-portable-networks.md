@@ -92,8 +92,3 @@ The fix was not a tuning knob. It was an isolated SDN network that BOSH fully ow
 
 Placement lets a VM live anywhere; portable networking lets it keep its identity wherever it lives. But a VM's *data* has to outlive the VM entirely — that is the whole reason persistent disks exist. And PVE has no durable volume object to make that easy. Inventing one out of nothing is the work of [Chapter 8](08-durable-volume.md).
 
-## Grounding in the implementation
-
-- [Networks](../networks.md)
-- [ConfigDrive](../configdrive.md)
-- [Configuration reference](../configuration.md)

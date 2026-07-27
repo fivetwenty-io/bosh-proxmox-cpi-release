@@ -74,9 +74,3 @@ The CPI absorbs *typical* recycle and lock windows. When contention is *structur
 
 Absorbing load keeps deploys moving. But absorbing a storm is not the same as surviving a single call that fails anyway, halfway through building a machine. The next question is what the CPI does at the moment of failure. How does it guarantee it never wedges the Director, never leaks a half-built VM, and never destroys data it was only asked to detach? That is the subject of [Chapter 10](10-safety.md).
 
-## Grounding in the implementation
-
-- [Transient transport and retry](../pve-transient-transport.md)
-- [Storage locking](../pve-storage-locking.md)
-- [Host tuning](../pve-host-tuning.md)
-- [Architecture overview](../architecture.md)

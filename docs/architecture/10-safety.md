@@ -70,9 +70,3 @@ Four mechanisms, one shape. Recover a fault into a retriable error. Unwind a par
 
 A CPI that is safe to itself must also be safe to everything around it: the operator who holds its credential, the logs it writes, and the network it can reach. Safety against our own bugs is one thing; safety against a hostile world is another. That is the subject of [Chapter 11](11-hostile-by-default.md).
 
-## Grounding in the implementation
-
-- [Architecture overview](../architecture.md)
-- [Storage locking and the cluster pool lock](../pve-storage-locking.md)
-- [Operations and recovery](../operations.md)
-- [Troubleshooting](../troubleshooting.md)

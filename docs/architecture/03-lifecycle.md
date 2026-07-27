@@ -77,7 +77,3 @@ So the CPI manufactures them. A persistent disk is emulated by riding on a host 
 
 The chain has fourteen links, but they are not equal in cost. Most are quick API calls. One is expensive enough to threaten the whole deploy: making the VM itself. Block-copying a fresh operating-system image for every machine takes minutes, and minutes times dozens of machines is intolerable. The next chapter shows the trick that turns those minutes into seconds — pay for the image once, then stamp out cheap copies. See [Chapter 4](04-stemcell-mold.md).
 
-## Grounding in the implementation
-
-- [CPI method reference](../cpi_methods.md) — every method, its arguments, and its return shape.
-- [Architecture overview](../architecture.md) — the package layout and dispatch model behind these methods.

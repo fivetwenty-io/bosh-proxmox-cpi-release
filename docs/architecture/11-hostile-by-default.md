@@ -60,9 +60,3 @@ The **load-balancer registration** dials an operator-supplied URL, which makes t
 
 Fast, safe, and secure, the CPI still has to be *operated* — by someone who did not write it, at three in the morning, reading logs and running recovery commands under pressure. The last property of a production component is that it can be diagnosed and repaired from the outside. That is the subject of [Chapter 12](12-operating.md).
 
-## Grounding in the implementation
-
-- [API permissions and least privilege](../pve-api-permissions.md)
-- [Configuration reference](../configuration.md)
-- [Architecture overview](../architecture.md)
-- [Operations](../operations.md)

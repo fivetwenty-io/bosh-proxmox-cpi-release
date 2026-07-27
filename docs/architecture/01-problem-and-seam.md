@@ -63,8 +63,3 @@ Concretely, this CPI is a single binary that implements BOSH's CPI version 2 con
 
 The contract tells us *what* the Director and the CPI exchange. It does not yet tell us the one structural fact about *how* the Director runs this binary. That single fact, more than any feature, dictates the entire shape of the design — and it is where [Chapter 2](02-stateless-contract.md) begins.
 
-## Grounding in the implementation
-
-- [Architecture overview](../architecture.md)
-- [CPI methods](../cpi_methods.md)
-- [Documentation index](../index.md)

@@ -96,9 +96,3 @@ The same ethic runs through the supporting lab and CI tooling. The artifact cach
 
 Every piece is designed now. What remains is to step back from the parts and see the whole shape. The recurring principles. The layered architecture that *emerges* from them rather than being imposed. The honest edges where the walls are. That is [Chapter 13](13-whole-picture.md).
 
-## Grounding in the implementation
-
-- [Operations and recovery](../operations.md)
-- [Troubleshooting](../troubleshooting.md)
-- [Boolean inheritance convention](../bool-inheritance-convention.md)
-- [Integration testing](../integration-testing.md)

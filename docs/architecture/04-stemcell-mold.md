@@ -54,8 +54,3 @@ The CPI can optionally replicate the frozen template to every node in parallel, 
 
 A clone comes off the mold fast, but it comes off *anonymous*. It is an operating system with a sleeping agent and no idea who it is, where its message bus lives, or how to report for duty. Before it can join the deployment, something has to hand it an identity — and the CPI cannot log in to do it. The next chapter is about how a bare clone learns who it is and phones home. See [Chapter 5](05-machine-identity.md).
 
-## Grounding in the implementation
-
-- [Light stemcells](../light-stemcells.md) — the import, fingerprinting, and template lifecycle in detail.
-- [CPI method reference](../cpi_methods.md) — `create_stemcell`, `delete_stemcell`, and the clone path inside `create_vm`.
-- [Configuration](../configuration.md) — stemcell storage, replication, and the VMID bands.
