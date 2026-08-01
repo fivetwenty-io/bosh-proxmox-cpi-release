@@ -59,6 +59,13 @@ func Any(key string, val any) Field { return slog.Any(key, val) }
 // Err is a convenience for slog.Any("error", err); slog has no Error field helper.
 func Err(err error) Field { return slog.Any("error", err) }
 
+// URL returns a Field carrying a URL-shaped string with embedded credentials
+// masked (userinfo and sensitive query parameters such as presigned
+// signatures). Always use this instead of String for operator-supplied URLs —
+// image_url, source_url, endpoints — so a credential-bearing URL never
+// reaches a log sink verbatim.
+func URL(key, raw string) Field { return slog.String(key, ScrubMessage(raw)) }
+
 // ErrScrubbed returns a Field carrying the error message under the "error" key
 // with any URL credentials scrubbed (userinfo and sensitive query parameters).
 // Use this instead of Err when the error originates from a guest-controlled or

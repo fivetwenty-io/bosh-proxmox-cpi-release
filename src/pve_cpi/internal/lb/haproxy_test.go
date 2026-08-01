@@ -467,24 +467,9 @@ func TestNewHAProxyRegistrar_InvalidCACert(t *testing.T) {
 // --------------------------------------------------------------------------
 // Interface compliance
 // --------------------------------------------------------------------------
-
-func TestHAProxyRegistrar_ImplementsLBRegistrar(t *testing.T) {
-	t.Parallel()
-
-	cfg := lb.HAProxyConfig{
-		Endpoint:       "https://example.com:5555",
-		User:           "u",
-		Password:       "p",
-		AllowPrivateIP: true, // example.com may resolve to public IP; skip check for this compile-only test
-	}
-	r, err := lb.NewHAProxyRegistrar(cfg)
-	if err != nil {
-		// example.com may be unreachable in CI; skip if DNS fails — this is a
-		// compile-time interface check, not a network test.
-		t.Skipf("skipping interface check (DNS resolution: %v)", err)
-	}
-	var _ lb.Registrar = r
-}
+//
+// Enforced by the compile-time guard below; a live-DNS constructor round
+// trip added nothing beyond what that guard already checks.
 
 // --------------------------------------------------------------------------
 // Unused variable guard (ensure compiler catches interface shape)

@@ -338,6 +338,15 @@ type CPIConfig struct {
 	// applies the built-in 90s default. Valid range: 1-3600 seconds.
 	StemcellFetchIdleConnTimeoutSec int `json:"stemcell_fetch_idle_conn_timeout_sec,omitempty"`
 
+	// StemcellFetchBlockPrivateNetworks, when true, makes the https and
+	// bosh+blobstore stemcell fetchers refuse any connection whose target
+	// resolves to a private/loopback/link-local address, re-checked on every
+	// dial so redirect hops and DNS rebinding are covered. Default false —
+	// private mirrors on RFC1918 space are a legitimate deployment shape.
+	// Enable when the mirror is public and redirect chains should never
+	// re-enter the private network.
+	StemcellFetchBlockPrivateNetworks bool `json:"stemcell_fetch_block_private_networks,omitempty"`
+
 	// StemcellTemplateVMIDRangeStart is the inclusive lower bound of the VMID
 	// range for template VMs created by create_stemcell. Templates occupy a
 	// dedicated band above the persistent-disk range so they never collide with
@@ -1013,8 +1022,8 @@ type RetryConfig struct {
 	Pushback *RetryPolicy `json:"pushback,omitempty"`
 
 	// StorageLock governs the exponential backoff used between attempts inside
-	// RetryOnTransientOrLock / RetryOnStorageLock when PVE responds with a
-	// "got timeout waiting for worker" or "storage locked" signal. This is a
+	// RetryOnTransientOrLock when PVE responds with a "got timeout waiting for
+	// worker" or "storage locked" signal. This is a
 	// shorter curve than StorageImport because it guards the inner per-operation
 	// lock, not the full import pipeline. max_attempts overrides
 	// pve.DefaultStorageLockMaxAttempts (10) when > 0; 0 defers to that constant.
@@ -3022,10 +3031,10 @@ func (c *CPIConfig) RetryPushback() EffectiveRetryPolicy {
 	return out
 }
 
-// RetryStorageLock returns the resolved storage-lock backoff policy used inside
-// RetryOnTransientOrLock / RetryOnStorageLock. MaxAttempts 0 means callers
-// should fall back to pve.DefaultStorageLockMaxAttempts (the constant the CPI
-// shipped with). Defaults: base_ms 2000, cap_ms 30000, jitter_pct 30.
+// RetryStorageLock returns the resolved storage-lock backoff policy used
+// inside RetryOnTransientOrLock. MaxAttempts 0 means callers should fall back
+// to pve.DefaultStorageLockMaxAttempts (the constant the CPI shipped with).
+// Defaults: base_ms 2000, cap_ms 30000, jitter_pct 30.
 func (c *CPIConfig) RetryStorageLock() EffectiveRetryPolicy {
 	p := c.retryPolicyOf(func(r *RetryConfig) *RetryPolicy { return r.StorageLock })
 	out := EffectiveRetryPolicy{

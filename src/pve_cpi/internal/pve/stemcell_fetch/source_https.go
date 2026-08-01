@@ -9,6 +9,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
 )
 
 // httpsSource implements Source for https:// references. It streams the
@@ -25,9 +27,13 @@ type httpsSource struct {
 // newHTTPSSource returns a Source whose http.Client uses a 30-minute total
 // timeout, a TLS 1.2 floor, the supplied TransportConfig bounding dial/TLS/
 // response-header/idle timeouts, and a redirect policy that requires every
-// redirect target to use https:// (preventing accidental scheme downgrade and
-// SSRF-adjacent redirects to internal endpoints). Up to 10 redirects are still
-// permitted, matching Go's default cap.
+// redirect target to use https:// (preventing accidental scheme downgrade).
+// Up to 10 redirects are still permitted, matching Go's default cap.
+//
+// The scheme check alone does NOT restrict which hosts a redirect may target;
+// SSRF-style redirects to internal endpoints are blocked only when
+// TransportConfig.BlockPrivateNetworks is set, which installs a per-dial
+// address guard covering the initial request and every redirect hop alike.
 func newHTTPSSource(tc TransportConfig) *httpsSource {
 	return &httpsSource{
 		client: &http.Client{
@@ -106,12 +112,15 @@ func (h *httpsSource) Fetch(ctx context.Context, ref Reference, creds Credential
 }
 
 // readPreview reads up to 512 bytes from r without consuming the full body.
-// Used to enrich error messages with the server's response prefix.
+// Used to enrich error messages with the server's response prefix. The
+// preview is scrubbed because an error body can echo the request URL,
+// including a credential-bearing query string, and the enriched error reaches
+// both the log and the Director.
 func readPreview(r io.Reader) string {
 	buf := make([]byte, 512)
 	n, _ := r.Read(buf)
 	if n == 0 {
 		return "(no body)"
 	}
-	return strings.TrimSpace(string(buf[:n]))
+	return log.ScrubMessage(strings.TrimSpace(string(buf[:n])))
 }

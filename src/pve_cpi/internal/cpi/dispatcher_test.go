@@ -177,6 +177,37 @@ func TestHandle_HandlerReturnsError(t *testing.T) {
 }
 
 // --------------------------------------------------------------------------
+// TestHandle_ErrorMessageScrubbed
+// --------------------------------------------------------------------------
+
+// TestHandle_ErrorMessageScrubbed verifies the Director-bound error message is
+// scrubbed at the dispatcher choke point: a handler error embedding a
+// credential-bearing URL (the expired-presigned-fetch scenario) must not
+// reach resp.Error.Message verbatim, because the Director persists that
+// message in its task records.
+func TestHandle_ErrorMessageScrubbed(t *testing.T) {
+	t.Parallel()
+	d := cpi.NewDispatcher(nopLogger())
+
+	mustRegister(t, d, "create_stemcell", cpi.HandlerFunc(func(_ context.Context, _ []json.RawMessage, _ jsonrpc.Context) (any, error) {
+		return nil, cpierrors.Cloud(
+			"fetch %q: GET returned 403",
+			"https://bosh:s3cretpw@blob.lab.internal/img?X-Amz-Signature=deadbeef1234")
+	}))
+
+	resp := d.Handle(context.Background(), makeReq("create_stemcell"))
+	if resp == nil || resp.Error == nil {
+		t.Fatal("expected error response")
+	}
+	if strings.Contains(resp.Error.Message, "s3cretpw") || strings.Contains(resp.Error.Message, "deadbeef1234") {
+		t.Fatalf("credentials leaked into Director-bound error message: %s", resp.Error.Message)
+	}
+	if !strings.Contains(resp.Error.Message, "blob.lab.internal/img") {
+		t.Errorf("host/path must survive scrubbing for diagnosability: %s", resp.Error.Message)
+	}
+}
+
+// --------------------------------------------------------------------------
 // TestHandle_HandlerReturnsPlainError
 // --------------------------------------------------------------------------
 

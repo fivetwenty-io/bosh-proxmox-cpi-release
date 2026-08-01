@@ -15,6 +15,7 @@ import (
 	"time"
 
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
+	"github.com/fivetwenty-io/bosh-pve-cpi/internal/netguard"
 )
 
 // defaultTimeout is the per-request HTTP timeout when HAProxyConfig.Timeout is
@@ -75,32 +76,11 @@ type HAProxyRegistrar struct {
 	http     *http.Client
 }
 
-// privateIPNets supplements stdlib predicates with explicit CIDR blocks for
-// defense-in-depth. RFC1918 + RFC4193 are already covered by IsPrivate() in
-// Go 1.17+; they are listed explicitly for clarity.
-var privateIPNets []*net.IPNet //nolint:gochecknoglobals // defense-in-depth CIDR list; package-level is intentional
-
-func init() {
-	for _, cidr := range []string{
-		"10.0.0.0/8",
-		"172.16.0.0/12",
-		"192.168.0.0/16",
-		"fc00::/7",
-	} {
-		_, ipNet, err := net.ParseCIDR(cidr)
-		if err != nil {
-			panic("lb: bad CIDR in privateIPNets init: " + cidr + ": " + err.Error())
-		}
-		privateIPNets = append(privateIPNets, ipNet)
-	}
-}
-
 // isPrivateOrSpecial returns true when ip is a non-globally-routable address.
+// Delegates to the shared netguard classification so every SSRF-guarded
+// client in the CPI (LB registrar, stemcell fetcher) rejects the same set.
 func isPrivateOrSpecial(ip net.IP) bool {
-	return ip.IsPrivate() ||
-		ip.IsLoopback() ||
-		ip.IsLinkLocalUnicast() ||
-		ip.IsUnspecified()
+	return netguard.IsPrivateOrSpecial(ip)
 }
 
 // resolverFunc is the interface used to inject a test DNS resolver.
@@ -144,53 +124,12 @@ func checkEndpointIPsLiteral(endpoint string) error {
 // When res is non-nil it is used for resolution (test seam); otherwise
 // net.DefaultResolver is used.
 func ssrfDialContext(base *net.Dialer, res resolverFunc) func(ctx context.Context, network, addr string) (net.Conn, error) {
-	return func(ctx context.Context, network, addr string) (net.Conn, error) {
-		host, port, err := net.SplitHostPort(addr)
-		if err != nil {
-			return nil, fmt.Errorf("lb: dial: parse addr %q: %w", addr, err)
-		}
-
-		// If addr is already an IP literal, classify directly — no DNS needed.
-		if ip := net.ParseIP(host); ip != nil {
-			if isPrivateOrSpecial(ip) {
-				return nil, cpierrors.Cloud(
-					"lb: dial blocked: %s is a private/loopback address; set allow_private_ip=true to override",
-					ip.String(),
-				)
-			}
-			return base.DialContext(ctx, network, addr)
-		}
-
-		// Hostname: resolve and check every IP.
-		var resolver resolverFunc = net.DefaultResolver
-		if res != nil {
-			resolver = res
-		}
-		ips, lookupErr := resolver.LookupHost(ctx, host)
-		if lookupErr != nil {
-			return nil, cpierrors.Cloud("lb: dial: DNS lookup for %q failed: %s", host, lookupErr.Error())
-		}
-		if len(ips) == 0 {
-			return nil, cpierrors.Cloud("lb: dial: DNS lookup for %q returned no addresses", host)
-		}
-		for _, resolved := range ips {
-			ip := net.ParseIP(resolved)
-			if ip == nil {
-				continue
-			}
-			if isPrivateOrSpecial(ip) {
-				return nil, cpierrors.Cloud(
-					"lb: dial blocked: %s (resolved from %q) is a private/loopback address; set allow_private_ip=true to override",
-					ip.String(), host,
-				)
-			}
-		}
-
-		// All resolved IPs are public. Dial the first one explicitly so we use
-		// the validated address rather than letting the OS re-resolve.
-		dialAddr := net.JoinHostPort(ips[0], port)
-		return base.DialContext(ctx, network, dialAddr)
-	}
+	return netguard.DialGuard{
+		Base:      base,
+		Resolver:  res,
+		ErrPrefix: "lb",
+		Hint:      "set allow_private_ip=true to override",
+	}.DialContext()
 }
 
 // NewHAProxyRegistrar constructs an HAProxyRegistrar.

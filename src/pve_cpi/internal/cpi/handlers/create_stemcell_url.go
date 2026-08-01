@@ -66,7 +66,7 @@ func handleStemcellDownloadURL(
 		deps.Log(ctx).Warn("create_stemcell: server-download: sha256 not set; "+
 			"filename identity is weak (name+version only) — strongly recommend "+
 			"setting cloud_properties.sha256 alongside source_url",
-			log.String("source_url", cp.SourceURL),
+			log.URL("source_url", cp.SourceURL),
 			log.String("name", cp.Name),
 			log.String("version", cp.Version),
 		)
@@ -74,7 +74,7 @@ func handleStemcellDownloadURL(
 	qcow2Filename := pve.BuildStemcellFilename(cp.Name, cp.Version, cp.ExpectedSHA256)
 
 	deps.Log(ctx).Info("create_stemcell: server-side download requested",
-		log.String("source_url", cp.SourceURL),
+		log.URL("source_url", cp.SourceURL),
 		log.String("node", node),
 		log.String("storage", storage),
 		log.String("filename", qcow2Filename),
@@ -209,7 +209,7 @@ func handleStemcellDownloadURL(
 
 	templateCID := pve.BuildTemplateStemcellCID(vmid)
 	deps.Log(ctx).Info("create_stemcell: server-download stemcell ready",
-		log.String("source_url", cp.SourceURL),
+		log.URL("source_url", cp.SourceURL),
 		log.String("cid", templateCID),
 	)
 	return templateCID, nil

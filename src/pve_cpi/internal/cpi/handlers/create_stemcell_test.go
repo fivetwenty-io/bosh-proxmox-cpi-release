@@ -1141,6 +1141,40 @@ func TestCreateStemcell_RejectsNegativeHdrSize(t *testing.T) {
 	}
 }
 
+// TestCreateStemcell_RejectsDuplicateEntryBasenames verifies a tarball with
+// two entries whose basenames collide after path flattening is rejected as
+// invalid. Extraction flattens entry paths to basenames (path-traversal
+// defense), so "a/root.img" and "b/root.img" would write to one destination
+// with the second truncating the first while both candidate records keep
+// their own size and SHA — decoupling the recorded digest (which flows into
+// the stemcell filename, CID, and sha-tag dedup) from the file's actual
+// bytes. A legitimate BOSH stemcell never carries duplicate basenames.
+func TestCreateStemcell_RejectsDuplicateEntryBasenames(t *testing.T) {
+	t.Parallel()
+
+	tgzPath := makeStemcellTar(t, map[string][]byte{
+		"a/root.img": qcow2Bytes(2 * 1024 * 1024),
+		"b/root.img": qcow2Bytes(3 * 1024 * 1024),
+	})
+
+	deps := makeDeps(defaultStemcellClient())
+	h := handlers.HandleCreateStemcell(deps)
+
+	cp := map[string]any{"name": "ubuntu-jammy", "version": "1.0", "disk_format": "qcow2"}
+	args := []json.RawMessage{marshalArg(t, tgzPath), marshalArg(t, cp)}
+
+	_, err := h.Handle(context.Background(), args, jsonrpc.Context{})
+	if err == nil {
+		t.Fatal("expected error for duplicate entry basenames; got nil")
+	}
+	if !cpierrors.IsType(err, cpierrors.TypeStemcellInvalidTar) {
+		t.Errorf("error type: want StemcellInvalidTar for duplicate basenames, got %T %v", err, err)
+	}
+	if !strings.Contains(err.Error(), "duplicate entry basename") {
+		t.Errorf("error should name the duplicate-basename guard: %v", err)
+	}
+}
+
 // TestCreateStemcell_NoImgCandidateError verifies that a tarball whose
 // only candidate is a zero-byte .img file lands in the imgPath=="" branch
 // of the candidate-selection logic and is rejected with a Cloud error that

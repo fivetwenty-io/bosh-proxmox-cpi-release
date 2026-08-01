@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 )
@@ -181,6 +182,35 @@ func TestBuildStemcellProvenanceNotes_FullFields(t *testing.T) {
 	}
 	if !parsed.Equal(now) {
 		t.Errorf("Created: got %q, want %q", p.Created, now.UTC().Format(time.RFC3339))
+	}
+}
+
+// TestBuildStemcellProvenanceNotes_ScrubsCredentialBearingSource verifies a
+// presigned or userinfo-bearing source URL is scrubbed before it is persisted
+// into the PVE notes field (cluster-replicated, backup-captured, readable by
+// any VM.Audit holder), while the diagnostic parts — host, path, benign query
+// params — survive.
+func TestBuildStemcellProvenanceNotes_ScrubsCredentialBearingSource(t *testing.T) {
+	cp := stemcellCloudProps{Name: "s", Version: "1"}
+	now := time.Date(2026, 6, 3, 12, 0, 0, 0, time.UTC)
+	source := "https://bosh:s3cretpw@mirror.internal/stemcell.qcow2?X-Amz-Signature=deadbeef1234&X-Amz-Expires=3600"
+
+	notes, err := buildStemcellProvenanceNotes(cp, "ab12ef34", source, "director-xyz", now, "", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	var p stemcellProvenance
+	if err := json.Unmarshal([]byte(notes), &p); err != nil {
+		t.Fatalf("unmarshal failed: %v", err)
+	}
+	if strings.Contains(p.Source, "s3cretpw") || strings.Contains(p.Source, "deadbeef1234") {
+		t.Fatalf("Source leaked credentials: %q", p.Source)
+	}
+	if !strings.Contains(p.Source, "mirror.internal/stemcell.qcow2") {
+		t.Errorf("Source lost its diagnostic value: %q", p.Source)
+	}
+	if !strings.Contains(p.Source, "X-Amz-Expires=3600") {
+		t.Errorf("benign query param should survive scrubbing: %q", p.Source)
 	}
 }
 

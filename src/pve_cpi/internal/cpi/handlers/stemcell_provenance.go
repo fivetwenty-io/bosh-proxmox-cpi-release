@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"strings"
 	"time"
+
+	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
 )
 
 // Tag constants for stemcell provenance. Defined here to satisfy goconst
@@ -112,7 +114,13 @@ func buildStemcellProvenanceNotes(cp stemcellCloudProps, sha8, source, directorI
 		OSType:     cp.OSType,
 		DiskFormat: cp.DiskFormat,
 		SHA8:       sha8,
-		Source:     source,
+		// The source URL is scrubbed because PVE persists the notes field in
+		// /etc/pve/qemu-server/<vmid>.conf — readable by any VM.Audit holder,
+		// replicated cluster-wide, captured in config backups, and outliving
+		// log rotation. A presigned or userinfo-bearing image_url must not
+		// land there verbatim; host, path, bucket, and key survive scrubbing,
+		// which is all the provenance value needs.
+		Source:     log.ScrubMessage(source),
 		DirectorID: directorID,
 		Created:    now.UTC().Format(time.RFC3339),
 	}

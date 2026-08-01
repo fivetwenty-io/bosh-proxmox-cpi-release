@@ -316,7 +316,7 @@ func (d *Dispatcher) Handle(ctx context.Context, req *jsonrpc.Request) (resp *js
 		d.logger.Info("dispatch", requestFields(ctx, req.Method, req.Context.RequestID,
 			log.Float64("duration_ms", durationMS),
 			log.String("outcome", "timeout"),
-			log.Err(err),
+			log.ErrScrubbed(err),
 		)...)
 		// Recorded as "error", not "timeout": this mirrors what the wrapped
 		// handler's hooks already observed inside h.Handle above (the
@@ -335,7 +335,7 @@ func (d *Dispatcher) Handle(ctx context.Context, req *jsonrpc.Request) (resp *js
 		d.logger.Info("dispatch", requestFields(ctx, req.Method, req.Context.RequestID,
 			log.Float64("duration_ms", durationMS),
 			log.String("outcome", outcome),
-			log.Err(err),
+			log.ErrScrubbed(err),
 		)...)
 		d.recordDuration(ctx, req.Method, outcome, durationMS)
 		return dispatchError(err)
@@ -530,6 +530,12 @@ func (d *Dispatcher) recordDuration(ctx context.Context, method, outcome string,
 
 // dispatchError converts any error returned by a handler to a *jsonrpc.Response.
 // *cpierrors.Error values are mapped faithfully; plain errors become CloudError.
+//
+// The message is scrubbed at this choke point — the single funnel every
+// handler error passes through — because the Director persists it in its
+// task/event records: an error embedding a presigned or userinfo-bearing URL
+// (a failed stemcell fetch, for example) must not reach that sink verbatim.
+// This mirrors what endRootSpanErr already does for the trace exporter.
 func dispatchError(err error) *jsonrpc.Response {
 	var cpiErr *cpierrors.Error
 	if errors.As(err, &cpiErr) {
@@ -537,7 +543,7 @@ func dispatchError(err error) *jsonrpc.Response {
 			Result: nil,
 			Error: &jsonrpc.ErrorBody{
 				Type:      string(cpiErr.Type()),
-				Message:   cpiErr.Error(),
+				Message:   log.ScrubMessage(cpiErr.Error()),
 				OkToRetry: cpiErr.OkToRetry(),
 			},
 			Log: "",
@@ -547,13 +553,14 @@ func dispatchError(err error) *jsonrpc.Response {
 	return errorResponse(cpierrors.Cloud("%s", err.Error()))
 }
 
-// errorResponse builds a *jsonrpc.Response from a *cpierrors.Error.
+// errorResponse builds a *jsonrpc.Response from a *cpierrors.Error. The
+// message is scrubbed for the same reason dispatchError scrubs — see there.
 func errorResponse(e *cpierrors.Error) *jsonrpc.Response {
 	return &jsonrpc.Response{
 		Result: nil,
 		Error: &jsonrpc.ErrorBody{
 			Type:      string(e.Type()),
-			Message:   e.Error(),
+			Message:   log.ScrubMessage(e.Error()),
 			OkToRetry: e.OkToRetry(),
 		},
 		Log: "",

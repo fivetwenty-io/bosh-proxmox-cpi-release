@@ -564,6 +564,16 @@ properties:
       connection pool before being closed. 0 (default) applies the built-in 90s
       default. Valid range when set: 1-3600 seconds.
     default: 0
+  pve.stemcell_fetch_block_private_networks:
+    description: |
+      Optional. When true, the https and bosh+blobstore stemcell fetchers
+      refuse any connection whose target resolves to a private, loopback, or
+      link-local address. The check runs on every dial, so redirect hops and
+      DNS-rebinding flips are covered. Leave false (the default) when
+      image_url points at a mirror on a private network — that is a
+      legitimate deployment shape; enable when the mirror is public and a
+      redirect chain must never re-enter the private network.
+    default: false
   pve.api_dial_timeout_sec:
     description: |
       Optional. Bounds the TCP dial step of every PVE API HTTP request.
@@ -1770,8 +1780,12 @@ properties:
       the template Notes field receives a JSON object containing the stemcell
       name, version, OS type, disk format, content hash, source, and owning
       Director, and the template is tagged with a stable bosh-stemcell tag set
-      (marker, name, version, and director tags). Provenance records assist
-      orphan detection and audit. Default false (no behavior change).
+      (marker, name, version, and director tags). The recorded source URL is
+      scrubbed before it is written: userinfo credentials and signed query
+      parameters (presigned URLs) are masked, since PVE persists Notes in the
+      cluster filesystem where it is replicated, backed up, and readable by
+      any VM.Audit holder. Provenance records assist orphan detection and
+      audit. Default false (no behavior change).
 
   pve.operator_id:
     description: |

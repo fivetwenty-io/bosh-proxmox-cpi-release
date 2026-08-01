@@ -380,6 +380,28 @@ func TestErrScrubbed_ScrubsTokenBearingURL(t *testing.T) {
 	}
 }
 
+// TestURL_ScrubsCredentialBearingValue verifies the URL field helper masks
+// userinfo and presigned query parameters while preserving host and path.
+func TestURL_ScrubsCredentialBearingValue(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	l := mustLogger(t, "debug", &buf)
+	l.Info("fetch", log.URL("image_url",
+		"https://bosh:s3cretpw@mirror.internal/img.qcow2?X-Amz-Signature=deadbeef1234&region=us"))
+
+	out := buf.String()
+	if strings.Contains(out, "s3cretpw") || strings.Contains(out, "deadbeef1234") {
+		t.Errorf("credentials leaked through log.URL: %s", out)
+	}
+	if !strings.Contains(out, "mirror.internal/img.qcow2") {
+		t.Errorf("host/path must survive log.URL scrubbing: %s", out)
+	}
+	if !strings.Contains(out, "region=us") {
+		t.Errorf("benign query param must survive log.URL scrubbing: %s", out)
+	}
+}
+
 // TestErrScrubbed_NilError returns an empty string field without panic.
 func TestErrScrubbed_NilError(t *testing.T) {
 	t.Parallel()

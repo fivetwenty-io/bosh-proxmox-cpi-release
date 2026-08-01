@@ -98,6 +98,12 @@
     config[json_key] = v unless v == 0
   end
 
+  # Emit the private-network fetch guard only when the operator enables it,
+  # mirroring the omit-when-default pattern above (false is the Go zero value).
+  if p("pve.stemcell_fetch_block_private_networks", false)
+    config["stemcell_fetch_block_private_networks"] = true
+  end
+
   # Emit PVE API transport tuning knobs only when the operator sets them.
   # When absent or 0 (the default), the key is omitted so the Go config
   # zero-value (0) reaches NewClient unchanged and the SDK transport default

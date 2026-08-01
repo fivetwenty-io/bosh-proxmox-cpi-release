@@ -30,7 +30,7 @@ var sensitiveKeyFragments = []string{
 	"access_key", // AWS secret_access_key and access_key_id
 	"apikey",
 	"api_key",
-	"authorization",
+	"auth",      // subsumes "authorization"; catches *_auth / auth_* spellings
 	"signature", // S3 X-Amz-Signature, legacy query Signature
 }
 

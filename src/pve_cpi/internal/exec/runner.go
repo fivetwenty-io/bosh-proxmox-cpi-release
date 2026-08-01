@@ -130,6 +130,15 @@ func (r *Runner) Run(ctx context.Context, path string, args []string, extraEnv m
 		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 	}
 
+	// Stdout/Stderr are bytes.Buffers, so os/exec copies them through pipes
+	// and Wait blocks until every writer of the pipe closes it. A child that
+	// leaves the process group (setsid/nohup inside the hook script) survives
+	// the group SIGKILL while holding the inherited stdout descriptor, which
+	// would block cmd.Run past the deadline indefinitely. WaitDelay abandons
+	// the pipe copy shortly after Cancel so a detached grandchild cannot
+	// wedge the CPI request the hook runs inside.
+	cmd.WaitDelay = 5 * time.Second
+
 	// Rule 5: build env from scratch; never inherit os.Environ().
 	cmd.Env = r.buildEnv(extraEnv)
 
@@ -137,7 +146,14 @@ func (r *Runner) Run(ctx context.Context, path string, args []string, extraEnv m
 	cmd.Stdout = &stdoutBuf
 	cmd.Stderr = &stderrBuf
 
-	r.debugf("exec: running %q args=%v env_keys=%v", realPath, args, r.envKeys(cmd.Env))
+	// Args are operator-configured and static, but they are a plausible place
+	// to pass a token or a credential-bearing URL — scrub each before logging,
+	// consistent with the env treatment beside it (key names only).
+	scrubbedArgs := make([]string, len(args))
+	for i, a := range args {
+		scrubbedArgs[i] = log.ScrubMessage(a)
+	}
+	r.debugf("exec: running %q args=%v env_keys=%v", realPath, scrubbedArgs, r.envKeys(cmd.Env))
 
 	runErr := cmd.Run()
 	stdoutStr := stdoutBuf.String()

@@ -1241,10 +1241,12 @@ func buildAndDeduplicateStemcellCID(
 		digestSHA256, tarbullErr = sha256FilePath(imagePath, deps.Config.StemcellStagingDir)
 		if tarbullErr != nil {
 			// Hash failure for the tarball is non-fatal for the upload path
-			// (the upload uses the extracted .img, not the tarball). But it
-			// means we cannot verify the expected digest, so warn and skip
-			// verification rather than blocking a valid stemcell upload.
-			logger.Warn("create_stemcell: cannot compute tarball sha256 for digest verification (skipping check)",
+			// itself (the upload uses the extracted .img, not the tarball).
+			// The blank digest is only acceptable when the operator did not
+			// pin an expected digest; when cloud_properties.sha256 is set,
+			// verifyExpectedDigest below fails closed on the empty value
+			// rather than skipping the requested integrity check.
+			logger.Warn("create_stemcell: cannot compute tarball sha256 for digest verification",
 				log.Err(tarbullErr),
 				log.String("tarball", imagePath),
 			)
@@ -1440,10 +1442,10 @@ func handleLightStemcellPreUploaded(
 
 // resolveFetchSource returns the source and reference for rawURL. When
 // deps.FetchResolver is non-nil (tests), it replaces the default
-// stemcellfetch.ResolveSource package function. The production path uses
-// stemcellfetch.ResolveSourceWith so operator-tunable transport timeouts
-// (jobs/pve_cpi/spec stemcell_fetch_*_timeout_sec) reach the https and
-// bosh+blobstore sources.
+// stemcellfetch.ResolveSourceWith call. The production path calls
+// stemcellfetch.ResolveSourceWith directly so operator-tunable transport
+// timeouts (jobs/pve_cpi/spec stemcell_fetch_*_timeout_sec) reach the https
+// and bosh+blobstore sources.
 func resolveFetchSource(deps Deps, rawURL string) (stemcellfetch.Source, stemcellfetch.Reference, error) {
 	if deps.FetchResolver != nil {
 		return deps.FetchResolver(rawURL)
@@ -1453,6 +1455,7 @@ func resolveFetchSource(deps Deps, rawURL string) (stemcellfetch.Source, stemcel
 		TLSHandshakeTimeout:   time.Duration(deps.Config.StemcellFetchTLSHandshakeTimeoutSec) * time.Second,
 		ResponseHeaderTimeout: time.Duration(deps.Config.StemcellFetchResponseHeaderTimeoutSec) * time.Second,
 		IdleConnTimeout:       time.Duration(deps.Config.StemcellFetchIdleConnTimeoutSec) * time.Second,
+		BlockPrivateNetworks:  deps.Config.StemcellFetchBlockPrivateNetworks,
 	}
 	return stemcellfetch.ResolveSourceWith(rawURL, tc)
 }
@@ -1493,7 +1496,7 @@ func handleLightStemcellFetch(
 	}
 	if creds.Kind() == "none" {
 		deps.Log(ctx).Warn("create_stemcell: fetching stemcell without credentials",
-			log.String("image_url", cp.ImageURL),
+			log.URL("image_url", cp.ImageURL),
 		)
 	}
 
@@ -1654,7 +1657,7 @@ func handleLightStemcellFetch(
 
 	templateCID := pve.BuildTemplateStemcellCID(fetchVMID)
 	deps.Log(ctx).Info("create_stemcell: light stemcell (fetched) template ready",
-		log.String("image_url", cp.ImageURL),
+		log.URL("image_url", cp.ImageURL),
 		log.String("source_scheme", ref.Scheme),
 		log.String("creds_kind", creds.Kind()),
 		log.String("cid", templateCID),
@@ -1921,6 +1924,13 @@ type tarCandidate struct {
 func extractTarCandidates(tr *tar.Reader, tmpDir string, cleanup func()) ([]tarCandidate, error) {
 	var candidates []tarCandidate
 	var totalExtracted int64
+	// Destinations are basename-flattened (path-traversal defense below), so
+	// two distinct entries whose basenames collide would write to one path:
+	// the second os.Create truncates the first while both candidate records
+	// keep their own size and SHA, decoupling the recorded digest from the
+	// file's actual bytes. A legitimate BOSH stemcell has no duplicate
+	// basenames, so a collision means a malformed or crafted archive.
+	seenNames := make(map[string]struct{})
 	for {
 		hdr, terr := tr.Next()
 		if errors.Is(terr, io.EOF) {
@@ -1962,6 +1972,12 @@ func extractTarCandidates(tr *tar.Reader, tmpDir string, cleanup func()) ([]tarC
 				"create_stemcell: tarball entries exceed maximum %dGB; refusing to extract",
 				MaxStemcellTotalExtract/(1024*1024*1024))
 		}
+		if _, dup := seenNames[name]; dup {
+			cleanup()
+			return nil, cpierrors.StemcellInvalidTar(
+				"create_stemcell: tarball contains duplicate entry basename %q; refusing crafted or malformed archive", name)
+		}
+		seenNames[name] = struct{}{}
 		dst := filepath.Join(tmpDir, name)
 		entrySHA, _, writeErr := writeTarEntry(hdr, tr, dst)
 		if writeErr != nil {
@@ -2344,12 +2360,15 @@ func verifyExpectedDigest(
 	// SHA-256 check.
 	if cp.ExpectedSHA256 != "" {
 		if sha256hex == "" {
-			// Cannot verify because we have no computed hash. Treat as unverified
-			// (caller already warned) — same as no-digest path.
-			logger.Warn("create_stemcell: cannot verify sha256: computed hash unavailable",
-				log.String("expected_sha256", cp.ExpectedSHA256),
-			)
-			return nil
+			// Fail closed: the operator explicitly requested integrity
+			// verification, so an unavailable hash must block the upload
+			// rather than silently skip the check — a read error on the
+			// staging file would otherwise turn the integrity gate into a
+			// no-op with only a Warn nobody watches. Retriable because the
+			// underlying cause (transient I/O) usually clears.
+			return cpierrors.Retriable(
+				"create_stemcell: cloud_properties.sha256 is set (%s) but the actual digest could not be computed; refusing to upload unverified image",
+				strings.ToLower(cp.ExpectedSHA256))
 		}
 		if !strings.EqualFold(sha256hex, cp.ExpectedSHA256) {
 			msg := fmt.Sprintf(
@@ -2371,11 +2390,10 @@ func verifyExpectedDigest(
 	if cp.ExpectedSHA1 != "" {
 		actual, hashErr := sha1FilePath(resolvedPath, stagingDir)
 		if hashErr != nil {
-			// Hash computation failure: warn and skip (cannot block upload on it).
-			logger.Warn("create_stemcell: cannot compute sha1 for expected-digest check",
-				log.Err(hashErr),
-			)
-			return nil
+			// Fail closed, same rationale as the SHA-256 branch above.
+			return cpierrors.Retriable(
+				"create_stemcell: cloud_properties.sha1 is set but the actual digest could not be computed (%s); refusing to upload unverified image",
+				hashErr.Error())
 		}
 		if !strings.EqualFold(actual, cp.ExpectedSHA1) {
 			msg := fmt.Sprintf(

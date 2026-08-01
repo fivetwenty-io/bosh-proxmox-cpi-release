@@ -4,6 +4,8 @@ import (
 	"net"
 	"net/http"
 	"time"
+
+	"github.com/fivetwenty-io/bosh-pve-cpi/internal/netguard"
 )
 
 // TransportConfig bounds the network steps of every stemcell-fetch HTTP request
@@ -30,6 +32,15 @@ type TransportConfig struct {
 	// IdleConnTimeout bounds how long an idle keep-alive connection lives in
 	// the connection pool before being closed.
 	IdleConnTimeout time.Duration
+
+	// BlockPrivateNetworks, when true, rejects any fetch connection whose
+	// target resolves to a private/loopback/link-local address, re-checked on
+	// every dial (netguard.DialGuard), which also covers redirect targets and
+	// DNS rebinding. Off by default: image_url is operator-supplied, and
+	// private mirrors on RFC1918 space are a legitimate deployment shape —
+	// enable via pve.stemcell.fetch_block_private_networks when the mirror is
+	// public and redirect chains should never re-enter the private network.
+	BlockPrivateNetworks bool
 }
 
 // DefaultTransportConfig returns the production defaults: 30s dial, 15s TLS
@@ -72,6 +83,13 @@ func (tc TransportConfig) applyTransport(base *http.Transport) *http.Transport {
 	tc = tc.WithDefaults()
 	dialer := &net.Dialer{Timeout: tc.DialTimeout}
 	base.DialContext = dialer.DialContext
+	if tc.BlockPrivateNetworks {
+		base.DialContext = netguard.DialGuard{
+			Base:      dialer,
+			ErrPrefix: "stemcell_fetch",
+			Hint:      "unset pve.stemcell.fetch_block_private_networks to allow private-network mirrors",
+		}.DialContext()
+	}
 	base.TLSHandshakeTimeout = tc.TLSHandshakeTimeout
 	base.ResponseHeaderTimeout = tc.ResponseHeaderTimeout
 	base.IdleConnTimeout = tc.IdleConnTimeout

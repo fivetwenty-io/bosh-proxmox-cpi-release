@@ -98,12 +98,25 @@ func (h *ExternalCommandHook) After(ctx context.Context, method string, result a
 	out, runErr := h.runner.Run(ctx, h.command, h.args, extraEnv)
 	if runErr != nil {
 		h.logger.Warn("external_command: invocation failed (non-fatal)",
-			log.String("method", method), log.String("command", h.command), log.Err(runErr))
+			log.String("method", method), log.String("command", h.command), log.ErrScrubbed(runErr))
 		return result, err
 	}
+	// Site scripts routinely echo API responses and request URLs, which can
+	// carry IPAM/LB tokens — scrub and bound the output before it reaches the
+	// log (512 bytes matches the runner's own stderr-tail convention).
 	h.logger.Info("external_command: ran",
-		log.String("method", method), log.String("command", h.command), log.String("stdout", out))
+		log.String("method", method), log.String("command", h.command),
+		log.String("stdout", log.ScrubMessage(headBytes(out, 512))))
 	return result, err
+}
+
+// headBytes returns at most n leading bytes of s, appending a truncation
+// marker when s was longer.
+func headBytes(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "...[truncated]"
 }
 
 // ecVMID derives the VM CID from the create_vm result or the delete_vm context.

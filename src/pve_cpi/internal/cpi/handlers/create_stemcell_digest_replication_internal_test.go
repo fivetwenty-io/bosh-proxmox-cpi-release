@@ -80,6 +80,47 @@ func TestVerifyExpectedDigest_SHA256Match(t *testing.T) {
 	}
 }
 
+// TestVerifyExpectedDigest_SHA256UnavailableFailsClosed verifies the check
+// fails closed (retriable) when the operator pinned an expected sha256 but the
+// actual digest could not be computed — a read error must not silently turn
+// the requested integrity gate into a no-op.
+func TestVerifyExpectedDigest_SHA256UnavailableFailsClosed(t *testing.T) {
+	t.Parallel()
+	logger, _ := log.NewLogger("debug", io.Discard)
+	cp := stemcellCloudProps{ExpectedSHA256: strings.Repeat("a", 64)}
+	err := verifyExpectedDigest(context.Background(), logger, cp, "", "", "", stemcellSourceLocal)
+	if err == nil {
+		t.Fatal("expected fail-closed error when sha256 is pinned but unavailable, got nil")
+	}
+	var cpiErr *cpierrors.Error
+	if !asError(err, &cpiErr) {
+		t.Fatalf("expected *cpierrors.Error, got %T: %v", err, err)
+	}
+	if !cpiErr.OkToRetry() {
+		t.Errorf("expected retriable error (transient I/O is the usual cause), got non-retriable")
+	}
+}
+
+// TestVerifyExpectedDigest_SHA1UnavailableFailsClosed mirrors the sha256
+// fail-closed case for the sha1 branch: an unreadable file must block the
+// upload when a digest was pinned.
+func TestVerifyExpectedDigest_SHA1UnavailableFailsClosed(t *testing.T) {
+	t.Parallel()
+	logger, _ := log.NewLogger("debug", io.Discard)
+	cp := stemcellCloudProps{ExpectedSHA1: strings.Repeat("a", 40)}
+	err := verifyExpectedDigest(context.Background(), logger, cp, "", "/nonexistent/definitely-missing.img", "", stemcellSourceLocal)
+	if err == nil {
+		t.Fatal("expected fail-closed error when sha1 is pinned but uncomputable, got nil")
+	}
+	var cpiErr *cpierrors.Error
+	if !asError(err, &cpiErr) {
+		t.Fatalf("expected *cpierrors.Error, got %T: %v", err, err)
+	}
+	if !cpiErr.OkToRetry() {
+		t.Errorf("expected retriable error, got non-retriable")
+	}
+}
+
 // TestVerifyExpectedDigest_SHA256Mismatch_Local checks non-retriable on local tarball mismatch.
 func TestVerifyExpectedDigest_SHA256Mismatch_Local(t *testing.T) {
 	t.Parallel()
