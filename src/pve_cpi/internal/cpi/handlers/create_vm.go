@@ -4724,7 +4724,7 @@ func configureAgent(
 	ephemeralDevPath string,
 ) error {
 	// noagent: nothing to configure.
-	if deps.Config.AgentMode == "noagent" {
+	if deps.Config.AgentMode == config.AgentModeNoAgent {
 		return nil
 	}
 

@@ -1908,7 +1908,7 @@ func (c *CPIConfig) ApplyDefaults() {
 		c.CloneMode = CloneModeAuto
 	}
 	if c.NetworkMode == "" {
-		c.NetworkMode = "sdn"
+		c.NetworkMode = NetworkModeSDN
 	}
 	if c.SDNZoneType == "" {
 		c.SDNZoneType = "vxlan"
@@ -3526,7 +3526,7 @@ func (c *CPIConfig) validateSDNFields(errs *[]string) {
 		// reachable (mode sdn/auto), mirroring the zone-type enum validation:
 		// under network_mode bridge, sdn_zone_type is inert and stale SDN
 		// fields left over from a migrated config must not reject the load.
-		sdnReachable := c.NetworkMode == "sdn" || c.NetworkMode == "auto"
+		sdnReachable := c.NetworkMode == NetworkModeSDN || c.NetworkMode == NetworkModeAuto
 		if sdnReachable && sdnZoneTypeIsVLANCapped(c.SDNZoneType) && c.SDNVNIRangeEnd > 4094 {
 			*errs = append(*errs, fmt.Sprintf(
 				"sdn_vni_range %d..%d exceeds the 4094 VLAN ID cap for sdn_zone_type %q",
@@ -4466,7 +4466,7 @@ func (c *CPIConfig) strictCheckUseHaRules(errs *[]string) {
 // sdn_zone nor sdn_auto_manage_zone satisfies the zone requirement.
 // network_mode=auto is exempt because auto falls back to bridge when no zone.
 func (c *CPIConfig) strictCheckSDNZone(errs *[]string) {
-	if c.NetworkMode != "sdn" {
+	if c.NetworkMode != NetworkModeSDN {
 		return
 	}
 	if c.SDNZone != "" || c.SDNAutoManageZoneEnabled() {
