@@ -39,7 +39,8 @@ import (
 //
 // Shrink is not supported: PVE does not support disk shrink via the resize API.
 // Attempting to shrink returns a NotSupported error.
-// nolint:gocognit // Multi-phase orchestration not yet decomposed; flagged for follow-up extraction (see .golangci.yml comment). Behaviour-preserving refactor scope-deferred.
+//
+//nolint:gocognit // Multi-phase orchestration not yet decomposed; flagged for follow-up extraction (see .golangci.yml comment). Behaviour-preserving refactor scope-deferred.
 func HandleResizeDisk(deps Deps) Handler {
 	return HandlerFunc(func(ctx context.Context, args []json.RawMessage, reqCtx jsonrpc.Context) (any, error) {
 		deps, err := deps.WithRequestOverrides(ctx, reqCtx)

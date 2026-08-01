@@ -251,7 +251,8 @@ func createDiskAttemptBudgets(deps Deps) (maxAttempts, lockAttempts int) {
 // shared storage (e.g. ceph-rbd, NFS) is cluster-visible; local storage
 // requires the disk and its VM to reside on the same node. Operators using
 // local storage must ensure vm_cid and the new disk share the same node.
-// nolint:gocognit // Orchestration shell: parse args, attemptCreateVolume retry loop, deferred rollbackCreatedVolume. The retry+rollback wiring lives in extracted helpers; the closure carries the orchestration glue.
+//
+//nolint:gocognit // Orchestration shell: parse args, attemptCreateVolume retry loop, deferred rollbackCreatedVolume. The retry+rollback wiring lives in extracted helpers; the closure carries the orchestration glue.
 func HandleCreateDisk(deps Deps) Handler {
 	return HandlerFunc(func(ctx context.Context, args []json.RawMessage, reqCtx jsonrpc.Context) (any, error) {
 		deps, err := deps.WithRequestOverrides(ctx, reqCtx)

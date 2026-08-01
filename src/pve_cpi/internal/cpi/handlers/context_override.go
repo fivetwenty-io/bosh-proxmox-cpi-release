@@ -299,15 +299,13 @@ func (r *RequestOverrideRuntime) buildBundle(ctx context.Context, cfg *config.CP
 		return nil, fmt.Errorf("build PVE client: %w", err)
 	}
 
-	// Mirror main.go's agent_mode="auto" normalization for the primary boot
-	// agent (see cmd/cpi/main.go's cfgForBoot) and its ISOStorage resolution
-	// (agent.ResolveISOStorage), so an overridden request's agent behaves
-	// identically to the job-level one, modulo the overridden connection/
-	// storage/node identity itself.
+	// Mirror main.go's boot-agent construction (see cmd/cpi/main.go's
+	// cfgForBoot) and its ISOStorage resolution (agent.ResolveISOStorage), so
+	// an overridden request's agent behaves identically to the job-level one,
+	// modulo the overridden connection/storage/node identity itself. Both
+	// paths take the normalized mode from config.BootAgentMode.
 	cfgForBoot := *cfg
-	if cfgForBoot.AgentMode == "auto" {
-		cfgForBoot.AgentMode = "cloudinit"
-	}
+	cfgForBoot.AgentMode = cfg.BootAgentMode()
 	cfgForBoot.ISOStorage = agent.ResolveISOStorage(ctx, &cfgForBoot, client, logger)
 
 	bootAgent, err := agent.NewAgent(&cfgForBoot, client, logger)
@@ -337,17 +335,18 @@ func (r *RequestOverrideRuntime) buildBundle(ctx context.Context, cfg *config.CP
 // caller logs cache diagnostics.
 func requestOverrideCacheKey(cfg *config.CPIConfig) string {
 	h := sha256.New()
-	fmt.Fprintf(h, "host=%s\x00port=%d\x00user=%s\x00realm=%s\x00node=%s\x00",
+	// hash.Hash.Write never returns an error, so the Fprintf results are discarded.
+	_, _ = fmt.Fprintf(h, "host=%s\x00port=%d\x00user=%s\x00realm=%s\x00node=%s\x00",
 		cfg.Host, cfg.Port, cfg.User, cfg.Realm, cfg.Node)
-	fmt.Fprintf(h, "vm_storage=%s\x00disk_storage=%s\x00stemcell_storage=%s\x00iso_storage=%s\x00",
+	_, _ = fmt.Fprintf(h, "vm_storage=%s\x00disk_storage=%s\x00stemcell_storage=%s\x00iso_storage=%s\x00",
 		cfg.VMStorage, cfg.DiskStorage, cfg.StemcellStorage, cfg.ISOStorage)
-	fmt.Fprintf(h, "bridge=%s\x00verify_ssl=%t\x00vmid_start=%d\x00vmid_end=%d\x00",
+	_, _ = fmt.Fprintf(h, "bridge=%s\x00verify_ssl=%t\x00vmid_start=%d\x00vmid_end=%d\x00",
 		cfg.NetworkBridge, cfg.VerifySSLValue(), cfg.VMIDRangeStart, cfg.VMIDRangeEnd)
-	fmt.Fprintf(h, "agent_mode=%s\x00vm_disk_format=%s\x00agent_mbus=%s\x00",
+	_, _ = fmt.Fprintf(h, "agent_mode=%s\x00vm_disk_format=%s\x00agent_mbus=%s\x00",
 		cfg.AgentMode, cfg.VMDiskFormat, cfg.AgentMBus)
 	pwHash := sha256.Sum256([]byte(cfg.Password))
 	tokHash := sha256.Sum256([]byte(cfg.APIToken))
-	fmt.Fprintf(h, "password_sha=%s\x00api_token_sha=%s",
+	_, _ = fmt.Fprintf(h, "password_sha=%s\x00api_token_sha=%s",
 		hex.EncodeToString(pwHash[:]), hex.EncodeToString(tokHash[:]))
 	return hex.EncodeToString(h.Sum(nil))
 }

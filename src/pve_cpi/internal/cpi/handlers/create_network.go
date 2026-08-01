@@ -22,18 +22,13 @@ import (
 	sdknodes "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/nodes"
 )
 
-// networkModeBridge is the config.NetworkMode value that forces the bridge path.
-// Defined as a constant because the literal "bridge" appears in both the mode
-// switch and as a PVE node API Type string; keeping them named avoids the goconst
-// threshold while making the distinct semantics explicit.
-const networkModeBridge = "bridge"
-
-// networkModeSDN is the config.NetworkMode value that forces (or, for "auto",
-// participates in resolving) the SDN path. Defined as a constant alongside
-// networkModeBridge for the same reason: the literal "sdn" recurs across the
-// mode switch and SDN-capability checks (e.g. sdnVnetNameSet in create_vm.go)
-// often enough to cross the goconst threshold.
-const networkModeSDN = "sdn"
+// networkModeBridge and networkModeSDN alias the config-owned enum values so
+// handler code keeps its short local names while internal/config remains the
+// single owner of the literals (see config.NetworkModeBridge/NetworkModeSDN).
+const (
+	networkModeBridge = config.NetworkModeBridge
+	networkModeSDN    = config.NetworkModeSDN
+)
 
 // defaultSDNZoneName is the turnkey zone the CPI creates when the SDN path is
 // active, sdn_auto_manage_zone is enabled, and neither cloud_properties.zone
@@ -545,7 +540,8 @@ func applyWithRollback(
 // staged PVE state. Original-call errors are wrapped through pve.WrapError so
 // transient classes (5xx, ConnectionError, TimeoutError, storage lock) keep
 // their Retriable type all the way back to the BOSH director.
-// nolint:gocognit // Orchestration shell for 4 sequential SDN phases (zone, vnet, subnet, apply) with rollback chain; cognitive floor is set by the phase count, not by local complexity. Phase logic lives in resolveOrCreateSDNZone, createVnetIdempotent, createSubnetIdempotent, applyWithRollback.
+//
+//nolint:gocognit // Orchestration shell for 4 sequential SDN phases (zone, vnet, subnet, apply) with rollback chain; cognitive floor is set by the phase count, not by local complexity. Phase logic lives in resolveOrCreateSDNZone, createVnetIdempotent, createSubnetIdempotent, applyWithRollback.
 func createNetworkSDN(
 	ctx context.Context,
 	deps Deps,

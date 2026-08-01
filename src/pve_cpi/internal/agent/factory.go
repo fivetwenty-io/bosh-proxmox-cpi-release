@@ -34,7 +34,7 @@ func NewAgent(cfg *config.CPIConfig, pveClient pve.Client, logger *log.Logger) (
 	}
 
 	switch cfg.AgentMode {
-	case "cloudinit":
+	case config.AgentModeCloudInit:
 		if pveClient == nil {
 			return nil, cpierrors.Cloud("agent.NewAgent: pveClient required for cloudinit mode")
 		}
@@ -53,7 +53,7 @@ func NewAgent(cfg *config.CPIConfig, pveClient pve.Client, logger *log.Logger) (
 		}
 		return NewConfigDrive(pveClient, isoStorage, logger), nil
 
-	case "noagent":
+	case config.AgentModeNoAgent:
 		if cfg.ISOStorage != "" {
 			logger.Warn("agent.NewAgent: agent_mode=noagent ignores iso_storage",
 				log.String("iso_storage", cfg.ISOStorage))
@@ -112,7 +112,7 @@ func ResolveISOStorage(ctx context.Context, cfg *config.CPIConfig, pveClient pve
 	if !cfg.ISOStorageFollowVMStorageEnabled() {
 		return fallback
 	}
-	if cfg.AgentMode != "cloudinit" && cfg.AgentMode != "auto" {
+	if cfg.AgentMode != config.AgentModeCloudInit && cfg.AgentMode != config.AgentModeAuto {
 		return fallback
 	}
 	if fallback != isoStorageSpecDefault {

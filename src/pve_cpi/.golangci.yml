@@ -5,13 +5,20 @@
 # handler phase-helper extraction wave (HandleCreateVM, HandleCreateNetwork,
 # HandleDeleteVM, HandleCreateDisk, HandleCreateStemcell, HandleRebootVM,
 # HandleAttachDisk, HandleDetachDisk, HandleCalculateVMCloudProperties, and
-# config.ValidateWithLogger all decomposed). The next reduction target is 30;
-# residual functions over 40 are the orchestration shells whose phase count
-# (5-8 sequential PVE API steps with rollback) puts a floor on cognitive load:
-#   - createNetworkSDN (zone+vnet+subnet+apply with rollback chain): ~63
-#   - HandleCreateDisk closure (parse+attempt+rollback orchestration): ~48
-#   - HandleResizeDisk (not yet refactored): ~45
-#   - HandleCreateStemcell closure (light-vs-heavy dispatch): ~42
+# config.ValidateWithLogger all decomposed). The next reduction target is 30.
+#
+# Residual production functions over gocognit 40, measured with standalone
+# gocognit (`gocognit -over 40 cmd internal`; golangci-lint embeds its own
+# copy, numbers can drift slightly between versions). Regenerate this table
+# whenever the threshold moves:
+#   - HandleCreateStemcell closure (light-vs-heavy dispatch): 118 (gocyclo 48)
+#   - resolveTargetNodeWithFallbacks (multi-AZ placement loop): 86
+#   - HandleCreateDisk closure (parse+attempt+rollback orchestration): 80
+#   - createNetworkSDN (zone+vnet+subnet+apply with rollback chain): 61
+#   - HandleResizeDisk (not yet refactored): 53
+#   - createVMWithFallback (alternate-node retry ladder): 52
+#   - HandleUpdateDisk (sequential option-merge phases): 43
+#   - probeGuestAgentIPConflict / detectIPConflict (probe fan-outs): 41 each
 # TestResolveSource (~62) is a table-driven test; lint flags it but no
 # behaviour change is warranted.
 

@@ -1387,8 +1387,6 @@ func resolveVMShapeWithAlternates(
 //
 // rng is injected for deterministic shuffle in tests; pass nil for production
 // (a fresh rand source is created from the current time).
-//
-//nolint:gocognit // Multi-AZ loop + maintenance + retryability; inherent complexity.
 func resolveTargetNode(ctx context.Context, deps Deps, cp createVMCloudProps, groupTag string, diskCIDs []string, cloudPropsMap map[string]any) (string, error) {
 	return resolveTargetNodeWithRNG(ctx, deps, cp, groupTag, diskCIDs, nil, cloudPropsMap)
 }
@@ -3765,7 +3763,7 @@ func resolveCloneFullFlag(
 	linkedOK := pve.IsLinkedCloneSupported(shape.vmStorageType)
 
 	switch mode {
-	case "linked":
+	case config.CloneModeLinked:
 		switch {
 		case storageMismatch:
 			return nil, cpierrors.Cloud(
@@ -3801,7 +3799,7 @@ func resolveCloneFullFlag(
 		}
 		// nil → linked clone.
 		return nil, nil
-	case "full":
+	case config.CloneModeFull:
 		t := true
 		return &t, nil
 	default: // "auto"
@@ -4722,7 +4720,7 @@ func resolveCloneMode(cfg *config.CPIConfig, cpMap map[string]any) (string, erro
 	}
 	mode := cfg.CloneMode
 	if mode == "" {
-		mode = "auto"
+		mode = config.CloneModeAuto
 	}
 	return mode, nil
 }
@@ -4871,7 +4869,7 @@ func configureNICs(
 // in an SDN-capable mode ("sdn"/"auto") and the VM has NICs.
 func sdnVnetNameSet(ctx context.Context, deps Deps, logger *log.Logger, nicCount int) map[string]struct{} {
 	mode := deps.Config.NetworkMode
-	if nicCount == 0 || (mode != networkModeSDN && mode != "auto") {
+	if nicCount == 0 || (mode != networkModeSDN && mode != config.NetworkModeAuto) {
 		return nil
 	}
 	vnets, err := pve.ListSDNVnets(ctx, deps.PVE)

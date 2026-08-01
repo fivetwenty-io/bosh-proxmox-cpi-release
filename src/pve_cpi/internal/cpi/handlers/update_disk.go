@@ -52,7 +52,8 @@ import (
 //  8. Return nil.
 //
 // Empty update_spec (all absent or zero-value fields): returns nil (no-op).
-// nolint:gocognit // Orchestration shell: parse args, locate VM, resolve diskID, merge options, resize, PUT config. Sequential phases with per-step error handling; cognitive floor set by the step count.
+//
+//nolint:gocognit // Orchestration shell: parse args, locate VM, resolve diskID, merge options, resize, PUT config. Sequential phases with per-step error handling; cognitive floor set by the step count.
 func HandleUpdateDisk(deps Deps) Handler {
 	return HandlerFunc(func(ctx context.Context, args []json.RawMessage, reqCtx jsonrpc.Context) (any, error) {
 		deps, err := deps.WithRequestOverrides(ctx, reqCtx)

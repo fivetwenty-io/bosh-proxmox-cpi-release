@@ -240,7 +240,7 @@ func run() int {
 // and client-init path testable without spawning a subprocess or manipulating
 // os.Args.
 //
-// opts.ClientFactory overrides pve.NewClient when non-nil. The zero value of
+// opts.ClientFactory overrides pve.NewClientWithTracer when non-nil. The zero value of
 // runOptions selects production defaults, so production callers pass runOptions{}.
 //
 // Returning an int rather than calling os.Exit directly ensures that all
@@ -370,13 +370,11 @@ func runWithArgs(args []string, stdin io.Reader, stdout, stderr io.Writer, opts 
 	cfg.ISOStorage = agent.ResolveISOStorage(rootCtx, cfg, client, logger)
 
 	// When agent_mode="auto", the primary boot agent is always configdrive.
-	// Pass a synthetic cfg copy with AgentMode="cloudinit" so factory.go's
+	// Pass a synthetic cfg copy with the normalized boot mode so factory.go's
 	// default-error branch stays accurate and iso/stemcell storage resolves
 	// normally. All other modes pass cfg unchanged.
 	cfgForBoot := *cfg
-	if cfgForBoot.AgentMode == "auto" {
-		cfgForBoot.AgentMode = "cloudinit"
-	}
+	cfgForBoot.AgentMode = cfg.BootAgentMode()
 	bootAgent, err := agent.NewAgent(&cfgForBoot, client, logger)
 	if err != nil {
 		logger.Error("agent init failed", log.Err(err))

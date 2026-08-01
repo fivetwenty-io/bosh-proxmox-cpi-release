@@ -326,31 +326,15 @@ func fastPathDeleteVM(ctx context.Context, deps Deps, node, vmCID string, vmid i
 //
 // Returns nil result on success (including when the VM was already absent).
 //
-//nolint:gocognit // Orchestration shell: locate+stop+guard+delete+await+agent-cleanup. Steps are individually simple; combined complexity is inherent to the idempotent delete contract.
 func HandleDeleteVM(deps Deps) cpi.Handler {
 	return cpi.HandlerFunc(func(ctx context.Context, args []json.RawMessage, reqCtx jsonrpc.Context) (any, error) {
 		deps, err := deps.WithRequestOverrides(ctx, reqCtx)
 		if err != nil {
 			return nil, err
 		}
-		// --- argument extraction ---
-		if len(args) < 1 {
-			return nil, cpierrors.Cloud("delete_vm: missing required argument vm_cid")
-		}
-		var vmCID string
-		if err := json.Unmarshal(args[0], &vmCID); err != nil {
-			return nil, cpierrors.Cloud("delete_vm: vm_cid must be a string: %s", err.Error())
-		}
-		if vmCID == "" {
-			return nil, cpierrors.Cloud("delete_vm: vm_cid must not be empty")
-		}
-
-		vmid, err := strconv.Atoi(vmCID)
+		vmCID, vmid, err := parseDeleteVMArgs(args)
 		if err != nil {
-			return nil, cpierrors.Cloud("delete_vm: vm_cid %q is not a valid integer VMID: %s", vmCID, err.Error())
-		}
-		if vmid <= 0 {
-			return nil, cpierrors.Cloud("delete_vm: vm_cid %q must be a positive integer", vmCID)
+			return nil, err
 		}
 
 		logger := deps.Log(ctx).With(log.String("vm_cid", vmCID), log.Int("vmid", vmid))
@@ -376,40 +360,10 @@ func HandleDeleteVM(deps Deps) cpi.Handler {
 		logger.Debug("delete_vm: VM located", log.String("node", node))
 
 		// --- parker VM refusal (belt-and-braces PVE-level backstop) ---
-		// The Director should never hand a parker CID to delete_vm (parkers are
-		// internal CPI state). This guard catches misconfiguration or operator
-		// error. Classification is presence-based: range check first (zero extra
-		// API calls when not in range), then one config read to confirm the
-		// bosh-parker tag only when the VMID falls in the configured range.
-		// When the parker range is not configured (ParkedStrategyActive=false),
-		// IsParkerVM returns false with zero API calls — byte-identical behavior.
-		if deps.Config != nil && deps.Config.ParkedStrategyActive() {
-			parkerCfg := pve.ParkerConfig{
-				VMIDRangeStart: deps.Config.ParkedDiskVMIDRangeStartValue(),
-				VMIDRangeEnd:   deps.Config.ParkedDiskVMIDRangeEndValue(),
-				DirectorID:     deps.Config.StemcellDirectorID(),
-			}
-			// Range-first: only read the VM config when vmid is in the parker band.
-			if vmid >= parkerCfg.VMIDRangeStart && vmid <= parkerCfg.VMIDRangeEnd {
-				// Fail-closed: a transient config read error on an in-band VMID must
-				// NOT proceed. The fast path uses skiplock=true + purge=true, which
-				// bypasses protection=1 and destroys all parked disks. Any doubt →
-				// retriable so the Director retries when PVE recovers.
-				vmCfg, cfgErr := deps.PVE.QEMU().Config(ctx, node, vmid)
-				if cfgErr != nil {
-					if pve.IsNotFound(cfgErr) {
-						// VM gone during the read — treat as already deleted.
-						return nil, nil
-					}
-					return nil, cpierrors.Retriable(
-						"delete_vm: could not read config for in-band VMID %d to verify parker status: %s (retry when PVE recovers)",
-						vmid, cfgErr.Error())
-				}
-				tagsRaw, _ := vmCfg[jsonKeyTags].(string)
-				if pve.IsParkerVM(vmid, tagsRaw, parkerCfg) {
-					return nil, cpierrors.Cloud("refusing to delete parker VM %d", vmid)
-				}
-			}
+		if alreadyGone, parkerErr := refuseIfParkerVM(ctx, deps, node, vmid); parkerErr != nil {
+			return nil, parkerErr
+		} else if alreadyGone {
+			return nil, nil
 		}
 
 		// --- per-node in-flight gate (opt-in; limit=0 → unlimited, no gating) ---
@@ -455,40 +409,8 @@ func HandleDeleteVM(deps Deps) cpi.Handler {
 			return nil, nil
 		}
 
-		// --- HA anti-affinity / DLB cleanup (opt-in: anti_affinity.use_ha_rules or placement.dlb) ---
-		// Remove the VM from any CPI-managed negative-affinity rule and
-		// deregister its HA resource BEFORE stopping it. Order matters: while a
-		// VM is HA-managed, a status/stop call is redirected to a CRM request
-		// whose task completes when the request is accepted — not when the VM
-		// actually halts — so a stop-then-deregister sequence races the LRM and
-		// the subsequent destroy fails with "VM is running". Deregistering
-		// first restores plain qmstop semantics for the stop below. Also covers
-		// DLB-only VMs: removeAntiAffinityMembership purges the HA resource and
-		// prunes any associated rules; for a DLB-only VM with no affinity rule
-		// it simply deregisters the HA resource. Keyed on vmid (the group name
-		// is unavailable at delete time). Best-effort: HA failures are logged
-		// and never block VM deletion.
-		if deps.Config.AntiAffinityUseHaRulesEnabled() || deps.Config.DLBConfigured() {
-			if aaErr := removeAntiAffinityMembership(ctx, deps, vmid, logger); aaErr != nil {
-				logger.Warn("delete_vm: HA anti-affinity/DLB cleanup incomplete (non-fatal)", log.Err(aaErr))
-			}
-		}
-
-		// --- HA node-affinity pin cleanup ---
-		// Remove the per-VM node-affinity pin rule (bosh-na-<vmid>) and deregister
-		// its HA resource. Keyed on vmid; idempotent and best-effort. Safe
-		// alongside the anti-affinity cleanup above (both tolerate a not-found HA
-		// resource). Runs before the stop for the same CRM-interference reason.
-		//
-		// Unconditional because two writers create this rule: the AZ pin (gated by
-		// placement.pin_az_via_ha_rules) and the PCI strict pin (applied whenever
-		// pci_passthroughs is set, regardless of that flag). delete_vm has no
-		// cloud_properties, so it cannot know which writer ran; removing
-		// unconditionally guarantees no orphan rule survives the VM. For a VM that
-		// never had a pin this is two cheap not-found no-ops.
-		if pinErr := removeNodeAffinityPin(ctx, deps, vmid, logger); pinErr != nil {
-			logger.Warn("delete_vm: HA node-affinity pin cleanup incomplete (non-fatal)", log.Err(pinErr))
-		}
+		// --- HA anti-affinity / DLB / node-affinity pin cleanup (best-effort) ---
+		cleanupHAMembership(ctx, deps, vmid, logger)
 
 		// --- stop VM (synchronous path) ---
 		if stopDone, stopErr := stopVMBeforeDelete(ctx, deps, node, vmid, vmCID, logger); stopErr != nil {
@@ -526,86 +448,15 @@ func HandleDeleteVM(deps Deps) cpi.Handler {
 		// here, before the destroy call below.
 		reapPool := capturePoolForReap(ctx, deps, vmid, logger)
 
-		// --- delete VM (synchronous path) ---
-		// Purge removes VMID from backup/HA/replication configs (per PVE's own
-		// API description). Resource-pool membership (pve.vm_pool,
-		// stemcell_template_pool) is not explicitly documented as part of what
-		// purge cleans up — the delete endpoint's own description separately
-		// says it "Removes any VM specific permissions [ACLs] and firewall
-		// rules", which is a related but distinct PVE construct from pool
-		// membership. A stale pool-membership entry for a deleted VMID (if PVE
-		// leaves one) carries no capability risk — there is no VM behind that
-		// VMID to act on — but this is not verified against a live cluster;
-		// do not depend on the pool member list shrinking immediately after
-		// delete_vm without checking your PVE version.
-		// DestroyUnreferencedDisks: false on the retain path (ephemeral disk is now
-		// unreferenced + own-VMID — true would destroy it); true otherwise (byte-identical
-		// to prior behaviour). See detachRetainedEphemeralDisk for the full rationale.
-		//
-		// DestroyUnreferencedDisks=true triggers pvesm free under the per-storage lockfile
-		// for every attached volume, so on bursty deploys this can surface
-		// "can't lock file ... got timeout". Retry on that signal; everything else
-		// propagates immediately.
-		purge := true
-		destroyDisks := !retained
-		logger.Debug("delete_vm: deleting VM")
-		var deleteResp *sdknodes.DeleteQemuResponse
-		attemptDestroy := func() error {
-			return pve.RetryOnTransientOrLock(ctx, logger, "delete_vm", 0, func() error {
-				var innerErr error
-				deleteResp, innerErr = deps.PVE.Nodes().DeleteQemu(ctx, node, vmCID, &sdknodes.DeleteQemuParams{
-					Purge:                    &purge,
-					DestroyUnreferencedDisks: &destroyDisks,
-				})
-				return innerErr
-			})
-		}
-		deleteErr := attemptDestroy()
-		// PVE refuses to destroy a running VM ("VM <id> is running - destroy
-		// failed") and skiplock does not help. The stop above completed its
-		// task, but a stop accepted while the VM was still HA-managed (the CRM
-		// files the request and the task ends before the LRM halts the guest)
-		// can leave the VM briefly running. Wait until it actually reports
-		// stopped, then destroy once more. Observed live on a DLB-registered
-		// compilation VM.
-		if deleteErr != nil && pve.IsVMRunningDestroyFailure(deleteErr) {
-			logger.Info("delete_vm: VM still running after stop task — waiting for it to halt before destroy retry")
-			if waitErr := waitForVMStopped(ctx, deps, node, vmid, vmCID, logger); waitErr != nil {
-				return nil, waitErr
-			}
-			deleteErr = attemptDestroy()
-		}
-		// A killed worker or node reboot mid-clone/mid-create can leave the
-		// guest config carrying an in-flight lock (lock: clone|create|...),
-		// which PVE rejects the destroy against — without this, the Director
-		// would retry delete_vm forever against a VM that can never come
-		// unstuck on its own. Retry once with skiplock=true when the CPI is
-		// authenticated as root@pam (the only identity PVE honors skiplock
-		// for); when it is not, retryDestroyWithSkiplock returns deleteErr
-		// unretried and the IsVMConfigLocked branch below still fires.
-		if deleteErr != nil && pve.IsVMConfigLocked(deleteErr) {
-			deleteResp, deleteErr = retryDestroyWithSkiplock(ctx, deps, node, vmCID, vmid, purge, destroyDisks, deleteErr, logger)
-		}
+		// --- delete VM (synchronous path; see destroyVMWithRecovery for the
+		//     purge/DestroyUnreferencedDisks semantics and recovery ladder) ---
+		deleteResp, alreadyGone, deleteErr := destroyVMWithRecovery(ctx, deps, node, vmCID, vmid, retained, logger)
 		if deleteErr != nil {
-			if pve.IsNotFound(deleteErr) {
-				logger.Info("delete_vm: VM not found during delete -- already deleted, returning success")
-				// Still call agent.Remove so registry/cloud-init state is cleaned up
-				// if it exists; errors here are logged but not fatal.
-				if agentErr := deps.Agent.Remove(ctx, node, vmid); agentErr != nil {
-					logger.Warn("delete_vm: agent.Remove failed after idempotent delete", log.Err(agentErr))
-				}
-				cleanupAdvertisedRoutes(ctx, deps, vmid, vmTags, logger)
-				return nil, nil
-			}
-			if pve.IsVMConfigLocked(deleteErr) {
-				// Still locked after any skiplock attempt: surface an
-				// actionable, retriable error naming the lock type and the
-				// `qm unlock <vmid>` recovery command, instead of a generic
-				// 5xx the Director would retry forever with no diagnostic value.
-				logUnresolvedVMLock(logger, "delete_vm: delete failed", vmid, node, deleteErr)
-				return nil, pve.WrapVMConfigLocked(deleteErr, vmid, node)
-			}
-			return nil, cpierrors.Wrap(pve.WrapError(deleteErr), fmt.Sprintf("delete_vm: delete VM %s", vmCID))
+			return nil, deleteErr
+		}
+		if alreadyGone {
+			cleanupAdvertisedRoutes(ctx, deps, vmid, vmTags, logger)
+			return nil, nil
 		}
 
 		// Await the destroy task so the VM is fully purged from PVE before we
@@ -630,6 +481,194 @@ func HandleDeleteVM(deps Deps) cpi.Handler {
 		logger.Info("delete_vm: VM deleted successfully", log.String("node", node))
 		return nil, nil
 	})
+}
+
+// parseDeleteVMArgs extracts and validates the vm_cid argument, returning the
+// CID string and its integer VMID.
+func parseDeleteVMArgs(args []json.RawMessage) (string, int, error) {
+	if len(args) < 1 {
+		return "", 0, cpierrors.Cloud("delete_vm: missing required argument vm_cid")
+	}
+	var vmCID string
+	if err := json.Unmarshal(args[0], &vmCID); err != nil {
+		return "", 0, cpierrors.Cloud("delete_vm: vm_cid must be a string: %s", err.Error())
+	}
+	if vmCID == "" {
+		return "", 0, cpierrors.Cloud("delete_vm: vm_cid must not be empty")
+	}
+	vmid, err := strconv.Atoi(vmCID)
+	if err != nil {
+		return "", 0, cpierrors.Cloud("delete_vm: vm_cid %q is not a valid integer VMID: %s", vmCID, err.Error())
+	}
+	if vmid <= 0 {
+		return "", 0, cpierrors.Cloud("delete_vm: vm_cid %q must be a positive integer", vmCID)
+	}
+	return vmCID, vmid, nil
+}
+
+// refuseIfParkerVM is the belt-and-braces PVE-level backstop against deleting
+// a parker VM. The Director should never hand a parker CID to delete_vm
+// (parkers are internal CPI state); this guard catches misconfiguration or
+// operator error. Classification is presence-based: range check first (zero
+// extra API calls when not in range), then one config read to confirm the
+// bosh-parker tag only when the VMID falls in the configured range. When the
+// parker range is not configured (ParkedStrategyActive=false), it returns
+// (false, nil) with zero API calls — byte-identical behavior.
+//
+// Returns alreadyGone=true when the VM vanished during the config read (the
+// caller should treat delete_vm as already complete).
+func refuseIfParkerVM(ctx context.Context, deps Deps, node string, vmid int) (alreadyGone bool, err error) {
+	if deps.Config == nil || !deps.Config.ParkedStrategyActive() {
+		return false, nil
+	}
+	parkerCfg := pve.ParkerConfig{
+		VMIDRangeStart: deps.Config.ParkedDiskVMIDRangeStartValue(),
+		VMIDRangeEnd:   deps.Config.ParkedDiskVMIDRangeEndValue(),
+		DirectorID:     deps.Config.StemcellDirectorID(),
+	}
+	// Range-first: only read the VM config when vmid is in the parker band.
+	if vmid < parkerCfg.VMIDRangeStart || vmid > parkerCfg.VMIDRangeEnd {
+		return false, nil
+	}
+	// Fail-closed: a transient config read error on an in-band VMID must
+	// NOT proceed. The fast path uses skiplock=true + purge=true, which
+	// bypasses protection=1 and destroys all parked disks. Any doubt →
+	// retriable so the Director retries when PVE recovers.
+	vmCfg, cfgErr := deps.PVE.QEMU().Config(ctx, node, vmid)
+	if cfgErr != nil {
+		if pve.IsNotFound(cfgErr) {
+			// VM gone during the read — treat as already deleted.
+			return true, nil
+		}
+		return false, cpierrors.Retriable(
+			"delete_vm: could not read config for in-band VMID %d to verify parker status: %s (retry when PVE recovers)",
+			vmid, cfgErr.Error())
+	}
+	tagsRaw, _ := vmCfg[jsonKeyTags].(string)
+	if pve.IsParkerVM(vmid, tagsRaw, parkerCfg) {
+		return false, cpierrors.Cloud("refusing to delete parker VM %d", vmid)
+	}
+	return false, nil
+}
+
+// cleanupHAMembership removes the VM's CPI-managed HA state before the stop:
+// anti-affinity/DLB membership and the per-VM node-affinity pin. Order
+// matters: while a VM is HA-managed, a status/stop call is redirected to a
+// CRM request whose task completes when the request is accepted — not when
+// the VM actually halts — so a stop-then-deregister sequence races the LRM
+// and the subsequent destroy fails with "VM is running". Deregistering first
+// restores plain qmstop semantics for the stop that follows.
+//
+// The anti-affinity/DLB removal is gated on its opt-ins; it also covers
+// DLB-only VMs (removeAntiAffinityMembership purges the HA resource and
+// prunes any associated rules; for a DLB-only VM with no affinity rule it
+// simply deregisters the HA resource). The node-affinity pin removal is
+// unconditional because two writers create that rule: the AZ pin (gated by
+// placement.pin_az_via_ha_rules) and the PCI strict pin (applied whenever
+// pci_passthroughs is set, regardless of that flag). delete_vm has no
+// cloud_properties, so it cannot know which writer ran; removing
+// unconditionally guarantees no orphan rule survives the VM. For a VM that
+// never had a pin this is two cheap not-found no-ops.
+//
+// Everything here is best-effort: HA failures are logged and never block VM
+// deletion.
+func cleanupHAMembership(ctx context.Context, deps Deps, vmid int, logger *log.Logger) {
+	if deps.Config.AntiAffinityUseHaRulesEnabled() || deps.Config.DLBConfigured() {
+		if aaErr := removeAntiAffinityMembership(ctx, deps, vmid, logger); aaErr != nil {
+			logger.Warn("delete_vm: HA anti-affinity/DLB cleanup incomplete (non-fatal)", log.Err(aaErr))
+		}
+	}
+	if pinErr := removeNodeAffinityPin(ctx, deps, vmid, logger); pinErr != nil {
+		logger.Warn("delete_vm: HA node-affinity pin cleanup incomplete (non-fatal)", log.Err(pinErr))
+	}
+}
+
+// destroyVMWithRecovery issues the DeleteQemu destroy with the standard
+// transient/lock retry, then works the two recoverable refusals PVE can
+// answer with:
+//
+//   - "VM is running - destroy failed": the stop above completed its task,
+//     but a stop accepted while the VM was still HA-managed (the CRM files
+//     the request and the task ends before the LRM halts the guest) can
+//     leave the VM briefly running. Wait until it actually reports stopped,
+//     then destroy once more. Observed live on a DLB-registered compilation
+//     VM.
+//   - config lock (lock: clone|create|...): a killed worker or node reboot
+//     mid-clone/mid-create leaves the guest config locked, which PVE rejects
+//     the destroy against — without recovery the Director would retry
+//     delete_vm forever against a VM that can never come unstuck on its own.
+//     Retry once with skiplock=true when the CPI is authenticated as
+//     root@pam (the only identity PVE honors skiplock for); otherwise
+//     retryDestroyWithSkiplock returns the error unretried and the
+//     still-locked branch below surfaces the actionable `qm unlock` error.
+//
+// Purge removes the VMID from backup/HA/replication configs (per PVE's own
+// API description). Resource-pool membership (pve.vm_pool,
+// stemcell_template_pool) is not explicitly documented as part of what purge
+// cleans up — the delete endpoint's own description separately says it
+// "Removes any VM specific permissions [ACLs] and firewall rules", which is a
+// related but distinct PVE construct from pool membership. A stale
+// pool-membership entry for a deleted VMID (if PVE leaves one) carries no
+// capability risk — there is no VM behind that VMID to act on — but this is
+// not verified against a live cluster; do not depend on the pool member list
+// shrinking immediately after delete_vm without checking your PVE version.
+//
+// DestroyUnreferencedDisks is false on the retain path (the ephemeral disk is
+// now unreferenced + own-VMID — true would destroy it); true otherwise. See
+// detachRetainedEphemeralDisk for the full rationale. When true it triggers
+// pvesm free under the per-storage lockfile for every attached volume, so on
+// bursty deploys this can surface "can't lock file ... got timeout" — the
+// retry wrapper absorbs that signal; everything else propagates immediately.
+//
+// Returns alreadyGone=true for the idempotent not-found path (agent state
+// already cleaned; the caller finishes route cleanup and returns success).
+func destroyVMWithRecovery(
+	ctx context.Context, deps Deps, node, vmCID string, vmid int, retained bool, logger *log.Logger,
+) (resp *sdknodes.DeleteQemuResponse, alreadyGone bool, err error) {
+	purge := true
+	destroyDisks := !retained
+	logger.Debug("delete_vm: deleting VM")
+	var deleteResp *sdknodes.DeleteQemuResponse
+	attemptDestroy := func() error {
+		return pve.RetryOnTransientOrLock(ctx, logger, "delete_vm", 0, func() error {
+			var innerErr error
+			deleteResp, innerErr = deps.PVE.Nodes().DeleteQemu(ctx, node, vmCID, &sdknodes.DeleteQemuParams{
+				Purge:                    &purge,
+				DestroyUnreferencedDisks: &destroyDisks,
+			})
+			return innerErr
+		})
+	}
+	deleteErr := attemptDestroy()
+	if deleteErr != nil && pve.IsVMRunningDestroyFailure(deleteErr) {
+		logger.Info("delete_vm: VM still running after stop task — waiting for it to halt before destroy retry")
+		if waitErr := waitForVMStopped(ctx, deps, node, vmid, vmCID, logger); waitErr != nil {
+			return nil, false, waitErr
+		}
+		deleteErr = attemptDestroy()
+	}
+	if deleteErr != nil && pve.IsVMConfigLocked(deleteErr) {
+		deleteResp, deleteErr = retryDestroyWithSkiplock(ctx, deps, node, vmCID, vmid, purge, destroyDisks, deleteErr, logger)
+	}
+	if deleteErr != nil {
+		if pve.IsNotFound(deleteErr) {
+			logger.Info("delete_vm: VM not found during delete -- already deleted, returning success")
+			// Still clean up registry/cloud-init state if it exists; errors
+			// are logged but not fatal.
+			cleanupAgentForVM(ctx, deps, node, vmid, logger)
+			return nil, true, nil
+		}
+		if pve.IsVMConfigLocked(deleteErr) {
+			// Still locked after any skiplock attempt: surface an
+			// actionable, retriable error naming the lock type and the
+			// `qm unlock <vmid>` recovery command, instead of a generic
+			// 5xx the Director would retry forever with no diagnostic value.
+			logUnresolvedVMLock(logger, "delete_vm: delete failed", vmid, node, deleteErr)
+			return nil, false, pve.WrapVMConfigLocked(deleteErr, vmid, node)
+		}
+		return nil, false, cpierrors.Wrap(pve.WrapError(deleteErr), fmt.Sprintf("delete_vm: delete VM %s", vmCID))
+	}
+	return deleteResp, false, nil
 }
 
 // stopVMBeforeDelete stops the VM and awaits the stop task.
@@ -935,7 +974,7 @@ func detachRetainedEphemeralDisk(
 			fmt.Sprintf("delete_vm: read config for VM %s to check retain-ephemeral tag", vmCID))
 	}
 
-	tagsRaw, _ := vmCfg[jsonKeyTags].(string) //nolint:goconst // "tags" is a PVE config field name; jsonKeyTags is test-only
+	tagsRaw, _ := vmCfg[jsonKeyTags].(string)
 	if !tagsContain(tagsRaw, tagRetainEphemeral) {
 		return false, nil // flag not set — byte-identical path; no API calls
 	}

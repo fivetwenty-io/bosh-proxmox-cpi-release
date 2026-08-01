@@ -1812,7 +1812,7 @@ func (c *CPIConfig) ApplyDefaults() {
 		c.VerifySSL = &t
 	}
 	if c.AgentMode == "" {
-		c.AgentMode = "cloudinit"
+		c.AgentMode = AgentModeCloudInit
 	}
 	if c.VMDiskFormat == "" {
 		c.VMDiskFormat = "qcow2"
@@ -1896,7 +1896,7 @@ func (c *CPIConfig) ApplyDefaults() {
 		c.ParkedDiskVMIDRangeEnd = 90999   // default parker band end
 	}
 	if c.CloneMode == "" {
-		c.CloneMode = "auto"
+		c.CloneMode = CloneModeAuto
 	}
 	if c.NetworkMode == "" {
 		c.NetworkMode = "sdn"
@@ -3285,7 +3285,7 @@ func (c *CPIConfig) validateAuth(errs *[]string) {
 func (c *CPIConfig) validateEnumFields(errs *[]string) {
 	// AgentMode enum.
 	switch c.AgentMode {
-	case "cloudinit", "noagent", "auto":
+	case AgentModeCloudInit, AgentModeNoAgent, AgentModeAuto:
 		// valid
 	case "registry":
 		*errs = append(*errs, `agent_mode "registry" is no longer supported (the BOSH registry was deprecated upstream); set agent_mode to "cloudinit"`)
@@ -3327,7 +3327,7 @@ func (c *CPIConfig) validateEnumFields(errs *[]string) {
 
 	// NetworkMode enum.
 	switch c.NetworkMode {
-	case "sdn", "bridge", "auto":
+	case NetworkModeSDN, NetworkModeBridge, NetworkModeAuto:
 		// valid
 	default:
 		*errs = append(*errs, fmt.Sprintf(
@@ -3336,7 +3336,7 @@ func (c *CPIConfig) validateEnumFields(errs *[]string) {
 	}
 
 	// SDNZoneType enum — only validated when the SDN path is reachable.
-	if c.NetworkMode == "sdn" || c.NetworkMode == "auto" {
+	if c.NetworkMode == NetworkModeSDN || c.NetworkMode == NetworkModeAuto {
 		switch c.SDNZoneType {
 		case "simple", "vlan", "qinq", "vxlan", "evpn":
 			// valid
@@ -3351,7 +3351,7 @@ func (c *CPIConfig) validateEnumFields(errs *[]string) {
 	// "auto" and "linked" and "full" are the only valid values).
 	if c.CloneMode != "" {
 		switch c.CloneMode {
-		case "auto", "linked", "full":
+		case CloneModeAuto, CloneModeLinked, CloneModeFull:
 			// valid
 		default:
 			*errs = append(*errs, fmt.Sprintf(
