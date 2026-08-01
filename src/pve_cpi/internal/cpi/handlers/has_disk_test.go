@@ -195,6 +195,35 @@ func TestHandleHasDisk_SDKError_Propagated(t *testing.T) {
 	}
 }
 
+// TestHandleHasDisk_TransientSDKError_IsRetriable pins the retriability
+// contract for has_disk: a pvedaemon worker recycle (HTTP 5xx/596) during
+// the Exists check must reach the Director as a retriable error, not a
+// permanent CloudError — has_disk previously had no transient absorption at
+// all on this path.
+func TestHandleHasDisk_TransientSDKError_IsRetriable(t *testing.T) {
+	t.Parallel()
+	storageSvc := &mockStorageService{
+		existsFn: func(_ context.Context, _, _, _ string) (bool, error) {
+			// ParseAPIError sets the 5xx sentinel so errors.Is(err,
+			// sdkerrors.ErrServer) classifies it as transient.
+			return false, sdkerrors.ParseAPIError(596, []byte(`{"message":"connection close"}`))
+		},
+	}
+	deps := baseDepsForHas(t, storageSvc)
+
+	h := handlers.HandleHasDisk(deps)
+	_, err := h.Handle(fastRetryCtx(context.Background()), []json.RawMessage{
+		marshal("local-lvm:vm-9001-disk-0"),
+	}, jsonrpc.Context{})
+
+	if err == nil {
+		t.Fatal("expected error from persistent transient failure")
+	}
+	if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+		t.Errorf("5xx from Exists must be retriable, got %T %v", err, err)
+	}
+}
+
 func TestHandleHasDisk_MalformedCID_NoColon(t *testing.T) {
 	t.Parallel()
 	storageSvc := &mockStorageService{}

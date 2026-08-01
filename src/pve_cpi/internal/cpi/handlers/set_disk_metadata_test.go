@@ -519,6 +519,32 @@ func TestHandleSetDiskMetadata_ListResourcesError(t *testing.T) {
 	}
 }
 
+// TestHandleSetDiskMetadata_ListResourcesTransient_IsRetriable pins the
+// documented contract that transient transport errors from ListResources
+// propagate as RETRIABLE: a pvedaemon worker recycle (HTTP 5xx) must reach
+// the Director as ok_to_retry=true, not permanently fail the operation. This
+// is the classification the plain-error test above deliberately does not pin.
+func TestHandleSetDiskMetadata_ListResourcesTransient_IsRetriable(t *testing.T) {
+	t.Parallel()
+
+	pve := buildDiskMetaPVE(
+		// ParseAPIError (not a hand-built struct) so the 5xx sentinel is set
+		// and errors.Is(err, sdkerrors.ErrServer) classifies it as transient.
+		&diskMetaClusterSvc{listErr: sdkerrors.ParseAPIError(500, []byte(`{"message":"pvedaemon worker exiting"}`))},
+		map[string]map[string]any{},
+		&diskMetaNodesMock{},
+	)
+	h := handlers.HandleSetDiskMetadata(makeDiskMetaDeps(pve))
+
+	_, err := h.Handle(fastRetryCtx(context.Background()), makeMetaArgs(testDiskCID, map[string]any{"k": "v"}), jsonrpc.Context{})
+	if err == nil {
+		t.Fatal("expected error from transient ListResources failure, got nil")
+	}
+	if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+		t.Errorf("5xx from ListResources must be retriable, got %T %v", err, err)
+	}
+}
+
 // TestHandleSetDiskMetadata_UpdateConfigError verifies that an UpdateQemuConfig
 // SDK failure propagates as an error after the disk is found on a VM.
 func TestHandleSetDiskMetadata_UpdateConfigError(t *testing.T) {

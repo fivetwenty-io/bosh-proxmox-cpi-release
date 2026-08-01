@@ -599,3 +599,39 @@ func equalStringSlices(a, b []string) bool {
 	}
 	return true
 }
+
+// TestContextOverrideFieldOrder is the sync assertion the source comments at
+// contextOverrideFieldOrder / contextOverrideFields have cited since the
+// feature landed: every entry in the order slice must have a matching apply
+// function, every apply function must be listed in the order slice, and the
+// slice must be duplicate-free. A 19th overridable field added to one side
+// but not the other would either be silently skipped by
+// ApplyContextOverrides or invisible to the audit ordering — this converts
+// that mistake into a failing build.
+func TestContextOverrideFieldOrder(t *testing.T) {
+	t.Parallel()
+	order := config.ContextOverrideFieldOrderForTest()
+	keys := config.ContextOverrideFieldKeysForTest()
+
+	seen := make(map[string]bool, len(order))
+	for _, f := range order {
+		if seen[f] {
+			t.Errorf("contextOverrideFieldOrder contains duplicate entry %q", f)
+		}
+		seen[f] = true
+	}
+	keySet := make(map[string]bool, len(keys))
+	for _, k := range keys {
+		keySet[k] = true
+	}
+	for _, f := range order {
+		if !keySet[f] {
+			t.Errorf("field %q is in contextOverrideFieldOrder but has no apply function in contextOverrideFields", f)
+		}
+	}
+	for _, k := range keys {
+		if !seen[k] {
+			t.Errorf("field %q has an apply function but is missing from contextOverrideFieldOrder", k)
+		}
+	}
+}

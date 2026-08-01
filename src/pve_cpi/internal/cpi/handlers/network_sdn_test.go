@@ -11,18 +11,27 @@ import (
 	"testing"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/cpi/handlers"
+	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
 	sdkcluster "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cluster"
 	sdktasks "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/tasks"
+	sdkerrors "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/errors"
 )
 
 // invokeDeleteNetworkRaw calls HandleDeleteNetwork with raw CID bytes
 // and returns the handler error.
 func invokeDeleteNetworkRaw(t *testing.T, deps handlers.Deps, cidJSON json.RawMessage) error {
 	t.Helper()
+	return invokeDeleteNetworkRawCtx(t, context.Background(), deps, cidJSON)
+}
+
+// invokeDeleteNetworkRawCtx is invokeDeleteNetworkRaw with a caller-supplied
+// context (tests use fastRetryCtx to zero the retry backoff curves).
+func invokeDeleteNetworkRawCtx(t *testing.T, ctx context.Context, deps handlers.Deps, cidJSON json.RawMessage) error {
+	t.Helper()
 	h := handlers.HandleDeleteNetwork(deps)
-	_, err := h.Handle(context.Background(), []json.RawMessage{cidJSON}, jsonrpc.Context{})
+	_, err := h.Handle(ctx, []json.RawMessage{cidJSON}, jsonrpc.Context{})
 	return err
 }
 
@@ -115,6 +124,49 @@ func TestApplySDN_HappyPath(t *testing.T) {
 	}
 	if taskWaitCalls[0].upid != upid {
 		t.Errorf("Tasks.Wait upid: got %q, want %q", taskWaitCalls[0].upid, upid)
+	}
+}
+
+// TestApplySDN_TransientFailure_IsRetriable pins applySDN's retriability
+// contract: a 5xx from UpdateSdn (pvedaemon worker recycle mid-apply) must
+// surface as a retriable error after the transient retry budget is
+// exhausted — and the retry wrapper must actually re-attempt the call.
+// Previously a raw SDK error was wrapped straight into a non-retriable
+// CloudError, permanently failing the deploy on a condition that clears in
+// about a second.
+func TestApplySDN_TransientFailure_IsRetriable(t *testing.T) {
+	t.Parallel()
+
+	var updateSdnCalls int
+	clusterSvc := sdnDeleteOnlyCluster(func(_ context.Context, _ *sdkcluster.UpdateSdnParams) (*sdkcluster.UpdateSdnResponse, error) {
+		updateSdnCalls++
+		return nil, sdkerrors.ParseAPIError(500, []byte(`{"message":"pvedaemon worker exiting"}`))
+	})
+
+	cfg := testConfig()
+	cfg.NetworkMode = "auto"
+	cfg.SDNAutoManageZone = boolPtr(false)
+
+	deps := handlers.Deps{
+		Config: cfg,
+		PVE: &mockPVEClient{
+			clusterSvc: clusterSvc,
+			nodesSvc:   &mockNodesService{},
+			tasksSvc:   &mockTasksService{},
+		},
+		Logger: log.NewNopLogger(),
+	}
+
+	cidJSON, _ := json.Marshal("net01")
+	err := invokeDeleteNetworkRawCtx(t, fastRetryCtx(context.Background()), deps, cidJSON)
+	if err == nil {
+		t.Fatal("expected error from persistent UpdateSdn 5xx, got nil")
+	}
+	if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+		t.Errorf("5xx from UpdateSdn must be retriable, got %T %v", err, err)
+	}
+	if updateSdnCalls < 2 {
+		t.Errorf("UpdateSdn calls = %d; the transient retry wrapper must re-attempt", updateSdnCalls)
 	}
 }
 
