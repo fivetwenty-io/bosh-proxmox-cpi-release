@@ -222,7 +222,7 @@ func TestWaitForSnapshotAbsent_LingersThenGone(t *testing.T) {
 		return snapEntries("current"), nil
 	})
 	err := pve.WaitForSnapshotAbsent(context.Background(), client, "pve1", 9001, "snap1",
-		pve.WithPollInterval(1*time.Millisecond), pve.WithMaxWait(10*time.Second))
+		pve.WithPollIntervalForTest(1*time.Millisecond), pve.WithMaxWait(10*time.Second))
 	if err != nil {
 		t.Fatalf("unexpected error waiting for snapshot to clear: %v", err)
 	}
@@ -237,7 +237,7 @@ func TestWaitForSnapshotAbsent_Timeout(t *testing.T) {
 		return snapEntries("current", "snap1"), nil // never clears
 	})
 	err := pve.WaitForSnapshotAbsent(context.Background(), client, "pve1", 9001, "snap1",
-		pve.WithPollInterval(1*time.Millisecond), pve.WithMaxWait(1*time.Second))
+		pve.WithPollIntervalForTest(1*time.Millisecond), pve.WithMaxWait(1*time.Second))
 	if err == nil {
 		t.Fatal("expected timeout error when snapshot never clears")
 	}
@@ -271,7 +271,7 @@ func TestWaitForSnapshotAbsent_TransientInPollLoop_Retries(t *testing.T) {
 		return snapEntries("current"), nil
 	})
 	err := pve.WaitForSnapshotAbsent(context.Background(), client, "pve1", 9001, "snap1",
-		pve.WithPollInterval(1*time.Millisecond), pve.WithMaxWait(30*time.Second))
+		pve.WithPollIntervalForTest(1*time.Millisecond), pve.WithMaxWait(30*time.Second))
 	if err != nil {
 		t.Fatalf("expected success after transient retries, got: %v", err)
 	}
@@ -288,7 +288,7 @@ func TestWaitForSnapshotAbsent_ContextCancelled(t *testing.T) {
 		return snapEntries("current", "snap1"), nil // never clears → forces the wait/select
 	})
 	err := pve.WaitForSnapshotAbsent(ctx, client, "pve1", 9001, "snap1",
-		pve.WithPollInterval(50*time.Millisecond), pve.WithMaxWait(10*time.Second))
+		pve.WithPollIntervalForTest(50*time.Millisecond), pve.WithMaxWait(10*time.Second))
 	if err == nil {
 		t.Fatal("expected error when context is cancelled")
 	}

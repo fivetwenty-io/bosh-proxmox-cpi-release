@@ -120,9 +120,20 @@ func isSDNConflict(err error) bool {
 // and the apply is treated as successful — the HTTP 200 already confirmed the
 // request was accepted; operator should verify manually for non-simple zones.
 func applySDN(ctx context.Context, deps Deps, clusterSvc sdkcluster.Service, opCtx string) error {
-	resp, err := clusterSvc.UpdateSdn(ctx, nil)
+	var resp *sdkcluster.UpdateSdnResponse
+	// Retry + WrapError: a pvedaemon worker recycle (HTTP 5xx) during the
+	// apply is the exact transient RetryOnTransient exists to absorb, and a
+	// raw SDK error through cpierrors.Wrap would reach the Director as a
+	// non-retriable CloudError — permanently failing a deploy on a condition
+	// that clears in about a second. Mirrors internal/pve/sdn.go's own
+	// UpdateSdn treatment.
+	err := pve.RetryOnTransient(ctx, deps.Log(ctx), opCtx+"_apply_sdn", 0, func() error {
+		var inner error
+		resp, inner = clusterSvc.UpdateSdn(ctx, nil)
+		return inner
+	})
 	if err != nil {
-		return cpierrors.Wrap(err, fmt.Sprintf("%s: apply SDN", opCtx))
+		return cpierrors.Wrap(pve.WrapError(err), fmt.Sprintf("%s: apply SDN", opCtx))
 	}
 	if resp == nil || len(*resp) == 0 {
 		// Nil / empty body — simple zone synchronous apply; no task to await.

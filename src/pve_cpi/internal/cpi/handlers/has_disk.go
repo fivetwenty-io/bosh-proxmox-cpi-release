@@ -78,7 +78,7 @@ func HandleHasDisk(deps Deps) Handler {
 				)
 				return false, nil
 			}
-			return nil, cpierrors.Wrap(err, "has_disk")
+			return nil, cpierrors.Wrap(pve.WrapError(err), "has_disk")
 		}
 
 		// ----------------------------------------------------------------
@@ -89,7 +89,16 @@ func HandleHasDisk(deps Deps) Handler {
 		//    must answer false for a just-deleted disk regardless of
 		//    backend, not raise a retriable cloud error.
 		// ----------------------------------------------------------------
-		exists, err := pve.ExistsTolerant(ctx, deps.PVE, node, storage, bareDiskCID)
+		// RetryOnTransient + WrapError below: without them a single pvedaemon
+		// worker recycle (HTTP 596/5xx) during the Exists call turned
+		// has_disk into a permanent non-retriable failure — the only PVE
+		// call on this path that had no transient absorption at all.
+		var exists bool
+		err = pve.RetryOnTransient(ctx, deps.Log(ctx), "has_disk_exists", 0, func() error {
+			var inner error
+			exists, inner = pve.ExistsTolerant(ctx, deps.PVE, node, storage, bareDiskCID)
+			return inner
+		})
 		if err != nil {
 			// Belt-and-braces: any not-found classification surfacing through
 			// a non-Exists path still resolves to false.
@@ -99,7 +108,7 @@ func HandleHasDisk(deps Deps) Handler {
 				)
 				return false, nil
 			}
-			return nil, cpierrors.Wrap(err, "has_disk: Exists check failed for "+diskCID+" on node "+node)
+			return nil, cpierrors.Wrap(pve.WrapError(err), "has_disk: Exists check failed for "+diskCID+" on node "+node)
 		}
 
 		deps.Log(ctx).Debug("has_disk", log.String("disk_cid", diskCID), log.Bool("exists", exists))

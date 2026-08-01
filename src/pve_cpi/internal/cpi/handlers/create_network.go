@@ -516,7 +516,7 @@ func createSubnetIdempotent(
 
 // applyWithRollback calls applySDN and, on failure, invokes rollbackFn then
 // returns the original apply error. rollbackFn must use a detached context
-// (contextWithoutCancel) so cleanup completes even when the caller's context
+// (detachedContext, bounded by rollbackCleanupTimeout) so cleanup completes even when the caller's context
 // is cancelled; the caller is responsible for constructing that context and
 // closing over it inside rollbackFn.
 func applyWithRollback(
@@ -536,7 +536,7 @@ func applyWithRollback(
 // createNetworkSDN implements the SDN vnet creation flow.
 //
 // Rollback discipline: every best-effort cleanup call uses a context derived
-// via contextWithoutCancel so a caller-cancelled request still releases the
+// via detachedContext so a caller-cancelled request still releases the
 // staged PVE state. Original-call errors are wrapped through pve.WrapError so
 // transient classes (5xx, ConnectionError, TimeoutError, storage lock) keep
 // their Retriable type all the way back to the BOSH director.
@@ -584,7 +584,8 @@ func createNetworkSDN(
 		// detached from the parent's cancellation so cleanup runs even after
 		// the caller aborts.
 		if createdZone {
-			rollbackCtx := contextWithoutCancel(ctx)
+			rollbackCtx, rbCancel := detachedContext(ctx, rollbackCleanupTimeout)
+			defer rbCancel()
 			if delErr := clusterSvc.DeleteSdnZones(rollbackCtx, zone, nil); delErr != nil {
 				deps.Log(rollbackCtx).Warn("create_network: rollback delete zone failed", log.Err(delErr))
 			}
@@ -615,7 +616,8 @@ func createNetworkSDN(
 		if subnetCreateErr != nil {
 			// Best-effort rollback of what THIS call created. vnetCreated /
 			// createdZone guard against deleting pre-existing resources.
-			rollbackCtx := contextWithoutCancel(ctx)
+			rollbackCtx, rbCancel := detachedContext(ctx, rollbackCleanupTimeout)
+			defer rbCancel()
 			if vnetCreated {
 				if delErr := clusterSvc.DeleteSdnVnets(rollbackCtx, vnet, nil); delErr != nil {
 					deps.Log(rollbackCtx).Warn("create_network: rollback delete vnet failed", log.Err(delErr))
@@ -647,7 +649,8 @@ func createNetworkSDN(
 	// THIS call created (subnetCreated / vnetCreated / createdZone guard against
 	// touching pre-existing state). Rollback runs on a detached context so it
 	// completes even when the caller cancelled the request.
-	rollbackCtx := contextWithoutCancel(ctx)
+	rollbackCtx, rbCancel := detachedContext(ctx, rollbackCleanupTimeout)
+	defer rbCancel()
 	applyErr := applyWithRollback(ctx, deps, clusterSvc, sdnApplyArgs{opCtx: "create_network"},
 		func() {
 			if subnetCreated {

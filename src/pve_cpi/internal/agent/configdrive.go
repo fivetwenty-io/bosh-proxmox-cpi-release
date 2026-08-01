@@ -19,6 +19,12 @@ import (
 // localISOStorageWarnOnce guards the single-shot warning emitted when the
 // effective iso_storage resolves to "local". One warning per CPI process is
 // sufficient; re-firing on every create_vm would flood operator logs.
+//
+// Process-scoped, not cluster-scoped: with per-request context overrides one
+// process can serve several clusters, and only the first cluster to hit this
+// path gets the warning. Accepted — the warning is a low-stakes storage-
+// placement hint; contrast handlers' firewallMasterSwitchProbedClusters,
+// which is keyed per cluster because its warning is enforcement-relevant.
 var localISOStorageWarnOnce sync.Once
 
 // configDriveSlot is the SCSI bus slot used to attach the ConfigDrive ISO as

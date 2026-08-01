@@ -564,8 +564,11 @@ var errSignaled = errors.New("cpi: terminated by signal")
 //   - errSignaled when ctx is done before EOF.
 //   - Other errors indicate unrecoverable I/O failures writing to w.
 //
-// Decode errors (malformed JSON, missing "method", line too long) are non-fatal:
-// runCPI logs the error, writes a CloudError JSON-RPC response to w, and continues.
+// Decode errors (malformed JSON, missing "method") are non-fatal: runCPI logs
+// the error, writes a CloudError JSON-RPC response to w, and continues. Scan
+// errors (line too long, I/O failure reading r) are terminal: bufio.Scanner
+// never recovers from a read error, so runCPI writes one CloudError response
+// and returns instead of spinning on the dead scanner.
 func runCPI(
 	ctx context.Context,
 	r io.Reader,
@@ -583,8 +586,21 @@ func runCPI(
 	// Scan line-by-line so a malformed line never corrupts the decoder state
 	// for subsequent valid lines (json.Decoder does not recover from syntax errors).
 	sc := bufio.NewScanner(r)
-	buf := make([]byte, maxLineBytes)
-	sc.Buffer(buf, maxLineBytes)
+	// Small initial buffer, grown on demand up to the maxLineBytes ceiling —
+	// Scanner.Buffer treats the slice as the initial buffer only, so eagerly
+	// allocating the full 64 MiB would cost that much RSS on every process
+	// spawn for requests that are almost always a few KiB.
+	sc.Buffer(make([]byte, 0, 64*1024), maxLineBytes)
+
+	// A blocked read(2) on stdin does not observe context cancellation, so a
+	// SIGTERM arriving while the CPI is idle between requests would otherwise
+	// leave the process unkillable short of SIGKILL. Closing the read side
+	// unblocks sc.Scan(); the scanner then reports an error or EOF, both of
+	// which terminate the loop below.
+	if c, ok := r.(io.Closer); ok {
+		stopClose := context.AfterFunc(ctx, func() { _ = c.Close() })
+		defer stopClose()
+	}
 
 	for {
 		// Check for context cancellation between requests.
@@ -596,18 +612,24 @@ func runCPI(
 
 		if !sc.Scan() {
 			if err := sc.Err(); err != nil {
-				// Scanner error (e.g. line too long or I/O error reading r).
+				// A SIGTERM-triggered stdin close (see AfterFunc above)
+				// surfaces here as a read error — that is clean shutdown,
+				// not a failure.
+				if ctx.Err() != nil {
+					return errSignaled
+				}
+				// Scanner error (line too long or I/O error reading r).
+				// bufio.Scanner is single-shot after ANY read error: once
+				// its internal err is set, every subsequent Scan() returns
+				// false immediately with the same error, so re-entering the
+				// loop would spin hot writing the identical CloudError
+				// forever. Report once and exit cleanly.
 				logger.Warn("stdin: scan error", log.Err(err))
 				cpiErr := cpierrors.Cloud("request read failed: %s", err.Error())
 				if writeErr := writeErrorResponse(bw, cpiErr); writeErr != nil {
 					return fmt.Errorf("cpi: write scan error response: %w", writeErr)
 				}
-				// Continue the loop after a scan error only if sc is still usable.
-				// After ErrTooLong the scanner is not reusable, so exit cleanly.
-				if errors.Is(err, bufio.ErrTooLong) {
-					return nil
-				}
-				continue
+				return nil
 			}
 			// sc.Scan() returned false with no error — clean EOF.
 			return nil

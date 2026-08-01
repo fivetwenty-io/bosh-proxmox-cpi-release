@@ -60,14 +60,19 @@ var zfsThickProvisioningWarnedPools sync.Map
 //     propagated — this is a diagnostic, not a gate.
 //   - storageName not present in the storage list → silent.
 //   - sparse=1 → silent (this is the well-provisioned case).
-//   - fires the Info log at most once per storage ID for the lifetime of the
+//   - fires the Info log at most once per cluster+storage ID for the lifetime of the
 //     process (zfsThickProvisioningWarnedPools); a second, third, etc. call
 //     for the same pool is a fast no-op (checked before any API call).
 func warnIfZFSThickProvisioned(ctx context.Context, deps Deps, storageName, knownStorageType string) {
 	if storageName == "" || knownStorageType != pve.StorageTypeZFSPool || deps.PVE == nil || deps.PVE.ClusterStorage() == nil {
 		return
 	}
-	if _, alreadyWarned := zfsThickProvisioningWarnedPools.Load(storageName); alreadyWarned {
+	// Keyed by cluster identity + pool name, not pool name alone: with
+	// per-request context overrides one process can serve several clusters,
+	// and "local-zfs" on cluster A must not silence the warning for a
+	// distinct "local-zfs" on cluster B.
+	warnKey := clusterIdentity(deps.Config) + "\x00" + storageName
+	if _, alreadyWarned := zfsThickProvisioningWarnedPools.Load(warnKey); alreadyWarned {
 		return
 	}
 
@@ -101,7 +106,7 @@ func warnIfZFSThickProvisioned(ctx context.Context, deps Deps, storageName, know
 		if entry.Sparse != nil && *entry.Sparse != 0 {
 			return // sparse=1: silent, this is the well-provisioned case.
 		}
-		if _, loaded := zfsThickProvisioningWarnedPools.LoadOrStore(storageName, struct{}{}); loaded {
+		if _, loaded := zfsThickProvisioningWarnedPools.LoadOrStore(warnKey, struct{}{}); loaded {
 			// Lost a race against a concurrent caller that warned first.
 			return
 		}

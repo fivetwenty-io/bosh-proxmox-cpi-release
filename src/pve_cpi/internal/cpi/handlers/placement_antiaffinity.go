@@ -115,7 +115,13 @@ func ensureAntiAffinityMembership(ctx context.Context, deps Deps, groupKey strin
 			return lockErr
 		}
 		defer func() {
-			if relErr := handle.Release(ctx); relErr != nil {
+			// Detached + bounded for the same reason as withVMIDLock's
+			// release: a cancelled request must not orphan the sentinel
+			// pool, and the anti-affinity lock's longer TTL makes an orphan
+			// proportionally more disruptive to concurrent create_vm calls.
+			relCtx, relCancel := detachedContext(ctx, lockReleaseTimeout)
+			defer relCancel()
+			if relErr := handle.Release(relCtx); relErr != nil {
 				logger.Warn("anti-affinity: release cluster lock failed (non-fatal)",
 					log.String("group", groupKey), log.Err(relErr))
 			}

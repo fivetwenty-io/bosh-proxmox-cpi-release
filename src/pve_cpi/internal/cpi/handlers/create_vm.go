@@ -495,9 +495,14 @@ func createVM(
 
 	// -----------------------------------------------------------------------
 	// 3b. Per-node in-flight gate (opt-in; limit=0 → unlimited, no gating).
+	// The release is registered twice (see the second defer below the
+	// rollback arm); acquire's release is sync.Once-guarded so the double
+	// registration is safe.
 	// -----------------------------------------------------------------------
+	var inflightRelease func()
 	if deps.Config != nil {
-		inflightRelease, inflightErr := deps.Inflight.acquire(ctx, shape.node, deps.Config.MaxInflightPerNodeLimit())
+		var inflightErr error
+		inflightRelease, inflightErr = deps.Inflight.acquire(ctx, shape.node, deps.Config.MaxInflightPerNodeLimit())
 		if inflightErr != nil {
 			return nil, cpierrors.Retriable("create_vm: in-flight limit exceeded or context cancelled on node %s: %s", shape.node, inflightErr.Error())
 		}
@@ -526,6 +531,15 @@ func createVM(
 	// winning VM. See rollbackOnExit for the error-path and panic-path handling.
 	vmCreated := true
 	defer rollbackOnExit(ctx, deps, shape.node, vmid, parsed.env, logger, &vmCreated, &retErr)
+	// Registered AFTER the rollback arm so it runs FIRST (defer is LIFO): the
+	// per-node in-flight slot must be released before the rollback runs, not
+	// after — a slow rollback otherwise pins the slot for its whole duration
+	// and starves concurrent create_vm/attach_disk/delete_vm on the node. The
+	// earlier registration above still covers returns before this point;
+	// sync.Once inside the release makes the pair safe.
+	if inflightRelease != nil {
+		defer inflightRelease()
+	}
 
 	// Register a middleware-level rollback so that post-hooks (After callbacks
 	// in WrapHandler) can trigger cleanup when they flip a nil handler error
@@ -848,7 +862,7 @@ func createVMWithFallback(
 		if attemptErr != nil {
 			// Clean up this attempt's partial VM (if any was created).
 			if vmid != 0 {
-				cleanupVM(contextWithoutCancel(ctx), deps, candidateNode, vmid, nil, logger)
+				cleanupVMDetached(ctx, deps, candidateNode, vmid, logger)
 			}
 
 			if !shouldFallback || isLast {
@@ -1358,7 +1372,43 @@ func resolveVMShapeWithAlternates(
 	return s, alts, nil
 }
 
-// resolveTargetNode determines which PVE node the new VM will land on.
+// resolveTargetNode determines which PVE node the new VM will land on. See
+// resolveTargetNodeWithFallbacks — the single implementation of the placement
+// decision tree — for the full algorithm; this wrapper is the
+// production-default entry (non-deterministic shuffle, no alternates).
+func resolveTargetNode(ctx context.Context, deps Deps, cp createVMCloudProps, groupTag string, diskCIDs []string, cloudPropsMap map[string]any) (string, error) {
+	return resolveTargetNodeWithRNG(ctx, deps, cp, groupTag, diskCIDs, nil, cloudPropsMap)
+}
+
+// resolveTargetNodeWithRNG is the testable implementation of resolveTargetNode.
+// rng controls AZ shuffle order; pass nil for production (non-deterministic).
+// cloudPropsMap is the raw cloud_properties map used to build the layered resolver
+// for per-call placement weight overrides and AZ resolution via vm_type profiles.
+// Pass nil to skip resolver-based overrides.
+//
+// One-line delegation: resolveTargetNodeWithFallbacks with fallbackMax == 0 is
+// this exact algorithm — buildAlternates returns nil alternates at zero and
+// scoreAndPickWithRanked picks identically to the ranked-less variant this
+// function used to duplicate (~260 lines, byte-equivalent branch structure,
+// verified by diff before the copy was deleted). Keeping ONE implementation
+// means every future placement change lands on both the fallback and
+// non-fallback paths by construction instead of by remembering to edit twice.
+func resolveTargetNodeWithRNG(
+	ctx context.Context,
+	deps Deps,
+	cp createVMCloudProps,
+	groupTag string,
+	diskCIDs []string,
+	rng *rand.Rand,
+	cloudPropsMap map[string]any,
+) (string, error) {
+	node, _, err := resolveTargetNodeWithFallbacks(ctx, deps, cp, groupTag, diskCIDs, rng, cloudPropsMap, 0)
+	return node, err
+}
+
+// resolveTargetNodeWithFallbacks is the single implementation of the node
+// placement decision tree; every entry point (resolveTargetNode,
+// resolveTargetNodeWithRNG, resolveVMShapeWithAlternates) funnels here.
 //
 // Decision tree (evaluated in order):
 //  1. cp.TargetNode != "" → operator override; skip scoring entirely (backward compat).
@@ -1383,348 +1433,18 @@ func resolveVMShapeWithAlternates(
 //   - bare legacy CIDs (no metadata) impose no constraint.
 //
 // groupTag, when non-empty, is the anti-affinity tag (e.g. "job--diego-cell")
-// that activates scheduler-soft same-group spreading.
+// that activates scheduler-soft same-group spreading. rng is injected for
+// deterministic shuffle in tests; pass nil for production.
 //
-// rng is injected for deterministic shuffle in tests; pass nil for production
-// (a fresh rand source is created from the current time).
-func resolveTargetNode(ctx context.Context, deps Deps, cp createVMCloudProps, groupTag string, diskCIDs []string, cloudPropsMap map[string]any) (string, error) {
-	return resolveTargetNodeWithRNG(ctx, deps, cp, groupTag, diskCIDs, nil, cloudPropsMap)
-}
-
-// resolveTargetNodeWithRNG is the testable implementation of resolveTargetNode.
-// rng controls AZ shuffle order; pass nil for production (non-deterministic).
-// cloudPropsMap is the raw cloud_properties map used to build the layered resolver
-// for per-call placement weight overrides and AZ resolution via vm_type profiles.
-// Pass nil to skip resolver-based overrides (existing behavior preserved byte-identically).
-//
-//nolint:gocognit,gocyclo // Multi-AZ loop + maintenance + retryability; inherent complexity.
-func resolveTargetNodeWithRNG(
-	ctx context.Context,
-	deps Deps,
-	cp createVMCloudProps,
-	groupTag string,
-	diskCIDs []string,
-	rng *rand.Rand,
-	cloudPropsMap map[string]any,
-) (string, error) {
-	// deps.Log(ctx) is nil-Logger-safe (falls back to a nop logger) and, when
-	// ctx carries the per-request span-correlated logger, returns that one
-	// instead of deps.Logger — internal unit tests that call resolveVMShape
-	// directly with a bare ctx and no Deps.Logger still get a safe no-op.
-	logger := deps.Log(ctx)
-
-	// Derive hard fault-domain constraints from persistent disk CIDs before any
-	// placement decision. Bare legacy CIDs (no metadata) impose no constraint.
-	// Backend resolution uses the static resolver when Deps.Resolver is unset, so
-	// this step is safe in both production and test environments.
-	diskConstraints, dcErr := deriveDiskFaultConstraints(ctx, deps, diskCIDs)
-	if dcErr != nil {
-		return "", dcErr
-	}
-
-	// Branch 1: operator pin — no scoring.
-	// If a local disk's node is known, validate consistency with the operator override:
-	// pinning to a conflicting node would leave the disk unreachable.
-	if cp.TargetNode != "" {
-		if diskConstraints.requiredLocalNode != "" && diskConstraints.requiredLocalNode != cp.TargetNode {
-			return "", cpierrors.Cloud(
-				"create_vm: cloud_properties.target_node=%q conflicts with local disk placement constraint (disk node=%q); "+
-					"set target_node=%q or move the disk to shared storage",
-				cp.TargetNode, diskConstraints.requiredLocalNode, diskConstraints.requiredLocalNode,
-			)
-		}
-		logger.Debug("create_vm: node selection: operator override via target_node",
-			log.String("node", cp.TargetNode),
-		)
-		return cp.TargetNode, nil
-	}
-
-	// Build the layered resolver for per-call placement weight and AZ overrides.
-	// A nil or empty cloudPropsMap produces a call-only resolver with no profile layers;
-	// all lookups return not-found and behavior is byte-identical to the pre-resolver path.
-	// An unknown vm_type/disk_type selector returns a CloudError immediately.
-	var cpResolver *layeredResolver
-	if deps.Config != nil {
-		var resolverErr error
-		cpResolver, resolverErr = newLayeredResolver(cloudPropsMap, deps.Config)
-		if resolverErr != nil {
-			return "", resolverErr
-		}
-	}
-
-	// Branch 2: live placement scoring.
-	// Skip when deps.PVE is nil (unit test minimal setup) — fall through to Branch 3.
-	if deps.Config.PlacementEnabled() && deps.PVE != nil {
-		// Build the AZ iteration order.
-		// Singular availability_zone (backward compat) → single-element list,
-		// no multi-AZ fallback behavior.
-		azOrder := buildAZOrder(cp, deps.Config, rng, cpResolver)
-
-		// Apply shared-disk AZ constraint: if disks declare required AZs and the
-		// VM's AZ order is empty, constrain placement to the disk AZs. If the VM's
-		// AZ order is set and required AZs are a subset, keep the intersection in
-		// their original order. If required AZs are not a subset of the VM's AZ
-		// order, return a clear non-retriable error.
-		if len(diskConstraints.requiredAZs) > 0 {
-			azOrder, dcErr = applyDiskAZConstraint(azOrder, diskConstraints.requiredAZs)
-			if dcErr != nil {
-				return "", dcErr
-			}
-		}
-
-		// Pre-validate AZs: any unknown AZ name is a permanent misconfiguration.
-		// This check runs before GatherNodeFacts to preserve the existing behavior
-		// that unknown-AZ errors surface without making any cluster API calls.
-		// DLB sentinel AZs are silently skipped (not an error).
-		for _, az := range azOrder {
-			_, ok := deps.Config.AZCandidates(az)
-			if !ok && (az != deps.Config.DLBAZName() || deps.Config.DLBAZName() == "") {
-				return "", cpierrors.Cloud(
-					"create_vm: availability_zone %q is not defined in placement.az_map; "+
-						"add the AZ to config.placement.az_map or remove availability_zone from cloud_properties",
-					az,
-				)
-			}
-		}
-
-		// Gather live cluster facts once before the AZ loop.
-		// ExcludeMaintenanceNodes defaults true; MaintenanceNodeTags defaults ["maintenance"].
-		storageName := deps.Config.VMStorage
-		excludeMaintenance := deps.Config.ExcludeMaintenanceNodesEnabled()
-		facts, gatherErr := placement.GatherNodeFacts(ctx,
-			deps.PVE.Cluster(),
-			deps.PVE.Nodes(),
-			logger,
-			placement.GatherOptions{
-				StorageName:             storageName,
-				GroupTag:                groupTag,
-				ExcludeMaintenanceNodes: excludeMaintenance,
-				MaintenanceNodeTags:     deps.Config.MaintenanceNodeTagsValue(),
-			},
-		)
-		if gatherErr != nil {
-			// GatherNodeFacts returns a fatal error only when ListStatus fails.
-			// Wrap and propagate — director will retry create_vm.
-			return "", cpierrors.Wrap(pve.WrapError(gatherErr),
-				"create_vm: placement: gather node facts")
-		}
-
-		w := deps.Config.EffectiveWeights()
-		weights := placement.Weights{
-			Mem:          w.Mem,
-			Storage:      w.Storage,
-			CPU:          w.CPU,
-			GuestCount:   w.GuestCount,
-			MemorySignal: deps.Config.MemorySignalValue(),
-		}
-		// Per-call cloud_properties weight overrides (opt-in, no global mutation).
-		// Only axes with an explicit value in the resolver override the config axis;
-		// absent keys leave the config value intact. AntiAffinity is config-only.
-		if cpResolver != nil {
-			if f, found := cpResolver.Float("placement_weight_mem"); found {
-				weights.Mem = f
-			}
-			if f, found := cpResolver.Float("placement_weight_storage"); found {
-				weights.Storage = f
-			}
-			if f, found := cpResolver.Float("placement_weight_cpu"); found {
-				weights.CPU = f
-			}
-			if f, found := cpResolver.Float("placement_weight_guest_count"); found {
-				weights.GuestCount = f
-			}
-		}
-		if groupTag != "" {
-			weights.AntiAffinity = placement.DefaultWeights().AntiAffinity
-		}
-
-		// Local-disk node pin: if all local disks share one node, force the
-		// candidate set to that single node for all AZ iterations. This is checked
-		// after GatherNodeFacts so we can report whether the node is
-		// offline/maintenance rather than returning a generic "no candidates" error.
-		localPin := diskConstraints.requiredLocalNode
-		if localPin != "" {
-			// Search facts slice for the pinned node name.
-			var pinnedFact *placement.NodeFacts
-			for i := range facts {
-				if facts[i].Node == localPin {
-					pinnedFact = &facts[i]
-					break
-				}
-			}
-			if pinnedFact == nil {
-				return "", cpierrors.Cloud(
-					"create_vm: local disk is pinned to node %q but that node "+
-						"is not reachable in the cluster (offline, removed, or unknown); "+
-						"ensure the disk's home node is online before creating the VM",
-					localPin,
-				)
-			}
-			if pinnedFact.InMaintenance {
-				return "", cpierrors.Cloud(
-					"create_vm: local disk is pinned to node %q but that node "+
-						"is currently in maintenance; wait for maintenance to complete or "+
-						"migrate the disk to a different node",
-					localPin,
-				)
-			}
-			if !pinnedFact.Online {
-				return "", cpierrors.Cloud(
-					"create_vm: local disk is pinned to node %q but that node "+
-						"is offline; bring the node online before creating the VM",
-					localPin,
-				)
-			}
-			logger.Debug("create_vm: node selection: local disk pins node",
-				log.String("node", localPin),
-			)
-			return localPin, nil
-		}
-
-		// Build a PCI checker when pci_passthroughs is non-empty. The checker
-		// calls ListHardwarePci per candidate node (fail-safe: API error → reject).
-		// Empty list → nil checker → PCI pass skipped (byte-identical path).
-		var pciAddrs []string
-		var pciCheckerFn func(string) (bool, error)
-		if len(cp.PCIPassthroughs) > 0 {
-			pciAddrs = make([]string, len(cp.PCIPassthroughs))
-			for i, pt := range cp.PCIPassthroughs {
-				pciAddrs[i] = pt.Address
-			}
-			pciCheckerFn = buildPCIChecker(ctx, deps.PVE.Nodes(), pciAddrs)
-		}
-
-		// Compute the storage-capacity hard filter floor when the feature is enabled.
-		// requiredStorageBytes is 0 (no filter) when the gate is off — byte-identical.
-		//
-		// The placement facts measure deps.Config.VMStorage only. Root disk always
-		// lands on VMStorage. Ephemeral disk may land on a different pool (when
-		// cp.EphemeralStoragePool is set to a different name); in that case its bytes
-		// are excluded from the filter so we do not reject nodes based on a pool the
-		// facts did not measure. The resolver-layer ephemeral pool override is not
-		// consulted here because it requires a live PVE API call (storage-tier
-		// resolution) that is unavailable at this scope; the struct field
-		// (cp.EphemeralStoragePool) provides the best static approximation.
-		var requiredStorageBytes int64
-		if deps.Config.ReserveStorageHeadroomEnabled() {
-			requiredStorageBytes = computeRequiredStorageBytes(deps.Config, cp, storageName)
-		}
-
-		// Storage-utilization ceiling gate (storage.max_utilization_pct). See
-		// utilizationGateForRequest doc for the enforce/warn split.
-		utilCeilingPct, utilAddBytes, warnUtilChosen := utilizationGateForRequest(deps.Config, cp, storageName, facts, logger)
-
-		// AZ loop. When azOrder is empty (no AZ set at all), run a single
-		// iteration with no candidate restriction (all nodes).
-		allRejections := make(map[string]string)
-
-		if len(azOrder) == 0 {
-			// No AZ constraint: all nodes are candidates.
-			req := placement.Request{
-				ExcludeMaintenanceNodes: excludeMaintenance,
-				RequiredPCIAddresses:    pciAddrs,
-				PCIChecker:              pciCheckerFn,
-				RequiredStorageBytes:    requiredStorageBytes,
-				MaxUtilizationPct:       utilCeilingPct,
-				PlannedAddBytes:         utilAddBytes,
-			}
-			pass, rejections := placement.Filter(facts, req)
-			mergeRejections(allRejections, rejections)
-			logFilterRejections(logger, rejections, "")
-			if chosen := scoreAndPick(pass, weights, logger, ""); chosen != "" {
-				warnUtilChosen(chosen)
-				return chosen, nil
-			}
-		} else {
-			for _, az := range azOrder {
-				candidateSet, skipSilently := resolveAZCandidatesValidated(az, deps.Config, logger)
-				if skipSilently {
-					// DLB sentinel AZ: skip scoring, no error (pre-validation already passed).
-					continue
-				}
-
-				req := placement.Request{
-					CandidateNodes:          candidateSet,
-					ExcludeMaintenanceNodes: excludeMaintenance,
-					RequiredPCIAddresses:    pciAddrs,
-					PCIChecker:              pciCheckerFn,
-					RequiredStorageBytes:    requiredStorageBytes,
-					MaxUtilizationPct:       utilCeilingPct,
-					PlannedAddBytes:         utilAddBytes,
-				}
-				pass, rejections := placement.Filter(facts, req)
-				mergeRejections(allRejections, rejections)
-				logFilterRejections(logger, rejections, az)
-
-				if chosen := scoreAndPick(pass, weights, logger, az); chosen != "" {
-					warnUtilChosen(chosen)
-					return chosen, nil
-				}
-				logger.Debug("create_vm: placement: AZ exhausted, trying next",
-					log.String("az", az),
-				)
-			}
-		}
-
-		// All AZs exhausted (or no-AZ single pass had no candidates).
-		fallback := deps.Config.Node
-		logger.Warn("create_vm: placement: no viable candidates; falling back to config.node",
-			log.String("fallback", fallback),
-		)
-		if fallback == "" {
-			if classifyFilterResult(allRejections) {
-				return "", cpierrors.Retriable(
-					"create_vm: no viable placement candidates (transient); "+
-						"all nodes rejected: %s",
-					formatRejections(allRejections),
-				)
-			}
-			return "", cpierrors.Cloud(
-				"create_vm: no viable placement candidates; "+
-					"all nodes rejected: %s",
-				formatRejections(allRejections),
-			)
-		}
-		return fallback, nil
-	}
-
-	// Branch 3: placement disabled or PVE nil — legacy static node.
-	// When a local disk's home node is known, the VM must land there regardless
-	// of placement being disabled. This ensures co-location even in single-node
-	// static configs where config.node and the disk's node should agree; if they
-	// conflict we surface a clear error rather than silently creating an inaccessible VM.
-	if diskConstraints.requiredLocalNode != "" {
-		logger.Debug("create_vm: node selection: local disk pins node (placement disabled)",
-			log.String("node", diskConstraints.requiredLocalNode),
-		)
-		return diskConstraints.requiredLocalNode, nil
-	}
-
-	node := deps.Config.Node
-	if node == "" {
-		return "", cpierrors.Cloud(
-			"create_vm: target node not set in cloud_properties.target_node or config.node",
-		)
-	}
-	logger.Debug("create_vm: node selection: placement disabled, using config.node",
-		log.String("node", node),
-	)
-	return node, nil
-}
-
-// resolveTargetNodeWithFallbacks extends resolveTargetNodeWithRNG to also return
-// the ordered list of alternate node names from the same scored pass, capped at
-// fallbackMax. When fallbackMax == 0, this is equivalent to the existing single-
-// winner path and no alternates are returned (nil). When the winner comes from
+// fallbackMax caps the returned alternates — the tail of the ranked list
+// starting at rank 2, all of which passed the same Filter constraints (same
+// AZ, same maintenance/CPU/mem filter) as the winner. fallbackMax == 0 is the
+// plain single-winner path (alternates nil). When the winner comes from
 // Branch 1 (operator target_node), Branch 3 (static config.node), or the
-// config.node fallback inside Branch 2, no ranked alternates are available and
-// alternates is nil — the caller must treat nil as "no fallback candidates".
+// config.node fallback inside Branch 2, no ranked alternates are available
+// and alternates is nil — callers must treat nil as "no fallback candidates".
 //
-// The alternates slice does NOT include the winner; it is the tail of the ranked
-// list starting at rank 2. All alternates passed the same Filter constraints
-// (same AZ, same maintenance/CPU/mem filter) as the winner.
-//
-//nolint:gocognit,gocyclo // Mirrors resolveTargetNodeWithRNG complexity; inherent multi-AZ loop.
+//nolint:gocognit,gocyclo // Single home of the multi-AZ placement loop; inherent complexity.
 func resolveTargetNodeWithFallbacks(
 	ctx context.Context,
 	deps Deps,
@@ -2256,23 +1976,6 @@ func resolveAZCandidatesValidated(az string, cfg *config.CPIConfig, logger *log.
 	}
 	// Should not reach here after pre-validation; treat as skip.
 	return nil, true
-}
-
-// scoreAndPick scores the passed nodes and picks the best. Returns "" when
-// pass is empty.
-func scoreAndPick(pass []placement.NodeFacts, weights placement.Weights, logger *log.Logger, az string) string {
-	if len(pass) == 0 {
-		return ""
-	}
-	scored := placement.Score(pass, weights, nil)
-	chosen := placement.Pick(scored, nil)
-	if chosen != "" {
-		logger.Info("create_vm: node selection: placement scoring chose node",
-			log.String("node", chosen),
-			log.String("az", az),
-		)
-	}
-	return chosen
 }
 
 // scoreAndPickWithRanked scores the passed nodes, picks the best, and returns
@@ -3684,7 +3387,7 @@ func handleCloneError(
 			log.Int("vmid_attempted", candidate),
 			log.ErrScrubbed(cerr),
 		)
-		cleanupVM(contextWithoutCancel(ctx), deps, node, candidate, nil, logger)
+		cleanupVMDetached(ctx, deps, node, candidate, logger)
 	case pve.IsVMIDConflict(cerr):
 		logger.Info("create_vm: vmid conflict on clone, retrying",
 			log.Int("vmid_attempted", candidate),
@@ -3700,12 +3403,12 @@ func handleCloneError(
 			log.Int("vmid_attempted", candidate),
 			log.ErrScrubbed(cerr),
 		)
-		cleanupVM(contextWithoutCancel(ctx), deps, node, candidate, nil, logger)
+		cleanupVMDetached(ctx, deps, node, candidate, logger)
 	default:
 		// Non-retryable error (e.g. local-storage cross-node violation,
 		// template not found, or other PVE fatal). Clean up any partial VM
 		// state and propagate — AllocateWithRetry will not retry.
-		cleanupVM(contextWithoutCancel(ctx), deps, node, candidate, nil, logger)
+		cleanupVMDetached(ctx, deps, node, candidate, logger)
 	}
 	return cerr
 }
@@ -4189,7 +3892,7 @@ func handleCreateError(
 			log.Int("vmid_attempted", candidate),
 			log.ErrScrubbed(cerr),
 		)
-		cleanupVM(contextWithoutCancel(ctx), deps, node, candidate, nil, logger)
+		cleanupVMDetached(ctx, deps, node, candidate, logger)
 	}
 	return cerr
 }
@@ -4218,7 +3921,7 @@ func handleAwaitError(
 		// PVE rolled back its own qmcreate task — but the
 		// VMID may still be registered with the partial
 		// state. Clean up before the next attempt.
-		cleanupVM(contextWithoutCancel(ctx), deps, node, candidate, nil, logger)
+		cleanupVMDetached(ctx, deps, node, candidate, logger)
 		return werr
 	}
 	if pve.IsTransientTransport(werr) {
@@ -4229,14 +3932,14 @@ func handleAwaitError(
 		// The qmcreate task itself may still be running on
 		// PVE — we only lost the await connection. Clean
 		// up the VMID so a fresh attempt has a clean slate.
-		cleanupVM(contextWithoutCancel(ctx), deps, node, candidate, nil, logger)
+		cleanupVMDetached(ctx, deps, node, candidate, logger)
 		return werr
 	}
 	// Non-conflict failure after Create succeeded: the VM may
 	// have been partially registered. Roll back this attempt
 	// before propagating so the next retry (which won't run)
 	// or the caller sees a clean slate.
-	cleanupVM(contextWithoutCancel(ctx), deps, node, candidate, nil, logger)
+	cleanupVMDetached(ctx, deps, node, candidate, logger)
 	return werr
 }
 
@@ -4582,7 +4285,8 @@ func attachEphemeralDisk(
 	// volume. Errors are logged, never propagated — this is best-effort cleanup
 	// of an already-failed create_vm attempt.
 	cleanupVol := func() {
-		rollbackCtx := contextWithoutCancel(ctx)
+		rollbackCtx, rbCancel := detachedContext(ctx, rollbackCleanupTimeout)
+		defer rbCancel()
 		stor, _, _ := pve.ParseDiskCID(createdVolid)
 		if stor == "" {
 			stor = shape.ephemeralStorage
@@ -5172,17 +4876,21 @@ func rollbackOnExit(
 ) {
 	if r := recover(); r != nil {
 		if *vmCreated {
-			disposeFailedVM(contextWithoutCancel(ctx), deps, node, vmid, env, logger)
+			rbCtx, rbCancel := detachedContext(ctx, rollbackCleanupTimeout)
+			disposeFailedVM(rbCtx, deps, node, vmid, env, logger)
+			rbCancel()
 		}
 		panic(r)
 	}
 	if *retErr != nil && *vmCreated {
 		if deps.Config.KeepFailedVMsEnabled() {
-			tagFailedVM(contextWithoutCancel(ctx), deps, node, vmid, env, logger)
+			rbCtx, rbCancel := detachedContext(ctx, rollbackCleanupTimeout)
+			tagFailedVM(rbCtx, deps, node, vmid, env, logger)
+			rbCancel()
 			*retErr = preserveFailedVMError(*retErr, vmid, node)
 			return
 		}
-		cleanupVM(contextWithoutCancel(ctx), deps, node, vmid, nil, logger)
+		cleanupVMDetached(ctx, deps, node, vmid, logger)
 	}
 }
 
@@ -5286,6 +4994,17 @@ func preserveFailedVMError(orig error, vmid int, node string) error {
 // the skiplock recovery attempt and the actionable log message still run
 // regardless of env.
 // --------------------------------------------------------------------------
+// cleanupVMDetached runs cleanupVM on a cancellation-detached context bounded
+// by rollbackCleanupTimeout. Every rollback call site funnels here so cleanup
+// survives caller cancellation without inheriting the SDK's 30-minute
+// transport timeout times a retry budget as its only bound (see
+// detachedContext).
+func cleanupVMDetached(ctx context.Context, deps Deps, node string, vmid int, logger *log.Logger) {
+	rbCtx, rbCancel := detachedContext(ctx, rollbackCleanupTimeout)
+	defer rbCancel()
+	cleanupVM(rbCtx, deps, node, vmid, nil, logger)
+}
+
 func cleanupVM(ctx context.Context, deps Deps, node string, vmid int, env map[string]any, logger *log.Logger) {
 	logger.Warn("create_vm: rolling back, destroying created VM", log.Int(metadataKeyVMID, vmid))
 	vmCID := strconv.Itoa(vmid)

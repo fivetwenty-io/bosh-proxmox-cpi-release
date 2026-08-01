@@ -5,9 +5,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
@@ -132,6 +136,83 @@ func TestRunCPI_SingleRequest(t *testing.T) {
 	}
 	if !strings.Contains(resp.Error.Type, "NotImplemented") {
 		t.Errorf("expected NotImplemented error type, got %q", resp.Error.Type)
+	}
+}
+
+// scanErrReader fails every Read with a persistent non-EOF error, simulating
+// a wedged pipe (EIO) or a Director dying mid-write.
+type scanErrReader struct{}
+
+func (scanErrReader) Read([]byte) (int, error) {
+	return 0, fmt.Errorf("simulated stdin I/O error (EIO)")
+}
+
+// TestRunCPI_ScanErrorTerminates verifies a non-EOF, non-ErrTooLong read
+// error terminates runCPI after exactly one CloudError response.
+// bufio.Scanner is single-shot after any read error, so continuing the loop
+// would re-fail identically and spin hot, flooding stdout with repeated
+// CloudError responses.
+func TestRunCPI_ScanErrorTerminates(t *testing.T) {
+	t.Parallel()
+	_, logger := makeTestDeps(t)
+	var w bytes.Buffer
+
+	d := cpi.NewDispatcher(logger)
+	done := make(chan error, 1)
+	go func() {
+		done <- runCPI(context.Background(), scanErrReader{}, &w, d, logger, defaultMaxLineBytes, nil)
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("scan error should terminate cleanly, got: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("runCPI did not return after a persistent scan error (hot spin)")
+	}
+
+	lines := strings.Split(strings.TrimSpace(w.String()), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("expected exactly 1 CloudError response, got %d:\n%s", len(lines), w.String())
+	}
+	resp := parseResponse(t, lines[0])
+	if resp.Error == nil || !strings.Contains(resp.Error.Message, "request read failed") {
+		t.Fatalf("expected request-read-failed CloudError, got: %+v", resp)
+	}
+}
+
+// TestRunCPI_CancelUnblocksIdleRead verifies context cancellation terminates a
+// runCPI blocked in a read with no pending input: the AfterFunc closes the
+// read side, the blocked read returns, and runCPI reports errSignaled instead
+// of requiring SIGKILL.
+func TestRunCPI_CancelUnblocksIdleRead(t *testing.T) {
+	t.Parallel()
+	_, logger := makeTestDeps(t)
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	defer pw.Close() //nolint:errcheck // test cleanup
+	var w bytes.Buffer
+
+	ctx, cancel := context.WithCancel(context.Background())
+	d := cpi.NewDispatcher(logger)
+	done := make(chan error, 1)
+	go func() {
+		done <- runCPI(ctx, pr, &w, d, logger, defaultMaxLineBytes, nil)
+	}()
+
+	// Give runCPI time to park in the blocking read, then cancel.
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+
+	select {
+	case runErr := <-done:
+		if !errors.Is(runErr, errSignaled) {
+			t.Fatalf("expected errSignaled after cancel, got: %v", runErr)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("runCPI stayed blocked in read after context cancellation")
 	}
 }
 

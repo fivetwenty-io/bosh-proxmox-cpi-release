@@ -42,16 +42,6 @@ type awaitOptions struct {
 // AwaitOption is a functional option for AwaitTask.
 type AwaitOption func(*awaitOptions)
 
-// WithPollInterval sets the poll interval passed to the SDK WaitOptions.
-// Values ≤ 0 are ignored (default 2 s applies).
-func WithPollInterval(d time.Duration) AwaitOption {
-	return func(o *awaitOptions) {
-		if d > 0 {
-			o.pollIntervalMs = int(d.Milliseconds())
-		}
-	}
-}
-
 // WithMaxWait sets the maximum wait timeout passed to the SDK WaitOptions.
 // Overrides the ctx deadline if shorter. Values ≤ 0 are ignored (default 5 min applies).
 func WithMaxWait(d time.Duration) AwaitOption {
@@ -112,7 +102,7 @@ func AwaitTask(ctx context.Context, c Client, node, upid string, opts ...AwaitOp
 	}
 
 	// Resolve the poll cadence from the process-wide (operator-configurable)
-	// defaults. WithPollInterval still overrides the base interval per call.
+	// defaults.
 	pollIntervalMs, pollMaxIntervalMs, pollJitterPct := taskPollDefaults()
 	ao := &awaitOptions{
 		pollIntervalMs: pollIntervalMs,
@@ -211,7 +201,12 @@ func adaptiveTaskInterval(elapsed time.Duration, progress float64, fallback time
 }
 
 // awaitTaskAdaptive is the §7.28 progress-aware poll loop. It mirrors AwaitTask's
-// terminal/error classification exactly:
+// terminal/error classification, with ONE deliberate divergence: AwaitTask can
+// observe ExitStatus == "" only while the task is still running (it returns a
+// retriable poll-timeout for it), whereas this loop reaches classification
+// only after Status == "stopped", where an empty ExitStatus is treated as
+// success (see classifyTaskExit). The two paths never classify the same
+// observable state differently — they observe different states.
 //   - terminal "stopped" with exit OK/ok/"" or a WARNINGS status → nil
 //   - terminal "stopped" with any other exit → non-retriable CloudError
 //   - poll deadline exceeded while still running → retriable (task still running)
@@ -306,11 +301,21 @@ func nodeFromUPID(upid string) string {
 // taskStatusStopped is the PVE task status string for a finished task.
 const taskStatusStopped = "stopped"
 
-// classifyTaskExit maps a terminal task's exit status to the CPI result, mirroring
-// AwaitTask: OK/ok/"" or a WARNINGS status is success; anything else is a
-// non-retriable failure.
+// classifyTaskExit maps a terminal (Status == "stopped") task's exit status
+// to the CPI result: OK/ok or a WARNINGS status (warned) is success; anything
+// else is a non-retriable failure.
+//
+// An empty exit status on a STOPPED task is also accepted as success — an
+// explicit choice, not an oversight: some PVE task types report stopped with
+// no exit string, and failing them would break genuinely-completed
+// operations. This is the one classification AwaitTask never faces (it only
+// sees an empty ExitStatus while the task is still running, which it maps to
+// a retriable poll-timeout).
 func classifyTaskExit(upid, exit string, warned bool) error {
-	if warned || exit == "" || exit == "OK" || exit == "ok" {
+	if exit == "" {
+		return nil
+	}
+	if warned || exit == "OK" || exit == "ok" {
 		return nil
 	}
 	return cpierrors.Cloud("task %s failed: exit status %q", upid, exit)

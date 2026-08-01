@@ -32,7 +32,11 @@ func cleanupAdvertisedRoutes(ctx context.Context, deps Deps, vmid int, tagsRaw s
 	if len(refs) == 0 {
 		return
 	}
-	opCtx := contextWithoutCancel(ctx)
+	// Bounded: this cleanup is documented as entirely fail-open, so a tight
+	// deadline costs nothing while keeping a hung SDN mutation from pinning
+	// the handler past its operation budget.
+	opCtx, opCancel := detachedContext(ctx, rollbackCleanupTimeout)
+	defer opCancel()
 	clusterSvc := deps.PVE.Cluster()
 
 	shared := advrtTagsHeldByOthers(opCtx, clusterSvc, vmid, logger)

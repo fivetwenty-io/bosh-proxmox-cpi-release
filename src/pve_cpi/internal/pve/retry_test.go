@@ -6,138 +6,7 @@ import (
 	mrand "math/rand/v2"
 	"testing"
 	"time"
-
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
 )
-
-func TestRetryOnStorageLock_SucceedsImmediately(t *testing.T) {
-	t.Parallel()
-	calls := 0
-	err := RetryOnStorageLock(context.Background(), nil, "test", 5, func() error {
-		calls++
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if calls != 1 {
-		t.Fatalf("expected 1 call, got %d", calls)
-	}
-}
-
-func TestRetryOnStorageLock_NonLockErrorPropagates(t *testing.T) {
-	t.Parallel()
-	want := errors.New("some other failure")
-	calls := 0
-	err := RetryOnStorageLock(context.Background(), nil, "test", 5, func() error {
-		calls++
-		return want
-	})
-	if !errors.Is(err, want) {
-		t.Fatalf("expected wrapped sentinel, got %v", err)
-	}
-	if calls != 1 {
-		t.Fatalf("expected 1 call (no retry on non-lock error), got %d", calls)
-	}
-}
-
-func TestRetryOnStorageLock_LockTimeoutRetriesThenSucceeds(t *testing.T) {
-	t.Parallel()
-	// Override the backoff curve via WithTestBackoff so the retry loop's
-	// behaviour (call count, log lines, return value) is verified without
-	// burning multi-second sleeps. A small non-zero spacer keeps the loop
-	// exercising the timer path; bump if backoff observability ever needs
-	// asserting independently.
-	const spacer = 5 * time.Millisecond
-	ctx := WithTestBackoff(context.Background(), func(int) time.Duration { return spacer })
-	calls := 0
-	lockErr := errors.New("can't lock file '/var/lock/pve-manager/pve-storage-data' - got timeout")
-	start := time.Now()
-	err := RetryOnStorageLock(ctx, log.NewNopLogger(), "test", 3, func() error {
-		calls++
-		if calls < 3 {
-			return lockErr
-		}
-		return nil
-	})
-	elapsed := time.Since(start)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if calls != 3 {
-		t.Fatalf("expected 3 calls, got %d", calls)
-	}
-	// Two backoff hops at spacer each; lower bound proves the timer path
-	// fired without locking the test to the production curve.
-	if elapsed < 2*spacer {
-		t.Fatalf("expected at least %v of backoff, got %v", 2*spacer, elapsed)
-	}
-}
-
-func TestRetryOnStorageLock_ExhaustsAndReturnsLastErr(t *testing.T) {
-	t.Parallel()
-	calls := 0
-	lockErr := errors.New("CAN'T LOCK FILE ... GOT TIMEOUT")
-	err := RetryOnStorageLock(context.Background(), nil, "test", 2, func() error {
-		calls++
-		return lockErr
-	})
-	if !errors.Is(err, lockErr) {
-		t.Fatalf("expected exhausted-attempts error to wrap last lock error, got %v", err)
-	}
-	if calls != 2 {
-		t.Fatalf("expected 2 calls (max attempts), got %d", calls)
-	}
-}
-
-func TestRetryOnStorageLock_ContextCancelShortCircuits(t *testing.T) {
-	t.Parallel()
-	ctx, cancel := context.WithCancel(context.Background())
-	calls := 0
-	lockErr := errors.New("can't lock file 'x' - got timeout")
-	done := make(chan error, 1)
-	go func() {
-		done <- RetryOnStorageLock(ctx, nil, "test", 10, func() error {
-			calls++
-			if calls == 1 {
-				// After the first failure the retry loop will enter
-				// the backoff sleep; cancel just before that.
-				go cancel()
-			}
-			return lockErr
-		})
-	}()
-	select {
-	case err := <-done:
-		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("expected context.Canceled, got %v", err)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("RetryOnStorageLock did not honor ctx cancellation in time")
-	}
-}
-
-func TestRetryOnStorageLock_ZeroMaxAttemptsUsesDefault(t *testing.T) {
-	t.Parallel()
-	// With maxAttempts<=0 the helper substitutes DefaultStorageLockMaxAttempts
-	// (10). Verify by capturing a non-lock error on the second call so we
-	// never actually sleep.
-	want := errors.New("non lock error")
-	calls := 0
-	err := RetryOnStorageLock(context.Background(), nil, "test", 0, func() error {
-		calls++
-		if calls == 1 {
-			return errors.New("can't lock file 'x' - got timeout")
-		}
-		return want
-	})
-	if !errors.Is(err, want) {
-		t.Fatalf("expected sentinel, got %v", err)
-	}
-	if calls != 2 {
-		t.Fatalf("expected 2 calls, got %d", calls)
-	}
-}
 
 func TestRetryOnTransient_SucceedsImmediately(t *testing.T) {
 	t.Parallel()
@@ -275,29 +144,6 @@ func TestRetryOnTransientOrLock_QuorumIsRetried(t *testing.T) {
 	}
 }
 
-// TestRetryOnStorageLock_QuorumIsRetried proves RetryOnStorageLock — the
-// dedicated storage-lock curve helper — also retries quorum-loss errors, not
-// only lockfile timeouts, since both share the same curve.
-func TestRetryOnStorageLock_QuorumIsRetried(t *testing.T) {
-	t.Parallel()
-	ctx := WithTestBackoff(context.Background(), func(int) time.Duration { return 0 })
-	calls := 0
-	quorumErr := errors.New("cluster not ready - no quorum on node pve02")
-	err := RetryOnStorageLock(ctx, nil, "test", 4, func() error {
-		calls++
-		if calls < 3 {
-			return quorumErr
-		}
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if calls != 3 {
-		t.Fatalf("expected 3 calls, got %d", calls)
-	}
-}
-
 // TestRetryOrLockCurve_QuorumUsesStorageLockCurveNotTransient is the
 // retry-curve routing test the acceptance criteria calls for: it proves a
 // quorum error selects the storage-lock backoff curve (2s→30s, 10 attempts)
@@ -325,14 +171,45 @@ func TestRetryOrLockCurve_QuorumUsesStorageLockCurveNotTransient(t *testing.T) {
 	}
 }
 
-// TestRetryOrLockCurve_PushbackPriorityOverQuorum verifies pushback (the most
-// conservative signal — worker-pool exhaustion) still wins the curve
-// selection even when a quorum condition is also flagged for the same error.
-func TestRetryOrLockCurve_PushbackPriorityOverQuorum(t *testing.T) {
+// TestRetryOrLockCurve_LockAndQuorumWinOverPushback verifies lock and quorum
+// take priority over pushback. IsPVEPushback substring-matches "got timeout",
+// which appears in both canonical storage-lock error shapes, so both
+// classifiers flag the same error — a pushback-first ordering routed every
+// storage-lock retry onto the pushback curve, ignoring the operator's tuned
+// pve.retry.storage_lock settings and mislabeling the retry-log reason.
+func TestRetryOrLockCurve_LockAndQuorumWinOverPushback(t *testing.T) {
 	t.Parallel()
-	_, reason := retryOrLockCurve(true, false, true, 0)
-	if reason != "pushback" {
-		t.Errorf("reason = %q; want %q (pushback must win over quorum)", reason, "pushback")
+	if _, reason := retryOrLockCurve(true, false, true, 0); reason != "cluster_not_quorate" {
+		t.Errorf("reason = %q; want %q (quorum must win over pushback)", reason, "cluster_not_quorate")
+	}
+	if _, reason := retryOrLockCurve(true, true, false, 0); reason != "storage_lock" {
+		t.Errorf("reason = %q; want %q (lock must win over pushback)", reason, "storage_lock")
+	}
+	if _, reason := retryOrLockCurve(true, false, false, 0); reason != "pushback" {
+		t.Errorf("reason = %q; want %q (pure pushback keeps its curve)", reason, "pushback")
+	}
+}
+
+// TestRetryOrLockCurve_CanonicalStorageLockStrings routes the two canonical
+// PVE storage-lock error shapes through the real classifiers and asserts they
+// land on the storage_lock curve — the end-to-end regression for the
+// pushback-superset bug, using production classification rather than
+// hand-set booleans.
+func TestRetryOrLockCurve_CanonicalStorageLockStrings(t *testing.T) {
+	t.Parallel()
+	for _, msg := range []string{
+		"can't lock file '/var/lock/pve-manager/pve-storage-local' - got timeout",
+		"command '/sbin/lvcreate ...' failed: got timeout",
+	} {
+		err := errors.New(msg)
+		isLock := IsStorageLockTimeout(err)
+		if !isLock {
+			t.Fatalf("IsStorageLockTimeout(%q) = false; canonical shape must classify as lock", msg)
+		}
+		_, reason := retryOrLockCurve(IsPVEPushback(err), isLock, IsClusterNotQuorate(err), 0)
+		if reason != "storage_lock" {
+			t.Errorf("reason for %q = %q; want storage_lock", msg, reason)
+		}
 	}
 }
 

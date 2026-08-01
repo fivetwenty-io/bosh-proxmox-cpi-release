@@ -62,7 +62,13 @@ func withVMIDLock(
 		return err
 	}
 	defer func() {
-		if relErr := handle.Release(ctx); relErr != nil {
+		// Release is cleanup: run it on a detached, bounded context so an
+		// expired or cancelled request ctx cannot make DeletePool fail
+		// instantly and orphan the sentinel pool until a later acquirer
+		// steals it past the TTL.
+		relCtx, relCancel := detachedContext(ctx, lockReleaseTimeout)
+		defer relCancel()
+		if relErr := handle.Release(relCtx); relErr != nil {
 			if logger != nil {
 				logger.Warn("withVMIDLock: release failed (non-fatal)",
 					log.Int("vmid", vmid),

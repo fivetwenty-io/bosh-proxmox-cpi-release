@@ -559,7 +559,7 @@ func TestAwaitTask_PollIntervalOption(t *testing.T) {
 
 	interval := 500 * time.Millisecond
 	err := pve.AwaitTask(context.Background(), newMockClient(svc), "node1", "UPID:node1:abc",
-		pve.WithPollInterval(interval))
+		pve.WithPollIntervalForTest(interval))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -698,7 +698,7 @@ func TestAwaitTaskWithLogger_FailureWithLogger(t *testing.T) {
 	}
 }
 
-func TestAwaitTask_WithPollInterval_Zero(t *testing.T) {
+func TestAwaitTask_WithPollIntervalForTest_Zero(t *testing.T) {
 	t.Parallel()
 	// Zero duration opt is ignored; default should be used.
 	var capturedOpts *sdktasks.WaitOptions
@@ -709,7 +709,7 @@ func TestAwaitTask_WithPollInterval_Zero(t *testing.T) {
 		},
 	}
 	err := pve.AwaitTask(context.Background(), newMockClient(svc), "node1", "UPID:node1:abc",
-		pve.WithPollInterval(0))
+		pve.WithPollIntervalForTest(0))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

@@ -22,9 +22,15 @@ var globalVNIMu sync.Mutex
 // the vnet-tag exclusion set, exactly as it did before zone-level exclusion
 // was added. One warning per CPI process is enough to alert the operator
 // without flooding logs on every subsequent allocation while the underlying
-// PVE fault persists — mirrors the localISOStorageWarnOnce /
-// firewallMasterSwitchProbeOnce once-per-process idiom used elsewhere in this
-// codebase.
+// PVE fault persists — mirrors the localISOStorageWarnOnce once-per-process
+// idiom used elsewhere in this codebase.
+//
+// Process-scoped, not cluster-scoped: with per-request context overrides one
+// process can serve several clusters, and only the first to hit the failure
+// warns. Accepted for this low-stakes diagnostic; contrast handlers'
+// firewallMasterSwitchProbedClusters, keyed per cluster because its warning
+// is enforcement-relevant. Tests reset it via export_test.go so the suite is
+// repeat-safe under -count=N.
 var vniZoneListWarnOnce sync.Once
 
 // zoneReservedVNIFields decodes the numeric VNI-shaped fields a PVE SDN zone
@@ -43,9 +49,8 @@ var vniZoneListWarnOnce sync.Once
 // Both fields are optional and zone-type-dependent; PVE's zone row schema is
 // sparse and varies by plugin type (see SDNZone's own doc comment), so
 // decoding tolerates either or both being absent. Uses the same plain int64
-// JSON typing as SDNVnet.Tag / SDNVnetParams.Tag elsewhere in this file — PVE
-// encodes these as JSON numbers, not the 0/1 integer-boolean convention
-// pveBool exists for.
+// JSON typing as SDNVnet.Tag elsewhere in this file — PVE encodes these as
+// JSON numbers, not the 0/1 integer-boolean convention pveBool exists for.
 type zoneReservedVNIFields struct {
 	VrfVxlan *int64 `json:"vrf-vxlan,omitempty"`
 	Tag      *int64 `json:"tag,omitempty"`

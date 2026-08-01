@@ -214,10 +214,9 @@ func (r *RequestOverrideRuntime) cachePutOrExisting(key string, bundle *override
 // already governs that request (the operation-timeout envelope when
 // enabled, process shutdown otherwise), not by an unbounded background
 // timer. Only the LEADER's ctx governs the actual build; a follower that is
-// itself canceled while waiting still unblocks promptly once the leader's
-// build finishes (success or failure) — it does not get its own cancellation
-// propagated into the leader's in-flight build, since doing so would abort
-// the build for every other waiting follower too.
+// itself canceled while waiting returns its own ctx error immediately — its
+// cancellation is not propagated into the leader's in-flight build, since
+// doing so would abort the build for every other waiting follower too.
 //
 // Failure modes:
 //   - r is nil → returns an error rather than a nil-pointer panic. Guarded
@@ -254,12 +253,36 @@ func (r *RequestOverrideRuntime) resolve(ctx context.Context, cfg *config.CPICon
 	}
 	if !isLeader {
 		// Follower: wait for the leader's build to finish (success or
-		// failure) rather than starting a redundant build of our own.
-		<-call.done
-		return call.bundle, call.err
+		// failure) rather than starting a redundant build of our own. The
+		// ctx arm is an escape hatch, not a build abort: a cancelled
+		// follower stops waiting, but the leader's build continues for the
+		// other followers.
+		select {
+		case <-call.done:
+			return call.bundle, call.err
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 	}
 
-	built, err := r.buildBundle(ctx, cfg)
+	// finishBuild must run even when buildBundle panics: it is the only place
+	// that closes call.done and clears r.building[key], so skipping it would
+	// park every follower forever and turn every future request for this
+	// identity into a follower of a dead buildCall — a permanent per-identity
+	// wedge that outlives the dispatcher's own panic recovery. The recover
+	// converts the panic into an ordinary build error (shared with followers,
+	// nothing cached, next call retries) and the panic is NOT re-raised — the
+	// error path already reports it.
+	var built *overrideBundle
+	var err error
+	func() {
+		defer func() {
+			if rec := recover(); rec != nil {
+				built, err = nil, fmt.Errorf("cpi: override bundle build panicked: %v", rec)
+			}
+		}()
+		built, err = r.buildBundle(ctx, cfg)
+	}()
 	r.finishBuild(key, call, built, err)
 	return built, err
 }
@@ -478,6 +501,24 @@ func (d Deps) WithRequestOverrides(ctx context.Context, reqCtx jsonrpc.Context) 
 		log.Any("overridden_keys", applied),
 		log.String("effective_pve_host", effCfg.Host),
 	)
+
+	// A per-request TLS-verification downgrade is a security-relevant event
+	// that must be attributable to the request that carried it: the client
+	// constructor's own warning goes to the runtime logger (no request_id or
+	// method) and fires once per cached bundle, not once per affected
+	// request. The inherited job-level credentials are sent to the overridden
+	// host over the unverified connection, so name the host explicitly.
+	if !effCfg.VerifySSLValue() {
+		for _, k := range applied {
+			if k == "pve_verify_ssl" {
+				d.Log(ctx).Warn(
+					"cpi: request context override disables TLS verification for this request; job-level PVE credentials will be sent to the overridden host without certificate validation",
+					log.String("effective_pve_host", effCfg.Host),
+				)
+				break
+			}
+		}
+	}
 
 	d.Config = effCfg
 	d.PVE = bundle.client

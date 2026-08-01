@@ -253,19 +253,15 @@ func (h *ClusterLockHandle) Release(ctx context.Context) error {
 	if h == nil || h.released {
 		return nil
 	}
-	h.released = true
 	if err := h.pools.DeletePool(ctx, h.pool); err != nil && !isPoolNotFound(err) {
+		// released stays false: a failed delete (cancelled ctx, transient
+		// API fault) must not latch the handle closed, or a retried Release
+		// silently no-ops and the sentinel pool is orphaned until a later
+		// acquirer steals it past the TTL.
 		return cpierrors.Wrap(err, fmt.Sprintf("ReleaseClusterLock: delete sentinel pool %q", h.pool))
 	}
+	h.released = true
 	return nil
-}
-
-// PoolName returns the sentinel pool id backing this lock (diagnostics/tests).
-func (h *ClusterLockHandle) PoolName() string {
-	if h == nil {
-		return ""
-	}
-	return h.pool
 }
 
 // lockCommentPrefix and lockCommentExpKey frame the structured comment stamped

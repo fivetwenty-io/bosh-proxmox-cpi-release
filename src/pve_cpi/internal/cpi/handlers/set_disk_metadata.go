@@ -209,7 +209,9 @@ func findVMsHostingDisk(ctx context.Context, deps Deps, diskCID string) ([]attac
 		return inner
 	})
 	if listErr != nil {
-		return nil, cpierrors.Wrap(listErr, "set_disk_metadata: list cluster resources")
+		// WrapError keeps transport errors retriable, matching the contract
+		// documented above (transient list failures propagate as retriable).
+		return nil, cpierrors.Wrap(pve.WrapError(listErr), "set_disk_metadata: list cluster resources")
 	}
 	if resources == nil {
 		return nil, cpierrors.Cloud("set_disk_metadata: nil response from cluster resources")

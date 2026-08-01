@@ -117,6 +117,27 @@ func TestStorageInfoCache_CachesUntilTTL(t *testing.T) {
 	}
 }
 
+// TestStorageInfoCache_ZeroTTLDisablesPositiveCaching pins the documented
+// ttl <= 0 contract: every Get must trigger a fetch. The inverted hit
+// condition this regression-tests pinned the first /storage snapshot for the
+// process lifetime, silently routing disk placement by stale data after a
+// storage.cfg edit.
+func TestStorageInfoCache_ZeroTTLDisablesPositiveCaching(t *testing.T) {
+	t.Parallel()
+	lister := &fakeLister{entries: []map[string]any{
+		{"storage": "s1", "type": "rbd"},
+	}}
+	cache := NewStorageInfoCache(lister, 0)
+	for i := 0; i < 3; i++ {
+		if _, err := cache.Get(context.Background(), "s1"); err != nil {
+			t.Fatalf("Get #%d: %v", i, err)
+		}
+	}
+	if lister.calls != 3 {
+		t.Fatalf("lister.calls=%d, want 3 (ttl<=0 must fetch on every Get)", lister.calls)
+	}
+}
+
 func TestStorageInfoCache_MissingStorageReportsError(t *testing.T) {
 	t.Parallel()
 	lister := &fakeLister{entries: []map[string]any{

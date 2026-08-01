@@ -9,19 +9,35 @@ package handlers
 
 import (
 	"context"
+	"fmt"
 	"sync"
 
+	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
 )
 
-// firewallMasterSwitchProbeOnce guards the once-per-process probe of the PVE
-// datacenter firewall master switch (GET /cluster/firewall/options). The
+// firewallMasterSwitchProbedClusters guards the once-per-cluster probe of the
+// PVE datacenter firewall master switch (GET /cluster/firewall/options). The
 // master switch is a cluster-wide, rarely-changed setting, so one probe (and,
-// if warranted, one Warn) per CPI process is sufficient — re-querying on
-// every create_vm call would add an avoidable API round-trip to every deploy
-// without adding information. Mirrors the existing once-per-process Warn
-// idiom used for the ISO-storage-local warning (see internal/agent/configdrive.go).
-var firewallMasterSwitchProbeOnce sync.Once
+// if warranted, one Warn) per cluster per CPI process is sufficient —
+// re-querying on every create_vm call would add an avoidable API round-trip
+// to every deploy without adding information. Keyed per cluster rather than a
+// plain process-wide sync.Once because per-request context overrides let one
+// CPI process serve several PVE clusters: a process-lifetime Once would probe
+// whichever cluster the first create_vm targeted and silently skip every
+// other cluster's probe, hiding an unenforced-firewall warning exactly where
+// it was never checked.
+var firewallMasterSwitchProbedClusters sync.Map
+
+// clusterIdentity returns a stable per-cluster key for warn-once state:
+// host:port of the effective config. Returns "" for a nil config (callers
+// treat that as one shared identity, matching the pre-override behavior).
+func clusterIdentity(cfg *config.CPIConfig) string {
+	if cfg == nil {
+		return ""
+	}
+	return fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
+}
 
 // firewallFeatureInPlay reports whether any firewall-affecting feature is
 // requested for this VM: an enabled VM-level firewall flag, a non-empty
@@ -64,7 +80,10 @@ func firewallFeatureInPlay(effectiveGroups []string, firewallEnabled bool, netwo
 // single "could not verify" Warn and return. This probe NEVER fails create_vm
 // and never blocks on retries.
 func probeFirewallMasterSwitch(ctx context.Context, deps Deps, logger *log.Logger) {
-	firewallMasterSwitchProbeOnce.Do(func() {
+	if _, probed := firewallMasterSwitchProbedClusters.LoadOrStore(clusterIdentity(deps.Config), struct{}{}); probed {
+		return
+	}
+	func() {
 		if deps.PVE == nil || deps.PVE.Cluster() == nil {
 			return
 		}
@@ -94,5 +113,5 @@ func probeFirewallMasterSwitch(ctx context.Context, deps Deps, logger *log.Logge
 			"enforcement — before doing so, ensure a management allow rule and explicit allowances for " +
 			"required cluster traffic (e.g. Ceph, VXLAN UDP 4789, BGP TCP 179 where used) already exist, " +
 			"or the change can lock out cluster nodes. See docs/configuration.md for details.")
-	})
+	}()
 }

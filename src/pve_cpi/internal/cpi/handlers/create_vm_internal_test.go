@@ -2202,6 +2202,75 @@ func TestResolveTargetNodeWithRNG_TargetNodeMatchesLocalDisk_OK(t *testing.T) {
 	}
 }
 
+// TestResolveTargetNodeWithFallbacks_TargetNodeConflictsLocalDisk_Error drives
+// the operator-pin/local-disk conflict guard on the fallback entry point
+// (fallbackMax > 0) — the code path production takes when
+// placement_fallback_max is enabled. The implementation is shared with
+// resolveTargetNodeWithRNG by delegation, so this test guards the fallback
+// plumbing (extra return values, alternates handling) around the same guard.
+func TestResolveTargetNodeWithFallbacks_TargetNodeConflictsLocalDisk_Error(t *testing.T) {
+	t.Parallel()
+	deps := Deps{
+		Config: &config.CPIConfig{
+			Host:          "pve.test",
+			Node:          "",
+			VMStorage:     "local-lvm",
+			NetworkBridge: "vmbr0",
+		},
+		PVE:      nil,
+		Logger:   log.NewNopLogger(),
+		Resolver: &staticKindResolver{sharedPools: nil}, // all pools are local
+	}
+	diskCIDs := []string{encodeLocalCID("pve1")}
+	cp := createVMCloudProps{TargetNode: "pve2"} // conflicts with disk on pve1
+	_, alts, err := resolveTargetNodeWithFallbacks(context.Background(), deps, cp, "", diskCIDs, nil, nil, 3)
+	if err == nil {
+		t.Fatal("expected error for target_node/disk conflict; got nil")
+	}
+	if alts != nil {
+		t.Errorf("no alternates may accompany a conflict error; got %v", alts)
+	}
+	if !strings.Contains(err.Error(), "pve2") || !strings.Contains(err.Error(), "pve1") {
+		t.Errorf("error must name both target_node and disk node; got: %v", err)
+	}
+	var cpiErr *cpierrors.Error
+	if stderrors.As(err, &cpiErr) && cpiErr.OkToRetry() {
+		t.Error("target_node/disk conflict must not be retriable")
+	}
+}
+
+// TestResolveTargetNodeWithFallbacks_UnknownAZ_Error drives the
+// availability_zone-not-in-az_map rejection on the fallback entry point
+// (fallbackMax > 0), for the same shared-guard reason as the conflict test
+// above.
+func TestResolveTargetNodeWithFallbacks_UnknownAZ_Error(t *testing.T) {
+	t.Parallel()
+	deps := buildFaultDomainDeps(
+		[]map[string]any{onlineNode("pve1"), onlineNode("pve2")},
+		nil,
+		func(c *config.CPIConfig) {
+			c.Placement = &config.PlacementConfig{
+				AZMap: map[string][]string{"zone-a": {"pve1", "pve2"}},
+			}
+		},
+	)
+	cp := createVMCloudProps{AvailabilityZone: "zone-nope"}
+	_, alts, err := resolveTargetNodeWithFallbacks(context.Background(), deps, cp, "", nil, nil, nil, 3)
+	if err == nil {
+		t.Fatal("expected error for AZ missing from placement.az_map; got nil")
+	}
+	if alts != nil {
+		t.Errorf("no alternates may accompany an unknown-AZ error; got %v", alts)
+	}
+	if !strings.Contains(err.Error(), "zone-nope") {
+		t.Errorf("error must name the unknown AZ; got: %v", err)
+	}
+	var cpiErr *cpierrors.Error
+	if stderrors.As(err, &cpiErr) && cpiErr.OkToRetry() {
+		t.Error("unknown AZ is a config error and must not be retriable")
+	}
+}
+
 // ---------------------------------------------------------------------------
 // buildAZOrder — layered resolver integration
 // ---------------------------------------------------------------------------

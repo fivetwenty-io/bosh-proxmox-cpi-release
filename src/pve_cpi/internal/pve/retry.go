@@ -81,7 +81,7 @@ func TransientBackoff(attempt int) time.Duration {
 type testBackoffKey struct{}
 
 // WithTestBackoff returns a derived context that overrides the backoff curve
-// used by RetryOnStorageLock, RetryOnTransient, and RetryOnTransientOrLock.
+// used by RetryOnTransient and RetryOnTransientOrLock.
 // The returned duration is slept verbatim (return 0 to skip). Intended for
 // tests to skip multi-second exponential backoff without changing the retry
 // loop's other semantics (attempt count, context cancellation, log lines).
@@ -194,77 +194,6 @@ func PushbackBackoff(attempt int) time.Duration {
 	return out
 }
 
-// RetryOnStorageLock invokes op up to maxAttempts times, retrying when the
-// returned error is a PVE per-storage lockfile timeout (IsStorageLockTimeout)
-// OR a cluster quorum-loss condition (IsClusterNotQuorate). Other errors (or
-// success) return immediately.
-//
-// Used to absorb contention against /var/lock/pve-manager/pve-storage-<name>
-// from parallel qmcreate / qm resize / qm set / pvesm alloc / pvesm free
-// operations during bursts of concurrent CPI calls, and to pace retries
-// through a below-majority quorum loss on the same seconds-scale curve
-// (quorum loss is minutes-scale, not seconds, but a single retry attempt
-// costs nothing extra and the curve's 30s cap × 10 attempts gives roughly
-// enough total wall time to span a brief partition without requiring a
-// dedicated third curve). Backoff is the package's StorageLockBackoff curve.
-// ctx cancellation short-circuits the sleep.
-//
-// label is an opaque tag used in the retry-log line (e.g. "create_disk",
-// "configdrive_upload") so operators can see which surface is contending.
-// logger may be nil; if non-nil, one Info line per retry is emitted.
-//
-// maxAttempts ≤ 0 falls back to DefaultStorageLockMaxAttempts.
-func RetryOnStorageLock(
-	ctx context.Context,
-	logger *log.Logger,
-	label string,
-	maxAttempts int,
-	op func() error,
-) error {
-	if maxAttempts <= 0 {
-		maxAttempts = DefaultStorageLockMaxAttempts
-	}
-	var lastErr error
-	for attempt := 0; attempt < maxAttempts; attempt++ {
-		err := op()
-		if err == nil {
-			return nil
-		}
-		isLock := IsStorageLockTimeout(err)
-		isQuorum := IsClusterNotQuorate(err)
-		if !isLock && !isQuorum {
-			return err
-		}
-		lastErr = err
-		if attempt == maxAttempts-1 {
-			break
-		}
-		d := StorageLockBackoff(attempt)
-		if override := backoffFromCtx(ctx); override != nil {
-			d = override(attempt)
-		}
-		if logger != nil {
-			logMsg := "pve: storage lock timeout, retrying"
-			if isQuorum {
-				logMsg = "pve: cluster not quorate, retrying"
-			}
-			logger.Info(logMsg,
-				log.String("op", label),
-				log.Int("attempt", attempt+1),
-				log.Int("max_attempts", maxAttempts),
-				log.Int("backoff_ms", int(d/time.Millisecond)),
-				log.String("error", err.Error()),
-			)
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(d):
-		}
-	}
-	return lastErr
-}
-
 // RetryOnTransient invokes op up to maxAttempts times, retrying when the
 // returned error is a transient transport-layer fault (IsTransientTransport)
 // or a PVE rate-limit / worker-pool exhaustion signal (IsPVEPushback).
@@ -333,22 +262,26 @@ func RetryOnTransient(
 }
 
 // retryOrLockCurve selects the backoff curve and reason label for a
-// RetryOnTransientOrLock retry iteration. Pushback takes priority (longest
-// curve) because worker-pool saturation is the most conservative condition.
-// Quorum loss and storage-lock contention share the StorageLockBackoff curve
-// (2s→30s) — both are "wait for someone else to finish/recover" conditions on
-// a similar timescale, distinct from the shorter transient-transport curve
-// used as the default fallback. isQuorum is checked before isLock only to
-// give the log line an accurate reason label; the curve is identical either
-// way.
+// RetryOnTransientOrLock retry iteration. Quorum loss and storage-lock
+// contention are checked BEFORE pushback: IsPVEPushback substring-matches
+// "got timeout", which is present in both canonical storage-lock error
+// shapes, so a pushback-first ordering routed every storage-lock error onto
+// the pushback curve — silently ignoring the operator's tuned
+// pve.retry.storage_lock settings and mislabeling the log reason as
+// "pushback" for a storage-subsystem condition. Quorum loss and storage-lock
+// contention share the StorageLockBackoff curve (2s→30s) — both are "wait
+// for someone else to finish/recover" conditions on a similar timescale;
+// isQuorum before isLock only gives the log line an accurate reason label.
+// Genuine pushback (worker-pool saturation, rate limiting) still gets the
+// most conservative PushbackBackoff curve when no lock/quorum signal matched.
 func retryOrLockCurve(isPushback, isLock, isQuorum bool, attempt int) (d time.Duration, reason string) {
 	switch {
-	case isPushback:
-		return PushbackBackoff(attempt), "pushback"
 	case isQuorum:
 		return StorageLockBackoff(attempt), "cluster_not_quorate"
 	case isLock:
 		return StorageLockBackoff(attempt), "storage_lock"
+	case isPushback:
+		return PushbackBackoff(attempt), "pushback"
 	default:
 		return TransientBackoff(attempt), "transient_transport"
 	}
@@ -358,10 +291,10 @@ func retryOrLockCurve(isPushback, isLock, isQuorum bool, attempt int) (d time.Du
 // returned error is a per-storage lockfile timeout (IsStorageLockTimeout), a
 // cluster quorum-loss condition (IsClusterNotQuorate), a transient transport-
 // layer fault (IsTransientTransport), or a PVE rate-limit / worker-pool
-// exhaustion signal (IsPVEPushback). Backoff curve priority: pushback
-// (PushbackBackoff) > quorum loss / storage lock (StorageLockBackoff) >
-// transient (TransientBackoff). Pushback is the most conservative because
-// worker-pool saturation takes the longest to drain.
+// exhaustion signal (IsPVEPushback). Backoff curve priority: quorum loss /
+// storage lock (StorageLockBackoff) > pushback (PushbackBackoff) > transient
+// (TransientBackoff) — lock/quorum first because IsPVEPushback is a textual
+// superset of the storage-lock shapes (see retryOrLockCurve).
 //
 // Quorum loss rides the storage-lock curve rather than the transient curve
 // deliberately: a quorum 5xx also satisfies IsTransientTransport (it is a

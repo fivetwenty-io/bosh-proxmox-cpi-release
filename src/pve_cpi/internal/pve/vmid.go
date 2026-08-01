@@ -504,7 +504,11 @@ func AllocateWithRetry(
 				}
 				continue
 			}
-			return 0, cpierrors.Wrap(createErr, fmt.Sprintf("create VMID %d", vmid))
+			// WrapError first: a raw SDK 5xx through cpierrors.Wrap becomes a
+			// non-retriable CloudError, turning a transient pvedaemon recycle
+			// after the retry budget into a permanent create_vm/create_disk
+			// failure the Director will not re-drive.
+			return 0, cpierrors.Wrap(WrapError(createErr), fmt.Sprintf("create VMID %d", vmid))
 		}
 		return vmid, nil
 	}

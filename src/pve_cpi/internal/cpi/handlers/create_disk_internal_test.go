@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -11,7 +12,9 @@ import (
 // buildResolverForStorage builds a layeredResolver from a call-level map and an
 // optional CPIConfig, for use in TestResolveStorage* cases. The call map is
 // built from storagePool and storage string args (empty string = key absent).
-func buildResolverForStorage(t *testing.T, storagePool, storage, configDiskStorage string, cfg *config.CPIConfig) *layeredResolver {
+// Returns both the resolver and the CPIConfig it was built against, so
+// callers can drive resolveStorageForDisk with a matching Deps.Config.
+func buildResolverForStorage(t *testing.T, storagePool, storage, configDiskStorage string, cfg *config.CPIConfig) (*layeredResolver, *config.CPIConfig) {
 	t.Helper()
 	callCP := map[string]any{}
 	if storagePool != "" {
@@ -28,11 +31,12 @@ func buildResolverForStorage(t *testing.T, storagePool, storage, configDiskStora
 	if err != nil {
 		t.Fatalf("newLayeredResolver: unexpected error: %v", err)
 	}
-	return r
+	return r, cfg
 }
 
 // TestResolveStorage verifies the three-level precedence chain for storage
-// pool selection in create_disk, now driven through resolveStorageLayered:
+// pool selection in create_disk, driven through resolveStorageForDisk
+// (encrypted=false):
 //
 //  1. r.String("storage_pool","storage") — per-call cloud_properties (highest)
 //  2. config.DiskStorage                 — global default / lowest
@@ -169,11 +173,11 @@ func TestResolveStorage(t *testing.T) {
 				t.Fatalf("newLayeredResolver: unexpected error: %v", err)
 			}
 
-			got, err := resolveStorageLayered(r, tc.configDiskStorage)
+			got, err := resolveStorageForDisk(context.Background(), r, Deps{Config: cfg}, false)
 
 			if tc.wantErr {
 				if err == nil {
-					t.Fatalf("resolveStorageLayered: expected error, got nil (resolved %q)", got)
+					t.Fatalf("resolveStorageForDisk: expected error, got nil (resolved %q)", got)
 				}
 				// Error must mention "storage" to be actionable for the operator.
 				if !strings.Contains(err.Error(), "storage") {
@@ -183,10 +187,10 @@ func TestResolveStorage(t *testing.T) {
 			}
 
 			if err != nil {
-				t.Fatalf("resolveStorageLayered: unexpected error: %v", err)
+				t.Fatalf("resolveStorageForDisk: unexpected error: %v", err)
 			}
 			if got != tc.wantStorage {
-				t.Errorf("resolveStorageLayered() = %q, want %q", got, tc.wantStorage)
+				t.Errorf("resolveStorageForDisk() = %q, want %q", got, tc.wantStorage)
 			}
 		})
 	}
@@ -199,8 +203,8 @@ func TestResolveStorage_StoragePoolAliasIndependence(t *testing.T) {
 
 	// Only storage_pool set.
 	{
-		r := buildResolverForStorage(t, "pool-a", "", "fallback", nil)
-		got, err := resolveStorageLayered(r, "fallback")
+		r, cfg := buildResolverForStorage(t, "pool-a", "", "fallback", nil)
+		got, err := resolveStorageForDisk(context.Background(), r, Deps{Config: cfg}, false)
 		if err != nil || got != "pool-a" {
 			t.Errorf("only storage_pool set: got %q err %v, want pool-a nil", got, err)
 		}
@@ -208,8 +212,8 @@ func TestResolveStorage_StoragePoolAliasIndependence(t *testing.T) {
 
 	// Only storage (alias) set.
 	{
-		r := buildResolverForStorage(t, "", "pool-b", "fallback", nil)
-		got, err := resolveStorageLayered(r, "fallback")
+		r, cfg := buildResolverForStorage(t, "", "pool-b", "fallback", nil)
+		got, err := resolveStorageForDisk(context.Background(), r, Deps{Config: cfg}, false)
 		if err != nil || got != "pool-b" {
 			t.Errorf("only storage alias set: got %q err %v, want pool-b nil", got, err)
 		}
@@ -217,8 +221,8 @@ func TestResolveStorage_StoragePoolAliasIndependence(t *testing.T) {
 
 	// Both set: storage_pool must win.
 	{
-		r := buildResolverForStorage(t, "pool-a", "pool-b", "fallback", nil)
-		got, err := resolveStorageLayered(r, "fallback")
+		r, cfg := buildResolverForStorage(t, "pool-a", "pool-b", "fallback", nil)
+		got, err := resolveStorageForDisk(context.Background(), r, Deps{Config: cfg}, false)
 		if err != nil || got != "pool-a" {
 			t.Errorf("both set: got %q err %v, want pool-a nil", got, err)
 		}
@@ -249,7 +253,7 @@ func TestResolveStorage_DiskTypeProfileSuppliesPool(t *testing.T) {
 		t.Fatalf("newLayeredResolver: %v", err)
 	}
 
-	got, err := resolveStorageLayered(r, cfg.DiskStorage)
+	got, err := resolveStorageForDisk(context.Background(), r, Deps{Config: cfg}, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -281,7 +285,7 @@ func TestResolveStorage_VMTypeProfileSuppliesPool(t *testing.T) {
 		t.Fatalf("newLayeredResolver: %v", err)
 	}
 
-	got, err := resolveStorageLayered(r, cfg.DiskStorage)
+	got, err := resolveStorageForDisk(context.Background(), r, Deps{Config: cfg}, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -296,6 +300,7 @@ func TestResolveStorage_DiskTypeBeatsVMType(t *testing.T) {
 	t.Parallel()
 
 	cfg := &config.CPIConfig{
+		DiskStorage: "global",
 		DiskTypes: map[string]config.TypeProfile{
 			"fast": {CloudProperties: map[string]any{"storage_pool": "disk-ssd"}},
 		},
@@ -312,7 +317,7 @@ func TestResolveStorage_DiskTypeBeatsVMType(t *testing.T) {
 		t.Fatalf("newLayeredResolver: %v", err)
 	}
 
-	got, err := resolveStorageLayered(r, "global")
+	got, err := resolveStorageForDisk(context.Background(), r, Deps{Config: cfg}, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -327,6 +332,7 @@ func TestResolveStorage_CallBeatsProfiles(t *testing.T) {
 	t.Parallel()
 
 	cfg := &config.CPIConfig{
+		DiskStorage: "global",
 		DiskTypes: map[string]config.TypeProfile{
 			"fast": {CloudProperties: map[string]any{"storage_pool": "disk-ssd"}},
 		},
@@ -344,7 +350,7 @@ func TestResolveStorage_CallBeatsProfiles(t *testing.T) {
 		t.Fatalf("newLayeredResolver: %v", err)
 	}
 
-	got, err := resolveStorageLayered(r, "global")
+	got, err := resolveStorageForDisk(context.Background(), r, Deps{Config: cfg}, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -355,7 +361,7 @@ func TestResolveStorage_CallBeatsProfiles(t *testing.T) {
 
 // TestResolveStorage_UnknownDiskTypeSelector verifies that an unknown disk_type
 // selector in the call map causes newLayeredResolver to return a CloudError
-// before resolveStorageLayered is ever reached.
+// before resolveStorageForDisk is ever reached.
 func TestResolveStorage_UnknownDiskTypeSelector(t *testing.T) {
 	t.Parallel()
 

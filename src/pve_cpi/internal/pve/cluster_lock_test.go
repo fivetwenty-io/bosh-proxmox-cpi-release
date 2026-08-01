@@ -121,8 +121,8 @@ func TestAcquireClusterLock_FreeCreatesPool(t *testing.T) {
 	if err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
-	if h.PoolName() != "bosh-lock-web" {
-		t.Fatalf("pool = %q; want bosh-lock-web", h.PoolName())
+	if h.pool != "bosh-lock-web" {
+		t.Fatalf("pool = %q; want bosh-lock-web", h.pool)
 	}
 	if f.createN != 1 || f.getN != 0 {
 		t.Fatalf("free acquire should create once and never read; create=%d get=%d", f.createN, f.getN)
@@ -186,8 +186,8 @@ func TestAcquireClusterLock_HeldExpiredOwnerSteals(t *testing.T) {
 	if err != nil {
 		t.Fatalf("steal acquire: %v", err)
 	}
-	if h.PoolName() != "bosh-lock-web" {
-		t.Fatalf("pool = %q; want bosh-lock-web", h.PoolName())
+	if h.pool != "bosh-lock-web" {
+		t.Fatalf("pool = %q; want bosh-lock-web", h.pool)
 	}
 	// Steal = first create fails (dup) -> get holder -> delete -> recreate ->
 	// post-steal get confirming our owner token won.

@@ -100,10 +100,7 @@ type negativeCacheEntry struct {
 // enough that a transient PVE blip clears before any human-noticeable
 // extra latency, long enough that a thundering herd of CPI requests on
 // the same cold cache only triggers one upstream call per window.
-//
-// Declared as a var (not const) so tests can swap the value via t.Cleanup
-// to exercise TTL expiry without sleeping 5+ seconds in CI.
-var negativeCacheTTL = 5 * time.Second
+const negativeCacheTTL = 5 * time.Second
 
 // StorageInfoCacheOption configures a StorageInfoCache at construction time.
 type StorageInfoCacheOption func(*StorageInfoCache)
@@ -173,8 +170,13 @@ func (c *StorageInfoCache) Get(ctx context.Context, name string) (StorageInfo, e
 	for {
 		c.mu.Lock()
 
-		// Cache hit: valid entry exists and TTL not expired (or TTL disabled).
-		if entry, ok := c.entries[name]; ok && (c.ttl <= 0 || c.clock().Before(entry.exp)) {
+		// Cache hit: valid entry exists, positive caching is enabled
+		// (ttl > 0), and the entry has not expired. ttl <= 0 must MISS —
+		// the constructor documents it as "every Get triggers a fetch";
+		// short-circuiting to a permanent hit here would pin the first
+		// /storage snapshot for the process lifetime and silently route
+		// disk placement by stale data after a storage.cfg edit.
+		if entry, ok := c.entries[name]; ok && c.ttl > 0 && c.clock().Before(entry.exp) {
 			c.mu.Unlock()
 			return entry.info, nil
 		}

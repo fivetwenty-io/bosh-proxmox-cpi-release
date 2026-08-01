@@ -67,30 +67,6 @@ type createDiskCloudProperties struct {
 	RetainOnDelete *bool `json:"retain_on_delete,omitempty"`
 }
 
-// resolveStorageLayered returns the storage pool name to use for a create_disk call,
-// consulting layers in precedence order:
-//
-//  1. r.String("storage_pool","storage") — per-call or profile cloud_properties
-//  2. configDiskStorage — global CPI config default
-//
-// An empty or whitespace-only result at all levels is a misconfigured CPI manifest;
-// the returned error is a non-retriable CloudError.
-//
-// No PVE storage-type query is performed (v1: name-only resolution). The
-// caller is responsible for backend resolution via backendResolverOrDefault.
-func resolveStorageLayered(r *layeredResolver, configDiskStorage string) (string, error) {
-	if s, found := r.String("storage_pool", "storage"); found {
-		return s, nil
-	}
-	if s := strings.TrimSpace(configDiskStorage); s != "" {
-		return s, nil
-	}
-	return "", cpierrors.Cloud(
-		"create_disk: no storage configured (disk_storage empty and neither" +
-			" cloud_properties.storage_pool nor cloud_properties.storage is set)",
-	)
-}
-
 // resolveStorageForDisk resolves the target storage pool for a create_disk call.
 //
 // When encrypted=false (the default, unset path): byte-identical to pre-§7.49 —
@@ -600,7 +576,8 @@ func attemptCreateVolume(
 				// storage daemon timeout). Best-effort: remove it before
 				// propagating so retries (which won't run) and operator
 				// re-runs see a clean slate.
-				rollbackCtx := contextWithoutCancel(ctx)
+				rollbackCtx, rbCancel := detachedContext(ctx, rollbackCleanupTimeout)
+				defer rbCancel()
 				if exists, exErr := deps.PVE.Storage().Exists(rollbackCtx, node, storage, candidateCanonical); exErr == nil && exists {
 					upid, delErr := deps.PVE.Storage().DeleteVolumeAsync(rollbackCtx, node, storage, candidateCanonical)
 					switch {
@@ -676,15 +653,18 @@ func attemptCreateVolume(
 }
 
 // rollbackCreatedVolume best-effort deletes a successfully created volume when
-// a subsequent step in create_disk fails. Uses contextWithoutCancel so cleanup
-// completes even if the caller cancelled the request. Logs errors; never panics.
+// a subsequent step in create_disk fails. Runs on a detached, bounded context
+// (detachedContext) so cleanup completes even if the caller cancelled the
+// request without stalling past rollbackCleanupTimeout. Logs errors; never
+// panics.
 func rollbackCreatedVolume(
 	ctx context.Context,
 	deps Deps,
 	node, storage, canonicalVolID string,
 	logger *log.Logger,
 ) {
-	rollbackCtx := contextWithoutCancel(ctx)
+	rollbackCtx, rbCancel := detachedContext(ctx, rollbackCleanupTimeout)
+	defer rbCancel()
 	upid, delErr := deps.PVE.Storage().DeleteVolumeAsync(rollbackCtx, node, storage, canonicalVolID)
 	if delErr != nil {
 		logger.Warn("create_disk: rollback DeleteVolume failed",
@@ -706,14 +686,4 @@ func rollbackCreatedVolume(
 	logger.Info("create_disk: rolled back created volume after failure",
 		log.String("volid", canonicalVolID),
 	)
-}
-
-// contextWithoutCancel returns a context derived from parent that carries
-// parent's values but is detached from its cancellation/deadline. Used so
-// rollback I/O completes even when the caller cancelled the request.
-func contextWithoutCancel(parent context.Context) context.Context {
-	if parent == nil {
-		return context.Background()
-	}
-	return context.WithoutCancel(parent)
 }
