@@ -325,7 +325,6 @@ func fastPathDeleteVM(ctx context.Context, deps Deps, node, vmCID string, vmid i
 //  5. Call deps.Agent.Remove to clean up registry/cloud-init state.
 //
 // Returns nil result on success (including when the VM was already absent).
-//
 func HandleDeleteVM(deps Deps) cpi.Handler {
 	return cpi.HandlerFunc(func(ctx context.Context, args []json.RawMessage, reqCtx jsonrpc.Context) (any, error) {
 		deps, err := deps.WithRequestOverrides(ctx, reqCtx)

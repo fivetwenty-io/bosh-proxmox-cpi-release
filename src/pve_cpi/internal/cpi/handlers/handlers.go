@@ -25,9 +25,9 @@ type HandlerFunc = cpi.HandlerFunc
 // leave it nil to get the static "shared on Config.Node" default via the
 // backendResolverOrDefault helper.
 //
-// FetchResolver, when non-nil, replaces the default stemcellfetch.ResolveSource
-// call inside HandleCreateStemcell's resolveFetchSource path. Set by tests only;
-// production code leaves it nil.
+// FetchResolver, when non-nil, replaces the default
+// stemcellfetch.ResolveSourceWith call inside HandleCreateStemcell's
+// resolveFetchSource path. Set by tests only; production code leaves it nil.
 type Deps struct {
 	Config *config.CPIConfig
 	PVE    pve.Client

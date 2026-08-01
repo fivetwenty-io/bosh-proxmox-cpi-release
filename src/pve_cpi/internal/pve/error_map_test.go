@@ -239,85 +239,6 @@ func TestWrapError_Generic(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// WrapNotFoundVM
-// ---------------------------------------------------------------------------
-
-func TestWrapNotFoundVM_Nil(t *testing.T) {
-	t.Parallel()
-	if got := pve.WrapNotFoundVM(nil, "vm-100"); got != nil {
-		t.Errorf("expected nil, got %v", got)
-	}
-}
-
-func TestWrapNotFoundVM_404(t *testing.T) {
-	t.Parallel()
-	err := makeAPIErr(404, "vm not found")
-	got := pve.WrapNotFoundVM(err, "vm-100")
-	var cpiErr *cpierrors.Error
-	if !errors.As(got, &cpiErr) {
-		t.Fatalf("expected *cpierrors.Error, got %T", got)
-	}
-	if cpiErr.Type() != cpierrors.TypeVMNotFound {
-		t.Errorf("want TypeVMNotFound got %q", cpiErr.Type())
-	}
-	// Ensure vm CID is embedded in message.
-	if cpiErr.Error() == "" {
-		t.Error("error message must not be empty")
-	}
-}
-
-func TestWrapNotFoundVM_Other(t *testing.T) {
-	t.Parallel()
-	err := makeAPIErr(500, "server error")
-	got := pve.WrapNotFoundVM(err, "vm-100")
-	var cpiErr *cpierrors.Error
-	if !errors.As(got, &cpiErr) {
-		t.Fatalf("expected *cpierrors.Error, got %T", got)
-	}
-	// 500 passes through WrapError → retriable.
-	if !cpiErr.OkToRetry() {
-		t.Error("5xx passed through WrapNotFoundVM should be retriable")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// WrapNotFoundDisk
-// ---------------------------------------------------------------------------
-
-func TestWrapNotFoundDisk_Nil(t *testing.T) {
-	t.Parallel()
-	if got := pve.WrapNotFoundDisk(nil, "local:vol"); got != nil {
-		t.Errorf("expected nil, got %v", got)
-	}
-}
-
-func TestWrapNotFoundDisk_404(t *testing.T) {
-	t.Parallel()
-	err := makeAPIErr(404, "disk not found")
-	got := pve.WrapNotFoundDisk(err, "local:vm-100-disk-1")
-	var cpiErr *cpierrors.Error
-	if !errors.As(got, &cpiErr) {
-		t.Fatalf("expected *cpierrors.Error, got %T", got)
-	}
-	if cpiErr.Type() != cpierrors.TypeDiskNotFound {
-		t.Errorf("want TypeDiskNotFound got %q", cpiErr.Type())
-	}
-}
-
-func TestWrapNotFoundDisk_Other(t *testing.T) {
-	t.Parallel()
-	err := errors.New("generic error")
-	got := pve.WrapNotFoundDisk(err, "local:disk")
-	var cpiErr *cpierrors.Error
-	if !errors.As(got, &cpiErr) {
-		t.Fatalf("expected *cpierrors.Error, got %T", got)
-	}
-	if cpiErr.Type() != cpierrors.TypeCloud {
-		t.Errorf("want TypeCloud got %q", cpiErr.Type())
-	}
-}
-
-// ---------------------------------------------------------------------------
 // IsNotFound
 // ---------------------------------------------------------------------------
 
@@ -833,71 +754,6 @@ func TestWrapError_ClusterNotQuorate_5xxAPIError_IsRetriableWithHint(t *testing.
 }
 
 // ---------------------------------------------------------------------------
-// IsSnapshotBlocked
-// ---------------------------------------------------------------------------
-
-func TestIsSnapshotBlocked_Nil(t *testing.T) {
-	t.Parallel()
-	if pve.IsSnapshotBlocked(nil) {
-		t.Error("nil should not be snapshot-blocked")
-	}
-}
-
-// source: PVE pve-manager/PVE/QemuServer.pm (pve-manager v8.x)
-func TestIsSnapshotBlocked_DetachMessage(t *testing.T) {
-	t.Parallel()
-	// Canonical PVE detach surface: PUT /config delete:scsiN rejected because
-	// a snapshot references the disk.
-	err := errors.New("cannot delete disk 'scsi1', disk is used in snapshot 'snap1'")
-	if !pve.IsSnapshotBlocked(err) {
-		t.Errorf("detach snapshot-blocked message should match; err=%v", err)
-	}
-}
-
-func TestIsSnapshotBlocked_ResizeMessage(t *testing.T) {
-	t.Parallel()
-	// Canonical PVE resize surface (LVM-thin/ZFS): task body contains this text.
-	err := errors.New("can't resize volume, volume is referenced in snapshot 'bosh-1'")
-	if !pve.IsSnapshotBlocked(err) {
-		t.Errorf("resize snapshot-blocked message should match; err=%v", err)
-	}
-}
-
-func TestIsSnapshotBlocked_StorageLockTimeout(t *testing.T) {
-	t.Parallel()
-	// Unrelated transient error must not match.
-	err := errors.New("task failed: can't lock file '/var/lock/pve-manager/pve-storage-data' - got timeout")
-	if pve.IsSnapshotBlocked(err) {
-		t.Errorf("storage lock timeout should not be snapshot-blocked; err=%v", err)
-	}
-}
-
-func TestIsSnapshotBlocked_CaseInsensitive_UsedIn(t *testing.T) {
-	t.Parallel()
-	// PVE error text may arrive in mixed case depending on Perl die() formatting.
-	err := errors.New("Cannot Delete Disk 'scsi0', Disk Is Used In Snapshot 'auto-backup'")
-	if !pve.IsSnapshotBlocked(err) {
-		t.Errorf("mixed-case 'Is Used In Snapshot' should match; err=%v", err)
-	}
-}
-
-func TestIsSnapshotBlocked_CaseInsensitive_ReferencedIn(t *testing.T) {
-	t.Parallel()
-	err := errors.New("Task Failed: Volume Is Referenced In Snapshot 'daily-2024'")
-	if !pve.IsSnapshotBlocked(err) {
-		t.Errorf("mixed-case 'Referenced In Snapshot' should match; err=%v", err)
-	}
-}
-
-func TestIsSnapshotBlocked_Unrelated(t *testing.T) {
-	t.Parallel()
-	err := errors.New("VM 131 already exists on node 'pve'")
-	if pve.IsSnapshotBlocked(err) {
-		t.Errorf("unrelated error should not be snapshot-blocked; err=%v", err)
-	}
-}
-
-// ---------------------------------------------------------------------------
 // IsVolumeMissing — covers the lvmthin and zfspool 500-error patterns that
 // the SDK does not classify as 404. NodeForExisting must fold these into a
 // clean miss so a just-deleted disk does not surface as a retriable error.
@@ -1307,7 +1163,7 @@ func TestIsVMRunningDestroyFailure_Nil(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// IsPoolNotEmpty / IsPoolMoveConflict / IsPoolNotFound
+// IsPoolNotEmpty / IsPoolNotFound
 // ---------------------------------------------------------------------------
 
 func TestIsPoolNotEmpty_LiveText(t *testing.T) {
@@ -1337,36 +1193,6 @@ func TestIsPoolNotEmpty_LiveText(t *testing.T) {
 func TestIsPoolNotEmpty_Nil(t *testing.T) {
 	t.Parallel()
 	if pve.IsPoolNotEmpty(nil) {
-		t.Error("nil error should not match")
-	}
-}
-
-func TestIsPoolMoveConflict_LiveText(t *testing.T) {
-	t.Parallel()
-	cases := []struct {
-		name string
-		msg  string
-		want bool
-	}{
-		{"live text", "VM 99098 belongs already to pool 'p4' and 'allow-move' is not set", true},
-		{"mixed case", "vm 99098 Belongs Already To Pool 'p4'", true},
-		{"unrelated error", "storage 'nfs-images' is not online", false},
-		{"empty", "", false},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			err := makeAPIErr(500, tc.msg)
-			if got := pve.IsPoolMoveConflict(err); got != tc.want {
-				t.Errorf("IsPoolMoveConflict(%q) = %v, want %v", tc.msg, got, tc.want)
-			}
-		})
-	}
-}
-
-func TestIsPoolMoveConflict_Nil(t *testing.T) {
-	t.Parallel()
-	if pve.IsPoolMoveConflict(nil) {
 		t.Error("nil error should not match")
 	}
 }

@@ -251,6 +251,54 @@ func TestDeleteVM_ReaperToleratesPoolGone(t *testing.T) {
 	}
 }
 
+func TestDeleteVM_ReaperGetPoolCommentErrors_DeleteNeverCalled(t *testing.T) {
+	t.Parallel()
+
+	const vmid = 9007
+	fx := newReaperTestFixture(t, vmid, true, "bosh")
+	fx.pools.getCommentFn = func(_ context.Context, _ string) (string, bool, error) {
+		return "", false, errors.New("simulated: GetPoolComment transport failure")
+	}
+
+	if err := fx.run(t, vmid); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(fx.pools.getCommentCalls) != 1 || fx.pools.getCommentCalls[0] != "bosh" {
+		t.Fatalf("GetPoolComment: want 1 call for pool %q, got %v", "bosh", fx.pools.getCommentCalls)
+	}
+	if len(fx.pools.deletePoolCalls) != 0 {
+		t.Errorf("DeletePool: want 0 calls when GetPoolComment errors, got %v", fx.pools.deletePoolCalls)
+	}
+	logs := fx.logBuf.String()
+	if !strings.Contains(logs, "GetPoolComment failed") {
+		t.Errorf("expected the GetPoolComment-failed debug log; log=%s", logs)
+	}
+}
+
+func TestDeleteVM_ReaperPoolNotFound_DeleteNeverCalled(t *testing.T) {
+	t.Parallel()
+
+	const vmid = 9008
+	fx := newReaperTestFixture(t, vmid, true, "bosh")
+	fx.pools.getCommentFn = func(_ context.Context, _ string) (string, bool, error) {
+		return "", false, nil
+	}
+
+	if err := fx.run(t, vmid); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(fx.pools.getCommentCalls) != 1 || fx.pools.getCommentCalls[0] != "bosh" {
+		t.Fatalf("GetPoolComment: want 1 call for pool %q, got %v", "bosh", fx.pools.getCommentCalls)
+	}
+	if len(fx.pools.deletePoolCalls) != 0 {
+		t.Errorf("DeletePool: want 0 calls when the pool is already gone, got %v", fx.pools.deletePoolCalls)
+	}
+	logs := fx.logBuf.String()
+	if !strings.Contains(logs, "pool already gone before reap attempt") {
+		t.Errorf("expected the pool-already-gone debug log; log=%s", logs)
+	}
+}
+
 func TestDeleteVM_ReaperPoolLookupFails_NoOp(t *testing.T) {
 	t.Parallel()
 

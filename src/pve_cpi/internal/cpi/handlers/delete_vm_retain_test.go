@@ -2,7 +2,6 @@ package handlers
 
 import (
 	"context"
-	"strings"
 	"testing"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
@@ -379,47 +378,10 @@ func TestCreateDiskCloudProperties_RetainOnDelete_EncodedInOpts(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// TestRetainEphemeralTagInCreateVM: createVMCloudProps.RetainEphemeralOnDelete
-// flows into initialTags when *true (struct-level contract test).
-// ---------------------------------------------------------------------------
-
-func TestRetainEphemeralTagInCreateVM_True(t *testing.T) {
-	t.Parallel()
-
-	b := true
-	cp := createVMCloudProps{RetainEphemeralOnDelete: &b}
-	if cp.RetainEphemeralOnDelete == nil || !*cp.RetainEphemeralOnDelete {
-		t.Error("RetainEphemeralOnDelete *true not preserved after assignment")
-	}
-
-	// Simulate the initialTags construction logic from createVM.
-	baseRetainTags := buildCustomTags(cp.Tags)
-	if cp.RetainEphemeralOnDelete != nil && *cp.RetainEphemeralOnDelete {
-		baseRetainTags = append(baseRetainTags, tagRetainEphemeral)
-	}
-	tags := mergeTagList([]string{"bosh-cpi"}, baseRetainTags, maxTagLength)
-
-	if !strings.Contains(tags, tagRetainEphemeral) {
-		t.Errorf("initialTags must contain %q when RetainEphemeralOnDelete is true; got %q", tagRetainEphemeral, tags)
-	}
-}
-
-func TestRetainEphemeralTagInCreateVM_Nil(t *testing.T) {
-	t.Parallel()
-
-	cp := createVMCloudProps{RetainEphemeralOnDelete: nil}
-
-	baseRetainTags := buildCustomTags(cp.Tags)
-	if cp.RetainEphemeralOnDelete != nil && *cp.RetainEphemeralOnDelete {
-		baseRetainTags = append(baseRetainTags, tagRetainEphemeral)
-	}
-	tags := mergeTagList([]string{"bosh-cpi"}, baseRetainTags, maxTagLength)
-
-	if strings.Contains(tags, tagRetainEphemeral) {
-		t.Errorf("initialTags must NOT contain %q when RetainEphemeralOnDelete is nil; got %q", tagRetainEphemeral, tags)
-	}
-}
-
+// createVMCloudProps.RetainEphemeralOnDelete → initialTags is covered by a
+// real handler-driven test: TestCreateVM_RetainEphemeralOnDelete_TagOnCreate
+// in create_vm_retain_ephemeral_test.go (package handlers_test), which drives
+// HandleCreateVM end to end and asserts the tag on the captured create call.
 // ---------------------------------------------------------------------------
 // TestForeignDiskAlreadyPreserved: a disk with retain_on_delete in opts AND
 // a foreign VMID is already preserved by detachForeignActiveDisks. This test

@@ -2,7 +2,6 @@ package stemcellfetch
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -39,22 +38,17 @@ type Source interface {
 	Fetch(ctx context.Context, ref Reference, creds Credentials) (body io.ReadCloser, contentLength int64, err error)
 }
 
-// ResolveSource inspects rawURL's scheme and returns the matching Source
+// ResolveSourceWith inspects rawURL's scheme and returns the matching Source
 // along with a populated Reference. https://, s3://, bosh+blobstore:, and
-// oci:// are all wired. Sources are constructed with DefaultTransportConfig.
+// oci:// are all wired. Constructs sources whose HTTP clients honor the
+// caller-supplied TransportConfig (applies only to the https and
+// bosh+blobstore sources; s3 and oci use their own SDK clients). Used by
+// production callers that thread operator-tunable timeouts from the
+// CPI config.
 //
 // Error conditions:
 //   - empty rawURL → error
 //   - unknown/unsupported scheme → error with list of supported schemes
-func ResolveSource(rawURL string) (Source, Reference, error) {
-	return ResolveSourceWith(rawURL, DefaultTransportConfig())
-}
-
-// ResolveSourceWith behaves like ResolveSource but constructs sources whose
-// HTTP clients honor the caller-supplied TransportConfig (applies only to the
-// https and bosh+blobstore sources; s3 and oci use their own SDK clients).
-// Used by production callers that thread operator-tunable timeouts from the
-// CPI config.
 func ResolveSourceWith(rawURL string, tc TransportConfig) (Source, Reference, error) {
 	if rawURL == "" {
 		return nil, Reference{}, fmt.Errorf("stemcell_fetch: image_url is empty")
@@ -102,13 +96,8 @@ func ResolveSourceWith(rawURL string, tc TransportConfig) (Source, Reference, er
 
 	default:
 		return nil, ref, fmt.Errorf(
-			"stemcell_fetch: unsupported URL scheme in %q (supported: https://, s3://, bosh+blobstore:, oci://): %w",
-			rawURL, errNotImplemented,
+			"stemcell_fetch: unsupported URL scheme in %q (supported: https://, s3://, bosh+blobstore:, oci://)",
+			rawURL,
 		)
 	}
 }
-
-// errNotImplemented is the sentinel for a known-but-not-yet-wired scheme.
-// Callers that need to distinguish "not-yet-implemented" from "unsupported
-// scheme" may use errors.Is against this value.
-var errNotImplemented = errors.New("stemcell_fetch: source not yet implemented")

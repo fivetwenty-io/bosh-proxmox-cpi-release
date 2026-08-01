@@ -163,39 +163,6 @@ type ErrorBody struct {
 }
 
 // -----------------------------------------------------------------------
-// Decode
-// -----------------------------------------------------------------------
-
-// Decode reads exactly one JSON-RPC request from r.
-//
-// Failure modes:
-//   - I/O error reading from r → wrapped error.
-//   - Malformed JSON → wrapped json decode error.
-//   - Missing or empty "method" field → fmt.Errorf with descriptive message.
-//   - Empty input (io.EOF before any bytes) → wrapped error.
-//
-// Decode does not use DisallowUnknownFields so that forward-compatible context
-// extensions added by future Director versions are silently ignored. Callers
-// that need strict parsing should layer their own decoder on top.
-func Decode(r io.Reader) (*Request, error) {
-	if r == nil {
-		return nil, errors.New("jsonrpc: Decode called with nil reader")
-	}
-
-	dec := json.NewDecoder(r)
-	var req Request
-	if err := dec.Decode(&req); err != nil {
-		return nil, fmt.Errorf("jsonrpc: decode request: %w", err)
-	}
-
-	if req.Method == "" {
-		return nil, errors.New("jsonrpc: request missing required field \"method\"")
-	}
-
-	return &req, nil
-}
-
-// -----------------------------------------------------------------------
 // EncodeSuccess
 // -----------------------------------------------------------------------
 

@@ -494,22 +494,6 @@ func TestStripLightPrefix(t *testing.T) {
 	}
 }
 
-func TestBuildLightStemcellCID(t *testing.T) {
-	got := pve.BuildLightStemcellCID("nfs-stemcells", "bosh-stemcell-ubuntu-1.0-deadbeef.qcow2")
-	want := "light:nfs-stemcells:import/bosh-stemcell-ubuntu-1.0-deadbeef.qcow2"
-	if got != want {
-		t.Errorf("BuildLightStemcellCID = %q; want %q", got, want)
-	}
-	// Round-trip: built CID should parse back to original components.
-	storage, volpath, err := pve.ParseLightStemcellCID(got)
-	if err != nil {
-		t.Fatalf("ParseLightStemcellCID round-trip: %v", err)
-	}
-	if storage != "nfs-stemcells" || volpath != "import/bosh-stemcell-ubuntu-1.0-deadbeef.qcow2" {
-		t.Errorf("round-trip mismatch: storage=%q volpath=%q", storage, volpath)
-	}
-}
-
 // ---- Template-stemcell CID helpers ----
 
 // TestBuildTemplateStemcellCID verifies the canonical encoding.
@@ -614,39 +598,5 @@ func TestParseStemcellCID_RejectsTemplateCID(t *testing.T) {
 	_, _, err := pve.ParseStemcellCID("template:6042")
 	if err == nil {
 		t.Fatal("ParseStemcellCID(\"template:6042\") = nil error; want rejection so template CIDs are not misrouted as volume CIDs")
-	}
-}
-
-func TestParseLightStemcellCID(t *testing.T) {
-	cases := []struct {
-		name        string
-		cid         string
-		wantStorage string
-		wantVolPath string
-		wantErr     bool
-	}{
-		{name: "happy path", cid: "light:nfs:import/foo.qcow2", wantStorage: "nfs", wantVolPath: "import/foo.qcow2"},
-		{name: "missing light prefix", cid: "nfs:import/foo.qcow2", wantErr: true},
-		{name: "empty", cid: "", wantErr: true},
-		{name: "double prefix fails inner parse", cid: "light:light:nfs:import/foo.qcow2", wantErr: true},
-		{name: "missing import/ segment", cid: "light:nfs:foo.qcow2", wantErr: true},
-		{name: "no inner colon", cid: "light:badcid", wantErr: true},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			storage, volpath, err := pve.ParseLightStemcellCID(tc.cid)
-			if tc.wantErr {
-				if err == nil {
-					t.Fatalf("ParseLightStemcellCID(%q) = (%q, %q, nil); want error", tc.cid, storage, volpath)
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("ParseLightStemcellCID(%q) unexpected error: %v", tc.cid, err)
-			}
-			if storage != tc.wantStorage || volpath != tc.wantVolPath {
-				t.Errorf("ParseLightStemcellCID(%q) = (%q, %q); want (%q, %q)", tc.cid, storage, volpath, tc.wantStorage, tc.wantVolPath)
-			}
-		})
 	}
 }

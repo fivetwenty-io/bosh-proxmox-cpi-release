@@ -358,12 +358,6 @@ func TestNewTypeConstructors(t *testing.T) {
 			wantType:  cpierrors.TypeStemcellInvalidTar,
 			retriable: false,
 		},
-		{
-			name:      "RegistryConflict",
-			err:       cpierrors.RegistryConflict("write conflict on key %s", "vm/101"),
-			wantType:  cpierrors.TypeRegistryConflict,
-			retriable: false,
-		},
 	}
 
 	for _, tc := range cases {

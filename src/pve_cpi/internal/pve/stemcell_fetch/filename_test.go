@@ -33,22 +33,6 @@ func TestBuildFetchedFilename_ShortSHA(t *testing.T) {
 	}
 }
 
-func TestPartialFilename_Happy(t *testing.T) {
-	t.Parallel()
-	got := PartialFilename("bosh-stemcell-ubuntu-jammy-1.438-abcdef12.qcow2")
-	want := "bosh-stemcell-ubuntu-jammy-1.438-abcdef12.qcow2.partial"
-	if got != want {
-		t.Errorf("PartialFilename = %q; want %q", got, want)
-	}
-}
-
-func TestPartialFilename_Empty(t *testing.T) {
-	t.Parallel()
-	if got := PartialFilename(""); got != "" {
-		t.Errorf("PartialFilename(\"\") = %q; want empty string", got)
-	}
-}
-
 func TestFilenamePrefixForDedup_Standard(t *testing.T) {
 	t.Parallel()
 	got := FilenamePrefixForDedup("ubuntu-jammy", "1.438")

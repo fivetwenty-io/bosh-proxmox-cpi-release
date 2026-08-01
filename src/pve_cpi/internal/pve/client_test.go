@@ -44,7 +44,7 @@ func TestNewClient_TokenAuth(t *testing.T) {
 	cfg.Password = ""
 	cfg.APIToken = "root@pam!mytoken=abc123"
 
-	c, err := pve.NewClient(cfg, logger(t))
+	c, err := pve.NewClientWithTracer(cfg, logger(t), nil)
 	if err != nil {
 		t.Fatalf("expected no error, got: %v", err)
 	}
@@ -57,7 +57,7 @@ func TestNewClient_PasswordAuth(t *testing.T) {
 	t.Parallel()
 	cfg := baseConfig()
 
-	c, err := pve.NewClient(cfg, logger(t))
+	c, err := pve.NewClientWithTracer(cfg, logger(t), nil)
 	if err != nil {
 		t.Fatalf("expected no error, got: %v", err)
 	}
@@ -72,7 +72,7 @@ func TestNewClient_NoAuth(t *testing.T) {
 	cfg.Password = ""
 	cfg.APIToken = ""
 
-	_, err := pve.NewClient(cfg, logger(t))
+	_, err := pve.NewClientWithTracer(cfg, logger(t), nil)
 	if err == nil {
 		t.Fatal("expected error for missing auth, got nil")
 	}
@@ -83,7 +83,7 @@ func TestNewClient_VerifySSL_True(t *testing.T) {
 	cfg := baseConfig()
 	cfg.VerifySSL = boolPtr(true)
 
-	c, err := pve.NewClient(cfg, logger(t))
+	c, err := pve.NewClientWithTracer(cfg, logger(t), nil)
 	if err != nil {
 		t.Fatalf("expected no error, got: %v", err)
 	}
@@ -97,7 +97,7 @@ func TestNewClient_VerifySSL_False(t *testing.T) {
 	cfg := baseConfig()
 	cfg.VerifySSL = boolPtr(false)
 
-	c, err := pve.NewClient(cfg, logger(t))
+	c, err := pve.NewClientWithTracer(cfg, logger(t), nil)
 	if err != nil {
 		t.Fatalf("expected no error with VerifySSL=false, got: %v", err)
 	}
@@ -111,7 +111,7 @@ func TestNewClient_BadURL(t *testing.T) {
 	cfg := baseConfig()
 	cfg.Host = ""
 
-	_, err := pve.NewClient(cfg, logger(t))
+	_, err := pve.NewClientWithTracer(cfg, logger(t), nil)
 	if err == nil {
 		t.Fatal("expected error for empty host, got nil")
 	}
@@ -119,7 +119,7 @@ func TestNewClient_BadURL(t *testing.T) {
 
 func TestNewClient_NilConfig(t *testing.T) {
 	t.Parallel()
-	_, err := pve.NewClient(nil, logger(t))
+	_, err := pve.NewClientWithTracer(nil, logger(t), nil)
 	if err == nil {
 		t.Fatal("expected error for nil config, got nil")
 	}
@@ -129,7 +129,7 @@ func TestServiceAccessors(t *testing.T) {
 	t.Parallel()
 	cfg := baseConfig()
 
-	c, err := pve.NewClient(cfg, logger(t))
+	c, err := pve.NewClientWithTracer(cfg, logger(t), nil)
 	if err != nil {
 		t.Fatalf("expected no error, got: %v", err)
 	}
@@ -165,7 +165,7 @@ func TestNewClient_DefaultPort(t *testing.T) {
 	cfg := baseConfig()
 	cfg.Port = 0
 
-	c, err := pve.NewClient(cfg, logger(t))
+	c, err := pve.NewClientWithTracer(cfg, logger(t), nil)
 	if err != nil {
 		t.Fatalf("expected no error with zero port (should default 8006), got: %v", err)
 	}
@@ -179,7 +179,7 @@ func TestNewClient_DefaultRealm(t *testing.T) {
 	cfg := baseConfig()
 	cfg.Realm = ""
 
-	c, err := pve.NewClient(cfg, logger(t))
+	c, err := pve.NewClientWithTracer(cfg, logger(t), nil)
 	if err != nil {
 		t.Fatalf("expected no error with empty realm (should default pam), got: %v", err)
 	}
@@ -219,7 +219,7 @@ func TestNewClient_PVECACert_Empty(t *testing.T) {
 	cfg := baseConfig()
 	cfg.PVECACertPEM = ""
 
-	c, err := pve.NewClient(cfg, logger(t))
+	c, err := pve.NewClientWithTracer(cfg, logger(t), nil)
 	if err != nil {
 		t.Fatalf("empty PVECACertPEM: expected no error, got: %v", err)
 	}
@@ -237,7 +237,7 @@ func TestNewClient_PVECACert_ValidPEM(t *testing.T) {
 	cfg := baseConfig()
 	cfg.PVECACertPEM = selfSignedCAPEM(t)
 
-	c, err := pve.NewClient(cfg, logger(t))
+	c, err := pve.NewClientWithTracer(cfg, logger(t), nil)
 	if err != nil {
 		t.Fatalf("valid PVECACertPEM: expected no error, got: %v", err)
 	}
@@ -256,7 +256,7 @@ func TestNewClient_PVECACert_VerifySSLFalse(t *testing.T) {
 	// Supply malformed PEM to confirm it is NOT parsed (verify_ssl=false wins).
 	cfg.PVECACertPEM = "not-a-pem"
 
-	c, err := pve.NewClient(cfg, logger(t))
+	c, err := pve.NewClientWithTracer(cfg, logger(t), nil)
 	if err != nil {
 		t.Fatalf("verify_ssl=false with CA cert: expected no error, got: %v", err)
 	}
@@ -287,7 +287,7 @@ func newPoolStubClient(t *testing.T, mux *http.ServeMux) pve.Client {
 		APIToken:  "root@pam!test=tok-pool",
 		VerifySSL: boolPtr(false),
 	}
-	c, err := pve.NewClient(cfg, log.NewNopLogger())
+	c, err := pve.NewClientWithTracer(cfg, log.NewNopLogger(), nil)
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}

@@ -1,9 +1,9 @@
-// SDN backend adapter: typed CRUD primitives over PVE SDN zones, vnets, and
-// vnet subnets, plus an ApplySDN entry point that commits pending SDN
-// configuration changes (PUT /cluster/sdn). Each primitive accepts a typed
-// parameter struct and returns errors classified by WrapError; 404 responses
-// surface as ErrSDNNotFound so callers can distinguish missing entities from
-// generic failures.
+// SDN backend adapter: typed read/delete primitives over PVE SDN zones,
+// vnets, and vnet subnets. Each primitive returns errors classified by
+// WrapError; 404 responses surface as ErrSDNNotFound so callers can
+// distinguish missing entities from generic failures. Create and apply
+// operations for SDN objects are handled inline by the create_network and
+// create_vm_routes handlers, which call the SDK directly.
 //
 // PVE quirks captured here:
 //   - SDN zone create has no description/notes/comment field; callers cannot
@@ -13,9 +13,7 @@
 //     named CreateSdnRollback endpoint reverts pending changes — easy to
 //     confuse but the opposite operation.
 //   - Zone, vnet, and subnet create/delete return synchronously (no UPID
-//     task); only UpdateSdn potentially returns a task identifier. The
-//     primitives below do not poll task completion — that is the caller's
-//     responsibility based on the ApplySDN response.
+//     task); only UpdateSdn potentially returns a task identifier.
 package pve
 
 import (
@@ -63,22 +61,6 @@ func isSDNNotFoundShape(err error) bool {
 // Zone CRUD
 // ---------------------------------------------------------------------------
 
-// SDNZoneParams is the typed input for CreateSDNZone.
-//
-// Type is required and must be one of "simple", "vlan", "qinq", "vxlan",
-// "evpn" — the PVE-supported zone plugin types. Bridge is required for
-// "vlan" zones (the underlying Linux bridge for VLAN tagging) and optional
-// elsewhere. Other type-specific fields (peers, controller, exitnodes, etc.)
-// are intentionally omitted from this minimal struct; extend the type when a
-// caller needs them rather than passing free-form maps.
-//
-// No description/notes/comment field — PVE rejects those on zone create.
-type SDNZoneParams struct {
-	Zone   string
-	Type   string
-	Bridge string
-}
-
 // SDNZone is the decoded shape of a single row from GET /cluster/sdn/zones
 // and the singleton from GET /cluster/sdn/zones/{zone}. Fields beyond Zone
 // and Type are best-effort — PVE returns a sparse object whose keys depend
@@ -91,48 +73,6 @@ type SDNZone struct {
 	MTU    int64           `json:"mtu,omitempty"`
 	Nodes  string          `json:"nodes,omitempty"`
 	Raw    json.RawMessage `json:"-"`
-}
-
-// CreateSDNZone is reserved for a future create_network refactor; it is
-// covered by unit tests in sdn_test.go. Do not remove without updating
-// the corresponding test cases.
-//
-// CreateSDNZone issues POST /cluster/sdn/zones with the typed parameters.
-//
-// Returns nil on success. Validation errors (empty Zone or Type) surface as
-// non-retriable CloudError. SDK errors flow through WrapError; 404 is not
-// expected on create but is mapped through if PVE returns it.
-func CreateSDNZone(ctx context.Context, c Client, p SDNZoneParams) error {
-	if ctx == nil {
-		return cpierrors.Cloud("CreateSDNZone: ctx must not be nil")
-	}
-	if c == nil {
-		return cpierrors.Cloud("CreateSDNZone: client must not be nil")
-	}
-	if strings.TrimSpace(p.Zone) == "" {
-		return cpierrors.Cloud("CreateSDNZone: zone is required")
-	}
-	if strings.TrimSpace(p.Type) == "" {
-		return cpierrors.Cloud("CreateSDNZone: type is required")
-	}
-	svc := c.Cluster()
-	if svc == nil {
-		return cpierrors.Cloud("CreateSDNZone: cluster service unavailable")
-	}
-
-	params := &sdkcluster.CreateSdnZonesParams{
-		Zone: p.Zone,
-		Type: p.Type,
-	}
-	if p.Bridge != "" {
-		b := p.Bridge
-		params.Bridge = &b
-	}
-
-	if err := svc.CreateSdnZones(ctx, params); err != nil {
-		return WrapError(err)
-	}
-	return nil
 }
 
 // DeleteSDNZone issues DELETE /cluster/sdn/zones/{zone}.
@@ -251,18 +191,6 @@ func GetSDNZone(ctx context.Context, c Client, zone string) (*SDNZone, error) {
 // Vnet CRUD
 // ---------------------------------------------------------------------------
 
-// SDNVnetParams is the typed input for CreateSDNVnet. Vnet and Zone are
-// required. Alias, Tag, and Vlanaware are optional and forwarded only when
-// non-zero — zero values are treated as "not set" so callers don't have to
-// reach for pointer types in handler code.
-type SDNVnetParams struct {
-	Vnet      string
-	Zone      string
-	Alias     string
-	Tag       int64
-	Vlanaware bool
-}
-
 // SDNVnet is the decoded shape of a vnet row. Zone is promoted because
 // callers commonly derive the parent zone from a vnet name lookup.
 type SDNVnet struct {
@@ -273,52 +201,6 @@ type SDNVnet struct {
 	Vlanaware int64           `json:"vlanaware,omitempty"`
 	Type      string          `json:"type,omitempty"`
 	Raw       json.RawMessage `json:"-"`
-}
-
-// CreateSDNVnet is reserved for a future create_network refactor; it is
-// covered by unit tests in sdn_test.go. Do not remove without updating
-// the corresponding test cases.
-//
-// CreateSDNVnet issues POST /cluster/sdn/vnets.
-func CreateSDNVnet(ctx context.Context, c Client, p SDNVnetParams) error {
-	if ctx == nil {
-		return cpierrors.Cloud("CreateSDNVnet: ctx must not be nil")
-	}
-	if c == nil {
-		return cpierrors.Cloud("CreateSDNVnet: client must not be nil")
-	}
-	if strings.TrimSpace(p.Vnet) == "" {
-		return cpierrors.Cloud("CreateSDNVnet: vnet is required")
-	}
-	if strings.TrimSpace(p.Zone) == "" {
-		return cpierrors.Cloud("CreateSDNVnet: zone is required")
-	}
-	svc := c.Cluster()
-	if svc == nil {
-		return cpierrors.Cloud("CreateSDNVnet: cluster service unavailable")
-	}
-
-	params := &sdkcluster.CreateSdnVnetsParams{
-		Vnet: p.Vnet,
-		Zone: p.Zone,
-	}
-	if p.Alias != "" {
-		a := p.Alias
-		params.Alias = &a
-	}
-	if p.Tag != 0 {
-		t := p.Tag
-		params.Tag = &t
-	}
-	if p.Vlanaware {
-		v := true
-		params.Vlanaware = &v
-	}
-
-	if err := svc.CreateSdnVnets(ctx, params); err != nil {
-		return WrapError(err)
-	}
-	return nil
 }
 
 // DeleteSDNVnet issues DELETE /cluster/sdn/vnets/{vnet}. NotFound surfaces
@@ -429,20 +311,6 @@ func GetSDNVnet(ctx context.Context, c Client, vnet string) (*SDNVnet, error) {
 // Vnet Subnet CRUD
 // ---------------------------------------------------------------------------
 
-// SDNVnetSubnetParams is the typed input for CreateSDNVnetSubnet. Vnet and
-// Subnet (CIDR) are required. Gateway is optional but recommended for
-// layer-3 zones. Snat, DHCP, and DNS-register flags are forwarded only when
-// non-zero — same zero-value-means-unset rule as SDNVnetParams.
-type SDNVnetSubnetParams struct {
-	Vnet          string
-	Subnet        string
-	Gateway       string
-	Snat          bool
-	DhcpDNS       string
-	DhcpRange     []string
-	DNSZonePrefix string
-}
-
 // SDNSubnet is the decoded shape of a subnet row. Vnet is promoted so a
 // flattened list across vnets stays self-describing.
 type SDNSubnet struct {
@@ -453,62 +321,6 @@ type SDNSubnet struct {
 	Type    string          `json:"type,omitempty"`
 	Cidr    string          `json:"cidr,omitempty"`
 	Raw     json.RawMessage `json:"-"`
-}
-
-// CreateSDNVnetSubnet is reserved for a future create_network refactor; it is
-// covered by unit tests in sdn_test.go. Do not remove without updating
-// the corresponding test cases.
-//
-// CreateSDNVnetSubnet issues POST /cluster/sdn/vnets/{vnet}/subnets.
-//
-// The SDK requires a "type" field whose only PVE-accepted value is
-// "subnet" — hardcoded here so callers don't have to remember.
-func CreateSDNVnetSubnet(ctx context.Context, c Client, p SDNVnetSubnetParams) error {
-	if ctx == nil {
-		return cpierrors.Cloud("CreateSDNVnetSubnet: ctx must not be nil")
-	}
-	if c == nil {
-		return cpierrors.Cloud("CreateSDNVnetSubnet: client must not be nil")
-	}
-	if strings.TrimSpace(p.Vnet) == "" {
-		return cpierrors.Cloud("CreateSDNVnetSubnet: vnet is required")
-	}
-	if strings.TrimSpace(p.Subnet) == "" {
-		return cpierrors.Cloud("CreateSDNVnetSubnet: subnet (CIDR) is required")
-	}
-	svc := c.Cluster()
-	if svc == nil {
-		return cpierrors.Cloud("CreateSDNVnetSubnet: cluster service unavailable")
-	}
-
-	params := &sdkcluster.CreateSdnVnetsSubnetsParams{
-		Subnet: p.Subnet,
-		Type:   "subnet",
-	}
-	if p.Gateway != "" {
-		g := p.Gateway
-		params.Gateway = &g
-	}
-	if p.Snat {
-		s := true
-		params.Snat = &s
-	}
-	if p.DhcpDNS != "" {
-		d := p.DhcpDNS
-		params.DhcpDnsServer = &d
-	}
-	if len(p.DhcpRange) > 0 {
-		params.DhcpRange = append([]string(nil), p.DhcpRange...)
-	}
-	if p.DNSZonePrefix != "" {
-		d := p.DNSZonePrefix
-		params.Dnszoneprefix = &d
-	}
-
-	if err := svc.CreateSdnVnetsSubnets(ctx, p.Vnet, params); err != nil {
-		return WrapError(err)
-	}
-	return nil
 }
 
 // DeleteSDNVnetSubnet issues DELETE /cluster/sdn/vnets/{vnet}/subnets/{subnetCIDR}.
@@ -592,40 +404,4 @@ func ListSDNVnetSubnets(ctx context.Context, c Client, vnet string) ([]SDNSubnet
 		out = append(out, s)
 	}
 	return out, nil
-}
-
-// ---------------------------------------------------------------------------
-// Apply
-// ---------------------------------------------------------------------------
-
-// ApplySDN is reserved for a future create_network refactor; it is
-// covered by unit tests in sdn_test.go. Do not remove without updating
-// the corresponding test cases.
-//
-// ApplySDN commits pending SDN configuration via PUT /cluster/sdn
-// (cluster.Service.UpdateSdn). Passes nil params (no lock-token, no
-// release-lock) so the call is suitable for unlocked apply flows.
-//
-// CAUTION: this is "apply", not "rollback". The similarly named SDK method
-// CreateSdnRollback reverts pending changes and must NOT be used here.
-//
-// PVE may return a UPID identifying an asynchronous task. ApplySDN does not
-// poll the task — callers needing strong "applied" semantics should poll
-// the returned identifier via tasks.Service.
-func ApplySDN(ctx context.Context, c Client) error {
-	if ctx == nil {
-		return cpierrors.Cloud("ApplySDN: ctx must not be nil")
-	}
-	if c == nil {
-		return cpierrors.Cloud("ApplySDN: client must not be nil")
-	}
-	svc := c.Cluster()
-	if svc == nil {
-		return cpierrors.Cloud("ApplySDN: cluster service unavailable")
-	}
-
-	if _, err := svc.UpdateSdn(ctx, nil); err != nil {
-		return WrapError(err)
-	}
-	return nil
 }

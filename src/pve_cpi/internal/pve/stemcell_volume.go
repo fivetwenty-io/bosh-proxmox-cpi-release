@@ -157,26 +157,6 @@ func StripLightPrefix(cid string) string {
 	return cid
 }
 
-// BuildLightStemcellCID returns the canonical light-stemcell CID for the given
-// storage pool and qcow2 filename.
-//
-// Format: "light:<storage>:import/<filename>"
-func BuildLightStemcellCID(storage, qcow2Filename string) string {
-	return "light:" + BuildStemcellCID(storage, qcow2Filename)
-}
-
-// ParseLightStemcellCID splits a light-stemcell CID into (storage, volumePath).
-//
-// Expected format: "light:<storage>:import/<filename>"
-// Returns an error when cid does not satisfy IsLightStemcellCID. All errors
-// from the underlying ParseStemcellCID call are propagated as-is.
-func ParseLightStemcellCID(cid string) (storage string, volumePath string, err error) {
-	if !IsLightStemcellCID(cid) {
-		return "", "", fmt.Errorf("ParseLightStemcellCID: CID %q missing \"light:\" prefix", cid)
-	}
-	return ParseStemcellCID(StripLightPrefix(cid))
-}
-
 // BuildTemplateStemcellCID encodes a template VMID as "template:<vmid>".
 //
 // Format: "template:<vmid>" (e.g. "template:6042").

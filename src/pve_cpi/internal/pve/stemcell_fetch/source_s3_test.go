@@ -354,12 +354,12 @@ func TestResolveSource_S3(t *testing.T) {
 	t.Parallel()
 
 	rawURL := "s3://prod-stemcells/ubuntu/jammy/stemcell.qcow2"
-	src, ref, err := ResolveSource(rawURL)
+	src, ref, err := ResolveSourceWith(rawURL, DefaultTransportConfig())
 	if err != nil {
-		t.Fatalf("ResolveSource(%q): unexpected error: %v", rawURL, err)
+		t.Fatalf("ResolveSourceWith(%q, DefaultTransportConfig()): unexpected error: %v", rawURL, err)
 	}
 	if src == nil {
-		t.Fatalf("ResolveSource(%q): expected non-nil Source, got nil", rawURL)
+		t.Fatalf("ResolveSourceWith(%q, DefaultTransportConfig()): expected non-nil Source, got nil", rawURL)
 	}
 	if ref.Scheme != "s3" {
 		t.Errorf("ref.Scheme = %q, want \"s3\"", ref.Scheme)
@@ -391,12 +391,12 @@ func TestResolveSource_S3_InvalidURL(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			src, _, err := ResolveSource(tc.rawURL)
+			src, _, err := ResolveSourceWith(tc.rawURL, DefaultTransportConfig())
 			if err == nil {
-				t.Fatalf("ResolveSource(%q): expected error, got nil (src=%T)", tc.rawURL, src)
+				t.Fatalf("ResolveSourceWith(%q, DefaultTransportConfig()): expected error, got nil (src=%T)", tc.rawURL, src)
 			}
 			if src != nil {
-				t.Errorf("ResolveSource(%q): expected nil Source on error, got %T", tc.rawURL, src)
+				t.Errorf("ResolveSourceWith(%q, DefaultTransportConfig()): expected nil Source on error, got %T", tc.rawURL, src)
 			}
 		})
 	}

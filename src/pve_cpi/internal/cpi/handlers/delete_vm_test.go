@@ -2185,6 +2185,80 @@ func TestHandleDeleteVM_RetainEphemeral_VolumeActuallySurvives(t *testing.T) {
 	})
 }
 
+// TestHandleDeleteVM_RetainEphemeral_NoUnusedEntryAfterUnlink_ConservativeFalse
+// covers detachRetainedEphemeralDisk's conservative fallback: the SDK (or PVE
+// itself) can auto-sweep the unusedN config reference in the same operation
+// that demotes the ephemeral slot, so the post-unlink config re-read never
+// shows an unusedN entry for the volid at all. The handler cannot confirm the
+// reference is gone via a distinct sweep step, so it must still report
+// retained=true and DeleteQemu must still receive DestroyUnreferencedDisks=
+// false — the opposite (false→true) is the exact regression that would
+// destroy the volume the operator asked to retain.
+func TestHandleDeleteVM_RetainEphemeral_NoUnusedEntryAfterUnlink_ConservativeFalse(t *testing.T) {
+	t.Parallel()
+
+	const vmid = 502
+	const rootVolid = "zfs-1:vm-502-disk-0"
+	const ephemeralVolid = "zfs-1:vm-502-ephemeral-0"
+
+	var unlinked bool
+	qemuSvc := &mockQEMUService{
+		stopFn: func(_ context.Context, _ string, _ int) (string, error) {
+			return "", nil
+		},
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			if !unlinked {
+				return map[string]any{
+					"virtio0": rootVolid + ",size=5G",
+					"scsi1":   ephemeralVolid + ",size=10G",
+					"tags":    "bosh-cpi;bosh-retain-ephemeral",
+				}, nil
+			}
+			// Post-unlink: the SDK/PVE already swept the unusedN reference in the
+			// same operation, so no unusedN key appears for ephemeralVolid at all.
+			return map[string]any{
+				"virtio0": rootVolid + ",size=5G",
+				"tags":    "bosh-cpi;bosh-retain-ephemeral",
+			}, nil
+		},
+	}
+
+	var sweepCalled bool
+	var capturedDestroyUnref *bool
+	nodesSvc := &mockNodesService{
+		updateQemuUnlinkFn: func(_ context.Context, _ string, _ string, _ *nodes.UpdateQemuUnlinkParams) error {
+			unlinked = true
+			return nil
+		},
+		updateQemuConfigFn: func(_ context.Context, _ string, _ string, params *nodes.UpdateQemuConfigParams) error {
+			if params != nil && params.Delete != nil && strings.Contains(*params.Delete, "unused") {
+				sweepCalled = true
+			}
+			return nil
+		},
+		deleteQemuFn: func(_ context.Context, _ string, _ string, params *nodes.DeleteQemuParams) (*nodes.DeleteQemuResponse, error) {
+			if params != nil && params.DestroyUnreferencedDisks != nil {
+				v := *params.DestroyUnreferencedDisks
+				capturedDestroyUnref = &v
+			}
+			return &nodes.DeleteQemuResponse{}, nil
+		},
+	}
+
+	h := handlers.HandleDeleteVM(testDepsFoundVM(vmid, qemuSvc, nodesSvc, &mockTasksService{}, &mockAgentService{}))
+	_, err := h.Handle(context.Background(), marshalArgs(strconv.Itoa(vmid)), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("HandleDeleteVM: unexpected error: %v", err)
+	}
+
+	if sweepCalled {
+		t.Error("no unusedN entry was found after unlink; UpdateQemuConfig sweep must not be called")
+	}
+	if capturedDestroyUnref == nil || *capturedDestroyUnref {
+		t.Fatal("conservative fallback: DeleteQemu must receive DestroyUnreferencedDisks=false when no unusedN entry is found after unlink")
+	}
+}
+
 // ---------------------------------------------------------------------------
 // TestHandleDeleteVM_RetainEphemeral_StragglerSweepPreservesVolume covers the
 // straggler window: a retain-tagged VM whose fast-path destroy fails AFTER the

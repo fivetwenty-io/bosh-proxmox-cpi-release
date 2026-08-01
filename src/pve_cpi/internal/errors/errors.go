@@ -54,9 +54,6 @@ const (
 	// TypeStemcellInvalidTar signals that the stemcell tarball contained a
 	// malformed tar header (e.g., negative declared size); not retriable.
 	TypeStemcellInvalidTar Type = "Bosh::Clouds::StemcellInvalidTar"
-
-	// TypeRegistryConflict signals a registry write conflict; not retriable.
-	TypeRegistryConflict Type = "Bosh::Clouds::RegistryConflict"
 )
 
 // Error is the unified BOSH CPI error value. All constructors return *Error.
@@ -230,16 +227,6 @@ func StemcellEscapedRoot(format string, args ...any) *Error {
 func StemcellInvalidTar(format string, args ...any) *Error {
 	return &Error{
 		typ:       TypeStemcellInvalidTar,
-		msg:       fmt.Sprintf(format, args...),
-		retriable: false,
-	}
-}
-
-// RegistryConflict returns a non-retriable error indicating a registry write
-// conflict.
-func RegistryConflict(format string, args ...any) *Error {
-	return &Error{
-		typ:       TypeRegistryConflict,
 		msg:       fmt.Sprintf(format, args...),
 		retriable: false,
 	}

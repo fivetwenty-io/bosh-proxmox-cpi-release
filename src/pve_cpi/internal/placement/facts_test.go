@@ -535,10 +535,6 @@ func TestGatherNodeFacts_MultipleNodes(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// ParseNodeResources tests
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
 // Maintenance node exclusion tests
 // ---------------------------------------------------------------------------
 
@@ -728,36 +724,5 @@ func TestGatherNodeFacts_MaintenanceUnionHAAndTag(t *testing.T) {
 	}
 	if maintenance["pve3"] {
 		t.Error("pve3: expected InMaintenance=false")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// ParseNodeResources tests
-// ---------------------------------------------------------------------------
-
-func TestParseNodeResources_EmptySlice(t *testing.T) {
-	t.Parallel()
-	result, err := placement.ParseNodeResources(nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(result) != 0 {
-		t.Errorf("expected empty result; got %d", len(result))
-	}
-}
-
-func TestParseNodeResources_SkipsMalformed(t *testing.T) {
-	t.Parallel()
-	raw := []json.RawMessage{
-		json.RawMessage(`{invalid}`),
-		json.RawMessage(`{"type":"qemu","node":"pve1","name":"vm-100"}`),
-	}
-	result, err := placement.ParseNodeResources(raw)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	// Malformed entry skipped; valid entry decoded.
-	if len(result) != 1 {
-		t.Errorf("expected 1 result (malformed skipped); got %d", len(result))
 	}
 }

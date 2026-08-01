@@ -358,25 +358,6 @@ func IsParkerVM(vmid int, tags string, cfg ParkerConfig) bool {
 	return tagContainsParker(tags)
 }
 
-// chooseParkSlot scans the parsed disk map returned by qemu.ParseDisks and
-// returns the first free scsiN slot in [scsi0, scsi30]. Returns ErrNoSlots
-// when all 31 slots are occupied.
-//
-// Inputs:
-//   - disks: map[diskID]optString from qemu.ParseDisks; nil treated as empty.
-//
-// Failure modes:
-//   - all scsi0..scsi30 occupied → ErrNoSlots.
-func chooseParkSlot(disks map[string]string) (string, error) {
-	for i := 0; i < parkerMaxSlots; i++ {
-		slot := fmt.Sprintf("scsi%d", i)
-		if _, occupied := disks[slot]; !occupied {
-			return slot, nil
-		}
-	}
-	return "", ErrNoSlots
-}
-
 // FindParkerForNode scans cluster VM resources and returns the LOWEST parker
 // VMID on node. It does NOT check slot capacity — the returned parker may be
 // full. Callers that need a parker with a free slot (e.g. parkDiskOnNode) must
@@ -907,9 +888,17 @@ func attachToParker(ctx context.Context, c Client, logger *log.Logger, node stri
 	)
 }
 
-// chooseParkSlotExcluding is chooseParkSlot but skips any slot in the exclude
-// set (slots proven stolen by a concurrent park). Returns ErrNoSlots when no
-// non-excluded free slot remains.
+// chooseParkSlotExcluding scans the parsed disk map returned by
+// qemu.ParseDisks and returns the first free scsiN slot in [scsi0, scsi30],
+// skipping any slot in the exclude set (slots proven stolen by a concurrent
+// park). A nil exclude set behaves as "exclude nothing". Returns ErrNoSlots
+// when no non-excluded free slot remains.
+//
+// Inputs:
+//   - disks: map[diskID]optString from qemu.ParseDisks; nil treated as empty.
+//
+// Failure modes:
+//   - all non-excluded slots in scsi0..scsi30 occupied → ErrNoSlots.
 func chooseParkSlotExcluding(disks map[string]string, exclude map[string]bool) (string, error) {
 	for i := 0; i < parkerMaxSlots; i++ {
 		slot := fmt.Sprintf("scsi%d", i)

@@ -22,9 +22,9 @@ import (
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/qemu"
 )
 
-// tracingTestConfig returns a minimal valid CPIConfig for NewClient/
-// NewClientWithTracer construction tests. NewClient never dials the network
-// at construction time, so a non-resolvable host is safe to use here.
+// tracingTestConfig returns a minimal valid CPIConfig for NewClientWithTracer
+// construction tests. Construction never dials the network, so a
+// non-resolvable host is safe to use here.
 func tracingTestConfig() *config.CPIConfig {
 	verify := true
 	return &config.CPIConfig{
@@ -257,23 +257,23 @@ func TestTracedQEMUService_Clone_PassthroughUnaffected(t *testing.T) {
 }
 
 // --------------------------------------------------------------------------
-// (d) nil-tracer construction: NewClient (no tracer) stores raw, undecorated
-// services — asserted via a type assertion on the concrete service returned
-// from Client.QEMU(), which must NOT be a *tracedQEMUService.
+// (d) nil-tracer construction: NewClientWithTracer with a nil tracer stores
+// raw, undecorated services — asserted via a type assertion on the concrete
+// service returned from Client.QEMU(), which must NOT be a *tracedQEMUService.
 // --------------------------------------------------------------------------
 
 func TestNewClient_NilTracer_StoresRawServices(t *testing.T) {
 	t.Parallel()
 	cfg := tracingTestConfig()
-	c, err := NewClient(cfg, log.NewNopLogger())
+	c, err := NewClientWithTracer(cfg, log.NewNopLogger(), nil)
 	if err != nil {
-		t.Fatalf("NewClient: %v", err)
+		t.Fatalf("NewClientWithTracer: %v", err)
 	}
 	if _, isTraced := c.QEMU().(*tracedQEMUService); isTraced {
-		t.Fatal("NewClient (no tracer) returned a *tracedQEMUService — expected raw undecorated service")
+		t.Fatal("NewClientWithTracer (nil tracer) returned a *tracedQEMUService — expected raw undecorated service")
 	}
 	if _, isTraced := c.Pools().(*tracedPoolService); isTraced {
-		t.Fatal("NewClient (no tracer) returned a *tracedPoolService — expected raw undecorated service")
+		t.Fatal("NewClientWithTracer (nil tracer) returned a *tracedPoolService — expected raw undecorated service")
 	}
 }
 

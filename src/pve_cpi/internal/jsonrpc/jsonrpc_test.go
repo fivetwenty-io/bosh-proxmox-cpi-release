@@ -34,20 +34,22 @@ func captureEncode(t *testing.T, fn func(w io.Writer) error) string {
 }
 
 // -----------------------------------------------------------------------
-// Decode tests
+// Request JSON decoding (production decode is cmd/cpi's decodeRequest,
+// which is plain encoding/json against jsonrpc.Request — no jsonrpc-level
+// wrapper exists; these tests exercise the same encoding/json path so
+// Request/Context field decoding stays covered).
 // -----------------------------------------------------------------------
 
-func TestDecode_Valid(t *testing.T) {
+func TestRequestUnmarshalJSON_Valid(t *testing.T) {
 	t.Parallel()
-	f, err := os.Open("testdata/request.json")
+	b, err := os.ReadFile("testdata/request.json")
 	if err != nil {
-		t.Fatalf("open testdata/request.json: %v", err)
+		t.Fatalf("read testdata/request.json: %v", err)
 	}
-	defer func() { _ = f.Close() }()
 
-	req, err := Decode(f)
-	if err != nil {
-		t.Fatalf("Decode: unexpected error: %v", err)
+	var req Request
+	if err := json.Unmarshal(b, &req); err != nil {
+		t.Fatalf("Unmarshal: unexpected error: %v", err)
 	}
 
 	if req.Method != "create_vm" {
@@ -85,42 +87,6 @@ func TestDecode_Valid(t *testing.T) {
 	}
 	if req.APIVersion != 2 {
 		t.Errorf("APIVersion = %d, want 2", req.APIVersion)
-	}
-}
-
-func TestDecode_MissingMethod(t *testing.T) {
-	t.Parallel()
-	input := `{"arguments":[],"context":{"director_uuid":"x","request_id":"y"}}`
-	_, err := Decode(strings.NewReader(input))
-	if err == nil {
-		t.Fatal("expected error for missing method, got nil")
-	}
-	if !strings.Contains(err.Error(), "method") {
-		t.Errorf("error %q should mention \"method\"", err.Error())
-	}
-}
-
-func TestDecode_MalformedJSON(t *testing.T) {
-	t.Parallel()
-	_, err := Decode(strings.NewReader(`{not valid json`))
-	if err == nil {
-		t.Fatal("expected error for malformed JSON, got nil")
-	}
-}
-
-func TestDecode_EmptyInput(t *testing.T) {
-	t.Parallel()
-	_, err := Decode(strings.NewReader(""))
-	if err == nil {
-		t.Fatal("expected error for empty input, got nil")
-	}
-}
-
-func TestDecode_NilReader(t *testing.T) {
-	t.Parallel()
-	_, err := Decode(nil)
-	if err == nil {
-		t.Fatal("expected error for nil reader, got nil")
 	}
 }
 
@@ -244,11 +210,12 @@ func TestContext_UnmarshalJSON_Null(t *testing.T) {
 	}
 }
 
-// TestRequest_Decode_CapturesContextExtra is an end-to-end round trip through
-// the Request envelope (the actual production decode path in cmd/cpi's
-// decodeRequest / jsonrpc.Decode), confirming context.Extra survives nested
-// inside a full Request decode, not only a standalone Context decode.
-func TestRequest_Decode_CapturesContextExtra(t *testing.T) {
+// TestRequestUnmarshalJSON_CapturesContextExtra is an end-to-end round trip
+// through the Request envelope (the actual production decode path is
+// cmd/cpi's decodeRequest, plain encoding/json against jsonrpc.Request),
+// confirming context.Extra survives nested inside a full Request decode, not
+// only a standalone Context decode.
+func TestRequestUnmarshalJSON_CapturesContextExtra(t *testing.T) {
 	t.Parallel()
 	input := `{
 		"method": "create_stemcell",
@@ -260,24 +227,15 @@ func TestRequest_Decode_CapturesContextExtra(t *testing.T) {
 			"pve_api_token": "root@pam!cpi=deadbeef"
 		}
 	}`
-	req, err := Decode(strings.NewReader(input))
-	if err != nil {
-		t.Fatalf("Decode: unexpected error: %v", err)
+	var req Request
+	if err := json.Unmarshal([]byte(input), &req); err != nil {
+		t.Fatalf("Unmarshal: unexpected error: %v", err)
 	}
 	if req.Context.Extra["pve_host"] != "10.255.0.10" {
 		t.Errorf("Context.Extra[pve_host] = %#v, want \"10.255.0.10\"", req.Context.Extra["pve_host"])
 	}
 	if req.Context.Extra["pve_api_token"] != "root@pam!cpi=deadbeef" {
 		t.Errorf("Context.Extra[pve_api_token] = %#v, want the token string", req.Context.Extra["pve_api_token"])
-	}
-}
-
-func TestDecode_EmptyMethod(t *testing.T) {
-	t.Parallel()
-	input := `{"method":"","arguments":[],"context":{}}`
-	_, err := Decode(strings.NewReader(input))
-	if err == nil {
-		t.Fatal("expected error for empty method string, got nil")
 	}
 }
 
@@ -454,15 +412,14 @@ func TestEncodeError_NilWriter(t *testing.T) {
 func TestRoundTrip(t *testing.T) {
 	t.Parallel()
 	// 1. Decode request from testdata.
-	f, err := os.Open("testdata/request.json")
+	b, err := os.ReadFile("testdata/request.json")
 	if err != nil {
-		t.Fatalf("open request.json: %v", err)
+		t.Fatalf("read request.json: %v", err)
 	}
-	defer func() { _ = f.Close() }()
 
-	req, err := Decode(f)
-	if err != nil {
-		t.Fatalf("Decode request: %v", err)
+	var req Request
+	if err := json.Unmarshal(b, &req); err != nil {
+		t.Fatalf("Unmarshal request: %v", err)
 	}
 	if req.Method != "create_vm" {
 		t.Errorf("Method = %q, want create_vm", req.Method)

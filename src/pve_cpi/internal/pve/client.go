@@ -236,29 +236,20 @@ func buildTransportOpts(cfg *config.CPIConfig) sdkclient.Options {
 	}
 }
 
-// NewClient constructs a Client from CPIConfig.
+// NewClientWithTracer constructs a Client from CPIConfig.
 // Selects auth: APIToken if non-empty else User+Password+Realm.
 // Honors VerifySSL (false = skip TLS verify).
 //
-// Services are unwrapped raw SDK bindings — no tracing. Use
-// NewClientWithTracer to get one child span per PVE service call.
-func NewClient(cfg *config.CPIConfig, logger *log.Logger) (Client, error) {
-	return newClient(cfg, logger, nil)
-}
-
-// NewClientWithTracer constructs a Client identically to NewClient, additionally
-// decorating each PVE service call site actually used by CPI code (see
-// tracing.go) with a child span started from tracer when tracer is non-nil.
-// A nil tracer behaves exactly like NewClient: raw, undecorated services,
-// zero added overhead. This is the same single construction choke point as
-// NewClient — only the values stored in the returned Client's service fields
-// differ (raw vs. tracing-decorated).
+// Additionally decorates each PVE service call site actually used by CPI
+// code (see tracing.go) with a child span started from tracer when tracer is
+// non-nil. A nil tracer yields raw, undecorated services with zero added
+// overhead.
 func NewClientWithTracer(cfg *config.CPIConfig, logger *log.Logger, tracer trace.Tracer) (Client, error) {
 	return newClient(cfg, logger, tracer)
 }
 
-// newClient is the shared construction path for NewClient and
-// NewClientWithTracer. tracer == nil means "no tracing" (used by NewClient).
+// newClient is the shared construction path for NewClientWithTracer.
+// tracer == nil means "no tracing".
 func newClient(cfg *config.CPIConfig, logger *log.Logger, tracer trace.Tracer) (Client, error) {
 	if cfg == nil {
 		return nil, cpierrors.Cloud("pve client init: cfg must not be nil")

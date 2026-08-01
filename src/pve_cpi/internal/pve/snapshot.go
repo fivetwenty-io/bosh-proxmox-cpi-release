@@ -59,8 +59,8 @@ func HasSnapshots(ctx context.Context, client Client, node string, vmid int) ([]
 // following operation whose PVE-side guard rejects live snapshots — notably
 // detach_disk — fails spuriously. This poll bridges that gap.
 //
-// Options reuse AwaitTask's defaults (2 s interval, 5 min max wait) and may be
-// overridden with WithPollInterval / WithMaxWait.
+// Options reuse AwaitTask's defaults (2 s interval, 5 min max wait); the max
+// wait may be overridden per call with WithMaxWait.
 //
 // Returns nil once snapName is gone. Returns a *cpierrors.Error on timeout, on
 // ctx cancellation, or when the snapshot list cannot be read.

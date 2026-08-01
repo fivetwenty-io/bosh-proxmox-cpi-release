@@ -383,16 +383,16 @@ func TestParseBlobstoreAuth_NoUsernameOrPassword(t *testing.T) {
 	}
 }
 
-// ---- ResolveSource bosh+blobstore integration ----
+// ---- ResolveSourceWith bosh+blobstore integration ----
 
 // TestResolveSource_BoshBlobstore: well-formed bosh+blobstore URL returns a
 // non-nil Source and a populated Reference with the correct BlobID.
 func TestResolveSource_BoshBlobstore(t *testing.T) {
 	t.Parallel()
 
-	src, ref, err := ResolveSource("bosh+blobstore:abc-123")
+	src, ref, err := ResolveSourceWith("bosh+blobstore:abc-123", DefaultTransportConfig())
 	if err != nil {
-		t.Fatalf("ResolveSource: unexpected error: %v", err)
+		t.Fatalf("ResolveSourceWith: unexpected error: %v", err)
 	}
 	if src == nil {
 		t.Fatal("expected non-nil Source, got nil")
@@ -417,7 +417,7 @@ func TestResolveSource_BoshBlobstore(t *testing.T) {
 func TestResolveSource_BoshBlobstore_EmptyBlob(t *testing.T) {
 	t.Parallel()
 
-	_, _, err := ResolveSource("bosh+blobstore:")
+	_, _, err := ResolveSourceWith("bosh+blobstore:", DefaultTransportConfig())
 	if err == nil {
 		t.Fatal("expected error for empty blob id, got nil")
 	}

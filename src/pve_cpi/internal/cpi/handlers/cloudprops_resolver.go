@@ -92,17 +92,11 @@ func resolveProfileLayer(callCP map[string]any, selectorKey string, profiles map
 		)
 	}
 	// Profile with nil CloudProperties is valid; return an empty map so callers
-	// can still tell the profile resolved (hasLayers) without crashing on nil lookup.
+	// can still tell the profile resolved without crashing on nil lookup.
 	if profile.CloudProperties == nil {
 		return map[string]any{}, nil
 	}
 	return profile.CloudProperties, nil
-}
-
-// hasLayers reports whether any non-call profile layer was appended. Used for
-// logging/debugging — callers need not act on this flag.
-func (r *layeredResolver) hasLayers() bool {
-	return len(r.layers) > 1
 }
 
 // String walks layers in order. Within each layer it tries each key left-to-right.

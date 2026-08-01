@@ -70,7 +70,7 @@ func WrapError(err error) error {
 	// once the cluster reforms a majority, so callers should route this onto
 	// the storage-lock retry curve (2s→30s, 10 attempts) rather than the
 	// shorter transport curve (1s→15s, 8 attempts) — see IsClusterNotQuorate's
-	// use in RetryOnTransientOrLock and RetryOnStorageLock (retry.go).
+	// use in RetryOnTransientOrLock (retry.go).
 	if IsClusterNotQuorate(err) {
 		return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
 			"cluster has lost quorum; mutations are blocked until quorum returns — check `pvecm status`: "+err.Error())
@@ -112,30 +112,6 @@ func WrapError(err error) error {
 
 	// Fallback: generic wrap as non-retriable CloudError.
 	return cpierrors.Wrap(err, "PVE error: "+err.Error())
-}
-
-// WrapNotFoundVM upgrades a 404-class error to VMNotFound for the given VM CID.
-// Non-404 errors pass through WrapError unchanged.
-func WrapNotFoundVM(err error, vmCID string) error {
-	if err == nil {
-		return nil
-	}
-	if IsNotFound(err) {
-		return cpierrors.VMNotFound(vmCID)
-	}
-	return WrapError(err)
-}
-
-// WrapNotFoundDisk upgrades a 404-class error to DiskNotFound for the given disk CID.
-// Non-404 errors pass through WrapError unchanged.
-func WrapNotFoundDisk(err error, diskCID string) error {
-	if err == nil {
-		return nil
-	}
-	if IsNotFound(err) {
-		return cpierrors.DiskNotFound(diskCID)
-	}
-	return WrapError(err)
 }
 
 // IsNotFound returns true when err (or any error in its chain) signals HTTP 404
@@ -405,8 +381,8 @@ func IsLVMCommandTimeout(err error) bool {
 // unlike a plain 5xx, retries should use the storage-lock curve (2s→30s, 10
 // attempts) rather than the shorter transport curve (1s→15s, 8 attempts).
 // See WrapError (which injects an operator-actionable hint into the wrapped
-// message) and RetryOnTransientOrLock / RetryOnStorageLock (which route
-// retries onto the storage-lock curve) in this package.
+// message) and RetryOnTransientOrLock (which routes retries onto the
+// storage-lock curve) in this package.
 //
 // nil → false.
 func IsClusterNotQuorate(err error) bool {
@@ -415,34 +391,6 @@ func IsClusterNotQuorate(err error) bool {
 	}
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "not quorate") || strings.Contains(msg, "no quorum")
-}
-
-// IsSnapshotBlocked reports whether err signals that a PVE disk operation was
-// rejected because a VM snapshot holds a reference to the affected disk. PVE
-// refuses detach and resize on LVM-thin/ZFS storage when a snapshot captures
-// the disk state; the error surfaces as a task-body failure (for resize, via
-// AwaitTask) or as a synchronous HTTP error (for detach via PUT /config).
-//
-// Two PVE message shapes are detected (case-insensitive):
-//
-//   - "is used in snapshot" — detach path:
-//     "cannot delete disk 'scsiN', disk is used in snapshot '<name>'"
-//   - "referenced in snapshot" — resize path (LVM-thin/ZFS):
-//     "can't resize volume, volume is referenced in snapshot '<name>'"
-//
-// This is a defense-in-depth classifier. The primary guard is the pre-flight
-// HasSnapshots check in each handler. IsSnapshotBlocked lets callers add
-// remediation context when a guard is bypassed (race, config override, or
-// storage backends that allow the op but later fail at the task level).
-//
-// nil → false.
-func IsSnapshotBlocked(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "is used in snapshot") ||
-		strings.Contains(msg, "referenced in snapshot")
 }
 
 // IsBaseVolumeInUse reports whether err signals that PVE refused to delete a
@@ -625,21 +573,6 @@ func IsPoolNotEmpty(err error) bool {
 	}
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "pool") && strings.Contains(msg, "is not empty")
-}
-
-// IsPoolMoveConflict reports whether err signals that PVE refused to add a VM
-// to a resource pool because it already belongs to a different pool and the
-// request did not set allow-move. Live shape (PVE 9.2.4, HTTP 500 + text):
-//
-//	VM 99098 belongs already to pool 'p4' and 'allow-move' is not set
-//
-// nil → false.
-func IsPoolMoveConflict(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "belongs already to pool")
 }
 
 // IsPoolNotFound reports whether err signals that a referenced resource pool

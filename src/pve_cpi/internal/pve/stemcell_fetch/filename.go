@@ -14,18 +14,6 @@ func BuildFetchedFilename(name, version, sha256hex string) string {
 	return pve.BuildStemcellFilename(name, version, sha256hex)
 }
 
-// PartialFilename returns the staging filename used during in-flight uploads.
-// Format: "<finalFilename>.partial" so a crash leaves a recognizable orphan
-// that the dedup scanner ignores and a future cleanup pass can sweep.
-//
-// Returns empty string when finalFilename is empty.
-func PartialFilename(finalFilename string) string {
-	if finalFilename == "" {
-		return ""
-	}
-	return finalFilename + ".partial"
-}
-
 // FilenamePrefixForDedup returns the prefix "bosh-stemcell-<name>-<version>-"
 // used by FindStemcellByFilename when scanning for any sha8 variant of the
 // same (name, version) pair. Useful to short-circuit on an existing dedup hit

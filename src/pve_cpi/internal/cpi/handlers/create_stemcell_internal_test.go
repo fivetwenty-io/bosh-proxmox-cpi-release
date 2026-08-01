@@ -943,6 +943,15 @@ func TestEnsureTemplateVM_CreatePath_CpiOwnsSource(t *testing.T) {
 	if balloon, present := createParams["balloon"].(int); !present || balloon != 0 {
 		t.Errorf("balloon = %v (present=%v); want explicit 0", createParams["balloon"], present)
 	}
+	// Verify the template carries no "cpu" key. The clone-path cpu sentinel
+	// (create_vm.go, resourceParams.Cpu written only when non-empty) relies on
+	// templates never setting an explicit cpu model, so that cpu_type:
+	// "pve-default" restores PVE's kvm64 default on the clone instead of
+	// silently inheriting whatever the template last had. If this assertion
+	// ever fails, the clone-path sentinel needs a matching explicit override.
+	if _, present := createParams["cpu"]; present {
+		t.Errorf("cpu = %v present on template; want no cpu key (clone-path pve-default sentinel depends on its absence)", createParams["cpu"])
+	}
 	// Verify source qcow2 deleted (cpiOwnsSource=true). DeleteVolumeIfExists
 	// takes the storage pool and the volume PATH ("import/<file>") as SEPARATE
 	// args — same contract as delete_stemcell. The volume arg must NOT carry a

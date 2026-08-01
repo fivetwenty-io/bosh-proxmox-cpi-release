@@ -29,6 +29,10 @@ type Hook interface {
 // HookFunc adapts plain functions to the Hook interface. A nil field is a
 // no-op: BeforeFn nil returns ctx unchanged; AfterFn nil returns result and err
 // unchanged.
+//
+// Deliberate test seam: no production Hook is built this way (main.go wires
+// concrete Hook implementations directly), but HookFunc lets tests construct
+// ad hoc Before/After behavior inline without a named type per test case.
 type HookFunc struct {
 	BeforeFn func(context.Context, string, []json.RawMessage, jsonrpc.Context) context.Context
 	AfterFn  func(context.Context, string, any, error) (any, error)

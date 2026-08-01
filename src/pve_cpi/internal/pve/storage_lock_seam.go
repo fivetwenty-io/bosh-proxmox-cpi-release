@@ -14,8 +14,8 @@ import (
 // This mirrors the package-level seam pattern used for pushback cadence
 // (pushback_seam.go): BOSH runs one CPI process per invocation with a single
 // config, so a startup-time package default is the simplest correct wiring and
-// avoids threading a backoff policy through every RetryOnStorageLock /
-// RetryOnTransientOrLock call site.
+// avoids threading a backoff policy through every RetryOnTransientOrLock
+// call site.
 var (
 	storageLockBaseNs    atomic.Int64 // default 2000ms
 	storageLockCapNs     atomic.Int64 // default 30000ms

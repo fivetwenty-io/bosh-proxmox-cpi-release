@@ -152,9 +152,9 @@ func TestBuildTransportOpts_DefaultPort(t *testing.T) {
 	}
 }
 
-// TestNewClient_TransportFieldsSet verifies that NewClient succeeds when all
-// 5 transport-tuning fields are set to non-zero values in the config.
-// This is an integration test over the full NewClient path.
+// TestNewClient_TransportFieldsSet verifies that NewClientWithTracer succeeds
+// when all 5 transport-tuning fields are set to non-zero values in the
+// config. This is an integration test over the full client construction path.
 func TestNewClient_TransportFieldsSet(t *testing.T) {
 	t.Parallel()
 
@@ -174,7 +174,7 @@ func TestNewClient_TransportFieldsSet(t *testing.T) {
 		PVEIdleConnTimeoutSec:     90,
 		PVETCPKeepAliveSec:        30,
 	}
-	c, err := NewClient(cfg, nopLogger())
+	c, err := NewClientWithTracer(cfg, nopLogger(), nil)
 	if err != nil {
 		t.Fatalf("expected no error with transport fields set, got: %v", err)
 	}

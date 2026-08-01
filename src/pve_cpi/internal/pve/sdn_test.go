@@ -27,23 +27,16 @@ import (
 type sdnFakeCluster struct {
 	sdkcluster.Service
 
-	createZoneFn func(ctx context.Context, params *sdkcluster.CreateSdnZonesParams) error
 	deleteZoneFn func(ctx context.Context, zone string, params *sdkcluster.DeleteSdnZonesParams) error
 	listZonesFn  func(ctx context.Context, params *sdkcluster.ListSdnZonesParams) (*sdkcluster.ListSdnZonesResponse, error)
 	getZoneFn    func(ctx context.Context, zone string, params *sdkcluster.GetSdnZonesParams) (*sdkcluster.GetSdnZonesResponse, error)
-	createVnetFn func(ctx context.Context, params *sdkcluster.CreateSdnVnetsParams) error
 	deleteVnetFn func(ctx context.Context, vnet string, params *sdkcluster.DeleteSdnVnetsParams) error
 	listVnetsFn  func(ctx context.Context, params *sdkcluster.ListSdnVnetsParams) (*sdkcluster.ListSdnVnetsResponse, error)
 	getVnetFn    func(ctx context.Context, vnet string, params *sdkcluster.GetSdnVnetsParams) (*sdkcluster.GetSdnVnetsResponse, error)
-	createSubFn  func(ctx context.Context, vnet string, params *sdkcluster.CreateSdnVnetsSubnetsParams) error
 	deleteSubFn  func(ctx context.Context, vnet, subnet string, params *sdkcluster.DeleteSdnVnetsSubnetsParams) error
 	listSubsFn   func(ctx context.Context, vnet string, params *sdkcluster.ListSdnVnetsSubnetsParams) (*sdkcluster.ListSdnVnetsSubnetsResponse, error)
-	updateSdnFn  func(ctx context.Context, params *sdkcluster.UpdateSdnParams) (*sdkcluster.UpdateSdnResponse, error)
 }
 
-func (f *sdnFakeCluster) CreateSdnZones(ctx context.Context, params *sdkcluster.CreateSdnZonesParams) error {
-	return f.createZoneFn(ctx, params)
-}
 func (f *sdnFakeCluster) DeleteSdnZones(ctx context.Context, zone string, params *sdkcluster.DeleteSdnZonesParams) error {
 	return f.deleteZoneFn(ctx, zone, params)
 }
@@ -52,9 +45,6 @@ func (f *sdnFakeCluster) ListSdnZones(ctx context.Context, params *sdkcluster.Li
 }
 func (f *sdnFakeCluster) GetSdnZones(ctx context.Context, zone string, params *sdkcluster.GetSdnZonesParams) (*sdkcluster.GetSdnZonesResponse, error) {
 	return f.getZoneFn(ctx, zone, params)
-}
-func (f *sdnFakeCluster) CreateSdnVnets(ctx context.Context, params *sdkcluster.CreateSdnVnetsParams) error {
-	return f.createVnetFn(ctx, params)
 }
 func (f *sdnFakeCluster) DeleteSdnVnets(ctx context.Context, vnet string, params *sdkcluster.DeleteSdnVnetsParams) error {
 	return f.deleteVnetFn(ctx, vnet, params)
@@ -65,17 +55,11 @@ func (f *sdnFakeCluster) ListSdnVnets(ctx context.Context, params *sdkcluster.Li
 func (f *sdnFakeCluster) GetSdnVnets(ctx context.Context, vnet string, params *sdkcluster.GetSdnVnetsParams) (*sdkcluster.GetSdnVnetsResponse, error) {
 	return f.getVnetFn(ctx, vnet, params)
 }
-func (f *sdnFakeCluster) CreateSdnVnetsSubnets(ctx context.Context, vnet string, params *sdkcluster.CreateSdnVnetsSubnetsParams) error {
-	return f.createSubFn(ctx, vnet, params)
-}
 func (f *sdnFakeCluster) DeleteSdnVnetsSubnets(ctx context.Context, vnet, subnet string, params *sdkcluster.DeleteSdnVnetsSubnetsParams) error {
 	return f.deleteSubFn(ctx, vnet, subnet, params)
 }
 func (f *sdnFakeCluster) ListSdnVnetsSubnets(ctx context.Context, vnet string, params *sdkcluster.ListSdnVnetsSubnetsParams) (*sdkcluster.ListSdnVnetsSubnetsResponse, error) {
 	return f.listSubsFn(ctx, vnet, params)
-}
-func (f *sdnFakeCluster) UpdateSdn(ctx context.Context, params *sdkcluster.UpdateSdnParams) (*sdkcluster.UpdateSdnResponse, error) {
-	return f.updateSdnFn(ctx, params)
 }
 
 // sdnClient satisfies pve.Client and exposes only the Cluster service.
@@ -131,112 +115,6 @@ func isRetriable(t *testing.T, err error) bool {
 		return false
 	}
 	return e.OkToRetry()
-}
-
-// ---------------------------------------------------------------------------
-// CreateSDNZone
-// ---------------------------------------------------------------------------
-
-func TestCreateSDNZone_HappyPath(t *testing.T) {
-	t.Parallel()
-	var got *sdkcluster.CreateSdnZonesParams
-	fake := &sdnFakeCluster{
-		createZoneFn: func(_ context.Context, p *sdkcluster.CreateSdnZonesParams) error {
-			got = p
-			return nil
-		},
-	}
-	c := newSDNClient(fake)
-
-	err := pve.CreateSDNZone(context.Background(), c, pve.SDNZoneParams{
-		Zone:   "zcpi1",
-		Type:   "simple",
-		Bridge: "vmbr0",
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if got == nil {
-		t.Fatal("expected SDK CreateSdnZones invocation, got none")
-	}
-	if got.Zone != "zcpi1" {
-		t.Errorf("Zone: want zcpi1 got %q", got.Zone)
-	}
-	if got.Type != "simple" {
-		t.Errorf("Type: want simple got %q", got.Type)
-	}
-	if got.Bridge == nil || *got.Bridge != "vmbr0" {
-		t.Errorf("Bridge: want vmbr0 got %v", got.Bridge)
-	}
-
-	// Marshal and confirm no description/notes/comment keys present.
-	b, err := json.Marshal(got)
-	if err != nil {
-		t.Fatalf("marshal params: %v", err)
-	}
-	var asMap map[string]any
-	if err := json.Unmarshal(b, &asMap); err != nil {
-		t.Fatalf("decode params: %v", err)
-	}
-	for _, banned := range []string{"description", "notes", "comment"} {
-		if _, ok := asMap[banned]; ok {
-			t.Errorf("zone create payload must not include %q (PVE rejects it)", banned)
-		}
-	}
-}
-
-func TestCreateSDNZone_EmptyZone(t *testing.T) {
-	t.Parallel()
-	c := newSDNClient(&sdnFakeCluster{})
-	err := pve.CreateSDNZone(context.Background(), c, pve.SDNZoneParams{Type: "simple"})
-	if err == nil {
-		t.Fatal("expected validation error for empty zone")
-	}
-}
-
-func TestCreateSDNZone_EmptyType(t *testing.T) {
-	t.Parallel()
-	c := newSDNClient(&sdnFakeCluster{})
-	err := pve.CreateSDNZone(context.Background(), c, pve.SDNZoneParams{Zone: "zcpi"})
-	if err == nil {
-		t.Fatal("expected validation error for empty type")
-	}
-}
-
-func TestCreateSDNZone_NilCtx(t *testing.T) {
-	t.Parallel()
-	c := newSDNClient(&sdnFakeCluster{})
-	//nolint:staticcheck // SA1012: nil ctx is exactly what we want to reject.
-	//lint:ignore SA1012 nil ctx is exactly what we want to reject
-	err := pve.CreateSDNZone(nil, c, pve.SDNZoneParams{Zone: "z", Type: "simple"})
-	if err == nil {
-		t.Fatal("expected error for nil ctx")
-	}
-}
-
-func TestCreateSDNZone_NilClient(t *testing.T) {
-	t.Parallel()
-	err := pve.CreateSDNZone(context.Background(), nil, pve.SDNZoneParams{Zone: "z", Type: "simple"})
-	if err == nil {
-		t.Fatal("expected error for nil client")
-	}
-}
-
-func TestCreateSDNZone_ServerErrorRetriable(t *testing.T) {
-	t.Parallel()
-	fake := &sdnFakeCluster{
-		createZoneFn: func(_ context.Context, _ *sdkcluster.CreateSdnZonesParams) error {
-			return makeAPIErr(500, "boom")
-		},
-	}
-	c := newSDNClient(fake)
-	err := pve.CreateSDNZone(context.Background(), c, pve.SDNZoneParams{Zone: "z", Type: "simple"})
-	if err == nil {
-		t.Fatal("expected error from 500")
-	}
-	if !isRetriable(t, err) {
-		t.Errorf("5xx → expected retriable CloudError, got %v", err)
-	}
 }
 
 // ---------------------------------------------------------------------------
@@ -397,65 +275,6 @@ func TestGetSDNZone_NotFound(t *testing.T) {
 // CreateSDNVnet / DeleteSDNVnet / List / Get
 // ---------------------------------------------------------------------------
 
-func TestCreateSDNVnet_HappyPath(t *testing.T) {
-	t.Parallel()
-	var got *sdkcluster.CreateSdnVnetsParams
-	fake := &sdnFakeCluster{
-		createVnetFn: func(_ context.Context, p *sdkcluster.CreateSdnVnetsParams) error {
-			got = p
-			return nil
-		},
-	}
-	c := newSDNClient(fake)
-	err := pve.CreateSDNVnet(context.Background(), c, pve.SDNVnetParams{
-		Vnet: "vcpi", Zone: "zcpi", Alias: "ci-net", Tag: 100, Vlanaware: true,
-	})
-	if err != nil {
-		t.Fatalf("unexpected: %v", err)
-	}
-	if got.Vnet != "vcpi" || got.Zone != "zcpi" {
-		t.Errorf("required fields mismatch: %+v", got)
-	}
-	if got.Alias == nil || *got.Alias != "ci-net" {
-		t.Errorf("Alias: %v", got.Alias)
-	}
-	if got.Tag == nil || *got.Tag != 100 {
-		t.Errorf("Tag: %v", got.Tag)
-	}
-	if got.Vlanaware == nil || !*got.Vlanaware {
-		t.Errorf("Vlanaware: %v", got.Vlanaware)
-	}
-}
-
-func TestCreateSDNVnet_OmitOptionals(t *testing.T) {
-	t.Parallel()
-	var got *sdkcluster.CreateSdnVnetsParams
-	fake := &sdnFakeCluster{
-		createVnetFn: func(_ context.Context, p *sdkcluster.CreateSdnVnetsParams) error {
-			got = p
-			return nil
-		},
-	}
-	c := newSDNClient(fake)
-	err := pve.CreateSDNVnet(context.Background(), c, pve.SDNVnetParams{Vnet: "v", Zone: "z"})
-	if err != nil {
-		t.Fatalf("unexpected: %v", err)
-	}
-	if got.Alias != nil || got.Tag != nil || got.Vlanaware != nil {
-		t.Errorf("expected zero-value optionals to remain nil, got alias=%v tag=%v vlan=%v",
-			got.Alias, got.Tag, got.Vlanaware)
-	}
-}
-
-func TestCreateSDNVnet_EmptyZone(t *testing.T) {
-	t.Parallel()
-	c := newSDNClient(&sdnFakeCluster{})
-	err := pve.CreateSDNVnet(context.Background(), c, pve.SDNVnetParams{Vnet: "v"})
-	if err == nil {
-		t.Fatal("expected validation error")
-	}
-}
-
 func TestDeleteSDNVnet_NotFound(t *testing.T) {
 	t.Parallel()
 	fake := &sdnFakeCluster{
@@ -550,53 +369,6 @@ func TestGetSDNVnet_NotFound(t *testing.T) {
 // CreateSDNVnetSubnet / DeleteSDNVnetSubnet / ListSDNVnetSubnets
 // ---------------------------------------------------------------------------
 
-func TestCreateSDNVnetSubnet_HappyPath(t *testing.T) {
-	t.Parallel()
-	var gotVnet string
-	var got *sdkcluster.CreateSdnVnetsSubnetsParams
-	fake := &sdnFakeCluster{
-		createSubFn: func(_ context.Context, vnet string, p *sdkcluster.CreateSdnVnetsSubnetsParams) error {
-			gotVnet = vnet
-			got = p
-			return nil
-		},
-	}
-	c := newSDNClient(fake)
-	err := pve.CreateSDNVnetSubnet(context.Background(), c, pve.SDNVnetSubnetParams{
-		Vnet:    "vcpi",
-		Subnet:  "10.0.0.0/24",
-		Gateway: "10.0.0.1",
-		Snat:    true,
-	})
-	if err != nil {
-		t.Fatalf("unexpected: %v", err)
-	}
-	if gotVnet != "vcpi" {
-		t.Errorf("vnet arg: want vcpi got %q", gotVnet)
-	}
-	if got.Subnet != "10.0.0.0/24" {
-		t.Errorf("Subnet want CIDR got %q", got.Subnet)
-	}
-	if got.Type != "subnet" {
-		t.Errorf("Type must be hardcoded to 'subnet', got %q", got.Type)
-	}
-	if got.Gateway == nil || *got.Gateway != "10.0.0.1" {
-		t.Errorf("Gateway: %v", got.Gateway)
-	}
-	if got.Snat == nil || !*got.Snat {
-		t.Errorf("Snat: %v", got.Snat)
-	}
-}
-
-func TestCreateSDNVnetSubnet_EmptySubnet(t *testing.T) {
-	t.Parallel()
-	c := newSDNClient(&sdnFakeCluster{})
-	err := pve.CreateSDNVnetSubnet(context.Background(), c, pve.SDNVnetSubnetParams{Vnet: "v"})
-	if err == nil {
-		t.Fatal("expected validation error")
-	}
-}
-
 func TestDeleteSDNVnetSubnet_HappyPath(t *testing.T) {
 	t.Parallel()
 	var gotVnet, gotSub string
@@ -672,54 +444,5 @@ func TestListSDNVnetSubnets_VnetNotFound(t *testing.T) {
 	_, err := pve.ListSDNVnetSubnets(context.Background(), c, "ghost")
 	if !errors.Is(err, pve.ErrSDNNotFound) {
 		t.Errorf("404 on list → ErrSDNNotFound, got %v", err)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// ApplySDN
-// ---------------------------------------------------------------------------
-
-func TestApplySDN_CallsUpdateSdnWithNilParams(t *testing.T) {
-	t.Parallel()
-	var called bool
-	var gotParams *sdkcluster.UpdateSdnParams
-	fake := &sdnFakeCluster{
-		updateSdnFn: func(_ context.Context, p *sdkcluster.UpdateSdnParams) (*sdkcluster.UpdateSdnResponse, error) {
-			called = true
-			gotParams = p
-			rm := sdkcluster.UpdateSdnResponse(`"UPID:pve:00:..."`)
-			return &rm, nil
-		},
-	}
-	c := newSDNClient(fake)
-	if err := pve.ApplySDN(context.Background(), c); err != nil {
-		t.Fatalf("unexpected: %v", err)
-	}
-	if !called {
-		t.Fatal("expected UpdateSdn to be invoked")
-	}
-	if gotParams != nil {
-		t.Errorf("ApplySDN must invoke UpdateSdn with nil params (no lock-token), got %+v", gotParams)
-	}
-}
-
-func TestApplySDN_ServerErrorRetriable(t *testing.T) {
-	t.Parallel()
-	fake := &sdnFakeCluster{
-		updateSdnFn: func(_ context.Context, _ *sdkcluster.UpdateSdnParams) (*sdkcluster.UpdateSdnResponse, error) {
-			return nil, makeAPIErr(500, "apply failed")
-		},
-	}
-	c := newSDNClient(fake)
-	err := pve.ApplySDN(context.Background(), c)
-	if !isRetriable(t, err) {
-		t.Errorf("5xx → expected retriable CloudError, got %v", err)
-	}
-}
-
-func TestApplySDN_NilClient(t *testing.T) {
-	t.Parallel()
-	if err := pve.ApplySDN(context.Background(), nil); err == nil {
-		t.Fatal("expected error for nil client")
 	}
 }

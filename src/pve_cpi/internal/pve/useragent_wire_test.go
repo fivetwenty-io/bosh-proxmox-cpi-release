@@ -1,5 +1,5 @@
 // Wire-level tests for §7.52 User-Agent header propagation.
-// Uses package pve_test (external) to exercise the full NewClient path.
+// Uses package pve_test (external) to exercise the full client construction path.
 // Spins an httptest.TLS server to capture outgoing request headers, confirming
 // that raw.SetHeader reaches the wire for both unset and set operator_id.
 package pve_test
@@ -89,7 +89,7 @@ func stubCfg(t *testing.T, stub *pveStub, operatorID string) *config.CPIConfig {
 // (stub returns 200 + {"data":[]}).
 func issueProbeRequest(t *testing.T, cfg *config.CPIConfig) {
 	t.Helper()
-	c, err := pve.NewClient(cfg, log.NewNopLogger())
+	c, err := pve.NewClientWithTracer(cfg, log.NewNopLogger(), nil)
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}

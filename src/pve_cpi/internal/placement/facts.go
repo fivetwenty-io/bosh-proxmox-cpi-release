@@ -352,21 +352,6 @@ func gatherStorageFacts(
 	return storageAvail, storageTotal
 }
 
-// ParseNodeResources decodes a cluster ListResources response slice into typed
-// NodeResource values. Entries that fail JSON decode are skipped without error;
-// the caller receives a best-effort slice of decodable entries.
-func ParseNodeResources(raw []json.RawMessage) ([]NodeResource, error) {
-	out := make([]NodeResource, 0, len(raw))
-	for _, r := range raw {
-		var item NodeResource
-		if err := json.Unmarshal(r, &item); err != nil {
-			continue // skip malformed entries
-		}
-		out = append(out, item)
-	}
-	return out, nil
-}
-
 // hasTag returns true when the PVE tags string contains an exact match for
 // want. PVE returns the per-resource tags field as a delimited list; different
 // PVE versions and endpoints use ";", "," or whitespace as the separator, so

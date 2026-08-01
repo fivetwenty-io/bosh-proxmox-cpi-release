@@ -1,5 +1,6 @@
 // parker_internal_test.go — white-box tests for unexported parker helpers.
-// Package pve gives access to chooseParkSlot and other unexported symbols.
+// Package pve gives access to chooseParkSlotExcluding and other unexported
+// symbols.
 package pve
 
 import (
@@ -9,12 +10,12 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// chooseParkSlot
+// chooseParkSlotExcluding (nil exclude set)
 // ---------------------------------------------------------------------------
 
 func TestChooseParkSlot_EmptyParker(t *testing.T) {
 	t.Parallel()
-	slot, err := chooseParkSlot(nil)
+	slot, err := chooseParkSlotExcluding(nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -25,7 +26,7 @@ func TestChooseParkSlot_EmptyParker(t *testing.T) {
 
 func TestChooseParkSlot_EmptyMap(t *testing.T) {
 	t.Parallel()
-	slot, err := chooseParkSlot(map[string]string{})
+	slot, err := chooseParkSlotExcluding(map[string]string{}, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -39,7 +40,7 @@ func TestChooseParkSlot_Scsi0Taken(t *testing.T) {
 	disks := map[string]string{
 		"scsi0": "local-lvm:vm-9000-disk-0",
 	}
-	slot, err := chooseParkSlot(disks)
+	slot, err := chooseParkSlotExcluding(disks, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -55,7 +56,7 @@ func TestChooseParkSlot_HolesInMiddle(t *testing.T) {
 		"scsi0": "local-lvm:vm-9000-disk-0",
 		"scsi2": "local-lvm:vm-9000-disk-1",
 	}
-	slot, err := chooseParkSlot(disks)
+	slot, err := chooseParkSlotExcluding(disks, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -70,7 +71,7 @@ func TestChooseParkSlot_AllSlotsOccupied_ErrNoSlots(t *testing.T) {
 	for i := 0; i < parkerMaxSlots; i++ {
 		disks[fmt.Sprintf("scsi%d", i)] = fmt.Sprintf("local-lvm:vm-9000-disk-%d", i)
 	}
-	_, err := chooseParkSlot(disks)
+	_, err := chooseParkSlotExcluding(disks, nil)
 	if err == nil {
 		t.Fatal("expected ErrNoSlots for fully occupied parker")
 	}
@@ -86,7 +87,7 @@ func TestChooseParkSlot_Last30Taken_Scsi30Free(t *testing.T) {
 	for i := 0; i < 30; i++ {
 		disks[fmt.Sprintf("scsi%d", i)] = fmt.Sprintf("local-lvm:vm-9000-disk-%d", i)
 	}
-	slot, err := chooseParkSlot(disks)
+	slot, err := chooseParkSlotExcluding(disks, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

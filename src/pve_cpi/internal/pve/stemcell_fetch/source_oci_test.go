@@ -143,17 +143,17 @@ func TestParseOCIAuth(t *testing.T) {
 	}
 }
 
-// ---- ResolveSource OCI dispatch ----
+// ---- ResolveSourceWith OCI dispatch ----
 
 func TestResolveSource_OCI(t *testing.T) {
 	t.Parallel()
 
-	src, ref, err := ResolveSource("oci://reg.local/img:v1")
+	src, ref, err := ResolveSourceWith("oci://reg.local/img:v1", DefaultTransportConfig())
 	if err != nil {
-		t.Fatalf("ResolveSource: unexpected error: %v", err)
+		t.Fatalf("ResolveSourceWith: unexpected error: %v", err)
 	}
 	if src == nil {
-		t.Fatalf("ResolveSource: expected non-nil Source, got nil")
+		t.Fatalf("ResolveSourceWith: expected non-nil Source, got nil")
 	}
 	if _, ok := src.(*ociSource); !ok {
 		t.Errorf("Source is %T, want *ociSource", src)
@@ -175,12 +175,12 @@ func TestResolveSource_OCI(t *testing.T) {
 func TestResolveSource_OCI_NoTag(t *testing.T) {
 	t.Parallel()
 
-	src, ref, err := ResolveSource("oci://reg.local/img")
+	src, ref, err := ResolveSourceWith("oci://reg.local/img", DefaultTransportConfig())
 	if err != nil {
-		t.Fatalf("ResolveSource: unexpected error: %v", err)
+		t.Fatalf("ResolveSourceWith: unexpected error: %v", err)
 	}
 	if src == nil {
-		t.Fatalf("ResolveSource: expected non-nil Source, got nil")
+		t.Fatalf("ResolveSourceWith: expected non-nil Source, got nil")
 	}
 	if ref.Tag != "latest" {
 		t.Errorf("ref.Tag = %q, want \"latest\"", ref.Tag)

@@ -254,11 +254,10 @@ func TestNextVNI_ExcludesZoneTag(t *testing.T) {
 // allocation proceeds using only the vnet-tag exclusion set (the pre-§1.7
 // behavior) rather than failing the entire allocation, and the Warn fires
 // exactly once even across two separate NextVNI calls that both hit the
-// failure — vniZoneListWarnOnce is a package-level sync.Once with no
-// test-only reset hook, so exercising both the "fails open" and the
-// "warns once" assertions from one call sequence is the only way to keep
-// this deterministic regardless of test execution order within the package.
+// failure. pve.ResetVNIZoneListWarnOnce resets the package-level sync.Once
+// so this assertion is also repeat-safe under `go test -count=N`.
 func TestNextVNI_ZoneListFailure_FailsOpenAndWarnsOnce(t *testing.T) {
+	pve.ResetVNIZoneListWarnOnce()
 	c := newVNIClientZoneListError(
 		[]json.RawMessage{vnetRow("bosh1", 5000)},
 		errors.New("zone listing unavailable"),

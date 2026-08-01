@@ -9,7 +9,7 @@ import (
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
 )
 
-// ---- ResolveSource ----
+// ---- ResolveSourceWith ----
 
 // nolint:gocognit // Table-driven test with one case per supported URI scheme; complexity is from the test data, not from code under test.
 func TestResolveSource(t *testing.T) {
@@ -21,7 +21,7 @@ func TestResolveSource(t *testing.T) {
 		wantScheme string
 		wantBlobID string
 		// wantSuccess: true → expect nil error and non-nil Source.
-		// false → expect a non-nil error (errNotImplemented, unsupported, or empty).
+		// false → expect a non-nil error (unsupported scheme or empty URL).
 		wantSuccess     bool
 		wantErrContains string
 		wantUnsupported bool // true → expect "unsupported URL scheme" error
@@ -78,15 +78,15 @@ func TestResolveSource(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			src, ref, err := ResolveSource(tc.rawURL)
+			src, ref, err := ResolveSourceWith(tc.rawURL, DefaultTransportConfig())
 
 			// Success path: wired schemes return nil error and non-nil Source.
 			if tc.wantSuccess {
 				if err != nil {
-					t.Fatalf("ResolveSource(%q): unexpected error: %v", tc.rawURL, err)
+					t.Fatalf("ResolveSourceWith(%q, DefaultTransportConfig()): unexpected error: %v", tc.rawURL, err)
 				}
 				if src == nil {
-					t.Fatalf("ResolveSource(%q): expected non-nil Source, got nil", tc.rawURL)
+					t.Fatalf("ResolveSourceWith(%q, DefaultTransportConfig()): expected non-nil Source, got nil", tc.rawURL)
 				}
 				if ref.Scheme != tc.wantScheme {
 					t.Errorf("ref.Scheme = %q, want %q", ref.Scheme, tc.wantScheme)
@@ -100,10 +100,10 @@ func TestResolveSource(t *testing.T) {
 				return
 			}
 
-			// All remaining paths return a non-nil error: either empty-URL,
-			// unsupported scheme, or errNotImplemented for known schemes.
+			// All remaining paths return a non-nil error: either empty-URL or
+			// unsupported scheme.
 			if err == nil {
-				t.Fatalf("ResolveSource(%q): expected error, got nil (src=%v)", tc.rawURL, src)
+				t.Fatalf("ResolveSourceWith(%q, DefaultTransportConfig()): expected error, got nil (src=%v)", tc.rawURL, src)
 			}
 
 			if tc.wantEmptyURLErr {
@@ -125,24 +125,7 @@ func TestResolveSource(t *testing.T) {
 				return
 			}
 
-			// Known-but-not-implemented schemes: check errNotImplemented message.
-			if !strings.Contains(err.Error(), "not yet implemented") {
-				t.Errorf("expected errNotImplemented, got: %v", err)
-			}
-
-			if ref.Scheme != tc.wantScheme {
-				t.Errorf("ref.Scheme = %q, want %q", ref.Scheme, tc.wantScheme)
-			}
-			if ref.URL != tc.rawURL {
-				t.Errorf("ref.URL = %q, want %q", ref.URL, tc.rawURL)
-			}
-			if tc.wantBlobID != "" && ref.BlobID != tc.wantBlobID {
-				t.Errorf("ref.BlobID = %q, want %q", ref.BlobID, tc.wantBlobID)
-			}
-			// Source impl is nil for not-yet-wired schemes.
-			if src != nil {
-				t.Errorf("expected nil Source for not-yet-wired scheme, got %T", src)
-			}
+			t.Fatalf("test case %q set none of wantSuccess/wantEmptyURLErr/wantUnsupported", tc.name)
 		})
 	}
 }

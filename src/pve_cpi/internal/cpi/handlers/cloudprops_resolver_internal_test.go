@@ -22,10 +22,6 @@ func TestNewLayeredResolver_NilCallCP(t *testing.T) {
 	if r == nil {
 		t.Fatal("resolver must not be nil")
 	}
-	// No profiles resolved; call layer is empty map.
-	if r.hasLayers() {
-		t.Error("hasLayers() should be false when no vm_type or disk_type profiles exist")
-	}
 }
 
 func TestNewLayeredResolver_EmptyCallCP(t *testing.T) {
@@ -60,9 +56,6 @@ func TestNewLayeredResolver_VMTypeAndDiskTypeBothResolve(t *testing.T) {
 	r, err := newLayeredResolver(callCP, cfg)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
-	}
-	if !r.hasLayers() {
-		t.Error("hasLayers() should be true when both profiles resolved")
 	}
 	// call layer wins for "node"
 	node, ok := r.String("node")
@@ -721,9 +714,6 @@ func TestLayeredResolver_NoSelectors_CallOnlyLikeSingleMapLookup(t *testing.T) {
 	}
 	if _, ok := r.String("absent_key"); ok {
 		t.Error("String(absent_key) should return false")
-	}
-	if r.hasLayers() {
-		t.Error("hasLayers() should be false when no profile layers appended")
 	}
 }
 
