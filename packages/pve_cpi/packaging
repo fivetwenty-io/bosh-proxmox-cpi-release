@@ -131,18 +131,32 @@ pushd "${BOSH_COMPILE_TARGET}/pve_cpi" >/dev/null
     -o "${BOSH_INSTALL_TARGET}/bin/cpi" \
     ./cmd/cpi
 
+  # pve-cid: read-only operator CLI for decoding/locating CPI CIDs (see
+  # src/pve_cpi/cmd/pve-cid). Ships alongside the cpi binary in this same
+  # package — same module, same vendor tree, no extra spec dependency (the
+  # package spec's "pve_cpi/cmd/**/*.go" glob already covers this
+  # subdirectory).
+  go build \
+    -trimpath \
+    -ldflags "-s -w -X main.cliVersion=${BOSH_PACKAGE_VERSION_SANITIZED}" \
+    -o "${BOSH_INSTALL_TARGET}/bin/pve-cid" \
+    ./cmd/pve-cid
+
 popd >/dev/null
 
-# Confirm the binary is a Linux ELF (sanity check on the host-fallback path).
+# Confirm each binary is a Linux ELF (sanity check on the host-fallback path).
 if command -v file >/dev/null 2>&1; then
-  BIN_TYPE="$(file -b "${BOSH_INSTALL_TARGET}/bin/cpi")"
-  case "${BIN_TYPE}" in
-    ELF*) ;;
-    *)
-      echo "WARNING: produced binary does not appear to be an ELF: ${BIN_TYPE}" >&2
-      echo "WARNING: the binary may not execute on the Linux target VM." >&2
-      ;;
-  esac
+  for bin in cpi pve-cid; do
+    BIN_TYPE="$(file -b "${BOSH_INSTALL_TARGET}/bin/${bin}")"
+    case "${BIN_TYPE}" in
+      ELF*) ;;
+      *)
+        echo "WARNING: produced binary ${bin} does not appear to be an ELF: ${BIN_TYPE}" >&2
+        echo "WARNING: the binary may not execute on the Linux target VM." >&2
+        ;;
+    esac
+  done
 fi
 
 echo "==> pve_cpi built at ${BOSH_INSTALL_TARGET}/bin/cpi"
+echo "==> pve-cid built at ${BOSH_INSTALL_TARGET}/bin/pve-cid"
