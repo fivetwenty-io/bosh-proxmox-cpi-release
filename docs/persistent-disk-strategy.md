@@ -103,7 +103,7 @@ Each parker VM is created with the following fixed properties:
 | Property | Value |
 | --- | --- |
 | Name | `bosh-parker-<vmid>` |
-| Tags | `bosh-parker` (always); `director--<id>` when `pve.stemcell.director_id` is set |
+| Tags | `bosh-parker` (always); `director--<id>` when the calling director's identity is present in the request context (automatic — no configuration) |
 | `onboot` | `0` — never auto-started |
 | `protection` | `1` — PVE blocks deletion while protection is set |
 | `memory` | 16 MiB |
@@ -135,7 +135,7 @@ Fields:
 | `source_vm_cid` | VMID of the VM the disk was detached from. |
 | `parked_at` | RFC 3339 timestamp of the park operation. |
 | `node` | PVE cluster node the disk lives on. |
-| `director_id` | Optional BOSH director identifier from `pve.stemcell.director_id`. |
+| `director_id` | BOSH director UUID from the calling director's request context. Empty when the request carries no director UUID. Not a config property — no manifest setting controls it. |
 
 Provenance writes are best-effort: a failure logs a warning but does not block
 the park. Because PVE has no atomic read-modify-write on VM descriptions,

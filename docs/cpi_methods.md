@@ -59,13 +59,14 @@ The CPI advertises `openstack-qcow2` and `openstack-raw` because OpenStack qcow2
 bosh-stemcell-<name>-<version>-<sha8>.qcow2
 ```
 
-After upload, the CPI creates a frozen PVE template VM from the qcow2 in the template VMID range and tags it with `bosh-stemcell-sha-<sha8>`. For CPI-owned images (heavy and light-fetch), the CPI deletes the intermediate upload volume after freezing the template. For operator-preuploaded light stemcell images, the upload volume is preserved.
+After upload, the CPI builds — or, on a content-hash dedup hit, reuses — a frozen PVE cache template VM from the qcow2 in the template VMID range, tagged `bosh-stemcell-sha-<sha8>`. The template is a per-cluster clone-source cache, keyed by content hash; its VMID is internal and never appears in the returned CID. The calling BOSH director's UUID is always registered as a live reference on the cache template, whether the template was freshly built or reused on a dedup hit.
 
-Template creation is idempotent: if a template VM named `bosh-stemcell-<name>-<version>` already exists, its VMID is reused.
+The returned `stemcell_cid` is a path-identity CID identifying the qcow2 file itself, not any PVE VMID:
 
-The returned `stemcell_cid` is `template:<vmid>` (e.g. `template:6042`), identifying the frozen template VM.
+- **`:light:<storage>:import/<file>`** — an operator-managed qcow2 (the `image_id` mode below). The CPI never deletes this file, no matter how many directors stop referencing it.
+- **`:heavy:<storage>:import/<file>`** — a CPI-uploaded or CPI-downloaded qcow2 (the default tarball path, `image_url`, and `source_url` modes). The CPI deletes this file when the last director reference within this cluster is dropped, in `delete_stemcell`.
 
-`cloud_properties` must include `name` and `version`; both are required to build the deterministic template name. `stemcell_storage` must be a shared storage pool accessible from all cluster nodes.
+`cloud_properties` must include `name` and `version`; both are required to build the deterministic filename and cache-template name. `stemcell_storage` must be a shared storage pool accessible from all cluster nodes (or local storage on a single-node cluster, or with `pve.stemcell_replicate_local` enabled for per-node replicas).
 
 **Light stemcell cloud_properties:**
 
@@ -73,11 +74,13 @@ The following `cloud_properties` keys select the image source. They are mutually
 
 | Key | Type | Description |
 |---|---|---|
-| `image_id` | String | Pre-uploaded volume CID in PVE (`<storage>:import/<file>`). The operator has already placed the image in PVE storage. The CPI does not fetch or verify the image bytes; the volume is used directly. |
-| `image_url` | String | Remote URL (https, s3, bosh+blobstore, oci) from which the CPI fetches the image on the Director host and then uploads to PVE. Optional `image_url_auth` provides per-stemcell credentials. |
-| `source_url` | String | Remote URL that PVE downloads server-side (requires PVE 7.2+). The CPI issues a single `POST /nodes/{node}/storage/{storage}/download-url` request; PVE streams the bytes directly without the CPI buffering them locally. When `sha256` is also set, the CPI forwards the checksum to PVE, which verifies it server-side and fails the task on a mismatch; when `sha256` is absent, no checksum is sent and the CPI logs a weak-identity warning. Use this to avoid routing large image bytes through the Director host. |
+| `image_id` | String | Pre-uploaded volume identifying an operator-placed image: a bare volid (`<storage>:import/<file>`) or a `:light:` path-identity CID. `cloud_properties.sha256` is **required** in this mode (content identity and cache dedup depend on it). The CPI does not fetch or verify the image bytes; the volume is used directly, and the returned CID is `:light:`. |
+| `image_url` | String | Remote URL (https, s3, bosh+blobstore, oci) from which the CPI fetches the image on the Director host and then uploads to PVE. Optional `image_url_auth` provides per-stemcell credentials. Despite the historical "light" naming, this mode transfers bytes under CPI control, so the returned CID is `:heavy:`. |
+| `source_url` | String | Remote URL that PVE downloads server-side (requires PVE 7.2+). The CPI issues a single `POST /nodes/{node}/storage/{storage}/download-url` request; PVE streams the bytes directly without the CPI buffering them locally. When `sha256` is also set, the CPI forwards the checksum to PVE, which verifies it server-side and fails the task on a mismatch, and bakes the digest into the filename for content-addressed cache dedup; when `sha256` is absent, no checksum is sent, the CPI logs a weak-identity warning, and the cache template is looked up by name only. Returned CID is `:heavy:`. Use this to avoid routing large image bytes through the Director host. |
 
-When none of these keys is set, `create_stemcell` uploads the local tarball extracted from `image_path` (the standard heavy-stemcell path).
+When none of these keys is set, `create_stemcell` uploads the local tarball extracted from `image_path` (the standard heavy-stemcell path; returned CID is `:heavy:`).
+
+See [Light Stemcells](light-stemcells.md) for the full mode-by-mode walkthrough, storage requirements, and director-reference-counting model.
 
 ---
 
@@ -93,14 +96,16 @@ When none of these keys is set, `create_stemcell` uploads the local tarball extr
 
 **Errors:** `Bosh::Clouds::CloudError` on PVE API failure
 
-**Notes:** Routes on the stemcell CID format:
+**Notes:** `stemcell_cid` must be a path-identity CID — `:light:<storage>:import/<file>` or `:heavy:<storage>:import/<file>` (`pve.ParseStemcellPathCID`). This is a pre-release cutover with no backward compatibility: every earlier grammar (a bare `<storage>:import/<file>`, a `light:...`/`template:<vmid>` prefix, or a bare integer VMID) is rejected as a hard, non-retriable parse error.
 
-- `template:<vmid>` — destroys the template VM with `purge=true` (removes all associated disks). Idempotent: an absent VM is treated as success.
-- `<storage>:import/<filename>` — deletes the qcow2 upload volume. Absent volumes are treated as success.
-- `light:...` — no-op (operator-managed image; the CPI never deletes it).
-- Integer-only CIDs — no-op (pre-upgrade legacy scrub).
+`delete_stemcell` removes the calling director's reference from the CID's cache template (a cluster-scoped lookup by the CID's embedded content hash) and destroys that template only when the removed reference was the last one remaining in the cluster — other directors sharing this cluster keep the cache alive. After a last-reference destroy, the qcow2 file itself is handled by kind:
 
-From the Director's perspective a running VM has no lifecycle dependency on the template it was cloned from, so deleting the stemcell never disturbs deployed VMs. The block-level relationship depends on the clone type: a full clone is an independent byte copy, while a linked clone — the default on copy-on-write backends — shares the template's read-only base image and stays bound to it for as long as it lives. That dependency is safe by construction. PVE's storage layer refuses to remove a base volume while any linked clone still references it, and `delete_stemcell` destroys a `template:` VM only when it is the last stemcell reference (tracked in the template's `stemcell_refs`), preserving it otherwise. A base can therefore never be pulled out from under a VM that still needs it.
+- **`:light:`** — the qcow2 is never deleted, regardless of reference count. Only the cache template (a clone-source performance artifact) is destroyed.
+- **`:heavy:`** — the qcow2 is deleted in the same call, once its last-referencing cache template is destroyed.
+
+Both kinds are idempotent: a CID whose cache template is already gone (no matching content-hash tag found cluster-wide) converges to the same qcow2-lifecycle handling rather than erroring, covering a retry after a previous call died mid-way.
+
+From the Director's perspective a running VM has no lifecycle dependency on the cache template it was cloned from, so deleting the stemcell never disturbs deployed VMs. The block-level relationship depends on the clone type: a full clone is an independent byte copy, while a linked clone — the default on copy-on-write backends — shares the template's read-only base image and stays bound to it for as long as it lives. That dependency is safe by construction: PVE's storage layer refuses to remove a base volume while any linked clone still references it, so a `delete_stemcell` that would destroy an in-use cache template instead returns a clear, non-retriable error naming the template and instructing the operator to delete or migrate the dependent VM(s) first (the destroy is marked pending and resumes automatically on retry). See [Light Stemcells](light-stemcells.md) for the full reference-counting model.
 
 ---
 
@@ -113,7 +118,7 @@ From the Director's perspective a running VM has no lifecycle dependency on the 
 **Args:**
 
 - `args[0]` (String): `agent_id` — ID the Director has selected for the BOSH agent
-- `args[1]` (String): `stemcell_cid` — CID of the stemcell to clone. `template:<vmid>` for stemcells uploaded by this CPI version; `<storage>:import/<filename>` or `light:...` for pre-upgrade stemcells (the CPI opportunistically upgrades to the clone path)
+- `args[1]` (String): `stemcell_cid` — path-identity CID returned by `create_stemcell` (`:light:<storage>:import/<file>` or `:heavy:<storage>:import/<file>`)
 - `args[2]` (Hash): `cloud_properties` — resource pool properties from the manifest (e.g., `cpu`, `memory`, `ephemeral_disk_size_mb`)
 - `args[3]` (Hash): `networks` — NetworkSpec map; each key is a network name, each value has `type`, `ip`, `netmask`, `gateway`, `dns`, and `cloud_properties`
 - `args[4]` (Array of String): `disk_cids` — persistent disks likely to be attached (for placement optimization)
@@ -126,10 +131,12 @@ From the Director's perspective a running VM has no lifecycle dependency on the 
 - `Bosh::Clouds::VMCreationFailed` if VM creation fails (CPI must clean up partial resources)
 - `Bosh::Clouds::CloudError` on PVE API failure
 
-**Notes:** Creates a VM by cloning a stemcell template. The `stemcell_cid` drives dispatch:
+**Notes:** Creates a VM from a stemcell CID. `pve.stemcell_strategy` (default `template`; per-VM override `cloud_properties.stemcell_strategy`) selects how the root disk is materialized:
 
-- **`template:<vmid>`** — clones the identified template VM directly. On linked-clone-capable storage backends (`dir`, `nfs`, `cifs`, `zfspool`, `lvmthin`, `rbd`, `cephfs`), this is a copy-on-write clone that completes in seconds. On `lvm`-thick storage a full clone is performed. Clone type is controlled by `pve.clone_mode` (default `auto`).
-- **Pre-upgrade CID** (`<storage>:import/<file>` or `light:...`) — the CPI extracts the sha8 from the filename and searches for a matching template by PVE tag. If a template is found, it clones it (fast path). If not, it falls back to the original `import-from=` block-copy (slow path, roughly four minutes for a typical stemcell). Re-upload is not required for pre-upgrade stemcells.
+- **`template`** (default) — the CPI resolves the CID's cache template (a cluster-scoped lookup by the CID's embedded content hash) and clones it. On linked-clone-capable storage backends (`dir`, `nfs`, `cifs`, `zfspool`, `lvmthin`, `rbd`, `cephfs`), this is a copy-on-write clone that completes in seconds. On `lvm`-thick storage a full clone is performed. Clone type is controlled by `pve.clone_mode` (default `auto`). If the cache template is missing on a shared-storage multi-cluster setup (manually deleted, or never built on this cluster), `create_vm` logs a warning and falls back to `import` for that one VM rather than failing.
+- **`import`** — the CPI imports the qcow2 directly into the VM's root disk (`import-from=`), independent of any cache template. Slower (a full block-copy, roughly four minutes for a typical stemcell) but has no cache-template dependency.
+
+Both strategies work identically for `:light:` and `:heavy:` CIDs — the strategy only changes how the root disk is built, not the CID's storage/lifecycle semantics. See [Light Stemcells](light-stemcells.md) for the CID grammar and cache-template model.
 
 A VMID is allocated from `[vmid_range_start, vmid_range_end]` (default: `[100, 8999]`). After the clone task completes, the CPI configures NICs, attaches any pre-existing persistent disks, writes agent settings, and starts the VM. The returned `networks_with_mac` hash augments the input networks map with MAC addresses PVE assigned.
 
@@ -418,7 +425,7 @@ The disk CID may carry an optional encoded metadata suffix (see [Disk CID Encodi
 
 **Notes:** Used by cloudcheck to reconcile disk attachment state.
 
-The following slots are always excluded from results: `scsi0` (SCSI root disk), `virtio0` (virtio root disk), `ide0`, and `ide2`. Disks whose PVE option string contains `media=cdrom` are excluded regardless of slot. Each returned CID is the Director's verbatim `disk_cid` when `attach_disk` recorded it in the VM's description sentinel (so envelope CIDs survive cloudcheck comparison); disks attached by earlier releases fall back to the bare volid (`<storage>:<volume>`) without option strings.
+The following slots are always excluded from results: `scsi0` (SCSI root disk), `virtio0` (virtio root disk), `ide0`, and `ide2`. Disks whose PVE option string contains `media=cdrom` are excluded regardless of slot. Each returned CID is the Director's verbatim `disk_cid` when it was recorded in the VM's description sentinel — so envelope CIDs survive cloudcheck comparison — for both disks attached via `attach_disk` and persistent disks pre-attached at `create_vm` time (the `disk_cids` argument); a disk with no sentinel entry falls back to the bare volid (`<storage>:<volume>`) without option strings.
 
 The CPI locates the VM via a cluster scan (`FindVMNodeViaCluster`) before fetching its config, so the result is authoritative after an HA failover.
 
@@ -604,13 +611,15 @@ Note: on the SDN path `bridge` equals `vnet` because PVE realizes every vnet —
 
 **Path selection:**
 
-The handler picks a path from `pve.network_mode` (default `"sdn"`). The mode sets the default; an unambiguous request in the network spec overrides it, so one CPI config can serve SDN and bridge networks side by side:
+The handler picks a path from `pve.network_mode` (default `"bridge"`). The mode sets the default; an unambiguous request in the network spec overrides it, so one CPI config can serve SDN and bridge networks side by side:
 
 | `network_mode` | Path taken |
 |---|---|
-| `"sdn"` (default) | SDN — except when `cloud_properties` names a `bridge` and neither a `zone` nor a `vnet`, which is an explicit bridge request and takes the bridge path |
-| `"bridge"` (opt-in) | Bridge — except when `cloud_properties` names a `zone` or a `vnet`, which is an explicit SDN request and takes the SDN path |
+| `"bridge"` (default) | Bridge — except when `cloud_properties` names a `zone` or a `vnet`, which is an explicit SDN request and takes the SDN path |
+| `"sdn"` (opt-in) | SDN — except when `cloud_properties` names a `bridge` and neither a `zone` nor a `vnet`, which is an explicit bridge request and takes the bridge path |
 | `"auto"` (opt-in, legacy heuristic) | SDN when `cloud_properties.zone` or `cloud_properties.vnet` is set, or `pve.sdn_zone` is configured; bridge otherwise |
+
+See [Networks](networks.md) for Pattern A (operator-managed bridges) versus Pattern B (CPI-managed SDN) and the per-NIC `cloud_properties` reference (`bridge`, `model`, `firewall`, `vlan`, `mtu`) `create_vm` reads independently of this path selection.
 
 **Behavior — SDN path:**
 

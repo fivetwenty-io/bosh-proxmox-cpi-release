@@ -210,24 +210,24 @@ Every SDK error flows through `internal/pve.WrapError`, which classifies HTTP 4x
 
 Each stemcell is backed by a single frozen PVE template VM. `create_vm` clones that template rather than running a qcow2 block-copy per VM. On linked-clone-capable backends, this drops VM creation from roughly four minutes to seconds.
 
-`create_stemcell` uploads the disk image (extracting a gzip+tar tarball first when needed), imports it into a new QEMU VM in the template VMID range (default `[30000, 30999]`), freezes that VM with `MakeTemplate`, and tags it with a short SHA so later calls can find it. The returned stemcell CID is `template:<vmid>` — for example, `template:30042`. Template creation is idempotent: an existing template with the canonical name is reused. For multi-node clusters, `stemcell_storage` must be a shared pool reachable from every node; `create_stemcell` rejects local storage there, while single-node clusters may use it. The `stemcell_fetch` pipeline can fetch a tarball from S3 or local storage and replicate the frozen template across nodes in parallel; templates carry provenance tags that a cross-node sweep uses to garbage-collect orphans on delete.
+`create_stemcell` uploads the disk image (extracting a gzip+tar tarball first when needed), imports it into a new QEMU VM in the template VMID range (default `[30000, 30999]`), freezes that VM with `MakeTemplate`, and tags it with a short SHA so later calls can find it. The template's own VMID never appears in the returned CID — the returned stemcell CID is the path-identity `:light:<storage>:import/<file>` or `:heavy:<storage>:import/<file>` form (see [Light Stemcells](light-stemcells.md)) that names the uploaded qcow2 itself. Template creation is idempotent: an existing template matched by content-hash tag is reused. For multi-node clusters, `stemcell_storage` must be a shared pool reachable from every node; `create_stemcell` rejects local storage there, while single-node clusters may use it. The `stemcell_fetch` pipeline can fetch a tarball from S3 or local storage and replicate the frozen template across nodes in parallel; templates carry provenance tags that a cross-node sweep uses to garbage-collect orphans on delete.
 
-`create_vm` and `delete_stemcell` both dispatch on the stemcell CID format:
+`create_vm` and `delete_stemcell` both dispatch on the stemcell CID's `:light:`/`:heavy:` kind, decoded via `pve.ParseStemcellPathCID`:
 
 ```mermaid
 flowchart TD
-    CID[stemcell_cid] --> Fmt{Format?}
-    Fmt -->|template:vmid| Clone[Clone template, fast path]
-    Fmt -->|storage:import/file| Tag[Find template by SHA tag]
-    Fmt -->|light:...| Tag
-    Tag --> Found{Match?}
-    Found -->|yes| Clone
-    Found -->|no| Slow[block-copy import, slow path]
+    CID[stemcell_cid] --> Parse["ParseStemcellPathCID: kind, storage, path"]
+    Parse --> Strategy{stemcell_strategy?}
+    Strategy -->|template default| Lookup["Look up per-cluster cache\ntemplate by content-hash tag"]
+    Strategy -->|import| Slow[Import qcow2 directly into VM root disk]
+    Lookup --> Found{Cache hit?}
+    Found -->|yes| Clone[Clone cache template, fast path]
+    Found -->|no| Slow
     Clone --> Done[VM created]
     Slow --> Done
 ```
 
-The `template:` CID takes the clone path directly. Pre-upgrade CIDs (`storage:import/...` or `light:...`) extract the SHA, look up a matching template, and clone it when found or fall back to the per-VM block-copy when not. `delete_stemcell` destroys a `template:` VM with `purge=true`, deletes an `import/` volume, treats `light:` and integer-only CIDs as no-ops, and treats an already-absent resource as success. Clone type follows `pve.clone_mode` (default `auto`): linked copy-on-write for snapshot-capable backends, full clone for thick LVM. New VMs allocate from the VMID range (default `[100, 8999]`).
+`stemcell_strategy: template` (the default) clones the per-cluster cache template that `create_stemcell` builds eagerly at upload time. If the cache template is missing (deleted by hand, or never built on this cluster), `create_vm` logs a warning and falls back to `import` for that one VM rather than rebuilding the cache inline. `delete_stemcell` destroys the cache template (kind `light` or `heavy`, both use one) once no director's live reference set (`director_refs`) still names it, then applies kind-specific qcow2 lifecycle: `:light:` files are never deleted (operator-managed, shared across clusters); `:heavy:` files are deleted with the last cache template. Clone type follows `pve.clone_mode` (default `auto`): linked copy-on-write for snapshot-capable backends, full clone for thick LVM. New VMs allocate from the VMID range (default `[100, 8999]`). See [Light Stemcells](light-stemcells.md) for the full CID grammar, cache-template lifecycle, and director-UUID reference counting.
 
 For method signatures, arguments, returns, and per-method error handling, see [CPI Methods](cpi_methods.md). For light-stemcell deployment modes and storage requirements, see [Light Stemcells](light-stemcells.md).
 

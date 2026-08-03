@@ -1,38 +1,48 @@
 # Light Stemcells
 
-Light stemcells let operators reference an existing or remotely hosted qcow2 image
-instead of transferring image bytes through BOSH on every deploy. Two modes are
-available:
+Every stemcell CID this CPI issues identifies a qcow2 file on PVE storage, not any PVE VMID — the file path itself is the stemcell's identity, prefixed with a kind discriminator:
 
-1. **Pre-uploaded** — operator places a qcow2 on PVE storage out-of-band and
-   references it via `cloud_properties.image_id`.
+- **`:light:<storage>:import/<file>`** — an operator-managed qcow2. The operator places the file (or points the CPI at one to fetch) and owns its lifecycle; the CPI never deletes it, no matter how many directors stop referencing it.
 
-2. **CPI-assisted fetch** — operator references a remote URL via
-   `cloud_properties.image_url`; the CPI fetches it once and caches it in PVE
-   storage, deduplicating on re-deploy.
+- **`:heavy:<storage>:import/<file>`** — a CPI-managed qcow2. The CPI uploaded or downloaded the bytes, and deletes the file when the last BOSH director reference within this cluster is dropped.
 
-Both modes build a frozen template VM and return a stemcell CID of the form
-`template:<vmid>` (e.g., `template:30042`). `bosh delete-stemcell` on a
-`template:` CID destroys that template VM and its backing volume. The legacy
-`light:` CID prefix is recognized for backward compatibility on delete only —
-current code does not produce it. See the [Architecture — Stemcell Model](architecture.md#stemcell-model)
-section for the full CID dispatch table.
+Both kinds build (or reuse) a frozen PVE template VM as a per-cluster **clone-source cache** — this is a performance mechanism, not part of the CID, and its VMID is never exposed to the Director. `create_vm` clones the cache template instead of importing the qcow2 fresh into every VM's root disk. Because the cache is keyed by content hash, one qcow2 shared across multiple PVE clusters gets one independently-built cache template per cluster, all cloning from the same source file.
 
-## When to use
+There is no legacy CID compatibility: `create_stemcell` and `delete_stemcell` accept only the `:light:`/`:heavy:` grammar above. Every earlier grammar — a bare `<storage>:import/<file>`, a `light:...`/`template:<vmid>` prefix, or a bare integer VMID — is rejected as a hard, non-retriable parse error.
 
-- **Air-gapped lab** — upload once via `pvesm` or the PVE Upload API and reuse across
-  redeploys without touching the BOSH director upload path.
+## Choosing a mode
 
-- **Multi-deployment infrastructure** — point multiple deployments at the same CPI-fetched
-  image from a private mirror; the CPI reuses the cached copy.
+| Mode | `cloud_properties` | Who owns the file | When the CPI deletes it |
+|---|---|---|---|
+| **Pre-uploaded** (`:light:`) | `image_id` + required `sha256` | Operator | Never |
+| **CPI-fetch** (`:light:` — see [naming note](#a-naming-note-image_url-produces-heavy-not-light) below) | `image_url` (+ optional `image_url_auth`) | CPI | At last director reference in this cluster |
+| **Server-side download** (`:heavy:`) | `source_url` (+ optional `sha256`) | CPI | At last director reference in this cluster |
+| **Heavy tarball upload** (`:heavy:`) | none of the above — the normal `bosh upload-stemcell` path | CPI | At last director reference in this cluster |
 
-- **Large stemcells** — avoid the director-to-CPI upload bottleneck when bandwidth
-  between the director and PVE storage is limited.
+`image_id`, `image_url`, and `source_url` are mutually exclusive; setting more than one is a `create_stemcell` error.
+
+### A naming note: `image_url` produces `:heavy:`, not `:light:`
+
+Despite the "light stemcell" umbrella term this document covers, only the **pre-uploaded** mode (`image_id`) returns a `:light:` CID — the CPI never took ownership of those bytes. `image_url` (CPI-fetch) and `source_url` (server-side download) both transfer bytes under CPI control (directly, or via PVE's own download-url API), so both return `:heavy:` — the CPI, not the operator, owns deleting that file at last reference. The distinction that matters operationally is *who owns deletion*, not *who initiated the transfer*.
+
+## Why `:light:` matters: one file, every cluster
+
+The headline scenario this design serves: upload one qcow2 to a shared NFS export once, and every PVE cluster with `stemcell_storage` pointed at that export serves it — no per-cluster upload traffic, no cross-cluster refcounting complexity, because a `:light:` file is never deleted by the CPI regardless of how many clusters or directors reference it.
+
+```mermaid
+flowchart LR
+    Q["one qcow2 on shared NFS<br/>nfs-stemcells:import/ubuntu-jammy-1.438-a1b2c3d4.qcow2"]
+    Q --> C1["Cluster A cache template<br/>(own VMID, own node)"]
+    Q --> C2["Cluster B cache template<br/>(own VMID, own node)"]
+    C1 --> V1["create_vm clones (Cluster A)"]
+    C2 --> V2["create_vm clones (Cluster B)"]
+```
+
+Each cluster still builds and owns its own cache template — a template is a per-cluster clone source, and guest configuration is cluster-specific — but the qcow2 underneath every cache is the same file, uploaded once. This is the storage shape [Multi-cluster deployments](multi-cluster.md#light-stemcells-one-file-every-cluster) documents in full; see that page for the worked cpi-config example and the disjoint-VMID-banding requirement that makes sharing storage across clusters safe. `pve.stemcell_strategy` (default `template`) controls whether `create_vm` clones the cache or imports the qcow2 directly per VM; per-VM `cloud_properties.stemcell_strategy` overrides it.
 
 ## Storage requirements
 
-Light stemcells require **file-content** PVE storage. Block-only backends cannot
-accept qcow2 uploads and are rejected.
+Light-stemcell modes (pre-uploaded, CPI-fetch, and server-side download all share this policy) require **file-content** PVE storage. Block-only backends cannot accept qcow2 uploads and are rejected.
 
 | PVE storage type | Supported | Notes |
 |---|---|---|
@@ -49,20 +59,17 @@ accept qcow2 uploads and are rejected.
 
 **Policy by cluster shape:**
 
-- **Single-node** — any file-content backend is accepted. `cloud_properties.node`
-  is optional.
+- **Single-node** — any file-content backend is accepted. `cloud_properties.node` is optional.
 
-- **Multi-node + shared storage** (nfs, cifs, cephfs, glusterfs) — accepted without
-  node pinning.
+- **Multi-node + shared storage** (nfs, cifs, cephfs, glusterfs) — accepted without node pinning.
 
-- **Multi-node + local storage** (dir, btrfs) — `cloud_properties.node` is required.
-  Without it, the CPI cannot guarantee that the uploaded image and any VM that uses it
-  land on the same node.
+- **Multi-node + local storage** (dir, btrfs) — `cloud_properties.node` is required. Without it, the CPI cannot guarantee that the uploaded image and any VM that uses it land on the same node.
 
-## Mode 1: Pre-uploaded
+## Mode 1: Pre-uploaded (`:light:`)
 
-The operator uploads the qcow2 to PVE storage manually. The CPI confirms the file
-is present, builds a frozen template VM from it, and returns `template:<vmid>`.
+The operator uploads the qcow2 to PVE storage manually and declares its SHA-256 digest. The CPI never uploads, deletes, or rewrites the underlying volume — it only confirms the file is present, builds (or reuses) a frozen cache template from it, and registers this director's reference.
+
+`cloud_properties.sha256` is **required** in this mode (not optional, unlike the tarball and server-download paths): content identity and sha-tag cache dedup both depend on it, and a missing or malformed digest is a hard `create_stemcell` error before any PVE call is made.
 
 ### Operator workflow
 
@@ -73,15 +80,17 @@ is present, builds a frozen template VM from it, and returns `template:<vmid>`.
    pvesm upload <storage> /path/to/bosh-stemcell-ubuntu-jammy-1.438.qcow2 --content import
    ```
 
-   Or use the PVE web UI: navigate to the storage, open the **Content** tab, and
-   click **Upload**.
+   Or use the PVE web UI: navigate to the storage, open the **Content** tab, and click **Upload**.
 
-2. Note the resulting volid. The PVE storage browser displays it in the form
-   `<storage>:import/<filename>`. Example:
-   `nfs-stemcells:import/bosh-stemcell-ubuntu-jammy-1.438-a1b2c3d4.qcow2`
+2. Compute the SHA-256 digest of the uploaded file (required — see above):
 
-3. Author the stemcell tarball. The minimal `stemcell.MF` below references the
-   pre-uploaded volume via `cloud_properties.image_id`:
+   ```bash
+   sha256sum bosh-stemcell-ubuntu-jammy-1.438.qcow2
+   ```
+
+3. Note the resulting volid. The PVE storage browser displays it in the form `<storage>:import/<filename>`. Example: `nfs-stemcells:import/bosh-stemcell-ubuntu-jammy-1.438-a1b2c3d4.qcow2`.
+
+4. Author the stemcell tarball. The minimal `stemcell.MF` below references the pre-uploaded volume via `cloud_properties.image_id`. `image_id` accepts either a bare volid or a full `:light:` path-identity CID (a `:heavy:` CID is rejected here — that kind asserts CPI ownership, which a pre-uploaded image contradicts by definition):
 
    ```yaml
    name: bosh-proxmox-kvm-ubuntu-jammy-go_agent-light
@@ -92,44 +101,43 @@ is present, builds a frozen template VM from it, and returns `template:<vmid>`.
      - proxmox-kvm
    cloud_properties:
      image_id: "nfs-stemcells:import/bosh-stemcell-ubuntu-jammy-1.438-a1b2c3d4.qcow2"
+     sha256: "<64-character sha256 hex digest from step 2>"
      name: ubuntu-jammy
      version: "1.438"
      disk_format: qcow2
      os_type: l26
      disk: 10240
-     # Required when storage is local-dir on a multi-node cluster:
+     # Required when storage is local-dir/btrfs on a multi-node cluster:
      # node: pve-node1
    ```
 
-   The `bosh repack-stemcell` command can inject or replace `cloud_properties` in an
-   existing stemcell tarball, avoiding the need to author one from scratch.
+   The `bosh repack-stemcell` command can inject or replace `cloud_properties` in an existing stemcell tarball, avoiding the need to author one from scratch.
 
-4. Upload to the director:
+5. Upload to the director:
 
    ```bash
    bosh upload-stemcell <light-tarball.tgz>
    ```
 
-   The CPI confirms `image_id` points to a real volume on PVE, builds a frozen
-   template VM from it, and returns a `template:<vmid>` CID (e.g., `template:30042`).
+   The CPI confirms `image_id` points to a real volume on PVE, builds (or reuses) a frozen cache template from it, registers this director's reference, and returns a `:light:<storage>:import/<file>` CID.
 
-5. Deploy normally. `bosh deploy` passes the `template:` CID to `create_vm`, which
-   clones the template directly.
+6. Deploy normally. `bosh deploy` passes the `:light:` CID to `create_vm`, which clones the cache template (or imports the qcow2 directly under `stemcell_strategy: import`).
 
 ### Error messages
 
 | Error | Cause | Fix |
 |---|---|---|
-| `image_id %q is not a valid storage volid` | `image_id` does not match `<storage>:import/<file>` | Correct the volid format. |
-| `light stemcell image_id %q not found on storage %q node %q` | File not present on PVE. | Run `pvesm list <storage>` to confirm the upload landed. See [Troubleshooting](#troubleshooting) for the rescan note. |
-| `storage %q is local on a multi-node cluster` | Local-dir storage on a cluster with no node pin. | Add `cloud_properties.node: <nodename>`. |
-| `storage %q (type=%q) is block-only` | LVM, ZFS, or RBD storage chosen. | Switch to a file-content storage (nfs, dir, cephfs). |
+| `preuploaded stemcells must declare sha256 ...` | `cloud_properties.sha256` missing or not a 64-character hex string. | Compute and add the digest (step 2 above). |
+| `cloud_properties.image_id %q is not a valid path-identity CID` | `image_id` starts with `:` but doesn't parse as `:light:...`/`:heavy:...`. | Correct the CID or use a bare volid instead. |
+| `cloud_properties.image_id %q has kind "heavy"; preuploaded stemcells must use a bare volid or a ":light:" CID` | `image_id` is a `:heavy:` CID. | Use a bare volid or a `:light:` CID — a `:heavy:` CID asserts CPI ownership, which a pre-uploaded image contradicts. |
+| `cloud_properties.image_id %q is not a valid storage volid` | `image_id` does not match `<storage>:import/<file>`. | Correct the volid format. |
+| `light stemcell image_id %q not found on storage %q node %q` | File not present on PVE. | Run `pvesm list <storage>` to confirm the upload landed; see [Troubleshooting](#troubleshooting) for the rescan note. |
+| `storage %q is local on a multi-node cluster` | Local-dir/btrfs storage on a cluster with no node pin. | Add `cloud_properties.node: <nodename>`. |
+| `storage %q (type=%q) is block-only` | LVM, ZFS, or RBD storage chosen. | Switch to a file-content storage (nfs, dir, cephfs, cifs, glusterfs, btrfs). |
 
-## Mode 2: CPI-assisted fetch
+## Mode 2: CPI-assisted fetch (`:light:`)
 
-The CPI fetches the qcow2 from a remote URL, streams it into PVE storage, builds a
-frozen template VM from it, and returns `template:<vmid>`. Subsequent
-`bosh upload-stemcell` calls for the same image skip the download entirely.
+The CPI fetches the qcow2 from a remote URL, streams it into PVE storage while computing its SHA-256 in one pass, builds (or reuses) a frozen cache template, and returns a `:light:` CID (see the [naming note](#a-naming-note-image_url-produces-heavy-not-light) above — this mode transfers bytes under CPI control, but retains the `:light:` label used by the historical "light stemcell" feature name). Subsequent `bosh upload-stemcell` calls for the same content skip the download entirely.
 
 ### URL schemes
 
@@ -146,8 +154,7 @@ Credentials can be supplied per-stemcell in `cloud_properties` or centrally in t
 
 #### Per-stemcell credentials
 
-Set `cloud_properties.image_url_auth` in `stemcell.MF`. Per-stemcell auth overrides any
-config-level defaults.
+Set `cloud_properties.image_url_auth` in `stemcell.MF`. Per-stemcell auth overrides any config-level defaults.
 
 ```yaml
 cloud_properties:
@@ -159,8 +166,7 @@ cloud_properties:
 
 #### Centralized credentials (CPI config)
 
-Add entries to `pve.fetch_credential_defaults` in the CPI job properties. Each entry maps
-a URL prefix to an auth payload. When multiple entries match, the longest prefix wins.
+Add entries to `pve.fetch_credential_defaults` in the CPI job properties. Each entry maps a URL prefix to an auth payload. When multiple entries match, the longest prefix wins.
 
 ```yaml
 properties:
@@ -179,8 +185,7 @@ properties:
           endpoint: "https://s3.lab.local"
 ```
 
-Per-stemcell `image_url_auth` takes priority over config defaults. Among config defaults,
-the entry with the longest matching `url_prefix` wins.
+Per-stemcell `image_url_auth` takes priority over config defaults. Among config defaults, the entry with the longest matching `url_prefix` wins.
 
 ### Auth payload schemas
 
@@ -209,8 +214,7 @@ endpoint: "https://minio.lab.local"
 region: "us-east-1"
 force_path_style: true
 ```
-When `endpoint` is set, path-style addressing is enabled automatically (needed for
-MinIO and most S3-compatible servers).
+When `endpoint` is set, path-style addressing is enabled automatically (needed for MinIO and most S3-compatible servers).
 
 **`oci`**
 ```yaml
@@ -229,15 +233,7 @@ password: "<pass>"    # optional
 
 ### Dedup
 
-The CPI deduplicates fetched images using a `(name, version, sha8)` filename pattern. When
-`bosh upload-stemcell` is called again for the same image:
-
-1. The CPI scans PVE storage for any import volume with a matching `name`+`version` prefix.
-2. If a match is found, it returns the existing `template:<vmid>` CID without fetching the remote URL.
-3. After the fetch, an exact SHA-256 check provides a second dedup gate.
-
-A re-deploy or repeat `bosh upload-stemcell` for an already-cached image completes in
-milliseconds.
+Before fetching, the CPI does a best-effort prefix scan of storage for any existing volume matching the stemcell's name+version (avoiding a redundant network round-trip on a repeat upload with the same name+version, regardless of exact content match). After the fetch, an exact SHA-256-based filename check provides the precise dedup gate — a re-deploy or repeat `bosh upload-stemcell` for byte-identical content reuses the existing volume and completes in milliseconds.
 
 ### Error messages
 
@@ -249,77 +245,77 @@ milliseconds.
 | `storage %q (type=%q) is block-only` | Fetch target storage is LVM/ZFS/RBD. | Switch `stemcell_storage` to a file-content backend. |
 | `storage %q is local on a multi-node cluster` | Local storage, no node pin. | Add `cloud_properties.node`. |
 
-## Template VM lifecycle
+## Mode 3: Server-side download (`:heavy:`)
 
-All stemcell paths — heavy, pre-uploaded, and CPI-fetch — converge on the same lifecycle:
-the CPI builds a frozen PVE template VM and returns its VMID as the stemcell CID.
+`cloud_properties.source_url` streams the image directly into PVE storage via PVE's own `download-url` API (`POST /nodes/{node}/storage/{storage}/download-url`, requires PVE 7.2+) — only the PVE node needs network access to `source_url`, not the CPI host. The CPI never transfers image bytes in this mode, but it does own the resulting import volume (the operator didn't pre-place it), so the returned CID is always `:heavy:`.
+
+`cloud_properties.sha256` is optional but strongly recommended: when set, it is forwarded to PVE as a server-side checksum (a task failure on mismatch is a non-retriable `create_stemcell` error) and baked into the canonical filename for exact-content dedup and sha-tag cache identity. When absent, the CPI logs a warning and falls back to a `name`+`version`-only filename (weak identity — two different `source_url`s with the same name+version and no `sha256` share one import volume, first-writer wins) and looks up the cache template by name rather than by content hash.
+
+```yaml
+cloud_properties:
+  source_url: "https://artifacts.corp/stemcells/ubuntu-jammy-1.438.qcow2"
+  sha256: "<64-character sha256 hex digest>"   # optional but recommended
+  name: ubuntu-jammy
+  version: "1.438"
+  disk_format: qcow2
+  os_type: l26
+```
+
+## Mode 4: Heavy tarball upload (`:heavy:`)
+
+The normal `bosh upload-stemcell <tarball>.tgz` path with no `image_id`/`image_url`/`source_url` set. The CPI extracts the tarball, computes the SHA-256 of the disk image, uploads the resulting qcow2 to `stemcell_storage`, and builds (or reuses) the cache template — this is the path every `bosh` CLI stemcell upload takes by default, with no special `cloud_properties` required beyond what the stemcell tarball itself already carries.
+
+## Cache template lifecycle (all modes)
+
+Every mode — pre-uploaded, CPI-fetch, server-download, and heavy tarball — converges on the same cache-template mechanism after the qcow2 is in place:
 
 ```mermaid
 flowchart LR
-    A[heavy tarball] --> E[ensureTemplateVM]
-    B[pre-uploaded qcow2] --> E
-    C[CPI-fetch URL] --> D[download + store qcow2] --> E
-    E --> F["template:&lt;vmid&gt;"]
+    A[":light: pre-uploaded"] --> E[ensureTemplateVM]
+    B[":light: CPI-fetch"] --> E
+    C[":heavy: server-download"] --> E
+    D[":heavy: tarball upload"] --> E
+    E --> F["cache template (cluster-scoped)"]
+    F --> G["registerStemcellDirectorRef"]
 ```
+
+### Content-hash dedup and race reconciliation
+
+`ensureTemplateVM` tags every cache template with `bosh-stemcell-sha-<sha8>` (the first 8 hex characters of the qcow2's SHA-256) when the digest is known. On a subsequent `create_stemcell` call for the same content:
+
+1. A cluster-wide lookup by the `bosh-stemcell-sha-<sha8>` tag finds existing candidates. Each candidate's full SHA-256 (recorded in its provenance description) is re-verified against the wanted digest before reuse — a sha8 tag match alone is not proof of identity, since two different images can share an 8-hex-character tag by chance.
+2. When sha8 is unknown (server-download with no `sha256`, the one remaining case), the CPI falls back to a deterministic name lookup instead — a weaker identity, never used when content-addressed identity is available.
+3. If two `create_stemcell` calls race and both build a template for the same content, `reconcileTemplateRace` re-scans after freeze, keeps the lowest-VMID survivor cluster-wide, and deletes the loser's duplicate.
 
 ### VMID range
 
-Template VMs are allocated from a dedicated VMID range, separate from VM and disk
-ranges, so they are easy to identify in the PVE UI. The default range is `[30000, 30999]`.
-Override with `pve.stemcell_template_vmid_range_start` and
-`pve.stemcell_template_vmid_range_end` in the CPI config.
-
-### SHA-tag deduplication and race reconciliation
-
-After uploading the qcow2, `ensureTemplateVM` tags the template VM with
-`bosh-stemcell-sha-<sha8>` where `sha8` is the first 8 hex characters of the SHA-256
-digest. On subsequent `create_stemcell` calls for the same image:
-
-1. The CPI first checks for an existing template VM carrying that SHA tag.
-2. If not found by tag, it falls back to the deterministic filename lookup.
-3. If another `create_stemcell` call raced and created a duplicate, `reconcileTemplateRace`
-   scans for duplicates, keeps the survivor, and deletes the extra template.
+Cache template VMs allocate from a dedicated VMID range, separate from VM and disk ranges. Default `[30000, 30999]`; override with `pve.stemcell_template_vmid_range_start`/`_end`. See [Configuration — VMID ranges](configuration.md#vmid-ranges).
 
 ### Pool and node pinning
 
-Two optional config keys control template VM placement:
-
-- `pve.stemcell_template_node` — pins template creation to a specific cluster node;
-  `delete_stemcell` uses the same node for the primary destroy.
-
-- `pve.stemcell_template_pool` — assigns template VMs to a named PVE resource pool,
-  which scopes access controls and enables bulk operations.
+- `pve.stemcell_template_node` — pins cache-template creation to a specific cluster node; `delete_stemcell` uses the same node for the primary destroy.
+- `pve.stemcell_template_pool` — assigns cache templates to a named PVE resource pool (default `bosh-templates`, create-if-missing). See [Configuration — Resource Pools](configuration.md#resource-pools).
 
 ### Template replication
 
-When `pve.stemcell_replicate_local` is enabled, the CPI replicates the template VM to
-all cluster nodes after creation, up to `pve.stemcell_replication_concurrency` parallel
-copies (default: serial). Individual node replication failures are logged as warnings
-and do not fail `create_stemcell`. `delete_stemcell` performs a cross-node SHA-tag sweep
-to remove all replicas regardless of whether replication was enabled originally.
+When `pve.stemcell_replicate_local` is enabled, the CPI replicates the cache template to every other cluster node's local storage after creation (useful when `stemcell_storage` is node-local rather than shared). Individual node failures are logged as warnings and do not fail `create_stemcell`. `delete_stemcell` sweeps all replicas cluster-wide via the same sha8-tag lookup used for the primary, regardless of when replication was enabled.
 
-### Provenance and orphan pruning
+## Director-UUID reference counting
 
-When `pve.stemcell.provenance` is enabled, the CPI stores a JSON provenance record in
-the template VM description and applies `bosh-stemcell-sha` and `bosh-stemcell-name`
-tags. This lets the operator audit which templates correspond to which BOSH stemcell
-uploads.
+Every mode registers the calling BOSH director's UUID as a live reference on the cache template's provenance — this is a hard step, not best-effort: a silently dropped registration would let a different director's `delete_stemcell` destroy a template this director still depends on.
 
-`pve.stemcell.prune_orphans` (requires `pve.stemcell.director_id`) removes template
-VMs cluster-wide that carry the director's tag but are no longer tracked by the current
-director. Orphan pruning is best-effort: individual sweep failures do not fail
-`delete_stemcell`.
+- **`create_stemcell`** (any mode, including a dedup hit that reuses an existing cache) always registers this director's reference before returning the CID.
+- **`delete_stemcell`** removes this director's reference. The cache template is destroyed only when that was the *last* remaining reference in the cluster — refs from other directors sharing the same cluster keep the cache alive.
+- **`:light:` files are never deleted**, regardless of reference count — only the cache template (the clone-source performance artifact) goes away at last reference; the operator-owned qcow2 is untouched.
+- **`:heavy:` files are deleted at last reference**, in the same `delete_stemcell` call that destroys the last-referencing cache template.
+
+Multiple directors sharing one PVE cluster each hold independent references on the same cache template — see [Multi-cluster deployments — Stemcell registration across CPI entries](multi-cluster.md#stemcell-registration-across-cpi-entries) for the `--fix` re-registration workflow when one BOSH director targets multiple cpi-config entries.
 
 ## Operator caveats
 
-`bosh delete-stemcell` on a `template:` CID destroys the template
-VM and its backing disk volume via PVE purge. No manual `pvesm free` step is needed.
-Verify deletion by running `bosh stemcells` before and after; the CID disappears afterward.
+`bosh delete-stemcell` on a stemcell whose only remaining director reference is this director's destroys the cache template (and, for `:heavy:`, the qcow2). No manual `pvesm free` step is needed in that case. Verify with `bosh stemcells` before and after; the CID disappears once every director has released it.
 
-**Legacy `light:` CIDs** (produced only by CPI versions predating the template-VM
-model) are treated as no-ops: `bosh delete-stemcell` on a `light:` CID logs an INFO
-entry and returns success without touching PVE. If the director still holds `light:`
-CIDs from a prior CPI version, manage those volumes manually:
+For a `:light:` file, `pvesm free` (or the PVE UI's storage **Content** tab) is the *only* way to remove the qcow2 itself — the CPI will never do it:
 
 ```bash
 # From a PVE host shell:
@@ -329,17 +325,28 @@ pvesm free <storage>:import/<filename>
 pvesm free nfs-stemcells:import/bosh-stemcell-ubuntu-jammy-1.438-a1b2c3d4.qcow2
 ```
 
-Alternatively, open the PVE web UI, navigate to the storage's **Content** tab, select
-the volume, and click **Remove**.
+## Inspecting stemcell CIDs with `pve-cid`
+
+`pve-cid` ships on the Director VM at `/var/vcap/packages/pve_cpi/bin/pve-cid` — not on `PATH` by default. The examples below assume `export PATH="/var/vcap/packages/pve_cpi/bin:$PATH"`, or invoke the full path directly.
+
+`pve-cid decode` is fully offline (no PVE API call, no config load) and prints a CID's structure — storage, volume path, filename, and (when extractable) sha8:
+
+```bash
+pve-cid decode ':light:nfs-stemcells:import/bosh-stemcell-ubuntu-jammy-1.438-a1b2c3d4.qcow2'
+pve-cid decode ':heavy:local:import/bosh-stemcell-ubuntu-jammy-1.438-a1b2c3d4.qcow2' --json
+```
+
+`pve-cid stemcells` scans a live cluster (requires CPI config) and correlates cache templates with storage files, grouped by sha8, flagging entries with zero director references as orphan candidates:
+
+```bash
+pve-cid stemcells --config /path/to/cpi.json --orphans
+```
 
 ## Troubleshooting
 
 **Existence check fails immediately after `pvesm upload`**
 
-PVE caches storage content listings. The CPI queries that listing during the
-pre-uploaded existence check. If `pvesm list <storage>` does not yet show the file,
-run `pvesm rescan` on the PVE node or wait approximately 10 seconds and retry
-`bosh upload-stemcell`.
+PVE caches storage content listings. The CPI queries that listing during the pre-uploaded existence check. If `pvesm list <storage>` does not yet show the file, run `pvesm rescan` on the PVE node or wait approximately 10 seconds and retry `bosh upload-stemcell`.
 
 **Partial upload artifact left after a fetch failure**
 
@@ -355,23 +362,10 @@ Delete any partial file before retrying:
 pvesm free <storage>:import/<partial-filename>
 ```
 
-**CPI version downgrade after light stemcells were used**
-
-A CPI version that predates the template-VM model cannot parse `template:` CIDs. Before
-downgrading, re-upload all stemcells using the normal (heavy) path so the director holds
-the older CID format. Do not downgrade while any deployment still references a `template:` CID.
-
 ## See also
 
-- [Architecture — Stemcell Model](architecture.md#stemcell-model) — CID dispatch table,
-  clone behavior, and the create/delete lifecycle overview.
-- [Persistent disks](persistent-disks.md) — storage backend classification and
-  cloud-properties for disk pools.
-- [ConfigDrive layout](configdrive.md) — ISO delivery for agent bootstrap.
-- [Configuration reference](configuration.md) — stemcell config keys
-  (`stemcell_template_vmid_range_start/end`, `stemcell_template_node`,
-  `stemcell_template_pool`, `stemcell_replicate_local`,
-  `stemcell_replication_concurrency`, `stemcell.provenance`, `stemcell.director_id`,
-  `stemcell.prune_orphans`).
-- [BOSH light-stemcell convention](https://bosh.io/docs/stemcell/) — the equivalent
-  feature in AWS, OpenStack, and GCP CPIs uses the same operator workflow.
+- [Multi-cluster deployments](multi-cluster.md) — the full `:light:` shared-storage walkthrough, disjoint VMID banding, and cross-cluster stemcell inventory.
+- [Design Decisions](design-decisions.md) — the underlying rationale for the path-identity CID grammar and the qcow2 deletion policy.
+- [Configuration reference](configuration.md) — stemcell config keys (`stemcell_template_vmid_range_start`/`_end`, `stemcell_template_node`, `stemcell_template_pool`, `stemcell_strategy`, `stemcell_replicate_local`).
+- [CPI Methods — create_stemcell / delete_stemcell](cpi_methods.md) — the full method contract.
+- [BOSH light-stemcell convention](https://bosh.io/docs/stemcell/) — the equivalent feature in AWS, OpenStack, and GCP CPIs uses the same operator workflow.

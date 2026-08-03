@@ -1004,16 +1004,19 @@ add stable `bosh-stemcell*` tags (reusing the tag-sanitization path). In
 replicas); add an opt-in prune of `bosh-stemcell`-tagged templates with no referencing
 clones (cross-check `/cluster/resources`). Best-effort, config-gated, warn-never-fail.
 
-**Shipped.** At template finalization, when `pve.stemcell.provenance` is enabled the CPI
-stamps the template Notes field with a JSON provenance block containing name, version,
-os_type, disk_format, sha8, source, director_id, and created timestamp, and adds stable
-tags: a bare `bosh-stemcell` marker plus `bosh-stemcell-name-<v>`,
-`bosh-stemcell-version-<v>`, and `director--<id>` (sanitized), alongside the existing
-`bosh-stemcell-sha-<sha8>` content tag. Both the primary template and per-node replica
-templates (§7.2) receive the same stamps. The feature is off by default; with it unset,
-template config is byte-identical to prior releases. The `bosh-stemcell` marker plus
-`director--<id>` tag give PVE the resource-ownership grouping vSphere gets from its
-managed-by extension, expressed in PVE-native tags rather than a platform extension object.
+**Shipped.** At template finalization the CPI unconditionally stamps the template Notes
+field with a JSON provenance block containing name, version, os_type, disk_format, sha8,
+sha256, the path-identity CID, the creating director's UUID (`created_by`), and the live
+set of director UUIDs currently referencing the template (`director_refs`), and adds
+stable tags: a bare `bosh-stemcell` marker plus `bosh-stemcell-name-<v>`,
+`bosh-stemcell-version-<v>`, and `director--<id>` (sanitized, one per referencing
+director), alongside the existing `bosh-stemcell-sha-<sha8>` content tag. Both the primary
+template and per-node replica templates (§7.2) receive the same stamps. There is no
+config knob for this — director identity comes from the request context every CPI call
+carries (`jsonrpc.Context.DirectorUUID`), not from any property. The `bosh-stemcell`
+marker plus `director--<id>` tags give PVE the resource-ownership grouping vSphere gets
+from its managed-by extension, expressed in PVE-native tags rather than a platform
+extension object.
 
 `delete_stemcell` now always performs a best-effort cross-node sweep: it resolves the
 stemcell sha8 from the primary template, then deletes every template across the cluster
@@ -1025,18 +1028,21 @@ references that Azure's CSV ref-counting is built to track.
 
 Opt-in orphan pruning is available via `pve.stemcell.prune_orphans` (with
 `pve.stemcell.prune_dry_run` for a preview pass). The prune runs as a tail of
-`delete_stemcell` and is director-scoped: it requires `pve.stemcell.director_id`,
-enumerates all `bosh-stemcell`-tagged templates owned by that director, and attempts
-deletion for each. Rather than pre-scanning linked clones, it relies on Proxmox to
-atomically refuse removal of a base volume still referenced by a linked clone — such
-templates are skipped with a warning. Best-effort, config-gated, warn-never-fail.
+`delete_stemcell` and is director-scoped: it uses the calling director's UUID from the
+request context (no configuration needed — a request without a director UUID skips the
+pass with a warning), enumerates all `bosh-stemcell`-tagged templates carrying that
+director's `director--<uuid>` tag, and attempts deletion for each. Rather than
+pre-scanning linked clones, it relies on Proxmox to atomically refuse removal of a base
+volume still referenced by a linked clone — such templates are skipped with a warning.
+Best-effort, config-gated, warn-never-fail.
 
 **Limits (source-verified).** The orphan prune is *reactive only* — it fires as a tail
 of `delete_stemcell` (`delete_stemcell.go:260-340`), never on a schedule, so an interrupted
 `create_stemcell` leaves a template until the next delete of a same-content stemcell. Owner
-matching is by the `director--<id>` tag, but the tag sanitizer silently strips special
-characters (`stemcell_provenance.go`), so a `director_id` containing colons or semicolons is
-mangled and the prune assumes the sanitized form — keep director IDs to tag-safe characters.
+matching is by the `director--<uuid>` tag, but the tag sanitizer silently strips special
+characters (`stemcell_provenance.go`), so a director UUID containing colons or semicolons
+is mangled and the prune assumes the sanitized form — director UUIDs from a real BOSH
+director are always tag-safe in practice.
 
 #### 7.14 SHIPPED — Allowed-address-pairs / VIP ipfilter for in-deployment floating VIPs
 
@@ -2424,16 +2430,16 @@ prematurely deletes a template.
 **Shipped:** `stemcell_refs` CSV field added to `stemcellProvenance` struct in template notes
 JSON. `create_stemcell` SHA-match and name-match reuse paths append the new CID (idempotent)
 under a per-VMID cluster lock (`withVMIDLock`) via `registerStemcellRef`. New templates write
-the initial CID in `stemcell_refs` at creation time, always — regardless of
-`stemcell_provenance_enabled`. `delete_stemcell` decrements via
+the initial CID in `stemcell_refs` at creation time, always — provenance recording is
+unconditional, with no property gating it. `delete_stemcell` decrements via
 `gatedDeregisterAndDestroyRef`, which holds the per-VMID cluster lock through the destroy
 itself, so a concurrent `registerStemcellRef` cannot append a CID between the last-ref
 decrement and the `DeleteQemu` call; the template is destroyed only when refs become empty.
 Missing, empty, or unparseable refs are treated conservatively (template preserved) to avoid
 premature deletion of pre-refs templates; legacy templates created before refs existed are
 therefore never destroyed by `delete_stemcell` and are reclaimed instead via the opt-in
-director-scoped orphan prune of §7.13 (they carry the `bosh-stemcell` and `director--<id>`
-tags when provenance was enabled) or audited manually with `scripts/disk-audit`. The
+director-scoped orphan prune of §7.13 (they always carry the `bosh-stemcell` and
+`director--<id>` tags) or audited manually with `scripts/disk-audit`. The
 cross-node SHA-tag sweep destroys replicas without consulting their own `stemcell_refs`:
 replica refs are intentionally not maintained, and the sweep runs only after the primary
 template has passed the ref gate and been destroyed.
@@ -2501,7 +2507,9 @@ the task succeeds the downloaded volume is located by exact filename lookup with
 scan fallback (to handle PVE filename normalization). All downstream steps — template VM
 creation via `ensureTemplateVM`, freeze, provenance notes and tags, pool assignment, and
 replica distribution — run identically to the existing upload paths; the returned CID is
-always `"template:<vmid>"`. When `source_url` is absent the existing flow is byte-identical.
+always the `:light:`/`:heavy:` path-identity form for the storage the image landed on
+(see [Light Stemcells](light-stemcells.md)). When `source_url` is absent the existing
+flow is byte-identical.
 
 **Limits.** The URL must be reachable from the PVE node, not from the CPI host; operators
 must ensure network access from the PVE node to the image host. Requires PVE 7.2+. Task

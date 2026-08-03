@@ -600,6 +600,67 @@ See [PVE Storage Locking](pve-storage-locking.md) for full lock mechanics.
 
 ---
 
+## Stemcell lifecycle across directors
+
+When two or more BOSH directors share one PVE cluster — a management director and one or more environment directors, or several environment directors side by side — they can all depend on the same stemcell. This section covers what happens to a stemcell's cache template and backing qcow2 file as each director independently uploads and cleans it up. See [Design Decisions — D3](design-decisions.md#d3--stemcell-refcounting-per-director-reference-sets) for the reference-tracking design behind this.
+
+### `bosh clean-up` is safe across directors
+
+Each cache template records the set of director UUIDs currently depending on it. Running `bosh clean-up` (or `bosh clean-up --all`) on one director only removes *that* director's own reference — it never touches another director's reference to the same template, even though both directors may be looking at the same PVE cluster. The cache template, and for a CPI-uploaded (`:heavy:`) stemcell its qcow2 file, survive until the last director referencing them releases its reference. An operator-managed (`:light:`) qcow2 is never removed by the CPI regardless of reference count.
+
+Practically: cleaning up one director's unused stemcells is always safe to run on its own schedule, independent of what any other director sharing the cluster is doing.
+
+### `bosh-destroy-pending` retry semantics
+
+If a template's last reference is released but the destroy itself fails — most commonly because the template still backs a linked clone — the CPI does not leave the reference record in an inconsistent state. It tags the template `bosh-destroy-pending` and returns an error naming the blocker:
+
+```
+delete_stemcell: template VM 30012 (node "pve-n1") still backs one or more linked-clone VMs;
+delete or migrate those VMs, then retry delete_stemcell (the destroy is marked pending and will resume): ...
+```
+
+Delete or migrate the linked-clone VM(s) named in the error, then retry `delete_stemcell` (or let a later `bosh clean-up` retry it) — the CPI recognizes the `bosh-destroy-pending` tag and resumes the destroy directly rather than re-deriving whether this was really the last reference.
+
+### `IsBaseVolumeInUse`: linked clones must go first
+
+The underlying condition above is PVE refusing to delete a base volume that a linked clone still depends on. If you see this error while manually cleaning up templates via `qm destroy`, the fix is the same: find and remove the dependent VM(s) first.
+
+```bash
+# Find VMs cloned from a specific template (linked clones reference the base disk by volid)
+grep -rl 'base-<template_vmid>-disk-0' /etc/pve/nodes/*/qemu-server/*.conf
+```
+
+## Safe teardown ordering
+
+Tearing down a multi-director environment in the wrong order can leave orphaned VMs holding IP addresses, or attempt to destroy a stemcell template another director still depends on. Follow this order:
+
+1. **Delete every deployment** on each environment director (`bosh -e <env> delete-deployment -d <deployment>` for each), while that director is still up. Deleting deployments after their director is gone leaves orphaned VMs with no record of their IP reservations.
+2. **Run `bosh clean-up --all` on each environment director** once its deployments are gone. This drops that director's stemcell references (see above), its orphaned disks, and any CPI-managed networks it created.
+3. **Tear down the bootstrap/management director last** — the director you originally stood up with `bosh create-env`, which is typically also where any shared `:light:`/`:heavy:` stemcells were first uploaded and registered. Tearing it down before every environment director has finished its own clean-up risks removing a stemcell reference (or, on a shared cluster, PVE resources) that an environment director still needs mid-deploy.
+
+### Post-teardown verification
+
+After the last director is gone, confirm nothing was left behind. `pve-cid` ships on the Director VM at `/var/vcap/packages/pve_cpi/bin/pve-cid` — not on `PATH` by default, so either invoke it by full path or `export PATH="/var/vcap/packages/pve_cpi/bin:$PATH"` first:
+
+```bash
+/var/vcap/packages/pve_cpi/bin/pve-cid stemcells --orphans --config <path-to-cpi.json>
+python3 scripts/disk-audit --config <path-to-audit-config.json>
+```
+
+The first command surfaces stemcell qcow2 files with zero remaining director references, or cache templates whose backing file is gone — either is now safe to remove by hand if it was not already cleaned up automatically. The second inventories persistent-disk volumes, including any parked disks under `detached_disk_strategy: parked`, that no longer correspond to a live VM.
+
+### Known limitation: fast-path delete skips the pool reaper
+
+`pve.fast_path_delete: true` optimizes `delete_vm` for latency and deliberately skips the empty-pool reaper step that the synchronous delete path runs. The reaper itself is opt-in (`pve.pool_reap_empty`, default `false`) — with the default config nothing ever reaps an empty pool on any path. When `pool_reap_empty: true` is also set, a resource pool emptied by a fast-path delete is reaped only by a later synchronous-path delete, or manually:
+
+```bash
+pvesh delete /pools/<poolid>
+```
+
+This is a known, accepted trade-off of the fast path, not a bug — if your environment relies heavily on `fast_path_delete`, expect CPI-managed pools to accumulate until either a normal-path delete runs or you reap them by hand.
+
+---
+
 ## Filing a bug report
 
 Collect the following before opening an issue.

@@ -42,13 +42,13 @@ Derived from the API endpoint inventory under `src/pve_cpi/internal/cpi/handlers
 | `Datastore.AllocateSpace` | same four storage paths | `create_disk.go`, `create_vm.go` (`import-from=<storage>:import/...` disk allocation) |
 | `Datastore.AllocateTemplate` | `stemcell_storage`, `iso_storage` | `create_stemcell.go` (`POST .../upload` with `content=import`), ConfigDrive ISO upload (`content=iso`) |
 | `Datastore.Audit` | same four storage paths | `create_stemcell.go`, `get_disks.go`, `has_disk.go` (list/check volume) |
-| `SDN.Allocate` | `/sdn` | `create_network.go`, `delete_network.go` (zone create/delete check it on `/sdn/zones` and `/sdn/zones/{zone}`, covered by a propagated `/sdn` grant), `create_vm.go` (`advertised_routes` subnet injection) — required by default (`network_mode: sdn`); only a `network_mode: bridge` opt-out avoids it |
+| `SDN.Allocate` | `/sdn` | `create_network.go`, `delete_network.go` (zone create/delete check it on `/sdn/zones` and `/sdn/zones/{zone}`, covered by a propagated `/sdn` grant), `create_vm.go` (`advertised_routes` subnet injection) — opt-in, needed only when `network_mode: sdn` is set (or a network is marked `managed: true`, or `advertised_routes` is used); the default (`network_mode: bridge`) makes zero SDN calls and needs no grant |
 | `Sys.Console` | `/` | HA-rule writes — `POST`/`DELETE /cluster/ha/resources`, `POST`/`DELETE /cluster/ha/rules` driven by `placement.pin_az_via_ha_rules`, `anti_affinity.use_ha_rules`, and DLB (`placement.dlb` configured) — see note below |
 | `Pool.Allocate` | `/pool/<poolid>` | `pool.go`'s `EnsurePoolExists` (`POST /pools`) — create-if-missing for the resolved `pve.vm_pool` pool (default `bosh`) at `create_vm` time and for `pve.stemcell_template_pool` (default `bosh-templates`) at `create_stemcell` time; `cluster_lock.go` (`POST`/`DELETE /pools` — create/delete sentinel pools `bosh-lock-*` when `cluster_lock_mode: pool`); `delete_vm.go`'s opt-in empty-pool reaper (`DELETE /pools/{poolid}`, only when `pve.pool_reap_empty: true`). Required by default now that `vm_pool` and `stemcell_template_pool` both default to a non-empty, create-if-missing pool name; set both to `""` and leave `cluster_lock_mode`/`pool_reap_empty` unused to avoid needing it. This privilege alone is sufficient — no `Permissions.Modify` grant is needed; see the note below |
 | `Pool.Audit` | `/pool/<poolid>` | `GetPoolComment` (`GET /pools`/`GET /pools/{poolid}`) — read by `cluster_lock.go` (`cluster_lock_mode: pool`) to check a lock pool's owner/expiry when stealing or verifying a held lock, and by `delete_vm.go`'s opt-in empty-pool reaper (`pve.pool_reap_empty: true`) to check a pool's provenance comment before deleting it. Opt-in only, unlike `Pool.Allocate` above — the default create-if-missing path (`EnsurePoolExists`) never reads pool state; it calls only `POST /pools` and tolerates the "already exists" error as its idempotency check |
 | `Sys.Modify` | `/` | `placement_dlb.go` (`PUT /cluster/options` setting `crs=ha=dynamic,...`) — opt-in, only when `placement.dlb.manage_cluster_crs: true`; when false (default) the CPI only reads `/cluster/options` (`Sys.Audit`, already granted) and logs a warning instead of writing |
 
-**`SDN.Allocate` note:** required by default — SDN is the default network mode, and with defaults the CPI creates and deletes the turnkey vxlan zone, its vnets, and subnets, all gated on `SDN.Allocate` (the zone endpoints check it on `/sdn/zones` and `/sdn/zones/{zone}`, which a propagated `/sdn` grant covers). Only deployments that opt out with `network_mode: bridge`, never mark a network `managed: true`, and set no `advertised_routes` can omit this privilege. Grant it on `/sdn`:
+**`SDN.Allocate` note:** opt-in — `network_mode: bridge` is the default, and a default deployment makes zero SDN calls, so this grant is unneeded unless `network_mode: sdn` is set, a network is marked `managed: true`, or `advertised_routes` is used. Any of those turns on the turnkey vxlan zone (and its vnets and subnets) or an operator-created zone/vnet, all gated on `SDN.Allocate` (the zone endpoints check it on `/sdn/zones` and `/sdn/zones/{zone}`, which a propagated `/sdn` grant covers). Grant it on `/sdn` only for those deployments:
 
 ```bash
 curl -sk -X PUT -H "Authorization: $PVE_TOKEN" \
@@ -113,7 +113,7 @@ UI:
 
 2. Name: `BoshOperator`.
 
-3. Privileges: select `VM.Allocate`, `VM.Audit`, `VM.Config.Disk`, `VM.Config.Network`, `VM.Config.Options`, `VM.Config.Cloudinit`, `VM.PowerMgmt`, `VM.Snapshot`, `Datastore.Allocate`, `Datastore.AllocateSpace`, `Datastore.AllocateTemplate`, `Datastore.Audit`, `SDN.Allocate` (required by default; omit only for a `network_mode: bridge` opt-out), `Sys.Console` (if using HA placement features or DLB), `Pool.Allocate` (required by default — `vm_pool` and `stemcell_template_pool` both default to a create-if-missing pool name; omit only when both are set to `""`), `Pool.Audit` (only if using `cluster_lock_mode: pool` or `pool_reap_empty`), and `Sys.Modify` (if using `placement.dlb.manage_cluster_crs`).
+3. Privileges: select `VM.Allocate`, `VM.Audit`, `VM.Config.Disk`, `VM.Config.Network`, `VM.Config.Options`, `VM.Config.Cloudinit`, `VM.PowerMgmt`, `VM.Snapshot`, `Datastore.Allocate`, `Datastore.AllocateSpace`, `Datastore.AllocateTemplate`, `Datastore.Audit`, `Pool.Allocate` (required by default — `vm_pool` and `stemcell_template_pool` both default to a create-if-missing pool name; omit only when both are set to `""`), `SDN.Allocate` (opt-in — only if `network_mode: sdn` is set, a network is marked `managed: true`, or `advertised_routes` is used), `Sys.Console` (if using HA placement features or DLB), `Pool.Audit` (only if using `cluster_lock_mode: pool` or `pool_reap_empty`), and `Sys.Modify` (if using `placement.dlb.manage_cluster_crs`).
 
 4. Create.
 
@@ -127,11 +127,11 @@ curl -sk -X POST -H "Authorization: $PVE_TOKEN" \
   https://$PVE_HOST/api2/json/access/roles
 ```
 
-`SDN.Allocate` belongs in the default grant — SDN is the default network mode. `Pool.Allocate` also belongs in the default grant — `pve.vm_pool` (default `bosh`) and `pve.stemcell_template_pool` (default `bosh-templates`) are both create-if-missing. `Pool.Audit`, like `Sys.Console` and `Sys.Modify`, is opt-in only. A deployment that explicitly opts out with `network_mode: bridge` (and no `advertised_routes`), does not use HA placement features or DLB (`pin_az_via_ha_rules: false`, `use_ha_rules: false`, no `placement.dlb`), the resource-pool lock or reaper (`cluster_lock_mode: pool` unset, `pool_reap_empty` unset), or CPI-managed cluster CRS (`placement.dlb.manage_cluster_crs: false`/unset) may omit `SDN.Allocate`, `Sys.Console`, `Pool.Audit`, and `Sys.Modify`, respectively. `Pool.Allocate` itself drops out only when both `vm_pool` and `stemcell_template_pool` are set to `""`. The minimum set for that documented bridge-only, pool-less opt-out without HA placement or DLB is `VM.*,Datastore.*` as listed in the privilege table above. Note that `delete_vm`'s `skiplock` flag is separate from this role: it is gated on the `root@pam` user, not on any privilege (see the `delete_vm` note above), so granting `BoshOperator` does not enable it.
+`Pool.Allocate` belongs in the default grant — `pve.vm_pool` (default `bosh`) and `pve.stemcell_template_pool` (default `bosh-templates`) are both create-if-missing. `SDN.Allocate`, `Pool.Audit`, `Sys.Console`, and `Sys.Modify` are all opt-in only, since `network_mode: bridge` is the default and a default deployment makes zero SDN calls. A deployment that sets `network_mode: sdn` (or marks a network `managed: true`, or uses `advertised_routes`) needs `SDN.Allocate`; one that uses HA placement features or DLB needs `Sys.Console`; one that uses the resource-pool lock or reaper (`cluster_lock_mode: pool`, `pool_reap_empty`) needs `Pool.Audit`; one that enables `placement.dlb.manage_cluster_crs` needs `Sys.Modify`. `Pool.Allocate` itself drops out only when both `vm_pool` and `stemcell_template_pool` are set to `""`. The minimum set for a bridge-mode deployment with no resource pools, no HA placement, and no DLB is `VM.*,Datastore.*` as listed in the privilege table above. Note that `delete_vm`'s `skiplock` flag is separate from this role: it is gated on the `root@pam` user, not on any privilege (see the `delete_vm` note above), so granting `BoshOperator` does not enable it.
 
 ### 3c. Grant ACLs
 
-Six ACL grants are needed with defaults — cluster-wide audit, VM operations, SDN, one storage grant per configured storage pool, and the resource-pool grant (needed by default now that `vm_pool` and `stemcell_template_pool` both create their pool on demand) — plus one conditional grant (root-path) that applies only when HA placement, DLB, or CPI-managed cluster CRS is used. The SDN grant drops out only for a `network_mode: bridge` opt-out; the resource-pool grant drops out only when both `vm_pool` and `stemcell_template_pool` are set to `""` and `cluster_lock_mode: pool`/`pool_reap_empty` are unused.
+Four ACL grant categories apply by default — cluster-wide audit, VM operations, one storage grant per configured storage pool, and the resource-pool grant (needed by default now that `vm_pool` and `stemcell_template_pool` both create their pool on demand) — plus two conditional categories: SDN (only when `network_mode: sdn` is set, a network is marked `managed: true`, or `advertised_routes` is used) and root-path (only when HA placement, DLB, or CPI-managed cluster CRS is used). The resource-pool grant drops out only when both `vm_pool` and `stemcell_template_pool` are set to `""` and `cluster_lock_mode: pool`/`pool_reap_empty` are unused.
 
 UI (repeat for each row below):
 
@@ -152,7 +152,7 @@ UI (repeat for each row below):
 | `/` | `PVEAuditor` | Built-in role; grants `Sys.Audit` cluster-wide |
 | `/` | `BoshOperator` | Required for `Sys.Console` (HA-rule management) — only if using HA placement features or DLB; also required for `Sys.Modify` (`PUT /cluster/options`) — only if `placement.dlb.manage_cluster_crs: true` |
 | `/vms` | `BoshOperator` | All VM and disk mutation |
-| `/sdn` | `BoshOperator` | Required for `SDN.Allocate` — needed by default (`network_mode: sdn`); omit only for a `network_mode: bridge` opt-out with no `advertised_routes` |
+| `/sdn` | `BoshOperator` | Required for `SDN.Allocate` — opt-in, needed only when `network_mode: sdn` is set, a network is marked `managed: true`, or `advertised_routes` is used. `network_mode: bridge` (the default) needs no grant here |
 | `/storage/<vm_storage>` | `BoshOperator` | From `pve.vm_storage` |
 | `/storage/<disk_storage>` | `BoshOperator` | From `pve.disk_storage` |
 | `/storage/<stemcell_storage>` | `BoshOperator` | From `pve.stemcell_storage` (defaults to `vm_storage`) |
@@ -190,8 +190,9 @@ curl -sk -X PUT -H "Authorization: $PVE_TOKEN" \
   -d 'propagate=1' \
   https://$PVE_HOST/api2/json/access/acl
 
-# SDN — required by default (network_mode: sdn); omit only for a
-# network_mode: bridge opt-out with no advertised_routes.
+# SDN — opt-in, only when network_mode: sdn is set, a network is
+# marked managed: true, or advertised_routes is used. Omit for the
+# default network_mode: bridge.
 curl -sk -X PUT -H "Authorization: $PVE_TOKEN" \
   --data-urlencode 'path=/sdn' \
   --data-urlencode 'users=bosh@pve' \

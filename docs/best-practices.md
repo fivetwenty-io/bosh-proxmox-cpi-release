@@ -152,6 +152,22 @@ Property names and defaults are cross-referenced to [Configuration reference](co
 
 **Status.** Meets.
 
+**One export, one storage ID — avoid duplicate physical backings.**
+
+**Best practice.** Registering the same physical export or path under two different PVE storage IDs looks harmless in `storage.cfg` but silently defeats identity-sensitive logic: linked-clone downgrade decisions, VMID-collision scanning, and placement all key off storage ID, not off the underlying bytes.
+
+**CPI behavior.** At startup, the CPI resolves the backing identity (server+export for NFS/CIFS, path for dir-style plugins) of every storage ID it is configured to use — VM, disk, stemcell, ISO, and any storage tiers — and warns once per process lifetime when two or more configured IDs resolve to the same physical backing: `storage_info: two or more storage IDs share one physical backing`. The check is per-CPI-entry only; it cannot see a second cpi-config entry's storage IDs, so it is not a signal about deliberate multi-cluster storage sharing (see [Multi-cluster deployments — Shared-storage rules](multi-cluster.md#shared-storage-rules)) — only about accidentally registering one export twice within a single cluster's `storage.cfg`.
+
+**Status.** Meets — the check is a startup warning, not a hard failure; consolidate to a single storage ID per physical export when you see it.
+
+**Multi-cluster shared storage: disjoint VMID bands, `destroy_unreferenced_disks` stays `false`.**
+
+**Best practice.** Two independent PVE clusters pointed at the same shared export (a common shape for `:light:` stemcell distribution, see [Light Stemcells](light-stemcells.md)) have no cross-cluster coordination: PVE's own `pmxcfs` is per-cluster, and nothing outside the CPI stops both clusters from allocating the same VMID or destroying a volume the other cluster still owns.
+
+**CPI behavior.** Each `type: pve` cpi-config entry is independently configured, so cross-cluster safety is an operator convention the CPI validates only within one entry: give every entry that shares storage with another entry disjoint VMID bands across all four ranges (VM, persistent disk, stemcell-template cache, and parker VM when `detached_disk_strategy: parked`), and leave `pve.destroy_unreferenced_disks` at its default `false` on any storage a second cluster can reach — PVE's `DestroyUnreferencedDisks` flag frees every volume matching the destroyed VM's VMID regardless of which cluster's config actually references it. `:light:` stemcells (operator-managed, preuploaded qcow2, never deleted by the CPI) are the one artifact designed to be shared this way: upload once, every cluster clones from its own independently-built cache template. See [Multi-cluster deployments](multi-cluster.md) for the full worked cpi-config example, banding table, and shared-storage rules.
+
+**Status.** Meets — enforced within one cpi-config entry (its own four VMID bands are validated mutually disjoint at load); disjoint banding *across* entries and `destroy_unreferenced_disks: false` on shared storage are both operator responsibilities the CPI cannot see or enforce across process boundaries.
+
 ## 3. Stemcells and images
 
 **Never-booted templates.**
@@ -182,9 +198,9 @@ Property names and defaults are cross-referenced to [Configuration reference](co
 
 **Best practice.** Deleting a template that still backs a live linked clone destroys the base volume the clone's overlay depends on, corrupting every VM cloned from it.
 
-**CPI behavior.** The opt-in orphan-prune pass (`pve.stemcell.provenance` plus `pve.stemcell.director_id`) skips any template still referenced by a linked clone rather than destroying it, logging the skip by name.
+**CPI behavior.** The opt-in orphan-prune pass (`pve.stemcell.prune_orphans`) skips any template still referenced by a linked clone rather than destroying it, logging the skip by name. Provenance recording and director scoping are unconditional — no property controls them — since every CPI call carries the calling director's identity in its request context.
 
-**Status.** Configurable — enable `pve.stemcell.provenance` and set `pve.stemcell.director_id` to activate orphan detection and pruning; without them, stale templates accumulate and must be cleaned up by hand.
+**Status.** Configurable — enable `pve.stemcell.prune_orphans` to activate orphan detection and pruning; without it, stale templates accumulate and must be cleaned up by hand.
 
 ## 4. Cloud-init / config drive
 
@@ -278,13 +294,13 @@ Property names and defaults are cross-referenced to [Configuration reference](co
 
 **Status.** Meets.
 
-**VLAN segmentation only through SDN zones.**
+**SDN vnet-per-VLAN remains the recommended isolation model; trunked-bridge VLAN tagging is first-class for operator-managed fabrics.**
 
-**Best practice.** A vlan-aware trunk bridge, with the guest itself expected to tag its own frames, is a common anti-pattern that pushes VLAN correctness into every guest instead of the platform.
+**Best practice.** VLAN correctness depends on every tagging point in the path agreeing — the physical switch's trunk configuration, the bridge's VLAN-aware flag, and the tag applied to each NIC. A platform that owns the tagging end-to-end (one SDN vnet per VLAN; VMs join by bridge selection alone) removes the class of misconfiguration where a per-NIC setting disagrees with the switch, so it remains the recommended default for CPI-managed isolation. Where the trunk is fabric the network team already owns and controls end-to-end, having BOSH tag frames per NIC directly — rather than provisioning an additional vnet layer over an already-trunked bridge — is the leaner, equally correct choice for that operator-managed shape.
 
-**CPI behavior.** The CPI's only path to VLAN segmentation is a PVE SDN zone of type `vlan`, where each vnet maps to one discrete VLAN ID (vnet-per-VLAN). Under `sdn_zone_type: vlan` the CPI creates the zone turnkey with `pve.network_bridge` as underlay, tags each vnet with `cloud_properties.vnet_tag` (the 802.1Q VLAN ID, capped at 4094; the auto-allocation band defaults to 2000–2999 for vlan zones), and VMs join by bridge selection alone — no `tag=` ever appears in a NIC config. The bridge-mode path (`network_mode: bridge`) attaches to a plain Linux bridge by name and carries no VLAN-tagging concept of its own — there is no vlan-aware-bridge option to misuse.
+**CPI behavior.** Two independent mechanisms exist, and choosing one does not disable the other. A PVE SDN zone of type `vlan` maps each vnet to one discrete VLAN ID (`cloud_properties.vnet_tag`, capped at 4094, default auto-allocation band 2000–2999) — `create_network` creates the zone turnkey with `pve.network_bridge` as underlay, and VMs join by bridge selection alone, with no `tag=` in any NIC config. Independently, `create_vm`'s per-NIC `cloud_properties.vlan` (1–4094) writes `tag=<n>` directly onto a NIC attached to any operator-managed bridge — Pattern A, no `create_network` call and no SDN zone involved at all — see [Networks — Per-NIC cloud_properties reference](networks.md#per-nic-cloud_properties-reference). Per-NIC `firewall`/`security_groups`/`allowed_address_pairs` (ipfilter seeding) and `pve.ensure_no_ip_conflicts`'s `(bridge, vlan)` L2-domain grouping both apply identically to a trunked-bridge NIC as to an SDN vnet NIC — a trunked-bridge network is not a lesser-protected path for either mechanism, and two networks sharing one trunk bridge but differing `vlan` values are correctly treated as separate L2 domains rather than flagged as a false IP conflict.
 
-**Status.** Meets.
+**Status.** Meets — pick per fabric ownership: SDN vnet-per-VLAN when the CPI should own the tag end-to-end, trunked-bridge `cloud_properties.vlan` when the network team already owns and trunks the fabric. Caveat: the CPI validates only the tag range (1–4094) and the virtio-model constraint on `mtu`; it cannot verify the physical switch ports are actually trunked to match, or that the bridge is actually `bridge-vlan-aware` — a mismatch on either side fails silently as unreachable traffic, not as a `create_vm` error.
 
 **EVPN zones operator-owned; advertised routes provenance-tagged and refcount-cleaned.**
 

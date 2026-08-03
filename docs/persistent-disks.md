@@ -151,12 +151,15 @@ pvd-eyJ2IjoibG9jYWwtbHZtOnZtLTMwMC1kaXNrLTAiLCJtIjp7InBvb2wiOiJsb2NhbC1sdm0iLCJv
 `attach_disk` decodes the `opts` map and merges it with the global `pve.disk_performance.*`
 config; per-disk values win over global defaults.
 
-Two legacy formats from earlier releases decode forever, because the Director
-replays stored CIDs indefinitely: the bare volid (`<storage>:<volume>`) and the
-pipe-annotated form (`<storage>:<volume>|<base64url-JSON DiskCIDMeta>`). A PVE
-storage whose name literally starts with `pvd-` still parses correctly — its
-bare CID contains `:`, which can never appear in a valid base64url payload, so
-the decoder falls back to the legacy paths.
+Only the two envelope forms are valid disk CIDs. The decoder hard-rejects
+everything else — bare volids, the retired pipe-annotated form, and arbitrary
+strings — so a corrupted or hand-edited CID fails loudly at the CPI boundary
+instead of propagating a half-parsed volid into PVE API calls. A CID longer
+than 255 characters is likewise rejected at `create_disk` time (with the
+just-created volume rolled back) because a MySQL-backed Director would
+truncate it and orphan the disk; enable `pve.disk_cid_compression` if rich
+`disk_pool` option sets push the envelope over the limit. Use the bundled
+`pve-cid` tool (`pve-cid decode <cid>`, installed on the Director VM at `/var/vcap/packages/pve_cpi/bin/pve-cid`, not on `PATH` by default) to inspect any CID offline.
 
 `create_disk` logs a warning when an emitted CID exceeds 255 characters:
 MySQL-backed Directors store `disk_cid` in a `VARCHAR(255)` column, and the
@@ -203,14 +206,15 @@ payload="${cid#pvz-}"
 python3 -c "import sys,base64,gzip; p=sys.argv[1]; print(gzip.decompress(base64.urlsafe_b64decode(p + '=' * (-len(p) % 4))).decode())" "$payload"
 ```
 
-`get_disks` returns the Director's verbatim disk CID whenever `attach_disk`
-recorded one: the attach handler stores the CID it received against the bare
-volid in the VM's description sentinel, and `get_disks` looks each attached
-volid up there before answering. Cloudcheck compares its stored `disk_cid`
-strings against this list, and an envelope CID embeds creation-time metadata
-that cannot be reconstructed from PVE state — without the recording, every
-envelope-CID disk would scan as missing. Disks attached by earlier releases
-(or whose best-effort sentinel write failed) fall back to the bare volid.
+`get_disks` returns the Director's verbatim disk CID whenever it was
+recorded: both `attach_disk` and `create_vm` (for disks passed in the
+`disk_cids` argument) store the CID they received against the bare volid in
+the VM's description sentinel, and `get_disks` looks each attached volid up
+there before answering. Cloudcheck compares its stored `disk_cid` strings
+against this list, and an envelope CID embeds creation-time metadata that
+cannot be reconstructed from PVE state — without the recording, every
+envelope-CID disk would scan as missing. Disks whose best-effort sentinel
+write failed fall back to the bare volid.
 
 ## Worked examples
 

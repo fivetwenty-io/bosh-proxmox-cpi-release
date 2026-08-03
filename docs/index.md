@@ -8,6 +8,8 @@ This CPI enables BOSH to provision and manage resources on PVE 9.x. It implement
 
 ## Table of Contents
 
+- [Design Decisions](design-decisions.md): The operator-facing record of the stemcell CID, storage, network, and multi-cluster design decisions — context, options considered, chosen behavior, and migration notes for each.
+
 - [Development Guide](development.md): Instructions for setting up a development environment, running tests, and building releases.
 
 - [Architecture](architecture.md): High-level overview of the CPI’s design and components.
@@ -35,6 +37,10 @@ This CPI enables BOSH to provision and manage resources on PVE 9.x. It implement
 - [PVE Per-Storage Lockfile Behaviour](pve-storage-locking.md): How PVE's per-storage lockfile serialises every storage mutation, why bursty BOSH deploys hit it, and how the CPI retries to absorb the contention.
 
 - [DLB-Aware Placement](dlb-aware-placement.md): Opt-in integration with the PVE 9.2 Dynamic Load Balancer — node scoring, availability-zone pinning, and HA node-affinity rules.
+
+- [HA and Resurrection](ha-and-resurrection.md): Ownership matrix for BOSH-resurrector-owned versus PVE-HA-owned recovery, the double-healing race, and the CPI's warning guard rail.
+
+- [Multi-Cluster Deployments](multi-cluster.md): cpi-config walkthrough for multiple PVE clusters, AZ-to-CPI binding, disjoint VMID banding, and shared-storage safety rules.
 
 - [PVE Transient Transport Faults](pve-transient-transport.md): How pvedaemon worker recycling produces HTTP 596 and auth-ticket EOFs under burst load, and how the CPI absorbs them.
 

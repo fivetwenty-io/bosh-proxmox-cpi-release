@@ -99,26 +99,7 @@ The full table covers the remaining properties, including SDN zone management, s
 
 ## Multi-CPI usage (multi-AZ / multiple PVE clusters)
 
-A single BOSH director can register multiple named `type: pve` cpi-config entries — for example one entry per PVE cluster, to give each availability zone its own cluster. No release code change, extra job colocation, or extra release upload is required for this: BOSH resolves the executable to run for a cpi-config entry from its `type` field, not its `name`, so every `type: pve` entry (regardless of how many are declared) dispatches to the same colocated `pve_cpi` job binary already installed on the director VM. Each entry keeps its own `properties:` block (host, credentials, node, storage pools, and so on), so each CPI targets an independent PVE cluster with its own connection details.
-
-```yaml
-cpis:
-- name: pve-cpi
-  type: pve
-  properties: { host: ..., user: ..., api_token: ((...)), node: ..., vm_storage: ..., disk_storage: ..., ... }
-- name: pve-cpi-az2
-  type: pve
-  properties: { host: ..., user: ..., api_token: ((...)), node: ..., vm_storage: ..., disk_storage: ..., ... }
-```
-
-Stemcells bind to a specific cpi-config entry on upload; uploading a stemcell once does not automatically register it against every named entry. Upload once normally, then repeat with `--fix` for each additional entry so the stemcell content re-registers against it:
-
-```bash
-bosh -e <alias> upload-stemcell <stemcell>.tgz --sha1 <sha1>          # registers against the first-seen entry
-bosh -e <alias> upload-stemcell <stemcell>.tgz --sha1 <sha1> --fix    # re-registers against every other named entry, e.g. pve-cpi-az2
-```
-
-An instance group's AZ assignment determines which named CPI (and so which PVE cluster) BOSH uses for every operation against that instance, including cloud-check and resurrection — each AZ's problems are scanned and fixed exclusively through that AZ's own CPI. Persistent disks do not transfer automatically if an existing instance's AZ is reassigned across two independent clusters: the redeploy succeeds without any error, but BOSH recreates the instance on the new cluster with a fresh, empty disk and leaves the old disk orphaned on the original cluster (visible only in the director's orphaned-disk listing) — there is no in-place cross-cluster disk move, because the clusters share no storage. Treat an AZ reassignment across clusters as a new instance group (blue/green) with an out-of-band data migration, rather than an in-place `azs:` change on an existing deployed instance group.
+A single BOSH director can register multiple named `type: pve` cpi-config entries — one entry per PVE cluster — to give each availability zone its own independent cluster, with no release code change or extra job colocation required. This covers the cpi-config walkthrough, AZ-to-CPI binding, stemcell registration across entries, and — the part that matters once storage is shared between clusters — disjoint VMID banding as the safety pattern that keeps two clusters from corrupting each other's data. See [Multi-Cluster Deployments](docs/multi-cluster.md) for the full guide, including a worked `cpi-config.yml` example and the AZ-reassignment trap to avoid.
 
 ## Operations
 

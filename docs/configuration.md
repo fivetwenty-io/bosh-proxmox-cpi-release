@@ -2,6 +2,23 @@
 
 The CPI reads configuration from a BOSH deployment manifest. The job template renders the manifest properties into a JSON document the binary reads with the `--config` flag. All properties correspond to fields in `jobs/pve_cpi/spec`.
 
+## Minimal Configuration
+
+Config validation requires five properties: `host`, `user`, one of `password` or `api_token`, `vm_storage`, and `disk_storage` (`network_bridge` is also validated, but the job spec always renders its `vmbr0` default, so a manifest that omits it still passes). In practice, also set `node`: it is where `create_stemcell` builds cache templates by default and where `create_vm` falls back when placement scoring is disabled or a call does not resolve a target node.
+
+```yaml
+properties:
+  pve:
+    host: pve.example.com
+    user: root@pam
+    api_token: root@pam!bosh=((pve_api_token))
+    node: pve1
+    vm_storage: local-lvm
+    disk_storage: local-lvm
+```
+
+With just this manifest: `create_vm` attaches every NIC to the pre-existing `vmbr0` Linux bridge (see [Networks — Pattern A: operator-managed bridges](networks.md#pattern-a-operator-managed-bridges) — no SDN prerequisites), stemcells and VM disks share `local-lvm`, and every VM and stemcell cache template is auto-assigned into a create-if-missing `bosh` / `bosh-templates` resource pool pair (see [Resource Pools](#resource-pools) below). `stemcell_storage` defaults to `vm_storage`, but PVE only accepts qcow2 uploads on **file-based** storage (`dir`, `nfs`, `cifs`, `glusterfs`, `cephfs`) — a block-based `vm_storage` such as `local-lvm` works for VM and persistent disks but not for stemcells, so set `stemcell_storage` explicitly to a file-based pool once one is available. See [Zero-config baseline](#zero-config-baseline) at the end of this document for every other default that applies with no further configuration, and the full property table below for everything else.
+
 | Property | Description | Default | Required |
 |---|---|---|---|
 | `pve.host` | PVE host (IP or FQDN) | - | yes |
@@ -16,9 +33,9 @@ The CPI reads configuration from a BOSH deployment manifest. The job template re
 | `pve.stemcell_storage` | Storage pool for stemcell qcow2 images. Must be a file-based PVE storage (`dir`, `nfs`, `cifs`, `glusterfs`, `cephfs`) — block-based storages (`lvm`, `lvmthin`, `zfspool`, `rbd`) cannot accept qcow2 uploads. Must also be shared across cluster nodes when the cluster has more than one node. Defaults to `vm_storage`; in that case `vm_storage` must satisfy the same constraints. | `""` (falls back to `vm_storage`) | no |
 | `pve.iso_storage` | Storage pool (`dir`, `nfs`, or `cifs` with `iso` content enabled) used for per-VM ConfigDrive ISOs in `cloudinit` agent mode. Block storages (`lvm`, `lvmthin`, `zfspool`) cannot hold ISO files. The default `local` value places ISOs on node-local storage and is readable by any user with PVE node access — see [ConfigDrive ISO storage](operations.md#configdrive-iso-storage) for the dedicated-pool recommendation. The ISO stays attached for the VM's whole life, so a node-local pool also blocks live migration and HA recovery — see [ConfigDrive — Migration and HA interaction](configdrive.md#migration-and-ha-interaction). | `local` | no |
 | `pve.require_shared_iso_for_ha` | Escalates the config-drive ISO migration-safety warning to a `create_vm` error. The warning (and, when this is `true`, the error) fires whenever `create_vm` registers the VM under `placement.dlb`, `placement.pin_az_via_ha_rules`, or `placement.anti_affinity.use_ha_rules` while `iso_storage` resolves to a pool `/storage` does not report as shared. | `false` | no |
-| `pve.iso_storage_follow_vm_storage` | When `true`, resolves the ConfigDrive ISO pool to `vm_storage` instead of the `iso_storage` default, provided `vm_storage` advertises PVE content type `iso` and is shared. Evaluated once at CPI process startup. Because BOSH always renders the `"local"` spec default for `iso_storage` whether or not the operator set it, this flag treats `iso_storage` resolving to the literal value `"local"` as the "unset" signal — an operator who deliberately sets `iso_storage: local` while also enabling this flag gets `vm_storage`-following behavior instead; set `iso_storage` to any other value to pin a literal pool this flag will never override. Falls back to `iso_storage` unchanged with a warning when `vm_storage` lacks `iso` content, is not shared, or cannot be resolved. | `false` | no |
-| `pve.network_bridge` | Default Linux bridge for `create_vm` NIC attachment. Required regardless of `network_mode`. | `vmbr0` | no |
-| `pve.network_mode` | Default network creation path for managed networks; an unambiguous network spec overrides it (a `bridge`-only spec takes the bridge path under `sdn`, a `zone`/`vnet` spec takes the SDN path under `bridge`). `sdn` (default) — PVE SDN vnet lifecycle. `bridge` — Linux bridge lifecycle (opt-in, single-node). `auto` — legacy heuristic (opt-in): SDN when `cloud_properties.zone` or `pve.sdn_zone` is set; bridge otherwise. See [Network configuration](networks.md). | `sdn` | no |
+| `pve.iso_storage_follow_vm_storage` | When unset (the default) or `true`, resolves the ConfigDrive ISO pool to `vm_storage` instead of the `iso_storage` default, provided `vm_storage` advertises PVE content type `iso` and is shared. Evaluated once at CPI process startup. Because BOSH always renders the `"local"` spec default for `iso_storage` whether or not the operator set it, this flag treats `iso_storage` resolving to the literal value `"local"` as the "unset" signal — an operator who deliberately sets `iso_storage: local` while also enabling this flag gets `vm_storage`-following behavior instead; set `iso_storage` to any other value to pin a literal pool this flag will never override. Falls back to `iso_storage` unchanged with a warning when `vm_storage` lacks `iso` content, is not shared, or cannot be resolved. Set `false` to always use `iso_storage` as configured. | `~` (→ `true`) | no |
+| `pve.network_bridge` | Default Linux bridge for `create_vm` NIC attachment and the VLAN zone's underlay bridge. Required regardless of `network_mode`. | `vmbr0` | no |
+| `pve.network_mode` | Default network creation path for managed networks; an unambiguous network spec overrides it (a `zone`/`vnet` spec takes the SDN path under `bridge`, a `bridge`-only spec takes the bridge path under `sdn`). `bridge` (default) — Linux bridge lifecycle via the nodes API; a plain pre-existing Linux bridge needs no SDN prerequisites and no CPI-side provisioning. `sdn` — PVE SDN vnet lifecycle (opt-in; cluster SDN must be enabled). `auto` — legacy heuristic (opt-in): SDN when `cloud_properties.zone` or `pve.sdn_zone` is set; bridge otherwise. This setting governs `create_network`/`delete_network` only — it has no effect on `create_vm`'s NIC attachment: `mtu=1` vnet-MTU inheritance and `cloud_properties.vlan` tagging are decided by the actual SDN vnet list in every mode. See [Networks — Pattern A vs Pattern B](networks.md). | `bridge` | no |
 | `pve.sdn_zone` | Default PVE SDN zone for vnet placement. When empty and `sdn_auto_manage_zone` is on, the CPI uses the turnkey zone `bosh`, creating it on demand. See [Network configuration](networks.md). | `""` (→ turnkey zone `bosh`) | no |
 | `pve.sdn_zone_type` | Zone type the CPI uses when creating a zone. `vxlan` (default) — cluster-wide L2 overlay with peers derived from the online cluster nodes. `simple` — isolated per-node bridge (opt-in, single-node). `vlan`/`qinq` — tagged segments on an existing bridge (opt-in). `evpn` — never CPI-created; the operator pre-creates the zone and its controller and the CPI manages only vnets and subnets inside it. Only relevant when `sdn_auto_manage_zone` is `true`. | `vxlan` | no |
 | `pve.sdn_auto_manage_zone` | When `true` (default), the CPI may create SDN zones on `create_network` and delete them on `delete_network` when all safety conditions are met (EVPN zones are never created or deleted). Set `false` to keep zones operator-owned. See [Network configuration](networks.md). | `true` | no |
@@ -43,7 +60,7 @@ The CPI reads configuration from a BOSH deployment manifest. The job template re
 | `pve.disk_vmid_range_start` | First VMID used for persistent-disk container allocation. When unset (`0`), defaults to `9000`. Must not overlap the VM range or the template range. | `0` (→ `9000`) | no |
 | `pve.disk_vmid_range_end` | Inclusive upper bound of the persistent-disk VMID range. When unset (`0`), defaults to `29999`. Must be greater than `disk_vmid_range_start`. | `0` (→ `29999`) | no |
 | `pve.clone_mode` | Clone type used when `create_vm` clones a stemcell template. A linked clone's overlay volume always lands on the *template's own* storage pool (PVE does not honor a `Storage` override for linked clones), never on `vm_storage` — only a full clone can be placed on `vm_storage`. `auto` (default): linked clone when the template's storage supports it (all backends except `lvm`-thick) **and** `vm_storage` is the same pool as the template's storage; full clone otherwise, including whenever `vm_storage` differs from the template's storage (`stemcell_storage`), so the root disk always lands where `vm_storage` points. `linked`: force linked clone; returns an error if the template's storage does not support linked clones, or if `vm_storage` differs from the template's storage (which would silently misplace the disk). `full`: force full clone on all backends. One of `auto`\|`linked`\|`full`. | `auto` | no |
-| `pve.root_disk_bus` | PVE bus the root (system) disk is created on. `virtio` (default when empty): root disk lands on `virtio0` — byte-identical to every release before this property existed. `scsi`: root disk lands on `scsi0`, on the same virtio-scsi controller persistent disks already use, unlocking TRIM (`discard`) and `ssd` auto-resolution on the root disk itself (both unavailable on virtio-blk). Persistent-disk slot allocation is unaffected either way — `scsi0` has always been reserved for the root disk and `attach_disk`'s free-slot search has always started at `scsi1`, so there is no slot collision to manage. **Clone-path requirement:** `create_vm`'s dominant path clones a pre-built stemcell template (every `template:<vmid>` CID), and a clone inherits its source's exact disk layout. Templates are built once by `create_stemcell` and reused by content-hash tag match, so flipping this setting does not retroactively rebuild existing templates — `create_vm` compares the resolved bus against the matched template's actual root disk key before cloning and fails with a clear, non-retriable error on a mismatch rather than silently producing a root disk on the wrong bus. Re-run `create_stemcell` for affected stemcells after changing this value so new templates are built on the matching bus. One of `virtio`\|`scsi`. | `""` (→ `virtio`) | no |
+| `pve.root_disk_bus` | PVE bus the root (system) disk is created on. `virtio` (default when empty): root disk lands on `virtio0` — byte-identical to every release before this property existed. `scsi`: root disk lands on `scsi0`, on the same virtio-scsi controller persistent disks already use, unlocking TRIM (`discard`) and `ssd` auto-resolution on the root disk itself (both unavailable on virtio-blk). Persistent-disk slot allocation is unaffected either way — `scsi0` has always been reserved for the root disk and `attach_disk`'s free-slot search has always started at `scsi1`, so there is no slot collision to manage. **Clone-path requirement:** `create_vm`'s dominant path clones a pre-built stemcell template (every `:light:`/`:heavy:` stemcell CID resolves to one — see [Light Stemcells](light-stemcells.md)), and a clone inherits its source's exact disk layout. Templates are built once by `create_stemcell` and reused by content-hash tag match, so flipping this setting does not retroactively rebuild existing templates — `create_vm` compares the resolved bus against the matched template's actual root disk key before cloning and fails with a clear, non-retriable error on a mismatch rather than silently producing a root disk on the wrong bus. Re-run `create_stemcell` for affected stemcells after changing this value so new templates are built on the matching bus. One of `virtio`\|`scsi`. | `""` (→ `virtio`) | no |
 | `pve.stemcell_template_vmid_range_start` | Starting VMID for stemcell template VM allocation — a dedicated band above the persistent-disk range. When unset (`0`), defaults to `30000`. Must not overlap the VM range or the persistent-disk range `9000–29999`. | `0` (→ `30000`) | no |
 | `pve.stemcell_template_vmid_range_end` | Inclusive upper bound of the template VMID range. When unset (`0`), defaults to `30999`. Must be greater than `stemcell_template_vmid_range_start`. Must not overlap the persistent-disk range. | `0` (→ `30999`) | no |
 | `pve.stemcell_template_pool` | PVE resource pool assigned to newly created template VMs. The CPI creates this pool if it does not already exist, tagging it with a `managed by bosh-pve-cpi` provenance comment, before the first template VM is assigned to it. Set explicitly to `""` to opt out entirely — no pool assignment and no pool creation. Must not equal `pve.vm_pool` (validated at config load — pools are the ACL boundary between workload VMs and shared stemcell templates), and must not start with `bosh-lock-` (reserved cluster-lock namespace). Must be a flat PVE poolid (no `/`). See [Resource Pools](#resource-pools) below. | `bosh-templates` | no |
@@ -72,7 +89,7 @@ The storage pool must have the `import` content type enabled. See [Proxmox VE Se
 
 ## Stemcell Template Cloning
 
-`create_stemcell` builds one frozen PVE template VM per stemcell and returns a `template:<vmid>` CID. `create_vm` then clones that template instead of running a full qcow2 block-copy per VM. On linked-clone–capable storage backends this reduces VM creation time from roughly four minutes to seconds.
+`create_stemcell` builds (or reuses) a frozen PVE template VM per stemcell as a per-cluster clone-source cache — see [Light Stemcells](light-stemcells.md) for the full `:light:`/`:heavy:` CID model this cache sits behind; the template's own VMID is internal and never appears in the returned CID. `create_vm` then clones the cache template instead of running a full qcow2 block-copy per VM. On linked-clone–capable storage backends this reduces VM creation time from roughly four minutes to seconds.
 
 The five properties in the table above (`clone_mode`, `stemcell_template_vmid_range_start`, `stemcell_template_vmid_range_end`, `stemcell_template_pool`, `stemcell_template_node`) are all optional; the defaults produce the correct behavior for most deployments.
 
@@ -85,6 +102,12 @@ The five properties in the table above (`clone_mode`, `stemcell_template_vmid_ra
 | `lvm` (thick) | Full | `lvm`-thick does not support linked clones |
 
 Set `clone_mode: full` to force full clones everywhere, or `clone_mode: linked` to force linked clones and get an explicit error on `lvm`-thick rather than a silent fallback.
+
+### Choosing between the template cache and a direct import
+
+| Property | Type | Default | Description |
+|---|---|---|---|
+| `pve.stemcell_strategy` | String | `""` (→ `"template"`) | How `create_vm` materializes a VM root disk from a stemcell CID. `template` (default): clone the per-cluster stemcell cache template described above — CoW-fast; the cache is built eagerly by `create_stemcell` and reused by every `create_vm` on the cluster. `import`: import the stemcell qcow2 directly into the VM root disk — a full copy per VM, slower, but independent of the template cache; useful when clones must not share a base volume. Per-VM override: `vm_type`/resource-pool `cloud_properties.stemcell_strategy`. Valid values: `""`, `"template"`, `"import"`. |
 
 ### `vm_storage` must match the template's storage for a linked clone
 
@@ -128,9 +151,9 @@ For local storage backends (`dir`, `zfspool`, `lvmthin`, `lvm`) on multi-node cl
 
 The CPI does not auto-migrate templates between nodes. If a clone lands on the wrong node, manually live-migrate the resulting VM in the PVE UI after `create_vm` completes.
 
-### Back-compatibility
+### No legacy CID compatibility
 
-Stemcells uploaded before this feature was introduced continue to work without operator action. When `create_vm` receives a pre-upgrade CID (a `<storage>:import/<file>` or `light:...` form), it looks for a matching template by content hash. If a template is found, the fast clone path runs; if not, the original slow `import-from=` path runs. No re-upload is required.
+`create_stemcell` and `delete_stemcell` accept only the current path-identity CID grammar (`:light:<storage>:import/<file>` or `:heavy:<storage>:import/<file>`, see [Light Stemcells](light-stemcells.md)). Every earlier grammar — a bare `<storage>:import/<file>`, a `light:...`/`template:<vmid>` prefix, or a bare integer VMID — is rejected as a hard, non-retriable parse error. There is no fallback path: re-upload every stemcell with a CPI at this CID grammar before deploying against it.
 
 ## Resource Pools
 
@@ -184,19 +207,19 @@ See [pve-api-permissions.md](pve-api-permissions.md) for token creation and the 
 
 ## SDN Network Management
 
-When the Director's cloud-config marks a network as `managed: true`, the CPI calls `create_network` and `delete_network` to provision and remove the network resource. The CPI supports two backends: PVE SDN vnets and Linux bridges.
+When the Director's cloud-config marks a network as `managed: true`, the CPI calls `create_network` and `delete_network` to provision and remove the network resource. The CPI supports two backends: Linux bridges (the default) and PVE SDN vnets (opt-in). See [Networks](networks.md) for the full Pattern A (operator-managed bridges) versus Pattern B (CPI-managed SDN) treatment, including the per-NIC `cloud_properties` reference table; this section covers only the `create_network`/`delete_network` provisioning path for `managed: true` networks.
 
-### Prerequisites — SDN Mode (the default)
+### Prerequisites — SDN Mode (opt-in)
 
 1. PVE SDN must be enabled at the datacenter level. The **Datacenter > SDN** menu appears in PVE 7.2+ and requires `libpve-network-perl` on all cluster nodes.
 
-2. The PVE API token or user must hold the `SDN.Allocate` privilege on `/sdn`. This is required by default now that SDN is the default network mode; only a `network_mode: bridge` opt-out avoids it.
+2. The PVE API token or user must hold the `SDN.Allocate` privilege on `/sdn`. Required only when a managed network actually routes to the SDN path — either `network_mode: sdn`/`auto`, or a `bridge`-mode network whose `cloud_properties` names a `zone` or `vnet`.
 
-3. A pre-existing SDN zone is required only when `sdn_auto_manage_zone: false` (the CPI never creates zones then) or when `sdn_zone_type: evpn` (EVPN zones and their controllers are always operator-created). With defaults, the CPI creates the turnkey vxlan zone `bosh` on demand.
+3. A pre-existing SDN zone is required only when `sdn_auto_manage_zone: false` (the CPI never creates zones then) or when `sdn_zone_type: evpn` (EVPN zones and their controllers are always operator-created). With `sdn_auto_manage_zone` at its default (`true`), the CPI creates the turnkey vxlan zone `bosh` on demand.
 
-### Manifest Example — Turnkey VXLAN (the default)
+### Manifest Example — Opt-in Cluster-wide VXLAN Overlay
 
-Nothing SDN-specific to configure — the defaults create the vxlan zone `bosh` with peers derived from the online cluster nodes:
+Set `network_mode: sdn`; the CPI then creates the vxlan zone `bosh` with peers derived from the online cluster nodes on the first `create_network` call:
 
 ```yaml
 properties:
@@ -208,6 +231,7 @@ properties:
     vm_storage: local-lvm
     disk_storage: local-lvm
     network_bridge: vmbr0
+    network_mode: sdn
 ```
 
 Cloud-config managed network:
@@ -266,16 +290,15 @@ networks:
       vnet_tag: 59           # the 802.1Q VLAN ID (≤ 4094)
 ```
 
-The CPI creates the vlan zone with `network_bridge` as underlay, the vnet with tag 59, and returns `bridge: vlan59` for VM attachment. Pre-created vnets work without `managed: true` — point `cloud_properties.bridge` at the vnet name. See [Networks — Example 3](networks.md#example-3--vlan-vnet-per-vlan) for the full walkthrough and [Operations — SDN VLAN operations](operations.md#sdn-vlan-operations) for fabric prerequisites.
+The CPI creates the vlan zone with `network_bridge` as underlay, the vnet with tag 59, and returns `bridge: vlan59` for VM attachment. Pre-created vnets work without `managed: true` — point `cloud_properties.bridge` at the vnet name. See [Networks — VLAN (vnet-per-VLAN)](networks.md#vlan-vnet-per-vlan-managed-true) for the full walkthrough and [Operations — SDN VLAN operations](operations.md#sdn-vlan-operations) for fabric prerequisites.
 
-### Manifest Example — Bridge Mode (opt-in)
+### Manifest Example — Bridge Mode (the default)
 
-The legacy non-SDN path, retained for single-node setups without `libpve-network-perl`:
+No `network_mode` to set — this is the out-of-the-box behavior. Requires only a pre-existing Linux bridge on the target node(s); no SDN prerequisites:
 
 ```yaml
 properties:
   pve:
-    network_mode: bridge
     network_bridge: vmbr0
 ```
 
@@ -492,18 +515,16 @@ graph TD
 
 ## Stemcell Management
 
-Controls stemcell template replication, provenance recording, orphan pruning, and fast-path delete.
+Controls stemcell template replication, orphan pruning, and fast-path delete. Provenance recording is unconditional — no property controls it — and director identity is never configured: every CPI call carries the calling BOSH director's identity in its request context, which the CPI stamps onto each template as a `director--<uuid>` tag.
 
-Stemcell CIDs take the form `template:<vmid>` (e.g. `template:30042`). All upload paths — heavy, pre-uploaded, and CPI-fetch — produce this format. See [Light Stemcells](light-stemcells.md) for the full stemcell lifecycle.
+Stemcell CIDs identify the qcow2 file, not any PVE VMID — see [Light Stemcells](light-stemcells.md) for the full `:light:`/`:heavy:` CID grammar and lifecycle. The properties below tune the per-cluster cache template that backs every stemcell CID: replication, provenance recording, orphan pruning, and fast-path delete.
 
 | Property | Type | Default | Description |
 |---|---|---|---|
 | `pve.stemcell_replicate_local` | Boolean | `false` | When `true`, `create_stemcell` uploads the qcow2 independently to every candidate cluster node's local storage and creates a per-node template VM tagged `bosh-stemcell-node-<node>`. Enables `create_vm` on local-storage nodes in multi-node clusters. `delete_stemcell` removes all replicas (best-effort; a single-node failure is logged and skipped). When `false` (default), local stemcell storage on a multi-node cluster is rejected at `create_stemcell` time. |
 | `pve.replica_adopt_timeout_sec` | Integer | `0` | Adopt-and-wait bound (seconds) for a racing concurrent template-replica clone. When > 0, `create_stemcell` probes for an in-flight winner building the same replica and waits up to this many seconds for it to settle before adopting it. A winner that never settles causes the node to be skipped. `0` disables the adopt path (byte-identical behavior). Conventional value: `300`. |
 | `pve.stemcell_replication_concurrency` | Integer | `0` | Maximum nodes receiving a stemcell replica upload concurrently during `create_stemcell`. Only meaningful when `stemcell_replicate_local` is `true`. `0` resolves to `1` (serial). Set a positive value up to `64` to replicate multiple nodes in parallel. Per-node failures are best-effort. |
-| `pve.stemcell.provenance` | Boolean | `false` | When `true`, stamps BOSH provenance into each uploaded stemcell template: the Notes field receives a JSON object (stemcell name, version, OS type, disk format, content hash, source, owning Director) and the template is tagged with `bosh-stemcell-sha-<sha8>` and related tags. Assists orphan detection and audit. |
-| `pve.stemcell.director_id` | String | `""` | Identity string for the owning BOSH Director, stamped into the provenance Notes object and used to scope orphan-prune operations to templates uploaded by this Director only. Required for `prune_orphans`; when unset, orphan pruning is skipped with a warning. |
-| `pve.stemcell.prune_orphans` | Boolean | `false` | When `true`, the `delete_stemcell` call performs an opt-in garbage-collection pass over `bosh-stemcell`-tagged templates owned by this Director that no longer have a referencing linked clone. Pruning is best-effort: failures are logged and do not cause `delete_stemcell` to fail. Requires `stemcell.director_id` to be set. |
+| `pve.stemcell.prune_orphans` | Boolean | `false` | When `true`, the `delete_stemcell` call performs an opt-in garbage-collection pass over `bosh-stemcell`-tagged templates carrying the calling director's `director--<uuid>` tag (director identity comes from the request context every CPI call carries — no configuration needed) that no longer have a referencing linked clone. Pruning is best-effort: failures are logged and do not cause `delete_stemcell` to fail. A request without a director UUID in its context skips the pass with a warning. |
 | `pve.stemcell.prune_dry_run` | Boolean | `false` | When `true` and `prune_orphans` is enabled, the GC pass logs each candidate it would delete but performs no deletions. Use to audit orphan accumulation before enabling live pruning. Has no effect when `prune_orphans` is `false`. |
 | `pve.fast_path_delete` | Boolean | `false` | When `true`, `delete_vm` and `delete_disk` issue the PVE destroy call and return immediately without awaiting the task's terminal state. `delete_vm` additionally stamps a `bosh-deleting` tag on the VM before issuing the destroy; subsequent fast-path calls sweep for and re-issue destroys on stalled VMs. `delete_disk` carries no marker (PVE disk volumes cannot hold tags). Eventual consistency: a subsequent `has_vm` or `has_disk` call may briefly still see the resource. Default `false` (synchronous, fully-consistent). The fast-path destroy uses `skiplock=true`, which PVE honors only for the literal `root@pam` superuser (password auth) — not for any API token, including one owned by `root@pam`, and not for any other identity. The CPI logs a startup Warn naming the configured identity when `fast_path_delete` is enabled under any other identity, but never blocks config load over it. |
 
@@ -611,6 +632,7 @@ These properties govern defensive behavior during disk resize and deletion and c
 | `pve.ephemeral_disk_min_mode` | String | `""` (→ `enforce`) | Action when the `ephemeral_disk_min_ratio` invariant is violated. `enforce` (default): rejects `create_vm` with a non-retriable error naming the deficit. `warn`: logs the deficit and proceeds. No effect unless `ephemeral_disk_min_ratio` is set. Valid values: `""`, `"enforce"`, `"warn"`. |
 | `pve.resize_wait_for_convergence` | Boolean | `false` | When `true`, `resize_disk` polls the VM config after the PVE resize task completes until the reported disk size matches the requested size. Corrects size-metadata lag on asynchronous backends (Ceph RBD, LVM-thin). Poll is best-effort: if size has not converged within `resize_convergence_timeout_sec`, a warning is logged and `resize_disk` returns success. |
 | `pve.resize_convergence_timeout_sec` | Integer | `0` (→ 120 s) | Bounds the `resize_wait_for_convergence` poll, in seconds. Independent of the `operation_timeout` envelope. `0` applies the built-in 120 s. Only meaningful when `resize_wait_for_convergence` is `true`. |
+| `pve.destroy_unreferenced_disks` | Boolean | `false` | When `true`, `delete_vm` passes `DestroyUnreferencedDisks=true` to PVE's destroy call on every non-retain delete (synchronous path, fast path, and the fast-path straggler sweep). PVE's semantics: free every volume on the VM's storages that is not referenced in the destroyed VM's config *and* carries a VMID matching the VM being destroyed — a storage-wide scan by VMID, not scoped to this VM's own config. **Multi-cluster data-loss hazard:** safe only on storage dedicated to a single PVE cluster, where it sweeps up orphaned own-VMID volumes (e.g. a disk left behind by an interrupted create) that the config-scoped guards never touch. Leave `false` the moment `vm_storage`/`disk_storage`/`iso_storage` is shared with a second, independent PVE cluster — a second BOSH-Proxmox AZ pointed at the same NFS/dir export can allocate an overlapping VMID band, and this flag would then free that *other* cluster's live disks, indistinguishable from this cluster's view as a genuine orphan. On shared storage, keep this `false` and rely on disjoint per-CPI VMID banding instead; orphaned own-cluster volumes then accumulate and are visible to `scripts/disk-audit` rather than being auto-freed. See [Multi-cluster deployments](multi-cluster.md#shared-storage-rules). |
 
 ## Encrypted Storage
 
@@ -830,4 +852,25 @@ Notes:
 - The CPI reserves three tag-key prefixes: `director--`, `deployment--`, and `job--`. These are rebuilt from BOSH-supplied metadata on every `set_vm_metadata` call. Custom tags survive those re-syncs.
 
 - PVE has no native disk-volume tag field. Tags on a `disk_type` are written to the tag field of the VM the disk is attached to and recorded in the VM description sentinel under `bosh_disk_tags`. Disk tags become visible only once the disk is attached to a VM; if `create_disk` is called without a `vm_cid` hint, the tags are deferred and applied on the next `set_disk_metadata` call.
+
+## Zero-Config Baseline
+
+Every default listed below applies with the [Minimal Configuration](#minimal-configuration) manifest and no further properties set. "PVE grants" lists only what each default adds beyond the baseline token privileges in [PVE API permissions](pve-api-permissions.md); "-" means no additional grant is needed.
+
+| Property | Default | What it touches | PVE grants beyond baseline |
+|---|---|---|---|
+| `network_mode` | `bridge` | `create_vm` NIC attachment uses the named `network_bridge` (`vmbr0`) directly, with no SDN API calls unless a network spec names a `zone`/`vnet`. `create_network`/`delete_network` (only reachable via `managed: true` networks) also take the bridge path. | - (the named bridge must already exist on the placement node; operator-managed) |
+| `stemcell_strategy` | `template` | `create_vm` clones the per-cluster cache template built by `create_stemcell` instead of importing the qcow2 directly into every VM's root disk. | - |
+| `iso_storage_follow_vm_storage` | unset → `true` | Resolved once at CPI startup: the ConfigDrive ISO pool follows `vm_storage` instead of the `iso_storage` spec default (`local`), provided `vm_storage` advertises PVE content type `iso` and is shared. Falls back to `iso_storage` (`local`) with a warning when `vm_storage` does not qualify. | - |
+| `destroy_unreferenced_disks` | `false` | `delete_vm` does not pass `DestroyUnreferencedDisks=true` to PVE's destroy call; orphaned own-VMID volumes on shared storage are left for `scripts/disk-audit` rather than swept automatically. Safety default — see the property's full description above for the shared-storage hazard it avoids. | - |
+| `vm_pool` / `stemcell_template_pool` | `bosh` / `bosh-templates` | Every VM and stemcell cache template is assigned into its pool, which the CPI creates on first use (tagged `managed by bosh-pve-cpi`). A pool-creation or pool-assignment failure is fatal to `create_vm`/`create_stemcell`. | `Pool.Allocate` on `/pools` |
+| `balloon` | unset → `"0"` | Every new VM's PVE `balloon` config key is `0` (device disabled) — BOSH sizes VMs deterministically from the manifest, so PVE's own auto-ballooning default would reclaim memory beneath the Director's assumptions. | - |
+| `cpu_type` | unset → `host` | Every new VM's PVE `cpu` config key is `host` — the guest sees the physical CPU's full feature set. **Assumes a homogeneous cluster**: a `host`-typed guest can crash when live-migrated to a node with a different CPU generation. Clusters that mix CPU models and rely on live migration (HA, DLB, maintenance evacuations) should set `cpu_type: x86-64-v2-AES` or a lower-common-denominator named model. | - |
+| cores / sockets / memory | fallback `2` / `1` / `512` MiB | Only fires when no `vm_type`/`disk_type`/call-level layer sets a size — a floor that keeps `create_vm` from failing outright on a missing size, not a usable production default. See "Give every `vm_type` explicit sizing" above. | - |
+| `ensure_no_ip_conflicts` | `true` | `create_vm` runs a full-cluster static-IP scan (`ListResources` plus a per-VM config fan-out) before provisioning any VM with a static IP. | read access to list cluster VMs and their config (already required for placement) |
+| `placement.enabled` | `true` | `create_vm` scores cluster nodes on live memory/CPU/storage/guest-count facts instead of using `pve.node` unconditionally. An explicit `cloud_properties.target_node` always wins. | read access to node/cluster status (already required) |
+| `placement.exclude_maintenance_nodes` | `true` | Excludes nodes in HA maintenance/error state from placement candidates. Fails open with a per-`create_vm` warning if the HA status call errors (e.g. missing HA read privilege). | HA status read (fail-open if absent) |
+| `network_resolve_retries` | unset → `30` | Gates `create_network`'s SDN convergence poll and `create_vm`'s per-bridge SDN-membership check. On an all-bridge cluster this costs one `ListSdnVnets` call per unique bridge per `create_vm` (fail-open, pass-through for non-SDN bridges); it only blocks anything when the bridge genuinely is an SDN vnet still converging. | - |
+
+Everything not listed here — hooks, OTel, metrics, DLB, anti-affinity, encrypted storage, disk-performance overrides, retry tuning, transport timeouts, and the rest — defaults to off/unset and adds no PVE grant and no behavior beyond the [Minimal Configuration](#minimal-configuration) manifest.
 
