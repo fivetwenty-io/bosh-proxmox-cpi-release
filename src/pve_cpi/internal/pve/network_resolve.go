@@ -13,6 +13,7 @@ import (
 	"context"
 	"encoding/json"
 	"strings"
+	"sync"
 	"time"
 
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
@@ -122,6 +123,150 @@ func sdnVnetInRunningConfig(ctx context.Context, svc sdkcluster.Service, vnet st
 	return false, nil
 }
 
+// vnetNameCacheTTL bounds how often the per-cluster SDN vnet-membership cache
+// is refreshed. Short enough that a genuinely new/renamed vnet is picked up
+// within roughly one TTL window of create_vm calls; long enough that a
+// plain-bridge cluster (zero vnets, ever) pays at most one ListSDNVnets call
+// per TTL window rather than once per create_vm and once per unique NIC
+// bridge per create_vm — the two call sites that share this cache (see
+// cachedVnetNames).
+const vnetNameCacheTTL = 30 * time.Second
+
+// vnetNameCache is a process-wide, TTL-bounded, mutex-protected cache of "is
+// this bridge name a known SDN vnet" membership, keyed by the pve.Client
+// instance so a multi-cluster CPI process (per-request pve_* overrides —
+// context_override.go's bounded-LRU client bundle cache) never mixes vnet
+// membership across distinct clusters: each override identity gets its own
+// Client, and the concrete type backing that interface (a pointer) is
+// comparable, so it is safe and correct as a map key.
+//
+// Two call sites share this cache: cachedVnetNames' callers in the handlers
+// package (mtu=1 vnet-MTU inheritance and vlan/tag membership, decoupled
+// from network_mode) and bridgeIsSDNVnet in this file (the
+// consume-side eventual-consistency gate). Both need the identical answer to
+// "is this bridge an SDN vnet"; sharing one cache means a plain-bridge
+// cluster pays the ListSDNVnets cost once per TTL window rather than once
+// per call site per create_vm.
+var vnetNameCache = newVnetCache()
+
+type vnetCache struct {
+	mu       sync.Mutex
+	entries  map[Client]vnetCacheEntry
+	negative map[Client]vnetNegativeCacheEntry
+}
+
+type vnetCacheEntry struct {
+	names map[string]struct{}
+	exp   time.Time
+}
+
+// vnetNegativeCacheEntry holds the most recent ListSDNVnets failure for a
+// given Client, with an expiry. Mirrors StorageInfoCache's negCache/negTTL
+// pattern (see internal/pve/storage_info.go): a failed refresh is replayed
+// from here for vnetNameNegativeCacheTTL rather than re-attempted on every
+// call, so a cluster where the listing always errors (SDN not configured,
+// insufficient permissions) does not pay a failed API round trip on every
+// single create_vm forever.
+type vnetNegativeCacheEntry struct {
+	err error
+	exp time.Time
+}
+
+// vnetNameNegativeCacheTTL bounds how long a failed SDN vnet listing is
+// replayed from the negative cache before the next attempt is allowed.
+// Shorter than vnetNameCacheTTL's positive-result rationale does not apply
+// symmetrically here: a stuck failure is worse to pin for a long window than
+// a stale success, so this stays on the same order of magnitude as
+// StorageInfoCache's negativeCacheTTL rather than matching the (longer)
+// positive TTL above.
+const vnetNameNegativeCacheTTL = 30 * time.Second
+
+func newVnetCache() *vnetCache {
+	return &vnetCache{
+		entries:  make(map[Client]vnetCacheEntry),
+		negative: make(map[Client]vnetNegativeCacheEntry),
+	}
+}
+
+// CachedVnetNames returns the set of SDN vnet names currently defined
+// (pending included) for c, from the process-wide cache when fresh or via a
+// live ListSDNVnets otherwise. This is the exported entry point used by
+// create_vm's NIC-attachment path (mtu=1 inheritance, vlan/tag membership);
+// bridgeIsSDNVnet below uses the unexported cachedVnetNames directly.
+//
+// A listing failure returns (nil, err) and is cached in the per-Client
+// negative cache for vnetNameNegativeCacheTTL, so a cluster where the
+// listing always errors (SDN not configured, insufficient permissions) is
+// replayed from the negative cache rather than re-attempted on every call —
+// the sdnVnetNameSet call in create_vm_network.go runs on every single
+// create_vm regardless of network_mode, so an uncached failure would mean a
+// failed API round trip on every create_vm forever. Callers must treat a
+// non-nil error as "membership unknown, not a vnet" rather than propagating
+// it — see sdnVnetNameSet for the reference caller.
+func CachedVnetNames(ctx context.Context, c Client) (map[string]struct{}, error) {
+	return cachedVnetNames(ctx, c)
+}
+
+func cachedVnetNames(ctx context.Context, c Client) (map[string]struct{}, error) {
+	if c == nil {
+		return nil, cpierrors.Cloud("CachedVnetNames: client must not be nil")
+	}
+	now := time.Now()
+
+	vnetNameCache.mu.Lock()
+	if entry, ok := vnetNameCache.entries[c]; ok && now.Before(entry.exp) {
+		names := entry.names
+		vnetNameCache.mu.Unlock()
+		return names, nil
+	}
+	if neg, ok := vnetNameCache.negative[c]; ok && now.Before(neg.exp) {
+		cachedErr := neg.err
+		vnetNameCache.mu.Unlock()
+		return nil, cachedErr
+	}
+	vnetNameCache.mu.Unlock()
+
+	vnets, err := ListSDNVnets(ctx, c)
+	if err != nil {
+		vnetNameCache.mu.Lock()
+		vnetNameCache.negative[c] = vnetNegativeCacheEntry{err: err, exp: now.Add(vnetNameNegativeCacheTTL)}
+		vnetNameCache.mu.Unlock()
+		return nil, err
+	}
+	set := make(map[string]struct{}, len(vnets))
+	for _, v := range vnets {
+		set[v.Vnet] = struct{}{}
+	}
+
+	vnetNameCache.mu.Lock()
+	// A fresh success clears any prior negative-cache entry for this Client so
+	// a subsequent failure starts a new TTL window rather than reusing a stale
+	// expiry from before the cluster recovered.
+	delete(vnetNameCache.negative, c)
+	// Opportunistic sweep of expired entries on every write: bounds the map's
+	// long-run size to the number of DISTINCT Client instances that have
+	// actually made a request recently, rather than every Client instance
+	// ever constructed over a long-running process's lifetime (e.g. every
+	// per-request override bundle context_override.go's own LRU has since
+	// evicted). Cheap — proportional to the (small, cluster-count-bounded)
+	// map size, run only when this goroutine already holds the lock to
+	// write a new entry.
+	for k, e := range vnetNameCache.entries {
+		if !now.Before(e.exp) {
+			delete(vnetNameCache.entries, k)
+		}
+	}
+	for k, e := range vnetNameCache.negative {
+		if !now.Before(e.exp) {
+			delete(vnetNameCache.negative, k)
+		}
+	}
+	vnetNameCache.entries[c] = vnetCacheEntry{names: set, exp: now.Add(vnetNameCacheTTL)}
+	vnetNameCache.mu.Unlock()
+
+	return set, nil
+}
+
 // ResolveNodeBridgeOnNode is the consume-side eventual-consistency gate for
 // create_vm. Before writing a NIC's bridge into the VM config, it confirms the
 // bridge is realized on the target node. It only gates SDN-managed vnets: a
@@ -173,31 +318,23 @@ func resolveNodeBridgeOnNode(
 	return nil
 }
 
-// bridgeIsSDNVnet reports whether bridge names a known SDN vnet. The vnet list
-// includes pending state, so a vnet created moments earlier (and still realizing
-// on nodes) is correctly recognized as SDN-managed. Rows are decoded leniently
-// (vnet name only) so a single malformed vnet row elsewhere in the cluster does
-// not error out the membership check and silently disable the gate for an
-// unrelated bridge.
+// bridgeIsSDNVnet reports whether bridge names a known SDN vnet, via the
+// shared process-wide vnetNameCache (see cachedVnetNames) — the same cache
+// create_vm's mtu=1/vlan-tag membership check uses, so a plain-bridge cluster
+// pays the ListSDNVnets cost at most once per TTL window rather than once per
+// call site. The underlying list includes pending state, so a vnet created
+// moments earlier (and still realizing on nodes) is correctly recognized as
+// SDN-managed.
 func bridgeIsSDNVnet(ctx context.Context, c Client, bridge string) (bool, error) {
-	svc := c.Cluster()
-	if svc == nil {
+	if c.Cluster() == nil {
 		return false, nil
 	}
-	pending := true
-	resp, err := svc.ListSdnVnets(ctx, &sdkcluster.ListSdnVnetsParams{Pending: &pending})
+	names, err := cachedVnetNames(ctx, c)
 	if err != nil {
-		return false, WrapError(err)
+		return false, err
 	}
-	if resp == nil {
-		return false, nil
-	}
-	for _, raw := range *resp {
-		if decodeVnetName(raw) == bridge {
-			return true, nil
-		}
-	}
-	return false, nil
+	_, ok := names[bridge]
+	return ok, nil
 }
 
 // nodeHasBridge reports whether bridge appears as an interface on node. A

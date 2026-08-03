@@ -275,6 +275,85 @@ func TestResolveNodeBridgeOnNode_NodeNetworkError_KeepsPolling(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// CachedVnetNames: positive result + negative caching (F11)
+// ---------------------------------------------------------------------------
+
+func TestCachedVnetNames_Success(t *testing.T) {
+	fc := &nrFakeCluster{listVnet: func(int, *sdkcluster.ListSdnVnetsParams) (*sdkcluster.ListSdnVnetsResponse, error) {
+		return vnetsResp("v1", "v2"), nil
+	}}
+	c := &nrFakeClient{cluster: fc}
+
+	names, err := CachedVnetNames(context.Background(), c)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, ok := names["v1"]; !ok {
+		t.Errorf("expected v1 in result, got %v", names)
+	}
+	if _, ok := names["v2"]; !ok {
+		t.Errorf("expected v2 in result, got %v", names)
+	}
+}
+
+// TestCachedVnetNames_CachesNegativeResult verifies that a ListSDNVnets
+// failure is cached per-Client for vnetNameNegativeCacheTTL: a second call
+// within the TTL window replays the cached error rather than re-listing —
+// closing the gap where a cluster whose listing always errors (SDN not
+// configured, insufficient permissions) paid a failed API round trip on
+// every single create_vm forever.
+func TestCachedVnetNames_CachesNegativeResult(t *testing.T) {
+	fc := &nrFakeCluster{listVnet: func(int, *sdkcluster.ListSdnVnetsParams) (*sdkcluster.ListSdnVnetsResponse, error) {
+		return nil, errors.New("permission denied")
+	}}
+	// Distinct Client instance so this test's cache entry cannot collide with
+	// any other test sharing the process-wide vnetNameCache singleton.
+	c := &nrFakeClient{cluster: fc}
+
+	if _, err := CachedVnetNames(context.Background(), c); err == nil {
+		t.Fatal("first call: want error, got nil")
+	}
+	if _, err := CachedVnetNames(context.Background(), c); err == nil {
+		t.Fatal("second call within negative-cache TTL: want cached error, got nil")
+	}
+	if fc.calls != 1 {
+		t.Errorf("second call within negative-cache TTL must not re-list; want 1 ListSdnVnets call, got %d", fc.calls)
+	}
+}
+
+// TestCachedVnetNames_SuccessAfterFailure_DifferentClient verifies that a
+// negative-cache entry for one Client instance does not bleed into a
+// different Client's lookup — the cache is keyed per-Client (per-cluster
+// override identity), not process-wide.
+func TestCachedVnetNames_SuccessAfterFailure_DifferentClient(t *testing.T) {
+	failing := &nrFakeCluster{listVnet: func(int, *sdkcluster.ListSdnVnetsParams) (*sdkcluster.ListSdnVnetsResponse, error) {
+		return nil, errors.New("permission denied")
+	}}
+	cFailing := &nrFakeClient{cluster: failing}
+	if _, err := CachedVnetNames(context.Background(), cFailing); err == nil {
+		t.Fatal("want error from the failing client, got nil")
+	}
+
+	succeeding := &nrFakeCluster{listVnet: func(int, *sdkcluster.ListSdnVnetsParams) (*sdkcluster.ListSdnVnetsResponse, error) {
+		return vnetsResp("v1"), nil
+	}}
+	cSucceeding := &nrFakeClient{cluster: succeeding}
+	names, err := CachedVnetNames(context.Background(), cSucceeding)
+	if err != nil {
+		t.Fatalf("a different Client's lookup must not be affected by another Client's negative cache entry: %v", err)
+	}
+	if _, ok := names["v1"]; !ok {
+		t.Errorf("expected v1 in result, got %v", names)
+	}
+}
+
+func TestCachedVnetNames_NilClient_Errors(t *testing.T) {
+	if _, err := CachedVnetNames(context.Background(), nil); err == nil {
+		t.Error("nil client: want error, got nil")
+	}
+}
+
 func TestResolveNodeBridgeOnNode_NilClient_NoOp(t *testing.T) {
 	if err := ResolveNodeBridgeOnNode(context.Background(), nil, "pve1", "v1", 5, time.Minute); err != nil {
 		t.Errorf("nil client: want nil, got %v", err)

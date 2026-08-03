@@ -787,6 +787,20 @@ const cloudPropNodeKey = "node"
 // follow-up UpdateNetwork (PUT /nodes/{node}/network) reloads ifupdown2 so
 // the bridge is realized on the host. Both calls flow through pve.WrapError
 // so transient transport faults bubble back to BOSH as Retriable.
+//
+// Single-node scope: this provisions the bridge on exactly ONE PVE
+// node — cloud_properties.node, or config.node when unset — never every
+// cluster node. There is no loop over cluster nodes and none is added here:
+// a bridge is a per-node kernel/ifupdown2 interface with no cluster-wide
+// realization concept (unlike an SDN vnet, which PVE itself replicates to
+// every node — see createNetworkSDN). A VM whose NIC attaches to a bridge
+// this call created can only run on the node it was created on; PVE refuses
+// to migrate or HA-recover it onto any other node, since the bridge simply
+// does not exist there. THE multi-node bridge pattern is to pre-provision
+// the bridge identically on every node OUTSIDE the CPI (config
+// management, PVE host templating, …) and reference it with
+// managed: false — that path needs zero CPI involvement and has no
+// single-node limitation. See docs/networks.md's worked example.
 func createNetworkBridge(
 	ctx context.Context,
 	deps Deps,
@@ -812,6 +826,14 @@ func createNetworkBridge(
 			"create_network: target node not set — supply cloud_properties.node or config.node",
 		)
 	}
+	deps.Log(ctx).Info(
+		"create_network: provisioning a Linux bridge on one PVE node only ("+
+			"not cluster-wide like an SDN vnet); a VM attached to it cannot migrate or "+
+			"HA-recover to any other node — pre-provision the bridge on every node and "+
+			"use managed: false for a multi-node bridge fabric",
+		log.String("bridge", bridge),
+		log.String("node", node),
+	)
 
 	autostart := true
 	if err := deps.PVE.Nodes().CreateNetwork(ctx, node, &sdknodes.CreateNetworkParams{

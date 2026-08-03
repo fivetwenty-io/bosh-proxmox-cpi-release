@@ -39,8 +39,19 @@ type IPConflict struct {
 
 // IPConflictCloudError formats a CloudError whose message names the conflicting
 // guest so the BOSH director log contains actionable information. Call this
-// from create_vm when detectIPConflict returns a non-nil *IPConflict.
-func IPConflictCloudError(conflict *IPConflict, bridge string) *cpierrors.Error {
+// from create_vm when detectIPConflict returns a non-nil *IPConflict. vlan is
+// the L2 domain's VLAN tag (0 = untagged); when non-zero it is named in the
+// message so an operator running several VLANs on one trunk bridge can tell
+// which domain actually conflicted.
+func IPConflictCloudError(conflict *IPConflict, bridge string, vlan int) *cpierrors.Error {
+	if vlan != 0 {
+		return cpierrors.Cloud(
+			"create_vm: IP conflict detected — address %s is already statically assigned "+
+				"to VM %d (%s) on bridge/vnet %q vlan %d; "+
+				"choose a different IP or remove the conflicting assignment before retrying",
+			conflict.IP, conflict.VMID, conflict.Name, bridge, vlan,
+		)
+	}
 	return cpierrors.Cloud(
 		"create_vm: IP conflict detected — address %s is already statically assigned "+
 			"to VM %d (%s) on bridge/vnet %q; "+
@@ -59,7 +70,13 @@ func IPConflictCloudError(conflict *IPConflict, bridge string) *cpierrors.Error 
 //   - targetIPs: the IP addresses (plain, no CIDR prefix) to check; e.g. ["10.0.0.5"].
 //     Empty or nil slice returns nil, nil immediately.
 //   - bridge: optional bridge/vnet name to filter NICs; empty string disables
-//     bridge filtering and matches any NIC (wider scan, potentially slower).
+//     bridge (and vlan) filtering and matches any NIC (wider scan, potentially
+//     slower).
+//   - vlan: VLAN tag to further restrict the bridge filter to one L2 domain
+//     (0 = untagged; ignored when bridge is ""). A NIC matches iff its net{N}
+//     bridge= equals bridge AND its tag= equals vlan (absent tag== vlan 0) —
+//     see nicTagMatches. This keeps two guests on the same trunk bridge but
+//     different VLANs from being reported as conflicting.
 //   - excludeVMID: VMID to exclude from the scan. Pass the just-created VM's
 //     VMID here so the new VM cannot conflict with its own ipconfig entries.
 //     Pass 0 (or any value <= 0) to disable exclusion and scan all VMs.
@@ -68,7 +85,8 @@ func IPConflictCloudError(conflict *IPConflict, bridge string) *cpierrors.Error 
 //  1. cluster.ListResources(type=vm) → all (vmid, node) pairs.
 //  2. Per-VM: QEMU().Config(node, vmid) → parse ipconfig{N} for static IPs.
 //     Concurrency is bounded to maxIPConflictWorkers goroutines.
-//  3. When bridge != "", also parse net{N} keys to restrict to NICs on that bridge.
+//  3. When bridge != "", also parse net{N} keys to restrict to NICs on that
+//     (bridge, vlan) L2 domain.
 //  4. First conflict found cancels remaining goroutines and is returned.
 //
 // Error handling:
@@ -83,6 +101,7 @@ func detectIPConflict(
 	deps Deps,
 	targetIPs []string,
 	bridge string,
+	vlan int,
 	excludeVMID int,
 ) (*IPConflict, error) {
 	if len(targetIPs) == 0 {
@@ -205,7 +224,7 @@ func detectIPConflict(
 			}
 
 			// Determine which NIC indices are on the target bridge (when filtering).
-			bridgeNICs := nicIndicesOnBridge(cfg, bridge)
+			bridgeNICs := nicIndicesOnBridge(cfg, bridge, vlan)
 
 			// Scan ipconfig{N} for static IPs.
 			conflict := parseIPConflict(cfg, targetSet, bridgeNICs, bridge, vmid, entry.Name)
@@ -231,10 +250,12 @@ func detectIPConflict(
 }
 
 // nicIndicesOnBridge returns the set of NIC indices (0, 1, ...) whose net{N}
-// key in cfg contains "bridge=<targetBridge>" or "bridge=<targetBridge>,".
-// When bridge is empty, returns nil to signal "no bridge filter" — callers
-// treat nil as "all indices match".
-func nicIndicesOnBridge(cfg map[string]any, bridge string) map[int]struct{} {
+// key in cfg both references bridge (nicIsOnBridge) AND matches vlan
+// (nicTagMatches) — i.e. sits in the same (bridge, vlan) L2 domain. When
+// bridge is empty, returns nil to signal "no bridge filter" — callers treat
+// nil as "all indices match" (vlan is ignored in that case: an empty bridge
+// disables domain filtering entirely, not just the bridge half of it).
+func nicIndicesOnBridge(cfg map[string]any, bridge string, vlan int) map[int]struct{} {
 	if bridge == "" {
 		return nil // no filter
 	}
@@ -251,7 +272,7 @@ func nicIndicesOnBridge(cfg map[string]any, bridge string) map[int]struct{} {
 		if !ok {
 			continue
 		}
-		if nicIsOnBridge(netStr, bridge) {
+		if nicIsOnBridge(netStr, bridge) && nicTagMatches(netStr, vlan) {
 			result[idx] = struct{}{}
 		}
 	}
@@ -269,6 +290,44 @@ func nicIsOnBridge(netVal, bridge string) bool {
 		}
 	}
 	return false
+}
+
+// nicTagMatches reports whether netVal's tag= (VLAN ID) segment matches vlan,
+// under a deliberately asymmetric rule:
+//
+//   - netVal carries an explicit tag= segment (hasTag == true): exact match
+//     only — matches iff tag == vlan. Two guests both stating their VLAN
+//     explicitly are on the same L2 domain iff the tags agree; this mirrors
+//     the same rule create_vm attaches NICs under (resolveNICBridgeAndVLAN /
+//     configureNICs' ",tag=<n>" assembly).
+//   - netVal carries no tag= segment (or an unparseable one): matches ANY
+//     vlan, including 0. On a VLAN-aware trunk bridge with a configured
+//     native VLAN N, an untagged existing NIC and a new NIC requesting
+//     vlan: N are in the SAME L2 domain — but which VLAN an untagged port's
+//     native VLAN actually is cannot be determined from the VM config
+//     alone. A conflict GUARD must stay conservative in the face of that
+//     ambiguity (false positive: an extra "possible conflict" the operator
+//     can rule out; false negative: a real duplicate IP silently missed),
+//     so an untagged existing NIC is treated as a wildcard rather than as
+//     "vlan 0 only" — this restores the pre-tag-aware bridge-only
+//     conservatism exactly where the ambiguity exists.
+func nicTagMatches(netVal string, vlan int) bool {
+	tag := 0
+	hasTag := false
+	for _, seg := range strings.Split(netVal, ",") {
+		kv := strings.SplitN(seg, "=", 2)
+		if len(kv) == 2 && strings.EqualFold(kv[0], "tag") {
+			if n, err := strconv.Atoi(strings.TrimSpace(kv[1])); err == nil {
+				tag = n
+				hasTag = true
+			}
+			break
+		}
+	}
+	if !hasTag {
+		return true
+	}
+	return tag == vlan
 }
 
 // parseIPConflict inspects ipconfig{N} entries in cfg for static IPs that

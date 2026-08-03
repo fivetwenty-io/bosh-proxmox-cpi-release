@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/agent"
@@ -112,7 +113,7 @@ func TestNicIndicesOnBridge(t *testing.T) {
 		cfg := map[string]any{
 			"net0": "virtio,bridge=vmbr0",
 		}
-		result := nicIndicesOnBridge(cfg, "")
+		result := nicIndicesOnBridge(cfg, "", 0)
 		if result != nil {
 			t.Errorf("expected nil for empty bridge, got %v", result)
 		}
@@ -125,7 +126,7 @@ func TestNicIndicesOnBridge(t *testing.T) {
 			"net2": "virtio,bridge=vmbr0",
 			"name": "somevm",
 		}
-		result := nicIndicesOnBridge(cfg, "vmbr0")
+		result := nicIndicesOnBridge(cfg, "vmbr0", 0)
 		if result == nil {
 			t.Fatal("expected non-nil map")
 		}
@@ -144,7 +145,7 @@ func TestNicIndicesOnBridge(t *testing.T) {
 		cfg := map[string]any{
 			"netXYZ": "virtio,bridge=vmbr0",
 		}
-		result := nicIndicesOnBridge(cfg, "vmbr0")
+		result := nicIndicesOnBridge(cfg, "vmbr0", 0)
 		if len(result) != 0 {
 			t.Errorf("expected empty map for non-numeric net key, got %v", result)
 		}
@@ -154,11 +155,87 @@ func TestNicIndicesOnBridge(t *testing.T) {
 		cfg := map[string]any{
 			"net0": 12345,
 		}
-		result := nicIndicesOnBridge(cfg, "vmbr0")
+		result := nicIndicesOnBridge(cfg, "vmbr0", 0)
 		if len(result) != 0 {
 			t.Errorf("expected empty map for non-string net value, got %v", result)
 		}
 	})
+
+	t.Run("same bridge different tagged vlans excluded from each other", func(t *testing.T) {
+		// Two TAGGED NICs on different VLANs stay separate L2 domains (exact
+		// match); an untagged NIC on the same bridge is a conservative
+		// wildcard (see nicTagMatches) and matches every vlan filter, since
+		// its native VLAN is unknowable from the VM config alone.
+		cfg := map[string]any{
+			"net0": "virtio,bridge=vmbr0,tag=10",
+			"net1": "virtio,bridge=vmbr0,tag=20",
+			"net2": "virtio,bridge=vmbr0",
+		}
+		result := nicIndicesOnBridge(cfg, "vmbr0", 10)
+		if _, ok := result[0]; !ok {
+			t.Error("expected net0 (tag=10) in vlan-10 result")
+		}
+		if _, ok := result[1]; ok {
+			t.Error("net1 (tag=20) must not be in vlan-10 result")
+		}
+		if _, ok := result[2]; !ok {
+			t.Error("expected net2 (untagged, conservative wildcard) in vlan-10 result")
+		}
+	})
+
+	t.Run("untagged NIC matches every vlan filter (conservative wildcard)", func(t *testing.T) {
+		cfg := map[string]any{
+			"net0": "virtio,bridge=vmbr0",
+			"net1": "virtio,bridge=vmbr0,tag=10",
+		}
+		result0 := nicIndicesOnBridge(cfg, "vmbr0", 0)
+		if _, ok := result0[0]; !ok {
+			t.Error("expected untagged net0 in vlan-0 result")
+		}
+		if _, ok := result0[1]; ok {
+			t.Error("tagged net1 (tag=10) must not be in vlan-0 (untagged) result")
+		}
+
+		result10 := nicIndicesOnBridge(cfg, "vmbr0", 10)
+		if _, ok := result10[0]; !ok {
+			t.Error("expected untagged net0 (conservative wildcard) in vlan-10 result")
+		}
+		if _, ok := result10[1]; !ok {
+			t.Error("expected tagged net1 (tag=10, exact match) in vlan-10 result")
+		}
+	})
+}
+
+func TestNicTagMatches(t *testing.T) {
+	cases := []struct {
+		name   string
+		netVal string
+		vlan   int
+		want   bool
+	}{
+		{"untagged matches vlan 0", "virtio,bridge=vmbr0", 0, true},
+		// Conservative wildcard: an untagged existing NIC could be on ANY
+		// candidate vlan's native VLAN, which is unknowable from the VM
+		// config alone — see nicTagMatches' doc comment.
+		{"untagged matches vlan 10 (conservative wildcard)", "virtio,bridge=vmbr0", 10, true},
+		{"tag=10 matches vlan 10", "virtio,bridge=vmbr0,tag=10", 10, true},
+		{"tag=10 does not match vlan 20", "virtio,bridge=vmbr0,tag=10", 20, false},
+		{"tag=10 does not match vlan 0", "virtio,bridge=vmbr0,tag=10", 0, false},
+		{"case-insensitive Tag key", "virtio,bridge=vmbr0,Tag=10", 10, true},
+		{"malformed tag treated as untagged (wildcard)", "virtio,bridge=vmbr0,tag=notanumber", 0, true},
+		{"malformed tag matches non-zero vlan too (wildcard)", "virtio,bridge=vmbr0,tag=notanumber", 10, true},
+		{"empty netVal matches vlan 0", "", 0, true},
+		{"empty netVal matches vlan 10 (wildcard)", "", 10, true},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			got := nicTagMatches(tc.netVal, tc.vlan)
+			if got != tc.want {
+				t.Errorf("nicTagMatches(%q, %d) = %v; want %v", tc.netVal, tc.vlan, got, tc.want)
+			}
+		})
+	}
 }
 
 func TestParseIPConflict(t *testing.T) {
@@ -225,7 +302,7 @@ func TestParseIPConflict(t *testing.T) {
 
 func TestIPConflictCloudError_Internal(t *testing.T) {
 	conflict := &IPConflict{VMID: 101, Name: "test-vm", IP: "10.0.0.1"}
-	err := IPConflictCloudError(conflict, "vmbr0")
+	err := IPConflictCloudError(conflict, "vmbr0", 0)
 	if err == nil {
 		t.Fatal("expected non-nil error")
 	}
@@ -247,6 +324,20 @@ func TestIPConflictCloudError_Internal(t *testing.T) {
 		if !found {
 			t.Errorf("error message %q missing %q", msg, want)
 		}
+	}
+}
+
+// TestIPConflictCloudError_NamesVLAN verifies that a non-zero vlan tag is
+// named in the error message so an operator running several VLANs on one
+// trunk bridge can tell which L2 domain actually conflicted.
+func TestIPConflictCloudError_NamesVLAN(t *testing.T) {
+	conflict := &IPConflict{VMID: 202, Name: "vlan-vm", IP: "10.0.0.2"}
+	err := IPConflictCloudError(conflict, "vmbr0", 42)
+	if err == nil {
+		t.Fatal("expected non-nil error")
+	}
+	if !strings.Contains(err.Error(), "vlan 42") {
+		t.Errorf("error message %q must name the conflicting vlan tag", err.Error())
 	}
 }
 
@@ -408,7 +499,7 @@ func TestDetectIPConflict_NilTargets(t *testing.T) {
 		called = true
 		return ipListResp(), nil
 	}, nil)
-	conflict, err := detectIPConflict(context.Background(), deps, nil, "vmbr0", 0)
+	conflict, err := detectIPConflict(context.Background(), deps, nil, "vmbr0", 0, 0)
 	if err != nil || conflict != nil {
 		t.Fatalf("nil targetIPs: expected (nil,nil), got (%v,%v)", conflict, err)
 	}
@@ -421,7 +512,7 @@ func TestDetectIPConflict_EmptyCluster(t *testing.T) {
 	deps := icDeps(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
 		return ipListResp(), nil
 	}, nil)
-	conflict, err := detectIPConflict(context.Background(), deps, []string{"10.0.0.5"}, "vmbr0", 0)
+	conflict, err := detectIPConflict(context.Background(), deps, []string{"10.0.0.5"}, "vmbr0", 0, 0)
 	if err != nil || conflict != nil {
 		t.Fatalf("empty cluster: expected (nil,nil), got (%v,%v)", conflict, err)
 	}
@@ -442,7 +533,7 @@ func TestDetectIPConflict_NoConflict(t *testing.T) {
 			return map[string]any{}, nil
 		},
 	)
-	conflict, err := detectIPConflict(context.Background(), deps, []string{"10.0.0.5"}, "vmbr0", 0)
+	conflict, err := detectIPConflict(context.Background(), deps, []string{"10.0.0.5"}, "vmbr0", 0, 0)
 	if err != nil || conflict != nil {
 		t.Fatalf("no-conflict: expected (nil,nil), got (%v,%v)", conflict, err)
 	}
@@ -463,7 +554,7 @@ func TestDetectIPConflict_ConflictFound(t *testing.T) {
 			return map[string]any{}, nil
 		},
 	)
-	conflict, err := detectIPConflict(context.Background(), deps, []string{"10.0.0.5"}, "vmbr0", 0)
+	conflict, err := detectIPConflict(context.Background(), deps, []string{"10.0.0.5"}, "vmbr0", 0, 0)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -472,6 +563,36 @@ func TestDetectIPConflict_ConflictFound(t *testing.T) {
 	}
 	if conflict.VMID != 200 || conflict.IP != "10.0.0.5" || conflict.Name != "conflict-vm" {
 		t.Errorf("unexpected conflict fields: %+v", conflict)
+	}
+}
+
+// TestDetectIPConflict_UntaggedExistingNIC_MatchesTaggedCandidate is the
+// integration-level regression test for the native/untagged VLAN
+// false-negative: an existing VM's NIC carries no tag= segment (untagged) and
+// the candidate scan requests vlan 10 on the same bridge. Because the
+// existing NIC's native VLAN cannot be determined from the VM config alone,
+// the conservative conflict guard must still report the conflict rather than
+// treating the two as separate L2 domains.
+func TestDetectIPConflict_UntaggedExistingNIC_MatchesTaggedCandidate(t *testing.T) {
+	deps := icDeps(
+		func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+			return ipListResp(ipVMResource(400, "untagged-native-vlan")), nil
+		},
+		func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			// Existing NIC carries no tag= — the native/untagged VLAN on a
+			// trunk bridge, which could be the same domain as vlan 10.
+			return map[string]any{"name": "untagged-native-vlan", "ipconfig0": "ip=10.0.0.5/24", "net0": "virtio,bridge=vmbr0"}, nil
+		},
+	)
+	conflict, err := detectIPConflict(context.Background(), deps, []string{"10.0.0.5"}, "vmbr0", 10, 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if conflict == nil {
+		t.Fatal("expected conflict: untagged existing NIC must be treated as a possible match for a tagged candidate vlan")
+	}
+	if conflict.VMID != 400 {
+		t.Errorf("expected conflict from VMID 400, got %+v", conflict)
 	}
 }
 
@@ -485,7 +606,7 @@ func TestDetectIPConflict_BridgeFilterPreventsMatch(t *testing.T) {
 			return map[string]any{"name": "other-bridge", "ipconfig0": "ip=10.0.0.5/24", "net0": "virtio,bridge=vmbr1"}, nil
 		},
 	)
-	conflict, err := detectIPConflict(context.Background(), deps, []string{"10.0.0.5"}, "vmbr0", 0)
+	conflict, err := detectIPConflict(context.Background(), deps, []string{"10.0.0.5"}, "vmbr0", 0, 0)
 	if err != nil || conflict != nil {
 		t.Fatalf("bridge filter must prevent match: (%v,%v)", conflict, err)
 	}
@@ -501,7 +622,7 @@ func TestDetectIPConflict_NoBridgeFilterMatchesAll(t *testing.T) {
 			return map[string]any{"name": "any-bridge", "ipconfig0": "ip=10.0.0.5/24", "net0": "virtio,bridge=vmbr99"}, nil
 		},
 	)
-	conflict, err := detectIPConflict(context.Background(), deps, []string{"10.0.0.5"}, "", 0)
+	conflict, err := detectIPConflict(context.Background(), deps, []string{"10.0.0.5"}, "", 0, 0)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -523,7 +644,7 @@ func TestDetectIPConflict_ConfigFetchErrorSkipped(t *testing.T) {
 			return map[string]any{"name": "ok", "ipconfig0": "ip=10.0.0.20/24", "net0": "virtio,bridge=vmbr0"}, nil
 		},
 	)
-	conflict, err := detectIPConflict(context.Background(), deps, []string{"10.0.0.5"}, "vmbr0", 0)
+	conflict, err := detectIPConflict(context.Background(), deps, []string{"10.0.0.5"}, "vmbr0", 0, 0)
 	if err != nil {
 		t.Fatalf("config fetch error must not propagate: %v", err)
 	}
@@ -537,7 +658,7 @@ func TestDetectIPConflict_TransientListError(t *testing.T) {
 	deps := icDeps(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
 		return nil, sentinel
 	}, nil)
-	conflict, err := detectIPConflict(context.Background(), deps, []string{"10.0.0.5"}, "vmbr0", 0)
+	conflict, err := detectIPConflict(context.Background(), deps, []string{"10.0.0.5"}, "vmbr0", 0, 0)
 	if err == nil {
 		t.Fatal("expected error from ListResources, got nil")
 	}
@@ -555,7 +676,7 @@ func TestDetectIPConflict_MultipleTargetIPs(t *testing.T) {
 			return map[string]any{"name": "vm-700", "ipconfig0": "ip=10.0.0.10/24", "net0": "virtio,bridge=vmbr0"}, nil
 		},
 	)
-	conflict, err := detectIPConflict(context.Background(), deps, []string{"10.0.0.1", "10.0.0.10", "10.0.0.20"}, "vmbr0", 0)
+	conflict, err := detectIPConflict(context.Background(), deps, []string{"10.0.0.1", "10.0.0.10", "10.0.0.20"}, "vmbr0", 0, 0)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -576,7 +697,7 @@ func TestDetectIPConflict_SecondNICConflict(t *testing.T) {
 			}, nil
 		},
 	)
-	conflict, err := detectIPConflict(context.Background(), deps, []string{"192.168.0.5"}, "vmbr0", 0)
+	conflict, err := detectIPConflict(context.Background(), deps, []string{"192.168.0.5"}, "vmbr0", 0, 0)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -599,7 +720,7 @@ func TestDetectIPConflict_MalformedResourceRowSkipped(t *testing.T) {
 		},
 	)
 	// 10.0.0.5 != 10.0.0.50 — no conflict; malformed row silently dropped.
-	conflict, err := detectIPConflict(context.Background(), deps, []string{"10.0.0.5"}, "vmbr0", 0)
+	conflict, err := detectIPConflict(context.Background(), deps, []string{"10.0.0.5"}, "vmbr0", 0, 0)
 	if err != nil || conflict != nil {
 		t.Fatalf("malformed row must be skipped: (%v,%v)", conflict, err)
 	}
@@ -621,7 +742,7 @@ func TestDetectIPConflict_ContextCancellation(t *testing.T) {
 			return map[string]any{"ipconfig0": "ip=10.0.0.100/24"}, nil
 		},
 	)
-	_, _ = detectIPConflict(ctx, deps, []string{"10.0.0.100"}, "vmbr0", 0)
+	_, _ = detectIPConflict(ctx, deps, []string{"10.0.0.100"}, "vmbr0", 0, 0)
 }
 
 func TestDetectIPConflict_NilVMConfig(t *testing.T) {
@@ -634,7 +755,7 @@ func TestDetectIPConflict_NilVMConfig(t *testing.T) {
 			return nil, nil // nil map, no error
 		},
 	)
-	conflict, err := detectIPConflict(context.Background(), deps, []string{"10.0.0.5"}, "vmbr0", 0)
+	conflict, err := detectIPConflict(context.Background(), deps, []string{"10.0.0.5"}, "vmbr0", 0, 0)
 	if err != nil || conflict != nil {
 		t.Fatalf("nil VM config must be skipped: (%v,%v)", conflict, err)
 	}
@@ -673,7 +794,7 @@ func TestDetectIPConflict_SelfExclusion_NoConflict(t *testing.T) {
 	)
 
 	// Pass excludeVMID = newVMID — the new VM must be skipped.
-	conflict, err := detectIPConflict(context.Background(), deps, []string{targetIP}, "vmbr0", newVMID)
+	conflict, err := detectIPConflict(context.Background(), deps, []string{targetIP}, "vmbr0", 0, newVMID)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -720,7 +841,7 @@ func TestDetectIPConflict_SelfExclusion_ExternalConflictStillDetected(t *testing
 	)
 
 	// excludeVMID skips newVMID; externalVMID must still be detected.
-	conflict, err := detectIPConflict(context.Background(), deps, []string{targetIP}, "vmbr0", newVMID)
+	conflict, err := detectIPConflict(context.Background(), deps, []string{targetIP}, "vmbr0", 0, newVMID)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

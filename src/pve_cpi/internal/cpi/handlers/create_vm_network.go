@@ -21,26 +21,45 @@ import (
 	sdknodes "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/nodes"
 )
 
+// nicL2Domain identifies the (bridge, vlan) pair NICs are grouped by for the
+// IP-conflict pre-check — two NICs share an L2 domain, and can therefore
+// genuinely collide on the same IP, iff their bridge AND vlan tag are both
+// equal (absent tag == absent tag, vlan 0). Without the vlan half of this
+// tuple, a plain trunk bridge carrying several VLANs would report a false
+// conflict between two guests that legitimately reuse the same address in
+// separate L2 domains.
+type nicL2Domain struct {
+	bridge string
+	vlan   int
+}
+
 // collectStaticIPsForConflictCheck extracts the bare IP addresses from the
 // parsed network specs that carry a static (manual, non-DHCP) assignment.
 // Dynamic (type=="dynamic") and VIP networks are skipped.
 //
-// collectStaticIPsForConflictCheck groups static IPs by their bridge so that
-// the caller can call detectIPConflict once per bridge with the correct NIC
-// filter, preventing conflicts on any bridge from being silently missed.
+// collectStaticIPsForConflictCheck groups static IPs by their (bridge, vlan)
+// L2 domain so that the caller can call detectIPConflict once per domain with
+// the correct NIC filter, preventing conflicts on any domain from being
+// silently missed.
 //
-// Returns a map[bridge][]IP. The default bridge (cloud_properties.network_bridge
-// → config.NetworkBridge → "vmbr0") applies to networks that do not specify an
-// explicit bridge override. Networks of type dynamic/vip or with empty/DHCP IPs
-// are skipped. An empty map means no static IPs were found; callers must check
-// len(result) > 0 before calling detectIPConflict.
-func collectStaticIPsForConflictCheck(parsed *createVMParsedArgs, cfg *config.CPIConfig) map[string][]string {
+// Bridge and vlan are resolved via resolveNICBridgeAndVLAN — the IDENTICAL
+// precedence chain configureNICs' resolveNICAttributes uses (VM-level
+// network_defaults[key] > per-NIC spec.CloudProperties[key] > resolver
+// default) — so this pre-check can never classify a NIC onto a different
+// domain than create_vm actually attaches it to (the previous
+// implementation ignored cloud_properties.network_defaults.bridge entirely,
+// so a VM-level bridge override silently defeated the duplicate-IP guard).
+//
+// Returns a map[nicL2Domain][]IP. Networks of type dynamic/vip or with
+// empty/DHCP IPs are skipped. An empty map means no static IPs were found;
+// callers must check len(result) > 0 before calling detectIPConflict.
+func collectStaticIPsForConflictCheck(parsed *createVMParsedArgs, cfg *config.CPIConfig) map[nicL2Domain][]string {
 	// Resolve the default bridge using the same layered logic as configureNICs.
 	// Errors from an unknown vm_type selector are suppressed here: this is a
 	// pre-flight check and the main create_vm path will surface the error later.
 	defaultBridge, _, _ := resolveVMNICDefaultsWithError(cfg, parsed.cloudProps, parsed.cloudPropsMap)
 
-	result := make(map[string][]string)
+	result := make(map[nicL2Domain][]string)
 	for netName := range parsed.networks {
 		spec := parsed.networks[netName]
 		switch strings.ToLower(spec.Type) {
@@ -48,12 +67,16 @@ func collectStaticIPsForConflictCheck(parsed *createVMParsedArgs, cfg *config.CP
 			if spec.IP == "" || strings.EqualFold(spec.IP, "dhcp") {
 				continue
 			}
-			// Use per-network bridge override when present; otherwise the VM default.
-			bridge := defaultBridge
-			if b, ok := spec.CloudProperties[nicCPKeyBridge].(string); ok && b != "" {
-				bridge = b
-			}
-			result[bridge] = append(result[bridge], spec.IP)
+			// A malformed vlan value here is suppressed, not returned: this is a
+			// pre-flight check (collectStaticIPsForConflictCheck has no error
+			// return), and configureNICs — which always runs before this
+			// pre-check, see runIPConflictChecks' step ordering in create_vm.go —
+			// resolves the SAME network through resolveNICAttributes and will
+			// already have failed the create with the same malformed value
+			// before this code path is ever reached.
+			bridge, vlan, _ := resolveNICBridgeAndVLAN(parsed.cloudProps.NetworkDefaults, spec.CloudProperties, defaultBridge, netName)
+			domain := nicL2Domain{bridge: bridge, vlan: vlan}
+			result[domain] = append(result[domain], spec.IP)
 		default:
 			// dynamic, vip, "" → skip
 		}
@@ -71,16 +94,16 @@ func runIPConflictChecks(ctx context.Context, deps Deps, logger *log.Logger, par
 	}
 
 	// 5b. Static ipconfig{N} scan — DHCP/dynamic addresses are not visible here.
-	ipsByBridge := collectStaticIPsForConflictCheck(parsed, deps.Config)
-	for bridge, ips := range ipsByBridge {
+	ipsByDomain := collectStaticIPsForConflictCheck(parsed, deps.Config)
+	for domain, ips := range ipsByDomain {
 		// Pass vmid as excludeVMID so the newly created VM's own ipconfig
 		// entries are not treated as a conflict against itself.
-		conflict, conflictErr := detectIPConflict(ctx, deps, ips, bridge, vmid)
+		conflict, conflictErr := detectIPConflict(ctx, deps, ips, domain.bridge, domain.vlan, vmid)
 		if conflictErr != nil {
 			return cpierrors.Wrap(conflictErr, "create_vm: IP-conflict pre-flight")
 		}
 		if conflict != nil {
-			return IPConflictCloudError(conflict, bridge)
+			return IPConflictCloudError(conflict, domain.bridge, domain.vlan)
 		}
 	}
 
@@ -92,7 +115,7 @@ func runIPConflictChecks(ctx context.Context, deps Deps, logger *log.Logger, par
 	// unreachable agent is logged and skipped, never blocking provisioning.
 	if deps.Config.ActiveIPProbeEnabled() {
 		var allTargetIPs []string
-		for _, ips := range ipsByBridge {
+		for _, ips := range ipsByDomain {
 			allTargetIPs = append(allTargetIPs, ips...)
 		}
 		if probeErr := probeGuestAgentIPConflict(ctx, deps, logger, allTargetIPs); probeErr != nil {
@@ -195,7 +218,13 @@ func configureNICs(
 	// SDN vnets run at a reduced MTU (VXLAN encapsulation spends ~50 bytes;
 	// PVE derives e.g. 1450 on a 1500 underlay). NICs attached to a vnet get
 	// mtu=1 — "inherit the bridge MTU" — so the guest never emits an
-	// oversized frame. One vnet listing per create_vm call, fail-open.
+	// oversized frame. Membership is decided by the actual SDN vnet list in
+	// EVERY network_mode (this used to be gated on network_mode,
+	// which is a create_network/delete_network routing knob, not a NIC
+	// attribute — a NIC genuinely attached to a pre-existing SDN vnet must
+	// get mtu=1 even under network_mode: bridge). The list itself is cached
+	// (pve.CachedVnetNames, short TTL) so a plain-bridge cluster pays the
+	// cost at most once per TTL window, not once per create_vm.
 	vnetNames := sdnVnetNameSet(ctx, deps, logger, len(netNames))
 
 	// Build net map[int]string and ipconfig map[int]string for UpdateQemuConfigParams
@@ -211,32 +240,60 @@ func configureNICs(
 	for i, name := range netNames {
 		spec := parsed.networks[name]
 
-		bridge, model, nicFirewall := resolveNICAttributes(
-			deps, parsed.cloudProps.NetworkDefaults, spec.CloudProperties, defaultBridge, defaultModel)
+		attrs, attrErr := resolveNICAttributes(
+			deps, parsed.cloudProps.NetworkDefaults, spec.CloudProperties, defaultBridge, defaultModel, name)
+		if attrErr != nil {
+			return nil, attrErr
+		}
+		bridge, model, nicFirewall, vlan, mtu := attrs.bridge, attrs.model, attrs.firewall, attrs.vlan, attrs.mtu
 
 		// net0 = "virtio,bridge=vmbr0" (no MAC — PVE assigns one)
 		netMap[i] = fmt.Sprintf("%s,bridge=%s", model, bridge)
 		if nicFirewall {
 			netMap[i] += ",firewall=1"
 		}
-		// mtu=1 is a virtio-only option (PVE rejects it on e1000/rtl8139).
-		_, isVnet := vnetNames[bridge]
+		if vlan != 0 {
+			netMap[i] += fmt.Sprintf(",tag=%d", vlan)
+			// An explicit vlan tag (Pattern A) on a bridge that is itself an SDN
+			// vnet (Pattern B) mixes the two documented alternatives — the vnet
+			// may already encode a VLAN of its own. Warn rather than fail: PVE
+			// is the authority on whether the combination is actually invalid,
+			// and will reject the config outright when it is.
+			if _, onVnet := vnetNames[bridge]; onVnet {
+				logger.Warn("create_vm: network sets an explicit vlan tag on a bridge that is itself an SDN vnet (mixing per-NIC VLAN tagging with an SDN vnet-per-VLAN pattern)",
+					log.String("network", name),
+					log.String("bridge", bridge),
+					log.Int("vlan", vlan),
+				)
+			}
+		}
+		// mtu is a virtio-only option (PVE rejects it on e1000/rtl8139) —
+		// resolveNICAttributes already validated that above for an explicit
+		// per-NIC/network_defaults value. An explicit mtu always wins over
+		// the automatic vnet-derived mtu=1 inheritance below — never emit
+		// both mtu= segments.
 		switch {
-		case isVnet && strings.HasPrefix(model, "virtio"):
-			netMap[i] += ",mtu=1"
-		case isVnet:
-			// Non-virtio model on an SDN vnet: the guest cannot inherit the
-			// vnet's (typically reduced, VXLAN-encapsulated) MTU the way a
-			// virtio NIC does, and stays at the PVE default of 1500. That
-			// mismatch is the "small packets pass, large packets hang"
-			// blackhole — see docs/troubleshooting.md's "Small packets pass,
-			// large packets hang (SDN MTU)" entry. Warn at create time rather
-			// than leaving the operator to discover it via a hung transfer.
-			logger.Warn("create_vm: non-virtio NIC model on an SDN vnet will not auto-track the vnet MTU",
-				log.String("network", name),
-				log.String("model", model),
-				log.String("vnet", bridge),
-			)
+		case mtu != 0:
+			netMap[i] += fmt.Sprintf(",mtu=%d", mtu)
+		default:
+			_, isVnet := vnetNames[bridge]
+			switch {
+			case isVnet && strings.HasPrefix(model, "virtio"):
+				netMap[i] += ",mtu=1"
+			case isVnet:
+				// Non-virtio model on an SDN vnet: the guest cannot inherit the
+				// vnet's (typically reduced, VXLAN-encapsulated) MTU the way a
+				// virtio NIC does, and stays at the PVE default of 1500. That
+				// mismatch is the "small packets pass, large packets hang"
+				// blackhole — see docs/troubleshooting.md's "Small packets pass,
+				// large packets hang (SDN MTU)" entry. Warn at create time rather
+				// than leaving the operator to discover it via a hung transfer.
+				logger.Warn("create_vm: non-virtio NIC model on an SDN vnet will not auto-track the vnet MTU",
+					log.String("network", name),
+					log.String("model", model),
+					log.String("vnet", bridge),
+				)
+			}
 		}
 		if bridge != "" {
 			bridgeSet[bridge] = struct{}{}
@@ -307,58 +364,123 @@ func configureNICs(
 
 // sdnVnetNameSet returns the set of SDN vnet names currently defined
 // (pending included) so configureNICs can hand vnet-attached virtio NICs
-// mtu=1 (inherit the bridge MTU). Deliberately FAIL-OPEN: any listing
-// failure returns an empty set and the VM creates without the mtu option —
-// a guest at the underlay MTU on an external bridge is unaffected, and a
-// guest on a vnet degrades to the pre-existing behavior rather than
-// blocking create_vm. Skipped entirely (nil, no API call) unless the CPI is
-// in an SDN-capable mode ("sdn"/"auto") and the VM has NICs.
+// mtu=1 (inherit the bridge MTU) and decide vlan/tag membership. Deliberately
+// FAIL-OPEN: any listing failure returns an empty set and the VM creates
+// without the mtu option — a guest at the underlay MTU on an external bridge
+// is unaffected, and a guest on a vnet degrades to the pre-existing behavior
+// rather than blocking create_vm. Membership is decided by the actual vnet
+// list in EVERY network_mode (see the call site's comment); the
+// list itself comes from pve.CachedVnetNames, a short-TTL process-wide cache
+// shared with the consume-side bridge-resolve gate, so this is skipped
+// entirely (nil, no API call) only when the VM has no NICs at all.
 func sdnVnetNameSet(ctx context.Context, deps Deps, logger *log.Logger, nicCount int) map[string]struct{} {
-	mode := deps.Config.NetworkMode
-	if nicCount == 0 || (mode != networkModeSDN && mode != config.NetworkModeAuto) {
+	if nicCount == 0 {
 		return nil
 	}
-	vnets, err := pve.ListSDNVnets(ctx, deps.PVE)
+	set, err := pve.CachedVnetNames(ctx, deps.PVE)
 	if err != nil {
-		logger.Debug("create_vm: SDN vnet listing failed; NICs get no mtu inheritance",
+		logger.Debug("create_vm: SDN vnet listing failed; NICs get no mtu inheritance and vlan/tag membership is treated as not-a-vnet",
 			log.Err(err))
 		return nil
-	}
-	set := make(map[string]struct{}, len(vnets))
-	for _, v := range vnets {
-		set[v.Vnet] = struct{}{}
 	}
 	return set
 }
 
-// resolveNICAttributes computes the effective bridge, model, and per-NIC
-// firewall flag for one NIC. Precedence (highest first):
+// resolveNICBridgeAndVLAN computes the effective bridge and VLAN tag for one
+// NIC using precedence (highest first): VM-level network_defaults[key] >
+// per-NIC spec cloud_properties[key] > the resolver default bridge (vlan has
+// no resolver-default source; absent anywhere resolves to 0 — untagged).
 //
-//	VM-level network_defaults[key] (§7.34)
-//	  > per-NIC spec cloud_properties[key]
-//	  > resolver default (struct field / profile / config / const)
+// Extracted as its own function, rather than duplicated inline, so
+// collectStaticIPsForConflictCheck (the IP-conflict pre-check, which must
+// classify NICs into the exact same L2 domains create_vm actually attaches
+// them to) and resolveNICAttributes (the real NIC-assembly path) can never
+// drift apart — bugs N1 (network_defaults.bridge invisible to the
+// pre-check) and N3 (pre-check VLAN-blind) both stem from that kind of
+// duplication.
 //
-// Supported keys: bridge, model, firewall. Unknown keys are silently ignored —
-// cloud_properties are loosely typed. The firewall flag here only selects the
-// NIC's firewall=1 bit; the VM-level firewall must also be enabled for filtering
-// to take effect (see applySecurityGroups).
-func resolveNICAttributes(
-	deps Deps, netDefaults, nicCP map[string]any, defaultBridge, defaultModel string,
-) (bridge, model string, firewall bool) {
+// Returns a non-retriable CloudError, naming nicName and the offending
+// cloud_properties key, when a vlan key is PRESENT but not integer-shaped
+// (coerceInt fails) — e.g. null, a bool, or an array. Silently treating an
+// unparseable vlan as "absent" would attach the NIC untagged (vlan 0, the
+// bridge's native/management VLAN) with no indication anything was wrong.
+func resolveNICBridgeAndVLAN(netDefaults, nicCP map[string]any, defaultBridge, nicName string) (bridge string, vlan int, err error) {
 	bridge = defaultBridge
-	if cp, ok := nicCP[nicCPKeyBridge].(string); ok && cp != "" {
-		bridge = cp
+	if v, ok := nicCP[nicCPKeyBridge].(string); ok && v != "" {
+		bridge = v
 	}
-	model = defaultModel
-	if cp, ok := nicCP[nicCPKeyModel].(string); ok && cp != "" {
-		model = cp
-	}
-	firewall = deps.Config.VMFirewallEnabled()
-	if cp, ok := nicCP[nicCPKeyFirewall].(bool); ok {
-		firewall = cp
+	if v, ok := nicCP[nicCPKeyVLAN]; ok {
+		n, ok2 := coerceInt(v)
+		if !ok2 {
+			return "", 0, cpierrors.Cloud(
+				"create_vm: network %q cloud_properties.%s must be an integer, got %v (%T)",
+				nicName, nicCPKeyVLAN, v, v)
+		}
+		vlan = n
 	}
 	if v, ok := netDefaults[nicCPKeyBridge].(string); ok && v != "" {
 		bridge = v
+	}
+	if v, ok := netDefaults[nicCPKeyVLAN]; ok {
+		n, ok2 := coerceInt(v)
+		if !ok2 {
+			return "", 0, cpierrors.Cloud(
+				"create_vm: network %q cloud_properties.network_defaults.%s must be an integer, got %v (%T)",
+				nicName, nicCPKeyVLAN, v, v)
+		}
+		vlan = n
+	}
+	return bridge, vlan, nil
+}
+
+// resolveNICAttributes computes the effective bridge, model, per-NIC firewall
+// flag, VLAN tag, and explicit MTU for one NIC. Precedence for every key
+// (highest first):
+//
+//	VM-level network_defaults[key] (§7.34)
+//	  > per-NIC spec cloud_properties[key]
+//	  > resolver default (bridge/model only — struct field / profile /
+//	    config / const; vlan/mtu have no resolver-default source, absent
+//	    anywhere resolves to 0 — untagged / no explicit MTU)
+//
+// Supported keys: bridge, model, firewall, vlan, mtu. Unknown keys are
+// silently ignored — cloud_properties are loosely typed. The firewall flag
+// here only selects the NIC's firewall=1 bit; the VM-level firewall must
+// also be enabled for filtering to take effect (see applySecurityGroups).
+//
+// Returns a non-retriable CloudError, naming nicName, when:
+//   - vlan is present and not integer-shaped (via resolveNICBridgeAndVLAN).
+//   - vlan is present and outside 1..4094 (the 802.1Q VLAN ID space).
+//   - mtu is present and not integer-shaped.
+//   - mtu is present and is neither exactly 1 (inherit) nor within 576..65520.
+//   - mtu is present and the effective model is not virtio-prefixed — PVE
+//     rejects the mtu option on e1000/rtl8139/etc.
+//
+// nicAttributes groups the resolved fields so resolveNICAttributes stays
+// within the project's max-results limit; see the doc comment there.
+type nicAttributes struct {
+	bridge   string
+	model    string
+	firewall bool
+	vlan     int
+	mtu      int
+}
+
+func resolveNICAttributes(
+	deps Deps, netDefaults, nicCP map[string]any, defaultBridge, defaultModel, nicName string,
+) (nicAttributes, error) {
+	bridge, vlan, err := resolveNICBridgeAndVLAN(netDefaults, nicCP, defaultBridge, nicName)
+	if err != nil {
+		return nicAttributes{}, err
+	}
+
+	model := defaultModel
+	if cp, ok := nicCP[nicCPKeyModel].(string); ok && cp != "" {
+		model = cp
+	}
+	firewall := deps.Config.VMFirewallEnabled()
+	if cp, ok := nicCP[nicCPKeyFirewall].(bool); ok {
+		firewall = cp
 	}
 	if v, ok := netDefaults[nicCPKeyModel].(string); ok && v != "" {
 		model = v
@@ -366,7 +488,43 @@ func resolveNICAttributes(
 	if v, ok := netDefaults[nicCPKeyFirewall].(bool); ok {
 		firewall = v
 	}
-	return bridge, model, firewall
+
+	mtu := 0
+	if v, ok := nicCP[nicCPKeyMTU]; ok {
+		n, ok2 := coerceInt(v)
+		if !ok2 {
+			return nicAttributes{}, cpierrors.Cloud(
+				"create_vm: network %q cloud_properties.%s must be an integer, got %v (%T)",
+				nicName, nicCPKeyMTU, v, v)
+		}
+		mtu = n
+	}
+	if v, ok := netDefaults[nicCPKeyMTU]; ok {
+		n, ok2 := coerceInt(v)
+		if !ok2 {
+			return nicAttributes{}, cpierrors.Cloud(
+				"create_vm: network %q cloud_properties.network_defaults.%s must be an integer, got %v (%T)",
+				nicName, nicCPKeyMTU, v, v)
+		}
+		mtu = n
+	}
+
+	if vlan != 0 && (vlan < 1 || vlan > vlanMaxTag) {
+		return nicAttributes{}, cpierrors.Cloud(
+			"create_vm: network %q vlan tag must be within 1..%d, got %d", nicName, vlanMaxTag, vlan)
+	}
+	if mtu != 0 && mtu != 1 && (mtu < 576 || mtu > 65520) {
+		return nicAttributes{}, cpierrors.Cloud(
+			"create_vm: network %q mtu must be 1 (inherit bridge MTU) or within 576..65520, got %d",
+			nicName, mtu)
+	}
+	if mtu != 0 && !strings.HasPrefix(model, "virtio") {
+		return nicAttributes{}, cpierrors.Cloud(
+			"create_vm: network %q mtu is only valid on a virtio NIC model, got model %q",
+			nicName, model)
+	}
+
+	return nicAttributes{bridge: bridge, model: model, firewall: firewall, vlan: vlan, mtu: mtu}, nil
 }
 
 // resolveNICBridges is the consume-side SDN eventual-consistency gate. When

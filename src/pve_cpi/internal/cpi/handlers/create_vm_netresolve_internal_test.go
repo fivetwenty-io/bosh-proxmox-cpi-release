@@ -25,6 +25,14 @@ func nrParsed(bridge string) *createVMParsedArgs {
 	}
 }
 
+// TestConfigureNICs_GateOff_NoResolveCalls verifies that disabling the
+// consume-side bridge-resolve gate (NetworkResolveRetries=0) makes zero
+// node-network polls. It does NOT disable the separate SDN vnet-membership
+// listing that decides mtu=1 inheritance and vlan/tag membership — that
+// listing runs whenever the VM has NICs, in every mode and regardless of
+// this gate (see TestConfigureNICs_MTU_BridgeMode_* for the
+// membership behavior itself), so exactly one ListSdnVnets call is expected
+// here.
 func TestConfigureNICs_GateOff_NoResolveCalls(t *testing.T) {
 	cfg := icMinConfig()
 	cfg.NetworkResolveRetries = nrIntPtr(0) // explicit 0: gate off (Phase 1 opt-out)
@@ -36,9 +44,12 @@ func TestConfigureNICs_GateOff_NoResolveCalls(t *testing.T) {
 	if _, err := configureNICs(context.Background(), deps, log.NewNopLogger(), nrParsed("v1"), shape, 100); err != nil {
 		t.Fatalf("configureNICs: %v", err)
 	}
-	if cl.listSdnVnetsCall != 0 || nd.listNetCalls != 0 {
-		t.Errorf("gate off must make no resolve calls; got listSdnVnets=%d listNetwork=%d",
-			cl.listSdnVnetsCall, nd.listNetCalls)
+	if cl.listSdnVnetsCall != 1 {
+		t.Errorf("vnet-membership listing must still run once (mtu/vlan, decoupled from this gate); got %d calls",
+			cl.listSdnVnetsCall)
+	}
+	if nd.listNetCalls != 0 {
+		t.Errorf("gate off must make no node-network resolve calls; got %d", nd.listNetCalls)
 	}
 	if nd.lastNet == nil {
 		t.Error("UpdateQemuConfig must still run when the gate is off")
