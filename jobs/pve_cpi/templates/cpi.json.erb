@@ -11,6 +11,7 @@
     "iso_storage"      => p("pve.iso_storage"),
     "network_bridge"         => p("pve.network_bridge"),
     "network_mode"           => p("pve.network_mode"),
+    "stemcell_strategy"      => p("pve.stemcell_strategy"),
     "sdn_zone"               => p("pve.sdn_zone"),
     "sdn_zone_type"          => p("pve.sdn_zone_type"),
     "sdn_auto_manage_zone"   => p("pve.sdn_auto_manage_zone"),
@@ -184,6 +185,14 @@
   # defaults to no reaping (pools accumulate) when the key is omitted.
   if p("pve.pool_reap_empty", false)
     config["pool_reap_empty"] = true
+  end
+
+  # Emit destroy_unreferenced_disks only when the operator opts in. The Go
+  # config defaults to false (safe on shared storage) when the key is
+  # omitted -- see the property description for the cross-cluster hazard
+  # this flag introduces when enabled.
+  if p("pve.destroy_unreferenced_disks", false)
+    config["destroy_unreferenced_disks"] = true
   end
 
   # Emit stemcell_template_node only when the operator supplies a non-empty value.
@@ -767,13 +776,11 @@
 
   # Emit stemcell only when the operator sets at least one sub-field.
   # When all sub-fields are unset the block is omitted entirely so the Go config
-  # zero-value (nil *StemcellConfig) is preserved — byte-identical to prior
-  # releases. Bool fields use if_p (no default in spec → nil when unset).
-  # director_id uses p(..., "") with unless-empty guard.
+  # zero-value (nil *StemcellProvenanceConfig) is preserved. Provenance itself
+  # is unconditional (no knob) and director identity comes from the request
+  # context, so only the prune knobs remain. Bool fields use if_p (no default
+  # in spec → nil when unset).
   stemcell = {}
-  if_p("pve.stemcell.provenance")    { |v| stemcell["provenance"]    = v }
-  sc_dir_id = p("pve.stemcell.director_id", "")
-  stemcell["director_id"] = sc_dir_id unless sc_dir_id.to_s.empty?
   if_p("pve.stemcell.prune_orphans") { |v| stemcell["prune_orphans"] = v }
   if_p("pve.stemcell.prune_dry_run") { |v| stemcell["prune_dry_run"] = v }
   config["stemcell"] = stemcell unless stemcell.empty?
@@ -799,12 +806,14 @@
     config["require_shared_iso_for_ha"] = true
   end
 
-  # Emit iso_storage_follow_vm_storage only when explicitly true. The Go
-  # accessor defaults nil *bool -> false (disabled, iso_storage unchanged);
-  # omitting the key preserves that default.
-  if p("pve.iso_storage_follow_vm_storage", false)
-    config["iso_storage_follow_vm_storage"] = true
-  end
+  # Emit iso_storage_follow_vm_storage only when the operator explicitly sets
+  # it (true or false). The spec has no default (default: ~), so if_p only
+  # fires on an explicit manifest value -- this preserves the Go accessor's
+  # tri-state: key absent -> nil -> effective default true (ISO follows
+  # vm_storage); explicit false -> disabled, iso_storage used as configured;
+  # explicit true -> enabled (byte-identical to the default, stated for
+  # operator clarity).
+  if_p("pve.iso_storage_follow_vm_storage") { |v| config["iso_storage_follow_vm_storage"] = v }
 
   JSON.dump(config)
 %>

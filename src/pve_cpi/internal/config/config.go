@@ -80,12 +80,19 @@ type CPIConfig struct {
 	// cannot distinguish "unset" from "explicitly local" any other way. As a
 	// result this flag treats ISOStorage=="local" (the literal spec default) as
 	// the "unset" sentinel: an operator who explicitly types iso_storage: local
-	// while also enabling this flag gets VMStorage-following behavior instead
-	// of a literal local pool. Set iso_storage to any other value to pin a
-	// literal pool that this flag will never override. When VMStorage lacks
-	// `iso` content, is not shared, or cannot be resolved, the CPI falls back
-	// to ISOStorage unchanged and logs a Warn (fail-open). Default false (nil →
-	// disabled, byte-identical to prior releases). Use
+	// while this flag is active (its default state) gets VMStorage-following
+	// behavior instead of a literal local pool. Set iso_storage to any other
+	// value to pin a literal pool that this flag will never override. When
+	// VMStorage lacks `iso` content, is not shared, or cannot be resolved, the
+	// CPI falls back to ISOStorage unchanged and logs a Warn (fail-open).
+	//
+	// Default TRUE (nil → true): a zero-config deployment now lands the
+	// ConfigDrive ISO on the same (typically shared) pool as the VM's disks
+	// instead of the historically node-local "local" default, so HA/DLB/
+	// migration are not silently defeated by an unshared ISO pool out of the
+	// box. Explicit *false restores the pre-P5 behavior (ISOStorage always
+	// used as configured). Pointer-typed tri-state so JSON absence (nil, →
+	// true) is distinguishable from an explicit *false. Use
 	// ISOStorageFollowVMStorageEnabled() for the effective bool.
 	ISOStorageFollowVMStorage *bool `json:"iso_storage_follow_vm_storage,omitempty"`
 
@@ -97,7 +104,8 @@ type CPIConfig struct {
 	// "bridge" — Linux bridge lifecycle via nodes API.
 	// "auto" — use SDN if cloud_properties.zone or config SDNZone is set;
 	//           fall back to bridge otherwise (legacy heuristic, opt-in).
-	// Defaults to "sdn".
+	// Defaults to "bridge" (simple-first: plain Linux bridges need no SDN
+	// stack; SDN is a one-line opt-in).
 	NetworkMode string `json:"network_mode,omitempty"`
 
 	// SDNZone is the default PVE SDN zone name for vnet creation. Operators may
@@ -426,6 +434,40 @@ type CPIConfig struct {
 	// validate-only-when-set; omit from ERB when empty.
 	VMPoolTemplate string `json:"vm_pool_template,omitempty"`
 
+	// DestroyUnreferencedDisks opts in to passing DestroyUnreferencedDisks=true
+	// to PVE's DeleteQemu on every non-retain delete_vm (sync path, fast path,
+	// and the fast-path straggler sweep). PVE's own semantics: "free every
+	// volume that (a) is not referenced in the destroyed VM's config AND (b)
+	// has a VMID matching the VM being destroyed" — a storage-wide scan by
+	// VMID, not a config-scoped one.
+	//
+	// Default FALSE. On storage dedicated to a single PVE cluster this is
+	// safe and desirable: it sweeps up orphaned own-VMID volumes (e.g. a
+	// disk left behind by an interrupted create) that the config-scoped
+	// guards (guardUnusedVolumes, detachForeignActiveDisks) never touch,
+	// because those only see volumes CURRENTLY referenced by this VM's
+	// config. It is UNSAFE the moment storage is shared with a second,
+	// independent PVE cluster (a second BOSH-Proxmox AZ pointed at the same
+	// NFS/dir export, same storage ID): the destroyed VM's VMID band can
+	// overlap the other cluster's VMID band (see WithStorageScan's doc
+	// comment for the allocation-time half of this hazard), and this flag
+	// would free the OTHER cluster's live disks — they are unreferenced from
+	// THIS cluster's view and share the VMID by construction. Nothing in the
+	// delete path can distinguish "orphaned by this cluster" from "owned by
+	// another cluster sharing storage": both look identical (unreferenced,
+	// matching VMID) from here.
+	//
+	// Enable only when the configured pve.vm_storage/disk_storage/iso_storage
+	// pools are NOT shared with any other independent PVE cluster or non-CPI
+	// tooling that allocates VMIDs in the same range. On shared storage,
+	// leave this false and rely on disjoint per-CPI VMID banding instead
+	// (see docs/multi-cluster.md, a later phase) — orphaned own-cluster
+	// volumes accumulate and are visible to scripts/disk-audit rather than
+	// being swept automatically.
+	//
+	// No validation; any bool value is accepted. omit from ERB when false.
+	DestroyUnreferencedDisks bool `json:"destroy_unreferenced_disks,omitempty"`
+
 	// PoolReapEmpty opts in to an empty-pool reaper at delete_vm: when the
 	// destroyed VM's pool membership (captured before destroy) is a
 	// CPI-managed pool (provenance comment "managed by bosh-pve-cpi") that
@@ -458,6 +500,16 @@ type CPIConfig struct {
 	// operator into the replication strategy as an alternative to shared storage.
 	// validate-only-when-set; omit from ERB when false.
 	StemcellReplicateLocal bool `json:"stemcell_replicate_local,omitempty"`
+
+	// StemcellStrategy selects how create_vm materializes a VM root disk from
+	// a stemcell CID.
+	// "template" — clone the per-cluster cache template (CoW-fast; the cache
+	//              is built eagerly by create_stemcell and rebuilt on demand).
+	// "import"   — import-from the stemcell qcow2 directly (full copy per VM;
+	//              slower but template-independent).
+	// Per-VM cloud_properties.stemcell_strategy overrides this global.
+	// Defaults to "template".
+	StemcellStrategy string `json:"stemcell_strategy,omitempty"`
 
 	// ReplicaAdoptTimeoutSec bounds the adopt-and-wait on a racing concurrent
 	// template-replica clone. When two CPI invocations independently decide a node
@@ -976,24 +1028,16 @@ type DiskPerformanceDefaults struct {
 	AIO string `json:"aio,omitempty"`
 }
 
-// StemcellProvenanceConfig holds optional stemcell provenance tracking and
-// orphan-pruning knobs. All fields are optional; a nil block (default) emits
-// nothing and preserves byte-identical behavior. Accessors on *CPIConfig handle
-// nil blocks safely so callers never dereference this pointer directly.
+// StemcellProvenanceConfig holds optional stemcell orphan-pruning knobs.
+// Provenance itself is no longer a knob: every stemcell template is stamped
+// unconditionally with tags and notes JSON (name/version/sha256/kind/cid/
+// director refs), and director identity comes from the JSON-RPC request
+// context (Deps.RequestDirectorUUID), not config. All fields are optional; a
+// nil block (default) emits nothing. Accessors on *CPIConfig handle nil
+// blocks safely so callers never dereference this pointer directly.
 type StemcellProvenanceConfig struct {
-	// Provenance enables tagging stemcell templates with BOSH director metadata
-	// so provenance can be verified at upload and delete time. Default false
-	// (nil or absent → false via StemcellProvenanceEnabled accessor).
-	Provenance *bool `json:"provenance,omitempty"`
-
-	// DirectorID is an optional human-readable identifier for the BOSH director
-	// that owns the stemcell templates. Used in provenance tags when Provenance
-	// is enabled. Empty string is valid (feature off). Must contain at least one
-	// alphanumeric or hyphen character when non-empty.
-	DirectorID string `json:"director_id,omitempty"`
-
-	// PruneOrphans enables pruning of stemcell templates whose associated
-	// director is no longer active. Requires Provenance=true to be meaningful.
+	// PruneOrphans enables pruning of stemcell templates tagged by the
+	// requesting director that no longer have a referencing linked clone.
 	// Default false (nil or absent → false via StemcellOrphanPruneEnabled accessor).
 	PruneOrphans *bool `json:"prune_orphans,omitempty"`
 
@@ -1922,10 +1966,23 @@ func (c *CPIConfig) ApplyDefaults() {
 		c.CloneMode = CloneModeAuto
 	}
 	if c.NetworkMode == "" {
-		c.NetworkMode = NetworkModeSDN
+		// Simple-first default: a plain pre-existing Linux bridge
+		// (managed: false, cloud_properties.bridge) needs zero SDN
+		// prerequisites and zero CPI-side provisioning, so it is the
+		// right zero-config behavior for the common shared-storage,
+		// operator-managed-fabric deployment. SDN remains fully
+		// supported as a one-line opt-in (network_mode: sdn) or per
+		// network (cloud_properties naming a zone or vnet).
+		c.NetworkMode = NetworkModeBridge
 	}
 	if c.SDNZoneType == "" {
 		c.SDNZoneType = "vxlan"
+	}
+	if c.StemcellStrategy == "" {
+		// Clone-from-cache is the fast path: the per-cluster cache template is
+		// built once at upload time, so every create_vm pays seconds (CoW
+		// clone) instead of a full qcow2 import.
+		c.StemcellStrategy = StemcellStrategyTemplate
 	}
 	// VNI auto-allocation band. Filled unconditionally (unlike the parker band)
 	// because the band is always meaningful once a tagged zone type is in play.
@@ -2832,11 +2889,18 @@ func (c *CPIConfig) RequireSharedISOForHAEnabled() bool {
 }
 
 // ISOStorageFollowVMStorageEnabled returns the effective
-// iso_storage_follow_vm_storage setting. nil (field absent from JSON) → false
-// (disabled, byte-identical to prior releases). *false → false; *true → true.
+// iso_storage_follow_vm_storage setting. nil (field absent from JSON) → TRUE
+// (the P5 default: ISO follows vm_storage when eligible). *false → false
+// (opt-out, pre-P5 behavior); *true → true (explicit, same as default).
 // See the ISOStorageFollowVMStorage field doc for the resolution algorithm.
 func (c *CPIConfig) ISOStorageFollowVMStorageEnabled() bool {
-	return c != nil && c.ISOStorageFollowVMStorage != nil && *c.ISOStorageFollowVMStorage
+	if c == nil {
+		return false
+	}
+	if c.ISOStorageFollowVMStorage == nil {
+		return true
+	}
+	return *c.ISOStorageFollowVMStorage
 }
 
 // HooksValue returns the configured hook names in order, or nil when none are
@@ -3157,16 +3221,6 @@ func (c *CPIConfig) OperationTimeoutDefaultSec() int {
 	return c.OperationTimeout.DefaultSec
 }
 
-// StemcellProvenanceEnabled reports whether stemcell provenance tracking is
-// active. Returns false when the block is nil, Provenance is nil, or Provenance
-// is *false. Only an explicit *true returns true.
-func (c *CPIConfig) StemcellProvenanceEnabled() bool {
-	if c == nil || c.Stemcell == nil || c.Stemcell.Provenance == nil {
-		return false
-	}
-	return *c.Stemcell.Provenance
-}
-
 // StemcellOrphanPruneEnabled reports whether stemcell orphan pruning is active.
 // Returns false when the block is nil, PruneOrphans is nil, or PruneOrphans is
 // *false. Only an explicit *true returns true.
@@ -3185,15 +3239,6 @@ func (c *CPIConfig) StemcellOrphanPruneDryRun() bool {
 		return false
 	}
 	return *c.Stemcell.PruneDryRun
-}
-
-// StemcellDirectorID returns the configured director identifier for provenance
-// tagging. Returns empty string when the block is nil or DirectorID is unset.
-func (c *CPIConfig) StemcellDirectorID() string {
-	if c == nil || c.Stemcell == nil {
-		return ""
-	}
-	return c.Stemcell.DirectorID
 }
 
 // MaxInflightPerNodeLimit returns the configured per-node in-flight cap.
@@ -3267,7 +3312,6 @@ func (c *CPIConfig) ValidateWithLogger(_ *log.Logger) error {
 	c.validateOTel(&errs)
 	c.validateStorageTiers(&errs)
 	c.validateDiskPerformance(&errs)
-	c.validateStemcell(&errs)
 	c.validateVMPool(&errs)
 	c.validateStemcellTemplatePool(&errs)
 	c.validateVMPoolTemplate(&errs)
@@ -3315,82 +3359,22 @@ func (c *CPIConfig) validateAuth(errs *[]string) {
 // network_mode, sdn_zone_type (conditional on network_mode), reboot_mode,
 // stemcell_staging_dir path constraints, and the pve_ca_cert PEM check.
 func (c *CPIConfig) validateEnumFields(errs *[]string) {
-	// AgentMode enum.
-	switch c.AgentMode {
-	case AgentModeCloudInit, AgentModeNoAgent, AgentModeAuto:
-		// valid
-	case "registry":
-		*errs = append(*errs, `agent_mode "registry" is no longer supported (the BOSH registry was deprecated upstream); set agent_mode to "cloudinit"`)
-	default:
-		*errs = append(*errs, fmt.Sprintf(
-			"agent_mode must be one of cloudinit|noagent|auto, got %q", c.AgentMode,
-		))
-	}
+	c.validateAgentModeEnum(errs)
+	c.validateVMDiskFormatEnum(errs)
+	c.validateLogLevelEnum(errs)
+	c.validateRebootModeEnum(errs)
 
-	// VMDiskFormat enum.
-	switch c.VMDiskFormat {
-	case "qcow2", "raw", "vmdk":
-		// valid
-	default:
-		*errs = append(*errs, fmt.Sprintf(
-			"vm_disk_format must be one of qcow2|raw|vmdk, got %q", c.VMDiskFormat,
-		))
-	}
-
-	// LogLevel enum.
-	switch c.LogLevel {
-	case "debug", "info", "warn", "error":
-		// valid
-	default:
-		*errs = append(*errs, fmt.Sprintf(
-			"log_level must be one of debug|info|warn|error, got %q", c.LogLevel,
-		))
-	}
-
-	// RebootMode enum.
-	switch c.RebootMode {
-	case "soft", "hard":
-		// valid
-	default:
-		*errs = append(*errs, fmt.Sprintf(
-			`reboot_mode must be one of soft|hard, got %q`, c.RebootMode,
-		))
-	}
-
-	// NetworkMode enum.
-	switch c.NetworkMode {
-	case NetworkModeSDN, NetworkModeBridge, NetworkModeAuto:
-		// valid
-	default:
-		*errs = append(*errs, fmt.Sprintf(
-			"network_mode must be one of sdn|bridge|auto, got %q", c.NetworkMode,
-		))
-	}
-
-	// SDNZoneType enum — only validated when the SDN path is reachable.
-	if c.NetworkMode == NetworkModeSDN || c.NetworkMode == NetworkModeAuto {
-		switch c.SDNZoneType {
-		case "simple", "vlan", "qinq", "vxlan", "evpn":
-			// valid
-		default:
-			*errs = append(*errs, fmt.Sprintf(
-				"sdn_zone_type must be one of simple|vlan|qinq|vxlan|evpn, got %q", c.SDNZoneType,
-			))
-		}
-	}
+	// NetworkMode enum, plus the SDNZoneType enum which is only validated
+	// when the SDN path is reachable.
+	c.validateNetworkModeAndZoneEnum(errs)
 
 	// CloneMode enum: validate only when non-empty (ApplyDefaults sets "auto" when absent;
 	// "auto" and "linked" and "full" are the only valid values).
-	if c.CloneMode != "" {
-		switch c.CloneMode {
-		case CloneModeAuto, CloneModeLinked, CloneModeFull:
-			// valid
-		default:
-			*errs = append(*errs, fmt.Sprintf(
-				"clone_mode must be one of auto|linked|full, got %q", c.CloneMode,
-			))
-		}
-	}
+	c.validateCloneModeEnum(errs)
+
+	// StemcellStrategy enum: validate only when non-empty (ApplyDefaults sets
+	// "template" when absent).
+	c.validateStemcellStrategyEnum(errs)
 
 	// Balloon: validate only when non-empty.
 	c.validateBalloon(errs)
@@ -3405,42 +3389,204 @@ func (c *CPIConfig) validateEnumFields(errs *[]string) {
 	c.validateDetachedDiskStrategyEnum(errs)
 
 	// DiskPerfInvariantMode enum: validate only when non-empty.
-	if c.DiskPerfInvariantMode != "" {
-		switch strings.ToLower(strings.TrimSpace(c.DiskPerfInvariantMode)) {
-		case "enforce", "warn", enumValueOff:
+	c.validateDiskPerfInvariantModeEnum(errs)
+
+	// ReplicaAdoptTimeoutSec: 0 disables the adopt path; negative is invalid.
+	c.validateReplicaAdoptTimeoutSecField(errs)
+
+	// ClusterLock mode enum: validate only when non-empty.
+	c.validateClusterLockModeEnum(errs)
+
+	// RootDiskBus enum: validate only when non-empty.
+	c.validateRootDiskBusEnum(errs)
+
+	// ClusterLockTimeoutSec, NetworkResolveRetries, NetworkResolveTimeoutSec,
+	// and EphemeralDiskMinRatio: independent "must be >= 0" numeric bounds.
+	c.validateNetworkTimingFields(errs)
+
+	// EphemeralDiskMinMode enum: validate only when non-empty.
+	c.validateEphemeralDiskMinModeEnum(errs)
+
+	// StemcellStagingDir: when set, must be an absolute path to an existing directory.
+	c.validateStemcellStagingDirField(errs)
+
+	// ResizeConvergenceTimeoutSec: negative is invalid (0 → default). An overly
+	// long budget is allowed (operator's choice); only nonsense is rejected.
+	c.validateResizeConvergenceTimeoutSecField(errs)
+
+	// PVECACertPEM: when non-empty AND verify_ssl=true, the PEM must parse to at
+	// least one valid certificate.
+	c.validatePVECACertPEMField(errs)
+}
+
+// validateAgentModeEnum appends an error when agent_mode is not one of
+// cloudinit|noagent|auto. The removed "registry" value gets a dedicated
+// message pointing at cloudinit since the BOSH registry was deprecated
+// upstream.
+func (c *CPIConfig) validateAgentModeEnum(errs *[]string) {
+	switch c.AgentMode {
+	case AgentModeCloudInit, AgentModeNoAgent, AgentModeAuto:
+		// valid
+	case "registry":
+		*errs = append(*errs, `agent_mode "registry" is no longer supported (the BOSH registry was deprecated upstream); set agent_mode to "cloudinit"`)
+	default:
+		*errs = append(*errs, fmt.Sprintf(
+			"agent_mode must be one of cloudinit|noagent|auto, got %q", c.AgentMode,
+		))
+	}
+}
+
+// validateVMDiskFormatEnum appends an error when vm_disk_format is not one
+// of qcow2|raw|vmdk.
+func (c *CPIConfig) validateVMDiskFormatEnum(errs *[]string) {
+	switch c.VMDiskFormat {
+	case "qcow2", "raw", "vmdk":
+		// valid
+	default:
+		*errs = append(*errs, fmt.Sprintf(
+			"vm_disk_format must be one of qcow2|raw|vmdk, got %q", c.VMDiskFormat,
+		))
+	}
+}
+
+// validateLogLevelEnum appends an error when log_level is not one of
+// debug|info|warn|error.
+func (c *CPIConfig) validateLogLevelEnum(errs *[]string) {
+	switch c.LogLevel {
+	case "debug", "info", "warn", "error":
+		// valid
+	default:
+		*errs = append(*errs, fmt.Sprintf(
+			"log_level must be one of debug|info|warn|error, got %q", c.LogLevel,
+		))
+	}
+}
+
+// validateRebootModeEnum appends an error when reboot_mode is not one of
+// soft|hard.
+func (c *CPIConfig) validateRebootModeEnum(errs *[]string) {
+	switch c.RebootMode {
+	case "soft", "hard":
+		// valid
+	default:
+		*errs = append(*errs, fmt.Sprintf(
+			`reboot_mode must be one of soft|hard, got %q`, c.RebootMode,
+		))
+	}
+}
+
+// validateNetworkModeAndZoneEnum appends an error when network_mode is not
+// one of sdn|bridge|auto, and — only when the SDN path is reachable
+// (network_mode sdn or auto) — when sdn_zone_type is not one of
+// simple|vlan|qinq|vxlan|evpn.
+func (c *CPIConfig) validateNetworkModeAndZoneEnum(errs *[]string) {
+	switch c.NetworkMode {
+	case NetworkModeSDN, NetworkModeBridge, NetworkModeAuto:
+		// valid
+	default:
+		*errs = append(*errs, fmt.Sprintf(
+			"network_mode must be one of sdn|bridge|auto, got %q", c.NetworkMode,
+		))
+	}
+
+	if c.NetworkMode == NetworkModeSDN || c.NetworkMode == NetworkModeAuto {
+		switch c.SDNZoneType {
+		case "simple", "vlan", "qinq", "vxlan", "evpn":
 			// valid
 		default:
 			*errs = append(*errs, fmt.Sprintf(
-				"disk_perf_invariant_mode must be one of enforce|warn|off (or empty for default enforce), got %q",
-				c.DiskPerfInvariantMode,
+				"sdn_zone_type must be one of simple|vlan|qinq|vxlan|evpn, got %q", c.SDNZoneType,
 			))
 		}
 	}
+}
 
-	// ReplicaAdoptTimeoutSec: 0 disables the adopt path; negative is invalid.
+// validateCloneModeEnum appends an error when clone_mode is set to a value
+// other than auto|linked|full. Empty (the default; ApplyDefaults fills
+// "auto") is valid.
+func (c *CPIConfig) validateCloneModeEnum(errs *[]string) {
+	if c.CloneMode == "" {
+		return
+	}
+	switch c.CloneMode {
+	case CloneModeAuto, CloneModeLinked, CloneModeFull:
+		// valid
+	default:
+		*errs = append(*errs, fmt.Sprintf(
+			"clone_mode must be one of auto|linked|full, got %q", c.CloneMode,
+		))
+	}
+}
+
+// validateStemcellStrategyEnum appends an error when stemcell_strategy is
+// set to a value other than template|import. Empty (the default;
+// ApplyDefaults fills "template") is valid.
+func (c *CPIConfig) validateStemcellStrategyEnum(errs *[]string) {
+	if c.StemcellStrategy == "" {
+		return
+	}
+	switch c.StemcellStrategy {
+	case StemcellStrategyTemplate, StemcellStrategyImport:
+		// valid
+	default:
+		*errs = append(*errs, fmt.Sprintf(
+			"stemcell_strategy must be one of template|import, got %q", c.StemcellStrategy,
+		))
+	}
+}
+
+// validateDiskPerfInvariantModeEnum appends an error when
+// disk_perf_invariant_mode is set to a value other than enforce|warn|off.
+// Empty (the default) is valid and resolves to enforce.
+func (c *CPIConfig) validateDiskPerfInvariantModeEnum(errs *[]string) {
+	if c.DiskPerfInvariantMode == "" {
+		return
+	}
+	switch strings.ToLower(strings.TrimSpace(c.DiskPerfInvariantMode)) {
+	case "enforce", "warn", enumValueOff:
+		// valid
+	default:
+		*errs = append(*errs, fmt.Sprintf(
+			"disk_perf_invariant_mode must be one of enforce|warn|off (or empty for default enforce), got %q",
+			c.DiskPerfInvariantMode,
+		))
+	}
+}
+
+// validateReplicaAdoptTimeoutSecField appends an error when
+// replica_adopt_timeout_sec is negative. 0 disables the adopt path.
+func (c *CPIConfig) validateReplicaAdoptTimeoutSecField(errs *[]string) {
 	if c.ReplicaAdoptTimeoutSec < 0 {
 		*errs = append(*errs, fmt.Sprintf(
 			"replica_adopt_timeout_sec must be >= 0 (0 disables adopt-and-wait), got %d",
 			c.ReplicaAdoptTimeoutSec,
 		))
 	}
+}
 
-	// ClusterLock mode enum: validate only when non-empty.
-	if c.ClusterLock != "" {
-		switch strings.ToLower(strings.TrimSpace(c.ClusterLock)) {
-		case enumValueOff, "pool":
-			// valid
-		default:
-			*errs = append(*errs, fmt.Sprintf(
-				"cluster_lock_mode must be one of off|pool (or empty for default off), got %q",
-				c.ClusterLock,
-			))
-		}
+// validateClusterLockModeEnum appends an error when cluster_lock_mode is
+// set to a value other than off|pool. Empty (the default) is valid.
+func (c *CPIConfig) validateClusterLockModeEnum(errs *[]string) {
+	if c.ClusterLock == "" {
+		return
 	}
+	switch strings.ToLower(strings.TrimSpace(c.ClusterLock)) {
+	case enumValueOff, "pool":
+		// valid
+	default:
+		*errs = append(*errs, fmt.Sprintf(
+			"cluster_lock_mode must be one of off|pool (or empty for default off), got %q",
+			c.ClusterLock,
+		))
+	}
+}
 
-	// RootDiskBus enum: validate only when non-empty.
-	c.validateRootDiskBusEnum(errs)
-
+// validateNetworkTimingFields appends an error for each of
+// cluster_lock_timeout_sec, network_resolve_retries,
+// network_resolve_timeout_sec, and ephemeral_disk_min_ratio that carries an
+// out-of-range value. Grouped together since each is an independent
+// "must be >= 0" numeric bound with no cross-field interaction.
+func (c *CPIConfig) validateNetworkTimingFields(errs *[]string) {
 	// ClusterLockTimeoutSec: 0 resolves to the 60s default; negative is invalid.
 	if c.ClusterLockTimeoutSec < 0 {
 		*errs = append(*errs, fmt.Sprintf(
@@ -3473,45 +3619,54 @@ func (c *CPIConfig) validateEnumFields(errs *[]string) {
 			c.EphemeralDiskMinRatio,
 		))
 	}
+}
 
-	// EphemeralDiskMinMode enum: validate only when non-empty.
-	c.validateEphemeralDiskMinModeEnum(errs)
-
-	// StemcellStagingDir: when set, must be an absolute path to an existing directory.
-	if c.StemcellStagingDir != "" {
-		if !strings.HasPrefix(c.StemcellStagingDir, "/") {
-			*errs = append(*errs, fmt.Sprintf(
-				"stemcell_staging_dir %q must be an absolute path", c.StemcellStagingDir))
-		} else {
-			fi, statErr := os.Stat(c.StemcellStagingDir)
-			if statErr != nil {
-				if os.IsNotExist(statErr) {
-					*errs = append(*errs, fmt.Sprintf(
-						"stemcell_staging_dir %q does not exist", c.StemcellStagingDir))
-				} else {
-					*errs = append(*errs, fmt.Sprintf(
-						"stemcell_staging_dir %q cannot be stat'd: %s", c.StemcellStagingDir, statErr.Error()))
-				}
-			} else if !fi.IsDir() {
+// validateStemcellStagingDirField appends an error when
+// stemcell_staging_dir is set but is not an absolute path to an existing
+// directory. Empty (the default) is valid.
+func (c *CPIConfig) validateStemcellStagingDirField(errs *[]string) {
+	if c.StemcellStagingDir == "" {
+		return
+	}
+	if !strings.HasPrefix(c.StemcellStagingDir, "/") {
+		*errs = append(*errs, fmt.Sprintf(
+			"stemcell_staging_dir %q must be an absolute path", c.StemcellStagingDir))
+	} else {
+		fi, statErr := os.Stat(c.StemcellStagingDir)
+		if statErr != nil {
+			if os.IsNotExist(statErr) {
 				*errs = append(*errs, fmt.Sprintf(
-					"stemcell_staging_dir %q is not a directory", c.StemcellStagingDir))
+					"stemcell_staging_dir %q does not exist", c.StemcellStagingDir))
+			} else {
+				*errs = append(*errs, fmt.Sprintf(
+					"stemcell_staging_dir %q cannot be stat'd: %s", c.StemcellStagingDir, statErr.Error()))
 			}
+		} else if !fi.IsDir() {
+			*errs = append(*errs, fmt.Sprintf(
+				"stemcell_staging_dir %q is not a directory", c.StemcellStagingDir))
 		}
 	}
+}
 
-	// ResizeConvergenceTimeoutSec: negative is invalid (0 → default). An overly
-	// long budget is allowed (operator's choice); only nonsense is rejected.
+// validateResizeConvergenceTimeoutSecField appends an error when
+// resize_convergence_timeout_sec is negative. 0 resolves to the default
+// 120s; an overly long budget is allowed (operator's choice) — only
+// nonsense is rejected.
+func (c *CPIConfig) validateResizeConvergenceTimeoutSecField(errs *[]string) {
 	if c.ResizeConvergenceTimeoutSec < 0 {
 		*errs = append(*errs, fmt.Sprintf(
 			"resize_convergence_timeout_sec must be >= 0 (0 means default 120s), got %d",
 			c.ResizeConvergenceTimeoutSec,
 		))
 	}
+}
 
-	// PVECACertPEM: when non-empty AND verify_ssl=true, the PEM must parse to at
-	// least one valid certificate. Malformed PEM at startup is rejected so the
-	// operator learns immediately rather than encountering TLS errors at runtime.
-	// When verify_ssl=false the CA cert is ignored (insecure-skip-verify wins).
+// validatePVECACertPEMField appends an error when pve_ca_cert is set and
+// verify_ssl is true but the PEM does not parse to at least one valid
+// certificate. Malformed PEM at startup is rejected so the operator learns
+// immediately rather than encountering TLS errors at runtime. When
+// verify_ssl=false the CA cert is ignored (insecure-skip-verify wins).
+func (c *CPIConfig) validatePVECACertPEMField(errs *[]string) {
 	if c.PVECACertPEM != "" && c.VerifySSLValue() {
 		pool := x509.NewCertPool()
 		if !pool.AppendCertsFromPEM([]byte(c.PVECACertPEM)) {
@@ -3522,13 +3677,38 @@ func (c *CPIConfig) validateEnumFields(errs *[]string) {
 
 // validateSDNFields appends an error for each malformed SDN overlay field:
 // VXLAN peer IPs, the VNI auto-allocation band, and the zone MTU override.
+//
+// Design contract (SDN-only validation must not leak into bridge
+// mode, but must not go silent on a genuine operator typo either): every
+// check below is gated on "the field is explicitly set", NOT on
+// c.NetworkMode. A config migrated to network_mode: bridge that still
+// carries a stale/malformed sdn_* field left over from an SDN deployment
+// gets flagged just as loudly as it would under sdn/auto — the operator
+// set it, so catching the typo beats silently ignoring it (matching the
+// zone-type enum and 4094-cap checks' own precedent for what "reachable"
+// means). Only the 4094 VLAN-ID cap sub-check is mode-gated on top of that:
+// its correct value depends on the EFFECTIVE zone type, which is only
+// resolvable once the SDN path actually runs (bridge mode never resolves a
+// zone at all), so a stale band under bridge mode is left unenforced by
+// design — see sdnReachable below.
+//
+// None of these gates fire on defaults alone: ApplyDefaults' own band fill
+// (5000..5999, or 2000..2999 for vlan/qinq) is always self-consistent, so a
+// zero-config deployment in any mode never trips this function.
 func (c *CPIConfig) validateSDNFields(errs *[]string) {
-	// VXLAN peer IPs — each entry must parse as an IP address.
-	for _, peer := range c.SDNVxlanPeers {
-		if net.ParseIP(peer) == nil {
-			*errs = append(*errs, fmt.Sprintf(
-				"sdn_vxlan_peers entry %q is not a valid IP address", peer,
-			))
+	sdnReachable := c.NetworkMode == NetworkModeSDN || c.NetworkMode == NetworkModeAuto
+
+	// VXLAN peer IPs — each entry must parse as an IP address. An empty list
+	// (the default, and the only state a pure bridge-mode deployment ever
+	// reaches) is always a no-op; a non-empty list is validated in every
+	// mode because a non-empty value can only come from the operator.
+	if sdnReachable || len(c.SDNVxlanPeers) > 0 {
+		for _, peer := range c.SDNVxlanPeers {
+			if net.ParseIP(peer) == nil {
+				*errs = append(*errs, fmt.Sprintf(
+					"sdn_vxlan_peers entry %q is not a valid IP address", peer,
+				))
+			}
 		}
 	}
 
@@ -3549,7 +3729,6 @@ func (c *CPIConfig) validateSDNFields(errs *[]string) {
 		// reachable (mode sdn/auto), mirroring the zone-type enum validation:
 		// under network_mode bridge, sdn_zone_type is inert and stale SDN
 		// fields left over from a migrated config must not reject the load.
-		sdnReachable := c.NetworkMode == NetworkModeSDN || c.NetworkMode == NetworkModeAuto
 		if sdnReachable && sdnZoneTypeIsVLANCapped(c.SDNZoneType) && c.SDNVNIRangeEnd > 4094 {
 			*errs = append(*errs, fmt.Sprintf(
 				"sdn_vni_range %d..%d exceeds the 4094 VLAN ID cap for sdn_zone_type %q",
@@ -3558,7 +3737,9 @@ func (c *CPIConfig) validateSDNFields(errs *[]string) {
 		}
 	}
 
-	// Zone MTU — sane Ethernet/jumbo bounds when set.
+	// Zone MTU — sane Ethernet/jumbo bounds when set. A nil pointer (the
+	// default) is always a no-op; a set value is validated in every mode —
+	// like the peer list, a non-nil value can only come from the operator.
 	if c.SDNZoneMTU != nil && (*c.SDNZoneMTU < 576 || *c.SDNZoneMTU > 65520) {
 		*errs = append(*errs, fmt.Sprintf(
 			"sdn_zone_mtu must be within 576..65520, got %d", *c.SDNZoneMTU,
@@ -4282,34 +4463,6 @@ func (c *CPIConfig) validateDiskPerformance(errs *[]string) {
 		}
 	}
 }
-
-// validateStemcell validates the optional Stemcell block.
-// Skipped entirely when Stemcell is nil (validate-only-when-set).
-// Rules enforced when the block is present:
-//   - DirectorID non-empty after TrimSpace must contain at least one
-//     [A-Za-z0-9-] character; a value consisting entirely of non-word/non-hyphen
-//     characters (e.g. "@@@") is rejected.
-//
-// Boolean fields (Provenance, PruneOrphans, PruneDryRun) are *bool with no
-// further constraints; any non-nil *bool is valid.
-func (c *CPIConfig) validateStemcell(errs *[]string) {
-	if c.Stemcell == nil {
-		return
-	}
-	id := strings.TrimSpace(c.Stemcell.DirectorID)
-	if id != "" {
-		if !stemcellDirectorIDRe.MatchString(id) {
-			*errs = append(*errs, fmt.Sprintf(
-				"stemcell.director_id must contain at least one alphanumeric or hyphen character, got %q",
-				c.Stemcell.DirectorID,
-			))
-		}
-	}
-}
-
-// stemcellDirectorIDRe matches any string that contains at least one
-// alphanumeric character or hyphen. Used by validateStemcell.
-var stemcellDirectorIDRe = regexp.MustCompile(`[A-Za-z0-9-]`)
 
 // clusterLockPoolPrefix mirrors internal/pve's own clusterLockPoolPrefix
 // constant (see internal/pve/cluster_lock.go). internal/pve imports this

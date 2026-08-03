@@ -927,6 +927,30 @@ func TestFastPathDeleteEnabled(t *testing.T) {
 	}
 }
 
+func TestISOStorageFollowVMStorageEnabled(t *testing.T) {
+	t.Parallel()
+	var nilCfg *config.CPIConfig
+	// nil receiver: must return false, not panic (never true for a nil config).
+	if nilCfg.ISOStorageFollowVMStorageEnabled() {
+		t.Error("nil receiver: want false")
+	}
+	// absent field (nil *bool): P5 default is true.
+	if !(&config.CPIConfig{}).ISOStorageFollowVMStorageEnabled() {
+		t.Error("nil *bool: want true (P5 default)")
+	}
+	// explicit *true: must return true.
+	tru := true
+	if !(&config.CPIConfig{ISOStorageFollowVMStorage: &tru}).ISOStorageFollowVMStorageEnabled() {
+		t.Error("explicit *true: want true")
+	}
+	// explicit *false: must return false (opt-out honored despite the
+	// default flip).
+	fal := false
+	if (&config.CPIConfig{ISOStorageFollowVMStorage: &fal}).ISOStorageFollowVMStorageEnabled() {
+		t.Error("explicit *false: want false")
+	}
+}
+
 func TestHealthCheckExpectedAgentSHA256_EmptyWhenUnset(t *testing.T) {
 	t.Parallel()
 	var nilCfg *config.CPIConfig
@@ -1595,16 +1619,17 @@ func TestApplyDefaults_SnapshotGuardBools(t *testing.T) {
 // TestApplyDefaults_NetworkMode_DefaultsToSDN
 // --------------------------------------------------------------------------
 
-// TestApplyDefaults_NetworkMode_DefaultsToSDN verifies that a zero-value
-// CPIConfig gets NetworkMode="sdn" after ApplyDefaults.
-func TestApplyDefaults_NetworkMode_DefaultsToSDN(t *testing.T) {
+// TestApplyDefaults_NetworkMode_DefaultsToBridge verifies that a zero-value
+// CPIConfig gets NetworkMode="bridge" after ApplyDefaults (simple-first
+// default — SDN remains a one-line opt-in via network_mode: sdn).
+func TestApplyDefaults_NetworkMode_DefaultsToBridge(t *testing.T) {
 	t.Parallel()
 	var cfg config.CPIConfig
 	cfg.VMStorage = "vm-store"
 	cfg.ApplyDefaults()
 
-	if cfg.NetworkMode != "sdn" {
-		t.Errorf("NetworkMode = %q, want %q", cfg.NetworkMode, "sdn")
+	if cfg.NetworkMode != "bridge" {
+		t.Errorf("NetworkMode = %q, want %q", cfg.NetworkMode, "bridge")
 	}
 }
 
@@ -1913,9 +1938,9 @@ func TestLoad_UnknownFields_LogsWarn_StillLoads(t *testing.T) {
 	}
 }
 
-// TestLoad_NetworkMode_Omitted_GetsSDN confirms that omitting network_mode
-// from JSON results in NetworkMode="sdn" after Load applies defaults.
-func TestLoad_NetworkMode_Omitted_GetsSDN(t *testing.T) {
+// TestLoad_NetworkMode_Omitted_GetsBridge confirms that omitting network_mode
+// from JSON results in NetworkMode="bridge" after Load applies defaults.
+func TestLoad_NetworkMode_Omitted_GetsBridge(t *testing.T) {
 	t.Parallel()
 	cfg, err := mustLoad(t, `{
 		"host":"h","user":"u","password":"p",
@@ -1924,8 +1949,8 @@ func TestLoad_NetworkMode_Omitted_GetsSDN(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if cfg.NetworkMode != "sdn" {
-		t.Errorf("NetworkMode = %q, want %q (default when omitted)", cfg.NetworkMode, "sdn")
+	if cfg.NetworkMode != "bridge" {
+		t.Errorf("NetworkMode = %q, want %q (default when omitted)", cfg.NetworkMode, "bridge")
 	}
 }
 
@@ -4953,15 +4978,6 @@ func TestLoad_DiskPerformance_RoundTrip(t *testing.T) {
 // TestStemcellProvenance
 // --------------------------------------------------------------------------
 
-// TestStemcellProvenanceEnabled_NilConfig confirms a nil *CPIConfig returns false.
-func TestStemcellProvenanceEnabled_NilConfig(t *testing.T) {
-	t.Parallel()
-	var c *config.CPIConfig
-	if c.StemcellProvenanceEnabled() {
-		t.Error("nil *CPIConfig: StemcellProvenanceEnabled() = true, want false")
-	}
-}
-
 // TestStemcellOrphanPruneEnabled_NilConfig confirms a nil *CPIConfig returns false.
 func TestStemcellOrphanPruneEnabled_NilConfig(t *testing.T) {
 	t.Parallel()
@@ -4980,31 +4996,16 @@ func TestStemcellOrphanPruneDryRun_NilConfig(t *testing.T) {
 	}
 }
 
-// TestStemcellDirectorID_NilConfig confirms a nil *CPIConfig returns "".
-func TestStemcellDirectorID_NilConfig(t *testing.T) {
-	t.Parallel()
-	var c *config.CPIConfig
-	if got := c.StemcellDirectorID(); got != "" {
-		t.Errorf("nil *CPIConfig: StemcellDirectorID() = %q, want \"\"", got)
-	}
-}
-
 // TestStemcellAccessors_NilBlock confirms all accessors return zero values when
 // Stemcell block is nil on an otherwise valid CPIConfig.
 func TestStemcellAccessors_NilBlock(t *testing.T) {
 	t.Parallel()
 	c := &config.CPIConfig{}
-	if c.StemcellProvenanceEnabled() {
-		t.Error("nil Stemcell block: StemcellProvenanceEnabled() = true, want false")
-	}
 	if c.StemcellOrphanPruneEnabled() {
 		t.Error("nil Stemcell block: StemcellOrphanPruneEnabled() = true, want false")
 	}
 	if c.StemcellOrphanPruneDryRun() {
 		t.Error("nil Stemcell block: StemcellOrphanPruneDryRun() = true, want false")
-	}
-	if got := c.StemcellDirectorID(); got != "" {
-		t.Errorf("nil Stemcell block: StemcellDirectorID() = %q, want \"\"", got)
 	}
 }
 
@@ -5014,13 +5015,9 @@ func TestStemcellAccessors_PtrFalse(t *testing.T) {
 	f := false
 	c := &config.CPIConfig{
 		Stemcell: &config.StemcellProvenanceConfig{
-			Provenance:   &f,
 			PruneOrphans: &f,
 			PruneDryRun:  &f,
 		},
-	}
-	if c.StemcellProvenanceEnabled() {
-		t.Error("*false Provenance: StemcellProvenanceEnabled() = true, want false")
 	}
 	if c.StemcellOrphanPruneEnabled() {
 		t.Error("*false PruneOrphans: StemcellOrphanPruneEnabled() = true, want false")
@@ -5036,36 +5033,15 @@ func TestStemcellAccessors_PtrTrue(t *testing.T) {
 	tr := true
 	c := &config.CPIConfig{
 		Stemcell: &config.StemcellProvenanceConfig{
-			Provenance:   &tr,
 			PruneOrphans: &tr,
 			PruneDryRun:  &tr,
-			DirectorID:   "bosh-director-1",
 		},
-	}
-	if !c.StemcellProvenanceEnabled() {
-		t.Error("*true Provenance: StemcellProvenanceEnabled() = false, want true")
 	}
 	if !c.StemcellOrphanPruneEnabled() {
 		t.Error("*true PruneOrphans: StemcellOrphanPruneEnabled() = false, want true")
 	}
 	if !c.StemcellOrphanPruneDryRun() {
 		t.Error("*true PruneDryRun: StemcellOrphanPruneDryRun() = false, want true")
-	}
-	if got := c.StemcellDirectorID(); got != "bosh-director-1" {
-		t.Errorf("StemcellDirectorID() = %q, want \"bosh-director-1\"", got)
-	}
-}
-
-// TestStemcellDirectorID_EmptyString confirms empty DirectorID returns "".
-func TestStemcellDirectorID_EmptyString(t *testing.T) {
-	t.Parallel()
-	c := &config.CPIConfig{
-		Stemcell: &config.StemcellProvenanceConfig{
-			DirectorID: "",
-		},
-	}
-	if got := c.StemcellDirectorID(); got != "" {
-		t.Errorf("empty DirectorID: StemcellDirectorID() = %q, want \"\"", got)
 	}
 }
 
@@ -5079,43 +5055,6 @@ func TestValidate_Stemcell_NilBlock(t *testing.T) {
 	}`)
 	if err != nil {
 		t.Fatalf("nil stemcell block: unexpected error: %v", err)
-	}
-}
-
-// TestValidate_Stemcell_ValidDirectorID confirms well-formed director IDs pass.
-func TestValidate_Stemcell_ValidDirectorID(t *testing.T) {
-	t.Parallel()
-	for _, id := range []string{"bosh-1", "director", "a", "my-bosh-director-2", "123"} {
-		id := id
-		t.Run(id, func(t *testing.T) {
-			t.Parallel()
-			_, err := mustLoad(t, `{
-				"host":"h","user":"u","password":"p",
-				"vm_storage":"s","disk_storage":"s","network_bridge":"br",
-				"stemcell":{"director_id":"`+id+`"}
-			}`)
-			if err != nil {
-				t.Errorf("director_id=%q: unexpected error: %v", id, err)
-			}
-		})
-	}
-}
-
-// TestValidate_Stemcell_InvalidDirectorID confirms all-symbol director IDs are
-// rejected (must contain at least one alphanumeric or hyphen character).
-func TestValidate_Stemcell_InvalidDirectorID(t *testing.T) {
-	t.Parallel()
-	for _, id := range []string{"@@@", "!!!", "...", "***"} {
-		id := id
-		t.Run(id, func(t *testing.T) {
-			t.Parallel()
-			_, err := mustLoad(t, `{
-				"host":"h","user":"u","password":"p",
-				"vm_storage":"s","disk_storage":"s","network_bridge":"br",
-				"stemcell":{"director_id":"`+id+`"}
-			}`)
-			assertCloudError(t, err, "stemcell.director_id")
-		})
 	}
 }
 
@@ -5168,8 +5107,7 @@ func TestStemcell_JSONMarshal_SetBlockIncluded(t *testing.T) {
 		DiskStorage:   "s",
 		NetworkBridge: "br",
 		Stemcell: &config.StemcellProvenanceConfig{
-			Provenance: &tr,
-			DirectorID: "my-director",
+			PruneOrphans: &tr,
 		},
 	}
 	b, err := json.Marshal(c)
@@ -5179,11 +5117,8 @@ func TestStemcell_JSONMarshal_SetBlockIncluded(t *testing.T) {
 	if !bytes.Contains(b, []byte(`"stemcell"`)) {
 		t.Errorf("non-nil Stemcell: JSON missing \"stemcell\" key; got %s", b)
 	}
-	if !bytes.Contains(b, []byte(`"director_id":"my-director"`)) {
-		t.Errorf("non-nil Stemcell: JSON missing director_id; got %s", b)
-	}
-	if !bytes.Contains(b, []byte(`"provenance":true`)) {
-		t.Errorf("non-nil Stemcell: JSON missing provenance:true; got %s", b)
+	if !bytes.Contains(b, []byte(`"prune_orphans":true`)) {
+		t.Errorf("non-nil Stemcell: JSON missing prune_orphans:true; got %s", b)
 	}
 }
 

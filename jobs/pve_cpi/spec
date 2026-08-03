@@ -76,44 +76,60 @@ properties:
     default: false
   pve.iso_storage_follow_vm_storage:
     description: |
-      When true, resolves the ConfigDrive ISO pool to pve.vm_storage instead
-      of the pve.iso_storage default, provided vm_storage advertises PVE
-      content type `iso` and is shared. Evaluated once at CPI process
-      startup, before pve.iso_storage is otherwise applied. Because BOSH
-      renders the "local" spec default for iso_storage whether or not the
-      operator set it in the manifest, the CPI cannot distinguish "unset"
-      from "explicitly local" — this flag therefore treats iso_storage
-      resolving to the literal value "local" as the "unset" signal. An
-      operator who deliberately sets iso_storage: local while also enabling
-      this flag gets vm_storage-following behavior instead of a literal local
-      pool; set iso_storage to any other value to pin a literal pool this
-      flag will never override. When vm_storage lacks `iso` content, is not
-      shared, or cannot be resolved, the CPI falls back to iso_storage
-      unchanged and logs a warning (fail-open). Default false: iso_storage
-      behavior is unchanged.
-    default: false
+      When true (the default), resolves the ConfigDrive ISO pool to
+      pve.vm_storage instead of the pve.iso_storage default, provided
+      vm_storage advertises PVE content type `iso` and is shared. Evaluated
+      once at CPI process startup, before pve.iso_storage is otherwise
+      applied. Because BOSH renders the "local" spec default for iso_storage
+      whether or not the operator set it in the manifest, the CPI cannot
+      distinguish "unset" from "explicitly local" — this flag therefore
+      treats iso_storage resolving to the literal value "local" as the
+      "unset" signal. An operator who deliberately sets iso_storage: local
+      while this flag is active (its default state) gets vm_storage-following
+      behavior instead of a literal local pool; set iso_storage to any other
+      value to pin a literal pool this flag will never override. When
+      vm_storage lacks `iso` content, is not shared, or cannot be resolved,
+      the CPI falls back to iso_storage unchanged and logs a warning
+      (fail-open). Set explicitly to false to disable and always use
+      iso_storage as configured — the pre-P5 behavior. Leave unset (~) to get
+      the default-true behavior; explicit true/false always overrides it.
+    default: ~
   pve.network_bridge:
-    description: "Default network bridge"
+    description: |
+      Default network bridge. Per-NIC cloud_properties (bridge, model,
+      firewall, vlan, mtu) and cloud_properties.network_defaults override
+      this per network or for every NIC on one VM — see docs/networks.md
+      for the full per-NIC cloud_properties reference.
     default: "vmbr0"
   pve.network_mode:
     description: |
       Selects the default create_network/delete_network path. The mode
       governs networks whose spec does not say otherwise; an unambiguous
-      network spec overrides it (cloud_properties naming only a bridge
-      takes the bridge path under "sdn"; naming a zone or vnet takes the
-      SDN path under "bridge").
-      "sdn" — PVE SDN vnet lifecycle (cluster SDN must be enabled). The
-               default: CPI-created networks are SDN vnets that span every
-               cluster node.
-      "bridge" — Linux bridge lifecycle via the nodes API (opt-in; bridges
-               are per-node and do not follow VMs across migration).
+      network spec overrides it (cloud_properties naming a zone or vnet
+      takes the SDN path under "bridge"; naming only a bridge takes the
+      bridge path under "sdn"). This setting has no effect on create_vm's
+      NIC attachment: mtu=1 vnet-MTU inheritance and cloud_properties.vlan
+      tagging are both decided by the actual SDN vnet list in every mode,
+      not by network_mode.
+      "bridge" — Linux bridge lifecycle via the nodes API. The default:
+               a plain pre-existing Linux bridge (managed: false,
+               cloud_properties.bridge) needs no SDN prerequisites and no
+               CPI-side provisioning — the normal path for an
+               operator-managed fabric. create_network under this mode
+               provisions a bridge on one PVE node only (see
+               create_network's own single-node-scope note); multi-node
+               bridge fabrics must be pre-provisioned outside the CPI.
+      "sdn" — PVE SDN vnet lifecycle (cluster SDN must be enabled).
+               CPI-created networks are SDN vnets that span every cluster
+               node. Opt in globally (network_mode: sdn) or per network via
+               cloud_properties naming a zone or vnet.
       "auto" — legacy heuristic retained for compatibility: use SDN when
                cloud_properties.zone or pve.sdn_zone is set; fall back to
                bridge otherwise. Deployments that relied on the old
                auto-to-bridge fallback without naming a zone can also give
                each bridge network an explicit cloud_properties.bridge and
                keep the default mode.
-    default: "sdn"
+    default: "bridge"
   pve.sdn_zone:
     description: |
       Default PVE SDN zone name for vnet creation. Used when
@@ -425,6 +441,34 @@ properties:
       Requires the CPI's PVE token to hold Pool.Allocate on the pool being
       reaped. Default false: empty pools accumulate and are left for the
       operator to manage.
+    default: false
+  pve.destroy_unreferenced_disks:
+    description: |
+      When true, delete_vm passes DestroyUnreferencedDisks=true to PVE's
+      destroy call on every non-retain delete (the synchronous path, the
+      fast path, and the fast-path straggler sweep). PVE's own semantics:
+      free every volume on the VM's storages that is (a) not referenced in
+      the destroyed VM's config and (b) has a VMID matching the VM being
+      destroyed -- a storage-wide scan by VMID, not scoped to this VM's
+      config.
+
+      Default false. On storage dedicated to a single PVE cluster this is
+      safe and sweeps up orphaned own-VMID volumes (e.g. a disk left behind
+      by an interrupted create) that the config-scoped guards never touch.
+      It is UNSAFE the moment pve.vm_storage/disk_storage/iso_storage is
+      shared with a second, independent PVE cluster (a second BOSH-Proxmox
+      AZ pointed at the same NFS/dir export): the destroyed VM's VMID band
+      can overlap the other cluster's VMID band, and this flag would then
+      free the OTHER cluster's live disks -- from this cluster's view they
+      are unreferenced and VMID-matching, identical to a genuine orphan.
+      Nothing in the delete path can tell the two cases apart.
+
+      Enable only when the configured storage pools are NOT shared with any
+      other independent PVE cluster or non-CPI tooling allocating VMIDs in
+      the same range. On shared storage, leave this false and rely on
+      disjoint per-CPI VMID banding instead -- orphaned own-cluster volumes
+      then accumulate and are visible to scripts/disk-audit rather than
+      being swept automatically.
     default: false
   pve.stemcell_template_node:
     description: |
@@ -1213,6 +1257,17 @@ properties:
       max_utilization_mode, since snapshot growth cannot be estimated and
       blocking snapshots on a capacity guess would be unsound.
     default: "enforce"
+  pve.stemcell_strategy:
+    description: |
+      How create_vm materializes a VM root disk from a stemcell CID.
+      "template" — clone the per-cluster stemcell cache template (CoW-fast;
+               the cache is built eagerly by create_stemcell and used by
+               every create_vm on the cluster).
+      "import" — import the stemcell qcow2 directly into the VM root disk
+               (full copy per VM; slower, but independent of the template
+               cache — useful when clones must not share a base volume).
+      Per-VM override: vm_type/resource_pool cloud_properties.stemcell_strategy.
+    default: "template"
   pve.stemcell_replicate_local:
     description: |
       When true, create_stemcell uploads the stemcell qcow2 independently to every
@@ -1785,19 +1840,6 @@ properties:
       onto the SCSI bus is a separate, opt-in change tracked independently of
       this property.
 
-  pve.stemcell.provenance:
-    description: |
-      When true, stamps BOSH provenance into each uploaded stemcell template:
-      the template Notes field receives a JSON object containing the stemcell
-      name, version, OS type, disk format, content hash, source, and owning
-      Director, and the template is tagged with a stable bosh-stemcell tag set
-      (marker, name, version, and director tags). The recorded source URL is
-      scrubbed before it is written: userinfo credentials and signed query
-      parameters (presigned URLs) are masked, since PVE persists Notes in the
-      cluster filesystem where it is replicated, backed up, and readable by
-      any VM.Audit holder. Provenance records assist orphan detection and
-      audit. Default false (no behavior change).
-
   pve.operator_id:
     description: |
       Optional operator identifier appended to the User-Agent header on all PVE
@@ -1834,22 +1876,15 @@ properties:
       operator may know the identity ultimately resolves to root@pam
       through a proxy layer this check cannot see.
 
-  pve.stemcell.director_id:
-    description: |
-      Identity string for the owning BOSH Director, stamped into the provenance
-      Notes object and used to scope orphan-prune operations to templates
-      uploaded by this Director only. Orphan pruning requires this value: when
-      unset or empty, prune_orphans is skipped (with a warning) to avoid
-      deleting templates owned by other Directors. Omitted from the rendered
-      config when empty.
-
   pve.stemcell.prune_orphans:
     description: |
       When true, the delete_stemcell call performs an opt-in garbage-collection
-      pass over bosh-stemcell-tagged templates owned by this Director that no
+      pass over bosh-stemcell-tagged templates carrying the calling Director's
+      "director--<uuid>" tag (director identity comes from the request context
+      the Director sends with every CPI call; no configuration needed) that no
       longer have a referencing linked clone. Pruning is best-effort: failures
-      are logged and do not cause delete_stemcell to fail. Requires director_id
-      to be set, else the pass is skipped. Default false (no behavior change).
+      are logged and do not cause delete_stemcell to fail. A request without a
+      director UUID in its context skips the pass with a warning. Default false.
 
   pve.stemcell.prune_dry_run:
     description: |

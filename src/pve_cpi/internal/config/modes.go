@@ -30,6 +30,17 @@ const (
 	NetworkModeBridge = "bridge"
 )
 
+// StemcellStrategy values (pve.stemcell_strategy; per-VM override via
+// cloud_properties.stemcell_strategy).
+const (
+	// StemcellStrategyTemplate clones the per-cluster stemcell cache template
+	// (CoW-fast; cache built eagerly by create_stemcell).
+	StemcellStrategyTemplate = "template"
+	// StemcellStrategyImport imports the stemcell qcow2 directly into the VM
+	// root disk (full copy per VM; template-independent).
+	StemcellStrategyImport = "import"
+)
+
 // CloneMode values (pve.clone_mode).
 const (
 	// CloneModeAuto picks linked clones on snapshot-capable backends and full

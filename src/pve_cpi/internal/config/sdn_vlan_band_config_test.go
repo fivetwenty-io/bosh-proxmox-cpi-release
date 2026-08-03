@@ -64,6 +64,7 @@ func TestSDNVNIBand_VlanZoneType_BandOutsideCap_Rejected(t *testing.T) {
 		_, err := mustLoad(t, `{
 			"host": "h", "user": "u", "password": "p",
 			"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
+			"network_mode": "sdn",
 			"sdn_zone_type": "`+zt+`",
 			"sdn_vni_range_start": 5000, "sdn_vni_range_end": 5999
 		}`)
@@ -84,10 +85,14 @@ func TestSDNVNIBand_VlanZoneType_BandOutsideCap_Rejected(t *testing.T) {
 // start (start > end).
 func TestSDNVNIBand_VlanZoneType_SingleFieldBand_FailsLoudly(t *testing.T) {
 	t.Parallel()
-	// start-only: end fills to 5999 → 4094-cap violation.
+	// start-only: end fills to 5999 → 4094-cap violation. network_mode: sdn is
+	// explicit here — the 4094 cap depends on the effective zone type, which
+	// only resolves on the reachable SDN path (the cap check is
+	// deliberately gated on mode, unlike the other SDN field checks).
 	_, err := mustLoad(t, `{
 		"host": "h", "user": "u", "password": "p",
 		"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
+		"network_mode": "sdn",
 		"sdn_zone_type": "vlan",
 		"sdn_vni_range_start": 100
 	}`)
@@ -96,7 +101,10 @@ func TestSDNVNIBand_VlanZoneType_SingleFieldBand_FailsLoudly(t *testing.T) {
 	} else if !strings.Contains(err.Error(), "4094") {
 		t.Errorf("start-only band: error %q does not mention the 4094 cap", err)
 	}
-	// end-only: start fills to 5000 → start > end bounds violation.
+	// end-only: start fills to 5000 → start > end bounds violation. This
+	// ordering check is NOT mode-gated (it fires whenever the operator sets
+	// either band field, in every mode), so network_mode is left at its
+	// bridge default here to also cover that cross-mode behavior.
 	_, err = mustLoad(t, `{
 		"host": "h", "user": "u", "password": "p",
 		"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
@@ -136,6 +144,7 @@ func TestSDNVNIBand_VlanZoneType_BandEndAtCap_Accepted(t *testing.T) {
 	_, err := mustLoad(t, `{
 		"host": "h", "user": "u", "password": "p",
 		"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
+		"network_mode": "sdn",
 		"sdn_zone_type": "vlan",
 		"sdn_vni_range_start": 4000, "sdn_vni_range_end": 4094
 	}`)
@@ -151,6 +160,7 @@ func TestSDNVNIBand_VxlanZoneType_HighBandAccepted(t *testing.T) {
 	_, err := mustLoad(t, `{
 		"host": "h", "user": "u", "password": "p",
 		"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
+		"network_mode": "sdn",
 		"sdn_zone_type": "vxlan",
 		"sdn_vni_range_start": 5000, "sdn_vni_range_end": 5999
 	}`)
@@ -167,6 +177,7 @@ func TestSDNVNIBand_VlanZoneType_LoadDefaultsWithinCap(t *testing.T) {
 	cfg, err := mustLoad(t, `{
 		"host": "h", "user": "u", "password": "p",
 		"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
+		"network_mode": "sdn",
 		"sdn_zone_type": "vlan"
 	}`)
 	if err != nil {
