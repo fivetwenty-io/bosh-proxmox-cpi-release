@@ -158,7 +158,7 @@ func TestHandleSetDiskMetadata_LockAcquiredBeforeRead(t *testing.T) {
 
 	h := handlers.HandleSetDiskMetadata(deps)
 	_, err := h.Handle(context.Background(),
-		marshalArgs(diskCID, map[string]any{"instance_id": "vm-abc"}),
+		marshalArgs(mustEncodeDiskCID(t, diskCID, nil), map[string]any{"instance_id": "vm-abc"}),
 		jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -245,7 +245,7 @@ func TestHandleSetDiskMetadata_LockAcquireFailureRetriable(t *testing.T) {
 
 	h := handlers.HandleSetDiskMetadata(deps)
 	_, err := h.Handle(context.Background(),
-		marshalArgs(diskCID, map[string]any{"instance_id": "vm-abc"}),
+		marshalArgs(mustEncodeDiskCID(t, diskCID, nil), map[string]any{"instance_id": "vm-abc"}),
 		jsonrpc.Context{})
 
 	if err == nil {

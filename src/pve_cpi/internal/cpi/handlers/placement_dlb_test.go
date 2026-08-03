@@ -530,6 +530,12 @@ func TestPVEVersionAtLeast(t *testing.T) {
 type dlbStorageEntry struct {
 	storageType string
 	shared      bool
+	// server/export/path are optional backing-identity fields (see
+	// pve.StorageInfo.BackingKey). Left empty they encode nothing extra —
+	// every pre-existing fixture that doesn't set them is unaffected.
+	server string
+	export string
+	path   string
 }
 
 type dlbMultiStorageStub struct {
@@ -544,11 +550,21 @@ func (s *dlbMultiStorageStub) ListStorage(_ context.Context, _ *clusterstorage.L
 		if e.shared {
 			sharedInt = 1
 		}
-		raw, _ := json.Marshal(map[string]any{
+		row := map[string]any{
 			"storage": name,
 			"type":    e.storageType,
 			"shared":  sharedInt,
-		})
+		}
+		if e.server != "" {
+			row["server"] = e.server
+		}
+		if e.export != "" {
+			row["export"] = e.export
+		}
+		if e.path != "" {
+			row["path"] = e.path
+		}
+		raw, _ := json.Marshal(row)
 		resp = append(resp, json.RawMessage(raw))
 	}
 	return &resp, nil

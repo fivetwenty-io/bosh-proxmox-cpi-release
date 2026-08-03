@@ -92,16 +92,18 @@ func pinAZForNode(cp createVMCloudProps, cfg *config.CPIConfig, node string) str
 }
 
 // warnSingleNodeAZPin logs a Warn when a strict node-affinity pin binds the VM
-// to an AZ node set of exactly one node. Two hazards follow from this
-// configuration: (1) if that single node goes down, PVE HA has no other node
-// in the AZ to fail over to, so the VM cannot restart until the node returns;
-// (2) draining that node for maintenance (reboot, upgrade) has nowhere legal
-// to place the VM, which can wedge the maintenance operation. Both hazards are
-// specific to strict pins — a non-strict (preferred) pin lets HA relocate
-// off-AZ instead of being stuck. Deduplicates/trims azNodes the same way
-// ensureNodeAffinityPin does, so a config with blank or repeated entries is
-// judged on its effective node count, not its raw slice length. A no-op when
-// strict is false or the effective node count is not exactly one.
+// to an AZ node set of one or two nodes. Two hazards follow from a small
+// pinned node set: (1) once every node in the set is simultaneously down
+// (the only node, for a one-node set; both nodes, for a two-node set — e.g.
+// one down and one drained for maintenance), PVE HA has no remaining node in
+// the AZ to fail over to, so the VM cannot restart until a pinned node
+// returns; (2) draining a node for maintenance (reboot, upgrade) can leave no
+// legal placement target for the VM, wedging the maintenance operation. Both
+// hazards are specific to strict pins — a non-strict (preferred) pin lets HA
+// relocate off-AZ instead of being stuck. Deduplicates/trims azNodes the same
+// way ensureNodeAffinityPin does, so a config with blank or repeated entries
+// is judged on its effective node count, not its raw slice length. A no-op
+// when strict is false or the effective node count is more than two.
 func warnSingleNodeAZPin(az string, azNodes []string, strict bool, logger *log.Logger) {
 	if !strict {
 		return
@@ -111,13 +113,15 @@ func warnSingleNodeAZPin(az string, azNodes []string, strict bool, logger *log.L
 		return
 	}
 	nodes := strings.Split(nodesCSV, ",")
-	if len(nodes) != 1 {
+	if len(nodes) > 2 {
 		return
 	}
-	logger.Warn("create_vm: strict AZ node-affinity pin targets a single-node AZ; "+
-		"no failover target if the node goes down, and node maintenance can wedge the VM "+
-		"(map the AZ to >= 2 nodes to avoid this hazard)",
-		log.String("az", az), log.String("node", nodes[0]))
+	logger.Warn("create_vm: strict AZ node-affinity pin targets a small node set; "+
+		"if every pinned node is simultaneously down or drained for maintenance, PVE HA has "+
+		"nowhere in the AZ left to fail over to and the VM stays down until a pinned node returns "+
+		"(map the AZ to >= 3 nodes to avoid this wedge risk, or set pve.placement.pin_az_strict=false "+
+		"to allow HA to relocate off-AZ instead)",
+		log.String("az", az), log.String("nodes", nodesCSV), log.Int("pinned_node_count", len(nodes)))
 }
 
 // ensureNodeAffinityPin writes a PVE HA node-affinity rule binding the VM to the

@@ -8,6 +8,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"path"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -19,11 +21,20 @@ import (
 )
 
 // StorageInfo is the CPI-facing view of a PVE storage entry.
+//
+// Path/Server/Export carry the backing-identity fields PVE reports for
+// file-content-capable storages: Path for dir-style plugins, Server+Export
+// for nfs, Server+Export (populated from the "share" field) for cifs. They
+// are used only by BackingKey — nothing else in this struct depends on them.
 type StorageInfo struct {
-	Name   string
-	Type   string
-	Shared bool
-	Nodes  []string
+	Name    string
+	Type    string
+	Shared  bool
+	Nodes   []string
+	Path    string
+	Server  string
+	Export  string
+	Content string
 }
 
 // IsShared classifies the storage as "shared" (cluster-visible) or "local"
@@ -39,6 +50,212 @@ func (s StorageInfo) IsShared() bool {
 		return true
 	}
 	return false
+}
+
+// backingKeyNetFSScheme prefixes the normalized identity of an NFS storage.
+// NFS mounts a remote export by server+path, so a storage ID configured
+// against the same server and export is the same physical backing.
+const backingKeyNetFSScheme = "nfs://"
+
+// backingKeyCIFSScheme prefixes the normalized identity of a CIFS/SMB
+// storage. It is deliberately distinct from backingKeyNetFSScheme: a CIFS
+// share name is an entry in the SMB server's namespace, not a filesystem
+// path, so a share name that happens to render identically to some NFS
+// export's path is a coincidence, not evidence the two protocols are
+// exposing the same bytes. Keeping the schemes separate means that
+// coincidence can never merge them.
+const backingKeyCIFSScheme = "cifs://"
+
+// backingKeyDirScheme prefixes the normalized identity of a dir-plugin
+// storage: two storage IDs pointing at the same local filesystem path AND
+// the same restricted node set are the same backing directory. See the
+// Nodes handling in BackingKey's dir case.
+const backingKeyDirScheme = "dir://"
+
+// backingKeyIDScheme prefixes the fallback identity used for every storage
+// type this package does not know how to normalize (block-native backends —
+// lvm, lvmthin, zfspool, rbd — plus cluster-service-backed types this package
+// does not parse a location out of — cephfs, glusterfs, pbs, btrfs, and any
+// unrecognised/future type). The key is just the storage ID itself, so it can
+// never accidentally equal another storage's key unless the name is literally
+// the same: correctness over cleverness — a wrong merge here would treat two
+// genuinely distinct pools as one and mis-drive clone-mode, placement, or
+// (once destroy paths use it) disk deletion.
+const backingKeyIDScheme = "id://"
+
+// BackingKey returns a normalized identity for the physical storage backing
+// this entry, so two differently-named PVE storage IDs that point at the same
+// physical location (Kevin's "two names, one export" scenario) can be
+// recognized as sharing state.
+//
+//   - nfs: backingKeyNetFSScheme + lowercased Server + cleaned Export — e.g.
+//     "nfs://10.0.0.5/tank/proxmox". Server is lowercased because DNS names
+//     and most operators' IP literals are case-insensitive identity; the
+//     export path is path.Clean-ed so a trailing slash or "//" typo does not
+//     defeat the match.
+//   - cifs: backingKeyCIFSScheme, normalized the same way as nfs but under
+//     its own scheme — a CIFS share name and an NFS export path are never
+//     compared to each other, only to other CIFS shares (see the scheme
+//     doc comment).
+//   - dir: backingKeyDirScheme + cleaned Path + a canonicalized Nodes suffix.
+//     PVE's dir plugin is commonly registered once per node against an
+//     identically-mounted local disk ("ssd-n1" on node n1, "ssd-n2" on node
+//     n2, both /mnt/ssd) — those are DIFFERENT physical disks that merely
+//     share a mount path, so the node set is part of the key: two dir
+//     entries at the same path only produce the same key when their Nodes
+//     sets are identical, INCLUDING both empty (PVE's "no nodes list"
+//     meaning "available on every node" is one unambiguous visibility, so
+//     two such entries at the same path are the same backing). Any other
+//     relationship between the two Nodes sets — disjoint, overlapping, or
+//     one empty and the other restricted — is conservatively treated as
+//     NOT the same backing, even though the sets are not necessarily
+//     disjoint; guessing "same" on partial node-set overlap risks the exact
+//     misplacement this key exists to prevent.
+//   - every other type (lvm, lvmthin, zfspool, rbd, cephfs, glusterfs, pbs,
+//     btrfs, unknown/future types): backingKeyIDScheme + Name — never
+//     normalized, so two distinct storage IDs of these types are NEVER
+//     reported as sharing a backing even if they happen to wrap the same
+//     underlying device (this package has no reliable way to tell, and
+//     guessing wrong is worse than not merging).
+//
+// Returns "" when the entry carries no usable identity for its type (nfs/cifs
+// missing Server or Export, dir missing Path, or Name empty for the fallback
+// case). Callers MUST treat "" as "backing unknown, never a match" — see
+// SameBacking.
+func (s StorageInfo) BackingKey() string {
+	switch strings.ToLower(s.Type) {
+	case StorageTypeNFS:
+		if s.Server == "" || s.Export == "" {
+			return ""
+		}
+		return backingKeyNetFSScheme + strings.ToLower(s.Server) + path.Clean("/"+s.Export)
+	case StorageTypeCIFS:
+		if s.Server == "" || s.Export == "" {
+			return ""
+		}
+		return backingKeyCIFSScheme + strings.ToLower(s.Server) + path.Clean("/"+s.Export)
+	case StorageTypeDir:
+		if s.Path == "" {
+			return ""
+		}
+		return backingKeyDirScheme + path.Clean(s.Path) + "#nodes=" + canonicalNodeSet(s.Nodes)
+	default:
+		if s.Name == "" {
+			return ""
+		}
+		return backingKeyIDScheme + s.Name
+	}
+}
+
+// canonicalNodeSet returns a deterministic, order-independent representation
+// of a storage entry's restricted-node list, for folding into BackingKey's
+// dir case. An empty/nil nodes list (PVE's "no restriction, every node")
+// canonicalizes to "" so two unrestricted dir entries at the same path
+// compare equal; any non-empty list is sorted and comma-joined so the same
+// set of nodes in a different order still canonicalizes identically.
+func canonicalNodeSet(nodes []string) string {
+	if len(nodes) == 0 {
+		return ""
+	}
+	sorted := make([]string, len(nodes))
+	copy(sorted, nodes)
+	sort.Strings(sorted)
+	return strings.Join(sorted, ",")
+}
+
+// SameBacking reports whether a and b are backed by the same physical storage
+// location: equal, non-empty BackingKey values. An empty key on either side
+// (undeterminable identity) never counts as a match — treating "unknown" as
+// "same" would silently merge storages that might be entirely different, the
+// opposite of the safety BackingKey exists to provide.
+func SameBacking(a, b StorageInfo) bool {
+	ka := a.BackingKey()
+	if ka == "" {
+		return false
+	}
+	return ka == b.BackingKey()
+}
+
+// SharedViaBacking classifies target as shared when either target.IsShared()
+// is true on its own terms, OR target shares a BackingKey with some other
+// entry in all whose own IsShared() is true.
+//
+// This closes a config-drift gap specific to storage types whose IsShared()
+// depends on the storage.cfg "shared" flag rather than being fixed by type
+// (dir/lvm/lvmthin/zfspool/btrfs — see the IsShared doc comment): an operator
+// who registers the same network mount under two storage IDs and only
+// remembers to flag one of them "shared: 1" gets an inconsistent answer from
+// a plain per-ID IsShared() check even though both IDs resolve to the same
+// bytes. Types whose IsShared() is fixed by type (nfs/cifs/rbd/cephfs/
+// glusterfs/pbs) are unaffected — they are already shared on their own terms,
+// so the "other entry" branch is only ever consulted for the drift-prone
+// types, and even then only when BackingKey identifies a genuine physical
+// match (dir path or nfs/cifs server+export) — never for the id:// fallback,
+// which by construction only matches itself.
+//
+// target must be present in all (or have Name equal to some entry there) for
+// the backing-propagation branch to find anything; a target absent from all
+// simply falls back to its own IsShared().
+func SharedViaBacking(target StorageInfo, all []StorageInfo) bool {
+	if target.IsShared() {
+		return true
+	}
+	key := target.BackingKey()
+	if key == "" {
+		return false
+	}
+	for i := range all {
+		if all[i].Name == target.Name {
+			continue
+		}
+		if all[i].BackingKey() == key && all[i].IsShared() {
+			return true
+		}
+	}
+	return false
+}
+
+// WarnDuplicateBackingStorages logs one Warn for every distinct BackingKey
+// shared by two or more storage IDs in infos — e.g. two storage IDs
+// configured against the same NFS export ("two names, one export"). Storage
+// types that never normalize (BackingKey's id:// fallback) can never appear
+// here, since that key is always unique to a single Name by construction.
+//
+// infos with an empty BackingKey (undeterminable identity) are skipped
+// entirely — never grouped together, matching SameBacking's "unknown is
+// never a match" contract.
+func WarnDuplicateBackingStorages(ctx context.Context, infos []StorageInfo) {
+	byKey := make(map[string][]string)
+	for i := range infos {
+		key := infos[i].BackingKey()
+		if key == "" {
+			continue
+		}
+		byKey[key] = append(byKey[key], infos[i].Name)
+	}
+
+	dupeKeys := make([]string, 0)
+	for key, names := range byKey {
+		if len(names) > 1 {
+			dupeKeys = append(dupeKeys, key)
+		}
+	}
+	if len(dupeKeys) == 0 {
+		return
+	}
+	sort.Strings(dupeKeys) // deterministic log order
+
+	logger := log.FromContext(ctx)
+	for _, key := range dupeKeys {
+		names := byKey[key]
+		sort.Strings(names)
+		logger.Warn("storage_info: two or more storage IDs share one physical backing — "+
+			"two names, one export; prefer a single storage ID to avoid silent full-clone "+
+			"downgrades, cross-cluster VMID collisions, and split placement decisions",
+			log.String("backing", key),
+			log.String("storage_ids", strings.Join(names, ",")),
+		)
+	}
 }
 
 // StorageLister is the slice of the PVE SDK we depend on to classify storages.
@@ -80,6 +297,14 @@ type StorageInfoCache struct {
 	entries  map[string]storageInfoEntry
 	inflight map[string]chan struct{}
 	negCache negativeCacheEntry
+
+	// backingWarnOnce gates WarnDuplicateBackingStorages to a single firing
+	// per cache instance (in production, per process lifetime): storage.cfg
+	// duplicate-backing misconfiguration is static operator state, not
+	// something that flips on a routine TTL refresh, so re-warning on every
+	// refresh would just be process-lifetime log noise for a condition that
+	// does not change without an operator edit and a CPI restart.
+	backingWarnOnce sync.Once
 }
 
 type storageInfoEntry struct {
@@ -311,17 +536,44 @@ func (c *StorageInfoCache) refresh(ctx context.Context) error {
 	}
 	// Successful refresh clears the negative cache.
 	c.negCache = negativeCacheEntry{}
+
+	// One-time duplicate-backing warning (see backingWarnOnce doc). Run under
+	// the same c.mu already held for this refresh — WarnDuplicateBackingStorages
+	// is pure logging over the just-built entries, so this cannot deadlock or
+	// re-enter the cache.
+	c.backingWarnOnce.Do(func() {
+		infos := make([]StorageInfo, 0, len(c.entries))
+		for k := range c.entries {
+			infos = append(infos, c.entries[k].info)
+		}
+		WarnDuplicateBackingStorages(ctx, infos)
+	})
 	return nil
 }
 
 // parseStorageEntry decodes the relevant fields from a /storage response item.
 // PVE returns shared as a 0/1 integer; nodes is comma-joined when present.
+//
+// Backing-identity fields per PVE storage plugin (pveStorage(5)): dir-style
+// plugins report "path"; nfs reports "server"+"export"; cifs reports
+// "server"+"share" — decoded into the same StorageInfo.Export field as nfs
+// purely because both name the mounted resource on the remote server; they
+// are NOT treated as identical by BackingKey, which keys them under separate
+// nfs:// and cifs:// schemes (see the BackingKey doc comment) so a share name
+// that happens to render like some export's path never merges the two. Every
+// other plugin type leaves Path/Server/Export empty, which is correct:
+// BackingKey falls back to the storage ID for those types regardless.
 func parseStorageEntry(raw json.RawMessage) (StorageInfo, error) {
 	var v struct {
 		Storage string `json:"storage"`
 		Type    string `json:"type"`
 		Shared  *int   `json:"shared,omitempty"`
 		Nodes   string `json:"nodes,omitempty"`
+		Path    string `json:"path,omitempty"`
+		Server  string `json:"server,omitempty"`
+		Export  string `json:"export,omitempty"`
+		Share   string `json:"share,omitempty"`
+		Content string `json:"content,omitempty"`
 	}
 	if err := json.Unmarshal(raw, &v); err != nil {
 		return StorageInfo{}, err
@@ -331,11 +583,23 @@ func parseStorageEntry(raw json.RawMessage) (StorageInfo, error) {
 	}
 
 	info := StorageInfo{
-		Name: v.Storage,
-		Type: v.Type,
+		Name:    v.Storage,
+		Type:    v.Type,
+		Path:    v.Path,
+		Server:  v.Server,
+		Content: v.Content,
 	}
 	if v.Shared != nil && *v.Shared != 0 {
 		info.Shared = true
+	}
+	// cifs names its remote resource "share", not "export"; both feed the
+	// same BackingKey field since a cifs share and an nfs export are the same
+	// concept (the path under Server that is actually mounted).
+	switch {
+	case v.Export != "":
+		info.Export = v.Export
+	case v.Share != "":
+		info.Export = v.Share
 	}
 	if v.Nodes != "" {
 		for _, part := range strings.Split(v.Nodes, ",") {
@@ -346,6 +610,17 @@ func parseStorageEntry(raw json.RawMessage) (StorageInfo, error) {
 		}
 	}
 	return info, nil
+}
+
+// ParseStorageEntry decodes a single /storage response item into a
+// StorageInfo. Exported so callers that already hold a json.RawMessage from a
+// direct ClusterStorage().ListStorage() call — rather than a single-name
+// StorageInfoCache.Get lookup — can decode consistently with the cache's own
+// parsing. placement_dlb.go's shared-storage guard is the current example: it
+// needs the FULL index (to evaluate backing-identity across pools), not one
+// cached name, so it cannot go through StorageInfoCache.Get as-is.
+func ParseStorageEntry(raw json.RawMessage) (StorageInfo, error) {
+	return parseStorageEntry(raw)
 }
 
 // ClusterStorageAsLister adapts a clusterstorage.Service to StorageLister.

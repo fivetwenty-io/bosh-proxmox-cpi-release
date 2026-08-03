@@ -2,6 +2,16 @@
 // enforces five placement rules that determine whether a given PVE storage is
 // acceptable for light stemcell uploads and whether a specific cluster node
 // must be pinned for that upload.
+//
+// Backing-identity note: both ValidateTemplateCloneStorage and
+// ValidateLightStemcellStorage classify exactly ONE named storage's own
+// topology (shared/local, block/file, cluster size) — neither compares two
+// storage IDs against each other, so StorageInfo.BackingKey/SameBacking
+// (storage_info.go) have no direct application inside this file. The
+// backing-identity-aware "are these two storage IDs really the same
+// storage" decisions live where an actual two-ID comparison exists: the
+// clone-mode storageMismatch check and the clone Target-validation direction
+// fix, both in create_vm_disk.go.
 package pve
 
 import (

@@ -151,7 +151,7 @@ func TestHandleUpdateDisk_OptionsOnly(t *testing.T) {
 	}
 
 	h := handlers.HandleUpdateDisk(updateDiskDeps(qemuSvc, updateClusterWith(100), nil))
-	_, err := h.Handle(context.Background(), marshalArgs(diskCID, map[string]any{
+	_, err := h.Handle(context.Background(), marshalArgs(mustEncodeDiskCID(t, diskCID, nil), map[string]any{
 		"cache":    "writeback",
 		"iothread": true,
 	}), jsonrpc.Context{})
@@ -204,7 +204,7 @@ func TestHandleUpdateDisk_SizeOnly(t *testing.T) {
 
 	h := handlers.HandleUpdateDisk(updateDiskDeps(qemuSvc, updateClusterWith(100), nil))
 	// size=20480 MiB = 20 GiB; current = 10 GiB → delta = 10 GiB.
-	_, err := h.Handle(context.Background(), marshalArgs(diskCID, map[string]any{
+	_, err := h.Handle(context.Background(), marshalArgs(mustEncodeDiskCID(t, diskCID, nil), map[string]any{
 		"size": 20480,
 	}), jsonrpc.Context{})
 	if err != nil {
@@ -247,7 +247,7 @@ func TestHandleUpdateDisk_CombinedSizeAndOptions(t *testing.T) {
 	}
 
 	h := handlers.HandleUpdateDisk(updateDiskDeps(qemuSvc, updateClusterWith(100), nil))
-	_, err := h.Handle(context.Background(), marshalArgs(diskCID, map[string]any{
+	_, err := h.Handle(context.Background(), marshalArgs(mustEncodeDiskCID(t, diskCID, nil), map[string]any{
 		"size":    20480,
 		"discard": "on",
 	}), jsonrpc.Context{})
@@ -281,7 +281,7 @@ func TestHandleUpdateDisk_EmptySpec_NoOp(t *testing.T) {
 	}
 
 	h := handlers.HandleUpdateDisk(updateDiskDeps(qemuSvc, updateClusterWith(100), nil))
-	_, err := h.Handle(context.Background(), marshalArgs(diskCID, map[string]any{}), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), marshalArgs(mustEncodeDiskCID(t, diskCID, nil), map[string]any{}), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -302,7 +302,7 @@ func TestHandleUpdateDisk_DetachedDisk(t *testing.T) {
 	}
 
 	h := handlers.HandleUpdateDisk(updateDiskDeps(&updateDiskQEMUService{}, emptyCluster, nil))
-	_, err := h.Handle(context.Background(), marshalArgs(diskCID, map[string]any{"cache": "writeback"}), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), marshalArgs(mustEncodeDiskCID(t, diskCID, nil), map[string]any{"cache": "writeback"}), jsonrpc.Context{})
 	if err == nil {
 		t.Fatal("expected error for detached disk")
 	}
@@ -334,7 +334,7 @@ func TestHandleUpdateDisk_DetachedDisk_SentinelWrapped(t *testing.T) {
 	}
 
 	h := handlers.HandleUpdateDisk(updateDiskDeps(qemuSvc, oneVMCluster, nil))
-	_, err := h.Handle(context.Background(), marshalArgs(diskCID, map[string]any{"cache": "writeback"}), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), marshalArgs(mustEncodeDiskCID(t, diskCID, nil), map[string]any{"cache": "writeback"}), jsonrpc.Context{})
 	if err == nil {
 		t.Fatal("expected error for sentinel-wrapped detached disk")
 	}
@@ -358,7 +358,7 @@ func TestHandleUpdateDisk_FindVMTransportError(t *testing.T) {
 	}
 
 	h := handlers.HandleUpdateDisk(updateDiskDeps(&updateDiskQEMUService{}, faultCluster, nil))
-	_, err := h.Handle(context.Background(), marshalArgs(diskCID, map[string]any{"cache": "writeback"}), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), marshalArgs(mustEncodeDiskCID(t, diskCID, nil), map[string]any{"cache": "writeback"}), jsonrpc.Context{})
 	if err == nil {
 		t.Fatal("expected error for cluster transport failure, got nil")
 	}
@@ -390,7 +390,7 @@ func TestHandleUpdateDisk_ShrinkRejected(t *testing.T) {
 
 	h := handlers.HandleUpdateDisk(updateDiskDeps(qemuSvc, updateClusterWith(100), nil))
 	// 5120 MiB = 5 GiB; current = 20 GiB → shrink.
-	_, err := h.Handle(context.Background(), marshalArgs(diskCID, map[string]any{"size": 5120}), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), marshalArgs(mustEncodeDiskCID(t, diskCID, nil), map[string]any{"size": 5120}), jsonrpc.Context{})
 	if err == nil {
 		t.Fatal("expected error for shrink attempt")
 	}
@@ -440,7 +440,7 @@ func TestHandleUpdateDisk_IOThreadFalseRemovesOption(t *testing.T) {
 	}
 
 	h := handlers.HandleUpdateDisk(updateDiskDeps(qemuSvc, updateClusterWith(100), nil))
-	_, err := h.Handle(context.Background(), marshalArgs(diskCID, map[string]any{
+	_, err := h.Handle(context.Background(), marshalArgs(mustEncodeDiskCID(t, diskCID, nil), map[string]any{
 		"iothread": false, // disable iothread
 	}), jsonrpc.Context{})
 	if err != nil {
@@ -473,7 +473,7 @@ func TestHandleUpdateDisk_AttachSDKError(t *testing.T) {
 	}
 
 	h := handlers.HandleUpdateDisk(updateDiskDeps(qemuSvc, updateClusterWith(100), nil))
-	_, err := h.Handle(context.Background(), marshalArgs(diskCID, map[string]any{
+	_, err := h.Handle(context.Background(), marshalArgs(mustEncodeDiskCID(t, diskCID, nil), map[string]any{
 		"cache": "writeback",
 	}), jsonrpc.Context{})
 	if err == nil {
@@ -509,7 +509,7 @@ func TestHandleUpdateDisk_ResizeWithUpid(t *testing.T) {
 	}
 
 	h := handlers.HandleUpdateDisk(updateDiskDeps(qemuSvc, updateClusterWith(100), tasksSvc))
-	_, err := h.Handle(context.Background(), marshalArgs(diskCID, map[string]any{
+	_, err := h.Handle(context.Background(), marshalArgs(mustEncodeDiskCID(t, diskCID, nil), map[string]any{
 		"size": 20480,
 	}), jsonrpc.Context{})
 	if err != nil {
@@ -545,7 +545,7 @@ func TestHandleUpdateDisk_PreservesExistingOptions(t *testing.T) {
 	}
 
 	h := handlers.HandleUpdateDisk(updateDiskDeps(qemuSvc, updateClusterWith(100), nil))
-	_, err := h.Handle(context.Background(), marshalArgs(diskCID, map[string]any{
+	_, err := h.Handle(context.Background(), marshalArgs(mustEncodeDiskCID(t, diskCID, nil), map[string]any{
 		"cache": "none",
 		// backup not in update_spec → must be preserved
 	}), jsonrpc.Context{})
@@ -584,7 +584,7 @@ func TestHandleUpdateDisk_BandwidthIOPS(t *testing.T) {
 	}
 
 	h := handlers.HandleUpdateDisk(updateDiskDeps(qemuSvc, updateClusterWith(100), nil))
-	_, err := h.Handle(context.Background(), marshalArgs(diskCID, map[string]any{
+	_, err := h.Handle(context.Background(), marshalArgs(mustEncodeDiskCID(t, diskCID, nil), map[string]any{
 		"mbps_rd": 100,
 		"mbps_wr": 50,
 		"iops_rd": 200,
@@ -624,7 +624,7 @@ func TestHandleUpdateDisk_SSDAndBackup(t *testing.T) {
 	}
 
 	h := handlers.HandleUpdateDisk(updateDiskDeps(qemuSvc, updateClusterWith(100), nil))
-	_, err := h.Handle(context.Background(), marshalArgs(diskCID, map[string]any{
+	_, err := h.Handle(context.Background(), marshalArgs(mustEncodeDiskCID(t, diskCID, nil), map[string]any{
 		"ssd":    true,
 		"backup": true,
 	}), jsonrpc.Context{})
@@ -651,8 +651,9 @@ func TestHandleUpdateDisk_NullSpec_NoOp(t *testing.T) {
 	}
 
 	h := handlers.HandleUpdateDisk(updateDiskDeps(qemuSvc, updateClusterWith(100), nil))
+	encodedVolid, _ := json.Marshal(mustEncodeDiskCID(t, volid, nil))
 	_, err := h.Handle(context.Background(), []json.RawMessage{
-		json.RawMessage(`"local-lvm:vm-9001-disk-0"`),
+		encodedVolid,
 		json.RawMessage(`null`),
 	}, jsonrpc.Context{})
 	if err != nil {
@@ -686,7 +687,7 @@ func TestHandleUpdateDisk_ConfigReadError(t *testing.T) {
 	}
 
 	h := handlers.HandleUpdateDisk(updateDiskDeps(qemuSvc, updateClusterWith(100), nil))
-	_, err := h.Handle(context.Background(), marshalArgs(diskCID, map[string]any{
+	_, err := h.Handle(context.Background(), marshalArgs(mustEncodeDiskCID(t, diskCID, nil), map[string]any{
 		"cache": "writeback",
 	}), jsonrpc.Context{})
 	if err == nil {
@@ -719,7 +720,7 @@ func TestHandleUpdateDisk_ResolveDiskIDError(t *testing.T) {
 	}
 
 	h := handlers.HandleUpdateDisk(updateDiskDeps(qemuSvc, updateClusterWith(100), nil))
-	_, err := h.Handle(context.Background(), marshalArgs(diskCID, map[string]any{
+	_, err := h.Handle(context.Background(), marshalArgs(mustEncodeDiskCID(t, diskCID, nil), map[string]any{
 		"cache": "writeback",
 	}), jsonrpc.Context{})
 	if err == nil {
@@ -746,7 +747,7 @@ func TestHandleUpdateDisk_SizeWrongType(t *testing.T) {
 	}
 
 	h := handlers.HandleUpdateDisk(updateDiskDeps(qemuSvc, updateClusterWith(100), nil))
-	_, err := h.Handle(context.Background(), marshalArgs(diskCID, map[string]any{
+	_, err := h.Handle(context.Background(), marshalArgs(mustEncodeDiskCID(t, diskCID, nil), map[string]any{
 		"size": "big",
 	}), jsonrpc.Context{})
 	if err == nil {
@@ -805,7 +806,7 @@ func TestHandleUpdateDisk_Dir_CID(t *testing.T) {
 	}
 
 	h := handlers.HandleUpdateDisk(updateDiskDeps(qemuSvc, updateClusterWith(100), nil))
-	_, err := h.Handle(context.Background(), marshalArgs(diskCID, map[string]any{
+	_, err := h.Handle(context.Background(), marshalArgs(mustEncodeDiskCID(t, diskCID, nil), map[string]any{
 		"cache": "none",
 	}), jsonrpc.Context{})
 	if err != nil {
@@ -846,7 +847,7 @@ func TestHandleUpdateDisk_ZFSPool_CID(t *testing.T) {
 	}
 
 	h := handlers.HandleUpdateDisk(updateDiskDeps(qemuSvc, updateClusterWith(100), nil))
-	_, err := h.Handle(context.Background(), marshalArgs(diskCID, map[string]any{
+	_, err := h.Handle(context.Background(), marshalArgs(mustEncodeDiskCID(t, diskCID, nil), map[string]any{
 		"iothread": true,
 	}), jsonrpc.Context{})
 	if err != nil {
@@ -935,7 +936,7 @@ func TestHandleUpdateDisk_ResizeUnderStorageLock_RetriesAndSucceeds(t *testing.T
 	}
 
 	h := handlers.HandleUpdateDisk(updateDiskDeps(qemuSvc, updateClusterWith(100), nil))
-	_, err := h.Handle(fastRetryCtx(context.Background()), marshalArgs(diskCID, map[string]any{
+	_, err := h.Handle(fastRetryCtx(context.Background()), marshalArgs(mustEncodeDiskCID(t, diskCID, nil), map[string]any{
 		"size": 20480, // 20 GiB, current=10 GiB → delta=10 GiB
 	}), jsonrpc.Context{})
 	if err != nil {
@@ -987,7 +988,7 @@ func TestHandleUpdateDisk_ResizeUnderStorageLock_ExhaustsRetries(t *testing.T) {
 	defer cancel()
 
 	h := handlers.HandleUpdateDisk(updateDiskDeps(qemuSvc, updateClusterWith(100), nil))
-	_, err := h.Handle(ctx, marshalArgs(diskCID, map[string]any{
+	_, err := h.Handle(ctx, marshalArgs(mustEncodeDiskCID(t, diskCID, nil), map[string]any{
 		"size": 20480,
 	}), jsonrpc.Context{})
 	if err == nil {

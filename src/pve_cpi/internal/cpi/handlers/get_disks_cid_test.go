@@ -42,15 +42,17 @@ func TestHandleGetDisks_ReturnsRecordedCIDWhenPresent(t *testing.T) {
 }
 
 // TestHandleGetDisks_FallsBackWhenVolidNotRecorded verifies get_disks falls
-// back to the bare volid when a sentinel is present but has no entry for the
-// currently-attached volid (e.g. a stale entry for a different disk).
+// back to the bare volid, re-encoded through EncodeDiskCID, when a sentinel
+// is present but has no entry for the currently-attached volid (e.g. a stale
+// entry for a different disk).
 func TestHandleGetDisks_FallsBackWhenVolidNotRecorded(t *testing.T) {
 	t.Parallel()
+	const bareVolid = "local-lvm:vm-9001-disk-0"
 	qemuSvc := &getDisksQEMUService{
 		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
 			return map[string]any{
 				"scsi0":       "local-lvm:vm-100-disk-0",
-				"scsi1":       "local-lvm:vm-9001-disk-0",
+				"scsi1":       bareVolid,
 				"description": `<!--BOSH:{"bosh_attached_disks":{"local-lvm:vm-9099-disk-0":"pvd-other"}}-->`,
 			}, nil
 		},
@@ -63,21 +65,23 @@ func TestHandleGetDisks_FallsBackWhenVolidNotRecorded(t *testing.T) {
 	}
 
 	diskCIDs := result.([]string)
-	if len(diskCIDs) != 1 || diskCIDs[0] != "local-lvm:vm-9001-disk-0" {
-		t.Errorf("want bare volid fallback [local-lvm:vm-9001-disk-0], got %v", diskCIDs)
+	want := mustEncodeDiskCID(t, bareVolid, nil)
+	if len(diskCIDs) != 1 || diskCIDs[0] != want {
+		t.Errorf("want re-encoded fallback [%s], got %v", want, diskCIDs)
 	}
 }
 
 // TestHandleGetDisks_CorruptSentinel_FallsBackGracefully verifies a
 // corrupted description sentinel does not error get_disks; every disk falls
-// back to its bare volid.
+// back to its bare volid, re-encoded through EncodeDiskCID.
 func TestHandleGetDisks_CorruptSentinel_FallsBackGracefully(t *testing.T) {
 	t.Parallel()
+	const bareVolid = "local-lvm:vm-9001-disk-0"
 	qemuSvc := &getDisksQEMUService{
 		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
 			return map[string]any{
 				"scsi0":       "local-lvm:vm-100-disk-0",
-				"scsi1":       "local-lvm:vm-9001-disk-0",
+				"scsi1":       bareVolid,
 				"description": `<!--BOSH:{not valid json-->`,
 			}, nil
 		},
@@ -90,21 +94,25 @@ func TestHandleGetDisks_CorruptSentinel_FallsBackGracefully(t *testing.T) {
 	}
 
 	diskCIDs := result.([]string)
-	if len(diskCIDs) != 1 || diskCIDs[0] != "local-lvm:vm-9001-disk-0" {
-		t.Errorf("want bare volid fallback on corrupt sentinel, got %v", diskCIDs)
+	want := mustEncodeDiskCID(t, bareVolid, nil)
+	if len(diskCIDs) != 1 || diskCIDs[0] != want {
+		t.Errorf("want re-encoded fallback on corrupt sentinel [%s], got %v", want, diskCIDs)
 	}
 }
 
 // TestHandleGetDisks_NoDescription_FallsBackToBareVolid verifies the
 // no-sentinel-at-all case (pre-feature VM, or a disk attached by a
-// pre-envelope CPI release) still returns the bare volid unchanged.
+// pre-envelope CPI release) returns the bare volid re-encoded through
+// EncodeDiskCID — a decodable pvd- envelope rather than the raw
+// "<storage>:<volid>" string every other disk handler now rejects.
 func TestHandleGetDisks_NoDescription_FallsBackToBareVolid(t *testing.T) {
 	t.Parallel()
+	const bareVolid = "local-lvm:vm-9001-disk-0"
 	qemuSvc := &getDisksQEMUService{
 		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
 			return map[string]any{
 				"scsi0": "local-lvm:vm-100-disk-0",
-				"scsi1": "local-lvm:vm-9001-disk-0",
+				"scsi1": bareVolid,
 			}, nil
 		},
 	}
@@ -116,8 +124,9 @@ func TestHandleGetDisks_NoDescription_FallsBackToBareVolid(t *testing.T) {
 	}
 
 	diskCIDs := result.([]string)
-	if len(diskCIDs) != 1 || diskCIDs[0] != "local-lvm:vm-9001-disk-0" {
-		t.Errorf("want bare volid fallback, got %v", diskCIDs)
+	want := mustEncodeDiskCID(t, bareVolid, nil)
+	if len(diskCIDs) != 1 || diskCIDs[0] != want {
+		t.Errorf("want re-encoded fallback [%s], got %v", want, diskCIDs)
 	}
 }
 
@@ -185,7 +194,7 @@ func TestAttachThenGetDisks_RoundTripReturnsExactCID(t *testing.T) {
 	t.Parallel()
 	const vmCID = "100"
 	bareVolid := "local-lvm:vm-9010-disk-0"
-	envelopeCID := pve.EncodeDiskCID(bareVolid, &pve.DiskCIDMeta{Pool: "local-lvm", Node: "pve-node1", AZ: "az1"})
+	envelopeCID := mustEncodeDiskCID(t, bareVolid, &pve.DiskCIDMeta{Pool: "local-lvm", Node: "pve-node1", AZ: "az1"})
 
 	store := &roundTripCfgStore{cfg: map[string]any{
 		"scsi0": testDiskCID,
@@ -204,7 +213,7 @@ func TestAttachThenGetDisks_RoundTripReturnsExactCID(t *testing.T) {
 	deps := testDepsFoundVM(100, qemuSvc, nodesSvc, nil, &captureAgent{})
 
 	attachH := handlers.HandleAttachDisk(deps)
-	if _, err := attachH.Handle(context.Background(), attachArgs(vmCID, envelopeCID), jsonrpc.Context{}); err != nil {
+	if _, err := attachH.Handle(context.Background(), attachArgs(t, vmCID, envelopeCID), jsonrpc.Context{}); err != nil {
 		t.Fatalf("attach_disk: unexpected error: %v", err)
 	}
 

@@ -62,7 +62,7 @@ func TestHandleDetachDisk_RemovesRecordedCID(t *testing.T) {
 	}
 	h := handlers.HandleDetachDisk(detachDepsWithNodes(qemuSvc, nodesSvc))
 
-	result, err := h.Handle(context.Background(), detachArgs(vmCID, diskCID), jsonrpc.Context{})
+	result, err := h.Handle(context.Background(), detachArgs(t, vmCID, diskCID), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -109,7 +109,7 @@ func TestHandleDetachDisk_NoRecordedCID_SkipsSentinelWrite(t *testing.T) {
 	}
 	h := handlers.HandleDetachDisk(detachDepsWithNodes(qemuSvc, nodesSvc))
 
-	_, err := h.Handle(context.Background(), detachArgs(vmCID, diskCID), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), detachArgs(t, vmCID, diskCID), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -140,7 +140,7 @@ func TestHandleDetachDisk_CIDRemoveFailureDoesNotFailDetach(t *testing.T) {
 	}
 	h := handlers.HandleDetachDisk(detachDepsWithNodes(qemuSvc, nodesSvc))
 
-	result, err := h.Handle(context.Background(), detachArgs(vmCID, diskCID), jsonrpc.Context{})
+	result, err := h.Handle(context.Background(), detachArgs(t, vmCID, diskCID), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("detach_disk must succeed despite CID-remove failure: %v", err)
 	}

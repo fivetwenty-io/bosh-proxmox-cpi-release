@@ -276,9 +276,18 @@ func cleanupVM(ctx context.Context, deps Deps, node string, vmid int, env map[st
 		}
 	}
 
-	// Purge the VM
+	// Purge the VM. DestroyUnreferencedDisks follows pve.destroy_unreferenced_disks
+	// (default false; see the config field doc for the cross-cluster shared-storage
+	// data-loss hazard enabling it introduces). This rollback fires on every failed
+	// create (placement rejection, cloud-init error, NIC validation error, ...) —
+	// a routine path, not an exceptional one — so it must honor the same safety
+	// default every other DeleteQemu call site does (delete_vm.go's straggler
+	// sweep, sync path, and fast path all read the same config field). deps.Config
+	// nil-checked here (unlike a method call such as KeepFailedVMsEnabled, a plain
+	// field read has no nil-receiver safety of its own) because cleanupVM is a
+	// shared rollback helper reachable with deps.Config unset.
 	purge := true
-	destroyUnref := true
+	destroyUnref := deps.Config != nil && deps.Config.DestroyUnreferencedDisks
 	delResp, delErr := deps.PVE.Nodes().DeleteQemu(ctx, node, vmCID, &sdknodes.DeleteQemuParams{
 		Purge:                    &purge,
 		DestroyUnreferencedDisks: &destroyUnref,

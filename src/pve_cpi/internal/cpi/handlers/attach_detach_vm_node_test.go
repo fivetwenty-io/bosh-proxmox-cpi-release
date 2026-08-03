@@ -98,7 +98,7 @@ func TestHandleAttachDisk_SharedDisk_TargetsVMNodeNotDefault(t *testing.T) {
 	}
 
 	h := handlers.HandleAttachDisk(deps)
-	result, err := h.Handle(context.Background(), attachArgs(vmCID, volid), jsonrpc.Context{})
+	result, err := h.Handle(context.Background(), attachArgs(t, vmCID, volid), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -137,7 +137,7 @@ func TestHandleDetachDisk_SharedDisk_TargetsVMNodeNotDefault(t *testing.T) {
 	}
 
 	h := handlers.HandleDetachDisk(deps)
-	_, err := h.Handle(context.Background(), marshalArgs(vmCID, volid), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), detachArgs(t, vmCID, volid), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

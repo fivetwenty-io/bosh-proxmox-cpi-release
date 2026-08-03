@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strconv"
 	"strings"
 
@@ -48,8 +49,11 @@ var systemDiskSlots = map[string]bool{
 //     any disk whose option string contains "media=cdrom").
 //  6. For each remaining disk, extract the bare volid (the part before the first
 //     comma in the option string). Return the recorded disk_cid from the VM's
-//     description sentinel (pve.GetAttachedDiskCIDs) when attach_disk recorded
-//     one for this volid; otherwise fall back to the bare volid.
+//     description sentinel (pve.GetAttachedDiskCIDs) when attach_disk or
+//     create_vm's persistent-disk attach recorded one for this volid;
+//     otherwise re-encode the bare volid through pve.EncodeDiskCID (a
+//     metadata-free pvd- envelope) so the fallback is a value every other
+//     disk handler (attach_disk, detach_disk, delete_disk, ...) can decode.
 //  7. Return the list. An empty list is a valid response when no persistent disks
 //     are attached.
 //
@@ -117,9 +121,13 @@ func HandleGetDisks(deps Deps) Handler {
 		// may have received an opaque envelope CID (metadata that cannot be
 		// reconstructed from PVE state) — so recordedCIDs, read from the VM's
 		// description sentinel, supplies the exact string when attach_disk
-		// recorded one. Absent entry (disk attached by a pre-envelope CPI
-		// release, or the sentinel write failed) falls back to the bare
-		// volid, matching pre-feature behavior.
+		// or create_vm's persistent-disk attach recorded one. Absent entry
+		// (disk attached by a pre-envelope CPI release, or the sentinel
+		// write failed) falls back to the bare volid re-encoded through
+		// pve.EncodeDiskCID (metadata-free): the codec rejects a raw
+		// "<storage>:<volid>" string everywhere else (attach_disk,
+		// detach_disk, delete_disk, ...), so a fallback CID must be a
+		// well-formed envelope, not the pre-envelope-era bare form.
 		// ----------------------------------------------------------------
 		allDisks := qemu.ParseDisks(cfg)
 		recordedCIDs := pve.GetAttachedDiskCIDs(pve.DescriptionFromConfig(cfg))
@@ -151,7 +159,17 @@ func HandleGetDisks(deps Deps) Handler {
 				diskCIDs = append(diskCIDs, recordedCID)
 				recordedCount++
 			} else {
-				diskCIDs = append(diskCIDs, bareVolid)
+				// No sentinel entry for this volid: wrap it in a metadata-free
+				// pvd- envelope rather than returning the raw "<storage>:<volid>"
+				// string, which every other disk handler now hard-rejects.
+				// EncodeDiskCID only fails on an empty bareCID, which cannot
+				// happen here (checked above), but the error is still handled
+				// rather than ignored to honor the function's documented contract.
+				encoded, encErr := pve.EncodeDiskCID(bareVolid, nil)
+				if encErr != nil {
+					return nil, cpierrors.Wrap(encErr, fmt.Sprintf("get_disks: encode fallback CID for VM %s disk %s", vmCID, bareVolid))
+				}
+				diskCIDs = append(diskCIDs, encoded)
 				fallbackCount++
 			}
 		}

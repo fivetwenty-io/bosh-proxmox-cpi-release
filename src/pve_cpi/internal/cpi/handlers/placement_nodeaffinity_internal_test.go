@@ -203,19 +203,33 @@ func TestWarnSingleNodeAZPin_SingleNodeStrict_Warns(t *testing.T) {
 	var buf bytes.Buffer
 	warnSingleNodeAZPin("z1", []string{"pve01"}, true, warnLogger(t, &buf))
 	out := buf.String()
-	if !strings.Contains(out, "single-node AZ") {
-		t.Errorf("expected single-node-AZ warning, got %q", out)
+	if !strings.Contains(out, "small node set") {
+		t.Errorf("expected small-node-set warning, got %q", out)
 	}
 	if !strings.Contains(out, "z1") || !strings.Contains(out, "pve01") {
 		t.Errorf("expected warning to name AZ z1 and node pve01, got %q", out)
 	}
 }
 
-func TestWarnSingleNodeAZPin_MultiNode_NoWarn(t *testing.T) {
+func TestWarnSingleNodeAZPin_TwoNodeStrict_Warns(t *testing.T) {
+	// A two-node pinned set still wedges if both nodes are simultaneously
+	// down or drained, so it must warn just like the single-node case.
 	var buf bytes.Buffer
 	warnSingleNodeAZPin("z1", []string{"pve01", "pve02"}, true, warnLogger(t, &buf))
+	out := buf.String()
+	if !strings.Contains(out, "small node set") {
+		t.Errorf("expected small-node-set warning for a two-node AZ, got %q", out)
+	}
+	if !strings.Contains(out, "pve01") || !strings.Contains(out, "pve02") {
+		t.Errorf("expected warning to name both nodes, got %q", out)
+	}
+}
+
+func TestWarnSingleNodeAZPin_ThreeOrMoreNodes_NoWarn(t *testing.T) {
+	var buf bytes.Buffer
+	warnSingleNodeAZPin("z1", []string{"pve01", "pve02", "pve03"}, true, warnLogger(t, &buf))
 	if out := buf.String(); out != "" {
-		t.Errorf("multi-node AZ must not warn, got %q", out)
+		t.Errorf("AZ with >= 3 nodes must not warn, got %q", out)
 	}
 }
 
@@ -234,8 +248,8 @@ func TestWarnSingleNodeAZPin_DedupCollapsesToSingleNode(t *testing.T) {
 	// Blank and duplicate entries collapse to one effective node; the hazard
 	// still applies and must be reported on the effective, not raw, count.
 	warnSingleNodeAZPin("z1", []string{"pve01", "", "pve01", "  "}, true, warnLogger(t, &buf))
-	if out := buf.String(); !strings.Contains(out, "single-node AZ") {
-		t.Errorf("expected single-node-AZ warning after dedup, got %q", out)
+	if out := buf.String(); !strings.Contains(out, "small node set") {
+		t.Errorf("expected small-node-set warning after dedup, got %q", out)
 	}
 }
 
@@ -261,12 +275,12 @@ func TestApplyAZNodeAffinityPin_SingleNodeAZ_WarnsEndToEnd(t *testing.T) {
 		createVMCloudProps{AvailabilityZone: "z1"}, "pve01", logger); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if out := buf.String(); !strings.Contains(out, "single-node AZ") {
-		t.Errorf("expected single-node-AZ warning through applyAZNodeAffinityPin, got %q", out)
+	if out := buf.String(); !strings.Contains(out, "small node set") {
+		t.Errorf("expected small-node-set warning through applyAZNodeAffinityPin, got %q", out)
 	}
 }
 
-func TestApplyAZNodeAffinityPin_MultiNodeAZ_NoSingleNodeWarn(t *testing.T) {
+func TestApplyAZNodeAffinityPin_TwoNodeAZ_WarnsEndToEnd(t *testing.T) {
 	var buf bytes.Buffer
 	stub := newNAStub()
 	deps := Deps{
@@ -280,8 +294,27 @@ func TestApplyAZNodeAffinityPin_MultiNodeAZ_NoSingleNodeWarn(t *testing.T) {
 		createVMCloudProps{AvailabilityZone: "z1"}, "pve01", logger); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if out := buf.String(); strings.Contains(out, "single-node AZ") {
-		t.Errorf("multi-node AZ must not emit the single-node-AZ warning, got %q", out)
+	if out := buf.String(); !strings.Contains(out, "small node set") {
+		t.Errorf("expected small-node-set warning for a two-node AZ through applyAZNodeAffinityPin, got %q", out)
+	}
+}
+
+func TestApplyAZNodeAffinityPin_ThreeNodeAZ_NoSmallNodeSetWarn(t *testing.T) {
+	var buf bytes.Buffer
+	stub := newNAStub()
+	deps := Deps{
+		Config: naPinConfig(map[string][]string{"z1": {"pve01", "pve02", "pve03"}}),
+		PVE:    &icPVEClient{clusterSvc: stub},
+		Agent:  &icAgentStub{},
+		Logger: log.NewNopLogger(),
+	}
+	logger := warnLogger(t, &buf)
+	if err := applyAZNodeAffinityPin(context.Background(), deps, 100,
+		createVMCloudProps{AvailabilityZone: "z1"}, "pve01", logger); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if out := buf.String(); strings.Contains(out, "small node set") {
+		t.Errorf(">=3-node AZ must not emit the small-node-set warning, got %q", out)
 	}
 }
 

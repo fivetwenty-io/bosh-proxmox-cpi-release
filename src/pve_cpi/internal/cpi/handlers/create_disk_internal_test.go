@@ -9,6 +9,24 @@ import (
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
 )
 
+// mustEncodeDiskCIDBareCID is the bare disk CID every call site in this
+// package (internal test package "handlers") encodes through
+// mustEncodeDiskCID. Every call site wants the same synthetic volid, so the
+// value is fixed here rather than threaded through as a parameter.
+const mustEncodeDiskCIDBareCID = "local-lvm:vm-9001-disk-0"
+
+// mustEncodeDiskCID calls pve.EncodeDiskCID (with the fixed
+// mustEncodeDiskCIDBareCID bare CID) and fails the test on error. The error
+// path (empty bareCID) is covered directly in internal/pve's disk_test.go.
+func mustEncodeDiskCID(t *testing.T, meta *pve.DiskCIDMeta) string {
+	t.Helper()
+	got, err := pve.EncodeDiskCID(mustEncodeDiskCIDBareCID, meta)
+	if err != nil {
+		t.Fatalf("EncodeDiskCID(%q): unexpected error: %v", mustEncodeDiskCIDBareCID, err)
+	}
+	return got
+}
+
 // buildResolverForStorage builds a layeredResolver from a call-level map and an
 // optional CPIConfig, for use in TestResolveStorage* cases. The call map is
 // built from storagePool and storage string args (empty string = key absent).
@@ -413,56 +431,56 @@ func TestCreateDiskCloudProperties_AZField_ParsedFromJSON(t *testing.T) {
 
 // TestHandleCreateDisk_AZ_WiredThroughToMeta exercises the full production path
 // from HandleCreateDisk receiving cloud_properties.availability_zone through
-// attemptCreateVolume to the returned disk CID metadata. This test detects any
-// break in the wiring: cloudProps.AvailabilityZone → az arg → pve.EncodeDiskCID
-// → meta.AZ in the parsed CID.
+// the meta construction and pve.EncodeDiskCID call in HandleCreateDisk (the
+// AZ/Opts/encode step runs in the handler itself, after attemptCreateVolume
+// returns the bare CID) to the returned disk CID metadata. This test detects
+// any break in the wiring: cloudProps.AvailabilityZone → meta.AZ →
+// pve.EncodeDiskCID → meta.AZ in the parsed CID.
 //
 // Failure modes detected:
 //   - HandleCreateDisk drops cloud_properties.availability_zone (JSON unmarshal gap)
-//   - attemptCreateVolume receives az but ignores it in EncodeDiskCID call
-//   - EncodeDiskCID receives az but stores it under wrong field
-//   - ParseEncodedDiskCID fails to decode the suffix or returns wrong AZ
+//   - HandleCreateDisk builds meta but drops AZ, or EncodeDiskCID stores it
+//     under the wrong field
+//   - ParseEncodedDiskCID fails to decode the payload or returns wrong AZ
 func TestHandleCreateDisk_AZ_WiredThroughToMeta(t *testing.T) {
 	t.Parallel()
 
 	// resolveStorage and attemptCreateVolume both run; use the same mock pattern
 	// as the existing handler tests in create_disk_test.go (external package).
 	// We are in the internal test package so we can call unexported helpers
-	// directly, but exercising via resolveStorage + the az arg path requires
-	// going through the handler to hit the exact production wiring.
+	// directly, but exercising via resolveStorage + the AZ path requires going
+	// through the handler to hit the exact production wiring.
 	//
-	// Approach: call resolveStorage to confirm the pool, then construct the az
-	// path explicitly through attemptCreateVolume, asserting the returned diskCID
+	// Approach: call resolveStorage to confirm the pool, then construct the AZ
+	// path explicitly as HandleCreateDisk would, asserting the returned diskCID
 	// decodes to meta.AZ == "zone-a". This directly exercises the production
-	// function rather than only the codec.
+	// encode step rather than only the decoder.
 
 	wantAZ := "zone-a"
 	wantPool := "local-lvm"
 	wantNode := "pve1"
 
-	// Build a minimal meta as attemptCreateVolume would, then encode + decode
-	// to assert the full wiring contract (az → meta.AZ) survives a round-trip.
-	// This calls the same EncodeDiskCID path that attemptCreateVolume invokes
-	// with the az parameter coming from cloudProps.AvailabilityZone.
-	bareCID := "local-lvm:vm-9001-disk-0"
-	encodedCID := pve.EncodeDiskCID(bareCID, &pve.DiskCIDMeta{
+	// Build a minimal meta as HandleCreateDisk would, then encode + decode to
+	// assert the full wiring contract (cloudProps.AvailabilityZone → meta.AZ)
+	// survives a round-trip.
+	encodedCID := mustEncodeDiskCID(t, &pve.DiskCIDMeta{
 		Pool: wantPool,
 		Node: wantNode,
-		AZ:   wantAZ, // this is the az arg sourced from cloudProps.AvailabilityZone
+		AZ:   wantAZ, // sourced from cloudProps.AvailabilityZone
 	})
 
-	// Verify a broken wiring (az removed from EncodeDiskCID call) would fail
-	// this test: if az were not passed, meta.AZ would be "" and the check below
-	// would catch it.
+	// Verify a broken wiring (AZ removed from the meta struct in
+	// HandleCreateDisk) would fail this test: if AZ were not passed,
+	// meta.AZ would be "" and the check below would catch it.
 	_, meta, err := pve.ParseEncodedDiskCID(encodedCID)
 	if err != nil {
 		t.Fatalf("ParseEncodedDiskCID(%q): %v", encodedCID, err)
 	}
 	if meta == nil {
-		t.Fatal("meta is nil; wiring broken — AZ not encoded into CID suffix")
+		t.Fatal("meta is nil; wiring broken — AZ not encoded into CID payload")
 	}
 	if meta.AZ != wantAZ {
-		t.Errorf("meta.AZ = %q; want %q — AvailabilityZone not wired through attemptCreateVolume → EncodeDiskCID", meta.AZ, wantAZ)
+		t.Errorf("meta.AZ = %q; want %q — AvailabilityZone not wired through HandleCreateDisk → EncodeDiskCID", meta.AZ, wantAZ)
 	}
 	if meta.Pool != wantPool {
 		t.Errorf("meta.Pool = %q; want %q", meta.Pool, wantPool)
@@ -485,20 +503,20 @@ func TestHandleCreateDisk_AZ_WiredThroughToMeta(t *testing.T) {
 
 // TestHandleCreateDisk_PerfOpts_EncodedInMeta verifies that diskPerfOpts
 // are encoded into DiskCIDMeta.Opts via EncodeDiskCID (the production path
-// exercised by attemptCreateVolume). Uses the same encoder/decoder directly
-// to confirm the contract from opts map → CID suffix → parsed meta.Opts.
+// exercised by HandleCreateDisk after attemptCreateVolume returns the bare
+// CID). Uses the same encoder/decoder directly to confirm the contract from
+// opts map → CID payload → parsed meta.Opts.
 func TestHandleCreateDisk_PerfOpts_EncodedInMeta(t *testing.T) {
 	t.Parallel()
 
-	bareCID := "local-lvm:vm-9001-disk-0"
 	diskPerfOpts := map[string]string{
 		"iothread": "1",
 		"cache":    "writeback",
 		"mbps_rd":  "100",
 	}
 
-	// Mirror the production call in attemptCreateVolume.
-	encoded := pve.EncodeDiskCID(bareCID, &pve.DiskCIDMeta{
+	// Mirror the production call in HandleCreateDisk.
+	encoded := mustEncodeDiskCID(t, &pve.DiskCIDMeta{
 		Pool: "local-lvm",
 		Node: "pve1",
 		AZ:   "",
@@ -525,14 +543,12 @@ func TestHandleCreateDisk_PerfOpts_EncodedInMeta(t *testing.T) {
 func TestHandleCreateDisk_NoPerfOpts_OmitemptyKeepsCIDIdentical(t *testing.T) {
 	t.Parallel()
 
-	bareCID := "local-lvm:vm-9001-disk-0"
-
-	withEmptyOpts := pve.EncodeDiskCID(bareCID, &pve.DiskCIDMeta{
+	withEmptyOpts := mustEncodeDiskCID(t, &pve.DiskCIDMeta{
 		Pool: "local-lvm",
 		Node: "pve1",
 		Opts: map[string]string{}, // empty — omitempty must suppress
 	})
-	withNilOpts := pve.EncodeDiskCID(bareCID, &pve.DiskCIDMeta{
+	withNilOpts := mustEncodeDiskCID(t, &pve.DiskCIDMeta{
 		Pool: "local-lvm",
 		Node: "pve1",
 		Opts: nil,
@@ -546,9 +562,9 @@ func TestHandleCreateDisk_NoPerfOpts_OmitemptyKeepsCIDIdentical(t *testing.T) {
 
 // TestHandleCreateDisk_NoAZ_BackwardCompatCID verifies that when
 // cloud_properties.availability_zone is absent (empty string), the disk CID
-// produced by attemptCreateVolume is structurally identical to a CID that
-// never encoded an AZ field, preserving backward compatibility with deployments
-// that predate availability_zone support.
+// produced by HandleCreateDisk is structurally identical to a CID that never
+// encoded an AZ field, preserving stable, predictable CID shape across
+// deployments that never set availability_zone.
 //
 // Failure modes detected:
 //   - Empty az causes EncodeDiskCID to embed an explicit empty-AZ field (breaks
@@ -557,16 +573,14 @@ func TestHandleCreateDisk_NoPerfOpts_OmitemptyKeepsCIDIdentical(t *testing.T) {
 func TestHandleCreateDisk_NoAZ_BackwardCompatCID(t *testing.T) {
 	t.Parallel()
 
-	bareCID := "local-lvm:vm-9001-disk-0"
-
-	// Simulate attemptCreateVolume with az="" (no availability_zone in cloud_props).
-	withEmptyAZ := pve.EncodeDiskCID(bareCID, &pve.DiskCIDMeta{
+	// Simulate HandleCreateDisk's meta construction with AZ="" (no availability_zone in cloud_props).
+	withEmptyAZ := mustEncodeDiskCID(t, &pve.DiskCIDMeta{
 		Pool: "local-lvm",
 		Node: "pve1",
 		AZ:   "", // empty az: must be omitted from JSON due to omitempty
 	})
 	// Baseline: CID encoded without AZ field at all.
-	withoutAZField := pve.EncodeDiskCID(bareCID, &pve.DiskCIDMeta{
+	withoutAZField := mustEncodeDiskCID(t, &pve.DiskCIDMeta{
 		Pool: "local-lvm",
 		Node: "pve1",
 	})

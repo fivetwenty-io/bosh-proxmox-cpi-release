@@ -300,12 +300,15 @@ func TestHandleGetDisks_EmptyVM(t *testing.T) {
 
 func TestHandleGetDisks_BareVolidNoOptions(t *testing.T) {
 	t.Parallel()
-	// Disk stored as bare volid (no option string) → returned as-is.
+	// Disk stored as bare volid (no option string, no sentinel entry) → the
+	// fallback re-encodes it as a metadata-free pvd- envelope, since the raw
+	// "<storage>:<volid>" form is rejected everywhere else.
+	const bareVolid = "local-lvm:vm-9001-disk-0"
 	qemuSvc := &getDisksQEMUService{
 		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
 			return map[string]any{
-				"scsi0": "local-lvm:vm-100-disk-0",  // system disk
-				"scsi1": "local-lvm:vm-9001-disk-0", // bare volid, no options
+				"scsi0": "local-lvm:vm-100-disk-0", // system disk
+				"scsi1": bareVolid,
 			}, nil
 		},
 	}
@@ -320,8 +323,9 @@ func TestHandleGetDisks_BareVolidNoOptions(t *testing.T) {
 	if len(diskCIDs) != 1 {
 		t.Fatalf("disk count: want 1, got %d: %v", len(diskCIDs), diskCIDs)
 	}
-	if diskCIDs[0] != "local-lvm:vm-9001-disk-0" {
-		t.Errorf("disk_cid: want local-lvm:vm-9001-disk-0, got %q", diskCIDs[0])
+	want := mustEncodeDiskCID(t, bareVolid, nil)
+	if diskCIDs[0] != want {
+		t.Errorf("disk_cid: want re-encoded envelope %q, got %q", want, diskCIDs[0])
 	}
 }
 
@@ -338,7 +342,8 @@ func TestHandleGetDisks_BareVolidNoOptions(t *testing.T) {
 func TestHandleGetDisks_Dir_CID(t *testing.T) {
 	t.Parallel()
 	// dir storage: CID has subpath form "<storage>:<vmid>/<volname>.<ext>".
-	// The colon splits at first occurrence; the full CID is the volid returned.
+	// The colon splits at first occurrence; the full volid, re-encoded through
+	// EncodeDiskCID (no sentinel entry recorded), is the returned CID.
 	const diskCID = "local:9001/vm-9001-disk-0.raw"
 	qemuSvc := &getDisksQEMUService{
 		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
@@ -362,8 +367,9 @@ func TestHandleGetDisks_Dir_CID(t *testing.T) {
 	if len(diskCIDs) != 1 {
 		t.Fatalf("Dir CID: disk count: want 1, got %d: %v", len(diskCIDs), diskCIDs)
 	}
-	if diskCIDs[0] != diskCID {
-		t.Errorf("Dir CID: disk_cid: want %q, got %q", diskCID, diskCIDs[0])
+	want := mustEncodeDiskCID(t, diskCID, nil)
+	if diskCIDs[0] != want {
+		t.Errorf("Dir CID: disk_cid: want re-encoded envelope %q, got %q", want, diskCIDs[0])
 	}
 }
 
@@ -393,8 +399,9 @@ func TestHandleGetDisks_ZFSPool_CID(t *testing.T) {
 	if len(diskCIDs) != 1 {
 		t.Fatalf("ZFSPool CID: disk count: want 1, got %d: %v", len(diskCIDs), diskCIDs)
 	}
-	if diskCIDs[0] != diskCID {
-		t.Errorf("ZFSPool CID: disk_cid: want %q, got %q", diskCID, diskCIDs[0])
+	want := mustEncodeDiskCID(t, diskCID, nil)
+	if diskCIDs[0] != want {
+		t.Errorf("ZFSPool CID: disk_cid: want re-encoded envelope %q, got %q", want, diskCIDs[0])
 	}
 }
 
@@ -424,8 +431,9 @@ func TestHandleGetDisks_LVMThin_CID(t *testing.T) {
 	if len(diskCIDs) != 1 {
 		t.Fatalf("LVMThin CID: disk count: want 1, got %d: %v", len(diskCIDs), diskCIDs)
 	}
-	if diskCIDs[0] != diskCID {
-		t.Errorf("LVMThin CID: disk_cid: want %q, got %q", diskCID, diskCIDs[0])
+	want := mustEncodeDiskCID(t, diskCID, nil)
+	if diskCIDs[0] != want {
+		t.Errorf("LVMThin CID: disk_cid: want re-encoded envelope %q, got %q", want, diskCIDs[0])
 	}
 }
 

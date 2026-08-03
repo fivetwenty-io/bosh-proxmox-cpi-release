@@ -267,7 +267,12 @@ func handleAlreadyDetachedParked(ctx context.Context, deps Deps, diskCID, bareDi
 	parkerCfg := pve.ParkerConfig{
 		VMIDRangeStart: deps.Config.ParkedDiskVMIDRangeStartValue(),
 		VMIDRangeEnd:   deps.Config.ParkedDiskVMIDRangeEndValue(),
-		DirectorID:     deps.Config.StemcellDirectorID(),
+		DirectorID:     deps.RequestDirectorUUID,
+		// DiskStorage feeds WithStorageScan on parker VMID allocation, same as
+		// parkAfterDetach below -- this already-detached (retry) path reaches
+		// the same createParkerVM/NextVMID allocation and must close the same
+		// cross-cluster parker-VMID collision gap.
+		DiskStorage: deps.Config.DiskStorage,
 	}
 	_, _, _, isParked, parkedErr := pve.IsDiskParked(ctx, deps.PVE, deps.Log(ctx), bareDiskCID, parkerCfg)
 	if parkedErr != nil {
@@ -371,7 +376,11 @@ func parkAfterDetach(ctx context.Context, deps Deps, vmCID, diskCID, bareDiskCID
 	parkerCfg := pve.ParkerConfig{
 		VMIDRangeStart: deps.Config.ParkedDiskVMIDRangeStartValue(),
 		VMIDRangeEnd:   deps.Config.ParkedDiskVMIDRangeEndValue(),
-		DirectorID:     deps.Config.StemcellDirectorID(),
+		DirectorID:     deps.RequestDirectorUUID,
+		// DiskStorage feeds WithStorageScan on parker VMID allocation so a
+		// VMID whose number is already claimed by orphaned volumes on the
+		// disk storage is skipped (same guard create_vm applies).
+		DiskStorage: deps.Config.DiskStorage,
 	}
 	pctx := pve.ParkContext{DiskCID: diskCID, SourceVMCID: vmCID}
 	if parkErr := pve.ParkDisk(ctx, deps.PVE, deps.Log(ctx), node, bareDiskCID, parkerCfg, pctx); parkErr != nil {

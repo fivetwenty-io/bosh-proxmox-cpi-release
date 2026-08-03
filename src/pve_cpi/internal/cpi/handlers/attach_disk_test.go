@@ -169,9 +169,21 @@ func attachDepsWithConfig(qemuSvc qemu.Service, ag agent.Agent, cfg *config.CPIC
 	}
 }
 
-// attachArgs builds a two-element arg slice for attach_disk.
-func attachArgs(vmCID, diskCID string) []json.RawMessage {
-	return marshalArgs(vmCID, diskCID)
+// attachArgs builds a two-element arg slice for attach_disk. The handler
+// hard-rejects unenveloped input, so a bare diskCID is wrapped in a pvd-
+// envelope here — callers in this file pass either a bare PVE-volid-shaped
+// string (including deliberately malformed ones used to exercise error
+// paths) or an already-encoded CID built via mustEncodeDiskCID/perfDiskCID
+// (e.g. when the test needs specific meta baked in). An already-encoded or
+// empty diskCID is passed through unchanged so it is never double-wrapped
+// and the handler's own empty-disk_cid rejection still hits that check
+// directly.
+func attachArgs(t *testing.T, vmCID, diskCID string) []json.RawMessage {
+	t.Helper()
+	if diskCID == "" || strings.HasPrefix(diskCID, "pvd-") || strings.HasPrefix(diskCID, "pvz-") {
+		return marshalArgs(vmCID, diskCID)
+	}
+	return marshalArgs(vmCID, mustEncodeDiskCID(t, diskCID, nil))
 }
 
 // extractPath unmarshals result into a map and returns the "path" value.
@@ -214,7 +226,7 @@ func TestHandleAttachDisk_Happy(t *testing.T) {
 	ag := &captureAgent{}
 	h := handlers.HandleAttachDisk(attachDeps(qemuSvc, ag))
 
-	result, err := h.Handle(context.Background(), attachArgs(vmCID, diskCID), jsonrpc.Context{})
+	result, err := h.Handle(context.Background(), attachArgs(t, vmCID, diskCID), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -248,7 +260,7 @@ func TestHandleAttachDisk_AlreadyAttached(t *testing.T) {
 	ag := &captureAgent{}
 	h := handlers.HandleAttachDisk(attachDeps(qemuSvc, ag))
 
-	result, err := h.Handle(context.Background(), attachArgs(vmCID, diskCID), jsonrpc.Context{})
+	result, err := h.Handle(context.Background(), attachArgs(t, vmCID, diskCID), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("unexpected error on already-attached: %v", err)
 	}
@@ -268,7 +280,7 @@ func TestHandleAttachDisk_VMNotFound(t *testing.T) {
 	}
 	h := handlers.HandleAttachDisk(attachDeps(qemuSvc, &captureAgent{}))
 
-	_, err := h.Handle(context.Background(), attachArgs("999", "local-lvm:vol"), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), attachArgs(t, "999", "local-lvm:vol"), jsonrpc.Context{})
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -285,7 +297,7 @@ func TestHandleAttachDisk_AttachFail(t *testing.T) {
 	}
 	h := handlers.HandleAttachDisk(attachDeps(qemuSvc, &captureAgent{}))
 
-	_, err := h.Handle(context.Background(), attachArgs("100", "local-lvm:vol"), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), attachArgs(t, "100", "local-lvm:vol"), jsonrpc.Context{})
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -295,7 +307,7 @@ func TestHandleAttachDisk_AttachFail(t *testing.T) {
 func TestHandleAttachDisk_InvalidVMCID(t *testing.T) {
 	t.Parallel()
 	h := handlers.HandleAttachDisk(attachDeps(&attachQEMUService{}, &captureAgent{}))
-	_, err := h.Handle(context.Background(), attachArgs("not-a-number", "local:vol"), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), attachArgs(t, "not-a-number", "local:vol"), jsonrpc.Context{})
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -308,7 +320,7 @@ func TestHandleAttachDisk_InvalidVMCID(t *testing.T) {
 func TestHandleAttachDisk_InvalidDiskCID(t *testing.T) {
 	t.Parallel()
 	h := handlers.HandleAttachDisk(attachDeps(&attachQEMUService{}, &captureAgent{}))
-	_, err := h.Handle(context.Background(), attachArgs("100", "nodisk"), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), attachArgs(t, "100", "nodisk"), jsonrpc.Context{})
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -331,7 +343,7 @@ func TestHandleAttachDisk_MissingArgs(t *testing.T) {
 func TestHandleAttachDisk_EmptyVMCID(t *testing.T) {
 	t.Parallel()
 	h := handlers.HandleAttachDisk(attachDeps(&attachQEMUService{}, &captureAgent{}))
-	_, err := h.Handle(context.Background(), attachArgs("", "local:vol"), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), attachArgs(t, "", "local:vol"), jsonrpc.Context{})
 	if err == nil {
 		t.Fatal("expected error for empty vm_cid")
 	}
@@ -341,7 +353,7 @@ func TestHandleAttachDisk_EmptyVMCID(t *testing.T) {
 func TestHandleAttachDisk_EmptyDiskCID(t *testing.T) {
 	t.Parallel()
 	h := handlers.HandleAttachDisk(attachDeps(&attachQEMUService{}, &captureAgent{}))
-	_, err := h.Handle(context.Background(), attachArgs("100", ""), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), attachArgs(t, "100", ""), jsonrpc.Context{})
 	if err == nil {
 		t.Fatal("expected error for empty disk_cid")
 	}
@@ -365,7 +377,7 @@ func TestHandleAttachDisk_ResolveFallback(t *testing.T) {
 	ag := &captureAgent{}
 	h := handlers.HandleAttachDisk(attachDeps(qemuSvc, ag))
 
-	result, err := h.Handle(context.Background(), attachArgs("100", "local:vol"), jsonrpc.Context{})
+	result, err := h.Handle(context.Background(), attachArgs(t, "100", "local:vol"), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("unexpected error in fallback path: %v", err)
 	}
@@ -392,7 +404,7 @@ func TestHandleAttachDisk_DiskHintsShape(t *testing.T) {
 	}
 	h := handlers.HandleAttachDisk(attachDeps(qemuSvc, &captureAgent{}))
 
-	result, err := h.Handle(context.Background(), attachArgs("100", "local:"+volid), jsonrpc.Context{})
+	result, err := h.Handle(context.Background(), attachArgs(t, "100", "local:"+volid), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -435,7 +447,7 @@ func TestHandleAttachDisk_FreshVMSkipsSCSI0(t *testing.T) {
 	ag := &captureAgent{}
 	h := handlers.HandleAttachDisk(attachDeps(qemuSvc, ag))
 
-	result, err := h.Handle(context.Background(), attachArgs("100", "data:"+volid), jsonrpc.Context{})
+	result, err := h.Handle(context.Background(), attachArgs(t, "100", "data:"+volid), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -468,7 +480,7 @@ func TestHandleAttachDisk_RootDiskBusSCSI_StillSkipsSCSI0(t *testing.T) {
 	ag := &captureAgent{}
 	h := handlers.HandleAttachDisk(attachDeps(qemuSvc, ag))
 
-	result, err := h.Handle(context.Background(), attachArgs("100", "data:"+volid), jsonrpc.Context{})
+	result, err := h.Handle(context.Background(), attachArgs(t, "100", "data:"+volid), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -506,7 +518,7 @@ func TestHandleAttachDisk_LegacySCSI0Migration(t *testing.T) {
 	ag := &captureAgent{}
 	h := handlers.HandleAttachDisk(attachDeps(qemuSvc, ag))
 
-	result, err := h.Handle(context.Background(), attachArgs("100", diskCID), jsonrpc.Context{})
+	result, err := h.Handle(context.Background(), attachArgs(t, "100", diskCID), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -540,7 +552,7 @@ func TestHandleAttachDisk_PreservesExistingNonZeroSlot(t *testing.T) {
 	ag := &captureAgent{}
 	h := handlers.HandleAttachDisk(attachDeps(qemuSvc, ag))
 
-	result, err := h.Handle(context.Background(), attachArgs("100", diskCID), jsonrpc.Context{})
+	result, err := h.Handle(context.Background(), attachArgs(t, "100", diskCID), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -573,7 +585,7 @@ func TestHandleAttachDisk_PicksLowestFreeAtOrAboveOne(t *testing.T) {
 	ag := &captureAgent{}
 	h := handlers.HandleAttachDisk(attachDeps(qemuSvc, ag))
 
-	result, err := h.Handle(context.Background(), attachArgs("100", "data:"+volid), jsonrpc.Context{})
+	result, err := h.Handle(context.Background(), attachArgs(t, "100", "data:"+volid), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -665,7 +677,7 @@ func TestHandleAttachDisk_GuardBlocksWhenSnapshotsPresent(t *testing.T) {
 	ag := &captureAgent{}
 	h := handlers.HandleAttachDisk(attachDepsWithConfig(qemuSvc, ag, guardCfg(false, false)))
 
-	_, err := h.Handle(context.Background(), attachArgs("100", diskCID), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), attachArgs(t, "100", diskCID), jsonrpc.Context{})
 	if err == nil {
 		t.Fatal("expected error when snapshots present; got nil")
 	}
@@ -692,7 +704,7 @@ func TestHandleAttachDisk_GuardProceedsWhenNoSnapshots(t *testing.T) {
 	ag := &captureAgent{}
 	h := handlers.HandleAttachDisk(attachDepsWithConfig(qemuSvc, ag, guardCfg(false, false)))
 
-	result, err := h.Handle(context.Background(), attachArgs("100", diskCID), jsonrpc.Context{})
+	result, err := h.Handle(context.Background(), attachArgs(t, "100", diskCID), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("unexpected error when no snapshots: %v", err)
 	}
@@ -714,7 +726,7 @@ func TestHandleAttachDisk_GuardCheckErrorFailOpen(t *testing.T) {
 	ag := &captureAgent{}
 	h := handlers.HandleAttachDisk(attachDepsWithConfig(qemuSvc, ag, guardCfg(false, false)))
 
-	result, err := h.Handle(context.Background(), attachArgs("100", diskCID), jsonrpc.Context{})
+	result, err := h.Handle(context.Background(), attachArgs(t, "100", diskCID), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("expected fail-open (proceed with warn) when RequireSnapshotCheckPass=false; got error: %v", err)
 	}
@@ -738,7 +750,7 @@ func TestHandleAttachDisk_GuardCheckErrorFailClosed(t *testing.T) {
 	ag := &captureAgent{}
 	h := handlers.HandleAttachDisk(attachDepsWithConfig(qemuSvc, ag, guardCfg(false, true)))
 
-	_, err := h.Handle(context.Background(), attachArgs("100", diskCID), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), attachArgs(t, "100", diskCID), jsonrpc.Context{})
 	if err == nil {
 		t.Fatal("expected error when RequireSnapshotCheckPass=true and check fails; got nil")
 	}
@@ -759,7 +771,7 @@ func TestHandleAttachDisk_GuardAllowOverrideProceeds(t *testing.T) {
 	ag := &captureAgent{}
 	h := handlers.HandleAttachDisk(attachDepsWithConfig(qemuSvc, ag, guardCfg(true, false)))
 
-	result, err := h.Handle(context.Background(), attachArgs("100", diskCID), jsonrpc.Context{})
+	result, err := h.Handle(context.Background(), attachArgs(t, "100", diskCID), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("expected proceed when AllowDiskOpsWithSnapshots=true; got error: %v", err)
 	}
@@ -882,7 +894,7 @@ func TestHandleAttachDisk_LocalBackend_CoLocationEnforced(t *testing.T) {
 	}
 
 	h := handlers.HandleAttachDisk(deps)
-	_, err := h.Handle(context.Background(), attachArgs(vmCID, diskCID), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), attachArgs(t, vmCID, diskCID), jsonrpc.Context{})
 	if err == nil {
 		t.Fatal("expected co-location error; got nil")
 	}
@@ -922,7 +934,7 @@ func TestHandleAttachDisk_LVM_CID(t *testing.T) {
 	ag := &captureAgent{}
 	h := handlers.HandleAttachDisk(attachDeps(qemuSvc, ag))
 
-	result, err := h.Handle(context.Background(), attachArgs("100", diskCID), jsonrpc.Context{})
+	result, err := h.Handle(context.Background(), attachArgs(t, "100", diskCID), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("LVM CID: unexpected error: %v", err)
 	}
@@ -944,7 +956,7 @@ func TestHandleAttachDisk_ZFSPool_CID(t *testing.T) {
 	ag := &captureAgent{}
 	h := handlers.HandleAttachDisk(attachDeps(qemuSvc, ag))
 
-	result, err := h.Handle(context.Background(), attachArgs("100", diskCID), jsonrpc.Context{})
+	result, err := h.Handle(context.Background(), attachArgs(t, "100", diskCID), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("ZFSPool CID: unexpected error: %v", err)
 	}
@@ -967,7 +979,7 @@ func TestHandleAttachDisk_Dir_CID(t *testing.T) {
 	ag := &captureAgent{}
 	h := handlers.HandleAttachDisk(attachDeps(qemuSvc, ag))
 
-	result, err := h.Handle(context.Background(), attachArgs("100", diskCID), jsonrpc.Context{})
+	result, err := h.Handle(context.Background(), attachArgs(t, "100", diskCID), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("Dir CID: unexpected error: %v", err)
 	}
@@ -988,7 +1000,7 @@ func TestHandleAttachDisk_LVMThin_CID(t *testing.T) {
 	ag := &captureAgent{}
 	h := handlers.HandleAttachDisk(attachDeps(qemuSvc, ag))
 
-	result, err := h.Handle(context.Background(), attachArgs("100", diskCID), jsonrpc.Context{})
+	result, err := h.Handle(context.Background(), attachArgs(t, "100", diskCID), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("LVMThin CID: unexpected error: %v", err)
 	}
@@ -1038,7 +1050,7 @@ func TestHandleAttachDisk_AuthFailure(t *testing.T) {
 	}
 	h := handlers.HandleAttachDisk(attachDeps(qemuSvc, &captureAgent{}))
 
-	_, err := h.Handle(context.Background(), attachArgs("100", "local-lvm:vm-9001-disk-0"), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), attachArgs(t, "100", "local-lvm:vm-9001-disk-0"), jsonrpc.Context{})
 	if err == nil {
 		t.Fatal("expected error from 401 auth failure")
 	}
@@ -1110,7 +1122,7 @@ func TestAttachDisk_ConcurrentSameVM(t *testing.T) {
 			// Independent QEMU service + captureAgent per goroutine — no shared mutable state.
 			ag := &captureAgent{}
 			h := handlers.HandleAttachDisk(attachDeps(newQEMU(), ag))
-			_, err := h.Handle(context.Background(), attachArgs(vmCID, diskCID), jsonrpc.Context{})
+			_, err := h.Handle(context.Background(), attachArgs(t, vmCID, diskCID), jsonrpc.Context{})
 			results <- callResult{err: err}
 		}()
 	}
@@ -1159,8 +1171,13 @@ func TestAttachDisk_ConcurrentSameVM(t *testing.T) {
 
 // perfDiskCID encodes a bare disk CID with the given option map in its
 // metadata suffix. Mirrors what create_disk produces at CID-encode time.
-func perfDiskCID(bare string, opts map[string]string) string {
-	return pve.EncodeDiskCID(bare, &pve.DiskCIDMeta{Opts: opts})
+func perfDiskCID(t *testing.T, bare string, opts map[string]string) string {
+	t.Helper()
+	got, err := pve.EncodeDiskCID(bare, &pve.DiskCIDMeta{Opts: opts})
+	if err != nil {
+		t.Fatalf("EncodeDiskCID(%q): unexpected error: %v", bare, err)
+	}
+	return got
 }
 
 // attachDepsPerf builds Deps with a caller-supplied CPIConfig for perf tests.
@@ -1181,7 +1198,7 @@ func TestHandleAttachDisk_PerfOpts_MetaOptsApplied(t *testing.T) {
 	t.Parallel()
 	const bareCID = "local-lvm:vm-9001-disk-0"
 	metaOpts := map[string]string{"iothread": "1", "cache": "writeback"}
-	encodedCID := perfDiskCID(bareCID, metaOpts)
+	encodedCID := perfDiskCID(t, bareCID, metaOpts)
 
 	qemuSvc := &attachQEMUService{
 		attachReturnDiskID: "scsi1",
@@ -1195,7 +1212,7 @@ func TestHandleAttachDisk_PerfOpts_MetaOptsApplied(t *testing.T) {
 	}
 	h := handlers.HandleAttachDisk(attachDepsPerf(qemuSvc, &captureAgent{}, cfg))
 
-	_, err := h.Handle(context.Background(), attachArgs("100", encodedCID), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), attachArgs(t, "100", encodedCID), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1232,7 +1249,7 @@ func TestHandleAttachDisk_PerfOpts_NoConfigCurrentDefaultApplied(t *testing.T) {
 	}
 	h := handlers.HandleAttachDisk(attachDepsPerf(qemuSvc, &captureAgent{}, cfg))
 
-	_, err := h.Handle(context.Background(), attachArgs("100", bareCID), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), attachArgs(t, "100", bareCID), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1263,7 +1280,7 @@ func TestHandleAttachDisk_PerfOpts_ExplicitOptOut_BareNoOptions(t *testing.T) {
 	}
 	h := handlers.HandleAttachDisk(attachDepsPerf(qemuSvc, &captureAgent{}, cfg))
 
-	_, err := h.Handle(context.Background(), attachArgs("100", bareCID), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), attachArgs(t, "100", bareCID), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1296,7 +1313,7 @@ func TestHandleAttachDisk_PerfOpts_GlobalDefaultApplied(t *testing.T) {
 	}
 	h := handlers.HandleAttachDisk(attachDepsPerf(qemuSvc, &captureAgent{}, cfg))
 
-	_, err := h.Handle(context.Background(), attachArgs("100", bareCID), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), attachArgs(t, "100", bareCID), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1314,7 +1331,7 @@ func TestHandleAttachDisk_PerfOpts_PerDiskWinsOverGlobal(t *testing.T) {
 	t.Parallel()
 	const bareCID = "local-lvm:vm-9001-disk-0"
 	// Per-disk meta overrides cache with writeback.
-	encodedCID := perfDiskCID(bareCID, map[string]string{"cache": "writeback"})
+	encodedCID := perfDiskCID(t, bareCID, map[string]string{"cache": "writeback"})
 
 	qemuSvc := &attachQEMUService{
 		attachReturnDiskID: "scsi1",
@@ -1336,7 +1353,7 @@ func TestHandleAttachDisk_PerfOpts_PerDiskWinsOverGlobal(t *testing.T) {
 	}
 	h := handlers.HandleAttachDisk(attachDepsPerf(qemuSvc, &captureAgent{}, cfg))
 
-	_, err := h.Handle(context.Background(), attachArgs("100", encodedCID), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), attachArgs(t, "100", encodedCID), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1352,9 +1369,10 @@ func TestHandleAttachDisk_PerfOpts_PerDiskWinsOverGlobal(t *testing.T) {
 // introduces iothread=true. The merge pins cache=writeback (per-disk wins) yet
 // adds iothread=1, which the disk did not have at creation — a structural
 // invariant divergence. mode is the disk_perf_invariant_mode config value.
-func invariantDivergenceSetup(mode string) (*attachQEMUService, *config.CPIConfig, string) {
+func invariantDivergenceSetup(t *testing.T, mode string) (*attachQEMUService, *config.CPIConfig, string) {
+	t.Helper()
 	const bareCID = "local-lvm:vm-9100-disk-0"
-	encodedCID := perfDiskCID(bareCID, map[string]string{"cache": "writeback"})
+	encodedCID := perfDiskCID(t, bareCID, map[string]string{"cache": "writeback"})
 	qemuSvc := &attachQEMUService{
 		attachReturnDiskID: "scsi1",
 		configCfg:          map[string]any{"scsi1": bareCID},
@@ -1374,10 +1392,10 @@ func invariantDivergenceSetup(mode string) (*attachQEMUService, *config.CPIConfi
 // non-retriable CloudError BEFORE any AttachDisk call (no orphan).
 func TestHandleAttachDisk_Invariant_EnforceRejects(t *testing.T) {
 	t.Parallel()
-	qemuSvc, cfg, encodedCID := invariantDivergenceSetup("") // empty → enforce
+	qemuSvc, cfg, encodedCID := invariantDivergenceSetup(t, "") // empty → enforce
 
 	h := handlers.HandleAttachDisk(attachDepsPerf(qemuSvc, &captureAgent{}, cfg))
-	_, err := h.Handle(context.Background(), attachArgs("100", encodedCID), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), attachArgs(t, "100", encodedCID), jsonrpc.Context{})
 
 	if err == nil {
 		t.Fatal("expected enforce-mode invariant divergence to error, got nil")
@@ -1397,10 +1415,10 @@ func TestHandleAttachDisk_Invariant_EnforceRejects(t *testing.T) {
 // proceeds, applying the merged options (cache=writeback,iothread=1).
 func TestHandleAttachDisk_Invariant_WarnProceeds(t *testing.T) {
 	t.Parallel()
-	qemuSvc, cfg, encodedCID := invariantDivergenceSetup("warn")
+	qemuSvc, cfg, encodedCID := invariantDivergenceSetup(t, "warn")
 
 	h := handlers.HandleAttachDisk(attachDepsPerf(qemuSvc, &captureAgent{}, cfg))
-	_, err := h.Handle(context.Background(), attachArgs("100", encodedCID), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), attachArgs(t, "100", encodedCID), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("warn mode must not error, got: %v", err)
 	}
@@ -1415,10 +1433,10 @@ func TestHandleAttachDisk_Invariant_WarnProceeds(t *testing.T) {
 // entirely and proceeds with the merged options.
 func TestHandleAttachDisk_Invariant_OffSkips(t *testing.T) {
 	t.Parallel()
-	qemuSvc, cfg, encodedCID := invariantDivergenceSetup("off")
+	qemuSvc, cfg, encodedCID := invariantDivergenceSetup(t, "off")
 
 	h := handlers.HandleAttachDisk(attachDepsPerf(qemuSvc, &captureAgent{}, cfg))
-	_, err := h.Handle(context.Background(), attachArgs("100", encodedCID), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), attachArgs(t, "100", encodedCID), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("off mode must not error, got: %v", err)
 	}
@@ -1436,7 +1454,7 @@ func TestHandleAttachDisk_Invariant_OffSkips(t *testing.T) {
 func TestHandleAttachDisk_Invariant_EnforceNoDivergence(t *testing.T) {
 	t.Parallel()
 	const bareCID = "local-lvm:vm-9001-disk-0"
-	encodedCID := perfDiskCID(bareCID, map[string]string{"cache": "writeback"})
+	encodedCID := perfDiskCID(t, bareCID, map[string]string{"cache": "writeback"})
 	qemuSvc := &attachQEMUService{
 		attachReturnDiskID: "scsi1",
 		configCfg:          map[string]any{"scsi1": bareCID},
@@ -1456,7 +1474,7 @@ func TestHandleAttachDisk_Invariant_EnforceNoDivergence(t *testing.T) {
 	}
 
 	h := handlers.HandleAttachDisk(attachDepsPerf(qemuSvc, &captureAgent{}, cfg))
-	_, err := h.Handle(context.Background(), attachArgs("100", encodedCID), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), attachArgs(t, "100", encodedCID), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("enforce mode must not error when effective matches creation, got: %v", err)
 	}
@@ -1586,7 +1604,7 @@ func TestHandleAttachDisk_Parked_UnparksBeforeAttach(t *testing.T) {
 	}
 
 	h := handlers.HandleAttachDisk(deps)
-	result, err := h.Handle(context.Background(), attachArgs("100", bareCID), jsonrpc.Context{})
+	result, err := h.Handle(context.Background(), attachArgs(t, "100", bareCID), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("parked disk attach: unexpected error: %v", err)
 	}
@@ -1635,7 +1653,7 @@ func TestHandleAttachDisk_Parked_FreeFloatingProceedsNormally(t *testing.T) {
 	}
 
 	h := handlers.HandleAttachDisk(deps)
-	result, err := h.Handle(context.Background(), attachArgs("100", bareCID), jsonrpc.Context{})
+	result, err := h.Handle(context.Background(), attachArgs(t, "100", bareCID), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("free-floating under parked strategy: unexpected error: %v", err)
 	}
@@ -1679,7 +1697,7 @@ func TestHandleAttachDisk_Parked_UnparkFailRetriable(t *testing.T) {
 	}
 
 	h := handlers.HandleAttachDisk(deps)
-	_, err := h.Handle(context.Background(), attachArgs("100", bareCID), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), attachArgs(t, "100", bareCID), jsonrpc.Context{})
 	if err == nil {
 		t.Fatal("expected retriable error when unpark fails; got nil")
 	}
@@ -1740,7 +1758,7 @@ func TestHandleAttachDisk_StrategyFree_NoParkerCalls(t *testing.T) {
 	}
 
 	h := handlers.HandleAttachDisk(deps)
-	result, err := h.Handle(context.Background(), attachArgs("100", bareCID), jsonrpc.Context{})
+	result, err := h.Handle(context.Background(), attachArgs(t, "100", bareCID), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("strategy=free: unexpected error: %v", err)
 	}

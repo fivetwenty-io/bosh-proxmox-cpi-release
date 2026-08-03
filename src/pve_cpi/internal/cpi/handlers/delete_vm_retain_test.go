@@ -329,17 +329,15 @@ func TestDetachRetainedEphemeralDisk_NoEphemeralSlot(t *testing.T) {
 func TestCreateDiskCloudProperties_RetainOnDelete_OmitEmpty(t *testing.T) {
 	t.Parallel()
 
-	bareCID := "local-lvm:vm-9001-disk-0"
-
 	// Nil retain_on_delete → no opts key added.
-	withNil := pve.EncodeDiskCID(bareCID, &pve.DiskCIDMeta{
+	withNil := mustEncodeDiskCID(t, &pve.DiskCIDMeta{
 		Pool: "local-lvm",
 		Node: "pve1",
 		Opts: nil,
 	})
 	// Simulate what HandleCreateDisk produces when RetainOnDelete is nil:
 	// diskPerfOpts is nil → EncodeDiskCID gets nil Opts → omitempty omits.
-	withoutFlag := pve.EncodeDiskCID(bareCID, &pve.DiskCIDMeta{
+	withoutFlag := mustEncodeDiskCID(t, &pve.DiskCIDMeta{
 		Pool: "local-lvm",
 		Node: "pve1",
 	})
@@ -354,12 +352,11 @@ func TestCreateDiskCloudProperties_RetainOnDelete_OmitEmpty(t *testing.T) {
 func TestCreateDiskCloudProperties_RetainOnDelete_EncodedInOpts(t *testing.T) {
 	t.Parallel()
 
-	bareCID := "local-lvm:vm-9001-disk-0"
 	opts := map[string]string{
 		diskOptRetainOnDelete: "1",
 	}
 
-	encoded := pve.EncodeDiskCID(bareCID, &pve.DiskCIDMeta{
+	encoded := mustEncodeDiskCID(t, &pve.DiskCIDMeta{
 		Pool: "local-lvm",
 		Node: "pve1",
 		Opts: opts,

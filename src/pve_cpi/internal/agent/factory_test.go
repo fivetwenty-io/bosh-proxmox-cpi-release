@@ -1,12 +1,15 @@
 package agent
 
 import (
+	"context"
+	"encoding/json"
 	"testing"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
+	sdkclusterstorage "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/clusterstorage"
 )
 
 //nolint:modernize // helper supports non-zero bool values; new(bool) only gives false
@@ -137,5 +140,60 @@ func TestNewAgent_NilLogger(t *testing.T) {
 	_, err := NewAgent(minimalCfg("noagent"), nil, nil)
 	if err == nil {
 		t.Fatal("expected error for nil logger")
+	}
+}
+
+// rawEntryClusterStorageSvc returns exactly the raw JSON bytes given, with no
+// field re-marshaling — unlike fakeClusterStorageSvc (which always emits a
+// "shared" and "content" key), this lets a test omit a key entirely to prove
+// the decoder does not carry a value over from a prior entry.
+type rawEntryClusterStorageSvc struct {
+	sdkclusterstorage.Service
+	entries []json.RawMessage
+}
+
+func (f *rawEntryClusterStorageSvc) ListStorage(context.Context, *sdkclusterstorage.ListStorageParams) (*sdkclusterstorage.ListStorageResponse, error) {
+	resp := sdkclusterstorage.ListStorageResponse(f.entries)
+	return &resp, nil
+}
+
+// TestVMStorageISOEligibility_DoesNotInheritPriorEntryFields is the F1
+// regression test: the decode struct that previously lived outside the scan
+// loop left "shared" and "content" at the prior entry's values whenever a
+// later /storage entry omitted those optional JSON keys. Here vmpool omits
+// both keys entirely (as most non-network storage types do in PVE's real
+// response), and directly precedes it is a shared, iso-capable cephfs entry
+// — the exact inheritance trap from the review. vmpool must report its own
+// (absent) values, not cephfs-a's.
+func TestVMStorageISOEligibility_DoesNotInheritPriorEntryFields(t *testing.T) {
+	t.Parallel()
+	svc := &rawEntryClusterStorageSvc{entries: []json.RawMessage{
+		json.RawMessage(`{"storage":"cephfs-a","type":"cephfs","shared":1,"content":"iso,vztmpl"}`),
+		json.RawMessage(`{"storage":"vmpool","type":"lvmthin"}`), // no "shared", no "content" key at all
+	}}
+	pveClient := &fakePVEClient{clusterStorageSvc: svc}
+
+	shared, hasISO, found, err := vmStorageISOEligibility(context.Background(), pveClient, "vmpool")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !found {
+		t.Fatal("expected vmpool to be found in the index")
+	}
+	if shared {
+		t.Error("vmpool carries no \"shared\" key and lvmthin is not shared-by-type: must report shared=false, not inherit cephfs-a's shared=true")
+	}
+	if hasISO {
+		t.Error("vmpool carries no \"content\" key: must report hasISO=false, not inherit cephfs-a's iso content")
+	}
+
+	// The earlier entry itself must still decode correctly (scan order does
+	// not corrupt the first entry either).
+	sharedA, hasISOA, foundA, errA := vmStorageISOEligibility(context.Background(), pveClient, "cephfs-a")
+	if errA != nil {
+		t.Fatalf("unexpected error: %v", errA)
+	}
+	if !foundA || !sharedA || !hasISOA {
+		t.Errorf("cephfs-a: want found=true shared=true hasISO=true, got found=%v shared=%v hasISO=%v", foundA, sharedA, hasISOA)
 	}
 }

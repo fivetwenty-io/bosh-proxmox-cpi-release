@@ -239,7 +239,16 @@ func makeDiskMetaDepsClient(client pve.Client) handlers.Deps {
 	}
 }
 
-func makeMetaArgs(diskCID string, meta map[string]any) []json.RawMessage {
+// makeMetaArgs builds the two-element set_disk_metadata arg slice. The
+// handler hard-rejects unenveloped disk_cid input, so a bare diskCID is
+// wrapped in a pvd- envelope here; an already-encoded or empty diskCID is
+// passed through unchanged so it is never double-wrapped and the handler's
+// own empty-disk_cid rejection still hits that check directly.
+func makeMetaArgs(t *testing.T, diskCID string, meta map[string]any) []json.RawMessage {
+	t.Helper()
+	if diskCID != "" && !strings.HasPrefix(diskCID, "pvd-") && !strings.HasPrefix(diskCID, "pvz-") {
+		diskCID = mustEncodeDiskCID(t, diskCID, nil)
+	}
 	r0, _ := json.Marshal(diskCID)
 	r1, _ := json.Marshal(meta)
 	return []json.RawMessage{json.RawMessage(r0), json.RawMessage(r1)}
@@ -272,7 +281,7 @@ func TestHandleSetDiskMetadata_AttachedSingleVM(t *testing.T) {
 	h := handlers.HandleSetDiskMetadata(makeDiskMetaDeps(pve))
 
 	meta := map[string]any{"deployment": "cf", "instance_id": "vm-abc123"}
-	result, err := h.Handle(context.Background(), makeMetaArgs(testDiskCID, meta), jsonrpc.Context{})
+	result, err := h.Handle(context.Background(), makeMetaArgs(t, testDiskCID, meta), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -312,7 +321,7 @@ func TestHandleSetDiskMetadata_Detached(t *testing.T) {
 	}
 
 	h := handlers.HandleSetDiskMetadata(deps)
-	result, err := h.Handle(context.Background(), makeMetaArgs(testDiskCID, map[string]any{}), jsonrpc.Context{})
+	result, err := h.Handle(context.Background(), makeMetaArgs(t, testDiskCID, map[string]any{}), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("detached disk: unexpected error: %v", err)
 	}
@@ -352,7 +361,7 @@ func TestHandleSetDiskMetadata_Ambiguous(t *testing.T) {
 	}, nodesSvc)
 
 	hAmbig := handlers.HandleSetDiskMetadata(makeDiskMetaDeps(pve))
-	ambigResult, ambigErr := hAmbig.Handle(context.Background(), makeMetaArgs(testDiskCID, map[string]any{}), jsonrpc.Context{})
+	ambigResult, ambigErr := hAmbig.Handle(context.Background(), makeMetaArgs(t, testDiskCID, map[string]any{}), jsonrpc.Context{})
 	if ambigErr == nil {
 		t.Fatalf("ambiguous: expected error, got nil result=%v", ambigResult)
 	}
@@ -375,7 +384,7 @@ func TestHandleSetDiskMetadata_DescriptionPreserved(t *testing.T) {
 	}, nodesSvc)
 
 	h := handlers.HandleSetDiskMetadata(makeDiskMetaDeps(pve))
-	_, err := h.Handle(context.Background(), makeMetaArgs(testDiskCID, map[string]any{"k": "v"}), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), makeMetaArgs(t, testDiskCID, map[string]any{"k": "v"}), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -433,7 +442,7 @@ func TestHandleSetDiskMetadata_AppliesDiskTags(t *testing.T) {
 			"tier": "bronze",
 		},
 	}
-	_, err := h.Handle(context.Background(), makeMetaArgs(testDiskCID, meta), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), makeMetaArgs(t, testDiskCID, meta), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -486,7 +495,7 @@ func TestHandleSetDiskMetadata_MetadataNotObject(t *testing.T) {
 	)
 	h := handlers.HandleSetDiskMetadata(makeDiskMetaDeps(pve))
 
-	r0, _ := json.Marshal(testDiskCID)
+	r0, _ := json.Marshal(mustEncodeDiskCID(t, testDiskCID, nil))
 	r1 := json.RawMessage(`42`) // integer, not JSON object
 	_, err := h.Handle(context.Background(), []json.RawMessage{r0, r1}, jsonrpc.Context{})
 	if err == nil {
@@ -510,7 +519,7 @@ func TestHandleSetDiskMetadata_ListResourcesError(t *testing.T) {
 	)
 	h := handlers.HandleSetDiskMetadata(makeDiskMetaDeps(pve))
 
-	_, err := h.Handle(context.Background(), makeMetaArgs(testDiskCID, map[string]any{"k": "v"}), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), makeMetaArgs(t, testDiskCID, map[string]any{"k": "v"}), jsonrpc.Context{})
 	if err == nil {
 		t.Fatal("expected error from ListResources failure, got nil")
 	}
@@ -536,7 +545,7 @@ func TestHandleSetDiskMetadata_ListResourcesTransient_IsRetriable(t *testing.T) 
 	)
 	h := handlers.HandleSetDiskMetadata(makeDiskMetaDeps(pve))
 
-	_, err := h.Handle(fastRetryCtx(context.Background()), makeMetaArgs(testDiskCID, map[string]any{"k": "v"}), jsonrpc.Context{})
+	_, err := h.Handle(fastRetryCtx(context.Background()), makeMetaArgs(t, testDiskCID, map[string]any{"k": "v"}), jsonrpc.Context{})
 	if err == nil {
 		t.Fatal("expected error from transient ListResources failure, got nil")
 	}
@@ -558,7 +567,7 @@ func TestHandleSetDiskMetadata_UpdateConfigError(t *testing.T) {
 	}, nodesSvc)
 
 	h := handlers.HandleSetDiskMetadata(makeDiskMetaDeps(pve))
-	_, err := h.Handle(context.Background(), makeMetaArgs(testDiskCID, map[string]any{"k": "v"}), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), makeMetaArgs(t, testDiskCID, map[string]any{"k": "v"}), jsonrpc.Context{})
 	if err == nil {
 		t.Fatal("expected error from UpdateQemuConfig failure, got nil")
 	}
@@ -573,7 +582,7 @@ func setDiskMetadataCallHandler(t *testing.T, nodesSvc *diskMetaNodesMock, qemuS
 	t.Helper()
 	pve := &diskMetaClientMock{qemuSvc: qemuSvc, nodesSvc: nodesSvc, clusterSvc: clusterSvc}
 	h := handlers.HandleSetDiskMetadata(makeDiskMetaDeps(pve))
-	_, err := h.Handle(context.Background(), makeMetaArgs(diskCID, meta), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), makeMetaArgs(t, diskCID, meta), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("unexpected handler error: %v", err)
 	}
@@ -612,7 +621,7 @@ func TestHandleSetDiskMetadata_SameCIDReplaces(t *testing.T) {
 	clusterSvc2 := &diskMetaClusterSvc{resp: clusterResourcesWithVM(testVMID, testNode)}
 	pve2 := &diskMetaClientMock{qemuSvc: qemuSvc, nodesSvc: nodesSvc, clusterSvc: clusterSvc2}
 	h2 := handlers.HandleSetDiskMetadata(makeDiskMetaDeps(pve2))
-	_, err := h2.Handle(context.Background(), makeMetaArgs(testDiskCID, map[string]any{"instance_id": "vm-xyz"}), jsonrpc.Context{})
+	_, err := h2.Handle(context.Background(), makeMetaArgs(t, testDiskCID, map[string]any{"instance_id": "vm-xyz"}), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("second call: unexpected error: %v", err)
 	}
@@ -669,7 +678,7 @@ func TestHandleSetDiskMetadata_CrossDiskMergePreserved(t *testing.T) {
 	clusterSvc2 := &diskMetaClusterSvc{resp: clusterResourcesWithVM(testVMID, testNode)}
 	pve2 := &diskMetaClientMock{qemuSvc: qemuSvc, nodesSvc: nodesSvc, clusterSvc: clusterSvc2}
 	h2 := handlers.HandleSetDiskMetadata(makeDiskMetaDeps(pve2))
-	_, err := h2.Handle(context.Background(), makeMetaArgs(diskB, map[string]any{"instance_id": "vm-xyz"}), jsonrpc.Context{})
+	_, err := h2.Handle(context.Background(), makeMetaArgs(t, diskB, map[string]any{"instance_id": "vm-xyz"}), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("call 2: unexpected error: %v", err)
 	}
@@ -710,7 +719,7 @@ func TestHandleSetDiskMetadata_CorruptedSentinel(t *testing.T) {
 	pve := buildDiskMetaPVE(clusterSvc, qemuSvc.configs, nodesSvc)
 
 	h := handlers.HandleSetDiskMetadata(makeDiskMetaDeps(pve))
-	_, err := h.Handle(context.Background(), makeMetaArgs(testDiskCID, map[string]any{"deployment": "reset-test"}), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), makeMetaArgs(t, testDiskCID, map[string]any{"deployment": "reset-test"}), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("corrupted sentinel: unexpected error (should reset+rewrite): %v", err)
 	}
@@ -745,7 +754,7 @@ func TestHandleSetDiskMetadata_Dir_CID(t *testing.T) {
 	}, nodesSvc)
 
 	h := handlers.HandleSetDiskMetadata(makeDiskMetaDeps(pve))
-	_, err := h.Handle(context.Background(), makeMetaArgs(dirCID, map[string]any{"deployment": "cf"}), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), makeMetaArgs(t, dirCID, map[string]any{"deployment": "cf"}), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("dir CID: unexpected error: %v", err)
 	}
@@ -786,7 +795,7 @@ func TestHandleSetDiskMetadata_ExactVolidMatch(t *testing.T) {
 		Logger: logger,
 	}
 	h := handlers.HandleSetDiskMetadata(deps)
-	result, err := h.Handle(context.Background(), makeMetaArgs(wantCID, map[string]any{"k": "v"}), jsonrpc.Context{})
+	result, err := h.Handle(context.Background(), makeMetaArgs(t, wantCID, map[string]any{"k": "v"}), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("exact volid match: unexpected error: %v", err)
 	}
@@ -815,7 +824,7 @@ func TestHandleSetDiskMetadata_OptionStringVolidMatch(t *testing.T) {
 	}, nodesSvc)
 
 	h := handlers.HandleSetDiskMetadata(makeDiskMetaDeps(pve))
-	_, err := h.Handle(context.Background(), makeMetaArgs(wantCID, map[string]any{"deployment": "cf"}), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), makeMetaArgs(t, wantCID, map[string]any{"deployment": "cf"}), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("option string volid match: unexpected error: %v", err)
 	}
@@ -838,7 +847,7 @@ func TestHandleSetDiskMetadata_TransportErrorPropagates(t *testing.T) {
 	)
 	h := handlers.HandleSetDiskMetadata(makeDiskMetaDeps(pve))
 
-	_, err := h.Handle(context.Background(), makeMetaArgs(testDiskCID, map[string]any{"deployment": "cf"}), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), makeMetaArgs(t, testDiskCID, map[string]any{"deployment": "cf"}), jsonrpc.Context{})
 	if err == nil {
 		t.Fatal("transport error: expected error, got nil")
 	}
@@ -880,7 +889,7 @@ func TestSetDiskMetadata_UpdateTransient_Retriable(t *testing.T) {
 			clusterSvc: clusterSvc,
 		}
 		h := handlers.HandleSetDiskMetadata(makeDiskMetaDepsClient(client))
-		_, err := h.Handle(context.Background(), makeMetaArgs(cid, meta), jsonrpc.Context{})
+		_, err := h.Handle(context.Background(), makeMetaArgs(t, cid, meta), jsonrpc.Context{})
 		if err == nil {
 			t.Fatalf("%s: expected error from transient SDK failure, got nil", name)
 		}
@@ -1088,7 +1097,7 @@ func TestHandleSetDiskMetadata_TransientConfigErrorDuringScan_Retriable(t *testi
 	}
 
 	h := handlers.HandleSetDiskMetadata(makeDiskMetaDepsClient(client))
-	_, err := h.Handle(context.Background(), makeMetaArgs(testDiskCID, map[string]any{"deployment": "cf"}), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), makeMetaArgs(t, testDiskCID, map[string]any{"deployment": "cf"}), jsonrpc.Context{})
 	if err == nil {
 		t.Fatal("transient config error during scan: expected error, got nil")
 	}
@@ -1136,7 +1145,7 @@ func TestHandleSetDiskMetadata_NotFoundSkippedDuringScan(t *testing.T) {
 	}
 
 	h := handlers.HandleSetDiskMetadata(makeDiskMetaDepsClient(client))
-	_, err := h.Handle(context.Background(), makeMetaArgs(testDiskCID, map[string]any{"deployment": "cf"}), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), makeMetaArgs(t, testDiskCID, map[string]any{"deployment": "cf"}), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("404 during scan: unexpected error: %v", err)
 	}
@@ -1220,7 +1229,7 @@ func TestHandleSetDiskMetadata_ParkerSkipped_RealVMMatches(t *testing.T) {
 	client := buildDiskMetaPVE(clusterSvc, qemuCfgs, nodesSvc)
 
 	h := handlers.HandleSetDiskMetadata(makeParkedDeps(client, parkerRangeStart, parkerRangeEnd))
-	_, err := h.Handle(context.Background(), makeMetaArgs(testDiskCID, map[string]any{"deployment": "cf"}), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), makeMetaArgs(t, testDiskCID, map[string]any{"deployment": "cf"}), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("parker skip + real VM: unexpected error: %v", err)
 	}
@@ -1267,7 +1276,7 @@ func TestHandleSetDiskMetadata_ParkedDiskOnly_WarnAndNil(t *testing.T) {
 	}
 
 	h := handlers.HandleSetDiskMetadata(deps)
-	result, err := h.Handle(context.Background(), makeMetaArgs(testDiskCID, map[string]any{"deployment": "cf"}), jsonrpc.Context{})
+	result, err := h.Handle(context.Background(), makeMetaArgs(t, testDiskCID, map[string]any{"deployment": "cf"}), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("parked-only: unexpected error: %v", err)
 	}
@@ -1310,7 +1319,7 @@ func TestHandleSetDiskMetadata_ZeroConfig_ParkerTagIgnored(t *testing.T) {
 	client := buildDiskMetaPVE(clusterSvc, qemuCfgs, nodesSvc)
 	h := handlers.HandleSetDiskMetadata(makeDiskMetaDeps(client))
 
-	_, err := h.Handle(context.Background(), makeMetaArgs(testDiskCID, map[string]any{"deployment": "cf"}), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), makeMetaArgs(t, testDiskCID, map[string]any{"deployment": "cf"}), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("zero-config: unexpected error: %v", err)
 	}
@@ -1344,7 +1353,7 @@ func TestHandleSetDiskMetadata_RangeOnlyNoTag_NotSkipped(t *testing.T) {
 	client := buildDiskMetaPVE(clusterSvc, qemuCfgs, nodesSvc)
 
 	h := handlers.HandleSetDiskMetadata(makeParkedDeps(client, parkerRangeStart, parkerRangeEnd))
-	_, err := h.Handle(context.Background(), makeMetaArgs(testDiskCID, map[string]any{"deployment": "cf"}), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), makeMetaArgs(t, testDiskCID, map[string]any{"deployment": "cf"}), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("range-only no tag: unexpected error: %v", err)
 	}
@@ -1373,7 +1382,7 @@ func TestHandleSetDiskMetadata_PreservesForeignSentinelKeys(t *testing.T) {
 
 	h := handlers.HandleSetDiskMetadata(makeDiskMetaDeps(pve))
 	meta := map[string]any{"deployment": "cf", "instance_id": "vm-abc123"}
-	if _, err := h.Handle(context.Background(), makeMetaArgs(testDiskCID, meta), jsonrpc.Context{}); err != nil {
+	if _, err := h.Handle(context.Background(), makeMetaArgs(t, testDiskCID, meta), jsonrpc.Context{}); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
@@ -1406,7 +1415,7 @@ func TestHandleSetDiskMetadata_TagsPathPreservesForeignSentinelKeys(t *testing.T
 		"deployment": "cf",
 		"tags":       map[string]any{"tier": "bronze"},
 	}
-	if _, err := h.Handle(context.Background(), makeMetaArgs(testDiskCID, meta), jsonrpc.Context{}); err != nil {
+	if _, err := h.Handle(context.Background(), makeMetaArgs(t, testDiskCID, meta), jsonrpc.Context{}); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 

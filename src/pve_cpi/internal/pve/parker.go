@@ -10,7 +10,7 @@
 //	cfg := pve.ParkerConfig{
 //	    VMIDRangeStart: cpiCfg.ParkedDiskVMIDRangeStartValue(),
 //	    VMIDRangeEnd:   cpiCfg.ParkedDiskVMIDRangeEndValue(),
-//	    DirectorID:     cpiCfg.StemcellDirectorID(), // empty = omit director scope tag
+//	    DirectorID:     deps.RequestDirectorUUID, // empty = omit director scope tag
 //	}
 //
 // # Tag constants
@@ -77,6 +77,18 @@ type ParkerConfig struct {
 	// "director--<sanitized-id>" tag is added to newly created parker VMs so
 	// operators can distinguish parkers per director in multi-director clusters.
 	DirectorID string
+	// DiskStorage is the CPI's configured pve.disk_storage pool. When set,
+	// createParkerVM passes it to pve.WithStorageScan so parker VMID
+	// allocation also scans that storage's volume content, closing the same
+	// cross-cluster co-mingling gap WithStorageScan already closes for the
+	// VM, disk, and template ranges (see WithStorageScan's doc comment):
+	// without this, two independent PVE clusters sharing one storage backend
+	// can each allocate a parker at the same VMID, and a later
+	// DestroyUnreferencedDisks-driven destroy of one cluster's parker frees
+	// the other cluster's parked disks by matching VMID. Empty (the
+	// zero-value default) makes the scan a no-op — byte-identical to prior
+	// releases for callers that do not set it.
+	DiskStorage string
 	// NowFunc returns the current time. Nil defaults to time.Now().UTC().
 	// Tests inject a fixed clock to assert parked_at values deterministically.
 	NowFunc func() time.Time
@@ -508,6 +520,7 @@ func createParkerVM(ctx context.Context, c Client, logger *log.Logger, node stri
 		1,
 		WithRange(cfg.VMIDRangeStart, cfg.VMIDRangeEnd),
 		WithNoBackoff(),
+		WithStorageScan(node, cfg.DiskStorage),
 	)
 	if createErr != nil {
 		// Create-conflict path: another CPI won the race. Re-find and adopt.

@@ -224,7 +224,7 @@ func findVMsHostingDisk(ctx context.Context, deps Deps, diskCID string) ([]attac
 		parkerCfg = pve.ParkerConfig{
 			VMIDRangeStart: deps.Config.ParkedDiskVMIDRangeStartValue(),
 			VMIDRangeEnd:   deps.Config.ParkedDiskVMIDRangeEndValue(),
-			DirectorID:     deps.Config.StemcellDirectorID(),
+			DirectorID:     deps.RequestDirectorUUID,
 		}
 	}
 

@@ -2,7 +2,6 @@ package agent
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -160,6 +159,12 @@ func ResolveISOStorage(ctx context.Context, cfg *config.CPIConfig, pveClient pve
 // all. found is false only when the storage is absent from the index; any
 // other lookup failure (transport error, malformed response) is returned as a
 // non-nil err with shared/hasISO/found all false.
+//
+// Decodes each entry through pve.ParseStorageEntry — the same decoder
+// StorageInfoCache.refresh and create_vm_disk.go's liveStorageInfo use — so
+// this lookup cannot diverge from the canonical field mapping (in
+// particular: a fresh, per-entry StorageInfo value, so a storage entry
+// missing "shared" or "content" never inherits the previous entry's fields).
 func vmStorageISOEligibility(ctx context.Context, pveClient pve.Client, storageName string) (shared, hasISO, found bool, err error) {
 	resp, listErr := pveClient.ClusterStorage().ListStorage(ctx, &sdkclusterstorage.ListStorageParams{})
 	if listErr != nil {
@@ -168,25 +173,15 @@ func vmStorageISOEligibility(ctx context.Context, pveClient pve.Client, storageN
 	if resp == nil {
 		return false, false, false, fmt.Errorf("nil response from cluster storage list")
 	}
-	var entry struct {
-		Storage string `json:"storage"`
-		Type    string `json:"type"`
-		Shared  *int   `json:"shared,omitempty"`
-		Content string `json:"content,omitempty"`
-	}
 	for _, raw := range *resp {
-		if jerr := json.Unmarshal(raw, &entry); jerr != nil {
+		info, perr := pve.ParseStorageEntry(raw)
+		if perr != nil {
 			continue
 		}
-		if entry.Storage != storageName {
+		if info.Name != storageName {
 			continue
 		}
-		info := pve.StorageInfo{
-			Name:   entry.Storage,
-			Type:   entry.Type,
-			Shared: entry.Shared != nil && *entry.Shared != 0,
-		}
-		return info.IsShared(), contentIncludesISO(entry.Content), true, nil
+		return info.IsShared(), contentIncludesISO(info.Content), true, nil
 	}
 	return false, false, false, nil
 }

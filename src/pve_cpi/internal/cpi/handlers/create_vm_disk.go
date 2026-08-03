@@ -6,7 +6,6 @@ package handlers
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
@@ -20,36 +19,62 @@ import (
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/qemu"
 )
 
-// lookupVMStorageType fetches the PVE storage type for storageName by listing
-// the cluster storage index. Returns "" on any error — callers treat "" as
-// linked-clone-capable (permissive). This is intentionally best-effort: the
-// create_vm flow must not fail on a storage-lookup error that does not affect
-// the import path; the clone-mode decision downstream uses "" → linked safely.
+// liveStorageInfo issues a live /storage listing and decodes it through
+// pve.ParseStorageEntry — the SAME decoder StorageInfoCache.refresh uses —
+// so this file's storage-classification call sites cannot silently diverge
+// from the canonical parsing (in particular: this is what gives lookupVMStorageType
+// and needsReplicaCheck access to the backing-identity fields (Path/Server/
+// Export) needed by the clone-mode storageMismatch check below, without each
+// duplicating its own ad-hoc JSON decode).
+//
+// This deliberately does NOT go through deps.Resolver/StorageInfoCache: the
+// static fallback backend built when Resolver is unwired (the common shape
+// for handler unit tests — see backendResolverOrDefault) reports every
+// storage as shared with no StorageInfo at all, which would silently defeat
+// every caller below. A live, uncached listing exactly matches the pre-
+// existing behavior of the two ad-hoc readers this replaces: works whether or
+// not Resolver is wired, at the cost of one extra API call per invocation
+// (unchanged from before — neither prior implementation cached either).
+//
+// Returns (info, false) on any failure: nil PVE/ClusterStorage, empty name,
+// transport error, or the name absent from the index. Callers treat false as
+// "unknown" and fail open, exactly as the pre-consolidation ad-hoc decoders
+// did on any failure.
+func liveStorageInfo(ctx context.Context, deps Deps, storageName string) (pve.StorageInfo, bool) {
+	if deps.PVE == nil || deps.PVE.ClusterStorage() == nil || storageName == "" {
+		return pve.StorageInfo{}, false
+	}
+	resp, err := deps.PVE.ClusterStorage().ListStorage(ctx, &sdkclusterstorage.ListStorageParams{})
+	if err != nil || resp == nil {
+		return pve.StorageInfo{}, false
+	}
+	for _, raw := range *resp {
+		info, perr := pve.ParseStorageEntry(raw)
+		if perr != nil {
+			continue
+		}
+		if info.Name == storageName {
+			return info, true
+		}
+	}
+	return pve.StorageInfo{}, false
+}
+
+// lookupVMStorageType fetches the PVE storage type for storageName. Returns
+// "" on any error — callers treat "" as linked-clone-capable (permissive).
+// This is intentionally best-effort: the create_vm flow must not fail on a
+// storage-lookup error that does not affect the import path; the clone-mode
+// decision downstream uses "" → linked safely.
 //
 // ClusterStorage() == nil (e.g. test mocks that don't wire it) is the expected
 // case in unit tests; the function returns "" without logging to keep test
 // output clean.
 func lookupVMStorageType(ctx context.Context, deps Deps, storageName string) string {
-	if deps.PVE == nil || deps.PVE.ClusterStorage() == nil || storageName == "" {
+	info, ok := liveStorageInfo(ctx, deps, storageName)
+	if !ok {
 		return ""
 	}
-	resp, err := deps.PVE.ClusterStorage().ListStorage(ctx, &sdkclusterstorage.ListStorageParams{})
-	if err != nil || resp == nil {
-		return ""
-	}
-	for _, raw := range *resp {
-		var entry struct {
-			Storage string `json:"storage"`
-			Type    string `json:"type"`
-		}
-		if jerr := json.Unmarshal(raw, &entry); jerr != nil {
-			continue
-		}
-		if entry.Storage == storageName {
-			return entry.Type
-		}
-	}
-	return ""
+	return info.Type
 }
 
 // resolveTemplateDiskStorage reads templateVMID's config on templateNode and
@@ -165,52 +190,38 @@ func extractSHA8FromFilenameInCID(rawCID string) (sha8 string, ok bool) {
 // the cluster): on a multi-node cluster, a local-storage template is only
 // accessible on the node that holds it. When storage information is unavailable
 // (lookup error or nil PVE client), returns false (fail-open: skip guard).
+//
+// Classification is via StorageInfo.IsShared() (routed through the shared
+// liveStorageInfo decoder above) rather than a raw "shared" flag comparison:
+// IsShared() also treats network-backed types (nfs/cifs/rbd/cephfs/
+// glusterfs/pbs) as shared by definition even when storage.cfg leaves the
+// "shared" flag unset — the same classification every other shared/local
+// decision in this codebase uses (StorageInfoCache, Backend resolution,
+// placement, DLB). A prior version of this function read only the raw flag,
+// which meant an NFS/CIFS/etc pool without an explicit "shared: 1" entry was
+// misclassified as needing the local-template guard.
 func needsReplicaCheck(ctx context.Context, deps Deps, vmStorage string) bool {
-	if deps.PVE == nil || deps.PVE.ClusterStorage() == nil || vmStorage == "" {
+	info, ok := liveStorageInfo(ctx, deps, vmStorage)
+	if !ok {
+		// Storage undeterminable or not found in the index: fail-open (skip guard).
 		return false
 	}
-	resp, err := deps.PVE.ClusterStorage().ListStorage(ctx, &sdkclusterstorage.ListStorageParams{})
-	if err != nil || resp == nil {
-		return false
-	}
-	for _, raw := range *resp {
-		var entry struct {
-			Storage string `json:"storage"`
-			Type    string `json:"type"`
-			Shared  int    `json:"shared"` // PVE integer bool: 1 = shared
-		}
-		if jerr := json.Unmarshal(raw, &entry); jerr != nil {
-			continue
-		}
-		if entry.Storage != vmStorage {
-			continue
-		}
-		// Shared storage: no guard needed (template accessible from any node).
-		if entry.Shared == 1 {
-			return false
-		}
-		// Local storage: guard needed.
-		return true
-	}
-	// Storage not found in index: fail-open (skip guard).
-	return false
+	return !info.IsShared()
 }
 
-// extractSHA8FromTemplateCIDContext extracts the sha8 digest from the parsed
-// args when the stemcell CID is a template CID. Template CIDs carry no filename
-// (they are "template:<vmid>"), so the sha8 must come from a previous lookup
-// context. For now we use the raw CID filename when present (old-form CIDs
-// carry sha8 in the filename). Returns ("", false) when the sha8 cannot be
-// determined — the caller skips the replica lookup in that case.
-func extractSHA8FromTemplateCIDContext(parsed *createVMParsedArgs) (sha8 string, ok bool) {
-	// Template CIDs (template:<vmid>) do not embed a sha8. The sha8 is available
-	// from the raw CID if the operator is using an old-form CID at the same time
-	// (not the case for pure template CIDs). Return not-found so the guard is
-	// skipped for pure template CIDs without a raw CID fallback.
-	if parsed.rawCID == "" {
+// extractSHA8FromParsed extracts the 8-hex-char content sha from the parsed
+// stemcell CID's rawVolid ("<storage>:import/<file>") — delegating to
+// extractSHA8FromFilenameInCID so both callers share one parse path. Returns
+// ("", false) when the stemcell filename does not match the expected
+// bosh-stemcell-<name>-<version>-<sha8>.qcow2 pattern (pre-upgrade or custom
+// stems, or the "00000000" unknown-digest placeholder some paths use).
+// Callers treat this as "skip the cluster template-cache lookup, fall back to
+// import-from" rather than an error.
+func extractSHA8FromParsed(parsed *createVMParsedArgs) (sha8 string, ok bool) {
+	if parsed == nil || parsed.rawVolid == "" {
 		return "", false
 	}
-	return extractSHA8FromFilenameInCID(parsed.rawCID)
+	return extractSHA8FromFilenameInCID(parsed.rawVolid)
 }
 
 // handleCloneError classifies a cloneFromTemplate error and logs appropriately.
@@ -326,7 +337,8 @@ func resolveCloneFullFlag(
 		case storageMismatch:
 			t := true
 			logger.Info("create_vm: clone_mode=auto: downgrading linked clone to full clone because"+
-				" vm_storage differs from the template's storage",
+				" vm_storage differs from the template's storage and the two storage IDs do not"+
+				" share a physical backing (not the same NFS export or directory)",
 				log.String("vm_storage", shape.vmStorage),
 				log.String("template_storage", templateStorage),
 			)
@@ -414,6 +426,40 @@ func checkRootDiskBusMatch(
 	return nil
 }
 
+// storageMismatchByBacking reports whether templateStorage and vmStorage are
+// a genuine clone-mode misplacement risk: their PVE storage IDs differ AND
+// they do not share a physical backing (Kevin's trap — see the storageMismatch
+// doc comment in cloneFromTemplate). Two IDs that differ but resolve to the
+// same NFS export (or the same dir path) are NOT a mismatch: a linked clone's
+// overlay lands on the same bytes either way, so clone_mode=auto must not
+// downgrade to a full clone, and clone_mode=linked must not be rejected.
+//
+// templateStorage == vmStorage short-circuits to false without any lookup —
+// the common case, and avoids a wasted /storage round trip.
+//
+// Both storages' backing identity is resolved via liveStorageInfo; an
+// undeterminable backing on either side is conservative — falls back to the
+// plain ID-differs-so-mismatch result, matching the pre-backing-identity
+// behavior exactly rather than guessing "same" on missing data.
+func storageMismatchByBacking(ctx context.Context, deps Deps, logger *log.Logger, templateStorage, vmStorage string) bool {
+	if templateStorage == vmStorage {
+		return false
+	}
+	templateInfo, templateOK := liveStorageInfo(ctx, deps, templateStorage)
+	vmInfo, vmOK := liveStorageInfo(ctx, deps, vmStorage)
+	if templateOK && vmOK && pve.SameBacking(templateInfo, vmInfo) {
+		logger.Info("create_vm: vm_storage and the template's storage are different PVE storage IDs"+
+			" but share one physical backing; treating clone_mode placement as a match rather than"+
+			" a mismatch (two names, one export)",
+			log.String("vm_storage", vmStorage),
+			log.String("template_storage", templateStorage),
+			log.String("backing", templateInfo.BackingKey()),
+		)
+		return false
+	}
+	return true
+}
+
 func cloneFromTemplate(
 	ctx context.Context,
 	deps Deps,
@@ -444,7 +490,18 @@ func cloneFromTemplate(
 	// A linked clone's overlay always lands on templateStorage, never on
 	// vm_storage, so any mismatch between the two is a real misplacement risk
 	// — but only when templateStorage is actually known.
-	storageMismatch := templateStorageKnown && templateStorage != shape.vmStorage
+	//
+	// A plain string-compare of the two storage IDs is Kevin's trap: two PVE
+	// storage IDs configured against the same physical backing (e.g. the same
+	// NFS export registered twice under different names) are NOT a
+	// misplacement risk even though their IDs differ — a linked clone's
+	// overlay lands on the same bytes either way. storageMismatchByBacking
+	// resolves both storages' backing identity and only reports a mismatch
+	// when the IDs differ AND the backing genuinely differs too; an
+	// undeterminable backing on either side is conservative (falls back to
+	// the plain ID compare, same as before this fix — never silently treats
+	// "unknown" as "same").
+	storageMismatch := templateStorageKnown && storageMismatchByBacking(ctx, deps, logger, templateStorage, shape.vmStorage)
 
 	if busErr := checkRootDiskBusMatch(shape, templateVMID, templateStorageKnown, templateStorageErr, templateRootKey); busErr != nil {
 		return busErr
@@ -509,11 +566,26 @@ func cloneFromTemplate(
 	// if templateNode and shape.node differ AND storage is not shared, PVE cannot
 	// clone across nodes — the operator must fix this by
 	// pinning the VM node to match the template node or switching to shared storage.
+	//
+	// PVE's own constraint (per the SDK's CreateQemuCloneParams.Target doc) is
+	// "Target node. Only allowed if the ORIGINAL VM is on shared storage" — the
+	// original VM here is the TEMPLATE, not the destination vm_storage. Consult
+	// templateStorage's shared-ness, not shape.vmStorage's: a template on local
+	// storage with a shared vm_storage would otherwise pass this check and set
+	// Target, only for PVE itself to reject the clone with its own (less
+	// actionable) error — this pre-flight check exists specifically to catch
+	// that case before any PVE mutation. Falls back to shape.vmStorage only
+	// when the template's own storage is undeterminable (Config read failure),
+	// preserving the pre-fix fail-open behavior for that case.
 	if templateNode != shape.node {
-		storageInfo, infoErr := policyDeps.StorageInfo(ctx, shape.vmStorage)
+		checkStorage := shape.vmStorage
+		if templateStorageKnown {
+			checkStorage = templateStorage
+		}
+		storageInfo, infoErr := policyDeps.StorageInfo(ctx, checkStorage)
 		if infoErr != nil {
 			return cpierrors.Wrap(infoErr,
-				"create_vm: cross-node clone: cannot look up storage "+shape.vmStorage+" to determine if Target is safe")
+				"create_vm: cross-node clone: cannot look up storage "+checkStorage+" to determine if Target is safe")
 		}
 		if !storageInfo.IsShared() {
 			return cpierrors.Cloud(
@@ -521,7 +593,7 @@ func cloneFromTemplate(
 					" storage %q is local (not shared) — PVE cannot cross-node clone local storage;"+
 					" set cloud_properties.node to match the template node (%q),"+
 					" or use shared storage",
-				templateNode, shape.node, shape.vmStorage, templateNode)
+				templateNode, shape.node, checkStorage, templateNode)
 		}
 		// Shared storage confirmed: set Target so PVE lands the clone on shape.node.
 		targetNode := shape.node
@@ -1126,6 +1198,12 @@ func attachPersistentDisks(
 			log.String("disk_cid", diskCID),
 			log.String("disk_id", diskID),
 		)
+		// Record the Director's verbatim disk_cid against the bare volid on
+		// the VM's description sentinel, exactly as attach_disk does, so a
+		// later get_disks returns this string instead of the bare volid —
+		// cloudcheck membership fidelity for disks attached at create time.
+		// Best-effort: never fails the create.
+		pve.UpdateAttachedDiskCID(ctx, deps.PVE, logger, shape.node, vmid, bareDiskCID, diskCID)
 	}
 	return nil
 }

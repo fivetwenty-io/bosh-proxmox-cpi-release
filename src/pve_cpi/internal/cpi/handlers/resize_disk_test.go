@@ -164,7 +164,7 @@ func TestHandleResizeDisk_Grow(t *testing.T) {
 	h := handlers.HandleResizeDisk(resizeDeps(qemuSvc, resizeClusterWith(100), nil))
 
 	// 15360 MiB = 15 GiB; current = 10 GiB → delta = 5 GiB.
-	result, err := h.Handle(context.Background(), marshalArgs(diskCID, 15360), jsonrpc.Context{})
+	result, err := h.Handle(context.Background(), marshalArgs(mustEncodeDiskCID(t, diskCID, nil), 15360), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -216,7 +216,7 @@ func TestHandleResizeDisk_ConvergenceWaitsThenConverges(t *testing.T) {
 	tru := true
 	deps.Config.ResizeWaitForConvergence = &tru
 
-	_, err := handlers.HandleResizeDisk(deps).Handle(context.Background(), marshalArgs(diskCID, 20480), jsonrpc.Context{})
+	_, err := handlers.HandleResizeDisk(deps).Handle(context.Background(), marshalArgs(mustEncodeDiskCID(t, diskCID, nil), 20480), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -245,7 +245,7 @@ func TestHandleResizeDisk_ConvergenceBestEffortTimeout(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
 	defer cancel()
 
-	_, err := handlers.HandleResizeDisk(deps).Handle(ctx, marshalArgs(diskCID, 20480), jsonrpc.Context{})
+	_, err := handlers.HandleResizeDisk(deps).Handle(ctx, marshalArgs(mustEncodeDiskCID(t, diskCID, nil), 20480), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("best-effort convergence must not error on non-convergence, got: %v", err)
 	}
@@ -265,7 +265,7 @@ func TestHandleResizeDisk_ConvergenceDisabledNoExtraCalls(t *testing.T) {
 
 	deps := resizeDeps(qemuSvc, resizeClusterWith(100), nil) // convergence not enabled
 
-	_, err := handlers.HandleResizeDisk(deps).Handle(context.Background(), marshalArgs(diskCID, 20480), jsonrpc.Context{})
+	_, err := handlers.HandleResizeDisk(deps).Handle(context.Background(), marshalArgs(mustEncodeDiskCID(t, diskCID, nil), 20480), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -287,7 +287,7 @@ func TestHandleResizeDisk_NoOp(t *testing.T) {
 
 	h := handlers.HandleResizeDisk(resizeDeps(qemuSvc, resizeClusterWith(100), nil))
 	// 10240 MiB = 10 GiB exactly, same as current.
-	_, err := h.Handle(context.Background(), marshalArgs(diskCID, 10240), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), marshalArgs(mustEncodeDiskCID(t, diskCID, nil), 10240), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("unexpected error for no-op resize: %v", err)
 	}
@@ -304,7 +304,7 @@ func TestHandleResizeDisk_ShrinkRejected(t *testing.T) {
 
 	h := handlers.HandleResizeDisk(resizeDeps(qemuSvc, resizeClusterWith(100), nil))
 	// 5120 MiB = 5 GiB; current = 20 GiB → shrink.
-	_, err := h.Handle(context.Background(), marshalArgs(diskCID, 5120), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), marshalArgs(mustEncodeDiskCID(t, diskCID, nil), 5120), jsonrpc.Context{})
 	if err == nil {
 		t.Fatal("expected error for shrink attempt")
 	}
@@ -329,7 +329,7 @@ func TestHandleResizeDisk_WithUpid(t *testing.T) {
 	})
 
 	h := handlers.HandleResizeDisk(resizeDeps(qemuSvc, resizeClusterWith(100), tasksSvc))
-	_, err := h.Handle(context.Background(), marshalArgs(diskCID, 20480), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), marshalArgs(mustEncodeDiskCID(t, diskCID, nil), 20480), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -349,7 +349,7 @@ func TestHandleResizeDisk_DiskNotAttached(t *testing.T) {
 	}
 
 	h := handlers.HandleResizeDisk(resizeDeps(qemuSvc, resizeClusterWith(100), nil))
-	_, err := h.Handle(context.Background(), marshalArgs(diskCID, 20480), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), marshalArgs(mustEncodeDiskCID(t, diskCID, nil), 20480), jsonrpc.Context{})
 	if err == nil {
 		t.Fatal("expected error for disk not attached to any VM")
 	}
@@ -362,7 +362,7 @@ func TestHandleResizeDisk_SizeParseFail(t *testing.T) {
 	qemuSvc := resizeQEMUWithDisk(diskSlot, diskCID+",cache=writeback", nil)
 
 	h := handlers.HandleResizeDisk(resizeDeps(qemuSvc, resizeClusterWith(100), nil))
-	_, err := h.Handle(context.Background(), marshalArgs(diskCID, 20480), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), marshalArgs(mustEncodeDiskCID(t, diskCID, nil), 20480), jsonrpc.Context{})
 	if err == nil {
 		t.Fatal("expected error when size cannot be parsed from config")
 	}
@@ -376,7 +376,7 @@ func TestHandleResizeDisk_ResizeSDKError(t *testing.T) {
 	})
 
 	h := handlers.HandleResizeDisk(resizeDeps(qemuSvc, resizeClusterWith(100), nil))
-	_, err := h.Handle(context.Background(), marshalArgs(diskCID, 20480), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), marshalArgs(mustEncodeDiskCID(t, diskCID, nil), 20480), jsonrpc.Context{})
 	if err == nil {
 		t.Fatal("expected error from ResizeDisk SDK failure")
 	}
@@ -443,7 +443,7 @@ func TestHandleResizeDisk_CeilingMath(t *testing.T) {
 	})
 
 	h := handlers.HandleResizeDisk(resizeDeps(qemuSvc, resizeClusterWith(100), nil))
-	_, err := h.Handle(context.Background(), marshalArgs(diskCID, 10241), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), marshalArgs(mustEncodeDiskCID(t, diskCID, nil), 10241), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -507,7 +507,7 @@ func TestHandleResizeDisk_SnapshotsPresent_HardFail(t *testing.T) {
 		AllowDiskOpsWithSnapshots: false,
 	}
 	h := handlers.HandleResizeDisk(resizeDepsWithConfig(cfg, qemuSvc, resizeClusterWith(100)))
-	_, err := h.Handle(context.Background(), marshalArgs(diskCID, 20480), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), marshalArgs(mustEncodeDiskCID(t, diskCID, nil), 20480), jsonrpc.Context{})
 	if err == nil {
 		t.Fatal("expected error when snapshots exist and allow_disk_ops_with_snapshots=false")
 	}
@@ -538,7 +538,7 @@ func TestHandleResizeDisk_NoSnapshots_Proceeds(t *testing.T) {
 
 	cfg := &config.CPIConfig{Node: testNode}
 	h := handlers.HandleResizeDisk(resizeDepsWithConfig(cfg, qemuSvc, resizeClusterWith(100)))
-	_, err := h.Handle(context.Background(), marshalArgs(diskCID, 20480), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), marshalArgs(mustEncodeDiskCID(t, diskCID, nil), 20480), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("unexpected error when no snapshots: %v", err)
 	}
@@ -568,7 +568,7 @@ func TestHandleResizeDisk_SnapshotCheckError_FailOpen(t *testing.T) {
 		RequireSnapshotCheckPass: false,
 	}
 	h := handlers.HandleResizeDisk(resizeDepsWithConfig(cfg, qemuSvc, resizeClusterWith(100)))
-	_, err := h.Handle(context.Background(), marshalArgs(diskCID, 20480), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), marshalArgs(mustEncodeDiskCID(t, diskCID, nil), 20480), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("expected fail-open: no error when RequireSnapshotCheckPass=false; got: %v", err)
 	}
@@ -598,7 +598,7 @@ func TestHandleResizeDisk_SnapshotCheckError_FailClosed(t *testing.T) {
 		RequireSnapshotCheckPass: true,
 	}
 	h := handlers.HandleResizeDisk(resizeDepsWithConfig(cfg, qemuSvc, resizeClusterWith(100)))
-	_, err := h.Handle(context.Background(), marshalArgs(diskCID, 20480), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), marshalArgs(mustEncodeDiskCID(t, diskCID, nil), 20480), jsonrpc.Context{})
 	if err == nil {
 		t.Fatal("expected error when RequireSnapshotCheckPass=true and ListSnapshots fails")
 	}
@@ -631,7 +631,7 @@ func TestHandleResizeDisk_SnapshotsPresent_AllowOverride(t *testing.T) {
 		AllowDiskOpsWithSnapshots: true,
 	}
 	h := handlers.HandleResizeDisk(resizeDepsWithConfig(cfg, qemuSvc, resizeClusterWith(100)))
-	_, err := h.Handle(context.Background(), marshalArgs(diskCID, 20480), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), marshalArgs(mustEncodeDiskCID(t, diskCID, nil), 20480), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("expected no error with allow_disk_ops_with_snapshots=true; got: %v", err)
 	}
@@ -664,7 +664,7 @@ func TestHandleResizeDisk_ConfigFetchError(t *testing.T) {
 	}
 
 	h := handlers.HandleResizeDisk(resizeDeps(qemuSvc, resizeClusterWith(100), nil))
-	_, err := h.Handle(context.Background(), marshalArgs(diskCID, 20480), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), marshalArgs(mustEncodeDiskCID(t, diskCID, nil), 20480), jsonrpc.Context{})
 	if err == nil {
 		t.Fatal("expected error when Config() fails after disk is located")
 	}
@@ -682,7 +682,7 @@ func TestHandleResizeDisk_UnknownSizeUnit(t *testing.T) {
 	qemuSvc := resizeQEMUWithDisk(diskSlot, diskCID+",size=100xyz", nil)
 
 	h := handlers.HandleResizeDisk(resizeDeps(qemuSvc, resizeClusterWith(100), nil))
-	_, err := h.Handle(context.Background(), marshalArgs(diskCID, 20480), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), marshalArgs(mustEncodeDiskCID(t, diskCID, nil), 20480), jsonrpc.Context{})
 	if err == nil {
 		t.Fatal("expected error for unsupported size unit")
 	}
@@ -708,7 +708,7 @@ func TestHandleResizeDisk_AwaitTaskFailure(t *testing.T) {
 	}
 
 	h := handlers.HandleResizeDisk(resizeDeps(qemuSvc, resizeClusterWith(100), tasksSvc))
-	_, err := h.Handle(context.Background(), marshalArgs(diskCID, 20480), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), marshalArgs(mustEncodeDiskCID(t, diskCID, nil), 20480), jsonrpc.Context{})
 	if err == nil {
 		t.Fatal("expected error when AwaitTask returns non-OK ExitStatus")
 	}
@@ -738,7 +738,7 @@ func TestHandleResizeDisk_Dir_CID(t *testing.T) {
 	)
 
 	h := handlers.HandleResizeDisk(resizeDeps(qemuSvc, resizeClusterWith(9001), nil))
-	_, err := h.Handle(context.Background(), marshalArgs(diskCID, 30720), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), marshalArgs(mustEncodeDiskCID(t, diskCID, nil), 30720), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("unexpected error for dir-style CID: %v", err)
 	}
@@ -763,7 +763,7 @@ func TestHandleResizeDisk_ZFSPool_CID(t *testing.T) {
 	)
 
 	h := handlers.HandleResizeDisk(resizeDeps(qemuSvc, resizeClusterWith(9001), nil))
-	_, err := h.Handle(context.Background(), marshalArgs(diskCID, 20480), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), marshalArgs(mustEncodeDiskCID(t, diskCID, nil), 20480), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("unexpected error for zfspool CID: %v", err)
 	}
@@ -788,7 +788,7 @@ func TestHandleResizeDisk_LVMThin_CID(t *testing.T) {
 	)
 
 	h := handlers.HandleResizeDisk(resizeDeps(qemuSvc, resizeClusterWith(9001), nil))
-	_, err := h.Handle(context.Background(), marshalArgs(diskCID, 20480), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), marshalArgs(mustEncodeDiskCID(t, diskCID, nil), 20480), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("unexpected error for lvmthin CID: %v", err)
 	}
@@ -862,7 +862,7 @@ func TestHandleResizeDisk_ParkedDisk_Succeeds(t *testing.T) {
 	})
 
 	// Request 15 GiB (15360 MiB); current 10 GiB on parker → delta 5 GiB.
-	_, err := h.Handle(context.Background(), marshalArgs(diskCID, 15360), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), marshalArgs(mustEncodeDiskCID(t, diskCID, nil), 15360), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("resize of parked disk must succeed, got error: %v", err)
 	}
@@ -900,7 +900,7 @@ func TestHandleResizeDisk_NeverOptedIn_NormalResize(t *testing.T) {
 	})
 
 	// 20 GiB request; current 10 GiB → delta 10 GiB.
-	_, err := h.Handle(context.Background(), marshalArgs(diskCID, 20480), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), marshalArgs(mustEncodeDiskCID(t, diskCID, nil), 20480), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("never-opted-in resize: unexpected error: %v", err)
 	}

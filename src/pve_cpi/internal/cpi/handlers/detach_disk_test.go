@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
@@ -12,6 +13,7 @@ import (
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cluster"
+	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/nodes"
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/qemu"
 	sdkerrors "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/errors"
 )
@@ -108,9 +110,19 @@ func detachDeps(qemuSvc qemu.Service) handlers.Deps {
 	}
 }
 
-// detachArgs builds a two-element arg slice for detach_disk.
-func detachArgs(vmCID, diskCID string) []json.RawMessage {
-	return marshalArgs(vmCID, diskCID)
+// detachArgs builds a two-element arg slice for detach_disk. The handler
+// hard-rejects unenveloped input, so a bare diskCID is wrapped in a pvd-
+// envelope here — callers in this file pass either a bare PVE-volid-shaped
+// string (including deliberately malformed ones used to exercise error
+// paths) or an already-encoded CID. An already-encoded or empty diskCID is
+// passed through unchanged so it is never double-wrapped and the handler's
+// own empty-disk_cid rejection still hits that check directly.
+func detachArgs(t *testing.T, vmCID, diskCID string) []json.RawMessage {
+	t.Helper()
+	if diskCID == "" || strings.HasPrefix(diskCID, "pvd-") || strings.HasPrefix(diskCID, "pvz-") {
+		return marshalArgs(vmCID, diskCID)
+	}
+	return marshalArgs(vmCID, mustEncodeDiskCID(t, diskCID, nil))
 }
 
 // ---------------------------------------------------------------------------
@@ -137,7 +149,7 @@ func TestHandleDetachDisk_Happy(t *testing.T) {
 	}
 	h := handlers.HandleDetachDisk(detachDeps(qemuSvc))
 
-	result, err := h.Handle(context.Background(), detachArgs(vmCID, diskCID), jsonrpc.Context{})
+	result, err := h.Handle(context.Background(), detachArgs(t, vmCID, diskCID), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -168,7 +180,7 @@ func TestHandleDetachDisk_NotAttached(t *testing.T) {
 	}
 	h := handlers.HandleDetachDisk(detachDeps(qemuSvc))
 
-	result, err := h.Handle(context.Background(), detachArgs(vmCID, diskCID), jsonrpc.Context{})
+	result, err := h.Handle(context.Background(), detachArgs(t, vmCID, diskCID), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("unexpected error for not-attached disk: %v", err)
 	}
@@ -198,7 +210,7 @@ func TestHandleDetachDisk_SweepsLingeringUnusedSlot(t *testing.T) {
 	}
 	h := handlers.HandleDetachDisk(detachDeps(qemuSvc))
 
-	result, err := h.Handle(context.Background(), detachArgs(vmCID, diskCID), jsonrpc.Context{})
+	result, err := h.Handle(context.Background(), detachArgs(t, vmCID, diskCID), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("unexpected error sweeping unused slot: %v", err)
 	}
@@ -226,7 +238,7 @@ func TestHandleDetachDisk_UnusedSlotDifferentVolume(t *testing.T) {
 	}
 	h := handlers.HandleDetachDisk(detachDeps(qemuSvc))
 
-	if _, err := h.Handle(context.Background(), detachArgs(vmCID, diskCID), jsonrpc.Context{}); err != nil {
+	if _, err := h.Handle(context.Background(), detachArgs(t, vmCID, diskCID), jsonrpc.Context{}); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if qemuSvc.detachCalled {
@@ -248,7 +260,7 @@ func TestHandleDetachDisk_DetachFail(t *testing.T) {
 	}
 	h := handlers.HandleDetachDisk(detachDeps(qemuSvc))
 
-	_, err := h.Handle(context.Background(), detachArgs(vmCID, diskCID), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), detachArgs(t, vmCID, diskCID), jsonrpc.Context{})
 	if err == nil {
 		t.Fatal("expected error from DetachDisk failure")
 	}
@@ -268,7 +280,7 @@ func TestHandleDetachDisk_VMNotFound(t *testing.T) {
 	}
 	h := handlers.HandleDetachDisk(detachDeps(qemuSvc))
 
-	_, err := h.Handle(context.Background(), detachArgs(vmCID, diskCID), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), detachArgs(t, vmCID, diskCID), jsonrpc.Context{})
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -281,7 +293,7 @@ func TestHandleDetachDisk_VMNotFound(t *testing.T) {
 func TestHandleDetachDisk_InvalidVMCID(t *testing.T) {
 	t.Parallel()
 	h := handlers.HandleDetachDisk(detachDeps(&detachQEMUService{}))
-	_, err := h.Handle(context.Background(), detachArgs("not-an-int", "local:vol"), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), detachArgs(t, "not-an-int", "local:vol"), jsonrpc.Context{})
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -294,7 +306,7 @@ func TestHandleDetachDisk_InvalidVMCID(t *testing.T) {
 func TestHandleDetachDisk_InvalidDiskCID(t *testing.T) {
 	t.Parallel()
 	h := handlers.HandleDetachDisk(detachDeps(&detachQEMUService{}))
-	_, err := h.Handle(context.Background(), detachArgs("100", "nodisk"), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), detachArgs(t, "100", "nodisk"), jsonrpc.Context{})
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -317,7 +329,7 @@ func TestHandleDetachDisk_MissingArgs(t *testing.T) {
 func TestHandleDetachDisk_EmptyVMCID(t *testing.T) {
 	t.Parallel()
 	h := handlers.HandleDetachDisk(detachDeps(&detachQEMUService{}))
-	_, err := h.Handle(context.Background(), detachArgs("", "local:vol"), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), detachArgs(t, "", "local:vol"), jsonrpc.Context{})
 	if err == nil {
 		t.Fatal("expected error for empty vm_cid")
 	}
@@ -327,7 +339,7 @@ func TestHandleDetachDisk_EmptyVMCID(t *testing.T) {
 func TestHandleDetachDisk_EmptyDiskCID(t *testing.T) {
 	t.Parallel()
 	h := handlers.HandleDetachDisk(detachDeps(&detachQEMUService{}))
-	_, err := h.Handle(context.Background(), detachArgs("100", ""), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), detachArgs(t, "100", ""), jsonrpc.Context{})
 	if err == nil {
 		t.Fatal("expected error for empty disk_cid")
 	}
@@ -341,7 +353,7 @@ func TestHandleDetachDisk_ConfigFetchError(t *testing.T) {
 		configErr: errors.New("network unreachable"),
 	}
 	h := handlers.HandleDetachDisk(detachDeps(qemuSvc))
-	_, err := h.Handle(context.Background(), detachArgs("100", "local-lvm:vol"), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), detachArgs(t, "100", "local-lvm:vol"), jsonrpc.Context{})
 	if err == nil {
 		t.Fatal("expected error when Config fetch fails")
 	}
@@ -356,7 +368,7 @@ func TestHandleDetachDisk_EmptyConfigIdempotent(t *testing.T) {
 	}
 	h := handlers.HandleDetachDisk(detachDeps(qemuSvc))
 
-	result, err := h.Handle(context.Background(), detachArgs("100", "local-lvm:missing"), jsonrpc.Context{})
+	result, err := h.Handle(context.Background(), detachArgs(t, "100", "local-lvm:missing"), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("unexpected error for empty config: %v", err)
 	}
@@ -417,7 +429,7 @@ func TestHandleDetachDisk_SnapshotPresent_HardFail(t *testing.T) {
 	}
 	h := handlers.HandleDetachDisk(detachDepsWithCfg(qemuSvc, false, false))
 
-	_, err := h.Handle(context.Background(), detachArgs(vmCID, diskCID), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), detachArgs(t, vmCID, diskCID), jsonrpc.Context{})
 	if err == nil {
 		t.Fatal("expected Cloud error when snapshots present and AllowDiskOpsWithSnapshots=false")
 	}
@@ -446,7 +458,7 @@ func TestHandleDetachDisk_NoSnapshots_Proceeds(t *testing.T) {
 	}
 	h := handlers.HandleDetachDisk(detachDepsWithCfg(qemuSvc, false, false))
 
-	_, err := h.Handle(context.Background(), detachArgs(vmCID, diskCID), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), detachArgs(t, vmCID, diskCID), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("unexpected error when no real snapshots: %v", err)
 	}
@@ -473,7 +485,7 @@ func TestHandleDetachDisk_SnapshotCheckError_FailOpen(t *testing.T) {
 	}
 	h := handlers.HandleDetachDisk(detachDepsWithCfg(qemuSvc, false, false))
 
-	_, err := h.Handle(context.Background(), detachArgs(vmCID, diskCID), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), detachArgs(t, vmCID, diskCID), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("expected fail-open (no error) when snapshot check errors and require=false: %v", err)
 	}
@@ -500,7 +512,7 @@ func TestHandleDetachDisk_SnapshotCheckError_FailClosed(t *testing.T) {
 	}
 	h := handlers.HandleDetachDisk(detachDepsWithCfg(qemuSvc, false, true))
 
-	_, err := h.Handle(context.Background(), detachArgs(vmCID, diskCID), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), detachArgs(t, vmCID, diskCID), jsonrpc.Context{})
 	if err == nil {
 		t.Fatal("expected error when snapshot check errors and require_snapshot_check_pass=true")
 	}
@@ -527,7 +539,7 @@ func TestHandleDetachDisk_SnapshotPresent_AllowOverride(t *testing.T) {
 	}
 	h := handlers.HandleDetachDisk(detachDepsWithCfg(qemuSvc, true, false))
 
-	_, err := h.Handle(context.Background(), detachArgs(vmCID, diskCID), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), detachArgs(t, vmCID, diskCID), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("unexpected error with AllowDiskOpsWithSnapshots=true: %v", err)
 	}
@@ -555,7 +567,7 @@ func TestHandleDetachDisk_LVM_CID(t *testing.T) {
 	}
 	h := handlers.HandleDetachDisk(detachDeps(qemuSvc))
 
-	result, err := h.Handle(context.Background(), detachArgs("100", diskCID), jsonrpc.Context{})
+	result, err := h.Handle(context.Background(), detachArgs(t, "100", diskCID), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("LVM CID: unexpected error: %v", err)
 	}
@@ -578,7 +590,7 @@ func TestHandleDetachDisk_ZFSPool_CID(t *testing.T) {
 	}
 	h := handlers.HandleDetachDisk(detachDeps(qemuSvc))
 
-	result, err := h.Handle(context.Background(), detachArgs("100", diskCID), jsonrpc.Context{})
+	result, err := h.Handle(context.Background(), detachArgs(t, "100", diskCID), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("ZFSPool CID: unexpected error: %v", err)
 	}
@@ -602,7 +614,7 @@ func TestHandleDetachDisk_Dir_CID(t *testing.T) {
 	}
 	h := handlers.HandleDetachDisk(detachDeps(qemuSvc))
 
-	result, err := h.Handle(context.Background(), detachArgs("100", diskCID), jsonrpc.Context{})
+	result, err := h.Handle(context.Background(), detachArgs(t, "100", diskCID), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("Dir CID: unexpected error: %v", err)
 	}
@@ -625,7 +637,7 @@ func TestHandleDetachDisk_LVMThin_CID(t *testing.T) {
 	}
 	h := handlers.HandleDetachDisk(detachDeps(qemuSvc))
 
-	result, err := h.Handle(context.Background(), detachArgs("100", diskCID), jsonrpc.Context{})
+	result, err := h.Handle(context.Background(), detachArgs(t, "100", diskCID), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("LVMThin CID: unexpected error: %v", err)
 	}
@@ -655,7 +667,7 @@ func TestDetachDisk_SentinelIdempotent(t *testing.T) {
 	}
 	h := handlers.HandleDetachDisk(detachDeps(qemuSvc))
 
-	result, err := h.Handle(context.Background(), detachArgs(vmCID, diskCID), jsonrpc.Context{})
+	result, err := h.Handle(context.Background(), detachArgs(t, vmCID, diskCID), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("expected nil error for sentinel-idempotent path, got: %v", err)
 	}
@@ -684,7 +696,7 @@ func TestDetachDisk_OtherCloudErrorPropagates(t *testing.T) {
 	}
 	h := handlers.HandleDetachDisk(detachDeps(qemuSvc))
 
-	_, err := h.Handle(context.Background(), detachArgs(vmCID, diskCID), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), detachArgs(t, vmCID, diskCID), jsonrpc.Context{})
 	if err == nil {
 		t.Fatal("expected error from non-sentinel Cloud failure; got nil")
 	}
@@ -893,8 +905,8 @@ var _ qemu.Service = (*parkerQEMUService)(nil)
 // holder scan iterates the same list looking for a Config match — since the
 // source VM config does not include diskCID on any slot (detach already removed
 // it) the scan misses and returns not-found.
-func parkerEmptyClusterSvc(sourceVMID int) *mockClusterSvc {
-	return defaultClusterSvc(sourceVMID, testNode)
+func parkerEmptyClusterSvc() *mockClusterSvc {
+	return defaultClusterSvc(100, testNode)
 }
 
 // parkerDiskHeldClusterSvc returns a cluster where sourceVMID is present AND
@@ -930,6 +942,32 @@ func detachDepsParked(qemuSvc qemu.Service, clusterSvc cluster.Service) handlers
 		},
 		PVE: &mockPVEClient{
 			qemuSvc:    qemuSvc,
+			tasksSvc:   &mockTasksService{},
+			clusterSvc: clusterSvc,
+		},
+		Agent:  &mockAgentService{},
+		Logger: log.NewNopLogger(),
+	}
+}
+
+// detachDepsParkedWithDiskStorage is detachDepsParked plus pve.disk_storage
+// set and a real nodes.Service, so the cross-cluster parker-VMID collision
+// scan (WithStorageScan, fed by ParkerConfig.DiskStorage) actually reaches
+// ListStorageContent instead of being a silent no-op — see detach_disk.go's
+// handleAlreadyDetachedParked.
+func detachDepsParkedWithDiskStorage(qemuSvc qemu.Service, clusterSvc cluster.Service, nodesSvc nodes.Service) handlers.Deps {
+	return handlers.Deps{
+		Config: &config.CPIConfig{
+			Node:                     testNode,
+			VMDiskFormat:             "qcow2",
+			DetachedDiskStrategy:     "parked",
+			ParkedDiskVMIDRangeStart: 90000,
+			ParkedDiskVMIDRangeEnd:   90999,
+			DiskStorage:              "local-lvm",
+		},
+		PVE: &mockPVEClient{
+			qemuSvc:    qemuSvc,
+			nodesSvc:   nodesSvc,
 			tasksSvc:   &mockTasksService{},
 			clusterSvc: clusterSvc,
 		},
@@ -996,11 +1034,11 @@ func TestHandleDetachDisk_ParkedStrategy_DetachAndPark(t *testing.T) {
 	}
 	// Cluster returns empty (source VM not needed in cluster scan; IsDiskParked
 	// finds no holder → free-floating → ParkDisk proceeds).
-	clusterSvc := parkerEmptyClusterSvc(100)
+	clusterSvc := parkerEmptyClusterSvc()
 
 	h := handlers.HandleDetachDisk(detachDepsParked(qemuSvc, clusterSvc))
 
-	_, err := h.Handle(context.Background(), detachArgs(vmCID, parkedVolid), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), detachArgs(t, vmCID, parkedVolid), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1041,11 +1079,11 @@ func TestHandleDetachDisk_ParkedStrategy_ParkFail_Retriable(t *testing.T) {
 			return "", errors.New("PVE storage locked")
 		},
 	}
-	clusterSvc := parkerEmptyClusterSvc(100)
+	clusterSvc := parkerEmptyClusterSvc()
 
 	h := handlers.HandleDetachDisk(detachDepsParked(qemuSvc, clusterSvc))
 
-	_, err := h.Handle(context.Background(), detachArgs(vmCID, parkedVolid), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), detachArgs(t, vmCID, parkedVolid), jsonrpc.Context{})
 	if err == nil {
 		t.Fatal("expected retriable error when ParkDisk fails")
 	}
@@ -1090,11 +1128,11 @@ func TestHandleDetachDisk_ParkedStrategy_RetryFreeFloating_ReParks(t *testing.T)
 		},
 	}
 	// Cluster: source VM present for node resolution; no disk holder.
-	clusterSvc := parkerEmptyClusterSvc(100)
+	clusterSvc := parkerEmptyClusterSvc()
 
 	h := handlers.HandleDetachDisk(detachDepsParked(qemuSvc, clusterSvc))
 
-	_, err := h.Handle(context.Background(), detachArgs("100", parkedVolid), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), detachArgs(t, "100", parkedVolid), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("unexpected error on retry free-floating path: %v", err)
 	}
@@ -1106,6 +1144,57 @@ func TestHandleDetachDisk_ParkedStrategy_RetryFreeFloating_ReParks(t *testing.T)
 	}
 	// The test's primary assertion is no error. If attach was NOT called the
 	// volume disappeared — also success. Both are acceptable per idempotency contract.
+}
+
+// TestHandleDetachDisk_ParkedStrategy_RetryFreeFloating_ScansDiskStorage
+// verifies that the free-floating re-park path (handleAlreadyDetachedParked)
+// feeds pve.disk_storage into the parker VMID allocation's WithStorageScan,
+// closing the same cross-cluster parker-VMID collision gap the sibling
+// parkAfterDetach path already closed. Before the fix the ParkerConfig built
+// on this path omitted DiskStorage, so WithStorageScan's (node, storage) pair
+// was empty and the storage-content scan never ran.
+func TestHandleDetachDisk_ParkedStrategy_RetryFreeFloating_ScansDiskStorage(t *testing.T) {
+	t.Parallel()
+	const parkedVolid = "local-lvm:vm-9001-disk-0"
+
+	qemuSvc := &parkerQEMUService{
+		sourceVMID:      100,
+		parkerVMIDStart: 90000,
+		// Source VM config does NOT contain diskCID → alreadyDetached=true.
+		sourceCfg: map[string]any{"scsi0": testDiskCID},
+		parkerCfg: map[string]any{"tags": "bosh-parker"},
+	}
+	clusterSvc := parkerEmptyClusterSvc()
+
+	var storageScanCalls int
+	var scannedStorage string
+	nodesSvc := &mockNodesService{
+		listStorageContentFn: func(_ context.Context, _ string, storage string, _ *nodes.ListStorageContentParams) (*nodes.ListStorageContentResponse, error) {
+			storageScanCalls++
+			scannedStorage = storage
+			empty := nodes.ListStorageContentResponse{}
+			return &empty, nil
+		},
+		// ParkDisk's provenance write (parker.go's updateParkerProvenance) reaches
+		// UpdateQemuConfig once a real (non-empty) DiskStorage lets allocation
+		// proceed further than the storage-scan-only assertion above requires.
+		updateQemuConfigFn: func(_ context.Context, _ string, _ string, _ *nodes.UpdateQemuConfigParams) error {
+			return nil
+		},
+	}
+
+	h := handlers.HandleDetachDisk(detachDepsParkedWithDiskStorage(qemuSvc, clusterSvc, nodesSvc))
+
+	_, err := h.Handle(context.Background(), detachArgs(t, "100", parkedVolid), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if storageScanCalls == 0 {
+		t.Fatal("expected the parker VMID allocation to scan pve.disk_storage via WithStorageScan; ListStorageContent was never called")
+	}
+	if scannedStorage != "local-lvm" {
+		t.Errorf("storage scan: want storage %q, got %q", "local-lvm", scannedStorage)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -1147,7 +1236,7 @@ func TestHandleDetachDisk_ParkedStrategy_RetryAlreadyParked_Nil(t *testing.T) {
 
 	h := handlers.HandleDetachDisk(detachDepsParked(qemuSvc, clusterSvc))
 
-	_, err := h.Handle(context.Background(), detachArgs("100", parkedVolid), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), detachArgs(t, "100", parkedVolid), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("expected nil error for already-parked retry; got: %v", err)
 	}
@@ -1199,7 +1288,7 @@ func TestHandleDetachDisk_ParkedStrategy_RealVMHolder_NoPark(t *testing.T) {
 
 	h := handlers.HandleDetachDisk(detachDepsParked(qemuSvc, clusterSvc))
 
-	_, err := h.Handle(context.Background(), detachArgs("100", parkedVolid), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), detachArgs(t, "100", parkedVolid), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("expected nil (idempotent no-op) when a real VM holds the disk; got: %v", err)
 	}
@@ -1222,7 +1311,7 @@ func TestHandleDetachDisk_StrategyFree_NoParkerCalls(t *testing.T) {
 	}
 	h := handlers.HandleDetachDisk(detachDepsStrategyFree(qemuSvc))
 
-	_, err := h.Handle(context.Background(), detachArgs("100", parkedVolid), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), detachArgs(t, "100", parkedVolid), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("strategy-free detach: unexpected error: %v", err)
 	}

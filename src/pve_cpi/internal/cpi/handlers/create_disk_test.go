@@ -1294,10 +1294,13 @@ func TestHandleCreateDisk_ExplicitOptOut_ByteIdenticalCID(t *testing.T) {
 
 	// Construct the expected CID as EncodeDiskCID would without Opts.
 	bareCID := fmt.Sprintf("%s:vm-%d-disk-0", capturedStorage, capturedVMID)
-	expectedCID := pve.EncodeDiskCID(bareCID, &pve.DiskCIDMeta{
+	expectedCID, encErr := pve.EncodeDiskCID(bareCID, &pve.DiskCIDMeta{
 		Pool: capturedStorage,
 		Node: deps.Config.Node,
 	})
+	if encErr != nil {
+		t.Fatalf("EncodeDiskCID(%q): unexpected error: %v", bareCID, encErr)
+	}
 	if diskCID != expectedCID {
 		t.Errorf("explicit-opt-out CID not byte-identical to pre-Phase-2 form:\n  got  = %q\n  want = %q", diskCID, expectedCID)
 	}
@@ -1423,44 +1426,49 @@ func TestHandleCreateDisk_BadAioMode_CloudError(t *testing.T) {
 // Emitted CID length warning
 // ---------------------------------------------------------------------------
 
-// TestHandleCreateDisk_WarnsWhenCIDExceeds255 verifies that create_disk logs a
-// warning when the emitted pvd envelope CID is longer than 255 characters —
-// MySQL-backed Directors store disk_cid in a VARCHAR(255) column.
-func TestHandleCreateDisk_WarnsWhenCIDExceeds255(t *testing.T) {
+// TestHandleCreateDisk_HardErrorsWhenCIDExceeds255WithCompressionOff verifies
+// that create_disk returns a hard, non-retriable error — not a warning — when
+// the emitted pvd envelope CID would exceed 255 characters and
+// disk_cid_compression is off. MySQL-backed Directors store disk_cid in a
+// VARCHAR(255) column; silently emitting an overflowing CID would truncate or
+// be rejected on a later write and orphan the volume, so the volume that was
+// just created must also be rolled back (DeleteVolumeAsync called) rather than
+// leaked.
+func TestHandleCreateDisk_HardErrorsWhenCIDExceeds255WithCompressionOff(t *testing.T) {
 	t.Parallel()
 	longStorage := strings.Repeat("s", 220)
+	var deletedVolume string
 	storageSvc := &mockStorageService{
 		createVolumeFn: func(_ context.Context, _, storage string, _ int, _ string, vmid int, _ string) (string, error) {
 			return fmt.Sprintf("%s:vm-%d-disk-0", storage, vmid), nil
+		},
+		deleteVolumeAsyncFn: func(_ context.Context, _, _, volume string) (string, error) {
+			deletedVolume = volume
+			return "", nil
 		},
 	}
 	deps := baseDepsForCreate(t, storageSvc, nil)
 	deps.Config.DiskStorage = longStorage
 
-	var buf bytes.Buffer
-	logger, lerr := log.NewLogger("info", &buf)
-	if lerr != nil {
-		t.Fatalf("NewLogger: %v", lerr)
-	}
-	deps.Logger = logger
-
 	h := handlers.HandleCreateDisk(deps)
-	result, err := h.Handle(context.Background(), []json.RawMessage{
+	_, err := h.Handle(context.Background(), []json.RawMessage{
 		marshal(1024),
 		marshal(map[string]string{}),
 	}, jsonrpc.Context{})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	if err == nil {
+		t.Fatal("expected a hard error for an over-255-character disk CID with compression off")
 	}
-	diskCID, ok := result.(string)
-	if !ok {
-		t.Fatalf("expected string result, got %T", result)
+	if !cpierrors.IsType(err, cpierrors.TypeCloud) {
+		t.Errorf("error type: want TypeCloud (non-retriable config problem), got %T: %v", err, err)
 	}
-	if len(diskCID) <= 255 {
-		t.Fatalf("test setup: expected emitted CID > 255 chars, got %d", len(diskCID))
+	if !strings.Contains(err.Error(), "255") {
+		t.Errorf("error should mention the 255-character limit, got: %v", err)
 	}
-	if !strings.Contains(buf.String(), "disk CID exceeds 255 characters") {
-		t.Errorf("expected length warning in logs, got: %s", buf.String())
+	if !strings.Contains(err.Error(), "disk_cid_compression") {
+		t.Errorf("error should name the disk_cid_compression remediation, got: %v", err)
+	}
+	if deletedVolume == "" {
+		t.Error("expected the just-created volume to be rolled back (DeleteVolumeAsync called), got none")
 	}
 }
 
@@ -1580,78 +1588,49 @@ func TestHandleCreateDisk_CompressionSmallCIDStaysPvd(t *testing.T) {
 	}
 }
 
-// TestHandleCreateDisk_CompressionOffKeepsPvd pins the default path: without
-// the opt-in flag an over-limit CID is still emitted as pvd- (the operator
-// asked for no format change; the length warning covers the risk).
-func TestHandleCreateDisk_CompressionOffKeepsPvd(t *testing.T) {
-	t.Parallel()
-	longStorage := strings.Repeat("s", 220)
-	storageSvc := &mockStorageService{
-		createVolumeFn: func(_ context.Context, _, storage string, _ int, _ string, vmid int, _ string) (string, error) {
-			return fmt.Sprintf("%s:vm-%d-disk-0", storage, vmid), nil
-		},
-	}
-	deps := baseDepsForCreate(t, storageSvc, nil)
-	deps.Config.DiskStorage = longStorage
-
-	h := handlers.HandleCreateDisk(deps)
-	result, err := h.Handle(context.Background(), []json.RawMessage{
-		marshal(1024),
-		marshal(map[string]string{}),
-	}, jsonrpc.Context{})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	diskCID, ok := result.(string)
-	if !ok {
-		t.Fatalf("expected string result, got %T", result)
-	}
-	if !strings.HasPrefix(diskCID, "pvd-") {
-		t.Errorf("flag-off CID must stay pvd-, got %q", diskCID)
-	}
-}
-
-// TestHandleCreateDisk_CompressionWarnsWhenStillOver255: gzip gains little on
-// a high-entropy payload, so even the best emitted form still overflows 255
-// characters and the length warning must fire — compression is best-effort,
-// not a guarantee.
-func TestHandleCreateDisk_CompressionWarnsWhenStillOver255(t *testing.T) {
+// TestHandleCreateDisk_CompressionHardErrorsWhenStillOver255: gzip gains
+// little on a high-entropy payload, so even the compressed form still
+// overflows 255 characters. This must be a hard error — same as the
+// compression-off case — with rollback of the just-created volume;
+// compression is best-effort, not a guarantee, and a still-overflowing CID is
+// exactly as unsafe as the uncompressed case.
+func TestHandleCreateDisk_CompressionHardErrorsWhenStillOver255(t *testing.T) {
 	t.Parallel()
 	entropy := "Zq3xK9mWp2Lr8vTn5cYd1Bf7Hs4Ej6Ug0QaXwOiNkMzRlPyAoJhFbCtDeSvGxIu" +
 		"VrEw2nT8mK5pL3qZ9dX7cB1fY4hS6jE0gU5aQ8wO2iN4kM6zR1lP3yA7oJ9hF2bC" +
 		"Wm8sD4vN0xQ6tR2yU9aE5cI1oP7kL3gZjHfXbSnTdMwVrCqYeAiOuKgJhBzNvDx"
+	var deletedVolume string
 	storageSvc := &mockStorageService{
 		createVolumeFn: func(_ context.Context, _, storage string, _ int, _ string, vmid int, _ string) (string, error) {
 			return fmt.Sprintf("%s:vm-%d-disk-0", storage, vmid), nil
+		},
+		deleteVolumeAsyncFn: func(_ context.Context, _, _, volume string) (string, error) {
+			deletedVolume = volume
+			return "", nil
 		},
 	}
 	deps := baseDepsForCreate(t, storageSvc, nil)
 	deps.Config.DiskStorage = entropy
 	deps.Config.DiskCIDCompression = true
 
-	var buf bytes.Buffer
-	logger, lerr := log.NewLogger("info", &buf)
-	if lerr != nil {
-		t.Fatalf("NewLogger: %v", lerr)
-	}
-	deps.Logger = logger
-
 	h := handlers.HandleCreateDisk(deps)
-	result, err := h.Handle(context.Background(), []json.RawMessage{
+	_, err := h.Handle(context.Background(), []json.RawMessage{
 		marshal(1024),
 		marshal(map[string]string{}),
 	}, jsonrpc.Context{})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	if err == nil {
+		t.Fatal("expected a hard error for a still-over-255 CID even with compression on")
 	}
-	diskCID, ok := result.(string)
-	if !ok {
-		t.Fatalf("expected string result, got %T", result)
+	if !cpierrors.IsType(err, cpierrors.TypeCloud) {
+		t.Errorf("error type: want TypeCloud (non-retriable config problem), got %T: %v", err, err)
 	}
-	if len(diskCID) <= 255 {
-		t.Fatalf("test premise broken: expected an incompressible CID > 255 chars, got %d", len(diskCID))
+	if !strings.Contains(err.Error(), "255") {
+		t.Errorf("error should mention the 255-character limit, got: %v", err)
 	}
-	if !strings.Contains(buf.String(), "disk CID exceeds 255 characters") {
-		t.Errorf("expected length warning for a CID that still overflows, got: %s", buf.String())
+	if !strings.Contains(err.Error(), "compression") {
+		t.Errorf("error should acknowledge compression was already applied, got: %v", err)
+	}
+	if deletedVolume == "" {
+		t.Error("expected the just-created volume to be rolled back (DeleteVolumeAsync called), got none")
 	}
 }

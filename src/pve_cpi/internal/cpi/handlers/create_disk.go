@@ -431,9 +431,8 @@ func HandleCreateDisk(deps Deps) Handler {
 		// failed iterations. On non-conflict CreateVolume failures the
 		// callback removes any partially-committed volume before propagating.
 		// ----------------------------------------------------------------
-		namingVMID, diskCID, canonicalVolID, err := attemptCreateVolume(
+		namingVMID, bareDiskCID, canonicalVolID, err := attemptCreateVolume(
 			ctx, deps, node, storage, sizeGiB, formatArg, volExt, lockAttempts, maxAttempts,
-			cloudProps.AvailabilityZone, diskPerfOpts,
 		)
 		if err != nil {
 			return nil, cpierrors.Wrap(err, "create_disk: CreateVolume failed on node "+node+" storage "+storage)
@@ -441,7 +440,9 @@ func HandleCreateDisk(deps Deps) Handler {
 
 		// From here on, any failure path must roll back the just-created
 		// volume so we never leak storage on partial failure. The flag is
-		// flipped to true only on the success return below.
+		// flipped to true only on the success return below. Registered before
+		// the CID encode/length-check below so a failure there (including the
+		// over-255 hard error) also triggers rollback.
 		success := false
 		defer func() {
 			if success {
@@ -449,6 +450,38 @@ func HandleCreateDisk(deps Deps) Handler {
 			}
 			rollbackCreatedVolume(ctx, deps, node, storage, canonicalVolID, deps.Log(ctx))
 		}()
+
+		// Append placement metadata so downstream handlers (attach_disk and
+		// fault-domain co-location in create_vm) can read pool, node, and AZ
+		// without an extra PVE API call. Pool is always the resolved storage;
+		// node is the PVE node that holds the volume (meaningful for
+		// local-backend deployments). AZ is set from
+		// cloud_properties.availability_zone when provided; otherwise left
+		// empty so the CID carries no AZ constraint.
+		meta := &pve.DiskCIDMeta{
+			Pool: storage,
+			Node: node,
+			AZ:   cloudProps.AvailabilityZone,
+			Opts: diskPerfOpts,
+		}
+		// With disk_cid_compression enabled, a CID whose pvd- form would
+		// overflow MySQL-backed Directors' varchar(255) disk_cid column is
+		// emitted as a pvz- gzip envelope instead; CIDs that fit are
+		// unaffected. Decode accepts both forms unconditionally, so the flag
+		// is safe to toggle at any time.
+		var diskCID string
+		if deps.Config.DiskCIDCompression {
+			diskCID, err = pve.EncodeDiskCIDCompressed(bareDiskCID, meta)
+		} else {
+			diskCID, err = pve.EncodeDiskCID(bareDiskCID, meta)
+		}
+		if err != nil {
+			// Unreachable in practice: bareDiskCID is always non-empty here
+			// (attemptCreateVolume guarantees it). Kept as a hard error rather
+			// than a panic so a future refactor that breaks the invariant
+			// fails loudly instead of corrupting a disk CID.
+			return nil, cpierrors.Wrap(err, "create_disk: encode disk CID")
+		}
 
 		deps.Log(ctx).Info("create_disk",
 			log.String("disk_cid", diskCID),
@@ -460,12 +493,22 @@ func HandleCreateDisk(deps Deps) Handler {
 		)
 
 		// MySQL-backed Directors store disk_cid in a VARCHAR(255) column
-		// (Postgres uses TEXT). The envelope only exceeds that bound when long
-		// storage names combine with many per-disk performance options.
-		if len(diskCID) > 255 {
-			deps.Log(ctx).Warn("create_disk: emitted disk CID exceeds 255 characters; MySQL-backed Directors may truncate or reject it",
-				log.Int("cid_length", len(diskCID)),
-				log.Int("perf_opt_count", len(diskPerfOpts)),
+		// (Postgres uses TEXT). A CID that still overflows this bound after
+		// encoding (or after compression, when disk_cid_compression is
+		// enabled) would silently truncate or be rejected by such a
+		// Director on the next create_disk-adjacent write, orphaning the
+		// volume just created above — so this is a hard error, not a
+		// warning, and the deferred rollback above reclaims the volume.
+		if len(diskCID) > pve.DiskCIDLengthTarget {
+			if deps.Config.DiskCIDCompression {
+				return nil, cpierrors.Cloud(
+					"create_disk: encoded disk CID is %d characters even after gzip compression, exceeding the %d-character limit enforced by MySQL-backed BOSH Directors (varchar(255) disk_cid column); reduce per-disk metadata (fewer performance options, shorter storage/node names) to bring it under the limit",
+					len(diskCID), pve.DiskCIDLengthTarget,
+				)
+			}
+			return nil, cpierrors.Cloud(
+				"create_disk: encoded disk CID is %d characters, exceeding the %d-character limit enforced by MySQL-backed BOSH Directors (varchar(255) disk_cid column); set pve.disk_cid_compression: true in the CPI manifest to enable gzip envelope compression",
+				len(diskCID), pve.DiskCIDLengthTarget,
 			)
 		}
 
@@ -473,50 +516,54 @@ func HandleCreateDisk(deps Deps) Handler {
 		// no native disk-volume tag field, so disk tags can only ride on the
 		// hosting VM. When create_disk is called without a vm_cid hint we
 		// can't attribute them yet — set_disk_metadata picks them up later.
-		if len(cloudProps.Tags) > 0 {
-			if vmCID == "" {
-				deps.Log(ctx).Warn(
-					"create_disk: tags supplied but disk has no attached VM; tags deferred until set_disk_metadata is called",
-					log.String("disk_cid", diskCID),
-				)
-			} else if vmid, parseErr := strconv.Atoi(vmCID); parseErr == nil && vmid > 0 {
-				if applyErr := applyCustomTagsToVM(ctx, deps, node, vmid, cloudProps.Tags, diskCID); applyErr != nil {
-					// Tagging is best-effort metadata; do not fail volume
-					// creation when only the tag write fails. The next
-					// set_disk_metadata call will re-apply.
-					deps.Log(ctx).Warn("create_disk: failed to apply tags to attached VM",
-						log.String("disk_cid", diskCID),
-						log.String("vm_cid", vmCID),
-						log.Err(applyErr),
-					)
-				}
-			} else {
-				deps.Log(ctx).Warn(
-					"create_disk: tags supplied but vm_cid is not a valid integer; tags deferred",
-					log.String("disk_cid", diskCID),
-					log.String("vm_cid", vmCID),
-				)
-			}
-		}
+		applyCreateDiskTags(ctx, deps, node, vmCID, diskCID, cloudProps.Tags)
 
 		success = true
 		return diskCID, nil
 	})
 }
 
+// applyCreateDiskTags applies cloud_properties.tags to the VM the new disk
+// is attached to, when vm_cid was supplied and parses to a positive VMID.
+// Tagging is best-effort metadata: a failure here is logged and never fails
+// create_disk (the volume is already committed); the next set_disk_metadata
+// call re-applies. Extracted from HandleCreateDisk to keep its cyclomatic
+// complexity under the project threshold; behavior is unchanged.
+func applyCreateDiskTags(ctx context.Context, deps Deps, node, vmCID, diskCID string, tags map[string]string) {
+	if len(tags) == 0 {
+		return
+	}
+	if vmCID == "" {
+		deps.Log(ctx).Warn(
+			"create_disk: tags supplied but disk has no attached VM; tags deferred until set_disk_metadata is called",
+			log.String("disk_cid", diskCID),
+		)
+		return
+	}
+	vmid, parseErr := strconv.Atoi(vmCID)
+	if parseErr != nil || vmid <= 0 {
+		deps.Log(ctx).Warn(
+			"create_disk: tags supplied but vm_cid is not a valid integer; tags deferred",
+			log.String("disk_cid", diskCID),
+			log.String("vm_cid", vmCID),
+		)
+		return
+	}
+	if applyErr := applyCustomTagsToVM(ctx, deps, node, vmid, tags, diskCID); applyErr != nil {
+		// Tagging is best-effort metadata; do not fail volume
+		// creation when only the tag write fails. The next
+		// set_disk_metadata call will re-apply.
+		deps.Log(ctx).Warn("create_disk: failed to apply tags to attached VM",
+			log.String("disk_cid", diskCID),
+			log.String("vm_cid", vmCID),
+			log.Err(applyErr),
+		)
+	}
+}
+
 // attemptCreateVolume allocates a synthetic disk VMID and calls CreateVolume,
 // retrying on VMID conflicts up to maxAttempts times. On a non-conflict
 // CreateVolume failure it performs best-effort orphan cleanup before returning.
-//
-// az is the availability-zone label from cloud_properties.availability_zone.
-// When non-empty it is encoded into the returned disk CID metadata so that
-// create_vm can enforce fault-domain co-location for shared-storage disks.
-// An empty az produces a CID identical to pre-AZ releases (backward-compatible).
-//
-// diskPerfOpts holds per-disk PVE performance options (iothread, cache, etc.)
-// resolved by resolveDiskPerfOptions from the §7.8 layered resolver. A nil or
-// empty map is encoded as-is; omitempty on DiskCIDMeta.Opts keeps the CID
-// byte-identical to pre-performance-options releases when no options are set.
 //
 // volExt is the filename extension (".qcow2", ".raw"; leading dot included)
 // required by dir-style storages, or "" for block storages. When set, the
@@ -526,8 +573,12 @@ func HandleCreateDisk(deps Deps) Handler {
 //
 // Returns:
 //   - namingVMID: the VMID allocated by AllocateDiskWithRetry (for logging)
-//   - diskCID: the volid to use as the BOSH disk CID; equals the PVE-returned
-//     volid when non-empty, otherwise falls back to the constructed canonical form
+//   - bareDiskCID: the bare PVE volid ("<storage>:<volname>"), equal to the
+//     PVE-returned volid when non-empty, otherwise the constructed canonical
+//     form. Never empty when err is nil. The caller (HandleCreateDisk) is
+//     responsible for wrapping it in the pvd-/pvz- envelope and adding
+//     placement metadata — that step happens after the rollback defer is
+//     registered so an encode/length failure still reclaims the volume.
 //   - canonicalVolID: the constructed "storage:name" form, used for rollback
 //   - err: non-nil when all attempts fail
 func attemptCreateVolume(
@@ -537,9 +588,7 @@ func attemptCreateVolume(
 	sizeGiB int,
 	formatArg, volExt string,
 	lockAttempts, maxAttempts int,
-	az string,
-	diskPerfOpts map[string]string,
-) (namingVMID int, diskCID, canonicalVolID string, err error) {
+) (namingVMID int, bareDiskCID, canonicalVolID string, err error) {
 	var volid string
 
 	namingVMID, err = pve.AllocateDiskWithRetry(ctx, deps.PVE, node, storage,
@@ -621,35 +670,14 @@ func attemptCreateVolume(
 
 	// PVE returns the full volid in canonical "storage:name" form
 	// ("local-lvm:vm-9001-disk-0") or an empty string when it echoes the
-	// filename. Use the canonical form when empty so the disk_cid is always
+	// filename. Use the canonical form when empty so the bare CID is always
 	// well-formed. The volid is already a valid disk CID; re-prefixing with
 	// storage would double it (e.g. "data:data:...").
-	diskCID = volid
-	if diskCID == "" {
-		diskCID = canonicalVolID
+	bareDiskCID = volid
+	if bareDiskCID == "" {
+		bareDiskCID = canonicalVolID
 	}
-	// Append placement metadata so downstream handlers (attach_disk and
-	// fault-domain co-location in create_vm) can read pool, node, and AZ
-	// without an extra PVE API call. Pool is always the resolved storage;
-	// node is the PVE node that holds the volume (meaningful for local-backend
-	// deployments). AZ is set from cloud_properties.availability_zone when
-	// provided; otherwise left empty so the CID is backward-compatible.
-	meta := &pve.DiskCIDMeta{
-		Pool: storage,
-		Node: node,
-		AZ:   az,
-		Opts: diskPerfOpts,
-	}
-	// With disk_cid_compression enabled, a CID whose pvd- form would overflow
-	// MySQL-backed Directors' varchar(255) disk_cid column is emitted as a
-	// pvz- gzip envelope instead; CIDs that fit are unaffected. Decode accepts
-	// both forms unconditionally, so the flag is safe to toggle at any time.
-	if deps.Config.DiskCIDCompression {
-		diskCID = pve.EncodeDiskCIDCompressed(diskCID, meta)
-	} else {
-		diskCID = pve.EncodeDiskCID(diskCID, meta)
-	}
-	return namingVMID, diskCID, canonicalVolID, nil
+	return namingVMID, bareDiskCID, canonicalVolID, nil
 }
 
 // rollbackCreatedVolume best-effort deletes a successfully created volume when

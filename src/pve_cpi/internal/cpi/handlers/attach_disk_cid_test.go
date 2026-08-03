@@ -17,6 +17,18 @@ import (
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
 )
 
+// mustEncodeDiskCID calls pve.EncodeDiskCID and fails the test on error. Test
+// call sites in this package always pass a non-empty bareCID; the error path
+// (empty bareCID) is covered directly in internal/pve's disk_test.go.
+func mustEncodeDiskCID(t *testing.T, bareCID string, meta *pve.DiskCIDMeta) string {
+	t.Helper()
+	got, err := pve.EncodeDiskCID(bareCID, meta)
+	if err != nil {
+		t.Fatalf("EncodeDiskCID(%q): unexpected error: %v", bareCID, err)
+	}
+	return got
+}
+
 // attachDepsWithNodes is attachDeps plus an injectable nodes.Service, used by
 // tests that assert the bosh_attached_disks sentinel write (or its absence)
 // triggered by pve.UpdateAttachedDiskCID.
@@ -39,7 +51,7 @@ func TestHandleAttachDisk_RecordsVerbatimCID(t *testing.T) {
 	t.Parallel()
 	const vmCID = "100"
 	bareVolid := "local-lvm:vm-9001-disk-0"
-	envelopeCID := pve.EncodeDiskCID(bareVolid, &pve.DiskCIDMeta{Pool: "local-lvm", Node: "pve1", AZ: "az1"})
+	envelopeCID := mustEncodeDiskCID(t, bareVolid, &pve.DiskCIDMeta{Pool: "local-lvm", Node: "pve1", AZ: "az1"})
 
 	qemuSvc := &attachQEMUService{
 		attachReturnDiskID: "scsi1",
@@ -59,7 +71,7 @@ func TestHandleAttachDisk_RecordsVerbatimCID(t *testing.T) {
 	}
 	h := handlers.HandleAttachDisk(attachDepsWithNodes(qemuSvc, nodesSvc, &captureAgent{}))
 
-	_, err := h.Handle(context.Background(), attachArgs(vmCID, envelopeCID), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), attachArgs(t, vmCID, envelopeCID), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -80,6 +92,7 @@ func TestHandleAttachDisk_SentinelMergePreservesExistingKeys(t *testing.T) {
 	t.Parallel()
 	const vmCID = "100"
 	bareVolid := "local-lvm:vm-9002-disk-0"
+	envelopeCID := mustEncodeDiskCID(t, bareVolid, nil)
 
 	seededDesc := `<!--BOSH:{"bosh_parked_disks":{"local-lvm:vm-9099-disk-0":{"disk_cid":"local-lvm:vm-9099-disk-0","parked_at":"2026-06-01T00:00:00Z","node":"pve1"}},"unknown_future_key":{"z":1}}-->`
 
@@ -102,7 +115,12 @@ func TestHandleAttachDisk_SentinelMergePreservesExistingKeys(t *testing.T) {
 	}
 	h := handlers.HandleAttachDisk(attachDepsWithNodes(qemuSvc, nodesSvc, &captureAgent{}))
 
-	_, err := h.Handle(context.Background(), attachArgs(vmCID, bareVolid), jsonrpc.Context{})
+	// Pass the already-encoded CID directly (attachArgs passes an already-
+	// enveloped CID through unchanged) so the recorded sentinel entry is
+	// asserted against the exact verbatim string the Director sent, per the
+	// "record whatever the Director handed us" contract this sentinel exists
+	// for.
+	_, err := h.Handle(context.Background(), attachArgs(t, vmCID, envelopeCID), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -114,8 +132,8 @@ func TestHandleAttachDisk_SentinelMergePreservesExistingKeys(t *testing.T) {
 		t.Errorf("description %q must preserve unknown_future_key", capturedDesc)
 	}
 	got := pve.GetAttachedDiskCIDs(capturedDesc)
-	if got[bareVolid] != bareVolid {
-		t.Errorf("recorded CID: want %q, got %q", bareVolid, got[bareVolid])
+	if got[bareVolid] != envelopeCID {
+		t.Errorf("recorded CID: want %q, got %q", envelopeCID, got[bareVolid])
 	}
 }
 
@@ -141,7 +159,7 @@ func TestHandleAttachDisk_CIDRecordFailureDoesNotFailAttach(t *testing.T) {
 	}
 	h := handlers.HandleAttachDisk(attachDepsWithNodes(qemuSvc, nodesSvc, &captureAgent{}))
 
-	result, err := h.Handle(context.Background(), attachArgs(vmCID, bareVolid), jsonrpc.Context{})
+	result, err := h.Handle(context.Background(), attachArgs(t, vmCID, bareVolid), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("attach_disk must succeed despite CID-record failure: %v", err)
 	}
@@ -171,7 +189,7 @@ func TestHandleAttachDisk_NoNodesService_CIDRecordSkippedSilently(t *testing.T) 
 	}
 	h := handlers.HandleAttachDisk(attachDeps(qemuSvc, &captureAgent{}))
 
-	result, err := h.Handle(context.Background(), attachArgs(vmCID, bareVolid), jsonrpc.Context{})
+	result, err := h.Handle(context.Background(), attachArgs(t, vmCID, bareVolid), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

@@ -105,7 +105,7 @@ func TestHandleHasDisk_Exists(t *testing.T) {
 
 	h := handlers.HandleHasDisk(deps)
 	result, err := h.Handle(context.Background(), []json.RawMessage{
-		marshal("local-lvm:vm-9001-disk-0"),
+		marshal(mustEncodeDiskCID(t, "local-lvm:vm-9001-disk-0", nil)),
 	}, jsonrpc.Context{})
 
 	if err != nil {
@@ -131,7 +131,7 @@ func TestHandleHasDisk_NotExists(t *testing.T) {
 
 	h := handlers.HandleHasDisk(deps)
 	result, err := h.Handle(context.Background(), []json.RawMessage{
-		marshal("local-lvm:vm-9999-disk-0"),
+		marshal(mustEncodeDiskCID(t, "local-lvm:vm-9999-disk-0", nil)),
 	}, jsonrpc.Context{})
 
 	if err != nil {
@@ -161,7 +161,7 @@ func TestHandleHasDisk_SDKNotFoundError_ReturnsFalse(t *testing.T) {
 
 	h := handlers.HandleHasDisk(deps)
 	result, err := h.Handle(context.Background(), []json.RawMessage{
-		marshal("local-lvm:vm-9001-disk-0"),
+		marshal(mustEncodeDiskCID(t, "local-lvm:vm-9001-disk-0", nil)),
 	}, jsonrpc.Context{})
 
 	if err != nil {
@@ -187,7 +187,7 @@ func TestHandleHasDisk_SDKError_Propagated(t *testing.T) {
 
 	h := handlers.HandleHasDisk(deps)
 	_, err := h.Handle(context.Background(), []json.RawMessage{
-		marshal("local-lvm:vm-9001-disk-0"),
+		marshal(mustEncodeDiskCID(t, "local-lvm:vm-9001-disk-0", nil)),
 	}, jsonrpc.Context{})
 
 	if err == nil {
@@ -213,7 +213,7 @@ func TestHandleHasDisk_TransientSDKError_IsRetriable(t *testing.T) {
 
 	h := handlers.HandleHasDisk(deps)
 	_, err := h.Handle(fastRetryCtx(context.Background()), []json.RawMessage{
-		marshal("local-lvm:vm-9001-disk-0"),
+		marshal(mustEncodeDiskCID(t, "local-lvm:vm-9001-disk-0", nil)),
 	}, jsonrpc.Context{})
 
 	if err == nil {
@@ -281,7 +281,7 @@ func TestHandleHasDisk_MissingNode(t *testing.T) {
 
 	h := handlers.HandleHasDisk(deps)
 	_, err := h.Handle(context.Background(), []json.RawMessage{
-		marshal("local-lvm:vm-9001-disk-0"),
+		marshal(mustEncodeDiskCID(t, "local-lvm:vm-9001-disk-0", nil)),
 	}, jsonrpc.Context{})
 
 	if err == nil {
@@ -354,7 +354,7 @@ func TestHandleHasDisk_NodeForExistingDiskNotFound(t *testing.T) {
 
 	h := handlers.HandleHasDisk(deps)
 	result, err := h.Handle(context.Background(), []json.RawMessage{
-		marshal("local-lvm:vm-9001-disk-0"),
+		marshal(mustEncodeDiskCID(t, "local-lvm:vm-9001-disk-0", nil)),
 	}, jsonrpc.Context{})
 
 	if err != nil {
@@ -399,7 +399,7 @@ func TestHandleHasDisk_NodeForExistingOtherError(t *testing.T) {
 
 	h := handlers.HandleHasDisk(deps)
 	_, err := h.Handle(context.Background(), []json.RawMessage{
-		marshal("local-lvm:vm-9001-disk-0"),
+		marshal(mustEncodeDiskCID(t, "local-lvm:vm-9001-disk-0", nil)),
 	}, jsonrpc.Context{})
 
 	if err == nil {
@@ -432,7 +432,7 @@ func TestHandleHasDisk_BackendResolveError(t *testing.T) {
 
 	h := handlers.HandleHasDisk(deps)
 	_, err := h.Handle(context.Background(), []json.RawMessage{
-		marshal("local-lvm:vm-9001-disk-0"),
+		marshal(mustEncodeDiskCID(t, "local-lvm:vm-9001-disk-0", nil)),
 	}, jsonrpc.Context{})
 
 	if err == nil {
@@ -476,7 +476,7 @@ func TestHandleHasDisk_Dir_CID(t *testing.T) {
 
 	h := handlers.HandleHasDisk(deps)
 	result, err := h.Handle(context.Background(), []json.RawMessage{
-		marshal(cid),
+		marshal(mustEncodeDiskCID(t, cid, nil)),
 	}, jsonrpc.Context{})
 
 	if err != nil {
@@ -516,7 +516,7 @@ func TestHandleHasDisk_ZFSPool_CID(t *testing.T) {
 
 	h := handlers.HandleHasDisk(deps)
 	result, err := h.Handle(context.Background(), []json.RawMessage{
-		marshal(cid),
+		marshal(mustEncodeDiskCID(t, cid, nil)),
 	}, jsonrpc.Context{})
 
 	if err != nil {
@@ -556,7 +556,7 @@ func TestHandleHasDisk_LVMThin_CID(t *testing.T) {
 
 	h := handlers.HandleHasDisk(deps)
 	result, err := h.Handle(context.Background(), []json.RawMessage{
-		marshal(cid),
+		marshal(mustEncodeDiskCID(t, cid, nil)),
 	}, jsonrpc.Context{})
 
 	if err != nil {

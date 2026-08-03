@@ -22,7 +22,7 @@ func unparkBeforeDelete(ctx context.Context, deps Deps, diskCID, bareDiskCID str
 	parkerCfg := pve.ParkerConfig{
 		VMIDRangeStart: deps.Config.ParkedDiskVMIDRangeStartValue(),
 		VMIDRangeEnd:   deps.Config.ParkedDiskVMIDRangeEndValue(),
-		DirectorID:     deps.Config.StemcellDirectorID(),
+		DirectorID:     deps.RequestDirectorUUID,
 	}
 	// UnparkDisk re-runs the is-parked check internally and is idempotent when
 	// the disk is not parked, so calling it directly avoids a redundant

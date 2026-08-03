@@ -168,7 +168,7 @@ func TestHandleSnapshotDisk_Happy(t *testing.T) {
 
 	h := handlers.HandleSnapshotDisk(snapDeps(qemuSvc, clusterSvc, nil))
 
-	result, err := h.Handle(context.Background(), marshalArgs(diskCID), jsonrpc.Context{})
+	result, err := h.Handle(context.Background(), marshalArgs(mustEncodeDiskCID(t, diskCID, nil)), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -210,7 +210,7 @@ func TestHandleSnapshotDisk_WithDescription(t *testing.T) {
 	}
 
 	h := handlers.HandleSnapshotDisk(snapDeps(qemuSvc, clusterSvc, nil))
-	_, err := h.Handle(context.Background(), marshalArgs(diskCID, map[string]any{
+	_, err := h.Handle(context.Background(), marshalArgs(mustEncodeDiskCID(t, diskCID, nil), map[string]any{
 		"description": "my snap",
 	}), jsonrpc.Context{})
 	if err != nil {
@@ -248,7 +248,7 @@ func TestHandleSnapshotDisk_WithUpid(t *testing.T) {
 	}
 
 	h := handlers.HandleSnapshotDisk(snapDeps(qemuSvc, clusterSvc, tasksSvc))
-	result, err := h.Handle(context.Background(), marshalArgs(diskCID), jsonrpc.Context{})
+	result, err := h.Handle(context.Background(), marshalArgs(mustEncodeDiskCID(t, diskCID, nil)), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -277,7 +277,7 @@ func TestHandleSnapshotDisk_DiskNotAttached(t *testing.T) {
 	}
 
 	h := handlers.HandleSnapshotDisk(snapDeps(qemuSvc, clusterSvc, nil))
-	_, err := h.Handle(context.Background(), marshalArgs(diskCID), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), marshalArgs(mustEncodeDiskCID(t, diskCID, nil)), jsonrpc.Context{})
 	if err == nil {
 		t.Fatal("expected error for disk not attached to any VM")
 	}
@@ -295,7 +295,7 @@ func TestHandleSnapshotDisk_EmptyClusterList(t *testing.T) {
 	}
 
 	h := handlers.HandleSnapshotDisk(snapDeps(&snapQEMUService{}, clusterSvc, nil))
-	_, err := h.Handle(context.Background(), marshalArgs(diskCID), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), marshalArgs(mustEncodeDiskCID(t, diskCID, nil)), jsonrpc.Context{})
 	if err == nil {
 		t.Fatal("expected error when cluster has no VMs")
 	}
@@ -320,7 +320,7 @@ func TestHandleSnapshotDisk_SnapshotFails(t *testing.T) {
 	}
 
 	h := handlers.HandleSnapshotDisk(snapDeps(qemuSvc, clusterSvc, nil))
-	_, err := h.Handle(context.Background(), marshalArgs(diskCID), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), marshalArgs(mustEncodeDiskCID(t, diskCID, nil)), jsonrpc.Context{})
 	if err == nil {
 		t.Fatal("expected error when Snapshot fails")
 	}
@@ -354,7 +354,7 @@ func TestHandleSnapshotDisk_ClusterListError(t *testing.T) {
 	}
 
 	h := handlers.HandleSnapshotDisk(snapDeps(&snapQEMUService{}, clusterSvc, nil))
-	_, err := h.Handle(context.Background(), marshalArgs(diskCID), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), marshalArgs(mustEncodeDiskCID(t, diskCID, nil)), jsonrpc.Context{})
 	if err == nil {
 		t.Fatal("expected error when cluster list fails")
 	}
@@ -387,7 +387,7 @@ func TestHandleSnapshotDisk_DiskInOptionString(t *testing.T) {
 	}
 
 	h := handlers.HandleSnapshotDisk(snapDeps(qemuSvc, clusterSvc, nil))
-	_, err := h.Handle(context.Background(), marshalArgs(diskCID), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), marshalArgs(mustEncodeDiskCID(t, diskCID, nil)), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("unexpected error for disk stored with option string: %v", err)
 	}
@@ -416,7 +416,7 @@ func TestHandleSnapshotDisk_SDKError404(t *testing.T) {
 	}
 
 	h := handlers.HandleSnapshotDisk(snapDeps(qemuSvc, clusterSvc, nil))
-	_, err := h.Handle(context.Background(), marshalArgs(diskCID), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), marshalArgs(mustEncodeDiskCID(t, diskCID, nil)), jsonrpc.Context{})
 	if err == nil {
 		t.Fatal("expected error for 404 from Snapshot")
 	}
@@ -456,7 +456,7 @@ func TestHandleSnapshotDisk_Dir_CID(t *testing.T) {
 	}
 
 	h := handlers.HandleSnapshotDisk(snapDeps(qemuSvc, clusterSvc, nil))
-	result, err := h.Handle(context.Background(), marshalArgs(diskCID), jsonrpc.Context{})
+	result, err := h.Handle(context.Background(), marshalArgs(mustEncodeDiskCID(t, diskCID, nil)), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("Dir CID: unexpected error: %v", err)
 	}
@@ -494,7 +494,7 @@ func TestHandleSnapshotDisk_ZFSPool_CID(t *testing.T) {
 	}
 
 	h := handlers.HandleSnapshotDisk(snapDeps(qemuSvc, clusterSvc, nil))
-	result, err := h.Handle(context.Background(), marshalArgs(diskCID), jsonrpc.Context{})
+	result, err := h.Handle(context.Background(), marshalArgs(mustEncodeDiskCID(t, diskCID, nil)), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("ZFSPool CID: unexpected error: %v", err)
 	}
@@ -532,7 +532,7 @@ func TestHandleSnapshotDisk_LVMThin_CID(t *testing.T) {
 	}
 
 	h := handlers.HandleSnapshotDisk(snapDeps(qemuSvc, clusterSvc, nil))
-	result, err := h.Handle(context.Background(), marshalArgs(diskCID), jsonrpc.Context{})
+	result, err := h.Handle(context.Background(), marshalArgs(mustEncodeDiskCID(t, diskCID, nil)), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("LVMThin CID: unexpected error: %v", err)
 	}
@@ -604,7 +604,7 @@ func TestHandleSnapshotDisk_ParkedDisk_Rejected(t *testing.T) {
 	}
 
 	h := handlers.HandleSnapshotDisk(snapDepsWithConfig(cfg, qemuSvc, clusterSvc))
-	_, err := h.Handle(context.Background(), marshalArgs(volid), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), marshalArgs(mustEncodeDiskCID(t, volid, nil)), jsonrpc.Context{})
 	if err == nil {
 		t.Fatal("expected non-retriable CloudError when disk is parked")
 	}
@@ -662,7 +662,7 @@ func TestHandleSnapshotDisk_ParkedStrategyActive_RealVM_Proceeds(t *testing.T) {
 	}
 
 	h := handlers.HandleSnapshotDisk(snapDepsWithConfig(cfg, qemuSvc, clusterSvc))
-	_, err := h.Handle(context.Background(), marshalArgs(volid), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), marshalArgs(mustEncodeDiskCID(t, volid, nil)), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("unexpected error for real VM with parked strategy active: %v", err)
 	}
@@ -708,7 +708,7 @@ func TestHandleSnapshotDisk_NeverOptedIn_ZeroExtraCalls(t *testing.T) {
 	cfg := &config.CPIConfig{Node: testNode}
 
 	h := handlers.HandleSnapshotDisk(snapDepsWithConfig(cfg, qemuSvc, clusterSvc))
-	_, err := h.Handle(context.Background(), marshalArgs(volid), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), marshalArgs(mustEncodeDiskCID(t, volid, nil)), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("unexpected error for never-opted-in: %v", err)
 	}
@@ -760,7 +760,7 @@ func TestHandleSnapshotDisk_InRangeNoParkerTag_Proceeds(t *testing.T) {
 	}
 
 	h := handlers.HandleSnapshotDisk(snapDepsWithConfig(cfg, qemuSvc, clusterSvc))
-	_, err := h.Handle(context.Background(), marshalArgs(volid), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), marshalArgs(mustEncodeDiskCID(t, volid, nil)), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("in-range VM without bosh-parker tag must not be blocked: %v", err)
 	}

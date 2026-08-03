@@ -136,15 +136,20 @@ func sweepFastDeleteStragglers(ctx context.Context, deps Deps, logger *log.Logge
 			log.String("node", item.Node),
 			log.String("vmid", vmIDStr),
 		)
+		// Base value is pve.destroy_unreferenced_disks (default false; see the
+		// config field doc for the cross-cluster shared-storage data-loss
+		// hazard enabling it introduces).
+		//
 		// A straggler may carry tagRetainEphemeral: its original fast-path delete
 		// stamped bosh-deleting before the retain detach ran, so the straggler can
 		// hold an ephemeral disk in any state — still attached, or already
 		// unlinked+swept (unreferenced with a matching VMID, exactly what
 		// DestroyUnreferencedDisks=true frees). Re-run the detach to finish any
 		// pending unlink, and force the destroy flag false for retain-tagged
-		// stragglers. On detach failure, skip this straggler (left for the next
-		// sweep) rather than destroy with the volume in an unknown state.
-		destroyDisks := true
+		// stragglers regardless of the config knob. On detach failure, skip this
+		// straggler (left for the next sweep) rather than destroy with the
+		// volume in an unknown state.
+		destroyDisks := deps.Config.DestroyUnreferencedDisks
 		if tagsContain(item.Tags, tagRetainEphemeral) {
 			retained, retainErr := detachRetainedEphemeralDisk(ctx, deps, item.Node, vmIDStr, int(item.VMID), sweepLogger)
 			if retainErr != nil {
@@ -152,7 +157,7 @@ func sweepFastDeleteStragglers(ctx context.Context, deps Deps, logger *log.Logge
 					log.Err(retainErr))
 				continue
 			}
-			destroyDisks = !retained
+			destroyDisks = destroyDisks && !retained
 		}
 		// Fire-and-forget: discard the UPID, no await. Purge's pool-membership
 		// interplay: see the synchronous-path DeleteQemu comment in
@@ -280,13 +285,15 @@ func fastPathDeleteVM(ctx context.Context, deps Deps, node, vmCID string, vmid i
 	// Purge's pool-membership interplay: see the synchronous-path DeleteQemu
 	// comment in HandleDeleteVM.
 	//
-	// DestroyUnreferencedDisks=false on the retain path: after the unlink+sweep
-	// sequence the ephemeral volume is unreferenced AND has a matching VMID.
-	// DestroyUnreferencedDisks=true would free it. Setting false preserves it.
-	// Non-retain deletes keep true (byte-identical to prior behaviour).
+	// DestroyUnreferencedDisks is pve.destroy_unreferenced_disks (default
+	// false; see the config field doc for the cross-cluster shared-storage
+	// data-loss hazard it introduces when enabled) AND-ed with !retained:
+	// retain semantics always win regardless of the knob -- after the
+	// unlink+sweep sequence the ephemeral volume is unreferenced AND has a
+	// matching VMID, exactly what DestroyUnreferencedDisks=true would free.
 	logger.Debug("delete_vm: fast-path: issuing skiplock destroy without await")
 	purge := true
-	destroyDisks := !retained
+	destroyDisks := deps.Config.DestroyUnreferencedDisks && !retained
 	skiplock := true
 	_, delErr := deps.PVE.Nodes().DeleteQemu(ctx, node, vmCID, &sdknodes.DeleteQemuParams{
 		Purge:                    &purge,
@@ -523,7 +530,7 @@ func refuseIfParkerVM(ctx context.Context, deps Deps, node string, vmid int) (al
 	parkerCfg := pve.ParkerConfig{
 		VMIDRangeStart: deps.Config.ParkedDiskVMIDRangeStartValue(),
 		VMIDRangeEnd:   deps.Config.ParkedDiskVMIDRangeEndValue(),
-		DirectorID:     deps.Config.StemcellDirectorID(),
+		DirectorID:     deps.RequestDirectorUUID,
 	}
 	// Range-first: only read the VM config when vmid is in the parker band.
 	if vmid < parkerCfg.VMIDRangeStart || vmid > parkerCfg.VMIDRangeEnd {
@@ -612,12 +619,17 @@ func cleanupHAMembership(ctx context.Context, deps Deps, vmid int, logger *log.L
 // not verified against a live cluster; do not depend on the pool member list
 // shrinking immediately after delete_vm without checking your PVE version.
 //
-// DestroyUnreferencedDisks is false on the retain path (the ephemeral disk is
-// now unreferenced + own-VMID — true would destroy it); true otherwise. See
-// detachRetainedEphemeralDisk for the full rationale. When true it triggers
-// pvesm free under the per-storage lockfile for every attached volume, so on
-// bursty deploys this can surface "can't lock file ... got timeout" — the
-// retry wrapper absorbs that signal; everything else propagates immediately.
+// DestroyUnreferencedDisks is pve.destroy_unreferenced_disks (default false)
+// AND-ed with !retained: it is always false on the retain path (the
+// ephemeral disk is now unreferenced + own-VMID — true would destroy it)
+// regardless of the config knob, and otherwise reflects the operator's
+// opt-in. See detachRetainedEphemeralDisk for the retain rationale and the
+// DestroyUnreferencedDisks field doc on config.CPIConfig for the
+// cross-cluster shared-storage data-loss hazard enabling the knob
+// introduces. When true it triggers pvesm free under the per-storage
+// lockfile for every attached volume, so on bursty deploys this can surface
+// "can't lock file ... got timeout" — the retry wrapper absorbs that signal;
+// everything else propagates immediately.
 //
 // Returns alreadyGone=true for the idempotent not-found path (agent state
 // already cleaned; the caller finishes route cleanup and returns success).
@@ -625,7 +637,7 @@ func destroyVMWithRecovery(
 	ctx context.Context, deps Deps, node, vmCID string, vmid int, retained bool, logger *log.Logger,
 ) (resp *sdknodes.DeleteQemuResponse, alreadyGone bool, err error) {
 	purge := true
-	destroyDisks := !retained
+	destroyDisks := deps.Config.DestroyUnreferencedDisks && !retained
 	logger.Debug("delete_vm: deleting VM")
 	var deleteResp *sdknodes.DeleteQemuResponse
 	attemptDestroy := func() error {

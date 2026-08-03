@@ -186,7 +186,7 @@ func guardSnapshotParked(ctx context.Context, deps Deps, diskCID string, vmid in
 	parkerCfg := pve.ParkerConfig{
 		VMIDRangeStart: deps.Config.ParkedDiskVMIDRangeStartValue(),
 		VMIDRangeEnd:   deps.Config.ParkedDiskVMIDRangeEndValue(),
-		DirectorID:     deps.Config.StemcellDirectorID(),
+		DirectorID:     deps.RequestDirectorUUID,
 	}
 	if vmid < parkerCfg.VMIDRangeStart || vmid > parkerCfg.VMIDRangeEnd {
 		return nil

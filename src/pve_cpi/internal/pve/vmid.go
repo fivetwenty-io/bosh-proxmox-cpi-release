@@ -55,6 +55,19 @@ type allocOpts struct {
 	// Set via WithStorageScan. Left empty ("", "") the option is a no-op.
 	storageScanNode    string
 	storageScanStorage string
+	// extraStorageScans holds additional (node, storage) pairs unioned into
+	// the same used-set as storageScanNode/storageScanStorage. Set via
+	// WithExtraStorageScan, which may be supplied more than once to scan
+	// several distinct pools in one allocation call (e.g. vm_storage AND a
+	// distinct iso_storage). Empty by default — zero extra API calls and
+	// byte-identical behavior for every caller that does not use it.
+	extraStorageScans []storageScanTarget
+}
+
+// storageScanTarget is one (node, storage) pair queued by WithExtraStorageScan.
+type storageScanTarget struct {
+	node    string
+	storage string
 }
 
 // AllocOption is a functional option for NextVMID and the retry helpers.
@@ -116,6 +129,28 @@ func WithStorageScan(node, storage string) AllocOption {
 	return func(o *allocOpts) {
 		o.storageScanNode = node
 		o.storageScanStorage = storage
+	}
+}
+
+// WithExtraStorageScan queues one additional (node, storage) pair to be
+// unioned into NextVMID's used-set alongside the primary WithStorageScan
+// pair (if any). Callers may supply it more than once to scan several
+// distinct pools in a single allocation — e.g. vm_storage via WithStorageScan
+// plus a distinct iso_storage via WithExtraStorageScan, closing the gap
+// documented at WithStorageScan for pools WithStorageScan itself does not
+// cover.
+//
+// Either argument empty is a no-op: nothing is queued and behavior is
+// unaffected for that call. Duplicate (node, storage) pairs — including one
+// identical to the primary WithStorageScan pair — are queued and scanned
+// again; listStorageVMIDs is idempotent so this only costs a redundant API
+// call, never a correctness issue.
+func WithExtraStorageScan(node, storage string) AllocOption {
+	return func(o *allocOpts) {
+		if node == "" || storage == "" {
+			return
+		}
+		o.extraStorageScans = append(o.extraStorageScans, storageScanTarget{node: node, storage: storage})
 	}
 }
 
@@ -263,7 +298,9 @@ func nextVMIDInRange(used map[int]struct{}, start, end int) (int, error) {
 // see WithStorageScan for why this matters on storage shared across PVE
 // clusters. Fetched outside the mutex for the same reason as the cluster
 // list. Omitted (or either argument empty), behavior is unchanged from
-// before this option existed.
+// before this option existed. WithExtraStorageScan queues additional
+// (node, storage) pairs scanned the same way, for callers that must cover
+// more than one pool in a single allocation.
 //
 // Inputs and failure modes:
 //   - ctx nil → returns *cpierrors.Error before any SDK call.
@@ -298,6 +335,15 @@ func NextVMID(ctx context.Context, c Client, opts ...AllocOption) (int, error) {
 
 	if ao.storageScanNode != "" && ao.storageScanStorage != "" {
 		storageUsed, sErr := listStorageVMIDs(ctx, c, ao.storageScanNode, ao.storageScanStorage)
+		if sErr != nil {
+			return 0, sErr
+		}
+		for id := range storageUsed {
+			used[id] = struct{}{}
+		}
+	}
+	for _, extra := range ao.extraStorageScans {
+		storageUsed, sErr := listStorageVMIDs(ctx, c, extra.node, extra.storage)
 		if sErr != nil {
 			return 0, sErr
 		}

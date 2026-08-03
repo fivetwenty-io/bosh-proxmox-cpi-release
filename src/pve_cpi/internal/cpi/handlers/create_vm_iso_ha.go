@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"strings"
+	"sync"
 
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
@@ -60,6 +61,83 @@ func haRegistrationFeatures(deps Deps, cp createVMCloudProps, node string, env m
 	return out
 }
 
+// haResurrectorWarnOnce guards the single warning create_vm emits per CPI
+// process when it registers a VM under any HA-registration feature (DLB,
+// anti-affinity HA rules, or AZ node-affinity pinning). PVE HA and the BOSH
+// resurrector independently detect and restart a failed guest: PVE HA
+// relocates the guest to another node while the Director, seeing the
+// original VMID become unresponsive, issues its own create_vm, producing a
+// duplicate that conflicts with the HA-recovered guest on IP, VMID, or agent
+// credentials. The CPI cannot detect the resurrector's runtime state, so it
+// can only warn, not prevent the race — see docs/dlb-aware-placement.md and
+// docs/ha-and-resurrection.md for the full ownership matrix and the
+// `bosh update-resurrection off` remediation.
+//
+// One warning per CPI process is enough to alert the operator without
+// flooding logs on every subsequent HA-registered create_vm — mirrors the
+// vniZoneListWarnOnce once-per-process idiom (internal/pve/vni.go).
+// Process-scoped, not per-feature-set: the first HA-registered create_vm in
+// this process warns; later ones (even under a different feature
+// combination) do not repeat it. Tests reset it via export_test.go so the
+// suite is repeat-safe under -count=N.
+var haResurrectorWarnOnce sync.Once
+
+// warnHAResurrectorConflictOnce emits the one-per-process
+// HA-vs-resurrector Warn when features is non-empty. Called from
+// checkISOStorageForHA, which already computes haRegistrationFeatures on
+// every create_vm — piggybacking here avoids a second create_vm.go call
+// site. A no-op when features is empty (no HA-registration feature fired
+// for this VM) or logger is nil.
+func warnHAResurrectorConflictOnce(vmid int, features []haRegistrationFeature, logger *log.Logger) {
+	if len(features) == 0 || logger == nil {
+		return
+	}
+	haResurrectorWarnOnce.Do(func() {
+		featureNames := make([]string, len(features))
+		for i, f := range features {
+			featureNames[i] = string(f)
+		}
+		logger.Warn("create_vm: this VM is registered as a PVE HA resource; the BOSH resurrector "+
+			"must be disabled for HA-managed deployments, or PVE HA and the resurrector can both "+
+			"try to recover the same failed guest independently, producing a duplicate VM that "+
+			"conflicts on IP, VMID, or agent credentials -- run `bosh update-resurrection off` "+
+			"(or set resurrector_enabled: false in the Director manifest) for any deployment using "+
+			"placement.dlb, placement.anti_affinity.use_ha_rules, or placement.pin_az_via_ha_rules; "+
+			"see docs/ha-and-resurrection.md",
+			log.Int(metadataKeyVMID, vmid),
+			log.String("features", strings.Join(featureNames, ",")),
+		)
+	})
+}
+
+// isoStorageScanTarget returns deps.Config.ISOStorage when it is a pool
+// distinct from vmStorage and deps.Config.DiskStorage, or "" otherwise.
+//
+// Feeds pve.WithExtraStorageScan at the create_vm VMID-allocation call sites
+// (allocateVM / allocateVMForFallback in create_vm.go): pve.WithStorageScan
+// there only covers vmStorage, so on a cluster whose iso_storage pool is
+// ALSO shared with another independent PVE cluster (a second BOSH-Proxmox
+// AZ), a VMID already holding files under images/<vmid>/ on that shared ISO
+// pool — because the other cluster owns that VM or template — was
+// previously invisible to this cluster's VMID allocation (see
+// pve.WithStorageScan's doc comment for the general co-mingling hazard
+// this closes for vmStorage).
+//
+// "" is a safe default: pve.WithExtraStorageScan treats an empty storage
+// argument as a no-op, so a call site that always passes this helper's
+// result costs nothing extra when ISOStorage is unset, matches vmStorage, or
+// matches DiskStorage (already covered, or nothing to add).
+func isoStorageScanTarget(deps Deps, vmStorage string) string {
+	if deps.Config == nil {
+		return ""
+	}
+	iso := deps.Config.ISOStorage
+	if iso == "" || iso == vmStorage || iso == deps.Config.DiskStorage {
+		return ""
+	}
+	return iso
+}
+
 // checkISOStorageForHA is create_vm step 10b: the config-drive ISO migration-
 // safety check. The ConfigDrive ISO CD-ROM attached at scsi30 lives for the
 // VM's whole life on deps.Config.ISOStorage (see internal/agent/configdrive.go),
@@ -89,6 +167,11 @@ func checkISOStorageForHA(
 	if len(features) == 0 {
 		return nil
 	}
+
+	// D11: one-per-process HA-vs-resurrector Warn. Independent of the
+	// ISO-storage migration-safety check below — it fires whenever any
+	// HA-registration feature is active, regardless of iso_storage sharing.
+	warnHAResurrectorConflictOnce(vmid, features, logger)
 
 	isoPool := deps.Config.ISOStorage
 	if isoPool == "" {

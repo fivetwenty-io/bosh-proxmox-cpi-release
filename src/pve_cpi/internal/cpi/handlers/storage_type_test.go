@@ -154,7 +154,7 @@ func TestResizeDisk_StorageTypes(t *testing.T) {
 			)
 
 			h := handlers.HandleResizeDisk(resizeDeps(qemuSvc, resizeClusterWith(9001), nil))
-			result, err := h.Handle(context.Background(), marshalArgs(tc.diskCID, tc.newMiB), jsonrpc.Context{})
+			result, err := h.Handle(context.Background(), marshalArgs(mustEncodeDiskCID(t, tc.diskCID, nil), tc.newMiB), jsonrpc.Context{})
 			if err != nil {
 				t.Fatalf("unexpected error for %s CID: %v", tc.storageType, err)
 			}

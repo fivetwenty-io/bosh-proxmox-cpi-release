@@ -43,7 +43,7 @@ func TestHandleAttachDisk_DiscardSSDAuto_BareCID_TrimCapableStorage(t *testing.T
 	deps := attachDepsPerfWithStorageType(qemuSvc, cfg, "zfspool")
 	h := handlers.HandleAttachDisk(deps)
 
-	_, err := h.Handle(context.Background(), attachArgs("100", bareCID), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), attachArgs(t, "100", bareCID), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -70,7 +70,7 @@ func TestHandleAttachDisk_DiscardSSDAuto_LegacyCID_SSDInvariantViolation(t *test
 	const bareCID = "local-lvm:vm-9100-disk-0"
 	// Legacy CID: only cache was ever recorded — no ssd (or discard) key,
 	// simulating a disk created before this feature existed.
-	encodedCID := perfDiskCID(bareCID, map[string]string{"cache": "writeback"})
+	encodedCID := perfDiskCID(t, bareCID, map[string]string{"cache": "writeback"})
 
 	qemuSvc := &attachQEMUService{
 		attachReturnDiskID: "scsi1",
@@ -88,7 +88,7 @@ func TestHandleAttachDisk_DiscardSSDAuto_LegacyCID_SSDInvariantViolation(t *test
 	deps := attachDepsPerfWithStorageType(qemuSvc, cfg, "rbd") // TRIM-capable
 
 	h := handlers.HandleAttachDisk(deps)
-	_, err := h.Handle(context.Background(), attachArgs("100", encodedCID), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), attachArgs(t, "100", encodedCID), jsonrpc.Context{})
 
 	if err == nil {
 		t.Fatal("expected an invariant-divergence error for the unrecorded ssd auto-default, got nil")
@@ -114,7 +114,7 @@ func TestHandleAttachDisk_DiscardSSDAuto_LegacyCID_SSDInvariantViolation(t *test
 func TestHandleAttachDisk_DiscardSSDAuto_LegacyCID_WarnModeProceeds(t *testing.T) {
 	t.Parallel()
 	const bareCID = "local-lvm:vm-9101-disk-0"
-	encodedCID := perfDiskCID(bareCID, map[string]string{"cache": "writeback"})
+	encodedCID := perfDiskCID(t, bareCID, map[string]string{"cache": "writeback"})
 
 	qemuSvc := &attachQEMUService{
 		attachReturnDiskID: "scsi1",
@@ -129,7 +129,7 @@ func TestHandleAttachDisk_DiscardSSDAuto_LegacyCID_WarnModeProceeds(t *testing.T
 	deps := attachDepsPerfWithStorageType(qemuSvc, cfg, "rbd")
 
 	h := handlers.HandleAttachDisk(deps)
-	_, err := h.Handle(context.Background(), attachArgs("100", encodedCID), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), attachArgs(t, "100", encodedCID), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("warn mode must not error, got: %v", err)
 	}

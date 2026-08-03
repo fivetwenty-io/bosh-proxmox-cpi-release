@@ -56,7 +56,7 @@ func TestHandleDeleteDisk_Happy(t *testing.T) {
 
 	h := handlers.HandleDeleteDisk(deps)
 	result, err := h.Handle(context.Background(), []json.RawMessage{
-		marshal(diskCID),
+		marshal(mustEncodeDiskCID(t, diskCID, nil)),
 	}, jsonrpc.Context{})
 
 	if err != nil {
@@ -96,7 +96,7 @@ func TestHandleDeleteDisk_NotFound_Idempotent(t *testing.T) {
 
 	h := handlers.HandleDeleteDisk(deps)
 	result, err := h.Handle(context.Background(), []json.RawMessage{
-		marshal(diskCID),
+		marshal(mustEncodeDiskCID(t, diskCID, nil)),
 	}, jsonrpc.Context{})
 
 	if err != nil {
@@ -118,7 +118,7 @@ func TestHandleDeleteDisk_SDKError(t *testing.T) {
 
 	h := handlers.HandleDeleteDisk(deps)
 	_, err := h.Handle(context.Background(), []json.RawMessage{
-		marshal(diskCID),
+		marshal(mustEncodeDiskCID(t, diskCID, nil)),
 	}, jsonrpc.Context{})
 
 	if err == nil {
@@ -183,7 +183,7 @@ func TestHandleDeleteDisk_MissingNode(t *testing.T) {
 
 	h := handlers.HandleDeleteDisk(deps)
 	_, err := h.Handle(context.Background(), []json.RawMessage{
-		marshal(diskCID),
+		marshal(mustEncodeDiskCID(t, diskCID, nil)),
 	}, jsonrpc.Context{})
 
 	if err == nil {
@@ -243,7 +243,7 @@ func TestHandleDeleteDisk_SDKDeleteVolumeReturnsNil(t *testing.T) {
 
 	h := handlers.HandleDeleteDisk(deps)
 	result, err := h.Handle(context.Background(), []json.RawMessage{
-		marshal(diskCID),
+		marshal(mustEncodeDiskCID(t, diskCID, nil)),
 	}, jsonrpc.Context{})
 
 	if err != nil {
@@ -279,7 +279,7 @@ func TestHandleDeleteDisk_LVM_CID(t *testing.T) {
 	deps := baseDepsForDelete(t, storageSvc)
 
 	h := handlers.HandleDeleteDisk(deps)
-	_, err := h.Handle(context.Background(), []json.RawMessage{marshal(cid)}, jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), []json.RawMessage{marshal(mustEncodeDiskCID(t, cid, nil))}, jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -305,7 +305,7 @@ func TestHandleDeleteDisk_LVMThin_CID(t *testing.T) {
 	deps := baseDepsForDelete(t, storageSvc)
 
 	h := handlers.HandleDeleteDisk(deps)
-	_, err := h.Handle(context.Background(), []json.RawMessage{marshal(cid)}, jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), []json.RawMessage{marshal(mustEncodeDiskCID(t, cid, nil))}, jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -331,7 +331,7 @@ func TestHandleDeleteDisk_ZFSPool_CID(t *testing.T) {
 	deps := baseDepsForDelete(t, storageSvc)
 
 	h := handlers.HandleDeleteDisk(deps)
-	_, err := h.Handle(context.Background(), []json.RawMessage{marshal(cid)}, jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), []json.RawMessage{marshal(mustEncodeDiskCID(t, cid, nil))}, jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -361,7 +361,7 @@ func TestHandleDeleteDisk_Dir_CID(t *testing.T) {
 	deps := baseDepsForDelete(t, storageSvc)
 
 	h := handlers.HandleDeleteDisk(deps)
-	_, err := h.Handle(context.Background(), []json.RawMessage{marshal(cid)}, jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), []json.RawMessage{marshal(mustEncodeDiskCID(t, cid, nil))}, jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -476,7 +476,7 @@ func TestHandleDeleteDisk_Parker_Parked_UnparksAndDeletes(t *testing.T) {
 	deps := parkerDepsForDelete(client)
 
 	h := handlers.HandleDeleteDisk(deps)
-	_, err := h.Handle(context.Background(), []json.RawMessage{marshal(diskCID)}, jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), []json.RawMessage{marshal(mustEncodeDiskCID(t, diskCID, nil))}, jsonrpc.Context{})
 
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -506,7 +506,7 @@ func TestHandleDeleteDisk_Parker_UnparkFail_Retriable(t *testing.T) {
 	deps := parkerDepsForDelete(client)
 
 	h := handlers.HandleDeleteDisk(deps)
-	_, err := h.Handle(context.Background(), []json.RawMessage{marshal(diskCID)}, jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), []json.RawMessage{marshal(mustEncodeDiskCID(t, diskCID, nil))}, jsonrpc.Context{})
 
 	if err == nil {
 		t.Fatal("expected error when unpark fails, got nil")
@@ -534,7 +534,7 @@ func TestHandleDeleteDisk_Parker_NotParked_DirectDelete(t *testing.T) {
 	deps := parkerDepsForDelete(client)
 
 	h := handlers.HandleDeleteDisk(deps)
-	_, err := h.Handle(context.Background(), []json.RawMessage{marshal(diskCID)}, jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), []json.RawMessage{marshal(mustEncodeDiskCID(t, diskCID, nil))}, jsonrpc.Context{})
 
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -602,7 +602,7 @@ func TestHandleDeleteDisk_Parker_StrategyFree_NoParkerCalls(t *testing.T) {
 	}
 
 	h := handlers.HandleDeleteDisk(deps)
-	_, err := h.Handle(context.Background(), []json.RawMessage{marshal(diskCID)}, jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), []json.RawMessage{marshal(mustEncodeDiskCID(t, diskCID, nil))}, jsonrpc.Context{})
 
 	if err != nil {
 		t.Fatalf("unexpected error with free strategy: %v", err)
@@ -655,7 +655,7 @@ func TestHandleDeleteDisk_NoClusterCallExpected(t *testing.T) {
 
 	h := handlers.HandleDeleteDisk(deps)
 	_, err := h.Handle(context.Background(), []json.RawMessage{
-		marshal(diskCID),
+		marshal(mustEncodeDiskCID(t, diskCID, nil)),
 	}, jsonrpc.Context{})
 
 	if err != nil {
@@ -736,7 +736,7 @@ func TestHandleDeleteDisk_Guard_OwnerLocked_Retriable(t *testing.T) {
 	deps := guardDepsForDelete(client)
 
 	h := handlers.HandleDeleteDisk(deps)
-	_, err := h.Handle(context.Background(), []json.RawMessage{marshal(diskCID)}, jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), []json.RawMessage{marshal(mustEncodeDiskCID(t, diskCID, nil))}, jsonrpc.Context{})
 
 	if err == nil {
 		t.Fatal("expected retriable error when the attached VM is locked, got nil")
@@ -780,7 +780,7 @@ func TestHandleDeleteDisk_Guard_DefaultUnset_OwnerLocked_Retriable(t *testing.T)
 	}
 
 	h := handlers.HandleDeleteDisk(deps)
-	_, err := h.Handle(context.Background(), []json.RawMessage{marshal(diskCID)}, jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), []json.RawMessage{marshal(mustEncodeDiskCID(t, diskCID, nil))}, jsonrpc.Context{})
 
 	if err == nil {
 		t.Fatal("empty-manifest config: expected retriable error when the attached VM is locked, got nil")
@@ -811,7 +811,7 @@ func TestHandleDeleteDisk_Guard_OwnerUnlocked_Deletes(t *testing.T) {
 	deps := guardDepsForDelete(client)
 
 	h := handlers.HandleDeleteDisk(deps)
-	_, err := h.Handle(context.Background(), []json.RawMessage{marshal(diskCID)}, jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), []json.RawMessage{marshal(mustEncodeDiskCID(t, diskCID, nil))}, jsonrpc.Context{})
 
 	if err != nil {
 		t.Fatalf("unexpected error when the attached VM is unlocked: %v", err)
@@ -853,7 +853,7 @@ func TestHandleDeleteDisk_Guard_Off_NoOwnerLookup(t *testing.T) {
 	}
 
 	h := handlers.HandleDeleteDisk(deps)
-	_, err := h.Handle(context.Background(), []json.RawMessage{marshal(diskCID)}, jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), []json.RawMessage{marshal(mustEncodeDiskCID(t, diskCID, nil))}, jsonrpc.Context{})
 
 	if err != nil {
 		t.Fatalf("unexpected error with guard off: %v", err)
@@ -891,7 +891,7 @@ func TestHandleDeleteDisk_Guard_NotAttached_Deletes(t *testing.T) {
 	deps := guardDepsForDelete(client)
 
 	h := handlers.HandleDeleteDisk(deps)
-	_, err := h.Handle(context.Background(), []json.RawMessage{marshal(diskCID)}, jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), []json.RawMessage{marshal(mustEncodeDiskCID(t, diskCID, nil))}, jsonrpc.Context{})
 
 	if err != nil {
 		t.Fatalf("unexpected error when disk is not attached: %v", err)
@@ -936,7 +936,7 @@ func TestHandleDeleteDisk_FastPath_NoAwait(t *testing.T) {
 	deps := fastPathDepsForDisk(t, storageSvc)
 	h := handlers.HandleDeleteDisk(deps)
 	result, err := h.Handle(context.Background(), []json.RawMessage{
-		marshal(diskCID),
+		marshal(mustEncodeDiskCID(t, diskCID, nil)),
 	}, jsonrpc.Context{})
 
 	if err != nil {
@@ -964,7 +964,7 @@ func TestHandleDeleteDisk_FastPath_NotFound_Idempotent(t *testing.T) {
 	deps := fastPathDepsForDisk(t, storageSvc)
 	h := handlers.HandleDeleteDisk(deps)
 	result, err := h.Handle(context.Background(), []json.RawMessage{
-		marshal(diskCID),
+		marshal(mustEncodeDiskCID(t, diskCID, nil)),
 	}, jsonrpc.Context{})
 
 	if err != nil {
@@ -1017,7 +1017,7 @@ func TestHandleDeleteDisk_SlowPath_AwaitsTask(t *testing.T) {
 
 	h := handlers.HandleDeleteDisk(deps)
 	_, err := h.Handle(context.Background(), []json.RawMessage{
-		marshal(diskCID),
+		marshal(mustEncodeDiskCID(t, diskCID, nil)),
 	}, jsonrpc.Context{})
 
 	if err != nil {
@@ -1064,7 +1064,7 @@ func TestHandleDeleteDisk_WithoutClusterService(t *testing.T) {
 
 	h := handlers.HandleDeleteDisk(deps)
 	result, err := h.Handle(context.Background(), []json.RawMessage{
-		marshal(diskCID),
+		marshal(mustEncodeDiskCID(t, diskCID, nil)),
 	}, jsonrpc.Context{})
 
 	if err != nil {

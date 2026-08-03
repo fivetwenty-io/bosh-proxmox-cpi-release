@@ -3,8 +3,10 @@
 package handlers
 
 import (
+	"bytes"
 	"context"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
@@ -255,6 +257,151 @@ func TestCheckISOStorageForHA_AntiAffinityActive_LocalISO_WarnOnly(t *testing.T)
 	err := checkISOStorageForHA(context.Background(), deps, 100, cp, "pve01", env, log.NewNopLogger())
 	if err != nil {
 		t.Fatalf("require_shared_iso_for_ha is false: expected nil error (warn-only), got %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// isoStorageScanTarget (P5.3: create_vm VMID-allocation ISO-pool scan target)
+// ---------------------------------------------------------------------------
+
+func TestIsoStorageScanTarget(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name        string
+		cfg         *config.CPIConfig
+		vmStorage   string
+		wantStorage string
+	}{
+		{
+			name:        "nil config",
+			cfg:         nil,
+			vmStorage:   "vm-storage",
+			wantStorage: "",
+		},
+		{
+			name:        "distinct iso pool returned",
+			cfg:         &config.CPIConfig{ISOStorage: "iso-nfs", DiskStorage: "disk-storage"},
+			vmStorage:   "vm-storage",
+			wantStorage: "iso-nfs",
+		},
+		{
+			name:        "empty iso_storage is a no-op",
+			cfg:         &config.CPIConfig{ISOStorage: "", DiskStorage: "disk-storage"},
+			vmStorage:   "vm-storage",
+			wantStorage: "",
+		},
+		{
+			name:        "iso_storage equal to vmStorage is a no-op (already scanned)",
+			cfg:         &config.CPIConfig{ISOStorage: "vm-storage", DiskStorage: "disk-storage"},
+			vmStorage:   "vm-storage",
+			wantStorage: "",
+		},
+		{
+			name:        "iso_storage equal to DiskStorage is a no-op",
+			cfg:         &config.CPIConfig{ISOStorage: "disk-storage", DiskStorage: "disk-storage"},
+			vmStorage:   "vm-storage",
+			wantStorage: "",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			deps := Deps{Config: tc.cfg}
+			if got := isoStorageScanTarget(deps, tc.vmStorage); got != tc.wantStorage {
+				t.Errorf("isoStorageScanTarget() = %q; want %q", got, tc.wantStorage)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// D11: HA-vs-resurrector one-per-process warning
+// ---------------------------------------------------------------------------
+
+// resetHAResurrectorWarnOnce lets each test observe a fresh first-fire,
+// keeping the suite repeat-safe under -count=N (mirrors the
+// vniZoneListWarnOnce reset in internal/pve/export_test.go).
+func resetHAResurrectorWarnOnce(t *testing.T) {
+	t.Helper()
+	haResurrectorWarnOnce = sync.Once{}
+	t.Cleanup(func() { haResurrectorWarnOnce = sync.Once{} })
+}
+
+func TestWarnHAResurrectorConflictOnce_EmptyFeatures_NoWarn(t *testing.T) {
+	resetHAResurrectorWarnOnce(t)
+	var buf bytes.Buffer
+	warnHAResurrectorConflictOnce(100, nil, warnLogger(t, &buf))
+	if out := buf.String(); out != "" {
+		t.Errorf("empty feature list must not warn, got %q", out)
+	}
+}
+
+func TestWarnHAResurrectorConflictOnce_NilLogger_NoPanic(t *testing.T) {
+	resetHAResurrectorWarnOnce(t)
+	warnHAResurrectorConflictOnce(100, []haRegistrationFeature{haFeatureDLB}, nil)
+}
+
+func TestWarnHAResurrectorConflictOnce_FiresOncePerProcess(t *testing.T) {
+	resetHAResurrectorWarnOnce(t)
+	var buf bytes.Buffer
+	logger := warnLogger(t, &buf)
+	features := []haRegistrationFeature{haFeatureDLB, haFeatureAZPin}
+
+	warnHAResurrectorConflictOnce(100, features, logger)
+	first := buf.String()
+	if !strings.Contains(first, "update-resurrection off") {
+		t.Errorf("expected the warning to name the bosh update-resurrection off remediation, got %q", first)
+	}
+	if !strings.Contains(first, string(haFeatureDLB)) || !strings.Contains(first, string(haFeatureAZPin)) {
+		t.Errorf("expected the warning to name both triggering features, got %q", first)
+	}
+
+	// A second call, even with a different vmid/feature set, must not repeat
+	// the warning: it is process-scoped, not per-VM or per-feature-set.
+	warnHAResurrectorConflictOnce(200, []haRegistrationFeature{haFeatureAntiAffinity}, logger)
+	if got := buf.String(); got != first {
+		t.Errorf("second call must not emit an additional warning; buffer grew: %q -> %q", first, got)
+	}
+}
+
+func TestCheckISOStorageForHA_DLBActive_SharedISO_StillWarnsHAResurrector(t *testing.T) {
+	resetHAResurrectorWarnOnce(t)
+	enabled := true
+	cfg := isoHABaseConfig("vm-storage")
+	cfg.Placement = &config.PlacementConfig{DLB: &config.DLBConfig{Enabled: &enabled}}
+	storageSvc := &dlbStorageStub{storageType: "nfs", shared: true}
+	deps := dlbDeps(nil, nil, storageSvc, cfg)
+	cp := createVMCloudProps{}
+
+	var buf bytes.Buffer
+	err := checkISOStorageForHA(context.Background(), deps, 100, cp, "pve01", nil, warnLogger(t, &buf))
+	if err != nil {
+		t.Fatalf("shared iso_storage: expected nil error, got %v", err)
+	}
+	// The ISO-storage migration-safety warning must NOT fire (shared pool),
+	// but the HA-vs-resurrector warning fires regardless of ISO sharing.
+	if strings.Contains(buf.String(), "config-drive ISO on non-shared storage") {
+		t.Errorf("did not expect the ISO migration-safety warning for a shared pool, got %q", buf.String())
+	}
+	if !strings.Contains(buf.String(), "update-resurrection off") {
+		t.Errorf("expected the HA-vs-resurrector warning even with a shared iso_storage pool, got %q", buf.String())
+	}
+}
+
+func TestCheckISOStorageForHA_NoFeatureActive_NoHAResurrectorWarn(t *testing.T) {
+	resetHAResurrectorWarnOnce(t)
+	cfg := isoHABaseConfig("local")
+	deps := dlbDeps(nil, nil, panicStorageStub{t: t}, cfg)
+	cp := createVMCloudProps{}
+
+	var buf bytes.Buffer
+	err := checkISOStorageForHA(context.Background(), deps, 100, cp, "pve01", nil, warnLogger(t, &buf))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if out := buf.String(); out != "" {
+		t.Errorf("no HA feature active: expected no warning, got %q", out)
 	}
 }
 

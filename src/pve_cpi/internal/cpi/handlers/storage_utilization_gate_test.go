@@ -249,7 +249,7 @@ func TestHandleResizeDisk_UtilizationGate_EnforceBlocks(t *testing.T) {
 	// Grow from 10 GiB to 15 GiB: a 5 GiB delta. 85% + 5% -> 90% == ceiling,
 	// so bump the request to push strictly over: 10G -> 25G (15 GiB delta,
 	// 85%+15%=100% > 90%).
-	_, err := h.Handle(context.Background(), marshalArgs(diskCID, 25600), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), marshalArgs(mustEncodeDiskCID(t, diskCID, nil), 25600), jsonrpc.Context{})
 
 	if err == nil {
 		t.Fatal("expected an error when the utilization ceiling is exceeded in enforce mode")
@@ -275,7 +275,7 @@ func TestHandleResizeDisk_UtilizationGate_WarnProceeds(t *testing.T) {
 		&config.StorageConfig{MaxUtilizationPct: &pct, MaxUtilizationMode: suGateWarnMode})
 
 	h := handlers.HandleResizeDisk(deps)
-	_, err := h.Handle(context.Background(), marshalArgs(diskCID, 25600), jsonrpc.Context{})
+	_, err := h.Handle(context.Background(), marshalArgs(mustEncodeDiskCID(t, diskCID, nil), 25600), jsonrpc.Context{})
 
 	if err != nil {
 		t.Fatalf("warn mode must not block resize_disk, got: %v", err)
@@ -333,7 +333,7 @@ func TestHandleSnapshotDisk_UtilizationGate_EnforceMode_StillOnlyWarnsAndProceed
 	}
 
 	h := handlers.HandleSnapshotDisk(deps)
-	_, err = h.Handle(context.Background(), marshalArgs(volid, nil), jsonrpc.Context{})
+	_, err = h.Handle(context.Background(), marshalArgs(mustEncodeDiskCID(t, volid, nil), nil), jsonrpc.Context{})
 
 	if err != nil {
 		t.Fatalf("snapshot_disk must never be blocked by the utilization gate, got: %v", err)

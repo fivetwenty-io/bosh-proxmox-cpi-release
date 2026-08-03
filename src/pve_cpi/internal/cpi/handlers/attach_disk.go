@@ -668,7 +668,7 @@ func unparkBeforeAttach(ctx context.Context, deps Deps, diskCID, bareDiskCID str
 	parkerCfg := pve.ParkerConfig{
 		VMIDRangeStart: deps.Config.ParkedDiskVMIDRangeStartValue(),
 		VMIDRangeEnd:   deps.Config.ParkedDiskVMIDRangeEndValue(),
-		DirectorID:     deps.Config.StemcellDirectorID(),
+		DirectorID:     deps.RequestDirectorUUID,
 	}
 	if unErr := pve.UnparkDisk(ctx, deps.PVE, deps.Log(ctx), bareDiskCID, parkerCfg); unErr != nil {
 		return cpierrors.Retriable("attach_disk: unpark disk %s failed: %s", diskCID, unErr.Error())

@@ -225,6 +225,15 @@ func firstClusterNode(ctx context.Context, deps Deps) (string, error) {
 // Returns (true, nil) for shared, (false, nil) for local,
 // (false, non-nil) when the classification cannot be determined.
 // Fail-open callers treat a non-nil error as "proceed anyway".
+//
+// Classification is via pve.SharedViaBacking against the FULL /storage index
+// (not just the one named entry): this closes a config-drift gap where an
+// operator registers the same network mount under two storage IDs and only
+// remembers to flag one of them "shared: 1" in storage.cfg — see the
+// SharedViaBacking doc comment. Requires the full index (rather than a
+// single-name StorageInfoCache.Get) precisely because the propagation needs
+// to see every OTHER entry's BackingKey, which is why this stays a live
+// listing rather than routing through the cache.
 func dlbStorageIsShared(ctx context.Context, deps Deps, storage string) (bool, error) {
 	if storage == "" {
 		return false, fmt.Errorf("DLB storage guard: storage name is empty")
@@ -239,26 +248,25 @@ func dlbStorageIsShared(ctx context.Context, deps Deps, storage string) (bool, e
 	if resp == nil {
 		return false, fmt.Errorf("DLB storage guard: nil response from cluster storage list")
 	}
-	var entry struct {
-		Storage string `json:"storage"`
-		Type    string `json:"type"`
-		Shared  *int   `json:"shared,omitempty"`
-	}
+
+	all := make([]pve.StorageInfo, 0, len(*resp))
+	var target pve.StorageInfo
+	found := false
 	for _, raw := range *resp {
-		if jerr := json.Unmarshal(raw, &entry); jerr != nil {
+		info, perr := pve.ParseStorageEntry(raw)
+		if perr != nil {
 			continue
 		}
-		if entry.Storage != storage {
-			continue
+		all = append(all, info)
+		if info.Name == storage {
+			target = info
+			found = true
 		}
-		info := pve.StorageInfo{
-			Name:   entry.Storage,
-			Type:   entry.Type,
-			Shared: entry.Shared != nil && *entry.Shared != 0,
-		}
-		return info.IsShared(), nil
 	}
-	return false, fmt.Errorf("DLB storage guard: storage %q not found in cluster storage list", storage)
+	if !found {
+		return false, fmt.Errorf("DLB storage guard: storage %q not found in cluster storage list", storage)
+	}
+	return pve.SharedViaBacking(target, all), nil
 }
 
 // pveVersionAtLeast parses a PVE version string (e.g. "9.2-1", "9.2", "10.0")
