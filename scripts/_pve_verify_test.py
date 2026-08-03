@@ -35,7 +35,7 @@ from pathlib import Path
 # Make scripts/ importable regardless of working directory.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _pve_verify
-from _pve_verify import PVEVerifier, PVEVerifyError
+from _pve_verify import PVEVerifier, PVEVerifyError, parse_stemcell_cid, parse_stemcell_path_cid
 
 
 # ---------------------------------------------------------------------------
@@ -496,32 +496,34 @@ class TestVolumeExists(unittest.TestCase):
 
     def test_happy_path_found(self) -> None:
         v = self._verifier()
+        cid = self._pvd_cid("local-lvm:vm-101-disk-0")
         with self._urlopen_with([{"volid": "local-lvm:vm-101-disk-0"}]):
-            self.assertTrue(v.volume_exists("local-lvm:vm-101-disk-0"))
+            self.assertTrue(v.volume_exists(cid))
 
     def test_happy_path_not_found(self) -> None:
         v = self._verifier()
+        cid = self._pvd_cid("local-lvm:vm-101-disk-0")
         with self._urlopen_with([{"volid": "local-lvm:vm-200-disk-0"}]):
-            self.assertFalse(v.volume_exists("local-lvm:vm-101-disk-0"))
+            self.assertFalse(v.volume_exists(cid))
 
-    def test_annotated_cid_matches_bare_volid(self) -> None:
-        """A disk CID with a '|<base64-metadata>' codec suffix must match the
-        bare volid PVE reports (regression: create_disk verify in lifecycle)."""
+    def test_bare_cid_raises(self) -> None:
+        """A bare (unenveloped) disk CID is a hard parse error: this package
+        carries no backward-compatibility requirement, and the legacy '|'
+        pipe-suffix and bare-CID fallback paths have been removed entirely."""
         v = self._verifier()
-        annotated = "data:vm-9897-disk-0|eyJwb29sIjoiZGF0YSIsIm5vZGUiOiJwdmUifQ"
-        with self._urlopen_with([{"volid": "data:vm-9897-disk-0"}]):
-            self.assertTrue(v.volume_exists(annotated))
+        with self.assertRaises(PVEVerifyError):
+            v.volume_exists("data:vm-9897-disk-0")
 
-    def test_annotated_cid_not_found(self) -> None:
+    def test_legacy_pipe_suffix_raises(self) -> None:
         v = self._verifier()
-        annotated = "data:vm-9897-disk-0|eyJwb29sIjoiZGF0YSJ9"
-        with self._urlopen_with([{"volid": "data:vm-200-disk-0"}]):
-            self.assertFalse(v.volume_exists(annotated))
+        with self.assertRaises(PVEVerifyError):
+            v.volume_exists("data:vm-9897-disk-0|eyJwb29sIjoiZGF0YSIsIm5vZGUiOiJwdmUifQ")
 
     def test_happy_path_empty_list(self) -> None:
         v = self._verifier()
+        cid = self._pvd_cid("local-lvm:vm-101-disk-0")
         with self._urlopen_with([]):
-            self.assertFalse(v.volume_exists("local-lvm:vm-101-disk-0"))
+            self.assertFalse(v.volume_exists(cid))
 
     @staticmethod
     def _pvd_cid(volid: str, meta: dict | None = None) -> str:
@@ -576,13 +578,14 @@ class TestVolumeExists(unittest.TestCase):
         with self.assertRaises(PVEVerifyError):
             v.volume_exists("pvd-!!!notbase64")
 
-    def test_pvd_named_storage_falls_back_to_legacy(self) -> None:
-        """A PVE storage literally named 'pvd-*' produces a legacy bare CID
-        that starts with the envelope prefix but contains ':'; it must fall
-        back to the legacy paths instead of raising."""
+    def test_pvd_named_storage_hard_errors(self) -> None:
+        """A PVE storage literally named 'pvd-*' produces a bare CID that
+        starts with the envelope prefix but contains ':' (outside the
+        base64url alphabet). With the legacy fallback removed, this is now a
+        hard parse error rather than a silent fallback."""
         v = self._verifier()
-        with self._urlopen_with([{"volid": "pvd-foo:vm-100-disk-0"}]):
-            self.assertTrue(v.volume_exists("pvd-foo:vm-100-disk-0"))
+        with self.assertRaises(PVEVerifyError):
+            v.volume_exists("pvd-foo:vm-100-disk-0")
 
     @staticmethod
     def _pvz_cid(volid: str, meta: dict | None = None) -> str:
@@ -673,25 +676,27 @@ class TestVolumeExists(unittest.TestCase):
         with self.assertRaises(PVEVerifyError):
             v.volume_exists("pvz-" + payload)
 
-    def test_pvz_named_storage_falls_back_to_legacy(self) -> None:
-        """A PVE storage literally named 'pvz-*' must fall back to the legacy
-        paths, mirroring the pvd- rule."""
+    def test_pvz_named_storage_hard_errors(self) -> None:
+        """A PVE storage literally named 'pvz-*' is a hard parse error,
+        mirroring the pvd- rule."""
         v = self._verifier()
-        with self._urlopen_with([{"volid": "pvz-foo:vm-100-disk-0"}]):
-            self.assertTrue(v.volume_exists("pvz-foo:vm-100-disk-0"))
+        with self.assertRaises(PVEVerifyError):
+            v.volume_exists("pvz-foo:vm-100-disk-0")
 
     def test_auth_401_raises(self) -> None:
         v = self._verifier()
+        cid = self._pvd_cid("local-lvm:vm-101-disk-0")
         with unittest.mock.patch("urllib.request.urlopen", side_effect=_make_http_error(401, "Unauthorized")):
             with self.assertRaises(PVEVerifyError) as ctx:
-                v.volume_exists("local-lvm:vm-101-disk-0")
+                v.volume_exists(cid)
             self.assertIn("401", str(ctx.exception))
 
     def test_not_found_404_raises(self) -> None:
         v = self._verifier()
+        cid = self._pvd_cid("local-lvm:vm-101-disk-0")
         with unittest.mock.patch("urllib.request.urlopen", side_effect=_make_http_error(404, "Not Found")):
             with self.assertRaises(PVEVerifyError) as ctx:
-                v.volume_exists("local-lvm:vm-101-disk-0")
+                v.volume_exists(cid)
             self.assertIn("404", str(ctx.exception))
 
     def test_malformed_json_raises(self) -> None:
@@ -705,11 +710,12 @@ class TestVolumeExists(unittest.TestCase):
                 v.volume_exists("local-lvm:vm-101-disk-0")
 
     def test_missing_colon_raises(self) -> None:
-        """disk_cid without ':' is invalid and must raise PVEVerifyError."""
+        """A disk_cid without a pvd-/pvz- envelope prefix (here also lacking
+        ':') is invalid and must raise PVEVerifyError."""
         v = self._verifier()
         with self.assertRaises(PVEVerifyError) as ctx:
             v.volume_exists("no-colon-here")
-        self.assertIn("storage", str(ctx.exception).lower())
+        self.assertIn("envelope", str(ctx.exception).lower())
 
     def test_missing_node_raises(self) -> None:
         cfg = _token_config(node="")
@@ -833,6 +839,105 @@ class TestBridgeRealized(unittest.TestCase):
         payload = {"data": []}
         with unittest.mock.patch("urllib.request.urlopen", return_value=_make_response(payload)):
             self.assertFalse(v.bridge_realized("itvnet"))
+
+
+# ---------------------------------------------------------------------------
+# parse_stemcell_cid / parse_stemcell_path_cid
+# ---------------------------------------------------------------------------
+
+class TestParseStemcellCID(unittest.TestCase):
+    """Tests for parse_stemcell_cid (bare '<storage>:import/<file>' form)."""
+
+    def test_happy_path(self) -> None:
+        storage, volume_path = parse_stemcell_cid(
+            "nfs-stemcells:import/bosh-stemcell-ubuntu-1.0-deadbeef.qcow2"
+        )
+        self.assertEqual(storage, "nfs-stemcells")
+        self.assertEqual(volume_path, "import/bosh-stemcell-ubuntu-1.0-deadbeef.qcow2")
+
+    def test_empty_raises(self) -> None:
+        with self.assertRaises(PVEVerifyError):
+            parse_stemcell_cid("")
+
+    def test_missing_colon_raises(self) -> None:
+        with self.assertRaises(PVEVerifyError):
+            parse_stemcell_cid("nfs-stemcellsimport/x.qcow2")
+
+    def test_non_import_path_raises(self) -> None:
+        with self.assertRaises(PVEVerifyError):
+            parse_stemcell_cid("nfs-stemcells:iso/x.qcow2")
+
+
+class TestParseStemcellPathCID(unittest.TestCase):
+    """Tests for parse_stemcell_path_cid, mirroring the Go
+    ParseStemcellPathCID error contract (internal/pve/stemcell_volume.go)."""
+
+    # Fixture pinned to the same string the Go tests use, for
+    # cross-implementation parity.
+    LIGHT_FIXTURE = ":light:nfs-stemcells:import/bosh-stemcell-ubuntu-1.0-deadbeef.qcow2"
+    HEAVY_FIXTURE = ":heavy:nfs-stemcells:import/bosh-stemcell-ubuntu-1.0-deadbeef.qcow2"
+
+    def test_light_roundtrip_fixture(self) -> None:
+        kind, storage, volume_path = parse_stemcell_path_cid(self.LIGHT_FIXTURE)
+        self.assertEqual(kind, "light")
+        self.assertEqual(storage, "nfs-stemcells")
+        self.assertEqual(volume_path, "import/bosh-stemcell-ubuntu-1.0-deadbeef.qcow2")
+        self.assertEqual(
+            f":{kind}:{storage}:{volume_path}", self.LIGHT_FIXTURE
+        )
+
+    def test_heavy_roundtrip_fixture(self) -> None:
+        kind, storage, volume_path = parse_stemcell_path_cid(self.HEAVY_FIXTURE)
+        self.assertEqual(kind, "heavy")
+        self.assertEqual(storage, "nfs-stemcells")
+        self.assertEqual(volume_path, "import/bosh-stemcell-ubuntu-1.0-deadbeef.qcow2")
+        self.assertEqual(
+            f":{kind}:{storage}:{volume_path}", self.HEAVY_FIXTURE
+        )
+
+    def test_empty_raises(self) -> None:
+        with self.assertRaises(PVEVerifyError):
+            parse_stemcell_path_cid("")
+
+    def test_bare_storage_form_raises(self) -> None:
+        """Retired grammar: bare '<storage>:import/<file>' has no leading ':'."""
+        with self.assertRaises(PVEVerifyError):
+            parse_stemcell_path_cid("nfs-stemcells:import/x.qcow2")
+
+    def test_old_light_prefix_without_colon_raises(self) -> None:
+        """Retired grammar: 'light:<storage>:import/<file>' (no leading ':')."""
+        with self.assertRaises(PVEVerifyError):
+            parse_stemcell_path_cid("light:nfs-stemcells:import/x.qcow2")
+
+    def test_template_form_raises(self) -> None:
+        """Retired grammar: 'template:<vmid>' (no leading ':')."""
+        with self.assertRaises(PVEVerifyError):
+            parse_stemcell_path_cid("template:6042")
+
+    def test_bare_integer_raises(self) -> None:
+        """Retired grammar: legacy bare-VMID stemcell CID."""
+        with self.assertRaises(PVEVerifyError):
+            parse_stemcell_path_cid("5042")
+
+    def test_unknown_kind_raises(self) -> None:
+        with self.assertRaises(PVEVerifyError):
+            parse_stemcell_path_cid(":medium:nfs-stemcells:import/x.qcow2")
+
+    def test_doubled_prefix_raises(self) -> None:
+        with self.assertRaises(PVEVerifyError):
+            parse_stemcell_path_cid(":light::heavy:nfs-stemcells:import/x.qcow2")
+
+    def test_payload_missing_import_prefix_raises(self) -> None:
+        with self.assertRaises(PVEVerifyError):
+            parse_stemcell_path_cid(":light:nfs-stemcells:iso/x.qcow2")
+
+    def test_payload_missing_colon_raises(self) -> None:
+        with self.assertRaises(PVEVerifyError):
+            parse_stemcell_path_cid(":light:nfs-stemcellsimport/x.qcow2")
+
+    def test_kind_prefix_only_no_payload_raises(self) -> None:
+        with self.assertRaises(PVEVerifyError):
+            parse_stemcell_path_cid(":light:")
 
 
 if __name__ == "__main__":

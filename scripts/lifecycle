@@ -114,6 +114,21 @@ def env(name: str, default: str | None = None, *, required: bool = False) -> str
     return val or ""
 
 
+def bare_disk_volid(disk_cid: str) -> str:
+    """Return disk_cid's bare '<storage>:<volid>' form for CID comparison.
+
+    create_disk/attach_disk emit only 'pvd-' or 'pvz-' envelope CIDs (see
+    internal/pve/disk.go); get_disks may echo that exact envelope back or
+    fall back to the bare volid it read from PVE config. Decode via the
+    already-validated envelope codec (_pve_verify._bare_disk_cid) when an
+    envelope prefix is present; anything else is assumed already bare (the
+    get_disks fallback path, or a value this harness never produces itself).
+    """
+    if disk_cid.startswith("pvd-") or disk_cid.startswith("pvz-"):
+        return _pve_verify._bare_disk_cid(disk_cid)
+    return disk_cid
+
+
 CPI_CONFIG = env("CPI_CONFIG", required=True)
 STEMCELL_PATH = env("STEMCELL_PATH", required=True)
 CPI_BIN = env("CPI_BIN", "./bin/cpi")
@@ -552,13 +567,13 @@ def main() -> int:
         step("8. get_disks")
         disks = call("get_disks", [state["vm_cid"]])
         print(f"disks={json.dumps(disks)}")
-        # get_disks reads the bare volid from the PVE VM config and cannot
-        # reconstruct the disk-CID codec metadata suffix that create_disk
-        # appends ("<volid>|<base64>"). Compare on the bare volid (the part
-        # before the first '|') on both sides so an annotated create_disk CID
-        # matches the un-annotated volid get_disks reports.
-        want_bare = state["disk_cid"].split("|", 1)[0]
-        got_bare = [d.split("|", 1)[0] for d in disks]
+        # get_disks returns the exact pvd-/pvz- envelope CID attach_disk
+        # recorded in the VM's description sentinel when present, falling
+        # back to the bare volid otherwise (internal/cpi/handlers/get_disks.go).
+        # Decode both sides to the bare volid before comparing so either
+        # return shape matches create_disk's envelope CID.
+        want_bare = bare_disk_volid(state["disk_cid"])
+        got_bare = [bare_disk_volid(d) for d in disks]
         if want_bare not in got_bare:
             raise RuntimeError(f"get_disks did not include {state['disk_cid']}")
 

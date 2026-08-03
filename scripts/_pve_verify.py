@@ -59,15 +59,15 @@ _MAX_ENVELOPE_BYTES = 64 * 1024
 def _bare_disk_cid(disk_cid: str) -> str:
     """Decode a disk CID to its bare '<storage>:<volid>' form.
 
-    Mirrors the Go codec's decode order (internal/pve/disk.go):
+    Mirrors the Go codec's decode order (internal/pve/disk.go
+    ParseEncodedDiskCID), which accepts ONLY the two envelope forms below —
+    there is no legacy bare-CID or '|'-suffixed fallback; pre-release software
+    carries no backward-compatibility requirement, and any other input is a
+    hard parse error.
 
     1. 'pvd-<base64url(json)>' envelope — the bare volid is the payload's "v".
     2. 'pvz-<base64url(gzip(json))>' compressed envelope (opt-in
        disk_cid_compression) — same payload, gzip container, size-capped.
-    3. On envelope decode failure, fall back to the legacy paths only when the
-       CID contains ':' (a PVE storage literally named 'pvd-*'/'pvz-*');
-       otherwise the CID was meant to be an envelope and its corruption raises.
-    4. Legacy: strip an optional '|<base64url-metadata>' suffix.
     """
     if disk_cid.startswith("pvd-"):
         payload = disk_cid[len("pvd-"):]
@@ -83,11 +83,9 @@ def _bare_disk_cid(disk_cid: str) -> str:
                 raise ValueError("envelope volid is empty")
             return volid
         except (ValueError, KeyError, TypeError) as exc:
-            if ":" not in disk_cid:
-                raise PVEVerifyError(
-                    f"disk_cid {disk_cid!r}: invalid pvd envelope: {exc}"
-                ) from exc
-            # Legacy CID on a 'pvd-*'-named storage — fall through.
+            raise PVEVerifyError(
+                f"disk_cid {disk_cid!r}: invalid pvd envelope: {exc}"
+            ) from exc
     if disk_cid.startswith("pvz-"):
         payload = disk_cid[len("pvz-"):]
         try:
@@ -108,12 +106,96 @@ def _bare_disk_cid(disk_cid: str) -> str:
                 raise ValueError("envelope volid is empty")
             return volid
         except (ValueError, KeyError, TypeError, zlib.error) as exc:
-            if ":" not in disk_cid:
-                raise PVEVerifyError(
-                    f"disk_cid {disk_cid!r}: invalid pvz envelope: {exc}"
-                ) from exc
-            # Legacy CID on a 'pvz-*'-named storage — fall through.
-    return disk_cid.split("|", 1)[0]
+            raise PVEVerifyError(
+                f"disk_cid {disk_cid!r}: invalid pvz envelope: {exc}"
+            ) from exc
+    raise PVEVerifyError(
+        f"disk_cid {disk_cid!r}: expected a 'pvd-' or 'pvz-' envelope prefix"
+    )
+
+
+def parse_stemcell_cid(cid: str) -> "tuple[str, str]":
+    """Split a bare '<storage>:import/<file>' CID into (storage, volume_path).
+
+    Mirrors internal/pve/stemcell_volume.go ParseStemcellCID. volume_path is
+    the full "import/<filename>" tail. Raises PVEVerifyError for an empty
+    CID, a CID with no ':' separator, or a path component that does not
+    start with "import/".
+    """
+    if not cid:
+        raise PVEVerifyError("parse_stemcell_cid: empty CID")
+    idx = cid.find(":")
+    if idx < 0:
+        raise PVEVerifyError(f"parse_stemcell_cid: CID {cid!r} missing ':' separator")
+    storage = cid[:idx]
+    volume_path = cid[idx + 1 :]
+    if not volume_path.startswith("import/"):
+        raise PVEVerifyError(
+            f"parse_stemcell_cid: CID {cid!r} volume path {volume_path!r} "
+            'does not start with "import/"'
+        )
+    return storage, volume_path
+
+
+def parse_stemcell_path_cid(cid: str) -> "tuple[str, str, str]":
+    """Validate and decompose a path-identity stemcell CID.
+
+    Mirrors internal/pve/stemcell_volume.go ParseStemcellPathCID with the same
+    strictness (same accepted forms, same error cases).
+
+    Accepted forms:
+        ":light:<storage>:import/<filename>"
+        ":heavy:<storage>:import/<filename>"
+
+    Returns (kind, storage, volume_path); kind is the literal string "light"
+    or "heavy". volume_path is the "import/<filename>" tail.
+
+    Raises PVEVerifyError for:
+      - empty CID
+      - missing leading ':' -- this covers every retired grammar this
+        pre-release codebase no longer accepts: "light:...", "template:<vmid>",
+        bare "<storage>:import/...", and bare integers
+      - unknown kind segment (anything other than "light"/"heavy")
+      - doubled prefix (":light::heavy:...") -- the payload after the kind
+        must itself parse as "<storage>:import/<filename>", and a storage
+        name cannot be empty or start with ':'
+      - payload whose path component does not start with "import/"
+    """
+    if not cid:
+        raise PVEVerifyError("parse_stemcell_path_cid: empty CID")
+    if not cid.startswith(":"):
+        raise PVEVerifyError(
+            f"parse_stemcell_path_cid: CID {cid!r} missing leading ':' -- expected "
+            '":light:<storage>:import/<file>" or ":heavy:<storage>:import/<file>"'
+        )
+
+    light_prefix, heavy_prefix = ":light:", ":heavy:"
+    if cid.startswith(light_prefix):
+        kind = "light"
+        rest = cid[len(light_prefix) :]
+    elif cid.startswith(heavy_prefix):
+        kind = "heavy"
+        rest = cid[len(heavy_prefix) :]
+    else:
+        raise PVEVerifyError(
+            f"parse_stemcell_path_cid: CID {cid!r} has unknown kind -- expected "
+            '":light:" or ":heavy:" prefix'
+        )
+
+    if rest.startswith(":"):
+        raise PVEVerifyError(
+            f"parse_stemcell_path_cid: CID {cid!r} has an empty storage segment "
+            "(doubled prefix?)"
+        )
+
+    try:
+        storage, volume_path = parse_stemcell_cid(rest)
+    except PVEVerifyError as exc:
+        raise PVEVerifyError(
+            f"parse_stemcell_path_cid: CID {cid!r} payload invalid: {exc}"
+        ) from exc
+
+    return kind, storage, volume_path
 
 
 class PVEVerifier:
@@ -284,12 +366,11 @@ class PVEVerifier:
     def volume_exists(self, disk_cid: str) -> bool:
         """True when a storage volume with volid == the bare disk_cid exists.
 
-        The CPI emits pvd- envelope CIDs ('pvd-<base64url(json)>' with the bare
-        volid in the payload's "v" field); older releases emitted the bare
-        '<storage>:<volid>' with an optional '|<base64url-metadata>' suffix.
-        PVE's storage content listing reports only the bare volid, so decode the
-        CID to its bare form (mirroring the Go codec's decode order in
-        internal/pve/disk.go) before matching.
+        The CPI emits only pvd- ('pvd-<base64url(json)>') or, opt-in, pvz-
+        (gzip-compressed) envelope CIDs, with the bare volid in the payload's
+        "v" field. PVE's storage content listing reports only the bare volid,
+        so decode the CID to its bare form (mirroring the Go codec's decode
+        order in internal/pve/disk.go) before matching.
         """
         node = self._require_node()
         bare_cid = _bare_disk_cid(disk_cid)
