@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 
@@ -369,6 +370,133 @@ func TestWithRequestOverrides_MixedKnownAndUnknownPVEKeys_WarnsAndApplies(t *tes
 	}
 	if len(tracker.calls) != 1 {
 		t.Errorf("ClientFactory should be invoked exactly once, got %d call(s)", len(tracker.calls))
+	}
+}
+
+// -----------------------------------------------------------------------
+// S8 follow-up — pve.reject_tls_downgrade_overrides
+// -----------------------------------------------------------------------
+
+// TestWithRequestOverrides_RejectTLSDowngradeOverrides_GenuineDowngrade_Rejected
+// covers the knob's core case: a job-level config that itself verifies TLS
+// (VerifySSL=true), with reject_tls_downgrade_overrides enabled, must refuse
+// a request whose context applies pve_verify_ssl=false — and must do so
+// BEFORE building/caching a PVE client bundle for the downgraded config.
+func TestWithRequestOverrides_RejectTLSDowngradeOverrides_GenuineDowngrade_Rejected(t *testing.T) {
+	t.Parallel()
+	base := overrideTestBaseConfig()
+	base.RejectTLSDowngradeOverrides = boolPtr(true)
+	tracker := &fakeTransportClientFactory{}
+	deps := handlers.Deps{
+		Config: base,
+		PVE:    &mockPVEClient{},
+		Logger: log.NewNopLogger(),
+		Overrides: &handlers.RequestOverrideRuntime{
+			ClientFactory: tracker.Factory,
+			Logger:        log.NewNopLogger(),
+		},
+	}
+
+	_, err := deps.WithRequestOverrides(context.Background(), jsonrpc.Context{
+		Extra: map[string]any{"pve_verify_ssl": false},
+	})
+	if err == nil {
+		t.Fatal("expected an error when reject_tls_downgrade_overrides is enabled and a request downgrades TLS verification, got nil")
+	}
+	var cpiErr *cpierrors.Error
+	if !errors.As(err, &cpiErr) {
+		t.Fatalf("error %v is not a *cpierrors.Error", err)
+	}
+	if cpiErr.OkToRetry() {
+		t.Error("a rejected TLS downgrade is a manifest/cpi-config authoring or policy decision — must be non-retriable, got OkToRetry()=true")
+	}
+	if !strings.Contains(err.Error(), "reject_tls_downgrade_overrides") {
+		t.Errorf("error message %q must name the knob (reject_tls_downgrade_overrides)", err.Error())
+	}
+	if !strings.Contains(err.Error(), "pve_verify_ssl") {
+		t.Errorf("error message %q must name the offending override key (pve_verify_ssl)", err.Error())
+	}
+	if len(tracker.calls) != 0 {
+		t.Errorf("ClientFactory must not be invoked when the downgrade is rejected before resolve(), got %d call(s)", len(tracker.calls))
+	}
+}
+
+// TestWithRequestOverrides_RejectTLSDowngradeOverrides_BaseAlreadyFalse_NotRejected
+// covers the "not a downgrade" carve-out: when the job-level config already
+// has verify_ssl=false, an override that also sets pve_verify_ssl=false does
+// not change the effective TLS posture, so the knob must NOT reject it —
+// the request proceeds exactly as it did before this knob existed.
+func TestWithRequestOverrides_RejectTLSDowngradeOverrides_BaseAlreadyFalse_NotRejected(t *testing.T) {
+	t.Parallel()
+	base := overrideTestBaseConfig()
+	base.VerifySSL = boolPtr(false)
+	base.RejectTLSDowngradeOverrides = boolPtr(true)
+	tracker := &fakeTransportClientFactory{}
+	deps := handlers.Deps{
+		Config: base,
+		PVE:    &mockPVEClient{},
+		Logger: log.NewNopLogger(),
+		Overrides: &handlers.RequestOverrideRuntime{
+			ClientFactory: tracker.Factory,
+			Logger:        log.NewNopLogger(),
+		},
+	}
+
+	got, err := deps.WithRequestOverrides(context.Background(), jsonrpc.Context{
+		Extra: map[string]any{"pve_verify_ssl": false, "pve_host": "az1.example"},
+	})
+	if err != nil {
+		t.Fatalf("a request that does not actually downgrade TLS verification (base already verify_ssl=false) must not be rejected, got error: %v", err)
+	}
+	if got.Config.VerifySSLValue() {
+		t.Error("effective config VerifySSLValue() = true, want false")
+	}
+	if len(tracker.calls) != 1 {
+		t.Errorf("ClientFactory should be invoked exactly once, got %d call(s)", len(tracker.calls))
+	}
+}
+
+// TestWithRequestOverrides_TLSDowngrade_KnobOff_WarnOnlyUnchanged confirms
+// the knob's off-by-default contract: with reject_tls_downgrade_overrides
+// unset, a genuine TLS-verification downgrade still proceeds (byte-identical
+// to every release before this knob existed) and is still logged at Warn.
+func TestWithRequestOverrides_TLSDowngrade_KnobOff_WarnOnlyUnchanged(t *testing.T) {
+	t.Parallel()
+	base := overrideTestBaseConfig() // RejectTLSDowngradeOverrides left nil (off)
+	tracker := &fakeTransportClientFactory{}
+	observedLogger, obs := log.NewObservedLogger(log.LevelDebug)
+	deps := handlers.Deps{
+		Config: base,
+		PVE:    &mockPVEClient{},
+		Logger: observedLogger,
+		Overrides: &handlers.RequestOverrideRuntime{
+			ClientFactory: tracker.Factory,
+			Logger:        log.NewNopLogger(),
+		},
+	}
+
+	got, err := deps.WithRequestOverrides(context.Background(), jsonrpc.Context{
+		Extra: map[string]any{"pve_verify_ssl": false, "pve_host": "az1.example"},
+	})
+	if err != nil {
+		t.Fatalf("knob-off TLS downgrade must proceed (warn-only), got error: %v", err)
+	}
+	if got.Config.VerifySSLValue() {
+		t.Error("effective config VerifySSLValue() = true, want false")
+	}
+	if len(tracker.calls) != 1 {
+		t.Errorf("ClientFactory should be invoked exactly once, got %d call(s)", len(tracker.calls))
+	}
+
+	found := false
+	for _, e := range obs.All() {
+		if e.Level == log.LevelWarn && strings.Contains(e.Message, "disables TLS verification") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("expected a Warn log entry about the TLS-verification downgrade, found none")
 	}
 }
 

@@ -253,6 +253,12 @@
     config["redact_logs"] = true
   end
 
+  # Emit reject_tls_downgrade_overrides only when explicitly true. The Go
+  # accessor defaults to warn-only (never reject) when the key is omitted.
+  if p("pve.reject_tls_downgrade_overrides", false)
+    config["reject_tls_downgrade_overrides"] = true
+  end
+
   # Emit resize-convergence knobs only when the operator opts in. The Go config
   # defaults (disabled; 120s budget) hold when the keys are omitted.
   if p("pve.resize_wait_for_convergence", false)

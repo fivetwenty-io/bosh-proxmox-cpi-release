@@ -479,6 +479,34 @@ func (d Deps) WithRequestOverrides(ctx context.Context, reqCtx jsonrpc.Context) 
 		)
 	}
 
+	verifySSLOverrideApplied := false
+	for _, k := range applied {
+		if k == "pve_verify_ssl" {
+			verifySSLOverrideApplied = true
+			break
+		}
+	}
+
+	// S8 follow-up: pve.reject_tls_downgrade_overrides hardens the warn-only
+	// TLS-downgrade path below into a hard failure. A genuine downgrade is a
+	// job-level config that itself verifies (d.Config.VerifySSLValue() true)
+	// whose applied overrides include pve_verify_ssl AND whose effective
+	// config no longer verifies. A job-level config that already has
+	// verify_ssl=false is NOT a downgrade and is never rejected here — it
+	// falls through to the existing warn-only path below unchanged. This
+	// check MUST run before d.Overrides.resolve() below: resolve() builds
+	// (and caches) the PVE client/agent/resolver bundle for effCfg, so
+	// rejecting after that call would still have constructed and cached a
+	// client that talks to the overridden host without certificate
+	// validation before the request was ever refused.
+	if verifySSLOverrideApplied && d.Config.VerifySSLValue() && !effCfg.VerifySSLValue() &&
+		d.Config.RejectTLSDowngradeOverridesEnabled() {
+		return Deps{}, cpierrors.Cloud(
+			"cpi: reject_tls_downgrade_overrides is enabled; request context override %q would disable TLS certificate verification (job-level pve.verify_ssl=true) for overridden host %q — rejecting",
+			"pve_verify_ssl", effCfg.Host,
+		)
+	}
+
 	bundle, resolveErr := d.Overrides.resolve(ctx, effCfg)
 	if resolveErr != nil {
 		return Deps{}, cpierrors.Retriable(
@@ -507,17 +535,14 @@ func (d Deps) WithRequestOverrides(ctx context.Context, reqCtx jsonrpc.Context) 
 	// constructor's own warning goes to the runtime logger (no request_id or
 	// method) and fires once per cached bundle, not once per affected
 	// request. The inherited job-level credentials are sent to the overridden
-	// host over the unverified connection, so name the host explicitly.
-	if !effCfg.VerifySSLValue() {
-		for _, k := range applied {
-			if k == "pve_verify_ssl" {
-				d.Log(ctx).Warn(
-					"cpi: request context override disables TLS verification for this request; job-level PVE credentials will be sent to the overridden host without certificate validation",
-					log.String("effective_pve_host", effCfg.Host),
-				)
-				break
-			}
-		}
+	// host over the unverified connection, so name the host explicitly. This
+	// only fires when reject_tls_downgrade_overrides did NOT already reject
+	// the request above (knob off, or base config already had verify_ssl=false).
+	if !effCfg.VerifySSLValue() && verifySSLOverrideApplied {
+		d.Log(ctx).Warn(
+			"cpi: request context override disables TLS verification for this request; job-level PVE credentials will be sent to the overridden host without certificate validation",
+			log.String("effective_pve_host", effCfg.Host),
+		)
 	}
 
 	d.Config = effCfg

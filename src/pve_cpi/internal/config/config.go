@@ -156,6 +156,20 @@ type CPIConfig struct {
 	// prior releases. Ignored when VerifySSL is false.
 	PVECACertPEM string `json:"pve_ca_cert,omitempty"`
 
+	// RejectTLSDowngradeOverrides hardens the per-request pve_* context
+	// override mechanism (config.ApplyContextOverrides / handlers.Deps.
+	// WithRequestOverrides): when true, a request whose context carries
+	// pve_verify_ssl=false against a job-level config that itself verifies
+	// (VerifySSLValue() true) is rejected with a non-retriable CloudError
+	// instead of the default warn-and-proceed behavior. A base config that
+	// already has verify_ssl=false is not a downgrade and is never rejected
+	// by this knob. Pointer so JSON omission (nil) is distinguishable from
+	// explicit false; use RejectTLSDowngradeOverridesEnabled() for the
+	// effective bool. Default false (nil): behavior is byte-identical to
+	// every prior release — the downgrade is still logged at Warn, never
+	// rejected. Omit from ERB when unset; emit only when true.
+	RejectTLSDowngradeOverrides *bool `json:"reject_tls_downgrade_overrides,omitempty"`
+
 	// OperatorID is an optional label appended to the User-Agent header on all
 	// PVE API requests as "pid-<value>". Use it to attribute CPI traffic in PVE
 	// access logs when multiple BOSH directors share a single PVE cluster.
@@ -2513,6 +2527,15 @@ func (c *CPIConfig) RedactLogsEnabled() bool {
 // post-resize size convergence. Nil (default) → false.
 func (c *CPIConfig) ResizeWaitForConvergenceEnabled() bool {
 	return c != nil && c.ResizeWaitForConvergence != nil && *c.ResizeWaitForConvergence
+}
+
+// RejectTLSDowngradeOverridesEnabled reports whether a per-request context
+// override that downgrades TLS verification (pve_verify_ssl=false against a
+// verifying base config) must be rejected rather than merely warned about.
+// Nil receiver or unset field → false (warn-only, byte-identical to every
+// release before this knob existed).
+func (c *CPIConfig) RejectTLSDowngradeOverridesEnabled() bool {
+	return c != nil && c.RejectTLSDowngradeOverrides != nil && *c.RejectTLSDowngradeOverrides
 }
 
 // ResizeConvergenceTimeoutSecValue returns the effective convergence poll budget

@@ -193,6 +193,17 @@ properties:
       PEM is parsed and the resulting cert pool replaces the system pool for PVE
       API HTTPS verification. Ignored when verify_ssl is false.
     default: ""
+  pve.reject_tls_downgrade_overrides:
+    description: |
+      Hardens the per-request pve_* context override mechanism (BOSH
+      cpi-config multi-cluster routing). When true, a request whose context
+      carries pve_verify_ssl=false against a job-level config that itself
+      verifies (verify_ssl=true) is rejected with a non-retriable error
+      instead of the default warn-and-proceed behavior. A job-level config
+      that already has verify_ssl=false is never rejected by this knob.
+      Default false: the downgrade is still logged at Warn, never rejected —
+      behavior is byte-identical to prior releases.
+    default: false
   pve.agent_mode:
     description: |
       Agent bootstrap mode. Valid values: cloudinit, noagent, auto.
