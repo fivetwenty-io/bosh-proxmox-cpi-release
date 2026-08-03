@@ -1316,6 +1316,13 @@ func (c *templateGapClusterSvc) ListHaStatusCurrent(_ context.Context) (*sdkclus
 	return &empty, nil
 }
 
+// DeleteHaRules / DeleteHaResources are no-ops so cleanupVM's best-effort HA
+// pin removal (removeNodeAffinityPin) can run against this fixture.
+func (c *templateGapClusterSvc) DeleteHaRules(_ context.Context, _ string) error { return nil }
+func (c *templateGapClusterSvc) DeleteHaResources(_ context.Context, _ string, _ *sdkcluster.DeleteHaResourcesParams) error {
+	return nil
+}
+
 var _ sdkcluster.Service = (*templateGapClusterSvc)(nil)
 
 // templateGapClusterStorageSvc reports storage with configurable shared flag.
@@ -1360,6 +1367,14 @@ type templateGapNodesSvc struct {
 	listQemuFn       func(ctx context.Context, node string) (*sdknodes.ListQemuResponse, error)
 	cloneCapture     *struct{ node, vmidStr string }
 	cloneErr         error
+	deleteQemuFn     func(ctx context.Context, node, vmidStr string, params *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error)
+}
+
+func (n *templateGapNodesSvc) DeleteQemu(ctx context.Context, node, vmidStr string, params *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
+	if n.deleteQemuFn != nil {
+		return n.deleteQemuFn(ctx, node, vmidStr, params)
+	}
+	panic("templateGapNodesSvc.DeleteQemu: not expected (set deleteQemuFn to intercept)")
 }
 
 func (n *templateGapNodesSvc) ListQemu(ctx context.Context, node string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
@@ -1382,10 +1397,14 @@ func (n *templateGapNodesSvc) CreateQemuClone(_ context.Context, node, vmidStr s
 }
 
 // templateGapPVE wires the pieces needed by attemptCreateVM for template-gap tests.
+// qemu, when set, overrides the default benign etQEMU stub — used by tests whose
+// path reaches QEMU calls beyond Config (e.g. the rollback Stop in
+// cleanupVMDetached).
 type templateGapPVE struct {
 	nodes   *templateGapNodesSvc
 	cluster *templateGapClusterSvc
 	storage *templateGapClusterStorageSvc
+	qemu    sdkqemu.Service
 }
 
 // QEMU returns a benign stub whose Config call returns an empty map (no
@@ -1397,7 +1416,12 @@ type templateGapPVE struct {
 // resolution "undeterminable", which fails open to this test's pre-existing
 // (vm_storage-keyed) expectations — the test asserts on clone-error handling
 // and ListQemu, not on clone-mode selection.
-func (p *templateGapPVE) QEMU() sdkqemu.Service           { return &etQEMU{} }
+func (p *templateGapPVE) QEMU() sdkqemu.Service {
+	if p.qemu != nil {
+		return p.qemu
+	}
+	return &etQEMU{}
+}
 func (p *templateGapPVE) Nodes() sdknodes.Service         { return p.nodes }
 func (p *templateGapPVE) Tasks() sdktasks.Service         { panic("not needed") }
 func (p *templateGapPVE) Storage() sdkstorage.Service     { panic("not needed") }
@@ -1422,14 +1446,20 @@ const templateGapSHA8 = "abcd1234"
 // templateGapClusterSvc.resourceRows fixture below uses.
 const templateGapPrimaryVMID = 6042
 
+// templateGapTemplateNode is the node hosting the cluster-cache template in
+// every templateGapClusterSvc fixture — deliberately not shape.node ("pve-vm").
+const templateGapTemplateNode = "pve-tmpl"
+
 // templateGapResourceRow returns a GET /cluster/resources row for a frozen
-// stemcell-cache template at (vmid, node) tagged with templateGapSHA8 — the
-// fixture resolveTemplateCacheTarget's cluster-scoped lookup discovers.
-func templateGapResourceRow(vmid int64, node string) map[string]any {
+// stemcell-cache template at (templateGapPrimaryVMID, templateGapTemplateNode)
+// tagged with templateGapSHA8 — the fixture resolveTemplateCacheTarget's
+// cluster-scoped lookup discovers. The node differs from shape.node ("pve-vm")
+// so every test exercises the cross-node template branches.
+func templateGapResourceRow() map[string]any {
 	return map[string]any{
 		"type":     "qemu",
-		"vmid":     vmid,
-		"node":     node,
+		"vmid":     templateGapPrimaryVMID,
+		"node":     templateGapTemplateNode,
 		"name":     "bosh-stemcell-ubuntu-jammy-1-0",
 		"tags":     "bosh-stemcell-sha-" + templateGapSHA8,
 		"template": true,
@@ -1511,7 +1541,7 @@ func TestAttemptCreateVM_TemplateGap_ReplicaFound(t *testing.T) {
 		// routes into the per-node replica guard, which listQemuWithReplica
 		// satisfies.
 		cluster: &templateGapClusterSvc{
-			resourceRows: []map[string]any{templateGapResourceRow(templateGapPrimaryVMID, "pve-tmpl")},
+			resourceRows: []map[string]any{templateGapResourceRow()},
 		},
 		storage: &templateGapClusterStorageSvc{shared: false},
 	}
@@ -1569,7 +1599,7 @@ func TestAttemptCreateVM_TemplateGap_NotFound_ReplicateDisabled(t *testing.T) {
 	pveCli := &templateGapPVE{
 		nodes: ns,
 		cluster: &templateGapClusterSvc{
-			resourceRows: []map[string]any{templateGapResourceRow(templateGapPrimaryVMID, "pve-tmpl")},
+			resourceRows: []map[string]any{templateGapResourceRow()},
 		},
 		storage: &templateGapClusterStorageSvc{shared: false},
 	}
@@ -1632,7 +1662,7 @@ func TestAttemptCreateVM_TemplateGap_SharedStorage_NoGuard(t *testing.T) {
 	pveCli := &templateGapPVE{
 		nodes: ns,
 		cluster: &templateGapClusterSvc{
-			resourceRows: []map[string]any{templateGapResourceRow(templateGapPrimaryVMID, "pve-tmpl")},
+			resourceRows: []map[string]any{templateGapResourceRow()},
 		},
 		storage: &templateGapClusterStorageSvc{shared: true}, // shared → guard skipped
 	}
@@ -1661,6 +1691,69 @@ func TestAttemptCreateVM_TemplateGap_SharedStorage_NoGuard(t *testing.T) {
 	// Clone must fire with the primary VMID (6042), not a replica.
 	if capture.vmidStr != "6042" {
 		t.Errorf("clone vmidStr: want %q (primary), got %q", "6042", capture.vmidStr)
+	}
+}
+
+// TestAttemptStemcellTemplateClone_SourceVanished_FallsBackToImport verifies
+// the mid-flight-vanish fallback: the cluster cache lookup finds a template,
+// but the clone itself fails with clone-source-missing (the template was
+// destroyed between lookup and clone POST — out-of-band, or by a concurrent
+// delete_stemcell). attemptStemcellTemplateClone must report handled=false
+// with a nil error so attemptCreateVM proceeds to strategy=import (the qcow2
+// the CID names may still exist), and must sweep the candidate VMID first —
+// the failed clone may have left partial VM state.
+func TestAttemptStemcellTemplateClone_SourceVanished_FallsBackToImport(t *testing.T) {
+	t.Parallel()
+
+	capture := &struct{ node, vmidStr string }{}
+	var deletedVMIDs []string
+	ns := &templateGapNodesSvc{
+		cloneCapture: capture,
+		cloneErr:     stderrors.New("unable to find configuration file for VM 6042 on node 'pve-tmpl'"),
+		deleteQemuFn: func(_ context.Context, _ string, vmidStr string, _ *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
+			deletedVMIDs = append(deletedVMIDs, vmidStr)
+			return nil, nil // synchronous destroy — no task to await
+		},
+	}
+	pveCli := &templateGapPVE{
+		nodes: ns,
+		cluster: &templateGapClusterSvc{
+			resourceRows: []map[string]any{templateGapResourceRow()},
+		},
+		storage: &templateGapClusterStorageSvc{shared: true}, // shared → clone with cluster primary
+		// cleanupVMDetached's best-effort Stop must not panic; a plain error
+		// (VM was never started) exits the rollback's stop phase immediately.
+		qemu: &etQEMU{stopFn: func(_ context.Context, _ string, _ int) (string, error) {
+			return "", stderrors.New("VM 203 not running")
+		}},
+	}
+	deps := Deps{
+		Config: &config.CPIConfig{
+			Node:          "",
+			VMStorage:     "local-lvm",
+			NetworkBridge: "vmbr0",
+		},
+		PVE:    pveCli,
+		Logger: log.NewNopLogger(),
+	}
+
+	parsed, shape := buildTemplateGapArgs(true)
+	handled, err := attemptStemcellTemplateClone(
+		context.Background(), deps, log.NewNopLogger(), parsed, shape, 203, "vm-203")
+
+	if err != nil {
+		t.Fatalf("want nil error (fall back to import), got: %v", err)
+	}
+	if handled {
+		t.Fatal("want handled=false so attemptCreateVM falls back to strategy=import")
+	}
+	// The clone must actually have been attempted against the primary template.
+	if capture.vmidStr != "6042" {
+		t.Errorf("clone vmidStr: want %q (primary), got %q", "6042", capture.vmidStr)
+	}
+	// The candidate VMID must have been swept before the fallback.
+	if len(deletedVMIDs) != 1 || deletedVMIDs[0] != "203" {
+		t.Errorf("candidate sweep: want DeleteQemu for vmid 203 exactly once, got %v", deletedVMIDs)
 	}
 }
 

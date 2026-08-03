@@ -229,6 +229,9 @@ func extractSHA8FromParsed(parsed *createVMParsedArgs) (sha8 string, ok bool) {
 // handleCreateError). Storage-lock timeouts from the clone task are also retried.
 // Local-storage cross-node violations are NOT retryable — they are
 // configuration errors that must propagate immediately.
+//
+// Clone-source-missing never reaches this function: attemptStemcellTemplateClone
+// intercepts it before classification and falls back to strategy=import.
 func handleCloneError(
 	ctx context.Context,
 	deps Deps,
@@ -238,15 +241,6 @@ func handleCloneError(
 	cerr error,
 ) error {
 	switch {
-	case pve.IsCloneSourceMissing(cerr):
-		// Permanent: the clone source template VM is gone on the node (stemcell
-		// template removed out-of-band). Retrying a fresh VMID cannot help —
-		// surface the real cause instead of "exhausted VMID allocation".
-		logger.Error("create_vm: clone source template missing, not retrying",
-			log.Int("vmid_attempted", candidate),
-			log.ErrScrubbed(cerr),
-		)
-		cleanupVMDetached(ctx, deps, node, candidate, logger)
 	case pve.IsVMIDConflict(cerr):
 		logger.Info("create_vm: vmid conflict on clone, retrying",
 			log.Int("vmid_attempted", candidate),

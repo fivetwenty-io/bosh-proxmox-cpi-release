@@ -832,8 +832,9 @@ func createVM(
 //     (success or terminal-fail). Intermediate failures are silently cleaned up.
 //   - Fallback only activates on transient clone errors (IsTransientTransport,
 //     IsStorageLockTimeout) or transient start errors (IsTransientTransport).
-//     Permanent errors (IsCloneSourceMissing, any non-transient error) surface
-//     immediately without consuming alternates.
+//     Permanent errors surface immediately without consuming alternates.
+//     (Clone-source-missing never surfaces here at all: the template path
+//     falls back to strategy=import inside attemptStemcellTemplateClone.)
 //   - The in-flight semaphore from step 3b is NOT acquired here to keep the
 //     fallback loop simple; the semaphore protects per-node concurrency and is
 //     best applied to the final committed node rather than each attempt node.
@@ -1208,9 +1209,12 @@ func resolveVMIDAllocParams(cfg *config.CPIConfig) (rangeStart, maxAttempts int)
 // because retrying on a fresh node with the same VMID pool is not guaranteed
 // to resolve the conflict.
 //
-// Permanent conditions (IsCloneSourceMissing) return false — the stemcell
-// template is missing cluster-wide, not just on this node; a fallback would
-// not help and would only delay surfacing the real error.
+// The IsCloneSourceMissing guard is defense-in-depth: the template path
+// normally intercepts a missing clone source and falls back to
+// strategy=import, but the matcher is message-based ("unable to find
+// configuration file for vm") and PVE can emit that text from other QEMU
+// operations, where the condition is permanent — a node fallback would not
+// help and would only delay surfacing the real error.
 func isTransientAllocateError(err error) bool {
 	if err == nil {
 		return false
@@ -1343,10 +1347,12 @@ func allocateVM(
 	shape *createVMShape,
 ) (int, error) {
 	isRetryable := func(e error) bool {
-		// A missing clone source (stemcell template removed out-of-band) is
-		// permanent: it surfaces as a 5xx that IsTransientTransport would match,
-		// but retrying with a fresh VMID cannot help. Short-circuit so the real
-		// cause propagates instead of "exhausted VMID allocation".
+		// Defense-in-depth: attemptStemcellTemplateClone intercepts a missing
+		// clone source and falls back to import, so this error normally never
+		// propagates here. But the matcher is message-based and the text can
+		// surface from other QEMU operations as a 5xx that IsTransientTransport
+		// would match; retrying with a fresh VMID cannot help. Short-circuit so
+		// the real cause propagates instead of "exhausted VMID allocation".
 		if pve.IsCloneSourceMissing(e) {
 			return false
 		}
@@ -1375,7 +1381,9 @@ func allocateVM(
 //
 // VMID conflicts and storage-lock timeouts are still retried internally (they
 // are VMID-specific, not node-specific, and retrying with a fresh VMID on the
-// same node is still correct). Clone-source-missing remains permanent.
+// same node is still correct). The clone-source-missing guard is the same
+// defense-in-depth as allocateVM's: normally intercepted upstream by the
+// import fallback, kept here for message-matcher spillover from other ops.
 func allocateVMForFallback(
 	ctx context.Context,
 	deps Deps,
@@ -1462,13 +1470,17 @@ func attemptCreateVM(
 // sha8 and clone it.
 //
 // Returns handled=false (nil error) when the caller must fall back to
-// strategy=import — either the sha8 could not be extracted from the
-// stemcell's filename, or no cache template exists anywhere in the cluster
-// (create_stemcell builds the cache; it may have been manually deleted).
+// strategy=import — the sha8 could not be extracted from the stemcell's
+// filename, no cache template exists anywhere in the cluster
+// (create_stemcell builds the cache; it may have been manually deleted), or
+// the template vanished between the cache lookup and the clone attempt
+// (clone-source-missing) — the qcow2 the CID names may still exist, so the
+// import path gets its chance before the failure is declared permanent.
 //
 // Returns handled=true with a non-nil error for a real, actionable failure
 // (a local-storage replica gap with replication disabled, or the clone
-// attempt itself failing) that must propagate without an import fallback.
+// attempt itself failing for any reason other than a missing source) that
+// must propagate without an import fallback.
 //
 // Returns handled=true with a nil error when the clone — and its post-clone
 // config (pve_config passthrough + PCI hostpciN) — succeeded.
@@ -1503,6 +1515,23 @@ func attemptStemcellTemplateClone(
 
 	cloneErr := cloneFromTemplate(ctx, deps, logger, shape, candidate, candidateName, templateNode, templateVMID)
 	if cloneErr != nil {
+		if pve.IsCloneSourceMissing(cloneErr) {
+			// The cache template vanished between resolveTemplateCacheTarget
+			// and the clone POST (deleted out-of-band, or by a concurrent
+			// delete_stemcell). The qcow2 the stemcell CID names may still
+			// exist, so fall back to strategy=import — the same path a cache
+			// miss takes. Sweep the candidate VMID first: the failed clone
+			// may have left partial VM state behind.
+			logger.Warn("create_vm: clone source template vanished mid-flight; falling back to direct import",
+				log.Int("vmid_attempted", candidate),
+				log.Int64("template_vmid", templateVMID),
+				log.String("template_node", templateNode),
+				log.String("sha8", sha8),
+				log.ErrScrubbed(cloneErr),
+			)
+			cleanupVMDetached(ctx, deps, shape.node, candidate, logger)
+			return false, nil
+		}
 		// Classify for retry: VMID conflicts and transient transport faults are
 		// retryable — they use the same retry classification as the import path.
 		return true, handleCloneError(ctx, deps, logger, shape.node, candidate, cloneErr)

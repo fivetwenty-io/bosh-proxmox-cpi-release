@@ -1737,8 +1737,10 @@ releases). When set to a positive value (valid range 1–5; recommended 2):
   falls back when it is `IsTransientTransport` or `IsStorageLockTimeout`; a start failure falls
   back when it is `IsTransientTransport`. VMID conflicts are not a fallback trigger — they are
   resolved on the same node by the allocate-with-retry loop, which regenerates the VMID (see
-  §7.33), so they never surface to the candidate loop. Permanent errors (missing clone source,
-  non-retriable PVE errors) fail immediately without consuming alternates.
+  §7.33), so they never surface to the candidate loop. Permanent errors (non-retriable PVE
+  errors) fail immediately without consuming alternates; a clone source that vanishes between
+  the cache lookup and the clone falls back to a direct qcow2 import on the same node rather
+  than failing or consuming an alternate.
 - At most `1 + fallback_max` total attempts are made; 0 means the feature is fully off.
 
 This is the post-selection analogue of the §7.10 pre-selection multi-AZ fallback, mirroring two
