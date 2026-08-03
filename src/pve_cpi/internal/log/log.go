@@ -56,8 +56,14 @@ func Bool(key string, val bool) Field { return slog.Bool(key, val) }
 // Any returns a Field carrying an arbitrary value under the given key.
 func Any(key string, val any) Field { return slog.Any(key, val) }
 
-// Err is a convenience for slog.Any("error", err); slog has no Error field helper.
-func Err(err error) Field { return slog.Any("error", err) }
+// Err returns a Field carrying the error message under the "error" key with
+// any URL credentials scrubbed (userinfo and sensitive query parameters).
+// Every call site that logs an error goes through this scrubbing: an error
+// message can originate from a guest-controlled or PVE-returned value that
+// embeds a token-bearing URL (e.g. a storage API endpoint with a presigned
+// query parameter), so there is no safe unscrubbed variant. Err and
+// ErrScrubbed are equivalent; Err delegates to it.
+func Err(err error) Field { return ErrScrubbed(err) }
 
 // URL returns a Field carrying a URL-shaped string with embedded credentials
 // masked (userinfo and sensitive query parameters such as presigned
@@ -68,10 +74,9 @@ func URL(key, raw string) Field { return slog.String(key, ScrubMessage(raw)) }
 
 // ErrScrubbed returns a Field carrying the error message under the "error" key
 // with any URL credentials scrubbed (userinfo and sensitive query parameters).
-// Use this instead of Err when the error originates from a guest-controlled or
-// PVE-returned value that may embed a token-bearing URL (e.g. a storage API
-// endpoint with a presigned query parameter). Err passes the error value directly
-// to slog, which renders it via Error() without scrubbing.
+// Err is identical (it delegates here); ErrScrubbed remains exported as a
+// separate name so a call site can still signal, for a reader, that it
+// specifically expects a credential-bearing value at that point.
 func ErrScrubbed(err error) Field {
 	if err == nil {
 		return slog.String("error", "")

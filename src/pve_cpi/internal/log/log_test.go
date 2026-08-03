@@ -432,6 +432,89 @@ func TestErrScrubbed_PlainErrorPassesThrough(t *testing.T) {
 	}
 }
 
+// TestErr_ScrubsTokenBearingURL verifies that Err scrubs a token-bearing URL
+// embedded in an error message exactly as ErrScrubbed does: Err has no
+// unscrubbed variant, since any error may originate from a guest-controlled
+// or PVE-returned value.
+func TestErr_ScrubsTokenBearingURL(t *testing.T) {
+	t.Parallel()
+
+	tokenErr := errors.New("storage request failed: https://pve.example.com:8006/api2/json/nodes/pve/storage?access_token=secret-pve-token-abc123&node=pve")
+
+	var buf bytes.Buffer
+	l := mustLogger(t, "debug", &buf)
+	l.Debug("scrub test", log.Err(tokenErr))
+
+	out := buf.String()
+	if strings.Contains(out, "secret-pve-token-abc123") {
+		t.Errorf("token leaked through Err: %s", out)
+	}
+	if !strings.Contains(out, log.RedactedPlaceholder) {
+		t.Errorf("expected %q placeholder in output: %s", log.RedactedPlaceholder, out)
+	}
+	if !strings.Contains(out, "storage request failed") {
+		t.Errorf("non-sensitive message prefix must be preserved: %s", out)
+	}
+}
+
+// TestErr_ScrubsUserinfoCredentials verifies that Err masks a userinfo
+// credential (scheme://user:pass@host) embedded in an error message.
+func TestErr_ScrubsUserinfoCredentials(t *testing.T) {
+	t.Parallel()
+
+	userinfoErr := errors.New("dial failed: https://bosh:s3cretpw@mirror.internal/img.qcow2")
+
+	var buf bytes.Buffer
+	l := mustLogger(t, "debug", &buf)
+	l.Debug("scrub test", log.Err(userinfoErr))
+
+	out := buf.String()
+	if strings.Contains(out, "s3cretpw") {
+		t.Errorf("userinfo credential leaked through Err: %s", out)
+	}
+	if !strings.Contains(out, log.RedactedPlaceholder) {
+		t.Errorf("expected %q placeholder in output: %s", log.RedactedPlaceholder, out)
+	}
+	if !strings.Contains(out, "mirror.internal/img.qcow2") {
+		t.Errorf("host/path must survive Err scrubbing: %s", out)
+	}
+}
+
+// TestErr_NilError returns an empty string field without panic, matching
+// ErrScrubbed's nil handling.
+func TestErr_NilError(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	l := mustLogger(t, "debug", &buf)
+	l.Debug("nil err test", log.Err(nil))
+
+	out := buf.String()
+	if !strings.Contains(out, `"error":""`) && !strings.Contains(out, `"error": ""`) {
+		t.Errorf("nil Err must produce empty error field: %s", out)
+	}
+}
+
+// TestErr_EquivalentToErrScrubbed verifies Err and ErrScrubbed produce
+// byte-identical Fields for the same error, across a nil error, a plain
+// error, and an error embedding credentials.
+func TestErr_EquivalentToErrScrubbed(t *testing.T) {
+	t.Parallel()
+
+	cases := []error{
+		nil,
+		errors.New("connection refused"),
+		errors.New("failed: https://bosh:s3cretpw@mirror.internal/img.qcow2?access_token=secret123"),
+	}
+	for _, err := range cases {
+		a := log.Err(err)
+		b := log.ErrScrubbed(err)
+		if a.Key != b.Key || a.Value.Any() != b.Value.Any() {
+			t.Errorf("Err(%v) = %+v, ErrScrubbed(%v) = %+v; want equal", err, a, err, b)
+		}
+	}
+}
+
 // TestNewLoggerWithHandlers_ZeroExtrasIdenticalToNewLogger verifies that
 // NewLoggerWithHandlers with no extra handlers produces byte-identical
 // output to NewLogger for the same sequence of log calls (regression:

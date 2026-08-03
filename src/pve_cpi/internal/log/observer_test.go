@@ -20,7 +20,7 @@ func TestFieldConstructors_AllTypes(t *testing.T) {
 		t.Fatalf("Any: got %+v", got)
 	}
 	want := errors.New("boom")
-	if got := Err(want); got.Key != "error" || got.Value.Any() != want { //nolint:errorlint // identity check: slog.Value carries exact error pointer, not wrapped
+	if got := Err(want); got.Key != "error" || got.Value.Any() != want.Error() {
 		t.Fatalf("Err: got %+v", got)
 	}
 }
