@@ -17,6 +17,19 @@
 // poolid, and the comment round-trip, are inferred from the API shape and the
 // pmxcfs serialization model. Unit tests assert this contract against a fake
 // PoolService; a true multi-process race must be validated on a live cluster.
+//
+// SCOPE: this lock is PER-CLUSTER, never cross-cluster. pmxcfs is the
+// per-cluster corosync-backed filesystem that serializes POST /pools; two
+// independent PVE clusters each run their own pmxcfs instance, so the same
+// sentinel poolid can be created simultaneously in both clusters and each
+// will believe it holds the lock. Every RMW this lock protects — VM/disk tag
+// and notes updates, stemcell reference counts, anti-affinity HA rule
+// membership — is therefore only serialized against other CPI processes
+// pointed at THIS cluster. On storage shared between two independent
+// clusters (see internal/cpi/handlers/vmid_lock.go and the
+// pve.destroy_unreferenced_disks config doc for the resulting data-loss
+// path), cross-cluster safety comes from disjoint VMID banding per CPI
+// config, not from this lock.
 package pve
 
 import (

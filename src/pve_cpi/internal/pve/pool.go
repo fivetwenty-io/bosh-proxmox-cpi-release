@@ -6,8 +6,10 @@ package pve
 
 import (
 	"context"
+	"errors"
 
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
+	sdkerrors "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/errors"
 )
 
 // PoolProvenanceComment is the comment the CPI writes on every resource pool
@@ -72,4 +74,35 @@ func EnsurePoolExists(ctx context.Context, c Client, poolID, comment string) err
 		return nil
 	}
 	return cpierrors.Wrap(WrapError(err), "EnsurePoolExists: create pool "+poolID)
+}
+
+// IsPoolPermissionDenied reports whether err signals that PVE denied read
+// access to a resource pool -- HTTP 401 (invalid credentials) or 403 (valid
+// credentials, missing grant, e.g. Pool.Audit on /pool/<name>) -- as opposed
+// to a transient network/server fault or the pool simply not existing yet
+// (PoolService.GetPoolComment already maps a not-found pool to
+// found=false with a nil error, so that case never reaches this classifier).
+//
+// Used by the CPI startup preflight (cmd/cpi/main.go) to fail fast with an
+// actionable grant-naming message on a genuine permission problem, while
+// treating every other GetPoolComment error as transient (Warn-only, does
+// not block boot) -- a startup-time PVE API hiccup must not be
+// indistinguishable from a misconfigured token.
+func IsPoolPermissionDenied(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, sdkerrors.ErrUnauthorized) || errors.Is(err, sdkerrors.ErrForbidden) {
+		return true
+	}
+	var apiErr *sdkerrors.APIError
+	if errors.As(err, &apiErr) {
+		return apiErr.IsUnauthorized() || apiErr.IsForbidden()
+	}
+	var permErr *sdkerrors.PermissionError
+	if errors.As(err, &permErr) {
+		return true
+	}
+	var authErr *sdkerrors.AuthenticationError
+	return errors.As(err, &authErr)
 }

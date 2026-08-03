@@ -12,6 +12,7 @@ import (
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/qemu"
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/storage"
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/tasks"
+	sdkerrors "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/errors"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
 )
@@ -164,6 +165,39 @@ func TestPoolProvenance_WithAndWithoutDirector(t *testing.T) {
 			t.Parallel()
 			if got := pve.PoolProvenance(tc.director); got != tc.want {
 				t.Errorf("PoolProvenance(%q) = %q; want %q", tc.director, got, tc.want)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// IsPoolPermissionDenied
+// ---------------------------------------------------------------------------
+
+func TestIsPoolPermissionDenied(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil error", nil, false},
+		{"403 APIError", &sdkerrors.APIError{HTTPCode: 403, Message: "permission denied", Code: 403}, true},
+		{"401 APIError", &sdkerrors.APIError{HTTPCode: 401, Message: "authentication failure", Code: 401}, true},
+		{"404 APIError (pool not found -- not a permission issue)", &sdkerrors.APIError{HTTPCode: 404, Message: "no such pool"}, false},
+		{"500 APIError (transient server fault)", &sdkerrors.APIError{HTTPCode: 500, Message: "worker busy"}, false},
+		{"ErrForbidden sentinel", sdkerrors.ErrForbidden, true},
+		{"ErrUnauthorized sentinel", sdkerrors.ErrUnauthorized, true},
+		{"PermissionError", &sdkerrors.PermissionError{What: "Pool.Audit"}, true},
+		{"AuthenticationError", &sdkerrors.AuthenticationError{Realm: "pam"}, true},
+		{"plain non-SDK error", errors.New("connection refused"), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := pve.IsPoolPermissionDenied(tc.err); got != tc.want {
+				t.Errorf("IsPoolPermissionDenied(%v) = %v; want %v", tc.err, got, tc.want)
 			}
 		})
 	}
