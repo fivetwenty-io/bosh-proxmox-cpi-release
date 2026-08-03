@@ -90,7 +90,7 @@ type CPIConfig struct {
 	// ConfigDrive ISO on the same (typically shared) pool as the VM's disks
 	// instead of the historically node-local "local" default, so HA/DLB/
 	// migration are not silently defeated by an unshared ISO pool out of the
-	// box. Explicit *false restores the pre-P5 behavior (ISOStorage always
+	// box. Explicit *false opts out (ISOStorage always
 	// used as configured). Pointer-typed tri-state so JSON absence (nil, →
 	// true) is distinguishable from an explicit *false. Use
 	// ISOStorageFollowVMStorageEnabled() for the effective bool.
@@ -2890,8 +2890,8 @@ func (c *CPIConfig) RequireSharedISOForHAEnabled() bool {
 
 // ISOStorageFollowVMStorageEnabled returns the effective
 // iso_storage_follow_vm_storage setting. nil (field absent from JSON) → TRUE
-// (the P5 default: ISO follows vm_storage when eligible). *false → false
-// (opt-out, pre-P5 behavior); *true → true (explicit, same as default).
+// (the default: ISO follows vm_storage when eligible). *false → false
+// (opt-out: ISOStorage used as configured); *true → true (explicit, same as default).
 // See the ISOStorageFollowVMStorage field doc for the resolution algorithm.
 func (c *CPIConfig) ISOStorageFollowVMStorageEnabled() bool {
 	if c == nil {

@@ -1,4 +1,4 @@
-// Package handlers internal tests for the P4.2/P4.3 per-NIC vlan and mtu
+// Package handlers internal tests for the per-NIC vlan and mtu
 // cloud_properties keys — plain 802.1Q VLAN tagging and explicit MTU on an
 // operator-managed bridge, with no SDN involvement.
 package handlers
@@ -33,7 +33,7 @@ func vlanParsed(bridge string, vlan, mtu any, model string) *createVMParsedArgs 
 }
 
 // --------------------------------------------------------------------------
-// P4.2 — per-NIC vlan key
+// per-NIC vlan key
 // --------------------------------------------------------------------------
 
 func TestConfigureNICs_VLAN_PerNIC_AppendsTag(t *testing.T) {
@@ -197,7 +197,7 @@ func TestConfigureNICs_VLAN_NetworkDefaults_Malformed_Rejected(t *testing.T) {
 }
 
 // --------------------------------------------------------------------------
-// P4.3 — per-NIC mtu key
+// per-NIC mtu key
 // --------------------------------------------------------------------------
 
 func TestConfigureNICs_MTU_PerNIC_ExplicitInherit(t *testing.T) {
@@ -265,7 +265,7 @@ func TestConfigureNICs_MTU_PerNIC_NonVirtioModel_Rejected(t *testing.T) {
 }
 
 func TestConfigureNICs_MTU_ExplicitWinsOverVnetInheritance(t *testing.T) {
-	// bug/interaction from P4.3: an explicit per-NIC mtu must win over the
+	// bug/interaction: an explicit per-NIC mtu must win over the
 	// automatic vnet-derived mtu=1 inheritance — never emit both mtu=
 	// segments.
 	cfg := icMinConfig()
@@ -304,7 +304,7 @@ func TestConfigureNICs_MTU_NetworkDefaultsOverridesPerNIC(t *testing.T) {
 }
 
 // --------------------------------------------------------------------------
-// P4.2/N1/N3 — IP-conflict pre-check resolves (bridge, vlan) via the SAME
+// IP-conflict pre-check resolves (bridge, vlan) via the SAME
 // precedence configureNICs uses.
 // --------------------------------------------------------------------------
 

@@ -1,5 +1,5 @@
 // Package handlers -- internal tests for liveStorageInfo, lookupVMStorageType,
-// and needsReplicaCheck: the P3.1 consolidation of these two previously
+// and needsReplicaCheck: the consolidation of these two previously
 // independent ad-hoc /storage readers onto the shared pve.ParseStorageEntry
 // decoder.
 package handlers

@@ -261,7 +261,7 @@ func TestCheckISOStorageForHA_AntiAffinityActive_LocalISO_WarnOnly(t *testing.T)
 }
 
 // ---------------------------------------------------------------------------
-// isoStorageScanTarget (P5.3: create_vm VMID-allocation ISO-pool scan target)
+// isoStorageScanTarget (create_vm VMID-allocation ISO-pool scan target)
 // ---------------------------------------------------------------------------
 
 func TestIsoStorageScanTarget(t *testing.T) {

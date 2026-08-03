@@ -237,7 +237,7 @@ func TestCreateStemcell_NoSourceURL_ExistingFlowUnchanged(t *testing.T) {
 		"name":     "ubuntu-jammy",
 		"version":  "1.0",
 		"image_id": "nfs:import/bosh-stemcell-ubuntu-jammy-1.0-00000000.qcow2",
-		// sha256 is now required for preuploaded stemcells (P1.1).
+		// sha256 is required for preuploaded stemcells.
 		"sha256": "ef0c5d8d1d8ba6e1a8620b2cba931c76e3bc9049395c3e7a5d5733cc3df2983f",
 	}
 	args := []json.RawMessage{
@@ -478,7 +478,7 @@ func TestCreateStemcell_SourceURL_TaskFailure_NonRetriable(t *testing.T) {
 		"name":       "ubuntu-jammy",
 		"version":    "1.503",
 		"source_url": "https://example.com/stemcell.qcow2",
-		// sha256 is now required for server-download (P1.1 tightening).
+		// sha256 is required for server-download.
 		"sha256": "ef0c5d8d1d8ba6e1a8620b2cba931c76e3bc9049395c3e7a5d5733cc3df2983f",
 	}
 	args := []json.RawMessage{

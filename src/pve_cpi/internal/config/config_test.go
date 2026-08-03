@@ -934,9 +934,9 @@ func TestISOStorageFollowVMStorageEnabled(t *testing.T) {
 	if nilCfg.ISOStorageFollowVMStorageEnabled() {
 		t.Error("nil receiver: want false")
 	}
-	// absent field (nil *bool): P5 default is true.
+	// absent field (nil *bool): default is true.
 	if !(&config.CPIConfig{}).ISOStorageFollowVMStorageEnabled() {
-		t.Error("nil *bool: want true (P5 default)")
+		t.Error("nil *bool: want true (default)")
 	}
 	// explicit *true: must return true.
 	tru := true

@@ -278,7 +278,7 @@ func TestConfigureNICs_MTU_NetworkDefaults_Malformed_Rejected(t *testing.T) {
 }
 
 // --------------------------------------------------------------------------
-// P4.9 — explicit vlan tag on a bridge that is itself an SDN vnet: warn, don't fail.
+// Explicit vlan tag on a bridge that is itself an SDN vnet: warn, don't fail.
 // --------------------------------------------------------------------------
 
 // TestConfigureNICs_VLANOnSDNVnet_Warns verifies that setting an explicit

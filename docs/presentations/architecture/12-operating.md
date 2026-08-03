@@ -76,7 +76,7 @@ flowchart LR
 - The rendered config file will be the second ground-truth artifact: the Director interpolates the manifest, resolves secrets from the credential store, and writes one file the binary reads every invocation.
 - On load the CPI will apply defaults, validate the whole structure, and accumulate every error before opening a single connection to PVE — malformed input fails at the door, not twelve minutes into a deploy.
 - API token will win over password when both are supplied — revocable and scoped on its own, no ticket to expire mid-deploy; at least one of the two is required, a config with neither is rejected at load.
-- What the token can do is exactly what the handlers call, and no more: see the [PVE API permissions](../pve-api-permissions.md) reference and [Chapter 11](11-hostile-by-default.md) for why the set is derived from the call graph.
+- What the token can do is exactly what the handlers call, and no more: see the [PVE API permissions](../../pve-api-permissions.md) reference and [Chapter 11](11-hostile-by-default.md) for why the set is derived from the call graph.
 -->
 
 ---
@@ -154,7 +154,7 @@ flowchart LR
 - Metrics will be the third signal: exactly one instrument, a `cpi.action.duration` millisecond histogram tagged by CPI method and final outcome (`success`, `error`, or `marshal_error`), delta rather than cumulative because a one-shot process has no running series — no per-PVE-call metrics.
 - `cpi.response_write_failure` will be a fresh span opened from the response-write panic-recovery path, since the root span has usually already closed by then and appending to it is a no-op.
 - Nothing about any of the three signals will touch stdout, which stays the JSON-RPC reply alone; each signal opts in on its own, and one protocol setting redirects traces, logs, and metrics together between OTLP/HTTP and OTLP/gRPC.
-- The enable switch, endpoint, sample ratio, and flush deadline live in the [configuration reference](../configuration.md), every one defaulting to inert.
+- The enable switch, endpoint, sample ratio, and flush deadline live in the [configuration reference](../../configuration.md), every one defaulting to inert.
 -->
 
 ---

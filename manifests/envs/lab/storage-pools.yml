@@ -39,7 +39,7 @@
   value: local
 
 # iso_storage: local is an EXPLICIT single-node choice here, not the CPI
-# default behavior. As of the P5 defaults profile, pve.iso_storage_follow_vm_storage
+# default behavior. pve.iso_storage_follow_vm_storage
 # defaults to true: a deployment that leaves iso_storage unset resolves the
 # ConfigDrive ISO pool to vm_storage instead, provided vm_storage advertises
 # PVE content type `iso` and is shared. In this single-node lab, vm_storage

@@ -111,7 +111,7 @@ func TestHandleDeleteVM_Happy(t *testing.T) {
 		t.Error("DeleteQemu: expected purge=true")
 	}
 	if deleteCalls[0].destroyUnref {
-		t.Error("DeleteQemu: expected destroy-unreferenced-disks=false (P5 default; pve.destroy_unreferenced_disks unset)")
+		t.Error("DeleteQemu: expected destroy-unreferenced-disks=false (default; pve.destroy_unreferenced_disks unset)")
 	}
 	if len(removeCalls) != 1 {
 		t.Fatalf("Agent.Remove: want 1 call, got %d", len(removeCalls))
@@ -122,7 +122,7 @@ func TestHandleDeleteVM_Happy(t *testing.T) {
 }
 
 // TestHandleDeleteVM_DestroyUnreferencedDisksOptIn verifies that explicit
-// pve.destroy_unreferenced_disks=true restores the pre-P5 default: the
+// pve.destroy_unreferenced_disks=true opts into disk destruction: the
 // synchronous delete path passes DestroyUnreferencedDisks=true to DeleteQemu
 // for a non-retain delete.
 func TestHandleDeleteVM_DestroyUnreferencedDisksOptIn(t *testing.T) {
@@ -2019,7 +2019,7 @@ func TestHandleDeleteVM_VMInRange_NoParkerTag_Proceeds(t *testing.T) {
 // TestHandleDeleteVM_RetainEphemeral_VolumeActuallySurvives is an end-to-end
 // test that proves the fix for F1: DestroyUnreferencedDisks=true would destroy
 // the ephemeral volume after unlink+sweep (it is then unreferenced + own-VMID),
-// and DestroyUnreferencedDisks=false (set by the retain path, or by the P5
+// and DestroyUnreferencedDisks=false (set by the retain path, or by
 // default when pve.destroy_unreferenced_disks is left unset) preserves it.
 //
 // The DeleteQemu double models PVE's actual behavior:
@@ -2032,11 +2032,11 @@ func TestHandleDeleteVM_VMInRange_NoParkerTag_Proceeds(t *testing.T) {
 // Sub-cases:
 //   (a) retain flag present: DestroyUnreferencedDisks=false → ephemeral survives,
 //       root disk is freed (it remains config-referenced at destroy time).
-//   (b) retain flag absent, pve.destroy_unreferenced_disks unset (P5 default):
+//   (b) retain flag absent, pve.destroy_unreferenced_disks unset (the default):
 //       DestroyUnreferencedDisks=false → nothing in this class is freed.
 //   (c) retain flag absent, pve.destroy_unreferenced_disks=true (explicit
-//       opt-in): DestroyUnreferencedDisks=true → byte-identical to the
-//       pre-P5 default.
+//       opt-in): DestroyUnreferencedDisks=true → the now-unreferenced
+//       ephemeral volume is freed.
 // ---------------------------------------------------------------------------
 
 //nolint:gocognit // Models the PVE config/storage state machine across unlink, sweep, and destroy; splitting obscures the sequence under test.
@@ -2173,7 +2173,7 @@ func TestHandleDeleteVM_RetainEphemeral_VolumeActuallySurvives(t *testing.T) {
 			}
 		default:
 			if capturedDestroyUnref == nil || *capturedDestroyUnref {
-				t.Error("non-retain path with pve.destroy_unreferenced_disks unset (P5 default): DeleteQemu must receive DestroyUnreferencedDisks=false")
+				t.Error("non-retain path with pve.destroy_unreferenced_disks unset (default): DeleteQemu must receive DestroyUnreferencedDisks=false")
 			}
 		}
 
@@ -2208,7 +2208,7 @@ func TestHandleDeleteVM_RetainEphemeral_VolumeActuallySurvives(t *testing.T) {
 
 	t.Run("no_retain_flag_destroyDisks_defaults_false", func(t *testing.T) {
 		t.Parallel()
-		// P5 default: pve.destroy_unreferenced_disks unset -> DeleteQemu
+		// Default: pve.destroy_unreferenced_disks unset -> DeleteQemu
 		// receives DestroyUnreferencedDisks=false even on the non-retain
 		// path. runCase's inner assertion checks this directly; no orphan
 		// volume is freed here because the flag is off.
@@ -2217,8 +2217,8 @@ func TestHandleDeleteVM_RetainEphemeral_VolumeActuallySurvives(t *testing.T) {
 
 	t.Run("no_retain_flag_destroyDisks_true_when_opted_in", func(t *testing.T) {
 		t.Parallel()
-		// Explicit pve.destroy_unreferenced_disks=true restores the
-		// pre-P5 default behaviour: DeleteQemu receives
+		// Explicit pve.destroy_unreferenced_disks=true opts
+		// in: DeleteQemu receives
 		// DestroyUnreferencedDisks=true on the non-retain path.
 		runCase(t, false, true)
 	})

@@ -158,7 +158,7 @@ def parse_stemcell_path_cid(cid: str) -> "tuple[str, str, str]":
       - unknown kind segment (anything other than "light"/"heavy")
       - doubled prefix (":light::heavy:...") -- the payload after the kind
         must itself parse as "<storage>:import/<filename>", and a storage
-        name cannot be empty or start with ':'
+        name cannot be empty or contain ':'
       - payload whose path component does not start with "import/"
     """
     if not cid:

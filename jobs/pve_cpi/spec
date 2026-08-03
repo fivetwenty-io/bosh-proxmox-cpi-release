@@ -91,7 +91,7 @@ properties:
       vm_storage lacks `iso` content, is not shared, or cannot be resolved,
       the CPI falls back to iso_storage unchanged and logs a warning
       (fail-open). Set explicitly to false to disable and always use
-      iso_storage as configured — the pre-P5 behavior. Leave unset (~) to get
+      iso_storage as configured. Leave unset (~) to get
       the default-true behavior; explicit true/false always overrides it.
     default: ~
   pve.network_bridge:

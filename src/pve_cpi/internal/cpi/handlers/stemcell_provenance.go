@@ -101,8 +101,7 @@ func buildStemcellProvenanceTags(cp stemcellCloudProps, directorID string) []str
 //     (including empty) yields an empty SHA8, matching the
 //     BuildStemcellFilename convention for an unknown digest.
 //   - source: human-readable origin label (URL, blobstore ref, etc.); scrubbed
-//     via log.ScrubMessage exactly as buildStemcellProvenanceNotes does, and
-//     omitted from the JSON when empty.
+//     via log.ScrubMessage, and omitted from the JSON when empty.
 //   - creatingDirectorUUID: the BOSH director UUID that built (froze) this
 //     template. Recorded verbatim (including empty) as CreatedBy. The
 //     DirectorRefs seed uses directorRefOrSentinel(creatingDirectorUUID)
@@ -141,7 +140,7 @@ func buildStemcellProvenanceNotesPath(
 		SHA256:     sha256hex,
 		Kind:       string(kind),
 		CID:        cid,
-		// Scrubbed for the same reason as buildStemcellProvenanceNotes: the
+		// Scrubbed because the
 		// notes field persists in /etc/pve/qemu-server/<vmid>.conf, readable
 		// by any VM.Audit holder and replicated cluster-wide.
 		Source:    log.ScrubMessage(source),

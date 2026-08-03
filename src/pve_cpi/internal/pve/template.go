@@ -66,7 +66,8 @@ func (b *pveBool) UnmarshalJSON(data []byte) error {
 // leading/trailing "-". The combined result is capped at maxStemcellFilenameLen
 // total characters; any trailing "-" introduced by truncation is stripped.
 //
-// The name is used as the idempotency lookup key for FindTemplateByName: two
+// The name is used as the idempotency lookup key for FindTemplateByNameCluster:
+// two
 // calls with the same (name, version) produce the same string.
 func BuildTemplateName(name, version string) string {
 	// PVE VM names must be valid DNS names (each label is [a-z0-9-]); '_' and

@@ -645,7 +645,7 @@ func ensureTemplateAndRegisterRef(
 }
 
 // stemcellStorageIsShared classifies storage's shared-ness for the
-// replication gate (P1.5): replication to other cluster nodes is only
+// replication gate: replication to other cluster nodes is only
 // meaningful when storage is node-local — on shared storage the single cache
 // template built on templateNode is already reachable from every node.
 //
@@ -745,7 +745,7 @@ func stemcellBackingQCow2Exists(ctx context.Context, deps Deps, node, storage, q
 //  1. BuildTemplateNameWithSHA(cp.Name, cp.Version, sha8) → deterministic name
 //     (idempotency key when sha8 is unknown; sha-tag identity is preferred
 //     when known).
-//  2. Cluster-scoped dedup (P1.4 — create-side and destroy-side now see the
+//  2. Cluster-scoped dedup (create-side and destroy-side see the
 //     same world, unlike the historical per-node ListQemu scan):
 //     a. sha8 known: pve.FindTemplatesBySHATagCluster(sha8), tried in
 //     ascending-VMID order. Each candidate's full sha256 is verified via
@@ -766,7 +766,7 @@ func stemcellBackingQCow2Exists(ctx context.Context, deps Deps, node, storage, q
 //  4. QEMU().Create with import-from=<storage>:import/<qcow2Filename>; no NIC,
 //     no agent, onboot=0; tags include "bosh-stemcell-cache" (cache marker,
 //     unconditional) and "bosh-stemcell-sha-<sha8>" (only when sha8 is
-//     known); provenance tags/notes are always stamped (P1.6 — no config
+//     known); provenance tags/notes are always stamped (no config
 //     gate); await UPID with StemcellMaxWait.
 //  5. MakeTemplate → freeze VM; await UPID if non-empty.
 //  6. Race reconciliation (reconcileTemplateRace, cluster-scoped): if a
@@ -1071,7 +1071,7 @@ func ensureTemplateVM(
 
 // reconcileTemplateRace returns the (lowest VMID, node) of a frozen template
 // matching the stemcell identity, used after freeze to detect a
-// concurrently-created duplicate. Cluster-scoped (P1.4): prefers the stable
+// concurrently-created duplicate. Cluster-scoped: prefers the stable
 // sha tag (when sha8 is known — the caller's already-resolved value, which
 // may come from a full digest or a knownSHA8 fallback) and falls back to the
 // deterministic name. A return of (0, "", nil) means no matching template was
@@ -1280,7 +1280,7 @@ type templateBuildSpec struct {
 //     with format=qcow2 and size=5G default.
 //   - Tags: ownershipTag, stemcellCacheTag always; "bosh-stemcell-sha-<sha8>"
 //     when spec.ShaTag is non-empty; provenance name/version tags always
-//     (P1.6 — provenance is unconditional, no config gate).
+//     (provenance is unconditional, no config gate).
 //
 // Provenance notes (buildStemcellProvenanceNotesPath) are always written to
 // the description field — the path-identity design has no "disabled" mode;
@@ -1350,7 +1350,7 @@ func attemptCreateTemplateVM(
 		"onboot":            0,
 	}
 
-	// Provenance is unconditional (P1.6): every cache template gets full
+	// Provenance is unconditional: every cache template gets full
 	// notes JSON (name/version/os_type/disk_format/sha8/sha256/kind/cid/
 	// created_by/created/director_refs seeded with the creating director) and
 	// tags (marker + name + version). Per-director "director--<uuid>" tags

@@ -335,7 +335,7 @@ func lightStoragePolicyCPArgs(t *testing.T, imgPath string) []json.RawMessage {
 		"name":     "ubuntu-jammy",
 		"version":  "1.234",
 		"image_id": "local:import/bosh-stemcell-ubuntu-jammy-1.234-abcdef12.qcow2",
-		// sha256 is now required for preuploaded stemcells (P1.1); its value is
+		// sha256 is required for preuploaded stemcells; its value is
 		// irrelevant to these boundary tests, which exercise storage-policy and
 		// cluster-node-count API failures upstream of any content verification.
 		"sha256": "ef0c5d8d1d8ba6e1a8620b2cba931c76e3bc9049395c3e7a5d5733cc3df2983f",

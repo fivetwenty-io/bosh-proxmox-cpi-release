@@ -490,7 +490,7 @@ func TestCreateStemcell_BoshCPITag(t *testing.T) {
 
 // TestCreateStemcell_Dedup_SameFilename verifies that when the qcow2 volume
 // already exists on storage AND a matching cache template already exists
-// (cluster-scoped sha-tag lookup, P1.4), Upload is not called and the handler
+// (cluster-scoped sha-tag lookup), Upload is not called and the handler
 // returns the same :heavy: CID the qcow2 filename determines — CID identity
 // no longer depends on which VMID backs the cache template.
 func TestCreateStemcell_Dedup_SameFilename(t *testing.T) {
@@ -1499,7 +1499,7 @@ func emptyVolumeListFn() func(_ context.Context, _, _ string, _ *sdknodes.ListSt
 // the preuploaded (light) stemcell test fixtures below. Its actual byte
 // content is irrelevant to these tests — only its shape (valid hex, 64
 // chars) matters, since preuploaded mode now requires cloud_properties.sha256
-// (P1.1) but does not verify it against the (non-existent, /dev/null) local
+// but does not verify it against the (non-existent, /dev/null) local
 // file.
 const preuploadedSHA256 = "ef0c5d8d1d8ba6e1a8620b2cba931c76e3bc9049395c3e7a5d5733cc3df2983f"
 
@@ -1557,7 +1557,7 @@ func TestHandleCreateStemcell_LightPreUploaded_HappyPath(t *testing.T) {
 
 // TestHandleCreateStemcell_LightPreUploaded_MissingSHA256 verifies that a
 // preuploaded stemcell without cloud_properties.sha256 is rejected with a
-// clear validation error (P1.1 — sha256 is now required for content identity
+// clear validation error (sha256 is required for content identity
 // and dedup).
 func TestHandleCreateStemcell_LightPreUploaded_MissingSHA256(t *testing.T) {
 	t.Parallel()

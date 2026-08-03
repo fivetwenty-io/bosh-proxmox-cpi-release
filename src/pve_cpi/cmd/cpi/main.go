@@ -453,8 +453,8 @@ func runWithArgs(args []string, stdin io.Reader, stdout, stderr io.Writer, opts 
 		return 1
 	}
 
-	// Resolve pve.iso_storage_follow_vm_storage (default ON as of the P5
-	// defaults profile; explicit false opts out) once, in place on cfg,
+	// Resolve pve.iso_storage_follow_vm_storage (default ON; explicit
+	// false opts out) once, in place on cfg,
 	// before any Deps or agent are built downstream. Mutating cfg directly
 	// (not a copy) keeps every consumer — the boot agent, and deps.Config
 	// read by create_vm's HA migration-safety check — looking at the same

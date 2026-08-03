@@ -1030,7 +1030,7 @@ func TestEnsureTemplateVM_CreatePath_NoSourceDeletion(t *testing.T) {
 		t.Error("Nodes.CreateQemuTemplate (MakeTemplate) was not called")
 	}
 	// Verify ownership + cache + sha + provenance marker/name/version tags in
-	// create params (P1.6 — provenance tags are unconditional).
+	// create params (provenance tags are unconditional).
 	wantTag := ownershipTag + ";" + stemcellCacheTag + ";bosh-stemcell-sha-" + sha8 +
 		";" + stemcellMarkerTag + ";" + stemcellNameTagPrefix + "ubuntu-jammy" + ";" + stemcellVersionTagPrefix + "1-0"
 	if tag, _ := createParams["tags"].(string); tag != wantTag {
@@ -1326,7 +1326,7 @@ func TestEnsureTemplateVM_SHATagFormat(t *testing.T) {
 	const fullSHA = "deadbeef11223344deadbeef11223344deadbeef11223344deadbeef11223344"
 	// ownershipTag ("bosh-cpi") and stemcellCacheTag ("bosh-stemcell-cache")
 	// are always prepended; shaTag and provenance marker/name/version tags follow
-	// (P1.6 — provenance tags are unconditional).
+	// (provenance tags are unconditional).
 	const wantTag = ownershipTag + ";" + stemcellCacheTag + ";bosh-stemcell-sha-deadbeef;" +
 		stemcellMarkerTag + ";" + stemcellNameTagPrefix + "ubuntu-focal;" + stemcellVersionTagPrefix + "5-0"
 
@@ -1819,7 +1819,7 @@ func TestEnsureTemplateVM_AssignStillFatal(t *testing.T) {
 // differs from the freshly-derived BuildTemplateNameWithSHA output. This is
 // the dot-vs-dash naming-scheme change (commit 2b01653): keying dedup solely
 // on the mutable display name orphaned identical-disk templates and created
-// duplicates. Cluster-scoped (P1.4): the match comes from Cluster().ListResources,
+// duplicates. Cluster-scoped: the match comes from Cluster().ListResources,
 // not a node-scoped ListQemu scan.
 func TestEnsureTemplateVM_DedupBySHATag_AcrossNameSchemeChange(t *testing.T) {
 	t.Parallel()
@@ -1897,7 +1897,7 @@ func (n *wbTemplateNodes) DeleteQemu(ctx context.Context, node, vmid string, par
 // in the window between our lookup and our freeze, ensureTemplateVM deletes the
 // template it just created and returns the survivor's VMID (and node).
 //
-// Cluster-scoped (P1.4): both the pre-create sha-tag dedup lookup and the
+// Cluster-scoped: both the pre-create sha-tag dedup lookup and the
 // post-freeze reconcile scan go through Cluster().ListResources, as does
 // pve.AllocateWithRetry's NextVMID call in between — so the fixture's call
 // counter now instruments wbClusterForAlloc.listResourcesFn (calls 1-2 empty,
@@ -2133,7 +2133,7 @@ func buildProvDeps(t *testing.T) (Deps, *wbProvCapture) {
 	return deps, captured
 }
 
-// TestAttemptCreateTemplateVM_ProvenanceAlwaysWritten verifies P1.6: provenance
+// TestAttemptCreateTemplateVM_ProvenanceAlwaysWritten verifies that provenance
 // tags (ownership/cache/sha/marker/name/version) and the full notes JSON
 // (name, version, sha8, sha256, kind, cid, created_by, created, director_refs
 // seeded with the creating director) are unconditionally written — there is
@@ -2673,7 +2673,7 @@ func TestHandleCreateStemcell_NoEnvArg_ByteIdentical(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// ensureTemplateAndRegisterRef / director-ref registration tests (P1.3/item 6)
+// ensureTemplateAndRegisterRef / director-ref registration tests
 // ---------------------------------------------------------------------------
 
 // TestEnsureTemplateAndRegisterRef_FreshBuild_RegistersDirectorUUID verifies
@@ -3154,11 +3154,11 @@ func TestEnsureTemplateVM_SHATagDedup_MissingBackingQCow2_BuildsFresh(t *testing
 }
 
 // ---------------------------------------------------------------------------
-// Replication shared-storage gate (P1.5) + fetchFindByPrefix anchoring (P1.4)
+// Replication shared-storage gate + fetchFindByPrefix anchoring
 // ---------------------------------------------------------------------------
 
 // TestHandleCreateStemcell_ReplicateLocal_SharedStorage_SkipsReplication
-// verifies P1.5's replication gate: when stemcell_replicate_local is true but
+// verifies the replication gate: when stemcell_replicate_local is true but
 // the resolved storage classifies as SHARED, create_stemcell never attempts
 // to replicate to the cluster's other nodes — the single cache template is
 // already reachable from every node. Asserted by counting Upload calls: a
