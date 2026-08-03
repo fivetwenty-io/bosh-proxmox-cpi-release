@@ -182,6 +182,7 @@ gosec: ## Run gosec security scanner
 # .gitignore and the manifest script checks, not by rotation); the secret
 # scanner must not fail the build on it.
 TRIVY_SKIP := --skip-files manifests/bosh/creds.yml \
+	--skip-files "manifests/bosh/creds.yml.*" \
 	--skip-files manifests/envs/cpitest/artifacts_ssh \
 	--skip-dirs .e2e-results
 

@@ -79,3 +79,6 @@ bun.lock
 docs/architecture/index.html
 docs/architecture/node_modules/
 node_modules
+
+# Locally built operator CLI (go build ./cmd/pve-cid)
+src/pve_cpi/pve-cid
