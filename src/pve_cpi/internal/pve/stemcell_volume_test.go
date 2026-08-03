@@ -409,186 +409,9 @@ func TestSanitizeStemcellPart_MultibyteUTF8_ProducesAsciiOnly(t *testing.T) {
 
 // ---- TestIsLegacyIntegerStemcellCID ----
 
-// TestIsLegacyIntegerStemcellCID covers the predicate that delete_stemcell
-// uses to treat obsolete integer-only CIDs (e.g. "5042" from the
-// template-clone era) as no-op deletes. Every CID shape the function might
-// encounter at runtime gets a row.
-func TestIsLegacyIntegerStemcellCID(t *testing.T) {
-	t.Parallel()
-	cases := []struct {
-		name string
-		cid  string
-		want bool
-	}{
-		{name: "empty string is not legacy", cid: "", want: false},
-		{name: "single digit", cid: "5", want: true},
-		{name: "small integer", cid: "100", want: true},
-		{name: "typical legacy VMID", cid: "5042", want: true},
-		{name: "large integer fits PVE VMID space", cid: "9999", want: true},
-		{name: "very large integer string still all-digits", cid: "1234567890123456", want: true},
-		{name: "prefixed colon CID (current format)", cid: "local-lvm:import/foo.qcow2", want: false},
-		{name: "prefixed colon CID with only digits before colon", cid: "5042:import/foo.qcow2", want: false},
-		{name: "trailing whitespace breaks all-digit", cid: "5042 ", want: false},
-		{name: "leading whitespace breaks all-digit", cid: " 5042", want: false},
-		{name: "leading plus sign", cid: "+5042", want: false},
-		{name: "leading minus sign", cid: "-5042", want: false},
-		{name: "hex prefix", cid: "0x5042", want: false},
-		{name: "non-ASCII digit", cid: "５０４２", want: false}, // fullwidth digits — not [0-9]
-		{name: "alpha-only", cid: "abc", want: false},
-		{name: "alphanumeric mix", cid: "5042a", want: false},
-		{name: "alphanumeric mix leading alpha", cid: "a5042", want: false},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got := pve.IsLegacyIntegerStemcellCID(tc.cid)
-			if got != tc.want {
-				t.Errorf("IsLegacyIntegerStemcellCID(%q) = %v; want %v", tc.cid, got, tc.want)
-			}
-		})
-	}
-}
-
 // ---- Light-stemcell CID helpers ----
 
-func TestIsLightStemcellCID(t *testing.T) {
-	cases := []struct {
-		name string
-		cid  string
-		want bool
-	}{
-		{name: "empty", cid: "", want: false},
-		{name: "prefix-only", cid: "light:", want: false},
-		{name: "happy path", cid: "light:nfs:import/foo.qcow2", want: true},
-		{name: "double prefix", cid: "light:light:nfs:import/foo.qcow2", want: true},
-		{name: "no prefix", cid: "nfs:import/foo.qcow2", want: false},
-		{name: "wrong prefix case", cid: "Light:nfs:import/foo.qcow2", want: false},
-		{name: "legacy integer", cid: "5042", want: false},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := pve.IsLightStemcellCID(tc.cid); got != tc.want {
-				t.Errorf("IsLightStemcellCID(%q) = %v; want %v", tc.cid, got, tc.want)
-			}
-		})
-	}
-}
-
-func TestStripLightPrefix(t *testing.T) {
-	cases := []struct {
-		name string
-		cid  string
-		want string
-	}{
-		{name: "empty unchanged", cid: "", want: ""},
-		{name: "happy path", cid: "light:nfs:import/foo.qcow2", want: "nfs:import/foo.qcow2"},
-		{name: "double prefix strips one", cid: "light:light:nfs:import/foo.qcow2", want: "light:nfs:import/foo.qcow2"},
-		{name: "no prefix unchanged", cid: "nfs:import/foo.qcow2", want: "nfs:import/foo.qcow2"},
-		{name: "legacy integer unchanged", cid: "5042", want: "5042"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := pve.StripLightPrefix(tc.cid); got != tc.want {
-				t.Errorf("StripLightPrefix(%q) = %q; want %q", tc.cid, got, tc.want)
-			}
-		})
-	}
-}
-
 // ---- Template-stemcell CID helpers ----
-
-// TestBuildTemplateStemcellCID verifies the canonical encoding.
-func TestBuildTemplateStemcellCID(t *testing.T) {
-	t.Parallel()
-	got := pve.BuildTemplateStemcellCID(6042)
-	want := "template:6042"
-	if got != want {
-		t.Errorf("BuildTemplateStemcellCID(6042) = %q; want %q", got, want)
-	}
-}
-
-// TestTemplateStemcellCIDRoundTrip verifies build→parse round-trip.
-func TestTemplateStemcellCIDRoundTrip(t *testing.T) {
-	t.Parallel()
-	cid := pve.BuildTemplateStemcellCID(6042)
-	vmid, err := pve.ParseTemplateStemcellCID(cid)
-	if err != nil {
-		t.Fatalf("ParseTemplateStemcellCID(%q) unexpected error: %v", cid, err)
-	}
-	if vmid != 6042 {
-		t.Errorf("round-trip VMID = %d; want 6042", vmid)
-	}
-}
-
-// TestIsTemplateStemcellCID covers the full predicate matrix from plan/P2 §B1.
-func TestIsTemplateStemcellCID(t *testing.T) {
-	t.Parallel()
-	cases := []struct {
-		name string
-		cid  string
-		want bool
-	}{
-		{name: "happy path", cid: "template:6042", want: true},
-		{name: "min valid VMID", cid: "template:1", want: true},
-		{name: "large VMID", cid: "template:999999999", want: true},
-		{name: "empty string", cid: "", want: false},
-		{name: "prefix only (empty remainder)", cid: "template:", want: false},
-		{name: "non-digit remainder", cid: "template:abc", want: false},
-		{name: "decimal in remainder", cid: "template:6.5", want: false},
-		{name: "negative VMID", cid: "template:-1", want: false},
-		{name: "nested prefix", cid: "template:template:6042", want: false},
-		{name: "light CID not template", cid: "light:nfs:import/x", want: false},
-		{name: "legacy integer no prefix", cid: "5042", want: false},
-		{name: "plain volume CID", cid: "local:import/x", want: false},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := pve.IsTemplateStemcellCID(tc.cid); got != tc.want {
-				t.Errorf("IsTemplateStemcellCID(%q) = %v; want %v", tc.cid, got, tc.want)
-			}
-		})
-	}
-}
-
-// TestParseTemplateStemcellCID covers valid and all rejection cases from plan/P2 §B1.
-func TestParseTemplateStemcellCID(t *testing.T) {
-	t.Parallel()
-	cases := []struct {
-		name    string
-		cid     string
-		wantID  int64
-		wantErr bool
-	}{
-		{name: "happy path", cid: "template:6042", wantID: 6042},
-		{name: "min positive VMID", cid: "template:1", wantID: 1},
-		{name: "large VMID", cid: "template:8999", wantID: 8999},
-		{name: "empty string", cid: "", wantErr: true},
-		{name: "prefix only", cid: "template:", wantErr: true},
-		{name: "non-digit remainder", cid: "template:abc", wantErr: true},
-		{name: "decimal", cid: "template:6.5", wantErr: true},
-		{name: "negative VMID", cid: "template:-1", wantErr: true},
-		{name: "nested prefix", cid: "template:template:6042", wantErr: true},
-		{name: "light CID", cid: "light:nfs:import/x", wantErr: true},
-		{name: "legacy integer", cid: "5042", wantErr: true},
-		{name: "plain volume CID", cid: "local:import/x", wantErr: true},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			vmid, err := pve.ParseTemplateStemcellCID(tc.cid)
-			if tc.wantErr {
-				if err == nil {
-					t.Errorf("ParseTemplateStemcellCID(%q) = %d, nil; want error", tc.cid, vmid)
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("ParseTemplateStemcellCID(%q) unexpected error: %v", tc.cid, err)
-			}
-			if vmid != tc.wantID {
-				t.Errorf("ParseTemplateStemcellCID(%q) = %d; want %d", tc.cid, vmid, tc.wantID)
-			}
-		})
-	}
-}
 
 // TestParseStemcellCID_RejectsTemplateCID is a regression assertion: the old
 // ParseStemcellCID must return an error for "template:6042" so that template
@@ -598,5 +421,141 @@ func TestParseStemcellCID_RejectsTemplateCID(t *testing.T) {
 	_, _, err := pve.ParseStemcellCID("template:6042")
 	if err == nil {
 		t.Fatal("ParseStemcellCID(\"template:6042\") = nil error; want rejection so template CIDs are not misrouted as volume CIDs")
+	}
+}
+
+// ---- Path-identity stemcell CIDs ----
+
+func TestBuildLightStemcellCID(t *testing.T) {
+	t.Parallel()
+	got := pve.BuildLightStemcellCID("nfs-stemcells", "bosh-stemcell-ubuntu-1.0-deadbeef.qcow2")
+	want := ":light:nfs-stemcells:import/bosh-stemcell-ubuntu-1.0-deadbeef.qcow2"
+	if got != want {
+		t.Errorf("BuildLightStemcellCID = %q; want %q", got, want)
+	}
+}
+
+func TestBuildHeavyStemcellCID(t *testing.T) {
+	t.Parallel()
+	got := pve.BuildHeavyStemcellCID("local-lvm", "bosh-stemcell-ubuntu-1.0-deadbeef.qcow2")
+	want := ":heavy:local-lvm:import/bosh-stemcell-ubuntu-1.0-deadbeef.qcow2"
+	if got != want {
+		t.Errorf("BuildHeavyStemcellCID = %q; want %q", got, want)
+	}
+}
+
+func TestIsStemcellPathCID(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		cid  string
+		want bool
+	}{
+		{":light:nfs:import/foo.qcow2", true},
+		{":heavy:nfs:import/foo.qcow2", true},
+		{":garbage", true}, // predicate only checks the discriminator
+		{"light:nfs:import/foo.qcow2", false},
+		{"template:6042", false},
+		{"nfs:import/foo.qcow2", false},
+		{"5042", false},
+		{"", false},
+	}
+	for _, tc := range cases {
+		if got := pve.IsStemcellPathCID(tc.cid); got != tc.want {
+			t.Errorf("IsStemcellPathCID(%q) = %v; want %v", tc.cid, got, tc.want)
+		}
+	}
+}
+
+func TestParseStemcellPathCID(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name        string
+		cid         string
+		wantKind    pve.StemcellKind
+		wantStorage string
+		wantVolPath string
+		wantErr     string
+	}{
+		{
+			name:        "valid light",
+			cid:         ":light:nfs-stemcells:import/bosh-stemcell-ubuntu-1.0-deadbeef.qcow2",
+			wantKind:    pve.StemcellKindLight,
+			wantStorage: "nfs-stemcells",
+			wantVolPath: "import/bosh-stemcell-ubuntu-1.0-deadbeef.qcow2",
+		},
+		{
+			name:        "valid heavy",
+			cid:         ":heavy:local-lvm:import/foo.qcow2",
+			wantKind:    pve.StemcellKindHeavy,
+			wantStorage: "local-lvm",
+			wantVolPath: "import/foo.qcow2",
+		},
+		{
+			name:        "storage pool literally named light",
+			cid:         ":light:light:import/foo.qcow2",
+			wantKind:    pve.StemcellKindLight,
+			wantStorage: "light",
+			wantVolPath: "import/foo.qcow2",
+		},
+		{
+			name:        "storage pool literally named heavy under heavy kind",
+			cid:         ":heavy:heavy:import/foo.qcow2",
+			wantKind:    pve.StemcellKindHeavy,
+			wantStorage: "heavy",
+			wantVolPath: "import/foo.qcow2",
+		},
+		{name: "empty", cid: "", wantErr: "empty CID"},
+		{name: "retired light prefix without leading colon", cid: "light:nfs:import/foo.qcow2", wantErr: "missing leading ':'"},
+		{name: "retired template CID", cid: "template:6042", wantErr: "missing leading ':'"},
+		{name: "bare volid form", cid: "nfs:import/foo.qcow2", wantErr: "missing leading ':'"},
+		{name: "retired integer CID", cid: "5042", wantErr: "missing leading ':'"},
+		{name: "unknown kind", cid: ":medium:nfs:import/foo.qcow2", wantErr: "unknown kind"},
+		{name: "bare light prefix no payload", cid: ":light:", wantErr: "payload invalid"},
+		{name: "doubled prefix", cid: ":light::heavy:nfs:import/foo.qcow2", wantErr: "empty storage segment"},
+		{name: "payload missing import path", cid: ":light:nfs:iso/foo.iso", wantErr: "does not start with \"import/\""},
+		{name: "payload missing colon", cid: ":heavy:justastring", wantErr: "payload invalid"},
+		{name: "uppercase kind rejected", cid: ":Light:nfs:import/foo.qcow2", wantErr: "unknown kind"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			kind, storage, volPath, err := pve.ParseStemcellPathCID(tc.cid)
+			if tc.wantErr != "" {
+				if err == nil {
+					t.Fatalf("ParseStemcellPathCID(%q) = (%q, %q, %q, nil); want error containing %q", tc.cid, kind, storage, volPath, tc.wantErr)
+				}
+				if !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("ParseStemcellPathCID(%q) error %q; want it to contain %q", tc.cid, err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ParseStemcellPathCID(%q) unexpected error: %v", tc.cid, err)
+			}
+			if kind != tc.wantKind || storage != tc.wantStorage || volPath != tc.wantVolPath {
+				t.Errorf("ParseStemcellPathCID(%q) = (%q, %q, %q); want (%q, %q, %q)",
+					tc.cid, kind, storage, volPath, tc.wantKind, tc.wantStorage, tc.wantVolPath)
+			}
+		})
+	}
+}
+
+func TestParseStemcellPathCID_RoundTrip(t *testing.T) {
+	t.Parallel()
+	filename := pve.BuildStemcellFilename("ubuntu-jammy", "1.719", "cafebabe00112233")
+	for _, build := range []struct {
+		kind pve.StemcellKind
+		cid  string
+	}{
+		{pve.StemcellKindLight, pve.BuildLightStemcellCID("nfs-a", filename)},
+		{pve.StemcellKindHeavy, pve.BuildHeavyStemcellCID("nfs-a", filename)},
+	} {
+		kind, storage, volPath, err := pve.ParseStemcellPathCID(build.cid)
+		if err != nil {
+			t.Fatalf("round-trip %q: %v", build.cid, err)
+		}
+		if kind != build.kind || storage != "nfs-a" || volPath != "import/"+filename {
+			t.Errorf("round-trip %q = (%q, %q, %q)", build.cid, kind, storage, volPath)
+		}
 	}
 }

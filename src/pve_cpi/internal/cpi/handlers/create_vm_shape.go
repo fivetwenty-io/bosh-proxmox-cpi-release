@@ -246,7 +246,7 @@ func resolveVMShapeStorage(cfg *config.CPIConfig, parsed *createVMParsedArgs, ti
 	} else {
 		vmStorage = cfg.VMStorage
 		if vmStorage == "" {
-			vmStorage = parsed.stemcellStor
+			vmStorage = parsed.stemcellStorage
 		}
 	}
 

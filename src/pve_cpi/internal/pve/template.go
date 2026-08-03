@@ -5,9 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 
+	sdkcluster "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cluster"
 	sdknodes "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/nodes"
 
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
@@ -205,80 +207,6 @@ func MakeTemplate(ctx context.Context, c Client, node string, vmid int64) (upid 
 	return upid, nil
 }
 
-// FindTemplateByName returns the VMID of a template VM whose Name exactly
-// matches name on node. It calls ListQemu and scans all results.
-//
-// Match criteria:
-//   - The VM Name field equals name (exact, case-sensitive).
-//   - If the Template field is present in the response, it must be true.
-//     When Template is absent (PVE omits it for non-templates), the entry is
-//     skipped — only items where Template is explicitly true are matched.
-//     This avoids false positives from regular VMs whose name happens to match
-//     a template name before the freeze task completes.
-//
-// On multiple matches (e.g. two templates with identical names due to manual
-// PVE manipulation), the entry with the lowest VMID is returned. The
-// ListQemuResponse order is not guaranteed, so all entries are scanned.
-//
-// Return values:
-//   - (vmid, true, nil)  — exactly one match found; vmid is the lowest-VMID match.
-//   - (0, false, nil)    — no match; nil list; or all elements failed to parse.
-//   - (0, false, err)    — ListQemu API error; err is wrapped with context.
-func FindTemplateByName(ctx context.Context, c Client, node, name string) (vmid int64, found bool, err error) {
-	if ctx == nil {
-		return 0, false, cpierrors.Cloud("FindTemplateByName: ctx must not be nil")
-	}
-	if c == nil {
-		return 0, false, cpierrors.Cloud("FindTemplateByName: client must not be nil")
-	}
-	if node == "" {
-		return 0, false, cpierrors.Cloud("FindTemplateByName: node must not be empty")
-	}
-	if name == "" {
-		return 0, false, cpierrors.Cloud("FindTemplateByName: name must not be empty")
-	}
-
-	resp, err := c.Nodes().ListQemu(ctx, node, nil)
-	if err != nil {
-		return 0, false, cpierrors.Wrap(err, fmt.Sprintf("FindTemplateByName: node %s name %q", node, name))
-	}
-	if resp == nil || len(*resp) == 0 {
-		return 0, false, nil
-	}
-
-	var bestVMID int64
-	for i, raw := range *resp {
-		var item qemuListItem
-		if jsonErr := json.Unmarshal(raw, &item); jsonErr != nil {
-			// Malformed element — skip; do not fail the whole scan. Logged at
-			// Debug so schema drift leaves a diagnostic trail instead of
-			// silently reporting "template not found" a layer up.
-			log.FromContext(ctx).Debug("template: skipping malformed qemu list entry",
-				log.String("node", node),
-				log.Int("index", i),
-				log.Err(jsonErr),
-			)
-			continue
-		}
-		// Only match confirmed templates.
-		if item.Template == nil || !*item.Template {
-			continue
-		}
-		if item.Name == nil || *item.Name != name {
-			continue
-		}
-		// Match found. Keep the lowest VMID for determinism on multi-match.
-		if bestVMID == 0 || item.Vmid < bestVMID {
-			bestVMID = item.Vmid
-		}
-	}
-
-	if bestVMID == 0 {
-		return 0, false, nil
-	}
-	return bestVMID, true, nil
-}
-
 // AssignVMToPool adds vmid to the named PVE resource pool by delegating to
 // c.Pools().AddVM. Returns nil when poolID is empty (caller skips the call).
 //
@@ -331,94 +259,6 @@ func splitPVETags(tags string) []string {
 		}
 	}
 	return out
-}
-
-// FindTemplateBySHATag returns the VMID of a template VM carrying the tag
-// "bosh-stemcell-sha-<sha8>". It calls ListQemu and scans all results.
-//
-// Tag matching uses token-exact comparison: the Tags field is split on PVE's
-// tag separator (";", with "," normalized), and the wanted tag must appear as
-// a whole token. Naive substring matching is explicitly avoided to prevent
-// prefix collisions (e.g. sha8 "abc12345" must NOT match a tag token
-// "bosh-stemcell-sha-abc123456").
-//
-// Match criteria:
-//   - The VM has Template == true.
-//   - The Tags field contains "bosh-stemcell-sha-<sha8>" as an exact token.
-//
-// On multiple matches (should not occur in practice — each stemcell has a
-// unique sha8), the entry with the lowest VMID is returned.
-//
-// Return values:
-//   - (vmid, true, nil)  — match found.
-//   - (0, false, nil)    — no match; nil/empty list; sha8 empty string.
-//   - (0, false, err)    — ListQemu API error; err is wrapped with context.
-func FindTemplateBySHATag(ctx context.Context, c Client, node, sha8 string) (vmid int64, found bool, err error) {
-	if ctx == nil {
-		return 0, false, cpierrors.Cloud("FindTemplateBySHATag: ctx must not be nil")
-	}
-	if c == nil {
-		return 0, false, cpierrors.Cloud("FindTemplateBySHATag: client must not be nil")
-	}
-	if node == "" {
-		return 0, false, cpierrors.Cloud("FindTemplateBySHATag: node must not be empty")
-	}
-	if sha8 == "" {
-		return 0, false, nil
-	}
-
-	wantedTag := "bosh-stemcell-sha-" + sha8
-
-	resp, err := c.Nodes().ListQemu(ctx, node, nil)
-	if err != nil {
-		return 0, false, cpierrors.Wrap(err, fmt.Sprintf("FindTemplateBySHATag: node %s sha8 %q", node, sha8))
-	}
-	if resp == nil || len(*resp) == 0 {
-		return 0, false, nil
-	}
-
-	var bestVMID int64
-	for i, raw := range *resp {
-		var item qemuListItem
-		if jsonErr := json.Unmarshal(raw, &item); jsonErr != nil {
-			// Malformed element — skip. Logged at Debug so schema drift
-			// leaves a diagnostic trail instead of silently reporting
-			// "template not found" a layer up.
-			log.FromContext(ctx).Debug("template: skipping malformed qemu list entry",
-				log.String("node", node),
-				log.Int("index", i),
-				log.Err(jsonErr),
-			)
-			continue
-		}
-		// Only match confirmed templates.
-		if item.Template == nil || !*item.Template {
-			continue
-		}
-		if item.Tags == nil {
-			continue
-		}
-		tokens := splitPVETags(*item.Tags)
-		matched := false
-		for _, tok := range tokens {
-			if tok == wantedTag {
-				matched = true
-				break
-			}
-		}
-		if !matched {
-			continue
-		}
-		// Match found. Keep the lowest VMID for determinism on multi-match.
-		if bestVMID == 0 || item.Vmid < bestVMID {
-			bestVMID = item.Vmid
-		}
-	}
-
-	if bestVMID == 0 {
-		return 0, false, nil
-	}
-	return bestVMID, true, nil
 }
 
 // replicaNodeTag returns the canonical per-node replica tag for node.
@@ -531,4 +371,223 @@ func ResolveTemplateVMIDForNode(ctx context.Context, c Client, node, sha8 string
 		return 0, false, nil
 	}
 	return int(bestVMID), true, nil
+}
+
+// ---- Cluster-scoped template cache lookup ----
+//
+// A node-scoped ListQemu lookup would mean create-side dedup on node A and a
+// destroy-side sweep initiated from node B see different worlds. The
+// functions below scan Cluster().ListResources instead, so create-side lookup
+// and destroy-side sweep always agree on which cache templates exist,
+// clusterwide, regardless of which node the caller is talking to.
+
+// clusterResourceTypeQemu is the "type" discriminator for QEMU guest rows in
+// a GET /cluster/resources response (as opposed to "lxc", "node", "storage",
+// "pool", "sdn", etc.).
+const clusterResourceTypeQemu = "qemu"
+
+// TemplateRef identifies a stemcell-cache template VM discovered by a
+// cluster-scoped scan (FindTemplatesBySHATagCluster / FindTemplateByNameCluster).
+type TemplateRef struct {
+	// VMID is the template's PVE VM ID.
+	VMID int64
+	// Node is the PVE node currently hosting the template.
+	Node string
+	// Name is the template's PVE VM name.
+	Name string
+	// Tags is the raw (semicolon-delimited) PVE tags string, returned as-is
+	// so callers needing further tag inspection (e.g. per-node replica tags)
+	// do not have to re-fetch the resource list.
+	Tags string
+}
+
+// IsReplica reports whether this template carries a per-node replica tag
+// ("bosh-stemcell-node-<node>"). Replicas are clone-speed caches: they never
+// hold director references (their provenance ref set is a fossil of their
+// creation), so ref-anchor selection — the create-side dedup register and
+// delete_stemcell's deregister target — must skip them. Anchoring on a
+// replica would consult the wrong ref set and can either destroy a template
+// other directors still reference or turn delete_stemcell into a no-op.
+func (r TemplateRef) IsReplica() bool {
+	for _, tok := range splitPVETags(r.Tags) {
+		if strings.HasPrefix(tok, "bosh-stemcell-node-") {
+			return true
+		}
+	}
+	return false
+}
+
+// clusterQemuResourceItem is the subset of fields needed from each element of
+// a GET /cluster/resources response to identify stemcell-cache template VMs.
+type clusterQemuResourceItem struct {
+	// Type discriminates resource kind; only clusterResourceTypeQemu ("qemu")
+	// rows are VM guests — "lxc", "node", "storage" etc. are skipped.
+	Type string `json:"type"`
+	// Vmid is the unique VM ID; 0 for non-VM resource rows.
+	Vmid int64 `json:"vmid"`
+	// Node is the hosting PVE node.
+	Node string `json:"node"`
+	// Name is the VM (host)name; absent for unnamed VMs.
+	Name string `json:"name"`
+	// Tags is the semicolon-delimited PVE tag string; absent when no tags set.
+	Tags string `json:"tags"`
+	// Template is true when the VM has been frozen as a PVE template. Decoded
+	// through pveBool for the same reason as qemuListItem.Template above: PVE
+	// serialises this boolean as 1/0, not true/false.
+	Template *pveBool `json:"template,omitempty"`
+}
+
+// listClusterQemuTemplates fetches the full cluster resource list and returns
+// the decoded, type/template-filtered QEMU template rows. Shared by
+// FindTemplatesBySHATagCluster and FindTemplateByNameCluster so both apply
+// identical filtering (type=="qemu", template==true) before their respective
+// name/tag match.
+func listClusterQemuTemplates(ctx context.Context, c Client, label string) ([]clusterQemuResourceItem, error) {
+	resp, err := c.Cluster().ListResources(ctx, &sdkcluster.ListResourcesParams{})
+	if err != nil {
+		return nil, cpierrors.Wrap(err, label)
+	}
+	if resp == nil || len(*resp) == 0 {
+		return nil, nil
+	}
+
+	out := make([]clusterQemuResourceItem, 0, len(*resp))
+	for i, raw := range *resp {
+		var item clusterQemuResourceItem
+		if jsonErr := json.Unmarshal(raw, &item); jsonErr != nil {
+			// Malformed element — skip; do not fail the whole scan. Logged at
+			// Debug so schema drift leaves a diagnostic trail instead of
+			// silently reporting "template not found" a layer up.
+			log.FromContext(ctx).Debug("template: skipping malformed cluster resource entry",
+				log.Int("index", i),
+				log.Err(jsonErr),
+			)
+			continue
+		}
+		if item.Type != clusterResourceTypeQemu || item.Vmid == 0 {
+			// Excludes lxc containers, nodes, storages, pools, and any other
+			// non-VM resource row.
+			continue
+		}
+		if item.Template == nil || !*item.Template {
+			// Excludes running VMs (not yet — or never — frozen as templates).
+			continue
+		}
+		out = append(out, item)
+	}
+	return out, nil
+}
+
+// FindTemplatesBySHATagCluster scans the whole cluster (not a single node)
+// for template VMs carrying the tag "bosh-stemcell-sha-<sha8>" as an exact
+// tag token. Returns every match — a cache with per-node replicas can have
+// more than one — sorted by VMID ascending for deterministic output.
+//
+// Input validation:
+//   - ctx nil → error
+//   - c nil → error
+//   - sha8 empty → (nil, nil) — not an error; callers that have not yet
+//     resolved a sha8 simply see no matches.
+//
+// Return values:
+//   - ([]TemplateRef, nil) — zero or more matches (nil slice means zero).
+//   - (nil, err) — Cluster().ListResources API error, wrapped with context.
+func FindTemplatesBySHATagCluster(ctx context.Context, c Client, sha8 string) ([]TemplateRef, error) {
+	if ctx == nil {
+		return nil, cpierrors.Cloud("FindTemplatesBySHATagCluster: ctx must not be nil")
+	}
+	if c == nil {
+		return nil, cpierrors.Cloud("FindTemplatesBySHATagCluster: client must not be nil")
+	}
+	if sha8 == "" {
+		return nil, nil
+	}
+
+	wantedTag := "bosh-stemcell-sha-" + sha8
+
+	items, err := listClusterQemuTemplates(ctx, c, fmt.Sprintf("FindTemplatesBySHATagCluster: sha8 %q", sha8))
+	if err != nil {
+		return nil, err
+	}
+
+	var out []TemplateRef
+	for _, item := range items {
+		matched := false
+		for _, tok := range splitPVETags(item.Tags) {
+			if tok == wantedTag {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			continue
+		}
+		out = append(out, TemplateRef{VMID: item.Vmid, Node: item.Node, Name: item.Name, Tags: item.Tags})
+	}
+
+	sort.Slice(out, func(i, j int) bool { return out[i].VMID < out[j].VMID })
+	return out, nil
+}
+
+// FindTemplateByNameCluster scans the whole cluster for template VMs whose
+// Name exactly matches name. Returns every match (should be unique in
+// practice, but manual PVE manipulation can produce duplicates), sorted by
+// VMID ascending for deterministic output.
+//
+// Input validation:
+//   - ctx nil → error
+//   - c nil → error
+//   - name empty → error
+//
+// Return values:
+//   - ([]TemplateRef, nil) — zero or more matches (nil slice means zero).
+//   - (nil, err) — Cluster().ListResources API error, wrapped with context.
+func FindTemplateByNameCluster(ctx context.Context, c Client, name string) ([]TemplateRef, error) {
+	if ctx == nil {
+		return nil, cpierrors.Cloud("FindTemplateByNameCluster: ctx must not be nil")
+	}
+	if c == nil {
+		return nil, cpierrors.Cloud("FindTemplateByNameCluster: client must not be nil")
+	}
+	if name == "" {
+		return nil, cpierrors.Cloud("FindTemplateByNameCluster: name must not be empty")
+	}
+
+	items, err := listClusterQemuTemplates(ctx, c, fmt.Sprintf("FindTemplateByNameCluster: name %q", name))
+	if err != nil {
+		return nil, err
+	}
+
+	var out []TemplateRef
+	for _, item := range items {
+		if item.Name != name {
+			continue
+		}
+		out = append(out, TemplateRef{VMID: item.Vmid, Node: item.Node, Name: item.Name, Tags: item.Tags})
+	}
+
+	sort.Slice(out, func(i, j int) bool { return out[i].VMID < out[j].VMID })
+	return out, nil
+}
+
+// BuildTemplateNameWithSHA returns the canonical PVE VM name for a
+// stemcell-cache template, mirroring BuildTemplateName but appending
+// "-<sha8>" AFTER length truncation — the same discipline
+// BuildStemcellFilename applies to the qcow2 filename. Two stemcells whose
+// sanitized name+version collide at the maxStemcellFilenameLen truncation
+// boundary get distinct template names because the sha8 is appended after
+// the cap, not folded into the truncated portion.
+//
+// sha8 is passed through dnsSafeStemcellPart (same DNS-safe sanitizer
+// BuildTemplateName uses) so an unexpected non-hex value cannot introduce PVE
+// name-invalid characters. An empty or all-invalid sha8 falls back to the
+// same "00000000" placeholder BuildStemcellFilename uses for an unknown
+// digest, keeping the two conventions aligned.
+func BuildTemplateNameWithSHA(name, version, sha8 string) string {
+	base := BuildTemplateName(name, version)
+	safeSHA := dnsSafeStemcellPart(sha8)
+	if safeSHA == "" {
+		safeSHA = "00000000"
+	}
+	return base + "-" + safeSHA
 }

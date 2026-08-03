@@ -514,7 +514,7 @@ func TestReplicateStemcellToNodes_Disabled(t *testing.T) {
 	// does not check the flag — the flag guard lives in HandleCreateStemcell.
 	// Calling it with only the primary node means no replicas should be attempted.
 	replicateStemcellToNodes(context.Background(), deps, "pve1", "local", "test.qcow2",
-		sha256hex, []string{"pve1"}, "/dev/null", "", cp, "")
+		sha256hex, []string{"pve1"}, "/dev/null", "", ":heavy:local:import/test.qcow2", "test-director", cp, "")
 
 	// Primary node must never receive an upload: given only the primary in the
 	// node list, replicateStemcellToNodes has no other node to replicate to.
@@ -634,7 +634,7 @@ func TestReplicateStemcellToNodes_Enabled_TwoNodes(t *testing.T) {
 	clusterNodes := []string{"pve1", "pve2", "pve3"}
 
 	replicateStemcellToNodes(context.Background(), deps, "pve1", "local", "bosh-stemcell.qcow2",
-		sha256hex, clusterNodes, srcPath, "", cp, "")
+		sha256hex, clusterNodes, srcPath, "", ":heavy:local:import/test.qcow2", "test-director", cp, "")
 
 	// pve1 is primary — should NOT receive a replica upload.
 	if uploadedNodes["pve1"] != 0 {
@@ -768,7 +768,7 @@ func TestReplicateStemcellToNodes_PartialFailure(t *testing.T) {
 	// Calling replicateStemcellToNodes must not panic or return an error.
 	// It is void (best-effort); errors are logged as warnings.
 	replicateStemcellToNodes(context.Background(), deps, "pve1", "local", "bosh-stemcell.qcow2",
-		sha256hex, clusterNodes, srcPath, "", cp, "")
+		sha256hex, clusterNodes, srcPath, "", ":heavy:local:import/test.qcow2", "test-director", cp, "")
 
 	// pve1 = primary, no upload.
 	if uploadedNodes["pve1"] != 0 {
@@ -981,7 +981,7 @@ func TestReplicateStemcellToNodes_Concurrency_AllNodesAttempted(t *testing.T) {
 	cp := stemcellCloudProps{Name: "ubuntu-jammy", Version: "1.0"}
 
 	replicateStemcellToNodes(context.Background(), deps, "pve1", "local", "bosh-stemcell.qcow2",
-		sha256hex, targetNodes, srcPath, "", cp, "")
+		sha256hex, targetNodes, srcPath, "", ":heavy:local:import/test.qcow2", "test-director", cp, "")
 
 	// All non-primary nodes must have received an upload.
 	for _, n := range nonPrimary {
@@ -1068,7 +1068,7 @@ func TestReplicateStemcellToNodes_Concurrency_Serial(t *testing.T) {
 	cp := stemcellCloudProps{Name: "ubuntu-jammy", Version: "1.0"}
 
 	replicateStemcellToNodes(context.Background(), deps, "pve1", "local", "bosh-stemcell.qcow2",
-		sha256hex, targetNodes, srcPath, "", cp, "")
+		sha256hex, targetNodes, srcPath, "", ":heavy:local:import/test.qcow2", "test-director", cp, "")
 
 	// Both non-primary nodes must have been attempted.
 	for _, n := range []string{"pve2", "pve3"} {
@@ -1141,7 +1141,7 @@ func TestReplicateStemcellToNodes_Concurrency_NonFatal(t *testing.T) {
 
 	// Must not panic or return error — best-effort.
 	replicateStemcellToNodes(context.Background(), deps, "pve1", "local", "bosh-stemcell.qcow2",
-		sha256hex, targetNodes, srcPath, "", cp, "")
+		sha256hex, targetNodes, srcPath, "", ":heavy:local:import/test.qcow2", "test-director", cp, "")
 
 	// pve2 upload failed → no VM for pve2.
 	if _, ok := vmCreated.Load("pve2"); ok {
@@ -1234,7 +1234,7 @@ func TestReplicateStemcellToNodes_Concurrency_IdempotentSkip(t *testing.T) {
 	cp := stemcellCloudProps{Name: "ubuntu-jammy", Version: "1.0"}
 
 	replicateStemcellToNodes(context.Background(), deps, "pve1", "local", "bosh-stemcell.qcow2",
-		sha256hex, targetNodes, srcPath, "", cp, "")
+		sha256hex, targetNodes, srcPath, "", ":heavy:local:import/test.qcow2", "test-director", cp, "")
 
 	// pve2 already had a replica — no upload, no VM create.
 	if _, ok := uploadedNodes.Load("pve2"); ok {
@@ -1329,7 +1329,7 @@ func TestReplicateStemcellToNodes_AdoptsRacingReplica(t *testing.T) {
 	cp := stemcellCloudProps{Name: "ubuntu-jammy", Version: "1.0"}
 
 	replicateStemcellToNodes(context.Background(), deps, "pve1", "local", "bosh-stemcell.qcow2",
-		sha256hex, targetNodes, srcPath, "", cp, "")
+		sha256hex, targetNodes, srcPath, "", ":heavy:local:import/test.qcow2", "test-director", cp, "")
 
 	// pve2: adopted the racing winner — no upload, no VM create.
 	if _, ok := uploadedNodes.Load("pve2"); ok {
@@ -1407,7 +1407,7 @@ func TestReplicateStemcellToNodes_AdoptDisabled_BuildsReplica(t *testing.T) {
 	cp := stemcellCloudProps{Name: "ubuntu-jammy", Version: "1.0"}
 
 	replicateStemcellToNodes(context.Background(), deps, "pve1", "local", "bosh-stemcell.qcow2",
-		sha256hex, targetNodes, srcPath, "", cp, "")
+		sha256hex, targetNodes, srcPath, "", ":heavy:local:import/test.qcow2", "test-director", cp, "")
 
 	// adopt off: pve2 builds its own replica (upload + create), byte-identical.
 	if _, ok := uploadedNodes.Load("pve2"); !ok {
@@ -1585,7 +1585,7 @@ func TestReplicateStemcellToNodes_PanicRecovered(t *testing.T) {
 	// exactly why this test's mere ability to reach the assertions below is
 	// itself part of the regression guard.
 	replicateStemcellToNodes(context.Background(), deps, "pve1", "local", "bosh-stemcell.qcow2",
-		sha256hex, clusterNodes, srcPath, "", cp, "")
+		sha256hex, clusterNodes, srcPath, "", ":heavy:local:import/test.qcow2", "test-director", cp, "")
 
 	mu.Lock()
 	defer mu.Unlock()

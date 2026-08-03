@@ -415,20 +415,14 @@ func TestCreateStemcell_HappyPath_NewFlow(t *testing.T) {
 		t.Fatalf("result is %T; want string", result)
 	}
 
-	// New flow: handler builds a PVE template VM and returns "template:<vmid>".
-	if !pve.IsTemplateStemcellCID(cidStr) {
-		t.Errorf("CID = %q; want template:<vmid> format", cidStr)
-	}
-	vmid, parseErr := pve.ParseTemplateStemcellCID(cidStr)
-	if parseErr != nil {
-		t.Fatalf("ParseTemplateStemcellCID(%q) failed: %v", cidStr, parseErr)
-	}
-	if vmid <= 0 {
-		t.Errorf("parsed vmid = %d; want positive VMID", vmid)
+	// New flow: the tarball-upload path is always CPI-owned bytes → :heavy:.
+	wantFilename := "bosh-stemcell-ubuntu-jammy-1.234-" + sha8 + ".qcow2"
+	wantCID := pve.BuildHeavyStemcellCID("local", wantFilename)
+	if cidStr != wantCID {
+		t.Errorf("CID = %q; want %q", cidStr, wantCID)
 	}
 
 	// Upload still happens: qcow2 is staged to storage before template creation.
-	wantFilename := "bosh-stemcell-ubuntu-jammy-1.234-" + sha8 + ".qcow2"
 	if len(uploads) != 1 {
 		t.Fatalf("expected 1 Upload call, got %d: %v", len(uploads), uploads)
 	}
@@ -495,10 +489,10 @@ func TestCreateStemcell_BoshCPITag(t *testing.T) {
 }
 
 // TestCreateStemcell_Dedup_SameFilename verifies that when the qcow2 volume
-// already exists on storage AND a matching template VM already exists,
-// Upload is not called and the handler returns the existing template CID.
-// Idempotency is now at the template level: the same name+version always
-// maps to the same template VMID via FindTemplateByName.
+// already exists on storage AND a matching cache template already exists
+// (cluster-scoped sha-tag lookup, P1.4), Upload is not called and the handler
+// returns the same :heavy: CID the qcow2 filename determines — CID identity
+// no longer depends on which VMID backs the cache template.
 func TestCreateStemcell_Dedup_SameFilename(t *testing.T) {
 	t.Parallel()
 
@@ -508,11 +502,10 @@ func TestCreateStemcell_Dedup_SameFilename(t *testing.T) {
 	wantFilename := "bosh-stemcell-ubuntu-jammy-1.234-" + sha8 + ".qcow2"
 	existingVolid := "local:import/" + wantFilename
 
-	// existingVMID is the VMID of the pre-existing template. FindTemplateByName
-	// will return this so ensureTemplateVM reuses it without creating a new VM.
+	// existingVMID is the VMID of the pre-existing cache template, discovered
+	// via the cluster-scoped sha-tag lookup (not ListQemu).
 	const existingVMID = int64(6042)
-	templateName := pve.BuildTemplateName("ubuntu-jammy", "1.234")
-	isTemplate := true
+	templateName := pve.BuildTemplateNameWithSHA("ubuntu-jammy", "1.234", sha8)
 
 	var uploadCalls []struct{}
 	storageSvc := &stemcellMockStorage{
@@ -523,26 +516,25 @@ func TestCreateStemcell_Dedup_SameFilename(t *testing.T) {
 	}
 
 	// ListStorageContent returns the matching qcow2 volume (dedup hit).
-	// ListQemu returns the matching template (FindTemplateByName hit).
 	nodesSvc := &stemcellMockNodes{
 		listStorageFn: func(_ context.Context, _, _ string, _ *sdknodes.ListStorageContentParams) (*sdknodes.ListStorageContentResponse, error) {
 			entry, _ := json.Marshal(map[string]string{"volid": existingVolid})
 			resp := sdknodes.ListStorageContentResponse{entry}
 			return &resp, nil
 		},
-		listQemuFn: func(_ context.Context, _ string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
-			name := templateName
-			item, _ := json.Marshal(map[string]any{
-				"vmid":     existingVMID,
-				"name":     name,
-				"template": isTemplate,
-			})
-			resp := sdknodes.ListQemuResponse{item}
-			return &resp, nil
+	}
+	// Cluster().ListResources returns the matching cache template
+	// (pve.FindTemplatesBySHATagCluster hit).
+	clusterSvc := &stemcellMockCluster{
+		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+			items := sdkcluster.ListResourcesResponse{
+				clusterTemplateItem(existingVMID, vmNode, templateName, shaTag(sha8)),
+			}
+			return &items, nil
 		},
 	}
 
-	client := buildStemcellClient(&stemcellMockQEMU{}, nodesSvc, &stemcellMockTasks{}, &stemcellMockCluster{})
+	client := buildStemcellClient(&stemcellMockQEMU{}, nodesSvc, &stemcellMockTasks{}, clusterSvc)
 	client.storageSvc = storageSvc
 
 	deps := makeDeps(client)
@@ -551,7 +543,7 @@ func TestCreateStemcell_Dedup_SameFilename(t *testing.T) {
 	cp := map[string]any{"name": "ubuntu-jammy", "version": "1.234", "disk_format": "qcow2"}
 	args := []json.RawMessage{marshalArg(t, imgPath), marshalArg(t, cp)}
 
-	result, err := h.Handle(context.Background(), args, jsonrpc.Context{})
+	result, err := h.Handle(context.Background(), args, jsonrpc.Context{DirectorUUID: "dir-a"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -559,16 +551,11 @@ func TestCreateStemcell_Dedup_SameFilename(t *testing.T) {
 	if !ok {
 		t.Fatalf("result is %T; want string", result)
 	}
-	// Dedup returns the existing template CID, not the raw volid.
-	if !pve.IsTemplateStemcellCID(cidStr) {
-		t.Errorf("CID = %q; want template:<vmid> format", cidStr)
-	}
-	vmid, parseErr := pve.ParseTemplateStemcellCID(cidStr)
-	if parseErr != nil {
-		t.Fatalf("ParseTemplateStemcellCID(%q) failed: %v", cidStr, parseErr)
-	}
-	if vmid != existingVMID {
-		t.Errorf("CID vmid = %d; want existing template VMID %d", vmid, existingVMID)
+	// Dedup returns the deterministic :heavy: CID (storage+filename), not a
+	// VMID-bearing identifier.
+	wantCID := pve.BuildHeavyStemcellCID("local", wantFilename)
+	if cidStr != wantCID {
+		t.Errorf("CID = %q; want %q", cidStr, wantCID)
 	}
 	if len(uploadCalls) != 0 {
 		t.Error("Upload called despite dedup hit; should be skipped")
@@ -784,7 +771,7 @@ func TestCreateStemcell_NoNodeConfigured(t *testing.T) {
 }
 
 // ============================================================
-// Tests: disk format translation (retained — pveDiskFormat still used)
+// Tests: disk_format aliases accepted end-to-end (canonical .qcow2 upload name)
 // ============================================================
 
 // captureUploadsForFormat invokes create_stemcell with the given disk_format
@@ -879,16 +866,20 @@ func TestCreateStemcell_CIDFormat(t *testing.T) {
 		t.Fatalf("result is %T; want string", result)
 	}
 
-	// CID must be a template CID and parse to a positive VMID.
-	if !pve.IsTemplateStemcellCID(cid) {
-		t.Errorf("CID %q is not a template CID; want template:<vmid> format", cid)
-	}
-	vmid, parseErr := pve.ParseTemplateStemcellCID(cid)
+	// CID must be a well-formed :heavy: path-identity CID (the tarball-upload
+	// path is always CPI-owned bytes).
+	kind, storage, volumePath, parseErr := pve.ParseStemcellPathCID(cid)
 	if parseErr != nil {
-		t.Fatalf("ParseTemplateStemcellCID(%q) failed: %v", cid, parseErr)
+		t.Fatalf("ParseStemcellPathCID(%q) failed: %v", cid, parseErr)
 	}
-	if vmid <= 0 {
-		t.Errorf("parsed vmid = %d; want positive VMID", vmid)
+	if kind != pve.StemcellKindHeavy {
+		t.Errorf("CID %q kind = %q; want %q", cid, kind, pve.StemcellKindHeavy)
+	}
+	if storage != "local" {
+		t.Errorf("CID %q storage = %q; want %q", cid, storage, "local")
+	}
+	if !strings.HasPrefix(volumePath, "import/") {
+		t.Errorf("CID %q volume path = %q; want \"import/...\"", cid, volumePath)
 	}
 }
 
@@ -935,17 +926,15 @@ func TestCreateStemcell_QCow2FileBarePassthrough(t *testing.T) {
 	if !ok {
 		t.Fatalf("result is %T; want string", result)
 	}
-	// Bare qcow2 passthrough still produces a template CID — the handler builds
-	// a PVE template VM from the uploaded image regardless of input format.
-	if !pve.IsTemplateStemcellCID(cid) {
-		t.Errorf("CID %q is not a template CID; want template:<vmid> format", cid)
-	}
-	vmid, parseErr := pve.ParseTemplateStemcellCID(cid)
+	// Bare qcow2 passthrough still produces a well-formed :heavy: CID — the
+	// handler builds/reuses a PVE cache template from the uploaded image
+	// regardless of input format.
+	kind, _, _, parseErr := pve.ParseStemcellPathCID(cid)
 	if parseErr != nil {
-		t.Fatalf("ParseTemplateStemcellCID(%q) failed: %v", cid, parseErr)
+		t.Fatalf("ParseStemcellPathCID(%q) failed: %v", cid, parseErr)
 	}
-	if vmid <= 0 {
-		t.Errorf("parsed vmid = %d; want positive VMID", vmid)
+	if kind != pve.StemcellKindHeavy {
+		t.Errorf("CID %q kind = %q; want %q", cid, kind, pve.StemcellKindHeavy)
 	}
 }
 
@@ -1506,9 +1495,18 @@ func emptyVolumeListFn() func(_ context.Context, _, _ string, _ *sdknodes.ListSt
 	}
 }
 
+// preuploadedSHA256 is a fixed, well-formed 64-hex-character digest used by
+// the preuploaded (light) stemcell test fixtures below. Its actual byte
+// content is irrelevant to these tests — only its shape (valid hex, 64
+// chars) matters, since preuploaded mode now requires cloud_properties.sha256
+// (P1.1) but does not verify it against the (non-existent, /dev/null) local
+// file.
+const preuploadedSHA256 = "ef0c5d8d1d8ba6e1a8620b2cba931c76e3bc9049395c3e7a5d5733cc3df2983f"
+
 // TestHandleCreateStemcell_LightPreUploaded_HappyPath verifies the end-to-end
-// success path: valid image_id, shared NFS storage on a single-node cluster,
-// file found on PVE — handler returns a "template:<vmid>" CID, no upload occurs.
+// success path: valid image_id + sha256, shared NFS storage on a single-node
+// cluster, file found on PVE — handler returns a well-formed :light: CID, no
+// upload occurs.
 func TestHandleCreateStemcell_LightPreUploaded_HappyPath(t *testing.T) {
 	t.Parallel()
 
@@ -1534,6 +1532,7 @@ func TestHandleCreateStemcell_LightPreUploaded_HappyPath(t *testing.T) {
 		"name":     "ubuntu-jammy",
 		"version":  "1.438",
 		"image_id": imageID,
+		"sha256":   preuploadedSHA256,
 	}
 	// BOSH passes /dev/null for light stemcells — not a real file.
 	args := []json.RawMessage{marshalArg(t, "/dev/null"), marshalArg(t, cp)}
@@ -1546,19 +1545,80 @@ func TestHandleCreateStemcell_LightPreUploaded_HappyPath(t *testing.T) {
 	if !ok {
 		t.Fatalf("result is %T; want string", result)
 	}
-	// Light-preuploaded now builds a PVE template VM and returns a template CID.
-	if !pve.IsTemplateStemcellCID(cid) {
-		t.Errorf("CID = %q; want template:<vmid> format", cid)
-	}
-	vmid, parseErr := pve.ParseTemplateStemcellCID(cid)
-	if parseErr != nil {
-		t.Fatalf("ParseTemplateStemcellCID(%q) failed: %v", cid, parseErr)
-	}
-	if vmid <= 0 {
-		t.Errorf("parsed vmid = %d; want positive VMID", vmid)
+	// Light-preuploaded returns the deterministic :light: CID.
+	wantCID := pve.BuildLightStemcellCID(storageName, filename)
+	if cid != wantCID {
+		t.Errorf("CID = %q; want %q", cid, wantCID)
 	}
 	if len(uploadCalls) != 0 {
 		t.Error("Upload called for light stemcell; must be skipped")
+	}
+}
+
+// TestHandleCreateStemcell_LightPreUploaded_MissingSHA256 verifies that a
+// preuploaded stemcell without cloud_properties.sha256 is rejected with a
+// clear validation error (P1.1 — sha256 is now required for content identity
+// and dedup).
+func TestHandleCreateStemcell_LightPreUploaded_MissingSHA256(t *testing.T) {
+	t.Parallel()
+
+	const (
+		storageName = "nfs"
+		filename    = "ubuntu-jammy-1.438-abc12345.qcow2"
+		imageID     = storageName + ":import/" + filename
+	)
+
+	clusterStorage := lightStemcellClusterStorage(storageName, "nfs", true)
+	deps := lightStemcellDeps(t, clusterStorage, existingVolumeListFn(storageName, filename), 1)
+
+	h := handlers.HandleCreateStemcell(deps)
+	cp := map[string]any{
+		"name":     "ubuntu-jammy",
+		"version":  "1.438",
+		"image_id": imageID,
+		// sha256 intentionally omitted.
+	}
+	args := []json.RawMessage{marshalArg(t, "/dev/null"), marshalArg(t, cp)}
+
+	_, err := h.Handle(context.Background(), args, jsonrpc.Context{})
+	if err == nil {
+		t.Fatal("expected error for missing sha256; got nil")
+	}
+	if !strings.Contains(err.Error(), "sha256") {
+		t.Errorf("error %q does not mention sha256", err.Error())
+	}
+}
+
+// TestHandleCreateStemcell_LightPreUploaded_MalformedSHA256 verifies that a
+// preuploaded stemcell with a malformed cloud_properties.sha256 (wrong
+// length / non-hex) is rejected with a clear validation error.
+func TestHandleCreateStemcell_LightPreUploaded_MalformedSHA256(t *testing.T) {
+	t.Parallel()
+
+	const (
+		storageName = "nfs"
+		filename    = "ubuntu-jammy-1.438-abc12345.qcow2"
+		imageID     = storageName + ":import/" + filename
+	)
+
+	clusterStorage := lightStemcellClusterStorage(storageName, "nfs", true)
+	deps := lightStemcellDeps(t, clusterStorage, existingVolumeListFn(storageName, filename), 1)
+
+	h := handlers.HandleCreateStemcell(deps)
+	cp := map[string]any{
+		"name":     "ubuntu-jammy",
+		"version":  "1.438",
+		"image_id": imageID,
+		"sha256":   "not-hex-and-too-short",
+	}
+	args := []json.RawMessage{marshalArg(t, "/dev/null"), marshalArg(t, cp)}
+
+	_, err := h.Handle(context.Background(), args, jsonrpc.Context{})
+	if err == nil {
+		t.Fatal("expected error for malformed sha256; got nil")
+	}
+	if !strings.Contains(err.Error(), "sha256") {
+		t.Errorf("error %q does not mention sha256", err.Error())
 	}
 }
 
@@ -1576,6 +1636,7 @@ func TestHandleCreateStemcell_LightPreUploaded_MalformedImageID(t *testing.T) {
 		"name":     "ubuntu-jammy",
 		"version":  "1.438",
 		"image_id": "not-a-valid-volid",
+		"sha256":   preuploadedSHA256,
 	}
 	args := []json.RawMessage{marshalArg(t, "/dev/null"), marshalArg(t, cp)}
 
@@ -1607,6 +1668,7 @@ func TestHandleCreateStemcell_LightPreUploaded_VolumeNotFound(t *testing.T) {
 		"name":     "ubuntu-jammy",
 		"version":  "1.438",
 		"image_id": imageID,
+		"sha256":   preuploadedSHA256,
 	}
 	args := []json.RawMessage{marshalArg(t, "/dev/null"), marshalArg(t, cp)}
 
@@ -1640,6 +1702,7 @@ func TestHandleCreateStemcell_LightPreUploaded_BlockStorageRejected(t *testing.T
 		"name":     "ubuntu-jammy",
 		"version":  "1.438",
 		"image_id": imageID,
+		"sha256":   preuploadedSHA256,
 	}
 	args := []json.RawMessage{marshalArg(t, "/dev/null"), marshalArg(t, cp)}
 
@@ -1674,6 +1737,7 @@ func TestHandleCreateStemcell_LightPreUploaded_LocalMultiNodeNoPin(t *testing.T)
 		"name":     "ubuntu-jammy",
 		"version":  "1.438",
 		"image_id": imageID,
+		"sha256":   preuploadedSHA256,
 		// node intentionally omitted.
 	}
 	args := []json.RawMessage{marshalArg(t, "/dev/null"), marshalArg(t, cp)}
@@ -1706,6 +1770,7 @@ func TestHandleCreateStemcell_LightPreUploaded_LocalSingleNodeAccepted(t *testin
 		"name":     "ubuntu-jammy",
 		"version":  "1.438",
 		"image_id": imageID,
+		"sha256":   preuploadedSHA256,
 	}
 	args := []json.RawMessage{marshalArg(t, "/dev/null"), marshalArg(t, cp)}
 
@@ -1717,16 +1782,9 @@ func TestHandleCreateStemcell_LightPreUploaded_LocalSingleNodeAccepted(t *testin
 	if !ok {
 		t.Fatalf("result is %T; want string", result)
 	}
-	// Light-preuploaded now returns a template CID.
-	if !pve.IsTemplateStemcellCID(cid) {
-		t.Errorf("CID %q is not a template CID; want template:<vmid> format", cid)
-	}
-	vmid2, parseErr := pve.ParseTemplateStemcellCID(cid)
-	if parseErr != nil {
-		t.Fatalf("ParseTemplateStemcellCID(%q) failed: %v", cid, parseErr)
-	}
-	if vmid2 <= 0 {
-		t.Errorf("parsed vmid = %d; want positive VMID", vmid2)
+	wantCID := pve.BuildLightStemcellCID(storageName, filename)
+	if cid != wantCID {
+		t.Errorf("CID = %q; want %q", cid, wantCID)
 	}
 }
 
@@ -1751,6 +1809,7 @@ func TestHandleCreateStemcell_LightPreUploaded_AnyStorageAccepted(t *testing.T) 
 		"name":     "ubuntu-jammy",
 		"version":  "1.438",
 		"image_id": imageID,
+		"sha256":   preuploadedSHA256,
 	}
 	args := []json.RawMessage{marshalArg(t, "/dev/null"), marshalArg(t, cp)}
 
@@ -1762,23 +1821,16 @@ func TestHandleCreateStemcell_LightPreUploaded_AnyStorageAccepted(t *testing.T) 
 	if !ok {
 		t.Fatalf("result is %T; want string", result)
 	}
-	// Light-preuploaded now returns a template CID. The storage-policy acceptance
-	// (any shared-file storage is accepted) is still validated — only the CID
-	// format changes from "light:..." to "template:<vmid>".
-	if !pve.IsTemplateStemcellCID(cid) {
-		t.Errorf("CID %q is not a template CID; want template:<vmid> format", cid)
-	}
-	vmid, parseErr := pve.ParseTemplateStemcellCID(cid)
-	if parseErr != nil {
-		t.Fatalf("ParseTemplateStemcellCID(%q) failed: %v", cid, parseErr)
-	}
-	if vmid <= 0 {
-		t.Errorf("parsed vmid = %d; want positive VMID", vmid)
+	// The storage-policy acceptance (any shared-file storage is accepted) is
+	// still validated — the CID reflects the deterministic :light: grammar.
+	wantCID := pve.BuildLightStemcellCID(storageName, filename)
+	if cid != wantCID {
+		t.Errorf("CID = %q; want %q", cid, wantCID)
 	}
 }
 
 // TestHandleCreateStemcell_LightPreUploaded_StorageMatchSuccess verifies that
-// shared-file storage is accepted and produces a valid template CID.
+// shared-file storage is accepted and produces a well-formed :light: CID.
 func TestHandleCreateStemcell_LightPreUploaded_StorageMatchSuccess(t *testing.T) {
 	t.Parallel()
 
@@ -1796,6 +1848,7 @@ func TestHandleCreateStemcell_LightPreUploaded_StorageMatchSuccess(t *testing.T)
 		"name":     "ubuntu-jammy",
 		"version":  "1.438",
 		"image_id": imageID,
+		"sha256":   preuploadedSHA256,
 	}
 	args := []json.RawMessage{marshalArg(t, "/dev/null"), marshalArg(t, cp)}
 
@@ -1804,16 +1857,9 @@ func TestHandleCreateStemcell_LightPreUploaded_StorageMatchSuccess(t *testing.T)
 		t.Fatalf("unexpected error when storage matches config: %v", err)
 	}
 	cid, _ := result.(string)
-	// Light-preuploaded now returns a template CID, not a light: CID.
-	if !pve.IsTemplateStemcellCID(cid) {
-		t.Errorf("CID %q is not a template CID; want template:<vmid> format", cid)
-	}
-	vmid, parseErr := pve.ParseTemplateStemcellCID(cid)
-	if parseErr != nil {
-		t.Fatalf("ParseTemplateStemcellCID(%q) failed: %v", cid, parseErr)
-	}
-	if vmid <= 0 {
-		t.Errorf("parsed vmid = %d; want positive VMID", vmid)
+	wantCID := pve.BuildLightStemcellCID(storageName, filename)
+	if cid != wantCID {
+		t.Errorf("CID = %q; want %q", cid, wantCID)
 	}
 }
 
@@ -1873,19 +1919,18 @@ func TestHandleCreateStemcell_LightFetch_BlockStorageRejected(t *testing.T) {
 	}
 }
 
-// TestHandleCreateStemcell_LightPreUploaded_LightPrefixStripped verifies that
-// an image_id that already has the "light:" prefix is accepted (the prefix is
-// stripped from the INPUT before volid parsing, so the handler succeeds).
-// The returned CID is a template CID ("template:<vmid>"), not a light: CID.
-func TestHandleCreateStemcell_LightPreUploaded_LightPrefixStripped(t *testing.T) {
+// TestHandleCreateStemcell_LightPreUploaded_PathCIDAccepted verifies that
+// cloud_properties.image_id may itself be a full ":light:" path-identity CID
+// (not just a bare volid) — an operator re-supplying a previously-returned
+// CID as image_id must work.
+func TestHandleCreateStemcell_LightPreUploaded_PathCIDAccepted(t *testing.T) {
 	t.Parallel()
 
 	const (
 		storageName = "nfs"
 		filename    = "ubuntu-jammy-1.438-abc12345.qcow2"
-		// Operator accidentally includes the light: prefix in image_id.
-		imageID = "light:nfs:import/" + filename
 	)
+	imageID := pve.BuildLightStemcellCID(storageName, filename)
 
 	clusterStorage := lightStemcellClusterStorage(storageName, "nfs", true)
 	deps := lightStemcellDeps(t, clusterStorage, existingVolumeListFn(storageName, filename), 1)
@@ -1895,25 +1940,51 @@ func TestHandleCreateStemcell_LightPreUploaded_LightPrefixStripped(t *testing.T)
 		"name":     "ubuntu-jammy",
 		"version":  "1.438",
 		"image_id": imageID,
+		"sha256":   preuploadedSHA256,
 	}
 	args := []json.RawMessage{marshalArg(t, "/dev/null"), marshalArg(t, cp)}
 
 	result, err := h.Handle(context.Background(), args, jsonrpc.Context{})
 	if err != nil {
-		t.Fatalf("unexpected error when image_id has light: prefix: %v", err)
+		t.Fatalf("unexpected error when image_id is a :light: path CID: %v", err)
 	}
 	cid, _ := result.(string)
-	// Input light: prefix is stripped before parsing; the returned CID is a
-	// template CID (handler builds a PVE template from the preuploaded qcow2).
-	if !pve.IsTemplateStemcellCID(cid) {
-		t.Errorf("CID %q is not a template CID; want template:<vmid> format", cid)
+	wantCID := pve.BuildLightStemcellCID(storageName, filename)
+	if cid != wantCID {
+		t.Errorf("CID = %q; want %q", cid, wantCID)
 	}
-	vmid, parseErr := pve.ParseTemplateStemcellCID(cid)
-	if parseErr != nil {
-		t.Fatalf("ParseTemplateStemcellCID(%q) failed: %v", cid, parseErr)
+}
+
+// TestHandleCreateStemcell_LightPreUploaded_HeavyImageIDRejected verifies that
+// a ":heavy:"-prefixed image_id is rejected: that kind asserts CPI ownership,
+// which an operator-supplied preuploaded image contradicts by definition.
+func TestHandleCreateStemcell_LightPreUploaded_HeavyImageIDRejected(t *testing.T) {
+	t.Parallel()
+
+	const (
+		storageName = "nfs"
+		filename    = "ubuntu-jammy-1.438-abc12345.qcow2"
+	)
+	imageID := pve.BuildHeavyStemcellCID(storageName, filename)
+
+	clusterStorage := lightStemcellClusterStorage(storageName, "nfs", true)
+	deps := lightStemcellDeps(t, clusterStorage, existingVolumeListFn(storageName, filename), 1)
+
+	h := handlers.HandleCreateStemcell(deps)
+	cp := map[string]any{
+		"name":     "ubuntu-jammy",
+		"version":  "1.438",
+		"image_id": imageID,
+		"sha256":   preuploadedSHA256,
 	}
-	if vmid <= 0 {
-		t.Errorf("parsed vmid = %d; want positive VMID", vmid)
+	args := []json.RawMessage{marshalArg(t, "/dev/null"), marshalArg(t, cp)}
+
+	_, err := h.Handle(context.Background(), args, jsonrpc.Context{})
+	if err == nil {
+		t.Fatal("expected error for :heavy: image_id; got nil")
+	}
+	if !strings.Contains(err.Error(), "heavy") {
+		t.Errorf("error %q does not mention the rejected :heavy: kind", err.Error())
 	}
 }
 

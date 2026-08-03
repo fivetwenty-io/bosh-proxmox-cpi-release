@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	sdkcluster "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cluster"
 	sdknodes "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/nodes"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
@@ -400,462 +401,9 @@ func TestMakeTemplate_UPIDFromObjectField(t *testing.T) {
 
 // ---- helpers for FindTemplate tests ----
 
-// strPtr returns a pointer to the supplied string value.
-func strPtr(s string) *string { return &s }
-
-// listQemuItem is the in-test struct used to build ListQemu fake responses.
-// It mirrors the subset of fields consumed by FindTemplateByName and
-// FindTemplateBySHATag — the remainder of the per-VM JSON is irrelevant.
-type listQemuItem struct {
-	Vmid     int64   `json:"vmid"`
-	Name     *string `json:"name,omitempty"`
-	Tags     *string `json:"tags,omitempty"`
-	Template *bool   `json:"template,omitempty"`
-}
-
-// makeListQemuResponse serialises a slice of listQemuItem into the
-// sdknodes.ListQemuResponse shape ([]json.RawMessage).
-func makeListQemuResponse(items []listQemuItem) *sdknodes.ListQemuResponse {
-	resp := make(sdknodes.ListQemuResponse, 0, len(items))
-	for _, item := range items {
-		raw, err := json.Marshal(item)
-		if err != nil {
-			panic("makeListQemuResponse: marshal: " + err.Error())
-		}
-		resp = append(resp, raw)
-	}
-	return &resp
-}
-
-// newFindTemplateClient builds a mockClient whose Nodes().ListQemu is served
-// by fn and all other node methods use the default templateNodesService
-// (which panics on unimplemented methods).
-func newFindTemplateClient(fn func(ctx context.Context, node string, params *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error)) *mockClient {
-	return newTemplateClient(&templateNodesService{listQemuFn: fn})
-}
-
 // ---- FindTemplateByName tests ----
 
-func TestFindTemplateByName_Found(t *testing.T) {
-	t.Parallel()
-	const wantVMID = int64(6042)
-	const wantName = "bosh-stemcell-ubuntu-jammy-1.234"
-
-	items := []listQemuItem{
-		{Vmid: 101, Name: strPtr("some-other-vm"), Template: boolPtr(false)},
-		{Vmid: wantVMID, Name: strPtr(wantName), Template: boolPtr(true)},
-	}
-	c := newFindTemplateClient(func(_ context.Context, _ string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
-		return makeListQemuResponse(items), nil
-	})
-
-	vmid, found, err := pve.FindTemplateByName(context.Background(), c, "pve1", wantName)
-	if err != nil {
-		t.Fatalf("FindTemplateByName: unexpected error: %v", err)
-	}
-	if !found {
-		t.Fatal("FindTemplateByName: expected found=true, got false")
-	}
-	if vmid != wantVMID {
-		t.Errorf("FindTemplateByName: vmid = %d, want %d", vmid, wantVMID)
-	}
-}
-
-func TestFindTemplateByName_NotFound(t *testing.T) {
-	t.Parallel()
-
-	items := []listQemuItem{
-		{Vmid: 100, Name: strPtr("bosh-stemcell-other-name-1.0"), Template: boolPtr(true)},
-	}
-	c := newFindTemplateClient(func(_ context.Context, _ string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
-		return makeListQemuResponse(items), nil
-	})
-
-	vmid, found, err := pve.FindTemplateByName(context.Background(), c, "pve1", "bosh-stemcell-ubuntu-jammy-1.234")
-	if err != nil {
-		t.Fatalf("FindTemplateByName: unexpected error: %v", err)
-	}
-	if found {
-		t.Errorf("FindTemplateByName: expected found=false, got vmid=%d", vmid)
-	}
-	if vmid != 0 {
-		t.Errorf("FindTemplateByName: expected vmid=0, got %d", vmid)
-	}
-}
-
-func TestFindTemplateByName_NotFound_NonTemplateVMMatchesName(t *testing.T) {
-	t.Parallel()
-	// A VM whose name matches but Template==false must NOT be returned.
-
-	items := []listQemuItem{
-		{Vmid: 200, Name: strPtr("bosh-stemcell-ubuntu-jammy-1.234"), Template: boolPtr(false)},
-	}
-	c := newFindTemplateClient(func(_ context.Context, _ string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
-		return makeListQemuResponse(items), nil
-	})
-
-	vmid, found, err := pve.FindTemplateByName(context.Background(), c, "pve1", "bosh-stemcell-ubuntu-jammy-1.234")
-	if err != nil {
-		t.Fatalf("FindTemplateByName: unexpected error: %v", err)
-	}
-	if found {
-		t.Errorf("FindTemplateByName: non-template VM with matching name must not match; vmid=%d", vmid)
-	}
-}
-
-func TestFindTemplateByName_NotFound_TemplateFlagAbsent(t *testing.T) {
-	t.Parallel()
-	// Template field omitted entirely (not-yet-frozen VM) — must NOT match.
-
-	items := []listQemuItem{
-		// No Template field set → nil pointer in struct → omitempty drops it.
-		{Vmid: 300, Name: strPtr("bosh-stemcell-ubuntu-jammy-1.234")},
-	}
-	c := newFindTemplateClient(func(_ context.Context, _ string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
-		return makeListQemuResponse(items), nil
-	})
-
-	_, found, err := pve.FindTemplateByName(context.Background(), c, "pve1", "bosh-stemcell-ubuntu-jammy-1.234")
-	if err != nil {
-		t.Fatalf("FindTemplateByName: unexpected error: %v", err)
-	}
-	if found {
-		t.Error("FindTemplateByName: VM with absent Template field must not match")
-	}
-}
-
-func TestFindTemplateByName_MultiMatch_ReturnsLowestVMID(t *testing.T) {
-	t.Parallel()
-	// Two templates with same name → return the lower VMID.
-	// This pins the deterministic multi-match behavior.
-	const matchName = "bosh-stemcell-ubuntu-jammy-1.234"
-
-	items := []listQemuItem{
-		{Vmid: 6100, Name: strPtr(matchName), Template: boolPtr(true)},
-		{Vmid: 6050, Name: strPtr(matchName), Template: boolPtr(true)},
-		{Vmid: 6200, Name: strPtr(matchName), Template: boolPtr(true)},
-	}
-	c := newFindTemplateClient(func(_ context.Context, _ string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
-		return makeListQemuResponse(items), nil
-	})
-
-	vmid, found, err := pve.FindTemplateByName(context.Background(), c, "pve1", matchName)
-	if err != nil {
-		t.Fatalf("FindTemplateByName: unexpected error: %v", err)
-	}
-	if !found {
-		t.Fatal("FindTemplateByName: expected found=true")
-	}
-	if vmid != 6050 {
-		t.Errorf("FindTemplateByName: multi-match: expected lowest vmid=6050, got %d", vmid)
-	}
-}
-
-func TestFindTemplateByName_NilResponse(t *testing.T) {
-	t.Parallel()
-	c := newFindTemplateClient(func(_ context.Context, _ string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
-		return nil, nil
-	})
-
-	vmid, found, err := pve.FindTemplateByName(context.Background(), c, "pve1", "bosh-stemcell-ubuntu-jammy-1.234")
-	if err != nil {
-		t.Fatalf("FindTemplateByName: nil response must not error: %v", err)
-	}
-	if found || vmid != 0 {
-		t.Errorf("FindTemplateByName: nil response: expected (0,false), got (%d,%v)", vmid, found)
-	}
-}
-
-func TestFindTemplateByName_EmptyList(t *testing.T) {
-	t.Parallel()
-	c := newFindTemplateClient(func(_ context.Context, _ string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
-		return makeListQemuResponse(nil), nil
-	})
-
-	vmid, found, err := pve.FindTemplateByName(context.Background(), c, "pve1", "bosh-stemcell-ubuntu-jammy-1.234")
-	if err != nil {
-		t.Fatalf("FindTemplateByName: empty list must not error: %v", err)
-	}
-	if found || vmid != 0 {
-		t.Errorf("FindTemplateByName: empty list: expected (0,false), got (%d,%v)", vmid, found)
-	}
-}
-
-func TestFindTemplateByName_APIError(t *testing.T) {
-	t.Parallel()
-	apiErr := errors.New("PVE connection refused")
-	c := newFindTemplateClient(func(_ context.Context, _ string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
-		return nil, apiErr
-	})
-
-	_, _, err := pve.FindTemplateByName(context.Background(), c, "pve1", "bosh-stemcell-ubuntu-jammy-1.234")
-	if err == nil {
-		t.Fatal("FindTemplateByName: expected error from API, got nil")
-	}
-	if !strings.Contains(err.Error(), "FindTemplateByName") {
-		t.Errorf("FindTemplateByName: error missing context label: %v", err)
-	}
-	if !strings.Contains(err.Error(), "connection refused") {
-		t.Errorf("FindTemplateByName: error missing original message: %v", err)
-	}
-}
-
-func TestFindTemplateByName_NilContext(t *testing.T) {
-	t.Parallel()
-	c := newFindTemplateClient(nil)
-	//nolint:staticcheck // intentional nil ctx for validation test
-	//lint:ignore SA1012 intentional nil ctx for validation test
-	_, _, err := pve.FindTemplateByName(nil, c, "pve1", "bosh-stemcell-ubuntu-jammy-1.234")
-	if err == nil {
-		t.Fatal("FindTemplateByName: expected error for nil ctx")
-	}
-}
-
-func TestFindTemplateByName_NilClient(t *testing.T) {
-	t.Parallel()
-	_, _, err := pve.FindTemplateByName(context.Background(), nil, "pve1", "bosh-stemcell-ubuntu-jammy-1.234")
-	if err == nil {
-		t.Fatal("FindTemplateByName: expected error for nil client")
-	}
-}
-
-func TestFindTemplateByName_EmptyNode(t *testing.T) {
-	t.Parallel()
-	c := newFindTemplateClient(nil)
-	_, _, err := pve.FindTemplateByName(context.Background(), c, "", "bosh-stemcell-ubuntu-jammy-1.234")
-	if err == nil {
-		t.Fatal("FindTemplateByName: expected error for empty node")
-	}
-}
-
-func TestFindTemplateByName_EmptyName(t *testing.T) {
-	t.Parallel()
-	c := newFindTemplateClient(nil)
-	_, _, err := pve.FindTemplateByName(context.Background(), c, "pve1", "")
-	if err == nil {
-		t.Fatal("FindTemplateByName: expected error for empty name")
-	}
-}
-
 // ---- FindTemplateBySHATag tests ----
-
-func TestFindTemplateBySHATag_Found(t *testing.T) {
-	t.Parallel()
-	const sha8 = "ab12cd34"
-	const wantVMID = int64(6042)
-
-	items := []listQemuItem{
-		{Vmid: 101, Tags: strPtr("some-tag"), Template: boolPtr(true)},
-		{Vmid: wantVMID, Tags: strPtr("env--prod;bosh-stemcell-sha-" + sha8), Template: boolPtr(true)},
-	}
-	c := newFindTemplateClient(func(_ context.Context, _ string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
-		return makeListQemuResponse(items), nil
-	})
-
-	vmid, found, err := pve.FindTemplateBySHATag(context.Background(), c, "pve1", sha8)
-	if err != nil {
-		t.Fatalf("FindTemplateBySHATag: unexpected error: %v", err)
-	}
-	if !found {
-		t.Fatal("FindTemplateBySHATag: expected found=true, got false")
-	}
-	if vmid != wantVMID {
-		t.Errorf("FindTemplateBySHATag: vmid = %d, want %d", vmid, wantVMID)
-	}
-}
-
-func TestFindTemplateBySHATag_NotFound(t *testing.T) {
-	t.Parallel()
-	items := []listQemuItem{
-		{Vmid: 100, Tags: strPtr("bosh-stemcell-sha-xxxxxxxx"), Template: boolPtr(true)},
-	}
-	c := newFindTemplateClient(func(_ context.Context, _ string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
-		return makeListQemuResponse(items), nil
-	})
-
-	vmid, found, err := pve.FindTemplateBySHATag(context.Background(), c, "pve1", "ab12cd34")
-	if err != nil {
-		t.Fatalf("FindTemplateBySHATag: unexpected error: %v", err)
-	}
-	if found {
-		t.Errorf("FindTemplateBySHATag: expected found=false, got vmid=%d", vmid)
-	}
-}
-
-func TestFindTemplateBySHATag_WrongTagPrefix_NotMatched(t *testing.T) {
-	t.Parallel()
-	// sha8 "abc12345" must NOT match token "bosh-stemcell-sha-abc123456"
-	// (longer token — not a prefix collision guard, but exact-token requirement).
-	// This pins the token-exact (not substring) matching behavior.
-	const sha8 = "abc12345"
-
-	items := []listQemuItem{
-		// Token "bosh-stemcell-sha-abc12345x" differs from "bosh-stemcell-sha-abc12345".
-		{Vmid: 200, Tags: strPtr("bosh-stemcell-sha-abc12345x"), Template: boolPtr(true)},
-	}
-	c := newFindTemplateClient(func(_ context.Context, _ string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
-		return makeListQemuResponse(items), nil
-	})
-
-	vmid, found, err := pve.FindTemplateBySHATag(context.Background(), c, "pve1", sha8)
-	if err != nil {
-		t.Fatalf("FindTemplateBySHATag: unexpected error: %v", err)
-	}
-	if found {
-		t.Errorf("FindTemplateBySHATag: wrong-prefix tag must not match; vmid=%d", vmid)
-	}
-}
-
-func TestFindTemplateBySHATag_NonTemplateNotMatched(t *testing.T) {
-	t.Parallel()
-	const sha8 = "ab12cd34"
-
-	items := []listQemuItem{
-		// Matching tag but Template==false — must be skipped.
-		{Vmid: 300, Tags: strPtr("bosh-stemcell-sha-" + sha8), Template: boolPtr(false)},
-	}
-	c := newFindTemplateClient(func(_ context.Context, _ string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
-		return makeListQemuResponse(items), nil
-	})
-
-	vmid, found, err := pve.FindTemplateBySHATag(context.Background(), c, "pve1", sha8)
-	if err != nil {
-		t.Fatalf("FindTemplateBySHATag: unexpected error: %v", err)
-	}
-	if found {
-		t.Errorf("FindTemplateBySHATag: non-template must not match; vmid=%d", vmid)
-	}
-}
-
-func TestFindTemplateBySHATag_CommaSeparatedTags(t *testing.T) {
-	t.Parallel()
-	// PVE also accepts comma-delimited tags; verify normalization works.
-	const sha8 = "ab12cd34"
-	const wantVMID = int64(6043)
-
-	items := []listQemuItem{
-		{Vmid: wantVMID, Tags: strPtr("env--prod,bosh-stemcell-sha-" + sha8), Template: boolPtr(true)},
-	}
-	c := newFindTemplateClient(func(_ context.Context, _ string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
-		return makeListQemuResponse(items), nil
-	})
-
-	vmid, found, err := pve.FindTemplateBySHATag(context.Background(), c, "pve1", sha8)
-	if err != nil {
-		t.Fatalf("FindTemplateBySHATag: unexpected error: %v", err)
-	}
-	if !found {
-		t.Fatal("FindTemplateBySHATag: comma-delimited tags must match")
-	}
-	if vmid != wantVMID {
-		t.Errorf("FindTemplateBySHATag: vmid = %d, want %d", vmid, wantVMID)
-	}
-}
-
-func TestFindTemplateBySHATag_MultiMatch_ReturnsLowestVMID(t *testing.T) {
-	t.Parallel()
-	const sha8 = "ab12cd34"
-	const tag = "bosh-stemcell-sha-" + sha8
-
-	items := []listQemuItem{
-		{Vmid: 6100, Tags: strPtr(tag), Template: boolPtr(true)},
-		{Vmid: 6050, Tags: strPtr(tag), Template: boolPtr(true)},
-		{Vmid: 6200, Tags: strPtr(tag), Template: boolPtr(true)},
-	}
-	c := newFindTemplateClient(func(_ context.Context, _ string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
-		return makeListQemuResponse(items), nil
-	})
-
-	vmid, found, err := pve.FindTemplateBySHATag(context.Background(), c, "pve1", sha8)
-	if err != nil {
-		t.Fatalf("FindTemplateBySHATag: unexpected error: %v", err)
-	}
-	if !found {
-		t.Fatal("FindTemplateBySHATag: expected found=true")
-	}
-	if vmid != 6050 {
-		t.Errorf("FindTemplateBySHATag: multi-match: expected lowest vmid=6050, got %d", vmid)
-	}
-}
-
-func TestFindTemplateBySHATag_EmptySHA8_ReturnsFalse(t *testing.T) {
-	t.Parallel()
-	// Empty sha8 → (0,false,nil) without calling the API.
-	c := newFindTemplateClient(func(_ context.Context, _ string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
-		t.Error("FindTemplateBySHATag: ListQemu must not be called for empty sha8")
-		return nil, nil
-	})
-
-	vmid, found, err := pve.FindTemplateBySHATag(context.Background(), c, "pve1", "")
-	if err != nil {
-		t.Fatalf("FindTemplateBySHATag: empty sha8 must not error: %v", err)
-	}
-	if found || vmid != 0 {
-		t.Errorf("FindTemplateBySHATag: empty sha8: expected (0,false), got (%d,%v)", vmid, found)
-	}
-}
-
-func TestFindTemplateBySHATag_NilResponse(t *testing.T) {
-	t.Parallel()
-	c := newFindTemplateClient(func(_ context.Context, _ string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
-		return nil, nil
-	})
-
-	vmid, found, err := pve.FindTemplateBySHATag(context.Background(), c, "pve1", "ab12cd34")
-	if err != nil {
-		t.Fatalf("FindTemplateBySHATag: nil response must not error: %v", err)
-	}
-	if found || vmid != 0 {
-		t.Errorf("FindTemplateBySHATag: nil response: expected (0,false), got (%d,%v)", vmid, found)
-	}
-}
-
-func TestFindTemplateBySHATag_APIError(t *testing.T) {
-	t.Parallel()
-	apiErr := errors.New("PVE timeout")
-	c := newFindTemplateClient(func(_ context.Context, _ string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
-		return nil, apiErr
-	})
-
-	_, _, err := pve.FindTemplateBySHATag(context.Background(), c, "pve1", "ab12cd34")
-	if err == nil {
-		t.Fatal("FindTemplateBySHATag: expected error from API, got nil")
-	}
-	if !strings.Contains(err.Error(), "FindTemplateBySHATag") {
-		t.Errorf("FindTemplateBySHATag: error missing context label: %v", err)
-	}
-	if !strings.Contains(err.Error(), "timeout") {
-		t.Errorf("FindTemplateBySHATag: error missing original message: %v", err)
-	}
-}
-
-func TestFindTemplateBySHATag_NilContext(t *testing.T) {
-	t.Parallel()
-	c := newFindTemplateClient(nil)
-	//nolint:staticcheck // intentional nil ctx for validation test
-	//lint:ignore SA1012 intentional nil ctx for validation test
-	_, _, err := pve.FindTemplateBySHATag(nil, c, "pve1", "ab12cd34")
-	if err == nil {
-		t.Fatal("FindTemplateBySHATag: expected error for nil ctx")
-	}
-}
-
-func TestFindTemplateBySHATag_NilClient(t *testing.T) {
-	t.Parallel()
-	_, _, err := pve.FindTemplateBySHATag(context.Background(), nil, "pve1", "ab12cd34")
-	if err == nil {
-		t.Fatal("FindTemplateBySHATag: expected error for nil client")
-	}
-}
-
-func TestFindTemplateBySHATag_EmptyNode(t *testing.T) {
-	t.Parallel()
-	c := newFindTemplateClient(nil)
-	_, _, err := pve.FindTemplateBySHATag(context.Background(), c, "", "ab12cd34")
-	if err == nil {
-		t.Fatal("FindTemplateBySHATag: expected error for empty node")
-	}
-}
 
 // ---- regression: PVE serialises booleans as integers (0/1) ----
 //
@@ -873,72 +421,6 @@ func makeListQemuResponseRaw(objs ...string) *sdknodes.ListQemuResponse {
 		resp = append(resp, json.RawMessage(o))
 	}
 	return &resp
-}
-
-func TestFindTemplateByName_MatchesIntegerTemplateFlag(t *testing.T) {
-	t.Parallel()
-	const wantVMID = int64(30231)
-	const wantName = "bosh-stemcell-bosh-openstack-kvm-ubuntu-noble-1-364"
-
-	c := newFindTemplateClient(func(_ context.Context, _ string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
-		return makeListQemuResponseRaw(
-			`{"vmid":101,"name":"some-vm"}`,
-			`{"vmid":30231,"name":"`+wantName+`","template":1}`,
-		), nil
-	})
-
-	vmid, found, err := pve.FindTemplateByName(context.Background(), c, "pve", wantName)
-	if err != nil {
-		t.Fatalf("FindTemplateByName: unexpected error: %v", err)
-	}
-	if !found {
-		t.Fatal("FindTemplateByName: expected found=true for integer template flag, got false")
-	}
-	if vmid != wantVMID {
-		t.Errorf("FindTemplateByName: vmid = %d, want %d", vmid, wantVMID)
-	}
-}
-
-func TestFindTemplateBySHATag_MatchesIntegerTemplateFlag(t *testing.T) {
-	t.Parallel()
-	const sha8 = "891b3b74"
-	const wantVMID = int64(30231)
-
-	c := newFindTemplateClient(func(_ context.Context, _ string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
-		return makeListQemuResponseRaw(
-			`{"vmid":30231,"name":"bosh-stemcell-x","tags":"bosh-stemcell-sha-` + sha8 + `","template":1}`,
-		), nil
-	})
-
-	vmid, found, err := pve.FindTemplateBySHATag(context.Background(), c, "pve", sha8)
-	if err != nil {
-		t.Fatalf("FindTemplateBySHATag: unexpected error: %v", err)
-	}
-	if !found {
-		t.Fatal("FindTemplateBySHATag: expected found=true for integer template flag, got false")
-	}
-	if vmid != wantVMID {
-		t.Errorf("FindTemplateBySHATag: vmid = %d, want %d", vmid, wantVMID)
-	}
-}
-
-func TestFindTemplateByName_IntegerZeroTemplateFlagNotMatched(t *testing.T) {
-	t.Parallel()
-	const name = "bosh-stemcell-x"
-	c := newFindTemplateClient(func(_ context.Context, _ string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
-		// template:0 is a regular VM that happens to share the name; must NOT match.
-		return makeListQemuResponseRaw(
-			`{"vmid":42,"name":"` + name + `","template":0}`,
-		), nil
-	})
-
-	_, found, err := pve.FindTemplateByName(context.Background(), c, "pve", name)
-	if err != nil {
-		t.Fatalf("FindTemplateByName: unexpected error: %v", err)
-	}
-	if found {
-		t.Fatal("FindTemplateByName: template:0 must not match")
-	}
 }
 
 // ============================================================
@@ -1106,5 +588,319 @@ func TestReplicaNodeTagForNode_Format(t *testing.T) {
 				t.Errorf("ReplicaNodeTagForNode(%q) = %q; want %q", tc.node, got, tc.want)
 			}
 		})
+	}
+}
+
+// ============================================================================
+// Cluster-scoped template lookup: FindTemplatesBySHATagCluster,
+// FindTemplateByNameCluster, BuildTemplateNameWithSHA.
+// ============================================================================
+
+// clusterResourceItem is the in-test struct used to build ListResources fake
+// responses for cluster-scoped template lookups. Mirrors the subset of
+// /cluster/resources fields FindTemplatesBySHATagCluster and
+// FindTemplateByNameCluster consume.
+type clusterResourceItem struct {
+	Type     string `json:"type"`
+	Vmid     int64  `json:"vmid,omitempty"`
+	Node     string `json:"node,omitempty"`
+	Name     string `json:"name,omitempty"`
+	Tags     string `json:"tags,omitempty"`
+	Template *bool  `json:"template,omitempty"`
+}
+
+// makeClusterResourcesResponse serialises a slice of clusterResourceItem into
+// the sdkcluster.ListResourcesResponse shape ([]json.RawMessage).
+func makeClusterResourcesResponse(items []clusterResourceItem) *sdkcluster.ListResourcesResponse {
+	resp := make(sdkcluster.ListResourcesResponse, 0, len(items))
+	for _, item := range items {
+		raw, err := json.Marshal(item)
+		if err != nil {
+			panic("makeClusterResourcesResponse: marshal: " + err.Error())
+		}
+		resp = append(resp, raw)
+	}
+	return &resp
+}
+
+// templateClusterService satisfies cluster.Service via embedding (nil embed —
+// panics on unimplemented methods) with only ListResources overridden.
+type templateClusterService struct {
+	sdkcluster.Service
+	listResourcesFn func(ctx context.Context, params *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error)
+}
+
+func (s *templateClusterService) ListResources(ctx context.Context, params *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+	if s.listResourcesFn != nil {
+		return s.listResourcesFn(ctx, params)
+	}
+	resp := sdkcluster.ListResourcesResponse{}
+	return &resp, nil
+}
+
+// newClusterTemplateClient builds a mockClient whose Cluster().ListResources
+// is served by fn.
+func newClusterTemplateClient(fn func(ctx context.Context, params *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error)) *mockClient {
+	return &mockClient{clusterSvc: &templateClusterService{listResourcesFn: fn}}
+}
+
+func TestFindTemplatesBySHATagCluster_MatchesAcrossNodes(t *testing.T) {
+	t.Parallel()
+	const sha8 = "ab12cd34"
+
+	items := []clusterResourceItem{
+		// Non-template VM on pve1: excluded (Template nil).
+		{Type: "qemu", Vmid: 100, Node: "pve1", Tags: "bosh-stemcell-sha-" + sha8},
+		// Primary cache template on pve1.
+		{Type: "qemu", Vmid: 6042, Node: "pve1", Name: "bosh-stemcell-ubuntu-jammy-1.0-" + sha8, Tags: "bosh-stemcell-sha-" + sha8, Template: boolPtr(true)},
+		// Per-node replica on pve2 — matched too (both are cache templates for the same sha).
+		{Type: "qemu", Vmid: 6099, Node: "pve2", Name: "bosh-stemcell-ubuntu-jammy-1.0-" + sha8, Tags: "bosh-stemcell-sha-" + sha8 + ";bosh-stemcell-node-pve2", Template: boolPtr(true)},
+		// LXC container carrying the same sha tag: excluded by type.
+		{Type: "lxc", Vmid: 7000, Node: "pve1", Tags: "bosh-stemcell-sha-" + sha8, Template: boolPtr(true)},
+		// Non-VM resource row (node/storage/pool): excluded by type + vmid==0.
+		{Type: "node", Node: "pve3"},
+		// Template on a different sha tag: excluded.
+		{Type: "qemu", Vmid: 6100, Node: "pve1", Tags: "bosh-stemcell-sha-ffffffff", Template: boolPtr(true)},
+	}
+	c := newClusterTemplateClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+		return makeClusterResourcesResponse(items), nil
+	})
+
+	refs, err := pve.FindTemplatesBySHATagCluster(context.Background(), c, sha8)
+	if err != nil {
+		t.Fatalf("FindTemplatesBySHATagCluster: unexpected error: %v", err)
+	}
+	if len(refs) != 2 {
+		t.Fatalf("FindTemplatesBySHATagCluster: got %d refs, want 2: %+v", len(refs), refs)
+	}
+	if refs[0].VMID != 6042 || refs[0].Node != "pve1" {
+		t.Errorf("FindTemplatesBySHATagCluster: refs[0] = %+v, want vmid=6042 node=pve1", refs[0])
+	}
+	if refs[1].VMID != 6099 || refs[1].Node != "pve2" {
+		t.Errorf("FindTemplatesBySHATagCluster: refs[1] = %+v, want vmid=6099 node=pve2", refs[1])
+	}
+}
+
+func TestFindTemplatesBySHATagCluster_NoMatch(t *testing.T) {
+	t.Parallel()
+	items := []clusterResourceItem{
+		{Type: "qemu", Vmid: 100, Node: "pve1", Tags: "bosh-stemcell-sha-ffffffff", Template: boolPtr(true)},
+	}
+	c := newClusterTemplateClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+		return makeClusterResourcesResponse(items), nil
+	})
+
+	refs, err := pve.FindTemplatesBySHATagCluster(context.Background(), c, "ab12cd34")
+	if err != nil {
+		t.Fatalf("FindTemplatesBySHATagCluster: unexpected error: %v", err)
+	}
+	if len(refs) != 0 {
+		t.Errorf("FindTemplatesBySHATagCluster: got %d refs, want 0: %+v", len(refs), refs)
+	}
+}
+
+func TestFindTemplatesBySHATagCluster_EmptySHA8_ReturnsEmpty(t *testing.T) {
+	t.Parallel()
+	c := newClusterTemplateClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+		t.Fatal("ListResources must not be called for an empty sha8")
+		return nil, nil
+	})
+
+	refs, err := pve.FindTemplatesBySHATagCluster(context.Background(), c, "")
+	if err != nil {
+		t.Fatalf("FindTemplatesBySHATagCluster: unexpected error: %v", err)
+	}
+	if len(refs) != 0 {
+		t.Errorf("FindTemplatesBySHATagCluster: got %d refs, want 0", len(refs))
+	}
+}
+
+func TestFindTemplatesBySHATagCluster_APIError(t *testing.T) {
+	t.Parallel()
+	c := newClusterTemplateClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+		return nil, errors.New("connection refused")
+	})
+
+	_, err := pve.FindTemplatesBySHATagCluster(context.Background(), c, "ab12cd34")
+	if err == nil {
+		t.Fatal("FindTemplatesBySHATagCluster: expected error from API failure, got nil")
+	}
+	if !strings.Contains(err.Error(), "FindTemplatesBySHATagCluster") {
+		t.Errorf("FindTemplatesBySHATagCluster: error missing context label: %v", err)
+	}
+}
+
+func TestFindTemplatesBySHATagCluster_NilContext(t *testing.T) {
+	t.Parallel()
+	c := newClusterTemplateClient(nil)
+	//nolint:staticcheck // intentional nil ctx for validation test
+	//lint:ignore SA1012 intentional nil ctx for validation test
+	_, err := pve.FindTemplatesBySHATagCluster(nil, c, "ab12cd34")
+	if err == nil {
+		t.Fatal("FindTemplatesBySHATagCluster: expected error for nil ctx, got nil")
+	}
+}
+
+func TestFindTemplatesBySHATagCluster_NilClient(t *testing.T) {
+	t.Parallel()
+	_, err := pve.FindTemplatesBySHATagCluster(context.Background(), nil, "ab12cd34")
+	if err == nil {
+		t.Fatal("FindTemplatesBySHATagCluster: expected error for nil client, got nil")
+	}
+}
+
+func TestFindTemplateByNameCluster_Found(t *testing.T) {
+	t.Parallel()
+	const wantName = "bosh-stemcell-ubuntu-jammy-1.0-ab12cd34"
+
+	items := []clusterResourceItem{
+		{Type: "qemu", Vmid: 100, Node: "pve1", Name: "unrelated", Template: boolPtr(true)},
+		{Type: "qemu", Vmid: 6042, Node: "pve1", Name: wantName, Template: boolPtr(true)},
+		// Same name but not a template: excluded.
+		{Type: "qemu", Vmid: 6043, Node: "pve2", Name: wantName},
+	}
+	c := newClusterTemplateClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+		return makeClusterResourcesResponse(items), nil
+	})
+
+	refs, err := pve.FindTemplateByNameCluster(context.Background(), c, wantName)
+	if err != nil {
+		t.Fatalf("FindTemplateByNameCluster: unexpected error: %v", err)
+	}
+	if len(refs) != 1 {
+		t.Fatalf("FindTemplateByNameCluster: got %d refs, want 1: %+v", len(refs), refs)
+	}
+	if refs[0].VMID != 6042 {
+		t.Errorf("FindTemplateByNameCluster: refs[0].VMID = %d, want 6042", refs[0].VMID)
+	}
+}
+
+func TestFindTemplateByNameCluster_MultiMatch_SortedByVMID(t *testing.T) {
+	t.Parallel()
+	const name = "bosh-stemcell-ubuntu-jammy-1.0-ab12cd34"
+
+	items := []clusterResourceItem{
+		{Type: "qemu", Vmid: 6099, Node: "pve2", Name: name, Template: boolPtr(true)},
+		{Type: "qemu", Vmid: 6042, Node: "pve1", Name: name, Template: boolPtr(true)},
+	}
+	c := newClusterTemplateClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+		return makeClusterResourcesResponse(items), nil
+	})
+
+	refs, err := pve.FindTemplateByNameCluster(context.Background(), c, name)
+	if err != nil {
+		t.Fatalf("FindTemplateByNameCluster: unexpected error: %v", err)
+	}
+	if len(refs) != 2 || refs[0].VMID != 6042 || refs[1].VMID != 6099 {
+		t.Fatalf("FindTemplateByNameCluster: got %+v, want sorted [6042, 6099]", refs)
+	}
+}
+
+func TestFindTemplateByNameCluster_NoMatch(t *testing.T) {
+	t.Parallel()
+	c := newClusterTemplateClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+		return makeClusterResourcesResponse(nil), nil
+	})
+
+	refs, err := pve.FindTemplateByNameCluster(context.Background(), c, "does-not-exist")
+	if err != nil {
+		t.Fatalf("FindTemplateByNameCluster: unexpected error: %v", err)
+	}
+	if len(refs) != 0 {
+		t.Errorf("FindTemplateByNameCluster: got %d refs, want 0", len(refs))
+	}
+}
+
+func TestFindTemplateByNameCluster_EmptyName(t *testing.T) {
+	t.Parallel()
+	c := newClusterTemplateClient(nil)
+	_, err := pve.FindTemplateByNameCluster(context.Background(), c, "")
+	if err == nil {
+		t.Fatal("FindTemplateByNameCluster: expected error for empty name, got nil")
+	}
+}
+
+func TestFindTemplateByNameCluster_NilContext(t *testing.T) {
+	t.Parallel()
+	c := newClusterTemplateClient(nil)
+	//nolint:staticcheck // intentional nil ctx for validation test
+	//lint:ignore SA1012 intentional nil ctx for validation test
+	_, err := pve.FindTemplateByNameCluster(nil, c, "some-name")
+	if err == nil {
+		t.Fatal("FindTemplateByNameCluster: expected error for nil ctx, got nil")
+	}
+}
+
+func TestFindTemplateByNameCluster_NilClient(t *testing.T) {
+	t.Parallel()
+	_, err := pve.FindTemplateByNameCluster(context.Background(), nil, "some-name")
+	if err == nil {
+		t.Fatal("FindTemplateByNameCluster: expected error for nil client, got nil")
+	}
+}
+
+// ---- BuildTemplateNameWithSHA tests ----
+
+func TestBuildTemplateNameWithSHA_AppendsAfterTruncation(t *testing.T) {
+	t.Parallel()
+	got := pve.BuildTemplateNameWithSHA("ubuntu-jammy", "1.0", "ab12cd34")
+	want := "bosh-stemcell-ubuntu-jammy-1-0-ab12cd34"
+	if got != want {
+		t.Errorf("BuildTemplateNameWithSHA: got %q, want %q", got, want)
+	}
+}
+
+func TestBuildTemplateNameWithSHA_EmptySHA8_UsesUnknownPlaceholder(t *testing.T) {
+	t.Parallel()
+	got := pve.BuildTemplateNameWithSHA("ubuntu-jammy", "1.0", "")
+	want := "bosh-stemcell-ubuntu-jammy-1-0-00000000"
+	if got != want {
+		t.Errorf("BuildTemplateNameWithSHA: got %q, want %q", got, want)
+	}
+}
+
+// TestBuildTemplateNameWithSHA_TruncationCollision_Disambiguated pins the
+// bug fix: two stemcells whose sanitized name+version are IDENTICAL up to
+// the 200-char BuildTemplateName truncation boundary (so BuildTemplateName
+// alone would alias them to the same template name) must still produce
+// distinct names once the differing sha8 is appended after truncation.
+func TestBuildTemplateNameWithSHA_TruncationCollision_Disambiguated(t *testing.T) {
+	t.Parallel()
+
+	// A name long enough that BuildTemplateName truncates at 200 chars
+	// regardless of what a short "version" suffix is — the two versions
+	// below differ only in the region truncation discards.
+	longName := strings.Repeat("a", 250)
+
+	nameA := pve.BuildTemplateNameWithSHA(longName, "version-one", "11111111")
+	nameB := pve.BuildTemplateNameWithSHA(longName, "version-two", "22222222")
+
+	// Precondition the test is actually exercising the collision: the
+	// pre-sha base (BuildTemplateName output) must be identical for both —
+	// the truncation cap swallows the version difference entirely.
+	baseA := pve.BuildTemplateName(longName, "version-one")
+	baseB := pve.BuildTemplateName(longName, "version-two")
+	if baseA != baseB {
+		t.Fatalf("test precondition failed: BuildTemplateName bases differ (%q vs %q) — truncation collision not exercised", baseA, baseB)
+	}
+
+	if nameA == nameB {
+		t.Errorf("BuildTemplateNameWithSHA: truncation-collision names must differ once sha8 is appended; both = %q", nameA)
+	}
+	if !strings.HasSuffix(nameA, "-11111111") {
+		t.Errorf("BuildTemplateNameWithSHA: nameA = %q, want suffix -11111111", nameA)
+	}
+	if !strings.HasSuffix(nameB, "-22222222") {
+		t.Errorf("BuildTemplateNameWithSHA: nameB = %q, want suffix -22222222", nameB)
+	}
+}
+
+func TestBuildTemplateNameWithSHA_InvalidCharsSanitized(t *testing.T) {
+	t.Parallel()
+	// sha8 is expected to be lowercase hex; a wildly out-of-band value must
+	// still yield a DNS-safe name via the same sanitizer BuildTemplateName uses.
+	got := pve.BuildTemplateNameWithSHA("ubuntu-jammy", "1.0", "AB12_CD!34")
+	if strings.ContainsAny(got, "_!") {
+		t.Errorf("BuildTemplateNameWithSHA: result contains DNS-unsafe characters: %q", got)
 	}
 }

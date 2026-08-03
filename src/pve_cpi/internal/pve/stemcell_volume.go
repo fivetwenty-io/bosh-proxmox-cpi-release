@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"strconv"
 	"strings"
 
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/nodes"
@@ -106,11 +105,6 @@ func ParseStemcellCID(cid string) (storage string, volumePath string, err error)
 		return "", "", fmt.Errorf("ParseStemcellCID: empty CID")
 	}
 
-	// Reject legacy integer-only CIDs (e.g. "5042").
-	if isAllDigits(cid) {
-		return "", "", fmt.Errorf("ParseStemcellCID: legacy integer CID %q not supported in direct-qcow mode; clear the stemcell entry from BOSH state and re-upload to regenerate the CID", cid)
-	}
-
 	idx := strings.IndexByte(cid, ':')
 	if idx < 0 {
 		return "", "", fmt.Errorf("ParseStemcellCID: CID %q missing ':' separator", cid)
@@ -126,98 +120,110 @@ func ParseStemcellCID(cid string) (storage string, volumePath string, err error)
 	return storage, volumePath, nil
 }
 
-// IsLegacyIntegerStemcellCID reports whether cid is the obsolete integer-only
-// stemcell CID format (a bare VMID such as "5042") that the template-clone CPI
-// design used before the direct-qcow rewrite. Used by delete_stemcell to
-// treat legacy rows as no-op deletes so operators can scrub them from the
-// director without sql surgery.
-func IsLegacyIntegerStemcellCID(cid string) bool {
-	return cid != "" && isAllDigits(cid)
-}
-
-// IsLightStemcellCID reports whether cid is a light-stemcell CID.
+// ---- Path-identity stemcell CIDs ----
 //
-// A light-stemcell CID has the form "light:<storage>:import/<filename>".
-// Returns true iff cid starts with the literal prefix "light:" and has at
-// least one character after that prefix. A bare "light:" string (no payload)
-// returns false. Double-prefixed strings such as "light:light:..." return true
-// because the outer prefix is present; StripLightPrefix removes exactly one layer.
-func IsLightStemcellCID(cid string) bool {
-	const prefix = "light:"
-	return strings.HasPrefix(cid, prefix) && len(cid) > len(prefix)
+// CID family overview — every identifier the CPI emits or accepts:
+//
+//	Stemcell  :light:<storage>:import/<file>   operator-managed qcow2; the CPI never deletes the file
+//	Stemcell  :heavy:<storage>:import/<file>   CPI-uploaded qcow2; deleted at the last director ref within a cluster
+//	Disk      pvd-<base64url(json)>            persistent-disk envelope (internal/pve/disk.go)
+//	Disk      pvz-<base64url(gzip(json))>      compressed persistent-disk envelope
+//	VM        <vmid>                           bare integer
+//	Snapshot  <vmid>:<name>                    VMID plus PVE snapshot name
+//
+// The leading ':' is the stemcell discriminator: a PVE storage identifier
+// cannot begin with ':', so no raw "<storage>:<path>" volid can ever collide
+// with a path-identity stemcell CID — including a storage pool literally
+// named "light" or "heavy".
+
+// StemcellKind discriminates the two path-identity stemcell CID families.
+type StemcellKind string
+
+const (
+	// StemcellKindLight marks an operator-managed qcow2. The operator placed
+	// the file and owns its lifecycle; delete_stemcell drops references and
+	// cache templates but never removes the file.
+	StemcellKindLight StemcellKind = "light"
+	// StemcellKindHeavy marks a CPI-uploaded qcow2. The CPI owns the file and
+	// deletes it when the last registered director reference within the
+	// cluster is dropped.
+	StemcellKindHeavy StemcellKind = "heavy"
+)
+
+const (
+	lightStemcellCIDPrefix = ":light:"
+	heavyStemcellCIDPrefix = ":heavy:"
+)
+
+// BuildLightStemcellCID composes a light path-identity stemcell CID.
+//
+// Format: ":light:<storage>:import/<filename>"
+func BuildLightStemcellCID(storage, qcow2Filename string) string {
+	return lightStemcellCIDPrefix + BuildStemcellCID(storage, qcow2Filename)
 }
 
-// StripLightPrefix removes exactly one leading "light:" segment from cid.
-// If cid does not satisfy IsLightStemcellCID, cid is returned unchanged.
-// The function intentionally strips only one layer; callers must not double-strip.
-func StripLightPrefix(cid string) string {
-	if IsLightStemcellCID(cid) {
-		return cid[len("light:"):]
+// BuildHeavyStemcellCID composes a heavy path-identity stemcell CID.
+//
+// Format: ":heavy:<storage>:import/<filename>"
+func BuildHeavyStemcellCID(storage, qcow2Filename string) string {
+	return heavyStemcellCIDPrefix + BuildStemcellCID(storage, qcow2Filename)
+}
+
+// IsStemcellPathCID reports whether cid begins with the path-identity
+// discriminator ':'. It performs no further validation; use
+// ParseStemcellPathCID to validate and decompose.
+func IsStemcellPathCID(cid string) bool {
+	return strings.HasPrefix(cid, ":")
+}
+
+// ParseStemcellPathCID validates and decomposes a path-identity stemcell CID.
+//
+// Accepted forms:
+//
+//	":light:<storage>:import/<filename>"
+//	":heavy:<storage>:import/<filename>"
+//
+// volumePath is the "import/<filename>" tail used as the PVE volume path.
+//
+// Errors:
+//   - empty CID
+//   - missing leading ':' (includes every retired grammar: "light:...",
+//     "template:<vmid>", bare "<storage>:import/...", bare integers)
+//   - unknown kind segment (anything other than "light"/"heavy")
+//   - doubled prefix (":light::heavy:...") — the payload after the kind must
+//     itself parse as "<storage>:import/<filename>", and a storage name
+//     cannot be empty or contain ':'
+//   - payload whose path component does not start with "import/"
+func ParseStemcellPathCID(cid string) (kind StemcellKind, storage, volumePath string, err error) {
+	if cid == "" {
+		return "", "", "", fmt.Errorf("ParseStemcellPathCID: empty CID")
 	}
-	return cid
-}
-
-// BuildTemplateStemcellCID encodes a template VMID as "template:<vmid>".
-//
-// Format: "template:<vmid>" (e.g. "template:6042").
-// vmid must be a positive integer; callers are responsible for supplying a
-// valid PVE VMID from the configured template range.
-func BuildTemplateStemcellCID(vmid int64) string {
-	return fmt.Sprintf("template:%d", vmid)
-}
-
-// IsTemplateStemcellCID reports whether cid starts with "template:" and has at
-// least one character after the prefix that forms a valid positive integer.
-//
-// Returns false for:
-//   - bare "template:" (empty remainder)
-//   - "template:abc" (non-digit remainder)
-//   - "template:-1" (leading minus — not all-digits)
-//   - "template:6.5" (decimal point — not all-digits)
-//   - "template:template:6042" (nested prefix — "template:6042" is not all-digits)
-func IsTemplateStemcellCID(cid string) bool {
-	const prefix = "template:"
-	if !strings.HasPrefix(cid, prefix) {
-		return false
+	if !strings.HasPrefix(cid, ":") {
+		return "", "", "", fmt.Errorf("ParseStemcellPathCID: CID %q missing leading ':' — expected \":light:<storage>:import/<file>\" or \":heavy:<storage>:import/<file>\"", cid)
 	}
-	remainder := cid[len(prefix):]
-	return isAllDigits(remainder)
-}
 
-// ParseTemplateStemcellCID extracts the VMID from a "template:<vmid>" CID.
-//
-// Returns an error when:
-//   - cid does not satisfy IsTemplateStemcellCID (missing prefix, empty remainder,
-//     non-digit characters, negative sign, decimal point, or nested prefix)
-//   - the VMID string overflows int64
-//   - the parsed VMID is zero or negative (template VMIDs must be positive)
-func ParseTemplateStemcellCID(cid string) (int64, error) {
-	if !IsTemplateStemcellCID(cid) {
-		return 0, fmt.Errorf("ParseTemplateStemcellCID: CID %q is not a valid template CID (expected \"template:<positive-integer>\")", cid)
+	var rest string
+	switch {
+	case strings.HasPrefix(cid, lightStemcellCIDPrefix):
+		kind = StemcellKindLight
+		rest = cid[len(lightStemcellCIDPrefix):]
+	case strings.HasPrefix(cid, heavyStemcellCIDPrefix):
+		kind = StemcellKindHeavy
+		rest = cid[len(heavyStemcellCIDPrefix):]
+	default:
+		return "", "", "", fmt.Errorf("ParseStemcellPathCID: CID %q has unknown kind — expected \":light:\" or \":heavy:\" prefix", cid)
 	}
-	const prefix = "template:"
-	remainder := cid[len(prefix):]
-	vmid, err := strconv.ParseInt(remainder, 10, 64)
+
+	if strings.HasPrefix(rest, ":") {
+		return "", "", "", fmt.Errorf("ParseStemcellPathCID: CID %q has an empty storage segment (doubled prefix?)", cid)
+	}
+
+	storage, volumePath, err = ParseStemcellCID(rest)
 	if err != nil {
-		return 0, fmt.Errorf("ParseTemplateStemcellCID: CID %q VMID %q: %w", cid, remainder, err)
+		return "", "", "", fmt.Errorf("ParseStemcellPathCID: CID %q payload invalid: %w", cid, err)
 	}
-	if vmid <= 0 {
-		return 0, fmt.Errorf("ParseTemplateStemcellCID: CID %q VMID %d must be a positive integer", cid, vmid)
-	}
-	return vmid, nil
-}
 
-// isAllDigits reports whether s consists entirely of ASCII decimal digits.
-func isAllDigits(s string) bool {
-	if s == "" {
-		return false
-	}
-	for i := 0; i < len(s); i++ {
-		if s[i] < '0' || s[i] > '9' {
-			return false
-		}
-	}
-	return true
+	return kind, storage, volumePath, nil
 }
 
 // storageContentItem is the subset of fields needed from each item returned by

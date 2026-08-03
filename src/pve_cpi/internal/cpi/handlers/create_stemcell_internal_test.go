@@ -22,6 +22,7 @@ import (
 	sdkqemu "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/qemu"
 	sdkstorage "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/storage"
 	sdktasks "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/tasks"
+	pveerr "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/errors"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
@@ -292,9 +293,24 @@ func (m *wbMockClusterStorage) ListStorage(_ context.Context, _ *sdkclusterstora
 type wbMockCluster struct {
 	sdkcluster.Service
 	nodeCount int
+	// listResourcesFn, when set, backs ListResources — used by cluster-scoped
+	// cache-template lookup tests (pve.FindTemplatesBySHATagCluster /
+	// pve.FindTemplateByNameCluster) to report existing template VMs. nil
+	// (the default) reports an empty cluster-resources list, so
+	// AllocateWithRetry/NextVMID starts at range start and no cache template
+	// is ever "found" by the cluster-scoped lookups.
+	listResourcesFn func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error)
+	// listConfigNodesFn, when set, backs ListConfigNodes (listClusterNodes'
+	// replication-target discovery) — used by tests that need distinct,
+	// caller-named cluster nodes rather than the nodeCount-many identical
+	// "pve-node1" default below.
+	listConfigNodesFn func(_ context.Context) (*sdkcluster.ListConfigNodesResponse, error)
 }
 
-func (c *wbMockCluster) ListConfigNodes(_ context.Context) (*sdkcluster.ListConfigNodesResponse, error) {
+func (c *wbMockCluster) ListConfigNodes(ctx context.Context) (*sdkcluster.ListConfigNodesResponse, error) {
+	if c.listConfigNodesFn != nil {
+		return c.listConfigNodesFn(ctx)
+	}
 	var resp sdkcluster.ListConfigNodesResponse
 	for i := 0; i < c.nodeCount; i++ {
 		raw, _ := json.Marshal(map[string]string{"node": "pve-node1"})
@@ -303,10 +319,30 @@ func (c *wbMockCluster) ListConfigNodes(_ context.Context) (*sdkcluster.ListConf
 	return &resp, nil
 }
 
-func (c *wbMockCluster) ListResources(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+func (c *wbMockCluster) ListResources(ctx context.Context, params *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+	if c.listResourcesFn != nil {
+		return c.listResourcesFn(ctx, params)
+	}
 	// Default: no existing VMs → AllocateWithRetry/NextVMID starts at range start.
 	empty := sdkcluster.ListResourcesResponse{}
 	return &empty, nil
+}
+
+// clusterResourceQemuTemplate marshals one cluster/resources JSON row for a
+// frozen QEMU template VM — the shape pve.FindTemplatesBySHATagCluster /
+// pve.FindTemplateByNameCluster decode (type="qemu", vmid, node, name, tags,
+// template=true). Used by stemcell cache-template lookup tests to populate
+// wbMockCluster.listResourcesFn.
+func clusterResourceQemuTemplate(vmid int64, node, name, tags string) json.RawMessage {
+	raw, _ := json.Marshal(map[string]any{
+		"type":     "qemu",
+		"vmid":     vmid,
+		"node":     node,
+		"name":     name,
+		"tags":     tags,
+		"template": true,
+	})
+	return raw
 }
 
 type wbMockNodes struct {
@@ -362,7 +398,7 @@ func (s *wbMockStorage) DeleteVolumeIfExists(_ context.Context, _, _, _ string) 
 
 // TestHandleCreateStemcell_LightFetch_HappyPath verifies the full fetch success
 // path: mock Source returns fixed body, dedup misses (empty storage), upload
-// records the canonical filename, CID is "template:<vmid>".
+// records the canonical filename, CID is a well-formed :heavy: path-identity CID.
 func TestHandleCreateStemcell_LightFetch_HappyPath(t *testing.T) {
 	t.Parallel()
 
@@ -410,9 +446,10 @@ func TestHandleCreateStemcell_LightFetch_HappyPath(t *testing.T) {
 	if !ok {
 		t.Fatalf("result is %T; want string", result)
 	}
-	// Result is always "template:<vmid>" now.
-	if !pve.IsTemplateStemcellCID(cid) {
-		t.Errorf("CID = %q; want template:<vmid> format", cid)
+	// Fetch is always CPI-owned bytes → :heavy:, regardless of dedup outcome.
+	wantCID := pve.BuildHeavyStemcellCID("nfs", wantFilename)
+	if cid != wantCID {
+		t.Errorf("CID = %q; want %q", cid, wantCID)
 	}
 	if uploadedFilename != wantFilename {
 		t.Errorf("uploaded filename = %q; want %q", uploadedFilename, wantFilename)
@@ -421,7 +458,8 @@ func TestHandleCreateStemcell_LightFetch_HappyPath(t *testing.T) {
 
 // TestHandleCreateStemcell_LightFetch_DedupBySHA verifies that when the exact
 // SHA-matched filename already exists on storage, no upload occurs and the
-// returned CID is "template:<vmid>" (template built from existing qcow2).
+// returned CID is the same well-formed :heavy: CID (template built/reused
+// from the existing qcow2).
 func TestHandleCreateStemcell_LightFetch_DedupBySHA(t *testing.T) {
 	t.Parallel()
 
@@ -467,12 +505,79 @@ func TestHandleCreateStemcell_LightFetch_DedupBySHA(t *testing.T) {
 	if !ok {
 		t.Fatalf("result is %T; want string", result)
 	}
-	// SHA-dedup hit → build template from existing qcow2 → "template:<vmid>".
-	if !pve.IsTemplateStemcellCID(cid) {
-		t.Errorf("CID = %q; want template:<vmid> format", cid)
+	// SHA-dedup hit → build/reuse template from the existing qcow2; the
+	// computed filename (name+version+sha8) matches existingFilename exactly.
+	wantCID := pve.BuildHeavyStemcellCID("nfs", existingFilename)
+	if cid != wantCID {
+		t.Errorf("CID = %q; want %q", cid, wantCID)
 	}
 	if len(uploadCalls) != 0 {
 		t.Error("Upload called despite SHA dedup hit; should be skipped")
+	}
+}
+
+// TestHandleCreateStemcell_LightFetch_PrefixDedup_WritesSHATag verifies the
+// the light-fetch prefix-dedup arm (Step 3, fetchFindByPrefix — hit
+// before any network fetch, sha256hex genuinely unknown to THIS call) derives
+// the sha8 from the matched existing filename and threads it through so the
+// resulting cache template still carries "bosh-stemcell-sha-<sha8>". Without
+// this, sha8Of("") produces no sha tag at all, and the template becomes
+// unreachable by delete_stemcell's and create_vm's sha-tag lookups even
+// though the filename it was built from plainly carries a known digest.
+func TestHandleCreateStemcell_LightFetch_PrefixDedup_WritesSHATag(t *testing.T) {
+	t.Parallel()
+
+	const sha8 = "aabbccdd"
+	existingFilename := "bosh-stemcell-ubuntu-jammy-1.998-" + sha8 + ".qcow2"
+
+	var capturedTags string
+	var createCalled bool
+	deps := wbBuildFetchDeps(t, wbExistingVolumeListFn("nfs", existingFilename))
+	// resolveFetchSource always runs (Step 1, before the prefix-dedup check),
+	// so the resolver itself must succeed; a network fetch here would mean the
+	// prefix-dedup short-circuit failed to fire, so Source.Fetch is wired to
+	// fail loudly if it is ever actually called.
+	deps.FetchResolver = func(rawURL string) (stemcellfetch.Source, stemcellfetch.Reference, error) {
+		return &mockSource{fetchErr: fmt.Errorf("network fetch must not be attempted on a prefix-dedup hit")},
+			stemcellfetch.Reference{Scheme: "https", URL: rawURL}, nil
+	}
+	deps.PVE.(*wbTemplateMockClient).qemuSvc = &wbMockQEMU{
+		createFn: func(_ context.Context, _ string, params map[string]any) (string, error) {
+			createCalled = true
+			capturedTags, _ = params["tags"].(string)
+			return "", nil
+		},
+	}
+
+	h := HandleCreateStemcell(deps)
+	cp := map[string]any{
+		"name":      "ubuntu-jammy",
+		"version":   "1.998",
+		"image_url": "https://example.com/ubuntu-jammy.qcow2",
+	}
+	args := []json.RawMessage{
+		mustMarshal(t, "/dev/null"),
+		mustMarshal(t, cp),
+	}
+
+	result, err := h.Handle(context.Background(), args, jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	wantCID := pve.BuildHeavyStemcellCID("nfs", existingFilename)
+	if cid, ok := result.(string); !ok || cid != wantCID {
+		t.Errorf("CID = %v; want %q", result, wantCID)
+	}
+	// The cache template already exists (dedup hit) in this fixture's cluster
+	// view (wbBuildFetchDeps' clusterSvc reports no templates by default), so
+	// QEMU.Create IS expected here — this asserts the FRESH-BUILD tag set,
+	// which is the only place the sha tag is written.
+	if !createCalled {
+		t.Fatal("expected QEMU.Create to build the cache template")
+	}
+	wantTag := stemcellSHATagPrefix + sha8
+	if !strings.Contains(capturedTags, wantTag) {
+		t.Errorf("template tags = %q; want to contain %q (derived from the matched filename's sha8)", capturedTags, wantTag)
 	}
 }
 
@@ -510,6 +615,7 @@ func TestHandleCreateStemcell_LightFetch_SkipsVMIDOwnedByStorageContent(t *testi
 	}
 
 	var uploadedFilename string
+	var allocatedVMID int
 	deps := wbBuildFetchDeps(t, nodeListFn)
 	deps.FetchResolver = func(rawURL string) (stemcellfetch.Source, stemcellfetch.Reference, error) {
 		return &mockSource{body: body, contentLength: int64(len(body))},
@@ -523,6 +629,17 @@ func TestHandleCreateStemcell_LightFetch_SkipsVMIDOwnedByStorageContent(t *testi
 				uploadedFilename = filename
 				return "", nil
 			},
+		},
+	}
+	// Capture the VMID QEMU.Create actually allocated — the returned CID no
+	// longer carries it (path-identity CIDs are storage+filename only), so
+	// the collision assertion below must observe it via the create params.
+	deps.PVE.(*wbTemplateMockClient).qemuSvc = &wbMockQEMU{
+		createFn: func(_ context.Context, _ string, params map[string]any) (string, error) {
+			if v, ok := params[metadataKeyVMID].(int); ok {
+				allocatedVMID = v
+			}
+			return "", nil
 		},
 	}
 
@@ -545,20 +662,19 @@ func TestHandleCreateStemcell_LightFetch_SkipsVMIDOwnedByStorageContent(t *testi
 	if !ok {
 		t.Fatalf("result is %T; want string", result)
 	}
-	if !pve.IsTemplateStemcellCID(cid) {
-		t.Fatalf("CID = %q; want template:<vmid> format", cid)
-	}
-	vmid, parseErr := pve.ParseTemplateStemcellCID(cid)
-	if parseErr != nil {
-		t.Fatalf("ParseTemplateStemcellCID(%q): %v", cid, parseErr)
+	if kind, _, _, parseErr := pve.ParseStemcellPathCID(cid); parseErr != nil || kind != pve.StemcellKindHeavy {
+		t.Fatalf("CID = %q (kind=%q, err=%v); want a well-formed :heavy: path-identity CID", cid, kind, parseErr)
 	}
 	if uploadedFilename == "" {
 		t.Fatal("expected upload to occur (no SHA/import dedup hit configured)")
 	}
-	if int(vmid) == peerOwnedVMID {
+	if allocatedVMID == 0 {
+		t.Fatal("expected QEMU.Create to be called with a non-zero vmid")
+	}
+	if allocatedVMID == peerOwnedVMID {
 		t.Errorf("allocated template VMID %d collides with peer-cluster volume base-%d-disk-0 on shared storage — "+
 			"storage-scan wiring at ensureTemplateVM's AllocateWithRetry call did not take effect",
-			vmid, peerOwnedVMID)
+			allocatedVMID, peerOwnedVMID)
 	}
 }
 
@@ -769,6 +885,16 @@ func (s *wbTemplateStorage) DeleteVolumeIfExists(ctx context.Context, node, stor
 
 // buildEnsureTemplateDeps constructs a Deps suitable for ensureTemplateVM tests.
 // All fields default to success no-ops unless overridden by the caller.
+//
+// clusterSvc defaults to a wbMockCluster reporting a single node and an empty
+// cluster-resources list: ensureTemplateVM's cluster-scoped dedup
+// (pve.FindTemplatesBySHATagCluster / pve.FindTemplateByNameCluster) and
+// pve.AllocateWithRetry's NextVMID both call Client.Cluster().ListResources
+// unconditionally, so a nil Cluster() panics on ANY fresh-build test case
+// (not just cluster-lookup-specific tests) — this default keeps every
+// existing call site of buildEnsureTemplateDeps working without change.
+// Tests that need a populated cluster-resources view wire nodes.listQemuFn
+// or override deps.PVE after construction (see wbTemplateMockClient.clusterSvc).
 func buildEnsureTemplateDeps(
 	qemu *wbMockQEMU,
 	nodes *wbTemplateNodes,
@@ -779,6 +905,7 @@ func buildEnsureTemplateDeps(
 		wbMockClient: wbMockClient{
 			nodesSvc:   nodes,
 			storageSvc: storage,
+			clusterSvc: &wbMockCluster{nodeCount: 1},
 		},
 		qemuSvc:  qemu,
 		tasksSvc: tasks,
@@ -795,21 +922,6 @@ func buildEnsureTemplateDeps(
 		},
 		PVE:    pveClient,
 		Logger: log.NewNopLogger(),
-	}
-}
-
-// listQemuOneTemplate returns a ListQemu stub reporting a single frozen template
-// with the given name and vmid. Used for idempotency tests.
-func listQemuOneTemplate(name string, vmid int64) func(ctx context.Context, node string, params *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
-	return func(_ context.Context, _ string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
-		isTemplate := true
-		raw, _ := json.Marshal(map[string]any{
-			"vmid":     vmid,
-			"name":     name,
-			"template": isTemplate,
-		})
-		resp := sdknodes.ListQemuResponse{raw}
-		return &resp, nil
 	}
 }
 
@@ -844,11 +956,13 @@ func (c *wbClusterForAlloc) ListResources(ctx context.Context, params *sdkcluste
 	return &empty, nil
 }
 
-// TestEnsureTemplateVM_CreatePath_CpiOwnsSource verifies the create path
+// TestEnsureTemplateVM_CreatePath_NoSourceDeletion verifies the create path
 // (no existing template): QEMU.Create called with import-from and sha tag,
-// MakeTemplate called (freeze), source qcow2 deleted (cpiOwnsSource=true),
-// and the returned VMID is in the template range.
-func TestEnsureTemplateVM_CreatePath_CpiOwnsSource(t *testing.T) {
+// MakeTemplate called (freeze), the returned VMID is in the template range,
+// and — per D10 — the source qcow2 is NEVER deleted by ensureTemplateVM
+// regardless of the CID kind (:heavy: here). Spy asserts zero
+// DeleteVolumeIfExists calls.
+func TestEnsureTemplateVM_CreatePath_NoSourceDeletion(t *testing.T) {
 	t.Parallel()
 
 	const sha256hex = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
@@ -859,8 +973,7 @@ func TestEnsureTemplateVM_CreatePath_CpiOwnsSource(t *testing.T) {
 	var createParams map[string]any
 	var createCalled bool
 	var freezeCalled bool
-	var deletedVolume string
-	var deletedStorage string
+	var deleteCalls int
 
 	qemu := &wbMockQEMU{
 		createFn: func(_ context.Context, _ string, params map[string]any) (string, error) {
@@ -879,9 +992,8 @@ func TestEnsureTemplateVM_CreatePath_CpiOwnsSource(t *testing.T) {
 	}
 	tasks := &wbMockTasks{}
 	stor := &wbTemplateStorage{
-		deleteVolumeIfExistsFn: func(_ context.Context, _, storageName, volume string) (bool, error) {
-			deletedStorage = storageName
-			deletedVolume = volume
+		deleteVolumeIfExistsFn: func(_ context.Context, _, _, _ string) (bool, error) {
+			deleteCalls++
 			return true, nil
 		},
 	}
@@ -891,18 +1003,25 @@ func TestEnsureTemplateVM_CreatePath_CpiOwnsSource(t *testing.T) {
 	// from the import-from source storage (StemcellStorage = "nfs"); they need
 	// not be the same PVE storage (local has "import" but not "images").
 	deps.Config.VMStorage = "images-pool"
-	// Wire cluster service for AllocateWithRetry → NextVMID.
+	// Wire cluster service for AllocateWithRetry → NextVMID AND the new
+	// cluster-scoped cache-template lookups (both consult Cluster().ListResources).
 	deps.PVE.(*wbTemplateMockClient).clusterSvc = &wbClusterForAlloc{
 		listResourcesFn: listClusterResourcesEmpty(),
 	}
 
 	cp := stemcellCloudProps{Name: "ubuntu-jammy", Version: "1.0"}
-	vmid, err := ensureTemplateVM(context.Background(), deps, "pve-node1", storage, qcow2Filename, sha256hex, true, cp, "/tmp/test.qcow2")
+	stemcellCID := pve.BuildHeavyStemcellCID(storage, qcow2Filename)
+	vmid, node, err := ensureTemplateVM(context.Background(), deps, "pve-node1", storage, qcow2Filename, sha256hex,
+		"",
+		pve.StemcellKindHeavy, stemcellCID, "test-director", cp, "/tmp/test.qcow2")
 	if err != nil {
 		t.Fatalf("ensureTemplateVM returned error: %v", err)
 	}
 	if vmid < 30000 || vmid > 30999 {
 		t.Errorf("vmid %d outside expected template range [30000,30999]", vmid)
+	}
+	if node != "pve-node1" {
+		t.Errorf("node = %q; want %q", node, "pve-node1")
 	}
 	if !createCalled {
 		t.Error("QEMU.Create was not called")
@@ -910,9 +1029,10 @@ func TestEnsureTemplateVM_CreatePath_CpiOwnsSource(t *testing.T) {
 	if !freezeCalled {
 		t.Error("Nodes.CreateQemuTemplate (MakeTemplate) was not called")
 	}
-	// Verify ownership + sha tags in create params. ownershipTag ("bosh-cpi")
-	// is always prepended; shaTag follows.
-	wantTag := ownershipTag + ";bosh-stemcell-sha-" + sha8
+	// Verify ownership + cache + sha + provenance marker/name/version tags in
+	// create params (P1.6 — provenance tags are unconditional).
+	wantTag := ownershipTag + ";" + stemcellCacheTag + ";bosh-stemcell-sha-" + sha8 +
+		";" + stemcellMarkerTag + ";" + stemcellNameTagPrefix + "ubuntu-jammy" + ";" + stemcellVersionTagPrefix + "1-0"
 	if tag, _ := createParams["tags"].(string); tag != wantTag {
 		t.Errorf("tags = %q; want %q", tag, wantTag)
 	}
@@ -952,16 +1072,10 @@ func TestEnsureTemplateVM_CreatePath_CpiOwnsSource(t *testing.T) {
 	if _, present := createParams["cpu"]; present {
 		t.Errorf("cpu = %v present on template; want no cpu key (clone-path pve-default sentinel depends on its absence)", createParams["cpu"])
 	}
-	// Verify source qcow2 deleted (cpiOwnsSource=true). DeleteVolumeIfExists
-	// takes the storage pool and the volume PATH ("import/<file>") as SEPARATE
-	// args — same contract as delete_stemcell. The volume arg must NOT carry a
-	// "<storage>:" prefix, or the pool is double-prefixed and the delete no-ops.
-	wantDeleted := "import/" + qcow2Filename
-	if deletedVolume != wantDeleted {
-		t.Errorf("deleted volume = %q; want %q", deletedVolume, wantDeleted)
-	}
-	if deletedStorage != storage {
-		t.Errorf("delete storage arg = %q; want %q", deletedStorage, storage)
+	// D10: the source qcow2 is never reclaimed by create_stemcell/ensureTemplateVM
+	// — it IS the :heavy: stemcell identity. delete_stemcell owns last-ref deletion.
+	if deleteCalls != 0 {
+		t.Errorf("DeleteVolumeIfExists called %d times; want 0 (no post-freeze reclaim, D10)", deleteCalls)
 	}
 }
 
@@ -1004,7 +1118,10 @@ func TestEnsureTemplateVM_RootDiskBusSCSI_UsesScsi0(t *testing.T) {
 	}
 
 	cp := stemcellCloudProps{Name: "ubuntu-jammy", Version: "1.0"}
-	_, err := ensureTemplateVM(context.Background(), deps, "pve-node1", storage, qcow2Filename, sha256hex, true, cp, "/tmp/test.qcow2")
+	stemcellCID := pve.BuildHeavyStemcellCID(storage, qcow2Filename)
+	_, _, err := ensureTemplateVM(context.Background(), deps, "pve-node1", storage, qcow2Filename, sha256hex,
+		"",
+		pve.StemcellKindHeavy, stemcellCID, "test-director", cp, "/tmp/test.qcow2")
 	if err != nil {
 		t.Fatalf("ensureTemplateVM returned error: %v", err)
 	}
@@ -1020,13 +1137,17 @@ func TestEnsureTemplateVM_RootDiskBusSCSI_UsesScsi0(t *testing.T) {
 	}
 }
 
-// TestEnsureTemplateVM_Idempotent_ExistingTemplate verifies that when
-// FindTemplateByName finds an existing template, the existing VMID is returned
-// immediately without creating a new VM or deleting the source qcow2.
+// TestEnsureTemplateVM_Idempotent_ExistingTemplate verifies that when the
+// cluster-scoped sha-tag lookup (pve.FindTemplatesBySHATagCluster) finds an
+// existing cache template, the existing (VMID, node) is returned immediately
+// without creating a new VM or touching the source qcow2.
 func TestEnsureTemplateVM_Idempotent_ExistingTemplate(t *testing.T) {
 	t.Parallel()
 
 	const existingVMID = int64(10042)
+	const existingNode = "pve-node2"
+	const sha256hex = "aabbccddee112233aabbccddee112233aabbccddee112233aabbccddee112233"
+	const sha8 = "aabbccdd"
 	var createCalled bool
 	var deleteCalled bool
 
@@ -1035,11 +1156,25 @@ func TestEnsureTemplateVM_Idempotent_ExistingTemplate(t *testing.T) {
 			createCalled = true
 			return "", nil
 		},
+		// Config backs sha256MatchesTemplateProvenance's read of the candidate's
+		// description; an empty map (no "description" key) means "no recorded
+		// SHA256 in provenance" — treated as a legacy/unknown match, reused.
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return map[string]any{}, nil
+		},
 	}
-	// BuildTemplateName("ubuntu-jammy","1.0") = "bosh-stemcell-ubuntu-jammy-1-0"
-	// (the version's "." is replaced by "-" by the DNS-safe sanitiser).
 	nodes := &wbTemplateNodes{
-		listQemuFn: listQemuOneTemplate("bosh-stemcell-ubuntu-jammy-1-0", existingVMID),
+		listQemuFn: listQemuEmpty(),
+		wbMockNodes: wbMockNodes{
+			// Backs stemcellBackingQCow2Exists: the dedup hit is only
+			// accepted once the sha-tag match is also confirmed to still have a
+			// live backing qcow2 on storage.
+			listStorageFn: func(_ context.Context, _, _ string, _ *sdknodes.ListStorageContentParams) (*sdknodes.ListStorageContentResponse, error) {
+				entry, _ := json.Marshal(map[string]any{"volid": "nfs:import/stem.qcow2"})
+				resp := sdknodes.ListStorageContentResponse{entry}
+				return &resp, nil
+			},
+		},
 	}
 	storage := &wbTemplateStorage{
 		deleteVolumeIfExistsFn: func(_ context.Context, _, _, _ string) (bool, error) {
@@ -1048,18 +1183,31 @@ func TestEnsureTemplateVM_Idempotent_ExistingTemplate(t *testing.T) {
 		},
 	}
 	deps := buildEnsureTemplateDeps(qemu, nodes, &wbMockTasks{}, storage)
+	// Cluster-scoped sha-tag lookup: report one existing template on a
+	// DIFFERENT node than the caller's templateNode, verifying ensureTemplateVM
+	// returns the template's ACTUAL node rather than assuming templateNode.
 	deps.PVE.(*wbTemplateMockClient).clusterSvc = &wbClusterForAlloc{
-		listResourcesFn: listClusterResourcesEmpty(),
+		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+			resp := sdkcluster.ListResourcesResponse{
+				clusterResourceQemuTemplate(existingVMID, existingNode, "bosh-stemcell-ubuntu-jammy-1-0-"+sha8,
+					ownershipTag+";"+stemcellCacheTag+";bosh-stemcell-sha-"+sha8),
+			}
+			return &resp, nil
+		},
 	}
 
 	cp := stemcellCloudProps{Name: "ubuntu-jammy", Version: "1.0"}
-	vmid, err := ensureTemplateVM(context.Background(), deps, "pve-node1", "nfs", "stem.qcow2",
-		"aabbccddee112233aabbccddee112233aabbccddee112233aabbccddee112233", true, cp, "")
+	stemcellCID := pve.BuildHeavyStemcellCID("nfs", "stem.qcow2")
+	vmid, node, err := ensureTemplateVM(context.Background(), deps, "pve-node1", "nfs", "stem.qcow2",
+		sha256hex, "", pve.StemcellKindHeavy, stemcellCID, "test-director", cp, "")
 	if err != nil {
 		t.Fatalf("expected nil error on idempotent reuse, got: %v", err)
 	}
 	if vmid != existingVMID {
 		t.Errorf("vmid = %d; want %d", vmid, existingVMID)
+	}
+	if node != existingNode {
+		t.Errorf("node = %q; want %q (the template's actual node, not templateNode)", node, existingNode)
 	}
 	if createCalled {
 		t.Error("QEMU.Create must NOT be called on idempotent reuse path")
@@ -1076,11 +1224,30 @@ func TestEnsureTemplateVM_MakeTemplateFails_ErrorReturned(t *testing.T) {
 	t.Parallel()
 
 	var deleteCalled bool
+	var deletedVMID string
+	var allocatedVMID int64
+	qemu := &wbMockQEMU{
+		createFn: func(_ context.Context, _ string, params map[string]any) (string, error) {
+			if v, ok := params["vmid"].(int); ok {
+				allocatedVMID = int64(v)
+			}
+			return "", nil
+		},
+	}
 	nodes := &wbTemplateNodes{
 		listQemuFn: listQemuEmpty(),
 		createQemuTemplateFn: func(_ context.Context, _, _ string, _ *sdknodes.CreateQemuTemplateParams) (*sdknodes.CreateQemuTemplateResponse, error) {
 			return nil, errors.New("PVE: cannot freeze: disk locked")
 		},
+	}
+	// deleteQemuFn backs the leaked-VM cleanup: on freeze failure,
+	// ensureTemplateVM must best-effort delete the VM it just created —
+	// otherwise it is invisible to every discovery scan (template != true)
+	// and permanently occupies a VMID and a disk.
+	nodes.deleteQemuFn = func(_ context.Context, _, vmid string, _ *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
+		deletedVMID = vmid
+		raw := sdknodes.DeleteQemuResponse(`""`)
+		return &raw, nil
 	}
 	storage := &wbTemplateStorage{
 		deleteVolumeIfExistsFn: func(_ context.Context, _, _, _ string) (bool, error) {
@@ -1088,14 +1255,17 @@ func TestEnsureTemplateVM_MakeTemplateFails_ErrorReturned(t *testing.T) {
 			return true, nil
 		},
 	}
-	deps := buildEnsureTemplateDeps(&wbMockQEMU{}, nodes, &wbMockTasks{}, storage)
+	deps := buildEnsureTemplateDeps(qemu, nodes, &wbMockTasks{}, storage)
 	deps.PVE.(*wbTemplateMockClient).clusterSvc = &wbClusterForAlloc{
 		listResourcesFn: listClusterResourcesEmpty(),
 	}
 
 	cp := stemcellCloudProps{Name: "ubuntu-focal", Version: "2.0"}
-	_, err := ensureTemplateVM(context.Background(), deps, "pve-node1", "nfs", "focal.qcow2",
-		"aabbccddee112233aabbccddee112233aabbccddee112233aabbccddee112233", true, cp, "")
+	stemcellCID := pve.BuildHeavyStemcellCID("nfs", "focal.qcow2")
+	_, _, err := ensureTemplateVM(context.Background(), deps, "pve-node1", "nfs", "focal.qcow2",
+		"aabbccddee112233aabbccddee112233aabbccddee112233aabbccddee112233",
+		"",
+		pve.StemcellKindHeavy, stemcellCID, "test-director", cp, "")
 	if err == nil {
 		t.Fatal("expected error when MakeTemplate fails; got nil")
 	}
@@ -1105,12 +1275,17 @@ func TestEnsureTemplateVM_MakeTemplateFails_ErrorReturned(t *testing.T) {
 	if deleteCalled {
 		t.Error("source qcow2 must NOT be deleted when freeze fails")
 	}
+	wantDeleted := strconv.FormatInt(allocatedVMID, 10)
+	if deletedVMID != wantDeleted {
+		t.Errorf("deleted VMID = %q; want the unfrozen VM %q to be cleaned up after freeze failure", deletedVMID, wantDeleted)
+	}
 }
 
-// TestEnsureTemplateVM_CpiOwnsSourceFalse_SourceNotDeleted verifies that when
-// cpiOwnsSource=false (light-preuploaded path), the source qcow2 is never deleted
-// even after successful template creation and freeze.
-func TestEnsureTemplateVM_CpiOwnsSourceFalse_SourceNotDeleted(t *testing.T) {
+// TestEnsureTemplateVM_LightKind_SourceNeverDeleted verifies that a
+// :light: cache template build never touches the source qcow2 — same D10
+// no-reclaim policy as :heavy:, but exercised with StemcellKindLight to
+// confirm the kind itself has no bearing on the (already-absent) delete step.
+func TestEnsureTemplateVM_LightKind_SourceNeverDeleted(t *testing.T) {
 	t.Parallel()
 
 	var deleteCalled bool
@@ -1127,10 +1302,11 @@ func TestEnsureTemplateVM_CpiOwnsSourceFalse_SourceNotDeleted(t *testing.T) {
 	}
 
 	cp := stemcellCloudProps{Name: "ubuntu-jammy", Version: "3.0"}
-	vmid, err := ensureTemplateVM(context.Background(), deps, "pve-node1", "nfs", "jammy.qcow2",
+	stemcellCID := pve.BuildLightStemcellCID("nfs", "jammy.qcow2")
+	vmid, _, err := ensureTemplateVM(context.Background(), deps, "pve-node1", "nfs", "jammy.qcow2",
 		"aabbccddee112233aabbccddee112233aabbccddee112233aabbccddee112233",
-		false, // cpiOwnsSource = false (operator pre-uploaded)
-		cp, "")
+		"",
+		pve.StemcellKindLight, stemcellCID, "test-director", cp, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1138,37 +1314,7 @@ func TestEnsureTemplateVM_CpiOwnsSourceFalse_SourceNotDeleted(t *testing.T) {
 		t.Error("expected non-zero vmid")
 	}
 	if deleteCalled {
-		t.Error("DeleteVolumeIfExists must NOT be called when cpiOwnsSource=false")
-	}
-}
-
-// TestEnsureTemplateVM_DeleteFailsBestEffort_VmidStillReturned verifies the
-// best-effort deletion contract: when Storage().DeleteVolumeIfExists fails (e.g.
-// network timeout), the function logs a warning but returns the vmid without error.
-func TestEnsureTemplateVM_DeleteFailsBestEffort_VmidStillReturned(t *testing.T) {
-	t.Parallel()
-
-	nodes := &wbTemplateNodes{listQemuFn: listQemuEmpty()}
-	storage := &wbTemplateStorage{
-		deleteVolumeIfExistsFn: func(_ context.Context, _, _, _ string) (bool, error) {
-			return false, errors.New("storage: timeout deleting volume")
-		},
-	}
-	deps := buildEnsureTemplateDeps(&wbMockQEMU{}, nodes, &wbMockTasks{}, storage)
-	deps.PVE.(*wbTemplateMockClient).clusterSvc = &wbClusterForAlloc{
-		listResourcesFn: listClusterResourcesEmpty(),
-	}
-
-	cp := stemcellCloudProps{Name: "ubuntu-bionic", Version: "4.0"}
-	vmid, err := ensureTemplateVM(context.Background(), deps, "pve-node1", "nfs", "bionic.qcow2",
-		"aabbccddee112233aabbccddee112233aabbccddee112233aabbccddee112233",
-		true, // cpiOwnsSource: delete attempted but fails
-		cp, "")
-	if err != nil {
-		t.Fatalf("delete failure must not surface as error (best-effort); got: %v", err)
-	}
-	if vmid < 30000 || vmid > 30999 {
-		t.Errorf("vmid %d outside expected template range [30000,30999]", vmid)
+		t.Error("DeleteVolumeIfExists must NOT be called for a :light: cache template build")
 	}
 }
 
@@ -1178,8 +1324,11 @@ func TestEnsureTemplateVM_SHATagFormat(t *testing.T) {
 	t.Parallel()
 
 	const fullSHA = "deadbeef11223344deadbeef11223344deadbeef11223344deadbeef11223344"
-	// ownershipTag ("bosh-cpi") is always prepended; shaTag follows.
-	const wantTag = ownershipTag + ";bosh-stemcell-sha-deadbeef"
+	// ownershipTag ("bosh-cpi") and stemcellCacheTag ("bosh-stemcell-cache")
+	// are always prepended; shaTag and provenance marker/name/version tags follow
+	// (P1.6 — provenance tags are unconditional).
+	const wantTag = ownershipTag + ";" + stemcellCacheTag + ";bosh-stemcell-sha-deadbeef;" +
+		stemcellMarkerTag + ";" + stemcellNameTagPrefix + "ubuntu-focal;" + stemcellVersionTagPrefix + "5-0"
 
 	var capturedTag string
 	qemu := &wbMockQEMU{
@@ -1195,7 +1344,10 @@ func TestEnsureTemplateVM_SHATagFormat(t *testing.T) {
 	}
 
 	cp := stemcellCloudProps{Name: "ubuntu-focal", Version: "5.0"}
-	vmid, err := ensureTemplateVM(context.Background(), deps, "pve-node1", "nfs", "focal.qcow2", fullSHA, false, cp, "")
+	stemcellCID := pve.BuildLightStemcellCID("nfs", "focal.qcow2")
+	vmid, _, err := ensureTemplateVM(context.Background(), deps, "pve-node1", "nfs", "focal.qcow2", fullSHA,
+		"",
+		pve.StemcellKindLight, stemcellCID, "test-director", cp, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1207,9 +1359,73 @@ func TestEnsureTemplateVM_SHATagFormat(t *testing.T) {
 	}
 }
 
-// TestEnsureTemplateVM_FindTemplateByNameAPIError verifies that an API error
-// from FindTemplateByName (ListQemu) propagates as an error, no VM is created.
-func TestEnsureTemplateVM_FindTemplateByNameAPIError(t *testing.T) {
+// TestEnsureTemplateVM_KnownSHA8Fallback_WritesTagWithoutFullDigest verifies
+// the knownSHA8 fallback directly: when sha256hex is empty but the caller
+// supplies a genuinely content-derived sha8 (e.g. recovered from an existing
+// qcow2's filename — the light-fetch prefix-dedup case), the built template
+// carries the correct "bosh-stemcell-sha-<sha8>" tag (letting the sha-tag
+// cluster scan and delete_stemcell's lookup find it), but its provenance
+// notes record NEITHER a sha8 NOR a full sha256 — buildStemcellProvenanceNotesPath
+// derives its own SHA8 field from the full digest alone, so a template built
+// from only a recovered sha8 records nothing there rather than an unverified
+// value it cannot independently confirm. Downstream code never reads
+// stemcellProvenance.SHA8 (it exists purely as descriptive metadata), so this
+// asymmetry between the tag and the notes JSON is intentional and harmless.
+func TestEnsureTemplateVM_KnownSHA8Fallback_WritesTagWithoutFullDigest(t *testing.T) {
+	t.Parallel()
+
+	const knownSHA8 = "deadbeef"
+	wantTag := ownershipTag + ";" + stemcellCacheTag + ";bosh-stemcell-sha-" + knownSHA8 + ";" +
+		stemcellMarkerTag + ";" + stemcellNameTagPrefix + "ubuntu-focal;" + stemcellVersionTagPrefix + "9-0"
+
+	var capturedTag string
+	var capturedDescription string
+	qemu := &wbMockQEMU{
+		createFn: func(_ context.Context, _ string, params map[string]any) (string, error) {
+			capturedTag, _ = params["tags"].(string)
+			capturedDescription, _ = params[pveConfigKeyDescription].(string)
+			return "", nil
+		},
+	}
+	nodes := &wbTemplateNodes{listQemuFn: listQemuEmpty()}
+	deps := buildEnsureTemplateDeps(qemu, nodes, &wbMockTasks{}, &wbTemplateStorage{})
+	deps.PVE.(*wbTemplateMockClient).clusterSvc = &wbClusterForAlloc{
+		listResourcesFn: listClusterResourcesEmpty(),
+	}
+
+	cp := stemcellCloudProps{Name: "ubuntu-focal", Version: "9.0"}
+	stemcellCID := pve.BuildHeavyStemcellCID("nfs", "focal.qcow2")
+	vmid, _, err := ensureTemplateVM(context.Background(), deps, "pve-node1", "nfs", "focal.qcow2",
+		"" /* sha256hex unknown */, knownSHA8,
+		pve.StemcellKindHeavy, stemcellCID, "test-director", cp, "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if vmid == 0 {
+		t.Error("expected non-zero vmid")
+	}
+	if capturedTag != wantTag {
+		t.Errorf("tag = %q; want %q", capturedTag, wantTag)
+	}
+
+	var prov stemcellProvenance
+	if jsonErr := json.Unmarshal([]byte(capturedDescription), &prov); jsonErr != nil {
+		t.Fatalf("description not valid JSON: %v — raw: %q", jsonErr, capturedDescription)
+	}
+	if prov.SHA8 != "" {
+		t.Errorf("provenance SHA8 = %q; want empty — recorded only alongside a verified full sha256", prov.SHA8)
+	}
+	if prov.SHA256 != "" {
+		t.Errorf("provenance SHA256 = %q; want empty — the caller only knows sha8, not the full digest", prov.SHA256)
+	}
+}
+
+// TestEnsureTemplateVM_FindTemplateByNameClusterAPIError verifies that an API
+// error from the cluster-scoped name lookup (pve.FindTemplateByNameCluster,
+// Cluster().ListResources) propagates as an error and no VM is created. Only
+// reachable when sha8 is unknown (empty sha256hex) — a known sha8 never
+// consults the name-keyed fallback.
+func TestEnsureTemplateVM_FindTemplateByNameClusterAPIError(t *testing.T) {
 	t.Parallel()
 
 	var createCalled bool
@@ -1219,24 +1435,25 @@ func TestEnsureTemplateVM_FindTemplateByNameAPIError(t *testing.T) {
 			return "", nil
 		},
 	}
-	nodes := &wbTemplateNodes{
-		listQemuFn: func(_ context.Context, _ string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
+	nodes := &wbTemplateNodes{listQemuFn: listQemuEmpty()}
+	deps := buildEnsureTemplateDeps(qemu, nodes, &wbMockTasks{}, &wbTemplateStorage{})
+	deps.PVE.(*wbTemplateMockClient).clusterSvc = &wbClusterForAlloc{
+		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
 			return nil, errors.New("PVE: connection refused")
 		},
 	}
-	deps := buildEnsureTemplateDeps(qemu, nodes, &wbMockTasks{}, &wbTemplateStorage{})
-	deps.PVE.(*wbTemplateMockClient).clusterSvc = &wbClusterForAlloc{
-		listResourcesFn: listClusterResourcesEmpty(),
-	}
 
 	cp := stemcellCloudProps{Name: "ubuntu-focal", Version: "6.0"}
-	_, err := ensureTemplateVM(context.Background(), deps, "pve-node1", "nfs", "x.qcow2",
-		"aabbccddee112233aabbccddee112233aabbccddee112233aabbccddee112233", true, cp, "")
+	stemcellCID := pve.BuildHeavyStemcellCID("nfs", "x.qcow2")
+	_, _, err := ensureTemplateVM(context.Background(), deps, "pve-node1", "nfs", "x.qcow2",
+		"", // sha8 unknown → name-fallback branch, which hits the failing cluster lookup
+		"",
+		pve.StemcellKindHeavy, stemcellCID, "test-director", cp, "")
 	if err == nil {
-		t.Fatal("expected error when FindTemplateByName fails; got nil")
+		t.Fatal("expected error when FindTemplateByNameCluster fails; got nil")
 	}
 	if createCalled {
-		t.Error("QEMU.Create must NOT be called when FindTemplateByName fails")
+		t.Error("QEMU.Create must NOT be called when FindTemplateByNameCluster fails")
 	}
 }
 
@@ -1393,8 +1610,11 @@ func TestEnsureTemplateVM_PoolAssignment_Called(t *testing.T) {
 	}
 
 	cp := stemcellCloudProps{Name: "ubuntu-jammy", Version: "7.0"}
-	vmid, err := ensureTemplateVM(context.Background(), deps, "pve-node1", "nfs", "jammy.qcow2",
-		"aabbccddee112233aabbccddee112233aabbccddee112233aabbccddee112233", false, cp, "")
+	stemcellCID := pve.BuildHeavyStemcellCID("nfs", "jammy.qcow2")
+	vmid, _, err := ensureTemplateVM(context.Background(), deps, "pve-node1", "nfs", "jammy.qcow2",
+		"aabbccddee112233aabbccddee112233aabbccddee112233aabbccddee112233",
+		"",
+		pve.StemcellKindHeavy, stemcellCID, "test-director", cp, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1428,8 +1648,11 @@ func TestEnsureTemplateVM_NoPool_AddVMNotCalled(t *testing.T) {
 	}
 
 	cp := stemcellCloudProps{Name: "ubuntu-focal", Version: "8.0"}
-	_, err := ensureTemplateVM(context.Background(), deps, "pve-node1", "nfs", "focal.qcow2",
-		"aabbccddee112233aabbccddee112233aabbccddee112233aabbccddee112233", false, cp, "")
+	stemcellCID := pve.BuildHeavyStemcellCID("nfs", "focal.qcow2")
+	_, _, err := ensureTemplateVM(context.Background(), deps, "pve-node1", "nfs", "focal.qcow2",
+		"aabbccddee112233aabbccddee112233aabbccddee112233aabbccddee112233",
+		"",
+		pve.StemcellKindHeavy, stemcellCID, "test-director", cp, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1457,8 +1680,11 @@ func TestEnsureTemplateVM_PoolAssignmentError_ReturnsError(t *testing.T) {
 	}
 
 	cp := stemcellCloudProps{Name: "ubuntu-bionic", Version: "9.0"}
-	_, err := ensureTemplateVM(context.Background(), deps, "pve-node1", "nfs", "bionic.qcow2",
-		"aabbccddee112233aabbccddee112233aabbccddee112233aabbccddee112233", false, cp, "")
+	stemcellCID := pve.BuildHeavyStemcellCID("nfs", "bionic.qcow2")
+	_, _, err := ensureTemplateVM(context.Background(), deps, "pve-node1", "nfs", "bionic.qcow2",
+		"aabbccddee112233aabbccddee112233aabbccddee112233aabbccddee112233",
+		"",
+		pve.StemcellKindHeavy, stemcellCID, "test-director", cp, "")
 	if err == nil {
 		t.Fatal("expected error when pool AddVM fails; got nil")
 	}
@@ -1485,8 +1711,11 @@ func TestEnsureTemplateVM_PoolCreatedIfMissing(t *testing.T) {
 	}
 
 	cp := stemcellCloudProps{Name: "ubuntu-jammy", Version: "10.0"}
-	vmid, err := ensureTemplateVM(context.Background(), deps, "pve-node1", "nfs", "jammy2.qcow2",
-		"aabbccddee112233aabbccddee112233aabbccddee112233aabbccddee112233", false, cp, "")
+	stemcellCID := pve.BuildHeavyStemcellCID("nfs", "jammy2.qcow2")
+	vmid, _, err := ensureTemplateVM(context.Background(), deps, "pve-node1", "nfs", "jammy2.qcow2",
+		"aabbccddee112233aabbccddee112233aabbccddee112233aabbccddee112233",
+		"",
+		pve.StemcellKindHeavy, stemcellCID, "test-director", cp, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1533,8 +1762,11 @@ func TestEnsureTemplateVM_PoolDuplicateTolerated(t *testing.T) {
 	}
 
 	cp := stemcellCloudProps{Name: "ubuntu-jammy", Version: "11.0"}
-	vmid, err := ensureTemplateVM(context.Background(), deps, "pve-node1", "nfs", "jammy3.qcow2",
-		"aabbccddee112233aabbccddee112233aabbccddee112233aabbccddee112233", false, cp, "")
+	stemcellCID := pve.BuildHeavyStemcellCID("nfs", "jammy3.qcow2")
+	vmid, _, err := ensureTemplateVM(context.Background(), deps, "pve-node1", "nfs", "jammy3.qcow2",
+		"aabbccddee112233aabbccddee112233aabbccddee112233aabbccddee112233",
+		"",
+		pve.StemcellKindHeavy, stemcellCID, "test-director", cp, "")
 	if err != nil {
 		t.Fatalf("unexpected error (duplicate-pool CreatePool error must be tolerated): %v", err)
 	}
@@ -1565,8 +1797,11 @@ func TestEnsureTemplateVM_AssignStillFatal(t *testing.T) {
 	}
 
 	cp := stemcellCloudProps{Name: "ubuntu-jammy", Version: "12.0"}
-	_, err := ensureTemplateVM(context.Background(), deps, "pve-node1", "nfs", "jammy4.qcow2",
-		"aabbccddee112233aabbccddee112233aabbccddee112233aabbccddee112233", false, cp, "")
+	stemcellCID := pve.BuildHeavyStemcellCID("nfs", "jammy4.qcow2")
+	_, _, err := ensureTemplateVM(context.Background(), deps, "pve-node1", "nfs", "jammy4.qcow2",
+		"aabbccddee112233aabbccddee112233aabbccddee112233aabbccddee112233",
+		"",
+		pve.StemcellKindHeavy, stemcellCID, "test-director", cp, "")
 	if err == nil {
 		t.Fatal("expected error when AddVM fails after a successful CreatePool; got nil")
 	}
@@ -1579,26 +1814,18 @@ func TestEnsureTemplateVM_AssignStillFatal(t *testing.T) {
 	}
 }
 
-// listQemuTemplateWithTag returns a ListQemu stub reporting a single frozen
-// template carrying both a name and a tags string. PVE emits the template flag
-// as the integer 1 (Perl-backed API), matching the real wire shape.
-func listQemuTemplateWithTag(name, tags string, vmid int64) func(ctx context.Context, node string, params *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
-	return func(_ context.Context, _ string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
-		raw := json.RawMessage(fmt.Sprintf(`{"vmid":%d,"name":%q,"tags":%q,"template":1}`, vmid, name, tags))
-		resp := sdknodes.ListQemuResponse{raw}
-		return &resp, nil
-	}
-}
-
 // TestEnsureTemplateVM_DedupBySHATag_AcrossNameSchemeChange verifies that an
 // existing template is reused when its sha tag matches, even though its NAME
-// differs from the freshly-derived BuildTemplateName output. This is the
-// dot-vs-dash naming-scheme change (commit 2b01653): keying dedup solely on the
-// mutable display name orphaned identical-disk templates and created duplicates.
+// differs from the freshly-derived BuildTemplateNameWithSHA output. This is
+// the dot-vs-dash naming-scheme change (commit 2b01653): keying dedup solely
+// on the mutable display name orphaned identical-disk templates and created
+// duplicates. Cluster-scoped (P1.4): the match comes from Cluster().ListResources,
+// not a node-scoped ListQemu scan.
 func TestEnsureTemplateVM_DedupBySHATag_AcrossNameSchemeChange(t *testing.T) {
 	t.Parallel()
 
 	const existingVMID = int64(30203)
+	const existingNode = "pve-node1"
 	const sha8 = "891b3b74"
 	const fullSHA = sha8 + "00000000000000000000000000000000000000000000000000000000"
 	// Existing template carries the OLD dot-form name; the new derivation yields
@@ -1611,23 +1838,45 @@ func TestEnsureTemplateVM_DedupBySHATag_AcrossNameSchemeChange(t *testing.T) {
 			createCalled = true
 			return "", nil
 		},
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return map[string]any{}, nil
+		},
 	}
 	nodes := &wbTemplateNodes{
-		listQemuFn: listQemuTemplateWithTag(oldName, "bosh-stemcell-sha-"+sha8, existingVMID),
+		listQemuFn: listQemuEmpty(),
+		wbMockNodes: wbMockNodes{
+			// Backs stemcellBackingQCow2Exists.
+			listStorageFn: func(_ context.Context, _, _ string, _ *sdknodes.ListStorageContentParams) (*sdknodes.ListStorageContentResponse, error) {
+				entry, _ := json.Marshal(map[string]any{"volid": "nfs:import/noble.qcow2"})
+				resp := sdknodes.ListStorageContentResponse{entry}
+				return &resp, nil
+			},
+		},
 	}
 	deps := buildEnsureTemplateDeps(qemu, nodes, &wbMockTasks{}, &wbTemplateStorage{})
 	deps.PVE.(*wbTemplateMockClient).clusterSvc = &wbClusterForAlloc{
-		listResourcesFn: listClusterResourcesEmpty(),
+		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+			resp := sdkcluster.ListResourcesResponse{
+				clusterResourceQemuTemplate(existingVMID, existingNode, oldName, "bosh-stemcell-sha-"+sha8),
+			}
+			return &resp, nil
+		},
 	}
 
-	// cp produces the NEW dash-form name "bosh-stemcell-ubuntu-noble-1-364".
+	// cp produces the NEW dash-form name "bosh-stemcell-ubuntu-noble-1-364-891b3b74".
 	cp := stemcellCloudProps{Name: "ubuntu-noble", Version: "1.364"}
-	vmid, err := ensureTemplateVM(context.Background(), deps, "pve-node1", "nfs", "noble.qcow2", fullSHA, true, cp, "")
+	stemcellCID := pve.BuildHeavyStemcellCID("nfs", "noble.qcow2")
+	vmid, node, err := ensureTemplateVM(context.Background(), deps, "pve-node1", "nfs", "noble.qcow2", fullSHA,
+		"",
+		pve.StemcellKindHeavy, stemcellCID, "test-director", cp, "")
 	if err != nil {
 		t.Fatalf("ensureTemplateVM returned error: %v", err)
 	}
 	if vmid != existingVMID {
 		t.Errorf("vmid = %d; want %d (reuse by sha tag across name-scheme change)", vmid, existingVMID)
+	}
+	if node != existingNode {
+		t.Errorf("node = %q; want %q", node, existingNode)
 	}
 	if createCalled {
 		t.Error("QEMU.Create must NOT be called: existing template matched by sha tag")
@@ -1646,11 +1895,18 @@ func (n *wbTemplateNodes) DeleteQemu(ctx context.Context, node, vmid string, par
 // TestEnsureTemplateVM_LostRace_DeletesDuplicateAndReusesSurvivor verifies the
 // TOCTOU reconcile: when a concurrent create_stemcell froze a lower-VMID twin
 // in the window between our lookup and our freeze, ensureTemplateVM deletes the
-// template it just created and returns the survivor's VMID.
+// template it just created and returns the survivor's VMID (and node).
+//
+// Cluster-scoped (P1.4): both the pre-create sha-tag dedup lookup and the
+// post-freeze reconcile scan go through Cluster().ListResources, as does
+// pve.AllocateWithRetry's NextVMID call in between — so the fixture's call
+// counter now instruments wbClusterForAlloc.listResourcesFn (calls 1-2 empty,
+// call 3+ reports the survivor) rather than nodes.listQemuFn.
 func TestEnsureTemplateVM_LostRace_DeletesDuplicateAndReusesSurvivor(t *testing.T) {
 	const sha8 = "891b3b74"
 	const fullSHA = sha8 + "00000000000000000000000000000000000000000000000000000000"
 	const survivorVMID = int64(1) // impossibly low → guaranteed < our random allocation
+	const survivorNode = "pve-node1"
 
 	var listCalls int
 	var allocatedVMID int64
@@ -1664,18 +1920,18 @@ func TestEnsureTemplateVM_LostRace_DeletesDuplicateAndReusesSurvivor(t *testing.
 			return "", nil
 		},
 	}
-	nodes := &wbTemplateNodes{}
-	nodes.listQemuFn = func(_ context.Context, _ string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
-		listCalls++
-		// First two scans are the pre-create lookups (sha tag, then name): empty.
-		// Any later scan is the post-freeze reconcile: report the lower-VMID twin.
-		if listCalls <= 2 {
-			empty := sdknodes.ListQemuResponse{}
-			return &empty, nil
-		}
-		raw := json.RawMessage(fmt.Sprintf(`{"vmid":%d,"name":"bosh-stemcell-x","tags":"bosh-stemcell-sha-%s","template":1}`, survivorVMID, sha8))
-		resp := sdknodes.ListQemuResponse{raw}
-		return &resp, nil
+	nodes := &wbTemplateNodes{
+		listQemuFn: listQemuEmpty(),
+		wbMockNodes: wbMockNodes{
+			// Backs stemcellBackingQCow2Exists: the survivor's
+			// backing qcow2 must still be confirmed present before reconcile
+			// adopts it as the race winner.
+			listStorageFn: func(_ context.Context, _, _ string, _ *sdknodes.ListStorageContentParams) (*sdknodes.ListStorageContentResponse, error) {
+				entry, _ := json.Marshal(map[string]any{"volid": "nfs:import/noble.qcow2"})
+				resp := sdknodes.ListStorageContentResponse{entry}
+				return &resp, nil
+			},
+		},
 	}
 	nodes.deleteQemuFn = func(_ context.Context, _, vmid string, _ *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
 		deletedVMID = vmid
@@ -1685,13 +1941,32 @@ func TestEnsureTemplateVM_LostRace_DeletesDuplicateAndReusesSurvivor(t *testing.
 
 	deps := buildEnsureTemplateDeps(qemu, nodes, &wbMockTasks{}, &wbTemplateStorage{})
 	deps.PVE.(*wbTemplateMockClient).clusterSvc = &wbClusterForAlloc{
-		listResourcesFn: listClusterResourcesEmpty(),
+		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+			listCalls++
+			// Calls 1-2 are the pre-create sha-tag dedup lookup and
+			// AllocateWithRetry's NextVMID cluster scan: empty. Any later call
+			// is the post-freeze reconcile: report the lower-VMID twin.
+			if listCalls <= 2 {
+				empty := sdkcluster.ListResourcesResponse{}
+				return &empty, nil
+			}
+			resp := sdkcluster.ListResourcesResponse{
+				clusterResourceQemuTemplate(survivorVMID, survivorNode, "bosh-stemcell-x", "bosh-stemcell-sha-"+sha8),
+			}
+			return &resp, nil
+		},
 	}
 
 	cp := stemcellCloudProps{Name: "ubuntu-noble", Version: "1.364"}
-	vmid, err := ensureTemplateVM(context.Background(), deps, "pve-node1", "nfs", "noble.qcow2", fullSHA, true, cp, "")
+	stemcellCID := pve.BuildHeavyStemcellCID("nfs", "noble.qcow2")
+	vmid, node, err := ensureTemplateVM(context.Background(), deps, "pve-node1", "nfs", "noble.qcow2", fullSHA,
+		"",
+		pve.StemcellKindHeavy, stemcellCID, "test-director", cp, "")
 	if err != nil {
 		t.Fatalf("ensureTemplateVM returned error: %v", err)
+	}
+	if node != survivorNode {
+		t.Errorf("node = %q; want survivor node %q", node, survivorNode)
 	}
 	if vmid != survivorVMID {
 		t.Errorf("vmid = %d; want survivor %d", vmid, survivorVMID)
@@ -1699,6 +1974,130 @@ func TestEnsureTemplateVM_LostRace_DeletesDuplicateAndReusesSurvivor(t *testing.
 	wantDeleted := strconv.FormatInt(allocatedVMID, 10)
 	if deletedVMID != wantDeleted {
 		t.Errorf("deleted VMID = %q; want our just-created allocation %q", deletedVMID, wantDeleted)
+	}
+}
+
+// TestEnsureTemplateVM_RaceReconcile_SkipsSHA256CollidingTwin verifies the
+// post-freeze reconcile applies the full-sha256 provenance guard: a lower-VMID
+// template carrying the same sha8 tag but a DIFFERENT full sha256 (a 32-bit
+// tag collision, not a genuine twin) must NOT be adopted — our freshly-frozen
+// template survives and nothing is deleted.
+func TestEnsureTemplateVM_RaceReconcile_SkipsSHA256CollidingTwin(t *testing.T) {
+	const sha8 = "891b3b74"
+	const fullSHA = sha8 + "00000000000000000000000000000000000000000000000000000000"
+	const collidingSHA = sha8 + "ffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+	const twinVMID = int64(1) // impossibly low → always below our random allocation
+	const twinNode = "pve-node1"
+
+	collidingDescription, marshalErr := json.Marshal(stemcellProvenance{
+		Name: "ubuntu-noble", Version: "1.364", SHA8: sha8, SHA256: collidingSHA,
+		Kind: string(pve.StemcellKindHeavy), CreatedBy: "dir-a", DirectorRefs: []string{"dir-a"},
+	})
+	if marshalErr != nil {
+		t.Fatalf("marshal fixture description: %v", marshalErr)
+	}
+
+	var listCalls int
+	var allocatedVMID int64
+	var deleteCalled bool
+
+	qemu := &wbMockQEMU{
+		createFn: func(_ context.Context, _ string, params map[string]any) (string, error) {
+			if v, ok := params["vmid"].(int); ok {
+				allocatedVMID = int64(v)
+			}
+			return "", nil
+		},
+		configFn: func(_ context.Context, _ string, vmid int) (map[string]any, error) {
+			if int64(vmid) == twinVMID {
+				return map[string]any{"description": string(collidingDescription)}, nil
+			}
+			return map[string]any{}, nil
+		},
+	}
+	nodes := &wbTemplateNodes{listQemuFn: listQemuEmpty()}
+	nodes.deleteQemuFn = func(_ context.Context, _, _ string, _ *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
+		deleteCalled = true
+		raw := sdknodes.DeleteQemuResponse(`""`)
+		return &raw, nil
+	}
+
+	deps := buildEnsureTemplateDeps(qemu, nodes, &wbMockTasks{}, &wbTemplateStorage{})
+	deps.PVE.(*wbTemplateMockClient).clusterSvc = &wbClusterForAlloc{
+		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+			listCalls++
+			// Calls 1-2: pre-create dedup lookup + NextVMID scan (empty).
+			// Later calls: the reconcile scan sees only the colliding twin.
+			if listCalls <= 2 {
+				empty := sdkcluster.ListResourcesResponse{}
+				return &empty, nil
+			}
+			resp := sdkcluster.ListResourcesResponse{
+				clusterResourceQemuTemplate(twinVMID, twinNode, "bosh-stemcell-x", "bosh-stemcell-sha-"+sha8),
+			}
+			return &resp, nil
+		},
+	}
+
+	cp := stemcellCloudProps{Name: "ubuntu-noble", Version: "1.364"}
+	stemcellCID := pve.BuildHeavyStemcellCID("nfs", "noble.qcow2")
+	vmid, _, err := ensureTemplateVM(context.Background(), deps, "pve-node1", "nfs", "noble.qcow2", fullSHA,
+		"",
+		pve.StemcellKindHeavy, stemcellCID, "test-director", cp, "")
+	if err != nil {
+		t.Fatalf("ensureTemplateVM returned error: %v", err)
+	}
+	if vmid != allocatedVMID {
+		t.Errorf("vmid = %d; want our own allocation %d (colliding twin must not be adopted)", vmid, allocatedVMID)
+	}
+	if deleteCalled {
+		t.Error("our template was deleted; the sha256-colliding twin must not win the reconcile")
+	}
+}
+
+// TestDeleteTemplateVM_DestroyDisksFollowsConfig verifies that deleteTemplateVM
+// routes DestroyUnreferencedDisks through deps.Config.DestroyUnreferencedDisks
+// instead of hardcoding true — same rationale as destroyTemplateVM in
+// delete_stemcell.go: on storage shared by a second cluster with an
+// overlapping VMID band, an unconditional true would free the OTHER
+// cluster's VMID-matching volumes.
+func TestDeleteTemplateVM_DestroyDisksFollowsConfig(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name             string
+		configFlag       bool
+		wantDestroyValue bool
+	}{
+		{name: "config false propagates false", configFlag: false, wantDestroyValue: false},
+		{name: "config true propagates true", configFlag: true, wantDestroyValue: true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			var capturedDestroy *bool
+			nodes := &wbTemplateNodes{listQemuFn: listQemuEmpty()}
+			nodes.deleteQemuFn = func(_ context.Context, _, _ string, params *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
+				capturedDestroy = params.DestroyUnreferencedDisks
+				raw := sdknodes.DeleteQemuResponse(`""`)
+				return &raw, nil
+			}
+			deps := buildEnsureTemplateDeps(&wbMockQEMU{}, nodes, &wbMockTasks{}, &wbTemplateStorage{})
+			deps.Config.DestroyUnreferencedDisks = tc.configFlag
+
+			if err := deleteTemplateVM(context.Background(), deps, "pve-node1", 30500, deps.Logger); err != nil {
+				t.Fatalf("deleteTemplateVM returned error: %v", err)
+			}
+			if capturedDestroy == nil {
+				t.Fatal("DeleteQemuParams.DestroyUnreferencedDisks was not set")
+			}
+			if *capturedDestroy != tc.wantDestroyValue {
+				t.Errorf("DestroyUnreferencedDisks = %v; want %v (config.DestroyUnreferencedDisks=%v)",
+					*capturedDestroy, tc.wantDestroyValue, tc.configFlag)
+			}
+		})
 	}
 }
 
@@ -1713,10 +2112,9 @@ type wbProvCapture struct {
 	params map[string]any
 }
 
-// buildProvDeps returns a Deps wired for attemptCreateTemplateVM provenance
-// tests. qemu.createFn captures createParams into the returned wbProvCapture.
-// provenanceOn controls whether deps.Config.Stemcell.Provenance is set to true.
-func buildProvDeps(t *testing.T, provenanceOn bool, directorID string) (Deps, *wbProvCapture) {
+// buildProvDeps returns a Deps wired for attemptCreateTemplateVM tests.
+// qemu.createFn captures createParams into the returned wbProvCapture.
+func buildProvDeps(t *testing.T) (Deps, *wbProvCapture) {
 	t.Helper()
 	captured := &wbProvCapture{params: make(map[string]any)}
 	qemu := &wbMockQEMU{
@@ -1732,116 +2130,74 @@ func buildProvDeps(t *testing.T, provenanceOn bool, directorID string) (Deps, *w
 	deps.PVE.(*wbTemplateMockClient).clusterSvc = &wbClusterForAlloc{
 		listResourcesFn: listClusterResourcesEmpty(),
 	}
-	if provenanceOn {
-		trueVal := true
-		deps.Config.Stemcell = &config.StemcellProvenanceConfig{
-			Provenance: &trueVal,
-			DirectorID: directorID,
-		}
-	}
 	return deps, captured
 }
 
-// TestAttemptCreateTemplateVM_ProvenanceOFF verifies that when provenance is
-// disabled (default), createParams["tags"] equals exactly the raw shaTag string
-// and no "description" key is present — byte-identical to pre-provenance.
-func TestAttemptCreateTemplateVM_ProvenanceOFF(t *testing.T) {
+// TestAttemptCreateTemplateVM_ProvenanceAlwaysWritten verifies P1.6: provenance
+// tags (ownership/cache/sha/marker/name/version) and the full notes JSON
+// (name, version, sha8, sha256, kind, cid, created_by, created, director_refs
+// seeded with the creating director) are unconditionally written — there is
+// no config gate. attemptCreateTemplateVM itself does NOT stamp a
+// "director--<uuid>" tag (that is registerStemcellDirectorRef's job, applied
+// per registration, not per template build).
+func TestAttemptCreateTemplateVM_ProvenanceAlwaysWritten(t *testing.T) {
 	t.Parallel()
 
 	const sha8 = "abcdef12"
 	const shaTag = stemcellSHATagPrefix + sha8
-
-	deps, got := buildProvDeps(t, false, "")
-
-	cp := stemcellCloudProps{Name: "ubuntu-jammy", Version: "1.0"}
-	err := attemptCreateTemplateVM(
-		context.Background(), deps, deps.Logger,
-		"pve-node1", 30001,
-		"bosh-stemcell-ubuntu-jammy-1-0", "nfs:import/test.qcow2", shaTag, "nfs",
-		cp, "/tmp/test.qcow2", nil,
-	)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	// tags must be exactly "bosh-cpi;<shaTag>" — ownershipTag is always
-	// prepended; no other tokens when provenance is OFF.
-	wantTagsOFF := ownershipTag + ";" + shaTag
-	gotTags, _ := got.params["tags"].(string)
-	if gotTags != wantTagsOFF {
-		t.Errorf("tags = %q; want %q (byte-identical OFF path)", gotTags, wantTagsOFF)
-	}
-
-	// When provenance is OFF, description is written as a minimal JSON object
-	// containing only stemcell_refs (for reference counting). Verify it is valid
-	// JSON and contains only the refs field — no name/version/sha8/source/director.
-	descRaw, hasDesc := got.params["description"].(string)
-	if !hasDesc || descRaw == "" {
-		t.Fatal("description must be present (minimal refs JSON) even when provenance is OFF")
-	}
-	var prov stemcellProvenance
-	if err := json.Unmarshal([]byte(descRaw), &prov); err != nil {
-		t.Fatalf("description is not valid JSON when provenance OFF: %v — raw: %q", err, descRaw)
-	}
-	if prov.StemcellRefs == "" {
-		t.Error("stemcell_refs must be non-empty in minimal description when provenance is OFF")
-	}
-	// Full provenance fields must NOT be set when provenance is OFF.
-	if prov.Name != "" {
-		t.Errorf("name must be empty in minimal description (provenance OFF); got %q", prov.Name)
-	}
-	if prov.DirectorID != "" {
-		t.Errorf("director_id must be empty in minimal description (provenance OFF); got %q", prov.DirectorID)
-	}
-}
-
-// TestAttemptCreateTemplateVM_ProvenanceON verifies that when provenance is
-// enabled, createParams["description"] is valid JSON with the expected fields
-// and createParams["tags"] includes shaTag plus the provenance marker/name/
-// version/director tokens.
-func TestAttemptCreateTemplateVM_ProvenanceON(t *testing.T) {
-	t.Parallel()
-
-	const sha8 = "abcdef12"
-	const shaTag = stemcellSHATagPrefix + sha8
-	const directorID = "prod-director"
+	const sha256hex = sha8 + "34567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+	const creatingDirectorUUID = "prod-director-uuid"
 	const stemcellName = "ubuntu-jammy"
 	const stemcellVersion = "1.438"
 
-	deps, got := buildProvDeps(t, true, directorID)
+	deps, got := buildProvDeps(t)
 
 	cp := stemcellCloudProps{Name: stemcellName, Version: stemcellVersion}
 	source := "https://s3.example.com/ubuntu-jammy.qcow2"
+	stemcellCID := pve.BuildHeavyStemcellCID("nfs", "jammy.qcow2")
+	spec := templateBuildSpec{
+		TemplateName:         "bosh-stemcell-ubuntu-jammy-1-438-" + sha8,
+		ImportVolid:          "nfs:import/jammy.qcow2",
+		ShaTag:               shaTag,
+		SHA256Hex:            sha256hex,
+		TargetStorage:        "nfs",
+		Kind:                 pve.StemcellKindHeavy,
+		CID:                  stemcellCID,
+		CreatingDirectorUUID: creatingDirectorUUID,
+	}
 	err := attemptCreateTemplateVM(
 		context.Background(), deps, deps.Logger,
-		"pve-node1", 30001,
-		"bosh-stemcell-ubuntu-jammy-1-438", "nfs:import/jammy.qcow2", shaTag, "nfs",
-		cp, source, nil,
+		"pve-node1", 30001, spec,
+		cp, source,
 	)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// tags must contain ownership marker + shaTag + stemcell marker + name +
-	// version + director tokens.
+	// tags must contain ownership + cache markers + shaTag + stemcell marker +
+	// name + version tokens. No "director--" token here (per-registration, not
+	// per-build).
 	gotTags, _ := got.params["tags"].(string)
 	for _, wantToken := range []string{
 		ownershipTag,
+		stemcellCacheTag,
 		shaTag,
 		stemcellMarkerTag,
 		stemcellNameTagPrefix + sanitizeTagValue(stemcellName),
 		stemcellVersionTagPrefix + sanitizeTagValue(stemcellVersion),
-		"director--" + sanitizeTagValue(directorID),
 	} {
 		if !strings.Contains(gotTags, wantToken) {
 			t.Errorf("tags %q missing expected token %q", gotTags, wantToken)
 		}
 	}
+	if strings.Contains(gotTags, "director--") {
+		t.Errorf("tags %q must NOT contain a director--<uuid> token (attemptCreateTemplateVM does not stamp it)", gotTags)
+	}
 
-	// description must be valid JSON with required provenance fields.
+	// description must be valid JSON with the full path-identity provenance fields.
 	descRaw, hasDesc := got.params["description"].(string)
 	if !hasDesc || descRaw == "" {
-		t.Fatalf("description key missing or empty when provenance is ON")
+		t.Fatalf("description key missing or empty")
 	}
 	var prov stemcellProvenance
 	if err := json.Unmarshal([]byte(descRaw), &prov); err != nil {
@@ -1856,8 +2212,20 @@ func TestAttemptCreateTemplateVM_ProvenanceON(t *testing.T) {
 	if prov.SHA8 != sha8 {
 		t.Errorf("provenance.sha8 = %q; want %q", prov.SHA8, sha8)
 	}
-	if prov.DirectorID != directorID {
-		t.Errorf("provenance.director_id = %q; want %q", prov.DirectorID, directorID)
+	if prov.SHA256 != sha256hex {
+		t.Errorf("provenance.sha256 = %q; want %q", prov.SHA256, sha256hex)
+	}
+	if prov.Kind != string(pve.StemcellKindHeavy) {
+		t.Errorf("provenance.kind = %q; want %q", prov.Kind, pve.StemcellKindHeavy)
+	}
+	if prov.CID != stemcellCID {
+		t.Errorf("provenance.cid = %q; want %q", prov.CID, stemcellCID)
+	}
+	if prov.CreatedBy != creatingDirectorUUID {
+		t.Errorf("provenance.created_by = %q; want %q", prov.CreatedBy, creatingDirectorUUID)
+	}
+	if len(prov.DirectorRefs) != 1 || prov.DirectorRefs[0] != creatingDirectorUUID {
+		t.Errorf("provenance.director_refs = %v; want [%q]", prov.DirectorRefs, creatingDirectorUUID)
 	}
 	if prov.Source != source {
 		t.Errorf("provenance.source = %q; want %q", prov.Source, source)
@@ -1867,95 +2235,64 @@ func TestAttemptCreateTemplateVM_ProvenanceON(t *testing.T) {
 	}
 }
 
-// TestAttemptCreateTemplateVM_ReplicaProvenanceOFF verifies that with
-// extraBaseTags=[nodeTag] and provenance OFF, the tags field is exactly
-// "shaTag;nodeTag" — byte-identical to the old combinedTags join.
-func TestAttemptCreateTemplateVM_ReplicaProvenanceOFF(t *testing.T) {
+// TestAttemptCreateTemplateVM_Replica verifies that with
+// spec.ExtraBaseTags=[nodeTag], the tags field carries ownership, cache, sha,
+// and node markers together, and the full provenance notes JSON is written
+// exactly as the primary path's.
+func TestAttemptCreateTemplateVM_Replica(t *testing.T) {
 	t.Parallel()
 
 	const sha8 = "abcdef12"
 	const shaTag = stemcellSHATagPrefix + sha8
-	const replicaNode = "pve-node2"
-	nodeTag := pve.ReplicaNodeTagForNode(replicaNode)
-	// ownershipTag ("bosh-cpi") is always first; sha and node follow.
-	wantTags := ownershipTag + ";" + shaTag + ";" + nodeTag
-
-	deps, got := buildProvDeps(t, false, "")
-	cp := stemcellCloudProps{Name: "ubuntu-jammy", Version: "1.0"}
-	err := attemptCreateTemplateVM(
-		context.Background(), deps, deps.Logger,
-		replicaNode, 30002,
-		"bosh-stemcell-ubuntu-jammy-1-0", "nfs:import/jammy.qcow2", shaTag, "nfs",
-		cp, "/tmp/jammy.qcow2", []string{nodeTag},
-	)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	gotTags, _ := got.params["tags"].(string)
-	if gotTags != wantTags {
-		t.Errorf("replica OFF tags = %q; want %q (byte-identical combinedTags)", gotTags, wantTags)
-	}
-	// Replica provenance OFF: description is the minimal refs JSON, same as
-	// primary provenance OFF path (stemcell_refs only, no full provenance fields).
-	descRaw, hasDesc := got.params["description"].(string)
-	if !hasDesc || descRaw == "" {
-		t.Fatal("description must be present (minimal refs JSON) even when provenance is OFF")
-	}
-	var provOFF stemcellProvenance
-	if err := json.Unmarshal([]byte(descRaw), &provOFF); err != nil {
-		t.Fatalf("description is not valid JSON when replica provenance OFF: %v — raw: %q", err, descRaw)
-	}
-	if provOFF.StemcellRefs == "" {
-		t.Error("stemcell_refs must be non-empty in replica minimal description")
-	}
-}
-
-// TestAttemptCreateTemplateVM_ReplicaProvenanceON verifies that with
-// extraBaseTags=[nodeTag] and provenance ON, combinedTags (sha+node) AND
-// provenance tokens all appear in tags, and description is valid JSON.
-func TestAttemptCreateTemplateVM_ReplicaProvenanceON(t *testing.T) {
-	t.Parallel()
-
-	const sha8 = "abcdef12"
-	const shaTag = stemcellSHATagPrefix + sha8
+	const sha256hex = sha8 + "34567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
 	const replicaNode = "pve-node2"
 	const stemcellName = "ubuntu-jammy"
 	const stemcellVersion = "1.438"
-	const directorID = "lab-director"
+	const creatingDirectorUUID = "lab-director-uuid"
 	nodeTag := pve.ReplicaNodeTagForNode(replicaNode)
 
-	deps, got := buildProvDeps(t, true, directorID)
+	deps, got := buildProvDeps(t)
 	cp := stemcellCloudProps{Name: stemcellName, Version: stemcellVersion}
+	stemcellCID := pve.BuildHeavyStemcellCID("nfs", "jammy.qcow2")
+	spec := templateBuildSpec{
+		TemplateName:         "bosh-stemcell-ubuntu-jammy-1-438-" + sha8,
+		ImportVolid:          "nfs:import/jammy.qcow2",
+		ShaTag:               shaTag,
+		SHA256Hex:            sha256hex,
+		TargetStorage:        "nfs",
+		Kind:                 pve.StemcellKindHeavy,
+		CID:                  stemcellCID,
+		CreatingDirectorUUID: creatingDirectorUUID,
+		ExtraBaseTags:        []string{nodeTag},
+	}
 	err := attemptCreateTemplateVM(
 		context.Background(), deps, deps.Logger,
-		replicaNode, 30002,
-		"bosh-stemcell-ubuntu-jammy-1-438", "nfs:import/jammy.qcow2", shaTag, "nfs",
-		cp, "/tmp/jammy.qcow2", []string{nodeTag},
+		replicaNode, 30002, spec,
+		cp, "/tmp/jammy.qcow2",
 	)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
 	gotTags, _ := got.params["tags"].(string)
-	// ownership, sha, node, marker, name, version, director all present.
+	// ownership, cache, sha, node, marker, name, version all present.
 	for _, wantToken := range []string{
 		ownershipTag,
+		stemcellCacheTag,
 		shaTag,
 		nodeTag,
 		stemcellMarkerTag,
 		stemcellNameTagPrefix + sanitizeTagValue(stemcellName),
 		stemcellVersionTagPrefix + sanitizeTagValue(stemcellVersion),
-		"director--" + sanitizeTagValue(directorID),
 	} {
 		if !strings.Contains(gotTags, wantToken) {
-			t.Errorf("replica ON tags %q missing expected token %q", gotTags, wantToken)
+			t.Errorf("replica tags %q missing expected token %q", gotTags, wantToken)
 		}
 	}
 
 	descRaw, hasDesc := got.params["description"].(string)
 	if !hasDesc || descRaw == "" {
-		t.Fatalf("description key missing or empty when provenance is ON (replica path)")
+		t.Fatalf("description key missing or empty (replica path)")
 	}
 	var prov stemcellProvenance
 	if err := json.Unmarshal([]byte(descRaw), &prov); err != nil {
@@ -1964,8 +2301,8 @@ func TestAttemptCreateTemplateVM_ReplicaProvenanceON(t *testing.T) {
 	if prov.SHA8 != sha8 {
 		t.Errorf("provenance.sha8 = %q; want %q", prov.SHA8, sha8)
 	}
-	if prov.DirectorID != directorID {
-		t.Errorf("provenance.director_id = %q; want %q", prov.DirectorID, directorID)
+	if prov.CreatedBy != creatingDirectorUUID {
+		t.Errorf("provenance.created_by = %q; want %q", prov.CreatedBy, creatingDirectorUUID)
 	}
 }
 
@@ -1991,7 +2328,6 @@ func TestBuildAndDeduplicateStemcellCID_ReturnsHashWithoutReread(t *testing.T) {
 	wantSHA8 := wantHash[:8]
 	// BuildStemcellFilename keeps dots in the version; "1.0" stays "1.0", not "1-0".
 	wantFilename := "bosh-stemcell-ubuntu-jammy-1.0-" + wantSHA8 + ".qcow2"
-	wantCID := "nfs:import/" + wantFilename
 
 	// buildAndDeduplicateStemcellCID calls FindStemcellByFilename which needs
 	// ListStorageContent. Return empty so the dedup check misses (no-upload path).
@@ -2014,8 +2350,8 @@ func TestBuildAndDeduplicateStemcellCID_ReturnsHashWithoutReread(t *testing.T) {
 	if dedup.Found {
 		t.Error("found must be false when storage is empty (no dedup hit)")
 	}
-	if dedup.CID != wantCID {
-		t.Errorf("cid = %q; want %q", dedup.CID, wantCID)
+	if dedup.QCow2Filename != wantFilename {
+		t.Errorf("qcow2 filename = %q; want %q", dedup.QCow2Filename, wantFilename)
 	}
 	if dedup.SHA256Hex != wantHash {
 		t.Errorf("returned sha256hex = %q; want %q", dedup.SHA256Hex, wantHash)
@@ -2063,17 +2399,29 @@ func TestBuildAndDeduplicateStemcellCID_DedupHit_HashStillReturned(t *testing.T)
 // CPI v3 env.tags tests
 // ---------------------------------------------------------------------------
 
+// wbDirectorTagsSpec builds a minimal templateBuildSpec for the DirectorTags
+// tests below, keeping each test focused on cp.DirectorTags behavior.
+func wbDirectorTagsSpec(shaTag string) templateBuildSpec {
+	return templateBuildSpec{
+		TemplateName:  "bosh-stemcell-ubuntu-jammy-1-0",
+		ImportVolid:   "nfs:import/test.qcow2",
+		ShaTag:        shaTag,
+		TargetStorage: "nfs",
+		Kind:          pve.StemcellKindHeavy,
+		CID:           pve.BuildHeavyStemcellCID("nfs", "test.qcow2"),
+	}
+}
+
 // TestAttemptCreateTemplateVM_DirectorTags_MergedIntoTags verifies that when
 // cp.DirectorTags is non-empty, the sanitized "key-value" tokens appear in the
-// createParams["tags"] field alongside the base tags (ownershipTag + shaTag),
-// and provenance is disabled (byte-identical base path plus director tokens).
+// createParams["tags"] field alongside the base tags (ownershipTag + shaTag).
 func TestAttemptCreateTemplateVM_DirectorTags_MergedIntoTags(t *testing.T) {
 	t.Parallel()
 
 	const sha8 = "deadbeef"
 	const shaTag = stemcellSHATagPrefix + sha8
 
-	deps, got := buildProvDeps(t, false, "")
+	deps, got := buildProvDeps(t)
 	cp := stemcellCloudProps{
 		Name:    "ubuntu-jammy",
 		Version: "1.0",
@@ -2085,9 +2433,8 @@ func TestAttemptCreateTemplateVM_DirectorTags_MergedIntoTags(t *testing.T) {
 
 	err := attemptCreateTemplateVM(
 		context.Background(), deps, deps.Logger,
-		"pve-node1", 30001,
-		"bosh-stemcell-ubuntu-jammy-1-0", "nfs:import/test.qcow2", shaTag, "nfs",
-		cp, "/tmp/test.qcow2", nil,
+		"pve-node1", 30001, wbDirectorTagsSpec(shaTag),
+		cp, "/tmp/test.qcow2",
 	)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -2113,27 +2460,27 @@ func TestAttemptCreateTemplateVM_DirectorTags_MergedIntoTags(t *testing.T) {
 }
 
 // TestAttemptCreateTemplateVM_DirectorTags_Absent_ByteIdentical verifies that
-// when cp.DirectorTags is nil, the tags field is byte-identical to a call
-// without env (no extra tokens appended).
+// when cp.DirectorTags is nil, the tags field carries only the base tokens
+// (no director-tag tokens appended).
 func TestAttemptCreateTemplateVM_DirectorTags_Absent_ByteIdentical(t *testing.T) {
 	t.Parallel()
 
 	const sha8 = "deadbeef"
 	const shaTag = stemcellSHATagPrefix + sha8
-	wantTags := ownershipTag + ";" + shaTag
+	wantTags := ownershipTag + ";" + stemcellCacheTag + ";" + shaTag + ";" +
+		stemcellMarkerTag + ";" + stemcellNameTagPrefix + "ubuntu-jammy" + ";" + stemcellVersionTagPrefix + "1-0"
 
-	deps, got := buildProvDeps(t, false, "")
+	deps, got := buildProvDeps(t)
 	cp := stemcellCloudProps{
 		Name:         "ubuntu-jammy",
 		Version:      "1.0",
-		DirectorTags: nil, // absent — must be byte-identical to pre-v3 path
+		DirectorTags: nil, // absent — no director-tag tokens appended
 	}
 
 	err := attemptCreateTemplateVM(
 		context.Background(), deps, deps.Logger,
-		"pve-node1", 30001,
-		"bosh-stemcell-ubuntu-jammy-1-0", "nfs:import/test.qcow2", shaTag, "nfs",
-		cp, "/tmp/test.qcow2", nil,
+		"pve-node1", 30001, wbDirectorTagsSpec(shaTag),
+		cp, "/tmp/test.qcow2",
 	)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -2141,7 +2488,7 @@ func TestAttemptCreateTemplateVM_DirectorTags_Absent_ByteIdentical(t *testing.T)
 
 	gotTags, _ := got.params["tags"].(string)
 	if gotTags != wantTags {
-		t.Errorf("tags = %q; want %q (must be byte-identical when DirectorTags nil)", gotTags, wantTags)
+		t.Errorf("tags = %q; want %q (no director-tag tokens when DirectorTags nil)", gotTags, wantTags)
 	}
 }
 
@@ -2154,7 +2501,7 @@ func TestAttemptCreateTemplateVM_DirectorTags_InvalidValue_Skipped(t *testing.T)
 	const sha8 = "deadbeef"
 	const shaTag = stemcellSHATagPrefix + sha8
 
-	deps, got := buildProvDeps(t, false, "")
+	deps, got := buildProvDeps(t)
 	cp := stemcellCloudProps{
 		Name:    "ubuntu-jammy",
 		Version: "1.0",
@@ -2167,9 +2514,8 @@ func TestAttemptCreateTemplateVM_DirectorTags_InvalidValue_Skipped(t *testing.T)
 
 	err := attemptCreateTemplateVM(
 		context.Background(), deps, deps.Logger,
-		"pve-node1", 30001,
-		"bosh-stemcell-ubuntu-jammy-1-0", "nfs:import/test.qcow2", shaTag, "nfs",
-		cp, "/tmp/test.qcow2", nil,
+		"pve-node1", 30001, wbDirectorTagsSpec(shaTag),
+		cp, "/tmp/test.qcow2",
 	)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -2250,8 +2596,8 @@ func TestHandleCreateStemcell_EnvTags_MergedIntoTemplate(t *testing.T) {
 	if !ok {
 		t.Fatalf("result is %T; want string", result)
 	}
-	if !pve.IsTemplateStemcellCID(cid) {
-		t.Errorf("CID = %q; want template:<vmid> format", cid)
+	if kind, _, _, parseErr := pve.ParseStemcellPathCID(cid); parseErr != nil || kind != pve.StemcellKindHeavy {
+		t.Errorf("CID = %q (kind=%q, err=%v); want a well-formed :heavy: path-identity CID", cid, kind, parseErr)
 	}
 
 	// sha8 token from the sha tag must be present (base identity).
@@ -2323,5 +2669,866 @@ func TestHandleCreateStemcell_NoEnvArg_ByteIdentical(t *testing.T) {
 	// Base tokens must be present.
 	if !strings.Contains(capturedTags, ownershipTag) {
 		t.Errorf("tags %q missing ownershipTag %q", capturedTags, ownershipTag)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ensureTemplateAndRegisterRef / director-ref registration tests (P1.3/item 6)
+// ---------------------------------------------------------------------------
+
+// TestEnsureTemplateAndRegisterRef_FreshBuild_RegistersDirectorUUID verifies
+// that a fresh cache-template build ends with the creating director's UUID
+// registered: the initial provenance notes (written at QEMU.Create) seed
+// DirectorRefs with it, and the follow-up registerStemcellDirectorRef call
+// stamps the corresponding "director--<uuid>" tag via UpdateQemuConfig.
+func TestEnsureTemplateAndRegisterRef_FreshBuild_RegistersDirectorUUID(t *testing.T) {
+	t.Parallel()
+
+	const directorUUID = "dir-uuid-fresh-build"
+	var createDescription string
+	var updatedTags string
+	var updateCalls int
+
+	qemu := &wbMockQEMU{
+		createFn: func(_ context.Context, _ string, params map[string]any) (string, error) {
+			createDescription, _ = params["description"].(string)
+			return "", nil
+		},
+	}
+	nodes := &wbTemplateNodes{
+		listQemuFn: listQemuEmpty(),
+		wbMockNodes: wbMockNodes{
+			updateConfigFn: func(_ context.Context, _, _ string, params *sdknodes.UpdateQemuConfigParams) error {
+				updateCalls++
+				if params.Tags != nil {
+					updatedTags = *params.Tags
+				}
+				return nil
+			},
+		},
+	}
+	deps := buildEnsureTemplateDeps(qemu, nodes, &wbMockTasks{}, &wbTemplateStorage{})
+	deps.PVE.(*wbTemplateMockClient).clusterSvc = &wbClusterForAlloc{
+		listResourcesFn: listClusterResourcesEmpty(),
+	}
+
+	cp := stemcellCloudProps{Name: "ubuntu-jammy", Version: "1.0"}
+	sha256hex := "aabbccddee112233aabbccddee112233aabbccddee112233aabbccddee112233"
+	stemcellCID := pve.BuildHeavyStemcellCID("nfs", "jammy.qcow2")
+	vmid, node, err := ensureTemplateAndRegisterRef(context.Background(), deps, deps.Logger,
+		"pve-node1", "nfs", "jammy.qcow2", sha256hex,
+		"",
+		pve.StemcellKindHeavy, stemcellCID, directorUUID, cp, "/tmp/jammy.qcow2")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if vmid == 0 || node == "" {
+		t.Fatalf("expected non-zero vmid/node, got vmid=%d node=%q", vmid, node)
+	}
+
+	// Initial notes (written at create time) must seed director_refs with the
+	// creating director's UUID.
+	var prov stemcellProvenance
+	if jsonErr := json.Unmarshal([]byte(createDescription), &prov); jsonErr != nil {
+		t.Fatalf("create-time description not valid JSON: %v — raw: %q", jsonErr, createDescription)
+	}
+	if len(prov.DirectorRefs) != 1 || prov.DirectorRefs[0] != directorUUID {
+		t.Errorf("create-time director_refs = %v; want [%q]", prov.DirectorRefs, directorUUID)
+	}
+
+	// registerStemcellDirectorRef's follow-up call stamps the director tag
+	// (idempotent no-op on the ref itself, since it was already seeded).
+	if updateCalls == 0 {
+		t.Fatal("expected registerStemcellDirectorRef to issue at least one UpdateQemuConfig call")
+	}
+	wantDirectorTag := "director--" + sanitizeTagValue(directorUUID)
+	if !strings.Contains(updatedTags, wantDirectorTag) {
+		t.Errorf("updated tags = %q; want to contain %q", updatedTags, wantDirectorTag)
+	}
+}
+
+// TestEnsureTemplateAndRegisterRef_DedupHit_RegistersDirectorUUID verifies
+// that a cluster-scoped dedup hit (cache template already exists, built by a
+// DIFFERENT director) still registers the calling director's UUID as a live
+// reference — refs must accumulate across directors sharing one cache
+// template, not just at the template's original creation.
+func TestEnsureTemplateAndRegisterRef_DedupHit_RegistersDirectorUUID(t *testing.T) {
+	t.Parallel()
+
+	const existingVMID = int64(30777)
+	const existingNode = "pve-node1"
+	const sha8 = "aabbccdd"
+	const sha256hex = sha8 + "ee112233aabbccddee112233aabbccddee112233aabbccddee112233"
+	const creatorUUID = "dir-uuid-original-creator"
+	const callingUUID = "dir-uuid-second-caller"
+
+	// existingDescription models a template already built by creatorUUID;
+	// registerStemcellDirectorRef must merge callingUUID into DirectorRefs.
+	existingDescription, marshalErr := json.Marshal(stemcellProvenance{
+		Name: "ubuntu-jammy", Version: "1.0", SHA8: sha8, SHA256: sha256hex,
+		Kind: string(pve.StemcellKindHeavy), CreatedBy: creatorUUID,
+		DirectorRefs: []string{creatorUUID},
+	})
+	if marshalErr != nil {
+		t.Fatalf("marshal fixture description: %v", marshalErr)
+	}
+
+	var updatedDescription string
+	qemu := &wbMockQEMU{
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return map[string]any{"description": string(existingDescription)}, nil
+		},
+	}
+	nodes := &wbTemplateNodes{
+		listQemuFn: listQemuEmpty(),
+		wbMockNodes: wbMockNodes{
+			updateConfigFn: func(_ context.Context, _, _ string, params *sdknodes.UpdateQemuConfigParams) error {
+				if params.Description != nil {
+					updatedDescription = *params.Description
+				}
+				return nil
+			},
+			// Backs stemcellBackingQCow2Exists.
+			listStorageFn: func(_ context.Context, _, _ string, _ *sdknodes.ListStorageContentParams) (*sdknodes.ListStorageContentResponse, error) {
+				entry, _ := json.Marshal(map[string]any{"volid": "nfs:import/bosh-stemcell-ubuntu-jammy-1.0-" + sha8 + ".qcow2"})
+				resp := sdknodes.ListStorageContentResponse{entry}
+				return &resp, nil
+			},
+		},
+	}
+	deps := buildEnsureTemplateDeps(qemu, nodes, &wbMockTasks{}, &wbTemplateStorage{})
+	deps.PVE.(*wbTemplateMockClient).clusterSvc = &wbClusterForAlloc{
+		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+			resp := sdkcluster.ListResourcesResponse{
+				clusterResourceQemuTemplate(existingVMID, existingNode, "bosh-stemcell-ubuntu-jammy-1-0-"+sha8, "bosh-stemcell-sha-"+sha8),
+			}
+			return &resp, nil
+		},
+	}
+
+	cp := stemcellCloudProps{Name: "ubuntu-jammy", Version: "1.0"}
+	stemcellCID := pve.BuildHeavyStemcellCID("nfs", "bosh-stemcell-ubuntu-jammy-1.0-"+sha8+".qcow2")
+	vmid, node, err := ensureTemplateAndRegisterRef(context.Background(), deps, deps.Logger,
+		"pve-node1", "nfs", "bosh-stemcell-ubuntu-jammy-1.0-"+sha8+".qcow2", sha256hex,
+		"",
+		pve.StemcellKindHeavy, stemcellCID, callingUUID, cp, "/tmp/jammy.qcow2")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if vmid != existingVMID || node != existingNode {
+		t.Fatalf("vmid/node = %d/%q; want %d/%q (dedup hit)", vmid, node, existingVMID, existingNode)
+	}
+
+	if updatedDescription == "" {
+		t.Fatal("expected registerStemcellDirectorRef to write an updated description (new ref)")
+	}
+	var prov stemcellProvenance
+	if jsonErr := json.Unmarshal([]byte(updatedDescription), &prov); jsonErr != nil {
+		t.Fatalf("updated description not valid JSON: %v — raw: %q", jsonErr, updatedDescription)
+	}
+	foundCreator, foundCaller := false, false
+	for _, r := range prov.DirectorRefs {
+		if r == creatorUUID {
+			foundCreator = true
+		}
+		if r == callingUUID {
+			foundCaller = true
+		}
+	}
+	if !foundCreator {
+		t.Errorf("director_refs = %v; must still contain original creator %q", prov.DirectorRefs, creatorUUID)
+	}
+	if !foundCaller {
+		t.Errorf("director_refs = %v; must now also contain calling director %q", prov.DirectorRefs, callingUUID)
+	}
+}
+
+// TestEnsureTemplateAndRegisterRef_TemplateGone_RebuildsAndRegisters verifies
+// the ErrStemcellTemplateGone retry contract: when registerStemcellDirectorRef
+// discovers the cache template vanished (a concurrent last-ref delete raced
+// this lookup — modeled here by QEMU.Config returning not-found on the FIRST
+// call), ensureTemplateAndRegisterRef rebuilds the template once and retries
+// registration, succeeding on the second attempt.
+func TestEnsureTemplateAndRegisterRef_TemplateGone_RebuildsAndRegisters(t *testing.T) {
+	t.Parallel()
+
+	const directorUUID = "dir-uuid-gone-retry"
+	var createCalls int
+	var configCalls int
+
+	qemu := &wbMockQEMU{
+		createFn: func(_ context.Context, _ string, _ map[string]any) (string, error) {
+			createCalls++
+			return "", nil
+		},
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			configCalls++
+			if configCalls == 1 {
+				// First registration attempt: template already gone.
+				return nil, pveerr.ErrNotFound
+			}
+			return map[string]any{}, nil
+		},
+	}
+	nodes := &wbTemplateNodes{listQemuFn: listQemuEmpty()}
+	deps := buildEnsureTemplateDeps(qemu, nodes, &wbMockTasks{}, &wbTemplateStorage{})
+	// Cluster-scoped lookups: always empty (no existing template) — both the
+	// initial build and the post-gone rebuild must construct fresh.
+	deps.PVE.(*wbTemplateMockClient).clusterSvc = &wbClusterForAlloc{
+		listResourcesFn: listClusterResourcesEmpty(),
+	}
+
+	cp := stemcellCloudProps{Name: "ubuntu-jammy", Version: "1.0"}
+	sha256hex := "aabbccddee112233aabbccddee112233aabbccddee112233aabbccddee112233"
+	stemcellCID := pve.BuildHeavyStemcellCID("nfs", "jammy.qcow2")
+	vmid, node, err := ensureTemplateAndRegisterRef(context.Background(), deps, deps.Logger,
+		"pve-node1", "nfs", "jammy.qcow2", sha256hex,
+		"",
+		pve.StemcellKindHeavy, stemcellCID, directorUUID, cp, "/tmp/jammy.qcow2")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if vmid == 0 || node == "" {
+		t.Fatalf("expected non-zero vmid/node after rebuild, got vmid=%d node=%q", vmid, node)
+	}
+	if createCalls != 2 {
+		t.Errorf("QEMU.Create called %d times; want 2 (initial build + rebuild after template-gone)", createCalls)
+	}
+	if configCalls != 2 {
+		t.Errorf("QEMU.Config called %d times; want 2 (gone on first registration attempt, success on retry)", configCalls)
+	}
+}
+
+// TestEnsureTemplateVM_SHA256Mismatch_BuildsFreshTemplate verifies the sha8
+// (32-bit) collision guard: when a cluster-scoped sha-tag match's recorded
+// full sha256 (in its provenance notes) differs from the caller's sha256,
+// ensureTemplateVM does NOT reuse it — it logs a warning and builds a new
+// template instead.
+func TestEnsureTemplateVM_SHA256Mismatch_BuildsFreshTemplate(t *testing.T) {
+	t.Parallel()
+
+	const collidingVMID = int64(30888)
+	const collidingNode = "pve-node1"
+	const sha8 = "aabbccdd"
+	const wantSHA256 = sha8 + "34567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+	const collidingSHA256 = sha8 + "00000000000000000000000000000000000000000000000000000000ffff"
+
+	collidingDescription, marshalErr := json.Marshal(stemcellProvenance{
+		Name: "ubuntu-jammy", Version: "1.0", SHA8: sha8, SHA256: collidingSHA256,
+		Kind: string(pve.StemcellKindHeavy), CreatedBy: "dir-a", DirectorRefs: []string{"dir-a"},
+	})
+	if marshalErr != nil {
+		t.Fatalf("marshal fixture description: %v", marshalErr)
+	}
+
+	var createCalled bool
+	qemu := &wbMockQEMU{
+		createFn: func(_ context.Context, _ string, _ map[string]any) (string, error) {
+			createCalled = true
+			return "", nil
+		},
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return map[string]any{"description": string(collidingDescription)}, nil
+		},
+	}
+	nodes := &wbTemplateNodes{listQemuFn: listQemuEmpty()}
+	deps := buildEnsureTemplateDeps(qemu, nodes, &wbMockTasks{}, &wbTemplateStorage{})
+	deps.PVE.(*wbTemplateMockClient).clusterSvc = &wbClusterForAlloc{
+		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+			resp := sdkcluster.ListResourcesResponse{
+				clusterResourceQemuTemplate(collidingVMID, collidingNode, "bosh-stemcell-ubuntu-jammy-1-0-"+sha8, "bosh-stemcell-sha-"+sha8),
+			}
+			return &resp, nil
+		},
+	}
+
+	cp := stemcellCloudProps{Name: "ubuntu-jammy", Version: "1.0"}
+	stemcellCID := pve.BuildHeavyStemcellCID("nfs", "bosh-stemcell-ubuntu-jammy-1.0-"+sha8+".qcow2")
+	vmid, _, err := ensureTemplateVM(context.Background(), deps, "pve-node1", "nfs",
+		"bosh-stemcell-ubuntu-jammy-1.0-"+sha8+".qcow2", wantSHA256,
+		"",
+		pve.StemcellKindHeavy, stemcellCID, "dir-b", cp, "/tmp/jammy.qcow2")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if vmid == collidingVMID {
+		t.Errorf("vmid = %d; must NOT reuse the sha8-colliding template (full sha256 mismatch)", vmid)
+	}
+	if !createCalled {
+		t.Error("expected QEMU.Create to build a fresh template after the collision guard rejected the sha-tag match")
+	}
+}
+
+// TestEnsureTemplateVM_SHATagDedup_SkipsReplicaAnchor verifies that a per-node
+// replica carrying a LOWER VMID than the primary is never selected as the
+// dedup-hit anchor: replicas never hold their own director references (their
+// ref set is a fossil of their creator), so registering against one would
+// consult the wrong ref set. Both entries carry no recorded provenance
+// SHA256, so both would pass sha256MatchesTemplateProvenance's legacy-match
+// fallback — IsReplica() must be the deciding factor, not sha256 verification.
+func TestEnsureTemplateVM_SHATagDedup_SkipsReplicaAnchor(t *testing.T) {
+	t.Parallel()
+
+	const primaryVMID = int64(30500)
+	const primaryNode = "pve-node1"
+	const replicaVMID = int64(30100) // lower than primary
+	const replicaNode = "pve-node2"
+	const sha8 = "891b3b74"
+	const fullSHA = sha8 + "00000000000000000000000000000000000000000000000000000000"
+
+	var createCalled bool
+	qemu := &wbMockQEMU{
+		createFn: func(_ context.Context, _ string, _ map[string]any) (string, error) {
+			createCalled = true
+			return "", nil
+		},
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return map[string]any{}, nil
+		},
+	}
+	nodes := &wbTemplateNodes{
+		listQemuFn: listQemuEmpty(),
+		wbMockNodes: wbMockNodes{
+			listStorageFn: func(_ context.Context, _, _ string, _ *sdknodes.ListStorageContentParams) (*sdknodes.ListStorageContentResponse, error) {
+				entry, _ := json.Marshal(map[string]any{"volid": "nfs:import/noble.qcow2"})
+				resp := sdknodes.ListStorageContentResponse{entry}
+				return &resp, nil
+			},
+		},
+	}
+	deps := buildEnsureTemplateDeps(qemu, nodes, &wbMockTasks{}, &wbTemplateStorage{})
+	deps.PVE.(*wbTemplateMockClient).clusterSvc = &wbClusterForAlloc{
+		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+			resp := sdkcluster.ListResourcesResponse{
+				// Replica sorts first (lower VMID) but must be skipped.
+				clusterResourceQemuTemplate(replicaVMID, replicaNode, "bosh-stemcell-ubuntu-noble-1-364-"+sha8,
+					"bosh-stemcell-sha-"+sha8+";"+pve.ReplicaNodeTagForNode(replicaNode)),
+				clusterResourceQemuTemplate(primaryVMID, primaryNode, "bosh-stemcell-ubuntu-noble-1-364-"+sha8,
+					"bosh-stemcell-sha-"+sha8),
+			}
+			return &resp, nil
+		},
+	}
+
+	cp := stemcellCloudProps{Name: "ubuntu-noble", Version: "1.364"}
+	stemcellCID := pve.BuildHeavyStemcellCID("nfs", "noble.qcow2")
+	vmid, node, err := ensureTemplateVM(context.Background(), deps, "pve-node1", "nfs", "noble.qcow2", fullSHA,
+		"", pve.StemcellKindHeavy, stemcellCID, "test-director", cp, "")
+	if err != nil {
+		t.Fatalf("ensureTemplateVM returned error: %v", err)
+	}
+	if vmid != primaryVMID || node != primaryNode {
+		t.Errorf("vmid/node = %d/%q; want primary %d/%q — replica must never anchor the dedup hit",
+			vmid, node, primaryVMID, primaryNode)
+	}
+	if createCalled {
+		t.Error("QEMU.Create must NOT be called: the (non-replica) primary already satisfies the dedup lookup")
+	}
+}
+
+// TestEnsureTemplateVM_RaceReconcile_SkipsReplicaWinner verifies that a
+// replica surfaced by the post-freeze reconcile scan (reconcileTemplateRace)
+// is never adopted as the race winner, even when its VMID is lower than the
+// template this call just froze: adopting a replica would discard our own
+// (correctly anchored) template in favor of one that carries no live
+// director-ref set of its own.
+func TestEnsureTemplateVM_RaceReconcile_SkipsReplicaWinner(t *testing.T) {
+	const sha8 = "891b3b74"
+	const fullSHA = sha8 + "00000000000000000000000000000000000000000000000000000000"
+	const replicaVMID = int64(1) // impossibly low → always below our random allocation
+	const replicaNode = "pve-node2"
+
+	var listCalls int
+	var allocatedVMID int64
+	var deleteCalled bool
+
+	qemu := &wbMockQEMU{
+		createFn: func(_ context.Context, _ string, params map[string]any) (string, error) {
+			if v, ok := params["vmid"].(int); ok {
+				allocatedVMID = int64(v)
+			}
+			return "", nil
+		},
+	}
+	nodes := &wbTemplateNodes{listQemuFn: listQemuEmpty()}
+	nodes.deleteQemuFn = func(_ context.Context, _, _ string, _ *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
+		deleteCalled = true
+		raw := sdknodes.DeleteQemuResponse(`""`)
+		return &raw, nil
+	}
+
+	deps := buildEnsureTemplateDeps(qemu, nodes, &wbMockTasks{}, &wbTemplateStorage{})
+	deps.PVE.(*wbTemplateMockClient).clusterSvc = &wbClusterForAlloc{
+		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+			listCalls++
+			// Calls 1-2: pre-create dedup lookup + NextVMID scan (empty).
+			// Later calls: the reconcile scan sees only the lower-VMID replica.
+			if listCalls <= 2 {
+				empty := sdkcluster.ListResourcesResponse{}
+				return &empty, nil
+			}
+			resp := sdkcluster.ListResourcesResponse{
+				clusterResourceQemuTemplate(replicaVMID, replicaNode, "bosh-stemcell-x",
+					"bosh-stemcell-sha-"+sha8+";"+pve.ReplicaNodeTagForNode(replicaNode)),
+			}
+			return &resp, nil
+		},
+	}
+
+	cp := stemcellCloudProps{Name: "ubuntu-noble", Version: "1.364"}
+	stemcellCID := pve.BuildHeavyStemcellCID("nfs", "noble.qcow2")
+	vmid, node, err := ensureTemplateVM(context.Background(), deps, "pve-node1", "nfs", "noble.qcow2", fullSHA,
+		"", pve.StemcellKindHeavy, stemcellCID, "test-director", cp, "")
+	if err != nil {
+		t.Fatalf("ensureTemplateVM returned error: %v", err)
+	}
+	if vmid != allocatedVMID || node != "pve-node1" {
+		t.Errorf("vmid/node = %d/%q; want our own allocation %d/\"pve-node1\" (replica must not win the reconcile)",
+			vmid, node, allocatedVMID)
+	}
+	if deleteCalled {
+		t.Error("our template was deleted; a replica must never win the race reconcile")
+	}
+}
+
+// TestEnsureTemplateVM_SHATagDedup_MissingBackingQCow2_BuildsFresh verifies
+// a sha-tag+provenance dedup hit is rejected, and a fresh
+// template built instead, when the storage content listing no longer
+// contains the candidate's backing qcow2 — the signature of a
+// partially-failed delete_stemcell run that destroyed the qcow2 but left the
+// tagged template behind. Without this check the caller would receive a CID
+// pointing at a file that no longer exists.
+func TestEnsureTemplateVM_SHATagDedup_MissingBackingQCow2_BuildsFresh(t *testing.T) {
+	t.Parallel()
+
+	const staleVMID = int64(30500)
+	const staleNode = "pve-node1"
+	const sha8 = "891b3b74"
+	const fullSHA = sha8 + "00000000000000000000000000000000000000000000000000000000"
+
+	var createCalled bool
+	qemu := &wbMockQEMU{
+		createFn: func(_ context.Context, _ string, _ map[string]any) (string, error) {
+			createCalled = true
+			return "", nil
+		},
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return map[string]any{}, nil
+		},
+	}
+	nodes := &wbTemplateNodes{
+		listQemuFn: listQemuEmpty(),
+		wbMockNodes: wbMockNodes{
+			// Storage content listing has NO entry for noble.qcow2 — the
+			// backing file was already removed (e.g. a partial delete_stemcell).
+			listStorageFn: func(_ context.Context, _, _ string, _ *sdknodes.ListStorageContentParams) (*sdknodes.ListStorageContentResponse, error) {
+				empty := sdknodes.ListStorageContentResponse{}
+				return &empty, nil
+			},
+		},
+	}
+	deps := buildEnsureTemplateDeps(qemu, nodes, &wbMockTasks{}, &wbTemplateStorage{})
+	deps.PVE.(*wbTemplateMockClient).clusterSvc = &wbClusterForAlloc{
+		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+			resp := sdkcluster.ListResourcesResponse{
+				clusterResourceQemuTemplate(staleVMID, staleNode, "bosh-stemcell-ubuntu-noble-1-364-"+sha8,
+					"bosh-stemcell-sha-"+sha8),
+			}
+			return &resp, nil
+		},
+	}
+
+	cp := stemcellCloudProps{Name: "ubuntu-noble", Version: "1.364"}
+	stemcellCID := pve.BuildHeavyStemcellCID("nfs", "noble.qcow2")
+	vmid, _, err := ensureTemplateVM(context.Background(), deps, "pve-node1", "nfs", "noble.qcow2", fullSHA,
+		"", pve.StemcellKindHeavy, stemcellCID, "test-director", cp, "")
+	if err != nil {
+		t.Fatalf("ensureTemplateVM returned error: %v", err)
+	}
+	if vmid == staleVMID {
+		t.Errorf("vmid = %d; must NOT reuse the stale template whose backing qcow2 is gone", vmid)
+	}
+	if !createCalled {
+		t.Error("expected QEMU.Create to build a fresh template after the missing-qcow2 guard rejected the stale dedup hit")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Replication shared-storage gate (P1.5) + fetchFindByPrefix anchoring (P1.4)
+// ---------------------------------------------------------------------------
+
+// TestHandleCreateStemcell_ReplicateLocal_SharedStorage_SkipsReplication
+// verifies P1.5's replication gate: when stemcell_replicate_local is true but
+// the resolved storage classifies as SHARED, create_stemcell never attempts
+// to replicate to the cluster's other nodes — the single cache template is
+// already reachable from every node. Asserted by counting Upload calls: a
+// non-gated (local-storage) replication path would upload once per
+// non-primary node; a correctly-gated shared-storage path uploads exactly
+// once (the primary qcow2 only).
+func TestHandleCreateStemcell_ReplicateLocal_SharedStorage_SkipsReplication(t *testing.T) {
+	t.Parallel()
+
+	imgPath := makeTempImageFile(t, []byte("REPLICATION-GATE-TEST-IMAGE-BYTES"))
+
+	var uploadCount int
+	nodesSvc := &wbTemplateNodes{listQemuFn: listQemuEmpty()}
+	storageSvc := &wbTemplateStorage{
+		wbMockStorage: wbMockStorage{
+			uploadFn: func(_ context.Context, _, _, _, _ string, body io.Reader) (string, error) {
+				_, _ = io.Copy(io.Discard, body)
+				uploadCount++
+				return "", nil
+			},
+		},
+	}
+	// Two-node cluster with SHARED nfs storage — replication must be a no-op.
+	clusterStorage := &wbMockClusterStorage{storageName: "nfs", storageType: "nfs", isShared: true}
+	cluster := &wbMockCluster{
+		nodeCount: 2,
+		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+			empty := sdkcluster.ListResourcesResponse{}
+			return &empty, nil
+		},
+	}
+	pveClient := &wbTemplateMockClient{
+		wbMockClient: wbMockClient{
+			nodesSvc:          nodesSvc,
+			clusterStorageSvc: clusterStorage,
+			clusterSvc:        cluster,
+			storageSvc:        storageSvc,
+		},
+		qemuSvc:  &wbMockQEMU{},
+		tasksSvc: &wbMockTasks{},
+	}
+	deps := Deps{
+		Config: &config.CPIConfig{
+			Node:                           "pve-node1",
+			StemcellStorage:                "nfs",
+			VMStorage:                      "nfs",
+			StemcellTemplateVMIDRangeStart: 30000,
+			StemcellTemplateVMIDRangeEnd:   30999,
+			StemcellReplicateLocal:         true,
+		},
+		PVE:    pveClient,
+		Logger: log.NewNopLogger(),
+	}
+
+	h := HandleCreateStemcell(deps)
+	cp := map[string]any{"name": "ubuntu-jammy", "version": "1.0", "disk_format": "qcow2"}
+	args := []json.RawMessage{mustMarshal(t, imgPath), mustMarshal(t, cp)}
+
+	_, err := h.Handle(context.Background(), args, jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if uploadCount != 1 {
+		t.Errorf("Upload called %d times; want 1 (shared storage must skip replication entirely)", uploadCount)
+	}
+}
+
+// TestHandleCreateStemcell_LightFetch_ReplicateLocal_UploadsToOtherNode
+// verifies that handleLightStemcellFetch's fresh-fetch arm now
+// replicates the fetched image to every other cluster node, same as the
+// tarball mainline — previously image_url stemcells on node-local storage
+// were stranded on the single node that happened to fetch them.
+func TestHandleCreateStemcell_LightFetch_ReplicateLocal_UploadsToOtherNode(t *testing.T) {
+	t.Parallel()
+
+	body := []byte("REPLICATE-LIGHT-FETCH-TEST-IMAGE-BYTES")
+
+	var uploadNodes []string
+	var createNodes []string
+	var replicaTags string
+
+	nodesSvc := &wbTemplateNodes{listQemuFn: listQemuEmpty()}
+	storageSvc := &wbTemplateStorage{
+		wbMockStorage: wbMockStorage{
+			uploadFn: func(_ context.Context, node, _, _, _ string, body io.Reader) (string, error) {
+				_, _ = io.Copy(io.Discard, body)
+				uploadNodes = append(uploadNodes, node)
+				return "", nil
+			},
+		},
+	}
+	qemuSvc := &wbMockQEMU{
+		createFn: func(_ context.Context, node string, params map[string]any) (string, error) {
+			createNodes = append(createNodes, node)
+			if node == "pve-node2" {
+				replicaTags, _ = params["tags"].(string)
+			}
+			return "", nil
+		},
+	}
+	// Local (non-shared) storage on a two-node cluster — replication must fire.
+	clusterStorage := &wbMockClusterStorage{storageName: "nfs", storageType: "dir", isShared: false}
+	cluster := &wbMockCluster{
+		nodeCount: 2,
+		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+			empty := sdkcluster.ListResourcesResponse{}
+			return &empty, nil
+		},
+		listConfigNodesFn: func(_ context.Context) (*sdkcluster.ListConfigNodesResponse, error) {
+			raw1, _ := json.Marshal(map[string]string{"name": "pve-node1"})
+			raw2, _ := json.Marshal(map[string]string{"name": "pve-node2"})
+			resp := sdkcluster.ListConfigNodesResponse{raw1, raw2}
+			return &resp, nil
+		},
+	}
+	pveClient := &wbTemplateMockClient{
+		wbMockClient: wbMockClient{
+			nodesSvc:          nodesSvc,
+			clusterStorageSvc: clusterStorage,
+			clusterSvc:        cluster,
+			storageSvc:        storageSvc,
+		},
+		qemuSvc:  qemuSvc,
+		tasksSvc: &wbMockTasks{},
+	}
+	deps := Deps{
+		Config: &config.CPIConfig{
+			Node:                           "pve-node1",
+			StemcellStorage:                "nfs",
+			VMStorage:                      "nfs",
+			StemcellTemplateVMIDRangeStart: 30000,
+			StemcellTemplateVMIDRangeEnd:   30999,
+			StemcellReplicateLocal:         true,
+		},
+		PVE:    pveClient,
+		Logger: log.NewNopLogger(),
+	}
+	deps.FetchResolver = func(rawURL string) (stemcellfetch.Source, stemcellfetch.Reference, error) {
+		return &mockSource{body: body, contentLength: int64(len(body))},
+			stemcellfetch.Reference{Scheme: "https", URL: rawURL}, nil
+	}
+
+	h := HandleCreateStemcell(deps)
+	cp := map[string]any{
+		"name":      "ubuntu-jammy",
+		"version":   "1.997",
+		"image_url": "https://example.com/ubuntu-jammy.qcow2",
+		// Local storage on a multi-node cluster requires pinning the
+		// PRIMARY fetch to one node (pve.ValidateLightStemcellStorage);
+		// replication then fans the image out to the rest.
+		"node": "pve-node1",
+	}
+	args := []json.RawMessage{
+		mustMarshal(t, "/dev/null"),
+		mustMarshal(t, cp),
+	}
+
+	_, err := h.Handle(context.Background(), args, jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(uploadNodes) != 2 {
+		t.Fatalf("Upload called for nodes %v; want exactly 2 calls (primary pve-node1 + replica pve-node2)", uploadNodes)
+	}
+	foundPrimary, foundReplica := false, false
+	for _, n := range uploadNodes {
+		if n == "pve-node1" {
+			foundPrimary = true
+		}
+		if n == "pve-node2" {
+			foundReplica = true
+		}
+	}
+	if !foundPrimary || !foundReplica {
+		t.Errorf("uploadNodes = %v; want both pve-node1 (primary) and pve-node2 (replica)", uploadNodes)
+	}
+	wantNodeTag := pve.ReplicaNodeTagForNode("pve-node2")
+	if !strings.Contains(replicaTags, wantNodeTag) {
+		t.Errorf("replica template tags = %q; want to contain %q", replicaTags, wantNodeTag)
+	}
+}
+
+// buildReplicateOneNodeFailureDeps constructs Deps for replicateOneNode
+// cleanup-guard tests: upload succeeds, then QEMU.Create fails with a
+// non-retriable error so ensureReplicaTemplateVM fails and replicateOneNode's
+// cleanup path runs. clusterStorage backs the shared/local classification
+// stemcellStorageIsShared consults.
+func buildReplicateOneNodeFailureDeps(clusterStorage *wbMockClusterStorage) (Deps, *bool) {
+	deleteCalled := false
+	nodesSvc := &wbTemplateNodes{listQemuFn: listQemuEmpty()}
+	storageSvc := &wbTemplateStorage{
+		wbMockStorage: wbMockStorage{
+			uploadFn: func(_ context.Context, _, _, _, _ string, body io.Reader) (string, error) {
+				_, _ = io.Copy(io.Discard, body)
+				return "", nil
+			},
+		},
+		deleteVolumeIfExistsFn: func(_ context.Context, _, _, _ string) (bool, error) {
+			deleteCalled = true
+			return true, nil
+		},
+	}
+	qemuSvc := &wbMockQEMU{
+		createFn: func(_ context.Context, _ string, _ map[string]any) (string, error) {
+			return "", errors.New("PVE: 500 internal error")
+		},
+	}
+	pveClient := &wbTemplateMockClient{
+		wbMockClient: wbMockClient{
+			nodesSvc:          nodesSvc,
+			clusterStorageSvc: clusterStorage,
+			clusterSvc:        &wbClusterForAlloc{listResourcesFn: listClusterResourcesEmpty()},
+			storageSvc:        storageSvc,
+		},
+		qemuSvc:  qemuSvc,
+		tasksSvc: &wbMockTasks{},
+	}
+	deps := Deps{
+		Config: &config.CPIConfig{
+			Node:                           "pve-node1",
+			StemcellStorage:                "nfs",
+			VMStorage:                      "nfs",
+			StemcellTemplateVMIDRangeStart: 30000,
+			StemcellTemplateVMIDRangeEnd:   30999,
+		},
+		PVE:    pveClient,
+		Logger: log.NewNopLogger(),
+	}
+	return deps, &deleteCalled
+}
+
+// TestReplicateOneNode_CleanupSkipped_UnclassifiableStorage verifies the
+// fix: when a replica build fails and the storage's shared/local
+// classification cannot be determined (no matching ClusterStorage entry —
+// mirrors deps.PVE.ClusterStorage() returning nothing usable), the
+// best-effort upload cleanup is SKIPPED rather than deleting
+// "import/<file>" — on shared storage that path can be the exact file the
+// caller's already-returned CID names.
+func TestReplicateOneNode_CleanupSkipped_UnclassifiableStorage(t *testing.T) {
+	t.Parallel()
+
+	// storageName mismatches "nfs" so liveStorageInfo finds no entry — known=false.
+	unclassifiable := &wbMockClusterStorage{storageName: "other-storage", storageType: "dir", isShared: false}
+	deps, deleteCalled := buildReplicateOneNodeFailureDeps(unclassifiable)
+
+	srcPath := makeTempImageFile(t, []byte("replicate-one-node-cleanup-guard-test"))
+	nodeLogger := log.NewNopLogger()
+	cp := stemcellCloudProps{Name: "ubuntu-jammy", Version: "1.0"}
+	replicateOneNode(context.Background(), deps, nodeLogger, "pve-node2", "nfs",
+		"bosh-stemcell-ubuntu-jammy-1.0-aabbccdd.qcow2", "aabbccdd00000000000000000000000000000000000000000000000000000000",
+		"aabbccdd", srcPath, "", ":heavy:nfs:import/x.qcow2", "test-director", cp, "")
+
+	if *deleteCalled {
+		t.Error("DeleteVolumeIfExists must NOT be called when storage classification is unknown — " +
+			"the just-uploaded file may be the same one the returned CID names on shared storage")
+	}
+}
+
+// TestReplicateOneNode_CleanupSkipped_SharedStorage mirrors the unclassifiable
+// case but with storage POSITIVELY classified shared: cleanup must still be
+// skipped, since "import/<file>" resolves to the same file on every node.
+func TestReplicateOneNode_CleanupSkipped_SharedStorage(t *testing.T) {
+	t.Parallel()
+
+	shared := &wbMockClusterStorage{storageName: "nfs", storageType: "nfs", isShared: true}
+	deps, deleteCalled := buildReplicateOneNodeFailureDeps(shared)
+
+	srcPath := makeTempImageFile(t, []byte("replicate-one-node-cleanup-guard-test"))
+	nodeLogger := log.NewNopLogger()
+	cp := stemcellCloudProps{Name: "ubuntu-jammy", Version: "1.0"}
+	replicateOneNode(context.Background(), deps, nodeLogger, "pve-node2", "nfs",
+		"bosh-stemcell-ubuntu-jammy-1.0-aabbccdd.qcow2", "aabbccdd00000000000000000000000000000000000000000000000000000000",
+		"aabbccdd", srcPath, "", ":heavy:nfs:import/x.qcow2", "test-director", cp, "")
+
+	if *deleteCalled {
+		t.Error("DeleteVolumeIfExists must NOT be called on shared storage — the uploaded file is the one the returned CID names")
+	}
+}
+
+// TestReplicateOneNode_CleanupOccurs_LocalStorage verifies cleanup DOES fire
+// when storage is positively classified node-local: the just-uploaded
+// "import/<file>" is genuinely this node's own copy, safe to reclaim on a
+// failed replica build.
+func TestReplicateOneNode_CleanupOccurs_LocalStorage(t *testing.T) {
+	t.Parallel()
+
+	local := &wbMockClusterStorage{storageName: "nfs", storageType: "dir", isShared: false}
+	deps, deleteCalled := buildReplicateOneNodeFailureDeps(local)
+
+	srcPath := makeTempImageFile(t, []byte("replicate-one-node-cleanup-guard-test"))
+	nodeLogger := log.NewNopLogger()
+	cp := stemcellCloudProps{Name: "ubuntu-jammy", Version: "1.0"}
+	replicateOneNode(context.Background(), deps, nodeLogger, "pve-node2", "nfs",
+		"bosh-stemcell-ubuntu-jammy-1.0-aabbccdd.qcow2", "aabbccdd00000000000000000000000000000000000000000000000000000000",
+		"aabbccdd", srcPath, "", ":heavy:nfs:import/x.qcow2", "test-director", cp, "")
+
+	if !*deleteCalled {
+		t.Error("DeleteVolumeIfExists must be called to reclaim this node's own local copy after a failed replica build")
+	}
+}
+
+// TestFetchFindByPrefix_AnchoredMatch_RejectsNearMiss verifies the anchored-match fix:
+// fetchFindByPrefix must NOT match a stored filename that merely contains the
+// wanted "bosh-stemcell-<name>-<version>-" prefix as a substring — e.g. a
+// DIFFERENT, longer-named stemcell ("ubuntu-jammy-go_agent") must not
+// false-positive against a scan for "ubuntu-jammy".
+func TestFetchFindByPrefix_AnchoredMatch_RejectsNearMiss(t *testing.T) {
+	t.Parallel()
+
+	const storage = "nfs"
+	// Near-miss: "ubuntu-jammy-go-agent" contains "ubuntu-jammy-" as a
+	// substring immediately after "import/", but is a DIFFERENT stemcell name
+	// with extra characters before the sha8+".qcow2" tail — must NOT match.
+	nearMissVolid := storage + ":import/bosh-stemcell-ubuntu-jammy-go-agent-1.0-deadbeef.qcow2"
+	// Exact match: the real target, listed alongside the near-miss so a
+	// non-anchored scan finding the near-miss FIRST would still be a bug even
+	// if this one is present later.
+	exactVolid := storage + ":import/bosh-stemcell-ubuntu-jammy-1.0-cafebabe.qcow2"
+
+	nodes := &wbTemplateNodes{
+		listQemuFn: listQemuEmpty(),
+		wbMockNodes: wbMockNodes{
+			listStorageFn: func(_ context.Context, _, _ string, _ *sdknodes.ListStorageContentParams) (*sdknodes.ListStorageContentResponse, error) {
+				near, _ := json.Marshal(map[string]string{"volid": nearMissVolid})
+				exact, _ := json.Marshal(map[string]string{"volid": exactVolid})
+				resp := sdknodes.ListStorageContentResponse{near, exact}
+				return &resp, nil
+			},
+		},
+	}
+	deps := buildEnsureTemplateDeps(&wbMockQEMU{}, nodes, &wbMockTasks{}, &wbTemplateStorage{})
+
+	prefix := stemcellfetch.FilenamePrefixForDedup("ubuntu-jammy", "1.0")
+	got, err := fetchFindByPrefix(context.Background(), deps, "pve-node1", storage, prefix)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != exactVolid {
+		t.Errorf("fetchFindByPrefix = %q; want the anchored exact match %q (near-miss %q must be rejected)",
+			got, exactVolid, nearMissVolid)
+	}
+}
+
+// TestFetchFindByPrefix_NoMatch_ReturnsEmpty verifies that when storage
+// contains ONLY a near-miss (no exact anchored match at all), fetchFindByPrefix
+// returns ("", nil) rather than falsely matching the near-miss.
+func TestFetchFindByPrefix_NoMatch_ReturnsEmpty(t *testing.T) {
+	t.Parallel()
+
+	const storage = "nfs"
+	nearMissVolid := storage + ":import/bosh-stemcell-ubuntu-jammy-go-agent-1.0-deadbeef.qcow2"
+
+	nodes := &wbTemplateNodes{
+		listQemuFn: listQemuEmpty(),
+		wbMockNodes: wbMockNodes{
+			listStorageFn: func(_ context.Context, _, _ string, _ *sdknodes.ListStorageContentParams) (*sdknodes.ListStorageContentResponse, error) {
+				near, _ := json.Marshal(map[string]string{"volid": nearMissVolid})
+				resp := sdknodes.ListStorageContentResponse{near}
+				return &resp, nil
+			},
+		},
+	}
+	deps := buildEnsureTemplateDeps(&wbMockQEMU{}, nodes, &wbMockTasks{}, &wbTemplateStorage{})
+
+	prefix := stemcellfetch.FilenamePrefixForDedup("ubuntu-jammy", "1.0")
+	got, err := fetchFindByPrefix(context.Background(), deps, "pve-node1", storage, prefix)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != "" {
+		t.Errorf("fetchFindByPrefix = %q; want \"\" (near-miss must never match)", got)
 	}
 }

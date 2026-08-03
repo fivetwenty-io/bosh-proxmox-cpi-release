@@ -1,6 +1,7 @@
 package handlers_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -14,6 +15,7 @@ import (
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
+	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
 	sdkcluster "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cluster"
 	sdknodes "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/nodes"
 	sdkstorage "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/storage"
@@ -21,19 +23,52 @@ import (
 )
 
 // ============================================================
-// Tests: HandleDeleteStemcell
+// Tests: HandleDeleteStemcell (path-identity CID / director-UUID refs)
+//
+// Fixtures reuse the shared stemcellMock* mock infrastructure defined in
+// create_stemcell_test.go (same handlers_test package).
 // ============================================================
 
-// deleteStemcellMockStorage implements sdkstorage.Service for delete_stemcell tests.
-// Only DeleteVolumeIfExists is wired; all other methods panic on accidental call.
+const testStemcellSHA8 = "ab12cd34"
+
+// testHeavyStemcellFilename returns the canonical qcow2 filename produced by
+// pve.BuildStemcellFilename for a stemcell whose content sha8 is testStemcellSHA8.
+func testStemcellFilename() string {
+	return "bosh-stemcell-ubuntu-jammy-1.0-" + testStemcellSHA8 + ".qcow2"
+}
+
+func testHeavyCID() string {
+	return pve.BuildHeavyStemcellCID("local", testStemcellFilename())
+}
+
+func testLightCID() string {
+	return pve.BuildLightStemcellCID("local", testStemcellFilename())
+}
+
+func testVolumePath() string {
+	return "import/" + testStemcellFilename()
+}
+
+// deleteStemcellVolumeCall records one observed DeleteVolumeIfExists
+// invocation, in call order, so tests can assert both content and ordering
+// (e.g. primary-then-replica).
+type deleteStemcellVolumeCall struct {
+	node, storage, volume string
+}
+
+// deleteStemcellMockStorage implements sdkstorage.Service for delete_stemcell
+// tests. Only DeleteVolumeIfExists is wired; all other methods panic on
+// accidental call.
 type deleteStemcellMockStorage struct {
 	sdkstorage.Service        // nil embed — panics on unhandled calls
 	deleteVolumeIfExistsFn    func(ctx context.Context, node, storage, volume string) (bool, error)
 	deleteVolumeIfExistsCalls int
+	calls                     []deleteStemcellVolumeCall
 }
 
 func (m *deleteStemcellMockStorage) DeleteVolumeIfExists(ctx context.Context, node, storage, volume string) (bool, error) {
 	m.deleteVolumeIfExistsCalls++
+	m.calls = append(m.calls, deleteStemcellVolumeCall{node: node, storage: storage, volume: volume})
 	if m.deleteVolumeIfExistsFn != nil {
 		return m.deleteVolumeIfExistsFn(ctx, node, storage, volume)
 	}
@@ -47,148 +82,91 @@ func (m *deleteStemcellMockStorage) Upload(_ context.Context, _, _, _, _ string,
 	panic("deleteStemcellMockStorage.Upload: not expected in delete_stemcell tests")
 }
 
-// buildDeleteStemcellDeps constructs Deps for delete_stemcell tests using the
-// provided storage mock. Node and StemcellStorage are pre-set.
-func buildDeleteStemcellDeps(storageSvc sdkstorage.Service) handlers.Deps {
+// deleteStemcellDepsOpts collects the pieces buildDeleteStemcellDeps needs;
+// every field defaults to a harmless no-op mock/value when left zero.
+type deleteStemcellDepsOpts struct {
+	cfg        *config.CPIConfig
+	qemuSvc    *stemcellMockQEMU
+	nodesSvc   *stemcellMockNodes
+	clusterSvc *stemcellMockCluster
+	storageSvc *deleteStemcellMockStorage
+	logger     *log.Logger
+}
+
+func buildDeleteStemcellDeps(o deleteStemcellDepsOpts) handlers.Deps {
+	if o.cfg == nil {
+		o.cfg = &config.CPIConfig{Node: vmNode, StemcellStorage: "local", VMStorage: "local", DiskStorage: "local"}
+	}
+	if o.qemuSvc == nil {
+		o.qemuSvc = &stemcellMockQEMU{}
+	}
+	if o.nodesSvc == nil {
+		o.nodesSvc = &stemcellMockNodes{}
+	}
+	if o.clusterSvc == nil {
+		o.clusterSvc = &stemcellMockCluster{}
+	}
+	if o.storageSvc == nil {
+		o.storageSvc = &deleteStemcellMockStorage{}
+	}
+	if o.logger == nil {
+		o.logger = log.NewNopLogger()
+	}
 	client := &stemcellMockClient{
-		qemuSvc:    &stemcellMockQEMU{},
-		nodesSvc:   &stemcellMockNodes{},
+		qemuSvc:    o.qemuSvc,
+		nodesSvc:   o.nodesSvc,
 		tasksSvc:   &stemcellMockTasks{},
-		clusterSvc: &stemcellMockCluster{},
-		storageSvc: storageSvc,
+		clusterSvc: o.clusterSvc,
+		storageSvc: o.storageSvc,
 	}
-	return handlers.Deps{
-		Config: &config.CPIConfig{
-			Node:            vmNode,
-			StemcellStorage: "local",
-			VMStorage:       "local",
-			DiskStorage:     "local",
-		},
-		PVE:    client,
-		Logger: log.NewNopLogger(),
-	}
+	return handlers.Deps{Config: o.cfg, PVE: client, Logger: o.logger}
 }
 
-// buildDeleteStemcellDepsWithQemuAndNodes constructs Deps with both a custom QEMU
-// mock (for Config reads used by the refs gate) and a custom nodes mock.
-func buildDeleteStemcellDepsWithQemuAndNodes(qemuSvc *stemcellMockQEMU, nodesSvc *stemcellMockNodes, cfg *config.CPIConfig) handlers.Deps {
-	client := &stemcellMockClient{
-		qemuSvc:    qemuSvc,
-		nodesSvc:   nodesSvc,
-		tasksSvc:   &stemcellMockTasks{},
-		clusterSvc: &stemcellMockCluster{},
-		storageSvc: &deleteStemcellMockStorage{},
+// directorRefsDescJSON builds a template description JSON string carrying the
+// given sha8 and director_refs set, matching stemcellProvenance's shape.
+func directorRefsDescJSON(sha8 string, refs ...string) string {
+	if refs == nil {
+		refs = []string{}
 	}
-	return handlers.Deps{
-		Config: cfg,
-		PVE:    client,
-		Logger: log.NewNopLogger(),
-	}
+	b, _ := json.Marshal(refs)
+	return fmt.Sprintf(
+		`{"name":"test","version":"1.0","sha8":%q,"created":"2026-08-03T00:00:00Z","kind":"heavy","director_refs":%s}`,
+		sha8, string(b),
+	)
 }
 
-// stemcellRefsDesc builds a description JSON string with the given stemcell_refs
-// CSV so QEMU.Config mocks can return a realistic template description for the
-// refs-gate in delete_stemcell.
-func stemcellRefsDesc(refs ...string) map[string]any {
-	joined := strings.Join(refs, ",")
-	desc := fmt.Sprintf(`{"name":"test","version":"1.0","sha8":"ab12ef34","created":"2026-06-12T00:00:00Z","stemcell_refs":%q}`, joined)
-	return map[string]any{"description": desc}
+// directorRefsDescMap wraps directorRefsDescJSON in the map[string]any shape
+// QEMU().Config mocks return. Every call site in this file exercises the
+// same fixture sha8 (testStemcellSHA8), so it is fixed here rather than
+// threaded through as a parameter.
+func directorRefsDescMap(refs ...string) map[string]any {
+	return map[string]any{"description": directorRefsDescJSON(testStemcellSHA8, refs...)}
 }
 
-// defaultTemplateDeps returns Deps configured for template CID tests.
-// nodesSvc.deleteQemuFn is wired by the caller. The QEMU Config mock returns
-// a description with stemcell_refs = the template CID so the refs gate allows
-// destruction (simulating a normally-created template).
-func defaultTemplateDeps(nodesSvc *stemcellMockNodes) handlers.Deps {
-	return defaultTemplateDepsForCID(nodesSvc, "template:6042")
+// clusterTemplateItem builds a raw JSON cluster resource entry for a stemcell
+// template with the given vmid, node, and semicolon-separated tags.
+func clusterTemplateItem(vmid int64, node, name, tags string) json.RawMessage {
+	raw, _ := json.Marshal(map[string]any{
+		"type":     "qemu",
+		"vmid":     vmid,
+		"node":     node,
+		"name":     name,
+		"tags":     tags,
+		"template": 1,
+	})
+	return raw
 }
 
-// defaultTemplateDepsForCID is like defaultTemplateDeps but uses a specific CID
-// to populate the stemcell_refs in the description returned by QEMU.Config.
-func defaultTemplateDepsForCID(nodesSvc *stemcellMockNodes, cid string) handlers.Deps {
-	cfg := &config.CPIConfig{
-		Node:            vmNode,
-		StemcellStorage: "local",
-		VMStorage:       "local",
-		DiskStorage:     "local",
-	}
-	qemuSvc := &stemcellMockQEMU{
-		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
-			return stemcellRefsDesc(cid), nil
-		},
-	}
-	return buildDeleteStemcellDepsWithQemuAndNodes(qemuSvc, nodesSvc, cfg)
-}
+func shaTag(sha8 string) string { return "bosh-stemcell-sha-" + sha8 }
 
-// validStemcellCID returns a well-formed stemcell CID for use in tests.
-func validStemcellCID() string {
-	return "local:import/bosh-stemcell-ubuntu-jammy-1.0-abc12345.qcow2"
-}
+// ============================================================
+// Tests: argument validation + CID grammar
+// ============================================================
 
-// TestDeleteStemcell_HappyPath verifies that the qcow2 volume is deleted.
-// Volume notes attached to the qcow2 are removed transitively.
-func TestDeleteStemcell_HappyPath(t *testing.T) {
-	t.Parallel()
-
-	cid := validStemcellCID()
-
-	var deletedVolumes []string
-	storageSvc := &deleteStemcellMockStorage{
-		deleteVolumeIfExistsFn: func(_ context.Context, _, _, volume string) (bool, error) {
-			deletedVolumes = append(deletedVolumes, volume)
-			return true, nil
-		},
-	}
-
-	deps := buildDeleteStemcellDeps(storageSvc)
-	h := handlers.HandleDeleteStemcell(deps)
-
-	args := []json.RawMessage{marshalArg(t, cid)}
-	result, err := h.Handle(context.Background(), args, jsonrpc.Context{RequestID: "req-del-1"})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if result != nil {
-		t.Errorf("expected nil result (void), got %v", result)
-	}
-	if len(deletedVolumes) != 1 {
-		t.Fatalf("expected 1 DeleteVolumeIfExists call, got %d: %v", len(deletedVolumes), deletedVolumes)
-	}
-	if deletedVolumes[0] != "import/bosh-stemcell-ubuntu-jammy-1.0-abc12345.qcow2" {
-		t.Errorf("delete volume = %q; want qcow2 import path", deletedVolumes[0])
-	}
-}
-
-// TestDeleteStemcell_Idempotent_VolumeAbsent verifies success when the qcow2 is
-// already gone. delete_stemcell must be idempotent — an absent volume produces
-// a warning, not an error.
-func TestDeleteStemcell_Idempotent_VolumeAbsent(t *testing.T) {
-	t.Parallel()
-
-	storageSvc := &deleteStemcellMockStorage{
-		deleteVolumeIfExistsFn: func(_ context.Context, _, _, _ string) (bool, error) {
-			return false, nil // volume did not exist
-		},
-	}
-
-	deps := buildDeleteStemcellDeps(storageSvc)
-	h := handlers.HandleDeleteStemcell(deps)
-
-	args := []json.RawMessage{marshalArg(t, validStemcellCID())}
-	result, err := h.Handle(context.Background(), args, jsonrpc.Context{})
-	if err != nil {
-		t.Fatalf("expected nil error when volume absent (idempotent), got: %v", err)
-	}
-	if result != nil {
-		t.Errorf("expected nil result, got %v", result)
-	}
-}
-
-// TestDeleteStemcell_MissingArg verifies CloudError when no arguments provided.
 func TestDeleteStemcell_MissingArg(t *testing.T) {
 	t.Parallel()
 
-	deps := buildDeleteStemcellDeps(&deleteStemcellMockStorage{})
+	deps := buildDeleteStemcellDeps(deleteStemcellDepsOpts{})
 	h := handlers.HandleDeleteStemcell(deps)
 
 	_, err := h.Handle(context.Background(), nil, jsonrpc.Context{})
@@ -201,14 +179,12 @@ func TestDeleteStemcell_MissingArg(t *testing.T) {
 	}
 }
 
-// TestDeleteStemcell_NonStringArg verifies CloudError when stemcell_cid is a JSON number.
 func TestDeleteStemcell_NonStringArg(t *testing.T) {
 	t.Parallel()
 
-	deps := buildDeleteStemcellDeps(&deleteStemcellMockStorage{})
+	deps := buildDeleteStemcellDeps(deleteStemcellDepsOpts{})
 	h := handlers.HandleDeleteStemcell(deps)
 
-	// JSON number (5042) instead of string.
 	args := []json.RawMessage{json.RawMessage(`5042`)}
 	_, err := h.Handle(context.Background(), args, jsonrpc.Context{})
 	if err == nil {
@@ -220,108 +196,617 @@ func TestDeleteStemcell_NonStringArg(t *testing.T) {
 	}
 }
 
-// TestDeleteStemcell_LegacyIntegerCID verifies CloudError for legacy integer-only CIDs.
-// These were the old VMID-style CIDs and are no longer valid in the qcow2 volume model.
-// Legacy integer CIDs come from the obsolete template-clone CPI design.
-// delete_stemcell must accept them as a no-op so operators can scrub the
-// stale row from the director without manual database surgery. The PVE
-// side is NOT touched (no DeleteVolumeIfExists call) since the original
-// template VM and its import qcow2 are out-of-band cleanup.
-func TestDeleteStemcell_LegacyIntegerCID(t *testing.T) {
-	t.Parallel()
-
-	legacyCIDs := []string{"5042", "5000", "5999", "100", "1"}
-
-	for _, cid := range legacyCIDs {
-		cid := cid
-		t.Run("cid="+cid, func(t *testing.T) {
-			t.Parallel()
-
-			storage := &deleteStemcellMockStorage{}
-			deps := buildDeleteStemcellDeps(storage)
-			h := handlers.HandleDeleteStemcell(deps)
-
-			args := []json.RawMessage{marshalArg(t, cid)}
-			result, err := h.Handle(context.Background(), args, jsonrpc.Context{})
-			if err != nil {
-				t.Fatalf("expected nil error for legacy CID %q (no-op accept), got: %v", cid, err)
-			}
-			if result != nil {
-				t.Errorf("expected nil result, got %v", result)
-			}
-			if storage.deleteVolumeIfExistsCalls != 0 {
-				t.Errorf("expected no PVE delete calls for legacy CID, got %d", storage.deleteVolumeIfExistsCalls)
-			}
-		})
-	}
-}
-
-// TestDeleteStemcell_MalformedCID verifies CloudError for CIDs that lack the
-// expected "<storage>:import/<filename>" format.
-func TestDeleteStemcell_MalformedCID(t *testing.T) {
+// TestDeleteStemcell_LegacyAndMalformedCIDs_HardError verifies that every
+// retired CID grammar — and every malformed path CID — is rejected as a hard,
+// non-retriable cloud error with zero PVE API calls. Pre-release cutover: no
+// backward compatibility, no legacy no-op arms.
+func TestDeleteStemcell_LegacyAndMalformedCIDs_HardError(t *testing.T) {
 	t.Parallel()
 
 	cases := []struct {
 		name string
 		cid  string
 	}{
-		{"no colon", "localbosh-stemcell-ubuntu.qcow2"},
-		{"no import prefix", "local:volumes/bosh-stemcell.qcow2"},
+		{"legacy template CID", "template:6042"},
+		{"legacy integer CID", "5042"},
+		{"legacy light CID (no leading colon)", "light:nfs:import/bosh-stemcell-ubuntu-1.0-deadbeef.qcow2"},
+		{"legacy bare volume CID (no leading colon)", "nfs:import/bosh-stemcell-ubuntu-1.0-deadbeef.qcow2"},
 		{"empty", ""},
 		{"just colon", ":"},
-		{"colon no import", "local:bosh-stemcell.qcow2"},
+		{"unknown kind", ":medium:local:import/x.qcow2"},
+		{"doubled prefix", ":light::heavy:local:import/x.qcow2"},
+		{"missing import prefix", ":heavy:local:volumes/x.qcow2"},
+		{"no colon at all", "localbosh-stemcell-ubuntu.qcow2"},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			deps := buildDeleteStemcellDeps(&deleteStemcellMockStorage{})
+			storageSvc := &deleteStemcellMockStorage{}
+			var deleteQemuCalled bool
+			nodesSvc := &stemcellMockNodes{
+				deleteQemuFn: func(_ context.Context, _, _ string, _ *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
+					deleteQemuCalled = true
+					resp := sdknodes.DeleteQemuResponse(`""`)
+					return &resp, nil
+				},
+			}
+			deps := buildDeleteStemcellDeps(deleteStemcellDepsOpts{nodesSvc: nodesSvc, storageSvc: storageSvc})
 			h := handlers.HandleDeleteStemcell(deps)
 
-			var args []json.RawMessage
-			if tc.cid == "" {
-				args = []json.RawMessage{marshalArg(t, "")}
-			} else {
-				args = []json.RawMessage{marshalArg(t, tc.cid)}
-			}
-
+			args := []json.RawMessage{marshalArg(t, tc.cid)}
 			_, err := h.Handle(context.Background(), args, jsonrpc.Context{})
 			if err == nil {
-				t.Fatalf("expected error for malformed CID %q, got nil", tc.cid)
+				t.Fatalf("expected error for CID %q, got nil", tc.cid)
 			}
 			var cpiErr *cpierrors.Error
 			if !errors.As(err, &cpiErr) {
 				t.Errorf("expected *cpierrors.Error, got %T: %v", err, err)
 			}
+			if storageSvc.deleteVolumeIfExistsCalls != 0 {
+				t.Errorf("expected zero storage calls for rejected CID %q, got %d", tc.cid, storageSvc.deleteVolumeIfExistsCalls)
+			}
+			if deleteQemuCalled {
+				t.Errorf("expected zero DeleteQemu calls for rejected CID %q", tc.cid)
+			}
 		})
 	}
 }
 
-// TestDeleteStemcell_NoNodeConfigured verifies CloudError when config.Node is empty.
-func TestDeleteStemcell_NoNodeConfigured(t *testing.T) {
+// ============================================================
+// Tests: light stemcells — file NEVER deleted
+// ============================================================
+
+func TestDeleteStemcell_Light_LastRef_TemplateDestroyed_FileNeverDeleted(t *testing.T) {
 	t.Parallel()
 
-	client := &stemcellMockClient{
-		qemuSvc:    &stemcellMockQEMU{},
-		nodesSvc:   &stemcellMockNodes{},
-		tasksSvc:   &stemcellMockTasks{},
-		clusterSvc: &stemcellMockCluster{},
-		storageSvc: &deleteStemcellMockStorage{},
-	}
-	deps := handlers.Deps{
-		Config: &config.CPIConfig{
-			Node:            "", // deliberately empty
-			StemcellStorage: "local",
-			VMStorage:       "local",
-			DiskStorage:     "local",
+	const primaryVMID = int64(6042)
+	var destroyedVMIDs []string
+	nodesSvc := &stemcellMockNodes{
+		deleteQemuFn: func(_ context.Context, _, vmid string, _ *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
+			destroyedVMIDs = append(destroyedVMIDs, vmid)
+			resp := sdknodes.DeleteQemuResponse(`""`)
+			return &resp, nil
 		},
-		PVE:    client,
-		Logger: log.NewNopLogger(),
 	}
+	qemuSvc := &stemcellMockQEMU{
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return directorRefsDescMap("dir-a"), nil
+		},
+	}
+	clusterSvc := &stemcellMockCluster{
+		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+			items := sdkcluster.ListResourcesResponse{
+				clusterTemplateItem(primaryVMID, vmNode, "stemcell-cache", shaTag(testStemcellSHA8)),
+			}
+			return &items, nil
+		},
+	}
+	storageSvc := &deleteStemcellMockStorage{}
+
+	deps := buildDeleteStemcellDeps(deleteStemcellDepsOpts{qemuSvc: qemuSvc, nodesSvc: nodesSvc, clusterSvc: clusterSvc, storageSvc: storageSvc})
 	h := handlers.HandleDeleteStemcell(deps)
 
-	args := []json.RawMessage{marshalArg(t, validStemcellCID())}
+	args := []json.RawMessage{marshalArg(t, testLightCID())}
+	result, err := h.Handle(context.Background(), args, jsonrpc.Context{DirectorUUID: "dir-a"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result != nil {
+		t.Errorf("expected nil result, got %v", result)
+	}
+	if len(destroyedVMIDs) != 1 || destroyedVMIDs[0] != fmt.Sprintf("%d", primaryVMID) {
+		t.Errorf("expected primary template %d destroyed, got %v", primaryVMID, destroyedVMIDs)
+	}
+	if storageSvc.deleteVolumeIfExistsCalls != 0 {
+		t.Errorf("light stemcell: DeleteVolumeIfExists must NEVER be called, got %d calls", storageSvc.deleteVolumeIfExistsCalls)
+	}
+}
+
+func TestDeleteStemcell_Light_NoTemplates_NoOp(t *testing.T) {
+	t.Parallel()
+
+	storageSvc := &deleteStemcellMockStorage{}
+	deps := buildDeleteStemcellDeps(deleteStemcellDepsOpts{storageSvc: storageSvc})
+	h := handlers.HandleDeleteStemcell(deps)
+
+	args := []json.RawMessage{marshalArg(t, testLightCID())}
+	result, err := h.Handle(context.Background(), args, jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result != nil {
+		t.Errorf("expected nil result, got %v", result)
+	}
+	if storageSvc.deleteVolumeIfExistsCalls != 0 {
+		t.Errorf("light stemcell no-template path must never touch storage, got %d calls", storageSvc.deleteVolumeIfExistsCalls)
+	}
+}
+
+// TestDeleteStemcell_Light_NoTemplates_NoNodeConfigured_StillSucceeds verifies
+// that a light no-op does not require config.node — there is no PVE call to
+// make.
+func TestDeleteStemcell_Light_NoTemplates_NoNodeConfigured_StillSucceeds(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.CPIConfig{Node: "", StemcellStorage: "local", VMStorage: "local", DiskStorage: "local"}
+	deps := buildDeleteStemcellDeps(deleteStemcellDepsOpts{cfg: cfg})
+	h := handlers.HandleDeleteStemcell(deps)
+
+	args := []json.RawMessage{marshalArg(t, testLightCID())}
+	_, err := h.Handle(context.Background(), args, jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// ============================================================
+// Tests: heavy stemcells — destroy-then-delete ordering, replicas
+// ============================================================
+
+func TestDeleteStemcell_Heavy_LastRef_DestroysTemplateThenDeletesFile_OrderAsserted(t *testing.T) {
+	t.Parallel()
+
+	const primaryVMID = int64(7001)
+	const replicaVMID = int64(7002)
+
+	var events []string
+	nodesSvc := &stemcellMockNodes{
+		deleteQemuFn: func(_ context.Context, node, vmid string, _ *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
+			events = append(events, fmt.Sprintf("destroy:%s:%s", node, vmid))
+			resp := sdknodes.DeleteQemuResponse(`""`)
+			return &resp, nil
+		},
+	}
+	qemuSvc := &stemcellMockQEMU{
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return directorRefsDescMap("dir-a"), nil
+		},
+	}
+	clusterSvc := &stemcellMockCluster{
+		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+			items := sdkcluster.ListResourcesResponse{
+				clusterTemplateItem(primaryVMID, vmNode, "stemcell-cache", shaTag(testStemcellSHA8)),
+				clusterTemplateItem(replicaVMID, "pve2", "stemcell-cache-replica", shaTag(testStemcellSHA8)),
+			}
+			return &items, nil
+		},
+	}
+	storageSvc := &deleteStemcellMockStorage{
+		deleteVolumeIfExistsFn: func(_ context.Context, node, _, _ string) (bool, error) {
+			events = append(events, "qcow2:"+node)
+			return true, nil
+		},
+	}
+
+	deps := buildDeleteStemcellDeps(deleteStemcellDepsOpts{qemuSvc: qemuSvc, nodesSvc: nodesSvc, clusterSvc: clusterSvc, storageSvc: storageSvc})
+	h := handlers.HandleDeleteStemcell(deps)
+
+	args := []json.RawMessage{marshalArg(t, testHeavyCID())}
+	_, err := h.Handle(context.Background(), args, jsonrpc.Context{DirectorUUID: "dir-a"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	want := []string{
+		fmt.Sprintf("destroy:%s:%d", vmNode, primaryVMID),
+		fmt.Sprintf("destroy:%s:%d", "pve2", replicaVMID),
+		"qcow2:" + vmNode,
+		"qcow2:pve2",
+	}
+	if len(events) != len(want) {
+		t.Fatalf("event order = %v, want %v", events, want)
+	}
+	for i := range want {
+		if events[i] != want[i] {
+			t.Errorf("event[%d] = %q, want %q (full sequence: %v)", i, events[i], want[i], events)
+		}
+	}
+	if storageSvc.deleteVolumeIfExistsCalls != 2 {
+		t.Errorf("expected 2 qcow2 deletes (primary + 1 replica), got %d", storageSvc.deleteVolumeIfExistsCalls)
+	}
+	if storageSvc.calls[0].volume != testVolumePath() || storageSvc.calls[1].volume != testVolumePath() {
+		t.Errorf("expected both qcow2 deletes to target %q, got %+v", testVolumePath(), storageSvc.calls)
+	}
+}
+
+func TestDeleteStemcell_Heavy_ReplicaDestroyFailure_BestEffort_OverallSucceeds(t *testing.T) {
+	t.Parallel()
+
+	const primaryVMID = int64(7101)
+	const replicaVMID = int64(7102)
+
+	var destroyCount int
+	nodesSvc := &stemcellMockNodes{
+		deleteQemuFn: func(_ context.Context, _, vmid string, _ *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
+			destroyCount++
+			if vmid == fmt.Sprintf("%d", replicaVMID) {
+				return nil, errors.New("PVE: transient error on replica")
+			}
+			resp := sdknodes.DeleteQemuResponse(`""`)
+			return &resp, nil
+		},
+	}
+	qemuSvc := &stemcellMockQEMU{
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return directorRefsDescMap("dir-a"), nil
+		},
+	}
+	clusterSvc := &stemcellMockCluster{
+		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+			items := sdkcluster.ListResourcesResponse{
+				clusterTemplateItem(primaryVMID, vmNode, "stemcell-cache", shaTag(testStemcellSHA8)),
+				clusterTemplateItem(replicaVMID, "pve2", "stemcell-cache-replica", shaTag(testStemcellSHA8)),
+			}
+			return &items, nil
+		},
+	}
+	storageSvc := &deleteStemcellMockStorage{}
+
+	deps := buildDeleteStemcellDeps(deleteStemcellDepsOpts{qemuSvc: qemuSvc, nodesSvc: nodesSvc, clusterSvc: clusterSvc, storageSvc: storageSvc})
+	h := handlers.HandleDeleteStemcell(deps)
+
+	args := []json.RawMessage{marshalArg(t, testHeavyCID())}
+	_, err := h.Handle(context.Background(), args, jsonrpc.Context{DirectorUUID: "dir-a"})
+	if err != nil {
+		t.Fatalf("delete_stemcell must succeed even when a replica template destroy fails; got: %v", err)
+	}
+	if destroyCount != 2 {
+		t.Errorf("expected 2 DeleteQemu attempts (primary + replica), got %d", destroyCount)
+	}
+	// The template destroy overall still counts as "destroyed" (primary
+	// succeeded); qcow2 cleanup on both nodes is still attempted.
+	if storageSvc.deleteVolumeIfExistsCalls != 2 {
+		t.Errorf("expected qcow2 delete attempted on both nodes despite replica destroy failure, got %d calls", storageSvc.deleteVolumeIfExistsCalls)
+	}
+}
+
+// ============================================================
+// Tests: anchor selection — replicas must never hijack the ref-anchor
+// ============================================================
+
+// TestDeleteStemcell_ReplicaLowerVMID_DoesNotHijackAnchor verifies that a
+// per-node replica carrying a LOWER VMID than the primary never becomes the
+// deregister anchor — anchor selection must skip every replica-tagged match
+// and pick the lowest-VMID NON-replica match instead, regardless of the
+// ascending-VMID order FindTemplatesBySHATagCluster returns.
+func TestDeleteStemcell_ReplicaLowerVMID_DoesNotHijackAnchor(t *testing.T) {
+	t.Parallel()
+
+	const primaryVMID = int64(30500) // anchor: NOT tagged as a replica.
+	const replicaVMID = int64(30100) // lower VMID, but IS tagged as a replica.
+	const replicaNode = "pve2"
+
+	var events []string
+	nodesSvc := &stemcellMockNodes{
+		deleteQemuFn: func(_ context.Context, node, vmid string, _ *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
+			events = append(events, fmt.Sprintf("destroy:%s:%s", node, vmid))
+			resp := sdknodes.DeleteQemuResponse(`""`)
+			return &resp, nil
+		},
+	}
+	qemuSvc := &stemcellMockQEMU{
+		configFn: func(_ context.Context, node string, _ int) (map[string]any, error) {
+			events = append(events, "config-read:"+node)
+			return directorRefsDescMap("dir-a"), nil
+		},
+	}
+	clusterSvc := &stemcellMockCluster{
+		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+			// Deliberately listed replica-first; FindTemplatesBySHATagCluster
+			// sorts ascending by VMID, so the replica (lower VMID) sorts
+			// first in refs regardless of this order — anchor selection must
+			// still skip it.
+			items := sdkcluster.ListResourcesResponse{
+				clusterTemplateItem(replicaVMID, replicaNode, "stemcell-cache-replica",
+					shaTag(testStemcellSHA8)+";"+pve.ReplicaNodeTagForNode(replicaNode)),
+				clusterTemplateItem(primaryVMID, vmNode, "stemcell-cache", shaTag(testStemcellSHA8)),
+			}
+			return &items, nil
+		},
+	}
+	storageSvc := &deleteStemcellMockStorage{}
+
+	deps := buildDeleteStemcellDeps(deleteStemcellDepsOpts{qemuSvc: qemuSvc, nodesSvc: nodesSvc, clusterSvc: clusterSvc, storageSvc: storageSvc})
+	h := handlers.HandleDeleteStemcell(deps)
+
+	args := []json.RawMessage{marshalArg(t, testHeavyCID())}
+	_, err := h.Handle(context.Background(), args, jsonrpc.Context{DirectorUUID: "dir-a"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// The deregister read-modify-write's config read must target the
+	// primary — the anchor — never the lower-VMID replica.
+	if len(events) == 0 || events[0] != "config-read:"+vmNode {
+		t.Fatalf("anchor config read must target the primary node %q first, got events=%v", vmNode, events)
+	}
+	wantDestroyOrder := []string{
+		"destroy:" + vmNode + ":" + fmt.Sprintf("%d", primaryVMID),
+		"destroy:" + replicaNode + ":" + fmt.Sprintf("%d", replicaVMID),
+	}
+	var gotDestroys []string
+	for _, e := range events {
+		if strings.HasPrefix(e, "destroy:") {
+			gotDestroys = append(gotDestroys, e)
+		}
+	}
+	if len(gotDestroys) != len(wantDestroyOrder) {
+		t.Fatalf("destroy events = %v, want %v", gotDestroys, wantDestroyOrder)
+	}
+	for i := range wantDestroyOrder {
+		if gotDestroys[i] != wantDestroyOrder[i] {
+			t.Errorf("destroy[%d] = %q, want %q (full events: %v)", i, gotDestroys[i], wantDestroyOrder[i], events)
+		}
+	}
+}
+
+// TestDeleteStemcell_AllReplicas_FallsThroughToNoTemplateSemantics verifies
+// The other anchor edge: when every cluster-scoped match for this content sha8 is
+// a per-node replica, there is no anchor to deregister against — the call
+// must fall through to the no-cache-template semantics (idempotent qcow2
+// delete convergence) rather than deregistering against, and possibly
+// destroying, a replica whose ref set is a fossil of its own creation.
+func TestDeleteStemcell_AllReplicas_FallsThroughToNoTemplateSemantics(t *testing.T) {
+	t.Parallel()
+
+	const replicaVMID = int64(30200)
+	const replicaNode = "pve3"
+
+	var deleteQemuCalled bool
+	nodesSvc := &stemcellMockNodes{
+		deleteQemuFn: func(_ context.Context, _, _ string, _ *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
+			deleteQemuCalled = true
+			resp := sdknodes.DeleteQemuResponse(`""`)
+			return &resp, nil
+		},
+	}
+	clusterSvc := &stemcellMockCluster{
+		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+			items := sdkcluster.ListResourcesResponse{
+				clusterTemplateItem(replicaVMID, replicaNode, "stemcell-cache-replica",
+					shaTag(testStemcellSHA8)+";"+pve.ReplicaNodeTagForNode(replicaNode)),
+			}
+			return &items, nil
+		},
+	}
+	storageSvc := &deleteStemcellMockStorage{}
+
+	deps := buildDeleteStemcellDeps(deleteStemcellDepsOpts{nodesSvc: nodesSvc, clusterSvc: clusterSvc, storageSvc: storageSvc})
+	h := handlers.HandleDeleteStemcell(deps)
+
+	args := []json.RawMessage{marshalArg(t, testHeavyCID())}
+	result, err := h.Handle(context.Background(), args, jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result != nil {
+		t.Errorf("expected nil result, got %v", result)
+	}
+	if deleteQemuCalled {
+		t.Error("an all-replica match set must never be deregistered/destroyed directly — there is no anchor")
+	}
+	// No-template semantics: qcow2 delete still attempted for retry
+	// convergence, on config.Node (there is no template to read a node from).
+	if storageSvc.deleteVolumeIfExistsCalls == 0 {
+		t.Error("expected the no-template heavy qcow2 delete to still run")
+	}
+	if len(storageSvc.calls) == 0 || storageSvc.calls[0].node != vmNode {
+		t.Errorf("expected the first qcow2 delete on config.Node %q, got %+v", vmNode, storageSvc.calls)
+	}
+}
+
+// ============================================================
+// Tests: refs remain — nothing destroyed
+// ============================================================
+
+func TestDeleteStemcell_Heavy_NonLastRef_NothingDestroyed_RefsWrittenMinusCaller(t *testing.T) {
+	t.Parallel()
+
+	const primaryVMID = int64(7201)
+
+	var deleteQemuCalled bool
+	var capturedDesc string
+	nodesSvc := &stemcellMockNodes{
+		deleteQemuFn: func(_ context.Context, _, _ string, _ *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
+			deleteQemuCalled = true
+			resp := sdknodes.DeleteQemuResponse(`""`)
+			return &resp, nil
+		},
+		updateConfigFn: func(_ context.Context, _, _ string, params *sdknodes.UpdateQemuConfigParams) error {
+			if params != nil && params.Description != nil {
+				capturedDesc = *params.Description
+			}
+			return nil
+		},
+	}
+	qemuSvc := &stemcellMockQEMU{
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return directorRefsDescMap("dir-a", "dir-b"), nil
+		},
+	}
+	clusterSvc := &stemcellMockCluster{
+		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+			items := sdkcluster.ListResourcesResponse{
+				clusterTemplateItem(primaryVMID, vmNode, "stemcell-cache", shaTag(testStemcellSHA8)),
+			}
+			return &items, nil
+		},
+	}
+	storageSvc := &deleteStemcellMockStorage{}
+
+	deps := buildDeleteStemcellDeps(deleteStemcellDepsOpts{qemuSvc: qemuSvc, nodesSvc: nodesSvc, clusterSvc: clusterSvc, storageSvc: storageSvc})
+	h := handlers.HandleDeleteStemcell(deps)
+
+	args := []json.RawMessage{marshalArg(t, testHeavyCID())}
+	_, err := h.Handle(context.Background(), args, jsonrpc.Context{DirectorUUID: "dir-a"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if deleteQemuCalled {
+		t.Error("template must NOT be destroyed while another director's ref remains")
+	}
+	if storageSvc.deleteVolumeIfExistsCalls != 0 {
+		t.Errorf("qcow2 must NOT be touched while refs remain, got %d calls", storageSvc.deleteVolumeIfExistsCalls)
+	}
+	if capturedDesc == "" {
+		t.Fatal("expected the ref set to be persisted (RMW write)")
+	}
+	if strings.Contains(capturedDesc, `"dir-a"`) {
+		t.Errorf("caller's ref must be removed from the persisted set: %s", capturedDesc)
+	}
+	if !strings.Contains(capturedDesc, `"dir-b"`) {
+		t.Errorf("remaining director's ref must survive: %s", capturedDesc)
+	}
+}
+
+// TestDeleteStemcell_SecondDirectorDeleteAfterFirst_Destroys simulates two
+// sequential deletes from different directors sharing one cache template: the
+// first drops its ref (template survives), the second is the last ref and
+// destroys.
+func TestDeleteStemcell_SecondDirectorDeleteAfterFirst_Destroys(t *testing.T) {
+	t.Parallel()
+
+	const primaryVMID = int64(7301)
+
+	// --- First director's delete: refs=[dir-a,dir-b], caller dir-a. ---
+	var firstDestroyCalled bool
+	firstNodes := &stemcellMockNodes{
+		deleteQemuFn: func(_ context.Context, _, _ string, _ *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
+			firstDestroyCalled = true
+			resp := sdknodes.DeleteQemuResponse(`""`)
+			return &resp, nil
+		},
+	}
+	firstQemu := &stemcellMockQEMU{
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return directorRefsDescMap("dir-a", "dir-b"), nil
+		},
+	}
+	firstCluster := &stemcellMockCluster{
+		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+			items := sdkcluster.ListResourcesResponse{clusterTemplateItem(primaryVMID, vmNode, "stemcell-cache", shaTag(testStemcellSHA8))}
+			return &items, nil
+		},
+	}
+	firstDeps := buildDeleteStemcellDeps(deleteStemcellDepsOpts{qemuSvc: firstQemu, nodesSvc: firstNodes, clusterSvc: firstCluster})
+	h1 := handlers.HandleDeleteStemcell(firstDeps)
+	args := []json.RawMessage{marshalArg(t, testHeavyCID())}
+	if _, err := h1.Handle(context.Background(), args, jsonrpc.Context{DirectorUUID: "dir-a"}); err != nil {
+		t.Fatalf("first delete: unexpected error: %v", err)
+	}
+	if firstDestroyCalled {
+		t.Fatal("first delete must NOT destroy — dir-b's ref remains")
+	}
+
+	// --- Second director's delete: refs now [dir-b] (persisted state), caller dir-b. ---
+	var secondDestroyCalled bool
+	secondNodes := &stemcellMockNodes{
+		deleteQemuFn: func(_ context.Context, _, _ string, _ *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
+			secondDestroyCalled = true
+			resp := sdknodes.DeleteQemuResponse(`""`)
+			return &resp, nil
+		},
+	}
+	secondQemu := &stemcellMockQEMU{
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return directorRefsDescMap("dir-b"), nil
+		},
+	}
+	secondCluster := &stemcellMockCluster{
+		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+			items := sdkcluster.ListResourcesResponse{clusterTemplateItem(primaryVMID, vmNode, "stemcell-cache", shaTag(testStemcellSHA8))}
+			return &items, nil
+		},
+	}
+	secondDeps := buildDeleteStemcellDeps(deleteStemcellDepsOpts{qemuSvc: secondQemu, nodesSvc: secondNodes, clusterSvc: secondCluster})
+	h2 := handlers.HandleDeleteStemcell(secondDeps)
+	if _, err := h2.Handle(context.Background(), args, jsonrpc.Context{DirectorUUID: "dir-b"}); err != nil {
+		t.Fatalf("second delete: unexpected error: %v", err)
+	}
+	if !secondDestroyCalled {
+		t.Error("second delete must destroy — dir-b was the last ref")
+	}
+}
+
+// ============================================================
+// Tests: no cache template found — idempotent retry convergence
+// ============================================================
+
+func TestDeleteStemcell_Heavy_NoTemplates_FileDeleteStillAttempted(t *testing.T) {
+	t.Parallel()
+
+	storageSvc := &deleteStemcellMockStorage{}
+	deps := buildDeleteStemcellDeps(deleteStemcellDepsOpts{storageSvc: storageSvc})
+	h := handlers.HandleDeleteStemcell(deps)
+
+	args := []json.RawMessage{marshalArg(t, testHeavyCID())}
+	_, err := h.Handle(context.Background(), args, jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if storageSvc.deleteVolumeIfExistsCalls != 1 {
+		t.Fatalf("expected 1 DeleteVolumeIfExists call, got %d", storageSvc.deleteVolumeIfExistsCalls)
+	}
+	got := storageSvc.calls[0]
+	if got.node != vmNode || got.storage != "local" || got.volume != testVolumePath() {
+		t.Errorf("qcow2 delete call = %+v, want node=%q storage=local volume=%q", got, vmNode, testVolumePath())
+	}
+}
+
+func TestDeleteStemcell_Heavy_NoTemplates_VolumeAlreadyAbsent_Idempotent(t *testing.T) {
+	t.Parallel()
+
+	storageSvc := &deleteStemcellMockStorage{
+		deleteVolumeIfExistsFn: func(_ context.Context, _, _, _ string) (bool, error) {
+			return false, nil // already gone
+		},
+	}
+	deps := buildDeleteStemcellDeps(deleteStemcellDepsOpts{storageSvc: storageSvc})
+	h := handlers.HandleDeleteStemcell(deps)
+
+	args := []json.RawMessage{marshalArg(t, testHeavyCID())}
+	result, err := h.Handle(context.Background(), args, jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("expected nil error when volume already absent (idempotent), got: %v", err)
+	}
+	if result != nil {
+		t.Errorf("expected nil result, got %v", result)
+	}
+}
+
+func TestDeleteStemcell_Heavy_NoTemplates_QCow2DeleteError_Propagates(t *testing.T) {
+	t.Parallel()
+
+	storageErr := errors.New("PVE storage: permission denied")
+	storageSvc := &deleteStemcellMockStorage{
+		deleteVolumeIfExistsFn: func(_ context.Context, _, _, _ string) (bool, error) {
+			return false, storageErr
+		},
+	}
+	deps := buildDeleteStemcellDeps(deleteStemcellDepsOpts{storageSvc: storageSvc})
+	h := handlers.HandleDeleteStemcell(deps)
+
+	args := []json.RawMessage{marshalArg(t, testHeavyCID())}
+	_, err := h.Handle(context.Background(), args, jsonrpc.Context{})
+	if err == nil {
+		t.Fatal("expected error for qcow2 delete failure, got nil")
+	}
+	var cpiErr *cpierrors.Error
+	if !errors.As(err, &cpiErr) {
+		t.Errorf("expected *cpierrors.Error, got %T: %v", err, err)
+	}
+}
+
+func TestDeleteStemcell_Heavy_NoTemplates_NoNodeConfigured_Errors(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.CPIConfig{Node: "", StemcellStorage: "local", VMStorage: "local", DiskStorage: "local"}
+	deps := buildDeleteStemcellDeps(deleteStemcellDepsOpts{cfg: cfg})
+	h := handlers.HandleDeleteStemcell(deps)
+
+	args := []json.RawMessage{marshalArg(t, testHeavyCID())}
 	_, err := h.Handle(context.Background(), args, jsonrpc.Context{})
 	if err == nil {
 		t.Fatal("expected error when node is empty, got nil")
@@ -332,232 +817,13 @@ func TestDeleteStemcell_NoNodeConfigured(t *testing.T) {
 	}
 }
 
-// TestDeleteStemcell_QCow2DeleteError verifies that a storage API error deleting
-// the qcow2 volume is propagated as a CloudError.
-func TestDeleteStemcell_QCow2DeleteError(t *testing.T) {
+// TestDeleteStemcell_Heavy_NoTemplates_UsesStemcellTemplateNode verifies the
+// node fallback order (StemcellTemplateNode over Node) when there is no
+// template left to read a node from.
+func TestDeleteStemcell_Heavy_NoTemplates_UsesStemcellTemplateNode(t *testing.T) {
 	t.Parallel()
 
-	storageErr := errors.New("PVE storage: permission denied")
-	callCount := 0
-	storageSvc := &deleteStemcellMockStorage{
-		deleteVolumeIfExistsFn: func(_ context.Context, _, _, _ string) (bool, error) {
-			callCount++
-			return false, storageErr // first call (qcow2) fails
-		},
-	}
-
-	deps := buildDeleteStemcellDeps(storageSvc)
-	h := handlers.HandleDeleteStemcell(deps)
-
-	args := []json.RawMessage{marshalArg(t, validStemcellCID())}
-	_, err := h.Handle(context.Background(), args, jsonrpc.Context{})
-	if err == nil {
-		t.Fatal("expected error for qcow2 delete failure, got nil")
-	}
-	var cpiErr *cpierrors.Error
-	if !errors.As(err, &cpiErr) {
-		t.Errorf("expected *cpierrors.Error, got %T: %v", err, err)
-	}
-	// Only one call expected — handler returns immediately on qcow2 delete error.
-	if callCount != 1 {
-		t.Errorf("expected 1 DeleteVolumeIfExists call on qcow2 error, got %d", callCount)
-	}
-}
-
-// TestDeleteStemcell_StorageExtractedFromCID verifies that the storage pool is
-// taken from the CID, not from config.StemcellStorage. This matters when a CID
-// refers to a storage other than the current default.
-func TestDeleteStemcell_StorageExtractedFromCID(t *testing.T) {
-	t.Parallel()
-
-	// CID references "nfs-pool"; config.StemcellStorage = "local".
-	cid := "nfs-pool:import/bosh-stemcell-ubuntu-jammy-1.0-deadbeef.qcow2"
-
-	var capturedStorage string
-	storageSvc := &deleteStemcellMockStorage{
-		deleteVolumeIfExistsFn: func(_ context.Context, _, storage, _ string) (bool, error) {
-			capturedStorage = storage
-			return true, nil
-		},
-	}
-
-	deps := buildDeleteStemcellDeps(storageSvc)
-	h := handlers.HandleDeleteStemcell(deps)
-
-	args := []json.RawMessage{marshalArg(t, cid)}
-	_, err := h.Handle(context.Background(), args, jsonrpc.Context{})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if capturedStorage != "nfs-pool" {
-		t.Errorf("storage passed to DeleteVolumeIfExists = %q; want %q", capturedStorage, "nfs-pool")
-	}
-}
-
-// TestDeleteStemcell_LightCID_NoOp verifies that delete_stemcell short-circuits
-// on a "light:" prefixed CID without calling the PVE Storage API. Light
-// stemcells are operator-managed; the CPI must never delete their underlying
-// volumes.
-func TestDeleteStemcell_LightCID_NoOp(t *testing.T) {
-	t.Parallel()
-
-	cases := []struct {
-		name string
-		cid  string
-	}{
-		{name: "light shared storage", cid: "light:nfs-stemcells:import/bosh-stemcell-ubuntu-1.0-deadbeef.qcow2"},
-		{name: "light local storage", cid: "light:local:import/bosh-stemcell-other-2.0-cafebabe.qcow2"},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-
-			storageSvc := &deleteStemcellMockStorage{}
-			deps := buildDeleteStemcellDeps(storageSvc)
-			h := handlers.HandleDeleteStemcell(deps)
-
-			args := []json.RawMessage{marshalArg(t, tc.cid)}
-			result, err := h.Handle(context.Background(), args, jsonrpc.Context{RequestID: "req-del-light"})
-			if err != nil {
-				t.Fatalf("unexpected error for light CID %q: %v", tc.cid, err)
-			}
-			if result != nil {
-				t.Errorf("expected nil result for light CID %q, got %v", tc.cid, result)
-			}
-			if storageSvc.deleteVolumeIfExistsCalls != 0 {
-				t.Errorf("expected ZERO DeleteVolumeIfExists calls for light CID, got %d",
-					storageSvc.deleteVolumeIfExistsCalls)
-			}
-		})
-	}
-}
-
-// ============================================================
-// Tests: HandleDeleteStemcell — template CID routing
-// ============================================================
-
-// TestDeleteStemcell_TemplateCID_HappyPath verifies that a "template:<vmid>"
-// CID triggers DeleteQemu with purge=true and destroy-unreferenced-disks=true,
-// and that the returned UPID is awaited.
-func TestDeleteStemcell_TemplateCID_HappyPath(t *testing.T) {
-	t.Parallel()
-
-	type deleteCall struct {
-		node         string
-		vmid         string
-		purge        bool
-		destroyDisks bool
-	}
-	var deleteCalls []deleteCall
-
-	nodesSvc := &stemcellMockNodes{
-		deleteQemuFn: func(_ context.Context, node, vmid string, params *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
-			call := deleteCall{node: node, vmid: vmid}
-			if params != nil && params.Purge != nil {
-				call.purge = *params.Purge
-			}
-			if params != nil && params.DestroyUnreferencedDisks != nil {
-				call.destroyDisks = *params.DestroyUnreferencedDisks
-			}
-			deleteCalls = append(deleteCalls, call)
-			// Return a non-empty UPID so the await path is exercised.
-			resp := sdknodes.DeleteQemuResponse(`"UPID:pve-node1:00AB12CD:template-del"`)
-			return &resp, nil
-		},
-	}
-
-	deps := defaultTemplateDeps(nodesSvc)
-	h := handlers.HandleDeleteStemcell(deps)
-
-	args := []json.RawMessage{marshalArg(t, "template:6042")}
-	result, err := h.Handle(context.Background(), args, jsonrpc.Context{RequestID: "req-del-tmpl-1"})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if result != nil {
-		t.Errorf("expected nil result (void), got %v", result)
-	}
-	if len(deleteCalls) != 1 {
-		t.Fatalf("expected 1 DeleteQemu call, got %d", len(deleteCalls))
-	}
-	if deleteCalls[0].vmid != "6042" {
-		t.Errorf("DeleteQemu vmid = %q; want %q", deleteCalls[0].vmid, "6042")
-	}
-	if deleteCalls[0].node != vmNode {
-		t.Errorf("DeleteQemu node = %q; want %q", deleteCalls[0].node, vmNode)
-	}
-	if !deleteCalls[0].purge {
-		t.Error("DeleteQemu: purge must be true")
-	}
-	if !deleteCalls[0].destroyDisks {
-		t.Error("DeleteQemu: DestroyUnreferencedDisks must be true")
-	}
-}
-
-// TestDeleteStemcell_TemplateCID_Idempotent_NotFound verifies that a 404 from
-// DeleteQemu is treated as success. BOSH may call delete_stemcell multiple times.
-func TestDeleteStemcell_TemplateCID_Idempotent_NotFound(t *testing.T) {
-	t.Parallel()
-
-	nodesSvc := &stemcellMockNodes{
-		deleteQemuFn: func(_ context.Context, _, _ string, _ *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
-			return nil, &sdkerrors.APIError{HTTPCode: 404}
-		},
-	}
-
-	deps := defaultTemplateDeps(nodesSvc)
-	h := handlers.HandleDeleteStemcell(deps)
-
-	args := []json.RawMessage{marshalArg(t, "template:6042")}
-	result, err := h.Handle(context.Background(), args, jsonrpc.Context{})
-	if err != nil {
-		t.Fatalf("expected nil error when VM not found (idempotent), got: %v", err)
-	}
-	if result != nil {
-		t.Errorf("expected nil result, got %v", result)
-	}
-}
-
-// TestDeleteStemcell_TemplateCID_DestroyError verifies that a non-404 error from
-// DeleteQemu is propagated as a cloud error.
-func TestDeleteStemcell_TemplateCID_DestroyError(t *testing.T) {
-	t.Parallel()
-
-	nodesSvc := &stemcellMockNodes{
-		deleteQemuFn: func(_ context.Context, _, _ string, _ *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
-			return nil, errors.New("PVE: internal server error")
-		},
-	}
-
-	deps := defaultTemplateDeps(nodesSvc)
-	h := handlers.HandleDeleteStemcell(deps)
-
-	args := []json.RawMessage{marshalArg(t, "template:6042")}
-	_, err := h.Handle(context.Background(), args, jsonrpc.Context{})
-	if err == nil {
-		t.Fatal("expected error for template destroy failure, got nil")
-	}
-	var cpiErr *cpierrors.Error
-	if !errors.As(err, &cpiErr) {
-		t.Errorf("expected *cpierrors.Error, got %T: %v", err, err)
-	}
-}
-
-// TestDeleteStemcell_TemplateCID_NodeFromStemcellTemplateNode verifies that when
-// StemcellTemplateNode is set it is used for the delete call rather than Node.
-func TestDeleteStemcell_TemplateCID_NodeFromStemcellTemplateNode(t *testing.T) {
-	t.Parallel()
-
-	var capturedNode string
-	nodesSvc := &stemcellMockNodes{
-		deleteQemuFn: func(_ context.Context, node, _ string, _ *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
-			capturedNode = node
-			resp := sdknodes.DeleteQemuResponse(`""`)
-			return &resp, nil
-		},
-	}
-
+	storageSvc := &deleteStemcellMockStorage{}
 	cfg := &config.CPIConfig{
 		Node:                 vmNode,
 		StemcellTemplateNode: "pve-template-node",
@@ -565,368 +831,253 @@ func TestDeleteStemcell_TemplateCID_NodeFromStemcellTemplateNode(t *testing.T) {
 		VMStorage:            "local",
 		DiskStorage:          "local",
 	}
-	deps := buildDeleteStemcellDepsWithQemuAndNodes(
-		&stemcellMockQEMU{
-			configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
-				return stemcellRefsDesc("template:7001"), nil
-			},
-		},
-		nodesSvc,
-		cfg,
-	)
+	deps := buildDeleteStemcellDeps(deleteStemcellDepsOpts{cfg: cfg, storageSvc: storageSvc})
 	h := handlers.HandleDeleteStemcell(deps)
 
-	args := []json.RawMessage{marshalArg(t, "template:7001")}
+	args := []json.RawMessage{marshalArg(t, testHeavyCID())}
 	_, err := h.Handle(context.Background(), args, jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if capturedNode != "pve-template-node" {
-		t.Errorf("DeleteQemu node = %q; want %q (StemcellTemplateNode)", capturedNode, "pve-template-node")
+	if len(storageSvc.calls) != 1 || storageSvc.calls[0].node != "pve-template-node" {
+		t.Errorf("expected qcow2 delete on StemcellTemplateNode, got %+v", storageSvc.calls)
 	}
 }
 
-// TestDeleteStemcell_TemplateCID_MalformedVMID verifies that a "template:"
-// CID with a non-integer suffix is rejected as a cloud error without making
-// any PVE API calls.
-func TestDeleteStemcell_TemplateCID_MalformedVMID(t *testing.T) {
+// TestDeleteStemcell_Heavy_NoTemplates_ReplicatedStorage_DeletesEveryNode
+// verifies that with no cache template left to read a replica node list
+// from, the no-template branch still best-effort deletes the qcow2 on every
+// OTHER cluster node when storage is not positively known to be shared (the
+// default here — no ClusterStorage service wired, so classification is
+// unknown, which the branch treats as "not positively shared").
+func TestDeleteStemcell_Heavy_NoTemplates_ReplicatedStorage_DeletesEveryNode(t *testing.T) {
 	t.Parallel()
 
-	nodesSvc := &stemcellMockNodes{}
-	deps := defaultTemplateDeps(nodesSvc)
+	var deletedNodes []string
+	storageSvc := &deleteStemcellMockStorage{
+		deleteVolumeIfExistsFn: func(_ context.Context, node, _, _ string) (bool, error) {
+			deletedNodes = append(deletedNodes, node)
+			return true, nil
+		},
+	}
+	clusterSvc := &stemcellMockCluster{
+		listConfigNodesFn: func(_ context.Context) (*sdkcluster.ListConfigNodesResponse, error) {
+			n1, _ := json.Marshal(map[string]string{"name": vmNode})
+			n2, _ := json.Marshal(map[string]string{"name": "pve2"})
+			n3, _ := json.Marshal(map[string]string{"name": "pve3"})
+			resp := sdkcluster.ListConfigNodesResponse{n1, n2, n3}
+			return &resp, nil
+		},
+	}
+	deps := buildDeleteStemcellDeps(deleteStemcellDepsOpts{storageSvc: storageSvc, clusterSvc: clusterSvc})
 	h := handlers.HandleDeleteStemcell(deps)
 
-	// "template:abc" satisfies HasPrefix("template:") but IsTemplateStemcellCID
-	// returns false because "abc" is not all-digits, so it falls through to the
-	// legacy/volume parse path and gets rejected there.  Use a CID where the
-	// prefix is "template:" and the remainder looks like a template but parses
-	// as something the handler rejects at the CID-routing level by forcing a
-	// direct call through the flow.  The simplest approach: any CID that is NOT
-	// IsTemplateStemcellCID but starts with "template:" reaches ParseStemcellCID
-	// which will reject it.  We test that no DeleteQemu call is made.
-	args := []json.RawMessage{marshalArg(t, "template:abc")}
+	args := []json.RawMessage{marshalArg(t, testHeavyCID())}
 	_, err := h.Handle(context.Background(), args, jsonrpc.Context{})
-	if err == nil {
-		t.Fatal("expected error for malformed template CID, got nil")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
-	var cpiErr *cpierrors.Error
-	if !errors.As(err, &cpiErr) {
-		t.Errorf("expected *cpierrors.Error, got %T: %v", err, err)
+
+	want := map[string]bool{vmNode: true, "pve2": true, "pve3": true}
+	if len(deletedNodes) != len(want) {
+		t.Fatalf("expected qcow2 delete attempted on all %d cluster nodes, got %v", len(want), deletedNodes)
 	}
-	// No DeleteQemu should have been called.
-	if nodesSvc.deleteQemuFn != nil {
-		// deleteQemuFn is nil by default; if it were wired a call would panic.
-		t.Log("deleteQemuFn is nil, no call possible")
+	for _, n := range deletedNodes {
+		if !want[n] {
+			t.Errorf("unexpected node in delete attempts: %q (all attempts: %v)", n, deletedNodes)
+		}
 	}
 }
 
-// TestDeleteStemcell_VolumeCID_Regression_TemplateRouteNotTriggered verifies that
-// a plain volume CID ("local:import/foo.qcow2") takes the existing volume-delete
-// path and does NOT trigger any DeleteQemu call.
-func TestDeleteStemcell_VolumeCID_Regression_TemplateRouteNotTriggered(t *testing.T) {
+// TestDeleteStemcell_Heavy_NoTemplates_SharedStorage_SkipsOtherNodes verifies
+// The positive-shared exemption: when storage IS positively known to be
+// shared, the primary delete already removed the cluster's only copy, so no
+// per-other-node cleanup should be attempted.
+func TestDeleteStemcell_Heavy_NoTemplates_SharedStorage_SkipsOtherNodes(t *testing.T) {
 	t.Parallel()
 
-	cid := "local:import/bosh-stemcell-ubuntu-jammy-1.0-deadbeef.qcow2"
-
-	var deleteQemuCalled bool
-	nodesSvc := &stemcellMockNodes{
-		deleteQemuFn: func(_ context.Context, _, _ string, _ *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
-			deleteQemuCalled = true
-			return nil, nil
+	var deletedNodes []string
+	storageSvc := &deleteStemcellMockStorage{
+		deleteVolumeIfExistsFn: func(_ context.Context, node, _, _ string) (bool, error) {
+			deletedNodes = append(deletedNodes, node)
+			return true, nil
 		},
 	}
-	storageSvc := &deleteStemcellMockStorage{}
+	clusterStorageSvc := lightStemcellClusterStorage("local", "nfs", true) // shared=1
 	client := &stemcellMockClient{
-		qemuSvc:    &stemcellMockQEMU{},
-		nodesSvc:   nodesSvc,
-		tasksSvc:   &stemcellMockTasks{},
-		clusterSvc: &stemcellMockCluster{},
-		storageSvc: storageSvc,
+		qemuSvc:           &stemcellMockQEMU{},
+		nodesSvc:          &stemcellMockNodes{},
+		tasksSvc:          &stemcellMockTasks{},
+		clusterSvc:        &stemcellMockCluster{},
+		storageSvc:        storageSvc,
+		clusterStorageSvc: clusterStorageSvc,
 	}
-	deps := handlers.Deps{
-		Config: &config.CPIConfig{
-			Node:            vmNode,
-			StemcellStorage: "local",
-			VMStorage:       "local",
-			DiskStorage:     "local",
-		},
-		PVE:    client,
-		Logger: log.NewNopLogger(),
+	cfg := &config.CPIConfig{Node: vmNode, StemcellStorage: "local", VMStorage: "local", DiskStorage: "local"}
+	deps := handlers.Deps{Config: cfg, PVE: client, Logger: log.NewNopLogger()}
+	h := handlers.HandleDeleteStemcell(deps)
+
+	args := []json.RawMessage{marshalArg(t, testHeavyCID())}
+	_, err := h.Handle(context.Background(), args, jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
+	if len(deletedNodes) != 1 || deletedNodes[0] != vmNode {
+		t.Errorf("expected exactly 1 qcow2 delete (primary, positively-shared storage), got %v", deletedNodes)
+	}
+}
+
+// TestDeleteStemcell_StorageExtractedFromCID verifies the storage pool comes
+// from the CID, not config.StemcellStorage.
+func TestDeleteStemcell_StorageExtractedFromCID(t *testing.T) {
+	t.Parallel()
+
+	cid := pve.BuildHeavyStemcellCID("nfs-pool", testStemcellFilename())
+
+	storageSvc := &deleteStemcellMockStorage{}
+	deps := buildDeleteStemcellDeps(deleteStemcellDepsOpts{storageSvc: storageSvc}) // config.StemcellStorage = "local"
 	h := handlers.HandleDeleteStemcell(deps)
 
 	args := []json.RawMessage{marshalArg(t, cid)}
 	_, err := h.Handle(context.Background(), args, jsonrpc.Context{})
 	if err != nil {
-		t.Fatalf("unexpected error for volume CID: %v", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
-	if deleteQemuCalled {
-		t.Error("DeleteQemu must NOT be called for a volume CID — template route was incorrectly triggered")
-	}
-	if storageSvc.deleteVolumeIfExistsCalls != 1 {
-		t.Errorf("expected 1 DeleteVolumeIfExists call for volume CID, got %d", storageSvc.deleteVolumeIfExistsCalls)
+	if len(storageSvc.calls) != 1 || storageSvc.calls[0].storage != "nfs-pool" {
+		t.Errorf("storage passed to DeleteVolumeIfExists = %+v; want storage=nfs-pool", storageSvc.calls)
 	}
 }
 
-// TestDeleteStemcell_LightCID_Regression_TemplateRouteNotTriggered verifies
-// that a light CID takes the no-op path and does not call DeleteQemu.
-func TestDeleteStemcell_LightCID_Regression_TemplateRouteNotTriggered(t *testing.T) {
+// ============================================================
+// Tests: base-volume-in-use → actionable, non-retriable error
+// ============================================================
+
+func TestDeleteStemcell_IsBaseVolumeInUse_ActionableMessage(t *testing.T) {
 	t.Parallel()
 
-	var deleteQemuCalled bool
+	const primaryVMID = int64(7401)
+
+	var updateCalls []string
 	nodesSvc := &stemcellMockNodes{
 		deleteQemuFn: func(_ context.Context, _, _ string, _ *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
-			deleteQemuCalled = true
-			return nil, nil
+			return nil, &sdkerrors.APIError{HTTPCode: 500, Message: "volume 'local:base-7401-disk-0' is still in use by 'linked-clone-9999'"}
+		},
+		updateConfigFn: func(_ context.Context, _, _ string, params *sdknodes.UpdateQemuConfigParams) error {
+			if params != nil && params.Tags != nil {
+				updateCalls = append(updateCalls, *params.Tags)
+			}
+			return nil
 		},
 	}
-	storageSvc := &deleteStemcellMockStorage{}
-	client := &stemcellMockClient{
-		qemuSvc:    &stemcellMockQEMU{},
-		nodesSvc:   nodesSvc,
-		tasksSvc:   &stemcellMockTasks{},
-		clusterSvc: &stemcellMockCluster{},
-		storageSvc: storageSvc,
-	}
-	deps := handlers.Deps{
-		Config: &config.CPIConfig{
-			Node:            vmNode,
-			StemcellStorage: "local",
-			VMStorage:       "local",
-			DiskStorage:     "local",
+	qemuSvc := &stemcellMockQEMU{
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return directorRefsDescMap("dir-a"), nil
 		},
-		PVE:    client,
-		Logger: log.NewNopLogger(),
 	}
+	clusterSvc := &stemcellMockCluster{
+		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+			items := sdkcluster.ListResourcesResponse{clusterTemplateItem(primaryVMID, vmNode, "stemcell-cache", shaTag(testStemcellSHA8))}
+			return &items, nil
+		},
+	}
+	deps := buildDeleteStemcellDeps(deleteStemcellDepsOpts{qemuSvc: qemuSvc, nodesSvc: nodesSvc, clusterSvc: clusterSvc})
 	h := handlers.HandleDeleteStemcell(deps)
 
-	args := []json.RawMessage{marshalArg(t, "light:nfs:import/bosh-stemcell-ubuntu-1.0-cafebabe.qcow2")}
-	result, err := h.Handle(context.Background(), args, jsonrpc.Context{})
-	if err != nil {
-		t.Fatalf("unexpected error for light CID: %v", err)
+	args := []json.RawMessage{marshalArg(t, testHeavyCID())}
+	_, err := h.Handle(context.Background(), args, jsonrpc.Context{DirectorUUID: "dir-a"})
+	if err == nil {
+		t.Fatal("expected error when the template's base volume is still in use")
 	}
-	if result != nil {
-		t.Errorf("expected nil result, got %v", result)
+	var cpiErr *cpierrors.Error
+	if !errors.As(err, &cpiErr) {
+		t.Fatalf("expected *cpierrors.Error, got %T: %v", err, err)
 	}
-	if deleteQemuCalled {
-		t.Error("DeleteQemu must NOT be called for a light CID")
+	if cpiErr.OkToRetry() {
+		t.Error("base-volume-in-use error must be non-retriable (operator action required)")
 	}
-	if storageSvc.deleteVolumeIfExistsCalls != 0 {
-		t.Errorf("expected 0 DeleteVolumeIfExists calls for light CID, got %d", storageSvc.deleteVolumeIfExistsCalls)
+	msg := err.Error()
+	if !strings.Contains(msg, fmt.Sprintf("%d", primaryVMID)) {
+		t.Errorf("error message must name the template VMID: %s", msg)
+	}
+	if !strings.Contains(msg, vmNode) {
+		t.Errorf("error message must name the node: %s", msg)
+	}
+	if !strings.Contains(strings.ToLower(msg), "linked-clone") && !strings.Contains(strings.ToLower(msg), "linked clone") {
+		t.Errorf("error message must instruct deleting/migrating the dependent VM(s): %s", msg)
+	}
+	// A pending-destroy marker must have been stamped so a retry resumes.
+	foundPending := false
+	for _, tags := range updateCalls {
+		if strings.Contains(tags, "bosh-destroy-pending") {
+			foundPending = true
+		}
+	}
+	if !foundPending {
+		t.Errorf("expected a bosh-destroy-pending tag stamp, got tag writes: %v", updateCalls)
 	}
 }
 
 // ============================================================
-// Tests: sha-sweep (always cross-node)
+// Tests: empty director UUID collapses to the shared sentinel
 // ============================================================
 
-// buildDeleteStemcellDepsWithCluster constructs Deps for sha-sweep and
-// orphan-prune tests that need a wired cluster mock. The QEMU Config mock
-// returns a description with stemcell_refs computed from the queried VMID, so
-// the refs gate in delete_stemcell allows destruction for any template VMID.
-func buildDeleteStemcellDepsWithCluster(
-	nodesSvc *stemcellMockNodes,
-	clusterSvc *stemcellMockCluster,
-	cfg *config.CPIConfig,
-) handlers.Deps {
-	qemuSvc := &stemcellMockQEMU{
-		configFn: func(_ context.Context, _ string, vmid int) (map[string]any, error) {
-			return stemcellRefsDesc(fmt.Sprintf("template:%d", vmid)), nil
-		},
-	}
-	client := &stemcellMockClient{
-		qemuSvc:    qemuSvc,
-		nodesSvc:   nodesSvc,
-		tasksSvc:   &stemcellMockTasks{},
-		clusterSvc: clusterSvc,
-		storageSvc: &deleteStemcellMockStorage{},
-	}
-	return handlers.Deps{
-		Config: cfg,
-		PVE:    client,
-		Logger: log.NewNopLogger(),
-	}
-}
-
-// makeStemcellClusterItem builds a raw JSON cluster resource entry for a
-// stemcell template with the given vmid, node, and semicolon-separated tags.
-func makeStemcellClusterItem(vmid int64, node, name, tags string) json.RawMessage {
-	templateVal := 1
-	raw, _ := json.Marshal(map[string]any{
-		"type":     "qemu",
-		"vmid":     vmid,
-		"node":     node,
-		"name":     name,
-		"tags":     tags,
-		"template": templateVal,
-	})
-	return raw
-}
-
-// TestDeleteStemcell_ShaSwep_DeletesCrossNodeReplicas verifies that the sha-sweep
-// deletes two cross-node template VMs carrying the sha8 tag.
-func TestDeleteStemcell_ShaSwep_DeletesCrossNodeReplicas(t *testing.T) {
+func TestDeleteStemcell_EmptyDirectorUUID_UnknownDirectorFlow(t *testing.T) {
 	t.Parallel()
 
-	const sha8 = "abc12345"
-	const primaryVMID = int64(6042)
-	const replica1VMID = int64(6043)
-	const replica2VMID = int64(6044)
+	const primaryVMID = int64(7501)
 
-	// Primary tag set for resolveStemcellSHA8FromVMID (ListQemu on primary node).
-	primaryTagsStr := "bosh-stemcell;bosh-stemcell-sha-" + sha8
+	var buf bytes.Buffer
+	logger, logErr := log.NewLogger("warn", &buf)
+	if logErr != nil {
+		t.Fatalf("log.NewLogger: %v", logErr)
+	}
+
+	var destroyed bool
 	nodesSvc := &stemcellMockNodes{
-		listQemuFn: func(_ context.Context, node string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
-			if node != vmNode {
-				return &sdknodes.ListQemuResponse{}, nil
-			}
-			raw, _ := json.Marshal(map[string]any{
-				"vmid": primaryVMID,
-				"tags": primaryTagsStr,
-			})
-			resp := sdknodes.ListQemuResponse{raw}
-			return &resp, nil
-		},
 		deleteQemuFn: func(_ context.Context, _, _ string, _ *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
+			destroyed = true
 			resp := sdknodes.DeleteQemuResponse(`""`)
 			return &resp, nil
 		},
 	}
-
-	var destroyedVMIDs []int64
-	origDelete := nodesSvc.deleteQemuFn
-	nodesSvc.deleteQemuFn = func(_ context.Context, node, vmid string, params *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
-		id := int64(0)
-		for _, v := range []int64{primaryVMID, replica1VMID, replica2VMID} {
-			if vmid == fmt.Sprintf("%d", v) {
-				id = v
-			}
-		}
-		if id != 0 {
-			destroyedVMIDs = append(destroyedVMIDs, id)
-		}
-		return origDelete(context.Background(), node, vmid, params)
+	qemuSvc := &stemcellMockQEMU{
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return directorRefsDescMap("unknown-director"), nil
+		},
 	}
-
-	shaTag := "bosh-stemcell-sha-" + sha8
 	clusterSvc := &stemcellMockCluster{
 		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
-			items := sdkcluster.ListResourcesResponse{
-				makeStemcellClusterItem(replica1VMID, "pve2", "stemcell-r1", shaTag),
-				makeStemcellClusterItem(replica2VMID, "pve3", "stemcell-r2", shaTag),
-				// non-template (template==0) — must not be touched
-				func() json.RawMessage {
-					tmplZero := 0
-					raw, _ := json.Marshal(map[string]any{
-						"type":     "qemu",
-						"vmid":     int64(9999),
-						"node":     "pve4",
-						"tags":     shaTag,
-						"template": tmplZero,
-					})
-					return raw
-				}(),
-			}
+			items := sdkcluster.ListResourcesResponse{clusterTemplateItem(primaryVMID, vmNode, "stemcell-cache", shaTag(testStemcellSHA8))}
 			return &items, nil
 		},
 	}
-
-	cfg := &config.CPIConfig{
-		Node:            vmNode,
-		StemcellStorage: "local",
-		VMStorage:       "local",
-		DiskStorage:     "local",
-	}
-	deps := buildDeleteStemcellDepsWithCluster(nodesSvc, clusterSvc, cfg)
+	deps := buildDeleteStemcellDeps(deleteStemcellDepsOpts{qemuSvc: qemuSvc, nodesSvc: nodesSvc, clusterSvc: clusterSvc, logger: logger})
 	h := handlers.HandleDeleteStemcell(deps)
 
-	args := []json.RawMessage{marshalArg(t, fmt.Sprintf("template:%d", primaryVMID))}
-	result, err := h.Handle(context.Background(), args, jsonrpc.Context{RequestID: "req-sweep-1"})
+	args := []json.RawMessage{marshalArg(t, testHeavyCID())}
+	_, err := h.Handle(context.Background(), args, jsonrpc.Context{DirectorUUID: ""})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if result != nil {
-		t.Errorf("expected nil result, got %v", result)
+	if !destroyed {
+		t.Error("expected destroy — empty UUID collapses to the shared unknown-director ref, matching the only ref present")
 	}
-
-	// Primary + both replicas must have been destroyed.
-	found := map[int64]bool{}
-	for _, id := range destroyedVMIDs {
-		found[id] = true
-	}
-	for _, want := range []int64{primaryVMID, replica1VMID, replica2VMID} {
-		if !found[want] {
-			t.Errorf("expected VMID %d to be destroyed; destroyed set: %v", want, destroyedVMIDs)
-		}
-	}
-}
-
-// TestDeleteStemcell_ShaSwep_BestEffort verifies that a destroy error on one
-// replica does not prevent the handler from returning success.
-func TestDeleteStemcell_ShaSwep_BestEffort(t *testing.T) {
-	t.Parallel()
-
-	const sha8 = "deadbeef"
-	const primaryVMID = int64(7001)
-	const replica1VMID = int64(7002)
-	const replica2VMID = int64(7003)
-
-	primaryTagsStr := "bosh-stemcell;bosh-stemcell-sha-" + sha8
-	var destroyCount int
-	nodesSvc := &stemcellMockNodes{
-		listQemuFn: func(_ context.Context, node string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
-			if node != vmNode {
-				return &sdknodes.ListQemuResponse{}, nil
-			}
-			raw, _ := json.Marshal(map[string]any{"vmid": primaryVMID, "tags": primaryTagsStr})
-			resp := sdknodes.ListQemuResponse{raw}
-			return &resp, nil
-		},
-		deleteQemuFn: func(_ context.Context, _, vmid string, _ *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
-			destroyCount++
-			// Fail on replica1 only.
-			if vmid == fmt.Sprintf("%d", replica1VMID) {
-				return nil, errors.New("PVE: transient error on replica")
-			}
-			resp := sdknodes.DeleteQemuResponse(`""`)
-			return &resp, nil
-		},
-	}
-
-	shaTag := "bosh-stemcell-sha-" + sha8
-	clusterSvc := &stemcellMockCluster{
-		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
-			items := sdkcluster.ListResourcesResponse{
-				makeStemcellClusterItem(replica1VMID, "pve2", "r1", shaTag),
-				makeStemcellClusterItem(replica2VMID, "pve3", "r2", shaTag),
-			}
-			return &items, nil
-		},
-	}
-
-	cfg := &config.CPIConfig{Node: vmNode, StemcellStorage: "local", VMStorage: "local", DiskStorage: "local"}
-	deps := buildDeleteStemcellDepsWithCluster(nodesSvc, clusterSvc, cfg)
-	h := handlers.HandleDeleteStemcell(deps)
-
-	args := []json.RawMessage{marshalArg(t, fmt.Sprintf("template:%d", primaryVMID))}
-	_, err := h.Handle(context.Background(), args, jsonrpc.Context{})
-	if err != nil {
-		t.Fatalf("delete_stemcell must succeed even when a replica destroy fails; got: %v", err)
-	}
-	// primary + 2 sweep attempts = 3 calls (replica1 fails, replica2 succeeds)
-	if destroyCount != 3 {
-		t.Errorf("expected 3 DeleteQemu calls (primary + 2 replicas), got %d", destroyCount)
+	if !strings.Contains(buf.String(), "director UUID") {
+		t.Errorf("expected a Warn log about the missing director UUID, got: %s", buf.String())
 	}
 }
 
 // ============================================================
-// Tests: orphan prune (opt-in director-scoped)
+// Tests: sha8 unextractable from the CID filename
 // ============================================================
 
-// TestDeleteStemcell_OrphanPrune_Disabled verifies no prune ListResources call
-// when pruning is not enabled.
-func TestDeleteStemcell_OrphanPrune_Disabled(t *testing.T) {
+func TestDeleteStemcell_SHA8Unextractable_WarnsAndSkipsClusterLookup(t *testing.T) {
 	t.Parallel()
+
+	var buf bytes.Buffer
+	logger, logErr := log.NewLogger("warn", &buf)
+	if logErr != nil {
+		t.Fatalf("log.NewLogger: %v", logErr)
+	}
 
 	var listResourcesCalled bool
 	clusterSvc := &stemcellMockCluster{
@@ -935,6 +1086,83 @@ func TestDeleteStemcell_OrphanPrune_Disabled(t *testing.T) {
 			return &sdkcluster.ListResourcesResponse{}, nil
 		},
 	}
+	storageSvc := &deleteStemcellMockStorage{}
+	deps := buildDeleteStemcellDeps(deleteStemcellDepsOpts{clusterSvc: clusterSvc, storageSvc: storageSvc, logger: logger})
+	h := handlers.HandleDeleteStemcell(deps)
+
+	// "badname.qcow2" has no "-<8hex>" tail — extractSHA8FromFilename fails.
+	cid := ":heavy:local:import/badname.qcow2"
+	args := []json.RawMessage{marshalArg(t, cid)}
+	_, err := h.Handle(context.Background(), args, jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if listResourcesCalled {
+		t.Error("cluster template lookup must be skipped when sha8 is unextractable")
+	}
+	if !strings.Contains(buf.String(), "sha8 unextractable") {
+		t.Errorf("expected a Warn log naming sha8 unextractable, got: %s", buf.String())
+	}
+	// Falls through to the no-template heavy path: qcow2 delete still attempted.
+	if storageSvc.deleteVolumeIfExistsCalls != 1 {
+		t.Errorf("expected the no-template heavy qcow2 delete to still run, got %d calls", storageSvc.deleteVolumeIfExistsCalls)
+	}
+}
+
+// ============================================================
+// Tests: orphan prune (opt-in, director-scoped from the REQUEST context)
+// ============================================================
+
+func TestDeleteStemcell_OrphanPrune_Disabled_NoSecondListResourcesCall(t *testing.T) {
+	t.Parallel()
+
+	const primaryVMID = int64(7601)
+
+	var listResourcesCalls int
+	nodesSvc := &stemcellMockNodes{
+		deleteQemuFn: func(_ context.Context, _, _ string, _ *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
+			resp := sdknodes.DeleteQemuResponse(`""`)
+			return &resp, nil
+		},
+	}
+	qemuSvc := &stemcellMockQEMU{
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return directorRefsDescMap("dir-a"), nil
+		},
+	}
+	clusterSvc := &stemcellMockCluster{
+		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+			listResourcesCalls++
+			items := sdkcluster.ListResourcesResponse{clusterTemplateItem(primaryVMID, vmNode, "stemcell-cache", shaTag(testStemcellSHA8))}
+			return &items, nil
+		},
+	}
+	// Prune off: nil Stemcell block = default.
+	cfg := &config.CPIConfig{Node: vmNode, StemcellStorage: "local", VMStorage: "local", DiskStorage: "local"}
+	deps := buildDeleteStemcellDeps(deleteStemcellDepsOpts{cfg: cfg, qemuSvc: qemuSvc, nodesSvc: nodesSvc, clusterSvc: clusterSvc})
+	h := handlers.HandleDeleteStemcell(deps)
+
+	args := []json.RawMessage{marshalArg(t, testHeavyCID())}
+	_, err := h.Handle(context.Background(), args, jsonrpc.Context{DirectorUUID: "dir-a"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if listResourcesCalls != 1 {
+		t.Errorf("expected exactly 1 ListResources call (template lookup only, no orphan scan), got %d", listResourcesCalls)
+	}
+}
+
+func TestDeleteStemcell_OrphanPrune_EmptyDirectorUUID_Skipped(t *testing.T) {
+	t.Parallel()
+
+	const primaryVMID = int64(7602)
+
+	var listResourcesCalls int
+	var buf bytes.Buffer
+	logger, logErr := log.NewLogger("warn", &buf)
+	if logErr != nil {
+		t.Fatalf("log.NewLogger: %v", logErr)
+	}
 
 	nodesSvc := &stemcellMockNodes{
 		deleteQemuFn: func(_ context.Context, _, _ string, _ *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
@@ -942,166 +1170,344 @@ func TestDeleteStemcell_OrphanPrune_Disabled(t *testing.T) {
 			return &resp, nil
 		},
 	}
-
-	// Prune is off (nil Stemcell block = default).
-	cfg := &config.CPIConfig{Node: vmNode, StemcellStorage: "local", VMStorage: "local", DiskStorage: "local"}
-	deps := buildDeleteStemcellDepsWithCluster(nodesSvc, clusterSvc, cfg)
+	qemuSvc := &stemcellMockQEMU{
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return directorRefsDescMap("unknown-director"), nil
+		},
+	}
+	clusterSvc := &stemcellMockCluster{
+		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+			listResourcesCalls++
+			items := sdkcluster.ListResourcesResponse{clusterTemplateItem(primaryVMID, vmNode, "stemcell-cache", shaTag(testStemcellSHA8))}
+			return &items, nil
+		},
+	}
+	tr := true
+	cfg := &config.CPIConfig{
+		Node: vmNode, StemcellStorage: "local", VMStorage: "local", DiskStorage: "local",
+		Stemcell: &config.StemcellProvenanceConfig{PruneOrphans: &tr},
+	}
+	deps := buildDeleteStemcellDeps(deleteStemcellDepsOpts{cfg: cfg, qemuSvc: qemuSvc, nodesSvc: nodesSvc, clusterSvc: clusterSvc, logger: logger})
 	h := handlers.HandleDeleteStemcell(deps)
 
-	// Use a volume CID — avoids sha-sweep ListResources path entirely.
-	args := []json.RawMessage{marshalArg(t, "local:import/bosh-stemcell-ubuntu-jammy-1.0-abc12345.qcow2")}
-	_, err := h.Handle(context.Background(), args, jsonrpc.Context{})
+	args := []json.RawMessage{marshalArg(t, testHeavyCID())}
+	_, err := h.Handle(context.Background(), args, jsonrpc.Context{DirectorUUID: ""})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if listResourcesCalled {
-		t.Error("ListResources must NOT be called when orphan prune is disabled")
+	if listResourcesCalls != 1 {
+		t.Errorf("expected exactly 1 ListResources call (prune must be skipped before any orphan scan), got %d", listResourcesCalls)
+	}
+	if !strings.Contains(buf.String(), "carried no director UUID") {
+		t.Errorf("expected a Warn log about orphan prune skipping due to missing director UUID, got: %s", buf.String())
 	}
 }
 
-// TestDeleteStemcell_OrphanPrune_DryRun verifies that candidates are logged but
-// no DeleteQemu is issued when dry_run is true.
-func TestDeleteStemcell_OrphanPrune_DryRun(t *testing.T) {
+func TestDeleteStemcell_OrphanPrune_DryRun_NoDeletion(t *testing.T) {
 	t.Parallel()
 
-	const dirID = "bosh-dir-test"
-	const sha8 = "cafebabe"
-	const primaryVMID = int64(8001)
-	const orphanVMID = int64(8002)
+	const primaryVMID = int64(7701)
+	const orphanVMID = int64(7702)
+	const dirUUID = "dir-prod"
 
-	primaryTagsStr := "bosh-stemcell;bosh-stemcell-sha-" + sha8 + ";director--" + dirID
-
+	var deletedVMIDs []string
 	nodesSvc := &stemcellMockNodes{
-		listQemuFn: func(_ context.Context, node string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
-			if node != vmNode {
-				return &sdknodes.ListQemuResponse{}, nil
-			}
-			raw, _ := json.Marshal(map[string]any{"vmid": primaryVMID, "tags": primaryTagsStr})
-			resp := sdknodes.ListQemuResponse{raw}
-			return &resp, nil
-		},
 		deleteQemuFn: func(_ context.Context, _, vmid string, _ *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
-			// Only primary delete is expected (sha sweep finds nothing extra in cluster).
-			if vmid != fmt.Sprintf("%d", primaryVMID) {
-				t.Errorf("unexpected DeleteQemu for vmid %s in dry-run test", vmid)
-			}
+			deletedVMIDs = append(deletedVMIDs, vmid)
 			resp := sdknodes.DeleteQemuResponse(`""`)
 			return &resp, nil
 		},
 	}
-
-	// sha-sweep: cluster returns only the primary (already gone = idempotent).
-	// prune candidate: orphanVMID carries marker + director tag.
-	shaTag := "bosh-stemcell-sha-" + sha8
-	dirTag := "director--" + dirID
+	qemuSvc := &stemcellMockQEMU{
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return directorRefsDescMap(dirUUID), nil
+		},
+	}
+	dirTag := "director--" + dirUUID
+	var listCall int
 	clusterSvc := &stemcellMockCluster{
 		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+			listCall++
+			if listCall == 1 {
+				// Template-cache lookup (sha-scoped).
+				items := sdkcluster.ListResourcesResponse{clusterTemplateItem(primaryVMID, vmNode, "stemcell-cache", shaTag(testStemcellSHA8))}
+				return &items, nil
+			}
+			// Orphan sweep (marker+director-scoped).
 			items := sdkcluster.ListResourcesResponse{
-				// sha-sweep candidate (primary — already gone, idempotent)
-				makeStemcellClusterItem(primaryVMID, vmNode, "primary", shaTag),
-				// orphan candidate: has marker+director, no sha tag
-				makeStemcellClusterItem(orphanVMID, "pve2", "orphan", "bosh-stemcell;"+dirTag),
+				clusterTemplateItem(orphanVMID, "pve2", "orphan", "bosh-stemcell;"+dirTag),
 			}
 			return &items, nil
 		},
 	}
-
 	tr := true
 	cfg := &config.CPIConfig{
-		Node:            vmNode,
-		StemcellStorage: "local",
-		VMStorage:       "local",
-		DiskStorage:     "local",
-		Stemcell: &config.StemcellProvenanceConfig{
-			PruneOrphans: &tr,
-			PruneDryRun:  &tr,
-			DirectorID:   dirID,
-		},
+		Node: vmNode, StemcellStorage: "local", VMStorage: "local", DiskStorage: "local",
+		Stemcell: &config.StemcellProvenanceConfig{PruneOrphans: &tr, PruneDryRun: &tr},
 	}
-	deps := buildDeleteStemcellDepsWithCluster(nodesSvc, clusterSvc, cfg)
+	deps := buildDeleteStemcellDeps(deleteStemcellDepsOpts{cfg: cfg, qemuSvc: qemuSvc, nodesSvc: nodesSvc, clusterSvc: clusterSvc})
 	h := handlers.HandleDeleteStemcell(deps)
 
-	args := []json.RawMessage{marshalArg(t, fmt.Sprintf("template:%d", primaryVMID))}
-	_, err := h.Handle(context.Background(), args, jsonrpc.Context{})
+	args := []json.RawMessage{marshalArg(t, testHeavyCID())}
+	_, err := h.Handle(context.Background(), args, jsonrpc.Context{DirectorUUID: dirUUID})
 	if err != nil {
-		t.Fatalf("delete_stemcell must succeed in dry-run; got: %v", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
-	// deleteQemuFn would call t.Errorf if orphanVMID was passed — test passes
-	// if no unexpected call occurs.
+	for _, id := range deletedVMIDs {
+		if id == fmt.Sprintf("%d", orphanVMID) {
+			t.Errorf("dry-run must not delete the orphan candidate %d", orphanVMID)
+		}
+	}
 }
 
-// TestDeleteStemcell_OrphanPrune_Live verifies that an orphan is destroyed, and
-// that a base-in-use error causes a skip rather than failure.
-func TestDeleteStemcell_OrphanPrune_Live(t *testing.T) {
+// TestDeleteStemcell_OrphanPrune_CandidateWithForeignRef_NotPruned verifies
+// The marker+director tag pair alone is not sufficient to prune — a
+// candidate whose OWN provenance director_refs still names a director OTHER
+// than (or in addition to) this request's director UUID must be skipped,
+// because nothing ever removes the "director--<uuid>" tag on deregistration
+// and the candidate may still be a live cache for a DIFFERENT stemcell this
+// director (or another) actively references.
+func TestDeleteStemcell_OrphanPrune_CandidateWithForeignRef_NotPruned(t *testing.T) {
 	t.Parallel()
 
-	const dirID = "bosh-dir-prod"
-	const sha8 = "11223344"
-	const primaryVMID = int64(9001)
-	const orphanVMID = int64(9002)
-	const baseInUseVMID = int64(9003)
-
-	primaryTagsStr := "bosh-stemcell;bosh-stemcell-sha-" + sha8 + ";director--" + dirID
+	const primaryVMID = int64(7901)
+	const foreignRefVMID = int64(7902)
+	const dirUUID = "dir-scope"
 
 	var deletedVMIDs []string
 	nodesSvc := &stemcellMockNodes{
-		listQemuFn: func(_ context.Context, node string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
-			if node != vmNode {
-				return &sdknodes.ListQemuResponse{}, nil
-			}
-			raw, _ := json.Marshal(map[string]any{"vmid": primaryVMID, "tags": primaryTagsStr})
-			resp := sdknodes.ListQemuResponse{raw}
+		deleteQemuFn: func(_ context.Context, _, vmid string, _ *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
+			deletedVMIDs = append(deletedVMIDs, vmid)
+			resp := sdknodes.DeleteQemuResponse(`""`)
 			return &resp, nil
 		},
+	}
+	qemuSvc := &stemcellMockQEMU{
+		configFn: func(_ context.Context, _ string, vmid int) (map[string]any, error) {
+			if vmid == int(foreignRefVMID) {
+				// Live-referenced by dirUUID AND a different director — must
+				// not be pruned out from under that other director.
+				return directorRefsDescMap(dirUUID, "some-other-director"), nil
+			}
+			return directorRefsDescMap(dirUUID), nil
+		},
+	}
+	dirTag := "director--" + dirUUID
+	var listCall int
+	clusterSvc := &stemcellMockCluster{
+		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+			listCall++
+			if listCall == 1 {
+				items := sdkcluster.ListResourcesResponse{clusterTemplateItem(primaryVMID, vmNode, "stemcell-cache", shaTag(testStemcellSHA8))}
+				return &items, nil
+			}
+			items := sdkcluster.ListResourcesResponse{
+				clusterTemplateItem(foreignRefVMID, "pve2", "still-live", "bosh-stemcell;"+dirTag),
+			}
+			return &items, nil
+		},
+	}
+	tr := true
+	cfg := &config.CPIConfig{
+		Node: vmNode, StemcellStorage: "local", VMStorage: "local", DiskStorage: "local",
+		Stemcell: &config.StemcellProvenanceConfig{PruneOrphans: &tr},
+	}
+	deps := buildDeleteStemcellDeps(deleteStemcellDepsOpts{cfg: cfg, qemuSvc: qemuSvc, nodesSvc: nodesSvc, clusterSvc: clusterSvc})
+	h := handlers.HandleDeleteStemcell(deps)
+
+	args := []json.RawMessage{marshalArg(t, testHeavyCID())}
+	_, err := h.Handle(context.Background(), args, jsonrpc.Context{DirectorUUID: dirUUID})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	for _, id := range deletedVMIDs {
+		if id == fmt.Sprintf("%d", foreignRefVMID) {
+			t.Errorf("candidate carrying a live foreign director ref must NOT be pruned, destroys=%v", deletedVMIDs)
+		}
+	}
+}
+
+// TestDeleteStemcell_OrphanPrune_ExcludesJustHandledTemplate verifies the
+// excludeVMIDs guard: the orphan sweep must never re-evaluate (and
+// re-destroy) a VMID this SAME delete_stemcell call already handled above,
+// even if a stale cluster-resource snapshot re-lists it.
+func TestDeleteStemcell_OrphanPrune_ExcludesJustHandledTemplate(t *testing.T) {
+	t.Parallel()
+
+	const primaryVMID = int64(7910)
+	const dirUUID = "dir-exclude"
+
+	var destroyCount int
+	nodesSvc := &stemcellMockNodes{
+		deleteQemuFn: func(_ context.Context, _, _ string, _ *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
+			destroyCount++
+			resp := sdknodes.DeleteQemuResponse(`""`)
+			return &resp, nil
+		},
+	}
+	qemuSvc := &stemcellMockQEMU{
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return directorRefsDescMap(dirUUID), nil
+		},
+	}
+	dirTag := "director--" + dirUUID
+	var listCall int
+	clusterSvc := &stemcellMockCluster{
+		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+			listCall++
+			if listCall == 1 {
+				// Template-cache lookup: sha-tag match only is enough here.
+				items := sdkcluster.ListResourcesResponse{clusterTemplateItem(primaryVMID, vmNode, "stemcell-cache", shaTag(testStemcellSHA8))}
+				return &items, nil
+			}
+			// Orphan sweep re-lists the SAME vmid this call already
+			// destroyed above (stale cluster-resource snapshot), now also
+			// carrying the marker+director tags the sweep's filter needs —
+			// excludeVMIDs must keep it from being evaluated a second time.
+			items := sdkcluster.ListResourcesResponse{
+				clusterTemplateItem(primaryVMID, vmNode, "stemcell-cache", "bosh-stemcell;"+dirTag+";"+shaTag(testStemcellSHA8)),
+			}
+			return &items, nil
+		},
+	}
+	tr := true
+	cfg := &config.CPIConfig{
+		Node: vmNode, StemcellStorage: "local", VMStorage: "local", DiskStorage: "local",
+		Stemcell: &config.StemcellProvenanceConfig{PruneOrphans: &tr},
+	}
+	deps := buildDeleteStemcellDeps(deleteStemcellDepsOpts{cfg: cfg, qemuSvc: qemuSvc, nodesSvc: nodesSvc, clusterSvc: clusterSvc})
+	h := handlers.HandleDeleteStemcell(deps)
+
+	args := []json.RawMessage{marshalArg(t, testHeavyCID())}
+	_, err := h.Handle(context.Background(), args, jsonrpc.Context{DirectorUUID: dirUUID})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if destroyCount != 1 {
+		t.Errorf("expected exactly 1 destroy (the anchor, via deregister); excludeVMIDs must keep the prune "+
+			"sweep from re-destroying the same VMID, got %d", destroyCount)
+	}
+}
+
+// TestDeleteStemcell_OrphanPrune_NoTemplateBranch_StillRuns verifies that
+// the opt-in orphan prune must also run at the end of the no-cache-template
+// branch (handleDeleteStemcellNoTemplate), not only after a
+// templates-found-and-destroyed call.
+func TestDeleteStemcell_OrphanPrune_NoTemplateBranch_StillRuns(t *testing.T) {
+	t.Parallel()
+
+	const orphanVMID = int64(7920)
+	const dirUUID = "dir-notmpl"
+
+	var deletedVMIDs []string
+	nodesSvc := &stemcellMockNodes{
+		deleteQemuFn: func(_ context.Context, _, vmid string, _ *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
+			deletedVMIDs = append(deletedVMIDs, vmid)
+			resp := sdknodes.DeleteQemuResponse(`""`)
+			return &resp, nil
+		},
+	}
+	qemuSvc := &stemcellMockQEMU{
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return directorRefsDescMap(dirUUID), nil
+		},
+	}
+	dirTag := "director--" + dirUUID
+	var listCall int
+	clusterSvc := &stemcellMockCluster{
+		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+			listCall++
+			if listCall == 1 {
+				// Template-cache lookup for THIS stemcell's sha8: zero
+				// matches (already destroyed / never existed) — the
+				// no-template branch.
+				return &sdkcluster.ListResourcesResponse{}, nil
+			}
+			// Orphan sweep for a DIFFERENT stemcell's abandoned template.
+			items := sdkcluster.ListResourcesResponse{
+				clusterTemplateItem(orphanVMID, "pve2", "orphan", "bosh-stemcell;"+dirTag),
+			}
+			return &items, nil
+		},
+	}
+	storageSvc := &deleteStemcellMockStorage{}
+	tr := true
+	cfg := &config.CPIConfig{
+		Node: vmNode, StemcellStorage: "local", VMStorage: "local", DiskStorage: "local",
+		Stemcell: &config.StemcellProvenanceConfig{PruneOrphans: &tr},
+	}
+	deps := buildDeleteStemcellDeps(deleteStemcellDepsOpts{cfg: cfg, qemuSvc: qemuSvc, nodesSvc: nodesSvc, clusterSvc: clusterSvc, storageSvc: storageSvc})
+	h := handlers.HandleDeleteStemcell(deps)
+
+	args := []json.RawMessage{marshalArg(t, testHeavyCID())}
+	_, err := h.Handle(context.Background(), args, jsonrpc.Context{DirectorUUID: dirUUID})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	found := false
+	for _, id := range deletedVMIDs {
+		if id == fmt.Sprintf("%d", orphanVMID) {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected orphan prune to run on the no-template branch and destroy orphan VMID %d, got destroys=%v", orphanVMID, deletedVMIDs)
+	}
+}
+
+func TestDeleteStemcell_OrphanPrune_Live_DestroysOrphan_SkipsBaseInUse(t *testing.T) {
+	t.Parallel()
+
+	const primaryVMID = int64(7801)
+	const orphanVMID = int64(7802)
+	const baseInUseVMID = int64(7803)
+	const dirUUID = "dir-prod2"
+
+	var deletedVMIDs []string
+	nodesSvc := &stemcellMockNodes{
 		deleteQemuFn: func(_ context.Context, _, vmid string, _ *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
 			deletedVMIDs = append(deletedVMIDs, vmid)
 			if vmid == fmt.Sprintf("%d", baseInUseVMID) {
-				// Simulate PVE "base volume still in use" error.
 				return nil, &sdkerrors.APIError{HTTPCode: 500, Message: "base volume still in use"}
 			}
 			resp := sdknodes.DeleteQemuResponse(`""`)
 			return &resp, nil
 		},
 	}
-
-	shaTag := "bosh-stemcell-sha-" + sha8
-	dirTag := "director--" + dirID
+	qemuSvc := &stemcellMockQEMU{
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return directorRefsDescMap(dirUUID), nil
+		},
+	}
+	dirTag := "director--" + dirUUID
+	var listCall int
 	clusterSvc := &stemcellMockCluster{
 		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+			listCall++
+			if listCall == 1 {
+				items := sdkcluster.ListResourcesResponse{clusterTemplateItem(primaryVMID, vmNode, "stemcell-cache", shaTag(testStemcellSHA8))}
+				return &items, nil
+			}
 			items := sdkcluster.ListResourcesResponse{
-				// sha-sweep: primary already gone — idempotent 404 path
-				makeStemcellClusterItem(primaryVMID, vmNode, "primary", shaTag),
-				// orphan: should be deleted
-				makeStemcellClusterItem(orphanVMID, "pve2", "orphan", "bosh-stemcell;"+dirTag),
-				// base-in-use: should be skipped
-				makeStemcellClusterItem(baseInUseVMID, "pve3", "base-in-use", "bosh-stemcell;"+dirTag),
+				clusterTemplateItem(orphanVMID, "pve2", "orphan", "bosh-stemcell;"+dirTag),
+				clusterTemplateItem(baseInUseVMID, "pve3", "base-in-use", "bosh-stemcell;"+dirTag),
 			}
 			return &items, nil
 		},
 	}
-
 	tr := true
 	cfg := &config.CPIConfig{
-		Node:            vmNode,
-		StemcellStorage: "local",
-		VMStorage:       "local",
-		DiskStorage:     "local",
-		Stemcell: &config.StemcellProvenanceConfig{
-			PruneOrphans: &tr,
-			PruneDryRun:  nil, // live mode
-			DirectorID:   dirID,
-		},
+		Node: vmNode, StemcellStorage: "local", VMStorage: "local", DiskStorage: "local",
+		Stemcell: &config.StemcellProvenanceConfig{PruneOrphans: &tr},
 	}
-	deps := buildDeleteStemcellDepsWithCluster(nodesSvc, clusterSvc, cfg)
+	deps := buildDeleteStemcellDeps(deleteStemcellDepsOpts{cfg: cfg, qemuSvc: qemuSvc, nodesSvc: nodesSvc, clusterSvc: clusterSvc})
 	h := handlers.HandleDeleteStemcell(deps)
 
-	args := []json.RawMessage{marshalArg(t, fmt.Sprintf("template:%d", primaryVMID))}
-	_, err := h.Handle(context.Background(), args, jsonrpc.Context{})
+	args := []json.RawMessage{marshalArg(t, testHeavyCID())}
+	_, err := h.Handle(context.Background(), args, jsonrpc.Context{DirectorUUID: dirUUID})
 	if err != nil {
-		t.Fatalf("delete_stemcell must succeed even with base-in-use skip; got: %v", err)
+		t.Fatalf("delete_stemcell must succeed even with a base-in-use orphan skip; got: %v", err)
 	}
-
-	// orphanVMID must have been attempted.
 	foundOrphan := false
 	for _, id := range deletedVMIDs {
 		if id == fmt.Sprintf("%d", orphanVMID) {
@@ -1109,323 +1515,6 @@ func TestDeleteStemcell_OrphanPrune_Live(t *testing.T) {
 		}
 	}
 	if !foundOrphan {
-		t.Errorf("expected orphanVMID %d to be deleted; deletedVMIDs: %v", orphanVMID, deletedVMIDs)
-	}
-}
-
-// TestDeleteStemcell_OrphanPrune_EmptyDirectorID verifies that when director_id
-// is empty, pruning is skipped with a warning and no deletions occur.
-func TestDeleteStemcell_OrphanPrune_EmptyDirectorID(t *testing.T) {
-	t.Parallel()
-
-	const sha8 = "55667788"
-	const primaryVMID = int64(5501)
-
-	primaryTagsStr := "bosh-stemcell;bosh-stemcell-sha-" + sha8
-	var orphanDeleteCalled bool
-
-	nodesSvc := &stemcellMockNodes{
-		listQemuFn: func(_ context.Context, node string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
-			if node != vmNode {
-				return &sdknodes.ListQemuResponse{}, nil
-			}
-			raw, _ := json.Marshal(map[string]any{"vmid": primaryVMID, "tags": primaryTagsStr})
-			resp := sdknodes.ListQemuResponse{raw}
-			return &resp, nil
-		},
-		deleteQemuFn: func(_ context.Context, _, vmid string, _ *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
-			if vmid != fmt.Sprintf("%d", primaryVMID) {
-				orphanDeleteCalled = true
-			}
-			resp := sdknodes.DeleteQemuResponse(`""`)
-			return &resp, nil
-		},
-	}
-
-	shaTag := "bosh-stemcell-sha-" + sha8
-	clusterSvc := &stemcellMockCluster{
-		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
-			// Provide a sha-sweep item (primary) and an orphan with no director tag.
-			items := sdkcluster.ListResourcesResponse{
-				makeStemcellClusterItem(primaryVMID, vmNode, "primary", shaTag),
-				makeStemcellClusterItem(int64(5502), "pve2", "orphan-no-dir", "bosh-stemcell"),
-			}
-			return &items, nil
-		},
-	}
-
-	tr := true
-	cfg := &config.CPIConfig{
-		Node:            vmNode,
-		StemcellStorage: "local",
-		VMStorage:       "local",
-		DiskStorage:     "local",
-		Stemcell: &config.StemcellProvenanceConfig{
-			PruneOrphans: &tr,
-			DirectorID:   "", // empty — prune must be skipped
-		},
-	}
-	deps := buildDeleteStemcellDepsWithCluster(nodesSvc, clusterSvc, cfg)
-	h := handlers.HandleDeleteStemcell(deps)
-
-	args := []json.RawMessage{marshalArg(t, fmt.Sprintf("template:%d", primaryVMID))}
-	_, err := h.Handle(context.Background(), args, jsonrpc.Context{})
-	if err != nil {
-		t.Fatalf("delete_stemcell must succeed when director_id is empty; got: %v", err)
-	}
-	if orphanDeleteCalled {
-		t.Error("expected no orphan deletions when director_id is empty")
-	}
-}
-
-// TestDeleteStemcell_ShaSwep_Idempotent_Primary404 verifies that a 404 on the
-// primary delete is still treated as success.
-func TestDeleteStemcell_ShaSwep_Idempotent_Primary404(t *testing.T) {
-	t.Parallel()
-
-	const primaryVMID = int64(4040)
-
-	nodesSvc := &stemcellMockNodes{
-		listQemuFn: func(_ context.Context, _ string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
-			// Primary already gone — empty list.
-			return &sdknodes.ListQemuResponse{}, nil
-		},
-		deleteQemuFn: func(_ context.Context, _, _ string, _ *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
-			return nil, &sdkerrors.APIError{HTTPCode: 404}
-		},
-	}
-
-	clusterSvc := &stemcellMockCluster{} // returns empty list by default
-
-	cfg := &config.CPIConfig{Node: vmNode, StemcellStorage: "local", VMStorage: "local", DiskStorage: "local"}
-	deps := buildDeleteStemcellDepsWithCluster(nodesSvc, clusterSvc, cfg)
-	h := handlers.HandleDeleteStemcell(deps)
-
-	args := []json.RawMessage{marshalArg(t, fmt.Sprintf("template:%d", primaryVMID))}
-	_, err := h.Handle(context.Background(), args, jsonrpc.Context{})
-	if err != nil {
-		t.Fatalf("expected nil error for 404 on primary (idempotent); got: %v", err)
-	}
-}
-
-// Ensure sdkcluster import is used even if other test variants are skipped.
-var _ *sdkcluster.ListResourcesParams
-
-// Ensure sdkerrors import is used even if other test variants are skipped.
-var _ = sdkerrors.APIError{}
-
-// ============================================================
-// Tests: §7.48 stemcell reference counting (delete_stemcell)
-// ============================================================
-
-// TestDeleteStemcell_Refs_LastRef_Destroys verifies that when the deleted CID
-// is the last entry in stemcell_refs, the template is destroyed.
-func TestDeleteStemcell_Refs_LastRef_Destroys(t *testing.T) {
-	t.Parallel()
-
-	const vmid = int64(6042)
-	cid := fmt.Sprintf("template:%d", vmid)
-
-	var deleteQemuCalled bool
-	var capturedUpdateDesc string
-	nodesSvc := &stemcellMockNodes{
-		updateConfigFn: func(_ context.Context, _, _ string, params *sdknodes.UpdateQemuConfigParams) error {
-			if params != nil && params.Description != nil {
-				capturedUpdateDesc = *params.Description
-			}
-			return nil
-		},
-		deleteQemuFn: func(_ context.Context, _, _ string, _ *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
-			deleteQemuCalled = true
-			resp := sdknodes.DeleteQemuResponse(`""`)
-			return &resp, nil
-		},
-	}
-	// QEMU.Config returns a description with refs = [cid] (the only ref).
-	qemuSvc := &stemcellMockQEMU{
-		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
-			return stemcellRefsDesc(cid), nil
-		},
-	}
-
-	deps := buildDeleteStemcellDepsWithQemuAndNodes(qemuSvc, nodesSvc,
-		&config.CPIConfig{Node: vmNode, StemcellStorage: "local", VMStorage: "local", DiskStorage: "local"})
-	h := handlers.HandleDeleteStemcell(deps)
-
-	args := []json.RawMessage{marshalArg(t, cid)}
-	_, err := h.Handle(context.Background(), args, jsonrpc.Context{})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if !deleteQemuCalled {
-		t.Error("expected template to be destroyed when last ref is removed")
-	}
-	// The updated description written before destroy must have empty stemcell_refs.
-	if strings.Contains(capturedUpdateDesc, cid) {
-		t.Errorf("updated description still contains %q after last-ref removal: %s", cid, capturedUpdateDesc)
-	}
-}
-
-// TestDeleteStemcell_Refs_RefsRemain_NoDestroy verifies that when other CID refs
-// remain after removing the deleted CID, the template is NOT destroyed.
-func TestDeleteStemcell_Refs_RefsRemain_NoDestroy(t *testing.T) {
-	t.Parallel()
-
-	const vmid = int64(6042)
-	cid := fmt.Sprintf("template:%d", vmid)
-	otherCID := "template:6043"
-
-	var deleteQemuCalled bool
-	var capturedUpdateDesc string
-	nodesSvc := &stemcellMockNodes{
-		updateConfigFn: func(_ context.Context, _, _ string, params *sdknodes.UpdateQemuConfigParams) error {
-			if params != nil && params.Description != nil {
-				capturedUpdateDesc = *params.Description
-			}
-			return nil
-		},
-		deleteQemuFn: func(_ context.Context, _, _ string, _ *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
-			deleteQemuCalled = true
-			resp := sdknodes.DeleteQemuResponse(`""`)
-			return &resp, nil
-		},
-	}
-	// QEMU.Config returns a description with refs = [cid, otherCID].
-	qemuSvc := &stemcellMockQEMU{
-		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
-			return stemcellRefsDesc(cid, otherCID), nil
-		},
-	}
-
-	deps := buildDeleteStemcellDepsWithQemuAndNodes(qemuSvc, nodesSvc,
-		&config.CPIConfig{Node: vmNode, StemcellStorage: "local", VMStorage: "local", DiskStorage: "local"})
-	h := handlers.HandleDeleteStemcell(deps)
-
-	args := []json.RawMessage{marshalArg(t, cid)}
-	_, err := h.Handle(context.Background(), args, jsonrpc.Context{})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if deleteQemuCalled {
-		t.Error("template must NOT be destroyed when refs remain after removal")
-	}
-	// Updated description must still contain otherCID.
-	if !strings.Contains(capturedUpdateDesc, otherCID) {
-		t.Errorf("updated description %q must contain remaining ref %q", capturedUpdateDesc, otherCID)
-	}
-}
-
-// TestDeleteStemcell_Refs_MissingRefs_Conservative verifies that when the
-// template description contains no parseable stemcell_refs, the template is
-// NOT destroyed (conservative rule: unknown state → do not destroy).
-func TestDeleteStemcell_Refs_MissingRefs_Conservative(t *testing.T) {
-	t.Parallel()
-
-	const vmid = int64(6042)
-	cid := fmt.Sprintf("template:%d", vmid)
-
-	var deleteQemuCalled bool
-	nodesSvc := &stemcellMockNodes{
-		deleteQemuFn: func(_ context.Context, _, _ string, _ *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
-			deleteQemuCalled = true
-			resp := sdknodes.DeleteQemuResponse(`""`)
-			return &resp, nil
-		},
-	}
-	// QEMU.Config returns a description with no JSON (pre-7.48 template).
-	qemuSvc := &stemcellMockQEMU{
-		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
-			return map[string]any{"description": "director: cf\ndeployment: prod\n"}, nil
-		},
-	}
-
-	deps := buildDeleteStemcellDepsWithQemuAndNodes(qemuSvc, nodesSvc,
-		&config.CPIConfig{Node: vmNode, StemcellStorage: "local", VMStorage: "local", DiskStorage: "local"})
-	h := handlers.HandleDeleteStemcell(deps)
-
-	args := []json.RawMessage{marshalArg(t, cid)}
-	_, err := h.Handle(context.Background(), args, jsonrpc.Context{})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if deleteQemuCalled {
-		t.Error("template must NOT be destroyed when stemcell_refs is missing (conservative rule)")
-	}
-}
-
-// TestDeleteStemcell_Refs_EmptyRefs_Conservative verifies that when
-// stemcell_refs exists but is empty, the template is NOT destroyed.
-func TestDeleteStemcell_Refs_EmptyRefs_Conservative(t *testing.T) {
-	t.Parallel()
-
-	const vmid = int64(6042)
-	cid := fmt.Sprintf("template:%d", vmid)
-
-	var deleteQemuCalled bool
-	nodesSvc := &stemcellMockNodes{
-		deleteQemuFn: func(_ context.Context, _, _ string, _ *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
-			deleteQemuCalled = true
-			resp := sdknodes.DeleteQemuResponse(`""`)
-			return &resp, nil
-		},
-	}
-	// QEMU.Config returns valid JSON with an explicitly empty stemcell_refs.
-	qemuSvc := &stemcellMockQEMU{
-		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
-			desc := `{"name":"test","version":"1.0","sha8":"ab12ef34","created":"2026-06-12T00:00:00Z","stemcell_refs":""}`
-			return map[string]any{"description": desc}, nil
-		},
-	}
-
-	deps := buildDeleteStemcellDepsWithQemuAndNodes(qemuSvc, nodesSvc,
-		&config.CPIConfig{Node: vmNode, StemcellStorage: "local", VMStorage: "local", DiskStorage: "local"})
-	h := handlers.HandleDeleteStemcell(deps)
-
-	args := []json.RawMessage{marshalArg(t, cid)}
-	_, err := h.Handle(context.Background(), args, jsonrpc.Context{})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if deleteQemuCalled {
-		t.Error("template must NOT be destroyed when stemcell_refs is empty (conservative rule)")
-	}
-}
-
-// TestDeleteStemcell_Refs_Idempotent_CIDNotInRefs verifies that if the CID
-// being deleted is not in the refs list (already removed or never added), the
-// handler behaves conservatively — refs remain non-empty, no destroy.
-func TestDeleteStemcell_Refs_Idempotent_CIDNotInRefs(t *testing.T) {
-	t.Parallel()
-
-	const vmid = int64(6042)
-	cid := fmt.Sprintf("template:%d", vmid)
-	otherCID := "template:6099"
-
-	var deleteQemuCalled bool
-	nodesSvc := &stemcellMockNodes{
-		deleteQemuFn: func(_ context.Context, _, _ string, _ *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
-			deleteQemuCalled = true
-			resp := sdknodes.DeleteQemuResponse(`""`)
-			return &resp, nil
-		},
-	}
-	// QEMU.Config returns refs with only otherCID — cid is NOT present.
-	qemuSvc := &stemcellMockQEMU{
-		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
-			return stemcellRefsDesc(otherCID), nil
-		},
-	}
-
-	deps := buildDeleteStemcellDepsWithQemuAndNodes(qemuSvc, nodesSvc,
-		&config.CPIConfig{Node: vmNode, StemcellStorage: "local", VMStorage: "local", DiskStorage: "local"})
-	h := handlers.HandleDeleteStemcell(deps)
-
-	args := []json.RawMessage{marshalArg(t, cid)}
-	_, err := h.Handle(context.Background(), args, jsonrpc.Context{})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if deleteQemuCalled {
-		t.Error("template must NOT be destroyed when CID is not in refs (other refs remain)")
+		t.Errorf("expected orphan VMID %d to be attempted, got %v", orphanVMID, deletedVMIDs)
 	}
 }

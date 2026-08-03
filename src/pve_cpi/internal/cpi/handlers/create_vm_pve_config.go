@@ -33,6 +33,17 @@ const pveConfigKeyMachine = "machine"
 // sites in create_vm.go share one literal.
 const pveConfigKeySerial0 = "serial0"
 
+// pveConfigKeyMemory is the PVE VM config key for guest memory (MiB).
+// Defined as a constant to satisfy goconst (the literal "memory" recurs
+// across the blocklist and the create/clone param-building sites).
+const pveConfigKeyMemory = "memory"
+
+// pveConfigKeyDescription is the PVE VM config key for the free-text
+// description/notes field. Defined as a constant to satisfy goconst (the
+// literal "description" recurs across the blocklist and the stemcell/VM
+// param-building sites).
+const pveConfigKeyDescription = "description"
+
 // pveConfigAllowlist is the set of PVE VM config keys an operator may supply
 // via cloud_properties.pve_config. Keys here are safe to pass through because
 // the CPI does not own them and they do not affect disk/network slot layout.
@@ -67,23 +78,23 @@ var pveConfigAllowlist = map[string]struct{}{
 // Index-based keys are represented as prefixes (net, scsi, ide, virtio) and
 // matched by prefix in validatePVEConfigKey.
 var pveConfigBlocklist = map[string]struct{}{
-	"cores":             {},
-	"memory":            {},
-	"sockets":           {},
-	"boot":              {},
-	metadataKeyName:     {},
-	jsonKeyTags:         {},
-	"hotplug":           {},
-	"numa":              {},
-	pveConfigKeyBalloon: {},
-	"smbios1":           {},
-	"agent":             {},
-	"onboot":            {},
-	"tablet":            {},
-	"vmgenid":           {},
-	"description":       {},
-	"ostype":            {},
-	"args":              {},
+	"cores":                 {},
+	pveConfigKeyMemory:      {},
+	"sockets":               {},
+	"boot":                  {},
+	metadataKeyName:         {},
+	jsonKeyTags:             {},
+	"hotplug":               {},
+	"numa":                  {},
+	pveConfigKeyBalloon:     {},
+	"smbios1":               {},
+	"agent":                 {},
+	"onboot":                {},
+	"tablet":                {},
+	"vmgenid":               {},
+	pveConfigKeyDescription: {},
+	"ostype":                {},
+	"args":                  {},
 }
 
 // pveConfigBlocklistPrefixes matches indexed PVE keys (net0..net9,

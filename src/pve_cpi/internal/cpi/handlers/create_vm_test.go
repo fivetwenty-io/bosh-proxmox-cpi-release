@@ -17,6 +17,7 @@ import (
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/cpi/handlers"
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
+	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
 	sdkcluster "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cluster"
 	sdknodes "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/nodes"
 	sdkqemu "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/qemu"
@@ -24,8 +25,18 @@ import (
 	sdkerrors "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/errors"
 )
 
-// testStemcellCID is the canonical volid-format stemcell CID used across create_vm tests.
-const testStemcellCID = "test-storage:import/bosh-stemcell-foo-1.0-abc12345.qcow2"
+// testStemcellStorage and testCreateVMStemcellFilename are the storage/filename
+// components of the canonical stemcell CID fixture used across create_vm
+// tests. testStemcellVolid is the bare "<storage>:import/<file>" volid PVE's
+// import-from= parameter consumes; testStemcellCID is the path-identity CID
+// create_vm's parser accepts. The two are distinct: PVE never sees the
+// ":light:" prefix (create_vm strips it before building import-from=).
+const (
+	testStemcellStorage          = "test-storage"
+	testCreateVMStemcellFilename = "bosh-stemcell-foo-1.0-abc12345.qcow2"
+	testStemcellVolid            = testStemcellStorage + ":import/" + testCreateVMStemcellFilename
+	testStemcellCID              = ":light:" + testStemcellVolid
+)
 
 // --------------------------------------------------------------------------
 // create_vm-specific mocks
@@ -248,9 +259,29 @@ func (m *vmMockNodes) ListStorage(ctx context.Context, node string, params *sdkn
 // nil, so pve.WithStorageScan's storage-content scan sees no volumes and
 // contributes nothing to allocateVM's used-VMID set. Tests exercising the
 // shared-storage collision path set listStorageContentFn explicitly.
+//
+// A Content="import" query is a different caller entirely: create_vm's
+// pre-import stemcell-existence check (pve.FindStemcellByFilename). The
+// default reports the suite's standard stemcell fixtures (testStemcellCID,
+// testStemcellCIDWithSHA) as present so the ~80 tests that build a create_vm
+// call around those fixtures are unaffected by the existence check without
+// each wiring listStorageContentFn; tests exercising a genuinely missing
+// stemcell set listStorageContentFn explicitly.
 func (m *vmMockNodes) ListStorageContent(ctx context.Context, node, storage string, params *sdknodes.ListStorageContentParams) (*sdknodes.ListStorageContentResponse, error) {
 	if m.listStorageContentFn != nil {
 		return m.listStorageContentFn(ctx, node, storage, params)
+	}
+	if params != nil && params.Content != nil && *params.Content == "import" {
+		items := []map[string]any{
+			{"volid": storage + ":import/" + testCreateVMStemcellFilename},
+			{"volid": storage + ":import/" + testStemcellFilenameWithSHA},
+		}
+		out := make(sdknodes.ListStorageContentResponse, 0, len(items))
+		for _, it := range items {
+			raw, _ := json.Marshal(it)
+			out = append(out, raw)
+		}
+		return &out, nil
 	}
 	empty := sdknodes.ListStorageContentResponse{}
 	return &empty, nil
@@ -544,7 +575,7 @@ func TestHandleCreateVM_HappyPath(t *testing.T) {
 	if !ok {
 		t.Fatalf("create params missing virtio0 key or wrong type: %v", createParams["virtio0"])
 	}
-	wantImportFrom := "import-from=" + testStemcellCID
+	wantImportFrom := "import-from=" + testStemcellVolid
 	if !strings.Contains(virtio0, wantImportFrom) {
 		t.Errorf("virtio0 %q must contain %q", virtio0, wantImportFrom)
 	}
@@ -617,7 +648,19 @@ func TestHandleCreateVM_SkipsVMIDOwnedByStorageContent(t *testing.T) {
 	// so the storage scan targets exactly the volid below.
 	peerOwnedVMID := 100
 	n := &vmMockNodes{
-		listStorageContentFn: func(_ context.Context, node, storage string, _ *sdknodes.ListStorageContentParams) (*sdknodes.ListStorageContentResponse, error) {
+		listStorageContentFn: func(_ context.Context, node, storage string, params *sdknodes.ListStorageContentParams) (*sdknodes.ListStorageContentResponse, error) {
+			// create_vm's pre-import stemcell-existence check
+			// (pve.FindStemcellByFilename) also calls ListStorageContent, on
+			// the stemcell's own storage ("test-storage") with
+			// Content="import" — a different call from the VMID-collision
+			// scan this test targets. Report the standard stemcell fixture
+			// as present so that call is a no-op here; only the nil-params
+			// scan call is asserted on below.
+			if params != nil && params.Content != nil && *params.Content == "import" {
+				raw, _ := json.Marshal(map[string]string{"volid": storage + ":import/" + testCreateVMStemcellFilename})
+				resp := sdknodes.ListStorageContentResponse{raw}
+				return &resp, nil
+			}
 			if node != "pve" || storage != storageName {
 				t.Errorf("unexpected storage-scan node/storage: %q/%q", node, storage)
 			}
@@ -1342,10 +1385,12 @@ func TestCreateVM_AttachDiskTransient_Retriable(t *testing.T) {
 	n := &vmMockNodes{}
 	h := handlers.HandleCreateVM(buildVMDeps(q, n, &vmMockCluster{}, &vmMockAgent{}))
 
-	// Non-empty diskCIDs forces the AttachDisk path.
+	// Non-empty diskCIDs forces the AttachDisk path. The Director always hands
+	// create_vm an already-encoded disk_cid (as returned by create_disk), so
+	// the fixture must be a pvd- envelope, not a bare volid.
 	args := mkArgs("agent-1", testStemcellCID, map[string]any{},
 		map[string]any{"default": map[string]any{"type": "dynamic", "cloud_properties": map[string]any{}}},
-		[]string{"local-lvm:vm-9002-disk-0"}, map[string]any{})
+		[]string{mustEncodeDiskCID(t, "local-lvm:vm-9002-disk-0", nil)}, map[string]any{})
 
 	_, err := h.Handle(context.Background(), args, mkCtx("attachdisk-transient"))
 	if err == nil {
@@ -1544,15 +1589,14 @@ func TestCreateVM_AgentDead_EmitsDiagnostic(t *testing.T) {
 	}
 }
 
-// TestHandleCreateVM_LightStemcellCID_StripsPrefix verifies that a stemcell CID
-// with the "light:" prefix is stripped before being passed to PVE's import-from=
-// directive. Light CIDs identify operator-managed stemcells; PVE itself only
-// understands the underlying "<storage>:import/<file>" volid. Without the strip,
-// every deploy of a light stemcell would fail with an invalid-storage error
-// from PVE.
+// TestHandleCreateVM_LightStemcellCID_StripsPrefix verifies that a
+// path-identity stemcell CID's ":light:" discriminator is stripped before
+// being passed to PVE's import-from= directive. Light CIDs identify
+// operator-managed stemcells; PVE itself only understands the underlying
+// "<storage>:import/<file>" volid. Without the strip, every deploy of a
+// light stemcell would fail with an invalid-storage error from PVE.
 func TestHandleCreateVM_LightStemcellCID_StripsPrefix(t *testing.T) {
 	t.Parallel()
-	const lightCID = "light:" + testStemcellCID
 
 	q := &vmMockQEMU{}
 	n := &vmMockNodes{}
@@ -1560,7 +1604,7 @@ func TestHandleCreateVM_LightStemcellCID_StripsPrefix(t *testing.T) {
 	a := &vmMockAgent{}
 	h := handlers.HandleCreateVM(buildVMDeps(q, n, c, a))
 
-	args := mkArgs("agent-uuid-light", lightCID,
+	args := mkArgs("agent-uuid-light", testStemcellCID,
 		map[string]any{"cores": 1, "memory": 512},
 		map[string]any{"default": map[string]any{
 			"type": "manual", "ip": "10.0.0.7",
@@ -1578,12 +1622,12 @@ func TestHandleCreateVM_LightStemcellCID_StripsPrefix(t *testing.T) {
 		t.Fatalf("expected 1 QEMU.Create call, got %d", len(q.createCalls))
 	}
 	virtio0, _ := q.createCalls[0].params["virtio0"].(string)
-	wantImportFrom := "import-from=" + testStemcellCID
+	wantImportFrom := "import-from=" + testStemcellVolid
 	if !strings.Contains(virtio0, wantImportFrom) {
 		t.Errorf("virtio0 %q must contain stripped import-from %q", virtio0, wantImportFrom)
 	}
-	if strings.Contains(virtio0, "light:") {
-		t.Errorf("virtio0 %q must NOT contain \"light:\" — prefix must be stripped before passing to PVE", virtio0)
+	if strings.Contains(virtio0, ":light:") {
+		t.Errorf("virtio0 %q must NOT contain \":light:\" — prefix must be stripped before passing to PVE", virtio0)
 	}
 }
 
@@ -1591,10 +1635,43 @@ func TestHandleCreateVM_LightStemcellCID_StripsPrefix(t *testing.T) {
 // Template-CID dispatch tests
 // --------------------------------------------------------------------------
 
+// testTemplateSHA8 is the content sha8 embedded in testTemplateFilename —
+// the tag ensureDefaultTemplateCacheFixture's default cache row carries.
+const testTemplateSHA8 = "abcd1234"
+
+// testTemplateFilename / testTemplateCID: a path-identity stemcell CID whose
+// filename sha8 (testTemplateSHA8) matches the stemcell-cache template
+// fixture buildVMDepsForTemplate / buildVMDepsForTemplateCrossNode wire by
+// default — the strategy=template dispatch tests use this in place of the
+// retired "template:<vmid>" CID form.
+const (
+	testTemplateFilename = "bosh-stemcell-ubuntu-jammy-1.0-" + testTemplateSHA8 + ".qcow2"
+	testTemplateCID      = ":light:" + storageName + ":import/" + testTemplateFilename
+)
+
+// ensureDefaultTemplateCacheFixture wires c.listResourcesFn, when unset, to
+// report a single frozen stemcell-cache template (vmid, node) tagged with
+// testTemplateSHA8. Every buildVMDepsForTemplate / buildVMDepsForTemplateCrossNode
+// caller that passes a bare &vmMockCluster{} relies on this default implicitly
+// via testTemplateCID for the strategy=template clone-cache dispatch — VMID-
+// collision scans (Type="vm") still see an empty list, so wiring the fixture
+// never perturbs VMID allocation. Callers that need a different cluster-cache
+// shape (or none at all) wire c.listResourcesFn themselves before calling
+// buildVMDepsForTemplate — the explicit wiring wins and this default is skipped.
+func ensureDefaultTemplateCacheFixture(c *vmMockCluster, vmid int64, node string) {
+	if c.listResourcesFn != nil {
+		return
+	}
+	c.listResourcesFn = clusterCacheListResourcesFn(vmid, node, testTemplateSHA8)
+}
+
 // buildVMDepsForTemplate constructs Deps with cluster storage + single-node
 // cluster wired. Used for template-CID dispatch tests that go through
-// ValidateTemplateCloneStorage.
+// ValidateTemplateCloneStorage. See ensureDefaultTemplateCacheFixture for the
+// implicit cache-template default (vmid 6042, node "pve" — matching config.Node
+// below, i.e. a same-node cache hit with no Target= redirect).
 func buildVMDepsForTemplate(q *vmMockQEMU, n *vmMockNodes, c *vmMockCluster, a *vmMockAgent) handlers.Deps {
+	ensureDefaultTemplateCacheFixture(c, 6042, "pve")
 	return handlers.Deps{
 		Config: &config.CPIConfig{
 			Node:                "pve",
@@ -1625,24 +1702,27 @@ func buildVMDepsForTemplate(q *vmMockQEMU, n *vmMockNodes, c *vmMockCluster, a *
 	}
 }
 
-// buildVMDepsForTemplateCrossNode constructs Deps for cross-node template tests
-// with a 2-node cluster and configurable storage shared flag.
+// buildVMDepsForTemplateCrossNode constructs Deps for cross-node template
+// tests with a 2-node cluster and configurable storage shared flag. The
+// stemcell-cache template fixture (see ensureDefaultTemplateCacheFixture) is
+// wired on node "pve-tmpl" — cross-node from config.Node "pve" below.
 func buildVMDepsForTemplateCrossNode(q *vmMockQEMU, n *vmMockNodes, a *vmMockAgent, storageType string, shared bool) handlers.Deps {
+	c := &vmMockCluster{}
+	ensureDefaultTemplateCacheFixture(c, 6042, "pve-tmpl")
 	return handlers.Deps{
 		Config: &config.CPIConfig{
-			Node:                 "pve",
-			VMStorage:            storageName,
-			NetworkBridge:        "vmbr0",
-			VMIDRangeStart:       100,
-			AgentMBus:            "nats://mbus.test:4222",
-			StemcellTemplateNode: "pve-tmpl",
-			Placement:            &config.PlacementConfig{Enabled: placementDisabled},
-			EnsureNoIPConflicts:  placementDisabled,
+			Node:                "pve",
+			VMStorage:           storageName,
+			NetworkBridge:       "vmbr0",
+			VMIDRangeStart:      100,
+			AgentMBus:           "nats://mbus.test:4222",
+			Placement:           &config.PlacementConfig{Enabled: placementDisabled},
+			EnsureNoIPConflicts: placementDisabled,
 		},
 		PVE: &mockPVEClient{
 			qemuSvc:    q,
 			nodesSvc:   n,
-			clusterSvc: withConfigNodes(&vmMockCluster{}, 2),
+			clusterSvc: withConfigNodes(c, 2),
 			tasksSvc: &mockTasksService{
 				waitFn: func(_ context.Context, _, _ string, _ *sdktasks.WaitOptions) (*sdktasks.Status, error) {
 					return &sdktasks.Status{ExitStatus: "OK"}, nil
@@ -1691,12 +1771,10 @@ func withConfigNodes(c *vmMockCluster, nodeCount int) *mockClusterSvc {
 	}
 }
 
-// testTemplateCID is a sample template stemcell CID used in dispatch tests.
-const testTemplateCID = "template:6042"
-
-// TestCreateVM_TemplateCID_ClonesNotImports verifies that a "template:<vmid>"
-// CID routes to CreateQemuClone (not QEMU.Create), and the post-clone tail
-// (NIC config, agent configure, start) still runs.
+// TestCreateVM_TemplateCID_ClonesNotImports verifies that a strategy=template
+// stemcell CID with a same-node cache hit routes to CreateQemuClone (not
+// QEMU.Create), and the post-clone tail (NIC config, agent configure, start)
+// still runs.
 func TestCreateVM_TemplateCID_ClonesNotImports(t *testing.T) {
 	t.Parallel()
 
@@ -1841,8 +1919,9 @@ func TestCreateVM_TemplateCID_CrossNode_Shared_SetsTarget(t *testing.T) {
 	}
 }
 
-// TestCreateVM_TemplateCID_CrossNode_Local_Error verifies that a template CID
-// with local storage and nodes that differ returns a cross-node local-storage error and does not
+// TestCreateVM_TemplateCID_CrossNode_Local_Error verifies that a strategy=
+// template cache hit on local storage, with no template on shape.node and no
+// per-node replica, returns the actionable replica-gap error and does not
 // call CreateQemuClone.
 func TestCreateVM_TemplateCID_CrossNode_Local_Error(t *testing.T) {
 	t.Parallel()
@@ -1851,7 +1930,7 @@ func TestCreateVM_TemplateCID_CrossNode_Local_Error(t *testing.T) {
 	q := &vmMockQEMU{}
 	a := &vmMockAgent{}
 
-	// StemcellTemplateNode="pve-tmpl", config.Node="pve", LOCAL dir storage, 2 nodes.
+	// Cache template on "pve-tmpl", config.Node="pve", LOCAL dir storage, 2 nodes.
 	deps := buildVMDepsForTemplateCrossNode(q, n, a, "dir", false)
 	h := handlers.HandleCreateVM(deps)
 
@@ -1872,14 +1951,14 @@ func TestCreateVM_TemplateCID_CrossNode_Local_Error(t *testing.T) {
 	}
 }
 
-// TestCreateVM_OldFormCID_NoTemplate_StillImports verifies that an old-form CID
-// ("<storage>:import/<file>") uses the QEMU.Create import-from= path when no
-// matching template is found by the opportunistic sha-tag lookup.
+// TestCreateVM_OldFormCID_NoTemplate_StillImports verifies that a
+// strategy=template stemcell CID uses the QEMU.Create import-from= path when
+// no matching cache template is found anywhere in the cluster (empty
+// ListResources — the default when listResourcesFn is nil).
 func TestCreateVM_OldFormCID_NoTemplate_StillImports(t *testing.T) {
 	t.Parallel()
 
 	q := &vmMockQEMU{}
-	// listQemuFn returns empty (no templates) — the default when listQemuFn is nil.
 	n := &vmMockNodes{}
 	c := &vmMockCluster{}
 	a := &vmMockAgent{}
@@ -1951,14 +2030,18 @@ func TestCreateVM_TemplateCID_CloneConflict_Retries(t *testing.T) {
 // Old-CID opportunistic template dispatch tests
 // --------------------------------------------------------------------------
 
-// testStemcellCIDWithSHA is a stemcell CID whose filename contains a known sha8
-// so the opportunistic lookup can match it. sha8 = "abc12345" (from filename).
-const testStemcellCIDWithSHA = "test-storage:import/bosh-stemcell-ubuntu-jammy-1.438-abc12345.qcow2"
+// testStemcellFilenameWithSHA / testStemcellCIDWithSHA is a stemcell CID
+// whose filename contains a known sha8 so the strategy=template cluster
+// cache lookup can match it. sha8 = "abc12345" (from filename).
+const (
+	testStemcellFilenameWithSHA = "bosh-stemcell-ubuntu-jammy-1.438-abc12345.qcow2"
+	testStemcellCIDWithSHA      = ":light:" + testStemcellStorage + ":import/" + testStemcellFilenameWithSHA
+)
 
 // buildVMDepsForOldCIDLookup constructs Deps with cluster storage + single-node
-// cluster wired. The nodes mock has listQemuFn set to the provided function so
-// FindTemplateBySHATag exercises the correct code path.
-func buildVMDepsForOldCIDLookup(q *vmMockQEMU, n *vmMockNodes, a *vmMockAgent) handlers.Deps {
+// cluster wired. c's ListResources controls what
+// pve.FindTemplatesBySHATagCluster (the strategy=template cache lookup) sees.
+func buildVMDepsForOldCIDLookup(q *vmMockQEMU, n *vmMockNodes, c *vmMockCluster, a *vmMockAgent) handlers.Deps {
 	return handlers.Deps{
 		Config: &config.CPIConfig{
 			Node:                "pve",
@@ -1972,7 +2055,7 @@ func buildVMDepsForOldCIDLookup(q *vmMockQEMU, n *vmMockNodes, a *vmMockAgent) h
 		PVE: &mockPVEClient{
 			qemuSvc:    q,
 			nodesSvc:   n,
-			clusterSvc: withConfigNodes(&vmMockCluster{}, 1),
+			clusterSvc: withConfigNodes(c, 1),
 			tasksSvc: &mockTasksService{
 				waitFn: func(_ context.Context, _, _ string, _ *sdktasks.WaitOptions) (*sdktasks.Status, error) {
 					return &sdktasks.Status{ExitStatus: "OK"}, nil
@@ -1989,33 +2072,39 @@ func buildVMDepsForOldCIDLookup(q *vmMockQEMU, n *vmMockNodes, a *vmMockAgent) h
 	}
 }
 
-// listQemuWithTemplate returns a ListQemu stub that reports a single frozen
-// template carrying the given sha8 tag and VMID.
-func listQemuWithTemplate(vmid int64, sha8 string) func(context.Context, string, *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
-	return func(_ context.Context, _ string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
-		isTemplate := true
-		tag := "bosh-stemcell-sha-" + sha8
+// clusterCacheListResourcesFn returns a vmMockCluster.listResourcesFn that
+// reports a single frozen stemcell-cache template (vmid, node, sha8 tag) for
+// a cache-lookup query (Type unset) and an empty list for a VMID-collision
+// scan query (Type="vm"), so wiring the fixture never perturbs VMID
+// allocation.
+func clusterCacheListResourcesFn(vmid int64, node, sha8 string) func(context.Context, *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+	return func(_ context.Context, params *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+		if params != nil && params.Type != nil {
+			empty := sdkcluster.ListResourcesResponse{}
+			return &empty, nil
+		}
 		raw, _ := json.Marshal(map[string]any{
+			"type":     "qemu",
 			"vmid":     vmid,
-			"name":     "bosh-stemcell-ubuntu-jammy-1.438",
-			"tags":     tag,
-			"template": isTemplate,
+			"node":     node,
+			"name":     "bosh-stemcell-ubuntu-jammy-1-438",
+			"tags":     "bosh-stemcell-sha-" + sha8,
+			"template": true,
 		})
-		resp := sdknodes.ListQemuResponse{raw}
+		resp := sdkcluster.ListResourcesResponse{raw}
 		return &resp, nil
 	}
 }
 
 // TestCreateVM_OldCID_TemplateFound_ClonesNotImports verifies that when the
-// opportunistic sha-tag lookup finds an existing template, CreateQemuClone is
-// called and QEMU.Create (import-from) is NOT called.
+// strategy=template cluster-cache lookup finds an existing template on
+// shape.node, CreateQemuClone is called and QEMU.Create (import-from) is NOT
+// called.
 func TestCreateVM_OldCID_TemplateFound_ClonesNotImports(t *testing.T) {
 	t.Parallel()
 
 	cloneCalled := false
 	n := &vmMockNodes{
-		// FindTemplateBySHATag calls ListQemu; return a matching template.
-		listQemuFn: listQemuWithTemplate(6042, "abc12345"),
 		// Clone path fires when template is found.
 		createQemuCloneFn: func(_ context.Context, _, _ string, params *sdknodes.CreateQemuCloneParams) (*sdknodes.CreateQemuCloneResponse, error) {
 			cloneCalled = true
@@ -2026,8 +2115,9 @@ func TestCreateVM_OldCID_TemplateFound_ClonesNotImports(t *testing.T) {
 	}
 	q := &vmMockQEMU{} // Create must NOT be called — panics via nil createFn path
 	a := &vmMockAgent{}
+	c := &vmMockCluster{listResourcesFn: clusterCacheListResourcesFn(6042, "pve", "abc12345")}
 
-	deps := buildVMDepsForOldCIDLookup(q, n, a)
+	deps := buildVMDepsForOldCIDLookup(q, n, c, a)
 	h := handlers.HandleCreateVM(deps)
 
 	args := mkArgs("agent-oldcid-found", testStemcellCIDWithSHA,
@@ -2068,23 +2158,25 @@ func TestCreateVM_OldCID_TemplateFound_ClonesNotImports(t *testing.T) {
 }
 
 // TestCreateVM_OldCID_NoTemplate_FallsBackToImport verifies that when the
-// opportunistic lookup returns no match, QEMU.Create (import-from) is called
-// and CreateQemuClone is NOT called.
+// cluster-cache lookup returns no match (empty cluster), QEMU.Create
+// (import-from) is called and CreateQemuClone is NOT called.
 func TestCreateVM_OldCID_NoTemplate_FallsBackToImport(t *testing.T) {
 	t.Parallel()
 
-	// listQemuFn returns empty → not-found; the nil default on vmMockNodes does
-	// exactly this, but we set it explicitly to document the intent.
-	n := &vmMockNodes{
-		listQemuFn: func(_ context.Context, _ string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
-			empty := sdknodes.ListQemuResponse{}
+	// c's ListResources default (unwired) reports an empty cluster — cache
+	// miss; the nil default on vmMockCluster does exactly this, but it is
+	// wired explicitly here to document the intent.
+	n := &vmMockNodes{}
+	c := &vmMockCluster{
+		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+			empty := sdkcluster.ListResourcesResponse{}
 			return &empty, nil
 		},
 	}
 	q := &vmMockQEMU{}
 	a := &vmMockAgent{}
 
-	deps := buildVMDepsForOldCIDLookup(q, n, a)
+	deps := buildVMDepsForOldCIDLookup(q, n, c, a)
 	h := handlers.HandleCreateVM(deps)
 
 	args := mkArgs("agent-oldcid-notfound", testStemcellCIDWithSHA,
@@ -2105,21 +2197,30 @@ func TestCreateVM_OldCID_NoTemplate_FallsBackToImport(t *testing.T) {
 }
 
 // TestCreateVM_OldCID_LookupError_FallsBackToImport verifies that when
-// FindTemplateBySHATag returns an error, create_vm does NOT fail — it logs
-// a warning and falls back to the import-from path.
+// FindTemplatesBySHATagCluster returns an error, create_vm does NOT fail —
+// it logs a warning and falls back to the import-from path.
 func TestCreateVM_OldCID_LookupError_FallsBackToImport(t *testing.T) {
 	t.Parallel()
 
 	lookupErr := fmt.Errorf("PVE API: connection refused")
-	n := &vmMockNodes{
-		listQemuFn: func(_ context.Context, _ string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
+	n := &vmMockNodes{}
+	c := &vmMockCluster{
+		listResourcesFn: func(_ context.Context, params *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+			// Only the strategy=template cache lookup (Type unset) should
+			// fail here; the VMID-collision scan (Type="vm", used by
+			// AllocateWithRetry regardless of stemcell strategy) must keep
+			// working so this test isolates the cache-lookup fallback.
+			if params != nil && params.Type != nil {
+				empty := sdkcluster.ListResourcesResponse{}
+				return &empty, nil
+			}
 			return nil, lookupErr
 		},
 	}
 	q := &vmMockQEMU{}
 	a := &vmMockAgent{}
 
-	deps := buildVMDepsForOldCIDLookup(q, n, a)
+	deps := buildVMDepsForOldCIDLookup(q, n, c, a)
 	h := handlers.HandleCreateVM(deps)
 
 	args := mkArgs("agent-oldcid-lookuperr", testStemcellCIDWithSHA,
@@ -2141,14 +2242,13 @@ func TestCreateVM_OldCID_LookupError_FallsBackToImport(t *testing.T) {
 }
 
 // TestCreateVM_OldCID_TemplateFound_ConflictRetries verifies that when the
-// opportunistic clone path is taken and the first attempt hits a VMID conflict,
-// AllocateWithRetry retries with a fresh candidate.
+// strategy=template cache-hit clone path is taken and the first attempt hits
+// a VMID conflict, AllocateWithRetry retries with a fresh candidate.
 func TestCreateVM_OldCID_TemplateFound_ConflictRetries(t *testing.T) {
 	t.Parallel()
 
 	cloneAttempts := 0
 	n := &vmMockNodes{
-		listQemuFn: listQemuWithTemplate(6042, "abc12345"),
 		createQemuCloneFn: func(_ context.Context, _, _ string, params *sdknodes.CreateQemuCloneParams) (*sdknodes.CreateQemuCloneResponse, error) {
 			cloneAttempts++
 			if cloneAttempts == 1 {
@@ -2161,8 +2261,9 @@ func TestCreateVM_OldCID_TemplateFound_ConflictRetries(t *testing.T) {
 	}
 	q := &vmMockQEMU{}
 	a := &vmMockAgent{}
+	c := &vmMockCluster{listResourcesFn: clusterCacheListResourcesFn(6042, "pve", "abc12345")}
 
-	deps := buildVMDepsForOldCIDLookup(q, n, a)
+	deps := buildVMDepsForOldCIDLookup(q, n, c, a)
 	h := handlers.HandleCreateVM(deps)
 
 	args := mkArgs("agent-oldcid-retry", testStemcellCIDWithSHA,
@@ -2187,19 +2288,21 @@ func TestCreateVM_OldCID_TemplateFound_ConflictRetries(t *testing.T) {
 	}
 }
 
-// TestCreateVM_TemplateCID_Regression_StillClones verifies that the template:<vmid>
-// path is unchanged by the old-CID opportunistic change — no ListQemu call
-// is made and CreateQemuClone fires directly.
+// TestCreateVM_TemplateCID_Regression_StillClones verifies that a same-node
+// strategy=template cache hit clones directly without ever calling the
+// node-scoped ListQemu (used only by the per-node replica guard on a
+// cross-node, local-storage miss) — CreateQemuClone fires straight from the
+// cluster-scoped cache lookup.
 func TestCreateVM_TemplateCID_Regression_StillClones(t *testing.T) {
 	t.Parallel()
 
 	cloneCalled := false
 	n := &vmMockNodes{
-		// listQemuFn is nil: if ListQemu is called for a template:<vmid> CID
-		// it returns empty — but it must NOT be called at all on this path.
-		// We detect accidental calls via a sentinel.
+		// listQemuFn: if ListQemu is called on a same-node cache hit, that is
+		// the regression this test guards against — the replica guard must
+		// never fire when the cache lookup already matched shape.node.
 		listQemuFn: func(_ context.Context, _ string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
-			t.Error("template:<vmid> path must not call ListQemu")
+			t.Error("same-node cache hit must not call ListQemu")
 			empty := sdknodes.ListQemuResponse{}
 			return &empty, nil
 		},
@@ -2229,6 +2332,172 @@ func TestCreateVM_TemplateCID_Regression_StillClones(t *testing.T) {
 	}
 	if len(q.createCalls) != 0 {
 		t.Errorf("template:<vmid> regression: QEMU.Create must not be called, got %d calls", len(q.createCalls))
+	}
+}
+
+// --------------------------------------------------------------------------
+// stemcell_strategy: explicit import, per-VM override, sha8-unextractable
+// --------------------------------------------------------------------------
+
+// TestCreateVM_StrategyImport_ExistenceCheck_Positive verifies that an
+// explicit cloud_properties.stemcell_strategy="import" imports directly
+// (never attempts the cluster cache lookup) and the pre-import existence
+// check passes for a qcow2 that is present.
+func TestCreateVM_StrategyImport_ExistenceCheck_Positive(t *testing.T) {
+	t.Parallel()
+	q := &vmMockQEMU{}
+	n := &vmMockNodes{}
+	c := &vmMockCluster{
+		listResourcesFn: func(_ context.Context, params *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+			if params == nil || params.Type == nil {
+				t.Error("strategy=import must not call the cluster cache lookup (Type-unset ListResources)")
+			}
+			empty := sdkcluster.ListResourcesResponse{}
+			return &empty, nil
+		},
+	}
+	a := &vmMockAgent{}
+	h := handlers.HandleCreateVM(buildVMDeps(q, n, c, a))
+
+	args := mkArgs("agent-strategy-import", testStemcellCID,
+		map[string]any{"cores": 1, "memory": 512, "stemcell_strategy": "import"},
+		defaultNetMap(), []string{}, map[string]any{})
+
+	if _, err := h.Handle(context.Background(), args, mkCtx("strategy-import-positive")); err != nil {
+		t.Fatalf("strategy=import: unexpected error: %v", err)
+	}
+	if len(q.createCalls) != 1 {
+		t.Fatalf("strategy=import: expected 1 QEMU.Create call, got %d", len(q.createCalls))
+	}
+	if len(n.createQemuCloneCalls) != 0 {
+		t.Errorf("strategy=import: CreateQemuClone must not be called, got %d calls", len(n.createQemuCloneCalls))
+	}
+}
+
+// TestCreateVM_StrategyImport_ExistenceCheck_MissingFile verifies that the
+// pre-import existence check (pve.FindStemcellByFilename) returns a crisp,
+// actionable error when the storage listing confirms the qcow2 is absent —
+// QEMU.Create is never called.
+func TestCreateVM_StrategyImport_ExistenceCheck_MissingFile(t *testing.T) {
+	t.Parallel()
+	q := &vmMockQEMU{}
+	n := &vmMockNodes{
+		listStorageContentFn: func(_ context.Context, _, _ string, params *sdknodes.ListStorageContentParams) (*sdknodes.ListStorageContentResponse, error) {
+			if params != nil && params.Content != nil && *params.Content == "import" {
+				// Confirmed absence: a successful listing with no matching item.
+				empty := sdknodes.ListStorageContentResponse{}
+				return &empty, nil
+			}
+			empty := sdknodes.ListStorageContentResponse{}
+			return &empty, nil
+		},
+	}
+	c := &vmMockCluster{}
+	a := &vmMockAgent{}
+	h := handlers.HandleCreateVM(buildVMDeps(q, n, c, a))
+
+	args := mkArgs("agent-strategy-import-missing", testStemcellCID,
+		map[string]any{"cores": 1, "memory": 512, "stemcell_strategy": "import"},
+		defaultNetMap(), []string{}, map[string]any{})
+
+	_, err := h.Handle(context.Background(), args, mkCtx("strategy-import-missing"))
+	if err == nil {
+		t.Fatal("strategy=import missing file: expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "not found") {
+		t.Errorf("strategy=import missing file: error must mention 'not found'; got: %v", err)
+	}
+	if !strings.Contains(err.Error(), testStemcellVolid) {
+		t.Errorf("strategy=import missing file: error must name the missing volid %q; got: %v", testStemcellVolid, err)
+	}
+	if len(q.createCalls) != 0 {
+		t.Errorf("strategy=import missing file: QEMU.Create must not be called, got %d calls", len(q.createCalls))
+	}
+}
+
+// TestCreateVM_StemcellStrategy_PerVMOverridesGlobal verifies that a per-VM
+// cloud_properties.stemcell_strategy="template" wins over a global
+// pve.stemcell_strategy="import" config default.
+func TestCreateVM_StemcellStrategy_PerVMOverridesGlobal(t *testing.T) {
+	t.Parallel()
+	cloneCalled := false
+	n := &vmMockNodes{
+		createQemuCloneFn: func(_ context.Context, _, _ string, _ *sdknodes.CreateQemuCloneParams) (*sdknodes.CreateQemuCloneResponse, error) {
+			cloneCalled = true
+			raw := sdknodes.CreateQemuCloneResponse{}
+			_ = json.Unmarshal([]byte(`"UPID:pve:00008888:00000001:clone:ok"`), &raw)
+			return &raw, nil
+		},
+	}
+	q := &vmMockQEMU{}
+	a := &vmMockAgent{}
+
+	deps := buildVMDepsForTemplate(q, n, &vmMockCluster{}, a)
+	deps.Config.StemcellStrategy = "import" // global default would import, not clone
+
+	h := handlers.HandleCreateVM(deps)
+
+	args := mkArgs("agent-strategy-override", testTemplateCID,
+		map[string]any{"cores": 1, "memory": 512, "stemcell_strategy": "template"},
+		map[string]any{"default": map[string]any{"type": "dynamic", "cloud_properties": map[string]any{}}},
+		[]string{}, map[string]any{})
+
+	if _, err := h.Handle(context.Background(), args, mkCtx("strategy-override")); err != nil {
+		t.Fatalf("per-VM strategy override: unexpected error: %v", err)
+	}
+	if !cloneCalled {
+		t.Error("per-VM stemcell_strategy=template must win over global stemcell_strategy=import — CreateQemuClone was not called")
+	}
+	if len(q.createCalls) != 0 {
+		t.Errorf("per-VM strategy override: QEMU.Create must not be called, got %d calls", len(q.createCalls))
+	}
+}
+
+// TestCreateVM_TemplateStrategy_SHA8Unextractable_FallsBackToImport verifies
+// that when strategy=template (the default) but the stemcell filename does
+// not match the bosh-stemcell-<name>-<version>-<sha8>.qcow2 pattern, create_vm
+// skips the cluster cache lookup entirely and imports directly — it must
+// never error solely because sha8 could not be extracted.
+func TestCreateVM_TemplateStrategy_SHA8Unextractable_FallsBackToImport(t *testing.T) {
+	t.Parallel()
+	const customCID = ":light:test-storage:import/my-custom-image.qcow2"
+
+	q := &vmMockQEMU{}
+	n := &vmMockNodes{
+		listStorageContentFn: func(_ context.Context, _, storage string, params *sdknodes.ListStorageContentParams) (*sdknodes.ListStorageContentResponse, error) {
+			if params != nil && params.Content != nil && *params.Content == "import" {
+				raw, _ := json.Marshal(map[string]string{"volid": storage + ":import/my-custom-image.qcow2"})
+				resp := sdknodes.ListStorageContentResponse{raw}
+				return &resp, nil
+			}
+			empty := sdknodes.ListStorageContentResponse{}
+			return &empty, nil
+		},
+	}
+	c := &vmMockCluster{
+		listResourcesFn: func(_ context.Context, params *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+			if params == nil || params.Type == nil {
+				t.Error("sha8-unextractable stemcell must never reach the cluster cache lookup")
+			}
+			empty := sdkcluster.ListResourcesResponse{}
+			return &empty, nil
+		},
+	}
+	a := &vmMockAgent{}
+	h := handlers.HandleCreateVM(buildVMDeps(q, n, c, a))
+
+	args := mkArgs("agent-sha8-unextractable", customCID,
+		map[string]any{"cores": 1, "memory": 512},
+		defaultNetMap(), []string{}, map[string]any{})
+
+	if _, err := h.Handle(context.Background(), args, mkCtx("sha8-unextractable")); err != nil {
+		t.Fatalf("sha8-unextractable: unexpected error: %v", err)
+	}
+	if len(q.createCalls) != 1 {
+		t.Fatalf("sha8-unextractable: expected 1 QEMU.Create call, got %d", len(q.createCalls))
+	}
+	if len(n.createQemuCloneCalls) != 0 {
+		t.Errorf("sha8-unextractable: CreateQemuClone must not be called, got %d calls", len(n.createQemuCloneCalls))
 	}
 }
 
@@ -4460,5 +4729,46 @@ func TestHandleCreateVM_Searchdomain_Absent(t *testing.T) {
 	}
 	if capturedNICParams.Searchdomain != nil {
 		t.Errorf("Searchdomain must be nil when no search_domain property set, got %q", *capturedNICParams.Searchdomain)
+	}
+}
+
+// TestCreateVM_AttachedDiskRecordsVerbatimCID verifies that a persistent disk
+// attached at create_vm time records the Director's exact (envelope) disk_cid
+// against the bare volid on the VM's description sentinel — the same contract
+// attach_disk honors — so a later get_disks returns the verbatim CID and
+// cloudcheck membership comparison works for create-time attachments.
+func TestCreateVM_AttachedDiskRecordsVerbatimCID(t *testing.T) {
+	t.Parallel()
+	bareVolid := "local-lvm:vm-9010-disk-0"
+	envelopeCID := mustEncodeDiskCID(t, bareVolid, &pve.DiskCIDMeta{Pool: "local-lvm"})
+
+	q := &vmMockQEMU{}
+	n := &vmMockNodes{}
+	h := handlers.HandleCreateVM(buildVMDeps(q, n, &vmMockCluster{}, &vmMockAgent{}))
+
+	args := mkArgs("agent-uuid-1", testStemcellCID,
+		map[string]any{},
+		map[string]any{"default": map[string]any{
+			"type": "dynamic", "cloud_properties": map[string]any{},
+		}},
+		[]string{envelopeCID}, map[string]any{})
+
+	if _, err := h.Handle(context.Background(), args, mkCtx("cid-sentinel-1")); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	found := false
+	for _, call := range n.updateConfigCalls {
+		if call.params == nil || call.params.Description == nil {
+			continue
+		}
+		if got := pve.GetAttachedDiskCIDs(*call.params.Description); got[bareVolid] == envelopeCID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("no UpdateQemuConfig call recorded the bosh_attached_disks sentinel mapping %q -> %q (%d config writes seen)",
+			bareVolid, envelopeCID, len(n.updateConfigCalls))
 	}
 }

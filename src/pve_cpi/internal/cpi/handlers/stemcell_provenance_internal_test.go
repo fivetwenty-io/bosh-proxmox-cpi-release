@@ -2,9 +2,12 @@ package handlers
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
 )
 
 // TestBuildStemcellProvenanceTags_WithDirector verifies all four tags are
@@ -132,308 +135,9 @@ func TestBuildStemcellProvenanceTags_SanitizationCasesPreserved(t *testing.T) {
 	}
 }
 
-// TestBuildStemcellProvenanceNotes_FullFields verifies JSON output when all
-// fields are non-empty.
-func TestBuildStemcellProvenanceNotes_FullFields(t *testing.T) {
-	cp := stemcellCloudProps{
-		Name:       "bosh-ubuntu-noble",
-		Version:    "1.42",
-		OSType:     "l26",
-		DiskFormat: "qcow2",
-	}
-	now := time.Date(2026, 6, 3, 12, 0, 0, 0, time.UTC)
-
-	notes, err := buildStemcellProvenanceNotes(cp, "ab12ef34", "https://example.com/stemcell.tgz", "director-xyz", now, "", nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	var p stemcellProvenance
-	if err := json.Unmarshal([]byte(notes), &p); err != nil {
-		t.Fatalf("unmarshal failed: %v", err)
-	}
-
-	if p.Name != "bosh-ubuntu-noble" {
-		t.Errorf("Name: got %q, want %q", p.Name, "bosh-ubuntu-noble")
-	}
-	if p.Version != "1.42" {
-		t.Errorf("Version: got %q, want %q", p.Version, "1.42")
-	}
-	if p.OSType != "l26" {
-		t.Errorf("OSType: got %q, want %q", p.OSType, "l26")
-	}
-	if p.DiskFormat != "qcow2" {
-		t.Errorf("DiskFormat: got %q, want %q", p.DiskFormat, "qcow2")
-	}
-	if p.SHA8 != "ab12ef34" {
-		t.Errorf("SHA8: got %q, want %q", p.SHA8, "ab12ef34")
-	}
-	if p.Source != "https://example.com/stemcell.tgz" {
-		t.Errorf("Source: got %q", p.Source)
-	}
-	if p.DirectorID != "director-xyz" {
-		t.Errorf("DirectorID: got %q", p.DirectorID)
-	}
-
-	// Created must parse as RFC3339 and equal the input UTC time.
-	parsed, err := time.Parse(time.RFC3339, p.Created)
-	if err != nil {
-		t.Fatalf("Created parse error: %v", err)
-	}
-	if !parsed.Equal(now) {
-		t.Errorf("Created: got %q, want %q", p.Created, now.UTC().Format(time.RFC3339))
-	}
-}
-
-// TestBuildStemcellProvenanceNotes_ScrubsCredentialBearingSource verifies a
-// presigned or userinfo-bearing source URL is scrubbed before it is persisted
-// into the PVE notes field (cluster-replicated, backup-captured, readable by
-// any VM.Audit holder), while the diagnostic parts — host, path, benign query
-// params — survive.
-func TestBuildStemcellProvenanceNotes_ScrubsCredentialBearingSource(t *testing.T) {
-	cp := stemcellCloudProps{Name: "s", Version: "1"}
-	now := time.Date(2026, 6, 3, 12, 0, 0, 0, time.UTC)
-	source := "https://bosh:s3cretpw@mirror.internal/stemcell.qcow2?X-Amz-Signature=deadbeef1234&X-Amz-Expires=3600"
-
-	notes, err := buildStemcellProvenanceNotes(cp, "ab12ef34", source, "director-xyz", now, "", nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	var p stemcellProvenance
-	if err := json.Unmarshal([]byte(notes), &p); err != nil {
-		t.Fatalf("unmarshal failed: %v", err)
-	}
-	if strings.Contains(p.Source, "s3cretpw") || strings.Contains(p.Source, "deadbeef1234") {
-		t.Fatalf("Source leaked credentials: %q", p.Source)
-	}
-	if !strings.Contains(p.Source, "mirror.internal/stemcell.qcow2") {
-		t.Errorf("Source lost its diagnostic value: %q", p.Source)
-	}
-	if !strings.Contains(p.Source, "X-Amz-Expires=3600") {
-		t.Errorf("benign query param should survive scrubbing: %q", p.Source)
-	}
-}
-
-// TestBuildStemcellProvenanceNotes_OmitemptyFields verifies omitempty fields
-// are absent from JSON when empty.
-func TestBuildStemcellProvenanceNotes_OmitemptyFields(t *testing.T) {
-	cp := stemcellCloudProps{
-		Name:    "minimal-stemcell",
-		Version: "0.1",
-		// OSType and DiskFormat intentionally empty
-	}
-	now := time.Date(2026, 6, 3, 0, 0, 0, 0, time.UTC)
-
-	notes, err := buildStemcellProvenanceNotes(cp, "", "", "", now, "", nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	// Unmarshal into a generic map to check key presence.
-	var m map[string]interface{}
-	if err := json.Unmarshal([]byte(notes), &m); err != nil {
-		t.Fatalf("unmarshal failed: %v", err)
-	}
-
-	for _, absent := range []string{"os_type", "disk_format", "source", "director_id"} {
-		if _, ok := m[absent]; ok {
-			t.Errorf("key %q present in JSON but should be omitted (omitempty, empty value)", absent)
-		}
-	}
-
-	// name, version, sha8, created must always appear
-	for _, required := range []string{"name", "version", "sha8", "created"} {
-		if _, ok := m[required]; !ok {
-			t.Errorf("key %q missing from JSON", required)
-		}
-	}
-}
-
-// TestBuildStemcellProvenanceNotes_CreatedIsUTC verifies Created is stored in
-// UTC even when a non-UTC time.Time is passed.
-func TestBuildStemcellProvenanceNotes_CreatedIsUTC(t *testing.T) {
-	cp := stemcellCloudProps{Name: "x", Version: "1"}
-	loc, _ := time.LoadLocation("America/New_York")
-	now := time.Date(2026, 6, 3, 8, 0, 0, 0, loc) // 08:00 ET = 12:00 UTC
-
-	notes, err := buildStemcellProvenanceNotes(cp, "", "", "", now, "", nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	var p stemcellProvenance
-	if err := json.Unmarshal([]byte(notes), &p); err != nil {
-		t.Fatalf("unmarshal failed: %v", err)
-	}
-
-	parsed, err := time.Parse(time.RFC3339, p.Created)
-	if err != nil {
-		t.Fatalf("Created parse error: %v", err)
-	}
-
-	wantUTC := now.UTC()
-	if !parsed.Equal(wantUTC) {
-		t.Errorf("Created time mismatch: got %v, want %v", parsed, wantUTC)
-	}
-	// RFC3339 UTC suffix must be "Z" or "+00:00"
-	if parsed.Location() != time.UTC {
-		t.Errorf("Created timezone is not UTC: %v", parsed.Location())
-	}
-}
-
 // ============================================================
 // Tests: ParseStemcellRefs and FormatStemcellRefs
 // ============================================================
-
-// TestParseStemcellRefs verifies CSV parse including empty-string edge case.
-func TestParseStemcellRefs(t *testing.T) {
-	t.Parallel()
-
-	cases := []struct {
-		name  string
-		input string
-		want  []string
-	}{
-		{"empty string returns empty slice", "", []string{}},
-		{"whitespace-only returns empty slice", "   ", []string{}},
-		{"single CID", "template:6042", []string{"template:6042"}},
-		{"two CIDs", "template:6042,template:6043", []string{"template:6042", "template:6043"}},
-		{"trims whitespace around entries", " template:6042 , template:6043 ", []string{"template:6042", "template:6043"}},
-		{"drops empty tokens between commas", "template:6042,,template:6043", []string{"template:6042", "template:6043"}},
-		{"single CID with trailing comma", "template:6042,", []string{"template:6042"}},
-	}
-
-	for _, tc := range cases {
-		tc := tc
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			got := ParseStemcellRefs(tc.input)
-			if len(got) != len(tc.want) {
-				t.Fatalf("ParseStemcellRefs(%q) = %v (len %d), want %v (len %d)",
-					tc.input, got, len(got), tc.want, len(tc.want))
-			}
-			for i := range tc.want {
-				if got[i] != tc.want[i] {
-					t.Errorf("ParseStemcellRefs(%q)[%d] = %q, want %q", tc.input, i, got[i], tc.want[i])
-				}
-			}
-		})
-	}
-}
-
-// TestParseStemcellRefs_EmptyStringNeverReturnsOneBlankEntry verifies the
-// critical invariant: ParseStemcellRefs("") must return []string{}, NOT
-// []string{""}, because a single blank entry would be treated as "1 implicit
-// ref" and incorrectly block template destruction.
-func TestParseStemcellRefs_EmptyStringNeverReturnsOneBlankEntry(t *testing.T) {
-	t.Parallel()
-
-	got := ParseStemcellRefs("")
-	if len(got) != 0 {
-		t.Errorf("ParseStemcellRefs(\"\") returned %d entries %v; want 0 entries",
-			len(got), got)
-	}
-	for _, r := range got {
-		if r == "" {
-			t.Error("ParseStemcellRefs(\"\") must not return an empty-string entry")
-		}
-	}
-}
-
-// TestFormatStemcellRefs verifies round-trip CSV serialization.
-func TestFormatStemcellRefs(t *testing.T) {
-	t.Parallel()
-
-	cases := []struct {
-		name  string
-		input []string
-		want  string
-	}{
-		{"nil slice returns empty string", nil, ""},
-		{"empty slice returns empty string", []string{}, ""},
-		{"single entry", []string{"template:6042"}, "template:6042"},
-		{"two entries", []string{"template:6042", "template:6043"}, "template:6042,template:6043"},
-	}
-
-	for _, tc := range cases {
-		tc := tc
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			got := FormatStemcellRefs(tc.input)
-			if got != tc.want {
-				t.Errorf("FormatStemcellRefs(%v) = %q, want %q", tc.input, got, tc.want)
-			}
-		})
-	}
-}
-
-// TestParseStemcellRefs_RoundTrip verifies that parse→format→parse is stable.
-func TestParseStemcellRefs_RoundTrip(t *testing.T) {
-	t.Parallel()
-
-	original := []string{"template:6042", "template:6100", "template:7000"}
-	formatted := FormatStemcellRefs(original)
-	reparsed := ParseStemcellRefs(formatted)
-
-	if len(reparsed) != len(original) {
-		t.Fatalf("round-trip length mismatch: got %d, want %d; formatted=%q", len(reparsed), len(original), formatted)
-	}
-	for i := range original {
-		if reparsed[i] != original[i] {
-			t.Errorf("round-trip[%d] = %q, want %q", i, reparsed[i], original[i])
-		}
-	}
-}
-
-// TestBuildStemcellProvenanceNotes_StemcellRefsIncluded verifies that when
-// initialCID is non-empty, the stemcell_refs field appears in the JSON output.
-func TestBuildStemcellProvenanceNotes_StemcellRefsIncluded(t *testing.T) {
-	t.Parallel()
-
-	cp := stemcellCloudProps{Name: "bosh-ubuntu-noble", Version: "1.0"}
-	now := time.Date(2026, 6, 12, 0, 0, 0, 0, time.UTC)
-
-	notes, err := buildStemcellProvenanceNotes(cp, "ab12ef34", "", "", now, "template:6042", nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	var m map[string]any
-	if err := json.Unmarshal([]byte(notes), &m); err != nil {
-		t.Fatalf("unmarshal failed: %v", err)
-	}
-
-	refs, ok := m["stemcell_refs"]
-	if !ok {
-		t.Fatal("stemcell_refs key absent from JSON when initialCID is non-empty")
-	}
-	if refs != "template:6042" {
-		t.Errorf("stemcell_refs = %v, want %q", refs, "template:6042")
-	}
-}
-
-// TestBuildStemcellProvenanceNotes_StemcellRefsOmittedWhenEmpty verifies that
-// when initialCID is empty, the stemcell_refs key is omitted (omitempty).
-func TestBuildStemcellProvenanceNotes_StemcellRefsOmittedWhenEmpty(t *testing.T) {
-	t.Parallel()
-
-	cp := stemcellCloudProps{Name: "bosh-ubuntu-noble", Version: "1.0"}
-	now := time.Date(2026, 6, 12, 0, 0, 0, 0, time.UTC)
-
-	notes, err := buildStemcellProvenanceNotes(cp, "ab12ef34", "", "", now, "", nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	var m map[string]any
-	if err := json.Unmarshal([]byte(notes), &m); err != nil {
-		t.Fatalf("unmarshal failed: %v", err)
-	}
-
-	if _, ok := m["stemcell_refs"]; ok {
-		t.Error("stemcell_refs must be omitted from JSON when initialCID is empty")
-	}
-}
 
 // TestParseStemcellProvenanceFromDescription verifies JSON parse and the
 // ok=false path for empty/non-JSON input.
@@ -464,9 +168,9 @@ func TestParseStemcellProvenanceFromDescription(t *testing.T) {
 		}
 	})
 
-	t.Run("valid JSON with refs parses correctly", func(t *testing.T) {
+	t.Run("valid JSON with director refs parses correctly", func(t *testing.T) {
 		t.Parallel()
-		input := `{"name":"bosh-ubuntu-noble","version":"1.0","sha8":"ab12ef34","created":"2026-06-12T00:00:00Z","stemcell_refs":"template:6042"}`
+		input := `{"name":"bosh-ubuntu-noble","version":"1.0","sha8":"ab12ef34","created":"2026-06-12T00:00:00Z","director_refs":["uuid-a","uuid-b"]}`
 		prov, ok := parseStemcellProvenanceFromDescription(input)
 		if !ok {
 			t.Fatal("expected ok=true for valid JSON")
@@ -474,83 +178,170 @@ func TestParseStemcellProvenanceFromDescription(t *testing.T) {
 		if prov.Name != "bosh-ubuntu-noble" {
 			t.Errorf("Name = %q, want %q", prov.Name, "bosh-ubuntu-noble")
 		}
-		if prov.StemcellRefs != "template:6042" {
-			t.Errorf("StemcellRefs = %q, want %q", prov.StemcellRefs, "template:6042")
+		if len(prov.DirectorRefs) != 2 || prov.DirectorRefs[0] != "uuid-a" || prov.DirectorRefs[1] != "uuid-b" {
+			t.Errorf("DirectorRefs = %v, want [uuid-a uuid-b]", prov.DirectorRefs)
 		}
 	})
 
-	t.Run("valid JSON without refs field parses with empty StemcellRefs", func(t *testing.T) {
+	t.Run("valid JSON without refs field parses with empty DirectorRefs", func(t *testing.T) {
 		t.Parallel()
 		input := `{"name":"bosh-ubuntu-noble","version":"1.0","sha8":"ab12ef34","created":"2026-06-12T00:00:00Z"}`
 		prov, ok := parseStemcellProvenanceFromDescription(input)
 		if !ok {
 			t.Fatal("expected ok=true for valid JSON")
 		}
-		if prov.StemcellRefs != "" {
-			t.Errorf("StemcellRefs = %q, want empty string", prov.StemcellRefs)
+		if len(prov.DirectorRefs) != 0 {
+			t.Errorf("DirectorRefs = %v, want empty", prov.DirectorRefs)
 		}
 	})
 }
 
-// TestBuildStemcellProvenanceNotes_DirectorTagsPresent verifies that when
-// directorTags is non-empty, director_tags appears in the JSON output and
-// its key/value pairs round-trip correctly.
-func TestBuildStemcellProvenanceNotes_DirectorTagsPresent(t *testing.T) {
+// ============================================================
+// Tests: buildStemcellProvenanceNotesPath (D1/D3 path-identity CID design)
+// ============================================================
+
+// TestBuildStemcellProvenanceNotesPath_FullFields verifies every field lands
+// in the JSON output, SHA8 is derived as the first 8 lowercased characters of
+// sha256hex, and DirectorRefs seeds with the creating director as its sole
+// initial entry.
+func TestBuildStemcellProvenanceNotesPath_FullFields(t *testing.T) {
 	t.Parallel()
 
-	cp := stemcellCloudProps{Name: "bosh-ubuntu-noble", Version: "1.0"}
-	now := time.Date(2026, 6, 15, 0, 0, 0, 0, time.UTC)
-	directorTags := map[string]string{"env": "prod", "team": "platform"}
+	cp := stemcellCloudProps{
+		Name:       "bosh-ubuntu-noble",
+		Version:    "1.42",
+		OSType:     "l26",
+		DiskFormat: "qcow2",
+	}
+	now := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
+	const sha256hex = "AB12EF34CD56AB12EF34CD56AB12EF34CD56AB12EF34CD56AB12EF34CD56AB"
+	const cid = ":heavy:local:import/bosh-stemcell-ubuntu-noble-1.42-ab12ef34.qcow2"
+	directorTags := map[string]string{"env": "prod"}
 
-	notes, err := buildStemcellProvenanceNotes(cp, "ab12ef34", "", "", now, "", directorTags)
+	notes, err := buildStemcellProvenanceNotesPath(cp, pve.StemcellKindHeavy, cid, sha256hex, "https://example.com/stemcell.tgz", "director-xyz", now, directorTags)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	var m map[string]any
-	if err := json.Unmarshal([]byte(notes), &m); err != nil {
+	var p stemcellProvenance
+	if err := json.Unmarshal([]byte(notes), &p); err != nil {
 		t.Fatalf("unmarshal failed: %v", err)
 	}
 
-	rawTags, ok := m["director_tags"]
-	if !ok {
-		t.Fatal("director_tags key absent from JSON when directorTags is non-empty")
+	if p.Name != cp.Name {
+		t.Errorf("Name: got %q, want %q", p.Name, cp.Name)
 	}
-	tagsMap, ok := rawTags.(map[string]any)
-	if !ok {
-		t.Fatalf("director_tags is not a JSON object; got %T", rawTags)
+	if p.Version != cp.Version {
+		t.Errorf("Version: got %q, want %q", p.Version, cp.Version)
 	}
-	for k, want := range directorTags {
-		got, ok := tagsMap[k]
-		if !ok {
-			t.Errorf("director_tags[%q] missing", k)
-			continue
-		}
-		if got != want {
-			t.Errorf("director_tags[%q] = %v; want %q", k, got, want)
-		}
+	if p.OSType != cp.OSType {
+		t.Errorf("OSType: got %q, want %q", p.OSType, cp.OSType)
+	}
+	if p.DiskFormat != cp.DiskFormat {
+		t.Errorf("DiskFormat: got %q, want %q", p.DiskFormat, cp.DiskFormat)
+	}
+	wantSHA8 := strings.ToLower(sha256hex[:8])
+	if p.SHA8 != wantSHA8 {
+		t.Errorf("SHA8: got %q, want %q", p.SHA8, wantSHA8)
+	}
+	if p.SHA256 != sha256hex {
+		t.Errorf("SHA256: got %q, want %q", p.SHA256, sha256hex)
+	}
+	if p.Kind != string(pve.StemcellKindHeavy) {
+		t.Errorf("Kind: got %q, want %q", p.Kind, pve.StemcellKindHeavy)
+	}
+	if p.CID != cid {
+		t.Errorf("CID: got %q, want %q", p.CID, cid)
+	}
+	if p.CreatedBy != "director-xyz" {
+		t.Errorf("CreatedBy: got %q, want %q", p.CreatedBy, "director-xyz")
+	}
+	if len(p.DirectorRefs) != 1 || p.DirectorRefs[0] != "director-xyz" {
+		t.Errorf("DirectorRefs: got %v, want [director-xyz]", p.DirectorRefs)
+	}
+	if p.Source == "" || strings.Contains(p.Source, "\x00") {
+		t.Errorf("Source unexpectedly empty/corrupted: %q", p.Source)
+	}
+	if p.DirectorTags["env"] != "prod" {
+		t.Errorf("DirectorTags: got %v, want env=prod", p.DirectorTags)
+	}
+
+	parsed, err := time.Parse(time.RFC3339, p.Created)
+	if err != nil {
+		t.Fatalf("Created parse error: %v", err)
+	}
+	if !parsed.Equal(now) {
+		t.Errorf("Created: got %q, want %q", p.Created, now.Format(time.RFC3339))
 	}
 }
 
-// TestBuildStemcellProvenanceNotes_DirectorTagsAbsent verifies that when
-// directorTags is nil, director_tags is omitted (omitempty) and notes output
-// is byte-identical to the pre-v3 format.
-func TestBuildStemcellProvenanceNotes_DirectorTagsAbsent(t *testing.T) {
+// TestBuildStemcellProvenanceNotesPath_LightKind verifies Kind serializes as
+// "light" for pve.StemcellKindLight.
+func TestBuildStemcellProvenanceNotesPath_LightKind(t *testing.T) {
 	t.Parallel()
 
-	cp := stemcellCloudProps{Name: "bosh-ubuntu-noble", Version: "1.0"}
-	now := time.Date(2026, 6, 15, 0, 0, 0, 0, time.UTC)
+	cp := stemcellCloudProps{Name: "s", Version: "1"}
+	now := time.Date(2026, 8, 3, 0, 0, 0, 0, time.UTC)
 
-	notes, err := buildStemcellProvenanceNotes(cp, "ab12ef34", "", "", now, "", nil)
+	notes, err := buildStemcellProvenanceNotesPath(cp, pve.StemcellKindLight, ":light:nfs:import/x.qcow2", "", "", "director-a", now, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+	var p stemcellProvenance
+	if err := json.Unmarshal([]byte(notes), &p); err != nil {
+		t.Fatalf("unmarshal failed: %v", err)
+	}
+	if p.Kind != string(pve.StemcellKindLight) {
+		t.Errorf("Kind: got %q, want %q", p.Kind, pve.StemcellKindLight)
+	}
+}
 
+// TestBuildStemcellProvenanceNotesPath_ShortSHA256_EmptySHA8 verifies that a
+// sha256hex shorter than 8 characters (including the empty string — the
+// legitimate server-download-without-sha256 case) yields an empty SHA8,
+// matching the BuildStemcellFilename convention for an unknown digest.
+func TestBuildStemcellProvenanceNotesPath_ShortSHA256_EmptySHA8(t *testing.T) {
+	t.Parallel()
+
+	cp := stemcellCloudProps{Name: "s", Version: "1"}
+	now := time.Date(2026, 8, 3, 0, 0, 0, 0, time.UTC)
+
+	cases := []string{"", "ab12"}
+	for _, sha := range cases {
+		sha := sha
+		t.Run(fmt.Sprintf("sha256=%q", sha), func(t *testing.T) {
+			t.Parallel()
+			notes, err := buildStemcellProvenanceNotesPath(cp, pve.StemcellKindHeavy, ":heavy:local:import/x.qcow2", sha, "", "director-a", now, nil)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			var p stemcellProvenance
+			if err := json.Unmarshal([]byte(notes), &p); err != nil {
+				t.Fatalf("unmarshal failed: %v", err)
+			}
+			if p.SHA8 != "" {
+				t.Errorf("SHA8: got %q, want empty for short/empty sha256hex %q", p.SHA8, sha)
+			}
+		})
+	}
+}
+
+// TestBuildStemcellProvenanceNotesPath_DirectorTagsOmittedWhenEmpty verifies
+// director_tags is omitted (omitempty) when directorTags is nil.
+func TestBuildStemcellProvenanceNotesPath_DirectorTagsOmittedWhenEmpty(t *testing.T) {
+	t.Parallel()
+
+	cp := stemcellCloudProps{Name: "s", Version: "1"}
+	now := time.Date(2026, 8, 3, 0, 0, 0, 0, time.UTC)
+
+	notes, err := buildStemcellProvenanceNotesPath(cp, pve.StemcellKindHeavy, ":heavy:local:import/x.qcow2", "", "", "director-a", now, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	var m map[string]any
 	if err := json.Unmarshal([]byte(notes), &m); err != nil {
 		t.Fatalf("unmarshal failed: %v", err)
 	}
-
 	if _, ok := m["director_tags"]; ok {
 		t.Error("director_tags must be omitted when directorTags is nil (omitempty)")
 	}

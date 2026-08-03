@@ -428,6 +428,9 @@ func requestOverrideCacheKey(cfg *config.CPIConfig) string {
 //     defect class if allowed to fall through to the job-level cluster —
 //     see M2 in the A13 review.
 func (d Deps) WithRequestOverrides(ctx context.Context, reqCtx jsonrpc.Context) (Deps, error) {
+	// Stamp the caller's director UUID before any early return so every
+	// handler path (override or not) carries it — see Deps.RequestDirectorUUID.
+	d.RequestDirectorUUID = reqCtx.DirectorUUID
 	if d.Overrides == nil || len(reqCtx.Extra) == 0 {
 		return d, nil
 	}

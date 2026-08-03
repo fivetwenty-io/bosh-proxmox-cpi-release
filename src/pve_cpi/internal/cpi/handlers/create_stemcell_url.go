@@ -19,30 +19,37 @@ import (
 // The CPI does not transfer image bytes; only the PVE node needs network
 // access to source_url. Requires PVE 7.2+.
 //
-// When cloud_properties.sha256 is also set, Checksum and ChecksumAlgorithm
-// params are forwarded to PVE for server-side integrity verification. A task
-// failure due to checksum mismatch is returned as a non-retriable cloud error.
-// When sha256 is absent, no checksum params are sent.
+// cloud_properties.sha256 is mandatory: Checksum and ChecksumAlgorithm
+// params are forwarded to PVE for server-side integrity verification, and a
+// task failure due to checksum mismatch is returned as a non-retriable cloud
+// error. Content identity (the sha-tag cache-template lookup and the CID's
+// filename) is derived entirely from this digest — PVE, not the CPI, streams
+// the bytes, so there is no independent point at which the CPI could compute
+// or verify one after the fact.
 //
-// The returned CID is "template:<vmid>" — identical semantics to all other
-// create_stemcell paths. All downstream steps (template VM creation, freeze,
-// provenance, pool assignment) run identically via ensureTemplateVM.
+// The returned CID is always ":heavy:<storage>:import/<file>" — PVE, not the
+// CPI, transferred the bytes, but the CPI owns the resulting import volume
+// (it is not operator-preuploaded). All downstream steps (template VM
+// creation, freeze, provenance, pool assignment, director-ref registration)
+// run identically via ensureTemplateAndRegisterRef.
 //
 // Flow:
-//  1. Resolve storage and target node from config.
-//  2. Derive canonical qcow2 filename from name, version, and sha256
-//     (or placeholder sha8 "00000000" when sha256 is absent).
+//  1. Resolve storage and target node from config; reject the call outright
+//     when cloud_properties.sha256 is missing or malformed.
+//  2. Derive canonical qcow2 filename from name, version, and sha256.
 //  3. Pre-dedup: scan storage for existing volume with that filename. If
-//     found, skip download and proceed directly to ensureTemplateVM.
+//     found, skip download and proceed directly to ensureTemplateAndRegisterRef.
 //  4. Call CreateStorageDownloadUrl; await UPID via AwaitTask.
 //  5. On task failure (including checksum mismatch): return non-retriable error.
 //  6. Locate the downloaded volume by prefix scan to get the canonical volid.
-//  7. ensureTemplateVM builds or reuses the frozen template VM.
-//  8. Return "template:<vmid>".
+//  7. ensureTemplateAndRegisterRef builds or reuses the cache template and
+//     registers directorUUID as a live reference.
+//  8. Return the ":heavy:" CID.
 func handleStemcellDownloadURL(
 	ctx context.Context,
 	deps Deps,
 	cp stemcellCloudProps,
+	directorUUID string,
 ) (any, error) {
 	// 1. Resolve storage and node. Reuse the shared helper that also enforces
 	//    the shared-storage constraint for multi-node clusters.
@@ -56,29 +63,36 @@ func handleStemcellDownloadURL(
 		templateNode = node
 	}
 
-	// 2. Derive canonical qcow2 filename.
-	// When sha256 is provided, bake it into the filename for exact dedup and
-	// content-based identity. When absent, sha8 defaults to "00000000" via
-	// BuildStemcellFilename — two different source_urls with the same name+version
-	// and no sha256 produce the same filename and will share the same import volume
-	// (first-writer wins). Warn so operators are aware of the weak identity.
-	if cp.ExpectedSHA256 == "" {
-		deps.Log(ctx).Warn("create_stemcell: server-download: sha256 not set; "+
-			"filename identity is weak (name+version only) — strongly recommend "+
-			"setting cloud_properties.sha256 alongside source_url",
-			log.URL("source_url", cp.SourceURL),
-			log.String("name", cp.Name),
-			log.String("version", cp.Version),
-		)
+	// 1b. sha256 is mandatory for server-side download. Without it the
+	// resulting template would need a sha8 tag derived from
+	// BuildStemcellFilename's "00000000" unknown-digest placeholder — but that
+	// placeholder is a literal constant shared by every source_url stemcell
+	// lacking a digest, regardless of actual content, so tagging with it would
+	// make the sha-tag cluster scan (FindTemplatesBySHATagCluster) treat
+	// unrelated stemcells as the same candidate (sha256MatchesTemplateProvenance
+	// trusts a tag match when neither side records a full digest). Unlike the
+	// light-fetch prefix-dedup case, there is no genuinely content-derived sha8
+	// available here to fall back on: PVE, not the CPI, streams the bytes, so
+	// this path never computes one. Requiring the digest up front — the same
+	// requirement handleLightStemcellPreUploaded already enforces — closes the
+	// gap at the root instead of emitting an identity the rest of the system
+	// cannot safely dedup or look up by.
+	if !isValidSHA256Hex(cp.ExpectedSHA256) {
+		return nil, cpierrors.Cloud(
+			"create_stemcell: server-download (cloud_properties.source_url) requires cloud_properties.sha256 "+
+				"so content identity and dedup work (must be a 64-character hex string, got %q)", cp.ExpectedSHA256)
 	}
+
+	// 2. Derive canonical qcow2 filename from the verified digest.
 	qcow2Filename := pve.BuildStemcellFilename(cp.Name, cp.Version, cp.ExpectedSHA256)
+	stemcellCID := pve.BuildHeavyStemcellCID(storage, qcow2Filename)
 
 	deps.Log(ctx).Info("create_stemcell: server-side download requested",
 		log.URL("source_url", cp.SourceURL),
 		log.String("node", node),
 		log.String("storage", storage),
 		log.String("filename", qcow2Filename),
-		log.String("sha256", cp.ExpectedSHA256),
+		log.String(jsonKeySHA256, cp.ExpectedSHA256),
 	)
 
 	// 3. Pre-dedup: if the volume already exists, skip the download entirely.
@@ -90,22 +104,31 @@ func handleStemcellDownloadURL(
 		deps.Log(ctx).Info("create_stemcell: server-download — volume already present, skipping download",
 			log.String("volid", existingVol),
 		)
-		vmid, tmplErr := ensureTemplateVM(ctx, deps, templateNode, storage, qcow2Filename, cp.ExpectedSHA256, false, cp, cp.SourceURL)
+		vmid, winnerNode, tmplErr := ensureTemplateAndRegisterRef(ctx, deps, deps.Log(ctx),
+			templateNode, storage, qcow2Filename, cp.ExpectedSHA256, "",
+			pve.StemcellKindHeavy, stemcellCID, directorUUID, cp, cp.SourceURL)
 		if tmplErr != nil {
 			return nil, fmt.Errorf("create_stemcell: server-download dedup: ensure template: %w", tmplErr)
 		}
-		return pve.BuildTemplateStemcellCID(vmid), nil
+		deps.Log(ctx).Info("create_stemcell: server-download (dedup) template ready",
+			log.Int64(metadataKeyVMID, vmid),
+			log.String("template_node", winnerNode),
+			log.String("cid", stemcellCID),
+		)
+		maybeReplicateServerDownload(ctx, deps, templateNode, storage, qcow2Filename,
+			cp.ExpectedSHA256, cp.SourceURL, stemcellCID, directorUUID, cp)
+		return stemcellCID, nil
 	}
 
 	// 4. Build CreateStorageDownloadUrl params.
 	params := &sdknodes.CreateStorageDownloadUrlParams{
-		Content:  "import",
+		Content:  pveStorageContentImport,
 		Filename: qcow2Filename,
 		Url:      cp.SourceURL,
 	}
 	if cp.ExpectedSHA256 != "" {
 		checksum := cp.ExpectedSHA256
-		algo := "sha256"
+		algo := jsonKeySHA256
 		params.Checksum = &checksum
 		params.ChecksumAlgorithm = &algo
 	}
@@ -197,22 +220,68 @@ func handleStemcellDownloadURL(
 		log.String("actual_filename", actualFilename),
 	)
 
-	// 7. Build template VM from the downloaded volume.
-	// server-download: CPI did not upload the volume (PVE owns the bytes), but
-	// the volume is a new CPI-managed import. cpiOwnsSource=true so ensureTemplateVM
-	// deletes the import volume after the template is frozen (import volumes
-	// on stemcell storage are staging only; the template disk is the live copy).
-	vmid, tmplErr := ensureTemplateVM(ctx, deps, templateNode, storage, actualFilename, cp.ExpectedSHA256, true, cp, cp.SourceURL)
+	// 7. Ensure the cache template from the downloaded volume and register
+	// this director's reference. server-download: PVE (not the CPI) streamed
+	// the bytes, but the CPI owns the resulting import volume — it is not
+	// operator-preuploaded, so the CID is :heavy: and, per D10, the volume is
+	// never reclaimed here (delete_stemcell owns last-ref deletion). The
+	// actual downloaded filename (actualFilename, which may differ from
+	// qcow2Filename after PVE normalization) is used for identity from here
+	// on, so the CID reflects the same filename PVE registered.
+	actualCID := pve.BuildHeavyStemcellCID(storage, actualFilename)
+	vmid, winnerNode, tmplErr := ensureTemplateAndRegisterRef(ctx, deps, deps.Log(ctx),
+		templateNode, storage, actualFilename, cp.ExpectedSHA256, "",
+		pve.StemcellKindHeavy, actualCID, directorUUID, cp, cp.SourceURL)
 	if tmplErr != nil {
 		return nil, fmt.Errorf("create_stemcell: server-download: ensure template: %w", tmplErr)
 	}
 
-	templateCID := pve.BuildTemplateStemcellCID(vmid)
 	deps.Log(ctx).Info("create_stemcell: server-download stemcell ready",
 		log.URL("source_url", cp.SourceURL),
-		log.String("cid", templateCID),
+		log.Int64(metadataKeyVMID, vmid),
+		log.String("template_node", winnerNode),
+		log.String("cid", actualCID),
 	)
-	return templateCID, nil
+	maybeReplicateServerDownload(ctx, deps, templateNode, storage, actualFilename,
+		cp.ExpectedSHA256, cp.SourceURL, actualCID, directorUUID, cp)
+	return actualCID, nil
+}
+
+// maybeReplicateServerDownload applies the same replication gate
+// HandleCreateStemcell's mainline uses (opt-in, storage not shared, more than
+// one cluster node) before fanning the download out to every other node via
+// replicateServerDownloadToNodes. Both handleStemcellDownloadURL return paths
+// (pre-dedup hit and fresh download) call this at the equivalent point after
+// template creation, so a source_url stemcell is no longer stranded on the
+// single node PVE happened to download it to.
+//
+// Best-effort: a failure to list cluster nodes only skips replication and
+// logs a warning; it never fails the call whose CID was already committed.
+func maybeReplicateServerDownload(
+	ctx context.Context,
+	deps Deps,
+	templateNode, storage, qcow2Filename, sha256hex, sourceURL, stemcellCID, directorUUID string,
+	cp stemcellCloudProps,
+) {
+	if deps.Config == nil || !deps.Config.StemcellReplicateLocal || sha256hex == "" {
+		return
+	}
+	if shared, known := stemcellStorageIsShared(ctx, deps, storage); known && shared {
+		deps.Log(ctx).Info("create_stemcell: server-download: stemcell storage is shared; replication not needed")
+		return
+	}
+	clusterNodes, listErr := listClusterNodes(ctx, deps)
+	if listErr != nil {
+		deps.Log(ctx).Warn("create_stemcell: server-download: replication: cannot list cluster nodes (skipping replication)",
+			log.Err(listErr),
+		)
+		return
+	}
+	if len(clusterNodes) <= 1 {
+		return
+	}
+	replicateServerDownloadToNodes(ctx, deps, templateNode, storage, qcow2Filename,
+		sha256hex, clusterNodes, sourceURL, stemcellCID, directorUUID, cp)
 }
 
 // stemcellDownloadURLPrefix returns the filename prefix used for the fallback

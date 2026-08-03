@@ -13,6 +13,7 @@ import (
 	"strings"
 	"testing"
 
+	sdkcluster "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cluster"
 	sdknodes "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/nodes"
 	sdktasks "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/tasks"
 
@@ -99,7 +100,9 @@ func buildDownloadDeps(
 // wbDownloadListFn returns a ListStorageContent that reports no volumes on the
 // first call (pre-dedup miss) then reports the given volume on subsequent calls
 // (post-download volume-find). This models the common server-download sequence.
-func wbDownloadListFn(storage, filename string) func(_ context.Context, _, _ string, _ *sdknodes.ListStorageContentParams) (*sdknodes.ListStorageContentResponse, error) {
+// Every caller in this file targets the "nfs" storage, so that segment of the
+// volid is fixed rather than threaded through as a parameter.
+func wbDownloadListFn(filename string) func(_ context.Context, _, _ string, _ *sdknodes.ListStorageContentParams) (*sdknodes.ListStorageContentResponse, error) {
 	var callCount int
 	return func(_ context.Context, _, _ string, _ *sdknodes.ListStorageContentParams) (*sdknodes.ListStorageContentResponse, error) {
 		callCount++
@@ -109,7 +112,7 @@ func wbDownloadListFn(storage, filename string) func(_ context.Context, _, _ str
 			return &empty, nil
 		}
 		// Post-download: volume present.
-		volid := storage + ":import/" + filename
+		volid := "nfs:import/" + filename
 		raw, _ := json.Marshal(map[string]string{"volid": volid})
 		resp := sdknodes.ListStorageContentResponse{raw}
 		return &resp, nil
@@ -138,7 +141,7 @@ func TestCreateStemcell_SourceURL_Dispatches(t *testing.T) {
 	var dlCallParams *sdknodes.CreateStorageDownloadUrlParams
 	var uploadCalled bool
 
-	listFn := wbDownloadListFn("nfs", wantFilename)
+	listFn := wbDownloadListFn(wantFilename)
 	dlFn := func(_ context.Context, _, _ string, params *sdknodes.CreateStorageDownloadUrlParams) (*sdknodes.CreateStorageDownloadUrlResponse, error) {
 		dlCallParams = params
 		raw := sdknodes.CreateStorageDownloadUrlResponse(`"UPID:pve-node1:00001234:00000001:00000001:download:0:root@pam:"`)
@@ -181,13 +184,15 @@ func TestCreateStemcell_SourceURL_Dispatches(t *testing.T) {
 		t.Error("Upload was called; expected server-download path to never call Upload")
 	}
 
-	// Returned CID must be template:<vmid>.
+	// Returned CID must be the deterministic :heavy: CID — PVE (not the CPI)
+	// streamed the bytes, but the CPI owns the resulting import volume.
 	cid, ok := result.(string)
 	if !ok {
 		t.Fatalf("result is %T; want string", result)
 	}
-	if !pve.IsTemplateStemcellCID(cid) {
-		t.Errorf("CID = %q; want template:<vmid> form", cid)
+	wantCID := pve.BuildHeavyStemcellCID("nfs", wantFilename)
+	if cid != wantCID {
+		t.Errorf("CID = %q; want %q", cid, wantCID)
 	}
 
 	// source_url must be forwarded to the SDK call.
@@ -232,6 +237,8 @@ func TestCreateStemcell_NoSourceURL_ExistingFlowUnchanged(t *testing.T) {
 		"name":     "ubuntu-jammy",
 		"version":  "1.0",
 		"image_id": "nfs:import/bosh-stemcell-ubuntu-jammy-1.0-00000000.qcow2",
+		// sha256 is now required for preuploaded stemcells (P1.1).
+		"sha256": "ef0c5d8d1d8ba6e1a8620b2cba931c76e3bc9049395c3e7a5d5733cc3df2983f",
 	}
 	args := []json.RawMessage{
 		mustMarshalStr(t, "/dev/null"),
@@ -260,7 +267,7 @@ func TestCreateStemcell_SourceURL_ChecksumParams(t *testing.T) {
 	wantFilename := pve.BuildStemcellFilename("ubuntu-jammy", "1.501", sha256hex)
 
 	var dlCallParams *sdknodes.CreateStorageDownloadUrlParams
-	listFn := wbDownloadListFn("nfs", wantFilename)
+	listFn := wbDownloadListFn(wantFilename)
 	dlFn := func(_ context.Context, _, _ string, params *sdknodes.CreateStorageDownloadUrlParams) (*sdknodes.CreateStorageDownloadUrlResponse, error) {
 		dlCallParams = params
 		raw := sdknodes.CreateStorageDownloadUrlResponse(`"UPID:pve-node1:00001234:00000001:00000001:download:0:root@pam:"`)
@@ -302,19 +309,68 @@ func TestCreateStemcell_SourceURL_ChecksumParams(t *testing.T) {
 }
 
 // ============================================================
-// TestCreateStemcell_SourceURL_NoSHA256_NoChecksumParams
-// Verifies that when sha256 is absent, no Checksum/ChecksumAlgorithm params
-// are sent to CreateStorageDownloadUrl.
+// TestCreateStemcell_SourceURL_NoSHA256_Rejected
+// Verifies that server-download (source_url) now requires cloud_properties.sha256:
+// a placeholder sha8 ("00000000") shared by every digest-less source_url
+// stemcell would let sha256MatchesTemplateProvenance treat unrelated
+// stemcells as a sha-tag match (neither side records a full digest), so the
+// CPI rejects the call outright instead of emitting a colliding identity.
 // ============================================================
 
-func TestCreateStemcell_SourceURL_NoSHA256_NoChecksumParams(t *testing.T) {
+func TestCreateStemcell_SourceURL_NoSHA256_Rejected(t *testing.T) {
 	t.Parallel()
 
-	// Without sha256, filename uses placeholder sha8 "00000000".
-	wantFilename := pve.BuildStemcellFilename("ubuntu-jammy", "1.502", "")
+	var dlCalled bool
+	listFn := func(_ context.Context, _, _ string, _ *sdknodes.ListStorageContentParams) (*sdknodes.ListStorageContentResponse, error) {
+		empty := sdknodes.ListStorageContentResponse{}
+		return &empty, nil
+	}
+	dlFn := func(_ context.Context, _, _ string, _ *sdknodes.CreateStorageDownloadUrlParams) (*sdknodes.CreateStorageDownloadUrlResponse, error) {
+		dlCalled = true
+		raw := sdknodes.CreateStorageDownloadUrlResponse(`"UPID:pve-node1:00001234:00000001:00000001:download:0:root@pam:"`)
+		return &raw, nil
+	}
+
+	deps := buildDownloadDeps(t, listFn, dlFn)
+	h := HandleCreateStemcell(deps)
+	cp := map[string]any{
+		"name":       "ubuntu-jammy",
+		"version":    "1.502",
+		"source_url": "https://example.com/stemcell.qcow2",
+		// sha256 intentionally absent.
+	}
+	args := []json.RawMessage{
+		mustMarshalStr(t, "/dev/null"),
+		mustMarshalMap(t, cp),
+	}
+
+	_, err := h.Handle(context.Background(), args, jsonrpc.Context{})
+	if err == nil {
+		t.Fatal("expected error for missing sha256; got nil")
+	}
+	if !strings.Contains(err.Error(), "sha256") {
+		t.Errorf("error %q does not mention sha256", err.Error())
+	}
+	if dlCalled {
+		t.Error("CreateStorageDownloadUrl must not be called when sha256 validation fails")
+	}
+}
+
+// ============================================================
+// TestCreateStemcell_SourceURL_ChecksumParamsAlwaysSent
+// Verifies that, now that sha256 is mandatory for server-download,
+// Checksum/ChecksumAlgorithm params are always forwarded to
+// CreateStorageDownloadUrl.
+// ============================================================
+
+func TestCreateStemcell_SourceURL_ChecksumParamsAlwaysSent(t *testing.T) {
+	t.Parallel()
+
+	const sha256hex = "ef0c5d8d1d8ba6e1a8620b2cba931c76e3bc9049395c3e7a5d5733cc3df2983f"
+	wantFilename := pve.BuildStemcellFilename("ubuntu-jammy", "1.502", sha256hex)
 
 	var dlCallParams *sdknodes.CreateStorageDownloadUrlParams
-	listFn := wbDownloadListFn("nfs", wantFilename)
+	listFn := wbDownloadListFn(wantFilename)
 	dlFn := func(_ context.Context, _, _ string, params *sdknodes.CreateStorageDownloadUrlParams) (*sdknodes.CreateStorageDownloadUrlResponse, error) {
 		dlCallParams = params
 		raw := sdknodes.CreateStorageDownloadUrlResponse(`"UPID:pve-node1:00001234:00000001:00000001:download:0:root@pam:"`)
@@ -327,7 +383,7 @@ func TestCreateStemcell_SourceURL_NoSHA256_NoChecksumParams(t *testing.T) {
 		"name":       "ubuntu-jammy",
 		"version":    "1.502",
 		"source_url": "https://example.com/stemcell.qcow2",
-		// sha256 intentionally absent
+		"sha256":     sha256hex,
 	}
 	args := []json.RawMessage{
 		mustMarshalStr(t, "/dev/null"),
@@ -341,11 +397,11 @@ func TestCreateStemcell_SourceURL_NoSHA256_NoChecksumParams(t *testing.T) {
 	if dlCallParams == nil {
 		t.Fatal("CreateStorageDownloadUrl was not called")
 	}
-	if dlCallParams.Checksum != nil {
-		t.Errorf("Checksum = %q; want nil (no sha256 supplied)", *dlCallParams.Checksum)
+	if dlCallParams.Checksum == nil || *dlCallParams.Checksum != sha256hex {
+		t.Errorf("Checksum = %v; want %q", dlCallParams.Checksum, sha256hex)
 	}
-	if dlCallParams.ChecksumAlgorithm != nil {
-		t.Errorf("ChecksumAlgorithm = %q; want nil (no sha256 supplied)", *dlCallParams.ChecksumAlgorithm)
+	if dlCallParams.ChecksumAlgorithm == nil || *dlCallParams.ChecksumAlgorithm != "sha256" {
+		t.Errorf("ChecksumAlgorithm = %v; want \"sha256\"", dlCallParams.ChecksumAlgorithm)
 	}
 }
 
@@ -422,6 +478,8 @@ func TestCreateStemcell_SourceURL_TaskFailure_NonRetriable(t *testing.T) {
 		"name":       "ubuntu-jammy",
 		"version":    "1.503",
 		"source_url": "https://example.com/stemcell.qcow2",
+		// sha256 is now required for server-download (P1.1 tightening).
+		"sha256": "ef0c5d8d1d8ba6e1a8620b2cba931c76e3bc9049395c3e7a5d5733cc3df2983f",
 	}
 	args := []json.RawMessage{
 		mustMarshalStr(t, "/dev/null"),
@@ -502,8 +560,9 @@ func TestCreateStemcell_SourceURL_Dedup_SkipsDownload(t *testing.T) {
 		t.Error("CreateStorageDownloadUrl was called; dedup hit should prevent download")
 	}
 	cid, ok := result.(string)
-	if !ok || !pve.IsTemplateStemcellCID(cid) {
-		t.Errorf("CID = %v (%T); want template:<vmid> string", result, result)
+	wantCID := pve.BuildHeavyStemcellCID("nfs", wantFilename)
+	if !ok || cid != wantCID {
+		t.Errorf("CID = %v (%T); want %q", result, result, wantCID)
 	}
 }
 
@@ -585,6 +644,124 @@ func TestParseStemcellCloudProps_SourceURL_Absent(t *testing.T) {
 	}
 	if p.LightMode() != "" {
 		t.Errorf("LightMode() = %q; want empty", p.LightMode())
+	}
+}
+
+// ============================================================
+// TestCreateStemcell_SourceURL_ReplicateLocal_DownloadsOnOtherNode
+// Verifies that handleStemcellDownloadURL now replicates a
+// server-side download to every other cluster node by re-issuing
+// CreateStorageDownloadUrl there — previously source_url stemcells on
+// node-local storage were stranded on the single node PVE happened to
+// download to.
+// ============================================================
+
+func TestCreateStemcell_SourceURL_ReplicateLocal_DownloadsOnOtherNode(t *testing.T) {
+	t.Parallel()
+
+	const sha256hex = "d0d0cafed0d0cafed0d0cafed0d0cafed0d0cafed0d0cafed0d0cafed0d0cafe"
+	wantFilename := pve.BuildStemcellFilename("ubuntu-jammy", "1.996", sha256hex)
+
+	var dlNodes []string
+	var createNodes []string
+	var replicaTags string
+
+	// Every node reports the volume already present (models both the primary's
+	// pre-dedup hit and, after each replica's own download, its post-download
+	// volume-find) so this test does not have to also fake task-await plumbing
+	// per node.
+	listFn := wbDownloadListFn(wantFilename)
+	dlFn := func(_ context.Context, node, _ string, _ *sdknodes.CreateStorageDownloadUrlParams) (*sdknodes.CreateStorageDownloadUrlResponse, error) {
+		dlNodes = append(dlNodes, node)
+		raw := sdknodes.CreateStorageDownloadUrlResponse(`"UPID:pve-node1:00001234:00000001:00000001:download:0:root@pam:"`)
+		return &raw, nil
+	}
+
+	templateNodes := wbTemplateNodes{
+		listQemuFn: listQemuEmpty(),
+		wbMockNodes: wbMockNodes{
+			listStorageFn: listFn,
+		},
+	}
+	downloadNodes := &wbDownloadNodes{
+		wbTemplateNodes:            templateNodes,
+		createStorageDownloadURLFn: dlFn,
+	}
+	qemuSvc := &wbMockQEMU{
+		createFn: func(_ context.Context, node string, params map[string]any) (string, error) {
+			createNodes = append(createNodes, node)
+			if node == "pve-node2" {
+				replicaTags, _ = params["tags"].(string)
+			}
+			return "", nil
+		},
+	}
+	// Local (non-shared) storage on a two-node cluster — replication must fire.
+	clusterStorage := &wbMockClusterStorage{storageName: "nfs", storageType: "dir", isShared: false}
+	cluster := &wbMockCluster{
+		nodeCount: 2,
+		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+			empty := sdkcluster.ListResourcesResponse{}
+			return &empty, nil
+		},
+		listConfigNodesFn: func(_ context.Context) (*sdkcluster.ListConfigNodesResponse, error) {
+			raw1, _ := json.Marshal(map[string]string{"name": "pve-node1"})
+			raw2, _ := json.Marshal(map[string]string{"name": "pve-node2"})
+			resp := sdkcluster.ListConfigNodesResponse{raw1, raw2}
+			return &resp, nil
+		},
+	}
+	pveClient := &wbTemplateMockClient{
+		wbMockClient: wbMockClient{
+			nodesSvc:          downloadNodes,
+			clusterStorageSvc: clusterStorage,
+			clusterSvc:        cluster,
+			storageSvc:        &wbTemplateStorage{},
+		},
+		qemuSvc:  qemuSvc,
+		tasksSvc: &wbMockTasks{},
+	}
+	deps := Deps{
+		Config: &config.CPIConfig{
+			Node:                           "pve-node1",
+			StemcellStorage:                "nfs",
+			VMStorage:                      "nfs",
+			StemcellTemplateVMIDRangeStart: 30000,
+			StemcellTemplateVMIDRangeEnd:   30999,
+			StemcellReplicateLocal:         true,
+		},
+		PVE:    pveClient,
+		Logger: log.NewNopLogger(),
+	}
+
+	h := HandleCreateStemcell(deps)
+	cp := map[string]any{
+		"name":       "ubuntu-jammy",
+		"version":    "1.996",
+		"source_url": "https://example.com/stemcell.qcow2",
+		"sha256":     sha256hex,
+	}
+	args := []json.RawMessage{
+		mustMarshalStr(t, "/dev/null"),
+		mustMarshalMap(t, cp),
+	}
+
+	_, err := h.Handle(context.Background(), args, jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	foundReplicaDownload := false
+	for _, n := range dlNodes {
+		if n == "pve-node2" {
+			foundReplicaDownload = true
+		}
+	}
+	if !foundReplicaDownload {
+		t.Errorf("CreateStorageDownloadUrl node calls = %v; want a call for replica node pve-node2", dlNodes)
+	}
+	wantNodeTag := pve.ReplicaNodeTagForNode("pve-node2")
+	if !strings.Contains(replicaTags, wantNodeTag) {
+		t.Errorf("replica template tags = %q; want to contain %q", replicaTags, wantNodeTag)
 	}
 }
 

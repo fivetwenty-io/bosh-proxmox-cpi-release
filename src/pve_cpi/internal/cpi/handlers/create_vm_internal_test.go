@@ -424,11 +424,15 @@ var _ pve.Client = (*shapeTestPVEClient)(nil)
 // by resolveVMShape. stemcellStorage is used as the fallback vmStorage when
 // deps.Config.VMStorage is empty.
 func minimalParsedArgs(stemcellStorage string) *createVMParsedArgs {
+	const filename = "bosh-stemcell-test-1.0.qcow2"
 	return &createVMParsedArgs{
-		agentID:      "agent-test",
-		stemcellCID:  stemcellStorage + ":import/bosh-stemcell-test-1.0.qcow2",
-		rawCID:       stemcellStorage + ":import/bosh-stemcell-test-1.0.qcow2",
-		stemcellStor: stemcellStorage,
+		agentID:          "agent-test",
+		stemcellCID:      ":light:" + stemcellStorage + ":import/" + filename,
+		stemcellKind:     pve.StemcellKindLight,
+		stemcellStorage:  stemcellStorage,
+		stemcellVolPath:  "import/" + filename,
+		stemcellFilename: filename,
+		rawVolid:         stemcellStorage + ":import/" + filename,
 		cloudProps: createVMCloudProps{
 			TargetNode: "pve",
 		},
@@ -1266,18 +1270,24 @@ var _ pve.Client = (*rawNodeTestPVE)(nil)
 //   (b) local storage + not found + replicate disabled → Cloud error, no clone.
 //   (c) shared storage                 → guard skipped, clone with primary VMID.
 //
-// "template:6042" is the stemcell CID (IsTemplateStemcellCID true).
-// rawCID is set to a valid old-form CID carrying sha8 "abcd1234" so that
-// extractSHA8FromTemplateCIDContext returns ("abcd1234", true) and the guard
-// fires. This models the operator scenario described in the code comment for
-// extractSHA8FromTemplateCIDContext.
+// buildTemplateGapArgs builds a path-identity stemcell CID whose filename
+// embeds sha8 "abcd1234" (extractSHA8FromParsed returns it), and each test
+// wires templateGapClusterSvc.resourceRows with a single cluster-scoped
+// stemcell-cache template (vmid 6042, node "pve-tmpl") carrying that sha8 tag
+// so resolveTemplateCacheTarget's cluster lookup (FindTemplatesBySHATagCluster)
+// finds it and proceeds into the same-node/shared/replica branches under test.
 
 // templateGapClusterSvc is a minimal cluster.Service for template-gap tests.
 // ListConfigNodes returns a single-node cluster so ValidateTemplateCloneStorage
-// returns immediately (single-node → any storage accepted).
-// All placement methods that would fire return empty/noop.
+// returns immediately (single-node → any storage accepted). ListResources
+// reports resourceRows for a non-VMID-scan query (Type unset) and an empty
+// list for a VMID-collision scan (Type="vm"), so wiring a cache-template
+// fixture never perturbs VMID allocation.
+// All other placement methods that would fire return empty/noop.
 type templateGapClusterSvc struct {
 	sdkcluster.Service // nil — panics on any non-overridden call
+
+	resourceRows []map[string]any
 }
 
 func (c *templateGapClusterSvc) ListConfigNodes(_ context.Context) (*sdkcluster.ListConfigNodesResponse, error) {
@@ -1289,9 +1299,17 @@ func (c *templateGapClusterSvc) ListStatus(_ context.Context) (*sdkcluster.ListS
 	empty := sdkcluster.ListStatusResponse{}
 	return &empty, nil
 }
-func (c *templateGapClusterSvc) ListResources(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
-	empty := sdkcluster.ListResourcesResponse{}
-	return &empty, nil
+func (c *templateGapClusterSvc) ListResources(_ context.Context, params *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+	if (params != nil && params.Type != nil) || len(c.resourceRows) == 0 {
+		empty := sdkcluster.ListResourcesResponse{}
+		return &empty, nil
+	}
+	out := make(sdkcluster.ListResourcesResponse, 0, len(c.resourceRows))
+	for _, row := range c.resourceRows {
+		raw, _ := json.Marshal(row)
+		out = append(out, raw)
+	}
+	return &out, nil
 }
 func (c *templateGapClusterSvc) ListHaStatusCurrent(_ context.Context) (*sdkcluster.ListHaStatusCurrentResponse, error) {
 	empty := sdkcluster.ListHaStatusCurrentResponse{}
@@ -1392,16 +1410,47 @@ func (p *templateGapPVE) Pools() pve.PoolService { return nil }
 
 var _ pve.Client = (*templateGapPVE)(nil)
 
+// templateGapFilename is the stemcell qcow2 filename shared by
+// buildTemplateGapArgs and each test's cluster-cache resource row: its sha8
+// suffix ("abcd1234") is what resolveTemplateCacheTarget matches on.
+const templateGapFilename = "bosh-stemcell-ubuntu-jammy-1.0-abcd1234.qcow2"
+
+// templateGapSHA8 is the content sha8 embedded in templateGapFilename.
+const templateGapSHA8 = "abcd1234"
+
+// templateGapPrimaryVMID is the cluster-cache template VMID every
+// templateGapClusterSvc.resourceRows fixture below uses.
+const templateGapPrimaryVMID = 6042
+
+// templateGapResourceRow returns a GET /cluster/resources row for a frozen
+// stemcell-cache template at (vmid, node) tagged with templateGapSHA8 — the
+// fixture resolveTemplateCacheTarget's cluster-scoped lookup discovers.
+func templateGapResourceRow(vmid int64, node string) map[string]any {
+	return map[string]any{
+		"type":     "qemu",
+		"vmid":     vmid,
+		"node":     node,
+		"name":     "bosh-stemcell-ubuntu-jammy-1-0",
+		"tags":     "bosh-stemcell-sha-" + templateGapSHA8,
+		"template": true,
+	}
+}
+
 // buildTemplateGapArgs returns a (parsed, shape) pair for template-gap tests.
-// stemcellCID is "template:6042". rawCID carries sha8 "abcd1234" so the guard fires.
-// shape.node = vmNode, templateNode = "pve-tmpl" (cross-node).
+// stemcellCID is a path-identity CID whose filename carries sha8 "abcd1234"
+// so extractSHA8FromParsed returns it and the cluster-cache lookup fires.
+// shape.node = vmNode; the cache template's node (set via each test's
+// templateGapClusterSvc.resourceRows) is "pve-tmpl" (cross-node).
 func buildTemplateGapArgs(shared bool) (*createVMParsedArgs, *createVMShape) {
 	parsed := &createVMParsedArgs{
-		stemcellCID: "template:6042",
-		// rawCID carries sha8 "abcd1234" → extractSHA8FromTemplateCIDContext returns it.
-		rawCID:     "local-lvm:import/bosh-stemcell-ubuntu-jammy-1.0-abcd1234.qcow2",
-		cloudProps: createVMCloudProps{},
-		networks:   map[string]createVMNetworkSpec{},
+		stemcellCID:      ":light:local-lvm:import/" + templateGapFilename,
+		stemcellKind:     pve.StemcellKindLight,
+		stemcellStorage:  "local-lvm",
+		stemcellVolPath:  "import/" + templateGapFilename,
+		stemcellFilename: templateGapFilename,
+		rawVolid:         "local-lvm:import/" + templateGapFilename,
+		cloudProps:       createVMCloudProps{},
+		networks:         map[string]createVMNetworkSpec{},
 	}
 	vmStorageType := "lvm"
 	if shared {
@@ -1456,16 +1505,21 @@ func TestAttemptCreateVM_TemplateGap_ReplicaFound(t *testing.T) {
 		cloneErr:     cloneErr,
 	}
 	pveCli := &templateGapPVE{
-		nodes:   ns,
-		cluster: &templateGapClusterSvc{},
+		nodes: ns,
+		// Cluster-scoped cache lookup finds the primary template on
+		// "pve-tmpl" (cross-node from shape.node "pve-vm"); local storage
+		// routes into the per-node replica guard, which listQemuWithReplica
+		// satisfies.
+		cluster: &templateGapClusterSvc{
+			resourceRows: []map[string]any{templateGapResourceRow(templateGapPrimaryVMID, "pve-tmpl")},
+		},
 		storage: &templateGapClusterStorageSvc{shared: false},
 	}
 	deps := Deps{
 		Config: &config.CPIConfig{
-			Node:                 "",
-			StemcellTemplateNode: "pve-tmpl", // cross-node: template on pve-tmpl, VM on pve-vm
-			VMStorage:            "local-lvm",
-			NetworkBridge:        "vmbr0",
+			Node:          "",
+			VMStorage:     "local-lvm",
+			NetworkBridge: "vmbr0",
 		},
 		PVE:    pveCli,
 		Logger: log.NewNopLogger(),
@@ -1513,14 +1567,15 @@ func TestAttemptCreateVM_TemplateGap_NotFound_ReplicateDisabled(t *testing.T) {
 	_ = cloneCalled // checked via absence of error containing "clone-must-not-be-called"
 
 	pveCli := &templateGapPVE{
-		nodes:   ns,
-		cluster: &templateGapClusterSvc{},
+		nodes: ns,
+		cluster: &templateGapClusterSvc{
+			resourceRows: []map[string]any{templateGapResourceRow(templateGapPrimaryVMID, "pve-tmpl")},
+		},
 		storage: &templateGapClusterStorageSvc{shared: false},
 	}
 	deps := Deps{
 		Config: &config.CPIConfig{
 			Node:                   "",
-			StemcellTemplateNode:   "pve-tmpl",
 			VMStorage:              "local-lvm",
 			NetworkBridge:          "vmbr0",
 			StemcellReplicateLocal: false,
@@ -1575,16 +1630,17 @@ func TestAttemptCreateVM_TemplateGap_SharedStorage_NoGuard(t *testing.T) {
 		cloneErr:     cloneErr,
 	}
 	pveCli := &templateGapPVE{
-		nodes:   ns,
-		cluster: &templateGapClusterSvc{},
+		nodes: ns,
+		cluster: &templateGapClusterSvc{
+			resourceRows: []map[string]any{templateGapResourceRow(templateGapPrimaryVMID, "pve-tmpl")},
+		},
 		storage: &templateGapClusterStorageSvc{shared: true}, // shared → guard skipped
 	}
 	deps := Deps{
 		Config: &config.CPIConfig{
-			Node:                 "",
-			StemcellTemplateNode: "pve-tmpl",
-			VMStorage:            "local-lvm",
-			NetworkBridge:        "vmbr0",
+			Node:          "",
+			VMStorage:     "local-lvm",
+			NetworkBridge: "vmbr0",
 		},
 		PVE:    pveCli,
 		Logger: log.NewNopLogger(),
@@ -1614,16 +1670,26 @@ func TestAttemptCreateVM_TemplateGap_SharedStorage_NoGuard(t *testing.T) {
 
 // encodeLocalCID builds an encoded disk CID for a local-backend disk on node.
 // Uses "local-lvm" as the storage pool (the only pool used in these tests).
-func encodeLocalCID(node string) string {
+func encodeLocalCID(t *testing.T, node string) string {
+	t.Helper()
 	const pool = "local-lvm"
 	bareCID := pool + ":vm-9001-disk-0"
-	return pve.EncodeDiskCID(bareCID, &pve.DiskCIDMeta{Pool: pool, Node: node})
+	got, err := pve.EncodeDiskCID(bareCID, &pve.DiskCIDMeta{Pool: pool, Node: node})
+	if err != nil {
+		t.Fatalf("EncodeDiskCID(%q): unexpected error: %v", bareCID, err)
+	}
+	return got
 }
 
 // encodeSharedCID builds an encoded disk CID for a shared-backend disk with an AZ.
-func encodeSharedCID(pool, az string) string {
+func encodeSharedCID(t *testing.T, pool, az string) string {
+	t.Helper()
 	bareCID := pool + ":vm-9001-disk-0"
-	return pve.EncodeDiskCID(bareCID, &pve.DiskCIDMeta{Pool: pool, AZ: az})
+	got, err := pve.EncodeDiskCID(bareCID, &pve.DiskCIDMeta{Pool: pool, AZ: az})
+	if err != nil {
+		t.Fatalf("EncodeDiskCID(%q): unexpected error: %v", bareCID, err)
+	}
+	return got
 }
 
 // sharedStorageSvc reports the test storage as shared (cluster-visible).
@@ -1761,7 +1827,7 @@ func TestDeriveDiskFaultConstraints_BareLegacyCID(t *testing.T) {
 func TestDeriveDiskFaultConstraints_SingleLocalDisk_PinsNode(t *testing.T) {
 	t.Parallel()
 	deps := buildFaultDomainDeps(nil, nil, nil)
-	cid := encodeLocalCID("pve1")
+	cid := encodeLocalCID(t, "pve1")
 	c, err := deriveDiskFaultConstraints(context.Background(), deps, []string{cid})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -1777,8 +1843,8 @@ func TestDeriveDiskFaultConstraints_SingleLocalDisk_PinsNode(t *testing.T) {
 func TestDeriveDiskFaultConstraints_TwoLocalDisks_SameNode_OK(t *testing.T) {
 	t.Parallel()
 	deps := buildFaultDomainDeps(nil, nil, nil)
-	cid1 := encodeLocalCID("pve1")
-	cid2 := encodeLocalCID("pve1")
+	cid1 := encodeLocalCID(t, "pve1")
+	cid2 := encodeLocalCID(t, "pve1")
 	c, err := deriveDiskFaultConstraints(context.Background(), deps, []string{cid1, cid2})
 	if err != nil {
 		t.Fatalf("unexpected error for same-node disks: %v", err)
@@ -1793,8 +1859,8 @@ func TestDeriveDiskFaultConstraints_TwoLocalDisks_SameNode_OK(t *testing.T) {
 func TestDeriveDiskFaultConstraints_TwoLocalDisks_DifferentNodes_Error(t *testing.T) {
 	t.Parallel()
 	deps := buildFaultDomainDeps(nil, nil, nil)
-	cid1 := encodeLocalCID("pve1")
-	cid2 := encodeLocalCID("pve2")
+	cid1 := encodeLocalCID(t, "pve1")
+	cid2 := encodeLocalCID(t, "pve2")
 	_, err := deriveDiskFaultConstraints(context.Background(), deps, []string{cid1, cid2})
 	if err == nil {
 		t.Fatal("expected error for disks on different nodes; got nil")
@@ -1815,7 +1881,7 @@ func TestDeriveDiskFaultConstraints_SharedDisk_AZConstraint(t *testing.T) {
 	t.Parallel()
 	// sharedStorageSvc returns ceph-pool as shared.
 	deps := buildFaultDomainDeps(nil, map[string]bool{"ceph-pool": true}, nil)
-	cid := encodeSharedCID("ceph-pool", "zone-a")
+	cid := encodeSharedCID(t, "ceph-pool", "zone-a")
 	c, err := deriveDiskFaultConstraints(context.Background(), deps, []string{cid})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -1828,15 +1894,15 @@ func TestDeriveDiskFaultConstraints_SharedDisk_AZConstraint(t *testing.T) {
 	}
 }
 
-// TestDeriveDiskFaultConstraints_MixedLegacyAndEncoded verifies that a mix of
-// bare legacy CIDs and encoded CIDs correctly ignores the legacy ones while
+// TestDeriveDiskFaultConstraints_MixedBareAndEncoded verifies that a mix of
+// bare volid strings and encoded CIDs correctly ignores the bare ones while
 // applying constraints from the encoded ones.
-func TestDeriveDiskFaultConstraints_MixedLegacyAndEncoded(t *testing.T) {
+func TestDeriveDiskFaultConstraints_MixedBareAndEncoded(t *testing.T) {
 	t.Parallel()
 	deps := buildFaultDomainDeps(nil, nil, nil)
-	legacyCID := "local-lvm:vm-100-disk-0" // bare — no constraint
-	encodedCID := encodeLocalCID("pve1")   // local — pins node
-	c, err := deriveDiskFaultConstraints(context.Background(), deps, []string{legacyCID, encodedCID})
+	bareCID := "local-lvm:vm-100-disk-0"    // bare volid — no constraint
+	encodedCID := encodeLocalCID(t, "pve1") // local — pins node
+	c, err := deriveDiskFaultConstraints(context.Background(), deps, []string{bareCID, encodedCID})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1935,7 +2001,7 @@ func TestResolveTargetNodeWithRNG_LocalDisk_PinsNode(t *testing.T) {
 			}
 		},
 	)
-	diskCIDs := []string{encodeLocalCID("pve1")}
+	diskCIDs := []string{encodeLocalCID(t, "pve1")}
 	node, err := resolveTargetNodeWithRNG(context.Background(), deps, createVMCloudProps{}, "", diskCIDs, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -1959,8 +2025,8 @@ func TestResolveTargetNodeWithRNG_TwoLocalDisks_SameNode_OK(t *testing.T) {
 		},
 	)
 	diskCIDs := []string{
-		encodeLocalCID("pve1"),
-		encodeLocalCID("pve1"),
+		encodeLocalCID(t, "pve1"),
+		encodeLocalCID(t, "pve1"),
 	}
 	node, err := resolveTargetNodeWithRNG(context.Background(), deps, createVMCloudProps{}, "", diskCIDs, nil, nil)
 	if err != nil {
@@ -1989,8 +2055,8 @@ func TestResolveTargetNodeWithRNG_TwoLocalDisks_DifferentNodes_Error(t *testing.
 		},
 	)
 	diskCIDs := []string{
-		encodeLocalCID("pve1"),
-		encodeLocalCID("pve2"),
+		encodeLocalCID(t, "pve1"),
+		encodeLocalCID(t, "pve2"),
 	}
 	_, err := resolveTargetNodeWithRNG(context.Background(), deps, createVMCloudProps{}, "", diskCIDs, nil, nil)
 	if err == nil {
@@ -2022,7 +2088,7 @@ func TestResolveTargetNodeWithRNG_SharedDisk_AZConstrains_Compatible(t *testing.
 			}
 		},
 	)
-	diskCIDs := []string{encodeSharedCID("ceph-pool", "zone-a")}
+	diskCIDs := []string{encodeSharedCID(t, "ceph-pool", "zone-a")}
 	cp := createVMCloudProps{AvailabilityZones: []string{"zone-a", "zone-b"}}
 	node, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", diskCIDs, nil, nil)
 	if err != nil {
@@ -2051,7 +2117,7 @@ func TestResolveTargetNodeWithRNG_SharedDisk_AZConflicts_Error(t *testing.T) {
 			}
 		},
 	)
-	diskCIDs := []string{encodeSharedCID("ceph-pool", "zone-b")}
+	diskCIDs := []string{encodeSharedCID(t, "ceph-pool", "zone-b")}
 	cp := createVMCloudProps{AvailabilityZone: "zone-a"} // singular AZ — zone-a only
 	_, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", diskCIDs, nil, nil)
 	if err == nil {
@@ -2081,7 +2147,7 @@ func TestResolveTargetNodeWithRNG_LocalDiskPinnedNodeOffline_Error(t *testing.T)
 			}
 		},
 	)
-	diskCIDs := []string{encodeLocalCID("pve1")}
+	diskCIDs := []string{encodeLocalCID(t, "pve1")}
 	_, err := resolveTargetNodeWithRNG(context.Background(), deps, createVMCloudProps{}, "", diskCIDs, nil, nil)
 	if err == nil {
 		t.Fatal("expected error when disk's home node is offline; got nil")
@@ -2133,7 +2199,7 @@ func TestResolveTargetNodeWithRNG_PlacementDisabled_LocalDiskPinsNode(t *testing
 		Logger:   log.NewNopLogger(),
 		Resolver: &staticKindResolver{sharedPools: nil}, // all pools are local
 	}
-	diskCIDs := []string{encodeLocalCID("pve1")}
+	diskCIDs := []string{encodeLocalCID(t, "pve1")}
 	node, err := resolveTargetNodeWithRNG(context.Background(), deps, createVMCloudProps{}, "", diskCIDs, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -2160,7 +2226,7 @@ func TestResolveTargetNodeWithRNG_TargetNodeConflictsLocalDisk_Error(t *testing.
 		Logger:   log.NewNopLogger(),
 		Resolver: &staticKindResolver{sharedPools: nil}, // all pools are local
 	}
-	diskCIDs := []string{encodeLocalCID("pve1")}
+	diskCIDs := []string{encodeLocalCID(t, "pve1")}
 	cp := createVMCloudProps{TargetNode: "pve2"} // conflicts with disk on pve1
 	_, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", diskCIDs, nil, nil)
 	if err == nil {
@@ -2191,7 +2257,7 @@ func TestResolveTargetNodeWithRNG_TargetNodeMatchesLocalDisk_OK(t *testing.T) {
 		Logger:   log.NewNopLogger(),
 		Resolver: &staticKindResolver{sharedPools: nil}, // all pools are local
 	}
-	diskCIDs := []string{encodeLocalCID("pve1")}
+	diskCIDs := []string{encodeLocalCID(t, "pve1")}
 	cp := createVMCloudProps{TargetNode: "pve1"} // consistent with disk
 	node, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", diskCIDs, nil, nil)
 	if err != nil {
@@ -2221,7 +2287,7 @@ func TestResolveTargetNodeWithFallbacks_TargetNodeConflictsLocalDisk_Error(t *te
 		Logger:   log.NewNopLogger(),
 		Resolver: &staticKindResolver{sharedPools: nil}, // all pools are local
 	}
-	diskCIDs := []string{encodeLocalCID("pve1")}
+	diskCIDs := []string{encodeLocalCID(t, "pve1")}
 	cp := createVMCloudProps{TargetNode: "pve2"} // conflicts with disk on pve1
 	_, alts, err := resolveTargetNodeWithFallbacks(context.Background(), deps, cp, "", diskCIDs, nil, nil, 3)
 	if err == nil {
@@ -3720,5 +3786,243 @@ func TestParseSha256SumOutput_AtLimit_Accepted(t *testing.T) {
 	}
 	if got != digest {
 		t.Errorf("digest = %q; want %q", got, digest)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// parseCreateVMArgs: stemcell CID grammar + stemcell_strategy validation
+// ---------------------------------------------------------------------------
+
+// TestParseCreateVMArgs_PathIdentityCID_PopulatesFields verifies that valid
+// ":light:"/":heavy:" path-identity stemcell CIDs populate every new
+// createVMParsedArgs stemcell field.
+func TestParseCreateVMArgs_PathIdentityCID_PopulatesFields(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name        string
+		cid         string
+		wantKind    pve.StemcellKind
+		wantStor    string
+		wantVolPath string
+		wantFile    string
+	}{
+		{
+			name:        "light",
+			cid:         ":light:test-storage:import/bosh-stemcell-foo-1.0-abc12345.qcow2",
+			wantKind:    pve.StemcellKindLight,
+			wantStor:    "test-storage",
+			wantVolPath: "import/bosh-stemcell-foo-1.0-abc12345.qcow2",
+			wantFile:    "bosh-stemcell-foo-1.0-abc12345.qcow2",
+		},
+		{
+			name:        "heavy",
+			cid:         ":heavy:nfs-pool:import/bosh-stemcell-bar-2.0-deadbeef.qcow2",
+			wantKind:    pve.StemcellKindHeavy,
+			wantStor:    "nfs-pool",
+			wantVolPath: "import/bosh-stemcell-bar-2.0-deadbeef.qcow2",
+			wantFile:    "bosh-stemcell-bar-2.0-deadbeef.qcow2",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			args := marshalCreateVMArgs(t, []any{
+				"agent-id-1", tc.cid,
+				map[string]any{"cores": 1, "memory": 512},
+				map[string]any{}, []string{}, map[string]any{},
+			})
+			parsed, err := parseCreateVMArgs(args)
+			if err != nil {
+				t.Fatalf("parseCreateVMArgs(%q): unexpected error: %v", tc.cid, err)
+			}
+			if parsed.stemcellCID != tc.cid {
+				t.Errorf("stemcellCID = %q, want %q (original preserved)", parsed.stemcellCID, tc.cid)
+			}
+			if parsed.stemcellKind != tc.wantKind {
+				t.Errorf("stemcellKind = %q, want %q", parsed.stemcellKind, tc.wantKind)
+			}
+			if parsed.stemcellStorage != tc.wantStor {
+				t.Errorf("stemcellStorage = %q, want %q", parsed.stemcellStorage, tc.wantStor)
+			}
+			if parsed.stemcellVolPath != tc.wantVolPath {
+				t.Errorf("stemcellVolPath = %q, want %q", parsed.stemcellVolPath, tc.wantVolPath)
+			}
+			if parsed.stemcellFilename != tc.wantFile {
+				t.Errorf("stemcellFilename = %q, want %q", parsed.stemcellFilename, tc.wantFile)
+			}
+			wantRawVolid := tc.wantStor + ":" + tc.wantVolPath
+			if parsed.rawVolid != wantRawVolid {
+				t.Errorf("rawVolid = %q, want %q", parsed.rawVolid, wantRawVolid)
+			}
+		})
+	}
+}
+
+// TestParseCreateVMArgs_LegacyCID_Rejected verifies every retired stemcell
+// CID grammar (legacy template CID, old "light:" prefix, bare volid, and
+// integer CIDs) is rejected as a non-retriable CloudError at parse time —
+// pre-release cutover leaves no compat path for any of these forms.
+func TestParseCreateVMArgs_LegacyCID_Rejected(t *testing.T) {
+	t.Parallel()
+
+	cases := []string{
+		"template:6042",
+		"light:test-storage:import/bosh-stemcell-foo-1.0-abc12345.qcow2",
+		"test-storage:import/bosh-stemcell-foo-1.0-abc12345.qcow2",
+		"5042",
+		"",
+	}
+
+	for _, cid := range cases {
+		t.Run(cid, func(t *testing.T) {
+			t.Parallel()
+			args := marshalCreateVMArgs(t, []any{
+				"agent-id-1", cid,
+				map[string]any{"cores": 1, "memory": 512},
+				map[string]any{}, []string{}, map[string]any{},
+			})
+			_, err := parseCreateVMArgs(args)
+			if err == nil {
+				t.Fatalf("parseCreateVMArgs(%q): expected error, got nil", cid)
+			}
+			if !cpierrors.IsType(err, cpierrors.TypeCloud) {
+				t.Errorf("parseCreateVMArgs(%q): expected non-retriable Cloud error, got: %v", cid, err)
+			}
+		})
+	}
+}
+
+// TestParseCreateVMArgs_StemcellStrategy_Validation verifies the per-VM
+// cloud_properties.stemcell_strategy override: "", "template", and "import"
+// are accepted; any other value is a non-retriable CloudError at parse time.
+func TestParseCreateVMArgs_StemcellStrategy_Validation(t *testing.T) {
+	t.Parallel()
+
+	const validCID = ":light:test-storage:import/bosh-stemcell-foo-1.0-abc12345.qcow2"
+
+	cases := []struct {
+		name      string
+		strategy  string
+		wantError bool
+	}{
+		{name: "empty defers to global", strategy: "", wantError: false},
+		{name: "template", strategy: "template", wantError: false},
+		{name: "import", strategy: "import", wantError: false},
+		{name: "invalid value", strategy: "bogus", wantError: true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			args := marshalCreateVMArgs(t, []any{
+				"agent-id-1", validCID,
+				map[string]any{"cores": 1, "memory": 512, "stemcell_strategy": tc.strategy},
+				map[string]any{}, []string{}, map[string]any{},
+			})
+			parsed, err := parseCreateVMArgs(args)
+			if tc.wantError {
+				if err == nil {
+					t.Fatalf("stemcell_strategy=%q: expected error, got nil", tc.strategy)
+				}
+				if !cpierrors.IsType(err, cpierrors.TypeCloud) {
+					t.Errorf("stemcell_strategy=%q: expected non-retriable Cloud error, got: %v", tc.strategy, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("stemcell_strategy=%q: unexpected error: %v", tc.strategy, err)
+			}
+			if parsed.cloudProps.StemcellStrategy != tc.strategy {
+				t.Errorf("parsed StemcellStrategy = %q, want %q", parsed.cloudProps.StemcellStrategy, tc.strategy)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// resolveStemcellStrategy
+// ---------------------------------------------------------------------------
+
+// TestResolveStemcellStrategy_Precedence verifies per-VM cloud_properties
+// override > global config value > "template" default.
+func TestResolveStemcellStrategy_Precedence(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name       string
+		perVM      string
+		globalCfg  string
+		wantResult string
+	}{
+		{name: "per-VM import overrides global template", perVM: "import", globalCfg: "template", wantResult: "import"},
+		{name: "per-VM template overrides global import", perVM: "template", globalCfg: "import", wantResult: "template"},
+		{name: "empty per-VM defers to global import", perVM: "", globalCfg: "import", wantResult: "import"},
+		{name: "empty per-VM and empty global defaults to template", perVM: "", globalCfg: "", wantResult: "template"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := &config.CPIConfig{StemcellStrategy: tc.globalCfg}
+			parsed := &createVMParsedArgs{cloudProps: createVMCloudProps{StemcellStrategy: tc.perVM}}
+			got := resolveStemcellStrategy(cfg, parsed)
+			if got != tc.wantResult {
+				t.Errorf("resolveStemcellStrategy(global=%q, perVM=%q) = %q, want %q",
+					tc.globalCfg, tc.perVM, got, tc.wantResult)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// extractSHA8FromParsed
+// ---------------------------------------------------------------------------
+
+// TestExtractSHA8FromParsed verifies sha8 extraction from the parsed args'
+// rawVolid, including the unextractable case (no valid trailing sha8) that
+// strategy=template treats as "skip the cache lookup, go straight to import".
+func TestExtractSHA8FromParsed(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name     string
+		rawVolid string
+		wantSHA8 string
+		wantOK   bool
+	}{
+		{
+			name:     "valid sha8",
+			rawVolid: "test-storage:import/bosh-stemcell-foo-1.0-abc12345.qcow2",
+			wantSHA8: "abc12345",
+			wantOK:   true,
+		},
+		{
+			name:     "unextractable (custom filename, no sha8 suffix)",
+			rawVolid: "test-storage:import/my-custom-image.qcow2",
+			wantSHA8: "",
+			wantOK:   false,
+		},
+		{
+			name:     "empty rawVolid",
+			rawVolid: "",
+			wantSHA8: "",
+			wantOK:   false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			parsed := &createVMParsedArgs{rawVolid: tc.rawVolid}
+			gotSHA8, gotOK := extractSHA8FromParsed(parsed)
+			if gotOK != tc.wantOK {
+				t.Errorf("extractSHA8FromParsed(rawVolid=%q): ok=%v, want %v", tc.rawVolid, gotOK, tc.wantOK)
+			}
+			if gotSHA8 != tc.wantSHA8 {
+				t.Errorf("extractSHA8FromParsed(rawVolid=%q): sha8=%q, want %q", tc.rawVolid, gotSHA8, tc.wantSHA8)
+			}
+		})
 	}
 }

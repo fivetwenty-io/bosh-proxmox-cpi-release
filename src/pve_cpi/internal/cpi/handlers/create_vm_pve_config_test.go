@@ -354,7 +354,7 @@ func TestPVEConfig_BadKeyRejectedPreClone(t *testing.T) {
 
 	args := marshalCreateVMArgs(t, []any{
 		"agent-id-1",
-		"template:100",
+		":light:test-storage:import/bosh-stemcell-foo-1.0-abc12345.qcow2",
 		map[string]any{
 			"cpu":    1,
 			"memory": 512,
@@ -380,7 +380,7 @@ func TestPVEConfig_EmptyValueRejectedPreClone(t *testing.T) {
 
 	args := marshalCreateVMArgs(t, []any{
 		"agent-id-2",
-		"template:100",
+		":light:test-storage:import/bosh-stemcell-foo-1.0-abc12345.qcow2",
 		map[string]any{
 			"cpu":    1,
 			"memory": 512,

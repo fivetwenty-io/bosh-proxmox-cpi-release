@@ -2,6 +2,7 @@ package handlers_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -107,6 +108,15 @@ func (h *healthNodes) ListStorage(ctx context.Context, node string, p *sdknodes.
 func (h *healthNodes) ListStorageContent(ctx context.Context, node, storage string, p *sdknodes.ListStorageContentParams) (*sdknodes.ListStorageContentResponse, error) {
 	if h.listStorageContentFn != nil {
 		return h.listStorageContentFn(ctx, node, storage, p)
+	}
+	// create_vm's pre-import stemcell-existence check (pve.FindStemcellByFilename)
+	// queries Content="import"; report the suite's standard stemcell fixture
+	// (testStemcellCID) as present so health-gate tests need no configuration
+	// for it, mirroring vmMockNodes.ListStorageContent's default in create_vm_test.go.
+	if p != nil && p.Content != nil && *p.Content == "import" {
+		raw, _ := json.Marshal(map[string]string{"volid": storage + ":import/" + testCreateVMStemcellFilename})
+		resp := sdknodes.ListStorageContentResponse{raw}
+		return &resp, nil
 	}
 	empty := sdknodes.ListStorageContentResponse{}
 	return &empty, nil

@@ -52,6 +52,13 @@ type Deps struct {
 	// unset), so this field is opt-in and does not change behavior for any
 	// deployment or test that does not wire it.
 	Overrides *RequestOverrideRuntime
+	// RequestDirectorUUID is the calling BOSH director's UUID from the
+	// JSON-RPC request context, stamped by WithRequestOverrides so helpers
+	// that only receive Deps (parker provenance, prune scoping) can attribute
+	// work to the requesting director without threading jsonrpc.Context
+	// through every signature. Empty when the caller sent no context
+	// (hand-rolled CPI calls, some tests).
+	RequestDirectorUUID string
 }
 
 // Log returns the per-request, span-correlated logger stored in ctx (attached

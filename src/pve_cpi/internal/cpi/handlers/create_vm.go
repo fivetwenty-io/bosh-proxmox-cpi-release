@@ -93,14 +93,21 @@ const nicTypeDynamic = "dynamic"
 // Compared case-insensitively against spec.Type throughout the handler.
 const nicTypeManual = "manual"
 
-// nicCPKeyBridge, nicCPKeyModel, and nicCPKeyFirewall are the cloud_properties
-// map keys used in both per-NIC network specs and VM-level network_defaults
-// (§7.34). Defined as constants to satisfy goconst (>3 occurrences across the
-// package) and to make the key contract explicit.
+// nicCPKeyBridge, nicCPKeyModel, nicCPKeyFirewall, nicCPKeyVLAN, and
+// nicCPKeyMTU are the cloud_properties map keys used in both per-NIC network
+// specs and VM-level network_defaults (§7.34). Defined as constants to
+// satisfy goconst (>3 occurrences across the package) and to make the key
+// contract explicit. vlan (int, 1-4094) appends a plain 802.1Q tag= to the
+// NIC's net{i} string for an operator-managed trunk bridge — no SDN
+// involvement. mtu (int, 1 = inherit bridge MTU, or 576-65520) is
+// virtio-model-only and wins over the automatic vnet-derived mtu=1
+// inheritance below.
 const (
 	nicCPKeyBridge   = "bridge"
 	nicCPKeyModel    = "model"
 	nicCPKeyFirewall = "firewall"
+	nicCPKeyVLAN     = "vlan"
+	nicCPKeyMTU      = "mtu"
 )
 
 // diskKeyVirtio0 is the PVE VM config key for the primary root disk under the
@@ -229,12 +236,12 @@ type createVMCloudProps struct {
 	//
 	//   NetworkDefaults[key] > per-NIC spec.CloudProperties[key] > resolver default
 	//
-	// Supported keys: "bridge" (string), "model" (string), "firewall" (bool).
+	// Supported keys: "bridge" (string), "model" (string), "firewall" (bool),
+	// "vlan" (int, 1-4094 — plain 802.1Q tag=, no SDN involvement), "mtu"
+	// (int, 1 = inherit bridge MTU or 576-65520, virtio-model-only).
 	// Unknown keys are ignored gracefully — this is a cloud_property map, not
 	// CPI config, so strict validation does not apply here.
 	// Absent map or absent key → unchanged (byte-identical to pre-override behavior).
-	// Extensibility: add new NIC attributes here as PVE support grows (e.g. mtu,
-	// vlan_tag) without touching the resolver or per-NIC spec parsing.
 	NetworkDefaults map[string]any `json:"network_defaults,omitempty"`
 	// Encrypted is the per-VM opt-in for encrypted-storage placement on the
 	// ephemeral disk (§7.49). When *true, ephemeral disk storage-tier selection
@@ -266,6 +273,13 @@ type createVMCloudProps struct {
 	// isolation. Nil or empty → byte-identical (no PCI filter, no hostpciN
 	// config, no strict pin).
 	PCIPassthroughs []PCIPassthrough `json:"pci_passthroughs,omitempty"`
+	// StemcellStrategy overrides the global pve.stemcell_strategy for this VM's
+	// stemcell resolution. "" (default) defers to the global config value
+	// (itself defaulting to "template"). "template" clones the per-cluster
+	// stemcell cache template; "import" imports the stemcell qcow2 directly
+	// into the VM's root disk. Any other value is a validation error at parse
+	// time, before any PVE mutation.
+	StemcellStrategy string `json:"stemcell_strategy,omitempty"`
 	// AdvertisedRoutes lists SDN vnet subnets to create for this VM
 	// post-clone. Each entry names a vnet and a destination CIDR; the CPI
 	// calls CreateSdnVnetsSubnets then applySDN to commit the subnet to the
@@ -296,11 +310,31 @@ type createVMNetworkSpec struct {
 
 // createVMParsedArgs holds the validated, unmarshalled create_vm arguments.
 type createVMParsedArgs struct {
-	agentID      string
-	stemcellCID  string // original (may have "light:" prefix)
-	rawCID       string // stripped of "light:" prefix
-	stemcellStor string // storage component of rawCID
-	cloudProps   createVMCloudProps
+	agentID string
+	// stemcellCID is the original path-identity CID as received
+	// (":light:<storage>:import/<file>" or ":heavy:<storage>:import/<file>").
+	stemcellCID string
+	// stemcellKind is the decoded CID family (StemcellKindLight/StemcellKindHeavy).
+	// Purely informational here — create_vm treats both kinds identically;
+	// delete_stemcell and pve-cid are what act on the distinction.
+	stemcellKind pve.StemcellKind
+	// stemcellStorage is the PVE storage pool name decoded from the CID. Used
+	// both as the import-from= source storage and, when deps.Config.VMStorage
+	// is empty, as the fallback destination vm_storage (see
+	// resolveVMShapeStorage).
+	stemcellStorage string
+	// stemcellVolPath is the "import/<file>" tail decoded from the CID — the
+	// PVE volume path component (without the storage prefix).
+	stemcellVolPath string
+	// stemcellFilename is the bare qcow2 filename (stemcellVolPath with the
+	// "import/" prefix stripped), used for sha8 extraction and the
+	// pre-import existence check.
+	stemcellFilename string
+	// rawVolid is "<storage>:import/<file>" — the bare PVE volid PVE's
+	// import-from= parameter consumes. Derived once from stemcellStorage +
+	// stemcellVolPath.
+	rawVolid   string
+	cloudProps createVMCloudProps
 	// cloudPropsMap is the raw map decoded from args[2] (same JSON as
 	// cloudProps). It carries the vm_type / disk_type selector keys and any
 	// extra cloud_properties (e.g. storage_pool) that are not modelled as
@@ -405,13 +439,14 @@ type createVMShape struct {
 // Arguments (positional, all required):
 //
 //	[0] agent_id      string
-//	[1] stemcell_cid  string — CID returned by create_stemcell. Supported formats:
-//	                    "template:<vmid>"           — new template CID; VM is created by cloning the template.
-//	                    "<storage>:import/<file>"   — pre-upgrade volume CID; the CPI checks for a matching
-//	                                                  template by sha8 tag and clones it if found, otherwise
-//	                                                  falls back to import-from= (slow path).
-//	                    "light:<storage>:import/<file>" — pre-upgrade light CID; same opportunistic logic as above.
-//	[2] cloud_props   map     (cores, sockets, memory, vm_disk_format, target_node, ...)
+//	[1] stemcell_cid  string — CID returned by create_stemcell. Path-identity grammar only:
+//	                    ":light:<storage>:import/<file>" — operator-managed qcow2 (the CPI never deletes it).
+//	                    ":heavy:<storage>:import/<file>" — CPI-uploaded qcow2.
+//	                    The qcow2's content sha8 (embedded in <file>) is looked up against the per-cluster
+//	                    stemcell-cache templates create_stemcell maintains; strategy=template (default) clones
+//	                    a cache hit and falls back to strategy=import on a cache miss or unextractable sha8.
+//	                    See resolveStemcellStrategy / attemptStemcellTemplateClone / attemptStemcellImport.
+//	[2] cloud_props   map     (cores, sockets, memory, vm_disk_format, target_node, stemcell_strategy, ...)
 //	[3] networks      map[name]NetworkSpec
 //	[4] disk_cids     []string  (persistent disks to pre-attach)
 //	[5] env           map[string]any
@@ -1021,34 +1056,20 @@ func parseCreateVMArgs(args []json.RawMessage) (*createVMParsedArgs, error) {
 	if err := json.Unmarshal(args[1], &stemcellCID); err != nil {
 		return nil, cpierrors.Cloud("create_vm: parse stemcell_cid: %s", err.Error())
 	}
-	// Strip the "light:" prefix if present. Light stemcell CIDs are
-	// "light:<storage>:import/<file>"; PVE's import-from= accepts only the
-	// underlying "<storage>:import/<file>" volid. The light: marker exists so
-	// delete_stemcell can recognize and no-op these CIDs without consulting
-	// any external state.
-	rawCID := pve.StripLightPrefix(stemcellCID)
-	// stemcellStor is used as a fallback VMStorage when deps.Config.VMStorage
-	// is empty (see VMStorage resolution below). For template CIDs ("template:<vmid>")
-	// there is no storage component — stemcellStor is left empty and VMStorage
-	// must be set in config or cloud_properties.
-	var stemcellStor string
-	if pve.IsTemplateStemcellCID(stemcellCID) {
-		// Template CIDs carry only a VMID; validate the format now so errors
-		// surface at parse time rather than at candidate-allocation time.
-		if _, err := pve.ParseTemplateStemcellCID(stemcellCID); err != nil {
-			return nil, cpierrors.Cloud("create_vm: invalid template stemcell_cid %q: %s", stemcellCID, err.Error())
-		}
-		// stemcellStor stays "" — VMStorage from config or resolveVMShapeStorage
-		// must supply the target storage. Template clones carry no import-from path.
-	} else {
-		// Old-form CID: "light:<storage>:import/<file>" or "<storage>:import/<file>".
-		// ParseStemcellCID guarantees a non-empty storage component when err == nil.
-		var err error
-		stemcellStor, _, err = pve.ParseStemcellCID(rawCID)
-		if err != nil {
-			return nil, cpierrors.Cloud("create_vm: invalid stemcell_cid %q: %s", stemcellCID, err.Error())
-		}
+	// Path-identity grammar only: ":light:<storage>:import/<file>" or
+	// ":heavy:<storage>:import/<file>". Every retired form (legacy
+	// "template:<vmid>", old "light:..."/bare "<storage>:import/<file>",
+	// integer CIDs) is rejected here — ParseStemcellPathCID's error text
+	// explains the expected grammar.
+	stemcellKind, stemcellStorage, stemcellVolPath, err := pve.ParseStemcellPathCID(stemcellCID)
+	if err != nil {
+		return nil, cpierrors.Cloud("create_vm: invalid stemcell_cid: %s", err.Error())
 	}
+	// ParseStemcellPathCID guarantees stemcellVolPath starts with "import/".
+	stemcellFilename := strings.TrimPrefix(stemcellVolPath, "import/")
+	// rawVolid is the bare "<storage>:import/<file>" volid PVE's import-from=
+	// parameter consumes.
+	rawVolid := stemcellStorage + ":" + stemcellVolPath
 
 	var cloudProps createVMCloudProps
 	if err := json.Unmarshal(args[2], &cloudProps); err != nil {
@@ -1068,6 +1089,12 @@ func parseCreateVMArgs(args []json.RawMessage) (*createVMParsedArgs, error) {
 	// Validate advertised_routes CIDR destinations and vnet names pre-clone so
 	// malformed entries never reach the SDN API and no orphan VM is produced.
 	if err := validateAdvertisedRoutes(cloudProps.AdvertisedRoutes); err != nil {
+		return nil, err
+	}
+	// Validate the per-VM stemcell_strategy override pre-clone. Empty defers
+	// to the global config default; any other value must be "template" or
+	// "import".
+	if err := validateStemcellStrategyCloudProp(cloudProps.StemcellStrategy); err != nil {
 		return nil, err
 	}
 
@@ -1123,15 +1150,18 @@ func parseCreateVMArgs(args []json.RawMessage) (*createVMParsedArgs, error) {
 	}
 
 	return &createVMParsedArgs{
-		agentID:       agentID,
-		stemcellCID:   stemcellCID,
-		rawCID:        rawCID,
-		stemcellStor:  stemcellStor,
-		cloudProps:    cloudProps,
-		cloudPropsMap: cloudPropsMap,
-		networks:      networks,
-		diskCIDs:      diskCIDs,
-		env:           env,
+		agentID:          agentID,
+		stemcellCID:      stemcellCID,
+		stemcellKind:     stemcellKind,
+		stemcellStorage:  stemcellStorage,
+		stemcellVolPath:  stemcellVolPath,
+		stemcellFilename: stemcellFilename,
+		rawVolid:         rawVolid,
+		cloudProps:       cloudProps,
+		cloudPropsMap:    cloudPropsMap,
+		networks:         networks,
+		diskCIDs:         diskCIDs,
+		env:              env,
 	}, nil
 }
 
@@ -1331,6 +1361,7 @@ func allocateVM(
 		shape.maxAttempts,
 		pve.WithRange(shape.rangeStart, deps.Config.VMIDRangeEnd),
 		pve.WithStorageScan(shape.node, shape.vmStorage),
+		pve.WithExtraStorageScan(shape.node, isoStorageScanTarget(deps, shape.vmStorage)),
 		pve.WithBackoffFunc(newCreateVMRetryBackoff(
 			deps.Config.RetryStorageImport(), deps.Config.RetryVMIDAlloc())),
 	)
@@ -1371,17 +1402,20 @@ func allocateVMForFallback(
 		shape.maxAttempts,
 		pve.WithRange(shape.rangeStart, deps.Config.VMIDRangeEnd),
 		pve.WithStorageScan(shape.node, shape.vmStorage),
+		pve.WithExtraStorageScan(shape.node, isoStorageScanTarget(deps, shape.vmStorage)),
 		pve.WithBackoffFunc(newCreateVMRetryBackoff(
 			deps.Config.RetryStorageImport(), deps.Config.RetryVMIDAlloc())),
 	)
 	return vmid, err
 }
 
-// attemptCreateVM builds the create params for one VMID candidate, then either
-// clones from a template (when stemcellCID is a "template:<vmid>" CID) or calls
-// QEMU.Create with import-from= (old-form CID). On retryable failures it logs
-// and optionally cleans up the candidate VMID before returning the error so
-// AllocateWithRetry can retry with a fresh candidate.
+// attemptCreateVM builds the create params for one VMID candidate, then
+// either clones from the stemcell's per-cluster cache template
+// (strategy=template, the default) or calls QEMU.Create with import-from=
+// (strategy=import, or the strategy=template fallback on a cache miss or
+// unextractable sha8). On retryable failures it logs and optionally cleans
+// up the candidate VMID before returning the error so AllocateWithRetry can
+// retry with a fresh candidate.
 func attemptCreateVM(
 	ctx context.Context,
 	deps Deps,
@@ -1405,134 +1439,202 @@ func attemptCreateVM(
 		return pciErr
 	}
 
-	// --- Template-clone path ---
-	if pve.IsTemplateStemcellCID(parsed.stemcellCID) {
-		templateVMID, err := pve.ParseTemplateStemcellCID(parsed.stemcellCID)
-		if err != nil {
-			// Should never happen: parsing was validated in parseCreateVMArgs.
-			return cpierrors.Wrap(err, "create_vm: parse template CID")
+	// --- Stemcell strategy dispatch ---
+	//
+	// strategy=template (default): clone the per-cluster stemcell-cache
+	// template found by content sha8. A cache miss or an unextractable sha8
+	// falls back to strategy=import — create_vm NEVER builds a template
+	// itself (that stays create_stemcell's job; the cache is read-only from
+	// here), so there is nothing new to roll back on a fallback.
+	// strategy=import: import-from= the stemcell qcow2 directly.
+	strategy := resolveStemcellStrategy(deps.Config, parsed)
+	if strategy == config.StemcellStrategyTemplate {
+		handled, cloneErr := attemptStemcellTemplateClone(ctx, deps, logger, parsed, shape, candidate, candidateName)
+		if handled {
+			return cloneErr
 		}
+	}
+	return attemptStemcellImport(ctx, deps, logger, parsed, shape, candidate, candidateName)
+}
 
-		// Compute the node that hosts the template. StemcellTemplateNode, when
-		// set, is where create_stemcell built the template; fall back to the
-		// general config.Node. The clone task is submitted to templateNode;
-		// Target= redirects the resulting VM to shape.node (cross-node shared).
-		templateNode := deps.Config.StemcellTemplateNode
-		if templateNode == "" {
-			templateNode = deps.Config.Node
-		}
-
-		// Template-gap guard: when the chosen VM node differs from the template
-		// node and the stemcell storage is local (not shared), the template is
-		// not accessible from shape.node. Check for a per-node replica first;
-		// if none exists, return a clear actionable error instead of letting the
-		// clone task fail with an opaque PVE error.
-		effectiveTemplateVMID := templateVMID
-		effectiveTemplateNode := templateNode
-		if shape.node != "" && shape.node != templateNode {
-			if needsReplicaCheck(ctx, deps, shape.vmStorage) {
-				// Extract sha8 from the stemcell CID to look up a replica.
-				sha8, hasSHA := extractSHA8FromTemplateCIDContext(parsed)
-				if hasSHA && sha8 != "" {
-					replicaVMID, found, lookupErr := pve.ResolveTemplateVMIDForNode(ctx, deps.PVE, shape.node, sha8)
-					switch {
-					case lookupErr != nil:
-						logger.Warn("create_vm: template replica lookup failed (continuing with primary)",
-							log.String("node", shape.node),
-							log.String("sha8", sha8),
-							log.Err(lookupErr),
-						)
-					case found:
-						logger.Info("create_vm: using per-node template replica",
-							log.String("node", shape.node),
-							log.Int("replica_vmid", replicaVMID),
-							log.String("sha8", sha8),
-						)
-						effectiveTemplateVMID = int64(replicaVMID)
-						effectiveTemplateNode = shape.node
-					case !deps.Config.StemcellReplicateLocal:
-						// No replica found and replication is disabled — fail fast with
-						// an actionable message rather than letting the clone fail opaquely.
-						return cpierrors.Cloud(
-							"create_vm: stemcell template (vmid=%d sha8=%s) is not present on node %q "+
-								"and stemcell_replicate_local is disabled; "+
-								"either enable stemcell_replicate_local to allow per-node replication, "+
-								"or use shared storage for the stemcell pool (%s)",
-							templateVMID, sha8, shape.node, shape.vmStorage,
-						)
-					}
-				}
-			}
-		}
-
-		cloneErr := cloneFromTemplate(ctx, deps, logger, shape, candidate, candidateName, effectiveTemplateNode, effectiveTemplateVMID)
-		if cloneErr != nil {
-			// Classify for retry: VMID conflicts and transient transport faults are
-			// retryable — they use the same retry classification as the import path.
-			return handleCloneError(ctx, deps, logger, shape.node, candidate, cloneErr)
-		}
-
-		logger.Info("create_vm: vm cloned from template",
-			log.Int("vmid_attempted", candidate),
-			log.Int64("template_vmid", effectiveTemplateVMID),
-			log.String("template_node", effectiveTemplateNode),
+// attemptStemcellTemplateClone attempts the strategy=template dispatch: find
+// a cluster-scoped stemcell-cache template matching the stemcell's content
+// sha8 and clone it.
+//
+// Returns handled=false (nil error) when the caller must fall back to
+// strategy=import — either the sha8 could not be extracted from the
+// stemcell's filename, or no cache template exists anywhere in the cluster
+// (create_stemcell builds the cache; it may have been manually deleted).
+//
+// Returns handled=true with a non-nil error for a real, actionable failure
+// (a local-storage replica gap with replication disabled, or the clone
+// attempt itself failing) that must propagate without an import fallback.
+//
+// Returns handled=true with a nil error when the clone — and its post-clone
+// config (pve_config passthrough + PCI hostpciN) — succeeded.
+func attemptStemcellTemplateClone(
+	ctx context.Context,
+	deps Deps,
+	logger *log.Logger,
+	parsed *createVMParsedArgs,
+	shape *createVMShape,
+	candidate int,
+	candidateName string,
+) (handled bool, err error) {
+	sha8, hasSHA := extractSHA8FromParsed(parsed)
+	if !hasSHA {
+		logger.Warn("create_vm: stemcell filename sha8 unextractable; strategy=template falls back to import",
+			log.String("stemcell_filename", parsed.stemcellFilename),
 		)
-		// Apply post-clone config (pve_config passthrough + PCI hostpciN).
-		// Both steps are no-ops when the respective cloud_properties are absent.
-		return applyPostCloneConfig(ctx, deps, shape.node, candidate, parsed, logger)
+		return false, nil
 	}
 
-	// --- Old-form CID: opportunistic template lookup before import-from ---
-	//
-	// If an existing template carries a matching sha tag, clone it
-	// (fast path). If not found or lookup fails, fall through to import-from
-	// (slow but correct). create_vm NEVER builds a template here — read-only
-	// lookup only.
-	//
-	// The sha8 lives in the filename: bosh-stemcell-<name>-<version>-<sha8>.qcow2.
-	// We extract it from the last "-"-separated segment before ".qcow2". If the
-	// filename does not match that pattern (pre-upgrade or custom stems), skip
-	// lookup silently.
-	if sha8, ok := extractSHA8FromFilenameInCID(parsed.rawCID); ok {
-		templateNode := deps.Config.StemcellTemplateNode
-		if templateNode == "" {
-			templateNode = deps.Config.Node
-		}
-		templateVMID, found, lookupErr := pve.FindTemplateBySHATag(ctx, deps.PVE, templateNode, sha8)
-		if lookupErr != nil {
-			// Lookup failure is non-fatal: log and fall through to import-from.
-			// Do NOT fail create_vm on a read-only lookup error — the safe path
-			// (import-from) is always available.
-			logger.Warn("create_vm: template SHA lookup failed, falling back to import-from",
-				log.String("sha8", sha8),
-				log.String("template_node", templateNode),
-				log.Err(lookupErr),
-			)
-		} else if found {
-			// A pre-built template matches this stemcell content — clone it.
-			logger.Info("create_vm: opportunistic template found by sha tag, cloning",
-				log.String("sha8", sha8),
-				log.Int64("template_vmid", templateVMID),
-				log.String("template_node", templateNode),
-			)
-			cloneErr := cloneFromTemplate(ctx, deps, logger, shape, candidate, candidateName, templateNode, templateVMID)
-			if cloneErr != nil {
-				return handleCloneError(ctx, deps, logger, shape.node, candidate, cloneErr)
-			}
-			logger.Info("create_vm: vm cloned from opportunistic template",
-				log.Int("vmid_attempted", candidate),
-				log.Int64("template_vmid", templateVMID),
-				log.String("template_node", templateNode),
-			)
-			// Apply post-clone config (pve_config passthrough + PCI hostpciN).
-			return applyPostCloneConfig(ctx, deps, shape.node, candidate, parsed, logger)
-		}
-		// !found → fall through to import-from below.
+	templateVMID, templateNode, found, resolveErr := resolveTemplateCacheTarget(ctx, deps, logger, shape, sha8)
+	if resolveErr != nil {
+		return true, resolveErr
+	}
+	if !found {
+		logger.Warn("create_vm: stemcell cache template missing for sha8; falling back to direct import"+
+			" (create_stemcell builds the cache; it may have been manually deleted)",
+			log.String("sha8", sha8),
+		)
+		return false, nil
 	}
 
-	// --- Import-from path (old-form CID: light: or plain <storage>:import/<file>) ---
+	cloneErr := cloneFromTemplate(ctx, deps, logger, shape, candidate, candidateName, templateNode, templateVMID)
+	if cloneErr != nil {
+		// Classify for retry: VMID conflicts and transient transport faults are
+		// retryable — they use the same retry classification as the import path.
+		return true, handleCloneError(ctx, deps, logger, shape.node, candidate, cloneErr)
+	}
+
+	logger.Info("create_vm: vm cloned from stemcell cache template",
+		log.Int("vmid_attempted", candidate),
+		log.Int64("template_vmid", templateVMID),
+		log.String("template_node", templateNode),
+		log.String("sha8", sha8),
+	)
+	// Apply post-clone config (pve_config passthrough + PCI hostpciN). Both
+	// steps are no-ops when the respective cloud_properties are absent.
+	return true, applyPostCloneConfig(ctx, deps, shape.node, candidate, parsed, logger)
+}
+
+// resolveTemplateCacheTarget resolves which cluster-scoped stemcell-cache
+// template to clone for strategy=template.
+//
+// Selection order:
+//  1. A template on shape.node — used directly, no cross-node concerns.
+//  2. No template on shape.node, but the stemcell storage is shared across
+//     the cluster (needsReplicaCheck reports false) — any cluster template
+//     works; cloneFromTemplate handles the cross-node Target= redirect.
+//  3. No template on shape.node and storage is local (needsReplicaCheck
+//     reports true) — consult the per-node replica tag
+//     (pve.ResolveTemplateVMIDForNode). A replica match wins. Otherwise,
+//     when stemcell_replicate_local is disabled, an actionable error is
+//     returned — replicating the pre-rewrite behavior at this branch point.
+//     When enabled but no replica exists yet, falls through to the cluster
+//     primary (lowest VMID) so cloneFromTemplate's own cross-node
+//     local-storage guard produces the (more specific) rejection.
+//
+// Returns found=false (nil error) when no cache template exists anywhere in
+// the cluster for sha8 — a true cache miss; the caller falls back to
+// strategy=import. A non-nil error is a real actionable failure that must
+// propagate, not fall back.
+func resolveTemplateCacheTarget(
+	ctx context.Context,
+	deps Deps,
+	logger *log.Logger,
+	shape *createVMShape,
+	sha8 string,
+) (templateVMID int64, templateNode string, found bool, err error) {
+	refs, listErr := pve.FindTemplatesBySHATagCluster(ctx, deps.PVE, sha8)
+	if listErr != nil {
+		// Lookup failure is non-fatal: log and fall through to import-from.
+		// Do NOT fail create_vm on a read-only lookup error — the safe path
+		// (import-from) is always available.
+		logger.Warn("create_vm: cluster stemcell-cache template lookup failed, falling back to import-from",
+			log.String("sha8", sha8),
+			log.Err(listErr),
+		)
+		return 0, "", false, nil
+	}
+	if len(refs) == 0 {
+		return 0, "", false, nil
+	}
+
+	// Prefer a template already on shape.node.
+	for _, ref := range refs {
+		if ref.Node == shape.node {
+			return ref.VMID, ref.Node, true, nil
+		}
+	}
+
+	// No template on shape.node. Shared stemcell storage: any cluster
+	// template works — clone with a cross-node Target= redirect.
+	if !needsReplicaCheck(ctx, deps, shape.vmStorage) {
+		primary := refs[0]
+		return primary.VMID, primary.Node, true, nil
+	}
+
+	// Local storage, no template on shape.node: consult the per-node replica
+	// guard exactly as the pre-rewrite template-CID path did.
+	replicaVMID, replicaFound, lookupErr := pve.ResolveTemplateVMIDForNode(ctx, deps.PVE, shape.node, sha8)
+	if lookupErr != nil {
+		logger.Warn("create_vm: template replica lookup failed (continuing with cluster primary)",
+			log.String("node", shape.node),
+			log.String("sha8", sha8),
+			log.Err(lookupErr),
+		)
+		primary := refs[0]
+		return primary.VMID, primary.Node, true, nil
+	}
+	if replicaFound {
+		logger.Info("create_vm: using per-node template replica",
+			log.String("node", shape.node),
+			log.Int("replica_vmid", replicaVMID),
+			log.String("sha8", sha8),
+		)
+		return int64(replicaVMID), shape.node, true, nil
+	}
+	if !deps.Config.StemcellReplicateLocal {
+		// No replica found and replication is disabled — fail fast with an
+		// actionable message rather than letting the clone fail opaquely.
+		return 0, "", false, cpierrors.Cloud(
+			"create_vm: stemcell cache template for sha8=%s not present on node %q "+
+				"and stemcell storage %q is local; "+
+				"either enable stemcell_replicate_local to allow per-node replication, "+
+				"or use shared storage for the stemcell pool",
+			sha8, shape.node, shape.vmStorage,
+		)
+	}
+	// Replication enabled but no replica exists for this node yet: fall
+	// through to the cluster primary (lowest VMID, deterministic) so
+	// cloneFromTemplate's own cross-node local-storage guard produces the
+	// rejection — mirrors the pre-rewrite behavior, where this same
+	// configuration reached the clone attempt via the primary template.
+	primary := refs[0]
+	return primary.VMID, primary.Node, true, nil
+}
+
+// attemptStemcellImport imports the stemcell qcow2 directly into the VM's
+// root disk via PVE's import-from= directive. Used for strategy=import and
+// as the strategy=template fallback (unextractable sha8 or an empty cluster
+// cache).
+func attemptStemcellImport(
+	ctx context.Context,
+	deps Deps,
+	logger *log.Logger,
+	parsed *createVMParsedArgs,
+	shape *createVMShape,
+	candidate int,
+	candidateName string,
+) error {
+	if existErr := verifyStemcellQcow2Exists(ctx, deps, logger, shape.node, parsed); existErr != nil {
+		return existErr
+	}
+
 	rootDiskVal := fmt.Sprintf("%s:0,import-from=%s,format=%s,size=%dG",
-		shape.vmStorage, parsed.rawCID, shape.vmDiskFormat, shape.rootDiskGiB)
+		shape.vmStorage, parsed.rawVolid, shape.vmDiskFormat, shape.rootDiskGiB)
 	// Append resolved per-disk performance options (iothread, cache, etc.) when
 	// any are set. buildDiskOptStr treats the whole rootDiskVal string as the bare
 	// volid prefix and appends ",key=value" pairs in deterministic alpha order.
@@ -1542,17 +1644,17 @@ func attemptCreateVM(
 	}
 
 	createParams := map[string]any{
-		metadataKeyVMID:   candidate,
-		metadataKeyName:   candidateName,
-		"memory":          shape.memMiB,
-		"cores":           shape.cores,
-		"ostype":          osTypeLinux26,
-		"scsihw":          shape.scsihw,
-		shape.rootDiskKey: rootDiskVal,
-		"boot":            "order=" + shape.rootDiskKey,
-		"agent":           "enabled=1",
-		"hotplug":         shape.hotplug,
-		"onboot":          0,
+		metadataKeyVMID:    candidate,
+		metadataKeyName:    candidateName,
+		pveConfigKeyMemory: shape.memMiB,
+		"cores":            shape.cores,
+		"ostype":           osTypeLinux26,
+		"scsihw":           shape.scsihw,
+		shape.rootDiskKey:  rootDiskVal,
+		"boot":             "order=" + shape.rootDiskKey,
+		"agent":            "enabled=1",
+		"hotplug":          shape.hotplug,
+		"onboot":           0,
 		// Every BOSH VM is headless: the emulated USB tablet exists only to
 		// smooth mouse tracking for an interactive VNC/SPICE console and costs
 		// 2-3% CPU at scale for no benefit on a VM nobody looks at. No
@@ -1591,6 +1693,73 @@ func attemptCreateVM(
 	)
 	// Apply post-clone config (pve_config passthrough + PCI hostpciN).
 	return applyPostCloneConfig(ctx, deps, shape.node, candidate, parsed, logger)
+}
+
+// verifyStemcellQcow2Exists confirms the stemcell's qcow2 file is present on
+// node's copy of parsed.stemcellStorage before an import-from= is submitted,
+// producing a crisp, actionable error instead of an opaque PVE import
+// failure.
+//
+// The existence check itself is best-effort: a lookup failure (API/transport
+// error) is logged and the import proceeds — PVE surfaces its own error if
+// the file is genuinely missing, and a lookup hiccup here must never hard-
+// fail create_vm. Only a confirmed absence (a successful lookup that found no
+// matching volid) is a hard failure.
+func verifyStemcellQcow2Exists(
+	ctx context.Context,
+	deps Deps,
+	logger *log.Logger,
+	node string,
+	parsed *createVMParsedArgs,
+) error {
+	volid, findErr := pve.FindStemcellByFilename(ctx, deps.PVE, node, parsed.stemcellStorage, parsed.stemcellFilename)
+	if findErr != nil {
+		logger.Warn("create_vm: stemcell existence pre-check failed (continuing with import)",
+			log.String("storage", parsed.stemcellStorage),
+			log.String("filename", parsed.stemcellFilename),
+			log.Err(findErr),
+		)
+		return nil
+	}
+	if volid == "" {
+		return cpierrors.Cloud(
+			"create_vm: stemcell qcow2 %s:%s not found — re-upload the stemcell (bosh upload-stemcell --fix)",
+			parsed.stemcellStorage, parsed.stemcellVolPath,
+		)
+	}
+	return nil
+}
+
+// validateStemcellStrategyCloudProp validates the optional per-VM
+// cloud_properties.stemcell_strategy override at parse time, before any PVE
+// mutation. Empty is valid (defers to the global config default). Any
+// non-empty value other than "template"/"import" is a manifest error.
+func validateStemcellStrategyCloudProp(v string) error {
+	switch v {
+	case "", config.StemcellStrategyTemplate, config.StemcellStrategyImport:
+		return nil
+	default:
+		return cpierrors.Cloud(
+			"create_vm: cloud_properties.stemcell_strategy %q invalid; must be %q, %q, or omitted",
+			v, config.StemcellStrategyTemplate, config.StemcellStrategyImport,
+		)
+	}
+}
+
+// resolveStemcellStrategy resolves the effective stemcell strategy: per-VM
+// cloud_properties.stemcell_strategy (validated at parse time by
+// validateStemcellStrategyCloudProp) takes precedence over the global
+// pve.stemcell_strategy config value, itself defaulting to "template"
+// (config.ApplyDefaults normally fills this; the nil/empty fallback here
+// covers direct unit-test construction of *config.CPIConfig).
+func resolveStemcellStrategy(cfg *config.CPIConfig, parsed *createVMParsedArgs) string {
+	if parsed.cloudProps.StemcellStrategy != "" {
+		return parsed.cloudProps.StemcellStrategy
+	}
+	if cfg != nil && cfg.StemcellStrategy != "" {
+		return cfg.StemcellStrategy
+	}
+	return config.StemcellStrategyTemplate
 }
 
 // startVMAndReadConfig starts the VM, awaits the task, reads back PVE config

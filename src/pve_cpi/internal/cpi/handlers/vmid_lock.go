@@ -30,6 +30,14 @@ const vmidLockTimeout = 10 * time.Second
 // "bosh-lock-vm-<vmid>". This serializes all tag/notes read-modify-write
 // operations for a given VMID across concurrent CPI process invocations.
 //
+// SCOPE: pools (and therefore this lock) live inside a single pmxcfs
+// instance, so "vm-<vmid>" in cluster A and "vm-<vmid>" in cluster B are two
+// unrelated locks — see the per-cluster scope note on the pve package's
+// cluster_lock.go doc comment. A VMID that collides across two independent
+// clusters sharing storage (same VMID band, no per-CPI banding) is NOT
+// serialized by this lock: set_vm_metadata, set_disk_metadata, stemcell_refs,
+// and delete_vm on that VMID can interleave freely between the clusters.
+//
 // Failure modes:
 //   - pools == nil: returns a retriable error immediately; fn is not called.
 //   - AcquireClusterLock failure: returns the retriable error from the lock
