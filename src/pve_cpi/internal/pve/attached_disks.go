@@ -107,7 +107,7 @@ func UpdateAttachedDiskCID(ctx context.Context, c Client, logger *log.Logger, no
 				log.Int("vmid", vmid),
 				log.String("node", node),
 				log.String("volid", bareVolid),
-				log.String("error", err.Error()),
+				log.Err(err),
 			)
 		}
 		return
@@ -122,7 +122,7 @@ func UpdateAttachedDiskCID(ctx context.Context, c Client, logger *log.Logger, no
 			logger.Warn("attached-disk CID: marshal failed — CID not recorded",
 				log.Int("vmid", vmid),
 				log.String("volid", bareVolid),
-				log.String("error", marshalErr.Error()),
+				log.Err(marshalErr),
 			)
 		}
 		return
@@ -141,7 +141,7 @@ func UpdateAttachedDiskCID(ctx context.Context, c Client, logger *log.Logger, no
 				log.Int("vmid", vmid),
 				log.String("node", node),
 				log.String("volid", bareVolid),
-				log.String("error", updateErr.Error()),
+				log.Err(updateErr),
 			)
 		}
 	}
@@ -165,7 +165,7 @@ func RemoveAttachedDiskCID(ctx context.Context, c Client, logger *log.Logger, no
 				log.Int("vmid", vmid),
 				log.String("node", node),
 				log.String("volid", bareVolid),
-				log.String("error", err.Error()),
+				log.Err(err),
 			)
 		}
 		return
@@ -185,7 +185,7 @@ func RemoveAttachedDiskCID(ctx context.Context, c Client, logger *log.Logger, no
 			logger.Warn("attached-disk CID: marshal failed on remove — CID not removed",
 				log.Int("vmid", vmid),
 				log.String("volid", bareVolid),
-				log.String("error", marshalErr.Error()),
+				log.Err(marshalErr),
 			)
 		}
 		return
@@ -204,7 +204,7 @@ func RemoveAttachedDiskCID(ctx context.Context, c Client, logger *log.Logger, no
 				log.Int("vmid", vmid),
 				log.String("node", node),
 				log.String("volid", bareVolid),
-				log.String("error", updateErr.Error()),
+				log.Err(updateErr),
 			)
 		}
 	}

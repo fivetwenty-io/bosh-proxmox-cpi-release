@@ -249,7 +249,7 @@ func RetryOnTransient(
 				log.Int("attempt", attempt+1),
 				log.Int("max_attempts", maxAttempts),
 				log.Int("backoff_ms", int(d/time.Millisecond)),
-				log.String("error", err.Error()),
+				log.Err(err),
 			)
 		}
 		select {
@@ -348,7 +348,7 @@ func RetryOnTransientOrLock(
 				log.Int("attempt", attempt+1),
 				log.Int("max_attempts", maxAttempts),
 				log.Int("backoff_ms", int(d/time.Millisecond)),
-				log.String("error", err.Error()),
+				log.Err(err),
 			)
 		}
 		select {
@@ -416,7 +416,7 @@ func RetryOnTransientOrUnplugBusy(
 				log.Int("attempt", attempt+1),
 				log.Int("max_attempts", maxAttempts),
 				log.Int("backoff_ms", int(d/time.Millisecond)),
-				log.String("error", err.Error()),
+				log.Err(err),
 			)
 		}
 		select {

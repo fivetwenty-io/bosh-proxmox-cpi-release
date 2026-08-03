@@ -1088,7 +1088,7 @@ func attemptCreateTemplateVM(
 		case pve.IsTransientTransport(cerr):
 			logger.Info("ensureTemplateVM: transient transport fault on create, retrying",
 				log.Int("vmid_attempted", candidate),
-				log.String("error", cerr.Error()),
+				log.Err(cerr),
 			)
 		}
 		return cerr
@@ -1100,7 +1100,7 @@ func attemptCreateTemplateVM(
 			if pve.IsVMIDConflict(werr) || pve.IsStorageLockTimeout(werr) || pve.IsTransientTransport(werr) {
 				logger.Info("ensureTemplateVM: retryable error awaiting create task",
 					log.Int("vmid_attempted", candidate),
-					log.String("error", werr.Error()),
+					log.Err(werr),
 				)
 			}
 			return werr

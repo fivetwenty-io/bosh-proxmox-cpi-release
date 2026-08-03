@@ -184,7 +184,7 @@ func updateParkerProvenance(ctx context.Context, c Client, logger *log.Logger, n
 				log.Int("parker_vmid", parkerVMID),
 				log.String("node", node),
 				log.String("volid", bareVolid),
-				log.String("error", err.Error()),
+				log.Err(err),
 			)
 		}
 		return
@@ -215,7 +215,7 @@ func updateParkerProvenance(ctx context.Context, c Client, logger *log.Logger, n
 			logger.Warn("parker provenance: marshal failed — provenance not updated",
 				log.Int("parker_vmid", parkerVMID),
 				log.String("volid", bareVolid),
-				log.String("error", marshalErr.Error()),
+				log.Err(marshalErr),
 			)
 		}
 		return
@@ -235,7 +235,7 @@ func updateParkerProvenance(ctx context.Context, c Client, logger *log.Logger, n
 				log.Int("parker_vmid", parkerVMID),
 				log.String("node", node),
 				log.String("volid", bareVolid),
-				log.String("error", updateErr.Error()),
+				log.Err(updateErr),
 			)
 		}
 	}
@@ -255,7 +255,7 @@ func removeParkerProvenance(ctx context.Context, c Client, logger *log.Logger, n
 				log.Int("parker_vmid", parkerVMID),
 				log.String("node", node),
 				log.String("volid", bareVolid),
-				log.String("error", err.Error()),
+				log.Err(err),
 			)
 		}
 		return
@@ -277,7 +277,7 @@ func removeParkerProvenance(ctx context.Context, c Client, logger *log.Logger, n
 			logger.Warn("parker provenance: marshal failed on remove — provenance not removed",
 				log.Int("parker_vmid", parkerVMID),
 				log.String("volid", bareVolid),
-				log.String("error", marshalErr.Error()),
+				log.Err(marshalErr),
 			)
 		}
 		return
@@ -297,7 +297,7 @@ func removeParkerProvenance(ctx context.Context, c Client, logger *log.Logger, n
 				log.Int("parker_vmid", parkerVMID),
 				log.String("node", node),
 				log.String("volid", bareVolid),
-				log.String("error", updateErr.Error()),
+				log.Err(updateErr),
 			)
 		}
 	}
