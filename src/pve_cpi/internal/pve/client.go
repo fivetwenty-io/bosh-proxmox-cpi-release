@@ -166,9 +166,19 @@ func (s *sdkPoolService) GetPoolComment(ctx context.Context, poolID string) (str
 }
 
 // isPoolNotFound reports whether err indicates the queried pool does not exist.
-// Fail-closed: only returns true when we POSITIVELY identify a 404. Unknown errors
-// propagate as failures rather than being treated as absent (fail-open would let
-// a transient error be mistaken for an available slot).
+// Fail-closed: only returns true when we POSITIVELY identify the pool as
+// absent. Unknown errors propagate as failures rather than being treated as
+// absent (fail-open would let a transient error be mistaken for an available
+// slot).
+//
+// Two positive shapes are recognised. A genuine 404 (SDK sentinel or APIError)
+// covers the documented contract. Live PVE 9.2 does not use it: GET
+// /pools/{poolid} for a missing pool answers HTTP 500 with the body text
+// "pool 'x' does not exist" — the same 500-with-text convention every other
+// pool error follows — so IsPoolNotFound's text matcher is consulted too.
+// Without it every first boot against the shipped default pools logged a
+// spurious "could not confirm pool access" warning, because a pool that does
+// not exist yet is the normal pre-lazy-creation state, not a fault.
 func isPoolNotFound(err error) bool {
 	if err == nil {
 		return false
@@ -178,10 +188,10 @@ func isPoolNotFound(err error) bool {
 		return true
 	}
 	var apiErr *sdkerrors.APIError
-	if errors.As(err, &apiErr) {
-		return apiErr.IsNotFound()
+	if errors.As(err, &apiErr) && apiErr.IsNotFound() {
+		return true
 	}
-	return false
+	return IsPoolNotFound(err)
 }
 
 // buildUserAgent returns the User-Agent string for all PVE API requests.

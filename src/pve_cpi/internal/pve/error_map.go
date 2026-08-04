@@ -599,13 +599,19 @@ func IsPoolNotEmpty(err error) bool {
 //
 //	delete pool failed: pool 'x' does not exist
 //
+// The same shape comes back from a plain read (GET /pools/{poolid}) of a pool
+// that has not been created yet:
+//
+//	pool 'bosh-templates' does not exist
+//
 // This is deliberately distinct from the generic 404-based IsNotFound: PVE
 // pool errors are always surfaced as 500 with a text body, so IsNotFound
 // never matches them. Callers needing an already-gone signal for a pool
-// (e.g. the delete_vm empty-pool reaper's tolerate-already-deleted branch)
-// must use this classifier instead. Matched with a "pool" adjacency guard so
-// an unrelated "does not exist" message (e.g. "storage does not exist") is
-// not misclassified.
+// (the delete_vm empty-pool reaper's tolerate-already-deleted branch, and
+// sdkPoolService.GetPoolComment's absent-pool mapping) must use this
+// classifier instead. Matched with a "pool" adjacency guard so an unrelated
+// "does not exist" message (e.g. "storage does not exist") is not
+// misclassified.
 //
 // nil → false.
 func IsPoolNotFound(err error) bool {

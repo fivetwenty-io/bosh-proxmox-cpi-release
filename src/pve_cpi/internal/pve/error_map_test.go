@@ -1223,6 +1223,9 @@ func TestIsPoolNotFound_LiveText(t *testing.T) {
 		want bool
 	}{
 		{"live text", "delete pool failed: pool 'x' does not exist", true},
+		// The read shape: GET /pools/{poolid} for a pool that does not exist
+		// yet answers 500 + this text, not 404. Observed on PVE 9.2.6.
+		{"live read text", "API request failed: pool 'v2-templates' does not exist\n (code: 0)", true},
 		{"mixed case", "Delete Pool Failed: Pool 'x' Does Not Exist", true},
 		{"unrelated no pool word", "storage does not exist", false},
 		{"empty", "", false},

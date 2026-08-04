@@ -119,6 +119,37 @@ func TestPreflightPoolAccess_NotYetExistingPool_NoError(t *testing.T) {
 	}
 }
 
+// TestPreflightPoolAccess_NotYetExistingPool_LogsQuietDebug pins the log level
+// for the normal zero-config first boot, where neither shipped default pool
+// exists yet. That state must be reported at Debug and say lazy creation
+// handles it -- an operator seeing a Warn here cannot tell it apart from a real
+// API fault, which is exactly what the live run reported.
+func TestPreflightPoolAccess_NotYetExistingPool_LogsQuietDebug(t *testing.T) {
+	t.Parallel()
+	fake := &fakePreflightPoolService{
+		getPoolCommentFn: func(string) (string, bool, error) { return "", false, nil },
+	}
+	cfg := &config.CPIConfig{VMPool: "bosh", StemcellTemplatePool: "bosh-templates"}
+	logger, obs := log.NewObservedLogger(log.LevelDebug)
+
+	if err := preflightPoolAccess(context.Background(), cfg, preflightTestClient{pools: fake}, logger); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	entries := obs.All()
+	if len(entries) != 2 {
+		t.Fatalf("expected one entry per probed pool, got %d: %+v", len(entries), entries)
+	}
+	for _, e := range entries {
+		if e.Level != log.LevelDebug {
+			t.Errorf("entry %q logged at %v; want Debug", e.Message, e.Level)
+		}
+		if !strings.Contains(e.Message, "does not exist yet") {
+			t.Errorf("entry %q does not say the pool will be created on first use", e.Message)
+		}
+	}
+}
+
 func TestPreflightPoolAccess_DuplicatePoolNames_ProbedOnce(t *testing.T) {
 	t.Parallel()
 	fake := &fakePreflightPoolService{

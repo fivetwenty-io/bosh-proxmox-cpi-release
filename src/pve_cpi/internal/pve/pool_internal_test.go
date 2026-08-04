@@ -1,4 +1,5 @@
-// pool_internal_test.go — white-box tests for sdkPoolService.AddVM.
+// pool_internal_test.go — white-box tests for sdkPoolService.AddVM and
+// GetPoolComment.
 // Uses package pve (internal) so sdkPoolService can be constructed directly.
 package pve
 
@@ -9,12 +10,14 @@ import (
 	"testing"
 
 	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/pools"
+	sdkerrors "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/errors"
 )
 
 // fakePoolsService implements pools.Service for unit tests.
 // Only UpdatePools2 is wired; all other methods panic on call.
 type fakePoolsService struct {
 	updatePools2Fn func(ctx context.Context, poolid string, params *pools.UpdatePools2Params) error
+	getPoolsFn     func(ctx context.Context, poolid string, params *pools.GetPoolsParams) (*pools.GetPoolsResponse, error)
 }
 
 func (f *fakePoolsService) UpdatePools2(ctx context.Context, poolid string, params *pools.UpdatePools2Params) error {
@@ -36,7 +39,10 @@ func (f *fakePoolsService) DeletePools(_ context.Context, _ *pools.DeletePoolsPa
 	panic("fakePoolsService: DeletePools unexpected call")
 }
 
-func (f *fakePoolsService) GetPools(_ context.Context, _ string, _ *pools.GetPoolsParams) (*pools.GetPoolsResponse, error) {
+func (f *fakePoolsService) GetPools(ctx context.Context, poolid string, params *pools.GetPoolsParams) (*pools.GetPoolsResponse, error) {
+	if f.getPoolsFn != nil {
+		return f.getPoolsFn(ctx, poolid, params)
+	}
 	panic("fakePoolsService: GetPools unexpected call")
 }
 
@@ -180,5 +186,56 @@ func TestSDKPoolService_AddVM_UpdatePools2Error(t *testing.T) {
 	}
 	if !errors.Is(err, rawErr) && !strings.Contains(err.Error(), rawErr.Error()) {
 		t.Errorf("error %q does not wrap or contain raw error %q", err.Error(), rawErr.Error())
+	}
+}
+
+// TestSDKPoolService_GetPoolComment_LiveNotFoundTextIsAbsent covers the live
+// PVE 9.2 not-found shape for a pool read: HTTP 500 with the body text
+// "pool 'x' does not exist", never a 404. GetPoolComment must map it to
+// (found=false, err=nil) — a pool the CPI has not created yet is the normal
+// pre-lazy-creation state, and reporting it as an error made every first boot
+// against the shipped default pools log a spurious transient warning.
+func TestSDKPoolService_GetPoolComment_LiveNotFoundTextIsAbsent(t *testing.T) {
+	t.Parallel()
+
+	svc := &sdkPoolService{
+		svc: &fakePoolsService{
+			getPoolsFn: func(_ context.Context, _ string, _ *pools.GetPoolsParams) (*pools.GetPoolsResponse, error) {
+				return nil, sdkerrors.ParseAPIError(500,
+					[]byte(`{"message":"pool 'v2-templates' does not exist","code":0}`))
+			},
+		},
+	}
+
+	comment, found, err := svc.GetPoolComment(context.Background(), "v2-templates")
+	if err != nil {
+		t.Fatalf("a pool that does not exist must not surface as an error: %v", err)
+	}
+	if found {
+		t.Error("found = true; want false for a pool that does not exist")
+	}
+	if comment != "" {
+		t.Errorf("comment = %q; want empty", comment)
+	}
+}
+
+// TestSDKPoolService_GetPoolComment_UnrelatedErrorPropagates keeps the mapping
+// fail-closed: only a positively identified not-found becomes absent. Any
+// other fault must still reach the caller so a genuine API problem is not
+// mistaken for a missing pool.
+func TestSDKPoolService_GetPoolComment_UnrelatedErrorPropagates(t *testing.T) {
+	t.Parallel()
+
+	svc := &sdkPoolService{
+		svc: &fakePoolsService{
+			getPoolsFn: func(_ context.Context, _ string, _ *pools.GetPoolsParams) (*pools.GetPoolsResponse, error) {
+				return nil, sdkerrors.ParseAPIError(500,
+					[]byte(`{"message":"storage 'x' does not exist","code":0}`))
+			},
+		},
+	}
+
+	if _, _, err := svc.GetPoolComment(context.Background(), "bosh"); err == nil {
+		t.Fatal("an unrelated 500 must propagate, not be treated as an absent pool")
 	}
 }

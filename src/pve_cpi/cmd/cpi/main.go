@@ -259,9 +259,13 @@ func run() int {
 // operator fixes both at once instead of discovering the Allocate gap
 // separately on the first real create_vm/create_stemcell call.
 //
-// A pool that does not exist yet is NOT a failure: GetPoolComment maps that
-// to (found=false, err=nil), and the CPI creates the pool lazily on first
-// use. Only a classified permission error (pve.IsPoolPermissionDenied: HTTP
+// A pool that does not exist yet is NOT a failure: GetPoolComment maps both
+// PVE not-found shapes -- a 404, and the 500-with-text "pool 'x' does not
+// exist" live PVE actually returns -- to (found=false, err=nil), and the CPI
+// creates the pool lazily on first use. That case is logged at Debug and says
+// so; it is the normal state of a zero-config first boot, where neither
+// default pool exists yet, and must never look like an API fault.
+// Only a classified permission error (pve.IsPoolPermissionDenied: HTTP
 // 401/403) fails this preflight. Every other error (network fault, PVE 5xx,
 // context deadline) is logged at Warn and treated as transient, so a
 // startup-time PVE hiccup never blocks the CPI from booting -- the same
@@ -294,9 +298,14 @@ func preflightPoolAccess(ctx context.Context, cfg *config.CPIConfig, client pve.
 
 	for _, poolID := range pools {
 		probeCtx, cancel := context.WithTimeout(ctx, poolsPreflightTimeout)
-		_, _, err := client.Pools().GetPoolComment(probeCtx, poolID)
+		_, found, err := client.Pools().GetPoolComment(probeCtx, poolID)
 		cancel()
 		if err == nil {
+			if !found {
+				logger.Debug("pools preflight: pool does not exist yet; it will be created on first use",
+					log.String("pool", poolID))
+				continue
+			}
 			logger.Debug("pools preflight: pool visible", log.String("pool", poolID))
 			continue
 		}
