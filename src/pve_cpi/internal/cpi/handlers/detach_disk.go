@@ -116,7 +116,8 @@ func detachDiskResolveSlot(
 // Arguments (positional JSON array):
 //
 //	[0] vm_cid   string — VMID of the target VM (integer as string, e.g. "100")
-//	[1] disk_cid string — persistent disk CID in "<storage>:<volid>" form
+//	[1] disk_cid string — persistent disk CID in the "pvd-" (or compressed
+//	                      "pvz-") envelope form emitted by create_disk
 //
 // Returns: null (void). The Director expects a null result on success.
 //
@@ -168,9 +169,9 @@ func HandleDetachDisk(deps Deps) Handler {
 		}
 		// Strip optional metadata suffix; PVE API and volid comparisons need
 		// the bare "<storage>:<volid>" form.
-		bareDiskCID, _, decErr := pve.ParseEncodedDiskCID(diskCID)
+		bareDiskCID, _, decErr := decodeDiskCID(ctx, deps, "detach_disk", diskCID)
 		if decErr != nil {
-			return nil, cpierrors.DiskNotFound(diskCID)
+			return nil, decErr
 		}
 
 		// --------------------------------------------------------------------

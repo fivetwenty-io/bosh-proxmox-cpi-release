@@ -14,12 +14,15 @@ import (
 //
 // Arguments (positional JSON array):
 //
-//	[0] disk_cid  string — disk CID of the form "<storage>:<volume>"
+//	[0] disk_cid  string — disk CID in the "pvd-" (or compressed "pvz-")
+//	                       envelope form emitted by create_disk
 //
 // Returns: bool — true if the volume exists in PVE storage, false if not.
 //
 // Error handling:
-//   - Malformed disk_cid → non-nil error (CloudError, not retriable).
+//   - Malformed disk_cid → DiskNotFound (not retriable). A CID this CPI
+//     could not have emitted names no disk it owns; the codec's rejection
+//     reason is logged at Warn by decodeDiskCID.
 //   - 404 from PVE → false, nil (volume absent is normal).
 //   - Other SDK errors → non-nil error propagated to the dispatcher.
 //
@@ -46,9 +49,9 @@ func HandleHasDisk(deps Deps) Handler {
 			return nil, cpierrors.Cloud("has_disk: disk_cid must not be empty")
 		}
 		// Strip optional metadata suffix before any PVE API or storage lookup.
-		bareDiskCID, _, decErr := pve.ParseEncodedDiskCID(diskCID)
+		bareDiskCID, _, decErr := decodeDiskCID(ctx, deps, "has_disk", diskCID)
 		if decErr != nil {
-			return nil, cpierrors.DiskNotFound(diskCID)
+			return nil, decErr
 		}
 
 		// ----------------------------------------------------------------

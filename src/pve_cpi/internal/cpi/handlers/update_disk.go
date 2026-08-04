@@ -21,7 +21,8 @@ import (
 //
 // Arguments (positional JSON array):
 //
-//	[0] disk_cid     string         — disk CID of the form "<storage>:<volume>"
+//	[0] disk_cid     string         — disk CID in the "pvd-"/"pvz-" envelope
+//	                                  form emitted by create_disk
 //	[1] update_spec  map[string]any — update specification (see below)
 //
 // update_spec recognized fields:
@@ -76,9 +77,9 @@ func HandleUpdateDisk(deps Deps) Handler {
 			return nil, cpierrors.Cloud("update_disk: args[0] disk_cid must not be empty")
 		}
 		// Strip optional metadata suffix before any PVE API or storage lookup.
-		bareDiskCID, _, decErr := pve.ParseEncodedDiskCID(diskCID)
+		bareDiskCID, _, decErr := decodeDiskCID(ctx, deps, "update_disk", diskCID)
 		if decErr != nil {
-			return nil, cpierrors.DiskNotFound(diskCID)
+			return nil, decErr
 		}
 
 		// update_spec may be null or missing; treat as empty map.

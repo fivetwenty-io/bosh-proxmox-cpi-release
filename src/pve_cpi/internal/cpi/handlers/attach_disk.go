@@ -31,7 +31,8 @@ type diskHints struct {
 // Arguments (positional JSON array):
 //
 //	[0] vm_cid   string — VMID of the target VM (integer as string, e.g. "100")
-//	[1] disk_cid string — persistent disk CID in "<storage>:<volid>" form
+//	[1] disk_cid string — persistent disk CID in the "pvd-" (or compressed
+//	                      "pvz-") envelope form emitted by create_disk
 //
 // Returns (v2): disk_hints object {"path": "/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_drive-scsi<N>"} per the BOSH CPI v2 spec.
 //
@@ -93,9 +94,9 @@ func HandleAttachDisk(deps Deps) Handler {
 		// preserved for agent hints and log fields so the Director can match
 		// the CID it originally stored. meta carries per-disk performance
 		// options resolved at create_disk time; nil for bare (legacy) CIDs.
-		bareDiskCID, meta, err := pve.ParseEncodedDiskCID(diskCID)
+		bareDiskCID, meta, err := decodeDiskCID(ctx, deps, "attach_disk", diskCID)
 		if err != nil {
-			return nil, cpierrors.DiskNotFound(diskCID)
+			return nil, err
 		}
 
 		// --------------------------------------------------------------------

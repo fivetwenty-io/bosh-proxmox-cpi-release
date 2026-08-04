@@ -18,7 +18,8 @@ import (
 //
 // Arguments (positional JSON array):
 //
-//	[0] disk_cid     string — disk CID of the form "<storage>:<volume>"
+//	[0] disk_cid     string — disk CID in the "pvd-"/"pvz-" envelope form
+//	                          emitted by create_disk
 //	[1] new_size_mb  int    — new total disk size in MiB (must be > 0)
 //
 // Returns: null on success (BOSH void method).
@@ -62,9 +63,9 @@ func HandleResizeDisk(deps Deps) Handler {
 			return nil, cpierrors.Cloud("resize_disk: args[0] disk_cid must not be empty")
 		}
 		// Strip optional metadata suffix before any PVE API or storage lookup.
-		bareDiskCID, _, decErr := pve.ParseEncodedDiskCID(diskCID)
+		bareDiskCID, _, decErr := decodeDiskCID(ctx, deps, "resize_disk", diskCID)
 		if decErr != nil {
-			return nil, cpierrors.DiskNotFound(diskCID)
+			return nil, decErr
 		}
 
 		var newSizeMB int

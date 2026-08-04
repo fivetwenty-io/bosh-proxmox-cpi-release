@@ -19,7 +19,8 @@ import (
 //
 // Arguments (positional JSON array):
 //
-//	[0] disk_cid  string         — disk CID of the form "<storage>:<volume>"
+//	[0] disk_cid  string         — disk CID in the "pvd-"/"pvz-" envelope form
+//	                               emitted by create_disk
 //	[1] metadata  map[string]any — optional snapshot metadata; "description" key
 //	                               is forwarded to PVE as the snapshot description.
 //
@@ -51,9 +52,9 @@ func HandleSnapshotDisk(deps Deps) Handler {
 			return nil, cpierrors.Cloud("snapshot_disk: args[0] disk_cid must not be empty")
 		}
 		// Strip optional metadata suffix before any PVE API or storage lookup.
-		bareDiskCID, _, decErr := pve.ParseEncodedDiskCID(diskCID)
+		bareDiskCID, _, decErr := decodeDiskCID(ctx, deps, "snapshot_disk", diskCID)
 		if decErr != nil {
-			return nil, cpierrors.DiskNotFound(diskCID)
+			return nil, decErr
 		}
 
 		// metadata arg is optional and may be null or absent.

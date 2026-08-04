@@ -45,7 +45,8 @@ type attachedVM struct {
 // Any non-BOSH content in the description is preserved before the sentinel block.
 //
 // Arguments:
-//   - args[0]: disk_cid (string) — "<storage>:<volume>", parsed via pve.ParseDiskCID.
+//   - args[0]: disk_cid (string) — the "pvd-"/"pvz-" envelope form emitted by
+//     create_disk; decoded via decodeDiskCID, then parsed via pve.ParseDiskCID.
 //   - args[1]: metadata (map[string]any) — arbitrary key-value pairs from the Director.
 //
 // Logic:
@@ -79,9 +80,9 @@ func HandleSetDiskMetadata(deps Deps) cpi.Handler {
 			return nil, cpierrors.Cloud("set_disk_metadata: disk_cid must be a non-empty string")
 		}
 		// Strip optional metadata suffix before any PVE API or storage lookup.
-		bareDiskCID, _, decErr := pve.ParseEncodedDiskCID(diskCID)
+		bareDiskCID, _, decErr := decodeDiskCID(ctx, deps, "set_disk_metadata", diskCID)
 		if decErr != nil {
-			return nil, cpierrors.DiskNotFound(diskCID)
+			return nil, decErr
 		}
 
 		var metadata map[string]any

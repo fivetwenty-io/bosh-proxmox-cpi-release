@@ -153,18 +153,23 @@ config; per-disk values win over global defaults.
 
 Only the two envelope forms are valid disk CIDs. The decoder hard-rejects
 everything else — bare volids, the retired pipe-annotated form, and arbitrary
-strings — so a corrupted or hand-edited CID fails loudly at the CPI boundary
-instead of propagating a half-parsed volid into PVE API calls. A CID longer
-than 255 characters is likewise rejected at `create_disk` time (with the
-just-created volume rolled back) because a MySQL-backed Director would
-truncate it and orphan the disk; enable `pve.disk_cid_compression` if rich
-`disk_pool` option sets push the envelope over the limit. Use the bundled
-`pve-cid` tool (`pve-cid decode <cid>`, installed on the Director VM at `/var/vcap/packages/pve_cpi/bin/pve-cid`, not on `PATH` by default) to inspect any CID offline.
+strings — so a corrupted or hand-edited CID fails at the CPI boundary instead
+of propagating a half-parsed volid into PVE API calls. A CID longer than 255
+characters is likewise rejected at `create_disk` time (with the just-created
+volume rolled back) because a MySQL-backed Director would truncate it and
+orphan the disk; enable `pve.disk_cid_compression` if rich `disk_pool` option
+sets push the envelope over the limit. Use the bundled `pve-cid` tool
+(`pve-cid decode <cid>`, installed on the Director VM at
+`/var/vcap/packages/pve_cpi/bin/pve-cid`, not on `PATH` by default) to inspect
+any CID offline.
 
-`create_disk` logs a warning when an emitted CID exceeds 255 characters:
-MySQL-backed Directors store `disk_cid` in a `VARCHAR(255)` column, and the
-envelope can cross that bound when long storage names combine with many
-per-disk performance options.
+A rejected CID is reported to the Director as `DiskNotFound`, which is accurate
+— a CID this CPI never emitted names no disk it owns — but says nothing about
+why. The codec's specific reason (wrong prefix, bad base64url, bad gzip,
+oversized inflation, empty volid) is written to the CPI log at `WARN` alongside
+the offending CID. When a disk operation fails with "disk not found" on a
+volume that is visibly present in PVE, that log line is where we look: it means
+the CID never decoded, and the volume was never the problem.
 
 ### Compressed CIDs (`pvz-`, opt-in)
 
@@ -180,8 +185,8 @@ The JSON payload, the charset guarantee, and the decode rules are identical to
 `pvd-`; only the container changes. CIDs that fit 255 characters are emitted as
 `pvd-` unchanged, byte-identical to the flag-off encoding, so enabling the flag
 never alters the common case. If gzip cannot shorten an unusually high-entropy
-payload, the plain form is kept (both overflow; the length warning fires either
-way).
+payload, the plain form is kept — both forms overflow, so `create_disk` fails
+with the same hard error either way and rolls the just-created volume back.
 
 The flag exists for MySQL-backed Directors, whose `disk_cid` column is a hard
 `VARCHAR(255)` (strict mode rejects longer values; legacy non-strict mode

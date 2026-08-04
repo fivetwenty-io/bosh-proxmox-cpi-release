@@ -40,7 +40,8 @@ func unparkBeforeDelete(ctx context.Context, deps Deps, diskCID, bareDiskCID str
 //
 // Arguments (positional JSON array):
 //
-//	[0] disk_cid  string — disk CID of the form "<storage>:<volume>"
+//	[0] disk_cid  string — disk CID in the "pvd-" (or compressed "pvz-")
+//	                       envelope form emitted by create_disk
 //
 // Returns: null on success (BOSH void method).
 //
@@ -72,9 +73,9 @@ func HandleDeleteDisk(deps Deps) Handler {
 			return nil, cpierrors.Cloud("delete_disk: disk_cid must not be empty")
 		}
 		// Strip optional metadata suffix before any PVE API or storage lookup.
-		bareDiskCID, _, decErr := pve.ParseEncodedDiskCID(diskCID)
+		bareDiskCID, _, decErr := decodeDiskCID(ctx, deps, "delete_disk", diskCID)
 		if decErr != nil {
-			return nil, cpierrors.DiskNotFound(diskCID)
+			return nil, decErr
 		}
 
 		// ----------------------------------------------------------------
