@@ -239,6 +239,27 @@ def build_cpi_config(
         "agent_mbus": agent_mbus,
     }
 
+    # vmid_range_end must reach the CPI: its default (8999) is a hard upper
+    # bound the CPI validates vmid_range_start against, so any range starting
+    # above 8999 fails config validation before the first API call.
+    vmid_range_end = tier1.get("vmid_range_end")
+    if vmid_range_end is not None:
+        cpi_cfg["vmid_range_end"] = int(vmid_range_end)
+
+    # The CPI rejects a VM range that overlaps its persistent-disk
+    # ([9000,29999]) or stemcell-template ([30000,30999]) defaults, so a lab
+    # whose only free VMID band sits inside either default needs all three
+    # ranges moved together. Each is optional; absent keys keep CPI defaults.
+    for _key in (
+        "disk_vmid_range_start",
+        "disk_vmid_range_end",
+        "stemcell_template_vmid_range_start",
+        "stemcell_template_vmid_range_end",
+    ):
+        _val = tier1.get(_key)
+        if _val is not None:
+            cpi_cfg[_key] = int(_val)
+
     # Attach auth — api_token wins if non-empty (and not a dry-run placeholder).
     is_placeholder = api_token.startswith("<dry-run:")
     if api_token and not is_placeholder:

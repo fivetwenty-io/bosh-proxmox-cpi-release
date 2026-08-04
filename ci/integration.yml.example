@@ -42,7 +42,15 @@ cpi_release_path: ""
 # Tier 1: CPI lifecycle test — isolated VMID range and network parameters.
 tier1:
   vmid_range_start: 900            # First VMID reserved for integration tests
-  vmid_range_end:   999            # Reserved/informational — range enforcement uses vmid_range_start only
+  vmid_range_end:   999            # Last VMID reserved — passed to the CPI, which validates start < end
+  # The CPI requires the VM, persistent-disk, and stemcell-template VMID
+  # ranges to be pairwise disjoint. If the lab's free band overlaps a CPI
+  # default (disks [9000,29999], templates [30000,30999]), move those bands
+  # too; absent keys keep the CPI defaults.
+  # disk_vmid_range_start: 20200
+  # disk_vmid_range_end:   20299
+  # stemcell_template_vmid_range_start: 20300
+  # stemcell_template_vmid_range_end:   20399
   network_ip:       192.168.1.250  # Static IP assigned to the test VM
   network_range:    192.168.1.0/24 # Subnet containing the test VM
   network_gateway:  192.168.1.1    # Default gateway for the test VM
