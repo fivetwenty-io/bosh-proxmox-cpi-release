@@ -6,7 +6,6 @@ import (
 	"bytes"
 	"context"
 	"strings"
-	"sync"
 	"testing"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
@@ -320,12 +319,17 @@ func TestIsoStorageScanTarget(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // resetHAResurrectorWarnOnce lets each test observe a fresh first-fire,
-// keeping the suite repeat-safe under -count=N (mirrors the
-// vniZoneListWarnOnce reset in internal/pve/export_test.go).
+// keeping the suite repeat-safe under -count=N. Routed through the
+// resetHAResurrectorWarnOnceForTest seam (ha_warn_seam.go) so the swap is
+// atomic; the previous shape assigned the package var directly, which was
+// unsynchronized and safe only because every caller happens to be a
+// non-parallel test.
+//
+// Callers must NOT be parallel: the gate is process-wide, so two parallel
+// tests would race over which one observes the single firing.
 func resetHAResurrectorWarnOnce(t *testing.T) {
 	t.Helper()
-	haResurrectorWarnOnce = sync.Once{}
-	t.Cleanup(func() { haResurrectorWarnOnce = sync.Once{} })
+	t.Cleanup(resetHAResurrectorWarnOnceForTest())
 }
 
 func TestWarnHAResurrectorConflictOnce_EmptyFeatures_NoWarn(t *testing.T) {
@@ -419,5 +423,34 @@ func TestCheckISOStorageForHA_AZPinActive_LocalISO_WarnOnly(t *testing.T) {
 	err := checkISOStorageForHA(context.Background(), deps, 100, cp, "pve01", nil, log.NewNopLogger())
 	if err != nil {
 		t.Fatalf("require_shared_iso_for_ha is false: expected nil error (warn-only), got %v", err)
+	}
+}
+
+// TestResetHAResurrectorWarnOnceForTest_ReArmsAndRestores pins the seam's own
+// contract (ha_warn_seam.go): the returned function must put the PREVIOUS gate
+// back, not merely install another fresh one. Without that, a test using the
+// seam would leave the gate re-armed for whatever runs next, and the
+// "once per process" guarantee every other assertion rests on would silently
+// become "once per test".
+//
+// Not parallel: the gate is process-wide.
+func TestResetHAResurrectorWarnOnceForTest_ReArmsAndRestores(t *testing.T) {
+	features := []haRegistrationFeature{haFeatureDLB}
+
+	// Spend the ambient gate so "previous" is definitively a used one.
+	warnHAResurrectorConflictOnce(1, features, log.NewNopLogger())
+
+	restore := resetHAResurrectorWarnOnceForTest()
+	var rearmed bytes.Buffer
+	warnHAResurrectorConflictOnce(2, features, warnLogger(t, &rearmed))
+	if rearmed.Len() == 0 {
+		t.Error("a re-armed gate must allow exactly one fresh firing")
+	}
+	restore()
+
+	var afterRestore bytes.Buffer
+	warnHAResurrectorConflictOnce(3, features, warnLogger(t, &afterRestore))
+	if afterRestore.Len() != 0 {
+		t.Errorf("restore must reinstate the spent gate, got: %s", afterRestore.String())
 	}
 }

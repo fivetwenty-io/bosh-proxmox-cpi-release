@@ -8,10 +8,26 @@ package handlers
 import (
 	"bytes"
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
 )
+
+// migrationSafetyWarnText is the leading fragment of the one Warn these tests
+// are about (see checkISOStorageForHA). Both tests match on it rather than on
+// buffer emptiness: checkISOStorageForHA also drives the once-per-process
+// HA-vs-resurrector Warn (haResurrectorWarnOnce), so whichever test in the
+// binary reaches that once FIRST captures an extra, unrelated line in its
+// buffer. A length check therefore passes or fails on test ordering — it is
+// why these two tests failed under -shuffle and in isolation. Matching the
+// message keeps them order-independent without mutating process-wide state
+// from a parallel test.
+const migrationSafetyWarnText = "live migration and HA recovery of this VM will fail"
+
+func countMigrationSafetyWarns(logged string) int {
+	return strings.Count(logged, migrationSafetyWarnText)
+}
 
 // TestCheckISOStorageForHA_ConfigDriftBacking_TreatedAsShared verifies that
 // when iso_storage ("iso-b") is NOT itself flagged shared but shares a dir
@@ -34,8 +50,8 @@ func TestCheckISOStorageForHA_ConfigDriftBacking_TreatedAsShared(t *testing.T) {
 	if err != nil {
 		t.Fatalf("iso-b shares iso-a's backing and iso-a is shared: expected nil error, got %v", err)
 	}
-	if buf.Len() != 0 {
-		t.Errorf("expected no migration-safety Warn (iso-b treated as shared via backing), got: %s", buf.String())
+	if n := countMigrationSafetyWarns(buf.String()); n != 0 {
+		t.Errorf("expected no migration-safety Warn (iso-b treated as shared via backing), got %d: %s", n, buf.String())
 	}
 }
 
@@ -59,7 +75,7 @@ func TestCheckISOStorageForHA_DistinctBacking_StillWarns(t *testing.T) {
 	if err != nil {
 		t.Fatalf("require_shared_iso_for_ha is false: expected nil error (warn-only), got %v", err)
 	}
-	if buf.Len() == 0 {
-		t.Error("iso-c shares no backing with any shared entry: expected the migration-safety Warn to still fire")
+	if countMigrationSafetyWarns(buf.String()) == 0 {
+		t.Errorf("iso-c shares no backing with any shared entry: expected the migration-safety Warn to still fire, got: %s", buf.String())
 	}
 }

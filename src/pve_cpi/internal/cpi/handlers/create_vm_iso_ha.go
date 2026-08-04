@@ -3,7 +3,6 @@ package handlers
 import (
 	"context"
 	"strings"
-	"sync"
 
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
@@ -61,8 +60,8 @@ func haRegistrationFeatures(deps Deps, cp createVMCloudProps, node string, env m
 	return out
 }
 
-// haResurrectorWarnOnce guards the single warning create_vm emits per CPI
-// process when it registers a VM under any HA-registration feature (DLB,
+// warnHAResurrectorConflictOnce emits the single warning create_vm makes per
+// CPI process when it registers a VM under any HA-registration feature (DLB,
 // anti-affinity HA rules, or AZ node-affinity pinning). PVE HA and the BOSH
 // resurrector independently detect and restart a failed guest: PVE HA
 // relocates the guest to another node while the Director, seeing the
@@ -75,24 +74,25 @@ func haRegistrationFeatures(deps Deps, cp createVMCloudProps, node string, env m
 //
 // One warning per CPI process is enough to alert the operator without
 // flooding logs on every subsequent HA-registered create_vm — mirrors the
-// vniZoneListWarnOnce once-per-process idiom (internal/pve/vni.go).
-// Process-scoped, not per-feature-set: the first HA-registered create_vm in
-// this process warns; later ones (even under a different feature
-// combination) do not repeat it. Tests reset it via export_test.go so the
-// suite is repeat-safe under -count=N.
-var haResurrectorWarnOnce sync.Once
-
-// warnHAResurrectorConflictOnce emits the one-per-process
-// HA-vs-resurrector Warn when features is non-empty. Called from
-// checkISOStorageForHA, which already computes haRegistrationFeatures on
-// every create_vm — piggybacking here avoids a second create_vm.go call
-// site. A no-op when features is empty (no HA-registration feature fired
-// for this VM) or logger is nil.
+// vniZoneListWarnOnce once-per-process idiom (internal/pve/vni.go). The gate
+// itself and its test seam live in ha_warn_seam.go.
+//
+// Called from checkISOStorageForHA, which already computes
+// haRegistrationFeatures on every create_vm — piggybacking there avoids a
+// second create_vm.go call site. A no-op when features is empty (no
+// HA-registration feature fired for this VM) or logger is nil.
+//
+// NOTE for tests asserting on checkISOStorageForHA's logger: that function
+// writes BOTH this once-per-process warning and the per-call ISO
+// migration-safety warning to the same logger. Assert on the specific message
+// under test rather than on buffer emptiness or length — otherwise whichever
+// test reaches this gate first in the binary captures an extra line and the
+// assertion becomes order-dependent.
 func warnHAResurrectorConflictOnce(vmid int, features []haRegistrationFeature, logger *log.Logger) {
 	if len(features) == 0 || logger == nil {
 		return
 	}
-	haResurrectorWarnOnce.Do(func() {
+	haResurrectorWarnOnce.Load().Do(func() {
 		featureNames := make([]string, len(features))
 		for i, f := range features {
 			featureNames[i] = string(f)
