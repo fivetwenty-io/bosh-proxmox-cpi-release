@@ -259,6 +259,37 @@ def stemcell_os_version() -> "tuple[str, str]":
     return _lightstemcell.parse_os_version(_light_int_opt("/stemcell_url"))
 
 
+def _light_cpi_cfg() -> dict:
+    """PVE connection config for the light-stemcell helper, env-layered.
+
+    Mirrors scripts/bosh._ensure_light_stemcell: the active env's vars.yml
+    (BOSH_PVE_ENV) wins over manifests/bosh/vars.yml for every pve_* key, with
+    the base file filling anything the env does not override. Without the
+    layering the qcow2 presence check and upload target the BASE vars' cluster
+    and storage even when the env points at a different one — on the pve-cpi
+    env that meant probing the pmx lab (10.253.0.10) for a stemcell on storage
+    `local`, and registering a light record whose image_id named `local`
+    instead of the env's shared `nfs-images`.
+    """
+    env_name = active_env()
+    env_f = (REPO_ROOT / "manifests" / "envs" / env_name / "vars.yml") if env_name else None
+    if env_f is None or not env_f.exists():
+        return _lightstemcell.pve_cfg_from_bosh_vars(BOSH_VARS)
+
+    def _opt(path: "Path", json_path: str) -> "str | None":
+        res = subprocess.run(
+            ["bosh", "int", str(path), "--path", json_path],
+            capture_output=True, text=True,
+        )
+        return None if res.returncode != 0 else res.stdout.rstrip("\n")
+
+    def _layered(json_path: str) -> "str | None":
+        v = _opt(env_f, json_path)
+        return v if v is not None else _opt(BOSH_VARS, json_path)
+
+    return _lightstemcell.pve_cfg_from_bosh_vars(BOSH_VARS, reader=_layered)
+
+
 def ensure_light_stemcell(build_tarball: bool = False) -> "_lightstemcell.LightStemcell":
     """Ensure the light stemcell is on PVE and return its descriptor.
 
@@ -272,8 +303,9 @@ def ensure_light_stemcell(build_tarball: bool = False) -> "_lightstemcell.LightS
     mode = _light_int_opt("/light_stemcell_mode") or "preuploaded"
     fetch_url = _light_int_opt("/stemcell_fetch_url")
     token = _light_int_opt("/stemcell_fetch_token")
-    cpi_cfg = _lightstemcell.pve_cfg_from_bosh_vars(BOSH_VARS)
-    print(f"    light stemcell ({mode}): {os_name} {version}")
+    cpi_cfg = _light_cpi_cfg()
+    print(f"    light stemcell ({mode}): {os_name} {version} "
+          f"(host {cpi_cfg['host']}, storage {cpi_cfg['stemcell_storage']})")
     return _lightstemcell.ensure_light_stemcell(
         cpi_cfg=cpi_cfg, mode=mode, os_name=os_name, version=version,
         source_url=source_url, source_sha1=source_sha1,
