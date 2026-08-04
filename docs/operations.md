@@ -813,9 +813,9 @@ pvesm status
 
 In `cloudinit` agent mode (the default), the CPI builds an ISO 9660 image containing the BOSH agent settings for each VM. These settings include the NATS mbus URL — which embeds credentials when the Director is deployed with a `nats://user:password@host:port` mbus string — and the blobstore credentials map. The ISO is uploaded to the storage pool named by `pve.iso_storage` and attached to the VM as a CD-ROM on `scsi30`. It remains on storage for the lifetime of the VM.
 
-### Default (`local`) and its trust boundary
+### When the ISO lands on node-local `local`, and its trust boundary
 
-The default `iso_storage` value is `local`, which maps to the node-local directory storage at `/var/lib/vz/`. Anyone with read access to that storage pool — including any PVE user with `Datastore.AllocateSpace` or `Datastore.AllocateTemplate` privilege, or any root-level process on the PVE node — can mount the ISO and extract the credentials it contains.
+The spec default for `iso_storage` is `local`, but `pve.iso_storage_follow_vm_storage` (default `true`) treats a resolved `local` as "unset" and points the ConfigDrive pool at `pve.vm_storage` when that pool advertises `iso` content and is shared. The literal node-local `/var/lib/vz/` pool is used only when following is disabled, when `iso_storage` is pinned to another node-local pool, or when the fail-open fallback fires because `vm_storage` is unusable for ISOs. In those cases, anyone with read access to that storage pool — including any PVE user with `Datastore.AllocateSpace` or `Datastore.AllocateTemplate` privilege, or any root-level process on the PVE node — can mount the ISO and extract the credentials it contains.
 
 When the CPI configures a VM against the `local` pool, it emits a warning in the CPI log:
 
@@ -827,7 +827,7 @@ Treat this warning as a deploy-time signal to move to a dedicated pool. The warn
 
 ### Migration and HA availability, not only credential exposure
 
-The `local` default has a second consequence beyond credential exposure: the ISO stays attached to the VM's CD-ROM slot for the VM's whole life, and PVE refuses to live-migrate — or HA-recover on another node — a VM whose CD-ROM volume sits on non-shared storage. If any of `pve.placement.dlb`, `pve.placement.pin_az_via_ha_rules`, or `pve.placement.anti_affinity.use_ha_rules` is enabled, `create_vm` separately logs a warning naming the non-shared `iso_storage` pool and the triggering feature, and `pve.require_shared_iso_for_ha: true` escalates that warning to a `create_vm` error. See [ConfigDrive — Migration and HA interaction](configdrive.md#migration-and-ha-interaction) for the full detail.
+A node-local ISO pool has a second consequence beyond credential exposure: the ISO stays attached to the VM's CD-ROM slot for the VM's whole life, and PVE refuses to live-migrate — or HA-recover on another node — a VM whose CD-ROM volume sits on non-shared storage. If any of `pve.placement.dlb`, `pve.placement.pin_az_via_ha_rules`, or `pve.placement.anti_affinity.use_ha_rules` is enabled, `create_vm` separately logs a warning naming the non-shared `iso_storage` pool and the triggering feature, and `pve.require_shared_iso_for_ha: true` escalates that warning to a `create_vm` error. See [ConfigDrive — Migration and HA interaction](configdrive.md#migration-and-ha-interaction) for the full detail.
 
 ### Recommended configuration
 

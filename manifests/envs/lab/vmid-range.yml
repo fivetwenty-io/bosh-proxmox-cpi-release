@@ -2,11 +2,16 @@
 # Env bundle: lab — VMID range override
 #
 # Sets pve.vmid_range_start to 200 so the CPI allocates VMIDs from 200
-# upward (VMIDs 100-199 are reserved for manually-managed VMs: drgao-bastion=100,
-# wayne-bastion=101, ocfp-artifacts=138, etc.; CPI-managed VMs start at 200
-# and count up to 5999; persistent disks use 9000-9999).
+# upward. VMIDs 100-199 are reserved for manually-managed VMs (drgao-bastion=100,
+# wayne-bastion=101, ocfp-artifacts=138, etc.).
 #
-# Property path confirmed via jobs/pve_cpi/spec line 82.
+# Only the start is overridden here; every other band keeps its spec default,
+# so this env's effective bands are VMs 200-8999, persistent disks 9000-29999,
+# and stemcell templates 30000-30999. The multi-CPI manifests/cpi-config.yml
+# narrows these further per entry so two clusters never share a band — see
+# docs/multi-cluster.md.
+#
+# Property: pve.vmid_range_start (jobs/pve_cpi/spec).
 #
 # Apply after manifests/bosh/cpi.yml.
 #

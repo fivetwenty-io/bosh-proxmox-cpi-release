@@ -27,20 +27,21 @@ Create a CPI config file (e.g. `~/.bosh-pve-cpi/cpi.json`):
   "node": "pve1",
   "vm_storage": "local-lvm",
   "disk_storage": "local-lvm",
-  "stemcell_storage": "local-lvm",
+  "stemcell_storage": "local",
   "network_bridge": "vmbr0",
   "verify_ssl": false,
   "agent_mode": "noagent",
   "vm_disk_format": "qcow2",
   "log_level": "info",
-  "vmid_range_start": 9000
+  "vmid_range_start": 8000
 }
 ```
 
 Notes:
 
 - `agent_mode: noagent` is recommended for lifecycle tests — the harness validates CPI plumbing, not agent bootstrap. Set `cloudinit` to exercise the full agent handoff.
-- `vmid_range_start: 9000` (or any value above your production VMID range) avoids conflicts with real workloads.
+- `stemcell_storage` must be a file-backed pool (`dir`, `nfs`, `cifs`, `cephfs`, `glusterfs`, `btrfs`) with `import` content enabled — block pools (`lvm`, `lvmthin`, `zfspool`, `rbd`) are rejected at `create_stemcell`. `local` is the stock file-backed pool on a default PVE install; `vm_storage` and `disk_storage` have no such restriction.
+- `vmid_range_start: 8000` narrows the VM band away from your production workloads while staying inside `[100, 8999]`. Keep the start below `vmid_range_end` (default `8999`) — persistent disks own 9000–29999 and stemcell templates 30000–30999, so a VM band reaching into those fails config validation.
 - Use an API token rather than a password — it appears in PVE audit logs as a distinct identity and can be revoked independently.
 
 ### Run

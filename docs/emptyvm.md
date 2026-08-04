@@ -111,7 +111,7 @@ Watch the task output. A clean run takes roughly one to two minutes and proceeds
 
 3. `create_disk` + `attach_disk` — allocates a synthetic vmid in `[9000,29999]`, creates `vm-<vmid>-disk-0` on `pve_disk_storage`, attaches it to the new VM as `scsiN`.
 
-4. Agent configuration — uploads the ConfigDrive ISO to `pve_iso_storage` (default `local`), attaches as `scsi30`, starts the VM.
+4. Agent configuration — uploads the ConfigDrive ISO to the effective ISO pool (`pve_vm_storage` by default, since `pve.iso_storage_follow_vm_storage` defaults true and treats `iso_storage: local` as unset), attaches as `scsi30`, starts the VM.
 
 5. Agent handshake — the bosh-agent boots from the stemcell, reads `settings.json` via the OpenStack ConfigDrive datasource, binds the mbus endpoint on `:6868`, registers with the Director.
 
@@ -155,7 +155,7 @@ The Director's DNS (1.1.1.1 / 8.8.8.8 by default) cannot resolve tailnet hostnam
 can't upload to storage type 'lvmthin'
 ```
 
-`pve_iso_storage` must be a file-backed storage (dir/nfs/cifs). Block storages cannot hold ISO files. Default is `local`. Set explicitly in `vars.yml` if your `local` pool was renamed.
+`pve_iso_storage` must be a file-backed storage (dir/nfs/cifs). Block storages cannot hold ISO files. By default the CPI follows `pve_vm_storage` (`pve.iso_storage_follow_vm_storage`, default true) and falls back to `pve_iso_storage` — spec default `local` — with a warning when `vm_storage` is block-backed or non-shared. Set `pve_iso_storage` to an explicit file-backed pool in `vars.yml` to pin it.
 
 ### Persistent disk name collision
 

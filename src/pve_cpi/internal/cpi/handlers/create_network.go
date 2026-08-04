@@ -67,10 +67,10 @@ const vlanMaxTag = 4094
 //
 // Routing — the mode sets the default path; an unambiguous call/profile-level
 // request overrides it:
-//   - NetworkMode=="sdn" (default): SDN, unless cloud_properties names a bridge
+//   - NetworkMode=="sdn": SDN, unless cloud_properties names a bridge
 //     and neither a zone nor a vnet (explicit bridge request → bridge path).
-//   - NetworkMode=="bridge": bridge, unless cloud_properties names a zone or a
-//     vnet (explicit SDN request → SDN path).
+//   - NetworkMode=="bridge" (default): bridge, unless cloud_properties names a
+//     zone or a vnet (explicit SDN request → SDN path).
 //   - "auto" (legacy heuristic): SDN when a zone is resolvable (call, profile,
 //     or config sdn_zone) or a vnet is named; bridge fallback otherwise.
 //   - No routing info → cpierrors.Cloud.

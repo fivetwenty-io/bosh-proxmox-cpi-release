@@ -2804,7 +2804,7 @@ func (c *CPIConfig) validateDiskDeleteStateGuardEnum(errs *[]string) {
 		// valid
 	default:
 		*errs = append(*errs, fmt.Sprintf(
-			"disk_delete_state_guard must be one of off|on (or empty for default off), got %q",
+			"disk_delete_state_guard must be one of off|on (or empty for default on), got %q",
 			c.DiskDeleteStateGuard,
 		))
 	}

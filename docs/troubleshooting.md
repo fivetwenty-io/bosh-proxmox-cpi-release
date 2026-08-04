@@ -432,12 +432,12 @@ Enable `import` content on the storage in the PVE web UI under Datacenter → St
 **Symptom**
 
 ```text
-ParseStemcellCID: legacy integer CID "5042" not supported in direct-qcow mode; clear the stemcell entry from BOSH state and re-upload to regenerate the CID
+ParseStemcellPathCID: CID "5042" missing leading ':' — expected ":light:<storage>:import/<file>" or ":heavy:<storage>:import/<file>"
 ```
 
 **Diagnosis**
 
-The BOSH state database holds a legacy integer CID from a previous CPI version. The current CPI uses a content-addressed string CID.
+The BOSH state database holds a legacy integer (template-VMID) CID from a previous CPI version. The current CPI uses a path-identity string CID: `:light:<storage>:import/<file>` for an operator-managed qcow2, `:heavy:<storage>:import/<file>` for one the CPI uploaded.
 
 **Fix**
 

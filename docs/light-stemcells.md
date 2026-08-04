@@ -15,8 +15,8 @@ There is no legacy CID compatibility: `create_stemcell` and `delete_stemcell` ac
 | Mode | `cloud_properties` | Who owns the file | When the CPI deletes it |
 |---|---|---|---|
 | **Pre-uploaded** (`:light:`) | `image_id` + required `sha256` | Operator | Never |
-| **CPI-fetch** (`:light:` — see [naming note](#a-naming-note-image_url-produces-heavy-not-light) below) | `image_url` (+ optional `image_url_auth`) | CPI | At last director reference in this cluster |
-| **Server-side download** (`:heavy:`) | `source_url` (+ optional `sha256`) | CPI | At last director reference in this cluster |
+| **CPI-fetch** (`:heavy:` — see [naming note](#a-naming-note-image_url-produces-heavy-not-light) below) | `image_url` (+ optional `image_url_auth`) | CPI | At last director reference in this cluster |
+| **Server-side download** (`:heavy:`) | `source_url` + required `sha256` | CPI | At last director reference in this cluster |
 | **Heavy tarball upload** (`:heavy:`) | none of the above — the normal `bosh upload-stemcell` path | CPI | At last director reference in this cluster |
 
 `image_id`, `image_url`, and `source_url` are mutually exclusive; setting more than one is a `create_stemcell` error.
@@ -69,7 +69,7 @@ Light-stemcell modes (pre-uploaded, CPI-fetch, and server-side download all shar
 
 The operator uploads the qcow2 to PVE storage manually and declares its SHA-256 digest. The CPI never uploads, deletes, or rewrites the underlying volume — it only confirms the file is present, builds (or reuses) a frozen cache template from it, and registers this director's reference.
 
-`cloud_properties.sha256` is **required** in this mode (not optional, unlike the tarball and server-download paths): content identity and sha-tag cache dedup both depend on it, and a missing or malformed digest is a hard `create_stemcell` error before any PVE call is made.
+`cloud_properties.sha256` is **required** in this mode (the tarball and CPI-fetch paths compute the digest themselves from bytes they handle; this one and server-download cannot): content identity and sha-tag cache dedup both depend on it, and a missing or malformed digest is a hard `create_stemcell` error before any PVE call is made.
 
 ### Operator workflow
 
@@ -135,9 +135,9 @@ The operator uploads the qcow2 to PVE storage manually and declares its SHA-256 
 | `storage %q is local on a multi-node cluster` | Local-dir/btrfs storage on a cluster with no node pin. | Add `cloud_properties.node: <nodename>`. |
 | `storage %q (type=%q) is block-only` | LVM, ZFS, or RBD storage chosen. | Switch to a file-content storage (nfs, dir, cephfs, cifs, glusterfs, btrfs). |
 
-## Mode 2: CPI-assisted fetch (`:light:`)
+## Mode 2: CPI-assisted fetch (`:heavy:`)
 
-The CPI fetches the qcow2 from a remote URL, streams it into PVE storage while computing its SHA-256 in one pass, builds (or reuses) a frozen cache template, and returns a `:light:` CID (see the [naming note](#a-naming-note-image_url-produces-heavy-not-light) above — this mode transfers bytes under CPI control, but retains the `:light:` label used by the historical "light stemcell" feature name). Subsequent `bosh upload-stemcell` calls for the same content skip the download entirely.
+The CPI fetches the qcow2 from a remote URL, streams it into PVE storage while computing its SHA-256 in one pass, builds (or reuses) a frozen cache template, and returns a `:heavy:` CID (see the [naming note](#a-naming-note-image_url-produces-heavy-not-light) above — this mode is covered by the "light stemcell" umbrella term because of the historical feature name, but the CPI transferred the bytes, so it owns deleting them). Subsequent `bosh upload-stemcell` calls for the same content skip the download entirely.
 
 ### URL schemes
 
@@ -249,12 +249,18 @@ Before fetching, the CPI does a best-effort prefix scan of storage for any exist
 
 `cloud_properties.source_url` streams the image directly into PVE storage via PVE's own `download-url` API (`POST /nodes/{node}/storage/{storage}/download-url`, requires PVE 7.2+) — only the PVE node needs network access to `source_url`, not the CPI host. The CPI never transfers image bytes in this mode, but it does own the resulting import volume (the operator didn't pre-place it), so the returned CID is always `:heavy:`.
 
-`cloud_properties.sha256` is optional but strongly recommended: when set, it is forwarded to PVE as a server-side checksum (a task failure on mismatch is a non-retriable `create_stemcell` error) and baked into the canonical filename for exact-content dedup and sha-tag cache identity. When absent, the CPI logs a warning and falls back to a `name`+`version`-only filename (weak identity — two different `source_url`s with the same name+version and no `sha256` share one import volume, first-writer wins) and looks up the cache template by name rather than by content hash.
+`cloud_properties.sha256` is **required** in this mode. It is forwarded to PVE as a server-side checksum (a task failure on mismatch is a non-retriable `create_stemcell` error) and baked into the canonical filename for exact-content dedup and sha-tag cache identity. A missing or malformed digest is a hard `create_stemcell` error raised before any PVE call:
+
+```text
+create_stemcell: server-download (cloud_properties.source_url) requires cloud_properties.sha256 so content identity and dedup work (must be a 64-character hex string, got "")
+```
+
+PVE, not the CPI, streams these bytes, so this path never computes a digest of its own to fall back on.
 
 ```yaml
 cloud_properties:
   source_url: "https://artifacts.corp/stemcells/ubuntu-jammy-1.438.qcow2"
-  sha256: "<64-character sha256 hex digest>"   # optional but recommended
+  sha256: "<64-character sha256 hex digest>"   # required
   name: ubuntu-jammy
   version: "1.438"
   disk_format: qcow2
@@ -284,8 +290,16 @@ flowchart LR
 `ensureTemplateVM` tags every cache template with `bosh-stemcell-sha-<sha8>` (the first 8 hex characters of the qcow2's SHA-256) when the digest is known. On a subsequent `create_stemcell` call for the same content:
 
 1. A cluster-wide lookup by the `bosh-stemcell-sha-<sha8>` tag finds existing candidates. Each candidate's full SHA-256 (recorded in its provenance description) is re-verified against the wanted digest before reuse — a sha8 tag match alone is not proof of identity, since two different images can share an 8-hex-character tag by chance.
-2. When sha8 is unknown (server-download with no `sha256`, the one remaining case), the CPI falls back to a deterministic name lookup instead — a weaker identity, never used when content-addressed identity is available.
+2. When sha8 is unknown the CPI falls back to a deterministic name lookup instead — a weaker identity, never used when content-addressed identity is available. Every mode now requires a digest, so this fallback is unreachable in normal operation.
 3. If two `create_stemcell` calls race and both build a template for the same content, `reconcileTemplateRace` re-scans after freeze, keeps the lowest-VMID survivor cluster-wide, and deletes the loser's duplicate.
+
+### Templates from a previous CPI generation
+
+The sha8 tag records *content*, not ownership. Any CPI generation that ever cached the same BOSH stemcell on this cluster wrote the identical tag, so tag identity alone cannot tell "our cache template" from "a template some older CPI built and a still-running director is cloning from". Adopting the latter would register a reference against a template whose provenance records none, and the first `delete_stemcell` for that content would then see a reference count of zero and destroy a live template out from under the older director.
+
+Every sha8-keyed lookup and sweep therefore requires a second marker before a template is eligible at all: either `bosh-stemcell-cache` (stamped on every cache template this CPI builds) or a `director--<uuid>` reference tag (stamped when a director registers a reference, which keeps an already-adopted template visible for refcounting and eventual cleanup). A template carrying neither is invisible — never adopted, never swept, never destroyed.
+
+The practical consequence on a cluster mid-upgrade: the CPI builds its own cache template alongside the older generation's rather than reusing it, so both exist for a while and the same stemcell occupies template VMIDs twice. That is deliberate — a duplicated template costs disk, while a wrongly adopted one costs a running foundation. Once no director depends on the older templates, delete them manually; the CPI will never do it.
 
 ### VMID range
 

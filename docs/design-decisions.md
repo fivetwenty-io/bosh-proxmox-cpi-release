@@ -15,10 +15,11 @@ This is the operator-facing record of the design decisions behind the pre-releas
 | D5 | `network_mode` default | `bridge` (plain Linux bridges, zero SDN prerequisites); SDN is a one-line opt-in |
 | D6 | Resource pools | Kept default-on (`bosh`/`bosh-templates`); added a startup preflight that fails fast on a missing grant |
 | D7 | `iso_storage` default | Follows `vm_storage` when eligible, instead of always defaulting to node-local `local` |
-| D8 | Copy-vs-move / storage identity | Full backing-identity normalization: two storage IDs pointing at the same export are recognized as the same storage everywhere a storage-equality decision is made |
+| D8 | Copy-vs-move / storage identity | Full backing-identity normalization: two storage IDs pointing at the same export are recognized as the same storage at every point the CPI compares two storage identities |
 | D9 | Cross-cluster delete safety | `pve.destroy_unreferenced_disks` now defaults to `false` |
 | D10 | qcow2 deletion policy | `:light:` files are never deleted by the CPI; `:heavy:` files are deleted only at the last director reference within a cluster |
 | D11 | HA versus the BOSH resurrector | An active, once-per-process warning plus a dedicated ownership doc; no change to `has_vm` behavior |
+| D12 | Per-request cloud-property overrides | BOSH's nested cpi-config context flattened into a closed `pve_*` override registry, with every overridable field in the client-bundle cache key |
 
 ---
 
@@ -45,7 +46,7 @@ The leading colon is deliberate: no PVE storage identifier can begin with `:`, s
 
 ### CID family reference
 
-The CPI emits and accepts five CID shapes in total:
+The CPI emits and accepts six CID shapes in total:
 
 | Family | Format | Meaning |
 |---|---|---|
@@ -74,7 +75,7 @@ Every `create_stemcell` call builds (or reuses) the per-cluster cache template, 
 
 **Chosen: both, with `template` as the default.** `pve.stemcell_strategy` accepts `template` (clone the per-cluster cache — the fast path, and the default) or `import` (import-from the stemcell qcow2 directly — slower, but the resulting VM shares no base volume with any other clone). A per-stemcell `cloud_properties.stemcell_strategy` overrides the global default.
 
-**Implementation note.** `create_vm` never builds a template itself — that stays `create_stemcell`'s job. If `stemcell_strategy: template` is in effect and the cluster-scoped cache-template lookup finds no match for the stemcell's content hash (a manually deleted cache, or an unextractable hash from the CID's filename), `create_vm` logs a warning and falls back to `strategy: import` for that one VM rather than failing or attempting to rebuild the cache inline.
+**Implementation note.** `create_vm` never builds a template itself — that stays `create_stemcell`'s job. If `stemcell_strategy: template` is in effect and the cluster-scoped cache-template lookup finds no match for the stemcell's content hash (a manually deleted cache, or an unextractable hash from the CID's filename), `create_vm` logs a warning and falls back to `strategy: import` for that one VM rather than failing or attempting to rebuild the cache inline. The same fallback also covers a cache template that disappears mid-flight — if the clone call itself fails because the source template was deleted between lookup and clone, `create_vm` logs a warning and imports directly rather than failing the VM.
 
 **Operator-visible consequences.** No change for the common case — clone-from-cache remains the default and behaves as before. Set `stemcell_strategy: import` (globally or per stemcell) when you need import semantics.
 
@@ -88,7 +89,7 @@ Every `create_stemcell` call builds (or reuses) the per-cluster cache template, 
 
 **Options considered.** No refcounting at all (first delete wins, unsafe for the two-director pattern); a CID-keyed reference count; a set of BOSH director UUIDs stored on the template itself, keyed off the director UUID BOSH already sends on every JSON-RPC request context.
 
-**Chosen: the director-UUID set.** Every cache template's provenance JSON carries `director_refs`, a set (not a counter — duplicate registrations from the same director are idempotent) of the director UUIDs currently depending on it. `create_stemcell` registers the calling director's UUID on every return path, fresh build or dedup hit alike. `delete_stemcell` removes the calling director's UUID; the template (and, for `:heavy:`, the qcow2) is destroyed only when that removal empties the set.
+**Chosen: the director-UUID set.** Every cache template's provenance JSON carries `director_refs`, a set (not a counter — duplicate registrations from the same director are idempotent) of the director UUIDs currently depending on it. A request that arrives with no director UUID in its context is recorded under a single reserved "unknown director" entry rather than being dropped, so an unattributed `create_stemcell` still holds a reference. `create_stemcell` registers the calling director's UUID on every return path, fresh build or dedup hit alike. `delete_stemcell` removes the calling director's UUID; the template (and, for `:heavy:`, the qcow2) is destroyed only when that removal empties the set.
 
 **The trapdoor fix.** When a delete empties the reference set, the CPI destroys the template *first* — the provenance is never separately rewritten to "empty" beforehand. If the destroy fails (for example, PVE reports the template still backs a linked clone), the template's provenance is untouched and a `bosh-destroy-pending` tag marks it so a retried `delete_stemcell` resumes the destroy directly instead of re-deriving "was this the last reference".
 
@@ -166,9 +167,9 @@ Both were already anticipated in the pre-existing per-NIC design; the bridge-mod
 
 **Options considered.** Keep `local` as the default; require `iso_storage` to be set explicitly (a breaking change with no default); default to following `vm_storage` when it is eligible.
 
-**Chosen: follow `vm_storage` by default.** `pve.iso_storage_follow_vm_storage` defaults `true`: at CPI process startup, before any `create_vm` call, the CPI resolves the ISO pool to `vm_storage` instead of the spec's `local` default — provided `vm_storage` advertises PVE content type `iso` and is shared. An explicitly-set `pve.iso_storage` always wins over this behavior. Setting `iso_storage_follow_vm_storage: false` restores the old always-`local` default.
+**Chosen: follow `vm_storage` by default.** `pve.iso_storage_follow_vm_storage` defaults `true`: at CPI process startup, before any `create_vm` call, the CPI resolves the ISO pool to `vm_storage` instead of the spec's `local` default — provided `vm_storage` advertises PVE content type `iso` and is shared. An `iso_storage` pinned to any value *other than* the spec default `local` always wins over this behavior. Because BOSH renders the `local` default into the job config whether or not the operator set it, the CPI cannot distinguish "unset" from "explicitly `local`", so it treats the literal value `local` as the unset signal. Setting `iso_storage_follow_vm_storage: false` restores the old always-`local` default.
 
-**Operator-visible consequences.** HA/DLB-enabled deployments on a shared `vm_storage` pool that also serves `iso` content no longer need a separate `iso_storage` manifest edit to avoid the migration-safety warning. Genuinely single-node deployments that set `iso_storage: local` explicitly (the deliberate, documented shape for the repo's single-node lab manifests) are unaffected — an explicit value always wins.
+**Operator-visible consequences.** HA/DLB-enabled deployments on a shared `vm_storage` pool that also serves `iso` content no longer need a separate `iso_storage` manifest edit to avoid the migration-safety warning. Genuinely single-node deployments cannot pin the node-local pool by writing `iso_storage: local` — that value reads as "unset" and gets `vm_storage`-following. Either set `iso_storage_follow_vm_storage: false`, or name the node-local pool under a distinct storage ID. When `vm_storage` is block-backed or non-shared the CPI falls back to `iso_storage` unchanged and logs a warning, so the practical outcome on a single-node lvmthin lab is still `local` — by fail-open, not by precedence.
 
 **Migration.** None required.
 
@@ -180,9 +181,9 @@ Both were already anticipated in the pre-existing per-NIC design; the bridge-mod
 
 **Options considered.** Fix only the clone-target bug narrowly; fix the clone path plus the storage-mismatch check; normalize backing identity at every storage-comparison decision point in the codebase.
 
-**Chosen: full normalization.** `StorageInfo.BackingKey()` returns a normalized physical identity for a storage entry: server-plus-export (host lowercased, export path cleaned) for NFS/CIFS, cleaned path for `dir`, and — deliberately — the bare storage ID itself for every other type (`lvm`, `lvmthin`, `zfspool`, `rbd`, `cephfs`, `glusterfs`, `pbs`, `btrfs`). Those other types never normalize to a shared key, even if they might wrap the same underlying device, because the CPI has no reliable way to prove it and a wrong merge is worse than none. Two storage IDs sharing a `BackingKey` are now treated as "the same storage" everywhere a storage-equality decision is made: clone-mode auto/linked selection, the clone target-validation fix (validated against the *template's* storage, not the destination's), disk fault-domain placement constraints, attach-disk co-location, and the DLB/ConfigDrive shared-storage checks. At startup, the CPI warns when two of your configured storage IDs (across VM, disk, stemcell, and ISO pools) share a `BackingKey`.
+**Chosen: full normalization.** `StorageInfo.BackingKey()` returns a normalized physical identity for a storage entry: server-plus-export (host lowercased, export path cleaned) for NFS/CIFS, cleaned path for `dir`, and — deliberately — the bare storage ID itself for every other type (`lvm`, `lvmthin`, `zfspool`, `rbd`, `cephfs`, `glusterfs`, `pbs`, `btrfs`). Those other types never normalize to a shared key, even if they might wrap the same underlying device, because the CPI has no reliable way to prove it and a wrong merge is worse than none. Two storage IDs sharing a `BackingKey` are now treated as "the same storage" at both places the CPI compares two storage identities: clone-mode auto/linked selection, including the clone target-validation fix (validated against the *template's* storage, not the destination's), and the shared-storage classification behind the DLB and ConfigDrive migration-safety checks. The two remaining places a duplicate registration could have bitten — disk fault-domain placement and attach-disk co-location — turned out to need no fix: neither compares two storage IDs. Fault-domain classifies each disk's own pool independently, and attach-disk compares node names. Both are covered by regression tests against the "two IDs, one export" fixture. On its first storage lookup, the CPI warns when two storage IDs in the cluster's `/storage` index share a `BackingKey`.
 
-**Operator-visible consequences.** `clone_mode: auto` now correctly stays a fast linked clone when the template's and the destination VM's storage IDs differ in name but share a physical backing, instead of silently downgrading to a full copy. A duplicate-registration mistake (the same export under two names) now surfaces as a startup warning instead of producing inconsistent behavior you'd have to debug from symptoms.
+**Operator-visible consequences.** `clone_mode: auto` now correctly stays a fast linked clone when the template's and the destination VM's storage IDs differ in name but share a physical backing, instead of silently downgrading to a full copy. A duplicate-registration mistake (the same export under two names) now surfaces as a warning on the CPI's first storage lookup instead of producing inconsistent behavior you'd have to debug from symptoms.
 
 **Migration.** None required — this only widens what the CPI recognizes as "the same storage." Genuinely distinct backings behave exactly as before.
 
@@ -194,7 +195,7 @@ Both were already anticipated in the pre-existing per-NIC design; the bridge-mod
 
 **Options considered.** Leave the flag unconditionally `true` (the status quo — unsafe the moment storage is shared); default it `false` with no way to opt back in (loses a real cleanup benefit for genuinely single-cluster storage); default `false`, with an explicit opt-in flag.
 
-**Chosen: default `false`, opt-in via `pve.destroy_unreferenced_disks`.** The new config flag gates `DestroyUnreferencedDisks` at every site that sets it: the synchronous `delete_vm` path, the fast-path delete, the fast-path straggler sweep, and template teardown in `delete_stemcell`. Enable it only when the storage pools this CPI is configured against are **not** shared with any other independent PVE cluster or non-CPI tooling that allocates VMIDs in the same range.
+**Chosen: default `false`, opt-in via `pve.destroy_unreferenced_disks`.** The new config flag gates `DestroyUnreferencedDisks` at every site that sets it: the synchronous `delete_vm` path, the fast-path delete, the fast-path straggler sweep, template teardown in `delete_stemcell`, the freeze-failure template cleanup in `create_stemcell`, and the rollback purge in `create_vm`. Enable it only when the storage pools this CPI is configured against are **not** shared with any other independent PVE cluster or non-CPI tooling that allocates VMIDs in the same range.
 
 **A companion fix.** The VMID-allocation-time storage scan (`WithStorageScan`, which prevents a *new* allocation from colliding with a foreign cluster's existing volumes) previously covered only the VM-storage and disk-storage pools. It now also covers parker-VM allocation (the `detached_disk_strategy: parked` band) and the ISO-storage pool, closing two allocation-time gaps that mirrored the same underlying hazard.
 
@@ -229,6 +230,24 @@ Both were already anticipated in the pre-existing per-NIC design; the bridge-mod
 **Operator-visible consequences.** The first HA-registered `create_vm` in a CPI process's lifetime produces a clear, actionable warning in the CPI log. See [HA and Resurrection](ha-and-resurrection.md) for the complete ownership model, the double-healing race in detail, and remediation.
 
 **Migration.** None — this is warn-only and does not change `create_vm`'s or `has_vm`'s success/failure outcomes.
+
+---
+
+## D12 — Per-request cloud-property overrides from cpi-config
+
+**Context.** BOSH's cpi-config feature lets one Director register several named CPI entries — two `type: pve` blocks pointing at distinct Proxmox clusters, say — and BOSH resolves the executable from the entry's `type`, so every entry dispatches into the *same* running instance of this CPI binary. The Director communicates which entry a request belongs to by merging that entry's `properties:` hash into the JSON-RPC request context. Nothing in the CPI read those keys back out, so every request ran against whichever `pve.*` config the process happened to be launched with — silently uploading stemcells and creating VMs on the wrong cluster while reporting success. This is the mechanism the entire multi-cluster story rests on; without it, a second cpi-config entry is decorative.
+
+**Options considered.** Job-config only, requiring one CPI release deployment per cluster (rejected — it defeats the point of cpi-config and doubles the operational surface); per-request overrides read from flat `pve_*` context keys; per-request overrides that additionally fold BOSH's real nested context shape into that flat namespace.
+
+**Chosen: per-request overrides with nested-shape flattening.** The Director does not deliver an entry's properties as flat keys. It merges the whole `properties:` hash verbatim, so they arrive nested — `context.pve = {host: …, vm_storage: …}` and `context.agent = {mbus: …}`. The CPI flattens each key of the nested `pve` map to `pve_<key>` (and `context.agent.mbus` to `pve_agent_mbus`) before applying it, with an explicit flat key always winning over a nested one.
+
+The set of overridable fields is a closed registry, not "anything in the context". It covers connection and routing identity (host, port, user, password/token, realm, node), the four storage pools, the network bridge, `verify_ssl`, every VMID band (VM, disk, stemcell-template, and parker), `stemcell_replicate_local`, `vm_prefix`, `agent_mode`, `vm_disk_format`, and the agent mbus. Everything else — disk-performance policy, HA and anti-affinity behavior, retry curves, placement weights — is process-wide operating policy rather than a property of which cluster a request targets, and continues to come from the job config unconditionally.
+
+Two guardrails matter operationally. First, a key inside the registry carrying an uncoercible value, or a fully-merged effective config that fails the same validation the job config must pass at startup, is a hard error rather than a silent fall-back to the job config — falling back would reproduce the exact "request quietly runs against the wrong cluster" defect the mechanism exists to close. Unknown keys outside the registry are ignored, since most `pve.*` properties are legitimately job-level-only. Second, every overridable field participates in the per-request client-bundle cache key, so two requests resolving to the same effective config share one cached PVE client, boot agent, and backend resolver, while any difference in a keyed field — including a VMID band or `stemcell_replicate_local` — yields a distinct bundle rather than silently reusing another cluster's connection.
+
+**Operator-visible consequences.** One deployed CPI release serves several PVE clusters, each cpi-config entry carrying its own credentials, storage pools, disjoint VMID bands, and its own `stemcell_replicate_local` setting. Because each entry builds its own client bundle, it also builds its own storage-info cache — which is why the duplicate-backing warning (D8) fires per entry rather than once per process. Entry-to-entry band disjointness remains an operator convention: the CPI validates its own four bands against each other within one effective config, but it cannot see a sibling entry's bands. See [Multi-Cluster Deployments](multi-cluster.md).
+
+**Migration.** None for single-cluster deployments — a request with no `pve_*` context keys resolves to the job-level config unchanged. Multi-cluster operators should confirm every entry's bands are disjoint before applying a cpi-config with more than one `type: pve` entry.
 
 ---
 

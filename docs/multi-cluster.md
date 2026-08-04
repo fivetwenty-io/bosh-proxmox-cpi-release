@@ -12,7 +12,7 @@ BOSH resolves the executable to run for a cpi-config entry from its `type` field
 
 ```yaml
 cpis:
-- name: pve-cpi-az1
+- name: pve-az1
   type: pve
   properties:
     pve:
@@ -32,7 +32,7 @@ cpis:
       stemcell_template_vmid_range_start: 30000
       stemcell_template_vmid_range_end: 30499
 
-- name: pve-cpi-az2
+- name: pve-az2
   type: pve
   properties:
     pve:
@@ -59,7 +59,7 @@ Apply it the same way as any other cpi-config:
 bosh update-cpi-config cpi-config.yml
 ```
 
-The repository ships a parameterized version of this manifest at `manifests/cpi-config.yml`, applied via `scripts/bosh update-cpi-config` — which layers the active env's vars (`BOSH_PVE_ENV`), then re-registers the active light stemcell against every entry with `--fix`. The AZ binding below ships as the ops layer `manifests/cf/multi-cpi-azs.yml`, which `scripts/cf cloud-config` applies automatically whenever the Director reports an active cpi-config.
+The repository ships a parameterized version of this manifest at `manifests/cpi-config.yml`, applied via `scripts/bosh update-cpi-config` — which layers the active env's vars (`BOSH_PVE_ENV`), then re-registers the active light stemcell against every entry with `--fix`. An AZ binding of this shape ships as the ops layer `manifests/cf/multi-cpi-azs.yml`, which `scripts/cf cloud-config` applies automatically whenever the Director reports an active cpi-config. That layer binds three AZs against the two shipped entries — `z1` and `z2` to `pve-az1`, `z3` to `pve-az2` — so the CF deployment keeps three AZs while the second cluster carries one of them.
 
 Note the two entries above share `stemcell_storage: nfs-shared` — a shared NFS export both clusters can reach — while every VMID range is disjoint between the two entries. That combination is the multi-cluster safety pattern this document exists to explain; see [Disjoint VMID banding](#disjoint-vmid-banding-the-multi-cluster-safety-pattern) below.
 
@@ -70,9 +70,9 @@ BOSH's `azs[].cpi` field binds an availability zone to a named cpi-config entry:
 ```yaml
 azs:
 - name: z1
-  cpi: pve-cpi-az1
+  cpi: pve-az1
 - name: z2
-  cpi: pve-cpi-az2
+  cpi: pve-az2
 ```
 
 Every operation BOSH performs against an instance in a given AZ — create, delete, cloud-check, resurrection — is dispatched exclusively through that AZ's bound CPI entry, and so exclusively against that AZ's PVE cluster.
@@ -82,8 +82,8 @@ Every operation BOSH performs against an instance in a given AZ — create, dele
 A stemcell upload binds to a specific cpi-config entry — uploading it once does **not** automatically register it against every entry. Upload normally against the first entry, then re-register the same content against each additional entry with `--fix`:
 
 ```bash
-bosh -e <alias> upload-stemcell <stemcell>.tgz --sha1 <sha1>          # registers against the first-seen entry
-bosh -e <alias> upload-stemcell <stemcell>.tgz --sha1 <sha1> --fix    # re-registers against every other named entry (e.g. pve-cpi-az2)
+bosh -e <alias> upload-stemcell <stemcell>.tgz          # registers against the first-seen entry
+bosh -e <alias> upload-stemcell <stemcell>.tgz --fix    # re-registers against every other named entry (e.g. pve-az2)
 ```
 
 Each `--fix` invocation runs `create_stemcell` against that entry's own cluster, which — per the eager-cache design in [Design Decisions — D1](design-decisions.md#the-refs-anchor-rule) — builds that cluster's own per-cluster cache template immediately, tagged `bosh-stemcell-cache`, and registers that entry's director UUID as a reference on it.
@@ -98,7 +98,7 @@ Treat a cross-cluster AZ reassignment as a blue/green instance-group change with
 
 Two safety mechanisms exist inside a single CPI process, and neither one extends across independent CPI processes:
 
-- **VMID-allocation storage scanning** (`WithStorageScan`) checks the shared storage pool for volumes belonging to VMIDs *outside* this cluster's own resource list before allocating a new one, closing the allocation-time collision for the one pool it scans. It now covers VM allocation, disk allocation, stemcell-template allocation, parker-VM allocation, and the ISO pool. But it is a read at allocation time with no cross-cluster lock: two clusters allocating concurrently can still pick the same VMID (a genuine time-of-check-to-time-of-use race), and it cannot repair a collision that already existed before this guard was added, or one created by non-CPI tooling.
+- **VMID-allocation storage scanning** checks the shared storage pool for volumes belonging to VMIDs *outside* this cluster's own resource list before allocating a new one, closing the allocation-time collision for the one pool it scans. It covers VM, stemcell-template, and parker-VM allocation (via `WithStorageScan`), disk allocation (built into `NextDiskVMID`), and the ISO pool (via `WithExtraStorageScan`, and only when `iso_storage` is a distinct third pool — a scan of `vm_storage` or `disk_storage` under another name would be redundant). But it is a read at allocation time with no cross-cluster lock: two clusters allocating concurrently can still pick the same VMID (a genuine time-of-check-to-time-of-use race), and it cannot repair a collision that already existed before this guard was added, or one created by non-CPI tooling.
 - **The pool-comment cluster lock** (used for VM metadata, disk metadata, stemcell-reference read-modify-write, and delete serialization) relies on PVE's `pmxcfs`, which is a per-cluster, corosync-backed filesystem. Two independent PVE clusters run two independent `pmxcfs` instances, so the same sentinel pool name can be "locked" simultaneously in both clusters — each cluster's lock is real, but neither serializes against the other.
 
 Because of this, **disjoint VMID banding across CPI entries sharing storage is not optional — it is the mechanism that makes shared storage safe at all.** Give every CPI entry that shares any storage pool with another entry a non-overlapping range for every band it uses:
@@ -120,11 +120,11 @@ When two or more CPI entries share a storage pool, three rules apply.
 
 **`destroy_unreferenced_disks` must stay `false`.** This is the default (see [Design Decisions — D9](design-decisions.md#d9--cross-cluster-delete-safety-destroy_unreferenced_disks-defaults-false)), and on shared storage it must remain the default. PVE's `DestroyUnreferencedDisks` flag frees every volume matching the destroyed VM's VMID that is not referenced in *this* cluster's view of that VM's config — with overlapping or accidentally-colliding VMID bands, that can free another cluster's live disks. Leave it off on any storage a second cluster can reach.
 
-**Watch for the duplicate-backing warning.** At startup, each CPI entry independently checks its *own* configured storage IDs (VM, disk, stemcell, ISO, and any tiers) for two IDs that resolve to the same physical export or path, and warns:
+**Watch for the duplicate-backing warning.** On its first storage lookup, each CPI entry independently checks every storage ID in *its own* cluster's `/storage` index for two IDs that resolve to the same physical export or path, and warns once per entry:
 
 > `storage_info: two or more storage IDs share one physical backing — two names, one export; prefer a single storage ID to avoid silent full-clone downgrades, cross-cluster VMID collisions, and split placement decisions`
 
-This check runs per CPI entry, against that entry's own storage configuration — it does not, and cannot, compare storage IDs across two separate cpi-config entries, even when both point at the same physical export under matching names. Seeing this warning means you registered the same export twice under different names *within one cluster's storage.cfg*; it is not a signal about cross-cluster sharing, which is expected and by design when you deliberately point two CPI entries at one shared pool.
+This check runs per CPI entry, against that entry's own cluster's storage index — it does not, and cannot, compare storage IDs across two separate cpi-config entries, even when both point at the same physical export under matching names. Seeing this warning means you registered the same export twice under different names *within one cluster's storage.cfg*; it is not a signal about cross-cluster sharing, which is expected and by design when you deliberately point two CPI entries at one shared pool.
 
 **A duplicate qcow2 filename is benign; a template VMID collision is not.** Stemcell qcow2 filenames are deterministic (name, version, and content hash), so two clusters uploading the identical stemcell to the same shared pool write the same path — harmless, since the content is identical. Cache templates, however, are built independently per cluster (each cluster needs its own guest configuration), so each cluster consumes a template VMID from its own stemcell-template band; that's exactly why the bands must stay disjoint.
 
@@ -139,8 +139,8 @@ Each cluster still builds and owns its own cache template. `create_stemcell` (ru
 `pve-cid stemcells --orphans` (see [Design Decisions — D4](design-decisions.md#d4--disk-cids-keep-the-envelope-ship-a-tool)) gives you the "what is safe to delete" view of one cluster's stemcell storage: qcow2 files correlated against cache templates and their director references. It is a single-cluster tool by construction — each run loads one CPI entry's `cpi.json`. `pve-cid` ships on the Director VM at `/var/vcap/packages/pve_cpi/bin/pve-cid` (not on `PATH` by default). For a full multi-cluster inventory, run it once per entry:
 
 ```bash
-pve-cid stemcells --orphans --config /path/to/pve-cpi-az1/cpi.json
-pve-cid stemcells --orphans --config /path/to/pve-cpi-az2/cpi.json
+pve-cid stemcells --orphans --config /path/to/pve-az1/cpi.json
+pve-cid stemcells --orphans --config /path/to/pve-az2/cpi.json
 ```
 
 An entry showing an orphan on shared `:light:` storage that another entry still actively references is expected and correct — orphan status is always relative to the one cluster the command was run against, exactly matching how director references are scoped.

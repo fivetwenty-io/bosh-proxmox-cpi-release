@@ -74,7 +74,7 @@ Observed contention points, in deploy-time order:
 
 5. **ConfigDrive upload** (`agent/configdrive` → `Storage().Upload` → task). One per VM. Uploads to the ISO storage, which may be the same or different from the VM storage; if the same, this stacks on top of the import + resize burst.
 
-6. **VM/disk delete** (`delete_vm` with `destroy-unreferenced-disks=true`, `delete_disk`). On scale-down or redeploy.
+6. **VM/disk delete** (`delete_vm`, `delete_disk`). On scale-down or redeploy. `delete_vm` passes `destroy-unreferenced-disks=true` only when `pve.destroy_unreferenced_disks` is enabled (default false) and the VM is not being retained; with the default, the destroy frees only volumes referenced in the VM's own config.
 
 ## The retry strategy
 
@@ -98,7 +98,7 @@ All storage-touching call sites use `RetryOnTransientOrLock`, which combines pus
 | `create_disk` | `CreateVolume` inside `AllocateDiskWithRetry` callback | transient_transport, pushback |
 | `delete_disk` | `DeleteVolume` | transient_transport, pushback |
 | `resize_disk` | `ResizeDisk` + await | transient_transport, pushback |
-| `delete_vm` | `DeleteQemu` (with `DestroyUnreferencedDisks=true`) | transient_transport, pushback |
+| `delete_vm` | `DeleteQemu` (`DestroyUnreferencedDisks` only when `pve.destroy_unreferenced_disks` is true; default false) | transient_transport, pushback |
 | `create_stemcell` | `Storage().Upload` + await (file handle reopened per attempt) | transient_transport, pushback |
 | `delete_stemcell` | `DeleteVolumeIfExists` | transient_transport, pushback |
 | `snapshot_disk` | `Snapshot` + await | transient_transport, pushback |

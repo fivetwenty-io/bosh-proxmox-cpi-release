@@ -156,7 +156,7 @@ UI (repeat for each row below):
 | `/storage/<vm_storage>` | `BoshOperator` | From `pve.vm_storage` |
 | `/storage/<disk_storage>` | `BoshOperator` | From `pve.disk_storage` |
 | `/storage/<stemcell_storage>` | `BoshOperator` | From `pve.stemcell_storage` (defaults to `vm_storage`) |
-| `/storage/<iso_storage>` | `BoshOperator` | From `pve.iso_storage` (defaults to `local`) |
+| `/storage/<iso_storage>` | `BoshOperator` | From `pve.iso_storage`. With `pve.iso_storage_follow_vm_storage` (default true) the effective ISO pool is `pve.vm_storage` when that pool has `iso` content and is shared — no extra grant needed. Grant this only for a pinned `iso_storage` pool distinct from `vm_storage` |
 | `/pool/<poolid>` | `BoshOperator` | Required for `Pool.Allocate` by default — needed for the `vm_pool` (`bosh`) and `stemcell_template_pool` (`bosh-templates`) create-if-missing pools; omit only when both are set to `""`. `Pool.Audit` is bundled in the same grant but only actually used when `cluster_lock_mode: pool` or `pool_reap_empty` is set |
 
 API:

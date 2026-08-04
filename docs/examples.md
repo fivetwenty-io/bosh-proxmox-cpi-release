@@ -21,7 +21,10 @@ cloud_provider:
       vm_storage: local-lvm
       disk_storage: local-lvm
       stemcell_storage: local
+      # vm_storage here is block-backed (local-lvm), which cannot hold ISOs, so
+      # pin the node-local file pool instead of following vm_storage.
       iso_storage: local
+      iso_storage_follow_vm_storage: false
       network_bridge: vmbr0
       verify_ssl: true
       agent_mode: cloudinit
@@ -43,7 +46,7 @@ The `agent.mbus` value shown is the `bosh-deployment` default for create-env boo
 | `pve.vm_storage` | Yes | Storage pool for VM root disks |
 | `pve.disk_storage` | Yes | Storage pool for persistent disks |
 | `pve.stemcell_storage` | No | File-backed pool for stemcell qcow2 images; falls back to `vm_storage` when unset |
-| `pve.iso_storage` | Yes | File-backed storage pool (`iso` content enabled) for ConfigDrive ISOs; block storages are rejected |
+| `pve.iso_storage` | No | File-backed pool (`iso` content enabled) for ConfigDrive ISOs; block storages are rejected. Defaults to following `pve.vm_storage` via `pve.iso_storage_follow_vm_storage` (default true), which treats the literal value `local` as "unset"; set `iso_storage` to a non-`local` pool, or set `iso_storage_follow_vm_storage: false`, to pin one explicitly |
 | `pve.network_bridge` | No | Default bridge for NICs that set no `bridge` cloud property; defaults to `vmbr0` |
 | `pve.agent_mode` | No | Bootstrap mode: `cloudinit`, `noagent`, or `auto`; defaults to `cloudinit`. `auto` always selects ConfigDrive regardless of stemcell API version. |
 

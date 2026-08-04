@@ -30,7 +30,8 @@ import (
 //	"iothread" bool   — enable/disable dedicated I/O thread
 //	"cache"    string — PVE cache mode: "none", "writethrough", "writeback",
 //	                    "unsafe", "directsync" (empty → remove cache option)
-//	"discard"  string — "on" or "off" (empty → remove discard option)
+//	"discard"  string — PVE discard mode: "ignore" or "on" (empty → remove
+//	                    discard option)
 //	"ssd"      bool   — mark as SSD emulation
 //	"backup"   bool   — include disk in vzdump backups
 //	"mbps_rd"  int    — read throughput limit in MB/s (0 → remove limit)

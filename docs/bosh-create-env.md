@@ -336,7 +336,7 @@ Add `manifests/vars.yml`, `manifests/state.json`, `manifests/creds.yml`, and `bo
 
 - **`lvm name 'data:vm-...' contains illegal characters` during attach**
 
-  Caused by a double-prefixed `disk_cid` reaching PVE's disk-config parser. Resolved by parsing the `disk_cid` (with `pve.ParseDiskCID`) before calling `AttachDisk` so PVE receives a single `<storage>:<volname>` value. Rebuild the release if seen on an old build.
+  Caused by a double-prefixed volid reaching PVE's disk-config parser. Resolved by decoding the `disk_cid` envelope with `pve.ParseEncodedDiskCID` (disk CIDs are `pvd-<base64url>`, or `pvz-<base64url(gzip)>` when compressed) and passing only the decoded bare `<storage>:<volname>` to `AttachDisk`. Rebuild the release if seen on an old build.
 
 - **`no such logical volume <storage>/vm-9NNN-disk-0` during attach on redeploy**
 

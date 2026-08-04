@@ -1270,13 +1270,23 @@ properties:
     default: "template"
   pve.stemcell_replicate_local:
     description: |
-      When true, create_stemcell uploads the stemcell qcow2 independently to every
-      candidate cluster node's local storage and creates a template VM per node (tagged
-      "bosh-stemcell-node-<node>"). Enables create_vm on local-storage nodes in
-      multi-node clusters. delete_stemcell removes all replicas (best-effort; a
-      single-node failure is logged and skipped rather than aborting). Default false:
-      local stemcell storage on a multi-node cluster is rejected at create_stemcell
-      time with a clear error directing the operator to use shared storage.
+      When true, create_stemcell builds a per-node cache template (tagged
+      "bosh-stemcell-node-<node>") on every candidate cluster node, enabling
+      create_vm on nodes that cannot reach a cross-node clone source.
+
+      The gate is pve.vm_storage — where every cache template's root disk
+      lands — not the stemcell (qcow2) pool. Replicas are built whenever
+      vm_storage classifies as node-local, regardless of whether the qcow2
+      pool is shared; a shared qcow2 pool only skips the per-node file copy,
+      not the per-node template. This applies to every stemcell kind,
+      including a pre-uploaded ":light:" image the operator owns.
+
+      delete_stemcell removes all replicas (best-effort; a single-node failure
+      is logged and skipped rather than aborting).
+
+      Default false: a node-local vm_storage on a multi-node cluster is then
+      rejected at create_stemcell time with a clear error directing the
+      operator to use shared storage or enable this flag.
     default: false
   pve.replica_adopt_timeout_sec:
     description: |

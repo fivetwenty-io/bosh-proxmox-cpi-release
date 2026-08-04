@@ -18,7 +18,7 @@ Property names and defaults are cross-referenced to [Configuration reference](co
 
 **Best practice.** VirtIO NICs give the best network throughput and the lowest CPU overhead of any PVE-emulated model; emulated hardware models (e1000, rtl8139) exist only for guests that cannot load VirtIO drivers.
 
-**CPI behavior.** Every NIC resolves to model `virtio` unless a call, profile, or global `network_model` override names something else. The default requires no configuration.
+**CPI behavior.** Every NIC resolves to model `virtio` unless an override names something else: `cloud_properties.network_model` at the call or `vm_type` profile layer, or `cloud_properties.network_defaults.model` / a per-NIC `networks[].cloud_properties.model` (`network_defaults` wins over the per-NIC value). There is no global `pve.network_model` property; the default requires no configuration.
 
 **Status.** Meets.
 
@@ -82,7 +82,7 @@ Property names and defaults are cross-referenced to [Configuration reference](co
 
 **Best practice.** An unset boot order leaves PVE to guess which device to boot from; on a multi-disk VM that guess is not guaranteed to land on the root disk.
 
-**CPI behavior.** Every VM the CPI creates or clones carries an explicit `boot: order=<root-disk-key>` naming the actual root disk device (`virtio0` by default, or `scsi0` when `pve.root_disk_bus: scsi` is set) — never left to PVE's own device-order heuristic.
+**CPI behavior.** Every VM the CPI creates carries an explicit `boot: order=<root-disk-key>` naming the actual root disk device (`virtio0` by default, or `scsi0` when `pve.root_disk_bus: scsi` is set) — written directly on the import path, and inherited on the clone path from a cache template the CPI stamped with the same order. Never left to PVE's own device-order heuristic.
 
 **Status.** Meets.
 
@@ -90,7 +90,7 @@ Property names and defaults are cross-referenced to [Configuration reference](co
 
 **Best practice.** The QEMU guest agent channel must exist in the VM config before the guest's first boot, or the in-guest agent package has nothing to attach to and IP/status reporting through PVE never comes up.
 
-**CPI behavior.** The CPI writes `agent: enabled=1` in the create payload before the VM is started — never as a post-boot reconfiguration.
+**CPI behavior.** The CPI writes `agent: enabled=1` before the VM is started — in the create payload on the import path, and as a pre-start config patch on the clone path — never as a post-boot reconfiguration.
 
 **Status.** Meets.
 
@@ -124,7 +124,7 @@ Property names and defaults are cross-referenced to [Configuration reference](co
 
 **Best practice.** Block-backed storages (LVM, LVM-thin, ZFS pool) reject the qcow2 format outright and only accept raw; file-backed storages (dir, NFS, CIFS) support qcow2's copy-on-write and snapshot capabilities that raw lacks.
 
-**CPI behavior.** `pve.vm_disk_format` defaults to `qcow2`, which is correct for file-backed pools. When no layer expresses an explicit format preference, the CPI omits the format parameter entirely on block-backed storage so PVE selects the correct default for that storage type itself, rather than forcing qcow2 where PVE would reject it.
+**CPI behavior.** `pve.vm_disk_format` defaults to `qcow2`, which is correct for file-backed pools. When no call- or profile-level layer expresses an explicit format preference, `create_disk` omits the format parameter entirely on block-backed storage so PVE selects the correct default for that storage type itself, rather than forcing qcow2 where PVE would reject it. (`create_vm`'s root disk is a separate path: its format is always carried in the import-from string.)
 
 **Status.** Meets.
 
@@ -156,7 +156,7 @@ Property names and defaults are cross-referenced to [Configuration reference](co
 
 **Best practice.** Registering the same physical export or path under two different PVE storage IDs looks harmless in `storage.cfg` but silently defeats identity-sensitive logic: linked-clone downgrade decisions, VMID-collision scanning, and placement all key off storage ID, not off the underlying bytes.
 
-**CPI behavior.** At startup, the CPI resolves the backing identity (server+export for NFS/CIFS, path for dir-style plugins) of every storage ID it is configured to use — VM, disk, stemcell, ISO, and any storage tiers — and warns once per process lifetime when two or more configured IDs resolve to the same physical backing: `storage_info: two or more storage IDs share one physical backing`. The check is per-CPI-entry only; it cannot see a second cpi-config entry's storage IDs, so it is not a signal about deliberate multi-cluster storage sharing (see [Multi-cluster deployments — Shared-storage rules](multi-cluster.md#shared-storage-rules)) — only about accidentally registering one export twice within a single cluster's `storage.cfg`.
+**CPI behavior.** On its first storage lookup, the CPI resolves the backing identity (server+export for NFS/CIFS, path for dir-style plugins) of every storage ID in the cluster's `/storage` index — not just the ones it is configured to use — and warns once per storage cache, in practice once per PVE client, so a process serving a second cpi-config context warns again for that context, when two or more IDs resolve to the same physical backing: `storage_info: two or more storage IDs share one physical backing`. The check is per-CPI-entry only; it cannot see a second cpi-config entry's storage IDs, so it is not a signal about deliberate multi-cluster storage sharing (see [Multi-cluster deployments — Shared-storage rules](multi-cluster.md#shared-storage-rules)) — only about accidentally registering one export twice within a single cluster's `storage.cfg`.
 
 **Status.** Meets — the check is a startup warning, not a hard failure; consolidate to a single storage ID per physical export when you see it.
 
@@ -182,7 +182,7 @@ Property names and defaults are cross-referenced to [Configuration reference](co
 
 **Best practice.** Re-uploading and re-converting an identical stemcell image on every deploy wastes storage and time; deduplicating by content hash lets repeat deploys of the same stemcell reuse the existing template.
 
-**CPI behavior.** Every stemcell template is tagged `bosh-stemcell-sha-<sha8>` from the image's SHA-256 digest; `create_stemcell` matches against that tag before uploading anything new.
+**CPI behavior.** Every stemcell template whose SHA-256 digest is known is tagged `bosh-stemcell-sha-<sha8>`. Before uploading, `create_stemcell` dedups on the deterministic qcow2 filename (which itself carries the sha8); the sha tag is what dedups the per-cluster cache template, confirmed against the full SHA-256 recorded in the template's provenance.
 
 **Status.** Meets.
 
@@ -190,7 +190,7 @@ Property names and defaults are cross-referenced to [Configuration reference](co
 
 **Best practice.** Streaming a stemcell image through the CPI process (download, then re-upload to PVE) doubles the transfer and adds a failure mode the platform's own download path does not have.
 
-**CPI behavior.** When `cloud_properties.source_url` is set, `create_stemcell` uses PVE's `download-url` storage API so PVE streams the image directly into storage rather than through the CPI process, and verifies the result against `cloud_properties.sha256` when supplied; when it is absent, the CPI warns that the image identity is weak rather than verifying against a lesser digest.
+**CPI behavior.** When `cloud_properties.source_url` is set, `create_stemcell` uses PVE's `download-url` storage API so PVE streams the image directly into storage rather than through the CPI process, and verifies the result against `cloud_properties.sha256`, which is required on this path — a `source_url` with no valid `sha256` fails `create_stemcell` outright rather than importing an unverified image.
 
 **Status.** Meets.
 
@@ -201,6 +201,22 @@ Property names and defaults are cross-referenced to [Configuration reference](co
 **CPI behavior.** The opt-in orphan-prune pass (`pve.stemcell.prune_orphans`) skips any template still referenced by a linked clone rather than destroying it, logging the skip by name. Provenance recording and director scoping are unconditional — no property controls them — since every CPI call carries the calling director's identity in its request context.
 
 **Status.** Configurable — enable `pve.stemcell.prune_orphans` to activate orphan detection and pruning; without it, stale templates accumulate and must be cleaned up by hand.
+
+**Template replication keyed on `vm_storage`, not the stemcell pool.**
+
+**Best practice.** A cache template can only be cloned onto a node that can actually read its disk. What decides that is where the template's *root disk* lands — `pve.vm_storage` — not where the stemcell qcow2 sits. Treating the two as the same pool skips replicas in exactly the split configuration that needs them: a shared NFS qcow2 pool with node-local `vm_storage`.
+
+**CPI behavior.** `pve.stemcell_replicate_local` (default `false`) gates replication, and when it is on, `create_stemcell` builds per-node template replicas whenever `vm_storage` classifies as node-local — regardless of the qcow2 pool's shared-ness, and for every stemcell kind including a pre-uploaded `:light:`. A shared qcow2 pool only suppresses the per-node *file* copy; the per-node template is still built. Classification reads PVE's live storage index rather than the raw `shared` flag, so an NFS pool without an explicit `shared: 1` entry is not misclassified. Replication failures are warn-only, and `delete_stemcell` sweeps replicas by sha8 tag.
+
+**Status.** Configurable — leave `stemcell_replicate_local: false` when `vm_storage` is shared; enable it when `vm_storage` is node-local on a multi-node cluster, which otherwise fails at `create_stemcell` time.
+
+**Cross-node clone pre-flight.**
+
+**Best practice.** PVE cannot clone across nodes when either side of the operation sits on node-local storage. Discovering that from PVE's own error mid-clone leaves a partially created VM to roll back.
+
+**CPI behavior.** When the cache template is on a different node than the VM's target, `create_vm` checks *both* sides before submitting the clone: the template's own storage must be shared, and so must the destination `vm_storage`. Either one failing is a clear, non-retriable rejection naming the pool, the two nodes, and the three ways out — enable `stemcell_replicate_local` so every node gets its own replica, pin `cloud_properties.node` to the template's node, or move the pool to shared storage.
+
+**Status.** Meets — the check is unconditional and needs no configuration.
 
 ## 4. Cloud-init / config drive
 
@@ -232,9 +248,9 @@ Property names and defaults are cross-referenced to [Configuration reference](co
 
 **Best practice.** A config-drive ISO on node-local storage blocks live migration and HA recovery of that VM, since the file does not exist on any other node — silently defeating DLB rebalancing, HA AZ pinning, and HA anti-affinity, all of which depend on migration actually working.
 
-**CPI behavior.** `pve.iso_storage` defaults to `local` (node-local). `pve.require_shared_iso_for_ha` (default `false`) escalates the CPI's migration-safety warning to a hard `create_vm` error whenever the VM is being HA-registered and the resolved ISO pool is not shared; `pve.iso_storage_follow_vm_storage` (default `false`) offers a path off `local` by resolving the ISO pool to `vm_storage` when that pool is shared and advertises `iso` content.
+**CPI behavior.** `pve.iso_storage` defaults to `local` (node-local). `pve.require_shared_iso_for_ha` (default `false`) escalates the CPI's migration-safety warning to a hard `create_vm` error whenever the VM is being HA-registered and the resolved ISO pool is not shared; `pve.iso_storage_follow_vm_storage` (default `true`) already offers a path off `local`, resolving the ISO pool to `vm_storage` whenever that pool is shared and advertises `iso` content. Because BOSH renders the `local` spec default for `iso_storage` unconditionally, the flag treats the literal value `local` as the "unset" signal — set `iso_storage` to any other value to pin a pool the flag will never override, or set the flag `false` to use `iso_storage` as configured.
 
-**Status.** Configurable — recommended: point `iso_storage` at a shared pool (or set `iso_storage_follow_vm_storage: true`) whenever DLB, HA AZ pinning, or HA anti-affinity is in use; set `require_shared_iso_for_ha: true` to make the gap fail closed.
+**Status.** Configurable — recommended: point `iso_storage` at a shared pool whenever DLB, HA AZ pinning, or HA anti-affinity is in use, or rely on the default `iso_storage_follow_vm_storage: true` when `vm_storage` is itself shared and advertises `iso` content; set `require_shared_iso_for_ha: true` to make the gap fail closed.
 
 **Credential-at-rest warning for local ISO storage.**
 
@@ -274,7 +290,7 @@ Property names and defaults are cross-referenced to [Configuration reference](co
 
 **Best practice.** VXLAN Network Identifiers are fabric-global — an EVPN zone's own control-plane VNI (`vrf-vxlan`) and an auto-allocated vnet tag share one identifier space, and PVE does not reject the collision; it silently cross-talks or blackholes traffic on the affected VRF.
 
-**CPI behavior.** `pve.sdn_vni_range_start`/`_end` (default 5000-5999) bounds auto-allocation, and the allocator excludes every zone-level `vrf-vxlan` value it can list from the candidate set, falling open with a single Warn if the zone listing itself fails.
+**CPI behavior.** `pve.sdn_vni_range_start`/`_end` (default 5000-5999 for vxlan/evpn zones, 2000-2999 when `sdn_zone_type` is `vlan` or `qinq`, so the band fits the 4094 VLAN ID cap) bounds auto-allocation, and the allocator excludes every zone-level `vrf-vxlan` value it can list from the candidate set, falling open with a single Warn if the zone listing itself fails.
 
 **Status.** Meets — the exclusion is fail-open by design, so we recommend keeping any operator-managed control VNI below 5000 (e.g. 4999) as a convention independent of the exclusion succeeding.
 
@@ -282,7 +298,7 @@ Property names and defaults are cross-referenced to [Configuration reference](co
 
 **Best practice.** VXLAN encapsulation costs roughly 50 bytes of overhead per frame; a guest NIC set to the underlay's full MTU on an overlay segment produces oversized frames that PVE silently drops rather than fragments.
 
-**CPI behavior.** Every virtio NIC the CPI attaches to an SDN vnet carries `mtu=1`, meaning "inherit the bridge MTU" — so a guest never emits a frame larger than what the overlay can actually carry. PVE derives the overlay MTU from the underlay automatically (a 1500-byte underlay yields 1450); `pve.sdn_zone_mtu` overrides that derivation for jumbo-frame or IPv6 underlays, where the automatic figure assumes IPv4 encapsulation overhead and over-estimates on an IPv6 underlay.
+**CPI behavior.** Unless a per-NIC or `network_defaults` `mtu` is set explicitly, every virtio NIC the CPI attaches to an SDN vnet carries `mtu=1`, meaning "inherit the bridge MTU" — so a guest never emits a frame larger than what the overlay can actually carry. PVE derives the overlay MTU from the underlay automatically (a 1500-byte underlay yields 1450); `pve.sdn_zone_mtu` overrides that derivation for jumbo-frame or IPv6 underlays, where the automatic figure assumes IPv4 encapsulation overhead and over-estimates on an IPv6 underlay.
 
 **Status.** Meets, Configurable for non-standard underlays — recommended: `sdn_zone_mtu: 8950` for a 9000-byte jumbo underlay, `sdn_zone_mtu: 1430` for an IPv6 underlay.
 
@@ -306,7 +322,7 @@ Property names and defaults are cross-referenced to [Configuration reference](co
 
 **Best practice.** An EVPN fabric's BGP controller, route reflectors, and exit nodes are cluster-wide infrastructure that should not be created or destroyed by a per-deployment CPI call; and injected routes that are never cleaned up on VM deletion accumulate as fabric debris.
 
-**CPI behavior.** The CPI never creates or deletes EVPN zones — `create_network` against an absent EVPN zone fails fast with instructions to create it in PVE first. `cloud_properties.advertised_routes` injects routes into an existing EVPN zone's fabric, stamping a `advrt-<vnet>-<hash>` provenance tag per route on the VM; `delete_vm` removes each recorded subnet unless another live VM carries the same tag (paired routers sharing a route), entirely fail-open so a cleanup failure never blocks the delete.
+**CPI behavior.** The CPI never creates or deletes EVPN zones — `create_network` against an absent EVPN zone fails fast with instructions to create it in PVE first. `cloud_properties.advertised_routes` injects routes into an existing EVPN zone's fabric, stamping a `advrt-<vnet>-<hash>` provenance tag per route on the VM; `delete_vm` removes each recorded subnet unless another live VM carries the same tag (paired routers sharing a route) — fail-open throughout, so a cleanup failure never blocks the delete. Injection at `create_vm` is the opposite: a failed route injection rolls back and fails the call.
 
 **Status.** Meets.
 
@@ -340,7 +356,7 @@ Property names and defaults are cross-referenced to [Configuration reference](co
 
 **Best practice.** A node an operator has explicitly put into HA maintenance state is being drained for a reason; placing a new VM there works against that intent.
 
-**CPI behavior.** `pve.placement.exclude_maintenance_nodes` defaults `true`: any node PVE's HA subsystem reports in a maintenance or error state is excluded from candidate scoring.
+**CPI behavior.** `pve.placement.exclude_maintenance_nodes` defaults `true`: any node PVE's HA subsystem reports in a `maintenance`, `error`, `fence`, or `recovery` state is excluded from candidate scoring, as is any node carrying a tag listed in `pve.placement.maintenance_node_tags`.
 
 **Status.** Meets.
 
@@ -380,9 +396,9 @@ Property names and defaults are cross-referenced to [Configuration reference](co
 
 **Best practice.** BOSH's AZ concept is a placement contract, not a preference — a strict pin should mean the VM stays in that AZ or does not run, never a silent fallback elsewhere. The tradeoff: a strictly pinned VM whose entire AZ goes down cannot restart anywhere, and a strict pin can also block routine node maintenance if there is nowhere else legal for the VM to go.
 
-**CPI behavior.** `pve.placement.pin_az_strict` defaults `true`, creating a hard PVE HA node-affinity rule rather than a soft preference. The CPI logs a Warn naming the AZ whenever a strictly pinned AZ resolves to a single node, since that configuration has no failover target within the AZ at all.
+**CPI behavior.** `pve.placement.pin_az_strict` defaults `true`, creating a hard PVE HA node-affinity rule rather than a soft preference. The CPI logs a Warn naming the AZ whenever a strictly pinned AZ resolves to fewer than three nodes — one node has no failover target within the AZ at all, and two leaves no headroom for a node in maintenance.
 
-**Status.** Meets — recommended: map every strict AZ to at least two nodes.
+**Status.** Meets — recommended: map every strict AZ to at least three nodes.
 
 **Shared-storage guards covering VM, disk, and ISO pools.**
 
@@ -454,7 +470,7 @@ Property names and defaults are cross-referenced to [Configuration reference](co
 
 **Best practice.** A `create_network`/`delete_network` retry after a partial prior success should converge to the same end state, not fail on "already exists" or "not found."
 
-**CPI behavior.** SDN entity creation treats a 409 conflict as success (the entity already exists from a prior attempt); `ErrSDNNotFound` during deletion is swallowed throughout the delete path, making repeated or concurrent `delete_network` calls idempotent.
+**CPI behavior.** Vnet, subnet, and bridge creation treat a 409 conflict as success (the entity already exists from a prior attempt); zone creation is guarded by an existence probe instead, so a genuine concurrent zone-create race still surfaces as an error. `ErrSDNNotFound` during deletion is swallowed throughout the delete path, making repeated or concurrent `delete_network` calls idempotent.
 
 **Status.** Meets.
 
@@ -504,7 +520,7 @@ Property names and defaults are cross-referenced to [Configuration reference](co
 
 **Best practice.** PVE's datacenter firewall master switch defaults off; an operator who configures `security_groups` or `allowed_address_pairs` and watches every API call succeed has no signal that zero packets are actually being filtered until an incident proves it.
 
-**CPI behavior.** Whenever a VM is created with `pve.vm_firewall`, `security_groups`, or `allowed_address_pairs` in play, `create_vm` probes `GET /cluster/firewall/options` once per process and logs a Warn naming the gap when the datacenter master switch is off. The probe is diagnostic only — a probe failure (e.g. a token missing `Sys.Audit`) logs and proceeds rather than blocking the VM.
+**CPI behavior.** Whenever a VM is created with `pve.vm_firewall`, `security_groups`, or `allowed_address_pairs` in play, `create_vm` probes `GET /cluster/firewall/options` once per PVE cluster per process — so a Director running several cpi-config entries probes each cluster — and logs a Warn naming the gap when the datacenter master switch is off. The probe is diagnostic only — a probe failure (e.g. a token missing `Sys.Audit`) logs and proceeds rather than blocking the VM.
 
 **Status.** Meets.
 

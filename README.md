@@ -92,7 +92,7 @@ The CPI exposes properties under the `pve.*` and `agent.*` namespaces. The most 
 | `pve.network_bridge` | Default Linux bridge for VM NICs | `vmbr0` |
 | `pve.cpu_type` | Emulated CPU model (`host` = full physical feature set; set `x86-64-v2-AES` on mixed-CPU clusters that live-migrate) | `host` |
 | `pve.balloon` | Memory ballooning (`"0"` disables the balloon device; a MiB floor enables auto-ballooning; `pve-default` restores PVE's default) | `"0"` |
-| `pve.network_mode` | Managed-network mode (`sdn`, `bridge`, `auto`) | `auto` |
+| `pve.network_mode` | Managed-network mode (`bridge`, `sdn`, `auto`) | `bridge` |
 | `pve.agent_mode` | Agent bootstrap mode (`cloudinit`, `noagent`, `auto`) | `cloudinit` |
 
 The full table covers the remaining properties, including SDN zone management, snapshot guards, hotplug flags, reboot strategy, VMID allocation range, detached-disk lifecycle strategy, and the `agent.*` mbus fallback. See the [configuration reference](docs/configuration.md).
@@ -107,7 +107,7 @@ Day-2 operations, log locations, error triage, ConfigDrive ISO storage hardening
 
 Specific topics:
 
-- [ConfigDrive ISO storage](docs/operations.md#configdrive-iso-storage) — the default `local` value places ISOs on node-local storage where any PVE node user can read agent credentials. Dedicate a separate pool for production.
+- [ConfigDrive ISO storage](docs/operations.md#configdrive-iso-storage) — an ISO on the node-local `local` pool can be read by any PVE node user, agent credentials included. `pve.iso_storage_follow_vm_storage` (default true) moves it onto a shared `vm_storage` when that pool is eligible; dedicate a separate pool for production.
 
 - [Error message hygiene](docs/operations.md#error-message-hygiene) — what surfaces in BOSH task output versus what stays in CPI logs, and the secrets-redaction contract.
 
