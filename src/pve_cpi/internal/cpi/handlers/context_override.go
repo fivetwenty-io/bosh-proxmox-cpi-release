@@ -365,6 +365,12 @@ func requestOverrideCacheKey(cfg *config.CPIConfig) string {
 		cfg.VMStorage, cfg.DiskStorage, cfg.StemcellStorage, cfg.ISOStorage)
 	_, _ = fmt.Fprintf(h, "bridge=%s\x00verify_ssl=%t\x00vmid_start=%d\x00vmid_end=%d\x00",
 		cfg.NetworkBridge, cfg.VerifySSLValue(), cfg.VMIDRangeStart, cfg.VMIDRangeEnd)
+	_, _ = fmt.Fprintf(h, "disk_vmid_start=%d\x00disk_vmid_end=%d\x00tmpl_vmid_start=%d\x00tmpl_vmid_end=%d\x00",
+		cfg.DiskVMIDRangeStart, cfg.DiskVMIDRangeEnd,
+		cfg.StemcellTemplateVMIDRangeStart, cfg.StemcellTemplateVMIDRangeEnd)
+	_, _ = fmt.Fprintf(h, "parked_vmid_start=%d\x00parked_vmid_end=%d\x00replicate_local=%t\x00vm_prefix=%s\x00",
+		cfg.ParkedDiskVMIDRangeStart, cfg.ParkedDiskVMIDRangeEnd,
+		cfg.StemcellReplicateLocal, cfg.VMPrefix)
 	_, _ = fmt.Fprintf(h, "agent_mode=%s\x00vm_disk_format=%s\x00agent_mbus=%s\x00",
 		cfg.AgentMode, cfg.VMDiskFormat, cfg.AgentMBus)
 	pwHash := sha256.Sum256([]byte(cfg.Password))

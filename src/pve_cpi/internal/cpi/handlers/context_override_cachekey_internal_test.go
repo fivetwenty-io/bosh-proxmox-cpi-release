@@ -34,8 +34,12 @@ func TestRequestOverrideCacheKey_CoversEveryOverridableField(t *testing.T) {
 		VMIDRangeStart:  100,
 		VMIDRangeEnd:    8999,
 		AgentMode:       config.AgentModeCloudInit,
-		VMDiskFormat:    "qcow2",
-		AgentMBus:       "nats://mbus-a",
+		// Parker band set in the base so single-bound parker overrides
+		// validate against a real opposite bound.
+		ParkedDiskVMIDRangeStart: 90000,
+		ParkedDiskVMIDRangeEnd:   90999,
+		VMDiskFormat:             "qcow2",
+		AgentMBus:                "nats://mbus-a",
 	}
 	// ApplyContextOverrides re-validates the effective config, so the base
 	// must be a fully-defaulted, valid config first.
@@ -46,24 +50,32 @@ func TestRequestOverrideCacheKey_CoversEveryOverridableField(t *testing.T) {
 	// base and coerce cleanly; enum validity is enforced later by Validate(),
 	// not by ApplyContextOverrides.
 	overrideValues := map[string]any{
-		"pve_host":             "pve-b.example",
-		"pve_port":             float64(9999), // JSON numbers decode as float64
-		"pve_user":             "other",
-		"pve_password":         "pw-two",
-		"pve_api_token":        "tok-two",
-		"pve_realm":            "pve",
-		"pve_node":             "pve2",
-		"pve_vm_storage":       "vmstore-b",
-		"pve_disk_storage":     "diskstore-b",
-		"pve_stemcell_storage": "stemstore-b",
-		"pve_iso_storage":      "isostore-b",
-		"pve_network_bridge":   "vmbr1",
-		"pve_verify_ssl":       false,
-		"pve_vmid_range_start": float64(5000),
-		"pve_vmid_range_end":   float64(8000),
-		"pve_agent_mode":       config.AgentModeNoAgent,
-		"pve_vm_disk_format":   "vmdk",
-		"pve_agent_mbus":       "nats://mbus-b",
+		"pve_host":                               "pve-b.example",
+		"pve_port":                               float64(9999), // JSON numbers decode as float64
+		"pve_user":                               "other",
+		"pve_password":                           "pw-two",
+		"pve_api_token":                          "tok-two",
+		"pve_realm":                              "pve",
+		"pve_node":                               "pve2",
+		"pve_vm_storage":                         "vmstore-b",
+		"pve_disk_storage":                       "diskstore-b",
+		"pve_stemcell_storage":                   "stemstore-b",
+		"pve_iso_storage":                        "isostore-b",
+		"pve_network_bridge":                     "vmbr1",
+		"pve_verify_ssl":                         false,
+		"pve_vmid_range_start":                   float64(5000),
+		"pve_vmid_range_end":                     float64(8000),
+		"pve_disk_vmid_range_start":              float64(20000),
+		"pve_disk_vmid_range_end":                float64(28999),
+		"pve_stemcell_template_vmid_range_start": float64(30500),
+		"pve_stemcell_template_vmid_range_end":   float64(30998),
+		"pve_parked_disk_vmid_range_start":       float64(90100),
+		"pve_parked_disk_vmid_range_end":         float64(90900),
+		"pve_stemcell_replicate_local":           true,
+		"pve_vm_prefix":                          "az2",
+		"pve_agent_mode":                         config.AgentModeNoAgent,
+		"pve_vm_disk_format":                     "vmdk",
+		"pve_agent_mbus":                         "nats://mbus-b",
 	}
 
 	for _, field := range config.ContextOverrideFieldOrderForTest() {

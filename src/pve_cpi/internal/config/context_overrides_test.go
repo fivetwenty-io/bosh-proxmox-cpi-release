@@ -635,3 +635,106 @@ func TestContextOverrideFieldOrder(t *testing.T) {
 		}
 	}
 }
+
+// TestApplyContextOverrides_NestedCPIConfigShape verifies the shape BOSH's
+// cpi-config feature actually delivers (live-verified against a 282.x
+// director): the entry's whole properties hash arrives NESTED in the request
+// context as context.pve = {...} and context.agent = {mbus: ...} — not as
+// flat pve_* keys. Every supported nested property must apply, agent.mbus
+// must land on AgentMBus, and unsupported nested properties must surface in
+// unknown under their flat name.
+func TestApplyContextOverrides_NestedCPIConfigShape(t *testing.T) {
+	t.Parallel()
+	base := validBaseCfg()
+
+	extra := map[string]any{
+		"director_uuid": "d-1",
+		"request_id":    "cpi-1",
+		"agent":         map[string]any{"mbus": "nats://10.254.48.10:4222"},
+		"pve": map[string]any{
+			"host":                               "10.255.0.10",
+			"node":                               "az2-node",
+			"vm_storage":                         "az2-lvm",
+			"disk_storage":                       "az2-lvm",
+			"stemcell_storage":                   "nfs-shared",
+			"iso_storage":                        "local",
+			"vmid_range_start":                   float64(5000),
+			"vmid_range_end":                     float64(8999),
+			"disk_vmid_range_start":              float64(20000),
+			"disk_vmid_range_end":                float64(29999),
+			"stemcell_template_vmid_range_start": float64(30500),
+			"stemcell_template_vmid_range_end":   float64(30999),
+			"stemcell_replicate_local":           true,
+			"vm_prefix":                          "az2",
+			"log_level":                          "info", // deliberately unsupported per-request
+		},
+	}
+
+	eff, applied, unknown, err := config.ApplyContextOverrides(base, extra)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if eff.Host != "10.255.0.10" || eff.Node != "az2-node" {
+		t.Errorf("host/node = %q/%q, want the nested entry's cluster", eff.Host, eff.Node)
+	}
+	if eff.StemcellStorage != "nfs-shared" || eff.VMStorage != "az2-lvm" {
+		t.Errorf("storages = %q/%q, want nested values", eff.StemcellStorage, eff.VMStorage)
+	}
+	if eff.VMIDRangeStart != 5000 || eff.VMIDRangeEnd != 8999 {
+		t.Errorf("vm band = %d-%d, want 5000-8999", eff.VMIDRangeStart, eff.VMIDRangeEnd)
+	}
+	if eff.DiskVMIDRangeStart != 20000 || eff.DiskVMIDRangeEnd != 29999 {
+		t.Errorf("disk band = %d-%d, want 20000-29999", eff.DiskVMIDRangeStart, eff.DiskVMIDRangeEnd)
+	}
+	if eff.StemcellTemplateVMIDRangeStart != 30500 || eff.StemcellTemplateVMIDRangeEnd != 30999 {
+		t.Errorf("template band = %d-%d, want 30500-30999",
+			eff.StemcellTemplateVMIDRangeStart, eff.StemcellTemplateVMIDRangeEnd)
+	}
+	if !eff.StemcellReplicateLocal {
+		t.Error("stemcell_replicate_local must apply from the nested entry")
+	}
+	if eff.VMPrefix != "az2" {
+		t.Errorf("vm_prefix = %q, want az2", eff.VMPrefix)
+	}
+	if eff.AgentMBus != "nats://10.254.48.10:4222" {
+		t.Errorf("agent mbus = %q, want the nested agent.mbus", eff.AgentMBus)
+	}
+	if len(applied) == 0 {
+		t.Fatal("applied is empty — the nested shape did not fold into overrides")
+	}
+	foundUnknown := false
+	for _, k := range unknown {
+		if k == "pve_log_level" {
+			foundUnknown = true
+		}
+	}
+	if !foundUnknown {
+		t.Errorf("unknown = %v, want it to carry pve_log_level (unsupported nested property)", unknown)
+	}
+	// Input map must not be mutated by the fold.
+	if _, mutated := extra["pve_host"]; mutated {
+		t.Error("input extra map was mutated with flattened keys")
+	}
+	// Base must stay untouched.
+	if base.Host != "h" || base.StemcellReplicateLocal {
+		t.Error("base config was mutated")
+	}
+}
+
+// TestApplyContextOverrides_NestedFlatPrecedence verifies explicit flat keys
+// win over the nested entry hash.
+func TestApplyContextOverrides_NestedFlatPrecedence(t *testing.T) {
+	t.Parallel()
+	base := validBaseCfg()
+	extra := map[string]any{
+		"pve_host": "flat-wins",
+		"pve":      map[string]any{"host": "nested-loses"},
+	}
+	eff, _, _, err := config.ApplyContextOverrides(base, extra)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if eff.Host != "flat-wins" {
+		t.Errorf("host = %q, want the explicit flat key to win", eff.Host)
+	}
+}

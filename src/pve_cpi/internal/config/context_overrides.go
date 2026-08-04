@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"maps"
 	"math"
 	"sort"
 	"strconv"
@@ -42,6 +43,14 @@ var contextOverrideFieldOrder = []string{
 	"pve_verify_ssl",
 	"pve_vmid_range_start",
 	"pve_vmid_range_end",
+	"pve_disk_vmid_range_start",
+	"pve_disk_vmid_range_end",
+	"pve_stemcell_template_vmid_range_start",
+	"pve_stemcell_template_vmid_range_end",
+	"pve_parked_disk_vmid_range_start",
+	"pve_parked_disk_vmid_range_end",
+	"pve_stemcell_replicate_local",
+	"pve_vm_prefix",
 	"pve_agent_mode",
 	"pve_vm_disk_format",
 	"pve_agent_mbus",
@@ -197,6 +206,82 @@ var contextOverrideFields = map[string]func(*CPIConfig, any) error{
 		c.VMIDRangeEnd = n
 		return nil
 	},
+	// The disk/template/parker bands are per-request overridable for the same
+	// reason vmid_range_* is: disjoint per-entry banding is the multi-cluster
+	// safety mechanism when cpi-config entries share storage
+	// (docs/multi-cluster.md), so each entry's own band literals must reach
+	// the request that allocates in them. Constraints (ordering, mutual
+	// disjointness) are enforced by eff.Validate() at the end of
+	// ApplyContextOverrides, exactly as for the job-level config.
+	"pve_disk_vmid_range_start": func(c *CPIConfig, v any) error {
+		n, err := coerceOverrideInt(v)
+		if err != nil {
+			return err
+		}
+		c.DiskVMIDRangeStart = n
+		return nil
+	},
+	"pve_disk_vmid_range_end": func(c *CPIConfig, v any) error {
+		n, err := coerceOverrideInt(v)
+		if err != nil {
+			return err
+		}
+		c.DiskVMIDRangeEnd = n
+		return nil
+	},
+	"pve_stemcell_template_vmid_range_start": func(c *CPIConfig, v any) error {
+		n, err := coerceOverrideInt(v)
+		if err != nil {
+			return err
+		}
+		c.StemcellTemplateVMIDRangeStart = n
+		return nil
+	},
+	"pve_stemcell_template_vmid_range_end": func(c *CPIConfig, v any) error {
+		n, err := coerceOverrideInt(v)
+		if err != nil {
+			return err
+		}
+		c.StemcellTemplateVMIDRangeEnd = n
+		return nil
+	},
+	"pve_parked_disk_vmid_range_start": func(c *CPIConfig, v any) error {
+		n, err := coerceOverrideInt(v)
+		if err != nil {
+			return err
+		}
+		c.ParkedDiskVMIDRangeStart = n
+		return nil
+	},
+	"pve_parked_disk_vmid_range_end": func(c *CPIConfig, v any) error {
+		n, err := coerceOverrideInt(v)
+		if err != nil {
+			return err
+		}
+		c.ParkedDiskVMIDRangeEnd = n
+		return nil
+	},
+	// Whether cache templates need per-node replicas is a property of the
+	// TARGET cluster's storage topology (node-local vs shared vm_storage),
+	// so a cpi-config entry must be able to set it for its own cluster.
+	"pve_stemcell_replicate_local": func(c *CPIConfig, v any) error {
+		b, err := coerceOverrideBool(v)
+		if err != nil {
+			return err
+		}
+		c.StemcellReplicateLocal = b
+		return nil
+	},
+	// VM-name prefix is cluster-facing identity (operators distinguish each
+	// director/entry's VMs by it in the PVE UI), not process policy.
+	"pve_vm_prefix": func(c *CPIConfig, v any) error {
+		s, err := coerceOverrideString(v)
+		if err != nil {
+			return err
+		}
+		c.VMPrefix = s
+		return nil
+	},
 	"pve_agent_mode": func(c *CPIConfig, v any) error {
 		s, err := coerceOverrideString(v)
 		if err != nil {
@@ -290,6 +375,42 @@ func coerceOverrideBool(v any) (bool, error) {
 	}
 }
 
+// flattenNestedContextOverrides folds BOSH's actual cpi-config context shape
+// into the flat pve_* candidate keys this mechanism reads. The director does
+// NOT deliver an entry's properties as flat pve_* keys: the entry's whole
+// `properties:` hash is merged into the request context as-is, so they
+// arrive NESTED — context.pve = {host: ..., vm_storage: ..., ...} and
+// context.agent = {mbus: ...} (live-verified against a BOSH 282.x director's
+// task debug log; without this fold every cpi-config request silently ran
+// against the job-level cluster, the exact defect this mechanism exists to
+// close). Every key of a nested pve map becomes "pve_<key>", so supported
+// ones apply and unsupported ones surface in the unknown list under the
+// same name an operator would use for the flat form. context.agent.mbus
+// maps to pve_agent_mbus, the registry's existing key for the agent
+// bootstrap endpoint. Explicit flat keys always win over nested ones. The
+// input map is never mutated.
+func flattenNestedContextOverrides(extra map[string]any) map[string]any {
+	pveRaw, _ := extra["pve"].(map[string]any)
+	agentRaw, _ := extra["agent"].(map[string]any)
+	if pveRaw == nil && agentRaw == nil {
+		return extra
+	}
+	merged := make(map[string]any, len(extra)+len(pveRaw)+1)
+	maps.Copy(merged, extra)
+	for k, v := range pveRaw {
+		flat := contextOverridePrefix + k
+		if _, exists := merged[flat]; !exists {
+			merged[flat] = v
+		}
+	}
+	if mbus, ok := agentRaw["mbus"]; ok {
+		if _, exists := merged["pve_agent_mbus"]; !exists {
+			merged["pve_agent_mbus"] = mbus
+		}
+	}
+	return merged
+}
+
 // ApplyContextOverrides returns a per-request effective CPIConfig built by
 // overriding select fields of base with the "pve_"-prefixed keys present in
 // extra (the jsonrpc.Context.Extra map decoded from one dispatched JSON-RPC
@@ -379,6 +500,7 @@ func ApplyContextOverrides(base *CPIConfig, extra map[string]any) (effective *CP
 	if len(extra) == 0 {
 		return base, nil, nil, nil
 	}
+	extra = flattenNestedContextOverrides(extra)
 
 	eff := *base // shallow copy — see doc comment above.
 	var appliedKeys []string
