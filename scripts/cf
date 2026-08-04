@@ -207,12 +207,33 @@ def _bosh_var(json_path: str, fallback: Path | None = None) -> str:
     return capture("bosh", "int", str(fallback or BOSH_VARS), f"--path={json_path}")
 
 
+def _multi_cpi_azs_ops() -> list[str]:
+    """Return -o for the AZ→CPI binding layer when a cpi-config is active.
+
+    `azs[].cpi:` naming an entry the Director does not have fails the
+    cloud-config update, so the binding (manifests/cf/multi-cpi-azs.yml) is
+    layered only when `bosh cpi-config` reports a non-empty config — i.e.
+    after `scripts/bosh update-cpi-config` has applied
+    manifests/cpi-config.yml. Any error reading it means no cpi-config.
+    """
+    res = subprocess.run(
+        ["bosh", "-e", ENV, "cpi-config"],
+        cwd=REPO_ROOT, capture_output=True, text=True,
+    )
+    if res.returncode != 0 or "cpis" not in res.stdout:
+        return []
+    layer = REPO_ROOT / "manifests" / "cf" / "multi-cpi-azs.yml"
+    print("cloud-config: cpi-config active — layering AZ→CPI binding (multi-cpi-azs.yml)")
+    return ["-o", str(layer)]
+
+
 def cmd_cloud_config(_extra: list[str]) -> None:
     banner("Cloud-config")
     run(
         "bosh", "-e", ENV,  "-n","update-cloud-config",
         "manifests/cf/cloud-config.yml",
         *_env_cf_cloud_config_ops(),
+        *_multi_cpi_azs_ops(),
         "-l", "manifests/bosh/vars.yml",
         "-l", "manifests/cf/vars.yml",
         *_env_vars_layer(),

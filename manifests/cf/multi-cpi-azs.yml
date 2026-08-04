@@ -1,0 +1,36 @@
+---
+# ============================================================================
+# Ops layer: bind cloud-config AZs to named cpi-config entries.
+#
+# Layer onto manifests/cf/cloud-config.yml ONLY when manifests/cpi-config.yml
+# has been applied (`scripts/bosh update-cpi-config`) — an `azs[].cpi:` naming
+# an entry the Director does not have fails the cloud-config update.
+#
+# Binding: z1/z2 → pve-az1 (the primary cluster), z3 → pve-az2. Every BOSH
+# operation against an instance in a bound AZ — create, delete, cloud-check,
+# resurrection — dispatches exclusively through that entry, and so against
+# that entry's PVE cluster.
+#
+# WARNING — the AZ-reassignment trap (docs/multi-cluster.md): changing an
+# already-deployed instance group's AZ across entries recreates it fresh on
+# the new cluster with an EMPTY persistent disk and orphans the old disk on
+# the original cluster. Treat cross-cluster AZ moves as blue/green changes
+# with an explicit data migration, never an in-place azs: edit.
+#
+# Usage:
+#   bosh -e pve update-cloud-config manifests/cf/cloud-config.yml \
+#     -o manifests/cf/multi-cpi-azs.yml \
+#     -l manifests/bosh/vars.yml -l manifests/cf/vars.yml
+# ============================================================================
+
+- type: replace
+  path: /azs/name=z1/cpi?
+  value: pve-az1
+
+- type: replace
+  path: /azs/name=z2/cpi?
+  value: pve-az1
+
+- type: replace
+  path: /azs/name=z3/cpi?
+  value: pve-az2

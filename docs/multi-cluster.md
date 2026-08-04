@@ -59,6 +59,8 @@ Apply it the same way as any other cpi-config:
 bosh update-cpi-config cpi-config.yml
 ```
 
+The repository ships a parameterized version of this manifest at `manifests/cpi-config.yml`, applied via `scripts/bosh update-cpi-config` — which layers the active env's vars (`BOSH_PVE_ENV`), then re-registers the active light stemcell against every entry with `--fix`. The AZ binding below ships as the ops layer `manifests/cf/multi-cpi-azs.yml`, which `scripts/cf cloud-config` applies automatically whenever the Director reports an active cpi-config.
+
 Note the two entries above share `stemcell_storage: nfs-shared` — a shared NFS export both clusters can reach — while every VMID range is disjoint between the two entries. That combination is the multi-cluster safety pattern this document exists to explain; see [Disjoint VMID banding](#disjoint-vmid-banding-the-multi-cluster-safety-pattern) below.
 
 ## AZ-to-CPI binding in cloud-config

@@ -1,0 +1,91 @@
+---
+# ============================================================================
+# BOSH cpi-config: one named `type: pve` entry per PVE cluster.
+#
+# Apply with:
+#   BOSH_PVE_ENV=<env> ./scripts/bosh update-cpi-config
+# which layers manifests/bosh/vars.yml then manifests/envs/<env>/vars.yml
+# (env keys win) and, after a successful update, re-registers the active
+# light stemcell against every entry via `bosh upload-stemcell --fix` — a
+# stemcell upload binds to a specific entry, so each additional entry needs
+# the --fix re-registration to build its own per-cluster cache template.
+# See docs/multi-cluster.md for the full walkthrough.
+#
+# AZ binding lives in manifests/cf/multi-cpi-azs.yml (layered by
+# `scripts/cf cloud-config` when this cpi-config is active): z1/z2 →
+# pve-az1, z3 → pve-az2.
+#
+# VMID banding: every band below is DISJOINT between the two entries, and
+# stays inside the bands the base director config already uses (VMs from
+# manifests/envs/lab/vmid-range.yml's 200 floor; disks 9000+; templates
+# 30000-30999). Disjoint banding across entries sharing storage is the
+# multi-cluster safety mechanism — the CPI validates its own bands within
+# one entry but cannot see a sibling entry's. Keep these literals visible
+# and edit deliberately; do not turn them into vars.
+# (docs/multi-cluster.md#disjoint-vmid-banding-the-multi-cluster-safety-pattern)
+#
+# Shared-storage rules (docs/multi-cluster.md#shared-storage-rules):
+#   - stemcell_storage should be a shared pool with `import` content that
+#     BOTH clusters mount (the `:light:` one-file-every-cluster scenario);
+#   - destroy_unreferenced_disks stays unset (default false);
+#   - parker bands are omitted (detached_disk_strategy is not `parked` here).
+# ============================================================================
+
+cpis:
+- name: pve-az1
+  type: pve
+  properties:
+    agent:
+      mbus: nats://((internal_ip)):4222
+    pve:
+      host: ((pve_az1_host))
+      port: ((pve_port))
+      user: ((pve_user))
+      password: ((pve_password))
+      api_token: ((pve_api_token))
+      node: ((pve_az1_node))
+      vm_storage: ((pve_az1_vm_storage))
+      disk_storage: ((pve_az1_disk_storage))
+      stemcell_storage: ((pve_multi_stemcell_storage))
+      iso_storage: ((pve_az1_iso_storage))
+      network_bridge: ((pve_network_bridge))
+      verify_ssl: ((pve_verify_ssl))
+      agent_mode: cloudinit
+      vm_disk_format: qcow2
+      log_level: info
+      vm_prefix: ((pve_vm_prefix))
+      vmid_range_start: 200
+      vmid_range_end: 4999
+      disk_vmid_range_start: 9000
+      disk_vmid_range_end: 19999
+      stemcell_template_vmid_range_start: 30000
+      stemcell_template_vmid_range_end: 30499
+
+- name: pve-az2
+  type: pve
+  properties:
+    agent:
+      mbus: nats://((internal_ip)):4222
+    pve:
+      host: ((pve_az2_host))
+      port: ((pve_port))
+      user: ((pve_user))
+      password: ((pve_password))
+      api_token: ((pve_api_token))
+      node: ((pve_az2_node))
+      vm_storage: ((pve_az2_vm_storage))
+      disk_storage: ((pve_az2_disk_storage))
+      stemcell_storage: ((pve_multi_stemcell_storage))
+      iso_storage: ((pve_az2_iso_storage))
+      network_bridge: ((pve_network_bridge))
+      verify_ssl: ((pve_verify_ssl))
+      agent_mode: cloudinit
+      vm_disk_format: qcow2
+      log_level: info
+      vm_prefix: ((pve_vm_prefix))
+      vmid_range_start: 5000
+      vmid_range_end: 8999
+      disk_vmid_range_start: 20000
+      disk_vmid_range_end: 29999
+      stemcell_template_vmid_range_start: 30500
+      stemcell_template_vmid_range_end: 30999

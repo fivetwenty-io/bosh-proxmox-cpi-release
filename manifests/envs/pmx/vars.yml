@@ -78,3 +78,27 @@ pmx_reserved:
 - 10.253.32.200-10.253.255.254
 pmx_static:
 - 10.253.32.50
+
+# --- Multi-CPI (manifests/cpi-config.yml) ----------------------------------
+# Consumed by `BOSH_PVE_ENV=pmx ./scripts/bosh update-cpi-config`. AZ1 is the
+# existing nested cluster ("pmx": lab-pmx-0/lab-pmx-1, API 10.253.0.10).
+# nfs-images is the cluster's shared NFS pool with `import` content — the
+# shared stemcell pool for the `:light:` one-file-every-cluster scenario.
+pve_az1_host:         10.253.0.10
+pve_az1_node:         lab-pmx-0
+pve_az1_vm_storage:   local-lvm-data
+pve_az1_disk_storage: local-lvm-data
+pve_az1_iso_storage:  local
+pve_multi_stemcell_storage: nfs-images
+
+# AZ2 requires a SECOND independent nested PVE cluster (not a second node of
+# the "pmx" cluster — lab-pmx-1 is already a member). Until it exists,
+# update-cpi-config fails loudly with "Expected to find variables:
+# pve_az2_host ..." — that is the intended signal, not a bug. When the AZ2
+# cluster stands up: mount the same NFS export as nfs-images there, then
+# uncomment and fill these.
+# pve_az2_host:         10.253.0.TBD
+# pve_az2_node:         lab-pmx2-0
+# pve_az2_vm_storage:   local-lvm-data
+# pve_az2_disk_storage: local-lvm-data
+# pve_az2_iso_storage:  local

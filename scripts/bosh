@@ -18,6 +18,12 @@ Subcommands:
                            (named runtime-config "pve-guest-agent")
     upload-stemcell        upload $STEMCELL_PATH to the director (needed before
                            emptyvm; idempotent for an already-present version)
+    update-cpi-config      apply manifests/cpi-config.yml (one named type: pve
+                           entry per PVE cluster; docs/multi-cluster.md), then
+                           re-register the active light stemcell against every
+                           entry via upload-stemcell --fix so each cluster
+                           builds its own cache template. Layers the active
+                           env's vars (BOSH_PVE_ENV).
     emptyvm                deploy manifests/bosh/emptyvm.yml
     net-up | network-up    create the active env's isolated SDN test network
                            (zone + vnet + subnet, idempotent) on the PVE host.
@@ -105,6 +111,7 @@ NATS_TUNING_OPS = BOSH_DIR / "nats-tuning.yml"
 HM_TUNING_OPS = BOSH_DIR / "hm-tuning.yml"
 DIRECTOR_TUNING_OPS = BOSH_DIR / "director-tuning.yml"
 CLOUD_CONFIG = BOSH_DIR / "cloud-config.yml"
+CPI_CONFIG = MANIFESTS / "cpi-config.yml"
 EMPTYVM = BOSH_DIR / "emptyvm.yml"
 PVE_GUEST_AGENT_RC = MANIFESTS / "runtime-configs" / "pve-guest-agent.yml"
 ENVS_DIR = MANIFESTS / "envs"
@@ -594,6 +601,31 @@ def cmd_upload_stemcell(args: list[str]) -> int:
         "bosh", "-e", "pve", "-n", "upload-stemcell", str(light.create_env_tarball),
         "--fix", *args, env=director_env(),
     )
+
+
+def cmd_update_cpi_config(args: list[str]) -> int:
+    # Apply the multi-CPI cpi-config (one named `type: pve` entry per PVE
+    # cluster), layering base vars then the active env's vars so the env's
+    # per-AZ endpoint/storage keys win. A missing az2 var fails loudly with
+    # "Expected to find variables: ..." — the intended signal until the second
+    # cluster exists (see manifests/envs/pmx/vars.yml).
+    rc = run(
+        "bosh", "-e", "pve", "-n", "update-cpi-config",
+        str(CPI_CONFIG),
+        "-l", str(VARS),
+        *env_vars_layer(),
+        *args,
+        env=director_env(),
+    )
+    if rc != 0:
+        return rc
+    # A stemcell upload binds to a specific cpi-config entry; entries added
+    # after the upload have no registration and no per-cluster cache template.
+    # upload-stemcell already passes --fix, which re-registers the same light
+    # tarball and runs create_stemcell against every entry that lacks it —
+    # building each cluster's cache template eagerly (docs/multi-cluster.md).
+    print("update-cpi-config: re-registering the light stemcell against all entries (--fix)")
+    return cmd_upload_stemcell([])
 
 
 def cmd_credhub(args: list[str]) -> int:
@@ -1316,6 +1348,7 @@ COMMANDS = {
     "upload-cloud-config": cmd_ucc,
     "runtime-config": cmd_runtime_config,
     "upload-stemcell": cmd_upload_stemcell,
+    "update-cpi-config": cmd_update_cpi_config,
     "emptyvm": cmd_emptyvm,
     "net-up": cmd_net_up,
     "network-up": cmd_net_up,
