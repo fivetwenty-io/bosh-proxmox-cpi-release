@@ -685,18 +685,38 @@ func cloneFromTemplate(
 	// as agent/tablet above — matching the import path's default write. A
 	// pve_config.serial0 override (applied later, post-clone) still wins as
 	// the final value.
+	//
+	// Also REPLACE the inherited tags and clear the inherited description. PVE
+	// copies both from the clone source, so without this a workload VM comes up
+	// advertising the cache template's identity: bosh-stemcell,
+	// bosh-stemcell-cache, bosh-stemcell-sha-<sha8>, the name/version tags, the
+	// template's director--<uuid> ref tag, and the template's provenance JSON as
+	// its description. Those tags are the exact keys the stemcell lookups,
+	// delete_stemcell's cluster-wide sha8 sweep, and the orphan prune all match
+	// on; only the template=1 predicate keeps a clone out of those paths today,
+	// which is one predicate of margin for a VM that has no business claiming a
+	// stemcell identity at all. shape.initialTags is the workload tag set the
+	// import path writes at create time (bosh-cpi plus any operator tags and
+	// advertised-route provenance), and the import path leaves the description
+	// empty, so writing both here makes the two paths converge on the same
+	// VM identity. set_vm_metadata later adds the director/deployment/job triple
+	// and its own description to either path.
 	memStr := strconv.Itoa(shape.memMiB)
 	cores64 := int64(shape.cores)
 	sockets64 := int64(shape.sockets)
 	agentEnabled := "enabled=1"
 	tabletOff := false
+	workloadTags := shape.initialTags
+	clearedDescription := ""
 	resourceParams := &sdknodes.UpdateQemuConfigParams{
-		Memory:  &memStr,
-		Cores:   &cores64,
-		Sockets: &sockets64,
-		Agent:   &agentEnabled,
-		Tablet:  &tabletOff,
-		Serial:  map[int]string{0: "socket"},
+		Memory:      &memStr,
+		Cores:       &cores64,
+		Sockets:     &sockets64,
+		Agent:       &agentEnabled,
+		Tablet:      &tabletOff,
+		Serial:      map[int]string{0: "socket"},
+		Tags:        &workloadTags,
+		Description: &clearedDescription,
 	}
 	// Apply scsihw override only when switched away from the historic default.
 	// Emitting "virtio-scsi-pci" explicitly would be byte-identical in effect but

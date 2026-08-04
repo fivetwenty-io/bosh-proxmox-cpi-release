@@ -1507,14 +1507,17 @@ func attemptStemcellTemplateClone(
 		return false, nil
 	}
 
-	templateVMID, templateNode, found, resolveErr := resolveTemplateCacheTarget(ctx, deps, logger, shape, sha8)
+	templateVMID, templateNode, found, resolveErr := resolveTemplateCacheTargetSettled(ctx, deps, logger, shape, sha8)
 	if resolveErr != nil {
 		return true, resolveErr
 	}
 	if !found {
-		logger.Warn("create_vm: stemcell cache template missing for sha8; falling back to direct import"+
-			" (create_stemcell builds the cache; it may have been manually deleted)",
+		logger.Warn("create_vm: stemcell cache template still not visible for sha8 after re-checking;"+
+			" falling back to the slower direct-import path (full copy instead of a clone)."+
+			" Usual causes: PVE's /cluster/resources index has not caught up with a just-frozen"+
+			" template, or the cache template create_stemcell built was deleted out of band",
 			log.String("sha8", sha8),
+			log.Int("recheck_attempts", templateCacheRecheckAttempts),
 		)
 		return false, nil
 	}
@@ -1552,6 +1555,91 @@ func attemptStemcellTemplateClone(
 	// Apply post-clone config (pve_config passthrough + PCI hostpciN). Both
 	// steps are no-ops when the respective cloud_properties are absent.
 	return true, applyPostCloneConfig(ctx, deps, shape.node, candidate, parsed, logger)
+}
+
+// templateCacheRecheckAttempts bounds how many times
+// resolveTemplateCacheTargetSettled looks for a cache template before
+// conceding a genuine miss. Three attempts spaced by
+// templateCacheRecheckDelay cover PVE's cluster-index lag with margin while
+// costing a genuine miss under two seconds before it falls back to import.
+const templateCacheRecheckAttempts = 3
+
+// resolveTemplateCacheTargetSettled is resolveTemplateCacheTarget plus a
+// bounded re-check that defeats PVE's cluster-index lag.
+//
+// resolveTemplateCacheTarget reads through GET /cluster/resources, whose index
+// trails a freshly frozen template by around a second. A BOSH director issues
+// create_vm immediately after create_stemcell, so the first VM of every
+// fresh-stemcell deploy hit that window: the lookup missed a template that had
+// existed for well under a second, and the VM silently took the full-copy
+// import path instead of the CoW clone. The template was never missing —
+// re-issuing the identical create_vm moments later cloned correctly.
+//
+// Two independent mechanisms close it, in this order per attempt:
+//
+//  1. The cluster-scoped lookup, which is the only one that can find a
+//     template hosted on a node other than the placement target.
+//  2. An authoritative per-node listing of the placement node
+//     (pve.ResolveTemplateVMIDForNode → GET /nodes/<node>/qemu). That endpoint
+//     reads the node's own guest config directly rather than the cluster
+//     index, so it sees a just-frozen local template with no lag at all —
+//     which resolves the single-node and same-node cases on the first attempt,
+//     with no wait.
+//
+// Only when both miss does the attempt sleep and retry. A genuine absence
+// (operator deleted the cache template) still falls through to found=false
+// after the full budget, and the caller falls back to import as before.
+// A ctx cancellation during the wait ends the re-check immediately and reports
+// a miss — the import fallback is always a safe answer.
+func resolveTemplateCacheTargetSettled(
+	ctx context.Context,
+	deps Deps,
+	logger *log.Logger,
+	shape *createVMShape,
+	sha8 string,
+) (templateVMID int64, templateNode string, found bool, err error) {
+	for attempt := 1; attempt <= templateCacheRecheckAttempts; attempt++ {
+		templateVMID, templateNode, found, err = resolveTemplateCacheTarget(ctx, deps, logger, shape, sha8)
+		if err != nil || found {
+			if found && attempt > 1 {
+				logger.Info("create_vm: stemcell cache template became visible on re-check"+
+					" (PVE cluster-resource index lag); cloning instead of importing",
+					log.String("sha8", sha8),
+					log.Int("attempt", attempt),
+				)
+			}
+			return templateVMID, templateNode, found, err
+		}
+
+		// Authoritative per-node read: not served from the lagging cluster
+		// index, so a template just frozen on this node is visible at once.
+		if vmid, ok, probeErr := pve.ResolveTemplateVMIDForNode(ctx, deps.PVE, shape.node, sha8); probeErr != nil {
+			logger.Warn("create_vm: authoritative per-node cache-template probe failed (continuing re-check)",
+				log.String("node", shape.node),
+				log.String("sha8", sha8),
+				log.Err(probeErr),
+			)
+		} else if ok {
+			logger.Info("create_vm: stemcell cache template found by authoritative per-node listing"+
+				" after a cluster-index miss; cloning instead of importing",
+				log.String("node", shape.node),
+				log.Int("template_vmid", vmid),
+				log.String("sha8", sha8),
+				log.Int("attempt", attempt),
+			)
+			return int64(vmid), shape.node, true, nil
+		}
+
+		if attempt == templateCacheRecheckAttempts {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return 0, "", false, nil
+		case <-time.After(templateCacheRecheckDelay()):
+		}
+	}
+	return 0, "", false, nil
 }
 
 // resolveTemplateCacheTarget resolves which cluster-scoped stemcell-cache
