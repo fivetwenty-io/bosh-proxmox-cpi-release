@@ -19,6 +19,27 @@ Three configuration knobs opt a VM into PVE HA:
 
 Any one of these registers the VM in `ha-manager`. The moment that happens, **you must disable the BOSH resurrector for that deployment**, via `bosh update-resurrection off` or `resurrector_enabled: false` in the Director manifest.
 
+### Two prerequisites that are easy to miss
+
+**`pin_az_via_ha_rules` also needs `cloud_properties.availability_zone` on every `vm_type`.** BOSH does not pass the cloud-config AZ *name* to `create_vm` — an AZ block selects which CPI runs and which subnet the VM gets, and nothing more. The CPI therefore learns a VM's AZ only from `cloud_properties.availability_zone`, and it must name an AZ that appears in `placement.az_map`. Setting `pin_az_via_ha_rules` and `az_map` without it yields an entirely inert feature: every VM is created with no HA registration and no pin. The CPI warns once per unpinned VM:
+
+> `create_vm: HA node-affinity pin is enabled but this VM was not pinned — no availability_zone resolved for the placed node; BOSH does not pass the cloud-config AZ name to the CPI, so each vm_type needs cloud_properties.availability_zone set to an AZ named in placement.az_map`
+
+A minimal `vm_type`:
+
+```yaml
+vm_types:
+- name: default
+  cloud_properties:
+    cores: 2
+    memory: 4096
+    availability_zone: z1   # must be a key in pve.placement.az_map
+```
+
+**PVE HA recovers a guest only when it can establish that the failed node is gone.** Relocation waits on fencing confirmation. A node that keeps running with corosync stopped is never confirmed dead, so the cluster resource manager parks the service in the `fence` state and refuses to move it — the correct split-brain-safe refusal, but it means the guest stays down until an operator intervenes. Opting into PVE HA ownership therefore assumes a cluster that can actually fence: quorum plus a watchdog (`softdog` by default, or hardware/IPMI). Without that, disabling the BOSH resurrector removes the recovery mechanism that would have worked and replaces it with one that will not. See [Observed timings](#observed-timings) for a measured example of exactly this refusal.
+
+**Shared storage is a third prerequisite.** A guest whose root disk (`pve.vm_storage`) or ConfigDrive ISO (`pve.iso_storage`) lives on node-local storage cannot start on any other node, so HA relocation always fails. Point both at a pool every node mounts before enabling any HA feature; the CPI's `checkISOStorageForHA` check and the DLB shared-storage guard exist to catch this, but they warn rather than block.
+
 **One exception, and it is automatic.** A VM that declares `cloud_properties.pci_passthroughs` is always registered with a strict, single-node HA pin, with no config knob to opt out — PCI passthrough is incompatible with live migration, so the VM can never move off its assigned node regardless. This pin is deliberately excluded from the HA-registration warning below: a PCI-pinned VM is not expected to migrate, so the double-healing race this document otherwise addresses does not apply to it in the same way.
 
 ## The double-healing race

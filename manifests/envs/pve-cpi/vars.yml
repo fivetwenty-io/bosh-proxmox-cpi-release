@@ -76,6 +76,15 @@ pve_network_bridge:   vmbr0
 # stemcell cache template's disk lives on vm_storage, so per-node replicas
 # are required for create_vm to clone on any node.
 pve_stemcell_replicate_local: true
+#
+# HA HAZARD: vm_storage and iso_storage above are node-local. A guest whose
+# root disk or ConfigDrive ISO lives on node-local storage cannot be started
+# on any other node, so PVE HA relocation always fails — which silently
+# defeats every HA feature (placement.dlb, anti_affinity.use_ha_rules,
+# pin_az_via_ha_rules). Before enabling any of them here, repoint
+# pve_vm_storage and pve_iso_storage at a pool every node mounts
+# (nfs-images serves both `images` and `iso` content on these clusters).
+# See docs/ha-and-resurrection.md.
 
 # --- Director + deployment network -----------------------------------------
 internal_cidr:       10.254.0.0/16
@@ -119,6 +128,11 @@ pve_az2_node:         lab-pve-cpi-az2-0
 pve_az2_vm_storage:   local-lvm-data
 pve_az2_disk_storage: local-lvm-data
 pve_az2_iso_storage:  local
+
+# Same HA hazard as the default CPI above: both entries' vm_storage and
+# iso_storage are node-local, so PVE HA could never relocate a guest on
+# either cluster. Repoint them at nfs-images before enabling an HA feature
+# in a cpi-config entry's placement block.
 
 # The shared pool both clusters mount (identical export, identical name).
 pve_multi_stemcell_storage: nfs-images

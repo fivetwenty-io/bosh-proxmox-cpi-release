@@ -385,3 +385,105 @@ func TestSortedNodesCSV_DedupAndSort(t *testing.T) {
 		t.Errorf("sortedNodesCSV = %q; want pve01,pve02,pve03", got)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// F3: an enabled pin that resolves no AZ must be visible above Debug.
+//
+// BOSH does not pass the cloud-config AZ name to create_vm — the AZ only
+// selects the CPI and the subnet — so the CPI learns the AZ solely from
+// cloud_properties.availability_zone. An operator who sets
+// pin_az_via_ha_rules and az_map but never adds availability_zone to a
+// vm_type got a completely inert feature: pinAZForNode returned "",
+// applyAZNodeAffinityPin skipped at Debug, and the VM was created with no HA
+// registration and no signal at the default log level.
+// ---------------------------------------------------------------------------
+
+// TestApplyAZNodeAffinityPin_NoResolvableAZ_Warns pins the promotion from
+// Debug to Warn: the config says "pin every VM" and the CPI is pinning none.
+func TestApplyAZNodeAffinityPin_NoResolvableAZ_Warns(t *testing.T) {
+	cases := []struct {
+		name string
+		cp   createVMCloudProps
+		node string
+	}{
+		{
+			// The live V7 shape: cloud_properties carried no availability_zone
+			// at all, so there is no AZ to resolve.
+			name: "no availability_zone in cloud_properties",
+			cp:   createVMCloudProps{},
+			node: "pve01",
+		},
+		{
+			// AZ requested, but the VM landed outside its node set (operator
+			// target_node override, local-disk pin, or config.node fallback).
+			name: "placed node outside the requested AZ node set",
+			cp:   createVMCloudProps{AvailabilityZone: "z1"},
+			node: "pve99",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			deps := Deps{
+				Config: naPinConfig(map[string][]string{"z1": {"pve01", "pve02", "pve03"}}),
+				PVE:    &icPVEClient{clusterSvc: newNAStub()},
+				Agent:  &icAgentStub{},
+				Logger: log.NewNopLogger(),
+			}
+			if err := applyAZNodeAffinityPin(context.Background(), deps, 100, tc.cp, tc.node,
+				warnLogger(t, &buf)); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			out := buf.String()
+			if out == "" {
+				t.Fatal("an enabled pin that resolves no AZ must warn, not skip at Debug")
+			}
+			// The message has to name the cloud-config prerequisite, or the
+			// operator has no way to act on it.
+			if !strings.Contains(out, "availability_zone") {
+				t.Errorf("warning must name cloud_properties.availability_zone, got %q", out)
+			}
+		})
+	}
+}
+
+// TestApplyAZNodeAffinityPin_Disabled_StaysSilent keeps the warning scoped to
+// operators who actually asked for pinning: with the feature off there is
+// nothing inert to report.
+func TestApplyAZNodeAffinityPin_Disabled_StaysSilent(t *testing.T) {
+	var buf bytes.Buffer
+	cfg := naPinConfig(map[string][]string{"z1": {"pve01"}})
+	cfg.Placement.PinAZViaHARules = nil // feature not enabled
+	deps := Deps{
+		Config: cfg,
+		PVE:    &icPVEClient{clusterSvc: newNAStub()},
+		Agent:  &icAgentStub{},
+		Logger: log.NewNopLogger(),
+	}
+	if err := applyAZNodeAffinityPin(context.Background(), deps, 100,
+		createVMCloudProps{}, "pve01", warnLogger(t, &buf)); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if out := buf.String(); out != "" {
+		t.Errorf("pin disabled: expected no warning, got %q", out)
+	}
+}
+
+// TestApplyAZNodeAffinityPin_ResolvableAZ_NoInertWarn guards against the
+// warning firing on the healthy path.
+func TestApplyAZNodeAffinityPin_ResolvableAZ_NoInertWarn(t *testing.T) {
+	var buf bytes.Buffer
+	deps := Deps{
+		Config: naPinConfig(map[string][]string{"z1": {"pve01", "pve02", "pve03"}}),
+		PVE:    &icPVEClient{clusterSvc: newNAStub()},
+		Agent:  &icAgentStub{},
+		Logger: log.NewNopLogger(),
+	}
+	if err := applyAZNodeAffinityPin(context.Background(), deps, 100,
+		createVMCloudProps{AvailabilityZone: "z1"}, "pve01", warnLogger(t, &buf)); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if out := buf.String(); strings.Contains(out, "availability_zone") {
+		t.Errorf("a resolvable AZ must not emit the inert-pin warning, got %q", out)
+	}
+}
