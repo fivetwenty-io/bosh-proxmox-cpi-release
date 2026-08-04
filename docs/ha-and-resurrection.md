@@ -64,7 +64,22 @@ The Dynamic Load Balancer (`placement.dlb`) is a third HA-registering feature an
 
 ## Observed timings
 
-*This section is a placeholder pending the live node-kill race test in the validation matrix (V7 — PVE-HA-registered deployment with resurrection off, followed by the inverse: no HA registration with resurrection on). Once that test runs against the lab, this section will record the observed detection-to-recovery timings for each ownership mode side by side.*
+Measured 2026-08-04 on a three-node PVE 9.2.4 cluster (`lab-pve-cpi-az2`), one BOSH instance with its root disk and its `scsi30` ConfigDrive ISO on shared NFS, polled once per second from a surviving node's API. Two kill mechanisms, because they produce materially different outcomes:
+
+| Failure | Node offline | HA acts | VM running again | Recovered where |
+|---|---|---|---|---|
+| Abrupt crash (`sysrq-b`), node reboots in ~26 s | +8 s | restart in place | **+152 s** | same node |
+| Sustained partition (corosync stopped), node stays up | +2 s | service parked in `fence` | **+245 s** | different node |
+
+Neither run ever produced a second guest: exactly one VMID and one VM name throughout, and with the resurrector off the Director issued no scan-and-fix.
+
+Three things are worth carrying forward from these numbers.
+
+**A fast reboot never reaches HA failover.** The crashed node returned well inside the fence timeout, so the cluster resource manager never fenced it and never relocated the guest. Recovery was the returning node's own LRM restarting the VM after it reacquired the agent lock — and that lock wait, not the 26-second reboot, is most of the 152 seconds.
+
+**Relocation needs a node that can actually be fenced.** In the partition run the node kept running with corosync stopped, so no fencing confirmation ever reached the CRM. The CRM correctly parked the service in the `fence` state and refused to move it — the textbook split-brain-safe refusal — and relocation only proceeded once we restored corosync by hand. The 245 seconds therefore measures operator-assisted recovery, not an unattended failover, and should not be quoted as one. The general point stands regardless of the mechanism: PVE HA recovers a guest only when it can establish that the failed node is gone.
+
+**That refusal window is the widest opening for the double-healing race.** For roughly six minutes the guest was still running on the partitioned node while the cluster considered it lost. A live resurrector, working from the Director's own agent-heartbeat timeout, would have built its replacement squarely inside that window — against an original that was never actually down.
 
 ## See also
 
