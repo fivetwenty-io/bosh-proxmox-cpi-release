@@ -1,0 +1,39 @@
+---
+# ============================================================================
+# Env bundle: pve-cpi — place CF instance groups on the AZ2 cluster.
+#
+# manifests/cf/multi-cpi-azs.yml binds z3 -> the pve-az2 cpi-config entry, but
+# stock cf-deployment puts every instance group in z1/z2, so nothing ever
+# dispatches through that entry. This layer moves three groups to z3 so a
+# normal `scripts/cf deploy` exercises both clusters in one deployment.
+#
+# Chosen groups:
+#   doppler      stateless singleton, no persistent disk
+#   tcp-router   stateless singleton, no persistent disk
+#   diego-cell   the deployment's heaviest group (2 x large); moving it also
+#                relieves the AZ1 cluster, which co-hosts a live OCFP env
+#
+# All three are diskless. Groups carrying a persistent disk stay on z1/z2:
+# moving one across entries after the fact recreates it with an EMPTY disk and
+# orphans the old one on the original cluster (the AZ-reassignment trap in
+# manifests/cf/multi-cpi-azs.yml and docs/multi-cluster.md).
+#
+# Requires the z3 subnet from manifests/envs/pve-cpi/cf-cloud-config.yml
+# (10.255.48.20-199) and an applied manifests/cpi-config.yml.
+#
+# Usage:
+#   BOSH_PVE_ENV=pve-cpi ./scripts/cf deploy \
+#     -o manifests/envs/pve-cpi/cf-az2.yml
+# ============================================================================
+
+- type: replace
+  path: /instance_groups/name=doppler/azs
+  value: [z3]
+
+- type: replace
+  path: /instance_groups/name=tcp-router/azs
+  value: [z3]
+
+- type: replace
+  path: /instance_groups/name=diego-cell/azs
+  value: [z3]
