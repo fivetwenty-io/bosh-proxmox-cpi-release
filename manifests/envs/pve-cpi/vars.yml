@@ -36,6 +36,13 @@
 #      STORAGE vnet pvecpist owns 10.254.32.0/24 (pvecp2st: 10.255.32.0/24)
 #      — an address inside a more-specific foreign route black-holes on the
 #      outer host even though the vnet L2 would deliver it.
+#   6. Every nested node's vmbr0 MUST carry the full /16 prefix (matching
+#      the pmx lab), not the /24 the labs were provisioned with. With a /24
+#      the node replies to BOSH guests via the outer gateway, and the outer
+#      host drops the hairpinned half of the TCP handshake as out-of-state —
+#      the Director dials its own cluster's API into a timeout. `pmx lab
+#      status` warns about exactly this; re-address live + in
+#      /etc/network/interfaces on each node.
 #
 # Reachability from a workstation: the tailnet's `pve` subnet router carries
 # both /16s; the outer host SNATs tailnet-sourced traffic entering each vnet
