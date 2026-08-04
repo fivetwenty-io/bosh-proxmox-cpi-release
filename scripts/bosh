@@ -297,8 +297,19 @@ def _ensure_light_stemcell(*, build_tarball: bool) -> "_lightstemcell.LightStemc
     mode = (_bosh_int_opt(VARS, "/light_stemcell_mode") or "preuploaded").strip()
     fetch_url = (_bosh_int_opt(VARS, "/stemcell_fetch_url") or "").strip()
     token = (_bosh_int_opt(VARS, "/stemcell_fetch_token") or "").strip()
-    cpi_cfg = _lightstemcell.pve_cfg_from_bosh_vars(VARS)
-    print(f"==> light stemcell ({mode}): ensuring {os_name} {version} is available on PVE")
+    # Honor the active env's pve_* overrides (BOSH_PVE_ENV) the same way
+    # create-env's vars layering does: env vars.yml wins, base vars.yml
+    # fills the rest. Without this the qcow2 lands on the base vars' PVE
+    # host even when the env targets a different cluster.
+    env_f = env_vars_file()
+    if env_f:
+        def _layered_var(p: str) -> "str | None":
+            v = _bosh_int_opt(env_f, p)
+            return v if v is not None else _bosh_int_opt(VARS, p)
+        cpi_cfg = _lightstemcell.pve_cfg_from_bosh_vars(VARS, reader=_layered_var)
+    else:
+        cpi_cfg = _lightstemcell.pve_cfg_from_bosh_vars(VARS)
+    print(f"==> light stemcell ({mode}): ensuring {os_name} {version} is available on PVE (host {cpi_cfg['host']})")
     return _lightstemcell.ensure_light_stemcell(
         cpi_cfg=cpi_cfg,
         mode=mode,

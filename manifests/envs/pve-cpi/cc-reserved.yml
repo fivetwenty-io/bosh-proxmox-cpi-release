@@ -1,0 +1,14 @@
+---
+# update-cloud-config-only override (applied by `scripts/bosh ucc`, never by
+# create-env). Widens the bosh cloud-config's default-network reserved band to
+# the same infra band CF uses (pve_cpi_reserved), so a VM placed on the bosh
+# cloud-config — emptyvm in particular — lands in the dynamic middle
+# (10.254.32.20+) instead of a low infra slot the env keeps for the gateway,
+# the nested hosts, and the Director (orphan-vm-duplicate-ip-after-delete-env).
+#
+# pve_cpi_reserved (manifests/envs/pve-cpi/vars.yml) is the single source of
+# truth for the infra band and is layered in by `scripts/bosh ucc` via the
+# env vars file.
+- type: replace
+  path: /networks/name=default/subnets/0/reserved
+  value: ((pve_cpi_reserved))

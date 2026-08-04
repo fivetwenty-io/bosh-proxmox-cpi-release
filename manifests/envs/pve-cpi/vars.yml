@@ -1,0 +1,106 @@
+---
+# ============================================================================
+# Env bundle: pve-cpi — the multi-CPI pair of nested PVE clusters.
+#
+# Two independent 3-node nested clusters provisioned by the pmx CLI:
+#   AZ1  cluster "pve-cpi"      nodes lab-pve-cpi-{0,1,2}      API 10.254.0.10
+#        outer SDN vnet `pvecpi`  (simple zone `labs`, 10.254.0.0/16, gw 10.254.0.1)
+#   AZ2  cluster "pve-cpi-az2"  nodes lab-pve-cpi-az2-{0,1,2}  API 10.255.0.10
+#        outer SDN vnet `pvecpi2` (simple zone `labs`, 10.255.0.0/16, gw 10.255.0.1)
+#
+# Both clusters mount the SAME NFS export (/tank/nfs/labs/pve-cpi/images on
+# the outer host) as storage ID `nfs-images` with `import` content — the
+# shared stemcell pool for the `:light:` one-file-every-cluster scenario
+# (docs/multi-cluster.md). This env exists to exercise manifests/
+# cpi-config.yml for real: create-env targets AZ1, then
+# `BOSH_PVE_ENV=pve-cpi ./scripts/bosh update-cpi-config` registers both
+# clusters as named CPIs, and `scripts/cf cloud-config` auto-layers the
+# z3 → pve-az2 AZ binding.
+#
+# The Director lives on AZ1 (10.254.32.10). Cross-cluster traffic (Director →
+# AZ2 API, AZ2 VMs → NATS on the Director) routes between the two vnets via
+# the outer host's gateway addresses; verified reachable in both directions.
+#
+# Keep these invariants consistent (mirrors the pmx/cpitest/lab headers):
+#   1. pve_network_bridge MUST be the bridge VMs attach to on the nested
+#      hosts (vmbr0 on both clusters).
+#   2. internal_cidr MUST contain internal_ip, haproxy_private_ip, and every
+#      pve_cpi_reserved / pve_cpi_static entry, and MUST match AZ1's wire
+#      subnet (the outer vnet's 10.254.0.0/16).
+#   3. internal_gw MUST be AZ1's vnet gateway.
+#   4. The AZ2 bands (pve_cpi_az2_*) must lie inside 10.255.0.0/16 and are
+#      consumed only by this env's cf-cloud-config.yml subnet for z3.
+#
+# Reachability from a workstation: the tailnet's `pve` subnet router carries
+# both /16s; the outer host SNATs tailnet-sourced traffic entering each vnet
+# to that vnet's gateway (idempotent post-up/post-down hooks in the vmbr1
+# stanza of /etc/network/interfaces on sm-0, same pattern as the pmx vnet).
+#
+# system_domain override: *.cf.10-254-32-50.sslip.io resolves to the HAProxy
+# static IP (10.254.32.50) from anywhere — no tunnel or local DNS needed.
+#
+# Usage:
+#   BOSH_PVE_ENV=pve-cpi ./scripts/bosh create-env
+#   BOSH_PVE_ENV=pve-cpi ./scripts/bosh update-cpi-config
+#   BOSH_PVE_ENV=pve-cpi ./scripts/cf deploy
+#
+# Tracked in git (force-added past the global vars.yml ignore) because it is
+# pure network/topology configuration. KEEP IT SECRET-FREE — credentials
+# belong in manifests/bosh/vars.yml (gitignored), not here. Both clusters
+# accept the same credentials, so the single pve_user/pve_password pair from
+# the base vars file serves the default CPI and both cpi-config entries.
+# ============================================================================
+
+# --- Target PVE (overrides manifests/bosh/vars.yml; AZ1 cluster) -----------
+pve_host:             10.254.0.10
+pve_node:             lab-pve-cpi-0
+pve_vm_storage:       local-lvm-data
+pve_disk_storage:     local-lvm-data
+pve_stemcell_storage: nfs-images
+pve_iso_storage:      local
+pve_network_bridge:   vmbr0
+
+# --- Director + deployment network -----------------------------------------
+internal_cidr:       10.254.0.0/16
+internal_gw:         10.254.0.1
+internal_ip:         10.254.32.10
+# HAProxy entry point (CF). The sslip.io system domain resolves here.
+haproxy_private_ip:  10.254.32.50
+
+# --- CF system domain (overrides manifests/cf/vars.yml) --------------------
+system_domain:       cf.10-254-32-50.sslip.io
+
+# --- Cloud-config IPAM bands (consumed by cf-cloud-config.yml + cc-reserved.yml)
+# AZ1: BOSH VMs confined to the 10.254.32.0/20 block — reserve the mgmt /24
+# (nested nodes at .0.10-.0.12) and everything below the block, the block's
+# infra band (gateway-analog slots + the Director at 10.254.32.10), and
+# everything from .32.200 upward. HAProxy sits in the static slot; CF VMs
+# take the dynamic middle (10.254.32.20-10.254.32.199).
+pve_cpi_reserved:
+- 10.254.0.1-10.254.32.19
+- 10.254.32.200-10.254.255.254
+pve_cpi_static:
+- 10.254.32.50
+
+# AZ2: same shape shifted into 10.255.0.0/16 — z3 VMs land in
+# 10.255.32.20-10.255.32.199 on the pve-cpi-az2 cluster.
+pve_cpi_az2_reserved:
+- 10.255.0.1-10.255.32.19
+- 10.255.32.200-10.255.255.254
+
+# --- Multi-CPI (manifests/cpi-config.yml) ----------------------------------
+# Consumed by `BOSH_PVE_ENV=pve-cpi ./scripts/bosh update-cpi-config`.
+pve_az1_host:         10.254.0.10
+pve_az1_node:         lab-pve-cpi-0
+pve_az1_vm_storage:   local-lvm-data
+pve_az1_disk_storage: local-lvm-data
+pve_az1_iso_storage:  local
+
+pve_az2_host:         10.255.0.10
+pve_az2_node:         lab-pve-cpi-az2-0
+pve_az2_vm_storage:   local-lvm-data
+pve_az2_disk_storage: local-lvm-data
+pve_az2_iso_storage:  local
+
+# The shared pool both clusters mount (identical export, identical name).
+pve_multi_stemcell_storage: nfs-images

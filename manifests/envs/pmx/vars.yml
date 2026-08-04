@@ -92,13 +92,10 @@ pve_az1_iso_storage:  local
 pve_multi_stemcell_storage: nfs-images
 
 # AZ2 requires a SECOND independent nested PVE cluster (not a second node of
-# the "pmx" cluster — lab-pmx-1 is already a member). Until it exists,
-# update-cpi-config fails loudly with "Expected to find variables:
-# pve_az2_host ..." — that is the intended signal, not a bug. When the AZ2
-# cluster stands up: mount the same NFS export as nfs-images there, then
-# uncomment and fill these.
-# pve_az2_host:         10.253.0.TBD
-# pve_az2_node:         lab-pmx2-0
-# pve_az2_vm_storage:   local-lvm-data
-# pve_az2_disk_storage: local-lvm-data
-# pve_az2_iso_storage:  local
+# the "pmx" cluster — lab-pmx-1 is already a member), and this env's
+# nfs-images is a pmx-only export, so no second cluster can share it. The
+# real multi-CPI pair lives in the pve-cpi env (manifests/envs/pve-cpi/):
+# two 3-node nested clusters mounting one shared NFS export. Use
+# BOSH_PVE_ENV=pve-cpi for multi-CPI work; here update-cpi-config fails
+# loudly with "Expected to find variables: pve_az2_host ..." — that is the
+# intended signal, not a bug.

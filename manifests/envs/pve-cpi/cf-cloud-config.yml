@@ -1,0 +1,64 @@
+---
+# ============================================================================
+# Env bundle: pve-cpi — CF cloud-config network override (multi-CPI).
+#
+# Auto-layered by `scripts/cf cloud-config` (and the full `deploy`) when
+# BOSH_PVE_ENV=pve-cpi. Reshapes the default network into TWO subnets, one
+# per cluster:
+#   subnet 0: 10.254.0.0/16 (AZ1 cluster, vnet `pvecpi`)  — azs z1, z2
+#   subnet 1: 10.255.0.0/16 (AZ2 cluster, vnet `pvecpi2`) — az  z3
+#
+# This pairing only makes sense with manifests/cpi-config.yml applied and
+# the z-to-entry binding from manifests/cf/multi-cpi-azs.yml layered (which
+# `scripts/cf cloud-config` does automatically once the Director reports an
+# active cpi-config): z3 instances are created by the pve-az2 entry on the
+# AZ2 cluster, so they must draw IPs from the AZ2 wire subnet. Without the
+# cpi-config, a z3 instance would get a 10.255.x address but be created on
+# the AZ1 cluster — apply the cpi-config first.
+#
+# All values are pulled from manifests/envs/pve-cpi/vars.yml so a single
+# edit there re-shapes both the Director network and this cloud-config in
+# lockstep.
+#
+# Direct invocation:
+#   bosh -e pve update-cloud-config manifests/cf/cloud-config.yml \
+#     -o manifests/envs/pve-cpi/cf-cloud-config.yml \
+#     -o manifests/cf/multi-cpi-azs.yml \
+#     -l manifests/bosh/vars.yml -l manifests/cf/vars.yml \
+#     -l manifests/envs/pve-cpi/vars.yml
+# ============================================================================
+
+- type: replace
+  path: /networks/name=default/subnets/0/range
+  value: ((internal_cidr))
+
+- type: replace
+  path: /networks/name=default/subnets/0/gateway
+  value: ((internal_gw))
+
+- type: replace
+  path: /networks/name=default/subnets/0/reserved
+  value: ((pve_cpi_reserved))
+
+- type: replace
+  path: /networks/name=default/subnets/0/static
+  value: ((pve_cpi_static))
+
+- type: replace
+  path: /networks/name=default/subnets/0/azs
+  value: [z1, z2]
+
+- type: replace
+  path: /networks/name=default/subnets/0/cloud_properties/bridge
+  value: ((pve_network_bridge))
+
+- type: replace
+  path: /networks/name=default/subnets/-
+  value:
+    range: 10.255.0.0/16
+    gateway: 10.255.0.1
+    dns: [1.1.1.1, 8.8.8.8]
+    reserved: ((pve_cpi_az2_reserved))
+    azs: [z3]
+    cloud_properties:
+      bridge: ((pve_network_bridge))
