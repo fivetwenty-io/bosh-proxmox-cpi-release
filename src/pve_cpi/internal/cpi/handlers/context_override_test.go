@@ -814,3 +814,175 @@ func TestWithRequestOverrides_Concurrent_MixedIdentities(t *testing.T) {
 			got, len(hosts), perHost, want)
 	}
 }
+
+// -----------------------------------------------------------------------
+// F1: entry-level placement reaches AZ resolution
+// -----------------------------------------------------------------------
+
+// TestWithRequestOverrides_EntryPlacementAZMap_ResolvesEntryAZ reproduces the
+// exact V7 live failure shape end to end, one layer above
+// config.ApplyContextOverrides: a cpi-config entry whose properties define
+// placement.az_map with "z3" is dispatched against a job-level config whose
+// az_map does NOT know z3.
+//
+// Before placement was overridable, the director's Warn named pve_placement as
+// unsupported, the request fell back to the job-level (empty) az_map, and
+// create_vm hard-failed with
+//
+//	create_vm: availability_zone "z3" is not defined in placement.az_map
+//
+// even though the dispatched entry plainly defined it. This asserts the AZ now
+// resolves from the ENTRY, that the job-level config is untouched, and that
+// pve_placement no longer appears in the unsupported-key list.
+func TestWithRequestOverrides_EntryPlacementAZMap_ResolvesEntryAZ(t *testing.T) {
+	t.Parallel()
+
+	base := overrideTestBaseConfig()
+	// The job-level cluster knows only z1 — z3 belongs to the other cluster.
+	base.Placement = &config.PlacementConfig{
+		AZMap: map[string][]string{"z1": {"job-n1", "job-n2", "job-n3"}},
+	}
+	base.ApplyDefaults()
+
+	tracker := &fakeTransportClientFactory{}
+	deps := handlers.Deps{
+		Config: base,
+		PVE:    &mockPVEClient{},
+		Logger: log.NewNopLogger(),
+		Overrides: &handlers.RequestOverrideRuntime{
+			ClientFactory: tracker.Factory,
+			Logger:        log.NewNopLogger(),
+		},
+	}
+
+	// The nested shape a director actually merges from a cpi-config entry's
+	// `properties:` hash.
+	got, err := deps.WithRequestOverrides(context.Background(), jsonrpc.Context{
+		RequestID: "r-az2",
+		Extra: map[string]any{
+			"pve": map[string]any{
+				"host": "az2-cluster.example",
+				"placement": map[string]any{
+					"az_map": map[string]any{
+						"z3": []any{"pve-az2-1", "pve-az2-2", "pve-az2-3"},
+					},
+					"pin_az_via_ha_rules": true,
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// The AZ the entry defines now resolves, against the entry's nodes.
+	nodes, ok := got.Config.AZCandidates("z3")
+	if !ok {
+		t.Fatal(`AZ "z3" did not resolve from the dispatched entry's placement.az_map — this is the V7 create_vm failure`)
+	}
+	if len(nodes) != 3 || nodes[0] != "pve-az2-1" {
+		t.Errorf(`AZ "z3" resolved to %#v, want the entry's node list`, nodes)
+	}
+	if !got.Config.HANodeAffinityPinEnabled() {
+		t.Error("the entry's pin_az_via_ha_rules must be in effect for this request")
+	}
+
+	// The job-level cluster's own AZ is NOT inherited: an entry that defines
+	// placement defines it completely.
+	if _, leaked := got.Config.AZCandidates("z1"); leaked {
+		t.Error(`job-level AZ "z1" must not survive into an entry that defines its own placement block`)
+	}
+
+	// The job-level config is untouched for every other request.
+	if _, gone := base.Placement.AZMap["z1"]; !gone {
+		t.Error("job-level az_map lost its own AZ — base must never be mutated")
+	}
+	if _, leaked := base.Placement.AZMap["z3"]; leaked {
+		t.Error("the entry's AZ leaked into the job-level az_map")
+	}
+}
+
+// TestWithRequestOverrides_PlacementNoLongerUnsupported pins the other half of
+// the V7 evidence: the director's context carried pve_placement and the CPI
+// logged it under unsupported_keys. A context carrying ONLY pve_placement must
+// now apply cleanly rather than being rejected as an all-unsupported request.
+func TestWithRequestOverrides_PlacementNoLongerUnsupported(t *testing.T) {
+	t.Parallel()
+
+	base := overrideTestBaseConfig()
+	base.ApplyDefaults()
+	tracker := &fakeTransportClientFactory{}
+	deps := handlers.Deps{
+		Config: base,
+		PVE:    &mockPVEClient{},
+		Logger: log.NewNopLogger(),
+		Overrides: &handlers.RequestOverrideRuntime{
+			ClientFactory: tracker.Factory,
+			Logger:        log.NewNopLogger(),
+		},
+	}
+
+	got, err := deps.WithRequestOverrides(context.Background(), jsonrpc.Context{
+		RequestID: "r-placement-only",
+		Extra: map[string]any{
+			"pve_placement": map[string]any{
+				"az_map": map[string]any{"z3": []any{"pve-az2-1"}},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("a context carrying only pve_placement must not be rejected as all-unsupported: %v", err)
+	}
+	if _, ok := got.Config.AZCandidates("z3"); !ok {
+		t.Error("pve_placement was accepted but did not take effect")
+	}
+}
+
+// TestWithRequestOverrides_EntryPlacementInvalid_FailsThatRequest proves an
+// entry with a bad az_map fails its own requests loudly, matching what
+// validation does to a bad job-level config at boot, rather than silently
+// falling back to the job-level placement.
+func TestWithRequestOverrides_EntryPlacementInvalid_FailsThatRequest(t *testing.T) {
+	t.Parallel()
+
+	base := overrideTestBaseConfig()
+	base.Placement = &config.PlacementConfig{AZMap: map[string][]string{"z1": {"job-n1"}}}
+	base.ApplyDefaults()
+
+	tracker := &fakeTransportClientFactory{}
+	deps := handlers.Deps{
+		Config: base,
+		PVE:    &mockPVEClient{},
+		Logger: log.NewNopLogger(),
+		Overrides: &handlers.RequestOverrideRuntime{
+			ClientFactory: tracker.Factory,
+			Logger:        log.NewNopLogger(),
+		},
+	}
+
+	_, err := deps.WithRequestOverrides(context.Background(), jsonrpc.Context{
+		RequestID: "r-bad",
+		Extra: map[string]any{
+			"pve": map[string]any{
+				"placement": map[string]any{
+					"az_map": map[string]any{"z3": []any{}}, // no nodes
+				},
+			},
+		},
+	})
+	if err == nil {
+		t.Fatal("an entry with an invalid az_map must fail its own requests, not fall back to the job-level placement")
+	}
+	// The rejection must come from VALIDATING the block, not from the
+	// all-keys-unsupported path — otherwise this test would still pass with
+	// placement unregistered, which is the state it exists to rule out.
+	if !strings.Contains(err.Error(), "az_map") {
+		t.Errorf("error must name the offending az_map (validation rejection), got: %v", err)
+	}
+	if strings.Contains(err.Error(), "none are supported") {
+		t.Errorf("placement was rejected as an unsupported key rather than validated: %v", err)
+	}
+	if len(tracker.calls) != 0 {
+		t.Errorf("no PVE client should be built for a rejected override, got %d call(s)", len(tracker.calls))
+	}
+}
