@@ -528,7 +528,7 @@ func TestCreateStemcell_Dedup_SameFilename(t *testing.T) {
 	clusterSvc := &stemcellMockCluster{
 		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
 			items := sdkcluster.ListResourcesResponse{
-				clusterTemplateItem(existingVMID, vmNode, templateName, shaTag(sha8)),
+				clusterTemplateItem(existingVMID, vmNode, templateName, cacheTemplateTags(sha8)),
 			}
 			return &items, nil
 		},

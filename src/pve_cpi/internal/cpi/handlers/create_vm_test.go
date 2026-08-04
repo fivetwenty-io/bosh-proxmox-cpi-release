@@ -2088,7 +2088,10 @@ func clusterCacheListResourcesFn(vmid int64, node, sha8 string) func(context.Con
 			"vmid":     vmid,
 			"node":     node,
 			"name":     "bosh-stemcell-ubuntu-jammy-1-438",
-			"tags":     "bosh-stemcell-sha-" + sha8,
+			// The cache marker is what makes this template eligible for the
+			// sha8-keyed lookup: a sha tag alone means a previous CPI
+			// generation built it, and those are deliberately invisible.
+			"tags":     "bosh-stemcell-cache;bosh-stemcell-sha-" + sha8,
 			"template": true,
 		})
 		resp := sdkcluster.ListResourcesResponse{raw}

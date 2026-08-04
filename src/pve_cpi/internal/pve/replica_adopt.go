@@ -125,6 +125,14 @@ func findReplicaCandidate(ctx context.Context, c Client, node, sha8 string) (rep
 			continue
 		}
 		tokens := splitPVETags(*item.Tags)
+		if !hasStemcellGenerationMarker(tokens) {
+			// Generation gate (stemcell_generation.go). Every replica this CPI
+			// builds carries the cache tag from creation — including while it
+			// is still mid-build, which is exactly what this scan looks for —
+			// so the gate never hides a genuine adopt candidate, but it does
+			// keep a previous generation's sha-tagged template out.
+			continue
+		}
 		hasSHA, hasNode := false, false
 		for _, tok := range tokens {
 			if tok == shaTag {

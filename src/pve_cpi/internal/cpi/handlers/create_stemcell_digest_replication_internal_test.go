@@ -1206,7 +1206,7 @@ func TestReplicateStemcellToNodes_Concurrency_IdempotentSkip(t *testing.T) {
 					"vmid":     30500,
 					"name":     pve2TemplateName,
 					"template": isTemplate,
-					"tags":     "bosh-stemcell-sha-" + sha8 + ";bosh-stemcell-node-pve2",
+					"tags":     stemcellCacheTag + ";bosh-stemcell-sha-" + sha8 + ";bosh-stemcell-node-pve2",
 				})
 				resp := sdknodes.ListQemuResponse{entry}
 				return &resp, nil
@@ -1286,7 +1286,7 @@ func TestReplicateStemcellToNodes_AdoptsRacingReplica(t *testing.T) {
 			return true, nil
 		},
 	}
-	tags := "bosh-stemcell-sha-" + sha8 + ";bosh-stemcell-node-pve2"
+	tags := stemcellCacheTag + ";bosh-stemcell-sha-" + sha8 + ";bosh-stemcell-node-pve2"
 	nodesSvc := countingNodesService{
 		listQemuFn: func(_ context.Context, node string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
 			if node == "pve2" {
@@ -1375,7 +1375,7 @@ func TestReplicateStemcellToNodes_AdoptDisabled_BuildsReplica(t *testing.T) {
 	}
 	// pve2 always shows an in-flight (unfrozen) replica. With adopt OFF, the
 	// settled-only check misses it and there is no adopt probe, so the node builds.
-	inflightTags := "bosh-stemcell-sha-" + sha8 + ";bosh-stemcell-node-pve2"
+	inflightTags := stemcellCacheTag + ";bosh-stemcell-sha-" + sha8 + ";bosh-stemcell-node-pve2"
 	nodesSvc := countingNodesService{
 		listQemuFn: func(_ context.Context, node string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
 			if node == "pve2" {

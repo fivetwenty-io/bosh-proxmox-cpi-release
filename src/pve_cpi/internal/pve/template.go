@@ -283,7 +283,10 @@ func ReplicaNodeTagForNode(node string) string {
 // canonical template node) and per-node replicas tagged with
 // "bosh-stemcell-node-<node>".
 //
-// Match criteria (both candidate types accepted; lowest VMID wins on tie):
+// Match criteria (both candidate types accepted; lowest VMID wins on tie).
+// Every candidate must first pass the generation gate — carry
+// "bosh-stemcell-cache" or a "director--<uuid>" ref tag — so a template left
+// by a previous CPI generation is never returned (see stemcell_generation.go):
 //  1. Template carries "bosh-stemcell-sha-<sha8>" AND "bosh-stemcell-node-<node>". → replica.
 //  2. Template carries "bosh-stemcell-sha-<sha8>" AND no "bosh-stemcell-node-" tag. → primary.
 //
@@ -341,6 +344,14 @@ func ResolveTemplateVMIDForNode(ctx context.Context, c Client, node, sha8 string
 			continue
 		}
 		tokens := splitPVETags(*item.Tags)
+		if !hasStemcellGenerationMarker(tokens) {
+			// Same generation gate the cluster-scoped scan applies: a
+			// pre-generation template carries the sha tag but none of this
+			// CPI's markers and must stay invisible here too, or the
+			// placement scorer would treat it as a usable clone source and
+			// pull it back into the adopt/destroy paths.
+			continue
+		}
 
 		hasSHA := false
 		hasNodeTag := false
@@ -441,8 +452,13 @@ type clusterQemuResourceItem struct {
 // listClusterQemuTemplates fetches the full cluster resource list and returns
 // the decoded, type/template-filtered QEMU template rows. Shared by
 // FindTemplatesBySHATagCluster and FindTemplateByNameCluster so both apply
-// identical filtering (type=="qemu", template==true) before their respective
-// name/tag match.
+// identical filtering (type=="qemu", template==true, generation-compatible)
+// before their respective name/tag match.
+//
+// Rows without a marker proving this CPI generation built or adopted them
+// (hasStemcellGenerationMarker) are dropped here rather than in each caller,
+// so no sha8- or name-keyed path can adopt, sweep, or destroy a template a
+// previous CPI generation left on the cluster. See stemcell_generation.go.
 func listClusterQemuTemplates(ctx context.Context, c Client, label string) ([]clusterQemuResourceItem, error) {
 	resp, err := c.Cluster().ListResources(ctx, &sdkcluster.ListResourcesParams{})
 	if err != nil {
@@ -474,6 +490,19 @@ func listClusterQemuTemplates(ctx context.Context, c Client, label string) ([]cl
 			// Excludes running VMs (not yet — or never — frozen as templates).
 			continue
 		}
+		if !hasStemcellGenerationMarker(splitPVETags(item.Tags)) {
+			// Excludes templates left by a previous CPI generation: they carry
+			// the same content sha tag but none of this generation's refs, so
+			// adopting one would destroy a live template on the first
+			// last-ref delete_stemcell. Logged at Debug so an operator seeing
+			// an unexpected duplicate cache can tell why.
+			log.FromContext(ctx).Debug("template: skipping stemcell template with no current-generation marker",
+				log.Int64("vmid", item.Vmid),
+				log.String("node", item.Node),
+				log.String("name", item.Name),
+			)
+			continue
+		}
 		out = append(out, item)
 	}
 	return out, nil
@@ -483,6 +512,13 @@ func listClusterQemuTemplates(ctx context.Context, c Client, label string) ([]cl
 // for template VMs carrying the tag "bosh-stemcell-sha-<sha8>" as an exact
 // tag token. Returns every match — a cache with per-node replicas can have
 // more than one — sorted by VMID ascending for deterministic output.
+//
+// Only generation-compatible templates are returned: the sha tag identifies
+// CONTENT, and a template built by a previous CPI generation carries the same
+// tag for the same stemcell. listClusterQemuTemplates drops any row lacking
+// this generation's cache or director-ref marker, so such a template is never
+// adopted here and never reaches the delete_stemcell sweep that would destroy
+// it out from under the older director still using it.
 //
 // Input validation:
 //   - ctx nil → error

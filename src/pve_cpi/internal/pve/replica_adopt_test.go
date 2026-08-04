@@ -91,14 +91,26 @@ type adoptCtxFakeClient struct {
 
 func (c *adoptCtxFakeClient) Nodes() nodes.Service { return c.nodesvc }
 
-func adoptShaTag() string  { return "bosh-stemcell-sha-" + adoptSHA }
+func adoptShaTag() string { return "bosh-stemcell-sha-" + adoptSHA }
+
+// adoptCacheTag is the generation marker every replica this CPI builds carries
+// from creation — including while it is still mid-build, which is what
+// findReplicaCandidate looks for. Fixtures need it or the generation gate
+// hides them.
+const adoptCacheTag = "bosh-stemcell-cache"
+
+// adoptReplicaTags is the full tag string of a replica this CPI built: cache
+// marker, content sha, and the per-node replica tag.
+func adoptReplicaTags() string {
+	return adoptCacheTag + ";" + adoptShaTag() + ";" + adoptNodeTag()
+}
 func adoptNodeTag() string { return ReplicaNodeTagForNode(adoptNode) }
 
 // ---- findReplicaCandidate ----
 
 func TestFindReplicaCandidate_InFlightCloneLocked(t *testing.T) {
 	t.Parallel()
-	tags := adoptShaTag() + ";" + adoptNodeTag()
+	tags := adoptReplicaTags()
 	c, _ := adoptClient(func(int) (*nodes.ListQemuResponse, error) {
 		return listFromRaw(
 			`{"vmid":40001,"template":0,"lock":"clone","tags":"` + tags + `"}`,
@@ -127,7 +139,7 @@ func TestFindReplicaCandidate_InFlightCloneLocked(t *testing.T) {
 
 func TestFindReplicaCandidate_SettledTemplate(t *testing.T) {
 	t.Parallel()
-	tags := adoptShaTag() + ";" + adoptNodeTag()
+	tags := adoptReplicaTags()
 	c, _ := adoptClient(func(int) (*nodes.ListQemuResponse, error) {
 		return listFromRaw(
 			`{"vmid":40002,"template":1,"tags":"` + tags + `"}`,
@@ -147,7 +159,7 @@ func TestFindReplicaCandidate_RequiresBothTags(t *testing.T) {
 	// sha tag present but NO per-node tag → not a replica for this node.
 	c, _ := adoptClient(func(int) (*nodes.ListQemuResponse, error) {
 		return listFromRaw(
-			`{"vmid":40003,"template":1,"tags":"` + adoptShaTag() + `"}`,
+			`{"vmid":40003,"template":1,"tags":"` + adoptCacheTag + ";" + adoptShaTag() + `"}`,
 		), nil
 	})
 	_, found, err := findReplicaCandidate(context.Background(), c, adoptNode, adoptSHA)
@@ -161,7 +173,7 @@ func TestFindReplicaCandidate_RequiresBothTags(t *testing.T) {
 
 func TestFindReplicaCandidate_LowestVMIDWins(t *testing.T) {
 	t.Parallel()
-	tags := adoptShaTag() + ";" + adoptNodeTag()
+	tags := adoptReplicaTags()
 	// Two candidates of equal settled-ness (both in-flight clone-locked): the
 	// lowest VMID wins, matching ResolveTemplateVMIDForNode's tie-break.
 	c, _ := adoptClient(func(int) (*nodes.ListQemuResponse, error) {
@@ -181,7 +193,7 @@ func TestFindReplicaCandidate_LowestVMIDWins(t *testing.T) {
 
 func TestFindReplicaCandidate_PrefersSettledOverLowerVMIDOrphan(t *testing.T) {
 	t.Parallel()
-	tags := adoptShaTag() + ";" + adoptNodeTag()
+	tags := adoptReplicaTags()
 	// A crashed-mid-build orphan at a LOW VMID (unfrozen, no lock, never settles)
 	// coexists with a genuine settled template at a HIGHER VMID. The scan must
 	// prefer the settled one, not the lower-VMID orphan — otherwise adopt would
@@ -203,7 +215,7 @@ func TestFindReplicaCandidate_PrefersSettledOverLowerVMIDOrphan(t *testing.T) {
 
 func TestAdoptReplicaTemplate_AdoptsSettledDespiteLowerVMIDOrphan(t *testing.T) {
 	t.Parallel()
-	tags := adoptShaTag() + ";" + adoptNodeTag()
+	tags := adoptReplicaTags()
 	c, _ := adoptClient(func(int) (*nodes.ListQemuResponse, error) {
 		return listFromRaw(
 			`{"vmid":40071,"template":0,"tags":"`+tags+`"}`,
@@ -262,7 +274,7 @@ func TestAdoptReplicaTemplate_ExportedWrapper_NoCandidate_NotAdopted(t *testing.
 // without sleeping and is safe against the real clock.
 func TestAdoptReplicaTemplate_ExportedWrapper_SettledImmediately_Adopts(t *testing.T) {
 	t.Parallel()
-	tags := adoptShaTag() + ";" + adoptNodeTag()
+	tags := adoptReplicaTags()
 	c, n := adoptClient(func(int) (*nodes.ListQemuResponse, error) {
 		return listFromRaw(`{"vmid":40091,"template":1,"tags":"` + tags + `"}`), nil
 	})
@@ -298,7 +310,7 @@ func TestAdoptReplicaTemplate_NoCandidate_NotAdopted(t *testing.T) {
 
 func TestAdoptReplicaTemplate_SettledImmediately_Adopts(t *testing.T) {
 	t.Parallel()
-	tags := adoptShaTag() + ";" + adoptNodeTag()
+	tags := adoptReplicaTags()
 	c, n := adoptClient(func(int) (*nodes.ListQemuResponse, error) {
 		return listFromRaw(`{"vmid":40020,"template":1,"tags":"` + tags + `"}`), nil
 	})
@@ -318,7 +330,7 @@ func TestAdoptReplicaTemplate_SettledImmediately_Adopts(t *testing.T) {
 
 func TestAdoptReplicaTemplate_WaitsForLockClear_ThenAdopts(t *testing.T) {
 	t.Parallel()
-	tags := adoptShaTag() + ";" + adoptNodeTag()
+	tags := adoptReplicaTags()
 	c, n := adoptClient(func(call int) (*nodes.ListQemuResponse, error) {
 		if call < 3 {
 			// First two polls: winner is still cloning.
@@ -343,7 +355,7 @@ func TestAdoptReplicaTemplate_WaitsForLockClear_ThenAdopts(t *testing.T) {
 
 func TestAdoptReplicaTemplate_Timeout_Retriable(t *testing.T) {
 	t.Parallel()
-	tags := adoptShaTag() + ";" + adoptNodeTag()
+	tags := adoptReplicaTags()
 	c, _ := adoptClient(func(int) (*nodes.ListQemuResponse, error) {
 		// Never settles: stays clone-locked forever.
 		return listFromRaw(`{"vmid":40040,"template":0,"lock":"clone","tags":"` + tags + `"}`), nil
@@ -365,7 +377,7 @@ func TestAdoptReplicaTemplate_Timeout_Retriable(t *testing.T) {
 
 func TestAdoptReplicaTemplate_InFlightVanishes_NotAdopted(t *testing.T) {
 	t.Parallel()
-	tags := adoptShaTag() + ";" + adoptNodeTag()
+	tags := adoptReplicaTags()
 	c, _ := adoptClient(func(call int) (*nodes.ListQemuResponse, error) {
 		if call == 1 {
 			return listFromRaw(`{"vmid":40050,"template":0,"lock":"clone","tags":"` + tags + `"}`), nil
@@ -389,7 +401,7 @@ func TestAdoptReplicaTemplate_InFlightVanishes_NotAdopted(t *testing.T) {
 // the adoption timeout, so a hung ListQemu cannot stall past that deadline.
 func TestAdoptReplicaTemplate_LoopContextHasDeadline(t *testing.T) {
 	t.Parallel()
-	tags := adoptShaTag() + ";" + adoptNodeTag()
+	tags := adoptReplicaTags()
 
 	acn := &adoptCtxFakeNodes{}
 	acn.fn = func(call int, ctx context.Context) (*nodes.ListQemuResponse, error) {
@@ -431,7 +443,7 @@ func TestAdoptReplicaTemplate_LoopContextHasDeadline(t *testing.T) {
 
 func TestAdoptReplicaTemplate_DisabledTimeout_InFlight_NotAdopted(t *testing.T) {
 	t.Parallel()
-	tags := adoptShaTag() + ";" + adoptNodeTag()
+	tags := adoptReplicaTags()
 	c, n := adoptClient(func(int) (*nodes.ListQemuResponse, error) {
 		return listFromRaw(`{"vmid":40060,"template":0,"lock":"clone","tags":"` + tags + `"}`), nil
 	})

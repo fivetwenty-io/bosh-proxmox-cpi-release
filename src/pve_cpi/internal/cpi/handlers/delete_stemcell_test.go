@@ -157,7 +157,14 @@ func clusterTemplateItem(vmid int64, node, name, tags string) json.RawMessage {
 	return raw
 }
 
-func shaTag(sha8 string) string { return "bosh-stemcell-sha-" + sha8 }
+// cacheTemplateTags is the tag string of a cache template this CPI built: the
+// generation marker plus the content sha tag. The marker is what makes a
+// template eligible for the sha8-keyed lookup and sweep at all — a template
+// carrying only the sha tag was built by a previous CPI generation and is
+// deliberately invisible to both.
+func cacheTemplateTags(sha8 string) string {
+	return "bosh-stemcell-cache;bosh-stemcell-sha-" + sha8
+}
 
 // ============================================================
 // Tests: argument validation + CID grammar
@@ -278,7 +285,7 @@ func TestDeleteStemcell_Light_LastRef_TemplateDestroyed_FileNeverDeleted(t *test
 	clusterSvc := &stemcellMockCluster{
 		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
 			items := sdkcluster.ListResourcesResponse{
-				clusterTemplateItem(primaryVMID, vmNode, "stemcell-cache", shaTag(testStemcellSHA8)),
+				clusterTemplateItem(primaryVMID, vmNode, "stemcell-cache", cacheTemplateTags(testStemcellSHA8)),
 			}
 			return &items, nil
 		},
@@ -367,8 +374,8 @@ func TestDeleteStemcell_Heavy_LastRef_DestroysTemplateThenDeletesFile_OrderAsser
 	clusterSvc := &stemcellMockCluster{
 		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
 			items := sdkcluster.ListResourcesResponse{
-				clusterTemplateItem(primaryVMID, vmNode, "stemcell-cache", shaTag(testStemcellSHA8)),
-				clusterTemplateItem(replicaVMID, "pve2", "stemcell-cache-replica", shaTag(testStemcellSHA8)),
+				clusterTemplateItem(primaryVMID, vmNode, "stemcell-cache", cacheTemplateTags(testStemcellSHA8)),
+				clusterTemplateItem(replicaVMID, "pve2", "stemcell-cache-replica", cacheTemplateTags(testStemcellSHA8)),
 			}
 			return &items, nil
 		},
@@ -436,8 +443,8 @@ func TestDeleteStemcell_Heavy_ReplicaDestroyFailure_BestEffort_OverallSucceeds(t
 	clusterSvc := &stemcellMockCluster{
 		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
 			items := sdkcluster.ListResourcesResponse{
-				clusterTemplateItem(primaryVMID, vmNode, "stemcell-cache", shaTag(testStemcellSHA8)),
-				clusterTemplateItem(replicaVMID, "pve2", "stemcell-cache-replica", shaTag(testStemcellSHA8)),
+				clusterTemplateItem(primaryVMID, vmNode, "stemcell-cache", cacheTemplateTags(testStemcellSHA8)),
+				clusterTemplateItem(replicaVMID, "pve2", "stemcell-cache-replica", cacheTemplateTags(testStemcellSHA8)),
 			}
 			return &items, nil
 		},
@@ -500,8 +507,8 @@ func TestDeleteStemcell_ReplicaLowerVMID_DoesNotHijackAnchor(t *testing.T) {
 			// still skip it.
 			items := sdkcluster.ListResourcesResponse{
 				clusterTemplateItem(replicaVMID, replicaNode, "stemcell-cache-replica",
-					shaTag(testStemcellSHA8)+";"+pve.ReplicaNodeTagForNode(replicaNode)),
-				clusterTemplateItem(primaryVMID, vmNode, "stemcell-cache", shaTag(testStemcellSHA8)),
+					cacheTemplateTags(testStemcellSHA8)+";"+pve.ReplicaNodeTagForNode(replicaNode)),
+				clusterTemplateItem(primaryVMID, vmNode, "stemcell-cache", cacheTemplateTags(testStemcellSHA8)),
 			}
 			return &items, nil
 		},
@@ -566,7 +573,7 @@ func TestDeleteStemcell_AllReplicas_FallsThroughToNoTemplateSemantics(t *testing
 		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
 			items := sdkcluster.ListResourcesResponse{
 				clusterTemplateItem(replicaVMID, replicaNode, "stemcell-cache-replica",
-					shaTag(testStemcellSHA8)+";"+pve.ReplicaNodeTagForNode(replicaNode)),
+					cacheTemplateTags(testStemcellSHA8)+";"+pve.ReplicaNodeTagForNode(replicaNode)),
 			}
 			return &items, nil
 		},
@@ -629,7 +636,7 @@ func TestDeleteStemcell_Heavy_NonLastRef_NothingDestroyed_RefsWrittenMinusCaller
 	clusterSvc := &stemcellMockCluster{
 		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
 			items := sdkcluster.ListResourcesResponse{
-				clusterTemplateItem(primaryVMID, vmNode, "stemcell-cache", shaTag(testStemcellSHA8)),
+				clusterTemplateItem(primaryVMID, vmNode, "stemcell-cache", cacheTemplateTags(testStemcellSHA8)),
 			}
 			return &items, nil
 		},
@@ -686,7 +693,7 @@ func TestDeleteStemcell_SecondDirectorDeleteAfterFirst_Destroys(t *testing.T) {
 	}
 	firstCluster := &stemcellMockCluster{
 		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
-			items := sdkcluster.ListResourcesResponse{clusterTemplateItem(primaryVMID, vmNode, "stemcell-cache", shaTag(testStemcellSHA8))}
+			items := sdkcluster.ListResourcesResponse{clusterTemplateItem(primaryVMID, vmNode, "stemcell-cache", cacheTemplateTags(testStemcellSHA8))}
 			return &items, nil
 		},
 	}
@@ -716,7 +723,7 @@ func TestDeleteStemcell_SecondDirectorDeleteAfterFirst_Destroys(t *testing.T) {
 	}
 	secondCluster := &stemcellMockCluster{
 		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
-			items := sdkcluster.ListResourcesResponse{clusterTemplateItem(primaryVMID, vmNode, "stemcell-cache", shaTag(testStemcellSHA8))}
+			items := sdkcluster.ListResourcesResponse{clusterTemplateItem(primaryVMID, vmNode, "stemcell-cache", cacheTemplateTags(testStemcellSHA8))}
 			return &items, nil
 		},
 	}
@@ -975,7 +982,7 @@ func TestDeleteStemcell_IsBaseVolumeInUse_ActionableMessage(t *testing.T) {
 	}
 	clusterSvc := &stemcellMockCluster{
 		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
-			items := sdkcluster.ListResourcesResponse{clusterTemplateItem(primaryVMID, vmNode, "stemcell-cache", shaTag(testStemcellSHA8))}
+			items := sdkcluster.ListResourcesResponse{clusterTemplateItem(primaryVMID, vmNode, "stemcell-cache", cacheTemplateTags(testStemcellSHA8))}
 			return &items, nil
 		},
 	}
@@ -1046,7 +1053,7 @@ func TestDeleteStemcell_EmptyDirectorUUID_UnknownDirectorFlow(t *testing.T) {
 	}
 	clusterSvc := &stemcellMockCluster{
 		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
-			items := sdkcluster.ListResourcesResponse{clusterTemplateItem(primaryVMID, vmNode, "stemcell-cache", shaTag(testStemcellSHA8))}
+			items := sdkcluster.ListResourcesResponse{clusterTemplateItem(primaryVMID, vmNode, "stemcell-cache", cacheTemplateTags(testStemcellSHA8))}
 			return &items, nil
 		},
 	}
@@ -1133,7 +1140,7 @@ func TestDeleteStemcell_OrphanPrune_Disabled_NoSecondListResourcesCall(t *testin
 	clusterSvc := &stemcellMockCluster{
 		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
 			listResourcesCalls++
-			items := sdkcluster.ListResourcesResponse{clusterTemplateItem(primaryVMID, vmNode, "stemcell-cache", shaTag(testStemcellSHA8))}
+			items := sdkcluster.ListResourcesResponse{clusterTemplateItem(primaryVMID, vmNode, "stemcell-cache", cacheTemplateTags(testStemcellSHA8))}
 			return &items, nil
 		},
 	}
@@ -1178,7 +1185,7 @@ func TestDeleteStemcell_OrphanPrune_EmptyDirectorUUID_Skipped(t *testing.T) {
 	clusterSvc := &stemcellMockCluster{
 		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
 			listResourcesCalls++
-			items := sdkcluster.ListResourcesResponse{clusterTemplateItem(primaryVMID, vmNode, "stemcell-cache", shaTag(testStemcellSHA8))}
+			items := sdkcluster.ListResourcesResponse{clusterTemplateItem(primaryVMID, vmNode, "stemcell-cache", cacheTemplateTags(testStemcellSHA8))}
 			return &items, nil
 		},
 	}
@@ -1230,7 +1237,7 @@ func TestDeleteStemcell_OrphanPrune_DryRun_NoDeletion(t *testing.T) {
 			listCall++
 			if listCall == 1 {
 				// Template-cache lookup (sha-scoped).
-				items := sdkcluster.ListResourcesResponse{clusterTemplateItem(primaryVMID, vmNode, "stemcell-cache", shaTag(testStemcellSHA8))}
+				items := sdkcluster.ListResourcesResponse{clusterTemplateItem(primaryVMID, vmNode, "stemcell-cache", cacheTemplateTags(testStemcellSHA8))}
 				return &items, nil
 			}
 			// Orphan sweep (marker+director-scoped).
@@ -1298,7 +1305,7 @@ func TestDeleteStemcell_OrphanPrune_CandidateWithForeignRef_NotPruned(t *testing
 		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
 			listCall++
 			if listCall == 1 {
-				items := sdkcluster.ListResourcesResponse{clusterTemplateItem(primaryVMID, vmNode, "stemcell-cache", shaTag(testStemcellSHA8))}
+				items := sdkcluster.ListResourcesResponse{clusterTemplateItem(primaryVMID, vmNode, "stemcell-cache", cacheTemplateTags(testStemcellSHA8))}
 				return &items, nil
 			}
 			items := sdkcluster.ListResourcesResponse{
@@ -1357,7 +1364,7 @@ func TestDeleteStemcell_OrphanPrune_ExcludesJustHandledTemplate(t *testing.T) {
 			listCall++
 			if listCall == 1 {
 				// Template-cache lookup: sha-tag match only is enough here.
-				items := sdkcluster.ListResourcesResponse{clusterTemplateItem(primaryVMID, vmNode, "stemcell-cache", shaTag(testStemcellSHA8))}
+				items := sdkcluster.ListResourcesResponse{clusterTemplateItem(primaryVMID, vmNode, "stemcell-cache", cacheTemplateTags(testStemcellSHA8))}
 				return &items, nil
 			}
 			// Orphan sweep re-lists the SAME vmid this call already
@@ -1365,7 +1372,7 @@ func TestDeleteStemcell_OrphanPrune_ExcludesJustHandledTemplate(t *testing.T) {
 			// carrying the marker+director tags the sweep's filter needs —
 			// excludeVMIDs must keep it from being evaluated a second time.
 			items := sdkcluster.ListResourcesResponse{
-				clusterTemplateItem(primaryVMID, vmNode, "stemcell-cache", "bosh-stemcell;"+dirTag+";"+shaTag(testStemcellSHA8)),
+				clusterTemplateItem(primaryVMID, vmNode, "stemcell-cache", "bosh-stemcell;"+dirTag+";"+cacheTemplateTags(testStemcellSHA8)),
 			}
 			return &items, nil
 		},
@@ -1485,7 +1492,7 @@ func TestDeleteStemcell_OrphanPrune_Live_DestroysOrphan_SkipsBaseInUse(t *testin
 		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
 			listCall++
 			if listCall == 1 {
-				items := sdkcluster.ListResourcesResponse{clusterTemplateItem(primaryVMID, vmNode, "stemcell-cache", shaTag(testStemcellSHA8))}
+				items := sdkcluster.ListResourcesResponse{clusterTemplateItem(primaryVMID, vmNode, "stemcell-cache", cacheTemplateTags(testStemcellSHA8))}
 				return &items, nil
 			}
 			items := sdkcluster.ListResourcesResponse{
@@ -1516,5 +1523,64 @@ func TestDeleteStemcell_OrphanPrune_Live_DestroysOrphan_SkipsBaseInUse(t *testin
 	}
 	if !foundOrphan {
 		t.Errorf("expected orphan VMID %d to be attempted, got %v", orphanVMID, deletedVMIDs)
+	}
+}
+
+// TestDeleteStemcell_PreGenerationTemplate_NotSwept is the cross-generation
+// safety guard on the destroy side. A template built by a PREVIOUS CPI
+// generation carries the content sha tag but neither this generation's cache
+// marker nor any director-- ref tag, so its provenance records no refs. If the
+// sweep could see it, the very first delete_stemcell for that content would
+// find a zero ref count and destroy a template a live older director still
+// clones from. It must be invisible: nothing destroyed, and the call converges
+// on the no-cache-template path.
+func TestDeleteStemcell_PreGenerationTemplate_NotSwept(t *testing.T) {
+	t.Parallel()
+
+	const preGenVMID = int64(30169)
+	var destroyedVMIDs []string
+	var configReads []int
+	nodesSvc := &stemcellMockNodes{
+		deleteQemuFn: func(_ context.Context, _, vmid string, _ *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
+			destroyedVMIDs = append(destroyedVMIDs, vmid)
+			resp := sdknodes.DeleteQemuResponse(`""`)
+			return &resp, nil
+		},
+	}
+	// A config read against the pre-generation template means the sweep
+	// selected it as a ref anchor — the deregister step is the first thing to
+	// touch it, and that is already too far.
+	qemuSvc := &stemcellMockQEMU{
+		configFn: func(_ context.Context, _ string, vmid int) (map[string]any, error) {
+			configReads = append(configReads, vmid)
+			return directorRefsDescMap(), nil
+		},
+	}
+	clusterSvc := &stemcellMockCluster{
+		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+			items := sdkcluster.ListResourcesResponse{
+				// Previous-generation shape: bosh-cpi + sha tag only.
+				clusterTemplateItem(preGenVMID, vmNode, "bosh-stemcell-ubuntu-noble-1-383",
+					"bosh-cpi;bosh-stemcell-sha-"+testStemcellSHA8),
+			}
+			return &items, nil
+		},
+	}
+	storageSvc := &deleteStemcellMockStorage{}
+
+	deps := buildDeleteStemcellDeps(deleteStemcellDepsOpts{
+		qemuSvc: qemuSvc, nodesSvc: nodesSvc, clusterSvc: clusterSvc, storageSvc: storageSvc,
+	})
+	h := handlers.HandleDeleteStemcell(deps)
+
+	args := []json.RawMessage{marshalArg(t, testLightCID())}
+	if _, err := h.Handle(context.Background(), args, jsonrpc.Context{DirectorUUID: "dir-a"}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(destroyedVMIDs) != 0 {
+		t.Errorf("a previous-generation template must never be destroyed, got destroys of %v", destroyedVMIDs)
+	}
+	if len(configReads) != 0 {
+		t.Errorf("a previous-generation template must never be selected as a ref anchor, got config reads of %v", configReads)
 	}
 }

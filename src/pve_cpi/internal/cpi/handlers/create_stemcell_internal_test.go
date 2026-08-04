@@ -1857,7 +1857,7 @@ func TestEnsureTemplateVM_DedupBySHATag_AcrossNameSchemeChange(t *testing.T) {
 	deps.PVE.(*wbTemplateMockClient).clusterSvc = &wbClusterForAlloc{
 		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
 			resp := sdkcluster.ListResourcesResponse{
-				clusterResourceQemuTemplate(existingVMID, existingNode, oldName, "bosh-stemcell-sha-"+sha8),
+				clusterResourceQemuTemplate(existingVMID, existingNode, oldName, stemcellCacheTag+";bosh-stemcell-sha-"+sha8),
 			}
 			return &resp, nil
 		},
@@ -1951,7 +1951,7 @@ func TestEnsureTemplateVM_LostRace_DeletesDuplicateAndReusesSurvivor(t *testing.
 				return &empty, nil
 			}
 			resp := sdkcluster.ListResourcesResponse{
-				clusterResourceQemuTemplate(survivorVMID, survivorNode, "bosh-stemcell-x", "bosh-stemcell-sha-"+sha8),
+				clusterResourceQemuTemplate(survivorVMID, survivorNode, "bosh-stemcell-x", stemcellCacheTag+";bosh-stemcell-sha-"+sha8),
 			}
 			return &resp, nil
 		},
@@ -2033,7 +2033,7 @@ func TestEnsureTemplateVM_RaceReconcile_SkipsSHA256CollidingTwin(t *testing.T) {
 				return &empty, nil
 			}
 			resp := sdkcluster.ListResourcesResponse{
-				clusterResourceQemuTemplate(twinVMID, twinNode, "bosh-stemcell-x", "bosh-stemcell-sha-"+sha8),
+				clusterResourceQemuTemplate(twinVMID, twinNode, "bosh-stemcell-x", stemcellCacheTag+";bosh-stemcell-sha-"+sha8),
 			}
 			return &resp, nil
 		},
@@ -2800,7 +2800,7 @@ func TestEnsureTemplateAndRegisterRef_DedupHit_RegistersDirectorUUID(t *testing.
 	deps.PVE.(*wbTemplateMockClient).clusterSvc = &wbClusterForAlloc{
 		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
 			resp := sdkcluster.ListResourcesResponse{
-				clusterResourceQemuTemplate(existingVMID, existingNode, "bosh-stemcell-ubuntu-jammy-1-0-"+sha8, "bosh-stemcell-sha-"+sha8),
+				clusterResourceQemuTemplate(existingVMID, existingNode, "bosh-stemcell-ubuntu-jammy-1-0-"+sha8, stemcellCacheTag+";bosh-stemcell-sha-"+sha8),
 			}
 			return &resp, nil
 		},
@@ -2936,7 +2936,7 @@ func TestEnsureTemplateVM_SHA256Mismatch_BuildsFreshTemplate(t *testing.T) {
 	deps.PVE.(*wbTemplateMockClient).clusterSvc = &wbClusterForAlloc{
 		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
 			resp := sdkcluster.ListResourcesResponse{
-				clusterResourceQemuTemplate(collidingVMID, collidingNode, "bosh-stemcell-ubuntu-jammy-1-0-"+sha8, "bosh-stemcell-sha-"+sha8),
+				clusterResourceQemuTemplate(collidingVMID, collidingNode, "bosh-stemcell-ubuntu-jammy-1-0-"+sha8, stemcellCacheTag+";bosh-stemcell-sha-"+sha8),
 			}
 			return &resp, nil
 		},
@@ -3002,9 +3002,9 @@ func TestEnsureTemplateVM_SHATagDedup_SkipsReplicaAnchor(t *testing.T) {
 			resp := sdkcluster.ListResourcesResponse{
 				// Replica sorts first (lower VMID) but must be skipped.
 				clusterResourceQemuTemplate(replicaVMID, replicaNode, "bosh-stemcell-ubuntu-noble-1-364-"+sha8,
-					"bosh-stemcell-sha-"+sha8+";"+pve.ReplicaNodeTagForNode(replicaNode)),
+					stemcellCacheTag+";bosh-stemcell-sha-"+sha8+";"+pve.ReplicaNodeTagForNode(replicaNode)),
 				clusterResourceQemuTemplate(primaryVMID, primaryNode, "bosh-stemcell-ubuntu-noble-1-364-"+sha8,
-					"bosh-stemcell-sha-"+sha8),
+					stemcellCacheTag+";bosh-stemcell-sha-"+sha8),
 			}
 			return &resp, nil
 		},
@@ -3069,7 +3069,7 @@ func TestEnsureTemplateVM_RaceReconcile_SkipsReplicaWinner(t *testing.T) {
 			}
 			resp := sdkcluster.ListResourcesResponse{
 				clusterResourceQemuTemplate(replicaVMID, replicaNode, "bosh-stemcell-x",
-					"bosh-stemcell-sha-"+sha8+";"+pve.ReplicaNodeTagForNode(replicaNode)),
+					stemcellCacheTag+";bosh-stemcell-sha-"+sha8+";"+pve.ReplicaNodeTagForNode(replicaNode)),
 			}
 			return &resp, nil
 		},
@@ -3132,7 +3132,7 @@ func TestEnsureTemplateVM_SHATagDedup_MissingBackingQCow2_BuildsFresh(t *testing
 		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
 			resp := sdkcluster.ListResourcesResponse{
 				clusterResourceQemuTemplate(staleVMID, staleNode, "bosh-stemcell-ubuntu-noble-1-364-"+sha8,
-					"bosh-stemcell-sha-"+sha8),
+					stemcellCacheTag+";bosh-stemcell-sha-"+sha8),
 			}
 			return &resp, nil
 		},
@@ -3688,5 +3688,66 @@ func TestFetchFindByPrefix_NoMatch_ReturnsEmpty(t *testing.T) {
 	}
 	if got != "" {
 		t.Errorf("fetchFindByPrefix = %q; want \"\" (near-miss must never match)", got)
+	}
+}
+
+// TestEnsureTemplateVM_PreGenerationTemplate_NotAdopted is the cross-generation
+// safety guard on the create side. A cluster upgraded from a previous CPI
+// generation still holds that generation's cache templates: they carry the
+// content sha tag (same stemcell, same digest) but neither this generation's
+// cache marker nor any director-- ref tag. Adopting one would register a
+// reference against a template whose provenance records none, so the first
+// last-ref delete_stemcell would destroy a template the older director is
+// still cloning from. ensureTemplateVM must ignore it and build its own.
+func TestEnsureTemplateVM_PreGenerationTemplate_NotAdopted(t *testing.T) {
+	t.Parallel()
+
+	const preGenVMID = int64(30169)
+	const sha8 = "cbc4cf34"
+	const fullSHA = sha8 + "00000000000000000000000000000000000000000000000000000000"
+
+	var createCalled bool
+	qemu := &wbMockQEMU{
+		createFn: func(_ context.Context, _ string, _ map[string]any) (string, error) {
+			createCalled = true
+			return "", nil
+		},
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return map[string]any{}, nil
+		},
+	}
+	nodes := &wbTemplateNodes{
+		listQemuFn: listQemuEmpty(),
+		wbMockNodes: wbMockNodes{
+			listStorageFn: func(_ context.Context, _, _ string, _ *sdknodes.ListStorageContentParams) (*sdknodes.ListStorageContentResponse, error) {
+				entry, _ := json.Marshal(map[string]any{"volid": "nfs:import/noble.qcow2"})
+				resp := sdknodes.ListStorageContentResponse{entry}
+				return &resp, nil
+			},
+		},
+	}
+	deps := buildEnsureTemplateDeps(qemu, nodes, &wbMockTasks{}, &wbTemplateStorage{})
+	deps.PVE.(*wbTemplateMockClient).clusterSvc = &wbClusterForAlloc{
+		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+			resp := sdkcluster.ListResourcesResponse{
+				clusterResourceQemuTemplate(preGenVMID, "pve-node1", "bosh-stemcell-ubuntu-noble-1-383",
+					ownershipTag+";bosh-stemcell-sha-"+sha8),
+			}
+			return &resp, nil
+		},
+	}
+
+	cp := stemcellCloudProps{Name: "ubuntu-noble", Version: "1.383"}
+	stemcellCID := pve.BuildHeavyStemcellCID("nfs", "noble.qcow2")
+	vmid, _, err := ensureTemplateVM(context.Background(), deps, "pve-node1", "nfs", "noble.qcow2", fullSHA,
+		"", pve.StemcellKindHeavy, stemcellCID, "test-director", cp, "")
+	if err != nil {
+		t.Fatalf("ensureTemplateVM returned error: %v", err)
+	}
+	if vmid == preGenVMID {
+		t.Errorf("adopted the previous generation's template %d; it must be invisible", preGenVMID)
+	}
+	if !createCalled {
+		t.Error("QEMU.Create was not called: the CPI must build its own cache template alongside the older one")
 	}
 }

@@ -59,7 +59,7 @@ The CPI advertises `openstack-qcow2` and `openstack-raw` because OpenStack qcow2
 bosh-stemcell-<name>-<version>-<sha8>.qcow2
 ```
 
-After upload, the CPI builds — or, on a content-hash dedup hit, reuses — a frozen PVE cache template VM from the qcow2 in the template VMID range, tagged `bosh-stemcell-sha-<sha8>`. The template is a per-cluster clone-source cache, keyed by content hash; its VMID is internal and never appears in the returned CID. The calling BOSH director's UUID is always registered as a live reference on the cache template, whether the template was freshly built or reused on a dedup hit.
+After upload, the CPI builds — or, on a content-hash dedup hit, reuses — a frozen PVE cache template VM from the qcow2 in the template VMID range, tagged `bosh-stemcell-cache` and `bosh-stemcell-sha-<sha8>`. Both tags matter: the sha8 tag is the content key the dedup lookup matches on, and the cache tag is what marks the template as this CPI generation's to adopt — a template carrying the sha8 tag without it belongs to an older CPI generation and is deliberately invisible (see [Light stemcells — Templates from a previous CPI generation](light-stemcells.md#templates-from-a-previous-cpi-generation)). The template is a per-cluster clone-source cache, keyed by content hash; its VMID is internal and never appears in the returned CID. The calling BOSH director's UUID is always registered as a live reference on the cache template, whether the template was freshly built or reused on a dedup hit.
 
 The returned `stemcell_cid` is a path-identity CID identifying the qcow2 file itself, not any PVE VMID:
 

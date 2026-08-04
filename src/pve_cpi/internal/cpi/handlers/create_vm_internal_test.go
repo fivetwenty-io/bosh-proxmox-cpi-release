@@ -1461,7 +1461,7 @@ func templateGapResourceRow() map[string]any {
 		"vmid":     templateGapPrimaryVMID,
 		"node":     templateGapTemplateNode,
 		"name":     "bosh-stemcell-ubuntu-jammy-1-0",
-		"tags":     "bosh-stemcell-sha-" + templateGapSHA8,
+		"tags":     stemcellCacheTag + ";bosh-stemcell-sha-" + templateGapSHA8,
 		"template": true,
 	}
 }
@@ -1505,7 +1505,7 @@ func buildTemplateGapArgs(shared bool) (*createVMParsedArgs, *createVMShape) {
 func listQemuWithReplica(_ context.Context, _ string) (*sdknodes.ListQemuResponse, error) {
 	tr := true
 	vmid := int64(9099)
-	tags := "bosh-stemcell-sha-abcd1234;bosh-stemcell-node-pve-vm"
+	tags := stemcellCacheTag + ";bosh-stemcell-sha-abcd1234;bosh-stemcell-node-pve-vm"
 	raw, _ := json.Marshal(map[string]any{
 		"vmid":     vmid,
 		"template": tr,

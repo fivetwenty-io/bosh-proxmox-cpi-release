@@ -440,7 +440,7 @@ func TestResolveTemplateVMIDForNode_PrimaryTemplate(t *testing.T) {
 	c := resolveTemplateClient(func(_ context.Context, _ string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
 		// Primary: sha tag present, no node tag.
 		return makeListQemuResponseRaw(
-			`{"vmid":30001,"template":1,"tags":"bosh-stemcell-sha-` + sha8 + `"}`,
+			`{"vmid":30001,"template":1,"tags":"bosh-stemcell-cache;bosh-stemcell-sha-` + sha8 + `"}`,
 		), nil
 	})
 
@@ -464,7 +464,7 @@ func TestResolveTemplateVMIDForNode_Replica(t *testing.T) {
 	nodeTag := pve.ReplicaNodeTagForNode(node)
 	c := resolveTemplateClient(func(_ context.Context, _ string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
 		return makeListQemuResponseRaw(
-			`{"vmid":30002,"template":1,"tags":"bosh-stemcell-sha-` + sha8 + `;` + nodeTag + `"}`,
+			`{"vmid":30002,"template":1,"tags":"bosh-stemcell-cache;bosh-stemcell-sha-` + sha8 + `;` + nodeTag + `"}`,
 		), nil
 	})
 
@@ -490,7 +490,7 @@ func TestResolveTemplateVMIDForNode_OtherNodeReplicaNotMatched(t *testing.T) {
 	c := resolveTemplateClient(func(_ context.Context, _ string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
 		// This replica is for pve3, not pve2.
 		return makeListQemuResponseRaw(
-			`{"vmid":30003,"template":1,"tags":"bosh-stemcell-sha-` + sha8 + `;` + otherTag + `"}`,
+			`{"vmid":30003,"template":1,"tags":"bosh-stemcell-cache;bosh-stemcell-sha-` + sha8 + `;` + otherTag + `"}`,
 		), nil
 	})
 
@@ -523,7 +523,7 @@ func TestResolveTemplateVMIDForNode_NotFound(t *testing.T) {
 func TestResolveTemplateVMIDForNode_EmptySHA8_ReturnsNotFound(t *testing.T) {
 	t.Parallel()
 	c := resolveTemplateClient(func(_ context.Context, _ string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
-		return makeListQemuResponseRaw(`{"vmid":30004,"template":1,"tags":"bosh-stemcell-sha-"}`), nil
+		return makeListQemuResponseRaw(`{"vmid":30004,"template":1,"tags":"bosh-stemcell-cache;bosh-stemcell-sha-"}`), nil
 	})
 	_, found, err := pve.ResolveTemplateVMIDForNode(context.Background(), c, "pve1", "")
 	if err != nil {
@@ -551,8 +551,8 @@ func TestResolveTemplateVMIDForNode_LowestVMIDWins(t *testing.T) {
 	t.Parallel()
 	sha8 := "jkl12345"
 	c := resolveTemplateClient(func(_ context.Context, _ string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
-		item1 := json.RawMessage(`{"vmid":30010,"template":1,"tags":"bosh-stemcell-sha-` + sha8 + `"}`)
-		item2 := json.RawMessage(`{"vmid":30005,"template":1,"tags":"bosh-stemcell-sha-` + sha8 + `"}`)
+		item1 := json.RawMessage(`{"vmid":30010,"template":1,"tags":"bosh-stemcell-cache;bosh-stemcell-sha-` + sha8 + `"}`)
+		item2 := json.RawMessage(`{"vmid":30005,"template":1,"tags":"bosh-stemcell-cache;bosh-stemcell-sha-` + sha8 + `"}`)
 		resp := sdknodes.ListQemuResponse{item1, item2}
 		return &resp, nil
 	})
@@ -595,6 +595,12 @@ func TestReplicaNodeTagForNode_Format(t *testing.T) {
 // Cluster-scoped template lookup: FindTemplatesBySHATagCluster,
 // FindTemplateByNameCluster, BuildTemplateNameWithSHA.
 // ============================================================================
+
+// cacheTag is the generation marker every cache template this CPI builds
+// carries. Fixtures must include it (or a director-- ref tag) or the
+// generation gate in listClusterQemuTemplates hides them, exactly as it hides
+// a template left behind by a previous CPI generation.
+const cacheTag = "bosh-stemcell-cache"
 
 // clusterResourceItem is the in-test struct used to build ListResources fake
 // responses for cluster-scoped template lookups. Mirrors the subset of
@@ -650,17 +656,17 @@ func TestFindTemplatesBySHATagCluster_MatchesAcrossNodes(t *testing.T) {
 
 	items := []clusterResourceItem{
 		// Non-template VM on pve1: excluded (Template nil).
-		{Type: "qemu", Vmid: 100, Node: "pve1", Tags: "bosh-stemcell-sha-" + sha8},
+		{Type: "qemu", Vmid: 100, Node: "pve1", Tags: "bosh-stemcell-cache;bosh-stemcell-sha-" + sha8},
 		// Primary cache template on pve1.
-		{Type: "qemu", Vmid: 6042, Node: "pve1", Name: "bosh-stemcell-ubuntu-jammy-1.0-" + sha8, Tags: "bosh-stemcell-sha-" + sha8, Template: boolPtr(true)},
+		{Type: "qemu", Vmid: 6042, Node: "pve1", Name: "bosh-stemcell-ubuntu-jammy-1.0-" + sha8, Tags: "bosh-stemcell-cache;bosh-stemcell-sha-" + sha8, Template: boolPtr(true)},
 		// Per-node replica on pve2 — matched too (both are cache templates for the same sha).
-		{Type: "qemu", Vmid: 6099, Node: "pve2", Name: "bosh-stemcell-ubuntu-jammy-1.0-" + sha8, Tags: "bosh-stemcell-sha-" + sha8 + ";bosh-stemcell-node-pve2", Template: boolPtr(true)},
+		{Type: "qemu", Vmid: 6099, Node: "pve2", Name: "bosh-stemcell-ubuntu-jammy-1.0-" + sha8, Tags: "bosh-stemcell-cache;bosh-stemcell-sha-" + sha8 + ";bosh-stemcell-node-pve2", Template: boolPtr(true)},
 		// LXC container carrying the same sha tag: excluded by type.
-		{Type: "lxc", Vmid: 7000, Node: "pve1", Tags: "bosh-stemcell-sha-" + sha8, Template: boolPtr(true)},
+		{Type: "lxc", Vmid: 7000, Node: "pve1", Tags: "bosh-stemcell-cache;bosh-stemcell-sha-" + sha8, Template: boolPtr(true)},
 		// Non-VM resource row (node/storage/pool): excluded by type + vmid==0.
 		{Type: "node", Node: "pve3"},
 		// Template on a different sha tag: excluded.
-		{Type: "qemu", Vmid: 6100, Node: "pve1", Tags: "bosh-stemcell-sha-ffffffff", Template: boolPtr(true)},
+		{Type: "qemu", Vmid: 6100, Node: "pve1", Tags: "bosh-stemcell-cache;bosh-stemcell-sha-ffffffff", Template: boolPtr(true)},
 	}
 	c := newClusterTemplateClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
 		return makeClusterResourcesResponse(items), nil
@@ -681,10 +687,109 @@ func TestFindTemplatesBySHATagCluster_MatchesAcrossNodes(t *testing.T) {
 	}
 }
 
+// TestFindTemplatesBySHATagCluster_PreGenerationTemplateInvisible is the
+// cross-generation adoption guard: a template built by a PREVIOUS CPI
+// generation carries the content sha tag (and bosh-cpi) but neither
+// bosh-stemcell-cache nor any director-- ref tag. Adopting it would register a
+// ref this CPI could then drop to zero and destroy a template a live older
+// director still clones from, so it must be invisible to the lookup entirely.
+func TestFindTemplatesBySHATagCluster_PreGenerationTemplateInvisible(t *testing.T) {
+	t.Parallel()
+	const sha8 = "cbc4cf34"
+
+	items := []clusterResourceItem{
+		// Previous-generation template: sha tag + bosh-cpi, no cache tag, no ref tag.
+		{Type: "qemu", Vmid: 30169, Node: "pve1", Name: "bosh-stemcell-ubuntu-noble-1-383",
+			Tags: "bosh-cpi;bosh-stemcell-sha-" + sha8, Template: boolPtr(true)},
+	}
+	c := newClusterTemplateClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+		return makeClusterResourcesResponse(items), nil
+	})
+
+	refs, err := pve.FindTemplatesBySHATagCluster(context.Background(), c, sha8)
+	if err != nil {
+		t.Fatalf("FindTemplatesBySHATagCluster: unexpected error: %v", err)
+	}
+	if len(refs) != 0 {
+		t.Fatalf("FindTemplatesBySHATagCluster: pre-generation template must be invisible, got %+v", refs)
+	}
+}
+
+// TestFindTemplatesBySHATagCluster_RefTaggedOnlyStillVisible covers the second
+// eligibility arm: a template this CPI has already adopted carries a
+// director-- ref tag. It must stay visible even without the cache tag, or its
+// ref set becomes unreachable — refcounting would never converge and the
+// template could never be cleaned up.
+func TestFindTemplatesBySHATagCluster_RefTaggedOnlyStillVisible(t *testing.T) {
+	t.Parallel()
+	const sha8 = "cbc4cf34"
+
+	items := []clusterResourceItem{
+		{Type: "qemu", Vmid: 30169, Node: "pve1", Name: "bosh-stemcell-ubuntu-noble-1-383",
+			Tags: "bosh-cpi;bosh-stemcell-sha-" + sha8 + ";director--abc123", Template: boolPtr(true)},
+	}
+	c := newClusterTemplateClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+		return makeClusterResourcesResponse(items), nil
+	})
+
+	refs, err := pve.FindTemplatesBySHATagCluster(context.Background(), c, sha8)
+	if err != nil {
+		t.Fatalf("FindTemplatesBySHATagCluster: unexpected error: %v", err)
+	}
+	if len(refs) != 1 || refs[0].VMID != 30169 {
+		t.Fatalf("FindTemplatesBySHATagCluster: adopted (ref-tagged) template must stay visible, got %+v", refs)
+	}
+}
+
+// TestFindTemplatesBySHATagCluster_BareDirectorPrefixNotAMarker guards the
+// eligibility predicate against a degenerate "director--" token with no UUID:
+// an empty ref names no director and must not confer eligibility.
+func TestFindTemplatesBySHATagCluster_BareDirectorPrefixNotAMarker(t *testing.T) {
+	t.Parallel()
+	const sha8 = "cbc4cf34"
+
+	items := []clusterResourceItem{
+		{Type: "qemu", Vmid: 30169, Node: "pve1", Tags: "bosh-stemcell-sha-" + sha8 + ";director--", Template: boolPtr(true)},
+	}
+	c := newClusterTemplateClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+		return makeClusterResourcesResponse(items), nil
+	})
+
+	refs, err := pve.FindTemplatesBySHATagCluster(context.Background(), c, sha8)
+	if err != nil {
+		t.Fatalf("FindTemplatesBySHATagCluster: unexpected error: %v", err)
+	}
+	if len(refs) != 0 {
+		t.Fatalf("FindTemplatesBySHATagCluster: bare director-- prefix must not confer eligibility, got %+v", refs)
+	}
+}
+
+// TestResolveTemplateVMIDForNode_PreGenerationTemplateInvisible applies the
+// same guard to the node-scoped resolver, which reads GET /nodes/<node>/qemu
+// rather than the cluster index and would otherwise re-expose a
+// pre-generation template to the placement scorer and the create_vm clone path.
+func TestResolveTemplateVMIDForNode_PreGenerationTemplateInvisible(t *testing.T) {
+	t.Parallel()
+	const sha8 = "cbc4cf34"
+	c := resolveTemplateClient(func(_ context.Context, _ string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
+		return makeListQemuResponseRaw(
+			`{"vmid":30169,"template":1,"tags":"bosh-cpi;bosh-stemcell-sha-` + sha8 + `"}`,
+		), nil
+	})
+
+	_, found, err := pve.ResolveTemplateVMIDForNode(context.Background(), c, "pve1", sha8)
+	if err != nil {
+		t.Fatalf("ResolveTemplateVMIDForNode: unexpected error: %v", err)
+	}
+	if found {
+		t.Fatal("ResolveTemplateVMIDForNode: pre-generation template must be invisible")
+	}
+}
+
 func TestFindTemplatesBySHATagCluster_NoMatch(t *testing.T) {
 	t.Parallel()
 	items := []clusterResourceItem{
-		{Type: "qemu", Vmid: 100, Node: "pve1", Tags: "bosh-stemcell-sha-ffffffff", Template: boolPtr(true)},
+		{Type: "qemu", Vmid: 100, Node: "pve1", Tags: "bosh-stemcell-cache;bosh-stemcell-sha-ffffffff", Template: boolPtr(true)},
 	}
 	c := newClusterTemplateClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
 		return makeClusterResourcesResponse(items), nil
@@ -754,10 +859,10 @@ func TestFindTemplateByNameCluster_Found(t *testing.T) {
 	const wantName = "bosh-stemcell-ubuntu-jammy-1.0-ab12cd34"
 
 	items := []clusterResourceItem{
-		{Type: "qemu", Vmid: 100, Node: "pve1", Name: "unrelated", Template: boolPtr(true)},
-		{Type: "qemu", Vmid: 6042, Node: "pve1", Name: wantName, Template: boolPtr(true)},
+		{Type: "qemu", Vmid: 100, Node: "pve1", Name: "unrelated", Tags: cacheTag, Template: boolPtr(true)},
+		{Type: "qemu", Vmid: 6042, Node: "pve1", Name: wantName, Tags: cacheTag, Template: boolPtr(true)},
 		// Same name but not a template: excluded.
-		{Type: "qemu", Vmid: 6043, Node: "pve2", Name: wantName},
+		{Type: "qemu", Vmid: 6043, Node: "pve2", Name: wantName, Tags: cacheTag},
 	}
 	c := newClusterTemplateClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
 		return makeClusterResourcesResponse(items), nil
@@ -780,8 +885,8 @@ func TestFindTemplateByNameCluster_MultiMatch_SortedByVMID(t *testing.T) {
 	const name = "bosh-stemcell-ubuntu-jammy-1.0-ab12cd34"
 
 	items := []clusterResourceItem{
-		{Type: "qemu", Vmid: 6099, Node: "pve2", Name: name, Template: boolPtr(true)},
-		{Type: "qemu", Vmid: 6042, Node: "pve1", Name: name, Template: boolPtr(true)},
+		{Type: "qemu", Vmid: 6099, Node: "pve2", Name: name, Tags: cacheTag, Template: boolPtr(true)},
+		{Type: "qemu", Vmid: 6042, Node: "pve1", Name: name, Tags: cacheTag, Template: boolPtr(true)},
 	}
 	c := newClusterTemplateClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
 		return makeClusterResourcesResponse(items), nil
