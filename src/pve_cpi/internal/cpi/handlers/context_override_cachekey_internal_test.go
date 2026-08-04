@@ -76,6 +76,13 @@ func TestRequestOverrideCacheKey_CoversEveryOverridableField(t *testing.T) {
 		"pve_agent_mode":                         config.AgentModeNoAgent,
 		"pve_vm_disk_format":                     "vmdk",
 		"pve_agent_mbus":                         "nats://mbus-b",
+		// placement is a nested block, not a scalar: az_map names PVE NODES,
+		// which are meaningful only within one cluster, so two entries with
+		// different placement must not share a cached bundle.
+		"pve_placement": map[string]any{
+			"az_map":              map[string]any{"z3": []any{"pve-az2-1"}},
+			"pin_az_via_ha_rules": true,
+		},
 	}
 
 	for _, field := range config.ContextOverrideFieldOrderForTest() {

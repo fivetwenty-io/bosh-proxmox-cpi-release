@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"sync"
 	"time"
@@ -373,6 +374,17 @@ func requestOverrideCacheKey(cfg *config.CPIConfig) string {
 		cfg.StemcellReplicateLocal, cfg.VMPrefix)
 	_, _ = fmt.Fprintf(h, "agent_mode=%s\x00vm_disk_format=%s\x00agent_mbus=%s\x00",
 		cfg.AgentMode, cfg.VMDiskFormat, cfg.AgentMBus)
+	// Placement is a nested block rather than a scalar, so it is folded in as
+	// its canonical JSON. encoding/json sorts map keys, which makes this
+	// deterministic across runs for the az_map. A marshal error is impossible
+	// for this struct (no channels, funcs, or cyclic values) but is folded in
+	// rather than ignored so an unexpected one can never collapse two distinct
+	// placements onto one key.
+	if placementJSON, perr := json.Marshal(cfg.Placement); perr == nil {
+		_, _ = fmt.Fprintf(h, "placement=%s\x00", placementJSON)
+	} else {
+		_, _ = fmt.Fprintf(h, "placement_marshal_error=%s\x00", perr.Error())
+	}
 	pwHash := sha256.Sum256([]byte(cfg.Password))
 	tokHash := sha256.Sum256([]byte(cfg.APIToken))
 	_, _ = fmt.Fprintf(h, "password_sha=%s\x00api_token_sha=%s",
@@ -422,7 +434,7 @@ func requestOverrideCacheKey(cfg *config.CPIConfig) string {
 //     never an error; logged at Warn (once, this call) via d.Log(ctx) so the
 //     condition is visible without failing the request, since a director's
 //     cpi-config properties block commonly carries the FULL pve.* property
-//     set for that entry — most of which (placement, hooks, otel, ...) is
+//     set for that entry — most of which (hooks, otel, retry curves, ...) is
 //     intentionally NOT overridable per-request; see
 //     config.ApplyContextOverrides' doc comment for the full list in scope.
 //   - reqCtx.Extra contains ONLY unsupported pve_* keys (zero applied) →
@@ -463,7 +475,7 @@ func (d Deps) WithRequestOverrides(ctx context.Context, reqCtx jsonrpc.Context) 
 			// request demonstrably reached the cluster its recognized
 			// overrides named, and a cpi-config properties block routinely
 			// carries pve.* properties this mechanism intentionally does not
-			// override per-request (placement, hooks, otel, ...), so that
+			// override per-request (hooks, otel, retry curves, ...), so that
 			// case stays Warn-only by design.
 			d.Log(ctx).Error(
 				"cpi: request context carried pve_* properties but none are supported per-request overrides; refusing to silently fall back to the job-level cluster",

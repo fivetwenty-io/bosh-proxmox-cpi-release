@@ -1,6 +1,8 @@
 package config
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"maps"
 	"math"
@@ -21,12 +23,23 @@ const contextOverridePrefix = "pve_"
 // names, network bridge, VMID allocation range, agent bootstrap mode, and
 // disk format — i.e. everything a single request needs to target the
 // correct PVE cluster and place its VM/disk/stemcell correctly there once
-// it does. Every other pve.* config knob (placement scoring, hooks, otel,
-// disk-performance policy, HA/anti-affinity behavior, retry curves, etc.) is
-// process-wide operating policy rather than a property of which cluster a
-// request targets, and is deliberately NOT in this list — it continues to
-// come from the job-level config unconditionally for every request,
-// overridden or not.
+// it does.
+//
+// pve_placement is in scope too, despite being a policy block rather than a
+// connection field: its az_map names PVE NODES, and node names are meaningful
+// only within one cluster. Excluding it made the three HA features
+// (placement.dlb, anti_affinity.use_ha_rules, pin_az_via_ha_rules)
+// unreachable from a cpi-config entry — that is, unreachable in exactly the
+// multi-cluster deployments that have more than one cluster to fail over
+// within — and, once cloud_properties.availability_zone was set, made every
+// create_vm on a non-job-level entry hard-fail against the job-level (empty)
+// az_map. See coerceOverridePlacement for the whole-block replace semantics.
+//
+// Every other pve.* config knob (hooks, otel, disk-performance policy, retry
+// curves, etc.) is process-wide operating policy rather than a property of
+// which cluster a request targets, and is deliberately NOT in this list — it
+// continues to come from the job-level config unconditionally for every
+// request, overridden or not.
 var contextOverrideFieldOrder = []string{
 	"pve_host",
 	"pve_port",
@@ -54,6 +67,7 @@ var contextOverrideFieldOrder = []string{
 	"pve_agent_mode",
 	"pve_vm_disk_format",
 	"pve_agent_mbus",
+	"pve_placement",
 }
 
 // contextOverrideFields maps each supported context key to the function that
@@ -298,6 +312,23 @@ var contextOverrideFields = map[string]func(*CPIConfig, any) error{
 		c.VMDiskFormat = s
 		return nil
 	},
+	"pve_placement": func(c *CPIConfig, v any) error {
+		p, err := coerceOverridePlacement(v)
+		if err != nil {
+			return err
+		}
+		// Always a freshly-allocated block (or nil), never base's pointer —
+		// ApplyContextOverrides' shallow copy shares every other pointer
+		// field with base, so writing through this one would leak an entry's
+		// az_map into every other cpi-config entry this process serves.
+		c.Placement = p
+		// Give the overridden block the same weight defaults ApplyDefaults
+		// gives the job-level one; ApplyContextOverrides runs Validate but
+		// not ApplyDefaults, so without this an entry setting a partial
+		// weights block would score on zeroed axes.
+		c.applyPlacementDefaults()
+		return nil
+	},
 	"pve_agent_mbus": func(c *CPIConfig, v any) error {
 		s, err := coerceOverrideString(v)
 		if err != nil {
@@ -306,6 +337,47 @@ var contextOverrideFields = map[string]func(*CPIConfig, any) error{
 		c.AgentMBus = s
 		return nil
 	},
+}
+
+// coerceOverridePlacement decodes a context value into a *PlacementConfig.
+//
+// Whole-block REPLACE, not a merge: a cpi-config entry that defines placement
+// defines it completely, so an operator reading one entry sees that entry's
+// entire placement policy rather than a diff against a job-level block they
+// have to hold in their head. Merging pointer-typed sub-blocks (weights,
+// anti_affinity, dlb) field by field would also make "unset" and "explicitly
+// false" indistinguishable per field, which is exactly the ambiguity the
+// pointer types exist to avoid. An entry that wants the job-level policy
+// simply omits the key; an entry that wants NO placement policy sends null.
+//
+// Decoding goes through JSON so the block honors the identical struct tags
+// and nested shapes the job-level config parses, with DisallowUnknownFields
+// so a typo inside the block (say "pin_az_via_ha_rule") is rejected rather
+// than silently parsed into a block that pins nothing. Values that are not
+// objects at all are rejected for the same reason: coercing them to an empty
+// block would quietly disable every placement feature for that entry.
+//
+// nil (explicit JSON null) clears the block, letting one entry opt out of an
+// inherited job-level policy.
+func coerceOverridePlacement(v any) (*PlacementConfig, error) {
+	if v == nil {
+		return nil, nil
+	}
+	raw, ok := v.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("expected a placement object, got %T", v)
+	}
+	encoded, err := json.Marshal(raw)
+	if err != nil {
+		return nil, fmt.Errorf("cannot re-encode placement block: %w", err)
+	}
+	dec := json.NewDecoder(bytes.NewReader(encoded))
+	dec.DisallowUnknownFields()
+	var p PlacementConfig
+	if err := dec.Decode(&p); err != nil {
+		return nil, fmt.Errorf("cannot decode placement block: %w", err)
+	}
+	return &p, nil
 }
 
 // coerceOverrideString requires v to already be a JSON string. Context
@@ -428,8 +500,8 @@ func flattenNestedContextOverrides(extra map[string]any) map[string]any {
 //
 // Only the keys enumerated in contextOverrideFieldOrder are applied — see
 // that slice's doc comment for exactly which pve.* properties are in scope
-// and why the rest (placement, hooks, otel, HA policy, retry curves, ...)
-// are deliberately excluded from per-request override.
+// and why the rest (hooks, otel, retry curves, ...) are deliberately
+// excluded from per-request override.
 //
 // base must be non-nil. extra may be nil or empty; that is the ordinary case
 // (single-CPI deployments, or a cpi-config entry matching the job-level
@@ -443,10 +515,10 @@ func flattenNestedContextOverrides(extra map[string]any) map[string]any {
 //     named in contextOverrideFieldOrder — including every pointer, slice,
 //     and map field other than VerifySSL — is shared with base by the
 //     shallow copy: an overridden request inherits ALL other job-level
-//     policy (placement, hooks, otel, retry curves, HA settings, ...)
-//     unconditionally. VerifySSL is the one pointer field this function may
-//     itself write, and it always allocates a fresh *bool rather than
-//     writing through base's pointer (see the pve_verify_ssl entry in
+//     policy (hooks, otel, retry curves, ...) unconditionally. VerifySSL and
+//     Placement are the pointer fields this function may itself write, and
+//     both always allocate a fresh value rather than writing through base's
+//     pointer (see the pve_verify_ssl and pve_placement entries in
 //     contextOverrideFields), so base is never mutated by this call.
 //   - applied: the sorted list of context keys that were recognized AND
 //     successfully applied. Empty (nil) exactly when effective == base.

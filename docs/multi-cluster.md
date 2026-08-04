@@ -63,6 +63,27 @@ The repository ships a parameterized version of this manifest at `manifests/cpi-
 
 Note the two entries above share `stemcell_storage: nfs-shared` — a shared NFS export both clusters can reach — while every VMID range is disjoint between the two entries. That combination is the multi-cluster safety pattern this document exists to explain; see [Disjoint VMID banding](#disjoint-vmid-banding-the-multi-cluster-safety-pattern) below.
 
+### Per-entry `placement`
+
+An entry may also carry its own `placement` block. This matters most for `az_map`, whose values are PVE *node* names — names that mean nothing outside the one cluster that has them, so a single job-level map cannot serve two clusters:
+
+```yaml
+- name: pve-az2
+  type: pve
+  properties:
+    pve:
+      host: pve-az2.example.com
+      # ... connection and VMID settings as above ...
+      placement:
+        az_map:
+          z3: [pve-az2-n1, pve-az2-n2, pve-az2-n3]
+        pin_az_via_ha_rules: true
+```
+
+An entry's `placement` block replaces the job-level one entirely rather than merging into it, so each entry states its own complete placement policy. Omit the key to inherit the job-level block; send `null` to run with no placement policy at all. A typo inside the block is rejected rather than ignored, so a misspelled field fails the request instead of silently disabling the feature it was meant to enable.
+
+The three HA features (`placement.dlb`, `placement.anti_affinity.use_ha_rules`, `placement.pin_az_via_ha_rules`) are reachable only this way in a multi-cluster deployment. Enabling any of them also means disabling the BOSH resurrector for the affected deployment, and `pin_az_via_ha_rules` additionally requires `cloud_properties.availability_zone` on each `vm_type` — see [HA and Resurrection](ha-and-resurrection.md).
+
 ## AZ-to-CPI binding in cloud-config
 
 BOSH's `azs[].cpi` field binds an availability zone to a named cpi-config entry:
