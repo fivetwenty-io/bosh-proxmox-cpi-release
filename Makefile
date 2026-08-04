@@ -121,6 +121,17 @@ fmt: ## Format Go source files with gofmt
 	@gofmt -w $$(find $(SRC_ROOT) -name '*.go' -not -path '$(SRC_ROOT)/vendor/*')
 	@echo "$(GREEN)✓ Code formatted$(RESET)"
 
+.PHONY: fmt-check
+fmt-check: ## Fail if any Go source file is not gofmt-formatted
+	@echo "$(GREEN)Checking gofmt...$(RESET)"
+	@unformatted=$$(gofmt -l $$(find $(SRC_ROOT) -name '*.go' -not -path '$(SRC_ROOT)/vendor/*')); \
+	if [ -n "$$unformatted" ]; then \
+		echo "$(YELLOW)FAIL: files need gofmt (run 'make fmt'):$(RESET)"; \
+		echo "$$unformatted"; \
+		exit 1; \
+	fi
+	@echo "$(GREEN)✓ gofmt clean$(RESET)"
+
 .PHONY: vet
 vet: ## Run go vet
 	@echo "$(GREEN)Running go vet...$(RESET)"
@@ -153,7 +164,7 @@ staticcheck: ## Run staticcheck (skip with notice if not installed)
 	fi
 
 .PHONY: check
-check: vet staticcheck lint coverage-check test ## Run vet, staticcheck, lint, coverage-check, and test (cheap-fast checks first)
+check: fmt-check vet staticcheck lint coverage-check test ## Run fmt-check, vet, staticcheck, lint, coverage-check, and test (cheap-fast checks first)
 	@echo "$(GREEN)✓ All checks passed$(RESET)"
 
 ##@ Security

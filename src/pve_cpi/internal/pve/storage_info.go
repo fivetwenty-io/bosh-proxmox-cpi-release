@@ -297,7 +297,6 @@ type StorageInfoCache struct {
 	entries  map[string]storageInfoEntry
 	inflight map[string]chan struct{}
 	negCache negativeCacheEntry
-
 }
 
 type storageInfoEntry struct {

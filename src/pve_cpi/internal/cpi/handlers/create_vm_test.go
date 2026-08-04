@@ -2084,10 +2084,10 @@ func clusterCacheListResourcesFn(vmid int64, node, sha8 string) func(context.Con
 			return &empty, nil
 		}
 		raw, _ := json.Marshal(map[string]any{
-			"type":     "qemu",
-			"vmid":     vmid,
-			"node":     node,
-			"name":     "bosh-stemcell-ubuntu-jammy-1-438",
+			"type": "qemu",
+			"vmid": vmid,
+			"node": node,
+			"name": "bosh-stemcell-ubuntu-jammy-1-438",
 			// The cache marker is what makes this template eligible for the
 			// sha8-keyed lookup: a sha tag alone means a previous CPI
 			// generation built it, and those are deliberately invisible.
