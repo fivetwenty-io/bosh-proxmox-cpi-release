@@ -2254,37 +2254,38 @@ func (h *handlerPolicyDeps) StorageInfo(ctx context.Context, name string) (pve.S
 		return pve.StorageInfo{}, fmt.Errorf("handlerPolicyDeps: nil response from cluster storage list")
 	}
 
-	// Parse raw JSON entries identical to StorageInfoCache.refresh. Each item is
-	// a json.RawMessage; we decode only the subset pve.StorageInfo needs.
-	var entry struct {
-		Storage string `json:"storage"`
-		Type    string `json:"type"`
-		Shared  *int   `json:"shared,omitempty"`
-		Nodes   string `json:"nodes,omitempty"`
-	}
+	// Decode through pve.ParseStorageEntry — the SAME decoder
+	// StorageInfoCache.refresh uses — rather than an inline field mapping. The
+	// inline version this replaces populated only Name/Type/Shared/Nodes,
+	// leaving the backing-identity fields (Path/Server/Export) empty, so
+	// BackingKey() was "" for every entry the stemcell path produced: backing
+	// identity was unusable here, and two unrelated storages both keyed ""
+	// would compare equal to any consumer that did not special-case the empty
+	// key.
+	//
+	// The whole index is decoded (not just the requested name) because the
+	// duplicate-backing warning below needs every entry to be meaningful.
+	all := make([]pve.StorageInfo, 0, len(*resp))
 	for _, raw := range *resp {
-		if jerr := json.Unmarshal(raw, &entry); jerr != nil {
+		info, perr := pve.ParseStorageEntry(raw)
+		if perr != nil {
 			continue
 		}
-		if entry.Storage != name {
-			continue
+		all = append(all, info)
+	}
+
+	// `bosh upload-stemcell` before any deploy runs create_stemcell without
+	// ever touching StorageInfoCache, so this is the only place the
+	// duplicate-backing warning can fire on a stemcell-only workload. The
+	// process-wide gate inside WarnDuplicateBackingStoragesOnce keeps it to a
+	// single firing and prevents a double warn when a later deploy fills the
+	// cache in the same process.
+	pve.WarnDuplicateBackingStoragesOnce(ctx, all)
+
+	for i := range all {
+		if all[i].Name == name {
+			return all[i], nil
 		}
-		info := pve.StorageInfo{
-			Name: entry.Storage,
-			Type: entry.Type,
-		}
-		if entry.Shared != nil && *entry.Shared != 0 {
-			info.Shared = true
-		}
-		if entry.Nodes != "" {
-			for _, part := range strings.Split(entry.Nodes, ",") {
-				part = strings.TrimSpace(part)
-				if part != "" {
-					info.Nodes = append(info.Nodes, part)
-				}
-			}
-		}
-		return info, nil
 	}
 	return pve.StorageInfo{}, fmt.Errorf("handlerPolicyDeps: storage %q not found in cluster storage list", name)
 }

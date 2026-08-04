@@ -408,8 +408,11 @@ func TestParseStorageEntry_DecodesBackingFields(t *testing.T) {
 // successful fill, not on every refresh.
 // ---------------------------------------------------------------------------
 
+// Not parallel: the duplicate-backing gate is process-wide (see
+// ResetDuplicateBackingWarnOnceForTest), so a parallel sibling would race over
+// which test gets the single firing.
 func TestStorageInfoCache_WarnsDuplicateBackingOnceAtFirstFill(t *testing.T) {
-	t.Parallel()
+	defer ResetDuplicateBackingWarnOnceForTest()()
 	lister := &fakeLister{entries: []map[string]any{
 		{"storage": "nfs-a", "type": "nfs", "server": "10.0.0.5", "export": "/tank/proxmox"},
 		{"storage": "nfs-b", "type": "nfs", "server": "10.0.0.5", "export": "/tank/proxmox"},
@@ -442,7 +445,7 @@ func TestStorageInfoCache_WarnsDuplicateBackingOnceAtFirstFill(t *testing.T) {
 // TestStorageInfoCache_NoDuplicateBackingWarningWhenNoneShare verifies the
 // common case (no duplicate backing configured) emits nothing extra.
 func TestStorageInfoCache_NoDuplicateBackingWarningWhenNoneShare(t *testing.T) {
-	t.Parallel()
+	defer ResetDuplicateBackingWarnOnceForTest()()
 	lister := &fakeLister{entries: []map[string]any{
 		{"storage": "nfs-a", "type": "nfs", "server": "10.0.0.5", "export": "/tank/a"},
 		{"storage": "local-lvm", "type": "lvm"},
@@ -454,5 +457,71 @@ func TestStorageInfoCache_NoDuplicateBackingWarningWhenNoneShare(t *testing.T) {
 	}
 	if strings.Contains(buf.String(), "share one physical backing") {
 		t.Errorf("no duplicate backing configured: expected no warning, got: %s", buf.String())
+	}
+}
+
+// TestWarnDuplicateBackingStorages_EmptyKeysNeverGroup is the explicit guard
+// against the "" == "" trap: entries whose backing identity cannot be
+// determined must be skipped outright, never grouped with each other, even
+// when several of them appear alongside a genuine duplicate pair.
+func TestWarnDuplicateBackingStorages_EmptyKeysNeverGroup(t *testing.T) {
+	t.Parallel()
+	ctx, buf := testLoggerCtx(t)
+	infos := []StorageInfo{
+		// Undeterminable identity, three different reasons, all keyed "".
+		{Name: "dir-nopath", Type: "dir"},                        // dir without Path
+		{Name: "nfs-noserver", Type: "nfs", Export: "/tank/x"},   // nfs without Server
+		{Name: "cifs-noshare", Type: "cifs", Server: "10.0.0.5"}, // cifs without Share
+		{Name: "", Type: "lvm"},                                  // fallback case without a Name
+		// One genuine duplicate pair, which must still be reported.
+		{Name: "nfs-a", Type: "nfs", Server: "10.0.0.5", Export: "/tank/proxmox"},
+		{Name: "nfs-b", Type: "nfs", Server: "10.0.0.5", Export: "/tank/proxmox"},
+	}
+	WarnDuplicateBackingStorages(ctx, infos)
+
+	logged := buf.String()
+	if strings.Count(logged, "two or more storage IDs share one physical backing") != 1 {
+		t.Fatalf("expected exactly one warning (the genuine pair), got: %s", logged)
+	}
+	for _, name := range []string{"dir-nopath", "nfs-noserver", "cifs-noshare"} {
+		if strings.Contains(logged, name) {
+			t.Errorf("undeterminable-backing storage %q must never be reported as a duplicate: %s", name, logged)
+		}
+	}
+	if !strings.Contains(logged, "nfs-a") || !strings.Contains(logged, "nfs-b") {
+		t.Errorf("the genuine duplicate pair must still be named: %s", logged)
+	}
+}
+
+// TestWarnDuplicateBackingStoragesOnce_GatesAcrossPaths proves the gate is
+// process-wide, not per-cache: a cache refresh and a direct call (the
+// create_stemcell PolicyDeps path) over the same storage.cfg produce exactly
+// one warning between them, in whichever order they run.
+//
+// Not parallel: the gate is process-wide state.
+func TestWarnDuplicateBackingStoragesOnce_GatesAcrossPaths(t *testing.T) {
+	defer ResetDuplicateBackingWarnOnceForTest()()
+
+	dupes := []StorageInfo{
+		{Name: "nfs-a", Type: "nfs", Server: "10.0.0.5", Export: "/tank/proxmox"},
+		{Name: "nfs-b", Type: "nfs", Server: "10.0.0.5", Export: "/tank/proxmox"},
+	}
+	lister := &fakeLister{entries: []map[string]any{
+		{"storage": "nfs-a", "type": "nfs", "server": "10.0.0.5", "export": "/tank/proxmox"},
+		{"storage": "nfs-b", "type": "nfs", "server": "10.0.0.5", "export": "/tank/proxmox"},
+	}}
+	cache := NewStorageInfoCache(lister, 0)
+
+	ctx, buf := testLoggerCtx(t)
+	// Stemcell-style direct call first, then the cache path.
+	WarnDuplicateBackingStoragesOnce(ctx, dupes)
+	if _, err := cache.Get(ctx, "nfs-a"); err != nil {
+		t.Fatalf("cache Get: %v", err)
+	}
+	WarnDuplicateBackingStoragesOnce(ctx, dupes)
+
+	occurrences := strings.Count(buf.String(), "two or more storage IDs share one physical backing")
+	if occurrences != 1 {
+		t.Errorf("expected exactly one warning across both paths, got %d: %s", occurrences, buf.String())
 	}
 }

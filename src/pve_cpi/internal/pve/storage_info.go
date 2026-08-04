@@ -298,13 +298,6 @@ type StorageInfoCache struct {
 	inflight map[string]chan struct{}
 	negCache negativeCacheEntry
 
-	// backingWarnOnce gates WarnDuplicateBackingStorages to a single firing
-	// per cache instance (in production, per process lifetime): storage.cfg
-	// duplicate-backing misconfiguration is static operator state, not
-	// something that flips on a routine TTL refresh, so re-warning on every
-	// refresh would just be process-lifetime log noise for a condition that
-	// does not change without an operator edit and a CPI restart.
-	backingWarnOnce sync.Once
 }
 
 type storageInfoEntry struct {
@@ -537,17 +530,17 @@ func (c *StorageInfoCache) refresh(ctx context.Context) error {
 	// Successful refresh clears the negative cache.
 	c.negCache = negativeCacheEntry{}
 
-	// One-time duplicate-backing warning (see backingWarnOnce doc). Run under
-	// the same c.mu already held for this refresh — WarnDuplicateBackingStorages
-	// is pure logging over the just-built entries, so this cannot deadlock or
-	// re-enter the cache.
-	c.backingWarnOnce.Do(func() {
-		infos := make([]StorageInfo, 0, len(c.entries))
-		for k := range c.entries {
-			infos = append(infos, c.entries[k].info)
-		}
-		WarnDuplicateBackingStorages(ctx, infos)
-	})
+	// One-time duplicate-backing warning, gated process-wide rather than per
+	// cache instance so this and create_stemcell's PolicyDeps adapter — the
+	// only other path that decodes a full /storage index — cannot both warn
+	// about the same storage.cfg (see duplicateBackingWarnOnce). Run under the
+	// same c.mu already held for this refresh: it is pure logging over the
+	// just-built entries, so it cannot deadlock or re-enter the cache.
+	infos := make([]StorageInfo, 0, len(c.entries))
+	for k := range c.entries {
+		infos = append(infos, c.entries[k].info)
+	}
+	WarnDuplicateBackingStoragesOnce(ctx, infos)
 	return nil
 }
 
