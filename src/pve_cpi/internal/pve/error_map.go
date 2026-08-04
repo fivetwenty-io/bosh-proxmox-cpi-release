@@ -76,6 +76,18 @@ func WrapError(err error) error {
 			"cluster has lost quorum; mutations are blocked until quorum returns — check `pvecm status`: "+err.Error())
 	}
 
+	// Permanent 500-with-text: PVE returns a request-shaped rejection as a 500
+	// body, which the generic APIError branch below would map to a retriable
+	// "PVE server error". Checked first so the director gets ok_to_retry=false
+	// and an operator-actionable message naming the volid. See
+	// IsVolumeFormatUnknown.
+	if IsVolumeFormatUnknown(err) {
+		return cpierrors.Cloud(
+			"PVE cannot determine a disk format for this volume ID — the volume ID is malformed "+
+				"or names a path its storage plugin cannot resolve; this is permanent, not a transient "+
+				"server fault: %s", err.Error())
+	}
+
 	// SDK APIError: check HTTP code for 404 vs 5xx vs 429 vs other 4xx.
 	var apiErr *sdkerrors.APIError
 	if errors.As(err, &apiErr) {
@@ -279,6 +291,13 @@ func IsCloneToNonSharedStorage(err error) bool {
 // nil → false.
 func IsTransientTransport(err error) bool {
 	if err == nil {
+		return false
+	}
+	// Permanent 500-with-text shapes are excluded before the blanket 5xx rule
+	// below: PVE answers a request-shaped rejection with a 500 body rather than
+	// a 4xx, so "is a 5xx" alone cannot distinguish a cycling worker from a
+	// verdict that will never change. See IsVolumeFormatUnknown.
+	if IsVolumeFormatUnknown(err) {
 		return false
 	}
 	if errors.Is(err, sdkerrors.ErrServer) {
@@ -620,6 +639,37 @@ func IsPoolNotFound(err error) bool {
 	}
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "pool") && strings.Contains(msg, "does not exist")
+}
+
+// IsVolumeFormatUnknown reports whether err is PVE's refusal to inspect a
+// volume whose volid it cannot parse into a known disk format. Live shape
+// (PVE 9.2, HTTP 500 + text, never 4xx):
+//
+//	volume_size_info on 'nfs-images:9999/vm-9999-disk-0.qcow2' failed - no format
+//
+// PVE's storage layer raises this from volume_size_info when the volid names a
+// directory-style path on file storage that its plugin cannot resolve to a
+// format. It is a permanent, request-shaped verdict about the volid the caller
+// supplied — the same request fails identically forever — but it arrives as a
+// 500, so the blanket 5xx rule in IsTransientTransport classified it transient
+// and every retry helper burned its full budget (observed live: 8 attempts,
+// ~29.9s on a has_disk probe) before surfacing the identical error. Both
+// IsTransientTransport and WrapError check this first so the error surfaces
+// immediately and non-retriably.
+//
+// Matched with a "volume_size_info" adjacency guard (both substrings must be
+// present) so an unrelated 500 mentioning a format — a genuinely transient
+// server fault whose text happens to include the word — is not misclassified
+// as permanent. Reachable only with a malformed disk CID; a CPI-issued disk
+// CID always names a well-formed volid.
+//
+// nil → false.
+func IsVolumeFormatUnknown(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "volume_size_info") && strings.Contains(msg, "no format")
 }
 
 // IsPVEPushback reports whether err signals PVE server-side rate-limiting or

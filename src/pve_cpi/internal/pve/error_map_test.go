@@ -1247,3 +1247,101 @@ func TestIsPoolNotFound_Nil(t *testing.T) {
 		t.Error("nil error should not match")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// IsVolumeFormatUnknown — permanent PVE 500 that must not be retried
+// ---------------------------------------------------------------------------
+
+// liveVolumeSizeInfoNoFormat is the verbatim PVE 9.2 body observed on a
+// has_disk probe for a directory-style volid on file storage. Pinned exactly
+// (including the trailing newline and "(code: 0)" suffix the SDK appends) so a
+// future PVE wording change fails this test rather than silently reverting the
+// classifier to "transient".
+const liveVolumeSizeInfoNoFormat = "volume_size_info on 'nfs-images:9999/vm-9999-disk-0.qcow2' failed - no format\n (code: 0)"
+
+func TestIsVolumeFormatUnknown_LiveText(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		msg  string
+		want bool
+	}{
+		{"live text", liveVolumeSizeInfoNoFormat, true},
+		{"mixed case", "VOLUME_SIZE_INFO on 'x' FAILED - NO FORMAT", true},
+		// Conservative: neither half alone is enough.
+		{"format word without volume_size_info", "unsupported format 'raw' for storage", false},
+		{"no format without volume_size_info", "backup failed - no format", false},
+		{"volume_size_info other failure", "volume_size_info on 'x' failed - permission denied", false},
+		{"unrelated 500", "internal server error", false},
+		{"empty", "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			err := makeAPIErr(500, tc.msg)
+			if got := pve.IsVolumeFormatUnknown(err); got != tc.want {
+				t.Errorf("IsVolumeFormatUnknown(%q) = %v, want %v", tc.msg, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestIsVolumeFormatUnknown_Nil(t *testing.T) {
+	t.Parallel()
+	if pve.IsVolumeFormatUnknown(nil) {
+		t.Error("nil error should not match")
+	}
+}
+
+// TestIsTransientTransport_VolumeFormatUnknownIsPermanent pins the fix for the
+// live regression: this shape is an HTTP 500, so the blanket 5xx rule in
+// IsTransientTransport classified it transient and the retry helpers burned the
+// full 8-attempt budget (~29.9s) before surfacing the identical error.
+func TestIsTransientTransport_VolumeFormatUnknownIsPermanent(t *testing.T) {
+	t.Parallel()
+	err := makeAPIErr(500, liveVolumeSizeInfoNoFormat)
+	if pve.IsTransientTransport(err) {
+		t.Error("volume_size_info ... no format is a permanent request-shaped error, must not be transient")
+	}
+	if pve.IsPVEPushback(err) {
+		t.Error("volume_size_info ... no format must not be classified as pushback either")
+	}
+	// A plain 500 stays transient — the exclusion must be shape-specific.
+	if !pve.IsTransientTransport(makeAPIErr(500, "internal server error")) {
+		t.Error("an unrelated 500 must still be transient")
+	}
+}
+
+// TestWrapError_VolumeFormatUnknown_NotRetriable proves the same shape surfaces
+// to the director as a permanent CloudError rather than a RetriableCloudError.
+func TestWrapError_VolumeFormatUnknown_NotRetriable(t *testing.T) {
+	t.Parallel()
+	got := pve.WrapError(makeAPIErr(500, liveVolumeSizeInfoNoFormat))
+	var cpiErr *cpierrors.Error
+	if !errors.As(got, &cpiErr) {
+		t.Fatalf("expected *cpierrors.Error, got %T: %v", got, got)
+	}
+	if cpiErr.Type() != cpierrors.TypeCloud {
+		t.Errorf("want TypeCloud got %q", cpiErr.Type())
+	}
+	if cpiErr.OkToRetry() {
+		t.Error("a malformed-volid 500 is permanent; ok_to_retry must be false")
+	}
+}
+
+// TestRetryOnTransient_DoesNotRetryVolumeFormatUnknown asserts the retry helper
+// returns on the first attempt instead of burning the transient budget.
+func TestRetryOnTransient_DoesNotRetryVolumeFormatUnknown(t *testing.T) {
+	t.Parallel()
+	calls := 0
+	err := pve.RetryOnTransient(context.Background(), nil, "has_disk_exists", 8, func() error {
+		calls++
+		return makeAPIErr(500, liveVolumeSizeInfoNoFormat)
+	})
+	if err == nil {
+		t.Fatal("expected the error to surface")
+	}
+	if calls != 1 {
+		t.Errorf("expected exactly 1 attempt (permanent error), got %d", calls)
+	}
+}
