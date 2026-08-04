@@ -486,3 +486,78 @@ func TestCollectStemcellTemplates_MarkerVariants(t *testing.T) {
 		})
 	}
 }
+
+// TestCollectStemcellTemplates_MarksGeneration is the "shown but
+// distinguishable" requirement: an old-generation template must appear in the
+// inventory (an operator has to see it to clean it up) while never reading as
+// one this CPI owns.
+func TestCollectStemcellTemplates_MarksGeneration(t *testing.T) {
+	vms := []ClusterVM{
+		{VMID: 30406, Node: "pve1", Name: "cache",
+			Tags: "bosh-stemcell;bosh-stemcell-cache;bosh-stemcell-sha-aaaaaaaa", Template: true},
+		{VMID: 30006, Node: "pve1", Name: "ref-anchor",
+			Tags: "bosh-stemcell-sha-bbbbbbbb;director--uuid-1", Template: true},
+		// Previous generation: content sha identity, no generation marker.
+		{VMID: 29000, Node: "pve1", Name: "old-gen",
+			Tags: "bosh-stemcell;bosh-stemcell-sha-cccccccc", Template: true},
+	}
+
+	bySHA, _ := collectStemcellTemplates(context.Background(), &fakeReader{}, vms)
+
+	for _, tc := range []struct {
+		sha  string
+		want bool
+	}{
+		{"aaaaaaaa", true},  // cache tag
+		{"bbbbbbbb", true},  // director-- ref
+		{"cccccccc", false}, // neither
+	} {
+		recs := bySHA[tc.sha]
+		if len(recs) != 1 {
+			t.Fatalf("sha %s: expected 1 template (old generation must still be LISTED), got %d", tc.sha, len(recs))
+		}
+		if recs[0].CurrentGeneration != tc.want {
+			t.Errorf("sha %s: CurrentGeneration = %v, want %v", tc.sha, recs[0].CurrentGeneration, tc.want)
+		}
+	}
+}
+
+// TestStemcellEntryGeneration covers the GENERATION column summary.
+func TestStemcellEntryGeneration(t *testing.T) {
+	cur := StemcellTemplateRecord{CurrentGeneration: true}
+	old := StemcellTemplateRecord{CurrentGeneration: false}
+	cases := []struct {
+		name string
+		e    StemcellInventoryEntry
+		want string
+	}{
+		{"no templates", StemcellInventoryEntry{}, "-"},
+		{"all current", StemcellInventoryEntry{Templates: []StemcellTemplateRecord{cur, cur}}, "current"},
+		{"all previous", StemcellInventoryEntry{Templates: []StemcellTemplateRecord{old, old}}, "previous"},
+		{"mixed", StemcellInventoryEntry{Templates: []StemcellTemplateRecord{cur, old}}, "mixed"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := stemcellEntryGeneration(tc.e); got != tc.want {
+				t.Errorf("stemcellEntryGeneration = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestPrintStemcellInventoryTable_ShowsGeneration proves the distinction
+// reaches the operator's screen, not just the JSON.
+func TestPrintStemcellInventoryTable_ShowsGeneration(t *testing.T) {
+	var buf strings.Builder
+	printStemcellInventoryTable(&buf, []StemcellInventoryEntry{
+		{SHA8: "aaaaaaaa", Templates: []StemcellTemplateRecord{{VMID: 30406, CurrentGeneration: true}}},
+		{SHA8: "cccccccc", Templates: []StemcellTemplateRecord{{VMID: 29000, CurrentGeneration: false}}},
+	})
+	out := buf.String()
+	if !strings.Contains(out, "GENERATION") {
+		t.Errorf("table must carry a GENERATION column, got:\n%s", out)
+	}
+	if !strings.Contains(out, "current") || !strings.Contains(out, "previous") {
+		t.Errorf("table must distinguish current from previous generation, got:\n%s", out)
+	}
+}

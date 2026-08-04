@@ -39,11 +39,18 @@ const (
 	directorRefTagPrefix = "director--"
 )
 
-// hasStemcellGenerationMarker reports whether the given PVE tag tokens carry
+// HasStemcellGenerationMarker reports whether the given PVE tag tokens carry
 // at least one marker proving the template belongs to this CPI generation:
 // the cache tag, or a non-empty director reference tag. See the package
 // comment above for why sha-tag identity alone is not sufficient.
-func hasStemcellGenerationMarker(tokens []string) bool {
+//
+// Exported for cmd/pve-cid, whose stemcell inventory must classify the same
+// templates this package's lookups filter on. The operator tool deliberately
+// LISTS previous-generation templates that the CPI ignores — an inventory
+// exists to surface leftovers — so it needs the predicate as a label rather
+// than only as a filter. Sharing this one implementation keeps the tool's
+// notion of "this generation" from drifting away from the CPI's.
+func HasStemcellGenerationMarker(tokens []string) bool {
 	for _, tok := range tokens {
 		if tok == stemcellCacheTagValue {
 			return true

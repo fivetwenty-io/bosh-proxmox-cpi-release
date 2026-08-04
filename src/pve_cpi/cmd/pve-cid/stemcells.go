@@ -476,7 +476,7 @@ func printStemcellInventoryTable(w io.Writer, entries []StemcellInventoryEntry) 
 	}
 
 	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
-	_, _ = fmt.Fprintln(tw, "SHA8\tNAME\tVERSION\tTEMPLATES\tFILES\tDIRECTOR_REFS\tORPHAN")
+	_, _ = fmt.Fprintln(tw, "SHA8\tNAME\tVERSION\tTEMPLATES\tGENERATION\tFILES\tDIRECTOR_REFS\tORPHAN")
 	for _, e := range entries {
 		name, version := "-", "-"
 		refCount := 0
@@ -491,8 +491,9 @@ func printStemcellInventoryTable(w io.Writer, entries []StemcellInventoryEntry) 
 			}
 			refCount = len(seen)
 		}
-		_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%d\t%d\t%d\t%t\n",
-			stemcellEntryLabel(e), name, version, len(e.Templates), len(e.Files), refCount, e.Orphan)
+		_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%d\t%s\t%d\t%d\t%t\n",
+			stemcellEntryLabel(e), name, version, len(e.Templates),
+			stemcellEntryGeneration(e), len(e.Files), refCount, e.Orphan)
 	}
 	_ = tw.Flush()
 
@@ -504,6 +505,40 @@ func printStemcellInventoryTable(w io.Writer, entries []StemcellInventoryEntry) 
 		for _, reason := range e.OrphanReasons {
 			_, _ = fmt.Fprintf(w, "  - %s\n", reason)
 		}
+	}
+}
+
+// stemcellEntryGeneration summarises the GENERATION column for e: whether the
+// templates grouped under this sha8 belong to the running CPI's generation.
+//
+//	current  — every template carries a cache tag or a director-- ref
+//	previous — none do: leftovers the CPI will neither adopt nor delete,
+//	           listed so an operator can find and remove them by hand
+//	mixed    — both, which normally means a rebuild left the old anchor behind
+//	-        — no templates in this entry (a file with no template at all)
+//
+// Without this column a previous-generation leftover is indistinguishable
+// from a template this CPI owns, and "it appears in the inventory" reads as
+// "the CPI is managing it" — which is exactly backwards for a leftover.
+func stemcellEntryGeneration(e StemcellInventoryEntry) string {
+	if len(e.Templates) == 0 {
+		return "-"
+	}
+	current, previous := 0, 0
+	for i := range e.Templates {
+		if e.Templates[i].CurrentGeneration {
+			current++
+			continue
+		}
+		previous++
+	}
+	switch {
+	case previous == 0:
+		return "current"
+	case current == 0:
+		return "previous"
+	default:
+		return "mixed"
 	}
 }
 

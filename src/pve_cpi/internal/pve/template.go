@@ -344,7 +344,7 @@ func ResolveTemplateVMIDForNode(ctx context.Context, c Client, node, sha8 string
 			continue
 		}
 		tokens := splitPVETags(*item.Tags)
-		if !hasStemcellGenerationMarker(tokens) {
+		if !HasStemcellGenerationMarker(tokens) {
 			// Same generation gate the cluster-scoped scan applies: a
 			// pre-generation template carries the sha tag but none of this
 			// CPI's markers and must stay invisible here too, or the
@@ -456,7 +456,7 @@ type clusterQemuResourceItem struct {
 // before their respective name/tag match.
 //
 // Rows without a marker proving this CPI generation built or adopted them
-// (hasStemcellGenerationMarker) are dropped here rather than in each caller,
+// (HasStemcellGenerationMarker) are dropped here rather than in each caller,
 // so no sha8- or name-keyed path can adopt, sweep, or destroy a template a
 // previous CPI generation left on the cluster. See stemcell_generation.go.
 func listClusterQemuTemplates(ctx context.Context, c Client, label string) ([]clusterQemuResourceItem, error) {
@@ -490,7 +490,7 @@ func listClusterQemuTemplates(ctx context.Context, c Client, label string) ([]cl
 			// Excludes running VMs (not yet — or never — frozen as templates).
 			continue
 		}
-		if !hasStemcellGenerationMarker(splitPVETags(item.Tags)) {
+		if !HasStemcellGenerationMarker(splitPVETags(item.Tags)) {
 			// Excludes templates left by a previous CPI generation: they carry
 			// the same content sha tag but none of this generation's refs, so
 			// adopting one would destroy a live template on the first

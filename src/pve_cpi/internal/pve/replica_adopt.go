@@ -125,7 +125,7 @@ func findReplicaCandidate(ctx context.Context, c Client, node, sha8 string) (rep
 			continue
 		}
 		tokens := splitPVETags(*item.Tags)
-		if !hasStemcellGenerationMarker(tokens) {
+		if !HasStemcellGenerationMarker(tokens) {
 			// Generation gate (stemcell_generation.go). Every replica this CPI
 			// builds carries the cache tag from creation — including while it
 			// is still mid-build, which is exactly what this scan looks for —

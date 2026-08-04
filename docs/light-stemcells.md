@@ -325,6 +325,14 @@ Every mode registers the calling BOSH director's UUID as a live reference on the
 
 Multiple directors sharing one PVE cluster each hold independent references on the same cache template — see [Multi-cluster deployments — Stemcell registration across CPI entries](multi-cluster.md#stemcell-registration-across-cpi-entries) for the `--fix` re-registration workflow when one BOSH director targets multiple cpi-config entries.
 
+### `:heavy:` and a cross-cluster shared export do not mix
+
+Reference counts are scoped to one cpi-config entry, because an entry can only see its own cluster's templates. That is harmless while each cluster owns its own copy of a file, and it is the whole reason `:light:` is safe on a shared export — nothing the CPI does can delete an operator-managed qcow2.
+
+For `:heavy:` it is a trap. Point two entries' `stemcell_storage` at one shared export and both write the same deterministic filename, so both end up referencing one file while counting references separately. The first cluster to release its last reference deletes that file, and the second cluster's templates keep pointing at a path that is no longer there. Nothing in the surviving cluster's own state records why: its reference count never reached zero, so from its side the deletion is unexplained, and the failure usually surfaces later as a `create_vm` that cannot find its image.
+
+Put `:heavy:` stemcells on storage only one entry can reach, or use `:light:` on the shared pool.
+
 ## Operator caveats
 
 `bosh delete-stemcell` on a stemcell whose only remaining director reference is this director's destroys the cache template (and, for `:heavy:`, the qcow2). No manual `pvesm free` step is needed in that case. Verify with `bosh stemcells` before and after; the CID disappears once every director has released it.
