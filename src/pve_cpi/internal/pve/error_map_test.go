@@ -397,6 +397,24 @@ func TestIsCloneSourceMissing_Unrelated500(t *testing.T) {
 	}
 }
 
+func TestIsCloneToNonSharedStorage(t *testing.T) {
+	t.Parallel()
+	// Exact live shape: PVE rejects a cross-node clone whose destination
+	// storage is node-local. The SDK surfaced it with code 0, which the
+	// transient-transport classifier would otherwise match — the real
+	// failure behind another "exhausted VMID allocation" message.
+	err := makeAPIErr(500, "can't clone to non-shared storage 'local-lvm-data'")
+	if !pve.IsCloneToNonSharedStorage(err) {
+		t.Errorf("destination-not-shared rejection should match, got false; err=%v", err)
+	}
+	if pve.IsCloneToNonSharedStorage(nil) {
+		t.Error("nil should not match")
+	}
+	if pve.IsCloneToNonSharedStorage(makeAPIErr(500, "storage 'zfs-0' is not online")) {
+		t.Error("unrelated 500 should not match")
+	}
+}
+
 func TestIsTransientTransport_Nil(t *testing.T) {
 	t.Parallel()
 	if pve.IsTransientTransport(nil) {

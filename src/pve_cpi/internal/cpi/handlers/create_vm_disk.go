@@ -249,6 +249,16 @@ func handleCloneError(
 		logger.Info("create_vm: storage lock timeout on clone, retrying",
 			log.Int("vmid_attempted", candidate),
 		)
+	case pve.IsCloneToNonSharedStorage(cerr):
+		// PVE rejected the cross-node clone because the DESTINATION storage
+		// is node-local. Permanent configuration condition — checked before
+		// IsTransientTransport, whose classification the underlying SDK
+		// error can also match.
+		logger.Error("create_vm: cross-node clone rejected by PVE: destination storage is node-local",
+			log.Int("vmid_attempted", candidate),
+			log.ErrScrubbed(cerr),
+		)
+		cleanupVMDetached(ctx, deps, node, candidate, logger)
 	case pve.IsTransientTransport(cerr):
 		// Clone POST may or may not have committed — sweep the candidate VMID
 		// before retrying so the cluster list is clean.
@@ -264,6 +274,67 @@ func handleCloneError(
 		cleanupVMDetached(ctx, deps, node, candidate, logger)
 	}
 	return cerr
+}
+
+// enforceCrossNodeCloneTarget applies the local-storage cross-node constraint
+// and, when the clone legitimately crosses nodes, sets params.Target. No-op
+// when the template already sits on the VM's node.
+//
+// PVE requires BOTH sides of a cross-node clone to be shared:
+//
+//   - The ORIGINAL VM's storage (per the SDK's CreateQemuCloneParams.Target
+//     doc): consult templateStorage's shared-ness, not shape.vmStorage's — a
+//     template on local storage with a shared vm_storage would otherwise pass
+//     and PVE itself would reject the clone with a less actionable error.
+//     Falls back to shape.vmStorage only when the template's own storage is
+//     undeterminable (Config read failure), preserving fail-open behavior.
+//   - The DESTINATION storage the new disks land on: a shared-storage
+//     template cloning into node-local vm_storage fails PVE-side with
+//     "can't clone to non-shared storage". Live-hit shape: an adopted cache
+//     template whose disk sits on the shared stemcell pool while vm_storage
+//     is lvmthin.
+func enforceCrossNodeCloneTarget(
+	ctx context.Context,
+	deps Deps,
+	policyDeps pve.PolicyDeps,
+	shape *createVMShape,
+	templateNode, templateStorage string,
+	templateStorageKnown bool,
+	params *sdknodes.CreateQemuCloneParams,
+) error {
+	if templateNode == shape.node {
+		return nil
+	}
+	checkStorage := shape.vmStorage
+	if templateStorageKnown {
+		checkStorage = templateStorage
+	}
+	storageInfo, infoErr := policyDeps.StorageInfo(ctx, checkStorage)
+	if infoErr != nil {
+		return cpierrors.Wrap(infoErr,
+			"create_vm: cross-node clone: cannot look up storage "+checkStorage+" to determine if Target is safe")
+	}
+	if !storageInfo.IsShared() {
+		return cpierrors.Cloud(
+			"create_vm: cross-node clone rejected: template is on node %q but VM is targeted to node %q;"+
+				" storage %q is local (not shared) — PVE cannot cross-node clone local storage;"+
+				" set cloud_properties.node to match the template node (%q),"+
+				" or use shared storage",
+			templateNode, shape.node, checkStorage, templateNode)
+	}
+	if needsReplicaCheck(ctx, deps, shape.vmStorage) {
+		return cpierrors.Cloud(
+			"create_vm: cross-node clone rejected: template is on node %q but VM is targeted to node %q,"+
+				" and destination storage %q is local (not shared) — PVE cannot write a cross-node clone's"+
+				" disks to local storage; enable stemcell_replicate_local so every node gets its own"+
+				" template replica, set cloud_properties.node to match the template node (%q),"+
+				" or use shared storage for vm_storage",
+			templateNode, shape.node, shape.vmStorage, templateNode)
+	}
+	// Both sides shared: set Target so PVE lands the clone on shape.node.
+	targetNode := shape.node
+	params.Target = &targetNode
+	return nil
 }
 
 // resolveCloneFullFlag decides linked vs full clone from clone_mode plus the
@@ -556,42 +627,9 @@ func cloneFromTemplate(
 		return policyErr
 	}
 
-	// After policy validation, enforce the local-storage cross-node constraint:
-	// if templateNode and shape.node differ AND storage is not shared, PVE cannot
-	// clone across nodes — the operator must fix this by
-	// pinning the VM node to match the template node or switching to shared storage.
-	//
-	// PVE's own constraint (per the SDK's CreateQemuCloneParams.Target doc) is
-	// "Target node. Only allowed if the ORIGINAL VM is on shared storage" — the
-	// original VM here is the TEMPLATE, not the destination vm_storage. Consult
-	// templateStorage's shared-ness, not shape.vmStorage's: a template on local
-	// storage with a shared vm_storage would otherwise pass this check and set
-	// Target, only for PVE itself to reject the clone with its own (less
-	// actionable) error — this pre-flight check exists specifically to catch
-	// that case before any PVE mutation. Falls back to shape.vmStorage only
-	// when the template's own storage is undeterminable (Config read failure),
-	// preserving the pre-fix fail-open behavior for that case.
-	if templateNode != shape.node {
-		checkStorage := shape.vmStorage
-		if templateStorageKnown {
-			checkStorage = templateStorage
-		}
-		storageInfo, infoErr := policyDeps.StorageInfo(ctx, checkStorage)
-		if infoErr != nil {
-			return cpierrors.Wrap(infoErr,
-				"create_vm: cross-node clone: cannot look up storage "+checkStorage+" to determine if Target is safe")
-		}
-		if !storageInfo.IsShared() {
-			return cpierrors.Cloud(
-				"create_vm: cross-node clone rejected: template is on node %q but VM is targeted to node %q;"+
-					" storage %q is local (not shared) — PVE cannot cross-node clone local storage;"+
-					" set cloud_properties.node to match the template node (%q),"+
-					" or use shared storage",
-				templateNode, shape.node, checkStorage, templateNode)
-		}
-		// Shared storage confirmed: set Target so PVE lands the clone on shape.node.
-		targetNode := shape.node
-		params.Target = &targetNode
+	if err := enforceCrossNodeCloneTarget(ctx, deps, policyDeps, shape, templateNode,
+		templateStorage, templateStorageKnown, params); err != nil {
+		return err
 	}
 
 	logger.Info("create_vm: cloning template",

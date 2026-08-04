@@ -1356,6 +1356,12 @@ func allocateVM(
 		if pve.IsCloneSourceMissing(e) {
 			return false
 		}
+		// Same short-circuit for PVE's cross-node clone rejection: it can
+		// surface with an SDK classification IsTransientTransport matches,
+		// but it is a permanent configuration condition.
+		if pve.IsCloneToNonSharedStorage(e) {
+			return false
+		}
 		return pve.IsVMIDConflict(e) || pve.IsStorageLockTimeout(e) || pve.IsTransientTransport(e)
 	}
 

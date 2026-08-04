@@ -210,13 +210,15 @@ func TestCloneFromTemplate_K3_TemplateLocal_VMStorageShared_TargetRejected(t *te
 	}
 }
 
-// TestCloneFromTemplate_K3_TemplateShared_VMStorageLocal_TargetAccepted is the
+// TestCloneFromTemplate_K3_TemplateShared_VMStorageLocal_Rejected is the
 // mirror case: the template lives on SHARED storage while vm_storage is a
-// DIFFERENT, LOCAL storage. Before the fix this checked vm_storage's shared-
-// ness (false) and would have wrongly rejected a cross-node clone that PVE
-// would actually permit (the ORIGINAL/template VM is what must be shared).
-// After the fix, Target is set and the clone proceeds.
-func TestCloneFromTemplate_K3_TemplateShared_VMStorageLocal_TargetAccepted(t *testing.T) {
+// DIFFERENT, LOCAL storage. An earlier revision expected Target to be set
+// here on the theory that only the ORIGINAL/template VM's storage must be
+// shared — live PVE disproved that: the clone POST fails with "can't clone
+// to non-shared storage '<vm_storage>'", because PVE also requires the
+// DESTINATION storage of a cross-node clone to be shared. The pre-flight
+// must reject with the replica remedy instead of letting PVE burn the VMID.
+func TestCloneFromTemplate_K3_TemplateShared_VMStorageLocal_Rejected(t *testing.T) {
 	t.Parallel()
 	n := &cloneNodes{}
 	entries := map[string]dlbStorageEntry{
@@ -227,17 +229,17 @@ func TestCloneFromTemplate_K3_TemplateShared_VMStorageLocal_TargetAccepted(t *te
 	shape := buildCloneShapeWithNode("vm-local", "dir", "qcow2", "pve02")
 
 	err := cloneFromTemplate(context.Background(), deps, log.NewNopLogger(), shape, 701, "vm-701", "pve01", 7201)
-	if err != nil {
-		t.Fatalf("K3 mirror: expected success (template is shared), got error: %v", err)
+	if err == nil {
+		t.Fatal("K3 mirror: expected rejection — PVE cannot write a cross-node clone's disks to local storage")
 	}
-	if len(n.calls) != 1 {
-		t.Fatalf("expected 1 CreateQemuClone call, got %d", len(n.calls))
+	if len(n.calls) != 0 {
+		t.Fatalf("K3 mirror: CreateQemuClone must not be called, got %d calls", len(n.calls))
 	}
-	p := n.calls[0]
-	if p.Target == nil {
-		t.Fatal("K3 mirror: Target must be set (template's storage is shared), got nil")
+	msg := err.Error()
+	if !strings.Contains(msg, "vm-local") {
+		t.Errorf("K3 mirror: error must name the destination storage (vm-local): %v", err)
 	}
-	if *p.Target != "pve02" {
-		t.Errorf("K3 mirror: Target = %q, want %q", *p.Target, "pve02")
+	if !strings.Contains(msg, "stemcell_replicate_local") {
+		t.Errorf("K3 mirror: error must offer the replica remedy: %v", err)
 	}
 }

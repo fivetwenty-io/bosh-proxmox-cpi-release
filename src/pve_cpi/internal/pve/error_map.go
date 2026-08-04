@@ -237,6 +237,25 @@ func IsCloneSourceMissing(err error) bool {
 	return strings.Contains(msg, "unable to find configuration file for vm")
 }
 
+// IsCloneToNonSharedStorage reports whether err is PVE's rejection of a
+// cross-node clone whose DESTINATION storage is node-local:
+//
+//	can't clone to non-shared storage 'local-lvm-data'
+//
+// PVE requires BOTH sides of a cross-node clone to be shared: the template's
+// own storage (the SDK's documented Target constraint) and the destination
+// storage the new disks are written to. The rejection can surface with an
+// SDK classification IsTransientTransport would match, but it is a PERMANENT
+// configuration condition: retrying with a fresh VMID cannot help, so
+// callers must treat it as non-retryable and surface the real cause instead
+// of an "exhausted VMID allocation" message.
+func IsCloneToNonSharedStorage(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "can't clone to non-shared storage")
+}
+
 // IsTransientTransport reports whether err signals a transient transport-layer
 // fault between the CPI and the PVE API surface, distinct from a deliberate
 // HTTP 4xx response. The canonical trigger is a pvedaemon worker cycling

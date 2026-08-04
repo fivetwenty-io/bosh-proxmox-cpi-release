@@ -352,3 +352,83 @@ func TestCloneFromTemplate_TemplateStorageUndeterminable_ForcedLinked_StillRejec
 		t.Errorf("error should reference vm_storage (the fail-open capability check target): %v", err)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Cross-node clones: PVE requires BOTH sides shared.
+// ---------------------------------------------------------------------------
+
+// buildCrossNodeCloneDeps mirrors buildCloneDepsMultiStorage but with a
+// multi-node cluster, for exercising the Target= enforcement block.
+func buildCrossNodeCloneDeps(
+	n *cloneNodes, entries map[string]dlbStorageEntry, templateStorage string, templateVMID int,
+) Deps {
+	cfg := &config.CPIConfig{Node: "pve-a", CloneMode: "auto"}
+	cfg.ApplyDefaults()
+	cfg.CloneMode = "auto"
+	return Deps{
+		Config: cfg,
+		PVE: &cloneClient{
+			etClient: etClient{
+				nodes: n,
+				qemu:  buildTemplateQEMU(templateStorage, templateVMID, nil),
+			},
+			clusterStorageSvc: &dlbMultiStorageStub{entries: entries},
+			clusterSvc:        &cloneClusterSvc{nodeCount: 3},
+		},
+		Logger: log.NewNopLogger(),
+	}
+}
+
+// TestCloneFromTemplate_CrossNode_LocalDestination_RejectedPreflight is the
+// live-hit regression: the template's own disk sits on a SHARED pool (an
+// adopted cache template on the shared stemcell pool), the VM targets a
+// different node, and vm_storage is node-local. The old guard consulted only
+// the template's storage, set Target, and PVE itself rejected the clone with
+// "can't clone to non-shared storage" — burning a VMID per retry. The
+// pre-flight must now reject before any PVE mutation.
+func TestCloneFromTemplate_CrossNode_LocalDestination_RejectedPreflight(t *testing.T) {
+	t.Parallel()
+	n := &cloneNodes{}
+	entries := map[string]dlbStorageEntry{
+		"nfs-images":     {storageType: "nfs", shared: true},
+		"local-lvm-data": {storageType: "lvmthin", shared: false},
+	}
+	deps := buildCrossNodeCloneDeps(n, entries, "nfs-images", 30006)
+	shape := buildCloneShapeWithNode("local-lvm-data", "lvmthin", "qcow2", "pve-b")
+
+	err := cloneFromTemplate(context.Background(), deps, log.NewNopLogger(), shape, 600, "vm-600", "pve-a", 30006)
+	if err == nil {
+		t.Fatal("expected pre-flight rejection: cross-node clone into node-local vm_storage")
+	}
+	if len(n.calls) != 0 {
+		t.Errorf("CreateQemuClone must not be called, got %d calls", len(n.calls))
+	}
+	if !strings.Contains(err.Error(), "destination storage") || !strings.Contains(err.Error(), "stemcell_replicate_local") {
+		t.Errorf("error should name the destination storage and the replica remedy: %v", err)
+	}
+}
+
+// TestCloneFromTemplate_CrossNode_SharedBothSides_SetsTarget verifies the
+// happy path the new destination check must not break: both the template's
+// storage and vm_storage shared → clone proceeds with Target set.
+func TestCloneFromTemplate_CrossNode_SharedBothSides_SetsTarget(t *testing.T) {
+	t.Parallel()
+	n := &cloneNodes{}
+	entries := map[string]dlbStorageEntry{
+		"nfs-images": {storageType: "nfs", shared: true},
+		"nfs-vms":    {storageType: "nfs", shared: true},
+	}
+	deps := buildCrossNodeCloneDeps(n, entries, "nfs-images", 30006)
+	shape := buildCloneShapeWithNode("nfs-vms", "nfs", "qcow2", "pve-b")
+
+	err := cloneFromTemplate(context.Background(), deps, log.NewNopLogger(), shape, 601, "vm-601", "pve-a", 30006)
+	if err != nil {
+		t.Fatalf("cross-node clone with both sides shared must succeed: %v", err)
+	}
+	if len(n.calls) != 1 {
+		t.Fatalf("expected 1 CreateQemuClone call, got %d", len(n.calls))
+	}
+	if n.calls[0].Target == nil || *n.calls[0].Target != "pve-b" {
+		t.Errorf("Target must be set to the VM's node; got %v", n.calls[0].Target)
+	}
+}
