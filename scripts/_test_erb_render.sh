@@ -121,6 +121,7 @@ BASE_PROPS='{
     "realm" => "pam", "node" => "pve1",
     "vm_storage" => "local-lvm", "disk_storage" => "local-lvm",
     "stemcell_storage" => "local", "iso_storage" => "local",
+    "stemcell_strategy" => "template",
     "network_bridge" => "vmbr0", "network_mode" => "sdn",
     "sdn_zone" => "", "sdn_zone_type" => "vxlan", "sdn_auto_manage_zone" => true,
     "verify_ssl" => true, "agent_mode" => "cloudinit",
