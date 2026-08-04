@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"reflect"
 	"testing"
 )
@@ -84,5 +85,51 @@ func TestTagValue(t *testing.T) {
 	}
 	if v := tagValue(tokens, stemcellVersionTagPrefix); v != "" {
 		t.Errorf("tagValue(version) = %q, want empty", v)
+	}
+}
+
+// TestPVEIntBool_DecodesPVEWireFormat guards the decode that gates the whole
+// template inventory. PVE serialises booleans as 1/0, not true/false — a plain
+// `bool` field fails to unmarshal the row, and since a failed row is skipped,
+// the symptom is an inventory that silently reports zero templates rather than
+// an error.
+func TestPVEIntBool_DecodesPVEWireFormat(t *testing.T) {
+	cases := []struct {
+		name string
+		json string
+		want bool
+	}{
+		{"PVE integer true", `{"template":1}`, true},
+		{"PVE integer false", `{"template":0}`, false},
+		{"quoted integer true", `{"template":"1"}`, true},
+		{"JSON true", `{"template":true}`, true},
+		{"JSON false", `{"template":false}`, false},
+		{"null", `{"template":null}`, false},
+		{"field absent (running VM)", `{}`, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var row struct {
+				Template pveIntBool `json:"template,omitempty"`
+			}
+			if err := json.Unmarshal([]byte(tc.json), &row); err != nil {
+				t.Fatalf("unmarshal %s: %v", tc.json, err)
+			}
+			if bool(row.Template) != tc.want {
+				t.Errorf("%s decoded to %v, want %v", tc.json, bool(row.Template), tc.want)
+			}
+		})
+	}
+}
+
+// TestPVEIntBool_RejectsUnrecognized matches internal/pve's pveBool: an
+// unexpected value is an error, so the row is skipped rather than quietly
+// classified as "not a template".
+func TestPVEIntBool_RejectsUnrecognized(t *testing.T) {
+	var row struct {
+		Template pveIntBool `json:"template,omitempty"`
+	}
+	if err := json.Unmarshal([]byte(`{"template":"maybe"}`), &row); err == nil {
+		t.Error("expected an error for an unrecognised PVE boolean")
 	}
 }

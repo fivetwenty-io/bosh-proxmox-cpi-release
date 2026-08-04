@@ -51,6 +51,18 @@ type StemcellTemplateRecord struct {
 	CID           string   `json:"cid,omitempty"`
 	HasProvenance bool     `json:"has_provenance"`
 	DirectorRefs  []string `json:"director_refs,omitempty"`
+
+	// CurrentGeneration reports whether this template carries a marker
+	// proving it belongs to a CPI generation that uses reference tags — the
+	// cache tag or a non-empty director-- ref (pve.HasStemcellGenerationMarker,
+	// the same predicate the CPI's own template lookup filters on).
+	//
+	// false means a previous-generation leftover: it carries the same content
+	// sha tag, but the running CPI will neither adopt nor delete it. Such a
+	// template is deliberately still listed — an operator needs to see it to
+	// clean it up by hand — so this flag is what keeps "listed" from reading
+	// as "owned".
+	CurrentGeneration bool `json:"current_generation"`
 }
 
 // StemcellInventoryEntry groups every cache template and qcow2 file sharing
@@ -138,8 +150,32 @@ func collectStemcellTemplates(ctx context.Context, r Reader, vms []ClusterVM) (m
 	var untaggedTemplates []StemcellTemplateRecord
 	for i := range vms {
 		vm := &vms[i]
+		if !vm.Template {
+			// PVE copies a template's tags onto every clone, so a running VM
+			// built from a cache template carries the full stemcell tag set.
+			// Without this check the inventory reported live VMs as templates
+			// — on the V5 baseline, 12 of AZ1's 15 reported templates were
+			// running cf VMs. This mirrors listClusterQemuTemplates, the
+			// filter the CPI's own lookup uses.
+			continue
+		}
 		tokens := splitPVETags(vm.Tags)
-		if !hasTagToken(tokens, stemcellMarkerTag) {
+		// Either marker qualifies. The bare bosh-stemcell tag alone missed
+		// cache templates whose tag set carries a sha tag and director-- refs
+		// but not that exact token (hasTagToken is an exact-token match) —
+		// VMID 30006 was the live example.
+		//
+		// pve.HasStemcellGenerationMarker is the CPI's OWN predicate, shared
+		// rather than re-derived so the tool's notion of "this generation"
+		// cannot drift from the CPI's. The CLI accepts it ALONGSIDE the bare
+		// marker rather than instead of it: the CPI ignores
+		// previous-generation templates on purpose (adopting one would
+		// destroy a live template on the first last-ref delete), but an
+		// operator inventory must still list them — surfacing leftovers is
+		// most of what an inventory is for. They are listed and LABELLED,
+		// never silently mixed in with templates this CPI owns.
+		currentGeneration := pve.HasStemcellGenerationMarker(tokens)
+		if !hasTagToken(tokens, stemcellMarkerTag) && !currentGeneration {
 			continue
 		}
 		rec := StemcellTemplateRecord{
@@ -149,6 +185,8 @@ func collectStemcellTemplates(ctx context.Context, r Reader, vms []ClusterVM) (m
 			NameTag:    tagValue(tokens, stemcellNameTagPrefix),
 			VersionTag: tagValue(tokens, stemcellVersionTagPrefix),
 			SHA8Tag:    tagValue(tokens, stemcellSHATagPrefix),
+
+			CurrentGeneration: currentGeneration,
 		}
 		if cfg, cfgErr := r.VMConfig(ctx, vm.Node, vm.VMID); cfgErr == nil && cfg != nil {
 			desc := pve.DescriptionFromConfig(cfg)

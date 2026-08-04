@@ -115,6 +115,22 @@ An instance group's AZ assignment determines which named CPI — and so which PV
 
 Treat a cross-cluster AZ reassignment as a blue/green instance-group change with an explicit, out-of-band data migration — never as an in-place `azs:` edit on an already-deployed instance group.
 
+### `bosh clean-up --all` fails the first time, then succeeds
+
+On a multi-entry director the first `bosh clean-up --all` reliably fails while deleting stemcells:
+
+```
+Task 126 | Deleting stemcells: bosh-proxmox-kvm-ubuntu-noble-go_agent-light/1.383
+          L Error: Attempt to delete object did not result in a single row modification
+            (Rows Deleted: 0, SQL: DELETE FROM "stemcells" WHERE ("id" = 1))
+```
+
+This is a Director-side bug, not a CPI failure. A stemcell is registered once per cpi-config entry, so the Director's cleanup loop walks it once per entry and issues the same `DELETE FROM "stemcells" WHERE ("id" = 1)` twice; the second matches zero rows and Sequel raises. The stack lands in `cleanup_artifact_manager.rb`'s `delete_stemcells`.
+
+Every CPI call in that same task succeeds — `delete_stemcell` returns `ok` for each entry, including the Director's own retry against an entry whose reference was already released, since the CPI is idempotent there. The Director simply cannot commit its own database row twice.
+
+Re-run the command: the second `bosh clean-up --all` completes normally, because the first run already removed the row. The window between the two runs is safe — the artifacts the failed run deleted stay deleted, and nothing is left half-referenced.
+
 ## Disjoint VMID banding: the multi-cluster safety pattern
 
 Two safety mechanisms exist inside a single CPI process, and neither one extends across independent CPI processes:
@@ -153,6 +169,8 @@ This check runs per CPI entry, against that entry's own cluster's storage index 
 
 The headline scenario this whole design serves: upload a stemcell once as `:light:` — a preuploaded, operator-managed qcow2 (`cloud_properties.image_id`) — onto storage every cluster's `stemcell_storage` can reach, and every cluster consumes it from that single file with no duplicate upload traffic and no cross-cluster refcounting complexity, because `:light:` files are never deleted by the CPI at all (see [Design Decisions — D10](design-decisions.md#d10--qcow2-deletion-policy-light-never-heavy-at-last-cluster-reference)).
 
+**Heavy stemcells must not sit on an export shared across clusters.** The `:light:` rule above is what makes a shared export safe: an operator-managed qcow2 is never deleted by the CPI, so no cluster can pull the file out from under another. A `:heavy:` stemcell is the opposite — the CPI owns the file and deletes it when the last director reference in *that cluster's* entry goes away. Reference counts are per entry, and an entry cannot see the other cluster's references, so the first cluster to reach zero deletes a file the other cluster is still using; that cluster's next `create_vm` fails on a missing image with nothing in its own state to explain why. Put heavy stemcells on storage only one entry can reach, or use `:light:` on the shared pool. This is not hypothetical bookkeeping: we have run a full teardown against a pair of clusters mounting one NFS export with identical content listings, and only the light-stemcell rule kept one cluster's clean-up from removing the other's file.
+
 Each cluster still builds and owns its own cache template. `create_stemcell` (run once per entry via the upload-plus-`--fix` sequence above) builds that cluster's cache template *eagerly*, at upload time — it is not deferred to the first `create_vm`. If a cluster's cache template is later missing (manually deleted, or never built there), a `create_vm` under `stemcell_strategy: template` does **not** rebuild it inline: it logs a warning and falls back to `stemcell_strategy: import` for that one VM, importing directly from the shared qcow2. Run `--fix` again against that entry to rebuild the cache, or set `stemcell_strategy: import` deliberately if you never want a given deployment to depend on the cache.
 
 ## Cross-cluster stemcell inventory
@@ -165,6 +183,8 @@ pve-cid stemcells --orphans --config /path/to/pve-az2/cpi.json
 ```
 
 An entry showing an orphan on shared `:light:` storage that another entry still actively references is expected and correct — orphan status is always relative to the one cluster the command was run against, exactly matching how director references are scoped.
+
+The same applies after a teardown. Once the last deployment is gone, every `:light:` stemcell is reported as an orphan with the reason *"qcow2 file has no correlated cache template"* — which is precisely the steady state a light stemcell is designed for: the operator's file outlives the cache templates built from it. Do not read that as a delete list. The CPI never deletes an operator-managed file, and neither should a post-teardown sweep.
 
 ## Network reachability
 

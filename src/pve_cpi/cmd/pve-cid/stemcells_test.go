@@ -22,7 +22,7 @@ func TestBuildStemcellInventory_CorrelatedNonOrphan(t *testing.T) {
 	r := &fakeReader{
 		vms: []ClusterVM{
 			{VMID: 6042, Node: "pve1", Name: "bosh-stemcell-ubuntu-jammy-1.719-cafebabe",
-				Tags: "bosh-stemcell;bosh-stemcell-name-ubuntu-jammy;bosh-stemcell-version-1.719;bosh-stemcell-sha-cafebabe"},
+				Tags: "bosh-stemcell;bosh-stemcell-name-ubuntu-jammy;bosh-stemcell-version-1.719;bosh-stemcell-sha-cafebabe", Template: true},
 		},
 		configs: map[string]map[string]any{
 			"pve1/6042": templateCfg(t, templateProvenance{
@@ -61,7 +61,7 @@ func TestBuildStemcellInventory_ZeroRefsOrphan(t *testing.T) {
 	r := &fakeReader{
 		vms: []ClusterVM{
 			{VMID: 7000, Node: "pve1", Name: "bosh-stemcell-x-1-deadbeef",
-				Tags: "bosh-stemcell;bosh-stemcell-sha-deadbeef"},
+				Tags: "bosh-stemcell;bosh-stemcell-sha-deadbeef", Template: true},
 		},
 		configs: map[string]map[string]any{
 			"pve1/7000": templateCfg(t, templateProvenance{
@@ -123,7 +123,7 @@ func TestBuildStemcellInventory_MissingBackingFileOrphan(t *testing.T) {
 	r := &fakeReader{
 		vms: []ClusterVM{
 			{VMID: 8000, Node: "pve1", Name: "bosh-stemcell-y-1-11111111",
-				Tags: "bosh-stemcell;bosh-stemcell-sha-11111111"},
+				Tags: "bosh-stemcell;bosh-stemcell-sha-11111111", Template: true},
 		},
 		configs: map[string]map[string]any{
 			"pve1/8000": templateCfg(t, templateProvenance{
@@ -159,9 +159,9 @@ func TestBuildStemcellInventory_LocalStorageReplicaNotFalseOrphan(t *testing.T) 
 	r := &fakeReader{
 		vms: []ClusterVM{
 			{VMID: 6042, Node: "pve1", Name: "bosh-stemcell-ubuntu-jammy-1.719-cafebabe",
-				Tags: "bosh-stemcell;bosh-stemcell-name-ubuntu-jammy;bosh-stemcell-version-1.719;bosh-stemcell-sha-cafebabe"},
+				Tags: "bosh-stemcell;bosh-stemcell-name-ubuntu-jammy;bosh-stemcell-version-1.719;bosh-stemcell-sha-cafebabe", Template: true},
 			{VMID: 6043, Node: "pve2", Name: "bosh-stemcell-ubuntu-jammy-1.719-cafebabe",
-				Tags: "bosh-stemcell;bosh-stemcell-name-ubuntu-jammy;bosh-stemcell-version-1.719;bosh-stemcell-sha-cafebabe"},
+				Tags: "bosh-stemcell;bosh-stemcell-name-ubuntu-jammy;bosh-stemcell-version-1.719;bosh-stemcell-sha-cafebabe", Template: true},
 		},
 		configs: map[string]map[string]any{
 			"pve1/6042": templateCfg(t, templateProvenance{
@@ -214,7 +214,7 @@ func TestBuildStemcellInventory_LocalStorageTrulyMissingBackingIsOrphan(t *testi
 	r := &fakeReader{
 		vms: []ClusterVM{
 			{VMID: 7042, Node: "pve1", Name: "bosh-stemcell-x-1-deadbeef",
-				Tags: "bosh-stemcell;bosh-stemcell-sha-deadbeef"},
+				Tags: "bosh-stemcell;bosh-stemcell-sha-deadbeef", Template: true},
 		},
 		configs: map[string]map[string]any{
 			"pve1/7042": templateCfg(t, templateProvenance{
@@ -258,7 +258,7 @@ func TestBuildStemcellInventory_SharedStorageSingleNodeScanSuffices(t *testing.T
 	r := &fakeReader{
 		vms: []ClusterVM{
 			{VMID: 6042, Node: "pve1", Name: "bosh-stemcell-x-1-cafebabe",
-				Tags: "bosh-stemcell;bosh-stemcell-sha-cafebabe"},
+				Tags: "bosh-stemcell;bosh-stemcell-sha-cafebabe", Template: true},
 		},
 		configs: map[string]map[string]any{
 			"pve1/6042": templateCfg(t, templateProvenance{
@@ -304,8 +304,8 @@ func TestBuildStemcellInventory_SharedStorageSingleNodeScanSuffices(t *testing.T
 func TestBuildStemcellInventory_UntaggedTemplatesGetSeparateEntries(t *testing.T) {
 	r := &fakeReader{
 		vms: []ClusterVM{
-			{VMID: 9001, Node: "pve1", Name: "bosh-stemcell-a-1-00000000", Tags: "bosh-stemcell"},
-			{VMID: 9002, Node: "pve1", Name: "bosh-stemcell-b-1-00000000", Tags: "bosh-stemcell"},
+			{VMID: 9001, Node: "pve1", Name: "bosh-stemcell-a-1-00000000", Tags: "bosh-stemcell", Template: true},
+			{VMID: 9002, Node: "pve1", Name: "bosh-stemcell-b-1-00000000", Tags: "bosh-stemcell", Template: true},
 		},
 		configs: map[string]map[string]any{
 			"pve1/9001": templateCfg(t, templateProvenance{
@@ -347,7 +347,7 @@ func TestBuildStemcellInventory_UntaggedTemplatesGetSeparateEntries(t *testing.T
 func TestBuildStemcellInventory_IgnoresNonStemcellTemplatesAndFiles(t *testing.T) {
 	r := &fakeReader{
 		vms: []ClusterVM{
-			{VMID: 9000, Node: "pve1", Name: "some-other-template", Tags: "not-a-stemcell"},
+			{VMID: 9000, Node: "pve1", Name: "some-other-template", Tags: "not-a-stemcell", Template: true},
 		},
 		content: map[string][]StorageContentItem{
 			"pve1|local": {{VolID: "local:import/not-a-stemcell-file.qcow2"}},
@@ -380,4 +380,109 @@ func containsSubstring(items []string, substr string) bool {
 		}
 	}
 	return false
+}
+
+// ---------------------------------------------------------------------------
+// V5 D-2: the template inventory filtered on the bare bosh-stemcell tag alone,
+// so it was wrong in both directions.
+//
+// Over-reported: a running clone inherits its template's tags (PVE copies them
+// on clone), so live VMs were listed as templates — on the V5 baseline, 12 of
+// AZ1's reported 15 "templates" were running cf VMs.
+//
+// Under-reported: a genuine cache template whose tag set carries a sha tag and
+// director-- refs but not the bare bosh-stemcell token never appeared at all
+// (hasTagToken is an exact-token match). VMID 30006 was the live example.
+//
+// The CPI itself was never affected: listClusterQemuTemplates filters on
+// template=1 AND hasStemcellGenerationMarker. This was reporting-only.
+// ---------------------------------------------------------------------------
+
+// TestCollectStemcellTemplates_ExcludesRunningClones is the over-report half.
+func TestCollectStemcellTemplates_ExcludesRunningClones(t *testing.T) {
+	const stemcellTags = "bosh-stemcell;bosh-stemcell-cache;bosh-stemcell-name-ubuntu-noble;" +
+		"bosh-stemcell-version-1.383;bosh-stemcell-sha-cbc4cf34"
+
+	vms := []ClusterVM{
+		// The real cache template.
+		{VMID: 30406, Node: "pve1", Name: "bosh-stemcell-ubuntu-noble-1.383-cbc4cf34",
+			Tags: stemcellTags, Template: true},
+		// Running clones that inherited the template's tags verbatim. These
+		// are the shape that inflated the V5 baseline count.
+		{VMID: 598, Node: "pve1", Name: "cpi-cf-nats-0",
+			Tags: stemcellTags + ";deployment--cf;job--nats", Template: false},
+		{VMID: 941, Node: "pve2", Name: "cpi-cf-router-0",
+			Tags: stemcellTags + ";deployment--cf;job--router", Template: false},
+	}
+
+	bySHA, untagged := collectStemcellTemplates(context.Background(), &fakeReader{}, vms)
+
+	if len(untagged) != 0 {
+		t.Errorf("expected no untagged templates, got %d: %+v", len(untagged), untagged)
+	}
+	recs := bySHA["cbc4cf34"]
+	if len(recs) != 1 {
+		t.Fatalf("expected exactly 1 template (the clones are running VMs, not templates), got %d: %+v", len(recs), recs)
+	}
+	if recs[0].VMID != 30406 {
+		t.Errorf("collected VMID %d, want the template 30406", recs[0].VMID)
+	}
+}
+
+// TestCollectStemcellTemplates_IncludesRefTaggedAnchor is the under-report
+// half: VMID 30006's live tag shape — a sha tag plus director-- refs, no bare
+// bosh-stemcell token.
+func TestCollectStemcellTemplates_IncludesRefTaggedAnchor(t *testing.T) {
+	vms := []ClusterVM{
+		{VMID: 30006, Node: "pve1", Name: "bosh-stemcell-ubuntu-noble-1.383-cbc4cf34",
+			Tags: "bosh-stemcell-sha-cbc4cf34;director--abc-123", Template: true},
+	}
+
+	bySHA, _ := collectStemcellTemplates(context.Background(), &fakeReader{}, vms)
+
+	recs := bySHA["cbc4cf34"]
+	if len(recs) != 1 {
+		t.Fatalf("a ref-tagged cache template must be inventoried even without the bare bosh-stemcell tag, got %d: %+v", len(recs), recs)
+	}
+	if recs[0].VMID != 30006 {
+		t.Errorf("collected VMID %d, want 30006", recs[0].VMID)
+	}
+}
+
+// TestCollectStemcellTemplates_MarkerVariants pins the exact accept/reject
+// predicate across the tag shapes a live cluster actually presents.
+func TestCollectStemcellTemplates_MarkerVariants(t *testing.T) {
+	cases := []struct {
+		name     string
+		tags     string
+		template bool
+		want     bool
+	}{
+		{"bare marker on a template", "bosh-stemcell;bosh-stemcell-sha-aaaaaaaa", true, true},
+		{"cache tag on a template", "bosh-stemcell-cache;bosh-stemcell-sha-aaaaaaaa", true, true},
+		{"director ref on a template", "director--uuid-1;bosh-stemcell-sha-aaaaaaaa", true, true},
+		// A previous-generation leftover: sha identity but no generation
+		// marker. The CPI deliberately ignores these; the operator CLI must
+		// still SHOW them, since finding leftovers is the whole point of an
+		// inventory.
+		{"sha tag only on a template (previous generation)", "bosh-stemcell;bosh-stemcell-sha-aaaaaaaa", true, true},
+		{"empty director-- prefix is not a marker", "director--;bosh-stemcell-sha-aaaaaaaa", true, false},
+		{"unrelated template", "some-other-tag", true, false},
+		{"no tags at all", "", true, false},
+		// Every marker shape, but running rather than frozen.
+		{"bare marker on a running VM", "bosh-stemcell;bosh-stemcell-sha-aaaaaaaa", false, false},
+		{"cache tag on a running VM", "bosh-stemcell-cache;bosh-stemcell-sha-aaaaaaaa", false, false},
+		{"director ref on a running VM", "director--uuid-1;bosh-stemcell-sha-aaaaaaaa", false, false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			vms := []ClusterVM{{VMID: 100, Node: "pve1", Name: "x", Tags: tc.tags, Template: tc.template}}
+			bySHA, untagged := collectStemcellTemplates(context.Background(), &fakeReader{}, vms)
+			got := len(bySHA) > 0 || len(untagged) > 0
+			if got != tc.want {
+				t.Errorf("collected=%v, want %v (tags=%q template=%v)", got, tc.want, tc.tags, tc.template)
+			}
+		})
+	}
 }

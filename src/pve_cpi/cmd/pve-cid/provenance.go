@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 )
 
@@ -57,6 +58,26 @@ const (
 	stemcellVersionTagPrefix = "bosh-stemcell-version-"
 	stemcellSHATagPrefix     = "bosh-stemcell-sha-"
 )
+
+// pveIntBool decodes a PVE boolean, which the API serialises as 1/0 rather
+// than true/false. Mirrors internal/pve's own pveBool (unexported there, the
+// same reason splitPVETags is duplicated below), including its rejection of
+// an unrecognised value: the callers here skip a row whose JSON fails to
+// decode, so an unexpected shape drops that one guest from the inventory
+// rather than being silently reported as "not a template".
+type pveIntBool bool
+
+func (b *pveIntBool) UnmarshalJSON(data []byte) error {
+	switch s := strings.Trim(strings.TrimSpace(string(data)), `"`); s {
+	case "1", "true":
+		*b = true
+	case "0", "false", "", "null":
+		*b = false
+	default:
+		return fmt.Errorf("pveIntBool: cannot decode %q as a PVE boolean", s)
+	}
+	return nil
+}
 
 // splitPVETags splits a PVE tags string (semicolon-delimited, comma also
 // accepted) into individual tag tokens, trimming whitespace and dropping

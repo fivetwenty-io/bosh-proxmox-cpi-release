@@ -31,6 +31,11 @@ type ClusterVM struct {
 	Node string
 	Name string
 	Tags string
+	// Template is true when PVE has frozen this guest as a template. PVE
+	// copies a template's tags onto every clone, so tags alone cannot tell a
+	// cache template from a running VM built from it — this flag is what
+	// separates them (see collectStemcellTemplates).
+	Template bool
 }
 
 // StorageContentItem is the subset of a GET
@@ -107,6 +112,10 @@ func (r *pveReader) ListClusterVMs(ctx context.Context) ([]ClusterVM, error) {
 			Node string `json:"node"`
 			Name string `json:"name"`
 			Tags string `json:"tags"`
+			// Decoded through pveIntBool because PVE serialises this as 1/0,
+			// not true/false — a plain bool field silently fails to decode
+			// the whole row.
+			Template pveIntBool `json:"template,omitempty"`
 		}
 		if err := json.Unmarshal(raw, &entry); err != nil {
 			// Malformed element — skip; do not fail the whole scan (matches
@@ -117,7 +126,13 @@ func (r *pveReader) ListClusterVMs(ctx context.Context) ([]ClusterVM, error) {
 			// Excludes lxc containers and any other non-VM resource row.
 			continue
 		}
-		out = append(out, ClusterVM{VMID: int(entry.VMID), Node: entry.Node, Name: entry.Name, Tags: entry.Tags})
+		out = append(out, ClusterVM{
+			VMID:     int(entry.VMID),
+			Node:     entry.Node,
+			Name:     entry.Name,
+			Tags:     entry.Tags,
+			Template: bool(entry.Template),
+		})
 	}
 	return out, nil
 }
