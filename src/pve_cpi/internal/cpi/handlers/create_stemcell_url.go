@@ -248,8 +248,9 @@ func handleStemcellDownloadURL(
 }
 
 // maybeReplicateServerDownload applies the same replication gate
-// HandleCreateStemcell's mainline uses (opt-in, storage not shared, more than
-// one cluster node) before fanning the download out to every other node via
+// HandleCreateStemcell's mainline uses (opt-in, template-disk pool node-local
+// per templateReplicasNeeded, more than one cluster node) before fanning the
+// download out to every other node via
 // replicateServerDownloadToNodes. Both handleStemcellDownloadURL return paths
 // (pre-dedup hit and fresh download) call this at the equivalent point after
 // template creation, so a source_url stemcell is no longer stranded on the
@@ -263,11 +264,10 @@ func maybeReplicateServerDownload(
 	templateNode, storage, qcow2Filename, sha256hex, sourceURL, stemcellCID, directorUUID string,
 	cp stemcellCloudProps,
 ) {
-	if deps.Config == nil || !deps.Config.StemcellReplicateLocal || sha256hex == "" {
+	if sha256hex == "" {
 		return
 	}
-	if shared, known := stemcellStorageIsShared(ctx, deps, storage); known && shared {
-		deps.Log(ctx).Info("create_stemcell: server-download: stemcell storage is shared; replication not needed")
+	if !templateReplicasNeeded(ctx, deps) {
 		return
 	}
 	clusterNodes, listErr := listClusterNodes(ctx, deps)

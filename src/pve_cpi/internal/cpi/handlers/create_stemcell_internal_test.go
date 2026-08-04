@@ -3409,7 +3409,7 @@ func TestReplicateOneNode_CleanupSkipped_UnclassifiableStorage(t *testing.T) {
 	cp := stemcellCloudProps{Name: "ubuntu-jammy", Version: "1.0"}
 	replicateOneNode(context.Background(), deps, nodeLogger, "pve-node2", "nfs",
 		"bosh-stemcell-ubuntu-jammy-1.0-aabbccdd.qcow2", "aabbccdd00000000000000000000000000000000000000000000000000000000",
-		"aabbccdd", srcPath, "", ":heavy:nfs:import/x.qcow2", "test-director", cp, "")
+		"aabbccdd", srcPath, "", ":heavy:nfs:import/x.qcow2", "test-director", pve.StemcellKindHeavy, cp, "")
 
 	if *deleteCalled {
 		t.Error("DeleteVolumeIfExists must NOT be called when storage classification is unknown — " +
@@ -3431,7 +3431,7 @@ func TestReplicateOneNode_CleanupSkipped_SharedStorage(t *testing.T) {
 	cp := stemcellCloudProps{Name: "ubuntu-jammy", Version: "1.0"}
 	replicateOneNode(context.Background(), deps, nodeLogger, "pve-node2", "nfs",
 		"bosh-stemcell-ubuntu-jammy-1.0-aabbccdd.qcow2", "aabbccdd00000000000000000000000000000000000000000000000000000000",
-		"aabbccdd", srcPath, "", ":heavy:nfs:import/x.qcow2", "test-director", cp, "")
+		"aabbccdd", srcPath, "", ":heavy:nfs:import/x.qcow2", "test-director", pve.StemcellKindHeavy, cp, "")
 
 	if *deleteCalled {
 		t.Error("DeleteVolumeIfExists must NOT be called on shared storage — the uploaded file is the one the returned CID names")
@@ -3453,10 +3453,168 @@ func TestReplicateOneNode_CleanupOccurs_LocalStorage(t *testing.T) {
 	cp := stemcellCloudProps{Name: "ubuntu-jammy", Version: "1.0"}
 	replicateOneNode(context.Background(), deps, nodeLogger, "pve-node2", "nfs",
 		"bosh-stemcell-ubuntu-jammy-1.0-aabbccdd.qcow2", "aabbccdd00000000000000000000000000000000000000000000000000000000",
-		"aabbccdd", srcPath, "", ":heavy:nfs:import/x.qcow2", "test-director", cp, "")
+		"aabbccdd", srcPath, "", ":heavy:nfs:import/x.qcow2", "test-director", pve.StemcellKindHeavy, cp, "")
 
 	if !*deleteCalled {
 		t.Error("DeleteVolumeIfExists must be called to reclaim this node's own local copy after a failed replica build")
+	}
+}
+
+// TestTemplateReplicasNeeded verifies the replication gate keys on the
+// TEMPLATE-DISK pool (config vm_storage) — not the stemcell (qcow2) pool.
+// The split configuration (shared qcow2 pool + node-local vm_storage) is the
+// one the old stemcell-pool gate got wrong: templates clone from vm_storage,
+// so replicas are needed there even though the qcow2 is visible everywhere.
+func TestTemplateReplicasNeeded(t *testing.T) {
+	t.Parallel()
+
+	entries := map[string]dlbStorageEntry{
+		"local-lvm": {storageType: "lvmthin", shared: false},
+		"nfs-imgs":  {storageType: "nfs", shared: true},
+	}
+	cases := []struct {
+		name      string
+		replicate bool
+		vmStorage string
+		want      bool
+	}{
+		{"flag off", false, "local-lvm", false},
+		{"local vm_storage needs replicas (split-pool regression)", true, "local-lvm", true},
+		{"shared vm_storage never needs replicas", true, "nfs-imgs", false},
+		{"unclassifiable vm_storage fails open like create_vm's guard", true, "mystery", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			deps := storageLookupDeps(entries)
+			deps.Config.StemcellReplicateLocal = c.replicate
+			deps.Config.VMStorage = c.vmStorage
+			// The stemcell pool is deliberately the SHARED one in every case:
+			// it must not influence the verdict.
+			deps.Config.StemcellStorage = "nfs-imgs"
+			if got := templateReplicasNeeded(context.Background(), deps); got != c.want {
+				t.Errorf("templateReplicasNeeded (vm_storage=%q replicate=%v) = %v, want %v",
+					c.vmStorage, c.replicate, got, c.want)
+			}
+		})
+	}
+}
+
+// TestReplicateOneNode_SharedPool_SkipsPerNodeUpload verifies the split-pool
+// replica flow: when the stemcell pool classifies as shared, the per-node
+// qcow2 upload is skipped ("import/<file>" already resolves on every node)
+// and the replica template build proceeds directly.
+func TestReplicateOneNode_SharedPool_SkipsPerNodeUpload(t *testing.T) {
+	t.Parallel()
+
+	uploadCalls := 0
+	createCalls := 0
+	nodesSvc := &wbTemplateNodes{listQemuFn: listQemuEmpty()}
+	storageSvc := &wbTemplateStorage{
+		wbMockStorage: wbMockStorage{
+			uploadFn: func(_ context.Context, _, _, _, _ string, body io.Reader) (string, error) {
+				uploadCalls++
+				_, _ = io.Copy(io.Discard, body)
+				return "", nil
+			},
+		},
+	}
+	qemuSvc := &wbMockQEMU{
+		createFn: func(_ context.Context, _ string, _ map[string]any) (string, error) {
+			createCalls++
+			return "", errors.New("PVE: 500 internal error") // stop after proving the build was attempted
+		},
+	}
+	deps := Deps{
+		Config: &config.CPIConfig{
+			Node:                           "pve-node1",
+			StemcellStorage:                "nfs",
+			VMStorage:                      "local-lvm",
+			StemcellTemplateVMIDRangeStart: 30000,
+			StemcellTemplateVMIDRangeEnd:   30999,
+		},
+		PVE: &wbTemplateMockClient{
+			wbMockClient: wbMockClient{
+				nodesSvc:          nodesSvc,
+				clusterStorageSvc: &wbMockClusterStorage{storageName: "nfs", storageType: "nfs", isShared: true},
+				clusterSvc:        &wbClusterForAlloc{listResourcesFn: listClusterResourcesEmpty()},
+				storageSvc:        storageSvc,
+			},
+			qemuSvc:  qemuSvc,
+			tasksSvc: &wbMockTasks{},
+		},
+		Logger: log.NewNopLogger(),
+	}
+
+	nodeLogger := log.NewNopLogger()
+	cp := stemcellCloudProps{Name: "ubuntu-jammy", Version: "1.0"}
+	// No upload source at all — the light-preuploaded shape.
+	replicateOneNode(context.Background(), deps, nodeLogger, "pve-node2", "nfs",
+		"bosh-stemcell-ubuntu-jammy-1.0-aabbccdd.qcow2", "aabbccdd00000000000000000000000000000000000000000000000000000000",
+		"aabbccdd", "", "", ":light:nfs:import/x.qcow2", "test-director", pve.StemcellKindLight, cp, "")
+
+	if uploadCalls != 0 {
+		t.Errorf("upload called %d times; want 0 — shared pool needs no per-node copy", uploadCalls)
+	}
+	if createCalls == 0 {
+		t.Error("replica template build was never attempted — shared-pool path must go straight to the build")
+	}
+}
+
+// TestReplicateOneNode_NoSourceUnclassifiablePool_SkipsNode verifies the
+// defensive arm: with no local upload source AND a pool that cannot be
+// classified shared, the node is skipped outright — no upload, no build.
+func TestReplicateOneNode_NoSourceUnclassifiablePool_SkipsNode(t *testing.T) {
+	t.Parallel()
+
+	uploadCalls := 0
+	createCalls := 0
+	nodesSvc := &wbTemplateNodes{listQemuFn: listQemuEmpty()}
+	storageSvc := &wbTemplateStorage{
+		wbMockStorage: wbMockStorage{
+			uploadFn: func(_ context.Context, _, _, _, _ string, body io.Reader) (string, error) {
+				uploadCalls++
+				_, _ = io.Copy(io.Discard, body)
+				return "", nil
+			},
+		},
+	}
+	qemuSvc := &wbMockQEMU{
+		createFn: func(_ context.Context, _ string, _ map[string]any) (string, error) {
+			createCalls++
+			return "", errors.New("unexpected")
+		},
+	}
+	deps := Deps{
+		Config: &config.CPIConfig{
+			Node:                           "pve-node1",
+			StemcellStorage:                "nfs",
+			VMStorage:                      "local-lvm",
+			StemcellTemplateVMIDRangeStart: 30000,
+			StemcellTemplateVMIDRangeEnd:   30999,
+		},
+		PVE: &wbTemplateMockClient{
+			wbMockClient: wbMockClient{
+				nodesSvc:          nodesSvc,
+				clusterStorageSvc: &wbMockClusterStorage{storageName: "other", storageType: "dir", isShared: false},
+				clusterSvc:        &wbClusterForAlloc{listResourcesFn: listClusterResourcesEmpty()},
+				storageSvc:        storageSvc,
+			},
+			qemuSvc:  qemuSvc,
+			tasksSvc: &wbMockTasks{},
+		},
+		Logger: log.NewNopLogger(),
+	}
+
+	nodeLogger := log.NewNopLogger()
+	cp := stemcellCloudProps{Name: "ubuntu-jammy", Version: "1.0"}
+	replicateOneNode(context.Background(), deps, nodeLogger, "pve-node2", "nfs",
+		"bosh-stemcell-ubuntu-jammy-1.0-aabbccdd.qcow2", "aabbccdd00000000000000000000000000000000000000000000000000000000",
+		"aabbccdd", "", "", ":light:nfs:import/x.qcow2", "test-director", pve.StemcellKindLight, cp, "")
+
+	if uploadCalls != 0 || createCalls != 0 {
+		t.Errorf("uploads=%d creates=%d; want 0/0 — node must be skipped when no source exists and the pool is unclassifiable",
+			uploadCalls, createCalls)
 	}
 }
 

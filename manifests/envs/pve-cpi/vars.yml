@@ -59,6 +59,10 @@ pve_disk_storage:     local-lvm-data
 pve_stemcell_storage: nfs-images
 pve_iso_storage:      local
 pve_network_bridge:   vmbr0
+# Both clusters are 3-node with node-local vm_storage (local-lvm-data): the
+# stemcell cache template's disk lives on vm_storage, so per-node replicas
+# are required for create_vm to clone on any node.
+pve_stemcell_replicate_local: true
 
 # --- Director + deployment network -----------------------------------------
 internal_cidr:       10.254.0.0/16

@@ -92,6 +92,10 @@
         vm_storage: ((pve_vm_storage))
         disk_storage: ((pve_disk_storage))
         stemcell_storage: ((pve_stemcell_storage))
+        # Required on multi-node clusters whose vm_storage is node-local: the
+        # stemcell cache template's root disk lives on vm_storage, so without
+        # per-node replicas a create_vm placed on any other node fails fast.
+        stemcell_replicate_local: ((pve_stemcell_replicate_local))
         iso_storage: ((pve_iso_storage))
         network_bridge: ((pve_network_bridge))
         network_mode: ((pve_network_mode))

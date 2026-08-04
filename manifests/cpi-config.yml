@@ -47,6 +47,9 @@ cpis:
       vm_storage: ((pve_az1_vm_storage))
       disk_storage: ((pve_az1_disk_storage))
       stemcell_storage: ((pve_multi_stemcell_storage))
+      # Cache-template disks live on vm_storage (node-local here); replicas
+      # let create_vm clone on every node of this multi-node cluster.
+      stemcell_replicate_local: true
       iso_storage: ((pve_az1_iso_storage))
       network_bridge: ((pve_network_bridge))
       verify_ssl: ((pve_verify_ssl))
@@ -76,6 +79,9 @@ cpis:
       vm_storage: ((pve_az2_vm_storage))
       disk_storage: ((pve_az2_disk_storage))
       stemcell_storage: ((pve_multi_stemcell_storage))
+      # Cache-template disks live on vm_storage (node-local here); replicas
+      # let create_vm clone on every node of this multi-node cluster.
+      stemcell_replicate_local: true
       iso_storage: ((pve_az2_iso_storage))
       network_bridge: ((pve_network_bridge))
       verify_ssl: ((pve_verify_ssl))

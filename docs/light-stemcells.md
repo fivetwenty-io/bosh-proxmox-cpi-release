@@ -298,7 +298,7 @@ Cache template VMs allocate from a dedicated VMID range, separate from VM and di
 
 ### Template replication
 
-When `pve.stemcell_replicate_local` is enabled, the CPI replicates the cache template to every other cluster node's local storage after creation (useful when `stemcell_storage` is node-local rather than shared). Individual node failures are logged as warnings and do not fail `create_stemcell`. `delete_stemcell` sweeps all replicas cluster-wide via the same sha8-tag lookup used for the primary, regardless of when replication was enabled.
+When `pve.stemcell_replicate_local` is enabled, the CPI replicates the cache template to every other cluster node after creation. What decides whether replicas are needed is `vm_storage` — the pool every cache template's root disk lives on — being node-local; the qcow2 pool's own shared-ness is irrelevant to cloning, and a shared `stemcell_storage` with node-local `vm_storage` (one shared NFS `import` pool feeding clusters whose VM disks are on lvmthin) still needs replicas on every node `create_vm` may target. When the qcow2 pool is shared, replication skips the per-node file copy — the one shared file serves every node's `import-from` — and only builds the per-node template. This applies to every stemcell kind, including pre-uploaded `:light:` stemcells: the operator owns the light qcow2, but the cache template and its replicas are CPI-owned. Individual node failures are logged as warnings and do not fail `create_stemcell`. `delete_stemcell` sweeps all replicas cluster-wide via the same sha8-tag lookup used for the primary, regardless of when replication was enabled.
 
 ## Director-UUID reference counting
 

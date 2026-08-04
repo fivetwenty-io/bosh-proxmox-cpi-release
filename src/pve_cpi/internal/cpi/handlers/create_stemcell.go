@@ -562,33 +562,16 @@ func HandleCreateStemcell(deps Deps) cpi.Handler {
 			return nil, fmt.Errorf("create_stemcell: ensure template: %w", tmplErr)
 		}
 
-		// Per-node replication (opt-in, default off, and inert on shared storage
-		// — the single cache template is already reachable cluster-wide there).
-		// When stemcell_replicate_local is true and the storage classifies as
-		// local, replicate the template to all other cluster nodes. This is a
-		// best-effort fire-and-forget: individual node failures are logged as
-		// warnings and do not fail create_stemcell. Only applicable when
-		// sha256hex is known (required for replica idempotency checks).
-		if deps.Config.StemcellReplicateLocal && sha256hex != "" {
-			if shared, known := stemcellStorageIsShared(ctx, deps, storage); known && shared {
-				deps.Log(ctx).Info("create_stemcell: stemcell storage is shared; replication not needed")
-			} else {
-				clusterNodes, listErr := listClusterNodes(ctx, deps)
-				if listErr != nil {
-					deps.Log(ctx).Warn("create_stemcell: replication: cannot list cluster nodes (skipping replication)",
-						log.Err(listErr),
-					)
-				} else if len(clusterNodes) > 1 {
-					uploadStagingDir := ""
-					if uploadSourcePath == imagePath {
-						uploadStagingDir = deps.Config.StemcellStagingDir
-					}
-					replicateStemcellToNodes(ctx, deps, templateNode, storage, qcow2Filename,
-						sha256hex, clusterNodes, uploadSourcePath, uploadStagingDir,
-						stemcellCID, reqCtx.DirectorUUID, cp, imagePath)
-				}
-			}
+		// Per-node replication (opt-in, default off; see maybeReplicateTemplate
+		// for the gate). Best-effort fire-and-forget: individual node failures
+		// are logged as warnings and do not fail create_stemcell.
+		uploadStagingDir := ""
+		if uploadSourcePath == imagePath {
+			uploadStagingDir = deps.Config.StemcellStagingDir
 		}
+		maybeReplicateTemplate(ctx, deps, templateNode, storage, qcow2Filename, sha256hex,
+			uploadSourcePath, uploadStagingDir, stemcellCID, reqCtx.DirectorUUID,
+			pve.StemcellKindHeavy, cp, imagePath)
 
 		return stemcellCID, nil
 	})
@@ -665,6 +648,69 @@ func stemcellStorageIsShared(ctx context.Context, deps Deps, storage string) (sh
 		return false, false
 	}
 	return info.IsShared(), true
+}
+
+// templateReplicasNeeded reports whether per-node cache-template replicas
+// serve any purpose in this configuration: replication is opt-in
+// (stemcell_replicate_local) and only meaningful when the TEMPLATE-DISK pool
+// — config vm_storage, where attemptCreateTemplateVM places every cache
+// template's root disk — is node-local. It deliberately reuses create_vm's
+// needsReplicaCheck so the build side and the consume side of the replica
+// contract classify the same pool the same way: create_vm demands a per-node
+// replica exactly when the template's disk cannot be cloned cross-node, and
+// that is a property of vm_storage, not of the stemcell (qcow2) pool. A
+// shared qcow2 pool with node-local vm_storage still needs replicas; gating
+// on the stemcell pool's shared-ness skipped them in exactly that split
+// configuration.
+func templateReplicasNeeded(ctx context.Context, deps Deps) bool {
+	if deps.Config == nil || !deps.Config.StemcellReplicateLocal {
+		return false
+	}
+	return needsReplicaCheck(ctx, deps, deps.Config.VMStorage)
+}
+
+// maybeReplicateTemplate replicates the cache template to the remaining
+// cluster nodes when replication is on and the template-disk pool is
+// node-local (templateReplicasNeeded). Applies to every kind create_stemcell
+// caches, including light stemcells: the operator owns a light qcow2, but the
+// cache template — and any per-node replica of it — is CPI-owned, exactly
+// like the primary. Best-effort fire-and-forget: individual node failures
+// are logged as warnings and never fail create_stemcell. Only runs when
+// sha256hex is known (required for replica idempotency checks).
+//
+// uploadSourcePath may be empty when the qcow2 needs no per-node transfer —
+// the light-preuploaded case, where the operator's file lives on a shared
+// pool every node mounts; replicateOneNode skips its upload step whenever the
+// stemcell pool classifies as shared.
+func maybeReplicateTemplate(
+	ctx context.Context,
+	deps Deps,
+	templateNode, storage, qcow2Filename, sha256hex string,
+	uploadSourcePath, uploadStagingDir string,
+	stemcellCID, directorUUID string,
+	kind pve.StemcellKind,
+	cp stemcellCloudProps,
+	source string,
+) {
+	if sha256hex == "" {
+		return
+	}
+	if !templateReplicasNeeded(ctx, deps) {
+		return
+	}
+	clusterNodes, listErr := listClusterNodes(ctx, deps)
+	if listErr != nil {
+		deps.Log(ctx).Warn("create_stemcell: replication: cannot list cluster nodes (skipping replication)",
+			log.Err(listErr),
+		)
+		return
+	}
+	if len(clusterNodes) <= 1 {
+		return
+	}
+	replicateStemcellToNodes(ctx, deps, templateNode, storage, qcow2Filename,
+		sha256hex, clusterNodes, uploadSourcePath, uploadStagingDir,
+		stemcellCID, directorUUID, kind, cp, source)
 }
 
 // sha8Of returns the first 8 lowercase hex characters of sha256hex, or "" when
@@ -1799,6 +1845,18 @@ func handleLightStemcellPreUploaded(
 		log.String("template_node", winnerNode),
 		log.String("cid", stemcellCID),
 	)
+
+	// Per-node replication (opt-in, default off; gate in
+	// maybeReplicateTemplate). The operator owns the light qcow2, but the
+	// cache template — and any per-node replica of it — is CPI-owned, and on
+	// a multi-node cluster whose vm_storage is node-local the replicas are
+	// what lets create_vm clone on every node. No upload source: the light
+	// policy already requires the qcow2's pool to be reachable where
+	// templates build, and replicateOneNode skips the per-node upload when
+	// that pool classifies as shared.
+	maybeReplicateTemplate(ctx, deps, winnerNode, storage, qcow2Filename, sha256hex,
+		"", "", stemcellCID, directorUUID, pve.StemcellKindLight, cp, cp.ImageID)
+
 	return stemcellCID, nil
 }
 
@@ -2055,55 +2113,19 @@ func handleLightStemcellFetch(
 		log.Int64("bytes", written),
 	)
 
-	// Per-node replication (opt-in, default off, inert on shared storage) —
-	// tmpPath is still valid here (its deferred removal runs on function
-	// return, after replicateStemcellToNodes's own wg.Wait() completes), so
-	// every other cluster node gets its own upload from the same bytes this
-	// call already fetched — without this, an image_url stemcell on
-	// node-local storage would be usable only on fetchTemplateNode.
-	maybeReplicateLightFetch(ctx, deps, fetchTemplateNode, storage, qcow2Filename,
-		sha256hex, tmpPath, stemcellCID, directorUUID, cp)
+	// Per-node replication (opt-in, default off; gate in
+	// maybeReplicateTemplate) — tmpPath is still valid here (its deferred
+	// removal runs on function return, after replicateStemcellToNodes's own
+	// wg.Wait() completes), so every other cluster node gets its own upload
+	// from the same bytes this call already fetched — without this, an
+	// image_url stemcell on node-local storage would be usable only on
+	// fetchTemplateNode. Kind heavy: the CPI uploaded these bytes, matching
+	// the kind the fetch path's own ensureTemplateAndRegisterRef stamps.
+	maybeReplicateTemplate(ctx, deps, fetchTemplateNode, storage, qcow2Filename,
+		sha256hex, tmpPath, "", stemcellCID, directorUUID,
+		pve.StemcellKindHeavy, cp, cp.ImageURL)
 
 	return stemcellCID, nil
-}
-
-// maybeReplicateLightFetch applies the same replication gate
-// HandleCreateStemcell's mainline (tarball) path uses — opt-in
-// (StemcellReplicateLocal), inert on shared storage, requires more than one
-// cluster node — before fanning uploadSourcePath out to every other node via
-// replicateStemcellToNodes. Called from handleLightStemcellFetch's
-// fresh-fetch arm at the equivalent point after template creation, so an
-// image_url stemcell on node-local storage is no longer stranded on the
-// single node that happened to fetch it.
-//
-// Best-effort: a failure to list cluster nodes only skips replication and
-// logs a warning; it never fails the call whose CID was already committed.
-func maybeReplicateLightFetch(
-	ctx context.Context,
-	deps Deps,
-	fetchTemplateNode, storage, qcow2Filename, sha256hex, uploadSourcePath, stemcellCID, directorUUID string,
-	cp stemcellCloudProps,
-) {
-	if deps.Config == nil || !deps.Config.StemcellReplicateLocal || sha256hex == "" {
-		return
-	}
-	if shared, known := stemcellStorageIsShared(ctx, deps, storage); known && shared {
-		deps.Log(ctx).Info("create_stemcell: light fetch: stemcell storage is shared; replication not needed")
-		return
-	}
-	clusterNodes, listErr := listClusterNodes(ctx, deps)
-	if listErr != nil {
-		deps.Log(ctx).Warn("create_stemcell: light fetch: replication: cannot list cluster nodes (skipping replication)",
-			log.Err(listErr),
-		)
-		return
-	}
-	if len(clusterNodes) <= 1 {
-		return
-	}
-	replicateStemcellToNodes(ctx, deps, fetchTemplateNode, storage, qcow2Filename,
-		sha256hex, clusterNodes, uploadSourcePath, "",
-		stemcellCID, directorUUID, cp, cp.ImageURL)
 }
 
 // isSHA8QCow2Tail reports whether tail is exactly 8 hex characters followed
@@ -2970,10 +2992,10 @@ func listClusterNodes(ctx context.Context, deps Deps) ([]string, error) {
 //     under concurrent cluster-wide allocation from parallel goroutines.
 //   - No mutable state is shared between goroutines; all results are logged directly.
 //
-// Replication only ever runs for heavy (CPI-uploaded) stemcells — light
-// stemcells are operator-managed and never CPI-replicated — so the target
-// kind is fixed to pve.StemcellKindHeavy rather than threaded through as a
-// parameter.
+// kind is the primary template's path-identity kind and is stamped into each
+// replica's provenance unchanged: a replica of a light stemcell's cache
+// template is still CPI-owned (the operator owns only the qcow2), but its
+// provenance must not claim the CPI uploaded the underlying bytes.
 func replicateStemcellToNodes(
 	ctx context.Context,
 	deps Deps,
@@ -2981,6 +3003,7 @@ func replicateStemcellToNodes(
 	targetNodes []string,
 	uploadSourcePath, uploadStagingDir string,
 	stemcellCID, creatingDirectorUUID string,
+	kind pve.StemcellKind,
 	cp stemcellCloudProps,
 	source string,
 ) {
@@ -3061,7 +3084,7 @@ func replicateStemcellToNodes(
 
 			replicateOneNode(ctx, deps, nodeLogger, node, storage,
 				qcow2Filename, sha256hex, sha8, uploadSourcePath, uploadStagingDir,
-				stemcellCID, creatingDirectorUUID, cp, source)
+				stemcellCID, creatingDirectorUUID, kind, cp, source)
 		}()
 	}
 	wg.Wait()
@@ -3087,6 +3110,7 @@ func replicateOneNode(
 	qcow2Filename, sha256hex, sha8,
 	uploadSourcePath, uploadStagingDir string,
 	stemcellCID, creatingDirectorUUID string,
+	kind pve.StemcellKind,
 	cp stemcellCloudProps,
 	source string,
 ) {
@@ -3130,10 +3154,24 @@ func replicateOneNode(
 		}
 	}
 
-	// Upload qcow2 to this node's local storage. uploadStemcellImage opens its
-	// own file handle (openStagedFile inside), so concurrent calls for different
-	// nodes read the same source file independently without sharing an *os.File.
-	if uploadErr := uploadStemcellImage(ctx, deps, node, storage, qcow2Filename, uploadSourcePath, uploadStagingDir); uploadErr != nil {
+	// Upload qcow2 to this node's local storage — unless the stemcell pool is
+	// cluster-shared, where "import/<file>" already resolves to the same file
+	// on every node and the template build below imports it directly (the
+	// split configuration replication now serves: shared qcow2 pool, local
+	// vm_storage). uploadStemcellImage opens its own file handle
+	// (openStagedFile inside), so concurrent calls for different nodes read
+	// the same source file independently without sharing an *os.File.
+	if shared, known := stemcellStorageIsShared(ctx, deps, storage); known && shared {
+		nodeLogger.Info("create_stemcell: replication: stemcell storage is shared; skipping per-node upload")
+	} else if uploadSourcePath == "" {
+		// No local bytes to re-upload and the pool is not known-shared: the
+		// import volid cannot be made visible on this node. Light-preuploaded
+		// only reaches replication via a shared pool, so this is a
+		// classification failure, not a normal configuration.
+		nodeLogger.Warn("create_stemcell: replication: no upload source and stemcell storage not " +
+			"classifiable as shared; skipping node")
+		return
+	} else if uploadErr := uploadStemcellImage(ctx, deps, node, storage, qcow2Filename, uploadSourcePath, uploadStagingDir); uploadErr != nil {
 		nodeLogger.Warn("create_stemcell: replication: upload failed (non-fatal; replica not created)",
 			log.Err(uploadErr),
 		)
@@ -3163,10 +3201,8 @@ func replicateOneNode(
 			}
 			defer replicaRelease()
 		}
-		// The tarball/light-fetch replication path is always heavy — the CPI
-		// uploaded the bytes it is now copying to this replica node.
 		replicaVMID, tmplErr := ensureReplicaTemplateVM(ctx, deps, node, storage, qcow2Filename, sha256hex,
-			pve.StemcellKindHeavy, stemcellCID, creatingDirectorUUID, replicaCP, source)
+			kind, stemcellCID, creatingDirectorUUID, replicaCP, source)
 		if tmplErr != nil {
 			nodeLogger.Warn("create_stemcell: replication: ensure template failed (non-fatal; replica not created)",
 				log.Err(tmplErr),
@@ -3394,6 +3430,50 @@ func replicateServerDownloadToNodes(
 // Like replicateOneNode, a replica built here does NOT register its own
 // director reference — the returned CID's ref set lives on the primary
 // template only.
+// buildServerDownloadReplica ensures one node's replica template from a
+// qcow2 already visible on that node — either the shared-pool arm of
+// replicateOneNodeServerDownload (no per-node download happened, so
+// onFailure is nil) or the post-download arm (onFailure is the download
+// cleanup for this node's own local copy). Applies the per-node in-flight
+// gate in both arms. Best-effort: failures are logged and never propagate.
+func buildServerDownloadReplica(
+	ctx context.Context,
+	deps Deps,
+	nodeLogger *log.Logger,
+	node, storage, qcow2Filename, sha256hex, sourceURL string,
+	stemcellCID, creatingDirectorUUID string,
+	cp stemcellCloudProps,
+	onFailure func(filename string),
+) {
+	replicaCP := cp
+	replicaCP.Node = node
+	if deps.Config != nil {
+		replicaRelease, replicaInflightErr := deps.Inflight.acquire(ctx, node, deps.Config.MaxInflightPerNodeLimit())
+		if replicaInflightErr != nil {
+			nodeLogger.Warn("create_stemcell: server-download replication: in-flight limit; skipping replica node",
+				log.String("node", node),
+				log.Err(replicaInflightErr),
+			)
+			return
+		}
+		defer replicaRelease()
+	}
+	replicaVMID, tmplErr := ensureReplicaTemplateVM(ctx, deps, node, storage, qcow2Filename, sha256hex,
+		pve.StemcellKindHeavy, stemcellCID, creatingDirectorUUID, replicaCP, sourceURL)
+	if tmplErr != nil {
+		nodeLogger.Warn("create_stemcell: server-download replication: ensure template failed (non-fatal; replica not created)",
+			log.Err(tmplErr),
+		)
+		if onFailure != nil {
+			onFailure(qcow2Filename)
+		}
+		return
+	}
+	nodeLogger.Info("create_stemcell: server-download replication: replica template created",
+		log.Int64(metadataKeyVMID, replicaVMID),
+	)
+}
+
 func replicateOneNodeServerDownload(
 	ctx context.Context,
 	deps Deps,
@@ -3438,6 +3518,17 @@ func replicateOneNodeServerDownload(
 
 	if deps.PVE == nil || deps.PVE.Nodes() == nil {
 		nodeLogger.Warn("create_stemcell: server-download replication: nodes service unavailable (skipping node)")
+		return
+	}
+
+	// Shared stemcell pool: the primary's download is already visible on this
+	// node — skip the per-node re-download and build the template directly
+	// (the split configuration replication now serves: shared qcow2 pool,
+	// node-local vm_storage).
+	if shared, known := stemcellStorageIsShared(ctx, deps, storage); known && shared {
+		nodeLogger.Info("create_stemcell: server-download replication: stemcell storage is shared; skipping per-node download")
+		buildServerDownloadReplica(ctx, deps, nodeLogger, node, storage, qcow2Filename,
+			sha256hex, sourceURL, stemcellCID, creatingDirectorUUID, cp, nil)
 		return
 	}
 
@@ -3513,31 +3604,6 @@ func replicateOneNodeServerDownload(
 		}
 	}
 
-	replicaCP := cp
-	replicaCP.Node = node
-	func() {
-		if deps.Config != nil {
-			replicaRelease, replicaInflightErr := deps.Inflight.acquire(ctx, node, deps.Config.MaxInflightPerNodeLimit())
-			if replicaInflightErr != nil {
-				nodeLogger.Warn("create_stemcell: server-download replication: in-flight limit; skipping replica node",
-					log.String("node", node),
-					log.Err(replicaInflightErr),
-				)
-				return
-			}
-			defer replicaRelease()
-		}
-		replicaVMID, tmplErr := ensureReplicaTemplateVM(ctx, deps, node, storage, actualFilename, sha256hex,
-			pve.StemcellKindHeavy, stemcellCID, creatingDirectorUUID, replicaCP, sourceURL)
-		if tmplErr != nil {
-			nodeLogger.Warn("create_stemcell: server-download replication: ensure template failed (non-fatal; replica not created)",
-				log.Err(tmplErr),
-			)
-			cleanupOnFailure(actualFilename)
-			return
-		}
-		nodeLogger.Info("create_stemcell: server-download replication: replica template created",
-			log.Int64(metadataKeyVMID, replicaVMID),
-		)
-	}()
+	buildServerDownloadReplica(ctx, deps, nodeLogger, node, storage, actualFilename,
+		sha256hex, sourceURL, stemcellCID, creatingDirectorUUID, cp, cleanupOnFailure)
 }

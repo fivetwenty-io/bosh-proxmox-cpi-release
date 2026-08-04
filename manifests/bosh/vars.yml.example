@@ -14,6 +14,10 @@ pve_node:            pve1
 pve_vm_storage:      local-lvm
 pve_disk_storage:    local-lvm
 pve_stemcell_storage: local
+# Set true on multi-node clusters whose vm_storage is node-local (the
+# stemcell cache template's disk lives on vm_storage; clones need it
+# present on the target node). Single-node or shared vm_storage: false.
+pve_stemcell_replicate_local: false
 # Storage pool (dir/nfs/cifs with iso content enabled) for per-VM cloud-init ISOs.
 # Block storages (lvm/lvmthin/zfspool) cannot hold ISO files; use "local" or a
 # dedicated NFS/CIFS ISO store. Must match a storage visible on all cluster nodes.
