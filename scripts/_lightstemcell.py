@@ -150,6 +150,7 @@ def stemcell_mf(
     image_url: "str | None" = None,
     image_url_auth_token: "str | None" = None,
     image_sha1: str = PLACEHOLDER_SHA1,
+    sha256: "str | None" = None,
 ) -> str:
     """Render the stemcell.MF document text for a light stemcell.
 
@@ -159,9 +160,18 @@ def stemcell_mf(
     scalars (colons are followed by non-space). image_sha1 is the sha of the
     tarball's `image` member — placeholder zeros for an upload-stemcell manifest
     (no image), or the real placeholder-image sha for a create-env tarball.
+    sha256 is the qcow2's content digest: the CPI REQUIRES it for preuploaded
+    (image_id) stemcells — content identity and sha-tag dedup depend on it —
+    so it is mandatory when image_id is set. Fetch (image_url) manifests omit
+    it; the CPI hashes what it downloads.
     """
     if bool(image_id) == bool(image_url):
         raise ValueError("stemcell_mf: set exactly one of image_id or image_url")
+    if image_id and not re.fullmatch(r"[0-9a-f]{64}", sha256 or ""):
+        raise ValueError(
+            "stemcell_mf: image_id (preuploaded) requires the qcow2's sha256 "
+            f"(64 lowercase hex chars), got {sha256!r}"
+        )
     name = f"bosh-proxmox-kvm-{os_name}-go_agent-light"
     lines = [
         "---",
@@ -176,6 +186,7 @@ def stemcell_mf(
     ]
     if image_id:
         lines.append(f"  image_id: {image_id}")
+        lines.append(f"  sha256: {sha256}")
     else:
         lines.append(f"  image_url: {image_url}")
         if image_url_auth_token:
@@ -200,6 +211,7 @@ def build_create_env_light_tarball(
     image_id: "str | None" = None,
     image_url: "str | None" = None,
     image_url_auth_token: "str | None" = None,
+    sha256: "str | None" = None,
 ) -> str:
     """Pack a light stemcell tarball for `bosh create-env`.
 
@@ -216,6 +228,7 @@ def build_create_env_light_tarball(
     mf = stemcell_mf(
         os_name, version, image_id=image_id, image_url=image_url,
         image_url_auth_token=image_url_auth_token, image_sha1=image_sha1,
+        sha256=sha256,
     ).encode("utf-8")
 
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -641,6 +654,7 @@ def render_light_manifest(
     image_id: "str | None" = None,
     image_url: "str | None" = None,
     token: "str | None" = None,
+    sha256: "str | None" = None,
 ) -> str:
     """Write a concrete upload-stemcell manifest to dest_dir and return its path.
 
@@ -652,6 +666,7 @@ def render_light_manifest(
     text = stemcell_mf(
         os_name, version, image_id=image_id, image_url=image_url,
         image_url_auth_token=token if mode == "fetch" else None,
+        sha256=sha256,
     )
     out = Path(dest_dir) / f"light-stemcell-{mode}.rendered.yml"
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -770,6 +785,7 @@ def _preuploaded_result(
     volid = import_volid(storage, fname)
     manifest = render_light_manifest(
         cache_dir, "preuploaded", os_name=os_name, version=version, image_id=volid,
+        sha256=sha256,
     )
     result = LightStemcell(
         os_name=os_name, version=version, mode="preuploaded", sha256=sha256,
@@ -778,6 +794,7 @@ def _preuploaded_result(
     if build_create_env_tarball:
         tb = build_create_env_light_tarball(
             cache_dir, os_name=os_name, version=version, image_id=volid,
+            sha256=sha256,
         )
         result.create_env_tarball = tb
         result.create_env_tarball_sha1 = file_sha1(tb)

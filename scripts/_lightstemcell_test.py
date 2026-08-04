@@ -94,8 +94,9 @@ class FindVolidTests(unittest.TestCase):
 
 class StemcellMFTests(unittest.TestCase):
     def test_preuploaded_carries_image_id(self) -> None:
-        mf = ls.stemcell_mf("ubuntu-noble", "1.383", image_id="local:import/x.qcow2")
+        mf = ls.stemcell_mf("ubuntu-noble", "1.383", image_id="local:import/x.qcow2", sha256=SHA)
         self.assertIn("image_id: local:import/x.qcow2", mf)
+        self.assertIn(f"  sha256: {SHA}", mf)
         self.assertNotIn("image_url:", mf)
         self.assertIn("operating_system: ubuntu-noble", mf)
         self.assertIn('version: "1.383"', mf)
@@ -112,7 +113,7 @@ class StemcellMFTests(unittest.TestCase):
         # bosh-cli create-env rejects a stemcell whose api_version < 2 with the
         # misleading "requires CPI v2.0 or greater" error. The MF must carry a
         # top-level api_version >= 2 (the registry-less contract the CPI emits).
-        mf = ls.stemcell_mf("ubuntu-noble", "1.383", image_id="local:import/x.qcow2")
+        mf = ls.stemcell_mf("ubuntu-noble", "1.383", image_id="local:import/x.qcow2", sha256=SHA)
         self.assertIn(f"api_version: {ls.STEMCELL_API_VERSION}", mf)
         self.assertGreaterEqual(ls.STEMCELL_API_VERSION, 2)
         # Top-level field, not nested under cloud_properties.
@@ -124,8 +125,20 @@ class StemcellMFTests(unittest.TestCase):
             ls.stemcell_mf("ubuntu-noble", "1.383")
         with self.assertRaises(ValueError):
             ls.stemcell_mf(
-                "ubuntu-noble", "1.383", image_id="a", image_url="b"
+                "ubuntu-noble", "1.383", image_id="a", image_url="b", sha256=SHA
             )
+
+    def test_preuploaded_requires_sha256(self) -> None:
+        # The CPI hard-rejects preuploaded stemcells without a 64-hex sha256;
+        # fail at render time rather than at create_stemcell time.
+        with self.assertRaises(ValueError):
+            ls.stemcell_mf("ubuntu-noble", "1.383", image_id="local:import/x.qcow2")
+        with self.assertRaises(ValueError):
+            ls.stemcell_mf(
+                "ubuntu-noble", "1.383", image_id="local:import/x.qcow2", sha256="short"
+            )
+        # Fetch mode has no local qcow2 to hash; sha256 stays optional there.
+        ls.stemcell_mf("ubuntu-noble", "1.383", image_url="https://example.com/x.qcow2")
 
 
 class CreateEnvTarballTests(unittest.TestCase):
@@ -133,7 +146,7 @@ class CreateEnvTarballTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             path = ls.build_create_env_light_tarball(
                 d, os_name="ubuntu-noble", version="1.383",
-                image_id="local:import/x.qcow2",
+                image_id="local:import/x.qcow2", sha256=SHA,
             )
             self.assertTrue(Path(path).exists())
             with tarfile.open(path, "r:gz") as tf:
@@ -142,6 +155,7 @@ class CreateEnvTarballTests(unittest.TestCase):
                 self.assertIn("image", names)
                 mf = tf.extractfile("stemcell.MF").read().decode()
                 self.assertIn("image_id: local:import/x.qcow2", mf)
+                self.assertIn(f"sha256: {SHA}", mf)
                 img = tf.extractfile("image").read()
                 # Placeholder only — must never be a real disk. Kept tiny.
                 self.assertLessEqual(len(img), 16)
@@ -150,7 +164,7 @@ class CreateEnvTarballTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             path = ls.build_create_env_light_tarball(
                 d, os_name="ubuntu-noble", version="1.383",
-                image_id="local:import/x.qcow2",
+                image_id="local:import/x.qcow2", sha256=SHA,
             )
             sha = ls.file_sha1(path)
             self.assertEqual(len(sha), 40)
