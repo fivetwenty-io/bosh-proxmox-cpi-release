@@ -55,6 +55,8 @@ When a VM registered under PVE HA stops responding, both systems act independent
 
 Both systems act on similar timescales (each roughly a one-minute detection window, independently tuned — PVE HA's own failure-detection interval on one side, the Director's agent-heartbeat timeout on the other). Nothing in the CPI coordinates the two; they are entirely separate control loops with no shared state.
 
+The duplicate hazard requires both loops to be live. Director-only recovery cannot duplicate: the resurrector's scan-and-fix deletes the failed VM (`delete_vm`, disks reaped) before it issues the replacement `create_vm`, so there is no window in which two guests exist — we have observed exactly this delete-then-create ordering live. The race arises only when PVE HA is also registered, because PVE HA restarts the *existing* guest in place or on another node while the Director, unaware, builds a *new* one.
+
 ## The CPI's guard rail: a once-per-process warning
 
 The CPI cannot read or set the BOSH resurrector's state — there is no PVE-API-only mechanism for that, and the CPI has no shell access to the Director. What it can do is warn whenever it is about to make PVE HA a co-owner of recovery. `create_vm` logs this once per CPI process, the first time any HA-registration feature fires:
