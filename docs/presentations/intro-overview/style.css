@@ -51,17 +51,10 @@
 /* --- Diagrams ------------------------------------------------
    NOTE: since Slidev 52 the rendered SVG lives inside a shadow
    root, so the `svg` descendant rules below cannot reach it —
-   they are kept for older Slidev versions only. The host
-   (.mermaid div) rules still apply and keep diagrams centered.
-
-   Sizing is therefore not ours to set here. Mermaid emits the
-   SVG with its own inline max-width plus width="100%", so a
-   diagram wider than the slide is fitted to the column
-   automatically and one narrower renders at natural size. Every
-   diagram in this deck is laid out LR and lands on-canvas that
-   way. If one ever needs explicit sizing, the only lever is the
-   Slidev-native per-fence ```mermaid {scale: N}``` option, which
-   sets the SVG height to viewBoxHeight * N and drops the width. */
+   actual diagram sizing is done per-fence with the Slidev-native
+   ```mermaid {scale: N}``` option in the slide sources. The host
+   (.mermaid div) rules still apply and keep diagrams centered;
+   the svg rules are kept for older Slidev versions only. */
 .slidev-layout .mermaid {
   display: flex;
   justify-content: center;

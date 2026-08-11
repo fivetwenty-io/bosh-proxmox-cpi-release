@@ -346,7 +346,7 @@ Substitute your own storage pool names in the loop. Run `bosh create-env` only a
 The CPI uploads stemcells as qcow2 files and references them via the **volume form** `import-from=<storage>:import/<file>.qcow2` (`src/pve_cpi/internal/cpi/handlers/create_vm.go`). The volume form is ACL-gated — it requires `Datastore.AllocateSpace` on the source storage but is **not** restricted to the `root@pam` account.
 
 
-The "Fix B is insufficient" warning in [pve-settings.md §3](pve-settings.md#fix-b--grant-acl-partial-not-sufficient-alone) applies only to the **path form** `import-from=/absolute/filesystem/path`, which PVE restricts to the `root` Unix account regardless of API privileges. The CPI never uses the path form, so the minimum-privilege setup in this doc does not hit that restriction.
+PVE additionally restricts the **path form** `import-from=/absolute/filesystem/path` to the `root` Unix account regardless of API privileges — see [pve-settings.md §3](pve-settings.md#3-disable-privilege-separation-on-the-api-token). The CPI never uses the path form, so the minimum-privilege setup in this doc does not hit that restriction.
 
 In short: a `bosh@pve` token with `privsep=0` and the §3 ACLs can upload stemcells and clone from them without `root@pam`.
 

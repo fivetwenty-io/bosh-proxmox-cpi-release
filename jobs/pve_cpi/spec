@@ -670,9 +670,9 @@ properties:
     default: 0
   pve.ensure_no_ip_conflicts:
     description: |
-      When true (default), create_vm checks that no existing VM on the candidate
-      node already holds the requested static IP before provisioning. Prevents
-      duplicate-IP collisions on static networks. Set to false only for
+      When true (default), create_vm scans the whole cluster's VMs and checks
+      that none already holds the requested static IP before provisioning.
+      Prevents duplicate-IP collisions on static networks. Set to false only for
       dynamic (DHCP) networks where IP pre-assignment is not meaningful.
       Protective default: true. Omitting this property preserves the default.
     default: true

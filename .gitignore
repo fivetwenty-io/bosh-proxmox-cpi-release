@@ -75,9 +75,11 @@ docs/presentations/**/*.pdf
 docs/presentations/**/.slidev/
 bun.lock
 
-# Architecture HTML build (generated from docs/architecture/*.md)
+# Narrative-docs HTML builds (generated from docs/<set>/*.md)
 docs/architecture/index.html
 docs/architecture/node_modules/
+docs/intro-overview/index.html
+docs/intro-overview/node_modules/
 node_modules
 
 # Locally built operator CLI (go build ./cmd/pve-cid)

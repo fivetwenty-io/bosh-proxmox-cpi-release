@@ -1,0 +1,14 @@
+{
+  "name": "bosh-pve-cpi-intro-overview-docs",
+  "private": true,
+  "description": "Build tooling for compiling docs/intro-overview/*.md into a single index.html",
+  "scripts": {
+    "build": "bun build-index.mjs"
+  },
+  "dependencies": {
+    "markdown-it": "^14.1.0"
+  },
+  "overrides": {
+    "linkify-it": "^5.0.2"
+  }
+}

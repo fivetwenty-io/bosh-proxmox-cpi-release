@@ -12,7 +12,7 @@ aloud from the corresponding `docs/architecture/` chapter.
 
 - `slides.md` — the deck entry point: headmatter, title, agenda, and `src:` imports of every chapter.
 - `01-…` through `13-…` — one file per chapter (transition slide + section slides). Each mirrors a source chapter.
-- `style.css` — global styling, auto-loaded by Slidev: vertically balanced bullet slides and a fit-to-slide cap so wide and tall Mermaid diagrams never overflow.
+- `style.css` — global styling, auto-loaded by Slidev: vertically balanced bullet slides and centered diagrams. Diagram *sizing* is not set here: Slidev 52+ renders Mermaid inside a shadow root that page CSS cannot reach, and Mermaid's own inline `max-width` fits each diagram to the slide column. Every diagram in this deck is laid out `LR` and fits on that basis; the per-fence ` ```mermaid {scale: N}` option is the only lever if one ever needs explicit sizing.
 
 The deck font is **Nunito** (FiveTwenty's main font), set via the `fonts:` headmatter
 in `slides.md` and pulled from Google Fonts at build time.

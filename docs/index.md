@@ -8,6 +8,8 @@ This CPI enables BOSH to provision and manage resources on PVE 9.x. It implement
 
 ## Table of Contents
 
+- [An Operator's Introduction](intro-overview/index.md): The one-hour operator walkthrough — how the CPI is put together, how it works, and how it is configured, in ten prose chapters with a matching [Slidev deck](presentations/intro-overview/README.md).
+
 - [Design Decisions](design-decisions.md): The operator-facing record of the stemcell CID, storage, network, and multi-cluster design decisions — context, options considered, chosen behavior, and migration notes for each.
 
 - [Development Guide](development.md): Instructions for setting up a development environment, running tests, and building releases.

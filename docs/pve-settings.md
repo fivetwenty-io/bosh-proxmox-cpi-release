@@ -86,7 +86,7 @@ The `content` line must include `import`.
 
 This section covers the `root@pam` quick-start token. For the recommended non-root setup — a dedicated `bosh@pve` user with a custom `BoshOperator` role — see [pve-api-permissions.md](pve-api-permissions.md). The `privsep=0` requirement applies to both paths; only the trust boundary differs.
 
-PVE API tokens default to **Privilege Separation = on**, giving the token its own (empty) ACL, distinct from the parent user — even when the parent is `root@pam`. The CPI then fails any call that needs full root authority, most visibly `--import-from=<path>` (filesystem-path arguments are user-bound, not ACL-bound).
+PVE API tokens default to **Privilege Separation = on**, giving the token its own (empty) ACL, distinct from the parent user — even when the parent is `root@pam`. Every ACL-gated call the CPI makes then fails with `403`; the stemcell upload and the `import-from=<storage>:import/<file>` clone that consumes it are typically the first casualties.
 
 ### Fix A — Disable Privilege Separation (recommended)
 
@@ -116,9 +116,9 @@ curl -sk -H "Authorization: $PVE_TOKEN" \
   | jq '.data.privsep'
 ```
 
-Expect `0`. The token now inherits the parent user's full powers. Required for `import-from=` and any other path-bound operation.
+Expect `0`. The token now inherits the parent user's full ACLs, and every CPI call — stemcell upload and `import-from=` included — is authorized as the parent user.
 
-### Fix B — Grant ACL (partial, not sufficient alone)
+### Fix B — Grant ACL to the token (works, but heavier)
 
 If you must keep Privilege Separation on, grant the token Administrator on `/`:
 
@@ -145,9 +145,9 @@ curl -sk -X PUT -H "Authorization: $PVE_TOKEN" \
   https://$PVE_HOST/api2/json/access/acl
 ```
 
-This unlocks ACL-gated APIs but **not** `--import-from=<path>`. PVE restricts arbitrary-filesystem-path arguments to the `root` user account (or a token with Privilege Separation disabled acting as root). Stemcell upload will still fail.
+This authorizes every ACL-gated API, which covers the CPI completely: the CPI references stemcells via the volume form `import-from=<storage>:import/<file>`, never a raw filesystem path, so PVE's root-only restriction on path-form arguments does not apply to it — see [pve-api-permissions.md §6](pve-api-permissions.md#6-caveat-import-from-and-privilege-separation). The trade is a second object to maintain: the token's ACL must be kept in sync with what the CPI needs, on top of the token itself.
 
-**TL;DR:** Use Fix A. Fix B alone is insufficient for stemcell import.
+**TL;DR:** Use Fix A — one flag, same effect, nothing extra to maintain.
 
 ## Full Verification
 

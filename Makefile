@@ -301,6 +301,27 @@ slides-architecture-build: ## Build the architecture deck to a static SPA (docs/
 	@cd $(SLIDES_ARCH_DIR) && bunx @slidev/cli build slides.md --out $(SLIDES_ARCH_DIST)
 	@echo "$(GREEN)✓ $(SLIDES_ARCH_DIR)/$(SLIDES_ARCH_DIST) built$(RESET)"
 
+SLIDES_INTRO_DIR  := docs/presentations/intro-overview
+SLIDES_INTRO_PDF  := intro-overview.pdf
+SLIDES_INTRO_DIST := dist
+
+.PHONY: slides-intro-overview
+slides-intro-overview: ## Launch the intro-overview Slidev deck in the live presenter (bun + @slidev/cli)
+	@echo "$(GREEN)Starting intro-overview slides presenter...$(RESET)"
+	@cd $(SLIDES_INTRO_DIR) && bun install --silent && bunx @slidev/cli slides.md
+
+.PHONY: slides-intro-overview-export
+slides-intro-overview-export: ## Export the intro-overview deck to a PDF (docs/presentations/intro-overview/intro-overview.pdf)
+	@echo "$(GREEN)Exporting intro-overview deck to PDF...$(RESET)"
+	@cd $(SLIDES_INTRO_DIR) && bun install --silent && bunx @slidev/cli export slides.md --output $(SLIDES_INTRO_PDF)
+	@echo "$(GREEN)✓ $(SLIDES_INTRO_DIR)/$(SLIDES_INTRO_PDF) written$(RESET)"
+
+.PHONY: slides-intro-overview-build
+slides-intro-overview-build: ## Build the intro-overview deck to a static SPA (docs/presentations/intro-overview/dist)
+	@echo "$(GREEN)Building intro-overview deck (static SPA)...$(RESET)"
+	@cd $(SLIDES_INTRO_DIR) && bun install --silent && bunx @slidev/cli build slides.md --out $(SLIDES_INTRO_DIST)
+	@echo "$(GREEN)✓ $(SLIDES_INTRO_DIR)/$(SLIDES_INTRO_DIST) built$(RESET)"
+
 ##@ Documentation
 
 # Architecture narrative (Markdown) → single readable index.html with rendered
@@ -313,6 +334,14 @@ docs-architecture-html: ## Compile docs/architecture/*.md into a single docs/arc
 	@cd $(DOCS_ARCH_DIR) && bun install --silent && bun build-index.mjs
 	@echo "$(GREEN)✓ $(DOCS_ARCH_DIR)/index.html built$(RESET)"
 
+DOCS_INTRO_DIR := docs/intro-overview
+
+.PHONY: docs-intro-overview-html
+docs-intro-overview-html: ## Compile docs/intro-overview/*.md into a single docs/intro-overview/index.html
+	@echo "$(GREEN)Building intro-overview HTML...$(RESET)"
+	@cd $(DOCS_INTRO_DIR) && bun install --silent && bun build-index.mjs
+	@echo "$(GREEN)✓ $(DOCS_INTRO_DIR)/index.html built$(RESET)"
+
 ##@ Cleanup
 
 .PHONY: clean
@@ -323,4 +352,5 @@ clean: release-clean ## Remove coverage files, bin/, and stray release artifacts
         staticcheck check govulncheck gosec trivy security download-blobs upload-blobs sync-blobs \
         release-build dev-release release release-clean release-hygiene bosh-clean \
         slides-architecture slides-architecture-export slides-architecture-build \
-        docs-architecture-html clean
+        slides-intro-overview slides-intro-overview-export slides-intro-overview-build \
+        docs-architecture-html docs-intro-overview-html clean
