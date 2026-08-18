@@ -5,10 +5,15 @@ Go implementation of the BOSH Cloud Provider Interface (CPI) v2 for Proxmox VE 9
 The CPI provisions VMs, persistent disks, networks, snapshots, and stemcells on a PVE cluster on behalf of a BOSH Director. It speaks the BOSH JSON-RPC envelope over stdin/stdout, supports three agent bootstrap modes (`cloudinit`, `noagent`, and `auto`), and ships as a single static Go binary packaged into a BOSH release.
 
 - BOSH CPI v2 compliant (`api_version: 2`)
+
 - PVE SDN vnet lifecycle plus Linux bridge fallback for managed networks
+
 - ConfigDrive ISO agent bootstrap with no external registry dependency
+
 - API token or password authentication; TLS verification on by default
-- [Light stemcells](docs/light-stemcells.md) — pre-uploaded or CPI-fetched qcow2 images; no director-side re-upload on redeploy
+
+- [Light stemcells](docs/light-stemcells.md)
+  Pre-uploaded or CPI-fetched qcow2 images, with no director-side re-upload on redeploy
 
 ## Quickstart
 
@@ -29,7 +34,7 @@ make dev-release      # builds dev_releases/bosh-pve-cpi/bosh-pve-cpi-<version>.
 RELEASE_TGZ=$(scripts/create-release dev | grep '^RELEASE_TGZ=' | cut -d= -f2)
 ```
 
-For a versioned final release use `make release VERSION=1.0.0`. Both targets write the tarball under `dev_releases/` or `releases/` — never at the repo root. `make release-hygiene` enforces that invariant.
+For a versioned final release, use `make release VERSION=1.0.0`. Both targets write the tarball under `dev_releases/` or `releases/`, never at the repo root. `make release-hygiene` enforces that invariant.
 
 ### 3. Configure your deployment variables
 
@@ -40,7 +45,7 @@ cp manifests/bosh/vars.yml.example manifests/bosh/vars.yml
 $EDITOR manifests/bosh/vars.yml
 ```
 
-`vars.yml` and `creds.yml` are gitignored. Treat them as secret material — `scripts/create-release` refuses to commit changes to them unless `ALLOW_SECRET_COMMIT=1` is set.
+`vars.yml` and `creds.yml` are gitignored. Treat them as secret material. `scripts/create-release` refuses to commit changes to them unless `ALLOW_SECRET_COMMIT=1` is set.
 
 ### 4. Deploy the Director
 
@@ -72,7 +77,7 @@ bosh -e <alias> env
 bosh -e <alias> task --recent=1 --debug
 ```
 
-For end-to-end CPI method exercise against a live cluster, see [BOSH CPI Lifecycle Tests](#bosh-cpi-lifecycle-tests).
+To exercise every CPI method end to end against a live cluster, see [BOSH CPI Lifecycle Tests](#bosh-cpi-lifecycle-tests).
 
 ## Properties
 
@@ -82,8 +87,8 @@ The CPI exposes properties under the `pve.*` and `agent.*` namespaces. The most 
 |---|---|---|
 | `pve.host` | PVE host (IP or FQDN) | **required** |
 | `pve.user` | PVE username (e.g. `bosh@pve`) | **required** |
-| `pve.api_token` | PVE API token — preferred over password in production | `""` |
-| `pve.password` | PVE password — mutually exclusive with `api_token` | `""` |
+| `pve.api_token` | PVE API token, preferred over password in production | `""` |
+| `pve.password` | PVE password, mutually exclusive with `api_token` | `""` |
 | `pve.node` | Default PVE node for placement | **required** |
 | `pve.vm_storage` | Storage pool for VM root disks | **required** |
 | `pve.disk_storage` | Storage pool for persistent disks | **required** |
@@ -99,7 +104,7 @@ The full table covers the remaining properties, including SDN zone management, s
 
 ## Multi-CPI usage (multi-AZ / multiple PVE clusters)
 
-A single BOSH director can register multiple named `type: pve` cpi-config entries — one entry per PVE cluster — to give each availability zone its own independent cluster, with no release code change or extra job colocation required. This covers the cpi-config walkthrough, AZ-to-CPI binding, stemcell registration across entries, and — the part that matters once storage is shared between clusters — disjoint VMID banding as the safety pattern that keeps two clusters from corrupting each other's data. See [Multi-Cluster Deployments](docs/multi-cluster.md) for the full guide, including a worked `cpi-config.yml` example and the AZ-reassignment trap to avoid.
+A single BOSH Director can register multiple named `type: pve` cpi-config entries, one per PVE cluster. Each availability zone then gets its own independent cluster, with no release code change and no extra job colocation. The [Multi-Cluster Deployments](docs/multi-cluster.md) guide covers the cpi-config walkthrough, AZ-to-CPI binding, stemcell registration across entries, and a worked `cpi-config.yml` example. It also covers disjoint VMID banding, the safety pattern that keeps two clusters with shared storage from corrupting each other's data, and the AZ-reassignment trap to avoid.
 
 ## Operations
 
@@ -107,15 +112,20 @@ Day-2 operations, log locations, error triage, ConfigDrive ISO storage hardening
 
 Specific topics:
 
-- [ConfigDrive ISO storage](docs/operations.md#configdrive-iso-storage) — an ISO on the node-local `local` pool can be read by any PVE node user, agent credentials included. `pve.iso_storage_follow_vm_storage` (default true) moves it onto a shared `vm_storage` when that pool is eligible; dedicate a separate pool for production.
+- [ConfigDrive ISO storage](docs/operations.md#configdrive-iso-storage)
+  An ISO on the node-local `local` pool can be read by any PVE node user, agent credentials included. `pve.iso_storage_follow_vm_storage` (default true) moves it onto a shared `vm_storage` when that pool is eligible; dedicate a separate pool for production.
 
-- [Error message hygiene](docs/operations.md#error-message-hygiene) — what surfaces in BOSH task output versus what stays in CPI logs, and the secrets-redaction contract.
+- [Error message hygiene](docs/operations.md#error-message-hygiene)
+  What surfaces in BOSH task output versus what stays in CPI logs, and the secrets-redaction contract.
 
-- [Persistent disks](docs/operations.md#persistent-disks-cloud_properties) — `disk_format` cloud-property requirements for LVM/ZFS pools (`raw`) versus directory/network-backed pools (`qcow2`).
+- [Persistent disks](docs/operations.md#persistent-disks-cloud_properties)
+  `disk_format` cloud-property requirements for LVM/ZFS pools (`raw`) versus directory/network-backed pools (`qcow2`).
 
-- [Persistent disk lifecycle strategy](docs/persistent-disk-strategy.md) — the free-floating and parked detachment strategies, `scripts/disk-audit`, parker VM teardown, and provenance sentinel details.
+- [Persistent disk lifecycle strategy](docs/persistent-disk-strategy.md)
+  The free-floating and parked detachment strategies, `scripts/disk-audit`, parker VM teardown, and provenance sentinel details.
 
-- [Release workflow](docs/operations.md) — operator workflow for capturing `RELEASE_TGZ` from `scripts/create-release` and passing it via `--var release_artifact_path=...`.
+- [Release workflow](docs/operations.md)
+  Operator workflow for capturing `RELEASE_TGZ` from `scripts/create-release` and passing it via `--var release_artifact_path=...`.
 
 ## Network configuration
 
@@ -128,8 +138,11 @@ See [Network configuration](docs/networks.md) for the full `cloud_properties` sc
 ### Requirements
 
 - Go 1.26 or higher (BOSH packaging compiles against the `golang-1.26` blob).
+
 - `golangci-lint` (`make lint` falls back to `go run` at a pinned version when not installed).
+
 - `staticcheck` (optional; `make staticcheck` skips with a notice when missing).
+
 - `govulncheck` and `gosec` (optional; `make security`).
 
 ### Make targets
@@ -156,7 +169,7 @@ See [Network configuration](docs/networks.md) for the full `cloud_properties` sc
 
 ### CI gating
 
-CI runs `make check` on every push. The composite target gates `vet`, `staticcheck`, `lint`, `coverage-check`, and `test` in that order, fast-fail. `COVERAGE_THRESHOLD` is `80`.
+CI runs `make check` on every push. The composite target gates `vet`, `staticcheck`, `lint`, `coverage-check`, and `test` in that order, stopping at the first failure. `COVERAGE_THRESHOLD` is `80`.
 
 Go sources live under `src/pve_cpi/`. Direct `go test` and `go build` invocations must run from there; the `make` targets re-root automatically.
 
@@ -178,30 +191,61 @@ See [CPI certification](docs/bosh-cpi-certification.md) for the full prerequisit
 
 For symptom-first triage of deployment, VM creation, disk attachment, network, and stemcell failures, see the [troubleshooting guide](docs/troubleshooting.md). Common starting points:
 
-- VM creation hangs at agent settle — check [CPI logs](docs/operations.md#cpi-logs) for the import task UPID and the post-import NIC/disk attach sequence.
-- Disk attach rejected with snapshot guard — review [snapshot guard on disk operations](docs/cpi_methods.md#snapshot-guard-on-disk-operations).
+- VM creation hangs at agent settle
+  Check [CPI logs](docs/operations.md#cpi-logs) for the import task UPID and the post-import NIC/disk attach sequence.
 
+- Disk attach rejected with snapshot guard
+  Review [snapshot guard on disk operations](docs/cpi_methods.md#snapshot-guard-on-disk-operations).
 
 ## Reference
 
-- [CPI methods reference](docs/cpi_methods.md) — every BOSH CPI v2 method with args, returns, errors, and notes.
-- [Configuration reference](docs/configuration.md) — all properties with defaults and validation rules.
-- [Network configuration](docs/networks.md) — SDN and bridge `cloud_properties` schema and manifest examples.
-- [Operations runbook](docs/operations.md) — day-2 operations and diagnostics.
-- [Best practices](docs/best-practices.md) — PVE and BOSH best practices, and how the CPI meets, exceeds, or makes each one configurable.
-- [Troubleshooting](docs/troubleshooting.md) — symptom-first failure triage.
-- [Light stemcells](docs/light-stemcells.md) — pre-uploaded and CPI-fetch modes, storage requirements, and credentials.
-- [Persistent disks](docs/persistent-disks.md) — storage backend classification and disk-pool cloud-properties.
-- [Persistent disk lifecycle strategy](docs/persistent-disk-strategy.md) — free-floating vs. parked detachment strategies, `scripts/disk-audit`, and provenance sentinel.
-- [ConfigDrive layout](docs/configdrive.md) — ISO 9660 volume layout and SCSI slot reservation map.
-- [PVE API permissions](docs/pve-api-permissions.md) — minimum-privilege `bosh@pve` user setup and token creation.
-- [PVE settings](docs/pve-settings.md) — cluster-level settings the CPI assumes (storage content types, SDN enablement).
+- [CPI methods reference](docs/cpi_methods.md)
+  Every BOSH CPI v2 method with args, returns, errors, and notes.
+
+- [Configuration reference](docs/configuration.md)
+  All properties with defaults and validation rules.
+
+- [Network configuration](docs/networks.md)
+  SDN and bridge `cloud_properties` schema and manifest examples.
+
+- [Operations runbook](docs/operations.md)
+  Day-2 operations and diagnostics.
+
+- [Best practices](docs/best-practices.md)
+  PVE and BOSH best practices, and how the CPI meets, exceeds, or makes each one configurable.
+
+- [Troubleshooting](docs/troubleshooting.md)
+  Symptom-first failure triage.
+
+- [Light stemcells](docs/light-stemcells.md)
+  Pre-uploaded and CPI-fetch modes, storage requirements, and credentials.
+
+- [Persistent disks](docs/persistent-disks.md)
+  Storage backend classification and disk-pool cloud-properties.
+
+- [Persistent disk lifecycle strategy](docs/persistent-disk-strategy.md)
+  Free-floating and parked detachment strategies, `scripts/disk-audit`, and the provenance sentinel.
+
+- [ConfigDrive layout](docs/configdrive.md)
+  ISO 9660 volume layout and SCSI slot reservation map.
+
+- [PVE API permissions](docs/pve-api-permissions.md)
+  Minimum-privilege `bosh@pve` user setup and token creation.
+
+- [PVE settings](docs/pve-settings.md)
+  Cluster-level settings the CPI assumes (storage content types, SDN enablement).
 
 ## External links
 
 - [BOSH CPI v2 specification](https://bosh.io/docs/cpi-api-v2/)
+
 - [Proxmox VE documentation](https://pve.proxmox.com/pve-docs/)
+
 - [bosh.io stemcells](https://bosh.io/stemcells/)
+
+## Contributing
+
+Bug reports, documentation fixes, and code contributions are welcome. The [contributing guide](CONTRIBUTING.md) explains how to report an issue, run the test suite, and submit a pull request.
 
 ## License
 

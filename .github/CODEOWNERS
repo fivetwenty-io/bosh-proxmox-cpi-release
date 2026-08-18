@@ -1,0 +1,20 @@
+# Code owners for bosh-pve-cpi-release
+#
+# GitHub reads this file to decide who reviews a pull request. When a pull
+# request touches a path listed here, GitHub asks the listed owners for a
+# review automatically. The last matching pattern wins, so more specific
+# rules belong below the general ones.
+#
+# Reference: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+# Default owners for everything in the repository.
+* @wayneeseguin
+
+# CPI source code, BOSH release packaging, and CI workflows.
+/src/ @wayneeseguin
+/jobs/ @wayneeseguin
+/packages/ @wayneeseguin
+/.github/workflows/ @wayneeseguin
+
+# Documentation.
+/docs/ @wayneeseguin
