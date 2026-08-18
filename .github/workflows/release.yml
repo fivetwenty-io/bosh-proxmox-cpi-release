@@ -1,0 +1,147 @@
+name: Release
+
+# Tag-driven final releases: push an annotated tag vX.Y.Z on main and this
+# workflow gates on the full CI check suite, builds the BOSH release tarball,
+# and publishes it as a GitHub Release with a sha256 checksum and a
+# ready-to-paste manifest snippet.
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+
+jobs:
+  check:
+    name: Check
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  release:
+    name: Build and Publish
+    needs: check
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    env:
+      RELEASE_NAME: bosh-pve-cpi
+      BOSH_CLI_VERSION: "7.10.9"
+      # sha256 of bosh-cli-7.10.9-linux-amd64 from cloudfoundry/bosh-cli releases
+      BOSH_CLI_SHA256: "b06db2e0ad45c1c24d90726c2e83011b025d5fe5c3dabb9d8af8f87db1f2a89c"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify tag and derive version
+        id: version
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          if ! [[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "ERROR: tag '${GITHUB_REF_NAME}' is not vX.Y.Z or vX.Y.Z-<prerelease>" >&2
+            exit 1
+          fi
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "${GITHUB_SHA}" origin/main; then
+            echo "ERROR: tag '${GITHUB_REF_NAME}' points at ${GITHUB_SHA}, which is not on main." >&2
+            echo "Releases are cut only from main. Delete the tag, merge the commit, re-tag." >&2
+            exit 1
+          fi
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+          if [[ "${VERSION}" == *-* ]]; then
+            echo "prerelease=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "prerelease=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Install bosh CLI
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/bosh \
+            "https://github.com/cloudfoundry/bosh-cli/releases/download/v${BOSH_CLI_VERSION}/bosh-cli-${BOSH_CLI_VERSION}-linux-amd64"
+          echo "${BOSH_CLI_SHA256}  /tmp/bosh" | sha256sum -c -
+          sudo install -m 0755 /tmp/bosh /usr/local/bin/bosh
+          bosh --version
+
+      - name: Write blobstore credentials (config/private.yml)
+        env:
+          BLOBSTORE_ACCESS_KEY_ID: ${{ secrets.BLOBSTORE_ACCESS_KEY_ID }}
+          BLOBSTORE_SECRET_ACCESS_KEY: ${{ secrets.BLOBSTORE_SECRET_ACCESS_KEY }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${BLOBSTORE_ACCESS_KEY_ID}" || -z "${BLOBSTORE_SECRET_ACCESS_KEY}" ]]; then
+            echo "ERROR: blobstore secrets are not configured for this repository." >&2
+            echo "Add them with:" >&2
+            echo "  gh secret set BLOBSTORE_ACCESS_KEY_ID" >&2
+            echo "  gh secret set BLOBSTORE_SECRET_ACCESS_KEY" >&2
+            echo "They must grant read access to the S3 bucket in config/final.yml." >&2
+            exit 1
+          fi
+          umask 077
+          printf -- '---\nblobstore:\n  options:\n    access_key_id: %s\n    secret_access_key: %s\n' \
+            "${BLOBSTORE_ACCESS_KEY_ID}" "${BLOBSTORE_SECRET_ACCESS_KEY}" \
+            > config/private.yml
+
+      - name: Cache blobs
+        uses: actions/cache@v4
+        with:
+          path: blobs
+          key: blobs-${{ hashFiles('config/blobs.yml') }}
+
+      - name: Sync blobs from blobstore
+        run: bosh sync-blobs
+
+      - name: Build release tarball
+        id: build
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.version.outputs.version }}"
+          TARBALL_DIR="releases/${RELEASE_NAME}"
+          TARBALL="${TARBALL_DIR}/${RELEASE_NAME}-${VERSION}.tgz"
+          mkdir -p "${TARBALL_DIR}"
+          bosh create-release --force --version="${VERSION}" --tarball="${TARBALL}"
+          (cd "${TARBALL_DIR}" && sha256sum "${RELEASE_NAME}-${VERSION}.tgz" > "${RELEASE_NAME}-${VERSION}.tgz.sha256")
+          echo "tarball=${TARBALL}" >> "${GITHUB_OUTPUT}"
+          echo "sha256=$(cut -d' ' -f1 "${TARBALL}.sha256")" >> "${GITHUB_OUTPUT}"
+
+      - name: Remove blobstore credentials
+        if: always()
+        run: rm -f config/private.yml
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+          PRERELEASE: ${{ steps.version.outputs.prerelease }}
+          TARBALL: ${{ steps.build.outputs.tarball }}
+          SHA256: ${{ steps.build.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          cat > /tmp/release-notes.md <<EOF
+          BOSH release tarball for the Proxmox VE CPI.
+
+          Reference it from a deployment manifest:
+
+          \`\`\`yaml
+          releases:
+          - name: ${RELEASE_NAME}
+            version: "${VERSION}"
+            url: https://github.com/${GITHUB_REPOSITORY}/releases/download/v${VERSION}/${RELEASE_NAME}-${VERSION}.tgz
+            sha1: sha256:${SHA256}
+          \`\`\`
+          EOF
+          ARGS=(--verify-tag --title "${RELEASE_NAME} ${VERSION}" --notes-file /tmp/release-notes.md --generate-notes)
+          if [[ "${PRERELEASE}" == "true" ]]; then
+            ARGS+=(--prerelease)
+          fi
+          gh release create "${GITHUB_REF_NAME}" "${ARGS[@]}" \
+            "${TARBALL}" "${TARBALL}.sha256"

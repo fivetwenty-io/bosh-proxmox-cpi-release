@@ -84,6 +84,21 @@ Keep each pull request focused on one change. A small, focused pull request is e
 
 Write commit messages that describe the code change, not the process that produced it. This repository follows the Conventional Commits style: a type prefix such as `fix:`, `feat:`, `docs:`, or `ci:`, followed by a short summary in the imperative mood. Look at `git log` for examples.
 
+## Releasing (maintainers)
+
+Releases are tag driven. Pushing a tag of the form `vX.Y.Z` on `main` runs the release workflow, which gates on the full CI check suite, builds the BOSH release tarball with a pinned `bosh` CLI, and publishes a GitHub Release with the tarball, a sha256 checksum file, and a manifest snippet ready to paste into a deployment.
+
+To cut a release:
+
+```bash
+git tag -a v1.2.3 -m "Version 1.2.3"
+git push origin v1.2.3
+```
+
+A tag with a prerelease suffix, such as `v1.2.3-rc.1`, is published as a GitHub prerelease. The workflow refuses tags that do not point at a commit on `main`.
+
+The build syncs blobs from the private S3 blobstore, so the repository needs two Actions secrets: `BLOBSTORE_ACCESS_KEY_ID` and `BLOBSTORE_SECRET_ACCESS_KEY`, holding a key with read access to the bucket named in `config/final.yml`. Set them with `gh secret set`. The workflow fails with instructions when they are missing.
+
 ## License
 
 This project is licensed under the [Apache License, Version 2.0](LICENSE). By submitting a contribution, you agree that it will be licensed under the same terms.
