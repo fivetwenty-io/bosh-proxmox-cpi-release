@@ -47,6 +47,11 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Mark workspace safe for git
+        # The host-mounted workspace has a different owner than the container
+        # user; without this, git commands fail with "dubious ownership"
+        run: git config --global --add safe.directory "${GITHUB_WORKSPACE}"
+
       - name: Verify tag and derive version
         id: version
         run: |

@@ -19,6 +19,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      - name: Mark workspace safe for git
+        # The host-mounted workspace has a different owner than the container
+        # user; without this, go tools fail with "error obtaining VCS status"
+        run: git config --global --add safe.directory "${GITHUB_WORKSPACE}"
+
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
