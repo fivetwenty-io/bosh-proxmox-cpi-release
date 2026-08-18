@@ -575,7 +575,8 @@ func TestIsDiskParked_TransientScanError_Propagates(t *testing.T) {
 		},
 	)
 
-	_, _, _, _, err := pve.IsDiskParked(context.Background(), c, nopLogger(),
+	ctx := pve.WithTestBackoff(context.Background(), func(_ int) time.Duration { return 0 })
+	_, _, _, _, err := pve.IsDiskParked(ctx, c, nopLogger(),
 		"local-lvm:vm-9001-disk-0", parkerTestCfg())
 	if err == nil {
 		t.Fatal("expected error to propagate for transient scan failure")
@@ -1336,7 +1337,8 @@ func TestFindVMByDiskVolidOrNone_TransientErrorPassthrough(t *testing.T) {
 		},
 	)
 
-	_, _, _, err := pve.FindVMByDiskVolidOrNone(context.Background(), c, "", "local-lvm:vm-9001-disk-0")
+	ctx := pve.WithTestBackoff(context.Background(), func(_ int) time.Duration { return 0 })
+	_, _, _, err := pve.FindVMByDiskVolidOrNone(ctx, c, "", "local-lvm:vm-9001-disk-0")
 	if err == nil {
 		t.Fatal("expected error to propagate for transient scan failure; got nil")
 	}
