@@ -205,6 +205,6 @@ For symptom-first triage of deployment, VM creation, disk attachment, network, a
 
 ## License
 
-Copyright 2026 Wayne E. Seguin and FiveTwenty.io.
+Copyright 2026 Wayne E. Seguin and Fivetwenty Inc.
 
 Licensed under the [Apache License, Version 2.0](LICENSE). See [NOTICE](NOTICE) for attribution details.
