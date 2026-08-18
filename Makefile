@@ -195,6 +195,7 @@ gosec: ## Run gosec security scanner
 TRIVY_SKIP := --skip-files manifests/bosh/creds.yml \
 	--skip-files "manifests/bosh/creds.yml.*" \
 	--skip-files manifests/envs/cpitest/artifacts_ssh \
+	--skip-files config/private.yml \
 	--skip-dirs .e2e-results
 
 .PHONY: trivy
