@@ -1,13 +1,13 @@
 version: 2
 updates:
-  # Go module for the CPI binary. The module vendors its dependencies, so
-  # Dependabot must refresh vendor/ in the same PR.
+  # Go module for the CPI binary. The module vendors its dependencies;
+  # Dependabot detects vendor/ automatically and refreshes it in the same PR
+  # (the explicit `vendor` option is bundler-only and fails schema validation).
   - package-ecosystem: gomod
     directory: /src/pve_cpi
     schedule:
       interval: weekly
       day: monday
-    vendor: true
     commit-message:
       prefix: "fix(deps)"
     groups:
