@@ -1,0 +1,39 @@
+version: 2
+updates:
+  # Go module for the CPI binary. The module vendors its dependencies, so
+  # Dependabot must refresh vendor/ in the same PR.
+  - package-ecosystem: gomod
+    directory: /src/pve_cpi
+    schedule:
+      interval: weekly
+      day: monday
+    vendor: true
+    commit-message:
+      prefix: "fix(deps)"
+    groups:
+      go-minor-patch:
+        update-types: ["minor", "patch"]
+
+  # Workflow actions, including SHA-pinned ones (Dependabot updates the pin
+  # and its version comment together).
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: "ci(deps)"
+    groups:
+      actions:
+        patterns: ["*"]
+
+  # Slidev presentation tooling only; no runtime dependencies.
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      slidev:
+        patterns: ["*"]
