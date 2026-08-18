@@ -25,7 +25,7 @@ jobs:
   release:
     name: Build and Publish
     needs: check
-    runs-on: ubuntu-24.04
+    runs-on: self-hosted
     permissions:
       contents: write
 
@@ -66,11 +66,12 @@ jobs:
       - name: Install bosh CLI
         run: |
           set -euo pipefail
-          curl -fsSL -o /tmp/bosh \
+          curl -fsSL -o "${RUNNER_TEMP}/bosh" \
             "https://github.com/cloudfoundry/bosh-cli/releases/download/v${BOSH_CLI_VERSION}/bosh-cli-${BOSH_CLI_VERSION}-linux-amd64"
-          echo "${BOSH_CLI_SHA256}  /tmp/bosh" | sha256sum -c -
-          sudo install -m 0755 /tmp/bosh /usr/local/bin/bosh
-          bosh --version
+          echo "${BOSH_CLI_SHA256}  ${RUNNER_TEMP}/bosh" | sha256sum -c -
+          install -D -m 0755 "${RUNNER_TEMP}/bosh" "${RUNNER_TEMP}/bin/bosh"
+          echo "${RUNNER_TEMP}/bin" >> "${GITHUB_PATH}"
+          "${RUNNER_TEMP}/bin/bosh" --version
 
       - name: Write blobstore credentials (config/private.yml)
         env:
