@@ -69,9 +69,9 @@ func TestHandleSetVMMetadata_Happy(t *testing.T) {
 		}
 	}
 
-	// Tags must not exceed maxTagLength (255).
-	if len(gotTags) > 255 {
-		t.Errorf("tags length %d exceeds 255; got: %q", len(gotTags), gotTags)
+	// Tags must not exceed maxTagLength (350).
+	if len(gotTags) > 350 {
+		t.Errorf("tags length %d exceeds 350; got: %q", len(gotTags), gotTags)
 	}
 }
 
@@ -200,13 +200,14 @@ func TestHandleSetVMMetadata_NullMetadata(t *testing.T) {
 func TestHandleSetVMMetadata_TagTruncation(t *testing.T) {
 	t.Parallel()
 
-	// Three values long enough that the joined "<key>--<value>" form exceeds
-	// maxTagLength (255). Each prefixed tag is ~110 bytes; three joined ~330.
+	// Values long enough that the joined "<key>--<value>" form exceeds
+	// maxTagLength (350). Each prefixed tag is ~110 bytes; four joined ~440.
 	long := strings.Repeat("a", 100)
 	metadata := map[string]any{
-		"director":   "d-" + long,
-		"deployment": "d-" + long,
-		"job":        "j-" + long,
+		"director":       "d-" + long,
+		"deployment":     "d-" + long,
+		"instance_group": "g-" + long,
+		"job":            "j-" + long,
 	}
 
 	var gotTags string
@@ -225,8 +226,8 @@ func TestHandleSetVMMetadata_TagTruncation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(gotTags) > 255 {
-		t.Errorf("tags length %d exceeds 255; got: %q", len(gotTags), gotTags)
+	if len(gotTags) > 350 {
+		t.Errorf("tags length %d exceeds 350; got: %q", len(gotTags), gotTags)
 	}
 	// Truncation must occur at a ";" boundary — no partial "<key>--<value>".
 	for part := range strings.SplitSeq(gotTags, ";") {
@@ -657,16 +658,18 @@ func TestHandleSetVMMetadata_VMNameWithPrefix(t *testing.T) {
 	}
 }
 
-// TestHandleSetVMMetadata_EmitsIndexTag verifies that metadata["index"] is
-// emitted as an "index--<n>" PVE tag alongside the director/deployment/job
-// triple, and that stale "index--" tags from a prior sync are replaced.
+// TestHandleSetVMMetadata_EmitsIndexTag verifies that metadata["index"] and
+// metadata["instance_group"] are emitted as "index--<n>" and
+// "instance-group--<value>" PVE tags alongside the director/deployment/job
+// triple, and that stale "index--"/"instance-group--" tags from a prior sync
+// are replaced.
 func TestHandleSetVMMetadata_EmitsIndexTag(t *testing.T) {
 	t.Parallel()
 
 	qemuSvc := &mockQEMUService{
 		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
 			return map[string]any{
-				"tags": "index--7;env--prod",
+				"tags": "index--7;instance-group--old-group;env--prod",
 			}, nil
 		},
 	}
@@ -683,10 +686,11 @@ func TestHandleSetVMMetadata_EmitsIndexTag(t *testing.T) {
 
 	h := handlers.HandleSetVMMetadata(testDepsFoundVM(101, qemuSvc, nodesSvc, nil, &mockAgentService{}))
 	_, err := h.Handle(context.Background(), marshalArgs("101", map[string]any{
-		"director":   "bosh",
-		"deployment": "cf",
-		"job":        "api",
-		"index":      0,
+		"director":       "bosh",
+		"deployment":     "cf",
+		"instance_group": "api",
+		"job":            "api",
+		"index":          0,
 	}), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -694,7 +698,10 @@ func TestHandleSetVMMetadata_EmitsIndexTag(t *testing.T) {
 	if strings.Contains(gotTags, "index--7") {
 		t.Errorf("stale index tag survived; got: %q", gotTags)
 	}
-	for _, want := range []string{"index--0", "director--bosh", "deployment--cf", "job--api", "env--prod"} {
+	if strings.Contains(gotTags, "instance-group--old-group") {
+		t.Errorf("stale instance-group tag survived; got: %q", gotTags)
+	}
+	for _, want := range []string{"index--0", "director--bosh", "deployment--cf", "instance-group--api", "job--api", "env--prod"} {
 		if !strings.Contains(gotTags, want) {
 			t.Errorf("tags missing %q; got: %q", want, gotTags)
 		}

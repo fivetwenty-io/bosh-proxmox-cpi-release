@@ -16,7 +16,7 @@ const ownershipTag = "bosh-cpi"
 // on every set_vm_metadata call. Entries with these prefixes are stripped
 // from a stored PVE tag list before BOSH-managed values are re-applied, so a
 // stale director/deployment/job triple cannot accumulate.
-var reservedBoshTagPrefixes = []string{"director--", "deployment--", "job--", "index--"}
+var reservedBoshTagPrefixes = []string{"director--", "deployment--", "instance-group--", "job--", "index--"}
 
 // jsonKeyTags is the PVE "tags" field key in qemu config/create payloads and
 // cluster-resource rows, named once so the literal stays under the goconst

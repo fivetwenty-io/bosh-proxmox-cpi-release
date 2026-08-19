@@ -20,9 +20,11 @@ import (
 // maxTagLength is the maximum byte length for the joined PVE tags field.
 // PVE has no hard cap on the joined tag list, but we bound it so unbounded
 // metadata can't bloat the QEMU config. The "<key>--<value>" form means a
-// single director/deployment/job triple can easily exceed 50 bytes, so the
-// cap is set to comfortably hold three full BOSH UUIDs with prefixes.
-const maxTagLength = 255
+// single director/deployment/job entry can easily exceed 50 bytes, so the
+// cap is sized to comfortably hold the full BOSH-managed set (director,
+// deployment, instance_group, job, index, and the UUID-bearing instance
+// name) plus a few operator tags.
+const maxTagLength = 350
 
 // HandleSetVMMetadata returns a handler for the set_vm_metadata CPI method.
 //
@@ -37,8 +39,9 @@ const maxTagLength = 255
 //     Not-found → VMNotFound. Transport error → propagate.
 //  3. Decode metadata map.
 //  4. Build description string: sorted "key: value\n" lines (matches Perl reference).
-//  5. Build tags string: extract director, deployment, job; emit as "<key>--<value>"
-//     entries (PVE tags allow only alphanumerics and "-"). Also extract the BOSH
+//  5. Build tags string: extract director, deployment, instance_group, job, and
+//     index; emit as "<key>--<value>" entries (PVE tags allow only alphanumerics
+//     and "-", so instance_group becomes "instance-group--..."). Also extract the BOSH
 //     instance name ("<job>/<id>") and emit "<job>--<id>" (PVE tags reject "/").
 //     Join with ";"; truncate to maxTagLength bytes at a tag boundary.
 //     5a. Derive a DNS-label VM name as "<job>-<index>" (e.g. "diego-cell-0",
@@ -297,11 +300,12 @@ func buildDescription(metadata map[string]any) string {
 	return sb.String()
 }
 
-// buildBoshManagedTags extracts director, deployment, job, and name from
-// metadata and returns sanitized tag entries.
+// buildBoshManagedTags extracts director, deployment, instance_group, job,
+// index, and name from metadata and returns sanitized tag entries.
 //
-// For director/deployment/job the form is "<key>--<value>". PVE tag values
-// accept only [A-Za-z0-9-]; any other byte in the value is replaced with "-".
+// The form is "<key>--<value>". PVE tag values accept only [A-Za-z0-9-]; any
+// other byte in the key or value is replaced with "-", so metadata key
+// "instance_group" is emitted as an "instance-group--<value>" tag.
 //
 // For the BOSH instance name (e.g. "diego-cell/2844c990-aef3-4de7-8bf3-..."),
 // the "/" between job and id is rewritten to "--" so the tag round-trips as
@@ -312,7 +316,7 @@ func buildDescription(metadata map[string]any) string {
 // Keys whose metadata value is missing, nil, or sanitizes to empty are skipped.
 func buildBoshManagedTags(metadata map[string]any) []string {
 	var parts []string
-	for _, key := range []string{"director", "deployment", "job", "index"} {
+	for _, key := range []string{"director", "deployment", "instance_group", "job", "index"} {
 		v, ok := metadata[key]
 		if !ok || v == nil {
 			continue
@@ -321,7 +325,7 @@ func buildBoshManagedTags(metadata map[string]any) []string {
 		if s == "" {
 			continue
 		}
-		parts = append(parts, key+"--"+s)
+		parts = append(parts, sanitizeTagValue(key)+"--"+s)
 	}
 	if v, ok := metadata[metadataKeyName]; ok && v != nil {
 		raw := strings.ReplaceAll(fmt.Sprintf("%v", v), "/", "--")

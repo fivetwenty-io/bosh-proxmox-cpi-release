@@ -482,7 +482,7 @@ Run `cloud-check` after any failed deploy or partial cleanup before attempting a
 ### Identifying orphans
 
 ```bash
-# BOSH VMs carry director--, deployment--, and job-- tags
+# BOSH VMs carry director--, deployment--, instance-group--, job--, and index-- tags
 pvesh get /cluster/resources --type vm \
   | jq '.[] | select(.tags != null) | {vmid:.vmid, name:.name, tags:.tags}'
 
